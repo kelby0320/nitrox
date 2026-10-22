@@ -347,6 +347,9 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     if count > SPAWN_MAX_HANDLES {
         return Err(KError::TooLarge);
     }
+    if (1..count).any(|i| args.handles[..i].contains(&args.handles[i])) {
+        return Err(KError::InvalidArgument);
+    }
     let parent_pid = crate::sched::current_owner_pid();
 
     let img =
@@ -1924,6 +1927,9 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
             h_raw[i] = u64::from_ne_bytes(hbytes[i * 8..i * 8 + 8].try_into().unwrap());
         }
     }
+    if (1..count).any(|i| h_raw[..i].contains(&h_raw[i])) {
+        return Err(KError::InvalidArgument);
+    }
 
     let pid = crate::sched::current_owner_pid();
     let ok = lookup_typed(ch, pid, Rights::SEND, KObjectType::IpcChannel)?;
@@ -1935,6 +1941,10 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
         let h = RawHandle(h_raw[i]);
         let t = global::get().lookup(h, pid, Rights::TRANSFER).map_err(map_handle_err)?;
         transfers[i] = Some(TransferRef { obj: t.object, rights: t.rights });
+    }
+    // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+    if unsafe { crate::sched::ipc_sends_its_receiver(ok.object.as_ptr(), &transfers) } {
+        return Err(KError::InvalidArgument);
     }
 
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed

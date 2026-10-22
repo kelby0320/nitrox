@@ -44,7 +44,8 @@ later field kept its offset.)
   spawner closes it after spawn. (init itself is loaded from the initramfs by the
   kernel at boot, before any userspace, so it needs no spawner.)
 - **`handle_count`** — number of valid `handles`/`rights` entries (`≤ 4`; larger
-  returns `TooLarge`).
+  returns `TooLarge`). A handle listed twice is refused `InvalidArgument`: moved, it would
+  arrive as two.
 - **`move_mask`** — for each `i < handle_count`, bit `i` selects **move** (the
   parent loses access; default) or **duplicate** (the parent keeps its handle).
 - **`arg0`** — an opaque word delivered to the child at entry (in `rcx`; see the register table below). The

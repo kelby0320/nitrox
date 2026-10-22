@@ -2248,6 +2248,16 @@ a report of the machine's CPUs.
 
 **Deadline scheduling (EDF) as a fourth scheduler class.** RealTime class uses fixed priority, not EDF. Adding EDF is possible without architectural changes — fourth scheduler class. Trigger: a workload that benefits.
 
+**Endpoints holding each other through two channels are never freed —
+`TODO(ipc-handle-cycles)`.** A send refuses the endpoint it delivers to (2026-10-22, the bug
+bash's kobj-6), so no endpoint holds itself. But endpoint B sent into D's ring and D into B's
+hold each other once their holders close them, and nothing frees either: their rings, up to
+4 MiB each at the deepest queue, and whatever the rings hold. Any process can make such pairs,
+repeatedly. Linux collects in-flight descriptors for the same shape (`SCM_RIGHTS`). Fix shape: a
+collector run when an endpoint with endpoints in its ring closes, or refusing to send an endpoint
+whose own ring holds endpoints. Trigger: a channel quota, or the first report of kernel memory
+lost this way.
+
 ### Memory management
 
 **The process memory model — one pass, four parts.** These extend the same AS/fault

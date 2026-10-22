@@ -243,6 +243,22 @@ fn channel_send_rejects_mode_and_oversize_count_before_pointers() {
     assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, (IPC_HANDLE_MAX + 1) as u64, 1, 0), Err(KError::TooLarge),);
 }
 
+/// Each handle moves once: one listed twice would arrive as two, though its holder may not
+/// duplicate it. Refused before anything is looked up: past that, a host test has no process.
+#[test]
+fn a_handle_listed_twice_is_refused_by_a_send_and_a_spawn() {
+    let send = |hs: [u64; 2]| sys_channel_send(0xDEAD, 0x1000, hs.as_ptr() as u64, 2, 1, 0);
+    assert_eq!(send([5, 5]), Err(KError::InvalidArgument));
+    let spawn = |hs: [u64; 2]| {
+        // SAFETY: `SpawnArgs` is plain `#[repr(C)]` data; all-zero is a valid value.
+        let mut args: crate::libkern::spawn::SpawnArgs = unsafe { core::mem::zeroed() };
+        args.handle_count = 2;
+        args.handles[..2].copy_from_slice(&hs.map(RawHandle));
+        sys_process_spawn(&raw const args as u64)
+    };
+    assert_eq!(spawn([5, 5]), Err(KError::InvalidArgument));
+}
+
 #[test]
 fn channel_send_rejects_bad_message_pointer() {
     assert_eq!(sys_channel_send(0xDEAD, USER_VIRT_END, 0, 0, 1, 0), Err(KError::FaultFromUser),);

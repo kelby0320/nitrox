@@ -85,6 +85,53 @@ pub(super) fn clock_set_refused_test() -> bool {
     true
 }
 
+/// **A send's handle list may not name a handle twice, nor the endpoint the message is for**:
+/// the first would copy a handle its holder cannot duplicate, the second leave that endpoint
+/// holding itself in its own ring, never freed. A list with neither is taken.
+pub(super) fn transfer_list_test() -> bool {
+    use libkern::{KError, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: transfers FAIL: ").s(why).end();
+        false
+    };
+    let (mut a, mut b) = (0u64, 0u64);
+    // SAFETY: valid writable out-params.
+    let made = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, 4, 0) } == 0;
+    // SAFETY: register-only syscall; it creates an object and touches no memory of ours.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if !made || mem <= 0 {
+        return fail(b"no channel or memory object");
+    }
+    let mem = mem as u64;
+    let msg = [0u8; 4096];
+    let send = |hs: &[u64]| {
+        // SAFETY: a valid message buffer and handle array.
+        unsafe {
+            syscall5(SYS_CHANNEL_SEND, a, msg.as_ptr() as u64, hs.as_ptr() as u64, hs.len() as u64, SENDMODE_NOBLOCK)
+        }
+    };
+    let refused = KError::InvalidArgument.as_i32() as i64;
+    let twice = send(&[mem, mem]) == refused;
+    let itself = send(&[b]) == refused;
+    let taken = send(&[mem]) == 0;
+    if !taken {
+        close(mem);
+    }
+    close(a);
+    close(b);
+    if !twice {
+        return fail(b"a handle listed twice was not refused InvalidArgument");
+    }
+    if !itself {
+        return fail(b"the endpoint the message is for was not refused InvalidArgument");
+    }
+    if !taken {
+        return fail(b"a list with neither was not taken");
+    }
+    kprint(b"boot-probe: a send refuses a handle twice and the endpoint it is for ok\n");
+    true
+}
+
 /// **A direct-handle bind needs `TRANSFER`**, since every resolve of the binding mints a handle
 /// to the object for whoever asked: without it, `init` could publish its system-control object,
 /// whose handle carries no `TRANSFER` so that it cannot leave `init`.

@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// Whether `transfers` holds the endpoint a send on `endpoint` delivers to: it would hold a
+/// reference to itself in its own ring, and never be freed. A cycle through two channels is not
+/// caught: TODO(ipc-handle-cycles).
+///
+/// # Safety
+///
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
+pub unsafe fn ipc_sends_its_receiver(endpoint: *mut (), transfers: &[Option<TransferRef>]) -> bool {
+    let _g = SCHED.lock();
+    // SAFETY: the caller pins `endpoint`; `SCHED` held. A peer only ever turns null.
+    let peer = unsafe { IpcChannel::peer_of(endpoint) };
+    transfers.iter().flatten().any(|t| t.obj.as_ptr() == peer)
+}
+
 /// Send `msg` from `endpoint` into its peer's receive ring under `SCHED`, **moving** any
 /// `transfers` into the queued slot and waking the peer's blocked receivers if the ring went
 /// empty→non-empty. The message is already copied in from user memory. On
@@ -521,4 +535,30 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
     // the rank-1 lock).
     drop(g);
     drop(orphans);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mm::test_support::init_global_heap;
+
+    #[test]
+    fn a_send_carrying_the_endpoint_it_delivers_to_is_caught() {
+        init_global_heap();
+        let (a, b) = IpcChannel::try_new_pair(1).unwrap();
+        let a = into_objref_of(a, KObjectType::IpcChannel);
+        let b = into_objref_of(b, KObjectType::IpcChannel);
+        let carrying = |r: &ObjectRef| [Some(TransferRef { obj: r.clone(), rights: Rights::empty() }), None];
+        // SAFETY: `a` and `b` pin the pair for each call.
+        unsafe {
+            assert!(ipc_sends_its_receiver(a.as_ptr(), &carrying(&b)), "a send on `a` delivers to `b`");
+            assert!(!ipc_sends_its_receiver(a.as_ptr(), &carrying(&a)), "`b` holding `a` is no cycle");
+            assert!(ipc_sends_its_receiver(b.as_ptr(), &carrying(&a)));
+        }
+    }
+
+    fn into_objref_of<T>(b: KBox<T>, ty: KObjectType) -> ObjectRef {
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), ty) }
+    }
 }
