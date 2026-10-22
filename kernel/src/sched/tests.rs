@@ -679,6 +679,17 @@ fn a_timer_fires_at_its_deadline_and_not_before() {
     assert!(!unsafe { Timer::in_heap(t.as_ptr()) });
 }
 
+/// A wait can arrive after the tick, if its thread was preempted between arming and waiting.
+#[test]
+fn a_one_shot_timer_fired_with_no_waiter_still_reads_signaled() {
+    init_global_heap();
+    let t = new_timer();
+    let mut st = heap_with(t.as_ptr(), 1_000, 0);
+    fire_expired_deadlines(&mut st, 1_000);
+    // SAFETY: pinned by `t`; single-threaded.
+    assert!(unsafe { Timer::already_signaled(t.as_ptr(), 1_500) });
+}
+
 #[test]
 fn a_periodic_timer_rearms_an_interval_after_the_tick_that_fired_it() {
     init_global_heap();

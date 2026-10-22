@@ -568,7 +568,7 @@ Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT |
 ```rust
 fn sys_timer_set(timer: RawHandle, deadline_ns: u64, interval_ns: u64) -> isize
 ```
-Programs the timer to fire at `deadline_ns` (**absolute** monotonic ns; `0` disarms) and re-fire every `interval_ns` thereafter. `interval_ns` of `0` is one-shot. Returns `0`. (Syscall number `9`; implemented in the wait-queues slice. Deadlines resolve on the periodic scheduler tick, ~10 ms granularity.)
+Programs the timer to fire at `deadline_ns` (**absolute** monotonic ns; `0` disarms) and re-fire every `interval_ns` thereafter. `interval_ns` of `0` is one-shot. **A one-shot timer reads signaled from its deadline until it is set again**, so a `sys_wait` that arrives after the tick still returns at once; a periodic one is signaled at each fire, to the threads then waiting. Returns `0`. (Syscall number `9`; implemented in the wait-queues slice. Deadlines resolve on the periodic scheduler tick, ~10 ms granularity.)
 
 ```rust
 fn sys_notif_recv(queue: RawHandle, out: UserMutPtr<Notification>) -> isize

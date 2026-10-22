@@ -95,6 +95,8 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
     }
     // SAFETY: live Timer, `SCHED` held.
     let interval = unsafe { Timer::interval(timer) };
+    // A one-shot keeps its passed deadline, out of the heap, so a wait that arrives after this
+    // tick still finds it signaled.
     if interval > 0 {
         let next = now.saturating_add(interval);
         // SAFETY: live Timer, `SCHED` held — re-arm the periodic timer.
@@ -113,9 +115,6 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
                 channel: 0,
             },
         );
-    } else {
-        // SAFETY: live Timer, `SCHED` held — one-shot: disarm.
-        unsafe { Timer::set_armed(timer, 0, 0) };
     }
 }
 
