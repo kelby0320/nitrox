@@ -36643,3 +36643,28 @@ each.
   claims not yet checked against `main` (pr365-11, pr365-12). **The laptop's two bugs** — `nxterm`
   painting only when the pointer moves, the Applications menu's search clearing — are Part D's
   still, to be reproduced first.
+
+## 2026-10-22 — Before Phase 7, Part D: group A's fixes change these contracts
+
+The kernel's group of the bash's findings is fixed (PR #391), and its review's answers with it.
+The fixes are in `bug-bash.md`; what a caller can now see differently is here:
+
+- **At most 512 threads** (`sched::MAX_THREADS`), the idle threads aside. A spawn or a
+  `sys_thread_create` past them is `OutOfMemory`. Every list a thread can be on is reserved to
+  hold them all, so a wake, a block, a fault or an exit never meets a full list, which each
+  answered with a panic. A system-wide cap, not a per-process one: that is Part H's quota question.
+- **A channel's queue depth is at most 512**, down from a 1024 that could never be made: a ring is
+  one allocation, and a 1024-slot one is past the buddy's 4 MiB block.
+- **The top page of the user half is never mapped** (`USER_MAP_END`): a `syscall` in its last bytes
+  returns to a non-canonical address, and Intel's `sysretq` faults on that in ring 0.
+- **A spawn image is at most 4 MiB less a page**, refused `TooLarge` past it, since it is copied
+  into one allocation; its `PT_LOAD`s claim 16 MiB at most in all; its entry is in the user half.
+- **A one-shot timer stays signaled once it fires**, until it is set again, so a wait that arrives
+  after the tick returns.
+- **A send refuses a handle listed twice, the endpoint it is for, and an endpoint already holding
+  one** (`InvalidArgument`): endpoints holding each other through their rings are freed by
+  nothing, and the last move of any such cycle is one of these. A cycle through a namespace binding
+  remains, `TODO(ipc-handle-cycles)`; binding needs `BIND_NAMESPACE`.
+- **A spawn's duplicate grant needs `DUPLICATE`** (`NoAccess` without it), as
+  `sys_handle_duplicate` does: `process-spawn-args.md` had asked only `TRANSFER`, against
+  `handle-encoding.md`. No in-tree spawner grants a handle without moving it.

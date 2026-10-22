@@ -15,7 +15,9 @@ needs a `#[panic_handler]`.
 
 The kernel ELF loader (`kernel/src/mm/elf.rs`) accepts only `ET_EXEC`
 (rejects PIE/`ET_DYN`), with no `PT_INTERP`, and page-aligned `PT_LOAD`
-segments (`p_vaddr % PAGE == p_offset % PAGE`), all below `USER_VIRT_END`.
+segments (`p_vaddr % PAGE == p_offset % PAGE`), all below `USER_MAP_END` — a page under
+`USER_VIRT_END`, the top page of the user half never mapped — claiming 16 MiB at most in all,
+with an entry point in the user half, in an image of 4 MiB less a page at most.
 Rust's `x86_64-unknown-none` defaults toward PIE, so the crate forces:
 
 - `.cargo/config.toml` (in the crate dir, so it doesn't affect sibling

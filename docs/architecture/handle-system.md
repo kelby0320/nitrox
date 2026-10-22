@@ -333,7 +333,7 @@ The mechanism, and why it is shaped this way:
 - That sweep **batches**: it unlinks entries under the rank-3 lock, releases
   the lock, then drops that batch's references. Dropping under rank 3 would
   invert the ranking (a destructor takes rank 4/6, and an `IpcChannel`'s takes
-  rank-1 `SCHED` to wake receivers). `close_owned_batch` therefore takes a
+  rank-1 `SCHED` to wake receivers, a `Timer`'s to leave the deadline heap). `close_owned_batch` therefore takes a
   resume cursor and returns `(count, more_remain)`.
 
 Pid reuse is not a hazard: pids are monotonic and never reused, so a sweep

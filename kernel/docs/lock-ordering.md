@@ -532,7 +532,9 @@ context). `IpcChannel::Drop`
 (an endpoint's last handle closing) takes `SCHED` to null the surviving peer's
 back-pointer and wake its receivers — sound because endpoint `ObjectRef`s are
 released only outside `SCHED` (handle close, the `sys_wait`/lookup references),
-never under it, so the destructor's acquire can never nest on a held `SCHED`.
+never under it, so the destructor's acquire can never nest on a held `SCHED`. **`Timer::Drop`
+takes it too**, to leave the deadline heap, and rests on the same rule: no `ObjectRef` of
+either kind is released under `SCHED`.
 
 ## Plain spinlocks are no-preemption regions (2026-07-21, F12)
 
