@@ -10,6 +10,14 @@ const ENDED_PIDS_RESERVE: usize = 64;
 /// Thread id of the reaper — like [`IDLE_TID`], an identity marker, not a real tid.
 const REAPER_TID: u32 = u32::MAX - 1;
 
+/// A list a thread can be on — a run queue, the blocked or suspended list, a reap list — reserved
+/// to hold [`MAX_THREADS`]: every list is made here, so the boot's reserves are the tests'.
+pub(super) fn thread_list() -> Result<KVec<ObjectRef>, AllocError> {
+    let mut list = KVec::new();
+    list.try_reserve(MAX_THREADS)?;
+    Ok(list)
+}
+
 /// Initialise the scheduler, adopting the running boot context as the first (current)
 /// thread so the first [`context_switch`] has a valid slot to save into. Must run once,
 /// after the allocators and paging are up and before any [`spawn`]/[`yield_now`].
@@ -20,14 +28,7 @@ pub fn init() -> Result<(), AllocError> {
 
     // Build the pre-reserved queues and heap OUTSIDE the lock (the only growth); blocking and
     // timer arming stay within these reserves.
-    let mut ready: KVec<ObjectRef> = KVec::new();
-    ready.try_reserve(READY_RESERVE)?;
-    let mut blocked: KVec<ObjectRef> = KVec::new();
-    blocked.try_reserve(BLOCKED_RESERVE)?;
-    let mut suspended: KVec<ObjectRef> = KVec::new();
-    suspended.try_reserve(BLOCKED_RESERVE)?;
-    let mut reap: KVec<ObjectRef> = KVec::new();
-    reap.try_reserve(REAP_RESERVE)?;
+    let (ready, blocked, suspended, reap) = (thread_list()?, thread_list()?, thread_list()?, thread_list()?);
     let mut deadlines: KVec<deadline::Entry> = KVec::new();
     deadlines.try_reserve(deadline::HEAP_RESERVE)?;
     let mut deferred_drops: KVec<ObjectRef> = KVec::new();
@@ -101,10 +102,7 @@ pub fn ap_init() -> Result<(), AllocError> {
     let idle_addr = idle_ref.as_ptr() as usize;
     // Reserved outside the lock so neither `finish_exit`'s reap push nor a placement onto
     // this CPU allocates under `SCHED`.
-    let mut reap: KVec<ObjectRef> = KVec::new();
-    reap.try_reserve(REAP_RESERVE)?;
-    let mut ready: KVec<ObjectRef> = KVec::new();
-    ready.try_reserve(READY_RESERVE)?;
+    let (reap, ready) = (thread_list()?, thread_list()?);
 
     let mut g = SCHED.lock();
     *g.cur_slot() = Some(boot_ref);

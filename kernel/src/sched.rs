@@ -81,14 +81,12 @@ pub use wait::*;
 // `crate::arch::Timer::read_ns()` (the `ArchTimer` trait provides `read_ns`).
 
 /// The most threads the scheduler holds at once, the idle threads aside: a spawn past it is
-/// refused. **Every list a thread can be on is reserved to hold this many**, and a thread is
-/// on one at a time, so a wake, a block, a fault or an exit never finds its list full — none
-/// of them can refuse, and growing a list under the rank-1 lock is an allocation.
+/// refused. **Every list a thread can be on is reserved to hold this many** ([`thread_list`]):
+/// a run queue, since affinity can pin every thread to one CPU, and a reap list, since an exit
+/// sweeps a whole process into one. A thread is on one list at a time, so a wake, a block, a
+/// fault or an exit never finds its list full — none of them can refuse, and growing a list
+/// under the rank-1 lock is an allocation.
 const MAX_THREADS: usize = 512;
-
-/// Per-CPU run-queue capacity, reserved once at [`init`]/[`ap_init`]: every thread, since
-/// affinity can pin them all to one CPU.
-const READY_RESERVE: usize = MAX_THREADS;
 
 /// Periodic scheduler tick: 10 ms (100 Hz), matching the PIT calibration window.
 pub const TICK_NS: u64 = 10_000_000;
@@ -99,14 +97,6 @@ const QUANTUM_TICKS: u32 = 1;
 /// Thread id for the idle thread, a sentinel outside the `next_tid` range. Idle identity is
 /// by object address (`SchedState::idle_addr`).
 const IDLE_TID: u32 = u32::MAX;
-
-/// Pre-reserved capacity for the blocked-thread parking list, and the suspended one: every
-/// thread, since all of them can wait or fault at once.
-const BLOCKED_RESERVE: usize = MAX_THREADS;
-
-/// Per-CPU reap-list capacity: every thread, since `exit_process` sweeps all of a process's
-/// threads into the exiting CPU's list in one lock hold.
-const REAP_RESERVE: usize = MAX_THREADS;
 
 /// Pre-reserved capacity for [`SchedState::deferred_drops`]. Sized to twice the only
 /// producer's burst (the entropy seed wake parks ≤ [`crate::entropy::SEED_WAITERS_MAX`]
@@ -219,7 +209,7 @@ struct SchedState {
     /// each entry holds one refcount on its `Thread`, keeping it and its kernel stack alive
     /// while queued. A preempted thread re-homes to **its own** CPU's queue; movement
     /// happens only via placement (spawn/wake) and stealing. Pre-reserved per CPU (see
-    /// [`READY_RESERVE`]), all under the one `SCHED` lock.
+    /// [`MAX_THREADS`]), all under the one `SCHED` lock.
     ready: [KVec<ObjectRef>; MAX_CPUS],
     /// Which CPUs' scheduler state is initialized (and whose queues are reserved). The BSP
     /// sets bit 0 in [`init`]; each AP sets its own in [`ap_init`] in the same critical
@@ -235,11 +225,11 @@ struct SchedState {
     /// on its stack at exit) and never cross-CPU: a thread parks itself here and then
     /// `switch_into`s off its stack, so freeing it from another CPU mid-switch would be a
     /// use-after-free. A **list** so a process exit can reap its siblings alongside the
-    /// caller. Pre-reserved per CPU (see [`REAP_RESERVE`]).
+    /// caller. Pre-reserved per CPU (see [`MAX_THREADS`]).
     reap: [KVec<ObjectRef>; MAX_CPUS],
     /// Threads suspended after a ring-3 fault, off the run queue with their `ExceptionFrame`
     /// on their kernel stacks. `sys_exception_resume` moves one back to `ready` or marks it
-    /// for termination. Pre-reserved (see [`BLOCKED_RESERVE`]).
+    /// for termination. Pre-reserved (see [`MAX_THREADS`]).
     suspended: KVec<ObjectRef>,
     /// Monotonic thread-id source.
     next_tid: u32,
@@ -261,7 +251,7 @@ struct SchedState {
     /// while idle runs). A `usize` so `SchedState` stays `Send`.
     idle_addr: [usize; MAX_CPUS],
     /// Threads blocked in `sys_wait`, off the run queue, each holding one refcount on its
-    /// `Thread`. Pre-reserved (see [`BLOCKED_RESERVE`]).
+    /// `Thread`. Pre-reserved (see [`MAX_THREADS`]).
     blocked: KVec<ObjectRef>,
     /// The deadline min-heap, drained on each tick. Pre-reserved (see [`deadline::HEAP_RESERVE`]).
     deadlines: KVec<deadline::Entry>,

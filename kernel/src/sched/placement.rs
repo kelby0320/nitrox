@@ -106,7 +106,7 @@ pub(super) fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usiz
     let mask = unsafe { Thread::cpu_mask(obj) };
     let mut best = usize::MAX;
     let mut best_len = usize::MAX;
-    // The same scan ignoring affinity, for the fallback below: a queue at `READY_RESERVE`
+    // The same scan ignoring affinity, for the fallback below: a full queue
     // makes `place_thread` return `Err`, which both wake callers turn into a `panic!`, so the
     // fallback must be least-loaded too.
     let mut spare = usize::MAX;
