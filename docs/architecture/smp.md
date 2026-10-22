@@ -286,9 +286,11 @@ spinlock (never an IRQ handler/DPC — frees, the only initiators, are already
 forbidden there).
 
 **Map-side installs are not shot down** (adding a
-mapping needs no cross-core invalidation on x86; the vmap PDPT is pre-allocated so
-intermediate structures are already present) — matching Linux, which shoots down
-only on unmap / permission-restrict.
+mapping needs no cross-core invalidation on x86; the vmap PDPT is pre-allocated) —
+matching Linux, which shoots down only on unmap / permission-restrict. **The tables
+below the PDPT are made on demand, under no lock**, as stacks are mapped: a slot is
+linked by compare-and-swap, so two cores mapping stacks in one fresh 2 MiB region
+share one table, the loser's going back (`ensure_table`).
 
 Broadcast-to-all is correct but unoptimized; per-`AddressSpace` `active_cpus`
 (target only cores holding the root) is deferred (§Deferred).
