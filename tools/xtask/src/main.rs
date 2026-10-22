@@ -172,12 +172,21 @@ const BOB_NEW_PASSWORD: &str = "bob's second password";
 const BOB_MISTYPED_PASSWORD: &str = "bob's second pasword";
 /// The wrong password `test-interactive` types at the login prompt, before the right one.
 const LOGIN_WRONG_PASSWORD: &str = "wrong-password";
+/// Typed at the password prompt after a `Ctrl-C` at `nitrox login:`.
+const AFTER_INTERRUPT_PASSWORD: &str = "after-interrupt";
 /// The wrong password it types at `with`'s prompt, in step 20b.
 const WITH_WRONG_PASSWORD: &str = "not-the-password-4271";
 /// **Every password `test-interactive` types**, none of which may appear in what the guest prints:
 /// each is typed with echo off, and a copy on the console is a copy in every log.
-const TYPED_PASSWORDS: &[&str] =
-    &[DEMO_PASSWORD, LOGIN_WRONG_PASSWORD, WITH_WRONG_PASSWORD, BOB_PASSWORD, BOB_NEW_PASSWORD, BOB_MISTYPED_PASSWORD];
+const TYPED_PASSWORDS: &[&str] = &[
+    DEMO_PASSWORD,
+    LOGIN_WRONG_PASSWORD,
+    AFTER_INTERRUPT_PASSWORD,
+    WITH_WRONG_PASSWORD,
+    BOB_PASSWORD,
+    BOB_NEW_PASSWORD,
+    BOB_MISTYPED_PASSWORD,
+];
 
 /// The greeter's window, `GREETER_W`×`GREETER_H`: **this file's own copy** of
 /// `desktop-session-mgr`'s pair, which `the_gates_greeter_size_is_the_greeters_own` reads out of

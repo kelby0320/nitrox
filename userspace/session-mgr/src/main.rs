@@ -30,6 +30,8 @@ static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut RECV_COUNT: usize = 0;
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
+/// The request id the last tty request was sent with: each its own, so its reply is told apart.
+static mut TTY_RID: u64 = 0;
 
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
@@ -335,9 +337,14 @@ fn tty_open(root_ns: u64) -> u64 {
 /// Send one tty request and wait for its reply. Returns the reply body length written into
 /// `out` (`0` for the acknowledgement-only ops), or `None` on any failure.
 fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
+    // SAFETY: single-threaded; each request takes the next id.
+    let rid = unsafe {
+        TTY_RID += 1;
+        TTY_RID
+    };
     // SAFETY: SEND_MSG is a valid buffer; the rsproto message goes at offset 24.
     let sent = unsafe {
-        let rs_len = encode(&mut SEND_MSG[PAYLOAD_OFF..], op, 1, 0, body, 0)?;
+        let rs_len = encode(&mut SEND_MSG[PAYLOAD_OFF..], op, rid, 0, body, 0)?;
         SEND_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         SEND_MSG[8] = 0;
         syscall5(
@@ -349,36 +356,46 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
             SENDMODE_NOBLOCK,
         ) == 0
     };
-    if !sent || !wait_one(ch) {
+    if !sent {
         return None;
     }
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        return None;
-    }
-    // SAFETY: bounded read-only slice over the reply.
-    unsafe {
-        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let rep = core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
+    loop {
+        if !wait_one(ch) {
+            return None;
+        }
+        // SAFETY: valid recv out-params.
+        let rr = unsafe {
+            syscall4(
+                SYS_CHANNEL_RECV,
+                ch,
+                (&raw mut RECV_MSG) as u64,
+                (&raw mut RECV_HANDLES) as u64,
+                (&raw mut RECV_COUNT) as u64,
+            )
+        };
+        if rr != 0 {
+            return None;
+        }
+        // SAFETY: bounded read-only slice over the reply.
+        let rep = unsafe {
+            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            core::slice::from_raw_parts(
+                ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+                payload_len.min(MSG_LEN - PAYLOAD_OFF),
+            )
+        };
         let m = decode(rep).ok()?;
+        // **Not this request's**: `tty-server`'s unsolicited `INTERRUPT` after a Ctrl-C, request id
+        // 0. Taken as the reply, it left every later request reading the one before's.
+        if m.request_id != rid {
+            continue;
+        }
         if m.op != op || m.is_error() {
             return None;
         }
         let n = m.body.len().min(out.len());
         out[..n].copy_from_slice(&m.body[..n]);
-        Some(n)
+        return Some(n);
     }
 }
 

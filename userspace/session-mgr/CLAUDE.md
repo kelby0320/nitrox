@@ -64,6 +64,11 @@ is the 2026-07-31 `logging-service` bug, found from a hung shell three subsystem
   session namespaces) and no more. It spawns the user shell with **empty syscaps** and
   a namespace naming only that session's resources — the sandbox is the namespace's
   *contents*, not a permission check.
+- **A tty reply is matched by its request id**, each request's its own (`tty_request`).
+  `tty-server` sends an unsolicited `INTERRUPT`, request id 0, at a Ctrl-C. Taken for a read's
+  reply, it left every later request reading the one before's, with echo back on under the
+  password's read. `test-interactive` presses Ctrl-C at `nitrox login:` and finds the next
+  password echoed if it is not.
 - **Never trust or store a password.** It forwards the console-entered password to
   auth-service once (over the auth channel) and does not keep it; the DB + hashing are
   auth-service's, never session-mgr's.
