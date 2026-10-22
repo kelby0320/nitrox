@@ -1018,9 +1018,22 @@ impl Broker {
         };
         let what = alloc::format!("{principal} {} {}", p.view, p.program);
         if ok {
-            let State::Password(p) = core::mem::replace(&mut self.clients[i].state, State::Idle) else {
+            let State::Password(mut p) = core::mem::replace(&mut self.clients[i].state, State::Idle) else {
                 return;
             };
+            // **Decided again**, since the password can come long after the request: a policy
+            // installed meanwhile must not be outrun. Allowed with other grants is asked again.
+            let decided = self.read_policy().and_then(|policy| match policy.decide(&principal, &p.view, &p.program) {
+                Decision::Allow { profile, .. } if profile.grants == p.grants => Ok(()),
+                Decision::Allow { .. } => Err(String::from("the view's grants changed while its password was asked")),
+                Decision::Deny(reason) => Err(reason),
+            });
+            if let Err(reason) = decided {
+                p.handles.close();
+                self.clients[i].state = State::Done;
+                self.audit(&alloc::format!("view: {what} — denied when its password came: {reason}"));
+                return reply_outcome(ch, OP_VIEWS_PASSWORD, request_id, Outcome::Denied { retry: false }, &reason);
+            }
             // Remembered for the terminal it was typed at, and for this view.
             if let (Some(b), Some(s)) = (p.backend, self.sessions.get_mut(session)) {
                 s.grace.remember(b, &p.view, now_ns());

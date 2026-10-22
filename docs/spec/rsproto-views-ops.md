@@ -126,7 +126,10 @@ A channel carries one request.
 ### `Password` (`0x0E03`) — client
 
 Request: the password's bytes. Reply: `Started`, or `Denied` with `retry` set while the request
-has failures left. **The broker holds the check** until the session's delay from its last failure
+has failures left. **A right password is not the decision**. The policy is read and decided again
+then, since a password can come long after its request. The program starts only if the policy
+still allows it with the same grants. Otherwise the reply is `Denied`, without `retry`, with the
+reason: the rule gone, or the view's grants changed, and the person asks again. **The broker holds the check** until the session's delay from its last failure
 has passed — on whichever request that failure was, **and whenever the check arrived**: passwords
 waiting on several requests are checked oldest first, one at a time, and a failure holds the rest
 (`view_broker::pacing::Held`). So a session makes at most one guess per delay however many

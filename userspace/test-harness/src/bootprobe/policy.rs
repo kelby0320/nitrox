@@ -315,8 +315,10 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
 /// - **Two policies no existing account could administer are refused**, by `Check` and by
 ///   `Install` alike, and the file stays as it was: one whose `admin` profile has lost `views`,
 ///   and one naming only an account that does not exist.
-/// - A policy with one more view is installed, `Show` and the device hold it, and `List` names the
-///   new view. The original is then installed again.
+/// - A policy with three more views is installed, `Show` and the device hold it, and `List` names
+///   one. Requests for the other two wait for a password while a policy without the first and with
+///   the second granting more is installed. Each password, though right, is refused: one rule is
+///   gone, and the other's view grants something else. Then the original goes back.
 /// - A closed session's policy channel is closed with it, and a session that is not open has no
 ///   policy endpoint.
 pub(super) fn policy_test(root_ns: u64) -> bool {
@@ -425,6 +427,18 @@ pub(super) fn policy_test(root_ns: u64) -> bool {
 
     let mut more = original.clone();
     more.extend_from_slice(b"\n[profile.d2probe]\ngrants = []\n\n[[rule]]\nwho = [\"alice\"]\nuse = [\"d2probe\"]\nrun = [\"nxsh\"]\nauth = \"none\"\n");
+    let d4 = |grants: &[u8]| {
+        let mut s = alloc::vec::Vec::from(&b"\n[profile.d4probe]\ngrants = ["[..]);
+        s.extend_from_slice(grants);
+        s.extend_from_slice(
+            b"]\n\n[[rule]]\nwho = [\"alice\"]\nuse = [\"d4probe\"]\nrun = [\"test-stage\"]\nauth = \"password\"\n",
+        );
+        s
+    };
+    let mut changed = original.clone();
+    changed.extend_from_slice(&d4(b"\"power\""));
+    more.extend_from_slice(b"\n[profile.d3probe]\ngrants = []\n\n[[rule]]\nwho = [\"alice\"]\nuse = [\"d3probe\"]\nrun = [\"test-stage\"]\nauth = \"password\"\n");
+    more.extend_from_slice(&d4(b""));
     if outcome_of(ask(pol, OP_VIEWS_INSTALL, &more)).map(|o| o.0) != Some(true) {
         return finish(fail(b"a policy with one more view was not installed"));
     }
@@ -441,6 +455,40 @@ pub(super) fn policy_test(root_ns: u64) -> bool {
     };
     if !lists(ask(cli, OP_VIEWS_LIST, &[]), b"d2probe") {
         return finish(fail(b"List does not name the installed view"));
+    }
+    // Two requests the installed policy allows, waiting for their passwords across the install of
+    // `changed`, which drops `d3probe` and has `d4probe` grant `power`.
+    let outcome = |r: Option<(bool, alloc::vec::Vec<u8>)>| {
+        r.filter(|(err, _)| !err).and_then(|(_, b)| parse_outcome(&b).map(|(o, _)| o))
+    };
+    let wait_for_password = |view: &[u8]| {
+        let (sw, waiting) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{session}").as_bytes(), chan);
+        // SAFETY: a namespace handle this process holds.
+        let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+        let mut req = [0u8; 128];
+        let asked = match build_request(&mut req, 0, view, b"test-stage", &[], b"", None) {
+            Some(n) if sw == 0 && waiting != 0 && copy > 0 => {
+                let sent = &[copy as u64];
+                outcome(views_call(waiting, OP_VIEWS_REQUEST, 1, &req[..n], sent, &mut alloc::vec::Vec::new()))
+            }
+            _ => None,
+        };
+        (asked == Some(Outcome::NeedPassword)).then_some(waiting).ok_or(waiting)
+    };
+    let (Ok(gone), Ok(regranted)) = (wait_for_password(b"d3probe"), wait_for_password(b"d4probe")) else {
+        return finish(fail(b"two requests the installed policy allows did not wait for a password"));
+    };
+    if outcome_of(ask(pol, OP_VIEWS_INSTALL, &changed)).map(|o| o.0) != Some(true) {
+        return finish(fail(b"the policy without d3probe was not installed"));
+    }
+    for (waiting, what) in [(gone, &b"whose rule is gone"[..]), (regranted, b"whose view grants more")] {
+        let answered =
+            outcome(views_call(waiting, OP_VIEWS_PASSWORD, 2, DEMO_PASSWORD, &[], &mut alloc::vec::Vec::new()));
+        close(waiting);
+        if answered != Some(Outcome::Denied { retry: false }) {
+            Line::new().s(b"boot-probe: policy: the request ").s(what).s(b" was started").end();
+            return finish(fail(b"a password started a request the policy no longer allows as asked"));
+        }
     }
 
     if outcome_of(ask(pol, OP_VIEWS_INSTALL, &original)).map(|o| o.0) != Some(true)
@@ -460,6 +508,6 @@ pub(super) fn policy_test(root_ns: u64) -> bool {
     if answered {
         return fail(b"a closed session's policy channel still answered");
     }
-    kprint(b"boot-probe: policy: Show is the device's file; a policy with no views administrator and one naming no account refused by Check and Install; one more view installed, listed, and put back; a closed session's channel closed ok\n");
+    kprint(b"boot-probe: policy: Show is the device's file; a policy with no views administrator and one naming no account refused by Check and Install; views installed, one listed, two requests waiting for a password refused once one rule was gone and one view granted more, the original put back; a closed session's channel closed ok\n");
     true
 }
