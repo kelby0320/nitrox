@@ -124,6 +124,9 @@ fn a_one_shot_timer_fired_with_no_waiter_still_reads_signaled() {
     fire_expired_deadlines(&mut st, 1_000);
     // SAFETY: pinned by `t`; single-threaded.
     assert!(unsafe { Timer::already_signaled(t.as_ptr(), 1_500) });
+    // A waiter on another CPU read the clock before this tick, and took `SCHED` after it.
+    // SAFETY: as above.
+    assert!(unsafe { Timer::already_signaled(t.as_ptr(), 999) }, "a clock read before the fire");
 }
 
 #[test]
