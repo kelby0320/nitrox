@@ -161,6 +161,9 @@ pub enum SendOutcome {
     Full,
     /// The peer endpoint has closed.
     PeerClosed,
+    /// Refused: it carries the endpoint it is for, or an endpoint holding one, and could leave
+    /// endpoints holding each other, which nothing frees. Only the syscall's sends check.
+    Cycle,
 }
 
 /// Outcome of a blocking send ([`send_or_queue`](IpcChannel::send_or_queue)): a full ring means
@@ -176,6 +179,8 @@ pub enum BlockSendOutcome {
     PendingFull,
     /// The peer endpoint has closed.
     PeerClosed,
+    /// Refused, as [`SendOutcome::Cycle`].
+    Cycle,
 }
 
 /// A blocking send held in a receiving endpoint's pending-send queue: the message, its
@@ -338,6 +343,20 @@ impl IpcChannel {
     pub(crate) unsafe fn set_us_reg(obj: *mut (), reg: *mut ()) {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.us_reg = reg;
+    }
+
+    /// `true` iff this endpoint's receive side holds an endpoint, in a queued message or a held
+    /// send. A popped slot's transfers are taken, so every slot can be read.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn holds_an_endpoint(obj: *mut ()) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
+        let inner = unsafe { Self::inner(obj) };
+        let endpoint =
+            |t: &Option<TransferRef>| t.as_ref().is_some_and(|t| t.obj.object_type() == KObjectType::IpcChannel);
+        inner.recv.slots.iter().any(|s| s.transfers.iter().any(endpoint))
+            || inner.pending_sends.iter().any(|p| p.transfers.iter().any(endpoint))
     }
 
     /// The owning [`UserspaceServerReg`](crate::object::UserspaceServerReg)

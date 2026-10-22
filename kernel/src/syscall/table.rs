@@ -1942,10 +1942,6 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
         let t = global::get().lookup(h, pid, Rights::TRANSFER).map_err(map_handle_err)?;
         transfers[i] = Some(TransferRef { obj: t.object, rights: t.rights });
     }
-    // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-    if unsafe { crate::sched::ipc_sends_its_receiver(ok.object.as_ptr(), &transfers) } {
-        return Err(KError::InvalidArgument);
-    }
 
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
     // in place — a stack temporary here would be 4 KiB on every send.
@@ -1988,6 +1984,7 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
                 }
                 SendOutcome::Full => Err(KError::WouldBlock),
                 SendOutcome::PeerClosed => Err(KError::PeerClosed),
+                SendOutcome::Cycle => Err(KError::InvalidArgument),
             }
         }
         // Returns a `PendingOperation` that completes on delivery; the message is committed
@@ -2026,6 +2023,10 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
                 BlockSendOutcome::PeerClosed => {
                     drop(po_ref);
                     Err(KError::PeerClosed)
+                }
+                BlockSendOutcome::Cycle => {
+                    drop(po_ref);
+                    Err(KError::InvalidArgument)
                 }
             }
         }

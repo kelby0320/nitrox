@@ -2,18 +2,25 @@
 
 use super::*;
 
-/// Whether `transfers` holds the endpoint a send on `endpoint` delivers to: it would hold a
-/// reference to itself in its own ring, and never be freed. A cycle through two channels is not
-/// caught: TODO(ipc-handle-cycles).
+/// Whether a send on `endpoint` carrying `transfers` could close a cycle of endpoints holding
+/// each other through their rings, which nothing would free: it carries the endpoint it is for,
+/// or one already holding an endpoint, as the last move of every such cycle must. A cycle
+/// through a namespace binding is not caught: TODO(ipc-handle-cycles).
 ///
 /// # Safety
 ///
-/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
-pub unsafe fn ipc_sends_its_receiver(endpoint: *mut (), transfers: &[Option<TransferRef>]) -> bool {
-    let _g = SCHED.lock();
-    // SAFETY: the caller pins `endpoint`; `SCHED` held. A peer only ever turns null.
+/// `endpoint` is a live `IpcChannel` the caller pins; the caller holds `SCHED`.
+unsafe fn closes_a_cycle(endpoint: *mut (), transfers: &[Option<TransferRef>]) -> bool {
+    if transfers.iter().all(Option::is_none) {
+        return false;
+    }
+    // SAFETY: the caller's contract. A peer only ever turns null.
     let peer = unsafe { IpcChannel::peer_of(endpoint) };
-    transfers.iter().flatten().any(|t| t.obj.as_ptr() == peer)
+    transfers.iter().flatten().any(|t| {
+        let ep = t.obj.as_ptr();
+        // SAFETY: an `IpcChannel` the transfer pins; `SCHED` held.
+        ep == peer || (t.obj.object_type() == KObjectType::IpcChannel && unsafe { IpcChannel::holds_an_endpoint(ep) })
+    })
 }
 
 /// Send `msg` from `endpoint` into its peer's receive ring under `SCHED`, **moving** any
@@ -32,6 +39,10 @@ pub unsafe fn ipc_send_push(
 ) -> SendOutcome {
     let mut g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
+    if unsafe { closes_a_cycle(endpoint, transfers) } {
+        return SendOutcome::Cycle;
+    }
+    // SAFETY: as above.
     let outcome = unsafe { IpcChannel::send_push(endpoint, msg, transfers) };
     if let SendOutcome::Sent { woke_edge: true } = outcome {
         // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
@@ -84,7 +95,7 @@ pub unsafe fn us_forward_notify(reg: *mut (), msg: &mut StoredMsg) -> bool {
             }
             true
         }
-        SendOutcome::Full | SendOutcome::PeerClosed => false,
+        SendOutcome::Full | SendOutcome::PeerClosed | SendOutcome::Cycle => false,
     }
 }
 
@@ -134,7 +145,7 @@ pub unsafe fn us_forward_originate(
             }
             ForwardOutcome::Pending
         }
-        SendOutcome::Full | SendOutcome::PeerClosed => {
+        SendOutcome::Full | SendOutcome::PeerClosed | SendOutcome::Cycle => {
             // Roll back the reserved slot; drop its `po` clone **outside** `SCHED`.
             // SAFETY: `reg` live, `SCHED` held.
             let pl = unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) };
@@ -188,7 +199,7 @@ pub unsafe fn us_forward_originate_fill(
             }
             ForwardOutcome::Pending
         }
-        SendOutcome::Full | SendOutcome::PeerClosed => {
+        SendOutcome::Full | SendOutcome::PeerClosed | SendOutcome::Cycle => {
             // Roll back the reserved slot; drop the fill's clones **outside** `SCHED`.
             // SAFETY: `reg` live, `SCHED` held.
             let pf = unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) };
@@ -370,6 +381,10 @@ pub unsafe fn ipc_send_push_blocking(
 ) -> BlockSendOutcome {
     let mut g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning `endpoint` and `po`; `SCHED` held.
+    if unsafe { closes_a_cycle(endpoint, transfers) } {
+        return BlockSendOutcome::Cycle;
+    }
+    // SAFETY: as above.
     let outcome = unsafe { IpcChannel::send_or_queue(endpoint, msg, transfers, po) };
     match outcome {
         BlockSendOutcome::Sent { woke_edge } => {
@@ -541,24 +556,58 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
+    use crate::object::header::test_probe;
 
-    #[test]
-    fn a_send_carrying_the_endpoint_it_delivers_to_is_caught() {
-        init_global_heap();
-        let (a, b) = IpcChannel::try_new_pair(1).unwrap();
-        let a = into_objref_of(a, KObjectType::IpcChannel);
-        let b = into_objref_of(b, KObjectType::IpcChannel);
-        let carrying = |r: &ObjectRef| [Some(TransferRef { obj: r.clone(), rights: Rights::empty() }), None];
-        // SAFETY: `a` and `b` pin the pair for each call.
-        unsafe {
-            assert!(ipc_sends_its_receiver(a.as_ptr(), &carrying(&b)), "a send on `a` delivers to `b`");
-            assert!(!ipc_sends_its_receiver(a.as_ptr(), &carrying(&a)), "`b` holding `a` is no cycle");
-            assert!(ipc_sends_its_receiver(b.as_ptr(), &carrying(&a)));
-        }
-    }
-
-    fn into_objref_of<T>(b: KBox<T>, ty: KObjectType) -> ObjectRef {
+    fn adopt<T>(b: KBox<T>, ty: KObjectType) -> ObjectRef {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), ty) }
+    }
+
+    fn pair() -> (ObjectRef, ObjectRef) {
+        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+        (adopt(a, KObjectType::IpcChannel), adopt(b, KObjectType::IpcChannel))
+    }
+
+    fn carrying(r: &ObjectRef) -> [Option<TransferRef>; IPC_HANDLE_MAX] {
+        core::array::from_fn(|i| (i == 0).then(|| TransferRef { obj: r.clone(), rights: Rights::empty() }))
+    }
+
+    /// The last move of any cycle of endpoints holding each other carries an endpoint already
+    /// holding one, or the endpoint it is for.
+    #[test]
+    fn a_send_that_could_close_a_cycle_of_endpoints_is_refused() {
+        init_global_heap();
+        test_probe::reset();
+        // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value.
+        let msg = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.unwrap();
+        let ((a, b), (c, d)) = (pair(), pair());
+        let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+        // SAFETY: every endpoint and the PO are pinned by the test's references.
+        unsafe {
+            assert_eq!(ipc_send_push(a.as_ptr(), &msg, &mut carrying(&b)), SendOutcome::Cycle, "B into its own ring");
+            assert!(matches!(ipc_send_push(c.as_ptr(), &msg, &mut carrying(&b)), SendOutcome::Sent { .. }));
+            assert_eq!(ipc_send_push(a.as_ptr(), &msg, &mut carrying(&d)), SendOutcome::Cycle, "D, holding B");
+            let blocking = ipc_send_push_blocking(a.as_ptr(), &msg, &mut carrying(&d), &po, u64::MAX);
+            assert_eq!(blocking, BlockSendOutcome::Cycle);
+        }
+        drop((a, b, c, d));
+        assert_eq!(test_probe::ipc_channel_destroys(), 4, "an endpoint left holding another");
+    }
+
+    #[test]
+    fn an_endpoint_holding_another_in_a_held_send_is_refused_too() {
+        init_global_heap();
+        // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value.
+        let msg = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.unwrap();
+        let ((a, b), (c, d)) = (pair(), pair());
+        let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+        let mut none: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        // SAFETY: every endpoint and the PO are pinned by the test's references.
+        unsafe {
+            while matches!(ipc_send_push(c.as_ptr(), &msg, &mut none), SendOutcome::Sent { .. }) {}
+            let held = ipc_send_push_blocking(c.as_ptr(), &msg, &mut carrying(&b), &po, u64::MAX);
+            assert_eq!(held, BlockSendOutcome::Queued, "D's ring is full: B waits in its held sends");
+            assert_eq!(ipc_send_push(a.as_ptr(), &msg, &mut carrying(&d)), SendOutcome::Cycle);
+        }
     }
 }
