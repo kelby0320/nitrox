@@ -4,7 +4,8 @@
 its two re-runs and what PR #365's trials left: 154 findings, 129 once a defect several runs found
 is one, 68 to fix in Part D, 60 later (4 in Part E, 56 in Part H) and 1 not. Untriaged: the five
 found before the bash, and the trials' test gaps and doc claims not yet checked (pr365-11,
-pr365-12).** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
+pr365-12). Group A fixed 2026-10-22, with sched-7 and kobj-9 from groups E and B and the test
+gaps that ride with them; sched-10 stays open for one mutation.** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
 laptop, what PR #365's two trial reviews found that `main` still has, and each `/bug-bash` run, a
 section a subsystem.
 
@@ -109,7 +110,7 @@ One flake on a branch that changed only the shell and `rename`, in a path it doe
 Lenses: logic, error-paths, trust-boundary, tests, architecture; returned nothing: none.
 Found 24, refuted by a boot 0, reported 13.
 
-- [ ] **kobj-1** `kernel/src/object/timer.rs:206` — Dropping a Timer never removes its deadline-heap
+- [x] **kobj-1** `kernel/src/object/timer.rs:206` — Dropping a Timer never removes its deadline-heap
   entry, so the entry dangles. `Timer::drop` only asserts that no waiters remain, and
   `dispatch_destroy` just frees the box. The heap entry is a raw address, not an ObjectRef. A
   process calls `sys_timer_create` and `sys_timer_set(h, now+X, interval)`, then
@@ -120,6 +121,8 @@ Found 24, refuted by a boot 0, reported 13.
   reused the slot, and firing the stale entry at now=200 disarmed it (its deadline went
   1_000_000 -> 0). The close and exit paths remove only `DeadlineKind::Thread` entries. logic,
   architecture. High. **Fix.**
+  Fixed in `fcc06ce8`; fails without it:
+  `a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it`.
 - [ ] **kobj-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` keeps the
   transferred DeviceNode's object and discards its rights (`tr.rights` is never read).
   `FileObject::writeback` then issues Write IRPs to that device with no rights check. The only
@@ -133,7 +136,7 @@ Found 24, refuted by a boot 0, reported 13.
   returned status 0, and the handle carried MAP_READ|MAP_WRITE. After `writeback`, the recording
   device saw a Write at offset 503808 (LBA 123), length 4096. error-paths also read the path;
   its own probe did not run. logic, error-paths, trust-boundary. High. **Fix.**
-- [ ] **kobj-3** `kernel/src/object/ipc_channel.rs:99` — An allocation over the buddy allocator's
+- [x] **kobj-3** `kernel/src/object/ipc_channel.rs:99` — An allocation over the buddy allocator's
   4 MiB MAX_ORDER block, reachable from user input, trips `debug_assert!(order <= MAX_ORDER)`
   (buddy.rs:163) and panics the kernel. xtask builds the kernel with plain `cargo build`
   (dev profile), so debug assertions are on in every boot, the release image included. Any
@@ -146,13 +149,21 @@ Found 24, refuted by a boot 0, reported 13.
   `try_new_pair(1024)` panicked with 'buddy: alloc order 11 > MAX_ORDER', and `try_new_pair(900)`
   was fine. A 5 MiB spawn image panicked and a 3 MiB one was fine. The FILE_BLOCKS case was read,
   not run. architecture. High. **Fix.**
-- [ ] **kobj-4** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE`
+  Fixed in `e56c6612`; fails without it: `an_order_past_the_largest_block_is_refused`,
+  `a_large_alloc_past_the_largest_block_is_refused`,
+  `copying_an_image_past_the_largest_block_is_refused`,
+  `a_file_blocks_header_claiming_more_runs_than_its_body_holds_is_refused` and
+  `a_block_map_the_page_cache_cannot_use_is_refused`; the channel depth falls to 512, the deepest
+  whose ring fits.
+- [x] **kobj-4** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE`
   without a checked add. `load_elf` only checks `e_phoff + i*56`, so an `e_phoff` within 56
   bytes of `u64::MAX` overflows, and with overflow-checks on in the dev profile the kernel
   panics. Any process passes a MemoryObject, or a file it can map, holding a valid ELF64 header
   with `e_phnum`=1, `e_phentsize`=56 and `e_phoff`=`u64::MAX-8` as `SpawnArgs.image` to
   `sys_process_spawn`. Demonstrated: a host probe with those header bytes panicked with
   'attempt to add with overflow' at elf.rs:182:22. logic. High. **Fix.**
+  Fixed in `badc91cd`; fails without it:
+  `a_program_header_offset_at_the_top_of_the_range_is_truncated`.
 - [ ] **kobj-5** `kernel/src/syscall/table.rs:2160` — A forwarded-resolve reply installs its
   handle into `pl.owner_pid` without checking the process still exists, and the comment at 2164
   ('A dead caller pid takes this path — fails cleanly') is false: `HandleTable::allocate` has no
@@ -168,7 +179,7 @@ Found 24, refuted by a boot 0, reported 13.
   a reply gave status 0 with a live handle, and `cache_objects().len()` was 1. A swept-pid
   `allocate` also succeeded. The real race against the reaper was not booted. logic,
   error-paths, trust-boundary, architecture. Medium. **Fix.**
-- [ ] **kobj-6** `kernel/src/object/ipc_channel.rs:366` — An endpoint sent over its own channel
+- [x] **kobj-6** `kernel/src/object/ipc_channel.rs:366` — An endpoint sent over its own channel
   keeps a reference to itself in its own receive ring, so it is never freed. `sys_channel_send`
   (table.rs:1934-1937) checks only TRANSFER on each handle and does not refuse the channel's own
   endpoint. A process calls `sys_channel_create(depth=1024)` for A and B, then
@@ -178,6 +189,8 @@ Found 24, refuted by a boot 0, reported 13.
   from short-lived processes exhausts kernel memory. Demonstrated: a host probe pushed
   `send_push(a, msg, [b])` and dropped both creation references. It asserted two destroys and
   got 1 (left 1, right 2). error-paths. Medium. **Fix.**
+  Fixed in `ff52c1b0`; fails without it: `a_send_carrying_the_endpoint_it_delivers_to_is_caught`,
+  and boot-probe's transfer check under `test-qemu`.
 - [ ] **kobj-7** `kernel/src/syscall/table.rs:1620` — `sys_io_submit` on a block device does not
   check that offset and length are multiples of the block size, or that offset+length lies
   within the device. `device-node.md` and `io-operation.md` require a synchronous
@@ -204,7 +217,7 @@ Found 24, refuted by a boot 0, reported 13.
   object's frame and `page_flags_for` = USER|NO_EXECUTE. logic, error-paths, trust-boundary.
   Reviewers disagreed on severity (the boot verifier and two lenses said low, trust-boundary
   said medium); ranked low as latent. **Fix.**
-- [ ] **kobj-9** `kernel/src/syscall/table.rs:1934` — `sys_channel_send`, and
+- [x] **kobj-9** `kernel/src/syscall/table.rs:1934` — `sys_channel_send`, and
   `sys_process_spawn`'s handle loop at 446, look up each listed handle separately and do not
   reject a handle listed twice. One handle sent as `[H, H]` arrives as two handles, and the
   second `close_and_release` fails silently. A holder of H with TRANSFER but not DUPLICATE
@@ -214,6 +227,8 @@ Found 24, refuted by a boot 0, reported 13.
   boot probe sent `[H, H]`, count=2, with a DUPLICATE-less INSPECT|TRANSFER memory handle over a
   loopback channel. Send returned 0, and recv returned 0 with count 2. error-paths, tests. Low.
   **Fix.**
+  Fixed in `ff52c1b0`; fails without it: `a_handle_listed_twice_is_refused_by_a_send_and_a_spawn`,
+  and boot-probe's transfer check under `test-qemu`.
 - [ ] **kobj-10** `kernel/src/sched/ipc.rs:453` — When a userspace server's endpoint dies,
   `ipc_endpoint_closing` and `us_reg_detach` drain only the registration's pending lookups,
   never its pending fills (`File::ReadRange`, Model B). A thread faulting a lazy
@@ -276,7 +291,7 @@ response, so only what it checked and found sound is below. A fresh run of that 
 them.
 Found 29, refuted by a boot 0, reported 19 (duplicates merged).
 
-- [ ] **kmem-1** `kernel/src/mm/elf.rs:128` — `load_elf` returns `e_entry` unchecked, and
+- [x] **kmem-1** `kernel/src/mm/elf.rs:128` — `load_elf` returns `e_entry` unchecked, and
   `spawn_user` hands it to `enter_user`'s `iretq`. `sys_thread_create` checks its entry with
   `UserPtr::new`; the spawn path checks nothing. Any process builds a MemoryObject holding an ELF
   with a valid PT_LOAD and `e_entry = 0x8000_0000_0000` (non-canonical), then calls
@@ -286,7 +301,8 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   ELF swapped into the 15th spawn: the kernel took `#GP` with cs 0x0008, the `iretq` frame showed
   rip=0x0000800000000000 and cs=0x23, and the dump ended "stopping every CPU". Lenses: logic,
   trust-boundary. High. **Fix.**
-- [ ] **kmem-2** `kernel/src/syscall/table.rs:885` — User mappings may reach `USER_VIRT_END`, so the
+  Fixed in `badc91cd`; fails without it: `an_entry_outside_the_user_half_is_refused`.
+- [x] **kmem-2** `kernel/src/syscall/table.rs:885` — User mappings may reach `USER_VIRT_END`, so the
   last canonical user page (0x7FFF_FFFF_F000) can be mapped executable, by a hinted
   `sys_memory_map` (`end > USER_VIRT_END` is the only bound) or an ELF PT_LOAD. A `syscall` in its
   last two bytes saves the non-canonical return RIP 0x0000_8000_0000_0000, and the `sysretq` exit
@@ -297,7 +313,10 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `syscall_entry` with rcx=0x0000800000000000, rsp on the user stack, and the machine halted. The
   serial output was interleaved, so the vector line was garbled. AMD is unaffected. Linux
   reserves this page for this reason. Lens: logic. High. **Fix.**
-- [ ] **kmem-3** `kernel/src/mm/addr_space.rs:274` — `AddressSpace::fault_in`'s Anonymous arm
+  Fixed in `badc91cd`; fails without it: `a_segment_in_the_top_page_of_the_user_half_is_refused` and
+  `no_way_of_mapping_reaches_the_top_page_of_the_user_half`, each of the four mapping calls reverted
+  alone.
+- [x] **kmem-3** `kernel/src/mm/addr_space.rs:274` — `AddressSpace::fault_in`'s Anonymous arm
   assumes the PTE is still absent and hits `unreachable!()` when `map_page` returns
   `AlreadyMapped`. `map_file_page` accepts `AlreadyMapped` for the same race. Two threads of one
   process on different CPUs touch the same untouched page of a lazy VMA, such as the initial
@@ -307,7 +326,9 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Demonstrated: a host test did `map_vma_lazy`, then `fault_in` twice on one page, and the second
   call panicked at `addr_space.rs:274`. The two-CPU interleaving itself was not booted. Lenses:
   error-paths, trust-boundary, tests. High. **Fix.**
-- [ ] **kmem-4** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE`
+  Fixed in `183111ab`; fails without it:
+  `a_fault_on_a_page_another_cpu_just_mapped_is_a_retry_and_keeps_no_frame`.
+- [x] **kmem-4** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE`
   unchecked. `load_elf` bounds `e_phoff + i*56` but not the `+56`, and every image boots a
   dev-profile kernel (`overflow-checks = true`). A MemoryObject holding an ELF with `e_phoff` near
   `u64::MAX` and `e_phnum >= 1`, passed to `sys_process_spawn` (which needs only MAP_READ on the
@@ -316,7 +337,9 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   logic lens noted that a release build wraps into the bounds-checked readers and returns
   Truncated, so only the shipped dev-profile kernel is affected. Lenses: error-paths,
   trust-boundary. High. **Fix**, as kobj-4.
-- [ ] **kmem-5** `kernel/src/mm/buddy.rs:163` — `BuddyAllocator::alloc` has
+  Fixed in `badc91cd`; fails without it:
+  `a_program_header_offset_at_the_top_of_the_range_is_truncated`.
+- [x] **kmem-5** `kernel/src/mm/buddy.rs:163` — `BuddyAllocator::alloc` has
   `debug_assert!(order <= MAX_ORDER)` ahead of its graceful `return None`, and slab's `large_alloc`
   passes `order_for_size(total)` unchecked. In the debug-built kernel every image boots, any
   kmalloc over about 4 MiB panics instead of failing. A process makes a 5 MiB MemoryObject
@@ -327,7 +350,13 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Demonstrated: a host test with `MemoryObject::try_new(5 MiB)` then `copy_to_kvec()` panicked at
   `buddy.rs:163` ("buddy: alloc order 11 > MAX_ORDER"). Lenses: error-paths, trust-boundary. High.
   **Fix**, as kobj-3.
-- [ ] **kmem-6** `kernel/src/arch/x86_64/paging.rs:224` — `ensure_table` is a non-atomic
+  Fixed in `e56c6612`; fails without it: `an_order_past_the_largest_block_is_refused`,
+  `a_large_alloc_past_the_largest_block_is_refused`,
+  `copying_an_image_past_the_largest_block_is_refused`,
+  `a_file_blocks_header_claiming_more_runs_than_its_body_holds_is_refused` and
+  `a_block_map_the_page_cache_cannot_use_is_refused`; the channel depth falls to 512, the deepest
+  whose ring fits.
+- [x] **kmem-6** `kernel/src/arch/x86_64/paging.rs:224` — `ensure_table` is a non-atomic
   read-then-write of a shared kernel-half page-table slot. `KernelStack::new` and
   `kvmap::map_mmio` call `map_page` on the shared vmap hierarchy holding no lock, so two CPUs that
   both find the slot empty each link their own new table, and one overwrites the other with all
@@ -340,6 +369,9 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `Thread::try_new_user` and `try_new_runnable` call `KernelStack::new` outside any lock. This is
   a different mechanism from the TLB-staleness theory that `deferred-decisions.md` rules out for
   TODO(unexplained-df), and may be a cause of that #DF. Lens: error-paths. High. **Fix.**
+  Fixed in `338d744f`; fails without it:
+  `a_cpu_beaten_to_an_empty_slot_takes_the_table_linked_first`, deterministic by a test-only hook
+  between the read and the link.
 - [ ] **kmem-7** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
   the caller asks for (`required = req & MAP_*`) but always installs a present, user-readable
   mapping. With `rights = 0`, or only MAP_WRITE or MAP_EXEC, a MemoryObject or FileObject handle
@@ -352,7 +384,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   with INSPECT|TRANSFER. `lookup` with an empty requirement succeeded, and `map_object` with
   `Protection::USER` left `Paging::translate` returning Some. The syscall wrapper itself cannot
   run on the host. Lenses: logic, error-paths, trust-boundary, tests. Medium. **Fix**, as kobj-8.
-- [ ] **kmem-8** `kernel/src/mm/elf.rs:223` — A PT_LOAD's `p_memsz` is bounded only by
+- [x] **kmem-8** `kernel/src/mm/elf.rs:223` — A PT_LOAD's `p_memsz` is bounded only by
   `USER_VIRT_END`, and `map_vma` commits it eagerly, allocating and zeroing a frame per page under
   the AS lock in an IF-masked syscall. `MemoryObject::MAX_SIZE` (16 MiB) exists to prevent
   exactly this, and the ELF path bypasses it. Any process spawns a tiny ELF with `p_memsz` in the
@@ -364,6 +396,8 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   was empty, 74.6 ms of uncapped allocation in one syscall on a guest with about 180 MB, so the
   stall scales with RAM. The effect on other CPUs was not measured. Lenses: logic, trust-boundary.
   Medium. **Fix.**
+  Fixed in `badc91cd`; fails without it:
+  `an_image_whose_segments_claim_more_than_the_budget_is_refused`.
 - [ ] **kmem-9** `kernel/src/mm/kvmap.rs:58` — `vmap_alloc_pages` bounds the bump pointer by
   `KERNEL_VMAP_END` (16 TiB), but only the first 512 GiB has a PDPT in the kernel template, and VA
   is never reclaimed. Past that, a new stack lands in a PML4 slot that `map_page` fills in one
@@ -396,7 +430,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Demonstrated: three mutations in `mm::addr_space` all survived, namely the EXEC test forced to
   `false`, the WRITE branch forced on, and the USER branch forced on. Only the WRITE_COMBINING
   branch was killed. Lens: tests. Medium. **Fix**, with kobj-8.
-- [ ] **kmem-12** `kernel/src/mm/addr_space.rs:574` — No test catches a leaked or double-freed frame
+- [x] **kmem-12** `kernel/src/mm/addr_space.rs:574` — No test catches a leaked or double-freed frame
   on unmap. A regression could leak an Anonymous frame per page, or collect Object and FileBacked
   frames into `frames`, so `sys_memory_unmap` would `buddy_free` frames a MemoryObject or the page
   cache still owns, a double free that corrupts the buddy lists. The
@@ -404,7 +438,10 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   is untested. Demonstrated: three mutations in `mm::addr_space` survived, namely
   `free_vma_pages`'s Anonymous arm changed to `{}`, the `matches!` guard changed to `true`, and
   `capacity - len < pages` changed to `< 0`. Lens: tests. Medium. **Fix**, with kmem-3.
-- [ ] **kmem-13** `kernel/src/mm/elf.rs:218` — The ELF loader's `p_filesz > p_memsz` check, its
+  Fixed in `183111ab`; fails without it:
+  `an_unmap_frees_an_anonymous_mappings_frames_and_never_an_objects`; its third mutation by
+  `e56c6612`'s `unmapping_an_object_needs_no_room_for_frames_and_an_anonymous_mapping_does`.
+- [x] **kmem-13** `kernel/src/mm/elf.rs:218` — The ELF loader's `p_filesz > p_memsz` check, its
   `file_end > bytes.len()` check and its `aligned_end > USER_VIRT_END` bound have no test, and
   neither does PF_W/PF_X mapping into protection bits. ELF bytes come from a disk or filesystem
   server, which is not trusted. A regression dropping a check gives a kernel panic on a malformed
@@ -413,6 +450,11 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `p_filesz > p_memsz` check forced to false, the `file_end` check forced to false, `aligned_end`
   loosened by one page, and `PF_W` and `PF_X` each forced to true. Lens: tests. Medium.
   **Fix**, with kobj-4.
+  Fixed in `badc91cd`; fails without it:
+  `a_segment_with_more_file_than_memory_or_past_the_image_is_refused` and
+  `a_segment_is_writable_or_executable_only_as_its_flags_say`, four of its five mutations. The
+  fifth, the loader's bound loosened by a page, fails nothing: the address-space layer refuses the
+  same segment with the same error, and is now the bound.
 - [ ] **kmem-14** `kernel/src/object/memory_object.rs:71` — Nothing tests that fresh MemoryObject
   or DmaBuffer frames are zeroed. A regression removing the zeroing in `sys_memory_create` would
   hand userspace stale kernel or other-process pages, a cross-process information leak. The host
@@ -431,7 +473,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `try_fault_in` (`idt.rs:315-319`) takes the index from `file_backing`, and the frame is
   installed without re-deriving it under the second AS-lock hold. Lens: logic. Low.
   **Later**, in Part E.
-- [ ] **kmem-16** `kernel/src/object/file_object.rs:540` — `begin_fill`'s read-ahead adjacency test
+- [x] **kmem-16** `kernel/src/object/file_object.rs:540` — `begin_fill`'s read-ahead adjacency test
   computes `first * bs + (n * PAGE_SIZE) as u64` unchecked. `block_map` guarantees only that each
   run's own end fits a u64, so a run map near the top of the byte range overflows when the next
   page lies past it. A filesystem server replies FILE_BLOCKS with bs = 512 and runs (0, D, 8) and
@@ -441,6 +483,8 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `mapped_file`/`miss`/`begin_fill` panicked at `file_object.rs:540:30` ("attempt to add with
   overflow"). `begin_write`'s matching `first * bs + (k * PAGE_SIZE)` was not probed. Lens:
   trust-boundary. Low. **Fix.**
+  Fixed in `655de0b6`; fails without it:
+  `a_page_that_would_lie_past_the_top_of_the_device_ends_a_run`, each sum unchecked in turn.
 - [ ] **kmem-17** `kernel/src/mm/vmm.rs:413` — `find_free_range`'s upper bound (`MMAP_MAX`, which
   keeps hint=0 mappings out of the stack guard gap) and its exact-fit boundary have no test. If
   the bound regressed, `sys_memory_map(hint=0)` could return ranges in the guard gap and a stack
@@ -448,7 +492,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   that fits. Demonstrated: three mutations in `mm::vmm` survived, namely the `> max` early return
   forced to `if false`, the final `cursor+size <= max` forced true, and `s >= cursor+size` changed
   to `s >`. Lens: tests. Low. **Later.**
-- [ ] **kmem-18** `kernel/src/mm/buddy.rs:142` — The `order > MAX_ORDER` guard in
+- [x] **kmem-18** `kernel/src/mm/buddy.rs:142` — The `order > MAX_ORDER` guard in
   `BuddyAllocator::alloc` is untested (only the `debug_assert` fires in debug), and neither is
   `BuddyAllocator::new`'s `bitmap_reservation` rounding to whole pages. In a release build
   without the guard, `alloc(order > 10)` would index `free_lists` out of bounds, and a rounding
@@ -457,6 +501,9 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `mm::buddy` survived, namely the guard changed to `if false` and `bitmap_reservation` using
   `bitmap_bytes`. See kmem-5 for the `debug_assert` that makes the guard unreachable in the dev
   build. Lens: tests. Low. **Fix**, with kobj-3.
+  Fixed in `e56c6612`; fails without it: `an_order_past_the_largest_block_is_refused`. Its second
+  mutation, the bitmap reservation's rounding, is equivalent: Limine's usable entries are
+  page-aligned, so both choose the same region.
 - [ ] **kmem-19** `kernel/src/object/file_object.rs:437` — `resize`'s
   `g.retired.try_reserve(gone)?`, the all-or-nothing allocation before pages are removed, can be
   deleted with every `file_object` test still passing. Without it, the later
@@ -951,7 +998,7 @@ usb-departed-records, block-transfer-split) were not reported.
 Lenses: logic, error-paths, trust-boundary, tests, architecture; returned nothing: none.
 Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
 
-- [ ] **proto-1** `kernel/src/object/file_object.rs:540` — Read-ahead and write-back overflow
+- [x] **proto-1** `kernel/src/object/file_object.rs:540` — Read-ahead and write-back overflow
   u64 on a run that `block_map` accepted. `block_map` (table.rs:2592) checks only that each run's
   device end in bytes fits a u64, but `begin_fill` computes `first * bs + (n * PAGE_SIZE) as u64`
   (write-back does the same at line 593). A run ending within a page of u64::MAX bytes passes
@@ -965,6 +1012,8 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   file_object tests, `fill_ahead(file_of(&f), 0, 512, 31)` on that run panicked at
   file_object.rs:540:30 (`cd kernel && cargo test --lib --target x86_64-unknown-linux-gnu`).
   Probes removed. logic. High. **Fix**, as kmem-16.
+  Fixed in `655de0b6`; fails without it:
+  `a_page_that_would_lie_past_the_top_of_the_device_ends_a_run`, each sum unchecked in turn.
 - [ ] **proto-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` takes the
   transferred DeviceNode and drops its rights (`tr.rights`). Whether the file is writable depends
   only on the server's own FILE_BLOCKS_READ_ONLY flag (line 2433). The sibling arms respect
@@ -983,20 +1032,23 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   server sends flags 0, then a client write plus `sys_file_sync` and a host read of the sector,
   would show the disk written. Requiring WRITE in `tr.rights` before granting MAP_WRITE should
   turn it into NoAccess. logic, trust-boundary, architecture. High. **Fix**, as kobj-2.
-- [ ] **proto-3** `kernel/src/rsproto.rs:59` — No test covers the `body_len` bound in
+- [x] **proto-3** `kernel/src/rsproto.rs:59` — No test covers the `body_len` bound in
   `reply_body`, `parse_reply` and `parse_read_range_reply`, the only guard between a hostile
   server's reply and an out-of-range slice panic in the kernel. A reply whose body_len exceeds
   the IPC payload would make `&msg[28..end]` panic if a check were removed. `reply_body` has no
   test at all. This is a test gap; the code is correct today. Demonstrated: each of the three
   checks removed in turn, and all 14 rsproto tests still passed (`cargo test --lib --target
   x86_64-unknown-linux-gnu rsproto`). Restored. tests. High. **Fix**, with kobj-3.
-- [ ] **proto-4** `kernel/src/rsproto.rs:127` — The `BlockRun` stride (24) and index-to-offset
+  Fixed in `e56c6612`; fails without it: `a_reply_body_may_not_run_past_its_message`, each of the
+  three checks removed in turn.
+- [x] **proto-4** `kernel/src/rsproto.rs:127` — The `BlockRun` stride (24) and index-to-offset
   arithmetic in `file_blocks_run` are pinned by no test; only run 0 is ever decoded. A wrong
   stride would make runs 1 and up read the wrong file_block, device_lba and length, so a Model A
   file with two or more extents fills from, or writes back to, the wrong disk blocks. Test gap;
   the code is correct today. Demonstrated: `FILE_BLOCKS_PREFIX_LEN + i * BLOCK_RUN_WIRE_LEN`
   changed to `i * 16`, and the rsproto tests all passed. Restored. tests. High.
   **Fix**, with kobj-3.
+  Fixed in `e56c6612`; fails without it: `each_block_run_is_read_at_its_own_offset`.
 - [ ] **proto-5** `userspace/librsproto/src/namespace.rs:113` — The length checks in
   `parse_resolve_grow_size`, `parse_resolve_rename` (both the tail+4 and tail+4+dest_len checks)
   and `file::parse_rename_request` have no test with a truncated or overrunning body. If one
@@ -1079,7 +1131,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   u16 length, so the wire length disagrees with the bytes written. Test gap; the code is correct
   today. Demonstrated: each guard removed or loosened individually, and every librsproto test
   still passed. tests. Medium. **Later.**
-- [ ] **proto-13** `kernel/src/syscall/table.rs:2589` — `block_map` calls
+- [x] **proto-13** `kernel/src/syscall/table.rs:2589` — `block_map` calls
   `runs.try_reserve(header.run_count as usize)` before the body is checked to hold that many
   runs. `run_count` is a server-chosen u32, but a reply body carries at most (3980-32)/24 = 164
   runs. A server answers FILE_BLOCKS with run_count 50,000,000 and a 32-byte body, and the
@@ -1089,6 +1141,12 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   huge run_count, or a look at what `try_reserve` does against kmalloc's cap, would settle it.
   Bounding run_count by `(body.len() - 32) / 24` first removes the question. logic. Low.
   **Fix**, as kobj-3.
+  Fixed in `e56c6612`; fails without it: `an_order_past_the_largest_block_is_refused`,
+  `a_large_alloc_past_the_largest_block_is_refused`,
+  `copying_an_image_past_the_largest_block_is_refused`,
+  `a_file_blocks_header_claiming_more_runs_than_its_body_holds_is_refused` and
+  `a_block_map_the_page_cache_cannot_use_is_refused`; the channel depth falls to 512, the deepest
+  whose ring fits.
 - [ ] **proto-14** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes
   `f.name.len() as u16` without refusing names over u16::MAX, and `WireErrorRecord::encode` does
   the same for `field_name` (line 733). Encoding reports Ok with a wrapped length, and the
@@ -1402,7 +1460,7 @@ probe was restored.
 Lenses: logic, error-paths, trust-boundary, tests; returned nothing: none, but the architecture lens's report was cut off before any findings came back, so its empty list is not a clean result and the hunt is incomplete until it is rerun.
 Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplicates).
 
-- [ ] **sched-1** `kernel/src/object/timer.rs:206` — Destroying a Timer never removes its deadline-heap
+- [x] **sched-1** `kernel/src/object/timer.rs:206` — Destroying a Timer never removes its deadline-heap
   entry. The heap holds a raw pointer with no reference, and neither `Timer::drop` nor
   `dispatch_destroy` calls `deadline::remove`. Any process, with no rights needed, runs
   `sys_timer_create`, `sys_timer_set(t, now+X, 0)`, then `sys_handle_close(t)` or exits. When X
@@ -1416,8 +1474,10 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   reuses A's slot and is armed for 1e9. `fire_expired_deadlines(2000)` leaves B with `deadline=0`
   and `in_heap=false`, and the heap names the freed A. A control that disarmed A before the drop
   left no entry. logic, error-paths, trust-boundary, tests. high. **Fix**, as kobj-1.
+  Fixed in `fcc06ce8`; fails without it:
+  `a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it`.
 
-- [ ] **sched-2** `kernel/src/sched/wait.rs:53` — A wake panics the kernel when every
+- [x] **sched-2** `kernel/src/sched/wait.rs:53` — A wake panics the kernel when every
   affinity-permitted run queue is at `READY_RESERVE` (32). `make_runnable` (and `resume_suspended`,
   `exit.rs:379`) has no refusal path, although spawn refuses at a full queue. A process uses
   `sys_thread_create` with `cpu_affinity=1` (TimeShared, no capability) to make 32 busy threads on
@@ -1429,8 +1489,12 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   and called the real `make_runnable` on a blocked mask=1 thread. CPU 1 had room, and the call
   panicked at `wait.rs:71` with 'wake placement: no ready queue would take the thread'. logic.
   high. **Fix.**
+  Fixed in `deabe050`; fails without it:
+  `every_thread_the_cap_admits_can_block_wake_and_be_reaped_on_one_cpu` and
+  `a_thread_counts_from_its_first_placement_until_its_reap_is_drained`; a 512-thread cap every
+  scheduler list is reserved to hold.
 
-- [ ] **sched-3** `kernel/src/sched/wait.rs:29` — Blocking has no capacity check, and the 64-entry
+- [x] **sched-3** `kernel/src/sched/wait.rs:29` — Blocking has no capacity check, and the 64-entry
   global `blocked` list panics when full. `wait_on` goes straight to `block_current_and_switch`,
   which calls `push_reserved`. The 64-entry `suspended` list (`exit.rs:322`) does the same. The doc
   at `sched.rs:98-102` says blocking beyond the reserve "is refused". One process makes threads
@@ -1443,8 +1507,12 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   st.blocked, ..)` panicked with 'blocked list: reserve exhausted'. `git show aec52d83` shows an
   earlier `debug_assert` plus `try_push` was turned into this panic. logic, error-paths. high.
   **Fix.**
+  Fixed in `deabe050`; fails without it:
+  `every_thread_the_cap_admits_can_block_wake_and_be_reaped_on_one_cpu` and
+  `a_thread_counts_from_its_first_placement_until_its_reap_is_drained`; a 512-thread cap every
+  scheduler list is reserved to hold.
 
-- [ ] **sched-4** `kernel/src/sched/exit.rs:59` — `reap_matching` assumes ready threads "register on
+- [x] **sched-4** `kernel/src/sched/exit.rs:59` — `reap_matching` assumes ready threads "register on
   no wait objects". That is false for a thread a waker just moved blocked to ready: it stays on the
   other wait objects' waiter lists and on the deadline heap until `wait_on`'s resume path runs.
   Thread A of process P calls `sys_wait([X, T], finite deadline)`, X signals, and A sits in ready
@@ -1456,6 +1524,8 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   (pid 7) on timers t1 and t2 with a deadline entry and parks it in `blocked`. Firing t1 moves A
   to `ready[0]`, and `reap_matching(ready[0], reap[0], 7)` reaps it. After the reap list dropped,
   A was freed, was still a t2 waiter and still had a heap Thread entry. error-paths. high. **Fix.**
+  Fixed in `deabe050`; fails without it:
+  `a_woken_thread_reaped_before_it_runs_leaves_nothing_naming_it`.
 
 - [ ] **sched-5** `kernel/src/sched/exit.rs:86` — When `exit_process` reaps a sibling blocked in
   `sys_wait` (or woken but not yet resumed), the sibling is never resumed. `sys_wait`'s on-stack
@@ -1482,7 +1552,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   50 ms, a fresh `sys_timer_set` still returned -4, and a finite-deadline `sys_wait` on an
   unsignalled timer returned -4 immediately. logic, error-paths, tests. medium. **Fix.**
 
-- [ ] **sched-7** `kernel/src/sched/timers.rs:97` — `fire_timer` disarms a one-shot timer
+- [x] **sched-7** `kernel/src/sched/timers.rs:97` — `fire_timer` disarms a one-shot timer
   (`set_armed(0,0)`) when it fires even if no thread waits, and `Timer::already_signaled` requires
   `deadline_ns != 0`, so an elapsed timer never reads as signaled again. storage-service `park(5
   ms)` does `sys_timer_set(now+5ms)` then `sys_wait(timer, u64::MAX)`. If it is preempted between
@@ -1493,6 +1563,8 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   100. `already_signaled(150)` was true, and after `fire_expired_deadlines(st, 120)` it was false
   and the timer was no longer scheduled. A second probe armed 1000, fired at 2000 with no waiters,
   and `already_signaled(3000)` failed. error-paths, tests. medium. **Fix.**
+  Fixed in `1b6ee7ea`; fails without it:
+  `a_one_shot_timer_fired_with_no_waiter_still_reads_signaled`.
 
 - [ ] **sched-8** `kernel/src/sched/exit.rs:181` — When the last thread of a process ends through
   `exit_thread` (`sys_thread_exit`, or a supervisor's Terminate after a fault), `set_process_ended`
@@ -1506,12 +1578,14 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   stopped, the same wait returned 1. Control under the same load: a child using `sys_process_exit`
   closed promptly (wait=1). error-paths. low. **Fix.**
 
-- [ ] **sched-9** `kernel/src/sched/deadline.rs:84` — Test gap: the sift-up branch of
+- [x] **sched-9** `kernel/src/sched/deadline.rs:84` — Test gap: the sift-up branch of
   `deadline::remove`, taken when the entry swapped into the hole is smaller than its new parent, is
   uncovered. Breaking it could leave a later deadline above an earlier one, so
   `fire_expired_deadlines` (which stops at the first entry later than `now`) would delay wakes.
   Demonstrated: a mutation collapsing the if/else to `sift_down(h, i)` still passed all 986 host
   tests; restored. tests. low. **Fix**, with kobj-1.
+  Fixed in `fcc06ce8`; fails without it:
+  `removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap_ordered`.
 
 - [ ] **sched-10** `kernel/src/sched/timers.rs:50` — Test gap: nothing on the host exercises
   `fire_expired_deadlines`, `fire_timer`, `timer_arm` or `wait_on`, and sched-1 and sched-7 sit in
@@ -1521,6 +1595,10 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   poll path removed; `has_deadline` forced false. Unverified: the mutation runs were not repeated
   by the verifier. The boot probes for sched-5, sched-6 and sched-8 did show those paths run only
   under a QEMU gate. tests. low. **Fix**, with kobj-1.
+  Five of its six mutations now fail a test: the four in the timer code by `fcc06ce8`'s
+  `sched::tests`, and `has_deadline` forced false by `test-qemu`. Removing `wait_on`'s poll path
+  still fails nothing: a poll then blocks until the next tick, which no host test can drive
+  without a running thread. Open, for Part H.
 
 What held up: `sys_wait` registration and blocking share one SCHED hold, so no lost wakeup, and a
 partial registration is fully unwound. The `wait_try_wake` CAS plus `make_runnable`'s not-in-blocked
@@ -1742,7 +1820,7 @@ device-mgr Owners. Sound on reading:
 Lenses: architecture; returned nothing: none.
 Found 11, refuted by a boot 0, reported 11.
 
-- [ ] **kmem-20** `kernel/src/mm/addr_space.rs:274` — `AddressSpace::fault_in` treats
+- [x] **kmem-20** `kernel/src/mm/addr_space.rs:274` — `AddressSpace::fault_in` treats
   `ArchMapError::AlreadyMapped` on an anonymous lazy page as impossible and calls `unreachable!()`,
   but on SMP two threads can take not-present faults on the same page, and the second finds the PTE
   the first installed. Any process: two threads on different CPUs touch the same untouched page of
@@ -1757,7 +1835,9 @@ Found 11, refuted by a boot 0, reported 11.
   an interrupt gate (`idt.rs:63`, 0x8E), so on one CPU it cannot happen, but nothing serialises
   two CPUs between the hardware fault and the AS lock. The sibling `map_file_page` already treats
   `AlreadyMapped` as success. Architecture. High. **Fix**, as kmem-3.
-- [ ] **kmem-21** `kernel/src/mm/buddy.rs:163` — any kernel allocation over 4 MiB panics. `kmalloc`
+  Fixed in `183111ab`; fails without it:
+  `a_fault_on_a_page_another_cpu_just_mapped_is_a_retry_and_keeps_no_frame`.
+- [x] **kmem-21** `kernel/src/mm/buddy.rs:163` — any kernel allocation over 4 MiB panics. `kmalloc`
   sends it to the slab's `large_alloc` (`slab.rs:402`), which computes a buddy order above
   `MAX_ORDER` (10) and calls `buddy_alloc`, whose `debug_assert!(order <= MAX_ORDER)` fires. The
   kernel ships in the dev profile (xtask runs `cargo build` with no `--release`), so debug
@@ -1773,7 +1853,13 @@ Found 11, refuted by a boot 0, reported 11.
   `MemoryObject::try_new(5 MiB)` succeeded, then `copy_to_kvec()` panicked at `buddy.rs:163` with
   "buddy: alloc order 11 > MAX_ORDER". Fix the class in `large_alloc` (return null when
   order > `MAX_ORDER`), not at each caller. Architecture. High. **Fix**, as kobj-3.
-- [ ] **kmem-22** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE` with
+  Fixed in `e56c6612`; fails without it: `an_order_past_the_largest_block_is_refused`,
+  `a_large_alloc_past_the_largest_block_is_refused`,
+  `copying_an_image_past_the_largest_block_is_refused`,
+  `a_file_blocks_header_claiming_more_runs_than_its_body_holds_is_refused` and
+  `a_block_map_the_page_cache_cannot_use_is_refused`; the channel depth falls to 512, the deepest
+  whose ring fits.
+- [x] **kmem-22** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE` with
   unchecked addition on `e_phoff`, which comes straight from the ELF. The kernel is built with
   `overflow-checks = true` (profile.dev), so an `e_phoff` near `u64::MAX` panics instead of
   returning `Truncated`. Any process writes an ELF header with `e_phoff = u64::MAX - 8` and
@@ -1782,7 +1868,9 @@ Found 11, refuted by a boot 0, reported 11.
   overflow" and the kernel panics. Demonstrated: a host probe in the `elf` tests, an `ElfBuilder`
   with one PT_LOAD and bytes 32..40 set to `u64::MAX-8`; `load_elf` panicked at `elf.rs:182:22`
   with "attempt to add with overflow". Architecture. High. **Fix**, as kobj-4.
-- [ ] **kmem-23** `kernel/src/mm/elf.rs:128` — `load_elf` returns `e_entry` from the untrusted ELF
+  Fixed in `badc91cd`; fails without it:
+  `a_program_header_offset_at_the_top_of_the_range_is_truncated`.
+- [x] **kmem-23** `kernel/src/mm/elf.rs:128` — `load_elf` returns `e_entry` from the untrusted ELF
   without checking that it is a canonical user-half address. `enter_user` starts the thread with
   `iretq`, and an `iretq` to a non-canonical RIP raises #GP while still at CPL 0;
   `exception_dispatch` then sees a kernel-mode fault and calls `dump_and_halt`. Any process builds
@@ -1798,7 +1886,8 @@ Found 11, refuted by a boot 0, reported 11.
   a ring-3 segfault ("unhandled ring-3 fault, pid 1"), so the halt shows on KVM only, as it would
   on real hardware. A child from `sys_process_spawn` takes the same path. Architecture. High.
   **Fix**, as kmem-1.
-- [ ] **kmem-24** `kernel/src/syscall/table.rs:2589` — `block_map` trusts the reply's `run_count`:
+  Fixed in `badc91cd`; fails without it: `an_entry_outside_the_user_half_is_refused`.
+- [x] **kmem-24** `kernel/src/syscall/table.rs:2589` — `block_map` trusts the reply's `run_count`:
   it reserves `run_count` `BlockRun`s (24 bytes each) before checking that the body holds that
   many, and a 4 KiB message fits about 170. A filesystem server's Model A resolve reply claims
   `run_count = 200000` while carrying one run. `runs.try_reserve(200000)` asks `kmalloc` for about
@@ -1809,6 +1898,12 @@ Found 11, refuted by a boot 0, reported 11.
   200000 and one valid run; `block_map` panicked with "buddy: alloc order 11 > MAX_ORDER". Fix:
   bound `run_count` by `(body.len() - 32) / 24` before reserving. Architecture. Medium.
   **Fix**, as kobj-3.
+  Fixed in `e56c6612`; fails without it: `an_order_past_the_largest_block_is_refused`,
+  `a_large_alloc_past_the_largest_block_is_refused`,
+  `copying_an_image_past_the_largest_block_is_refused`,
+  `a_file_blocks_header_claiming_more_runs_than_its_body_holds_is_refused` and
+  `a_block_map_the_page_cache_cannot_use_is_refused`; the channel depth falls to 512, the deepest
+  whose ring fits.
 - [ ] **kmem-25** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
   named in `rights`, yet always installs a user-readable mapping (prot starts at
   `Protection::USER`, and x86 has no read bit). A request with `rights = 0`, or MAP_WRITE alone,
@@ -1842,7 +1937,7 @@ Found 11, refuted by a boot 0, reported 11.
   was visible in a second AddressSpace (true). After bumping `VMAP_NEXT` to the 512 GiB edge, a
   stack at 0xffffc08000000000 was mapped in its own AS (true) but not in a fresh AS (false); the
   count needed to get there was 26843545 stacks. Architecture. Medium. **Later**, as kmem-9.
-- [ ] **kmem-27** `kernel/src/mm/elf.rs:241` — PT_LOAD `p_memsz` has no cap: `map_load_segment`
+- [x] **kmem-27** `kernel/src/mm/elf.rs:241` — PT_LOAD `p_memsz` has no cap: `map_load_segment`
   eagerly allocates and zeroes a frame for every page with `map_vma`, under the AS spinlock,
   inside `sys_process_spawn`, which runs with IF masked. This is the unpreemptable zeroing loop
   that `MemoryObject::MAX_SIZE` exists to prevent on `sys_memory_create`, and the ELF path
@@ -1858,6 +1953,8 @@ Found 11, refuted by a boot 0, reported 11.
   lock in the spawn path (SFMASK clears IF on syscall entry). The ~90M cycles is on a small-RAM
   guest and grows with RAM. The TLB-ack stall and OOM faults in other processes were not measured.
   Architecture. Medium. **Fix**, as kmem-8.
+  Fixed in `badc91cd`; fails without it:
+  `an_image_whose_segments_claim_more_than_the_budget_is_refused`.
 - [ ] **kmem-28** `kernel/src/arch/x86_64/idt.rs:250` — `pf_dispatch` checks the user-copy
   recovery table before demand paging, so a kernel copy that touches a valid but not-yet-faulted
   page (a lazy anonymous page or any FileBacked page) fails with `UserAccessError::Fault` instead
@@ -1922,7 +2019,7 @@ Lenses: architecture; returned nothing: none.
 Found 7, refuted by a boot 0, reported 7. This adds to the earlier scheduler section, whose
 architecture lens returned no findings.
 
-- [ ] **sched-11** `kernel/src/object/timer.rs:206` — Destroying a Timer never removes its entry
+- [x] **sched-11** `kernel/src/object/timer.rs:206` — Destroying a Timer never removes its entry
   from the global deadline heap, so the heap keeps a raw pointer to freed memory. A process arms a
   timer with `sys_timer_set`, then closes its only handle or exits. When the deadline passes, the
   tick's `fire_expired_deadlines` calls `set_in_heap`, `take_waiters` and `set_armed` on freed or
@@ -1934,7 +2031,9 @@ architecture lens returned no findings.
   disarmed that unrelated live timer (deadline=0, in_heap=false) and left its own heap entry
   orphaned. Neither `Timer::drop` nor `dispatch_destroy`'s Timer arm touches the heap.
   architecture. high. **Fix**, as kobj-1.
-- [ ] **sched-12** `kernel/src/sched/exit.rs:57` — `reap_matching` assumes threads in the ready
+  Fixed in `fcc06ce8`; fails without it:
+  `a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it`.
+- [x] **sched-12** `kernel/src/sched/exit.rs:57` — `reap_matching` assumes threads in the ready
   queues are registered on no wait objects. A sibling woken from `sys_wait` but not yet run is
   still on its other wait objects' waiter lists and in the deadline heap. `exit_process` reaps and
   frees it, leaving those pointers dangling. Thread A of process P waits on handles X and Y with a
@@ -1948,7 +2047,9 @@ architecture lens returned no findings.
   true", "B blocked=0 ready=1 (c3 never signalled)". An unrelated thread from another process,
   blocked with no deadline on an object that never signalled, was moved to ready by A's stale
   deadline. architecture. high. **Fix**, as sched-4.
-- [ ] **sched-13** `kernel/src/sched/wait.rs:29` — `block_current_and_switch` pushes onto the
+  Fixed in `deabe050`; fails without it:
+  `a_woken_thread_reaped_before_it_runs_leaves_nothing_naming_it`.
+- [x] **sched-13** `kernel/src/sched/wait.rs:29` — `block_current_and_switch` pushes onto the
   global blocked list (64 entries for the whole system) with `push_reserved` and no capacity check,
   so the 65th blocked thread panics the kernel. `suspend_with_fault` has the same unchecked push
   onto the suspended list, which also holds 64. `BLOCKED_RESERVE`'s doc comment says blocking past
@@ -1961,7 +2062,11 @@ architecture lens returned no findings.
   REAP_RESERVE only. Demonstrated: a host probe printed blocked capacity 64, and `push_reserved` at
   capacity panicked with "blocked list: reserve exhausted — this list is sized so that cannot
   happen". architecture. high. **Fix**, as sched-3.
-- [ ] **sched-14** `kernel/src/sched/timers.rs:118` — A one-shot timer fired by the tick with no
+  Fixed in `deabe050`; fails without it:
+  `every_thread_the_cap_admits_can_block_wake_and_be_reaped_on_one_cpu` and
+  `a_thread_counts_from_its_first_placement_until_its_reap_is_drained`; a 512-thread cap every
+  scheduler list is reserved to hold.
+- [x] **sched-14** `kernel/src/sched/timers.rs:118` — A one-shot timer fired by the tick with no
   waiters is disarmed (deadline 0), so `Timer::already_signaled` becomes false. A `sys_wait` that
   arrives after that tick finds nothing signalled and no heap entry, and blocks with nothing to
   wake it. Whether a wait on an expired timer returns depends on whether some CPU's tick ran
@@ -1974,6 +2079,8 @@ architecture lens returned no findings.
   only loses its 1 s backstop. Demonstrated: a host probe armed a timer at 5000. `already_signaled(6000)`
   was true before `fire_expired_deadlines(6000)` and false after, with the heap empty. architecture.
   high. **Fix**, as sched-7.
+  Fixed in `1b6ee7ea`; fails without it:
+  `a_one_shot_timer_fired_with_no_waiter_still_reads_signaled`.
 - [ ] **sched-15** `kernel/src/sched/exit.rs:111` — When `exit_process` reaps a sibling blocked in
   `sys_wait`, the thread's kernel stack is freed without `sys_wait`'s `refs` array being dropped,
   so every object it waited on leaks one reference. An IPC endpoint pinned this way never runs
