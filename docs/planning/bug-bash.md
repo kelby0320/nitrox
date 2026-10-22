@@ -6,7 +6,7 @@ is one, 68 to fix in Part D, 60 later (4 in Part E, 56 in Part H) and 1 not. The
 the five found before the bash, the trials' unchecked test gaps and doc claims, and the laptop's
 two bugs, five to fix, one already fixed and three later. Group A fixed 2026-10-22, with sched-7
 and kobj-9 from groups E and B and the test gaps that ride with them; sched-10 stays open for one
-mutation.** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
+mutation. Group B fixed 2026-10-22: the twelve capability and rights leaks.** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
 laptop, what PR #365's two trial reviews found that `main` still has, and each `/bug-bash` run, a
 section a subsystem.
 
@@ -140,7 +140,7 @@ Found 24, refuted by a boot 0, reported 13.
   architecture. High. **Fix.**
   Fixed in `fcc06ce8`; fails without it:
   `a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it`.
-- [ ] **kobj-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` keeps the
+- [x] **kobj-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` keeps the
   transferred DeviceNode's object and discards its rights (`tr.rights` is never read).
   `FileObject::writeback` then issues Write IRPs to that device with no rights check. The only
   read-only gate is the `FILE_BLOCKS_READ_ONLY` flag the server sets itself (table.rs:2433). A
@@ -153,6 +153,9 @@ Found 24, refuted by a boot 0, reported 13.
   returned status 0, and the handle carried MAP_READ|MAP_WRITE. After `writeback`, the recording
   device saw a Write at offset 503808 (LBA 123), length 4096. error-paths also read the path;
   its own probe did not run. logic, error-paths, trust-boundary. High. **Fix.**
+  Fixed in `4043ae92`; fails without it:
+  `a_file_blocks_file_is_writable_only_as_far_as_its_server_may_write_the_device` and
+  `a_file_blocks_reply_installs_a_file_no_more_writable_than_its_server_holds_its_device`.
 - [x] **kobj-3** `kernel/src/object/ipc_channel.rs:99` — An allocation over the buddy allocator's
   4 MiB MAX_ORDER block, reachable from user input, trips `debug_assert!(order <= MAX_ORDER)`
   (buddy.rs:163) and panics the kernel. xtask builds the kernel with plain `cargo build`
@@ -181,7 +184,7 @@ Found 24, refuted by a boot 0, reported 13.
   'attempt to add with overflow' at elf.rs:182:22. logic. High. **Fix.**
   Fixed in `badc91cd`; fails without it:
   `a_program_header_offset_at_the_top_of_the_range_is_truncated`.
-- [ ] **kobj-5** `kernel/src/syscall/table.rs:2160` — A forwarded-resolve reply installs its
+- [x] **kobj-5** `kernel/src/syscall/table.rs:2160` — A forwarded-resolve reply installs its
   handle into `pl.owner_pid` without checking the process still exists, and the comment at 2164
   ('A dead caller pid takes this path — fails cleanly') is false: `HandleTable::allocate` has no
   liveness check. The exit sweeps (`close_all_owned_by`, the reaper, `reap_pending`) run once per
@@ -196,6 +199,8 @@ Found 24, refuted by a boot 0, reported 13.
   a reply gave status 0 with a live handle, and `cache_objects().len()` was 1. A swept-pid
   `allocate` also succeeded. The real race against the reaper was not booted. logic,
   error-paths, trust-boundary, architecture. Medium. **Fix.**
+  Fixed in `912e0dda`; fails without it: `a_reply_for_a_client_that_exited_leaves_no_handle_behind`
+  and `a_forwarded_reply_for_a_client_that_exited_pins_nothing`.
 - [x] **kobj-6** `kernel/src/object/ipc_channel.rs:366` — An endpoint sent over its own channel
   keeps a reference to itself in its own receive ring, so it is never freed. `sys_channel_send`
   (table.rs:1934-1937) checks only TRANSFER on each handle and does not refuse the channel's own
@@ -225,7 +230,7 @@ Found 24, refuted by a boot 0, reported 13.
   a boot probe on the root partition accepted reads of (off 0, len 100), (off 100, len 512) and
   (off 0, len 600). All completed status 0 with 100, 512 and 600 bytes. The disk did not wedge
   on QEMU, so the hang or DMA overrun is not shown. trust-boundary. Medium. **Fix.**
-- [ ] **kobj-8** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_*
+- [x] **kobj-8** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_*
   bits present in the requested `rights`. With `rights`=0 nothing is required, and the mapping
   is installed as `Protection::USER`, which is present and readable. A MemoryObject or
   FileObject handle without MAP_READ can be mapped and read, against `syscall-abi.md` (a
@@ -237,6 +242,7 @@ Found 24, refuted by a boot 0, reported 13.
   object's frame and `page_flags_for` = USER|NO_EXECUTE. logic, error-paths, trust-boundary.
   Reviewers disagreed on severity (the boot verifier and two lenses said low, trust-boundary
   said medium); ranked low as latent. **Fix.**
+  Fixed in `48cecf0b`; fails without it: boot-probe's `map_needs_read_test`.
 - [x] **kobj-9** `kernel/src/syscall/table.rs:1934` — `sys_channel_send`, and
   `sys_process_spawn`'s handle loop at 446, look up each listed handle separately and do not
   reject a handle listed twice. One handle sent as `[H, H]` arrives as two handles, and the
@@ -553,7 +559,7 @@ bitmask. The intermediate page-table frame leak on unmap is a recorded deferral.
 Lenses: logic, error-paths, trust-boundary, tests; returned nothing: none.
 Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates into 19).
 
-- [ ] **fs-1** `userspace/fs-server-ext4/src/ext4.rs:1747` — `rename_at` validates only the new
+- [x] **fs-1** `userspace/fs-server-ext4/src/ext4.rs:1747` — `rename_at` validates only the new
   name, so a directory session can rename its own `..` or `.` entry to an ordinary name. A session
   in a namespace bound with subtree base `/home/alice` renames `..` to `up`. `/home/alice/up` then
   names `/home`, and repeating it from there reaches `/`, which is a way out of the confined
@@ -564,8 +570,10 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   hop reached `/system`. `e2fsck -fn` reported "Second entry 'up' ... should be '..'" and "'..' in
   /d is <The NULL inode>". FAT is not affected, because `dir::entries` skips dot entries. Lenses:
   logic, error-paths, trust-boundary, tests (four reviewers found it independently). high. **Fix.**
+  Fixed in `25bd9eb9`, for every name a session sends; fails without it:
+  `a_directorys_dot_entries_are_never_renamed` and boot-probe's `dot_entries_test`.
 
-- [ ] **fs-2** `userspace/libfsserver/src/server.rs:650` — A directory session is bound to a bare id
+- [x] **fs-2** `userspace/libfsserver/src/server.rs:650` — A directory session is bound to a bare id
   (an ext4 inode number, a FAT first cluster). `live_dir` rejects only a freed id, not a reused
   one. A session is open on `/tmp/d`, then `/tmp/d` is rmdir'd. The next mkdir anywhere takes the
   same id (ext4 takes the lowest free inode; FAT takes the cluster once the allocation hint wraps).
@@ -576,6 +584,8 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   and `read_dir` listed `victim.txt`. `rename_at` and `unlink_at` through the stale id both
   returned Ok. The existing test `a_removed_directory_is_refused_to_a_session_still_holding_it`
   covers only the non-reuse case. Lenses: logic, error-paths, tests. high. **Fix.**
+  Fixed in `6ce9737a`: an rmdir ends every session on the directory; fails without it: boot-probe's
+  `removed_dir_session_test`.
 
 - [ ] **fs-3** `userspace/fs-server-ext4/src/ext4.rs:1705` — A rename writes the new name first and
   deletes the old one second (ext4 `rename_path`; FAT `Fat::rename`, volume.rs:823-848). If the
@@ -784,7 +794,7 @@ mount and unmount state bits each failed a test when broken.
 Lenses: logic, error-paths, trust-boundary, tests, architecture; returned nothing: none.
 Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct defects).
 
-- [ ] **drv-1** `kernel/src/drivers/xhci/storage.rs:688` — A bulk-only read whose data stage ends
+- [x] **drv-1** `kernel/src/drivers/xhci/storage.rs:688` — A bulk-only read whose data stage ends
   SHORT_PACKET has its real residual thrown away: `Disks::on_transfer` never gets the event's
   residual, so only the CSW residue counts. A stick that moves part of the data, then answers
   Passed with residue 0, completes the IRP as success with the full length. A malicious or broken
@@ -803,6 +813,9 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   `retire()` reports `irp.length` and never reads PRDBC; that half is unverified for SATA firmware.
   Linux keeps the larger of the actual and reported residue. Lenses: error-paths, trust-boundary.
   High. **Fix.**
+  Fixed in `4257f5cc` (USB) and `bc7e017d` (AHCI's PRDBC, not yet booted on the laptop's HBA); fails
+  without it: `a_short_read_whose_status_says_nothing_is_missing_fails` and
+  `a_command_that_moved_less_than_its_length_fails`.
 
 - [ ] **drv-2** `kernel/src/drivers/ahci.rs:869` — `poll_complete_inflight` discards
   `wait_command_polled`'s timeout. `take_retired` then judges the command by TFD.ERR alone, so a
@@ -821,7 +834,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   :591-606). Its comment claims the IRP completes "with its error status" on a timeout. Lenses:
   logic, error-paths. High. **Fix.**
 
-- [ ] **drv-3** `kernel/src/drivers/gpt.rs:236` — `/dev/disk/by-partlabel/<label>` goes to the
+- [x] **drv-3** `kernel/src/drivers/gpt.rs:236` — `/dev/disk/by-partlabel/<label>` goes to the
   first boot-time disk published, and a later disk with the same label fails to bind
   (AlreadyBound, one log line). `drivers::probe` registers the AHCI disk before the RAM-disk
   modules (drivers/mod.rs:28-56), and `gpt::init` walks the table in that order. The BOOT flag is
@@ -835,6 +848,10 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   and the label named the internal disk, not the live one. The end-to-end mount was not run; it
   needs a live-image boot with such an AHCI disk. Lenses: trust-boundary, architecture. High.
   **Fix.**
+  Fixed in `3cea152b`, the storage service's matching with it; fails without it:
+  `a_name_two_partitions_carry_goes_to_the_boot_mediums`,
+  `a_name_two_partitions_carry_is_the_boot_mediums`, and check-storage, whose disk gains a decoy
+  `nitrox-live`.
 
 - [ ] **drv-4** `kernel/src/syscall/table.rs:2393` — A FILE_BLOCKS resolve reply discards the
   rights of the block DeviceNode handle the server transfers (`tr.rights`). The MEMOBJ path
@@ -1201,7 +1218,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   would be accepted as end of table instead of BadRecordTag. Test gap; the code is correct
   today. Demonstrated: `bitmap & !STREAM_MASK != 0` changed to `if false` and the BadRecordTag
   arm replaced with a `break`; all libstream tests passed. Restored. tests. Low. **Later.**
-- [ ] **proto-18** `kernel/src/syscall/table.rs:263` — `sys_file_truncate`, `sys_file_grow` and
+- [x] **proto-18** `kernel/src/syscall/table.rs:263` — `sys_file_truncate`, `sys_file_grow` and
   `sys_file_create` narrow the u64 size register with `a4 as u32` before it reaches the wire
   (`ResolveOp::Size(a4 as u32, ...)`, table.rs:251, 253, 263). A size of 4 GiB or more is taken
   modulo 2^32 instead of refused with TooLarge. `sys_file_truncate(ns, path, MAP_READ|MAP_WRITE,
@@ -1211,6 +1228,8 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   sizes at 8 MiB (MAX_COPY), so only direct syscall users reach this today. Unverified: read
   only. A host test of the syscall's size argument at 2^32 + n would settle it. architecture.
   Low. **Fix.**
+  Fixed in `20d88936`, with `sys_channel_send`'s mode likewise; fails without it:
+  `a_file_size_or_rename_flags_past_what_the_wire_carries_are_refused`.
 
 What held up: all eight kernel `rsproto.rs` parsers (`parse_reply`, `parse_read_range_reply`,
 `reply_body`, `subnamespace_reply`, `file_blocks_reply_header`, `file_blocks_run`,
@@ -1247,7 +1266,7 @@ want to drop them.
 Lenses: logic, error-paths, trust-boundary, tests; returned nothing: none.
 Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
 
-- [ ] **sec-1** `kernel/src/syscall/table.rs:1943` — `sys_channel_send` copies the sender's whole
+- [x] **sec-1** `kernel/src/syscall/table.rs:1943` — `sys_channel_send` copies the sender's whole
   4096-byte buffer and never zeroes the payload past `payload_len`, and `sys_channel_recv`
   (line 2771) copies all 4096 bytes back out. `docs/spec/ipc-message-format.md` lines 81 and 144
   say the kernel zero-fills those bytes. tty-server sends every reply from one static
@@ -1266,8 +1285,10 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   `READ_LINE` reply with `hunter2` and then an empty `SET_MODE` reply into one buffer, and
   `msg[52..59]` was still `hunter2`. The end-to-end read of one process's password by another
   was not booted. error-paths, trust-boundary. High. **Fix.**
+  Fixed in `db81c70d`; fails without it: `a_sealed_message_carries_nothing_past_its_payload`, and
+  boot-probe's `payload_sealed_test`.
 
-- [ ] **sec-2** `userspace/view-broker/src/main.rs:615` — `end_session` unbinds only the storage,
+- [x] **sec-2** `userspace/view-broker/src/main.rs:615` — `end_session` unbinds only the storage,
   policy and accounts grants and the block devices. The services (`/dev/services/admin`), power
   (`/dev/power`), logs (`/dev/logs`) and kernel-log (`/dev/log`) grants stay bound in the view.
   `rsproto-views-ops.md` says CloseSession "unbinds their grants", and the forcible-kill entry
@@ -1288,8 +1309,10 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   gate (`with admin` on a program that ignores terminate, log out, resolve
   `/dev/services/admin`) would confirm it end to end. logic, error-paths, trust-boundary.
   Medium. **Fix.**
+  Fixed in `ec85409c`, at a program's exit too; fails without it: boot-probe's
+  `view_grants_end_test`.
 
-- [ ] **sec-3** `userspace/view-broker/src/main.rs:919` — A request's grants are decided against
+- [x] **sec-3** `userspace/view-broker/src/main.rs:919` — A request's grants are decided against
   `/system/views.toml` when the Request arrives and stored in `Pending`. `check()` then calls
   `start()`, which spawns with `p.grants` (line 1304) without reading the policy again. Nothing
   times out a `State::Password`. Scenario: bob sends `with admin nxsh`, the broker answers
@@ -1302,6 +1325,8 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   `check()` (983) authenticates and calls `start()` (1012), which loops over `p.grants` (1304)
   and never calls `read_policy` or `decide` again. Only three failures, `client_gone` or
   `end_session` end a `State::Password`. Not run. error-paths. Medium. **Fix.**
+  Fixed in `4b69182f`; fails without it: boot-probe's `policy_test`, two requests waiting for a
+  password across an install.
 
 - [ ] **sec-4** `userspace/view-broker/src/main.rs:531` — `serve_resolve` admits a client channel
   only by the broker's global wait-set load, with no per-session limit. Idle client channels
@@ -1318,7 +1343,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   as two slots in `load()` (1601-1613). `end_session` (598-646) touches only Running, Password
   and Changing clients. The exhaustion itself was not booted. trust-boundary. Medium. **Later.**
 
-- [ ] **sec-5** `userspace/session-mgr/src/main.rs:376` — `tty_request` takes the first message on
+- [x] **sec-5** `userspace/session-mgr/src/main.rs:376` — `tty_request` takes the first message on
   the login terminal if its op matches, and never steps over tty-server's unsolicited
   `OP_TTY_INTERRUPT` (request id 0). A Ctrl-C at the serial login prompt then puts every later
   request one reply behind for the rest of `login()`. Scenario: at `nitrox login:` the person
@@ -1337,6 +1362,8 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   same model skipping rid-0 messages, as `libprompt::tty` does): the resumed user read got an
   empty line, then password write Ok, echo off Ok, password read Blocked, and nothing echoed.
   logic. Medium. **Fix.**
+  Fixed in `f2f7146d`; fails without it: test-interactive, a Ctrl-C at `nitrox login:` and the
+  password after it.
 
 - [ ] **sec-6** `userspace/auth-service/src/main.rs:379` — auth-service never closes handles that
   arrive with a message. `serve_resolve` (312) and `serve_session` (381) receive into

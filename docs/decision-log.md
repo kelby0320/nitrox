@@ -36668,3 +36668,34 @@ The fixes are in `bug-bash.md`; what a caller can now see differently is here:
 - **A spawn's duplicate grant needs `DUPLICATE`** (`NoAccess` without it), as
   `sys_handle_duplicate` does: `process-spawn-args.md` had asked only `TRANSFER`, against
   `handle-encoding.md`. No in-tree spawner grants a handle without moving it.
+
+## 2026-10-22 — Before Phase 7, Part D: group B's fixes change these contracts
+
+The bash's capability and rights leaks are fixed, twelve findings. `bug-bash.md` has each fix; what
+a caller can now see differently is here:
+
+- **A message carries nothing past its payload**: the kernel zeroes the rest of the bounce buffer
+  before the receiver can map it.
+- **A `FILE_BLOCKS` file is writable only as far as its server may write the device**: no `READ`,
+  no file; `MAP_WRITE` only with the device's `WRITE` and no `FILE_BLOCKS_READ_ONLY`.
+  `libfsserver` duplicates the device for the kernel with its own `WRITE`, if it has one.
+- **Every mapping needs `MAP_READ`**, whatever else it asks.
+- **A forwarded resolve's reply for a client that has exited completes `PeerClosed`**, its handle
+  closed again, rather than pinning its object for ever.
+- **A file size past 32 bits is `TooLarge`, and rename flags past 16 `InvalidArgument`**, never
+  cut to fit the wire. So is a send mode with high bits set.
+- **A read that moved less than its length fails `IoError`**: a USB read whose data stage came up
+  short, whatever the stick's status says, and an AHCI command whose byte count (PRDBC) falls short.
+  The AHCI half is QEMU's alone so far; the laptop's HBA has not booted it.
+- **A `/dev/disk` name two partitions carry is the boot medium's**: the disk Limine started from,
+  or a module's RAM disk. Otherwise it goes to the first found, and the storage service matches
+  `init`'s mounts the same way.
+- **A directory session names its own entries, never `.` or `..`**, and **an `Rmdir` ends every
+  session on the directory it removes**, since its id can be the next directory's.
+  `Volume::rmdir_at` returns that id.
+- **A view's grants are unbound when its program exits**, as at its session's close, now every
+  grant rather than three, so what the program started resolves nothing new through them.
+- **A view request is decided again when its password comes**: it starts only if the policy still
+  allows it with the same grants, and is refused otherwise, to be asked again.
+- **`session-mgr` matches a terminal's reply by its request id**, stepping over the interrupt a
+  Ctrl-C sends.
