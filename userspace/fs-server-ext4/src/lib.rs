@@ -1575,6 +1575,20 @@ mod tests {
         assert_e2fsck_clean(&rw.0.into_inner(), "a removed directory left alone");
     }
 
+    /// `.` and `..` are no entries to rename: `..` renamed `up` named the parent, a way out of a
+    /// directory a session is confined to, and the directory kept no `..`.
+    #[test]
+    fn a_directorys_dot_entries_are_never_renamed() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let sys = dir_ino(&rw, b"/system");
+        for old in [&b".."[..], b"."] {
+            assert_eq!(ext4::rename_at(&rw, sys, old, b"up", TEST_NOW), Err(FsError::Unsupported));
+        }
+        assert!(!names_of(&rw, b"/system").iter().any(|n| n == "up"));
+        assert_e2fsck_clean(&rw.0.into_inner(), "dot entries left alone");
+    }
+
     #[test]
     fn rename_at_moves_within_a_dir_and_stays_e2fsck_clean() {
         use std::cell::RefCell;

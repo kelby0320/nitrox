@@ -11,6 +11,7 @@
 //! The request→reply logic is the host-tested [`crate::serve`]; this module is the syscall
 //! plumbing, **alloc-free**: fixed `.bss` buffers, one set per process.
 
+use crate::serve::entry_name;
 use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve, serve_grown};
 use crate::{DirEntry, FsError, Refusal, Volume};
 use libkern::*;
@@ -659,7 +660,7 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
             }
             // Each names an entry in the bound directory, so a handle can never mutate outside it.
             OP_FILE_MKDIR | OP_FILE_UNLINK | OP_FILE_RMDIR | OP_FILE_TOUCH => {
-                let r = match parse_name_request(body) {
+                let r = match parse_name_request(body).filter(|n| entry_name(n)) {
                     Some(name) => match op {
                         OP_FILE_MKDIR => vol.mkdir_at(dir, name, now_secs()),
                         // The last name's removal frees the file only once the kernel has
@@ -678,8 +679,8 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
             }
             OP_FILE_RENAME => {
                 let r = match parse_rename_request(body) {
-                    Some((old, new)) => vol.rename_at(dir, old, new, now_secs()),
-                    None => Err(FsError::Unsupported),
+                    Some((old, new)) if entry_name(old) && entry_name(new) => vol.rename_at(dir, old, new, now_secs()),
+                    _ => Err(FsError::Unsupported),
                 };
                 reply_session_status(session_ch, request_id, op, r);
             }

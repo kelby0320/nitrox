@@ -200,6 +200,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & file_cache_test(root_ns)
         & unlinked_file_test(root_ns)
         & flush_test(root_ns)
+        & dot_entries_test(root_ns)
         & power_refused_test(root_ns)
         & clock_set_refused_test()
         & bind_needs_transfer_test()

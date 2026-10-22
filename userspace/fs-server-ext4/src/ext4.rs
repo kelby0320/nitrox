@@ -1751,7 +1751,7 @@ pub fn rename_at<RW: BlockReader + BlockWriter>(
     new: &[u8],
     now: i64,
 ) -> Result<(), FsError> {
-    if new.is_empty() || new.len() > 255 || new.contains(&b'/') || new == b"." || new == b".." {
+    if !libfsserver::serve::entry_name(old) || !libfsserver::serve::entry_name(new) {
         return Err(FsError::Unsupported);
     }
     let sb = read_superblock(rw)?;

@@ -313,6 +313,52 @@ pub(super) fn unlinked_file_test(root_ns: u64) -> bool {
     }
 }
 
+/// **A directory session names its own entries, never `.` or `..`**: `..` renamed gave the parent a
+/// name inside the directory, a way out of a subtree a session is confined to, and a touch of it
+/// stamped the parent. Each is refused, and the directory, keeping its `..`, is removed after.
+pub(super) fn dot_entries_test(root_ns: u64) -> bool {
+    use librsproto::session::Dir;
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: dot entries FAIL: ").s(why).end();
+        false
+    };
+    let mut sys_buf = [0u8; 4096];
+    let Ok(mut sys) = Dir::open(root_ns, b"/system", &mut sys_buf) else {
+        return fail(b"/system does not open");
+    };
+    if sys.mkdir(b"probe-dots").is_err() {
+        sys.close();
+        return fail(b"the directory is not made");
+    }
+    let mut buf = [0u8; 4096];
+    let (renamed, touched, up) = match Dir::open(root_ns, b"/system/probe-dots", &mut buf) {
+        Ok(mut d) => {
+            let renamed = [&b".."[..], b"."].iter().any(|old| d.rename(old, b"up").is_ok());
+            let touched = d.touch(b"..").is_ok() || d.touch(b".").is_ok();
+            let mut up = false;
+            let _ = d.read_dir(|e| {
+                up |= e.name == b"up";
+                true
+            });
+            d.close();
+            (renamed, touched, up)
+        }
+        Err(_) => (true, true, true),
+    };
+    let removed = sys.rmdir(b"probe-dots").is_ok();
+    sys.close();
+    match (renamed, touched, up, removed) {
+        (false, false, false, true) => {
+            kprint(b"boot-probe: a session's rename and touch of . and .. refused ok\n");
+            true
+        }
+        (true, ..) => fail(b"a rename of . or .. was taken"),
+        (_, true, ..) => fail(b"a touch of . or .. was taken"),
+        (.., true, _) => fail(b"the directory lists an entry named up"),
+        _ => fail(b"the directory does not remove"),
+    }
+}
+
 /// **A flush of the root disk completes.** `IoOpcode::Flush` on the root partition goes down to
 /// its disk (AHCI's `FLUSH CACHE EXT` in `test-qemu`) and its `PendingOperation` completes with
 /// status `0`. Two refusals alongside, which a flush path that ignored its descriptor would

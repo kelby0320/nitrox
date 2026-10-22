@@ -50,6 +50,9 @@ servers speak one protocol and a fix to it is a fix to both:
   (FAT's, to zero).
 - **A rename is resolved before the directory-session path**, which infers "directory open" from
   the suffix naming a directory; renaming a directory names one too.
+- **A session names entries of its own directory, never `.` or `..`** (`serve::entry_name`, checked
+  in `serve_session` for every op that takes a name): `..` renamed was a way out of a subtree, and
+  each filesystem's own refusals are not the boundary.
 - **`read_meta` is for what only the server writes**: directories, inode tables, bitmaps,
   descriptors, superblocks, extent nodes, the FAT. **Never a file's data**, which the kernel writes
   to the device behind the server's back — a cached copy of it would be stale. A read left as
