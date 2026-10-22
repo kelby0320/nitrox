@@ -36611,3 +36611,35 @@ could not:
 
 A stick formatted with `disk --format` mounted and ejected as the gates have it. **Part C is
 complete**, and Part D, the bug bash, is next.
+
+## 2026-10-22 — Before Phase 7, Part D: the bash triaged, and a Part H for what it left
+
+**The bash ran on `main` at `510381f4`**, eight subsystems by the maintainer, with kernel memory's
+and the scheduler's architecture lenses run again where the first runs lost them. With what PR
+#365's two trial reviews left, read against `main`: **154 findings, 129 once a defect several runs
+found is one** — the timer's dangling heap entry three times, the panic past the buddy's largest
+block five. Triaged with the maintainer from a draft of suggested verdicts; `bug-bash.md` holds
+each.
+
+- **What breaks a boundary is fixed in Part D** (the maintainer's call, so Part E can start soon):
+  any process panicking or corrupting the kernel, a capability or rights leak, a filesystem losing
+  data, the drivers' faults, a scheduler leak or hang one process inflicts on all, and handles that
+  arrive with a message never closed. **Also fixed there**: a slow stick at boot losing the storage
+  service for the whole boot (sup-1), the one later finding the laptop could meet in ordinary use;
+  and **each test gap in code a fix changes**, written with that fix, since the test is the
+  regression net for the very change. 68 to fix.
+- **The rest is later, in a new Part H** between Part G and Phase 7 (the maintainer's call): the
+  supervisors' and parsers' defects, the remaining test gaps, and six kernel, driver and filesystem
+  findings no boundary crosses. **Four go to Part E instead**: `sys_file_sync` bound to files by
+  its name, and three in the memory-mapping path that Phase 7's threads and loader reach first.
+  60 later.
+- **`bug-bash.md` is a later finding's record**: no `TODO(tag)` or `deferred-decisions.md` entry
+  each, as a part of the plan schedules them, and **no GitHub issues** (the maintainer's call:
+  overhead the project does not need now).
+- **sec-11, no** (the maintainer's ruling): a wrong current password on ChangePassword holds the
+  next check and leaves the session's remembered-password windows open, as the code does. The
+  spec's "a refused password forgets every window" is narrowed to `with`'s password.
+- **Not yet triaged**: the five findings from before the bash, and the trials' test gaps and doc
+  claims not yet checked against `main` (pr365-11, pr365-12). **The laptop's two bugs** — `nxterm`
+  painting only when the pointer moves, the Applications menu's search clearing — are Part D's
+  still, to be reproduced first.

@@ -7,8 +7,10 @@ built; Part B detailed 2026-10-14; B.1 built 2026-10-15; B.2 built 2026-10-16; B
 budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19; C.1 built
 2026-10-19; C.2 built 2026-10-19; C.3 built 2026-10-19; C.4 built 2026-10-19, the light left to
 the laptop; C.5 built 2026-10-20 — Part C built; the stick's light confirmed on the laptop
-2026-10-20 — Part C complete.** Each later part gets its detail pass when it is next. Seven parts, A–G, in the order below. Part E is the
-syscall-surface consolidation, planned separately in [`syscall-surface.md`](syscall-surface.md).
+2026-10-20 — Part C complete; Part D's bash run 2026-10-20 and triaged 2026-10-22, Part H added
+for what it left (the maintainer's call).** Each later part gets its detail pass when it is next.
+Eight parts, A–H, in the order below. Part E is the syscall-surface consolidation, planned
+separately in [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
 
@@ -935,9 +937,22 @@ that fails without the fix.
   and supervision (`storage-service`, `device-mgr`, `init`, `service-mgr`). Eight runs at first,
   each the maintainer's to start; more later as the budget allows.
 
+**Triaged 2026-10-22**, the eight runs, kernel memory's and the scheduler's architecture lenses run
+again, and PR #365's leftovers: 154 findings, 129 once a defect several runs found is one. **What
+breaks a boundary is fixed here** (the maintainer's call, so Part E can start): any process
+panicking or corrupting the kernel, a capability or rights leak, a filesystem losing data, the
+drivers' faults, a scheduler leak or hang one process inflicts on all, and handles that arrive with
+a message never closed. With them, a slow stick at boot losing the storage service for the boot
+(sup-1), and each test gap in code a fix changes, written with that fix. 68 to fix; 60 later, four
+in Part E and the rest in Part H; one not. `bug-bash.md` holds each verdict.
+
 ## Part E — the syscall surface
 
-As [`syscall-surface.md`](syscall-surface.md) plans it, after its own detail pass.
+As [`syscall-surface.md`](syscall-surface.md) plans it, after its own detail pass. **With it, four
+of the bash's findings** ([`bug-bash.md`](bug-bash.md)): `sys_file_sync`'s name and lookup binding
+it to files (kmem-30), and three in the memory-mapping path that Phase 7's threads and loader reach
+first: two hint-less maps racing for one range (kmem-29), a kernel copy from a page not yet faulted
+in failing (kmem-28), and a refault after a remap (kmem-15).
 
 ## Part F — context menus
 
@@ -949,6 +964,26 @@ dismisses, and menus in Files, the editor, the terminal and on the desktop.
 The system's workings written down for the person using it — the shell language, each program,
 the desktop — read with a `man`-style program from pages on the root filesystem, whose source is
 in the repository so there is one copy.
+
+## Part H — what the bash left
+
+**Added 2026-10-22, when Part D was triaged (the maintainer's call)**: the findings marked
+**later** in [`bug-bash.md`](bug-bash.md), which is their record. After Part G, so Part E is not
+held for them; before Phase 7, which builds on what they leave. Each is checked against `main`
+first, as Part E will have moved much of the code they name, then reproduced and fixed with a test
+that fails without it, as Part D's are.
+
+- **Supervisors, sessions and parsers**: one app holding every client slot of the view broker or
+  the storage service (sec-4, sup-6), the stream decoder's unbounded depth and cost (proto-7,
+  proto-8), `service-mgr`'s backoff and bring-up, and the rest of the class.
+- **Test gaps on a security boundary** that Part D's fixes do not write: the crypto comparison and
+  padding, `authenticate`, the GPT and partition guards, the USB descriptors, the kernel's codec,
+  a handle's rights and a fresh frame's zeroes.
+- **The other test gaps**, off a boundary.
+- **Six kernel, driver and filesystem findings**: kernel address space never reclaimed (kmem-9), a
+  server dying with a fill pending (kobj-10), a spawn reporting failure after its child runs
+  (kobj-11), a second AHCI controller (drv-8), and ext4's lost directory growth and extents over
+  metadata (fs-9, fs-11).
 
 ## Not here
 
@@ -967,4 +1002,5 @@ several branches at once, which waits on the gates leaving this machine.
 - CI's wall clock about 6 minutes.
 - Part C's fixes in, the stick's light confirmed on the laptop; Part D's bash run on its eight
   subsystems and every finding in `bug-bash.md` triaged, the ones marked fix fixed; Part E done as
-  its plan says; Parts F and G built.
+  its plan says; Parts F and G built; Part H's findings fixed, or each one's deferral past Phase 7
+  agreed with the maintainer.

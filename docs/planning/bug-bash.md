@@ -1,9 +1,12 @@
 # The bug bash: findings and their triage
 
-**Status: started 2026-10-14; five findings untriaged, three from Part C's detail pass, one from
-its PR's CI and one from building C.1.** Part D of
-[`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the laptop, what PR #365's two
-trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
+**Status: started 2026-10-14; triaged 2026-10-22 with the maintainer — the bash's eight runs,
+its two re-runs and what PR #365's trials left: 154 findings, 129 once a defect several runs found
+is one, 68 to fix in Part D, 60 later (4 in Part E, 56 in Part H) and 1 not. Untriaged: the five
+found before the bash, and the trials' test gaps and doc claims not yet checked (pr365-11,
+pr365-12).** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
+laptop, what PR #365's two trial reviews found that `main` still has, and each `/bug-bash` run, a
+section a subsystem.
 
 ## How a finding is kept
 
@@ -15,9 +18,13 @@ Each run's findings come as one section, headed with the subsystem and the commi
 hunted, in the shape `.claude/skills/bug-bash/report.md` gives.
 
 The ID is the subsystem's short name and a number, such as `kobj-3`. Triage, with the maintainer,
-adds one word after the severity: **fix** (in Part D), **later** (with a `TODO(tag)` and its
-`deferred-decisions.md` entry), or **no** (with the reason). A finding is reproduced before it is
-fixed, and its box is ticked with the commit that fixed it and the test that fails without it.
+adds one word after the severity: **fix** (in Part D), **later** (in Part H of
+[`pre-phase-7.md`](pre-phase-7.md), or in Part E where it says so), or **no** (with the reason).
+**This file is a later finding's record**: a part of the plan schedules it, so it takes no
+`TODO(tag)` and no `deferred-decisions.md` entry. A finding another run found first names it —
+**fix**, as kobj-1 — and goes with it. A test gap marked fix is written with the fix it names,
+which changes the code it guards. A finding is reproduced before it is fixed, and its box is
+ticked with the commit that fixed it and the test that fails without it.
 
 ## Findings
 
@@ -112,7 +119,7 @@ Found 24, refuted by a boot 0, reported 13.
   timer, dropped it, and the heap kept an entry whose target was the freed address. A new timer
   reused the slot, and firing the stale entry at now=200 disarmed it (its deadline went
   1_000_000 -> 0). The close and exit paths remove only `DeadlineKind::Thread` entries. logic,
-  architecture. High.
+  architecture. High. **Fix.**
 - [ ] **kobj-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` keeps the
   transferred DeviceNode's object and discards its rights (`tr.rights` is never read).
   `FileObject::writeback` then issues Write IRPs to that device with no rights check. The only
@@ -125,7 +132,7 @@ Found 24, refuted by a boot 0, reported 13.
   right writes the disk. Demonstrated: a host probe with a READ|TRANSFER device and flags 0
   returned status 0, and the handle carried MAP_READ|MAP_WRITE. After `writeback`, the recording
   device saw a Write at offset 503808 (LBA 123), length 4096. error-paths also read the path;
-  its own probe did not run. logic, error-paths, trust-boundary. High.
+  its own probe did not run. logic, error-paths, trust-boundary. High. **Fix.**
 - [ ] **kobj-3** `kernel/src/object/ipc_channel.rs:99` — An allocation over the buddy allocator's
   4 MiB MAX_ORDER block, reachable from user input, trips `debug_assert!(order <= MAX_ORDER)`
   (buddy.rs:163) and panics the kernel. xtask builds the kernel with plain `cargo build`
@@ -138,14 +145,14 @@ Found 24, refuted by a boot 0, reported 13.
   unbounded server u32 before the per-run body-length check. Demonstrated: a host probe of
   `try_new_pair(1024)` panicked with 'buddy: alloc order 11 > MAX_ORDER', and `try_new_pair(900)`
   was fine. A 5 MiB spawn image panicked and a 3 MiB one was fine. The FILE_BLOCKS case was read,
-  not run. architecture. High.
+  not run. architecture. High. **Fix.**
 - [ ] **kobj-4** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE`
   without a checked add. `load_elf` only checks `e_phoff + i*56`, so an `e_phoff` within 56
   bytes of `u64::MAX` overflows, and with overflow-checks on in the dev profile the kernel
   panics. Any process passes a MemoryObject, or a file it can map, holding a valid ELF64 header
   with `e_phnum`=1, `e_phentsize`=56 and `e_phoff`=`u64::MAX-8` as `SpawnArgs.image` to
   `sys_process_spawn`. Demonstrated: a host probe with those header bytes panicked with
-  'attempt to add with overflow' at elf.rs:182:22. logic. High.
+  'attempt to add with overflow' at elf.rs:182:22. logic. High. **Fix.**
 - [ ] **kobj-5** `kernel/src/syscall/table.rs:2160` — A forwarded-resolve reply installs its
   handle into `pl.owner_pid` without checking the process still exists, and the comment at 2164
   ('A dead caller pid takes this path — fails cleanly') is false: `HandleTable::allocate` has no
@@ -160,7 +167,7 @@ Found 24, refuted by a boot 0, reported 13.
   the sweep and then a reply for the dead pid. `close_all_owned_by` returned 1 on a second call,
   a reply gave status 0 with a live handle, and `cache_objects().len()` was 1. A swept-pid
   `allocate` also succeeded. The real race against the reaper was not booted. logic,
-  error-paths, trust-boundary, architecture. Medium.
+  error-paths, trust-boundary, architecture. Medium. **Fix.**
 - [ ] **kobj-6** `kernel/src/object/ipc_channel.rs:366` — An endpoint sent over its own channel
   keeps a reference to itself in its own receive ring, so it is never freed. `sys_channel_send`
   (table.rs:1934-1937) checks only TRANSFER on each handle and does not refuse the channel's own
@@ -170,7 +177,7 @@ Found 24, refuted by a boot 0, reported 13.
   it stay allocated, up to seven MemoryObjects of up to 16 MiB per queued message. Repeating this
   from short-lived processes exhausts kernel memory. Demonstrated: a host probe pushed
   `send_push(a, msg, [b])` and dropped both creation references. It asserted two destroys and
-  got 1 (left 1, right 2). error-paths. Medium.
+  got 1 (left 1, right 2). error-paths. Medium. **Fix.**
 - [ ] **kobj-7** `kernel/src/syscall/table.rs:1620` — `sys_io_submit` on a block device does not
   check that offset and length are multiples of the block size, or that offset+length lies
   within the device. `device-node.md` and `io-operation.md` require a synchronous
@@ -184,7 +191,7 @@ Found 24, refuted by a boot 0, reported 13.
   IRPs, the root filesystem's included, could hang. Demonstrated (the missing validation only):
   a boot probe on the root partition accepted reads of (off 0, len 100), (off 100, len 512) and
   (off 0, len 600). All completed status 0 with 100, 512 and 600 bytes. The disk did not wedge
-  on QEMU, so the hang or DMA overrun is not shown. trust-boundary. Medium.
+  on QEMU, so the hang or DMA overrun is not shown. trust-boundary. Medium. **Fix.**
 - [ ] **kobj-8** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_*
   bits present in the requested `rights`. With `rights`=0 nothing is required, and the mapping
   is installed as `Protection::USER`, which is present and readable. A MemoryObject or
@@ -196,7 +203,7 @@ Found 24, refuted by a boot 0, reported 13.
   `MAP_READ` gives NoAccess and `rights`=0 gives Ok(0x100000000), with `translate` finding the
   object's frame and `page_flags_for` = USER|NO_EXECUTE. logic, error-paths, trust-boundary.
   Reviewers disagreed on severity (the boot verifier and two lenses said low, trust-boundary
-  said medium); ranked low as latent.
+  said medium); ranked low as latent. **Fix.**
 - [ ] **kobj-9** `kernel/src/syscall/table.rs:1934` — `sys_channel_send`, and
   `sys_process_spawn`'s handle loop at 446, look up each listed handle separately and do not
   reject a handle listed twice. One handle sent as `[H, H]` arrives as two handles, and the
@@ -206,6 +213,7 @@ Found 24, refuted by a boot 0, reported 13.
   Spawn with `handles=[H, H]` does the same, but only the channel path was run. Demonstrated: a
   boot probe sent `[H, H]`, count=2, with a DUPLICATE-less INSPECT|TRANSFER memory handle over a
   loopback channel. Send returned 0, and recv returned 0 with count 2. error-paths, tests. Low.
+  **Fix.**
 - [ ] **kobj-10** `kernel/src/sched/ipc.rs:453` — When a userspace server's endpoint dies,
   `ipc_endpoint_closing` and `us_reg_detach` drain only the registration's pending lookups,
   never its pending fills (`File::ReadRange`, Model B). A thread faulting a lazy
@@ -217,14 +225,14 @@ Found 24, refuted by a boot 0, reported 13.
   dropped, gave 'lookup signalled true (-13, 0); fill signalled false (0, 0)'. The FileObject
   refcount was 2 (the test's reference plus the stranded fill's), and nothing drains
   `pending_fill`. logic, trust-boundary. Reviewers disagreed on severity (logic: medium,
-  trust-boundary: low); ranked low.
+  trust-boundary: low); ranked low. **Later.**
 - [ ] **kobj-11** `kernel/src/syscall/table.rs:483` — When allocating the parent's Process
   handle fails after the child thread is queued, `sys_process_spawn` returns an error while the
   child runs. It skips the move-close loop at 493-497, so the parent's move_mask handles stay
   open although the child already holds them. This needs a handle-table segment grow to fail
   after `spawn_user`. The parent sees a failed spawn and may retry, starting a second child.
   Unverified: needs a failure injection in the global table's segment grow and a boot to
-  settle. error-paths. Low.
+  settle. error-paths. Low. **Later.**
 - [ ] **kobj-12** `kernel/src/handle/table.rs:588` — No test hands `duplicate()` a `new_rights`
   with bits the source lacks, so replacing `info.rights & new_rights` with `new_rights` passes
   the whole kernel host suite. This is a test gap, not a defect in code that works, and it is
@@ -232,7 +240,7 @@ Found 24, refuted by a boot 0, reported 13.
   DUPLICATE|SIGNAL could mint TERMINATE; `allocate`'s type check does not stop amplification
   within a type). Demonstrated: the one-line break left 986 passed, 0 failed. The restrict twin
   is caught by `restrict_on_cannot_amplify`. tests. The reviewer rated it high; as a test gap,
-  low.
+  low. **Later.**
 - [ ] **kobj-13** `kernel/src/syscall/table.rs:1163` — Several syscall-level guards have no host
   coverage; these are test gaps, not defects. Removing `require_syscap(BIND_NAMESPACE)` in
   `sys_ns_bind`, `direct_bindable(rights)?`, `Rights::LOOKUP` on `sys_ns_derive`, the
@@ -242,7 +250,7 @@ Found 24, refuted by a boot 0, reported 13.
   `sys_memory_map`'s `size > max_bytes` check. Unverified: the host-survival claim was not
   re-run, and no per-break boot controls were run. A boot probe for bind-needs-TRANSFER exists
   and passes. Boot runs with each break would show which guards the QEMU probes catch. tests.
-  Low.
+  Low. **Later.**
 
 What held up: Deleting the owner-pid, generation or rights-subset check in handle lookup fails
 several tests. Close and restrict owner and generation checks fail named tests, and so do
@@ -277,7 +285,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   and kernel-half entries. `cargo xtask test-qemu --kvm` on an Intel i7-10875H, with a hand-built
   ELF swapped into the 15th spawn: the kernel took `#GP` with cs 0x0008, the `iretq` frame showed
   rip=0x0000800000000000 and cs=0x23, and the dump ended "stopping every CPU". Lenses: logic,
-  trust-boundary. High.
+  trust-boundary. High. **Fix.**
 - [ ] **kmem-2** `kernel/src/syscall/table.rs:885` — User mappings may reach `USER_VIRT_END`, so the
   last canonical user page (0x7FFF_FFFF_F000) can be mapped executable, by a hinted
   `sys_memory_map` (`end > USER_VIRT_END` is the only bound) or an ELF PT_LOAD. A `syscall` in its
@@ -288,7 +296,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   PT_LOAD there and a `syscall` in its last two bytes: the kernel stopped at cs 0x0008 inside
   `syscall_entry` with rcx=0x0000800000000000, rsp on the user stack, and the machine halted. The
   serial output was interleaved, so the vector line was garbled. AMD is unaffected. Linux
-  reserves this page for this reason. Lens: logic. High.
+  reserves this page for this reason. Lens: logic. High. **Fix.**
 - [ ] **kmem-3** `kernel/src/mm/addr_space.rs:274` — `AddressSpace::fault_in`'s Anonymous arm
   assumes the PTE is still absent and hits `unreachable!()` when `map_page` returns
   `AlreadyMapped`. `map_file_page` accepts `AlreadyMapped` for the same race. Two threads of one
@@ -298,7 +306,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   page-aligned not-present mapping"). Reachable with `sys_thread_create` and no privilege.
   Demonstrated: a host test did `map_vma_lazy`, then `fault_in` twice on one page, and the second
   call panicked at `addr_space.rs:274`. The two-CPU interleaving itself was not booted. Lenses:
-  error-paths, trust-boundary, tests. High.
+  error-paths, trust-boundary, tests. High. **Fix.**
 - [ ] **kmem-4** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE`
   unchecked. `load_elf` bounds `e_phoff + i*56` but not the `+56`, and every image boots a
   dev-profile kernel (`overflow-checks = true`). A MemoryObject holding an ELF with `e_phoff` near
@@ -307,7 +315,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   with `e_phoff = u64::MAX - 8` panicked with "attempt to add with overflow" at `elf.rs:182`. The
   logic lens noted that a release build wraps into the bounds-checked readers and returns
   Truncated, so only the shipped dev-profile kernel is affected. Lenses: error-paths,
-  trust-boundary. High.
+  trust-boundary. High. **Fix**, as kobj-4.
 - [ ] **kmem-5** `kernel/src/mm/buddy.rs:163` — `BuddyAllocator::alloc` has
   `debug_assert!(order <= MAX_ORDER)` ahead of its graceful `return None`, and slab's `large_alloc`
   passes `order_for_size(total)` unchecked. In the debug-built kernel every image boots, any
@@ -318,6 +326,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `sys_memory_unmap` of a mapping of 512Ki pages or more. Shipped binaries are all under 1 MiB.
   Demonstrated: a host test with `MemoryObject::try_new(5 MiB)` then `copy_to_kvec()` panicked at
   `buddy.rs:163` ("buddy: alloc order 11 > MAX_ORDER"). Lenses: error-paths, trust-boundary. High.
+  **Fix**, as kobj-3.
 - [ ] **kmem-6** `kernel/src/arch/x86_64/paging.rs:224` — `ensure_table` is a non-atomic
   read-then-write of a shared kernel-half page-table slot. `KernelStack::new` and
   `kvmap::map_mmio` call `map_page` on the shared vmap hierarchy holding no lock, so two CPUs that
@@ -330,7 +339,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   pages (64 whole stacks) did not translate. The control, with the two builds serialized, lost 0.
   `Thread::try_new_user` and `try_new_runnable` call `KernelStack::new` outside any lock. This is
   a different mechanism from the TLB-staleness theory that `deferred-decisions.md` rules out for
-  TODO(unexplained-df), and may be a cause of that #DF. Lens: error-paths. High.
+  TODO(unexplained-df), and may be a cause of that #DF. Lens: error-paths. High. **Fix.**
 - [ ] **kmem-7** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
   the caller asks for (`required = req & MAP_*`) but always installs a present, user-readable
   mapping. With `rights = 0`, or only MAP_WRITE or MAP_EXEC, a MemoryObject or FileObject handle
@@ -342,7 +351,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   is to always require MAP_READ. Demonstrated: host probes of the syscall's two steps on a handle
   with INSPECT|TRANSFER. `lookup` with an empty requirement succeeded, and `map_object` with
   `Protection::USER` left `Paging::translate` returning Some. The syscall wrapper itself cannot
-  run on the host. Lenses: logic, error-paths, trust-boundary, tests. Medium.
+  run on the host. Lenses: logic, error-paths, trust-boundary, tests. Medium. **Fix**, as kobj-8.
 - [ ] **kmem-8** `kernel/src/mm/elf.rs:223` — A PT_LOAD's `p_memsz` is bounded only by
   `USER_VIRT_END`, and `map_vma` commits it eagerly, allocating and zeroing a frame per page under
   the AS lock in an IF-masked syscall. `MemoryObject::MAX_SIZE` (16 MiB) exists to prevent
@@ -354,7 +363,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   with `p_memsz` = 0x600000000000: `load_elf` passed validation and `map_vma` ran until the buddy
   was empty, 74.6 ms of uncapped allocation in one syscall on a guest with about 180 MB, so the
   stall scales with RAM. The effect on other CPUs was not measured. Lenses: logic, trust-boundary.
-  Medium.
+  Medium. **Fix.**
 - [ ] **kmem-9** `kernel/src/mm/kvmap.rs:58` — `vmap_alloc_pages` bounds the bump pointer by
   `KERNEL_VMAP_END` (16 TiB), but only the first 512 GiB has a PDPT in the kernel template, and VA
   is never reclaimed. Past that, a new stack lands in a PML4 slot that `map_page` fills in one
@@ -366,7 +375,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   made ASes A and B and a stack at 0xffffc00000001000, visible from both. After bumping the cursor
   to 512 GiB, `KernelStack::new(A)` succeeded at 0xffffc08000001000, mapped in A and not in B. On
   small-RAM machines the recorded page-table-frame leak may exhaust memory first. Lens: logic.
-  Medium.
+  Medium. **Later.**
 - [ ] **kmem-10** `kernel/src/sched/ipc.rs:499` — When a server's endpoint closes
   (`ipc_endpoint_closing`, line 480) or its registration drops (`us_reg_detach`), only pending
   lookups are drained, never `pending_fill`. A Model B page-cache fill whose server dies or never
@@ -379,14 +388,14 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Demonstrated: a host test with a pair endpoint, one `begin()` lookup and one `begin_fill()`,
   then the server end dropped, gave "lookup signalled=true, fill signalled=false". Only
   `take_pending_fill_matching` ever takes `pending_fill`. A boot with a Model B test server was
-  not run. Lenses: logic, error-paths. Medium.
+  not run. Lenses: logic, error-paths. Medium. **Later**, as kobj-10.
 - [ ] **kmem-11** `kernel/src/mm/addr_space.rs:631` — No test pins `page_flags_for`'s WRITABLE,
   NO_EXECUTE and USER translation, and this function builds every user PTE. A regression that
   drops NX, makes read-only mappings writable or marks kernel mappings user-accessible would
   silently remove W^X and read-only protection, and boot gates probably would not notice.
   Demonstrated: three mutations in `mm::addr_space` all survived, namely the EXEC test forced to
   `false`, the WRITE branch forced on, and the USER branch forced on. Only the WRITE_COMBINING
-  branch was killed. Lens: tests. Medium.
+  branch was killed. Lens: tests. Medium. **Fix**, with kobj-8.
 - [ ] **kmem-12** `kernel/src/mm/addr_space.rs:574` — No test catches a leaked or double-freed frame
   on unmap. A regression could leak an Anonymous frame per page, or collect Object and FileBacked
   frames into `frames`, so `sys_memory_unmap` would `buddy_free` frames a MemoryObject or the page
@@ -394,7 +403,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `matches!(boxed.mapping, Anonymous)` guard in `unmap_covering_deferred` is the only barrier and
   is untested. Demonstrated: three mutations in `mm::addr_space` survived, namely
   `free_vma_pages`'s Anonymous arm changed to `{}`, the `matches!` guard changed to `true`, and
-  `capacity - len < pages` changed to `< 0`. Lens: tests. Medium.
+  `capacity - len < pages` changed to `< 0`. Lens: tests. Medium. **Fix**, with kmem-3.
 - [ ] **kmem-13** `kernel/src/mm/elf.rs:218` — The ELF loader's `p_filesz > p_memsz` check, its
   `file_end > bytes.len()` check and its `aligned_end > USER_VIRT_END` bound have no test, and
   neither does PF_W/PF_X mapping into protection bits. ELF bytes come from a disk or filesystem
@@ -403,6 +412,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   flag mapping gives W+X segments. Demonstrated: five mutations in `mm::elf` survived, namely the
   `p_filesz > p_memsz` check forced to false, the `file_end` check forced to false, `aligned_end`
   loosened by one page, and `PF_W` and `PF_X` each forced to true. Lens: tests. Medium.
+  **Fix**, with kobj-4.
 - [ ] **kmem-14** `kernel/src/object/memory_object.rs:71` — Nothing tests that fresh MemoryObject
   or DmaBuffer frames are zeroed. A regression removing the zeroing in `sys_memory_create` would
   hand userspace stale kernel or other-process pages, a cross-process information leak. The host
@@ -410,7 +420,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Demonstrated: four mutations survived. Removing `write_bytes` in `MemoryObject::try_new`
   (tests `object::memory_object`), removing the partial-failure `buddy_free(done, 0)` rollback,
   removing `write_bytes` in `DmaBuffer::alloc` (tests `mm::dma`), and `DmaBuffer::drop` freeing at
-  order 0 instead of `self.order`, which leaks higher-order buffers. Lens: tests. Medium.
+  order 0 instead of `self.order`, which leaks higher-order buffers. Lens: tests. Medium. **Later.**
 - [ ] **kmem-15** `kernel/src/mm/addr_space.rs:453` — `map_file_page` re-validates that a
   FileBacked VMA for the same object still covers `addr`, but not that `addr` still corresponds to
   the page index the fault filled. Thread A faults at X in a mapping of file F at base B (index
@@ -420,6 +430,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   interleaving `file_backing`, `unmap_covering`, `map_file` and `map_file_page` would settle it.
   `try_fault_in` (`idt.rs:315-319`) takes the index from `file_backing`, and the frame is
   installed without re-deriving it under the second AS-lock hold. Lens: logic. Low.
+  **Later**, in Part E.
 - [ ] **kmem-16** `kernel/src/object/file_object.rs:540` — `begin_fill`'s read-ahead adjacency test
   computes `first * bs + (n * PAGE_SIZE) as u64` unchecked. `block_map` guarantees only that each
   run's own end fits a u64, so a run map near the top of the byte range overflows when the next
@@ -429,14 +440,14 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   servers cannot produce such LBAs. Demonstrated: a host probe through
   `mapped_file`/`miss`/`begin_fill` panicked at `file_object.rs:540:30` ("attempt to add with
   overflow"). `begin_write`'s matching `first * bs + (k * PAGE_SIZE)` was not probed. Lens:
-  trust-boundary. Low.
+  trust-boundary. Low. **Fix.**
 - [ ] **kmem-17** `kernel/src/mm/vmm.rs:413` — `find_free_range`'s upper bound (`MMAP_MAX`, which
   keeps hint=0 mappings out of the stack guard gap) and its exact-fit boundary have no test. If
   the bound regressed, `sys_memory_map(hint=0)` could return ranges in the guard gap and a stack
   overrun would land in mapped memory. An off-by-one in the exact-fit comparison would skip a gap
   that fits. Demonstrated: three mutations in `mm::vmm` survived, namely the `> max` early return
   forced to `if false`, the final `cursor+size <= max` forced true, and `s >= cursor+size` changed
-  to `s >`. Lens: tests. Low.
+  to `s >`. Lens: tests. Low. **Later.**
 - [ ] **kmem-18** `kernel/src/mm/buddy.rs:142` — The `order > MAX_ORDER` guard in
   `BuddyAllocator::alloc` is untested (only the `debug_assert` fires in debug), and neither is
   `BuddyAllocator::new`'s `bitmap_reservation` rounding to whole pages. In a release build
@@ -445,7 +456,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `DmaBuffer::alloc` and `order_for` already bound the order. Demonstrated: two mutations in
   `mm::buddy` survived, namely the guard changed to `if false` and `bitmap_reservation` using
   `bitmap_bytes`. See kmem-5 for the `debug_assert` that makes the guard unreachable in the dev
-  build. Lens: tests. Low.
+  build. Lens: tests. Low. **Fix**, with kobj-3.
 - [ ] **kmem-19** `kernel/src/object/file_object.rs:437` — `resize`'s
   `g.retired.try_reserve(gone)?`, the all-or-nothing allocation before pages are removed, can be
   deleted with every `file_object` test still passing. Without it, the later
@@ -453,7 +464,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   frame is neither freed nor tracked, and the allocation also happens under the lock. With the
   reserve, a truncate that cannot grow `retired` returns Err and changes nothing. No test covers
   that failure. Demonstrated: removing the reserve and running `object::file_object` survived.
-  Lens: tests. Low.
+  Lens: tests. Low. **Later.**
 
 What held up: user copies (`validate_user_range` with `checked_add` against `USER_VIRT_END`,
 zero-size and empty-slice cases, `lookup_recovery` matching only the two registered PCs, `clac` and
@@ -484,7 +495,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   `resolve_dir("/home/alice/up/bob")` gave Bob's inode. `stat_file` of Bob's file succeeded. A second
   hop reached `/system`. `e2fsck -fn` reported "Second entry 'up' ... should be '..'" and "'..' in
   /d is <The NULL inode>". FAT is not affected, because `dir::entries` skips dot entries. Lenses:
-  logic, error-paths, trust-boundary, tests (four reviewers found it independently). high.
+  logic, error-paths, trust-boundary, tests (four reviewers found it independently). high. **Fix.**
 
 - [ ] **fs-2** `userspace/libfsserver/src/server.rs:650` — A directory session is bound to a bare id
   (an ext4 inode number, a FAT first cluster). `live_dir` rejects only a freed id, not a reused
@@ -496,7 +507,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   land in `/home/bob/private`. On FAT (16 MiB, 4 KiB clusters), session 4 equalled `/secret/inner`
   and `read_dir` listed `victim.txt`. `rename_at` and `unlink_at` through the stale id both
   returned Ok. The existing test `a_removed_directory_is_refused_to_a_session_still_holding_it`
-  covers only the non-reuse case. Lenses: logic, error-paths, tests. high.
+  covers only the non-reuse case. Lenses: logic, error-paths, tests. high. **Fix.**
 
 - [ ] **fs-3** `userspace/fs-server-ext4/src/ext4.rs:1705` — A rename writes the new name first and
   deletes the old one second (ext4 `rename_path`; FAT `Fat::rename`, volume.rs:823-848). If the
@@ -511,6 +522,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   mapped inode 17 at lba 12. The unlink-after-half-rename variant did the same. On FAT16 with 4 KiB
   clusters, with write 1 of 2 refused, the retry gave Ok(Some(2)) and release(2) Ok. `OTHER.TXT` took
   cluster 2 and `fsck.fat` said "/OTHER.TXT and /G.TXT share clusters". Lens: error-paths. high.
+  **Fix.**
 
 - [ ] **fs-4** `userspace/fs-server-ext4/src/ext4.rs:226` — `parse_superblock` and `check_device`
   refuse only INCOMPAT_64BIT and blocks over 4 KiB. They accept metadata_csum, an unreplayed
@@ -522,6 +534,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   showed has_journal and metadata_csum. `check_device` returned Ok, and `create_file` and
   `grow_file` returned Ok. `e2fsck -fn` then failed with "Superblock checksum does not match
   superblock". `check_device` also returned Ok with INCOMPAT_RECOVER (0x4) set. Lens: logic. high.
+  **Fix.**
 
 - [ ] **fs-5** `userspace/fs-server-ext4/src/ext4.rs:1075` — `dir_insert` computes `used =
   round4(8 + name_len)` from the on-disk entry and `rec_len - used` without checking `used <=
@@ -536,7 +549,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   overflow". Release panicked at 1081 with "range start index 4128 out of range for slice of length
   4096". A shallow crafted entry returned Ok and `e2fsck` reported "directory corrupted". The
   crate has no hostile-bytes test, unlike FAT's `garbage_in_any_structure_is_an_error_never_a_panic`.
-  Lenses: trust-boundary, tests. high.
+  Lenses: trust-boundary, tests. high. **Fix.**
 
 - [ ] **fs-6** `userspace/fs-server-ext4/src/ext4.rs:1627` — `dir_repoint` compares `&buf[off + 8..off
   + 8 + name_len]` without checking `off + 8 + name_len <= bs`, so a crafted directory block makes
@@ -546,7 +559,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   PeerClosed. Demonstrated: a host test panicked at ext4.rs:1627:60 with "range end index 4098 out
   of range for slice of length 4096". Reading the replacing-rename path (the trust-boundary
   reviewer's finding) is unverified; a host test feeding `rename_path` a crafted destination
-  directory would confirm it. Lenses: logic, trust-boundary. high.
+  directory would confirm it. Lenses: logic, trust-boundary. high. **Fix.**
 
 - [ ] **fs-7** `userspace/fs-server-ext4/src/ext4.rs:1665` — `rename_path` does not limit the
   destination leaf to 255 bytes, and `dir_insert` stores `name.len() as u8`, so a long name is cut
@@ -558,7 +571,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   listed only `.` and `..`, and `read_file` under both names gave NotFound. `e2fsck` reported
   "Entry '' in /system (13) has a zero-length name". For 300 bytes, `stat_file` of the full name gave
   NotFound and of the 44-byte prefix gave Ok(12288). FAT is not affected. Lenses: logic,
-  error-paths. high.
+  error-paths. high. **Fix.**
 
 - [ ] **fs-8** `userspace/fs-server-ext4/src/ext4.rs:1512` — `unlink_at` and `rename_path` can
   return Err after the irreversible step, and the orphan they held is lost with the error. In
@@ -569,7 +582,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   gets NotFound. Nothing here can run `e2fsck`. Demonstrated: a write-failure sweep of the ext4
   ops, with closures that use `?` as the server does. "unlink: write 1/9 once: Err(Io): Unattached
   inode 17" and "rename_path_replace: write 2/10 once: Err(Io): Unattached inode 18". FAT does not
-  have this. Lens: error-paths. medium.
+  have this. Lens: error-paths. medium. **Fix.**
 
 - [ ] **fs-9** `userspace/fs-server-ext4/src/ext4.rs:1115` — If `dir_insert`'s directory growth
   loses its last write (the inode's new size), nothing undoes it. Once the directory's extent tree
@@ -582,7 +595,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   until an offline `e2fsck`. Demonstrated: `probe_dir_growth_lost_inode_write` lost each of the
   create's 11 writes in turn. Only write 9 (the directory inode) gave "later creates failing: 30
   Some(Some(Corrupt))", and `e2fsck` said "end of extent exceeds allowed value (logical block 6,
-  physical block 388, len 1)". Lens: error-paths. medium.
+  physical block 388, len 1)". Lens: error-paths. medium. **Later.**
 
 - [ ] **fs-10** `userspace/fs-server-ext4/src/ext4.rs:1692` — The guard against moving a directory
   into its own subtree is a byte-prefix test, `new_parent_path.starts_with(old_path)`, with no
@@ -593,7 +606,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   bindings and the lookup and rename paths were not checked (unverified). FAT uses the ancestor
   walk `dir::within`. Demonstrated: `rename_path(/ab, /abc/ab)` and `(/d, /dd/d)` returned
   Err(Unsupported). The library-level `/ab` to `/./ab/x` call returned Ok(None) and `e2fsck`
-  reported "Entry 'x' in . is a link to '.'". Lenses: logic, error-paths, tests. medium.
+  reported "Entry 'x' in . is a link to '.'". Lenses: logic, error-paths, tests. medium. **Fix.**
 
 - [ ] **fs-11** `userspace/fs-server-ext4/src/extent.rs:163` — `on_device()` bounds an extent only to
   `[first_data_block, blocks_count)`, so an extent over a group's bitmaps, inode table or GDT, or
@@ -603,6 +616,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   later grow or create reuses it and overwrites inodes. Linux's `ext4_inode_block_valid` check is
   absent. Demonstrated: patching a created file's extent start to the inode-table block (34). Its
   bitmap bit was 1 before and 0 after `unlink_at` plus `release_inode`. Lens: tests. medium.
+  **Later.**
 
 - [ ] **fs-12** `userspace/fs-server-fat/src/table.rs:282` — `allocate()` aborts with `?` on a used
   cluster whose FAT entry is reserved or out of range (Corrupt) after it has marked free clusters.
@@ -612,7 +626,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   allocated to nobody, and every later grow or mkdir that scans through 5 fails the same way, so
   one bad entry makes the volume unwritable. Demonstrated: `grow_file(/A.TXT, 10000)` returned
   Err(Corrupt) and cluster 4's FAT entry afterwards read [255,255], not 0. `hostile_tests` only
-  checks for no panic. Lens: tests. medium.
+  checks for no panic. Lens: tests. medium. **Fix.**
 
 - [ ] **fs-13** `userspace/libfsserver/src/serve.rs:78` — The MAX_SUFFIX bound in `resolve()` and
   `serve_read_range()`, and the `.min(content.len())` clamp on the read length, are untested. A
@@ -623,7 +637,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   TooLarge. That function is syscall-bound and can only be checked in a boot. Demonstrated:
   deleting either `req.suffix.len() > MAX_SUFFIX` check, or the `.min(content.len())`, left
   libfsserver, fs-server-fat and fs-server-ext4 `--lib` all green. The truncation was found by
-  reading. Lens: tests. medium.
+  reading. Lens: tests. medium. **Later.**
 
 - [ ] **fs-14** `userspace/fs-server-fat/src/volume.rs:706` — FAT's `rmdir_at` NotEmpty check, the
   `is_dir` refusal in `unlink_at`, `names::valid` in `mkdir_at` and in rename, and the `grow_file`
@@ -632,7 +646,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   check, `unlink_at` on a directory frees a live directory chain. Without the name checks, names
   with `:` or `*` would be written to the volume. Demonstrated: five mutations (each guard deleted)
   left `cargo test -p fs-server-fat --lib` fully green. No FAT test mentions NotEmpty, though the
-  ext4 rmdir test covers it. Lens: tests. medium.
+  ext4 rmdir test covers it. Lens: tests. medium. **Fix**, with pr365-1.
 
 - [ ] **fs-15** `userspace/fs-server-ext4/src/ext4.rs:804` — The allocator's `start + len <
   capacity` bound and `.min(gfree)` cap in `alloc_run`, and the `!bit_clear` guard in `free_run`,
@@ -641,7 +655,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   zero. Without the third, a double free counts its blocks free twice. An image from another tool
   with spare bits clear, or a free count that disagrees with its bitmap, would then get an extent
   off the device. Demonstrated: three mutations, each leaving `cargo test -p fs-server-ext4 --lib`
-  green. Lens: tests. medium.
+  green. Lens: tests. medium. **Fix**, with fs-8.
 
 - [ ] **fs-16** `userspace/libfsserver/src/cache.rs:195` — `MetaCache::forget` has no test for a
   freed range whose end is not 4 KiB-aligned, and the rounding of the end of the range is
@@ -649,7 +663,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   and the partial block stays cached, the kernel writes file data there behind the server's back. A
   later `read_meta` of that block (reused as metadata) then sees stale bytes. Demonstrated:
   changing `(offset + len).div_ceil(BLOCK)` to `(offset + len) / BLOCK` left libfsserver,
-  fs-server-ext4 and fs-server-fat `--lib` green. Lens: tests. low.
+  fs-server-ext4 and fs-server-fat `--lib` green. Lens: tests. low. **Later.**
 
 - [ ] **fs-17** `userspace/libfsserver/src/server.rs:329` — `maybe_grow` notes only
   `FsError::ReadOnly`. Every other create, grow or truncate failure falls through, and the resolve
@@ -660,7 +674,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   forbidden name returns NotFound instead of InvalidArgument. The only silent-success case is
   ext4 with sub-page blocks, which is the recorded TODO(ext4-subpage-runs). Unverified: boot a
   full 1 KiB-block ext4 and run `copy_file`; it shows whether the copy is reported as success when
-  short. Lens: error-paths. low.
+  short. Lens: error-paths. low. **Fix.**
 
 - [ ] **fs-18** `userspace/libfsserver/src/server.rs:614` — When `reply_dir_handle`'s send fails,
   `open_dir_session` closes the session and the client endpoint but sends no error reply, while the
@@ -668,7 +682,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   caller's PendingOperation never completes, and a `Dir::open` in Files, nxsh or a libfs walk waits
   forever with nothing logged. Unverified: injecting a failing `SYS_CHANNEL_SEND` for that reply in
   a boot shows whether the lookup hangs or completes with an error. No existing gate produces the
-  trigger (a full queue or kernel out of memory). Lens: error-paths. low.
+  trigger (a full queue or kernel out of memory). Lens: error-paths. low. **Fix.**
 
 - [ ] **fs-19** `userspace/libfs/src/lib.rs:775` — `copy_tree` has no check that the destination
   lies inside the source, and its listing helpers pass server-supplied names to `join()`
@@ -679,7 +693,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   on a different file in a subdirectory than the one listed. Names `.` and `..` are filtered;
   embedded `/` is not. Unverified: (a) holds by reading, and `copy -r /dir /dir/sub` in a boot
   would confirm it. (b) needs a crafted stick with an entry named `a/b`, and whether a server can
-  list such a name is unchecked. libfs has only pure-helper host tests. Lens: tests. low.
+  list such a name is unchecked. libfs has only pure-helper host tests. Lens: tests. low. **Fix.**
 
 What held up: the kernel's `validate_path` rejects `.`, `..`, empty components and paths over 1024
 bytes before they reach a server, so the path-form calls (`rename_path`, create, grow) never see
@@ -720,7 +734,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   19 read-ahead pages came back holding the old 0xA5 bytes. AHCI has the same shape, since
   `retire()` reports `irp.length` and never reads PRDBC; that half is unverified for SATA firmware.
   Linux keeps the larger of the actual and reported residue. Lenses: error-paths, trust-boundary.
-  High.
+  High. **Fix.**
 
 - [ ] **drv-2** `kernel/src/drivers/ahci.rs:869` — `poll_complete_inflight` discards
   `wait_command_polled`'s timeout. `take_retired` then judges the command by TFD.ERR alone, so a
@@ -737,7 +751,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   `submit()` of a Write built its PRDT and CFIS over the busy slot. The timeout itself cannot fire
   on the host (`Timer::read_ns` is 0), so that half is from reading the code (wait_command_polled
   :591-606). Its comment claims the IRP completes "with its error status" on a timeout. Lenses:
-  logic, error-paths. High.
+  logic, error-paths. High. **Fix.**
 
 - [ ] **drv-3** `kernel/src/drivers/gpt.rs:236` — `/dev/disk/by-partlabel/<label>` goes to the
   first boot-time disk published, and a later disk with the same label fails to bind
@@ -752,6 +766,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   PartEntry and then made the live disk's bind as `bind_one` would. It gave `Err(AlreadyBound)`,
   and the label named the internal disk, not the live one. The end-to-end mount was not run; it
   needs a live-image boot with such an AHCI disk. Lenses: trust-boundary, architecture. High.
+  **Fix.**
 
 - [ ] **drv-4** `kernel/src/syscall/table.rs:2393` — A FILE_BLOCKS resolve reply discards the
   rights of the block DeviceNode handle the server transfers (`tr.rights`). The MEMOBJ path
@@ -766,7 +781,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   own flag (table.rs:2433-2434). Unverified: it was read, not run. A QEMU test whose fs server
   holds a READ-only partition handle and replies FILE_BLOCKS without the flag would settle it. The
   client maps MAP_WRITE, writes and syncs, then the test compares the device bytes. Lens:
-  architecture. High.
+  architecture. High. **Fix**, as kobj-2.
 
 - [ ] **drv-5** `kernel/src/drivers/ahci.rs:822` — The AHCI driver has no error recovery and no
   runtime deadline. The ISR retires slot 0 only when PxCI bit 0 is clear. AHCI 1.3.1 §6.2.2.1 has
@@ -780,7 +795,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   partition hangs until reboot. QEMU's `ahci_cmd_done` reportedly clears CI even on error, so no
   gate can show this. Unverified: on a real SATA machine, read an LBA past `sectors` through
   `/dev/blk/<disk>`, or use a drive with a pending sector, and see whether the PO completes and
-  later I/O proceeds. Lenses: logic, error-paths. High.
+  later I/O proceeds. Lenses: logic, error-paths. High. **Fix.**
 
 - [ ] **drv-6** `kernel/src/drivers/ahci.rs:726` — Nothing refuses a block request whose offset or
   length is not a multiple of the logical block size, or whose offset is past the device's end,
@@ -803,7 +818,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   `dispatch_block_irp` under a partition, a Write at offset span-256, length 256 returned Ok and
   reached the disk at byte 1099520, which AHCI would issue as the partition's last LBA with count
   0. A past-end offset dispatched Ok and was written to lba48 1. Lenses: logic, error-paths,
-  trust-boundary, tests, architecture (five reports of one defect). Medium.
+  trust-boundary, tests, architecture (five reports of one defect). Medium. **Fix**, as kobj-7.
 
 - [ ] **drv-7** `kernel/src/drivers/xhci/hub.rs:273` — `hub::depart` calls `storage::finish`
   unconditionally after `release()` returns Kept. That completes the in-flight or stranded IRP
@@ -816,7 +831,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   `buddy_free`), is released while the controller may still DMA into it. A failed Disable Slot
   takes the same path. Unverified: inject a Disable Slot failure, or set `x.wedged`, during a USB
   read and check that the IRP completes while the slot stays enabled. The fix shape is to leak the
-  held IRPs on the Kept path, as the memory is leaked. Lens: error-paths. Medium.
+  held IRPs on the Kept path, as the memory is leaked. Lens: error-paths. Medium. **Fix.**
 
 - [ ] **drv-8** `kernel/src/drivers/ahci.rs:321` — `drivers::probe` calls `ahci::init` for every
   AHCI-class function, but `AHCI.store(disk)` is unconditional and the ISR, `ahci_poll` (which
@@ -826,7 +841,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   inflight null and returns false, its table "did not read", and its IRP stays in flight so later
   IRPs queue and then fail IoError. If disk 1 holds `nitrox-root`, `/` cannot mount. Unverified:
   QEMU with two `-device ahci` controllers, each with a drive; check for the "partitions: the table
-  did not read" line. No xtask gate has that configuration. Lens: trust-boundary. Medium.
+  did not read" line. No xtask gate has that configuration. Lens: trust-boundary. Medium. **Later.**
 
 - [ ] **drv-9** `kernel/src/drivers/partitions.rs:97` — Test gap in untrusted-input guards: the GPT
   entry-size range check, the `.min(entries)` clamp on the array and the `.min(GPT_ENTRY_BLOCKS_MAX)`
@@ -837,7 +852,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   stale sixth in the block publishes a phantom sixth partition. Without the cap, a header declaring
   0xFFFFFFFF entries asks `try_reserve` for 512 GiB, so the disk reads as NoMemory instead of its
   first 128 entries. Demonstrated: temporary tests showed the first two (panic; left 6, right 5),
-  restored by `git checkout`. The third is from reading. Lens: tests. Medium.
+  restored by `git checkout`. The third is from reading. Lens: tests. Medium. **Later.**
 
 - [ ] **drv-10** `kernel/src/io/block.rs:526` — Test gap on the partition sandbox boundary:
   `partition_rebase`'s three overflow guards (`block_count.checked_mul(sector_size)`,
@@ -848,6 +863,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   the LBA to 48 bits. That could land outside the partition, and CI would not notice. The final
   `checked_add` alone currently catches one wrap shape, so the guards cover each other and the pair
   is untested. Demonstrated by per-guard mutation: each left 8/8 passing. Lens: tests. Medium.
+  **Later.**
 
 - [ ] **drv-11** `kernel/src/drivers/xhci/desc.rs:131` — Test gap: the `len >= 9` guard on
   interface descriptors in `interfaces()` is not pinned, and removing it passes all 19 desc tests.
@@ -858,6 +874,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   then `[4,4,0,0]`, wTotalLength 13) makes `interfaces()` index `b[here+4]` and panic (desc.rs:133).
   That is a kernel panic from a USB device's bytes if the guard regresses. Demonstrated by a
   temporary test `probe_short_iface` with the guard removed, then restored. Lens: tests. Medium.
+  **Later.**
 
 - [ ] **drv-12** `kernel/src/io/block.rs:127` — Test gap: `dispatch_block_irp`'s own `max_frags`
   check, which the code calls the PRDT-overflow protection, has no test. Changing `>` to
@@ -866,7 +883,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   (`frags.len().min(MAX_FRAGS)`) and would silently truncate a transfer that the CSW then reports
   whole. Deleting the storage.rs clamps (in `issue()` and `start()`) also fails no test. Only the
   boot-time self-test (drivers/mod.rs:147) exercises the limit. Demonstrated by mutation: io::block
-  8 passed, storage 27 passed. Lens: tests. Low.
+  8 passed, storage 27 passed. Lens: tests. Low. **Later.**
 
 - [ ] **drv-13** `kernel/src/drivers/hid/descriptor.rs:222` — Test gap: several of `walk()`'s
   untrusted-input rejections have no test. Each of these mutations passed all 14 descriptor tests:
@@ -876,7 +893,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   in `take_input` (a second key array). 7 of 13 mutations survived. A regression would read a
   layout from a corrupt descriptor instead of falling back to the boot protocol: a second
   collection's fields would overwrite the first's, or a mouse's offsets would come from state a
-  Pop never restored. Demonstrated by mutation. Lens: tests. Low.
+  Pop never restored. Demonstrated by mutation. Lens: tests. Low. **Later.**
 
 - [ ] **drv-14** `kernel/src/pci/mod.rs:195` — Test gap: the multifunction mask in
   `decode_function` (`header_type_raw(cfg) & 0x7F == 0`) is not pinned, and replacing it with
@@ -886,14 +903,14 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   00:1f.2 and many xHCI controllers) gets empty BAR windows. The driver finds no MMIO BAR and
   silently declines the controller, and only a boot on such hardware would show it. A dropped bit 2
   in the I/O mask would size 4- or 8-byte I/O BARs wrongly. Demonstrated by mutation. Lens: tests.
-  Low.
+  Low. **Later.**
 
 - [ ] **drv-15** `kernel/src/drivers/hid/keyboard.rs:132` — Test gap: the key array's
   `value >= a.logical_min` filter and the `FIRST_KEY` lower bound in `hold()` are not pinned.
   Replacing the filter with `true` passes all 14 keyboard tests, because every test layout uses
   `logical_min` 0. A report descriptor with `logical_min` 1 sends 0 in an empty slot. Without the
   filter `hold()` gets `first + (0 - 1)`, which can land on a real usage and press a phantom key on
-  every report. Demonstrated by mutation. Lens: tests. Low.
+  every report. Demonstrated by mutation. Lens: tests. Low. **Later.**
 
 - [ ] **drv-16** `kernel/src/power.rs:89` — `flush_every_disk` walks `/dev/blk/<n>` from 0 and
   stops at the first index `find_block_device` answers None. A departed device's served index is
@@ -907,7 +924,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   `while let Some(d) = r.block(index)` walk gave `walk visited [(0, false), (1, false), (2, false)];
   stick B is /dev/blk/Some(4)`. The existing test
   `a_departed_device_is_found_by_no_path_and_its_index_stays_taken` already asserts that `block(0)`
-  is None while `block(1)` is Some. Lens: architecture. Low.
+  is None while `block(1)` is Some. Lens: architecture. Low. **Fix.**
 
 What held up: the reviewers' mutations on input/ring.rs (6 of 6) and the device.rs registry (4 of 4)
 were all caught, as were 13 of 16 on pci/mod.rs, the partitions.rs end-of-disk, first==0 and
@@ -947,7 +964,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   `a_block_map_the_page_cache_cannot_use_is_refused` showed the run is accepted. In the
   file_object tests, `fill_ahead(file_of(&f), 0, 512, 31)` on that run panicked at
   file_object.rs:540:30 (`cd kernel && cargo test --lib --target x86_64-unknown-linux-gnu`).
-  Probes removed. logic. High.
+  Probes removed. logic. High. **Fix**, as kmem-16.
 - [ ] **proto-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` takes the
   transferred DeviceNode and drops its rights (`tr.rights`). Whether the file is writable depends
   only on the server's own FILE_BLOCKS_READ_ONLY flag (line 2433). The sibling arms respect
@@ -965,20 +982,21 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   READ-only TransferRef and flags 0 should show MAP_WRITE installed. A boot with a ro mount whose
   server sends flags 0, then a client write plus `sys_file_sync` and a host read of the sector,
   would show the disk written. Requiring WRITE in `tr.rights` before granting MAP_WRITE should
-  turn it into NoAccess. logic, trust-boundary, architecture. High.
+  turn it into NoAccess. logic, trust-boundary, architecture. High. **Fix**, as kobj-2.
 - [ ] **proto-3** `kernel/src/rsproto.rs:59` — No test covers the `body_len` bound in
   `reply_body`, `parse_reply` and `parse_read_range_reply`, the only guard between a hostile
   server's reply and an out-of-range slice panic in the kernel. A reply whose body_len exceeds
   the IPC payload would make `&msg[28..end]` panic if a check were removed. `reply_body` has no
   test at all. This is a test gap; the code is correct today. Demonstrated: each of the three
   checks removed in turn, and all 14 rsproto tests still passed (`cargo test --lib --target
-  x86_64-unknown-linux-gnu rsproto`). Restored. tests. High.
+  x86_64-unknown-linux-gnu rsproto`). Restored. tests. High. **Fix**, with kobj-3.
 - [ ] **proto-4** `kernel/src/rsproto.rs:127` — The `BlockRun` stride (24) and index-to-offset
   arithmetic in `file_blocks_run` are pinned by no test; only run 0 is ever decoded. A wrong
   stride would make runs 1 and up read the wrong file_block, device_lba and length, so a Model A
   file with two or more extents fills from, or writes back to, the wrong disk blocks. Test gap;
   the code is correct today. Demonstrated: `FILE_BLOCKS_PREFIX_LEN + i * BLOCK_RUN_WIRE_LEN`
   changed to `i * 16`, and the rsproto tests all passed. Restored. tests. High.
+  **Fix**, with kobj-3.
 - [ ] **proto-5** `userspace/librsproto/src/namespace.rs:113` — The length checks in
   `parse_resolve_grow_size`, `parse_resolve_rename` (both the tail+4 and tail+4+dest_len checks)
   and `file::parse_rename_request` have no test with a truncated or overrunning body. If one
@@ -986,7 +1004,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   RESOLVE_GROW or Rename and the filesystem server (a critical service) would slice out of
   range and panic. Test gap; the code is correct today. Demonstrated: each check replaced with
   `if false` individually, and every `cargo test -p librsproto --lib` run still passed.
-  Restored. tests. High.
+  Restored. tests. High. **Later.**
 - [ ] **proto-6** `userspace/libgpt/src/table.rs:261` — The guards in `read()` on the header_size
   range, entry_len == 128, count in 1..=1024 and `front.len() < end` are all untested. A disk
   with a valid-CRC header whose array_lba or count points past the buffer storage-service reads
@@ -995,7 +1013,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   `scratch[..header_size]`. Test gap; the code is correct today. Demonstrated: `front.len() <
   end` changed to `if false`, and the header_size range, entry_len check, `count == 0` and
   `count > 1024` mutated one by one. All 19 libgpt tests passed each time. Restored. tests.
-  High.
+  High. **Later.**
 - [ ] **proto-7** `userspace/libstream/src/wire.rs:532` — `read_value` and `read_list` recurse
   with no depth limit, and so does a Record through `Schema::decode` and `read_row_values`. A
   List level costs 5 bytes and a Record level 8, and dropping or displaying a decoded value
@@ -1007,7 +1025,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   lenses with release host probes decoding on an 8 MiB-stack thread. Depths of 20,000 to 30,000
   (100 to 150 KB) decoded. Depths of 40,000 (200 KB), 50,000, 100,000 and 200,000 (1 MB) aborted
   with 'thread has overflowed its stack' (SIGABRT). Probes removed. logic, error-paths,
-  trust-boundary, tests, architecture. Medium.
+  trust-boundary, tests, architecture. Medium. **Later.**
 - [ ] **proto-8** `userspace/libstream/src/wire.rs:590` — Decoding is not proportional to input.
   A Null-typed column takes 0 bytes per row and a row is one REC_DATA byte, but
   `read_row_values` allocates a 32-byte Value per column per row, so decoding allocates
@@ -1021,7 +1039,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   (1,000 Null columns, 4,000 rows) to 4,000,000 Values with a 131,219,456-byte heap peak
   (16,367×). A 64,017-byte stream (4,000 columns, 48,000 rows) aborted with 'memory allocation
   of 131072 bytes failed' against a 2 GiB cap. A 5,017-byte stream with 1,000 columns and 1,000
-  rows gave ~32 MB. Probes removed. error-paths, trust-boundary, architecture. Medium.
+  rows gave ~32 MB. Probes removed. error-paths, trust-boundary, architecture. Medium. **Later.**
 - [ ] **proto-9** `userspace/libstream/src/channel.rs:234` — `IpcPort::recv` passes `recv_handles`
   and `count` to SYS_CHANNEL_RECV, which installs every transferred handle in the receiver's
   table, and never closes or returns them. nxsh's `drain_diagnostics` (main.rs:127-132) and
@@ -1035,7 +1053,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   Unverified: code path confirmed by reading `channel.rs:235-261` and `sys_channel_recv`
   (table.rs:~2746-2769); no boot. A boot with a stage that sends handles on stdout, then
   counting nxsh's handles or watching its next spawn, would settle it. logic, error-paths,
-  trust-boundary, architecture. Medium.
+  trust-boundary, architecture. Medium. **Fix.**
 - [ ] **proto-10** `userspace/logging-service/src/main.rs:601` — `drain_source` receives log
   appends with `recv(h)`, which writes RECV_HANDLES and RECV_COUNT, and never closes them. Only
   `received()` (main.rs:401-410) closes transferred handles, and it runs on the read-session
@@ -1045,13 +1063,14 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   `essential`, so service-mgr will not restart it to reclaim them. Unverified: read only. A test
   process sending appends with transferred handles on a log channel, while watching the
   service's handle count or the global table's live slots, would settle it. error-paths. Medium.
+  **Fix.**
 - [ ] **proto-11** `userspace/libstream/src/wire.rs:573` — The `SCHEMA_FIELD_HINT_CAP` caps on
   `Vec::with_capacity` in `read_list`, `read_row_values` and `Schema::decode`, the allocation
   defence against hostile counts, have no test. A peer sending a u32 count of 4,000,000,000
   followed by a few bytes would make a consumer abort on a gigabyte reservation if a cap were
   removed. Test gap; the code is correct today. Demonstrated: `.min(SCHEMA_FIELD_HINT_CAP)`
   removed at each of the three sites in turn, and every libstream host test still passed.
-  Restored. tests. Medium.
+  Restored. tests. Medium. **Later.**
 - [ ] **proto-12** `userspace/librsproto/src/file.rs:333` — `DirEntryIter`'s truncated-entry
   guard (`body.len() < end`) and its `remaining == 0` stop, plus the name-length limits (u8::MAX
   in the dir-entry writer, u16::MAX in the name and rename encoders), are untested. A Readdir
@@ -1059,7 +1078,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   and crash the client. An over-long name not refused at encode time is truncated to a u8 or
   u16 length, so the wire length disagrees with the bytes written. Test gap; the code is correct
   today. Demonstrated: each guard removed or loosened individually, and every librsproto test
-  still passed. tests. Medium.
+  still passed. tests. Medium. **Later.**
 - [ ] **proto-13** `kernel/src/syscall/table.rs:2589` — `block_map` calls
   `runs.try_reserve(header.run_count as usize)` before the body is checked to hold that many
   runs. `run_count` is a server-chosen u32, but a reply body carries at most (3980-32)/24 = 164
@@ -1069,6 +1088,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   that fails at once, so the real cost may be nil. Unverified: read only. A host test with a
   huge run_count, or a look at what `try_reserve` does against kmalloc's cap, would settle it.
   Bounding run_count by `(body.len() - 32) / 24` first removes the question. logic. Low.
+  **Fix**, as kobj-3.
 - [ ] **proto-14** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes
   `f.name.len() as u16` without refusing names over u16::MAX, and `WireErrorRecord::encode` does
   the same for `field_name` (line 733). Encoding reports Ok with a wrapped length, and the
@@ -1077,7 +1097,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   untrusted file), and the consumer sees a different, shorter schema or an error. Demonstrated:
   a 65,538-byte crafted name ("ab", 0x02, 0x00, then padding) encoded Ok. `Table::decode` read
   one field "ab" of type Int and failed with Err(BadRecordTag(122)) on the next name byte
-  (`cargo test -p libstream --lib`). Probe removed. logic. Low.
+  (`cargo test -p libstream --lib`). Probe removed. logic. Low. **Later.**
 - [ ] **proto-15** `userspace/libgpt/src/table.rs:298` — `read()` computes disk_blocks as
   header[32..40] + 1, which overflows when a valid-CRC header carries backup_lba u64::MAX. A
   build with overflow checks panics 'attempt to add with overflow' in the storage service or
@@ -1086,7 +1106,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   check that partition LBAs lie within first_usable..=last_usable. Demonstrated: a host test
   forged the CRC after setting the backup LBA to u64::MAX, and `cargo test -p libgpt --lib`
   panicked at table.rs:298. The release wrap is by inspection of the profile, not run. Probe
-  removed. tests. Low.
+  removed. tests. Low. **Later.**
 - [ ] **proto-16** `kernel/src/rsproto.rs:408` — Several kernel codec guards are untested:
   `forget_request`'s magic check, the u16::MAX suffix limit in `build_resolve_request`,
   `build_read_range_request` and `build_resolve_request_rename`, and the error-body minimum
@@ -1094,14 +1114,14 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   65,535 bytes gets a truncated u16 length while body_len carries the full length, so the server
   parses a different path than the kernel meant. Without the forget magic check any message with
   op 0x0607 is a Forget. Test gap; the code is correct today. Demonstrated: each guard removed
-  individually, and the rsproto tests all survived. Restored. tests. Low.
+  individually, and the rsproto tests all survived. Restored. tests. Low. **Later.**
 - [ ] **proto-17** `userspace/libstream/src/setup.rs:93` — The unknown-bit rejection in
   `Streams::from_bitmap`, and the wrong-op and BadRecordTag handling in `Table::decode`, are
   untested. A setup bitmap with unknown bits and a matching handle count would have its extra
   bits ignored and the handles misassigned or leaked. An unknown record tag in `Table::decode`
   would be accepted as end of table instead of BadRecordTag. Test gap; the code is correct
   today. Demonstrated: `bitmap & !STREAM_MASK != 0` changed to `if false` and the BadRecordTag
-  arm replaced with a `break`; all libstream tests passed. Restored. tests. Low.
+  arm replaced with a `break`; all libstream tests passed. Restored. tests. Low. **Later.**
 - [ ] **proto-18** `kernel/src/syscall/table.rs:263` — `sys_file_truncate`, `sys_file_grow` and
   `sys_file_create` narrow the u64 size register with `a4 as u32` before it reaches the wire
   (`ResolveOp::Size(a4 as u32, ...)`, table.rs:251, 253, 263). A size of 4 GiB or more is taken
@@ -1111,7 +1131,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   bytes. `SYS_FILE_RENAME`'s `a5 as u16` flags are narrowed the same way. libfs caps its own
   sizes at 8 MiB (MAX_COPY), so only direct syscall users reach this today. Unverified: read
   only. A host test of the syscall's size argument at 2^32 + n would settle it. architecture.
-  Low.
+  Low. **Fix.**
 
 What held up: all eight kernel `rsproto.rs` parsers (`parse_reply`, `parse_read_range_reply`,
 `reply_body`, `subnamespace_reply`, `file_blocks_reply_header`, `file_blocks_run`,
@@ -1166,7 +1186,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   the spec's zero-fill added as a control, the same test failed. A librsproto test encoded a
   `READ_LINE` reply with `hunter2` and then an empty `SET_MODE` reply into one buffer, and
   `msg[52..59]` was still `hunter2`. The end-to-end read of one process's password by another
-  was not booted. error-paths, trust-boundary. High.
+  was not booted. error-paths, trust-boundary. High. **Fix.**
 
 - [ ] **sec-2** `userspace/view-broker/src/main.rs:615` — `end_session` unbinds only the storage,
   policy and accounts grants and the block devices. The services (`/dev/services/admin`), power
@@ -1188,7 +1208,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   child shares its parent's namespace object (`kernel/src/syscall/table.rs:412-427`). A QEMU
   gate (`with admin` on a program that ignores terminate, log out, resolve
   `/dev/services/admin`) would confirm it end to end. logic, error-paths, trust-boundary.
-  Medium.
+  Medium. **Fix.**
 
 - [ ] **sec-3** `userspace/view-broker/src/main.rs:919` — A request's grants are decided against
   `/system/views.toml` when the Request arrives and stored in `Pending`. `check()` then calls
@@ -1202,7 +1222,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   and stores `grants` in `Pending` (about 925). `password()` (956) only queues the password.
   `check()` (983) authenticates and calls `start()` (1012), which loops over `p.grants` (1304)
   and never calls `read_policy` or `decide` again. Only three failures, `client_gone` or
-  `end_session` end a `State::Password`. Not run. error-paths. Medium.
+  `end_session` end a `State::Password`. Not run. error-paths. Medium. **Fix.**
 
 - [ ] **sec-4** `userspace/view-broker/src/main.rs:531` — `serve_resolve` admits a client channel
   only by the broker's global wait-set load, with no per-session limit. Idle client channels
@@ -1217,7 +1237,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   `cargo test -p view-broker --lib a_client_is_admitted_only_with_room`, which passes. It
   asserts that 14 clients fill `MAX_WAIT_HANDLES` = 32 (FIXED 3 + 2 each). An idle client counts
   as two slots in `load()` (1601-1613). `end_session` (598-646) touches only Running, Password
-  and Changing clients. The exhaustion itself was not booted. trust-boundary. Medium.
+  and Changing clients. The exhaustion itself was not booted. trust-boundary. Medium. **Later.**
 
 - [ ] **sec-5** `userspace/session-mgr/src/main.rs:376` — `tty_request` takes the first message on
   the login terminal if its op matches, and never steps over tty-server's unsolicited
@@ -1237,7 +1257,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   input. Typing `hunter2\r` after the second `password: ` wrote it to the console. Control (the
   same model skipping rid-0 messages, as `libprompt::tty` does): the resumed user read got an
   empty line, then password write Ok, echo off Ok, password read Blocked, and nothing echoed.
-  logic. Medium.
+  logic. Medium. **Fix.**
 
 - [ ] **sec-6** `userspace/auth-service/src/main.rs:379` — auth-service never closes handles that
   arrive with a message. `serve_resolve` (312) and `serve_session` (381) receive into
@@ -1252,7 +1272,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   uses of `RECV_HANDLES` and `RECV_COUNT` are the declaration and the two recv call sites. No
   per-process handle quota was found. Not run to exhaustion. A boot gate that sends a 3-handle
   message on an oracle session many times and checks that the handle count stays flat would
-  settle it. tests. Medium.
+  settle it. tests. Medium. **Fix.**
 
 - [ ] **sec-7** `userspace/libcrypto/src/lib.rs:36` — No test fails if `ct_eq` compares only the
   last byte. `ct_eq_basic` is the only test, and every unequal pair in it differs in the last
@@ -1261,7 +1281,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   accepts any password whose 32-byte PBKDF2 output ends in the stored verifier's last byte,
   about 1 guess in 256. The libusers and auth-service tests use real PBKDF2 and also pass,
   since a random wrong password differs in the last byte 255 times in 256. Demonstrated by
-  mutation, restored. tests. Medium.
+  mutation, restored. tests. Medium. **Later.**
 
 - [ ] **sec-8** `userspace/auth-service/src/lib.rs:50` — No test fails if `authenticate` accepts an
   empty password. Nothing logs in through `authenticate` or `serve_authenticate` with a wrong
@@ -1269,7 +1289,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   `b"wrong"`. Scenario: changing the guard to `Some(rec) if rec.verifies(password) ||
   password.is_empty()` leaves auth-service's 10 tests passing, and every existing account then
   logs in with an empty password. libusers asserts `!r.verifies(b"")`, but that checks the
-  record, not the service's decision. Demonstrated by mutation, restored. tests. Medium.
+  record, not the service's decision. Demonstrated by mutation, restored. tests. Medium. **Later.**
 
 - [ ] **sec-9** `userspace/libcrypto/src/sha256.rs:98` — The padding boundary at 55 and 56 buffered
   bytes is untested, and so is the HMAC key-length boundary. The vectors are the empty string,
@@ -1280,7 +1300,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   changed to `> BLOCK_LEN + 1` in `hmac.rs` also leaves 17 passed. A 55-byte message hash, or
   the verifier of a 65-byte password, would then be wrong, locking out or colliding every
   account with such a password. Demonstrated by mutation, restored. The reviewers' hand check
-  of the 55/56/63-byte tails found the code correct as it stands. tests. Medium.
+  of the 55/56/63-byte tails found the code correct as it stands. tests. Medium. **Later.**
 
 - [ ] **sec-10** `userspace/view-broker/src/main.rs:1322` — Each endpoint grant's bind treats any
   non-zero `SYS_NS_BIND` result as "not there to grant". The view is a copy of the caller's
@@ -1296,7 +1316,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   power endpoint is not there to grant`. The pattern `bound = endpoint != 0 && SYS_NS_BIND(..)
   == 0` is at Storage 1322-1335, Services 1341-1349, Power 1355-1363 and Logs 1369-1377, and
   `bind_endpoint` for views and accounts (1411, 1418) works the same way. `with.rs:277` sends
-  `sys_ns_derive` of its own namespace unpruned. logic, trust-boundary. Low.
+  `sys_ns_derive` of its own namespace unpruned. logic, trust-boundary. Low. **Later.**
 
 - [ ] **sec-11** `userspace/view-broker/src/main.rs:1086` — A wrong current password on
   ChangePassword delays the session's next check but does not forget the session's
@@ -1311,6 +1331,9 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   `with` password the window would have been forgotten. The divergence is real by reading the
   code. Unverified: not run, and the intended behaviour needs the maintainer's ruling. logic.
   Low.
+  **No**: the maintainer's ruling. A wrong current password on ChangePassword holds the next check
+  and leaves the session's windows open, as the code does; the spec's sentence is narrowed to
+  `with`'s password.
 
 - [ ] **sec-12** `userspace/session-mgr/src/main.rs:236` — When the session namespace fails to
   build after a successful login, the loop `continue`s without `tty_close`. The success path
@@ -1320,7 +1343,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   `tty_open` runs at 199. tty-server keeps every terminal in its one wait set of 32, so after
   about 30 such logins `tty_open` fails, and the serial console loops on "no terminal for
   login" until reboot. Demonstrated by reading the code. Unverified: forcing the namespace
-  failure was not run. logic. Low.
+  failure was not run. logic. Low. **Later.**
 
 - [ ] **sec-13** `userspace/auth-service/src/main.rs:580` — `install()` discards the status of the
   `SYS_FILE_TRUNCATE` that clears a leftover `/system/users.new`, then creates the file with
@@ -1334,7 +1357,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   bytes n to S1 of the stale copy. Memory holds the n bytes, so the running system looks right,
   but the next boot's `load_db` reads the whole file and the stale records, such as the removed
   account, come back. Unverified: it needs a fault injected into `SYS_FILE_TRUNCATE` after a
-  failed install, then a boot-time reload. error-paths. Low.
+  failed install, then a boot-time reload. error-paths. Low. **Later.**
 
 - [ ] **sec-14** `userspace/libusers/src/lib.rs:374` — Three parser bounds on user-database input
   have no test: odd-length hex, u32 overflow in the iterations field, and an empty home field.
@@ -1345,7 +1368,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   iterations field of 4294967297 reads as 1, a trivially weak cost. (c) Dropping `||
   home.is_empty()` from `Record::parse` leaves 18 passed, so a record with no home is accepted
   and the empty home is returned to the caller. Demonstrated by three mutations, each restored.
-  tests. Low.
+  tests. Low. **Later.**
 
 - [ ] **sec-15** `userspace/libprompt/src/lib.rs:119` — No test would notice if the password
   scrubbing in `confirm` or `ask_password_then` were removed. `confirm` consumes its Vecs, so a
@@ -1355,7 +1378,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   ("every buffer here is zeroed"). The same holds for `scrub` in `ipc::send` and `ipc::recv`,
   which touch only syscalls. Demonstrated by mutation, restored. The impact is unverified; a
   test that hands `confirm` a buffer it can still inspect, such as one read through a test
-  allocator after the drop, would settle it. tests. Low.
+  allocator after the drop, would settle it. tests. Low. **Later.**
 
 What held up: authentication cost does not reveal which names exist, since an unknown user runs
 a dummy PBKDF2 at `DEFAULT_ITERATIONS`, which equals `libusers::ITERATIONS`, and the verifier is
@@ -1392,7 +1415,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   one, timer A is armed for t=1000 and its only ref dropped (`timer_destroys == 1`). Timer B then
   reuses A's slot and is armed for 1e9. `fire_expired_deadlines(2000)` leaves B with `deadline=0`
   and `in_heap=false`, and the heap names the freed A. A control that disarmed A before the drop
-  left no entry. logic, error-paths, trust-boundary, tests. high.
+  left no entry. logic, error-paths, trust-boundary, tests. high. **Fix**, as kobj-1.
 
 - [ ] **sched-2** `kernel/src/sched/wait.rs:53` — A wake panics the kernel when every
   affinity-permitted run queue is at `READY_RESERVE` (32). `make_runnable` (and `resume_suspended`,
@@ -1405,7 +1428,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   Demonstrated: a host probe (removed) with 2 CPUs online filled `ready[0]` with 32 mask=1 threads
   and called the real `make_runnable` on a blocked mask=1 thread. CPU 1 had room, and the call
   panicked at `wait.rs:71` with 'wake placement: no ready queue would take the thread'. logic.
-  high.
+  high. **Fix.**
 
 - [ ] **sched-3** `kernel/src/sched/wait.rs:29` — Blocking has no capacity check, and the 64-entry
   global `blocked` list panics when full. `wait_on` goes straight to `block_current_and_switch`,
@@ -1419,6 +1442,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   blocked cap=64, suspended cap=64, heap cap=16, ready cap=32. The 65th `push_reserved(&mut
   st.blocked, ..)` panicked with 'blocked list: reserve exhausted'. `git show aec52d83` shows an
   earlier `debug_assert` plus `try_push` was turned into this panic. logic, error-paths. high.
+  **Fix.**
 
 - [ ] **sched-4** `kernel/src/sched/exit.rs:59` — `reap_matching` assumes ready threads "register on
   no wait objects". That is false for a thread a waker just moved blocked to ready: it stays on the
@@ -1431,7 +1455,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   wakes early with a wrong result. Demonstrated: a host probe (removed) registers inert thread A
   (pid 7) on timers t1 and t2 with a deadline entry and parks it in `blocked`. Firing t1 moves A
   to `ready[0]`, and `reap_matching(ready[0], reap[0], 7)` reaps it. After the reap list dropped,
-  A was freed, was still a t2 waiter and still had a heap Thread entry. error-paths. high.
+  A was freed, was still a t2 waiter and still had a heap Thread entry. error-paths. high. **Fix.**
 
 - [ ] **sched-5** `kernel/src/sched/exit.rs:86` — When `exit_process` reaps a sibling blocked in
   `sys_wait` (or woken but not yet resumed), the sibling is never resumed. `sys_wait`'s on-stack
@@ -1443,7 +1467,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   child holds one end of a channel and the parent waits on the peer. Control: the child alone
   calls `process_exit` and the parent's wait returns 1. Test: the child first starts a second
   thread blocked in `sys_wait` on that endpoint, then calls `process_exit`. The parent's wait
-  times out (-12) after 2 s. error-paths. medium.
+  times out (-12) after 2 s. error-paths. medium. **Fix.**
 
 - [ ] **sched-6** `kernel/src/sched/deadline.rs:31` — The deadline heap is one global reserve of 16
   entries (`HEAP_RESERVE`, `spawn.rs:32`), shared by every armed timer, finite-deadline `sys_wait`
@@ -1456,7 +1480,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   hangs. Demonstrated: a probe on the `test-qemu` image (since restored). 11 far-future timers
   armed (the other 5 slots were in use), then OutOfMemory (-4). After closing all 11 and waiting
   50 ms, a fresh `sys_timer_set` still returned -4, and a finite-deadline `sys_wait` on an
-  unsignalled timer returned -4 immediately. logic, error-paths, tests. medium.
+  unsignalled timer returned -4 immediately. logic, error-paths, tests. medium. **Fix.**
 
 - [ ] **sched-7** `kernel/src/sched/timers.rs:97` — `fire_timer` disarms a one-shot timer
   (`set_armed(0,0)`) when it fires even if no thread waits, and `Timer::already_signaled` requires
@@ -1468,7 +1492,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   same window, but Ctrl-C recovers it. Demonstrated: a host probe (removed) armed a one-shot at
   100. `already_signaled(150)` was true, and after `fire_expired_deadlines(st, 120)` it was false
   and the timer was no longer scheduled. A second probe armed 1000, fired at 2000 with no waiters,
-  and `already_signaled(3000)` failed. error-paths, tests. medium.
+  and `already_signaled(3000)` failed. error-paths, tests. medium. **Fix.**
 
 - [ ] **sched-8** `kernel/src/sched/exit.rs:181` — When the last thread of a process ends through
   `exit_thread` (`sys_thread_exit`, or a supervisor's Terminate after a fault), `set_process_ended`
@@ -1480,14 +1504,14 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   With 12 spinning TimeShared threads, a child whose sole thread ended via `sys_thread_exit` never
   delivered `PeerClosed`, and the parent's wait timed out (-12) after 3 s. With the spinners
   stopped, the same wait returned 1. Control under the same load: a child using `sys_process_exit`
-  closed promptly (wait=1). error-paths. low.
+  closed promptly (wait=1). error-paths. low. **Fix.**
 
 - [ ] **sched-9** `kernel/src/sched/deadline.rs:84` — Test gap: the sift-up branch of
   `deadline::remove`, taken when the entry swapped into the hole is smaller than its new parent, is
   uncovered. Breaking it could leave a later deadline above an earlier one, so
   `fire_expired_deadlines` (which stops at the first entry later than `now`) would delay wakes.
   Demonstrated: a mutation collapsing the if/else to `sift_down(h, i)` still passed all 986 host
-  tests; restored. tests. low.
+  tests; restored. tests. low. **Fix**, with kobj-1.
 
 - [ ] **sched-10** `kernel/src/sched/timers.rs:50` — Test gap: nothing on the host exercises
   `fire_expired_deadlines`, `fire_timer`, `timer_arm` or `wait_on`, and sched-1 and sched-7 sit in
@@ -1496,7 +1520,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   periodic re-arm disabled; `timer_arm` pushing for `deadline_ns == 0`; `wait_on`'s deadline==0
   poll path removed; `has_deadline` forced false. Unverified: the mutation runs were not repeated
   by the verifier. The boot probes for sched-5, sched-6 and sched-8 did show those paths run only
-  under a QEMU gate. tests. low.
+  under a QEMU gate. tests. low. **Fix**, with kobj-1.
 
 What held up: `sys_wait` registration and blocking share one SCHED hold, so no lost wakeup, and a
 partial registration is fully unwound. The `wait_try_wake` CAS plus `make_runnable`'s not-in-blocked
@@ -1536,7 +1560,7 @@ Found 21, refuted by a boot 0, reported 16.
   going on without it", "unexpected message on a control channel (dropped, and 1 handle(s) it
   carried closed)" and "forwarding endpoint closed", and the gate failed. A natural 30 s stall
   from a real stick rests on the code-read USB deadline and was not booted. Lenses: logic,
-  error-paths, trust-boundary (three reviewers found it independently). High.
+  error-paths, trust-boundary (three reviewers found it independently). High. **Fix.**
 
 - [ ] **sup-2** `userspace/storage-service/src/lib.rs:95` — the `gpt-partuuid` matching in
   `source_device` reads the disk's table through libgpt and compares libgpt's entry name with the
@@ -1551,7 +1575,7 @@ Found 21, refuted by a boot 0, reported 16.
   tests.rs built a real GPT with `libgpt::table::build` and read it as `read_table` does. The
   unlabelled root printed `source_device = None` and `init_known = false`. A nine-partition disk
   printed `read_table = None`. Run with `cargo test -p storage-service --lib probe_ --
-  --nocapture`; the probe was removed. Lens: trust-boundary. Medium.
+  --nocapture`; the probe was removed. Lens: trust-boundary. Medium. **Later.**
 
 - [ ] **sup-3** `userspace/service-mgr/src/main.rs:160` — `compute_backoff`'s exponential arm uses
   `initial_ns.checked_shl(attempts)`, which fails only for shifts of 64 or more. Bits shifted out
@@ -1563,7 +1587,7 @@ Found 21, refuted by a boot 0, reported 16.
   standalone programs. At 1 s/5 min, attempt 54 gives 300000000000, attempts 55/56/60/63 give 0,
   and attempt 64 gives 300000000000. 200 ms/2 s also gives 0 at 55 and 63. Fix: saturating
   multiply, or clamp the shift. Lenses: logic, trust-boundary, tests (three reviewers; severity
-  rated low, low and medium). Medium.
+  rated low, low and medium). Medium. **Later.**
 
 - [ ] **sup-4** `userspace/service-mgr/src/main.rs:1192` — `serve_resolves` loops `recv_serve`
   per route until the ring is empty, with no per-pass bound. `serve_services` does the same for
@@ -1574,7 +1598,7 @@ Found 21, refuted by a boot 0, reported 16.
   reaped and no restart fires. No admin or power request is answered (Shutdown included), and no
   Ready deadline is acted on. storage-service and device-mgr take one message per handle per
   pass. Unverified: a two-thread flood client on `/dev/tty` while `service --stop` is issued would
-  show whether the stop is answered before the flood ends. Lens: logic. Medium.
+  show whether the stop is answered before the flood ends. Lens: logic. Medium. **Later.**
 
 - [ ] **sup-5** `userspace/storage-service/src/main.rs:642` — every resolve of `info/<name>.tsm`,
   including any session's `/dev/storage/all.tsm`, calls `refresh_unmounted`. That re-probes every
@@ -1587,7 +1611,7 @@ Found 21, refuted by a boot 0, reported 16.
   `stop_timeout`, and writable auto-mounts are never synced or marked clean. Only Ejected devices
   are skipped (main.rs:586). Unverified: time `cat /dev/storage/all.tsm` on a throttled QEMU
   usb-storage stick with no filesystem, and run `ls /storage` meanwhile. Lens: trust-boundary.
-  Medium.
+  Medium. **Later.**
 
 - [ ] **sup-6** `userspace/storage-service/src/main.rs:704` — media sessions
   (`MAX_MEDIA_SESSIONS` = 2) and directory sessions (`MAX_DIRS` = 9) are one pool shared by every
@@ -1599,7 +1623,7 @@ Found 21, refuted by a boot 0, reported 16.
   (`open_dir`, main.rs:1080). The user cannot eject and pulls the stick unsynced. device-mgr has
   the same shape for `/dev/devices` directory sessions (main.rs:55, 389). Unverified: a
   boot-probe client that holds two media sessions should get WouldBlock on a third resolve.
-  Lens: trust-boundary. Medium.
+  Lens: trust-boundary. Medium. **Later.**
 
 - [ ] **sup-7** `userspace/storage-service/src/main.rs:483` — storage-service reads `init.toml`
   differently from init. It stops at the first NUL and maps the object's whole size. Init
@@ -1611,7 +1635,7 @@ Found 21, refuted by a boot 0, reported 16.
   share one ext4. A manifest over 4 KiB is likewise cut by init at one page but read whole by
   storage-service. Demonstrated: a temporary libinittoml test, since removed, put a manifest with
   a NUL in a comment between two mounts into a 4096-byte page and sliced it with each rule. It
-  printed `init mounts ["/", "/data"]` and `storage mounts ["/"]`. Lens: logic. Low.
+  printed `init mounts ["/", "/data"]` and `storage mounts ["/"]`. Lens: logic. Low. **Later.**
 
 - [ ] **sup-8** `userspace/service-mgr/src/main.rs:280` — `skipped_critical` counts every skipped
   declaration that says `critical = true`, including a Duplicate (or a NoExecutable re-entered
@@ -1624,7 +1648,7 @@ Found 21, refuted by a boot 0, reported 16.
   through main.rs's Entry mapping and `skipped.iter().any(|s| s.critical)` into `unfit`. It
   printed `Skipped { name: "auth-service", why: Duplicate, critical: true }` and
   `unfit = Some("a critical declaration could not be read")`. The appended block gave
-  `NoExecutable` and the same result. The probe was removed. Lens: error-paths. Low.
+  `NoExecutable` and the same result. The probe was removed. Lens: error-paths. Low. **Later.**
 
 - [ ] **sup-9** `userspace/service-mgr/src/main.rs:1231` — bring-up's `Step::Start` calls
   `start(i, true)` without checking `running`. An admin Start of a declaration bring-up has not
@@ -1636,7 +1660,7 @@ Found 21, refuted by a boot 0, reported 16.
   server's Ready (up to 30 s) while an admin session issues Start for a later declaration, as
   with nxterm `after = ["display-selftest"]` in the test image. Unverified: `service --start
   nxterm` during that wait, then count nxterm processes or "starting service" lines. Lenses:
-  logic, error-paths (same defect). Low.
+  logic, error-paths (same defect). Low. **Later.**
 
 - [ ] **sup-10** `userspace/service-mgr/src/main.rs:1374` — `wait_codes` is meant to wait up to
   `CODE_GRACE_NS` for a dead service's exit code, but it returns false when any route wakes the
@@ -1648,7 +1672,7 @@ Found 21, refuted by a boot 0, reported 16.
   child's, or taken as the next death's. `lookup_serving` loops to its deadline; this does not.
   Unverified: on SMP, a server that exits 0 before its Ready while another process resolves
   through a route in a tight loop; look for `code=unknown` followed by "unsupervised child
-  exited code=0". Fix: loop until `until`. Lens: error-paths. Low.
+  exited code=0". Fix: loop until `until`. Lens: error-paths. Low. **Later.**
 
 - [ ] **sup-11** `userspace/service-mgr/src/main.rs:2202` — login supervisors get their route
   copies once, at login-chain start (574-576, 600-602), and only for servers live then
@@ -1658,7 +1682,7 @@ Found 21, refuted by a boot 0, reported 16.
   re-sends them, so every current and future login lacks `/storage`, `/dev/storage` or
   `/dev/devices` until reboot. Routes exist so that a restart reaches every session. Unverified:
   boot with storage-service failing its Ready, start it from an admin session, log in, and
-  resolve `/storage`. Lens: trust-boundary. Low.
+  resolve `/storage`. Lens: trust-boundary. Low. **Later.**
 
 - [ ] **sup-12** `userspace/storage-service/src/probe.rs:125` — `partition_entries`, which decides
   whether a whole disk's own filesystem is ignored, has conditions no test pins: the 0xAA half of
@@ -1666,33 +1690,33 @@ Found 21, refuted by a boot 0, reported 16.
   `RamDisk` arm of `whole` is also unpinned. A regression would treat a disk with a stale sector 0
   as partitioned (a FAT or ext4 that should mount is reported as Nothing), or mount a partitioned
   disk whole over its partitions. Demonstrated: each mutation alone passed `cargo test -p
-  storage-service --lib` (5 survivors, plus the `RamDisk` removal). Lens: tests. Low.
+  storage-service --lib` (5 survivors, plus the `RamDisk` removal). Lens: tests. Low. **Later.**
 
 - [ ] **sup-13** `userspace/storage-service/src/probe.rs:150` — `fat_label`'s FAT12/16 branch
   (the `0x29` extended signature at 0x26 and the FAT string at 0x36) and the sector-size
   allow-list lack negative tests. Removing the `sector[0x26] == 0x29` check, or accepting 0 as a
   sector size, passed all storage-service tests. A non-FAT sector carrying those bytes would be
   probed as FAT and offered for mounting. Demonstrated: the two mutations passed the suite; the
-  FAT32 branch equivalents were killed. Lens: tests. Low.
+  FAT32 branch equivalents were killed. Lens: tests. Low. **Later.**
 
 - [ ] **sup-14** `userspace/init/src/unmount.rs:42` — `unmount::answer` has no test for a wrong
   `RS_MAGIC`. Reducing the check to the length test passes all of init's tests, so a non-rsproto
   payload with the right bytes at offsets 6 and 16 would be accepted as a clean unmount
   (`Answer::Done`). The `reply_id` is also not matched to the request. Demonstrated: the
   mutation passed `cargo test -p init --lib`; `anything_else_is_unexpected` covers wrong op,
-  not-a-reply and truncation only. Lens: tests. Low.
+  not-a-reply and truncation only. Lens: tests. Low. **Later.**
 
 - [ ] **sup-15** `userspace/service-mgr/src/service_toml.rs:418` — an unrecognised or malformed
   restart `policy` falls back to `Never`, but no test pins it. Changing the fallback to `Always`
   passed `cargo test -p service-mgr --lib`, so a regression would make every mistyped
   declaration (`policy = "on-failur"`) restart forever. `parse_duration_ns`'s overflow behaviour
-  is untested too. Demonstrated by the surviving mutation. Lens: tests. Low.
+  is untested too. Demonstrated by the surviving mutation. Lens: tests. Low. **Later.**
 
 - [ ] **sup-16** `userspace/libinittoml/src/toml_lite.rs:257` — `parse_value` accepts a string
   with an interior quote: `key = "a"b"` parses as the value `a"b` instead of
   `UnterminatedString`. The `body.contains('"')` rejection is untested. Replacing it with
   `false` passed all 19 libinittoml tests. The manifest is trusted initramfs data, so the impact
-  is limited. Demonstrated by that mutation. Lens: tests. Low.
+  is limited. Demonstrated by that mutation. Lens: tests. Low. **Later.**
 
 What held up: about 105 single-line mutations across storage-service, the service-mgr lib,
 libinittoml, device-mgr and init were killed by the tests, apart from the survivors above and
@@ -1732,7 +1756,7 @@ Found 11, refuted by a boot 0, reported 11.
   fresh page-aligned not-present mapping". The race itself is read from the code: the #PF gate is
   an interrupt gate (`idt.rs:63`, 0x8E), so on one CPU it cannot happen, but nothing serialises
   two CPUs between the hardware fault and the AS lock. The sibling `map_file_page` already treats
-  `AlreadyMapped` as success. Architecture. High.
+  `AlreadyMapped` as success. Architecture. High. **Fix**, as kmem-3.
 - [ ] **kmem-21** `kernel/src/mm/buddy.rs:163` — any kernel allocation over 4 MiB panics. `kmalloc`
   sends it to the slab's `large_alloc` (`slab.rs:402`), which computes a buddy order above
   `MAX_ORDER` (10) and calls `buddy_alloc`, whose `debug_assert!(order <= MAX_ORDER)` fires. The
@@ -1748,7 +1772,7 @@ Found 11, refuted by a boot 0, reported 11.
   about 2 MiB hits it too. Demonstrated: a host probe in the `memory_object` tests,
   `MemoryObject::try_new(5 MiB)` succeeded, then `copy_to_kvec()` panicked at `buddy.rs:163` with
   "buddy: alloc order 11 > MAX_ORDER". Fix the class in `large_alloc` (return null when
-  order > `MAX_ORDER`), not at each caller. Architecture. High.
+  order > `MAX_ORDER`), not at each caller. Architecture. High. **Fix**, as kobj-3.
 - [ ] **kmem-22** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE` with
   unchecked addition on `e_phoff`, which comes straight from the ELF. The kernel is built with
   `overflow-checks = true` (profile.dev), so an `e_phoff` near `u64::MAX` panics instead of
@@ -1757,7 +1781,7 @@ Found 11, refuted by a boot 0, reported 11.
   passes it to `sys_process_spawn`; `load_elf` then `parse_phdr` hits "attempt to add with
   overflow" and the kernel panics. Demonstrated: a host probe in the `elf` tests, an `ElfBuilder`
   with one PT_LOAD and bytes 32..40 set to `u64::MAX-8`; `load_elf` panicked at `elf.rs:182:22`
-  with "attempt to add with overflow". Architecture. High.
+  with "attempt to add with overflow". Architecture. High. **Fix**, as kobj-4.
 - [ ] **kmem-23** `kernel/src/mm/elf.rs:128` — `load_elf` returns `e_entry` from the untrusted ELF
   without checking that it is a canonical user-half address. `enter_user` starts the thread with
   `iretq`, and an `iretq` to a non-canonical RIP raises #GP while still at CPL 0;
@@ -1773,6 +1797,7 @@ Found 11, refuted by a boot 0, reported 11.
   `thread_enter`, "stopping every CPU", then a test timeout. Under TCG, QEMU reports the `iretq` as
   a ring-3 segfault ("unhandled ring-3 fault, pid 1"), so the halt shows on KVM only, as it would
   on real hardware. A child from `sys_process_spawn` takes the same path. Architecture. High.
+  **Fix**, as kmem-1.
 - [ ] **kmem-24** `kernel/src/syscall/table.rs:2589` — `block_map` trusts the reply's `run_count`:
   it reserves `run_count` `BlockRun`s (24 bytes each) before checking that the body holds that
   many, and a 4 KiB message fits about 170. A filesystem server's Model A resolve reply claims
@@ -1783,6 +1808,7 @@ Found 11, refuted by a boot 0, reported 11.
   probe in the `syscall::table` tests, a body of 32 + 24 bytes with block_size 512, `run_count`
   200000 and one valid run; `block_map` panicked with "buddy: alloc order 11 > MAX_ORDER". Fix:
   bound `run_count` by `(body.len() - 32) / 24` before reserving. Architecture. Medium.
+  **Fix**, as kobj-3.
 - [ ] **kmem-25** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
   named in `rights`, yet always installs a user-readable mapping (prot starts at
   `Protection::USER`, and x86 has no read bit). A request with `rights = 0`, or MAP_WRITE alone,
@@ -1797,7 +1823,7 @@ Found 11, refuted by a boot 0, reported 11.
   empty set, and `page_flags_for` sets USER on a present leaf. `syscall-abi.md` says "the handle
   must carry every requested MAP_* bit", and nothing makes reading require MAP_READ. A host test
   that restricts a handle to MAP_WRITE and maps with `rights = 0` would settle it. Fix: always
-  require MAP_READ for any mapping. Architecture. Medium.
+  require MAP_READ for any mapping. Architecture. Medium. **Fix**, as kobj-8.
 - [ ] **kmem-26** `kernel/src/mm/kvmap.rs:55` — kernel-stack virtual addresses are never reclaimed:
   `vmap` is a bump allocator and `KernelStack::Drop` unmaps only the leaves. Thread churn
   therefore (a) retains a page-table frame for every 2 MiB of vmap (about 102 stacks) forever, and
@@ -1815,7 +1841,7 @@ Found 11, refuted by a boot 0, reported 11.
   built a boot root with `kvmap::init`'s PDPT and snapshotted it as the template. An early stack
   was visible in a second AddressSpace (true). After bumping `VMAP_NEXT` to the 512 GiB edge, a
   stack at 0xffffc08000000000 was mapped in its own AS (true) but not in a fresh AS (false); the
-  count needed to get there was 26843545 stacks. Architecture. Medium.
+  count needed to get there was 26843545 stacks. Architecture. Medium. **Later**, as kmem-9.
 - [ ] **kmem-27** `kernel/src/mm/elf.rs:241` — PT_LOAD `p_memsz` has no cap: `map_load_segment`
   eagerly allocates and zeroes a frame for every page with `map_vma`, under the AS spinlock,
   inside `sys_process_spawn`, which runs with IF masked. This is the unpreemptable zeroing loop
@@ -1831,7 +1857,7 @@ Found 11, refuted by a boot 0, reported 11.
   ok=false cycles=89568028", then "init: ELF load failed: OutOfMemory". The loop ran under the AS
   lock in the spawn path (SFMASK clears IF on syscall entry). The ~90M cycles is on a small-RAM
   guest and grows with RAM. The TLB-ack stall and OOM faults in other processes were not measured.
-  Architecture. Medium.
+  Architecture. Medium. **Fix**, as kmem-8.
 - [ ] **kmem-28** `kernel/src/arch/x86_64/idt.rs:250` — `pf_dispatch` checks the user-copy
   recovery table before demand paging, so a kernel copy that touches a valid but not-yet-faulted
   page (a lazy anonymous page or any FileBacked page) fails with `UserAccessError::Fault` instead
@@ -1846,7 +1872,7 @@ Found 11, refuted by a boot 0, reported 11.
   `mm/user_access.rs` has no pre-fault; `user-memory-access.md` line 162 still describes the
   pre-scheduler state. To settle it, boot a test-image program that maps a file (or lazy anonymous
   memory) and passes an untouched page as the source buffer of `sys_debug_kprint`, and check for
-  `Fault`. Architecture. Low.
+  `Fault`. Architecture. Low. **Later**, in Part E.
 - [ ] **kmem-29** `kernel/src/syscall/table.rs:878` — `sys_memory_map(hint = 0)` picks its range
   with `find_free_range` under one AS-lock hold and maps it under another, so two threads mapping
   concurrently can pick the same range. The loser gets `MapError::Overlap`, which reaches the
@@ -1856,6 +1882,7 @@ Found 11, refuted by a boot 0, reported 11.
   refused and an error code nobody would retry on. Demonstrated: a host probe had two
   `find_free_range(PAGE)` calls return the same range (true); `map_object` of the first returned
   `Ok(())`, the second `Err(Overlap)`. Fix: search and insert under one hold. Architecture. Low.
+  **Later**, in Part E.
 - [ ] **kmem-30** `kernel/src/syscall/table.rs:2188` — `sys_file_sync` is a per-kind verb: its name
   and `lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)` bind it to
   FileObject, beside `sys_ns_sync` and the per-kind memory calls, where the project prefers a few
@@ -1863,7 +1890,7 @@ Found 11, refuted by a boot 0, reported 11.
   future writable MemoryObject backing) needs another syscall number instead of one sync over
   handles. A design note rather than a failure, worth listing in the syscall-surface work.
   Unverified: nothing to run; the maintainer's call on whether the syscall-surface work takes it
-  up. Architecture. Low.
+  up. Architecture. Low. **Later**, in Part E.
 
 What held up: `user_access.rs` copy primitives check `addr+len` with `checked_add` against
 `USER_VIRT_END` (equal to the canonical boundary), handle zero-sized `T`, bound `copy_cstr` by the
@@ -1906,7 +1933,7 @@ architecture lens returned no findings.
   allocated landed on the freed slot ("slot reused by the next Timer: true"). The stale fire then
   disarmed that unrelated live timer (deadline=0, in_heap=false) and left its own heap entry
   orphaned. Neither `Timer::drop` nor `dispatch_destroy`'s Timer arm touches the heap.
-  architecture. high.
+  architecture. high. **Fix**, as kobj-1.
 - [ ] **sched-12** `kernel/src/sched/exit.rs:57` — `reap_matching` assumes threads in the ready
   queues are registered on no wait objects. A sibling woken from `sys_wait` but not yet run is
   still on its other wait objects' waiter lists and in the deadline heap. `exit_process` reaps and
@@ -1920,7 +1947,7 @@ architecture lens returned no findings.
   reap: 1 (first == freed A: true); heap still names A: true", "next Thread took the freed slot:
   true", "B blocked=0 ready=1 (c3 never signalled)". An unrelated thread from another process,
   blocked with no deadline on an object that never signalled, was moved to ready by A's stale
-  deadline. architecture. high.
+  deadline. architecture. high. **Fix**, as sched-4.
 - [ ] **sched-13** `kernel/src/sched/wait.rs:29` — `block_current_and_switch` pushes onto the
   global blocked list (64 entries for the whole system) with `push_reserved` and no capacity check,
   so the 65th blocked thread panics the kernel. `suspend_with_fault` has the same unchecked push
@@ -1933,7 +1960,7 @@ architecture lens returned no findings.
   too. That consequence is not in the recorded deferral, and the deferred-decisions entry covers
   REAP_RESERVE only. Demonstrated: a host probe printed blocked capacity 64, and `push_reserved` at
   capacity panicked with "blocked list: reserve exhausted — this list is sized so that cannot
-  happen". architecture. high.
+  happen". architecture. high. **Fix**, as sched-3.
 - [ ] **sched-14** `kernel/src/sched/timers.rs:118` — A one-shot timer fired by the tick with no
   waiters is disarmed (deadline 0), so `Timer::already_signaled` becomes false. A `sys_wait` that
   arrives after that tick finds nothing signalled and no heap entry, and blocks with nothing to
@@ -1946,7 +1973,7 @@ architecture lens returned no findings.
   (userspace/coreutils/src/bin/sleep.rs:94-118) would hang until Ctrl-C. session-mgr's `sleep_ms`
   only loses its 1 s backstop. Demonstrated: a host probe armed a timer at 5000. `already_signaled(6000)`
   was true before `fire_expired_deadlines(6000)` and false after, with the heap empty. architecture.
-  high.
+  high. **Fix**, as sched-7.
 - [ ] **sched-15** `kernel/src/sched/exit.rs:111` — When `exit_process` reaps a sibling blocked in
   `sys_wait`, the thread's kernel stack is freed without `sys_wait`'s `refs` array being dropped,
   so every object it waited on leaks one reference. An IPC endpoint pinned this way never runs
@@ -1964,7 +1991,7 @@ architecture lens returned no findings.
   with sibling blocked": PeerClosed never arrived and the demo chain did not finish. The control
   was the same probe with the sibling faulting on a bad stack, so it never blocked in `sys_wait`.
   There the pipe closed and the child's exit was reaped in 313 ms, matching the 300 ms sleep.
-  Probes reverted; git status clean. architecture. medium.
+  Probes reverted; git status clean. architecture. medium. **Fix**, as sched-5.
 - [ ] **sched-16** `kernel/src/sched/deadline.rs:31` — The deadline heap is a single global
   16-entry reserve with no per-process accounting, and closed armed timers (sched-11) hold their
   slots for good. An unprivileged process, needing no syscap for `sys_timer_create` or
@@ -1978,6 +2005,7 @@ architecture lens returned no findings.
   push failure. The existing test `heap_push_refuses_over_reserve` shows the refusal. Each
   consumer's handling was read, not run. A test that arms 16 timers from one process, then calls
   `sys_wait` with a deadline from another, would settle it. architecture. medium.
+  **Fix**, as sched-6.
 - [ ] **sched-17** `kernel/src/sched/exit.rs:181` — `exit_thread`'s last-thread branch marks the
   process ended but never queues its pid in `ended_pids` or wakes the reaper, though the comment
   says this is "deferred to the reaper". The handle table is closed only when this CPU next runs
@@ -1994,7 +2022,7 @@ architecture lens returned no findings.
   in 2993 ms, exactly when the spinners' 3 s limit ended and they exited, which runs
   `reap_pending`. The reaper thread was never woken. It is bounded by CPU load, and the path is
   rare, since most exits go through `exit_process`. Probes reverted; git status clean.
-  architecture. low.
+  architecture. low. **Fix**, as sched-8.
 
 What held up: `sys_wait` registers and blocks under one SCHED hold, and `wait_try_wake`'s CAS plus
 `make_runnable`'s blocked-list lookup absorb a second waker. `reap_blocked_matching` unregisters
@@ -2016,3 +2044,61 @@ both sides. `close_all_owned_by` drops refs outside the handle-table lock, and I
 takes SCHED only from that lock-free context. Not reported, already recorded: the running-sibling
 SMP gap in `exit_process` (smp.md § Deferred), REAP_RESERVE (deferred-decisions),
 TODO(unsupervised-fault) and TODO(smp-cpu-count).
+
+### PR #365's trial reviews, checked against main — main at 510381f4, 2026-10-20
+
+The two trial reviews of PR #365 (head `55e6bd18`; T1 posted 2026-10-14, T2 2026-10-15) were read
+against `main`, not run. What `main` had already fixed, by the original review's fixes (decision
+log, 2026-10-07), is left out: T1-1, 2, 4, 10, 12 and 15, and T2-1, 2, 3 and 12. Six more are the
+bash's own and go with them: the run count reserved unchecked (T1-3, T2-4) is kobj-3, the
+device's rights dropped (T1-29) kobj-2, a rename leaving two names (T1-5, T2-8) fs-3, `allocate`
+keeping what it took (T1-9, T2-7) fs-12, a create's real error dropped (T2-10) fs-17, and FAT's
+refusals untested (T1-11) fs-14. The rest follow, each still there by reading, and reproduced
+before it is fixed.
+
+- [ ] **pr365-1** `userspace/fs-server-fat/src/volume.rs:833` — a directory moved to another parent
+  has its old name deleted before its `..` is checked or rewritten (`:835`). A move whose `..` is
+  malformed, or whose rewrite fails, is answered Corrupt or Io after it is made, and the stale `..`
+  then misleads `within()`. T1-6, T2-14. Error paths. Medium. **Fix.**
+- [ ] **pr365-2** `userspace/fs-server-fat/src/bpb.rs:198` — `parse` has no upper bound on the
+  cluster count: a FAT16 of 65,525 clusters or more, or a FAT32 over 0x0FFFFFF5, is served, and its
+  high clusters collide with the end-of-chain and bad-cluster markers. T1-7, T2-5. Logic. Medium.
+  **Fix.**
+- [ ] **pr365-3** `userspace/fs-server-fat/src/volume.rs:440` — `mark_clean` clears the dirty bit
+  after a change that failed partway during this mount, since only a volume found dirty at mount
+  stays dirty, so shared or lost clusters are recorded as a clean unmount. T1-8, T2-9. Error paths.
+  Medium. **Fix.**
+- [ ] **pr365-4** `userspace/fs-server-fat/src/volume.rs:582` — a grow whose final zero write or FAT
+  flush fails leaves the clusters it took chained and lost (`z.finish()?` after `allocate`), and
+  `place()` (`:499`) has the same shape. A leak only. T1-21, T2-13. Error paths. Low. **Fix.**
+- [ ] **pr365-5** `userspace/fs-server-fat/src/volume.rs:415` — `mark_mounted` writes the dirty bit
+  before FSInfo. An FSInfo write that fails refuses the mount but leaves the bit set, so the stick
+  never reads clean again. T1-22. Error paths. Low. **Fix.**
+- [ ] **pr365-6** `userspace/fs-server-fat/src/table.rs:175` — a directory walk is bounded by the
+  volume's cluster count, not by `MAX_SLOTS` (65,536 entries), so a directory whose chain loops
+  costs O(volume) reads before it is refused. T2-6. Logic. Low. **Fix.**
+- [ ] **pr365-7** `userspace/fs-server-fat/src/volume/write_tests.rs:411` — test gap: `writes <= 24`
+  is loose against the 19 writes a 1 MiB grow records, so the FAT flush could lose its batching
+  unseen. T1-25. Tests. Low. **Later.**
+- [ ] **pr365-8** `userspace/libfsserver/src/server.rs:419` — test gap: the truncate-to-zero arm,
+  `forget_then_release`, is tested at no level; a gate step emptying a file on the FAT stick would
+  catch a leak. T1-14. Tests. Low. **Later.**
+- [ ] **pr365-9** `docs/spec/rsproto-namespace-ops.md:160` — "a page must lie within one run … that
+  one the kernel cannot check, and each server guarantees it" is wrong both ways: `block_map` could
+  check a page's alignment against the runs, and ext4 with blocks under a page does not guarantee
+  it (`TODO(ext4-subpage-runs)`). T1-17, T2-11. Docs. Low. **Fix.**
+- [ ] **pr365-10** `docs/spec/rsproto-block-ops.md:49` — `BlockRun` says a block is the filesystem
+  block size the kernel learns at mount, but runs are in the reply's `block_size` (FAT's are
+  512-byte sectors). T2-15. Docs. Low. **Fix.**
+- [ ] **pr365-11** — the trials' other test gaps, each a mutation that passed the suite at
+  `55e6bd18`, not yet run against `main`: no device write made to fail (T1-13); the volume-label
+  filter (T1-23); `fat_label`'s fallbacks (T1-24); the 64-run limit at its neighbour (T1-26); the
+  chunker's last chunk (T1-27); and eight of FAT's guards (T2-17 to T2-24: the second FAT copy on
+  eviction, the long-name ordinal bound and checksum, the numeric-tail window, the rewrite's slot
+  bound, the FSInfo hint, FAT32's reserved nibble, DEL in a name). Tests. Low.
+- [ ] **pr365-12** — the trials' other doc claims, not yet read against `main`: `Meta::Unmount`'s
+  "recorded clean" where FAT keeps a volume found dirty (T1-16); `error-codes.md` pointing at the
+  deleted `fs_kerror` (T1-18); `File::Forget`'s list missing a truncate to zero (T1-19);
+  `fat-fs-server.md` §9 citing deferrals that do not exist (T1-20); the refusal-in-place-of-Ready
+  text naming only ext4 (T1-28); and no marker where ext4 accepts a block under a page, with its
+  `CLAUDE.md` silent on it (T2-16). Docs. Low.
