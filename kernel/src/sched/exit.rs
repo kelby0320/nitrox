@@ -54,9 +54,15 @@ pub(super) fn has_live_siblings(g: &SchedState, my_pid: u32) -> bool {
         || g.current.iter().flatten().any(same)
 }
 
-/// Reap every thread of process `my_pid` parked in `list` (a `ready` or `suspended` queue,
-/// which register on no wait objects): mark each `Exited`, move it into `reap`.
-pub(super) fn reap_matching(list: &mut KVec<ObjectRef>, reap: &mut KVec<ObjectRef>, my_pid: u32) {
+/// Reap every thread of process `my_pid` parked in `list`, first unregistering it from its
+/// wait objects and the deadline heap so nothing dangles at a reaped thread: one woken but not
+/// yet run is in a `ready` queue still registered wherever it waited.
+pub(super) fn reap_matching(
+    list: &mut KVec<ObjectRef>,
+    deadlines: &mut KVec<deadline::Entry>,
+    reap: &mut KVec<ObjectRef>,
+    my_pid: u32,
+) {
     // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
     while let Some(i) = list.iter().position(|r| {
         // SAFETY: `r` pins a live Thread; `SCHED` held.
@@ -75,33 +81,6 @@ pub(super) fn reap_matching(list: &mut KVec<ObjectRef>, reap: &mut KVec<ObjectRe
             core::hint::spin_loop();
         }
         let r = list.remove(i);
-        // SAFETY: `r` pins the thread; `SCHED` held.
-        unsafe { Thread::set_state(r.as_ptr(), ThreadState::Exited) };
-        push_reserved(reap, r, "reap list");
-    }
-}
-
-/// Reap every `blocked` thread of process `my_pid`, first unregistering it from its wait
-/// objects and the deadline heap so nothing dangles at a reaped thread.
-fn reap_blocked_matching(
-    blocked: &mut KVec<ObjectRef>,
-    deadlines: &mut KVec<deadline::Entry>,
-    reap: &mut KVec<ObjectRef>,
-    my_pid: u32,
-) {
-    // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
-    while let Some(i) = blocked.iter().position(|r| {
-        // SAFETY: `r` pins a live Thread; `SCHED` held.
-        let th = unsafe { &*(r.as_ptr() as *const Thread) };
-        // Never reap an idle thread (see `reap_matching`).
-        th.owner_pid() == my_pid && th.tid() != IDLE_TID
-    }) {
-        // Wait out a mid-switch-out guard before reclaiming (see [`reap_matching`]).
-        // SAFETY: the entry pins a live Thread; `SCHED` held.
-        while unsafe { Thread::is_on_cpu(blocked[i].as_ptr()) } {
-            core::hint::spin_loop();
-        }
-        let r = blocked.remove(i);
         let obj = r.as_ptr();
         // Unregister from every object this thread was waiting on, as `wait_on`'s resume does.
         let mut snap = [(0usize, false); MAX_WAIT_HANDLES];
@@ -219,10 +198,10 @@ pub fn exit_process(status: ExitStatus) -> ! {
         // Torn-down siblings are parked off-CPU, so reaping them into this CPU's reap list is
         // safe. Sweep every per-CPU ready queue.
         for c in 0..MAX_CPUS {
-            reap_matching(&mut st.ready[c], &mut st.reap[cpu], me_pid);
+            reap_matching(&mut st.ready[c], &mut st.deadlines, &mut st.reap[cpu], me_pid);
         }
-        reap_matching(&mut st.suspended, &mut st.reap[cpu], me_pid);
-        reap_blocked_matching(&mut st.blocked, &mut st.deadlines, &mut st.reap[cpu], me_pid);
+        reap_matching(&mut st.suspended, &mut st.deadlines, &mut st.reap[cpu], me_pid);
+        reap_matching(&mut st.blocked, &mut st.deadlines, &mut st.reap[cpu], me_pid);
         // The process is ending: always deliver ChildExited, and mark this thread so the
         // reaper closes the process's handles. The sweep cannot happen here — it drops object
         // references (destructors reach the rank-6 allocator, and an IPC endpoint's takes
@@ -416,6 +395,7 @@ pub(super) fn drain_pending_drops(g: &mut SchedState, buf: &mut [Option<ObjectRe
     let mut n = 0;
     while n < buf.len() {
         let Some(r) = g.reap_slot().pop() else { break };
+        g.threads = g.threads.saturating_sub(1);
         buf[n] = Some(r);
         n += 1;
     }
@@ -443,8 +423,8 @@ pub fn reap_pending() {
     crate::drivers::ps2::reclaim_completed();
     crate::drivers::xhci::hid::reclaim_completed();
     loop {
-        let mut buf: [Option<ObjectRef>; REAP_RESERVE + DEFERRED_DROP_RESERVE] =
-            [const { None }; REAP_RESERVE + DEFERRED_DROP_RESERVE];
+        // A batch a lock hold, on this stack; the loop goes round for the rest.
+        let mut buf: [Option<ObjectRef>; 64] = [const { None }; 64];
         let n = {
             let mut g = SCHED.lock();
             drain_pending_drops(&mut g, &mut buf)
@@ -484,7 +464,7 @@ pub fn reap_pending() {
         if n < buf.len() {
             return; // drained everything that was parked when we looked
         }
-        // Filled the buffer (defensive) — go around for any remainder.
+        // Filled the batch: go around for the rest.
     }
 }
 

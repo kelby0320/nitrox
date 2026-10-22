@@ -80,10 +80,15 @@ pub use wait::*;
 // `Timer` above is the kernel object; the hardware monotonic clock is
 // `crate::arch::Timer::read_ns()` (the `ArchTimer` trait provides `read_ns`).
 
-/// Per-CPU run-queue capacity, reserved once at [`init`]/[`ap_init`]. Enqueueing beyond it
-/// is refused (spawn) or fatal (wake, after every permitted CPU's queue is full — see
-/// [`place_thread`]) rather than an allocation under the rank-1 lock.
-const READY_RESERVE: usize = 32;
+/// The most threads the scheduler holds at once, the idle threads aside: a spawn past it is
+/// refused. **Every list a thread can be on is reserved to hold this many**, and a thread is
+/// on one at a time, so a wake, a block, a fault or an exit never finds its list full — none
+/// of them can refuse, and growing a list under the rank-1 lock is an allocation.
+const MAX_THREADS: usize = 512;
+
+/// Per-CPU run-queue capacity, reserved once at [`init`]/[`ap_init`]: every thread, since
+/// affinity can pin them all to one CPU.
+const READY_RESERVE: usize = MAX_THREADS;
 
 /// Periodic scheduler tick: 10 ms (100 Hz), matching the PIT calibration window.
 pub const TICK_NS: u64 = 10_000_000;
@@ -95,20 +100,13 @@ const QUANTUM_TICKS: u32 = 1;
 /// by object address (`SchedState::idle_addr`).
 const IDLE_TID: u32 = u32::MAX;
 
-/// Pre-reserved capacity for the blocked-thread parking list; blocking beyond it is refused
-/// rather than allocating under the rank-1 lock. **Global, not per-CPU**: the number of
-/// threads the *whole system* may have parked in `sys_wait` at once. Every resource server
-/// spends its life there, so it scales with the process count.
-const BLOCKED_RESERVE: usize = 64;
+/// Pre-reserved capacity for the blocked-thread parking list, and the suspended one: every
+/// thread, since all of them can wait or fault at once.
+const BLOCKED_RESERVE: usize = MAX_THREADS;
 
-/// Pre-reserved capacity for the exited-thread reap list: the current thread plus the
-/// siblings a process exit tears down. `exit_process` sweeps every sibling into this list
-/// in one lock hold, so this caps threads-per-process at exit. **That cap is
-/// userspace-reachable and aborts the machine when crossed** (`sys_thread_create` has no
-/// per-process limit; 33 threads that block and then exit trip it). Growing here would be
-/// the forbidden allocation under `SCHED`; the alternative is reaping in batches, a real
-/// change to the exit path, tracked in `docs/rationale/deferred-decisions.md`.
-const REAP_RESERVE: usize = READY_RESERVE;
+/// Per-CPU reap-list capacity: every thread, since `exit_process` sweeps all of a process's
+/// threads into the exiting CPU's list in one lock hold.
+const REAP_RESERVE: usize = MAX_THREADS;
 
 /// Pre-reserved capacity for [`SchedState::deferred_drops`]. Sized to twice the only
 /// producer's burst (the entropy seed wake parks ≤ [`crate::entropy::SEED_WAITERS_MAX`]
@@ -285,6 +283,9 @@ struct SchedState {
     /// The reaper thread while it is parked. `None` while it is running or queued, like
     /// [`idle`](Self::idle), so a wake is a `take()`.
     reaper: Option<ObjectRef>,
+    /// Threads held, the idle threads aside: counted from a thread's first placement (or
+    /// adoption at boot) until its reap is drained. Bounded by [`MAX_THREADS`].
+    threads: usize,
 }
 
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(
@@ -307,6 +308,7 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(
         deferred_drops: KVec::new(),
         ended_pids: KVec::new(),
         reaper: None,
+        threads: 0,
     },
 );
 

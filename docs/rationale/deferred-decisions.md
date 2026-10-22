@@ -2336,6 +2336,13 @@ lock holds, or cap threads per process; both are changes to the exit path rather
 constant. Trigger: a per-process thread cap landing, a real workload approaching 32 threads,
 or the first report of this panic.
 
+> **Implemented 2026-10-22**, on the bug bash's report of this panic and its siblings (a wake
+> past full run queues, the 65th blocked thread): the scheduler holds at most `MAX_THREADS`
+> (512) threads, a spawn past them refused, and every list a thread can be on — each CPU's run
+> queue and reap list, the blocked and suspended lists — is reserved to hold them all. A
+> system-wide cap, not a per-process one: one process can still take every thread, which is
+> the quota question the bash's later findings raise for the view broker and storage service.
+
 **Every device interrupt is pinned to the BSP, so a BSP park kills all I/O.**
 `install_isa_irq` (`kernel/src/arch/x86_64/ioapic.rs:370`) routes each GSI to `Irq::id()` —
 the boot CPU — in physical destination mode. `sched::leave_online` (2026-08-13) keeps the

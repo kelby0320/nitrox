@@ -64,7 +64,9 @@ holding it, a sibling thread can read a faulted thread's registers
 - `FaultFromUser` — the `args` pointer is unreadable.
 - `InvalidArgument` — `entry`/`user_sp` is null or outside the user half, a
   reserved byte is non-zero, or the caller is not a user process.
-- `OutOfMemory` — the kernel could not allocate the thread or its kernel stack.
+- `OutOfMemory` — the kernel could not allocate the thread or its kernel stack, or already
+  holds the most threads it runs at once, 512 (`sched::MAX_THREADS`); `sys_process_spawn` is
+  refused the same way.
 - A handle-table error (`OutOfHandles`, …) if the result handle cannot be
   installed; the thread is already running and is left unreferenced by the caller.
 

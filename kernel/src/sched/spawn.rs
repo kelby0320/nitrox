@@ -62,6 +62,7 @@ pub fn init() -> Result<(), AllocError> {
     g.ended_pids = ended_pids;
     push_reserved(&mut g.ready[0], reaper_ref, "run queue (reaper install)");
     *g.cur_slot() = Some(boot_ref);
+    g.threads = 2; // the boot thread and the reaper
     *g.idle_slot() = Some(idle_ref);
     g.set_idle_addr(idle_addr);
     g.quantum = [QUANTUM_TICKS; MAX_CPUS];
@@ -107,6 +108,7 @@ pub fn ap_init() -> Result<(), AllocError> {
 
     let mut g = SCHED.lock();
     *g.cur_slot() = Some(boot_ref);
+    g.threads += 1; // this AP's boot thread, which exits into the reap list
     *g.idle_slot() = Some(idle_ref);
     g.set_idle_addr(idle_addr);
     *g.reap_slot() = reap;

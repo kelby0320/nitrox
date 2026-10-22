@@ -199,9 +199,10 @@ pub(super) fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Resu
         // kept coherent by TLB shootdown, and the switch-out race is closed by `on_cpu`.
         pick_target_cpu(g, obj, online)
     };
-    if g.ready[cpu].len() >= g.ready[cpu].capacity() {
+    if (!wake && g.threads >= MAX_THREADS) || g.ready[cpu].len() >= g.ready[cpu].capacity() {
         return Err(r);
     }
+    g.threads += usize::from(!wake);
     seed_vruntime(g, obj, cpu, wake);
     push_reserved(&mut g.ready[cpu], r, "run queue (placement)");
     g.stats[cpu].placed += 1;
