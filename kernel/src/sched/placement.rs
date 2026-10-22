@@ -106,7 +106,7 @@ pub(super) fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usiz
     let mask = unsafe { Thread::cpu_mask(obj) };
     let mut best = usize::MAX;
     let mut best_len = usize::MAX;
-    // The same scan ignoring affinity, for the fallback below: a queue at `READY_RESERVE`
+    // The same scan ignoring affinity, for the fallback below: a full queue
     // makes `place_thread` return `Err`, which both wake callers turn into a `panic!`, so the
     // fallback must be least-loaded too.
     let mut spare = usize::MAX;
@@ -199,9 +199,10 @@ pub(super) fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Resu
         // kept coherent by TLB shootdown, and the switch-out race is closed by `on_cpu`.
         pick_target_cpu(g, obj, online)
     };
-    if g.ready[cpu].len() >= g.ready[cpu].capacity() {
+    if (!wake && g.threads >= MAX_THREADS) || g.ready[cpu].len() >= g.ready[cpu].capacity() {
         return Err(r);
     }
+    g.threads += usize::from(!wake);
     seed_vruntime(g, obj, cpu, wake);
     push_reserved(&mut g.ready[cpu], r, "run queue (placement)");
     g.stats[cpu].placed += 1;

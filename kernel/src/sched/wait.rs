@@ -49,7 +49,7 @@ pub(super) fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     // SAFETY: `r` pins `thread`; `SCHED` held.
     unsafe { Thread::set_state(thread, ThreadState::Ready) };
     // Re-home onto its CPU (a full home falls back to the least-loaded permitted queue with
-    // room). Failing means *every* permitted queue is at reserve — genuine exhaustion, fatal.
+    // room). Failing means every permitted queue is full, which the thread cap rules out.
     if let Err(returned) = place_thread(g, r, true) {
         // **Do not let `returned` drop here.** `SCHED` is held, and an `ObjectRef` drop can
         // reach `dispatch_destroy` → `SlabCache::free` — a plain spinlock under the rank-1

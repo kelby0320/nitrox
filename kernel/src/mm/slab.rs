@@ -641,6 +641,24 @@ mod tests {
     }
 
     #[test]
+    fn a_large_alloc_past_the_largest_block_is_refused() {
+        let (_mem, pager) = make_world(PAGE_SIZE * 64);
+        let header = core::mem::size_of::<SlabDescriptor>();
+        assert!(large_alloc((PAGE_SIZE << crate::mm::buddy::MAX_ORDER) - header + 1, 8, &pager).is_null());
+        assert!(large_alloc(usize::MAX / 2, 8, &pager).is_null());
+    }
+
+    #[test]
+    fn the_largest_image_spawn_copies_is_4_mib_less_a_page() {
+        // Three times the block, so an aligned one lies inside.
+        let (_mem, pager) = make_world((PAGE_SIZE * 3) << crate::mm::buddy::MAX_ORDER);
+        let fits = large_alloc(crate::mm::elf::MAX_IMAGE_BYTES, 8, &pager);
+        assert!(!fits.is_null());
+        large_free(fits, &pager);
+        assert!(large_alloc(PAGE_SIZE << crate::mm::buddy::MAX_ORDER, 8, &pager).is_null(), "exactly 4 MiB");
+    }
+
+    #[test]
     fn large_alloc_round_trip_via_kfree_routing() {
         let (_mem, pager) = make_world(PAGE_SIZE * 64);
         let p = large_alloc(3000, 8, &pager);

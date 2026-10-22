@@ -32,6 +32,7 @@ use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::heap;
 use crate::mm::vmm::{MappingKind, Protection, VAddrRange, Vma};
 use crate::mm::{PAGE_SIZE, VirtAddr};
+use crate::object::MemoryObject;
 
 // ----- ELF64 constants (arch-neutral; spec values) -----
 
@@ -52,6 +53,14 @@ const PF_W: u32 = 1 << 1;
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
 
+/// The largest image spawn can copy into one allocation: 4 MiB, the buddy's largest block, less a
+/// page, since the slab's descriptor shares the block.
+pub const MAX_IMAGE_BYTES: usize = (PAGE_SIZE << crate::mm::buddy::MAX_ORDER) - PAGE_SIZE;
+
+/// The most an image's `PT_LOAD`s may claim in all: each page is allocated and zeroed at load,
+/// under the address-space lock with interrupts off, which `MAX_SIZE` bounds for a memory object.
+const MAX_LOAD_BYTES: u64 = MemoryObject::MAX_SIZE as u64;
+
 /// Why [`load_elf`] could not populate the address space.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ElfLoadError {
@@ -70,9 +79,13 @@ pub enum ElfLoadError {
     HasInterpreter,
     /// A `PT_LOAD` segment violated `p_vaddr % PAGE == p_offset % PAGE`.
     BadSegmentAlignment,
-    /// A `PT_LOAD` segment falls outside `[0, USER_VIRT_END)`, has a
+    /// A `PT_LOAD` segment falls outside `[0, USER_MAP_END)`, has a
     /// non-canonical endpoint, or `p_filesz > p_memsz`.
     BadSegmentRange,
+    /// `e_entry` is not in the user half: entering it would fault in the kernel.
+    BadEntry,
+    /// The `PT_LOAD`s claim more than [`MAX_LOAD_BYTES`] in all.
+    TooLarge,
     /// Two `PT_LOAD` segments overlap (or one overlaps the initial
     /// stack region).
     SegmentOverlap,
@@ -94,15 +107,19 @@ pub struct EntryInfo {
 /// may be partially populated; the caller should drop it.
 pub fn load_elf(asp: &AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLoadError> {
     let ehdr = parse_ehdr(bytes)?;
+    if ehdr.e_entry >= USER_VIRT_END {
+        return Err(ElfLoadError::BadEntry);
+    }
 
     // PT_INTERP rejects, PT_LOAD loads, the rest is ignored.
+    let mut loaded = 0u64;
     for i in 0..ehdr.e_phnum {
         let off =
             ehdr.e_phoff.checked_add((i as u64).wrapping_mul(ELF64_PHDR_SIZE as u64)).ok_or(ElfLoadError::Truncated)?;
-        let phdr = parse_phdr(bytes, off as usize)?;
+        let phdr = parse_phdr(bytes, usize::try_from(off).map_err(|_| ElfLoadError::Truncated)?)?;
         match phdr.p_type {
             PT_INTERP => return Err(ElfLoadError::HasInterpreter),
-            PT_LOAD => map_load_segment(asp, bytes, &phdr)?,
+            PT_LOAD => map_load_segment(asp, bytes, &phdr, &mut loaded)?,
             _ => continue,
         }
     }
@@ -179,7 +196,7 @@ fn parse_ehdr(bytes: &[u8]) -> Result<Ehdr, ElfLoadError> {
 }
 
 fn parse_phdr(bytes: &[u8], off: usize) -> Result<Phdr, ElfLoadError> {
-    if bytes.len() < off + ELF64_PHDR_SIZE {
+    if bytes.len() < off.checked_add(ELF64_PHDR_SIZE).ok_or(ElfLoadError::Truncated)? {
         return Err(ElfLoadError::Truncated);
     }
     Ok(Phdr {
@@ -193,21 +210,30 @@ fn parse_phdr(bytes: &[u8], off: usize) -> Result<Phdr, ElfLoadError> {
 }
 
 fn read_u16(bytes: &[u8], off: usize) -> Result<u16, ElfLoadError> {
-    let slice: [u8; 2] = bytes.get(off..off + 2).and_then(|s| s.try_into().ok()).ok_or(ElfLoadError::Truncated)?;
+    let slice: [u8; 2] = bytes
+        .get(off..off.checked_add(2).ok_or(ElfLoadError::Truncated)?)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(ElfLoadError::Truncated)?;
     Ok(u16::from_le_bytes(slice))
 }
 
 fn read_u32(bytes: &[u8], off: usize) -> Result<u32, ElfLoadError> {
-    let slice: [u8; 4] = bytes.get(off..off + 4).and_then(|s| s.try_into().ok()).ok_or(ElfLoadError::Truncated)?;
+    let slice: [u8; 4] = bytes
+        .get(off..off.checked_add(4).ok_or(ElfLoadError::Truncated)?)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(ElfLoadError::Truncated)?;
     Ok(u32::from_le_bytes(slice))
 }
 
 fn read_u64(bytes: &[u8], off: usize) -> Result<u64, ElfLoadError> {
-    let slice: [u8; 8] = bytes.get(off..off + 8).and_then(|s| s.try_into().ok()).ok_or(ElfLoadError::Truncated)?;
+    let slice: [u8; 8] = bytes
+        .get(off..off.checked_add(8).ok_or(ElfLoadError::Truncated)?)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(ElfLoadError::Truncated)?;
     Ok(u64::from_le_bytes(slice))
 }
 
-fn map_load_segment(asp: &AddressSpace, bytes: &[u8], phdr: &Phdr) -> Result<(), ElfLoadError> {
+fn map_load_segment(asp: &AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &mut u64) -> Result<(), ElfLoadError> {
     let page = PAGE_SIZE as u64;
 
     // `p_vaddr % PAGE == p_offset % PAGE` is mandatory: the file bytes are copied contiguously
@@ -223,8 +249,9 @@ fn map_load_segment(asp: &AddressSpace, bytes: &[u8], phdr: &Phdr) -> Result<(),
     let v_end = phdr.p_vaddr.checked_add(phdr.p_memsz).ok_or(ElfLoadError::BadSegmentRange)?;
     let aligned_start = phdr.p_vaddr & !(page - 1);
     let aligned_end = v_end.checked_add(page - 1).ok_or(ElfLoadError::BadSegmentRange)? & !(page - 1);
-    if aligned_end > USER_VIRT_END {
-        return Err(ElfLoadError::BadSegmentRange);
+    *loaded = loaded.saturating_add(aligned_end.saturating_sub(aligned_start));
+    if *loaded > MAX_LOAD_BYTES {
+        return Err(ElfLoadError::TooLarge);
     }
     let range = VAddrRange::new(VirtAddr::new(aligned_start), VirtAddr::new(aligned_end))
         .ok_or(ElfLoadError::BadSegmentRange)?;
@@ -585,6 +612,80 @@ mod tests {
             unsafe { Paging::translate(asp.root(), first_stack_byte) }.is_none(),
             "an untouched stack page must remain unbacked"
         );
+    }
+
+    #[test]
+    fn a_program_header_offset_at_the_top_of_the_range_is_truncated() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let mut bytes = ElfBuilder::new().load_segment(0x400000, PF_R, vec![0u8; 4], 4).build();
+        for phoff in [u64::MAX - 8, u64::MAX - 55, u64::MAX] {
+            bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
+            assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::Truncated), "e_phoff {phoff:#x}");
+        }
+    }
+
+    #[test]
+    fn an_entry_outside_the_user_half_is_refused() {
+        init_global_heap();
+        for (entry, want) in [
+            (USER_VIRT_END - 1, Ok(VirtAddr::new(USER_VIRT_END - 1))),
+            (USER_VIRT_END, Err(ElfLoadError::BadEntry)),
+            (0xFFFF_8000_0000_0000, Err(ElfLoadError::BadEntry)),
+        ] {
+            let asp = AddressSpace::new().unwrap();
+            let bytes = ElfBuilder::new().entry(entry).load_segment(0x400000, PF_R, vec![0u8; 4], 4).build();
+            assert_eq!(load_elf(&asp, &bytes).map(|i| i.entry_point), want, "entry {entry:#x}");
+        }
+    }
+
+    #[test]
+    fn a_segment_in_the_top_page_of_the_user_half_is_refused() {
+        init_global_heap();
+        let top = USER_VIRT_END - PAGE_SIZE as u64;
+        for (at, want) in [(top - PAGE_SIZE as u64, Ok(())), (top, Err(ElfLoadError::BadSegmentRange))] {
+            let asp = AddressSpace::new().unwrap();
+            let bytes = ElfBuilder::new().load_segment(at, PF_R | PF_X, vec![0x0f, 0x05], 2).build();
+            assert_eq!(load_elf(&asp, &bytes).map(|_| ()), want, "a segment at {at:#x}");
+        }
+    }
+
+    #[test]
+    fn an_image_whose_segments_claim_more_than_the_budget_is_refused() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let bytes = ElfBuilder::new().load_segment(0x400000, PF_R | PF_W, vec![], 1 << 40).build();
+        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::TooLarge));
+        let asp = AddressSpace::new().unwrap();
+        let bytes = ElfBuilder::new()
+            .load_segment(0x400000, PF_R, vec![0u8; 4], 4)
+            .load_segment(0x1000_0000, PF_R | PF_W, vec![], MAX_LOAD_BYTES)
+            .build();
+        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::TooLarge), "a page past it, over two segments");
+    }
+
+    #[test]
+    fn a_segment_with_more_file_than_memory_or_past_the_image_is_refused() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let bytes = ElfBuilder::new().load_segment(0x400000, PF_R, vec![1u8; 8], 4).build();
+        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::BadSegmentRange));
+        let asp = AddressSpace::new().unwrap();
+        let bytes = ElfBuilder::new().load_segment(0x400000, PF_R, vec![1u8; 8], 8).build();
+        assert_eq!(load_elf(&asp, &bytes[..bytes.len() - 1]), Err(ElfLoadError::Truncated));
+    }
+
+    #[test]
+    fn a_segment_is_writable_or_executable_only_as_its_flags_say() {
+        init_global_heap();
+        for (flags, write, exec) in [(PF_R, false, false), (PF_R | PF_W, true, false), (PF_R | PF_X, false, true)] {
+            let asp = AddressSpace::new().unwrap();
+            let bytes = ElfBuilder::new().load_segment(0x400000, flags, vec![0u8; 4], 4).build();
+            load_elf(&asp, &bytes).unwrap();
+            let prot = asp.unmap_covering(VirtAddr::new(0x400000)).unwrap().prot;
+            assert_eq!(prot.contains(Protection::WRITE), write, "flags {flags:#x}");
+            assert_eq!(prot.contains(Protection::EXEC), exec, "flags {flags:#x}");
+        }
     }
 
     /// The ELF `PF_R` bit; the loader ignores it, but realistic test ELFs set it on every `PT_LOAD`.

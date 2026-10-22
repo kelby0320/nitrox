@@ -9,6 +9,11 @@ pub const E_MACHINE: u16 = 62;
 /// A VMA reaching or crossing it is in the canonical hole or the kernel half and must be rejected.
 pub const USER_VIRT_END: u64 = 0x0000_8000_0000_0000;
 
+/// Exclusive upper bound of what a user mapping may cover: the top page of the user half stays
+/// unmapped, as Linux keeps it. A `syscall` in its last bytes would return to `USER_VIRT_END`,
+/// non-canonical, and Intel's `sysretq` faults on that in ring 0 with the user stack loaded.
+pub const USER_MAP_END: u64 = USER_VIRT_END - PAGE_SIZE as u64;
+
 /// Default initial-stack top for a freshly-loaded process: page-aligned, canonical, below
 /// [`USER_VIRT_END`].
 pub const DEFAULT_USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;

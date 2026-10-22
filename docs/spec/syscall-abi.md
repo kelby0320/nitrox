@@ -422,7 +422,7 @@ fn sys_process_spawn(args: UserPtr<SpawnArgs>) -> isize
 ```
 Spawns a new process per the `SpawnArgs` struct (see [SpawnArgs spec](process-spawn-args.md)) and returns a handle to it (`SIGNAL | TERMINATE`). The child's initial handle table is populated from `args.handles` (each installed with `source_rights & args.rights[i]`; `args.move_mask` chooses move vs. duplicate per handle), plus a fresh notification channel. (Syscall number `15`.)
 
-The image (`args.image`) is a **`MemoryObject` handle** holding the child's ELF: the spawner resolves the executable path in userspace (`sys_ns_lookup` → a readable object) and passes the handle, which the kernel reads (requires `MAP_READ`) and loads. No filesystem code enters the kernel. (This retired the Phase-1 kernel-embedded `ImageId` selector; see [SpawnArgs spec](process-spawn-args.md) § Image loading.)
+The image (`args.image`) is a **`MemoryObject` handle** holding the child's ELF: the spawner resolves the executable path in userspace (`sys_ns_lookup` → a readable object) and passes the handle, which the kernel reads (requires `MAP_READ`) and loads. No filesystem code enters the kernel. (This retired the Phase-1 kernel-embedded `ImageId` selector; see [SpawnArgs spec](process-spawn-args.md) § Image loading.) The image is copied into one kernel allocation, so one over 4 MiB less a page is refused `TooLarge`; so are `PT_LOAD`s claiming more than 16 MiB in all. A handle listed twice is `InvalidArgument`, and a duplicate grant without `DUPLICATE` is `NoAccess`.
 
 **Remaining Phase-1 form (deferred):**
 - The child learns its installed handle *values* through a **register bootstrap ABI** seeded at entry: `rdi` = its notification-channel handle, `rsi` = its root-namespace handle, `rdx` = its first installed handle, `rcx` = `args.arg0`. A later phase replaces this with a stack-resident bootstrap block / the real init handoff.
@@ -512,7 +512,7 @@ fn sys_memory_map(
     rights: Rights,
 ) -> isize
 ```
-Maps `obj`'s frames into the calling process's address space. `hint` is an advisory page-aligned address (`0` = "anywhere", chosen from a kernel mmap window). **A non-zero `hint` intersecting the stack guard gap is refused** with `InvalidArgument` — the gap below the initial thread's stack is reserved so that a stack overrun faults instead of landing in mapped memory, and the "anywhere" window's own bound cannot enforce that against a caller naming its own address. `rights` is the `MAP_*` subset to install; the handle must carry every requested `MAP_*` bit (so a mapping cannot amplify — e.g. mapping writable requires `MAP_WRITE`), else `NoAccess`. `size` is rounded up to a page and must be ≤ the object's size. Returns the mapped base virtual address. Mapping the same object twice **aliases the same physical memory** (the object owns the frames).
+Maps `obj`'s frames into the calling process's address space. `hint` is an advisory page-aligned address (`0` = "anywhere", chosen from a kernel mmap window). **A non-zero `hint` intersecting the stack guard gap is refused** with `InvalidArgument` — the gap below the initial thread's stack is reserved so that a stack overrun faults instead of landing in mapped memory, and the "anywhere" window's own bound cannot enforce that against a caller naming its own address. **So is one reaching the top page of the user half**, which no mapping covers: a `syscall` in its last bytes would return to a non-canonical address. `rights` is the `MAP_*` subset to install; the handle must carry every requested `MAP_*` bit (so a mapping cannot amplify — e.g. mapping writable requires `MAP_WRITE`), else `NoAccess`. `size` is rounded up to a page and must be ≤ the object's size. Returns the mapped base virtual address. Mapping the same object twice **aliases the same physical memory** (the object owns the frames).
 
 ```rust
 fn sys_memory_unmap(addr: usize, size: usize) -> isize
@@ -528,7 +528,7 @@ fn sys_channel_create(
     queue_depth: u32,
 ) -> isize
 ```
-Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 1024` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. (Syscall number `12`.)
+Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 512` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. (Syscall number `12`.)
 
 ```rust
 fn sys_channel_send(
@@ -542,7 +542,7 @@ fn sys_channel_send(
 ```
 Sends `*msg` plus `handles[0..count]` over `ch` (requires `SEND`). The kernel stamps `header.sender_pid` / `timestamp`. Returns `0`, `WouldBlock` if the queue is full (`NoBlock`), or `PeerClosed` if the peer endpoint has closed. (Syscall number `13`.)
 
-Sends `handles[0..count]` along with the message (always **move**; a sender that wants to keep a copy `sys_handle_duplicate`s first). Each transferred handle must carry `TRANSFER`; the move commits only after the message is queued, so a `WouldBlock`/`PeerClosed` send loses no capability.
+Sends `handles[0..count]` along with the message (always **move**; a sender that wants to keep a copy `sys_handle_duplicate`s first). Each transferred handle must carry `TRANSFER`; the move commits only after the message is queued, so a `WouldBlock`/`PeerClosed` send loses no capability. **Refused `InvalidArgument`**: a handle listed twice, the endpoint the message is for, and an endpoint whose own receive side holds an endpoint ([`ipc-message-format.md`](ipc-message-format.md) § *Handle transfer in messages*).
 
 **Implemented subset:** `mode == NoBlock` returns `0` / `WouldBlock` / `PeerClosed` as above. `mode == Block` returns a **`PendingOperation` handle** (non-negative): the message is committed to the kernel (delivered into the peer ring if it has space, else held in a bounded per-endpoint pending-sender queue) and the PO completes — `sys_wait` then reports `status 0` — when the message is delivered; a dead peer / full pending queue is the synchronous `PeerClosed` / `WouldBlock` error. `mode == BlockBounded` is `Block` with a delivery deadline (the 6th arg, absolute monotonic ns): identical to `Block`, except a held (undelivered) message is cancelled when the deadline elapses — its PO completes `TimedOut` and the message is reclaimed. The `deadline` arg is ignored for `NoBlock`/`Block`.
 
@@ -568,7 +568,7 @@ Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT |
 ```rust
 fn sys_timer_set(timer: RawHandle, deadline_ns: u64, interval_ns: u64) -> isize
 ```
-Programs the timer to fire at `deadline_ns` (**absolute** monotonic ns; `0` disarms) and re-fire every `interval_ns` thereafter. `interval_ns` of `0` is one-shot. Returns `0`. (Syscall number `9`; implemented in the wait-queues slice. Deadlines resolve on the periodic scheduler tick, ~10 ms granularity.)
+Programs the timer to fire at `deadline_ns` (**absolute** monotonic ns; `0` disarms) and re-fire every `interval_ns` thereafter. `interval_ns` of `0` is one-shot. **A one-shot timer reads signaled from its deadline until it is set again**, so a `sys_wait` that arrives after the tick still returns at once; a periodic one is signaled at each fire, to the threads then waiting. Returns `0`. (Syscall number `9`; implemented in the wait-queues slice. Deadlines resolve on the periodic scheduler tick, ~10 ms granularity.)
 
 ```rust
 fn sys_notif_recv(queue: RawHandle, out: UserMutPtr<Notification>) -> isize

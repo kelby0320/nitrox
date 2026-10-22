@@ -265,8 +265,8 @@ that its end of a pipe never closes so a peer never observes `PeerClosed`
 The sweep cannot run where the process actually dies. `exit_process` /
 `exit_thread` hold rank-1 `SCHED` and never return from `finish_exit`, and
 releasing an object reference runs a destructor that reaches the rank-6
-allocator — and, for an `IpcChannel`, takes rank-1 `SCHED` itself to wake
-blocked receivers. So:
+allocator — and, for an `IpcChannel` or a `Timer`, takes rank-1 `SCHED` itself,
+to wake blocked receivers or take the timer out of the deadline heap. So:
 
 1. The exiting thread only *marks* itself (`Thread::set_process_ended`) under
    `SCHED`.
@@ -277,7 +277,7 @@ blocked receivers. So:
    **releases rank 3** before dropping the batch's references.
 
 Step 3 is the load-bearing part: dropping under rank 3 would take rank 1
-(`ipc_endpoint_closing`) or rank 4/6 (other destructors) while holding rank 3,
+(`ipc_endpoint_closing`, `timer_closing`) or rank 4/6 (other destructors) while holding rank 3,
 inverting the ranking. `HandleTable::close_owned_batch` therefore returns a
 `(count, more_remain)` pair and a resume cursor rather than sweeping the whole
 process in one critical section — the same "unlink under the lock, free
@@ -532,7 +532,9 @@ context). `IpcChannel::Drop`
 (an endpoint's last handle closing) takes `SCHED` to null the surviving peer's
 back-pointer and wake its receivers — sound because endpoint `ObjectRef`s are
 released only outside `SCHED` (handle close, the `sys_wait`/lookup references),
-never under it, so the destructor's acquire can never nest on a held `SCHED`.
+never under it, so the destructor's acquire can never nest on a held `SCHED`. **`Timer::Drop`
+takes it too**, to leave the deadline heap, and rests on the same rule: no `ObjectRef` of
+either kind is released under `SCHED`.
 
 ## Plain spinlocks are no-preemption regions (2026-07-21, F12)
 

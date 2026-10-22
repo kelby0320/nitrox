@@ -308,7 +308,10 @@ updates both atomically; `unmap_covering` does the inverse.
   every higher-half mapping the running kernel relies on (its own
   code, the kernel stack, the HHDM, the framebuffer).
 - **`map_vma(KBox<Vma>)`.** Validates the range (canonical, within
-  `[0, USER_VIRT_END)`), pre-checks tree overlap, then walks the
+  `[0, USER_MAP_END)`: **the top page of the user half is never mapped**,
+  by this or any other mapping call, since a `syscall` in its last bytes
+  returns to a non-canonical address that Intel's `sysretq` faults on in
+  ring 0), pre-checks tree overlap, then walks the
   range one page at a time: allocate a frame, zero it through the
   HHDM, install the PTE via `ArchPaging::map_page`. On failure
   mid-walk, the partial install is rolled back (every installed PTE
@@ -485,7 +488,11 @@ a page-aligned VMA covering `[align_down(p_vaddr), align_up(p_vaddr
 + p_memsz))`, then copies file bytes `p_offset..p_offset + p_filesz`
 into the newly-allocated frames via the HHDM. BSS (the `p_memsz -
 p_filesz` tail) comes for free from `map_vma`'s zero-init step.
-After segments, an initial **8 MiB** stack VMA is installed at the
+**What it refuses**: an entry point outside the user half (entering it
+would fault in the kernel), and segments claiming more than
+`MemoryObject::MAX_SIZE` (16 MiB) in all, since every page is allocated
+and zeroed with interrupts off; a header whose offsets run off the image
+is `Truncated`, never an overflow. After segments, an initial **8 MiB** stack VMA is installed at the
 host architecture's `arch::abi::DEFAULT_USER_STACK_TOP` (on x86_64,
 `0x7FFF_FFFF_0000`); the returned [`EntryInfo`] carries the entry
 point and stack top for whatever launches the user thread later.

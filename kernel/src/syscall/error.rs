@@ -4,6 +4,7 @@
 //! operation-specific. The values are the contract (`docs/reference/error-codes.md`), not those
 //! of `docs/archive/os-design-v5.1.md`: `WouldBlock`/`TimedOut`/`PeerClosed` took `-11..-13`.
 
+use crate::mm::elf::ElfLoadError;
 use crate::mm::user_access::UserAccessError;
 
 /// A kernel error, as returned (negated) across the syscall boundary.
@@ -63,6 +64,16 @@ pub fn from_user_access(e: UserAccessError) -> KError {
     }
 }
 
+/// Convert an ELF load failure into the syscall error space: too large, or out of memory, keep
+/// their meaning; every other refusal is the image's, `InvalidArgument`.
+pub fn from_elf_load(e: ElfLoadError) -> KError {
+    match e {
+        ElfLoadError::TooLarge => KError::TooLarge,
+        ElfLoadError::OutOfMemory => KError::OutOfMemory,
+        _ => KError::InvalidArgument,
+    }
+}
+
 /// A handler's result: `Ok(non-negative)` or `Err(`[`KError`]`)`, collapsed by [`encode`].
 pub type SysResult = Result<isize, KError>;
 
@@ -111,5 +122,12 @@ mod tests {
         assert_eq!(from_user_access(UserAccessError::Fault), KError::FaultFromUser);
         assert_eq!(from_user_access(UserAccessError::Misaligned), KError::InvalidArgument);
         assert_eq!(from_user_access(UserAccessError::NoTerminator), KError::InvalidArgument);
+    }
+
+    #[test]
+    fn elf_load_errors_keep_too_large_and_out_of_memory() {
+        assert_eq!(from_elf_load(ElfLoadError::TooLarge), KError::TooLarge);
+        assert_eq!(from_elf_load(ElfLoadError::OutOfMemory), KError::OutOfMemory);
+        assert_eq!(from_elf_load(ElfLoadError::BadEntry), KError::InvalidArgument);
     }
 }

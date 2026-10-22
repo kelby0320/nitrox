@@ -32,8 +32,9 @@ pub const IPC_PAYLOAD_SIZE: usize = IPC_MSG_SIZE - IPC_HEADER_SIZE - IPC_HANDLE_
 /// Default per-direction queue depth when the caller passes `0` to
 /// `sys_channel_create`.
 pub const IPC_DEFAULT_QUEUE_DEPTH: u32 = 16;
-/// Largest per-direction queue depth `sys_channel_create` will honour.
-pub const IPC_MAX_QUEUE_DEPTH: u32 = 1024;
+/// Largest per-direction queue depth `sys_channel_create` will honour: the largest power of two
+/// whose ring fits the buddy's largest block, as `object/ipc_channel.rs` asserts.
+pub const IPC_MAX_QUEUE_DEPTH: u32 = 512;
 
 /// The fixed 24-byte message header (`docs/spec/ipc-message-format.md`).
 ///

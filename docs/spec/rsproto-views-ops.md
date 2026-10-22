@@ -94,9 +94,10 @@ a password, the broker redeems the token with `tty-server`, over a terminal it r
 learn which terminal the request came from — never from the caller, whose terminal handle could be
 a channel it serves. A password that succeeds is remembered for that **session, terminal and
 view, for five minutes**, and a later request matching all three is `Started` without asking; the
-audit says `allowed, within the grace period`. A refused password forgets every window of the
-session, as do `Forget` and the session's end. No token, one that names nothing, or a redeem that
-does not answer: the request is asked, as before.
+audit says `allowed, within the grace period`. A password refused to a request forgets every
+window of the session, as do `Forget` and the session's end; a wrong current password to
+`ChangePassword` does not. No token, one that names nothing, or a redeem that does not answer:
+the request is asked, as before.
 
 Transferred handles, in order: **a namespace** (always), then each stream whose bit is set, then
 the terminal. A count that disagrees with the bits is refused. **The namespace is the one the view
@@ -221,8 +222,9 @@ Request: the current password and the new one, laid out as `Auth::Add`'s name an
 `retry` 0 and the reason. The new password is checked against the rules at once — 1 to 128 bytes —
 and then **the request is held**, as a `Password` is, until the session's delay from its last
 failure has passed. The current password is checked as the session's principal's, and a wrong one
-is a failure like any other: it holds the session's next check, whichever op it is. On success the
-broker sends `auth-service` `SetPassword` for the principal. Only on an idle client channel.
+is a failure like any other: it holds the session's next check, whichever op it is, and leaves the
+session's remembered passwords as they are. On success the broker sends `auth-service`
+`SetPassword` for the principal. Only on an idle client channel.
 
 ### `AddAccount` (`0x0E0C`) — accounts channel
 

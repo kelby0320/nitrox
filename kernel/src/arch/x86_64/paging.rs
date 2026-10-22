@@ -226,22 +226,43 @@ fn alloc_page_table() -> Option<PhysAddr> {
 /// `table` must point at a valid 512-entry page table reachable through
 /// the HHDM, and `index` must be `< 512`.
 unsafe fn ensure_table(table: *mut Pte, index: usize) -> Result<*mut Pte, MapError> {
-    // SAFETY: the caller guarantees `table` is a valid 512-entry table
-    // and `index < 512`, so `table.add(index)` is in bounds. A present
-    // entry points at a real child table — this API creates no huge
-    // pages — and `alloc_page_table` yields a zeroed, HHDM-reachable
-    // frame.
-    unsafe {
-        let slot = table.add(index);
-        let entry = *slot;
+    // The kernel half's tables are shared and edited under no lock: two CPUs making kernel
+    // stacks in one fresh region can find a slot empty together. The link is a compare-and-swap,
+    // and the CPU that loses gives its table back and takes the winner's.
+    // SAFETY: the caller guarantees `table` is a valid 512-entry table and `index < 512`, so
+    // the slot is in bounds; a `Pte` is a `u64`, aligned as one, so it can be read as an atomic.
+    let slot = unsafe { core::sync::atomic::AtomicU64::from_ptr(table.add(index).cast::<u64>()) };
+    let mut child = None;
+    loop {
+        let entry = Pte(slot.load(core::sync::atomic::Ordering::Acquire));
         if entry.is_present() {
-            Ok(table_ptr(entry.phys()))
-        } else {
-            let child = alloc_page_table().ok_or(MapError::OutOfMemory)?;
-            *slot = Pte::new_table(child);
-            Ok(table_ptr(child))
+            if let Some(unused) = child {
+                heap::buddy_free(unused, 0);
+            }
+            return Ok(table_ptr(entry.phys()));
+        }
+        let new = match child {
+            Some(c) => c,
+            None => alloc_page_table().ok_or(MapError::OutOfMemory)?,
+        };
+        child = Some(new);
+        #[cfg(test)]
+        if let Some(other_cpu) = BEFORE_LINK.take() {
+            other_cpu(slot);
+        }
+        let linked = Pte::new_table(new).0;
+        let ordering = (core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
+        if slot.compare_exchange(entry.0, linked, ordering.0, ordering.1).is_ok() {
+            return Ok(table_ptr(new));
         }
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A test's stand-in for another CPU, run once between reading a slot empty and linking it.
+    static BEFORE_LINK: core::cell::Cell<Option<fn(&core::sync::atomic::AtomicU64)>> =
+        const { core::cell::Cell::new(None) };
 }
 
 /// Walk PML4 → PDPT → PD in the tree rooted at `root`, returning the page table that holds
@@ -508,6 +529,34 @@ impl ArchPaging for X86Paging {
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
+
+    std::thread_local! {
+        static OTHER_CPUS_TABLE: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    }
+
+    /// Another CPU links its own table into the slot this one has just read empty.
+    fn other_cpu_links_first(slot: &core::sync::atomic::AtomicU64) {
+        let table = alloc_page_table().unwrap();
+        OTHER_CPUS_TABLE.set(table.as_u64());
+        slot.store(Pte::new_table(table).0, core::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
+    fn a_cpu_beaten_to_an_empty_slot_takes_the_table_linked_first() {
+        init_global_heap();
+        let parent = alloc_page_table().unwrap();
+        BEFORE_LINK.set(Some(other_cpu_links_first));
+        let freed = heap::frames_freed_by_this_thread();
+        // SAFETY: `parent` is a fresh, zeroed table only this test touches; slot 7 is in bounds.
+        let got = unsafe { ensure_table(table_ptr(parent), 7) }.unwrap();
+        let first = PhysAddr::new(OTHER_CPUS_TABLE.get());
+        // SAFETY: as above.
+        assert_eq!(unsafe { *table_ptr(parent).add(7) }.phys(), first, "the first table was unlinked");
+        assert_eq!(got, table_ptr(first));
+        assert_eq!(heap::frames_freed_by_this_thread() - freed, 1, "the second table goes back");
+        heap::buddy_free(first, 0);
+        heap::buddy_free(parent, 0);
+    }
 
     #[test]
     fn index_split_isolates_each_level() {

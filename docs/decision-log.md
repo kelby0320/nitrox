@@ -36598,3 +36598,73 @@ second declined.
   ESPs all come through.
 - **`overview.md`'s Status line** still said Phases 0–5 with administration current, where the
   README sends a reader first; it says Phases 0–6 and the work before Phase 7.
+
+## 2026-10-20 — Before Phase 7, Part C complete: the laptop confirms it
+
+**Reinstalled from a live image of `main` at `510381f4`**, the laptop confirmed what the gates
+could not:
+- **an ejected stick's light goes out**, ejected from Files and with `disk --eject`, the last word
+  the definition of done left to it;
+- **line editing** at a prompt in `nxterm`, whose keys the gates reach only as Left on QEMU's
+  PS/2 keyboard and as escape sequences over serial;
+- **a window dragged to the top bar maximizes**, at the laptop's 1366×768.
+
+A stick formatted with `disk --format` mounted and ejected as the gates have it. **Part C is
+complete**, and Part D, the bug bash, is next.
+
+## 2026-10-22 — Before Phase 7, Part D: the bash triaged, and a Part H for what it left
+
+**The bash ran on `main` at `510381f4`**, eight subsystems by the maintainer, with kernel memory's
+and the scheduler's architecture lenses run again where the first runs lost them. With what PR
+#365's two trial reviews left, read against `main`: **154 findings, 129 once a defect several runs
+found is one** — the timer's dangling heap entry three times, the panic past the buddy's largest
+block five. Triaged with the maintainer from a draft of suggested verdicts; `bug-bash.md` holds
+each.
+
+- **What breaks a boundary is fixed in Part D** (the maintainer's call, so Part E can start soon):
+  any process panicking or corrupting the kernel, a capability or rights leak, a filesystem losing
+  data, the drivers' faults, a scheduler leak or hang one process inflicts on all, and handles that
+  arrive with a message never closed. **Also fixed there**: a slow stick at boot losing the storage
+  service for the whole boot (sup-1), the one later finding the laptop could meet in ordinary use;
+  and **each test gap in code a fix changes**, written with that fix, since the test is the
+  regression net for the very change. 68 to fix.
+- **The rest is later, in a new Part H** between Part G and Phase 7 (the maintainer's call): the
+  supervisors' and parsers' defects, the remaining test gaps, and six kernel, driver and filesystem
+  findings no boundary crosses. **Four go to Part E instead**: `sys_file_sync` bound to files by
+  its name, and three in the memory-mapping path that Phase 7's threads and loader reach first.
+  60 later.
+- **`bug-bash.md` is a later finding's record**: no `TODO(tag)` or `deferred-decisions.md` entry
+  each, as a part of the plan schedules them, and **no GitHub issues** (the maintainer's call:
+  overhead the project does not need now).
+- **sec-11, no** (the maintainer's ruling): a wrong current password on ChangePassword holds the
+  next check and leaves the session's remembered-password windows open, as the code does. The
+  spec's "a refused password forgets every window" is narrowed to `with`'s password.
+- **Not yet triaged**: the five findings from before the bash, and the trials' test gaps and doc
+  claims not yet checked against `main` (pr365-11, pr365-12). **The laptop's two bugs** — `nxterm`
+  painting only when the pointer moves, the Applications menu's search clearing — are Part D's
+  still, to be reproduced first.
+
+## 2026-10-22 — Before Phase 7, Part D: group A's fixes change these contracts
+
+The kernel's group of the bash's findings is fixed (PR #391), and its review's answers with it.
+The fixes are in `bug-bash.md`; what a caller can now see differently is here:
+
+- **At most 512 threads** (`sched::MAX_THREADS`), the idle threads aside. A spawn or a
+  `sys_thread_create` past them is `OutOfMemory`. Every list a thread can be on is reserved to
+  hold them all, so a wake, a block, a fault or an exit never meets a full list, which each
+  answered with a panic. A system-wide cap, not a per-process one: that is Part H's quota question.
+- **A channel's queue depth is at most 512**, down from a 1024 that could never be made: a ring is
+  one allocation, and a 1024-slot one is past the buddy's 4 MiB block.
+- **The top page of the user half is never mapped** (`USER_MAP_END`): a `syscall` in its last bytes
+  returns to a non-canonical address, and Intel's `sysretq` faults on that in ring 0.
+- **A spawn image is at most 4 MiB less a page**, refused `TooLarge` past it, since it is copied
+  into one allocation; its `PT_LOAD`s claim 16 MiB at most in all; its entry is in the user half.
+- **A one-shot timer stays signaled once it fires**, until it is set again, so a wait that arrives
+  after the tick returns.
+- **A send refuses a handle listed twice, the endpoint it is for, and an endpoint already holding
+  one** (`InvalidArgument`): endpoints holding each other through their rings are freed by
+  nothing, and the last move of any such cycle is one of these. A cycle through a namespace binding
+  remains, `TODO(ipc-handle-cycles)`; binding needs `BIND_NAMESPACE`.
+- **A spawn's duplicate grant needs `DUPLICATE`** (`NoAccess` without it), as
+  `sys_handle_duplicate` does: `process-spawn-args.md` had asked only `TRANSFER`, against
+  `handle-encoding.md`. No in-tree spawner grants a handle without moving it.

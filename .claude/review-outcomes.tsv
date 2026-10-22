@@ -157,3 +157,15 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-20	389	fd36b099	9	tests	optional	unverified	fixed	e3dc6de0	AHCI refuses before touching its disk, host-tested with none; abi-sync-check fails on a wrong libkern IO_OPCODE_EJECT (run in C.4)
 2026-10-20	389	fd36b099	10	rules-and-docs	optional	demonstrated	fixed	e3dc6de0	irp_command's doc here; mounts::eject's in c853e8c8
 2026-10-20	389	fd36b099	11	architecture	optional	unverified	fixed	c853e8c8	mark, reply, then stop; the gate takes the stop line and the reply in either order, and saw the reply first
+2026-10-22	391	ccfde55d	1	error-paths	worth-fixing	demonstrated	fixed	76e0dddd	a one-shot out of the heap with its deadline kept reads signaled; the test asks with a clock before the fire
+2026-10-22	391	ccfde55d	2	architecture	worth-fixing	demonstrated	fixed	f8c3bc43	a send refuses an endpoint already holding one; the two-pair cycle frees all four; namespace cycles stay TODO(ipc-handle-cycles)
+2026-10-22	391	ccfde55d	3	logic+architecture	worth-fixing	demonstrated	fixed	f8c3bc43	the check moved into the push hold and returns at once with no handles; by reading
+2026-10-22	391	ccfde55d	4	logic	worth-fixing	unverified	fixed	ddfe3b4b	reproduced by a boot-probe spawn; a duplicate grant asks DUPLICATE; no in-tree spawner duplicates a handle
+2026-10-22	391	ccfde55d	5	logic	optional	demonstrated	fixed	4167c538	MAX_IMAGE_BYTES is 4 MiB less a page; tested at both neighbours in a private world
+2026-10-22	391	ccfde55d	6	architecture	optional	demonstrated	fixed	4167c538	an image past one allocation is TooLarge; the loader keeps TooLarge and OutOfMemory
+2026-10-22	391	ccfde55d	7	error-paths	optional	demonstrated	fixed	179dad5d	thread_list makes every list; init, ap_init and the tests share it; the cap test passes through suspended
+2026-10-22	391	ccfde55d	8	tests	optional	demonstrated	fixed	06d522fd	the loader's redundant bound removed; the address space's four calls are held per site
+2026-10-22	391	ccfde55d	9	tests	optional	demonstrated	fixed	06d522fd	sys_memory_map's redundant bound removed; map_object refuses the same range InvalidArgument
+2026-10-22	391	ccfde55d	10	rules-and-docs	optional	demonstrated	fixed	f32b8f79	a decision-log entry names each contract group A changes
+2026-10-22	391	ccfde55d	11	rules-and-docs	optional	demonstrated	fixed	f32b8f79	userspace-build.md gives the loader bounds as they are
+2026-10-22	391	ccfde55d	12	architecture+rules-and-docs	optional	demonstrated	fixed	f32b8f79	syscall-abi.md names the refusals; handle-system.md and lock-ordering.md name Timer::drop

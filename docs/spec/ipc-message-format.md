@@ -115,7 +115,7 @@ pub enum SendMode {
 
 A sender passes the handles to transfer via `sys_channel_send`'s separate `handles`/`count` arguments (not the in-message `handles[]`, which the kernel fills with the *receiver's* values on receive). Transfer is **always move**, and the install happens at the receiver:
 
-1. Sender calls `sys_channel_send(ch, msg, handles, count, mode)` with `count` handles. Each must be valid in the sender's table with the `TRANSFER` right.
+1. Sender calls `sys_channel_send(ch, msg, handles, count, mode)` with `count` handles. Each must be valid in the sender's table with the `TRANSFER` right. **A handle listed twice is refused `InvalidArgument`**: it would arrive as two, a copy its holder could not make. **So is the endpoint the message is for, and an endpoint whose own receive side holds an endpoint**, in a queued message or a held send: endpoints holding each other through their rings are freed by nothing, and the last move of any such cycle is one of the two.
 2. Kernel validates + pins each handle (`lookup` with `TRANSFER`); any bad handle fails the whole send (atomic-or-fail) with the sender's table untouched.
 3. Kernel queues the message slot, **moving** the pinned references into it ("in flight"). Only then does it **commit the move** by closing the sender's source handles — so a `WouldBlock`/`PeerClosed` send loses no capability.
 4. Receiver's `sys_channel_recv` dequeues the message and **installs** each in-flight reference into its **own** table (with the rights the sender's handle carried), writing the new handle values into both the `handles` out-buffer and the in-message `handles[]`, and the count into `*count`. The handles are now valid in the receiver's table; the install is atomic-or-fail (a partial failure reclaims what it installed).
@@ -157,7 +157,7 @@ fn sys_channel_create(
 ) -> isize
 ```
 
-Creates an IPC channel with two endpoint handles, returned via `*end0` and `*end1`. The channel has separate queues in each direction; sending from `end0` enqueues to `end1`'s receive queue, and vice versa. Each direction has `queue_depth` slots (default 16; max 1024 — TBD).
+Creates an IPC channel with two endpoint handles, returned via `*end0` and `*end1`. The channel has separate queues in each direction; sending from `end0` enqueues to `end1`'s receive queue, and vice versa. Each direction has `queue_depth` slots (default 16; max 512, the deepest whose ring fits the kernel's largest single allocation).
 
 Each endpoint has full rights initially: `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. The creator typically attenuates rights (via `sys_handle_restrict` or by transferring with reduced rights) when handing endpoints to other parties.
 

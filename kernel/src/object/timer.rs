@@ -174,7 +174,9 @@ impl Timer {
         }
     }
 
-    /// `true` iff the timer is armed and its deadline is at or before `now`.
+    /// `true` iff the timer is armed and its deadline is at or before `now`, or it is a one-shot
+    /// the tick has already fired: out of the heap with its deadline kept, the one state that
+    /// means so. A waiter's `now` is read before it takes `SCHED`, and may predate that fire.
     ///
     /// # Safety
     ///
@@ -182,7 +184,8 @@ impl Timer {
     pub(crate) unsafe fn already_signaled(obj: *mut (), now_ns: u64) -> bool {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        inner.deadline_ns != 0 && inner.deadline_ns <= now_ns
+        let fired = inner.interval_ns == 0 && !inner.in_heap;
+        inner.deadline_ns != 0 && (inner.deadline_ns <= now_ns || fired)
     }
 
     /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
@@ -204,9 +207,12 @@ impl Timer {
 }
 
 impl Drop for Timer {
-    /// A live waiter pins this timer (it holds an `ObjectRef` across `sys_wait`), so the last
-    /// reference cannot drop while waiters remain; the assert documents that.
+    /// Take the timer out of the deadline heap, which names it by address. A live waiter pins
+    /// it (it holds an `ObjectRef` across `sys_wait`), so the last reference cannot drop while
+    /// waiters remain; the assert documents that.
     fn drop(&mut self) {
+        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
+        unsafe { crate::sched::timer_closing(self as *mut Self as *mut ()) };
         debug_assert!(self.inner.get_mut().waiters.is_empty(), "Timer dropped with live waiters");
     }
 }
@@ -240,12 +246,14 @@ mod tests {
         let obj = KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut ();
         // SAFETY: live Timer, single-threaded test.
         unsafe {
-            Timer::set_armed(obj, 1000, 0);
+            Timer::set_armed(obj, 1000, 0); // armed as `timer_arm` arms: into the heap
+            Timer::set_in_heap(obj, true);
             assert_eq!(Timer::deadline(obj), 1000);
             assert!(!Timer::already_signaled(obj, 999));
             assert!(Timer::already_signaled(obj, 1000));
             assert!(Timer::already_signaled(obj, 1001));
             Timer::set_armed(obj, 0, 0); // disarm
+            Timer::set_in_heap(obj, false);
             assert!(!Timer::already_signaled(obj, u64::MAX));
             drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));
         }

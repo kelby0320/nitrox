@@ -380,7 +380,10 @@ program text (the CoW/`MAP_PRIVATE` file mapping in the process-memory-model bun
 most of what read-ahead would buy here and is the thing to do first. **New trigger for
 read-ahead: after demand-paged program text lands**, when what remains is genuinely fill cost.
 **New trigger for that:** it is now the largest single line in the boot profile, so it wants
-scheduling rather than a trigger.
+scheduling rather than a trigger. **The copy also caps an image at 4 MiB less a page** (2026-10-22,
+`MAX_IMAGE_BYTES`): it is one kernel allocation, the buddy's largest block is 4 MiB and the slab's
+descriptor shares it, and a larger image is refused `TooLarge`, where it once stopped the kernel.
+The shipped binaries are 176–539 KB.
 
 > **Implemented for Model A** (2026-10-09, Phase 6 Part H.4), on Part H's measurement rather than
 > boot's: a copy of a 256 MiB file on the laptop read it a page a command, 65,536 of them. A fault
@@ -2246,6 +2249,17 @@ a report of the machine's CPUs.
 
 **Deadline scheduling (EDF) as a fourth scheduler class.** RealTime class uses fixed priority, not EDF. Adding EDF is possible without architectural changes — fourth scheduler class. Trigger: a workload that benefits.
 
+**Endpoints holding each other through a namespace are never freed —
+`TODO(ipc-handle-cycles)`.** A send refuses the endpoint it is for and any endpoint already holding
+one (2026-10-22, the bug bash's kobj-6 and PR #391's review), which closes every cycle made of
+endpoints alone: its last move is always one of the two. A namespace holds endpoints too, through
+its bindings, so an endpoint bound into a namespace, and the namespace sent into that endpoint's
+ring, hold each other: their rings, up to 4 MiB each at the deepest queue, and whatever they hold.
+Binding needs `BIND_NAMESPACE`, which only the supervisors hold. Linux collects in-flight
+descriptors for the same shape (`SCM_RIGHTS`). Fix shape: a collector run when an endpoint
+holding objects closes, or the send rule extended to whatever can hold an endpoint. Trigger: a
+binder outside the supervisors, or the first report of kernel memory lost this way.
+
 ### Memory management
 
 **The process memory model — one pass, four parts.** These extend the same AS/fault
@@ -2333,6 +2347,13 @@ block and then exit panics the kernel. Fix shape when taken: reap in batches acr
 lock holds, or cap threads per process; both are changes to the exit path rather than to a
 constant. Trigger: a per-process thread cap landing, a real workload approaching 32 threads,
 or the first report of this panic.
+
+> **Implemented 2026-10-22**, on the bug bash's report of this panic and its siblings (a wake
+> past full run queues, the 65th blocked thread): the scheduler holds at most `MAX_THREADS`
+> (512) threads, a spawn past them refused, and every list a thread can be on — each CPU's run
+> queue and reap list, the blocked and suspended lists — is reserved to hold them all. A
+> system-wide cap, not a per-process one: one process can still take every thread, which is
+> the quota question the bash's later findings raise for the view broker and storage service.
 
 **Every device interrupt is pinned to the BSP, so a BSP park kills all I/O.**
 `install_isa_irq` (`kernel/src/arch/x86_64/ioapic.rs:370`) routes each GSI to `Irq::id()` —
