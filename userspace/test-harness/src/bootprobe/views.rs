@@ -391,3 +391,112 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
     kprint(b"boot-probe: view broker: password held, one per delay, grant arrived, exit heard when full, policy refused, stray handles closed, session closed ok\n");
     true
 }
+
+/// **A view's grants end with its session, and with its program.** `test-stage grants` runs in an
+/// admin view sent with no `/dev/blk` and no `/dev/log`, so all eight of the grants it reports are
+/// the broker's, and it never reads its notifications, so it ignores a request to stop. It must see
+/// all eight first, which shows it can see them. Then none once the session is closed under it.
+/// And a second run, which leaves a child on its namespace and exits, must have its child see none
+/// once the broker has reported the exit.
+pub(super) fn view_grants_end_test(root_ns: u64) -> bool {
+    use librsproto::views::*;
+    let fail = |what: &[u8]| {
+        Line::new().s(b"boot-probe: view grants: ").s(what).s(b" FAIL").end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let mut exited = alloc::vec::Vec::new();
+    let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
+    if st != 0 || sup == 0 {
+        return fail(b"no supervisor channel");
+    }
+    let mask_on = |ch: u64| receive(ch, clock_ns() + 10_000_000_000).and_then(|m| m.body.first().copied());
+    let mut ok = true;
+    for exit_case in [false, true] {
+        let session = match views_call(sup, OP_VIEWS_OPEN_SESSION, 1, DEMO_USER, &[], &mut exited) {
+            Some((false, body)) => parse_session_id(&body),
+            _ => None,
+        };
+        let Some(session) = session else {
+            return fail(b"OpenSession");
+        };
+        let (st, cli) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{session}").as_bytes(), chan);
+        // SAFETY: a namespace handle this process holds.
+        let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
+        let (mut in_w, mut in_r, mut out_w, mut out_r) = (0u64, 0u64, 0u64, 0u64);
+        // SAFETY: valid writable out-params.
+        let piped = unsafe {
+            syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut in_w) as u64, (&raw mut in_r) as u64, 4, 0) == 0
+                && syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 4, 0) == 0
+        };
+        if st != 0 || cli == 0 || copy <= 0 || !piped {
+            return fail(b"a client, a copy and two pipes");
+        }
+        let copy = copy as u64;
+        for at in [&b"/dev/blk"[..], b"/dev/log"] {
+            // SAFETY: a namespace handle this process holds, and a valid path.
+            unsafe { syscall4(SYS_NS_UNBIND, copy, at.as_ptr() as u64, at.len() as u64, 0) };
+        }
+        let mut req = [0u8; 256];
+        let Some(n) = build_request(&mut req, REQ_STDIN | REQ_STDOUT, b"admin", b"test-stage", &[b"grants"], b"", None)
+        else {
+            return fail(b"build a request");
+        };
+        let started = matches!(
+            views_call(cli, OP_VIEWS_REQUEST, 2, &req[..n], &[copy, in_r, out_w], &mut exited),
+            Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::NeedPassword, _)))
+        ) && matches!(
+            views_call(cli, OP_VIEWS_PASSWORD, 3, DEMO_PASSWORD, &[], &mut exited),
+            Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _)))
+        );
+        let before = (started && rs_send(in_w, 1, 1, &[], &[])).then(|| mask_on(out_r)).flatten();
+        if before != Some(0xFF) {
+            Line::new()
+                .s(b"boot-probe: view grants: started ")
+                .i(started as i64)
+                .s(b", resolving as bits ")
+                .i(before.map_or(-1, i64::from))
+                .end();
+            return fail(b"the program in the view did not see all eight grants");
+        }
+        let mut close_body = [0u8; 8];
+        let closed = build_session_id(&mut close_body, session).is_some();
+        let after = if exit_case {
+            // The child's channel, then the broker's word that the program exited, after which the
+            // child asks what still resolves.
+            let child = rs_send(in_w, 2, 2, &[], &[]).then(|| receive(out_r, clock_ns() + 10_000_000_000)).flatten();
+            let child = child.and_then(|m| m.handles.first().copied()).unwrap_or(0);
+            let heard = exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)).is_some();
+            let mask = (child != 0 && heard && rs_send(child, 1, 1, &[], &[])).then(|| mask_on(child)).flatten();
+            close(child);
+            let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 9, &close_body, &[], &mut exited);
+            mask
+        } else {
+            let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 9, &close_body, &[], &mut exited);
+            let mask = rs_send(in_w, 1, 4, &[], &[]).then(|| mask_on(out_r)).flatten();
+            // Leaves a child waiting on a channel this closes below, and exits.
+            if let Some(m) =
+                rs_send(in_w, 2, 5, &[], &[]).then(|| receive(out_r, clock_ns() + 10_000_000_000)).flatten()
+            {
+                m.handles.iter().for_each(|&h| close(h));
+            }
+            mask
+        };
+        for h in [in_w, out_r, cli] {
+            close(h);
+        }
+        if !closed || after != Some(0) {
+            Line::new().s(b"boot-probe: view grants: still resolving, as bits: ").i(after.map_or(-1, i64::from)).end();
+            ok = fail(if exit_case {
+                b"a child of a program that exited"
+            } else {
+                b"a program whose session was closed"
+            });
+        }
+    }
+    if ok {
+        kprint(b"boot-probe: a view's grants end with its session and with its program ok\n");
+    }
+    close(sup);
+    ok
+}

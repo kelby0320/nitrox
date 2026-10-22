@@ -214,6 +214,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & auth_multi_client_test(root_ns)
         & ns_derive_test(root_ns)
         & view_broker_test(root_ns)
+        & view_grants_end_test(root_ns)
         & registry_test(root_ns)
         & past_two_tib_test(root_ns)
         & devices_test(root_ns)

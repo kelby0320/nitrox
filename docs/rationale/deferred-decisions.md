@@ -1271,7 +1271,8 @@ listen.
 
 **The view broker is the first place it costs something** (administration Part A, 2026-09-23).
 When a session ends, the broker asks every program it started for that session to exit and
-unbinds their grants, so nothing *new* can be resolved through them — but a program that ignores
+unbinds their grants, as it does when a program exits, so nothing *new* can be resolved through
+them by it or by anything it started — but a program that ignores
 the request keeps running with whatever it had already resolved, since the kernel has no
 revocation either. An elevated program can therefore outlive the login that started it. The
 maintainer took "asked, not forced" for Part A over building a kill inside it.
