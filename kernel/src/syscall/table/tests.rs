@@ -588,3 +588,68 @@ fn a_file_blocks_reply_installs_a_file_no_more_writable_than_its_server_holds_it
         }
     }
 }
+
+/// A reply for a client that exited first: on the host no process has threads, so every pid is
+/// such a client, and the handle installed for it is closed, its object freed.
+#[test]
+fn a_reply_for_a_client_that_exited_leaves_no_handle_behind() {
+    use crate::object::MemoryObject;
+    use crate::object::header::test_probe;
+    init_global_heap();
+    global::init_for_tests();
+    test_probe::reset();
+    const PID: u32 = 4343;
+    let mem = KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut ();
+    let h = global::get().allocate(PID, mem, KObjectType::MemoryObject, Rights::MAP_READ).unwrap();
+    assert_eq!(deliver_to_client(PID, 0, h.bits()), KError::PeerClosed as i32);
+    assert!(global::get().lookup(h, PID, Rights::empty()).is_err(), "the handle is closed");
+    assert_eq!(test_probe::memory_object_destroys(), 1);
+    assert_eq!(deliver_to_client(PID, KError::NotFound as i32, 0), KError::NotFound as i32);
+    assert_eq!(deliver_to_client(PID, 0, 0), 0, "a reply with no handle");
+}
+
+/// The whole path: a lookup forwarded for a client, then the server's reply carrying a memory
+/// object. The client has no threads, so the reply completes `PeerClosed` and the object, whose
+/// handle was installed and closed again, is freed rather than pinned for ever.
+#[test]
+fn a_forwarded_reply_for_a_client_that_exited_pins_nothing() {
+    use crate::object::header::test_probe;
+    use crate::object::ipc_channel::StoredMsg;
+    use crate::object::userspace_server::Forward;
+    use crate::object::{IpcChannel, MemoryObject, PendingOperation, UserspaceServerReg};
+    use crate::rsproto::{OBJECT_KIND_MEMOBJ, build_resolve_request};
+    init_global_heap();
+    global::init_for_tests();
+    test_probe::reset();
+    // SAFETY: each pointer is a fresh `into_raw`, carrying its single creation reference.
+    let adopt = |p: *mut (), t| unsafe { ObjectRef::from_raw(p, t) };
+    let (k, s) = IpcChannel::try_new_pair(4).unwrap();
+    let k = adopt(KBox::into_raw(k).as_ptr() as *mut (), KObjectType::IpcChannel);
+    let _server_end = adopt(KBox::into_raw(s).as_ptr() as *mut (), KObjectType::IpcChannel);
+    let reg = UserspaceServerReg::try_new(k).unwrap();
+    let reg = adopt(KBox::into_raw(reg).as_ptr() as *mut (), KObjectType::UserspaceServerReg);
+    let po =
+        adopt(KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (), KObjectType::PendingOperation);
+    let mut msg = StoredMsg::zeroed();
+    msg.header.payload_len = build_resolve_request(&mut msg.payload, Rights::MAP_READ.bits(), b"f").unwrap() as u32;
+    // SAFETY: `reg` and `po` are pinned by the test.
+    let forwarded = unsafe {
+        crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, &po, 4444, Rights::MAP_READ, b"f", Forward::PLAIN)
+    };
+    assert_eq!(forwarded, crate::sched::ForwardOutcome::Pending);
+    // The request's envelope turned round, as a server's reply: flags REPLY, a MEMOBJ body.
+    let mut reply = StoredMsg::zeroed();
+    reply.payload[..28].copy_from_slice(&msg.payload[..28]);
+    reply.payload[16..20].copy_from_slice(&1u32.to_le_bytes());
+    reply.payload[20..24].copy_from_slice(&8u32.to_le_bytes());
+    reply.payload[28..30].copy_from_slice(&OBJECT_KIND_MEMOBJ.to_le_bytes());
+    reply.payload[32..36].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    let mem =
+        adopt(KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut (), KObjectType::MemoryObject);
+    let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    transfers[0] = Some(TransferRef { obj: mem, rights: Rights::MAP_READ | Rights::TRANSFER });
+    assert_eq!(complete_resolve_reply(&reg, &reply, &mut transfers, &[0; IPC_HANDLE_MAX], 0, 4445, 36), Ok(0));
+    // SAFETY: `po` pins it; completed, it is stable, and no other thread reaches it.
+    assert_eq!(unsafe { PendingOperation::status(po.as_ptr()) }, KError::PeerClosed as i32);
+    assert_eq!(test_probe::memory_object_destroys(), 1, "the object pinned by a handle nothing will close");
+}

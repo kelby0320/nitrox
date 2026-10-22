@@ -818,6 +818,18 @@ fn map_mem_map_err(e: MapError) -> KError {
     }
 }
 
+/// The status a forwarded reply completes with, once its handle is in client `pid`'s table. A
+/// client that exited before its reply has had its handles swept, or will: the exit marks it
+/// before the sweep, and both take the table's lock, so after the allocation one of the two sees
+/// the other. Closed here, the handle is not left in a table nothing will close.
+fn deliver_to_client(pid: u32, status: i32, handle: u64) -> i32 {
+    if status != 0 || handle == 0 || crate::sched::pid_has_threads(pid) {
+        return status;
+    }
+    close_and_release(RawHandle(handle), pid);
+    KError::PeerClosed as i32
+}
+
 /// Spawn copies an image into one allocation, so one larger than [`MAX_IMAGE_BYTES`] is refused
 /// `TooLarge`: no retry would help, where `OutOfMemory` says one might.
 fn image_fits(len: usize) -> Result<(), KError> {
@@ -2181,7 +2193,6 @@ fn complete_resolve_reply(
                         Ok(h) => (0, h.bits()),
                         Err(e) => {
                             // SAFETY: `allocate` did not adopt the reference; reclaim it.
-                            // (A dead caller pid takes this path — fails cleanly.)
                             drop(unsafe { ObjectRef::from_raw(op, ot) });
                             (map_handle_err(e) as i32, 0)
                         }
@@ -2192,6 +2203,7 @@ fn complete_resolve_reply(
     };
 
     if let Some((status, result)) = outcome {
+        let status = deliver_to_client(pl.owner_pid, status, result);
         // SAFETY: `pl` owns the lookup's `PendingOperation` reference.
         unsafe { crate::sched::complete_pending_op(pl.po.as_ptr(), status, result) };
     }
