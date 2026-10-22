@@ -6,7 +6,7 @@
 use super::error::{KError, SysResult, encode, from_user_access};
 use crate::arch::Paging;
 use crate::arch::Timer;
-use crate::arch::abi::{USER_MAP_END, USER_VIRT_END};
+use crate::arch::abi::USER_VIRT_END;
 use crate::arch::paging::ArchPaging;
 use crate::arch::timer::ArchTimer;
 use crate::handle::global;
@@ -887,9 +887,6 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
             return Err(KError::InvalidArgument);
         }
         let end = hint.checked_add(size).ok_or(KError::InvalidArgument)?;
-        if end > USER_MAP_END {
-            return Err(KError::InvalidArgument);
-        }
         // The stack guard gap must bind hinted mappings too: `MMAP_MAX` bounds only the
         // `hint == 0` search, so an overrun into a hinted mapping would land in mapped memory
         // silently. `in_stack_guard` is host-tested; this call is not covered end to end.

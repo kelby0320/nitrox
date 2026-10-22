@@ -24,7 +24,7 @@
 
 use crate::arch::Paging;
 use crate::arch::abi::{
-    DEFAULT_USER_STACK_SIZE as STACK_SIZE, DEFAULT_USER_STACK_TOP as STACK_TOP, E_MACHINE, USER_MAP_END, USER_VIRT_END,
+    DEFAULT_USER_STACK_SIZE as STACK_SIZE, DEFAULT_USER_STACK_TOP as STACK_TOP, E_MACHINE, USER_VIRT_END,
 };
 use crate::arch::paging::ArchPaging;
 use crate::libkern::KBox;
@@ -245,9 +245,6 @@ fn map_load_segment(asp: &AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &mut 
     let v_end = phdr.p_vaddr.checked_add(phdr.p_memsz).ok_or(ElfLoadError::BadSegmentRange)?;
     let aligned_start = phdr.p_vaddr & !(page - 1);
     let aligned_end = v_end.checked_add(page - 1).ok_or(ElfLoadError::BadSegmentRange)? & !(page - 1);
-    if aligned_end > USER_MAP_END {
-        return Err(ElfLoadError::BadSegmentRange);
-    }
     *loaded = loaded.saturating_add(aligned_end.saturating_sub(aligned_start));
     if *loaded > MAX_LOAD_BYTES {
         return Err(ElfLoadError::TooLarge);
