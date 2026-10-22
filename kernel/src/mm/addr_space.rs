@@ -259,19 +259,20 @@ impl AddressSpace {
                 }
                 // SAFETY: `root` is this AS's PML4; `phys` is the fresh,
                 // zeroed frame; `page_base` is the page-aligned faulting
-                // address, in the validated user-half VMA range. The PTE is
-                // absent (this was a not-present fault), so `map_page` installs
-                // a new leaf rather than aliasing.
+                // address, in the validated user-half VMA range. A present PTE
+                // is refused, not aliased.
                 match unsafe { Paging::map_page(root, page_base, phys, flags) } {
-                    Ok(()) => {}
+                    Ok(()) => crate::mm::record_demand_fault(),
                     Err(ArchMapError::OutOfMemory) => {
                         heap::buddy_free(phys, 0);
                         return FaultIn::Oom;
                     }
-                    // Impossible: a not-present fault means no PTE, and `page_base` is aligned.
-                    Err(ArchMapError::AlreadyMapped | ArchMapError::Misaligned) => {
+                    // Another CPU faulted on the same page and mapped it first, between this
+                    // CPU's fault and the lock: the page is there, so the access can be retried.
+                    Err(ArchMapError::AlreadyMapped) => heap::buddy_free(phys, 0),
+                    Err(ArchMapError::Misaligned) => {
                         heap::buddy_free(phys, 0);
-                        unreachable!("fault_in: map_page rejected a fresh page-aligned not-present mapping");
+                        unreachable!("fault_in: map_page called Misaligned a page-aligned address");
                     }
                 }
                 // SAFETY: ring-0 `invlpg` evicting the not-present entry the
@@ -279,7 +280,6 @@ impl AddressSpace {
                 unsafe {
                     Paging::flush_tlb_page(page_base);
                 }
-                crate::mm::record_demand_fault();
                 FaultIn::Mapped
             }
             // Installed eagerly by `map_object`; a fault here is a bug or teardown race.

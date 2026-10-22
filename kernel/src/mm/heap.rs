@@ -43,8 +43,22 @@ pub fn buddy_alloc(order: usize) -> Option<PhysAddr> {
 
 /// Return frames from [`buddy_alloc`]; `order` must match. Panics before [`init_buddy`].
 pub fn buddy_free(addr: PhysAddr, order: usize) {
+    #[cfg(test)]
+    FREED.with(|f| f.set(f.get() + (1 << order)));
     let mut slot = BUDDY.lock();
     slot.as_mut().expect("heap::buddy_free called before init_buddy").free(addr, order);
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FREED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Frames this thread has given back, for a test counting a leak or a double free: libtest gives
+/// each test a thread of its own.
+#[cfg(test)]
+pub fn frames_freed_by_this_thread() -> usize {
+    FREED.with(core::cell::Cell::get)
 }
 
 /// HHDM offset captured at [`init_buddy`] time; `0` before init (no panic: the slab allocator

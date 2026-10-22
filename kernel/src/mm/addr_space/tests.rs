@@ -430,6 +430,44 @@ fn is_mapped(asp: &AddressSpace, v: VirtAddr) -> bool {
     unsafe { Paging::translate(asp.root(), v) }.is_some()
 }
 
+/// Two CPUs can fault on one fresh page: the second, taking the lock after the first mapped it,
+/// finds the page there.
+#[test]
+fn a_fault_on_a_page_another_cpu_just_mapped_is_a_retry_and_keeps_no_frame() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 6), uprot())).unwrap();
+    assert_eq!(asp.fault_in(va(PAGE * 5), FaultAccess::Write), FaultIn::Mapped);
+    // SAFETY: `asp`'s root is the live page table this test built.
+    let first = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) };
+    let freed = heap::frames_freed_by_this_thread();
+    assert_eq!(asp.fault_in(va(PAGE * 5 + 8), FaultAccess::Write), FaultIn::Mapped);
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 1, "the second fault's frame goes back");
+    // SAFETY: as above.
+    assert_eq!(unsafe { Paging::translate(asp.root(), va(PAGE * 5)) }, first);
+}
+
+#[test]
+fn an_unmap_frees_an_anonymous_mappings_frames_and_never_an_objects() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    asp.map_vma(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
+    let obj = into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap());
+    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).unwrap();
+    let mut frames = KVec::new();
+    frames.try_reserve(8).unwrap();
+    asp.unmap_covering_deferred(va(PAGE * 5), &mut frames).unwrap();
+    assert!(frames.is_empty(), "an object's frames are the object's to free");
+    asp.unmap_covering_deferred(va(PAGE * 16), &mut frames).unwrap();
+    assert_eq!(frames.len(), 2);
+
+    let held = AddressSpace::new().unwrap();
+    held.map_vma(anon_box(range(PAGE * 16, PAGE * 19), uprot())).unwrap();
+    let freed = heap::frames_freed_by_this_thread();
+    drop(held);
+    assert!(heap::frames_freed_by_this_thread() - freed >= 3, "a dropped address space frees its anonymous frames");
+}
+
 #[test]
 fn map_vma_lazy_installs_no_ptes() {
     init_global_heap();
