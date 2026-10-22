@@ -2,10 +2,11 @@
 
 **Status: started 2026-10-14; triaged 2026-10-22 with the maintainer — the bash's eight runs,
 its two re-runs and what PR #365's trials left: 154 findings, 129 once a defect several runs found
-is one, 68 to fix in Part D, 60 later (4 in Part E, 56 in Part H) and 1 not. Untriaged: the five
-found before the bash, and the trials' test gaps and doc claims not yet checked (pr365-11,
-pr365-12). Group A fixed 2026-10-22, with sched-7 and kobj-9 from groups E and B and the test
-gaps that ride with them; sched-10 stays open for one mutation.** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
+is one, 68 to fix in Part D, 60 later (4 in Part E, 56 in Part H) and 1 not. The same day, the rest:
+the five found before the bash, the trials' unchecked test gaps and doc claims, and the laptop's
+two bugs, five to fix, one already fixed and three later. Group A fixed 2026-10-22, with sched-7
+and kobj-9 from groups E and B and the test gaps that ride with them; sched-10 stays open for one
+mutation.** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
 laptop, what PR #365's two trial reviews found that `main` still has, and each `/bug-bash` run, a
 section a subsystem.
 
@@ -29,12 +30,24 @@ ticked with the commit that fixed it and the test that fails without it.
 
 ## Findings
 
+### Found on the laptop — Phase 6 Part H's runs, 2026-10
+
+Two bugs a person met on the laptop, not found by a run. Neither is reproduced yet, and each is
+reproduced before it is fixed.
+
+- [ ] **laptop-1** `userspace/nxterm` — output appears only after the pointer moves, every time in
+  the laptop's runs 3 and 4. The QEMU dry runs of Phase 6 Part H may reproduce it if run from
+  `nxterm`; those recorded were typed on serial, which never passes through it, so trying that
+  comes first. Unverified. **Fix**, reproduced first.
+- [ ] **laptop-2** `userspace/desktop-shell` — the Applications menu's search clears while typing,
+  now and then. A reliable way to make it happen comes first. Unverified. **Fix**, reproduced first.
+
 ### Found detailing Part C — main at 226a54f6, 2026-10-19
 
 These were found by the author while measuring Part C, not by a run. No lens hunted, and none
 was demonstrated: each is read from the source, and is reproduced before it is fixed.
 
-- [ ] **desk-1** `userspace/compositor/src/input.rs:449` — a press on a maximized window's title
+- [x] **desk-1** `userspace/compositor/src/input.rs:449` — a press on a maximized window's title
   bar that moves at all snaps it.
   - Scenario:
     - at 1360×768, a maximized window's title bar is rows 31–61;
@@ -47,6 +60,9 @@ was demonstrated: each is read from the source, and is reproduced before it is f
   - After Part C's C.3 the top zone maximizes instead, but the corners still quarter the window.
   - Unverified: a press, a one-pixel motion and a release over QMP on a maximized `nxterm` would
     settle it. Logic. Medium.
+    **Fix**: done by `7fcda1ff`, in PR #388's review: nothing moves until the pointer has gone 4
+    pixels; `a_click_that_shakes_by_less_than_the_threshold_moves_nothing_and_snaps_nothing` holds
+    it.
 - [ ] **nxsh-1** `userspace/nxsh/src/eval.rs:636` — assigning to an existing `$env` field changes
   the `$env` binding alone: a spawned program still gets the old value, and the next `cd` reverts
   the binding.
@@ -62,7 +78,7 @@ was demonstrated: each is read from the source, and is reproduced before it is f
     "record has no field `FOO`" and runs nothing.
   - Demonstrated by PR #385's review, and again by a temporary host test: `/x` from `$env.HOME`,
     `HOME=/home/a` in the stage's environment, `/home/a` after a `cd`, and the new field refused.
-    Logic. Medium.
+    Logic. Medium. **Later.**
 - [ ] **nxsh-2** `userspace/nxsh/src/eval.rs:1268` — `cd` and `exit` each read their first
   positional argument and ignore the rest.
   - `cd a b` goes to `a`, and `exit 1 2` exits with 1, each saying nothing, against the shell's
@@ -70,7 +86,7 @@ was demonstrated: each is read from the source, and is reproduced before it is f
   - `` `cd` takes one path `` fires only for an argument that is not positional (`:1280`), and so
     does `exit`'s check (`:1293-1318`).
   - Demonstrated by a temporary host test: `cd /a /b` left `PWD` at `/a`, and `exit 1 2` exited
-    with 1, neither with an error. Logic. Low.
+    with 1, neither with an error. Logic. Low. **Later.**
 
 ### Found on PR #385's CI — main at 226a54f6, 2026-10-19
 
@@ -89,7 +105,7 @@ A gate failed on a branch that changes only docs. It is the gate's own defect.
   - Its doc comment (`:5-9`) names a retry's hazard for the bar's toggles, not for a button that
     ends a dialog.
   - Demonstrated: the transcript of PR #385's CI, run 39291063887, job 118191523426. Tests.
-    Medium: it fails CI on branches that touch none of it.
+    Medium: it fails CI on branches that touch none of it. **Fix.**
 
 ### Found building Part C.1 — branch pre-phase-7/part-c1-paths at 2116dbcf, 2026-10-19
 
@@ -104,6 +120,7 @@ One flake on a branch that changed only the shell and `rename`, in a path it doe
     acted on it.
   - Demonstrated: failed once in three local `test-qemu --kvm` runs; the other two passed, with
     the guest unchanged. Error paths. Medium: a device plugged in later is not seen.
+    **Fix**, with group D.
 
 ### kernel-objects — main at 510381f4, 2026-10-20
 
@@ -2209,9 +2226,11 @@ before it is fixed.
   chunker's last chunk (T1-27); and eight of FAT's guards (T2-17 to T2-24: the second FAT copy on
   eviction, the long-name ordinal bound and checksum, the numeric-tail window, the rewrite's slot
   bound, the FSInfo hint, FAT32's reserved nibble, DEL in a name). Tests. Low.
+  **Later**: each run against `main` as a mutation in Part H first.
 - [ ] **pr365-12** — the trials' other doc claims, not yet read against `main`: `Meta::Unmount`'s
   "recorded clean" where FAT keeps a volume found dirty (T1-16); `error-codes.md` pointing at the
   deleted `fs_kerror` (T1-18); `File::Forget`'s list missing a truncate to zero (T1-19);
   `fat-fs-server.md` §9 citing deferrals that do not exist (T1-20); the refusal-in-place-of-Ready
   text naming only ext4 (T1-28); and no marker where ext4 accepts a block under a page, with its
   `CLAUDE.md` silent on it (T2-16). Docs. Low.
+  **Fix**, with pr365-9 and pr365-10, each read against `main` first.
