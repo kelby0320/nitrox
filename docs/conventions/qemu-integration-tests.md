@@ -427,7 +427,7 @@ each time.
 | `check-live` | `release-live` | 23 | The live stick: its RAM-disk root, the greeter within 1.5 s of the mount, the boot medium flagged and passed over. |
 | `check-report` | `release-live` | 23 | The live menu's hardware report with no serial port, its pages turned on PS/2: AHCI declined with no disk, no COM1. |
 | `check-report --usb` | `release-live` | 30 | The same pages turned on a USB keyboard, before `init`. |
-| `check-storage` | `live-test` | 137 / 63 | Disks the host reads afterwards: an unmount's writes, sticks plugged and pulled while mounted, FAT, partitioning and formatting. |
+| `check-storage` | `live-test` | 137 / 63 | Disks the host reads afterwards: an unmount's writes, sticks plugged and pulled while mounted, FAT, partitioning and formatting; a SATA partition labelled as the live root is. |
 | `check-media` | `live-test` | 46 | Removable media on the desktop: Files' Drives updated with nothing typed, Save As onto a stick, Files' eject. |
 | `check-display` | `display.yml` | 120 | The guest's screen against the host's render — base address, stride, channels — and the overview's round trip. |
 | `check-input` | `input.yml` | 104 | A PS/2 key and click reaching a client window through the compositor's router. |
@@ -633,7 +633,11 @@ command refused while mounted, ejected). The host reads the GPT and its ext4 in 
 MBR, no GPT header at either end, and the FAT in the stick. **It logs in only once `boot-probe` has
 exited**, whatever its verdict, which on that machine is a FAIL by the machine's shape: its later
 tests install a policy and fill the view broker's clients, and the sticks made the gate long enough
-to meet them. It runs in CI's QEMU job.
+to meet them. **The copy carries a decoy too**: a fourth partition of zeros labelled `nitrox-live`,
+as the live root is, on a disk published before the RAM disk holding the real one. The kernel's line
+passing it over is required. Without that, `init` mounts the decoy as `/` and refuses it. With the
+storage service matching the first partition published instead, it calls the boot an installed one
+and mounts the real root a second time, read-write. It runs in CI's QEMU job.
 
 `cargo xtask check-media` is the **removable-media gate** (Phase 6 Part F), on the desktop a person
 uses: the **release** live image as the boot stick beside a copy of the release disk, logged in at

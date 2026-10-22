@@ -228,7 +228,10 @@ enumeration — but the in-kernel resource-server registry
 - **Content-stable names — `/dev/disk/by-partuuid/*`, `/dev/disk/by-partlabel/*`**, since
   slice 6. They are derived from GPT partition metadata, so they are order-independent and are
   what `init.toml` mount specs reference. The raw `/dev/blk/N` nodes are not what a manifest
-  should name.
+  should name. Only disks the boot's probe found are named, not a USB disk. **A name two
+  partitions carry is the boot medium's**: the disk Limine started from, or a module's RAM disk.
+  Otherwise it goes to the first published, and the kernel logs each name it passes over
+  (`gpt::bind_order`).
 
 `Char` devices now have both shapes: `/dev/console` is a **leaf** binding to the single
 serial console, and `/dev/input/raw/<n>` is the first **indexed char registry** — a subtree

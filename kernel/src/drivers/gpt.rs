@@ -7,7 +7,8 @@
 //! recorded for the `/dev/disk/by-partuuid/<uuid>` and `by-partlabel/<label>` bindings made by
 //! [`bind_partition_names`]; **a USB disk's are not** ([`Names`]), since those names are how `init`
 //! finds its critical path among what the boot's probe found. The disk whose GPT GUID is the one
-//! Limine loaded the modules from is flagged `BOOT` ([`partitions::is_boot`]).
+//! Limine loaded the modules from is flagged `BOOT` ([`partitions::is_boot`]), and **a name two
+//! partitions carry goes to the boot medium's** ([`bind_order`]).
 //!
 //! [`init`] reads with interrupts masked, so it uses the polled
 //! [`read_blocking`](crate::io::block::read_blocking). The signature, entry size and bounds are
@@ -31,6 +32,8 @@ struct PartEntry {
     by_partuuid: KVec<u8>,
     /// `/dev/disk/by-partlabel/<label>` path (absent if the label is not a usable path component).
     by_partlabel: Option<KVec<u8>>,
+    /// On the disk the machine started from, or a RAM disk, which only the boot medium's modules are.
+    boot_medium: bool,
 }
 
 /// Partitions discovered across all disks, for [`bind_partition_names`]; written by [`init`].
@@ -72,11 +75,16 @@ pub fn publish(disk: &ObjectRef, table: Result<Table, Unread>, names: Names) -> 
             return 0;
         }
     };
+    // SAFETY: `disk` pins a live `DeviceNode`.
+    let mut boot_medium =
+        unsafe { &*(disk.as_ptr() as *const DeviceNode) }.block_info().kind == BlockKind::RamDisk.as_u32();
     let what = match table.scheme {
         Scheme::Gpt { disk_guid } => {
-            if partitions::is_boot(&disk_guid, partitions::boot_disk()) && crate::device::mark_boot(disk) {
+            let boot = partitions::is_boot(&disk_guid, partitions::boot_disk());
+            if boot && crate::device::mark_boot(disk) {
                 crate::kprintln!("gpt: the disk the machine started from: its GUID is the one Limine loaded from");
             }
+            boot_medium |= boot;
             "gpt"
         }
         Scheme::Mbr => "mbr",
@@ -87,7 +95,7 @@ pub fn publish(disk: &ObjectRef, table: Result<Table, Unread>, names: Names) -> 
     };
     let mut found = 0u32;
     for p in table.parts.iter() {
-        if publish_partition(disk, p, names) {
+        if publish_partition(disk, p, names, boot_medium) {
             found += 1;
         }
     }
@@ -103,7 +111,7 @@ pub fn publish(disk: &ObjectRef, table: Result<Table, Unread>, names: Names) -> 
 
 /// Create a partition window and block `DeviceNode`, register it, and record a boot disk's GPT
 /// names.
-fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bool {
+fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names, boot_medium: bool) -> bool {
     let Some(part) = Partition::new(disk, p.first_lba, p.count, SECTOR) else {
         return false;
     };
@@ -189,7 +197,7 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
     if names == Names::Bind
         && let Some(uuid) = format_partuuid(&guid[..])
     {
-        record(PartEntry { node: node_ref.clone(), by_partuuid: uuid, by_partlabel });
+        record(PartEntry { node: node_ref.clone(), by_partuuid: uuid, by_partlabel, boot_medium });
     }
     // The device table owns the node (it also resolves at /dev/blk/<n>) and records its disk.
     crate::device::register_partition(node_ref, disk, "gpt");
@@ -205,29 +213,44 @@ fn record(entry: PartEntry) {
 /// Bind every discovered partition's `/dev/disk/by-partuuid/<uuid>` and `by-partlabel/<label>` name
 /// into `ns` as direct handles. Called once when init's root namespace is built.
 pub fn bind_partition_names(ns: &Namespace) {
+    let Some(names) = bind_order(&PARTITIONS.lock()) else {
+        crate::kprintln!("gpt: no memory for the /dev/disk names");
+        return;
+    };
+    bind_names(ns, &names);
+    for (_, path, _) in names.iter().filter(|(_, _, free)| !free) {
+        crate::kprintln!(
+            "gpt: {} names an earlier partition, the boot medium's or the first found, not this one",
+            core::str::from_utf8(path).unwrap_or("a /dev/disk name")
+        );
+    }
+}
+
+/// Bind each name [`bind_order`] left free to its partition.
+fn bind_names(ns: &Namespace, names: &[(ObjectRef, KVec<u8>, bool)]) {
     // READ + WRITE (the RW fs-server writes filesystem metadata to its partition) + the
     // generic band (DUPLICATE lets it hand a device copy to the kernel for the data path).
     let rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    let mut snapshot: KVec<(ObjectRef, KVec<u8>, Option<KVec<u8>>)> = KVec::new();
-    {
-        let parts = PARTITIONS.lock();
-        if snapshot.try_reserve(parts.len()).is_err() {
-            return;
-        }
-        for pe in parts.iter() {
-            let uuid = copy_bytes(&pe.by_partuuid);
-            let label = pe.by_partlabel.as_ref().and_then(copy_bytes_opt);
-            if let Some(uuid) = uuid {
-                snapshot.try_push((pe.node.clone(), uuid, label)).expect("within reserved capacity");
+    for (node, path, _) in names.iter().filter(|(_, _, free)| *free) {
+        bind_one(ns, path, node, rights);
+    }
+}
+
+/// **Which partition each `/dev/disk` name goes to**, and whether it is still free for it: the boot
+/// medium's first, so another disk copying a label or GUID it carries never takes it, then the rest,
+/// each in the order found. `None` on running out of memory.
+fn bind_order(parts: &[PartEntry]) -> Option<KVec<(ObjectRef, KVec<u8>, bool)>> {
+    let mut out: KVec<(ObjectRef, KVec<u8>, bool)> = KVec::new();
+    out.try_reserve(2 * parts.len()).ok()?;
+    for boot_medium in [true, false] {
+        for pe in parts.iter().filter(|pe| pe.boot_medium == boot_medium) {
+            for path in core::iter::once(&pe.by_partuuid).chain(pe.by_partlabel.as_ref()) {
+                let free = !out.iter().any(|(_, taken, free)| *free && taken[..] == path[..]);
+                out.try_push((pe.node.clone(), copy_bytes(path)?, free)).ok()?;
             }
         }
     }
-    for (node, uuid, label) in snapshot.iter() {
-        bind_one(ns, uuid, node, rights);
-        if let Some(label) = label {
-            bind_one(ns, label, node, rights);
-        }
-    }
+    Some(out)
 }
 
 /// Bind `node` at `path` in `ns`; drop the handed-back ref on failure (outside any
@@ -243,10 +266,6 @@ fn copy_bytes(src: &KVec<u8>) -> Option<KVec<u8>> {
     let mut out = KVec::new();
     out.try_extend_from_slice(&src[..]).ok()?;
     Some(out)
-}
-
-fn copy_bytes_opt(src: &KVec<u8>) -> Option<KVec<u8>> {
-    copy_bytes(src)
 }
 
 /// Format a GPT partition GUID (mixed-endian: first three fields little-endian,
@@ -334,5 +353,57 @@ mod tests {
         bad[1] = 0x01; // high byte set => non-ASCII
         bad[0] = b'x';
         assert!(decode_partlabel(&bad).is_none());
+    }
+
+    /// The live root, on a RAM disk published after a SATA disk carrying its label and GUID, keeps
+    /// both; a name only one partition carries is bound wherever it is.
+    #[test]
+    fn a_name_two_partitions_carry_goes_to_the_boot_mediums() {
+        use crate::object::{MemoryObject, namespace::ResolvedTarget};
+        init_global_heap();
+        let node = || {
+            let mem = KBox::into_raw(MemoryObject::try_new(4096).unwrap()).as_ptr() as *mut ();
+            // SAFETY: a fresh `into_raw`, carrying its single creation reference.
+            unsafe { ObjectRef::from_raw(mem, KObjectType::MemoryObject) }
+        };
+        let path = |s: &[u8]| {
+            copy_bytes(&{
+                let mut v = KVec::new();
+                v.try_extend_from_slice(s).unwrap();
+                v
+            })
+        };
+        let entry = |node: &ObjectRef, uuid: &[u8], label: &[u8], boot_medium| PartEntry {
+            node: node.clone(),
+            by_partuuid: path(uuid).unwrap(),
+            by_partlabel: path(label),
+            boot_medium,
+        };
+        let (sata_root, sata_other, ram_root) = (node(), node(), node());
+        let live = b"/dev/disk/by-partlabel/nitrox-live";
+        let uuid = b"/dev/disk/by-partuuid/0000000a-0000-0000-0000-000000000000";
+        let parts = [
+            entry(&sata_root, uuid, live, false),
+            entry(&sata_other, b"/dev/disk/by-partuuid/b", b"/dev/disk/by-partlabel/nitrox-root", false),
+            entry(&ram_root, uuid, live, true),
+        ];
+        let ns = crate::object::Namespace::try_new().unwrap();
+        bind_names(&ns, &bind_order(&parts).unwrap());
+        let at = |p: &[u8]| match ns.resolve(p) {
+            Some((ResolvedTarget::DirectHandle(o), _, _)) => o.as_ptr(),
+            _ => core::ptr::null_mut(),
+        };
+        assert_eq!(at(live), ram_root.as_ptr(), "the label to the RAM disk's root");
+        assert_eq!(at(uuid), ram_root.as_ptr(), "and the GUID");
+        assert_eq!(at(b"/dev/disk/by-partlabel/nitrox-root"), sata_other.as_ptr(), "a name only one carries");
+        let passed: KVec<bool> = {
+            let mut v = KVec::new();
+            for (_, _, free) in bind_order(&parts).unwrap().iter() {
+                v.try_push(*free).unwrap();
+            }
+            v
+        };
+        let want = [true, true, false, false, true, true];
+        assert_eq!(&passed[..], &want, "the RAM disk's names, the SATA root's passed over, then the other's");
     }
 }
