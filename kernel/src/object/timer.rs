@@ -204,9 +204,12 @@ impl Timer {
 }
 
 impl Drop for Timer {
-    /// A live waiter pins this timer (it holds an `ObjectRef` across `sys_wait`), so the last
-    /// reference cannot drop while waiters remain; the assert documents that.
+    /// Take the timer out of the deadline heap, which names it by address. A live waiter pins
+    /// it (it holds an `ObjectRef` across `sys_wait`), so the last reference cannot drop while
+    /// waiters remain; the assert documents that.
     fn drop(&mut self) {
+        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
+        unsafe { crate::sched::timer_closing(self as *mut Self as *mut ()) };
         debug_assert!(self.inner.get_mut().waiters.is_empty(), "Timer dropped with live waiters");
     }
 }

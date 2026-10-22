@@ -53,8 +53,8 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
             }
             deadline::DeadlineKind::Timer => {
                 let timer = top.target as *mut ();
-                // SAFETY: a heaped timer is kept alive by its waiter(s)'
-                // `sys_wait` `ObjectRef`s (or the owner's handle); `SCHED` held.
+                // SAFETY: a heaped timer is whole: `timer_closing` removes its entry
+                // under `SCHED` before the memory goes; `SCHED` held.
                 unsafe { Timer::set_in_heap(timer, false) };
                 fire_timer(g, timer, now);
             }
@@ -130,11 +130,7 @@ pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> R
     let mut g = SCHED.lock();
     // Drop any stale heap entry (re-arm).
     // SAFETY: live Timer (caller holds its `ObjectRef`), `SCHED` held.
-    if unsafe { Timer::in_heap(timer) } {
-        deadline::remove(&mut g.deadlines, timer as usize, deadline::DeadlineKind::Timer);
-        // SAFETY: as above.
-        unsafe { Timer::set_in_heap(timer, false) };
-    }
+    unsafe { unheap(&mut g, timer) };
     // SAFETY: live Timer, `SCHED` held.
     unsafe { Timer::set_armed(timer, deadline_ns, interval_ns) };
     if deadline_ns != 0 {
@@ -152,4 +148,31 @@ pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> R
         unsafe { Timer::set_in_heap(timer, true) };
     }
     Ok(())
+}
+
+/// A timer is being destroyed: drop its heap entry, which names it by address and holds no
+/// reference, so a fire after the free would write freed memory. Called only from
+/// [`Timer::drop`](crate::object::Timer), which, like a channel's, runs outside `SCHED`.
+///
+/// # Safety
+///
+/// `timer` is the `Timer` being dropped: its memory whole, its last reference gone.
+pub unsafe fn timer_closing(timer: *mut ()) {
+    let mut g = SCHED.lock();
+    // SAFETY: the memory is whole until the drop returns; `SCHED` held.
+    unsafe { unheap(&mut g, timer) };
+}
+
+/// Remove `timer`'s heap entry, if it has one.
+///
+/// # Safety
+///
+/// `timer` is a `Timer` whose memory is whole; the caller holds `SCHED`.
+unsafe fn unheap(g: &mut SchedState, timer: *mut ()) {
+    // SAFETY: the caller's contract.
+    if unsafe { Timer::in_heap(timer) } {
+        deadline::remove(&mut g.deadlines, timer as usize, deadline::DeadlineKind::Timer);
+        // SAFETY: as above.
+        unsafe { Timer::set_in_heap(timer, false) };
+    }
 }
