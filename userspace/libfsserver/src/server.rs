@@ -12,7 +12,9 @@
 //! plumbing, **alloc-free**: fixed `.bss` buffers, one set per process.
 
 use crate::serve::entry_name;
-use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve, serve_grown};
+use crate::serve::{
+    MAX_FILE, MAX_SUFFIX, Served, apply_size, encode_error, encode_refusal, kerror, reason, serve, serve_grown,
+};
 use crate::{DirEntry, FsError, Refusal, Volume};
 use libkern::*;
 use librsproto::file::{
@@ -20,9 +22,8 @@ use librsproto::file::{
     parse_touch_request,
 };
 use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, OBJECT_KIND_NONE, RENAME_REPLACE, RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_RENAME,
-    RESOLVE_REPLY_LEN, RESOLVE_TRUNCATE, parse_resolve_grow_size, parse_resolve_rename, parse_resolve_request,
-    resolve_reply,
+    OBJECT_KIND_CHANNEL, OBJECT_KIND_NONE, RENAME_REPLACE, RESOLVE_RENAME, RESOLVE_REPLY_LEN, parse_resolve_rename,
+    parse_resolve_request, resolve_reply,
 };
 use librsproto::{
     OP_FILE_FORGET, OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK,
@@ -283,60 +284,14 @@ fn send_reply(serve_end: u64, count: usize) {
     }
 }
 
-/// Apply a resolve's `RESOLVE_GROW` or `RESOLVE_TRUNCATE` (after `RESOLVE_CREATE`), best-effort:
-/// an error leaves `serve` mapping the file at its current size. A truncate that ends a file's
-/// id has it forgotten and released first. **The size a grow took the file from**, which the
-/// reply marks past ([`crate::serve::serve_grown`]).
+/// [`apply_size`], then the forget and the release of an id a truncate ended. **The size a grow
+/// took the file from**, which the reply marks past ([`crate::serve::serve_grown`]).
 fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<Option<u64>, FsError> {
-    let Ok(m) = librsproto::decode(req) else {
-        return Ok(None);
-    };
-    if m.op != OP_NS_RESOLVE {
-        return Ok(None);
+    let resized = apply_size(vol, req, now_secs())?;
+    if let Some(id) = resized.ended {
+        forget_then_release(vol, serve_end, id);
     }
-    let Some(r) = parse_resolve_request(m.body) else {
-        return Ok(None);
-    };
-    if r.flags & (RESOLVE_GROW | RESOLVE_TRUNCATE) == 0 || r.suffix.len() > MAX_SUFFIX {
-        return Ok(None);
-    }
-    let Some(new_size) = parse_resolve_grow_size(m.body) else {
-        return Ok(None);
-    };
-    // **A read-only mount's refusal is the one failure reported**: it would otherwise answer a
-    // create or a grow with a file that never changed.
-    let mut refused = false;
-    let mut note = |r: Result<(), FsError>| refused |= r == Err(FsError::ReadOnly);
-    let mut path = [0u8; MAX_SUFFIX + 1];
-    path[0] = b'/';
-    path[1..1 + r.suffix.len()].copy_from_slice(r.suffix);
-    let path = &path[..1 + r.suffix.len()];
-
-    // Create-on-resolve is idempotent, so a re-resolve of a created file is harmless.
-    if r.flags & RESOLVE_CREATE != 0
-        && let Some(slash) = path.iter().rposition(|&b| b == b'/')
-    {
-        let parent = if slash == 0 { &b"/"[..] } else { &path[..slash] };
-        let name = &path[slash + 1..];
-        note(vol.create_file(parent, name, now_secs()));
-    }
-
-    let mut grown = None;
-    if r.flags & RESOLVE_TRUNCATE != 0 {
-        // Never combined with GROW: the two move the allocator in opposite directions.
-        match vol.truncate_file(path, new_size as usize, now_secs()) {
-            Ok(Some(id)) => forget_then_release(vol, serve_end, id),
-            Ok(None) => {}
-            Err(e) => note(Err(e)),
-        }
-    } else {
-        match vol.grow_file(path, new_size as usize, now_secs()) {
-            Ok(was) if was < new_size as u64 => grown = Some(was),
-            Ok(_) => {}
-            Err(e) => note(Err(e)),
-        }
-    }
-    if refused { Err(FsError::ReadOnly) } else { Ok(grown) }
+    Ok(resized.grown_from)
 }
 
 /// Receive one message on `h` into the `RECV_*` statics: `0` = arrived; `-11` (`WouldBlock`) =
@@ -955,7 +910,7 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
             core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
         let op = librsproto::decode(req).map(|m| m.op).unwrap_or(0);
         served_op = op;
-        // A grow comes first so the map covers the new size; a failure falls through.
+        // A grow comes first so the map covers the new size; its failure is the reply.
         match maybe_grow(vol, req, serve_end) {
             Err(e) => Served::Error {
                 reply_len: encode_error(reply, request_id, kerror(e).as_i32(), OP_NS_RESOLVE, reason(e)),

@@ -471,8 +471,8 @@ pub mod mounts {
     /// the label the service would choose if it is empty. `mounted` is everything mounted, `init`'s
     /// included; `taken` the labels in use; `room` whether a slot is free; `init_known` is
     /// [`init_known`](crate::sources::init_known)'s answer, and nothing is mounted without it.
-    /// **Writable**, on a live boot too, as the auto-mount is the careful one, unless the filesystem's
-    /// server would only read it.
+    /// **Writable**, on a live boot too, as the auto-mount is the careful one, unless the
+    /// filesystem's server would only read it.
     pub fn explicit(
         devices: &[Device],
         mounted: &[Mounted],

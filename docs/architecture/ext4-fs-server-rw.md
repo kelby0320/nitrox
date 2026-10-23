@@ -191,8 +191,7 @@ message (`init` does for `init.toml`'s `"ro"`), and the server serves through
 `FsError::ReadOnly`. So read-only isn't a check each mutation has to remember: whichever
 mutation is reached, by a session or a resolve, it fails at its first write having changed
 nothing, and the server answers `NoAccess` with the reason `read-only mount`. A grow or create
-that arrives as a resolve is refused, rather than falling through to the file's current size as
-other grow failures do. The same type answers `read_only()`, from which the block-file reply
+that arrives as a resolve is refused, as any of its failures is. The same type answers `read_only()`, from which the block-file reply
 takes its `FILE_BLOCKS_READ_ONLY` mark, so the kernel installs the files without `MAP_WRITE`;
 the mark and the refusal are one fact. It never writes the superblock.
 

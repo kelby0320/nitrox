@@ -89,8 +89,7 @@ fn exercise(vol: &Ext4<'_, RwImage>) {
     let _ = vol.mark_clean();
 }
 
-/// Where each record of a directory's blocks starts, as `(record's byte on the device, its block's
-/// byte)`.
+/// Each record of a directory, as `(its byte on the device, its block's byte)`.
 fn records(img: &RwImage, dir: u32) -> Vec<(u64, u64)> {
     let sb = read_superblock(img).unwrap();
     let inode = read_inode(img, &sb, dir).unwrap();
@@ -110,8 +109,7 @@ fn records(img: &RwImage, dir: u32) -> Vec<(u64, u64)> {
     found
 }
 
-/// Write over `at` a live record of its whole length, naming inode `ino` with a name `name_len`
-/// long: a name longer than the record leaves it running past its block.
+/// Write over `at` a live record of its whole length whose name may run past it.
 fn cut(at: &mut [u8], ino: u32, name_len: u8) {
     let len = at.len();
     at[..4].copy_from_slice(&ino.to_le_bytes());
@@ -121,9 +119,8 @@ fn cut(at: &mut [u8], ino: u32, name_len: u8) {
     at[8..].fill(b'.');
 }
 
-/// **A record cut at its block's end, with a name running past it, is an error to rename over**,
-/// refused before anything is written, at both block sizes: a directory's first record swallows the rest of its block but an 8-byte
-/// record whose two-byte name, where `..` is looked for, would end past the block.
+/// **A record cut at its block's end, its name running past it, is refused to rename over** before
+/// anything is written: an 8-byte record whose two-byte name, `..`'s length, ends past the block.
 #[test]
 fn a_record_whose_name_runs_past_its_block_is_an_error_to_rename_over() {
     for bs in [1024u32, 4096] {
@@ -145,8 +142,7 @@ fn a_record_whose_name_runs_past_its_block_is_an_error_to_rename_over() {
     }
 }
 
-/// **A chain of `..` records that loops is `Corrupt` to move a directory into**, not a walk for
-/// ever: a directory whose `..` names itself.
+/// **A loop of `..` records is `Corrupt` to move a directory into**, not a walk for ever.
 #[test]
 fn a_loop_of_parent_records_is_corrupt_to_move_a_directory_into() {
     let img = RwImage(RefCell::new(populated(4096)));
@@ -194,8 +190,7 @@ fn garbage_in_any_structure_is_an_error_never_a_panic() {
                 2 => {
                     let block = blocks[rng.below(blocks.len() as u64) as usize];
                     let in_block: Vec<u64> = recs.iter().filter(|r| r.1 == block).map(|r| r.0).collect();
-                    // The block's last record cut short, or its first made to swallow the rest: then
-                    // the name a request looks for is not found before the cut record is reached.
+                    // The first made to swallow the rest, so a lookup reaches the cut record.
                     let from = if rng.below(2) == 0 { in_block[0] } else { in_block[in_block.len() - 1] } as usize;
                     let end = (block + bs as u64) as usize;
                     let tail = [8usize, 12][rng.below(2) as usize];

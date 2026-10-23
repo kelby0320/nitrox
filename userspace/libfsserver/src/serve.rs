@@ -8,8 +8,9 @@ use libkern::KError;
 use librsproto::error::{ERROR_BODY_LEN, error_body};
 use librsproto::file::{READ_RANGE_REPLY_LEN, parse_read_range_request, read_range_reply};
 use librsproto::namespace::{
-    BLOCK_RUN_WIRE_LEN, FILE_BLOCKS_PREFIX_LEN, FILE_BLOCKS_READ_ONLY, OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY,
-    RESOLVE_REPLY_LEN, file_blocks_prefix, parse_resolve_request, resolve_reply,
+    BLOCK_RUN_WIRE_LEN, FILE_BLOCKS_PREFIX_LEN, FILE_BLOCKS_READ_ONLY, OBJECT_KIND_MEMOBJ, RESOLVE_CREATE,
+    RESOLVE_FILE_LAZY, RESOLVE_GROW, RESOLVE_REPLY_LEN, RESOLVE_TRUNCATE, file_blocks_prefix, parse_resolve_grow_size,
+    parse_resolve_request, resolve_reply,
 };
 use librsproto::{OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
@@ -63,6 +64,45 @@ pub fn serve<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], reply: &mut
 /// yields an error reply.
 pub fn serve_resolve<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], reply: &mut [u8]) -> Served {
     resolve(vol, request, content, reply, None)
+}
+
+/// What a resolve's grow or truncate changed, for the server to finish: the size a grow took the
+/// file from, which [`serve_grown`] marks past, and the id a truncate ended, to forget and release.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resized {
+    /// The size a grow took the file from, if it grew it.
+    pub grown_from: Option<u64>,
+    /// The id a truncate ended.
+    pub ended: Option<u64>,
+}
+
+/// **Apply a resolve's `RESOLVE_CREATE`, then its `RESOLVE_GROW` or `RESOLVE_TRUNCATE`**, before it
+/// is served; one with neither changes nothing. **Each failure fails the resolve**: served anyway,
+/// the file at its old size was installed as the size asked for.
+pub fn apply_size<V: Volume>(vol: &V, request: &[u8], now: i64) -> Result<Resized, FsError> {
+    let none = Ok(Resized::default());
+    let Ok(m) = decode(request) else { return none };
+    let Some(r) = parse_resolve_request(m.body).filter(|_| m.op == OP_NS_RESOLVE) else { return none };
+    if r.flags & (RESOLVE_GROW | RESOLVE_TRUNCATE) == 0 || r.suffix.len() > MAX_SUFFIX {
+        return none;
+    }
+    let Some(new_size) = parse_resolve_grow_size(m.body) else { return none };
+    let mut buf = [0u8; MAX_SUFFIX + 1];
+    buf[0] = b'/';
+    buf[1..1 + r.suffix.len()].copy_from_slice(r.suffix);
+    let path = &buf[..1 + r.suffix.len()];
+    if r.flags & RESOLVE_CREATE != 0
+        && let Some(slash) = path.iter().rposition(|&b| b == b'/')
+    {
+        let parent = if slash == 0 { &b"/"[..] } else { &path[..slash] };
+        vol.create_file(parent, &path[slash + 1..], now)?;
+    }
+    if r.flags & RESOLVE_TRUNCATE != 0 {
+        let ended = vol.truncate_file(path, new_size as usize, now)?;
+        return Ok(Resized { grown_from: None, ended });
+    }
+    let was = vol.grow_file(path, new_size as usize, now)?;
+    Ok(Resized { grown_from: (was < new_size as u64).then_some(was), ended: None })
 }
 
 /// [`serve_resolve`] for a resolve whose grow took the file from `grown_from` bytes: **what the

@@ -197,6 +197,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & overwrite_test(root_ns)
         & grow_test(root_ns)
         & create_test(root_ns)
+        & refused_create_test(root_ns)
         & file_cache_test(root_ns)
         & unlinked_file_test(root_ns)
         & flush_test(root_ns)

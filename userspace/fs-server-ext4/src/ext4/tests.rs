@@ -266,9 +266,9 @@ fn a_feature_this_server_cannot_keep_refuses_a_writable_mount_and_one_it_cannot_
     assert_eq!(check_device(&made), Ok(()), "what mkfs makes");
 }
 
-/// **A rename to a name its file has already does nothing**, as POSIX's does: a file under two names
-/// with one link, as a crash under an older writer left one, would lose that link to the rename and
-/// come back as an orphan for the server to free while a name still reaches it.
+/// **A rename to a name its file has already does nothing**, as POSIX's does: a file under two
+/// names with one link, as a crash under an older writer left one, would lose that link to the
+/// rename and come back as an orphan for the server to free while a name still reaches it.
 #[test]
 fn a_rename_to_a_name_its_file_has_already_does_nothing() {
     use super::{EXT4_FT_REG_FILE, dir_insert, read_superblock, rename_path, resolve_path_ino};

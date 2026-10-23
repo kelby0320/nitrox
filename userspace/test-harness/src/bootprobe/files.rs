@@ -808,6 +808,25 @@ pub(super) fn grow_test(root_ns: u64) -> bool {
 /// parent, then grows it to the target size), write into it, `sys_file_sync`, then read the
 /// path off the device and confirm both that it resolves there and that its data persisted —
 /// proving inode allocation + directory-entry insertion end to end.
+/// **A create the filesystem refuses fails with its refusal**: a name past ext4's 255 bytes,
+/// `Unsupported`. The server answered only a read-only mount's refusal and served the rest, so the
+/// file never made was looked up and answered `NotFound`.
+pub(super) fn refused_create_test(root_ns: u64) -> bool {
+    let mut path = [b'a'; 8 + 300];
+    path[..8].copy_from_slice(b"/system/");
+    let rights = RIGHT_MAP_READ | RIGHT_MAP_WRITE;
+    // SAFETY: `path` outlives the call and `root_ns` is a namespace handle this process holds.
+    let po = unsafe { syscall5(SYS_FILE_CREATE, root_ns, path.as_ptr() as u64, path.len() as u64, rights, 4096) };
+    let status = if po < 0 { po as i32 } else { po_wait(po as u64).0 };
+    if status == libkern::KError::Unsupported.as_i32() {
+        kprint(b"boot-probe: a create the filesystem refuses fails with its refusal ok\n");
+        true
+    } else {
+        Line::new().s(b"boot-probe: refused create FAIL: status ").i(status as i64).end();
+        false
+    }
+}
+
 pub(super) fn create_test(root_ns: u64) -> bool {
     let path = b"/system/created";
     let marker = [0xABu8, 0xCD, 0xEFu8, 0x42];

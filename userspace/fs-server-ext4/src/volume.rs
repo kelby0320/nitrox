@@ -390,6 +390,36 @@ mod tests {
         assert_eq!(flags_of(served, &reply), 0);
     }
 
+    /// **A resolve whose create, grow or truncate fails answers the failure**, not the file at its
+    /// old size, which the kernel installs as the new one: a grow past what is free, a create of a
+    /// name too long, a truncate of nothing. One that changes the file says how.
+    #[test]
+    fn a_resolve_whose_create_grow_or_truncate_fails_answers_the_failure() {
+        use crate::test_support::RwImage;
+        use libfsserver::serve::{Resized, apply_size};
+        use librsproto::namespace::{RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_TRUNCATE};
+        let req = |flags: u32, suffix: &[u8], size: u32| {
+            let mut body = vec![0u8; 2048];
+            let n = resolve_request(&mut body, 0, flags | RESOLVE_FILE_LAZY, suffix).unwrap();
+            body[n..n + 4].copy_from_slice(&size.to_le_bytes());
+            let mut msg = vec![0u8; 4096];
+            let len = encode(&mut msg, OP_NS_RESOLVE, 7, 0, &body[..n + 4], 0).unwrap();
+            msg.truncate(len);
+            msg
+        };
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
+        let vol = Ext4(&rw);
+        let grow = RESOLVE_CREATE | RESOLVE_GROW;
+        let long = [b"system/" as &[u8], &[b'a'; 300]].concat();
+        assert_eq!(apply_size(&vol, &req(grow, b"system/big", 64 << 20), 0), Err(FsError::TooLarge));
+        assert_eq!(apply_size(&vol, &req(grow, &long, 4096), 0), Err(FsError::Unsupported));
+        assert_eq!(apply_size(&vol, &req(RESOLVE_TRUNCATE, b"system/none", 0), 0), Err(FsError::NotFound));
+        let grown = Resized { grown_from: Some(0), ended: None };
+        assert_eq!(apply_size(&vol, &req(grow, b"system/new", 8192), 0), Ok(grown));
+        let ro = Ext4(&crate::ReadOnly(&rw));
+        assert_eq!(apply_size(&ro, &req(grow, b"system/other", 8192), 0), Err(FsError::ReadOnly));
+    }
+
     /// **A directory moves into a sibling whose name begins with its own, and never into itself**,
     /// whatever bytes name the destination: `/abc` is not under `/ab`, and `/abc/./ab/x` is.
     #[test]

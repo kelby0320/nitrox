@@ -52,12 +52,11 @@ fn remove(vol: &Ext4<'_, crate::test_support::RwImage>, path: &[u8]) {
     }
 }
 
-/// What no stop may leave, as `e2fsck` says it: a name reaching a freed inode, a block in two
-/// files, a directory under two names.
+/// What no stop may leave: a name reaching a freed inode, a block in two files, a directory twice.
 const NEVER: [&str; 3] = ["deleted/unused inode", "Multiply-claimed", "is a link to directory"];
 
-/// Whether `e2fsck` counted an inode more names than links, so one name's removal frees what another
-/// reaches. More links than names only leaks.
+/// Whether `e2fsck` counted an inode more names than links, so one name's removal frees what
+/// another reaches. More links than names only leaks.
 fn fewer_links_than_names(text: &str) -> bool {
     text.lines().filter_map(|l| l.split_once("ref count is ")).any(|(_, rest)| {
         let n: Vec<u32> = rest.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse().ok()).collect();
@@ -108,8 +107,7 @@ fn a_rename_stopped_at_any_write_never_leaves_a_name_reaching_what_is_freed() {
     }
 }
 
-/// **A name taken away returns what it freed, whatever write is refused after**: an unlink of a
-/// file's last name, and a rename over one, each with every write refused once. The server
+/// **A name taken away returns what it freed, whatever write is refused after**: the server
 /// releases an orphan only on `Ok`, so an error once the name was gone lost the file for good.
 #[test]
 fn a_name_taken_away_returns_what_it_freed_whatever_write_is_refused_after() {
@@ -139,9 +137,8 @@ fn a_name_taken_away_returns_what_it_freed_whatever_write_is_refused_after() {
     }
 }
 
-/// **What a change answers is what it did**: create, mkdir, unlink, rmdir and three renames, each
-/// with every write refused once, answer `Ok` exactly when a name changed. An error after one
-/// changed told the client the opposite, and an error that left one changed was not undone.
+/// **What a change answers is what it did**, with every write refused once: `Ok` exactly when a
+/// name changed. An error after a change told the client the opposite, or was not undone.
 #[test]
 fn what_a_change_answers_is_what_it_did() {
     type Op = fn(&Ext4<'_, Failing>) -> Result<(), FsError>;
