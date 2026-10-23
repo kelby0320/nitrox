@@ -269,8 +269,8 @@ fn stage_reply(payload_len: usize, handle: Option<u64>) -> usize {
 }
 
 /// The kernel completes the waiting lookup inline (the peer is its forwarding endpoint), so
-/// `NoBlock` is correct and the reply is consumed regardless.
-fn send_reply(serve_end: u64, count: usize) {
+/// `NoBlock` is correct and the reply is consumed regardless. Whether it went.
+fn send_reply(serve_end: u64, count: usize) -> bool {
     // SAFETY: valid endpoint + message + `count` transferred handles.
     unsafe {
         syscall5(
@@ -280,8 +280,28 @@ fn send_reply(serve_end: u64, count: usize) {
             (&raw const REPLY_HANDLES) as u64,
             count as u64,
             SENDMODE_NOBLOCK,
-        );
+        ) == 0
     }
+}
+
+/// [`send_reply`] for a forwarded request. **One the kernel did not take is answered with an
+/// error**, and its handles, which stayed here, are closed: a forwarded request has no deadline,
+/// and its client would wait for ever.
+fn send_forwarded(serve_end: u64, count: usize, request_id: u64, op: u16) {
+    if send_reply(serve_end, count) {
+        return;
+    }
+    // SAFETY: the `count` handles the failed send left in this process; single-threaded.
+    (0..count).for_each(|i| unsafe {
+        syscall1(SYS_HANDLE_CLOSE, REPLY_HANDLES[i]);
+    });
+    // SAFETY: disjoint reply region.
+    let elen = unsafe {
+        let reply =
+            core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
+        encode_error(reply, request_id, KError::KernelError.as_i32(), op, b"the reply could not be sent")
+    };
+    let _ = send_reply(serve_end, stage_reply(elen, None));
 }
 
 /// [`apply_size`], then the forget and the release of an id a truncate ended. **The size a grow
@@ -488,7 +508,7 @@ fn reply_resolve_none(serve_end: u64, request_id: u64) {
             };
         stage_reply(rs_len, None)
     };
-    send_reply(serve_end, count);
+    send_forwarded(serve_end, count, request_id, OP_NS_RESOLVE);
 }
 
 fn free_session_at(slot: usize) {
@@ -526,7 +546,7 @@ fn reply_resolve_error_why(serve_end: u64, request_id: u64, kerror: i32, why: &[
         encode_error(reply, request_id, kerror, OP_NS_RESOLVE, why)
     };
     let count = stage_reply(elen, None);
-    send_reply(serve_end, count);
+    let _ = send_reply(serve_end, count);
 }
 
 /// Reply `OBJECT_KIND_CHANNEL`, transferring `client_end`; `OBJECT_KIND_DIRECTORY` is never sent.
@@ -579,10 +599,12 @@ fn open_dir_session(serve_end: u64, request_id: u64, dir: u64) {
         SESSION_DIR[slot] = dir;
     }
     if !reply_dir_handle(serve_end, request_id, client_end) {
-        // The reply did not go: roll back the session and drop the client endpoint.
+        // The reply did not go: roll back the session, drop the client endpoint, and answer, since
+        // the kernel took nothing and the lookup would wait for ever.
         free_session_at(slot);
         // SAFETY: closing our own not-yet-transferred handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, client_end) };
+        reply_resolve_error(serve_end, request_id, KError::KernelError.as_i32());
     }
 }
 
@@ -742,7 +764,7 @@ fn reply_session_error_why(session_ch: u64, request_id: u64, op: u16, kerror: i3
         encode_error(reply, request_id, kerror, op, why)
     };
     let count = stage_reply(elen, None);
-    send_reply(session_ch, count);
+    let _ = send_reply(session_ch, count);
 }
 
 /// Never returns: an unmount or an unreachable endpoint ends the process.
@@ -869,7 +891,7 @@ fn serve_control<V: Volume>(vol: &V) {
                 stage_reply(elen, None)
             }
         };
-        send_reply(control, count);
+        let _ = send_reply(control, count);
         // A read-only mount says it recorded nothing: "recorded clean" would claim otherwise.
         if marked.is_ok() && vol.read_only() {
             kprint(b"fs-server: unmounted; a read-only mount wrote nothing, so the filesystem is as it was found\n");
@@ -956,7 +978,7 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
         }
         Served::Error { reply_len } => stage_reply(reply_len, None),
     };
-    send_reply(serve_end, count);
+    send_forwarded(serve_end, count, request_id, served_op);
 }
 
 /// The block-device handle and read-only flag from the setup message on `control`, then the
