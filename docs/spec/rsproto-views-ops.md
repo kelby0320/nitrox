@@ -75,8 +75,10 @@ The broker asks every program it started for the session to stop (`sys_process_t
 request), unbinds their grants, closes the session's policy and accounts channels, and answers
 nothing further under the session's bases. Closing a session that is not open is not an error.
 **Every binding a grant made goes**, the broker's own `/dev/log` snapshot included, while a
-`/dev/log` the caller already had stays. A program that ignores the request then resolves nothing
-new through any of them.
+`/dev/log` the caller already had stays. A program that ignores the request, and every process
+sharing its namespace, then resolves nothing new through any of them. **A copy of the view is
+beyond the broker's reach**: one made with `sys_ns_derive` — a `with` run inside the view makes
+one — keeps every binding it was made with, until its processes exit (`TODO(forcible-kill)`).
 
 ### `Request` (`0x0E02`) — client
 
@@ -142,7 +144,8 @@ session's and the cap the request's.
 
 **Unsolicited, `request_id` 0.** Body: the exit code (i32) and a crashed flag (1 byte), 5 bytes.
 Sent when the program exits, **after the view's grants are unbound**. A process the program started
-shares its namespace and outlives it, and then resolves nothing new through them.
+on its own namespace outlives it, and then resolves nothing new through them; one started on a
+copy keeps them, as at `CloseSession`.
 
 The code is matched to the program by **which program's life channel closed** — a handle the
 program never learns of, moved to it at spawn — and taken from the notification queue in arrival

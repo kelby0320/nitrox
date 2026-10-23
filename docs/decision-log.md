@@ -36678,7 +36678,8 @@ a caller can now see differently is here:
   before the receiver can map it.
 - **A `FILE_BLOCKS` file is writable only as far as its server may write the device**: no `READ`,
   no file; `MAP_WRITE` only with the device's `WRITE` and no `FILE_BLOCKS_READ_ONLY`.
-  `libfsserver` duplicates the device for the kernel with its own `WRITE`, if it has one.
+  `libfsserver` duplicates the device for the kernel with its own `WRITE`, if it has one. A reply
+  for a file the kernel already caches is refused `KernelError` if it names another device.
 - **Every mapping needs `MAP_READ`**, whatever else it asks.
 - **A forwarded resolve's reply for a client that has exited completes `PeerClosed`**, its handle
   closed again, rather than pinning its object for ever.
@@ -36692,9 +36693,16 @@ a caller can now see differently is here:
   `init`'s mounts the same way.
 - **A directory session names its own entries, never `.` or `..`**, and **an `Rmdir` ends every
   session on the directory it removes**, since its id can be the next directory's.
-  `Volume::rmdir_at` returns that id.
+  `Volume::rmdir_at` hands the server that id before it changes anything, so a removal that fails
+  midway ends them too.
 - **A view's grants are unbound when its program exits**, as at its session's close, now every
-  grant rather than three, so what the program started resolves nothing new through them.
+  grant rather than three, so nothing sharing the view's namespace resolves anything new through
+  them. **A copy keeps them**: a namespace made with `sys_ns_derive`, which a `with` run inside the
+  view makes, is a snapshot the broker cannot reach. **The maintainer's call: authority ends with
+  the session unless keeping it was asked for.** A program may outlive its session, as `nohup`
+  lets one, but what it keeps is the question, and keeping a view's grants is to be an explicit
+  request the policy allows, made with the forcible kill that ends the rest — not the default, and
+  not built now (`TODO(forcible-kill)`).
 - **A view request is decided again when its password comes**: it starts only if the policy still
   allows it with the same grants, and is refused otherwise, to be asked again.
 - **`session-mgr` matches a terminal's reply by its request id**, stepping over the interrupt a

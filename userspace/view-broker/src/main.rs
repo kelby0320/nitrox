@@ -158,8 +158,8 @@ struct Granted {
     disks: bool,
 }
 
-/// **Undo what a view's grants bound**, so nothing new resolves through them: a program may ignore
-/// a request to stop, and whatever shares its namespace outlives it.
+/// **Undo what a view's grants bound** for whatever shares the view, a program that ignored a
+/// request to stop included; a copy made with `sys_ns_derive` keeps them (`TODO(forcible-kill)`).
 fn unbind_grants(view_ns: u64, granted: &Granted) {
     if granted.disks {
         libsession::unbind_block_devices(view_ns);
