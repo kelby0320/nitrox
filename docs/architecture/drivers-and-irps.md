@@ -366,6 +366,12 @@ describes the requested byte range as a physical fragment list, one fragment per
 touched, and the driver turns that into the device's scatter-gather form (for AHCI, a
 PRDT). No bounce buffer, no copy.
 
+**A command succeeds only if it moved its whole length**, since a page-cache fill marks every
+page of a successful IRP filled, and a page the device skipped would be read as data holding
+whatever its frame held before. AHCI checks the byte count the HBA writes back into the command
+header (PRDBC). Bulk-only USB needs a data stage that did not come up short and a zero residue
+([usb.md](usb.md)). Anything less fails `IoError`.
+
 **How many fragments one command can describe is a device property, and the device
 publishes it** — [`BlockBackend::max_frags`](../../kernel/src/io/block.rs). AHCI's is
 its command table's PRDT capacity: one page, 128 bytes of command FIS, 16 bytes per

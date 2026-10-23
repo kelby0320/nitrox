@@ -48,6 +48,18 @@ impl StoredMsg {
         unsafe { core::mem::zeroed() }
     }
 
+    /// Zero what a receiver is promised zeroed, the header's padding and the payload past
+    /// `header.payload_len`: a sender's buffer can carry stale bytes there, a typed password among
+    /// them. `flags` is the sender's, and passes. `None` if the length claims more than the
+    /// payload holds.
+    pub fn seal(&mut self) -> Option<usize> {
+        let len = self.header.payload_len as usize;
+        self.payload.get_mut(len..)?.fill(0);
+        self.header._pad1 = 0;
+        self.header._pad2 = [0; 4];
+        Some(len)
+    }
+
     /// The 4096 wire bytes, for `copy_slice_to_user`.
     pub fn as_bytes(&self) -> &[u8; IPC_MSG_SIZE] {
         // SAFETY: `#[repr(C)]`, size 4096 (asserted), no interior padding (the

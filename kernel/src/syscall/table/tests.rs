@@ -240,6 +240,11 @@ fn channel_create_rejects_bad_pointer_and_oversize_depth() {
 #[test]
 fn channel_send_rejects_mode_and_oversize_count_before_pointers() {
     assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99, 0), Err(KError::InvalidArgument),);
+    assert_eq!(
+        sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 1 << 32 | 1, 0),
+        Err(KError::InvalidArgument),
+        "NoBlock, high bits set"
+    );
     assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, (IPC_HANDLE_MAX + 1) as u64, 1, 0), Err(KError::TooLarge),);
 }
 
@@ -525,4 +530,185 @@ fn full_mem_rights_are_allocatable_on_a_memory_object() {
     let co = t.close(h, 1).unwrap();
     // SAFETY: the table's reference, which `close` handed back.
     drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+}
+
+/// A fresh kernel object's reference; each caller names the type it boxed.
+fn adopt<T>(b: KBox<T>, t: KObjectType) -> ObjectRef {
+    // SAFETY: `into_raw` yields the box's single creation reference, of an object of type `t`.
+    unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), t) }
+}
+
+/// A file server's registration, its peer endpoint dropped.
+fn file_server_reg() -> ObjectRef {
+    use crate::object::{IpcChannel, UserspaceServerReg};
+    let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+    drop(adopt(b, KObjectType::IpcChannel));
+    let ep = adopt(a, KObjectType::IpcChannel);
+    adopt(UserspaceServerReg::try_new(ep).unwrap(), KObjectType::UserspaceServerReg)
+}
+
+fn block_device() -> ObjectRef {
+    use crate::object::DeviceNode;
+    use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
+    let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
+    adopt(dev, KObjectType::DeviceNode)
+}
+
+const FILE_CLIENT: u32 = 4242;
+
+/// `reg`'s server answers a lookup asking `MAP_READ | MAP_WRITE` with a file-blocks reply for
+/// `file_id` (`0` uncached): 512-byte blocks, one run of a page, `device` sent with `rights`.
+fn file_blocks_reply(reg: &ObjectRef, file_id: u64, device: ObjectRef, rights: Rights) -> (i32, u64) {
+    use crate::object::PendingOperation;
+    use crate::object::userspace_server::{ForwardOp, LOOKUP_SUFFIX_MAX, PendingLookup};
+    let mut msg = std::vec![0u8; 28 + 32 + 24];
+    msg[20..24].copy_from_slice(&56u32.to_le_bytes());
+    msg[28 + 8..28 + 12].copy_from_slice(&512u32.to_le_bytes());
+    msg[28 + 12..28 + 16].copy_from_slice(&1u32.to_le_bytes());
+    msg[28 + 16..28 + 24].copy_from_slice(&file_id.to_le_bytes());
+    msg[28 + 32 + 8..28 + 32 + 16].copy_from_slice(&100u64.to_le_bytes());
+    msg[28 + 32 + 16..28 + 32 + 20].copy_from_slice(&8u32.to_le_bytes());
+    let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+    let pl = PendingLookup {
+        request_id: 1,
+        po,
+        owner_pid: FILE_CLIENT,
+        requested: Rights::MAP_READ | Rights::MAP_WRITE,
+        suffix: [0; LOOKUP_SUFFIX_MAX],
+        suffix_len: 0,
+        op: ForwardOp::Plain,
+        dest: [0; LOOKUP_SUFFIX_MAX],
+        dest_len: 0,
+        depth: 0,
+    };
+    let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    transfers[0] = Some(TransferRef { obj: device, rights });
+    build_and_install_file_blocks(reg, &pl, 4096, &msg, &mut transfers)
+}
+
+/// A file-blocks reply's file is as writable as its server's hold on the device it sent: the
+/// kernel writes the file back to that device, and the server may not have been let write it.
+#[test]
+fn a_file_blocks_reply_installs_a_file_no_more_writable_than_its_server_holds_its_device() {
+    init_global_heap();
+    global::init_for_tests();
+    let reg = file_server_reg();
+    let rw = Rights::READ | Rights::WRITE | Rights::TRANSFER;
+    for (device, writable) in [(rw, Some(true)), (Rights::READ | Rights::TRANSFER, Some(false)), (Rights::WRITE, None)]
+    {
+        let (status, h) = file_blocks_reply(&reg, 0, block_device(), device);
+        match writable {
+            None => assert_eq!(status, KError::NoAccess as i32, "a server without READ on its device"),
+            Some(w) => {
+                assert_eq!(status, 0);
+                let write = global::get().lookup(RawHandle(h), FILE_CLIENT, Rights::MAP_WRITE).is_ok();
+                assert_eq!(write, w, "device rights {:?}", device);
+                close_and_release(RawHandle(h), FILE_CLIENT);
+            }
+        }
+    }
+}
+
+/// **A cached file keeps the device it was made with**, and is written back to it, so a later
+/// reply for the file naming another device is refused: its rights would decide `MAP_WRITE` for
+/// writes that go to the first. The same device sent with `WRITE` is its server's to write.
+#[test]
+fn a_reply_for_a_cached_file_naming_another_device_is_refused() {
+    init_global_heap();
+    global::init_for_tests();
+    let reg = file_server_reg();
+    let first = block_device();
+    let writable = |h: u64| global::get().lookup(RawHandle(h), FILE_CLIENT, Rights::MAP_WRITE).is_ok();
+
+    let (status, a) = file_blocks_reply(&reg, 7, first.clone(), Rights::READ | Rights::TRANSFER);
+    assert_eq!(status, 0);
+    assert!(!writable(a));
+    let (status, _) = file_blocks_reply(&reg, 7, block_device(), Rights::READ | Rights::WRITE | Rights::TRANSFER);
+    assert_eq!(status, KError::KernelError as i32, "another device for a cached file");
+    let (status, b) = file_blocks_reply(&reg, 7, first, Rights::READ | Rights::WRITE | Rights::TRANSFER);
+    assert_eq!(status, 0, "its own device again");
+    assert!(writable(b));
+    close_and_release(RawHandle(a), FILE_CLIENT);
+    close_and_release(RawHandle(b), FILE_CLIENT);
+}
+
+/// A reply for a client that exited first: on the host no process has threads, so every pid is
+/// such a client, and the handle installed for it is closed, its object freed.
+#[test]
+fn a_reply_for_a_client_that_exited_leaves_no_handle_behind() {
+    use crate::object::MemoryObject;
+    use crate::object::header::test_probe;
+    init_global_heap();
+    global::init_for_tests();
+    test_probe::reset();
+    const PID: u32 = 4343;
+    let mem = KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut ();
+    let h = global::get().allocate(PID, mem, KObjectType::MemoryObject, Rights::MAP_READ).unwrap();
+    assert_eq!(deliver_to_client(PID, 0, h.bits()), KError::PeerClosed as i32);
+    assert!(global::get().lookup(h, PID, Rights::empty()).is_err(), "the handle is closed");
+    assert_eq!(test_probe::memory_object_destroys(), 1);
+    assert_eq!(deliver_to_client(PID, KError::NotFound as i32, 0), KError::NotFound as i32);
+    assert_eq!(deliver_to_client(PID, 0, 0), 0, "a reply with no handle");
+}
+
+/// The whole path: a lookup forwarded for a client, then the server's reply carrying a memory
+/// object. The client has no threads, so the reply completes `PeerClosed` and the object, whose
+/// handle was installed and closed again, is freed rather than pinned for ever.
+#[test]
+fn a_forwarded_reply_for_a_client_that_exited_pins_nothing() {
+    use crate::object::header::test_probe;
+    use crate::object::ipc_channel::StoredMsg;
+    use crate::object::userspace_server::Forward;
+    use crate::object::{IpcChannel, MemoryObject, PendingOperation, UserspaceServerReg};
+    use crate::rsproto::{OBJECT_KIND_MEMOBJ, build_resolve_request};
+    init_global_heap();
+    global::init_for_tests();
+    test_probe::reset();
+    // SAFETY: each pointer is a fresh `into_raw`, carrying its single creation reference.
+    let adopt = |p: *mut (), t| unsafe { ObjectRef::from_raw(p, t) };
+    let (k, s) = IpcChannel::try_new_pair(4).unwrap();
+    let k = adopt(KBox::into_raw(k).as_ptr() as *mut (), KObjectType::IpcChannel);
+    let _server_end = adopt(KBox::into_raw(s).as_ptr() as *mut (), KObjectType::IpcChannel);
+    let reg = UserspaceServerReg::try_new(k).unwrap();
+    let reg = adopt(KBox::into_raw(reg).as_ptr() as *mut (), KObjectType::UserspaceServerReg);
+    let po =
+        adopt(KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (), KObjectType::PendingOperation);
+    let mut msg = StoredMsg::zeroed();
+    msg.header.payload_len = build_resolve_request(&mut msg.payload, Rights::MAP_READ.bits(), b"f").unwrap() as u32;
+    // SAFETY: `reg` and `po` are pinned by the test.
+    let forwarded = unsafe {
+        crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, &po, 4444, Rights::MAP_READ, b"f", Forward::PLAIN)
+    };
+    assert_eq!(forwarded, crate::sched::ForwardOutcome::Pending);
+    // The request's envelope turned round, as a server's reply: flags REPLY, a MEMOBJ body.
+    let mut reply = StoredMsg::zeroed();
+    reply.payload[..28].copy_from_slice(&msg.payload[..28]);
+    reply.payload[16..20].copy_from_slice(&1u32.to_le_bytes());
+    reply.payload[20..24].copy_from_slice(&8u32.to_le_bytes());
+    reply.payload[28..30].copy_from_slice(&OBJECT_KIND_MEMOBJ.to_le_bytes());
+    reply.payload[32..36].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    let mem =
+        adopt(KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut (), KObjectType::MemoryObject);
+    let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    transfers[0] = Some(TransferRef { obj: mem, rights: Rights::MAP_READ | Rights::TRANSFER });
+    assert_eq!(complete_resolve_reply(&reg, &reply, &mut transfers, &[0; IPC_HANDLE_MAX], 0, 4445, 36), Ok(0));
+    // SAFETY: `po` pins it; completed, it is stable, and no other thread reaches it.
+    assert_eq!(unsafe { PendingOperation::status(po.as_ptr()) }, KError::PeerClosed as i32);
+    assert_eq!(test_probe::memory_object_destroys(), 1, "the object pinned by a handle nothing will close");
+}
+
+/// The wire carries a size in 32 bits and rename flags in 16: one past either is refused, before
+/// anything is looked up, never cut to fit.
+#[test]
+fn a_file_size_or_rename_flags_past_what_the_wire_carries_are_refused() {
+    let size = |n: u64| ResolveOp::Size(n, SizeChange::Truncate).forward_op();
+    assert!(matches!(size(u32::MAX as u64), Ok(ForwardOp::Size(u32::MAX, _))));
+    assert_eq!(size(1 << 32).err(), Some(KError::TooLarge));
+    let rename = |f: u64| ResolveOp::Rename { dest_ptr: 0, dest_len: 0, flags: f }.forward_op();
+    assert!(matches!(rename(u16::MAX as u64), Ok(ForwardOp::Rename { flags: u16::MAX })));
+    assert_eq!(rename(1 << 16).err(), Some(KError::InvalidArgument));
+    let path = b"/f";
+    let just_over_4_gib = 0x1_0000_000A;
+    let truncate = dispatch(SYS_FILE_TRUNCATE, 0xDEAD, path.as_ptr() as u64, 2, 0, just_over_4_gib, 0);
+    assert_eq!(truncate, KError::TooLarge.as_isize(), "taken as 10 bytes, it would free the rest");
 }

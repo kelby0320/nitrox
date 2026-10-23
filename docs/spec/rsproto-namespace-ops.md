@@ -42,7 +42,7 @@ pub struct ResolveRequest {
 |---|---|---|
 | `RESOLVE_FILE_AS_MEMOBJ` | `1 << 0` | Slice-7 mode: a regular file resolves to a read-only `MemoryObject` holding its content, materialised eagerly. |
 | `RESOLVE_FILE_LAZY` | `1 << 1` | Slice-8 mode: a regular file resolves to a lazily page-cache-filled `File` (`OBJECT_KIND_FILE`); the reply carries the file **size**, not its bytes, and the kernel fills pages on demand via `File::ReadRange` ([rsproto-file-ops.md](rsproto-file-ops.md)). |
-| `RESOLVE_GROW` | `1 << 2` | **Grow** the file to the `new_size` appended after the suffix (allocate blocks, extend the extent tree) before replying its map. For `sys_file_grow`. |
+| `RESOLVE_GROW` | `1 << 2` | **Grow** the file to the `new_size` appended after the suffix (allocate blocks, extend the extent tree) before replying its map. For `sys_file_grow`. `new_size` is 32 bits on the wire: the syscall refuses a larger size `TooLarge` rather than send it cut down, as for create and truncate. |
 | `RESOLVE_CREATE` | `1 << 3` | **Create** the file in its parent directory if absent, before growing. Combined with `RESOLVE_GROW`. For `sys_file_create`. |
 | `RESOLVE_TRUNCATE` | `1 << 4` | **Shrink** the file to the `new_size` appended after the suffix, freeing the blocks past the new end, before replying its map. For `sys_file_truncate`. |
 | `RESOLVE_RENAME` | `1 << 5` | **Rename** the resolved path to a second path carried after the suffix, and reply status-only (`OBJECT_KIND_NONE`) rather than an object. For `sys_file_rename`. |
@@ -137,7 +137,7 @@ The 8-byte `ResolveReply` above, then:
 | 8 | 4 | `block_size` — the unit of the runs, in bytes: ext4's block, or FAT's 512-byte sector. **A power of two from 512 to a page**, else the kernel refuses the reply (below) |
 | 12 | 4 | `run_count` |
 | 16 | 8 | `file_id` — **the file's identity on its server**, stable for the file's life: its inode number, for ext4; its first cluster, for FAT, which has no inode — so an empty FAT file has none and replies `0`, and a truncate to zero ends its id, which its server forgets as for a removal. The kernel keeps one page-cache object per id per registration, and names the file by it in `File::Touch`; a server names the file by it in `File::Forget` before freeing it. `0` means none: the kernel gives such a file an object of its own, uncached |
-| 24 | 4 | `flags` — `FILE_BLOCKS_READ_ONLY` (`1 << 0`): the file may not be written, a read-only mount's; the kernel installs it without `MAP_WRITE` whatever the lookup asked for |
+| 24 | 4 | `flags` — `FILE_BLOCKS_READ_ONLY` (`1 << 0`): the file may not be written, a read-only mount's; the kernel installs it without `MAP_WRITE` whatever the lookup asked for. **So does a server's device handle without `WRITE`**: the kernel writes the file back to that device. Without `READ` the reply is refused `NoAccess`, as the kernel fills the file from it |
 | 28 | 4 | reserved, zero |
 | 32 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
 
@@ -150,7 +150,10 @@ size and map its reply carries.
 **A reply for a cached file in another block size is refused** too, `KernelError` (PR #365 review,
 finding 3): its runs were checked against its own block size, and the object the kernel caches for
 the id keeps the one it was made with, so they would be used against a size nothing checked them
-for. A file's block size is its filesystem's, and does not change.
+for. A file's block size is its filesystem's, and does not change. **So is one naming another
+device**, `KernelError`: the cached object reads and writes back the device it was made with, and
+`MAP_WRITE` would be decided by a device the writes never reach. A server sends one device each
+time, a duplicate of its own handle, so the object is the same.
 
 **A map the kernel cannot use is refused** (Phase 6 Part E.4): a `block_size` that is not a power of
 two from 512 to a page, or a run whose ends — `file_block + length`, `device_lba + length`, and that

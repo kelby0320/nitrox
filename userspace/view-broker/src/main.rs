@@ -145,8 +145,29 @@ enum State {
         view_ns: u64,
         view: String,
         program: String,
+        granted: Granted,
     },
     Done,
+}
+
+/// **What a view's grants bound in it**, for [`unbind_grants`]: each path the broker bound — not a
+/// `/dev/log` its caller already had — and whether it rebound the disks.
+#[derive(Default)]
+struct Granted {
+    paths: Vec<&'static [u8]>,
+    disks: bool,
+}
+
+/// **Undo what a view's grants bound** for whatever shares the view, a program that ignored a
+/// request to stop included; a copy made with `sys_ns_derive` keeps them (`TODO(forcible-kill)`).
+fn unbind_grants(view_ns: u64, granted: &Granted) {
+    if granted.disks {
+        libsession::unbind_block_devices(view_ns);
+    }
+    for at in &granted.paths {
+        // SAFETY: valid namespace handle and path.
+        unsafe { syscall3(SYS_NS_UNBIND, view_ns, at.as_ptr() as u64, at.len() as u64) };
+    }
 }
 
 struct Client {
@@ -607,15 +628,10 @@ impl Broker {
         }
         for c in self.clients.iter_mut().filter(|c| c.session == id) {
             match &mut c.state {
-                State::Running { process, view_ns, .. } => {
+                State::Running { process, view_ns, granted, .. } => {
                     // SAFETY: a Process handle this broker owns, with SIGNAL from spawn.
                     unsafe { syscall1(SYS_PROCESS_TERMINATE, *process) };
-                    libsession::unbind_block_devices(*view_ns);
-                    // The `storage`, `views` and `accounts` grants too.
-                    for at in [STORAGE_GRANT, POLICY_GRANT, ACCOUNTS_GRANT] {
-                        // SAFETY: valid namespace handle and path.
-                        unsafe { syscall3(SYS_NS_UNBIND, *view_ns, at.as_ptr() as u64, at.len() as u64) };
-                    }
+                    unbind_grants(*view_ns, granted);
                 }
                 State::Password(p) => {
                     p.handles.close();
@@ -1002,9 +1018,22 @@ impl Broker {
         };
         let what = alloc::format!("{principal} {} {}", p.view, p.program);
         if ok {
-            let State::Password(p) = core::mem::replace(&mut self.clients[i].state, State::Idle) else {
+            let State::Password(mut p) = core::mem::replace(&mut self.clients[i].state, State::Idle) else {
                 return;
             };
+            // **Decided again**, since the password can come long after the request: a policy
+            // installed meanwhile must not be outrun. Allowed with other grants is asked again.
+            let decided = self.read_policy().and_then(|policy| match policy.decide(&principal, &p.view, &p.program) {
+                Decision::Allow { profile, .. } if profile.grants == p.grants => Ok(()),
+                Decision::Allow { .. } => Err(String::from("the view's grants changed while its password was asked")),
+                Decision::Deny(reason) => Err(reason),
+            });
+            if let Err(reason) = decided {
+                p.handles.close();
+                self.clients[i].state = State::Done;
+                self.audit(&alloc::format!("view: {what} — denied when its password came: {reason}"));
+                return reply_outcome(ch, OP_VIEWS_PASSWORD, request_id, Outcome::Denied { retry: false }, &reason);
+            }
             // Remembered for the terminal it was typed at, and for this view.
             if let (Some(b), Some(s)) = (p.backend, self.sessions.get_mut(session)) {
                 s.grace.remember(b, &p.view, now_ns());
@@ -1301,6 +1330,7 @@ impl Broker {
         }
         let view_ns = view_ns as u64;
         let mut syscaps = 0;
+        let mut kernel_log_ours = false;
         for g in &p.grants {
             match g {
                 // Every disk not in use: a mounted filesystem's device, `init`'s root included,
@@ -1391,6 +1421,7 @@ impl Broker {
                         },
                     };
                     // A caller that already binds `/dev/log` keeps its own.
+                    kernel_log_ours = result == 0;
                     let bound = result == 0 || result == KError::AlreadyExists.as_i32() as i64;
                     if snapshot != 0 {
                         // The bind took its own reference.
@@ -1422,6 +1453,17 @@ impl Broker {
                 }
             }
         }
+        let paths = p.grants.iter().filter_map(|g| match g {
+            Grant::Storage => Some(STORAGE_GRANT),
+            Grant::Services => Some(SERVICES_GRANT),
+            Grant::Power => Some(POWER_GRANT),
+            Grant::Logs => Some(LOGS_GRANT),
+            Grant::Views => Some(POLICY_GRANT),
+            Grant::Accounts => Some(ACCOUNTS_GRANT),
+            Grant::KernelLog => kernel_log_ours.then_some(KERNEL_LOG),
+            Grant::Disks | Grant::Clock => None,
+        });
+        let granted = Granted { paths: paths.collect(), disks: p.grants.contains(&Grant::Disks) };
         // **Resolved in the broker's own namespace, not the view** — a caller can prune its copy,
         // and a name must not fall through to some shorter binding there.
         let mut path = String::from("/bin/");
@@ -1479,8 +1521,14 @@ impl Broker {
             unsafe { syscall1(SYS_PROCESS_TERMINATE, process as u64) };
         }
         self.audit(&alloc::format!("view: {what} — started"));
-        self.clients[i].state =
-            State::Running { process: process as u64, life: life_ours, view_ns, view: p.view, program: p.program };
+        self.clients[i].state = State::Running {
+            process: process as u64,
+            life: life_ours,
+            view_ns,
+            view: p.view,
+            program: p.program,
+            granted,
+        };
         reply_outcome(ch, op, request_id, Outcome::Started, "");
     }
 
@@ -1513,14 +1561,12 @@ impl Broker {
     fn client_gone(&mut self, i: usize) {
         let c = self.clients.remove(i);
         match c.state {
-            State::Running { process, life, view_ns, .. } => {
+            State::Running { process, life, view_ns, granted, .. } => {
                 // SAFETY: a Process handle this broker owns.
                 unsafe { syscall1(SYS_PROCESS_TERMINATE, process) };
-                self.clients.push(Client {
-                    ch: 0,
-                    session: c.session,
-                    state: State::Running { process, life, view_ns, view: String::new(), program: String::new() },
-                });
+                let state =
+                    State::Running { process, life, view_ns, view: String::new(), program: String::new(), granted };
+                self.clients.push(Client { ch: 0, session: c.session, state });
             }
             State::Password(mut p) => {
                 p.handles.close();
@@ -1578,11 +1624,13 @@ impl Broker {
             };
             let session = self.clients[i].session;
             let ch = self.clients[i].ch;
-            let State::Running { process, life, view_ns, view, program } =
+            let State::Running { process, life, view_ns, view, program, granted } =
                 core::mem::replace(&mut self.clients[i].state, State::Done)
             else {
                 continue;
             };
+            // **Unbound before the namespace is let go**: a process the program started shares it.
+            unbind_grants(view_ns, &granted);
             for h in [process, life, view_ns] {
                 close(h);
             }

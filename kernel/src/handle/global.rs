@@ -57,6 +57,17 @@ pub fn init() -> Result<(), HandleError> {
     Ok(())
 }
 
+/// [`init`] for the host tests that reach the global table, once however many ask, after the
+/// entropy it seeds from, as the boot orders them.
+#[cfg(test)]
+pub fn init_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::entropy::key_for_tests();
+        init().expect("the global handle table");
+    });
+}
+
 /// The global handle table. Panics in debug builds if called before [`init`].
 pub fn get() -> &'static HandleTable {
     debug_assert_eq!(GLOBAL.state.load(Ordering::Acquire), READY, "handle::global::get before init",);

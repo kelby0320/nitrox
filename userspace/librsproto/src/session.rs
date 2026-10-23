@@ -209,7 +209,8 @@ impl From<WireError> for DirError {
 
 /// Send one request on `endpoint` and receive its reply into `buf`, returning the reply's
 /// rsproto payload length. Shared by [`Dir`] and [`crate::desktop::Desktop`], so the
-/// send/wait/recv/handle sweep has one copy.
+/// send/wait/recv/handle sweep has one copy. A `buf` shorter than [`IPC_MSG_SIZE`] is refused
+/// `Protocol`: the kernel copies a whole message from it.
 pub fn round_trip(
     endpoint: u64,
     buf: &mut [u8],
@@ -217,6 +218,9 @@ pub fn round_trip(
     op: u16,
     body: &[u8],
 ) -> core::result::Result<usize, WireError> {
+    if buf.len() < IPC_MSG_SIZE {
+        return Err(WireError::Protocol);
+    }
     let region = &mut buf[PAYLOAD_OFF..];
     let rs_len = crate::encode(region, op, request_id, 0, body, 0).ok_or(WireError::Protocol)?;
     buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -300,3 +304,15 @@ pub(crate) fn po_wait(po: u64) -> (i32, u64) {
 
 /// The most entries one `ReadDir` reply can carry — what a caller sizes a per-reply array by.
 pub const MAX_REPLY_ENTRIES: usize = crate::RS_MAX_BODY / DIR_ENTRY_PREFIX_LEN;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Refused before anything is sent: a message one byte short reaches no syscall.
+    #[test]
+    fn a_round_trip_refuses_a_buffer_shorter_than_a_message() {
+        let mut short = [0u8; IPC_MSG_SIZE - 1];
+        assert!(matches!(round_trip(0, &mut short, 1, crate::OP_FILE_READ_DIR, &[]), Err(WireError::Protocol)));
+    }
+}

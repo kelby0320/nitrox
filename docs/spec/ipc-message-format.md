@@ -72,7 +72,8 @@ Offset  Size  Field
         24
 ```
 
-The padding bytes are zeroed by the kernel at message construction.
+The padding bytes are zeroed by the kernel at message construction, and on every send whatever
+the sender's buffer held there.
 
 ### Field semantics
 
@@ -82,17 +83,10 @@ The padding bytes are zeroed by the kernel at message construction.
 
 **`handle_count`** — number of valid handles in `handles[0..handle_count]`. Must be ≤ `IPC_HANDLE_MAX`. Slots beyond `handle_count` are `RawHandle::NULL`.
 
-**`flags`** — bitfield of `IpcMsgFlags`:
-
-```rust
-bitflags! {
-    pub struct IpcMsgFlags: u16 {
-        const URGENT     = 1 << 0;  // hint: deliver before non-urgent (reserved; not initially honored)
-        const REPLY      = 1 << 1;  // this message is a reply to a previous one
-        // bits 2..15 reserved
-    }
-}
-```
+**`flags`** — **the sender's**, carried to the receiver as sent: the kernel defines no bit of it
+and reads none. `libstream` marks the last message of a stream with bit 0. (An `IpcMsgFlags` with
+an `URGENT` hint and a `REPLY` bit was designed here and never built; a reply is told by its
+rsproto header.)
 
 **`timestamp`** — monotonic nanoseconds at the moment the kernel enqueued the message. Set by kernel; cannot be forged.
 

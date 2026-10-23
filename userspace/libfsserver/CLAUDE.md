@@ -50,6 +50,13 @@ servers speak one protocol and a fix to it is a fix to both:
   (FAT's, to zero).
 - **A rename is resolved before the directory-session path**, which infers "directory open" from
   the suffix naming a directory; renaming a directory names one too.
+- **A removed directory's sessions end** (`end_sessions_on`, which `Volume::rmdir_at` is handed
+  and calls before it changes anything, so a removal that then fails ends them too): a session
+  holds a bare id, and each filesystem gives a freed one to the next directory made. Checking the
+  id still names a live directory cannot tell the old one from the new.
+- **A session names entries of its own directory, never `.` or `..`** (`serve::entry_name`, checked
+  in `serve_session` for every op that takes a name): `..` renamed was a way out of a subtree, and
+  each filesystem's own refusals are not the boundary.
 - **`read_meta` is for what only the server writes**: directories, inode tables, bitmaps,
   descriptors, superblocks, extent nodes, the FAT. **Never a file's data**, which the kernel writes
   to the device behind the server's back — a cached copy of it would be stale. A read left as
@@ -65,7 +72,8 @@ servers speak one protocol and a fix to it is a fix to both:
 
 ## Capability discipline
 
-A server receives a read-write block-device handle and a control channel at spawn, and nothing
-else; it hands the kernel a `READ | TRANSFER` duplicate of the device for the Model A data path. It
-never holds `BIND_NAMESPACE`: its supervisor binds its endpoint
-(`docs/rationale/why-supervisor-registration.md`).
+A server receives a block-device handle — `WRITE` only for a read-write mount — and a control
+channel at spawn, and nothing else; it hands the kernel a duplicate of the device for the Model A
+data path, with `READ | TRANSFER` and its own `WRITE`, if it has one. The kernel writes a file
+back only through a device that carries `WRITE`. It never holds `BIND_NAMESPACE`: its supervisor
+binds its endpoint (`docs/rationale/why-supervisor-registration.md`).

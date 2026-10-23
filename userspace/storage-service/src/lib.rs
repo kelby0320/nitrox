@@ -14,12 +14,13 @@ pub mod sources {
     //! `init` records its mounts as namespace bindings, and nothing names the device behind one;
     //! `init.toml` does: every `[[mount]]` is critical-path, so on a running system each one
     //! succeeded, and its source names a partition by one of two schemes.
-    //! - `gpt-partlabel:<label>`: the first partition record whose name is the label, as the
-    //!   kernel binds `/dev/disk/by-partlabel/<label>`.
+    //! - `gpt-partlabel:<label>`: the partition record whose name is the label, chosen as the
+    //!   kernel binds `/dev/disk/by-partlabel/<label>` ([`name_rank`]).
     //! - `gpt-partuuid:<uuid>`: a partition's unique GUID, which the registry does not carry, so it
     //!   is read from the parent disk's table. The kernel publishes partitions in table order,
     //!   skipping unused entries, so the k-th entry in use is the k-th partition record under that
-    //!   disk; its name and size confirm it, and it is unmatched if they differ.
+    //!   disk; its name and size confirm it, and it is unmatched if they differ. Two disks
+    //!   carrying it are chosen between as for a label.
     //!
     //! **A live boot is one whose root is on a RAM disk**, which makes the machine's own disks the
     //! install target: an internal disk is auto-mounted read-only there (a removable one writable).
@@ -83,18 +84,30 @@ pub mod sources {
             if label.is_empty() {
                 return None;
             }
-            return partitions().find(|r| r.name() == label.as_bytes()).map(|r| r.id);
+            let named = partitions().filter(|r| r.name() == label.as_bytes());
+            return named
+                .filter_map(|r| Some((name_rank(records, r.parent)?, r.id)))
+                .min_by_key(|&(k, _)| k)
+                .map(|(_, id)| id);
         }
         let uuid = source.strip_prefix("gpt-partuuid:")?;
-        for t in tables {
-            let Some(k) = t.entries.iter().position(|e| partuuid(&e.guid) == uuid) else {
-                continue;
-            };
-            let entry = &t.entries[k];
-            let part = partitions().filter(|r| r.parent == t.disk).nth(k)?;
-            return (part.name() == entry.name.as_slice() && part.block_count == entry.blocks).then_some(part.id);
+        let carrying = |t: &DiskTable| t.entries.iter().position(|e| partuuid(&e.guid) == uuid);
+        let found = tables.iter().filter_map(|t| Some((name_rank(records, t.disk)?, t, carrying(t)?)));
+        let (_, t, k) = found.min_by_key(|&(rank, ..)| rank)?;
+        let entry = &t.entries[k];
+        let part = partitions().filter(|r| r.parent == t.disk).nth(k)?;
+        (part.name() == entry.name.as_slice() && part.block_count == entry.blocks).then_some(part.id)
+    }
+
+    /// **Whose partitions the kernel names first** (`gpt::bind_order`): `0` the boot medium's, the
+    /// disk started from or a RAM disk, `1` another disk's, `None` a USB disk's, which it never
+    /// names. A name two carry is the lowest's, and among equals the first published's.
+    pub fn name_rank(records: &[DeviceRecord], disk: u32) -> Option<u8> {
+        let d = records.iter().find(|r| r.id == disk)?;
+        match d.driver() == crate::mounts::USB_STORAGE {
+            true => None,
+            false => Some(u8::from(!(d.is_boot_medium() || d.kind() == DeviceKind::RamDisk))),
         }
-        None
     }
 
     /// A GUID in the form the kernel names `/dev/disk/by-partuuid/<uuid>` with: lowercase, the

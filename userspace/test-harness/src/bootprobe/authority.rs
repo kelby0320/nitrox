@@ -85,6 +85,87 @@ pub(super) fn clock_set_refused_test() -> bool {
     true
 }
 
+/// **Every mapping needs `MAP_READ`**, since a mapped page reads whatever bits were asked: a
+/// handle without it, mapped asking for none, is refused `NoAccess`; with it, mapped.
+pub(super) fn map_needs_read_test() -> bool {
+    use libkern::{KError, RIGHT_INSPECT};
+    // SAFETY: register-only syscall; it creates an object and touches no memory of ours.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if mem <= 0 {
+        Line::new().s(b"boot-probe: map FAIL: no memory object").end();
+        return false;
+    }
+    // SAFETY: register-only syscall on a handle this process holds.
+    let blind = unsafe { syscall2(SYS_HANDLE_DUPLICATE, mem as u64, RIGHT_INSPECT | RIGHT_TRANSFER) };
+    if blind <= 0 {
+        close(mem as u64);
+        Line::new().s(b"boot-probe: map FAIL: no handle without MAP_READ").end();
+        return false;
+    }
+    // SAFETY: register-only syscalls on handles this process holds; nothing is read through them.
+    let (refused, mapped) = unsafe {
+        (
+            syscall4(SYS_MEMORY_MAP, blind as u64, 0, PAGE, 0),
+            syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ),
+        )
+    };
+    if mapped > 0 {
+        // SAFETY: unmapping the page this call mapped.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, mapped as u64, PAGE) };
+    }
+    if refused > 0 {
+        // SAFETY: as above.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, refused as u64, PAGE) };
+    }
+    close(blind as u64);
+    close(mem as u64);
+    if refused != KError::NoAccess.as_i32() as i64 {
+        Line::new().s(b"boot-probe: map FAIL: a handle without MAP_READ was mapped").end();
+        return false;
+    }
+    if mapped <= 0 {
+        Line::new().s(b"boot-probe: map FAIL: a handle with MAP_READ was not mapped").end();
+        return false;
+    }
+    kprint(b"boot-probe: every mapping needs MAP_READ ok\n");
+    true
+}
+
+/// **A message carries nothing past its payload**: the kernel zeroes the rest, so a buffer a
+/// sender reuses cannot hand the receiver its stale bytes, a typed password among them.
+pub(super) fn payload_sealed_test() -> bool {
+    use libkern::{IPC_PAYLOAD_SIZE, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND};
+    let (mut a, mut b) = (0u64, 0u64);
+    // SAFETY: valid writable out-params.
+    if unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, 4, 0) } != 0 {
+        Line::new().s(b"boot-probe: payload FAIL: no channel").end();
+        return false;
+    }
+    let mut msg = [0xA5u8; 4096];
+    msg[..24].fill(0);
+    msg[4..8].copy_from_slice(&4u32.to_le_bytes());
+    // SAFETY: a valid message buffer; no handles.
+    let sent = unsafe { syscall5(SYS_CHANNEL_SEND, a, msg.as_ptr() as u64, 0, 0, SENDMODE_NOBLOCK) } == 0;
+    let (mut got, mut hs, mut count) = ([0u8; 4096], [0u64; 8], 0usize);
+    // SAFETY: valid receive buffers.
+    let rr = unsafe {
+        syscall4(SYS_CHANNEL_RECV, b, got.as_mut_ptr() as u64, hs.as_mut_ptr() as u64, (&raw mut count) as u64)
+    };
+    close(a);
+    close(b);
+    let payload = &got[24..24 + IPC_PAYLOAD_SIZE];
+    if !sent || rr != 0 || payload[..4] != [0xA5; 4] {
+        Line::new().s(b"boot-probe: payload FAIL: the message did not arrive whole").end();
+        return false;
+    }
+    if payload[4..].iter().any(|&x| x != 0) {
+        Line::new().s(b"boot-probe: payload FAIL: bytes past the payload reached the receiver").end();
+        return false;
+    }
+    kprint(b"boot-probe: a message carries nothing past its payload ok\n");
+    true
+}
+
 /// **A spawn copies a handle to the child only with `DUPLICATE`**: a grant in duplicate mode
 /// leaves the parent its handle and gives the child another, so without the right it is refused
 /// `NoAccess`, as `sys_handle_duplicate` refuses. The same handle moved is taken.

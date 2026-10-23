@@ -11,6 +11,7 @@
 //! The request→reply logic is the host-tested [`crate::serve`]; this module is the syscall
 //! plumbing, **alloc-free**: fixed `.bss` buffers, one set per process.
 
+use crate::serve::entry_name;
 use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve, serve_grown};
 use crate::{DirEntry, FsError, Refusal, Volume};
 use libkern::*;
@@ -547,6 +548,17 @@ fn free_session_at(slot: usize) {
     }
 }
 
+/// **End every session on directory `id`**, just removed: a session keeps a bare id, which the
+/// filesystem may give the next directory made, and the session would then reach into that one.
+fn end_sessions_on(id: u64) {
+    for slot in 0..MAX_SESSIONS {
+        // SAFETY: single-threaded; `slot < MAX_SESSIONS`.
+        if unsafe { SESSION_CH[slot] != 0 && SESSION_DIR[slot] == id } {
+            free_session_at(slot);
+        }
+    }
+}
+
 fn reply_resolve_error(serve_end: u64, request_id: u64, kerror: i32) {
     reply_resolve_error_why(serve_end, request_id, kerror, b"");
 }
@@ -659,7 +671,7 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
             }
             // Each names an entry in the bound directory, so a handle can never mutate outside it.
             OP_FILE_MKDIR | OP_FILE_UNLINK | OP_FILE_RMDIR | OP_FILE_TOUCH => {
-                let r = match parse_name_request(body) {
+                let r = match parse_name_request(body).filter(|n| entry_name(n)) {
                     Some(name) => match op {
                         OP_FILE_MKDIR => vol.mkdir_at(dir, name, now_secs()),
                         // The last name's removal frees the file only once the kernel has
@@ -669,7 +681,7 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
                                 forget_then_release(vol, serve_end, id);
                             }
                         }),
-                        OP_FILE_RMDIR => vol.rmdir_at(dir, name, now_secs()),
+                        OP_FILE_RMDIR => vol.rmdir_at(dir, name, now_secs(), end_sessions_on),
                         _ => vol.touch_at(dir, name, now_secs()),
                     },
                     None => Err(FsError::Unsupported),
@@ -678,8 +690,8 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
             }
             OP_FILE_RENAME => {
                 let r = match parse_rename_request(body) {
-                    Some((old, new)) => vol.rename_at(dir, old, new, now_secs()),
-                    None => Err(FsError::Unsupported),
+                    Some((old, new)) if entry_name(old) && entry_name(new) => vol.rename_at(dir, old, new, now_secs()),
+                    _ => Err(FsError::Unsupported),
                 };
                 reply_session_status(session_ch, request_id, op, r);
             }
@@ -970,8 +982,8 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
             }
         },
         Served::LazyBlocks { reply_len } => {
-            // SAFETY: `device` is our block-device handle (READ | TRANSFER | DUPLICATE).
-            let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, device, RIGHT_READ | RIGHT_TRANSFER) };
+            // SAFETY: our device handle, holding DUPLICATE. The copy has WRITE only if ours does.
+            let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, device, RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER) };
             if dup < 0 {
                 // The device cannot be shared: degrade to an error reply.
                 // SAFETY: disjoint static; reply region as above.

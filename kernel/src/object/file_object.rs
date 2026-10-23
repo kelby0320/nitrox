@@ -83,6 +83,8 @@ pub enum CacheInError {
     OutOfMemory,
     /// The reply's block size is not the one the cached object for its file was made with.
     BlockSizeChanged,
+    /// The reply's device is not the one the cached object for its file reads and writes back.
+    DeviceChanged,
 }
 
 /// Fill state of a cached page.
@@ -349,6 +351,16 @@ impl FileObject {
         }
     }
 
+    /// Whether both are block files over one device object.
+    fn same_device(&self, other: &FileObject) -> bool {
+        match (&self.producer, &other.producer) {
+            (Producer::FsServerBlocks { device: a, .. }, Producer::FsServerBlocks { device: b, .. }) => {
+                a.as_ptr() == b.as_ptr()
+            }
+            _ => false,
+        }
+    }
+
     /// The id this object is cached under in its registration, if it is cached.
     pub fn file_id(&self) -> Option<u64> {
         match &self.producer {
@@ -460,9 +472,9 @@ impl FileObject {
     /// resolve of one file gets one object.
     ///
     /// The candidate drops outside the cache's lock, since its `Drop` takes it. `Err` on
-    /// allocation failure, with nothing entered or resized; and for a reply whose block size is
-    /// not the cached object's (a producer's is fixed, and the reply's runs were checked only
-    /// against its own), with nothing resized.
+    /// allocation failure, with nothing entered or resized; and for a reply whose block size or
+    /// device is not the cached object's, with nothing resized: the reply's runs were checked
+    /// against its own block size, and its rights were decided by its own device.
     pub fn cache_in(reg: &ObjectRef, candidate: ObjectRef) -> Result<ObjectRef, CacheInError> {
         debug_assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
         debug_assert_eq!(candidate.object_type(), KObjectType::FileObject);
@@ -479,6 +491,10 @@ impl FileObject {
                 if ex.block_size() != cand.block_size() {
                     drop(candidate);
                     return Err(CacheInError::BlockSizeChanged);
+                }
+                if !ex.same_device(cand) {
+                    drop(candidate);
+                    return Err(CacheInError::DeviceChanged);
                 }
                 // **Its own statement**: a guard made inside `resize`'s argument list lives to the
                 // end of the call, and `resize` takes the other object's lock — nested page-cache
@@ -1463,10 +1479,17 @@ mod tests {
         candidate_in(reg, id, size, 4096)
     }
 
+    std::thread_local! {
+        /// The test's server's device: one, as a server has, since a cached file refuses another.
+        static DEVICE: ObjectRef = {
+            let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
+            // SAFETY: `into_raw` yields the single creation reference; adopt it.
+            unsafe { ObjectRef::from_raw(KBox::into_raw(dev).as_ptr() as *mut (), KObjectType::DeviceNode) }
+        };
+    }
+
     fn candidate_in(reg: &ObjectRef, id: u64, size: usize, block_size: u32) -> ObjectRef {
-        let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let device = unsafe { ObjectRef::from_raw(KBox::into_raw(dev).as_ptr() as *mut (), KObjectType::DeviceNode) };
+        let device = DEVICE.with(ObjectRef::clone);
         let f =
             FileObject::try_new(size, Producer::FsServerBlocks { device, block_size, reg: reg.clone(), file_id: id })
                 .unwrap();

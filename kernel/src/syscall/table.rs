@@ -19,11 +19,11 @@ use crate::rsproto::SizeChange;
 pub enum ResolveOp {
     /// A plain lookup.
     Plain,
-    /// Change the file's size first (`sys_file_create` / `_grow` / `_truncate`).
-    Size(u32, SizeChange),
+    /// Change the file's size first (`sys_file_create` / `_grow` / `_truncate`), as passed.
+    Size(u64, SizeChange),
     /// Rename the resolved path to `dest_ptr`/`dest_len` (`sys_file_rename`). Both paths must
     /// resolve through the **same binding**, so a server never sees a cross-filesystem rename.
-    Rename { dest_ptr: u64, dest_len: usize, flags: u16 },
+    Rename { dest_ptr: u64, dest_len: usize, flags: u64 },
 }
 use crate::arch::RegisterValues;
 use crate::arch::registers::ArchRegisters;
@@ -248,20 +248,16 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_POWER => encode(sys_power(a0, a1)),
         SYS_CLOCK_SET => encode(sys_clock_set(a0, a1)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
-        SYS_FILE_GROW => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow))),
-        SYS_FILE_CREATE => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Create)))
-        }
+        SYS_FILE_GROW => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4, SizeChange::Grow))),
+        SYS_FILE_CREATE => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4, SizeChange::Create))),
         SYS_FILE_RENAME => encode(sys_ns_lookup(
             a0,
             a1,
             a2 as usize,
             crate::libkern::handle::Rights::MAP_READ.bits(),
-            ResolveOp::Rename { dest_ptr: a3, dest_len: a4 as usize, flags: a5 as u16 },
+            ResolveOp::Rename { dest_ptr: a3, dest_len: a4 as usize, flags: a5 },
         )),
-        SYS_FILE_TRUNCATE => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Truncate)))
-        }
+        SYS_FILE_TRUNCATE => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4, SizeChange::Truncate))),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2)),
@@ -818,6 +814,18 @@ fn map_mem_map_err(e: MapError) -> KError {
     }
 }
 
+/// The status a forwarded reply completes with, once its handle is in client `pid`'s table. A
+/// client that exited before its reply has had its handles swept, or will: the exit marks it
+/// before the sweep, and both take the table's lock, so after the allocation one of the two sees
+/// the other. Closed here, the handle is not left in a table nothing will close.
+fn deliver_to_client(pid: u32, status: i32, handle: u64) -> i32 {
+    if status != 0 || handle == 0 || crate::sched::pid_has_threads(pid) {
+        return status;
+    }
+    close_and_release(RawHandle(handle), pid);
+    KError::PeerClosed as i32
+}
+
 /// Spawn copies an image into one allocation, so one larger than [`MAX_IMAGE_BYTES`] is refused
 /// `TooLarge`: no retry would help, where `OutOfMemory` says one might.
 fn image_fits(len: usize) -> Result<(), KError> {
@@ -868,8 +876,8 @@ pub fn sys_memory_create(size: u64, flags: u64) -> SysResult {
 /// otherwise `hint` is the requested page-aligned base. Returns the mapped base address.
 pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResult {
     let req = Rights::from_bits_truncate(rights);
-    // The handle must carry the `MAP_*` bits being installed; amplification is `NoAccess`.
-    let required = req & (Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC);
+    // The handle must carry the `MAP_*` bits installed, and `MAP_READ` always: every mapping reads.
+    let required = (req & (Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC)) | Rights::MAP_READ;
 
     let pid = crate::sched::current_owner_pid();
     let proc_ref = crate::sched::current_process().ok_or(KError::KernelError)?;
@@ -1365,6 +1373,7 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
 /// failures (no covering binding, or a non-empty suffix on a direct-handle leaf) arrive
 /// **through** the PO.
 pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64, op: ResolveOp) -> SysResult {
+    let fwd = op.forward_op()?;
     let pid = crate::sched::current_owner_pid();
     let requested = Rights::from_bits_truncate(rights_bits);
     let ns_ok = lookup_typed(ns_h, pid, Rights::LOOKUP, KObjectType::Namespace)?;
@@ -1399,7 +1408,7 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
 
     // SAFETY: live `Namespace` (type verified by `lookup_typed`).
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
-    if let Some((status, result)) = resolve_and_start(ns, path, dest, op.forward_op(), requested, pid, &po_ref, 0) {
+    if let Some((status, result)) = resolve_and_start(ns, path, dest, fwd, requested, pid, &po_ref, 0) {
         // SAFETY: `po_ref` pins the `PendingOperation` at `po_ptr`.
         unsafe { crate::sched::complete_pending_op(po_ptr, status, result) };
     }
@@ -1407,12 +1416,18 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
 }
 
 impl ResolveOp {
-    fn forward_op(self) -> ForwardOp {
-        match self {
+    /// The request the wire carries, or the refusal of a size or flags it cannot: a size past
+    /// `u32::MAX` is `TooLarge`, not that size modulo 2^32.
+    fn forward_op(self) -> Result<ForwardOp, KError> {
+        Ok(match self {
             ResolveOp::Plain => ForwardOp::Plain,
-            ResolveOp::Size(size, change) => ForwardOp::Size(size, change),
-            ResolveOp::Rename { flags, .. } => ForwardOp::Rename { flags },
-        }
+            ResolveOp::Size(size, change) => {
+                ForwardOp::Size(u32::try_from(size).map_err(|_| KError::TooLarge)?, change)
+            }
+            ResolveOp::Rename { flags, .. } => {
+                ForwardOp::Rename { flags: u16::try_from(flags).map_err(|_| KError::InvalidArgument)? }
+            }
+        })
     }
 }
 
@@ -1919,7 +1934,7 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
 ///   `BlockBounded` completes the PO `TimedOut` (reclaiming the message) if undelivered by
 ///   `deadline` (absolute monotonic ns); `deadline` is ignored for `NoBlock`/`Block`.
 pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, deadline: u64) -> SysResult {
-    let send_mode = match SendMode::from_u32(mode as u32) {
+    let send_mode = match u32::try_from(mode).ok().and_then(SendMode::from_u32) {
         Some(m) => m,
         None => return Err(KError::InvalidArgument),
     };
@@ -1958,9 +1973,7 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
     // in place — a stack temporary here would be 4 KiB on every send.
     let mut bounce = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
     copy_slice_from_user(bounce.as_bytes_mut(), mptr).map_err(from_user_access)?;
-    if bounce.header.payload_len as usize > IPC_PAYLOAD_SIZE {
-        return Err(KError::InvalidArgument);
-    }
+    bounce.seal().ok_or(KError::InvalidArgument)?;
     bounce.header.sender_pid = pid;
     bounce.header.timestamp = Timer::read_ns();
     bounce.header.handle_count = count as u8;
@@ -2183,7 +2196,6 @@ fn complete_resolve_reply(
                         Ok(h) => (0, h.bits()),
                         Err(e) => {
                             // SAFETY: `allocate` did not adopt the reference; reclaim it.
-                            // (A dead caller pid takes this path — fails cleanly.)
                             drop(unsafe { ObjectRef::from_raw(op, ot) });
                             (map_handle_err(e) as i32, 0)
                         }
@@ -2194,6 +2206,7 @@ fn complete_resolve_reply(
     };
 
     if let Some((status, result)) = outcome {
+        let status = deliver_to_client(pl.owner_pid, status, result);
         // SAFETY: `pl` owns the lookup's `PendingOperation` reference.
         unsafe { crate::sched::complete_pending_op(pl.po.as_ptr(), status, result) };
     }
@@ -2410,10 +2423,11 @@ fn build_and_install_file_blocks(
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> (i32, u64) {
     use crate::object::FileObject;
-    use crate::rsproto::{FILE_BLOCKS_READ_ONLY, reply_body};
+    use crate::object::file_object::CacheInError;
+    use crate::rsproto::{file_blocks_rights, reply_body};
 
-    let device = match transfers[0].take() {
-        Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => tr.obj,
+    let (device, device_rights) = match transfers[0].take() {
+        Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => (tr.obj, tr.rights),
         Some(tr) => {
             drop(tr.obj);
             return (KError::Unsupported as i32, 0);
@@ -2426,6 +2440,9 @@ fn build_and_install_file_blocks(
     let (header, runs) = match block_map(body) {
         Ok(m) => m,
         Err(e) => return (e as i32, 0),
+    };
+    let Some(rights) = file_blocks_rights(pl.requested, header.flags, device_rights) else {
+        return (KError::NoAccess as i32, 0);
     };
 
     let reg_ref = reg.clone();
@@ -2441,8 +2458,8 @@ fn build_and_install_file_blocks(
     } else {
         match FileObject::cache_in(&reg_ref, candidate) {
             Ok(f) => f,
-            Err(crate::object::file_object::CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, 0),
-            Err(crate::object::file_object::CacheInError::BlockSizeChanged) => {
+            Err(CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, 0),
+            Err(CacheInError::BlockSizeChanged | CacheInError::DeviceChanged) => {
                 return (KError::KernelError as i32, 0);
             }
         }
@@ -2450,11 +2467,6 @@ fn build_and_install_file_blocks(
     drop(reg_ref);
 
     let (op, ot) = fref.into_raw();
-    // `INSPECT` as above. A read-only mount's file is never writable, whatever was asked for.
-    let mut rights = pl.requested | Rights::INSPECT;
-    if header.flags & FILE_BLOCKS_READ_ONLY != 0 {
-        rights = rights.difference(Rights::MAP_WRITE);
-    }
     match global::get().allocate(pl.owner_pid, op, ot, rights) {
         Ok(h) => (0, h.bits()),
         Err(e) => {

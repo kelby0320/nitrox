@@ -590,3 +590,18 @@ fn mapping_an_aperture_object_selects_the_write_combining_entry() {
     assert_eq!(index(PAGE * 8), Some(0), "ordinary memory's");
     assert_eq!(index(PAGE * 16), None, "nothing is mapped there");
 }
+
+#[test]
+fn a_page_is_writable_executable_and_user_only_as_its_protection_says() {
+    use crate::arch::paging::PageFlags;
+    let f = |p| page_flags_for(p, Caching::Normal);
+    let user = Protection::USER;
+    for (prot, write, exec) in
+        [(user, false, false), (user | Protection::WRITE, true, false), (user | Protection::EXEC, false, true)]
+    {
+        assert_eq!(f(prot).contains(PageFlags::WRITABLE), write, "{prot:?}");
+        assert_eq!(!f(prot).contains(PageFlags::NO_EXECUTE), exec, "{prot:?}");
+        assert!(f(prot).contains(PageFlags::USER));
+    }
+    assert!(!f(Protection::WRITE).contains(PageFlags::USER), "a kernel mapping");
+}

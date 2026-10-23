@@ -54,6 +54,13 @@ pub(super) fn has_live_siblings(g: &SchedState, my_pid: u32) -> bool {
         || g.current.iter().flatten().any(same)
 }
 
+/// Whether process `pid` still has a thread the scheduler holds live. Once it has none its
+/// handles are swept, or about to be, so a handle installed for it after the sweep is closed by
+/// nothing: whoever installs one for another process checks this after allocating.
+pub fn pid_has_threads(pid: u32) -> bool {
+    has_live_siblings(&SCHED.lock(), pid)
+}
+
 /// Reap every thread of process `my_pid` parked in `list`, first unregistering it from its
 /// wait objects and the deadline heap so nothing dangles at a reaped thread: one woken but not
 /// yet run is in a `ready` queue still registered wherever it waited.

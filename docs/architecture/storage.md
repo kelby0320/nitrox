@@ -144,13 +144,19 @@ FAT32 as sold, an MBR and a partition, and nothing requires the older shapes Lin
 `init.toml`: every `[[mount]]` is critical-path, so on a running system each one succeeded. Its
 source names a partition by one of the two schemes `init` accepts
 ([`init-toml-schema.md`](../spec/init-toml-schema.md)):
-- **`gpt-partlabel:<label>`** is the first partition record with that name, as the kernel binds
-  `/dev/disk/by-partlabel/<label>` to the first partition published with it.
+- **`gpt-partlabel:<label>`** is the partition record with that name that the kernel binds
+  `/dev/disk/by-partlabel/<label>` to (`sources::name_rank`). That is the boot medium's if it
+  carries it, the boot medium being the disk the machine started from or a RAM disk; otherwise
+  the first published. A disk behind USB mass storage is never considered: the kernel names none
+  of its partitions. Matching only the first published would take a SATA partition that copies
+  the live root's label for `init`'s root, call the boot an installed one, and mount the real
+  root again.
 - **`gpt-partuuid:<uuid>`** is read from the parent disk's own table, since the registry does not
   carry a partition's GUID. The kernel publishes a disk's partitions in table order, skipping unused
   entries, so the k-th entry in use is the k-th partition record under that disk. Its name and size
   confirm the match, and a position they contradict is no match. The UUID is compared in the form
-  the kernel names the path with, exactly, as `init`'s lookup is.
+  the kernel names the path with, exactly, as `init`'s lookup is. Two disks carrying it are chosen
+  between as for a label.
 
 **`init`'s mounts stay `init`'s**: reported, never mounted again, never unmounted by this service.
 `init` unmounts them itself at a shutdown (Part E.4a).

@@ -74,6 +74,11 @@ Request: a session id, 8 bytes. Reply: empty.
 The broker asks every program it started for the session to stop (`sys_process_terminate` — a
 request), unbinds their grants, closes the session's policy and accounts channels, and answers
 nothing further under the session's bases. Closing a session that is not open is not an error.
+**Every binding a grant made goes**, the broker's own `/dev/log` snapshot included, while a
+`/dev/log` the caller already had stays. A program that ignores the request, and every process
+sharing its namespace, then resolves nothing new through any of them. **A copy of the view is
+beyond the broker's reach**: one made with `sys_ns_derive` — a `with` run inside the view makes
+one — keeps every binding it was made with, until its processes exit (`TODO(forcible-kill)`).
 
 ### `Request` (`0x0E02`) — client
 
@@ -123,7 +128,10 @@ A channel carries one request.
 ### `Password` (`0x0E03`) — client
 
 Request: the password's bytes. Reply: `Started`, or `Denied` with `retry` set while the request
-has failures left. **The broker holds the check** until the session's delay from its last failure
+has failures left. **A right password is not the decision**. The policy is read and decided again
+then, since a password can come long after its request. The program starts only if the policy
+still allows it with the same grants. Otherwise the reply is `Denied`, without `retry`, with the
+reason: the rule gone, or the view's grants changed, and the person asks again. **The broker holds the check** until the session's delay from its last failure
 has passed — on whichever request that failure was, **and whenever the check arrived**: passwords
 waiting on several requests are checked oldest first, one at a time, and a failure holds the rest
 (`view_broker::pacing::Held`). So a session makes at most one guess per delay however many
@@ -135,7 +143,9 @@ session's and the cap the request's.
 ### `Exited` (`0x0E04`) — broker → client
 
 **Unsolicited, `request_id` 0.** Body: the exit code (i32) and a crashed flag (1 byte), 5 bytes.
-Sent when the program exits.
+Sent when the program exits, **after the view's grants are unbound**. A process the program started
+on its own namespace outlives it, and then resolves nothing new through them; one started on a
+copy keeps them, as at `CloseSession`.
 
 The code is matched to the program by **which program's life channel closed** — a handle the
 program never learns of, moved to it at spawn — and taken from the notification queue in arrival

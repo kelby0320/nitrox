@@ -220,13 +220,36 @@ fn a_guid_is_formatted_as_the_kernel_names_it() {
 fn a_label_source_is_the_first_partition_with_that_name() {
     let mut records = release_records();
     records.insert(0, rec(2, DeviceKind::Disk, 9, NO_PARENT, "nitrox-root", 1)); // a disk, not a partition
-    records.push(rec(9, DeviceKind::Partition, 5, 5, "nitrox-root", 1)); // published later
+    records.push(rec(9, DeviceKind::Partition, 5, 3, "nitrox-root", 1)); // published later
     let tables = release_tables();
     assert_eq!(source_device("gpt-partlabel:nitrox-root", &records, &tables), Some(7));
     assert_eq!(source_device("gpt-partlabel:ESP", &records, &tables), Some(6));
     assert_eq!(source_device("gpt-partlabel:nothing", &records, &tables), None);
     assert_eq!(source_device("gpt-partlabel:", &records, &tables), None);
     assert_eq!(source_device("device-path:/dev/blk/3", &records, &tables), None, "not a scheme init accepts");
+}
+
+/// As the kernel binds a name two partitions carry: the boot medium's, whichever was published
+/// first, and never a USB disk's. A SATA partition carrying the live root's label is not the root.
+#[test]
+fn a_name_two_partitions_carry_is_the_boot_mediums() {
+    let mut records = release_records();
+    records[3] = rec(7, DeviceKind::Partition, 3, 3, "nitrox-live", 196_541);
+    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records, &[]), Some(8), "the RAM disk's, published after");
+    records[1] = rec(5, DeviceKind::Disk, 1, NO_PARENT, "root.img", 131_072);
+    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records, &[]), Some(7), "neither on it: the first");
+    records[1].flags = libkern::device::BOOT;
+    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records, &[]), Some(8), "the disk started from");
+    records[1].driver[..crate::mounts::USB_STORAGE.len()].copy_from_slice(crate::mounts::USB_STORAGE);
+    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records, &[]), Some(7), "a stick's is named nothing");
+
+    let tables = release_tables();
+    let mut copied = release_tables();
+    let ram_root = copied[1].entries[0].guid;
+    copied[0].entries[1].guid = ram_root;
+    let uuid = std::format!("gpt-partuuid:{}", partuuid(&ram_root));
+    assert_eq!(source_device(&uuid, &release_records(), &tables), Some(8));
+    assert_eq!(source_device(&uuid, &release_records(), &copied), Some(8), "the SATA root copying its GUID");
 }
 
 #[test]

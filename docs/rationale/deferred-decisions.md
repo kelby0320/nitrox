@@ -1271,10 +1271,25 @@ listen.
 
 **The view broker is the first place it costs something** (administration Part A, 2026-09-23).
 When a session ends, the broker asks every program it started for that session to exit and
-unbinds their grants, so nothing *new* can be resolved through them — but a program that ignores
+unbinds their grants, as it does when a program exits, so nothing *new* can be resolved through
+them by it or by any process sharing its namespace — but a program that ignores
 the request keeps running with whatever it had already resolved, since the kernel has no
 revocation either. An elevated program can therefore outlive the login that started it. The
 maintainer took "asked, not forced" for Part A over building a kill inside it.
+
+**A copy of the view keeps its grants** (found by the review of Part D's group B fixes,
+2026-10-22). `sys_ns_derive` needs only `LOOKUP`, which every program has on its own root, and its
+copy is a snapshot (`derive_is_a_snapshot_in_both_directions`): a child started on one resolves
+through every grant after the broker unbinds them from the view. `with` run inside a view makes
+such a copy for the broker to build the next view in, so a program started that way keeps the
+outer view's grants after the outer program exits, or its session closes. The unbind cannot reach
+a copy; a kill, or a revocation the kernel does not have, can.
+
+**When it is built, a program that should keep running must be able to ask** (the maintainer,
+2026-10-22): outliving a session is something a person may want, as `nohup` gives, so a kill at
+a session's end cannot be unconditional. **Authority ends with the session unless keeping it was
+asked for**: an explicit request the policy allows per rule, and the broker records, not the
+default.
 
 **Trigger: the first program that must not outlive its session** — anything granted authority a
 lingering copy could misuse without a person present. Building it means tearing down another

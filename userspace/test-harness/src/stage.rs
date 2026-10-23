@@ -1,8 +1,9 @@
 //! `test-stage` — a worker `parent` spawns. With a setup message pending (`arg0` marks it) it
 //! dispatches on `argv[0]`: `"stage <rows>"` verifies a TSM1 stream on stdin, `"fp <seed>"` runs
-//! the hard-float worker ([`run_fp_worker`]). With `arg0 == 0` it exits at once: the exit-storm
-//! child, whose payload is the process teardown (kernel-stack free, TLB shootdown, reap) racing
-//! across CPUs.
+//! the hard-float worker ([`run_fp_worker`]), `"test-stage grants"`, as a view broker starts it,
+//! reports what a view's grants still reach ([`run_grants`]). With `arg0 == 0` it exits at once:
+//! the exit-storm child, whose payload is the process teardown (kernel-stack free, TLB shootdown,
+//! reap) racing across CPUs.
 
 #![no_std]
 #![no_main]
@@ -261,6 +262,8 @@ fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             let seed = setup.argv.get(1).and_then(|s| parse_u64(s)).unwrap_or(0);
             run_fp_worker(seed);
         }
+        // A view broker names the program first, as a shell does.
+        Some("test-stage") if setup.argv.get(1).is_some_and(|a| a == "grants") => run_grants(&setup, ns),
         _ => {
             kprint(b"test-stage: unknown argv[0]\n");
             exit(1);
@@ -327,12 +330,154 @@ fn run_stage_consumer(setup: &libstream::setup::Setup) -> ! {
     exit(0);
 }
 
+/// `arg0` of the child [`run_grants`] leaves behind: no setup message, its channel in `rdx`.
+const GRANTS_CHILD: u64 = 0x4752_0000;
+
+/// Where a view's grants bind, bit `i` each in what [`grants_resolved`] reports; bit 7 stands for
+/// any `/dev/blk/<n>`, which the `disks` grant binds.
+const GRANT_PATHS: [&[u8]; 7] = [
+    b"/dev/storage/admin",
+    b"/dev/services/admin",
+    b"/dev/power",
+    b"/dev/logs",
+    b"/dev/policy",
+    b"/dev/accounts",
+    b"/dev/log",
+];
+
+/// Which of a view's grants resolve in `ns`, as bits of [`GRANT_PATHS`].
+fn grants_resolved(ns: u64) -> u8 {
+    use libkern::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_READ, RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
+    let rights = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_MAP_READ | RIGHT_READ | RIGHT_INSPECT;
+    let found = |path: &[u8]| match libfs::lookup_wait(ns, path, rights) {
+        (0, h) => {
+            // SAFETY: closing a handle the lookup gave this process.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+            true
+        }
+        _ => false,
+    };
+    let mut mask = 0;
+    for (i, path) in GRANT_PATHS.iter().enumerate() {
+        if found(path) {
+            mask |= 1 << i;
+        }
+    }
+    if (0..16).any(|n| found(alloc::format!("/dev/blk/{n}").as_bytes())) {
+        mask |= 1 << 7;
+    }
+    mask
+}
+
+/// Send one rsproto message with `op` and `body` on `ch`, moving `handles`.
+fn rs_send(ch: u64, op: u16, body: &[u8], handles: &[u64]) -> bool {
+    let mut msg = [0u8; libkern::abi::IPC_MSG_SIZE]; // the kernel copies a whole message
+    let Some(n) = librsproto::encode(&mut msg[24..], op, 1, 0, body, handles.len() as u16) else {
+        return false;
+    };
+    msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+    msg[8] = handles.len() as u8;
+    // SAFETY: a valid message buffer and handle array.
+    let sr = unsafe {
+        libkern::syscall5(
+            libkern::SYS_CHANNEL_SEND,
+            ch,
+            msg.as_ptr() as u64,
+            handles.as_ptr() as u64,
+            handles.len() as u64,
+            libkern::SENDMODE_NOBLOCK,
+        )
+    };
+    sr == 0
+}
+
+/// The next rsproto message's op on `ch`, waiting for it; `None` once the peer has gone.
+fn rs_recv(ch: u64) -> Option<u16> {
+    let mut buf = [0u8; 4096];
+    let mut hs = [0u64; 8];
+    loop {
+        let mut count = 0usize;
+        // SAFETY: valid receive out-params.
+        let rr = unsafe {
+            syscall4(
+                libkern::SYS_CHANNEL_RECV,
+                ch,
+                buf.as_mut_ptr() as u64,
+                hs.as_mut_ptr() as u64,
+                (&raw mut count) as u64,
+            )
+        };
+        if rr == 0 {
+            let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+            return librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok().map(|m| m.op);
+        }
+        if rr == libkern::KError::PeerClosed.as_i32() as i64 {
+            return None;
+        }
+        let waited = [ch];
+        let mut results = [0u64; 8];
+        // SAFETY: one handle to wait on and room for its result; no deadline.
+        unsafe { syscall4(SYS_WAIT, waited.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+    }
+}
+
+/// The `"grants"` role, run in a view by `boot-probe`, **never reading its notifications**, so a
+/// request to stop goes unheeded. Each message on stdin is answered on stdout: op 1 with the
+/// grants that resolve here ([`grants_resolved`]); op 2 by leaving a child on this namespace,
+/// handing over a channel to it, and exiting.
+fn run_grants(setup: &libstream::setup::Setup, ns: u64) -> ! {
+    let (Some(stdin), Some(stdout)) = (setup.streams.stdin, setup.streams.stdout) else {
+        exit(1);
+    };
+    while let Some(op) = rs_recv(stdin) {
+        if op == 1 {
+            rs_send(stdout, 1, &[grants_resolved(ns)], &[]);
+            continue;
+        }
+        let (mut mine, mut its) = (0u64, 0u64);
+        // SAFETY: valid writable out-params.
+        let made =
+            unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut mine) as u64, (&raw mut its) as u64, 4, 0) } == 0;
+        let (st, image) = libfs::lookup_wait(ns, b"/bin/test-stage", libkern::RIGHT_MAP_READ);
+        if !made || st != 0 {
+            exit(1);
+        }
+        let mut args = libkern::SpawnArgs {
+            image,
+            handle_count: 1,
+            move_mask: 1,
+            arg0: GRANTS_CHILD,
+            handles: [0; libkern::SPAWN_MAX_HANDLES],
+            rights: [0; libkern::SPAWN_MAX_HANDLES],
+            namespace: 0,
+            syscaps: 0,
+        };
+        args.handles[0] = its;
+        args.rights[0] = u64::MAX;
+        let spawned = libos::spawn(&args).is_ok();
+        exit(if spawned && rs_send(stdout, 2, &[], &[mine]) { 0 } else { 1 });
+    }
+    exit(0);
+}
+
+/// The child [`run_grants`] leaves: one message on its channel is answered with the grants that
+/// resolve in the namespace it shares with the program that started it.
+fn run_grants_child(ns: u64, ch: u64) -> ! {
+    if rs_recv(ch).is_some() {
+        rs_send(ch, 1, &[grants_resolved(ns)], &[]);
+    }
+    exit(0);
+}
+
 /// Bootstrap registers: `rdi` notif, `rsi` namespace, `rdx` endpoint (the setup channel for a
 /// Tier-1 stage), `rcx` `arg0`.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     if libstream::setup::setup_is_pending(arg0) {
         run_stage(notif, ns, endpoint, arg0);
+    }
+    if arg0 == GRANTS_CHILD {
+        run_grants_child(ns, endpoint);
     }
     exit(0);
 }

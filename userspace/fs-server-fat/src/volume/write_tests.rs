@@ -105,7 +105,7 @@ fn every_change_leaves_a_clean_filesystem_that_mtools_reads_back() {
         fat.release(id, NOW).unwrap();
         settle(&fat, what);
         fat.mkdir_at(root, b"empty", NOW).unwrap();
-        fat.rmdir_at(root, b"empty", NOW).unwrap();
+        fat.rmdir_at(root, b"empty", NOW, |_| ()).unwrap();
         settle(&fat, what);
 
         let want: BTreeSet<String> =
@@ -438,7 +438,7 @@ fn a_read_only_mount_refuses_every_change() {
     assert_eq!(fat.truncate_file(b"/file.txt", 0, NOW), Err(refused));
     assert_eq!(fat.mkdir_at(root, b"new", NOW), Err(refused));
     assert_eq!(fat.unlink_at(root, b"file.txt", NOW), Err(refused));
-    assert_eq!(fat.rmdir_at(root, b"dir", NOW), Err(refused));
+    assert_eq!(fat.rmdir_at(root, b"dir", NOW, |_| ()), Err(refused));
     assert_eq!(fat.touch_at(root, b"file.txt", NOW), Err(refused));
     assert_eq!(fat.rename_at(root, b"file.txt", b"other.txt", NOW), Err(refused));
     assert_eq!(fat.rename_path(b"/file.txt", b"/dir/file.txt", false, NOW), Err(refused));
@@ -581,7 +581,7 @@ fn every_change_through_the_metadata_cache_leaves_it_and_the_disk_agreeing() {
             fat.release(id, NOW).unwrap();
         }
     }
-    fat.rmdir_at(root, b"d2", NOW).unwrap();
+    fat.rmdir_at(root, b"d2", NOW, |_| ()).unwrap();
     for i in 0..20 {
         let name = format!("n{i:02}.bin");
         fat.create_file(b"/d1", name.as_bytes(), NOW).unwrap();
@@ -686,7 +686,7 @@ fn what_fat_frees_leaves_the_metadata_cache() {
     assert!(clusters.len() > 1, "a directory of {} clusters", clusters.len());
     assert!(clusters.iter().all(|&c| cached.holds(at(c))), "each read through the cache, so held");
 
-    fat.rmdir_at(root, b"d", NOW).unwrap();
+    fat.rmdir_at(root, b"d", NOW, |_| ()).unwrap();
     for c in clusters {
         let (first, last) = (at(c), at(c) + g.cluster_bytes() as u64 - 1);
         assert!(!cached.holds(first) && !cached.holds(last), "cluster {c} is free and still held");
@@ -748,4 +748,69 @@ fn a_directory_is_read_from_the_device_once_through_the_cache() {
     }
     assert_eq!(counted.1.take(), 0, "every lookup again reads nothing");
     assert!(scan >= 50 && missed <= 16, "uncached, a lookup took {scan} commands; cached, the first read {missed}");
+}
+
+/// **A removal gives its directory's id before any write it can fail after**, since the server
+/// ends the sessions on that id with it: FAT writes a change's sectors as it ends, and with each
+/// failing in turn, through the server's call, a directory whose id was not given is still there
+/// and its first cluster not the next directory's. A refusal gives nothing.
+#[test]
+fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
+    use crate::test_support::{Overlay, mmd};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    struct Failing {
+        image: Overlay,
+        writes: Cell<u64>,
+        at: u64,
+    }
+    impl BlockReader for Failing {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.image.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Failing {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            self.writes.set(self.writes.get() + 1);
+            if self.writes.get() == self.at + 1 {
+                return Err(FsError::Io);
+            }
+            self.image.write_at(offset, buf)
+        }
+    }
+    let img = mformat(16, &["-c", "8"]);
+    mmd(&img, "full");
+    mmd(&img, "full/inner");
+    mmd(&img, "gone");
+    put(&img, "afile", b"x");
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let root = fat.resolve_dir(b"/").unwrap();
+    let gone = fat.resolve_dir(b"/gone").unwrap();
+    let mut given = None;
+    assert_eq!(fat.rmdir_at(root, b"full", NOW, |id| given = Some(id)), Err(FsError::NotEmpty));
+    assert_eq!(fat.rmdir_at(root, b"afile", NOW, |id| given = Some(id)), Err(FsError::Unsupported));
+    let ro = ReadOnly(&disk);
+    assert_eq!(Fat::new(&ro).rmdir_at(root, b"gone", NOW, |id| given = Some(id)), Err(FsError::ReadOnly));
+    assert_eq!(given, None, "a refusal gives no id");
+
+    let image = Rc::new(std::fs::read(&img).unwrap());
+    for n in 0.. {
+        let f = Failing { image: Overlay::new(image.clone()), writes: 0.into(), at: n };
+        let mut given = None;
+        let r = Volume::rmdir_at(&Fat::new(&f), root, b"gone", NOW, |id| given = Some(id));
+        let after = Fat::new(&f.image);
+        match given {
+            Some(id) => assert_eq!(id, gone, "write {n} failing"),
+            None => {
+                assert_eq!(after.resolve_dir(b"/gone"), Ok(gone), "write {n} failing, nothing given");
+                after.mkdir_at(root, b"fresh", NOW).unwrap();
+                assert_ne!(after.resolve_dir(b"/fresh"), Ok(gone), "write {n}: its cluster reused");
+            }
+        }
+        if r.is_ok() {
+            assert_eq!(given, Some(gone), "a removal that succeeded");
+            break;
+        }
+    }
 }

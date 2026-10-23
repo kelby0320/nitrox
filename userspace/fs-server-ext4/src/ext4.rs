@@ -1051,6 +1051,9 @@ fn dir_insert<RW: BlockReader + BlockWriter>(
     file_type: u8,
     now: i64,
 ) -> Result<(), FsError> {
+    if name.len() > 255 {
+        return Err(FsError::Unsupported); // an entry's length is one byte
+    }
     let bs = sb.block_size as usize;
     let size = rd_u32(dir_inode, 4) as u64;
     let nblocks = size.div_ceil(sb.block_size as u64);
@@ -1558,10 +1561,20 @@ pub fn release_inode<RW: BlockReader + BlockWriter>(rw: &RW, ino: u32, now: i64)
 
 /// Remove the **empty subdirectory** `name` from directory inode `dir_ino`: verify it holds only
 /// `.`/`..`, unlink it, free its block and inode, and decrement the parent's link count. `NotFound`
-/// if absent; `Unsupported` if not a directory (use [`unlink_at`]); `NotEmpty` if it has entries.
-pub fn rmdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+/// if absent; `Unsupported` if not a directory (use [`unlink_at`]); `NotEmpty` if it has entries;
+/// `ReadOnly` through a read-only mount. **`freeing` is given its inode** before the first write.
+pub fn rmdir_at<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    dir_ino: u32,
+    name: &[u8],
+    now: i64,
+    freeing: impl FnOnce(u32),
+) -> Result<(), FsError> {
     if name == b"." || name == b".." {
         return Err(FsError::Unsupported);
+    }
+    if rw.read_only() {
+        return Err(FsError::ReadOnly);
     }
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
@@ -1584,6 +1597,7 @@ pub fn rmdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8
         return Err(FsError::NotEmpty);
     }
 
+    freeing(sub_ino);
     dir_remove(rw, &sb, &parent, name)?;
     free_inode(rw, &sb, sub_ino, true, now)?;
     adjust_links(rw, &sb, dir_ino, -1)?; // the subdir's `..` no longer links the parent
@@ -1751,7 +1765,7 @@ pub fn rename_at<RW: BlockReader + BlockWriter>(
     new: &[u8],
     now: i64,
 ) -> Result<(), FsError> {
-    if new.is_empty() || new.len() > 255 || new.contains(&b'/') || new == b"." || new == b".." {
+    if !libfsserver::serve::entry_name(old) || !libfsserver::serve::entry_name(new) {
         return Err(FsError::Unsupported);
     }
     let sb = read_superblock(rw)?;

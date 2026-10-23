@@ -123,6 +123,17 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("nitrox login:")?;
     steps += 1;
 
+    // 1b. **A Ctrl-C at the prompt costs that attempt and no more**: `tty-server` sends an
+    //     unsolicited interrupt, then the read's empty line. Taken as the read's reply, the
+    //     interrupt left each later request a reply behind, and echo came back on under the
+    //     password's read. So the password typed here was echoed, as the end-of-run check finds.
+    s.send_raw("\x03")?;
+    s.expect("password:")?;
+    s.send(AFTER_INTERRUPT_PASSWORD)?;
+    s.expect("login incorrect")?;
+    s.expect("nitrox login:")?;
+    steps += 1;
+
     // 2. A wrong password is refused and the prompt comes back, tested before the good one so a
     //    broken denial cannot hide behind a successful login.
     s.send("alice")?;

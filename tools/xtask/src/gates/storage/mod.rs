@@ -27,7 +27,9 @@ pub(crate) fn storage_pattern_byte(i: usize) -> u8 {
 /// other second disk a boot can have is a RAM disk, whose writes never reach a host file.
 ///
 /// The copy's root is first marked **not cleanly unmounted**, as an installed machine's is
-/// until its `shutdown`. On the serial console:
+/// until its `shutdown`, and the copy gains **a decoy**: a zeroed partition labelled as the live
+/// root is, which the kernel must not name `/dev/disk/by-partlabel/nitrox-live` and the storage
+/// service must not take for `init`'s root ([`add_decoy_live_root`]). On the serial console:
 /// - the storage service reports it so and auto-mounts it read-only, it being a live boot, and a
 ///   write there is refused;
 /// - the table's `clean` column says no, and still says no after the read-only unmount, which
@@ -56,6 +58,7 @@ pub(crate) fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     fs::copy(image_path(), &disk)?;
     mark_root_not_clean(&disk)?;
     add_internal_fat(&disk)?;
+    add_decoy_live_root(&disk)?;
     cmd_image_live_for(BuildMode::Selftest)?;
     // **Two sticks to plug in**: an MBR one holding an ext4 partition, which is ejected and read
     // on the host, and a whole-disk ext4, which is pulled while mounted.
@@ -329,6 +332,16 @@ fn add_internal_fat(disk: &Path) -> R<()> {
         .arg("::"))
 }
 
+/// **A SATA partition labelled as the live root is**: 2 MiB of zeros, the fourth on the copy,
+/// published before the RAM disk holding the real one.
+fn add_decoy_live_root(disk: &Path) -> R<()> {
+    const MIB: u64 = 1024 * 1024;
+    let len = fs::metadata(disk)?.len();
+    fs::OpenOptions::new().write(true).open(disk)?.set_len(len + 3 * MIB)?;
+    run(Command::new("sgdisk").arg("-e").arg(disk))?;
+    run(Command::new("sgdisk").arg("-n").arg("4:0:0").arg("-c").arg(format!("4:{LIVE_ROOT_PARTLABEL}")).arg(disk))
+}
+
 /// Mark the disk image's `nitrox-root` **not cleanly unmounted**, as an installed machine's is:
 /// nothing unmounts `init`'s root until `shutdown`. It is also what makes the table's `clean`
 /// column mean something: after the read-only unmount it must still say no.
@@ -389,6 +402,12 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
 
     // 0. The menu's countdown boots its first entry, the ordinary one.
     s.expect(", cmdline \"\"")?;
+    // 0b. **The decoy does not take the live root's name**; the storage service's live boot, below.
+    s.expect(&format!(
+        "gpt: /dev/disk/by-partlabel/{LIVE_ROOT_PARTLABEL} names an earlier partition, the boot medium's"
+    ))?;
+    s.expect("init: mounted fs-server-ext4 at /")?;
+    println!("  ok: the SATA disk's decoy {LIVE_ROOT_PARTLABEL} passed over for the RAM disk's");
 
     // 1. **The disk's root is auto-mounted read-only**, the boot being a live one. Its name is
     //    what the storage service calls it, read off the line that reports it.

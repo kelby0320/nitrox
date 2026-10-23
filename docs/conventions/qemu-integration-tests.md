@@ -420,14 +420,14 @@ each time.
 | `test-qemu` | `harness` | 125 / 33 | The self-test boot adjudicated whole by `isa-debug-exit`; USB enumeration and hot-plug, a disk written past 2 TiB, the I/O counters, AHCI claimed over MSI. |
 | `check-terminal` | `harness` | 54 | The compositor-to-shell round trip — a click, keys to `nxsh`, the answer rendered — `OSC 7` back to `nxterm`, and the PS/2 locks and lights read from QEMU's trace. |
 | `check-fbcon` | `harness` | 35 | A machine with no serial port: the boot and a panic read off the screen with the kernel's own glyphs. |
-| `test-interactive` | `release` | 120 / 32 | The release image's serial login and shell, its 48 steps through the real `login()` and `tty` layer. |
+| `test-interactive` | `release` | 120 / 32 | The release image's serial login and shell, its 49 steps through the real `login()` and `tty` layer, a Ctrl-C at `nitrox login:` among them. |
 | `check-login` | `release` | 61 | The graphical greeter on PS/2, then the desktop driven step by step: menus, windows, the overview, Files, the editor, the clipboard, dialogs. |
 | `check-login --usb` | `release` | 70 | The greeter and that session on a machine with no i8042, every key and click USB's. |
 | `check-logout` | `release-live` | 140 / 56 | Ending a session: log out past the editor's question, restart and shut down, in three boots. |
 | `check-live` | `release-live` | 23 | The live stick: its RAM-disk root, the greeter within 1.5 s of the mount, the boot medium flagged and passed over. |
 | `check-report` | `release-live` | 23 | The live menu's hardware report with no serial port, its pages turned on PS/2: AHCI declined with no disk, no COM1. |
 | `check-report --usb` | `release-live` | 30 | The same pages turned on a USB keyboard, before `init`. |
-| `check-storage` | `live-test` | 137 / 63 | Disks the host reads afterwards: an unmount's writes, sticks plugged and pulled while mounted, FAT, partitioning and formatting. |
+| `check-storage` | `live-test` | 137 / 63 | Disks the host reads afterwards: an unmount's writes, sticks plugged and pulled while mounted, FAT, partitioning and formatting; a SATA partition labelled as the live root is. |
 | `check-media` | `live-test` | 46 | Removable media on the desktop: Files' Drives updated with nothing typed, Save As onto a stick, Files' eject. |
 | `check-display` | `display.yml` | 120 | The guest's screen against the host's render — base address, stride, channels — and the overview's round trip. |
 | `check-input` | `input.yml` | 104 | A PS/2 key and click reaching a client window through the compositor's router. |
@@ -470,7 +470,7 @@ reads its metadata once. A file the build put there reads back as written in at 
 each fill reading up to 31 pages ahead.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
-the real prompt over the serial console and matches on what comes back — 48 steps,
+the real prompt over the serial console and matches on what comes back — 49 steps,
 expect-driven rather than sleep-driven. Since Phase 6 Part H.2 one of them is `nxsh`'s `time`: its
 line, of its shape, before the value it passes through.
 
@@ -633,7 +633,11 @@ command refused while mounted, ejected). The host reads the GPT and its ext4 in 
 MBR, no GPT header at either end, and the FAT in the stick. **It logs in only once `boot-probe` has
 exited**, whatever its verdict, which on that machine is a FAIL by the machine's shape: its later
 tests install a policy and fill the view broker's clients, and the sticks made the gate long enough
-to meet them. It runs in CI's QEMU job.
+to meet them. **The copy carries a decoy too**: a fourth partition of zeros labelled `nitrox-live`,
+as the live root is, on a disk published before the RAM disk holding the real one. The kernel's line
+passing it over is required. Without that, `init` mounts the decoy as `/` and refuses it. With the
+storage service matching the first partition published instead, it calls the boot an installed one
+and mounts the real root a second time, read-write. It runs in CI's QEMU job.
 
 `cargo xtask check-media` is the **removable-media gate** (Phase 6 Part F), on the desktop a person
 uses: the **release** live image as the boot stick beside a copy of the release disk, logged in at

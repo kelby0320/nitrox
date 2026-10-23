@@ -103,10 +103,10 @@ nobody else's business.
 
 ## Capability discipline
 
-The server receives only what it needs at spawn: a **read-write block-device
-handle** (`READ | WRITE`, for metadata I/O; it hands a `DUPLICATE`d copy to the kernel
-for the Model A data path) and a **control channel** (for the Ready handshake). It never
-holds `BIND_NAMESPACE` — the supervisor (init) binds its endpoint. See
+The server receives only what it needs at spawn: a **block-device handle** (`READ`, and
+`WRITE` for a read-write mount only, for metadata I/O; it hands a `DUPLICATE`d copy to the
+kernel for the Model A data path) and a **control channel** (for the Ready handshake). It never
+holds `BIND_NAMESPACE` — the supervisor (init, or the storage service) binds its endpoint. See
 `docs/rationale/why-supervisor-registration.md`.
 
 ## Forbidden

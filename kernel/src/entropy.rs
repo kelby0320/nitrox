@@ -182,6 +182,15 @@ impl EntropyState {
 /// The global entropy state, a leaf `IrqSpinLock`.
 static ENTROPY: IrqSpinLock<EntropyState> = IrqSpinLock::new(LockRank::Leaf, EntropyState::new());
 
+/// Key the CSPRNG for a host test, which [`init`] cannot do: it reads hardware and logs to the
+/// serial port. A fixed pool: a host test's draws need not be secret.
+#[cfg(test)]
+pub fn key_for_tests() {
+    let mut g = ENTROPY.lock();
+    g.absorb(0x6e69_7472_6f78);
+    g.key_from_pool();
+}
+
 /// Initialize the entropy subsystem once at boot: draw a hardware burst, mix in early jitter, key
 /// the CSPRNG, and latch `seeded` if the gate was crossed.
 ///

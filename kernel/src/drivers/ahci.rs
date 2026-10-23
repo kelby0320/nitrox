@@ -148,7 +148,7 @@ pub struct AhciDisk {
     abar: u64,      // mapped ABAR kernel-virtual base
     port_base: u64, // abar + 0x100 + port*0x80
     port: u32,
-    _cmd_list: DmaBuffer, // 1 KiB command list (kept mapped/owned)
+    cmd_list: DmaBuffer,  // 1 KiB command list; slot 0's header first
     _fis: DmaBuffer,      // 256 B received-FIS area
     cmd_table: DmaBuffer, // CFIS + PRDT for slot 0
     sectors: u64,
@@ -303,7 +303,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         abar,
         port_base,
         port,
-        _cmd_list: cmd_list,
+        cmd_list,
         _fis: fis,
         cmd_table,
         sectors: 0,
@@ -571,7 +571,7 @@ fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[Ph
         }
     }
 
-    let cl = disk._cmd_list.virt() as *mut u32;
+    let cl = disk.cmd_list.virt() as *mut u32;
     // DW0: CFL = 5 dwords (H2D FIS), W bit, PRDTL = frag count.
     let dw0 = 5u32 | ((write as u32) << 6) | ((frags.len() as u32) << 16);
     // SAFETY: `cl` addresses the 1 KiB command list; slot 0 is its first 32 bytes.
@@ -745,28 +745,39 @@ unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
 /// # Safety
 /// `irp` is the IRP [`take_retired`] just took out of flight: live, and uniquely this driver's
 /// until its DPC runs.
-unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool) {
+unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool, moved: u32) {
     let ns = crate::arch::Timer::read_ns().saturating_sub(d.issued_at.load(Ordering::Relaxed));
     // SAFETY: as the contract says.
     unsafe {
-        let status = if err { crate::syscall::error::KError::IoError as i32 } else { IrpStatus::Success as i32 };
-        let transferred = if err { 0 } else { (*irp).length };
-        d.counted.record((*irp).op, !err, transferred, ns);
+        let (status, transferred) = completion(err, (*irp).length, moved);
+        d.counted.record((*irp).op, status == IrpStatus::Success as i32, transferred, ns);
         (*irp).set_completion(status, transferred);
         crate::dpc::enqueue(&(*irp).dpc);
     }
 }
 
+/// A retired command's status and the bytes it moved: nothing on an error, or when the byte count
+/// the HBA wrote back falls short, since the pages a read did not fill would be read as data.
+fn completion(err: bool, length: u64, moved: u32) -> (i32, u64) {
+    match err || u64::from(moved) < length {
+        true => (crate::syscall::error::KError::IoError as i32, 0),
+        false => (IrpStatus::Success as i32, length),
+    }
+}
+
 /// Slot 0 has retired: under the port lock, take the completed IRP out of flight (capturing its
-/// error status) and mark the slot idle. Returns the IRP (`null` if already idle) and whether it
-/// errored. Does **not** issue the next command: [`drain_queue`] does, from a DPC, so a fast
-/// pipelined completion cannot race the interrupt ack. The caller completes the IRP outside any
-/// lock.
-fn take_retired(d: &AhciDisk) -> (*mut Irp, bool) {
+/// error status and the bytes it moved) and mark the slot idle. Returns the IRP (`null` if already
+/// idle), whether it errored, and its header's byte count. Does **not** issue the next command:
+/// [`drain_queue`] does, from a DPC, so a fast pipelined completion cannot race the interrupt ack.
+/// The caller completes the IRP outside any lock.
+fn take_retired(d: &AhciDisk) -> (*mut Irp, bool, u32) {
     let _q = d.pending.lock();
     let retired = d.inflight.swap(core::ptr::null_mut(), Ordering::AcqRel);
     let err = read32(d.port_base, PX_TFD) & TFD_ERR != 0;
-    (retired, err)
+    // SAFETY: the command list is this disk's, mapped while it lives, and slot 0's header DW1 is
+    // only rewritten by `build_command` for the next command, which cannot start under this lock.
+    let moved = unsafe { (d.cmd_list.virt() as *const u32).add(1).read_volatile() };
+    (retired, err, moved)
 }
 
 /// If slot 0 is idle, issue the next queued IRP. Called from the completion DPC and the boot poll
@@ -820,10 +831,10 @@ extern "C" fn isr() {
 
     // If slot 0 has retired, complete the IRP and queue the drain DPC for the next waiting command.
     if read32(d.port_base, PX_CI) & 1 == 0 {
-        let (irp, err) = take_retired(d);
+        let (irp, err, moved) = take_retired(d);
         if !irp.is_null() {
             // SAFETY: `irp` is the retired request; set status + queue its DPC.
-            unsafe { retire(d, irp, err) };
+            unsafe { retire(d, irp, err, moved) };
             crate::dpc::enqueue(&AHCI_DRAIN_DPC);
         }
     }
@@ -867,114 +878,16 @@ pub fn poll_complete_inflight() -> bool {
     // error status, so its waiter is not left stuck. Boot polling is synchronous: issue the next
     // directly.
     let _ = wait_command_polled(d);
-    let (irp, err) = take_retired(d);
+    let (irp, err, moved) = take_retired(d);
     if irp.is_null() {
         return false;
     }
     // SAFETY: `irp` is the retired request.
-    unsafe { retire(d, irp, err) };
+    unsafe { retire(d, irp, err, moved) };
     drain_queue(d);
     crate::dpc::run_pending();
     true
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_op_has_its_command_and_nothing_else_does() {
-        use crate::io::irp::IrpOp;
-        assert_eq!(ata_command(IrpOp::Read as u32, 0xEA), Some((ATA_READ_DMA_EXT, false)));
-        assert_eq!(ata_command(IrpOp::Write as u32, 0xEA), Some((ATA_WRITE_DMA_EXT, true)));
-        assert_eq!(ata_command(IrpOp::Flush as u32, 0xEA), Some((0xEA, false)), "the drive's flush");
-        assert_eq!(ata_command(IrpOp::Flush as u32, 0xE7), Some((0xE7, false)));
-        assert_eq!(ata_command(3, 0xEA), None, "not a read, which a count of 0 makes 65,536 sectors");
-    }
-
-    #[test]
-    fn a_drive_with_flush_cache_ext_is_flushed_with_it() {
-        assert_eq!(flush_command(1 << 13), ATA_FLUSH_CACHE_EXT);
-        assert_eq!(flush_command(0xFFFF), ATA_FLUSH_CACHE_EXT);
-        assert_eq!(flush_command(!(1 << 13)), ATA_FLUSH_CACHE, "every other bit set, not this one");
-        assert_eq!(flush_command(0), ATA_FLUSH_CACHE);
-    }
-
-    #[test]
-    fn the_prdt_capacity_is_what_fits_in_a_command_table() {
-        assert_eq!(MAX_PRDT_ENTRIES, 248);
-        assert!(PRDT_OFFSET + MAX_PRDT_ENTRIES as usize * PRDT_ENTRY <= CMD_TABLE_BYTES);
-        assert!(PRDT_OFFSET + (MAX_PRDT_ENTRIES as usize + 1) * PRDT_ENTRY > CMD_TABLE_BYTES);
-    }
-
-    /// What that capacity is worth as a transfer, pinning the figure in `deferred-decisions.md`.
-    #[test]
-    fn one_command_covers_just_under_a_megabyte() {
-        let bytes = MAX_PRDT_ENTRIES as usize * crate::mm::PAGE_SIZE;
-        assert_eq!(bytes, 1_015_808);
-        assert_eq!(bytes / 1024, 992);
-    }
-
-    /// Lay `text` into an IDENTIFY field as a drive does: byte-swapped within each word,
-    /// space-padded.
-    fn put_field(words: &mut [u16; 256], first: usize, width_words: usize, text: &[u8]) {
-        let mut bytes = [b' '; 40];
-        bytes[..text.len()].copy_from_slice(text);
-        for i in 0..width_words {
-            words[first + i] = u16::from(bytes[i * 2]) << 8 | u16::from(bytes[i * 2 + 1]);
-        }
-    }
-
-    fn identity_of(model: &[u8], serial: &[u8]) -> ([u8; MAX_DEVICE_NAME], usize) {
-        let mut words = [0u16; 256];
-        put_field(&mut words, 27, 20, model);
-        put_field(&mut words, 10, 10, serial);
-        let mut out = [0u8; MAX_DEVICE_NAME];
-        // SAFETY: `words` is a full 256-word IDENTIFY result, which is the contract.
-        let n = unsafe { format_identity(words.as_ptr(), &mut out) };
-        (out, n)
-    }
-
-    fn assert_identity(model: &[u8], serial: &[u8], want: &[u8]) {
-        let (out, n) = identity_of(model, serial);
-        assert_eq!(
-            &out[..n],
-            want,
-            "model {:?} serial {:?} produced {:?}",
-            core::str::from_utf8(model),
-            core::str::from_utf8(serial),
-            core::str::from_utf8(&out[..n])
-        );
-    }
-
-    /// **Padding is trimmed at both ends**, because the standard does not say which end a drive
-    /// pads.
-    #[test]
-    fn a_right_justified_field_loses_its_padding_too() {
-        assert_identity(b"ST1000LM035-1RK172", b"            WDELGVZ3", b"ST1000LM035-1RK172 (WDELGVZ3)");
-        assert_identity(b"QEMU HARDDISK", b"QM00001", b"QEMU HARDDISK (QM00001)");
-        // Padding on both ends of both fields, interior spaces kept: `QEMU HARDDISK` has one.
-        assert_identity(b"  A B  ", b"   C D  ", b"A B (C D)");
-    }
-
-    /// A field that is nothing but padding is empty, and a disk with no serial is named by its
-    /// model alone.
-    #[test]
-    fn an_all_padding_field_comes_back_empty() {
-        assert_identity(b"ST1000LM035", b"                    ", b"ST1000LM035");
-        assert_identity(b"                                        ", b"", b"");
-    }
-
-    #[test]
-    fn a_rescan_and_an_eject_are_refused_without_touching_a_disk() {
-        use crate::io::irp::{IrpBuffer, IrpOp};
-        crate::mm::test_support::init_global_heap();
-        crate::dpc::init().unwrap();
-        for op in [IrpOp::Rescan, IrpOp::Eject] {
-            let mut irp = Irp::new_block(op, core::ptr::null(), 0, 0, IrpBuffer::NONE, core::ptr::null_mut(), 0);
-            submit(&mut irp, core::ptr::null_mut());
-            crate::dpc::run_pending();
-            assert_eq!(irp.status, crate::syscall::error::KError::Unsupported as i32, "{op:?}");
-        }
-    }
-}
+mod tests;

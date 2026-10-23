@@ -147,7 +147,11 @@ Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
 - **A directory removed is no directory to a session still holding it** (PR #365 review): a
   session names its directory by id, its first cluster, which the removal frees and a grow may
   take. Every operation by id first checks that cluster is still allocated and still begins with a
-  `.` naming it, and refuses `NotFound` otherwise.
+  `.` naming it, and refuses `NotFound` otherwise. **That check cannot see the cluster reused** by
+  a new directory, which begins with its own `.`. So `rmdir` gives the protocol the id before it
+  changes anything, and the protocol ends every session holding it (`libfsserver`'s
+  `end_sessions_on`), whether the removal then succeeds or not: the client's next request meets
+  `PeerClosed`.
 - **A rename** writes the new name first — new entries, or a replaced file's entry pointed at the
   source — then deletes the old one, so a crash leaves the file under both names rather than
   neither. A directory moved to another parent has its `..` repointed: `0` for the root,
