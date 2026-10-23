@@ -281,6 +281,15 @@ exist). *Argument*, *permission*, and *allocation* failures (a bad `ns` handle o
 missing `LOOKUP`, a malformed/oversize `path`, or PO/handle exhaustion) return
 **synchronously** as a negative isize, with **no** `PendingOperation` created.
 
+**The file verbs are lookups too**: `sys_file_grow(ns, path, path_len, rights, size)`,
+`sys_file_create` and `sys_file_truncate` with the same arguments, and
+`sys_file_rename(ns, path, path_len, dest, dest_len, flags)` resolve `path` as `sys_ns_lookup`
+does and hand the server that owns it the operation: `RESOLVE_GROW`, `RESOLVE_CREATE`,
+`RESOLVE_TRUNCATE` and `RESOLVE_RENAME` in [`rsproto-namespace-ops.md`](rsproto-namespace-ops.md),
+which says what each does. **A `size` past `u32::MAX` is refused `TooLarge`, and `flags` past
+`u16::MAX` `InvalidArgument`**, synchronously, before anything resolves: the request carries 32
+and 16 bits, and a value cut to fit would truncate a file meant just over 4 GiB to its low bits.
+
 ```rust
 fn sys_ns_bind(
     ns:       RawHandle,
@@ -540,7 +549,7 @@ fn sys_channel_send(
     deadline: u64,        // absolute monotonic ns; consumed only by BlockBounded
 ) -> isize
 ```
-Sends `*msg` plus `handles[0..count]` over `ch` (requires `SEND`). The kernel stamps `header.sender_pid` / `timestamp`. Returns `0`, `WouldBlock` if the queue is full (`NoBlock`), or `PeerClosed` if the peer endpoint has closed. (Syscall number `13`.)
+Sends `*msg` plus `handles[0..count]` over `ch` (requires `SEND`). The kernel stamps `header.sender_pid` / `timestamp`. Returns `0`, `WouldBlock` if the queue is full (`NoBlock`), or `PeerClosed` if the peer endpoint has closed. A `mode` other than the three below, high bits included, is `InvalidArgument`. (Syscall number `13`.)
 
 Sends `handles[0..count]` along with the message (always **move**; a sender that wants to keep a copy `sys_handle_duplicate`s first). Each transferred handle must carry `TRANSFER`; the move commits only after the message is queued, so a `WouldBlock`/`PeerClosed` send loses no capability. **Refused `InvalidArgument`**: a handle listed twice, the endpoint the message is for, and an endpoint whose own receive side holds an endpoint ([`ipc-message-format.md`](ipc-message-format.md) § *Handle transfer in messages*).
 
