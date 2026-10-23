@@ -242,7 +242,7 @@ impl Lookup {
     /// What is at logical block `lb`, and how far it goes on.
     pub(crate) fn seg<R: BlockReader>(&mut self, r: &R, sb: &Superblock, lb: u64) -> Result<Seg, FsError> {
         if lb >= END {
-            return Ok(Seg { phys: 0, len: 1 }); // no extent reaches past 2^32 blocks
+            return Ok(Seg { phys: 0, len: u64::MAX - lb }); // no extent reaches past 2^32 blocks
         }
         let span = match self.span {
             Some(s) if s.lo <= lb && lb < s.hi => s,
@@ -1014,6 +1014,19 @@ mod tests {
         assert_eq!(map.block(&rw, &sb, MAX_LEN - 1).unwrap(), p + MAX_LEN - 1);
         assert_eq!(map.block(&rw, &sb, MAX_LEN).unwrap(), p + MAX_LEN);
         assert_eq!(rd_u32(&inode, 28) as u64, (MAX_LEN + 1) * 2, "i_blocks, in 512-byte units");
+    }
+
+    /// **Past the last block an extent can address, the rest is one hole**: a file whose size runs
+    /// past 2^32 blocks is mapped there in a step, where a block at a time took six minutes.
+    #[test]
+    fn past_the_last_block_an_extent_can_address_the_rest_is_one_hole() {
+        let rw = RwImage(RefCell::new(fixture_blocks(1024, 4096, 0, b"x\n")));
+        let sb = read_superblock(&rw).unwrap();
+        let mut inode = [0u8; 256];
+        empty_root(&mut inode);
+        let mut map = Lookup::new(&inode);
+        assert_eq!(map.seg(&rw, &sb, END).unwrap(), Seg { phys: 0, len: u64::MAX - END });
+        assert_eq!(map.seg(&rw, &sb, END - 1).unwrap(), Seg { phys: 0, len: 1 }, "the tree's own hole ends there");
     }
 
     /// **A grow the filesystem cannot hold gives back everything it took**: on a file with no
