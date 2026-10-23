@@ -1635,6 +1635,22 @@ fn dir_repoint<RW: BlockReader + BlockWriter>(
     Err(FsError::NotFound)
 }
 
+/// **Whether directory `dir` is `ancestor` or under it**, by its `..` records up to the root: a
+/// path's bytes name one directory many ways. A chain longer than any path's 512 components is
+/// `Corrupt`, as a loop of `..` records would be.
+fn within<R: BlockReader>(r: &R, sb: &Superblock, mut dir: u32, ancestor: u32) -> Result<bool, FsError> {
+    for _ in 0..512 {
+        if dir == ancestor {
+            return Ok(true);
+        }
+        if dir == ROOT_INO {
+            return Ok(false);
+        }
+        dir = dir_lookup(r, sb, &read_inode(r, sb, dir)?, b"..")?;
+    }
+    Err(FsError::Corrupt)
+}
+
 fn split_parent(path: &[u8]) -> Option<(&[u8], &[u8])> {
     let slash = path.iter().rposition(|&c| c == b'/')?;
     let leaf = &path[slash + 1..];
@@ -1684,10 +1700,8 @@ pub fn rename_path<RW: BlockReader + BlockWriter>(
     let src_is_dir = rd_u16(&src, 0) & S_IFMT == S_IFDIR;
     let src_ft = if src_is_dir { EXT4_FT_DIR } else { EXT4_FT_REG_FILE };
 
-    // Moving a directory into its own subtree would detach it (its `..` would point into the
-    // cycle). Cheap guard: refuse the parent-into-child case, the reachable one; a full ancestor
-    // walk is not done.
-    if src_is_dir && new_parent_path.starts_with(old_path) {
+    // Moving a directory into its own subtree would detach it: its `..` would point into the cycle.
+    if src_is_dir && within(rw, &sb, new_dir_ino, src_ino)? {
         return Err(FsError::Unsupported);
     }
 

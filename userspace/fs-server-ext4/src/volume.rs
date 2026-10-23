@@ -390,6 +390,26 @@ mod tests {
         assert_eq!(flags_of(served, &reply), 0);
     }
 
+    /// **A directory moves into a sibling whose name begins with its own, and never into itself**,
+    /// whatever bytes name the destination: `/abc` is not under `/ab`, and `/abc/./ab/x` is.
+    #[test]
+    fn a_directory_moves_beside_a_name_that_begins_with_its_own_but_never_into_itself() {
+        use crate::test_support::{RwImage, assert_e2fsck_clean};
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
+        let vol = Ext4(&rw);
+        for name in [b"ab" as &[u8], b"abc", b"d", b"dd"] {
+            vol.mkdir_at(2, name, 0).unwrap();
+        }
+        vol.mkdir_at(vol.resolve_dir(b"/ab").unwrap(), b"x", 0).unwrap();
+        assert_eq!(vol.rename_path(b"/ab", b"/abc/ab", false, 0), Ok(None));
+        assert_eq!(vol.rename_path(b"/d", b"/dd/d", false, 0), Ok(None));
+        for into in [b"/abc/./ab/x/ab" as &[u8], b"/abc/ab/ab", b"/abc/ab/x/y"] {
+            assert_eq!(vol.rename_path(b"/abc/ab", into, false, 0), Err(FsError::Unsupported), "{into:?}");
+        }
+        assert_eq!(vol.rename_path(b"/abc", b"/abc/ab/x/abc", false, 0), Err(FsError::Unsupported));
+        assert_e2fsck_clean(&rw.0.into_inner(), "after moves beside and into a directory");
+    }
+
     /// **A name past 255 bytes is no ext4 entry**, whichever call would insert it: an entry's
     /// length is one byte, and a rename to 256 wrote a zero-length name, one to 300 a 44-byte one.
     /// The protocol leaves the length to the filesystem, since FAT's can run to 765 bytes.

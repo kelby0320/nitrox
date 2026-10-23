@@ -143,6 +143,18 @@ fn a_record_whose_name_runs_past_its_block_is_an_error_to_rename_over() {
     }
 }
 
+/// **A chain of `..` records that loops is `Corrupt` to move a directory into**, not a walk for
+/// ever: a directory whose `..` names itself.
+#[test]
+fn a_loop_of_parent_records_is_corrupt_to_move_a_directory_into() {
+    let img = RwImage(RefCell::new(populated(4096)));
+    let vol = Ext4(&img);
+    let inner = vol.resolve_dir(b"/d/inner").unwrap() as u32;
+    let at = records(&img, inner)[1].0 as usize;
+    img.0.borrow_mut()[at..at + 4].copy_from_slice(&inner.to_le_bytes());
+    assert_eq!(vol.rename_path(b"/system", b"/d/inner/system", false, NOW), Err(FsError::Corrupt));
+}
+
 /// **Garbage anywhere ext4 keeps its structure is an error, never a panic**, at 1 KiB and 4 KiB
 /// blocks. Four kinds, each on a fresh copy of a populated image, then every request:
 /// - a random byte over the superblock, the descriptors, the bitmaps and the inode table;
