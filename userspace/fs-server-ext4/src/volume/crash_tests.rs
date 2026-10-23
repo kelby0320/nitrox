@@ -6,13 +6,15 @@ use crate::test_support::{Failing, fixture};
 
 const NOW: i64 = 1_791_244_800;
 
-/// `/d/src` and `/e/dst`, files with data, and `/d/sub`, an empty directory.
+/// `/d/src` and `/e/dst`, files with data, and `/d/sub`, an empty directory; `/e/keep` lifts `/e`'s
+/// count off the two a directory never goes below.
 fn base() -> Vec<u8> {
     let rw = Failing::after(fixture(4096, b"seed\n"), u64::MAX);
     let vol = Ext4(&rw);
     vol.mkdir_at(2, b"d", NOW).unwrap();
     vol.mkdir_at(2, b"e", NOW).unwrap();
     vol.mkdir_at(vol.resolve_dir(b"/d").unwrap(), b"sub", NOW).unwrap();
+    vol.mkdir_at(vol.resolve_dir(b"/e").unwrap(), b"keep", NOW).unwrap();
     for (parent, name, size) in [(b"/d" as &[u8], b"src" as &[u8], 9000), (b"/e", b"dst", 5000)] {
         vol.create_file(parent, name, NOW).unwrap();
         vol.grow_file(&[parent, b"/", name].concat(), size, NOW).unwrap();
@@ -83,7 +85,8 @@ fn a_rename_stopped_at_any_write_never_leaves_a_name_reaching_what_is_freed() {
                     let _ = Ext4(&rw.image).release(id, NOW);
                 }
                 let stopped = rw.image.0.into_inner();
-                for then in ["asked again", "the old name removed", "the new name removed"] {
+                let thens = ["asked again", "the old name removed", "the new name removed", "moved on", "moved into"];
+                for then in thens {
                     let rw = crate::test_support::RwImage(std::cell::RefCell::new(stopped.clone()));
                     let vol = Ext4(&rw);
                     match then {
@@ -93,7 +96,16 @@ fn a_rename_stopped_at_any_write_never_leaves_a_name_reaching_what_is_freed() {
                             }
                         }
                         "the old name removed" => remove(&vol, from),
-                        _ => remove(&vol, to),
+                        "the new name removed" => remove(&vol, to),
+                        "moved on" => {
+                            if let Ok(Some(id)) = vol.rename_path(to, b"/d/onward", false, NOW) {
+                                let _ = vol.release(id, NOW);
+                            }
+                        }
+                        _ => {
+                            let into = vol.rename_path(b"/e", b"/e/sub/e", false, NOW);
+                            assert!(into.is_err(), "{from:?} -> {to:?}, write {n} refused: /e moved into itself");
+                        }
                     }
                     let _ = vol.create_file(b"/e", b"fresh", NOW);
                     let _ = vol.grow_file(b"/e/fresh", 20000, NOW);
@@ -177,6 +189,26 @@ fn what_a_change_answers_is_what_it_did() {
             let answered = op(&Ext4(&rw));
             let changed = done(&Ext4(&rw.image));
             assert_eq!(answered.is_ok(), changed, "{what}, write {n} of {total} refused: answered {answered:?}");
+        }
+    }
+}
+
+/// **A mkdir stopped at any write leaves its parent no fewer links than names**: the parent counts
+/// the new `..` before it is named.
+#[test]
+fn a_mkdir_stopped_at_any_write_leaves_no_count_short() {
+    let base = base();
+    let total = writes(&base, |vol| {
+        let _ = vol.mkdir_at(vol.resolve_dir(b"/e").unwrap(), b"made", NOW);
+    });
+    for n in 0..total {
+        for once in [true, false] {
+            let rw = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
+            let vol = Ext4(&rw);
+            let _ = vol.mkdir_at(vol.resolve_dir(b"/e").unwrap(), b"made", NOW);
+            let text = e2fsck(&rw.image.0.borrow());
+            let ok = NEVER.iter().all(|bad| !text.contains(bad)) && !fewer_links_than_names(&text);
+            assert!(ok, "mkdir, write {n} of {total} refused {}:\n{text}", if once { "once" } else { "on" });
         }
     }
 }

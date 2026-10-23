@@ -166,8 +166,14 @@ a stop that cannot be undone leaves nothing a later change can damage:
   removed: a stop between leaves two names and two links.
 - **A directory loses its old name first**, since it may have only one: a stop leaves it
   unreachable, for `e2fsck` to reconnect. Moving between parents, the new parent counts its `..`
-  before it is repointed and the old stops after, so a count is only ever too high; `rmdir` takes
-  the link from the directory the removed `..` names.
+  before it is repointed and the directory the `..` named stops after, so a count is only ever too
+  high; `rmdir` takes the link from the directory the removed `..` names, if it is one. A `mkdir`
+  counts its parent before anything names the new directory. **A directory's count is
+  `dir_nlink`'s**, as Linux keeps it: 1 is more subdirectories than 65,000 could count, and stays
+  1; a count never goes below a directory's own two.
+- **Whether a directory is under another is asked of the tree**, a `..` at a time, each parent
+  required to name its child: a stopped move leaves a `..` its parent does not answer, and the walk
+  refuses it rather than trust it.
 - **A file renamed to a name it has already is left alone**, as POSIX's rename leaves it.
 
 **Once a change's name has changed, nothing after fails it**: an unlink, rmdir, create, `mkdir` or

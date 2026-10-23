@@ -397,3 +397,53 @@ fn a_rename_is_refused_before_it_writes() {
     let refused = rename_path(&none, b"/system/current-generation", &long, false, 0);
     assert_eq!(refused, Err(FsError::Unsupported), "refused before a write, which would have answered Io");
 }
+
+/// **A directory's count of 1 means too many subdirectories to count**, under `dir_nlink`: a mkdir
+/// or an rmdir in it leaves 1, a count past 65,000 becomes 1, and an rmdir never takes a directory
+/// below its own two. An rmdir took 1 to 0, and a live directory then answered `NotFound`.
+#[test]
+fn a_directory_count_of_one_means_too_many_to_count() {
+    use super::{inode_offset, mkdir_at, read_superblock, resolve_path_ino, rmdir_at};
+    use crate::test_support::RwImage;
+    let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    let sb = read_superblock(&rw).unwrap();
+    mkdir_at(&rw, 2, b"d", 0).unwrap();
+    let d = resolve_path_ino(&rw, &sb, b"/d").unwrap().0;
+    mkdir_at(&rw, d, b"s", 0).unwrap();
+    let at = inode_offset(&rw, &sb, d).unwrap() as usize + 26;
+    let links = |rw: &RwImage| u16::from_le_bytes([rw.0.borrow()[at], rw.0.borrow()[at + 1]]);
+    let set = |rw: &RwImage, n: u16| rw.0.borrow_mut()[at..at + 2].copy_from_slice(&n.to_le_bytes());
+    set(&rw, 1);
+    rmdir_at(&rw, d, b"s", 0, |_| ()).unwrap();
+    assert_eq!(links(&rw), 1, "an rmdir leaves 1");
+    mkdir_at(&rw, d, b"t", 0).unwrap();
+    assert_eq!(links(&rw), 1, "a mkdir leaves 1");
+    set(&rw, 65_000);
+    mkdir_at(&rw, d, b"u", 0).unwrap();
+    assert_eq!(links(&rw), 1, "past 65,000, 1");
+    set(&rw, 2);
+    rmdir_at(&rw, d, b"u", 0, |_| ()).unwrap();
+    assert_eq!(links(&rw), 2, "never below a directory's own two");
+}
+
+/// **An unlink of one of two names answers what it did**, with each write refused once: `Ok`
+/// exactly when the name is gone, though the other name's count is a write after the removal.
+#[test]
+fn an_unlink_of_one_of_two_names_answers_what_it_did() {
+    use super::{EXT4_FT_REG_FILE, dir_insert, inode_offset, read_superblock, resolve_path_ino, unlink_at};
+    use crate::test_support::{Failing, RwImage};
+    let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    let sb = read_superblock(&rw).unwrap();
+    let (sys, mut dir) = resolve_path_ino(&rw, &sb, b"/system").unwrap();
+    let (ino, _) = resolve_path_ino(&rw, &sb, b"/system/current-generation").unwrap();
+    dir_insert(&rw, &sb, sys, &mut dir, b"twin", ino, EXT4_FT_REG_FILE, 0).unwrap();
+    let at = inode_offset(&rw, &sb, ino).unwrap() as usize + 26;
+    rw.0.borrow_mut()[at..at + 2].copy_from_slice(&2u16.to_le_bytes());
+    let base = rw.0.into_inner();
+    for n in 0..3 {
+        let f = Failing::once(base.clone(), n);
+        let answered = unlink_at(&f, sys, b"twin", 0);
+        let gone = resolve_path_ino(&f.image, &sb, b"/system/twin").is_err();
+        assert_eq!(answered.map(|o| o.is_none()), if gone { Ok(true) } else { Err(FsError::Io) }, "write {n}");
+    }
+}

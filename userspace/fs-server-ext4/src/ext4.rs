@@ -1261,6 +1261,8 @@ fn live_dir(inode: &[u8; 256]) -> bool {
 }
 
 const DIR_MODE: u16 = S_IFDIR | 0o755;
+/// `EXT4_LINK_MAX`: past it a directory counts 1, `dir_nlink`'s "too many to count".
+const DIR_LINK_MAX: i32 = 65_000;
 
 /// Fixed `i_dtime` stamp for a freed inode (2023-11-14T22:13:20Z), the **fallback** for a machine
 /// whose wall clock could not be anchored; not a small value that `e2fsck` would read as an
@@ -1462,12 +1464,22 @@ fn dir_remove<RW: BlockReader + BlockWriter>(
 
 /// Adjust inode `ino`'s `i_links_count` by `delta`: a directory's for a subdirectory's `..`, a
 /// file's for a name a rename is moving. `Corrupt` for a count it would take past its range.
+///
+/// **A directory's count is `dir_nlink`'s**, as Linux keeps it: 1 means more subdirectories than
+/// 65,000 could count, so it stays 1, a count past that becomes 1, and a directory never goes
+/// below its own two, `.` and its name.
 fn adjust_links<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock, ino: u32, delta: i32) -> Result<(), FsError> {
     let off = inode_offset(rw, sb, ino)?;
     let mut inode = [0u8; 256];
     let n = (sb.inode_size as usize).min(256);
     rw.read_meta(off, &mut inode[..n])?;
-    let links = u16::try_from(rd_u16(&inode, 26) as i32 + delta).map_err(|_| FsError::Corrupt)?;
+    let was = rd_u16(&inode, 26) as i32;
+    let links = match rd_u16(&inode, 0) & S_IFMT == S_IFDIR {
+        true if was == 1 || (delta < 0 && was <= 2) => was,
+        true if was + delta > DIR_LINK_MAX => 1,
+        _ => was + delta,
+    };
+    let links = u16::try_from(links).map_err(|_| FsError::Corrupt)?;
     inode[26..28].copy_from_slice(&links.to_le_bytes());
     rw.write_at(off, &inode[..n])?;
     Ok(())
@@ -1494,7 +1506,11 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8
     let new_ino = alloc_inode(rw, &sb)?;
     let mut taken_block = None;
     let mut counted = false;
+    let mut parent_counted = false;
     let made = (|| {
+        // The parent counts the new `..` before anything names it, so a stop leaves it too high.
+        adjust_links(rw, &sb, dir_ino, 1)?;
+        parent_counted = true;
         let dblock = alloc_block(rw, &sb, sb.first_data_block as u64)?;
         taken_block = Some(dblock);
 
@@ -1543,18 +1559,20 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8
         rw.write_at(gd_off, &gd[..dsz])?;
         counted = true;
 
-        let mut parent = parent;
+        let mut parent = read_inode(rw, &sb, dir_ino)?;
         dir_insert(rw, &sb, dir_ino, &mut parent, name, new_ino, EXT4_FT_DIR, now)
     })();
     if let Err(e) = made {
+        if parent_counted {
+            let _ = adjust_links(rw, &sb, dir_ino, -1);
+        }
         if let Some(dblock) = taken_block {
             let _ = free_block(rw, &sb, dblock);
         }
         let _ = free_inode(rw, &sb, new_ino, counted, now);
         return Err(e);
     }
-    // Linked, so made: a count or a time left unwritten does not unmake it.
-    let _ = adjust_links(rw, &sb, dir_ino, 1);
+    // Linked, so made: a time left unwritten does not unmake it.
     let _ = touch_inode(rw, &sb, dir_ino, now, Stamp::Modified);
     Ok(())
 }
@@ -1673,8 +1691,7 @@ pub fn rmdir_at<RW: BlockReader + BlockWriter>(
         return Err(FsError::NotEmpty);
     }
 
-    // Its `..` gave a link to the directory it names: the parent, unless a move stopped between.
-    let up = dir_lookup(rw, &sb, &sub, b"..").ok();
+    let up = counted_parent(rw, &sb, &sub);
     freeing(sub_ino);
     dir_remove(rw, &sb, &parent, name)?;
     // The name is gone, so nothing left fails the removal; what is left unwritten leaks at worst.
@@ -1735,9 +1752,44 @@ fn within<R: BlockReader>(r: &R, sb: &Superblock, mut dir: u32, ancestor: u32) -
         if dir == ROOT_INO {
             return Ok(false);
         }
-        dir = dir_lookup(r, sb, &read_inode(r, sb, dir)?, b"..")?;
+        // A `..` its parent does not answer, as a move stopped between leaves one, is no path up.
+        let up = dir_lookup(r, sb, &read_inode(r, sb, dir)?, b"..")?;
+        if !names(r, sb, &read_inode(r, sb, up)?, dir)? {
+            return Err(FsError::Corrupt);
+        }
+        dir = up;
     }
     Err(FsError::Corrupt)
+}
+
+/// Whether directory `dir` has an entry, other than `.` and `..`, naming inode `ino`.
+fn names<R: BlockReader>(r: &R, sb: &Superblock, dir: &[u8; 256], ino: u32) -> Result<bool, FsError> {
+    let bs = sb.block_size as usize;
+    let mut buf = [0u8; MAX_BLOCK];
+    let mut map = Lookup::new(dir);
+    for lb in 0..(rd_u32(dir, 4) as u64).div_ceil(bs as u64) {
+        let phys = map.block(r, sb, lb)?;
+        if phys == 0 {
+            continue;
+        }
+        r.read_meta(phys * bs as u64, &mut buf[..bs])?;
+        let mut off = 0;
+        while let Some(e) = record(&buf[..bs], off) {
+            let name = &buf[off + 8..off + 8 + e.name_len];
+            if e.ino == ino && name != b"." && name != b".." {
+                return Ok(true);
+            }
+            off += e.len;
+        }
+    }
+    Ok(false)
+}
+
+/// **The directory whose count `dir`'s `..` holds a link in**, if it names a live directory: the
+/// parent, unless a move stopped between. A crafted `..` naming a file names none.
+fn counted_parent<R: BlockReader>(r: &R, sb: &Superblock, dir: &[u8; 256]) -> Option<u32> {
+    let up = dir_lookup(r, sb, dir, b"..").ok()?;
+    read_inode(r, sb, up).ok().filter(live_dir).map(|_| up)
 }
 
 fn split_parent(path: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -1819,6 +1871,7 @@ fn rename<RW: BlockReader + BlockWriter>(
     if moves_up {
         dir_lookup(rw, sb, &src, b"..")?; // the record the move repoints
     }
+    let up = counted_parent(rw, sb, &src);
     let replaced = match dir_lookup(rw, sb, &new_dir, new_name) {
         Ok(_) if !replace => return Err(FsError::Exists),
         Ok(dest_ino) if dest_ino == src_ino => return Ok(None), // as POSIX leaves it
@@ -1873,7 +1926,9 @@ fn rename<RW: BlockReader + BlockWriter>(
                 }
                 return Err(e);
             }
-            let _ = adjust_links(rw, sb, old_dir_ino, -1);
+            if let Some(up) = up {
+                let _ = adjust_links(rw, sb, up, -1);
+            }
         }
     } else {
         adjust_links(rw, sb, src_ino, 1)?;

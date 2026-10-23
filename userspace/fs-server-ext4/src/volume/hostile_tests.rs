@@ -214,3 +214,19 @@ fn garbage_in_any_structure_is_an_error_never_a_panic() {
         }
     }
 }
+
+/// **An rmdir takes a link only from a directory**: a crafted `..` naming a file took that file's
+/// one link, while a name still reached it.
+#[test]
+fn an_rmdir_takes_a_link_only_from_a_directory() {
+    let img = RwImage(RefCell::new(populated(4096)));
+    let vol = Ext4(&img);
+    let file = vol.map_file(b"/system/a", &mut [BlockRun::default(); 4]).unwrap().id as u32;
+    let inner = vol.resolve_dir(b"/d/inner").unwrap() as u32;
+    let at = records(&img, inner)[1].0 as usize;
+    img.0.borrow_mut()[at..at + 4].copy_from_slice(&file.to_le_bytes());
+    let d = vol.resolve_dir(b"/d").unwrap();
+    assert_eq!(vol.rmdir_at(d, b"inner", NOW, |_| ()), Ok(()));
+    let sb = read_superblock(&img).unwrap();
+    assert_eq!(rd_u16(&read_inode(&img, &sb, file).unwrap(), 26), 1, "the file keeps its link");
+}
