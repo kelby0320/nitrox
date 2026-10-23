@@ -212,7 +212,7 @@ pub struct IpcMsgHeader {
     pub handle_count: u8,
     /// Padding (offset 9).
     pub _pad1: u8,
-    /// `IpcMsgFlags` bitfield (offset 10).
+    /// The sender's flags, carried to the receiver as sent (offset 10).
     pub flags: u16,
     /// Padding to 8-byte-align `timestamp` (offset 12).
     pub _pad2: [u8; 4],

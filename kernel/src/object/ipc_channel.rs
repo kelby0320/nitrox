@@ -48,12 +48,15 @@ impl StoredMsg {
         unsafe { core::mem::zeroed() }
     }
 
-    /// Zero the payload past `header.payload_len`, as a receiver is promised: a sender's buffer
-    /// can carry stale bytes there, a typed password among them. `None` if the length claims
-    /// more than the payload holds.
+    /// Zero what a receiver is promised zeroed, the header's padding and the payload past
+    /// `header.payload_len`: a sender's buffer can carry stale bytes there, a typed password among
+    /// them. `flags` is the sender's, and passes. `None` if the length claims more than the
+    /// payload holds.
     pub fn seal(&mut self) -> Option<usize> {
         let len = self.header.payload_len as usize;
         self.payload.get_mut(len..)?.fill(0);
+        self.header._pad1 = 0;
+        self.header._pad2 = [0; 4];
         Some(len)
     }
 
