@@ -357,3 +357,43 @@ fn a_directory_linux_indexed_is_made_linear_before_a_name_goes_in() {
     rename_path(&rw, b"/big/a file with a longish name 7", b"/big/renamed", false, 0).unwrap();
     assert_e2fsck_clean(&rw.0.into_inner(), "after names went into an indexed directory");
 }
+
+/// **A rename keeps the type its record had**: a symlink renamed within a directory and across
+/// directories stays a symlink's record. The type was made from the mode, as a directory or a file.
+#[test]
+fn a_rename_keeps_the_type_its_record_had() {
+    use super::{read_superblock, rename_at, rename_path, resolve_path_ino};
+    use crate::test_support::{RwImage, assert_e2fsck_clean};
+    let dir = std::env::temp_dir().join(format!("nitrox-ext4-symlink-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("stage/d")).unwrap();
+    std::os::unix::fs::symlink("d", dir.join("stage/link")).unwrap();
+    std::os::unix::fs::symlink("..", dir.join("stage/d/up")).unwrap();
+    let img = dir.join("img");
+    let made = std::process::Command::new("mke2fs")
+        .args(["-q", "-F", "-t", "ext4", "-O", "^has_journal,^64bit,^metadata_csum,^resize_inode", "-d"])
+        .args([dir.join("stage").as_os_str(), img.as_os_str(), "4096".as_ref()])
+        .status();
+    assert!(made.unwrap().success());
+    let rw = RwImage(std::cell::RefCell::new(std::fs::read(&img).unwrap()));
+    let _ = std::fs::remove_dir_all(&dir);
+    rename_at(&rw, 2, b"link", b"link2", 0).unwrap();
+    rename_path(&rw, b"/d/up", b"/up2", false, 0).unwrap();
+    let sb = read_superblock(&rw).unwrap();
+    assert!(resolve_path_ino(&rw, &sb, b"/link2").is_ok());
+    assert_e2fsck_clean(&rw.0.into_inner(), "after renaming symlinks");
+}
+
+/// **A rename of a name that is not there is `NotFound`**, to itself too; and **a new name too long
+/// is refused before anything is written**, though a later insert would refuse it and be undone.
+#[test]
+fn a_rename_is_refused_before_it_writes() {
+    use super::{rename_at, rename_path};
+    use crate::test_support::RwImage;
+    let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    assert_eq!(rename_at(&rw, 2, b"missing", b"missing", 0), Err(FsError::NotFound));
+    assert_eq!(rename_path(&rw, b"/missing", b"/missing", false, 0), Err(FsError::NotFound));
+    let none = crate::test_support::Failing::after(rw.0.into_inner(), 0);
+    let long = [b"/system/" as &[u8], &[b'a'; 256]].concat();
+    let refused = rename_path(&none, b"/system/current-generation", &long, false, 0);
+    assert_eq!(refused, Err(FsError::Unsupported), "refused before a write, which would have answered Io");
+}

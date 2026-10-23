@@ -393,6 +393,11 @@ fn stat_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<InodeS
 }
 
 fn dir_lookup<R: BlockReader>(r: &R, sb: &Superblock, dir: &[u8; 256], name: &[u8]) -> Result<u32, FsError> {
+    dir_find(r, sb, dir, name).map(|(ino, _)| ino)
+}
+
+/// [`dir_lookup`], and the type its record gives.
+fn dir_find<R: BlockReader>(r: &R, sb: &Superblock, dir: &[u8; 256], name: &[u8]) -> Result<(u32, u8), FsError> {
     let size = rd_u32(dir, 4) as u64;
     let bs = sb.block_size as usize;
     let nblocks = size.div_ceil(sb.block_size as u64);
@@ -407,7 +412,7 @@ fn dir_lookup<R: BlockReader>(r: &R, sb: &Superblock, dir: &[u8; 256], name: &[u
         let mut off = 0;
         while let Some(e) = record(&buf[..bs], off) {
             if e.ino != 0 && e.name_len > 0 && &buf[off + 8..off + 8 + e.name_len] == name {
-                return Ok(e.ino);
+                return Ok((e.ino, e.file_type));
             }
             off += e.len;
         }
@@ -1795,16 +1800,17 @@ fn rename<RW: BlockReader + BlockWriter>(
     if !live_dir(&old_dir) || !live_dir(&new_dir) {
         return Err(FsError::NotFound);
     }
+    // The type the source's record gives, which the mode's format bits alone would not: a symlink,
+    // a device or a socket from Linux.
+    let (src_ino, src_ft) = dir_find(rw, sb, &old_dir, old_name)?;
     if old_dir_ino == new_dir_ino && old_name == new_name {
         return Ok(None);
     }
     if new_name.len() > 255 {
         return Err(FsError::Unsupported); // an entry's length is one byte
     }
-    let src_ino = dir_lookup(rw, sb, &old_dir, old_name)?;
     let src = read_inode(rw, sb, src_ino)?;
     let src_is_dir = rd_u16(&src, 0) & S_IFMT == S_IFDIR;
-    let src_ft = if src_is_dir { EXT4_FT_DIR } else { EXT4_FT_REG_FILE };
     let moves_up = src_is_dir && old_dir_ino != new_dir_ino;
     // Moving a directory into its own subtree would detach it: its `..` would point into the cycle.
     if src_is_dir && within(rw, sb, new_dir_ino, src_ino)? {
