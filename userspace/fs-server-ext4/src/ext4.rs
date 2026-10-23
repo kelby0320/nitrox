@@ -1051,6 +1051,9 @@ fn dir_insert<RW: BlockReader + BlockWriter>(
     file_type: u8,
     now: i64,
 ) -> Result<(), FsError> {
+    if name.len() > 255 {
+        return Err(FsError::Unsupported); // an entry's length is one byte
+    }
     let bs = sb.block_size as usize;
     let size = rd_u32(dir_inode, 4) as u64;
     let nblocks = size.div_ceil(sb.block_size as u64);

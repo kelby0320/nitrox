@@ -14,9 +14,10 @@ use librsproto::namespace::{
 use librsproto::{OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 /// **Whether a session may name `name`** in its directory: one entry, never `.` or `..`, which
-/// name the directory and its parent, a way out of a directory a session is confined to.
+/// name the directory and its parent, a way out of a directory a session is confined to. How long
+/// a name may be is each filesystem's: ext4's 255 bytes, FAT's 255 UTF-16 units, up to 765 bytes.
 pub fn entry_name(name: &[u8]) -> bool {
-    !name.is_empty() && name.len() <= 255 && !name.contains(&b'/') && name != b"." && name != b".."
+    !name.is_empty() && !name.contains(&b'/') && name != b"." && name != b".."
 }
 
 /// Largest suffix the server resolves (bounds the on-stack path buffer). A longer path

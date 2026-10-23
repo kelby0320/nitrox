@@ -291,3 +291,20 @@ fn a_removed_directory_is_refused_to_a_session_still_holding_it() {
     let (code, said) = crate::test_support::fsck(&img);
     assert_eq!(code, 0, "{said}");
 }
+
+/// **A long name is FAT's to limit, not the protocol's**: 100 CJK characters are 300 bytes of
+/// UTF-8 and 100 units, which FAT holds, so a session may name them as FAT can.
+#[test]
+fn a_long_name_past_255_bytes_of_utf8_passes_the_protocol_and_is_made() {
+    let img = mformat(16, &["-c", "8"]);
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let root = fat.resolve_dir(b"/").unwrap();
+    let long = "名".repeat(100);
+    assert!(libfsserver::serve::entry_name(long.as_bytes()), "a session may name it");
+    fat.mkdir_at(root, long.as_bytes(), NOW).unwrap();
+    let mut freed = None;
+    assert_eq!(fat.rmdir_at(root, long.as_bytes(), NOW, |id| freed = Some(id)), Ok(()), "and by it removed");
+    assert!(freed.is_some());
+    assert_eq!(fat.mkdir_at(root, "名".repeat(256).as_bytes(), NOW), Err(FsError::InvalidName), "past 255 units");
+}

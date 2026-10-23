@@ -390,6 +390,30 @@ mod tests {
         assert_eq!(flags_of(served, &reply), 0);
     }
 
+    /// **A name past 255 bytes is no ext4 entry**, whichever call would insert it: an entry's length
+    /// is one byte, and a rename to 256 wrote a zero-length name, one to 300 a 44-byte one. The
+    /// protocol leaves the length to the filesystem, since FAT's can run to 765 bytes.
+    #[test]
+    fn a_name_past_255_bytes_is_refused_by_every_insert() {
+        use crate::test_support::{RwImage, assert_e2fsck_clean};
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
+        let vol = Ext4(&rw);
+        let sys = vol.resolve_dir(b"/system").unwrap();
+        for len in [256, 300] {
+            let long = vec![b'a'; len];
+            let path = [b"/system/" as &[u8], &long].concat();
+            let old = b"/system/current-generation";
+            assert!(libfsserver::serve::entry_name(&long), "the protocol leaves it to the filesystem");
+            assert_eq!(vol.rename_path(old, &path, false, 0), Err(FsError::Unsupported), "{len}, by path");
+            assert_eq!(vol.rename_at(sys, b"current-generation", &long, 0), Err(FsError::Unsupported), "{len}");
+            assert_eq!(vol.mkdir_at(sys, &long, 0), Err(FsError::Unsupported), "{len}");
+            assert_eq!(vol.create_file(b"/system", &long, 0), Err(FsError::Unsupported), "{len}");
+        }
+        let longest = [b"/system/" as &[u8], &[b'a'; 255]].concat();
+        assert_eq!(vol.rename_path(b"/system/current-generation", &longest, false, 0), Ok(None));
+        assert_e2fsck_clean(&rw.0.into_inner(), "after names past 255 bytes");
+    }
+
     /// **A removal gives its directory's id before any write it can fail after**, since the
     /// server ends the sessions on that id with it: with each write failing in turn, a directory
     /// whose id was not given is still there, and its inode is not the next directory's. A

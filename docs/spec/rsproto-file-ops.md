@@ -158,11 +158,13 @@ which the next directory made may be given. The channel of each closes, and its 
 request meets `PeerClosed`. **So does one that fails once its refusals are past**, before its first
 write: a removal failing midway can have freed the id. A refused one ends nothing.
 
-**A name is one entry of the session's directory**: 1 to 255 bytes, no `/`, and never `.` or
-`..`. Those two are listed, but they name the directory and its parent, and a session that could
-rename or touch `..` would reach past the directory it is confined to. A server refuses them in
-every request that names an entry, a rename's two names and a session's touch among them,
-`Unsupported`, before its filesystem sees them (`libfsserver::serve::entry_name`).
+**A name is one entry of the session's directory**: not empty, no `/`, and never `.` or `..`.
+Those two are listed, but they name the directory and its parent, and a session that could rename
+or touch `..` would reach past the directory it is confined to. A server refuses them in every
+request that names an entry, a rename's two names and a session's touch among them,
+`Unsupported`, before its filesystem sees them (`libfsserver::serve::entry_name`). **How long a
+name may be is the filesystem's**: ext4 refuses one past 255 bytes, `Unsupported`, and FAT one past
+255 UTF-16 units, `InvalidArgument`, which in UTF-8 can be 765 bytes.
 
 ### Rename (`0x0605`)
 
