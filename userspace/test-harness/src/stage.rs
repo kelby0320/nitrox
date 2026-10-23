@@ -1,8 +1,9 @@
 //! `test-stage` — a worker `parent` spawns. With a setup message pending (`arg0` marks it) it
 //! dispatches on `argv[0]`: `"stage <rows>"` verifies a TSM1 stream on stdin, `"fp <seed>"` runs
 //! the hard-float worker ([`run_fp_worker`]), `"test-stage grants"`, as a view broker starts it,
-//! reports what a view's grants still reach ([`run_grants`]). With `arg0 == 0` it exits at once: the exit-storm child, whose payload is the
-//! process teardown (kernel-stack free, TLB shootdown, reap) racing across CPUs.
+//! reports what a view's grants still reach ([`run_grants`]). With `arg0 == 0` it exits at once:
+//! the exit-storm child, whose payload is the process teardown (kernel-stack free, TLB shootdown,
+//! reap) racing across CPUs.
 
 #![no_std]
 #![no_main]

@@ -32,7 +32,8 @@ struct PartEntry {
     by_partuuid: KVec<u8>,
     /// `/dev/disk/by-partlabel/<label>` path (absent if the label is not a usable path component).
     by_partlabel: Option<KVec<u8>>,
-    /// On the disk the machine started from, or a RAM disk, which only the boot medium's modules are.
+    /// On the disk the machine started from, or a RAM disk, which only the boot medium's modules
+    /// are.
     boot_medium: bool,
 }
 
@@ -236,9 +237,9 @@ fn bind_names(ns: &Namespace, names: &[(ObjectRef, KVec<u8>, bool)]) {
     }
 }
 
-/// **Which partition each `/dev/disk` name goes to**, and whether it is still free for it: the boot
-/// medium's first, so another disk copying a label or GUID it carries never takes it, then the rest,
-/// each in the order found. `None` on running out of memory.
+/// **Which partition each `/dev/disk` name goes to**, and whether it is still free for it: the
+/// boot medium's first, so another disk copying a label or GUID it carries never takes it, then
+/// the rest, each in the order found. `None` on running out of memory.
 fn bind_order(parts: &[PartEntry]) -> Option<KVec<(ObjectRef, KVec<u8>, bool)>> {
     let mut out: KVec<(ObjectRef, KVec<u8>, bool)> = KVec::new();
     out.try_reserve(2 * parts.len()).ok()?;

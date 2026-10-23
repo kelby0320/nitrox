@@ -767,9 +767,9 @@ fn completion(err: bool, length: u64, moved: u32) -> (i32, u64) {
 
 /// Slot 0 has retired: under the port lock, take the completed IRP out of flight (capturing its
 /// error status and the bytes it moved) and mark the slot idle. Returns the IRP (`null` if already
-/// idle), whether it errored, and its header's byte count. Does **not** issue the next command: [`drain_queue`] does, from a DPC, so a fast
-/// pipelined completion cannot race the interrupt ack. The caller completes the IRP outside any
-/// lock.
+/// idle), whether it errored, and its header's byte count. Does **not** issue the next command:
+/// [`drain_queue`] does, from a DPC, so a fast pipelined completion cannot race the interrupt ack.
+/// The caller completes the IRP outside any lock.
 fn take_retired(d: &AhciDisk) -> (*mut Irp, bool, u32) {
     let _q = d.pending.lock();
     let retired = d.inflight.swap(core::ptr::null_mut(), Ordering::AcqRel);

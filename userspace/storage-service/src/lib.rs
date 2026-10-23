@@ -100,8 +100,8 @@ pub mod sources {
     }
 
     /// **Whose partitions the kernel names first** (`gpt::bind_order`): `0` the boot medium's, the
-    /// disk started from or a RAM disk, `1` another disk's, `None` a USB disk's, which it never names.
-    /// A name two carry is the lowest's, and among equals the first published's.
+    /// disk started from or a RAM disk, `1` another disk's, `None` a USB disk's, which it never
+    /// names. A name two carry is the lowest's, and among equals the first published's.
     pub fn name_rank(records: &[DeviceRecord], disk: u32) -> Option<u8> {
         let d = records.iter().find(|r| r.id == disk)?;
         match d.driver() == crate::mounts::USB_STORAGE {

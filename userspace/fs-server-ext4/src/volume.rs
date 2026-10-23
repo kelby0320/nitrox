@@ -390,9 +390,9 @@ mod tests {
         assert_eq!(flags_of(served, &reply), 0);
     }
 
-    /// **A name past 255 bytes is no ext4 entry**, whichever call would insert it: an entry's length
-    /// is one byte, and a rename to 256 wrote a zero-length name, one to 300 a 44-byte one. The
-    /// protocol leaves the length to the filesystem, since FAT's can run to 765 bytes.
+    /// **A name past 255 bytes is no ext4 entry**, whichever call would insert it: an entry's
+    /// length is one byte, and a rename to 256 wrote a zero-length name, one to 300 a 44-byte one.
+    /// The protocol leaves the length to the filesystem, since FAT's can run to 765 bytes.
     #[test]
     fn a_name_past_255_bytes_is_refused_by_every_insert() {
         use crate::test_support::{RwImage, assert_e2fsck_clean};
