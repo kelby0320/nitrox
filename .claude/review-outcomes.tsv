@@ -169,3 +169,16 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-22	391	ccfde55d	10	rules-and-docs	optional	demonstrated	fixed	f32b8f79	a decision-log entry names each contract group A changes
 2026-10-22	391	ccfde55d	11	rules-and-docs	optional	demonstrated	fixed	f32b8f79	userspace-build.md gives the loader bounds as they are
 2026-10-22	391	ccfde55d	12	architecture+rules-and-docs	optional	demonstrated	fixed	f32b8f79	syscall-abi.md names the refusals; handle-system.md and lock-ordering.md name Timer::drop
+2026-10-22	392	bbca02b7	1	logic+architecture	worth-fixing	demonstrated	fixed	632705e0	a cached file refuses a reply naming another device, DeviceChanged, before anything is resized; the test fails with the check disabled
+2026-10-22	392	bbca02b7	2	error-paths	worth-fixing	demonstrated	fixed	d329f6fd	Volume::rmdir_at hands its id to a callback before its first change; every write failing in turn and FAT's hostile chain tested in both servers; the server handed a no-op fails boot-probe
+2026-10-22	392	bbca02b7	3	logic+architecture	worth-fixing	demonstrated	fixed	4ea99256	docs narrowed to what shares the view, a sys_ns_derive copy keeping its grants; the maintainer chose: authority ends with the session unless keeping it is asked for, built with the forcible kill
+2026-10-22	392	bbca02b7	4	logic	optional	unverified	fixed	3265783c	entry_name leaves length to the filesystem; the sweep found ext4 writing a 256-byte rename target as a zero-length entry, now refused in dir_insert
+2026-10-22	392	bbca02b7	5	logic	optional	demonstrated	fixed	42b0017e	init::device_rights gives WRITE only to an rw mount; host test; no gate boots an ro init mount
+2026-10-22	392	bbca02b7	6	logic	optional	demonstrated	fixed	16196768	rs_send sends from a whole message; the 93 other raw sends checked, all 4 KiB; round_trip refuses a short buffer, host-tested
+2026-10-22	392	bbca02b7	7	tests	optional	demonstrated	declined		a host test has no current process, so sys_memory_map stops KernelError before its rights; boot-probe map_needs_read_test fails without the rule, in CI
+2026-10-22	392	bbca02b7	8	tests	optional	demonstrated	declined		a host test has no current thread, so a send stops at its channel lookup; boot-probe payload_sealed_test fails without the seal, in CI
+2026-10-22	392	bbca02b7	9	tests	optional	demonstrated	declined		take_retired reads a live HBA; a wrong word fails every AHCI read and so every gate; only a short-reporting controller, which QEMU is not, shows the rest
+2026-10-22	392	bbca02b7	10	rules-and-docs	optional	demonstrated	fixed	dd01115f	both lines rewrapped, and four more this branch added past 100 columns
+2026-10-22	392	bbca02b7	11	rules-and-docs	optional	demonstrated	fixed	ded90488	syscall-abi.md gives the file verbs' arguments and states the refusals and the send mode's
+2026-10-22	392	bbca02b7	12	architecture	optional	demonstrated	fixed	8db8ae06	seal() zeroes the header padding; flags are the sender's, the spec's IpcMsgFlags never built and libstream relying on bit 0
+2026-10-22	392	bbca02b7	13	architecture	optional	unverified	declined		measured in test-qemu --kvm: 1,024 calls, 430 ns average with the lock, longest hold 4.6 us over at most 26 threads, bounded by MAX_THREADS; an O(1) flag would pin a Process per lookup
