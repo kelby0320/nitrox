@@ -327,10 +327,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
             return None;
         }
     };
-    // READ+WRITE (the RW server writes metadata) + TRANSFER (to hand it over) + DUPLICATE (the
-    // server hands the kernel a copy for the data path).
-    let (st, device) =
-        ns_lookup_wait(root_ns, dev_path.as_bytes(), RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER | RIGHT_DUPLICATE);
+    let (st, device) = ns_lookup_wait(root_ns, dev_path.as_bytes(), init::device_rights(m.mode));
     if st != 0 || device == 0 {
         Line::new().s(b"init: device ").s(dev_path.as_bytes()).s(b" not found").end();
         return None;

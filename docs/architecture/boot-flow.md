@@ -311,7 +311,8 @@ object`, then:
 1. **Read the manifest** — `/initramfs/etc/init.toml`, parsed into an ordered list of
    mounts (shallowest first). Unreadable, unparseable or non-UTF-8 → the emergency path.
 2. **Mount the critical path.** Per entry: resolve the device, spawn the fs-server, hand
-   over the device handle (and, for a `"ro"` mount, the read-only flag), wait for its `Ready`
+   over the device handle — with `WRITE` only for an `"rw"` mount, and for a `"ro"` one the
+   read-only flag too (`init::device_rights`) — wait for its `Ready`
    message carrying the server's endpoint, and bind that endpoint at the mount point, **keeping the
    server's control channel** for the unmount a shutdown ends with (administration Part E.4). A
    writable server records the filesystem mounted before it answers, and reports one it finds
