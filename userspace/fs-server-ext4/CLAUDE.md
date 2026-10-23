@@ -129,4 +129,7 @@ holds `BIND_NAMESPACE` — the supervisor (init, or the storage service) binds i
   step around a read-only mount's `ReadOnly`, which is the whole of its enforcement.
 - Binding itself into a namespace, or holding `BIND_NAMESPACE`.
 - Trusting on-disk structures without bounds-checking (a malformed image must
-  yield `FsError`, never a panic or OOB read).
+  yield `FsError`, never a panic or OOB read). A directory's records are read through `record`,
+  which refuses one its length cannot hold. `garbage_in_any_structure_is_an_error_never_a_panic`
+  (`volume/hostile_tests.rs`) holds the rule as a class, on real structures made wrong: a new
+  reader of on-disk bytes belongs in what it exercises.

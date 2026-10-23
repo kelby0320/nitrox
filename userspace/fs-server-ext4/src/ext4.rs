@@ -336,17 +336,11 @@ fn dir_lookup<R: BlockReader>(r: &R, sb: &Superblock, dir: &[u8; 256], name: &[u
         }
         r.read_meta(phys * sb.block_size as u64, &mut buf[..bs])?;
         let mut off = 0;
-        while off + 8 <= bs {
-            let e_ino = rd_u32(&buf, off);
-            let rec_len = rd_u16(&buf, off + 4) as usize;
-            let name_len = buf[off + 6] as usize;
-            if rec_len < 8 || off + rec_len > bs {
-                break; // malformed / end of block
+        while let Some(e) = record(&buf[..bs], off) {
+            if e.ino != 0 && e.name_len > 0 && &buf[off + 8..off + 8 + e.name_len] == name {
+                return Ok(e.ino);
             }
-            if e_ino != 0 && name_len > 0 && off + 8 + name_len <= bs && &buf[off + 8..off + 8 + name_len] == name {
-                return Ok(e_ino);
-            }
-            off += rec_len;
+            off += e.len;
         }
     }
     Err(FsError::NotFound)
@@ -476,29 +470,20 @@ fn read_dir_inner<R: BlockReader>(
             r.read_meta(phys * bs, &mut buf[..bs as usize])?;
             loaded_block = lb;
         }
-        if in_block + 8 > bs as usize {
+        let Some(e) = record(&buf[..bs as usize], in_block) else {
             pos = (lb + 1) * bs;
             continue;
-        }
-        let e_ino = rd_u32(&buf, in_block);
-        let rec_len = rd_u16(&buf, in_block + 4) as usize;
-        let name_len = buf[in_block + 6] as usize;
-        let file_type = buf[in_block + 7];
-        if rec_len < 8 || in_block + rec_len > bs as usize {
-            pos = (lb + 1) * bs;
-            continue;
-        }
-        // A live entry has a non-zero inode and a name that fits; `e_ino == 0` is a gap.
-        if e_ino != 0 && name_len > 0 && in_block + 8 + name_len <= bs as usize {
-            let name = &buf[in_block + 8..in_block + 8 + name_len];
+        };
+        if e.ino != 0 && e.name_len > 0 {
+            let name = &buf[in_block + 8..in_block + 8 + e.name_len];
             // A single bad inode degrades to a zeroed stat. This reads into its own buffers, so the
             // cached directory block in `buf` survives.
-            let stat = if want_stat { stat_inode(r, &sb, e_ino).unwrap_or_default() } else { InodeStat::default() };
-            if !emit(e_ino, file_type, name, &stat) {
+            let stat = if want_stat { stat_inode(r, &sb, e.ino).unwrap_or_default() } else { InodeStat::default() };
+            if !emit(e.ino, e.file_type, name, &stat) {
                 return Ok(pos);
             }
         }
-        pos += rec_len as u64;
+        pos += e.len as u64;
     }
     Ok(0)
 }
@@ -988,6 +973,29 @@ fn round4(n: usize) -> usize {
     (n + 3) & !3
 }
 
+/// A directory record's header: its inode (`0` for a gap), its length, and its name's.
+struct Record {
+    ino: u32,
+    len: usize,
+    name_len: usize,
+    file_type: u8,
+}
+
+/// **The record at `off` in the directory block `buf`**, or `None` where the block is malformed
+/// from there on: a record shorter than its header and name, not a multiple of 4, or past the
+/// block, as Linux checks one. Its name is then `buf[off + 8..off + 8 + name_len]`, in bounds.
+fn record(buf: &[u8], off: usize) -> Option<Record> {
+    if off + 8 > buf.len() {
+        return None;
+    }
+    let len = rd_u16(buf, off + 4) as usize;
+    let name_len = buf[off + 6] as usize;
+    if len < round4(8 + name_len) || !len.is_multiple_of(4) || off + len > buf.len() {
+        return None;
+    }
+    Some(Record { ino: rd_u32(buf, off), len, name_len, file_type: buf[off + 7] })
+}
+
 /// Allocate one free inode, taking the **first group that has one**: sets the inode-bitmap bit
 /// and decrements the group-descriptor and superblock free-inode counts. `TooLarge` only when
 /// every group is exhausted. **Locality is not attempted**: real ext4 places a new inode near its
@@ -1067,18 +1075,12 @@ fn dir_insert<RW: BlockReader + BlockWriter>(
         }
         rw.read_meta(phys * sb.block_size as u64, &mut buf[..bs])?;
         let mut off = 0;
-        while off + 8 <= bs {
-            let e_ino = rd_u32(&buf, off);
-            let rec_len = rd_u16(&buf, off + 4) as usize;
-            let e_name_len = buf[off + 6] as usize;
-            if rec_len < 8 || off + rec_len > bs {
-                break; // malformed / end of block
-            }
-            let used = if e_ino != 0 { round4(8 + e_name_len) } else { 0 };
-            if rec_len - used >= need {
+        while let Some(e) = record(&buf[..bs], off) {
+            let used = if e.ino != 0 { round4(8 + e.name_len) } else { 0 };
+            if e.len - used >= need {
                 let new_off = off + used;
-                let new_rec = rec_len - used;
-                if e_ino != 0 {
+                let new_rec = e.len - used;
+                if e.ino != 0 {
                     buf[off + 4..off + 6].copy_from_slice(&(used as u16).to_le_bytes());
                 }
                 buf[new_off..new_off + 4].copy_from_slice(&ino.to_le_bytes());
@@ -1089,7 +1091,7 @@ fn dir_insert<RW: BlockReader + BlockWriter>(
                 rw.write_at(phys * sb.block_size as u64, &buf[..bs])?;
                 return Ok(());
             }
-            off += rec_len;
+            off += e.len;
         }
     }
 
@@ -1356,22 +1358,11 @@ fn dir_remove<RW: BlockReader + BlockWriter>(
         rw.read_meta(phys * sb.block_size as u64, &mut buf[..bs])?;
         let mut off = 0;
         let mut prev: Option<usize> = None;
-        while off + 8 <= bs {
-            let e_ino = rd_u32(&buf, off);
-            let rec_len = rd_u16(&buf, off + 4) as usize;
-            let name_len = buf[off + 6] as usize;
-            let file_type = buf[off + 7];
-            if rec_len < 8 || off + rec_len > bs {
-                break;
-            }
-            if e_ino != 0
-                && name_len == name.len()
-                && off + 8 + name_len <= bs
-                && &buf[off + 8..off + 8 + name_len] == name
-            {
+        while let Some(e) = record(&buf[..bs], off) {
+            if e.ino != 0 && e.name_len == name.len() && &buf[off + 8..off + 8 + e.name_len] == name {
                 match prev {
                     Some(p) => {
-                        let prev_rec = rd_u16(&buf, p + 4) as usize + rec_len;
+                        let prev_rec = rd_u16(&buf, p + 4) as usize + e.len;
                         buf[p + 4..p + 6].copy_from_slice(&(prev_rec as u16).to_le_bytes());
                     }
                     None => {
@@ -1379,10 +1370,10 @@ fn dir_remove<RW: BlockReader + BlockWriter>(
                     }
                 }
                 rw.write_at(phys * sb.block_size as u64, &buf[..bs])?;
-                return Ok((e_ino, file_type));
+                return Ok((e.ino, e.file_type));
             }
             prev = Some(off);
-            off += rec_len;
+            off += e.len;
         }
     }
     Err(FsError::NotFound)
@@ -1631,21 +1622,14 @@ fn dir_repoint<RW: BlockReader + BlockWriter>(
         }
         rw.read_meta(phys * sb.block_size as u64, &mut buf[..bs])?;
         let mut off = 0;
-        while off + 8 <= bs {
-            let e_ino = rd_u32(&buf, off);
-            let rec_len = rd_u16(&buf, off + 4) as usize;
-            let name_len = buf[off + 6] as usize;
-            if rec_len < 8 || off + rec_len > bs {
-                break;
-            }
-            if e_ino != 0 && name_len == name.len() && &buf[off + 8..off + 8 + name_len] == name {
-                let old = e_ino;
+        while let Some(e) = record(&buf[..bs], off) {
+            if e.ino != 0 && e.name_len == name.len() && &buf[off + 8..off + 8 + e.name_len] == name {
                 buf[off..off + 4].copy_from_slice(&new_ino.to_le_bytes());
                 buf[off + 7] = new_ft;
                 rw.write_at(phys * sb.block_size as u64, &buf[..bs])?;
-                return Ok(old);
+                return Ok(e.ino);
             }
-            off += rec_len;
+            off += e.len;
         }
     }
     Err(FsError::NotFound)

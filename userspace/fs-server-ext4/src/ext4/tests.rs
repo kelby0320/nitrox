@@ -48,6 +48,25 @@ fn group_descriptors_are_a_flat_array_across_block_boundaries() {
     assert_eq!(sb.group_desc_offset(32), 2048 + 1024);
 }
 
+/// **A directory record is read only where its length holds its header and name**, is a
+/// multiple of 4 and ends in its block: each refusal, beside a record that passes.
+#[test]
+fn a_record_is_refused_unless_its_length_holds_it() {
+    use super::record;
+    let block = |len: u16, name_len: u8| {
+        let mut b = [0u8; 32];
+        b[0..4].copy_from_slice(&11u32.to_le_bytes());
+        b[4..6].copy_from_slice(&len.to_le_bytes());
+        b[6] = name_len;
+        b
+    };
+    assert_eq!(record(&block(12, 4), 0).map(|r| (r.ino, r.len, r.name_len)), Some((11, 12, 4)));
+    assert!(record(&block(12, 5), 0).is_none(), "a name past its record");
+    assert!(record(&block(14, 1), 0).is_none(), "a length not a multiple of 4");
+    assert!(record(&block(36, 1), 0).is_none(), "a record past its block");
+    assert!(record(&block(32, 1), 28).is_none(), "a header past its block");
+}
+
 /// `decode_time` takes the epoch-extension bits from the *matching* `extra` word.
 #[test]
 fn decode_time_applies_the_epoch_extension() {

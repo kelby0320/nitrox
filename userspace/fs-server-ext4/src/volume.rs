@@ -557,3 +557,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod hostile_tests;
