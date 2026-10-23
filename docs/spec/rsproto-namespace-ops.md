@@ -150,7 +150,10 @@ size and map its reply carries.
 **A reply for a cached file in another block size is refused** too, `KernelError` (PR #365 review,
 finding 3): its runs were checked against its own block size, and the object the kernel caches for
 the id keeps the one it was made with, so they would be used against a size nothing checked them
-for. A file's block size is its filesystem's, and does not change.
+for. A file's block size is its filesystem's, and does not change. **So is one naming another
+device**, `KernelError`: the cached object reads and writes back the device it was made with, and
+`MAP_WRITE` would be decided by a device the writes never reach. A server sends one device each
+time, a duplicate of its own handle, so the object is the same.
 
 **A map the kernel cannot use is refused** (Phase 6 Part E.4): a `block_size` that is not a power of
 two from 512 to a page, or a run whose ends — `file_block + length`, `device_lba + length`, and that

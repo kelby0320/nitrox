@@ -2423,6 +2423,7 @@ fn build_and_install_file_blocks(
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> (i32, u64) {
     use crate::object::FileObject;
+    use crate::object::file_object::CacheInError;
     use crate::rsproto::{file_blocks_rights, reply_body};
 
     let (device, device_rights) = match transfers[0].take() {
@@ -2457,8 +2458,8 @@ fn build_and_install_file_blocks(
     } else {
         match FileObject::cache_in(&reg_ref, candidate) {
             Ok(f) => f,
-            Err(crate::object::file_object::CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, 0),
-            Err(crate::object::file_object::CacheInError::BlockSizeChanged) => {
+            Err(CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, 0),
+            Err(CacheInError::BlockSizeChanged | CacheInError::DeviceChanged) => {
                 return (KError::KernelError as i32, 0);
             }
         }
