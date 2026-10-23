@@ -198,7 +198,10 @@ auto-mount is read-only**, since the machine's own disks are the install target 
 to one by accident could be taken back. **A removable disk's is writable on any boot** (Phase 6
 Part F): a stick is not the install target, and a person plugs one in to write to it. (Every
 auto-mount was read-only on a live boot until Part F.) An administrator's explicit mount (C.5c) is
-writable either way; it is the automatic one that has to be careful.
+writable either way; it is the automatic one that has to be careful. **Except an ext4 its server
+would only read**, mounted read-only by either (pre-Phase-7 Part D): one with a feature a write
+there would leave wrong, a checksum among them (`fs_server_ext4::ext4::check_writable`). Its log
+line and its row's note give the server's reason.
 
 **A mount is named by a label**: the filesystem's own, else its partition's name, else `blk-<n>`,
 taking the first that is valid. A valid label is 1 to 64 bytes of printable ASCII with no `/`, not

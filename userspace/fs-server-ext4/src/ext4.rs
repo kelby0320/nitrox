@@ -4,6 +4,8 @@
 //! descriptor's inode-table block, data via the inode's **extent tree**, and directories as a
 //! linear list of `ext4_dir_entry_2`.
 
+mod features;
+
 use crate::extent::{self, Extent, Lookup};
 use crate::{BlockReader, BlockWriter, FsError, rd_u16, rd_u32};
 
@@ -177,6 +179,20 @@ pub enum Unservable {
     /// A writable mount could not record that it is mounted: a filesystem that changed while
     /// looking clean would be worse than one not mounted.
     StateUnwritable,
+    /// The journal holds changes not yet replayed: what is on disk is not the filesystem yet.
+    NeedsRecovery,
+    /// Features this server does not read: their `s_feature_incompat` bits.
+    Incompatible {
+        /// The bits.
+        features: u32,
+    },
+    /// A writable mount of a filesystem a write here would leave wrong. It can be served read-only.
+    NotWritable {
+        /// The `ro_compat` bits.
+        ro_compat: u32,
+        /// The `incompat` bits missing.
+        lacking: u32,
+    },
 }
 
 impl Unservable {
@@ -187,7 +203,11 @@ impl Unservable {
             Unservable::NoMagic { .. } | Unservable::ZeroField(_) | Unservable::RootNotDirectory { .. } => {
                 FsError::Corrupt
             }
-            Unservable::Wide64Bit | Unservable::BlockTooLarge { .. } => FsError::Unsupported,
+            Unservable::Wide64Bit
+            | Unservable::BlockTooLarge { .. }
+            | Unservable::NeedsRecovery
+            | Unservable::Incompatible { .. } => FsError::Unsupported,
+            Unservable::NotWritable { .. } => FsError::ReadOnly,
         }
     }
 }
@@ -218,6 +238,26 @@ impl core::fmt::Display for Unservable {
             Unservable::StateUnwritable => {
                 write!(f, "the superblock could not be written to record the filesystem mounted")
             }
+            Unservable::NeedsRecovery => {
+                write!(f, "its journal holds changes not yet replayed: mount it on Linux, or run e2fsck, first")
+            }
+            Unservable::Incompatible { features } => {
+                write!(f, "features this server does not read: ")?;
+                features::names(f, features, false)
+            }
+            Unservable::NotWritable { ro_compat, lacking } => {
+                write!(f, "it can only be read here: ")?;
+                if ro_compat != 0 {
+                    write!(f, "this server does not keep its ")?;
+                    features::names(f, ro_compat, true)?;
+                }
+                if lacking != 0 {
+                    write!(f, "{}it lacks ", if ro_compat != 0 { "; " } else { "" })?;
+                    features::names(f, lacking, false)?;
+                    write!(f, ", which this server's writes make")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -228,8 +268,15 @@ fn parse_superblock(sb: &[u8; 1024]) -> Result<Superblock, Unservable> {
     if magic != SUPER_MAGIC {
         return Err(Unservable::NoMagic { found: magic });
     }
-    if rd_u32(sb, 96) & INCOMPAT_64BIT != 0 {
+    let incompat = rd_u32(sb, 96);
+    if incompat & INCOMPAT_64BIT != 0 {
         return Err(Unservable::Wide64Bit); // 64-bit changes the descriptor layout
+    }
+    if incompat & features::INCOMPAT_RECOVER != 0 {
+        return Err(Unservable::NeedsRecovery);
+    }
+    if incompat & !features::INCOMPAT_READ != 0 {
+        return Err(Unservable::Incompatible { features: incompat & !features::INCOMPAT_READ });
     }
     let log = rd_u32(sb, 24);
     if log > 2 {
@@ -278,18 +325,38 @@ pub(crate) fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsErr
 }
 
 /// Check that `r` holds a filesystem this reader can serve, before the server says it can: the
-/// superblock, then the root directory (inode 2, a directory). Nothing deeper is read; a
-/// filesystem wrong there fails the request that reaches it.
+/// superblock, its features (those a write must keep, unless `r` is read-only), then the root
+/// directory. Nothing deeper is read; a filesystem wrong there fails the request that reaches it.
 pub fn check_device<R: BlockReader>(r: &R) -> Result<(), Unservable> {
     let mut raw = [0u8; 1024];
     r.read_at(1024, &mut raw).map_err(|_| Unservable::Unreadable)?;
     let sb = parse_superblock(&raw)?;
+    if !r.read_only() {
+        writable(&raw)?;
+    }
     let root = read_inode(r, &sb, ROOT_INO).map_err(|_| Unservable::RootUnreadable)?;
     let mode = rd_u16(&root, 0);
     if mode & S_IFMT != S_IFDIR {
         return Err(Unservable::RootNotDirectory { mode });
     }
     Ok(())
+}
+
+/// **Whether a write here keeps the filesystem `r` holds**: `NotWritable` naming what it would not,
+/// for a supervisor to mount it read-only instead.
+pub fn check_writable<R: BlockReader>(r: &R) -> Result<(), Unservable> {
+    let mut raw = [0u8; 1024];
+    r.read_at(1024, &mut raw).map_err(|_| Unservable::Unreadable)?;
+    writable(&raw)
+}
+
+fn writable(sb: &[u8; 1024]) -> Result<(), Unservable> {
+    let ro_compat = rd_u32(sb, 100) & !features::RO_COMPAT_KEPT;
+    let lacking = features::INCOMPAT_WRITTEN & !rd_u32(sb, 96);
+    match ro_compat | lacking {
+        0 => Ok(()),
+        _ => Err(Unservable::NotWritable { ro_compat, lacking }),
+    }
 }
 
 /// Read inode `ino` into a fixed 256-byte buffer (inodes are ≤ 256 bytes here).
@@ -1702,12 +1769,10 @@ pub fn rename_at<RW: BlockReader + BlockWriter>(
     rename(rw, &sb, (dir_ino, old), (dir_ino, new), false, now).map(drop)
 }
 
-/// **The rename [`rename_path`] and [`rename_at`] make.** No journal, so the order is what a stop
-/// can leave: refusals first, a failed step undone, and never a name reaching what is freed. **A
-/// file** counts its new name before it has it and its old until it is gone, so a stop leaves two
-/// names and two links. **A directory** has one name, so loses the old first: a stop leaves it
-/// unreachable, for `e2fsck`. **Once the names are moved, nothing fails it**, since the server
-/// releases a replaced file only on `Ok`; a count or a time left unwritten leaks at worst.
+/// **The rename both make.** No journal, so refusals come first, a failed step is undone, and no
+/// stop leaves a name reaching what is freed: a file counts its new name before it has it and its
+/// old until it is gone; a directory, with one name, loses the old first. **Once the names are
+/// moved, nothing fails it**, as the server releases a replaced file only on `Ok`.
 fn rename<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,

@@ -196,6 +196,18 @@ other grow failures do. The same type answers `read_only()`, from which the bloc
 takes its `FILE_BLOCKS_READ_ONLY` mark, so the kernel installs the files without `MAP_WRITE`;
 the mark and the refusal are one fact. It never writes the superblock.
 
+**What a filesystem declares decides what is served** (pre-Phase-7 Part D, 2026-10-23), as Linux
+decides it. A feature in `s_feature_incompat` the reader does not read, anything past `filetype`,
+`extent` and `flex_bg`, refuses the filesystem, and so does a journal holding changes not yet
+replayed (`needs_recovery`), since a replay after a write here would undo it. A feature in
+`s_feature_ro_compat` the writer does not keep, past `sparse_super`, `large_file`, `huge_file`,
+`dir_nlink` and `extra_isize`, refuses a writable mount only: `metadata_csum` and `uninit_bg`
+checksums a write would leave stale, so `e2fsck` and Linux called the filesystem corrupt after the
+first, and `bigalloc` and quotas count what this writer does not. So does a filesystem lacking
+`filetype` or `extent`, which every write here makes. Until then each was mounted writable. The
+storage service mounts such a filesystem read-only, saying why (`check_writable`). The table is
+`ext4/features.rs`.
+
 **A filesystem knows how it was left.** A writable mount clears `s_state`'s clean bit
 (`mark_mounted`) before it answers `Ready`, so the filesystem never looks clean while it can
 change, and a mount that cannot write that is refused (`Unservable::StateUnwritable`). An

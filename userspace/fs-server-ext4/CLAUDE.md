@@ -65,9 +65,12 @@ Implements: superblock (`0xEF53`), block-group descriptors, inodes, the **extent
 at any depth: walk, append, split, cut, free), a linear `ext4_dir_entry_2` directory walk +
 **insert** (split an entry's slack), path resolution to a regular file, block-bitmap allocation +
 free-count updates, **inode-bitmap allocation** (new-file creation), and file growth. **Reject /
-skip** (return `FsError::Unsupported`/`Corrupt`): the journal, bigalloc, inline-data inodes, 64-bit
-block numbers, ≥ 8 KiB blocks, xattrs, ACLs, symlinks, checksums. htree directories need no special
-handling (the linear walk is backward-compatible).
+skip** (return `FsError::Unsupported`/`Corrupt`) — **by the superblock's feature words first**
+(`ext4/features.rs`): an `incompat` feature it does not read, or a journal to replay, refuses the
+filesystem; a `ro_compat` one its writes do not keep (`metadata_csum`, `uninit_bg`, `bigalloc`,
+quotas), or one lacking `filetype` or `extent`, refuses a writable mount. Then: the journal,
+bigalloc, inline-data inodes, 64-bit block numbers, ≥ 8 KiB blocks, xattrs, ACLs, symlinks,
+checksums. htree directories need no special handling (the linear walk is backward-compatible).
 
 **Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`, and
 `docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a deferral

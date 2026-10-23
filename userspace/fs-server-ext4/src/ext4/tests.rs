@@ -213,6 +213,57 @@ fn each_reason_reads_as_a_sentence_naming_what_was_found() {
         format!("{}", Unservable::BlockTooLarge { log: u32::MAX }),
         "blocks of 2^4294967295 bytes, over the 4096 this server reads"
     );
+    assert_eq!(
+        format!("{}", Unservable::Incompatible { features: 0x10 | 0x8000 | 0x80_0000 }),
+        "features this server does not read: meta_bg, inline_data, 0x800000"
+    );
+    assert_eq!(
+        format!("{}", Unservable::NotWritable { ro_compat: 0x400 | 0x10, lacking: 0x40 }),
+        "it can only be read here: this server does not keep its uninit_bg, metadata_csum; it lacks \
+         extent, which this server's writes make"
+    );
+}
+
+/// **A feature this server cannot read refuses a filesystem, and one its writes cannot keep refuses
+/// a writable mount**, as Linux refuses them: a checksum a write left stale makes the filesystem
+/// corrupt to `e2fsck` and Linux. A compatible feature, a clean journal's, refuses nothing.
+#[test]
+fn a_feature_this_server_cannot_keep_refuses_a_writable_mount_and_one_it_cannot_read_any() {
+    use crate::ReadOnly;
+    use crate::test_support::RwImage;
+    let with = |word: usize, set: u32, clear: u32| {
+        let mut img = fixture(4096, b"g\n");
+        let at = 1024 + word;
+        let v = u32::from_le_bytes(img[at..at + 4].try_into().unwrap());
+        img[at..at + 4].copy_from_slice(&((v | set) & !clear).to_le_bytes());
+        RwImage(std::cell::RefCell::new(img))
+    };
+    for ro_compat in [0x400, 0x10, 0x200, 0x100] {
+        let rw = with(100, ro_compat, 0);
+        assert_eq!(check_device(&rw), Err(Unservable::NotWritable { ro_compat, lacking: 0 }), "{ro_compat:#x}");
+        assert_eq!(check_device(&ReadOnly(&rw)), Ok(()), "{ro_compat:#x}, read-only");
+    }
+    for lacking in [0x2, 0x40] {
+        let rw = with(96, 0, lacking);
+        assert_eq!(check_device(&rw), Err(Unservable::NotWritable { ro_compat: 0, lacking }), "{lacking:#x}");
+        assert_eq!(check_device(&ReadOnly(&rw)), Ok(()), "{lacking:#x}, read-only");
+    }
+    assert_eq!(check_device(&ReadOnly(&with(96, 0x4, 0))), Err(Unservable::NeedsRecovery));
+    for features in [0x10, 0x8000, 0x2_0000] {
+        assert_eq!(check_device(&ReadOnly(&with(96, features, 0))), Err(Unservable::Incompatible { features }));
+    }
+    assert_eq!(check_device(&with(92, 0x4, 0)), Ok(()), "has_journal, its journal clean");
+    let made = RwImage(std::cell::RefCell::new(vec![0u8; 4096 * 4096]));
+    let params = crate::mkfs::Params {
+        blocks: 4096,
+        block_size: 4096,
+        bytes_per_inode: 16384,
+        uuid: [7; 16],
+        label: [0; 16],
+        now: 0,
+    };
+    crate::mkfs::format(&made, &params, &mut |_, _| {}).unwrap();
+    assert_eq!(check_device(&made), Ok(()), "what mkfs makes");
 }
 
 /// **A rename to a name its file has already does nothing**, as POSIX's does: a file under two names

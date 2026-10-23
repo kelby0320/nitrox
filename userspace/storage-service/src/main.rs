@@ -912,7 +912,8 @@ impl Service {
             return Err((KError::NotFound, b"this service holds no node for it"));
         };
         let m = mount(self.root_ns, &plan, node).map_err(|why| (KError::IoError, why))?;
-        Line::new().s(b"storage-service: mounted ").untrusted(m.label.as_bytes()).s(b" (rw), as asked").end();
+        let mode: &[u8] = if m.mode == Mode::Ro { b" (ro), as asked" } else { b" (rw), as asked" };
+        Line::new().s(b"storage-service: mounted ").untrusted(m.label.as_bytes()).s(mode).end();
         self.mounted.push(m);
         Ok(plan.label)
     }
@@ -1292,6 +1293,9 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     if let Some(m) = mount {
         line.s(b"; ").s(if m.by == By::Init { b"init's".as_slice() } else { b"mounted" });
         line.s(b" at ").untrusted(m.at.as_bytes()).s(if m.mode == Mode::Ro { b" (ro)".as_slice() } else { b" (rw)" });
+        if let Some(why) = d.found.read_only() {
+            line.s(b": ").s(why.as_bytes());
+        }
     } else if let Some(why) = mounts::unmounted_why(d, all) {
         // **Said, not left to an absence**: a gate can then match the reason a device was passed
         // over. The table's `note` gives the same words.

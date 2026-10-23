@@ -471,7 +471,8 @@ pub mod mounts {
     /// the label the service would choose if it is empty. `mounted` is everything mounted, `init`'s
     /// included; `taken` the labels in use; `room` whether a slot is free; `init_known` is
     /// [`init_known`](crate::sources::init_known)'s answer, and nothing is mounted without it.
-    /// **Always writable**, on a live boot too: the auto-mount is the careful one.
+    /// **Writable**, on a live boot too, as the auto-mount is the careful one, unless the filesystem's
+    /// server would only read it.
     pub fn explicit(
         devices: &[Device],
         mounted: &[Mounted],
@@ -504,7 +505,8 @@ pub mod mounts {
         if !room {
             return Err(Refusal::Full);
         }
-        Ok(Plan { device: d.record.id, label, mode: Mode::Rw, server })
+        let mode = if d.found.read_only().is_some() { Mode::Ro } else { Mode::Rw };
+        Ok(Plan { device: d.record.id, label, mode, server })
     }
 
     /// **The devices in use, which must not be granted raw**: every mounted filesystem's device,
@@ -588,7 +590,8 @@ pub mod mounts {
             }
             let label = labels::unique(&labels::preferred(d), &taken);
             taken.push(label.clone());
-            let mode = if live && !removable(d, all) { Mode::Ro } else { Mode::Rw };
+            let ro = (live && !removable(d, all)) || d.found.read_only().is_some();
+            let mode = if ro { Mode::Ro } else { Mode::Rw };
             plan.push(Plan { device: d.record.id, label, mode, server });
         }
         plan
@@ -797,14 +800,15 @@ pub mod mounts {
         Some(String::from(why))
     }
 
-    /// **The table's `note`**: [`unmounted_why`] for a filesystem found and not mounted; `None` for
-    /// a mounted one, and for a device holding nothing, whose row says so already.
+    /// **The table's `note`**: [`unmounted_why`] for a filesystem found and not mounted, and why a
+    /// mounted one is read-only if its server would only read it; `None` for a device holding
+    /// nothing, whose row says so already.
     pub fn note(d: &Device, all: &[Device], mount: Option<&Mounted>) -> Option<String> {
         if d.found == Found::Ejected {
             return Some(String::from("ejected; remove it"));
         }
         if mount.is_some() || d.found.filesystem().is_none() {
-            return None;
+            return mount.and(d.found.read_only()).map(String::from);
         }
         unmounted_why(d, all)
     }

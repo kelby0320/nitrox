@@ -6,8 +6,8 @@
 
 use alloc::format;
 use alloc::string::String;
-use fs_server_ext4::BlockReader;
-use fs_server_ext4::ext4::{check_device, volume_label, was_left_clean};
+use fs_server_ext4::ext4::{check_device, check_writable, volume_label, was_left_clean};
+use fs_server_ext4::{BlockReader, ReadOnly};
 use fs_server_fat::Fat;
 
 /// What a device holds.
@@ -19,6 +19,9 @@ pub enum Found {
         label: String,
         /// Whether it was left cleanly unmounted; `None` if the state would not read.
         clean: Option<bool>,
+        /// **Why `fs-server-ext4` would only read it**, in its refusal's words, or `None` if it
+        /// would write it too: a feature its writes would leave wrong, a checksum among them.
+        read_only: Option<String>,
     },
     /// A FAT filesystem.
     Fat {
@@ -62,6 +65,14 @@ impl Found {
         }
     }
 
+    /// Why it may only be read, if its server would refuse to write it.
+    pub fn read_only(&self) -> Option<&str> {
+        match self {
+            Found::Ext4 { read_only, .. } => read_only.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The server that would serve it; `None` for nothing, or a FAT its server would refuse.
     pub fn server(&self) -> Option<crate::mounts::Server> {
         use crate::mounts::Server;
@@ -75,11 +86,12 @@ impl Found {
 
 /// What `r` holds.
 pub fn probe<R: BlockReader>(r: &R) -> Found {
-    if check_device(r).is_ok() {
+    if check_device(&ReadOnly(r)).is_ok() {
         let mut raw = [0u8; 16];
         let n = volume_label(r, &mut raw).unwrap_or(0);
         let label = String::from_utf8_lossy(&raw[..n]).into_owned();
-        return Found::Ext4 { label, clean: was_left_clean(r).ok() };
+        let read_only = check_writable(r).err().map(|why| format!("{why}"));
+        return Found::Ext4 { label, clean: was_left_clean(r).ok(), read_only };
     }
     let mut sector = [0u8; 512];
     let recognised = r.read_at(0, &mut sector).ok().and_then(|()| fat_label(&sector));
