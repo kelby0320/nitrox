@@ -71,10 +71,13 @@ pub(crate) fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // With `io`, so the session helpers' refusals made before any syscall are tested too.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
         .arg("librsproto")
+        .arg("--features")
+        .arg("io")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;

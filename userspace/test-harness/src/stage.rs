@@ -370,7 +370,7 @@ fn grants_resolved(ns: u64) -> u8 {
 
 /// Send one rsproto message with `op` and `body` on `ch`, moving `handles`.
 fn rs_send(ch: u64, op: u16, body: &[u8], handles: &[u64]) -> bool {
-    let mut msg = [0u8; 256];
+    let mut msg = [0u8; libkern::abi::IPC_MSG_SIZE]; // the kernel copies a whole message
     let Some(n) = librsproto::encode(&mut msg[24..], op, 1, 0, body, handles.len() as u16) else {
         return false;
     };
