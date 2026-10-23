@@ -30,6 +30,8 @@ const ROOT_INO: u32 = 2;
 const INCOMPAT_64BIT: u32 = 0x80;
 const EXTENTS_FL: u32 = 0x0008_0000;
 const INLINE_DATA_FL: u32 = 0x1000_0000;
+/// `EXT4_INDEX_FL`: the directory carries a hash tree, which this writer does not keep.
+const INDEX_FL: u32 = 0x0000_1000;
 const S_IFMT: u16 = 0xF000;
 const S_IFREG: u16 = 0x8000;
 /// `ext4_dir_entry_2.file_type` for a regular file.
@@ -1128,6 +1130,13 @@ fn dir_insert<RW: BlockReader + BlockWriter>(
 ) -> Result<(), FsError> {
     if name.len() > 255 {
         return Err(FsError::Unsupported); // an entry's length is one byte
+    }
+    // A hash tree would not hold the name, and its root lies in the slack an insert takes. Made
+    // linear first, as an older writer makes one, the directory reads as its blocks already do.
+    let flags = rd_u32(dir_inode, 32);
+    if flags & INDEX_FL != 0 {
+        dir_inode[32..36].copy_from_slice(&(flags & !INDEX_FL).to_le_bytes());
+        rw.write_at(inode_offset(rw, sb, dir_ino)?, &dir_inode[..sb.inode_len()])?;
     }
     let bs = sb.block_size as usize;
     let size = rd_u32(dir_inode, 4) as u64;

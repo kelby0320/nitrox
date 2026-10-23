@@ -325,3 +325,35 @@ fn a_rename_refuses_a_file_whose_links_are_full() {
     assert_eq!(rename_path(&rw, b"/system/current-generation", b"/system/g", false, 0), Err(FsError::Corrupt));
     assert!(*rw.0.borrow() == before, "refused, it wrote nothing");
 }
+
+/// **A directory Linux indexed is made linear before a name goes in**, as an older writer makes
+/// one: an insert wrote over the hash tree's root, and `e2fsck` called the directory corrupt.
+#[test]
+fn a_directory_linux_indexed_is_made_linear_before_a_name_goes_in() {
+    use super::{INDEX_FL, create_file, mkdir_at, read_superblock, rename_path, resolve_path_ino};
+    use crate::test_support::{RwImage, assert_e2fsck_clean};
+    let dir = std::env::temp_dir().join(format!("nitrox-ext4-htree-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("stage/big")).unwrap();
+    for i in 0..400 {
+        std::fs::write(dir.join(format!("stage/big/a file with a longish name {i}")), b"x").unwrap();
+    }
+    let img = dir.join("img");
+    let mke2fs = std::process::Command::new("mke2fs")
+        .args(["-q", "-F", "-t", "ext4", "-O", "^has_journal,^64bit,^metadata_csum,^resize_inode", "-d"])
+        .args([dir.join("stage").as_os_str(), img.as_os_str(), "4096".as_ref()])
+        .status();
+    assert!(mke2fs.unwrap().success());
+    let indexed = std::process::Command::new("e2fsck").args(["-fyD".as_ref(), img.as_os_str()]).status();
+    assert!(indexed.unwrap().code().is_some_and(|c| c <= 1), "e2fsck -D indexes the directory");
+    let rw = RwImage(std::cell::RefCell::new(std::fs::read(&img).unwrap()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let sb = read_superblock(&rw).unwrap();
+    let flags = || crate::rd_u32(&resolve_path_ino(&rw, &sb, b"/big").unwrap().1, 32);
+    assert_ne!(flags() & INDEX_FL, 0, "Linux's tools indexed it");
+    let (big, _) = resolve_path_ino(&rw, &sb, b"/big").unwrap();
+    create_file(&rw, b"/big", b"new", 0).unwrap();
+    assert_eq!(flags() & INDEX_FL, 0, "made linear");
+    mkdir_at(&rw, big, b"made", 0).unwrap();
+    rename_path(&rw, b"/big/a file with a longish name 7", b"/big/renamed", false, 0).unwrap();
+    assert_e2fsck_clean(&rw.0.into_inner(), "after names went into an indexed directory");
+}

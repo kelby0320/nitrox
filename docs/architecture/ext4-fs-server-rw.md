@@ -206,7 +206,9 @@ checksums a write would leave stale, so `e2fsck` and Linux called the filesystem
 first, and `bigalloc` and quotas count what this writer does not. So does a filesystem lacking
 `filetype` or `extent`, which every write here makes. Until then each was mounted writable. The
 storage service mounts such a filesystem read-only, saying why (`check_writable`). The table is
-`ext4/features.rs`.
+`ext4/features.rs`. **`dir_index`**, a compatible feature, asks one thing of a writer that keeps no
+hash tree: a directory Linux indexed is made linear before a name goes in, as an older writer makes
+one, since its blocks read linearly as they are. An insert wrote over the tree's root instead.
 
 **A filesystem knows how it was left.** A writable mount clears `s_state`'s clean bit
 (`mark_mounted`) before it answers `Ready`, so the filesystem never looks clean while it can
