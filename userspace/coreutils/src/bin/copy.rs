@@ -133,6 +133,8 @@ fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<C
         Err(TreeError::MakeDir(_)) => stage.die(b"copy: cannot create the destination directory\n", EXIT_FAILURE),
         Err(TreeError::OpenDir) => stage.die(b"copy: cannot open a directory on the path\n", EXIT_FAILURE),
         Err(TreeError::ReadDir) => stage.die(b"copy: cannot enumerate the source directory\n", EXIT_FAILURE),
+        Err(TreeError::IntoItself) => stage.die(b"copy: cannot copy a directory into itself\n", EXIT_FAILURE),
+        Err(TreeError::Name) => stage.die(b"copy: a name in the tree is not one entry's\n", EXIT_FAILURE),
         Err(_) => stage.die(b"copy: cannot copy\n", EXIT_FAILURE),
     }
 }

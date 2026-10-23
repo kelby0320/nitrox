@@ -811,6 +811,23 @@ pub(super) fn grow_test(root_ns: u64) -> bool {
 /// **A create the filesystem refuses fails with its refusal**: a name past ext4's 255 bytes,
 /// `Unsupported`. The server answered only a read-only mount's refusal and served the rest, so the
 /// file never made was looked up and answered `NotFound`.
+/// **A copy into its own subtree is refused before it makes anything**: it made the destination,
+/// listed the source, which now held that, and copied it again, until it was 32 levels deep.
+pub(super) fn copy_into_itself_test(root_ns: u64) -> bool {
+    let made = libfs::mkdir(root_ns, b"/system/probe-tree").is_ok();
+    let copied =
+        libfs::copy_tree(root_ns, b"/system/probe-tree", b"/system/probe-tree/inner", false, &mut |_, _, _| {});
+    let junk = libfs::is_dir(root_ns, b"/system/probe-tree/inner");
+    let removed = libfs::remove_tree(root_ns, b"/system/probe-tree", &mut |_, _| {}).is_ok();
+    if made && copied == Err(libfs::TreeError::IntoItself) && !junk && removed {
+        kprint(b"boot-probe: a copy into its own subtree refused, nothing made ok\n");
+        return true;
+    }
+    let why = alloc::format!("made {made}, copied {copied:?}, left inner {junk}, removed {removed}");
+    Line::new().s(b"boot-probe: copy into itself FAIL: ").s(why.as_bytes()).end();
+    false
+}
+
 pub(super) fn refused_create_test(root_ns: u64) -> bool {
     let mut path = [b'a'; 8 + 300];
     path[..8].copy_from_slice(b"/system/");
