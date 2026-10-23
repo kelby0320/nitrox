@@ -214,3 +214,63 @@ fn each_reason_reads_as_a_sentence_naming_what_was_found() {
         "blocks of 2^4294967295 bytes, over the 4096 this server reads"
     );
 }
+
+/// **A rename to a name its file has already does nothing**, as POSIX's does: a file under two names
+/// with one link, as a crash under an older writer left one, would lose that link to the rename and
+/// come back as an orphan for the server to free while a name still reaches it.
+#[test]
+fn a_rename_to_a_name_its_file_has_already_does_nothing() {
+    use super::{EXT4_FT_REG_FILE, dir_insert, read_superblock, rename_path, resolve_path_ino};
+    let rw = crate::test_support::RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    let sb = read_superblock(&rw).unwrap();
+    let (sys, mut dir) = resolve_path_ino(&rw, &sb, b"/system").unwrap();
+    let (ino, _) = resolve_path_ino(&rw, &sb, b"/system/current-generation").unwrap();
+    dir_insert(&rw, &sb, sys, &mut dir, b"twin", ino, EXT4_FT_REG_FILE, 0).unwrap();
+    assert_eq!(rename_path(&rw, b"/system/twin", b"/system/current-generation", true, 0), Ok(None));
+    assert_eq!(resolve_path_ino(&rw, &sb, b"/system/twin").map(|(i, _)| i), Ok(ino), "both names stay");
+}
+
+/// **The allocator keeps to the filesystem and to its counts**: a run stops at a short last group's
+/// end where another tool left the bitmap's spare bits clear; a group whose count says fewer blocks
+/// free than its bitmap gives no more than the count; and a run freed twice is counted free once.
+#[test]
+fn the_allocator_keeps_to_the_filesystem_and_to_its_counts() {
+    use super::{alloc_run, free_run, read_superblock};
+    use crate::test_support::{RwImage, fixture_blocks};
+    use crate::{rd_u16, rd_u32};
+    let rw = RwImage(std::cell::RefCell::new(fixture_blocks(1024, 24576, 0, b"g\n")));
+    let sb = read_superblock(&rw).unwrap();
+    let gd = |g: u32| sb.group_desc_offset(g) as usize;
+    let group = |b: u64| ((b - sb.first_data_block as u64) / sb.blocks_per_group as u64) as u32;
+
+    let (spare, last) = (sb.blocks_in_group(2), sb.blocks_count - 1);
+    let bitmap = rd_u32(&rw.0.borrow(), gd(2)) as usize * 1024;
+    rw.0.borrow_mut()[bitmap + spare / 8] &= !(1 << (spare % 8));
+    assert_eq!(alloc_run(&rw, &sb, last, 4), Ok((last, 1)), "nothing past the filesystem's end");
+
+    rw.0.borrow_mut()[gd(1) + 12..gd(1) + 14].copy_from_slice(&2u16.to_le_bytes());
+    let (phys, len) = alloc_run(&rw, &sb, sb.group_start(1) + 100, 10).unwrap();
+    assert_eq!((group(phys), len, rd_u16(&rw.0.borrow(), gd(1) + 12)), (1, 2, 0), "no more than counted");
+
+    let (phys, len) = alloc_run(&rw, &sb, sb.group_start(0) + 500, 3).unwrap();
+    let free = || (rd_u16(&rw.0.borrow(), gd(group(phys)) + 12), rd_u32(&rw.0.borrow(), 1024 + 12));
+    free_run(&rw, &sb, phys, len).unwrap();
+    let once = free();
+    free_run(&rw, &sb, phys, len).unwrap();
+    assert_eq!(free(), once, "freed twice, counted once");
+}
+
+/// **A rename refuses a file whose link count it would take past its range**, before it writes: the
+/// count it adds while the file has both names would wrap a full one to nothing.
+#[test]
+fn a_rename_refuses_a_file_whose_links_are_full() {
+    use super::{inode_offset, read_superblock, rename_path, resolve_path_ino};
+    let rw = crate::test_support::RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    let sb = read_superblock(&rw).unwrap();
+    let (ino, _) = resolve_path_ino(&rw, &sb, b"/system/current-generation").unwrap();
+    let at = inode_offset(&rw, &sb, ino).unwrap() as usize + 26;
+    rw.0.borrow_mut()[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+    let before = rw.0.borrow().clone();
+    assert_eq!(rename_path(&rw, b"/system/current-generation", b"/system/g", false, 0), Err(FsError::Corrupt));
+    assert!(*rw.0.borrow() == before, "refused, it wrote nothing");
+}

@@ -122,7 +122,7 @@ fn cut(at: &mut [u8], ino: u32, name_len: u8) {
 }
 
 /// **A record cut at its block's end, with a name running past it, is an error to rename over**,
-/// at both block sizes: a directory's first record swallows the rest of its block but an 8-byte
+/// refused before anything is written, at both block sizes: a directory's first record swallows the rest of its block but an 8-byte
 /// record whose two-byte name, where `..` is looked for, would end past the block.
 #[test]
 fn a_record_whose_name_runs_past_its_block_is_an_error_to_rename_over() {
@@ -136,10 +136,12 @@ fn a_record_whose_name_runs_past_its_block_is_an_error_to_rename_over() {
         v[first as usize + 4..first as usize + 6].copy_from_slice(&((end - 8 - first as usize) as u16).to_le_bytes());
         cut(&mut v[end - 8..end], 2, 2);
         drop(v);
+        let before = img.0.borrow().clone();
         let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             vol.rename_path(b"/d/inner", b"/system/inner", false, NOW)
         }));
         assert!(matches!(&moved, Ok(Err(_))), "{bs}-byte blocks: {moved:?}");
+        assert!(*img.0.borrow() == before, "{bs}-byte blocks: refused, it wrote nothing");
     }
 }
 
@@ -156,12 +158,8 @@ fn a_loop_of_parent_records_is_corrupt_to_move_a_directory_into() {
 }
 
 /// **Garbage anywhere ext4 keeps its structure is an error, never a panic**, at 1 KiB and 4 KiB
-/// blocks. Four kinds, each on a fresh copy of a populated image, then every request:
-/// - a random byte over the superblock, the descriptors, the bitmaps and the inode table;
-/// - **a field of a real directory record** (inode, length, name length, type) made random;
-/// - **a record cut at the end of a real block**, its first or last record made to stop short of a
-///   live record of a few bytes there, with a name length the requests look up;
-/// - **a field of a real inode** (mode, size, links, flags, the extent tree) made random.
+/// blocks: random metadata bytes, then fields of real records and inodes, and records cut at a
+/// block's end, since random bytes alone rarely make a record a scan reads.
 #[test]
 fn garbage_in_any_structure_is_an_error_never_a_panic() {
     for bs in [1024u32, 4096] {

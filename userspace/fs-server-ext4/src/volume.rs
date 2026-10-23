@@ -580,3 +580,6 @@ mod tests {
 
 #[cfg(test)]
 mod hostile_tests;
+
+#[cfg(test)]
+mod crash_tests;

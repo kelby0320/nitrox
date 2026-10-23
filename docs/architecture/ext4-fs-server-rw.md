@@ -89,8 +89,8 @@ only once the kernel has answered `File::Forget` for the inode
 ([`filesystem-data-path.md`](filesystem-data-path.md) § *One object per file*). The kernel may be
 writing the file's pages to those blocks, and a block this server freed and handed to another
 file before that write landed would be overwritten with a dead file's bytes. Between the halves the
-inode is unattached with its link counted, the state `rename_path` could already leave on a crash,
-and `e2fsck` moves it to `lost+found`. The server waits for the answer on buffers of its own,
+inode is unattached with its link counted, the state a crash after a replacing rename's names
+changed can leave too, and `e2fsck` moves it to `lost+found`. The server waits for the answer on buffers of its own,
 since it asks from inside `serve_loop`'s walk of a batch of wait results. If the kernel cannot
 be asked, the inode is not freed: a leaked block can be repaired, a block claimed twice cannot.
 
@@ -155,6 +155,26 @@ the disk with every lookup past it `Corrupt`, and a leaf, or a truncated or rele
 left on the disk mapping blocks free for the next file. It costs a truncate whose root changes one
 more write of its inode. Held by host tests that lose each write of a cut, a truncate, a release and
 a directory's removal in turn, and that refuse every write from each on.
+
+**What a stop leaves a rename, and what a change answers** (pre-Phase-7 Part D, 2026-10-23). A
+rename wrote the new name, then removed the old: a stop between left a file under two names with
+one link, and removing either, or the rename asked again, freed the file while the other name
+still reached it. Now every refusal comes before the first write, a step that fails is undone, and
+a stop that cannot be undone leaves nothing a later change can damage:
+
+- **A file counts its new name before it is written**, and stops counting the old once that is
+  removed: a stop between leaves two names and two links.
+- **A directory loses its old name first**, since it may have only one: a stop leaves it
+  unreachable, for `e2fsck` to reconnect. Moving between parents, the new parent counts its `..`
+  before it is repointed and the old stops after, so a count is only ever too high; `rmdir` takes
+  the link from the directory the removed `..` names.
+- **A file renamed to a name it has already is left alone**, as POSIX's rename leaves it.
+
+**Once a change's name has changed, nothing after fails it**: an unlink, rmdir, create, `mkdir` or
+rename answers `Ok` exactly when it changed a name. A link count or a time left unwritten leaks at
+worst. An unlink or a replacing rename that answered an error once its name was gone lost the
+orphan with it, since the server releases one only on `Ok`. `volume/crash_tests.rs` stops each at
+every write, refused once or from there on, and asks `e2fsck` what it left.
 
 The tree is held to **e2fsprogs** in the host tests: `debugfs`' reading of every map, and `e2fsck
 -fn` clean — 4,096 files of 16 KiB in one directory; two files grown in turn to two levels at both
