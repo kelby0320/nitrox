@@ -289,3 +289,24 @@ fn a_chain_that_loops_or_leaves_the_volume_is_corrupt() {
     let mut runs = [BlockRun::default(); 8];
     assert_eq!(fat.map_file(b"/far.bin", &mut runs), Err(FsError::Corrupt));
 }
+
+/// **A removal that fails over a hostile chain has still freed the directory's first cluster**,
+/// which the next directory made takes, so it gives that id first, for its sessions to end.
+#[test]
+fn a_removal_failing_on_a_hostile_chain_still_gives_its_id() {
+    const NOW: i64 = 1_791_244_800;
+    let img = mformat(16, &["-c", "8"]);
+    mmd(&img, "d");
+    let disk = FileImage::open(&img);
+    let d = Fat::new(&disk).resolve_dir(b"/d").unwrap();
+    let g = *Fat::new(&disk).geometry().unwrap();
+    poke16(&disk, &g, d as u32, d as u16 + 40); // onto a free cluster
+    let fat = Fat::new(&disk);
+    let root = fat.resolve_dir(b"/").unwrap();
+    let mut given = None;
+    assert_eq!(fat.rmdir_at(root, b"d", NOW, |id| given = Some(id)), Err(FsError::Corrupt));
+    assert_eq!(given, Some(d));
+    let fresh = Fat::new(&disk);
+    fresh.mkdir_at(root, b"fresh", NOW).unwrap();
+    assert_eq!(fresh.resolve_dir(b"/fresh"), Ok(d), "what made the id worth giving: it is taken");
+}

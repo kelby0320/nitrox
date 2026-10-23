@@ -50,9 +50,10 @@ servers speak one protocol and a fix to it is a fix to both:
   (FAT's, to zero).
 - **A rename is resolved before the directory-session path**, which infers "directory open" from
   the suffix naming a directory; renaming a directory names one too.
-- **A removed directory's sessions end** (`end_sessions_on`, from `Volume::rmdir_at`'s id): a
-  session holds a bare id, and each filesystem gives a freed one to the next directory made.
-  Checking the id still names a live directory cannot tell the old one from the new.
+- **A removed directory's sessions end** (`end_sessions_on`, which `Volume::rmdir_at` is handed
+  and calls before it changes anything, so a removal that then fails ends them too): a session
+  holds a bare id, and each filesystem gives a freed one to the next directory made. Checking the
+  id still names a live directory cannot tell the old one from the new.
 - **A session names entries of its own directory, never `.` or `..`** (`serve::entry_name`, checked
   in `serve_session` for every op that takes a name): `..` renamed was a way out of a subtree, and
   each filesystem's own refusals are not the boundary.

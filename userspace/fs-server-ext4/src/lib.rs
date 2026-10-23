@@ -466,7 +466,7 @@ mod tests {
             ext4::release_inode(self, ino, now)
         }
         fn rmdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
-            ext4::rmdir_at(self, dir, name, now).map(|_| ())
+            ext4::rmdir_at(self, dir, name, now, |_| ())
         }
         fn rename_path(&self, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError> {
             ext4::rename_path(self, from, to, false, now).map(drop)
@@ -686,11 +686,11 @@ mod tests {
         }
         let outer = ext4::resolve_dir(&rw, name_path(&name_of(11)).as_bytes()).unwrap();
         ext4::mkdir_at(&rw, outer, b"inner", TEST_NOW).unwrap();
-        assert_eq!(ext4::rmdir_at(&rw, sys, name_of(11).as_bytes(), TEST_NOW), Err(FsError::NotEmpty));
-        ext4::rmdir_at(&rw, outer, b"inner", TEST_NOW).unwrap();
+        assert_eq!(ext4::rmdir_at(&rw, sys, name_of(11).as_bytes(), TEST_NOW, |_| ()), Err(FsError::NotEmpty));
+        ext4::rmdir_at(&rw, outer, b"inner", TEST_NOW, |_| ()).unwrap();
 
         for i in 0..12 {
-            ext4::rmdir_at(&rw, sys, name_of(i).as_bytes(), TEST_NOW)
+            ext4::rmdir_at(&rw, sys, name_of(i).as_bytes(), TEST_NOW, |_| ())
                 .unwrap_or_else(|e| panic!("rmdir {i} failed: {e:?}"));
         }
         let listed = list_dir(&ImageReader(rw.0.borrow().clone()), b"/system");
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(dir_entry_mtime(&r, sys, b"."), Some(TEST_NOW));
 
         let later = TEST_NOW + 600;
-        ext4::rmdir_at(&r, sys, b"kid", later).unwrap();
+        ext4::rmdir_at(&r, sys, b"kid", later, |_| ()).unwrap();
         assert_eq!(dir_entry_mtime(&r, sys, b"."), Some(later));
     }
 
@@ -999,7 +999,7 @@ mod tests {
         let late = ext4::resolve_dir(&rw, b"/late").unwrap();
         assert!(late > per_group, "the directory's inode {late} is past group 0's {per_group}");
         assert_e2fsck_clean(&rw.0.borrow(), "mkdir-group-1");
-        ext4::rmdir_at(&rw, root, b"late", TEST_NOW).unwrap();
+        ext4::rmdir_at(&rw, root, b"late", TEST_NOW, |_| ()).unwrap();
         assert_e2fsck_clean(&rw.0.borrow(), "rmdir-group-1");
     }
 
@@ -1242,7 +1242,7 @@ mod tests {
         let sys = dir_ino(&rw, b"/system");
         ext4::mkdir_at(&rw, sys, b"a", TEST_NOW).unwrap();
         ext4::rename_at(&rw, sys, b"a", b"b", TEST_NOW).unwrap();
-        ext4::rmdir_at(&rw, sys, b"b", TEST_NOW).unwrap();
+        ext4::rmdir_at(&rw, sys, b"b", TEST_NOW, |_| ()).unwrap();
         let names = names_of(&rw, b"/system");
         assert!(!names.iter().any(|n| n == "a" || n == "b"), "a/b linger: {names:?}");
         assert!(names.iter().any(|n| n == "current-generation"));
@@ -1409,7 +1409,7 @@ mod tests {
             let ino = ext4::unlink_at(&c, d2, name.as_bytes(), TEST_NOW).unwrap().unwrap();
             ext4::release_inode(&c, ino, TEST_NOW).unwrap();
         }
-        ext4::rmdir_at(&c, sys, b"d2", TEST_NOW).unwrap();
+        ext4::rmdir_at(&c, sys, b"d2", TEST_NOW, |_| ()).unwrap();
         for i in 0..20 {
             let name = format!("n{i:02}");
             ext4::create_file(&c, b"/system/d1", name.as_bytes(), TEST_NOW).unwrap();
@@ -1545,11 +1545,11 @@ mod tests {
 
         let full = dir_ino(&rw, b"/system/full");
         let _ = full;
-        assert_eq!(ext4::rmdir_at(&rw, sys, b"full", TEST_NOW), Err(FsError::NotEmpty));
+        assert_eq!(ext4::rmdir_at(&rw, sys, b"full", TEST_NOW, |_| ()), Err(FsError::NotEmpty));
         ext4::create_file(&rw, b"/system", b"afile", TEST_NOW).unwrap();
-        assert_eq!(ext4::rmdir_at(&rw, sys, b"afile", TEST_NOW), Err(FsError::Unsupported));
+        assert_eq!(ext4::rmdir_at(&rw, sys, b"afile", TEST_NOW, |_| ()), Err(FsError::Unsupported));
 
-        ext4::rmdir_at(&rw, sys, b"empty", TEST_NOW).unwrap();
+        ext4::rmdir_at(&rw, sys, b"empty", TEST_NOW, |_| ()).unwrap();
         assert!(!names_of(&rw, b"/system").iter().any(|n| n == "empty"));
 
         assert_e2fsck_clean(&rw.0.into_inner(), "rmdir");
@@ -1565,11 +1565,11 @@ mod tests {
         let sys = dir_ino(&rw, b"/system");
         ext4::mkdir_at(&rw, sys, b"gone", TEST_NOW).unwrap();
         let gone = dir_ino(&rw, b"/system/gone");
-        assert_eq!(ext4::rmdir_at(&rw, sys, b"gone", TEST_NOW), Ok(gone), "the id a session holds");
+        ext4::rmdir_at(&rw, sys, b"gone", TEST_NOW, |_| ()).unwrap();
         assert_eq!(ext4::mkdir_at(&rw, gone, b"x", TEST_NOW), Err(FsError::NotFound));
         assert_eq!(ext4::touch_at(&rw, gone, b".", TEST_NOW), Err(FsError::NotFound));
         assert_eq!(ext4::unlink_at(&rw, gone, b"x", TEST_NOW), Err(FsError::NotFound));
-        assert_eq!(ext4::rmdir_at(&rw, gone, b"x", TEST_NOW), Err(FsError::NotFound));
+        assert_eq!(ext4::rmdir_at(&rw, gone, b"x", TEST_NOW, |_| ()), Err(FsError::NotFound));
         assert_eq!(ext4::rename_at(&rw, gone, b"x", b"y", TEST_NOW), Err(FsError::NotFound));
         assert_eq!(ext4::read_dir_stat(&rw, gone, 0, |_, _, _, _| true).err(), Some(FsError::NotFound));
         assert_e2fsck_clean(&rw.0.into_inner(), "a removed directory left alone");

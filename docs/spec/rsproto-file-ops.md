@@ -155,7 +155,8 @@ reply; failure is the standard error reply.
 
 **An `Rmdir` ends every session on the directory it removes**: a session holds the directory's id,
 which the next directory made may be given. The channel of each closes, and its client's next
-request meets `PeerClosed`.
+request meets `PeerClosed`. **So does one that fails once its refusals are past**, before its first
+write: a removal failing midway can have freed the id. A refused one ends nothing.
 
 **A name is one entry of the session's directory**: 1 to 255 bytes, no `/`, and never `.` or
 `..`. Those two are listed, but they name the directory and its parent, and a session that could

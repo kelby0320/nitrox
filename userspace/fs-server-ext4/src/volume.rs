@@ -111,8 +111,8 @@ impl<R: BlockReader + BlockWriter> Volume for Ext4<'_, R> {
         ext4::unlink_at(self.0, ino(dir)?, name, now).map(|orphan| orphan.map(u64::from))
     }
 
-    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<u64, FsError> {
-        ext4::rmdir_at(self.0, ino(dir)?, name, now).map(u64::from)
+    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64, freeing: impl FnOnce(u64)) -> Result<(), FsError> {
+        ext4::rmdir_at(self.0, ino(dir)?, name, now, |i| freeing(u64::from(i)))
     }
 
     fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
@@ -388,6 +388,48 @@ mod tests {
         assert_eq!(flags_of(served, &reply), librsproto::namespace::FILE_BLOCKS_READ_ONLY);
         let served = serve(&Ext4(&r), &req[..req_len], &mut content, &mut reply);
         assert_eq!(flags_of(served, &reply), 0);
+    }
+
+    /// **A removal gives its directory's id before any write it can fail after**, since the
+    /// server ends the sessions on that id with it: with each write failing in turn, a directory
+    /// whose id was not given is still there, and its inode is not the next directory's. A
+    /// refusal gives nothing — a read-only mount's too, which would otherwise fail at a write.
+    #[test]
+    fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
+        use crate::test_support::{Failing, RwImage};
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
+        let vol = Ext4(&rw);
+        let sys = vol.resolve_dir(b"/system").unwrap();
+        vol.mkdir_at(sys, b"gone", 0).unwrap();
+        let gone = vol.resolve_dir(b"/system/gone").unwrap();
+        vol.mkdir_at(sys, b"full", 0).unwrap();
+        vol.create_file(b"/system/full", b"f", 0).unwrap();
+        let mut given = None;
+        assert_eq!(vol.rmdir_at(sys, b"full", 0, |id| given = Some(id)), Err(FsError::NotEmpty));
+        assert_eq!(vol.rmdir_at(sys, b"current-generation", 0, |id| given = Some(id)), Err(FsError::Unsupported));
+        let ro = crate::ReadOnly(&rw);
+        assert_eq!(Ext4(&ro).rmdir_at(sys, b"gone", 0, |id| given = Some(id)), Err(FsError::ReadOnly));
+        assert_eq!(given, None, "a refusal gives no id");
+
+        let image = rw.0.into_inner();
+        for n in 0.. {
+            let f = Failing::once(image.clone(), n);
+            let mut given = None;
+            let r = Ext4(&f).rmdir_at(sys, b"gone", 0, |id| given = Some(id));
+            let after = Ext4(&f.image);
+            match given {
+                Some(id) => assert_eq!(id, gone, "write {n} failing"),
+                None => {
+                    assert_eq!(after.resolve_dir(b"/system/gone"), Ok(gone), "write {n} failing, nothing given");
+                    after.mkdir_at(sys, b"fresh", 0).unwrap();
+                    assert_ne!(after.resolve_dir(b"/system/fresh"), Ok(gone), "write {n}: its inode reused");
+                }
+            }
+            if r.is_ok() {
+                assert_eq!(given, Some(gone), "a removal that succeeded");
+                break;
+            }
+        }
     }
 
     #[test]

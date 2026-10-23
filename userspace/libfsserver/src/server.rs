@@ -681,7 +681,7 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
                                 forget_then_release(vol, serve_end, id);
                             }
                         }),
-                        OP_FILE_RMDIR => vol.rmdir_at(dir, name, now_secs()).map(end_sessions_on),
+                        OP_FILE_RMDIR => vol.rmdir_at(dir, name, now_secs(), end_sessions_on),
                         _ => vol.touch_at(dir, name, now_secs()),
                     },
                     None => Err(FsError::Unsupported),

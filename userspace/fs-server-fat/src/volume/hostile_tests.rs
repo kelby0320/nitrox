@@ -103,7 +103,7 @@ fn exercise(fat: &Fat<Overlay>) {
             if let Ok(Some(id)) = fat.unlink_at(root, b"renamed by the test", NOW) {
                 let _ = fat.release(id, NOW);
             }
-            let _ = fat.rmdir_at(root, b"renamed by the test", NOW);
+            let _ = fat.rmdir_at(root, b"renamed by the test", NOW, |_| ());
         }
     }
     let _ = fat.mark_clean();
@@ -252,7 +252,9 @@ fn a_long_name_too_long_for_a_listing_is_listed_short_and_reached_by_either() {
     let id = fat.unlink_at(d, long.as_bytes(), NOW).unwrap().unwrap();
     fat.release(id, NOW).unwrap();
     let root = fat.resolve_dir(b"/").unwrap();
-    assert_eq!(fat.rmdir_at(root, b"d", NOW), Ok(d), "empty once the file is gone, and its id");
+    let mut freed = None;
+    assert_eq!(fat.rmdir_at(root, b"d", NOW, |id| freed = Some(id)), Ok(()), "empty once the file is gone");
+    assert_eq!(freed, Some(d), "and its id given");
 }
 
 /// **A directory removed is no directory to a session still holding its id**: a FAT
@@ -266,12 +268,12 @@ fn a_removed_directory_is_refused_to_a_session_still_holding_it() {
     let root = fat.resolve_dir(b"/").unwrap();
     fat.mkdir_at(root, b"d", NOW).unwrap();
     let d = fat.resolve_dir(b"/d").unwrap();
-    fat.rmdir_at(root, b"d", NOW).unwrap();
+    fat.rmdir_at(root, b"d", NOW, |_| ()).unwrap();
     let refused = |fat: &Fat<FileImage>, what: &str| {
         assert_eq!(fat.mkdir_at(d, b"x", NOW), Err(FsError::NotFound), "{what}");
         assert_eq!(fat.touch_at(d, b"x", NOW), Err(FsError::NotFound), "{what}");
         assert_eq!(fat.unlink_at(d, b"x", NOW), Err(FsError::NotFound), "{what}");
-        assert_eq!(fat.rmdir_at(d, b"x", NOW), Err(FsError::NotFound), "{what}");
+        assert_eq!(fat.rmdir_at(d, b"x", NOW, |_| ()), Err(FsError::NotFound), "{what}");
         assert_eq!(fat.rename_at(d, b"x", b"y", NOW), Err(FsError::NotFound), "{what}");
         assert_eq!(fat.read_dir(d, 0, |_| true), Err(FsError::NotFound), "{what}");
     };

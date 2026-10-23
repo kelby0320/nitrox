@@ -694,8 +694,9 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     }
 
     /// **Remove the empty directory `name` from directory `dir`**: its entries, then its clusters.
-    /// `NotEmpty` if it holds anything; `Unsupported` for a file.
-    pub fn rmdir_at(&self, dir: u64, name: &[u8], _now: i64) -> Result<u64, FsError> {
+    /// `NotEmpty` if it holds anything; `Unsupported` for a file. **`freeing` is given its id**
+    /// before anything changes.
+    pub fn rmdir_at(&self, dir: u64, name: &[u8], _now: i64, freeing: impl FnOnce(u64)) -> Result<(), FsError> {
         self.change(|g, cache| {
             let d = self.live_dir(g, cache, dir)?;
             let f = dir::lookup(self.r, g, cache, d, name)?;
@@ -711,9 +712,9 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             if !empty {
                 return Err(FsError::NotEmpty);
             }
+            freeing(sub.id());
             dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |_, e| e[0] = DELETED)?;
-            cache.free_chain(self.r, g, f.cluster)?;
-            Ok(sub.id())
+            cache.free_chain(self.r, g, f.cluster)
         })
     }
 
@@ -921,8 +922,8 @@ impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
         Fat::unlink_at(self, dir, name, now)
     }
 
-    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<u64, FsError> {
-        Fat::rmdir_at(self, dir, name, now)
+    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64, freeing: impl FnOnce(u64)) -> Result<(), FsError> {
+        Fat::rmdir_at(self, dir, name, now, freeing)
     }
 
     fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
