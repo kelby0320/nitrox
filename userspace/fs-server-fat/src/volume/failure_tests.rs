@@ -8,21 +8,32 @@ use std::rc::Rc;
 const NOW: i64 = 1_791_244_800;
 
 /// **Run `change` on `base` with each of its writes refused once in turn**, until a run refuses
-/// none, checking each image: one the change succeeded on has `takes` fewer clusters free.
+/// none, checking each image: one the change succeeded on has `takes` fewer clusters free. **A
+/// removal that fails may lose clusters**, since it writes its entry before it frees: its image
+/// is held to the crash tests' rule, which allows that, and no more.
 fn each_write_refused(
     base: &Rc<Vec<u8>>,
     what: &str,
-    takes: u32,
+    takes: i64,
     change: impl Fn(&Fat<Failing>) -> Result<(), FsError>,
 ) {
     let free = |disk: &Failing| {
         let g = *Fat::new(&disk.image).geometry().unwrap();
-        Cache::count_free(&disk.image, &g).unwrap()
+        Cache::count_free(&disk.image, &g).unwrap() as i64
     };
     let had = free(&Failing::once(base.clone(), u64::MAX));
     for n in 0.. {
         let disk = Failing::once(base.clone(), n);
         let out = change(&Fat::new(&disk));
+        let refused = disk.writes.get() > n;
+        if !refused {
+            assert_eq!(out, Ok(()), "{what}: with nothing refused");
+        }
+        if out.is_err() && takes < 0 {
+            let kept = super::crash_tests::consistent(&disk.image);
+            assert_eq!(kept, Ok(()), "{what}, write {n} refused ({out:?})");
+            continue;
+        }
         let saved = disk.image.save(what);
         let (status, said) = fsck(&saved);
         let _ = std::fs::remove_file(&saved);
@@ -30,8 +41,7 @@ fn each_write_refused(
         if out.is_ok() {
             assert_eq!(free(&disk), had - takes, "{what}, write {n} refused");
         }
-        if disk.writes.get() <= n {
-            assert_eq!(out, Ok(()), "{what}: with nothing refused");
+        if !refused {
             break;
         }
     }
@@ -188,4 +198,28 @@ fn a_refusal_comes_before_anything_is_written() {
     assert_eq!(fat.unlink_at(root, b"D", NOW), Err(FsError::Unsupported), "a directory unlinked");
     assert_eq!(fat.mkdir_at(root, b"a:b", NOW), Err(FsError::InvalidName), "a name a FAT cannot hold");
     assert_eq!(disk.writes.get(), 0, "nothing written");
+}
+
+/// **Every other change stopped at any write loses no cluster and leaves none in two chains**: a
+/// file made, a directory made and removed, a file removed and released, and one truncated.
+#[test]
+fn every_change_stopped_at_any_write_leaves_a_clean_volume() {
+    let img = mformat(64, &["-c", "8"]);
+    mmd(&img, "EMPTY");
+    put(&img, "BIG.BIN", &[9u8; 40_000]);
+    put(&img, "GONE.BIN", &[8u8; 40_000]);
+    let base = Rc::new(std::fs::read(&img).unwrap());
+    let _ = std::fs::remove_file(&img);
+    let root = |fat: &Fat<Failing>| fat.resolve_dir(b"/");
+    each_write_refused(&base, "a create", 0, |fat| fat.create_file(b"/", b"a file with a long name", NOW));
+    each_write_refused(&base, "a mkdir", 1, |fat| fat.mkdir_at(root(fat)?, b"a directory", NOW));
+    each_write_refused(&base, "an rmdir", -1, |fat| fat.rmdir_at(root(fat)?, b"EMPTY", NOW, drop));
+    each_write_refused(&base, "an unlink", -10, |fat| {
+        let id = fat.unlink_at(root(fat)?, b"GONE.BIN", NOW)?;
+        fat.release(id.unwrap(), NOW)
+    });
+    each_write_refused(&base, "a truncate", -9, |fat| {
+        let id = Volume::truncate_file(fat, b"/BIG.BIN", 100, NOW)?;
+        id.map_or(Ok(()), |id| fat.release(id, NOW))
+    });
 }

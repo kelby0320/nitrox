@@ -61,7 +61,7 @@ fn with_garbage_in_free_clusters(path: &std::path::Path) -> Rc<Vec<u8>> {
 /// two names**, two entries starting at the same cluster: a rename writes the new name before it
 /// deletes the old, so a crash between leaves the file twice rather than nowhere, as Linux's vfat
 /// does. Any other overlap is two files sharing a cluster, and fails.
-fn consistent(img: &Overlay) -> Result<(), String> {
+pub(super) fn consistent(img: &Overlay) -> Result<(), String> {
     let fat = Fat::new(img);
     let g = *fat.geometry().unwrap();
     let cb = g.cluster_bytes() as u64;
