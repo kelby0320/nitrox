@@ -91,6 +91,40 @@ pub fn parse_mount(body: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((device, &body[MOUNT_PREFIX_LEN + device_len..]))
 }
 
+/// Bytes before a `Mount` reply's label: its mode, a reserved `0`, and the label's length.
+pub const MOUNTED_PREFIX_LEN: usize = 4;
+
+/// Build a `Mount` reply: `mode` (`0` writable, `1` read-only), a reserved `0`, `label_len: u16`,
+/// the label, then `read_only`'s reason, nothing when writable; `None` if `out` is short.
+pub fn build_mounted(out: &mut [u8], label: &[u8], read_only: Option<&[u8]>) -> Option<usize> {
+    let why = read_only.unwrap_or_default();
+    let total = MOUNTED_PREFIX_LEN.checked_add(label.len())?.checked_add(why.len())?;
+    if out.len() < total || label.len() > u16::MAX as usize {
+        return None;
+    }
+    out[0] = read_only.is_some() as u8;
+    out[1] = 0;
+    put_u16(out, 2, label.len() as u16);
+    out[MOUNTED_PREFIX_LEN..MOUNTED_PREFIX_LEN + label.len()].copy_from_slice(label);
+    out[MOUNTED_PREFIX_LEN + label.len()..total].copy_from_slice(why);
+    Some(total)
+}
+
+/// A `Mount` reply's label, and why it is read-only if it is; `None` for one its mode and lengths do
+/// not account for, a writable one carrying a reason among them.
+pub fn parse_mounted(body: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    if body.len() < MOUNTED_PREFIX_LEN || body[1] != 0 {
+        return None;
+    }
+    let end = MOUNTED_PREFIX_LEN + get_u16(body, 2) as usize;
+    let (label, why) = (body.get(MOUNTED_PREFIX_LEN..end)?, &body[end..]);
+    match body[0] {
+        0 if why.is_empty() => Some((label, None)),
+        1 => Some((label, Some(why))),
+        _ => None,
+    }
+}
+
 /// Build an `InUse` reply: `count: u32`, then `count` `u32` registry ids; `None` if `out` is short.
 pub fn build_in_use(out: &mut [u8], ids: &[u32]) -> Option<usize> {
     let total = 4usize.checked_add(ids.len().checked_mul(4)?)?;
@@ -120,6 +154,22 @@ pub fn parse_in_use(body: &[u8], mut each: impl FnMut(u32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A Mount's reply says how it was mounted**, and why when read-only; one whose mode or
+    /// lengths do not account for it, a writable one with a reason among them, reads as nothing.
+    #[test]
+    fn a_mount_reply_says_how_it_was_mounted() {
+        let mut out = [0u8; 64];
+        let n = build_mounted(&mut out, b"data", None).unwrap();
+        assert_eq!(parse_mounted(&out[..n]), Some((&b"data"[..], None)));
+        let n = build_mounted(&mut out, b"csum", Some(b"it can only be read here")).unwrap();
+        assert_eq!(parse_mounted(&out[..n]), Some((&b"csum"[..], Some(&b"it can only be read here"[..]))));
+        let bad: [&[u8]; 5] =
+            [b"\x00\x00\x04\x00dat", b"\x02\x00\x01\x00d", b"\x00\x01\x01\x00d", b"\x00\x00\x01\x00dx", b"\x01\x00"];
+        for body in bad {
+            assert_eq!(parse_mounted(body), None, "{body:?}");
+        }
+    }
 
     #[test]
     fn a_mount_carries_a_device_and_a_label() {

@@ -82,7 +82,10 @@ const ARRIVAL_NS: u64 = 30_000_000_000;
 
 const FLAGS: [Flag; 8] = [
     Flag::long_only("list", "every block device, its filesystem, and where it is mounted"),
-    Flag::long_only("mount", "mount DEVICE writable at /storage/<label> (needs the storage grant)"),
+    Flag::long_only(
+        "mount",
+        "mount DEVICE at /storage/<label>, writable if its server writes it (needs the storage grant)",
+    ),
     Flag::long_only("unmount", "unmount the filesystem called LABEL (needs the storage grant)"),
     Flag::long_only("eject", "unmount the removable drive at /storage/NAME, so it can be pulled"),
     Flag::long_only("partition", "one partition spanning the removable DISK (needs with admin)"),
@@ -96,8 +99,8 @@ const HELP: &[u8] = b"usage: disk --list | --mount DEVICE [LABEL] | --unmount LA
     \n\
     --list              every block device, what it holds, where it is mounted, and whether\n\
     \x20                   it was left clean, as a table\n\
-    --mount DEVICE [L]  mount DEVICE (/dev/blk/N or blk-N) writable at /storage/L, or under\n\
-    \x20                   the label the storage service chooses\n\
+    --mount DEVICE [L]  mount DEVICE (/dev/blk/N or blk-N) at /storage/L, or under the label\n\
+    \x20                   the service chooses; read-only, saying why, if its server only reads it\n\
     --unmount LABEL     write back every file, flush the drive, and unmount; refused while a\n\
     \x20                   file on it is open\n\
     --eject NAME        the same for every filesystem on the removable drive holding\n\
@@ -308,20 +311,34 @@ fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
         Ok(r) => r,
         Err(f) => return failed(stage, "mount", &device, f),
     };
-    let label = String::from_utf8_lossy(&reply).into_owned();
+    let Some((label, read_only)) = librsproto::storage::parse_mounted(&reply) else {
+        say(stage, "disk: the storage service's answer was not a Mount reply\n");
+        return EXIT_FAILURE;
+    };
+    let label = String::from_utf8_lossy(label).into_owned();
+    let why = read_only.map(|w| String::from_utf8_lossy(w).into_owned());
     let at = format!("/storage/{label}");
     match stage.streams.stdout {
         Some(h) => {
             let schema = Schema::new()
                 .field("device", TypeTag::String, TypeModifiers::NONE)
                 .field("label", TypeTag::String, TypeModifiers::NONE)
-                .field("mounted", TypeTag::String, TypeModifiers::NONE);
-            let row = alloc::vec![Value::Str(device.clone()), Value::Str(label.clone()), Value::Str(at.clone())];
+                .field("mounted", TypeTag::String, TypeModifiers::NONE)
+                .field("mode", TypeTag::String, TypeModifiers::NONE)
+                .field("note", TypeTag::String, TypeModifiers::NULLABLE);
+            let mode = Value::Str(String::from(if why.is_some() { "ro" } else { "rw" }));
+            let note = why.clone().map_or(Value::Null, Value::Str);
+            let row =
+                alloc::vec![Value::Str(device.clone()), Value::Str(label.clone()), Value::Str(at.clone()), mode, note];
             write_table(stage, h, &schema, &[row]);
         }
-        None => stage.note(format!("{device} mounted at {at}\n").as_bytes()),
+        None => match &why {
+            Some(why) => stage.note(format!("{device} mounted read-only at {at}: {why}\n").as_bytes()),
+            None => stage.note(format!("{device} mounted at {at}\n").as_bytes()),
+        },
     }
-    Line::new().s(b"disk: mounted ").s(device.as_bytes()).s(b" at ").untrusted(at.as_bytes()).end();
+    let how: &[u8] = if why.is_some() { b" read-only at " } else { b" at " };
+    Line::new().s(b"disk: mounted ").s(device.as_bytes()).s(how).untrusted(at.as_bytes()).end();
     EXIT_OK
 }
 

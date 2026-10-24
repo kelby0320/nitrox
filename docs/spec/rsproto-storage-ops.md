@@ -56,7 +56,7 @@ echoing its `request_id`. A refusal is the standard
 
 ### `Mount` (`0x1000`)
 
-**Mount a device, writable.** Body:
+**Mount a device, writable unless its server would only read it.** Body:
 
 | Offset | Size | Field |
 |---|---|---|
@@ -66,10 +66,21 @@ echoing its `request_id`. A refusal is the standard
 | 4 + `device_len` | `label_len` | the label to mount it under, or nothing to let the service choose |
 
 A body whose lengths do not account for it exactly is refused with `InvalidArgument`. The reply's
-body is the label the filesystem was mounted under, and it appears at `/svc/storage/fs/<label>`.
+body says how it was mounted (`librsproto::storage::build_mounted`):
 
-**Always writable, on a live boot too.** The automatic mount of an internal disk on a live boot is
-read-only because nobody chose it; an administrator's mount is a choice.
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | `mode`: `0` writable, `1` read-only |
+| 1 | 1 | reserved, `0` |
+| 2 | 2 | `label_len` |
+| 4 | `label_len` | the label it was mounted under; it appears at `/svc/storage/fs/<label>` |
+| 4 + `label_len` | the rest | why it is read-only, its server's reason; empty when writable |
+
+**Writable, on a live boot too.** The automatic mount of an internal disk on a live boot is
+read-only because nobody chose it; an administrator's mount is a choice. **Except a filesystem its
+server would only read** (pre-Phase-7 Part D): an ext4 with a feature its writes would leave wrong,
+a checksum among them. It is mounted read-only, as the automatic mount mounts it, and the reply
+says so with the server's reason, which `disk --mount` prints.
 
 | Refusal | When |
 |---|---|

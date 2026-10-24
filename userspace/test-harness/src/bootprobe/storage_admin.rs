@@ -30,7 +30,7 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::storage::{
         OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_REREAD, OP_STORAGE_UNMOUNT, build_mount,
-        is_changed, parse_in_use,
+        is_changed, parse_in_use, parse_mounted,
     };
     use libstream::wire::{Table, Value};
     let fail = |what: &[u8]| {
@@ -262,7 +262,8 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     }
     let n = build_mount(&mut body, names[0].as_bytes(), b"").unwrap_or(0);
     let again = ask(OP_STORAGE_MOUNT, &body[..n]);
-    if !again.as_ref().is_some_and(|m| !m.error && m.body == b"nitrox-scratch") {
+    let mounted = |m: &Received| parse_mounted(&m.body) == Some((&b"nitrox-scratch"[..], None));
+    if !again.as_ref().is_some_and(|m| !m.error && mounted(m)) {
         return finish(fail(b"a Mount by name did not bring nitrox-scratch back"));
     }
     if !pinged(clock_ns() + 5_000_000_000) {
@@ -554,7 +555,7 @@ pub(super) fn storage_grant_test(root_ns: u64) -> bool {
     let mounted = run(&[b"--mount", path.as_bytes()]);
     let name = alloc::format!("blk-{scratch}");
     if mounted.map(|(code, row, _)| (code, row))
-        != Some((0, alloc::vec![s(&name), s("nitrox-scratch"), s("/storage/nitrox-scratch")]))
+        != Some((0, alloc::vec![s(&name), s("nitrox-scratch"), s("/storage/nitrox-scratch"), s("rw"), Value::Null]))
     {
         return finish(fail(b"disk --mount in the admin view did not answer its table"));
     }

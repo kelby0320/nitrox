@@ -432,7 +432,7 @@ block device in registry order, then one `<name>.tsm` per device. **A name is `/
 | `mode` | string, nullable | `ro` or `rw` |
 | `clean` | bool, nullable | whether an ext4 or a FAT was left cleanly unmounted |
 | `removable` | bool | whether the device is a disk behind USB mass storage, or a partition of one (§6): what Files decides an eject button by (Phase 6 Part F) |
-| `note` | string, nullable | **why a filesystem found is not mounted**, in the words of the service's log line: `not served: <its server's reason>`, `not removable, so not mounted`, `on the disk the machine started from, passed over`, `the installer's source, left unmounted`. Null for a mounted filesystem, one nothing kept from being mounted but a person, and a device holding nothing (Phase 6 Part G) |
+| `note` | string, nullable | **why a filesystem found is not mounted**, in the words of the service's log line: `not served: <its server's reason>`, `not removable, so not mounted`, `on the disk the machine started from, passed over`, `the installer's source, left unmounted`; **or why a mounted one is only read**, its server's reason, for an ext4 it would not write (pre-Phase-7 Part D). Null for any other mounted filesystem, one nothing kept from being mounted but a person, and a device holding nothing (Phase 6 Part G) |
 
 **`clean` is `Null` for a filesystem mounted writable.** A writable mount marks the filesystem in
 use before it answers Ready ([`ext4-fs-server-rw.md`](ext4-fs-server-rw.md),
@@ -441,7 +441,8 @@ because it is, and nothing about how the filesystem was left. The service's log 
 same rule.
 
 **`note` and the log line come from one function** (`storage_service::mounts::unmounted_why`), so
-they cannot disagree. The log gives its reason for a device holding nothing too — the boot stick's
+they cannot disagree; a mounted filesystem's read-only reason is the probe's (`Found::read_only`),
+which the mount's log line gives too. The log gives its reason for a device holding nothing too — the boot stick's
 disk is passed over — where the table's row already says it holds nothing.
 
 **A table reads the disks again.** When a table is read, and before an administrator's mount,
