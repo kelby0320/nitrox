@@ -306,16 +306,20 @@ impl Cache {
         }
         let after = |c: u32| if g.valid_cluster(c + 1) { c + 1 } else { 2 };
         let (mut first, mut last, mut got) = (0u32, 0u32, 0u32);
+        // A cluster ended and not yet linked: a failure frees it on its own.
+        let mut unlinked = None;
         let mut c = if g.valid_cluster(hint) { hint } else { 2 };
         let out = (|| {
             for _ in 0..g.clusters {
                 if entry(g.kind, c, |at| self.byte_rw(rw, g, at))? == 0 {
                     self.set(rw, g, c, end_mark(g))?;
+                    unlinked = Some(c);
                     if got == 0 {
                         first = c;
                     } else {
                         self.set(rw, g, last, c)?;
                     }
+                    unlinked = None;
                     last = c;
                     got += 1;
                     each(c)?;
@@ -327,8 +331,13 @@ impl Cache {
             }
             Err(FsError::TooLarge)
         })();
-        if out.is_err() && got > 0 {
-            self.free_chain(rw, g, first)?;
+        if out.is_err() {
+            if let Some(u) = unlinked {
+                self.set(rw, g, u, 0)?;
+            }
+            if got > 0 {
+                self.free_chain(rw, g, first)?;
+            }
         }
         out
     }

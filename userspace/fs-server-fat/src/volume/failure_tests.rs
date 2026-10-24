@@ -481,3 +481,57 @@ fn a_long_name_across_two_clusters_is_written_and_unwritten_whole() {
         }
     }
 }
+
+/// **An allocation stopped by a failed read gives back every cluster it took**, the one it had
+/// ended but not yet linked too. Two free clusters with 66 FAT sectors in use between them: the
+/// first's sector is evicted before the second is linked to it, and the read reloading it fails.
+#[test]
+fn an_allocation_stopped_by_a_failed_read_gives_back_every_cluster_it_took() {
+    use std::cell::Cell;
+    /// The first read of FAT sector `at` after a write to it, refused.
+    struct Reload<'a> {
+        image: &'a Overlay,
+        at: u64,
+        written: Cell<bool>,
+        refused: Cell<bool>,
+    }
+    impl BlockReader for Reload<'_> {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            if offset == self.at && self.written.get() && !self.refused.replace(true) {
+                return Err(FsError::Io);
+            }
+            self.image.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Reload<'_> {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            self.written.set(self.written.get() || offset == self.at);
+            self.image.write_at(offset, buf)
+        }
+    }
+    let img = mformat(64, &["-F", "-c", "1"]);
+    put(&img, "A.TXT", b"a");
+    let over = Overlay::new(Rc::new(std::fs::read(&img).unwrap()));
+    let _ = std::fs::remove_file(&img);
+    let fat = Fat::new(&over);
+    let g = *fat.geometry().unwrap();
+    let a = dir::lookup(&over, &g, &mut fat.cache.borrow_mut(), Dir::root(&g), b"A.TXT").unwrap().cluster;
+    let (c1, used) = (a + 1, 66 * SECTOR / 4);
+    for c in c1 + 1..c1 + 1 + used {
+        for copy in 0..g.fats {
+            over.write_at(g.fat_byte(copy) + c as u64 * 4, &0x0FFF_FFFFu32.to_le_bytes()).unwrap();
+        }
+    }
+    let c2 = c1 + 1 + used;
+    let disk = Reload {
+        image: &over,
+        at: g.fat_byte(0) + (c1 as u64 * 4) / 512 * 512,
+        written: false.into(),
+        refused: false.into(),
+    };
+    let fat = Fat::new(&disk);
+    assert_eq!(Volume::grow_file(&fat, b"/A.TXT", 3 * 512, NOW), Err(FsError::Io));
+    assert!(disk.refused.get(), "the reload was refused");
+    let raw = |c| Fat::new(&over).cache.borrow_mut().raw(&over, &g, c);
+    assert_eq!((raw(c1), raw(c2)), (Ok(0), Ok(0)), "both clusters given back");
+}
