@@ -93,14 +93,45 @@ fn build_frags(frames: &[PhysAddr], buf_offset: u64, length: u64) -> Result<KVec
     Ok(frags)
 }
 
+/// **Whether `dn` takes a transfer of `length` bytes at `offset` as whole logical blocks**, as
+/// `docs/spec/io-operation.md` requires; refused before an IRP exists otherwise, so no driver sees
+/// part of a block. AHCI divides both by its sector, and truncated what did not divide.
+fn whole_blocks(dn: &DeviceNode, offset: u64, length: u64) -> Result<(), KError> {
+    let size = dn.block_info().logical_block_size as u64;
+    if size == 0 || !offset.is_multiple_of(size) || !length.is_multiple_of(size) {
+        return Err(KError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// **Submit `irp` to `backend`, or complete it `InvalidArgument` if its range is not within
+/// `dn`'s blocks**: past the end is the operation's outcome (`docs/spec/io-operation.md`), and no
+/// driver sees such a request.
+fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: *mut Irp) {
+    let info = dn.block_info();
+    // SAFETY: `irp` is freshly placed and uniquely owned until it is submitted or completed.
+    let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
+    let span = info.block_count.checked_mul(info.logical_block_size as u64);
+    if offset.checked_add(length).zip(span).is_some_and(|(end, span)| end <= span) {
+        (backend.submit)(irp, backend.ctx);
+    } else {
+        // SAFETY: as above; set its status and queue its completion, as a refusing driver does.
+        unsafe {
+            (*irp).set_completion(KError::InvalidArgument as i32, 0);
+            crate::dpc::enqueue(&(*irp).dpc);
+        }
+    }
+}
+
 /// Build a block IRP for `opcode` on `device`, moving `length` bytes between
 /// device offset `dev_offset` and the `buffer` `MemoryObject`'s range
-/// `[buf_offset, ...)`, completing `po`. Handle types, rights and bounds are the
-/// caller's responsibility.
+/// `[buf_offset, ...)`, completing `po`. Handle types, rights and the buffer's bounds are the
+/// caller's responsibility; **the device's are checked here**.
 ///
 /// Returns `Err` **before the operation starts**, so the caller rolls back `po`:
 /// `OutOfMemory`, `Unsupported` without a block backend, `InvalidArgument` if
-/// the transfer needs more fragments than the device can describe in one command.
+/// the transfer is not whole blocks or needs more fragments than the device can describe in one
+/// command. A range past the device's end completes `po` `InvalidArgument`.
 pub fn dispatch_block_irp(
     device: &ObjectRef,
     buffer: &ObjectRef,
@@ -113,6 +144,7 @@ pub fn dispatch_block_irp(
     // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
+    whole_blocks(dn, dev_offset, length)?;
 
     // SAFETY: `buffer` pins a live `MemoryObject` (type checked by the caller).
     let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
@@ -168,7 +200,7 @@ pub fn dispatch_block_irp(
     };
 
     // Completes asynchronously: the backend (or completion ISR) queues `irp.dpc`.
-    (backend.submit)(irp_ptr, backend.ctx);
+    submit_within(dn, backend, irp_ptr);
     Ok(())
 }
 
@@ -200,6 +232,7 @@ pub fn dispatch_block_irp_into_frames(
     // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
+    whole_blocks(dn, dev_offset, length)?;
     if length > (frames.len() * PAGE_SIZE) as u64 {
         return Err(KError::InvalidArgument);
     }
@@ -244,7 +277,7 @@ pub fn dispatch_block_irp_into_frames(
         bx.irp.dpc = Dpc::new(irp_complete_dpc, bx_ptr as *mut ());
         &mut bx.irp as *mut Irp
     };
-    (backend.submit)(irp_ptr, backend.ctx);
+    submit_within(dn, backend, irp_ptr);
     Ok(())
 }
 
@@ -774,6 +807,77 @@ mod tests {
         unsafe { assert_eq!(((*irp).op, (*irp).offset, (*irp).length), (IrpOp::Write as u32, 4096, 8 * page)) };
         // Completed as the device would complete it, and its box reclaimed.
         irp_complete_dpc(irp as *mut ());
+        reclaim_completed();
+    }
+
+    /// **A block request off its device's blocks reaches no driver**: part of a block is refused
+    /// before an IRP exists, through the syscall's dispatch and the page cache's alike, and a range
+    /// past the end completes its operation `InvalidArgument`. AHCI took either, as another sector
+    /// or a count of 0, which ATA reads as 65,536.
+    #[test]
+    fn a_block_request_off_its_devices_blocks_reaches_no_driver() {
+        use crate::libkern::block::BlockKind;
+        use crate::libkern::handle::KObjectType;
+        use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
+        use crate::object::{MemoryObject, PendingOperation};
+        use core::cell::RefCell;
+        init_global_heap();
+        crate::dpc::init().unwrap();
+        /// Each IRP that reached the device.
+        struct Seen(RefCell<std::vec::Vec<*mut Irp>>);
+        fn disk_submit(irp: *mut Irp, ctx: *mut ()) {
+            // SAFETY: `ctx` is the test's `Seen`.
+            unsafe { (*(ctx as *const Seen)).0.borrow_mut().push(irp) };
+        }
+        fn disk_poll(_: *mut ()) {}
+        let seen = Seen(RefCell::new(std::vec::Vec::new()));
+        let backend =
+            BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+        let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
+        let node =
+            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
+        // SAFETY: `into_raw` yields each single creation reference, which the test adopts.
+        let adopt = |p: *mut (), kind| unsafe { ObjectRef::from_raw(p, kind) };
+        let disk = adopt(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode);
+        let buffer = adopt(
+            KBox::into_raw(MemoryObject::try_new(2 * PAGE_SIZE).unwrap()).as_ptr() as *mut (),
+            KObjectType::MemoryObject,
+        );
+        let po = || {
+            adopt(
+                KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
+                KObjectType::PendingOperation,
+            )
+        };
+        let frames = [PhysAddr(0x10_0000), PhysAddr(0x20_0000)];
+        // Each request through both entry points, its operation's status once settled.
+        let both = |offset: u64, length: u64| {
+            let (a, b) = (po(), po());
+            let r = dispatch_block_irp(&disk, &buffer, &a, IoOpcode::Read, offset, 0, length);
+            let s = dispatch_block_irp_into_frames(&disk, &frames, disk.clone(), &b, IoOpcode::Write, offset, length);
+            crate::dpc::run_pending();
+            reclaim_completed();
+            // SAFETY: each pins its live `PendingOperation`; a single-threaded test stands in for `SCHED`.
+            let status = |p: &ObjectRef| unsafe {
+                PendingOperation::already_signaled(p.as_ptr()).then(|| PendingOperation::status(p.as_ptr()))
+            };
+            ((r, status(&a)), (s, status(&b)))
+        };
+        let refused = (Err(KError::InvalidArgument), None);
+        for (offset, length) in [(0, 100), (100, 512), (0, 600), (1000, 1024)] {
+            assert_eq!(both(offset, length), (refused, refused), "part of a block: ({offset}, {length})");
+        }
+        let past = (Ok(()), Some(KError::InvalidArgument as i32));
+        let span = 64 * 512;
+        for (offset, length) in [(span - 512, 1024), (span, 512), (u64::MAX - 511, 512)] {
+            assert_eq!(both(offset, length), (past, past), "past the end: ({offset}, {length})");
+        }
+        assert!(seen.0.borrow().is_empty(), "nothing reached the device");
+        let last = (Ok(()), None);
+        assert_eq!(both(span - 512, 512), (last, last), "the last block goes down, for the device to complete");
+        for irp in seen.0.borrow_mut().drain(..) {
+            irp_complete_dpc(irp as *mut ());
+        }
         reclaim_completed();
     }
 

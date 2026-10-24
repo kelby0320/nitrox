@@ -95,9 +95,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   `InvalidArgument`.
 - **`offset`** — byte offset **within the resource** (the device) at which to
   read or write. For a block device it must be a multiple of the device's
-  logical block size (`offset` past the device's end completes the PO with
-  `InvalidArgument`); the block layer is byte-addressed at the ABI and converts
-  to LBA internally, so the descriptor stays resource-agnostic.
+  logical block size (a range, `offset + length`, past the device's end completes
+  the PO with `InvalidArgument`); the block layer is byte-addressed at the ABI and
+  converts to LBA internally, so the descriptor stays resource-agnostic.
 - **`length`** — number of bytes to transfer. For a block device it must be a
   multiple of the logical block size. `0` is a legal no-op that completes a
   pre-signalled PO with `result = 0` (lets a caller probe a resource's
