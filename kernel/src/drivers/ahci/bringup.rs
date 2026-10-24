@@ -134,10 +134,9 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         Ok(b) => KBox::into_raw(b).as_ptr(), // leak to 'static
         Err(_) => return declined(OUT_OF_MEMORY),
     };
-    AHCI.store(disk, Ordering::Release);
 
     let mut name = [0u8; MAX_DEVICE_NAME];
-    // SAFETY: `disk` is the just-published live state.
+    // SAFETY: `disk` is the live state, not yet published: IDENTIFY is polled.
     let (sectors, name_len, flush) = match unsafe { identify(&mut *disk, &mut name) } {
         Some(s) => s,
         None => {
@@ -163,6 +162,9 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         port,
         if flush == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" }
     );
+
+    // Published once the disk answered, so a controller declined above gets no watch thread.
+    AHCI.store(disk, Ordering::Release);
 
     // Prefer MSI: it does not depend on the PCI interrupt-line register, which QEMU's firmware
     // programs and real UEFI often leaves meaningless. INTx is the fallback.
