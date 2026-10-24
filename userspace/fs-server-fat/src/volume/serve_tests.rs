@@ -88,6 +88,8 @@ fn a_file_is_replied_in_sectors_with_its_first_cluster_as_its_id() {
 
     let ro = ReadOnly(&disk);
     assert_eq!(resolve(&Fat::new(&ro), b"file.bin").unwrap().flags, FILE_BLOCKS_READ_ONLY);
+    fat.broken.set(true);
+    assert_eq!(resolve(&fat, b"file.bin").unwrap().flags, FILE_BLOCKS_READ_ONLY, "a mount refusing changes");
 }
 
 /// **A grow's reply marks the sectors it added `UNWRITTEN`, which read zero on the device, and a

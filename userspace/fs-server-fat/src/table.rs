@@ -169,10 +169,23 @@ impl Cache {
         r: &R,
         g: &Geometry,
         first: u32,
+        each: impl FnMut(u32, u32) -> bool,
+    ) -> Result<(), FsError> {
+        self.walk_upto(r, g, first, g.clusters, each)
+    }
+
+    /// [`Cache::walk`], a chain longer than `most` clusters `Corrupt`: a directory's, which no more
+    /// than `MAX_SLOTS` entries fill, so one that loops costs that reach, not the volume's.
+    pub fn walk_upto<R: BlockReader>(
+        &mut self,
+        r: &R,
+        g: &Geometry,
+        first: u32,
+        most: u32,
         mut each: impl FnMut(u32, u32) -> bool,
     ) -> Result<(), FsError> {
         let mut c = first;
-        for i in 0..g.clusters {
+        for i in 0..most {
             if !g.valid_cluster(c) {
                 return Err(FsError::Corrupt);
             }
@@ -278,7 +291,8 @@ impl Cache {
     /// `each` as it is taken, so a caller can zero them, then linked in the order found and ended.
     /// So they are contiguous wherever the free space is. The first, and where the next search
     /// should begin. **All or nothing**: a volume that runs out gives back what it took, and the
-    /// allocation is `TooLarge`, as a full ext4's is.
+    /// allocation is `TooLarge`, as a full ext4's is; so does a failed zeroing or read. **An entry
+    /// not free is a cluster in use**, a reserved value too, as Linux reads it.
     pub fn allocate<RW: BlockReader + BlockWriter>(
         &mut self,
         rw: &RW,
@@ -292,31 +306,40 @@ impl Cache {
         }
         let after = |c: u32| if g.valid_cluster(c + 1) { c + 1 } else { 2 };
         let (mut first, mut last, mut got) = (0u32, 0u32, 0u32);
+        // A cluster ended and not yet linked: a failure frees it on its own.
+        let mut unlinked = None;
         let mut c = if g.valid_cluster(hint) { hint } else { 2 };
-        for _ in 0..g.clusters {
-            if self.next_rw(rw, g, c)? == Next::Free {
-                self.set(rw, g, c, end_mark(g))?;
-                if got == 0 {
-                    first = c;
-                } else {
-                    self.set(rw, g, last, c)?;
+        let out = (|| {
+            for _ in 0..g.clusters {
+                if entry(g.kind, c, |at| self.byte_rw(rw, g, at))? == 0 {
+                    self.set(rw, g, c, end_mark(g))?;
+                    unlinked = Some(c);
+                    if got == 0 {
+                        first = c;
+                    } else {
+                        self.set(rw, g, last, c)?;
+                    }
+                    unlinked = None;
+                    last = c;
+                    got += 1;
+                    each(c)?;
+                    if got == n {
+                        return Ok((first, after(c)));
+                    }
                 }
-                last = c;
-                got += 1;
-                if let Err(e) = each(c) {
-                    self.free_chain(rw, g, first)?;
-                    return Err(e);
-                }
-                if got == n {
-                    return Ok((first, after(c)));
-                }
+                c = after(c);
             }
-            c = after(c);
+            Err(FsError::TooLarge)
+        })();
+        if out.is_err() {
+            if let Some(u) = unlinked {
+                self.set(rw, g, u, 0)?;
+            }
+            if got > 0 {
+                self.free_chain(rw, g, first)?;
+            }
         }
-        if got > 0 {
-            self.free_chain(rw, g, first)?;
-        }
-        Err(FsError::TooLarge)
+        out
     }
 
     /// **Free the chain from `first`**, every cluster of it, bounded as a walk is. A freed cluster

@@ -13,7 +13,7 @@
 
 use core::cell::{Cell, RefCell};
 
-use crate::bpb::{self, Geometry, Kind, SECTOR, Unservable};
+use crate::bpb::{self, Geometry, SECTOR, Unservable};
 use crate::dir::{self, ATTR_ARCHIVE, ATTR_DIR, DELETED, DOT, DOTDOT, Dir, ENTRY, Found, MAX_SLOTS, Node};
 use crate::table::{self, Cache, Next};
 use crate::{BlockReader, BlockRun, BlockWriter, FsError};
@@ -90,8 +90,12 @@ pub struct Fat<'a, R> {
     r: &'a R,
     geometry: Result<Geometry, Unservable>,
     cache: RefCell<Cache>,
-    /// Whether the filesystem was found not cleanly unmounted, so its unmount leaves it so.
+    /// Whether the unmount leaves the filesystem marked not clean: found so, or a change failed
+    /// on the device during this mount. One found corrupt is `broken`, whose unmount writes nothing.
     found_dirty: Cell<bool>,
+    /// Whether a change found the filesystem corrupt, or could not undo itself, during this mount:
+    /// every later change is then refused, as Linux's FAT remounts itself read-only.
+    broken: Cell<bool>,
     /// Where the next allocation's search begins: FAT32's next-free hint, then past the last.
     hint: Cell<u32>,
     ids: RefCell<Ids>,
@@ -113,6 +117,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
             geometry,
             cache: RefCell::new(Cache::new()),
             found_dirty: Cell::new(false),
+            broken: Cell::new(false),
             hint: Cell::new(2),
             ids: RefCell::new(Ids::new()),
             orphans: RefCell::new([0; ORPHANS]),
@@ -169,9 +174,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
         }
         let mut e = [0u8; 32];
         self.r.read_meta(g.cluster_sector(c) * SECTOR as u64, &mut e)?;
-        let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
-        let named = (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
-        if &e[..11] != DOT || e[11] & ATTR_DIR == 0 || named != c {
+        if &e[..11] != DOT || e[11] & ATTR_DIR == 0 || dir::cluster(g.kind, &e) != c {
             return Err(FsError::NotFound);
         }
         Ok(d)
@@ -380,19 +383,27 @@ fn split(path: &[u8]) -> Result<(&[u8], &[u8]), FsError> {
 }
 
 impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
-    /// **Run a change to the filesystem**: refused on a read-only mount before anything is read,
-    /// and the FAT's dirty sectors written at its end. **A failure is written too**: one that is
-    /// not the device's leaves the cache as it found it, or with what it took given back; one that
-    /// is the device's leaves nothing certain; a failed write forgets the cache, so it never holds
-    /// what the device does not.
+    /// **Run a change to the filesystem**: refused on a read-only mount, or one a change found
+    /// corrupt, before anything is read, and the FAT's dirty sectors written at its end. **A
+    /// failure is written too**: one that is not the device's leaves the cache as it found it, or
+    /// with what it took given back; one that is the device's leaves nothing certain; a failed
+    /// write forgets the cache, so it never holds what the device does not.
     fn change<T>(&self, op: impl FnOnce(&Geometry, &mut Cache) -> Result<T, FsError>) -> Result<T, FsError> {
-        if self.r.read_only() {
+        if self.r.read_only() || self.broken.get() {
             return Err(FsError::ReadOnly);
         }
         let g = self.geometry()?;
         let mut cache = self.cache.borrow_mut();
         let out = op(g, &mut cache);
-        if let Err(e) = cache.flush(self.r, g) {
+        if matches!(out, Err(FsError::Corrupt)) {
+            self.broken.set(true);
+        }
+        let flushed = cache.flush(self.r, g);
+        // What the device holds is no longer certain, or not sound: the unmount says so.
+        if flushed.is_err() || matches!(out, Err(FsError::Io)) {
+            self.found_dirty.set(true);
+        }
+        if let Err(e) = flushed {
             cache.clear();
             return out.and(Err(e));
         }
@@ -409,19 +420,15 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         Ok((sig(0) == 0x4161_5252 && sig(484) == 0x6141_7272 && sig(508) == 0xAA55_0000).then_some(s))
     }
 
-    /// **Record the filesystem mounted**, before `Ready`: the state byte's bit set, and FAT32's free
-    /// count made unknown, since it is not kept while mounted. A filesystem found with the bit set
-    /// is remembered as not cleanly unmounted.
+    /// **Record the filesystem mounted**, before `Ready`: FAT32's free count made unknown, since it
+    /// is not kept while mounted, then the state byte's bit set, last, so a mount refused for a
+    /// failed write leaves the bit as found. A filesystem found with the bit set is remembered as
+    /// not cleanly unmounted.
     pub fn mark_mounted(&self) -> Result<(), FsError> {
         if self.r.read_only() {
             return Err(FsError::ReadOnly);
         }
         let g = self.geometry()?;
-        let mut b = [0u8; 1];
-        self.r.read_at(g.state_at as u64, &mut b)?;
-        self.found_dirty.set(b[0] & 1 != 0);
-        b[0] |= 1;
-        self.r.write_at(g.state_at as u64, &b)?;
         if let Some(mut info) = self.fsinfo(g)? {
             let next = u32::from_le_bytes([info[492], info[493], info[494], info[495]]);
             if g.valid_cluster(next) {
@@ -430,6 +437,11 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             info[488..492].copy_from_slice(&u32::MAX.to_le_bytes());
             self.r.write_at(g.fsinfo as u64 * SECTOR as u64, &info)?;
         }
+        let mut b = [0u8; 1];
+        self.r.read_at(g.state_at as u64, &mut b)?;
+        self.found_dirty.set(b[0] & 1 != 0);
+        b[0] |= 1;
+        self.r.write_at(g.state_at as u64, &b)?;
         Ok(())
     }
 
@@ -440,6 +452,10 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     pub fn mark_clean(&self) -> Result<(), FsError> {
         if self.r.read_only() {
             return Err(FsError::ReadOnly);
+        }
+        // Nothing more is written to a filesystem found corrupt; its state bit stays set.
+        if self.broken.get() {
+            return Ok(());
         }
         let g = self.geometry()?;
         self.cache.borrow_mut().flush(self.r, g)?;
@@ -496,16 +512,30 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         let cb = g.cluster_bytes() as u64;
         let mut z = Zeroer::new(self.r);
         let (new, _) = cache.allocate(self.r, g, more, last + 1, |c| z.add(g.cluster_sector(c) * SECTOR as u64, cb))?;
-        z.finish()?;
-        cache.flush(self.r, g)?;
-        cache.set(self.r, g, last, new)?;
+        let linked = z.finish().and_then(|()| cache.flush(self.r, g)).and_then(|_| cache.set(self.r, g, last, new));
+        if let Err(e) = linked {
+            self.give_back(g, cache, Some(last), new)?;
+            return Err(e);
+        }
         Ok(total - trailing)
+    }
+
+    /// **Give back the clusters from `taken`**, a failed change's: the link to them from `last`, if
+    /// it may have been made, undone and written first, so no chain on the device reaches one freed.
+    fn give_back(&self, g: &Geometry, cache: &mut Cache, last: Option<u32>, taken: u32) -> Result<(), FsError> {
+        if let Some(last) = last {
+            cache.set(self.r, g, last, table::end_mark(g))?;
+            cache.flush(self.r, g)?;
+        }
+        cache.free_chain(self.r, g, taken)
     }
 
     /// **Write the entries naming `name` into `d`**, its short entry made by `short` from its
     /// short name: the directory grown first if it must be, and **every FAT change made so far
     /// written before the entries** — a grown directory's link, and a `mkdir`'s cluster, which the
-    /// entry names. This one flush is the rule for both. Where its short entry is.
+    /// entry names. This one flush is the rule for both. Its first slot and its short entry's.
+    /// **A failed write is taken back**, every slot of the name marked deleted, whether it landed
+    /// or not; if that fails too the name may be on the disk, and the mount refuses changes.
     fn insert(
         &self,
         g: &Geometry,
@@ -513,13 +543,35 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         d: Dir,
         name: &[u8],
         short: impl FnOnce(&[u8; 11]) -> [u8; 32],
-    ) -> Result<u32, FsError> {
+    ) -> Result<(u32, u32), FsError> {
         let mut entries = [[0u8; 32]; dir::MAX_NAME_SLOTS];
         let n = dir::name_entries(self.r, g, cache, d, name, short, &mut entries)? as u32;
         let first = self.place(g, cache, d, n)?;
+        let last = first + n - 1;
         cache.flush(self.r, g)?;
-        dir::rewrite(self.r, g, cache, d, first, first + n - 1, |s, e| *e = entries[(s - first) as usize])?;
-        Ok(first + n - 1)
+        if let Err(e) = dir::rewrite(self.r, g, cache, d, first, last, |s, e| *e = entries[(s - first) as usize]) {
+            if dir::rewrite(self.r, g, cache, d, first, last, |_, e| e[0] = DELETED).is_err() {
+                self.broken.set(true);
+            }
+            return Err(e);
+        }
+        Ok((first, last))
+    }
+
+    /// **Mark the name `f` deleted in `d`**, a write per run of adjacent slots. **A failed write
+    /// is undone** — every slot written back as it was, whether that write landed or not — and the
+    /// error says whether the undo was written, so the name is whole again.
+    fn unname(&self, g: &Geometry, cache: &mut Cache, d: Dir, f: &Found) -> Result<(), (FsError, bool)> {
+        let mut was = [[0u8; 32]; dir::MAX_NAME_SLOTS];
+        for (k, w) in was.iter_mut().enumerate().take((f.slot - f.first_slot + 1) as usize) {
+            *w = self.raw_entry(g, cache, d, f.first_slot + k as u32).map_err(|e| (e, true))?;
+        }
+        let Err(e) = dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |_, e| e[0] = DELETED) else {
+            return Ok(());
+        };
+        let back =
+            dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |s, e| *e = was[(s - f.first_slot) as usize]);
+        Err((e, back.is_ok()))
     }
 
     fn find(&self, g: &Geometry, cache: &mut Cache, d: Dir, name: &[u8]) -> Result<Option<Found>, FsError> {
@@ -553,6 +605,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             if size <= f.size as usize {
                 return Ok(f.size as u64);
             }
+            let entry = self.raw_entry(g, cache, f.dir, f.slot)?;
             let size = u32::try_from(size).map_err(|_| FsError::TooLarge)?;
             let (old, new_end) = (f.size as u64, size as u64);
             let cb = g.cluster_bytes() as u64;
@@ -574,28 +627,43 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 err?;
             }
             let need = new_end.div_ceil(cb) as u32;
-            let mut first = f.cluster;
+            let (mut first, mut taken) = (f.cluster, None);
             if need > len {
                 let hint = if len > 0 { last + 1 } else { self.hint.get() };
-                let (taken, after) =
+                let (t, after) =
                     cache.allocate(self.r, g, need - len, hint, |c| z.add(g.cluster_sector(c) * SECTOR as u64, cb))?;
-                z.finish()?;
                 self.hint.set(after);
-                cache.flush(self.r, g)?;
+                taken = Some(t);
                 if len == 0 {
-                    first = taken;
-                } else {
-                    cache.set(self.r, g, last, taken)?;
-                    cache.flush(self.r, g)?;
+                    first = t;
                 }
-            } else {
-                z.finish()?;
             }
-            dir::rewrite(self.r, g, cache, f.dir, f.slot, f.slot, |_, e| {
-                dir::set_cluster(g.kind, e, first);
-                e[28..32].copy_from_slice(&size.to_le_bytes());
-                dir::stamp(e, now);
-            })?;
+            let linked = (len > 0).then_some(last);
+            let grown = (|| {
+                z.finish()?;
+                if let Some(t) = taken {
+                    cache.flush(self.r, g)?;
+                    if let Some(last) = linked {
+                        cache.set(self.r, g, last, t)?;
+                        cache.flush(self.r, g)?;
+                    }
+                }
+                dir::rewrite(self.r, g, cache, f.dir, f.slot, f.slot, |_, e| {
+                    dir::set_cluster(g.kind, e, first);
+                    e[28..32].copy_from_slice(&size.to_le_bytes());
+                    dir::stamp(e, now);
+                })
+            })();
+            if let Err(e) = grown {
+                // The entry's own write may have landed: it is written back first, and only then
+                // is what was taken given back. Else it is kept, the file's or lost, never free.
+                if dir::rewrite(self.r, g, cache, f.dir, f.slot, f.slot, |_, e| *e = entry).is_ok()
+                    && let Some(t) = taken
+                {
+                    self.give_back(g, cache, linked, t)?;
+                }
+                return Err(e);
+            }
             if first != f.cluster {
                 self.ids.borrow_mut().put(first, f.dir, f.slot);
             }
@@ -671,7 +739,8 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 self.insert(g, cache, d, name, |s| dir::short_entry(g.kind, s, ATTR_DIR, new, 0, now)).map(drop)
             };
             let out = made();
-            if out.is_err() {
+            // Not if a name may still reach it: `insert` could not take back a failed write.
+            if out.is_err() && !self.broken.get() {
                 cache.free_chain(self.r, g, new)?;
             }
             out
@@ -688,7 +757,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             if f.is_dir() {
                 return Err(FsError::Unsupported);
             }
-            dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |_, e| e[0] = DELETED)?;
+            self.unname(g, cache, d, &f).map_err(|(e, _)| e)?;
             Ok(self.removed(&f))
         })
     }
@@ -713,7 +782,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 return Err(FsError::NotEmpty);
             }
             freeing(sub.id());
-            dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |_, e| e[0] = DELETED)?;
+            self.unname(g, cache, d, &f).map_err(|(e, _)| e)?;
             cache.free_chain(self.r, g, f.cluster)
         })
     }
@@ -735,8 +804,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             let id = u32::try_from(id).map_err(|_| FsError::NotFound)?;
             let (d, slot) = self.ids.borrow().get(id).ok_or(FsError::NotFound)?;
             let e = self.raw_entry(g, cache, d, slot)?;
-            let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
-            let cluster = (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
+            let cluster = dir::cluster(g.kind, &e);
             let live = e[0] != 0
                 && e[0] != DELETED
                 && e[11] & 0x3F != dir::ATTR_LONG
@@ -783,8 +851,9 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
 
     /// **Move `from` to `to`**, each a directory and a name, in an order that never loses the
     /// source: the new name first — a replaced file's entry pointed at the source, or new entries
-    /// — then the old name deleted, then a moved directory's `..` pointed at its new parent. A crash
-    /// between leaves the file under both names, which a check sorts out.
+    /// — then a moved directory's `..` pointed at its new parent, then the old name deleted. **A
+    /// failure undoes them**, last first. A crash between leaves the file under both names, and a
+    /// rename finding it so finishes, deleting the old name and releasing nothing.
     ///
     /// A directory cannot move into itself, nor replace or be replaced (`Unsupported`), as on ext4
     /// here. A name the same as the source's but for case is the source renamed in place.
@@ -804,151 +873,101 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         if !crate::names::valid(nn) {
             return Err(FsError::InvalidName);
         }
-        if src.is_dir() && od != nd && dir::within(self.r, g, cache, nd, src.cluster)? {
+        let moved = src.is_dir() && od != nd;
+        if moved && dir::within(self.r, g, cache, nd, src.cluster)? {
             return Err(FsError::Unsupported);
         }
+        let dotdot = if moved {
+            let sub = dir::subdir(g, &src)?;
+            let e = self.raw_entry(g, cache, sub, 1)?;
+            if &e[..11] != DOTDOT {
+                return Err(FsError::Corrupt);
+            }
+            Some((sub, e))
+        } else {
+            None
+        };
         let target = match self.find(g, cache, nd, nn)? {
             Some(t) if t.dir == src.dir && t.slot == src.slot => None,
+            Some(t) if t.cluster != 0 && t.cluster == src.cluster => Some(t),
             Some(_) if !replace => return Err(FsError::Exists),
             Some(t) if t.is_dir() || src.is_dir() => return Err(FsError::Unsupported),
             other => other,
         };
+        let twice = target.is_some_and(|t| t.cluster == src.cluster);
         let raw = self.raw_entry(g, cache, od, src.slot)?;
-        let slot = match target {
+        // What the new name's write undoes to: the slots inserted, or the replaced entry as it was.
+        let (slots, was) = match target {
+            Some(t) if twice => ((t.slot, t.slot), None),
             Some(t) => {
+                let was = self.raw_entry(g, cache, nd, t.slot)?;
                 // Everything but the name, and the case bits that belong to the name.
-                dir::rewrite(self.r, g, cache, nd, t.slot, t.slot, |_, e| {
+                let made = dir::rewrite(self.r, g, cache, nd, t.slot, t.slot, |_, e| {
                     e[11] = raw[11];
                     e[13..].copy_from_slice(&raw[13..]);
-                })?;
-                t.slot
-            }
-            None => self.insert(g, cache, nd, nn, |s| {
-                let mut e = raw;
-                e[..11].copy_from_slice(s);
-                if e[0] == DELETED {
-                    e[0] = 0x05;
+                });
+                if let Err(e) = made {
+                    // Written back whether it landed or not; else the file may be under both names.
+                    if dir::rewrite(self.r, g, cache, nd, t.slot, t.slot, |_, e| *e = was).is_err() {
+                        self.broken.set(true);
+                    }
+                    return Err(e);
                 }
-                e[12] = 0;
-                e
-            })?,
+                ((t.slot, t.slot), Some(was))
+            }
+            None => (
+                self.insert(g, cache, nd, nn, |s| {
+                    let mut e = raw;
+                    e[..11].copy_from_slice(s);
+                    if e[0] == DELETED {
+                        e[0] = 0x05;
+                    }
+                    e[12] = 0;
+                    e
+                })?,
+                None,
+            ),
         };
-        dir::rewrite(self.r, g, cache, od, src.first_slot, src.slot, |_, e| e[0] = DELETED)?;
-        if src.is_dir() && od != nd {
-            let mut dotdot = false;
-            dir::rewrite(self.r, g, cache, dir::subdir(g, &src)?, 1, 1, |_, e| {
-                dotdot = &e[..11] == DOTDOT;
-                if dotdot {
-                    dir::set_cluster(g.kind, e, dir::dotdot_cluster(g, nd));
-                }
-            })?;
-            if !dotdot {
-                return Err(FsError::Corrupt);
+        let repointed = match dotdot {
+            Some((sub, _)) => dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| {
+                dir::set_cluster(g.kind, e, dir::dotdot_cluster(g, nd))
+            }),
+            None => Ok(()),
+        };
+        // The old name, last: `unname` says whether a failed deletion was undone.
+        let done = repointed.map_err(|e| (e, true)).and_then(|()| self.unname(g, cache, od, &src));
+        if let Err((e, whole)) = done {
+            // With the old name whole, what was written for the new one is undone, last first.
+            let undone = whole
+                && (|| -> Result<(), FsError> {
+                    if let Some((sub, old)) = dotdot {
+                        dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| *e = old)?;
+                    }
+                    match (target, was) {
+                        (Some(_), Some(was)) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.0, |_, e| *e = was),
+                        (None, _) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.1, |_, e| e[0] = DELETED),
+                        _ => Ok(()),
+                    }
+                })()
+                .is_ok();
+            // Else the file may be under both names, and removing either would free what the
+            // other holds.
+            if !undone {
+                self.broken.set(true);
             }
-        } else {
-            self.ids.borrow_mut().moved(src.cluster, nd, slot);
+            return Err(e);
         }
-        Ok(target.and_then(|t| self.removed(&t)))
+        self.ids.borrow_mut().moved(src.cluster, nd, slots.1);
+        Ok(target.filter(|_| !twice).and_then(|t| self.removed(&t)))
     }
 }
 
-/// **FAT as the protocol sees it**: what `libfsserver`'s loop calls, each the library's own method.
-impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
-    const NAME: &'static [u8] = b"fs-server-fat";
-    const KIND: &'static [u8] = b"fat";
-    type Unservable = Unservable;
-
-    fn read_only(&self) -> bool {
-        self.r.read_only()
-    }
-
-    fn check(&self) -> Result<(), Unservable> {
-        Fat::check(self)
-    }
-
-    fn state_unwritable() -> Unservable {
-        Unservable::StateUnwritable
-    }
-
-    fn was_left_clean(&self) -> Result<bool, FsError> {
-        Fat::was_left_clean(self)
-    }
-
-    fn mark_mounted(&self) -> Result<(), FsError> {
-        Fat::mark_mounted(self)
-    }
-
-    fn mark_clean(&self) -> Result<(), FsError> {
-        Fat::mark_clean(self)
-    }
-
-    fn map_file(&self, path: &[u8], runs: &mut [BlockRun]) -> Result<Mapped, FsError> {
-        Fat::map_file(self, path, runs)
-    }
-
-    fn read_file(&self, path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
-        Fat::read_file(self, path, out)
-    }
-
-    fn read_file_range(&self, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Result<usize, FsError> {
-        Fat::read_file_range(self, path, offset, len, out)
-    }
-
-    fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError> {
-        Fat::create_file(self, parent, name, now)
-    }
-
-    fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
-        Fat::grow_file(self, path, size, now)
-    }
-
-    fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<Option<u64>, FsError> {
-        Fat::truncate_file(self, path, size, now)
-    }
-
-    fn resolve_dir(&self, path: &[u8]) -> Result<u64, FsError> {
-        Fat::resolve_dir(self, path)
-    }
-
-    fn read_dir(&self, dir: u64, cursor: u64, emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError> {
-        Fat::read_dir(self, dir, cursor, emit)
-    }
-
-    fn mkdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
-        Fat::mkdir_at(self, dir, name, now)
-    }
-
-    fn unlink_at(&self, dir: u64, name: &[u8], now: i64) -> Result<Option<u64>, FsError> {
-        Fat::unlink_at(self, dir, name, now)
-    }
-
-    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64, freeing: impl FnOnce(u64)) -> Result<(), FsError> {
-        Fat::rmdir_at(self, dir, name, now, freeing)
-    }
-
-    fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
-        Fat::touch_at(self, dir, name, now)
-    }
-
-    fn rename_at(&self, dir: u64, old: &[u8], new: &[u8], now: i64) -> Result<(), FsError> {
-        Fat::rename_at(self, dir, old, new, now)
-    }
-
-    fn rename_path(&self, old: &[u8], new: &[u8], replace: bool, now: i64) -> Result<Option<u64>, FsError> {
-        Fat::rename_path(self, old, new, replace, now)
-    }
-
-    fn touch_file(&self, id: u64, now: i64) -> Result<(), FsError> {
-        Fat::touch_file(self, id, now)
-    }
-
-    fn release(&self, id: u64, now: i64) -> Result<(), FsError> {
-        Fat::release(self, id, now)
-    }
-}
+mod protocol;
 
 #[cfg(test)]
 mod crash_tests;
+#[cfg(test)]
+mod failure_tests;
 #[cfg(test)]
 mod hostile_tests;
 #[cfg(test)]

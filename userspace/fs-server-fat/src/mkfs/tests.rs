@@ -131,7 +131,7 @@ fn every_size_from_the_floor_makes_a_fat_the_server_takes() {
         assert_eq!(bpb::servable(&g), Ok(()), "{s} sectors");
         assert_eq!(g.data_start % g.sectors_per_cluster, 0, "{s} sectors: data off a cluster");
         assert!(g.data_start as u64 + g.clusters as u64 * g.sectors_per_cluster as u64 <= s);
-        let range = if g.kind == Kind::Fat32 { FAT32_CLUSTERS } else { FAT16_CLUSTERS };
+        let range = if g.kind == Kind::Fat32 { FAT32_RANGE } else { FAT16_RANGE };
         assert!(range.contains(&g.clusters), "{s} sectors: {} clusters for {:?}", g.clusters, g.kind);
     }
 }

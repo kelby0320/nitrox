@@ -18,7 +18,8 @@ pub trait BlockReader {
     }
 
     /// Whether this is a **read-only mount**: `true` only for [`ReadOnly`]. The block-file reply's
-    /// mark comes from here, so it and the refusal of every write are one fact.
+    /// mark comes from here, so it and the refusal of every write are one fact — and from
+    /// `Volume::refusing_changes`, a writable mount that has begun refusing them.
     fn read_only(&self) -> bool {
         false
     }

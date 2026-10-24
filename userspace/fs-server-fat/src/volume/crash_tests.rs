@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::test_support::{FileImage, Overlay, mformat, mkfs, mmd, put};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -16,6 +16,9 @@ const NOW: i64 = 1_791_244_800;
 struct Recorder<'a> {
     inner: &'a Overlay,
     log: RefCell<Vec<(u64, Vec<u8>)>>,
+    /// The write refused, counting from `0`: it changes nothing and is not logged.
+    refuse: u64,
+    seen: Cell<u64>,
 }
 
 impl BlockReader for Recorder<'_> {
@@ -26,6 +29,11 @@ impl BlockReader for Recorder<'_> {
 
 impl BlockWriter for Recorder<'_> {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+        let n = self.seen.get();
+        self.seen.set(n + 1);
+        if n == self.refuse {
+            return Err(FsError::Io);
+        }
         self.log.borrow_mut().push((offset, buf.to_vec()));
         self.inner.write_at(offset, buf)
     }
@@ -53,7 +61,7 @@ fn with_garbage_in_free_clusters(path: &std::path::Path) -> Rc<Vec<u8>> {
 /// two names**, two entries starting at the same cluster: a rename writes the new name before it
 /// deletes the old, so a crash between leaves the file twice rather than nowhere, as Linux's vfat
 /// does. Any other overlap is two files sharing a cluster, and fails.
-fn consistent(img: &Overlay) -> Result<(), String> {
+pub(super) fn consistent(img: &Overlay) -> Result<(), String> {
     let fat = Fat::new(img);
     let g = *fat.geometry().unwrap();
     let cb = g.cluster_bytes() as u64;
@@ -140,8 +148,19 @@ fn crash_everywhere(
     op: impl FnOnce(&Fat<Recorder>),
     check: impl Fn(&Overlay) -> Result<(), String>,
 ) -> usize {
+    refuse_then_crash_everywhere(base, u64::MAX, op, check).0
+}
+
+/// [`crash_everywhere`], with write `refuse` refused: how many writes were made, and whether one
+/// was refused.
+fn refuse_then_crash_everywhere(
+    base: &Rc<Vec<u8>>,
+    refuse: u64,
+    op: impl FnOnce(&Fat<Recorder>),
+    check: impl Fn(&Overlay) -> Result<(), String>,
+) -> (usize, bool) {
     let live = Overlay::new(base.clone());
-    let rec = Recorder { inner: &live, log: RefCell::new(Vec::new()) };
+    let rec = Recorder { inner: &live, log: RefCell::new(Vec::new()), refuse, seen: 0.into() };
     op(&Fat::new(&rec));
     let writes = rec.log.into_inner();
     let replay = Overlay::new(base.clone());
@@ -149,10 +168,11 @@ fn crash_everywhere(
     for (i, (at, bytes)) in writes.iter().enumerate() {
         replay.write_at(*at, bytes).unwrap();
         if let Err(e) = check(&replay) {
-            panic!("a crash after write {} of {} (at byte {at:#x}, {} bytes): {e}", i + 1, writes.len(), bytes.len());
+            let n = writes.len();
+            panic!("write {refuse} refused, a crash after write {} of {n} (at byte {at:#x}): {e}", i + 1);
         }
     }
-    writes.len()
+    (writes.len(), rec.seen.get() > refuse)
 }
 
 /// **A grow of a file with bytes**: zeroes its tail and the clusters it takes, then the chain,
@@ -214,6 +234,40 @@ fn a_crash_anywhere_in_a_truncate_leaves_no_chain_into_a_free_cluster() {
     crash_everywhere(&base, |fat| assert_eq!(fat.truncate_file(b"/b.bin", 100, NOW), Ok(None)), consistent);
 }
 
+/// **A grow refused any write, then crashed after any other, leaves no chain into a free
+/// cluster**. The file is cluster 302, in the FAT's third sector, and every cluster after it taken,
+/// so the grow takes clusters in the first, which a sector-ordered write would free first.
+#[test]
+fn a_grow_refused_a_write_then_crashed_leaves_no_chain_into_a_free_cluster() {
+    let img = mformat(64, &["-F", "-c", "8"]);
+    put(&img, "f.bin", &[0x33u8; 100]);
+    let mut bytes = std::fs::read(&img).unwrap();
+    let probe = Overlay::new(Rc::new(bytes.clone()));
+    let fat = Fat::new(&probe);
+    let g = *fat.geometry().unwrap();
+    let f = dir::lookup(&probe, &g, &mut fat.cache.borrow_mut(), Dir::root(&g), b"f.bin").unwrap();
+    let high = 302;
+    poke32(&mut bytes, &g, f.cluster, 0);
+    for c in high..g.clusters + 2 {
+        poke32(&mut bytes, &g, c, 0x0FFF_FFFF);
+    }
+    let at = dir::slot_byte(&probe, &g, &mut fat.cache.borrow_mut(), f.dir, f.slot).unwrap().unwrap() as usize;
+    bytes[at + 20..at + 22].copy_from_slice(&((high >> 16) as u16).to_le_bytes());
+    bytes[at + 26..at + 28].copy_from_slice(&(high as u16).to_le_bytes());
+    let base = Rc::new(bytes);
+    consistent(&Overlay::new(base.clone())).expect("the chain made by hand");
+    let grown = Overlay::new(base.clone());
+    Fat::new(&grown).grow_file(b"/f.bin", 12_000, NOW).unwrap();
+    let taken = Fat::new(&grown).cache.borrow_mut().nth(&grown, &g, high, 1).unwrap().unwrap();
+    assert!(taken * 4 / 512 < high * 4 / 512, "the clusters taken in a FAT sector before the link's");
+    for n in 0.. {
+        let grow = |fat: &Fat<Recorder>| _ = fat.grow_file(b"/f.bin", 12_000, NOW);
+        if !refuse_then_crash_everywhere(&base, n, grow, consistent).1 {
+            break;
+        }
+    }
+}
+
 /// **A directory made**, where its parent has room, and where its parent must grow: the child's
 /// cluster on the disk before the entry naming it, and a grown parent's new cluster zeroed and
 /// taken before it is linked. On 512-byte clusters a directory is sixteen slots, so fourteen files
@@ -266,5 +320,33 @@ fn a_crash_anywhere_in_a_removal_or_a_move_is_consistent() {
             fat.rename_path(b"/a/moved file with a long name.txt", b"/b/moved.txt", false, NOW).unwrap();
         },
         consistent,
+    );
+}
+
+/// **A directory moved, crashed after any write, has a `..` naming a parent that holds it**: the
+/// old name goes last, so `..` never names the parent that lost it.
+#[test]
+fn a_crash_anywhere_in_a_directory_move_leaves_its_dotdot_naming_a_parent_holding_it() {
+    let img = mformat(16, &["-c", "8"]);
+    mmd(&img, "A");
+    mmd(&img, "B");
+    mmd(&img, "A/D");
+    let base = with_garbage_in_free_clusters(&img);
+    let _ = std::fs::remove_file(&img);
+    let held = |img: &Overlay| {
+        let fat = Fat::new(img);
+        let g = *fat.geometry().unwrap();
+        let d = fat.resolve_dir(b"/A/D").or(fat.resolve_dir(b"/B/D")).map_err(|e| format!("D: {e:?}"))?;
+        let mut cache = fat.cache.borrow_mut();
+        let parent = dir::parent(img, &g, &mut cache, Dir::from_id(&g, d).unwrap()).map_err(|e| format!("{e:?}"))?;
+        match dir::lookup(img, &g, &mut cache, parent, b"D") {
+            Ok(f) if f.cluster as u64 == d => Ok(()),
+            other => Err(format!("D's `..` names a parent where D is {other:?}")),
+        }
+    };
+    crash_everywhere(
+        &base,
+        |fat| assert_eq!(fat.rename_path(b"/A/D", b"/B/D", false, NOW), Ok(None)),
+        |img| consistent(img).and_then(|()| held(img)),
     );
 }

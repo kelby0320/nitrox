@@ -104,8 +104,8 @@ pub struct FileBlocksHeader {
     pub flags: u32,
 }
 
-/// [`FileBlocksHeader::flags`]: the file may not be written (a read-only mount's). The kernel
-/// installs such a file without `MAP_WRITE`.
+/// [`FileBlocksHeader::flags`]: the file may not be written (a read-only mount's, or one resolved on
+/// a mount refusing changes). The kernel installs such a file without `MAP_WRITE`.
 pub const FILE_BLOCKS_READ_ONLY: u32 = 1 << 0;
 
 /// The rights a Model A reply's file is installed with: those asked for and `INSPECT`, less

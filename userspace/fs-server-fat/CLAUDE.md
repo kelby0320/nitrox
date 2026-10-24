@@ -20,8 +20,13 @@ loop.
   evicts a dirty sector; **a write path's reads go through `slot_rw`** (`next_rw`), which may, after
   writing it out. A walk on the read path with every slot dirty is refused `Io`, not served stale.
 - **`src/names.rs`**, **`src/dir.rs`**, **`src/time.rs`** — names, directory entries, times as UTC.
-- **`src/volume.rs`** — `Fat`: every operation, and its `Volume` impl. **`change` wraps every
-  mutation**: read-only refused first, the cache flushed at the end, after a failure too.
+- **`src/volume.rs`** — `Fat`: every operation; `src/volume/protocol.rs`, its `Volume` impl.
+  **`change` wraps every mutation**: read-only refused first, the cache flushed at the end, after
+  a failure too. **A failed write may have landed**: a change undoes one by writing back what was
+  there, and gives back what it took only once that undo is written; else it keeps it, and the
+  mount refuses changes where a file may be under two names. `failure_tests` fails each write in
+  turn — refused, landed, and landed with the undo lost or not — and reads names, not only
+  `fsck.fat -n`, which passes a long name cut to its short alias.
 - **`src/mkfs.rs`** (Phase 6 Part G.2) — making an empty FAT, what `disk --format` writes: FAT16
   or FAT32 by size, **never with clusters under a page**, so the server serves everything it makes.
   The boot sector is written last. Its tests hold each type and cluster size at its boundary's
@@ -51,7 +56,10 @@ loop.
 - **Directories, the FAT and the FSInfo are read with `read_meta`**, through the server's metadata
   cache; **a file's data with `read_at`**, since the kernel writes it behind the server's back.
   `free_chain` `forget`s each cluster it frees (Phase 6 Part H.4).
-- **A filesystem found dirty stays dirty** at its unmount. Nothing here repairs one.
+- **A filesystem found dirty stays dirty** at its unmount, and so does one a change failed on the
+  device, or found corrupt, during the mount. Nothing here repairs one. **A mount that finds it
+  corrupt** — a change answering `Corrupt`, or an undo failing where a file may be under two
+  names — **refuses every change after** (`broken`), as Linux's FAT remounts read-only.
 - **Tests run against the host's tools**: `mformat`, `mkfs.fat`, `mcopy` and `mdir` build and read
   the images, and **`fsck.fat -n` must find every image clean after every change**. A test of a
   writer that only reads back through this crate tests the writer against itself.

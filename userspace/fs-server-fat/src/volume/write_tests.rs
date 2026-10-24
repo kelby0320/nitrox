@@ -315,6 +315,10 @@ fn a_rename_keeps_the_file_and_a_replace_returns_the_replaced_id() {
     assert_eq!(mdir_all(&img), BTreeSet::from(["renamed with a long name.txt".to_string()]));
     assert_eq!(mtype(&img, "renamed with a long name.txt"), b"other\n");
     assert_eq!(fat.release(replaced, NOW), Err(FsError::NotFound), "released once");
+    // Two empty files share cluster 0 and are still two files, not one under both names.
+    fat.create_file(b"/", b"e1", NOW).unwrap();
+    fat.create_file(b"/", b"e2", NOW).unwrap();
+    assert_eq!(fat.rename_at(root, b"e1", b"e2", NOW), Err(FsError::Exists));
 }
 
 #[test]
@@ -756,28 +760,8 @@ fn a_directory_is_read_from_the_device_once_through_the_cache() {
 /// and its first cluster not the next directory's. A refusal gives nothing.
 #[test]
 fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
-    use crate::test_support::{Overlay, mmd};
-    use std::cell::Cell;
+    use crate::test_support::{Failing, mmd};
     use std::rc::Rc;
-    struct Failing {
-        image: Overlay,
-        writes: Cell<u64>,
-        at: u64,
-    }
-    impl BlockReader for Failing {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-            self.image.read_at(offset, buf)
-        }
-    }
-    impl BlockWriter for Failing {
-        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
-            self.writes.set(self.writes.get() + 1);
-            if self.writes.get() == self.at + 1 {
-                return Err(FsError::Io);
-            }
-            self.image.write_at(offset, buf)
-        }
-    }
     let img = mformat(16, &["-c", "8"]);
     mmd(&img, "full");
     mmd(&img, "full/inner");
@@ -796,7 +780,7 @@ fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
 
     let image = Rc::new(std::fs::read(&img).unwrap());
     for n in 0.. {
-        let f = Failing { image: Overlay::new(image.clone()), writes: 0.into(), at: n };
+        let f = Failing::once(image.clone(), n);
         let mut given = None;
         let r = Volume::rmdir_at(&Fat::new(&f), root, b"gone", NOW, |id| given = Some(id));
         let after = Fat::new(&f.image);
@@ -820,29 +804,9 @@ fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
 /// or a map, names no cluster the FAT holds free.
 #[test]
 fn a_truncate_stopped_at_any_write_is_answered_with_the_file_as_it_is() {
-    use crate::test_support::Overlay;
+    use crate::test_support::Failing;
     use librsproto::namespace::{RESOLVE_FILE_LAZY, RESOLVE_TRUNCATE, resolve_request};
-    use std::cell::Cell;
     use std::rc::Rc;
-    struct Failing {
-        image: Overlay,
-        writes: Cell<u64>,
-        at: u64,
-    }
-    impl BlockReader for Failing {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-            self.image.read_at(offset, buf)
-        }
-    }
-    impl BlockWriter for Failing {
-        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
-            self.writes.set(self.writes.get() + 1);
-            if self.writes.get() == self.at + 1 {
-                return Err(FsError::Io);
-            }
-            self.image.write_at(offset, buf)
-        }
-    }
     let mut body = [0u8; 64];
     let n = resolve_request(&mut body, 0, RESOLVE_TRUNCATE | RESOLVE_FILE_LAZY, b"BIG.BIN").unwrap();
     body[n..n + 4].copy_from_slice(&4096u32.to_le_bytes());
@@ -861,9 +825,9 @@ fn a_truncate_stopped_at_any_write_is_answered_with_the_file_as_it_is() {
             .map(|s| 2 + ((s - g.data_start as u64) / g.sectors_per_cluster as u64) as u32)
             .collect::<BTreeSet<_>>()
     };
-    let had = clusters(&Fat::new(&Failing { image: Overlay::new(base.clone()), writes: 0.into(), at: u64::MAX }));
+    let had = clusters(&Fat::new(&Failing::once(base.clone(), u64::MAX)));
     for at in 0..12 {
-        let disk = Failing { image: Overlay::new(base.clone()), writes: 0.into(), at };
+        let disk = Failing::once(base.clone(), at);
         let fat = Fat::new(&disk);
         let named = match libfsserver::serve::apply_size(&fat, &req[..len], NOW) {
             Err(_) => had.clone(),
@@ -874,4 +838,51 @@ fn a_truncate_stopped_at_any_write_is_answered_with_the_file_as_it_is() {
             named.into_iter().filter(|&c| fat.cache.borrow_mut().next(&disk, &g, c) == Ok(Next::Free)).collect();
         assert!(free.is_empty(), "write {at} refused: answered over free clusters {free:?}");
     }
+}
+
+/// **A mount refused for a failed write leaves the filesystem as clean as it was found**: FAT32's
+/// FSInfo is written before the state bit. The bit went first, and a refused FSInfo write left a
+/// stick that read as not cleanly unmounted ever after.
+#[test]
+fn a_mount_refused_for_a_failed_write_leaves_it_as_clean_as_found() {
+    use crate::test_support::Failing;
+    let img = mformat(64, &["-F", "-c", "8"]);
+    let base = std::rc::Rc::new(std::fs::read(&img).unwrap());
+    for (n, once) in [(0, true), (1, true), (0, false), (1, false)] {
+        let disk = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
+        let fat = Fat::new(&disk);
+        assert_eq!(fat.mark_mounted(), Err(FsError::Io), "write {n}");
+        assert_eq!(fat.was_left_clean(), Ok(true), "write {n} refused: as clean as found");
+    }
+}
+
+/// **A change that fails on the device, or finds the volume corrupt, leaves it marked for a check**
+/// at its unmount: what is on the device is no longer certain, and clearing the bit said it was.
+#[test]
+fn a_change_that_fails_on_the_device_leaves_the_volume_marked() {
+    use crate::test_support::Failing;
+    let img = mformat(64, &["-c", "8"]);
+    put(&img, "A.TXT", b"a");
+    let base = std::rc::Rc::new(std::fs::read(&img).unwrap());
+    let unmounted = |fault: u64, poke: Option<(u64, u32)>| {
+        let disk = Failing::once(base.clone(), fault);
+        if let Some((at, v)) = poke {
+            disk.image.write_at(at, &v.to_le_bytes()).unwrap();
+        }
+        let fat = Fat::new(&disk);
+        fat.mark_mounted().unwrap();
+        let grown = Volume::grow_file(&fat, b"/A.TXT", 20_000, NOW).map(drop);
+        fat.mark_clean().unwrap();
+        (grown, fat.was_left_clean().unwrap())
+    };
+    assert_eq!(unmounted(u64::MAX, None), (Ok(()), true), "a sound change leaves it clean");
+    assert_eq!(unmounted(1, None), (Err(FsError::Io), false), "the grow's first write refused");
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let g = *fat.geometry().unwrap();
+    let f = dir::lookup(&disk, &g, &mut fat.cache.borrow_mut(), Dir::root(&g), b"A.TXT").unwrap();
+    let at = dir::slot_byte(&disk, &g, &mut fat.cache.borrow_mut(), f.dir, f.slot).unwrap().unwrap();
+    // Three clusters' worth of bytes over a chain of one.
+    let short = Some((at + 28, 3 * g.cluster_bytes()));
+    assert_eq!(unmounted(u64::MAX, short), (Err(FsError::Corrupt), false), "a chain shorter than its size");
 }

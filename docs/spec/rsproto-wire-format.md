@@ -180,16 +180,18 @@ pub struct ReadyMessage {
 
 The supervisor binds `handles[0]` into the appropriate namespace location after receiving this message. See [why-supervisor-registration.md](../rationale/why-supervisor-registration.md).
 
-**A refusal in place of Ready.** A server that cannot serve what it was given — today, `fs-server-ext4` over a device holding no filesystem it can read, or one it was asked to serve writable and cannot record mounted — sends `Meta::Ready` with `RsFlags::ERROR` set, an [`ErrorBody`](#error-replies) in place of the `ReadyMessage`, and **no handle**, then exits. `kerror` is what a request would have failed with for the same reason; `msg` is the reason, in a sentence a supervisor prints beside what only it knows (the device, the mount point). `request_id` is 0 and `RsFlags::REPLY` is clear: the message answers nothing. A supervisor treats a refusal as a failed start and closes any handle that arrived with one. Only `init` receives one today (`userspace/init/src/ready.rs`).
+**A refusal in place of Ready.** A server that cannot serve what it was given — `fs-server-ext4` or `fs-server-fat` over a device holding no filesystem it can read, or one it was asked to serve writable and cannot record mounted, or the storage service with nothing to serve — sends `Meta::Ready` with `RsFlags::ERROR` set, an [`ErrorBody`](#error-replies) in place of the `ReadyMessage`, and **no handle**, then exits. `kerror` is what a request would have failed with for the same reason; `msg` is the reason, in a sentence a supervisor prints beside what only it knows (the device, the mount point). `request_id` is 0 and `RsFlags::REPLY` is clear: the message answers nothing. A supervisor treats a refusal as a failed start and closes any handle that arrived with one. Each supervisor receives them from what it starts: `init` (`userspace/init/src/ready.rs`), `service-mgr`, the storage service's among them (`userspace/service-mgr/src/main.rs`), and the storage service from the filesystem servers (`userspace/storage-service/src/mounting.rs`).
 
 
 ### Meta::Unmount (`0x0005`)
 
 *(Administration Part C.3, 2026-09-24.)* Sent by a supervisor to a **filesystem server** on its
 control channel, after `Ready`, to end the mount. Request body: empty. The server records the
-filesystem **cleanly unmounted** — ext4's `s_state` clean bit, set as its last write — then
-replies and exits. The reply is empty on success, or an [`ErrorBody`](#error-replies) if the state
-could not be written. A read-only mount writes nothing, since it never marked the filesystem
+filesystem **cleanly unmounted** as its last write — ext4's `s_state` clean bit set, FAT's state
+bit cleared, unless FAT's was found set, or a change during the mount failed on the device or
+found the filesystem corrupt, when it is left set for a check
+([`fat-fs-server.md`](../architecture/fat-fs-server.md) § 6) — then replies and exits. The reply
+is empty on success, or an [`ErrorBody`](#error-replies) if the state could not be written. A read-only mount writes nothing, since it never marked the filesystem
 mounted, and replies success.
 
 It is the fourth step of the storage service's unmount chain (administration Part C.5c,
@@ -218,9 +220,9 @@ supervisor, transferring the block device in `handles[0]`. Its payload is **one 
 An empty payload is `0`, writable, which is what every setup message said before the flags
 existed (administration Part C.3). `librsproto::meta::fs_setup` writes it; `init`, which does not
 link `librsproto`, states the byte itself (`Mode::setup_flags`), and a host test holds the two
-equal. A writable server records the filesystem mounted, clearing `s_state`'s clean bit, before
-it answers `Ready`. A server that finds the bit already clear reports that the filesystem was not
-cleanly unmounted, and serves it anyway.
+equal. A writable server records the filesystem mounted — ext4's `s_state` clean bit cleared,
+FAT's state bit set — before it answers `Ready`. A server that finds it already so reports that
+the filesystem was not cleanly unmounted, and serves it anyway.
 
 ## Error replies
 

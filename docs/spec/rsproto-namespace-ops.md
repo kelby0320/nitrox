@@ -143,7 +143,7 @@ The 8-byte `ResolveReply` above, then:
 | 8 | 4 | `block_size` — the unit of the runs, in bytes: ext4's block, or FAT's 512-byte sector. **A power of two from 512 to a page**, else the kernel refuses the reply (below) |
 | 12 | 4 | `run_count` |
 | 16 | 8 | `file_id` — **the file's identity on its server**, stable for the file's life: its inode number, for ext4; its first cluster, for FAT, which has no inode — so an empty FAT file has none and replies `0`, and a truncate to zero ends its id, which its server forgets as for a removal. The kernel keeps one page-cache object per id per registration, and names the file by it in `File::Touch`; a server names the file by it in `File::Forget` before freeing it. `0` means none: the kernel gives such a file an object of its own, uncached |
-| 24 | 4 | `flags` — `FILE_BLOCKS_READ_ONLY` (`1 << 0`): the file may not be written, a read-only mount's; the kernel installs it without `MAP_WRITE` whatever the lookup asked for. **So does a server's device handle without `WRITE`**: the kernel writes the file back to that device. Without `READ` the reply is refused `NoAccess`, as the kernel fills the file from it |
+| 24 | 4 | `flags` — `FILE_BLOCKS_READ_ONLY` (`1 << 0`): the file may not be written — a read-only mount's, or one a writable mount resolves once it refuses changes ([`fat-fs-server.md`](../architecture/fat-fs-server.md) § 6); the kernel installs it without `MAP_WRITE` whatever the lookup asked for. **So does a server's device handle without `WRITE`**: the kernel writes the file back to that device. Without `READ` the reply is refused `NoAccess`, as the kernel fills the file from it |
 | 28 | 4 | reserved, zero |
 | 32 | 24 × `run_count` | the file's `BlockRun`s, each `file_block: u64`, `device_lba: u64` (`0` = a hole), `length: u32`, `flags: u32` ([`rsproto-block-ops.md`](rsproto-block-ops.md) § `BlockRun`) |
 
@@ -166,8 +166,10 @@ two from 512 to a page, or a run whose ends — `file_block + length`, `device_l
 times `block_size` — do not fit a `u64`. The resolve fails `KernelError`, as for a body too short
 for its runs. The page cache divides by the block size and multiplies a device block by it, and a
 second server is one more process whose reply reaches that arithmetic. **A page must lie within one
-run**, since the kernel fills and writes it as one device range; that one the kernel cannot check,
-and each server guarantees it (`filesystem-data-path.md` § *A page within one run*).
+run**, since the kernel fills and writes it as one device range. That one the kernel does not check,
+though the runs would let it, and a server must make it so: FAT's does, and ext4's with blocks of a
+page, but not with smaller ones (`TODO(ext4-subpage-runs)`; `filesystem-data-path.md` § *A page
+within one run*).
 
 #### The `SUBNAMESPACE` body
 

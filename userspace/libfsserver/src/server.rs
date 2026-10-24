@@ -769,7 +769,14 @@ fn reply_session_error_why(session_ch: u64, request_id: u64, op: u16, kerror: i3
 
 /// Never returns: an unmount or an unreachable endpoint ends the process.
 fn serve_loop<V: Volume>(vol: &V, serve_end: u64, device: u64) -> ! {
+    let mut told = false;
     loop {
+        if !told && vol.refusing_changes() {
+            told = true;
+            kprint(
+                b"fs-server: a change found the filesystem corrupt, or could not be undone; refusing every change until it is mounted again\n",
+            );
+        }
         // `count ≤ MAX_WAIT_HANDLES`: while the control channel is open, a session never takes
         // the last slot ([`session_capacity`]).
         // SAFETY: single-threaded build of the wait array.
@@ -898,7 +905,11 @@ fn serve_control<V: Volume>(vol: &V) {
             exit(0);
         }
         if marked.is_ok() {
-            kprint(b"fs-server: unmounted, and the filesystem recorded clean\n");
+            // A filesystem found not clean, or found corrupt since, is left marked for a check.
+            match vol.was_left_clean() {
+                Ok(true) => kprint(b"fs-server: unmounted, and the filesystem recorded clean\n"),
+                _ => kprint(b"fs-server: unmounted, and the filesystem left marked for a check\n"),
+            }
             exit(0);
         }
         kprint(b"fs-server: unmounted, but the filesystem could not be recorded clean\n");

@@ -1397,8 +1397,12 @@ boot of an installed machine. `fs-server-ext4` **reports** that and serves the f
 anyway. There is no `e2fsck` here to run, and refusing would strand a disk that is most likely
 fine: this server writes metadata through at once, and a crash leaves at worst what
 `rename_path` and the two-phase free already document, an unattached inode that `e2fsck` puts in
-`lost+found`. Trigger: a filesystem that actually comes back inconsistent, or a journal, which
-needs a replay before a mount can trust anything.
+`lost+found`. **A FAT has no link count**, so a crash mid-rename leaves one file under two names,
+which `fs-server-fat` cannot tell from two files without reading every directory: a rename retried
+finishes, but removing either name frees the clusters the other still names. A mount that leaves
+them itself, a rename whose undo fails, refuses every change after, as Linux's FAT goes read-only.
+Trigger: a filesystem that actually comes back inconsistent, or a journal, which needs a replay
+before a mount can trust anything.
 
 **Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
 namespace binding to a userspace filesystem carries the rights of the **endpoint handle**

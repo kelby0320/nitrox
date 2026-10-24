@@ -7,8 +7,8 @@ the five found before the bash, the trials' unchecked test gaps and doc claims, 
 two bugs, five to fix, one already fixed and three later. Group A fixed 2026-10-22, with sched-7
 and kobj-9 from groups E and B and the test gaps that ride with them; sched-10 stays open for one
 mutation. Group B fixed 2026-10-22: the twelve capability and rights leaks, and the test gap that
-rides with them, kmem-11. Group C's first half fixed 2026-10-23: ext4's findings and those in the
-code both servers share, and fs-3's ext4 half; FAT's follow.** Part D of
+rides with them, kmem-11. Group C fixed 2026-10-23: ext4's findings and those in the code both
+servers share, then FAT's, with fs-3's two halves and the trials' doc claims.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -593,7 +593,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   Fixed in `6ce9737a`: an rmdir ends every session on the directory; fails without it: boot-probe's
   `removed_dir_session_test`.
 
-- [ ] **fs-3** `userspace/fs-server-ext4/src/ext4.rs:1705` — A rename writes the new name first and
+- [x] **fs-3** `userspace/fs-server-ext4/src/ext4.rs:1705` — A rename writes the new name first and
   deletes the old one second (ext4 `rename_path`; FAT `Fat::rename`, volume.rs:823-848). If the
   second write is refused or the server crashes between them, the file has two names backed by one
   ext4 inode (links_count 1) or one FAT chain. Nothing copes with it, and `unlink_at`/`drop_link`
@@ -611,7 +611,15 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   it is removed, a directory loses its old name first, a failed step is undone, and a rename to a
   name its file has already does nothing; fails without it:
   `a_rename_stopped_at_any_write_never_leaves_a_name_reaching_what_is_freed` and
-  `a_rename_to_a_name_its_file_has_already_does_nothing`. FAT's half is the next PR's.
+  `a_rename_to_a_name_its_file_has_already_does_nothing`.
+  FAT's half fixed in `eaaf7066`: a failed step is undone, last first, and a rename finding its file
+  under both names, as a crash between the writes leaves it, finishes, deleting the old name and
+  releasing nothing. Removing one of the two names before then still frees what the other holds,
+  since FAT has no link count; `deferred-decisions.md` says so under `TODO(fs-repair)`. Fails
+  without it: `a_rename_stopped_at_any_write_leaves_the_file_under_a_name`. And a mount that
+  leaves the two names itself, its undo failing, or that finds the volume corrupt, refuses every
+  change after, as Linux's FAT goes read-only (the maintainer's call); fails without it:
+  `a_mount_that_finds_its_filesystem_corrupt_refuses_every_change_after`.
 
 - [x] **fs-4** `userspace/fs-server-ext4/src/ext4.rs:226` — `parse_superblock` and `check_device`
   refuse only INCOMPAT_64BIT and blocks over 4 KiB. They accept metadata_csum, an unreplayed
@@ -732,7 +740,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   bitmap bit was 1 before and 0 after `unlink_at` plus `release_inode`. Lens: tests. medium.
   **Later.**
 
-- [ ] **fs-12** `userspace/fs-server-fat/src/table.rs:282` — `allocate()` aborts with `?` on a used
+- [x] **fs-12** `userspace/fs-server-fat/src/table.rs:282` — `allocate()` aborts with `?` on a used
   cluster whose FAT entry is reserved or out of range (Corrupt) after it has marked free clusters.
   The partial chain is neither freed nor are later clusters tried, and `change()` flushes the cache
   anyway, so it reaches the disk. On FAT16 with file A at clusters 2-3, cluster 4 free and cluster 5
@@ -741,6 +749,9 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   one bad entry makes the volume unwritable. Demonstrated: `grow_file(/A.TXT, 10000)` returned
   Err(Corrupt) and cluster 4's FAT entry afterwards read [255,255], not 0. `hostile_tests` only
   checks for no panic. Lens: tests. medium. **Fix.**
+  Fixed in `fd4e7f60`: an entry not free is a cluster in use, as Linux reads it, so an allocation
+  passes over a reserved one, and any failure inside it gives back what it took; fails without it:
+  `an_allocation_passes_over_a_reserved_entry`.
 
 - [ ] **fs-13** `userspace/libfsserver/src/serve.rs:78` — The MAX_SUFFIX bound in `resolve()` and
   `serve_read_range()`, and the `.min(content.len())` clamp on the read length, are untested. A
@@ -753,7 +764,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   libfsserver, fs-server-fat and fs-server-ext4 `--lib` all green. The truncation was found by
   reading. Lens: tests. medium. **Later.**
 
-- [ ] **fs-14** `userspace/fs-server-fat/src/volume.rs:706` — FAT's `rmdir_at` NotEmpty check, the
+- [x] **fs-14** `userspace/fs-server-fat/src/volume.rs:706` — FAT's `rmdir_at` NotEmpty check, the
   `is_dir` refusal in `unlink_at`, `names::valid` in `mkdir_at` and in rename, and the `grow_file`
   "chain shorter than size" check have no test that reaches them. Without NotEmpty, rmdir of a
   non-empty directory would free its chain and orphan its children's clusters. Without the `is_dir`
@@ -761,6 +772,9 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   with `:` or `*` would be written to the volume. Demonstrated: five mutations (each guard deleted)
   left `cargo test -p fs-server-fat --lib` fully green. No FAT test mentions NotEmpty, though the
   ext4 rmdir test covers it. Lens: tests. medium. **Fix**, with pr365-1.
+  Fixed in `eaaf7066`: rmdir's `NotEmpty` and the grow's chain check were already held by tests; the
+  other three now are, by `a_refusal_comes_before_anything_is_written` and
+  `a_rename_onto_an_entry_a_fat_cannot_name_is_refused`, each failing with its guard removed.
 
 - [x] **fs-15** `userspace/fs-server-ext4/src/ext4.rs:804` — The allocator's `start + len <
   capacity` bound and `.min(gfree)` cap in `alloc_run`, and the `!bit_clear` guard in `free_run`,
@@ -2268,40 +2282,63 @@ keeping what it took (T1-9, T2-7) fs-12, a create's real error dropped (T2-10) f
 refusals untested (T1-11) fs-14. The rest follow, each still there by reading, and reproduced
 before it is fixed.
 
-- [ ] **pr365-1** `userspace/fs-server-fat/src/volume.rs:833` — a directory moved to another parent
+- [x] **pr365-1** `userspace/fs-server-fat/src/volume.rs:833` — a directory moved to another parent
   has its old name deleted before its `..` is checked or rewritten (`:835`). A move whose `..` is
   malformed, or whose rewrite fails, is answered Corrupt or Io after it is made, and the stale `..`
   then misleads `within()`. T1-6, T2-14. Error paths. Medium. **Fix.**
-- [ ] **pr365-2** `userspace/fs-server-fat/src/bpb.rs:198` — `parse` has no upper bound on the
+  Fixed in `eaaf7066`: a moved directory's `..` is checked before anything is written and rewritten
+  before the old name goes, and a failure undoes it; fails without it:
+  `a_directory_moved_and_stopped_at_any_write_is_under_a_name` and
+  `a_crash_anywhere_in_a_directory_move_leaves_its_dotdot_naming_a_parent_holding_it`.
+- [x] **pr365-2** `userspace/fs-server-fat/src/bpb.rs:198` — `parse` has no upper bound on the
   cluster count: a FAT16 of 65,525 clusters or more, or a FAT32 over 0x0FFFFFF5, is served, and its
   high clusters collide with the end-of-chain and bad-cluster markers. T1-7, T2-5. Logic. Medium.
   **Fix.**
-- [ ] **pr365-3** `userspace/fs-server-fat/src/volume.rs:440` — `mark_clean` clears the dirty bit
+  Fixed in `c3838cc7`: a FAT16 of 65,525 clusters or more, or a FAT32 over `0x0FFF_FFF5`, is
+  refused, and `mkfs` takes its ranges from the same constants; fails without it:
+  `a_cluster_count_its_fat_cannot_number_is_refused`.
+- [x] **pr365-3** `userspace/fs-server-fat/src/volume.rs:440` — `mark_clean` clears the dirty bit
   after a change that failed partway during this mount, since only a volume found dirty at mount
   stays dirty, so shared or lost clusters are recorded as a clean unmount. T1-8, T2-9. Error paths.
   Medium. **Fix.**
-- [ ] **pr365-4** `userspace/fs-server-fat/src/volume.rs:582` — a grow whose final zero write or FAT
+  Fixed in `dd60c45f`: a change that fails on the device, or finds the volume corrupt, leaves it
+  marked at its unmount; fails without it:
+  `a_change_that_fails_on_the_device_leaves_the_volume_marked`.
+- [x] **pr365-4** `userspace/fs-server-fat/src/volume.rs:582` — a grow whose final zero write or FAT
   flush fails leaves the clusters it took chained and lost (`z.finish()?` after `allocate`), and
   `place()` (`:499`) has the same shape. A leak only. T1-21, T2-13. Error paths. Low. **Fix.**
-- [ ] **pr365-5** `userspace/fs-server-fat/src/volume.rs:415` — `mark_mounted` writes the dirty bit
+  Fixed in `fd4e7f60`: a grow, and a directory grown, give back what they took when a later step
+  fails, the link undone and written before the frees; fails without it:
+  `a_grow_stopped_at_any_write_loses_no_cluster`,
+  `a_directory_grown_and_stopped_at_any_write_loses_no_cluster` and
+  `a_grow_refused_a_write_then_crashed_leaves_no_chain_into_a_free_cluster`. The class swept in
+  `eecfa731`.
+- [x] **pr365-5** `userspace/fs-server-fat/src/volume.rs:415` — `mark_mounted` writes the dirty bit
   before FSInfo. An FSInfo write that fails refuses the mount but leaves the bit set, so the stick
   never reads clean again. T1-22. Error paths. Low. **Fix.**
-- [ ] **pr365-6** `userspace/fs-server-fat/src/table.rs:175` — a directory walk is bounded by the
+  Fixed in `dd60c45f`: FSInfo is written before the state bit; fails without it:
+  `a_mount_refused_for_a_failed_write_leaves_it_as_clean_as_found`.
+- [x] **pr365-6** `userspace/fs-server-fat/src/table.rs:175` — a directory walk is bounded by the
   volume's cluster count, not by `MAX_SLOTS` (65,536 entries), so a directory whose chain loops
   costs O(volume) reads before it is refused. T2-6. Logic. Low. **Fix.**
+  Fixed in `07fbbf55`: a directory's chain is walked to its `MAX_SLOTS` reach, and `within` climbs
+  at most a path's 512 components; fails without it:
+  `a_loop_in_a_directory_is_refused_within_a_directorys_reach`.
 - [ ] **pr365-7** `userspace/fs-server-fat/src/volume/write_tests.rs:411` — test gap: `writes <= 24`
   is loose against the 19 writes a 1 MiB grow records, so the FAT flush could lose its batching
   unseen. T1-25. Tests. Low. **Later.**
 - [ ] **pr365-8** `userspace/libfsserver/src/server.rs:419` — test gap: the truncate-to-zero arm,
   `forget_then_release`, is tested at no level; a gate step emptying a file on the FAT stick would
   catch a leak. T1-14. Tests. Low. **Later.**
-- [ ] **pr365-9** `docs/spec/rsproto-namespace-ops.md:160` — "a page must lie within one run … that
+- [x] **pr365-9** `docs/spec/rsproto-namespace-ops.md:160` — "a page must lie within one run … that
   one the kernel cannot check, and each server guarantees it" is wrong both ways: `block_map` could
   check a page's alignment against the runs, and ext4 with blocks under a page does not guarantee
   it (`TODO(ext4-subpage-runs)`). T1-17, T2-11. Docs. Low. **Fix.**
-- [ ] **pr365-10** `docs/spec/rsproto-block-ops.md:49` — `BlockRun` says a block is the filesystem
+  Fixed in `b87075a6`, in both docs that said it.
+- [x] **pr365-10** `docs/spec/rsproto-block-ops.md:49` — `BlockRun` says a block is the filesystem
   block size the kernel learns at mount, but runs are in the reply's `block_size` (FAT's are
   512-byte sectors). T2-15. Docs. Low. **Fix.**
+  Fixed in `b87075a6`.
 - [ ] **pr365-11** — the trials' other test gaps, each a mutation that passed the suite at
   `55e6bd18`, not yet run against `main`: no device write made to fail (T1-13); the volume-label
   filter (T1-23); `fat_label`'s fallbacks (T1-24); the 64-run limit at its neighbour (T1-26); the
@@ -2309,10 +2346,13 @@ before it is fixed.
   eviction, the long-name ordinal bound and checksum, the numeric-tail window, the rewrite's slot
   bound, the FSInfo hint, FAT32's reserved nibble, DEL in a name). Tests. Low.
   **Later**: each run against `main` as a mutation in Part H first.
-- [ ] **pr365-12** — the trials' other doc claims, not yet read against `main`: `Meta::Unmount`'s
+- [x] **pr365-12** — the trials' other doc claims, not yet read against `main`: `Meta::Unmount`'s
   "recorded clean" where FAT keeps a volume found dirty (T1-16); `error-codes.md` pointing at the
   deleted `fs_kerror` (T1-18); `File::Forget`'s list missing a truncate to zero (T1-19);
   `fat-fs-server.md` §9 citing deferrals that do not exist (T1-20); the refusal-in-place-of-Ready
   text naming only ext4 (T1-28); and no marker where ext4 accepts a block under a page, with its
   `CLAUDE.md` silent on it (T2-16). Docs. Low.
   **Fix**, with pr365-9 and pr365-10, each read against `main` first.
+  Fixed in `b87075a6`, each read against `main` first and each still wrong; the refusal text was
+  wider than found, the storage service sending and receiving them too. T2-16's marker was already
+  in `map_file`; ext4's `CLAUDE.md` now says it.

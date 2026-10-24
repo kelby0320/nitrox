@@ -36735,3 +36735,38 @@ share, the next FAT. `bug-bash.md` has each fix; what a caller can now see diffe
   the tree walks a listed name no entry can have, empty or holding a `/` (`Name`).
 - **A malformed ext4 directory record ends the scan of its block**, as Linux's check does, where a
   scan panicked the server.
+
+## 2026-10-23 — Before Phase 7, Part D: group C's second half changes these contracts
+
+The FAT half of group C, after ext4's. `bug-bash.md` has each fix; what a caller can now see
+differently is here:
+
+- **A FAT whose cluster count its FAT cannot number is refused**: a FAT16 of 65,525 clusters or
+  more, or a FAT32 over `0x0FFF_FFF5`, whose highest clusters' numbers are the values the FAT keeps
+  for a bad cluster and a chain's end. `mkfs` takes its ranges from the same constants.
+- **The state bit says what a mount did.** A change that fails on the device, or finds the volume
+  corrupt, leaves it marked not clean at its unmount, as a volume found so already was; a mount
+  refused for a failed write leaves the bit as it was found, FSInfo now written first.
+- **A failed FAT change gives back what it took and undoes what it wrote**: an allocation, a grow
+  and a directory grown give back their clusters, the link to them undone and written before the
+  frees; a rename is undone, last write first. **A write that fails may have landed**, so an undo
+  writes back what was there, whichever it was, and what was taken is given back only once that is
+  written; where it cannot be, what was taken is kept, lost at worst, and the mount refuses
+  changes if a file may be under two names. A name is made and unmade whole, a long name across
+  two directory clusters included. A removal that fails may still lose clusters, since
+  it writes its entry before it frees, which a check reclaims. **An allocation passes over a
+  reserved FAT entry**, as Linux does, where one such entry made the volume unwritable.
+- **A rename finding its file under both names finishes it**, deleting the old name and releasing
+  nothing, where a retry released the file under its new name. A moved directory's `..` is checked
+  before anything is written and rewritten before the old name goes. FAT has no link count, so
+  removing one of a crash's two names before then still frees what the other holds: that is the
+  check's to find (`TODO(fs-repair)`).
+- **A FAT mount that finds its filesystem corrupt refuses every change after**, as Linux's FAT
+  remounts itself read-only (the maintainer's call, over a mount-time scan for two names, which
+  stays with `TODO(fs-repair)`): a change answering `Corrupt`, or a rename whose undo fails. Later
+  changes answer `NoAccess`, "read-only mount"; files resolved after are marked read-only; the
+  unmount writes nothing; `fs-server` says so once (`Volume::refusing_changes`). A failed write
+  alone refuses nothing. **An unmount says what it left**: "recorded clean", or now "left marked
+  for a check" for a filesystem found not clean or found corrupt since, where it said clean.
+- **A loop in a directory's chain, or its `..` records, is refused within a directory's reach** —
+  `MAX_SLOTS` entries, and a path's 512 components — not after a read of the whole volume.

@@ -64,6 +64,11 @@ pub trait Volume {
     fn mark_mounted(&self) -> Result<(), FsError>;
     /// Record the filesystem cleanly unmounted, as an unmount's last write.
     fn mark_clean(&self) -> Result<(), FsError>;
+    /// **Whether this mount now refuses every change**, as a read-only one does, since a change
+    /// found the filesystem corrupt or could not be undone. The server says so once.
+    fn refusing_changes(&self) -> bool {
+        false
+    }
 
     /// **Map the regular file at `path`** for the Model A data path: its runs into `runs`.
     fn map_file(&self, path: &[u8], runs: &mut [BlockRun]) -> Result<Mapped, FsError>;

@@ -147,7 +147,8 @@ pub const FILE_BLOCKS_PREFIX_LEN: usize = 32;
 /// Bytes of one `BlockRun` in a `FILE_BLOCKS` reply: `file_block: u64`, `device_lba: u64`,
 /// `length: u32`, `flags: u32`.
 pub const BLOCK_RUN_WIRE_LEN: usize = 24;
-/// `FILE_BLOCKS` flag: a read-only mount's file; the kernel installs it without `MAP_WRITE`.
+/// `FILE_BLOCKS` flag: a file that may not be written, a read-only mount's or one resolved on a
+/// mount refusing changes; the kernel installs it without `MAP_WRITE`.
 pub const FILE_BLOCKS_READ_ONLY: u32 = 1 << 0;
 
 /// Build a `FILE_BLOCKS` reply body's prefix into `out`, returning [`FILE_BLOCKS_PREFIX_LEN`];

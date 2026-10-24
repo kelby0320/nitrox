@@ -17,6 +17,10 @@ pub const MIN_CLUSTER: u32 = 4096;
 /// Below this many clusters a FAT that is not FAT32 is FAT12, at or above it FAT16: the
 /// specification's bound.
 pub const FAT12_CLUSTERS: u32 = 4085;
+/// The fewest clusters a FAT32 has by count, and so one more than a FAT16 may.
+pub const FAT16_CLUSTERS: u32 = 65_525;
+/// The most a FAT32 may have: its last cluster, `0x0FFF_FFF6`, is the last below the bad marker.
+pub const FAT32_MOST: u32 = 0x0FFF_FFF5;
 
 /// Which FAT.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -206,6 +210,12 @@ pub fn parse(b: &[u8; 512]) -> Result<Geometry, Unservable> {
     } else {
         Kind::Fat16
     };
+    // **No cluster's number may reach the FAT's markers**, bad (`…F7`) and end of chain (`…F8` on):
+    // a FAT16 has fewer than 65,525 clusters, a FAT32's last is `0x0FFF_FFF6`.
+    let most = if is32 { FAT32_MOST } else { FAT16_CLUSTERS - 1 };
+    if clusters > most {
+        return Err(Unservable::Malformed("more clusters than its FAT can number"));
+    }
     // **The FAT must hold an entry for every cluster**: 12, 16 or 32 bits each, from entry 2.
     let need = match kind {
         Kind::Fat12 => (clusters as u64 + 2) * 3 / 2 + 1,
@@ -329,6 +339,25 @@ mod tests {
         let mut b = boot(32_768, 8, 32);
         b[510] = 0;
         assert_eq!(parse(&b), Err(Unservable::NotFat));
+    }
+
+    /// **A cluster's number never reaches the FAT's markers**, at the neighbours: a FAT16 of 65,524
+    /// clusters and a FAT32 of `0x0FFF_FFF5` are served, one more each refused, since its highest
+    /// cluster would read as bad or as a chain's end.
+    #[test]
+    fn a_cluster_count_its_fat_cannot_number_is_refused() {
+        let fat16 = |clusters: u32| parse(&boot(1 + 2 * 256 + 32 + clusters, 1, 256));
+        assert_eq!(fat16(65_524).map(|g| (g.clusters, g.kind)), Ok((65_524, Kind::Fat16)));
+        assert!(matches!(fat16(65_525), Err(Unservable::Malformed(_))), "65,525 clusters is a FAT32's count");
+        let fat32 = |clusters: u32| {
+            let mut b = boot(1 + 2 * 2_097_152 + clusters, 1, 0);
+            b[17..19].copy_from_slice(&0u16.to_le_bytes());
+            b[36..40].copy_from_slice(&2_097_152u32.to_le_bytes());
+            b[44..48].copy_from_slice(&2u32.to_le_bytes());
+            parse(&b)
+        };
+        assert_eq!(fat32(0x0FFF_FFF5).map(|g| g.clusters), Ok(0x0FFF_FFF5));
+        assert!(matches!(fat32(0x0FFF_FFF6), Err(Unservable::Malformed(_))), "its last would be 0x0FFF_FFF7, bad");
     }
 
     #[test]
