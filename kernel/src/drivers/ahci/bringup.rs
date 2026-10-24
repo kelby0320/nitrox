@@ -96,7 +96,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     write32(port_base, PX_FBU, (fis.phys().as_u64() >> 32) as u32);
     write32(port_base, PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
     write32(port_base, PX_IS, 0xFFFF_FFFF);
-    write32(port_base, PX_IE, PXIE_DHRE | PXIE_TFEE);
+    write32(port_base, PX_IE, PXIE_DHRE | PX_FATAL);
     start_port(port_base);
 
     let intr = match InterruptObject::try_new() {
@@ -106,6 +106,11 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     };
     let intr_ptr = intr.as_ptr();
     core::mem::forget(intr);
+    let wake = match InterruptObject::try_new() {
+        // SAFETY: `into_raw` yields the box's single creation reference, which the disk keeps.
+        Ok(io) => KBox::into_raw(io).as_ptr() as *mut (),
+        Err(_) => return declined(OUT_OF_MEMORY),
+    };
 
     let disk = AhciDisk {
         abar,
@@ -121,6 +126,9 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         intr: intr_ptr,
         issued_at: AtomicU64::new(0),
         counted: Counted::new(),
+        fault: AtomicU8::new(CLEAR),
+        wake,
+        dead: AtomicBool::new(false),
     };
     let disk = match KBox::try_new(disk) {
         Ok(b) => KBox::into_raw(b).as_ptr(), // leak to 'static

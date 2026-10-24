@@ -93,9 +93,8 @@ fn build_frags(frames: &[PhysAddr], buf_offset: u64, length: u64) -> Result<KVec
     Ok(frags)
 }
 
-/// **Whether `dn` takes a transfer of `length` bytes at `offset` as whole logical blocks**, as
-/// `docs/spec/io-operation.md` requires; refused before an IRP exists otherwise, so no driver sees
-/// part of a block. AHCI divides both by its sector, and truncated what did not divide.
+/// **Whether `dn` takes a transfer of `length` bytes at `offset` as whole logical blocks**
+/// (`docs/spec/io-operation.md`); no driver sees part of a block.
 fn whole_blocks(dn: &DeviceNode, offset: u64, length: u64) -> Result<(), KError> {
     let size = dn.block_info().logical_block_size as u64;
     if size == 0 || !offset.is_multiple_of(size) || !length.is_multiple_of(size) {
@@ -104,9 +103,8 @@ fn whole_blocks(dn: &DeviceNode, offset: u64, length: u64) -> Result<(), KError>
     Ok(())
 }
 
-/// **Submit `irp` to `backend`, or complete it `InvalidArgument` if its range is not within
-/// `dn`'s blocks**: past the end is the operation's outcome (`docs/spec/io-operation.md`), and no
-/// driver sees such a request.
+/// **Submit `irp` to `backend`, or complete it `InvalidArgument` if its range is past `dn`'s end**,
+/// an outcome, not an argument failure (`docs/spec/io-operation.md`).
 fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: *mut Irp) {
     let info = dn.block_info();
     // SAFETY: `irp` is freshly placed and uniquely owned until it is submitted or completed.
@@ -810,10 +808,7 @@ mod tests {
         reclaim_completed();
     }
 
-    /// **A block request off its device's blocks reaches no driver**: part of a block is refused
-    /// before an IRP exists, through the syscall's dispatch and the page cache's alike, and a range
-    /// past the end completes its operation `InvalidArgument`. AHCI took either, as another sector
-    /// or a count of 0, which ATA reads as 65,536.
+    /// **A block request off its device's blocks reaches no driver**, through both dispatches.
     #[test]
     fn a_block_request_off_its_devices_blocks_reaches_no_driver() {
         use crate::libkern::block::BlockKind;

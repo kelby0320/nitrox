@@ -109,3 +109,123 @@ fn a_command_that_moved_less_than_its_length_fails() {
     assert_eq!(completion(false, 0, 0), (ok, 0), "a flush");
     assert_eq!(completion(true, 8192, 8192), (io_error, 0), "the drive's error, whatever moved");
 }
+
+/// **A disk on fake registers**: memory standing in for the ABAR, held while the disk is used.
+fn fake_disk() -> (std::boxed::Box<[u32; 96]>, AhciDisk) {
+    crate::mm::test_support::init_global_heap();
+    crate::dpc::init().unwrap();
+    let regs = std::boxed::Box::new([0u32; 96]);
+    let abar = regs.as_ptr() as u64;
+    let disk = AhciDisk {
+        abar,
+        port_base: abar + PORT_BASE,
+        port: 0,
+        cmd_list: DmaBuffer::alloc(1024).unwrap(),
+        _fis: DmaBuffer::alloc(256).unwrap(),
+        cmd_table: DmaBuffer::alloc(CMD_TABLE_BYTES).unwrap(),
+        sectors: 1 << 20,
+        flush_command: ATA_FLUSH_CACHE_EXT,
+        inflight: AtomicPtr::new(core::ptr::null_mut()),
+        pending: IrqSpinLock::new(LockRank::Leaf, PendingRing::new()),
+        intr: core::ptr::null_mut(),
+        issued_at: AtomicU64::new(0),
+        counted: Counted::new(),
+        fault: AtomicU8::new(CLEAR),
+        wake: core::ptr::null_mut(),
+        dead: AtomicBool::new(false),
+    };
+    (regs, disk)
+}
+
+/// A read of one sector into `frag`.
+fn read_irp(frag: &PhysFrag) -> Irp {
+    use crate::io::irp::{IRP_BUF_FRAGS, IrpBuffer, IrpOp};
+    let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: frag as *const PhysFrag as u64 };
+    Irp::new_block(IrpOp::Read, core::ptr::null(), 0, 512, buffer, core::ptr::null_mut(), 0)
+}
+
+fn ctx(d: &AhciDisk) -> *mut () {
+    d as *const AhciDisk as *mut ()
+}
+
+const IO_ERROR: i32 = crate::syscall::error::KError::IoError as i32;
+const PENDING: i32 = IrpStatus::Pending as i32;
+
+/// **A command a polled wait gave up on is failed, not retired**: it retired as done while it may
+/// have been running yet, and the next was built over its slot.
+#[test]
+fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
+    let (_regs, d) = fake_disk();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
+    submit(&mut first, ctx(&d));
+    submit(&mut second, ctx(&d));
+    write32(d.port_base, PX_TFD, 0x50);
+    // SAFETY: slot 0's header is the disk's; DW1 is the byte count an HBA writes back.
+    unsafe { (d.cmd_list.virt() as *mut u32).add(1).write_volatile(512) };
+    assert_eq!(settle_polled(&d, false), Some(true));
+    crate::dpc::run_pending();
+    assert_eq!((first.status, first.transferred), (IO_ERROR, 0), "failed, whatever the count said");
+    assert_eq!(d.inflight.load(Ordering::Acquire), &mut second as *mut Irp, "the next issued");
+    assert_eq!(d.fault.load(Ordering::Acquire), CLEAR);
+}
+
+/// **A task file error is recovered, its command failed and the next issued**: a real HBA keeps the
+/// command's bit in PxCI, so the request waited for ever; QEMU clears it, so both are taken.
+#[test]
+fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
+    for keeps in [true, false] {
+        let (_regs, d) = fake_disk();
+        let frag = PhysFrag { base: 0x10_0000, len: 512 };
+        let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
+        submit(&mut first, ctx(&d));
+        submit(&mut second, ctx(&d));
+        write32(d.port_base, PX_IS, PXIE_TFEE);
+        write32(d.port_base, PX_TFD, 0x51);
+        write32(d.port_base, PX_CI, keeps as u32);
+        on_interrupt(&d);
+        crate::dpc::run_pending();
+        assert_eq!(first.status, PENDING, "keeps {keeps}: not retired, the watch thread's");
+        assert_eq!(d.fault.load(Ordering::Acquire), FAULTED, "keeps {keeps}");
+        let irp = claim(&d, 0, false).expect("a reported fault is claimed");
+        assert_eq!(irp, &mut first as *mut Irp);
+        assert_eq!(claim(&d, 0, true), None, "and only once");
+        write32(d.port_base, PX_CI, 0);
+        write32(d.port_base, PX_TFD, 0x50);
+        on_interrupt(&d);
+        crate::dpc::run_pending();
+        assert_eq!(first.status, PENDING, "keeps {keeps}: an interrupt while it is recovered");
+        assert!(recover(&d, irp));
+        crate::dpc::run_pending();
+        assert_eq!(first.status, IO_ERROR, "keeps {keeps}");
+        assert_eq!(d.inflight.load(Ordering::Acquire), &mut second as *mut Irp, "keeps {keeps}: the next issued");
+        assert_eq!(d.fault.load(Ordering::Acquire), CLEAR, "keeps {keeps}");
+    }
+}
+
+/// **A command past its deadline is recovered and failed**, held at the deadline's neighbours.
+#[test]
+fn a_command_past_its_deadline_is_recovered_and_failed() {
+    let (_regs, d) = fake_disk();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
+    assert_eq!(due_at(&d, 7), 7 + COMMAND_DEADLINE_NS, "idle: a deadline's length on");
+    submit(&mut first, ctx(&d));
+    submit(&mut second, ctx(&d));
+    write32(d.port_base, PX_TFD, 0x50);
+    let t = 1_000;
+    d.issued_at.store(t, Ordering::Relaxed);
+    assert_eq!(due_at(&d, t + 5), t + COMMAND_DEADLINE_NS + 1, "its deadline, before a deadline's length");
+    assert_eq!(claim(&d, t + COMMAND_DEADLINE_NS, false), None, "at its deadline");
+    let irp = claim(&d, t + COMMAND_DEADLINE_NS + 1, false).expect("past it");
+    assert!(recover(&d, irp));
+    crate::dpc::run_pending();
+    assert_eq!(first.status, IO_ERROR);
+    assert_eq!(d.inflight.load(Ordering::Acquire), &mut second as *mut Irp, "the next issued");
+    // A disk given up refuses what comes after.
+    d.dead.store(true, Ordering::Release);
+    let mut third = read_irp(&frag);
+    submit(&mut third, ctx(&d));
+    crate::dpc::run_pending();
+    assert_eq!(third.status, IO_ERROR, "refused by a disk given up");
+}

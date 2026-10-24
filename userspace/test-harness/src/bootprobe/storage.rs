@@ -430,10 +430,8 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
     true
 }
 
-/// **A block request off its device's blocks is refused**, on the root partition, down to its
-/// disk's driver: part of a block before anything is made, `InvalidArgument` and no operation, and
-/// a range past the partition's end through the operation, as `io-operation.md` has it. AHCI took
-/// either, as another sector or a count of 0. The last block still reads.
+/// **A block request off its device's blocks is refused**, on the root partition: part of a block
+/// with no operation made, a range past its end through the operation. The last block still reads.
 pub(super) fn block_bounds_test(root_ns: u64) -> bool {
     use libkern::{IO_OPCODE_READ, KError};
     let fail = |why: &[u8]| {

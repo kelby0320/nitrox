@@ -59,9 +59,11 @@ pub fn probe(flags: &crate::cmdline::Flags) {
     crate::device::log_outcomes();
 }
 
-/// **Start what drivers do after boot**: the USB hub thread, once the scheduler and APs are up.
+/// **Start what drivers do after boot**: the USB hub thread and AHCI's watch thread, once the
+/// scheduler and APs are up.
 pub fn start() {
     xhci::start();
+    ahci::start();
 }
 
 /// **Wait, bounded, for what [`start`] began to settle**: the USB hub thread's first round, so

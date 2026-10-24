@@ -282,8 +282,8 @@ fn kernel_main() {
     // thread, init included.
     bring_up_aps();
 
-    // Drivers' work after boot: the USB hub thread. After every CPU is up, because AP bring-up is
-    // the scheduler's most delicate moment and the overlap is worth less than staying out of it.
+    // Drivers' threads, USB's hub and AHCI's watch, after every CPU is up: AP bring-up is the
+    // scheduler's most delicate moment, and the overlap is worth less than staying out of it.
     nitrox_kernel::drivers::start();
 
     #[cfg(feature = "selftest")]
