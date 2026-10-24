@@ -616,7 +616,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   under both names, as a crash between the writes leaves it, finishes, deleting the old name and
   releasing nothing. Removing one of the two names before then still frees what the other holds,
   since FAT has no link count; `deferred-decisions.md` says so under `TODO(fs-repair)`. Fails
-  without it: `a_rename_stopped_at_any_write_is_undone_or_finished_by_its_retry`. And a mount that
+  without it: `a_rename_stopped_at_any_write_leaves_the_file_under_a_name`. And a mount that
   leaves the two names itself, its undo failing, or that finds the volume corrupt, refuses every
   change after, as Linux's FAT goes read-only (the maintainer's call); fails without it:
   `a_mount_that_finds_its_filesystem_corrupt_refuses_every_change_after`.
@@ -2288,7 +2288,7 @@ before it is fixed.
   then misleads `within()`. T1-6, T2-14. Error paths. Medium. **Fix.**
   Fixed in `eaaf7066`: a moved directory's `..` is checked before anything is written and rewritten
   before the old name goes, and a failure undoes it; fails without it:
-  `a_directory_moved_and_stopped_at_any_write_is_undone_or_finished_by_its_retry` and
+  `a_directory_moved_and_stopped_at_any_write_is_under_a_name` and
   `a_crash_anywhere_in_a_directory_move_leaves_its_dotdot_naming_a_parent_holding_it`.
 - [x] **pr365-2** `userspace/fs-server-fat/src/bpb.rs:198` — `parse` has no upper bound on the
   cluster count: a FAT16 of 65,525 clusters or more, or a FAT32 over 0x0FFFFFF5, is served, and its

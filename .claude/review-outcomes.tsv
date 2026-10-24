@@ -199,3 +199,18 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-23	393	71eb93aa	15	tests	optional	demonstrated	fixed	2c12b6b0	unlink of one of two names tested (2c12b6b0); the length refusal tested on a device refusing every write, Unsupported not Io (e2713abf)
 2026-10-23	393	71eb93aa	16	tests	optional	unverified	declined		the disjunctions define any change, which an error must not leave; a success's completeness is the crash test's
 2026-10-23	393	71eb93aa	17	rules-and-docs	optional	unverified	fixed	0e2c2c2c	within's doc says it is textual and why that holds
+2026-10-23	394	eed225cf	1	error-paths	blocking	demonstrated	fixed	c4afade3	grow writes its entry back before giving back, and keeps what it took if that fails; insert takes back a failed name, so mkdir frees only what no name reaches; held by landed writes in the sweep
+2026-10-23	394	eed225cf	2	logic+error-paths	worth-fixing	demonstrated	fixed	c4afade3	unname writes every slot of a name back when a write of its deletion fails; rename, unlink and rmdir use it; a straddle test on FAT12 reads names
+2026-10-23	394	eed225cf	3	error-paths	worth-fixing	demonstrated	fixed	c4afade3	insert marks every slot of the name deleted when a write fails, the mount refusing changes if that fails too
+2026-10-23	394	eed225cf	4	error-paths	worth-fixing	demonstrated	fixed	c4afade3	rename undoes the new name and .. only once the old name is whole again; a replaced entry written back; else broken; landed and landed-then-lost modes in both rename tests
+2026-10-23	394	eed225cf	5	architecture	worth-fixing	demonstrated	fixed	d9424a46	spec, librsproto, kernel and block.rs say a mount refusing changes sets FILE_BLOCKS_READ_ONLY too
+2026-10-23	394	eed225cf	6	architecture	worth-fixing	demonstrated	fixed	d9424a46	Meta::Unmount: left set when a change failed on the device or found the filesystem corrupt
+2026-10-23	394	eed225cf	7	architecture	worth-fixing	demonstrated	fixed	d9424a46	service-mgr named as a receiver; storage-service's comments said init
+2026-10-23	394	eed225cf	8	logic+architecture	worth-fixing	demonstrated	fixed	ec62fcdc	within's bound from MAX_SUFFIX; a move 511 deep, and a directory of exactly MAX_SLOTS entries and one a cluster larger, held at both neighbours
+2026-10-23	394	eed225cf	9	logic	optional	unverified	fixed	acced5cb	reproduced with a refused reload over 66 FAT sectors in use; allocate frees an ended, unlinked cluster
+2026-10-23	394	eed225cf	10	tests	optional	demonstrated	declined		server.rs makes syscalls and no gate meets a corrupt FAT; the clean branch of the unmount line is matched by four gates
+2026-10-23	394	eed225cf	11	architecture	optional	demonstrated	fixed	c4afade3	notice and refusing_changes doc: corrupt, or could not be undone
+2026-10-23	394	eed225cf	12	architecture	optional	unverified	fixed	c4afade3	doc: a file resolved before a mount refuses changes keeps its access and is written back; the behaviour kept, as no revocation exists
+2026-10-23	394	eed225cf	13	tests	optional	demonstrated	fixed	c4afade3	the dead Corrupt arm of found_dirty removed; broken keeps the bit
+2026-10-23	394	eed225cf	14	tests	optional	demonstrated	fixed	c4afade3	the guard was dead, only files being in the ids table; removed
+2026-10-23	394	eed225cf	15	rules-and-docs	optional	demonstrated	refuted		the description names each finding it fixes and does not claim pr365-7, -8 or -11; bug-bash.md triages all three Later
