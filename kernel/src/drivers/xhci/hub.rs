@@ -180,11 +180,9 @@ pub(super) extern "C" fn main(_arg: usize) {
         storage_round(x, &mut attached);
         lights_round(x, &mut attached);
         for port in 1..=x.max_ports {
-            let s = portsc(x, port);
-            if s & PORT_CSC == 0 {
+            let Some(connected) = connect_change(|| portsc(x, port), |v| write_portsc(x, port, v)) else {
                 continue;
-            }
-            clear_changes(x, port);
+            };
             // **A connect change on a port with a device is that device leaving**, whatever the
             // port says now: one pulled and another plugged in while this thread was busy, or a
             // contact that bounced, leaves Current Connect Status set and only the change bit.
@@ -192,7 +190,7 @@ pub(super) extern "C" fn main(_arg: usize) {
             if attached[port as usize].is_some() {
                 depart(x, port, &mut attached);
             }
-            if s & PORT_CCS != 0 {
+            if connected {
                 sleep(DEBOUNCE_NS);
                 if portsc(x, port) & PORT_CCS != 0 {
                     arrive(x, port, &mut attached);
@@ -879,6 +877,18 @@ fn write_portsc(x: &Xhci, port: u8, val: u32) {
     write32(x.op, PORTSC + 0x10 * (port as u64 - 1), val);
 }
 
+/// **A port's connect change, acknowledged**: `None` without one, else whether a device is
+/// connected, **read after the change is cleared**: every empty port carries a change from the
+/// controller's reset, and a device connecting before its clear has its own cleared with it.
+fn connect_change(read: impl Fn() -> u32, write: impl Fn(u32)) -> Option<bool> {
+    if read() & PORT_CSC == 0 {
+        return None;
+    }
+    let s = read();
+    write((s & PORT_KEEP) | (s & PORT_CHANGES));
+    Some(read() & PORT_CCS != 0)
+}
+
 fn clear_changes(x: &Xhci, port: u8) {
     let s = portsc(x, port);
     write_portsc(x, port, (s & PORT_KEEP) | (s & PORT_CHANGES));
@@ -920,5 +930,33 @@ fn poll(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {
             return done();
         }
         sleep(1_000_000);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::cell::Cell;
+
+    /// **A device that connects between a change's read and its clear is seen**, before the clear's
+    /// own read or the one after it; decided by the read before, it was lost.
+    #[test]
+    fn a_device_connecting_as_a_stale_change_is_cleared_is_seen() {
+        for at in [1, 2] {
+            let (reg, reads) = (Cell::new(PORT_CSC), Cell::new(0));
+            let read = || {
+                if reads.replace(reads.get() + 1) == at {
+                    reg.set(reg.get() | PORT_CCS | PORT_CSC);
+                }
+                reg.get()
+            };
+            let write = |v: u32| reg.set(reg.get() & !(v & PORT_CHANGES));
+            assert_eq!(connect_change(read, write), Some(true), "connected before read {at}");
+        }
+        let reg = Cell::new(PORT_CSC);
+        let write = |v: u32| reg.set(reg.get() & !(v & PORT_CHANGES));
+        assert_eq!(connect_change(|| reg.get(), write), Some(false), "a stale change on an empty port");
+        assert_eq!(reg.get() & PORT_CSC, 0, "and it is cleared");
+        assert_eq!(connect_change(|| reg.get(), |_| unreachable!()), None, "no change, no write");
     }
 }

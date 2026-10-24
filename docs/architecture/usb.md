@@ -154,7 +154,10 @@ controller may still move its data; only a rescan, which moves none, completes.
 
 **A connect change on a port that has a device is a departure**, then an arrival if something is
 there: a device pulled and another plugged in while the thread was busy — or a contact that bounced
-— leaves the port connected, and only the change bit says anything happened.
+— leaves the port connected, and only the change bit says anything happened. **Whether something is
+there is read after the change is cleared** (`hub::connect_change`, pre-Phase-7 Part D): every empty
+port carries a change from the controller's reset, and a device that connected between that
+change's read and its clear had its own cleared with it, so the read before missed it for good.
 
 **The log**, per device: `usb: port 9: 0627:0001 class 03/01/01, high-speed, "QEMU USB Keyboard
 (…)": HID boot keyboard`; the evaluation when it happens; `usb: first round: 5 device(s) in 209 ms`;
