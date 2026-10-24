@@ -180,7 +180,7 @@ pub struct ReadyMessage {
 
 The supervisor binds `handles[0]` into the appropriate namespace location after receiving this message. See [why-supervisor-registration.md](../rationale/why-supervisor-registration.md).
 
-**A refusal in place of Ready.** A server that cannot serve what it was given — `fs-server-ext4` or `fs-server-fat` over a device holding no filesystem it can read, or one it was asked to serve writable and cannot record mounted, or the storage service with nothing to serve — sends `Meta::Ready` with `RsFlags::ERROR` set, an [`ErrorBody`](#error-replies) in place of the `ReadyMessage`, and **no handle**, then exits. `kerror` is what a request would have failed with for the same reason; `msg` is the reason, in a sentence a supervisor prints beside what only it knows (the device, the mount point). `request_id` is 0 and `RsFlags::REPLY` is clear: the message answers nothing. A supervisor treats a refusal as a failed start and closes any handle that arrived with one. `init` receives them (`userspace/init/src/ready.rs`), and so does the storage service from the servers it starts (`userspace/storage-service/src/mounting.rs`).
+**A refusal in place of Ready.** A server that cannot serve what it was given — `fs-server-ext4` or `fs-server-fat` over a device holding no filesystem it can read, or one it was asked to serve writable and cannot record mounted, or the storage service with nothing to serve — sends `Meta::Ready` with `RsFlags::ERROR` set, an [`ErrorBody`](#error-replies) in place of the `ReadyMessage`, and **no handle**, then exits. `kerror` is what a request would have failed with for the same reason; `msg` is the reason, in a sentence a supervisor prints beside what only it knows (the device, the mount point). `request_id` is 0 and `RsFlags::REPLY` is clear: the message answers nothing. A supervisor treats a refusal as a failed start and closes any handle that arrived with one. Each supervisor receives them from what it starts: `init` (`userspace/init/src/ready.rs`), `service-mgr`, the storage service's among them (`userspace/service-mgr/src/main.rs`), and the storage service from the filesystem servers (`userspace/storage-service/src/mounting.rs`).
 
 
 ### Meta::Unmount (`0x0005`)
@@ -188,9 +188,10 @@ The supervisor binds `handles[0]` into the appropriate namespace location after 
 *(Administration Part C.3, 2026-09-24.)* Sent by a supervisor to a **filesystem server** on its
 control channel, after `Ready`, to end the mount. Request body: empty. The server records the
 filesystem **cleanly unmounted** as its last write — ext4's `s_state` clean bit set, FAT's state
-bit cleared, unless FAT's was found set or a change failed during the mount, when it is left set
-for a check ([`fat-fs-server.md`](../architecture/fat-fs-server.md) § 6) — then replies and exits. The reply is empty on success, or an [`ErrorBody`](#error-replies) if the state
-could not be written. A read-only mount writes nothing, since it never marked the filesystem
+bit cleared, unless FAT's was found set, or a change during the mount failed on the device or
+found the filesystem corrupt, when it is left set for a check
+([`fat-fs-server.md`](../architecture/fat-fs-server.md) § 6) — then replies and exits. The reply
+is empty on success, or an [`ErrorBody`](#error-replies) if the state could not be written. A read-only mount writes nothing, since it never marked the filesystem
 mounted, and replies success.
 
 It is the fourth step of the storage service's unmount chain (administration Part C.5c,

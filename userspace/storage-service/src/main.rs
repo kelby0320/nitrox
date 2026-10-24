@@ -1320,7 +1320,7 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     line.end();
 }
 
-/// Send `init` `Meta::Ready`, naming this server and carrying the forwarding endpoint's client end.
+/// Send `service-mgr` `Meta::Ready` naming this server, with the forwarding endpoint's client end.
 fn send_ready(control: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let Some(n) = librsproto::meta::ready(&mut body, b"storage-service") else {
@@ -1329,8 +1329,8 @@ fn send_ready(control: u64, client_end: u64) -> bool {
     send(control, librsproto::OP_READY, 0, 0, &body[..n], &[client_end])
 }
 
-/// Say, in place of `Meta::Ready`, that there is nothing to serve — no handle, and `init` prints
-/// `why` (`rsproto-wire-format.md` § Meta::Ready) — then exit.
+/// Say, in place of `Meta::Ready`, that there is nothing to serve — no handle, and `service-mgr`
+/// says `why` (`rsproto-wire-format.md` § Meta::Ready) — then exit.
 fn refuse(control: u64, err: KError, why: &[u8]) -> ! {
     let _ = send(control, librsproto::OP_READY, 0, RS_FLAG_ERROR, &error_reply(err, why), &[]);
     exit(1);
