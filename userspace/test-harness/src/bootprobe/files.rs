@@ -803,14 +803,6 @@ pub(super) fn grow_test(root_ns: u64) -> bool {
     }
 }
 
-/// **Create** a brand-new file via
-/// `sys_file_create` (the fs-server allocates an inode + inserts a directory entry in the
-/// parent, then grows it to the target size), write into it, `sys_file_sync`, then read the
-/// path off the device and confirm both that it resolves there and that its data persisted —
-/// proving inode allocation + directory-entry insertion end to end.
-/// **A create the filesystem refuses fails with its refusal**: a name past ext4's 255 bytes,
-/// `Unsupported`. The server answered only a read-only mount's refusal and served the rest, so the
-/// file never made was looked up and answered `NotFound`.
 /// **A copy into its own subtree is refused before it makes anything**: it made the destination,
 /// listed the source, which now held that, and copied it again, until it was 32 levels deep.
 pub(super) fn copy_into_itself_test(root_ns: u64) -> bool {
@@ -828,6 +820,9 @@ pub(super) fn copy_into_itself_test(root_ns: u64) -> bool {
     false
 }
 
+/// **A create the filesystem refuses fails with its refusal**: a name past ext4's 255 bytes,
+/// `Unsupported`. The server answered only a read-only mount's refusal and served the rest, so the
+/// file never made was looked up and answered `NotFound`.
 pub(super) fn refused_create_test(root_ns: u64) -> bool {
     let mut path = [b'a'; 8 + 300];
     path[..8].copy_from_slice(b"/system/");
@@ -844,6 +839,11 @@ pub(super) fn refused_create_test(root_ns: u64) -> bool {
     }
 }
 
+/// **Create** a brand-new file via
+/// `sys_file_create` (the fs-server allocates an inode + inserts a directory entry in the
+/// parent, then grows it to the target size), write into it, `sys_file_sync`, then read the
+/// path off the device and confirm both that it resolves there and that its data persisted —
+/// proving inode allocation + directory-entry insertion end to end.
 pub(super) fn create_test(root_ns: u64) -> bool {
     let path = b"/system/created";
     let marker = [0xABu8, 0xCD, 0xEFu8, 0x42];

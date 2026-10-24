@@ -778,7 +778,8 @@ pub enum TreeError {
 }
 
 /// **Whether `path` is `dir` or under it**, a component at a time, so `/abc` is not under `/ab`
-/// and `/a//b` is under `/a`.
+/// and `/a//b` is under `/a`. Textual: it resolves no `..`, which the kernel refuses in a path, and
+/// takes no directory to be bound at two paths, which no namespace here does.
 pub fn within(path: &[u8], dir: &[u8]) -> bool {
     fn parts(p: &[u8]) -> impl Iterator<Item = &[u8]> {
         p.split(|&c| c == b'/').filter(|c| !c.is_empty() && *c != b".")
