@@ -41,7 +41,10 @@ one on the stack.
 - **The type is read as Linux and the host tools read it**: FAT32 when the boot sector's 16-bit
   FAT size is zero, else FAT12 or FAT16 by cluster count, below 4,085 being FAT12. The
   specification decides by count alone. The two disagree only on a FAT32 with too few clusters,
-  which `mkfs.fat` writes, with a warning, below about 257 MiB.
+  which `mkfs.fat` writes, with a warning, below about 257 MiB. **Too many is refused**: a FAT16 of
+  65,525 clusters or more, or a FAT32 over `0x0FFF_FFF5`, would number a cluster with a value the
+  FAT keeps for bad or for a chain's end (pre-Phase-7 Part D); `mkfs` takes its ranges from the
+  same constants.
 - **Every field is checked before it is used**: a malformed one is refused with what made no
   sense, and a chain or entry naming a cluster outside the volume reads as `Corrupt`. A FAT is
   anyone's bytes. **A host test holds it as a class**: garbage over the boot sector, the FAT, the

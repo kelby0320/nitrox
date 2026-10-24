@@ -47,8 +47,8 @@ const FAT32_RESERVED: u32 = 32;
 const FSINFO: u32 = 1;
 const BACKUP_BOOT: u32 = 6;
 /// The fewest and most clusters each type may have, by the specification.
-const FAT16_CLUSTERS: core::ops::RangeInclusive<u32> = bpb::FAT12_CLUSTERS..=65_524;
-const FAT32_CLUSTERS: core::ops::RangeInclusive<u32> = 65_525..=0x0FFF_FFF5;
+const FAT16_RANGE: core::ops::RangeInclusive<u32> = bpb::FAT12_CLUSTERS..=bpb::FAT16_CLUSTERS - 1;
+const FAT32_RANGE: core::ops::RangeInclusive<u32> = bpb::FAT16_CLUSTERS..=bpb::FAT32_MOST;
 /// The fixed-disk media byte, which entry 0 of each FAT repeats.
 const MEDIA: u8 = 0xF8;
 const ZERO_SPAN: usize = 64 * 1024;
@@ -161,7 +161,7 @@ fn layout(kind: Kind, total: u32, spc: u32) -> Option<Geometry> {
         return None;
     }
     let clusters = (total - data_start) / spc;
-    let range = if kind == Kind::Fat32 { FAT32_CLUSTERS } else { FAT16_CLUSTERS };
+    let range = if kind == Kind::Fat32 { FAT32_RANGE } else { FAT16_RANGE };
     if !range.contains(&clusters) {
         return None;
     }
