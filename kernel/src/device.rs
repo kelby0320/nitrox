@@ -297,6 +297,16 @@ impl Registry {
             .map(|e| e.node.clone())
     }
 
+    /// **The live block node with the lowest served index from `index` on**, and that index: a
+    /// walk of every block device, which a departed one's index, never served again, cannot end.
+    pub fn block_from(&self, index: u32) -> Option<(u32, ObjectRef)> {
+        self.entries
+            .iter()
+            .filter(|e| !e.departed && node_of(e).class() == DeviceClass::Block && e.served >= index)
+            .min_by_key(|e| e.served)
+            .map(|e| (e.served, e.node.clone()))
+    }
+
     /// The input node `/dev/input/raw/<index>` serves. **None for a departed one**.
     pub fn input(&self, index: u32) -> Option<ObjectRef> {
         self.entries
@@ -606,6 +616,11 @@ pub fn mark_boot(disk: &ObjectRef) -> bool {
 /// Resolved through each entry's served index, which is also what `/dev/registry` reports.
 pub fn find_block_device(index: usize) -> Option<ObjectRef> {
     DEVICES.lock().block(index as u32)
+}
+
+/// [`Registry::block_from`]: the next live block device from `index` on, and its index.
+pub fn find_block_device_from(index: usize) -> Option<(usize, ObjectRef)> {
+    DEVICES.lock().block_from(index as u32).map(|(i, node)| (i as usize, node))
 }
 
 /// The node `/dev/input/raw/<index>` serves.
@@ -1226,6 +1241,26 @@ mod tests {
         c.depart(1);
         assert!(c.block(0).is_none() && c.block(2).is_none(), "the controller's disk, and that disk's partition");
         assert!(c.block(1).is_some() && c.node(0).is_some() && c.node(2).is_some(), "and nothing else");
+    }
+
+    /// **A walk of the block devices passes a departed one**, whose index is never served again:
+    /// the shutdown's flush walked from 0 to the first index nothing answered, so it flushed
+    /// nothing after a departed disk, here every disk.
+    #[test]
+    fn a_walk_of_the_block_devices_passes_a_departed_one() {
+        init_global_heap();
+        let (mut r, _, _) = booted();
+        r.depart(3);
+        let (kbd, ..) = with_usb(&mut r);
+        let stick = block(ResourceDescriptor::ZERO, BlockKind::Disk, b"QEMU QEMU HARDDISK", 1 << 15);
+        assert!(r.add_block_under(stick, kbd, "usb-storage"));
+        let mut walked: KVec<u32> = KVec::new();
+        let mut next = 0;
+        while let Some((index, _)) = r.block_from(next) {
+            walked.try_push(index).unwrap();
+            next = index + 1;
+        }
+        assert_eq!(&walked[..], [1, 3], "the RAM disk and the stick, past the departed disk and partition");
     }
 
     #[test]
