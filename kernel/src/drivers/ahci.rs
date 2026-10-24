@@ -12,7 +12,6 @@ use crate::libkern::printable::Printable;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::irq_install::ArchIrqInstall;
-use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;
@@ -179,7 +178,7 @@ pub struct AhciDisk {
     fault: AtomicU8,
     /// What wakes the watch thread: a fault's DPC signals it. An `InterruptObject`, leaked.
     wake: *mut (),
-    /// **The port would not stop**: its command is kept and every other request refused.
+    /// **The port would not stop**: its command kept, all else refused. Set under [`pending`].
     dead: AtomicBool,
 }
 
@@ -250,10 +249,20 @@ fn start_port(pb: u64) {
     write32(pb, PX_CMD, cmd);
 }
 
+/// **The port's clock.** A host test's moves on as it is read, where the host's reads 0.
+#[cfg(not(test))]
+fn clock() -> u64 {
+    use crate::arch::timer::ArchTimer;
+    crate::arch::Timer::read_ns()
+}
+
+#[cfg(test)]
+use tests::clock;
+
 fn wait_clear(pb: u64, off: u64, mask: u32) {
-    let start = crate::arch::Timer::read_ns();
+    let start = clock();
     while read32(pb, off) & mask != 0 {
-        if crate::arch::Timer::read_ns().wrapping_sub(start) > POLL_TIMEOUT_NS {
+        if clock().wrapping_sub(start) > POLL_TIMEOUT_NS {
             return;
         }
         core::hint::spin_loop();
@@ -404,7 +413,7 @@ fn issue(disk: &AhciDisk) {
 
 /// Poll slot 0 to completion within `timeout_ns`; `true` on success, `false` on timeout/error.
 fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
-    let start = crate::arch::Timer::read_ns();
+    let start = clock();
     loop {
         let ci = read32(disk.port_base, PX_CI);
         if ci & 1 == 0 {
@@ -413,7 +422,7 @@ fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
         if read32(disk.port_base, PX_TFD) & TFD_ERR != 0 {
             return false;
         }
-        if crate::arch::Timer::read_ns().wrapping_sub(start) > timeout_ns {
+        if clock().wrapping_sub(start) > timeout_ns {
             return false;
         }
         core::hint::spin_loop();
@@ -471,24 +480,12 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     // SAFETY: `irp` is a live block IRP during submit.
     let op = unsafe { (*irp).op };
     if op == crate::io::irp::IrpOp::Rescan as u32 || op == crate::io::irp::IrpOp::Eject as u32 {
-        // SAFETY: `irp` is uniquely owned during submit; completing it releases its waiter.
-        unsafe {
-            (*irp).set_completion(crate::syscall::error::KError::Unsupported as i32, 0);
-            crate::dpc::enqueue(&(*irp).dpc);
-        }
+        refuse(irp, crate::syscall::error::KError::Unsupported);
         return;
     }
     let disk = ctx as *mut AhciDisk;
     // SAFETY: `disk` is the live published disk.
     let d = unsafe { &*disk };
-    if d.dead.load(Ordering::Acquire) {
-        // SAFETY: `irp` is uniquely owned during submit; complete it with an error.
-        unsafe {
-            (*irp).set_completion(crate::syscall::error::KError::IoError as i32, 0);
-            crate::dpc::enqueue(&(*irp).dpc);
-        }
-        return;
-    }
 
     // **More fragments than one command table can describe: refuse, before the lock.**
     // `dispatch_block_irp` already rejects this against the published `max_frags`; this is the
@@ -496,33 +493,30 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     // it, unavailable under the lock.
     // SAFETY: `irp` is a live block IRP during submit.
     if unsafe { (*irp).buffer.count } as usize > MAX_PRDT_ENTRIES as usize {
-        // SAFETY: `irp` is uniquely owned during submit; complete it with an error so
-        // its waiter is released rather than parked forever.
-        unsafe {
-            (*irp).set_completion(crate::syscall::error::KError::InvalidArgument as i32, 0);
-            crate::dpc::enqueue(&(*irp).dpc);
-        }
+        refuse(irp, crate::syscall::error::KError::InvalidArgument);
         return;
     }
 
     // Take the port lock: it masks interrupts, so the completion ISR cannot run on
     // this CPU while we decide whether slot 0 is free — `inflight` is stable here.
     let mut q = d.pending.lock();
-    if d.inflight.load(Ordering::Acquire).is_null() {
+    // Under the lock a disk is given up under, so nothing is queued behind its kept command.
+    let refused = if d.dead.load(Ordering::Acquire) {
+        Some(crate::syscall::error::KError::IoError)
+    } else if d.inflight.load(Ordering::Acquire).is_null() && d.fault.load(Ordering::Acquire) == CLEAR {
         d.inflight.store(irp, Ordering::Release);
         // SAFETY: slot 0 is free; `irp` is a live block IRP.
-        if !unsafe { issue_locked(d, irp) } {
+        let issued = unsafe { issue_locked(d, irp) };
+        if !issued {
             d.inflight.store(core::ptr::null_mut(), Ordering::Release);
-            drop(q);
-            fail_irp(irp);
         }
-    } else if !q.push(irp) {
-        drop(q);
-        // SAFETY: `irp` is uniquely owned during submit; complete it with an error.
-        unsafe {
-            (*irp).set_completion(crate::syscall::error::KError::IoError as i32, 0);
-            crate::dpc::enqueue(&(*irp).dpc);
-        }
+        (!issued).then_some(crate::syscall::error::KError::InvalidArgument)
+    } else {
+        (!q.push(irp)).then_some(crate::syscall::error::KError::IoError)
+    };
+    drop(q);
+    if let Some(error) = refused {
+        refuse(irp, error);
     }
 }
 
@@ -557,7 +551,7 @@ unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
     } else {
         build_command(d, command, lba, count, frags, write);
     }
-    d.issued_at.store(crate::arch::Timer::read_ns(), Ordering::Relaxed);
+    d.issued_at.store(clock(), Ordering::Relaxed);
     issue(d);
     true
 }
@@ -569,7 +563,7 @@ unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
 /// `irp` is the IRP [`take_retired`] just took out of flight: live, and uniquely this driver's
 /// until its DPC runs.
 unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool, moved: u32) {
-    let ns = crate::arch::Timer::read_ns().saturating_sub(d.issued_at.load(Ordering::Relaxed));
+    let ns = clock().saturating_sub(d.issued_at.load(Ordering::Relaxed));
     // SAFETY: as the contract says.
     unsafe {
         let (status, transferred) = completion(err, (*irp).length, moved);
@@ -607,13 +601,13 @@ fn take_retired(d: &AhciDisk) -> (*mut Irp, bool, u32) {
     (retired, err, moved)
 }
 
-/// If slot 0 is idle, issue the next queued IRP. Called from the completion DPC and the boot poll
-/// path, not the ISR.
+/// If slot 0 is idle and the port not faulted, issue the next queued IRP. Called from the
+/// completion DPC and the boot poll path, not the ISR.
 fn drain_queue(d: &AhciDisk) {
     loop {
         let refused = {
             let mut q = d.pending.lock();
-            if !d.inflight.load(Ordering::Acquire).is_null() {
+            if !d.inflight.load(Ordering::Acquire).is_null() || d.fault.load(Ordering::Acquire) != CLEAR {
                 return;
             }
             let next = q.pop();
@@ -628,15 +622,15 @@ fn drain_queue(d: &AhciDisk) {
             d.inflight.store(core::ptr::null_mut(), Ordering::Release);
             next
         };
-        fail_irp(refused);
+        refuse(refused, crate::syscall::error::KError::InvalidArgument);
     }
 }
 
-/// Complete `irp` with `InvalidArgument` (an op with no command), outside the port lock.
-fn fail_irp(irp: *mut Irp) {
-    // SAFETY: `irp` is a live IRP no longer in flight or queued, so uniquely ours.
+/// Complete `irp` with `error`, outside the port lock.
+fn refuse(irp: *mut Irp, error: crate::syscall::error::KError) {
+    // SAFETY: `irp` is a live IRP not in flight or queued, so uniquely ours.
     unsafe {
-        (*irp).set_completion(crate::syscall::error::KError::InvalidArgument as i32, 0);
+        (*irp).set_completion(error as i32, 0);
         crate::dpc::enqueue(&(*irp).dpc);
     }
 }
@@ -693,14 +687,14 @@ extern "C" fn watch(_arg: usize) {
     // SAFETY: published once, never withdrawn.
     let d: &'static AhciDisk = unsafe { &*disk };
     while !d.dead.load(Ordering::Acquire) {
-        let now = crate::arch::Timer::read_ns();
+        let now = clock();
         // SAFETY: `d.wake` is the disk's `InterruptObject`, leaked with it.
         let woke = unsafe { crate::sched::wait_on(&[d.wake as usize], due_at(d, now), now) };
         if let crate::sched::WaitResult::Signaled(_) = woke {
             // SAFETY: as above.
             unsafe { crate::sched::interrupt_consume(d.wake) };
         }
-        if let Some(irp) = claim(d, crate::arch::Timer::read_ns(), false) {
+        if let Some(irp) = claim(d, clock(), false) {
             said(d, recover(d, irp));
         }
     }
@@ -748,9 +742,9 @@ fn claim(d: &AhciDisk, now: u64, forced: bool) -> Option<*mut Irp> {
 fn recover(d: &AhciDisk, irp: *mut Irp) -> bool {
     let pb = d.port_base;
     if !stop_port(pb) {
-        d.dead.store(true, Ordering::Release);
+        let mut refused = give_up(d, &mut d.pending.lock());
         loop {
-            let next = d.pending.lock().pop();
+            let next = refused.pop();
             if next.is_null() {
                 return false;
             }
@@ -778,6 +772,12 @@ fn recover(d: &AhciDisk, irp: *mut Irp) -> bool {
     true
 }
 
+/// **Give the disk up**, under its port lock `q`: refuse all from here, and hand back the queue.
+fn give_up(d: &AhciDisk, q: &mut PendingRing) -> PendingRing {
+    d.dead.store(true, Ordering::Release);
+    core::mem::replace(q, PendingRing::new())
+}
+
 /// Say what a recovery did.
 fn said(d: &AhciDisk, recovered: bool) {
     if recovered {
@@ -790,15 +790,13 @@ fn said(d: &AhciDisk, recovered: bool) {
 /// **Reset the link** (COMRESET, AHCI 1.3.1 §10.4.2), for a device still busy once stopped.
 fn comreset(pb: u64) {
     write32(pb, PX_SCTL, (read32(pb, PX_SCTL) & !0xF) | 1);
-    let start = crate::arch::Timer::read_ns();
-    while crate::arch::Timer::read_ns().wrapping_sub(start) < 1_000_000 {
+    let start = clock();
+    while clock().wrapping_sub(start) < 1_000_000 {
         core::hint::spin_loop();
     }
     write32(pb, PX_SCTL, read32(pb, PX_SCTL) & !0xF);
-    let start = crate::arch::Timer::read_ns();
-    while read32(pb, PX_SSTS) & 0xF != SSTS_DET_PRESENT
-        && crate::arch::Timer::read_ns().wrapping_sub(start) <= POLL_TIMEOUT_NS
-    {
+    let start = clock();
+    while read32(pb, PX_SSTS) & 0xF != SSTS_DET_PRESENT && clock().wrapping_sub(start) <= POLL_TIMEOUT_NS {
         core::hint::spin_loop();
     }
     write32(pb, PX_SERR, 0xFFFF_FFFF);
@@ -834,19 +832,24 @@ pub fn poll_complete_inflight() -> bool {
     }
     // SAFETY: live published state.
     let d = unsafe { &*disk };
-    if d.inflight.load(Ordering::Acquire).is_null() {
-        return false;
+    let settled = poll_disk(d);
+    if let Some((false, working)) = settled {
+        said(d, working);
     }
-    let finished = wait_command_polled(d, COMMAND_DEADLINE_NS);
-    match settle_polled(d, finished) {
-        Some(recovered) => {
-            if !finished {
-                said(d, recovered);
-            }
-            true
-        }
-        None => false,
-    }
+    settled.is_some()
+}
+
+/// **Poll slot 0's command to its end, then run every completion queued**, a refusal's too. `None`
+/// if there was none to wait for, else whether it finished and whether the port works.
+fn poll_disk(d: &AhciDisk) -> Option<(bool, bool)> {
+    let settled = if d.dead.load(Ordering::Acquire) || d.inflight.load(Ordering::Acquire).is_null() {
+        None
+    } else {
+        let finished = wait_command_polled(d, COMMAND_DEADLINE_NS);
+        settle_polled(d, finished).map(|working| (finished, working))
+    };
+    crate::dpc::run_pending();
+    settled
 }
 
 /// **Settle slot 0's command after a polled wait**: retired if it `finished`, else recovered and
@@ -861,10 +864,9 @@ fn settle_polled(d: &AhciDisk, finished: bool) -> Option<bool> {
         unsafe { retire(d, irp, err, moved) };
         true
     } else {
-        recover(d, claim(d, crate::arch::Timer::read_ns(), true)?)
+        recover(d, claim(d, clock(), true)?)
     };
     drain_queue(d);
-    crate::dpc::run_pending();
     Some(working)
 }
 
