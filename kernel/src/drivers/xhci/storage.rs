@@ -1686,9 +1686,13 @@ pub(super) fn depart(slot: u8) -> Departed {
     Departed(held)
 }
 
-/// **Complete what a departure handed back**, `PeerClosed`, now that the slot is disabled.
-pub(super) fn finish(d: Departed) {
-    for irp in d.0.into_iter().flatten() {
+/// **Complete what a departure handed back**, `PeerClosed`, by what became of the slot: all of it
+/// once disabled; if it was kept, its commands are kept with its memory, never completed, as the
+/// controller may still move their data, and only the rescan, which moves none, completes.
+pub(super) fn finish(d: Departed, slot: &super::hub::Released) {
+    let [inflight, stranded, rescan] = d.0;
+    let disabled = matches!(slot, super::hub::Released::Freed);
+    for irp in [inflight, stranded].into_iter().flatten().filter(|_| disabled).chain(rescan) {
         complete(irp, KError::PeerClosed as i32, 0);
     }
 }

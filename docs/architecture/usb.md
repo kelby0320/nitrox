@@ -148,6 +148,9 @@ a device's contexts and rings until its slot is disabled — QEMU's *Disable Slo
 default endpoint's output context — so a failed enumeration and a departure both disable first. A
 slot that does not disable, or that a wedged controller cannot be asked about, **keeps its memory
 for good**: a few pages leaked is the price of not handing the controller memory it may yet write.
+**And its storage commands with it** (pre-Phase-7 Part D): the one in flight and one a failed
+recovery stranded are never completed, since completing one hands its buffer back while the
+controller may still move its data; only a rescan, which moves none, completes.
 
 **A connect change on a port that has a device is a departure**, then an arrival if something is
 there: a device pulled and another plugged in while the thread was busy — or a contact that bounced
@@ -451,7 +454,8 @@ not see the stick plugged in again.
 
 **A departure**, before the records depart: the device out of the DPC's table, its queue completed
 `PeerClosed`, and any later submit refused so; the command in flight completed `PeerClosed` once the
-slot is disabled, since until then the controller may still move its data. **The devices are eight
+slot is disabled, since until then the controller may still move its data — and never, if it does
+not disable (`storage::finish`). **The devices are eight
 slots under an epoch**, as the input nodes are: a handle to a departed stick's node is refused
 rather than served the next stick's. Each publish leaks its partition windows, as at boot
 (`TODO(usb-departed-records)`).

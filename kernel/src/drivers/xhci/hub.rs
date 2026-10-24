@@ -264,16 +264,17 @@ fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     if let Some(id) = dev.record {
         crate::device::depart(id);
     }
-    match release(x, dev.slot, dev._mem) {
+    let released = release(x, dev.slot, dev._mem);
+    match released {
         Released::Freed => crate::kprintln!("usb: port {port}: disconnected; slot {} disabled", dev.slot),
         Released::Kept(why) => {
             crate::kprintln!("usb: port {port}: disconnected; slot {} kept: {why}", dev.slot)
         }
     }
-    super::storage::finish(storage);
+    super::storage::finish(storage, &released);
 }
 
-enum Released {
+pub(super) enum Released {
     Freed,
     /// Its memory was kept, **deliberately leaked**, because the controller may still own it.
     Kept(&'static str),
