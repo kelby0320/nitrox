@@ -131,7 +131,11 @@ Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
 - **Allocation is one pass**: first-fit from a hint — FAT32's next-free, then past the last
   allocation, or past the file's own last cluster — so a grow's clusters are contiguous wherever
   the free space is. **All or nothing**: a volume that runs out gives back what it took, and the
-  grow is `TooLarge`, as a full ext4's is.
+  grow is `TooLarge`, as a full ext4's is. **A grow, or a directory grown, that then fails** —
+  its zeroing, the FAT's write, the link or the entry — gives back what it took too, the link
+  undone and written before the frees, so no crash leaves a chain reaching a free cluster
+  (pre-Phase-7 Part D). **Any entry not free is a cluster in use**, as Linux reads it, a reserved
+  value too: a walk through one refuses it, but an allocation passes over it.
 - **Zeroing is in 64 KiB writes**, contiguous clusters merged.
 - **The FAT's sectors are cached**, 64 of them. A change marks its sectors dirty, and they are
   written at the points the order above needs and at the end of each request: adjacent sectors in

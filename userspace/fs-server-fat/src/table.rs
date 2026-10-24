@@ -291,7 +291,8 @@ impl Cache {
     /// `each` as it is taken, so a caller can zero them, then linked in the order found and ended.
     /// So they are contiguous wherever the free space is. The first, and where the next search
     /// should begin. **All or nothing**: a volume that runs out gives back what it took, and the
-    /// allocation is `TooLarge`, as a full ext4's is.
+    /// allocation is `TooLarge`, as a full ext4's is; so does a failed zeroing or read. **An entry
+    /// not free is a cluster in use**, a reserved value too, as Linux reads it.
     pub fn allocate<RW: BlockReader + BlockWriter>(
         &mut self,
         rw: &RW,
@@ -306,30 +307,30 @@ impl Cache {
         let after = |c: u32| if g.valid_cluster(c + 1) { c + 1 } else { 2 };
         let (mut first, mut last, mut got) = (0u32, 0u32, 0u32);
         let mut c = if g.valid_cluster(hint) { hint } else { 2 };
-        for _ in 0..g.clusters {
-            if self.next_rw(rw, g, c)? == Next::Free {
-                self.set(rw, g, c, end_mark(g))?;
-                if got == 0 {
-                    first = c;
-                } else {
-                    self.set(rw, g, last, c)?;
+        let out = (|| {
+            for _ in 0..g.clusters {
+                if entry(g.kind, c, |at| self.byte_rw(rw, g, at))? == 0 {
+                    self.set(rw, g, c, end_mark(g))?;
+                    if got == 0 {
+                        first = c;
+                    } else {
+                        self.set(rw, g, last, c)?;
+                    }
+                    last = c;
+                    got += 1;
+                    each(c)?;
+                    if got == n {
+                        return Ok((first, after(c)));
+                    }
                 }
-                last = c;
-                got += 1;
-                if let Err(e) = each(c) {
-                    self.free_chain(rw, g, first)?;
-                    return Err(e);
-                }
-                if got == n {
-                    return Ok((first, after(c)));
-                }
+                c = after(c);
             }
-            c = after(c);
-        }
-        if got > 0 {
+            Err(FsError::TooLarge)
+        })();
+        if out.is_err() && got > 0 {
             self.free_chain(rw, g, first)?;
         }
-        Err(FsError::TooLarge)
+        out
     }
 
     /// **Free the chain from `first`**, every cluster of it, bounded as a walk is. A freed cluster

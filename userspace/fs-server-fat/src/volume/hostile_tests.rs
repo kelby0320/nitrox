@@ -364,3 +364,35 @@ fn a_loop_in_a_directory_is_refused_within_a_directorys_reach() {
     assert_eq!(Fat::new(&counted).rename_path(b"/dir", b"/dir/sub/x", false, NOW), Err(FsError::Corrupt));
     assert!(counted.1.get() <= 1000, "a looping .. cost {} reads", counted.1.get());
 }
+
+/// **An allocation passes over a reserved FAT entry**, neither taking its cluster nor failing: it
+/// was `Corrupt`, losing the clusters it had ended, and so was every allocation after.
+#[test]
+fn an_allocation_passes_over_a_reserved_entry() {
+    let img = mformat(64, &["-c", "8"]);
+    put(&img, "A.TXT", b"a");
+    let over = Overlay::new(Rc::new(std::fs::read(&img).unwrap()));
+    let _ = std::fs::remove_file(&img);
+    let fat = Fat::new(&over);
+    let g = *fat.geometry().unwrap();
+    assert_eq!(g.kind, Kind::Fat16, "a 16-bit entry is poked");
+    let a = dir::lookup(&over, &g, &mut fat.cache.borrow_mut(), Dir::root(&g), b"A.TXT").unwrap().cluster;
+    let reserved = a + 2;
+    over.write_at(g.fat_byte(0) + reserved as u64 * 2, &0xFFF1u16.to_le_bytes()).unwrap();
+    let free = Cache::count_free(&over, &g).unwrap();
+    let cb = g.cluster_bytes() as usize;
+    assert_eq!(Volume::grow_file(&fat, b"/A.TXT", 4 * cb, NOW), Ok(1));
+    let mut chain = Vec::new();
+    fat.cache
+        .borrow_mut()
+        .walk(&over, &g, a, |_, c| {
+            chain.push(c);
+            true
+        })
+        .unwrap();
+    assert_eq!(chain, [a, a + 1, a + 3, a + 4], "the reserved cluster passed over");
+    assert_eq!(fat.cache.borrow_mut().raw(&over, &g, reserved), Ok(0xFFF1), "and left as it was");
+    assert_eq!(Cache::count_free(&over, &g), Ok(free - 3), "nothing taken but what the file holds");
+    let root = fat.resolve_dir(b"/").unwrap();
+    assert_eq!(fat.mkdir_at(root, b"after", NOW), Ok(()), "and the volume still written");
+}

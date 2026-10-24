@@ -503,10 +503,22 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         let cb = g.cluster_bytes() as u64;
         let mut z = Zeroer::new(self.r);
         let (new, _) = cache.allocate(self.r, g, more, last + 1, |c| z.add(g.cluster_sector(c) * SECTOR as u64, cb))?;
-        z.finish()?;
-        cache.flush(self.r, g)?;
-        cache.set(self.r, g, last, new)?;
+        let linked = z.finish().and_then(|()| cache.flush(self.r, g)).and_then(|_| cache.set(self.r, g, last, new));
+        if let Err(e) = linked {
+            self.give_back(g, cache, Some(last), new)?;
+            return Err(e);
+        }
         Ok(total - trailing)
+    }
+
+    /// **Give back the clusters from `taken`**, a failed change's: the link to them from `last`, if
+    /// it may have been made, undone and written first, so no chain on the device reaches one freed.
+    fn give_back(&self, g: &Geometry, cache: &mut Cache, last: Option<u32>, taken: u32) -> Result<(), FsError> {
+        if let Some(last) = last {
+            cache.set(self.r, g, last, table::end_mark(g))?;
+            cache.flush(self.r, g)?;
+        }
+        cache.free_chain(self.r, g, taken)
     }
 
     /// **Write the entries naming `name` into `d`**, its short entry made by `short` from its
@@ -581,28 +593,39 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 err?;
             }
             let need = new_end.div_ceil(cb) as u32;
-            let mut first = f.cluster;
+            let (mut first, mut taken) = (f.cluster, None);
             if need > len {
                 let hint = if len > 0 { last + 1 } else { self.hint.get() };
-                let (taken, after) =
+                let (t, after) =
                     cache.allocate(self.r, g, need - len, hint, |c| z.add(g.cluster_sector(c) * SECTOR as u64, cb))?;
-                z.finish()?;
                 self.hint.set(after);
-                cache.flush(self.r, g)?;
+                taken = Some(t);
                 if len == 0 {
-                    first = taken;
-                } else {
-                    cache.set(self.r, g, last, taken)?;
-                    cache.flush(self.r, g)?;
+                    first = t;
                 }
-            } else {
-                z.finish()?;
             }
-            dir::rewrite(self.r, g, cache, f.dir, f.slot, f.slot, |_, e| {
-                dir::set_cluster(g.kind, e, first);
-                e[28..32].copy_from_slice(&size.to_le_bytes());
-                dir::stamp(e, now);
-            })?;
+            let linked = (len > 0).then_some(last);
+            let grown = (|| {
+                z.finish()?;
+                if let Some(t) = taken {
+                    cache.flush(self.r, g)?;
+                    if let Some(last) = linked {
+                        cache.set(self.r, g, last, t)?;
+                        cache.flush(self.r, g)?;
+                    }
+                }
+                dir::rewrite(self.r, g, cache, f.dir, f.slot, f.slot, |_, e| {
+                    dir::set_cluster(g.kind, e, first);
+                    e[28..32].copy_from_slice(&size.to_le_bytes());
+                    dir::stamp(e, now);
+                })
+            })();
+            if let Err(e) = grown {
+                if let Some(t) = taken {
+                    self.give_back(g, cache, linked, t)?;
+                }
+                return Err(e);
+            }
             if first != f.cluster {
                 self.ids.borrow_mut().put(first, f.dir, f.slot);
             }
@@ -956,6 +979,8 @@ impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
 
 #[cfg(test)]
 mod crash_tests;
+#[cfg(test)]
+mod failure_tests;
 #[cfg(test)]
 mod hostile_tests;
 #[cfg(test)]

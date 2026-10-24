@@ -900,7 +900,7 @@ fn a_change_that_fails_on_the_device_leaves_the_volume_marked() {
     let img = mformat(64, &["-c", "8"]);
     put(&img, "A.TXT", b"a");
     let base = std::rc::Rc::new(std::fs::read(&img).unwrap());
-    let unmounted = |fault: u64, poke: Option<(u64, u16)>| {
+    let unmounted = |fault: u64, poke: Option<(u64, u32)>| {
         let disk = Failing::once(base.clone(), fault);
         if let Some((at, v)) = poke {
             disk.image.write_at(at, &v.to_le_bytes()).unwrap();
@@ -913,8 +913,12 @@ fn a_change_that_fails_on_the_device_leaves_the_volume_marked() {
     };
     assert_eq!(unmounted(u64::MAX, None), (Ok(()), true), "a sound change leaves it clean");
     assert_eq!(unmounted(1, None), (Err(FsError::Io), false), "the grow's first write refused");
-    let g = *Fat::new(&FileImage::open(&img)).geometry().unwrap();
-    assert_eq!(g.kind, Kind::Fat16, "a 16-bit entry is poked");
-    let reserved = Some((g.fat_byte(0) + 5 * 2, 0xFFF1));
-    assert_eq!(unmounted(u64::MAX, reserved), (Err(FsError::Corrupt), false), "a reserved entry met");
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let g = *fat.geometry().unwrap();
+    let f = dir::lookup(&disk, &g, &mut fat.cache.borrow_mut(), Dir::root(&g), b"A.TXT").unwrap();
+    let at = dir::slot_byte(&disk, &g, &mut fat.cache.borrow_mut(), f.dir, f.slot).unwrap().unwrap();
+    // Three clusters' worth of bytes over a chain of one.
+    let short = Some((at + 28, 3 * g.cluster_bytes()));
+    assert_eq!(unmounted(u64::MAX, short), (Err(FsError::Corrupt), false), "a chain shorter than its size");
 }

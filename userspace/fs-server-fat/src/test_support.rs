@@ -52,6 +52,17 @@ impl Overlay {
         Overlay { base, sectors: Default::default() }
     }
 
+    /// **The image as written, in a fresh file**, for the host's tools to read.
+    pub fn save(&self, what: &str) -> PathBuf {
+        let mut bytes = (*self.base).clone();
+        for (s, d) in self.sectors.borrow().iter() {
+            bytes[*s as usize * 512..][..512].copy_from_slice(d);
+        }
+        let path = scratch(what);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     fn sector(&self, s: u64) -> Result<[u8; 512], FsError> {
         if let Some(d) = self.sectors.borrow().get(&s) {
             return Ok(*d);
