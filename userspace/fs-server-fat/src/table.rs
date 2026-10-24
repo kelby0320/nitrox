@@ -169,10 +169,23 @@ impl Cache {
         r: &R,
         g: &Geometry,
         first: u32,
+        each: impl FnMut(u32, u32) -> bool,
+    ) -> Result<(), FsError> {
+        self.walk_upto(r, g, first, g.clusters, each)
+    }
+
+    /// [`Cache::walk`], a chain longer than `most` clusters `Corrupt`: a directory's, which no more
+    /// than `MAX_SLOTS` entries fill, so one that loops costs that reach, not the volume's.
+    pub fn walk_upto<R: BlockReader>(
+        &mut self,
+        r: &R,
+        g: &Geometry,
+        first: u32,
+        most: u32,
         mut each: impl FnMut(u32, u32) -> bool,
     ) -> Result<(), FsError> {
         let mut c = first;
-        for i in 0..g.clusters {
+        for i in 0..most {
             if !g.valid_cluster(c) {
                 return Err(FsError::Corrupt);
             }

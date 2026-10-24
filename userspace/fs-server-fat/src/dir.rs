@@ -140,7 +140,7 @@ fn walk<R: BlockReader>(
             let per_cluster = g.sectors_per_cluster * per_sector;
             let skip = from / per_cluster;
             let mut err = None;
-            cache.walk(r, g, first, |k, c| {
+            cache.walk_upto(r, g, first, MAX_SLOTS.div_ceil(per_cluster), |k, c| {
                 if k < skip {
                     return true;
                 }
@@ -672,7 +672,7 @@ pub fn parent<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir) 
 }
 
 /// **Whether `dir` is the directory whose chain begins `ancestor`, or within it**: its `..`
-/// followed to the root, bounded as a chain is.
+/// followed to the root, at most as many steps as a path has components.
 pub fn within<R: BlockReader>(
     r: &R,
     g: &Geometry,
@@ -681,7 +681,8 @@ pub fn within<R: BlockReader>(
     ancestor: u32,
 ) -> Result<bool, FsError> {
     let mut d = dir;
-    for _ in 0..g.clusters {
+    // No path reaches deeper than its 1,024 bytes' 512 components.
+    for _ in 0..512 {
         if d == Dir::Chain(ancestor) {
             return Ok(true);
         }

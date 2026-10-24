@@ -308,3 +308,59 @@ fn a_long_name_past_255_bytes_of_utf8_passes_the_protocol_and_is_made() {
     assert!(freed.is_some());
     assert_eq!(fat.mkdir_at(root, "名".repeat(256).as_bytes(), NOW), Err(FsError::InvalidName), "past 255 units");
 }
+
+/// **A loop is refused within a directory's reach, not the volume's**: a directory whose chain
+/// comes back on itself after as many clusters as `MAX_SLOTS` entries fill, and a `..` naming its
+/// own directory after as many steps up as a path can take. Each read the whole volume first.
+#[test]
+fn a_loop_in_a_directory_is_refused_within_a_directorys_reach() {
+    use std::cell::Cell;
+    struct Counted<'a>(&'a Overlay, Cell<u64>);
+    impl BlockReader for Counted<'_> {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.1.set(self.1.get() + 1);
+            self.0.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Counted<'_> {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            self.0.write_at(offset, buf)
+        }
+    }
+    let img = mformat(64, &["-c", "8"]);
+    mmd(&img, "dir");
+    mmd(&img, "dir/sub");
+    let base = Rc::new(std::fs::read(&img).unwrap());
+    let _ = std::fs::remove_file(&img);
+    let found = |over: &Overlay, path: &[u8]| {
+        let fat = Fat::new(over);
+        let g = *fat.geometry().unwrap();
+        let (parent, name) = path.split_at(path.iter().rposition(|&b| b == b'/').unwrap());
+        let d = dir::resolve_dir(over, &g, &mut fat.cache.borrow_mut(), if parent.is_empty() { b"/" } else { parent });
+        (g, dir::lookup(over, &g, &mut fat.cache.borrow_mut(), d.unwrap(), &name[1..]).unwrap())
+    };
+
+    let over = Overlay::new(base.clone());
+    let (g, d) = found(&over, b"/dir");
+    let fat = Fat::new(&over);
+    fat.cache.borrow_mut().set(&over, &g, d.cluster, d.cluster).unwrap();
+    fat.cache.borrow_mut().flush(&over, &g).unwrap();
+    // Deleted entries fill the cluster, so a walk goes on round the loop.
+    for slot in 2..g.cluster_bytes() / ENTRY {
+        let at = dir::slot_byte(&over, &g, &mut fat.cache.borrow_mut(), Dir::Chain(d.cluster), slot).unwrap();
+        over.write_at(at.unwrap(), &[DELETED]).unwrap();
+    }
+    let counted = Counted(&over, Cell::new(0));
+    assert_eq!(Fat::new(&counted).resolve_dir(b"/dir/missing"), Err(FsError::Corrupt));
+    let reach = (MAX_SLOTS * ENTRY).div_ceil(g.cluster_bytes()) as u64 * g.sectors_per_cluster as u64;
+    assert!(counted.1.get() <= reach + 64, "a looping directory cost {} reads, its reach {reach}", counted.1.get());
+
+    let over = Overlay::new(base);
+    let (g, sub) = found(&over, b"/dir/sub");
+    let fat = Fat::new(&over);
+    let at = dir::slot_byte(&over, &g, &mut fat.cache.borrow_mut(), Dir::Chain(sub.cluster), 1).unwrap().unwrap();
+    over.write_at(at + 26, &(sub.cluster as u16).to_le_bytes()).unwrap();
+    let counted = Counted(&over, Cell::new(0));
+    assert_eq!(Fat::new(&counted).rename_path(b"/dir", b"/dir/sub/x", false, NOW), Err(FsError::Corrupt));
+    assert!(counted.1.get() <= 1000, "a looping .. cost {} reads", counted.1.get());
+}
