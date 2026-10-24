@@ -431,3 +431,64 @@ fn a_rename_onto_an_entry_a_fat_cannot_name_is_refused() {
     assert!(fat.read_file(b"/A*B", &mut [0u8; 8]).is_ok(), "the entry found by its name");
     assert_eq!(fat.rename_path(b"/F.TXT", b"/A*B", true, NOW), Err(FsError::InvalidName));
 }
+
+/// **A move as deep as a path can reach is made, not refused as a loop**: its target's parent is
+/// climbed to the root in as many steps as the longest path the protocol carries has components.
+#[test]
+fn a_move_as_deep_as_a_path_reaches_is_made() {
+    let img = mformat(64, &["-c", "8"]);
+    mmd(&img, "x");
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let g = *fat.geometry().unwrap();
+    let mut d = fat.resolve_dir(b"/").unwrap();
+    let mut path = Vec::new();
+    for _ in 0..libfsserver::serve::MAX_SUFFIX.div_ceil(2) - 1 {
+        fat.mkdir_at(d, b"d", NOW).unwrap();
+        let parent = Dir::from_id(&g, d).unwrap();
+        d = dir::lookup(&disk, &g, &mut fat.cache.borrow_mut(), parent, b"d").unwrap().cluster as u64;
+        path.extend_from_slice(b"/d");
+    }
+    path.extend_from_slice(b"/x");
+    assert!(path.len() - 1 <= libfsserver::serve::MAX_SUFFIX, "a suffix the protocol carries");
+    assert_eq!(fat.rename_path(b"/x", &path, false, NOW), Ok(None));
+}
+
+/// **A directory as large as one may be is walked to its last entry**, and one a cluster larger is
+/// refused: the walk's bound is `MAX_SLOTS` entries, held at its neighbours.
+#[test]
+fn a_directory_as_large_as_one_may_be_is_walked_to_its_last_entry() {
+    let img = mformat(64, &["-c", "8"]);
+    mmd(&img, "D");
+    let base = std::fs::read(&img).unwrap();
+    let _ = std::fs::remove_file(&img);
+    let probe = Overlay::new(Rc::new(base.clone()));
+    let fat = Fat::new(&probe);
+    let g = *fat.geometry().unwrap();
+    assert_eq!(g.kind, Kind::Fat16, "16-bit entries are written");
+    let d = dir::lookup(&probe, &g, &mut fat.cache.borrow_mut(), Dir::root(&g), b"D").unwrap().cluster;
+    let cb = g.cluster_bytes() as usize;
+    // `D`'s chain made `clusters` long, every slot past `..` deleted but the last, a file's.
+    let built = |clusters: u32| {
+        let mut b = base.clone();
+        for k in 0..clusters {
+            let next = if k + 1 == clusters { 0xFFFF } else { (d + k + 1) as u16 };
+            for copy in 0..g.fats {
+                let at = (g.fat_byte(copy) + (d + k) as u64 * 2) as usize;
+                b[at..at + 2].copy_from_slice(&next.to_le_bytes());
+            }
+            let at = (g.cluster_sector(d + k) * SECTOR as u64) as usize;
+            for s in (at + if k == 0 { 2 * ENTRY as usize } else { 0 }..at + cb).step_by(ENTRY as usize) {
+                b[s] = DELETED;
+            }
+        }
+        let last = (g.cluster_sector(d + clusters - 1) * SECTOR as u64) as usize + cb - ENTRY as usize;
+        b[last..last + 32].copy_from_slice(&dir::short_entry(g.kind, b"LAST    TXT", ATTR_ARCHIVE, 0, 0, NOW));
+        Overlay::new(Rc::new(b))
+    };
+    let full = MAX_SLOTS / (g.cluster_bytes() / ENTRY);
+    let over = built(full);
+    assert_eq!(Fat::new(&over).read_file(b"/D/LAST.TXT", &mut [0; 8]), Ok(0), "MAX_SLOTS entries");
+    let over = built(full + 1);
+    assert_eq!(Fat::new(&over).read_file(b"/D/LAST.TXT", &mut [0; 8]), Err(FsError::Corrupt), "a cluster more");
+}

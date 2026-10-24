@@ -675,7 +675,7 @@ pub fn parent<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir) 
 }
 
 /// **Whether `dir` is the directory whose chain begins `ancestor`, or within it**: its `..`
-/// followed to the root, at most as many steps as a path has components.
+/// followed to the root, at most as many steps as a path the protocol carries has components.
 pub fn within<R: BlockReader>(
     r: &R,
     g: &Geometry,
@@ -684,8 +684,7 @@ pub fn within<R: BlockReader>(
     ancestor: u32,
 ) -> Result<bool, FsError> {
     let mut d = dir;
-    // No path reaches deeper than its 1,024 bytes' 512 components.
-    for _ in 0..512 {
+    for _ in 0..libfsserver::serve::MAX_SUFFIX.div_ceil(2) {
         if d == Dir::Chain(ancestor) {
             return Ok(true);
         }
