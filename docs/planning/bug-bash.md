@@ -8,7 +8,9 @@ two bugs, five to fix, one already fixed and three later. Group A fixed 2026-10-
 and kobj-9 from groups E and B and the test gaps that ride with them; sched-10 stays open for one
 mutation. Group B fixed 2026-10-22: the twelve capability and rights leaks, and the test gap that
 rides with them, kmem-11. Group C fixed 2026-10-23: ext4's findings and those in the code both
-servers share, then FAT's, with fs-3's two halves and the trials' doc claims.** Part D of
+servers share, then FAT's, with fs-3's two halves and the trials' doc claims. Group D fixed
+2026-10-24: the block layer's bounds, AHCI's recovery, a kept USB slot's commands, the shutdown's
+flush walk and the hot-plug window.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -113,7 +115,7 @@ A gate failed on a branch that changes only docs. It is the gate's own defect.
 
 One flake on a branch that changed only the shell and `rename`, in a path it does not touch.
 
-- [ ] **usb-1** `tools/xtask/src/usb.rs:120` — a USB keyboard hot-plugged after the hub thread's
+- [x] **usb-1** `tools/xtask/src/usb.rs:120` — a USB keyboard hot-plugged after the hub thread's
   first round sometimes never enumerates.
   - Scenario: `test-qemu --kvm` adds `usb-kbd` over QMP as soon as `usb: first round` appears
     (`usb.rs:58-65`).
@@ -123,6 +125,11 @@ One flake on a branch that changed only the shell and `rename`, in a path it doe
   - Demonstrated: failed once in three local `test-qemu --kvm` runs; the other two passed, with
     the guest unchanged. Error paths. Medium: a device plugged in later is not seen.
     **Fix**, with group D.
+  Fixed in `2a22622e`: a port's change is decided by the port read after its clear
+  (`hub::connect_change`), since every empty port carries a stale change from the controller's reset
+  and a device connecting before its clear lost its own; fails without it:
+  `a_device_connecting_as_a_stale_change_is_cleared_is_seen`. Reproduced 1 in 90 runs (under host
+  load); that the window is what failed it fits but was not caught by a probe in 70 loaded runs.
 
 ### kernel-objects — main at 510381f4, 2026-10-20
 
@@ -218,7 +225,7 @@ Found 24, refuted by a boot 0, reported 13.
   `a_send_that_could_close_a_cycle_of_endpoints_is_refused`,
   `an_endpoint_holding_another_in_a_held_send_is_refused_too`, and boot-probe's transfer check
   under `test-qemu`. A cycle through a namespace binding remains: `TODO(ipc-handle-cycles)`.
-- [ ] **kobj-7** `kernel/src/syscall/table.rs:1620` — `sys_io_submit` on a block device does not
+- [x] **kobj-7** `kernel/src/syscall/table.rs:1620` — `sys_io_submit` on a block device does not
   check that offset and length are multiples of the block size, or that offset+length lies
   within the device. `device-node.md` and `io-operation.md` require a synchronous
   InvalidArgument. `dispatch_block_irp` leaves bounds to the caller, `partition_rebase` checks
@@ -232,6 +239,10 @@ Found 24, refuted by a boot 0, reported 13.
   a boot probe on the root partition accepted reads of (off 0, len 100), (off 100, len 512) and
   (off 0, len 600). All completed status 0 with 100, 512 and 600 bytes. The disk did not wedge
   on QEMU, so the hang or DMA overrun is not shown. trust-boundary. Medium. **Fix.**
+  Fixed in `bc9731b9`, in the block layer for every driver: part of a block refused
+  `InvalidArgument` before an IRP exists, a range past the end completing its operation
+  `InvalidArgument`; fails without it: `a_block_request_off_its_devices_blocks_reaches_no_driver`,
+  and boot-probe's `block_bounds_test` on the root partition (test-qemu).
 - [x] **kobj-8** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_*
   bits present in the requested `rights`. With `rights`=0 nothing is required, and the mapping
   is installed as `Protection::USER`, which is present and readable. A MemoryObject or
@@ -879,7 +890,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   without it: `a_short_read_whose_status_says_nothing_is_missing_fails` and
   `a_command_that_moved_less_than_its_length_fails`.
 
-- [ ] **drv-2** `kernel/src/drivers/ahci.rs:869` — `poll_complete_inflight` discards
+- [x] **drv-2** `kernel/src/drivers/ahci.rs:869` — `poll_complete_inflight` discards
   `wait_command_polled`'s timeout. `take_retired` then judges the command by TFD.ERR alone, so a
   command still running (CI bit 0 set, BSY set) retires as Success with the full length, and slot 0
   is marked idle while the HBA owns it. `identify()` (line 462) has the same flaw: on a timeout it
@@ -895,6 +906,9 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   on the host (`Timer::read_ns` is 0), so that half is from reading the code (wait_command_polled
   :591-606). Its comment claims the IRP completes "with its error status" on a timeout. Lenses:
   logic, error-paths. High. **Fix.**
+  Fixed in `5e699918`: a polled wait that gives up recovers the port and fails the command, never
+  retiring it, and IDENTIFY stops the port before its buffer goes; fails without it:
+  `a_command_a_polled_wait_gave_up_on_is_failed_not_retired`.
 
 - [x] **drv-3** `kernel/src/drivers/gpt.rs:236` — `/dev/disk/by-partlabel/<label>` goes to the
   first boot-time disk published, and a later disk with the same label fails to bind
@@ -933,7 +947,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   `a_file_blocks_file_is_writable_only_as_far_as_its_server_may_write_the_device` and
   `a_file_blocks_reply_installs_a_file_no_more_writable_than_its_server_holds_its_device`.
 
-- [ ] **drv-5** `kernel/src/drivers/ahci.rs:822` — The AHCI driver has no error recovery and no
+- [x] **drv-5** `kernel/src/drivers/ahci.rs:822` — The AHCI driver has no error recovery and no
   runtime deadline. The ISR retires slot 0 only when PxCI bit 0 is clear. AHCI 1.3.1 §6.2.2.1 has
   software clear PxCMD.ST to reset PxCI after a task-file error. `stop_port` and `start_port`
   (:421-439) run only from init, `issued_at` feeds statistics only, and PX_IE enables only
@@ -946,8 +960,15 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   gate can show this. Unverified: on a real SATA machine, read an LBA past `sectors` through
   `/dev/blk/<disk>`, or use a drive with a pending sector, and see whether the PO completes and
   later I/O proceeds. Lenses: logic, error-paths. High. **Fix.**
+  Fixed in `5e699918`: a task file or fatal error wakes a watch thread, which recovers the port
+  (AHCI 1.3.1 §6.2.2.1) and fails the command `IoError`; the same thread enforces a 30 s command
+  deadline; a port that will not stop keeps its command and refuses the rest. Fails without it:
+  `a_task_file_error_is_recovered_its_command_failed_and_the_next_issued` and
+  `a_command_past_its_deadline_is_recovered_and_failed`. On QEMU, `blkdebug` failing one sector
+  showed the recovery and every probe after it passing; the kept-PxCI path is the host tests' (QEMU
+  clears it).
 
-- [ ] **drv-6** `kernel/src/drivers/ahci.rs:726` — Nothing refuses a block request whose offset or
+- [x] **drv-6** `kernel/src/drivers/ahci.rs:726` — Nothing refuses a block request whose offset or
   length is not a multiple of the logical block size, or whose offset is past the device's end,
   though `docs/spec/io-operation.md` (lines 41-45, 96-102) and device-node.md say both are
   InvalidArgument synchronously. `sys_io_submit` (table.rs:1620-1660), `dispatch_block_irp` and
@@ -969,8 +990,9 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   reached the disk at byte 1099520, which AHCI would issue as the partition's last LBA with count
   0. A past-end offset dispatched Ok and was written to lba48 1. Lenses: logic, error-paths,
   trust-boundary, tests, architecture (five reports of one defect). Medium. **Fix**, as kobj-7.
+  Fixed with kobj-7 in `bc9731b9`.
 
-- [ ] **drv-7** `kernel/src/drivers/xhci/hub.rs:273` — `hub::depart` calls `storage::finish`
+- [x] **drv-7** `kernel/src/drivers/xhci/hub.rs:273` — `hub::depart` calls `storage::finish`
   unconditionally after `release()` returns Kept. That completes the in-flight or stranded IRP
   PeerClosed while the slot is still enabled and its bulk endpoints may still move the IRP's data.
   storage.rs:1393-1396 documents `End::Stranded` as "completed once the slot is disabled". A
@@ -982,6 +1004,9 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   takes the same path. Unverified: inject a Disable Slot failure, or set `x.wedged`, during a USB
   read and check that the IRP completes while the slot stays enabled. The fix shape is to leak the
   held IRPs on the Kept path, as the memory is leaked. Lens: error-paths. Medium. **Fix.**
+  Fixed in `b061bbae`: `storage::finish` takes what became of the slot, and a kept slot keeps its
+  commands, never completed, a rescan alone completing; fails without it:
+  `a_departure_completes_its_commands_only_once_the_slot_is_disabled`.
 
 - [ ] **drv-8** `kernel/src/drivers/ahci.rs:321` — `drivers::probe` calls `ahci::init` for every
   AHCI-class function, but `AHCI.store(disk)` is unconditional and the ISR, `ahci_poll` (which
@@ -1062,7 +1087,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   filter `hold()` gets `first + (0 - 1)`, which can land on a real usage and press a phantom key on
   every report. Demonstrated by mutation. Lens: tests. Low. **Later.**
 
-- [ ] **drv-16** `kernel/src/power.rs:89` — `flush_every_disk` walks `/dev/blk/<n>` from 0 and
+- [x] **drv-16** `kernel/src/power.rs:89` — `flush_every_disk` walks `/dev/blk/<n>` from 0 and
   stops at the first index `find_block_device` answers None. A departed device's served index is
   never reused and resolves to None, so the walk ends at the first departed disk or partition and
   flushes nothing registered after it. Plug in USB stick A, then B (`/dev/blk/k+n`), then unplug A
@@ -1075,6 +1100,9 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   stick B is /dev/blk/Some(4)`. The existing test
   `a_departed_device_is_found_by_no_path_and_its_index_stays_taken` already asserts that `block(0)`
   is None while `block(1)` is Some. Lens: architecture. Low. **Fix.**
+  Fixed in `20fe57d9`: the walk goes from each live block device to the next
+  (`Registry::block_from`), past a departed one; fails without it:
+  `a_walk_of_the_block_devices_passes_a_departed_one`.
 
 What held up: the reviewers' mutations on input/ring.rs (6 of 6) and the device.rs registry (4 of 4)
 were all caught, as were 13 of 16 on pci/mod.rs, the partitions.rs end-of-disk, first==0 and
