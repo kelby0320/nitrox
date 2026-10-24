@@ -36707,3 +36707,31 @@ a caller can now see differently is here:
   allows it with the same grants, and is refused otherwise, to be asked again.
 - **`session-mgr` matches a terminal's reply by its request id**, stepping over the interrupt a
   Ctrl-C sends.
+
+## 2026-10-23 — Before Phase 7, Part D: group C's first half changes these contracts
+
+Group C is the bash's filesystem findings, in two PRs: this one ext4 and the code both servers
+share, the next FAT. `bug-bash.md` has each fix; what a caller can now see differently is here:
+
+- **ext4 serves what its superblock declares**, as Linux does: a feature in `s_feature_incompat`
+  the reader does not read, or a journal to replay, refuses the filesystem; one in
+  `s_feature_ro_compat` its writes do not keep (`metadata_csum`, `uninit_bg`, `bigalloc`, quotas),
+  or a filesystem lacking `filetype` or `extent`, refuses a writable mount. **The storage service
+  mounts such a filesystem read-only**, by the boot's rules and an administrator's alike, and says
+  why. A directory Linux indexed is made linear before a name goes in.
+- **An ext4 change answers `Ok` exactly when it changed a name**: an unlink, rmdir, create, `mkdir`
+  or rename that has made its change returns `Ok` whatever settling write fails after (a count, a
+  time), and one that fails before it is undone. A rename is ordered so that no stop leaves a name
+  reaching what a removal frees, and **a file renamed to a name it has already is left alone**, as
+  POSIX's rename leaves it. A directory moves into another unless that one is it or under it, by
+  the `..` records, whatever the path's bytes.
+- **A resolve whose create or grow fails, fails** with that error, in both servers, where only a
+  read-only mount's refusal did and the rest were served at the file's old size. **A truncate that
+  fails is served as the file now is**, since it may have freed blocks the kernel's map names; only
+  its read-only refusal fails it.
+- **Every forwarded request is answered**: a reply the kernel did not take is answered with an
+  error, its handles closed, since a forwarded lookup has no deadline.
+- **`libfs::copy_tree` refuses a destination that is its source or under it** (`IntoItself`), and
+  the tree walks a listed name no entry can have, empty or holding a `/` (`Name`).
+- **A malformed ext4 directory record ends the scan of its block**, as Linux's check does, where a
+  scan panicked the server.

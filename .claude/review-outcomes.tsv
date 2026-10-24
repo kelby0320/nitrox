@@ -182,3 +182,20 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-22	392	bbca02b7	11	rules-and-docs	optional	demonstrated	fixed	ded90488	syscall-abi.md gives the file verbs' arguments and states the refusals and the send mode's
 2026-10-22	392	bbca02b7	12	architecture	optional	demonstrated	fixed	8db8ae06	seal() zeroes the header padding; flags are the sender's, the spec's IpcMsgFlags never built and libstream relying on bit 0
 2026-10-22	392	bbca02b7	13	architecture	optional	unverified	declined		measured in test-qemu --kvm: 1,024 calls, 430 ns average with the lock, longest hold 4.6 us over at most 26 threads, bounded by MAX_THREADS; an O(1) flag would pin a Process per lookup
+2026-10-23	393	71eb93aa	1	logic+architecture	blocking	demonstrated	fixed	3b6052d6	a failed truncate is served as the file now is, only its read-only refusal failing it; ext4 and FAT tests that the answer names no free block, failing with the old rule
+2026-10-23	393	71eb93aa	2	architecture	blocking	demonstrated	fixed	b1d40662	maintainer's call: mount read-only and say so; the Mount reply carries mode and reason, disk prints it, spec and help say so
+2026-10-23	393	71eb93aa	3	architecture	blocking	demonstrated	fixed	b1d40662	kept the note for a mounted read-only ext4; storage.md's column definition and shell-language.md now say so
+2026-10-23	393	71eb93aa	4	architecture	blocking	demonstrated	fixed	e2713abf	the rename writes the type the source's record had (dir_find); symlink renames e2fsck-clean, failing with the type from the mode
+2026-10-23	393	71eb93aa	5	logic+architecture	worth-fixing	demonstrated	fixed	2c12b6b0	adjust_links keeps dir_nlink: 1 stays 1, past 65,000 becomes 1, never below 2; each part's removal fails the test
+2026-10-23	393	71eb93aa	6	logic+error-paths	worth-fixing	demonstrated	fixed	2c12b6b0	mkdir counts the parent before anything names the new directory, undone on failure; crash test per write, once and on
+2026-10-23	393	71eb93aa	7	error-paths	worth-fixing	demonstrated	fixed	2c12b6b0	within requires each parent to name its child, Corrupt otherwise; crash test's moved-into follow-up fails with the walk trusting ..
+2026-10-23	393	71eb93aa	8	error-paths	worth-fixing	demonstrated	fixed	2c12b6b0	a move uncounts the directory its .. named; the moved-on follow-up caught it only once /e had a subdirectory above the new floor
+2026-10-23	393	71eb93aa	9	error-paths+architecture	worth-fixing	demonstrated	fixed	b5d31e0d	Found::Ext4 gains refused; a refused ext4 is found, not served, noted with its server's reason
+2026-10-23	393	71eb93aa	10	logic+error-paths+tests+architecture	worth-fixing	demonstrated	fixed	0e2c2c2c	each doc back on its test; the run-based orphan sweep, positive-controlled on 71eb93aa, finds no other
+2026-10-23	393	71eb93aa	11	logic	optional	demonstrated	fixed	2c12b6b0	rmdir and a move uncount only a live directory the .. names (counted_parent); hostile test fails with .. trusted
+2026-10-23	393	71eb93aa	12	logic	optional	demonstrated	fixed	e2713abf	the same-name no-op comes after the source lookup, so a missing name is NotFound
+2026-10-23	393	71eb93aa	13	tests	optional	demonstrated	declined		copy_tree's path makes syscalls and there is no syscall mock; boot-probe's copy_into_itself_test is the call site's test in CI's test-qemu, failing without the guard
+2026-10-23	393	71eb93aa	14	tests	optional	unverified	declined		a refused forwarded send cannot be injected outside a probe build; three probe-build boots recorded in e6f6d404
+2026-10-23	393	71eb93aa	15	tests	optional	demonstrated	fixed	2c12b6b0	unlink of one of two names tested (2c12b6b0); the length refusal tested on a device refusing every write, Unsupported not Io (e2713abf)
+2026-10-23	393	71eb93aa	16	tests	optional	unverified	declined		the disjunctions define any change, which an error must not leave; a success's completeness is the crash test's
+2026-10-23	393	71eb93aa	17	rules-and-docs	optional	unverified	fixed	0e2c2c2c	within's doc says it is textual and why that holds

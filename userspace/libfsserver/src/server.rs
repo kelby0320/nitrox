@@ -12,7 +12,9 @@
 //! plumbing, **alloc-free**: fixed `.bss` buffers, one set per process.
 
 use crate::serve::entry_name;
-use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve, serve_grown};
+use crate::serve::{
+    MAX_FILE, MAX_SUFFIX, Served, apply_size, encode_error, encode_refusal, kerror, reason, serve, serve_grown,
+};
 use crate::{DirEntry, FsError, Refusal, Volume};
 use libkern::*;
 use librsproto::file::{
@@ -20,9 +22,8 @@ use librsproto::file::{
     parse_touch_request,
 };
 use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, OBJECT_KIND_NONE, RENAME_REPLACE, RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_RENAME,
-    RESOLVE_REPLY_LEN, RESOLVE_TRUNCATE, parse_resolve_grow_size, parse_resolve_rename, parse_resolve_request,
-    resolve_reply,
+    OBJECT_KIND_CHANNEL, OBJECT_KIND_NONE, RENAME_REPLACE, RESOLVE_RENAME, RESOLVE_REPLY_LEN, parse_resolve_rename,
+    parse_resolve_request, resolve_reply,
 };
 use librsproto::{
     OP_FILE_FORGET, OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK,
@@ -268,8 +269,8 @@ fn stage_reply(payload_len: usize, handle: Option<u64>) -> usize {
 }
 
 /// The kernel completes the waiting lookup inline (the peer is its forwarding endpoint), so
-/// `NoBlock` is correct and the reply is consumed regardless.
-fn send_reply(serve_end: u64, count: usize) {
+/// `NoBlock` is correct and the reply is consumed regardless. Whether it went.
+fn send_reply(serve_end: u64, count: usize) -> bool {
     // SAFETY: valid endpoint + message + `count` transferred handles.
     unsafe {
         syscall5(
@@ -279,64 +280,38 @@ fn send_reply(serve_end: u64, count: usize) {
             (&raw const REPLY_HANDLES) as u64,
             count as u64,
             SENDMODE_NOBLOCK,
-        );
+        ) == 0
     }
 }
 
-/// Apply a resolve's `RESOLVE_GROW` or `RESOLVE_TRUNCATE` (after `RESOLVE_CREATE`), best-effort:
-/// an error leaves `serve` mapping the file at its current size. A truncate that ends a file's
-/// id has it forgotten and released first. **The size a grow took the file from**, which the
-/// reply marks past ([`crate::serve::serve_grown`]).
+/// [`send_reply`] for a forwarded request. **One the kernel did not take is answered with an
+/// error**, and its handles, which stayed here, are closed: a forwarded request has no deadline,
+/// and its client would wait for ever.
+fn send_forwarded(serve_end: u64, count: usize, request_id: u64, op: u16) {
+    if send_reply(serve_end, count) {
+        return;
+    }
+    // SAFETY: the `count` handles the failed send left in this process; single-threaded.
+    (0..count).for_each(|i| unsafe {
+        syscall1(SYS_HANDLE_CLOSE, REPLY_HANDLES[i]);
+    });
+    // SAFETY: disjoint reply region.
+    let elen = unsafe {
+        let reply =
+            core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
+        encode_error(reply, request_id, KError::KernelError.as_i32(), op, b"the reply could not be sent")
+    };
+    let _ = send_reply(serve_end, stage_reply(elen, None));
+}
+
+/// [`apply_size`], then the forget and the release of an id a truncate ended. **The size a grow
+/// took the file from**, which the reply marks past ([`crate::serve::serve_grown`]).
 fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<Option<u64>, FsError> {
-    let Ok(m) = librsproto::decode(req) else {
-        return Ok(None);
-    };
-    if m.op != OP_NS_RESOLVE {
-        return Ok(None);
+    let resized = apply_size(vol, req, now_secs())?;
+    if let Some(id) = resized.ended {
+        forget_then_release(vol, serve_end, id);
     }
-    let Some(r) = parse_resolve_request(m.body) else {
-        return Ok(None);
-    };
-    if r.flags & (RESOLVE_GROW | RESOLVE_TRUNCATE) == 0 || r.suffix.len() > MAX_SUFFIX {
-        return Ok(None);
-    }
-    let Some(new_size) = parse_resolve_grow_size(m.body) else {
-        return Ok(None);
-    };
-    // **A read-only mount's refusal is the one failure reported**: it would otherwise answer a
-    // create or a grow with a file that never changed.
-    let mut refused = false;
-    let mut note = |r: Result<(), FsError>| refused |= r == Err(FsError::ReadOnly);
-    let mut path = [0u8; MAX_SUFFIX + 1];
-    path[0] = b'/';
-    path[1..1 + r.suffix.len()].copy_from_slice(r.suffix);
-    let path = &path[..1 + r.suffix.len()];
-
-    // Create-on-resolve is idempotent, so a re-resolve of a created file is harmless.
-    if r.flags & RESOLVE_CREATE != 0
-        && let Some(slash) = path.iter().rposition(|&b| b == b'/')
-    {
-        let parent = if slash == 0 { &b"/"[..] } else { &path[..slash] };
-        let name = &path[slash + 1..];
-        note(vol.create_file(parent, name, now_secs()));
-    }
-
-    let mut grown = None;
-    if r.flags & RESOLVE_TRUNCATE != 0 {
-        // Never combined with GROW: the two move the allocator in opposite directions.
-        match vol.truncate_file(path, new_size as usize, now_secs()) {
-            Ok(Some(id)) => forget_then_release(vol, serve_end, id),
-            Ok(None) => {}
-            Err(e) => note(Err(e)),
-        }
-    } else {
-        match vol.grow_file(path, new_size as usize, now_secs()) {
-            Ok(was) if was < new_size as u64 => grown = Some(was),
-            Ok(_) => {}
-            Err(e) => note(Err(e)),
-        }
-    }
-    if refused { Err(FsError::ReadOnly) } else { Ok(grown) }
+    Ok(resized.grown_from)
 }
 
 /// Receive one message on `h` into the `RECV_*` statics: `0` = arrived; `-11` (`WouldBlock`) =
@@ -533,7 +508,7 @@ fn reply_resolve_none(serve_end: u64, request_id: u64) {
             };
         stage_reply(rs_len, None)
     };
-    send_reply(serve_end, count);
+    send_forwarded(serve_end, count, request_id, OP_NS_RESOLVE);
 }
 
 fn free_session_at(slot: usize) {
@@ -571,7 +546,7 @@ fn reply_resolve_error_why(serve_end: u64, request_id: u64, kerror: i32, why: &[
         encode_error(reply, request_id, kerror, OP_NS_RESOLVE, why)
     };
     let count = stage_reply(elen, None);
-    send_reply(serve_end, count);
+    let _ = send_reply(serve_end, count);
 }
 
 /// Reply `OBJECT_KIND_CHANNEL`, transferring `client_end`; `OBJECT_KIND_DIRECTORY` is never sent.
@@ -624,10 +599,12 @@ fn open_dir_session(serve_end: u64, request_id: u64, dir: u64) {
         SESSION_DIR[slot] = dir;
     }
     if !reply_dir_handle(serve_end, request_id, client_end) {
-        // The reply did not go: roll back the session and drop the client endpoint.
+        // The reply did not go: roll back the session, drop the client endpoint, and answer, since
+        // the kernel took nothing and the lookup would wait for ever.
         free_session_at(slot);
         // SAFETY: closing our own not-yet-transferred handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, client_end) };
+        reply_resolve_error(serve_end, request_id, KError::KernelError.as_i32());
     }
 }
 
@@ -787,7 +764,7 @@ fn reply_session_error_why(session_ch: u64, request_id: u64, op: u16, kerror: i3
         encode_error(reply, request_id, kerror, op, why)
     };
     let count = stage_reply(elen, None);
-    send_reply(session_ch, count);
+    let _ = send_reply(session_ch, count);
 }
 
 /// Never returns: an unmount or an unreachable endpoint ends the process.
@@ -914,7 +891,7 @@ fn serve_control<V: Volume>(vol: &V) {
                 stage_reply(elen, None)
             }
         };
-        send_reply(control, count);
+        let _ = send_reply(control, count);
         // A read-only mount says it recorded nothing: "recorded clean" would claim otherwise.
         if marked.is_ok() && vol.read_only() {
             kprint(b"fs-server: unmounted; a read-only mount wrote nothing, so the filesystem is as it was found\n");
@@ -955,7 +932,7 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
             core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
         let op = librsproto::decode(req).map(|m| m.op).unwrap_or(0);
         served_op = op;
-        // A grow comes first so the map covers the new size; a failure falls through.
+        // A grow comes first so the map covers the new size; its failure is the reply.
         match maybe_grow(vol, req, serve_end) {
             Err(e) => Served::Error {
                 reply_len: encode_error(reply, request_id, kerror(e).as_i32(), OP_NS_RESOLVE, reason(e)),
@@ -1001,7 +978,7 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
         }
         Served::Error { reply_len } => stage_reply(reply_len, None),
     };
-    send_reply(serve_end, count);
+    send_forwarded(serve_end, count, request_id, served_op);
 }
 
 /// The block-device handle and read-only flag from the setup message on `control`, then the

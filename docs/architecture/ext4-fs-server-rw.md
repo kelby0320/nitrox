@@ -89,8 +89,8 @@ only once the kernel has answered `File::Forget` for the inode
 ([`filesystem-data-path.md`](filesystem-data-path.md) § *One object per file*). The kernel may be
 writing the file's pages to those blocks, and a block this server freed and handed to another
 file before that write landed would be overwritten with a dead file's bytes. Between the halves the
-inode is unattached with its link counted, the state `rename_path` could already leave on a crash,
-and `e2fsck` moves it to `lost+found`. The server waits for the answer on buffers of its own,
+inode is unattached with its link counted, the state a crash after a replacing rename's names
+changed can leave too, and `e2fsck` moves it to `lost+found`. The server waits for the answer on buffers of its own,
 since it asks from inside `serve_loop`'s walk of a batch of wait results. If the kernel cannot
 be asked, the inode is not freed: a leaked block can be repaired, a block claimed twice cannot.
 
@@ -156,6 +156,32 @@ left on the disk mapping blocks free for the next file. It costs a truncate whos
 more write of its inode. Held by host tests that lose each write of a cut, a truncate, a release and
 a directory's removal in turn, and that refuse every write from each on.
 
+**What a stop leaves a rename, and what a change answers** (pre-Phase-7 Part D, 2026-10-23). A
+rename wrote the new name, then removed the old: a stop between left a file under two names with
+one link, and removing either, or the rename asked again, freed the file while the other name
+still reached it. Now every refusal comes before the first write, a step that fails is undone, and
+a stop that cannot be undone leaves nothing a later change can damage:
+
+- **A file counts its new name before it is written**, and stops counting the old once that is
+  removed: a stop between leaves two names and two links.
+- **A directory loses its old name first**, since it may have only one: a stop leaves it
+  unreachable, for `e2fsck` to reconnect. Moving between parents, the new parent counts its `..`
+  before it is repointed and the directory the `..` named stops after, so a count is only ever too
+  high; `rmdir` takes the link from the directory the removed `..` names, if it is one. A `mkdir`
+  counts its parent before anything names the new directory. **A directory's count is
+  `dir_nlink`'s**, as Linux keeps it: 1 is more subdirectories than 65,000 could count, and stays
+  1; a count never goes below a directory's own two.
+- **Whether a directory is under another is asked of the tree**, a `..` at a time, each parent
+  required to name its child: a stopped move leaves a `..` its parent does not answer, and the walk
+  refuses it rather than trust it.
+- **A file renamed to a name it has already is left alone**, as POSIX's rename leaves it.
+
+**Once a change's name has changed, nothing after fails it**: an unlink, rmdir, create, `mkdir` or
+rename answers `Ok` exactly when it changed a name. A link count or a time left unwritten leaks at
+worst. An unlink or a replacing rename that answered an error once its name was gone lost the
+orphan with it, since the server releases one only on `Ok`. `volume/crash_tests.rs` stops each at
+every write, refused once or from there on, and asks `e2fsck` what it left.
+
 The tree is held to **e2fsprogs** in the host tests: `debugfs`' reading of every map, and `e2fsck
 -fn` clean — 4,096 files of 16 KiB in one directory; two files grown in turn to two levels at both
 block sizes and cut back through each; a two-level tree `mke2fs -d` wrote, read, cut and removed;
@@ -171,10 +197,23 @@ message (`init` does for `init.toml`'s `"ro"`), and the server serves through
 `FsError::ReadOnly`. So read-only isn't a check each mutation has to remember: whichever
 mutation is reached, by a session or a resolve, it fails at its first write having changed
 nothing, and the server answers `NoAccess` with the reason `read-only mount`. A grow or create
-that arrives as a resolve is refused, rather than falling through to the file's current size as
-other grow failures do. The same type answers `read_only()`, from which the block-file reply
+that arrives as a resolve is refused, as any of its failures is. The same type answers `read_only()`, from which the block-file reply
 takes its `FILE_BLOCKS_READ_ONLY` mark, so the kernel installs the files without `MAP_WRITE`;
 the mark and the refusal are one fact. It never writes the superblock.
+
+**What a filesystem declares decides what is served** (pre-Phase-7 Part D, 2026-10-23), as Linux
+decides it. A feature in `s_feature_incompat` the reader does not read, anything past `filetype`,
+`extent` and `flex_bg`, refuses the filesystem, and so does a journal holding changes not yet
+replayed (`needs_recovery`), since a replay after a write here would undo it. A feature in
+`s_feature_ro_compat` the writer does not keep, past `sparse_super`, `large_file`, `huge_file`,
+`dir_nlink` and `extra_isize`, refuses a writable mount only: `metadata_csum` and `uninit_bg`
+checksums a write would leave stale, so `e2fsck` and Linux called the filesystem corrupt after the
+first, and `bigalloc` and quotas count what this writer does not. So does a filesystem lacking
+`filetype` or `extent`, which every write here makes. Until then each was mounted writable. The
+storage service mounts such a filesystem read-only, saying why (`check_writable`). The table is
+`ext4/features.rs`. **`dir_index`**, a compatible feature, asks one thing of a writer that keeps no
+hash tree: a directory Linux indexed is made linear before a name goes in, as an older writer makes
+one, since its blocks read linearly as they are. An insert wrote over the tree's root instead.
 
 **A filesystem knows how it was left.** A writable mount clears `s_state`'s clean bit
 (`mark_mounted`) before it answers `Ready`, so the filesystem never looks clean while it can

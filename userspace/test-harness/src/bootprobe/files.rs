@@ -803,6 +803,42 @@ pub(super) fn grow_test(root_ns: u64) -> bool {
     }
 }
 
+/// **A copy into its own subtree is refused before it makes anything**: it made the destination,
+/// listed the source, which now held that, and copied it again, until it was 32 levels deep.
+pub(super) fn copy_into_itself_test(root_ns: u64) -> bool {
+    let made = libfs::mkdir(root_ns, b"/system/probe-tree").is_ok();
+    let copied =
+        libfs::copy_tree(root_ns, b"/system/probe-tree", b"/system/probe-tree/inner", false, &mut |_, _, _| {});
+    let junk = libfs::is_dir(root_ns, b"/system/probe-tree/inner");
+    let removed = libfs::remove_tree(root_ns, b"/system/probe-tree", &mut |_, _| {}).is_ok();
+    if made && copied == Err(libfs::TreeError::IntoItself) && !junk && removed {
+        kprint(b"boot-probe: a copy into its own subtree refused, nothing made ok\n");
+        return true;
+    }
+    let why = alloc::format!("made {made}, copied {copied:?}, left inner {junk}, removed {removed}");
+    Line::new().s(b"boot-probe: copy into itself FAIL: ").s(why.as_bytes()).end();
+    false
+}
+
+/// **A create the filesystem refuses fails with its refusal**: a name past ext4's 255 bytes,
+/// `Unsupported`. The server answered only a read-only mount's refusal and served the rest, so the
+/// file never made was looked up and answered `NotFound`.
+pub(super) fn refused_create_test(root_ns: u64) -> bool {
+    let mut path = [b'a'; 8 + 300];
+    path[..8].copy_from_slice(b"/system/");
+    let rights = RIGHT_MAP_READ | RIGHT_MAP_WRITE;
+    // SAFETY: `path` outlives the call and `root_ns` is a namespace handle this process holds.
+    let po = unsafe { syscall5(SYS_FILE_CREATE, root_ns, path.as_ptr() as u64, path.len() as u64, rights, 4096) };
+    let status = if po < 0 { po as i32 } else { po_wait(po as u64).0 };
+    if status == libkern::KError::Unsupported.as_i32() {
+        kprint(b"boot-probe: a create the filesystem refuses fails with its refusal ok\n");
+        true
+    } else {
+        Line::new().s(b"boot-probe: refused create FAIL: status ").i(status as i64).end();
+        false
+    }
+}
+
 /// **Create** a brand-new file via
 /// `sys_file_create` (the fs-server allocates an inode + inserts a directory entry in the
 /// parent, then grows it to the target size), write into it, `sys_file_sync`, then read the

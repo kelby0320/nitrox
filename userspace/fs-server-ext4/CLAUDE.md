@@ -65,9 +65,13 @@ Implements: superblock (`0xEF53`), block-group descriptors, inodes, the **extent
 at any depth: walk, append, split, cut, free), a linear `ext4_dir_entry_2` directory walk +
 **insert** (split an entry's slack), path resolution to a regular file, block-bitmap allocation +
 free-count updates, **inode-bitmap allocation** (new-file creation), and file growth. **Reject /
-skip** (return `FsError::Unsupported`/`Corrupt`): the journal, bigalloc, inline-data inodes, 64-bit
-block numbers, ≥ 8 KiB blocks, xattrs, ACLs, symlinks, checksums. htree directories need no special
-handling (the linear walk is backward-compatible).
+skip** (return `FsError::Unsupported`/`Corrupt`) — **by the superblock's feature words first**
+(`ext4/features.rs`): an `incompat` feature it does not read, or a journal to replay, refuses the
+filesystem; a `ro_compat` one its writes do not keep (`metadata_csum`, `uninit_bg`, `bigalloc`,
+quotas), or one lacking `filetype` or `extent`, refuses a writable mount. Then: the journal,
+bigalloc, inline-data inodes, 64-bit block numbers, ≥ 8 KiB blocks, xattrs, ACLs, symlinks,
+checksums. An htree directory is read by the linear walk, which is backward-compatible, and made
+linear, its index flag cleared, before a name goes in: an insert wrote over its hash tree's root.
 
 **Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`, and
 `docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a deferral
@@ -89,8 +93,9 @@ replacing `rename_path` return the inode, `release_inode` frees it), and
 another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries — and
 **extent trees** (Phase 6 Part H.1, 2026-10-08), so a directory no longer stops at about 815
 files with data, a file at four extents, or a removal of a file Linux wrote at its name. A
-grow, create, `mkdir` or rename that fails for want of space or depth now gives back what it took;
-one that loses a write midway does not yet (`TODO(ext4-failed-write-undo)`).
+grow, create, `mkdir` or rename that fails for want of space or depth now gives back what it took.
+A rename that loses a write midway is undone, and a stop there leaves no name reaching what a
+removal frees (2026-10-23); a grow that loses one is not yet (`TODO(ext4-failed-write-undo)`).
 
 ## This crate's library has a second consumer
 
@@ -129,4 +134,7 @@ holds `BIND_NAMESPACE` — the supervisor (init, or the storage service) binds i
   step around a read-only mount's `ReadOnly`, which is the whole of its enforcement.
 - Binding itself into a namespace, or holding `BIND_NAMESPACE`.
 - Trusting on-disk structures without bounds-checking (a malformed image must
-  yield `FsError`, never a panic or OOB read).
+  yield `FsError`, never a panic or OOB read). A directory's records are read through `record`,
+  which refuses one its length cannot hold. `garbage_in_any_structure_is_an_error_never_a_panic`
+  (`volume/hostile_tests.rs`) holds the rule as a class, on real structures made wrong: a new
+  reader of on-disk bytes belongs in what it exercises.

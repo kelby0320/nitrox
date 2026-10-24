@@ -390,6 +390,99 @@ mod tests {
         assert_eq!(flags_of(served, &reply), 0);
     }
 
+    /// A lazy resolve of `suffix` with `flags` and a size, as the kernel forwards one.
+    fn req(flags: u32, suffix: &[u8], size: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 2048];
+        let n = resolve_request(&mut body, 0, flags | RESOLVE_FILE_LAZY, suffix).unwrap();
+        body[n..n + 4].copy_from_slice(&size.to_le_bytes());
+        let mut msg = vec![0u8; 4096];
+        let len = encode(&mut msg, OP_NS_RESOLVE, 7, 0, &body[..n + 4], 0).unwrap();
+        msg.truncate(len);
+        msg
+    }
+
+    /// **A resolve whose create or grow fails answers the failure**, not the file at its old size,
+    /// which the kernel installs as the new one: a grow past what is free, a create of a name too
+    /// long. A truncate of nothing is served, and the serve answers `NotFound`. One that changes the
+    /// file says how.
+    #[test]
+    fn a_resolve_whose_create_or_grow_fails_answers_the_failure() {
+        use crate::test_support::RwImage;
+        use libfsserver::serve::{Resized, apply_size};
+        use librsproto::namespace::{RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_TRUNCATE};
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
+        let vol = Ext4(&rw);
+        let grow = RESOLVE_CREATE | RESOLVE_GROW;
+        let long = [b"system/" as &[u8], &[b'a'; 300]].concat();
+        assert_eq!(apply_size(&vol, &req(grow, b"system/big", 64 << 20), 0), Err(FsError::TooLarge));
+        assert_eq!(apply_size(&vol, &req(grow, &long, 4096), 0), Err(FsError::Unsupported));
+        assert_eq!(apply_size(&vol, &req(RESOLVE_TRUNCATE, b"system/none", 0), 0), Ok(Resized::default()));
+        let grown = Resized { grown_from: Some(0), ended: None };
+        assert_eq!(apply_size(&vol, &req(grow, b"system/new", 8192), 0), Ok(grown));
+        let ro = Ext4(&crate::ReadOnly(&rw));
+        assert_eq!(apply_size(&ro, &req(grow, b"system/other", 8192), 0), Err(FsError::ReadOnly));
+        let cut = req(RESOLVE_TRUNCATE, b"system/current-generation", 0);
+        assert_eq!(apply_size(&ro, &cut, 0), Err(FsError::ReadOnly), "a read-only truncate changed nothing");
+    }
+
+    /// **A truncate stopped at any write is answered with the file as it now is**: it may have freed
+    /// blocks the kernel's map of the file still names, and an error kept the kernel on that map,
+    /// the freed blocks the next file's. An error, then, only while every block the file had is in
+    /// use; otherwise a map naming none that is free.
+    #[test]
+    fn a_truncate_stopped_at_any_write_is_answered_with_the_file_as_it_is() {
+        use crate::ext4::{block_in_use, read_superblock};
+        use crate::test_support::{Failing, RwImage};
+        use libfsserver::serve::apply_size;
+        use librsproto::namespace::RESOLVE_TRUNCATE;
+        let blocks = |vol: &Ext4<'_, Failing>| {
+            let mut runs = [BlockRun::default(); 8];
+            let m = vol.map_file(b"/system/big", &mut runs).unwrap();
+            let runs = runs[..m.runs].iter().filter(|r| r.device_lba != 0);
+            runs.flat_map(|r| r.device_lba..r.device_lba + r.length as u64).collect::<Vec<_>>()
+        };
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
+        Ext4(&rw).create_file(b"/system", b"big", 0).unwrap();
+        Ext4(&rw).grow_file(b"/system/big", 40960, 0).unwrap();
+        let base = rw.0.into_inner();
+        let all = Failing::after(base.clone(), u64::MAX);
+        let had = blocks(&Ext4(&all));
+        apply_size(&Ext4(&all), &req(RESOLVE_TRUNCATE, b"system/big", 4096), 0).unwrap();
+        for n in 0..all.writes.get() {
+            for once in [true, false] {
+                let rw = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
+                let vol = Ext4(&rw);
+                let sb = read_superblock(&rw).unwrap();
+                let named = match apply_size(&vol, &req(RESOLVE_TRUNCATE, b"system/big", 4096), 0) {
+                    Err(_) => had.clone(),
+                    Ok(_) => blocks(&vol),
+                };
+                let free: Vec<u64> = named.into_iter().filter(|&b| !block_in_use(&rw, &sb, b)).collect();
+                assert!(free.is_empty(), "write {n} refused {}: answered over free blocks {free:?}", once);
+            }
+        }
+    }
+
+    /// **A directory moves into a sibling whose name begins with its own, and never into itself**,
+    /// whatever bytes name the destination: `/abc` is not under `/ab`, and `/abc/./ab/x` is.
+    #[test]
+    fn a_directory_moves_beside_a_name_that_begins_with_its_own_but_never_into_itself() {
+        use crate::test_support::{RwImage, assert_e2fsck_clean};
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
+        let vol = Ext4(&rw);
+        for name in [b"ab" as &[u8], b"abc", b"d", b"dd"] {
+            vol.mkdir_at(2, name, 0).unwrap();
+        }
+        vol.mkdir_at(vol.resolve_dir(b"/ab").unwrap(), b"x", 0).unwrap();
+        assert_eq!(vol.rename_path(b"/ab", b"/abc/ab", false, 0), Ok(None));
+        assert_eq!(vol.rename_path(b"/d", b"/dd/d", false, 0), Ok(None));
+        for into in [b"/abc/./ab/x/ab" as &[u8], b"/abc/ab/ab", b"/abc/ab/x/y"] {
+            assert_eq!(vol.rename_path(b"/abc/ab", into, false, 0), Err(FsError::Unsupported), "{into:?}");
+        }
+        assert_eq!(vol.rename_path(b"/abc", b"/abc/ab/x/abc", false, 0), Err(FsError::Unsupported));
+        assert_e2fsck_clean(&rw.0.into_inner(), "after moves beside and into a directory");
+    }
+
     /// **A name past 255 bytes is no ext4 entry**, whichever call would insert it: an entry's
     /// length is one byte, and a rename to 256 wrote a zero-length name, one to 300 a 44-byte one.
     /// The protocol leaves the length to the filesystem, since FAT's can run to 765 bytes.
@@ -557,3 +650,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod hostile_tests;
+
+#[cfg(test)]
+mod crash_tests;

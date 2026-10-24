@@ -52,7 +52,7 @@ use librsproto::namespace::{
 };
 use librsproto::storage::{
     OP_STORAGE_CHANGED, OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_REREAD, OP_STORAGE_UNMOUNT,
-    build_in_use, parse_mount,
+    build_in_use, build_mounted, parse_mount,
 };
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
@@ -576,6 +576,9 @@ struct Service {
     dirs: Vec<(u64, Listing)>,
 }
 
+/// A request refused: the error, and the reason its reply carries.
+type Refused = (KError, &'static [u8]);
+
 impl Service {
     /// **Read device `id` again.** The boot's probe goes stale as soon as anything writes the
     /// device, a mount of this service's or a raw writer through the `disks` grant, so what reads
@@ -851,8 +854,15 @@ impl Service {
                     return refuse(KError::InvalidArgument, b"a name or label that is not UTF-8");
                 };
                 match self.mount_explicit(device, label) {
-                    Ok(label) => {
-                        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, label.as_bytes(), &[]);
+                    Ok((label, read_only)) => {
+                        let mut body = [0u8; 512];
+                        let why = read_only.as_deref().map(str::as_bytes);
+                        match build_mounted(&mut body, label.as_bytes(), why) {
+                            Some(n) => {
+                                let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &body[..n], &[]);
+                            }
+                            None => refuse(KError::KernelError, b"mounted, but the reply would not encode"),
+                        }
                     }
                     Err((err, why)) => refuse(err, why),
                 }
@@ -902,7 +912,8 @@ impl Service {
         }
     }
 
-    fn mount_explicit(&mut self, device: &str, label: &str) -> Result<String, (KError, &'static [u8])> {
+    /// An administrator's mount: the label, and why it is read-only if its server would only read it.
+    fn mount_explicit(&mut self, device: &str, label: &str) -> Result<(String, Option<String>), Refused> {
         self.refresh_unmounted();
         let taken: Vec<String> = self.mounted.iter().map(|x| x.label.clone()).collect();
         let room = self.mounted.len() < MAX_MOUNTS;
@@ -912,9 +923,15 @@ impl Service {
             return Err((KError::NotFound, b"this service holds no node for it"));
         };
         let m = mount(self.root_ns, &plan, node).map_err(|why| (KError::IoError, why))?;
-        Line::new().s(b"storage-service: mounted ").untrusted(m.label.as_bytes()).s(b" (rw), as asked").end();
+        let found = self.devices.iter().find(|d| d.record.id == plan.device);
+        let read_only = found.and_then(|d| d.found.read_only()).filter(|_| m.mode == Mode::Ro).map(String::from);
+        let (mode, why): (&[u8], &[u8]) = match &read_only {
+            Some(why) => (b" (ro): ", why.as_bytes()),
+            None => (b" (rw), as asked", b""),
+        };
+        Line::new().s(b"storage-service: mounted ").untrusted(m.label.as_bytes()).s(mode).s(why).end();
         self.mounted.push(m);
-        Ok(plan.label)
+        Ok((plan.label, read_only))
     }
 
     /// **An administrator's `Reread`**: device `name` read again after `disk` wrote it and mounted
@@ -1292,6 +1309,9 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     if let Some(m) = mount {
         line.s(b"; ").s(if m.by == By::Init { b"init's".as_slice() } else { b"mounted" });
         line.s(b" at ").untrusted(m.at.as_bytes()).s(if m.mode == Mode::Ro { b" (ro)".as_slice() } else { b" (rw)" });
+        if let Some(why) = d.found.read_only() {
+            line.s(b": ").s(why.as_bytes());
+        }
     } else if let Some(why) = mounts::unmounted_why(d, all) {
         // **Said, not left to an absence**: a gate can then match the reason a device was passed
         // over. The table's `note` gives the same words.

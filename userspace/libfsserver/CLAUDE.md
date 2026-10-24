@@ -40,6 +40,9 @@ servers speak one protocol and a fix to it is a fix to both:
 - **A server that panics exits** (`server::panicked`, which both binaries' handlers call): a
   forwarded resolve has no deadline, so a server spinning in its handler held every client waiting
   on it for ever. An exit closes the endpoint, and the kernel fails each `PeerClosed`.
+- **Every forwarded request is answered**, for the same reason: a reply the kernel did not take
+  is answered with an error and its handles closed (`send_forwarded`, and a directory session's
+  open). Once the kernel takes one, it completes the lookup itself, an install that fails too.
 - **`no_std`, no `alloc`.** The loop's buffers are statics: one set per process, which is one
   server. A library holding them is no different from the binary holding them, since a server is
   one process serving one filesystem.

@@ -109,7 +109,7 @@ fn an_ejected_stick_is_listed_to_be_removed_and_refused_a_mount_or_a_reread() {
 /// started from, or one `init` mounted a filesystem on, a mount of this service's beside it.
 #[test]
 fn a_stick_the_system_runs_from_is_never_ejected() {
-    let ext4 = |l: &str| Found::Ext4 { label: String::from(l), clean: Some(true) };
+    let ext4 = |l: &str| Found::Ext4 { label: String::from(l), clean: Some(true), read_only: None, refused: None };
     let mut ds = with_a_stick(ext4("SIB"));
     ds.push(Device { record: rec(22, DeviceKind::Partition, 7, 20, "root", 4_096), found: ext4("ROOT") });
     let ours = Mounted { device: 21, at: at("SIB"), by: By::Storage, mode: Mode::Rw };
@@ -124,7 +124,8 @@ fn a_stick_the_system_runs_from_is_never_ejected() {
 
 #[test]
 fn an_eject_marks_the_disk_and_its_partitions_and_nothing_else() {
-    let mut ds = with_a_stick(Found::Ext4 { label: String::from("SIB"), clean: Some(true) });
+    let mut ds =
+        with_a_stick(Found::Ext4 { label: String::from("SIB"), clean: Some(true), read_only: None, refused: None });
     let before = ds.clone();
     mark_ejected(&mut ds, 20);
     for (d, was) in ds.iter().zip(&before) {

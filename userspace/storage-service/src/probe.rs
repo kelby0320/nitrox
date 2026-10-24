@@ -6,8 +6,8 @@
 
 use alloc::format;
 use alloc::string::String;
-use fs_server_ext4::BlockReader;
-use fs_server_ext4::ext4::{check_device, volume_label, was_left_clean};
+use fs_server_ext4::ext4::{Unservable, check_device, check_writable, volume_label, was_left_clean};
+use fs_server_ext4::{BlockReader, ReadOnly};
 use fs_server_fat::Fat;
 
 /// What a device holds.
@@ -19,6 +19,12 @@ pub enum Found {
         label: String,
         /// Whether it was left cleanly unmounted; `None` if the state would not read.
         clean: Option<bool>,
+        /// **Why `fs-server-ext4` would only read it**, in its refusal's words, or `None` if it
+        /// would write it too: a feature its writes would leave wrong, a checksum among them.
+        read_only: Option<String>,
+        /// **Why it would serve it not at all**, as FAT's `refused`: a journal to replay, a
+        /// feature it does not read.
+        refused: Option<String>,
     },
     /// A FAT filesystem.
     Fat {
@@ -62,11 +68,19 @@ impl Found {
         }
     }
 
+    /// Why it may only be read, if its server would refuse to write it.
+    pub fn read_only(&self) -> Option<&str> {
+        match self {
+            Found::Ext4 { read_only, .. } => read_only.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The server that would serve it; `None` for nothing, or a FAT its server would refuse.
     pub fn server(&self) -> Option<crate::mounts::Server> {
         use crate::mounts::Server;
         match self {
-            Found::Ext4 { .. } => Some(Server::Ext4),
+            Found::Ext4 { refused: None, .. } => Some(Server::Ext4),
             Found::Fat { refused: None, .. } => Some(Server::Fat),
             _ => None,
         }
@@ -75,11 +89,18 @@ impl Found {
 
 /// What `r` holds.
 pub fn probe<R: BlockReader>(r: &R) -> Found {
-    if check_device(r).is_ok() {
+    // An ext4 its server refuses is still one, and says why, as a FAT does.
+    let ext4 = match check_device(&ReadOnly(r)) {
+        Ok(()) => Some(None),
+        Err(Unservable::NoMagic { .. } | Unservable::Unreadable) => None,
+        Err(why) => Some(Some(format!("{why}"))),
+    };
+    if let Some(refused) = ext4 {
         let mut raw = [0u8; 16];
         let n = volume_label(r, &mut raw).unwrap_or(0);
         let label = String::from_utf8_lossy(&raw[..n]).into_owned();
-        return Found::Ext4 { label, clean: was_left_clean(r).ok() };
+        let read_only = refused.is_none().then(|| check_writable(r).err().map(|why| format!("{why}"))).flatten();
+        return Found::Ext4 { label, clean: was_left_clean(r).ok(), read_only, refused };
     }
     let mut sector = [0u8; 512];
     let recognised = r.read_at(0, &mut sector).ok().and_then(|()| fat_label(&sector));

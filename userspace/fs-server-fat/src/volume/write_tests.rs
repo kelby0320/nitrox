@@ -814,3 +814,64 @@ fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
         }
     }
 }
+
+/// **A truncate stopped at any write is answered with the file as it now is**, as on ext4: an
+/// error kept the kernel on a map whose freed clusters the next file takes, so the answer, an error
+/// or a map, names no cluster the FAT holds free.
+#[test]
+fn a_truncate_stopped_at_any_write_is_answered_with_the_file_as_it_is() {
+    use crate::test_support::Overlay;
+    use librsproto::namespace::{RESOLVE_FILE_LAZY, RESOLVE_TRUNCATE, resolve_request};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    struct Failing {
+        image: Overlay,
+        writes: Cell<u64>,
+        at: u64,
+    }
+    impl BlockReader for Failing {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.image.read_at(offset, buf)
+        }
+    }
+    impl BlockWriter for Failing {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            self.writes.set(self.writes.get() + 1);
+            if self.writes.get() == self.at + 1 {
+                return Err(FsError::Io);
+            }
+            self.image.write_at(offset, buf)
+        }
+    }
+    let mut body = [0u8; 64];
+    let n = resolve_request(&mut body, 0, RESOLVE_TRUNCATE | RESOLVE_FILE_LAZY, b"BIG.BIN").unwrap();
+    body[n..n + 4].copy_from_slice(&4096u32.to_le_bytes());
+    let mut req = [0u8; 256];
+    let len = librsproto::encode(&mut req, librsproto::OP_NS_RESOLVE, 7, 0, &body[..n + 4], 0).unwrap();
+    let img = mformat(16, &["-c", "8"]);
+    put(&img, "BIG.BIN", &[7u8; 40960]);
+    let base = Rc::new(std::fs::read(&img).unwrap());
+    let clusters = |fat: &Fat<'_, Failing>| {
+        let g = *fat.geometry().unwrap();
+        let mut runs = [BlockRun::default(); 8];
+        let m = Volume::map_file(fat, b"/BIG.BIN", &mut runs).unwrap();
+        let sectors = runs[..m.runs].iter().filter(|r| r.device_lba != 0);
+        let at = sectors.flat_map(|r| r.device_lba..r.device_lba + r.length as u64).collect::<BTreeSet<_>>();
+        at.into_iter()
+            .map(|s| 2 + ((s - g.data_start as u64) / g.sectors_per_cluster as u64) as u32)
+            .collect::<BTreeSet<_>>()
+    };
+    let had = clusters(&Fat::new(&Failing { image: Overlay::new(base.clone()), writes: 0.into(), at: u64::MAX }));
+    for at in 0..12 {
+        let disk = Failing { image: Overlay::new(base.clone()), writes: 0.into(), at };
+        let fat = Fat::new(&disk);
+        let named = match libfsserver::serve::apply_size(&fat, &req[..len], NOW) {
+            Err(_) => had.clone(),
+            Ok(_) => clusters(&fat),
+        };
+        let g = *fat.geometry().unwrap();
+        let free: Vec<u32> =
+            named.into_iter().filter(|&c| fat.cache.borrow_mut().next(&disk, &g, c) == Ok(Next::Free)).collect();
+        assert!(free.is_empty(), "write {at} refused: answered over free clusters {free:?}");
+    }
+}

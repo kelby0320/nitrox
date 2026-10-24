@@ -19,8 +19,8 @@ use libkern::syscall::{
     SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_ENUMERATE, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall3,
     syscall4, syscall5, syscall6,
 };
-use librsproto::file::OwnedEntry;
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE};
+use librsproto::file::{DirEntry, OwnedEntry};
 use librsproto::namespace::RENAME_REPLACE;
 use librsproto::session::{Dir, DirError};
 
@@ -569,6 +569,39 @@ pub fn places(home: &str) -> Vec<Place> {
 mod tests {
     use super::*;
 
+    /// **A path is under a directory a component at a time**: `/abc` is not under `/ab`, and a
+    /// copy of `/a` to `/a//b` would copy into itself as surely as to `/a/b`.
+    #[test]
+    fn a_path_is_within_a_directory_a_component_at_a_time() {
+        assert!(within(b"/a/b", b"/a") && within(b"/a", b"/a") && within(b"/a//b/", b"/a/"));
+        assert!(within(b"/a/./b/c", b"/a/b"));
+        assert!(!within(b"/abc", b"/ab") && !within(b"/a", b"/a/b") && !within(b"/b/a", b"/a"));
+    }
+
+    /// The names a walk takes from a listing of `names`, or why it stops.
+    fn walked(names: &[&[u8]], fails: bool) -> Result<Vec<String>, TreeError> {
+        let listed = listing(|f| {
+            for name in names {
+                let e = DirEntry { inode: 1, kind: DIRENT_KIND_FILE, mode: 0, size: 0, mtime: 0, name };
+                if !f(&e) {
+                    break;
+                }
+            }
+            if fails { Err(DirError::Protocol) } else { Ok(()) }
+        });
+        listed.map(|v| v.iter().map(|e| String::from_utf8_lossy(e.name()).into_owned()).collect())
+    }
+
+    /// **A listed name no entry can have stops a walk**, empty or holding a `/`: joined to the
+    /// path it names another file than the one listed, which a copy or a removal would then take.
+    #[test]
+    fn a_listed_name_no_entry_can_have_stops_a_walk() {
+        assert_eq!(walked(&[b".", b"..", b"a", b"b"], false), Ok(vec![String::from("a"), String::from("b")]));
+        assert_eq!(walked(&[b"a", b"x/y", b"b"], false), Err(TreeError::Name));
+        assert_eq!(walked(&[b"a", b""], false), Err(TreeError::Name));
+        assert_eq!(walked(&[b"a"], true), Err(TreeError::ReadDir));
+    }
+
     #[test]
     fn the_places_are_built_from_the_home_they_are_given() {
         let places = places("/home/someone-else");
@@ -737,6 +770,22 @@ pub enum TreeError {
     Unlink,
     /// A directory could not be removed once emptied; `NotEmpty` means an entry appeared mid-walk.
     Rmdir(i32),
+    /// A copy's destination is its source or under it, where the walk would copy what it made.
+    IntoItself,
+    /// A listed name no single entry can have, empty or holding a `/`: joined to the path, it
+    /// would name another file than the one listed.
+    Name,
+}
+
+/// **Whether `path` is `dir` or under it**, a component at a time, so `/abc` is not under `/ab`
+/// and `/a//b` is under `/a`. Textual: it resolves no `..`, which the kernel refuses in a path, and
+/// takes no directory to be bound at two paths, which no namespace here does.
+pub fn within(path: &[u8], dir: &[u8]) -> bool {
+    fn parts(p: &[u8]) -> impl Iterator<Item = &[u8]> {
+        p.split(|&c| c == b'/').filter(|c| !c.is_empty() && *c != b".")
+    }
+    let mut path = parts(path);
+    parts(dir).all(|d| path.next() == Some(d))
 }
 
 /// Enumerate `path`'s children, closing the session before returning.
@@ -745,18 +794,28 @@ pub enum TreeError {
 /// delete through it into another server's tree. Closing first keeps sessions (`MAX_SESSIONS`)
 /// from capping the depth.
 fn children(ns: u64, path: &[u8]) -> Result<Vec<OwnedEntry>, TreeError> {
-    let mut entries: Vec<OwnedEntry> = Vec::new();
     let mut buf = [0u8; 4096];
     let mut dir = Dir::open(ns, path, &mut buf).map_err(|_| TreeError::OpenDir)?;
-    let r = dir.read_dir(|e| {
-        if e.name != b"." && e.name != b".." {
+    let listed = listing(|f| dir.read_dir(f).map(drop));
+    dir.close();
+    listed
+}
+
+/// The entries `list` gives, `.` and `..` left out; [`TreeError::Name`] for a name no entry has.
+fn listing(
+    list: impl FnOnce(&mut dyn FnMut(&DirEntry<'_>) -> bool) -> Result<(), DirError>,
+) -> Result<Vec<OwnedEntry>, TreeError> {
+    let mut entries: Vec<OwnedEntry> = Vec::new();
+    let mut named = true;
+    list(&mut |e| {
+        named = !e.name.is_empty() && !e.name.contains(&b'/');
+        if named && e.name != b"." && e.name != b".." {
             entries.push(OwnedEntry::from_entry(e));
         }
-        true
-    });
-    dir.close();
-    r.map_err(|_| TreeError::ReadDir)?;
-    Ok(entries)
+        named
+    })
+    .map_err(|_| TreeError::ReadDir)?;
+    if named { Ok(entries) } else { Err(TreeError::Name) }
 }
 
 /// Copy `src` to `dst`, recursing if `src` is a directory; `on_file` gets `(src, dst, bytes)`.
@@ -782,6 +841,9 @@ fn copy_tree_at(
 ) -> Result<(), TreeError> {
     if depth > MAX_TREE_DEPTH {
         return Err(TreeError::TooDeep);
+    }
+    if within(dst, src) {
+        return Err(TreeError::IntoItself);
     }
     if !is_dir(ns, src) {
         let bytes = copy_file(ns, src, dst, force).map_err(TreeError::Copy)?;

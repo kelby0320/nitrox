@@ -137,6 +137,7 @@ fn remove_tree(stage: &Stage, path: &[u8], out: &mut Vec<Removed>) {
         Err(TreeError::OpenDir) => stage.die(b"remove: cannot open directory\n", EXIT_FAILURE),
         Err(TreeError::ReadDir) => stage.die(b"remove: cannot read directory\n", EXIT_FAILURE),
         Err(TreeError::Unlink) => stage.die(b"remove: cannot remove file\n", EXIT_FAILURE),
+        Err(TreeError::Name) => stage.die(b"remove: a name in the tree is not one entry's\n", EXIT_FAILURE),
         // The descent emptied the directory first, so `NotEmpty` means something else added an
         // entry meanwhile.
         Err(TreeError::Rmdir(k)) if k == KError::NotEmpty.as_i32() => {

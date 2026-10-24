@@ -7,9 +7,10 @@ the five found before the bash, the trials' unchecked test gaps and doc claims, 
 two bugs, five to fix, one already fixed and three later. Group A fixed 2026-10-22, with sched-7
 and kobj-9 from groups E and B and the test gaps that ride with them; sched-10 stays open for one
 mutation. Group B fixed 2026-10-22: the twelve capability and rights leaks, and the test gap that
-rides with them, kmem-11.** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
-laptop, what PR #365's two trial reviews found that `main` still has, and each `/bug-bash` run, a
-section a subsystem.
+rides with them, kmem-11. Group C's first half fixed 2026-10-23: ext4's findings and those in the
+code both servers share, and fs-3's ext4 half; FAT's follow.** Part D of
+[`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the laptop, what PR #365's two
+trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
 ## How a finding is kept
 
@@ -606,8 +607,13 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   clusters, with write 1 of 2 refused, the retry gave Ok(Some(2)) and release(2) Ok. `OTHER.TXT` took
   cluster 2 and `fsck.fat` said "/OTHER.TXT and /G.TXT share clusters". Lens: error-paths. high.
   **Fix.**
+  ext4's half fixed in `14fbd440`: a file counts its new name before it is written and its old until
+  it is removed, a directory loses its old name first, a failed step is undone, and a rename to a
+  name its file has already does nothing; fails without it:
+  `a_rename_stopped_at_any_write_never_leaves_a_name_reaching_what_is_freed` and
+  `a_rename_to_a_name_its_file_has_already_does_nothing`. FAT's half is the next PR's.
 
-- [ ] **fs-4** `userspace/fs-server-ext4/src/ext4.rs:226` — `parse_superblock` and `check_device`
+- [x] **fs-4** `userspace/fs-server-ext4/src/ext4.rs:226` — `parse_superblock` and `check_device`
   refuse only INCOMPAT_64BIT and blocks over 4 KiB. They accept metadata_csum, an unreplayed
   journal (needs_recovery), meta_bg and bigalloc, and mount them read-write. An ext4 made with
   `mke2fs -t ext4 -O ^64bit` on a removable disk is mounted writable. `mark_mounted` writes
@@ -618,8 +624,16 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   `grow_file` returned Ok. `e2fsck -fn` then failed with "Superblock checksum does not match
   superblock". `check_device` also returned Ok with INCOMPAT_RECOVER (0x4) set. Lens: logic. high.
   **Fix.**
+  Fixed in `16daae29`: an incompat feature the reader does not read, or a journal to replay, refuses
+  the filesystem; a ro_compat feature its writes do not keep, or a missing filetype or extent,
+  refuses a writable mount, and the storage service mounts such a filesystem read-only; fails
+  without it:
+  `a_feature_this_server_cannot_keep_refuses_a_writable_mount_and_one_it_cannot_read_any` and
+  storage-service's `an_ext4_its_server_would_only_read_is_mounted_read_only`. The sweep found an
+  insert writing over a Linux-indexed directory's hash tree, fixed in `e34de7c4`:
+  `a_directory_linux_indexed_is_made_linear_before_a_name_goes_in`.
 
-- [ ] **fs-5** `userspace/fs-server-ext4/src/ext4.rs:1075` — `dir_insert` computes `used =
+- [x] **fs-5** `userspace/fs-server-ext4/src/ext4.rs:1075` — `dir_insert` computes `used =
   round4(8 + name_len)` from the on-disk entry and `rec_len - used` without checking `used <=
   rec_len`. The three sibling scans (`dir_lookup` 346, `read_dir_inner` 492, `dir_remove` 1366) do
   carry their bound. A directory entry whose name_len exceeds its rec_len underflows the
@@ -633,8 +647,13 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   4096". A shallow crafted entry returned Ok and `e2fsck` reported "directory corrupted". The
   crate has no hostile-bytes test, unlike FAT's `garbage_in_any_structure_is_an_error_never_a_panic`.
   Lenses: trust-boundary, tests. high. **Fix.**
+  Fixed in `52e98a89`: every directory scan reads its records through `record`; fails without it:
+  `garbage_in_any_structure_is_an_error_never_a_panic`, new, and
+  `a_record_is_refused_unless_its_length_holds_it`. That test also timed a 364 s request on a file
+  sized past 2^32 blocks, fixed in `cae4645c`:
+  `past_the_last_block_an_extent_can_address_the_rest_is_one_hole`.
 
-- [ ] **fs-6** `userspace/fs-server-ext4/src/ext4.rs:1627` — `dir_repoint` compares `&buf[off + 8..off
+- [x] **fs-6** `userspace/fs-server-ext4/src/ext4.rs:1627` — `dir_repoint` compares `&buf[off + 8..off
   + 8 + name_len]` without checking `off + 8 + name_len <= bs`, so a crafted directory block makes
   the server panic. A directory whose first block ends in an 8-byte entry at offset 4088 with
   name_len 2 and a nonzero inode is moved with `rename_path`. A rename that replaces an existing
@@ -643,8 +662,11 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   of range for slice of length 4096". Reading the replacing-rename path (the trust-boundary
   reviewer's finding) is unverified; a host test feeding `rename_path` a crafted destination
   directory would confirm it. Lenses: logic, trust-boundary. high. **Fix.**
+  Fixed in `52e98a89`, with fs-5; fails without it:
+  `a_record_whose_name_runs_past_its_block_is_an_error_to_rename_over`, which since `14fbd440` also
+  requires the refusal to write nothing.
 
-- [ ] **fs-7** `userspace/fs-server-ext4/src/ext4.rs:1665` — `rename_path` does not limit the
+- [x] **fs-7** `userspace/fs-server-ext4/src/ext4.rs:1665` — `rename_path` does not limit the
   destination leaf to 255 bytes, and `dir_insert` stores `name.len() as u8`, so a long name is cut
   mod 256 and the rename reports success. `create_file`, `mkdir_at` and `rename_at` all check. A
   256-byte name gets name_len 0, so the file vanishes from lookup and listing. A 300-byte name
@@ -655,8 +677,10 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   "Entry '' in /system (13) has a zero-length name". For 300 bytes, `stat_file` of the full name gave
   NotFound and of the 44-byte prefix gave Ok(12288). FAT is not affected. Lenses: logic,
   error-paths. high. **Fix.**
+  Fixed in `3265783c`, PR #392's, whose review's sweep found it again; fails without it:
+  `a_name_past_255_bytes_is_refused_by_every_insert`.
 
-- [ ] **fs-8** `userspace/fs-server-ext4/src/ext4.rs:1512` — `unlink_at` and `rename_path` can
+- [x] **fs-8** `userspace/fs-server-ext4/src/ext4.rs:1512` — `unlink_at` and `rename_path` can
   return Err after the irreversible step, and the orphan they held is lost with the error. In
   `unlink_at`, the name is removed and `drop_link` has produced the inode when `touch_inode(dir)?`
   (an mtime stamp) fails. In `rename_path`, the touches and `adjust_links` after `drop_link` fail
@@ -666,6 +690,10 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   ops, with closures that use `?` as the server does. "unlink: write 1/9 once: Err(Io): Unattached
   inode 17" and "rename_path_replace: write 2/10 once: Err(Io): Unattached inode 18". FAT does not
   have this. Lens: error-paths. medium. **Fix.**
+  Fixed in `14fbd440`: once a change's name has changed nothing after fails it, and the sweep made
+  rmdir, create and mkdir answer so too; fails without it:
+  `a_name_taken_away_returns_what_it_freed_whatever_write_is_refused_after` and
+  `what_a_change_answers_is_what_it_did`.
 
 - [ ] **fs-9** `userspace/fs-server-ext4/src/ext4.rs:1115` — If `dir_insert`'s directory growth
   loses its last write (the inode's new size), nothing undoes it. Once the directory's extent tree
@@ -680,7 +708,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   Some(Some(Corrupt))", and `e2fsck` said "end of extent exceeds allowed value (logical block 6,
   physical block 388, len 1)". Lens: error-paths. medium. **Later.**
 
-- [ ] **fs-10** `userspace/fs-server-ext4/src/ext4.rs:1692` — The guard against moving a directory
+- [x] **fs-10** `userspace/fs-server-ext4/src/ext4.rs:1692` — The guard against moving a directory
   into its own subtree is a byte-prefix test, `new_parent_path.starts_with(old_path)`, with no
   component-boundary check. It refuses a legal move into a sibling whose name starts with the
   source's name. `libfs::rename` maps the resulting Unsupported to CrossDevice, so callers fall
@@ -690,6 +718,9 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   walk `dir::within`. Demonstrated: `rename_path(/ab, /abc/ab)` and `(/d, /dd/d)` returned
   Err(Unsupported). The library-level `/ab` to `/./ab/x` call returned Ok(None) and `e2fsck`
   reported "Entry 'x' in . is a link to '.'". Lenses: logic, error-paths, tests. medium. **Fix.**
+  Fixed in `c2fbace4`: the guard walks up from the new parent by its `..` records; fails without it:
+  `a_directory_moves_beside_a_name_that_begins_with_its_own_but_never_into_itself` and
+  `a_loop_of_parent_records_is_corrupt_to_move_a_directory_into`.
 
 - [ ] **fs-11** `userspace/fs-server-ext4/src/extent.rs:163` — `on_device()` bounds an extent only to
   `[first_data_block, blocks_count)`, so an extent over a group's bitmaps, inode table or GDT, or
@@ -731,7 +762,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   left `cargo test -p fs-server-fat --lib` fully green. No FAT test mentions NotEmpty, though the
   ext4 rmdir test covers it. Lens: tests. medium. **Fix**, with pr365-1.
 
-- [ ] **fs-15** `userspace/fs-server-ext4/src/ext4.rs:804` — The allocator's `start + len <
+- [x] **fs-15** `userspace/fs-server-ext4/src/ext4.rs:804` — The allocator's `start + len <
   capacity` bound and `.min(gfree)` cap in `alloc_run`, and the `!bit_clear` guard in `free_run`,
   are untested. Without the first, a short final group's spare bitmap bits can be allocated as
   blocks past the end of the filesystem. Without the second, the group's free count wraps below
@@ -739,6 +770,8 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   with spare bits clear, or a free count that disagrees with its bitmap, would then get an extent
   off the device. Demonstrated: three mutations, each leaving `cargo test -p fs-server-ext4 --lib`
   green. Lens: tests. medium. **Fix**, with fs-8.
+  Written with fs-8 in `14fbd440`: `the_allocator_keeps_to_the_filesystem_and_to_its_counts`,
+  failing with each of the three guards removed.
 
 - [ ] **fs-16** `userspace/libfsserver/src/cache.rs:195` — `MetaCache::forget` has no test for a
   freed range whose end is not 4 KiB-aligned, and the rounding of the end of the range is
@@ -748,7 +781,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   changing `(offset + len).div_ceil(BLOCK)` to `(offset + len) / BLOCK` left libfsserver,
   fs-server-ext4 and fs-server-fat `--lib` green. Lens: tests. low. **Later.**
 
-- [ ] **fs-17** `userspace/libfsserver/src/server.rs:329` — `maybe_grow` notes only
+- [x] **fs-17** `userspace/libfsserver/src/server.rs:329` — `maybe_grow` notes only
   `FsError::ReadOnly`. Every other create, grow or truncate failure falls through, and the resolve
   answers success with the file mapped at its old size. The spec says the reply's content_len is
   the new size, and the kernel installs the reply's size without comparing. On a full disk, a
@@ -758,16 +791,22 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   ext4 with sub-page blocks, which is the recorded TODO(ext4-subpage-runs). Unverified: boot a
   full 1 KiB-block ext4 and run `copy_file`; it shows whether the copy is reported as success when
   short. Lens: error-paths. low. **Fix.**
+  Fixed in `5be08622`: `libfsserver::serve::apply_size` fails a resolve with each failure, for FAT
+  too; fails without it: `a_resolve_whose_create_grow_or_truncate_fails_answers_the_failure`, and
+  boot-probe's `refused_create_test` with the server's call site swallowing it.
 
-- [ ] **fs-18** `userspace/libfsserver/src/server.rs:614` — When `reply_dir_handle`'s send fails,
+- [x] **fs-18** `userspace/libfsserver/src/server.rs:614` — When `reply_dir_handle`'s send fails,
   `open_dir_session` closes the session and the client endpoint but sends no error reply, while the
   other failure arms reply WouldBlock or KernelError. A forwarded lookup has no deadline, so the
   caller's PendingOperation never completes, and a `Dir::open` in Files, nxsh or a libfs walk waits
   forever with nothing logged. Unverified: injecting a failing `SYS_CHANNEL_SEND` for that reply in
   a boot shows whether the lookup hangs or completes with an error. No existing gate produces the
   trigger (a full queue or kernel out of memory). Lens: error-paths. low. **Fix.**
+  Fixed in `e6f6d404`, with every forwarded reply the kernel did not take; no host test can fail a
+  syscall, so a probe build whose reply carried a handle the kernel refuses showed the boot hang at
+  the open without the fix, and the open answered with it.
 
-- [ ] **fs-19** `userspace/libfs/src/lib.rs:775` — `copy_tree` has no check that the destination
+- [x] **fs-19** `userspace/libfs/src/lib.rs:775` — `copy_tree` has no check that the destination
   lies inside the source, and its listing helpers pass server-supplied names to `join()`
   unchecked. (a) `copy_tree(ns, "/a", "/a/b")` creates `/a/b`, then re-lists `/a`, which now holds
   `b`, and recurses until MAX_TREE_DEPTH (32) fails with TooDeep. That leaves about 32 nested
@@ -777,6 +816,10 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   embedded `/` is not. Unverified: (a) holds by reading, and `copy -r /dir /dir/sub` in a boot
   would confirm it. (b) needs a crafted stick with an entry named `a/b`, and whether a server can
   list such a name is unchecked. libfs has only pure-helper host tests. Lens: tests. low. **Fix.**
+  Fixed in `a0e9c905`: `copy_tree` refuses a destination in its source (`IntoItself`), and the
+  walks' listing a name no entry has (`Name`); fails without it:
+  `a_path_is_within_a_directory_a_component_at_a_time`,
+  `a_listed_name_no_entry_can_have_stops_a_walk`, and boot-probe's `copy_into_itself_test`.
 
 What held up: the kernel's `validate_path` rejects `.`, `..`, empty components and paths over 1024
 bytes before they reach a server, so the path-form calls (`rename_path`, create, grow) never see
