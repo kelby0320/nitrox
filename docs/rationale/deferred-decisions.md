@@ -1401,9 +1401,8 @@ fine: this server writes metadata through at once, and a crash leaves at worst w
 which `fs-server-fat` cannot tell from two files without reading every directory: a rename retried
 finishes, but removing either name frees the clusters the other still names. A mount that leaves
 them itself, a rename whose undo fails, refuses every change after, as Linux's FAT goes read-only.
-Trigger: a
-filesystem that actually comes back inconsistent, or a journal, which needs a replay before a
-mount can trust anything.
+Trigger: a filesystem that actually comes back inconsistent, or a journal, which needs a replay
+before a mount can trust anything.
 
 **Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
 namespace binding to a userspace filesystem carries the rights of the **endpoint handle**

@@ -299,13 +299,10 @@ impl Found {
     }
 }
 
-/// The parts of a short entry a [`Found`] carries. **The cluster's high half is FAT32's alone**: on
-/// FAT12 and FAT16 those bytes were OS/2's extended-attribute index, and are not a cluster.
+/// The parts of a short entry a [`Found`] carries.
 fn found(kind: Kind, dir: Dir, slot: u32, e: &[u8; 32], long: Option<(&[u16], u32)>) -> Found {
     let mut short = [0u8; 11];
     short.copy_from_slice(&e[..11]);
-    let hi = if kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
-    let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
     let mut f = Found {
         dir,
         first_slot: slot,
@@ -313,7 +310,7 @@ fn found(kind: Kind, dir: Dir, slot: u32, e: &[u8; 32], long: Option<(&[u16], u3
         short,
         case: e[12],
         attr: e[11],
-        cluster: (hi << 16) | lo,
+        cluster: cluster(kind, e),
         size: u32::from_le_bytes([e[28], e[29], e[30], e[31]]),
         mtime: crate::time::from_fat(u16::from_le_bytes([e[24], e[25]]), u16::from_le_bytes([e[22], e[23]])),
         long: [0; 255],
@@ -436,6 +433,13 @@ pub fn resolve_dir<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, path:
         Node::Root => Ok(Dir::root(g)),
         Node::Entry(f) => subdir(g, &f),
     }
+}
+
+/// **An entry's first cluster.** The high half is FAT32's alone: on FAT12 and FAT16 those bytes
+/// were OS/2's extended-attribute index, and are not a cluster.
+pub fn cluster(kind: Kind, e: &[u8; 32]) -> u32 {
+    let hi = if kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
+    (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32
 }
 
 /// **Set an entry's first cluster.** The high half is FAT32's alone; FAT12 and FAT16 keep what
@@ -663,8 +667,7 @@ pub fn parent<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir) 
     if &e[..11] != DOTDOT {
         return Err(FsError::Corrupt);
     }
-    let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
-    match (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32 {
+    match cluster(g.kind, &e) {
         0 => Ok(Dir::root(g)),
         c if g.valid_cluster(c) => Ok(Dir::Chain(c)),
         _ => Err(FsError::Corrupt),

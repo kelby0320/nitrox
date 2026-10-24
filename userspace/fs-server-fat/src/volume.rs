@@ -13,7 +13,7 @@
 
 use core::cell::{Cell, RefCell};
 
-use crate::bpb::{self, Geometry, Kind, SECTOR, Unservable};
+use crate::bpb::{self, Geometry, SECTOR, Unservable};
 use crate::dir::{self, ATTR_ARCHIVE, ATTR_DIR, DELETED, DOT, DOTDOT, Dir, ENTRY, Found, MAX_SLOTS, Node};
 use crate::table::{self, Cache, Next};
 use crate::{BlockReader, BlockRun, BlockWriter, FsError};
@@ -91,7 +91,7 @@ pub struct Fat<'a, R> {
     geometry: Result<Geometry, Unservable>,
     cache: RefCell<Cache>,
     /// Whether the unmount leaves the filesystem marked not clean: found so, or a change failed
-    /// on the device or found it corrupt during this mount.
+    /// on the device during this mount. One found corrupt is `broken`, whose unmount writes nothing.
     found_dirty: Cell<bool>,
     /// Whether a change found the filesystem corrupt, or could not undo itself, during this mount:
     /// every later change is then refused, as Linux's FAT remounts itself read-only.
@@ -174,9 +174,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
         }
         let mut e = [0u8; 32];
         self.r.read_meta(g.cluster_sector(c) * SECTOR as u64, &mut e)?;
-        let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
-        let named = (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
-        if &e[..11] != DOT || e[11] & ATTR_DIR == 0 || named != c {
+        if &e[..11] != DOT || e[11] & ATTR_DIR == 0 || dir::cluster(g.kind, &e) != c {
             return Err(FsError::NotFound);
         }
         Ok(d)
@@ -386,10 +384,10 @@ fn split(path: &[u8]) -> Result<(&[u8], &[u8]), FsError> {
 
 impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// **Run a change to the filesystem**: refused on a read-only mount, or one a change found
-    /// corrupt, before anything is read, and the FAT's dirty sectors written at its end. **A failure is written too**: one that is
-    /// not the device's leaves the cache as it found it, or with what it took given back; one that
-    /// is the device's leaves nothing certain; a failed write forgets the cache, so it never holds
-    /// what the device does not.
+    /// corrupt, before anything is read, and the FAT's dirty sectors written at its end. **A
+    /// failure is written too**: one that is not the device's leaves the cache as it found it, or
+    /// with what it took given back; one that is the device's leaves nothing certain; a failed
+    /// write forgets the cache, so it never holds what the device does not.
     fn change<T>(&self, op: impl FnOnce(&Geometry, &mut Cache) -> Result<T, FsError>) -> Result<T, FsError> {
         if self.r.read_only() || self.broken.get() {
             return Err(FsError::ReadOnly);
@@ -402,7 +400,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         }
         let flushed = cache.flush(self.r, g);
         // What the device holds is no longer certain, or not sound: the unmount says so.
-        if flushed.is_err() || matches!(out, Err(FsError::Io | FsError::Corrupt)) {
+        if flushed.is_err() || matches!(out, Err(FsError::Io)) {
             self.found_dirty.set(true);
         }
         if let Err(e) = flushed {
@@ -536,6 +534,8 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// short name: the directory grown first if it must be, and **every FAT change made so far
     /// written before the entries** — a grown directory's link, and a `mkdir`'s cluster, which the
     /// entry names. This one flush is the rule for both. Its first slot and its short entry's.
+    /// **A failed write is taken back**, every slot of the name marked deleted, whether it landed
+    /// or not; if that fails too the name may be on the disk, and the mount refuses changes.
     fn insert(
         &self,
         g: &Geometry,
@@ -547,9 +547,31 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         let mut entries = [[0u8; 32]; dir::MAX_NAME_SLOTS];
         let n = dir::name_entries(self.r, g, cache, d, name, short, &mut entries)? as u32;
         let first = self.place(g, cache, d, n)?;
+        let last = first + n - 1;
         cache.flush(self.r, g)?;
-        dir::rewrite(self.r, g, cache, d, first, first + n - 1, |s, e| *e = entries[(s - first) as usize])?;
-        Ok((first, first + n - 1))
+        if let Err(e) = dir::rewrite(self.r, g, cache, d, first, last, |s, e| *e = entries[(s - first) as usize]) {
+            if dir::rewrite(self.r, g, cache, d, first, last, |_, e| e[0] = DELETED).is_err() {
+                self.broken.set(true);
+            }
+            return Err(e);
+        }
+        Ok((first, last))
+    }
+
+    /// **Mark the name `f` deleted in `d`**, a write per run of adjacent slots. **A failed write
+    /// is undone** — every slot written back as it was, whether that write landed or not — and the
+    /// error says whether the undo was written, so the name is whole again.
+    fn unname(&self, g: &Geometry, cache: &mut Cache, d: Dir, f: &Found) -> Result<(), (FsError, bool)> {
+        let mut was = [[0u8; 32]; dir::MAX_NAME_SLOTS];
+        for (k, w) in was.iter_mut().enumerate().take((f.slot - f.first_slot + 1) as usize) {
+            *w = self.raw_entry(g, cache, d, f.first_slot + k as u32).map_err(|e| (e, true))?;
+        }
+        let Err(e) = dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |_, e| e[0] = DELETED) else {
+            return Ok(());
+        };
+        let back =
+            dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |s, e| *e = was[(s - f.first_slot) as usize]);
+        Err((e, back.is_ok()))
     }
 
     fn find(&self, g: &Geometry, cache: &mut Cache, d: Dir, name: &[u8]) -> Result<Option<Found>, FsError> {
@@ -583,6 +605,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             if size <= f.size as usize {
                 return Ok(f.size as u64);
             }
+            let entry = self.raw_entry(g, cache, f.dir, f.slot)?;
             let size = u32::try_from(size).map_err(|_| FsError::TooLarge)?;
             let (old, new_end) = (f.size as u64, size as u64);
             let cb = g.cluster_bytes() as u64;
@@ -632,7 +655,11 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 })
             })();
             if let Err(e) = grown {
-                if let Some(t) = taken {
+                // The entry's own write may have landed: it is written back first, and only then
+                // is what was taken given back. Else it is kept, the file's or lost, never free.
+                if dir::rewrite(self.r, g, cache, f.dir, f.slot, f.slot, |_, e| *e = entry).is_ok()
+                    && let Some(t) = taken
+                {
                     self.give_back(g, cache, linked, t)?;
                 }
                 return Err(e);
@@ -712,7 +739,8 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 self.insert(g, cache, d, name, |s| dir::short_entry(g.kind, s, ATTR_DIR, new, 0, now)).map(drop)
             };
             let out = made();
-            if out.is_err() {
+            // Not if a name may still reach it: `insert` could not take back a failed write.
+            if out.is_err() && !self.broken.get() {
                 cache.free_chain(self.r, g, new)?;
             }
             out
@@ -729,7 +757,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             if f.is_dir() {
                 return Err(FsError::Unsupported);
             }
-            dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |_, e| e[0] = DELETED)?;
+            self.unname(g, cache, d, &f).map_err(|(e, _)| e)?;
             Ok(self.removed(&f))
         })
     }
@@ -754,7 +782,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 return Err(FsError::NotEmpty);
             }
             freeing(sub.id());
-            dir::rewrite(self.r, g, cache, d, f.first_slot, f.slot, |_, e| e[0] = DELETED)?;
+            self.unname(g, cache, d, &f).map_err(|(e, _)| e)?;
             cache.free_chain(self.r, g, f.cluster)
         })
     }
@@ -776,8 +804,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             let id = u32::try_from(id).map_err(|_| FsError::NotFound)?;
             let (d, slot) = self.ids.borrow().get(id).ok_or(FsError::NotFound)?;
             let e = self.raw_entry(g, cache, d, slot)?;
-            let hi = if g.kind == Kind::Fat32 { u16::from_le_bytes([e[20], e[21]]) as u32 } else { 0 };
-            let cluster = (hi << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
+            let cluster = dir::cluster(g.kind, &e);
             let live = e[0] != 0
                 && e[0] != DELETED
                 && e[11] & 0x3F != dir::ATTR_LONG
@@ -875,10 +902,17 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             Some(t) => {
                 let was = self.raw_entry(g, cache, nd, t.slot)?;
                 // Everything but the name, and the case bits that belong to the name.
-                dir::rewrite(self.r, g, cache, nd, t.slot, t.slot, |_, e| {
+                let made = dir::rewrite(self.r, g, cache, nd, t.slot, t.slot, |_, e| {
                     e[11] = raw[11];
                     e[13..].copy_from_slice(&raw[13..]);
-                })?;
+                });
+                if let Err(e) = made {
+                    // Written back whether it landed or not; else the file may be under both names.
+                    if dir::rewrite(self.r, g, cache, nd, t.slot, t.slot, |_, e| *e = was).is_err() {
+                        self.broken.set(true);
+                    }
+                    return Err(e);
+                }
                 ((t.slot, t.slot), Some(was))
             }
             None => (
@@ -894,35 +928,36 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
                 None,
             ),
         };
-        let done = (|| {
-            if let Some((sub, _)) = dotdot {
-                dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| {
-                    dir::set_cluster(g.kind, e, dir::dotdot_cluster(g, nd))
-                })?;
-            }
-            dir::rewrite(self.r, g, cache, od, src.first_slot, src.slot, |_, e| e[0] = DELETED)
-        })();
-        if let Err(e) = done {
-            let undone = (|| -> Result<(), FsError> {
-                if let Some((sub, old)) = dotdot {
-                    dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| *e = old)?;
-                }
-                match (target, was) {
-                    (Some(_), Some(was)) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.0, |_, e| *e = was),
-                    (None, _) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.1, |_, e| e[0] = DELETED),
-                    _ => Ok(()),
-                }
-            })();
-            // The file may be left under both names, and removing either would free what the
+        let repointed = match dotdot {
+            Some((sub, _)) => dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| {
+                dir::set_cluster(g.kind, e, dir::dotdot_cluster(g, nd))
+            }),
+            None => Ok(()),
+        };
+        // The old name, last: `unname` says whether a failed deletion was undone.
+        let done = repointed.map_err(|e| (e, true)).and_then(|()| self.unname(g, cache, od, &src));
+        if let Err((e, whole)) = done {
+            // With the old name whole, what was written for the new one is undone, last first.
+            let undone = whole
+                && (|| -> Result<(), FsError> {
+                    if let Some((sub, old)) = dotdot {
+                        dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| *e = old)?;
+                    }
+                    match (target, was) {
+                        (Some(_), Some(was)) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.0, |_, e| *e = was),
+                        (None, _) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.1, |_, e| e[0] = DELETED),
+                        _ => Ok(()),
+                    }
+                })()
+                .is_ok();
+            // Else the file may be under both names, and removing either would free what the
             // other holds.
-            if undone.is_err() {
+            if !undone {
                 self.broken.set(true);
             }
-            return undone.and(Err(e));
+            return Err(e);
         }
-        if !moved {
-            self.ids.borrow_mut().moved(src.cluster, nd, slots.1);
-        }
+        self.ids.borrow_mut().moved(src.cluster, nd, slots.1);
         Ok(target.filter(|_| !twice).and_then(|t| self.removed(&t)))
     }
 }

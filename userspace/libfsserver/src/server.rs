@@ -774,7 +774,7 @@ fn serve_loop<V: Volume>(vol: &V, serve_end: u64, device: u64) -> ! {
         if !told && vol.refusing_changes() {
             told = true;
             kprint(
-                b"fs-server: a change found the filesystem corrupt; refusing every change until it is mounted again\n",
+                b"fs-server: a change found the filesystem corrupt, or could not be undone; refusing every change until it is mounted again\n",
             );
         }
         // `count ≤ MAX_WAIT_HANDLES`: while the control channel is open, a session never takes

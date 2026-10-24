@@ -36749,7 +36749,11 @@ differently is here:
   refused for a failed write leaves the bit as it was found, FSInfo now written first.
 - **A failed FAT change gives back what it took and undoes what it wrote**: an allocation, a grow
   and a directory grown give back their clusters, the link to them undone and written before the
-  frees; a rename is undone, last write first. A removal that fails may still lose clusters, since
+  frees; a rename is undone, last write first. **A write that fails may have landed**, so an undo
+  writes back what was there, whichever it was, and what was taken is given back only once that is
+  written; where it cannot be, what was taken is kept, lost at worst, and the mount refuses
+  changes if a file may be under two names. A name is made and unmade whole, a long name across
+  two directory clusters included. A removal that fails may still lose clusters, since
   it writes its entry before it frees, which a check reclaims. **An allocation passes over a
   reserved FAT entry**, as Linux does, where one such entry made the volume unwritable.
 - **A rename finding its file under both names finishes it**, deleting the old name and releasing

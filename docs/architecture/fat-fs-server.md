@@ -113,7 +113,14 @@ to lose.
 reclaims, and never gives one cluster to two files — the one exception a rename's, below, which
 leaves one file under two names. **A host test crashes each change after every write it makes**,
 and checks what a crash there would leave: each flush that orders the writes is one its removal
-fails (PR #365 review, finding 2):
+fails (PR #365 review, finding 2).
+
+**A write that fails may have landed**, as a device may answer `Io` for a write it made. So a
+change undoes a failed write by writing back what was there, whichever it was, and gives back
+what it took only once that undo is written; where the undo cannot be written either, it keeps
+what it took — a cluster lost at worst, never free under a name — and refuses changes after (§ 6)
+where a file may be left under two names (pre-Phase-7 Part D). A host test fails each change's
+writes in turn: refused, landed, and landed with the undo lost or not:
 - **A grow** zeroes what it adds on the device first: what the file's own clusters held past its
   end, and every cluster it takes. Then it writes the new chain to the FAT, links it to the file's
   last cluster and writes that, and only then writes the entry's size and first cluster. Its reply
@@ -132,9 +139,9 @@ Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
   allocation, or past the file's own last cluster — so a grow's clusters are contiguous wherever
   the free space is. **All or nothing**: a volume that runs out gives back what it took, and the
   grow is `TooLarge`, as a full ext4's is. **A grow, or a directory grown, that then fails** —
-  its zeroing, the FAT's write, the link or the entry — gives back what it took too, the link
-  undone and written before the frees, so no crash leaves a chain reaching a free cluster
-  (pre-Phase-7 Part D). **Any entry not free is a cluster in use**, as Linux reads it, a reserved
+  its zeroing, the FAT's write, the link or the entry — gives back what it took too: the entry
+  written back as it was, then the link undone and written before the frees, so no crash leaves
+  a chain reaching a free cluster (pre-Phase-7 Part D). **Any entry not free is a cluster in use**, as Linux reads it, a reserved
   value too: a walk through one refuses it, but an allocation passes over it.
 - **Zeroing is in 64 KiB writes**, contiguous clusters merged.
 - **The FAT's sectors are cached**, 64 of them. A change marks its sectors dirty, and they are
@@ -162,8 +169,11 @@ Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
 - **A rename** writes the new name first — new entries, or a replaced file's entry pointed at the
   source — then a moved directory's `..`, then deletes the old name, so a crash leaves the file
   under both names rather than neither, and a moved directory's `..` never names a parent that
-  lost it. **A failed step is undone**, last first, and a `..` that is not one is `Corrupt`
-  before anything is written. **A rename finding its file under both names finishes** — the old
+  lost it. **A failed step is undone**, last first — the new name's slots marked deleted, a
+  replaced entry and `..` written back, and the old name's slots too, as a long name across two
+  clusters is deleted in two writes — and a `..` that is not one is `Corrupt` before anything is
+  written. A name being made, by a create or a `mkdir` too, is taken back whole when one of its
+  writes fails. **A rename finding its file under both names finishes** — the old
   name deleted, nothing released — where a retry once released the file under its new name
   (pre-Phase-7 Part D). Removing one of the two names before then still frees what the other
   holds: finding them is a check's (`TODO(fs-repair)`). A rename whose undo fails too leaves them
@@ -189,11 +199,13 @@ one, **and so is one a change failed on the device, or found corrupt, during the
 can make one. ext4's server clears it; that is ext4's to revisit.
 
 **A mount that finds the filesystem corrupt refuses every change after** (pre-Phase-7 Part D), as
-Linux's FAT remounts itself read-only: once a change answers `Corrupt`, or a rename's undo fails and
-leaves a file under two names, removing either of which would free what the other holds. Every
+Linux's FAT remounts itself read-only: once a change answers `Corrupt`, or an undo fails where a
+file may be left under two names, removing either of which would free what the other holds. Every
 later change is refused as on a read-only mount, `NoAccess` with "read-only mount"; a file resolved
 after is marked `FILE_BLOCKS_READ_ONLY`; the unmount writes nothing, so the bit stays set; and the
 server says so once. A failed write alone refuses nothing, and the next mount changes it again.
+**A file resolved before then keeps the access it was given**: the kernel still writes back what
+it holds dirty of one, to the clusters that file holds, its sync at the unmount included.
 
 **FAT32's FSInfo free count is unknown while mounted** — set to `0xFFFFFFFF` at mount, which
 `fsck.fat` accepts — and counted off the FAT at the unmount, before the state byte, with the

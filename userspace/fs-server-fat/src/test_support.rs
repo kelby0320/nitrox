@@ -103,21 +103,34 @@ impl BlockWriter for Overlay {
     }
 }
 
-/// **An [`Overlay`] whose writes fail**: the `n`th alone, or every one from it on. A refused write
-/// is `Io` and changes nothing.
+/// **An [`Overlay`] whose writes fail**, from the `n`th on, for as many as asked. A refused write
+/// is `Io` and changes nothing; a **landed** one is `Io` too, but made, as a device may have made a
+/// write it answers with an error. Only the `n`th lands.
 pub(crate) struct Failing {
     pub image: Overlay,
     pub writes: std::cell::Cell<u64>,
     at: u64,
-    once: bool,
+    until: u64,
+    lands: bool,
 }
 
 impl Failing {
     pub fn once(base: std::rc::Rc<Vec<u8>>, n: u64) -> Failing {
-        Failing { image: Overlay::new(base), writes: 0.into(), at: n, once: true }
+        Failing { image: Overlay::new(base), writes: 0.into(), at: n, until: n.saturating_add(1), lands: false }
     }
     pub fn after(base: std::rc::Rc<Vec<u8>>, n: u64) -> Failing {
-        Failing { once: false, ..Failing::once(base, n) }
+        Failing { until: u64::MAX, ..Failing::once(base, n) }
+    }
+    pub fn landed(base: std::rc::Rc<Vec<u8>>, n: u64) -> Failing {
+        Failing { lands: true, ..Failing::once(base, n) }
+    }
+    /// The `n`th write landed and the next refused, then all made: an undo lost, and what follows not.
+    pub fn landed_then_one(base: std::rc::Rc<Vec<u8>>, n: u64) -> Failing {
+        Failing { lands: true, until: n.saturating_add(2), ..Failing::once(base, n) }
+    }
+    /// The `n`th write landed, and every one after it refused: an undo that cannot be written.
+    pub fn landed_then_after(base: std::rc::Rc<Vec<u8>>, n: u64) -> Failing {
+        Failing { lands: true, until: u64::MAX, ..Failing::once(base, n) }
     }
 }
 
@@ -131,7 +144,10 @@ impl BlockWriter for Failing {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
         let i = self.writes.get();
         self.writes.set(i + 1);
-        if i == self.at || (!self.once && i > self.at) {
+        if (self.at..self.until).contains(&i) {
+            if self.lands && i == self.at {
+                self.image.write_at(offset, buf)?;
+            }
             return Err(FsError::Io);
         }
         self.image.write_at(offset, buf)

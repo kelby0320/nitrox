@@ -3,6 +3,7 @@
 //! it spinning in its panic handler with a resolve waiting on it for ever.
 
 use super::*;
+use crate::bpb::Kind;
 use crate::test_support::{FileImage, Overlay, mformat, mkfs, mmd, put};
 use std::rc::Rc;
 
