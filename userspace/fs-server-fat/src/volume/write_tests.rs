@@ -760,28 +760,8 @@ fn a_directory_is_read_from_the_device_once_through_the_cache() {
 /// and its first cluster not the next directory's. A refusal gives nothing.
 #[test]
 fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
-    use crate::test_support::{Overlay, mmd};
-    use std::cell::Cell;
+    use crate::test_support::{Failing, mmd};
     use std::rc::Rc;
-    struct Failing {
-        image: Overlay,
-        writes: Cell<u64>,
-        at: u64,
-    }
-    impl BlockReader for Failing {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-            self.image.read_at(offset, buf)
-        }
-    }
-    impl BlockWriter for Failing {
-        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
-            self.writes.set(self.writes.get() + 1);
-            if self.writes.get() == self.at + 1 {
-                return Err(FsError::Io);
-            }
-            self.image.write_at(offset, buf)
-        }
-    }
     let img = mformat(16, &["-c", "8"]);
     mmd(&img, "full");
     mmd(&img, "full/inner");
@@ -800,7 +780,7 @@ fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
 
     let image = Rc::new(std::fs::read(&img).unwrap());
     for n in 0.. {
-        let f = Failing { image: Overlay::new(image.clone()), writes: 0.into(), at: n };
+        let f = Failing::once(image.clone(), n);
         let mut given = None;
         let r = Volume::rmdir_at(&Fat::new(&f), root, b"gone", NOW, |id| given = Some(id));
         let after = Fat::new(&f.image);
@@ -824,29 +804,9 @@ fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
 /// or a map, names no cluster the FAT holds free.
 #[test]
 fn a_truncate_stopped_at_any_write_is_answered_with_the_file_as_it_is() {
-    use crate::test_support::Overlay;
+    use crate::test_support::Failing;
     use librsproto::namespace::{RESOLVE_FILE_LAZY, RESOLVE_TRUNCATE, resolve_request};
-    use std::cell::Cell;
     use std::rc::Rc;
-    struct Failing {
-        image: Overlay,
-        writes: Cell<u64>,
-        at: u64,
-    }
-    impl BlockReader for Failing {
-        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-            self.image.read_at(offset, buf)
-        }
-    }
-    impl BlockWriter for Failing {
-        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
-            self.writes.set(self.writes.get() + 1);
-            if self.writes.get() == self.at + 1 {
-                return Err(FsError::Io);
-            }
-            self.image.write_at(offset, buf)
-        }
-    }
     let mut body = [0u8; 64];
     let n = resolve_request(&mut body, 0, RESOLVE_TRUNCATE | RESOLVE_FILE_LAZY, b"BIG.BIN").unwrap();
     body[n..n + 4].copy_from_slice(&4096u32.to_le_bytes());
@@ -865,9 +825,9 @@ fn a_truncate_stopped_at_any_write_is_answered_with_the_file_as_it_is() {
             .map(|s| 2 + ((s - g.data_start as u64) / g.sectors_per_cluster as u64) as u32)
             .collect::<BTreeSet<_>>()
     };
-    let had = clusters(&Fat::new(&Failing { image: Overlay::new(base.clone()), writes: 0.into(), at: u64::MAX }));
+    let had = clusters(&Fat::new(&Failing::once(base.clone(), u64::MAX)));
     for at in 0..12 {
-        let disk = Failing { image: Overlay::new(base.clone()), writes: 0.into(), at };
+        let disk = Failing::once(base.clone(), at);
         let fat = Fat::new(&disk);
         let named = match libfsserver::serve::apply_size(&fat, &req[..len], NOW) {
             Err(_) => had.clone(),
