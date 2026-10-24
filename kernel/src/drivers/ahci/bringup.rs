@@ -1,0 +1,216 @@
+use super::*;
+
+/// Probe and initialise an AHCI controller `DeviceNode`, publishing its first SATA disk; returns
+/// its fate (claimed, or declined with why).
+pub fn init(controller: &ObjectRef) -> Outcome {
+    // SAFETY: `controller` pins a live `DeviceNode`.
+    let dn: &DeviceNode = unsafe { &*(controller.as_ptr() as *const DeviceNode) };
+    let desc = dn.descriptor();
+
+    // BAR5 is the ABAR (AHCI 1.3). Map it uncached.
+    let bar = desc.bars[5];
+    if bar.size == 0 {
+        crate::kprintln!("ahci: controller has no ABAR (BAR5)");
+        return declined("the controller has no ABAR (BAR5)");
+    }
+    let pages = bar.size.div_ceil(crate::mm::PAGE_SIZE as u64).max(1);
+    // SAFETY: `bar.base` is the controller's MMIO ABAR from PCI BAR sizing.
+    let abar = match unsafe { kvmap::map_mmio(PhysAddr(bar.base), pages) } {
+        Ok(va) => va.as_u64() + (bar.base & (crate::mm::PAGE_SIZE as u64 - 1)),
+        Err(_) => {
+            crate::kprintln!("ahci: ABAR map failed");
+            return declined("its ABAR could not be mapped");
+        }
+    };
+
+    write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_AE);
+    let pi = read32(abar, HBA_PI);
+    let cap = read32(abar, HBA_CAP);
+    crate::kprintln!("ahci: HBA up (CAP {:#010x}, PI {:#010x})", cap, pi);
+
+    // The driver writes 64-bit addresses into the command list, the FIS base and every PRDT entry.
+    // An HBA without `S64A` would take the low half and DMA to the wrong place, so decline it.
+    if cap & CAP_S64A == 0 {
+        crate::kprintln!("ahci: HBA lacks 64-bit addressing (CAP.S64A clear) — declining");
+        return declined("no 64-bit addressing (CAP.S64A clear)");
+    }
+
+    let mut port = u32::MAX;
+    for p in 0..32u32 {
+        if pi & (1 << p) == 0 {
+            continue;
+        }
+        let pb = abar + PORT_BASE + p as u64 * PORT_STRIDE;
+        if read32(pb, PX_SSTS) & 0xF == SSTS_DET_PRESENT && read32(pb, PX_SIG) == SIG_SATA {
+            port = p;
+            break;
+        }
+    }
+    if port == u32::MAX {
+        crate::kprintln!("ahci: no SATA disk on any implemented port");
+        return declined(NO_SATA_DISK);
+    }
+    let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
+
+    let cfg = match crate::pci::Config::map(desc) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            crate::kprintln!(
+                "ahci: config space unreachable ({:?}) — INTx, and DMA is left relying on \
+                 whatever the firmware set",
+                e
+            );
+            None
+        }
+    };
+
+    // **Bus mastering must be enabled before anything DMAs**: `start_port` sets FRE (the HBA then
+    // writes received FISes to memory) and `identify` has it fetch a command list and a PRDT and
+    // write 512 bytes back. Firmware that left the bit clear would otherwise time `identify` out.
+    // Say which happened: leaving it on is a property of the firmware.
+    if let Some(cfg) = &cfg {
+        if crate::pci::enable_bus_master(cfg) {
+            crate::kprintln!("ahci: bus master already enabled by firmware");
+        } else {
+            crate::kprintln!("ahci: bus master enabled by the driver");
+        }
+    }
+
+    let cmd_list = match DmaBuffer::alloc(1024) {
+        Ok(b) => b,
+        Err(_) => return declined(OUT_OF_MEMORY),
+    };
+    let fis = match DmaBuffer::alloc(256) {
+        Ok(b) => b,
+        Err(_) => return declined(OUT_OF_MEMORY),
+    };
+    let cmd_table = match DmaBuffer::alloc(CMD_TABLE_BYTES) {
+        Ok(b) => b,
+        Err(_) => return declined(OUT_OF_MEMORY),
+    };
+
+    stop_port(port_base);
+    write32(port_base, PX_CLB, cmd_list.phys().as_u64() as u32);
+    write32(port_base, PX_CLBU, (cmd_list.phys().as_u64() >> 32) as u32);
+    write32(port_base, PX_FB, fis.phys().as_u64() as u32);
+    write32(port_base, PX_FBU, (fis.phys().as_u64() >> 32) as u32);
+    write32(port_base, PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
+    write32(port_base, PX_IS, 0xFFFF_FFFF);
+    write32(port_base, PX_IE, PXIE_DHRE | PXIE_TFEE);
+    start_port(port_base);
+
+    let intr = match InterruptObject::try_new() {
+        // SAFETY: `into_raw` yields the box's single creation reference, which this adopts.
+        Ok(io) => unsafe { ObjectRef::from_raw(KBox::into_raw(io).as_ptr() as *mut (), KObjectType::InterruptObject) },
+        Err(_) => return declined(OUT_OF_MEMORY),
+    };
+    let intr_ptr = intr.as_ptr();
+    core::mem::forget(intr);
+
+    let disk = AhciDisk {
+        abar,
+        port_base,
+        port,
+        cmd_list,
+        _fis: fis,
+        cmd_table,
+        sectors: 0,
+        flush_command: ATA_FLUSH_CACHE,
+        inflight: AtomicPtr::new(core::ptr::null_mut()),
+        pending: IrqSpinLock::new(LockRank::Leaf, PendingRing::new()),
+        intr: intr_ptr,
+        issued_at: AtomicU64::new(0),
+        counted: Counted::new(),
+    };
+    let disk = match KBox::try_new(disk) {
+        Ok(b) => KBox::into_raw(b).as_ptr(), // leak to 'static
+        Err(_) => return declined(OUT_OF_MEMORY),
+    };
+    AHCI.store(disk, Ordering::Release);
+
+    let mut name = [0u8; MAX_DEVICE_NAME];
+    // SAFETY: `disk` is the just-published live state.
+    let (sectors, name_len, flush) = match unsafe { identify(&mut *disk, &mut name) } {
+        Some(s) => s,
+        None => {
+            crate::kprintln!("ahci: IDENTIFY failed on port {}", port);
+            return declined("IDENTIFY failed");
+        }
+    };
+    // SAFETY: exclusive at bring-up (no IRQ, no other CPU).
+    unsafe {
+        (*disk).sectors = sectors;
+        (*disk).flush_command = flush;
+    }
+    crate::kprintln!(
+        "ahci: port {} disk ready ({} sectors, {} MiB): {}",
+        port,
+        sectors,
+        sectors * SECTOR_SIZE as u64 / (1024 * 1024),
+        Printable(&name[..name_len])
+    );
+    // Its own line: the one above is matched by a gate.
+    crate::kprintln!(
+        "ahci: port {} flushes with {}",
+        port,
+        if flush == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" }
+    );
+
+    // Prefer MSI: it does not depend on the PCI interrupt-line register, which QEMU's firmware
+    // programs and real UEFI often leaves meaningless. INTx is the fallback.
+    let mut signal = None;
+    if let Some(cfg) = &cfg
+        && let Some(msi) = crate::pci::read_msi(cfg)
+    {
+        // SAFETY: ring-0, post-Irq::init; `isr` stays valid for the kernel's
+        // lifetime, and nothing can be delivered until the message is written.
+        match unsafe { crate::arch::IrqInstall::install_msi(isr) } {
+            // SAFETY: the handler for `msg.vector` was just registered, so
+            // the device may write the message from here on.
+            Some(msg) if unsafe { crate::pci::program_msi(cfg, &msi, msg.address, msg.data) } => {
+                // MSI does not suppress INTx, and a device able to do both
+                // would assert a line nothing is listening on.
+                crate::pci::set_intx_disabled(cfg, true);
+                crate::kprintln!(
+                    "ahci: irq via MSI (vec {:#04x}, addr {:#x}, data {:#06x}, {}-bit cap at {:#04x})",
+                    msg.vector,
+                    msg.address,
+                    msg.data,
+                    if msi.addr64 { 64 } else { 32 },
+                    msi.off
+                );
+                signal = Some(Signal::Msi { vector: msg.vector });
+            }
+            Some(_) => crate::kprintln!(
+                "ahci: MSI declined — the capability cannot hold the message address; \
+                     falling back"
+            ),
+            None => crate::kprintln!("ahci: MSI declined — this CPU cannot be named in a message; falling back"),
+        }
+    }
+    let signal = match signal {
+        Some(signal) => signal,
+        None => {
+            // The GSI comes from the PCI interrupt-line register (firmware-programmed
+            // on QEMU; ACPI `_PRT` routing is deferred).
+            let gsi = desc.interrupt.line as u32;
+            // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the
+            // kernel's lifetime.
+            let vec = unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) };
+            if let Some(cfg) = &cfg {
+                crate::pci::set_intx_disabled(cfg, false);
+            }
+            crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vec);
+            Signal::Intx { gsi, vector: vec }
+        }
+    };
+
+    write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
+    write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
+
+    if publish_disk(controller, sectors, &name[..name_len], disk) {
+        Outcome::Claimed { driver: DRIVER, signal }
+    } else {
+        declined("the disk's device node could not be allocated")
+    }
+}
