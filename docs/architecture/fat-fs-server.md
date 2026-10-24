@@ -167,13 +167,15 @@ Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
 ## 6. How a filesystem was left
 
 **The dirty bit is the boot sector's state byte**: bit 0 of the byte at `0x25` on FAT12 and FAT16,
-`0x41` on FAT32, which `fsck.fat` and Linux read. A writable mount sets it before `Ready`, and an
+`0x41` on FAT32, which `fsck.fat` and Linux read. A writable mount sets it before `Ready`, as its
+last write, after FSInfo's, so a mount refused for a failed write leaves the bit as found; and an
 unmount clears it as its last write.
 
 **A filesystem found dirty is reported, served, and left dirty by its unmount**, as Linux leaves
-one. Nothing here repairs a filesystem (`TODO(fs-repair)`), so clearing the bit would hide that it
-needs a check from the next system that can make one. ext4's server clears it; that is ext4's to
-revisit.
+one, **and so is one a change failed on the device, or found corrupt, during the mount**
+(pre-Phase-7 Part D): what is on the device is no longer certain. Nothing here repairs a filesystem
+(`TODO(fs-repair)`), so clearing the bit would hide that it needs a check from the next system that
+can make one. ext4's server clears it; that is ext4's to revisit.
 
 **FAT32's FSInfo free count is unknown while mounted** — set to `0xFFFFFFFF` at mount, which
 `fsck.fat` accepts — and counted off the FAT at the unmount, before the state byte, with the

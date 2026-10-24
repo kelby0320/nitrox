@@ -90,7 +90,8 @@ pub struct Fat<'a, R> {
     r: &'a R,
     geometry: Result<Geometry, Unservable>,
     cache: RefCell<Cache>,
-    /// Whether the filesystem was found not cleanly unmounted, so its unmount leaves it so.
+    /// Whether the unmount leaves the filesystem marked not clean: found so, or a change failed
+    /// on the device or found it corrupt during this mount.
     found_dirty: Cell<bool>,
     /// Where the next allocation's search begins: FAT32's next-free hint, then past the last.
     hint: Cell<u32>,
@@ -392,7 +393,12 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         let g = self.geometry()?;
         let mut cache = self.cache.borrow_mut();
         let out = op(g, &mut cache);
-        if let Err(e) = cache.flush(self.r, g) {
+        let flushed = cache.flush(self.r, g);
+        // What the device holds is no longer certain, or not sound: the unmount says so.
+        if flushed.is_err() || matches!(out, Err(FsError::Io | FsError::Corrupt)) {
+            self.found_dirty.set(true);
+        }
+        if let Err(e) = flushed {
             cache.clear();
             return out.and(Err(e));
         }
@@ -409,19 +415,15 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         Ok((sig(0) == 0x4161_5252 && sig(484) == 0x6141_7272 && sig(508) == 0xAA55_0000).then_some(s))
     }
 
-    /// **Record the filesystem mounted**, before `Ready`: the state byte's bit set, and FAT32's free
-    /// count made unknown, since it is not kept while mounted. A filesystem found with the bit set
-    /// is remembered as not cleanly unmounted.
+    /// **Record the filesystem mounted**, before `Ready`: FAT32's free count made unknown, since it
+    /// is not kept while mounted, then the state byte's bit set, last, so a mount refused for a
+    /// failed write leaves the bit as found. A filesystem found with the bit set is remembered as
+    /// not cleanly unmounted.
     pub fn mark_mounted(&self) -> Result<(), FsError> {
         if self.r.read_only() {
             return Err(FsError::ReadOnly);
         }
         let g = self.geometry()?;
-        let mut b = [0u8; 1];
-        self.r.read_at(g.state_at as u64, &mut b)?;
-        self.found_dirty.set(b[0] & 1 != 0);
-        b[0] |= 1;
-        self.r.write_at(g.state_at as u64, &b)?;
         if let Some(mut info) = self.fsinfo(g)? {
             let next = u32::from_le_bytes([info[492], info[493], info[494], info[495]]);
             if g.valid_cluster(next) {
@@ -430,6 +432,11 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             info[488..492].copy_from_slice(&u32::MAX.to_le_bytes());
             self.r.write_at(g.fsinfo as u64 * SECTOR as u64, &info)?;
         }
+        let mut b = [0u8; 1];
+        self.r.read_at(g.state_at as u64, &mut b)?;
+        self.found_dirty.set(b[0] & 1 != 0);
+        b[0] |= 1;
+        self.r.write_at(g.state_at as u64, &b)?;
         Ok(())
     }
 

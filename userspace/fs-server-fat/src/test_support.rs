@@ -92,6 +92,41 @@ impl BlockWriter for Overlay {
     }
 }
 
+/// **An [`Overlay`] whose writes fail**: the `n`th alone, or every one from it on. A refused write
+/// is `Io` and changes nothing.
+pub(crate) struct Failing {
+    pub image: Overlay,
+    pub writes: std::cell::Cell<u64>,
+    at: u64,
+    once: bool,
+}
+
+impl Failing {
+    pub fn once(base: std::rc::Rc<Vec<u8>>, n: u64) -> Failing {
+        Failing { image: Overlay::new(base), writes: 0.into(), at: n, once: true }
+    }
+    pub fn after(base: std::rc::Rc<Vec<u8>>, n: u64) -> Failing {
+        Failing { once: false, ..Failing::once(base, n) }
+    }
+}
+
+impl BlockReader for Failing {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.image.read_at(offset, buf)
+    }
+}
+
+impl BlockWriter for Failing {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+        let i = self.writes.get();
+        self.writes.set(i + 1);
+        if i == self.at || (!self.once && i > self.at) {
+            return Err(FsError::Io);
+        }
+        self.image.write_at(offset, buf)
+    }
+}
+
 /// **A fresh path under the temp directory**, unique per call: cargo runs tests in parallel.
 pub(crate) fn scratch(what: &str) -> PathBuf {
     static SEQ: AtomicU32 = AtomicU32::new(0);

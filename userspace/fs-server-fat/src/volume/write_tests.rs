@@ -875,3 +875,46 @@ fn a_truncate_stopped_at_any_write_is_answered_with_the_file_as_it_is() {
         assert!(free.is_empty(), "write {at} refused: answered over free clusters {free:?}");
     }
 }
+
+/// **A mount refused for a failed write leaves the filesystem as clean as it was found**: FAT32's
+/// FSInfo is written before the state bit. The bit went first, and a refused FSInfo write left a
+/// stick that read as not cleanly unmounted ever after.
+#[test]
+fn a_mount_refused_for_a_failed_write_leaves_it_as_clean_as_found() {
+    use crate::test_support::Failing;
+    let img = mformat(64, &["-F", "-c", "8"]);
+    let base = std::rc::Rc::new(std::fs::read(&img).unwrap());
+    for (n, once) in [(0, true), (1, true), (0, false), (1, false)] {
+        let disk = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
+        let fat = Fat::new(&disk);
+        assert_eq!(fat.mark_mounted(), Err(FsError::Io), "write {n}");
+        assert_eq!(fat.was_left_clean(), Ok(true), "write {n} refused: as clean as found");
+    }
+}
+
+/// **A change that fails on the device, or finds the volume corrupt, leaves it marked for a check**
+/// at its unmount: what is on the device is no longer certain, and clearing the bit said it was.
+#[test]
+fn a_change_that_fails_on_the_device_leaves_the_volume_marked() {
+    use crate::test_support::Failing;
+    let img = mformat(64, &["-c", "8"]);
+    put(&img, "A.TXT", b"a");
+    let base = std::rc::Rc::new(std::fs::read(&img).unwrap());
+    let unmounted = |fault: u64, poke: Option<(u64, u16)>| {
+        let disk = Failing::once(base.clone(), fault);
+        if let Some((at, v)) = poke {
+            disk.image.write_at(at, &v.to_le_bytes()).unwrap();
+        }
+        let fat = Fat::new(&disk);
+        fat.mark_mounted().unwrap();
+        let grown = Volume::grow_file(&fat, b"/A.TXT", 20_000, NOW).map(drop);
+        fat.mark_clean().unwrap();
+        (grown, fat.was_left_clean().unwrap())
+    };
+    assert_eq!(unmounted(u64::MAX, None), (Ok(()), true), "a sound change leaves it clean");
+    assert_eq!(unmounted(1, None), (Err(FsError::Io), false), "the grow's first write refused");
+    let g = *Fat::new(&FileImage::open(&img)).geometry().unwrap();
+    assert_eq!(g.kind, Kind::Fat16, "a 16-bit entry is poked");
+    let reserved = Some((g.fat_byte(0) + 5 * 2, 0xFFF1));
+    assert_eq!(unmounted(u64::MAX, reserved), (Err(FsError::Corrupt), false), "a reserved entry met");
+}
