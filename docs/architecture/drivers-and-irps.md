@@ -386,8 +386,12 @@ the device is still busy, starts the port, fails the command `IoError` and issue
 wakes at the command in flight's deadline, 30 s as Linux's `sd` and USB storage give one, and
 sleeps no longer than a deadline, so a command issued while it sleeps needs no wake of its own. The
 boot's polled wait, before the thread runs, recovers the same way when it gives up on a command,
-which it retired as done before. **A port that will not stop** may still move its command's data:
-that command is kept, never completed, and the disk refuses everything else. QEMU clears PxCI on
+which it retired as done before, and runs every completion queued; `read_blocking` counts a read
+only once it completed. While a port is faulted or recovered, what is submitted waits in the queue.
+**A port that will not stop** may still move its command's data: that command is kept, never
+completed, and the disk refuses everything else. **What waits on a kept command waits for good**,
+as nothing in the kernel cancels a request: a filesystem server's write, and a `sys_ns_sync` behind
+it (deferred: *IRP cancellation and the completion timeout*). QEMU clears PxCI on
 an error, so the kept bit is a host test's (`drivers/ahci/tests.rs`); QEMU's `blkdebug`, failing a
 sector `test-qemu`'s probe reads, showed the recovery, and every probe after it passing.
 

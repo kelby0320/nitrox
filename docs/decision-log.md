@@ -36779,7 +36779,8 @@ here:
 - **A block request is whole blocks within its device, for every driver**: one that is not a
   multiple of the logical block size, in offset or length, is refused `InvalidArgument` by
   `sys_io_submit`, no operation made; one whose range runs past the device's end completes its
-  operation `InvalidArgument`, as `io-operation.md` had it. AHCI and the RAM disk took either.
+  operation `InvalidArgument`, as `io-operation.md` had it. AHCI took both, the RAM disk part of
+  a block. A length of 0 is still a no-op, whatever its offset.
 - **An AHCI command that fails, or does not finish within 30 s, fails `IoError`**, and the disk
   goes on: a watch thread, started with the USB hub thread, recovers the port (AHCI 1.3.1
   §6.2.2.1). Where a request waited for ever after a medium error, it now fails. **A port that will

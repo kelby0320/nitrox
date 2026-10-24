@@ -147,7 +147,8 @@ is refused `InvalidArgument` before any operation is made; and `offset + length`
 within `block_count * logical_block_size`, else the operation completes `InvalidArgument`
 (see [`io-operation.md`](io-operation.md)). The block layer checks both
 (`io::block::dispatch_block_irp`), so no driver sees part of a block or a range past the
-device's end.
+device's end. A `length` of 0 is the exception: a no-op, completed at once whatever its
+`offset`.
 
 **`length` is also bounded by what one command can describe** — the device's
 scatter-gather capacity, counted in the pages the buffer range touches rather than

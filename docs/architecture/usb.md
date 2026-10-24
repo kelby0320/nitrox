@@ -148,14 +148,15 @@ a device's contexts and rings until its slot is disabled — QEMU's *Disable Slo
 default endpoint's output context — so a failed enumeration and a departure both disable first. A
 slot that does not disable, or that a wedged controller cannot be asked about, **keeps its memory
 for good**: a few pages leaked is the price of not handing the controller memory it may yet write.
-**And its storage commands with it** (pre-Phase-7 Part D): the one in flight and one a failed
-recovery stranded are never completed, since completing one hands its buffer back while the
-controller may still move its data; only a rescan, which moves none, completes.
+**And its storage commands with it**: the one in flight and one a failed recovery stranded are
+never completed, since completing one hands its buffer back while the controller may still move its
+data; only a rescan, which moves none, completes. What waits on a kept command waits for good, as
+on AHCI ([`drivers-and-irps.md`](drivers-and-irps.md)).
 
 **A connect change on a port that has a device is a departure**, then an arrival if something is
 there: a device pulled and another plugged in while the thread was busy — or a contact that bounced
 — leaves the port connected, and only the change bit says anything happened. **Whether something is
-there is read after the change is cleared** (`hub::connect_change`, pre-Phase-7 Part D): every empty
+there is read after the change is cleared** (`hub::connect_change`): every empty
 port carries a change from the controller's reset, and a device that connected between that
 change's read and its clear had its own cleared with it, so the read before missed it for good.
 
