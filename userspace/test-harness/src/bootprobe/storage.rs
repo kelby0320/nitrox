@@ -430,8 +430,9 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
     true
 }
 
-/// **A block request off its device's blocks is refused**, on the root partition: part of a block
-/// with no operation made, a range past its end through the operation. The last block still reads.
+/// **A block request off its device's blocks is refused**, on the root partition's disk: part of a
+/// block with no operation made, a range past its end through the operation. The last block still
+/// reads. The disk, as a partition refused a range past its end already.
 pub(super) fn block_bounds_test(root_ns: u64) -> bool {
     use libkern::{IO_OPCODE_READ, KError};
     let fail = |why: &[u8]| {
@@ -445,19 +446,23 @@ pub(super) fn block_bounds_test(root_ns: u64) -> bool {
     let Some(root) = records.iter().find(|r| labels.contains(&r.name())) else {
         return fail(b"no root partition in the registry");
     };
-    let Some(index) = root.block_index() else {
-        return fail(b"the root partition has no /dev/blk index");
+    let Some(disk) = records.iter().find(|r| r.id == root.parent) else {
+        return fail(b"the root partition has no disk in the registry");
+    };
+    let Some(index) = disk.block_index() else {
+        return fail(b"the root's disk has no /dev/blk index");
     };
     let path = alloc::format!("/dev/blk/{index}");
     let (st, dev) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ);
     if st != 0 || dev == 0 {
-        return fail(b"the root partition does not open");
+        return fail(b"the root's disk does not open");
     }
+    // Two pages: room for a block and part of another, at 4,096 bytes a block.
     // SAFETY: register-only syscall.
-    let page = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    let page = unsafe { syscall4(SYS_MEMORY_CREATE, 2 * PAGE, 0, 0, 0) };
     if page <= 0 {
         close(dev);
-        return fail(b"no page to read into");
+        return fail(b"no pages to read into");
     }
     let page = page as u64;
     let submit = |offset: u64, length: u64| {
@@ -466,11 +471,12 @@ pub(super) fn block_bounds_test(root_ns: u64) -> bool {
         unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) }
     };
     let invalid = KError::InvalidArgument.as_i32();
-    let partial = [(0, 100), (100, 512), (0, 600)].iter().all(|&(o, l)| submit(o, l) == invalid as i64);
-    let end = root.block_count * root.logical_block_size as u64;
-    let past = submit(end, 512);
+    let block = u64::from(disk.logical_block_size);
+    let partial = [(0, 100), (100, block), (0, block + 100)].iter().all(|&(o, l)| submit(o, l) == invalid as i64);
+    let end = disk.block_count * block;
+    let past = submit(end, block);
     let past = past >= 0 && po_wait(past as u64).0 == invalid;
-    let last = submit(end - 512, 512);
+    let last = submit(end - block, block);
     let last = last >= 0 && po_wait(last as u64).0 == 0;
     close(page);
     close(dev);
