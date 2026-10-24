@@ -214,3 +214,15 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-23	394	eed225cf	13	tests	optional	demonstrated	fixed	c4afade3	the dead Corrupt arm of found_dirty removed; broken keeps the bit
 2026-10-23	394	eed225cf	14	tests	optional	demonstrated	fixed	c4afade3	the guard was dead, only files being in the ids table; removed
 2026-10-23	394	eed225cf	15	rules-and-docs	optional	demonstrated	refuted		the description names each finding it fixes and does not claim pr365-7, -8 or -11; bug-bash.md triages all three Later
+2026-10-24	395	73e7edb5	1	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	bd114520	submit and drain_queue queue while the port is faulted or recovered, so recover no longer forgets a request issued during it
+2026-10-24	395	73e7edb5	2	logic+error-paths+tests+architecture	worth-fixing	unverified	fixed	bd114520	give_up marks the disk dead and takes the queue under the port lock, submit reads dead under it; a two-thread test fails with the old check, 5 runs of 5
+2026-10-24	395	73e7edb5	3	error-paths	worth-fixing	demonstrated	fixed	45a2f464	read_blocking needs the operation signalled; AHCI's poll runs every completion and waits on no disk given up (bd114520); the sweep found a past-end read returned true too
+2026-10-24	395	73e7edb5	4	tests+logic	worth-fixing	demonstrated	fixed	bd114520	the port's waits read clock(), a host test's moving on as read; a give-up test with three controls
+2026-10-24	395	73e7edb5	5	tests	worth-fixing	demonstrated	fixed	bd114520	SERR, PxIS, HBA IS and PxCMD read back after a recovery; four controls
+2026-10-24	395	73e7edb5	6	architecture	optional	unverified	fixed	907a3f02	doc: what waits on a kept command waits for good, in usb.md, drivers-and-irps.md and the deferred cancellation entry
+2026-10-24	395	73e7edb5	7	logic	optional	unverified	fixed	0dbc92e7	AHCI published after IDENTIFY; a boot with a zero-size disk on port 0 showed the watch thread before and none after
+2026-10-24	395	73e7edb5	8	logic	optional	unverified	fixed	907a3f02	device-node.md and the decision log except a length of 0
+2026-10-24	395	73e7edb5	9	logic+tests	optional	demonstrated	fixed	4ee1bcf7	the past-end read is on the root's disk, in its block size; test-qemu fails with submit_within's bound removed
+2026-10-24	395	73e7edb5	10	tests	optional	unverified	declined		both callers are one line over a pinned helper, in code the host cannot run (the shutdown flush, the hub thread), and no gate meets a departed disk at shutdown or the usb-1 window on demand
+2026-10-24	395	73e7edb5	11	rules-and-docs	optional	unverified	fixed	907a3f02	the decision-log entry, new in this PR, edited in place
+2026-10-24	395	73e7edb5	12	rules-and-docs	optional	demonstrated	fixed	907a3f02	the two part cites removed from usb.md
