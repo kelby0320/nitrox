@@ -166,8 +166,10 @@ two from 512 to a page, or a run whose ends — `file_block + length`, `device_l
 times `block_size` — do not fit a `u64`. The resolve fails `KernelError`, as for a body too short
 for its runs. The page cache divides by the block size and multiplies a device block by it, and a
 second server is one more process whose reply reaches that arithmetic. **A page must lie within one
-run**, since the kernel fills and writes it as one device range; that one the kernel cannot check,
-and each server guarantees it (`filesystem-data-path.md` § *A page within one run*).
+run**, since the kernel fills and writes it as one device range. That one the kernel does not check,
+though the runs would let it, and a server must make it so: FAT's does, and ext4's with blocks of a
+page, but not with smaller ones (`TODO(ext4-subpage-runs)`; `filesystem-data-path.md` § *A page
+within one run*).
 
 #### The `SUBNAMESPACE` body
 

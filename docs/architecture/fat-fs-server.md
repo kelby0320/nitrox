@@ -254,13 +254,18 @@ metadata, and a format stopped after each write.
 
 ## 9. Not built
 
-- **Clusters under 4 KiB.** `disk --format` makes such a stick servable, by making it again (Part
-  G). Serving one needs a page filled from several runs, or a second data path, for a stick someone
-  needs.
-- **More than 64 fragments**, which `MapRange` would lift for both servers.
+- **Clusters under 4 KiB** (`TODO(fat-small-clusters)`). `disk --format` makes such a stick
+  servable, by making it again (Part G). Serving one needs a page filled from several runs, or a
+  second data path, for a stick someone needs.
+- **More than 64 fragments** (`TODO(map-range)`), which `MapRange` would lift for both servers.
+- **A long name over 255 bytes of UTF-8 listed by it** (`TODO(fat-long-utf8-names)`): such a file
+  is listed by its short name, and reached by either.
+- **`File::Touch` past its table** (`TODO(fat-touch-table)`): a file the table no longer holds
+  misses its `mtime` on an in-place write.
+- **Repair** (`TODO(fs-repair)`): a dirty filesystem is served as found.
 - **Sectors other than 512 bytes**, which no stick this phase meets uses.
 - **Attributes beyond read-only and directory** — hidden, system, archive are kept, not shown.
-- **Repair**: a dirty filesystem is served as found.
 - **exFAT.**
 
-See [`deferred-decisions.md`](../rationale/deferred-decisions.md) for each one's trigger.
+The five tagged are in [`deferred-decisions.md`](../rationale/deferred-decisions.md), each with its
+trigger; the last three have no entry, since nothing has asked for them.

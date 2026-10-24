@@ -46,8 +46,10 @@ Wire length: **24 bytes**. `flags`:
 `device_lba = 0` marks a **hole** (unallocated); the kernel zero-fills such a page. (A hole and
 an `UNWRITTEN` run both read as zero; they differ only in whether backing blocks exist.)
 
-"Block" here is the **filesystem block size** (from the superblock), which the kernel learns at
-mount; it need not equal the device sector size (the kernel scales LBAs accordingly).
+"Block" here is the **`block_size` of the reply carrying the runs** — ext4's block, FAT's 512-byte
+sector ([`rsproto-namespace-ops.md`](rsproto-namespace-ops.md) § *The `FILE_BLOCKS` body*) — not
+anything learned at mount; it need not equal the device sector size (the kernel scales LBAs
+accordingly).
 
 ## MapRange (`op = 0x0300`) — read-only
 

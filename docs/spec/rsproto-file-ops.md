@@ -217,8 +217,9 @@ Request body: `file_id: u64`, the id the file's `FILE_BLOCKS` replies carried. S
 no handles. The only request that travels in that direction. *(Administration Part C.1b,
 2026-09-24.)*
 
-**A server sends it before freeing a file's blocks** — the last name's unlink, or a rename that
-replaces a file — and frees them **only once it is answered**. The kernel may hold the file's
+**A server sends it before freeing a file's blocks** — the last name's unlink, a rename that
+replaces a file, or a truncate to zero that ends the file's id (FAT's, whose id is its first
+cluster) — and frees them **only once it is answered**. The kernel may hold the file's
 pages and be writing them to those blocks. Freeing them first would let a write it had already
 issued land in a block the server has since given to something else: another file, or a
 directory block the server writes through.
@@ -236,8 +237,8 @@ directory block the server writes through.
    flight ends. A second `Forget` of the file while the first waits gets the same PO.
 
 Sent `NoBlock` or `BlockBounded`, or with handles, it is refused with `InvalidArgument`. A
-server that cannot get an answer leaves the file unfreed, since a leaked block is repaired by
-`e2fsck` and a block claimed twice is not.
+server that cannot get an answer leaves the file unfreed, since a leaked block is repaired by a
+check (`e2fsck`, `fsck.fat`) and a block claimed twice is not.
 
 ## Versioning
 

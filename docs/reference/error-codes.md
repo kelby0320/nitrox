@@ -123,8 +123,8 @@ added to `libkern` alone, which is why the kernel is the canonical side.
 - **`IoResult.status`.** A completed `PendingOperation` carries `0` or a negative
   discriminant.
 - **rsproto error replies.** `ErrorBody.kerror`, alongside the optional `server_code`.
-  Resource servers map their internal error types onto this set — see `fs_kerror` in
-  `userspace/fs-server-ext4/src/main.rs` for the reference mapping.
+  Resource servers map their internal error types onto this set — see `kerror` in
+  `userspace/libfsserver/src/serve.rs`, both filesystem servers' mapping.
 - **`libos::ErrorKind`.** A coarse classification over these, named to match
   `std::io::ErrorKind` so a future `std` facade maps straight onto it.
 

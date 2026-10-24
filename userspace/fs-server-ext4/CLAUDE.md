@@ -72,6 +72,9 @@ quotas), or one lacking `filetype` or `extent`, refuses a writable mount. Then: 
 bigalloc, inline-data inodes, 64-bit block numbers, ≥ 8 KiB blocks, xattrs, ACLs, symlinks,
 checksums. An htree directory is read by the linear walk, which is backward-compatible, and made
 linear, its index flag cleared, before a name goes in: an insert wrote over its hash tree's root.
+**Blocks under a page are served, unchecked**: a map whose run ends inside a page would have the
+kernel fill that page from one run (`TODO(ext4-subpage-runs)`, at `map_file`). Every ext4 Nitrox
+makes has 4 KiB blocks.
 
 **Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`, and
 `docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a deferral
