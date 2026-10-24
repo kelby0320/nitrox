@@ -396,3 +396,22 @@ fn an_allocation_passes_over_a_reserved_entry() {
     let root = fat.resolve_dir(b"/").unwrap();
     assert_eq!(fat.mkdir_at(root, b"after", NOW), Ok(()), "and the volume still written");
 }
+
+/// **A rename to a name a FAT cannot hold is refused** though an entry already has it, which a
+/// replace would otherwise take over without writing a name of its own.
+#[test]
+fn a_rename_onto_an_entry_a_fat_cannot_name_is_refused() {
+    let img = mformat(64, &["-c", "8"]);
+    put(&img, "F.TXT", b"f");
+    put(&img, "AXB", b"x");
+    let over = Overlay::new(Rc::new(std::fs::read(&img).unwrap()));
+    let _ = std::fs::remove_file(&img);
+    let fat = Fat::new(&over);
+    let g = *fat.geometry().unwrap();
+    let f = dir::lookup(&over, &g, &mut fat.cache.borrow_mut(), Dir::root(&g), b"AXB").unwrap();
+    let at = dir::slot_byte(&over, &g, &mut fat.cache.borrow_mut(), f.dir, f.slot).unwrap().unwrap();
+    over.write_at(at + 1, b"*").unwrap();
+    let fat = Fat::new(&over);
+    assert!(fat.read_file(b"/A*B", &mut [0u8; 8]).is_ok(), "the entry found by its name");
+    assert_eq!(fat.rename_path(b"/F.TXT", b"/A*B", true, NOW), Err(FsError::InvalidName));
+}

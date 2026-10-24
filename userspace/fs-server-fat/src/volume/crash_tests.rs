@@ -322,3 +322,31 @@ fn a_crash_anywhere_in_a_removal_or_a_move_is_consistent() {
         consistent,
     );
 }
+
+/// **A directory moved, crashed after any write, has a `..` naming a parent that holds it**: the
+/// old name goes last, so `..` never names the parent that lost it.
+#[test]
+fn a_crash_anywhere_in_a_directory_move_leaves_its_dotdot_naming_a_parent_holding_it() {
+    let img = mformat(16, &["-c", "8"]);
+    mmd(&img, "A");
+    mmd(&img, "B");
+    mmd(&img, "A/D");
+    let base = with_garbage_in_free_clusters(&img);
+    let _ = std::fs::remove_file(&img);
+    let held = |img: &Overlay| {
+        let fat = Fat::new(img);
+        let g = *fat.geometry().unwrap();
+        let d = fat.resolve_dir(b"/A/D").or(fat.resolve_dir(b"/B/D")).map_err(|e| format!("D: {e:?}"))?;
+        let mut cache = fat.cache.borrow_mut();
+        let parent = dir::parent(img, &g, &mut cache, Dir::from_id(&g, d).unwrap()).map_err(|e| format!("{e:?}"))?;
+        match dir::lookup(img, &g, &mut cache, parent, b"D") {
+            Ok(f) if f.cluster as u64 == d => Ok(()),
+            other => Err(format!("D's `..` names a parent where D is {other:?}")),
+        }
+    };
+    crash_everywhere(
+        &base,
+        |fat| assert_eq!(fat.rename_path(b"/A/D", b"/B/D", false, NOW), Ok(None)),
+        |img| consistent(img).and_then(|()| held(img)),
+    );
+}

@@ -524,7 +524,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// **Write the entries naming `name` into `d`**, its short entry made by `short` from its
     /// short name: the directory grown first if it must be, and **every FAT change made so far
     /// written before the entries** — a grown directory's link, and a `mkdir`'s cluster, which the
-    /// entry names. This one flush is the rule for both. Where its short entry is.
+    /// entry names. This one flush is the rule for both. Its first slot and its short entry's.
     fn insert(
         &self,
         g: &Geometry,
@@ -532,13 +532,13 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         d: Dir,
         name: &[u8],
         short: impl FnOnce(&[u8; 11]) -> [u8; 32],
-    ) -> Result<u32, FsError> {
+    ) -> Result<(u32, u32), FsError> {
         let mut entries = [[0u8; 32]; dir::MAX_NAME_SLOTS];
         let n = dir::name_entries(self.r, g, cache, d, name, short, &mut entries)? as u32;
         let first = self.place(g, cache, d, n)?;
         cache.flush(self.r, g)?;
         dir::rewrite(self.r, g, cache, d, first, first + n - 1, |s, e| *e = entries[(s - first) as usize])?;
-        Ok(first + n - 1)
+        Ok((first, first + n - 1))
     }
 
     fn find(&self, g: &Geometry, cache: &mut Cache, d: Dir, name: &[u8]) -> Result<Option<Found>, FsError> {
@@ -813,8 +813,9 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
 
     /// **Move `from` to `to`**, each a directory and a name, in an order that never loses the
     /// source: the new name first — a replaced file's entry pointed at the source, or new entries
-    /// — then the old name deleted, then a moved directory's `..` pointed at its new parent. A crash
-    /// between leaves the file under both names, which a check sorts out.
+    /// — then a moved directory's `..` pointed at its new parent, then the old name deleted. **A
+    /// failure undoes them**, last first. A crash between leaves the file under both names, and a
+    /// rename finding it so finishes, deleting the old name and releasing nothing.
     ///
     /// A directory cannot move into itself, nor replace or be replaced (`Unsupported`), as on ext4
     /// here. A name the same as the source's but for case is the source renamed in place.
@@ -834,51 +835,77 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         if !crate::names::valid(nn) {
             return Err(FsError::InvalidName);
         }
-        if src.is_dir() && od != nd && dir::within(self.r, g, cache, nd, src.cluster)? {
+        let moved = src.is_dir() && od != nd;
+        if moved && dir::within(self.r, g, cache, nd, src.cluster)? {
             return Err(FsError::Unsupported);
         }
+        let dotdot = if moved {
+            let sub = dir::subdir(g, &src)?;
+            let e = self.raw_entry(g, cache, sub, 1)?;
+            if &e[..11] != DOTDOT {
+                return Err(FsError::Corrupt);
+            }
+            Some((sub, e))
+        } else {
+            None
+        };
         let target = match self.find(g, cache, nd, nn)? {
             Some(t) if t.dir == src.dir && t.slot == src.slot => None,
+            Some(t) if t.cluster != 0 && t.cluster == src.cluster => Some(t),
             Some(_) if !replace => return Err(FsError::Exists),
             Some(t) if t.is_dir() || src.is_dir() => return Err(FsError::Unsupported),
             other => other,
         };
+        let twice = target.is_some_and(|t| t.cluster == src.cluster);
         let raw = self.raw_entry(g, cache, od, src.slot)?;
-        let slot = match target {
+        // What the new name's write undoes to: the slots inserted, or the replaced entry as it was.
+        let (slots, was) = match target {
+            Some(t) if twice => ((t.slot, t.slot), None),
             Some(t) => {
+                let was = self.raw_entry(g, cache, nd, t.slot)?;
                 // Everything but the name, and the case bits that belong to the name.
                 dir::rewrite(self.r, g, cache, nd, t.slot, t.slot, |_, e| {
                     e[11] = raw[11];
                     e[13..].copy_from_slice(&raw[13..]);
                 })?;
-                t.slot
+                ((t.slot, t.slot), Some(was))
             }
-            None => self.insert(g, cache, nd, nn, |s| {
-                let mut e = raw;
-                e[..11].copy_from_slice(s);
-                if e[0] == DELETED {
-                    e[0] = 0x05;
-                }
-                e[12] = 0;
-                e
-            })?,
+            None => (
+                self.insert(g, cache, nd, nn, |s| {
+                    let mut e = raw;
+                    e[..11].copy_from_slice(s);
+                    if e[0] == DELETED {
+                        e[0] = 0x05;
+                    }
+                    e[12] = 0;
+                    e
+                })?,
+                None,
+            ),
         };
-        dir::rewrite(self.r, g, cache, od, src.first_slot, src.slot, |_, e| e[0] = DELETED)?;
-        if src.is_dir() && od != nd {
-            let mut dotdot = false;
-            dir::rewrite(self.r, g, cache, dir::subdir(g, &src)?, 1, 1, |_, e| {
-                dotdot = &e[..11] == DOTDOT;
-                if dotdot {
-                    dir::set_cluster(g.kind, e, dir::dotdot_cluster(g, nd));
-                }
-            })?;
-            if !dotdot {
-                return Err(FsError::Corrupt);
+        let done = (|| {
+            if let Some((sub, _)) = dotdot {
+                dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| {
+                    dir::set_cluster(g.kind, e, dir::dotdot_cluster(g, nd))
+                })?;
             }
-        } else {
-            self.ids.borrow_mut().moved(src.cluster, nd, slot);
+            dir::rewrite(self.r, g, cache, od, src.first_slot, src.slot, |_, e| e[0] = DELETED)
+        })();
+        if let Err(e) = done {
+            if let Some((sub, old)) = dotdot {
+                dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| *e = old)?;
+            }
+            match (target, was) {
+                (Some(_), Some(was)) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.0, |_, e| *e = was)?,
+                (None, _) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.1, |_, e| e[0] = DELETED)?,
+                _ => {}
+            }
+            return Err(e);
         }
-        Ok(target.and_then(|t| self.removed(&t)))
+        if !moved {
+            self.ids.borrow_mut().moved(src.cluster, nd, slots.1);
+        }
+        Ok(target.filter(|_| !twice).and_then(|t| self.removed(&t)))
     }
 }
 

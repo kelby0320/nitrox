@@ -315,6 +315,10 @@ fn a_rename_keeps_the_file_and_a_replace_returns_the_replaced_id() {
     assert_eq!(mdir_all(&img), BTreeSet::from(["renamed with a long name.txt".to_string()]));
     assert_eq!(mtype(&img, "renamed with a long name.txt"), b"other\n");
     assert_eq!(fat.release(replaced, NOW), Err(FsError::NotFound), "released once");
+    // Two empty files share cluster 0 and are still two files, not one under both names.
+    fat.create_file(b"/", b"e1", NOW).unwrap();
+    fat.create_file(b"/", b"e2", NOW).unwrap();
+    assert_eq!(fat.rename_at(root, b"e1", b"e2", NOW), Err(FsError::Exists));
 }
 
 #[test]

@@ -160,11 +160,17 @@ Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
   `end_sessions_on`), whether the removal then succeeds or not: the client's next request meets
   `PeerClosed`.
 - **A rename** writes the new name first — new entries, or a replaced file's entry pointed at the
-  source — then deletes the old one, so a crash leaves the file under both names rather than
-  neither. A directory moved to another parent has its `..` repointed: `0` for the root,
-  FAT32's included. **A directory cannot move into itself**: its `..` is followed from the target
-  to the root. A directory can neither replace nor be replaced (`Unsupported`), as on ext4 here.
-  A replaced file's id comes back for the loop to forget and release.
+  source — then a moved directory's `..`, then deletes the old name, so a crash leaves the file
+  under both names rather than neither, and a moved directory's `..` never names a parent that
+  lost it. **A failed step is undone**, last first, and a `..` that is not one is `Corrupt`
+  before anything is written. **A rename finding its file under both names finishes** — the old
+  name deleted, nothing released — where a retry once released the file under its new name
+  (pre-Phase-7 Part D). Removing one of the two names before then still frees what the other
+  holds: finding them is a check's (`TODO(fs-repair)`). A directory moved has its `..` repointed:
+  `0` for the root, FAT32's included. **A directory cannot move into itself**: its `..` is
+  followed from the target to the root. A directory can neither replace nor be replaced
+  (`Unsupported`), as on ext4 here. A replaced file's id comes back for the loop to forget and
+  release.
 
 **Times are UTC** both ways. FAT stores no zone, and the system has none either.
 

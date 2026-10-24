@@ -20,8 +20,10 @@ loop.
   evicts a dirty sector; **a write path's reads go through `slot_rw`** (`next_rw`), which may, after
   writing it out. A walk on the read path with every slot dirty is refused `Io`, not served stale.
 - **`src/names.rs`**, **`src/dir.rs`**, **`src/time.rs`** — names, directory entries, times as UTC.
-- **`src/volume.rs`** — `Fat`: every operation, and its `Volume` impl. **`change` wraps every
-  mutation**: read-only refused first, the cache flushed at the end, after a failure too.
+- **`src/volume.rs`** — `Fat`: every operation; `src/volume/protocol.rs`, its `Volume` impl.
+  **`change` wraps every mutation**: read-only refused first, the cache flushed at the end, after
+  a failure too. **A change that fails gives back what it took and undoes what it wrote**:
+  `failure_tests` refuses each of its writes in turn and holds the image to `fsck.fat -n`.
 - **`src/mkfs.rs`** (Phase 6 Part G.2) — making an empty FAT, what `disk --format` writes: FAT16
   or FAT32 by size, **never with clusters under a page**, so the server serves everything it makes.
   The boot sector is written last. Its tests hold each type and cluster size at its boundary's
