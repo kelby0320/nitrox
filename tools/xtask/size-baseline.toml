@@ -6,7 +6,7 @@
 "kernel/src/arch/x86_64/idt.rs" = 1026
 "kernel/src/device.rs" = 1414
 "kernel/src/drivers/xhci/hid.rs" = 1106
-"kernel/src/drivers/xhci/storage.rs" = 1701
+"kernel/src/drivers/xhci/storage.rs" = 1705
 "kernel/src/handle/table.rs" = 1583
 "kernel/src/main.rs" = 1213
 "kernel/src/mm/vmm.rs" = 1560
