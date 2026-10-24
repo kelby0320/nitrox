@@ -438,8 +438,12 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     (backend.poll)(backend.ctx);
 
     // SAFETY: `po_ref` is a live `PendingOperation` reference held across the call.
+    let done = unsafe { crate::sched::pending_op_is_signaled(po_ref.as_ptr()) };
+    // SAFETY: as above.
     let (status, _result) = unsafe { crate::sched::pending_op_completion(po_ref.as_ptr()) };
-    if status != 0 {
+    // **Not completed is not read**: a command the device kept, or a refusal whose DPC no poll ran,
+    // reads status 0 too.
+    if !done || status != 0 {
         return false;
     }
 
@@ -874,6 +878,41 @@ mod tests {
             irp_complete_dpc(irp as *mut ());
         }
         reclaim_completed();
+    }
+
+    /// **A blocking read succeeds only once its device completed it.**
+    #[test]
+    fn a_blocking_read_its_device_did_not_complete_fails() {
+        use crate::libkern::block::BlockKind;
+        use crate::libkern::handle::KObjectType;
+        use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
+        init_global_heap();
+        crate::dpc::init().unwrap();
+        fn kept(_: *mut Irp, _: *mut ()) {}
+        fn completes(irp: *mut Irp, _: *mut ()) {
+            // SAFETY: the test's live IRP, this backend's until its DPC runs.
+            unsafe {
+                (*irp).set_completion(crate::io::irp::IrpStatus::Success as i32, (*irp).length);
+                crate::dpc::enqueue(&(*irp).dpc);
+            }
+        }
+        fn idle(_: *mut ()) {}
+        fn runs(_: *mut ()) {
+            crate::dpc::run_pending();
+        }
+        let read = |submit: fn(*mut Irp, *mut ()), poll: fn(*mut ()), lba| {
+            let backend = BlockBackend { submit, poll, ctx: core::ptr::null_mut(), max_frags: 8 };
+            let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
+            let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend)
+                .unwrap();
+            // SAFETY: `into_raw` yields the single creation reference, which the test adopts.
+            let disk =
+                unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+            read_blocking(&disk, lba, 1, &mut [0u8; 512])
+        };
+        assert!(read(completes, runs, 0), "a read its device completed");
+        assert!(!read(kept, runs, 0), "a command its device kept");
+        assert!(!read(completes, idle, 64), "past the end, refused through a DPC no poll ran");
     }
 
     #[test]
