@@ -77,8 +77,11 @@ pub struct Resized {
 }
 
 /// **Apply a resolve's `RESOLVE_CREATE`, then its `RESOLVE_GROW` or `RESOLVE_TRUNCATE`**, before it
-/// is served; one with neither changes nothing. **Each failure fails the resolve**: served anyway,
-/// the file at its old size was installed as the size asked for.
+/// is served; one with neither changes nothing. **A create's or a grow's failure fails the
+/// resolve**: each gives back what it took, and served anyway, the file at its old size was
+/// installed as the size asked for. **A truncate's is served**, the file as it now is: it may have
+/// freed blocks the kernel's map still names, and only the new map lets them go. Its read-only
+/// refusal, which changed nothing, fails it.
 pub fn apply_size<V: Volume>(vol: &V, request: &[u8], now: i64) -> Result<Resized, FsError> {
     let none = Ok(Resized::default());
     let Ok(m) = decode(request) else { return none };
@@ -98,8 +101,11 @@ pub fn apply_size<V: Volume>(vol: &V, request: &[u8], now: i64) -> Result<Resize
         vol.create_file(parent, &path[slash + 1..], now)?;
     }
     if r.flags & RESOLVE_TRUNCATE != 0 {
-        let ended = vol.truncate_file(path, new_size as usize, now)?;
-        return Ok(Resized { grown_from: None, ended });
+        return match vol.truncate_file(path, new_size as usize, now) {
+            Ok(ended) => Ok(Resized { grown_from: None, ended }),
+            Err(FsError::ReadOnly) => Err(FsError::ReadOnly),
+            Err(_) => Ok(Resized::default()),
+        };
     }
     let was = vol.grow_file(path, new_size as usize, now)?;
     Ok(Resized { grown_from: (was < new_size as u64).then_some(was), ended: None })

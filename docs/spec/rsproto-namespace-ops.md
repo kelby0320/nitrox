@@ -56,10 +56,13 @@ server must materialise the content eagerly.
 `RESOLVE_GROW`, `RESOLVE_CREATE` and `RESOLVE_TRUNCATE` append the target size as a
 **`u32` immediately after the suffix**, and the server applies the change *before*
 replying — so the reply's `content_len` is the file's new size and the kernel builds a
-page-cache object of exactly that size. **A change that fails fails the resolve**, with the error
-it met (`libfsserver::serve::apply_size`): until pre-Phase-7 Part D only a read-only mount's
-refusal was answered, and any other failure was served as the file at its old size, which the
-kernel installed as the size asked for.
+page-cache object of exactly that size. **A create or a grow that fails fails the resolve**, with
+the error it met (`libfsserver::serve::apply_size`): each gives back what it took, so the kernel's
+map still holds. Until pre-Phase-7 Part D only a read-only mount's refusal was answered, and any
+other failure was served as the file at its old size, which the kernel installed as the size asked
+for. **A truncate that fails is served as the file now is**: it may have cut the file already,
+freeing blocks the kernel's map of it still names, and only a reply carrying the new map makes the
+kernel let them go. Its read-only refusal, which changes nothing, fails it.
 
 `GROW` and `TRUNCATE` are **mutually exclusive**: they move the block allocator in
 opposite directions, and a caller that asked for one must never silently get the other.

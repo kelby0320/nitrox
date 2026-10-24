@@ -36725,8 +36725,10 @@ share, the next FAT. `bug-bash.md` has each fix; what a caller can now see diffe
   reaching what a removal frees, and **a file renamed to a name it has already is left alone**, as
   POSIX's rename leaves it. A directory moves into another unless that one is it or under it, by
   the `..` records, whatever the path's bytes.
-- **A resolve whose create, grow or truncate fails, fails** with that error, in both servers, where
-  only a read-only mount's refusal did and the rest were served at the file's old size.
+- **A resolve whose create or grow fails, fails** with that error, in both servers, where only a
+  read-only mount's refusal did and the rest were served at the file's old size. **A truncate that
+  fails is served as the file now is**, since it may have freed blocks the kernel's map names; only
+  its read-only refusal fails it.
 - **Every forwarded request is answered**: a reply the kernel did not take is answered with an
   error, its handles closed, since a forwarded lookup has no deadline.
 - **`libfs::copy_tree` refuses a destination that is its source or under it** (`IntoItself`), and
