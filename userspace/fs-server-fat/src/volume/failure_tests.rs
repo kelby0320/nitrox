@@ -223,3 +223,63 @@ fn every_change_stopped_at_any_write_leaves_a_clean_volume() {
         id.map_or(Ok(()), |id| fat.release(id, NOW))
     });
 }
+
+/// **A mount that finds its filesystem corrupt refuses every change after**, as Linux's FAT
+/// remounts itself read-only: after a rename whose undo failed too, leaving the file under both
+/// names, and after a change that found the volume corrupt. Nothing more is written, its unmount
+/// included, and the next mount changes it again. A failed write alone refuses nothing.
+#[test]
+fn a_mount_that_finds_its_filesystem_corrupt_refuses_every_change_after() {
+    // FAT32, whose unmount writes FSInfo: an unmount that wrote anything would show.
+    let img = mformat(64, &["-F", "-c", "8"]);
+    put(&img, "F.TXT", b"f");
+    let base = Rc::new(std::fs::read(&img).unwrap());
+    let _ = std::fs::remove_file(&img);
+    let refuses = |fat: &Fat<Failing>, disk: &Failing, what: &str| {
+        let writes = disk.writes.get();
+        assert_eq!(fat.create_file(b"/", b"after.txt", NOW), Err(FsError::ReadOnly), "{what}: a change after");
+        assert!(Volume::refusing_changes(fat), "{what}: said");
+        assert_eq!(fat.mark_clean(), Ok(()), "{what}: its unmount");
+        assert_eq!(disk.writes.get(), writes, "{what}: nothing more written");
+        assert_eq!(fat.was_left_clean(), Ok(false), "{what}: left marked for a check");
+        let again = Fat::new(&disk.image);
+        assert_eq!(again.create_file(b"/", b"after.txt", NOW), Ok(()), "{what}: the next mount");
+    };
+
+    let both = (1..32).find_map(|n| {
+        let disk = Failing::after(base.clone(), n);
+        let fat = Fat::new(&disk);
+        fat.mark_mounted().ok()?;
+        let moved = fat.rename_path(b"/F.TXT", b"/a new name.txt", false, NOW);
+        let image = Fat::new(&disk.image);
+        let twice =
+            image.read_file(b"/F.TXT", &mut [0; 8]).is_ok() && image.read_file(b"/a new name.txt", &mut [0; 8]).is_ok();
+        (moved.is_err() && twice).then_some(n)
+    });
+    let n = both.expect("a write whose refusal leaves the file under both names");
+    let disk = Failing::after(base.clone(), n);
+    let fat = Fat::new(&disk);
+    fat.mark_mounted().unwrap();
+    assert!(fat.rename_path(b"/F.TXT", b"/a new name.txt", false, NOW).is_err());
+    refuses(&fat, &disk, &format!("the undo refused from write {n}"));
+
+    let disk = Failing::once(base.clone(), u64::MAX);
+    let fat = Fat::new(&disk);
+    let g = *fat.geometry().unwrap();
+    let f = dir::lookup(&disk, &g, &mut fat.cache.borrow_mut(), Dir::root(&g), b"F.TXT").unwrap();
+    let at = dir::slot_byte(&disk, &g, &mut fat.cache.borrow_mut(), f.dir, f.slot).unwrap().unwrap();
+    disk.image.write_at(at + 28, &(3 * g.cluster_bytes()).to_le_bytes()).unwrap();
+    let fat = Fat::new(&disk);
+    fat.mark_mounted().unwrap();
+    assert_eq!(Volume::grow_file(&fat, b"/F.TXT", 20_000, NOW), Err(FsError::Corrupt));
+    refuses(&fat, &disk, "a chain shorter than its size");
+
+    let mounting = Failing::once(base.clone(), u64::MAX);
+    Fat::new(&mounting).mark_mounted().unwrap();
+    let disk = Failing::once(base, mounting.writes.get());
+    let fat = Fat::new(&disk);
+    fat.mark_mounted().unwrap();
+    assert_eq!(fat.create_file(b"/", b"x", NOW), Err(FsError::Io), "the change's first write refused");
+    assert_eq!(fat.create_file(b"/", b"y", NOW), Ok(()), "and the next change made");
+    assert!(!Volume::refusing_changes(&fat));
+}

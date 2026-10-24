@@ -54,6 +54,8 @@ impl Rng {
 /// **Everything a request can do**, on whatever the image holds: each result is ignored, since
 /// only a panic is wrong here.
 fn exercise(fat: &Fat<Overlay>) {
+    // A mount refuses every change once one finds it corrupt; each change here is to run anyway.
+    let open = |fat: &Fat<Overlay>| fat.broken.set(false);
     if fat.check().is_err() {
         return;
     }
@@ -86,26 +88,39 @@ fn exercise(fat: &Fat<Overlay>) {
         let _ = fat.map_file(&path, &mut runs);
         if let Ok(d) = fat.resolve_dir(&path) {
             let _ = fat.read_dir(d, 0, |_| true);
+            open(fat);
             let _ = fat.mkdir_at(d, b"inner made here", NOW);
         }
+        open(fat);
         let _ = fat.touch_file(1, NOW);
     }
     let _ = fat.mark_mounted();
+    open(fat);
     let _ = fat.create_file(b"/", b"new file.txt", NOW);
+    open(fat);
     let _ = fat.grow_file(b"/new file.txt", 6_000, NOW);
+    open(fat);
     let _ = fat.truncate_file(b"/new file.txt", 100, NOW);
     if let Ok(root) = fat.resolve_dir(b"/") {
+        open(fat);
         let _ = fat.mkdir_at(root, b"made", NOW);
+        open(fat);
         let _ = fat.rename_path(b"/new file.txt", b"/made/moved.txt", false, NOW);
         for n in names.iter().take(4) {
+            open(fat);
             let _ = fat.touch_at(root, n, NOW);
+            open(fat);
             let _ = fat.rename_at(root, n, b"renamed by the test", NOW);
+            open(fat);
             if let Ok(Some(id)) = fat.unlink_at(root, b"renamed by the test", NOW) {
+                open(fat);
                 let _ = fat.release(id, NOW);
             }
+            open(fat);
             let _ = fat.rmdir_at(root, b"renamed by the test", NOW, |_| ());
         }
     }
+    open(fat);
     let _ = fat.mark_clean();
 }
 

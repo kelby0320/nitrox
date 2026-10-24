@@ -93,6 +93,9 @@ pub struct Fat<'a, R> {
     /// Whether the unmount leaves the filesystem marked not clean: found so, or a change failed
     /// on the device or found it corrupt during this mount.
     found_dirty: Cell<bool>,
+    /// Whether a change found the filesystem corrupt, or could not undo itself, during this mount:
+    /// every later change is then refused, as Linux's FAT remounts itself read-only.
+    broken: Cell<bool>,
     /// Where the next allocation's search begins: FAT32's next-free hint, then past the last.
     hint: Cell<u32>,
     ids: RefCell<Ids>,
@@ -114,6 +117,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
             geometry,
             cache: RefCell::new(Cache::new()),
             found_dirty: Cell::new(false),
+            broken: Cell::new(false),
             hint: Cell::new(2),
             ids: RefCell::new(Ids::new()),
             orphans: RefCell::new([0; ORPHANS]),
@@ -381,18 +385,21 @@ fn split(path: &[u8]) -> Result<(&[u8], &[u8]), FsError> {
 }
 
 impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
-    /// **Run a change to the filesystem**: refused on a read-only mount before anything is read,
-    /// and the FAT's dirty sectors written at its end. **A failure is written too**: one that is
+    /// **Run a change to the filesystem**: refused on a read-only mount, or one a change found
+    /// corrupt, before anything is read, and the FAT's dirty sectors written at its end. **A failure is written too**: one that is
     /// not the device's leaves the cache as it found it, or with what it took given back; one that
     /// is the device's leaves nothing certain; a failed write forgets the cache, so it never holds
     /// what the device does not.
     fn change<T>(&self, op: impl FnOnce(&Geometry, &mut Cache) -> Result<T, FsError>) -> Result<T, FsError> {
-        if self.r.read_only() {
+        if self.r.read_only() || self.broken.get() {
             return Err(FsError::ReadOnly);
         }
         let g = self.geometry()?;
         let mut cache = self.cache.borrow_mut();
         let out = op(g, &mut cache);
+        if matches!(out, Err(FsError::Corrupt)) {
+            self.broken.set(true);
+        }
         let flushed = cache.flush(self.r, g);
         // What the device holds is no longer certain, or not sound: the unmount says so.
         if flushed.is_err() || matches!(out, Err(FsError::Io | FsError::Corrupt)) {
@@ -447,6 +454,10 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     pub fn mark_clean(&self) -> Result<(), FsError> {
         if self.r.read_only() {
             return Err(FsError::ReadOnly);
+        }
+        // Nothing more is written to a filesystem found corrupt; its state bit stays set.
+        if self.broken.get() {
+            return Ok(());
         }
         let g = self.geometry()?;
         self.cache.borrow_mut().flush(self.r, g)?;
@@ -892,15 +903,22 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             dir::rewrite(self.r, g, cache, od, src.first_slot, src.slot, |_, e| e[0] = DELETED)
         })();
         if let Err(e) = done {
-            if let Some((sub, old)) = dotdot {
-                dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| *e = old)?;
+            let undone = (|| -> Result<(), FsError> {
+                if let Some((sub, old)) = dotdot {
+                    dir::rewrite(self.r, g, cache, sub, 1, 1, |_, e| *e = old)?;
+                }
+                match (target, was) {
+                    (Some(_), Some(was)) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.0, |_, e| *e = was),
+                    (None, _) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.1, |_, e| e[0] = DELETED),
+                    _ => Ok(()),
+                }
+            })();
+            // The file may be left under both names, and removing either would free what the
+            // other holds.
+            if undone.is_err() {
+                self.broken.set(true);
             }
-            match (target, was) {
-                (Some(_), Some(was)) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.0, |_, e| *e = was)?,
-                (None, _) => dir::rewrite(self.r, g, cache, nd, slots.0, slots.1, |_, e| e[0] = DELETED)?,
-                _ => {}
-            }
-            return Err(e);
+            return undone.and(Err(e));
         }
         if !moved {
             self.ids.borrow_mut().moved(src.cluster, nd, slots.1);

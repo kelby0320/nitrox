@@ -161,9 +161,9 @@ fn resolve<V: Volume>(
         return match vol.map_file(path, &mut runs) {
             Ok(m) if m.size > u32::MAX as usize => error_reply(reply, request_id, KError::TooLarge, OP_NS_RESOLVE),
             Ok(m) => {
-                // A read-only mount's files are marked so: the kernel installs them without
-                // `MAP_WRITE`.
-                let flags = if vol.read_only() { FILE_BLOCKS_READ_ONLY } else { 0 };
+                // A read-only mount's files are marked so, and a mount refusing changes since it
+                // found the filesystem corrupt: the kernel installs them without `MAP_WRITE`.
+                let flags = if vol.read_only() || vol.refusing_changes() { FILE_BLOCKS_READ_ONLY } else { 0 };
                 let n = match grown_from {
                     Some(was) if m.block_size > 0 => mark_grown(&mut runs, m.runs, was.div_ceil(m.block_size as u64)),
                     _ => m.runs,

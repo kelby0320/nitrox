@@ -616,7 +616,10 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   under both names, as a crash between the writes leaves it, finishes, deleting the old name and
   releasing nothing. Removing one of the two names before then still frees what the other holds,
   since FAT has no link count; `deferred-decisions.md` says so under `TODO(fs-repair)`. Fails
-  without it: `a_rename_stopped_at_any_write_is_undone_or_finished_by_its_retry`.
+  without it: `a_rename_stopped_at_any_write_is_undone_or_finished_by_its_retry`. And a mount that
+  leaves the two names itself, its undo failing, or that finds the volume corrupt, refuses every
+  change after, as Linux's FAT goes read-only (the maintainer's call); fails without it:
+  `a_mount_that_finds_its_filesystem_corrupt_refuses_every_change_after`.
 
 - [x] **fs-4** `userspace/fs-server-ext4/src/ext4.rs:226` — `parse_superblock` and `check_device`
   refuse only INCOMPAT_64BIT and blocks over 4 KiB. They accept metadata_csum, an unreplayed

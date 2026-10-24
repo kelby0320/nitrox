@@ -36757,5 +36757,12 @@ differently is here:
   before anything is written and rewritten before the old name goes. FAT has no link count, so
   removing one of a crash's two names before then still frees what the other holds: that is the
   check's to find (`TODO(fs-repair)`).
+- **A FAT mount that finds its filesystem corrupt refuses every change after**, as Linux's FAT
+  remounts itself read-only (the maintainer's call, over a mount-time scan for two names, which
+  stays with `TODO(fs-repair)`): a change answering `Corrupt`, or a rename whose undo fails. Later
+  changes answer `NoAccess`, "read-only mount"; files resolved after are marked read-only; the
+  unmount writes nothing; `fs-server` says so once (`Volume::refusing_changes`). A failed write
+  alone refuses nothing. **An unmount says what it left**: "recorded clean", or now "left marked
+  for a check" for a filesystem found not clean or found corrupt since, where it said clean.
 - **A loop in a directory's chain, or its `..` records, is refused within a directory's reach** —
   `MAX_SLOTS` entries, and a path's 512 components — not after a read of the whole volume.

@@ -1399,7 +1399,9 @@ fine: this server writes metadata through at once, and a crash leaves at worst w
 `rename_path` and the two-phase free already document, an unattached inode that `e2fsck` puts in
 `lost+found`. **A FAT has no link count**, so a crash mid-rename leaves one file under two names,
 which `fs-server-fat` cannot tell from two files without reading every directory: a rename retried
-finishes, but removing either name frees the clusters the other still names. Trigger: a
+finishes, but removing either name frees the clusters the other still names. A mount that leaves
+them itself, a rename whose undo fails, refuses every change after, as Linux's FAT goes read-only.
+Trigger: a
 filesystem that actually comes back inconsistent, or a journal, which needs a replay before a
 mount can trust anything.
 

@@ -54,7 +54,9 @@ loop.
   cache; **a file's data with `read_at`**, since the kernel writes it behind the server's back.
   `free_chain` `forget`s each cluster it frees (Phase 6 Part H.4).
 - **A filesystem found dirty stays dirty** at its unmount, and so does one a change failed on the
-  device, or found corrupt, during the mount. Nothing here repairs one.
+  device, or found corrupt, during the mount. Nothing here repairs one. **A mount that finds it
+  corrupt** — a change answering `Corrupt`, or a rename whose undo fails — **refuses every change
+  after** (`broken`), as Linux's FAT remounts read-only.
 - **Tests run against the host's tools**: `mformat`, `mkfs.fat`, `mcopy` and `mdir` build and read
   the images, and **`fsck.fat -n` must find every image clean after every change**. A test of a
   writer that only reads back through this crate tests the writer against itself.

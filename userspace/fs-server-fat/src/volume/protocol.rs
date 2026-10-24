@@ -30,6 +30,10 @@ impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
         Fat::mark_clean(self)
     }
 
+    fn refusing_changes(&self) -> bool {
+        self.broken.get()
+    }
+
     fn map_file(&self, path: &[u8], runs: &mut [BlockRun]) -> Result<Mapped, FsError> {
         Fat::map_file(self, path, runs)
     }

@@ -166,7 +166,8 @@ Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
   before anything is written. **A rename finding its file under both names finishes** — the old
   name deleted, nothing released — where a retry once released the file under its new name
   (pre-Phase-7 Part D). Removing one of the two names before then still frees what the other
-  holds: finding them is a check's (`TODO(fs-repair)`). A directory moved has its `..` repointed:
+  holds: finding them is a check's (`TODO(fs-repair)`). A rename whose undo fails too leaves them
+  itself, and the mount then refuses every change (§ 6). A directory moved has its `..` repointed:
   `0` for the root, FAT32's included. **A directory cannot move into itself**: its `..` is
   followed from the target to the root. A directory can neither replace nor be replaced
   (`Unsupported`), as on ext4 here. A replaced file's id comes back for the loop to forget and
@@ -186,6 +187,13 @@ one, **and so is one a change failed on the device, or found corrupt, during the
 (pre-Phase-7 Part D): what is on the device is no longer certain. Nothing here repairs a filesystem
 (`TODO(fs-repair)`), so clearing the bit would hide that it needs a check from the next system that
 can make one. ext4's server clears it; that is ext4's to revisit.
+
+**A mount that finds the filesystem corrupt refuses every change after** (pre-Phase-7 Part D), as
+Linux's FAT remounts itself read-only: once a change answers `Corrupt`, or a rename's undo fails and
+leaves a file under two names, removing either of which would free what the other holds. Every
+later change is refused as on a read-only mount, `NoAccess` with "read-only mount"; a file resolved
+after is marked `FILE_BLOCKS_READ_ONLY`; the unmount writes nothing, so the bit stays set; and the
+server says so once. A failed write alone refuses nothing, and the next mount changes it again.
 
 **FAT32's FSInfo free count is unknown while mounted** — set to `0xFFFFFFFF` at mount, which
 `fsck.fat` accepts — and counted off the FAT at the unmount, before the state byte, with the
