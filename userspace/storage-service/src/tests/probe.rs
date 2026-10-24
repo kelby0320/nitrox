@@ -25,10 +25,19 @@ fn a_fat_boot_sector_missing_any_mark_is_not_one() {
 #[test]
 fn ext4_is_found_with_its_label_and_state() {
     let img = ext4(b"nitrox-root");
-    assert_eq!(probe(&img), Found::Ext4 { label: String::from("nitrox-root"), clean: Some(true), read_only: None });
+    assert_eq!(
+        probe(&img),
+        Found::Ext4 { label: String::from("nitrox-root"), clean: Some(true), read_only: None, refused: None }
+    );
     fs_server_ext4::ext4::mark_mounted(&img).unwrap();
-    assert_eq!(probe(&img), Found::Ext4 { label: String::from("nitrox-root"), clean: Some(false), read_only: None });
-    assert_eq!(probe(&ext4(b"")), Found::Ext4 { label: String::new(), clean: Some(true), read_only: None });
+    assert_eq!(
+        probe(&img),
+        Found::Ext4 { label: String::from("nitrox-root"), clean: Some(false), read_only: None, refused: None }
+    );
+    assert_eq!(
+        probe(&ext4(b"")),
+        Found::Ext4 { label: String::new(), clean: Some(true), read_only: None, refused: None }
+    );
 }
 
 /// **An ext4 its server would only read is mounted read-only**, by the boot's rules and an
@@ -51,8 +60,11 @@ fn an_ext4_its_server_would_only_read_is_mounted_read_only() {
     assert_eq!(crate::mounts::note(&stick, &all, Some(&mounted)), Some(why));
 }
 
+/// **An ext4 its server would refuse is found, not served, and says why**, as a FAT does: one whose
+/// layout is not what its superblock says, and one whose journal holds changes not yet replayed.
+/// It was reported as no filesystem, which reads as a stick safe to format.
 #[test]
-fn an_ext4_its_server_would_refuse_is_nothing() {
+fn an_ext4_its_server_would_refuse_is_found_and_not_served() {
     let img = ext4(b"broken");
     // The root is inode 2: clear its type bits, at the start of the inode table's second slot.
     let table = {
@@ -64,7 +76,21 @@ fn an_ext4_its_server_would_refuse_is_nothing() {
     img.read_at(1024 + 88, &mut sb).unwrap(); // `s_inode_size`
     let inode = table + u16::from_le_bytes(sb) as usize;
     img.0.borrow_mut()[inode + 1] &= 0x0F; // `i_mode`'s type nibble
-    assert_eq!(probe(&img), Found::Nothing);
+    let refused = |f: &Found| match f {
+        Found::Ext4 { refused: Some(why), .. } => why.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(refused(&probe(&img)).starts_with("inode 2 is not a directory"));
+    let journal = ext4(b"journal");
+    let mut word = [0u8; 4];
+    journal.read_at(1024 + 96, &mut word).unwrap();
+    journal.0.borrow_mut()[1120..1124].copy_from_slice(&(u32::from_le_bytes(word) | 0x4).to_le_bytes());
+    let found = probe(&journal);
+    assert!(refused(&found).starts_with("its journal holds changes not yet replayed"));
+    assert_eq!(found.server(), None, "not served");
+    let stick = Device { record: rec(30, DeviceKind::Disk, 11, 29, "a stick", 16_384), found };
+    let why = crate::mounts::unmounted_why(&stick, core::slice::from_ref(&stick)).unwrap();
+    assert!(why.starts_with("not served: its journal holds"), "{why}");
 }
 
 #[test]

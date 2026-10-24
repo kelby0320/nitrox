@@ -785,7 +785,7 @@ pub mod mounts {
     /// a FAT its server refuses, the installer's source, anything on the disk the machine started
     /// from, a FAT on an internal disk — in that order. QEMU gates match these words.
     pub fn unmounted_why(d: &Device, all: &[Device]) -> Option<String> {
-        if let Found::Fat { refused: Some(why), .. } = &d.found {
+        if let Found::Fat { refused: Some(why), .. } | Found::Ext4 { refused: Some(why), .. } = &d.found {
             return Some(alloc::format!("not served: {why}"));
         }
         let why = if is_install_source(d) {

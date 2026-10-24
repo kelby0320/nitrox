@@ -249,8 +249,8 @@ fn a_live_boot_is_a_root_on_a_ram_disk() {
 fn devices() -> Vec<Device> {
     let found = |r: &DeviceRecord| match r.id {
         6 => Found::Fat { label: String::from("NITROX_ESP"), clean: Some(true), refused: Some(String::from(SMALL)) },
-        7 => Found::Ext4 { label: String::new(), clean: Some(false), read_only: None },
-        8 => Found::Ext4 { label: String::from("nitrox-live"), clean: Some(true), read_only: None },
+        7 => Found::Ext4 { label: String::new(), clean: Some(false), read_only: None, refused: None },
+        8 => Found::Ext4 { label: String::from("nitrox-live"), clean: Some(true), read_only: None, refused: None },
         _ => Found::Nothing,
     };
     release_records().into_iter().map(|record| Device { found: found(&record), record }).collect()
@@ -348,12 +348,12 @@ fn a_label_is_printable_ascii_a_person_can_type() {
 fn a_label_comes_from_the_filesystem_then_the_partition_then_the_index() {
     let ds = devices();
     let mut own = ds[3].clone();
-    own.found = Found::Ext4 { label: String::from("data"), clean: None, read_only: None };
+    own.found = Found::Ext4 { label: String::from("data"), clean: None, read_only: None, refused: None };
     assert_eq!(labels::preferred(&own), "data", "the filesystem's own, over its partition's name");
     assert_eq!(labels::preferred(&ds[4]), "nitrox-live", "the filesystem's own");
     assert_eq!(labels::preferred(&ds[3]), "nitrox-root", "no filesystem label: the partition's name");
     let mut hidden = ds[3].clone();
-    hidden.found = Found::Ext4 { label: String::from(".hidden"), clean: None, read_only: None };
+    hidden.found = Found::Ext4 { label: String::from(".hidden"), clean: None, read_only: None, refused: None };
     assert_eq!(labels::preferred(&hidden), "nitrox-root", "an invalid label falls back");
     assert_eq!(labels::preferred(&ds[1]), "blk-1", "a RAM disk's name is its module's path");
     let mut nameless = ds[3].clone();
@@ -411,8 +411,8 @@ fn a_live_boot_mounts_read_only() {
 #[test]
 fn two_filesystems_with_one_label_are_told_apart() {
     let mut ds = devices();
-    ds[3].found = Found::Ext4 { label: String::from("data"), clean: Some(true), read_only: None };
-    ds[4].found = Found::Ext4 { label: String::from("data"), clean: Some(true), read_only: None };
+    ds[3].found = Found::Ext4 { label: String::from("data"), clean: Some(true), read_only: None, refused: None };
+    ds[4].found = Found::Ext4 { label: String::from("data"), clean: Some(true), read_only: None, refused: None };
     let labels: Vec<String> = automount(&ds, &[], false, true).into_iter().map(|p| p.label).collect();
     assert_eq!(labels, ["data", "data-2"]);
 }
@@ -423,7 +423,8 @@ fn two_filesystems_with_one_label_are_told_apart() {
 #[test]
 fn the_installers_source_is_passed_over_and_nothing_else() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
-    let ext4 = |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true), read_only: None };
+    let ext4 =
+        |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true), read_only: None, refused: None };
     let install_boot = |source_name: &str| {
         std::vec![
             dev(rec(3, DeviceKind::Disk, 0, 1, "QEMU HARDDISK", 1_048_576), Found::Nothing),
@@ -528,7 +529,8 @@ fn an_administrators_mount_is_refused_for_each_reason() {
 #[test]
 fn nothing_on_the_boot_medium_is_mounted_and_its_disk_is_in_use() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
-    let ext4 = |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true), read_only: None };
+    let ext4 =
+        |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true), read_only: None, refused: None };
     let mut stick = rec(20, DeviceKind::Disk, 8, 19, "QEMU QEMU HARDDISK (1-0000:00:04.0-1)", 65_536);
     stick.flags |= libkern::device::BOOT;
     let ds = std::vec![
@@ -553,7 +555,8 @@ fn nothing_on_the_boot_medium_is_mounted_and_its_disk_is_in_use() {
 #[test]
 fn an_arrival_is_planned_alone_beside_the_mounts_there_are() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
-    let ext4 = |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true), read_only: None };
+    let ext4 =
+        |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true), read_only: None, refused: None };
     let unmounted = dev(rec(11, DeviceKind::RamDisk, 7, NO_PARENT, "scratch.img", 16_384), ext4("nitrox-scratch"));
     let new = dev(rec(40, DeviceKind::Partition, 12, 39, "partition 1 (unlabelled)", 16_384), ext4("stick"));
     let all = std::vec![unmounted, new.clone()];
@@ -617,7 +620,8 @@ fn a_fat_is_auto_mounted_on_a_removable_disk_alone() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
     let fat = |label: &str| Found::Fat { label: String::from(label), clean: Some(true), refused: None };
     let refused = Found::Fat { label: String::from("SMALL"), clean: Some(true), refused: Some(String::from(SMALL)) };
-    let ext4 = |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true), read_only: None };
+    let ext4 =
+        |label: &str| Found::Ext4 { label: String::from(label), clean: Some(true), read_only: None, refused: None };
     let ds = std::vec![
         dev(rec(3, DeviceKind::Disk, 0, 1, "QEMU HARDDISK", 1_048_576), Found::Nothing),
         dev(rec(4, DeviceKind::Partition, 1, 3, "internal", 131_072), fat("INTERNAL")),
@@ -885,7 +889,7 @@ fn each_note_is_the_log_lines_reason_and_null_where_nothing_is_kept_from_anyone(
     assert_eq!(notes, [&Value::Null, &Value::Null, &esp, &Value::Null, &Value::Null], "the ESP alone");
 
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
-    let ext4 = Found::Ext4 { label: String::from("data"), clean: Some(true), read_only: None };
+    let ext4 = Found::Ext4 { label: String::from("data"), clean: Some(true), read_only: None, refused: None };
     let fat = Found::Fat { label: String::from("INTERNAL"), clean: Some(true), refused: None };
     let mut stick = rec(20, DeviceKind::Disk, 8, 19, "the boot stick", 65_536);
     stick.flags |= libkern::device::BOOT;
