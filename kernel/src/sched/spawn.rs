@@ -229,9 +229,6 @@ pub fn spawn_user_sched(
         g.next_tid = g.next_tid.wrapping_add(1);
         t
     };
-    let process_ptr = process.as_ptr();
-    // SAFETY: `process` pins the live `Process`, and the thread built from it keeps it alive.
-    let exiting = || unsafe { &*(process_ptr as *const crate::object::Process) }.ending().is_some();
     // Heavy work outside the lock (consumes `process` on success).
     let thread = Thread::try_new_user(tid, process, entry, user_sp, boot_args)?;
     let r = into_objref(thread);
@@ -248,13 +245,7 @@ pub fn spawn_user_sched(
 
     let leftover = {
         let mut g = SCHED.lock();
-        // Under the hold `exit_process` marks a process's threads in, so a thread placed after
-        // it is marked here instead.
-        if exiting() {
-            // SAFETY: `obj` is the new thread, pinned by `r`; `SCHED` held.
-            unsafe { Thread::set_ending(obj) };
-        }
-        match place_thread(&mut g, r, false) {
+        match place_spawned(&mut g, r) {
             Ok(()) => return Ok(handle),
             Err(returned) => returned, // carry out of the locked block
         }
@@ -263,6 +254,20 @@ pub fn spawn_user_sched(
     // releasing the Process off the rank-1 lock.
     drop(leftover);
     Err(AllocError)
+}
+
+/// Place `r`, a thread just made for a process, marking it first if the process has begun to exit:
+/// a thread placed after `exit_process` marked the others is marked here instead.
+pub(super) fn place_spawned(g: &mut SchedState, r: ObjectRef) -> Result<(), ObjectRef> {
+    // SAFETY: `r` pins the new thread; `SCHED` held.
+    let th = unsafe { &*(r.as_ptr() as *const Thread) };
+    // SAFETY: the clone pins the live `Process`; the thread holds another reference, so dropping
+    // it frees nothing under `SCHED`.
+    if th.process_ref().is_some_and(|p| unsafe { &*(p.as_ptr() as *const crate::object::Process) }.ending().is_some()) {
+        // SAFETY: as above.
+        unsafe { Thread::set_ending(r.as_ptr()) };
+    }
+    place_thread(g, r, false)
 }
 
 /// The idle thread body: reap any exited thread, then `hlt` until the next interrupt. Runs

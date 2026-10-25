@@ -768,9 +768,8 @@ fn a_thread_counts_from_its_first_placement_until_its_reap_is_drained() {
     assert_eq!(st.threads, 0);
 }
 
-/// A blocked thread is woken to end itself, still registered on what it waited on and in the
-/// heap: its own return from `wait_on` unregisters it, and its own unwinding drops the references
-/// pinning those objects. A suspended thread resumes to terminate, and the CPU running one is told.
+/// A blocked thread is woken to end itself, still registered on its objects and in the heap for its
+/// own `wait_on` to undo; a suspended one resumes to terminate; the CPU running one is told.
 #[test]
 fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells_the_cpu_running_one() {
     init_global_heap();
@@ -863,4 +862,42 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
     let heard = unsafe { NotificationChannel::try_recv(parent.as_ptr()) }.expect("ChildExited");
     assert_eq!(heard.as_bytes(), Notification::child_exited(5, recorded).as_bytes());
     drop((sibling, me));
+}
+
+/// A marked thread's `wait_on` answers `Ended` at once; a wait for I/O in flight heeds no mark.
+#[test]
+fn a_thread_its_process_marked_waits_for_nothing_but_its_io() {
+    init_global_heap();
+    // SAFETY: no objects, so nothing to pin.
+    let (heeded, io) = with_current(an_ending_thread(), || unsafe { (wait_on(&[], 1, 0), wait_on_io(&[], 0, 0)) });
+    assert!(matches!(heeded, WaitResult::Ended));
+    assert!(matches!(io, WaitResult::TimedOut), "a poll for I/O answers as a poll");
+}
+
+/// A marked thread terminates at a fault instead of parking where nothing would resume it.
+#[test]
+fn a_thread_its_process_marked_terminates_at_a_fault_instead_of_suspending() {
+    init_global_heap();
+    let disposition = with_current(an_ending_thread(), || suspend_with_fault(0, Notification::divide_by_zero(1, 0x10)));
+    assert!(matches!(disposition, ResumeDisposition::Terminate(0)));
+}
+
+#[test]
+fn a_thread_made_for_a_process_that_has_begun_to_exit_is_placed_marked() {
+    use crate::object::thread::test_support::{user_process_ref, user_thread_no_stack};
+    init_global_heap();
+    super::online_set::force(0b1);
+    let mut st = reserved_state();
+    let (exiting, _) = user_process_ref(5);
+    // SAFETY: `exiting` pins the test's own `Process`.
+    unsafe { &*(exiting.as_ptr() as *const crate::object::Process) }
+        .begin_ending(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
+    let (running, _) = user_process_ref(6);
+    for (process, marked) in [(exiting, true), (running, false)] {
+        let thread = into_objref(user_thread_no_stack(1, process, 0x40_0000, 0x7fff_f000));
+        let obj = thread.as_ptr();
+        assert!(place_spawned(&mut st, thread).is_ok());
+        // SAFETY: pinned by its run queue; single-threaded.
+        assert_eq!(unsafe { Thread::is_ending(obj) }, marked);
+    }
 }
