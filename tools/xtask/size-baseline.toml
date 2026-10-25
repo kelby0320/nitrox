@@ -11,7 +11,7 @@
 "kernel/src/main.rs" = 1213
 "kernel/src/mm/vmm.rs" = 1560
 "kernel/src/object/file_object.rs" = 2460
-"kernel/src/object/thread.rs" = 1084
+"kernel/src/object/thread.rs" = 1028
 "kernel/src/pci/mod.rs" = 1045
 "kernel/src/syscall/table.rs" = 2834
 "userspace/compositor/src/input.rs" = 2636
