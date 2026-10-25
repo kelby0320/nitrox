@@ -95,3 +95,29 @@ pub fn current_thread() -> Option<ObjectRef> {
     // `&mut`, no drop), sound to perform under the run-queue lock.
     g.cur_ref().clone()
 }
+
+/// Run `f` with `thread` as the global scheduler's current thread, which no other host test reads:
+/// one at a time, and restored even if `f` panics.
+#[cfg(test)]
+pub(crate) fn with_current<R>(thread: ObjectRef, f: impl FnOnce() -> R) -> R {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    struct Restore(Option<ObjectRef>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let mine = core::mem::replace(SCHED.lock().cur_slot(), self.0.take());
+            drop(mine);
+        }
+    }
+    let _one = ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _restore = Restore(SCHED.lock().cur_slot().replace(thread));
+    f()
+}
+
+/// An inert thread whose process is exiting, for [`with_current`].
+#[cfg(test)]
+pub(crate) fn an_ending_thread() -> ObjectRef {
+    let t = into_objref(Thread::try_new(0, 0).unwrap());
+    // SAFETY: the test's own thread, which nothing else reads yet.
+    unsafe { Thread::set_ending(t.as_ptr()) };
+    t
+}

@@ -88,6 +88,7 @@ pub enum WaitResult {
     OutOfMemory,
     /// The thread's process is exiting, so it does not block: its caller unwinds to the return to
     /// ring 3, where it ends. A wait the exit found blocked is woken, and answers as a timeout.
+    /// Never from [`wait_on_io`].
     Ended,
 }
 
@@ -103,6 +104,23 @@ pub enum WaitResult {
 /// `PendingOperation` or `InterruptObject`, pinned by a reference the caller holds until this
 /// returns.
 pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
+    // SAFETY: the caller's contract.
+    unsafe { wait(objs, deadline_ns, now, true) }
+}
+
+/// [`wait_on`] for a wait that I/O in flight depends on: it never answers [`WaitResult::Ended`],
+/// and one the process's exit woke answers as a timeout, for the caller to wait again.
+///
+/// # Safety
+///
+/// As [`wait_on`].
+pub unsafe fn wait_on_io(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
+    // SAFETY: the caller's contract.
+    unsafe { wait(objs, deadline_ns, now, false) }
+}
+
+/// [`wait_on`], with its contract, answering [`WaitResult::Ended`] only if `heed_exit`.
+unsafe fn wait(objs: &[usize], deadline_ns: u64, now: u64, heed_exit: bool) -> WaitResult {
     debug_assert!(objs.len() <= MAX_WAIT_HANDLES);
     let me_ptr;
     {
@@ -111,7 +129,7 @@ pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult 
         // Under the hold `end_siblings` marks in: a thread marked before this blocks nowhere,
         // and one marked after is in `blocked`, where the marking wakes it.
         // SAFETY: live Thread (current), `SCHED` held.
-        if unsafe { Thread::is_ending(me_ptr) } {
+        if heed_exit && unsafe { Thread::is_ending(me_ptr) } {
             return WaitResult::Ended;
         }
 
