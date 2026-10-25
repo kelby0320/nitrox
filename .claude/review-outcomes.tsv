@@ -226,3 +226,21 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-24	395	73e7edb5	10	tests	optional	unverified	declined		both callers are one line over a pinned helper, in code the host cannot run (the shutdown flush, the hub thread), and no gate meets a departed disk at shutdown or the usb-1 window on demand
 2026-10-24	395	73e7edb5	11	rules-and-docs	optional	unverified	fixed	907a3f02	the decision-log entry, new in this PR, edited in place
 2026-10-24	395	73e7edb5	12	rules-and-docs	optional	demonstrated	fixed	907a3f02	the two part cites removed from usb.md
+2026-10-25	396	7ac0b846	1	logic+error-paths	blocking	demonstrated	fixed	9a2ccd04	fill and write-back waits use wait_on_io and loop until their PO completes; a marked thread waiting on a completed fill got false/-4 before, a_fill_wait_answers_the_fill_not_the_exit fails without it
+2026-10-25	396	7ac0b846	2	logic+error-paths	blocking	demonstrated	fixed	9a2ccd04	same class and fix as 1: wait_status waits out its write, a wait the exit woke waits again
+2026-10-25	396	7ac0b846	3	architecture	blocking	demonstrated	fixed	816dab62	the ring-3 carve-out recorded in lock-ordering.md beside the #PF one, the contradicted rules amended, and end_if_ending asserts nothing held and preemption on in debug builds; no test fires the assertions
+2026-10-25	396	7ac0b846	4	error-paths	worth-fixing	demonstrated	fixed	d172d33b	slots held by a SlotHold field and given back by its drop alone; the failure-injection probe went 1 -> 0 before and left every count unchanged after, for a timer and a channel pair
+2026-10-25	396	7ac0b846	5	architecture	worth-fixing	demonstrated	fixed	d172d33b	growth capped at one block (130,944 slots), reproduced stopping at 65,536; the per-process bound deferred, TODO(deadline-slot-quota)
+2026-10-25	396	7ac0b846	6	tests+error-paths	worth-fixing	demonstrated	fixed	d172d33b	a host test counts its own thread's slots across a timer and a channel pair; a SlotHold drop that gives nothing back fails it
+2026-10-25	396	7ac0b846	7	tests	worth-fixing	demonstrated	fixed	c81ac757	wait_on answers Ended to a marked current thread on the host, and wait_on_io does not; each removal fails it
+2026-10-25	396	7ac0b846	8	tests	worth-fixing	demonstrated	fixed	c81ac757	the spawn guard is place_spawned, held by a host test where the boot test caught its removal 3 runs in 5
+2026-10-25	396	7ac0b846	9	tests	worth-fixing	demonstrated	fixed	c81ac757	suspend_with_fault run on the host with a marked current thread answers Terminate; without the check it fails
+2026-10-25	396	7ac0b846	10	rules-and-docs	worth-fixing	demonstrated	fixed	0d6e9185	the stray Implemented note removed; its quota point is in the deadline-slot-quota entry
+2026-10-25	396	7ac0b846	11	rules-and-docs	worth-fixing	demonstrated	fixed	816dab62	the process-exit paragraphs say the last thread out delivers ChildExited
+2026-10-25	396	7ac0b846	12	architecture	worth-fixing	demonstrated	fixed	0d6e9185	sys_thread_exit's spec says the recorded status wins
+2026-10-25	396	7ac0b846	13	logic	optional	unverified	fixed	9a2ccd04	swept with 1: the shutdown flush waits with wait_on_io to its bound; held by the wait_on_io half of 7's test
+2026-10-25	396	7ac0b846	14	logic+architecture	optional	demonstrated	deferred	d172d33b	TODO(deadline-heap-scan) with the review's measurement; the docs' timing claim corrected in 0d6e9185
+2026-10-25	396	7ac0b846	15	tests	optional	demonstrated	declined		the IPI only ends a sibling sooner than its next tick would, so no test can tell it apart; the doc that claimed the probe waits out the IPI corrected in 0d6e9185
+2026-10-25	396	7ac0b846	16	tests	optional	demonstrated	fixed	d172d33b	a_periodic_timers_re_push_is_held_to_its_slot fails if the re-push goes round push_promised
+2026-10-25	396	7ac0b846	17	rules-and-docs	optional	demonstrated	fixed	d172d33b	Slots variants documented; user_process_ref in 4382f85d
+2026-10-25	396	7ac0b846	18	rules-and-docs	optional	demonstrated	fixed	4382f85d	test_support moved to thread/test_support.rs, thread.rs back to 1028 and its entry lowered
