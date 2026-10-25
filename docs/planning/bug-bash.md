@@ -2384,3 +2384,25 @@ before it is fixed.
   Fixed in `b87075a6`, each read against `main` first and each still wrong; the refusal text was
   wider than found, the storage service sending and receiving them too. T2-16's marker was already
   in `map_file`; ext4's `CLAUDE.md` now says it.
+
+### Found on the laptop — main at c5e59d4d, 2026-10-25
+
+Found by the maintainer at the laptop's prompt after reinstalling, not by a run.
+
+- [ ] **laptop-3** `userspace/nxsh/src/paths.rs:131` — `open` and `save` take no relative path
+  with a `.` or a `/` in it, so neither takes a plain file name: `open hello.txt` fails, as does
+  §4's own example, `open a.txt b.txt`.
+  - Their arguments are lexed in expression mode, where `.` and `/` are operators: `hello.txt`
+    arrives as a field access, and `Documents/hello.txt` as the name `Documents` and then the
+    path `/hello.txt`.
+  - `path_args` keeps words, names and strings, and drops anything else without a word
+    (`:131-139`).
+  - So `open hello.txt` and `save out.txt` fail "needs a path", and `open Documents/hello.txt`
+    reads `Documents`, then `/hello.txt`. On the laptop, `Documents` a directory under `/home`,
+    it failed "cannot size `/home/Documents`".
+  - An absolute path, `~/…`, a quoted path and a bare name with neither all work. `cd` takes its
+    argument in word mode, so `cd Documents/sub` works. The gates name absolute paths.
+  - Demonstrated on the laptop at `c5e59d4d`, and by a temporary host test: the tokens
+    `Ident("Documents")` and `Word("/hello.txt")`; `open hello.txt` and `save out.txt` refused for
+    want of a path; `save Documents/out.txt` refused for the format of `/p/Documents`; and
+    `open ./Documents/hello.txt` read the file. Logic. Medium. Untriaged.
