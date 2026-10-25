@@ -83,8 +83,8 @@ fn shared_page() -> Option<(u64, u64)> {
     Some((mem as u64, page as u64))
 }
 
-/// The count in `page` 20 ms after an exit began, then 50 ms later. `sys_process_exit` closes the
-/// handles before it reaches the siblings, so the first read waits out the IPI that stops them.
+/// The count in `page` 20 ms after an exit began, then 50 ms later: `sys_process_exit` closes the
+/// handles first, so the first read waits out what stops a sibling, an IPI or the next tick.
 fn counts_settled(page: u64) -> (u64, u64) {
     // SAFETY: `page` stays mapped until its owner unmaps it, after this.
     let count = || unsafe { &*(page as *const AtomicU64) }.load(Ordering::Relaxed);

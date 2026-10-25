@@ -444,7 +444,7 @@ Creates a new thread in the **calling process** and returns a `Thread` handle (`
 ```rust
 fn sys_thread_exit(status: i32) -> !
 ```
-Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive). Does not return. (Syscall number `17`.)
+Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive); after a `sys_process_exit` by another of its threads, its `status` is that call's, not this one's. Does not return. (Syscall number `17`.)
 
 ```rust
 fn sys_process_exit(status: i32) -> !
@@ -572,7 +572,7 @@ Receives a message from `ch` (requires `RECV`). Returns `WouldBlock` if no messa
 ```rust
 fn sys_timer_create(flags: TimerFlags) -> isize
 ```
-Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT | DUPLICATE | INSPECT | TRANSFER`. `flags` must be a valid `TimerFlags` (none defined yet → must be 0). The timer brings its own place among the kernel's deadlines, so arming it never fails and holding many delays no one else's: `OutOfMemory` here if that place cannot be made. (Syscall number `8`; implemented in the wait-queues slice.)
+Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT | DUPLICATE | INSPECT | TRANSFER`. `flags` must be a valid `TimerFlags` (none defined yet → must be 0). The timer brings its own place among the kernel's deadlines, so arming it never fails and holding many fails no one else's: `OutOfMemory` here if that place cannot be made. (Syscall number `8`; implemented in the wait-queues slice.)
 
 ```rust
 fn sys_timer_set(timer: RawHandle, deadline_ns: u64, interval_ns: u64) -> isize

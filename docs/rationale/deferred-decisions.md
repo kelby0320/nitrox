@@ -2360,13 +2360,6 @@ the boot chain does not already exercise, remains deferred. Trigger: a case that
 expressed as "the boot completes and the harness agrees". See
 `docs/conventions/qemu-integration-tests.md`.
 
-> **Implemented 2026-10-22**, on the bug bash's report of this panic and its siblings (a wake
-> past full run queues, the 65th blocked thread): the scheduler holds at most `MAX_THREADS`
-> (512) threads, a spawn past them refused, and every list a thread can be on — each CPU's run
-> queue and reap list, the blocked and suspended lists — is reserved to hold them all. A
-> system-wide cap, not a per-process one: one process can still take every thread, which is
-> the quota question the bash's later findings raise for the view broker and storage service.
-
 **One process can take every deadline-heap slot — `TODO(deadline-slot-quota)`.** A timer brings one
 slot and an IPC endpoint four (2026-10-25), and the heap grows to cover them, to one buddy block:
 about 131,000 slots. A process creating some 32,000 endpoints or 131,000 timers takes them all,

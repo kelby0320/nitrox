@@ -360,7 +360,8 @@ init (`MAX_THREADS` placed threads and a boot thread per CPU, each waiting on on
 most); a `Timer` brings one more, and an IPC endpoint one per `BlockBounded` send it can hold.
 Each reserves at creation, growing the heap outside `SCHED` if every slot is promised, and gives
 back at destruction. So a push never finds the heap full: a process holding many timers pays at
-creation, and delays no one else's wait. A debug build stops a push of a kind holding more entries
+creation, and fails no one else's wait. Its removals are a scan, so holding very many still
+slows others' timed waits (`TODO(deadline-heap-scan)`). A debug build stops a push of a kind holding more entries
 than slots, and a give-back of slots never promised.
 
 ## Decisions (locked 2026-06-26)
