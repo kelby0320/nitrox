@@ -119,12 +119,20 @@ const _: () = assert!(core::mem::offset_of!(ExceptionFrame, rip) == 17 * 8);
 /// `dispatch = sym …` names a function it did not generate. The guard is skipped on the
 /// diverging paths, reachable only from a context holding nothing, so the scope it would restore
 /// is the empty one.
+///
+/// It is every interrupt's way back to ring 3, so it ends a thread whose process is exiting there
+/// ([`crate::sched::end_if_ending`]); the body is a function of its own, so a `return` comes back.
 macro_rules! irq_dispatcher {
     ($(#[$attr:meta])* fn $name:ident($frame:ident: *mut ExceptionFrame) $body:block) => {
         $(#[$attr])*
         extern "C" fn $name($frame: *mut ExceptionFrame) {
             let _lock_scope = crate::libkern::lockrank::enter_interrupt();
-            $body
+            fn body($frame: *mut ExceptionFrame) $body
+            body($frame);
+            // SAFETY: the stub-built frame in RDI, valid for this call.
+            if unsafe { (*$frame).cs } & 3 == 3 {
+                crate::sched::end_if_ending();
+            }
         }
     };
 }

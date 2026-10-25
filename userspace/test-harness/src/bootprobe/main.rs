@@ -40,6 +40,7 @@ use libkern::{
 
 mod accounts;
 mod authority;
+mod exits;
 mod files;
 mod gates;
 mod policy;
@@ -51,6 +52,7 @@ mod views;
 
 use accounts::*;
 use authority::*;
+use exits::*;
 use files::*;
 use gates::*;
 use policy::*;
@@ -212,6 +214,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & payload_sealed_test()
         & map_needs_read_test()
         & spawn_copy_needs_duplicate_test(root_ns)
+        & exit_with_a_waiter_test(root_ns)
+        & exit_with_a_running_sibling_test(root_ns)
+        & exit_while_spawning_test(root_ns)
+        & thread_exit_under_load_test(root_ns)
         & continuation_test(root_ns)
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)

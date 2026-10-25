@@ -6,11 +6,12 @@
 //! `docs/architecture/overview.md`.
 
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, SysCaps};
+use crate::libkern::{AllocError, ExitStatus, KBox, SysCaps};
 use crate::mm::PhysAddr;
 use crate::mm::addr_space::AddressSpace;
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// A process kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
@@ -34,6 +35,15 @@ pub struct Process {
     /// **Ambient system capabilities** (`docs/architecture/syscaps.md`): granted at spawn
     /// (`child = parent & args.syscaps`, never amplified), **immutable**, checked at the boundary.
     syscaps: SysCaps,
+    /// `0` while the process runs; once a thread has asked it to exit, that exit's status, packed
+    /// by [`pack`]. Its other threads end themselves, and the last out reports this status.
+    ending: AtomicU64,
+}
+
+const ENDING: u64 = 1 << 63;
+
+fn pack(status: ExitStatus) -> u64 {
+    ENDING | (u64::from(status.kind) & 0x7fff_ffff) << 32 | u64::from(status.code as u32)
 }
 
 impl Process {
@@ -51,6 +61,7 @@ impl Process {
             parent_notif: None,
             namespace: None,
             syscaps: SysCaps::empty(),
+            ending: AtomicU64::new(0),
         })
     }
 
@@ -66,12 +77,26 @@ impl Process {
             parent_notif: None,
             namespace: None,
             syscaps,
+            ending: AtomicU64::new(0),
         })
     }
 
     /// This process's ambient system capabilities. Immutable after construction.
     pub fn syscaps(&self) -> SysCaps {
         self.syscaps
+    }
+
+    /// Record that the process is exiting with `status`, unless a thread asked first, and answer
+    /// the status it exits with.
+    pub fn begin_ending(&self, status: ExitStatus) -> ExitStatus {
+        let _ = self.ending.compare_exchange(0, pack(status), Ordering::AcqRel, Ordering::Acquire);
+        self.ending().unwrap_or(status)
+    }
+
+    /// The status the process is exiting with, once a thread has asked it to.
+    pub fn ending(&self) -> Option<ExitStatus> {
+        let v = self.ending.load(Ordering::Acquire);
+        (v != 0).then_some(ExitStatus { kind: (v >> 32) as u32 & 0x7fff_ffff, code: v as u32 as i32 })
     }
 
     /// The process identifier.
@@ -153,6 +178,17 @@ mod tests {
         assert_eq!(p.pid(), 7);
         assert!(p.magic_ok());
         assert!(p.address_space_root().is_none());
+    }
+
+    #[test]
+    fn the_first_exit_asked_for_is_the_one_a_process_ends_with() {
+        init_global_heap();
+        let p = Process::try_new(7).unwrap();
+        assert_eq!(p.ending(), None);
+        let first = ExitStatus { kind: 2, code: -11 };
+        assert_eq!(p.begin_ending(first), first);
+        assert_eq!(p.begin_ending(ExitStatus { kind: 0, code: 3 }), first);
+        assert_eq!(p.ending(), Some(first));
     }
 
     #[test]

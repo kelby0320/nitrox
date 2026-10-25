@@ -449,7 +449,7 @@ Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status)
 ```rust
 fn sys_process_exit(status: i32) -> !
 ```
-Exits the **calling process** with `status`: the kernel tears down every sibling thread of the caller's process (an `owner_pid` scan of the run/blocked/suspended queues — unregistering blocked siblings from their waits first), delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), then terminates the calling thread and reaps the process (freeing its address space). Does not return. (Syscall number `16`.)
+Exits the **calling process** with `status`: the kernel closes the process's handles, records `status` (a second `sys_process_exit` racing the first exits with the first's), and sets every other thread of the process on its way to end: a blocked one is woken and its `sys_wait` never returns to it, a suspended one is resumed to terminate, and one running on another CPU is stopped by an interrupt. Each ends on its way back to ring 3, so whatever it held is let go. The last thread out delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), and the process is reaped (freeing its address space). Does not return. (Syscall number `16`.)
 
 ```rust
 fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: u64) -> isize

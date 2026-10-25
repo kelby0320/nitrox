@@ -228,6 +228,9 @@ pub fn spawn_user_sched(
         g.next_tid = g.next_tid.wrapping_add(1);
         t
     };
+    let process_ptr = process.as_ptr();
+    // SAFETY: `process` pins the live `Process`, and the thread built from it keeps it alive.
+    let exiting = || unsafe { &*(process_ptr as *const crate::object::Process) }.ending().is_some();
     // Heavy work outside the lock (consumes `process` on success).
     let thread = Thread::try_new_user(tid, process, entry, user_sp, boot_args)?;
     let r = into_objref(thread);
@@ -244,6 +247,12 @@ pub fn spawn_user_sched(
 
     let leftover = {
         let mut g = SCHED.lock();
+        // Under the hold `exit_process` marks a process's threads in, so a thread placed after
+        // it is marked here instead.
+        if exiting() {
+            // SAFETY: `obj` is the new thread, pinned by `r`; `SCHED` held.
+            unsafe { Thread::set_ending(obj) };
+        }
         match place_thread(&mut g, r, false) {
             Ok(()) => return Ok(handle),
             Err(returned) => returned, // carry out of the locked block

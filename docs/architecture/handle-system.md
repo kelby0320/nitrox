@@ -325,9 +325,13 @@ observes `PeerClosed` (decision log, 2026-07-24).
 
 The mechanism, and why it is shaped this way:
 
-- The exiting thread only **marks** itself (`Thread::set_process_ended`). It
-  holds rank-1 `SCHED` and never returns from `finish_exit`, so it cannot do
-  the work itself.
+- The process's last thread out only **marks** itself
+  (`Thread::set_process_ended`) and queues the pid for the **reaper thread**,
+  which it wakes. It holds rank-1 `SCHED` and never returns from `finish_exit`,
+  so it cannot do the work itself; and a CPU kept busy may not reach its own
+  `reap_pending` for as long as the load lasts, so the reaper does not wait for
+  one. `sys_process_exit` closes the table before any of this, in its own
+  syscall context, and the reaper finds it empty.
 - `reap_pending` — thread context, no `SCHED` held, never IRQ context — sees
   the mark on a reaped thread and calls `handle::global::close_all_owned_by`.
 - That sweep **batches**: it unlinks entries under the rank-3 lock, releases

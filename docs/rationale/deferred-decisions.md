@@ -2360,16 +2360,6 @@ the boot chain does not already exercise, remains deferred. Trigger: a case that
 expressed as "the boot completes and the harness agrees". See
 `docs/conventions/qemu-integration-tests.md`.
 
-**`REAP_RESERVE` is a userspace-reachable cap that aborts when crossed.** `exit_process`
-sweeps every sibling of the exiting process into `reap[this_cpu]` in one `SCHED` hold, and
-since 2026-08-14 an over-full push refuses rather than growing (growing was allocation under
-the rank-1 lock — F11 — so the refusal is right). `sys_thread_create` has no per-process
-thread limit, so a process with more than `REAP_RESERVE` (= `READY_RESERVE`, 32) threads that
-block and then exit panics the kernel. Fix shape when taken: reap in batches across several
-lock holds, or cap threads per process; both are changes to the exit path rather than to a
-constant. Trigger: a per-process thread cap landing, a real workload approaching 32 threads,
-or the first report of this panic.
-
 > **Implemented 2026-10-22**, on the bug bash's report of this panic and its siblings (a wake
 > past full run queues, the 65th blocked thread): the scheduler holds at most `MAX_THREADS`
 > (512) threads, a spawn past them refused, and every list a thread can be on — each CPU's run
@@ -2409,6 +2399,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| `REAP_RESERVE`, a userspace-reachable cap that aborts when crossed | 2026-10-25 | The sweep it capped is gone: a process's exit only marks its threads, and each parks itself on the reap list of the CPU it ends on, as a lone thread's exit always did. The reap lists hold `MAX_THREADS` since 2026-10-22, and nothing pushes more than one thread at a time. |
 | `copy` and `remove` slow on a real disk (`fs-throughput`) | 2026-10-13 | **Phase 6 Part H**, measured on the laptop beside Linux on the same machine and fixed until it was not the bottleneck: ext4 allocating and freeing in runs, a grow's blocks not read back, each server caching its metadata, and more than a page a command — 6.7 times Linux's time to 0.73 over fifteen runs. The number went into Phase 6's Definition of Done (Part H.5, the maintainer's call); the two costs left are `TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`, above. |
 | Extent-tree splitting and index nodes (`fs-server-ext4`) | 2026-10-08 | **Phase 6 Part H.1**, `userspace/fs-server-ext4/src/extent.rs`: a tree appended to, split and deepened as ext4's own appends leave one, cut and folded back into the inode, and freed whole, at any depth; held to `debugfs`' reading of every map and to `e2fsck -fn`. **The trigger arrived on review**: the entry said creating *files* in one directory was unbounded, which held for empty files only — with data, the PR #370 review's probe and its author's stopped at about the 815th, and Part H's tree to copy holds 4,096. Checking it found four more in the same code, fixed with it: a removed file with a tree freed nothing, a failed grow kept every block it took, a 32,768-block extent read as a hole, and an unwritten extent as its blocks' old contents ([`ext4-fs-server-rw.md`](../architecture/ext4-fs-server-rw.md) § *The extent tree*). |
 | Saying why a stick did not mount (`unmounted-why`) | 2026-10-07 | **The storage table's `note` column, Phase 6 Part G** — why a filesystem found is not mounted, in the words of the service's log line, which comes from the same function; `disk --list` shows it. Files does not: its Drives lists mounts, and a stick that needs formatting is formatted with `with admin disk --format`. [`storage.md`](../architecture/storage.md) §9. |

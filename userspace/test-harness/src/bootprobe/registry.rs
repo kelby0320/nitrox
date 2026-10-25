@@ -4,7 +4,7 @@ use super::*;
 
 /// **Wait `ns`**, on a channel of its own that nothing signals: `sys_wait` takes an absolute deadline
 /// and answers `TimedOut`.
-fn nap(ns: u64) {
+pub(super) fn nap(ns: u64) {
     let (mut ours, mut theirs) = (0u64, 0u64);
     // SAFETY: valid writable out-params.
     let cr = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) };

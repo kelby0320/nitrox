@@ -224,8 +224,8 @@ struct SchedState {
     /// next scheduler entry **on the same CPU**, never by the thread itself (still running
     /// on its stack at exit) and never cross-CPU: a thread parks itself here and then
     /// `switch_into`s off its stack, so freeing it from another CPU mid-switch would be a
-    /// use-after-free. A **list** so a process exit can reap its siblings alongside the
-    /// caller. Pre-reserved per CPU (see [`MAX_THREADS`]).
+    /// use-after-free. A **list** because several threads can end on a CPU before its next
+    /// scheduler entry. Pre-reserved per CPU (see [`MAX_THREADS`]).
     reap: [KVec<ObjectRef>; MAX_CPUS],
     /// Threads suspended after a ring-3 fault, off the run queue with their `ExceptionFrame`
     /// on their kernel stacks. `sys_exception_resume` moves one back to `ready` or marks it
@@ -265,7 +265,7 @@ struct SchedState {
     /// [`DEFERRED_DROP_RESERVE`]); the only one is [`wake_entropy_seed_waiters`].
     deferred_drops: KVec<ObjectRef>,
     /// Processes whose last thread has exited and whose **handle table** still needs
-    /// closing. Pushed by [`exit_process`] under `SCHED`; drained by the
+    /// closing. Pushed by [`end_process_if_last`] under `SCHED`; drained by the
     /// [reaper thread](reaper_body) and, opportunistically, by [`reap_pending`].
     /// **CPU-agnostic, unlike [`reap`](Self::reap)**: closing a handle table is keyed on pid
     /// and touches no stack, so one reaper thread can serve the whole machine.
@@ -577,6 +577,9 @@ unsafe fn switch_into(
     // (cache-warm, minimal migration). SAFETY: `next_obj` pinned (now current); `SCHED`
     // still held.
     unsafe { Thread::set_last_cpu(next_obj, SchedState::this_cpu() as u8) };
+    // SAFETY: as above.
+    let ending = unsafe { Thread::is_ending(next_obj) };
+    with_ending(SchedState::this_cpu(), |e| e.store(ending, Ordering::Release));
     // Raise the outgoing thread's mid-switch-out guard **while still holding `SCHED`** (so
     // it is set before the lock release makes any `ready` entry for `out_obj` visible to a
     // stealer). `context_switch` clears it after it commits `out_obj`'s `saved_sp`, at which
@@ -723,6 +726,12 @@ pub(crate) extern "C" fn thread_enter() -> ! {
         let obj = cur.as_ptr();
         // SAFETY: `current` is pinned alive and we hold the lock.
         match unsafe { Thread::user_entry(obj) } {
+            // A thread whose process began exiting before it first ran never reaches ring 3.
+            // SAFETY: as above.
+            Some(_) if unsafe { Thread::is_ending(obj) } => {
+                drop(g);
+                exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
+            }
             Some((entry, user_sp)) => {
                 // SAFETY: as above.
                 let ktop = unsafe { Thread::kstack_top(obj) }.expect("a user thread has a kernel stack");

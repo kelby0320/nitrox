@@ -153,8 +153,10 @@ Two corollaries:
   drains the list (`mem::take`) under the lock and drops the threads *after*
   releasing — `KernelStack`'s `Drop` unmaps and returns frames to the buddy
   (rank 6), which must not happen under rank 1. `reap` is a `KVec` (not one
-  slot) because `exit_process` reaps the caller's torn-down sibling threads
-  alongside it; the drain still happens off the lock.
+  slot) because several threads can end on one CPU before its next scheduler
+  entry; the drain still happens off the lock. No thread parks another: a
+  process's exit only marks its siblings, and each ends itself on its way back
+  to ring 3, its kernel stack unwound.
 - **Suspend obeys the block-and-switch discipline.** `suspend_with_fault`
   (the ring-3 exception path) delivers the fault notification + parks the
   thread in `suspended` and context-switches away — all under one `SCHED`

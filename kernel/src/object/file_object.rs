@@ -1179,7 +1179,8 @@ fn wait_status(po: &ObjectRef) -> i32 {
     match unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) } {
         // SAFETY: `po` is a live `PendingOperation` reference held across the call.
         crate::sched::WaitResult::Signaled(_) => unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0,
-        // OutOfMemory (waiter registration failed); TimedOut cannot occur (no deadline).
+        // OutOfMemory (waiter registration failed), or the process is exiting and the fault ends
+        // the thread; TimedOut cannot occur (no deadline).
         _ => crate::syscall::error::KError::OutOfMemory as i32,
     }
 }
@@ -1217,6 +1218,8 @@ fn wait_for_fill(po: &ObjectRef) -> bool {
                 // SAFETY: `po` is a live `PendingOperation` reference held across the call.
                 return unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 == 0;
             }
+            // Every later wait would answer the same at once: the fault fails, and ends the thread.
+            crate::sched::WaitResult::Ended => return false,
             _ => park_briefly(),
         }
     }
