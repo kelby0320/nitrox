@@ -10,8 +10,9 @@ mutation. Group B fixed 2026-10-22: the twelve capability and rights leaks, and 
 rides with them, kmem-11. Group C fixed 2026-10-23: ext4's findings and those in the code both
 servers share, then FAT's, with fs-3's two halves and the trials' doc claims. Group D fixed
 2026-10-24: the block layer's bounds, AHCI's recovery, a kept USB slot's commands, the shutdown's
-flush walk and the hot-plug window.** Part D of
-[`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the laptop, what PR #365's two
+flush walk and the hot-plug window. Group E fixed 2026-10-25: a process's exit, which frees no
+thread in place now, and the deadline heap's slots.** Part D of
+[`pre-phase-7.md`](pre-phase-7.md) fills it: the bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
 ## How a finding is kept
@@ -1671,7 +1672,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   Fixed in `deabe050`; fails without it:
   `a_woken_thread_reaped_before_it_runs_leaves_nothing_naming_it`.
 
-- [ ] **sched-5** `kernel/src/sched/exit.rs:86` — When `exit_process` reaps a sibling blocked in
+- [x] **sched-5** `kernel/src/sched/exit.rs:86` — When `exit_process` reaps a sibling blocked in
   `sys_wait` (or woken but not yet resumed), the sibling is never resumed. `sys_wait`'s on-stack
   `refs: [Option<ObjectRef>; 32]` never drop, so each waited-on object leaks one reference. Thread
   A of a process waits on IPC endpoint E while thread B calls `sys_process_exit`. A's stack
@@ -1682,8 +1683,13 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   calls `process_exit` and the parent's wait returns 1. Test: the child first starts a second
   thread blocked in `sys_wait` on that endpoint, then calls `process_exit`. The parent's wait
   times out (-12) after 2 s. error-paths. medium. **Fix.**
+  Fixed in `ca8bd8c3`: no thread frees another. The exit marks its siblings, waking a blocked
+  one, and each ends itself on its way back to ring 3, its kernel stack unwound; a sibling running
+  on another CPU, which ran on before, is stopped by a reschedule IPI. Fails without it:
+  `exit_with_a_waiter_test` and `exit_with_a_running_sibling_test` (boot-probe), and
+  `a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells_the_cpu_running_one`.
 
-- [ ] **sched-6** `kernel/src/sched/deadline.rs:31` — The deadline heap is one global reserve of 16
+- [x] **sched-6** `kernel/src/sched/deadline.rs:31` — The deadline heap is one global reserve of 16
   entries (`HEAP_RESERVE`, `spawn.rs:32`), shared by every armed timer, finite-deadline `sys_wait`
   and BlockBounded send, with no per-process bound. Because of sched-1, closing or exiting does not
   give the slots back. A process arms far-future timers until refused, and may then exit. From then
@@ -1695,6 +1701,10 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   armed (the other 5 slots were in use), then OutOfMemory (-4). After closing all 11 and waiting
   50 ms, a fresh `sys_timer_set` still returned -4, and a finite-deadline `sys_wait` on an
   unsignalled timer returned -4 immediately. logic, error-paths, tests. medium. **Fix.**
+  Fixed in `d60373c3`: every slot is promised before anything pushes into it, one per thread at
+  init, one with each timer and four with each IPC endpoint, the heap growing outside `SCHED` to
+  cover them. Fails without it: `many_timers_test` (boot-probe), which armed 11 of its timers
+  before and arms 640 now, and `reserving_past_the_capacity_grows_the_heap_to_cover_every_slot_promised`.
 
 - [x] **sched-7** `kernel/src/sched/timers.rs:97` — `fire_timer` disarms a one-shot timer
   (`set_armed(0,0)`) when it fires even if no thread waits, and `Timer::already_signaled` requires
@@ -1711,7 +1721,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   PR #391's review found; fails without them:
   `a_one_shot_timer_fired_with_no_waiter_still_reads_signaled`.
 
-- [ ] **sched-8** `kernel/src/sched/exit.rs:181` — When the last thread of a process ends through
+- [x] **sched-8** `kernel/src/sched/exit.rs:181` — When the last thread of a process ends through
   `exit_thread` (`sys_thread_exit`, or a supervisor's Terminate after a fault), `set_process_ended`
   runs but the pid is never pushed to `ended_pids` and the reaper is not woken, although the
   comment there says it is deferred to the reaper. `exit_process` does both (`exit.rs:237-240`).
@@ -1722,6 +1732,10 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   delivered `PeerClosed`, and the parent's wait timed out (-12) after 3 s. With the spinners
   stopped, the same wait returned 1. Control under the same load: a child using `sys_process_exit`
   closed promptly (wait=1). error-paths. low. **Fix.**
+  Fixed in `ca8bd8c3`: the last thread out of a process, however it left, queues the pid and wakes
+  the reaper (`end_process_if_last`, shared by both exits). Fails without it:
+  `thread_exit_under_load_test` (boot-probe) and
+  `the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_recorded`.
 
 - [x] **sched-9** `kernel/src/sched/deadline.rs:84` — Test gap: the sift-up branch of
   `deadline::remove`, taken when the entry swapped into the hole is smaller than its new parent, is
@@ -2228,7 +2242,7 @@ architecture lens returned no findings.
   Fixed in `1b6ee7ea`, and in `76e0dddd` for a waiter whose clock was read before the fire, which
   PR #391's review found; fails without them:
   `a_one_shot_timer_fired_with_no_waiter_still_reads_signaled`.
-- [ ] **sched-15** `kernel/src/sched/exit.rs:111` — When `exit_process` reaps a sibling blocked in
+- [x] **sched-15** `kernel/src/sched/exit.rs:111` — When `exit_process` reaps a sibling blocked in
   `sys_wait`, the thread's kernel stack is freed without `sys_wait`'s `refs` array being dropped,
   so every object it waited on leaks one reference. An IPC endpoint pinned this way never runs
   `IpcChannel::drop`, so its peer never gets PeerClosed. Thread A of process P waits on endpoint E
@@ -2246,7 +2260,8 @@ architecture lens returned no findings.
   was the same probe with the sibling faulting on a bad stack, so it never blocked in `sys_wait`.
   There the pipe closed and the child's exit was reaped in 313 ms, matching the 300 ms sleep.
   Probes reverted; git status clean. architecture. medium. **Fix**, as sched-5.
-- [ ] **sched-16** `kernel/src/sched/deadline.rs:31` — The deadline heap is a single global
+  Fixed in `ca8bd8c3`, as sched-5.
+- [x] **sched-16** `kernel/src/sched/deadline.rs:31` — The deadline heap is a single global
   16-entry reserve with no per-process accounting, and closed armed timers (sched-11) hold their
   slots for good. An unprivileged process, needing no syscap for `sys_timer_create` or
   `sys_timer_set`, creates 16 timers and arms them far in the future. From then on every
@@ -2260,7 +2275,8 @@ architecture lens returned no findings.
   consumer's handling was read, not run. A test that arms 16 timers from one process, then calls
   `sys_wait` with a deadline from another, would settle it. architecture. medium.
   **Fix**, as sched-6.
-- [ ] **sched-17** `kernel/src/sched/exit.rs:181` — `exit_thread`'s last-thread branch marks the
+  Fixed in `d60373c3`, as sched-6.
+- [x] **sched-17** `kernel/src/sched/exit.rs:181` — `exit_thread`'s last-thread branch marks the
   process ended but never queues its pid in `ended_pids` or wakes the reaper, though the comment
   says this is "deferred to the reaper". The handle table is closed only when this CPU next runs
   `reap_pending`. A process's last thread leaves through `sys_thread_exit`, or a supervisor
@@ -2277,6 +2293,7 @@ architecture lens returned no findings.
   `reap_pending`. The reaper thread was never woken. It is bounded by CPU load, and the path is
   rare, since most exits go through `exit_process`. Probes reverted; git status clean.
   architecture. low. **Fix**, as sched-8.
+  Fixed in `ca8bd8c3`, as sched-8.
 
 What held up: `sys_wait` registers and blocks under one SCHED hold, and `wait_try_wake`'s CAS plus
 `make_runnable`'s blocked-list lookup absorb a second waker. `reap_blocked_matching` unregisters
