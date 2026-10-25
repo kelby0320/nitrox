@@ -88,6 +88,9 @@ pub(super) fn with_ending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R 
 /// kernel stack unwound and nothing held.
 pub fn end_if_ending() {
     if with_ending(SchedState::this_cpu(), |e| e.load(Ordering::Acquire)) {
+        // What makes freeing sound at an interrupt's tail (`lock-ordering.md`).
+        crate::libkern::lockrank::assert_user_entry_safe();
+        assert_user_entry_preempt_safe();
         // The status is the process's, recorded by the exit that marked the thread.
         exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
     }
@@ -194,9 +197,8 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     unreachable!("switched away from an exited thread");
 }
 
-/// Terminate the **current thread** with exit `status` and switch away forever: the last of a
-/// process out ends it. Used by `sys_thread_exit`, the resume-`Terminate` path,
-/// [`end_if_ending`] and kernel thread bodies.
+/// Terminate the **current thread** with exit `status`; the last of a process out ends it. Used by
+/// `sys_thread_exit`, the resume-`Terminate` path, [`end_if_ending`] and kernel thread bodies.
 pub fn exit_thread(status: ExitStatus) -> ! {
     // Reclaim any earlier exited thread first, so `reap` has room for us.
     reap_pending();
@@ -207,9 +209,8 @@ pub fn exit_thread(status: ExitStatus) -> ! {
     finish_exit(g, me);
 }
 
-/// Terminate the **whole process** of the current thread with exit `status`: record it, set every
-/// sibling to end itself ([`end_siblings`]) and exit; the last thread out ends the process. Used
-/// by `sys_process_exit`. A kernel/boot thread degrades to a plain [`exit_thread`].
+/// Terminate the **whole process** of the current thread with `status`: record it, set every
+/// sibling to end itself ([`end_siblings`]) and exit. Used by `sys_process_exit`.
 pub fn exit_process(status: ExitStatus) -> ! {
     // Reclaim any earlier exited thread first, so `reap` has room.
     reap_pending();

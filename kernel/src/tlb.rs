@@ -22,8 +22,9 @@
 //!
 //! ## Caller contract
 //!
-//! Call from **preemptible kernel context only**, never from an IRQ handler or DPC (the window
-//! enables interrupts, and frees, the only initiators, are forbidden there) and **never while
+//! Call from **preemptible kernel context only**, never from an IRQ handler or DPC that broke
+//! into kernel code (the window enables interrupts, and frees, the only initiators, are forbidden
+//! there; an interrupt taken from ring 3 broke into none, `lock-ordering.md`) and **never while
 //! holding a spinlock**: not `SCHED` (remote CPUs spin for it IF-masked and could not ack), and
 //! preempting a lock holder stalls every waiter. The mm layer's shootdown sites are reached via
 //! `reap_pending` outside all locks.

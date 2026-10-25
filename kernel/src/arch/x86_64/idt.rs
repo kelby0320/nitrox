@@ -428,7 +428,7 @@ extern "C" fn tlb_shootdown_stub() {
 
 irq_dispatcher! {
 /// TLB-shootdown IPI dispatcher: invalidate and acknowledge (in [`crate::tlb`]), then EOI.
-/// The frame is unused. Never reschedules or blocks.
+/// The frame is unused. Its body never reschedules or blocks.
 fn tlb_shootdown_dispatch(_frame: *mut ExceptionFrame) {
     crate::tlb::on_ipi();
     // SAFETY: ring-0 IPI context; a single write acknowledges the local APIC.

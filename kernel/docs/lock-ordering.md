@@ -218,7 +218,9 @@ drop later, in thread context with no lock held.
 > on the same CPU. The rule is therefore strict: **nothing that can reach a plain
 > spinlock may run under `SCHED` or in IRQ context — neither allocation nor an
 > `ObjectRef` drop.** Refs that must be released from such contexts are moved
-> (never dropped) into `deferred_drops` within its reserve.
+> (never dropped) into `deferred_drops` within its reserve. The tail of an
+> interrupt taken from ring 3, which interrupted no kernel code, is the exception:
+> § *A thread ends itself at an interrupt's return to ring 3*.
 
 ## The AddressSpace lock and the page-fault handler
 
@@ -243,6 +245,24 @@ faulted page's stale not-present TLB entry after installing the PTE (unlike the
 eager `map_vma`, which maps into a not-yet-loaded address space and skips the
 flush).
 
+## A thread ends itself at an interrupt's return to ring 3
+
+`sched::end_if_ending` runs at the tail of every interrupt and exception taken from
+ring 3 (`irq_dispatcher!`), and at the syscall tail. For a thread whose process is
+exiting it calls `exit_thread`, whose `reap_pending` frees kernel stacks and
+handle-table entries and may start a TLB shootdown: what the rule above forbids in
+IRQ context. It is sound there, for the reason the `#PF` fault-in is:
+
+- The interrupt was taken **from ring 3**, so it interrupted no kernel code. This CPU
+  holds no lock, plain or otherwise, and preemption is enabled; `end_if_ending`
+  asserts both in debug builds. No allocator holder can be waiting under it.
+- The body has sent its EOI by then (or, for an exception, has none to send), and it
+  runs on the thread's own kernel stack, so the shootdown's interrupt window nests
+  nothing unfinished. `exit_thread` never returns to the handler; the dispatcher's
+  lock scope, opened at depth 0, is left as the empty one, as on every diverging path.
+- The ring-3 exception path did the same before it: a supervisor's `Terminate` makes
+  `user_fault` call `exit_thread` from inside `exception_dispatch`.
+
 ## The Namespace binding lock
 
 `Namespace` (`kernel/src/object/namespace.rs`) is a syscall-accessed object — its
@@ -264,15 +284,16 @@ otherwise its entries pin their objects forever, and the visible symptom is
 that its end of a pipe never closes so a peer never observes `PeerClosed`
 (decision log, 2026-07-24).
 
-The sweep cannot run where the process actually dies. `exit_process` /
-`exit_thread` hold rank-1 `SCHED` and never return from `finish_exit`, and
+The sweep cannot run where the process actually dies, in its last thread's exit:
+that thread holds rank-1 `SCHED` and never returns from `finish_exit`, and
 releasing an object reference runs a destructor that reaches the rank-6
 allocator — and, for an `IpcChannel` or a `Timer`, takes rank-1 `SCHED` itself,
 to wake blocked receivers or take the timer out of the deadline heap. So:
 
-1. The exiting thread only *marks* itself (`Thread::set_process_ended`) under
-   `SCHED`.
-2. `reap_pending` — thread context, no `SCHED` held, never IRQ context — sees
+1. The last thread out only *marks* itself (`Thread::set_process_ended`) under
+   `SCHED`, and queues the pid for the reaper thread.
+2. `reap_pending` — no `SCHED` held, never in an interrupt that broke into kernel
+   code — sees
    the mark on a reaped thread and calls
    `handle::global::close_all_owned_by(pid)`.
 3. That sweep unlinks entries **under rank 3** into a fixed-size batch, then
@@ -504,12 +525,13 @@ notification under `SCHED` and copies the 64-byte record to user memory **after*
 releasing the lock (never hold the `IrqSpinLock` across a potentially-faulting
 user copy).
 
-Process exit obeys the same discipline: `sched::exit_thread`/`exit_process`
-deliver `ChildExited` to the parent's notification channel under `SCHED`
-(borrowing the channel pointer via the child `Process`'s `parent_notif`, never
-dropping an `ObjectRef` under the lock) **before** parking the exiting thread —
-immediate delivery so a parent blocked in `sys_wait` wakes, while stack
-reclamation stays deferred to reap.
+Process exit obeys the same discipline: the last thread out of a process
+(`sched::end_process_if_last`, from `exit_thread` or `exit_process`, which may be a
+sibling ending itself after another thread's `sys_process_exit`) delivers
+`ChildExited` to the parent's notification channel under `SCHED` (borrowing the
+channel pointer via the child `Process`'s `parent_notif`, never dropping an
+`ObjectRef` under the lock) **before** parking itself — immediate delivery so a
+parent blocked in `sys_wait` wakes, while stack reclamation stays deferred to reap.
 
 A related multi-user-thread invariant (not a lock, but switch-path state): the
 per-CPU trap/syscall stack (TSS.RSP0 + the syscall-entry stack) is re-armed for

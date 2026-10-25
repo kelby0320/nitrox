@@ -84,10 +84,11 @@ This is intentional — strict equality matching prevents subtle ABI mismatches.
 - `unwrap()` outside of tests or known-impossible cases (with `// unwrap: <reason>` comment).
 - Allocating in the IRQ handler or DPC — and **freeing counts as allocating**:
   an `ObjectRef` drop can reach the allocator locks, so no drops there (or under
-  `SCHED`) either; park refs in `sched`'s `deferred_drops` instead. (The ring-3
-  `#PF` fault-in path is the one documented exception: `map_page` may allocate
-  intermediate page-table frames — see `kernel/docs/lock-ordering.md`
-  § The AddressSpace lock.)
+  `SCHED`) either; park refs in `sched`'s `deferred_drops` instead. Two documented
+  exceptions, both reached only from ring 3, where nothing is held: the `#PF`
+  fault-in path (`map_page` may allocate intermediate page-table frames —
+  `kernel/docs/lock-ordering.md` § The AddressSpace lock), and a thread ending
+  itself at an interrupt's return to ring 3 (§ A thread ends itself).
 - Holding a spinlock across a function call that might allocate or block.
 - Manual `Box::leak` patterns. If you need a `'static` reference, the design is wrong.
 - Direct hardware port I/O outside the arch layer.
