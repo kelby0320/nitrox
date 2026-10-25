@@ -220,15 +220,14 @@ pub use self::io_stage::{Bootstrap, Setup, bootstrap, pipe, send_setup, send_set
 /// but carries transferred handles.
 #[cfg(feature = "io")]
 mod io_stage {
-    use super::{SetupPayload, Streams, setup_is_pending};
+    use super::{STREAM_MASK, SetupPayload, Streams, setup_is_pending};
     use crate::wire::{Record, Result, WireError};
     use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
     use libkern::abi::{IPC_HANDLE_MAX, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, SENDMODE_BLOCK};
     use libkern::syscall::{
-        SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4,
-        syscall6,
+        SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall6,
     };
 
     const E_WOULDBLOCK: i64 = -11; // KError::WouldBlock
@@ -379,22 +378,11 @@ mod io_stage {
 
         fn recv_setup(&self) -> Result<Setup> {
             let mut buf: Box<[u8; IPC_MSG_SIZE]> = Box::new([0u8; IPC_MSG_SIZE]);
-            let mut handles = [0u64; IPC_HANDLE_MAX];
-            let mut count: usize = 0;
-            loop {
-                // SAFETY: valid msg/handles/count out-params.
-                let r = unsafe {
-                    syscall4(
-                        SYS_CHANNEL_RECV,
-                        self.endpoint,
-                        buf.as_mut_ptr() as u64,
-                        handles.as_mut_ptr() as u64,
-                        (&raw mut count) as u64,
-                    )
+            let mut sent = loop {
+                let r = match libkern::channel_recv(self.endpoint, &mut buf) {
+                    Ok(sent) => break sent,
+                    Err(r) => r,
                 };
-                if r == 0 {
-                    break;
-                }
                 if r == E_WOULDBLOCK {
                     let wh = [self.endpoint];
                     let mut result = [0u8; 24];
@@ -407,7 +395,7 @@ mod io_stage {
                     continue;
                 }
                 return Err(map_err(r));
-            }
+            };
             let n = u32::from_le_bytes([
                 buf[OFF_PAYLOAD_LEN],
                 buf[OFF_PAYLOAD_LEN + 1],
@@ -418,9 +406,16 @@ mod io_stage {
                 return Err(WireError::UnexpectedEof);
             }
             let payload = SetupPayload::decode(&buf[OFF_PAYLOAD..OFF_PAYLOAD + n])?;
-            // Streams first, the terminal after: split by the bitmap's population count,
-            // not the handle count, which includes both.
-            let (streams, terminal) = super::split_handles(&payload, &handles[..count])?;
+            // Checked before any handle is taken, so a refused message closes all it brought.
+            super::split_handles(&payload, &[0; IPC_HANDLE_MAX][..sent.count()])?;
+            // Streams first, the terminal after: what the payload names, and no more; the rest
+            // close as `sent` drops.
+            let named = (payload.streams & STREAM_MASK).count_ones() as usize + usize::from(payload.terminal);
+            let mut handles = [0u64; IPC_HANDLE_MAX];
+            for (i, h) in handles[..named].iter_mut().enumerate() {
+                *h = sent.take(i).unwrap_or(0);
+            }
+            let (streams, terminal) = super::split_handles(&payload, &handles[..named])?;
             Ok(Setup { streams, argv: payload.argv, env: payload.env, terminal })
         }
     }

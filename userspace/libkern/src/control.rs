@@ -6,8 +6,8 @@
 //! says to take it out of the wait set.
 
 use crate::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE};
+use crate::channel::channel_recv;
 use crate::error::KError;
-use crate::syscall::{SYS_CHANNEL_RECV, SYS_HANDLE_CLOSE, syscall1, syscall4};
 
 /// What a control channel held.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -25,29 +25,11 @@ pub enum Control {
 /// carries one.
 pub fn recv(control: u64) -> Control {
     let mut msg = [0u8; IPC_MSG_SIZE];
-    let mut handles = [0u64; 8];
-    let mut count = 0usize;
-    // SAFETY: valid recv out-params on this frame; a non-blocking receive on a handle the caller
-    // owns.
-    let r = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            control,
-            msg.as_mut_ptr() as u64,
-            handles.as_mut_ptr() as u64,
-            (&raw mut count) as u64,
-        )
+    let _sent = match channel_recv(control, &mut msg) {
+        Ok(sent) => sent,
+        Err(r) if r == KError::PeerClosed.as_i32() as i64 => return Control::Closed,
+        Err(_) => return Control::Nothing,
     };
-    if r == KError::PeerClosed.as_i32() as i64 {
-        return Control::Closed;
-    }
-    if r != 0 {
-        return Control::Nothing;
-    }
-    for &h in &handles[..count.min(handles.len())] {
-        // SAFETY: a handle the kernel just installed in this process.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    }
     let len = u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize;
     op_of(&msg[IPC_HEADER_SIZE..IPC_HEADER_SIZE + len.min(IPC_MSG_SIZE - IPC_HEADER_SIZE)])
 }

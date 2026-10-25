@@ -79,12 +79,18 @@ Don't skip step 4. The spec doc is part of the contract.
 |---|---|
 | Raw syscall functions | Async executors |
 | ABI types (`#[repr(C)]`) | Typed handles (`Handle<T, M>`) |
-| `UserPtr<T>` wrappers | Higher-level RAII guards |
+| `UserPtr<T>` wrappers | RAII guards, but the one below |
 | `KError`, `Rights`, etc. | Path resolution helpers |
 | Thin `Result<>` wrappers | Stream readers/writers |
 | Constants (sizes, limits) | Custom data structures |
 
 If something doesn't strictly belong here but you find yourself wanting to put it here, the answer is almost always "put it in `libos` instead."
+
+**The one guard here is `channel::Received`** (pre-Phase-7 Part D, group F): the handles a message
+brought, closed when it drops unless taken. `sys_channel_recv` installs whatever a sender attaches,
+so every receiver must close what it did not ask for, the no-alloc ones (`auth-service`) included,
+and the lowest layer is the only one they all share. Receive through `channel_recv`, or
+`channel_recv_raw` into a `static mut` buffer, never a raw `SYS_CHANNEL_RECV`.
 
 ## Testing
 
