@@ -1227,7 +1227,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   (16,367×). A 64,017-byte stream (4,000 columns, 48,000 rows) aborted with 'memory allocation
   of 131072 bytes failed' against a 2 GiB cap. A 5,017-byte stream with 1,000 columns and 1,000
   rows gave ~32 MB. Probes removed. error-paths, trust-boundary, architecture. Medium. **Later.**
-- [ ] **proto-9** `userspace/libstream/src/channel.rs:234` — `IpcPort::recv` passes `recv_handles`
+- [x] **proto-9** `userspace/libstream/src/channel.rs:234` — `IpcPort::recv` passes `recv_handles`
   and `count` to SYS_CHANNEL_RECV, which installs every transferred handle in the receiver's
   table, and never closes or returns them. nxsh's `drain_diagnostics` (main.rs:127-132) and
   librsproto `session::round_trip` (session.rs:251-262) close the same class, each with a
@@ -1241,7 +1241,12 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   (table.rs:~2746-2769); no boot. A boot with a stage that sends handles on stdout, then
   counting nxsh's handles or watching its next spawn, would settle it. logic, error-paths,
   trust-boundary, architecture. Medium. **Fix.**
-- [ ] **proto-10** `userspace/logging-service/src/main.rs:601` — `drain_source` receives log
+  Fixed in `286484f2`: `IpcPort::recv` receives through `libkern::channel_recv`, whose `Received`
+  closes each handle not taken from it; `clip` reads through `IpcPort` and is fixed with it.
+  libstream's setup takes the handles its payload names and closes the rest. Fails without it:
+  `ipc_port_closes_what_it_was_sent_test` (boot-probe). The sweep, `2ec3294b`, moved every other
+  receive onto it; many left handles open.
+- [x] **proto-10** `userspace/logging-service/src/main.rs:601` — `drain_source` receives log
   appends with `recv(h)`, which writes RECV_HANDLES and RECV_COUNT, and never closes them. Only
   `received()` (main.rs:401-410) closes transferred handles, and it runs on the read-session
   path. Any holder of a log channel sends appends or TSM1 bodies with 8 handles attached; the
@@ -1251,6 +1256,9 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   process sending appends with transferred handles on a log channel, while watching the
   service's handle count or the global table's live slots, would settle it. error-paths. Medium.
   **Fix.**
+  Fixed in `286484f2`: every receive in the service returns a `Received`, which closes what came
+  as it drops. Fails without it: `log_closes_what_it_was_sent_test` (boot-probe), an append sent
+  with a channel's end, whose peer must see it closed.
 - [ ] **proto-11** `userspace/libstream/src/wire.rs:573` — The `SCHEMA_FIELD_HINT_CAP` caps on
   `Vec::with_capacity` in `read_list`, `read_row_values` and `Schema::decode`, the allocation
   defence against hostile counts, have no test. A peer sending a u32 count of 4,000,000,000
@@ -1462,7 +1470,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   Fixed in `f2f7146d`; fails without it: test-interactive, a Ctrl-C at `nitrox login:` and the
   password after it.
 
-- [ ] **sec-6** `userspace/auth-service/src/main.rs:379` — auth-service never closes handles that
+- [x] **sec-6** `userspace/auth-service/src/main.rs:379` — auth-service never closes handles that
   arrive with a message. `serve_resolve` (312) and `serve_session` (381) receive into
   `RECV_HANDLES` and `RECV_COUNT`, and nothing closes them. The comment "an Authenticate
   carries no transferred handles" describes well-behaved senders, not something enforced.
@@ -1476,6 +1484,9 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   per-process handle quota was found. Not run to exhaustion. A boot gate that sends a 3-handle
   message on an oracle session many times and checks that the handle count stays flat would
   settle it. tests. Medium. **Fix.**
+  Fixed in `286484f2`: both receives return a `Received`, which closes what came as it drops.
+  Fails without it: `auth_closes_what_it_was_sent_test` (boot-probe), a message sent on
+  `/svc/auth` with a channel's end, whose peer must see it closed.
 
 - [ ] **sec-7** `userspace/libcrypto/src/lib.rs:36` — No test fails if `ct_eq` compares only the
   last byte. `ct_eq_basic` is the only test, and every unequal pair in it differs in the last
