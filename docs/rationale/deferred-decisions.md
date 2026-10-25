@@ -2367,6 +2367,21 @@ expressed as "the boot completes and the harness agrees". See
 > system-wide cap, not a per-process one: one process can still take every thread, which is
 > the quota question the bash's later findings raise for the view broker and storage service.
 
+**One process can take every deadline-heap slot — `TODO(deadline-slot-quota)`.** A timer brings one
+slot and an IPC endpoint four (2026-10-25), and the heap grows to cover them, to one buddy block:
+about 131,000 slots. A process creating some 32,000 endpoints or 131,000 timers takes them all,
+and every other process's `sys_timer_create` and `sys_channel_create` then fail `OutOfMemory`. It
+is the quota question the 512-thread cap left (2026-10-22): one process can take every thread
+too. Trigger: per-process accounting (the rlimits item above), or a report of the refusal.
+
+**Removing a deadline is a scan of the heap — `TODO(deadline-heap-scan)`.** `deadline::remove` finds an
+entry by its target, linearly, under `SCHED` with interrupts masked, and a debug build's
+`push_promised` counts a kind the same way. While the heap held 16 that cost nothing; it now
+holds what is promised, so a process holding tens of thousands of armed timers slows every timed
+`sys_wait`'s resume and every re-arm: about 46 µs a push and remove at 66,000 entries, as PR
+#396's review measured on the host, against 19 ns at 16. The fix keeps each entry's index in its owner, for an O(log n)
+removal. Trigger: a measured stall, or a workload holding thousands of armed timers.
+
 **Every device interrupt is pinned to the BSP, so a BSP park kills all I/O.**
 `install_isa_irq` (`kernel/src/arch/x86_64/ioapic.rs:370`) routes each GSI to `Irq::id()` —
 the boot CPU — in physical destination mode. `sched::leave_online` (2026-08-13) keeps the

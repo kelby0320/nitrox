@@ -158,7 +158,6 @@ pub unsafe fn timer_closing(timer: *mut ()) {
     let mut g = SCHED.lock();
     // SAFETY: the memory is whole until the drop returns; `SCHED` held.
     unsafe { unheap(&mut g, timer) };
-    deadline::release_slots(&mut g, Slots::Timer);
 }
 
 /// Remove `timer`'s heap entry, if it has one.

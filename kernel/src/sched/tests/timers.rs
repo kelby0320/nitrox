@@ -241,15 +241,47 @@ fn an_entry_of_a_kind_with_every_slot_taken_stops_a_debug_build() {
 #[test]
 fn reserving_past_the_capacity_grows_the_heap_to_cover_every_slot_promised() {
     init_global_heap();
-    for _ in 0..200 {
-        reserve_slots(Slots::Endpoint).unwrap();
-    }
-    {
-        let g = SCHED.lock();
-        assert!(g.deadlines.capacity() >= g.deadline_slots.iter().sum::<usize>());
-        assert!(g.deadline_slots[deadline::DeadlineKind::PendingSend as usize] >= 200 * IpcChannel::MAX_PENDING_SENDS);
-    }
-    for _ in 0..200 {
-        give_back_slots(Slots::Endpoint);
-    }
+    let holds: std::vec::Vec<SlotHold> = (0..200).map(|_| SlotHold::reserve(Slots::Endpoint).unwrap()).collect();
+    let g = SCHED.lock();
+    assert!(g.deadlines.capacity() >= g.deadline_slots.iter().sum::<usize>());
+    assert!(g.deadline_slots[deadline::DeadlineKind::PendingSend as usize] >= 200 * IpcChannel::MAX_PENDING_SENDS);
+    drop(g);
+    drop(holds);
+}
+
+#[test]
+fn the_heap_grows_to_the_largest_allocation_and_no_further() {
+    use deadline::{MOST_SLOTS, grown_capacity};
+    assert_eq!(grown_capacity(10, 8), Some(16), "twice its size");
+    assert_eq!(grown_capacity(40, 8), Some(40), "or what is promised");
+    const { assert!(MOST_SLOTS > 66_564) };
+    assert_eq!(grown_capacity(66_564, 66_560), Some(MOST_SLOTS), "where twice would be past a block");
+    assert_eq!(grown_capacity(MOST_SLOTS, MOST_SLOTS - 4), Some(MOST_SLOTS));
+    assert_eq!(grown_capacity(MOST_SLOTS + 1, MOST_SLOTS), None);
+}
+
+/// Counted on this test's own thread, so others creating and dropping theirs do not disturb it.
+#[test]
+fn a_timer_and_a_channel_give_back_their_slots_when_dropped() {
+    init_global_heap();
+    let before = deadline::slots_held_here();
+    let timer = crate::object::Timer::try_new().unwrap();
+    assert_eq!(deadline::slots_held_here(), before + 1);
+    drop(timer);
+    assert_eq!(deadline::slots_held_here(), before);
+    let pair = IpcChannel::try_new_pair(4).unwrap();
+    assert_eq!(deadline::slots_held_here(), before + 2 * IpcChannel::MAX_PENDING_SENDS as isize);
+    drop(pair);
+    assert_eq!(deadline::slots_held_here(), before);
+}
+
+/// A periodic timer's re-push goes into the slot the timer holds, checked as every push is.
+#[test]
+#[should_panic(expected = "no slot promised")]
+fn a_periodic_timers_re_push_is_held_to_its_slot() {
+    init_global_heap();
+    let t = new_timer();
+    let mut st = heap_with(t.as_ptr(), 1_000, 250);
+    st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 0;
+    fire_expired_deadlines(&mut st, 1_100);
 }

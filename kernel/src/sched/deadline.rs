@@ -1,5 +1,7 @@
 use super::{MAX_CPUS, MAX_THREADS, SCHED, SchedState, push_reserved};
 use crate::libkern::{AllocError, KVec};
+use crate::mm::PAGE_SIZE;
+use crate::mm::buddy::MAX_ORDER;
 use crate::object::IpcChannel;
 
 /// What a deadline-heap entry fires when its `deadline_ns` elapses.
@@ -28,18 +30,16 @@ pub(super) struct Entry {
     pub channel: usize,
 }
 
-/// The heap capacity reserved at [`init`](super::init), every slot promised to a thread: a
-/// thread waits on one deadline at most, and there are `MAX_THREADS` placed threads at most and a
-/// boot thread per CPU.
+/// The slots [`init`](super::init) promises the threads: one each, for `MAX_THREADS` placed threads
+/// and a boot thread per CPU.
 pub(super) const HEAP_RESERVE: usize = MAX_THREADS + MAX_CPUS;
 
-/// What brings its own heap slots, from creation to destruction: a [`Timer`] one, and an IPC
-/// endpoint one per send it can hold.
-///
-/// [`Timer`]: crate::object::Timer
+/// What brings its own heap slots, held by a [`SlotHold`] from its creation to its destruction.
 #[derive(Clone, Copy)]
 pub enum Slots {
+    /// A [`Timer`](crate::object::Timer): one, for its one entry.
     Timer,
+    /// An IPC endpoint: one per send it can hold, each of which may carry a deadline.
     Endpoint,
 }
 
@@ -59,18 +59,44 @@ impl Slots {
     }
 }
 
-/// Promise `slots` their place in the heap, growing it outside `SCHED` first if every slot is
-/// promised, so that no push finds it full and a process holding many timers pays at creation.
-pub fn reserve_slots(slots: Slots) -> Result<(), AllocError> {
+/// Slots promised to the object this is a field of, given back once, when that is dropped.
+pub struct SlotHold(Slots);
+
+impl SlotHold {
+    /// Promise `slots`, growing the heap outside `SCHED` first if every slot it has is promised.
+    pub fn reserve(slots: Slots) -> Result<SlotHold, AllocError> {
+        reserve_slots(slots)?;
+        Ok(SlotHold(slots))
+    }
+}
+
+impl Drop for SlotHold {
+    fn drop(&mut self) {
+        release_slots(&mut SCHED.lock(), self.0);
+    }
+}
+
+/// The most slots one heap holds: one buddy block, less a page for the allocator's header.
+pub(super) const MOST_SLOTS: usize = ((PAGE_SIZE << MAX_ORDER) - PAGE_SIZE) / core::mem::size_of::<Entry>();
+
+/// Twice `capacity`, or `promised` if more, never past [`MOST_SLOTS`]; `None` past it.
+pub(super) fn grown_capacity(promised: usize, capacity: usize) -> Option<usize> {
+    (promised <= MOST_SLOTS).then(|| promised.max(2 * capacity).min(MOST_SLOTS))
+}
+
+pub(super) fn reserve_slots(slots: Slots) -> Result<(), AllocError> {
+    // TODO(deadline-slot-quota): one process can take every slot.
     loop {
         let want = {
             let mut g = SCHED.lock();
             let promised = g.deadline_slots.iter().sum::<usize>() + slots.count();
             if promised <= g.deadlines.capacity() {
                 g.deadline_slots[slots.kind()] += slots.count();
+                #[cfg(test)]
+                HELD_HERE.with(|h| h.set(h.get() + slots.count() as isize));
                 return Ok(());
             }
-            promised.max(2 * g.deadlines.capacity())
+            grown_capacity(promised, g.deadlines.capacity()).ok_or(AllocError)?
         };
         let mut grown = KVec::new();
         grown.try_reserve(want)?;
@@ -84,15 +110,23 @@ pub(super) fn release_slots(g: &mut SchedState, slots: Slots) {
     let held = &mut g.deadline_slots[slots.kind()];
     debug_assert!(*held >= slots.count(), "slots given back that were never promised");
     *held = held.saturating_sub(slots.count());
+    #[cfg(test)]
+    HELD_HERE.with(|h| h.set(h.get() - slots.count() as isize));
 }
 
-/// [`release_slots`], for a constructor that fails after reserving.
-pub fn give_back_slots(slots: Slots) {
-    release_slots(&mut SCHED.lock(), slots);
+#[cfg(test)]
+std::thread_local! {
+    /// This test thread's slots not given back, so a test can count its own.
+    static HELD_HERE: core::cell::Cell<isize> = const { core::cell::Cell::new(0) };
 }
 
-/// Leave the larger of `h` and `grown` in `h`, its entries in their order, and return the other
-/// for dropping outside `SCHED`.
+/// See [`HELD_HERE`].
+#[cfg(test)]
+pub(crate) fn slots_held_here() -> isize {
+    HELD_HERE.with(|h| h.get())
+}
+
+/// Leave the larger of `h` and `grown` in `h`, entries in order; return the other, to drop later.
 pub(super) fn regrow(h: &mut KVec<Entry>, mut grown: KVec<Entry>) -> KVec<Entry> {
     if grown.capacity() <= h.capacity() {
         return grown;
@@ -103,8 +137,7 @@ pub(super) fn regrow(h: &mut KVec<Entry>, mut grown: KVec<Entry>) -> KVec<Entry>
     core::mem::replace(h, grown)
 }
 
-/// [`push`] an entry its owner holds a slot for. A kind with more entries than slots is a
-/// reservation missing somewhere, which a debug build stops at.
+/// [`push`] an entry its owner holds a slot for; a debug build stops a kind past its slots.
 pub(super) fn push_promised(g: &mut SchedState, e: Entry) -> Result<(), AllocError> {
     debug_assert!(
         g.deadlines.iter().filter(|x| x.kind == e.kind).count() < g.deadline_slots[e.kind as usize],
@@ -157,6 +190,7 @@ pub(super) fn pop_min(h: &mut KVec<Entry>) -> Option<Entry> {
 /// is re-armed (drop its stale entry), or a `BlockBounded` send is delivered
 /// early / its endpoint closes (drop its pending-send deadline).
 pub(super) fn remove(h: &mut KVec<Entry>, target: usize, kind: DeadlineKind) -> bool {
+    // TODO(deadline-heap-scan): a scan, under `SCHED`, of a heap one process can fill.
     let Some(i) = h.iter().position(|e| e.target == target && e.kind == kind) else {
         return false;
     };

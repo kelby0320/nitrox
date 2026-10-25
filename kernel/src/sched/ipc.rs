@@ -545,7 +545,6 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
         deadline::remove(&mut g.deadlines, po as usize, deadline::DeadlineKind::PendingSend);
         signal_pending_op(&mut g, po, crate::syscall::error::KError::PeerClosed as i32);
     }
-    deadline::release_slots(&mut g, Slots::Endpoint);
     // Release `SCHED` before dropping the orphans (an `ObjectRef` drop must not run under
     // the rank-1 lock).
     drop(g);

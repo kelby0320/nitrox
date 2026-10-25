@@ -116,7 +116,7 @@ pub static EXIT_CLOSED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// The deadline min-heap: armed-timer and `sys_wait`-deadline expiries keyed by absolute
 /// monotonic ns, drained on each tick. A pure binary heap, host-tested.
 mod deadline;
-pub use deadline::{Slots, give_back_slots, reserve_slots};
+pub use deadline::{SlotHold, Slots};
 
 /// Scheduler statistics: the per-CPU event counters behind `/proc/sched/stats`, their
 /// snapshot, and the pure text formatter. Follows the **capture → format → synthesize**
@@ -256,9 +256,8 @@ struct SchedState {
     blocked: KVec<ObjectRef>,
     /// The deadline min-heap, drained on each tick. Never fuller than its promised slots.
     deadlines: KVec<deadline::Entry>,
-    /// The heap slots promised, by [`deadline::DeadlineKind`]: the threads' at
-    /// [`init`], and each timer's and endpoint's from [`reserve_slots`]. The heap's capacity
-    /// covers their sum.
+    /// The heap slots promised, by [`deadline::DeadlineKind`]: the threads' at [`init`], each
+    /// timer's and endpoint's in its [`SlotHold`]. The heap's capacity covers their sum.
     deadline_slots: [usize; 3],
     /// **Per-CPU** event counters, incremented at sites that all hold this lock.
     stats: [stats::Counters; MAX_CPUS],

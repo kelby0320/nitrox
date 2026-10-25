@@ -15,6 +15,7 @@
 //! already-null and skips. **Invariant:** endpoint references are released only in
 //! syscall/boot context, **never under `SCHED`**, so `drop` may itself take `SCHED`.
 
+use crate::sched::{SlotHold, Slots};
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
@@ -233,6 +234,8 @@ pub struct IpcChannel {
     header: KObjectHeader,
     magic: u64,
     inner: UnsafeCell<Inner>,
+    /// Its sends' deadline-heap slots, given back after `Drop` takes their entries out.
+    _slots: SlotHold,
 }
 
 struct Inner {
@@ -286,16 +289,7 @@ impl IpcChannel {
     /// Allocate one unconnected endpoint, refcount one. Ring and waiter vector are reserved up
     /// front (the only fallible growth), so later pushes never allocate under `SCHED`.
     fn try_new_endpoint(cap: usize) -> Result<KBox<Self>, AllocError> {
-        crate::sched::reserve_slots(crate::sched::Slots::Endpoint)?;
-        let made = Self::try_build_endpoint(cap);
-        if made.is_err() {
-            crate::sched::give_back_slots(crate::sched::Slots::Endpoint);
-        }
-        made
-    }
-
-    /// [`try_new_endpoint`](Self::try_new_endpoint)'s allocations, once its heap slots are held.
-    fn try_build_endpoint(cap: usize) -> Result<KBox<Self>, AllocError> {
+        let slots = SlotHold::reserve(Slots::Endpoint)?;
         let recv = MsgRing::with_capacity(cap)?;
         let mut recv_waiters: KVec<*mut ()> = KVec::new();
         recv_waiters.try_reserve(Self::MAX_WAITERS)?;
@@ -311,6 +305,7 @@ impl IpcChannel {
                 peer: core::ptr::null_mut(),
                 us_reg: core::ptr::null_mut(),
             }),
+            _slots: slots,
         })
     }
 
