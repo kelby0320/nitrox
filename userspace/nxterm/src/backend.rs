@@ -8,8 +8,8 @@
 use libkern::abi::SpawnArgs;
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_TRANSFER, RIGHT_WAIT};
 use libkern::{
-    SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN,
-    SYS_WAIT, kprint, syscall1, syscall4, syscall5,
+    SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, kprint,
+    syscall1, syscall4, syscall5,
 };
 use librsproto::{OP_TTY_ATTACH_BACKEND, OP_TTY_INPUT, OP_TTY_OUTPUT, RS_FLAG_REPLY, decode, encode};
 
@@ -21,7 +21,6 @@ const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
 static mut MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut WAIT_HANDLES: [u64; 4] = [0; 4];
 static mut WAIT_RESULTS: [u8; 24 * 4] = [0; 24 * 4];
 static mut CH0: u64 = 0;
@@ -177,13 +176,10 @@ pub unsafe fn attach(root_ns: u64) -> Option<(u64, Backend)> {
 
 /// Receive one message on `ch` and report whether it is a non-error reply.
 fn recv_is_ok(ch: u64) -> bool {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(SYS_CHANNEL_RECV, ch, (&raw mut MSG) as u64, (&raw mut HANDLES) as u64, (&raw mut RECV_COUNT) as u64)
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded; `MSG` is this module's buffer, lent for the call.
+    let Ok(_sent) = (unsafe { libkern::channel_recv_raw(ch, &raw mut MSG) }) else {
         return false;
-    }
+    };
     // SAFETY: bounded read-only slice over the just-received message.
     unsafe {
         let payload_len = u32::from_le_bytes([MSG[4], MSG[5], MSG[6], MSG[7]]) as usize;
@@ -208,20 +204,14 @@ impl Backend {
     /// no longer signalled, would never wake to retry. `PeerClosed` is recorded here for
     /// [`is_gone`](Self::is_gone).
     pub fn output(&mut self) -> Option<&'static [u8]> {
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                self.channel,
-                (&raw mut MSG) as u64,
-                (&raw mut HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
+        // SAFETY: single-threaded; `MSG` is this module's buffer, lent for the call.
+        let _sent = match unsafe { libkern::channel_recv_raw(self.channel, &raw mut MSG) } {
+            Ok(sent) => sent,
+            Err(rr) => {
+                self.gone = rr == libkern::error::KError::PeerClosed.as_i32() as i64;
+                return None;
+            }
         };
-        if rr != 0 {
-            self.gone = rr == libkern::error::KError::PeerClosed.as_i32() as i64;
-            return None;
-        }
         // SAFETY: bounded read-only slice over the just-received message. `'static` holds because
         // `MSG` is a module static and the caller consumes the bytes before the next receive.
         unsafe {

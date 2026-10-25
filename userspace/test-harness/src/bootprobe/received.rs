@@ -109,3 +109,78 @@ pub(super) fn received_closes_what_was_not_taken_test() -> bool {
     kprint(b"boot-probe: Received closes each handle not taken from it ok\n");
     true
 }
+
+/// **Every server a client opens a session on closes what the client sends it on the session**:
+/// the clipboard, a terminal, the input server's consumers, `/bin`'s projection and a filesystem.
+pub(super) fn sessions_close_what_they_were_sent_test(root_ns: u64) -> bool {
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let mut ok = true;
+    let mut check = |what: &[u8], closed: Option<bool>| {
+        if closed != Some(true) {
+            Line::new().s(b"boot-probe: session sent a handle FAIL: ").s(what).s(b" kept it").end();
+            ok = false;
+        }
+    };
+    for (what, path) in [
+        (&b"clipboard-server"[..], &b"/dev/clipboard"[..]),
+        (b"tty-server", b"/dev/tty"),
+        (b"input-server", b"/dev/input/new"),
+    ] {
+        let (st, session) = ns_lookup(root_ns, path, chan);
+        check(what, (st == 0 && session != 0).then(|| sent_end_closes(session, 0x7fff)).flatten());
+        close(session);
+    }
+    for (what, path) in [(&b"profile-server"[..], &b"/bin"[..]), (b"fs-server-ext4", b"/system")] {
+        let mut buf = [0u8; IPC_MSG_SIZE];
+        match librsproto::session::Dir::open(root_ns, path, &mut buf) {
+            Ok(dir) => {
+                check(what, sent_end_closes(dir.endpoint(), 0x7fff));
+                dir.close();
+            }
+            Err(_) => check(what, None),
+        }
+    }
+    if ok {
+        kprint(b"boot-probe: every session closes the handles its client sends ok\n");
+    }
+    ok
+}
+
+/// **A terminal's backend: the handles an attach brings past the backend, and what the backend
+/// sends, are closed.** Any session can attach a backend, so both are a client's to send.
+pub(super) fn tty_backend_closes_what_it_was_sent_test(root_ns: u64) -> bool {
+    use librsproto::OP_TTY_ATTACH_BACKEND;
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: tty backend sent a handle FAIL: ").s(why).end();
+        false
+    };
+    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let (st, tty) = ns_lookup(root_ns, b"/dev/tty", chan);
+    let (Some((ours, theirs)), Some((extra, extra_peer))) = (channel(), channel()) else {
+        close(tty);
+        return fail(b"no channels");
+    };
+    let attached = st == 0
+        && rs_send(tty, OP_TTY_ATTACH_BACKEND, 0x6175, &[], &[theirs, extra])
+        && loop {
+            match receive(tty, clock_ns() + 5_000 * MS) {
+                Some(m) if m.request_id == 0x6175 => break !m.error,
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+    let extra_closed = attached && peer_gone_by(extra_peer, clock_ns() + 2_000 * MS);
+    let sent_closed = attached && sent_end_closes(ours, 0x7fff) == Some(true);
+    [tty, ours, extra_peer].iter().for_each(|&h| close(h));
+    if !attached {
+        return fail(b"the terminal would not take a backend");
+    }
+    if !extra_closed {
+        return fail(b"it kept a handle the attach brought past the backend");
+    }
+    if !sent_closed {
+        return fail(b"it kept what the backend sent");
+    }
+    kprint(b"boot-probe: tty-server closes what a backend and its attach send ok\n");
+    true
+}

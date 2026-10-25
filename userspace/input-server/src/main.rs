@@ -23,15 +23,16 @@ use input_server::{
     BATCH_MAX, Consumer, FRAME_MAX, MAX_DEVICES, MERGE_MAX, PER_DEVICE, batches, lights_request, merge,
 };
 use libkern::abi::{CTRL_OP_SHUTDOWN, INPUT_EVENT_LEN, InputEvent};
+use libkern::channel_recv_raw;
 use libkern::control::Control;
 use libkern::debug::Line;
 use libkern::device::DeviceKind;
 use libkern::error::KError;
 use libkern::{
     CLOCK_MONOTONIC, IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_RECV, RIGHT_SEND,
-    RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ,
-    SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT,
-    exit, kprint, syscall2, syscall4, syscall5,
+    RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE,
+    SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
+    syscall2, syscall4, syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::{OP_INPUT_LIGHTS, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -93,8 +94,6 @@ fn now_ns() -> Option<u64> {
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
-static mut RECV_COUNT: u64 = 0;
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
@@ -654,41 +653,29 @@ fn retire_due(srv: &mut Server) {
 fn take_notices(srv: &mut Server) -> bool {
     let mut settled = false;
     while srv.subscription != 0 {
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                srv.subscription,
-                (&raw mut RECV_MSG) as u64,
-                (&raw mut RECV_HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
+        // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+        let mut sent = match unsafe { channel_recv_raw(srv.subscription, &raw mut RECV_MSG) } {
+            Ok(sent) => sent,
+            Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => {
+                kprint(b"input-server: the device manager has gone; the devices already read stay read\n");
+                close(srv.subscription);
+                srv.subscription = 0;
+                break;
+            }
+            Err(_) => break,
         };
-        if rr == KError::PeerClosed.as_i32() as i64 {
-            kprint(b"input-server: the device manager has gone; the devices already read stay read\n");
-            close(srv.subscription);
-            srv.subscription = 0;
-            break;
-        }
-        if rr != 0 {
-            break;
-        }
-        let mut handles = [0u64; libkern::abi::IPC_HANDLE_MAX];
-        // SAFETY: the kernel wrote the count, the header and that many handles, and this process
-        // is single-threaded, so nothing writes the buffers while they are read here. The payload
-        // read is bounded by the buffer.
-        let (n, count) = unsafe {
-            let count = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
-            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-            let received: &[u64; libkern::abi::IPC_HANDLE_MAX] = &*(&raw const RECV_HANDLES);
-            handles[..count].copy_from_slice(&received[..count]);
+        // `apply` keeps or closes each of these.
+        let count = sent.count();
+        let handles = sent.take_all();
+        // SAFETY: this process is single-threaded, so nothing writes the buffer while it is read
+        // here. The payload read is bounded by the buffer.
+        let n = unsafe {
             let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             let payload = core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], len.min(MSG_LEN - PAYLOAD_OFF));
-            let n = match decode(payload) {
+            match decode(payload) {
                 Ok(m) => notice(m.op, m.body, count),
                 Err(_) => Notice::Malformed,
-            };
-            (n, count)
+            }
         };
         settled |= apply(srv, n, &handles[..count]);
     }
@@ -718,19 +705,11 @@ fn settle(srv: &mut Server) -> bool {
 
 /// Handle a forwarded resolve on the serving endpoint. Returns `false` if the endpoint died.
 fn serve_forward(serve_end: u64, srv: &mut Server) -> bool {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            serve_end,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
+    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+    let _sent = match unsafe { channel_recv_raw(serve_end, &raw mut RECV_MSG) } {
+        Ok(sent) => sent,
+        Err(rr) => return rr != KError::PeerClosed.as_i32() as i64,
     };
-    if rr != 0 {
-        return rr != KError::PeerClosed.as_i32() as i64;
-    }
     // SAFETY: bounded read of the payload, then of the resolve's suffix.
     let (request_id, is_new, ok) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -857,22 +836,14 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             } else if let Some(slot) = srv.channels.iter().position(|&c| c == h && c != 0) {
                 // A signal means the receive queue is non-empty or the peer is gone; treating
                 // both as gone would silently cut the stream of any consumer that ever sends.
-                // SAFETY: valid recv out-params on a live endpoint.
-                let rr = unsafe {
-                    syscall4(
-                        SYS_CHANNEL_RECV,
-                        srv.channels[slot],
-                        (&raw mut RECV_MSG) as u64,
-                        (&raw mut RECV_HANDLES) as u64,
-                        (&raw mut RECV_COUNT) as u64,
-                    )
-                };
-                if rr == KError::PeerClosed.as_i32() as i64 {
+                // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+                let rr = unsafe { channel_recv_raw(srv.channels[slot], &raw mut RECV_MSG) };
+                if rr.as_ref().is_err_and(|&e| e == KError::PeerClosed.as_i32() as i64) {
                     close(srv.channels[slot]);
                     srv.channels[slot] = 0;
                     // Its debt goes with it: nothing could deliver it.
                     srv.consumers[slot] = Consumer::new();
-                } else if rr == 0 {
+                } else if rr.is_ok() {
                     // A consumer's message is the lights it wants; anything else is drained and
                     // ignored, with a line.
                     match consumer_lights() {

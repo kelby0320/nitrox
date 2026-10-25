@@ -62,8 +62,7 @@ struct Kept {
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
 static mut IPC_MSG: [u8; IPC_MSG_LEN] = [0; IPC_MSG_LEN];
-static mut IPC_HANDLES: [u64; init::ready::IPC_HANDLE_MAX] = [0; init::ready::IPC_HANDLE_MAX];
-static mut IPC_COUNT: usize = 0;
+static mut IPC_HANDLES: [u64; IPC_HANDLE_MAX] = [0; IPC_HANDLE_MAX];
 /// Spawn args for an `fs-server-ext4`: the control channel in `handles[0]` (`rdx`), a LOOKUP root.
 static mut SPAWN_FS: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/fs-server-ext4
@@ -455,44 +454,30 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
         say(b": waiting for its Ready failed, error ").i(waited).end();
         return None;
     }
-    // SAFETY: valid recv out-params; on success the kernel installs handles[0].
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ctrl,
-            (&raw mut IPC_MSG) as u64,
-            (&raw mut IPC_HANDLES) as u64,
-            (&raw mut IPC_COUNT) as u64,
-        )
-    };
-    // A queued message is received before the closed peer is: this is a server that exited
-    // without sending anything, not one that refused and then exited.
-    if rr == KError::PeerClosed as i64 {
-        say(b" exited without sending Ready").end();
-        return None;
-    }
-    if rr != 0 {
-        say(b": its Ready could not be received, error ").i(rr).end();
-        return None;
-    }
-    // SAFETY: the kernel wrote the count, the header, and `count` handles.
-    let (count, payload_len) = unsafe {
-        let count = (&raw const IPC_COUNT).read();
-        let len = u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]) as usize;
-        (count, len.min(IPC_MSG_LEN - 24))
+    // A Ready's endpoint is the one handle kept; any other a server sends closes as `sent` drops,
+    // where it would stay in PID 1's table for good.
+    // SAFETY: init is single-threaded; `IPC_MSG` is lent for the call.
+    let mut sent = match unsafe { channel_recv_raw(ctrl, &raw mut IPC_MSG) } {
+        Ok(sent) => sent,
+        // A queued message is received before the closed peer is: this is a server that exited
+        // without sending anything, not one that refused and then exited.
+        Err(rr) if rr == KError::PeerClosed as i64 => {
+            say(b" exited without sending Ready").end();
+            return None;
+        }
+        Err(rr) => {
+            say(b": its Ready could not be received, error ").i(rr).end();
+            return None;
+        }
     };
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: IPC_MSG and IPC_HANDLES are init's own buffers, read after the kernel filled them;
-    // single-threaded init writes them again only at its next receive.
-    let (msg, handles) = unsafe { (&*(&raw const IPC_MSG), &*(&raw const IPC_HANDLES)) };
-    let first = init::ready::parse(&msg[24..24 + payload_len], count);
-    for &extra in &handles[init::ready::handles_to_close(&first, count)] {
-        // SAFETY: a handle that came with the message and is not the endpoint init binds; nothing
-        // else holds it.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, extra) };
-    }
+    // SAFETY: init's own buffer, read after the kernel filled it; single-threaded init writes it
+    // again only at its next receive.
+    let msg = unsafe { &*(&raw const IPC_MSG) };
+    let payload_len = (u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize).min(IPC_MSG_LEN - 24);
+    let first = init::ready::parse(&msg[24..24 + payload_len], sent.count());
     match first {
-        init::ready::First::Ready => return Some(handles[0]),
+        init::ready::First::Ready => return sent.take(0),
         init::ready::First::Refused(reason) if !reason.is_empty() => say(b" refused: ").untrusted(reason).end(),
         init::ready::First::Refused(_) => say(b" refused, giving no reason init could read").end(),
         init::ready::First::Unexpected => say(b" sent something other than a Ready").end(),
@@ -807,17 +792,9 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
             continue;
         }
         loop {
-            // SAFETY: IPC_MSG/IPC_HANDLES/IPC_COUNT are valid writable out-params.
-            let rr = unsafe {
-                syscall4(
-                    SYS_CHANNEL_RECV,
-                    terminal,
-                    (&raw mut IPC_MSG) as u64,
-                    (&raw mut IPC_HANDLES) as u64,
-                    (&raw mut IPC_COUNT) as u64,
-                )
-            };
-            if rr == KError::PeerClosed.as_i32() as i64 {
+            // SAFETY: init is single-threaded; `IPC_MSG` is lent for the call.
+            let rr = unsafe { channel_recv_raw(terminal, &raw mut IPC_MSG) };
+            if rr.as_ref().is_err_and(|&e| e == KError::PeerClosed.as_i32() as i64) {
                 Line::new()
                     .s(b"init: service-mgr has exited -- nothing supervises the services now, ")
                     .s(b"and the machine needs a restart")
@@ -830,24 +807,14 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
                 }
                 break;
             }
-            if rr != 0 {
+            let Ok(_sent) = rr else {
                 break; // WouldBlock: nothing more
-            }
+            };
             // SAFETY: the kernel wrote the message; its payload at offset 24, an op and, for
             // `Finish`, whether to reboot.
-            let (len, op, reboot, handles) = unsafe {
-                (
-                    u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]),
-                    IPC_MSG[24],
-                    IPC_MSG[25] != 0,
-                    (&raw const IPC_COUNT).read(),
-                )
+            let (len, op, reboot) = unsafe {
+                (u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]), IPC_MSG[24], IPC_MSG[25] != 0)
             };
-            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-            for k in 0..handles.min(init::ready::IPC_HANDLE_MAX) {
-                // SAFETY: a handle the kernel installed, which no request carries.
-                unsafe { syscall1(SYS_HANDLE_CLOSE, (&raw const IPC_HANDLES[k]).read()) };
-            }
             if len >= 1 && op == TERMINAL_OP_EMERGENCY && !shell_started {
                 Line::new()
                     .s(b"init: service-mgr asks for the emergency shell -- ")
@@ -943,17 +910,8 @@ fn unmount_one(root_ns: u64, m: &Kept) {
         }
     };
     let answered = sent && wait_one_until(m.control, now_ns().saturating_add(UNMOUNT_TIMEOUT_NS));
-    // SAFETY: IPC_MSG/IPC_HANDLES/IPC_COUNT are valid writable out-params.
-    let received = answered
-        && unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                m.control,
-                (&raw mut IPC_MSG) as u64,
-                (&raw mut IPC_HANDLES) as u64,
-                (&raw mut IPC_COUNT) as u64,
-            )
-        } == 0;
+    // SAFETY: init is single-threaded; `IPC_MSG` is lent for the call.
+    let received = answered && unsafe { channel_recv_raw(m.control, &raw mut IPC_MSG) }.is_ok();
     let mut line = Line::new();
     line.s(b"init: ").s(at);
     if received {
@@ -970,13 +928,6 @@ fn unmount_one(root_ns: u64, m: &Kept) {
             Answer::Failed(why) => line.s(b" unmounted, but not left clean: ").untrusted(why),
             Answer::Unexpected => line.s(b" answered its unmount with something else"),
         };
-        // SAFETY: handles the kernel installed, which no answer carries.
-        unsafe {
-            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-            for k in 0..(&raw const IPC_COUNT).read().min(init::ready::IPC_HANDLE_MAX) {
-                syscall1(SYS_HANDLE_CLOSE, (&raw const IPC_HANDLES[k]).read());
-            }
-        }
     } else if sent {
         line.s(b" did not answer its unmount, and may not be left clean");
     } else {

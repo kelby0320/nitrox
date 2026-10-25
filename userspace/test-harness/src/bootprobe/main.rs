@@ -226,6 +226,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & thread_exit_under_load_test(root_ns)
         & many_timers_test()
         & received_closes_what_was_not_taken_test()
+        & sessions_close_what_they_were_sent_test(root_ns)
+        & tty_backend_closes_what_it_was_sent_test(root_ns)
         & ipc_port_closes_what_it_was_sent_test()
         & auth_closes_what_it_was_sent_test(root_ns)
         & log_closes_what_it_was_sent_test(root_ns)

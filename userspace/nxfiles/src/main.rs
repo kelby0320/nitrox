@@ -85,31 +85,14 @@ fn open_watch(ns: u64) -> Option<u64> {
 
 /// Take every ping queued on the watch, into `buf`: `Ok(true)` if there was one, `Err` once the
 /// service's end has gone. Called only when a wait said the watch was ready.
-fn drain_pings(watch: u64, buf: &mut [u8]) -> Result<bool, ()> {
+fn drain_pings(watch: u64, buf: &mut [u8; libkern::abi::IPC_MSG_SIZE]) -> Result<bool, ()> {
     let mut pinged = false;
     loop {
-        let mut handles = [0u64; 8];
-        let mut count: usize = 0;
-        // SAFETY: valid message, handle and count out-params.
-        let got = unsafe {
-            libkern::syscall4(
-                libkern::SYS_CHANNEL_RECV,
-                watch,
-                buf.as_mut_ptr() as u64,
-                handles.as_mut_ptr() as u64,
-                (&raw mut count) as u64,
-            )
+        let _sent = match libkern::channel_recv(watch, buf) {
+            Ok(sent) => sent,
+            Err(got) if got == libkern::KError::WouldBlock.as_i32() as i64 => return Ok(pinged),
+            Err(_) => return Err(()),
         };
-        if got == libkern::KError::WouldBlock.as_i32() as i64 {
-            return Ok(pinged);
-        }
-        if got != 0 {
-            return Err(());
-        }
-        for &h in handles.iter().take(count.min(8)) {
-            // SAFETY: closing a handle just installed: a watch carries none.
-            unsafe { libkern::syscall1(libkern::SYS_HANDLE_CLOSE, h) };
-        }
         let off = libkern::abi::IPC_HEADER_SIZE;
         let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
         if let Ok(m) = librsproto::decode(&buf[off..off + len.min(buf.len() - off)]) {
@@ -521,7 +504,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     if let Some(now) = read_drives(root_ns) {
         renew_drives(&mut wins, &mut drives, now);
     }
-    let mut ping_buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
+    let mut ping_buf = alloc::boxed::Box::new([0u8; libkern::abi::IPC_MSG_SIZE]);
 
     loop {
         let mut redraw_now = false;

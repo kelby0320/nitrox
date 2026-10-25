@@ -347,22 +347,11 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
         if views_call(cli2, op, 30 + k as u64, b"", &[theirs], &mut exited).is_none() {
             return fail(b"no answer to an op carrying a handle");
         }
-        let mut buf = [0u8; 64];
-        let mut hs = [0u64; 1];
-        let mut count = 0usize;
-        // SAFETY: valid recv out-params; `ours` is this process's.
-        let rr = unsafe {
-            let rr = syscall4(
-                libkern::SYS_CHANNEL_RECV,
-                ours,
-                buf.as_mut_ptr() as u64,
-                hs.as_mut_ptr() as u64,
-                (&raw mut count) as u64,
-            );
-            syscall1(SYS_HANDLE_CLOSE, ours);
-            rr
-        };
-        if rr != libkern::KError::PeerClosed.as_i32() as i64 {
+        let mut buf = [0u8; IPC_MSG_SIZE];
+        let rr = libkern::channel_recv(ours, &mut buf).err();
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ours) };
+        if rr != Some(libkern::KError::PeerClosed.as_i32() as i64) {
             Line::new().s(b"boot-probe: view broker: op ").u(op as u64).s(b" kept the handle sent with it").end();
             return fail(b"a handle sent with an op that takes none was kept");
         }

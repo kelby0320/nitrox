@@ -22,41 +22,26 @@ pub(super) fn serve_desktop_session(
         DesktopEntry, DesktopIndex, MAX_DESKTOP_NAME, MAX_LISTED, MAX_OPEN_PATH, OP_DESKTOP_LIST, OP_DESKTOP_NAME,
         OP_DESKTOP_OPEN, OP_DESKTOP_SWITCH, write_list,
     };
-    // SAFETY: valid recv out-params, sized from `IPC_HANDLE_MAX`.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut DS_MSG) as u64,
-            (&raw mut DS_HANDLES) as u64,
-            (&raw mut DS_COUNT) as u64,
-        )
-    };
-    // Close whatever came with it: the kernel installs attached handles whether or not anything
-    // looks at them, and they would pin slots in the global handle table.
-    // SAFETY: closing handles the kernel just installed for us.
-    unsafe {
-        let n = ((&raw const DS_COUNT).read()).min(libkern::abi::IPC_HANDLE_MAX);
-        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-        for i in 0..n {
-            syscall1(SYS_HANDLE_CLOSE, DS_HANDLES[i]);
-        }
-    }
-    if rr != 0 {
-        if rr == KError::PeerClosed.as_i32() as i64 {
-            // SAFETY: the peer is gone; free the slot and close our end.
-            unsafe {
-                #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-                for i in 0..MAX_DESKTOP_SESSIONS {
-                    if DESKTOP_SESSIONS[i] == ch {
-                        DESKTOP_SESSIONS[i] = 0;
+    // SAFETY: single-threaded; `DS_MSG` is lent for the call.
+    let rr = unsafe { channel_recv_raw(ch, &raw mut DS_MSG) };
+    let _sent = match rr {
+        Ok(sent) => sent,
+        Err(rr) => {
+            if rr == KError::PeerClosed.as_i32() as i64 {
+                // SAFETY: the peer is gone; free the slot and close our end.
+                unsafe {
+                    #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
+                    for i in 0..MAX_DESKTOP_SESSIONS {
+                        if DESKTOP_SESSIONS[i] == ch {
+                            DESKTOP_SESSIONS[i] = 0;
+                        }
                     }
+                    syscall1(SYS_HANDLE_CLOSE, ch);
                 }
-                syscall1(SYS_HANDLE_CLOSE, ch);
             }
+            return false;
         }
-        return false;
-    }
+    };
     // SAFETY: bounded read-only slice over the message just received.
     let (op, request_id, body) = unsafe {
         let payload_len = u32::from_le_bytes([DS_MSG[4], DS_MSG[5], DS_MSG[6], DS_MSG[7]]) as usize;
@@ -163,20 +148,10 @@ pub(super) fn serve_desktop_endpoint() {
     use librsproto::{OP_NS_RESOLVE, decode};
     // SAFETY: reading our own serve end into valid out-params.
     let serve = unsafe { DESKTOP_SERVE };
-    // SAFETY: DS_MSG, DS_HANDLES and DS_COUNT are this process's recv buffers, valid for writes and
-    // touched by one thread
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            serve,
-            (&raw mut DS_MSG) as u64,
-            (&raw mut DS_HANDLES) as u64,
-            (&raw mut DS_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded; `DS_MSG` is lent for the call.
+    let Ok(_sent) = (unsafe { channel_recv_raw(serve, &raw mut DS_MSG) }) else {
         return;
-    }
+    };
     // SAFETY: bounded read-only slice over the message just received.
     let (op, request_id, bare) = unsafe {
         let payload_len = u32::from_le_bytes([DS_MSG[4], DS_MSG[5], DS_MSG[6], DS_MSG[7]]) as usize;
@@ -238,13 +213,6 @@ pub(super) static mut DESKTOP_SERVE: u64 = 0;
 /// See [`DESKTOP_SERVE`].
 pub(super) static mut DESKTOP_SESSIONS: [u64; MAX_DESKTOP_SESSIONS] = [0; MAX_DESKTOP_SESSIONS];
 static mut DS_MSG: [u8; 4096] = [0; 4096];
-/// Sized from the ABI, not from what this server expects.
-///
-/// `sys_channel_recv` copies out `n * 8` bytes for the sender's stamped count, up to
-/// `IPC_HANDLE_MAX`, and `/dev/desktop` is bound into every application namespace, so a client
-/// attaching eight handles would smash whatever `.bss` follows a smaller array.
-static mut DS_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
-static mut DS_COUNT: usize = 0;
 static mut DS_REPLY: [u8; 4096] = [0; 4096];
 static mut DS_REPLY_HANDLES: [u64; 4] = [0; 4];
 static mut CH_OUT0: u64 = 0;
