@@ -372,6 +372,29 @@ whatever its frame held before. AHCI checks the byte count the HBA writes back i
 header (PRDBC). Bulk-only USB needs a data stage that did not come up short and a zero residue
 ([usb.md](usb.md)). Anything less fails `IoError`.
 
+**A request is whole blocks within the device**, checked once by the block layer for every driver
+(`io::block::dispatch_block_irp`, and the page cache's `_into_frames`): part of a block is refused
+`InvalidArgument` before an IRP exists, and a range past the end completes its operation
+`InvalidArgument` ([`io-operation.md`](../spec/io-operation.md)), so no driver sees either. AHCI
+divides both by its sector, and took a length of 100 as a count of 0, which ATA reads as 65,536.
+
+**A command that fails, or never finishes, is recovered, not left waiting.** An error stops an
+AHCI port, and the HBA keeps the command's bit in PxCI until software clears ST (AHCI 1.3.1
+§6.2.2.1), so the interrupt retires nothing then: it reports the fault to AHCI's **watch thread**,
+started with the USB hub thread. The thread stops the port, clears its errors, resets the link if
+the device is still busy, starts the port, fails the command `IoError` and issues the next. It also
+wakes at the command in flight's deadline, 30 s as Linux's `sd` and USB storage give one, and
+sleeps no longer than a deadline, so a command issued while it sleeps needs no wake of its own. The
+boot's polled wait, before the thread runs, recovers the same way when it gives up on a command,
+which it retired as done before, and runs every completion queued; `read_blocking` counts a read
+only once it completed. While a port is faulted or recovered, what is submitted waits in the queue.
+**A port that will not stop** may still move its command's data: that command is kept, never
+completed, and the disk refuses everything else. **What waits on a kept command waits for good**,
+as nothing in the kernel cancels a request: a filesystem server's write, and a `sys_ns_sync` behind
+it (deferred: *IRP cancellation and the completion timeout*). QEMU clears PxCI on
+an error, so the kept bit is a host test's (`drivers/ahci/tests.rs`); QEMU's `blkdebug`, failing a
+sector `test-qemu`'s probe reads, showed the recovery, and every probe after it passing.
+
 **How many fragments one command can describe is a device property, and the device
 publishes it** — [`BlockBackend::max_frags`](../../kernel/src/io/block.rs). AHCI's is
 its command table's PRDT capacity: one page, 128 bytes of command FIS, 16 bytes per

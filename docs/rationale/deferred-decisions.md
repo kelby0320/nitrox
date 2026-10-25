@@ -142,6 +142,9 @@ module unload (which drains in-flight IRPs). **A shutdown is exposed to it too**
 `init`'s `Finish` calls `sys_ns_sync`, which blocks until its write IRPs complete, so a disk that
 stops completing writes holds PID 1 there and `sys_power` is never reached. The kernel's own flush
 in `sys_power` is bounded; the write-back before it is only as bounded as the IRPs it waits on.
+**So does a request a driver keeps for good**: an AHCI port that will not stop and a USB slot that
+will not disable keep their commands, since the device may still write the buffers, and what waits
+on one — a filesystem server's write, a `sys_ns_sync` behind it — waits for good.
 
 **Async-I/O surface subset.** The [`IoOp`](../spec/io-operation.md) descriptor
 ships with only `Read`/`Write` opcodes and no `flags` modifiers; `Flush`/`Trim`,

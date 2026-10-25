@@ -1,4 +1,4 @@
-//! The storage service's mount, listing and past-2-TiB tests.
+//! The storage service's mount, listing and past-2-TiB tests, and a block device's bounds.
 
 use super::*;
 
@@ -427,5 +427,68 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
         .u(block.len() as u64)
         .s(b"), nitrox-root init's at /, the scratch disk the service's at /storage/nitrox-scratch, the ESP fat and the disk holding its table ok")
         .end();
+    true
+}
+
+/// **A block request off its device's blocks is refused**, on the root partition's disk: part of a
+/// block with no operation made, a range past its end through the operation. The last block still
+/// reads. The disk, as a partition refused a range past its end already.
+pub(super) fn block_bounds_test(root_ns: u64) -> bool {
+    use libkern::{IO_OPCODE_READ, KError};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: block bounds FAIL: ").s(why).end();
+        false
+    };
+    let Some(records) = registry_records(root_ns) else {
+        return fail(b"the registry does not read");
+    };
+    let labels: [&[u8]; 2] = [b"nitrox-root", b"nitrox-live"];
+    let Some(root) = records.iter().find(|r| labels.contains(&r.name())) else {
+        return fail(b"no root partition in the registry");
+    };
+    let Some(disk) = records.iter().find(|r| r.id == root.parent) else {
+        return fail(b"the root partition has no disk in the registry");
+    };
+    let Some(index) = disk.block_index() else {
+        return fail(b"the root's disk has no /dev/blk index");
+    };
+    let path = alloc::format!("/dev/blk/{index}");
+    let (st, dev) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ);
+    if st != 0 || dev == 0 {
+        return fail(b"the root's disk does not open");
+    }
+    // Two pages: room for a block and part of another, at 4,096 bytes a block.
+    // SAFETY: register-only syscall.
+    let page = unsafe { syscall4(SYS_MEMORY_CREATE, 2 * PAGE, 0, 0, 0) };
+    if page <= 0 {
+        close(dev);
+        return fail(b"no pages to read into");
+    }
+    let page = page as u64;
+    let submit = |offset: u64, length: u64| {
+        let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: page, buf_offset: 0, offset, length };
+        // SAFETY: `op` is a valid `IoOp`; `dev` and `page` are handles this process holds.
+        unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) }
+    };
+    let invalid = KError::InvalidArgument.as_i32();
+    let block = u64::from(disk.logical_block_size);
+    let partial = [(0, 100), (100, block), (0, block + 100)].iter().all(|&(o, l)| submit(o, l) == invalid as i64);
+    let end = disk.block_count * block;
+    let past = submit(end, block);
+    let past = past >= 0 && po_wait(past as u64).0 == invalid;
+    let last = submit(end - block, block);
+    let last = last >= 0 && po_wait(last as u64).0 == 0;
+    close(page);
+    close(dev);
+    if !partial {
+        return fail(b"part of a block was taken");
+    }
+    if !past {
+        return fail(b"a read past the end did not fail InvalidArgument");
+    }
+    if !last {
+        return fail(b"the last block did not read");
+    }
+    kprint(b"boot-probe: block bounds: part of a block refused, past the end failed, the last block read ok\n");
     true
 }

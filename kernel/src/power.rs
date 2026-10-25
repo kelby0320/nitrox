@@ -85,8 +85,9 @@ fn flushes(kind: u32) -> bool {
 fn flush_every_disk() {
     // `/dev/blk/<n>` and its flush's operation.
     let mut flushing: KVec<(usize, ObjectRef)> = KVec::new();
-    let mut index = 0usize;
-    while let Some(device) = crate::device::find_block_device(index) {
+    let mut next = 0usize;
+    while let Some((index, device)) = crate::device::find_block_device_from(next) {
+        next = index + 1;
         // SAFETY: the device table holds `DeviceNode`s, and `device` pins this one.
         let node = unsafe { &*(device.as_ptr() as *const DeviceNode) };
         if flushes(node.block_info().kind) {
@@ -101,7 +102,6 @@ fn flush_every_disk() {
                 }
             }
         }
-        index += 1;
     }
 
     let deadline = crate::arch::Timer::read_ns().saturating_add(FLUSH_BOUND_NS);

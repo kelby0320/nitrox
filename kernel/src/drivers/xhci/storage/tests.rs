@@ -807,3 +807,25 @@ fn a_departed_devices_node_is_refused_and_its_slot_reused_under_a_new_epoch() {
     assert_eq!(disks.submit(&mut fresh, context(i, 0, new_epoch), 0), Action::None, "the new node is served");
     assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_some());
 }
+
+/// **A departure completes its commands only once the slot is disabled**: a slot kept, its memory
+/// leaked because the controller may still own it, keeps them too, their buffers maybe still
+/// written; only a rescan, which moves no data, completes. They completed whatever became of it.
+#[test]
+fn a_departure_completes_its_commands_only_once_the_slot_is_disabled() {
+    init_global_heap();
+    crate::dpc::init().unwrap();
+    let peer_closed = KError::PeerClosed as i32;
+    let pending = crate::io::irp::IrpStatus::Pending as i32;
+    for (slot, moving) in
+        [(super::super::hub::Released::Freed, peer_closed), (super::super::hub::Released::Kept("wedged"), pending)]
+    {
+        let mut a = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
+        let mut b = irp(IrpOp::Write, 0, 512, &[PhysFrag { base: 0x2000, len: 512 }]);
+        let mut c = irp(IrpOp::Rescan, 0, 0, &[]);
+        finish(Departed([Some(&mut a), Some(&mut b), Some(&mut c)]), &slot);
+        crate::dpc::run_pending();
+        assert_eq!((a.status, b.status), (moving, moving), "the command in flight and the stranded one");
+        assert_eq!(c.status, peer_closed, "a rescan moves nothing, so it completes either way");
+    }
+}

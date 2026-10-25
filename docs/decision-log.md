@@ -36770,3 +36770,27 @@ differently is here:
   for a check" for a filesystem found not clean or found corrupt since, where it said clean.
 - **A loop in a directory's chain, or its `..` records, is refused within a directory's reach** —
   `MAX_SLOTS` entries, and a path's 512 components — not after a read of the whole volume.
+
+## 2026-10-24 — Before Phase 7, Part D: group D changes these contracts
+
+The bash's driver findings. `bug-bash.md` has each fix; what a caller can now see differently is
+here:
+
+- **A block request is whole blocks within its device, for every driver**: one that is not a
+  multiple of the logical block size, in offset or length, is refused `InvalidArgument` by
+  `sys_io_submit`, no operation made; one whose range runs past the device's end completes its
+  operation `InvalidArgument`, as `io-operation.md` had it. AHCI took both, the RAM disk part of
+  a block. A length of 0 is still a no-op, whatever its offset.
+- **An AHCI command that fails, or does not finish within 30 s, fails `IoError`**, and the disk
+  goes on: a watch thread, started with the USB hub thread, recovers the port (AHCI 1.3.1
+  §6.2.2.1). Where a request waited for ever after a medium error, it now fails. **A port that will
+  not stop** keeps its command, never completed, since its buffer may still be written, and the
+  disk refuses every request after it with `IoError`. The boot's polled read waits the same 30 s,
+  where it gave up after one and returned what the slot held.
+- **A USB stick whose slot does not disable keeps its commands** with its memory: the one in
+  flight and one a failed recovery stranded are never completed, where they completed
+  `PeerClosed` while the controller might still write their buffers.
+- **The shutdown flushes every disk**, past one that departed, where it stopped at the first
+  departed index.
+- **A device that connects as the hub thread clears a stale change is seen**: whether a port has a
+  device is read after its change is cleared.
