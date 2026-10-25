@@ -150,8 +150,8 @@ pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult 
             registered += 1;
         }
         if !failed && has_deadline {
-            failed = deadline::push(
-                &mut g.deadlines,
+            failed = deadline::push_promised(
+                &mut g,
                 deadline::Entry {
                     deadline_ns,
                     target: me_ptr as usize,

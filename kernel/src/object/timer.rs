@@ -53,8 +53,18 @@ impl Timer {
     /// Maximum simultaneous waiters; the reserve keeps `add_waiter` from allocating under `SCHED`.
     pub const MAX_WAITERS: usize = 4;
 
-    /// Allocate an unarmed `Timer` (refcount one), reserving the waiter vector up front.
+    /// Allocate an unarmed `Timer` (refcount one), reserving the waiter vector and its slot in
+    /// the deadline heap up front.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
+        crate::sched::reserve_slots(crate::sched::Slots::Timer)?;
+        let made = Self::try_build();
+        if made.is_err() {
+            crate::sched::give_back_slots(crate::sched::Slots::Timer);
+        }
+        made
+    }
+
+    fn try_build() -> Result<KBox<Self>, AllocError> {
         let mut waiters: KVec<*mut ()> = KVec::new();
         waiters.try_reserve(Self::MAX_WAITERS)?;
         KBox::try_new(Self {

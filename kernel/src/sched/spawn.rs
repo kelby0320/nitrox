@@ -59,6 +59,7 @@ pub fn init() -> Result<(), AllocError> {
     g.suspended = suspended;
     g.reap[0] = reap;
     g.deadlines = deadlines;
+    g.deadline_slots[deadline::DeadlineKind::Thread as usize] = deadline::HEAP_RESERVE;
     g.deferred_drops = deferred_drops;
     g.ended_pids = ended_pids;
     push_reserved(&mut g.ready[0], reaper_ref, "run queue (reaper install)");

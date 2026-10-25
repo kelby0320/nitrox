@@ -4,7 +4,8 @@
 fairness, work-stealing migration and reschedule IPIs are all live, and the `REAL_TIME`
 syscap gate landed with the capability system (Phase 3 slice 6, 2026-07-14). Remaining
 deferrals are marked inline. See [smp.md](smp.md) for the multi-core substrate.
-Verified 2026-08-05; the affinity-fallback paragraph re-verified 2026-08-14.
+Verified 2026-08-05; the affinity-fallback paragraph re-verified 2026-08-14; *Exit and the
+deadline heap* added 2026-10-25.
 
 The kernel scheduler: how runnable threads are chosen, how that scales from one
 CPU to many, and the per-CPU substrate SMP stands on. This document is the design
@@ -343,6 +344,24 @@ future surfaces like a keep-recent `/dev/log` ring reuse; anticipated in
 
 Consistency is per-capture: one `SCHED` hold makes each snapshot internally
 consistent; successive reads each produce a fresh object (like `/dev/log`).
+
+## Exit and the deadline heap
+
+**No thread frees another.** `sys_process_exit` records its status on the `Process` and marks
+every other thread of it: a blocked one is woken, a suspended one resumed to terminate, and a CPU
+running one sent a reschedule IPI. A marked thread ends itself on its next return to ring 3, from
+a syscall, an exception or an interrupt, so whatever its kernel stack held is let go on the way;
+its waits return at once meanwhile, and a thread created during the exit is marked as it is placed.
+The last thread out ends the process, with the recorded status: its handles go to the reaper
+thread, woken at once, and its parent hears `ChildExited`.
+
+**Every deadline has its slot before it is pushed.** The heap reserves one slot per thread at
+init (`MAX_THREADS` placed threads and a boot thread per CPU, each waiting on one deadline at
+most); a `Timer` brings one more, and an IPC endpoint one per `BlockBounded` send it can hold.
+Each reserves at creation, growing the heap outside `SCHED` if every slot is promised, and gives
+back at destruction. So a push never finds the heap full: a process holding many timers pays at
+creation, and delays no one else's wait. A debug build stops a push of a kind holding more entries
+than slots, and a give-back of slots never promised.
 
 ## Decisions (locked 2026-06-26)
 

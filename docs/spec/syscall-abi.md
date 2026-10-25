@@ -537,7 +537,7 @@ fn sys_channel_create(
     queue_depth: u32,
 ) -> isize
 ```
-Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 512` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. (Syscall number `12`.)
+Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 512` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. Each endpoint brings a place among the kernel's deadlines for every `BlockBounded` send it can hold, so such a send's deadline is always kept. (Syscall number `12`.)
 
 ```rust
 fn sys_channel_send(
@@ -572,7 +572,7 @@ Receives a message from `ch` (requires `RECV`). Returns `WouldBlock` if no messa
 ```rust
 fn sys_timer_create(flags: TimerFlags) -> isize
 ```
-Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT | DUPLICATE | INSPECT | TRANSFER`. `flags` must be a valid `TimerFlags` (none defined yet → must be 0). (Syscall number `8`; implemented in the wait-queues slice.)
+Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT | DUPLICATE | INSPECT | TRANSFER`. `flags` must be a valid `TimerFlags` (none defined yet → must be 0). The timer brings its own place among the kernel's deadlines, so arming it never fails and holding many delays no one else's: `OutOfMemory` here if that place cannot be made. (Syscall number `8`; implemented in the wait-queues slice.)
 
 ```rust
 fn sys_timer_set(timer: RawHandle, deadline_ns: u64, interval_ns: u64) -> isize

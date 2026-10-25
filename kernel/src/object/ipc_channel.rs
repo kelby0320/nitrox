@@ -286,6 +286,16 @@ impl IpcChannel {
     /// Allocate one unconnected endpoint, refcount one. Ring and waiter vector are reserved up
     /// front (the only fallible growth), so later pushes never allocate under `SCHED`.
     fn try_new_endpoint(cap: usize) -> Result<KBox<Self>, AllocError> {
+        crate::sched::reserve_slots(crate::sched::Slots::Endpoint)?;
+        let made = Self::try_build_endpoint(cap);
+        if made.is_err() {
+            crate::sched::give_back_slots(crate::sched::Slots::Endpoint);
+        }
+        made
+    }
+
+    /// [`try_new_endpoint`](Self::try_new_endpoint)'s allocations, once its heap slots are held.
+    fn try_build_endpoint(cap: usize) -> Result<KBox<Self>, AllocError> {
         let recv = MsgRing::with_capacity(cap)?;
         let mut recv_waiters: KVec<*mut ()> = KVec::new();
         recv_waiters.try_reserve(Self::MAX_WAITERS)?;

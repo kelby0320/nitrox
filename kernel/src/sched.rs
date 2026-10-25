@@ -116,6 +116,7 @@ pub static EXIT_CLOSED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// The deadline min-heap: armed-timer and `sys_wait`-deadline expiries keyed by absolute
 /// monotonic ns, drained on each tick. A pure binary heap, host-tested.
 mod deadline;
+pub use deadline::{Slots, give_back_slots, reserve_slots};
 
 /// Scheduler statistics: the per-CPU event counters behind `/proc/sched/stats`, their
 /// snapshot, and the pure text formatter. Follows the **capture → format → synthesize**
@@ -253,8 +254,12 @@ struct SchedState {
     /// Threads blocked in `sys_wait`, off the run queue, each holding one refcount on its
     /// `Thread`. Pre-reserved (see [`MAX_THREADS`]).
     blocked: KVec<ObjectRef>,
-    /// The deadline min-heap, drained on each tick. Pre-reserved (see [`deadline::HEAP_RESERVE`]).
+    /// The deadline min-heap, drained on each tick. Never fuller than its promised slots.
     deadlines: KVec<deadline::Entry>,
+    /// The heap slots promised, by [`deadline::DeadlineKind`]: the threads' at
+    /// [`init`], and each timer's and endpoint's from [`reserve_slots`]. The heap's capacity
+    /// covers their sum.
+    deadline_slots: [usize; 3],
     /// **Per-CPU** event counters, incremented at sites that all hold this lock.
     stats: [stats::Counters; MAX_CPUS],
     /// `ObjectRef`s parked for a **thread-context** drop by [`reap_pending`]: refs a
@@ -294,6 +299,7 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(
         idle_addr: [0; MAX_CPUS],
         blocked: KVec::new(),
         deadlines: KVec::new(),
+        deadline_slots: [0; 3],
         stats: [stats::Counters::ZERO; MAX_CPUS],
         deferred_drops: KVec::new(),
         ended_pids: KVec::new(),

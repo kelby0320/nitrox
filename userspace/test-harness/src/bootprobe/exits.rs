@@ -11,8 +11,6 @@ const EXIT_RUNNING: u64 = 0x4558_0002;
 const EXIT_ALONE: u64 = 0x4558_0003;
 const EXIT_SPAWNING: u64 = 0x4558_0004;
 
-const MS: u64 = 1_000_000;
-
 /// Spawn `test-stage` with `arg0`, handing it `handles`, moved where `move_mask` has a bit.
 fn spawn_stage(root_ns: u64, arg0: u64, handles: &[u64], move_mask: u32) -> bool {
     let (st, image) = ns_lookup(root_ns, b"/bin/test-stage", RIGHT_MAP_READ);

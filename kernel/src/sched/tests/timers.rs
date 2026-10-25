@@ -94,6 +94,7 @@ fn removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap
 fn heap_with(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> SchedState {
     let mut st = test_state();
     st.deadlines.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 1;
     deadline::push(&mut st.deadlines, entry(deadline_ns, timer as usize)).unwrap();
     // SAFETY: the caller pins `timer`; single-threaded test.
     unsafe {
@@ -201,4 +202,54 @@ fn a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it() {
         timer_arm(t.as_ptr(), 0, 0).unwrap();
     }
     assert!(!global_heap_names(t.as_ptr()), "a disarmed timer stays in the heap");
+}
+
+// --- slots promised -----------------------------------------------------------
+
+#[test]
+fn a_regrown_heap_keeps_its_entries_in_order_and_hands_back_the_smaller_buffer() {
+    init_global_heap();
+    let mut h: KVec<deadline::Entry> = KVec::new();
+    h.try_reserve(4).unwrap();
+    for d in [40u64, 10, 30, 20] {
+        deadline::push(&mut h, entry(d, d as usize)).unwrap();
+    }
+    let mut bigger = KVec::new();
+    bigger.try_reserve(64).unwrap();
+    let spare = deadline::regrow(&mut h, bigger);
+    assert!(h.capacity() >= 64 && spare.capacity() < 64);
+    let mut smaller = KVec::new();
+    smaller.try_reserve(8).unwrap();
+    assert!(deadline::regrow(&mut h, smaller).capacity() < 64, "a smaller buffer comes straight back");
+    let order: std::vec::Vec<u64> = core::iter::from_fn(|| deadline::pop_min(&mut h)).map(|e| e.deadline_ns).collect();
+    assert_eq!(order, [10, 20, 30, 40]);
+}
+
+#[test]
+#[should_panic(expected = "no slot promised")]
+fn an_entry_of_a_kind_with_every_slot_taken_stops_a_debug_build() {
+    init_global_heap();
+    let mut st = test_state();
+    st.deadlines.try_reserve(8).unwrap();
+    st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 1;
+    deadline::push_promised(&mut st, entry(10, 1)).unwrap();
+    let _ = deadline::push_promised(&mut st, entry(20, 2));
+}
+
+/// On the global heap, so other tests reserve and give back around it: what holds at every hold
+/// is that the capacity covers what is promised, and this test's own slots are among them.
+#[test]
+fn reserving_past_the_capacity_grows_the_heap_to_cover_every_slot_promised() {
+    init_global_heap();
+    for _ in 0..200 {
+        reserve_slots(Slots::Endpoint).unwrap();
+    }
+    {
+        let g = SCHED.lock();
+        assert!(g.deadlines.capacity() >= g.deadline_slots.iter().sum::<usize>());
+        assert!(g.deadline_slots[deadline::DeadlineKind::PendingSend as usize] >= 200 * IpcChannel::MAX_PENDING_SENDS);
+    }
+    for _ in 0..200 {
+        give_back_slots(Slots::Endpoint);
+    }
 }

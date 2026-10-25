@@ -131,6 +131,7 @@ fn test_state() -> SchedState {
         idle_addr: [0; MAX_CPUS],
         blocked: KVec::new(),
         deadlines: KVec::new(),
+        deadline_slots: [0; 3],
         stats: [stats::Counters::ZERO; MAX_CPUS],
         deferred_drops: KVec::new(),
         ended_pids: KVec::new(),
@@ -706,6 +707,7 @@ fn reserved_state() -> SchedState {
     st.suspended = thread_list().unwrap();
     st.reap[0] = thread_list().unwrap();
     st.deadlines.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    st.deadline_slots = [deadline::HEAP_RESERVE / 4; 3];
     st
 }
 
