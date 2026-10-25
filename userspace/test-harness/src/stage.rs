@@ -11,6 +11,7 @@
 extern crate alloc;
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use libkern::{
     CLOCK_MONOTONIC, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, exit, kprint,
     syscall1, syscall2, syscall4,
@@ -469,6 +470,182 @@ fn run_grants_child(ns: u64, ch: u64) -> ! {
     exit(0);
 }
 
+/// `arg0` of `boot-probe`'s exit children, each with its first handle in `rdx`.
+const EXIT_WAITING: u64 = 0x4558_0001;
+const EXIT_RUNNING: u64 = 0x4558_0002;
+const EXIT_ALONE: u64 = 0x4558_0003;
+const EXIT_SPAWNING: u64 = 0x4558_0004;
+
+/// The handle an exit child's second thread uses: a channel to wait on, or a counter's address.
+static EXIT_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// Set by an exit child's second thread once it runs.
+static EXIT_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Start a thread at `entry` on the CPUs in `affinity` (`0` for any), on a stack never unmapped.
+fn start_thread(entry: extern "C" fn() -> !, affinity: u8) -> bool {
+    const STACK: u64 = 4 * 4096;
+    // SAFETY: register-only syscalls; the second maps the object the first made.
+    let base = unsafe {
+        let mem = syscall4(libkern::SYS_MEMORY_CREATE, STACK, 0, 0, 0);
+        if mem < 0 {
+            return false;
+        }
+        syscall4(libkern::SYS_MEMORY_MAP, mem as u64, 0, STACK, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE)
+    };
+    let args = libkern::ThreadArgs {
+        entry: entry as *const () as u64,
+        user_sp: base as u64 + STACK,
+        arg0: 0,
+        class: 0,
+        rt_priority: 0,
+        nice: 0,
+        cpu_affinity: affinity,
+        _reserved: [0; 36],
+    };
+    base >= 0 && libos::thread_create(&args).is_ok()
+}
+
+fn thread_exit() -> ! {
+    // SAFETY: `sys_thread_exit` ends this thread.
+    unsafe { syscall1(libkern::SYS_THREAD_EXIT, 0) };
+    loop {
+        // SAFETY: `pause` is always valid in ring 3 and has no effects.
+        unsafe { asm!("pause", options(nomem, nostack)) };
+    }
+}
+
+/// `EXIT_WAITING`: a second thread blocks in `sys_wait` on `ch`, which nothing sends to; once it
+/// has had time to block, a message says so on `ch` and the process exits.
+fn exit_waiting(ch: u64) -> ! {
+    EXIT_HANDLE.store(ch, Ordering::Release);
+    if !start_thread(exit_waiter, 0) {
+        exit(1);
+    }
+    while !EXIT_STARTED.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    timer_nap_ms(20);
+    exit(if rs_send(ch, 1, &[], &[]) { 0 } else { 1 });
+}
+
+/// Waits on [`EXIT_HANDLE`] for good: a wait that returns waits again, so only an exit ends it.
+extern "C" fn exit_waiter() -> ! {
+    let ch = [EXIT_HANDLE.load(Ordering::Acquire)];
+    let mut results = [0u8; 24];
+    EXIT_STARTED.store(true, Ordering::Release);
+    loop {
+        // SAFETY: a one-handle list and a result buffer for it.
+        unsafe { syscall4(SYS_WAIT, ch.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+    }
+}
+
+/// `EXIT_RUNNING`: one thread counts in the page of `mem` on CPU 2, another exits the process
+/// from CPU 3 once the count has begun, and the first thread leaves.
+fn exit_running(mem: u64) -> ! {
+    // SAFETY: register-only syscall mapping the page the parent handed over.
+    let page =
+        unsafe { syscall4(libkern::SYS_MEMORY_MAP, mem, 0, 4096, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) };
+    if page < 0 {
+        exit(1);
+    }
+    EXIT_HANDLE.store(page as u64, Ordering::Release);
+    if !start_thread(exit_counter, 1 << 2) || !start_thread(exit_exiter, 1 << 3) {
+        exit(1);
+    }
+    thread_exit();
+}
+
+extern "C" fn exit_counter() -> ! {
+    // SAFETY: the page `exit_running` mapped, never unmapped; the parent only reads it.
+    let count = unsafe { &*(EXIT_HANDLE.load(Ordering::Acquire) as *const AtomicU64) };
+    loop {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+extern "C" fn exit_exiter() -> ! {
+    // SAFETY: as in `exit_counter`.
+    let count = unsafe { &*(EXIT_HANDLE.load(Ordering::Acquire) as *const AtomicU64) };
+    while count.load(Ordering::Relaxed) == 0 {
+        core::hint::spin_loop();
+    }
+    exit(0);
+}
+
+/// `EXIT_ALONE`: the process's only thread leaves by `sys_thread_exit`, holding the channel.
+fn exit_alone() -> ! {
+    thread_exit();
+}
+
+const SPAWNS: u64 = 48;
+static SPAWNED: AtomicU64 = AtomicU64::new(0);
+/// The address of the page [`spawn_waiter`]s count in.
+static SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Every spawn's stack, mapped up front so the spawner spends its time in `sys_thread_create`.
+static SPAWN_STACKS: AtomicU64 = AtomicU64::new(0);
+const SPAWN_STACK: u64 = 4 * 4096;
+
+/// `EXIT_SPAWNING`: a second thread starts [`spawn_waiter`]s as fast as it can, and the process
+/// exits once a few have, so the exit meets one mid-creation.
+fn exit_spawning(mem: u64) -> ! {
+    let rw = libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE;
+    let stacks = SPAWNS * SPAWN_STACK;
+    let (mut ours, mut theirs) = (0u64, 0u64);
+    // SAFETY: register-only syscalls and valid out-params; each map maps the object it names.
+    let (page, base, made) = unsafe {
+        let page = syscall4(libkern::SYS_MEMORY_MAP, mem, 0, 4096, rw);
+        let obj = syscall4(libkern::SYS_MEMORY_CREATE, stacks, 0, 0, 0);
+        let base = syscall4(libkern::SYS_MEMORY_MAP, obj.max(0) as u64, 0, stacks, rw);
+        let made = syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 4, 0);
+        (page, base, made == 0)
+    };
+    SPAWN_COUNT.store(page.max(0) as u64, Ordering::Release);
+    SPAWN_STACKS.store(base.max(0) as u64, Ordering::Release);
+    EXIT_HANDLE.store(ours, Ordering::Release);
+    if page < 0 || base < 0 || !made || !start_thread(exit_spawner, 0) {
+        exit(1);
+    }
+    while SPAWNED.load(Ordering::Acquire) < 4 {
+        core::hint::spin_loop();
+    }
+    exit(0);
+}
+
+extern "C" fn exit_spawner() -> ! {
+    let base = SPAWN_STACKS.load(Ordering::Acquire);
+    for i in 0..SPAWNS {
+        let args = libkern::ThreadArgs {
+            entry: spawn_waiter as *const () as u64,
+            user_sp: base + (i + 1) * SPAWN_STACK,
+            arg0: 0,
+            class: 0,
+            rt_priority: 0,
+            nice: 0,
+            cpu_affinity: 0,
+            _reserved: [0; 36],
+        };
+        if libos::thread_create(&args).is_err() {
+            break;
+        }
+        SPAWNED.fetch_add(1, Ordering::Release);
+    }
+    thread_exit();
+}
+
+/// Waits on [`EXIT_HANDLE`] for good, counting each wait that fails, as all do once it is closed.
+extern "C" fn spawn_waiter() -> ! {
+    let ch = [EXIT_HANDLE.load(Ordering::Acquire)];
+    // SAFETY: the page `exit_spawning` mapped, never unmapped; the parent only reads it.
+    let count = unsafe { &*(SPAWN_COUNT.load(Ordering::Acquire) as *const AtomicU64) };
+    let mut results = [0u8; 24];
+    loop {
+        // SAFETY: a one-handle list and a result buffer for it.
+        if unsafe { syscall4(SYS_WAIT, ch.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) } < 0 {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Bootstrap registers: `rdi` notif, `rsi` namespace, `rdx` endpoint (the setup channel for a
 /// Tier-1 stage), `rcx` `arg0`.
 #[unsafe(no_mangle)]
@@ -476,10 +653,14 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     if libstream::setup::setup_is_pending(arg0) {
         run_stage(notif, ns, endpoint, arg0);
     }
-    if arg0 == GRANTS_CHILD {
-        run_grants_child(ns, endpoint);
+    match arg0 {
+        GRANTS_CHILD => run_grants_child(ns, endpoint),
+        EXIT_WAITING => exit_waiting(endpoint),
+        EXIT_RUNNING => exit_running(endpoint),
+        EXIT_ALONE => exit_alone(),
+        EXIT_SPAWNING => exit_spawning(endpoint),
+        _ => exit(0),
     }
-    exit(0);
 }
 
 #[panic_handler]

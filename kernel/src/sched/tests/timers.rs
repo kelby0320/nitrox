@@ -94,6 +94,7 @@ fn removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap
 fn heap_with(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> SchedState {
     let mut st = test_state();
     st.deadlines.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 1;
     deadline::push(&mut st.deadlines, entry(deadline_ns, timer as usize)).unwrap();
     // SAFETY: the caller pins `timer`; single-threaded test.
     unsafe {
@@ -201,4 +202,86 @@ fn a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it() {
         timer_arm(t.as_ptr(), 0, 0).unwrap();
     }
     assert!(!global_heap_names(t.as_ptr()), "a disarmed timer stays in the heap");
+}
+
+// --- slots promised -----------------------------------------------------------
+
+#[test]
+fn a_regrown_heap_keeps_its_entries_in_order_and_hands_back_the_smaller_buffer() {
+    init_global_heap();
+    let mut h: KVec<deadline::Entry> = KVec::new();
+    h.try_reserve(4).unwrap();
+    for d in [40u64, 10, 30, 20] {
+        deadline::push(&mut h, entry(d, d as usize)).unwrap();
+    }
+    let mut bigger = KVec::new();
+    bigger.try_reserve(64).unwrap();
+    let spare = deadline::regrow(&mut h, bigger);
+    assert!(h.capacity() >= 64 && spare.capacity() < 64);
+    let mut smaller = KVec::new();
+    smaller.try_reserve(8).unwrap();
+    assert!(deadline::regrow(&mut h, smaller).capacity() < 64, "a smaller buffer comes straight back");
+    let order: std::vec::Vec<u64> = core::iter::from_fn(|| deadline::pop_min(&mut h)).map(|e| e.deadline_ns).collect();
+    assert_eq!(order, [10, 20, 30, 40]);
+}
+
+#[test]
+#[should_panic(expected = "no slot promised")]
+fn an_entry_of_a_kind_with_every_slot_taken_stops_a_debug_build() {
+    init_global_heap();
+    let mut st = test_state();
+    st.deadlines.try_reserve(8).unwrap();
+    st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 1;
+    deadline::push_promised(&mut st, entry(10, 1)).unwrap();
+    let _ = deadline::push_promised(&mut st, entry(20, 2));
+}
+
+/// On the global heap, so other tests reserve and give back around it: what holds at every hold
+/// is that the capacity covers what is promised, and this test's own slots are among them.
+#[test]
+fn reserving_past_the_capacity_grows_the_heap_to_cover_every_slot_promised() {
+    init_global_heap();
+    let holds: std::vec::Vec<SlotHold> = (0..200).map(|_| SlotHold::reserve(Slots::Endpoint).unwrap()).collect();
+    let g = SCHED.lock();
+    assert!(g.deadlines.capacity() >= g.deadline_slots.iter().sum::<usize>());
+    assert!(g.deadline_slots[deadline::DeadlineKind::PendingSend as usize] >= 200 * IpcChannel::MAX_PENDING_SENDS);
+    drop(g);
+    drop(holds);
+}
+
+#[test]
+fn the_heap_grows_to_the_largest_allocation_and_no_further() {
+    use deadline::{MOST_SLOTS, grown_capacity};
+    assert_eq!(grown_capacity(10, 8), Some(16), "twice its size");
+    assert_eq!(grown_capacity(40, 8), Some(40), "or what is promised");
+    const { assert!(MOST_SLOTS > 66_564) };
+    assert_eq!(grown_capacity(66_564, 66_560), Some(MOST_SLOTS), "where twice would be past a block");
+    assert_eq!(grown_capacity(MOST_SLOTS, MOST_SLOTS - 4), Some(MOST_SLOTS));
+    assert_eq!(grown_capacity(MOST_SLOTS + 1, MOST_SLOTS), None);
+}
+
+/// Counted on this test's own thread, so others creating and dropping theirs do not disturb it.
+#[test]
+fn a_timer_and_a_channel_give_back_their_slots_when_dropped() {
+    init_global_heap();
+    let before = deadline::slots_held_here();
+    let timer = crate::object::Timer::try_new().unwrap();
+    assert_eq!(deadline::slots_held_here(), before + 1);
+    drop(timer);
+    assert_eq!(deadline::slots_held_here(), before);
+    let pair = IpcChannel::try_new_pair(4).unwrap();
+    assert_eq!(deadline::slots_held_here(), before + 2 * IpcChannel::MAX_PENDING_SENDS as isize);
+    drop(pair);
+    assert_eq!(deadline::slots_held_here(), before);
+}
+
+/// A periodic timer's re-push goes into the slot the timer holds, checked as every push is.
+#[test]
+#[should_panic(expected = "no slot promised")]
+fn a_periodic_timers_re_push_is_held_to_its_slot() {
+    init_global_heap();
+    let t = new_timer();
+    let mut st = heap_with(t.as_ptr(), 1_000, 250);
+    st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 0;
+    fire_expired_deadlines(&mut st, 1_100);
 }

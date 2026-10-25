@@ -419,8 +419,11 @@ kernel stack that is live for the core's lifetime (I4).
 reap list; the drop-ring then showed its stack freed while in use.
 
 **Fix.** Never reap `tid == IDLE_TID`: the process-teardown sweeps
-(`reap_matching` / `reap_blocked_matching`) skip idle threads (they carry
-`owner_pid == 0`, so a `pid 0` teardown would otherwise sweep them all).
+(`reap_matching` / `reap_blocked_matching`) skipped idle threads (they carry
+`owner_pid == 0`, so a `pid 0` teardown would otherwise sweep them all). Since
+2026-10-25 no thread reaps another at all: a process's exit only marks its
+threads, by a process's pid, which an idle thread never has, and each parks
+itself.
 
 ### Bug 4 — the switch-out race (the big one)
 
@@ -505,11 +508,10 @@ syscalls while migratable.
 
 ## Deferred
 
-- **Cross-CPU deschedule IPI** — so `exit_process` / kill can stop a sibling thread
-  running as another core's `current`. Not yet triggerable: every userspace process
-  is single-threaded today, so `exit_process` never has a live off-core sibling
-  (the `has_live_siblings` scan already *sees* other cores' `current[]`; it just
-  can't *stop* one). Lands with the first multi-threaded user process.
+- **A forcible kill** — a process stopped from outside rather than by its own exit.
+  The stopping is built: since 2026-10-25 `exit_process` marks a sibling running as
+  another core's `current` and sends that core a reschedule IPI, whose return to
+  ring 3 ends it. What is missing is the call, which `TERMINATE` is kept free to gate.
 - **Per-`AddressSpace` `active_cpus`** — a bitmask of cores holding the root in CR3,
   maintained at the CR3 load in `switch_into`, so a shootdown targets only those
   cores instead of broadcasting to all online cores. A correctness-neutral

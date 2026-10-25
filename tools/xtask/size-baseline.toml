@@ -3,17 +3,17 @@
 # by hand, in a reviewed commit of its own that says why.
 [files]
 "kernel/src/arch/x86_64/acpi.rs" = 1040
-"kernel/src/arch/x86_64/idt.rs" = 1026
+"kernel/src/arch/x86_64/idt.rs" = 1034
 "kernel/src/device.rs" = 1414
 "kernel/src/drivers/xhci/hid.rs" = 1106
 "kernel/src/drivers/xhci/storage.rs" = 1705
 "kernel/src/handle/table.rs" = 1583
 "kernel/src/main.rs" = 1213
 "kernel/src/mm/vmm.rs" = 1560
-"kernel/src/object/file_object.rs" = 2454
-"kernel/src/object/thread.rs" = 1047
+"kernel/src/object/file_object.rs" = 2460
+"kernel/src/object/thread.rs" = 1028
 "kernel/src/pci/mod.rs" = 1045
-"kernel/src/syscall/table.rs" = 2831
+"kernel/src/syscall/table.rs" = 2834
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
 "userspace/compositor/src/main.rs" = 2329

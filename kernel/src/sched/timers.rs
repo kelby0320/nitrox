@@ -104,10 +104,9 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
             Timer::set_armed(timer, next, interval);
             Timer::set_in_heap(timer, true);
         }
-        // Re-push: a periodic timer that just had ≥1 waiter keeps a heap slot free (its
-        // entry was just popped), so this stays within reserve.
-        let _ = deadline::push(
-            &mut g.deadlines,
+        // Re-push into the slot the timer holds (its entry was just popped).
+        let _ = deadline::push_promised(
+            g,
             deadline::Entry {
                 deadline_ns: next,
                 target: timer as usize,
@@ -133,8 +132,8 @@ pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> R
     // SAFETY: live Timer, `SCHED` held.
     unsafe { Timer::set_armed(timer, deadline_ns, interval_ns) };
     if deadline_ns != 0 {
-        if deadline::push(
-            &mut g.deadlines,
+        if deadline::push_promised(
+            &mut g,
             deadline::Entry { deadline_ns, target: timer as usize, kind: deadline::DeadlineKind::Timer, channel: 0 },
         )
         .is_err()

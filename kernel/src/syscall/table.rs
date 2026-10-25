@@ -283,14 +283,15 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
     }
 }
 
-/// `sys_process_exit(status)` — terminate the calling **process** with `status`: every sibling
-/// thread is torn down, `ChildExited { pid, Normal(status) }` goes to the parent's notification
-/// channel (if any), and this thread is reaped. Never returns.
+/// `sys_process_exit(status)` — terminate the calling **process** with `status`: its other threads
+/// end themselves, and the last out sends `ChildExited { pid, Normal(status) }` to the parent's
+/// notification channel (if any). Never returns.
 fn sys_process_exit(status: i32) -> ! {
     // **Close our own handle table first, in syscall context** (no locks held, free to allocate
     // and drop): `exit_process` takes `SCHED` and never returns, so dropping there is forbidden.
     // An IPC endpoint's last reference nulls its peer, so this makes `PeerClosed` prompt. The
-    // reaper still closes this pid afterwards (an empty table) for a process killed externally.
+    // reaper closes this pid again once the last thread is out, taking anything a sibling still
+    // mid-syscall installed.
     if let Some((pid, _tid)) = crate::sched::current_pid_tid() {
         let n = crate::handle::global::close_all_owned_by(pid);
         crate::sched::EXIT_CLOSED.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
@@ -1837,6 +1838,8 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
             }
         }
         crate::sched::WaitResult::OutOfMemory => Err(KError::OutOfMemory),
+        // Never seen: the thread ends on its way back to ring 3.
+        crate::sched::WaitResult::Ended => Err(KError::TimedOut),
     }
 }
 

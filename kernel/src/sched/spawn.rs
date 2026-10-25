@@ -59,6 +59,7 @@ pub fn init() -> Result<(), AllocError> {
     g.suspended = suspended;
     g.reap[0] = reap;
     g.deadlines = deadlines;
+    g.deadline_slots[deadline::DeadlineKind::Thread as usize] = deadline::HEAP_RESERVE;
     g.deferred_drops = deferred_drops;
     g.ended_pids = ended_pids;
     push_reserved(&mut g.ready[0], reaper_ref, "run queue (reaper install)");
@@ -244,7 +245,7 @@ pub fn spawn_user_sched(
 
     let leftover = {
         let mut g = SCHED.lock();
-        match place_thread(&mut g, r, false) {
+        match place_spawned(&mut g, r) {
             Ok(()) => return Ok(handle),
             Err(returned) => returned, // carry out of the locked block
         }
@@ -253,6 +254,20 @@ pub fn spawn_user_sched(
     // releasing the Process off the rank-1 lock.
     drop(leftover);
     Err(AllocError)
+}
+
+/// Place `r`, a thread just made for a process, marking it first if the process has begun to exit:
+/// a thread placed after `exit_process` marked the others is marked here instead.
+pub(super) fn place_spawned(g: &mut SchedState, r: ObjectRef) -> Result<(), ObjectRef> {
+    // SAFETY: `r` pins the new thread; `SCHED` held.
+    let th = unsafe { &*(r.as_ptr() as *const Thread) };
+    // SAFETY: the clone pins the live `Process`; the thread holds another reference, so dropping
+    // it frees nothing under `SCHED`.
+    if th.process_ref().is_some_and(|p| unsafe { &*(p.as_ptr() as *const crate::object::Process) }.ending().is_some()) {
+        // SAFETY: as above.
+        unsafe { Thread::set_ending(r.as_ptr()) };
+    }
+    place_thread(g, r, false)
 }
 
 /// The idle thread body: reap any exited thread, then `hlt` until the next interrupt. Runs

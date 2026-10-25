@@ -444,12 +444,12 @@ Creates a new thread in the **calling process** and returns a `Thread` handle (`
 ```rust
 fn sys_thread_exit(status: i32) -> !
 ```
-Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive). Does not return. (Syscall number `17`.)
+Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive); after a `sys_process_exit` by another of its threads, its `status` is that call's, not this one's. Does not return. (Syscall number `17`.)
 
 ```rust
 fn sys_process_exit(status: i32) -> !
 ```
-Exits the **calling process** with `status`: the kernel tears down every sibling thread of the caller's process (an `owner_pid` scan of the run/blocked/suspended queues — unregistering blocked siblings from their waits first), delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), then terminates the calling thread and reaps the process (freeing its address space). Does not return. (Syscall number `16`.)
+Exits the **calling process** with `status`: the kernel closes the process's handles, records `status` (a second `sys_process_exit` racing the first exits with the first's), and sets every other thread of the process on its way to end: a blocked one is woken and its `sys_wait` never returns to it, a suspended one is resumed to terminate, and one running on another CPU is stopped by an interrupt. Each ends on its way back to ring 3, so whatever it held is let go. The last thread out delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), and the process is reaped (freeing its address space). Does not return. (Syscall number `16`.)
 
 ```rust
 fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: u64) -> isize
@@ -537,7 +537,7 @@ fn sys_channel_create(
     queue_depth: u32,
 ) -> isize
 ```
-Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 512` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. (Syscall number `12`.)
+Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 512` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. Each endpoint brings a place among the kernel's deadlines for every `BlockBounded` send it can hold, so such a send's deadline is always kept. (Syscall number `12`.)
 
 ```rust
 fn sys_channel_send(
@@ -572,7 +572,7 @@ Receives a message from `ch` (requires `RECV`). Returns `WouldBlock` if no messa
 ```rust
 fn sys_timer_create(flags: TimerFlags) -> isize
 ```
-Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT | DUPLICATE | INSPECT | TRANSFER`. `flags` must be a valid `TimerFlags` (none defined yet → must be 0). (Syscall number `8`; implemented in the wait-queues slice.)
+Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT | DUPLICATE | INSPECT | TRANSFER`. `flags` must be a valid `TimerFlags` (none defined yet → must be 0). The timer brings its own place among the kernel's deadlines, so arming it never fails and holding many fails no one else's: `OutOfMemory` here if that place cannot be made. (Syscall number `8`; implemented in the wait-queues slice.)
 
 ```rust
 fn sys_timer_set(timer: RawHandle, deadline_ns: u64, interval_ns: u64) -> isize

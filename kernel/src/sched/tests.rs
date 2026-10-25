@@ -131,6 +131,7 @@ fn test_state() -> SchedState {
         idle_addr: [0; MAX_CPUS],
         blocked: KVec::new(),
         deadlines: KVec::new(),
+        deadline_slots: [0; 3],
         stats: [stats::Counters::ZERO; MAX_CPUS],
         deferred_drops: KVec::new(),
         ended_pids: KVec::new(),
@@ -655,26 +656,22 @@ fn has_live_siblings_scans_all_parked_lists() {
 }
 
 #[test]
-fn reap_matching_moves_only_same_pid_threads() {
+fn a_process_ending_marks_only_its_own_threads_and_frees_none() {
     init_global_heap();
     test_probe::reset();
-    {
-        let mut st = test_state();
-        st.ready[0] = thread_list().unwrap();
-        st.reap[0] = thread_list().unwrap();
-        st.ready[0].try_push(inert_user_ref(1, 1)).unwrap();
-        st.ready[0].try_push(inert_user_ref(2, 2)).unwrap();
-        st.ready[0].try_push(inert_user_ref(3, 1)).unwrap();
+    let mut st = test_state();
+    st.ready[0] = thread_list().unwrap();
+    st.reap[0] = thread_list().unwrap();
+    for (tid, pid) in [(1, 1), (2, 2), (3, 1)] {
+        st.ready[0].try_push(inert_user_ref(tid, pid)).unwrap();
+    }
 
-        reap_matching(&mut st.ready[0], &mut st.deadlines, &mut st.reap[0], 1);
-        assert_eq!(st.reap[0].len(), 2, "both pid-1 threads reaped");
-        assert_eq!(st.ready[0].len(), 1, "the pid-2 thread stays");
-        // SAFETY: pinned, single-threaded.
-        let left = unsafe { &*(st.ready[0].iter().next().unwrap().as_ptr() as *const Thread) };
-        assert_eq!(left.owner_pid(), 2);
-        assert_eq!(test_probe::thread_destroys(), 0);
-    } // st dropped — reap + ready release their refs.
-    assert_eq!(test_probe::thread_destroys(), 3);
+    end_siblings(&mut st, 1);
+    // SAFETY: each is pinned by `ready`; single-threaded.
+    let marked: std::vec::Vec<bool> = st.ready[0].iter().map(|r| unsafe { Thread::is_ending(r.as_ptr()) }).collect();
+    assert_eq!(marked, [true, false, true]);
+    assert!(st.reap[0].is_empty(), "each ends itself; none is parked for reaping here");
+    assert_eq!(test_probe::thread_destroys(), 0);
 }
 
 #[test]
@@ -710,6 +707,7 @@ fn reserved_state() -> SchedState {
     st.suspended = thread_list().unwrap();
     st.reap[0] = thread_list().unwrap();
     st.deadlines.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    st.deadline_slots = [deadline::HEAP_RESERVE / 4; 3];
     st
 }
 
@@ -747,7 +745,10 @@ fn every_thread_the_cap_admits_can_fault_block_wake_and_be_reaped_on_one_cpu() {
     for obj in blocked {
         assert!(make_runnable(&mut st, obj));
     }
-    reap_matching(&mut st.ready[0], &mut st.deadlines, &mut st.reap[0], 7);
+    // Each parks itself for reaping on the CPU it ends on, as `finish_exit` does.
+    while let Some(r) = st.ready[0].pop() {
+        push_reserved(&mut st.reap[0], r, "reap list (self)");
+    }
     assert_eq!(st.reap[0].len(), MAX_THREADS);
 }
 
@@ -767,37 +768,136 @@ fn a_thread_counts_from_its_first_placement_until_its_reap_is_drained() {
     assert_eq!(st.threads, 0);
 }
 
-/// A thread a timer woke sits in `ready` still registered on its other wait objects and in
-/// the heap, until it runs; reaped first, it must leave neither naming it.
+/// A blocked thread is woken to end itself, still registered on its objects and in the heap for its
+/// own `wait_on` to undo; a suspended one resumes to terminate; the CPU running one is told.
 #[test]
-fn a_woken_thread_reaped_before_it_runs_leaves_nothing_naming_it() {
+fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells_the_cpu_running_one() {
+    init_global_heap();
+    super::online_set::force(0b11);
+    let mut st = reserved_state();
+    st.cpu_online[1] = true;
+    st.ready[1] = thread_list().unwrap();
+    let t1 = new_timer();
+    let blocked = inert_user_ref(1, 7);
+    let other = inert_user_ref(2, 8);
+    for r in [&blocked, &other] {
+        // SAFETY: every object here is pinned by the test; single-threaded.
+        unsafe {
+            Thread::wait_register(r.as_ptr(), &[t1.as_ptr() as usize], true);
+            Timer::add_waiter(t1.as_ptr(), r.as_ptr()).unwrap();
+            Thread::set_state(r.as_ptr(), ThreadState::Blocked);
+        }
+    }
+    let (b, o) = (blocked.as_ptr(), other.as_ptr());
+    let thread_deadline = deadline::Entry { kind: deadline::DeadlineKind::Thread, ..entry(5_000, b as usize) };
+    deadline::push(&mut st.deadlines, thread_deadline).unwrap();
+    st.blocked.try_push(blocked).unwrap();
+    st.blocked.try_push(other).unwrap();
+    let suspended = inert_user_ref(3, 7);
+    let s3 = suspended.as_ptr();
+    // SAFETY: pinned by the test; single-threaded.
+    unsafe { Thread::set_state(s3, ThreadState::Suspended) };
+    st.suspended.try_push(suspended).unwrap();
+    let running = inert_user_ref(4, 7);
+    let r4 = running.as_ptr();
+    st.current[1] = Some(running);
+
+    end_siblings(&mut st, 7);
+
+    // SAFETY: each thread is pinned by a scheduler list; single-threaded.
+    unsafe {
+        assert!(Thread::is_ending(b) && Thread::is_ending(s3) && Thread::is_ending(r4));
+        assert!(!Thread::is_ending(o), "another process's thread");
+        assert_eq!(Thread::take_disposition(s3), (DISP_TERMINATE, 0));
+    }
+    assert_eq!(st.blocked.len(), 1);
+    assert_eq!(st.blocked[0].as_ptr(), o, "the other process's thread stays blocked");
+    assert!(st.suspended.is_empty());
+    let ready: std::vec::Vec<_> = st.ready.iter().flat_map(|q| q.iter().map(|r| r.as_ptr())).collect();
+    assert!(ready.contains(&b) && ready.contains(&s3), "woken and resumed to run");
+    assert!(with_ending(1, |e| e.load(Ordering::Acquire)), "CPU 1 ends its running thread on the way out");
+    assert!(st.deadlines.iter().any(|e| e.target == b as usize), "left for its own wait_on to remove");
+    assert!(st.reap.iter().all(|q| q.is_empty()));
+    let mut waiters = [core::ptr::null_mut(); Timer::MAX_WAITERS];
+    // SAFETY: pinned by `t1`; single-threaded. What each thread's own `wait_on` would undo.
+    assert_eq!(unsafe { Timer::take_waiters(t1.as_ptr(), &mut waiters) }, 2, "both still registered");
+}
+
+/// The last thread out of a process, however it left, hands the process's handles to the reaper
+/// and wakes it, and its parent hears the status a `sys_process_exit` recorded, not its own.
+#[test]
+fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_recorded() {
+    use crate::object::thread::test_support::{user_process_ref, user_thread_no_stack};
     init_global_heap();
     super::online_set::force(0b1);
     let mut st = reserved_state();
-    let (t1, t2) = (new_timer(), new_timer());
-    let a = inert_user_ref(1, 7);
-    let obj = a.as_ptr();
-    // SAFETY: every object here is pinned by the test; single-threaded.
-    unsafe {
-        Thread::wait_register(obj, &[t1.as_ptr() as usize, t2.as_ptr() as usize], true);
-        Timer::add_waiter(t1.as_ptr(), obj).unwrap();
-        Timer::add_waiter(t2.as_ptr(), obj).unwrap();
-        Thread::set_state(obj, ThreadState::Blocked);
-        Timer::set_armed(t1.as_ptr(), 1_000, 0);
-        Timer::set_in_heap(t1.as_ptr(), true);
+    st.ended_pids.try_reserve(4).unwrap();
+    st.reaper = Some(inert_ref(99));
+    let (process, _root) = user_process_ref(5);
+    let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
+    // SAFETY: `into_raw` yielded the single creation reference; adopt it.
+    let parent = unsafe { ObjectRef::from_raw(chan, KObjectType::NotificationChannel) };
+    let recorded = ExitStatus { kind: ExitKind::Normal as u32, code: 3 };
+    {
+        let p = process.as_ptr() as *mut crate::object::Process;
+        // SAFETY: the test's own Process, not yet shared with anything that reads it.
+        unsafe { (*p).set_parent_notif(parent.clone()) };
+        // SAFETY: as above.
+        unsafe { &*p }.begin_ending(recorded);
     }
-    let thread_deadline = deadline::Entry { deadline_ns: 5_000, target: obj as usize, ..entry(0, 0) };
-    deadline::push(&mut st.deadlines, deadline::Entry { kind: deadline::DeadlineKind::Thread, ..thread_deadline })
-        .unwrap();
-    deadline::push(&mut st.deadlines, entry(1_000, t1.as_ptr() as usize)).unwrap();
-    st.blocked.try_push(a).unwrap();
-    fire_expired_deadlines(&mut st, 1_000);
-    assert_eq!(st.ready[0].len(), 1, "the timer woke it");
+    let me = into_objref(user_thread_no_stack(1, process.clone(), 0x40_0000, 0x7fff_f000));
+    let own = ExitStatus { kind: ExitKind::Crashed as u32, code: 14 };
+    st.blocked.try_push(inert_user_ref(2, 5)).unwrap();
 
-    reap_matching(&mut st.ready[0], &mut st.deadlines, &mut st.reap[0], 7);
-    assert_eq!(st.reap[0].len(), 1);
-    let mut waiters = [core::ptr::null_mut(); Timer::MAX_WAITERS];
-    // SAFETY: pinned by `t2`; single-threaded.
-    assert_eq!(unsafe { Timer::take_waiters(t2.as_ptr(), &mut waiters) }, 0, "still t2's waiter");
-    assert!(!st.deadlines.iter().any(|e| e.target == obj as usize), "still in the heap");
+    assert!(!end_process_if_last(&mut st, me.as_ptr(), own), "a sibling is still live");
+    assert!(st.ended_pids.is_empty() && st.reaper.is_some());
+
+    let sibling = st.blocked.pop().unwrap();
+    assert!(end_process_if_last(&mut st, me.as_ptr(), own));
+    assert_eq!(st.ended_pids.iter().copied().collect::<std::vec::Vec<_>>(), [5]);
+    assert!(st.reaper.is_none(), "the reaper was woken");
+    // SAFETY: pinned by `me`; single-threaded.
+    assert!(unsafe { Thread::process_ended(me.as_ptr()) });
+    // SAFETY: the parent channel is pinned by `parent`; single-threaded.
+    let heard = unsafe { NotificationChannel::try_recv(parent.as_ptr()) }.expect("ChildExited");
+    assert_eq!(heard.as_bytes(), Notification::child_exited(5, recorded).as_bytes());
+    drop((sibling, me));
+}
+
+/// A marked thread's `wait_on` answers `Ended` at once; a wait for I/O in flight heeds no mark.
+#[test]
+fn a_thread_its_process_marked_waits_for_nothing_but_its_io() {
+    init_global_heap();
+    // SAFETY: no objects, so nothing to pin.
+    let (heeded, io) = with_current(an_ending_thread(), || unsafe { (wait_on(&[], 1, 0), wait_on_io(&[], 0, 0)) });
+    assert!(matches!(heeded, WaitResult::Ended));
+    assert!(matches!(io, WaitResult::TimedOut), "a poll for I/O answers as a poll");
+}
+
+/// A marked thread terminates at a fault instead of parking where nothing would resume it.
+#[test]
+fn a_thread_its_process_marked_terminates_at_a_fault_instead_of_suspending() {
+    init_global_heap();
+    let disposition = with_current(an_ending_thread(), || suspend_with_fault(0, Notification::divide_by_zero(1, 0x10)));
+    assert!(matches!(disposition, ResumeDisposition::Terminate(0)));
+}
+
+#[test]
+fn a_thread_made_for_a_process_that_has_begun_to_exit_is_placed_marked() {
+    use crate::object::thread::test_support::{user_process_ref, user_thread_no_stack};
+    init_global_heap();
+    super::online_set::force(0b1);
+    let mut st = reserved_state();
+    let (exiting, _) = user_process_ref(5);
+    // SAFETY: `exiting` pins the test's own `Process`.
+    unsafe { &*(exiting.as_ptr() as *const crate::object::Process) }
+        .begin_ending(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
+    let (running, _) = user_process_ref(6);
+    for (process, marked) in [(exiting, true), (running, false)] {
+        let thread = into_objref(user_thread_no_stack(1, process, 0x40_0000, 0x7fff_f000));
+        let obj = thread.as_ptr();
+        assert!(place_spawned(&mut st, thread).is_ok());
+        // SAFETY: pinned by its run queue; single-threaded.
+        assert_eq!(unsafe { Thread::is_ending(obj) }, marked);
+    }
 }

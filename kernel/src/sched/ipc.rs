@@ -403,10 +403,9 @@ pub unsafe fn ipc_send_push_blocking(
             // lives on the peer (receiving) endpoint.
             // SAFETY: the send queued, proving the peer is non-null; `SCHED` held.
             let peer = unsafe { IpcChannel::peer_of(endpoint) };
-            // Heap-full degrades to an unbounded `Block` (the message still delivers, just
-            // without a timeout); the reserve far exceeds realistic pending sends.
-            let _ = deadline::push(
-                &mut g.deadlines,
+            // Into a slot the receiving endpoint holds, one for each send it can hold.
+            let _ = deadline::push_promised(
+                &mut g,
                 deadline::Entry {
                     deadline_ns,
                     target: po.as_ptr() as usize,

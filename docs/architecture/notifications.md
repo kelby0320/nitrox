@@ -73,9 +73,10 @@ chain.
 - **`ChildExited`:** `sys_process_exit` / `sys_thread_exit` deliver
   `ChildExited { pid, status }` to the parent's notification channel (the
   `parent_notif` recorded on the child `Process` at spawn), at exit time so a
-  parent blocked in `sys_wait` wakes promptly. `sys_thread_exit` fires it only
-  for a process's **last** thread; `sys_process_exit` tears down the siblings
-  first and always fires it.
+  parent blocked in `sys_wait` wakes promptly. The process's **last** thread out
+  fires it: `sys_thread_exit` from that thread, or, after a `sys_process_exit`,
+  whichever of the siblings it set on their way to end leaves last, with the
+  status `sys_process_exit` recorded.
 - **Deferred to Phase 2:** `PeerClosed` is produced (IPC slice); the debugger
   extras (`ResumeSkip` / `ModifyAndResume`, the 30 s auto-terminate timeout, the
   debugger exception-channel priority chain) and per-process queue-capacity

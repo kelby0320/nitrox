@@ -13,6 +13,7 @@
 //! (`kernel/docs/lock-ordering.md`). The `pub(crate) unsafe fn` accessors reach the cell
 //! through a type-erased `*mut ()`, so no aliasing `&mut Timer` is ever formed.
 
+use crate::sched::{SlotHold, Slots};
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::KObjectType;
@@ -25,6 +26,8 @@ pub struct Timer {
     header: KObjectHeader,
     magic: u64,
     inner: UnsafeCell<TimerInner>,
+    /// Its slot in the deadline heap, given back after `Drop` has taken its entry out.
+    _slot: SlotHold,
 }
 
 struct TimerInner {
@@ -53,14 +56,17 @@ impl Timer {
     /// Maximum simultaneous waiters; the reserve keeps `add_waiter` from allocating under `SCHED`.
     pub const MAX_WAITERS: usize = 4;
 
-    /// Allocate an unarmed `Timer` (refcount one), reserving the waiter vector up front.
+    /// Allocate an unarmed `Timer` (refcount one), reserving the waiter vector and its slot in
+    /// the deadline heap up front.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
+        let slot = SlotHold::reserve(Slots::Timer)?;
         let mut waiters: KVec<*mut ()> = KVec::new();
         waiters.try_reserve(Self::MAX_WAITERS)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Timer),
             magic: Self::MAGIC,
             inner: UnsafeCell::new(TimerInner { deadline_ns: 0, interval_ns: 0, in_heap: false, waiters }),
+            _slot: slot,
         })
     }
 

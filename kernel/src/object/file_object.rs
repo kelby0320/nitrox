@@ -1172,15 +1172,17 @@ impl FileObject {
     }
 }
 
-/// Park the current thread on the fill `po` until it completes, and answer its completion
-/// status (`0` = success). The `wait_on` fast path returns at once if `po` already completed.
+/// Wait until `po` has completed, and answer its status (`0` = success): a barrier for its I/O,
+/// so a wait woken with nothing signalled, by the process's exit or for want of room, waits again.
 fn wait_status(po: &ObjectRef) -> i32 {
-    // SAFETY: `po` pins the `PendingOperation` waited on.
-    match unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) } {
-        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-        crate::sched::WaitResult::Signaled(_) => unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0,
-        // OutOfMemory (waiter registration failed); TimedOut cannot occur (no deadline).
-        _ => crate::syscall::error::KError::OutOfMemory as i32,
+    loop {
+        // SAFETY: `po` pins the `PendingOperation` waited on.
+        let waited = unsafe { crate::sched::wait_on_io(&[po.as_ptr() as usize], u64::MAX, 0) };
+        if let crate::sched::WaitResult::Signaled(_) = waited {
+            // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+            return unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0;
+        }
+        park_briefly();
     }
 }
 
@@ -1207,19 +1209,9 @@ impl WriteBack {
     }
 }
 
-/// Wait for a page fill's `po` to complete; `true` iff it succeeded. A waiter that cannot
-/// register (`MAX_WAITERS`) parks and retries: the fill completes without it, and never spins.
+/// Wait for a page fill's `po` to complete, as [`wait_status`] does; `true` iff it succeeded.
 fn wait_for_fill(po: &ObjectRef) -> bool {
-    loop {
-        // SAFETY: `po` pins the `PendingOperation` waited on.
-        match unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) } {
-            crate::sched::WaitResult::Signaled(_) => {
-                // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-                return unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 == 0;
-            }
-            _ => park_briefly(),
-        }
-    }
+    wait_status(po) == 0
 }
 
 /// Park for a millisecond — a sleep with a deadline on no object, so the CPU runs something
@@ -1227,7 +1219,7 @@ fn wait_for_fill(po: &ObjectRef) -> bool {
 fn park_briefly() {
     let now = crate::arch::Timer::read_ns();
     // SAFETY: no objects: a sleep until the deadline.
-    let _ = unsafe { crate::sched::wait_on(&[], now + 1_000_000, now) };
+    let _ = unsafe { crate::sched::wait_on_io(&[], now + 1_000_000, now) };
 }
 
 /// A self-test fill in flight: the DPC and what it needs, heap-boxed so its `Dpc` has a stable
@@ -2061,6 +2053,20 @@ mod tests {
         // SAFETY: `irp` is the recording device's in-flight IRP.
         unsafe { crate::io::block::complete_for_test(irp) };
         crate::io::block::reclaim_completed();
+    }
+
+    /// A fill or write-back wait answers what its I/O came to, the process exiting or not.
+    #[test]
+    fn a_fill_wait_answers_the_fill_not_the_exit() {
+        init_global_heap();
+        let po = PendingOperation::try_new().unwrap();
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        let po = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
+        // SAFETY: `po` pins the `PendingOperation`; the device's side of a success.
+        unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, 0) };
+        let answers =
+            crate::sched::with_current(crate::sched::an_ending_thread(), || (wait_for_fill(&po), wait_status(&po)));
+        assert_eq!(answers, (true, 0));
     }
 
     struct Held(core::cell::RefCell<std::vec::Vec<*mut crate::io::irp::Irp>>);

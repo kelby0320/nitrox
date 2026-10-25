@@ -61,54 +61,105 @@ pub fn pid_has_threads(pid: u32) -> bool {
     has_live_siblings(&SCHED.lock(), pid)
 }
 
-/// Reap every thread of process `my_pid` parked in `list`, first unregistering it from its
-/// wait objects and the deadline heap so nothing dangles at a reaped thread: one woken but not
-/// yet run is in a `ready` queue still registered wherever it waited.
-pub(super) fn reap_matching(
-    list: &mut KVec<ObjectRef>,
-    deadlines: &mut KVec<deadline::Entry>,
-    reap: &mut KVec<ObjectRef>,
-    my_pid: u32,
-) {
-    // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
-    while let Some(i) = list.iter().position(|r| {
-        // SAFETY: `r` pins a live Thread; `SCHED` held.
-        let th = unsafe { &*(r.as_ptr() as *const Thread) };
-        // Never reap a per-CPU **idle** thread: it is scheduler infrastructure and may be
-        // *running right now* on another CPU — reclaiming it frees a live kernel stack. Idle
-        // threads carry `owner_pid()==0`, so a `pid==0` exit would otherwise sweep them all.
-        th.owner_pid() == my_pid && th.tid() != IDLE_TID
-    }) {
-        // Wait out a mid-switch-out guard: a sibling parked on another CPU's queue may not
-        // have committed its switch-out, so that CPU is still on its kernel stack and queueing
-        // it for the stack free would be a use-after-free. Bounded: the owning CPU clears the
-        // guard from post-release straight-line code, no lock needed.
-        // SAFETY: the entry pins a live Thread; `SCHED` held.
-        while unsafe { Thread::is_on_cpu(list[i].as_ptr()) } {
-            core::hint::spin_loop();
-        }
-        let r = list.remove(i);
-        let obj = r.as_ptr();
-        // Unregister from every object this thread was waiting on, as `wait_on`'s resume does.
-        let mut snap = [(0usize, false); MAX_WAIT_HANDLES];
-        // SAFETY: live Thread, `SCHED` held.
-        let n = unsafe { Thread::wait_snapshot(obj, &mut snap) };
-        for &(o, _) in &snap[..n] {
-            // SAFETY: the wait object is kept alive by this thread's `sys_wait`
-            // `ObjectRef`s (released only when it unblocks); `SCHED` held.
-            unsafe { obj_remove_waiter(o as *mut (), obj) };
-        }
-        // SAFETY: live Thread, `SCHED` held.
-        if unsafe { Thread::wait_has_deadline(obj) } {
-            deadline::remove(deadlines, obj as usize, deadline::DeadlineKind::Thread);
-        }
-        // SAFETY: live Thread, `SCHED` held.
-        unsafe {
-            Thread::wait_clear(obj);
-            Thread::set_state(obj, ThreadState::Exited);
-        }
-        push_reserved(reap, r, "reap list");
+/// Per-CPU copy of the running thread's [`Thread::is_ending`], written under `SCHED` and read on
+/// the way to ring 3 without it, by its own CPU with interrupts masked.
+#[cfg(not(test))]
+static ENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+#[cfg(test)]
+std::thread_local! {
+    /// Host-test backing for [`ENDING`], one set per test thread, as `preempt`'s flags are.
+    static ENDING_TLS: [AtomicBool; MAX_CPUS] = const { [const { AtomicBool::new(false) }; MAX_CPUS] };
+}
+
+/// CPU `cpu`'s copy of its running thread's mark. See [`ENDING`].
+#[cfg(not(test))]
+#[inline(always)]
+pub(super) fn with_ending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R {
+    f(&ENDING[cpu])
+}
+
+#[cfg(test)]
+pub(super) fn with_ending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R {
+    ENDING_TLS.with(|a| f(&a[cpu]))
+}
+
+/// End the running thread if its process is exiting: called on every return to ring 3, with its
+/// kernel stack unwound and nothing held.
+pub fn end_if_ending() {
+    if with_ending(SchedState::this_cpu(), |e| e.load(Ordering::Acquire)) {
+        // What makes freeing sound at an interrupt's tail (`lock-ordering.md`).
+        crate::libkern::lockrank::assert_user_entry_safe();
+        assert_user_entry_preempt_safe();
+        // The status is the process's, recorded by the exit that marked the thread.
+        exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
     }
+}
+
+/// Set every other thread of process `pid` to end itself on its next return to ring 3: each is
+/// marked, then woken, resumed or sent a reschedule IPI as it is blocked, suspended or running.
+/// **None is freed here**: only its own unwinding lets go of what its kernel stack holds.
+pub(super) fn end_siblings(g: &mut SchedState, pid: u32) {
+    // SAFETY: each entry pins a live Thread; `SCHED` held.
+    let same = |r: &ObjectRef| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == pid;
+    let me = SchedState::this_cpu();
+    for c in 0..MAX_CPUS {
+        for r in g.ready[c].iter().filter(|r| same(r)) {
+            // SAFETY: `r` pins the thread; `SCHED` held.
+            unsafe { Thread::set_ending(r.as_ptr()) };
+        }
+        if let Some(r) = g.current[c].as_ref().filter(|r| same(r)) {
+            // SAFETY: as above.
+            unsafe { Thread::set_ending(r.as_ptr()) };
+            with_ending(c, |e| e.store(true, Ordering::Release));
+            if c != me {
+                crate::arch::send_reschedule_ipi(c);
+            }
+        }
+    }
+    // SAFETY: as `same`.
+    let unmarked = |r: &ObjectRef| same(r) && !unsafe { Thread::is_ending(r.as_ptr()) };
+    while let Some(i) = g.blocked.iter().position(unmarked) {
+        let th = g.blocked[i].as_ptr();
+        // SAFETY: `blocked` pins the thread, blocked in `wait_on`; `SCHED` held.
+        unsafe {
+            Thread::set_ending(th);
+            if Thread::wait_try_wake(th) {
+                make_runnable(g, th);
+            }
+        }
+    }
+    while let Some(i) = g.suspended.iter().position(same) {
+        let r = g.suspended.remove(i);
+        // SAFETY: `r` pins the thread; `SCHED` held.
+        unsafe { Thread::set_ending(r.as_ptr()) };
+        resume_parked(g, r, DISP_TERMINATE, 0);
+    }
+}
+
+/// If no other thread of the exiting thread's process is live, end the process: its handles go
+/// to the reaper, woken at once rather than at this CPU's next idle, and its parent hears
+/// `ChildExited` with the status a `sys_process_exit` recorded, else `status`.
+pub(super) fn end_process_if_last(g: &mut SchedState, me_obj: *mut (), status: ExitStatus) -> bool {
+    // SAFETY: `me_obj` is the exiting thread, pinned by its caller; `SCHED` held.
+    let th = unsafe { &*(me_obj as *const Thread) };
+    let Some(process) = th.process_ref() else {
+        return false;
+    };
+    if has_live_siblings(g, th.owner_pid()) {
+        return false;
+    }
+    // SAFETY: `process` pins the live `Process`. Dropping this clone is never the last
+    // reference (the thread holds one), so it frees nothing under `SCHED`.
+    let status = unsafe { &*(process.as_ptr() as *const crate::object::Process) }.ending().unwrap_or(status);
+    // SAFETY: as above.
+    unsafe { Thread::set_process_ended(me_obj) };
+    // A full queue leaves the sweep to this CPU's `reap_pending`, which `process_ended` asks for.
+    if g.ended_pids.push_within_capacity(th.owner_pid()).is_ok() {
+        wake_reaper(g);
+    }
+    deliver_child_exited(g, me_obj, status);
+    true
 }
 
 /// Mark `me` (the current thread, already out of `current`) `Exited`, park it in `reap`, and
@@ -146,87 +197,35 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     unreachable!("switched away from an exited thread");
 }
 
-/// Terminate the **current thread** with exit `status` and switch away forever. Used by
-/// `sys_thread_exit`, the resume-`Terminate` path, and kernel thread bodies.
-///
-/// `ChildExited` is delivered **iff this is the process's last thread** (no live sibling).
-/// Kernel/boot threads have no process and produce none. Delivery happens before parking,
-/// so a parent blocked in `sys_wait` wakes promptly.
+/// Terminate the **current thread** with exit `status`; the last of a process out ends it. Used by
+/// `sys_thread_exit`, the resume-`Terminate` path, [`end_if_ending`] and kernel thread bodies.
 pub fn exit_thread(status: ExitStatus) -> ! {
     // Reclaim any earlier exited thread first, so `reap` has room for us.
     reap_pending();
 
     let mut g = SCHED.lock();
     let me = g.cur_slot().take().expect("current set");
-    let me_obj = me.as_ptr();
-
-    // SAFETY: `me` is the running thread, pinned, lock held.
-    let me_pid = unsafe { &*(me_obj as *const Thread) }.owner_pid();
-    // SAFETY: same.
-    let has_process = unsafe { &*(me_obj as *const Thread) }.process_ref().is_some();
-    if has_process && !has_live_siblings(&g, me_pid) {
-        // Last thread out: the process is ending, so its handles must be closed.
-        // Deferred to the reaper for the same reason as in `exit_process`.
-        // SAFETY: `me_obj` is the running thread, pinned, lock held.
-        unsafe { Thread::set_process_ended(me_obj) };
-        deliver_child_exited(&mut g, me_obj, status);
-    }
-
+    end_process_if_last(&mut g, me.as_ptr(), status);
     finish_exit(g, me);
 }
 
-/// Terminate the **whole process** of the current thread with exit `status`: tear down
-/// every sibling (scan `ready`/`blocked`/`suspended` by `owner_pid`, unregistering blocked
-/// siblings from their waits first), then exit the current thread **with** a `ChildExited`.
-/// Used by `sys_process_exit`.
-///
-/// The per-process thread list that would let an external killer find these threads
-/// without a scan lands later. **SMP gap (deferred):** a sibling *running* as another CPU's
-/// `current` is not reaped here — terminating it needs a cross-CPU deschedule IPI (the same
-/// machinery as TLB shootdown). Not triggered by today's workloads (multi-threaded
-/// processes don't `sys_process_exit` with a sibling live on another CPU). A kernel/boot
-/// thread (no process) degrades to a plain [`exit_thread`]-style exit.
+/// Terminate the **whole process** of the current thread with `status`: record it, set every
+/// sibling to end itself ([`end_siblings`]) and exit. Used by `sys_process_exit`.
 pub fn exit_process(status: ExitStatus) -> ! {
     // Reclaim any earlier exited thread first, so `reap` has room.
     reap_pending();
 
     let mut g = SCHED.lock();
     let me = g.cur_slot().take().expect("current set");
-    let me_obj = me.as_ptr();
-
     // SAFETY: `me` is the running thread, pinned, lock held.
-    let me_pid = unsafe { &*(me_obj as *const Thread) }.owner_pid();
-    // SAFETY: same.
-    let has_process = unsafe { &*(me_obj as *const Thread) }.process_ref().is_some();
-    if has_process {
-        // Reborrow the guard as `&mut SchedState` so the field borrows below are disjoint.
-        let cpu = SchedState::this_cpu();
-        let st: &mut SchedState = &mut g;
-        // Torn-down siblings are parked off-CPU, so reaping them into this CPU's reap list is
-        // safe. Sweep every per-CPU ready queue.
-        for c in 0..MAX_CPUS {
-            reap_matching(&mut st.ready[c], &mut st.deadlines, &mut st.reap[cpu], me_pid);
-        }
-        reap_matching(&mut st.suspended, &mut st.deadlines, &mut st.reap[cpu], me_pid);
-        reap_matching(&mut st.blocked, &mut st.deadlines, &mut st.reap[cpu], me_pid);
-        // The process is ending: always deliver ChildExited, and mark this thread so the
-        // reaper closes the process's handles. The sweep cannot happen here — it drops object
-        // references (destructors reach the rank-6 allocator, and an IPC endpoint's takes
-        // rank-1 `SCHED`), and we hold `SCHED` and never return from `finish_exit`.
-        // SAFETY: `me_obj` is the running thread, pinned, lock held.
-        unsafe { Thread::set_process_ended(me_obj) };
-        // Hand the handle table to the reaper. Peers wait on this half: closing an IPC
-        // endpoint nulls its peer and wakes anyone blocked there, so leaving it to "whenever
-        // some CPU next reaches idle" ties a blocked reader's liveness to unrelated
-        // scheduling. `set_process_ended` above keeps the per-CPU sweep as a fallback if the
-        // queue is full.
-        if st.ended_pids.len() < st.ended_pids.capacity() {
-            let _ = st.ended_pids.push_within_capacity(me_pid);
-            wake_reaper(st);
-        }
-        deliver_child_exited(st, me_obj, status);
+    let th = unsafe { &*(me.as_ptr() as *const Thread) };
+    if let Some(process) = th.process_ref() {
+        // SAFETY: `process` pins the live `Process`; dropping this clone frees nothing (the
+        // thread holds a reference), so it may drop under `SCHED`.
+        unsafe { &*(process.as_ptr() as *const crate::object::Process) }.begin_ending(status);
+        end_siblings(&mut g, th.owner_pid());
     }
-
+    end_process_if_last(&mut g, me.as_ptr(), status);
     finish_exit(g, me);
 }
 
@@ -272,6 +271,12 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
     let me_obj;
     {
         let mut g = SCHED.lock();
+        let cur = g.cur_ref().as_ref().expect("current set").as_ptr();
+        // SAFETY: the running thread, pinned by `current`; `SCHED` held.
+        if unsafe { Thread::is_ending(cur) } {
+            // Its process is exiting, and resumes nothing: it terminates instead of parking.
+            return ResumeDisposition::Terminate(0);
+        }
         let me = g.cur_slot().take().expect("current set");
         me_obj = me.as_ptr();
 
@@ -336,10 +341,13 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
         unsafe { Thread::take_disposition(me_obj) }
     };
     match tag {
-        2 => ResumeDisposition::Terminate(code),
+        DISP_TERMINATE => ResumeDisposition::Terminate(code),
         _ => ResumeDisposition::Resume,
     }
 }
+
+/// The disposition tag that terminates a resumed thread ([`ResumeDisposition::Terminate`]).
+pub(super) const DISP_TERMINATE: u8 = 2;
 
 /// Resume a thread suspended on a fault: record the supervisor's disposition on it and move
 /// it `suspended`→`ready`. Returns `false` (no-op) if `thread` is not `Suspended` — the
@@ -354,6 +362,13 @@ pub unsafe fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) ->
         return false;
     };
     let r = g.suspended.remove(i);
+    resume_parked(&mut g, r, disp_tag, disp_code);
+    true
+}
+
+/// Record a disposition on `r`, just taken out of `suspended`, and place it to run.
+fn resume_parked(g: &mut SchedState, r: ObjectRef, disp_tag: u8, disp_code: i32) {
+    let thread = r.as_ptr();
     // SAFETY: `r` pins `thread`; `SCHED` held. The disposition is read by
     // `suspend_with_fault` when this thread next runs.
     unsafe {
@@ -362,7 +377,7 @@ pub unsafe fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) ->
     }
     // Re-home on its CPU (a wake; a full home falls back to a permitted queue with room).
     // Fails only when every permitted queue is at reserve.
-    if let Err(returned) = place_thread(&mut g, r, true) {
+    if let Err(returned) = place_thread(g, r, true) {
         // **Do not let `returned` drop here**: `SCHED` is held and an `ObjectRef` drop can
         // reach the allocator's plain spinlock. Leaked deliberately (`panic = "abort"`); see
         // `make_runnable` for the full argument.
@@ -373,7 +388,6 @@ pub unsafe fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) ->
              that does is at reserve; or no CPU accepts work and this one is at reserve"
         );
     }
-    true
 }
 
 /// The kernel-stack address of `thread`'s captured `ExceptionFrame`, or `None` if it is not

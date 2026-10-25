@@ -4,7 +4,8 @@
 fairness, work-stealing migration and reschedule IPIs are all live, and the `REAL_TIME`
 syscap gate landed with the capability system (Phase 3 slice 6, 2026-07-14). Remaining
 deferrals are marked inline. See [smp.md](smp.md) for the multi-core substrate.
-Verified 2026-08-05; the affinity-fallback paragraph re-verified 2026-08-14.
+Verified 2026-08-05; the affinity-fallback paragraph re-verified 2026-08-14; *Exit and the
+deadline heap* added 2026-10-25.
 
 The kernel scheduler: how runnable threads are chosen, how that scales from one
 CPU to many, and the per-CPU substrate SMP stands on. This document is the design
@@ -260,7 +261,7 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
 | **1** ✅ | **SMP bring-up** *(landed; correctness items → slice 3)*: Limine AP startup; per-CPU GDT/TSS + shared IDT; **x2APIC** (MSR accessors + single-`WRMSR` IPI); per-CPU timer; APs run a per-CPU idle thread and pull from the **shared** global runqueue. Fixed a per-CPU `reap` UAF. **Deferred to slice 3:** TLB shootdown + `active_cpus`, and **user-thread-migration safety**. | `-smp 4`: 4 CPUs online, APs executing, full userspace boot clean 6/6. |
 | **2** ✅ | **Scheduler classes** *(landed)*: `SchedClass` RealTime/TimeShared/Idle + `rt_priority`/`nice`/`vruntime` on `Thread`; class-aware `dequeue_front` (policy scan over the shared `ready`); CFS-like vruntime (nice-weight table + `min_vruntime` floor/wake-boost); kernel-thread `spawn_with_class`. **Wired in the SysCaps slice (6):** the `REAL_TIME` gate + the user-facing `ThreadArgs` class/nice/affinity ABI — `sys_thread_create` now reads them and gates the RealTime class on the `REAL_TIME` syscap (see `docs/architecture/syscaps.md`). | `sched_class_demo`: RealTime finishes before any TimeShared round; nice-0 outpaces nice-10. |
 | **3** ✅ | **Per-CPU runqueues + work stealing + affinity** *(landed)*: `ready`/`min_vruntime` per-CPU (one `SCHED` lock); placement (kernel → least-loaded, wake → home CPU); idle-CPU work stealing; `cpu_mask` affinity + functional `sys_thread_set_affinity`; online CPUs tracked by a `cpu_online[]` mask; `has_live_siblings` scans other CPUs' `current[]`. **User threads were pinned to their creating CPU here** (structurally dodging the migration hazards) — lifted in 3b. | distribution demo → all APs (`0b1111`); affinity demo → each worker on its pinned CPU; `-smp 4` 12/12 clean. |
-| **3b** ✅ | **SMP correctness completion** *(landed 2026-07-01)*: TLB shootdown (broadcast IPI + synchronous ack) for the shared kernel vmap; the migration hazards root-caused and fixed (SCE re-arm at descent, APIC-id dense index, the **`on_cpu` switch-out-race guard**, and the misplaced-`init_this_cpu` dense-index collision), so **user threads distribute across and migrate between CPUs**. See [smp.md](smp.md) for the full mechanics + bug postmortem. **Deferred** (no consumer yet): cross-CPU deschedule IPI + per-`AddressSpace` `active_cpus`, which land with the first multi-threaded user process. | `-smp 4` KVM boot-loop 0/150 with userspace on the APs; scripted `eshell` stress 50/50 clean. |
+| **3b** ✅ | **SMP correctness completion** *(landed 2026-07-01)*: TLB shootdown (broadcast IPI + synchronous ack) for the shared kernel vmap; the migration hazards root-caused and fixed (SCE re-arm at descent, APIC-id dense index, the **`on_cpu` switch-out-race guard**, and the misplaced-`init_this_cpu` dense-index collision), so **user threads distribute across and migrate between CPUs**. See [smp.md](smp.md) for the full mechanics + bug postmortem. **Deferred** (no consumer yet): cross-CPU deschedule IPI + per-`AddressSpace` `active_cpus`, which land with the first multi-threaded user process. (The deschedule came with a process's exit, 2026-10-25: [smp.md](smp.md) § Deferred.) | `-smp 4` KVM boot-loop 0/150 with userspace on the APs; scripted `eshell` stress 50/50 clean. |
 
 ### Slice 0 in detail
 
@@ -343,6 +344,25 @@ future surfaces like a keep-recent `/dev/log` ring reuse; anticipated in
 
 Consistency is per-capture: one `SCHED` hold makes each snapshot internally
 consistent; successive reads each produce a fresh object (like `/dev/log`).
+
+## Exit and the deadline heap
+
+**No thread frees another.** `sys_process_exit` records its status on the `Process` and marks
+every other thread of it: a blocked one is woken, a suspended one resumed to terminate, and a CPU
+running one sent a reschedule IPI. A marked thread ends itself on its next return to ring 3, from
+a syscall, an exception or an interrupt, so whatever its kernel stack held is let go on the way;
+its waits return at once meanwhile, and a thread created during the exit is marked as it is placed.
+The last thread out ends the process, with the recorded status: its handles go to the reaper
+thread, woken at once, and its parent hears `ChildExited`.
+
+**Every deadline has its slot before it is pushed.** The heap reserves one slot per thread at
+init (`MAX_THREADS` placed threads and a boot thread per CPU, each waiting on one deadline at
+most); a `Timer` brings one more, and an IPC endpoint one per `BlockBounded` send it can hold.
+Each reserves at creation, growing the heap outside `SCHED` if every slot is promised, and gives
+back at destruction. So a push never finds the heap full: a process holding many timers pays at
+creation, and fails no one else's wait. Its removals are a scan, so holding very many still
+slows others' timed waits (`TODO(deadline-heap-scan)`). A debug build stops a push of a kind holding more entries
+than slots, and a give-back of slots never promised.
 
 ## Decisions (locked 2026-06-26)
 

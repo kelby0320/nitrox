@@ -132,6 +132,9 @@ pub struct Thread {
     /// which cannot run at exit time: the exiting thread holds rank-1 `SCHED` and never returns
     /// from `finish_exit`.
     process_ended: bool,
+    /// Set when the thread's process is exiting: it ends itself at its next return to ring 3,
+    /// letting go on the way of whatever its kernel stack holds, and its waits return at once.
+    ending: bool,
     /// Owning process, for a user thread. This [`ObjectRef`] keeps the `Process` and its
     /// `AddressSpace` alive until the thread is reaped. No cycle: the `Process` does not hold the
     /// thread. `None` for kernel/boot threads.
@@ -202,6 +205,7 @@ impl Thread {
             user_entry: None,
             user_boot_args: [0; 4],
             process_ended: false,
+            ending: false,
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -238,6 +242,7 @@ impl Thread {
             user_entry: None,
             user_boot_args: [0; 4],
             process_ended: false,
+            ending: false,
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -287,6 +292,7 @@ impl Thread {
             user_entry: None,
             user_boot_args: [0; 4],
             process_ended: false,
+            ending: false,
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -339,6 +345,7 @@ impl Thread {
             entry: inert_entry, // unused: user threads descend via user_entry
             arg: 0,
             process_ended: false,
+            ending: false,
             stack: Some(stack),
             addr_space_root: Some(root),
             user_entry: Some((entry, user_sp)),
@@ -431,6 +438,28 @@ impl Thread {
         let p = obj as *mut Thread;
         // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).process_ended) }
+    }
+
+    /// Mark the thread to end itself at its next return to ring 3 (see [`Thread::ending`]).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_ending(obj: *mut ()) {
+        let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED`
+        // is held.
+        unsafe { core::ptr::write(&raw mut (*p).ending, true) }
+    }
+
+    /// Whether the thread's process is exiting and it is to end itself.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn is_ending(obj: *mut ()) -> bool {
+        let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED`
+        // is held.
+        unsafe { core::ptr::read(&raw const (*p).ending) }
     }
 
     /// The thread's scheduling class.
@@ -872,7 +901,11 @@ impl Thread {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
     use crate::mm::test_support::init_global_heap;
 
@@ -923,58 +956,6 @@ mod tests {
             assert_eq!(Thread::saved_sp(obj), 0xDEAD_0000);
             drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
         }
-    }
-
-    fn user_process_ref(pid: u32) -> (ObjectRef, crate::mm::PhysAddr) {
-        use crate::mm::addr_space::AddressSpace;
-        let asp = AddressSpace::new().unwrap();
-        let root = asp.root();
-        let p = Process::try_new_user(pid, asp, crate::libkern::SysCaps::empty()).unwrap();
-        let ptr = KBox::into_raw(p).as_ptr() as *mut ();
-        // SAFETY: into_raw yielded the single creation ref; adopt it.
-        (unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }, root)
-    }
-
-    /// A user thread built **without** a kernel stack, avoiding the QEMU-only `fabricate_frame`,
-    /// which writes a kernel-vmap address that is not host memory.
-    fn user_thread_no_stack(tid: u32, process: ObjectRef, entry: u64, user_sp: u64) -> KBox<Thread> {
-        let root = {
-            let p = process.as_ptr() as *const Process;
-            // SAFETY: `process` is a live Process ref this test holds.
-            unsafe { (*p).address_space_root() }.unwrap()
-        };
-        KBox::try_new(Thread {
-            header: KObjectHeader::new(KObjectType::Thread),
-            tid,
-            owner_pid: 0,
-            arch: ArchThreadContext::new(),
-            state: ThreadState::Ready,
-            entry: inert_entry,
-            arg: 0,
-            stack: None,
-            addr_space_root: Some(root),
-            user_entry: Some((entry, user_sp)),
-            user_boot_args: [0; 4],
-            process_ended: false,
-            process: Some(process),
-            wait_objs: [0; MAX_WAIT_HANDLES],
-            wait_signaled: [false; MAX_WAIT_HANDLES],
-            wait_count: 0,
-            wait_has_deadline: false,
-            wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
-            disp_tag: 0,
-            disp_code: 0,
-            class: SchedClass::TimeShared,
-            rt_priority: 0,
-            nice: 0,
-            vruntime: 0,
-            last_cpu: 0,
-            cpu_mask: u8::MAX,
-            on_cpu: AtomicBool::new(false),
-            fpu: Some(new_fpu_area().expect("fpu area")),
-        })
-        .unwrap()
     }
 
     #[test]

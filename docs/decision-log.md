@@ -36794,3 +36794,32 @@ here:
   departed index.
 - **A device that connects as the hub thread clears a stale change is seen**: whether a port has a
   device is read after its change is cleared.
+
+## 2026-10-25 — Before Phase 7, Part D: group E changes these contracts
+
+The bash's scheduler findings, sched-5, sched-6 and sched-8 (and their duplicates, sched-15 to
+sched-17). `bug-bash.md` has each fix; what a caller can now see differently is here:
+
+- **No thread frees another; a process's exit marks its threads, and each ends itself on its way
+  back to ring 3.** A blocked sibling is woken, a suspended one resumed to terminate, and a CPU
+  running one sent a reschedule IPI, so a sibling's kernel stack unwinds and lets go of what it
+  held. A thread blocked in `sys_wait` on a channel no longer keeps that channel open for good, and
+  **a sibling running on another CPU stops** where it ran on after its process ended. This was the
+  maintainer's choice of the general fix over the narrow one, which would have woken only a
+  sibling in a wait; it is also how a forcible kill will stop a process, when one is built.
+- **`ChildExited` comes once the last thread is out**, where a `sys_process_exit` sent it at
+  once, with the status that call recorded; a second
+  `sys_process_exit` racing the first exits with the first's. `sys_process_exit` still closes the
+  process's handles itself, first, so a peer's `PeerClosed` is as prompt as before.
+- **A process whose last thread leaves by `sys_thread_exit`, or by a supervisor's `Terminate`, has
+  its handles closed at once**, by the reaper thread it wakes, where they waited for that CPU's
+  next idle, as long as a busy CPU's load lasted.
+- **Every deadline brings its slot in the heap**: one per thread at init, one with each timer and
+  four with each IPC endpoint, the heap growing to cover them. Arming a timer, a timed `sys_wait`
+  and a `BlockBounded` send's deadline no longer fail for want of room, whoever else holds timers;
+  `sys_timer_create` and `sys_channel_create` answer `OutOfMemory` if a slot cannot be made.
+- **The decision on sched-6's shape**: of the three put to the maintainer — slots reserved by what
+  fills them, a per-process cap on armed timers, a larger reserve — the first, as the only one that
+  keeps one process's timers from touching another's waits without accounting the kernel does not
+  have. A bounded send's slots come with its endpoint rather than with each send, the cheaper of
+  the two to keep paired.

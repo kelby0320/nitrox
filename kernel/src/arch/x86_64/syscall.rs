@@ -168,6 +168,7 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
     // passed its address; valid, aligned, and unaliased for this call.
     let f = unsafe { &mut *frame };
     let ret = table::dispatch(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
+    crate::sched::end_if_ending();
     // **A syscall body must not return with interrupts enabled**: the stub's `cli` makes the
     // `pop rsp` / `sysretq` window safe regardless, and this catches the *cause*.
     debug_assert!(
