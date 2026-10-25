@@ -10,7 +10,7 @@
 "kernel/src/handle/table.rs" = 1583
 "kernel/src/main.rs" = 1213
 "kernel/src/mm/vmm.rs" = 1560
-"kernel/src/object/file_object.rs" = 2457
+"kernel/src/object/file_object.rs" = 2460
 "kernel/src/object/thread.rs" = 1084
 "kernel/src/pci/mod.rs" = 1045
 "kernel/src/syscall/table.rs" = 2834
