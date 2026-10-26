@@ -263,6 +263,7 @@ fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             let seed = setup.argv.get(1).and_then(|s| parse_u64(s)).unwrap_or(0);
             run_fp_worker(seed);
         }
+        Some("hold") => run_hold(&setup),
         // A view broker names the program first, as a shell does.
         Some("test-stage") if setup.argv.get(1).is_some_and(|a| a == "grants") => run_grants(&setup, ns),
         _ => {
@@ -270,6 +271,18 @@ fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             exit(1);
         }
     }
+}
+
+/// The `"hold"` role: its setup taken, wait until `stdin`'s other end closes, then exit, so a test
+/// can look at what taking the setup left while the stage still runs.
+fn run_hold(setup: &libstream::setup::Setup) -> ! {
+    if let Some(stdin) = setup.streams.stdin {
+        let waited = [stdin];
+        let mut results = [0u8; 24];
+        // SAFETY: one handle to wait on and room for its result; no deadline.
+        unsafe { syscall4(SYS_WAIT, waited.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+    }
+    exit(0);
 }
 
 /// The `"stage <rows>"` role: read + verify a TSM1 stream on `stdin` (`<rows>` rows, row

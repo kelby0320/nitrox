@@ -2,6 +2,7 @@
 //! its handle table, and what they pin outlives their sender.
 
 use super::*;
+use libkern::{SENDMODE_NOBLOCK, SYS_CHANNEL_SEND};
 use libstream::channel::{IpcPort, MsgPort};
 
 /// Send on `ch` a message of `op` carrying one end of a fresh channel, and answer whether that end
@@ -44,6 +45,19 @@ pub(super) fn log_closes_what_it_was_sent_test(root_ns: u64) -> bool {
     true
 }
 
+/// `N` fresh channels, or none: those made before one failed are closed.
+fn channels<const N: usize>() -> Option<[(u64, u64); N]> {
+    let mut made = [(0, 0); N];
+    for i in 0..N {
+        let Some(c) = channel() else {
+            made[..i].iter().for_each(|&(a, b)| [a, b].iter().for_each(|&h| close(h)));
+            return None;
+        };
+        made[i] = c;
+    }
+    Some(made)
+}
+
 /// **`libstream`'s `IpcPort` closes the handles a stream's message carries**: nxsh reads a stage's
 /// output through it, and the stage chooses what comes.
 pub(super) fn ipc_port_closes_what_it_was_sent_test() -> bool {
@@ -51,7 +65,7 @@ pub(super) fn ipc_port_closes_what_it_was_sent_test() -> bool {
         Line::new().s(b"boot-probe: IpcPort sent a handle FAIL: ").s(why).end();
         false
     };
-    let (Some((ours, theirs)), Some((end, peer))) = (channel(), channel()) else {
+    let Some([(ours, theirs), (end, peer)]) = channels() else {
         return fail(b"no channels");
     };
     if !rs_send(theirs, 1, 1, b"x", &[end]) {
@@ -78,7 +92,7 @@ pub(super) fn received_closes_what_was_not_taken_test() -> bool {
         Line::new().s(b"boot-probe: Received FAIL: ").s(why).end();
         false
     };
-    let (Some((ours, theirs)), Some((e0, p0)), Some((e1, p1))) = (channel(), channel(), channel()) else {
+    let Some([(ours, theirs), (e0, p0), (e1, p1)]) = channels() else {
         return fail(b"no channels");
     };
     if !rs_send(theirs, 1, 1, b"", &[e0, e1]) {
@@ -156,12 +170,16 @@ pub(super) fn tty_backend_closes_what_it_was_sent_test(root_ns: u64) -> bool {
     };
     let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
     let (st, tty) = ns_lookup(root_ns, b"/dev/tty", chan);
-    let (Some((ours, theirs)), Some((extra, extra_peer))) = (channel(), channel()) else {
+    let Some([(ours, theirs), (extra, extra_peer)]) = channels() else {
         close(tty);
         return fail(b"no channels");
     };
-    let attached = st == 0
-        && rs_send(tty, OP_TTY_ATTACH_BACKEND, 0x6175, &[], &[theirs, extra])
+    let sent = st == 0 && rs_send(tty, OP_TTY_ATTACH_BACKEND, 0x6175, &[], &[theirs, extra]);
+    if !sent {
+        // A send not made, or refused, leaves both ends here.
+        [theirs, extra].iter().for_each(|&h| close(h));
+    }
+    let attached = sent
         && loop {
             match receive(tty, clock_ns() + 5_000 * MS) {
                 Some(m) if m.request_id == 0x6175 => break !m.error,
@@ -182,5 +200,51 @@ pub(super) fn tty_backend_closes_what_it_was_sent_test(root_ns: u64) -> bool {
         return fail(b"it kept what the backend sent");
     }
     kprint(b"boot-probe: tty-server closes what a backend and its attach send ok\n");
+    true
+}
+
+/// **A stage takes the handles its setup's fields name, and closes any past them while it runs.**
+pub(super) fn setup_closes_what_its_fields_do_not_name_test(root_ns: u64) -> bool {
+    use libstream::setup::{STREAM_STDIN, SetupPayload, bootstrap_arg0};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: setup surplus FAIL: ").s(why).end();
+        false
+    };
+    let Some([(ctrl, ctrl_far), (stdin, stdin_far), (extra, extra_peer)]) = channels() else {
+        return fail(b"no channels");
+    };
+    let payload =
+        SetupPayload { streams: STREAM_STDIN, argv: alloc::vec!["hold".into()], ..Default::default() }.encode();
+    let mut msg = [0u8; IPC_MSG_SIZE];
+    let sent = payload.is_ok_and(|p| {
+        msg[4..8].copy_from_slice(&(p.len() as u32).to_le_bytes());
+        msg[8] = 2;
+        msg[24..24 + p.len()].copy_from_slice(&p);
+        let handles = [stdin_far, extra];
+        // SAFETY: a whole message, and two handles this process holds.
+        let r = unsafe {
+            syscall5(SYS_CHANNEL_SEND, ctrl, msg.as_ptr() as u64, handles.as_ptr() as u64, 2, SENDMODE_NOBLOCK)
+        };
+        r == 0
+    });
+    if !sent {
+        [ctrl, ctrl_far, stdin, stdin_far, extra, extra_peer].iter().for_each(|&h| close(h));
+        return fail(b"no setup sent");
+    }
+    if !spawn_stage(root_ns, bootstrap_arg0(true), &[ctrl_far], 1) {
+        [ctrl, ctrl_far, stdin, extra_peer].iter().for_each(|&h| close(h));
+        return fail(b"no stage");
+    }
+    let surplus_closed = peer_gone_by(extra_peer, clock_ns() + 2_000 * MS);
+    // The stage holds stdin until its other end closes: still running, its exit closed nothing.
+    let running = !peer_gone_by(stdin, clock_ns());
+    [stdin, ctrl, extra_peer].iter().for_each(|&h| close(h));
+    if !running {
+        return fail(b"the stage had exited before it was looked at");
+    }
+    if !surplus_closed {
+        return fail(b"the stage kept a handle its setup did not name");
+    }
+    kprint(b"boot-probe: a stage closes the handles past those its setup names ok\n");
     true
 }
