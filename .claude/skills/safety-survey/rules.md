@@ -6,6 +6,13 @@ defect, a size, an ownership or a lifetime held by convention where no type hold
 `unsafe` that could be removed, narrowed or put behind an abstraction. **It is wide by design**: be
 thorough, and cut only what you would not raise in person.
 
+## What this is
+
+Nitrox is the maintainer's own operating system, a hobby project. The kernel and services you read
+run only on the maintainer's machines and under QEMU on this one, and the survey reads them to find
+and fix their own defects. Nothing here is aimed at another system, and what you write stays in
+this repository's tests.
+
 ## Two kinds of item
 
 ### A defect
@@ -77,6 +84,11 @@ A confidently wrong item costs the maintainer a reproduction and teaches them to
   test, a path pointed at, and what you ran and what happened — or labelled `unverified:` with what
   would settle it. It has a file and line, one sentence on the defect, and a scenario: the inputs or
   state, then the wrong behaviour.
+- **A race, a use-after-free or a lifetime across CPUs** is demonstrated by a host test that runs
+  the steps in the order that breaks, deterministically, or by Miri on one test. Do not build a
+  probe that widens a window in the running kernel, with a delay or a spin: the evidence a fix
+  needs is a test CI runs, which a widened window is not. Where no host test reaches the defect,
+  label it `unverified:` with the interleaving that would show it.
 - **An opportunity** is counted: the number of sites, and the command that counted them. Check the
   abstraction fits three of them before proposing it.
 

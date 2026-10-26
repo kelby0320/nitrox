@@ -36889,3 +36889,18 @@ by convention where no type held it. The maintainer's calls, made with the autho
   cannot run inline assembly, so neither a syscall nor `libm`'s `sqrtf`. On its first kernel run
   it found undefined behaviour in a test: AHCI's fake registers lent through a shared borrow and
   written.
+
+## 2026-10-26 — The safety survey shows a race by a test, not by widening it
+
+On the survey's first run, kernel-objects, the concurrency lens was writing a probe to widen a race
+window in the running kernel when Opus 5.5 declined the turn: `stop_reason: refusal`, category
+`cyber`, which the API's documentation says catches benign security work too. Claude Code finished
+that agent on its fallback model, Opus 4.8, without its earlier reasoning. The maintainer's call:
+
+- **The survey's rules say what Nitrox is**: the maintainer's own system, run only on the
+  maintainer's machines and under QEMU, read to fix its own defects.
+- **A race, a use-after-free or a lifetime across CPUs is shown by a host test** that runs the steps
+  in the order that breaks, or by Miri on one test, **never by a probe that widens a window in the
+  running kernel**. That is also the evidence a fix needs, since CI runs it; a defect no host test
+  reaches is labelled unverified, with the interleaving that would show it. The boot verifier
+  follows the same rule.

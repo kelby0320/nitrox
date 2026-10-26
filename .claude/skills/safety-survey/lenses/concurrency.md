@@ -17,6 +17,6 @@ Opportunities here are types that prove what a comment asserts: a guard paramete
 is held, per-CPU access through a type that cannot leave its CPU, an object reference that cannot
 outlive its count.
 
-Demonstrate a defect with a host test that interleaves the steps, or a probe that widens the window
-(a delay where the race needs one), restored after; or label it `unverified:` with the
-interleaving that would show it.
+Demonstrate a defect with a host test that interleaves the steps in the order that breaks, or with
+Miri on one test, never by widening a window in the running kernel (`rules.md`). Where no host test
+reaches it, label it `unverified:` with the interleaving that would show it.
