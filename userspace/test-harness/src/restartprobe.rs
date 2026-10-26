@@ -16,16 +16,14 @@
 
 use libkern::debug::Line;
 use libkern::{
-    CLOCK_MONOTONIC, KError, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ,
-    SYS_HANDLE_CLOSE, SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
+    CLOCK_MONOTONIC, KError, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE,
+    SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
 use librsproto::{OP_NS_RESOLVE, OP_READY, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 static mut MSG: [u8; 4096] = [0; 4096];
 static mut OUT: [u8; 4096] = [0; 4096];
-static mut HANDLES: [u64; 8] = [0; 8];
-static mut COUNT: usize = 0;
 
 fn now_ns() -> u64 {
     let mut t = 0u64;
@@ -112,26 +110,10 @@ pub extern "C" fn _start(_notif: u64, _ns: u64, control: u64, _arg0: u64) -> ! {
         // SAFETY: valid one-entry wait arrays on this frame.
         unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
         loop {
-            // SAFETY: valid recv out-params.
-            let rr = unsafe {
-                syscall4(
-                    SYS_CHANNEL_RECV,
-                    serve,
-                    (&raw mut MSG) as u64,
-                    (&raw mut HANDLES) as u64,
-                    (&raw mut COUNT) as u64,
-                )
-            };
-            if rr != 0 {
+            // SAFETY: single-threaded; `MSG` is lent for the call.
+            let Ok(_sent) = (unsafe { libkern::channel_recv_raw(serve, &raw mut MSG) }) else {
                 break;
-            }
-            // SAFETY: the kernel wrote the count and the handles; none is expected.
-            let count = unsafe { (&raw const COUNT).read() }.min(8);
-            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-            for k in 0..count {
-                // SAFETY: an installed handle, ours to close.
-                close(unsafe { (&raw const HANDLES[k]).read() });
-            }
+            };
             // SAFETY: bounded read of the payload the kernel just wrote.
             let msg = unsafe {
                 let len = u32::from_le_bytes([MSG[4], MSG[5], MSG[6], MSG[7]]) as usize;

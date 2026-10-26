@@ -78,26 +78,16 @@ fn recv_handoff(ctrl: u64) -> u64 {
     if waited != 1 {
         return 0;
     }
-    // SAFETY: valid recv out-params.
-    let r = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ctrl,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if r != 0 {
-        return 0;
+    // The one handle a handoff brings; any more close as `sent` drops. A whole message's buffer:
+    // the kernel copies all of one, however short its payload.
+    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+    match unsafe { channel_recv_raw(ctrl, &raw mut RECV_MSG) } {
+        Ok(mut sent) => sent.take(0).unwrap_or(0),
+        Err(_) => 0,
     }
-    // SAFETY: the kernel wrote `RECV_COUNT` transferred handles into `RECV_HANDLES`.
-    unsafe { if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] } }
 }
 
-static mut RECV_MSG: [u8; 256] = [0; 256];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
+static mut RECV_MSG: [u8; IPC_MSG_SIZE] = [0; IPC_MSG_SIZE];
 
 /// One login attempt, run to the session's end. `false` if the credentials were refused.
 #[allow(clippy::too_many_arguments, reason = "the session's handles, one for each service it is given")]

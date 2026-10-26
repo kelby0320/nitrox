@@ -22,14 +22,14 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use libkern::{Received, channel_recv_raw};
 
 use libkern::abi::{CLOCK_MONOTONIC, HandleInfo, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
 use libkern::handle::{RIGHT_DUPLICATE, RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_SEND, RIGHT_TRANSFER};
 use libkern::syscall::{
-    SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE,
-    SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE,
-    SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE, SYS_WAIT, syscall1, syscall2, syscall3, syscall4,
-    syscall5,
+    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_HANDLE_STAT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE, SYS_NS_LOOKUP,
+    SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE, SYS_WAIT, syscall1, syscall2, syscall3, syscall4, syscall5,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
@@ -98,9 +98,6 @@ fn signalled(n: i64, handle: u64) -> bool {
 }
 
 static mut ERR_MSG: [u8; 4096] = [0; 4096];
-const ERR_HANDLES_LEN: usize = 8;
-static mut ERR_HANDLES: [u64; ERR_HANDLES_LEN] = [0; ERR_HANDLES_LEN];
-static mut ERR_COUNT: usize = 0;
 
 /// Write every diagnostic waiting on `err` to the terminal, and do not block.
 ///
@@ -113,24 +110,11 @@ fn drain_diagnostics(err: u64, tty: u64) {
     // SAFETY: single-threaded shell; valid recv out-params.
     unsafe {
         loop {
-            let rr = syscall4(
-                SYS_CHANNEL_RECV,
-                err,
-                (&raw mut ERR_MSG) as u64,
-                (&raw mut ERR_HANDLES) as u64,
-                (&raw mut ERR_COUNT) as u64,
-            );
-            if rr != 0 {
+            // Every spawned program holds a `SEND` duplicate of this endpoint, so a stage can send
+            // handles: they close as `_sent` drops, or the shell's spawns would fail in the end.
+            let Ok(_sent) = channel_recv_raw(err, &raw mut ERR_MSG) else {
                 break; // WouldBlock (nothing waiting) or the last stage has closed its end
-            }
-            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-            // Close anything transferred, because `sys_channel_recv` installs it: every spawned
-            // program holds a `SEND` duplicate of this endpoint, so a stage can send handles, and
-            // leaking one per message eventually fails the shell's spawns.
-            for i in 0..ERR_COUNT.min(ERR_HANDLES_LEN) {
-                syscall1(SYS_HANDLE_CLOSE, ERR_HANDLES[i]);
-            }
-            ERR_COUNT = 0;
+            };
             let len = u32::from_le_bytes([ERR_MSG[4], ERR_MSG[5], ERR_MSG[6], ERR_MSG[7]]) as usize;
             let text = core::slice::from_raw_parts(((&raw const ERR_MSG) as *const u8).add(24), len.min(4096 - 24));
             let (level, text) = libstream::diag::parse(text);
@@ -608,16 +592,9 @@ impl Host for NitroxHost {
         // SAFETY: single-threaded shell; valid recv out-params.
         unsafe {
             loop {
-                let rr = syscall4(
-                    SYS_CHANNEL_RECV,
-                    self.tty,
-                    (&raw mut TTY_MSG) as u64,
-                    (&raw mut TTY_HANDLES) as u64,
-                    (&raw mut TTY_COUNT) as u64,
-                );
-                if rr != 0 {
+                let Ok(_sent) = channel_recv_raw(self.tty, &raw mut TTY_MSG) else {
                     break; // WouldBlock: nothing queued, which is the common case
-                }
+                };
                 let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
                 let rep = core::slice::from_raw_parts(
                     ((&raw const TTY_MSG) as *const u8).add(24),
@@ -749,16 +726,9 @@ fn drain_tty_interrupt(tty: u64) -> bool {
     // SAFETY: single-threaded shell; valid recv out-params.
     unsafe {
         loop {
-            let rr = syscall4(
-                SYS_CHANNEL_RECV,
-                tty,
-                (&raw mut TTY_MSG) as u64,
-                (&raw mut TTY_HANDLES) as u64,
-                (&raw mut TTY_COUNT) as u64,
-            );
-            if rr != 0 {
+            let Ok(_sent) = channel_recv_raw(tty, &raw mut TTY_MSG) else {
                 break;
-            }
+            };
             let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
             let rep =
                 core::slice::from_raw_parts(((&raw const TTY_MSG) as *const u8).add(24), payload_len.min(4096 - 24));
@@ -999,14 +969,14 @@ fn run_and_render(interp: &mut Interp, tty: u64, src: &str) -> Option<i64> {
     }
 }
 
-/// Send one tty request and wait for its reply, copying the body into `out`; `None` if the exchange
-/// failed.
-fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, usize)> {
+/// Send one tty request and wait for its reply, copying the body into `out`, with the handles the
+/// reply carried; `None` if the exchange failed.
+fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, usize, Received)> {
     tty_exchange(ch, op, body, out, false)
 }
 
 /// [`tty_request`], and when `watch`, the notification channel watched for a terminate request.
-fn tty_exchange(ch: u64, op: u16, body: &[u8], out: &mut [u8], watch: bool) -> Option<(bool, usize)> {
+fn tty_exchange(ch: u64, op: u16, body: &[u8], out: &mut [u8], watch: bool) -> Option<(bool, usize, Received)> {
     // SAFETY: TTY_MSG is a valid buffer; the rsproto message goes at the payload offset.
     let sent = unsafe {
         let rs_len = librsproto::encode(&mut TTY_MSG[24..], op, 1, 0, body, 0)?;
@@ -1033,7 +1003,7 @@ fn tty_exchange(ch: u64, op: u16, body: &[u8], out: &mut [u8], watch: bool) -> O
 /// reply is still coming behind it. When `watch`, the notification channel is watched too, so a
 /// terminate request finds the shell at the prompt's read; only the prompt watches, since elsewhere
 /// a stage's `ChildExited` could be taken from [`reap`].
-fn tty_await_reply(ch: u64, out: &mut [u8], watch: bool) -> Option<(bool, usize)> {
+fn tty_await_reply(ch: u64, out: &mut [u8], watch: bool) -> Option<(bool, usize, Received)> {
     // SAFETY: single-threaded shell; set once at startup.
     let notif = unsafe { NOTIF_CH };
     let watch = watch && notif != 0;
@@ -1068,19 +1038,8 @@ fn tty_await_reply(ch: u64, out: &mut [u8], watch: bool) -> Option<(bool, usize)
             break;
         }
     }
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut TTY_MSG) as u64,
-            (&raw mut TTY_HANDLES) as u64,
-            (&raw mut TTY_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        return None;
-    }
+    // SAFETY: single-threaded shell; `TTY_MSG` is lent for the call.
+    let sent = unsafe { channel_recv_raw(ch, &raw mut TTY_MSG) }.ok()?;
     // SAFETY: bounded read-only slice over the reply.
     unsafe {
         let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
@@ -1094,14 +1053,14 @@ fn tty_await_reply(ch: u64, out: &mut [u8], watch: bool) -> Option<(bool, usize)
         }
         let n = m.body.len().min(out.len());
         out[..n].copy_from_slice(&m.body[..n]);
-        Some((m.is_error(), n))
+        Some((m.is_error(), n, sent))
     }
 }
 
 /// Take whatever keystrokes are available. `None` if the terminal is unusable.
 fn tty_read(ch: u64, out: &mut [u8]) -> Option<usize> {
     match tty_exchange(ch, librsproto::OP_TTY_READ, &[], out, true) {
-        Some((false, n)) => Some(n),
+        Some((false, n, _)) => Some(n),
         _ => None,
     }
 }
@@ -1127,9 +1086,7 @@ fn tty_write(ch: u64, text: &[u8]) {
 fn tty_open_sibling(ch: u64) -> Option<u64> {
     let mut scratch = [0u8; 1];
     match tty_request(ch, librsproto::OP_TTY_OPEN_SIBLING, &[], &mut scratch) {
-        // SAFETY: `tty_await_reply` received the reply into these statics last — past any
-        // interrupt that arrived ahead of it — so its transferred handle is the one here.
-        Some((false, _)) => unsafe { (TTY_COUNT >= 1 && TTY_HANDLES[0] != 0).then(|| TTY_HANDLES[0]) },
+        Some((false, _, mut sent)) => sent.take(0),
         _ => None,
     }
 }
@@ -1193,7 +1150,6 @@ fn stop() -> ! {
 
 static mut TTY_MSG: [u8; 4096] = [0; 4096];
 static mut TTY_HANDLES: [u64; 8] = [0; 8];
-static mut TTY_COUNT: usize = 0;
 
 /// Is `path` a binding in `ns`, or an ancestor of one?
 /// Is `path` a binding in `ns`, or an ancestor of one? The namespace walk `list` uses

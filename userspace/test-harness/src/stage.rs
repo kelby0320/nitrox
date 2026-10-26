@@ -263,6 +263,7 @@ fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             let seed = setup.argv.get(1).and_then(|s| parse_u64(s)).unwrap_or(0);
             run_fp_worker(seed);
         }
+        Some("hold") => run_hold(&setup),
         // A view broker names the program first, as a shell does.
         Some("test-stage") if setup.argv.get(1).is_some_and(|a| a == "grants") => run_grants(&setup, ns),
         _ => {
@@ -270,6 +271,18 @@ fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             exit(1);
         }
     }
+}
+
+/// The `"hold"` role: its setup taken, wait until `stdin`'s other end closes, then exit, so a test
+/// can look at what taking the setup left while the stage still runs.
+fn run_hold(setup: &libstream::setup::Setup) -> ! {
+    if let Some(stdin) = setup.streams.stdin {
+        let waited = [stdin];
+        let mut results = [0u8; 24];
+        // SAFETY: one handle to wait on and room for its result; no deadline.
+        unsafe { syscall4(SYS_WAIT, waited.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+    }
+    exit(0);
 }
 
 /// The `"stage <rows>"` role: read + verify a TSM1 stream on `stdin` (`<rows>` rows, row
@@ -394,26 +407,15 @@ fn rs_send(ch: u64, op: u16, body: &[u8], handles: &[u64]) -> bool {
 
 /// The next rsproto message's op on `ch`, waiting for it; `None` once the peer has gone.
 fn rs_recv(ch: u64) -> Option<u16> {
-    let mut buf = [0u8; 4096];
-    let mut hs = [0u64; 8];
+    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
     loop {
-        let mut count = 0usize;
-        // SAFETY: valid receive out-params.
-        let rr = unsafe {
-            syscall4(
-                libkern::SYS_CHANNEL_RECV,
-                ch,
-                buf.as_mut_ptr() as u64,
-                hs.as_mut_ptr() as u64,
-                (&raw mut count) as u64,
-            )
-        };
-        if rr == 0 {
-            let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-            return librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok().map(|m| m.op);
-        }
-        if rr == libkern::KError::PeerClosed.as_i32() as i64 {
-            return None;
+        match libkern::channel_recv(ch, &mut buf) {
+            Ok(_) => {
+                let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+                return librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok().map(|m| m.op);
+            }
+            Err(rr) if rr == libkern::KError::PeerClosed.as_i32() as i64 => return None,
+            Err(_) => {}
         }
         let waited = [ch];
         let mut results = [0u64; 8];

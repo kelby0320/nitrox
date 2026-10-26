@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use libkern::channel_recv_raw;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::auth::{build_authenticate_request, parse_authenticate_reply};
@@ -25,9 +26,7 @@ const MSG_LEN: usize = 4096;
 /// **This crate's own message buffers**, not the caller's, so the two conversations cannot collide.
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 
 static mut WAIT_HANDLES: [u64; 1] = [0; 1];
@@ -205,19 +204,8 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
     if !wait_one(auth_ch) {
         return None;
     }
-    // SAFETY: valid recv out-params (the reply carries no transferred handles).
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            auth_ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        return None;
-    }
+    // SAFETY: single-threaded supervisor; `RECV_MSG` is lent for the call.
+    let _sent = unsafe { channel_recv_raw(auth_ch, &raw mut RECV_MSG) }.ok()?;
     // SAFETY: read payload_len + form a bounded slice over the reply payload.
     let (result_ok, home_len) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -260,19 +248,8 @@ fn views_call(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
     if sr != 0 || !wait_one(ch) {
         return None;
     }
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        return None;
-    }
+    // SAFETY: single-threaded supervisor; `RECV_MSG` is lent for the call.
+    let _sent = unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) }.ok()?;
     // SAFETY: bounded read of the reply the kernel just wrote.
     let reply = unsafe {
         let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;

@@ -60,8 +60,6 @@ const PAGE: u64 = 4096;
 const NODE_RIGHTS: u64 = RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
@@ -115,28 +113,12 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
 /// **Whatever handles came with it are closed here** — nothing a client sends this manager
 /// carries a handle it wants, and one kept would be kept for good.
 fn recv(ch: u64) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
+    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+    let _sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+        Ok(sent) => sent,
+        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
+        Err(_) => return Ok(None),
     };
-    if rr == KError::PeerClosed.as_i32() as i64 {
-        return Err(());
-    }
-    if rr != 0 {
-        return Ok(None);
-    }
-    // SAFETY: the kernel wrote RECV_COUNT handles into RECV_HANDLES.
-    unsafe {
-        for &h in &RECV_HANDLES[..RECV_COUNT.min(8)] {
-            close(h);
-        }
-    }
     // SAFETY: bounded read of the payload the kernel just wrote.
     let msg = unsafe {
         let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;

@@ -3,7 +3,7 @@
 use super::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use libkern::abi::SpawnArgs;
-use libkern::{KError, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_PROCESS_SPAWN};
+use libkern::{KError, SYS_CHANNEL_CREATE, SYS_PROCESS_SPAWN};
 
 /// `test-stage`'s exit children, by `arg0`.
 const EXIT_WAITING: u64 = 0x4558_0001;
@@ -12,7 +12,7 @@ const EXIT_ALONE: u64 = 0x4558_0003;
 const EXIT_SPAWNING: u64 = 0x4558_0004;
 
 /// Spawn `test-stage` with `arg0`, handing it `handles`, moved where `move_mask` has a bit.
-fn spawn_stage(root_ns: u64, arg0: u64, handles: &[u64], move_mask: u32) -> bool {
+pub(super) fn spawn_stage(root_ns: u64, arg0: u64, handles: &[u64], move_mask: u32) -> bool {
     let (st, image) = ns_lookup(root_ns, b"/bin/test-stage", RIGHT_MAP_READ);
     if st != 0 || image == 0 {
         return false;
@@ -35,7 +35,7 @@ fn spawn_stage(root_ns: u64, arg0: u64, handles: &[u64], move_mask: u32) -> bool
     p > 0
 }
 
-fn channel() -> Option<(u64, u64)> {
+pub(super) fn channel() -> Option<(u64, u64)> {
     let (mut a, mut b) = (0u64, 0u64);
     // SAFETY: valid writable out-params.
     let made = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, 4, 0) } == 0;
@@ -43,21 +43,13 @@ fn channel() -> Option<(u64, u64)> {
 }
 
 /// Whether `ch`'s peer has gone by `deadline`. A message still on the way is taken and dropped.
-fn peer_gone_by(ch: u64, deadline: u64) -> bool {
-    let mut buf = [0u8; 4096];
-    let mut hs = [0u64; 8];
+pub(super) fn peer_gone_by(ch: u64, deadline: u64) -> bool {
+    let mut buf = [0u8; IPC_MSG_SIZE];
     loop {
-        let mut count = 0usize;
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, hs.as_mut_ptr() as u64, (&raw mut count) as u64)
-        };
-        if rr == KError::PeerClosed.as_i32() as i64 {
-            return true;
-        }
-        if rr == 0 {
-            hs[..count.min(8)].iter().for_each(|&h| close(h));
-            continue;
+        match libkern::channel_recv(ch, &mut buf) {
+            Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return true,
+            Ok(_) => continue,
+            Err(_) => {}
         }
         if clock_ns() >= deadline {
             return false;

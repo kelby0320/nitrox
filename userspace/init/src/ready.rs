@@ -17,8 +17,6 @@ pub const FLAG_ERROR: u32 = 1 << 1;
 pub const HEADER_LEN: usize = 28;
 /// An `ErrorBody` before its message: `kerror`, `server_code`, `msg_len`, reserved.
 pub const ERROR_BODY_LEN: usize = 12;
-/// The most handles one `IpcMsg` carries, and so the most init can receive with a Ready.
-pub const IPC_HANDLE_MAX: usize = 8;
 
 /// What a server's first control message said.
 #[derive(Debug, PartialEq, Eq)]
@@ -51,14 +49,10 @@ fn reason(payload: &[u8]) -> Option<&[u8]> {
     body.get(ERROR_BODY_LEN..ERROR_BODY_LEN + msg_len)
 }
 
-/// Which of the `count` handles that arrived with `first` init must close: all but a Ready's
-/// `handles[0]`, the endpoint to bind; a surplus would stay in PID 1's table for good.
-pub fn handles_to_close(first: &First<'_>, count: usize) -> core::ops::Range<usize> {
-    let count = count.min(IPC_HANDLE_MAX);
-    match first {
-        First::Ready => 1.min(count)..count,
-        First::Refused(_) | First::Unexpected => 0..count,
-    }
+/// Which of the handles that came with `first` init keeps: a Ready's first, the endpoint it binds,
+/// and none of anything else, which close as the receive's `Received` drops.
+pub fn kept(first: &First<'_>) -> Option<usize> {
+    matches!(first, First::Ready).then_some(0)
 }
 
 fn u16_at(b: &[u8], off: usize) -> u16 {
@@ -131,6 +125,14 @@ mod tests {
     }
 
     #[test]
+    fn only_a_readys_endpoint_is_kept() {
+        assert_eq!(kept(&First::Ready), Some(0));
+        assert_eq!(kept(&First::Refused(b"why")), None);
+        assert_eq!(kept(&First::Refused(b"")), None);
+        assert_eq!(kept(&First::Unexpected), None);
+    }
+
+    #[test]
     fn anything_but_a_ready_is_unexpected() {
         let good = refusal(b"why");
         assert_eq!(parse(&good[..HEADER_LEN - 1], 1), First::Unexpected, "too short for a header");
@@ -140,17 +142,5 @@ mod tests {
         let mut op = good.clone();
         op[6..8].copy_from_slice(&librsproto::OP_PING.to_le_bytes());
         assert_eq!(parse(&op, 1), First::Unexpected, "an error-flagged message that is not a Ready");
-    }
-
-    #[test]
-    fn every_handle_that_is_not_the_endpoint_is_closed() {
-        let refused = First::Refused(b"why");
-        assert_eq!(handles_to_close(&First::Ready, 1), 1..1, "the endpoint is kept");
-        assert_eq!(handles_to_close(&First::Ready, 3), 1..3, "and only the endpoint");
-        assert_eq!(handles_to_close(&refused, 0), 0..0);
-        assert_eq!(handles_to_close(&refused, 3), 0..3);
-        assert_eq!(handles_to_close(&First::Unexpected, 2), 0..2);
-        // A count the kernel could never write is held to the buffer init received into.
-        assert_eq!(handles_to_close(&First::Unexpected, 100), 0..IPC_HANDLE_MAX);
     }
 }

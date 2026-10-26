@@ -106,8 +106,6 @@ const HELD_PARK_NS: u64 = 5_000_000;
 const SCRATCH: usize = 64 * 1024;
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
@@ -267,35 +265,22 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
     (r == 0).then_some((a, b))
 }
 
-struct Received {
+struct Message {
     op: u16,
     flags: u32,
     request_id: u64,
     body: Vec<u8>,
-    handles: Vec<u64>,
 }
 
-/// Receive one message on `ch`. `Ok(None)` if nothing was queued, `Err(())` if the peer has gone.
-/// The handles are the caller's: to keep, or to close.
-fn recv(ch: u64) -> Result<Option<Received>, ()> {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
+/// Receive one message on `ch`, and the handles it carried, closed with the [`libkern::Received`]
+/// unless taken. `Ok(None)` if nothing was queued, `Err(())` if the peer has gone.
+fn recv(ch: u64) -> Result<Option<(Message, libkern::Received)>, ()> {
+    // SAFETY: single-threaded service; `RECV_MSG` is lent for the call.
+    let sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+        Ok(sent) => sent,
+        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
+        Err(_) => return Ok(None),
     };
-    if rr == KError::PeerClosed.as_i32() as i64 {
-        return Err(());
-    }
-    if rr != 0 {
-        return Ok(None);
-    }
-    // SAFETY: the kernel wrote RECV_COUNT handles into RECV_HANDLES.
-    let handles = unsafe { RECV_HANDLES[..RECV_COUNT.min(8)].to_vec() };
     // SAFETY: bounded read of the payload the kernel just wrote.
     let msg = unsafe {
         let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -304,25 +289,16 @@ fn recv(ch: u64) -> Result<Option<Received>, ()> {
             len.min(MSG_LEN - PAYLOAD_OFF),
         )
     };
-    match decode(msg) {
-        Ok(m) => {
-            Ok(Some(Received { op: m.op, flags: m.flags, request_id: m.request_id, body: m.body.to_vec(), handles }))
-        }
-        Err(_) => {
-            handles.iter().for_each(|&h| close(h));
-            Ok(None)
-        }
-    }
+    // A message that does not decode closes what it carried, as `sent` drops.
+    Ok(decode(msg)
+        .ok()
+        .map(|m| (Message { op: m.op, flags: m.flags, request_id: m.request_id, body: m.body.to_vec() }, sent)))
 }
 
 /// Receive one message on `ch` and close whatever handles came with it: nothing a client sends
 /// this service carries a handle it wants, and one kept would be kept for good.
-fn recv_request(ch: u64) -> Result<Option<Received>, ()> {
-    let m = recv(ch)?;
-    if let Some(m) = &m {
-        m.handles.iter().for_each(|&h| close(h));
-    }
-    Ok(m)
+fn recv_request(ch: u64) -> Result<Option<Message>, ()> {
+    Ok(recv(ch)?.map(|(m, _)| m))
 }
 
 fn lookup(ns: u64, path: &[u8], rights: u64) -> (i64, u64) {
@@ -442,7 +418,7 @@ fn take_block(root_ns: u64) -> Result<(u64, Vec<(DeviceRecord, u64)>), &'static 
     }
     let mut devices = Vec::new();
     loop {
-        let m = match recv(sub) {
+        let (m, mut sent) = match recv(sub) {
             Ok(Some(m)) => m,
             Ok(None) if wait_until(sub, now_ns().saturating_add(REPLAY_WAIT_NS)) => continue,
             _ => {
@@ -451,10 +427,10 @@ fn take_block(root_ns: u64) -> Result<(u64, Vec<(DeviceRecord, u64)>), &'static 
                 return Err(b"the device manager's replay stopped before Settled");
             }
         };
-        match (m.op, parse_arrived(&m.body).and_then(DeviceRecord::read), m.handles.as_slice()) {
+        match (m.op, parse_arrived(&m.body).and_then(DeviceRecord::read), sent.count()) {
             (OP_DEVICES_SETTLED, _, _) => return Ok((sub, devices)),
-            (OP_DEVICES_ARRIVED, Some(r), &[node]) => devices.push((r, node)),
-            _ => m.handles.iter().for_each(|&h| close(h)),
+            (OP_DEVICES_ARRIVED, Some(r), 1) if let Some(node) = sent.take(0) => devices.push((r, node)),
+            _ => {}
         }
     }
 }
@@ -1036,10 +1012,7 @@ impl Service {
         } else {
             None
         };
-        let recorded = answer.as_ref().is_some_and(|a| a.op == OP_UNMOUNT && a.flags & RS_FLAG_ERROR == 0);
-        if let Some(a) = answer {
-            a.handles.iter().for_each(|&h| close(h));
-        }
+        let recorded = answer.is_some_and(|(a, _)| a.op == OP_UNMOUNT && a.flags & RS_FLAG_ERROR == 0);
         close(x.ns);
         close(x.control);
         close(x.process);
@@ -1162,7 +1135,7 @@ impl Service {
     fn serve_control(&mut self, i: usize) {
         loop {
             match recv(self.mounted[i].control) {
-                Ok(Some(m)) => m.handles.iter().for_each(|&h| close(h)),
+                Ok(Some(_)) => {}
                 Ok(None) => return,
                 Err(()) => {
                     let x = self.mounted.remove(i);
@@ -1186,19 +1159,20 @@ impl Service {
     fn serve_subscription(&mut self) {
         loop {
             match recv(self.subscription) {
-                Ok(Some(m)) => match (m.op, m.handles.as_slice()) {
-                    (OP_DEVICES_ARRIVED, &[node]) => match parse_arrived(&m.body).and_then(DeviceRecord::read) {
-                        Some(r) => self.arrived(r, node),
-                        None => close(node),
-                    },
-                    (OP_DEVICES_DEPARTED, &[]) if let Some(id) = parse_departed(&m.body) => self.departed(id),
+                Ok(Some((m, mut sent))) => match (m.op, sent.count()) {
+                    (OP_DEVICES_ARRIVED, 1) if let Some(node) = sent.take(0) => {
+                        match parse_arrived(&m.body).and_then(DeviceRecord::read) {
+                            Some(r) => self.arrived(r, node),
+                            None => close(node),
+                        }
+                    }
+                    (OP_DEVICES_DEPARTED, 0) if let Some(id) = parse_departed(&m.body) => self.departed(id),
                     _ => {
                         Line::new()
                             .s(b"storage-service: the device manager sent op ")
                             .u(m.op as u64)
                             .s(b" it does not read; ignored")
                             .end();
-                        m.handles.iter().for_each(|&h| close(h));
                     }
                 },
                 Ok(None) => return,
@@ -1252,9 +1226,8 @@ impl Service {
         let _ = unsafe { syscall3(SYS_NS_SYNC, x.ns, root.as_ptr() as u64, root.len() as u64) };
         if send(x.control, OP_UNMOUNT, 1, 0, &[], &[])
             && wait_until(x.control, now_ns().saturating_add(READY_TIMEOUT_NS))
-            && let Ok(Some(a)) = recv(x.control)
         {
-            a.handles.iter().for_each(|&h| close(h));
+            let _ = recv(x.control);
         }
         close(x.ns);
         close(x.control);

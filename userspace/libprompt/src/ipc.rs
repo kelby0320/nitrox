@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
 use libkern::scrub;
-use libkern::syscall::{SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall5};
+use libkern::syscall::{SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall5};
 use libkern::{KError, SENDMODE_NOBLOCK};
 
 /// A received message: `(op, request_id, is_error, body)`.
@@ -44,21 +44,11 @@ pub fn wait_until(handles: &[u64], deadline: u64) -> Option<usize> {
 #[allow(clippy::result_unit_err, reason = "the only error is the peer having gone")]
 pub fn recv(ch: u64) -> Result<Option<Msg>, ()> {
     let mut buf = [0u8; IPC_MSG_SIZE];
-    let mut hs = [0u64; 8];
-    let mut count = 0usize;
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, hs.as_mut_ptr() as u64, (&raw mut count) as u64)
+    let _sent = match libkern::channel_recv(ch, &mut buf) {
+        Ok(sent) => sent,
+        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
+        Err(_) => return Ok(None),
     };
-    if rr == KError::PeerClosed.as_i32() as i64 {
-        return Err(());
-    }
-    if rr != 0 {
-        return Ok(None);
-    }
-    for &h in &hs[..count.min(8)] {
-        close(h);
-    }
     let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
     let msg = librsproto::decode(&buf[24..24 + len.min(IPC_PAYLOAD_SIZE)])
         .ok()

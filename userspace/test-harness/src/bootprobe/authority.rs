@@ -134,7 +134,7 @@ pub(super) fn map_needs_read_test() -> bool {
 /// **A message carries nothing past its payload**: the kernel zeroes the rest, so a buffer a
 /// sender reuses cannot hand the receiver its stale bytes, a typed password among them.
 pub(super) fn payload_sealed_test() -> bool {
-    use libkern::{IPC_PAYLOAD_SIZE, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND};
+    use libkern::{IPC_PAYLOAD_SIZE, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND};
     let (mut a, mut b) = (0u64, 0u64);
     // SAFETY: valid writable out-params.
     if unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, 4, 0) } != 0 {
@@ -146,15 +146,12 @@ pub(super) fn payload_sealed_test() -> bool {
     msg[4..8].copy_from_slice(&4u32.to_le_bytes());
     // SAFETY: a valid message buffer; no handles.
     let sent = unsafe { syscall5(SYS_CHANNEL_SEND, a, msg.as_ptr() as u64, 0, 0, SENDMODE_NOBLOCK) } == 0;
-    let (mut got, mut hs, mut count) = ([0u8; 4096], [0u64; 8], 0usize);
-    // SAFETY: valid receive buffers.
-    let rr = unsafe {
-        syscall4(SYS_CHANNEL_RECV, b, got.as_mut_ptr() as u64, hs.as_mut_ptr() as u64, (&raw mut count) as u64)
-    };
+    let mut got = [0u8; IPC_MSG_SIZE];
+    let rr = libkern::channel_recv(b, &mut got).is_ok();
     close(a);
     close(b);
     let payload = &got[24..24 + IPC_PAYLOAD_SIZE];
-    if !sent || rr != 0 || payload[..4] != [0xA5; 4] {
+    if !sent || !rr || payload[..4] != [0xA5; 4] {
         Line::new().s(b"boot-probe: payload FAIL: the message did not arrive whole").end();
         return false;
     }

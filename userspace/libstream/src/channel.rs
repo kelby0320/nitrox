@@ -138,9 +138,7 @@ mod io_port {
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, SENDMODE_BLOCK};
-    use libkern::syscall::{
-        SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall6,
-    };
+    use libkern::syscall::{SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall6};
 
     const E_WOULDBLOCK: i64 = -11;
     const E_PEERCLOSED: i64 = -13;
@@ -232,33 +230,24 @@ mod io_port {
         }
 
         fn recv(&mut self, out: &mut Vec<u8>) -> Result<bool> {
-            let mut recv_handles = [0u64; 8];
-            let mut count: usize = 0;
             loop {
-                // SAFETY: valid msg/handles/count out-params.
-                let r = unsafe {
-                    syscall4(
-                        SYS_CHANNEL_RECV,
-                        self.endpoint,
-                        self.buf.as_mut_ptr() as u64,
-                        recv_handles.as_mut_ptr() as u64,
-                        (&raw mut count) as u64,
-                    )
-                };
-                if r == 0 {
-                    let n = u32::from_le_bytes([
-                        self.buf[OFF_PAYLOAD_LEN],
-                        self.buf[OFF_PAYLOAD_LEN + 1],
-                        self.buf[OFF_PAYLOAD_LEN + 2],
-                        self.buf[OFF_PAYLOAD_LEN + 3],
-                    ]) as usize;
-                    if n > IPC_PAYLOAD_SIZE {
-                        return Err(WireError::UnexpectedEof);
+                let r = match libkern::channel_recv(self.endpoint, &mut self.buf) {
+                    Ok(_sent) => {
+                        let n = u32::from_le_bytes([
+                            self.buf[OFF_PAYLOAD_LEN],
+                            self.buf[OFF_PAYLOAD_LEN + 1],
+                            self.buf[OFF_PAYLOAD_LEN + 2],
+                            self.buf[OFF_PAYLOAD_LEN + 3],
+                        ]) as usize;
+                        if n > IPC_PAYLOAD_SIZE {
+                            return Err(WireError::UnexpectedEof);
+                        }
+                        out.extend_from_slice(&self.buf[OFF_PAYLOAD..OFF_PAYLOAD + n]);
+                        let flags = u16::from_le_bytes([self.buf[OFF_FLAGS], self.buf[OFF_FLAGS + 1]]);
+                        return Ok(flags & MSG_FLAG_LAST != 0);
                     }
-                    out.extend_from_slice(&self.buf[OFF_PAYLOAD..OFF_PAYLOAD + n]);
-                    let flags = u16::from_le_bytes([self.buf[OFF_FLAGS], self.buf[OFF_FLAGS + 1]]);
-                    return Ok(flags & MSG_FLAG_LAST != 0);
-                }
+                    Err(r) => r,
+                };
                 if r == E_WOULDBLOCK {
                     // Empty ring: block until a message (or the peer's close) signals it.
                     let wait_handles = [self.endpoint];

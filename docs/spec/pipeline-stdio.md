@@ -78,7 +78,8 @@ canonical order **stdin, stdout, stderr** — only those present are included. T
 `streams` bitmap (below) says which are present, so the *k*-th set bit maps to the
 *k*-th transferred handle. **A terminal, when the `terminal` field is set, follows the
 streams** as the next handle. Room remains (`IPC_HANDLE_MAX = 8`) for later additions
-(a working-directory handle, extra streams) appended after those.
+(a working-directory handle, extra streams) appended after those; a stage today takes the
+handles its fields name and closes any after them.
 
 - **stdin** — the read end of the upstream pipe (a `sys_channel_create` endpoint).
   Absent for a *source* stage (no upstream).

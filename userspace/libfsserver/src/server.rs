@@ -17,6 +17,7 @@ use crate::serve::{
 };
 use crate::{DirEntry, FsError, Refusal, Volume};
 use libkern::*;
+use libkern::{Received, channel_recv_raw};
 use librsproto::file::{
     DirReplyWriter, forget_request, parse_name_request, parse_read_dir_request, parse_rename_request,
     parse_touch_request,
@@ -35,8 +36,6 @@ const MSG_LEN: usize = 4096;
 const PAYLOAD_OFF: usize = 24;
 
 static mut RECV_MSG: [u8; 4096] = [0; 4096];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; 4096] = [0; 4096];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 /// Outbox for a `File::Forget`, its own since one is sent while a reply may be half-staged.
@@ -119,21 +118,10 @@ fn recv_device(control: u64) -> Option<(u64, bool)> {
     if waited != 1 {
         return None;
     }
-    // SAFETY: valid recv out-params; on success the kernel installs the handle.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            control,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    // SAFETY: on success the kernel wrote the count + handle values.
-    let count = unsafe { (&raw const RECV_COUNT).read() };
-    if rr != 0 || count < 1 {
-        return None;
-    }
+    // The device is the one handle the setup message brings; any more close as `sent` drops.
+    // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
+    let mut sent = unsafe { channel_recv_raw(control, &raw mut RECV_MSG) }.ok()?;
+    let device = sent.take(0)?;
     // The payload is the setup flags; an empty one is writable.
     // SAFETY: `RECV_MSG` holds the setup message; the slice is bounded by its payload length.
     let flags = unsafe {
@@ -144,8 +132,7 @@ fn recv_device(control: u64) -> Option<(u64, bool)> {
         ))
     };
     let read_only = flags & librsproto::meta::FS_SETUP_READ_ONLY != 0;
-    // SAFETY: the kernel wrote the transferred handle.
-    Some((unsafe { (&raw const RECV_HANDLES[0]).read() }, read_only))
+    Some((device, read_only))
 }
 
 fn make_channel() -> Option<(u64, u64)> {
@@ -314,19 +301,12 @@ fn maybe_grow<V: Volume>(vol: &V, req: &[u8], serve_end: u64) -> Result<Option<u
     Ok(resized.grown_from)
 }
 
-/// Receive one message on `h` into the `RECV_*` statics: `0` = arrived; `-11` (`WouldBlock`) =
-/// drained; `-13` (`PeerClosed`) = the peer closed.
-fn recv_on(h: u64) -> i64 {
-    // SAFETY: valid recv out-params; the server is single-threaded, one message at a time.
-    unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            h,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    }
+/// Receive one message on `h` into `RECV_MSG`: `Err` with `WouldBlock` once drained, or
+/// `PeerClosed`. No request here carries a handle, so whatever came is closed as the [`Received`]
+/// drops.
+fn recv_on(h: u64) -> Result<Received, i64> {
+    // SAFETY: the server is single-threaded, one message at a time; `RECV_MSG` is lent for the call.
+    unsafe { channel_recv_raw(h, &raw mut RECV_MSG) }
 }
 
 /// # Safety
@@ -614,13 +594,15 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
         return; // already freed (e.g. an earlier result in this batch closed it)
     };
     loop {
-        let rr = recv_on(session_ch);
-        if rr != 0 {
-            if rr == KError::PeerClosed.as_i32() as i64 {
-                free_session_at(slot);
+        let _sent = match recv_on(session_ch) {
+            Ok(sent) => sent,
+            Err(rr) => {
+                if rr == KError::PeerClosed.as_i32() as i64 {
+                    free_session_at(slot);
+                }
+                return; // WouldBlock (drained) or PeerClosed (freed)
             }
-            return; // WouldBlock (drained) or PeerClosed (freed)
-        }
+        };
         // Copied out (two 255-byte names and prefixes fit) so no borrow of the statics interleaves.
         let mut body_buf = [0u8; 600];
         // SAFETY: single-threaded; nothing receives while `req` is held.
@@ -829,12 +811,12 @@ fn serve_loop<V: Volume>(vol: &V, serve_end: u64, device: u64) -> ! {
                     (0, false) => serve_session(vol, h, serve_end),
                     (1, true) => loop {
                         match recv_on(serve_end) {
-                            0 => handle_forwarded_resolve(vol, serve_end, device),
+                            Ok(_sent) => handle_forwarded_resolve(vol, serve_end, device),
                             // **Nothing can reach this server any more**: its registration and
                             // every file it handed out have let go of the other end. That peer
                             // stays signalled, so going round again would spin a CPU for the
                             // rest of the boot. Exiting is what `device-mgr` does here.
-                            rr if rr == KError::PeerClosed.as_i32() as i64 => {
+                            Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => {
                                 kprint(b"fs-server: nothing can reach this server any more; exiting\n");
                                 exit(0);
                             }
@@ -855,18 +837,18 @@ fn serve_control<V: Volume>(vol: &V) {
     // SAFETY: a single-threaded read.
     let control = unsafe { CONTROL };
     loop {
-        let rr = recv_on(control);
-        if rr == KError::PeerClosed.as_i32() as i64 {
-            // SAFETY: closing our own end, and forgetting it.
-            unsafe {
-                syscall1(SYS_HANDLE_CLOSE, control);
-                CONTROL = 0;
+        let _sent = match recv_on(control) {
+            Ok(sent) => sent,
+            Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => {
+                // SAFETY: closing our own end, and forgetting it.
+                unsafe {
+                    syscall1(SYS_HANDLE_CLOSE, control);
+                    CONTROL = 0;
+                }
+                return;
             }
-            return;
-        }
-        if rr != 0 {
-            return; // drained
-        }
+            Err(_) => return, // drained
+        };
         // SAFETY: single-threaded; nothing receives while `req` is held.
         let (op, flags, request_id) = unsafe {
             match librsproto::decode(received()) {

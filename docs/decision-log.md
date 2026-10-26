@@ -36823,3 +36823,40 @@ sched-17). `bug-bash.md` has each fix; what a caller can now see differently is 
   keeps one process's timers from touching another's waits without accounting the kernel does not
   have. A bounded send's slots come with its endpoint rather than with each send, the cheaper of
   the two to keep paired.
+
+## 2026-10-25 — Before Phase 7, Part D: group F changes these contracts
+
+The bash's findings on handles a receiver was sent, sec-6, proto-9 and proto-10. `bug-bash.md` has
+each fix; what a caller can now see differently is here:
+
+- **A receiver closes every handle a message brought that it does not keep.**
+  `libkern::channel_recv`, and `channel_recv_raw` into a `static mut` buffer, return a `Received`,
+  which closes as it drops each handle not taken from it, and every userspace receive goes through
+  one of the two. A handle sent with a message whose op takes none is closed at once: the peer of
+  a channel end sent that way sees `PeerClosed`, where the receiver used to keep it, and whatever
+  it pinned, for as long as the receiver ran.
+- **The class was in many receivers, not only the three found**, and who could reach each is who
+  holds the sending end of its channel (`2ec3294b` lists them):
+  - **a client, on a session it opened**, which any process able to open one could fill: the
+    clipboard's sessions, a terminal's and its backend's, the input server's consumers, `/bin`'s
+    projection, and libfsserver's sessions, which every filesystem server shares;
+  - **a server, in what it sends its client**: auth-service's replies to libsession, the
+    compositor's to libsurface, the terminal server's to nxsh, nxterm and session-mgr, and the
+    input server's events to the compositor;
+  - **a supervisor, in a handoff**: each took the first handle and kept any more;
+  - **no one, on a serve endpoint**: the kernel alone sends a forwarded resolve, with no handles,
+    so the resolve receives never leaked.
+- **A setup message's handles past those its fields name are closed**, where `recv_setup` kept
+  them: a stage takes its streams and its terminal, and nothing more until the format names more
+  (`pipeline-stdio.md`).
+- **desktop-session-mgr received into a 256-byte buffer**, and `sys_channel_recv` writes a whole
+  4,096-byte message whatever its payload, so each receive ran 3,840 bytes past it: zeros, past
+  the payload, over the heap's state (`libheap::ENGINE`), and the installed handle's value, at
+  offset 4,032, inside libsession's receive buffer. It did no harm only because its nine receives
+  run first in `_start`, before anything allocates, and libsession fills that buffer with a
+  receive of its own before it reads it. `channel_recv` takes a `&mut [u8; IPC_MSG_SIZE]`, so a
+  shorter buffer no longer compiles.
+- **The guard is libkern's, though libkern keeps no other RAII type**: libos, the layer
+  libkern's rules name for one, has no `alloc` either, but auth-service, librsproto and libstream
+  do not depend on it, and libkern is the one layer every receiver shares. This was the maintainer's choice over closing at each site, or a kernel change in
+  Part E; `userspace/libkern/CLAUDE.md` records the exception.

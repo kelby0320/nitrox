@@ -50,8 +50,6 @@ static mut STORM_SPAWN: SpawnArgs = SpawnArgs {
 };
 /// A zeroed 4096-byte IPC message for the blocking-send demos, used for both send and recv.
 static mut MSGBUF: [u8; 4096] = [0; 4096];
-static mut HBUF: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut WORKER_ARGS: ThreadArgs = ThreadArgs {
     entry: 0,
     user_sp: 0,
@@ -322,8 +320,6 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
 static mut FWD_KEND: u64 = 0;
 static mut FWD_SEND: u64 = 0;
 static mut FWD_REQ: [u8; 4096] = [0; 4096];
-static mut FWD_REQ_H: [u64; 8] = [0; 8];
-static mut FWD_REQ_COUNT: usize = 0;
 static mut FWD_REPLY: [u8; 4096] = [0; 4096];
 static mut FWD_REPLY_H: [u64; 8] = [0; 8];
 
@@ -447,11 +443,8 @@ fn block_send_demo() {
     }
     let po = po as u64;
 
-    // SAFETY: valid out-params; the demo message carries no transferred handles.
-    let rr = unsafe {
-        syscall4(SYS_CHANNEL_RECV, b, (&raw mut MSGBUF) as u64, (&raw mut HBUF) as u64, (&raw mut RECV_COUNT) as u64)
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded; `MSGBUF` is lent for the call.
+    if unsafe { libkern::channel_recv_raw(b, &raw mut MSGBUF) }.is_err() {
         kprint(b"test-harness: block-demo recv FAIL\n");
         return;
     }
@@ -475,17 +468,8 @@ fn block_send_demo() {
     }
 
     loop {
-        // SAFETY: valid out-params.
-        let r = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                b,
-                (&raw mut MSGBUF) as u64,
-                (&raw mut HBUF) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
-        };
-        if r != 0 {
+        // SAFETY: single-threaded; `MSGBUF` is lent for the call.
+        if unsafe { libkern::channel_recv_raw(b, &raw mut MSGBUF) }.is_err() {
             break;
         }
     }
@@ -2765,19 +2749,10 @@ fn tty_request(ch: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
     if waited < 1 {
         return false;
     }
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut TTY_MSG) as u64,
-            (&raw mut TTY_HANDLES) as u64,
-            (&raw mut TTY_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded; `TTY_MSG` is lent for the call.
+    let Ok(_sent) = (unsafe { libkern::channel_recv_raw(ch, &raw mut TTY_MSG) }) else {
         return false;
-    }
+    };
     // SAFETY: bounded read-only slice over the reply.
     unsafe {
         let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
@@ -2791,7 +2766,6 @@ fn tty_request(ch: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
 
 static mut TTY_MSG: [u8; 4096] = [0; 4096];
 static mut TTY_HANDLES: [u64; 8] = [0; 8];
-static mut TTY_COUNT: usize = 0;
 
 /// Whether `needle` occurs in `hay`; names appear verbatim in a TSM1 listing.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -3774,20 +3748,11 @@ fn forward_demo() {
     }
     let po = po as u64;
 
-    // SAFETY: valid endpoint + writable out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            send_end,
-            (&raw mut FWD_REQ) as u64,
-            (&raw mut FWD_REQ_H) as u64,
-            (&raw mut FWD_REQ_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded; `FWD_REQ` is lent for the call.
+    let Ok(_sent) = (unsafe { libkern::channel_recv_raw(send_end, &raw mut FWD_REQ) }) else {
         kprint(b"test-harness: fwd recv request FAIL\n");
         return;
-    }
+    };
 
     // SAFETY: FWD_REQ was filled by the recv above; bytes 4..8 are inside it; this thread owns it.
     let payload_len = unsafe { u32::from_le_bytes([FWD_REQ[4], FWD_REQ[5], FWD_REQ[6], FWD_REQ[7]]) as usize };

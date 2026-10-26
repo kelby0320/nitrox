@@ -26,8 +26,6 @@ static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 /// This supervisor's notification channel, where a shutdown's terminate request arrives.
 static mut NOTIF_CH: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
 /// The request id the last tty request was sent with: each its own, so its reply is told apart.
@@ -131,24 +129,12 @@ fn recv_handoff(ctrl: u64) -> u64 {
     if !wait_one(ctrl) {
         return 0;
     }
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ctrl,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    // SAFETY: this single-threaded process reads its own static; the count is used only once `rr`
-    // says the recv wrote it.
-    let count = unsafe { (&raw const RECV_COUNT).read() };
-    if rr != 0 || count < 1 {
-        return 0;
+    // The one handle a handoff brings; any more close as `sent` drops.
+    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+    match unsafe { channel_recv_raw(ctrl, &raw mut RECV_MSG) } {
+        Ok(mut sent) => sent.take(0).unwrap_or(0),
+        Err(_) => 0,
     }
-    // SAFETY: the kernel installed the transferred handle at handles[0].
-    unsafe { (&raw const RECV_HANDLES[0]).read() }
 }
 
 /// Bootstrap registers: `rdi` = notification channel (reaps the user shell), `rsi` =
@@ -363,19 +349,8 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
         if !wait_one(ch) {
             return None;
         }
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                ch,
-                (&raw mut RECV_MSG) as u64,
-                (&raw mut RECV_HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
-        };
-        if rr != 0 {
-            return None;
-        }
+        // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+        let _sent = unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) }.ok()?;
         // SAFETY: bounded read-only slice over the reply.
         let rep = unsafe {
             let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;

@@ -5,8 +5,7 @@
 
 use libkern::error::KError;
 use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_WAIT, abi::CLOCK_MONOTONIC, syscall2,
-    syscall4, syscall5,
+    SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_WAIT, abi::CLOCK_MONOTONIC, syscall2, syscall4, syscall5,
 };
 use librsproto::surface::OP_RELEASE;
 use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -47,10 +46,6 @@ pub struct ChannelTransport {
     msg: [u8; MSG_LEN],
     handles: [u64; 4],
     recv_msg: [u8; MSG_LEN],
-    /// Sized by the kernel's `IPC_HANDLE_MAX`: `sys_channel_recv` takes no capacity argument
-    /// and copies the sender's handle count here.
-    recv_handles: [u64; libkern::abi::IPC_HANDLE_MAX],
-    recv_count: u64,
     /// Messages that arrived while waiting for a reply — drained by `poll_event`.
     parked: [(u16, [u8; MAX_BODY], usize); MAX_PARKED],
     /// Whether a parked event was discarded since the last time anyone asked.
@@ -72,8 +67,6 @@ impl ChannelTransport {
             msg: [0; MSG_LEN],
             handles: [0; 4],
             recv_msg: [0; MSG_LEN],
-            recv_handles: [0; libkern::abi::IPC_HANDLE_MAX],
-            recv_count: 0,
             parked: [(0, [0; MAX_BODY], 0); MAX_PARKED],
             lost: false,
             parked_len: 0,
@@ -247,22 +240,11 @@ impl Transport for ChannelTransport {
             if waited != 1 {
                 return Err(UiError::Transport);
             }
-            // SAFETY: valid recv out-params.
-            let rr = unsafe {
-                syscall4(
-                    SYS_CHANNEL_RECV,
-                    self.channel,
-                    (&raw mut self.recv_msg) as u64,
-                    (&raw mut self.recv_handles) as u64,
-                    (&raw mut self.recv_count) as u64,
-                )
+            let _sent = match libkern::channel_recv(self.channel, &mut self.recv_msg) {
+                Ok(sent) => sent,
+                Err(rr) if rr == KError::WouldBlock.as_i32() as i64 => continue, // nothing to take
+                Err(_) => return Err(UiError::Transport),
             };
-            if rr == KError::WouldBlock.as_i32() as i64 {
-                continue; // woken with nothing to take; wait again
-            }
-            if rr != 0 {
-                return Err(UiError::Transport);
-            }
             let payload_len =
                 u32::from_le_bytes([self.recv_msg[4], self.recv_msg[5], self.recv_msg[6], self.recv_msg[7]]) as usize;
             let req = &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];
@@ -327,22 +309,11 @@ impl Transport for ChannelTransport {
             buf[..n].copy_from_slice(&body[..n]);
             return Ok(Some((op, n)));
         }
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                self.channel,
-                (&raw mut self.recv_msg) as u64,
-                (&raw mut self.recv_handles) as u64,
-                (&raw mut self.recv_count) as u64,
-            )
+        let _sent = match libkern::channel_recv(self.channel, &mut self.recv_msg) {
+            Ok(sent) => sent,
+            Err(rr) if rr == KError::WouldBlock.as_i32() as i64 => return Ok(None),
+            Err(_) => return Err(UiError::Transport),
         };
-        if rr == KError::WouldBlock.as_i32() as i64 {
-            return Ok(None);
-        }
-        if rr != 0 {
-            return Err(UiError::Transport);
-        }
         let payload_len =
             u32::from_le_bytes([self.recv_msg[4], self.recv_msg[5], self.recv_msg[6], self.recv_msg[7]]) as usize;
         let req = &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];

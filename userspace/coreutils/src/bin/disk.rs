@@ -530,28 +530,13 @@ fn wait_ping(watch: u64, deadline: u64) -> bool {
     if waited != 1 {
         return false;
     }
-    let mut buf = alloc::vec![0u8; IPC_MSG_SIZE];
+    let mut buf = alloc::boxed::Box::new([0u8; IPC_MSG_SIZE]);
     loop {
-        let mut got_handles = [0u64; 8];
-        let mut count: usize = 0;
-        // SAFETY: valid message, handle and count out-params.
-        let got = unsafe {
-            libkern::syscall::syscall4(
-                libkern::syscall::SYS_CHANNEL_RECV,
-                watch,
-                buf.as_mut_ptr() as u64,
-                got_handles.as_mut_ptr() as u64,
-                (&raw mut count) as u64,
-            )
-        };
-        if got == KError::WouldBlock.as_i32() as i64 {
-            return true;
+        match libkern::channel_recv(watch, &mut buf) {
+            Ok(_) => {}
+            Err(got) if got == KError::WouldBlock.as_i32() as i64 => return true,
+            Err(_) => return false,
         }
-        if got != 0 {
-            return false;
-        }
-        // A watch carries no handles; any that came are closed.
-        got_handles.iter().take(count.min(8)).for_each(|&h| close(h));
     }
 }
 

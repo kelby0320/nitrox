@@ -63,9 +63,7 @@ const FALLBACK_BEATS: u32 = 3;
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut CLOCK_BUF: u64 = 0;
-static mut RECV_MSG: IpcMsg = IpcMsg::ZEROED;
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: u64 = 0;
+static mut RECV_MSG: [u8; IPC_MSG_SIZE] = [0; IPC_MSG_SIZE];
 
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`; the slice is valid.
@@ -158,27 +156,11 @@ fn recv_log_handoff(control: u64) -> u64 {
     if waited < 1 {
         return 0; // no handoff (e.g. no logging service) — run without structured logging
     }
-    // SAFETY: valid recv out-params; on success the log endpoint rides in handles[0].
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            control,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        return 0;
-    }
-    // SAFETY: the kernel wrote the transferred-handle count + values.
-    let count = unsafe { (&raw const RECV_COUNT).read() };
-    if count >= 1 {
-        // SAFETY: the recv succeeded with `count >= 1`, so the kernel installed a handle at
-        // RECV_HANDLES[0].
-        unsafe { (&raw const RECV_HANDLES[0]).read() }
-    } else {
-        0
+    // The log endpoint is the one handle the handoff brings; any more close as `sent` drops.
+    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+    match unsafe { channel_recv_raw(control, &raw mut RECV_MSG) } {
+        Ok(mut sent) => sent.take(0).unwrap_or(0),
+        Err(_) => 0,
     }
 }
 
