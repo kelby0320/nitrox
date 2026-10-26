@@ -1,0 +1,191 @@
+# The subsystems a safety survey covers. `/safety-survey <name>` hands one entry to the workflow.
+# Together they cover every userspace crate and every entry of kernel/src, which the workflow's
+# test holds. A path is where the survey starts, not a fence: a reviewer follows the code out of it.
+# `id` prefixes the subsystem's items in docs/planning/safety-survey.md, as in `kobj-d3`.
+
+[[subsystem]]
+name = "kernel-objects"
+id = "kobj"
+what = "the syscall boundary, handles and their rights, and the kernel's objects"
+paths = [
+  "kernel/src/syscall/",
+  "kernel/src/object/",
+  "kernel/src/handle/",
+  "kernel/src/libkern/",
+  "kernel/src/rsproto.rs",
+  "kernel/src/entropy.rs",
+]
+
+[[subsystem]]
+name = "kernel-memory"
+id = "kmem"
+what = "physical and virtual memory, user copies, memory objects and the page cache, TLB shootdown"
+paths = [
+  "kernel/src/mm/",
+  "kernel/src/tlb.rs",
+  "kernel/src/arch/paging.rs",
+  "kernel/src/arch/user_access.rs",
+  "kernel/src/arch/x86_64/paging.rs",
+  "kernel/src/arch/x86_64/user_access.rs",
+  "kernel/src/arch/x86_64/tlb.rs",
+  "kernel/src/object/memory_object.rs",
+  "kernel/src/object/file_object.rs",
+]
+
+[[subsystem]]
+name = "scheduler"
+id = "sched"
+what = "threads, scheduling across CPUs, waiting, timers, DPCs and locks"
+paths = [
+  "kernel/src/sched.rs",
+  "kernel/src/sched/",
+  "kernel/src/dpc.rs",
+  "kernel/src/clock.rs",
+  "kernel/src/object/pending_op.rs",
+  "kernel/src/object/notification_channel.rs",
+  "kernel/src/object/timer.rs",
+  "kernel/src/libkern/spinlock.rs",
+  "kernel/src/libkern/lockrank.rs",
+  "kernel/src/arch/smp.rs",
+  "kernel/src/arch/x86_64/smp.rs",
+  "kernel/src/arch/x86_64/context.rs",
+  "kernel/src/arch/x86_64/resched.rs",
+  "kernel/src/arch/x86_64/timer.rs",
+]
+
+[[subsystem]]
+name = "drivers"
+id = "drv"
+what = "xHCI, USB HID and storage, AHCI, PS/2, PCI, and the block and IRP layer"
+paths = [
+  "kernel/src/drivers/",
+  "kernel/src/pci/",
+  "kernel/src/io/",
+  "kernel/src/device.rs",
+  "kernel/src/arch/x86_64/ps2.rs",
+]
+
+[[subsystem]]
+name = "kernel-platform"
+id = "kplat"
+what = "boot, the arch layer, interrupts and exceptions, the console, power, and the boot report"
+paths = [
+  "kernel/src/arch/",
+  "kernel/src/main.rs",
+  "kernel/src/lib.rs",
+  "kernel/src/limine.rs",
+  "kernel/src/boot_selftest.rs",
+  "kernel/src/cmdline.rs",
+  "kernel/src/handoff.rs",
+  "kernel/src/initramfs.rs",
+  "kernel/src/fbcon/",
+  "kernel/src/framebuffer.rs",
+  "kernel/src/klog.rs",
+  "kernel/src/power.rs",
+  "kernel/src/report.rs",
+]
+
+[[subsystem]]
+name = "runtime"
+id = "rt"
+what = "the userspace runtime: the syscall layer, libos, the heap, files, logging and time"
+paths = [
+  "userspace/libkern/",
+  "userspace/libos/",
+  "userspace/libheap/",
+  "userspace/libfs/",
+  "userspace/liblog/",
+  "userspace/libtime/",
+  "userspace/hello/",
+  "userspace/heartbeat/",
+]
+
+[[subsystem]]
+name = "protocols"
+id = "proto"
+what = "the resource-server wire format, streams, and partition tables read off a disk"
+paths = [
+  "userspace/librsproto/",
+  "userspace/libstream/",
+  "userspace/libgpt/",
+]
+
+[[subsystem]]
+name = "filesystems"
+id = "fs"
+what = "the ext4 and FAT servers and the library they share"
+paths = [
+  "userspace/fs-server-ext4/",
+  "userspace/fs-server-fat/",
+  "userspace/libfsserver/",
+]
+
+[[subsystem]]
+name = "supervision"
+id = "sup"
+what = "init, the service and device managers, the storage service and the log"
+paths = [
+  "userspace/init/",
+  "userspace/libinittoml/",
+  "userspace/service-mgr/",
+  "userspace/device-mgr/",
+  "userspace/storage-service/",
+  "userspace/logging-service/",
+]
+
+[[subsystem]]
+name = "security"
+id = "sec"
+what = "authentication, the view broker and elevation, sessions, the user database"
+paths = [
+  "userspace/auth-service/",
+  "userspace/view-broker/",
+  "userspace/session-mgr/",
+  "userspace/libsession/",
+  "userspace/libusers/",
+  "userspace/libcrypto/",
+  "userspace/libviews/",
+  "userspace/libprompt/",
+]
+
+[[subsystem]]
+name = "desktop"
+id = "desk"
+what = "the compositor, the desktop shell and its greeter, the toolkit, input, and the applications"
+paths = [
+  "userspace/compositor/",
+  "userspace/desktop-shell/",
+  "userspace/desktop-session-mgr/",
+  "userspace/libui/",
+  "userspace/libdraw/",
+  "userspace/libsurface/",
+  "userspace/libinput/",
+  "userspace/input-server/",
+  "userspace/clipboard-server/",
+  "userspace/nxfiles/",
+  "userspace/nxedit/",
+  "userspace/nxterm/",
+  "userspace/libterm/",
+]
+
+[[subsystem]]
+name = "shell"
+id = "sh"
+what = "the shell, the commands, terminals, the emergency shell, the installer and /bin's projection"
+paths = [
+  "userspace/nxsh/",
+  "userspace/coreutils/",
+  "userspace/tty-server/",
+  "userspace/libline/",
+  "userspace/eshell/",
+  "userspace/nxinstall/",
+  "userspace/profile-server/",
+]
+
+[[subsystem]]
+name = "test-harness"
+id = "th"
+what = "the in-guest test programs: the demo chain, boot-probe and the probes the gates drive"
+paths = [
+  "userspace/test-harness/",
+]
