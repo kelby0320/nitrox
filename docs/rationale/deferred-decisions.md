@@ -2212,6 +2212,14 @@ per-`Process` roll-up on reap. Trigger: profiling or accounting that needs CPU t
 than wall time — a `time` builtin, per-process scheduler statistics beyond the existing
 `/proc/sched/stats`, or rlimits (which need CPU-time accounting to enforce a CPU limit).
 
+**A receive's status is an `i64`, not a `KError` — `TODO(recv-kerror)`.** `libkern::channel_recv`
+and `channel_recv_raw` return `Result<Received, i64>`, so each caller spells the status it
+matches by hand — `KError::PeerClosed.as_i32() as i64`, `KError::PeerClosed as i64`, or a local
+`E_PEER_CLOSED` — and a wrong constant compiles. A `KError` would make each a checked match. It
+waits for the receive's move to libos, whose wrappers return its typed `Error`, so the forty-odd
+callers change once: the move the safety survey's plan, in PR #398, proposes. Trigger: that move,
+or a status mismatched at a call site.
+
 **vDSO-equivalent for `sys_clock_read`.** On modern Linux, `clock_gettime` is implemented in vDSO — userspace reads TSC directly, no syscall. Nitrox initially does one syscall per `sys_clock_read`. The API shape leaves room for this optimization later (the `ClockId` enum can map to fixed memory locations) without changing call sites.
 
 ### Concurrency primitives

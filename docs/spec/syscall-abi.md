@@ -565,7 +565,7 @@ fn sys_channel_recv(
     count:   UserMutPtr<usize>,
 ) -> isize
 ```
-Receives a message from `ch` (requires `RECV`). Returns `WouldBlock` if no message is queued — the caller `sys_wait`s on `ch` to block — or `PeerClosed` if the inbox is empty and the peer has closed. On success writes the 4096-byte message to `*msg`, installs any transferred handles into the caller's table (their values written to `handles[0..*count]` and the in-message `handles[]`), and writes the count to `*count`. (Syscall number `14`.)
+Receives a message from `ch` (requires `RECV`). Returns `WouldBlock` if no message is queued — the caller `sys_wait`s on `ch` to block — or `PeerClosed` if the inbox is empty and the peer has closed. On success writes the 4096-byte message to `*msg`, installs any transferred handles into the caller's table (their values written to `handles[0..*count]` and the in-message `handles[]`), and writes the count to `*count`. The handles are installed whether or not the caller asked for them, so a receiver closes every one it does not keep: userspace receives through `libkern::channel_recv`, whose `Received` does (`ipc-message-format.md`). (Syscall number `14`.)
 
 ### Kernel Objects
 

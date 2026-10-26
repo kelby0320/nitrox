@@ -137,7 +137,7 @@ Behavior:
 2. If queue is non-empty, the oldest message is dequeued.
 3. Message body is copied to `*msg` (4096 bytes). The kernel zeroes any portions of `payload` beyond `payload_len`.
 4. Handles are written to `handles[0..msg.header.handle_count]`. The kernel writes `handle_count` to `*count`.
-5. The handles in `*msg.handles` are kernel-internal copies of the same values; they refer to the same handles now in the receiver's table. (Userspace typically reads from `handles[]` rather than `msg.handles[]`; the duplication accommodates languages that prefer the in-message location.)
+5. The handles in `*msg.handles` are the same values as `handles[0..count]`: one set of handles in the receiver's table, written in two places. A receiver through `libkern::channel_recv` takes them from its `Received`, which closes each one not taken when it drops, so a handle read from the in-message copy and not taken is closed under its reader.
 
 Note: the user-supplied `handles` buffer must be large enough to hold `IPC_HANDLE_MAX` (8) entries. The kernel does not bounds-check this against a smaller buffer; passing a smaller buffer is undefined.
 

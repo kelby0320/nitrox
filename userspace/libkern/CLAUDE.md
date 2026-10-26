@@ -88,8 +88,9 @@ If something doesn't strictly belong here but you find yourself wanting to put i
 
 **The one guard here is `channel::Received`** (pre-Phase-7 Part D, group F): the handles a message
 brought, closed when it drops unless taken. `sys_channel_recv` installs whatever a sender attaches,
-so every receiver must close what it did not ask for, the no-alloc ones (`auth-service`) included,
-and the lowest layer is the only one they all share. Receive through `channel_recv`, or
+so every receiver must close what it did not ask for, those that do not depend on libos
+(`auth-service`, `librsproto`, `libstream`) included, and the lowest layer is the only one they
+all share. Receive through `channel_recv`, or
 `channel_recv_raw` into a `static mut` buffer, never a raw `SYS_CHANNEL_RECV`:
 `cargo xtask check-recv` fails any other userspace file that names it.
 

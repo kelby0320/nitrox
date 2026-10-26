@@ -59,6 +59,7 @@ fn close(h: u64) {
 
 /// Receive one message on `ch` into `msg`. `Err` with the syscall's status: `WouldBlock` for an
 /// empty ring, `PeerClosed`, or a refusal, none of which installs anything.
+// TODO(recv-kerror): an `i64` status, not a `KError`; the typed error comes with libos's receive.
 pub fn channel_recv(ch: u64, msg: &mut [u8; IPC_MSG_SIZE]) -> Result<Received, i64> {
     // SAFETY: a unique reference is valid for writes and aliased by nothing during the call.
     unsafe { channel_recv_raw(ch, msg) }

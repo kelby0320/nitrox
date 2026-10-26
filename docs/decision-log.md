@@ -36850,11 +36850,13 @@ each fix; what a caller can now see differently is here:
   them: a stage takes its streams and its terminal, and nothing more until the format names more
   (`pipeline-stdio.md`).
 - **desktop-session-mgr received into a 256-byte buffer**, and `sys_channel_recv` writes a whole
-  4,096-byte message whatever its payload, so each receive ran 3,840 bytes past it, over the
-  heap's state (`libheap::ENGINE`) and libsession's buffers. It did no harm only because its nine
-  receives run first in `_start`, before anything allocates, and write zeros there.
-  `channel_recv` takes a `&mut [u8; IPC_MSG_SIZE]`, so a shorter buffer no longer compiles.
-- **The guard is libkern's, though libkern keeps no other RAII type**: the receivers include
-  `auth-service` and `init`, which have no `alloc`, and libkern is the one layer every receiver
-  shares. This was the maintainer's choice over closing at each site, or a kernel change in
+  4,096-byte message whatever its payload, so each receive ran 3,840 bytes past it: zeros, past
+  the payload, over the heap's state (`libheap::ENGINE`), and the installed handle's value, at
+  offset 4,032, inside libsession's receive buffer. It did no harm only because its nine receives
+  run first in `_start`, before anything allocates, and libsession fills that buffer with a
+  receive of its own before it reads it. `channel_recv` takes a `&mut [u8; IPC_MSG_SIZE]`, so a
+  shorter buffer no longer compiles.
+- **The guard is libkern's, though libkern keeps no other RAII type**: libos, the layer
+  libkern's rules name for one, has no `alloc` either, but auth-service, librsproto and libstream
+  do not depend on it, and libkern is the one layer every receiver shares. This was the maintainer's choice over closing at each site, or a kernel change in
   Part E; `userspace/libkern/CLAUDE.md` records the exception.
