@@ -22,4 +22,5 @@ that unmaps on drop and lends slices tied to its lifetime, a kernel reference th
 a guard that gives a slot or a count back once.
 
 Demonstrate a defect by driving the path: a host test, Miri on one test, or a probe counting
-handles, restored after.
+handles, restored after. A use-after-free is shown as `rules.md` says: a host test or Miri, not a
+widened window.
