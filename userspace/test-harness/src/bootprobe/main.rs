@@ -24,7 +24,7 @@ extern crate alloc;
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-use libkern::abi::HandleInfo;
+use libkern::abi::{HandleInfo, IPC_MSG_SIZE};
 use libkern::debug::Line;
 use libkern::{
     IO_OPCODE_READ, IoOp, RIGHT_READ, SYS_FILE_TRUNCATE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_NS_SYNC, syscall6,
@@ -45,6 +45,7 @@ mod exits;
 mod files;
 mod gates;
 mod policy;
+mod received;
 mod registry;
 mod services;
 mod storage;
@@ -58,6 +59,7 @@ use exits::*;
 use files::*;
 use gates::*;
 use policy::*;
+use received::*;
 use registry::*;
 use services::*;
 use storage::*;
@@ -223,6 +225,13 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & exit_while_spawning_test(root_ns)
         & thread_exit_under_load_test(root_ns)
         & many_timers_test()
+        & received_closes_what_was_not_taken_test()
+        & sessions_close_what_they_were_sent_test(root_ns)
+        & tty_backend_closes_what_it_was_sent_test(root_ns)
+        & setup_closes_what_its_fields_do_not_name_test(root_ns)
+        & ipc_port_closes_what_it_was_sent_test()
+        & auth_closes_what_it_was_sent_test(root_ns)
+        & log_closes_what_it_was_sent_test(root_ns)
         & continuation_test(root_ns)
         & subtree_bind_test(root_ns)
         & auth_multi_client_test(root_ns)
@@ -345,29 +354,19 @@ struct Received {
 /// The next message on `ch`, waiting until `deadline` on the monotonic clock — `0` only looks.
 /// `None` if nothing came by then, or if what came is not rsproto.
 fn receive(ch: u64, deadline: u64) -> Option<Received> {
-    let mut buf = [0u8; 4096];
-    let mut hs = [0u64; 8];
+    let mut buf = [0u8; IPC_MSG_SIZE];
     loop {
-        let mut count = 0usize;
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(
-                libkern::SYS_CHANNEL_RECV,
-                ch,
-                buf.as_mut_ptr() as u64,
-                hs.as_mut_ptr() as u64,
-                (&raw mut count) as u64,
-            )
-        };
-        if rr == 0 {
+        if let Ok(mut sent) = libkern::channel_recv(ch, &mut buf) {
             let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
             let m = librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok()?;
+            let count = sent.count();
+            let hs = sent.take_all();
             return Some(Received {
                 op: m.op,
                 request_id: m.request_id,
                 error: m.is_error(),
                 body: m.body.to_vec(),
-                handles: hs[..count.min(hs.len())].to_vec(),
+                handles: hs[..count].to_vec(),
             });
         }
         if clock_ns() >= deadline {

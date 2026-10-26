@@ -168,30 +168,17 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, base as usize as *mut u8))
 }
 
-fn recv_message(ch: u64) -> bool {
-    if !wait_one(ch) {
-        return false;
-    }
-    // SAFETY: valid recv out-params.
-    let r = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    r == 0
-}
-
-/// Receive one message and return its first transferred handle, or `0`.
+/// Receive one message and return its first transferred handle, or `0`; any more close as the
+/// rest of the [`Received`] drops.
 fn recv_handle(ch: u64) -> u64 {
-    if !recv_message(ch) {
+    if !wait_one(ch) {
         return 0;
     }
-    // SAFETY: the kernel wrote `RECV_COUNT` transferred handles into `RECV_HANDLES`.
-    unsafe { if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] } }
+    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+    match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+        Ok(mut sent) => sent.take(0).unwrap_or(0),
+        Err(_) => 0,
+    }
 }
 
 fn wait_one(h: u64) -> bool {
@@ -205,8 +192,6 @@ fn wait_one(h: u64) -> bool {
 }
 
 static mut RECV_MSG: [u8; 4096] = [0; 4096];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 
 /// Wait set: the compositor's event channel, the manager channel, `/dev/desktop` and its
 /// sessions, the notification channel (a shutdown's terminate request), and the view broker's

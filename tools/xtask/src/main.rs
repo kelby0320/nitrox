@@ -428,6 +428,7 @@ fn main() -> ExitCode {
         Some("test-interactive") => cmd_test_interactive(accel),
         Some("check-arch") => cmd_check_arch(),
         Some("check-nightly") => cmd_check_nightly(),
+        Some("check-recv") => cmd_check_recv(),
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => docs::cmd_check_docs(),
         Some("check-comments") => comments::cmd_check_comments(&qargs),

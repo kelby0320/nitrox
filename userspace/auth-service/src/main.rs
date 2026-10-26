@@ -48,8 +48,6 @@ const USERS: &[u8] = b"/system/users";
 const USERS_NEW: &[u8] = b"/system/users.new";
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 /// How many clients may hold an auth session at once.
@@ -303,19 +301,10 @@ fn serve_loop(serve_end: u64, mut control: u64) -> ! {
 /// Answer a resolve of `/svc/auth` by minting a session channel for the caller, so one oracle
 /// serves several supervisors (`docs/architecture/session-and-auth.md`).
 fn serve_resolve(serve_end: u64) {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            serve_end,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded; `RECV_MSG` is this server's own buffer, lent for the call.
+    let Ok(_sent) = (unsafe { channel_recv_raw(serve_end, &raw mut RECV_MSG) }) else {
         return;
-    }
+    };
     // SAFETY: bounded read-only slice over the payload the kernel just wrote.
     let (op, request_id, ok) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -372,22 +361,13 @@ fn open_auth_session(serve_end: u64, request_id: u64, admin: bool) {
 }
 
 fn serve_session(ch: u64) {
-    // SAFETY: valid recv out-params (an Authenticate carries no transferred handles).
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded; `RECV_MSG` is this server's own buffer, lent for the call.
+    let Ok(_sent) = (unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) }) else {
         // **A closed peer frees the slot.** Without this a supervisor that exited would hold
         // one forever, and the set of clients would shrink by one per logout.
         free_session(ch);
         return;
-    }
+    };
     let serve_end = ch;
     // SAFETY: single-threaded read of the session table.
     let admin = unsafe { (0..MAX_SESSIONS).any(|i| SESSION_CH[i] == ch && SESSION_ADMIN[i]) };

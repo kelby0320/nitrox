@@ -46,8 +46,6 @@ const _: () = assert!(3 + 2 * MAX_TTYS <= libkern::abi::MAX_WAIT_HANDLES);
 const READ_CHUNK: u64 = 64;
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
@@ -412,20 +410,13 @@ fn free_tty(reg: &mut Registry, ch: u64) {
 
 /// Handle one request on terminal `i`'s channel. Returns `false` if the terminal is gone.
 fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
+    // Only `AttachBackend` takes a handle; whatever came with anything else closes as `sent` drops.
+    // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
+    let mut sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+        Ok(sent) => sent,
         // `PeerClosed` means the terminal is finished; anything else is an empty ring.
-        return rr != KError::PeerClosed.as_i32() as i64;
-    }
+        Err(rr) => return rr != KError::PeerClosed.as_i32() as i64,
+    };
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, request_id, body) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -449,8 +440,7 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
             perform(&reg.read(ch, request_id, kind));
         }
         OP_TTY_ATTACH_BACKEND => {
-            // SAFETY: the kernel wrote `RECV_COUNT` handles into `RECV_HANDLES`.
-            let handle = unsafe { if RECV_COUNT >= 1 { RECV_HANDLES[0] } else { 0 } };
+            let handle = sent.take(0).unwrap_or(0);
             if handle == 0 {
                 // Succeeding silently would leave the emulator waiting for output that goes to
                 // the console.
@@ -497,19 +487,11 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
 /// Feed in what a terminal emulator sent on backend `id`'s channel. Returns `false` if the
 /// emulator is gone, which ends every terminal on that backend.
 fn serve_backend(reg: &mut Registry, id: u32, ch: u64) -> bool {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
+    // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
+    let _sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+        Ok(sent) => sent,
+        Err(rr) => return rr != KError::PeerClosed.as_i32() as i64,
     };
-    if rr != 0 {
-        return rr != KError::PeerClosed.as_i32() as i64;
-    }
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, body) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -690,19 +672,10 @@ fn console_bytes(off: usize) -> u64 {
 /// Drain every queued forwarded resolve on the serving endpoint.
 fn drain_resolves(serve_end: u64, reg: &mut Registry) {
     loop {
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                serve_end,
-                (&raw mut RECV_MSG) as u64,
-                (&raw mut RECV_HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
-        };
-        if rr != 0 {
+        // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
+        let Ok(_sent) = (unsafe { channel_recv_raw(serve_end, &raw mut RECV_MSG) }) else {
             return;
-        }
+        };
         // SAFETY: bounded read-only slice over the received message.
         let (op, request_id, ok) = unsafe {
             let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;

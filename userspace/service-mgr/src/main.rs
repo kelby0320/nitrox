@@ -40,8 +40,6 @@ const WAIT_MAX: usize = libkern::abi::MAX_WAIT_HANDLES;
 static mut WAIT_HANDLES: [u64; WAIT_MAX] = [0; WAIT_MAX];
 static mut WAIT_RESULTS: [u8; 24 * WAIT_MAX] = [0; 24 * WAIT_MAX];
 static mut SRV_MSG: [u8; 4096] = [0; 4096];
-static mut SRV_HANDLES: [u64; 8] = [0; 8];
-static mut SRV_COUNT: usize = 0;
 /// The login supervisors' process and control handles, kept for a shutdown.
 static mut SUPERVISORS: [u64; 4] = [0; 4];
 /// How deep each route is: a full ring answers the resolver `WouldBlock` at once.
@@ -53,8 +51,6 @@ static mut CTRL_OUT1: u64 = 0;
 static mut SEND_MSG: IpcMsg = IpcMsg::ZEROED;
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
 static mut RDY_MSG: [u8; 4096] = [0; 4096];
-static mut RDY_HANDLES: [u64; 8] = [0; 8];
-static mut RDY_COUNT: usize = 0;
 
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
@@ -454,24 +450,12 @@ fn recv_handoff(ctrl: u64) -> u64 {
         kprint(b"service-mgr: handoff timeout\n");
         return 0;
     }
-    // SAFETY: valid recv out-params; the kernel installs any transferred handle at [0].
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ctrl,
-            (&raw mut RDY_MSG) as u64,
-            (&raw mut RDY_HANDLES) as u64,
-            (&raw mut RDY_COUNT) as u64,
-        )
-    };
-    // SAFETY: this single-threaded process reads its own static; the count is used only once `rr`
-    // says the recv wrote it.
-    let count = unsafe { (&raw const RDY_COUNT).read() };
-    if rr != 0 || count < 1 {
-        return 0;
+    // The one handle a handoff brings; any more close as `sent` drops.
+    // SAFETY: single-threaded; `RDY_MSG` is lent for the call.
+    match unsafe { channel_recv_raw(ctrl, &raw mut RDY_MSG) } {
+        Ok(mut sent) => sent.take(0).unwrap_or(0),
+        Err(_) => 0,
     }
-    // SAFETY: the kernel installed the transferred handle at handles[0].
-    unsafe { (&raw const RDY_HANDLES[0]).read() }
 }
 
 /// Move `handle` to a child over its control channel; closed if the send fails. A zero `handle`
@@ -789,29 +773,12 @@ fn recv_serve(ch: u64) -> Option<(u16, u64, alloc::vec::Vec<u8>)> {
 /// signalled, so a caller must drop it or the wait loop would spin. A route's cannot close.
 fn recv_request(ch: u64) -> Result<Option<(u16, u64, alloc::vec::Vec<u8>)>, ()> {
     loop {
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                ch,
-                (&raw mut SRV_MSG) as u64,
-                (&raw mut SRV_HANDLES) as u64,
-                (&raw mut SRV_COUNT) as u64,
-            )
+        // SAFETY: single-threaded; `SRV_MSG` is lent for the call.
+        let _sent = match unsafe { channel_recv_raw(ch, &raw mut SRV_MSG) } {
+            Ok(sent) => sent,
+            Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
+            Err(_) => return Ok(None),
         };
-        if rr == KError::PeerClosed.as_i32() as i64 {
-            return Err(());
-        }
-        if rr != 0 {
-            return Ok(None);
-        }
-        // SAFETY: the kernel wrote the count and the handles it installed.
-        let count = unsafe { (&raw const SRV_COUNT).read() }.min(8);
-        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-        for k in 0..count {
-            // SAFETY: an installed handle, ours to close.
-            close(unsafe { (&raw const SRV_HANDLES[k]).read() });
-        }
         // SAFETY: bounded read of the payload the kernel just wrote.
         let msg = unsafe {
             let len = u32::from_le_bytes([SRV_MSG[4], SRV_MSG[5], SRV_MSG[6], SRV_MSG[7]]) as usize;
@@ -903,48 +870,31 @@ enum Ready {
 }
 
 fn take_ready(ctrl: u64) -> Ready {
-    // SAFETY: RDY_MSG/RDY_HANDLES/RDY_COUNT are valid writable out-params; non-blocking receive.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ctrl,
-            (&raw mut RDY_MSG) as u64,
-            (&raw mut RDY_HANDLES) as u64,
-            (&raw mut RDY_COUNT) as u64,
-        )
+    // SAFETY: single-threaded; `RDY_MSG` is lent for the call.
+    let mut sent = match unsafe { channel_recv_raw(ctrl, &raw mut RDY_MSG) } {
+        Ok(sent) => sent,
+        Err(rr) if rr == KError::PeerClosed as i64 => return Ready::Closed,
+        Err(_) => return Ready::Nothing,
     };
-    if rr == KError::PeerClosed as i64 {
-        return Ready::Closed;
-    }
-    if rr != 0 {
-        return Ready::Nothing;
-    }
-    // SAFETY: the kernel wrote the count and the handles it installed.
-    let count = unsafe { (&raw const RDY_COUNT).read() }.min(8);
-    // SAFETY: as above.
-    let handles: alloc::vec::Vec<u64> = (0..count).map(|k| unsafe { (&raw const RDY_HANDLES[k]).read() }).collect();
     // SAFETY: bounded read of the payload the kernel just wrote.
     let msg = unsafe {
         let len = u32::from_le_bytes([RDY_MSG[4], RDY_MSG[5], RDY_MSG[6], RDY_MSG[7]]) as usize;
         core::slice::from_raw_parts(((&raw const RDY_MSG) as *const u8).add(24), len.min(4096 - 24))
     };
     let decoded = librsproto::decode(msg).ok().map(|m| (m.op, m.flags, m.body.to_vec()));
-    let refused = |why: &[u8], handles: &[u64]| {
-        handles.iter().for_each(|&h| close(h));
-        Ready::Refused(alloc::string::String::from_utf8_lossy(why).into_owned())
-    };
+    let endpoint = decoded.as_ref().and_then(|d| service_mgr::ready::kept(d.0, d.1)).and_then(|i| sent.take(i));
+    let refused = |why: &[u8]| Ready::Refused(alloc::string::String::from_utf8_lossy(why).into_owned());
     match decoded {
         Some((op, flags, body)) if op == librsproto::OP_READY && flags & librsproto::RS_FLAG_ERROR != 0 => {
             let why = librsproto::error::parse_error(&body).map(|e| e.msg).unwrap_or(b"");
             let why: &[u8] = if why.is_empty() { b"it refused, and gave no reason" } else { why };
-            refused(why, &handles)
+            refused(why)
         }
-        Some((op, _, _)) if op == librsproto::OP_READY && !handles.is_empty() => {
-            handles[1..].iter().for_each(|&h| close(h));
-            Ready::Endpoint(handles[0])
-        }
-        Some((op, _, _)) if op == librsproto::OP_READY => refused(b"a Ready with no endpoint in it", &handles),
-        _ => refused(b"its first message was not a Ready", &handles),
+        Some((op, _, _)) if op == librsproto::OP_READY => match endpoint {
+            Some(endpoint) => Ready::Endpoint(endpoint),
+            None => refused(b"a Ready with no endpoint in it"),
+        },
+        _ => refused(b"its first message was not a Ready"),
     }
 }
 
@@ -2272,30 +2222,14 @@ fn drain_codes(notif: u64, codes: &mut alloc::vec::Vec<i32>) {
 /// closed ends itself — its exit is then attributed here, as any other's.
 fn channel_peer_closed(ch: u64) -> bool {
     loop {
-        // SAFETY: RDY_MSG/RDY_HANDLES/RDY_COUNT are valid writable out-params; this is a
-        // non-blocking receive on a channel handle service-mgr owns.
-        let r = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                ch,
-                (&raw mut RDY_MSG) as u64,
-                (&raw mut RDY_HANDLES) as u64,
-                (&raw mut RDY_COUNT) as u64,
-            )
+        // SAFETY: single-threaded; `RDY_MSG` is lent for the call. What came closes as `sent`
+        // drops, at the end of this pass.
+        let sent = match unsafe { channel_recv_raw(ch, &raw mut RDY_MSG) } {
+            Ok(sent) => sent,
+            Err(r) if r == KError::PeerClosed as i64 => return true,
+            Err(_) => return false, // WouldBlock (alive and quiet), or an error we cannot act on
         };
-        if r == KError::PeerClosed as i64 {
-            return true;
-        }
-        if r != 0 {
-            return false; // WouldBlock (alive and quiet), or an error we cannot act on
-        }
-        // SAFETY: the kernel wrote the count and installed that many handles, ours to close.
-        let count = unsafe { (&raw const RDY_COUNT).read() }.min(8);
-        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-        for k in 0..count {
-            // SAFETY: a handle the kernel just installed in this process.
-            close(unsafe { (&raw const RDY_HANDLES[k]).read() });
-        }
+        let count = sent.count();
         Line::new()
             .s(b"service-mgr: unexpected message on a control channel (dropped, and ")
             .u(count as u64)

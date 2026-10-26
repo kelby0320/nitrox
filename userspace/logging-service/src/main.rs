@@ -59,8 +59,6 @@ const READ_ENDPOINT: &str = "read-endpoint";
 const READ_BODY_CAP: usize = IPC_PAYLOAD_SIZE - RS_HEADER_LEN;
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
@@ -178,18 +176,11 @@ fn make_channel(o0: *mut u64, o1: *mut u64) -> Option<(u64, u64)> {
     Some(unsafe { (o0.read(), o1.read()) })
 }
 
-/// Receive one message on `endpoint` into the RECV_* statics; 0 means one arrived.
-fn recv(endpoint: u64) -> i64 {
-    // SAFETY: RECV_* are valid writable buffers.
-    unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            endpoint,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    }
+/// Receive one message on `endpoint` into `RECV_MSG`. Nothing sent to this service needs a handle,
+/// so whatever came is closed as the [`Received`] drops.
+fn recv(endpoint: u64) -> Result<Received, i64> {
+    // SAFETY: single-threaded; `RECV_MSG` is this service's own buffer, lent for the call.
+    unsafe { channel_recv_raw(endpoint, &raw mut RECV_MSG) }
 }
 
 /// Send `Meta::Ready` on the control channel, transferring `kernel_end` (the endpoint the
@@ -397,17 +388,11 @@ fn mint_read_endpoint(serve_end: u64, request_id: u64, read_ends: &mut Vec<u64>)
     }
 }
 
-/// The rsproto message in `RECV_MSG`, and **every handle it carried closed**: nothing a reader
-/// sends needs one, and one kept unread would leak.
+/// The rsproto message in `RECV_MSG`.
 fn received() -> Option<librsproto::Message<'static>> {
-    // SAFETY: RECV_COUNT/RECV_HANDLES were written by the `recv` that filled RECV_MSG; this
-    // process is single-threaded, so nothing writes them while the slice below is read.
+    // SAFETY: written by the `recv` that filled RECV_MSG; this process is single-threaded, so
+    // nothing writes it while the slice below is read.
     unsafe {
-        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-        for i in 0..RECV_COUNT.min(8) {
-            close(RECV_HANDLES[i]);
-        }
-        RECV_COUNT = 0;
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
@@ -422,13 +407,11 @@ fn received() -> Option<librsproto::Message<'static>> {
 /// wait set rather than being signalled forever.
 fn serve_read_endpoint(from: u64, sessions: &mut Vec<u64>) -> bool {
     loop {
-        let rc = recv(from);
-        if rc == E_PEER_CLOSED {
-            return false;
-        }
-        if rc != 0 {
-            return true;
-        }
+        let _sent = match recv(from) {
+            Ok(sent) => sent,
+            Err(E_PEER_CLOSED) => return false,
+            Err(_) => return true,
+        };
         let Some(m) = received() else { continue };
         let (op, request_id) = (m.op, m.request_id);
         if op != OP_NS_RESOLVE {
@@ -455,13 +438,11 @@ fn serve_read_endpoint(from: u64, sessions: &mut Vec<u64>) -> bool {
 /// **A read session**: each `Log::Read` answered from the ring. `false` once its reader closed it.
 fn serve_read_session(h: u64, ring: &Ring) -> bool {
     loop {
-        let rc = recv(h);
-        if rc == E_PEER_CLOSED {
-            return false;
-        }
-        if rc != 0 {
-            return true;
-        }
+        let _sent = match recv(h) {
+            Ok(sent) => sent,
+            Err(E_PEER_CLOSED) => return false,
+            Err(_) => return true,
+        };
         let Some(m) = received() else { continue };
         let (op, request_id) = (m.op, m.request_id);
         if op != OP_LOG_READ {
@@ -599,16 +580,16 @@ fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
     };
     loop {
         let rc = recv(h);
-        if rc == E_PEER_CLOSED {
+        if rc.as_ref().is_err_and(|&e| e == E_PEER_CLOSED) {
             // **Terminal, and never retried.** A closed peer is permanently `signaled`, so a
             // dead handle left in the wait set makes `sys_wait` return at once, forever: this
             // service spins, the idle thread never runs, and with it no exited process on the
             // system is reclaimed (decision log, 2026-07-31).
             return true;
         }
-        if rc != 0 {
+        let Ok(_sent) = rc else {
             break; // WouldBlock: drained
-        }
+        };
         // SAFETY: read payload_len, then a bounded read-only slice over RECV_MSG.
         let body: &[u8] = unsafe {
             let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -725,7 +706,7 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
             }
         }
         if signalled.contains(&serve_end) {
-            while recv(serve_end) == 0 {
+            while let Ok(_sent) = recv(serve_end) {
                 process_resolve(serve_end, &mut sources, &mut read_ends);
             }
         }

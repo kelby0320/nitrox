@@ -244,3 +244,14 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-25	396	7ac0b846	16	tests	optional	demonstrated	fixed	d172d33b	a_periodic_timers_re_push_is_held_to_its_slot fails if the re-push goes round push_promised
 2026-10-25	396	7ac0b846	17	rules-and-docs	optional	demonstrated	fixed	d172d33b	Slots variants documented; user_process_ref in 4382f85d
 2026-10-25	396	7ac0b846	18	rules-and-docs	optional	demonstrated	fixed	4382f85d	test_support moved to thread/test_support.rs, thread.rs back to 1028 and its entry lowered
+2026-10-26	397	9a4f0e74	1	tests	worth-fixing	demonstrated	fixed	7323b761	Received's five host tests through a recorded close; init and service-mgr's kept() tested in 0ddd9c10; controls: five mutations of Received, two of kept
+2026-10-26	397	9a4f0e74	2	logic	worth-fixing	demonstrated	fixed	43436ec5	check-recv fails a userspace SYS_CHANNEL_RECV outside libkern's two files, in CI; a planted raw receive that passed every other check fails it
+2026-10-26	397	9a4f0e74	3	logic	worth-fixing	demonstrated	fixed	0b5ac580	decision log: the handle's value written into libsession's buffer, and why the guard is not libos's; 2ec3294b's message keeps the wrong claim
+2026-10-26	397	9a4f0e74	4	architecture	optional	demonstrated	fixed	0b5ac580	ipc-message-format item 5: one set of handles in two places, closed under a reader of the in-message copy
+2026-10-26	397	9a4f0e74	5	rules-and-docs	optional	demonstrated	fixed	0b5ac580	syscall-abi's sys_channel_recv states the close rule
+2026-10-26	397	9a4f0e74	6	architecture	optional	demonstrated	deferred	0b5ac580	TODO(recv-kerror): the typed error comes with the receive's move to libos, so its callers change once
+2026-10-26	397	9a4f0e74	7	rules-and-docs	optional	demonstrated	fixed	7323b761	the SAFETY comment says take and take_all zero what they hand out
+2026-10-26	397	9a4f0e74	8	error-paths	optional	unverified	fixed	93cf56bb	reproduced by a probe: with the lookup forced to fail both unsent ends were still held, closed after channels::<N>() and the tty test's close
+2026-10-26	397	9a4f0e74	9	tests	optional	unverified	refuted		a clipboard that tears down its session on the unknown op, its receive still leaking, fails the test: receiving the op installs the handle, and closing the session does not close it
+2026-10-26	397	9a4f0e74	10	tests	optional	unverified	declined		a coverage note; the review compared every site with main and found no defect; init's and service-mgr's Ready decisions are now tested (0ddd9c10), and the safety survey's ownership lens covers the rest
+2026-10-26	397	9a4f0e74	11	architecture	optional	unverified	fixed	93cf56bb	setup_closes_what_its_fields_do_not_name_test, with test-stage's hold role; the review's mutation fails it

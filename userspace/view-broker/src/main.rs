@@ -58,8 +58,6 @@ const MSG_LEN: usize = 4096;
 const POLICY_PATH: &[u8] = b"/system/views.toml";
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
@@ -279,32 +277,24 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
     (r == 0).then_some((a, b))
 }
 
-/// Receive one message on `ch` into the static buffers. `Ok(None)` if nothing was queued,
-/// `Err(())` if the peer has gone.
-fn recv(ch: u64) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
-    recv_full(ch).map(|m| m.map(|(op, request_id, _, body)| (op, request_id, body)))
+/// Receive one message on `ch` into the static buffer: its op, request id and body, and the
+/// handles it carried, closed with the [`Received`] unless taken. `Ok(None)` if nothing was
+/// queued, `Err(())` if the peer has gone.
+fn recv(ch: u64) -> Result<Option<Message>, ()> {
+    recv_full(ch).map(|m| m.map(|(op, request_id, _, body, sent)| (op, request_id, body, sent)))
 }
 
-type Incoming = (u16, u64, u32, Vec<u8>);
+type Message = (u16, u64, Vec<u8>, Received);
+type Incoming = (u16, u64, u32, Vec<u8>, Received);
 
 /// [`recv`], with the message's flags: an answer from a server may be an error reply.
 fn recv_full(ch: u64) -> Result<Option<Incoming>, ()> {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
+    // SAFETY: single-threaded broker; `RECV_MSG` is lent for the call.
+    let sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+        Ok(sent) => sent,
+        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
+        Err(_) => return Ok(None),
     };
-    if rr == KError::PeerClosed.as_i32() as i64 {
-        return Err(());
-    }
-    if rr != 0 {
-        return Ok(None);
-    }
     // SAFETY: bounded read of the payload the kernel just wrote.
     let msg = unsafe {
         let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -313,21 +303,8 @@ fn recv_full(ch: u64) -> Result<Option<Incoming>, ()> {
             len.min(MSG_LEN - PAYLOAD_OFF),
         )
     };
-    match decode(msg) {
-        Ok(m) => Ok(Some((m.op, m.request_id, m.flags, m.body.to_vec()))),
-        Err(_) => {
-            // A message that does not decode may still have carried handles; they are ours now.
-            for h in received() {
-                close(h);
-            }
-            Ok(None)
-        }
-    }
-}
-
-fn received() -> Vec<u64> {
-    // SAFETY: the kernel wrote RECV_COUNT handles into RECV_HANDLES.
-    unsafe { RECV_HANDLES[..RECV_COUNT.min(8)].to_vec() }
+    // A message that does not decode closes what it carried, as `sent` drops.
+    Ok(decode(msg).ok().map(|m| (m.op, m.request_id, m.flags, m.body.to_vec(), sent)))
 }
 
 fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
@@ -463,9 +440,11 @@ impl Broker {
         let answered = asked
             && loop {
                 match recv(session) {
-                    Ok(Some((op, 1, body))) if op == OP_STORAGE_IN_USE => break parse_in_use(&body, |id| ids.push(id)),
+                    Ok(Some((op, 1, body, _))) if op == OP_STORAGE_IN_USE => {
+                        break parse_in_use(&body, |id| ids.push(id));
+                    }
                     // A stray is dropped; nothing else is asked on this session.
-                    Ok(Some(_)) => received().into_iter().for_each(close),
+                    Ok(Some(_)) => {}
                     Ok(None) if wait_until(session, deadline) => {}
                     _ => break false,
                 }
@@ -496,13 +475,13 @@ impl Broker {
                         // An error reply is not an answer, by its flag: a refusal read as an id
                         // would make every refused token name one terminal, and a window opened
                         // under it would cover them all.
-                        Ok(Some((op, 1, flags, body))) if op == OP_TTY_REDEEM => {
+                        Ok(Some((op, 1, flags, body, _))) if op == OP_TTY_REDEEM => {
                             break (flags & RS_FLAG_ERROR == 0)
                                 .then(|| <[u8; 4]>::try_from(body.as_slice()).ok().map(u32::from_le_bytes))
                                 .flatten();
                         }
                         // A stray, or the error reply: nothing else is asked on this terminal.
-                        Ok(Some(_)) => received().into_iter().for_each(close),
+                        Ok(Some(_)) => {}
                         Ok(None) if wait_until(tty, deadline) => {}
                         _ => break None,
                     }
@@ -523,12 +502,9 @@ impl Broker {
     }
 
     fn serve_resolve(&mut self) {
-        let Ok(Some((op, request_id, body))) = recv(self.serve_end) else {
+        let Ok(Some((op, request_id, body, _sent))) = recv(self.serve_end) else {
             return;
         };
-        for h in received() {
-            close(h);
-        }
         let asked = match parse_resolve_request(&body) {
             Some(r) if op == OP_NS_RESOLVE => suffix::parse(r.suffix),
             _ => Suffix::Unknown,
@@ -579,7 +555,7 @@ impl Broker {
 
     fn serve_supervisor(&mut self, i: usize) {
         let ch = self.supervisors[i];
-        let (op, request_id, body) = match recv(ch) {
+        let (op, request_id, body, _sent) = match recv(ch) {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(()) => {
@@ -588,9 +564,6 @@ impl Broker {
                 return;
             }
         };
-        for h in received() {
-            close(h);
-        }
         match op {
             OP_VIEWS_OPEN_SESSION => {
                 let principal = match core::str::from_utf8(&body) {
@@ -695,8 +668,8 @@ impl Broker {
             .then(|| {
                 loop {
                     match recv_full(admin) {
-                        Ok(Some((o, 1, flags, body))) if o == op => break Some((flags & RS_FLAG_ERROR != 0, body)),
-                        Ok(Some(_)) => received().into_iter().for_each(close),
+                        Ok(Some((o, 1, flags, body, _))) if o == op => break Some((flags & RS_FLAG_ERROR != 0, body)),
+                        Ok(Some(_)) => {}
                         Ok(None) if wait_until(admin, deadline) => {}
                         _ => break None,
                     }
@@ -728,7 +701,7 @@ impl Broker {
     /// holding it is the authority.
     fn serve_endpoint(&mut self, i: usize) {
         let (ch, session, endpoint) = self.endpoints[i];
-        let (op, request_id, mut body) = match recv(ch) {
+        let (op, request_id, mut body, _sent) = match recv(ch) {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(()) => {
@@ -745,7 +718,6 @@ impl Broker {
                 scrub(&mut *(&raw mut RECV_MSG))
             };
         }
-        received().into_iter().for_each(close);
         let who = self.principal(session).unwrap_or_default();
         match endpoint {
             Endpoint::Policy => self.serve_policy(ch, op, request_id, &body, &who),
@@ -790,7 +762,7 @@ impl Broker {
 
     fn serve_client(&mut self, i: usize) {
         let ch = self.clients[i].ch;
-        let (op, request_id, mut body) = match recv(ch) {
+        let (op, request_id, mut body, mut sent) = match recv(ch) {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(()) => return self.client_gone(i),
@@ -803,14 +775,13 @@ impl Broker {
                 scrub(&mut *(&raw mut RECV_MSG))
             };
         }
-        // Only a request carries handles. Whatever came with anything else is closed here, not
-        // by each arm: an arm that forgot would keep them, and any program can send them.
-        let mut handles = received();
-        if op != OP_VIEWS_REQUEST {
-            for h in handles.drain(..) {
-                close(h);
-            }
-        }
+        // Only a request carries handles: it takes them, and whatever came with anything else
+        // closes as `sent` drops, here, not in each arm, where one that forgot would keep them.
+        let handles: Vec<u64> = match op {
+            OP_VIEWS_REQUEST => sent.take_all().into_iter().filter(|&h| h != 0).collect(),
+            _ => Vec::new(),
+        };
+        drop(sent);
         let session = self.clients[i].session;
         let Some(principal) = self.principal(session) else {
             for h in handles {
@@ -1820,11 +1791,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     // end, so anything it sends on it is closed unread.
                     match recv(h) {
                         Err(()) => b.life_closed(h),
-                        Ok(Some(_)) => {
-                            for stray in received() {
-                                close(stray);
-                            }
-                        }
+                        Ok(Some(_)) => {}
                         Ok(None) => {}
                     }
                 }

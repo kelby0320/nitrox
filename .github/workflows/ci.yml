@@ -61,6 +61,11 @@ jobs:
       - name: cargo xtask check-nightly
         run: cargo xtask check-nightly
 
+      # Userspace receives only through libkern's `channel_recv`, whose `Received` closes every
+      # handle a message brought and no one took; a raw receive leaves them in the table.
+      - name: cargo xtask check-recv
+        run: cargo xtask check-recv
+
       # Each workspace formatted by `cargo fmt` with its pinned toolchain and the root rustfmt.toml.
       - name: cargo fmt --check
         run: |

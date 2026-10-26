@@ -29,9 +29,10 @@ use libkern::abi::CLOCK_MONOTONIC;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::error::KError;
+use libkern::{Received, channel_recv_raw};
 use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE,
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
+    SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE,
+    SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
@@ -75,10 +76,6 @@ const MAX_LOGGED_INPUT_DIAGS: u32 = 256;
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-/// Sized by the kernel's limit: `sys_channel_recv` takes no capacity and copies the sender's
-/// `handle_count * 8` bytes, bounded only by `IPC_HANDLE_MAX`.
-static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
-static mut RECV_COUNT: u64 = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
@@ -844,22 +841,16 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     // Each batch is copied out because `RECV_MSG` is shared by every receive.
     let mut batches: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
     while batches.len() < INPUT_DRAIN_MAX {
-        // SAFETY: valid recv out-params (an events batch carries no transferred handles).
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                srv.input_ch,
-                (&raw mut RECV_MSG) as u64,
-                (&raw mut RECV_HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
+        // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+        let _sent = match unsafe { channel_recv_raw(srv.input_ch, &raw mut RECV_MSG) } {
+            Ok(sent) => sent,
+            Err(rr) => {
+                // The ordinary end of the drain. `PeerClosed` means the input server is gone and
+                // the handle must leave the wait set or the loop spins; anything else is spurious.
+                alive = rr != KError::PeerClosed.as_i32() as i64;
+                break;
+            }
         };
-        if rr != 0 {
-            // The ordinary end of the drain. `PeerClosed` means the input server is gone and the
-            // handle must leave the wait set or the loop spins; anything else is spurious.
-            alive = rr != KError::PeerClosed.as_i32() as i64;
-            break;
-        }
         // SAFETY: bounded read of the payload the kernel just wrote.
         let payload = unsafe {
             let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -1283,51 +1274,38 @@ enum Served {
 fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     // SAFETY: reading our own manager slot and valid recv out-params.
     let ch = unsafe { MANAGER_CH };
-    // SAFETY: the recv buffers are this process's statics, only touched from this loop, and the
-    // kernel fills them on return
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        return if rr == KError::PeerClosed.as_i32() as i64 { Served::Closed } else { Served::Empty };
+    // SAFETY: the receive buffer is this process's static, only touched from this loop.
+    match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+        Ok(sent) => {
+            if handle_manager_request(ch, srv, screen, sent) {
+                Served::One
+            } else {
+                Served::Closed
+            }
+        }
+        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => Served::Closed,
+        Err(_) => Served::Empty,
     }
-    if handle_manager_request(ch, srv, screen) { Served::One } else { Served::Closed }
 }
 
-fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
+fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>, mut sent: Received) -> bool {
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, request_id, body, carried) = unsafe {
-        // Close every transfer except the one `Capture` needs: unclosed, each pins a slot in the
-        // global handle table.
-        let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
         let decoded = decode(req);
-        let takes_handle = matches!(&decoded, Ok(m) if m.op == OP_MGR_CAPTURE);
-        let mut carried = 0u64;
-        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-        for i in 0..hcount {
-            if i == 0 && takes_handle {
-                carried = RECV_HANDLES[0];
-                continue;
-            }
-            syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
-        }
+        // Only `Capture` takes a handle; every other one closes as `sent` drops.
+        let carried = match &decoded {
+            Ok(m) if m.op == OP_MGR_CAPTURE => sent.take(0).unwrap_or(0),
+            _ => 0,
+        };
+        drop(sent);
         match decoded {
             Ok(m) => (m.op, m.request_id, m.body.to_vec(), carried),
             Err(_) => {
-                if carried != 0 {
-                    syscall4(SYS_HANDLE_CLOSE, carried, 0, 0, 0);
-                }
                 return true;
             }
         }
@@ -1687,47 +1665,42 @@ fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -
 fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     // SAFETY: SESSION_CH is only written by this single-threaded loop, and `slot` indexes it in bounds
     let ch = unsafe { SESSION_CH[slot] };
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
-        return if rr == KError::PeerClosed.as_i32() as i64 { Served::Closed } else { Served::Empty };
+    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+    match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+        Ok(sent) => {
+            if handle_session_request(slot, ch, srv, screen, sent) {
+                Served::One
+            } else {
+                Served::Closed
+            }
+        }
+        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => Served::Closed,
+        Err(_) => Served::Empty,
     }
-    if handle_session_request(slot, ch, srv, screen) { Served::One } else { Served::Closed }
 }
 
-fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
+fn handle_session_request(
+    slot: usize,
+    ch: u64,
+    srv: &mut Server,
+    screen: &mut Screen<RawFramebuffer>,
+    mut sent: Received,
+) -> bool {
     // Copied out to avoid two live `static mut` borrows. `MAX_BODY` fits a whole `SetTitle`, so
     // this `min` is a bounds check, not a policy.
     let mut body_buf = [0u8; MAX_BODY];
-    // SAFETY: RECV_MSG and RECV_HANDLES were filled by the recv in the caller; the slice is clamped to the payload
+    // SAFETY: RECV_MSG was filled by the recv in the caller; the slice is clamped to the payload
     // region and is copied out before anything else touches the statics
     let (op, request_id, body_len, handle) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF));
-        // Take the handles out before anything can fail: a message that does not decode may still
-        // carry some, and the surplus past the first is closed at once.
-        let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
-        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-        for i in 1..hcount {
-            // SAFETY: closing a handle this process owns and no op can name.
-            syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
-        }
-        let h = if hcount > 0 { RECV_HANDLES[0] } else { 0 };
+        // A message that does not decode closes what it carried as `sent` drops; past the first
+        // handle, so does one that does.
         let Ok(m) = decode(req) else {
-            if h != 0 {
-                // SAFETY: closing a handle this process owns and will never interpret.
-                syscall4(SYS_HANDLE_CLOSE, h, 0, 0, 0);
-            }
             return true;
         };
+        let h = sent.take(0).unwrap_or(0);
+        drop(sent);
         let n = m.body.len().min(MAX_BODY);
         body_buf[..n].copy_from_slice(&m.body[..n]);
         (m.op, m.request_id, n, h)
@@ -2186,19 +2159,10 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
         // A forwarded resolve: `new` mints a session, `manage` the manager channel, `<N>/info`
         // window metadata, `screen` the screen's size. `<N>/ports/...` is unscheduled:
         // `TODO(port-shape-rework)`.
-        // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                serve_end,
-                (&raw mut RECV_MSG) as u64,
-                (&raw mut RECV_HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
-        };
-        if rr != 0 {
+        // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
+        let Ok(_sent) = (unsafe { channel_recv_raw(serve_end, &raw mut RECV_MSG) }) else {
             continue;
-        }
+        };
         // SAFETY: bounded read of the payload, then of the resolve's suffix.
         let (request_id, resolved, ok) = unsafe {
             let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;

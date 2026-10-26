@@ -51,8 +51,6 @@ const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 /// The most open directory sessions at once; one `sys_wait` slot is the forwarding endpoint.
@@ -395,22 +393,16 @@ fn serve_session(root_ns: u64, packages: &[Package], session_ch: u64) {
         return; // already freed earlier in this batch
     };
     loop {
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                session_ch,
-                (&raw mut RECV_MSG) as u64,
-                (&raw mut RECV_HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
-        };
-        if rr != 0 {
-            if rr == KError::PeerClosed.as_i32() as i64 {
-                free_session_at(slot);
+        // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
+        let _sent = match unsafe { channel_recv_raw(session_ch, &raw mut RECV_MSG) } {
+            Ok(sent) => sent,
+            Err(rr) => {
+                if rr == KError::PeerClosed.as_i32() as i64 {
+                    free_session_at(slot);
+                }
+                return; // WouldBlock (drained) or PeerClosed (freed)
             }
-            return; // WouldBlock (drained) or PeerClosed (freed)
-        }
+        };
         // SAFETY: bounded read-only slice over the just-received message.
         let (op, request_id, cursor, ok) = unsafe {
             let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -575,19 +567,10 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
         if !served_endpoint {
             continue;
         }
-        // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                serve_end,
-                (&raw mut RECV_MSG) as u64,
-                (&raw mut RECV_HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
-        };
-        if rr != 0 {
+        // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
+        let Ok(_sent) = (unsafe { channel_recv_raw(serve_end, &raw mut RECV_MSG) }) else {
             continue;
-        }
+        };
 
         // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG.
         let (op, request_id, handle, ok) = unsafe {

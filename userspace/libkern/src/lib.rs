@@ -16,6 +16,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod abi;
+pub mod channel;
 pub mod control;
 pub mod debug;
 pub mod device;
@@ -30,6 +31,7 @@ pub mod syscaps;
 pub mod mem;
 
 pub use abi::*;
+pub use channel::{Received, channel_recv, channel_recv_raw};
 pub use debug::{exit, kprint, kprint_hex, kprint_u64};
 pub use error::{KError, from_raw};
 pub use handle::*;

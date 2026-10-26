@@ -112,7 +112,7 @@ A sender passes the handles to transfer via `sys_channel_send`'s separate `handl
 1. Sender calls `sys_channel_send(ch, msg, handles, count, mode)` with `count` handles. Each must be valid in the sender's table with the `TRANSFER` right. **A handle listed twice is refused `InvalidArgument`**: it would arrive as two, a copy its holder could not make. **So is the endpoint the message is for, and an endpoint whose own receive side holds an endpoint**, in a queued message or a held send: endpoints holding each other through their rings are freed by nothing, and the last move of any such cycle is one of the two.
 2. Kernel validates + pins each handle (`lookup` with `TRANSFER`); any bad handle fails the whole send (atomic-or-fail) with the sender's table untouched.
 3. Kernel queues the message slot, **moving** the pinned references into it ("in flight"). Only then does it **commit the move** by closing the sender's source handles — so a `WouldBlock`/`PeerClosed` send loses no capability.
-4. Receiver's `sys_channel_recv` dequeues the message and **installs** each in-flight reference into its **own** table (with the rights the sender's handle carried), writing the new handle values into both the `handles` out-buffer and the in-message `handles[]`, and the count into `*count`. The handles are now valid in the receiver's table; the install is atomic-or-fail (a partial failure reclaims what it installed).
+4. Receiver's `sys_channel_recv` dequeues the message and **installs** each in-flight reference into its **own** table (with the rights the sender's handle carried), writing the new handle values into both the `handles` out-buffer and the in-message `handles[]`, and the count into `*count`. The handles are now valid in the receiver's table; the install is atomic-or-fail (a partial failure reclaims what it installed). **They are installed whether or not the receiver asked for them**, so a receiver closes every one it does not keep: userspace receives through `libkern::channel_recv`, whose `Received` closes, as it drops, each handle not taken from it.
 
 If the receiving endpoint is destroyed with the message still queued, the undelivered in-flight references are released (the objects lose that reference).
 
@@ -137,7 +137,7 @@ Behavior:
 2. If queue is non-empty, the oldest message is dequeued.
 3. Message body is copied to `*msg` (4096 bytes). The kernel zeroes any portions of `payload` beyond `payload_len`.
 4. Handles are written to `handles[0..msg.header.handle_count]`. The kernel writes `handle_count` to `*count`.
-5. The handles in `*msg.handles` are kernel-internal copies of the same values; they refer to the same handles now in the receiver's table. (Userspace typically reads from `handles[]` rather than `msg.handles[]`; the duplication accommodates languages that prefer the in-message location.)
+5. The handles in `*msg.handles` are the same values as `handles[0..count]`: one set of handles in the receiver's table, written in two places. A receiver through `libkern::channel_recv` takes them from its `Received`, which closes each one not taken when it drops, so a handle read from the in-message copy and not taken is closed under its reader.
 
 Note: the user-supplied `handles` buffer must be large enough to hold `IPC_HANDLE_MAX` (8) entries. The kernel does not bounds-check this against a smaller buffer; passing a smaller buffer is undefined.
 

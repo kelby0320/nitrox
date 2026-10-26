@@ -14,8 +14,7 @@ extern crate alloc;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::{
-    RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4,
-    syscall5,
+    RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
 use librsproto::surface::{CreateWindowRequest, KeyEvent, PointerEvent, Role};
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
@@ -110,8 +109,6 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
 struct Stream {
     channel: u64,
     msg: [u8; 4096],
-    handles: [u64; 8],
-    count: u64,
     /// The harness pressed [`START_CODE`], asking for the motion phase.
     start_requested: bool,
     /// The idle deadline passed rather than the channel failing: nobody is driving this run.
@@ -121,7 +118,7 @@ struct Stream {
 impl Stream {
     fn open(root_ns: u64) -> Option<Self> {
         let channel = lookup(root_ns, b"/dev/input/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)?;
-        Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0, start_requested: false, timed_out: false })
+        Some(Self { channel, msg: [0; 4096], start_requested: false, timed_out: false })
     }
 
     /// Sum relative motion until the stream is quiet: `(dx, dy, announced, widest)`.
@@ -141,22 +138,11 @@ impl Stream {
             if waited != 1 {
                 return (dx, dy, announced, widest); // quiet for long enough
             }
-            // SAFETY: valid recv out-params on a live endpoint.
-            let rr = unsafe {
-                syscall4(
-                    SYS_CHANNEL_RECV,
-                    self.channel,
-                    (&raw mut self.msg) as u64,
-                    (&raw mut self.handles) as u64,
-                    (&raw mut self.count) as u64,
-                )
+            let _sent = match libkern::channel_recv(self.channel, &mut self.msg) {
+                Ok(sent) => sent,
+                Err(rr) if rr == libkern::error::KError::WouldBlock.as_i32() as i64 => continue,
+                Err(_) => return (dx, dy, announced, widest),
             };
-            if rr == libkern::error::KError::WouldBlock.as_i32() as i64 {
-                continue;
-            }
-            if rr != 0 {
-                return (dx, dy, announced, widest);
-            }
             let payload_len = u32::from_le_bytes([self.msg[4], self.msg[5], self.msg[6], self.msg[7]]) as usize;
             let req = &self.msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(4096 - PAYLOAD_OFF)];
             let Ok(m) = librsproto::decode(req) else { return (dx, dy, announced, widest) };
@@ -197,22 +183,11 @@ impl Stream {
                 self.timed_out = deadline_ns(0) >= deadline;
                 return None;
             }
-            // SAFETY: valid recv out-params on a live endpoint.
-            let rr = unsafe {
-                syscall4(
-                    SYS_CHANNEL_RECV,
-                    self.channel,
-                    (&raw mut self.msg) as u64,
-                    (&raw mut self.handles) as u64,
-                    (&raw mut self.count) as u64,
-                )
+            let _sent = match libkern::channel_recv(self.channel, &mut self.msg) {
+                Ok(sent) => sent,
+                Err(rr) if rr == libkern::error::KError::WouldBlock.as_i32() as i64 => continue, // woken with nothing to take
+                Err(_) => return None,
             };
-            if rr == libkern::error::KError::WouldBlock.as_i32() as i64 {
-                continue; // woken with nothing to take
-            }
-            if rr != 0 {
-                return None;
-            }
             let payload_len = u32::from_le_bytes([self.msg[4], self.msg[5], self.msg[6], self.msg[7]]) as usize;
             let req = &self.msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(4096 - PAYLOAD_OFF)];
             let Ok(m) = librsproto::decode(req) else { return None };

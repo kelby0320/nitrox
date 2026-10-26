@@ -139,6 +139,17 @@ pub mod registry {
     }
 }
 
+pub mod ready {
+    //! **A server's first message**, as `service-mgr` takes it.
+
+    /// Which of the handles that came with a server's first message `service-mgr` keeps: a
+    /// Ready's first, the endpoint to bind, and none of a refusal or anything else, which close
+    /// as the receive's `Received` drops.
+    pub fn kept(op: u16, flags: u32) -> Option<usize> {
+        (op == librsproto::OP_READY && flags & librsproto::RS_FLAG_ERROR == 0).then_some(0)
+    }
+}
+
 pub mod shutdown {
     //! **A shutdown's order**: the sessions first, then the services **last declared first** —
     //! the reverse of bring-up, so each server outlives the ones started after it, which may use
@@ -324,6 +335,19 @@ pub mod services {
 mod tests {
     use super::bringup::{Entry, Failed, Step, chain_at, failed_at_boot, next};
     use super::registry::{DERIVED, MAX_ROUTES, STARTING_ROOM, base, derived, derives, valid_name};
+
+    /// **Only a Ready's endpoint is kept**: a refusal, or any other first message, keeps none of
+    /// what it brought.
+    #[test]
+    fn only_a_readys_endpoint_is_kept() {
+        use super::ready::kept;
+        use librsproto::{OP_PING, OP_READY, RS_FLAG_ERROR, RS_FLAG_REPLY};
+        assert_eq!(kept(OP_READY, 0), Some(0));
+        assert_eq!(kept(OP_READY, RS_FLAG_REPLY), Some(0));
+        assert_eq!(kept(OP_READY, RS_FLAG_ERROR), None);
+        assert_eq!(kept(OP_READY, RS_FLAG_ERROR | RS_FLAG_REPLY), None);
+        assert_eq!(kept(OP_PING, 0), None);
+    }
 
     const S: Entry = Entry { server: true, critical: false };
     const C: Entry = Entry { server: true, critical: true };

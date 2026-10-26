@@ -17,9 +17,7 @@ use crate::{
 };
 use libkern::abi::{IPC_MSG_SIZE, SENDMODE_NOBLOCK};
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
-use libkern::syscall::{
-    SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall4, syscall5,
-};
+use libkern::syscall::{SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall4, syscall5};
 
 /// Byte offset of the rsproto payload within an `IpcMsg` (the IPC header precedes it).
 pub(crate) const PAYLOAD_OFF: usize = 24;
@@ -243,27 +241,8 @@ pub fn round_trip(
         return Err(WireError::Transport(waited as i32));
     }
 
-    let mut transferred = [0u64; 8];
-    let mut count: usize = 0;
-    // SAFETY: valid message/handle/count out-params.
-    let got = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            endpoint,
-            buf.as_mut_ptr() as u64,
-            transferred.as_mut_ptr() as u64,
-            (&raw mut count) as u64,
-        )
-    };
-    if got != 0 {
-        return Err(WireError::Transport(got as i32));
-    }
-    // Close anything the server transferred: no session op sends handles back, and a
-    // misbehaving server would exhaust the table.
-    for h in transferred.iter().take(count.min(8)) {
-        // SAFETY: closing a handle just installed into our table.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, *h) };
-    }
+    let msg: &mut [u8; IPC_MSG_SIZE] = (&mut buf[..IPC_MSG_SIZE]).try_into().map_err(|_| WireError::Protocol)?;
+    let _sent = libkern::channel_recv(endpoint, msg).map_err(|got| WireError::Transport(got as i32))?;
     let payload_len = u32::from_le_bytes([
         buf[OFF_PAYLOAD_LEN],
         buf[OFF_PAYLOAD_LEN + 1],

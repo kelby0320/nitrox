@@ -45,11 +45,6 @@ static mut RING: Ring = Ring::new();
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-/// Sized from the **ABI**: `sys_channel_recv` passes no receiver-side capacity, so the kernel
-/// copies out the *sender's* stamped handle count, bounded only by `IPC_HANDLE_MAX`. A shorter
-/// array is smashed by any client that attaches handles.
-static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
-static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
@@ -144,19 +139,10 @@ fn refuse(ch: u64, op: u16, request_id: u64, kerror: i32, server_code: u32) {
 }
 
 fn serve_resolve(serve_end: u64) {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            serve_end,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
+    let Ok(_sent) = (unsafe { channel_recv_raw(serve_end, &raw mut RECV_MSG) }) else {
         return;
-    }
+    };
     // SAFETY: bounded read-only slice over the payload the kernel just wrote.
     let (op, request_id, bare) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -240,21 +226,12 @@ fn free_session(ch: u64) {
 }
 
 fn serve_session(ch: u64) {
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    if rr != 0 {
+    // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
+    let Ok(_sent) = (unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) }) else {
         // A closed peer frees the slot; otherwise every exited application holds one forever.
         free_session(ch);
         return;
-    }
+    };
     // SAFETY: bounded read-only slice over the payload the kernel just wrote. The borrow ends
     // before anything writes to `RECV_MSG` again — nothing below receives.
     let msg = unsafe {

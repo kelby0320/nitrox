@@ -41,6 +41,7 @@ pub(crate) fn print_help() {
            \x20                one of greeter|desktop|apps|windows|terminal|hover|files|editor|overview\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
+           check-recv    fail if userspace receives raw, past libkern's `channel_recv`\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
            check-docs      fail if a doc links to, or cites, a path that does not exist\n  \
            check-comments  fail if new comments exceed 0.15 of new code plus 3, or cite a PR or part;\n  \

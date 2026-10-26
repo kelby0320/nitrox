@@ -69,21 +69,16 @@ fn wait_ready(control: u64) -> Result<u64, &'static [u8]> {
     if !wait_until(control, now_ns().saturating_add(READY_TIMEOUT_NS)) {
         return Err(b"it sent no Ready in time");
     }
-    let m = match recv(control) {
+    let (m, mut sent) = match recv(control) {
         Ok(Some(m)) => m,
         Ok(None) => return Err(b"what it sent was not a message"),
         Err(()) => return Err(b"it exited before Ready"),
     };
-    match (m.op, m.flags & RS_FLAG_ERROR != 0, m.handles.as_slice()) {
-        (librsproto::OP_READY, false, &[endpoint]) => Ok(endpoint),
-        (librsproto::OP_READY, true, _) => {
-            m.handles.iter().for_each(|&h| close(h));
-            Err(b"it refused the device")
-        }
-        _ => {
-            m.handles.iter().for_each(|&h| close(h));
-            Err(b"it sent something other than Ready")
-        }
+    // A Ready's one endpoint is kept; anything else closes as `sent` drops.
+    match (m.op, m.flags & RS_FLAG_ERROR != 0, sent.count()) {
+        (librsproto::OP_READY, false, 1) if let Some(endpoint) = sent.take(0) => Ok(endpoint),
+        (librsproto::OP_READY, true, _) => Err(b"it refused the device"),
+        _ => Err(b"it sent something other than Ready"),
     }
 }
 
