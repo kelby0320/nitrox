@@ -973,9 +973,10 @@ std port**, which builds on what it leaves.
   host test making a real syscall, or, in the kernel, undefined behaviour in an AHCI test's fake
   registers. Making its targets' tests run under it is part of this part.
 
-Measured on `main` at `90e1f456` with `cargo xtask unsafe-inventory`, test code left out: 108,159
-lines of code holding 2,835 `unsafe` blocks, 365 `unsafe fn`s, 325 `static mut`s and 1,260 raw
-syscalls. Five of 49 crates use libos, `init` once beside 55 raw syscalls.
+Measured on `main` at `6ffc1173`, after group F, with `cargo xtask unsafe-inventory`, test code
+left out: 107,589 lines of code holding 2,795 `unsafe` blocks, 374 `unsafe fn`s, 274
+`static mut`s, 1,183 raw syscalls and 454 raw-pointer dereferences. Five of 49 crates use libos,
+`init` once beside 55 raw syscalls.
 
 ## Part E — the syscall surface
 
