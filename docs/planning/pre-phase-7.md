@@ -966,7 +966,12 @@ std port**, which builds on what it leaves.
   per syscall, owning types over them, every crate moved onto them, and a check that lets the count
   of raw syscalls only fall. Its design goes into Part E's detail pass with the surface it wraps,
   so callers move once.
-- **Miri**, measured on the host tests before deciding whether CI runs it.
+- **Miri, in a CI job of its own, not on every PR** (the maintainer's call, 2026-10-26), run on a
+  schedule and by hand, over the kernel and the system services, where correctness is worth most.
+  Measured first: 27 of 44 host-test targets passed under it, 29 minutes against 4.8 s natively;
+  the rest stopped at a test past 20 minutes, `libm`'s inline `sqrtf`, a host tool spawned, a
+  host test making a real syscall, or, in the kernel, undefined behaviour in an AHCI test's fake
+  registers. Making its targets' tests run under it is part of this part.
 
 Measured on `main` at `90e1f456` with `cargo xtask unsafe-inventory`, test code left out: 108,159
 lines of code holding 2,835 `unsafe` blocks, 365 `unsafe fn`s, 325 `static mut`s and 1,260 raw

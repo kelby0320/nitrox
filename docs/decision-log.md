@@ -36845,6 +36845,10 @@ by convention where no type held it. The maintainer's calls, made with the autho
 - **All of it before the std port**, which would sit on such a layer, and which the `no_std`
   services would never use. **Part I is done when no raw syscall is left outside `libkern` and
   `libos`**, or each exception is agreed.
-- **Miri is measured before CI runs it**: it interprets, cannot run a syscall, and slows a
-  key-stretching test to minutes, so what it would cover, and what that costs, is a number to have
-  first.
+- **Miri runs in a CI job of its own, on a schedule and by hand, not on every PR, over the kernel
+  and the system services**, where correctness is worth most. Measured first, on every host-test
+  target: 27 of 44 passed, 29 minutes under Miri against 4.8 s natively, nearly all of it nxsh's
+  and nxinstall's tests; it interprets, so a tight loop runs hundreds of times slower, and it
+  cannot run inline assembly, so neither a syscall nor `libm`'s `sqrtf`. On its first kernel run
+  it found undefined behaviour in a test: AHCI's fake registers lent through a shared borrow and
+  written.
