@@ -36823,3 +36823,27 @@ sched-17). `bug-bash.md` has each fix; what a caller can now see differently is 
   keeps one process's timers from touching another's waits without accounting the kernel does not
   have. A bounded send's slots come with its endpoint rather than with each send, the cheaper of
   the two to keep paired.
+
+## 2026-10-26 — Before Phase 7: a safety survey, and libos as the syscall layer
+
+Group F's sweep moved every userspace receive onto one closing type, and found the class it fixed
+in most receivers, beside a receive buffer the kernel overran. Each was a size or an ownership held
+by convention where no type held it. The maintainer's calls, made with the author:
+
+- **A survey of the class, wide, before Part E** (`pre-phase-7.md`, Part I). It is the bug bash's
+  machinery, but a skill of its own, `/safety-survey`: the bash's rules leave out what the code
+  could do better, and half of what is wanted is that — `unsafe` that could be removed, narrowed or
+  encapsulated, counted as patterns. Its thirteen subsystems cover every userspace crate and every
+  entry of `kernel/src`, which its workflow's test holds, and each section opens with
+  `cargo xtask unsafe-inventory`, so its counts are a program's, not an agent's.
+- **libos is userspace's safe syscall layer**, as `docs/architecture/libos.md` designed it: `no_std`
+  and no `alloc`, so every process can use it, with a seam that makes the code above it
+  host-testable, which code making raw syscalls is not. It stopped at its first slice: channels were
+  never wrapped, its `sys` module passes `u64`s through, and the migration it planned never
+  happened — five of 49 crates use it, `init` once beside 55 raw syscalls. libkern stays the raw
+  layer. The wrappers are designed with Part E's surface, so callers move once.
+- **All of it before the std port**, which would sit on such a layer, and which the `no_std`
+  services would never use.
+- **Miri is measured before CI runs it**: it interprets, cannot run a syscall, and slows a
+  key-stretching test to minutes, so what it would cover, and what that costs, is a number to have
+  first.
