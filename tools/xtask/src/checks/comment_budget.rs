@@ -86,7 +86,7 @@ fn budget(files: &[(String, String)]) -> Budget {
     b
 }
 
-fn git(args: &[&str]) -> R<String> {
+pub(super) fn git(args: &[&str]) -> R<String> {
     let out = Command::new("git").args(args).current_dir(crate::repo_root()).output()?;
     if !out.status.success() {
         return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr)).into());

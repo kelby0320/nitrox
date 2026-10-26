@@ -8,8 +8,9 @@ budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19; C.
 2026-10-19; C.2 built 2026-10-19; C.3 built 2026-10-19; C.4 built 2026-10-19, the light left to
 the laptop; C.5 built 2026-10-20 — Part C built; the stick's light confirmed on the laptop
 2026-10-20 — Part C complete; Part D's bash run 2026-10-20 and triaged 2026-10-22, Part H added
-for what it left (the maintainer's call).** Each later part gets its detail pass when it is next.
-Eight parts, A–H, in the order below. Part E is the syscall-surface consolidation, planned
+for what it left (the maintainer's call); Part I added 2026-10-26, a safety survey (the
+maintainer's call).** Each later part gets its detail pass when it is next. Nine parts, A–I, in the
+order below, Part I between D and E. Part E is the syscall-surface consolidation, planned
 separately in [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
@@ -946,6 +947,37 @@ a message never closed. With them, a slow stick at boot losing the storage servi
 (sup-1), and each test gap in code a fix changes, written with that fix. 68 to fix; 60 later, four
 in Part E and the rest in Part H; one not. `bug-bash.md` holds each verdict.
 
+## Part I — a safety survey
+
+**Added 2026-10-26 (the maintainer's call)**, after group F's sweep found a received handle left
+open in most of userspace and a receive buffer the kernel overran. Lettered after H, it runs after
+Part D and before Part E's detail pass, which its findings shape. **All of it is done before the
+std port**, which builds on what it leaves.
+
+- **The survey.** `/safety-survey <subsystem>`, the maintainer's to start, is the bug bash's
+  machinery aimed at one class — a size, an ownership or a lifetime held by convention where no
+  type holds it — and at the `unsafe` that could be removed, narrowed or put behind an
+  abstraction, which the bash's rules leave out. It is wide: thirteen subsystems that together
+  cover every userspace crate and every entry of `kernel/src`, each section opening with
+  `cargo xtask unsafe-inventory` over its paths. Its items go in
+  [`safety-survey.md`](safety-survey.md) and are triaged with the maintainer.
+- **The layer it points at.** libos as userspace's safe syscall layer, as
+  [`libos.md`](../architecture/libos.md) designed it and nothing finished: one safe, typed wrapper
+  per syscall, owning types over them, every crate moved onto them, and a check that lets the count
+  of raw syscalls only fall. Its design goes into Part E's detail pass with the surface it wraps,
+  so callers move once.
+- **Miri, in a CI job of its own, not on every PR** (the maintainer's call, 2026-10-26), run on a
+  schedule and by hand, over the kernel and the system services, where correctness is worth most.
+  Measured first: 27 of 44 host-test targets passed under it, 29 minutes against 4.8 s natively;
+  the rest stopped at a test past 20 minutes, `libm`'s inline `sqrtf`, a host tool spawned, a
+  host test making a real syscall, or, in the kernel, undefined behaviour in an AHCI test's fake
+  registers. Making its targets' tests run under it is part of this part.
+
+Measured on `main` at `6ffc1173`, after group F, with `cargo xtask unsafe-inventory`, test code
+left out: 107,589 lines of code holding 2,795 `unsafe` blocks, 374 `unsafe fn`s, 274
+`static mut`s, 1,183 raw syscalls and 454 raw-pointer dereferences. Five of 49 crates use libos,
+`init` once beside 55 raw syscalls.
+
 ## Part E — the syscall surface
 
 As [`syscall-surface.md`](syscall-surface.md) plans it, after its own detail pass. **With it, four
@@ -1004,3 +1036,6 @@ several branches at once, which waits on the gates leaving this machine.
   subsystems and every finding in `bug-bash.md` triaged, the ones marked fix fixed; Part E done as
   its plan says; Parts F and G built; Part H's findings fixed, or each one's deferral past Phase 7
   agreed with the maintainer.
+- Part I's survey run on its thirteen subsystems and every item triaged; its defects marked fix
+  fixed, its opportunities marked plan in Part E's plan or a part of their own, and no raw syscall
+  outside `libkern` and `libos`, or each exception agreed with the maintainer.

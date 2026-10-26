@@ -36860,3 +36860,32 @@ each fix; what a caller can now see differently is here:
   libkern's rules name for one, has no `alloc` either, but auth-service, librsproto and libstream
   do not depend on it, and libkern is the one layer every receiver shares. This was the maintainer's choice over closing at each site, or a kernel change in
   Part E; `userspace/libkern/CLAUDE.md` records the exception.
+
+## 2026-10-26 — Before Phase 7: a safety survey, and libos as the syscall layer
+
+Group F's sweep moved every userspace receive onto one closing type, and found the class it fixed
+in most receivers, beside a receive buffer the kernel overran. Each was a size or an ownership held
+by convention where no type held it. The maintainer's calls, made with the author:
+
+- **A survey of the class, wide, before Part E** (`pre-phase-7.md`, Part I). It is the bug bash's
+  machinery, but a skill of its own, `/safety-survey`: the bash's rules leave out what the code
+  could do better, and half of what is wanted is that — `unsafe` that could be removed, narrowed or
+  encapsulated, counted as patterns. Its thirteen subsystems cover every userspace crate and every
+  entry of `kernel/src`, which its workflow's test holds, and each section opens with
+  `cargo xtask unsafe-inventory`, so its counts are a program's, not an agent's.
+- **libos is userspace's safe syscall layer**, as `docs/architecture/libos.md` designed it: `no_std`
+  and no `alloc`, so every process can use it, with a seam that makes the code above it
+  host-testable, which code making raw syscalls is not. It stopped at its first slice: channels were
+  never wrapped, its `sys` module passes `u64`s through, and the migration it planned never
+  happened — five of 49 crates use it, `init` once beside 55 raw syscalls. libkern stays the raw
+  layer. The wrappers are designed with Part E's surface, so callers move once.
+- **All of it before the std port**, which would sit on such a layer, and which the `no_std`
+  services would never use. **Part I is done when no raw syscall is left outside `libkern` and
+  `libos`**, or each exception is agreed.
+- **Miri runs in a CI job of its own, on a schedule and by hand, not on every PR, over the kernel
+  and the system services**, where correctness is worth most. Measured first, on every host-test
+  target: 27 of 44 passed, 29 minutes under Miri against 4.8 s natively, nearly all of it nxsh's
+  and nxinstall's tests; it interprets, so a tight loop runs hundreds of times slower, and it
+  cannot run inline assembly, so neither a syscall nor `libm`'s `sqrtf`. On its first kernel run
+  it found undefined behaviour in a test: AHCI's fake registers lent through a shared borrow and
+  written.

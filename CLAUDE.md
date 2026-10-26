@@ -84,8 +84,9 @@ on the branch and runs no `cargo` or QEMU. **`/pr-review-solo`** is the same rev
 The author acts on a review with **`/address-review`**: reproduce, fix with a control, sweep the
 class, and record the outcome in `.claude/review-outcomes.tsv`. **`/bug-bash <subsystem>`**, also
 the maintainer's, aims the same machinery at one subsystem of `main` and returns its findings for
-`docs/planning/bug-bash.md`. Their rules are in `.claude/skills/`; CI tests each workflow's control
-flow with its agents stubbed (`node .claude/workflows/<name>.test.mjs`).
+`docs/planning/bug-bash.md`; **`/safety-survey <subsystem>`** aims it at the subsystem's `unsafe`,
+sizes and ownership, for `docs/planning/safety-survey.md`. Their rules are in `.claude/skills/`; CI
+tests each workflow's control flow, its agents stubbed (`node .claude/workflows/<name>.test.mjs`).
 
 ## Who does the work
 

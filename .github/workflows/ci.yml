@@ -101,11 +101,12 @@ jobs:
           (cd userspace && cargo clippy --keep-going --all-features -- $D)
           (cd userspace && cargo clippy --keep-going --workspace --lib --profile test --all-features --target $H -- $D)
 
-      # The review and bug-bash workflows' control flow, every agent stubbed. No workflow runs.
+      # The three workflows' control flow, every agent stubbed. No workflow runs.
       - name: workflow checks
         run: |
           node .claude/workflows/pr-review-workflow.test.mjs
           node .claude/workflows/bug-bash-workflow.test.mjs
+          node .claude/workflows/safety-survey-workflow.test.mjs
 
       # A `TODO(tag)` in shipping source must have an entry in
       # docs/rationale/deferred-decisions.md. Three deferrals that cost real time to

@@ -52,6 +52,8 @@ pub(crate) fn print_help() {
            \x20               lowers stale entries, `--rename OLD NEW` moves one with its file,\n  \
            \x20               `--split OLD NEW...` moves one onto what the file was split into\n  \
            check-moves     fail if a commit (default HEAD) changes anything but code it moves\n  \
+           unsafe-inventory  `unsafe` and raw pointers by kind, a row per crate or kernel module,\n  \
+           \x20                 tests left out; `unsafe-inventory PATH...` for those paths\n  \
            check-images    fail if a test image and a release image differ by anything new\n  \
            check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope\n  \
            abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI\n  \
