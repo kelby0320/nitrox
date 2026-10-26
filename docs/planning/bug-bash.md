@@ -2413,6 +2413,26 @@ before it is fixed.
   wider than found, the storage service sending and receiving them too. T2-16's marker was already
   in `map_file`; ext4's `CLAUDE.md` now says it.
 
+### Found running group F's gates — branch pre-phase-7/part-d-f at 886332bb, 2026-10-25
+
+A gate failed on a branch that changes nothing it watches.
+
+- [ ] **gate-2** `kernel/src/sched/exit.rs:252` — `report_stranded_fault` prints through
+  `emergency_writer()`, which bypasses `SERIAL`'s lock, so its line interleaves byte by byte with
+  a `sys_kprint` on another CPU, and a gate waiting for that print's line never sees it.
+  - `emergency_writer` is for the panic and exception handlers (`serial.rs:147-150`), where the
+    lock may be held; a stranded fault's report is neither. `sys_kprint` takes `SERIAL`
+    (`table.rs:694`), so two lines written with the lock never mix.
+  - Scenario: `check-display --kvm`. test-harness's worker-fault demo ends in this report while
+    ui-testclient prints `ui-testclient: font loaded /system/fonts/DejaVuSansMono.ttf`; the two
+    came out character by character, mixed (transcript lines 303-306), and
+    `gates/display.rs:51` timed out after 45 s waiting for the font's line. ui-testclient went
+    on and passed.
+  - Demonstrated: once in three `check-display --kvm` runs at `886332bb` with two test files
+    added; the other two, and the full set at `b22a391c`, passed. Any gate whose line meets a
+    stranded fault's report can fail the same way. Tests. Low: it fails CI now and then on
+    branches that touch none of it. Untriaged.
+
 ### Found on the laptop — main at c5e59d4d, 2026-10-25
 
 Found by the maintainer at the laptop's prompt after reinstalling, not by a run.
