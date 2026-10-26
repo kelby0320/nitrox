@@ -52,7 +52,7 @@ check('what held up reaches the report', rp(r).includes('abi: held'))
 check('the section is returned', r.result?.section === 'SECTION' && r.result?.head === 'hhhh1234')
 check('the report numbers by the subsystem id and removes the run\'s worktrees', /id, for numbering: kobj\./.test(rp(r)) && rp(r).includes(`those whose path starts ${WT}.`))
 check('every reviewer checks out the scope\'s commit', r.calls.filter(c => c.label.startsWith('survey:')).every(c => c.prompt.includes('git checkout --detach hhhh1234')))
-check('the boot verifier reads the bug bash\'s verify.md', (r.calls.find(c => c.label === 'verify:boot')?.prompt || '').includes('.claude/skills/bug-bash/verify.md'))
+check('the boot verifier reads the survey\'s verify.md, which grades by the survey\'s rules', (r.calls.find(c => c.label === 'verify:boot')?.prompt || '').includes('.claude/skills/safety-survey/verify.md') && readFileSync(repo('.claude/skills/safety-survey/verify.md'), 'utf8').includes('.claude/skills/safety-survey/rules.md'))
 
 r = await run(USER, l => l === 'scope' ? scope() : l.startsWith('survey:') ? found([], [op('p')]) : 'SECTION')
 check('a userspace subsystem has no concurrency lens and no boot', !r.calls.some(c => c.label === 'survey:concurrency' || c.label === 'verify:boot') && r.calls.length === 6)
@@ -71,18 +71,28 @@ check('every lens dead: an error, worktrees still removed', !!r.error && /NO SUR
 r = await run(USER, l => l === 'scope' ? scope({ worktree: '/home/kelby/src/nitrox' }) : l.startsWith('survey:') ? found([]) : 'SECTION')
 check('a scope worktree outside .claude/worktrees removes nothing', /Remove no worktree/.test(rp(r)) && !rp(r).includes('/home/kelby/src/nitrox'))
 
-r = await run(USER, l => l === 'scope' ? scope() : l === 'survey:abi' ? found([d('a.rs', 1)], [op('p')]) : l.startsWith('survey:') ? found([]) : null)
-check('a dead report returns the items and the inventory unwritten', !r.error && r.result?.section === null && r.result?.defects.length === 1 && r.result?.opportunities.length === 1 && r.result?.inventory === '| INV |' && /no report/.test(r.result?.error), r.error)
+r = await run(USER, l => {
+  if (l === 'scope') return scope()
+  if (l === 'survey:abi') return found([d('a.rs', 1), d('b.rs', 2, { needs_boot: true })], [op('p')])
+  if (l === 'survey:soundness') return null
+  if (l.startsWith('survey:')) return found([])
+  if (l === 'verify:boot') return { verdicts: [{ id: 'abi-2', verdict: 'refuted', severity: 'low', evidence: 'no' }] }
+  return null
+})
+const dead = r.result || {}
+check('a dead report returns the items and the inventory unwritten', !r.error && dead.section === null && dead.opportunities?.length === 1 && dead.inventory === '| INV |' && /no report/.test(dead.error), r.error)
+check('a dead report returns only the defects a boot did not refute', dead.defects?.length === 1 && dead.defects[0].file === 'a.rs')
+check('a dead report returns what the section is written from: what held, the dead lenses, the counts, the head', dead.held_up?.includes('abi: held') && dead.lenses_missing?.join() === 'soundness' && dead.counts?.found === 2 && dead.counts?.refuted === 1 && dead.counts?.reported === 1 && dead.counts?.opportunities === 1 && dead.head === 'hhhh1234' && dead.subsystem === 'filesystems')
 
 const want = { scope: 'sonnet', 'survey:abi': undefined, 'survey:ownership': undefined, 'survey:soundness': undefined, 'survey:concurrency': undefined, 'survey:opportunities': undefined, 'verify:boot': 'sonnet', report: 'sonnet' }
 r = await run(KERNEL, l => l === 'scope' ? scope() : l.startsWith('survey:') ? found([d('a.rs', 1, { needs_boot: true })]) : l === 'verify:boot' ? { verdicts: [] } : 'SECTION')
 check('each stage on its model', r.calls.every(c => want[c.label] === c.opts.model), r.calls.map(c => `${c.label}=${c.opts.model}`).join(','))
 check('every agent but the report in its own worktree', r.calls.every(c => (c.label === 'report') === (c.opts.isolation !== 'worktree')))
 check('MAX_AGENTS is used', (src.match(/MAX_AGENTS/g) || []).length >= 2)
-const named = new Set(src.match(/\$\{(?:DIR|BASH)\}\/[\w./-]+\.md/g) || [])
-check('the rules, scope and report files are named', ['rules', 'scope', 'report'].every(n => named.has(`\${DIR}/${n}.md`)))
+const named = new Set(src.match(/\$\{DIR\}\/[\w./-]+\.md/g) || [])
+check('the rules, scope, verify and report files are named', ['rules', 'scope', 'verify', 'report'].every(n => named.has(`\${DIR}/${n}.md`)))
 for (const n of named) {
-  const path = n.replace('${DIR}', '.claude/skills/safety-survey').replace('${BASH}', '.claude/skills/bug-bash')
+  const path = n.replace('${DIR}', '.claude/skills/safety-survey')
   check(`${path} exists`, existsSync(repo(path)))
 }
 

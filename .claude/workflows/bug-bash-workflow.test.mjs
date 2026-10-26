@@ -61,8 +61,18 @@ check('every lens dead: an error, worktrees still removed', !!r.error && /NO HUN
 r = await run(USER, l => l === 'scope' ? scope({ worktree: '/home/kelby/src/nitrox' }) : l.startsWith('hunt:') ? hunt([]) : 'SECTION')
 check('a scope worktree outside .claude/worktrees removes nothing', /Remove no worktree/.test(rp(r)) && !rp(r).includes('/home/kelby/src/nitrox'))
 
-r = await run(USER, l => l === 'scope' ? scope() : l === 'hunt:logic' ? hunt([f('a.rs', 1)]) : l.startsWith('hunt:') ? hunt([]) : null)
-check('a dead report returns the findings unwritten', !r.error && r.result?.section === null && r.result?.findings.length === 1 && /no report/.test(r.result?.error), r.error)
+r = await run(USER, l => {
+  if (l === 'scope') return scope()
+  if (l === 'hunt:logic') return hunt([f('a.rs', 1), f('b.rs', 2, { needs_boot: true })])
+  if (l === 'hunt:tests') return null
+  if (l.startsWith('hunt:')) return hunt([])
+  if (l === 'verify:boot') return { verdicts: [{ id: 'logic-2', verdict: 'refuted', severity: 'low', evidence: 'no' }] }
+  return null
+})
+const dead = r.result || {}
+check('a dead report returns the findings unwritten', !r.error && dead.section === null && /no report/.test(dead.error), r.error)
+check('a dead report returns only the findings a boot did not refute', dead.findings?.length === 1 && dead.findings[0].file === 'a.rs')
+check('a dead report returns what the section is written from: what held, the dead lenses, the counts, the head', dead.held_up?.includes('logic: held') && dead.lenses_missing?.join() === 'tests' && dead.counts?.found === 2 && dead.counts?.refuted === 1 && dead.counts?.reported === 1 && dead.head === 'hhhh1234' && dead.subsystem === 'filesystems')
 
 const want = { scope: 'sonnet', 'hunt:logic': undefined, 'hunt:error-paths': undefined, 'hunt:trust-boundary': undefined, 'hunt:architecture': undefined, 'hunt:tests': 'sonnet', 'verify:boot': 'sonnet', report: 'sonnet' }
 r = await run(KERNEL, l => l === 'scope' ? scope() : l.startsWith('hunt:') ? hunt([f('a.rs', 1, { needs_boot: true })]) : l === 'verify:boot' ? { verdicts: [] } : 'SECTION')

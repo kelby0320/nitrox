@@ -13,7 +13,6 @@ export const meta = {
 // A scope, at most five reviewers, a boot verifier when a defect needs one, and the report.
 const MAX_AGENTS = 8
 const DIR = '.claude/skills/safety-survey'
-const BASH = '.claude/skills/bug-bash'
 const SONNET = 'sonnet'
 const SEVERITY = ['high', 'medium', 'low']
 
@@ -200,7 +199,7 @@ const boot = defects.filter(d => d.needs_boot)
 const booted = boot.length
   ? await agent(
       `You verify defects from a safety survey of one Nitrox subsystem that only a QEMU boot can show. ` +
-        `${setup(`${BASH}/verify.md`)}\n\n${context}\n\n` +
+        `${setup(`${DIR}/verify.md`)}\n\n${context}\n\n` +
         `You alone in this survey boot QEMU, one gate at a time; nothing else runs beside you. ` +
         `Restore every probe. Return one verdict for each defect, by id.\n\n` +
         `Defects:\n${JSON.stringify(boot, null, 1)}`,

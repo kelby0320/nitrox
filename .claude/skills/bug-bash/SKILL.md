@@ -15,10 +15,14 @@ Arguments: `$ARGUMENTS` — a subsystem's `name` or `id` from `subsystems.toml` 
    `main` and share none of this conversation.
 3. While it runs, change nothing in this checkout and run no `cargo` and no QEMU: its agents build
    and test in worktrees of their own, and one of them may boot QEMU.
-4. When it returns, append its `section` to `docs/planning/bug-bash.md`, after any earlier
-   subsystem's, as it gives it, and print it. Triage is the maintainer's: add no verdict. If it
-   returns no `section`, its report agent died: write the section from the `findings` it returned
-   as `report.md` says, and remove the worktrees its `error` names.
+4. When it returns a `section`, append it to `docs/planning/bug-bash.md`, after any earlier
+   subsystem's, as it gives it, and print it. Triage is the maintainer's: add no verdict.
+   - **`stopped`**: its scope found nothing to hunt. Print why, and append nothing.
+   - **`section: null`**: its report agent died. Write the section from the `findings`, `counts`,
+     `lenses_missing` and `held_up` it returned, as `report.md` says, and remove the worktrees its
+     `error` names.
+   - **An error**: every lens returned nothing, so there is no section. Print the error, and
+     remove any worktree of the run that `git worktree list` still shows.
 
 The rules its agents follow are in this directory: `rules.md` for all of them, then `scope.md`,
 the lenses, `verify.md` and `report.md` by stage. The logic, error-path and architecture lenses are
