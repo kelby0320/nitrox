@@ -36843,7 +36843,8 @@ by convention where no type held it. The maintainer's calls, made with the autho
   happened — five of 49 crates use it, `init` once beside 55 raw syscalls. libkern stays the raw
   layer. The wrappers are designed with Part E's surface, so callers move once.
 - **All of it before the std port**, which would sit on such a layer, and which the `no_std`
-  services would never use.
+  services would never use. **Part I is done when no raw syscall is left outside `libkern` and
+  `libos`**, or each exception is agreed.
 - **Miri is measured before CI runs it**: it interprets, cannot run a syscall, and slows a
   key-stretching test to minutes, so what it would cover, and what that costs, is a number to have
   first.
