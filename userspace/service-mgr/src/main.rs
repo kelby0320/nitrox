@@ -870,7 +870,6 @@ enum Ready {
 }
 
 fn take_ready(ctrl: u64) -> Ready {
-    // A Ready's endpoint is the one handle kept; any other closes as `sent` drops.
     // SAFETY: single-threaded; `RDY_MSG` is lent for the call.
     let mut sent = match unsafe { channel_recv_raw(ctrl, &raw mut RDY_MSG) } {
         Ok(sent) => sent,
@@ -883,6 +882,7 @@ fn take_ready(ctrl: u64) -> Ready {
         core::slice::from_raw_parts(((&raw const RDY_MSG) as *const u8).add(24), len.min(4096 - 24))
     };
     let decoded = librsproto::decode(msg).ok().map(|m| (m.op, m.flags, m.body.to_vec()));
+    let endpoint = decoded.as_ref().and_then(|d| service_mgr::ready::kept(d.0, d.1)).and_then(|i| sent.take(i));
     let refused = |why: &[u8]| Ready::Refused(alloc::string::String::from_utf8_lossy(why).into_owned());
     match decoded {
         Some((op, flags, body)) if op == librsproto::OP_READY && flags & librsproto::RS_FLAG_ERROR != 0 => {
@@ -890,7 +890,7 @@ fn take_ready(ctrl: u64) -> Ready {
             let why: &[u8] = if why.is_empty() { b"it refused, and gave no reason" } else { why };
             refused(why)
         }
-        Some((op, _, _)) if op == librsproto::OP_READY => match sent.take(0) {
+        Some((op, _, _)) if op == librsproto::OP_READY => match endpoint {
             Some(endpoint) => Ready::Endpoint(endpoint),
             None => refused(b"a Ready with no endpoint in it"),
         },

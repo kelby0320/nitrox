@@ -477,12 +477,12 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
     let payload_len = (u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize).min(IPC_MSG_LEN - 24);
     let first = init::ready::parse(&msg[24..24 + payload_len], sent.count());
     match first {
-        init::ready::First::Ready => return sent.take(0),
+        init::ready::First::Ready => {}
         init::ready::First::Refused(reason) if !reason.is_empty() => say(b" refused: ").untrusted(reason).end(),
         init::ready::First::Refused(_) => say(b" refused, giving no reason init could read").end(),
         init::ready::First::Unexpected => say(b" sent something other than a Ready").end(),
     }
-    None
+    init::ready::kept(&first).and_then(|i| sent.take(i))
 }
 
 /// Spawn the system profile server and bind its endpoint at `/bin`: [`mount_one`] minus the device.

@@ -49,6 +49,12 @@ fn reason(payload: &[u8]) -> Option<&[u8]> {
     body.get(ERROR_BODY_LEN..ERROR_BODY_LEN + msg_len)
 }
 
+/// Which of the handles that came with `first` init keeps: a Ready's first, the endpoint it binds,
+/// and none of anything else, which close as the receive's `Received` drops.
+pub fn kept(first: &First<'_>) -> Option<usize> {
+    matches!(first, First::Ready).then_some(0)
+}
+
 fn u16_at(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
 }
@@ -116,6 +122,14 @@ mod tests {
         let mut short = good.clone();
         short[20..24].copy_from_slice(&4u32.to_le_bytes());
         assert_eq!(parse(&short, 0), First::Refused(b""));
+    }
+
+    #[test]
+    fn only_a_readys_endpoint_is_kept() {
+        assert_eq!(kept(&First::Ready), Some(0));
+        assert_eq!(kept(&First::Refused(b"why")), None);
+        assert_eq!(kept(&First::Refused(b"")), None);
+        assert_eq!(kept(&First::Unexpected), None);
     }
 
     #[test]
