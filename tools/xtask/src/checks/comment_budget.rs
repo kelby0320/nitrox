@@ -86,7 +86,7 @@ fn budget(files: &[(String, String)]) -> Budget {
     b
 }
 
-fn git(args: &[&str]) -> R<String> {
+pub(super) fn git(args: &[&str]) -> R<String> {
     let out = Command::new("git").args(args).current_dir(crate::repo_root()).output()?;
     if !out.status.success() {
         return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr)).into());
@@ -141,7 +141,7 @@ pub(crate) fn cmd_ratio(args: &[String]) -> R<()> {
 
 /// `text` with its `//` comments taken out, string and character literals left whole, and the lines
 /// that held only comment or nothing dropped: what a comment-only change leaves alone.
-fn code_lines(text: &str) -> Vec<String> {
+pub(super) fn code_lines(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
     let mut i = 0;

@@ -11,6 +11,7 @@ mod irq_scope;
 pub(crate) mod moves;
 mod nightly;
 pub(crate) mod size;
+pub(crate) mod unsafe_inventory;
 
 pub(crate) use abi::*;
 pub(crate) use arch::*;

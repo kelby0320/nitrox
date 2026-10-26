@@ -433,6 +433,7 @@ fn main() -> ExitCode {
         Some("check-comments") => comments::cmd_check_comments(&qargs),
         Some("check-moves") => moves::cmd_check_moves(&qargs),
         Some("check-size") => size::cmd_check_size(&qargs),
+        Some("unsafe-inventory") => unsafe_inventory::cmd_unsafe_inventory(&qargs),
         Some("check-images") => cmd_check_images(),
         // The first *positional* argument: `qargs` has the global flags stripped.
         Some("tune") => cmd_tune(&qargs),
