@@ -10,6 +10,7 @@ mod images;
 mod irq_scope;
 pub(crate) mod moves;
 mod nightly;
+mod recv;
 pub(crate) mod size;
 
 pub(crate) use abi::*;
@@ -18,3 +19,4 @@ pub(crate) use deferrals::*;
 pub(crate) use images::*;
 pub(crate) use irq_scope::*;
 pub(crate) use nightly::*;
+pub(crate) use recv::*;
