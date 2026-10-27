@@ -9,9 +9,11 @@ budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19; C.
 the laptop; C.5 built 2026-10-20 — Part C built; the stick's light confirmed on the laptop
 2026-10-20 — Part C complete; Part D's bash run 2026-10-20 and triaged 2026-10-22, Part H added
 for what it left (the maintainer's call); Part I added 2026-10-26, a safety survey (the
-maintainer's call).** Each later part gets its detail pass when it is next. Nine parts, A–I, in the
-order below, Part I between D and E. Part E is the syscall-surface consolidation, planned
-separately in [`syscall-surface.md`](syscall-surface.md).
+maintainer's call), its thirteen runs done 2026-10-26 and 2026-10-27 and triaged 2026-10-27, and
+Part J added for the kernel layers it plans (the maintainer's call).** Each later part gets its
+detail pass when it is next. Ten parts, A–J, in the order below: Part I between D and E, and Part J
+after I. Part E is the syscall-surface consolidation, planned separately in
+[`syscall-surface.md`](syscall-surface.md).
 
 ## Why
 
@@ -978,13 +980,38 @@ left out: 107,589 lines of code holding 2,795 `unsafe` blocks, 374 `unsafe fn`s,
 `static mut`s, 1,183 raw syscalls and 454 raw-pointer dereferences. Five of 49 crates use libos,
 `init` once beside 55 raw syscalls.
 
+**Triaged 2026-10-27**, the thirteen runs: 354 items, 281 once an item several runs found is one.
+**221 to fix here**: first any process crashing the kernel through the flags an interrupt entry
+leaves (kplat-d1), an AHCI completion under live DMA (drv-d1) and the test heap that hides a
+use-after-free from Miri (kobj-o4), then the other high defects, then the rest. Ten of them repeat
+bash findings Part H held, which move here with them. **120 plan, in eight layers**: the kernel's
+six are Part J; libos (P7) and the wire formats (P8) go into Part E's detail pass. **10 later.**
+[`safety-survey.md`](safety-survey.md) holds each verdict, the layers and the calls.
+
+**libos is every userspace crate's syscall layer** (the maintainer's call, 2026-10-27): the
+"no libos" rule of `session-mgr` and `desktop-session-mgr` is lifted, `eshell` alone stays on
+`libkern`, and `librsproto` and `libstream` move onto libos. The decision log holds its conditions.
+
+## Part J — the kernel's typed layers
+
+**Added 2026-10-27, when Part I was triaged (the maintainer's call)**: the six kernel layers the
+survey marked **plan**, each ending a class Part I's fixes end one site of. The typed kernel object
+reference, its tag and pointer tied and its liveness and the scheduler lock held as types (P1);
+owned frames and a bounded view of their bytes (P2); typed page tables (P3); per-CPU state (P4);
+device memory and I/O, with in-flight IRPs, DMA and MMIO accessors and device teardown (P5); and
+the `unsafe fn`s whose only contract is "ring 0" (P6). [`safety-survey.md`](safety-survey.md)
+names each one's items. They change no syscall, so they are a part of their own; P1 reaches nearly
+every syscall Part E rewrites, so Part E's detail pass settles which of the two comes first.
+
 ## Part E — the syscall surface
 
 As [`syscall-surface.md`](syscall-surface.md) plans it, after its own detail pass. **With it, four
 of the bash's findings** ([`bug-bash.md`](bug-bash.md)): `sys_file_sync`'s name and lookup binding
 it to files (kmem-30), and three in the memory-mapping path that Phase 7's threads and loader reach
 first: two hint-less maps racing for one range (kmem-29), a kernel copy from a page not yet faulted
-in failing (kmem-28), and a refault after a remap (kmem-15).
+in failing (kmem-28), and a refault after a remap (kmem-15). **With it too, Part I's two layers for
+userspace**: libos, the safe syscall layer every crate moves onto (P7), and the wire formats (P8),
+in [`safety-survey.md`](safety-survey.md).
 
 ## Part F — context menus
 
@@ -1006,16 +1033,19 @@ first, as Part E will have moved much of the code they name, then reproduced and
 that fails without it, as Part D's are.
 
 - **Supervisors, sessions and parsers**: one app holding every client slot of the view broker or
-  the storage service (sec-4, sup-6), the stream decoder's unbounded depth and cost (proto-7,
-  proto-8), `service-mgr`'s backoff and bring-up, and the rest of the class.
+  the storage service (sec-4, sup-6), `service-mgr`'s backoff, and the rest of the class.
 - **Test gaps on a security boundary** that Part D's fixes do not write: the crypto comparison and
   padding, `authenticate`, the GPT and partition guards, the USB descriptors, the kernel's codec,
   a handle's rights and a fresh frame's zeroes.
 - **The other test gaps**, off a boundary.
-- **Six kernel, driver and filesystem findings**: kernel address space never reclaimed (kmem-9), a
-  server dying with a fill pending (kobj-10), a spawn reporting failure after its child runs
-  (kobj-11), a second AHCI controller (drv-8), and ext4's lost directory growth and extents over
-  metadata (fs-9, fs-11).
+- **Two ext4 findings**: its lost directory growth and extents over metadata (fs-9, fs-11).
+
+**Ten moved to Part I** on 2026-10-27, with the safety survey's defects that repeat them: kernel
+address space never reclaimed (kmem-9), a server dying with a fill pending (kobj-10), a spawn
+reporting failure after its child runs (kobj-11), a second AHCI controller (drv-8), the stream
+decoder's depth and cost (proto-7, proto-8) and a wrapped column-name length (proto-14), a GPT
+header's overflow (proto-15), a login's terminal left open (sec-12), and a service started twice
+during bring-up (sup-9).
 
 ## Not here
 
@@ -1036,6 +1066,6 @@ several branches at once, which waits on the gates leaving this machine.
   subsystems and every finding in `bug-bash.md` triaged, the ones marked fix fixed; Part E done as
   its plan says; Parts F and G built; Part H's findings fixed, or each one's deferral past Phase 7
   agreed with the maintainer.
-- Part I's survey run on its thirteen subsystems and every item triaged; its defects marked fix
-  fixed, its opportunities marked plan in Part E's plan or a part of their own, and no raw syscall
-  outside `libkern` and `libos`, or each exception agreed with the maintainer.
+- Part I's survey run on its thirteen subsystems and every item triaged; its items marked fix
+  fixed, its layers marked plan in Part E's plan or built in Part J, and no raw syscall outside
+  `libkern` and `libos`, or each exception agreed with the maintainer (`eshell`'s is agreed).
