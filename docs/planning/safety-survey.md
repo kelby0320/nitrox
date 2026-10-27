@@ -2604,3 +2604,435 @@ copied to or from user memory today is padding-free with valid-for-all bit patte
 snippet showed the compiler does move plain stores across it, so kplat-d22 stays a latent
 defect). `elapsed_ns` saturates for a cold AP. `install_msi` addresses (0xFEEx_x000) are never
 refused by `program_msi`, so the MSI-then-INTx fallback leaks no vector today.
+
+### runtime — main at 135055a8, 2026-10-27
+
+Lenses: abi, ownership, soundness, opportunities; returned nothing: none.
+Defects: found 23, refuted by a boot 0, reported 11 (after merging duplicates). Opportunities: 13 (34 raised, merged).
+
+The inventory, `cargo xtask unsafe-inventory` over its paths:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `userspace/libkern` | 1305 | 20 | 12 | 0 | 0 | 16 | 1 | 0 | 0 | 2 | 10 |
+| `userspace/libos` | 477 | 19 | 5 | 0 | 0 | 13 | 0 | 1 | 0 | 0 | 0 |
+| `userspace/libheap` | 236 | 15 | 6 | 3 | 0 | 5 | 0 | 3 | 0 | 0 | 0 |
+| `userspace/libfs` | 526 | 30 | 0 | 0 | 0 | 31 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/liblog` | 86 | 4 | 0 | 0 | 0 | 4 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/libtime` | 143 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/hello` | 239 | 45 | 0 | 0 | 8 | 26 | 0 | 2 | 0 | 2 | 3 |
+| `userspace/heartbeat` | 188 | 10 | 0 | 0 | 4 | 7 | 0 | 0 | 0 | 0 | 0 |
+| `total` | 3200 | 143 | 23 | 3 | 12 | 102 | 1 | 6 | 0 | 4 | 13 |
+
+**Defects**
+
+- [ ] **rt-d1** `userspace/libos/src/exec.rs:133` — `Op` is a public, safe `Future`, but
+  `Op::poll` casts the data pointer of whatever `Waker` polls it to `&Reactor` and writes a
+  72-byte `Registry` through it. Its SAFETY claim, that only `block_on` builds the waker, is not
+  enforced. Scenario: an `Op` that is still pending is polled with `Waker::noop()`, a
+  join/select that wraps the waker, a second executor, or the multi-task executor
+  `docs/architecture/libos.md` plans. `Reactor::register` then reads and writes 72 bytes at
+  that waker's data (null, or another executor's task state). A clone of `block_on`'s waker that
+  escapes the call (`waker_clone` shares the pointer into `block_on`'s stack frame) dangles
+  once `block_on` returns.
+  Demonstrated: host probe tests, removed. A scripted not-ready `Op` polled with a waker over a
+  zeroed `[u64; 9]` overwrote it (`[1000, 0, ..., 1]`). `Waker::noop()` panicked with 'null
+  reference produced' at exec.rs:133 in debug, and read garbage in release (`range end index
+  137424457960672`). Under Miri (`probe_waker_clone_outlives_block_on`, `probe_foreign_waker`):
+  'Undefined Behavior: constructing invalid value of type &exec::Reactor: encountered a dangling
+  reference'. The control, `deferred_op_polls_then_waits_then_completes`, is clean. Fix: give
+  clones their own vtable and test `ptr::eq(cx.waker().vtable(), &VTABLE)` before the cast,
+  else `wake_by_ref` and return `Pending`. With that change both probes pass under Miri and all
+  19 libos tests pass.
+  abi, ownership, soundness, opportunities. Medium.
+
+- [ ] **rt-d2** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
+  is a safe fn that never reads `self` and passes any address to `sys_memory_unmap`. The kernel
+  ignores `len` and the handle and unmaps the whole VMA covering `addr` (table.rs:949-966). The
+  doc on `map`, 'valid while `self` lives', is untrue in both directions. Scenario: safe code
+  calls `mem.unmap(vec.as_mut_ptr(), 1)`, or passes a stale address whose VA libheap's next arena
+  reused. The whole 64 KiB libheap arena, or a file mapping another slice borrows, vanishes under
+  live `Box`/`Vec`. The next access faults, or after a later map reuses the VA it touches
+  another object's memory. Callers today (libsurface screen.rs:37, libdraw text.rs:250,
+  test-harness uiclient.rs:159) pass what `map` returned, so this is latent. One wrong address
+  makes it bite.
+  Demonstrated: probe tests under `#[forbid(unsafe_code)]`, removed. `unmap(<page of a Vec>, 1)`
+  compiles with no `unsafe` and returns `Ok` on the mock. The kernel effect is shown by the code
+  path (objects.rs -> sys.rs:106 -> table.rs:949 `unmap_covering_deferred`), not executed. A
+  boot-probe step would settle it: Box a value, unmap its page, read it. Fix: make `unmap`
+  unsafe, or return an owning `Mapping` (see rt-o3).
+  abi, ownership, soundness, opportunities. Medium.
+
+- [ ] **rt-d3** `userspace/libos/src/objects.rs:167` — `thread_create(&ThreadArgs)` is a safe fn
+  that starts a thread at any `entry` on any `user_sp`. The kernel checks only that both are
+  non-zero user-half addresses (table.rs:538-542; 'that they are mapped is the caller's
+  responsibility'). Scenario: safe code sets `user_sp` to the end of a `Vec`'s buffer or into its
+  own stack frame, or drops the `Vec` afterwards, or sets `entry` to a Rust-ABI fn. The new
+  thread's pushes and spills overwrite live or freed heap, or it returns into garbage. The five
+  callers (test-harness stage.rs:507, 629, harness.rs:159, 362, bootprobe/exits.rs:242) map a
+  dedicated stack they never unmap, held by comment only (stage.rs:485). The same shape applies
+  to `spawn(&SpawnArgs)` and `move_mask`.
+  Demonstrated: probe test, removed. `ThreadArgs` with `user_sp` at the end of a local `[u8;
+  4096]` (and another with `entry=0x1000`, `user_sp` inside a live `Vec`) compiles with no
+  `unsafe` and `thread_create` returns `Ok` on the mock. The kernel side is by reading
+  table.rs:538-542. Fix: `unsafe fn` with a `# Safety` section, or a typed
+  `Thread::start(extern "C" fn(u64) -> !, Stack, arg0)` (see rt-o6).
+  abi (medium), soundness (low), opportunities (low). Medium.
+
+- [ ] **rt-d4** `userspace/liblog/src/lib.rs:103` — `open_source` resolves a SEND endpoint into
+  `Logger`, which is `#[derive(Copy, Clone)]` with no `Drop`, and nothing in the crate ever
+  closes it. `Logger::new` also wraps endpoints the caller still owns (heartbeat main.rs:217),
+  so the type cannot say which handles it owns. Scenario: bootprobe/services.rs:399, heartbeat
+  main.rs:172 and view-broker main.rs:1708 each open a source, log once and drop the `Logger`. The
+  handle stays in the table, and the logging service's per-source channel stays held, until
+  the process exits. Each caller leaks once today. A service that opens a source per request
+  fills the logging service's 26 source slots (MAX_SOURCES = 32-2-2-2, main.rs:54) after 26
+  calls, and the service then refuses every new log source system-wide ('source table full',
+  main.rs:341).
+  Demonstrated: path pointed at. lib.rs:16-19 has no `Drop` and no `SYS_HANDLE_CLOSE` of
+  `handle` (grep); `open_source` closes only the PO (line 118); `grep -rn 'open_source('
+  userspace` finds the 3 callers. Fix: an owning, non-`Copy` `Logger` closing on drop, plus a
+  borrowing constructor for endpoints a supervisor hands over.
+  abi, ownership, soundness. Low.
+
+- [ ] **rt-d5** `userspace/libdraw/src/text.rs:247` — libos `Handle::map` returns a bare pointer
+  with no owner, and three callers leave mappings behind. In `load`, the `?` on
+  `data.try_reserve_exact(size)` returns between `obj.map` (line 244) and `obj.unmap` (line
+  250). Scenario: a font up to MAX_FONT_BYTES (8 MiB) loads while the heap cannot reserve it.
+  `ImpossibleSize` is returned and the mapping, with the font's page-cache pages, is pinned for
+  the process's life. Two siblings leak on the success path: init/src/main.rs:577 maps
+  /system/current-generation once per boot and never unmaps it, and libdraw/src/acquire.rs:52
+  `read_info` maps /dev/framebuffer/info and never unmaps, called twice at compositor start
+  (compositor main.rs:2214 and acquire.rs:89).
+  Demonstrated for init and acquire.rs by reading (no unmap on any path; compare libsurface
+  screen.rs:34-37 and uiclient.rs:158-159, which unmap). Unverified for the text.rs early return:
+  no host test reaches `load`; an OOM-injected boot, or a host test behind a libos seam with a
+  failing allocator, would settle it.
+  ownership (demonstrated), opportunities (unverified). Low.
+
+- [ ] **rt-d6** `userspace/libos/src/exec.rs:141` — `Op::drop` closes an in-flight PO, but for a
+  forwarded lookup the kernel still installs the resolved handle in the caller's table when the
+  server replies. An abandoned lookup leaves a handle nothing holds. libfs `po_wait` and liblog
+  `open_source` do the same whenever `sys_wait` does not return 1. Scenario: a `Handle::lookup`
+  future is dropped before its userspace server answers, through a select or timeout combinator
+  or the planned executor's cancellation. `complete_resolve_reply` allocates into `pl.owner_pid`
+  (table.rs:2196) regardless of whether the PO handle is still open, and `deliver_to_client`
+  (table.rs:822-828) closes it only when the process has no threads. One handle leaks per
+  abandoned lookup, pinning the object. Today `block_on` always drives a lookup to completion.
+  Unverified: needs a boot-probe step that issues `sys_ns_lookup` against a server delaying its
+  reply, closes the PO, lets the reply land, and counts handles. Not booted.
+  ownership, soundness. Low.
+
+- [ ] **rt-d7** `userspace/test-harness/src/inputclient.rs:72` — input-testclient's `po_wait`
+  never closes its PendingOperation; the file imports no close at all. Scenario: each run
+  resolves /dev/input/new, waits and decodes, and the PO stays in the table. It is the only one
+  of the 15 `fn po_wait*` clones that does.
+  Demonstrated: `grep -n 'HANDLE_CLOSE\|syscall1\|fn close' inputclient.rs` finds nothing; all
+  15 bodies dumped with awk, and each of the other 14 closes `po` on both paths.
+  ownership. Low.
+
+- [ ] **rt-d8** `userspace/libos/src/exec.rs:122` — `Op::poll` sets `done` but never reads it, so
+  a re-poll after `Ready` waits on the still-open PO again and returns the same `IoResult`,
+  contrary to the field's comment ('a stray re-poll after Ready is a no-op'). Scenario: a
+  combinator re-polls a completed lookup `Op`. It gets a second `Ready(Ok(IoResult { result:
+  handle }))`, and objects.rs:374-377 turns each `Ready` into an owning `Handle::from_raw`, so
+  one handle gets two owners and is closed twice. `lookup`'s own async body never re-polls, so
+  this is latent.
+  Demonstrated: probe test, removed. `script_next(0, 777, true)`; `Op::submit`; poll twice with
+  `Waker::noop()`. Output: first and second both `Ready(Ok(IoResult { handle: 1000, ..., result:
+  777 }))`, and the assertion that the second poll is `Pending` failed. Fix: return `Pending` or
+  panic when `done`, or take the PO out on `Ready`.
+  abi. Low.
+
+- [ ] **rt-d9** `userspace/libos/src/exec.rs:169` — when no `Op` registered a handle, `block_on`
+  calls `sys::wait(&[], .., 0)` as a 'poll-yield, not a tight spin', but the kernel refuses count
+  0 at once with `InvalidArgument` (table.rs:1764-1766) before any scheduling. Scenario: a
+  hand-written future returns `Pending` without registering anything (it waits on a flag
+  another thread sets). `block_on` re-polls in a loop of rejected zero-length waits and burns a
+  CPU instead of yielding.
+  Demonstrated: path pointed at (exec.rs:167-169 passes an empty slice; kernel check quoted
+  above). Not run on target.
+  abi. Low.
+
+- [ ] **rt-d10** `userspace/libos/src/sys.rs:23` — `sys::wait(handles, results, deadline)` is a safe
+  fn that passes `handles.len()` as the count and `results` with no length. The kernel writes
+  one 24-byte record per signalled handle, so a shorter `results` is overrun. Scenario: a new
+  libos wait (the planned multi-task executor's wait-any, or a two-handle poll) passes
+  `zeroed_results::<1>()` for two signalled handles. The kernel writes 48 bytes into a 24-byte
+  stack array. The current callers (exec.rs:122, 169, 171) all hold the precondition by
+  construction.
+  Unverified on target (no caller does this today). Host probe, removed: two ready `Op`s passed
+  to `sys::wait(&[a.po, b.po], &mut one, 0)` compile with no `unsafe`, and the mock, which
+  bounds-checks, panicked 'index out of bounds: the len is 1 but the index is 1' at sys.rs:187.
+  The target body (sys.rs:27-33) has no such check.
+  ownership. Low.
+
+- [ ] **rt-d11** `userspace/libfs/src/lib.rs:181` — `read_file` and `copy_file` stat one resolve
+  of the path (`file_size`, which closes its handle) and then map a second, independent resolve
+  using that stale size, so the size crosses from one object to another. Scenario: between
+  `file_size` (lines 174 and 69) and the second lookup (181 and 94), another process renames a
+  different file over the path or truncates it. If the new file is larger, `read_file` returns
+  only its first `size` bytes and `copy_file` writes a truncated copy and reports `size` as
+  copied. If it shrank within the same page count the tail reads as zeros; if it lost pages the
+  map fails with `Io(InvalidArgument)`. No memory is overrun, because `sys_memory_map` bounds a
+  mapping by npages (table.rs:891-900).
+  Unverified: needs a boot with a second process racing a rename or truncate against
+  `read_file`; libfs issues raw syscalls, so no host test reaches it. Fix: one lookup with
+  MAP_READ|INSPECT, then stat and map that same handle, as libdraw text.rs:233-244 does.
+  abi. Low.
+
+**Opportunities**
+
+- [ ] **rt-o1** encapsulate: out-parameter syscalls called raw with a caller-chosen buffer or
+  `static mut` (`sys_handle_stat` into `HandleInfo`, `sys_notif_recv`, `sys_ns_enumerate`,
+  `sys_clock_read`, `sys_channel_create`) — 125 sites (`grep -rnE
+  "syscall[0-6]\(\s*(libkern::)?(syscall::)?SYS_(HANDLE_STAT|NOTIF_RECV|NS_ENUMERATE|CLOCK_READ|CHANNEL_CREATE)\b"
+  --include=*.rs userspace | grep -v '^userspace/libkern/' | wc -l`: stat 18, notif 16,
+  enumerate 6, clock 45, channel_create 40; 13 in runtime crates; the opportunities lens
+  counted 127 with its script), plus 38 `static mut` out-params, such as
+  `userspace/libfs/src/lib.rs:58`, `userspace/hello/src/main.rs:87`,
+  `userspace/heartbeat/src/main.rs:100`, `userspace/libos/src/objects.rs:383`. Thin typed
+  wrappers that own the out-param and return it by value: `handle_stat(h) ->
+  Result<HandleInfo, KError>`, `clock_read(clock) -> Result<u64, KError>`,
+  `notif_recv(ch) -> Result<Option<Notification>, KError>`, `ns_enumerate(ns, i) ->
+  Result<Option<NsEntry>, KError>`, `channel_create(depth) -> Result<(u64, u64), KError>`, in
+  libkern (its CLAUDE.md allows thin Result wrappers, and eshell, auth-service and init link
+  libkern without alloc), with typed faces in libos (`Handle::stat()`, a clock module). Checked
+  against libfs `file_size`, hello's stat and clock steps, heartbeat `clock_now`, hello's
+  channel create, and service-mgr/src/main.rs:441-443, which already does this by hand. Closes:
+  an out-buffer sized by the caller's expectation rather than by what the kernel writes (the
+  2026-07-24 stack smash, a 16-byte buffer for the 24-byte `HandleInfo`), stale reads after a
+  failed clock read, and shared `static mut` out-params. Depends on: nothing; write alongside
+  Part E's syscall-surface changes so each is written once. abi, ownership, opportunities.
+  Value high, effort medium.
+
+- [ ] **rt-o2** encapsulate: a PendingOperation waited on by hand with a raw `sys_wait` into a
+  hand-sized `[u8; 24*N]`, the `IoResult` decoded at byte offsets 0/8/16, and the PO closed by
+  hand — 99 sites in 46 files (`grep -rnE "syscall[0-6]\(\s*(libkern::)?(syscall::)?SYS_WAIT\b"
+  --include=*.rs userspace | grep -v '^userspace/libkern/' | wc -l`; 8 in runtime; the other
+  script counted 111 uses in 50 files), including 15 copies of `fn po_wait` (`grep -rn 'fn
+  po_wait' --include=*.rs userspace`), 41 hand-sized one-record buffers, 25 byte-offset status
+  decodes and 25 sites with count != 1, such as `userspace/libfs/src/lib.rs:384`,
+  `userspace/liblog/src/lib.rs:113`, `userspace/heartbeat/src/main.rs:154`,
+  `userspace/libos/src/sys.rs:60`. In libkern, for the libkern-only crates (eshell,
+  librsproto, auth-service): `wait(handles: &[u64], results: &mut [IoResult], deadline) ->
+  Result<&[IoResult], KError>`, which refuses `results.len() < handles.len()`; `wait_one(h,
+  deadline) -> Result<IoResult, KError>`; and `po_complete(po) -> Result<u64, KError>`, which
+  waits, closes and maps status. In libos, make `Op` constructible from every PO-returning
+  syscall (today `Op::from_po` is `pub(crate)`, exec.rs:111) with `ns_lookup`, `file_create`,
+  `file_truncate` and `file_rename` returning `Op`, driven by `block_on`, and make `sys::wait`
+  public and checked. Checked against libfs `po_wait` (four resolves), liblog `open_source`,
+  heartbeat `recv_log_handoff` and nxterm `wait_any` (n handles). Closes: a result buffer
+  sized by expectation (the desktop-session-mgr 256-vs-4096 class applied to `sys_wait`'s
+  count*24 write), `IoResult` read at hand-typed offsets, a PO leaked on an early return
+  (rt-d7), the rt-d10 overrun, and the drift of 15 copies of a helper `libos.md` says was
+  collapsed. Depends on: nothing for the libkern wrapper; for libos, crates that link only
+  libkern taking libos as a dependency (it is `no_std`, no alloc) or the maintainer extending
+  libkern's one-guard exception as for `Received`. abi, ownership, soundness, opportunities.
+  Value high, effort medium.
+
+- [ ] **rt-o3** encapsulate: a mapping kept as a bare address, with a slice built by
+  `from_raw_parts`/`copy_nonoverlapping` and an unmap the caller must remember, with some sites
+  never unmapping — 87 sites (`grep -rnE "syscall[0-6]\(\s*(libkern::)?(syscall::)?SYS_MEMORY_MAP\b"
+  --include=*.rs userspace | grep -v '^userspace/libkern/'` = 81 raw, plus 6 libos
+  `Handle::map` callers; 95 raw maps against 78 unmaps by the other grep; libfs alone has 10
+  mapping lifetimes in 10 of its 30 unsafe blocks), such as `userspace/libos/src/objects.rs:35`,
+  `userspace/libfs/src/lib.rs:183`, `userspace/libsurface/src/screen.rs:31`,
+  `userspace/init/src/main.rs:577`. `Handle<Memory, M>::map(&self, len) -> Result<Mapping<'_,
+  M>>`: `Mapping` unmaps its own base on `Drop`, lends `bytes(&self) -> &[u8]` tied to its
+  lifetime (`bytes_mut`, `copy_in` where `M: CanMapWrite`; `copy_out`, `copy_from_mapping`),
+  offers `into_raw()` for a mapping kept for the process's life (the framebuffer aperture,
+  acquire.rs:99) and `Stack`'s base for rt-o6. The free-standing safe `unmap(addr, len)` is
+  removed. Home: libos (objects.rs); `FileObject` handles need a `File` marker or `Memory`
+  typing. Checked against libfs `read_file`, `write_file` (drop before `sys_file_sync`, which
+  needs the unmap-before-flush order at :233-243) and `map_copy`; libsurface `screen::read`;
+  libdraw `text::load`; coreutils `whoami`. Closes: rt-d2, rt-d5, slices outliving their unmap,
+  a `&[u8]` built over memory another process writes (libsurface screen.rs:33). Depends on:
+  nothing for the type; libfs adopting it needs rt-o4. abi, ownership, soundness,
+  opportunities. Value high, effort medium.
+
+- [ ] **rt-o4** encapsulate: libfs holds files, POs and mappings as raw `u64` handles closed by
+  hand on every path, although layering (libfs above librsproto above libos) allows libos —
+  30 sites (30 `unsafe` blocks: 13 `SYS_HANDLE_CLOSE`, 4 `SYS_MEMORY_MAP`, 5 `SYS_MEMORY_UNMAP`, 2
+  `SYS_FILE_SYNC`, 1 each of stat, lookup, create, truncate, rename, enumerate and wait; `grep -c
+  'unsafe {' userspace/libfs/src/lib.rs`), plus `lookup_wait` handing a raw `u64` to 16 external
+  callers (`grep -rn 'libfs::lookup_wait' --include=*.rs userspace`), and liblog's one close,
+  such as `userspace/libfs/src/lib.rs:60`, `userspace/libfs/src/lib.rs:99`,
+  `userspace/libfs/src/lib.rs:183`, `userspace/libfs/src/lib.rs:261`. libfs and liblog over
+  libos: `lookup` returns an owning `Handle<File|Memory, M>` closed on `Drop` (`lookup_wait` ->
+  `Result<Handle<..>, i32>`); libos gains a `File` marker with `stat()` and `sync()`, and
+  `Namespace::create_file`, `truncate`, `rename`; liblog's `Logger` owns its handle. Checked
+  against `file_size`, `copy_file` (two handles closed on three paths), `read_file` (one lookup,
+  stat that handle, map, `to_vec`), `write_file` and whoami's caller. Home: libos (file ops)
+  with libfs rewritten over it. Closes: a handle leaked or closed twice on an early return (14
+  hand-placed closes in runtime, 356 userspace-wide), rt-d4, and by construction the rt-d11
+  stat-one-map-another race; nearly all of libfs's 30 unsafe blocks go, the largest share of
+  the subsystem's unsafe after hello. Depends on: rt-o1, rt-o2, rt-o3. abi, ownership,
+  soundness, opportunities. Value high, effort medium.
+
+- [ ] **rt-o5** encapsulate: an IPC message built and read as raw `[u8; 4096]`, `payload_len`
+  stamped and parsed at bytes 4..8 by hand with a local `const PAYLOAD_OFF: usize = 24` — 67
+  sites (`grep -rnE "\[4\.\.8\]\.copy_from_slice\(&\(" --include=*.rs userspace | wc -l`; 4 in
+  fs-server-ext4 may not be IPC; 19 local `PAYLOAD_OFF` copies; about 93 `SYS_CHANNEL_SEND` lines
+  in 35 files; 3 in runtime), such as `userspace/liblog/src/lib.rs:84`,
+  `userspace/heartbeat/src/main.rs:132`, `userspace/libkern/src/control.rs:187`,
+  `userspace/hello/src/main.rs:279`. Reuse libkern's `IpcMsg` (or an align(8) twin) as the only
+  send and receive buffer: `payload_mut(&mut self) -> &mut [u8; IPC_PAYLOAD_SIZE]`,
+  `set_payload_len(n) -> Result<(), TooLarge>`, `payload(&self) -> &[u8]` bounded by
+  `min(payload_len, IPC_PAYLOAD_SIZE)`, `sender_pid()`, with `channel_send(ch, &IpcMsg,
+  &[u64], mode) -> Result<i64, KError>` beside `channel_recv`; libos's `Handle<Channel, M:
+  CanSend>::send` sits above it (libos has no Channel object today). Home: libkern
+  abi.rs/channel.rs. Checked against liblog `emit`, heartbeat `emit_beat_typed`, hello's
+  self-send, `control::recv`. Closes: a payload bound that disagrees with the kernel's. liblog
+  and heartbeat encode into `buf[24..]` (4072 bytes) but `StoredMsg::seal` accepts 4008
+  (`IPC_PAYLOAD_SIZE`, ipc_channel.rs:56-58), so a 4009-4072 byte record is encoded and then
+  refused with `InvalidArgument`, the send result ignored (a probe encoding 4040 bytes made a
+  4064-byte record). Today the outcome matches liblog's documented 'dropped' behaviour only by
+  luck. Also closes header fields at hand-typed offsets. Depends on: nothing. abi,
+  soundness, opportunities. Value medium, effort small to medium.
+
+- [ ] **rt-o6** narrow/encapsulate: `spawn(&SpawnArgs)` and `thread_create(&ThreadArgs)` are safe
+  wrappers over raw ABI blocks; a thread's stack and entry, and the handles `move_mask` moves,
+  are held only by comments at the callers — 27 sites (22 `SpawnArgs {` literals outside
+  libkern/libos, `grep -rn 'SpawnArgs {' --include=*.rs userspace`; 5 `thread_create` callers, all
+  in test-harness; 21 non-zero `move_mask`), such as `userspace/libos/src/objects.rs:167`,
+  `userspace/libos/src/objects.rs:155`, `userspace/test-harness/src/stage.rs:446`,
+  `userspace/service-mgr/src/main.rs:417`. First `unsafe fn thread_create` with a `# Safety`
+  contract (`entry` is a never-returning `extern "C" fn`, `user_sp` tops a stack nothing else
+  uses for the thread's life); then `Thread::start(entry: extern "C" fn(u64) -> !, stack:
+  Stack, arg0)` with `Stack::map(bytes)` an owned mapping handed to the thread (needs rt-o3);
+  and `Spawn::new(&image).namespace(..).grant_move(Handle<T, M>, rights).grant_copy(&Handle,
+  rights).arg0(x).spawn() -> Result<Handle<Process, Only>, (Error, Grants)>`: moves consume the
+  `Handle` on success and come back on failure (the kernel is atomic-or-fail,
+  process-spawn-args.md:77 and closes moved handles in the parent on success, table.rs:497-501),
+  copies borrow. Checked against stage.rs `run_grants` (one moved channel), service-mgr
+  `spawn_with_control` (moves `child_end`, closes by hand on failure, main.rs:425-431), init's
+  spawns, stage.rs:486 and bootprobe/exits.rs:225. Home: libos objects.rs. Closes: rt-d3, and a
+  moved handle closed by its old owner after a successful spawn or leaked after a failed one.
+  Depends on: nothing for the `unsafe fn` and `Spawn` builder; rt-o3 for `Stack`. abi,
+  ownership, opportunities. Value medium, effort medium.
+
+- [ ] **rt-o7** encapsulate: bootstrap handles arrive at `_start` as bare `u64`s and travel as
+  `root_ns: u64`; each consumer re-wraps with `unsafe Handle::borrow` or declares its own `unsafe
+  fn f(root_ns: u64)` — 24 sites (9 `Handle::<..>::borrow(` in 8 files and 15 `unsafe fn` with a
+  raw namespace parameter, regex `unsafe fn \w+(<[^>]*>)?\([^)]*\b(root_ns|ns|namespace)\s*:\s*u64`;
+  52 `extern "C" fn _start(` and 52 `#[panic_handler]`), such as
+  `userspace/heartbeat/src/main.rs:213`, `userspace/libos/src/handle.rs:148`,
+  `userspace/libsurface/src/screen.rs:22`, `userspace/libdraw/src/text.rs:219`. A libos entry
+  shim (the thin-entry seam `libos.md` records) turns rdi/rsi/rdx/rcx into `Startup { notif:
+  Handle<Notify, Only>, root: Handle<Namespace, NsReadOnly>, handle0: RawHandle, arg0: u64 }`
+  held for the process's life, with `&'static Handle<Namespace, NsReadOnly>` passed down. Home:
+  libos. Checked against heartbeat `_start`, libdraw `text::load` (takes `&Handle<Namespace,
+  impl CanLookup>`, no longer unsafe), libsurface `screen::read`. Closes: a borrow that outlives
+  its owner and the per-crate unsafe raw-namespace contracts. Depends on: the entry/std-port
+  seam decision (`libos.md`). opportunities. Value medium, effort large.
+
+- [ ] **rt-o8** narrow: `Handle::borrow(raw, rights)` yields a full `Handle` with no lifetime, on
+  which safe `without_transfer`, `without_duplicate`, `into_read_only` and `into_raw` act on a
+  handle the borrow does not own, while `from_raw`, `borrow` and `Namespace::lookup` are `unsafe`
+  on a type/mode claim that no memory safety rests on (a wrong `T` or `M` only yields `Err`,
+  because the kernel type- and rights-checks every operation) — 17 sites outside libos (`grep -rnE
+  "\.lookup::<|Handle::<[^>]*>::borrow\(" --include=*.rs userspace | grep -v libos/`: 8 lookup
+  and 9 borrow; the other grep `>::borrow(RawHandle` found 11 borrows), such as
+  `userspace/libsurface/src/ipc.rs:111`, `userspace/init/src/main.rs:567`,
+  `userspace/libdraw/src/acquire.rs:47`, `userspace/test-harness/src/harness.rs:563`. A
+  `HandleRef<'a, T, M>`: `Copy`, no `Drop`, no `retype`, `without_*`, `into_read_only` or
+  `into_raw`; `Handle::as_ref(&self)`, `unsafe fn HandleRef::from_raw(RawHandle)` for bootstrap
+  words, `lookup`/`enumerate`/`bind` written once for both; make `lookup` and `from_raw` safe
+  (at most a debug type check). Home: libos handle.rs/objects.rs. Checked against the lookup
+  sites (ipc.rs:111, init:567), the bind site (harness.rs:563), `map`, `read`/`write`, `recv`
+  and `enumerate`. Closes: attenuating an owner's capability in place through a borrow
+  (forbidden only in `borrow`'s doc), `into_raw` on a borrow reaching a spawn's `move_mask`, a
+  borrow outliving its owner, and `unsafe` blocks that hold no memory obligation and dilute
+  those that do. Depends on: nothing. ownership, soundness. Value medium, effort small.
+
+- [ ] **rt-o9** remove: local re-implementations of `kprint` and `exit` over raw
+  `SYS_DEBUG_KPRINT` / `SYS_PROCESS_EXIT` although `libkern::debug::{kprint, exit}` exist (`exit` is
+  `-> !` via noreturn asm) — 24 sites (`grep -rnE
+  "syscall[0-6]\(\s*(libkern::)?(syscall::)?SYS_DEBUG_KPRINT\b" --include=*.rs userspace | grep -v
+  '^userspace/libkern/'` = 10, the same for `SYS_PROCESS_EXIT` = 15, heartbeat in both), such
+  as `userspace/heartbeat/src/main.rs:71`, `userspace/heartbeat/src/main.rs:92`,
+  `userspace/session-mgr/src/main.rs:36`, `userspace/desktop-shell/src/main.rs:118`. Delete the
+  local fns and use `libkern::{kprint, exit}`; heartbeat's `kprint_u32` becomes
+  `libkern::kprint_u64` or `debug::Line`. Home: libkern::debug (already there). Closes: nothing
+  new; removes 24 unsafe blocks and the spin-after-exit loops that paper over a non-diverging
+  `syscall1`. Depends on: nothing. abi. Value low, effort small.
+
+- [ ] **rt-o10** remove: `static mut` buffers in hello and heartbeat used as syscall out-params and
+  receive buffers, with the `unsafe` `channel_recv_raw` used where the safe `channel_recv` with
+  a stack buffer would do — 19 sites (`grep -rnw "static mut" userspace/hello/src
+  userspace/heartbeat/src` = 12, hello 8 and heartbeat 4; `grep -rn "channel_recv_raw("` = 5, hello
+  :261, :275, :302, :312 and heartbeat :161; heartbeat's local kprint/exit are rt-o9; 299
+  `static mut` in 38 files and 53 `channel_recv_raw` against 18 `channel_recv` userspace-wide),
+  such as `userspace/hello/src/main.rs:33`, `userspace/hello/src/main.rs:275`,
+  `userspace/heartbeat/src/main.rs:66`, `userspace/heartbeat/src/main.rs:161`. Stack locals
+  (the default user stack is 8 MiB, abi.rs:26; heartbeat already keeps 4 KiB send buffers
+  there) passed as `&raw mut` to the remaining raw syscalls, and `libkern::channel_recv(ch,
+  &mut [0; IPC_MSG_SIZE])` for receives. hello's raw syscalls stay, since exercising them is its
+  job. Home: hello and heartbeat (no new code). Checked against heartbeat `recv_log_handoff`, hello's
+  four receives and its `STAT_BUF`/`CLOCK_BUF`. Closes: a data race on a shared static the day
+  either program grows a second thread (`thread_create` is one call away). Depends on: rt-o1
+  for the CLOCK/STAT statics to lose their remaining `unsafe` and not just the `static`.
+  soundness, opportunities. Value low, effort small.
+
+- [ ] **rt-o11** narrow: 6 of libos's 13 `cfg(not(test))` seam functions in `sys.rs` are safe but
+  take an address as `u64` or rely on an unchecked length: `wait` (`results.len() >=
+  handles.len()` held by comment), `memory_unmap(addr)`, `ns_lookup(path, len)`, `ns_bind(path,
+  len)`, `ns_enumerate(out)`, `notif_recv(out)` — 6 sites (read of sys.rs, not a grep; the
+  module is private and every caller is correct today), such as
+  `userspace/libos/src/sys.rs:60`, `userspace/libos/src/sys.rs:106`,
+  `userspace/libos/src/sys.rs:120`, `userspace/libos/src/sys.rs:127`. Typed signatures:
+  `ns_lookup(ns, path: &[u8], rights)`, `ns_bind(ns, path: &[u8], res)`, `ns_enumerate(ns, i,
+  out: &mut NsEntry)`, `notif_recv(q, out: &mut Notification)`, `wait` taking `min(handles.len(),
+  results.len())` (or `&mut [IoResult; MAX_WAIT]`), and `memory_unmap` as `unsafe fn` or
+  reached only from `Mapping::drop`. The mock takes the same types and records lengths, so host
+  tests exercise what the real call is handed. Home: libos sys.rs. Closes: the rt-d10 overrun
+  the mock hides, and the shape of the rt-d2 defect. Depends on: rt-o3 for `memory_unmap`.
+  abi, ownership, soundness, opportunities. Value low, effort small.
+
+- [ ] **rt-o12** narrow: libheap's engine turns `usize` addresses back into pointers with `as *mut`,
+  so pointers it hands out carry only exposed provenance and Miri runs it only in permissive
+  mode — 5 sites (`grep -nE "\) as \*(mut|const) [A-Za-z]|[a-z_]+ as \*mut u8"
+  userspace/libheap/src/lib.rs`: lines 225, 228, 271, 278, 288; :345 is the kernel's address
+  and inherent), such as `userspace/libheap/src/lib.rs:225`, `userspace/libheap/src/lib.rs:271`,
+  `userspace/libheap/src/lib.rs:288`. Keep the arena base as `*mut u8` and derive slot and
+  header pointers with `base.with_addr(aligned)` / `ptr.map_addr(..)` (stable since 1.84); the
+  `ArenaSource`'s integer becomes a pointer once, at map. Home: libheap. Closes: provenance-
+  dependent UB the host tests cannot see; today Miri with `-Zmiri-strict-provenance` stops at
+  lib.rs:225 on `many_allocations_grow_arenas_without_overlap`. Depends on: nothing.
+  soundness, opportunities. Value low, effort small.
+
+- [ ] **rt-o13** remove: `DeviceRecord::read` and `as_bytes` reinterpret bytes as the struct with
+  `unsafe`, while the same file's `IoSnapshot::get` and abi.rs's `FramebufferInfo::from_bytes`
+  already decode field by field in safe code — 2 sites (`grep -n 'unsafe'
+  userspace/libkern/src/device.rs`: :197 `read_unaligned`, :204 `from_raw_parts`), such as
+  `userspace/libkern/src/device.rs:197`, `userspace/libkern/src/device.rs:204`,
+  `userspace/libkern/src/device.rs:437`. Field-wise little-endian decode in `read`, and a
+  `to_le_bytes() -> [u8; 144]` encoder for device-mgr's Arrived body (device-mgr/src/main.rs:567).
+  Home: libkern device.rs. Closes: a reinterpretation sound only while the struct has no
+  padding, which only offset asserts hold today. Depends on: nothing. opportunities. Value
+  low, effort small.
+
+What held up: libkern's `syscall6` asm (no `nomem`/`readonly`, rcx/r11 clobbered, matching the
+kernel entry stub, which preserves rdi/rsi/rdx/r8/r9/r10) and `exit`'s `noreturn` (the kernel's
+`sys_process_exit` is `-> !`). Every `size_of`/`offset_of` assert in libkern against the kernel's
+(SpawnArgs 104, ThreadArgs 64, IpcMsg 4096, IoResult 24, IoOp 40, HandleInfo 24, NsEntry 272,
+Notification 64, RegisterValues 144, DeviceRecord 144, and the rest). `channel_recv_raw` and
+`Received`: exact buffer types, count clamped, `take`/`take_all` zero what they hand out, `Drop`
+closes each remaining handle once, and an error holds nothing (the kernel rolls back at
+table.rs:2808-2829); Miri clean. `DeviceRecord::read`/`as_bytes` and the `device.rs` readers
+(checked arithmetic, length-checked, `name_len` clamped); Miri clean. `mem*` and `scrub`.
+libheap: slot alignment, large-header placement for every power-of-two align, no allocation on
+the grow path, unmap before close, a `Guard` that drops on every early return, OOM returns null;
+Miri clean under permissive provenance on three tests. libfs: every handle and mapping released on
+every path (13 close sites traced), and a stale size cannot overrun because the kernel bounds a
+file mapping by npages (table.rs:891-900) and a truncated page's frame stays for mappings that
+faulted it in. Handle generations turn a stale or double close into `InvalidHandle`. Spawn is
+atomic-or-fail. 14 of 15 `po_wait` clones close their PO; 16 `lookup_wait` callers sampled
+close theirs. `enter_user` gives `_start` an RSP that is 8 mod 16, matching the SysV alignment hard-float
+spills need; heartbeat's `_start` matches the kernel's boot handle order. hello and heartbeat
+`static mut` are single-threaded and touched only through `&raw`. liblog's 4072-byte window is
+bounded by the kernel's `seal`, so the documented drop holds. The kernel's `sys_ns_lookup` copies
+the path synchronously. libtime has no unsafe and bounds every field before arithmetic. The
+`Waker` fix in rt-d1 was applied as a control and passed all 19 libos tests and both Miri
+probes.
