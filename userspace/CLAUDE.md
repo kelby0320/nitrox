@@ -116,7 +116,7 @@ There is **no `librt` crate** — the Go-style fiber scheduler and a standalone 
 
 `libline` (the line discipline: what a byte does to a line being typed, and what to write so the screen keeps up) is a fourth: `alloc` only, depending on nothing. `tty-server` drives it in canonical mode and `nxsh` reads raw and drives it to edit its own prompt. It was `tty-server`'s library half until the shell called more of it than the server did (pre-Phase-7 Part C.2), which is the rule above applied again. `eshell` keeps its own copy: it has no `alloc`.
 
-Application code typically uses `libos` directly for async work (or its `block_on` for sync ergonomics). Reaching down to `libkern` should be rare — that's the raw syscall surface, used by early services and runtime infrastructure, not by ordinary application code.
+**`libos` is every userspace crate's syscall layer** (the decision log, 2026-10-27): code reaches the kernel through it, or through a library built on it, and a raw `libkern` syscall outside `libkern` and `libos` is an exception the maintainer agrees to. `eshell`'s is the one agreed: the recovery shell stays on `libkern` by choice. libos keeps what makes it safe for supervisors and PID 1: `no_std` with an alloc-free core, `libkern` its only dependency, and nothing to start up. Most crates still make raw syscalls today; pre-Phase-7 Part I and Part E move them.
 
 ## Async-first
 

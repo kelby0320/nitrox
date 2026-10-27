@@ -12,10 +12,9 @@ edition = "2024"
 # which is where the two columns genuinely differ. What is here is everything after the
 # credentials are in hand and everything before the leader has exited.
 #
-# **`libkern` + `librsproto` + `libstream`, and no `libos`**, because `session-mgr` links
-# this and that is `session-mgr`'s rule (`userspace/session-mgr/CLAUDE.md`). Satisfiable
-# because `libstream` and `librsproto` depend only on `libkern`. No `libheap` either: an
-# allocator is the *binary's* to register, and this crate only uses `alloc`.
+# **`libkern` + `librsproto` + `libstream`**, kept minimal because `session-mgr` links this;
+# `libos` is allowed, being every userspace crate's syscall layer (decision log, 2026-10-27).
+# No `libheap`: an allocator is the *binary's* to register, and this crate only uses `alloc`.
 [dependencies]
 libkern = { path = "../libkern" }
 librsproto = { path = "../librsproto" }

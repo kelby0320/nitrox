@@ -55,10 +55,11 @@ is the 2026-07-31 `logging-service` bug, found from a hung shell three subsystem
   allocation-free encoding path in `libstream` — would have cost more than it saved.
   `#![no_std]`/`#![no_main]` stay: `std` is not ported, and there is no runtime to hand a
   `main`.
-- **`libkern` + `librsproto` + `libstream` + `libheap` + `libsession`.** Still no `libos`
-  unless a real need appears — and `libsession` was built to that rule for this reason, since
-  a dependency's dependencies are yours. It remains a supervisor whose death is a system fault, so the *spirit* of
-  the rule — keep it minimal — still applies to everything else.
+- **`libkern` + `librsproto` + `libstream` + `libheap` + `libsession`, and `libos`.** libos
+  is every userspace crate's syscall layer (decision log, 2026-10-27), and the old "no `libos`"
+  rule is lifted: it is `no_std` with an alloc-free core, `libkern` is its only dependency, and
+  nothing in it starts up, so it adds no way for this supervisor to fail. session-mgr is still
+  a supervisor whose death is a system fault, so everything else stays minimal.
 - **No `panic!()` / `unwrap()`** in normal operation — degrade + log.
 - **Capability least-authority.** session-mgr holds `BIND_NAMESPACE` (to construct
   session namespaces) and no more. It spawns the user shell with **empty syscaps** and

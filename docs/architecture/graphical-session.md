@@ -306,7 +306,9 @@ Steps 2–4 are the same logic against different arguments, which is what
 [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 7 factors into a shared crate.
 **The split follows Linux's PAM precedent** — shared library, separate supervisors — and it has a
 hard constraint attached: the shared core must honour `session-mgr`'s dependency rule
-(`libkern` + `librsproto` + `libstream` + `libheap`, no `libos`), because `session-mgr` links it.
+(`libkern` + `librsproto` + `libstream` + `libheap`, kept minimal), because `session-mgr` links it.
+That rule excluded `libos` until 2026-10-27, when libos became every userspace crate's syscall
+layer (the decision log).
 The greeter — the part that draws — stays in each supervisor, which is exactly where the two
 diverge anyway.
 
