@@ -1,7 +1,9 @@
 # The safety survey: defects, opportunities and their triage
 
-**Status: planned 2026-10-26 (the maintainer's call); no subsystem surveyed yet.** Part I of
-[`pre-phase-7.md`](pre-phase-7.md) fills it: each `/safety-survey` run, a section a subsystem.
+**Status: planned 2026-10-26 (the maintainer's call); its thirteen subsystems surveyed
+2026-10-26 and 2026-10-27, and triaged 2026-10-27 with the maintainer.** Part I of
+[`pre-phase-7.md`](pre-phase-7.md) filled it, a `/safety-survey` run a section, and fixes what is
+marked fix.
 
 ## What it looks for
 
@@ -35,6 +37,50 @@ its own), **later** (past Phase 7, with the maintainer's agreement), or **no** (
 it, so it takes no `TODO(tag)` and no `deferred-decisions.md` entry. A defect is reproduced before
 it is fixed, and its box is ticked with the commit that fixed it and the test that fails without
 it; an opportunity's, with the commit that finished it.
+
+## The triage
+
+Triaged 2026-10-27 with the maintainer, on a page that started each item at a suggested verdict:
+the maintainer kept every suggestion and settled three calls. 354 ids, 281 once an item several
+runs found is one.
+
+- **221 fix**, in Part I. First kplat-d1 (any process crashes the kernel), drv-d1 (an AHCI
+  completion under live DMA) and kobj-o4 (the test heap that hides a use-after-free from Miri);
+  then the other high defects, kobj-d1, kobj-d2, kmem-d1, kmem-d2, kplat-d2, fs-d1, sh-d1 and
+  sh-d2; then the rest. Ten are defects the bash found and Part H held, which move here with them:
+  kmem-9, kobj-10, kobj-11, drv-8, proto-7, proto-8, proto-14, proto-15, sec-12 and sup-9.
+- **120 plan**, in eight layers, each ending a class rather than an instance:
+
+  | | Layer | Where |
+  |---|---|---|
+  | P1 | The typed kernel object layer: tag and pointer tied, liveness and the scheduler lock as types | Part J |
+  | P2 | Frames: an owned frame, and a bounded view of its bytes | Part J |
+  | P3 | Page tables: typed roots, atomic slots, one walk | Part J |
+  | P4 | Per-CPU state: an index that cannot outlive the code that pins it | Part J |
+  | P5 | Device memory and I/O: in-flight IRPs, DMA and MMIO accessors, device teardown | Part J |
+  | P6 | Unsafe that needs none: functions whose only contract is "ring 0" | Part J |
+  | P7 | libos, userspace's safe layer: owning handles, message buffers, waits, mappings | Part E |
+  | P8 | The wire formats: one bounded reader, and the kernel's copies of them checked | Part E |
+
+- **10 later**, past Phase 7: nine small changes with no defect behind them, and sched-d15, a CPU
+  whose x2APIC id is over 255.
+- kmem-d12 and kmem-d14 are the bash's kmem-15 and kmem-28, and go with them into Part E. kobj-d12
+  is two defects: its `try_new_pair` half is fixed as sched-d12, its `Drop` half planned as
+  sched-d11.
+
+The calls:
+
+- **libos is every userspace crate's syscall layer**, and the "no libos" rule of `session-mgr` and
+  `desktop-session-mgr` is lifted: the decision log, 2026-10-27, holds its conditions.
+- **P1 to P6 are a part of their own**, Part J, since they change no syscall.
+- **The VMA tree stays.** kmem-o7's second step, replacing the tree with a sorted vector, is later:
+  its insert cost grows with the VMA count, and a balanced tree is the maintainer's preference when
+  the std port shows how many mappings a process makes. Its first step, deleting the augmentation
+  nothing reads, is in P3. What to answer then is `find_free_range`, which scans every VMA while
+  libheap maps one per 64 KiB arena.
+
+Two sections count their opportunities differently from their lists: kernel-objects says 14 and
+lists 13, the test harness 16 and 17. Each is kept as its report gave it.
 
 ## Items
 
@@ -80,7 +126,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `concurrent_torn_read_torture` cannot see it either, because the slab sits over a leaked host
   `Vec` (see kobj-o4). Fix shape: park the `ClosedObject` in the `DeferredClose` entry and release
   it in `drain_expired` once the grace period has passed (see kobj-d5 for the barrier that fix
-  needs). abi/ownership/soundness/concurrency/opportunities reviewers all found it. High.
+  needs). abi/ownership/soundness/concurrency/opportunities reviewers all found it. High. **Fix.**
 
 - [ ] **kobj-d2** `kernel/src/syscall/table.rs:1971` — A handle move is not atomic, so two
   concurrent moves copy a handle that lacks `DUPLICATE`. `sys_channel_send` looks each handle up
@@ -97,7 +143,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   syscall holds a lock or an in-transit mark between lookup and close, and `dispatch` runs
   unserialised on every CPU. A two-thread `-smp 2` boot-probe that sends one `TRANSFER`-only
   handle on two channels in a loop, counting receivers that get it, would settle the timing. See
-  kobj-o5. abi/ownership. High.
+  kobj-o5. abi/ownership. High. **Fix.**
 
 - [ ] **kobj-d3** `kernel/src/sched/ipc.rs:481` — When a userspace server dies, outstanding
   forwarded page-cache fills (`UserspaceServerReg.pending_fill`) are never completed.
@@ -117,6 +163,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   signalled=false`, then `reg destroys=0 file destroys=0 po destroys=1` after every outside
   reference was dropped. The probes were removed. Fix shape: drain `pending_fill` in both
   teardown paths, completing each PO `PeerClosed`. abi/ownership/soundness/concurrency. Medium.
+  **Fix**, with the bash's kobj-10, moved here from Part H.
 
 - [ ] **kobj-d4** `kernel/src/syscall/table.rs:491` — `sys_process_spawn` commits (the child is
   running) and then returns `Err` if the parent's Process-handle `allocate` fails, before the move
@@ -128,7 +175,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   with `move_mask` set on a `TRANSFER`-only handle. Unverified by a boot. Demonstrated by reading
   the path, which is deterministic with no race (`:484-499`). A host test needs a current-thread
   harness that `syscall/table/tests.rs` lacks, or a boot-probe that fills the table and spawns
-  with a move. ownership. Medium.
+  with a move. ownership. Medium. **Fix**, with the bash's kobj-11, moved here from Part H.
 
 - [ ] **kobj-d5** `kernel/src/handle/grace.rs:48` — `GraceTracker::enter_read` announces the
   reader with a Release store followed only by an Acquire fence. On x86-TSO nothing orders that
@@ -139,7 +186,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   would rely on this tracker and would still let a reader dereference a freed object. It needs a
   SeqCst fence (or a locked op) after the store. Unverified. A loom or herd7 model of `enter_read`
   against close plus `drain_expired` would settle it. The writer side already gets a full barrier
-  from the rank-3 spinlock. ownership. Medium.
+  from the rank-3 spinlock. ownership. Medium. **Fix.**
 
 - [ ] **kobj-d6** `kernel/src/mm/user_access.rs:177` — `copy_from_user<T: Copy>` and `copy_to_user<T:
   Copy>` (`:205`) accept any `Copy` type. A `T` with invalid bit patterns (`bool`, an enum, `char`,
@@ -153,7 +200,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   cargo +nightly-2026-07-20 miri test --lib --target x86_64-unknown-linux-gnu
   probe_copy_from_user` gave "constructing invalid value ... encountered 0x00000007, but expected a
   valid enum tag" at `user_access.rs:199`. A second probe with `bool` on byte 2 failed the same
-  way. The probes were removed. See kobj-o6. soundness/opportunities. Medium.
+  way. The probes were removed. See kobj-o6. soundness/opportunities. Medium. **Fix.**
 
 - [ ] **kobj-d7** `kernel/src/syscall/table.rs:1202` — `sys_ns_bind`'s test for an existing
   registration (`us_forward_existing_reg`) and its install of the back-pointer (`us_server_attach`,
@@ -168,7 +215,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   probe in `sched/ipc.rs` that ran the exact call sequence of two interleaved binds, two forwarded
   lookups and a reply: it printed `reply routed to R2` and "request 1's answer completes the lookup
   of client 200 for \"public\"". It was removed. Fix shape: one SCHED hold for check and attach.
-  ownership/concurrency. Medium.
+  ownership/concurrency. Medium. **Fix.**
 
 - [ ] **kobj-d8** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` and its private twin `io/mod.rs:160` are safe functions that wrap
@@ -181,6 +228,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   entropy_object_destroys=1`, and `adopt(KBox::try_new([1u64, 0xDEAD]), SystemControl)` was
   destroyed through the `SystemControl` arm (`cargo test --lib --target x86_64-unknown-linux-gnu
   probe_safe_adopt`). It was removed. See kobj-o1 and kobj-o2. soundness/opportunities. Medium.
+  **Fix.**
 
 - [ ] **kobj-d9** `kernel/src/syscall/table.rs:611` — `sys_thread_get_registers` takes the
   suspended thread's `ExceptionFrame` address under SCHED (`thread_exception_frame`,
@@ -195,6 +243,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   path. A three-thread SMP boot-probe (one faults, one reads, one resumes), checking the registers
   for values T never held, would settle it. Fix: copy `RegisterValues` out while SCHED is held, and
   make the frame read `unsafe` or take a typed frame. abi/ownership/soundness/opportunities. Low.
+  **Fix**, as sched-d1.
 
 - [ ] **kobj-d10** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard`,
   `:249`) get auto `Send` and `Sync` from `&'a SpinLock<T>`, so a guard over a `Send + !Sync` value
@@ -205,7 +254,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   asserting `is_sync`/`is_send` on both guards over `Cell<u32>` passed. A second probe, run under
   Miri as `probe_guard_shares`, reported "Data race detected" in `Cell::get`. They were removed.
   Fix: `unsafe impl<T: Sync> Sync` and a `PhantomData<*const ()>` marker for `!Send`.
-  ownership/soundness. Low.
+  ownership/soundness. Low. **Fix.**
 
 - [ ] **kobj-d11** `kernel/src/sched/current.rs:31` — Shared `&Thread` is formed in 13 places
   (`sched/current.rs:31,45,59,86`; `sched/exit.rs:24,50,104,145,221,244,286,465`;
@@ -219,7 +268,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `thread.rs:566`. The existing test `the_last_thread_out_of_a_process_wakes_the_reaper` fails
   under Miri with "trying to retag from ... for SharedReadOnly ... that tag does not exist" at
   `exit.rs:158`, though it passes natively. Hardware forgives it. See kobj-o3. soundness/
-  opportunities. Low.
+  opportunities. Low. **Fix**, raised to Medium.
 
 - [ ] **kobj-d12** `kernel/src/object/ipc_channel.rs:627` — `IpcChannel::drop(&mut self)` (and
   `Timer::drop`, `timer.rs:215`, same shape) unlinks itself only inside its body, under SCHED.
@@ -237,6 +286,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   unverified: `Thread::fpu_area_ptr` (`thread.rs:716`) derives a write pointer from `&KBox`.
   Fix: unlink before the `&mut` exists, and derive peer pointers from `KBox::into_raw`.
   soundness/opportunities. Low.
+  **Fix** for its `try_new_pair` half, as sched-d12, and **plan** for its `Drop` half, as sched-d11,
+  in P1.
 
 - [ ] **kobj-d13** `kernel/src/object/memory_object.rs:203` — `MemoryObject::copy_to_kvec` (and
   `FileObject::read_to_kvec`, `file_object.rs:1043`) forms `&[u8]` over frames while a writable
@@ -246,7 +297,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   image bytes and the abstract-model race remain. Demonstrated under Miri: `probe_copy_to_kvec_vs`
   (with `-Zmiri-permissive-provenance`) reported "Data race detected between (1) retag read ... and
   (2) non-atomic write". It was removed. Fix: `ptr::copy_nonoverlapping` into the `KVec`'s spare
-  capacity (see kobj-o11). soundness/opportunities. Low.
+  capacity (see kobj-o11). soundness/opportunities. Low. **Plan**, in P2.
 
 - [ ] **kobj-d14** `kernel/src/handle/global.rs:72` — `global::get()` is a safe `pub fn` that
   returns `&'static HandleTable` via `assume_init_ref` and checks `READY` only with `debug_assert`
@@ -256,7 +307,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `entropy::init`, `clock::init`, `dpc::init` or `IrqRouter::init`) would use the zeroed table, with
   a zero-capacity defer ring that `close()` treats as permanently full. Unverified. A release-
   profile host test calling `get()` before `init()` would settle it. Fix: check `READY`
-  unconditionally, one load. soundness. Low.
+  unconditionally, one load. soundness. Low. **Fix.**
 
 - [ ] **kobj-d15** `kernel/src/handle/entry.rs:120` — The seqlock `WriteGuard` publishes the odd
   seq with a Release store but has no release fence before the Relaxed field stores that follow.
@@ -264,7 +315,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   fields with the old even seq on both sides and accept a torn snapshot. Latent until the aarch64
   port, since x86 TSO keeps stores in order. Standard writer: `store(s+1, Relaxed); fence(Release);`
   field stores; `store(s+2, Release)`. Unverified. A litmus test on aarch64, or Miri's weak-memory
-  emulation on a two-thread writer/reader test, would settle it. opportunities. Low.
+  emulation on a two-thread writer/reader test, would settle it. opportunities. Low. **Fix.**
 
 **Opportunities**
 
@@ -289,7 +340,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   downcast until kobj-o3 or kobj-d11 is fixed. Home: `kernel/src/object/header.rs`; `lookup_as` in
   `handle/table.rs`. Closes: a type-confused destroy (kobj-d8, demonstrated) and a cast made
   without its tag check. Depends on: nothing for the 13 non-`Thread` types. abi/ownership/
-  soundness/concurrency/opportunities. Value high, effort medium.
+  soundness/concurrency/opportunities. Value high, effort medium. **Plan**, in P1.
 
 - [ ] **kobj-o2** encapsulate: the handle table passes ownership as a raw `(*mut (), KObjectType)`
   pair. Every `allocate` caller does `into_raw` and, on `Err`, rebuilds the reference with `drop(unsafe
@@ -309,7 +360,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   the safe `allocate` that plants any pointer (kobj-d8), and the lookup use-after-free (kobj-d1):
   `Closed` is what the grace drain hands out once the release is deferred. Depends on: nothing; it
   fits best with the kobj-d1 fix and gains from kobj-o1. ownership/soundness/opportunities/
-  concurrency. Value high, effort medium.
+  concurrency. Value high, effort medium. **Plan**, in P1.
 
 - [ ] **kobj-o3** encapsulate: scheduler-owned interior state is reached through `unsafe fn
   accessor(obj: *mut (), ..)` whose contract is "live, pinned by the caller, and SCHED held" by
@@ -331,7 +382,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `&Thread` race (kobj-d11), two live `&mut Inner` on one object, interior touched without SCHED
   and the 12 per-type Send/Sync claims. Depends on: kobj-o1 for the `&T` receiver (otherwise the
   liveness half stays `unsafe`). ownership/soundness/concurrency/opportunities. Value high, effort
-  large.
+  large. **Plan**, in P1.
 
 - [ ] **kobj-o4** encapsulate: host tests and Miri cannot see use-after-free of kernel objects.
   The kernel slab sits over a leaked 16 MiB host `Vec`, so a freed object is still inside a live
@@ -344,7 +395,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   host tests. Home: `kernel/src/mm/slab.rs` and `mm/test_support.rs`. Closes: a kernel-object use
   after free passing every host test and Miri; the kobj-d1 probe is silent under Miri today.
   Depends on: nothing, though Miri on the IPC suite also needs the kobj-d12 peer-pointer fix first.
-  opportunities. Value high, effort small.
+  opportunities. Value high, effort small. **Fix**, first.
 
 - [ ] **kobj-o5** encapsulate: a handle move is a lookup with `TRANSFER`, a commit into a ring,
   child or reply, then an ignored-failure `close_and_release`, with nothing claiming the entry in
@@ -357,7 +408,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `Claim::commit(self)` closes the entry and cannot fail, and dropping an uncommitted claim
   restores it. Home: `kernel/src/handle/table.rs`. Closes: a move that copies (kobj-d2) and the
   spawn late-failure path (kobj-d4), where the claims would simply be committed. Depends on: nothing;
-  fits best with kobj-o2. ownership. Value high, effort medium.
+  fits best with kobj-o2. ownership. Value high, effort medium. **Fix.**
 
 - [ ] **kobj-o6** encapsulate: plain `#[repr(C)]` ABI data is reinterpreted by hand — per-type
   `as_bytes` through `from_raw_parts(self as *const Self as *const u8, size_of)`, `mem::zeroed`,
@@ -377,7 +428,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `kernel/src/libkern/pod.rs`, with the bound in `kernel/src/mm/user_access.rs`. Closes: invalid
   values built from user bytes (kobj-d6) and kernel padding copied out. It also removes the 9-10
   `as_bytes` unsafe blocks and `sys_wait`'s `from_raw_parts`. Depends on: nothing. abi/ownership/
-  soundness/opportunities. Value medium, effort small.
+  soundness/opportunities. Value medium, effort small. **Fix.**
 
 - [ ] **kobj-o7** narrow: the scheduler's entry points take a type-erased `*mut ()` with the
   contract "a live `T` pinned by the caller's reference", so every syscall site writes `unsafe {
@@ -393,7 +444,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   which already holds the typed lookup's `ObjectRef`. Home: `kernel/src/sched/*.rs`. Closes: a
   sched call after the `ObjectRef` dropped, or on the wrong type, and removes about 26 unsafe
   blocks from `syscall/table.rs`. Depends on: kobj-o1. ownership/soundness. Value medium, effort
-  medium.
+  medium. **Plan**, in P1.
 
 - [ ] **kobj-o8** encapsulate: bounded lists pushed under SCHED rely on a `try_reserve` at
   construction matching a separate `MAX` constant, and the waiter list (`add_waiter`/`remove_waiter`/
@@ -407,7 +458,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   (where a missing reserve silently drops the notification). Home: `kernel/src/libkern/arrayvec.rs`;
   `WaitQueue` in `kernel/src/object/mod.rs`. Closes: a reserve that drifts from its constant, so a
   push refuses or drops, or grows under rank-1 SCHED. Depends on: nothing. opportunities. Value
-  medium, effort small.
+  medium, effort small. **Fix**, as sched-o5.
 
 - [ ] **kobj-o9** encapsulate: handles installed partway through a syscall are rolled back by hand
   on each later early return — 17 sites (`grep -E
@@ -420,7 +471,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   committed. Checked against `sys_channel_create`, `sys_process_spawn` and `sys_channel_recv`.
   Home: `kernel/src/syscall/table.rs` (or `kernel/src/handle/`). Closes: a handle left in a table,
   pinning its object, when a new early return forgets the rollback. Depends on: nothing. ownership.
-  Value medium, effort small.
+  Value medium, effort small. **Plan**, in P1.
 
 - [ ] **kobj-o10** encapsulate: uncounted back-pointers to kernel objects (`IpcChannel.peer`,
   `IpcChannel.us_reg`, `CachedFile.obj`, the handle entry's object pointer) are each upgraded with
@@ -438,6 +489,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   against all three examples. Home: `kernel/src/object/header.rs`. Closes: upgrading a back-pointer
   without holding what the free path waits for, the shape of kobj-d1. Depends on: kobj-o1, and the
   kobj-d1 fix for the handle-table instance. opportunities. Value medium, effort medium.
+  **Plan**, in P1.
 
 - [ ] **kobj-o11** encapsulate: frame contents are reached by raw HHDM arithmetic, `(frame.as_u64() +
   heap::hhdm_offset()) as *mut u8`, each site with its own "owned, mapped, unaliased" SAFETY claim,
@@ -453,7 +505,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `copy_fill_into_frame` and `reserve`'s zeroing. Home: `kernel/src/mm/` (`heap.rs` or a new
   `frame.rs`). Closes: a reference over concurrently written frames (kobj-d13) and per-site
   `min(PAGE_SIZE)` arithmetic. Depends on: nothing. soundness/opportunities. Value medium (low per
-  one reviewer), effort small.
+  one reviewer), effort small. **Plan**, in P2.
 
 - [ ] **kobj-o12** encapsulate: the kernel's rsproto codec writes and parses the 28-byte RS
   envelope by hand-coded offsets — 98 sites (`awk 'NR<624' kernel/src/rsproto.rs | grep -cE
@@ -466,7 +518,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   Checked against `parse_reply`, `parse_read_range_reply` and `file_blocks_reply_header`. Home:
   `kernel/src/rsproto.rs`. Closes: a reply read at an unchecked offset (nothing reaches one today:
   a 200,000-input fuzz found none) and a builder writing a header field at a different offset.
-  Depends on: nothing. abi. Value low, effort small.
+  Depends on: nothing. abi. Value low, effort small. **Later.**
 
 - [ ] **kobj-o13** remove: raw `kmalloc` scratch and in-place segment initialisation in
   `handle/segment.rs`, where `KVec` and `KBox` exist — 7 sites (`grep -n unsafe
@@ -478,7 +530,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   MaybeUninit<T>| ..)`, published with `into_raw` and freed with `from_raw` in `Drop`. Home:
   `kernel/src/handle/segment.rs`, plus a small constructor in `kernel/src/libkern/kbox.rs`. Closes:
   a leak or double free of the scratch buffer on a new early return, and raw index arithmetic.
-  Depends on: nothing. opportunities. Value low, effort small.
+  Depends on: nothing. opportunities. Value low, effort small. **Later.**
 
 What held up: `mm/user_access.rs` range-checks every copy with `checked_add`, aligns `UserPtr<T>`,
 and validates the whole `copy_cstr` range. Every user length is bounded before it slices a fixed
@@ -548,7 +600,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `take_disposition`; overwrite; `read_from_exception_frame(p)` returned the overwritten word (for
   example rip = 0xffff80000badf00d), and `thread_exception_frame` was then None. The overwrite is
   the one simulated step, since no host test runs a thread. Miri showed the any-usize decoder.
-  abi, ownership, soundness, concurrency, opportunities. Medium.
+  abi, ownership, soundness, concurrency, opportunities. Medium. **Fix.**
 
 - [ ] **sched-d2** `kernel/src/sched/ipc.rs:527` — Outstanding page-cache fills
   (`UserspaceServerReg.pending_fill`) are never completed when a userspace server dies.
@@ -569,7 +621,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   fill was still unsignalled. A second test with `Producer::FsServer{reg}` counted 0 destroys of
   reg, file and PO (expected 1, 1, 1). Only `take_pending_fill_matching` (a matching reply, or
   originate's rollback) takes `pending_fill`. abi, ownership, soundness, concurrency,
-  opportunities. Medium.
+  opportunities. Medium. **Fix**, as kobj-d3.
 
 - [ ] **sched-d3** `kernel/src/dpc.rs:71` — The safe `pub fn enqueue(dpc: &Dpc)` takes a borrow of
   any lifetime and stores its address in the global queue. `run_pending` (`:122`) later turns that
@@ -584,7 +636,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: Miri on safe code only, `{ let d = dpc_for(&c); enqueue(&d); } run_pending();`
   (also a Box dropped before the drain) reports "constructing invalid value of type &dpc::Dpc:
   encountered a dangling reference" at `dpc.rs:122`. Control: `enqueue_then_drain_runs_handler_once`
-  passes under Miri. abi, ownership, soundness, concurrency, opportunities. Medium.
+  passes under Miri. abi, ownership, soundness, concurrency, opportunities. Medium. **Fix.**
 
 - [ ] **sched-d4** `kernel/src/arch/x86_64/idt.rs:663` — An NMI (vector 2, per-CPU IST2 stack) that
   lands in ring 3 is treated as a user fault: `exception_dispatch` → `user_fault` →
@@ -603,7 +655,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   CPUs 1-3 whenever they ran a user-owned thread, and made ring-0 NMIs return. Serial showed
   `PROBE: NMI from ring 3` then `*** unhandled ring-3 fault ... pid 15 tid 19 segfault @ 0x41e6b3
   ***`, and the compositor's outbox overflowed afterwards. The second-NMI overwrite was not booted;
-  it follows from the shared IST2 top. Probes reverted. concurrency. Medium.
+  it follows from the shared IST2 top. Probes reverted. concurrency. Medium. **Fix.**
 
 - [ ] **sched-d5** `kernel/src/dpc.rs:98` — The DPC queue is reserved to 64 on the premise that
   the bound is the number of distinct Dpc objects, but every IRP embeds its own Dpc. The block
@@ -620,7 +672,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by a host test in `io/block.rs` (since removed). `dpc::init()`, a 64-block disk and
   a backend that never completes, then `dispatch_block_irp(.., offset = 64*512, 512)` 65 times
   without `run_pending`. Submits 0-63 returned Ok; submit 64 panicked at `dpc.rs:98`. concurrency.
-  Medium.
+  Medium. **Fix.**
 
 - [ ] **sched-d6** `kernel/src/sched/exit.rs:437` — `reap_pending` is the only drain of the global
   completed-IRP list (`io::block::reclaim_completed`), the char-driver reclaim lists and each CPU's
@@ -638,7 +690,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (`exit.rs:204`, `:216`), `suspend_with_fault` (`:269`), `yield_now` (`sched.rs:385`, no production
   caller) and tests, and `reaper_body` only closes handle tables. To settle it, boot with N busy user
   threads plus a file-reading loop and watch RECLAIM's length or free memory grow. concurrency.
-  Medium.
+  Medium. **Fix.**
 
 - [ ] **sched-d7** `kernel/src/sched/ipc.rs:312` — `us_server_attach` overwrites an endpoint's
   `us_reg` back-pointer unconditionally, and `sys_ns_bind` checks `us_forward_existing_reg`
@@ -657,7 +709,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   order: `us_forward_existing_reg(k)` → None twice; two registrations attached; lookups from pid 10
   and 20; the reply to request 1 completed pid 20's lookup (assertion: left 20, right 10). The
   interleaving itself was shown by reading the code (two SCHED holds), not run. A second test showed
-  reg_a's lookup left unsignalled at server death. abi, ownership. Medium.
+  reg_a's lookup left unsignalled at server death. abi, ownership. Medium. **Fix**, as kobj-d7.
 
 - [ ] **sched-d8** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard` at
   `:249`) holds only `&SpinLock<T>`, so it is auto-Sync and auto-Send whenever `T: Send`. Through a
@@ -670,7 +722,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: Miri on safe code (`SpinLock<Cell<u32>>` and an `IrqSpinLock` twin, `&guard` into
   `std::thread::scope`) reports "Data race detected between (1) non-atomic write ... and (2)
   non-atomic read" in `Cell::get`/`Cell::replace`. That the probe compiled shows the guard is Sync.
-  abi, ownership, soundness, concurrency, opportunities. Low.
+  abi, ownership, soundness, concurrency, opportunities. Low. **Fix**, as kobj-d10.
 
 - [ ] **sched-d9** `kernel/src/object/thread.rs:716` — `Thread::fpu_area_ptr` derives the
   `*mut ArchFpuState` it gives `switch_into` from `&raw const **area`, which goes through
@@ -684,7 +736,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   that tag only grants SharedReadOnly permission", the tag created at `thread.rs:716`. Control:
   deriving it as `match &mut (*p).fpu { Some(area) => &raw mut **area }` passes; the file was
   restored. A second probe (one byte written through the pointer) gave the same report. ownership,
-  soundness. Low.
+  soundness. Low. **Fix.**
 
 - [ ] **sched-d10** `kernel/src/sched/exit.rs:50` — Whole-struct `&Thread` is formed under SCHED
   at 13 sites (`exit.rs:24,50,104,145,221,244,286,465`, `current.rs:31,45,59,86`, `spawn.rs:263`)
@@ -703,6 +755,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   between (1) non-atomic write ... and (2) retag read of type object::thread::Thread" at
   `exit.rs:50`. Control: the same interleaving through the raw-field accessor `Thread::is_ending`
   passes, as does moving the write before the unlock. soundness, concurrency. Low.
+  **Fix**, as kobj-d11.
 
 - [ ] **sched-d11** `kernel/src/object/ipc_channel.rs:629` — `IpcChannel::drop`, `Timer::drop`
   (`timer.rs:221`) and `UserspaceServerReg::drop` (`userspace_server.rs:489`) run with a live
@@ -719,7 +772,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (Stacked Borrows) reports "trying to retag from <..> for SharedReadOnly permission ... tag does
   not exist", the peer tag invalidated by the Unique retag at `kbox.rs:116`. Under Tree Borrows it
   reports "Data race detected between (1) non-atomic write ... ipc_channel.rs:149 self.len += 1 and
-  (2) retag read of type IpcChannel ... drop_in_place". concurrency. Low.
+  (2) retag read of type IpcChannel ... drop_in_place". concurrency. Low. **Plan**, in P1.
 
 - [ ] **sched-d12** `kernel/src/object/ipc_channel.rs:283` — `IpcChannel::try_new_pair` takes each
   peer pointer from a shared borrow (`&*b as *const Self`), then retags the box Unique through
@@ -735,7 +788,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   retag from <1785035> for SharedReadOnly permission ... but that tag does not exist in the borrow
   stack" at `ipc_channel.rs:332`, the tag created at `:283` and invalidated by the Unique retag in
   `KBox::deref_mut` (`kbox.rs:116`). The same test passes with `-Zmiri-tree-borrows`. opportunities.
-  Low.
+  Low. **Fix.**
 
 - [ ] **sched-d13** `kernel/src/dpc.rs:107` — `run_pending_in` drains into `[0usize; DPC_RESERVE]`
   with `buf[..n].copy_from_slice(&q)`, where `n` is the queue's length. The length is bounded by the
@@ -746,7 +799,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   type (sched-o4) or drain in chunks.
   Demonstrated by a host test (since removed): a fresh queue reserved to `DPC_RESERVE+1` (capacity
   128) and 65 distinct Dpcs queued panics at `dpc.rs:111`, "range end index 65 out of range for
-  slice of length 64". In production `init` reserves exactly 64 from empty. ownership. Low.
+  slice of length 64". In production `init` reserves exactly 64 from empty. ownership. Low. **Fix.**
 
 - [ ] **sched-d14** `kernel/src/sched.rs:368` — `alloc_pid` uses `next_pid.wrapping_add(1)`, so
   after 2^32-2 spawns pids come round to 0, 1, 2, and so on. `sched.rs:238` says "No pid reuse" and
@@ -758,7 +811,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   to spawn at exhaustion, or widen to u64.
   Demonstrated by a host test in `sched/tests.rs` (since removed): `SCHED.next_pid = u32::MAX`, then
   `alloc_pid()` four times gave 0xffffffff, 0, 1, 2 ("the pid source wrapped"). The spawn count
-  needed keeps it low. abi. Low.
+  needed keeps it low. abi. Low. **Fix.**
 
 - [ ] **sched-d15** `kernel/src/arch/x86_64/smp.rs:39` — `adopt_dense_index` matches `hw_apic_id()`
   (CPUID.01H:EBX[31:24], 8 bits) against the 32-bit `lapic_id`s the BSP bound. An AP whose x2APIC
@@ -774,7 +827,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (`main.rs:416/436`). A boot with `-smp 1,sockets=2,cores=256,threads=1,maxcpus=512 -device
   max-x86_64-cpu,socket-id=1,core-id=0,thread-id=0` gave an id-256 AP, but ACPI listed 2 CPUs and
   the kernel brought up only `cpu 0 online ... 1 of max 8`, so the AP was never started. To settle
-  it, request x2APIC in `limine.rs` and boot that topology. concurrency. Low.
+  it, request x2APIC in `limine.rs` and boot that topology. concurrency. Low. **Later.**
 
 **Opportunities**
 
@@ -801,7 +854,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   outliving its hold or aliased; and the `&Thread`-over-a-concurrently-written-`arch` race of
   sched-d10; it removes most of sched's 162 unsafe blocks of this kind. Depends on: nothing for the
   lock half; sched-o2 for the liveness half. abi, ownership, soundness, concurrency, opportunities.
-  Value high, effort large.
+  Value high, effort large. **Plan**, as kobj-o3, in P1.
 
 - [ ] **sched-o2** encapsulate: scheduler entry points take a type-erased `*mut ()` (and
   `wait_on`/`wait_on_io` take `&[usize]`) whose kind and liveness the caller promises, though nearly
@@ -827,7 +880,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   and `kernel/src/syscall/table.rs`. Closes: a wrong-kind or dangling object pointer reaching a
   SCHED-held accessor, the class behind the stale-`us_reg` crash and the `is_live`/magic backstops.
   Depends on: nothing. abi, ownership, soundness, concurrency, opportunities. Value high, effort
-  large.
+  large. **Plan**, as kobj-o7, in P1.
 
 - [ ] **sched-o3** encapsulate: per-CPU statics indexed by `this_cpu()` whose correctness rests on
   a comment that the caller cannot migrate between reading the index and using the slot — 28 sites
@@ -842,6 +895,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `kernel/src/libkern`, used by sched and lockrank. Closes: touching another CPU's slot after a
   migration between `this_cpu()` and the access, the SMP wrong-slot class seen before. Depends on:
   nothing (the remote accessor wants sched-o1's token). concurrency. Value medium, effort medium.
+  **Plan**, as kplat-o3, in P4.
 
 - [ ] **sched-o4** narrow: `dpc::enqueue(&Dpc)` is safe for any lifetime, though statics need
   nothing more and heap-embedded IRP DPCs are sound only by the convention that the box outlives its
@@ -856,7 +910,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (static, fits), the `io/block.rs` IrpBox (heap, `enqueue_raw`) and the file_object StubFillBox
   (heap, `enqueue_raw`). In `kernel/src/dpc.rs`. Closes: the dangling-Dpc use from safe code
   (sched-d3), and it marks each by-convention site. Depends on: nothing. abi, soundness. Value
-  medium, effort small.
+  medium, effort small. **Fix.**
 
 - [ ] **sched-o5** encapsulate: lists pushed under SCHED or at an interrupt tail are plain KVecs
   reserved up front and pushed only with `push_within_capacity`/`push_reserved`, and the five
@@ -874,7 +928,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the Timer waiter list and the DPC queue. In `kernel/src/libkern` (beside `kvec.rs`). Closes: an
   allocation or free under the rank-1 lock or in IRQ context through a growing push, and a drain
   buffer shorter than its list (sched-d13). Depends on: nothing. ownership, concurrency,
-  opportunities. Value medium, effort small.
+  opportunities. Value medium, effort small. **Fix.**
 
 - [ ] **sched-o6** encapsulate: five waitable objects each keep `waiters: KVec<*mut ()>` reserved to
   `MAX_WAITERS` = 4 and repeat `add_waiter`/`remove_waiter`/`take_waiters(obj, out: &mut [*mut ()])`
@@ -895,7 +949,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `waiters.rs`) and `kernel/src/sched/objects.rs`. Closes: a short out buffer passed to
   `take_waiters` (a panic in IRQ/DPC context under SCHED), growth under SCHED through a waiter push,
   and drift among the five wake loops. Depends on: nothing (composes with sched-o1). abi, soundness,
-  opportunities. Value medium, effort small.
+  opportunities. Value medium, effort small. **Plan**, in P1.
 
 - [ ] **sched-o7** encapsulate: uncounted back-pointers (`IpcChannel.peer`, `IpcChannel.us_reg`) that
   the target's Drop clears under SCHED are followed raw, and `ipc_endpoint_closing` reads a magic
@@ -910,7 +964,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `kernel/src/sched`. Closes: following a back-pointer after its target is freed (a stale-`us_reg`
   crash happened here before); it also makes the `is_live` read of possibly freed memory
   unnecessary, and a single `attach` that refuses when set would hold sched-d7. Depends on: sched-o1
-  (the token). opportunities. Value medium, effort medium.
+  (the token). opportunities. Value medium, effort medium. **Plan**, as kobj-o10, in P1.
 
 - [ ] **sched-o8** narrow: under SCHED, code clones an owned ObjectRef only to read through it
   (`th.process_ref()`) and argues at each site that dropping the clone "is never the last
@@ -928,7 +982,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `kernel/src/object/{thread,process,userspace_server}.rs`. Closes: an ObjectRef dropped under SCHED
   (the allocator under rank 1) at the clone sites, and a raw child pointer used after its owner is
   gone. Depends on: nothing (made safe internally by sched-o2's `downcast_ref`). opportunities.
-  Value medium, effort small.
+  Value medium, effort small. **Plan**, in P1.
 
 - [ ] **sched-o9** encapsulate: ObjectRefs that a SCHED-held path must release are carried out of
   the locked block by hand (`drop(g); drop(x)`, `Err(returned) => returned`, orphans arrays dropped
@@ -946,6 +1000,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   refused ref). In `kernel/src/sched.rs`. Closes: an ObjectRef dropped under the rank-1 lock reaching
   the allocator, the cross-CPU deadlock `make_runnable`'s comment describes, and the reason
   `deferred_drops` exists. Depends on: nothing. ownership. Value medium, effort medium.
+  **Plan**, in P1.
 
 - [ ] **sched-o10** encapsulate: the switch-away tail is written out five times — pick next or fall
   back to idle, take current, set both states, take the saved-SP slot, park prev on a list, install
@@ -965,7 +1020,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `kernel/src/sched.rs`. Closes: a switch path that parks prev on one list with another list's state
   (`park_reaper` sets Blocked but parks in the reaper slot) or passes an outgoing slot belonging to a
   different thread; it leaves a single unsafe switch call. Depends on: nothing. opportunities. Value
-  medium, effort small.
+  medium, effort small. **Plan**, in P1.
 
 - [ ] **sched-o11** narrow: deadline-heap entries carry their targets as bare `usize` (`target`,
   `channel`, 0 when unused) beside a separate `DeadlineKind`, cast back to `*mut ()` by kind at fire
@@ -979,7 +1034,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   constructions and the fire match fit directly. Liveness stays a protocol (removal before the
   free). In `kernel/src/sched/deadline.rs`. Closes: a target read as the wrong kind (a Timer address
   read as a thread) and a PendingSend entry with no channel. Depends on: nothing. abi,
-  opportunities. Value low, effort small.
+  opportunities. Value low, effort small. **Plan**, in P1.
 
 What held up: the `on_cpu` handoff in `switch_into` and `context_switch` (guard raised under SCHED,
 cleared only after the `saved_sp` store, spun on before `saved_sp` and the FPU image are read), the
@@ -1049,7 +1104,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `0xffffc08000001000`, translated in its own root and `None` in the other. The crash itself
   needs a boot or 26.8M cycles. `memory-management.md:627` states the limit and no code enforces
   it. Four lenses found it independently. Lenses: ownership, soundness, concurrency,
-  opportunities. High.
+  opportunities. High. **Fix**, with the bash's kmem-9, moved here from Part H.
 - [ ] **kmem-d2** `kernel/src/mm/addr_space.rs:617` — `map_object`'s out-of-memory rollback
   (`rollback_object_map`) clears PTEs that are live in a running address space and issues no
   TLB invalidation, and `sys_memory_map`'s error arm (syscall/table.rs:935) issues none either.
@@ -1061,7 +1116,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: reading the code confirms the OOM arm calls `Paging::unmap_page` with no flush and
   that `flush_tlb_all` runs only on the Ok path. It needs SMP plus a forced page-table OOM
   mid-range. A fix is `shootdown_all` in the rollback before the object is released.
-  Lens: concurrency. High.
+  Lens: concurrency. High. **Fix.**
 - [ ] **kmem-d3** `kernel/src/mm/slab.rs:334` — `kmalloc` accepts `align == SLAB_SIZE` (it refuses
   only larger). `large_alloc` then puts the object at `align_up(32, 4096) = 4096`, the block's
   second page, but `kfree` and `large_free` find the descriptor at `ptr & SLAB_MASK`, which is
@@ -1075,7 +1130,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `p - 4096`. Dropping a zeroed `KBox<IpcMsg>` changed `frames_freed_by_this_thread` by 1 where 2
   were taken. `large_alloc(64, align)` finds the descriptor for 8/64/1024/2048 and not 4096.
   After `large_free`, `alloc(0)` handed out a page of the live allocation. Lenses: abi, ownership,
-  soundness, opportunities. Medium.
+  soundness, opportunities. Medium. **Fix.**
 - [ ] **kmem-d4** `kernel/src/mm/kstack.rs:197` — `KernelStack` stores the `PhysAddr` root it was
   built under and walks it in `Drop`, and `KernelStack::new(root)` is a safe fn that forwards any
   frame to unsafe `map_page`. Nothing ties the root's lifetime to the stack. It holds only
@@ -1088,7 +1143,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `None`). A planted word in a frame the stack never owned reads 0 after the drop instead of
   `0xDEAD0001`. `KernelStack::new(memory_object.frames()[0])` with no `unsafe` wrote a PDPT link
   into the MemoryObject's data (word 384 became `0x7cae77ff0007`). Lenses: ownership, soundness,
-  concurrency, opportunities. Medium.
+  concurrency, opportunities. Medium. **Fix.**
 - [ ] **kmem-d5** `kernel/src/tlb.rs:125` — the shootdown publishes `REQUEST_ALL`, `REQUEST_VA`
   and `ACKED=0` with plain stores, then sends the IPI with a bare x2APIC ICR WRMSR. x2APIC
   WRMSR is not serializing (SDM 3A §11.12.3 asks for `MFENCE;LFENCE` first), `regs::wrmsr` is
@@ -1102,7 +1157,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   KVM traps ICR writes (which serializes them) and TCG cannot reorder, so only real SMP hardware
   or a litmus test settles it. The fix is `fence(SeqCst)` plus `lfence` before the ICR write, as
   Linux does with `weak_wrmsr_fence`. Lenses: ownership, soundness, concurrency, opportunities.
-  Medium.
+  Medium. **Fix.**
 - [ ] **kmem-d6** `kernel/src/mm/vmm.rs:245` — safe functions cast an `ObjectRef` to a concrete
   type behind only a `debug_assert` on its tag, so in release a wrong-kind reference is read as
   the wrong type. `Vma::drop` calls `writable_unmapped` whenever `mapping == FileBacked` and
@@ -1115,7 +1170,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   with "slice::from_raw_parts requires the pointer to be aligned", and the `MappingKind::Object`
   control passes. Release probe `map_object(range, uprot(), file_object_ref)` panics at
   addr_space.rs:349 with "index out of bounds: the len is 0 but the index is 0" (FileObject
-  memory read as `MemoryObject.frames`). Lenses: soundness, opportunities. Medium.
+  memory read as `MemoryObject.frames`). Lenses: soundness, opportunities. Medium. **Fix.**
 - [ ] **kmem-d7** `kernel/src/mm/user_access.rs:177` — safe `copy_from_user<T: Copy>`
   `assume_init`s user bytes as `T`, but `Copy` does not make every bit pattern valid (`bool`,
   enums, `char`, `NonZero`, references), and `copy_to_user<T: Copy>` copies padding out to user
@@ -1124,7 +1179,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   leaks kernel stack bytes.
   Demonstrated: Miri (nightly-2026-07-20) on a probe test, `copy_from_user(UserPtr::<bool>)`
   over a byte holding 2, reports UB at user_access.rs:199 `out.assume_init()`. Lens: ownership.
-  Medium.
+  Medium. **Fix**, as kobj-d6.
 - [ ] **kmem-d8** `kernel/src/sched/ipc.rs:527` — when a userspace server's endpoint closes,
   `ipc_endpoint_closing` (and `us_reg_detach`, line 281) fails every pending lookup but never
   touches `pending_fill`, so a Model B page-cache fill's PO is never completed. `wait_status`
@@ -1135,7 +1190,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kernel builds `Producer::FsServer` for any non-block resolve reply (table.rs:2398).
   Demonstrated: a host test in the userspace_server tests (an IpcChannel pair, one lookup and
   one fill outstanding, server end dropped). Lookup PO signalled `true`, fill PO signalled
-  `false`. Lenses: soundness, opportunities. Medium.
+  `false`. Lenses: soundness, opportunities. Medium. **Fix**, as kobj-d3.
 - [ ] **kmem-d9** `kernel/src/object/file_object.rs:790` — `mark_ready` (called by the Model B
   fill reply, table.rs:2703) readies whichever page now has the index, while `settle` was made
   to match by PO for this reason. A stale fill reply can mark a successor page Ready while its
@@ -1145,7 +1200,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   only Model A objects are resized today.
   Demonstrated: a host probe in the file_object tests ran that sequence. It reported "mapped
   PhysAddr(125966602964992); settle freed 1 frame(s); lookup(2) = None". Lenses: ownership,
-  opportunities. Medium.
+  opportunities. Medium. **Fix.**
 - [ ] **kmem-d10** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` is safe but wraps the unsafe `ObjectRef::from_raw`, so any box
   under any tag becomes an `ObjectRef` whose last drop runs `dispatch_destroy` for `ty`. The
@@ -1154,7 +1209,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   close destroys the allocation as the wrong type.
   Demonstrated: a host probe compiled `adopt(MemoryObject::try_new(PAGE).unwrap(),
   KObjectType::Timer)` with no `unsafe` and printed "adopted as Timer". The drop was not run.
-  Lens: opportunities. Medium.
+  Lens: opportunities. Medium. **Fix**, as kobj-d8.
 - [ ] **kmem-d11** `kernel/src/mm/heap.rs:45` — `heap::buddy_free`, `BuddyAllocator::free`
   (buddy.rs:182) and `BuddyPager::free` are safe fns that write the free-list link through the
   HHDM and hand the frame out again. Frame ownership is held by convention at 18 hand-written
@@ -1162,7 +1217,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the early free fixed in #396), corrupts memory with no `unsafe` at the call site.
   Demonstrated: a buddy host probe on a local allocator freed a live frame with the safe call.
   The owner's first word read 0x0 and the next `alloc` returned the same frame. Lens:
-  opportunities. Medium.
+  opportunities. Medium. **Plan**, in P2.
 - [ ] **kmem-d12** `kernel/src/mm/addr_space.rs:458` — `map_file_page` re-checks only that some
   FileBacked VMA of the same object covers `addr`, not that `addr` still maps to the page index
   `file_backing` computed in an earlier hold of the AS lock. Thread A faults at 6P in F mapped at
@@ -1172,7 +1227,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   page. The same window also makes a fault on a remapped region fatal where a retry would work.
   Demonstrated: a host test in addr_space/tests.rs ran those steps. `map_file_page` returned
   true and `translate(6P) == frame2` (a second probe asserts the equivalent with frame 1 at 5P).
-  Lenses: abi, ownership, concurrency. Low.
+  Lenses: abi, ownership, concurrency. Low. **Plan**, as the bash's kmem-15, in Part E.
 - [ ] **kmem-d13** `kernel/src/object/file_object.rs:598` — write-back takes a page's device
   position from its first block and writes `pages * PAGE_SIZE` contiguously from there, and
   `block_map` (table.rs:2622) accepts block sizes under a page without refusing a run boundary
@@ -1183,7 +1238,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   whatever follows on the device.
   Unverified: the path is pointed at. A host test of `write_runs` with runs [file 0..2 -> lba
   100, file 2..4 -> lba 500] at block_size 1024 should issue one 4096-byte IRP at byte 100*1024.
-  Lens: abi. Low.
+  Lens: abi. Low. **Fix.**
 - [ ] **kmem-d14** `kernel/src/arch/x86_64/idt.rs:258` — copy-primitive recovery runs before any
   demand fault-in, so the kernel never populates a valid but lazily backed user page (an untouched
   stack page or an untouched FileBacked page). The copy fails with `Fault`, and `sys_channel_recv`
@@ -1193,20 +1248,21 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by reading the code, not by a boot: `pf_dispatch` returns at
   `lookup_recovery(f.rip)` before `try_fault_in`, and there is no prefault step. A boot test
   receiving into an untouched page of a fresh file mapping would show it. Lens: abi. Low.
+  **Plan**, as the bash's kmem-28, in Part E.
 - [ ] **kmem-d15** `kernel/src/arch/x86_64/idt.rs:258` — recovery matches the faulting RIP alone,
   and `copy_bytes_raw` registers `rep movsb` for both directions, so a fault on the kernel-side
   pointer is also turned into `UserAccessError::Fault` instead of `dump_and_halt`. A dangling
   bounce buffer or a bad length past a kernel buffer is hidden and reported as a user error.
   Unverified: reasoned from code (`lookup_recovery_in` compares only `fault_pc`). Check
   `read_cr2() < USER_VIRT_END` before patching RIP, and boot with a deliberately bad kernel-side
-  pointer. Lens: abi. Low.
+  pointer. Lens: abi. Low. **Fix.**
 - [ ] **kmem-d16** `kernel/src/arch/x86_64/cpu.rs:190` — the kernel sets and checks SMAP and SMEP
   but never sets or checks CR0.WP. That `copy_to_user` cannot write a read-only user mapping
   holds only because Limine sets WP on the BSP and the APs. With WP clear, a process holding a
   read-only mapping of a shared page-cache page could have the kernel write into it through
   `sys_clock_read` or `sys_channel_recv` out pointers.
   Unverified: grep finds no `write_cr0` that sets bit 16. Assert `read_cr0() & (1<<16) != 0` on
-  every CPU at bring-up. It holds under Limine today. Lens: abi. Low.
+  every CPU at bring-up. It holds under Limine today. Lens: abi. Low. **Fix.**
 - [ ] **kmem-d17** `kernel/src/mm/kvmap.rs:111` — `remap_mmio_page` repoints a page of the shared
   vmap and flushes only the local TLB, and its `# Safety` contract does not say that the page
   must have been used by one CPU only. Safe today because its only caller, `pci::enumerate`
@@ -1214,7 +1270,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   hotplug after SMP start, with the thread migrating, would read the previous function's config
   space through a stale entry. `shootdown_page` has no callers at all.
   Unverified: path pointed at (`unmap_page`, `map_page`, `flush_tlb_page`, no `shootdown_page`).
-  Lenses: ownership, soundness, concurrency. Low.
+  Lenses: ownership, soundness, concurrency. Low. **Fix.**
 - [ ] **kmem-d18** `kernel/src/object/memory_object.rs:203` — `copy_to_kvec` forms a `&[u8]` over
   each frame under a SAFETY comment saying it is "not aliased", but MemoryObject frames are
   mapped into user spaces by design. `file_object.rs:1043` (`read_to_kvec`) does the same over
@@ -1224,7 +1280,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   changing bytes, a data race in Rust's model.
   Unverified: Miri cannot tell this from a raw copy. Copy with `ptr::copy` from raw pointers (or
   the user-copy asm), never forming the reference, and correct the SAFETY comments.
-  Lenses: soundness, concurrency. Low.
+  Lenses: soundness, concurrency. Low. **Plan**, as kobj-d13, in P2.
 - [ ] **kmem-d19** `kernel/src/object/memory_object.rs:106` — `try_new_borrowed`'s `# Safety` does
   not require the range to be HHDM-mapped, but safe accessors (`copy_in` at line 174,
   `copy_to_kvec` at 192) and the I/O paths dereference every frame through the HHDM, and
@@ -1234,7 +1290,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   take a kernel #PF.
   Unverified: grep finds no `FrameOwnership` check outside memory_object.rs. A host test handing
   a Borrowed object to `sys_io_submit`'s validation, or refusing Borrowed buffers there, would
-  settle it. Lenses: soundness, opportunities. Low.
+  settle it. Lenses: soundness, opportunities. Low. **Fix.**
 
 **Opportunities**
 
@@ -1259,6 +1315,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `unsafe impl Send/Sync` claims every object is Send + Sync while `Process` is not (VmaTree's
   `NonNull` links), so the supertrait would force an explicit, argued impl. Depends on: nothing.
   Lenses: abi, ownership, soundness, concurrency, opportunities. Value high, effort medium.
+  **Plan**, as kobj-o1, in P1.
 - [ ] **kmem-o2** encapsulate: physical frames are bare `Copy` `PhysAddr` values from
   `heap::buddy_alloc` and returned by hand with the safe `buddy_free(addr, order)`; the buddy
   only `debug_assert`s a free, and 8 alloc sites carry their own unsafe zeroing block — 28 to 32
@@ -1278,7 +1335,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   large_free misroute, the Borrowed/Owned flag kept by hand, hand-written rollback loops). It
   also lets host tests carry provenance so Miri can check frame accesses. Depends on: nothing;
   pairs with kmem-o6. Lenses: ownership, soundness, opportunities. Value high, effort medium
-  (one lens said large).
+  (one lens said large). **Plan**, in P2.
 - [ ] **kmem-o3** encapsulate: kernel-half (vmap) mappings are made through
   `Paging::map_page`/`unmap_page` with a caller-chosen root (`active_root()`, a process root, or
   the root stored in `KernelStack`) and a local-only TLB flush, although the tables are shared by
@@ -1297,7 +1354,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `KERNEL_TEMPLATE` in `arch/x86_64/paging.rs`). Closes: a kernel stack mapped in one address space
   only (kmem-d1), `KernelStack` walking a freed PML4 (kmem-d4), stale cross-CPU translations
   after a shared remap (kmem-d17). Depends on: nothing; pairs with kmem-o2. Lenses: ownership,
-  soundness, concurrency. Value high, effort small to medium.
+  soundness, concurrency. Value high, effort small to medium. **Fix.**
 - [ ] **kmem-o4** encapsulate: each page-table unmap returns its old frame, and the caller is
   trusted to invalidate other CPUs' TLBs before the frame or its owning object can be freed;
   `rollback_object_map` does not — 8 sites (`grep -rn "Paging::unmap_page(" kernel/src
@@ -1311,7 +1368,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `rollback_object_map` (which would have to finish before returning the object). In
   `kernel/src/mm/addr_space.rs`, with `tlb.rs`. Closes: a frame, or the object owning it, freed
   while another CPU may still cache its translation (kmem-d2). Depends on: nothing. Lens:
-  concurrency. Value high, effort medium.
+  concurrency. Value high, effort medium. **Fix.**
 - [ ] **kmem-o5** encapsulate: frame contents are reached by hand-computing `phys +
   hhdm_offset()` at each site, then a raw write, a copy, or a `&[u8]` slice, with each site
   re-arguing its bounds and liveness — 44 HHDM-arithmetic sites (`grep -rn "hhdm_offset()"
@@ -1330,7 +1387,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   offset or length at one of the sites, and shared references over user-shared frames
   (kmem-d18, kmem-d19). Depends on: nothing (usable over `PhysAddr`; the `Frame` type, kmem-o2,
   for owned frames). Lenses: abi, ownership, concurrency, opportunities. Value medium, effort
-  medium.
+  medium. **Plan**, as kobj-o11, in P2.
 - [ ] **kmem-o6** narrow: every `ArchPaging` operation takes `root: PhysAddr` under the unsafe
   contract "a valid top-level table owned by the caller" (10 unsafe trait fns, 15 more in the
   x86_64 impl), and safe wrappers such as `KernelStack::new(root)` forward a caller's value —
@@ -1346,7 +1403,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   In `kernel/src/arch/paging.rs` (trait) and `kernel/src/mm/addr_space.rs` (owner). Closes: a
   safe fn passing an arbitrary root to `map_page` (kmem-d4), and `load_elf` translating a live AS
   without its lock. It also gives the 512 GiB vmap bound one place to live. Depends on: nothing;
-  best with kmem-o2. Lens: opportunities. Value medium, effort medium.
+  best with kmem-o2. Lens: opportunities. Value medium, effort medium. **Plan**, in P3.
 - [ ] **kmem-o7** remove: `VmaTree` is an intrusive red-black tree over raw `NonNull<Vma>` links
   and holds 102 of the subsystem's 139 raw derefs, plus 23 unsafe blocks and 4 unsafe fns; its
   interval augmentation `subtree_max_end` is maintained by `recompute_max_end`,
@@ -1362,7 +1419,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   corruption in the tree; it removes nearly all of the subsystem's raw-deref column. Medium only
   because the tree already passes Miri and the decision log chose it deliberately. Depends on:
   nothing for step 1; revisiting the decision-log VmaTree entry for step 2. Lens: opportunities.
-  Value medium, effort medium.
+  Value medium, effort medium. **Plan**, in P3.
 - [ ] **kmem-o8** narrow: `copy_from_user`/`copy_to_user` are generic over `T: Copy`, and ABI
   types reinterpret themselves as bytes in hand-written unsafe blocks, each with its own padding
   claim — 21 sites (11 typed copies: `grep -rn 'copy_to_user(\|copy_from_user(' kernel/src
@@ -1381,6 +1438,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `kernel/src/mm/user_access.rs` (trait; impls beside the ABI types in `kernel/src/libkern`).
   Closes: invalid-value UB from user bytes (kmem-d7) and padding leaks to user memory. Depends on:
   nothing. Lenses: abi, ownership, soundness, opportunities. Value medium, effort small.
+  **Fix**, as kobj-o6.
 - [ ] **kmem-o9** encapsulate: drivers reach `DmaBuffer` memory through the raw `virt()` pointer,
   with their own offset arithmetic, volatile accesses and slice building, and sometimes store the
   address as a `u64` in their own structs; `as_slice`/`as_mut_slice` hand out references over
@@ -1395,7 +1453,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the AHCI command-list read (ahci.rs:600). In `kernel/src/mm/dma.rs`. Closes: a ring or context
   offset past the buffer, references over device-written bytes, and a raw address stored in a
   driver struct (hid.rs:446, storage.rs:861) that outlives its `DmaBuffer`. Depends on: kmem-o8's
-  marker trait. Lens: abi. Value medium, effort medium.
+  marker trait. Lens: abi. Value medium, effort medium. **Plan**, as drv-o3, in P5.
 - [ ] **kmem-o10** narrow: `AddressSpace` repeats `unsafe { Paging::map_page/unmap_page(root, ..)
   }` with the same SAFETY argument ("root is this AS's PML4, lock held, the frame is fresh or the
   object's"), though holding `&mut Inner` already proves the lock and the root — 8 sites (`grep -n
@@ -1409,7 +1467,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `unmap_covering_deferred`. In `kernel/src/mm/addr_space.rs`. Closes: a future AS path editing
   tables without the lock or through the wrong root (none seen today; it makes the rank-4 lock
   claim structural). Depends on: kmem-o2 and kmem-o4. Lenses: soundness, concurrency. Value
-  medium, effort small.
+  medium, effort small. **Plan**, in P3.
 - [ ] **kmem-o11** narrow: x86_64 page-table walks dereference `*table_ptr(x).add(index)` raw at
   every level under a per-function SAFETY argument; `translate` and `attribute_index` duplicate
   the same four-level walk, and shared kernel-half slots are read with plain loads but linked
@@ -1422,7 +1480,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `attribute_index`. In `kernel/src/arch/x86_64/paging.rs`. Closes: per-level SAFETY arguments
   repeated in 7 functions, the duplicate walk, and mixed atomic and plain access to the lock-free
   kernel-half tables. Depends on: nothing (kmem-o6 for the trait-level contract). Lens:
-  opportunities. Value low, effort small.
+  opportunities. Value low, effort small. **Fix.**
 
 What held up: the two asm copy primitives (register constraints, `cld`, `clac` on every exit, only
 the user-side instruction in the extable, the `max==0` guard, the linker KEEP). `UserPtr`
@@ -1475,6 +1533,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   same result. Control: adding `|| read32(d.port_base, PX_CI) & 1 != 0` to `take_retired`'s early
   return made both pass, with all 15 and 16 existing AHCI tests still green. Fix: read PxCI inside
   `take_retired`, under `pending`. Lenses: concurrency, ownership, opportunities. High.
+  **Fix**, first.
 
 - [ ] **drv-d2** `kernel/src/dpc.rs:98` — the DPC queue reserves 64 entries on the claim that "the
   bound is the number of distinct Dpc objects" (dpc.rs:23-25). But every IrpBox has its own inline
@@ -1492,7 +1551,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `run_pending`. Output: submits 0..64 succeed, then "panicked at src/dpc.rs:98:5: DPC queue
   capacity exceeded". Not booted, so whether 65 submits fit inside one tick on a running kernel is
   untested. Fix: an intrusive link in the IrpBox the way RECLAIM links it (see drv-o5). Lenses:
-  abi, soundness, concurrency, opportunities. Medium.
+  abi, soundness, concurrency, opportunities. Medium. **Fix**, as sched-d5.
 
 - [ ] **drv-d3** `kernel/src/drivers/xhci/storage.rs:1512` — `Disks::issue_hub` overwrites
   `dev.inflight` and rewrites the wrapper page without checking that no IRP command is in flight.
@@ -1508,7 +1567,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `xhci/storage/tests.rs` (since removed): `take(fake.dev(..))`, submit a Read on LUN 0 (started),
   then `issue_hub(i, po, 1, INQUIRY, 36)` returned true and inflight became `Owner::Hub { po }`.
   `depart(i)` then handed back `queued=0 held=[None, None, None]` with the read's status still
-  Pending. Lenses: ownership, soundness, concurrency. Medium.
+  Pending. Lenses: ownership, soundness, concurrency. Medium. **Fix.**
 
 - [ ] **drv-d4** `kernel/src/drivers/ahci/bringup.rs:167` — `drivers::probe` calls `ahci::init` for
   every 01.06.01 function (drivers/mod.rs:36-37), and `init` stores each disk into the AHCI static
@@ -1525,6 +1584,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   boot-time partition-table read with "partitions: the table did not read" (`Unread::Io`, not "no
   table"). Boot worked only because the system disk happened to enumerate last. No one-controller
   control was run. Lens: concurrency. Medium.
+  **Fix**, with the bash's drv-8, moved here from Part H.
 
 - [ ] **drv-d5** `kernel/src/io/ramdisk.rs:199` — `RamDisk::transfer` bounds-checks only
   `irp.offset + irp.length` against the backing, then copies each fragment's own `len`. The SAFETY
@@ -1541,7 +1601,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   and the guard bytes [2048..2560] were overwritten (they were 0xAB). Miri also reports
   "attempting to access 1024 bytes, but got alloc...+0x600 which is only 512 bytes from the end of
   the allocation" at ramdisk.rs:209. Fix: copy `min(f.len, remaining)`, or check the fragment sum
-  (see drv-o1). Lenses: abi, soundness, opportunities. Medium.
+  (see drv-o1). Lenses: abi, soundness, opportunities. Medium. **Fix.**
 
 - [ ] **drv-d6** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` is a safe function with the whole contract of `ObjectRef::from_raw`:
@@ -1554,7 +1614,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   ObjectRef said the wrong one (the test forgot the ref). Under Miri,
   `adopt(PendingOperation, MemoryObject)` then drop gives "constructing invalid value of type
   NonNull<mm::PhysAddr>: encountered 0" at libkern/kvec.rs:218, through `dispatch_destroy`. Lenses:
-  abi, ownership, soundness, opportunities. Medium.
+  abi, ownership, soundness, opportunities. Medium. **Fix**, as kobj-d8.
 
 - [ ] **drv-d7** `kernel/src/dpc.rs:71` — `pub fn enqueue(dpc: &Dpc)` is safe and takes a borrow of
   any lifetime, but the queue keeps the address until a later drain calls its handler. Safe code
@@ -1566,7 +1626,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   removed) that builds a stack Dpc, calls the public `enqueue`, returns, scribbles the stack and
   calls `run_pending`: "constructing invalid value of type &dpc::Dpc: encountered a dangling
   reference" at dpc.rs:122. Fix: `enqueue(&'static Dpc)` plus an `unsafe fn` for IRP-inline DPCs
-  (see drv-o12). Lens: soundness. Medium.
+  (see drv-o12). Lens: soundness. Medium. **Fix**, as sched-d3.
 
 - [ ] **drv-d8** `kernel/src/drivers/xhci/hub.rs:626` — `data_bytes(mem, len: u16)` and
   `control_in`'s `write_bytes` (hub.rs:638) are safe functions taking any length up to 65,535 over
@@ -1577,7 +1637,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   and let the USB device DMA up to 64 KiB past it. An untrusted USB device would corrupt kernel
   memory. Demonstrated: host test in hub.rs tests (since removed): `device_mem()`, then
   `data_bytes(&mem, 3*4096)` returned a 12,288-byte slice over a 4,096-byte page. Lens:
-  opportunities. Medium.
+  opportunities. Medium. **Fix.**
 
 - [ ] **drv-d9** `kernel/src/drivers/ahci/bringup.rs:156` — the boot log line computes `sectors *
   SECTOR_SIZE as u64` unchecked. `sectors` is IDENTIFY words 100..103 read as a full u64
@@ -1587,7 +1647,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   userspace. The rest of the block layer uses checked or saturating arithmetic on the same value.
   Unverified: path read only. QEMU sizes the disk from its image, so it cannot report this. A host
   test of a factored-out size formatter fed `words[103] = 0x0080` would settle it. Fix:
-  `saturating_mul`, or log in sectors and refuse counts above 2^48. Lens: abi. Medium.
+  `saturating_mul`, or log in sectors and refuse counts above 2^48. Lens: abi. Medium. **Fix.**
 
 - [ ] **drv-d10** `kernel/src/drivers/ahci.rs:390` — AHCI wants word-aligned PRDT bases (DBA bit 0
   reserved) and even byte counts (DBC bit 0 set), but the block layer accepts any `buf_offset`
@@ -1601,7 +1661,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   laptop's Sunrise Point AHCI, with a read at `buf_offset` 4095 and a canary in the physically
   adjacent frame. The boot verifier could not reproduce it under QEMU. Fix: require an even or
   block-aligned `buf_offset` for block devices, as Linux's `queue_dma_alignment` does. Lens: abi.
-  Medium.
+  Medium. **Fix.**
 
 - [ ] **drv-d11** `kernel/src/drivers/ahci/bringup.rs:105` — `init` programs PxCLB/PxFB and starts
   the port (FRE and ST, lines 92-100) before three fallible allocations. Each failure at lines 105,
@@ -1613,7 +1673,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   100-135 and confirmed the order). An allocation-failure seam at line 105, followed by a check that
   PxCMD.FRE is clear before the DmaBuffers drop, would settle it. Fix: `stop_port` first, and
   forget the buffers when it fails (see drv-o7). Lenses: abi, ownership, soundness, opportunities.
-  Low.
+  Low. **Fix.**
 
 - [ ] **drv-d12** `kernel/src/drivers/xhci/mod.rs:579` — `stop()` discards both `wait_for` results
   (HCH set, HCRST complete). Every decline after USBCMD.RUN (lines 500, 505, 511) then drops the
@@ -1625,6 +1685,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   decline after the controller started stops it first" is held by intent. Unverified: read only. It
   needs a controller that ignores Run/Stop, which QEMU's model does not do. Fix: `stop()` returns
   whether HCH set, and `mem::forget(boxed)` when it did not. Lenses: ownership, soundness. Low.
+  **Fix.**
 
 - [ ] **drv-d13** `kernel/src/drivers/xhci/hub.rs:384` — `control_in`'s SAFETY argument (hub.rs:634-638)
   is that any ep0 failure that can leave a transfer live "ends the device". `hid::bind` instead ends
@@ -1636,7 +1697,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   a `&[u8]` over it, and its short-packet event writes its residual into the new Waiting record.
   The bytes stay inside the device's own page, but the unsafe block's precondition is false and GET
   MAX LUN reads a stale byte. Unverified: path read only (hid.rs:498-503 and 512-518,
-  hub.rs:380-385). No QEMU device is composite and slow enough to reach it. Lens: abi. Low.
+  hub.rs:380-385). No QEMU device is composite and slow enough to reach it. Lens: abi. Low. **Fix.**
 
 - [ ] **drv-d14** `kernel/src/drivers/xhci/desc.rs:187` — `Endpoint::dci()` turns a device-supplied
   `bEndpointAddress` into a Device Context Index without rejecting endpoint number 0. Scenario: a USB
@@ -1648,7 +1709,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   device-supplied index is used without a range check. Demonstrated: host test in
   `xhci/context.rs` (since removed): `storage_interface` over that configuration printed "out dci 0
   in dci 3", and `configure_endpoints` printed "slot ctx dw2 0xdeadb001 add flags 0x9", failing the
-  assertion that the slot context's dword 2 is 0. Lens: abi. Low.
+  assertion that the slot context's dword 2 is 0. Lens: abi. Low. **Fix.**
 
 - [ ] **drv-d15** `kernel/src/drivers/xhci/storage.rs:1271` — `run()` copies `len` bytes of the
   binding buffer into `out` on any Passed status, ignoring the CSW residue. The buffer is never
@@ -1658,7 +1719,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `sense_outcome` judges by them. A short READ CAPACITY likewise takes its block count and length
   from stale bytes. `hub::control_in` zeroes its page before each transfer for exactly this reason;
   the bulk path does not. Unverified: path read only. A host seam over `run_once` returning
-  `Passed { residue: 10 }` after a pre-filled buffer would settle it. Lens: abi. Low.
+  `Passed { residue: 10 }` after a pre-filled buffer would settle it. Lens: abi. Low. **Fix.**
 
 - [ ] **drv-d16** `kernel/src/io/block.rs:622` — `window_of` decides that a backend's `ctx` is a
   leaked `&'static Partition` by comparing `backend.submit as *const ()` with `partition_submit as
@@ -1669,7 +1730,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `&Partition` and `retire_window` would store to it. Conversely a Partition could compare unequal
   and miss its retire on rescan. Unverified: by reading (`core::ptr::fn_addr_eq`'s documentation).
   Fix: a tag in `BlockBackend`, or `block_info().kind == BlockKind::Partition` (see drv-o14). Lens:
-  abi. Low.
+  abi. Low. **Fix.**
 
 - [ ] **drv-d17** `kernel/src/drivers/ahci.rs:468` — `publish_disk` ignores whether `device::register`
   took the node. `register` returns nothing and drops the node when the table cannot grow
@@ -1681,7 +1742,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   today, so `record()` never writes the pointer; any change that reaches the backend without the
   registry makes every completion a `fetch_add` on freed slab memory. Unverified: path pointed at.
   A host test failing registry growth, then `Counted::record` under Miri, would settle it. Lenses:
-  soundness, opportunities. Low.
+  soundness, opportunities. Low. **Fix.**
 
 - [ ] **drv-d18** `kernel/src/drivers/xhci/hid.rs:996` — `depart`'s keyboard branch offers its key
   releases in their own reader-lock holds and only then retires the node with no releases (line
@@ -1695,7 +1756,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `xhci/hid/tests.rs` (since removed): `readers[i].lock().offer([release 30, syn])`, then
   `push(i, epoch, [press 30, syn])`, then `retire(i, &[])`. The ring's key events were
   [(30,0),(30,1)], ending on a press. The existing single-hold test shows the late push dropped.
-  Lens: concurrency. Low.
+  Lens: concurrency. Low. **Fix.**
 
 - [ ] **drv-d19** `kernel/src/drivers/xhci/mod.rs:647` — `xhci_dpc` can run as two concurrent
   instances (`dpc.rs` clears `queued` before the handler, and the queue is global). Each drains a
@@ -1707,7 +1768,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   bytes where fewer arrived. The same interleaving can deliver two HID reports in swapped order.
   Unverified: read of `xhci_dpc`, dpc.rs:13-16, `ep0_event` and `hid::on_transfer`. A host test
   driving two batches through `on_event` in swapped order against a Waiting record would settle it.
-  Lens: concurrency. Low.
+  Lens: concurrency. Low. **Fix.**
 
 - [ ] **drv-d20** `kernel/src/drivers/xhci/ring.rs:328` — `Consumer::next` reads the whole event TRB
   through `DmaSlots::read` (dwords 0, 1, 2, then 3, mod.rs:228-236) and only then checks the cycle
@@ -1719,7 +1780,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   is lost and leaves a storage command to its 30 s deadline. It depends on the controller's 16-byte
   write not being observed atomically (QEMU writes it with one `dma_memory_write`). Unverified:
   read only. A `Slots` stand-in whose read returns dwords from two laps would settle it once the
-  reader reads dword 3 first (see drv-o11). Lens: concurrency. Low.
+  reader reads dword 3 first (see drv-o11). Lens: concurrency. Low. **Fix.**
 
 - [ ] **drv-d21** `kernel/src/io/ramdisk.rs:132` — for an Owned backing, `RamDisk::base()` returns
   `v.as_ptr()`. `KVec` has no inherent `as_ptr`, so this goes through Deref to a `&[u8]` and the
@@ -1731,7 +1792,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   Write IRP with one 512-byte fragment: "attempting a write access using <tag> ... but that tag
   only grants SharedReadOnly permission", the tag created at ramdisk.rs:132 (Stacked Borrows). Fix:
   keep a raw pointer taken from `&mut` at construction, or wrap the bytes in `UnsafeCell`. Lens:
-  soundness. Low.
+  soundness. Low. **Fix.**
 
 **Opportunities**
 
@@ -1755,7 +1816,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `io/block.rs`. Closes: the RAM disk overrun (drv-d5), double or lost completion (drv-d3's IRP
   would have been a dropped token), the three variants of null and zero-count handling, and safe fn
   pointers that dereference raw arguments. Depends on: nothing. Lenses: abi, ownership,
-  opportunities. Value high, effort medium.
+  opportunities. Value high, effort medium. **Plan**, in P5.
 
 - [ ] **drv-o2** encapsulate: kernel objects are adopted from a `KBox` and downcast from an
   `ObjectRef` by hand. `ObjectRef::from_raw(KBox::into_raw(x).as_ptr() as *mut (),
@@ -1776,6 +1837,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   In `kernel/src/object/header.rs`. Closes: the type-confused adopt (drv-d6) and unchecked casts
   reached from safe signatures; it removes 27 of the subsystem's 96 raw derefs. Depends on:
   nothing. Lenses: abi, ownership, soundness, opportunities. Value high, effort medium.
+  **Plan**, as kobj-o1, in P1.
 
 - [ ] **drv-o3** encapsulate: DMA memory is read and written through raw pointers from
   `DmaBuffer::virt()`, or u64 addresses kept beside the buffer, at hand-computed offsets: AHCI
@@ -1793,7 +1855,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `kernel/src/mm/dma.rs`. Closes: a write past a DMA structure the device then follows — the
   demonstrated `data_bytes` slice (drv-d8), the PRDT count guarded by convention twice
   (ahci.rs:363-366, 491), the DCBAA slot index. Depends on: nothing. Lenses: abi, opportunities.
-  Value high, effort medium.
+  Value high, effort medium. **Plan**, in P5.
 
 - [ ] **drv-o4** encapsulate: device memory handed to a controller, then freed by drop on a path
   that has not proved the controller quiescent: decline paths after a port or controller was
@@ -1809,7 +1871,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   scratchpads, rings) and `hub::release` (DeviceMem). In `kernel/src/mm/dma.rs`. Closes: device DMA
   into memory the allocator has handed out again (drv-d11, drv-d12); the comment at
   xhci/mod.rs:488-490 records a fixed instance. Depends on: nothing. Lens: soundness. Value high,
-  effort medium.
+  effort medium. **Fix.**
 
 - [ ] **drv-o5** encapsulate: IRP completion through each IRP's own inline Dpc — `set_completion` +
   `dpc::enqueue(&(*irp).dpc)` in every driver, so the global DPC queue holds one entry per completed
@@ -1823,6 +1885,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `DPC_RESERVE` is a real bound. It also replaces seven hand-written pairs with one call. In
   `kernel/src/io/block.rs`. Closes: DPC-reserve exhaustion, a kernel panic reachable by any holder of
   a block handle (drv-d2). Depends on: nothing. Lens: concurrency. Value high, effort small.
+  **Fix.**
 
 - [ ] **drv-o6** encapsulate: "a DPC must never drop an `ObjectRef`" (the same-CPU SlabCache
   deadlock, decision log 2026-08-06, and the earlier input bug input/mod.rs cites) is held by
@@ -1845,7 +1908,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `kernel/src/sched` (beside `deferred_drops`), with the console half in `drivers/input/mod.rs`.
   Closes: an `ObjectRef`'s last drop in DPC or IRQ context, and another CPU dropping what a DPC is
   using — both have bitten this codebase. Depends on: nothing. Lenses: abi, ownership, soundness,
-  concurrency, opportunities. Value high, effort medium.
+  concurrency, opportunities. Value high, effort medium. **Plan**, in P5.
 
 - [ ] **drv-o7** narrow: MMIO accessors are safe functions that dereference whatever base and offset
   they are given. AHCI and xHCI `read32/write32/write64(base: u64, off: u64)`, PCI
@@ -1864,7 +1927,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   AHCI fake-register tests. In `kernel/src/mm/kvmap.rs`. Closes: a device-supplied offset (DBOFF,
   RTSOFF, MaxPorts, a slot ID) or a wrong base turning a register access into a write to arbitrary
   kernel memory, and out-of-window or unaligned config reads through a safe trait method. Depends
-  on: nothing. Lenses: abi, soundness, opportunities. Value medium, effort medium.
+  on: nothing. Lenses: abi, soundness, opportunities. Value medium, effort medium. **Plan**, in P5.
 
 - [ ] **drv-o8** encapsulate: the scheduler's object calls (`complete_pending_op`,
   `pending_op_is_signaled`, `pending_op_completion`, `signal_interrupt`, `interrupt_consume`,
@@ -1881,7 +1944,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   leaked wake/intr) keep the unsafe fn. In `kernel/src/sched/objects.rs` and
   `kernel/src/sched/wait.rs`. Closes: a PO or interrupt operation on a wrong-typed or already-dead
   object address. Depends on: drv-o2 (or a runtime `object_type()` check in each wrapper). Lenses:
-  soundness, concurrency, opportunities. Value medium, effort medium.
+  soundness, concurrency, opportunities. Value medium, effort medium. **Plan**, as kobj-o7, in P1.
 
 - [ ] **drv-o9** encapsulate: AHCI slot-0 state (`inflight`, `issued_at`, `dead`, `fault`) is kept
   as atomics with comments saying "accessed under pending's lock", plus `unsafe fn issue_locked`
@@ -1894,7 +1957,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   report, its PxCI read and the retire happen in one hold, and the lock-free peeks (`due_at`,
   `poll_disk`) take the lock. In `kernel/src/drivers/ahci.rs`. Closes: decisions taken on device or
   driver state read outside the port lock (drv-d1), with the lock held by structure rather than by
-  comment. Depends on: nothing. Lens: concurrency. Value medium, effort small.
+  comment. Depends on: nothing. Lens: concurrency. Value medium, effort small. **Fix.**
 
 - [ ] **drv-o10** narrow: `dpc::enqueue(&Dpc)` is a safe API whose borrow outlives the call —
   static DPCs, IRP-inline DPCs and one stack DPC all go through it — 22 sites (`grep -rn
@@ -1907,7 +1970,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   at its address until its handler has run; the 9 heap/IRP sites already sit in unsafe blocks, and
   the stack Dpc in io/mod.rs becomes a static. In `kernel/src/dpc.rs`. Closes: use-after-free of a
   queued Dpc reached from safe code (drv-d7). Depends on: nothing. Lens: soundness. Value medium,
-  effort small.
+  effort small. **Fix**, as sched-o4.
 
 - [ ] **drv-o11** encapsulate: a static `AtomicPtr<T>` is published once, then `unsafe { &*p }` with
   "published once, never withdrawn" at every ISR, DPC and thread entry; xHCI already has a safe
@@ -1926,7 +1989,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   the hub thread, scratchpads and ERST never after init). In `kernel/src/libkern` (beside KBox and
   IrqSpinLock). Closes: a second publish silently replacing the first (drv-d4), and dereferencing a
   published pointer before initialisation finishes. Depends on: nothing. Lenses: ownership,
-  soundness, concurrency, opportunities. Value medium, effort small.
+  soundness, concurrency, opportunities. Value medium, effort small. **Fix.**
 
 - [ ] **drv-o12** encapsulate: `BlockBackend`'s `ctx: *mut ()` is re-cast at every submit and poll
   (Partition, AhciDisk, RamDisk), or is an integer smuggled through the pointer (USB slot/lun/epoch,
@@ -1943,7 +2006,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   irp)`. In `kernel/src/io/block.rs`. Closes: reading one backend's context as another's type, and a
   window missed on rescan because two function addresses compare equal or unequal (drv-d16).
   Depends on: drv-o11 (for the `'static` device refs). Lenses: ownership, soundness, opportunities.
-  Value medium, effort medium.
+  Value medium, effort medium. **Plan**, in P5.
 
 - [ ] **drv-o13** encapsulate: the storage `Dev` and HID `Bound` table entries keep raw u64 virtual
   addresses of rings, wrapper, binding and report pages that live in `DeviceMem.class`, owned by
@@ -1965,7 +2028,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   addresses (the DPC touching a freed ring or report page), freeing a device's memory before its
   slot is disabled, and safe `RawSlots` writes to an arbitrary address. Depends on: drv-o3 and
   drv-o4 for the accessors and for `release` (not required). Lenses: ownership, soundness,
-  opportunities. Value medium, effort medium.
+  opportunities. Value medium, effort medium. **Plan**, in P5.
 
 - [ ] **drv-o14** remove: MemoryObject bytes are read through hand-computed HHDM pointers (frame +
   `hhdm_offset`) instead of a bounded accessor, and `copy_into_memobj` is duplicated as an `unsafe
@@ -1981,7 +2044,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `kernel/src/object/memory_object.rs` and `kernel/src/drivers/input/mod.rs`. Closes: reads past a
   MemoryObject's frames held only by `sys_io_submit`'s earlier bound, and a dangling `*const ()`
   reaching the copy. Depends on: nothing (drv-o2 optional). Lenses: opportunities, soundness
-  (the console copy). Value medium, effort small.
+  (the console copy). Value medium, effort small. **Plan**, in P2.
 
 - [ ] **drv-o15** encapsulate: a PendingOperation is borrowed by raw pointer (`PoPtr`,
   `Owner::Hub { po }`, `Action::Hub`) while the hub thread's `ObjectRef` pins it, and "take the
@@ -1997,7 +2060,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   and registration refuses while a record is already armed. In `kernel/src/drivers/xhci/mod.rs`
   (or `sched`, beside `wait_on`). Closes: completing a PO after its waiter dropped it, and one
   record silently replacing another. Depends on: nothing. Lens: ownership. Value medium, effort
-  medium.
+  medium. **Plan**, in P5.
 
 - [ ] **drv-o16** encapsulate: three hand-written `Slots` impls over TRB ring memory (xhci/mod.rs
   `DmaSlots`, storage.rs `RawSlots`, hid.rs `RawSlots`) disagree on ordering: `DmaSlots` and
@@ -2013,7 +2076,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `kernel/src/drivers/xhci/ring.rs`. Closes: accepting a torn event TRB, and a ring copy that hands
   a TRB to the controller before its fields are in place; hid is ordered today only by x86 TSO,
   which matters once aarch64 lands. Depends on: drv-o3's region accessors (optional). Lenses: abi,
-  concurrency. Value medium, effort small.
+  concurrency. Value medium, effort small. **Fix.**
 
 - [ ] **drv-o17** narrow: `arch/x86_64/ps2.rs` opens a separate `unsafe { inb(..) }` or `unsafe {
   outb(..) }` at every access to the i8042's two fixed ports, restating the same SAFETY argument —
@@ -2024,7 +2087,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `write_cmd(u8)` and `write_data(u8)` holding the only unsafe port accesses; `pulse_reset` stays
   `unsafe fn` for its machine-reset contract. In `kernel/src/arch/x86_64/ps2.rs`. Closes: no defect
   class; it cuts 12 SAFETY arguments to 4. Depends on: nothing. Lenses: ownership, opportunities.
-  Value low, effort small.
+  Value low, effort small. **Later.**
 
 - [ ] **drv-o18** narrow: `unsafe fn Counted::attach(&self, node: &ObjectRef)` stores a pointer into
   a DeviceNode's `IoStats` on the contract "registered in the device table, which holds it
@@ -2037,7 +2100,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   counters outlive every `record()` whatever the registry did; alternatively `register()` returns
   `bool` and `attach` takes the registry's proof. In `kernel/src/io/stats.rs`. Closes: a dangling
   `IoStats` pointer when registration failed under memory pressure. Depends on: nothing. Lens:
-  opportunities. Value low, effort small.
+  opportunities. Value low, effort small. **Fix.**
 
 What held up: IrpBox lifetime. `_po`, `_buffer` and `_device` pin every raw pointer in the Irp;
 `irp_complete_dpc` signals the PO and links the box onto the allocation-free RECLAIM list as its
@@ -2105,6 +2168,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `init: up (pid 1)` the kernel took `#PF`, rip 0, cs 0x8, rflags 0x10446 (DF set), r12 =
   the memcpy/memset address. The unpatched image boots. Any ring-3 process can crash the
   kernel. Fix: `cld; clac` at the top of every stub (see kplat-o9). concurrency. High.
+  **Fix**, first.
 - [ ] **kplat-d2** `kernel/src/sched.rs:756` — `thread_enter`'s ring-3 descent calls
   `set_kernel_stack`, `set_syscall_kernel_stack` and `arm_user_entry_cpu_base` (gdt.rs:249,
   syscall.rs:98, 114) with IF=1 and preemption on. Each reads the CPU index with RDTSCP, then
@@ -2121,7 +2185,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: no host test reaches RDTSCP/WRMSR. A seam for `rdtscp_aux` in a host test, or
   masking IF across the descent and test-qemu at `-smp 4` under thread churn, would settle
   it. Fix: do the three writes inside `thread_enter`'s SCHED-held block (see kplat-o3).
-  ownership, concurrency. High.
+  ownership, concurrency. High. **Fix.**
 - [ ] **kplat-d3** `kernel/src/arch/x86_64/idt.rs:662` — A vector-2 NMI (IST2) or a #DF (IST1)
   taken in ring 3 goes through `is_user_fault` to `user_fault` and `suspend_with_fault`. That
   parks the thread with its ExceptionFrame and context on the per-CPU IST stack, not on its own
@@ -2136,6 +2200,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   IPI to its CPU. Log: `exc2 cs=0x23 ... stopping=false`, then `user_fault vec=2 frame_ptr=
   0xffffffff800d1f10`, which is inside IST2, not a 0xffffc000... thread stack. A second NMI
   on that CPU entered at the same rsp. Probes reverted. abi, opportunities. Medium.
+  **Fix**, as sched-d4.
 - [ ] **kplat-d4** `kernel/src/arch/x86_64/idt.rs:692` — `ArchRegisters::read_from_exception_frame
   (frame_ptr: usize)` is a safe trait fn that dereferences any address as an ExceptionFrame.
   Its one caller, `sys_thread_get_registers` (syscall/table.rs:611-614), gets the address from
@@ -2152,7 +2217,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `thread_exception_frame` gave the frame, the test overwrote words 14 and 17 as the next entry
   would, and `read_from_exception_frame` returned rax=0xffffffff80123456
   rip=0xffffffff80001000 (`probe_get_registers`, 1 passed). abi, ownership, concurrency,
-  opportunities. Medium.
+  opportunities. Medium. **Fix**, as sched-d1.
 - [ ] **kplat-d5** `kernel/src/mm/user_access.rs:180` — `copy_from_user<T: Copy>` and
   `copy_to_user<T: Copy>` are safe fns that accept any `Copy` type. `copy_from_user`
   `assume_init`s user bytes as T, so a T with invalid bit patterns (bool, enum, char,
@@ -2163,7 +2228,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   user-chosen byte 0x02 an invalid value in the kernel.
   Demonstrated: Miri (nightly-2026-07-20) on a probe test (removed) reading
   `copy_from_user::<bool>` of byte 0x02: "constructing invalid value of type bool: encountered
-  0x02" at user_access.rs:199. Native run printed "read as false". abi. Medium.
+  0x02" at user_access.rs:199. Native run printed "read as false". abi. Medium. **Fix**, as kobj-d6.
 - [ ] **kplat-d6** `kernel/src/main.rs:145` — The kernel command line is recorded as a
   `&'static [u8]` into Limine's bootloader-reclaimable memory (`c_bytes` returns an unbounded
   lifetime, main.rs:543), and `/proc/cmdline` serves it on every lookup. The `'static` holds
@@ -2177,7 +2242,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: Miri on a probe test in cmdline.rs (removed): `c_bytes` over a Vec, `record()`,
   drop the Vec, `line().to_vec()` gave "constructing invalid value of type &[u8]: encountered a
   dangling reference (use-after-free)" at cmdline.rs:52 (`probe_recorded_line`). ownership.
-  Medium.
+  Medium. **Fix.**
 - [ ] **kplat-d7** `kernel/src/arch/x86_64/paging.rs:482` — The page-table walkers (`translate`,
   `attribute_index`, `walk_to_pt`) read PTEs with plain non-atomic loads, and `map_page`,
   `unmap_page` and `ensure_kernel_intermediate` write leaf and PML4 slots with plain stores,
@@ -2190,7 +2255,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: Miri on a probe test (removed). One thread ran `map_page`, the main thread ran
   `translate` on a fresh root. "Data race detected between non-atomic read (translate,
   paging.rs:482) and atomic read-modify-write (ensure_table compare_exchange, paging.rs:255)".
-  Native run passed. soundness, opportunities. Medium.
+  Native run passed. soundness, opportunities. Medium. **Fix.**
 - [ ] **kplat-d8** `kernel/src/arch/x86_64/smp.rs:95` — `ArchSmp::init_this_cpu(index: u32)` is
   safe and writes any value to IA32_TSC_AUX. Per-CPU accesses then index `static mut` arrays
   with `.add(idx)` guarded only by a `debug_assert`, which release builds drop (gdt.rs:143-146,
@@ -2200,7 +2265,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `set_kernel_stack` and `set_syscall_kernel_stack` write past `TSSES`/`GDTS`/`CPUS`, and the
   next syscall loads RSP from an out-of-bounds block. The only caller passes 0 (main.rs:265),
   and the AP path's `adopt_dense_index` is below MAX_CPUS by construction.
-  Demonstrated by path, read end to end. No probe was run. opportunities. Medium.
+  Demonstrated by path, read end to end. No probe was run. opportunities. Medium. **Fix.**
 - [ ] **kplat-d9** `kernel/src/arch/x86_64/user_access.rs:109` — `copy_cstr_raw`'s loop runs
   `lodsb`/`stosb` before it compares the count with `max_len`. With `max_len` = 0 it writes one
   byte into a destination its contract says has zero writable bytes, then reports
@@ -2211,7 +2276,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: host probe running the same instruction sequence without stac/clac and the
   extable entry (removed). dst=[0xAA,0xAA], src="x\0", max_len=0 gave code 2, count 1, dst
   [78, aa]. The stub gave [aa, aa]. A second probe gave `backing=[ee, 00, ee, ee]` with
-  `result=0 count=1`. abi, opportunities. Low.
+  `result=0 count=1`. abi, opportunities. Low. **Fix.**
 - [ ] **kplat-d10** `kernel/src/framebuffer.rs:52` — `record_aperture` records
   `phys_base = address - hhdm` with no page-alignment check, but
   `MemoryObject::try_new_borrowed` requires a page-aligned base (memory_object.rs:100). The
@@ -2222,7 +2287,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: host probes (removed) with address 0x1000_0800 (hhdm 0) and 0x8000_0800:
   `record_aperture` returned true, `try_new_borrowed` succeeded, and `map_object` panicked
   "ArchPaging::map_page returned Misaligned for a page-aligned per-page address". abi,
-  ownership. Low.
+  ownership. Low. **Fix.**
 - [ ] **kplat-d11** `kernel/src/arch/x86_64/gdt.rs:18` — On the BSP, `gdt::init` (via
   `init_tables`, main.rs:117) indexes `GDTS`, `TSSES`, `DF_STACKS` and `NMI_STACKS` by
   `rdtscp_aux` before `init_this_cpu(0)` writes TSC_AUX (main.rs:265), so the SAFETY arguments
@@ -2234,7 +2299,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `init_this_cpu(0)`.
   Unverified: QEMU resets TSC_AUX to 0 in every boot run. Writing TSC_AUX=0 at the top of
   `kernel_main` and booting firmware that leaves it nonzero, or a probe that writes it before
-  `init_tables`, would settle it. abi, ownership, concurrency. Low.
+  `init_tables`, would settle it. abi, ownership, concurrency. Low. **Fix.**
 - [ ] **kplat-d12** `kernel/src/main.rs:775` — `plain_mapping` returns None through `.ok()?`
   when `map_page` fails at page k > 0 and does not unmap pages 0..k. `report_framebuffer_cost`
   unmaps only on Some (main.rs:733-737), so part of the second alias of the aperture, with
@@ -2242,7 +2307,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   main.rs:731-732 says must not happen. The vmap VA is never reused, so it stays for the life
   of the system. Reachable only on page-table-frame OOM during boot.
   Unverified: by path, read end to end; a fault-injected `map_page` in a boot would settle it
-  (main.rs is the binary and has no host tests). abi, ownership, opportunities. Low.
+  (main.rs is the binary and has no host tests). abi, ownership, opportunities. Low. **Fix.**
 - [ ] **kplat-d13** `kernel/src/main.rs:493` — The SAFETY arguments for the Limine response
   reads (main.rs:55, 493-496, 1108-1111) say a raw-pointer copy, or `static mut` itself, stops
   the optimiser folding the pre-Limine null. Neither does. The read survives only because each
@@ -2253,7 +2318,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   use the pattern, and main.rs:406 reads the field directly without it.
   Demonstrated: `rustc -O` on a `static mut` in `.limine_requests` read with
   `(&raw const R).read().is_null()`. With `#[used]` it emits `cmpq $0, R(%rip)`. Without it
-  emits `movb $1, %al`. abi. Low.
+  emits `movb $1, %al`. abi. Low. **Fix.**
 - [ ] **kplat-d14** `kernel/src/arch/x86_64/ioapic.rs:217` — `X86IoApic::route` casts the 32-bit
   x2APIC destination with `dest as u8`, silently truncating, where its MSI sibling
   `irq_install::compose` refuses ids above 0xFF (test
@@ -2262,7 +2327,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   irq_install.rs:50) route the line to `id & 0xFF`, another CPU or none, and the device's
   interrupts are lost instead of the install being refused.
   Unverified: QEMU boots use APIC id 0 or 1; it needs a machine with an x2APIC id of 256 or
-  more. abi. Low.
+  more. abi. Low. **Fix.**
 - [ ] **kplat-d15** `kernel/src/klog.rs:237` — `copy_into_frames(frames: &[PhysAddr])` is a safe
   pub fn that writes the log through the HHDM into whatever frames it is given; its SAFETY
   comment (klog.rs:253-255, "within an owned, HHDM-mapped frame") is a claim about the caller
@@ -2274,6 +2339,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: host probes (removed). A `Box<[u8; 4096]>` borrowed only immutably, its
   PhysAddr passed with no unsafe in the test, had 11 log bytes written into it
   (`victim[0..4]` = [112, 114, 111, 98]; `victim[0] != 0xAB`). ownership, opportunities. Low.
+  **Fix.**
 - [ ] **kplat-d16** `kernel/src/main.rs:874` — `run_first_userspace` allocates pid-1
   handle-table entries (`notif_h`, then `ns_h` and `system_control_h`) as raw u64s, then returns
   on twelve later failure paths (main.rs:877, 888, 894, 900, 934, 943, 949, 962, 972, 980,
@@ -2281,7 +2347,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   namespace, system-control object) referenced forever. A boot-time OOM in `Namespace::try_new`,
   any `bind_kernel_server`, or `spawn_user` leaks them to a process that will never exist.
   Unverified: by path (`notif_h` at main.rs:863-871, and the early returns read). Reachable
-  only by a boot-time OOM or bind failure, not injected. ownership. Low.
+  only by a boot-time OOM or bind failure, not injected. ownership. Low. **Plan**, in P1.
 - [ ] **kplat-d17** `kernel/src/arch/x86_64/ioapic.rs:55` — IOAPIC registers use an indirect
   IOREGSEL-then-IOWIN protocol and `set_rte_mask` is a read-modify-write, but nothing
   serialises them, and the `ArchIrqRouter` route/mask/unmask contracts do not ask callers to
@@ -2292,7 +2358,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   IOREGSEL writes so one's IOWIN lands in the other's register. No lock appears in
   kernel/docs/lock-ordering.md.
   Unverified: no host seam for the MMIO; a host test with a fake register pair driven in the
-  interleaved order would settle it. concurrency. Low.
+  interleaved order would settle it. concurrency. Low. **Fix.**
 - [ ] **kplat-d18** `kernel/src/tlb.rs:96` — `shootdown` reads `me` and `online` before
   `preempt_disable` (line 113), then takes the sole-online-CPU fast path and invalidates
   "locally". If the thread migrates in between, it invalidates the new CPU's TLB and the CPU
@@ -2301,7 +2367,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   steals it, and the BSP keeps its translation of a page the caller then frees. The window
   exists only while the online set grows (bring-up, any future hotplug).
   Unverified: needs a host seam for the CPU id; moving the reads after `preempt_disable`
-  would settle it. concurrency. Low.
+  would settle it. concurrency. Low. **Fix.**
 - [ ] **kplat-d19** `kernel/src/fbcon/mod.rs:447` — `with_console_waiting`, `yield_to_userspace`
   and `with_console` compute `me = current_cpu()+1` (fbcon/mod.rs:388-390, 446-450, 495-505)
   before taking CONSOLE, which masks IRQs. A thread migrated in between stores another CPU's
@@ -2310,7 +2376,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   diagnosis, and a fault inside the console on the new CPU waits PATIENCE spins instead of
   taking the re-entry shortcut. No memory is at stake.
   Unverified: needs a host seam for `current_cpu()`; reading the CPU after the lock is held
-  would settle it. concurrency. Low.
+  would settle it. concurrency. Low. **Fix.**
 - [ ] **kplat-d20** `kernel/src/arch/x86_64/serial.rs:50` — `SerialPort::new(base: u16)` is a
   pub safe `const fn`, and `init`/`write_byte`/`read_byte`/`set_loopback`/`enable_rx_interrupt`
   do `outb`/`inb` at base+0..7 for any base. The SAFETY arguments ("the COM1 base port, which
@@ -2319,7 +2385,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `SerialPort::new(0xCF8).init()` and do port I/O on the PCI configuration mechanism with no
   unsafe block. No code outside serial.rs uses `SerialPort` today.
   Demonstrated by path, read end to end; grep outside serial.rs found no use. opportunities.
-  Low.
+  Low. **Fix.**
 - [ ] **kplat-d21** `kernel/src/arch/x86_64/syscall.rs:114` — `set_syscall_kernel_stack(top: u64)`
   and `ArchCpu::set_kernel_stack(top: u64)` (arch/cpu.rs:23, TSS.RSP0) are safe, yet the value
   becomes the stack pointer the hardware loads on the next syscall or ring-3 trap
@@ -2329,7 +2395,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   caller that "disarms" with `set_kernel_stack(0)` gets a #DF on the next ring-3 interrupt. One
   that arms a top whose KernelStack can drop while the thread is current makes the next trap
   push its frame into freed and reused frames, triggered from ring 3.
-  Demonstrated by path, read end to end. opportunities. Low.
+  Demonstrated by path, read end to end. opportunities. Low. **Fix.**
 - [ ] **kplat-d22** `kernel/src/arch/x86_64/regs.rs:339` — `cli`, `sti` (regs.rs:339, 353),
   `halt_loop`'s `cli;hlt` (cpu.rs:106) and `idle_halt`'s `sti;hlt` (cpu.rs:128) are
   `asm!(..., options(nomem))`, which lets the compiler move or merge memory accesses across the
@@ -2341,7 +2407,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: standalone probe compiled `-O` for x86_64-unknown-none. With `nomem`,
   `window_nomem` read `*p` once before `cli` and reused it in the window (`movq (%rdi),%rax;
   cli; leaq 1(%rax),%rcx; movq %rcx,(%rdi); sti`). With the memory clobber, `window_mem`
-  reloaded `*p` after `cli`. opportunities, soundness. Low.
+  reloaded `*p` after `cli`. opportunities, soundness. Low. **Fix.**
 
 **Opportunities**
 
@@ -2358,7 +2424,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `translate` and `attribute_index` become safe. The atomic slot cell alone is medium effort;
   typed roots make it large. Closes: the CAS-versus-plain-read data race (kplat-d7), a dangling
   root, an out-of-range slot index. Depends on: nothing. soundness, opportunities. Value high,
-  effort large.
+  effort large. **Plan**, in P3.
 - [ ] **kplat-o2** encapsulate: every Limine request read by hand (`(&raw const X).read()
   .response`, null check, `&*`, raw `.add(i)` array walks, `c_bytes`/`CStr::from_ptr` strings,
   each with its own SAFETY text) plus ten needless `unsafe impl Sync` on `static mut`
@@ -2379,7 +2445,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the folded-null read (kplat-d13), the `'static` into reclaimable memory (kplat-d6), the
   unbounded `CStr::from_ptr` on module paths (main.rs:1071), about 32 of main.rs's 57 unsafe
   blocks. Depends on: nothing. abi, ownership, soundness, opportunities. Value high, effort
-  medium.
+  medium. **Fix.**
 - [ ] **kplat-o3** encapsulate: a CPU index read from hardware (`rdtscp_aux`/`Smp::current_cpu`)
   and then used to index per-CPU state, with migration between read and use left to each
   caller, the per-CPU arrays indexed through unchecked `.add(idx)`, and `init_this_cpu(u32)` a
@@ -2401,7 +2467,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   guard). Closes: a thread migrating between index read and write (kplat-d2, kplat-d18,
   kplat-d19), an out-of-range TSC_AUX (kplat-d8, kplat-d11), and 5 of the arch layer's 12
   `static mut`. Depends on: nothing. abi, ownership, concurrency, opportunities. Value high,
-  effort medium.
+  effort medium. **Plan**, in P4.
 - [ ] **kplat-o4** narrow: a suspended thread's ExceptionFrame location carried as a bare
   `usize` (`Thread::exception_frame`) and dereferenced by a safe `ArchRegisters` fn after SCHED,
   the lock that proves the thread parked, is dropped — 6 sites (`grep -rn
@@ -2416,7 +2482,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   &mut SchedGuard, thread, f) -> Option<R>`. `irq_dispatcher!` can hand bodies `&mut
   ExceptionFrame` converted once. Home: kernel/src/sched/exit.rs and kernel/src/arch/
   registers.rs. Closes: reading, and later writing, a frame the thread has left (kplat-d4).
-  Depends on: nothing. ownership, opportunities. Value high, effort small.
+  Depends on: nothing. ownership, opportunities. Value high, effort small. **Fix.**
 - [ ] **kplat-o5** encapsulate: kernel objects travel type-erased — adopted with `ObjectRef::
   from_raw(KBox::into_raw(x).as_ptr() as *mut (), KObjectType::T)`, downcast with `&*(r.as_ptr()
   as *const T)`, and passed to `unsafe fn f(obj: *mut ())` — 235 sites (downcasts `grep -rnE
@@ -2432,6 +2498,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   wrong type), a cast to the wrong concrete type, a raw pointer used after the ref that pinned
   it drops. Depends on: nothing; spans object and sched, seen here from power.rs, idt.rs and
   main.rs. ownership, soundness, opportunities. Value medium, effort large.
+  **Plan**, as kobj-o1, in P1.
 - [ ] **kplat-o6** encapsulate: physical frames written through `(phys + hhdm_offset()) as *mut
   u8` from a bare `PhysAddr`, ownership asserted only in a SAFETY comment — 44 sites (`grep -rn
   'hhdm_offset()' kernel/src` less comments, the definition and tests.rs; 19 of them write, by
@@ -2442,7 +2509,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   for borrowed cases (firmware tables, page tables), and `MemoryObject` exposing frames as views
   so klog's fill is `memobj.copy_in(off, run)` and `copy_into_frames` takes `&mut MemoryObject`.
   Home: kernel/src/mm. Closes: safe code writing a frame it does not own (kplat-d15). Depends
-  on: nothing. ownership, opportunities. Value medium, effort medium.
+  on: nothing. ownership, opportunities. Value medium, effort medium. **Plan**, in P2.
 - [ ] **kplat-o7** encapsulate: handle installation by `global::get().allocate(owner, raw_ptr,
   ty, rights)` after `ObjectRef::into_raw`, with a manual `drop(ObjectRef::from_raw(p, t))` on
   the error arm — 27 sites (`grep -rn "global::get().allocate(" kernel/src --include=*.rs |
@@ -2453,7 +2520,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   success and returns it on failure. Home: kernel/src/handle/global.rs. Closes: a reference
   reclaimed twice or never on an allocate error path, a type tag that disagrees with the
   pointer (the class behind kplat-d16). Depends on: nothing. ownership. Value medium, effort
-  medium.
+  medium. **Plan**, as kobj-o2, in P1.
 - [ ] **kplat-o8** remove: `unsafe fn`s whose whole contract is "ring 0" and whose bodies cannot
   break memory safety (TLB flushes, `wbinvd`, masking interrupts, MTRR/PAT reads after a CPUID
   check, walking the always-valid active root); `ArchCpu::halt` has no callers — 24 sites
@@ -2470,6 +2537,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `unsafe fn` declarations and 24 call-site obligations whose SAFETY text is the vacuous "ring
   0", diluting review of the ones that matter. Depends on: `of_mapping` is cleaner after the
   typed-root part of kplat-o1; the rest on nothing. opportunities. Value medium, effort small.
+  **Plan**, in P6.
 - [ ] **kplat-o9** encapsulate: the interrupt/exception entry prologue (error-code slot, vector,
   15 GPR pushes, `mov rdi, rsp`, call, unwind, iretq) written out six times — 6 sites (`grep -c
   'push rax\\npush rbx' kernel/src/arch/x86_64/idt.rs` = 6: `exception_stub!`, vec14,
@@ -2480,7 +2548,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   vector immediate and dispatcher symbol (checked against `timer_stub`, vec14 and
   `device_irq_stub`). Home: kernel/src/arch/x86_64/idt.rs, beside `irq_dispatcher!`. Closes: an
   entry path missing a flag normalisation (kplat-d1 lives in all six copies). Depends on:
-  nothing. concurrency. Value medium, effort small.
+  nothing. concurrency. Value medium, effort small. **Fix.**
 - [ ] **kplat-o10** narrow: user copies bounded only by `T: Copy`, byte reinterpretations of
   `#[repr(C)]` ABI types held sound by convention, and raw copy primitives taking the kernel
   side as `(ptr, len)` — 13 sites for the type bound (`grep -n 'copy_from_user(\|
@@ -2499,7 +2567,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   user_access.rs and kernel/src/arch/user_access.rs. Closes: the invalid-bool read and padding
   leak (kplat-d5), the one-byte overrun at `max_len == 0` (kplat-d9), a kernel-side length that
   disagrees with the buffer. Depends on: nothing. abi, opportunities. Value medium, effort
-  medium.
+  medium. **Fix**, as kobj-o6.
 - [ ] **kplat-o11** encapsulate: boot-published firmware and module tables kept as `static mut`
   arrays or structs with a separate count/flag atomic, written once by an `unsafe fn init`
   ("called once") and lent out as `&'static` through `from_raw_parts`, plus the device-IRQ
@@ -2516,7 +2584,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   IF=0), as `framebuffer::APERTURE`, `cmdline::LINE` and `partitions::BOOT_DISK` do. Home:
   kernel/src/libkern. Closes: a second `Platform::init` mutating data behind a live `&'static`
   slice, count/data publication drifting apart, and the subsystem's only transmute. Depends on:
-  nothing. ownership, concurrency, opportunities. Value low, effort small.
+  nothing. ownership, concurrency, opportunities. Value low, effort small. **Later.**
 - [ ] **kplat-o12** encapsulate: device vectors registered from a pool of eight with no release;
   a driver that registers and then declines keeps the slot, and exhausting the pool is an assert
   — 8 sites (`grep -rn "install_msi\|install_software\|install_intx\|install_isa_irq\|
@@ -2530,7 +2598,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   arch/x86_64/idt.rs and kernel/src/arch/irq_install.rs. Closes: a vector leaked on a bring-up
   failure path and the boot-time assert when the pool runs out (the release image already uses
   5 or 6 slots, the test image 7, io/ramdisk.rs:35-38). Depends on: nothing. ownership. Value
-  low, effort small.
+  low, effort small. **Plan**, in P5.
 - [ ] **kplat-o13** narrow: hardware stack pointers travel as `u64`: the TSS.RSP0 and syscall
   stack setters are safe fns taking any `u64`, and `fabricate_frame` is an `unsafe fn` whose
   contract is "top has 56 writable bytes below it", all three values coming from a KernelStack
@@ -2545,7 +2613,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `Thread::try_new_runnable`/`try_new_user`. Home: kernel/src/mm/kstack.rs with kernel/src/arch/
   {cpu.rs, x86_64/syscall.rs, x86_64/context.rs}. Closes: loading an arbitrary or stale RSP0 or
   syscall stack from safe code (kplat-d21). Depends on: nothing. abi, opportunities. Value low,
-  effort small.
+  effort small. **Fix.**
 - [ ] **kplat-o14** encapsulate: index/data port pairs (CMOS 0x70/0x71, IOAPIC IOREGSEL/IOWIN,
   PCI 0xCF8/0xCFC) driven by unlocked select-then-access helpers, with serialisation held by
   callers (`clock::SETTING` for RTC writes, "called once" for the RTC read, boot-only use for
@@ -2560,7 +2628,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `route`, `set_rte_mask` and `init` run under the guard. Home: kernel/src/arch/x86_64/regs.rs
   and ioapic.rs. Closes: two contexts interleaving select and access so a write lands in
   another register (kplat-d17). Depends on: nothing. ownership, concurrency. Value low, effort
-  small.
+  small. **Fix.**
 - [ ] **kplat-o15** narrow: the FP/SIMD save area handled through raw `*mut`/`*const
   ArchFpuState` even where the caller holds a `KBox` or `&mut` — 4 sites (`grep -rn
   'fpu_save\|fpu_restore\|fpu_init_area' kernel/src`, less arch/mod.rs: object/thread.rs:186,
@@ -2572,7 +2640,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `switch_into`'s swap. Home: kernel/src/arch/x86_64/fpu.rs. Closes: restoring an uninitialised
   or foreign image (#GP from MXCSR or XSTATE_BV) and an unaligned or dangling area pointer.
   Depends on: nothing; the sched call sites keep raw access until kplat-o5 gives them `&Thread`.
-  opportunities. Value low, effort small.
+  opportunities. Value low, effort small. **Fix.**
 
 What held up: `SyscallFrame` and `ExceptionFrame` match their stubs' push and pop order, pinned
 by `offset_of!`/`size_of` asserts, and RSP is 16-byte aligned at each `call`. `sysretq` to a
@@ -2644,7 +2712,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   clones their own vtable and test `ptr::eq(cx.waker().vtable(), &VTABLE)` before the cast,
   else `wake_by_ref` and return `Pending`. With that change both probes pass under Miri and all
   19 libos tests pass.
-  abi, ownership, soundness, opportunities. Medium.
+  abi, ownership, soundness, opportunities. Medium. **Fix.**
 
 - [ ] **rt-d2** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
   is a safe fn that never reads `self` and passes any address to `sys_memory_unmap`. The kernel
@@ -2661,7 +2729,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   path (objects.rs -> sys.rs:106 -> table.rs:949 `unmap_covering_deferred`), not executed. A
   boot-probe step would settle it: Box a value, unmap its page, read it. Fix: make `unmap`
   unsafe, or return an owning `Mapping` (see rt-o3).
-  abi, ownership, soundness, opportunities. Medium.
+  abi, ownership, soundness, opportunities. Medium. **Fix.**
 
 - [ ] **rt-d3** `userspace/libos/src/objects.rs:167` — `thread_create(&ThreadArgs)` is a safe fn
   that starts a thread at any `entry` on any `user_sp`. The kernel checks only that both are
@@ -2677,7 +2745,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `unsafe` and `thread_create` returns `Ok` on the mock. The kernel side is by reading
   table.rs:538-542. Fix: `unsafe fn` with a `# Safety` section, or a typed
   `Thread::start(extern "C" fn(u64) -> !, Stack, arg0)` (see rt-o6).
-  abi (medium), soundness (low), opportunities (low). Medium.
+  abi (medium), soundness (low), opportunities (low). Medium. **Fix.**
 
 - [ ] **rt-d4** `userspace/liblog/src/lib.rs:103` — `open_source` resolves a SEND endpoint into
   `Logger`, which is `#[derive(Copy, Clone)]` with no `Drop`, and nothing in the crate ever
@@ -2693,7 +2761,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `handle` (grep); `open_source` closes only the PO (line 118); `grep -rn 'open_source('
   userspace` finds the 3 callers. Fix: an owning, non-`Copy` `Logger` closing on drop, plus a
   borrowing constructor for endpoints a supervisor hands over.
-  abi, ownership, soundness. Low.
+  abi, ownership, soundness. Low. **Fix.**
 
 - [ ] **rt-d5** `userspace/libdraw/src/text.rs:247` — libos `Handle::map` returns a bare pointer
   with no owner, and three callers leave mappings behind. In `load`, the `?` on
@@ -2708,7 +2776,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   screen.rs:34-37 and uiclient.rs:158-159, which unmap). Unverified for the text.rs early return:
   no host test reaches `load`; an OOM-injected boot, or a host test behind a libos seam with a
   failing allocator, would settle it.
-  ownership (demonstrated), opportunities (unverified). Low.
+  ownership (demonstrated), opportunities (unverified). Low. **Fix.**
 
 - [ ] **rt-d6** `userspace/libos/src/exec.rs:141` — `Op::drop` closes an in-flight PO, but for a
   forwarded lookup the kernel still installs the resolved handle in the caller's table when the
@@ -2721,7 +2789,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   abandoned lookup, pinning the object. Today `block_on` always drives a lookup to completion.
   Unverified: needs a boot-probe step that issues `sys_ns_lookup` against a server delaying its
   reply, closes the PO, lets the reply land, and counts handles. Not booted.
-  ownership, soundness. Low.
+  ownership, soundness. Low. **Fix**, raised to Medium.
 
 - [ ] **rt-d7** `userspace/test-harness/src/inputclient.rs:72` — input-testclient's `po_wait`
   never closes its PendingOperation; the file imports no close at all. Scenario: each run
@@ -2729,7 +2797,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   of the 15 `fn po_wait*` clones that does.
   Demonstrated: `grep -n 'HANDLE_CLOSE\|syscall1\|fn close' inputclient.rs` finds nothing; all
   15 bodies dumped with awk, and each of the other 14 closes `po` on both paths.
-  ownership. Low.
+  ownership. Low. **Fix.**
 
 - [ ] **rt-d8** `userspace/libos/src/exec.rs:122` — `Op::poll` sets `done` but never reads it, so
   a re-poll after `Ready` waits on the still-open PO again and returns the same `IoResult`,
@@ -2742,7 +2810,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `Waker::noop()`. Output: first and second both `Ready(Ok(IoResult { handle: 1000, ..., result:
   777 }))`, and the assertion that the second poll is `Pending` failed. Fix: return `Pending` or
   panic when `done`, or take the PO out on `Ready`.
-  abi. Low.
+  abi. Low. **Fix.**
 
 - [ ] **rt-d9** `userspace/libos/src/exec.rs:169` — when no `Op` registered a handle, `block_on`
   calls `sys::wait(&[], .., 0)` as a 'poll-yield, not a tight spin', but the kernel refuses count
@@ -2752,7 +2820,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   CPU instead of yielding.
   Demonstrated: path pointed at (exec.rs:167-169 passes an empty slice; kernel check quoted
   above). Not run on target.
-  abi. Low.
+  abi. Low. **Fix.**
 
 - [ ] **rt-d10** `userspace/libos/src/sys.rs:23` — `sys::wait(handles, results, deadline)` is a safe
   fn that passes `handles.len()` as the count and `results` with no length. The kernel writes
@@ -2765,7 +2833,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   to `sys::wait(&[a.po, b.po], &mut one, 0)` compile with no `unsafe`, and the mock, which
   bounds-checks, panicked 'index out of bounds: the len is 1 but the index is 1' at sys.rs:187.
   The target body (sys.rs:27-33) has no such check.
-  ownership. Low.
+  ownership. Low. **Fix.**
 
 - [ ] **rt-d11** `userspace/libfs/src/lib.rs:181` — `read_file` and `copy_file` stat one resolve
   of the path (`file_size`, which closes its handle) and then map a second, independent resolve
@@ -2779,7 +2847,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: needs a boot with a second process racing a rename or truncate against
   `read_file`; libfs issues raw syscalls, so no host test reaches it. Fix: one lookup with
   MAP_READ|INSPECT, then stat and map that same handle, as libdraw text.rs:233-244 does.
-  abi. Low.
+  abi. Low. **Fix.**
 
 **Opportunities**
 
@@ -2804,7 +2872,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   2026-07-24 stack smash, a 16-byte buffer for the 24-byte `HandleInfo`), stale reads after a
   failed clock read, and shared `static mut` out-params. Depends on: nothing; write alongside
   Part E's syscall-surface changes so each is written once. abi, ownership, opportunities.
-  Value high, effort medium.
+  Value high, effort medium. **Plan**, in P7.
 
 - [ ] **rt-o2** encapsulate: a PendingOperation waited on by hand with a raw `sys_wait` into a
   hand-sized `[u8; 24*N]`, the `IoResult` decoded at byte offsets 0/8/16, and the PO closed by
@@ -2829,7 +2897,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   collapsed. Depends on: nothing for the libkern wrapper; for libos, crates that link only
   libkern taking libos as a dependency (it is `no_std`, no alloc) or the maintainer extending
   libkern's one-guard exception as for `Received`. abi, ownership, soundness, opportunities.
-  Value high, effort medium.
+  Value high, effort medium. **Plan**, in P7.
 
 - [ ] **rt-o3** encapsulate: a mapping kept as a bare address, with a slice built by
   `from_raw_parts`/`copy_nonoverlapping` and an unmap the caller must remember, with some sites
@@ -2849,7 +2917,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   libdraw `text::load`; coreutils `whoami`. Closes: rt-d2, rt-d5, slices outliving their unmap,
   a `&[u8]` built over memory another process writes (libsurface screen.rs:33). Depends on:
   nothing for the type; libfs adopting it needs rt-o4. abi, ownership, soundness,
-  opportunities. Value high, effort medium.
+  opportunities. Value high, effort medium. **Plan**, in P7.
 
 - [ ] **rt-o4** encapsulate: libfs holds files, POs and mappings as raw `u64` handles closed by
   hand on every path, although layering (libfs above librsproto above libos) allows libos —
@@ -2868,7 +2936,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   hand-placed closes in runtime, 356 userspace-wide), rt-d4, and by construction the rt-d11
   stat-one-map-another race; nearly all of libfs's 30 unsafe blocks go, the largest share of
   the subsystem's unsafe after hello. Depends on: rt-o1, rt-o2, rt-o3. abi, ownership,
-  soundness, opportunities. Value high, effort medium.
+  soundness, opportunities. Value high, effort medium. **Plan**, in P7.
 
 - [ ] **rt-o5** encapsulate: an IPC message built and read as raw `[u8; 4096]`, `payload_len`
   stamped and parsed at bytes 4..8 by hand with a local `const PAYLOAD_OFF: usize = 24` — 67
@@ -2889,7 +2957,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   refused with `InvalidArgument`, the send result ignored (a probe encoding 4040 bytes made a
   4064-byte record). Today the outcome matches liblog's documented 'dropped' behaviour only by
   luck. Also closes header fields at hand-typed offsets. Depends on: nothing. abi,
-  soundness, opportunities. Value medium, effort small to medium.
+  soundness, opportunities. Value medium, effort small to medium. **Plan**, in P7.
 
 - [ ] **rt-o6** narrow/encapsulate: `spawn(&SpawnArgs)` and `thread_create(&ThreadArgs)` are safe
   wrappers over raw ABI blocks; a thread's stack and entry, and the handles `move_mask` moves,
@@ -2910,7 +2978,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   spawns, stage.rs:486 and bootprobe/exits.rs:225. Home: libos objects.rs. Closes: rt-d3, and a
   moved handle closed by its old owner after a successful spawn or leaked after a failed one.
   Depends on: nothing for the `unsafe fn` and `Spawn` builder; rt-o3 for `Stack`. abi,
-  ownership, opportunities. Value medium, effort medium.
+  ownership, opportunities. Value medium, effort medium. **Plan**, in P7.
 
 - [ ] **rt-o7** encapsulate: bootstrap handles arrive at `_start` as bare `u64`s and travel as
   `root_ns: u64`; each consumer re-wraps with `unsafe Handle::borrow` or declares its own `unsafe
@@ -2925,7 +2993,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   libos. Checked against heartbeat `_start`, libdraw `text::load` (takes `&Handle<Namespace,
   impl CanLookup>`, no longer unsafe), libsurface `screen::read`. Closes: a borrow that outlives
   its owner and the per-crate unsafe raw-namespace contracts. Depends on: the entry/std-port
-  seam decision (`libos.md`). opportunities. Value medium, effort large.
+  seam decision (`libos.md`). opportunities. Value medium, effort large. **Plan**, in P7.
 
 - [ ] **rt-o8** narrow: `Handle::borrow(raw, rights)` yields a full `Handle` with no lifetime, on
   which safe `without_transfer`, `without_duplicate`, `into_read_only` and `into_raw` act on a
@@ -2945,6 +3013,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (forbidden only in `borrow`'s doc), `into_raw` on a borrow reaching a spawn's `move_mask`, a
   borrow outliving its owner, and `unsafe` blocks that hold no memory obligation and dilute
   those that do. Depends on: nothing. ownership, soundness. Value medium, effort small.
+  **Plan**, in P7.
 
 - [ ] **rt-o9** remove: local re-implementations of `kprint` and `exit` over raw
   `SYS_DEBUG_KPRINT` / `SYS_PROCESS_EXIT` although `libkern::debug::{kprint, exit}` exist (`exit` is
@@ -2956,7 +3025,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   local fns and use `libkern::{kprint, exit}`; heartbeat's `kprint_u32` becomes
   `libkern::kprint_u64` or `debug::Line`. Home: libkern::debug (already there). Closes: nothing
   new; removes 24 unsafe blocks and the spin-after-exit loops that paper over a non-diverging
-  `syscall1`. Depends on: nothing. abi. Value low, effort small.
+  `syscall1`. Depends on: nothing. abi. Value low, effort small. **Plan**, in P7.
 
 - [ ] **rt-o10** remove: `static mut` buffers in hello and heartbeat used as syscall out-params and
   receive buffers, with the `unsafe` `channel_recv_raw` used where the safe `channel_recv` with
@@ -2973,7 +3042,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   four receives and its `STAT_BUF`/`CLOCK_BUF`. Closes: a data race on a shared static the day
   either program grows a second thread (`thread_create` is one call away). Depends on: rt-o1
   for the CLOCK/STAT statics to lose their remaining `unsafe` and not just the `static`.
-  soundness, opportunities. Value low, effort small.
+  soundness, opportunities. Value low, effort small. **Plan**, in P7.
 
 - [ ] **rt-o11** narrow: 6 of libos's 13 `cfg(not(test))` seam functions in `sys.rs` are safe but
   take an address as `u64` or rely on an unchecked length: `wait` (`results.len() >=
@@ -2988,7 +3057,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   reached only from `Mapping::drop`. The mock takes the same types and records lengths, so host
   tests exercise what the real call is handed. Home: libos sys.rs. Closes: the rt-d10 overrun
   the mock hides, and the shape of the rt-d2 defect. Depends on: rt-o3 for `memory_unmap`.
-  abi, ownership, soundness, opportunities. Value low, effort small.
+  abi, ownership, soundness, opportunities. Value low, effort small. **Fix.**
 
 - [ ] **rt-o12** narrow: libheap's engine turns `usize` addresses back into pointers with `as *mut`,
   so pointers it hands out carry only exposed provenance and Miri runs it only in permissive
@@ -3000,7 +3069,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `ArenaSource`'s integer becomes a pointer once, at map. Home: libheap. Closes: provenance-
   dependent UB the host tests cannot see; today Miri with `-Zmiri-strict-provenance` stops at
   lib.rs:225 on `many_allocations_grow_arenas_without_overlap`. Depends on: nothing.
-  soundness, opportunities. Value low, effort small.
+  soundness, opportunities. Value low, effort small. **Fix.**
 
 - [ ] **rt-o13** remove: `DeviceRecord::read` and `as_bytes` reinterpret bytes as the struct with
   `unsafe`, while the same file's `IoSnapshot::get` and abi.rs's `FramebufferInfo::from_bytes`
@@ -3011,7 +3080,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `to_le_bytes() -> [u8; 144]` encoder for device-mgr's Arrived body (device-mgr/src/main.rs:567).
   Home: libkern device.rs. Closes: a reinterpretation sound only while the struct has no
   padding, which only offset asserts hold today. Depends on: nothing. opportunities. Value
-  low, effort small.
+  low, effort small. **Later.**
 
 What held up: libkern's `syscall6` asm (no `nomem`/`readonly`, rcx/r11 clobbered, matching the
 kernel entry stub, which preserves rdi/rsi/rdx/r8/r9/r10) and `exit`'s `noreturn` (the kernel's
@@ -3068,7 +3137,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `cargo check --release --target ../x86_64-unknown-nitrox.json -Z build-std=core,alloc,compiler_builtins`.
   Miri on a replica of the pair reports `Undefined Behavior: trying to retag ... for
   SharedReadOnly permission ... that tag does not exist in the borrow stack`. Probes restored.
-  abi, ownership, soundness, opportunities. Medium.
+  abi, ownership, soundness, opportunities. Medium. **Fix.**
 - [ ] **sup-d2** `userspace/storage-service/src/main.rs:1115` — `serve_dir` sizes its ReadDir body
   buffer as the IPC payload (`MSG_LEN - PAYLOAD_OFF - 64` = 4008 bytes) instead of `RS_MAX_BODY`
   (3980), and `let _ = send(..)` at 1128-1129 drops the refusal. A listing that fills past 3980
@@ -3081,6 +3150,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   RS_MAX_BODY=3980 encoded=None`. The control with an `RS_MAX_BODY` buffer printed `packed=116
   body=3958 encoded=Some(3986)`. The kernel publishes every in-use GPT entry (up to 128) and
   device-mgr's replay depth reaches them. Test removed. abi, soundness, opportunities. Medium.
+  **Fix.**
 - [ ] **sup-d3** `userspace/service-mgr/src/main.rs:1248` — an admin Start or Restart of a
   declaration that bring-up has not reached yet is allowed, and when bring-up reaches it,
   `start(i, true)` spawns it again and overwrites `proc_h` and `ctrl` without closing them.
@@ -3094,6 +3164,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   main.rs, which does not build on the host. A test-image boot whose probe sends an admin Start of
   nxterm while display-selftest runs would print `starting service 'nxterm'` twice. The fix is to
   skip or refuse when `running` is true. ownership. Medium.
+  **Fix**, with the bash's sup-9, moved here from Part H.
 - [ ] **sup-d4** `userspace/service-mgr/src/main.rs:1369` — `lookup_serving` closes its lookup's
   PendingOperation at the deadline, but the kernel still installs the server's late reply handle
   in service-mgr's table, where nothing knows its value. `derive()` resolves device-mgr's
@@ -3109,7 +3180,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `lookup_serving`, `complete_resolve_reply` and `deliver_to_client`. A boot where device-mgr
   answers `info-endpoint` more than 5 s late (a probe sleep in `mint_info_endpoint`) would show
   `info_ends.len()` at 1 after service-mgr logged "gave no info-endpoint" and service-mgr's
-  handle count growing. ownership, opportunities. Medium.
+  handle count growing. ownership, opportunities. Medium. **Fix**, as rt-d6.
 - [ ] **sup-d5** `userspace/init/src/main.rs:420` — init discards the process handle of every
   fs-server and of the profile server it spawns (`let _ = fs_h;`, `let _ = ps_h;` at 559), and
   leaks it on every failure after the spawn: 377-410 and 516-553. The comments say init keeps
@@ -3121,7 +3192,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: `grep -n 'fs_h\|ps_h' userspace/init/src/main.rs` shows only the spawn, the `< 0`
   test and the discard, with no store and no close. Unverified: that the frames stay pinned in a
   running system; a boot that kills a mount's server and reads free memory would settle it. abi,
-  ownership, soundness, opportunities. Low.
+  ownership, soundness, opportunities. Low. **Fix.**
 - [ ] **sup-d6** `userspace/service-mgr/src/main.rs:402` — safe functions take raw pointers that
   they dereference, or hand to the kernel to write and then read. `spawn_with_control(root_ns,
   path, args: *mut SpawnArgs)` writes `(*args).image`, `handles`, `handle_count` and `move_mask`.
@@ -3135,7 +3206,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `spawn_with_control(0, b"/bin/x", core::ptr::null_mut())` and `make_channel(dangling, dangling)`
   from safe fns built clean for `x86_64-unknown-nitrox`. A positive control in service-mgr (a
   `u8 = "str"` mismatch) gave `E0308`, so the bin is type-checked. Probes restored. abi,
-  ownership, soundness, opportunities. Low.
+  ownership, soundness, opportunities. Low. **Fix.**
 - [ ] **sup-d7** `userspace/storage-service/src/main.rs:399` — `DeviceIo::read_at`'s SAFETY
   argument `intra + want <= span <= SCRATCH` does not hold, because the record's
   `logical_block_size` is taken unvalidated from a USB stick's READ CAPACITY (kernel scsi.rs:96,
@@ -3147,7 +3218,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   every probe of it reads as empty. A change that maps the scratch larger than its object, or
   drops the `moved != span` check, would read past the mapping. Demonstrated: the lines 377-380
   arithmetic replayed in Python gives span 66000 (3000), 66040 (520) and 131072 (131072), all
-  `span<=SCRATCH` False, and True for 512 and 4096. abi, soundness, opportunities. Low.
+  `span<=SCRATCH` False, and True for 512 and 4096. abi, soundness, opportunities. Low. **Fix.**
 - [ ] **sup-d8** `userspace/init/src/main.rs:181` — init maps exactly one page of
   `/initramfs/etc/init.toml` ("assumed to fit") and parses to the last non-NUL byte of that page,
   while the storage service maps the object's whole `HandleInfo.size` (main.rs:313-321, 457-459),
@@ -3160,7 +3231,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   byte 4096, run as `cargo test -p libinittoml --lib probe_a_manifest_past_one_page`, printed
   "init (one page) sees 1 mount(s); the storage service (whole object) sees 2". The kernel maps a
   prefix of a larger object without complaint (table.rs:878). Test removed. abi, opportunities.
-  Low.
+  Low. **Fix.**
 - [ ] **sup-d9** `userspace/init/src/main.rs:181` — init maps the init.toml page (181/189) and
   `/system/current-generation` (577/585) and never unmaps either, so PID 1 keeps both mappings,
   and the second pins a root-filesystem FileObject through shutdown's sync and `Meta::Unmount` of
@@ -3168,7 +3239,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kernel mapping outlives the handle. read_manifest's comment at 239-240 says the mapping was kept
   on purpose; read_current_generation has no such comment. Demonstrated: `grep -n -i
   'unmap\|MEMORY_MAP\|\.map(' userspace/init/src/main.rs` finds the two maps and no unmap.
-  ownership, opportunities. Low.
+  ownership, opportunities. Low. **Fix**, as rt-d5.
 - [ ] **sup-d10** `userspace/device-mgr/src/main.rs:176` — `read_registry` and `read_io` (176,
   204) and storage-service `with_mapped` (main.rs:327) unmap with size 0, which works only because
   `sys_memory_unmap` ignores `size` today (table.rs:949, `_size` unused). syscall-abi.md:529 says
@@ -3176,12 +3247,13 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   resolve and every manifest read would leave a mapping that pins a snapshot object. The same
   files pass the real length elsewhere (device-mgr 226, storage 486). Latent until that kernel
   change. Demonstrated: the three call sites pass 0 and the kernel ignores it, by code read. No
-  test can run it today. ownership, opportunities. Low.
+  test can run it today. ownership, opportunities. Low. **Fix.**
 - [ ] **sup-d11** `userspace/device-mgr/src/main.rs:654` — the `/dev/registry/changes` handle is
   dropped without a close when the change page cannot be created or mapped: the struct literal
   stores `changes: if change_at == 0 { 0 } else { changes }` and the other arm never closes it, so
   the handle stays in device-mgr's table for its life. This is reached when `SYS_MEMORY_CREATE` or
   `SYS_MEMORY_MAP` fails at startup. Demonstrated: code read of main.rs:637-654. ownership. Low.
+  **Fix.**
 - [ ] **sup-d12** `userspace/device-mgr/src/main.rs:694` — the main loops of device-mgr (694-731)
   and storage-service (main.rs:1477-1519) read wait record `j` lazily from `static mut
   WAIT_RESULTS` after the handlers for earlier records have run nested waits (`lookup`, `po_wait`,
@@ -3195,7 +3267,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `lookup`; storage `serve_resolve(File)` -> `refresh_unmounted` -> `read_at` -> `po_wait` (155),
   `unmount` -> `held_files` -> `park` -> `wait_until` (132). service-mgr already uses a stack
   buffer in `wait_serving`. Unverified: main.rs is not host-testable. A host test of an extracted
-  dispatch with a two-handle nested wait would settle it. abi, ownership. Low.
+  dispatch with a two-handle nested wait would settle it. abi, ownership. Low. **Fix.**
 - [ ] **sup-d13** `userspace/storage-service/src/main.rs:161` — `po_wait` closes the PO and
   reports failure when `sys_wait` returns without it signalled, though the read it waited on may
   still be in flight into the shared Scratch object. `read_at` returns `Err(Io)` and the next
@@ -3207,7 +3279,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `obj_add_waiter` for one PO while its IRP is in flight, then a check of what the next read
   returns. No boot was run; widening a window is not allowed. A host test faking a wait that
   returns unsignalled and then submitting a second read into the same Scratch would show it.
-  ownership, soundness. Low.
+  ownership, soundness. Low. **Fix.**
 - [ ] **sup-d14** `userspace/init/src/main.rs:692` — handoffs are read by position, and a handoff
   whose send fails is closed with nothing sent in its place, so every later handle shifts one
   slot. The code sends an empty message for a zero handle but not for a failed send. Same in
@@ -3217,7 +3289,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   takes the profile endpoint as fs, so each session binds `/home` to the profile server, and the
   third receive waits 30 s. A failed tty send to session-mgr shifts clip into tty, and so on.
   Unverified: needs a send failure injected mid-sequence. Read of init main.rs:676-699 and
-  service-mgr 463-482, 556-560 and 584-586. ownership. Low.
+  service-mgr 463-482, 556-560 and 584-586. ownership. Low. **Fix.**
 
 **Opportunities**
 
@@ -3243,7 +3315,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   memory (`dup_endpoint`, `close_retained_endpoints`). It leaves `unsafe` only where memory
   crosses: wait, send/recv, map, spawn. Depends on: Part E's syscall changes, so callers move
   once (they would rename wrappers, not add sites). abi, soundness, opportunities. Value high,
-  effort medium.
+  effort medium. **Plan**, as rt-o1, in P7.
 - [ ] **sup-o2** encapsulate: raw `u64` handles owned by convention and closed by hand at each
   exit, in locals, struct fields, `Vec<u64>`s and handle-holding statics — 143 manual close
   points (`grep -nE '(^|[^_a-z.])close\(' <the six files> | grep -v 'fn close('` = 101 helper
@@ -3259,7 +3331,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   objects.rs). Closes: handles leaked on error paths (sup-d5, sup-d11) and overwrite leaks
   (sup-d3), and double closes made possible by copied teardown. Generation numbers already make a
   double close harmless, so leaks are the class closed. Depends on: sup-o1 and the send API in
-  sup-o4, and Part E. ownership, opportunities. Value high, effort large.
+  sup-o4, and Part E. ownership, opportunities. Value high, effort large. **Plan**, in P7.
 - [ ] **sup-o3** remove: `static mut` used as scratch, out-param, spawn block or process state
   where a local or a struct field does the same job — 51 sites (`grep -n '^static mut'` over the
   five mains: init 16, service-mgr 15, logging 10, device-mgr 5, storage 5), such as
@@ -3275,7 +3347,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (`Box<[u8; 4096]>`) or the stack, which is 8 MiB (kernel arch/x86_64/abi.rs:26). Home: each
   crate's main.rs. Closes: reentrancy through a shared buffer (sup-d12), ownership by convention
   in init's state statics, and the static that makes `received() -> Message<'static>` (sup-d1)
-  possible. Depends on: nothing. opportunities, ownership. Value high, effort medium.
+  possible. Depends on: nothing. opportunities, ownership. Value high, effort medium. **Fix.**
 - [ ] **sup-o4** encapsulate: IPC messages through `static mut [u8; 4096]` buffers, the header
   parsed by byte offset, the payload sliced with `from_raw_parts(add(24), len.min(4072))`, sends
   framed by hand into `[24..]` — 34 sites (`grep -rn "channel_recv_raw("` = 10 receives, 9
@@ -3295,7 +3367,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   stale header flags carried from a receive into the next send through one static (init
   `IPC_MSG`), and positional handoffs with nowhere to send a placeholder (sup-d14). Depends on:
   nothing; easier after sup-o1. abi, ownership, soundness, opportunities. Value high, effort
-  medium.
+  medium. **Plan**, as rt-o5, in P7.
 - [ ] **sup-o5** encapsulate: `sys_wait` through static `WAIT_HANDLES`/`WAIT_RESULTS`, each
   `IoResult` decoded by byte offset (status at 8..12, result at 16..24) — 14 sites (`grep -rn
   SYS_WAIT` over the five src dirs: init 4, service-mgr 4, storage 3, device-mgr 2, logging 1; 13
@@ -3314,7 +3386,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   main.rs:157 records ("read whole, AlreadyExists would never compare equal"); results buffers
   sized by expectation; a handle dropped silently at capacity. It removes all 10 wait statics.
   Depends on: nothing (sup-o1 helps). abi, ownership, soundness, opportunities. Value high, effort
-  medium.
+  medium. **Plan**, as rt-o2, in P7.
 - [ ] **sup-o6** encapsulate: each server hand-writes the same reply plumbing (send, `reply_error`,
   `reply_channel`, `reply_with_object`/`reply_table`, `reply_subnamespace`, `serve_dir`), and the
   copies have drifted on the rules each must keep — 19 sites (`grep -nE 'fn
@@ -3334,7 +3406,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   librsproto (server-side module; the four servers link it, init does not serve). Closes: bodies
   sized against the wrong bound (sup-d2), a failed reply that hangs a forwarded resolve, and IPC
   header bytes stamped by offset at 15 sites. Depends on: sup-o4 and sup-o7. opportunities. Value
-  medium, effort medium.
+  medium, effort medium. **Plan**, in P7.
 - [ ] **sup-o7** encapsulate: memory mapped by hand (stat, map, `from_raw_parts` or
   `copy_nonoverlapping`, unmap with a caller-supplied length, or never) — 10 map sites with 6
   unmaps (`grep -rn "SYS_MEMORY_MAP\|SYS_MEMORY_UNMAP\|\.map(PAGE"` over the five src dirs; 6
@@ -3354,7 +3426,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kernel's check); a slice outliving its unmap; and reply-copy drift, since service-mgr narrows
   the object it hands out and the other two send the creation handle, harmless only because the
   kernel installs requested and granted rights intersected. Depends on: nothing. abi, ownership,
-  soundness, opportunities. Value medium, effort small.
+  soundness, opportunities. Value medium, effort small. **Plan**, as rt-o3, in P7.
 - [ ] **sup-o8** encapsulate: a hand-written "`sys_ns_lookup`, wait on the PO, read the result at
   16..24, close the PO" helper per crate, each closing the PO whether or not the lookup completed
   — 5 sites (`grep -rnE "^fn (ns_lookup_wait|ns_lookup|lookup)\("` gives 4, plus service-mgr
@@ -3370,7 +3442,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   byte-offset status decode per copy, and results orphaned by a PO closed before completion
   (sup-d4 and its siblings). Depends on: nothing for the dedup; a kernel change to `sys_ns_lookup`
   completion (Part E's syscall surface) for the timeout case. ownership, soundness. Value medium,
-  effort small for the dedup, medium with the kernel half.
+  effort small for the dedup, medium with the kernel half. **Fix.**
 - [ ] **sup-o9** encapsulate: the five event loops (init `reap_loop`, service-mgr `Mgr::run`,
   device-mgr and storage-service `_start` loops, logging `serve_loop`) hold all 225 unsafe blocks,
   and no host test or Miri reaches any of them — 5 sites (per-file `grep -c unsafe`: 0 in every
@@ -3386,6 +3458,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   multi-handle waits) and each crate's lib.rs. Closes: the absence of any CI reach into this
   `unsafe`. It would have reached three of this survey's defects (sup-d1, sup-d2, sup-d4) without
   a boot. Depends on: sup-o1, sup-o2, sup-o5. opportunities. Value medium, effort large.
+  **Plan**, in P7.
 - [ ] **sup-o10** remove: `SpawnArgs` kept as `static mut` templates, stamped in place and spawned
   through a raw pointer (an `unsafe fn` in init, a safe fn over `*mut` in service-mgr) — 4 spawn
   calls carrying 7 static SpawnArgs (`grep -n 'SYS_PROCESS_SPAWN\|static mut SPAWN'`: init 166,
@@ -3402,7 +3475,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   SpawnArgs)` (sup-d6); fields carried between spawns in a shared static (SPAWN_SERVICE's
   `handles[0]`/`rights[0]` keep the previous child's values, masked today by `handle_count = 0`).
   It removes 7 statics and 1 `unsafe fn`. Depends on: nothing (the builder wants owned handles
-  from sup-o2). abi, ownership, soundness, opportunities. Value medium, effort small.
+  from sup-o2). abi, ownership, soundness, opportunities. Value medium, effort small. **Fix.**
 - [ ] **sup-o11** remove: local redefinitions of operations that already have a safe form —
   `kprint` over raw `SYS_DEBUG_KPRINT`, `exit` over raw `SYS_PROCESS_EXIT`, and an `asm!("pause")`
   loop — 5 sites (`grep -n 'fn kprint\|fn exit\|SYS_PROCESS_EXIT\|asm!'` over the mains), such as
@@ -3411,7 +3484,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `libkern::debug::{kprint, exit}` (device-mgr and storage already do) and
   `core::hint::spin_loop()` (service-mgr 2247 and logging 150 already do). Home: libkern::debug /
   core. Closes: three `unsafe` blocks and the subsystem's only inline assembly. Depends on:
-  nothing. opportunities. Value low, effort small.
+  nothing. opportunities. Value low, effort small. **Plan**, as rt-o9, in P7.
 - [ ] **sup-o12** encapsulate: `ChildExited` decoded by byte offset from a static `Notification`
   (pid at body[0..4], code at body[8..12]), ignoring `ExitStatus.kind` — 2 sites (`grep -n
   'KIND_CHILD_EXITED'` over the mains), `userspace/init/src/main.rs:777-780` and
@@ -3422,7 +3495,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   out-value. Home: libkern `abi.rs` (the accessor) and libos `objects.rs`. Closes:
   byte-offset decoding of a kernel ABI body at each consumer, and the crash-read-as-exit-code
   confusion that service-mgr's `should_restart` inherits. Depends on: nothing. opportunities.
-  Value low, effort small.
+  Value low, effort small. **Plan**, in P7.
 
 What held up: every receive buffer holds a whole message (all 4096-byte, kernel copies exactly
 `IPC_MSG_SIZE`), and every `sys_wait` results buffer holds 24 bytes per waitable handle with each
@@ -3479,7 +3552,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the kernel's `SubtreeBase::from_path` refusing all of them and accepting `/home/alice`
   (`cargo test --lib --target x86_64-unknown-linux-gnu survey_probe`). The only `tty_close`
   calls are at 252-254 and 274-276, and tty-server/src/main.rs:43 and :290 refuse the 15th
-  terminal. ownership, soundness. Medium.
+  terminal. ownership, soundness. Medium. **Fix**, with the bash's sec-12, moved here from Part H.
 - [ ] **sec-d2** `userspace/libos/src/exec.rs:133` — `Op::poll` is a safe `Future` impl that
   turns `cx.waker().data()` into `&Reactor`. It is sound only when libos's `block_on` built the
   Waker, so a foreign Waker makes safe code produce a null or foreign reference. libos is
@@ -3491,7 +3564,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the Waker, would make it memory corruption in init. Demonstrated: a temporary host test
   `probe_op_polled_by_a_foreign_waker` (scripted not-ready mock, `Waker::noop()`) aborted with
   'panicked at libos/src/exec.rs:133:32: null reference produced'. Probe removed. opportunities.
-  Medium.
+  Medium. **Fix**, as rt-d1.
 - [ ] **sec-d3** `userspace/libsession/src/lib.rs:208` — `authenticate` (and `views_call`, line
   252) takes the next message on a long-lived channel as the answer to its request. The request
   id is always 1 and is never compared, and the reply's principal is never compared with
@@ -3505,7 +3578,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   The same bite follows from putting a deadline on these waits, when a slow PBKDF2 outruns it.
   Contrast session-mgr `tty_request` (fresh ids) and the broker's `ask_auth` (closes the
   channel on give-up). Unverified: fail one `sys_channel_recv` allocation on the auth channel
-  under QEMU, or add a host seam for libsession's syscalls. abi. Medium.
+  under QEMU, or add a host seam for libsession's syscalls. abi. Medium. **Fix.**
 - [ ] **sec-d4** `userspace/auth-service/src/main.rs:73` — `ADMIN_REPLY` is sized
   `MSG_LEN - PAYLOAD_OFF - 64` = 4008 (a whole payload) where a reply body may be at most
   `RS_MAX_BODY` = 3980. A List body of 3981..=4008 bytes is built as `Admin::Reply`, then
@@ -3519,7 +3592,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `serve_admin(OP_AUTH_LIST)` into a 4008-byte buffer returned `Admin::Reply(4002..4007)`,
   `librsproto::encode` into the 4072-byte tail returned None ('list body 4007 bytes;
   RS_MAX_BODY 3980', 'encode -> None'). Control: a reply buffer of `RS_MAX_BODY` gives
-  `Refused(ListTooLong)`. abi, soundness, opportunities. Low.
+  `Refused(ListTooLong)`. abi, soundness, opportunities. Low. **Fix.**
 - [ ] **sec-d5** `userspace/view-broker/src/main.rs:1447` — `let (Ok((setup_ours,
   setup_child)), Some((life_ours, life_child))) = (pipe(1), make_channel(1)) else {..}`
   evaluates both creates, and when exactly one fails the else arm closes `image` and `view_ns`
@@ -3528,7 +3601,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   pair stays in the essential broker's table for the boot, holding its kernel rings, and each
   later failure adds two. Demonstrated by the path: both pairs are plain `u64`s with no Drop
   (libstream setup.rs:244-253, main.rs:273-278), and the else arm at 1448-1450 names neither.
-  Not run. abi, ownership, soundness, opportunities. Low.
+  Not run. abi, ownership, soundness, opportunities. Low. **Fix.**
 - [ ] **sec-d6** `userspace/libsession/src/lib.rs:1042` — Two error paths in `spawn_leader`
   return -1 without giving back what they took. A failed setup send leaves the leader's Process
   handle `h` open, so the leader is unsupervised and the process pinned. A failed `pipe`
@@ -3540,7 +3613,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   FileObject handle on every attempt. Demonstrated by the path: `h` is closed only at 1064 and
   1081, the `sent.is_err()` return at 1042-1045 closes only `setup_mgr`, and the pipe `Err` arm
   at 950-953 never reaches the image close at 965. Not run, since every step is a syscall.
-  ownership, soundness, opportunities. Low.
+  ownership, soundness, opportunities. Low. **Fix.**
 - [ ] **sec-d7** `userspace/session-mgr/src/main.rs:299` — `login()` reads the typed password
   into the stack array `pass: [u8; 128]` and never zeroes it, against session-mgr's CLAUDE.md
   ('does not keep it'). `libsession::authenticate` scrubs its own two copies, and
@@ -3549,7 +3622,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   it. The tty READ_LINE reply in `RECV_MSG` is also kept if the following `tty_set_echo` send
   fails, until the next successful receive. Demonstrated by the path: `grep scrub
   userspace/session-mgr/src/main.rs` finds nothing, and 299-307 fill, use and drop `pass`.
-  Memory not read. abi, ownership, soundness, opportunities. Low.
+  Memory not read. abi, ownership, soundness, opportunities. Low. **Fix.**
 - [ ] **sec-d8** `userspace/libcrypto/src/hmac.rs:19` — `HmacSha256::new` leaves the key in `k`,
   in `ipad` and in the `opad` field (key XOR 0x5c), and nothing zeroes them. The type has no
   Drop, and `pbkdf2_hmac_sha256` clones it once per iteration. When PBKDF2 keys it the key is
@@ -3557,7 +3630,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `scrub_request` zeroing `RECV_MSG` does not satisfy auth-service/CLAUDE.md. Demonstrated: a
   probe test (restored) recovered the key from `opad` XOR 0x5c; `needs_drop::<HmacSha256>()`
   was false and a clone carried the same bytes (`cargo test -p libcrypto --lib survey_probe`:
-  1 passed). ownership. Low.
+  1 passed). ownership. Low. **Fix.**
 - [ ] **sec-d9** `userspace/libsession/src/lib.rs:719` — `registry_blocks` maps the registry
   snapshot with `info.size` (703) but unmaps it with size 0. It frees the mapping only because
   `sys_memory_unmap` ignores its size argument today (`_size`, TODO(mm),
@@ -3567,6 +3640,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `start` → `rebind_block_devices_except` → `block_indices` → `registry_blocks`, as in `with
   admin nxinstall`) would then leak a registry mapping in the broker. Demonstrated by the path:
   every other unmap in scope passes the mapped length. Not run. soundness, opportunities. Low.
+  **Fix.**
 - [ ] **sec-d10** `userspace/libsession/src/lib.rs:219` — `authenticate` copies
   `min(home.len(), home_out.len())` bytes and still reports success. The supervisors pass
   256-byte buffers while auth-service's reply admits a home up to about 500 bytes, so a longer
@@ -3578,7 +3652,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   bytes is refused by the kernel (NS_SUBTREE_BASE_MAX) before the truncation matters, which
   becomes sec-d1's path. Demonstrated by the path: `let n = r.home.len().min(home_out.len());
   ...; (true, n)` at 219-221, and a host probe that a 300-byte home authenticates and comes
-  back whole. The wrong-/home binding itself was not run. abi, opportunities. Low.
+  back whole. The wrong-/home binding itself was not run. abi, opportunities. Low. **Fix.**
 - [ ] **sec-d11** `userspace/view-broker/src/main.rs:1489` — `start()` treats an `Err` from
   `send_setup_full` as 'the stream handles are still ours', which is not always true. A Block
   send that committed closes the moved handles first, then fails to install the PO handle on a
@@ -3589,7 +3663,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `send_setup_full`'s Result (libstream setup.rs:293-306) cannot say whether the handles moved.
   Unverified: a full broker handle table under QEMU, or a kernel host test of
   `sys_channel_send`'s Block path at a full table asserting the sender's handles are gone while
-  Err is returned. abi, ownership. Low.
+  Err is returned. abi, ownership. Low. **Fix.**
 - [ ] **sec-d12** `userspace/auth-service/src/main.rs:365` — `serve_session` frees the session
   slot and closes the channel on any receive error. Its comment says a closed peer frees it,
   but OutOfMemory, which `sys_channel_recv` returns with the message still queued, closes a
@@ -3599,7 +3673,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   PeerClosed and prints 'login incorrect' until reboot. The broker re-resolves `auth_ch` only
   while it is 0, so every `with` password fails for the boot. Compare the broker's `recv_full`,
   which treats only PeerClosed as gone. Unverified: OOM injection into one `sys_channel_recv`
-  under QEMU. abi. Low.
+  under QEMU. abi. Low. **Fix.**
 - [ ] **sec-d13** `userspace/view-broker/src/main.rs:73` — The child end of the life channel is
   spawned with every right an endpoint has: `SPAWN.rights` is `u64::MAX`, intersected with
   `channel_endpoint_rights` (SEND|RECV|DUPLICATE|TRANSFER|INSPECT|WAIT). A program that
@@ -3610,7 +3684,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   This is not the residual TODO(child-exit-attribution) records (two exits in one wake). The
   premise needs checking: the program is never told the life handle's slot, so it must find it
   by enumerating its handles. Unverified: a boot probe that runs a program duplicating its
-  handles and checks the reported codes. ownership. Low.
+  handles and checks the reported codes. ownership. Low. **Fix.**
 - [ ] **sec-d14** `userspace/libsession/src/lib.rs:27` — Safe `pub fn`s read and write
   process-wide `static mut` buffers (`authenticate`, `ns_lookup`, `views_open_session` and
   `views_close_session`, `build`, `build_namespace`, `spawn_leader`, `drain_for_stop`,
@@ -3623,7 +3697,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `authenticate` and `views_call` so that one sends the other's bytes, or a mix carrying a
   password, or one's scrub zeroes the other's message. Unverified: the interleaving needs
   syscalls, so neither a host test nor Miri reaches it; sec-o2 and sec-o5 make it structural.
-  opportunities. Low.
+  opportunities. Low. **Fix.**
 
 **Opportunities**
 
@@ -3646,7 +3720,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   sec-d6), a handle closed after a send moved it (sec-d11), and a Copy struct of handles used
   after the move. Depends on: libos gaining Channel and File types, and lifting the 'no libos'
   rule in userspace/session-mgr/CLAUDE.md (which libsession follows), or the libkern variant.
-  ownership, soundness, opportunities. Value high, effort large.
+  ownership, soundness, opportunities. Value high, effort large. **Plan**, as sup-o2, in P7.
 - [ ] **sec-o2** encapsulate: message I/O through `static mut` 4 KiB buffers, with the IpcMsg
   header (`payload_len` at 4..8, `handle_count` at 8) stamped by hand, a `from_raw_parts`
   payload view clamped to `MSG_LEN - PAYLOAD_OFF` (4072, not `IPC_PAYLOAD_SIZE` 4008), a raw
@@ -3674,6 +3748,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   view-broker `send`'s `REPLY_HANDLES[..handles.len()]` panic for over 8 handles. Depends on:
   nothing for the libkern variant; libos lacks a Channel marker, and auth-service must stay
   alloc-free. abi, ownership, soundness, opportunities. Value high, effort medium.
+  **Plan**, as rt-o5, in P7.
 - [ ] **sec-o3** encapsulate: a request/reply exchange on a long-lived channel written out by
   hand with a fixed request id (1); some sites take the next message as the answer, others
   match the id but must close the channel on a timeout — 8 sites (the six fixed-id sends found
@@ -3690,7 +3765,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Clipboard) with id matching, a deadline and handles. Home: librsproto::session (`io`
   feature). Closes: a reply read by position (sec-d3, the stale AUTHENTICATED and `views_call`
   session id) and the tty INTERRUPT bug session-mgr's CLAUDE.md records. Depends on: nothing;
-  shares its buffer type with sec-o2. abi. Value high, effort medium.
+  shares its buffer type with sec-o2. abi. Value high, effort medium. **Fix.**
 - [ ] **sec-o4** encapsulate: how long a password lives in memory depends on hand-placed
   `scrub()` calls; the two places without one leak it — 32 sites (`grep -nE
   "scrub\(|scrub_request\(\)"` over auth-service, view-broker, session-mgr, libsession,
@@ -3705,7 +3780,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `IpcBuf::scrub` (sec-o2). Home: libkern (`Secret`, beside `scrub`), libcrypto (its own
   Drop). Closes: a password copy dropped unscrubbed (sec-d7, sec-d8) and a scrub skipped by an
   early return added later. Depends on: nothing. ownership, soundness. Value medium, effort
-  medium.
+  medium. **Fix.**
 - [ ] **sec-o5** encapsulate: sys_wait through a hand-sized results byte buffer, `IoResult`
   decoded by byte offset (handle 0..8, status 8..12, result 16..24), and the lookup-and-wait PO
   helper rewritten in each crate — 9 sites (`grep -rn "SYS_WAIT," auth-service/src
@@ -3726,6 +3801,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   buffer, and a handle silently dropped past capacity. Removes about 13 unsafe blocks and 8
   static muts. Depends on: nothing (a WaitSet/libos variant also needs `Op::from_po` public and
   sec-d2 fixed). abi, ownership, soundness, opportunities. Value medium, effort small.
+  **Plan**, as rt-o2, in P7.
 - [ ] **sec-o6** encapsulate: namespace construction as raw syscalls, each in its own unsafe
   with a 'valid namespace handle, path, endpoint' SAFETY line — 29 sites (`grep -rnE
   "SYS_NS_BIND|SYS_NS_UNBIND|SYS_NS_CREATE|SYS_NS_DERIVE"` over the five crates, less `use`:
@@ -3740,7 +3816,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (`objects.rs`). Closes: the thinnest of the set; it moves (ptr, len) pairs out of the call
   sites (none is wrong today) and keeps the resource handle borrowed across the bind. Depends
   on: sec-o1 for typed resource handles, or accept RawHandle meanwhile. opportunities. Value
-  medium, effort small.
+  medium, effort small. **Plan**, in P7.
 - [ ] **sec-o7** encapsulate: a mapping handled by hand in three steps, `SYS_MEMORY_MAP`, then
   `from_raw_parts` or `copy_nonoverlapping`, then `SYS_MEMORY_UNMAP(addr, size)`, with the slice
   length and the unmap size each restated — 4 sites (`grep -rnE
@@ -3755,7 +3831,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   today). Closes: an unmap whose size is not the map's (sec-d9), a slice longer than the
   mapping (held by const asserts), a slice used after its unmap, and a mapping leaked on an
   early return. Depends on: a File object marker in libos. ownership, opportunities. Value
-  medium, effort small.
+  medium, effort small. **Plan**, as rt-o3, in P7.
 - [ ] **sec-o8** remove: `static mut` used only as a syscall out-parameter, argument block or
   value set once, where a stack local, a struct field or an atomic does the same safely — 12
   sites (read of each declaration `grep -nE '^\s*static mut'` lists in the four main files, 44
@@ -3770,7 +3846,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   once become fields of a server struct (the broker's `Broker`) or `AtomicU64` (as libsession's
   `STOP_ASKED`). Home: each crate. Closes: references to `static mut`, and the library-level
   statics behind safe pub fns (sec-d14); drops one or two unsafe blocks per site. Depends on:
-  nothing. abi, soundness, opportunities. Value low, effort small.
+  nothing. abi, soundness, opportunities. Value low, effort small. **Fix.**
 - [ ] **sec-o9** encapsulate: auth-service's state as parallel `static mut`s — 12 sites (6
   statics, USER_DB with USER_DB_LEN, NEW_DB, ADMIN_REPLY, SESSION_CH with SESSION_ADMIN,
   reached from 12 unsafe blocks: 3 `from_raw_parts` at 159, 391, 457, 5 raw derefs at 458,
@@ -3786,7 +3862,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   userspace/auth-service (main.rs). Closes: a length outgrowing its buffer (held by two
   separate checks), a reply buffer sized by local arithmetic instead of `RS_MAX_BODY` (sec-d4),
   and parallel arrays drifting (the failed-transfer path at 356 clears SESSION_CH but not
-  SESSION_ADMIN). Depends on: nothing. opportunities. Value low, effort small.
+  SESSION_ADMIN). Depends on: nothing. opportunities. Value low, effort small. **Fix.**
 - [ ] **sec-o10** remove: libsession records what the last build bound in seven `static mut
   SESSION_HAS_*` bools read through seven safe `session_has_*()` fns, although `build()`
   already returns the same facts as `Built` — 7 sites (`grep -n "static mut SESSION_HAS_"
@@ -3800,7 +3876,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the readers. Home: libsession. Closes: a flag read as 'the session's' that belongs to
   another build, and a safe fn over `static mut`; removes 7 of libsession's 14 `static mut`s
   and 8 unsafe blocks. Depends on: nothing. abi, ownership, soundness, opportunities. Value
-  low, effort small.
+  low, effort small. **Fix.**
 - [ ] **sec-o11** remove: local copies of libkern helpers, each with its own unsafe: `kprint`
   (x3), process exit (x2) and a hand-written volatile zeroing loop (x1) — 6 sites (`grep -rnE
   "^fn kprint|^fn exit|SYS_PROCESS_EXIT|write_volatile"` over the five crates: 8 lines, one
@@ -3812,7 +3888,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   duplicated SAFETY arguments; auth-service's `exit` spins on `spin_loop` after the syscall
   instead of being noreturn, and `scrub_request` duplicates `libkern::scrub`'s volatile loop
   (the volatile column's only site). Depends on: nothing. opportunities. Value low, effort
-  small.
+  small. **Plan**, as rt-o9, in P7.
 
 What held up: Every receive lends the kernel a whole 4096-byte buffer, every send passes a full
 page whose handle array and header count agree, and the 4072-byte payload clamp stays inside the
@@ -3872,7 +3948,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   0xFF, bg_free_blocks_count = 100: `check()` Ok; `grow_file` on /a and /b both returned Ok(0);
   `map_file` gave both `[BlockRun { file_block: 0, device_lba: 8193, length: 1 }]`, one block
   given to two files, and group 1's first block, which the grow also zeroed. Run with
-  `cd userspace && cargo test -p fs-server-ext4 --lib probe_ -- --nocapture`. abi. High.
+  `cd userspace && cargo test -p fs-server-ext4 --lib probe_ -- --nocapture`. abi. High. **Fix.**
 
 - [ ] **fs-d2** `userspace/fs-server-ext4/src/ext4.rs:296` — The group-descriptor stride is read
   from s_desc_size even though 64bit is refused. Linux and e2fsprogs use 32 whenever 64bit is off
@@ -3889,7 +3965,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   clean. `map_file("/f126")` (inode 141, group 1) returned Err(NotFound). `create_file("/new")`
   returned Ok with inode 129, already a file's. e2fsck afterwards, s_desc_size reset to 0: 'Inode
   129 ref count is 1, should be 2' and 'Unattached zero-length inode 257'. Fix: desc_size = 32
-  while 64bit is refused. abi. Medium.
+  while 64bit is refused. abi. Medium. **Fix.**
 
 - [ ] **fs-d3** `userspace/fs-server-ext4/src/extent.rs:685` — That each tree block has one parent
   is held only by convention. `cut()` and `free_tree()` walk and free a child once per index
@@ -3906,7 +3982,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   `truncate(..., keep 0)` returned Ok after 156 device writes against 39 for the honest tree: 4x,
   one walk per naming entry. Each further level multiplies by its node's entry count; `header()`
   allows depth 5. A depth-2 tree (one index block of 340 entries naming one leaf) would settle
-  the full blowup, expected ~1360x. abi. Medium.
+  the full blowup, expected ~1360x. abi. Medium. **Fix.**
 
 - [ ] **fs-d4** `userspace/libfsserver/src/disk.rs:37` — `po_wait` closes the PendingOperation
   and returns (-1, 0) whenever `sys_wait` returns anything other than one signalled record,
@@ -3930,7 +4006,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   the kernel `IrpBox` holds the buffer (io/block.rs:178-185). A host seam for disk.rs's two
   syscalls (as libos/src/sys.rs has) whose wait returns TimedOut once would settle it: the next
   submit would name the same scratch. Path: disk.rs:19-38, :106-108, :245-247, then
-  cache.rs:115-119. soundness, opportunities. Medium.
+  cache.rs:115-119. soundness, opportunities. Medium. **Fix.**
 
 - [ ] **fs-d5** `userspace/libfsserver/src/server.rs:992` — `server::run` and `server::bootstrap`
   (server.rs:979) are safe `pub fn`s, but they reach the eleven process-global `static mut`
@@ -3950,7 +4026,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   Unverified: no host test reaches `run` or `bootstrap`, since the first act of each is a raw
   syscall, and Miri cannot run syscalls. Making both `unsafe fn` with a one-thread contract, or
   handing the buffers out once through an AtomicBool-guarded take with a host test that a second
-  take is refused, would settle it. ownership, soundness. Medium.
+  take is refused, would settle it. ownership, soundness. Medium. **Fix.**
 
 - [ ] **fs-d6** `userspace/fs-server-ext4/src/ext4.rs:547` — A directory session's ReadDir cursor
   is supplied by the client (server.rs:625) and used as a raw byte offset into the directory,
@@ -3965,7 +4041,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   `mkdir_at(box, <14 LE u32, 0x0C0C LE, 1, 1, 'X','Y','Z','W'>)`; `vol.read_dir(box, 12+12+8, ..)`
   emitted `[(14, 33204, 21, [88])]`: inode 14, mode 0o100664, size 21, name "X". Fix: validate
   the cursor by walking its block from offset 0 to it, or encode it as a block plus record
-  index. abi. Low.
+  index. abi. Low. **Fix**, raised to Medium.
 
 - [ ] **fs-d7** `userspace/fs-server-ext4/src/ext4.rs:1136` — Names entering ext4 through a
   session are checked only for '/', '.' and '..' (libfsserver's `entry_name`, serve.rs:20, plus
@@ -3976,7 +4052,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   then reports the filesystem damaged.
   Demonstrated: same probe as fs-d6: `mkdir_at(box, <name with three 0x00 bytes>)` returned Ok;
   `e2fsck -fn` printed "Entry '^N^@^@^@^L^L^A^AXYZW' in /box (15) has illegal characters in its
-  name. Fix? no". abi. Low.
+  name. Fix? no". abi. Low. **Fix.**
 
 - [ ] **fs-d8** `userspace/libfsserver/src/disk.rs:76` — If a later step fails, `Disk::new` and
   `SectorDisk::new` leak what they have already made. Neither has a `Drop`, so a dropped one
@@ -3993,7 +4069,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   441, `PartitionIo`'s; the three returns above carry no SYS_HANDLE_CLOSE or SYS_MEMORY_UNMAP,
   whereas `PartitionIo::new` (350-354) closes its scratch when the map fails. Of 4 maps in
   libfsserver, the two never unmapped are `Disk`'s and `SectorDisk`'s. Not host-testable: each
-  constructor's first statement is a syscall. ownership. Low.
+  constructor's first statement is a syscall. ownership. Low. **Fix.**
 
 - [ ] **fs-d9** `userspace/libfsserver/src/server.rs:607` — `serve_session` copies a session
   request body into a 600-byte stack buffer and silently cuts a longer one. A single-name op
@@ -4009,7 +4085,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   Demonstrated: a temporary test in fs-server-fat/src/volume/write_tests.rs (restored)
   reproduced the copy and parse, then called `Fat::mkdir_at`; `cargo test -p fs-server-fat --lib
   probe_session_body_cap -- --nocapture` printed `PROBE: 699-byte name: session parse None,
-  Fat::mkdir_at Ok, listed true, fsck clean`. opportunities. Low.
+  Fat::mkdir_at Ok, listed true, fsck clean`. opportunities. Low. **Fix.**
 
 - [ ] **fs-d10** `userspace/libfsserver/src/server.rs:339` — `try_resolve_directory` clamps a
   suffix longer than MAX_SUFFIX to its first 1024 bytes and resolves that as a directory, while
@@ -4020,7 +4096,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   bytes opens a directory session on whatever its first 1024 bytes name, an ancestor or a sibling
   cut mid-component, inside the same binding, where `resolve()` would answer TooLarge.
   Unverified: not reachable today. Moving the decode into a pure function and testing a 1100-byte
-  suffix, or a kernel change that lengthens the path, would settle it. abi. Low.
+  suffix, or a kernel change that lengthens the path, would settle it. abi. Low. **Fix.**
 
 **Opportunities**
 
@@ -4044,7 +4120,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   disjoint fields), `try_resolve_rename` and `serve_session`. Closes: a receive overwriting a
   payload still borrowed, two live `&mut` to one static, a second `&mut` to STORE, and safe
   `run`/`bootstrap` causing UB (fs-d5). Depends on: nothing. abi, ownership, soundness,
-  opportunities. Value high, effort medium.
+  opportunities. Value high, effort medium. **Fix.**
 
 - [ ] **fs-o2** narrow: ext4 bitmaps live in a `[0u8; MAX_BLOCK]` scratch of which only `[..bs]` is
   read and written back, but `bit_clear`, `bit_set` and `bit_unset` index the whole scratch with
@@ -4057,7 +4133,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   `unset` answering Corrupt past `len * 8`, in fs-server-ext4 (ext4.rs); it complements a
   superblock geometry check like Linux's. Checked against `alloc_run`, `alloc_inode`, `free_run`
   and `free_inode`. Closes: a bitmap bit indexed past the bytes read from disk (fs-d1). Depends
-  on: nothing. abi. Value high, effort small.
+  on: nothing. abi. Value high, effort small. **Fix.**
 
 - [ ] **fs-o3** remove: a device transfer is a raw `SYS_IO_SUBMIT` followed by a hand-rolled
   `po_wait` that decodes IoResult status@8 and result@16 by byte offset, closes whatever u64 it
@@ -4079,7 +4155,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   `forget`. Closes: a scratch reused while an abandoned IRP still DMAs into it (fs-d4); a PO
   leaked on an early return; also makes the wait host-testable under libos's mock. Depends on:
   libfsserver taking a libos dependency (no_std, no alloc, nothing in libfsserver's CLAUDE.md
-  forbids it). abi, ownership, soundness, opportunities. Value high, effort small.
+  forbids it). abi, ownership, soundness, opportunities. Value high, effort small. **Plan**, in P7.
 
 - [ ] **fs-o4** encapsulate: IPC messages are handled as `[u8; 4096]` with hand-written header
   offsets (payload_len at [4..8], handle_count at [8]) and payload views at `PAYLOAD_OFF` with
@@ -4098,6 +4174,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   Closes: a payload view sized by the wrong bound, a header stamped at the wrong offset or left
   stale (written separately at 7 send sites); 9 raw-slice unsafe blocks become field access.
   Depends on: pairs with fs-o1. abi, soundness. Value medium, effort small.
+  **Plan**, as rt-o5, in P7.
 
 - [ ] **fs-o5** encapsulate: server.rs's loop makes its raw syscalls inline, so none of the rules
   libfsserver/CLAUDE.md states for it is held by a host test, only by QEMU gates; serve.rs's pure
@@ -4113,7 +4190,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   rmdir; `.` and `..` refused; rename before the session path). Depends on: fs-o1, fs-o3, fs-o4,
   fs-o7 and fs-o8; libos's sys mock is `#[cfg(test)]` inside libos (sys.rs:118-130) with no
   Cargo feature, so a downstream crate's tests link the real syscalls. opportunities. Value
-  medium, effort large.
+  medium, effort large. **Plan**, as sup-o9, in P7.
 
 - [ ] **fs-o6** encapsulate: scratch and content MemoryObjects are created and mapped by hand,
   reached through `scratch_addr as *const u8` with `from_raw_parts` or `copy_nonoverlapping`
@@ -4136,7 +4213,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   probe with IO_BLOCK = 8192 built and passed the disk tests, and only the kernel's size check
   on the preceding read stops it). Depends on: nothing (`Handle<Memory>::create/map/unmap/
   into_read_only` exist) and libfsserver taking libos. abi, ownership, soundness, opportunities.
-  Value medium, effort small.
+  Value medium, effort small. **Plan**, as rt-o3, in P7.
 
 - [ ] **fs-o7** encapsulate: handles are bare u64s closed by hand at each exit, and a message is
   staged in REPLY_MSG/REPLY_HANDLES/FORGET_MSG and sent with raw `SYS_CHANNEL_SEND`; whether a
@@ -4158,7 +4235,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   paths are right by hand today; the class seen before is 'a failed reply hangs a forwarded
   resolve'). Depends on: nothing for libkern; libos Channel kind and Part E's syscall surface
   for the libos form; pairs with fs-o1. ownership, soundness, opportunities. Value medium,
-  effort medium.
+  effort medium. **Plan**, as sup-o2, in P7.
 
 - [ ] **fs-o8** encapsulate: the session table and control slot (SESSION_CH, SESSION_DIR,
   CONTROL) are bare u64 endpoints and directory ids in three `static mut`s; a slot is freed by
@@ -4178,7 +4255,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   `end_sessions_on` (508-515) and `serve_control`'s PeerClosed arm (842-848). Closes: the width
   invariant split across two guards; a slot cleared without its endpoint closed, or closed twice;
   a stale handle number matching a live slot; makes capacity 30/31 and slot reuse host-testable.
-  Depends on: fs-o1 for the struct. opportunities. Value medium, effort small.
+  Depends on: fs-o1 for the struct. opportunities. Value medium, effort small. **Plan**, in P7.
 
 - [ ] **fs-o9** narrow: counts returned by a `Volume` are trusted as slice bounds by the loop
   (`Mapped::runs` indexes `runs[..n]`; `read_file` and `read_file_range` lengths index
@@ -4190,7 +4267,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   buffer: `fn read_file<'o>(&self, path: &[u8], out: &'o mut [u8]) -> Result<&'o [u8], FsError>`,
   likewise `read_file_range`, and `map_file` returning `(Mapped, &'r [BlockRun])`, in libfsserver
   (volume.rs). Closes: a Volume answering a count larger than the buffer it filled crashes the
-  server. Depends on: nothing. abi. Value low, effort small.
+  server. Depends on: nothing. abi. Value low, effort small. **Later.**
 
 - [ ] **fs-o10** encapsulate: test helpers build a 1 MiB Store with
   `Box::<Store<SERVER_BLOCKS>>::new_zeroed().assume_init()`, restating outside the type that
@@ -4202,7 +4279,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   Box<Store<N>>` behind a host-only feature (e.g. `alloc`) enabled by the server crates in
   dev-dependencies, in libfsserver::cache. Closes: a field added to Store that zero does not
   inhabit (an enum, a NonZero, a reference) turning all three sites into UB with no compile
-  error. Depends on: nothing. abi, soundness. Value low, effort small.
+  error. Depends on: nothing. abi, soundness. Value low, effort small. **Later.**
 
 - [ ] **fs-o11** narrow: each server's 1 MiB `static mut STORE` is reached once by
   `&mut *(&raw mut STORE)`, justified only by '_start runs once'; these are the only `unsafe`
@@ -4213,7 +4290,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   new(v)` and `take(&'static self) -> Option<&'static mut T>` (a second take answers None), in
   libos, or `libfsserver::cache::server_store()` for Store alone; subsumed if fs-o1 is taken.
   Closes: a second `&mut` to the same static, and the last `unsafe` in the two server crates.
-  Depends on: nothing. ownership, opportunities. Value low, effort small.
+  Depends on: nothing. ownership, opportunities. Value low, effort small. **Fix.**
 
 What held up: the `unsafe` byte paths are sound. Every `recv` buffer is exactly the size the
 kernel writes (4096 bytes, at most 8 handle words in `Received`), and every send reads whole
@@ -4287,7 +4364,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   (kernel/src/syscall/table.rs:2045). The leak is shown by reading nxsh main.rs:220-298 and
   404-436, not by a boot; a boot would show the hung stage and the growing handle count.
   nxterm backend.rs:288-296 and view-broker main.rs:1484-1492 close everything in the same
-  situation. Lenses: abi, ownership, soundness, opportunities. Medium.
+  situation. Lenses: abi, ownership, soundness, opportunities. Medium. **Fix.**
 - [ ] **proto-d2** `userspace/libstream/src/wire.rs:532` — `read_value` recurses once per nesting
   level (List -> `read_list` -> `read_value`; Record -> `Schema::decode` -> `read_row_values` ->
   `read_value`) with no depth limit, and dropping the decoded `Value` recurses the same way. A
@@ -4306,6 +4383,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   "thread has overflowed its stack" (SIGABRT), as did 50,000, 200,000 and 209,000 (1,045,026
   bytes). What the target does with the fault needs a boot. Lenses: abi, ownership, soundness,
   opportunities. Medium (soundness rated it medium as latent-high; the other three low).
+  **Fix**, with the bash's proto-7, moved here from Part H.
 - [ ] **proto-d3** `userspace/libstream/src/wire.rs:590` — The TSM1 decoder's memory use has no
   bound relative to its input. A Null-typed column takes 0 bytes per row, yet each row allocates a
   `Vec<Value>` of `schema.fields.len()` entries at 32 bytes each, so one `REC_DATA` byte costs
@@ -4319,7 +4397,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   Demonstrated: a host probe with `cargo test --release -p libstream --lib`, file restored. A
   5,017-byte stream (1,000 Null columns, 1,000 one-byte rows) decoded to 1,000 x 1,000 `Value`s,
   at least 32,000,000 bytes, about 6,400 times the input. The system-wide effect needs a boot.
-  Lenses: abi, soundness. Medium.
+  Lenses: abi, soundness. Medium. **Fix**, with the bash's proto-8, moved here from Part H.
 - [ ] **proto-d4** `userspace/libgpt/src/table.rs:298` — `disk_blocks: alternate_lba + 1` adds a
   field read from an untrusted disk with no overflow check: it panics where overflow checks are on
   and wraps `disk_blocks` to 0 where they are off. A stick whose GPT header has `alternate_lba =
@@ -4333,6 +4411,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   recomputed the CRC (file restored). Debug panicked with "attempt to add with overflow" at
   libgpt/src/table.rs:298:22; release returned Ok with `disk_blocks = 0`. Lenses: abi,
   soundness, opportunities. Medium (abi rated it medium as latent; the others low).
+  **Fix**, with the bash's proto-15, moved here from Part H.
 - [ ] **proto-d5** `userspace/libstream/src/setup.rs:314` — `send_setup_full` returns Err in two
   opposite ownership states. Before the send (an encode error, or r < 0) the handles are still the
   caller's. After a committed `SENDMODE_BLOCK` send (waited < 1 at :314, or PO status < 0 at :318)
@@ -4345,7 +4424,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   Unverified: the kernel closes the handles on Sent or Queued (kernel/src/syscall/table.rs, the
   `sys_channel_send` Block arm), and setup.rs:314-320 then returns Err. A fresh depth-4 setup
   channel takes the message as Sent, so the Queued-then-PeerClosed order needs a gate with a full
-  ring and a stage that exits before the message is delivered. Lenses: soundness. Low.
+  ring and a stage that exits before the message is delivered. Lenses: soundness. Low. **Fix.**
 - [ ] **proto-d6** `userspace/libstream/src/channel.rs:114` — `ChannelReceiver::receive` appends
   every message to one `Vec` until the producer sends `last`, with no size limit. nxsh already
   replaced it with its own loop capped at MAX_CAPTURE (main.rs:361-412), which shows the cap
@@ -4354,7 +4433,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   text with MAX_CLIP_BYTES (about 3.9 KB) only afterwards. The test-harness readers use it too.
   Unverified: found by reading channel.rs:114-121 and clip.rs:215-229. A host test with a `MsgPort`
   whose `recv` never returns true plus a counting allocator would settle it, or a boot running
-  `<endless producer> | clip --copy`. Lenses: abi, ownership, opportunities. Low.
+  `<endless producer> | clip --copy`. Lenses: abi, ownership, opportunities. Low. **Fix.**
 - [ ] **proto-d7** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes a field name's
   length as `f.name.len() as u16` with no range check, then writes every byte of the name;
   `WireErrorRecord::encode` does the same with `field_name` at :733. A name of 65,536 bytes or
@@ -4367,12 +4446,13 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   3-byte name read as a type tag. A second probe with a name whose tail spelled
   `\x04\x00\x01\x06\x00\x00\x00forged` decoded as one field named "ok" followed by a `REC_DATA`
   row `Ok([Str("forged")])`. Lenses: abi, soundness. Low.
+  **Fix**, with the bash's proto-14, moved here from Part H.
 - [ ] **proto-d8** `userspace/librsproto/src/session.rs:158` — `Dir::rename` builds its request in
   a 512-byte buffer, but two names of the maximum 255 bytes need 2+255+2+255 = 514 bytes.
   `rename_request` (file.rs:384-387) returns None, so the rename fails client-side with
   `DirError::Protocol`. Only test-harness calls `Dir::rename` today; real moves go through
   `RESOLVE_RENAME`. Unverified: shown by arithmetic from the code; a host test renaming
-  255-byte names would settle it. Lenses: abi. Low.
+  255-byte names would settle it. Lenses: abi. Low. **Fix.**
 
 **Opportunities**
 
@@ -4400,6 +4480,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   endpoint eventually makes /dev/draw/new fail for every process"), and a borrowed endpoint
   closed by its new owner. Depends on: nothing (the `po_wait` wrapper in proto-o3 if it lands
   first). Lenses: abi, ownership, soundness, opportunities. Value high, effort medium.
+  **Plan**, as sup-o2, in P7.
 - [ ] **proto-o2** encapsulate: `send_setup_full(channel, &Streams, Option<u64>, ...)` moves the
   stream and terminal handles on success and leaves them with the caller on most failures. `Streams`
   is `Copy` over `Option<u64>` and `pipe()` returns `(u64, u64)`, so each caller restates the rule
@@ -4418,7 +4499,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   `Lost`). nxterm and view-broker lose their hand-written close code; desktop-shell and libsession
   pass empty streams. Home: `libstream::setup`. Closes: the nxsh pipeline leak and the stale
   double close. Depends on: an owned-handle type (proto-o1's `Endpoint`, or libos). Lenses: abi,
-  ownership, soundness, opportunities. Value high, effort medium.
+  ownership, soundness, opportunities. Value high, effort medium. **Fix.**
 - [ ] **proto-o3** encapsulate: every syscall in the subsystem is a raw `syscallN` with a
   hand-built pointer, length and result buffer: WAIT x6 (each with a `[0u8; 24]` result decoded at
   bytes 8..12 and 16..24), HANDLE_CLOSE x6 (3 endpoints, 3 POs), NS_LOOKUP x3, CHANNEL_SEND x3,
@@ -4440,7 +4521,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   keeps it off libos. Closes: a result or message buffer shorter than what the kernel copies (the
   HandleInfo 16-vs-24-byte stack smash and the 256-byte receive classes, here for sends and waits),
   a PO leaked or closed twice, and the copies' disagreement. Depends on: nothing. Lenses: abi,
-  ownership, soundness, opportunities. Value high, effort medium.
+  ownership, soundness, opportunities. Value high, effort medium. **Plan**, in P7.
 - [ ] **proto-o4** encapsulate: librsproto parsers check `body.len() >= CONST` and then read at
   fixed offsets with `get_u16/32/64` or `from_le_bytes([b[i], ..])`, which panic past the end, so
   guard and offsets agree only by hand. Three iterators validate at parse time and then index
@@ -4457,7 +4538,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   `parse_read_range_request`, `parse_authenticate_reply`, `WindowInfo::read` and `parse_mount`.
   Home: librsproto `lib.rs`. Closes: a length guard that disagrees with its offsets (weakening
   `parse_ping`'s guard by one byte made a fuzz probe panic at lib.rs:286 at once). Depends on:
-  nothing. Lenses: opportunities. Value medium, effort medium.
+  nothing. Lenses: opportunities. Value medium, effort medium. **Plan**, in P8.
 - [ ] **proto-o5** encapsulate: each IO module hand-rolls its channel I/O: IPC header offsets
   (payload_len at 4, handle_count at 8, flags at 10, payload at 24) redefined in session.rs:23-27,
   channel.rs:148-151 and setup.rs:235-237, a hand `payload_len` write, a `buf.len() <
@@ -4482,7 +4563,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   exported libos mock seam) host tests for `round_trip`, `send_setup` and `recv_setup` ordering.
   Depends on: libos gaining a `Channel`; for libstream, session-mgr's no-libos rule (via
   libsession) must be revisited or the type lives in libstream first. Lenses: abi, soundness,
-  opportunities. Value medium, effort large.
+  opportunities. Value medium, effort large. **Plan**, in P7.
 - [ ] **proto-o6** encapsulate: wire layouts shared across the kernel boundary are checked by
   nothing. kernel/src/rsproto.rs copies librsproto's constants by hand (30 shared names, all equal
   today) and `abi-sync-check` covers libkern only. The `FILE_BLOCKS` `BlockRun` layout is written
@@ -4498,7 +4579,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   assert!(RECORD_LEN == size_of::<libkern::device::DeviceRecord>());`, as `RS_MAX_PAYLOAD` already
   has. Home: tools/xtask/src/checks/abi.rs and librsproto. Closes: the kernel and a userspace
   server reading the same reply at different offsets after one side changes. Depends on: nothing.
-  Lenses: abi. Value low, effort small.
+  Lenses: abi. Value low, effort small. **Plan**, in P8.
 
 What held up: all 19 unsafe blocks have SAFETY arguments that hold. Every send buffer is a whole
 4,096-byte message (a run-time check at session.rs:219, `Box<[u8; IPC_MSG_SIZE]>` in channel.rs
@@ -4560,7 +4641,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path: `grep -rn 'UNMAP\|unmap' userspace/desktop-session-mgr/src/` is empty,
   while the same grep finds `overview.rs:40` in desktop-shell (positive control). `open_greeter`
   runs after every submit and at startup (:301). Not booted. Counting free frames across N refused
-  logins would put a number on it. abi, ownership, soundness, opportunities. Medium.
+  logins would put a number on it. abi, ownership, soundness, opportunities. Medium. **Fix.**
 
 - [ ] **desk-d2** `userspace/nxterm/src/backend.rs:206` — `Backend::output` is a safe fn returning
   `Option<&'static [u8]>` into `static mut MSG`. `output()`, `typed()`/`send()` and `recv_is_ok`
@@ -4576,7 +4657,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   retag ... SharedReadOnly ... later invalidated by a write access" at send's copy. Run natively,
   the held slice reads `XYllo` after a send and `WORLD` after a second receive. The reproduction
   is out of tree because `backend.rs` is in the bin crate. The probe was restored. abi, ownership,
-  soundness, opportunities. Medium.
+  soundness, opportunities. Medium. **Fix.**
 
 - [ ] **desk-d3** `userspace/nxterm/src/main.rs:334` — `spawn_shell` returns the shell's process
   handle (SIGNAL|TERMINATE) and `reconcile_backends` only tests it `< 0` and drops it. Every tab
@@ -4586,7 +4667,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path: `backend.rs:268-271` takes `child` from `SYS_PROCESS_SPAWN` and :300
   returns it. `grep -rn 'spawn_shell(' userspace` finds only the definition and this caller. The
   kernel returns `parent_handle.bits()` (table.rs:491-509), and desktop-shell's `launch` closes
-  the same value (apps.rs:390/416). abi, ownership. Medium.
+  the same value (apps.rs:390/416). abi, ownership. Medium. **Fix.**
 
 - [ ] **desk-d4** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
   is a safe fn, but the kernel unmaps the whole VMA covering `addr` and ignores both the size and
@@ -4596,7 +4677,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   returned. One ordinary change makes it bite: unmapping twice (an error path plus a later cleanup)
   or after another `map()` reused the range.
   Demonstrated by reading the signature and the kernel handler. The unsafe is not on the signature.
-  ownership. Medium.
+  ownership. Medium. **Fix**, as rt-d2.
 
 - [ ] **desk-d5** `userspace/compositor/src/main.rs:1576` — `map_attached_buffer` maps whatever
   object the client transferred, though the spec says `AttachBuffer` carries a MemoryObject, and
@@ -4610,7 +4691,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: read at 135055a8, not booted. A boot would settle it: a test client attaches a stick
   file as buffer 0, commits, ejects the stick (check-media's flow) and forces a repaint. The same
   boot would test the fix, refusing `object_type != MemoryObject` before the map. abi, soundness.
-  Medium (would be high if the compositor counts as a critical service).
+  Medium (would be high if the compositor counts as a critical service). **Fix.**
 
 - [ ] **desk-d6** `userspace/libdraw/src/acquire.rs:52` — `read_info` maps the FramebufferInfo
   object and never unmaps it, and the kernel mints a fresh object per resolve
@@ -4621,7 +4702,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (:244) and unmap (:250), leaking the font-file mapping and pinning the file.
   Demonstrated by path: `grep -n unmap userspace/libdraw/src/acquire.rs` is empty, while
   `libsurface/src/screen.rs:37-39` unmaps the same kind of object and says why. abi, ownership,
-  soundness, opportunities. Low.
+  soundness, opportunities. Low. **Fix**, as rt-d5.
 
 - [ ] **desk-d7** `userspace/libdraw/src/acquire.rs:99` — `acquire` maps `info.byte_len` bytes but
   wraps them in `RawFramebuffer::new`, whose contract needs `geometry.byte_len()` = pitch x
@@ -4633,6 +4714,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `find_free_range` put next to it. One check, `info.byte_len >= geometry.byte_len()`, makes it
   structural.
   Demonstrated by path (acquire.rs:61-76, :99; framebuffer.rs:337-343). abi, soundness. Low.
+  **Fix.**
 
 - [ ] **desk-d8** `userspace/desktop-shell/src/wallpaper.rs:88` — `open_wallpaper` unmaps none of
   its shared buffers on any path. On a failed attach, a refused commit (:98) or a vanished window
@@ -4642,6 +4724,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   capture-refused-leak. The mapping half is not.
   Demonstrated by path: nothing in `wallpaper.rs` calls `SYS_MEMORY_UNMAP` or `release_buffer`;
   `overview.rs:209-213` releases on the same kind of failure. abi, soundness, opportunities. Low.
+  **Fix.**
 
 - [ ] **desk-d9** `userspace/desktop-shell/src/overview.rs:196` — when `attach_with_format` fails in
   `open_overview` (and `open_wallpaper`, wallpaper.rs:88), the MemoryObject handle is left open.
@@ -4651,7 +4734,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   object (about 4 MB). It is distinct from the recorded capture-refused-leak at overview.rs:411.
   Unverified: read, not booted. A boot with the attach send forced to fail, counting handles,
   would settle it. `libsurface/src/buffers.rs:install` shows the correct cleanup for the same
-  failure. ownership. Low.
+  failure. ownership. Low. **Fix.**
 
 - [ ] **desk-d10** `userspace/nxterm/src/backend.rs:250` — `spawn_shell` documents `terminal` as
   moved, but its early `return -1` paths (no `/bin/nxsh` at :248-250, setup-channel failure at
@@ -4661,7 +4744,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   PeerClosed and the terminal outlives its tab. Reachable with a namespace lacking `/bin/nxsh` or
   a failed channel create, and each further tab leaks another handle.
   Demonstrated by path (the two close-sites and the early returns, side by side). abi, ownership,
-  opportunities. Low.
+  opportunities. Low. **Fix.**
 
 - [ ] **desk-d11** `userspace/nxterm/src/main.rs:695` — the wait set spans the session channel plus
   every backend of every window, but `MAX_TABS` (MAX_WAIT_HANDLES - 1) caps tabs per window only.
@@ -4671,7 +4754,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: a temporary host test building two `App`s with `MAX_TABS` NewTab each failed
   (`1 + a.tabs().len() + b.tabs().len() <= MAX_WAIT_HANDLES`; "waits on 63 handles", and 33 with
   15 per window). The const assert at lib.rs:2317 checks one window. Probe restored. ownership,
-  opportunities. Low.
+  opportunities. Low. **Fix.**
 
 - [ ] **desk-d12** `userspace/compositor/src/main.rs:1704` — `handle_session_request` copies each
   request body into `MAX_BODY` = 4 + `MAX_TITLE` = 260 bytes, sized for SetTitle, the comment
@@ -4684,7 +4767,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by two host probes (removed). A 328-byte StartDrag (306-byte path) parsed whole,
   but `StartDrag::read` on the first 260 bytes was `None`. A 278-byte StartDrag failed
   `assert_eq!(whole, cut)`, with the name 60 vs 42 'n'. A second probe in librsproto's tests
-  found the same: 300-byte path `None`, 200+64 gives a 48-byte name. abi, soundness. Low.
+  found the same: 300-byte path `None`, 200+64 gives a 48-byte name. abi, soundness. Low. **Fix.**
 
 - [ ] **desk-d13** `userspace/compositor/src/main.rs:1354` — `Manage::Close` (desktop-shell's
   insist_on_close) destroys a window and its popups through the manager path, which never drops
@@ -4695,6 +4778,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   reused, so nothing aliases.
   Demonstrated by path: `grep -n 'buffers.retain' userspace/compositor/src/main.rs` finds only
   those three lines, none inside `handle_manager_request` (:1291-1481). ownership, soundness. Low.
+  **Fix.**
 
 - [ ] **desk-d14** `userspace/compositor/src/main.rs:1916` — an AttachBuffer carrying no handle is
   still applied: `dispatch` records the new geometry for (window, buffer), but the mapping is
@@ -4705,7 +4789,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (a full-size capture, a screenshot) would read past the mapping, and any client can reach it.
   Demonstrated by path: server.rs:182-189, lib.rs:724-726, main.rs:1916. The existing test
   `a_short_buffer_is_skipped_rather_than_read_past_its_end` covers the readers, not this
-  producer. ownership. Low.
+  producer. ownership. Low. **Fix.**
 
 - [ ] **desk-d15** `userspace/compositor/src/main.rs:2121` — when the supervisor's control channel
   reads `Closed`, it is dropped from the wait set (`control = 0`) and the handle is never closed.
@@ -4713,7 +4797,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `libkern::control::recv` does not close it. Bounded at one handle per process, but no path ever
   closes it.
   Demonstrated by path (`Control::Closed => control = 0` with no `SYS_HANDLE_CLOSE`). ownership.
-  Low.
+  Low. **Fix.**
 
 - [ ] **desk-d16** `userspace/compositor/src/server.rs:113` — `static mut TITLE_TRUNCATED_LOGGED`
   lives in the compositor library and is read and written without synchronisation by the safe
@@ -4724,7 +4808,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: a Miri probe calling `set_title` with a `MAX_TITLE+50` title from two threads
   reported "Data race detected between (1) non-atomic write on thread `server::title_t` and (2)
   non-atomic read on thread `unnamed-2`" at server.rs:120/123. Probe removed, `git status` clean.
-  soundness, opportunities. Low.
+  soundness, opportunities. Low. **Fix.**
 
 - [ ] **desk-d17** `userspace/compositor/src/main.rs:159` — `BufferSource::pixels` builds a `&[u8]`
   over a mapping the client holds read-write (libsurface maps `MAP_READ|MAP_WRITE`,
@@ -4735,7 +4819,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   not `from_raw_parts`' immutability requirement.
   Unverified: cross-process, so no host test or Miri reaches it. A copy-only reader (`ptr::copy`
   or volatile loads) behind a Mapping type (see desk-o5) would settle it. soundness,
-  opportunities. Low.
+  opportunities. Low. **Plan**, in P7.
 
 **Opportunities**
 
@@ -4759,7 +4843,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   none yet), and the typed message buffer (desk-o2) for send's signature. Note:
   desktop-session-mgr's CLAUDE.md inherits "no libos", yet `cargo tree` shows libos already
   linked through libsurface and libdraw, so that rule needs a decision. abi, ownership,
-  soundness, opportunities. Value high, effort large.
+  soundness, opportunities. Value high, effort large. **Plan**, as sup-o2, in P7.
 
 - [ ] **desk-o2** encapsulate: IPC messages as raw `static mut [u8; 4096]` buffers, framed by hand
   (payload_len read at [4..8], slices via `from_raw_parts(base+24, len.min(4096-24))`, headers
@@ -4784,6 +4868,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   desk-d12's MAX_BODY. Removes about 10 `static mut` buffers and 30 unsafe blocks. Depends on:
   nothing (the 8 MiB stack is decided; the "32 KiB stack" comments are stale); moving handles in
   a send waits for desk-o1. abi, ownership, soundness, opportunities. Value high, effort medium.
+  **Plan**, as rt-o5, in P7.
 
 - [ ] **desk-o3** encapsulate: `sys_wait` called by hand over `static mut WAIT_HANDLES` and
   `WAIT_RESULTS`, with 24-byte `IoResult` records decoded by byte offset and the result buffer
@@ -4802,7 +4887,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   a result buffer smaller than the wait set, as in a81cf9c0 (desktop-shell, 24 bytes past a
   static); a wait set over the kernel limit (desk-d11, nxterm's `Full` becomes "no more tabs"
   instead of exit). Depends on: nothing. abi, ownership, soundness, opportunities. Value high,
-  effort medium.
+  effort medium. **Plan**, as rt-o2, in P7.
 
 - [ ] **desk-o4** narrow: `unsafe fn`s whose only contract is "root_ns must be a live namespace
   handle". A stale handle fails the generation check and returns InvalidHandle, so the contract
@@ -4823,6 +4908,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   perform lookups through it. Closes: no defect class, but the unsafe that remains marks real
   memory hazards. Depends on: a one-time borrow of the bootstrap namespace in each `_start` (or
   libos's thin-entry seam). abi, soundness, opportunities. Value high, effort medium.
+  **Plan**, in P7.
 
 - [ ] **desk-o5** encapsulate: shared mappings as raw `(*mut u8, len)` pairs, unmapped by hand or
   not at all — 12 map sites against 10 to 13 unmaps and 9 `from_raw_parts` slices over mappings,
@@ -4844,7 +4930,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   15534384 and 77f5aeff), the safe-unmap hole (desk-d4), the length behind desk-d7, and the
   shared-pixel reference (desk-d17). Host-testable once libos's mock sits under it. Depends on:
   nothing (the handle that moves at attach shares desk-o1's send contract). abi, ownership,
-  soundness, opportunities. Value high, effort medium.
+  soundness, opportunities. Value high, effort medium. **Plan**, as rt-o3, in P7.
 
 - [ ] **desk-o6** remove: desktop-session-mgr and desktop-shell hand-roll shared window buffers
   (own `shared_buffer`, raw `*mut u8` arrays, `copy_nonoverlapping`, manual release) where
@@ -4860,7 +4946,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   in the callers. Closes: a mapping outliving its window (desk-d1, d8; the overview's hand-kept
   release, which leaked 9 MB once in 77f5aeff). `install` also closes and unmaps on a failed
   attach, which closes desk-d9 for these sites. Depends on: nothing. opportunities. Value high,
-  effort small.
+  effort small. **Fix.**
 
 - [ ] **desk-o7** remove: `static mut` used as syscall out-params and diagnostic counters where a
   local or an atomic serves — 21 sites (of 57 `static mut`), counted by `grep -rnE 'static mut
@@ -4878,7 +4964,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (desk-d16) and unsafe blocks wider than their operation: `route_one_batch`'s 152-line block
   (main.rs:896-1048) exists only for `INPUT_DIAGS_LOGGED`; about 45 of the 302 unsafe blocks wrap
   these statics. Depends on: nothing. abi, ownership, soundness, opportunities. Value medium,
-  effort small.
+  effort small. **Fix.**
 
 - [ ] **desk-o8** encapsulate: server state kept in `static mut` tables whose "nothing else holds
   it" claim rests on call order — 10 statics (SESSION_CH and MANAGER_CH in the compositor;
@@ -4892,7 +4978,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   already have one); clipboard's `Ring` can be a `_start` local (8 MiB stacks since 2026-08-10).
   In each server binary. Closes: a table or buffer aliased across a call that changes it,
   prevented today only by single-threading and call order. Depends on: desk-o2 (the receive and
-  reply buffers move with this state). soundness. Value medium, effort medium.
+  reply buffers move with this state). soundness. Value medium, effort medium. **Plan**, in P7.
 
 - [ ] **desk-o9** encapsulate: the compositor keeps a buffer's geometry in `WindowStack` and its
   mapping in a second table (`Server.buffers`), kept in step by hand-placed retains — 4 sites
@@ -4904,7 +4990,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Mapping`. In compositor `lib.rs` (WindowStack) with `main.rs` supplying the Mapping. Closes: a
   mapping outliving its window (desk-d13) and geometry with no memory behind it (desk-d14), both
   held today only by two length checks. Depends on: desk-o5. ownership. Value medium, effort
-  medium.
+  medium. **Plan**, in P7.
 
 - [ ] **desk-o10** remove: the namespace lookup's wait-and-decode copied into three crates, the
   copy-paste libos was built to replace — 3 sites (`grep -rnE
@@ -4916,7 +5002,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   In libos. Checked: all three want (status, handle). Closes: a status read from a wait record
   the last wait did not write, and PO handles each copy must remember to close. Depends on:
   nothing; a safe lookup (desk-o4) removes the remaining unsafe. opportunities. Value medium,
-  effort small.
+  effort small. **Plan**, in P7.
 
 - [ ] **desk-o11** narrow: a transferred handle taken out of `Received` before the code knows it
   will keep it, then closed by hand on each branch — 2 sites: compositor `handle_session_request`
@@ -4929,7 +5015,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   and `userspace/input-server/src/main.rs`. Removes 5 unsafe closes. Closes: a new op branch
   before `dispatch` that forgets the close, leaking one client-supplied handle per request (the
   class b4cc3a39 fixed by hand). Depends on: nothing (desk-o1 would make it structural).
-  opportunities. Value medium, effort small.
+  opportunities. Value medium, effort small. **Plan**, in P7.
 
 - [ ] **desk-o12** remove: raw syscalls that have, or need only, a one-line safe wrapper — 24
   sites, counted by `grep -rnE
@@ -4942,7 +5028,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   becomes `&entry.path[..len]`), plus new `clock_read(clock) -> Result<u64, KError>` and
   `test_exit(ok)` in libkern (`debug.rs`, a clock fn) and `stat` in libos. Closes: duplicated
   wrappers drifting apart, such as the three exit loops that spin if the syscall returns.
-  Depends on: nothing. opportunities. Value low, effort small.
+  Depends on: nothing. opportunities. Value low, effort small. **Plan**, as rt-o9, in P7.
 
 What held up:
 - **Receive sizing.** The desktop-session-mgr 256-byte class cannot recur. All 18 receives (15
@@ -5037,7 +5123,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: path read on 135055a8 by all four lenses (main.rs:443-451 checks only
   `handle != 0`; lib.rs:321-329 stores any u64; the kernel lines above); not booted. A boot gate
   that sends AttachBackend with a memory object and then writes to a terminal would show the
-  spin. abi, ownership, soundness, opportunities. High.
+  spin. abi, ownership, soundness, opportunities. High. **Fix.**
 - [ ] **sh-d2** `userspace/profile-server/src/main.rs:294` — profile-server forwards the client's
   requested rights, MAP_WRITE included, into its own root-namespace lookup of the store file and
   re-exports the handle, so a store binary may be reachable writable by any process with /bin or
@@ -5052,7 +5138,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   MAP_WRITE on a writable device). To settle it, boot a session, look up /bin/<prog> with
   MAP_WRITE, map it writable, write one byte and read it from another process; the control is
   masking requested_rights to READ|MAP_READ|MAP_EXEC|INSPECT before line 294. opportunities.
-  High.
+  High. **Fix.**
 - [ ] **sh-d3** `userspace/nxsh/src/main.rs:297` — Host::run's early returns close nothing and
   stop nothing. Setup send refused after the spawn (292-297, closes only `terminal`), a capture
   over MAX_CAPTURE (417-418, skipping rx close 424, reap 427, err_rx close 432), a pipe `?` at
@@ -5068,7 +5154,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   temporary MockHost host test (removed) handed Host::run a 4,497-byte argv and SetupPayload::
   encode returned Err(SetupTooLarge); `list <5000 x>` reached Host::run unchecked; paths read at
   the lines above; stranded processes and tty-server's terminal count need a boot to see.
-  abi, ownership, soundness, opportunities. Medium.
+  abi, ownership, soundness, opportunities. Medium. **Fix**, as proto-d1.
 - [ ] **sh-d4** `userspace/tty-server/src/main.rs:624` — The console read's PendingOperation is
   never closed: each completed read sets `read_po = 0` and submits another, leaking one PO handle
   and kernel object per console read in an essential server that is never restarted. Every
@@ -5078,6 +5164,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   closing it); kernel sys_wait reports a PO's completion without closing it (table.rs:1763-1843);
   eshell's po_wait (main.rs:54) and tty-server's own po_wait (172-173) close theirs. Not booted;
   counting handles per keystroke would show it. abi, ownership, soundness, opportunities. Medium.
+  **Fix.**
 - [ ] **sh-d5** `userspace/tty-server/src/main.rs:450` — attach_backend returns the previous
   backend's channel for the caller to close, and the serve loop drops it with `Some(_)`. A second
   AttachBackend on one terminal retires the first backend (lib.rs:327, 332-342) and tty-server
@@ -5086,7 +5173,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   bound. Demonstrated: `cargo test -p tty-server --lib re_pointing_a_terminal_hands_back_the_
   backend_it_left` passes, asserting `Some(0xAAA)` comes back; main.rs:449-453 binds it to `_`
   and closes only in the None arm; attach_backend's own doc says dropping it would leak.
-  abi, ownership, soundness, opportunities. Medium.
+  abi, ownership, soundness, opportunities. Medium. **Fix.**
 - [ ] **sh-d6** `userspace/nxsh/src/main.rs:469` — `save` (Host::write_file) creates at
   bytes.len() through SYS_FILE_CREATE, which only grows, so saving over a longer file keeps the
   old tail, and a 0-byte save creates the file and then fails at the size-0 map with 'cannot
@@ -5096,7 +5183,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   asserting a grow to less answers its size (libfsserver volume.rs:81-84 states the contract);
   nxsh main.rs:472-498 never truncates, the kernel refuses size 0 at table.rs:897, and
   libfs::write_file (lib.rs:210-251) shrinks first and handles size 0. Not booted. abi,
-  soundness, opportunities. Low.
+  soundness, opportunities. Low. **Fix.**
 - [ ] **sh-d7** `userspace/profile-server/src/main.rs:130` — read_manifest maps and parses
   exactly one page of the manifest, with no stat of its size, and never unmaps it, so a manifest
   over 4096 bytes is cut silently and the packages past the cut vanish from /bin while the server
@@ -5106,21 +5193,21 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the ordinary change that triggers it. Demonstrated: a temporary test (removed) parsed the first
   4096 bytes of a 40-package, 4,301-byte manifest as read_manifest does and got 38 packages with
   no error; main.rs:130 maps PAGE, 137 slices PAGE, 141 closes the handle and nothing unmaps.
-  abi, ownership, soundness, opportunities. Low.
+  abi, ownership, soundness, opportunities. Low. **Fix.**
 - [ ] **sh-d8** `userspace/nxsh/src/main.rs:452` — Host::read_file maps and copies the file's
   whole stat size into one Vec with no cap, while stage output is capped at MAX_CAPTURE and
   libfs::read_file at MAX_COPY (8 MiB). `open` on a multi-GiB file (a sparse file grown towards
   u32::MAX, or a disk image on a stick) asks for that allocation and may take the login shell
   down through the panic handler. Unverified: whether the map succeeds at that size and whether
   the failed allocation panics or aborts; a boot running `open` on a file larger than free RAM
-  settles it. abi, soundness. Low.
+  settles it. abi, soundness. Low. **Fix.**
 - [ ] **sh-d9** `userspace/eshell/src/main.rs:286` — cmd_lsblk unmaps with size 0, as does
   coreutils/src/bin/disk.rs:472 (device_info). This is right today only because sys_memory_unmap
   ignores its size and drops the whole VMA (table.rs:949 takes `_size` unused). syscall-abi.md:529
   names partial or splitting unmap as a later refinement; once it honours `size`, eshell leaks one
   mapping per `lsblk` for the life of the shell and disk.rs one per device_info call.
   Demonstrated: path pointed at (eshell maps info.size at 238, disk.rs maps 4096 at 463). Latent,
-  made to bite by implementing the refinement. ownership. Low.
+  made to bite by implementing the refinement. ownership. Low. **Fix.**
 - [ ] **sh-d10** `userspace/nxsh/src/main.rs:294` — The SAFETY argument 'the send failed, so the
   terminal never moved; it is ours to close' is false when send_setup_full fails after its
   Block-mode send committed (the wait fails, or the PO completes PeerClosed because the stage
@@ -5128,7 +5215,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   value it no longer owns; generation counters make the stale value fail InvalidHandle, so it is
   harmless today only by that. Demonstrated: path pointed at (libstream setup.rs:293-320 returns
   Err after a committed send; syscall-abi.md § sys_channel_send; kernel ipc_channel.rs:605-620;
-  handle-encoding.md § Generation counter). soundness. Low.
+  handle-encoding.md § Generation counter). soundness. Low. **Fix**, as proto-d5.
 - [ ] **sh-d11** `userspace/nxsh/src/main.rs:459` — Several sites form a Rust reference over a
   FileObject's shared page-cache mapping that another process may write at once: `&[u8]` in nxsh
   read_file (459) and read_head (stage.rs:102), eshell cmd_cat (206), profile-server
@@ -5136,14 +5223,14 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Rust's model, though the hardware forgives it; libfs::read_file and write_file make the same
   copies with ptr::copy_nonoverlapping and form no reference. Unverified: needs two processes
   mapping one file with a write during the copy; no host test reaches these syscall paths and
-  Miri cannot run them. soundness. Low.
+  Miri cannot run them. soundness. Low. **Plan**, in P7.
 - [ ] **sh-d12** `userspace/nxsh/src/main.rs:84` — `fn signalled(n: i64, handle: u64)` is safe but
   walks `n` 24-byte records of the 96-byte WAIT_RESULTS through raw pointer arithmetic with no
   bound, so any n > 4 reads past the static. Latent: every caller passes sys_wait's return for at
   most 4 handles; waiting on a fifth handle without growing WAIT_RESULTS makes it bite.
   Demonstrated: Miri on a verbatim copy (removed), `signalled(5, 0xdeadbeef)`, reported 'attempting
   to access 8 bytes, but got alloc+0x60 which is at or beyond the end of the allocation of size 96
-  bytes'. opportunities. Low.
+  bytes'. opportunities. Low. **Fix.**
 - [ ] **sh-d13** `userspace/profile-server/src/main.rs:478` — reply_success ignores a failed
   send, so the resolved store handle it meant to move stays in profile-server's table and the
   forwarded resolve is never answered; tty-server open_tty (318-327) answers no error on a failed
@@ -5153,7 +5240,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   no deadline. Unverified: today the handle carries TRANSFER (requested at 294) and the forwarding
   endpoint completes uncorrelated replies with Ok(0) (kernel table.rs:2146-2151), so no ordinary
   failure was found; a send with a handle restricted to drop TRANSFER would settle it.
-  opportunities. Low.
+  opportunities. Low. **Fix.**
 
 **Opportunities**
 
@@ -5173,7 +5260,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Closes: handles and processes leaked on early returns (sh-d3, sh-d4, sh-d5) and closing a
   handle that already moved (sh-d10). Depends on: libos gaining the wrappers above; eshell is
   excluded by its CLAUDE.md (6 sites). abi, ownership, soundness, opportunities. Value high,
-  effort large.
+  effort large. **Plan**, as sup-o2, in P7.
 - [ ] **sh-o2** encapsulate: rsproto messages sent and received by hand through `static mut
   [u8; 4096]` (encode at [24..], payload_len stamped at [4..8], handle_count at [8], handles in
   a second static, raw SYS_CHANNEL_SEND; receive then `from_raw_parts(MSG + 24,
@@ -5194,7 +5281,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   copies, hand-written bounds that disagree with the kernel (nxinstall raw_send clamps to 4072
   where the kernel refuses past 4008), and moved handles stranded by a refused reply (sh-d13).
   Removes 22 unsafe blocks and 9 statics. Depends on: nothing. abi, ownership, soundness,
-  opportunities. Value high, effort medium.
+  opportunities. Value high, effort medium. **Plan**, as rt-o5, in P7.
 - [ ] **sh-o3** encapsulate: raw SYS_WAIT into hand-sized buffers, IoResult decoded by byte offset
   (handle @0, status @8, result @16), and PendingOperation lifecycles with private po_wait copies
   — 13 call sites (`grep -rn "syscall4(SYS_WAIT\|SYS_WAIT," userspace/{nxsh,coreutils,tty-server,
@@ -5215,6 +5302,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   tty_await_reply; profile-server's ns_lookup shares the serve loop's buffers; tty-server added
   PO_RESULTS after exactly this). Depends on: libos making its wait public; eshell stays on
   libkern. abi, ownership, soundness, opportunities. Value high, effort medium.
+  **Plan**, as rt-o2, in P7.
 - [ ] **sh-o4** encapsulate: nxsh Host::run holds a dozen raw handles and a `Vec<u64>` of
   children with cleanup written per path, missing on 6 exits — 6 sites (`sed -n 192,435p
   userspace/nxsh/src/main.rs | grep -n 'return Err\|)?;'` gives 8 exits; 2 come before any handle
@@ -5227,7 +5315,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   userspace/nxsh/src/pipeline.rs (main.rs is at its size entry), beside stage.rs's `Images`.
   Closes: handles and processes stranded by an early return (sh-d3) and the stale ChildExited
   they leave for the next reap. Depends on: nothing; sh-o1's handle type would shrink it.
-  ownership, abi, opportunities. Value high, effort medium.
+  ownership, abi, opportunities. Value high, effort medium. **Fix.**
 - [ ] **sh-o5** encapsulate: map, `from_raw_parts` slice, then unmap (or forget to), with the
   mapped, read and object lengths chosen separately — 11 sites (`grep -rn 'SYS_MEMORY_MAP,'` gives
   12, 9 of them file reads and 1 a mapped write; `grep -rn from_raw_parts` gives 21, 11 over
@@ -5241,7 +5329,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   page-cache mappings (sh-d11), mappings never unmapped (profile-server read_manifest, nxinstall
   devices), size-0 unmaps (sh-d9) and a manifest cut at a page (sh-d7). Depends on: sh-o1, for
   `&Handle`; eshell keeps its 2 sites. ownership, soundness, opportunities. Value medium, effort
-  medium.
+  medium. **Plan**, as rt-o3, in P7.
 - [ ] **sh-o6** remove: nxsh's own file I/O and lookup helpers duplicate libfs, already a
   dependency — 3 helpers, 15 unsafe blocks (`awk 'NR>=437 && NR<=508 && /unsafe/'` gives 11,
   `NR>=747 && NR<=783` gives 4; `grep -n "SYS_MEMORY_MAP,\|SYS_FILE_CREATE,\|syscall4(SYS_NS_LOOKUP"`
@@ -5251,7 +5339,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `libfs::lookup_wait`; stage.rs read_head stays. libfs::read_file needs one small extension, to
   report a directory as an error rather than as empty, which nxsh relies on. Home: libfs. Closes:
   sh-d6, sh-d8 and the reference-over-mapping UB at main.rs:459 and :498. Depends on: that
-  extension. abi, soundness. Value medium, effort small.
+  extension. abi, soundness. Value medium, effort small. **Fix.**
 - [ ] **sh-o7** narrow: a handle received over IPC is kept as a given object type with only `!= 0`
   checked — 3 sites (every `sent.take(` and kept `terminal`/`streams` handle in the paths), such
   as `userspace/tty-server/src/main.rs:443`, `userspace/nxsh/src/main.rs:1089`,
@@ -5261,7 +5349,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   and closes a wrong one; libos.md already anticipates it. Home: libos handle.rs, beside the
   unchecked `unsafe fn from_raw`. Closes: a client-supplied handle of the wrong type or rights
   poisoning a server's wait set (sh-d1). Depends on: sh-o1's Channel type. ownership,
-  opportunities. Value medium, effort small.
+  opportunities. Value medium, effort small. **Plan**, in P7.
 - [ ] **sh-o8** remove: `static mut` used only as a syscall out-parameter, argument block or
   per-call scratch, where a local does the job — 12 sites (`grep -rn 'static mut'` gives 45;
   CLOCK_BUF in sleep.rs and date.rs, CTRL_OUT0/1 in tty-server and profile-server, NOTIF/NOTIF_BUF
@@ -5272,7 +5360,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   and with.rs token_deadline already do; a stack array or Vec for FRONT/BACK (sources() keeps a
   FRONT_BYTES array on the stack). Home: each binary. Closes: two live `&mut` to one static in
   nxinstall and about 20 unsafe blocks that only reach the statics. Depends on: nothing. abi,
-  ownership, soundness, opportunities. Value low, effort small.
+  ownership, soundness, opportunities. Value low, effort small. **Plan**, in P7.
 - [ ] **sh-o9** remove: profile-server keeps its state in `static mut` (INDEX, SESSION_CH,
   SESSION_DIR, PENDING_DIR) and reborrows the index as `&'static [Entry]` — 4 sites
   (`grep -n '^static mut \(INDEX\|SESSION_\|PENDING_DIR\)'`), at
@@ -5282,14 +5370,14 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `index(&mut self, ..) -> &[Entry]` and the pending-dir handoff as a return value; tty-server's
   Registry is the model. Home: profile-server. Closes: a `&'static` reborrow whose soundness
   rests on a comment (it holds today; see below). Depends on: nothing. ownership. Value low,
-  effort small.
+  effort small. **Later.**
 - [ ] **sh-o10** encapsulate: `librsproto::session::Dir` is closed by an explicit `close(self)`
   with no Drop — 4 sites in the subsystem (`grep -rn 'Dir::open'`; 4 more in libfs), at
   `userspace/nxsh/src/main.rs:528`, `userspace/coreutils/src/bin/mkdir.rs:134`,
   `userspace/profile-server/src/main.rs:204`. `impl Drop for Dir` closing the endpoint, with
   `close(self)` kept as an early release. Home: librsproto session.rs. Closes: a session endpoint
   leaked by an early return between open and close; none found today. Depends on: nothing.
-  ownership. Value low, effort small.
+  ownership. Value low, effort small. **Plan**, as sup-o2, in P7.
 - [ ] **sh-o11** encapsulate: a coreutil opens a one-shot service session with
   `libfs::lookup_wait(DIR_SESSION_RIGHTS)`, calls round_trip and closes the endpoint with a raw
   syscall — 4 sites (`grep -rn 'round_trip(session' userspace/coreutils/src/bin`), at
@@ -5298,7 +5386,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   and closing it on Drop: `Session::open(ns, path) -> Result<Session, i32>` (NotFound kept
   distinct) and `ask(&mut self, buf, op, body) -> Result<usize, WireError>`. Home: librsproto
   session. Closes: a session endpoint leaked on an early return; removes 4 unsafe blocks.
-  Depends on: nothing. opportunities. Value low, effort small.
+  Depends on: nothing. opportunities. Value low, effort small. **Plan**, in P7.
 - [ ] **sh-o12** remove: raw operations where core or the type already offers a safe one — 3
   sites (the inventory's only asm, its only `unsafe fn`, and a raw slice over a local struct
   field), at `userspace/eshell/src/main.rs:367`, `userspace/nxsh/src/main.rs:1175`,
@@ -5306,7 +5394,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   tty-server and profile-server exit loops already use it), `&entry.path[..len]` as eshell
   main.rs:157 does, and a safe `pub extern "C" fn _start` as every other bin's is. Home: each
   binary. Closes: nothing new; removes 3 unsafe sites and the only asm. Depends on: nothing.
-  soundness, opportunities. Value low, effort small.
+  soundness, opportunities. Value low, effort small. **Plan**, as rt-o9, in P7.
 
 What held up: every receive goes through libkern's `Received` into a whole 4096-byte page, with
 every payload slice clamped to 4096-24, and every send passes a whole page within
@@ -5347,7 +5435,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   bootprobe/exits.rs:242) map a fresh stack and never unmap it, so the invariant holds by
   convention only. Demonstrated: a `#[forbid(unsafe_code)]` fn that passed a local `[u8; 256]` as
   the stack and then wrote `stack[0]` built with `cargo check -Z build-std=core,alloc,compiler_builtins
-  --bin test-stage` and no error; the probe was removed. abi, soundness. Medium.
+  --bin test-stage` and no error; the probe was removed. abi, soundness. Medium. **Fix**, as rt-d3.
 - [ ] **th-d2** `userspace/test-harness/src/bootprobe/storage.rs:273` — `past_two_tib_test` makes
   one `&mut [u8]` over the DMA page and keeps it live across `io(IO_OPCODE_WRITE)` and
   `io(IO_OPCODE_READ)`, then compares through it at :284. The device's write invalidates the
@@ -5360,7 +5448,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   does not exist in the borrow stack") and Tree Borrows ("reborrow through ... is forbidden").
   The control, with the slice made after the I/O as `RootDevice::read_at` does, passes. The models
   are analogs, since Miri cannot run the syscall. No other site keeps a reference across a device
-  write. abi, ownership, soundness, opportunities. Low.
+  write. abi, ownership, soundness, opportunities. Low. **Fix.**
 - [ ] **th-d3** `userspace/test-harness/src/bootprobe/main.rs:363` — boot-probe's `receive()`
   calls `take_all()` on `libkern::Received`, which disarms its close-on-drop, and moves the
   handles into its own `Received` with `handles: Vec<u64>` and no `Drop`. 9 of the 20 `receive()`
@@ -5372,7 +5460,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   main.rs:356-371 empties the guard into a `Vec<u64>`. The other 11 callers close
   `m.handles` by hand (12 `for_each` loops). The three lenses counted the unclosed callers as
   8 of 15 or 9 of 20; the 9-of-20 count is used here. abi (as opportunity), ownership, soundness,
-  opportunities. Low.
+  opportunities. Low. **Fix.**
 - [ ] **th-d4** `userspace/test-harness/src/harness.rs:2354` — Every coreutil spawn looks up the
   image handle and never closes it, though `sys_process_spawn` only looks the image up
   (table.rs:352-353; process-spawn-args.md:43: "the spawner closes it after spawn").
@@ -5382,7 +5470,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   that many `/bin` file handles stay pinned until the harness exits. `exit_storm_demo` (:997),
   `fp_hardfloat_demo` (:3435) and boot-probe's `spawn_stage` close theirs. Demonstrated by path:
   `grep -n "let (st, img)\|HANDLE_CLOSE, img" harness.rs` shows 6 lookups and 2 closes. abi,
-  ownership, opportunities. Low.
+  ownership, opportunities. Low. **Fix.**
 - [ ] **th-d5** `userspace/test-harness/src/bootprobe/views.rs:226` — `view_broker_test` opens
   client channels until the broker refuses one (:218-236). Five of its six failure returns (226,
   236, 249, 253, 258) do not close them; only the loop at :260 does. A misbehaving broker then
@@ -5390,7 +5478,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   its machine-wide wait set (rsproto-views-ops.md:36-40), so every later views resolve is refused
   WouldBlock. `view_grants_end_test`, `storage_grant_test`, `policy_test`, `grace_test` and
   `accounts_test` would then fail for the wrong reason and the broker would stay wedged for the
-  boot. Demonstrated by path: the returns skip :260. Failure paths only. ownership. Low.
+  boot. Demonstrated by path: the returns skip :260. Failure paths only. ownership. Low. **Fix.**
 - [ ] **th-d6** `userspace/test-harness/src/bootprobe/files.rs:694` — On success, `overwrite_test`
   (:694), `grow_test` (:777) and `create_test` (:893) never close the file handle or unmap their
   writable mapping, and `read_large_file` (:934) closes the handle but never unmaps its 32 KiB
@@ -5398,7 +5486,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   boot-probe exits, so anything later that checks the root mount has let go of its files
   (`sys_ns_held` on `/system`, an unmount) would see them held. Demonstrated by path: no
   `SYS_MEMORY_UNMAP` anywhere in files.rs:684-969, and the closes are only on the failure paths
-  (698, 781, 897). ownership, soundness, opportunities. Low.
+  (698, 781, 897). ownership, soundness, opportunities. Low. **Fix.**
 - [ ] **th-d7** `userspace/test-harness/src/harness.rs:3727` — `forward_demo` releases nothing it
   made on success: the namespace with the userspace-server binding (3727/3736), `send_end`
   (3724), the resolved MemoryObject (3846) and both mappings (3782, 3853). The same success-path
@@ -5409,7 +5497,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `dev_entropy_lookup_demo` (735/745) and `proc_self_demo` (816/825/835) also return without
   closing. Demonstrated by path: `awk 'NR>=3713 && NR<=3865 && /close\(|SYS_HANDLE_CLOSE|SYS_MEMORY_UNMAP/'
   harness.rs` prints nothing. Bounded: the harness exits at the end of the chain. ownership,
-  soundness, opportunities. Low.
+  soundness, opportunities. Low. **Plan**, in P7.
 - [ ] **th-d8** `userspace/test-harness/src/harness.rs:3156` — `rename_wait` discards
   `sys_wait`'s return and reads the status from the shared `WAIT_RESULTS[8..12]` anyway. Its own
   SAFETY comment says those bytes hold the result "only when it returned 1". A failed wait (for
@@ -5419,7 +5507,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   deadline is `u64::MAX` on a fresh PO, so no input makes it fail. Unverified: nothing was run.
   A host test cannot reach it, since `syscallN` runs Linux syscalls on the host. A boot with
   `SYS_WAIT` forced to fail once after a successful lookup would settle it. abi, soundness,
-  opportunities. Low.
+  opportunities. Low. **Fix.**
 - [ ] **th-d9** `userspace/test-harness/src/stage.rs:621` — The crate's user threads run on stacks
   with no guard gap. Each stack is mapped at exactly its size with hint 0, so first-fit places it
   directly against the previous mapping, and `EXIT_SPAWNING` carves 48 stacks from one mapping.
@@ -5429,13 +5517,13 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   Demonstrated in part: a temporary kernel host test mapping two 4-page anonymous VMAs via
   `find_free_range` + `map_vma_lazy` asserted `b.start == a.end` and passed (vmm.rs:413-435); the
   probe was restored. Unverified: the overrun itself, which a boot with a thread recursing past
-  its stack would show. soundness. Low.
+  its stack would show. soundness. Low. **Plan**, in P7.
 - [ ] **th-d10** `userspace/test-harness/src/inputclient.rs:104` — `lookup` never closes the
   PendingOperation that `sys_ns_lookup` returned, because this copy of `po_wait` (:72-96), unlike
   the other 11 hand-rolled copies, does not close the PO. One PO handle leaks per
   `Stream::open` of `/dev/input/new`. Demonstrated by path: no `SYS_HANDLE_CLOSE` in
   inputclient.rs:72-106. harness.rs:789, bootprobe/main.rs:117/157 and pattern.rs:271 all close.
-  ownership. Low.
+  ownership. Low. **Fix**, as rt-d7.
 - [ ] **th-d11** `userspace/test-harness/src/composebench.rs:166` — `libdraw::acquire::acquire`
   requires that "nothing else may write the mapping" (acquire.rs:85-86), but compose-bench (and
   display-selftest, display.rs:82) acquire the aperture while the compositor, an essential
@@ -5446,7 +5534,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   unused, so it is latent; hashing the screen through `_fb.bytes()` would make it bite. The two
   SAFETY comments cover only `root_ns` being live. Unverified: the contract violation is confirmed
   by reading; a boot of the bench image with a client committing during the E2 loop would show
-  the torn frames. soundness. Low.
+  the torn frames. soundness. Low. **Plan**, in P7.
 - [ ] **th-d12** `userspace/test-harness/src/bootprobe/files.rs:85` — `RootDevice::read_at`
   hard-codes `const SECTOR: u64 = 512`, but the kernel refuses any block request that is not
   whole logical blocks (`whole_blocks`, kernel/src/io/block.rs:97). On a device reporting
@@ -5455,7 +5543,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   the storage-admin device checks all report FAIL on a correct filesystem. RAM disk
   (`RAMDISK_BLOCK` = 512) and AHCI are 512, so no gate reaches it. Unverified: a boot of
   `image --live --selftest` on a QEMU usb-storage device with `logical_block_size=4096` would
-  settle it. abi. Low.
+  settle it. abi. Low. **Fix.**
 - [ ] **th-d13** `userspace/test-harness/src/bootprobe/storage.rs:71` — Latent: 17
   `SYS_MEMORY_UNMAP` calls pass size 0 and work only because the kernel ignores `size`
   (`sys_memory_unmap(addr, _size)` at table.rs:949, TODO(mm); syscall-abi.md:529). If the kernel
@@ -5466,7 +5554,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   files.rs:113/182/183/227/229/276, storage.rs:71/286, storage_admin.rs:207, registry.rs:581/647,
   exits.rs:91, gates.rs:208, harness.rs:3473/3505/3611. Counted by `grep -rnE "SYS_MEMORY_UNMAP,
   [a-z_.]+( as u64)?, 0\)" userspace/test-harness/src | wc -l` = 17. Unverified: a kernel branch
-  refusing size 0 and a test-qemu run would settle it. opportunities. Low.
+  refusing size 0 and a test-qemu run would settle it. opportunities. Low. **Fix.**
 
 **Opportunities**
 
@@ -5483,7 +5571,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   Closes: handles left open on success and failure paths (th-d4, th-d5, th-d6, th-d7, th-d10) and
   double closes; removes 113 unsafe close blocks. Depends on: libos markers for
   Channel/Timer/Pending/File; easier after th-o3. ownership, opportunities. Value high, effort
-  large.
+  large. **Plan**, as sup-o2, in P7.
 - [ ] **th-o2** encapsulate: a mapping is a bare address that is turned into `from_raw_parts`
   slices or raw volatile accesses, with a hand-written unmap that some paths never reach — 38 to
   48 sites (38 `SYS_MEMORY_MAP` by script, plus 9 `map_file(` calls; 32 unmaps, 17 of them size 0;
@@ -5498,7 +5586,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `Handle<Memory,_>::map`, which returns a `*mut u8` and unmaps nothing. Closes: a `&mut` held
   across a device write (th-d2), mappings never unmapped (th-d6, th-d7), size-0 unmaps (th-d13),
   offsets past the mapped length. Depends on: th-o1 for the File marker. abi, ownership,
-  soundness, opportunities. Value high, effort medium.
+  soundness, opportunities. Value high, effort medium. **Plan**, as rt-o3, in P7.
 - [ ] **th-o3** encapsulate: out-params of kernel calls held by convention as raw pointers cast
   to `u64` — 46 sites (20 `CHANNEL_CREATE`, 12 `CLOCK_READ`, 5 `NOTIF_RECV`, 5 `HANDLE_STAT`, 3
   `ENTROPY_READ`, 1 `THREAD_GET_REGISTERS` by `grep -rnE "syscall[0-9]\((libkern::)?SYS_(...)"`;
@@ -5513,7 +5601,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   kernel writes — this crate's own HandleInfo 16-vs-24 smash (harness.rs:798) — and a clock
   out-param shared through a static, with the 'failed read leaves its last value' reads at
   harness.rs:2004 and inputclient.rs:478. Depends on: nothing. opportunities, soundness. Value
-  high, effort medium.
+  high, effort medium. **Plan**, as rt-o1, in P7.
 - [ ] **th-o4** encapsulate: raw `SYS_WAIT` on a hand-sized result buffer with the `IoResult`
   decoded from byte offsets (status at 8..12, result at 16..24), each caller checking `== 1` for
   itself — 39 sites (35 `grep -rnE "syscall[456]\((libkern::)?SYS_WAIT,"` plus 4 multi-line;
@@ -5529,7 +5617,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   thin `Result` wrapper in libkern beside `channel_recv`. Closes: a result buffer sized by
   convention (the 16-vs-24 smash), a status read from a wait that did not return 1 (th-d8), and
   `IoResult` byte offsets restated 17 times. Depends on: nothing. abi, ownership, soundness,
-  opportunities. Value high, effort medium.
+  opportunities. Value high, effort medium. **Plan**, as rt-o2, in P7.
 - [ ] **th-o5** remove: `static mut` as per-call scratch for syscall out-params, argument blocks
   and message buffers — 31 statics (`grep -rn "static mut" userspace/test-harness/src`), 103 of
   the 494 unsafe blocks naming one (81 in harness.rs, 10 inputclient.rs, 6 bootprobe, 3
@@ -5544,7 +5632,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   threads) calls a helper, an overrun that clobbers the neighbouring static instead of faulting,
   and unenforced 'only this thread touches it' SAFETY claims. Depends on: th-o4 and th-o9 for the
   `WAIT_*` and message statics (smaller once the typed wrappers land). abi, ownership,
-  soundness, opportunities. Value high, effort medium.
+  soundness, opportunities. Value high, effort medium. **Plan**, in P7.
 - [ ] **th-o6** encapsulate: starting a thread by hand — `SYS_MEMORY_CREATE`, `SYS_MEMORY_MAP`, a
   `ThreadArgs` literal with `_reserved: [0; 36]` and the safe `libos::thread_create`; handle and
   pointer values travel through statics and `AtomicU64`s, while `arg0` is always 0 — 5 sites
@@ -5558,7 +5646,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   written after it started. Depends on: nothing for the typed entry and owned stack; for the guard
   half (th-d9), a kernel way to keep an unmapped range below a caller-supplied stack (a reserved
   no-access VMA, or a gap `find_free_range` leaves; Part E). abi, ownership, soundness,
-  opportunities. Value high, effort medium.
+  opportunities. Value high, effort medium. **Plan**, as rt-o6, in P7.
 - [ ] **th-o7** remove: private copies of a namespace lookup plus PO wait — 3 helpers, 141 callers
   (`harness.rs:760` `ns_lookup_wait`, 29 callers; `bootprobe/main.rs:89` `ns_lookup`, 111;
   `inputclient.rs:96` `lookup`, 1). `libfs::lookup_wait(ns, path, rights) -> (i32, u64)`, already
@@ -5568,6 +5656,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   return `(0, 0)` for a handle-less success. Later this becomes the libos typed lookup (th-o1).
   In libfs (exists). Closes: three more hand-parsed `IoResult` copies with their own static wait
   buffers (th-d10). Depends on: nothing. abi, opportunities. Value medium, effort small.
+  **Plan**, in P7.
 - [ ] **th-o8** encapsulate: boot-probe's `Received` strips `libkern::Received`'s guard — 20
   `receive()` callers (`grep -rnE "(^|[^_a-z])receive\(" userspace/test-harness/src/bootprobe |
   grep -v "fn receive\|views_receive\|ChannelReceiver"`), 12 closing `m.handles` by hand and 9
@@ -5578,7 +5667,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `take(0)`. Checked on those two and services.rs:29-33. In bootprobe/main.rs, or
   `librsproto::session::recv` if th-o9 lands first. Closes: the leak at th-d3, the class
   `libkern::Received` was written to close. Depends on: nothing. abi, ownership, opportunities.
-  Value medium, effort small.
+  Value medium, effort small. **Fix.**
 - [ ] **th-o9** encapsulate: IPC messages framed and parsed by hand in raw `[u8; 4096]` buffers
   (payload length at [4..8], handle count at [8], rsproto at [24..]) and sent with a raw
   `SYS_CHANNEL_SEND` — 14 to 15 sites (14 sends by grep; 8 `[4..8].copy_from_slice` header writes,
@@ -5593,7 +5682,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   buffer shorter than the page the kernel copies (all 14 are 4096 today by convention; the
   desktop-session-mgr 256-byte receive was this class), header offsets disagreeing with
   `IpcMsgHeader`, and payload slices running past `IPC_PAYLOAD_SIZE` into the handle area.
-  Depends on: nothing. abi, opportunities. Value medium, effort medium.
+  Depends on: nothing. abi, opportunities. Value medium, effort medium. **Plan**, as rt-o5, in P7.
 - [ ] **th-o10** encapsulate: spawning a program by path by hand (look up the image, fill
   `SpawnArgs`, spawn, then remember to close the image; 4 of 9 sites forget) — 9 sites
   (`grep -rnE 'syscall1\(SYS_PROCESS_SPAWN|[^_]spawn\(&'`), such as `harness.rs:2370`,
@@ -5603,7 +5692,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `libstream::setup` wrapper adds the setup channel. Checked on `run_coreutil_in`, `spawn_stage`
   and `run_grants`. In libos beside `spawn` (which already returns an owning `Handle<Process>`).
   Closes: the never-closed spawn images (th-d4, about 56 per run). Depends on: nothing. ownership.
-  Value medium, effort small.
+  Value medium, effort small. **Plan**, in P7.
 - [ ] **th-o11** encapsulate: DMA buffers built by hand (an `IoOp` submitted raw on a memory
   object that is mapped and read around the I/O, then closed whether or not the wait completed)
   — 8 sites (`SYS_IO_SUBMIT`; three map and read the buffer: `harness.rs:3567`,
@@ -5615,7 +5704,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   through `Op::submit`'s `Err`. In libos. Closes: a reference held over memory a device writes
   (th-d2), and a DMA buffer closed or unmapped while its I/O may still be in flight after a
   failed wait (harness.rs:3568-3578, `RootDevice::drop` after a failed read). Depends on: th-o2.
-  soundness. Value medium, effort small.
+  soundness. Value medium, effort small. **Plan**, in P7.
 - [ ] **th-o12** encapsulate: `librsproto::session::Dir` is closed only by an explicit `.close()`
   on every path (its doc says drop cannot report a failure, but `close()` returns `()`) — 46
   sites (`grep -rnE "Dir::(open|from_endpoint)\("` 46; `grep -rnoE "\.close\(\)"` 46), such as
@@ -5623,7 +5712,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   its endpoint, with `into_endpoint()` for the one borrowing use (`harness.rs:2941`). In
   librsproto session.rs. Closes: a session left open on an early return, holding one of a
   server's `MAX_WAIT_HANDLES - 2` slots (`session_fanout_demo` shows the table is finite).
-  Depends on: nothing. opportunities. Value low, effort small.
+  Depends on: nothing. opportunities. Value low, effort small. **Plan**, as sup-o2, in P7.
 - [ ] **th-o13** narrow: `unsafe` library calls whose only contract is "this `u64` is a live
   namespace handle I own" — 16 to 17 sites (`grep -rnE "ChannelTransport::(connect|manage)|
   acquire::acquire\(|text::load_(ui|mono)\(|Handle::<[A-Za-z]+, *[A-Za-z]+>::(borrow|from_raw)"`
@@ -5635,7 +5724,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   libsurface ipc.rs, libdraw text.rs and acquire.rs, and libos. Closes: the copy-pasted SAFETY
   sentence that hides the one clause that is broken (th-d11). A wrong value is a kernel
   InvalidHandle, never UB. Depends on: the libos thin-entry shim for the full form. soundness,
-  opportunities. Value low, effort medium.
+  opportunities. Value low, effort medium. **Plan**, as desk-o4, in P7.
 - [ ] **th-o14** remove: inline asm with safe or intrinsic equivalents — 9 sites (`grep -rnE
   "asm!\(\"pause\"|\"cpuid\"|\"xgetbv\""`: 5 `pause` loops, 2 `cpuid`, 2 `xgetbv`), such as
   `stage.rs:42`, `bootprobe/gates.rs:119`, `harness.rs:114`, `stage.rs:65`. `core::hint::spin_loop()`
@@ -5645,6 +5734,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   FP-check module shared by test-stage and boot-probe (the check is duplicated). In `core::arch`
   and `core::hint`, and a shared module in test-harness. Closes: 7 of 9 asm sites and the
   hand-routed `rbx` clobber. Depends on: nothing. opportunities. Value low, effort small.
+  **Plan**, in P7.
 - [ ] **th-o15** encapsulate: sleeping reimplemented six times (create a timer, arm it, wait,
   close it; or wait with a deadline on a channel or notification that is not meant to signal) —
   6 helpers, 13 callers (`grep -rnE "fn (timer_sleep_ms|timer_nap_ms|nap|sleep_ns)\(|
@@ -5654,7 +5744,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   services.rs:58-77. In libos. Closes: static clock scratch read after a failed read, and a sleep
   that ends early (inputclient's `sleep_ns` waits on `notif`, which its own `wait_event_before`
   at :496 says is never drained). Depends on: th-o3 (`clock_now`). opportunities. Value low,
-  effort small.
+  effort small. **Plan**, in P7.
 - [ ] **th-o16** remove: kernel snapshot objects (`/proc/sched/stats`, `/proc/self/status`,
   `/initramfs/etc/init.toml`) mapped at exactly one page whatever size the kernel reports, read
   as a 4096-byte slice and unmapped by hand — 6 sites (`grep -rnE "SYS_MEMORY_MAP, mem, 0,
@@ -5664,7 +5754,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   (main.rs:393). In libfs (exists). Closes: a snapshot outgrowing one page being parsed truncated
   (`idle_cpus` would undercount and fail `dead_log_source_demo` falsely at about 40 online CPUs;
   `MAX_CPUS` is 8 today) and the leaked initramfs mapping. Depends on: nothing. abi. Value low,
-  effort small.
+  effort small. **Plan**, in P7.
 - [ ] **th-o17** remove: kernel error discriminants copied as literals where
   `KError::X.as_i32()` exists (harness.rs:22 already does it for TimedOut) — 3 sites (`grep -rn
   "const KERR_\|== -[0-9]\+\b"`): `harness.rs:636` (`status2 == -10`), `harness.rs:2999`
@@ -5672,7 +5762,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `KError::NotFound.as_i32()`, `WouldBlock`, `Unsupported`. In libkern::error (exists). Closes:
   silent drift of an ABI discriminant in a test that would then assert the wrong refusal;
   abi-sync-check holds libkern to the kernel but not these copies. The three literals match
-  today. Depends on: nothing. abi. Value low, effort small.
+  today. Depends on: nothing. abi. Value low, effort small. **Later.**
 
 What held up: Every `SYS_WAIT` (39 sites) passes count 1 with a result buffer of at least 24
 bytes, and the 16-vs-24 `HandleInfo` smash at harness.rs:798 has not come back; every kernel
