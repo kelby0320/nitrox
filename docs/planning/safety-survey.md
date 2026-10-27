@@ -4523,3 +4523,484 @@ reply's request id, which is sound only while every channel it serves is strictl
 desktop-shell, profile-server, nxsh and coreutils close the session on every path. The inventory
 is 19 blocks (session.rs 6, setup.rs 5, channel.rs 4, clipboard.rs 2, desktop.rs 2); the scope's
 7/6/5/3/3 counts matched `use` lines too.
+
+### desktop — main at 135055a8, 2026-10-27
+
+Lenses: abi, ownership, soundness, opportunities; returned nothing: none.
+Defects: found 38, refuted by a boot 0, reported 17 (duplicates merged). Opportunities: 12 (29 proposed).
+
+The inventory, `cargo xtask unsafe-inventory` over its paths:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `userspace/compositor` | 3702 | 79 | 0 | 0 | 13 | 39 | 6 | 0 | 0 | 0 | 0 |
+| `userspace/desktop-shell` | 4206 | 63 | 0 | 0 | 15 | 42 | 4 | 0 | 0 | 0 | 0 |
+| `userspace/desktop-session-mgr` | 500 | 18 | 0 | 0 | 4 | 11 | 0 | 0 | 0 | 0 | 1 |
+| `userspace/libui` | 3825 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/libdraw` | 2087 | 18 | 7 | 0 | 0 | 1 | 4 | 0 | 0 | 0 | 0 |
+| `userspace/libsurface` | 788 | 20 | 5 | 0 | 0 | 12 | 1 | 0 | 0 | 0 | 0 |
+| `userspace/libinput` | 377 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/input-server` | 987 | 36 | 0 | 0 | 9 | 23 | 4 | 0 | 0 | 0 | 1 |
+| `userspace/clipboard-server` | 404 | 24 | 0 | 0 | 10 | 10 | 2 | 4 | 0 | 0 | 0 |
+| `userspace/nxfiles` | 2663 | 7 | 0 | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/nxedit` | 2414 | 5 | 0 | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/nxterm` | 1540 | 32 | 4 | 0 | 6 | 22 | 2 | 0 | 0 | 0 | 0 |
+| `userspace/libterm` | 1313 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `total` | 24806 | 302 | 16 | 0 | 57 | 167 | 23 | 4 | 0 | 0 | 2 |
+
+**Defects**
+
+- [ ] **desk-d1** `userspace/desktop-session-mgr/src/main.rs:421` — `open_greeter` maps two new
+  shared buffers on every call and overwrites `addrs[i]` without unmapping the old pair. The crate
+  has no `SYS_MEMORY_UNMAP` anywhere. Someone at the greeter types a wrong password and presses
+  Enter repeatedly (logins and logouts do the same). Each submit destroys the window (:362), then
+  `open_greeter` (:389) maps 2 x 191,760 bytes (47 pages each). The handles moved at attach, so
+  the stale mappings are the last reference. About 376 KiB leaks per attempt, unbounded, in a
+  supervisor that never exits.
+  Demonstrated by path: `grep -rn 'UNMAP\|unmap' userspace/desktop-session-mgr/src/` is empty,
+  while the same grep finds `overview.rs:40` in desktop-shell (positive control). `open_greeter`
+  runs after every submit and at startup (:301). Not booted. Counting free frames across N refused
+  logins would put a number on it. abi, ownership, soundness, opportunities. Medium.
+
+- [ ] **desk-d2** `userspace/nxterm/src/backend.rs:206` — `Backend::output` is a safe fn returning
+  `Option<&'static [u8]>` into `static mut MSG`. `output()`, `typed()`/`send()` and `recv_is_ok`
+  on any tab's `Backend` overwrite `MSG`, so safe code can hold the slice across a write. That is
+  an aliasing violation, and the bytes change underneath it. The only caller today (main.rs:580)
+  feeds each chunk before the next call. One ordinary change makes it bite: answering a terminal
+  query (DSR `ESC[6n`, which libterm drops today) with `typed(reply)` inside the output loop, or
+  collecting several tabs' output before feeding.
+  Demonstrated two ways. A compile probe added a safe fn that holds `a.output()` across
+  `b.output()` and `a.typed(..)`. `cargo check -p nxterm --bin nxterm --target
+  x86_64-unknown-linux-gnu` accepted it without error or warning. A faithful Miri reproduction
+  (same static, same unsafe blocks, receive simulated) reports "Undefined Behavior: trying to
+  retag ... SharedReadOnly ... later invalidated by a write access" at send's copy. Run natively,
+  the held slice reads `XYllo` after a send and `WORLD` after a second receive. The reproduction
+  is out of tree because `backend.rs` is in the bin crate. The probe was restored. abi, ownership,
+  soundness, opportunities. Medium.
+
+- [ ] **desk-d3** `userspace/nxterm/src/main.rs:334` — `spawn_shell` returns the shell's process
+  handle (SIGNAL|TERMINATE) and `reconcile_backends` only tests it `< 0` and drops it. Every tab
+  leaks a Process handle in nxterm's table and pins the exited shell's Process object. Opening
+  and closing tabs or windows (`open_window` also calls `reconcile_backends`) grows the table
+  until allocation is refused.
+  Demonstrated by path: `backend.rs:268-271` takes `child` from `SYS_PROCESS_SPAWN` and :300
+  returns it. `grep -rn 'spawn_shell(' userspace` finds only the definition and this caller. The
+  kernel returns `parent_handle.bits()` (table.rs:491-509), and desktop-shell's `launch` closes
+  the same value (apps.rs:390/416). abi, ownership. Medium.
+
+- [ ] **desk-d4** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
+  is a safe fn, but the kernel unmaps the whole VMA covering `addr` and ignores both the size and
+  the handle (`sys_memory_unmap` -> `unmap_covering_deferred`, table.rs:949). Safe code can
+  therefore unmap memory a live reference points into (heap, stack, another mapping). Latent. The
+  desktop callers (`libsurface/screen.rs:37`, `libdraw/text.rs:250`) pass the address `map()` just
+  returned. One ordinary change makes it bite: unmapping twice (an error path plus a later cleanup)
+  or after another `map()` reused the range.
+  Demonstrated by reading the signature and the kernel handler. The unsafe is not on the signature.
+  ownership. Medium.
+
+- [ ] **desk-d5** `userspace/compositor/src/main.rs:1576` — `map_attached_buffer` maps whatever
+  object the client transferred, though the spec says `AttachBuffer` carries a MemoryObject, and
+  the SAFETY comment claims "a MemoryObject". Nothing checks the type (no `SYS_HANDLE_STAT`;
+  `HandleInfo.object_type` exists). An app resolves a file with `MAP_READ|TRANSFER`, sends it as
+  an AttachBuffer whose geometry fits within the file, and commits. `sys_memory_map` maps a
+  FileObject lazily (table.rs:887-931), so each composite faults pages in through the fs server on
+  the compositor's single thread. If the stick is pulled, or a fill fails (Oom), the fault is fatal
+  (idt.rs:318-330) and the compositor, and the session with it, dies. It is also reachable by any
+  app (untrusted).
+  Unverified: read at 135055a8, not booted. A boot would settle it: a test client attaches a stick
+  file as buffer 0, commits, ejects the stick (check-media's flow) and forces a repaint. The same
+  boot would test the fix, refusing `object_type != MemoryObject` before the map. abi, soundness.
+  Medium (would be high if the compositor counts as a critical service).
+
+- [ ] **desk-d6** `userspace/libdraw/src/acquire.rs:52` — `read_info` maps the FramebufferInfo
+  object and never unmaps it, and the kernel mints a fresh object per resolve
+  (kernel_server.rs:361). The compositor calls it twice at start (main.rs:2214 and inside
+  `acquire`, :89), so two info pages and their objects stay pinned for the process's life. A
+  future caller that re-reads the geometry leaks a page per call. The same class is in
+  `libdraw/src/text.rs:247`: `load` returns through the `?` on `try_reserve_exact` between its map
+  (:244) and unmap (:250), leaking the font-file mapping and pinning the file.
+  Demonstrated by path: `grep -n unmap userspace/libdraw/src/acquire.rs` is empty, while
+  `libsurface/src/screen.rs:37-39` unmaps the same kind of object and says why. abi, ownership,
+  soundness, opportunities. Low.
+
+- [ ] **desk-d7** `userspace/libdraw/src/acquire.rs:99` — `acquire` maps `info.byte_len` bytes but
+  wraps them in `RawFramebuffer::new`, whose contract needs `geometry.byte_len()` = pitch x
+  height. `geometry_from` (:62-76) never reads `byte_len`, so the SAFETY argument ("maps byte_len
+  writable bytes") names the wrong quantity. It holds only because the kernel computes
+  `byte_len = pitch.saturating_mul(height)` (kernel/src/framebuffer.rs:55). If byte_len were
+  smaller (firmware-reported size, another boot protocol on the planned aarch64 port), the
+  mapping would be shorter than the slice, and `copy_damage` would write past it into whatever
+  `find_free_range` put next to it. One check, `info.byte_len >= geometry.byte_len()`, makes it
+  structural.
+  Demonstrated by path (acquire.rs:61-76, :99; framebuffer.rs:337-343). abi, soundness. Low.
+
+- [ ] **desk-d8** `userspace/desktop-shell/src/wallpaper.rs:88` — `open_wallpaper` unmaps none of
+  its shared buffers on any path. On a failed attach, a refused commit (:98) or a vanished window
+  (the `!ok` exit, :108-112), the screen-sized mappings (about 4 MB each at 1280x800) stay mapped
+  for the shell's life. On success both stay too, though nothing writes them after the copy.
+  `Wallpaper` stores no addresses. The handle half of a failed attach is the recorded
+  capture-refused-leak. The mapping half is not.
+  Demonstrated by path: nothing in `wallpaper.rs` calls `SYS_MEMORY_UNMAP` or `release_buffer`;
+  `overview.rs:209-213` releases on the same kind of failure. abi, soundness, opportunities. Low.
+
+- [ ] **desk-d9** `userspace/desktop-shell/src/overview.rs:196` — when `attach_with_format` fails in
+  `open_overview` (and `open_wallpaper`, wallpaper.rs:88), the MemoryObject handle is left open.
+  The cleanup unmaps and destroys the window but never closes `handle`. libsurface transfers the
+  handle only on a successful send (buffers.rs:113-114), so a refused NOBLOCK send (session ring
+  full, compositor gone) leaves it this process's. Each failed overview open leaks a screen-sized
+  object (about 4 MB). It is distinct from the recorded capture-refused-leak at overview.rs:411.
+  Unverified: read, not booted. A boot with the attach send forced to fail, counting handles,
+  would settle it. `libsurface/src/buffers.rs:install` shows the correct cleanup for the same
+  failure. ownership. Low.
+
+- [ ] **desk-d10** `userspace/nxterm/src/backend.rs:250` — `spawn_shell` documents `terminal` as
+  moved, but its early `return -1` paths (no `/bin/nxsh` at :248-250, setup-channel failure at
+  :252-255) never close it, unlike the spawn-failure (:276) and send-failure (:296) paths.
+  `attach`'s `make_channel()?` at :145 returns without closing the `tty` resolved at :140.
+  `reconcile_backends` keeps the Backend anyway (main.rs:329-337), so the tty server never sees
+  PeerClosed and the terminal outlives its tab. Reachable with a namespace lacking `/bin/nxsh` or
+  a failed channel create, and each further tab leaks another handle.
+  Demonstrated by path (the two close-sites and the early returns, side by side). abi, ownership,
+  opportunities. Low.
+
+- [ ] **desk-d11** `userspace/nxterm/src/main.rs:695` — the wait set spans the session channel plus
+  every backend of every window, but `MAX_TABS` (MAX_WAIT_HANDLES - 1) caps tabs per window only.
+  Two windows of 31 tabs give 63 handles, and 32 windows of one tab give 33. The kernel refuses
+  a wait over 32 (table.rs:1767), `wait_any` returns false and :696 calls `fail(...)`, which exits
+  nxterm and every shell in every window (a QEMU failure exit under the test-harness kernel).
+  Demonstrated: a temporary host test building two `App`s with `MAX_TABS` NewTab each failed
+  (`1 + a.tabs().len() + b.tabs().len() <= MAX_WAIT_HANDLES`; "waits on 63 handles", and 33 with
+  15 per window). The const assert at lib.rs:2317 checks one window. Probe restored. ownership,
+  opportunities. Low.
+
+- [ ] **desk-d12** `userspace/compositor/src/main.rs:1704` — `handle_session_request` copies each
+  request body into `MAX_BODY` = 4 + `MAX_TITLE` = 260 bytes, sized for SetTitle, the comment
+  calling the min "a bounds check, not a policy". StartDrag allows 12 + 512 + 64 = 588 bytes
+  (rsproto-surface-ops.md:1442-1443), and libsurface sizes it that way (lib.rs:574). nxfiles
+  dragging a file with a path over about 248 bytes gets InvalidArgument (path_len runs past the
+  cut body) after logging "dragging". A 200-byte path with a 64-byte name is accepted with the
+  name cut to 48 bytes, and the drop carries the shortened name. The const assertion at main.rs:58
+  ties MAX_BODY to MAX_TITLE only.
+  Demonstrated by two host probes (removed). A 328-byte StartDrag (306-byte path) parsed whole,
+  but `StartDrag::read` on the first 260 bytes was `None`. A 278-byte StartDrag failed
+  `assert_eq!(whole, cut)`, with the name 60 vs 42 'n'. A second probe in librsproto's tests
+  found the same: 300-byte path `None`, 200+64 gives a 48-byte name. abi, soundness. Low.
+
+- [ ] **desk-d13** `userspace/compositor/src/main.rs:1354` — `Manage::Close` (desktop-shell's
+  insist_on_close) destroys a window and its popups through the manager path, which never drops
+  their `MappedBuffer`s. `srv.buffers.retain` runs only at :1558 (close_session), :1573 and :1991
+  (after a session request is Applied). A hung app force-closed by a double middle-click keeps its
+  two buffers mapped until some client next commits (in practice the clock, up to a minute) or
+  indefinitely on a quiet desktop. A delay, not a permanent leak, and window ids are never
+  reused, so nothing aliases.
+  Demonstrated by path: `grep -n 'buffers.retain' userspace/compositor/src/main.rs` finds only
+  those three lines, none inside `handle_manager_request` (:1291-1481). ownership, soundness. Low.
+
+- [ ] **desk-d14** `userspace/compositor/src/main.rs:1916` — an AttachBuffer carrying no handle is
+  still applied: `dispatch` records the new geometry for (window, buffer), but the mapping is
+  replaced only `if op == OP_ATTACH_BUFFER && handle != 0`. A client attaches (W,B) at 8x8 with
+  memory, re-attaches (W,B) at 4096x4096 without a handle and commits. The stack says 64 MiB
+  while `pixels(W,B)` is still the old 256-byte mapping. Today `compose_into` (lib.rs:943) and
+  `box_downscale` skip a short buffer. One more reader that trusts the stack's geometry
+  (a full-size capture, a screenshot) would read past the mapping, and any client can reach it.
+  Demonstrated by path: server.rs:182-189, lib.rs:724-726, main.rs:1916. The existing test
+  `a_short_buffer_is_skipped_rather_than_read_past_its_end` covers the readers, not this
+  producer. ownership. Low.
+
+- [ ] **desk-d15** `userspace/compositor/src/main.rs:2121` — when the supervisor's control channel
+  reads `Closed`, it is dropped from the wait set (`control = 0`) and the handle is never closed.
+  The same in `input-server/src/main.rs:825` and `clipboard-server/src/main.rs:378`.
+  `libkern::control::recv` does not close it. Bounded at one handle per process, but no path ever
+  closes it.
+  Demonstrated by path (`Control::Closed => control = 0` with no `SYS_HANDLE_CLOSE`). ownership.
+  Low.
+
+- [ ] **desk-d16** `userspace/compositor/src/server.rs:113` — `static mut TITLE_TRUNCATED_LOGGED`
+  lives in the compositor library and is read and written without synchronisation by the safe
+  `pub fn dispatch` (via `note_title_truncated`). The "single-threaded server" argument holds for
+  the binary but not for libtest, which gives every test its own thread. Today only
+  `title_tests::an_over_long_title_is_stored_truncated` reaches it, and a second over-long-title
+  test is an ordinary addition.
+  Demonstrated: a Miri probe calling `set_title` with a `MAX_TITLE+50` title from two threads
+  reported "Data race detected between (1) non-atomic write on thread `server::title_t` and (2)
+  non-atomic read on thread `unnamed-2`" at server.rs:120/123. Probe removed, `git status` clean.
+  soundness, opportunities. Low.
+
+- [ ] **desk-d17** `userspace/compositor/src/main.rs:159` — `BufferSource::pixels` builds a `&[u8]`
+  over a mapping the client holds read-write (libsurface maps `MAP_READ|MAP_WRITE`,
+  buffers.rs:170), and `do_capture` (:1244) makes a `&mut [u8]` over the manager's object. A
+  reference promises that nothing writes the bytes while it lives, and the other process can break
+  that at any time. No pixel value reaches an index or bound today (blend and average only), so
+  the visible result is a torn frame, but the SAFETY argument covers the mapping's lifetime and
+  not `from_raw_parts`' immutability requirement.
+  Unverified: cross-process, so no host test or Miri reaches it. A copy-only reader (`ptr::copy`
+  or volatile loads) behind a Mapping type (see desk-o5) would settle it. soundness,
+  opportunities. Low.
+
+**Opportunities**
+
+- [ ] **desk-o1** encapsulate: handles held as raw `u64` and closed by hand on every path,
+  including after a send that may or may not have moved them — 73 sites of `SYS_HANDLE_CLOSE` (86
+  with input-server's 13 `close()` calls), counted by `cd userspace && grep -rnE
+  'syscall[0-9]\((libkern::)?(syscall::)?SYS_HANDLE_CLOSE' --include=*.rs <the 13 crates> | wc
+  -l`; by crate compositor ~21, desktop-shell ~23, nxterm ~14, input-server ~5, clipboard-server
+  3, libsurface 3, nxfiles 2, dsm 2. Such as `userspace/nxterm/src/backend.rs:271`,
+  `userspace/compositor/src/main.rs:1185`, `userspace/desktop-shell/src/apps.rs:379`,
+  `userspace/desktop-shell/src/overview.rs:187`. Own every handle as libos `Handle<T, M>`
+  (`into_raw` only at a committed transfer). Add a libos channel object with `send(&self, msg,
+  handles: [Handle; N]) -> Result<(), Refused<N>>`, which consumes on success and hands back on
+  refusal; `Received::take(i) -> Option<owning handle>`; Transport::request and `Window::attach`
+  take the handle by value, which settles their contract by type. In libos (`handle.rs`,
+  `objects.rs`; `libkern::channel::Received`; libsurface's Transport signature). Checked against
+  nxterm `spawn_shell`, compositor `open_session` (both ends drop on a refused reply),
+  desktop-shell `launch` (loses 9 closes) and `map_attached_buffer`. Closes: handles dropped on
+  early return or refused send (desk-d3, d9, d10, d15, the handle half of capture-refused-leak,
+  the class b4cc3a39 fixed by hand). Depends on: a libos channel create/send/recv API (libos has
+  none yet), and the typed message buffer (desk-o2) for send's signature. Note:
+  desktop-session-mgr's CLAUDE.md inherits "no libos", yet `cargo tree` shows libos already
+  linked through libsurface and libdraw, so that rule needs a decision. abi, ownership,
+  soundness, opportunities. Value high, effort large.
+
+- [ ] **desk-o2** encapsulate: IPC messages as raw `static mut [u8; 4096]` buffers, framed by hand
+  (payload_len read at [4..8], slices via `from_raw_parts(base+24, len.min(4096-24))`, headers
+  stamped at [4..8] and [8], raw `SYS_CHANNEL_SEND`) — 30 to 45 sites, counted by `grep -rnE
+  'from_le_bytes\(\[[A-Za-z_.]+\[4\]'` (16 receive parses), `grep -rnE
+  '\[4\.\.8\]\.copy_from_slice'` (17 send stamps), `from_raw_parts` over receive statics (13),
+  `channel_recv_raw(` (15), over 12 message-buffer statics and 5 send-handle arrays;
+  `PAYLOAD_OFF` and `MSG_LEN` are redefined in five crates, desktop-shell uses the literals 24 and
+  4096, and nobody uses libkern's `IpcMsg`. Such as `userspace/compositor/src/main.rs:1695`,
+  `userspace/clipboard-server/src/main.rs:239`, `userspace/nxterm/src/backend.rs:219`,
+  `userspace/input-server/src/main.rs:392`. An owned `IpcMsg`/`MsgBuf` (libkern's
+  `#[repr(C, align(4096))]`, or boxed in each server's state) with `recv(&mut self, ch) ->
+  Result<(Decoded<'_>, Received), i64>` (the view borrows the buffer) and `send(&mut self, ch,
+  op, id, flags, body, handles)`, stamping both header fields. The payload is clamped to
+  `IPC_PAYLOAD_SIZE` (4008), not 4072, which also covers the handle slots. In libkern (`IpcMsg`
+  and accessors, beside `channel_recv`) with the encode helper in librsproto (beside `encode` and
+  `round_trip`) or libos; nxfiles already receives into a `Box<[u8; IPC_MSG_SIZE]>`. Checked
+  against compositor `handle_session_request`, clipboard `serve_session` (separate recv and reply
+  buffers) and nxterm `Backend::output`, which becomes `fn output(&mut self) -> Option<&[u8]>`.
+  Closes: a view of a static buffer outliving the next receive/send (desk-d2), buffers sized by
+  expectation (the desktop-session-mgr 256-byte class), the 4072/4008 clamp disagreement, and
+  desk-d12's MAX_BODY. Removes about 10 `static mut` buffers and 30 unsafe blocks. Depends on:
+  nothing (the 8 MiB stack is decided; the "32 KiB stack" comments are stale); moving handles in
+  a send waits for desk-o1. abi, ownership, soundness, opportunities. Value high, effort medium.
+
+- [ ] **desk-o3** encapsulate: `sys_wait` called by hand over `static mut WAIT_HANDLES` and
+  `WAIT_RESULTS`, with 24-byte `IoResult` records decoded by byte offset and the result buffer
+  sized by a comment — 17 to 21 sites, counted by `grep -rn 'SYS_WAIT,' --include=*.rs <the 13
+  crates> | wc -l` (21 hits, 17 to 18 calls once import lines are removed), over 12 wait-array
+  statics and 7 hand-decoding functions (compositor:2097, clipboard:358, input-server:266 and
+  :805, desktop-shell apps.rs:272, nxterm backend.rs:59, nxfiles:334). Such as
+  `userspace/compositor/src/main.rs:2085`, `userspace/input-server/src/main.rs:255`,
+  `userspace/nxterm/src/backend.rs:53`, `userspace/nxfiles/src/main.rs:328`. Make libos's
+  private `sys::wait(handles, &mut [IoResult], deadline)` public with `results.len() >=
+  handles.len()` checked, and put `WaitSet<const N: usize> { handles, results: [IoResult; N],
+  len }` over it: `push(h) -> Result<(), Full>`, `wait(deadline) -> Result<&[IoResult], KError>`,
+  N const-checked against `MAX_WAIT_HANDLES`. In libos (using libkern's `IoResult`,
+  abi.rs:287). Checked against compositor `serve_loop`, input-server `po_completion` (a
+  `WaitSet<1>` stops it overwriting record 0 of the loop's batch) and nxfiles `wait_for`. Closes:
+  a result buffer smaller than the wait set, as in a81cf9c0 (desktop-shell, 24 bytes past a
+  static); a wait set over the kernel limit (desk-d11, nxterm's `Full` becomes "no more tabs"
+  instead of exit). Depends on: nothing. abi, ownership, soundness, opportunities. Value high,
+  effort medium.
+
+- [ ] **desk-o4** narrow: `unsafe fn`s whose only contract is "root_ns must be a live namespace
+  handle". A stale handle fails the generation check and returns InvalidHandle, so the contract
+  guards no UB, yet it makes every caller write `unsafe` — 14 of the subsystem's 16 `unsafe fn`s
+  with 26 to 31 unsafe call blocks, counted by `grep -rnE 'unsafe fn [a-z_]+(<[^>]*>)?\('
+  --include=*.rs <the 13 crates>` (16, minus `RawFramebuffer::new` and `ChannelTransport::new`)
+  and `grep -rn 'unsafe { .*(load_ui|load_mono|connect|manage|screen::read|read_info|acquire(|
+  attach(root|spawn_shell|open_window|reconcile_backends)'`. The 14: libdraw `read_info`,
+  `acquire`, `load`, `load_ui`, `load_mono`, `load_themed`; libsurface `screen::read`, `connect`,
+  `manage`, `resolve`; nxterm `attach`, `spawn_shell`, `open_window`, `reconcile_backends`. Such
+  as `userspace/libdraw/src/text.rs:265`, `userspace/libsurface/src/ipc.rs:81`,
+  `userspace/libsurface/src/screen.rs:22`, `userspace/nxterm/src/backend.rs:139`. Take `ns:
+  &Handle<Namespace, NsReadOnly>` instead of `root_ns: u64`, borrowed once in each `_start` with
+  `unsafe { Handle::borrow(RawHandle(root_ns), Rights::LOOKUP) }`; optionally a checked
+  `lookup_as::<Memory, MapRead>` that confirms the type with `sys_handle_stat`, which is also the
+  check desk-d5 needs. In the callee crates (libdraw, libsurface, nxterm), libos supplying the
+  lookup. Checked against `load_ui`, `ChannelTransport::connect` and nxterm `attach`, which only
+  perform lookups through it. Closes: no defect class, but the unsafe that remains marks real
+  memory hazards. Depends on: a one-time borrow of the bootstrap namespace in each `_start` (or
+  libos's thin-entry seam). abi, soundness, opportunities. Value high, effort medium.
+
+- [ ] **desk-o5** encapsulate: shared mappings as raw `(*mut u8, len)` pairs, unmapped by hand or
+  not at all — 12 map sites against 10 to 13 unmaps and 9 `from_raw_parts` slices over mappings,
+  counted by `grep -rnE 'syscall[0-9]\((libkern::)?SYS_MEMORY_MAP|obj\.map\(' --include=*.rs
+  <the 13 crates>`; `shared_buffer()` is copied in three or four places, and the compositor
+  (`MappedBuffer`), libsurface (`Mapping`/`BufferPool`) and input-server (`Device.buf_addr`) each
+  hand-roll an owner. Such as `userspace/libdraw/src/acquire.rs:52`,
+  `userspace/desktop-session-mgr/src/main.rs:61`, `userspace/desktop-shell/src/main.rs:162`,
+  `userspace/compositor/src/main.rs:1239`. `Handle<Memory, M>::map(&self, len) ->
+  Result<Mapping<M>>`: a Mapping owns the VMA and unmaps once on Drop, with `read_into(off,
+  &mut [u8])`, and `write_from` for `CanMapWrite`. Memory a peer can write is reached only by
+  copy (`ptr::copy`), and slice access exists only on a private mapping, via an `unsafe fn
+  assume_unshared`. Libos's safe `unmap(addr)` goes away; `RawFramebuffer::from_mapping(Geometry,
+  Mapping)` checks `len >= geometry.byte_len()` and removes its `unsafe fn new`; one
+  `SharedBuffer::create(len)` replaces the shared_buffer copies. In libos (`objects.rs`, with the
+  `sys.rs` mock for host tests). Checked against `text::load`, `screen::read`, compositor
+  `reply_with_object` and `MappedBuffer`, `read_info` and the greeter's `addrs`. Closes: mappings
+  leaked on a path out (desk-d1, d6, d8, the mapping half of capture-refused-leak, the history at
+  15534384 and 77f5aeff), the safe-unmap hole (desk-d4), the length behind desk-d7, and the
+  shared-pixel reference (desk-d17). Host-testable once libos's mock sits under it. Depends on:
+  nothing (the handle that moves at attach shares desk-o1's send contract). abi, ownership,
+  soundness, opportunities. Value high, effort medium.
+
+- [ ] **desk-o6** remove: desktop-session-mgr and desktop-shell hand-roll shared window buffers
+  (own `shared_buffer`, raw `*mut u8` arrays, `copy_nonoverlapping`, manual release) where
+  `libsurface::buffers::BufferPool` already does it safely and libui uses it (`window.rs:83`) — 3
+  buffer sets, counted by `grep -n 'copy_nonoverlapping\|fn shared_buffer\|shared_buffer(len)'
+  userspace/desktop-session-mgr/src/main.rs userspace/desktop-shell/src/*.rs` (3 copies, 2
+  definitions, 4 callers; removes 7 unsafe blocks), such as
+  `userspace/desktop-session-mgr/src/main.rs:421`, `userspace/desktop-shell/src/overview.rs:258`,
+  `userspace/desktop-shell/src/wallpaper.rs:82`. `BufferPool::in_format(&mut window, Size,
+  BUFFERS, format)` plus `pool.write(id, &frame)`, unmapped on drop; GREETER_PITCH and
+  `Screen::pitch()` are width*4, which is its `pitch_of`; the overview needs ARGB8888; the
+  wallpaper writes after attach, still before its commit. In `userspace/libsurface`, with changes
+  in the callers. Closes: a mapping outliving its window (desk-d1, d8; the overview's hand-kept
+  release, which leaked 9 MB once in 77f5aeff). `install` also closes and unmaps on a failed
+  attach, which closes desk-d9 for these sites. Depends on: nothing. opportunities. Value high,
+  effort small.
+
+- [ ] **desk-o7** remove: `static mut` used as syscall out-params and diagnostic counters where a
+  local or an atomic serves — 21 sites (of 57 `static mut`), counted by `grep -rnE 'static mut
+  (CTRL_OUT[01]|CH_OUT[01]|CH[01]|CLOCK_BUF|[A-Z_]*LOGGED|REDRAWS)\b'` (19) plus `SPAWN_APP`,
+  `NOTIF` and `OVERRUNS_LOGGED`: 14 out-params (CLOCK_BUF x3, CTRL_OUT0/1 x2, CH_OUT0/1 x2,
+  CH0/CH1, NOTIF), 6 counters (ROUTES_LOGGED, INPUT_DIAGS_LOGGED, TITLE_TRUNCATED_LOGGED,
+  OVERRUNS_LOGGED, REDRAWS, GEOMETRY_LOGGED) and SPAWN_APP. Such as
+  `userspace/compositor/src/main.rs:87`, `userspace/compositor/src/server.rs:113`,
+  `userspace/input-server/src/main.rs:94`, `userspace/desktop-shell/src/apps.rs:293`. Locals for
+  out-params (libsurface `ipc.rs:139-141` and nxfiles already read the clock into a local;
+  compositor `main.rs:1974` too), thin safe `libkern::channel_create` and `clock_read`, and
+  `AtomicU32`/`AtomicBool` (Relaxed) for the counters. Checked against compositor `now_ns`,
+  `make_channel`, `log_route`, input-server `make_channel` and dsm's REDRAWS. In each crate, with
+  the clock and channel-pair helpers in libkern/libos. Closes: the data race on a library static
+  (desk-d16) and unsafe blocks wider than their operation: `route_one_batch`'s 152-line block
+  (main.rs:896-1048) exists only for `INPUT_DIAGS_LOGGED`; about 45 of the 302 unsafe blocks wrap
+  these statics. Depends on: nothing. abi, ownership, soundness, opportunities. Value medium,
+  effort small.
+
+- [ ] **desk-o8** encapsulate: server state kept in `static mut` tables whose "nothing else holds
+  it" claim rests on call order — 10 statics (SESSION_CH and MANAGER_CH in the compositor;
+  DESKTOP_SERVE, DESKTOP_SESSIONS, SHELL_NOTIF, NOTIF and SPAWN_APP in desktop-shell; RING,
+  SESSION_CH and REPLY_BODY in clipboard-server), 62 uses, counted by `grep -nE
+  '\b(SESSION_CH|MANAGER_CH|DESKTOP_SERVE|DESKTOP_SESSIONS|SPAWN_APP|SHELL_NOTIF|NOTIF|RING|REPLY_BODY)\b'`
+  excluding declarations. Such as `userspace/compositor/src/main.rs:81`,
+  `userspace/desktop-shell/src/desktop_sessions.rs:214`,
+  `userspace/clipboard-server/src/main.rs:42`, `userspace/desktop-shell/src/apps.rs:293`. Make
+  them fields of an owned `Server` struct passed as `&mut` (the compositor and input-server
+  already have one); clipboard's `Ring` can be a `_start` local (8 MiB stacks since 2026-08-10).
+  In each server binary. Closes: a table or buffer aliased across a call that changes it,
+  prevented today only by single-threading and call order. Depends on: desk-o2 (the receive and
+  reply buffers move with this state). soundness. Value medium, effort medium.
+
+- [ ] **desk-o9** encapsulate: the compositor keeps a buffer's geometry in `WindowStack` and its
+  mapping in a second table (`Server.buffers`), kept in step by hand-placed retains — 4 sites
+  (`grep -n 'buffers.retain\|buffers.push' userspace/compositor/src/main.rs`: 1558, 1573, 1583,
+  1991), such as `userspace/compositor/src/main.rs:1558`, `:1573`, `:1991`, `:1916`. Make
+  `WindowStack` generic over a payload, `AttachedBuffer<P> { id, geometry, mem: P }`, with
+  `attach(req, mem: P)` requiring the memory and destroy/replace dropping it. `BufferSource`
+  goes away because the stack lends pixels from P; host tests use `P = Vec<u8>`, the binary `P =
+  Mapping`. In compositor `lib.rs` (WindowStack) with `main.rs` supplying the Mapping. Closes: a
+  mapping outliving its window (desk-d13) and geometry with no memory behind it (desk-d14), both
+  held today only by two length checks. Depends on: desk-o5. ownership. Value medium, effort
+  medium.
+
+- [ ] **desk-o10** remove: the namespace lookup's wait-and-decode copied into three crates, the
+  copy-paste libos was built to replace — 3 sites (`grep -rnE
+  'syscall[0-9]\((libkern::)?SYS_NS_LOOKUP'`), `userspace/input-server/src/main.rs:236` (lookup +
+  `wait_one` + `po_completion`), `userspace/nxterm/src/backend.rs:84` (`ns_lookup` + `po_wait`),
+  `userspace/desktop-shell/src/apps.rs:262` (`ns_lookup` + `wait_one`). Use
+  `block_on(ns.lookup::<T, M>(path, rights))`, which libdraw and libsurface already use; the
+  caller reads `Error::code()` for the NotFound vs WouldBlock that `verify_app_namespace` needs.
+  In libos. Checked: all three want (status, handle). Closes: a status read from a wait record
+  the last wait did not write, and PO handles each copy must remember to close. Depends on:
+  nothing; a safe lookup (desk-o4) removes the remaining unsafe. opportunities. Value medium,
+  effort small.
+
+- [ ] **desk-o11** narrow: a transferred handle taken out of `Received` before the code knows it
+  will keep it, then closed by hand on each branch — 2 sites: compositor `handle_session_request`
+  takes handle 0 unconditionally (main.rs:1702) and closes it at 6 sites (`grep -n 'if handle !=
+  0' userspace/compositor/src/main.rs`: 1713, 1752, 1803, 1842, 1885, 1922), and input-server
+  `take_notices` calls `sent.take_all()` (main.rs:669), leaving `apply()` responsible for every
+  handle. Take the handle only for the op that keeps it, as `handle_manager_request` does for
+  Capture (:1284-1288): `(m.op == OP_ATTACH_BUFFER).then(|| sent.take(0)).flatten()`, and pass
+  `&mut Received` to `apply()`, taking 0 only on Arrived. In `userspace/compositor/src/main.rs`
+  and `userspace/input-server/src/main.rs`. Removes 5 unsafe closes. Closes: a new op branch
+  before `dispatch` that forgets the close, leaking one client-supplied handle per request (the
+  class b4cc3a39 fixed by hand). Depends on: nothing (desk-o1 would make it structural).
+  opportunities. Value medium, effort small.
+
+- [ ] **desk-o12** remove: raw syscalls that have, or need only, a one-line safe wrapper — 24
+  sites, counted by `grep -rnE
+  'syscall[0-9]\((libkern::)?SYS_(DEBUG_KPRINT|PROCESS_EXIT|TEST_EXIT|CLOCK_READ|NS_ENUMERATE|HANDLE_STAT)'`:
+  DEBUG_KPRINT 3 and PROCESS_EXIT 8 (clipboard, desktop-shell and dsm redefine `libkern::kprint`
+  and `libkern::exit`), CLOCK_READ 8, TEST_EXIT 3, NS_ENUMERATE 1, HANDLE_STAT 1. Such as
+  `userspace/clipboard-server/src/main.rs:56`, `userspace/desktop-session-mgr/src/main.rs:39`,
+  `userspace/desktop-shell/src/apps.rs:247`. Use the existing `libkern::kprint`/`libkern::exit`
+  and libos `Handle<Namespace>::enumerate` (`bound_in`'s `from_raw_parts` over a local `NsEntry`
+  becomes `&entry.path[..len]`), plus new `clock_read(clock) -> Result<u64, KError>` and
+  `test_exit(ok)` in libkern (`debug.rs`, a clock fn) and `stat` in libos. Closes: duplicated
+  wrappers drifting apart, such as the three exit loops that spin if the syscall returns.
+  Depends on: nothing. opportunities. Value low, effort small.
+
+What held up:
+- **Receive sizing.** The desktop-session-mgr 256-byte class cannot recur. All 18 receives (15
+  raw, 3 safe) take a `[u8; IPC_MSG_SIZE]` by type, every static receive buffer is exactly that,
+  and the kernel writes all 4096 bytes. All 17 raw sends pass a 4096-byte buffer. The handles
+  out-param is `IPC_HANDLE_MAX` inside `Received`.
+- **Wait results.** All 18 to 21 `sys_wait` sites have at least 24 bytes per handle. The compositor
+  and clipboard are const-asserted, desktop-shell holds 9 for 9 pushes, input-server is at most 15
+  of 32, and the rest size theirs locally. The one failure is nxterm's handle count (desk-d11),
+  not its buffer.
+- **Received handles.** `Received` closes every untaken handle on drop. The compositor, clipboard,
+  input-server (`notice()` fixes the handle count per kind, so anything else is Malformed and
+  closes all), desktop-shell, nxterm, nxfiles and libsurface close or adopt every handle. Refused
+  sends close what stayed behind in compositor `open_session`/`open_manager`/`reply_with_object`,
+  input-server `open_consumer`, clipboard, `serve_desktop_endpoint`, nxterm `attach` and
+  `BufferPool::install`. A stale forwarded resolve reply makes the kernel close the transferred
+  handles, so no slot leaks.
+- **Compositor MappedBuffer.** Drop unmaps once, `pixels()` borrows `&self`, and both retain sites
+  need `&mut srv`. `compose_into` and `box_downscale` skip a short buffer
+  (`a_short_buffer_is_skipped_rather_than_read_past_its_end`). The kernel refuses a map longer
+  than the object (table.rs:899-901) and `parse_attach_buffer_request` refuses `pitch < width*4`.
+  Re-attaching the on-screen buffer is refused (DuplicateBuffer), and window ids never reuse, so
+  a lingering mapping cannot be read as another window's. `do_capture` and `reply_with_object`
+  unmap before replying.
+- **Client-writable memory.** It is only read as pixels, and no value is used as an index. Every
+  length and geometry comes from the compositor's own stack, and font bytes are copied out before
+  `ab_glyph` parses them.
+- **libsurface BufferPool.** A failed attach unmaps and closes, the old mapping is unmapped after
+  the new attach, only free buffers are replaced, and `write()` refuses a length mismatch.
+  `ChannelTransport` never drops a Release and reports an oversized body as a loss. desktop-shell's
+  260-byte manager drain does likewise.
+- **input-server.** `harvest` reads at most 512 of a 4096-byte page. `retire()` may abandon a
+  parked read because the driver pins the buffer object. `po_completion`'s overwrite of
+  `WAIT_RESULTS[0..24]` is safe as argued (count=1, record 0 already read). The lights page is
+  copied at submit by both PS/2 and xHCI.
+- **Other conventions.** clipboard-server's raw derefs of `RING` and `REPLY_BODY` are sound
+  (separate statics, one `&mut` at a time). desktop-shell `launch` closes image, namespace and
+  process handle, and closes both setup ends only on failure, as the kernel moves a handle only
+  on success (table.rs:501-505). The old 16-vs-24-byte `HandleInfo` smash is gone. desktop-session-mgr
+  copies at most 64 and 128 bytes of name and password and zeroes the password with
+  `write_volatile`. No desktop binary creates a thread, so the 57 `static mut` race nothing in
+  shipped binaries (desk-d16 is the host-test exception). Handles carry a 31-bit generation, so a
+  stale `u64` errors rather than aliasing.
+- **Parsers.** Wire parsers on these paths check declared lengths with checked adds
+  (`DroppedEvent`, `StartDrag`, `ClipEntry`, `ClipList`, `DesktopIndex`, libsurface
+  `window_event`, `FramebufferInfo::from_bytes`). A libterm fuzz of 12,000 escape-heavy streams at
+  4 grid sizes, then resized, did not panic (the control, an out buffer of 1, panicked at
+  parse.rs:294). A libdraw PNG fuzz of 100,000 mutants of 5 valid PNGs, debug and release, did
+  not panic (IHDR size-checked, inflate limited to the size the header implies, allocations
+  fallible). Both probes were removed. libdraw `RawFramebuffer` is clean under Miri
+  (`a_raw_framebuffer_over_an_allocation_matches_the_in_memory_one`). libui, libinput and libterm
+  contain no unsafe.
+- **Doc/source disagreement, not an item.** No receiver checks the rsproto `handle_count` against
+  the IPC handle count, though rsproto-wire-format.md (Validation) calls a mismatch a protocol
+  error. nxterm's AttachBackend encodes 0 while moving one handle (backend.rs:105), so enforcing
+  the spec would refuse every terminal attach.
+- **Host-test reach.** Only two of the subsystem's unsafe sites run under a host test (libdraw
+  `RawFramebuffer`, and compositor `server.rs`'s `static mut`). Every other unsafe site is in a bin
+  crate's `main.rs` with no host test, so no test can reach desk-d1, d3, d6 to d10. desk-o1, o3 and
+  o5, in libos behind its `sys.rs` mock, would make close-on-every-path and unmap-on-every-path
+  testable.
