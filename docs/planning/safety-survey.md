@@ -1010,3 +1010,433 @@ process-ending, periodic-timer, `resume_suspended` and `enqueue_then_drain_runs_
 No host test reaches `switch_into`, `context_switch`, the five switch-away tails, `thread_enter`,
 `end_if_ending` or the arch MMIO/MSR code, and Miri stops on any test that builds an IPC pair until
 sched-d12 is fixed.
+
+### kernel-memory — main at 135055a8, 2026-10-26
+
+Lenses: abi, ownership, soundness, concurrency, opportunities; returned nothing: none.
+Defects: found 40, refuted by a boot 0, reported 19 (the 40 merge into 19 distinct defects).
+Opportunities: 11 (from 26).
+
+The inventory, `cargo xtask unsafe-inventory` over its paths:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `kernel/src/mm` | 2284 | 96 | 20 | 3 | 0 | 0 | 3 | 123 | 0 | 0 | 4 |
+| `kernel/src/tlb.rs` | 68 | 5 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/arch/paging.rs` | 54 | 0 | 10 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/arch/user_access.rs` | 5 | 0 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/arch/x86_64/paging.rs` | 305 | 16 | 15 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 |
+| `kernel/src/arch/x86_64/user_access.rs` | 96 | 5 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 0 |
+| `kernel/src/arch/x86_64/tlb.rs` | 6 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/object/memory_object.rs` | 136 | 4 | 1 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 |
+| `kernel/src/object/file_object.rs` | 902 | 30 | 1 | 0 | 0 | 0 | 1 | 15 | 0 | 0 | 0 |
+| `total` | 3856 | 157 | 54 | 3 | 0 | 0 | 5 | 139 | 0 | 2 | 4 |
+
+**Defects**
+
+- [ ] **kmem-d1** `kernel/src/mm/kvmap.rs:58` — `vmap_alloc_pages` is bounded only by
+  `KERNEL_VMAP_END` (16 TiB), but `kvmap::init` templates only the first 512 GiB PDPT, so a
+  kernel stack past that boundary is mapped under one root only. Each thread takes 5 vmap pages
+  (20 KiB) that are never reclaimed, and `sys_thread_create` needs no authority. After about 26.8M
+  creations (refused ones included: `spawn_user_sched` allocates the stack before
+  `place_spawned` refuses at MAX_THREADS) the cursor passes `0xFFFF_C080_0000_0000`. The next
+  `KernelStack::new(root)` links a fresh PDPT into that process's PML4 only. `switch_into` then
+  loads another root while still on that stack (sched.rs:613-618 relies on "every stack is mapped
+  in every root"), and the kernel takes #PF, then #DF, then halts.
+  Demonstrated: a host test in the kstack tests builds the template as boot does and makes two
+  AddressSpaces. A stack inside the first 512 GiB translates in both (control). After
+  `vmap_alloc_pages` spends the rest of the window, `KernelStack::new` returns
+  `0xffffc08000001000`, translated in its own root and `None` in the other. The crash itself
+  needs a boot or 26.8M cycles. `memory-management.md:627` states the limit and no code enforces
+  it. Four lenses found it independently. Lenses: ownership, soundness, concurrency,
+  opportunities. High.
+- [ ] **kmem-d2** `kernel/src/mm/addr_space.rs:617` — `map_object`'s out-of-memory rollback
+  (`rollback_object_map`) clears PTEs that are live in a running address space and issues no
+  TLB invalidation, and `sys_memory_map`'s error arm (syscall/table.rs:935) issues none either.
+  Process P has threads on CPUs A and B. A's `sys_memory_map` installs pages 0..k, then fails
+  allocating a page table for page k+1. B touches the range in the window and caches a
+  translation. A rolls back with no flush and drops the object. When the last handle closes,
+  `MemoryObject::drop` frees frames that B's TLB still maps. An untrusted process can race it,
+  though it needs memory exhaustion.
+  Unverified: reading the code confirms the OOM arm calls `Paging::unmap_page` with no flush and
+  that `flush_tlb_all` runs only on the Ok path. It needs SMP plus a forced page-table OOM
+  mid-range. A fix is `shootdown_all` in the rollback before the object is released.
+  Lens: concurrency. High.
+- [ ] **kmem-d3** `kernel/src/mm/slab.rs:334` — `kmalloc` accepts `align == SLAB_SIZE` (it refuses
+  only larger). `large_alloc` then puts the object at `align_up(32, 4096) = 4096`, the block's
+  second page, but `kfree` and `large_free` find the descriptor at `ptr & SLAB_MASK`, which is
+  the object's own first bytes. `KBox::<IpcMsg>::try_new_zeroed()` (libkern's
+  `#[repr(C, align(4096))]`) and drop reads `owner` and `obj_size` from message bytes. With zeros
+  it frees one frame at phys+4096 in an order-1 block (the other leaks and the coalesce bitmap is
+  corrupted). With a nonzero `owner` it dereferences message bytes as a `&SlabCache`. Latent:
+  nothing allocates at 4096 alignment today, and one `KBox` or `KVec` of any `align(4096)` type
+  would trigger it.
+  Demonstrated: slab host probes. `kmalloc(4096, 4096)` gave `p & SLAB_MASK == p` instead of
+  `p - 4096`. Dropping a zeroed `KBox<IpcMsg>` changed `frames_freed_by_this_thread` by 1 where 2
+  were taken. `large_alloc(64, align)` finds the descriptor for 8/64/1024/2048 and not 4096.
+  After `large_free`, `alloc(0)` handed out a page of the live allocation. Lenses: abi, ownership,
+  soundness, opportunities. Medium.
+- [ ] **kmem-d4** `kernel/src/mm/kstack.rs:197` — `KernelStack` stores the `PhysAddr` root it was
+  built under and walks it in `Drop`, and `KernelStack::new(root)` is a safe fn that forwards any
+  frame to unsafe `map_page`. Nothing ties the root's lifetime to the stack. It holds only
+  because `Thread` declares `stack` before `process` and kernel threads are spawned only under
+  the boot root. Two ordinary changes break it: reordering `Thread`'s fields, or spawning a
+  kernel thread from a syscall. `Drop` then walks a freed, reused PML4, writes through it, and
+  leaves the stack's PTEs in the shared vmap while freeing their frames.
+  Demonstrated: three host probes in the kstack tests. After `drop(asp)` and reusing the root
+  frame, `drop(stack)` leaves `translate(other, base)` as `Some` (the control, in order, gives
+  `None`). A planted word in a frame the stack never owned reads 0 after the drop instead of
+  `0xDEAD0001`. `KernelStack::new(memory_object.frames()[0])` with no `unsafe` wrote a PDPT link
+  into the MemoryObject's data (word 384 became `0x7cae77ff0007`). Lenses: ownership, soundness,
+  concurrency, opportunities. Medium.
+- [ ] **kmem-d5** `kernel/src/tlb.rs:125` — the shootdown publishes `REQUEST_ALL`, `REQUEST_VA`
+  and `ACKED=0` with plain stores, then sends the IPI with a bare x2APIC ICR WRMSR. x2APIC
+  WRMSR is not serializing (SDM 3A §11.12.3 asks for `MFENCE;LFENCE` first), `regs::wrmsr` is
+  `options(nomem)` so the compiler may move the stores past it, and the `Release` on `ACKED`
+  pairs with nothing in `on_ipi`. Two outcomes: (a) a target's `fetch_or` of `ACKED` lands
+  before the buffered `store(0)` and the ack is lost. The initiator spins forever holding
+  `LOCK` with preemption off, hanging every later unmap and kernel-stack free. (b) a target
+  reloads CR3 before the PTE clear is visible, re-caches the old translation and acks, and the
+  frames are freed while still mapped. The same `send_ipi` carries the resched IPIs.
+  Unverified: no `mfence` or `lfence` appears in `kernel/src` or in the objdump of `shootdown`.
+  KVM traps ICR writes (which serializes them) and TCG cannot reorder, so only real SMP hardware
+  or a litmus test settles it. The fix is `fence(SeqCst)` plus `lfence` before the ICR write, as
+  Linux does with `weak_wrmsr_fence`. Lenses: ownership, soundness, concurrency, opportunities.
+  Medium.
+- [ ] **kmem-d6** `kernel/src/mm/vmm.rs:245` — safe functions cast an `ObjectRef` to a concrete
+  type behind only a `debug_assert` on its tag, so in release a wrong-kind reference is read as
+  the wrong type. `Vma::drop` calls `writable_unmapped` whenever `mapping == FileBacked` and
+  WRITE is set, and `mapping` and `object` are `pub` fields no type ties together.
+  `AddressSpace::map_object` (addr_space.rs:316), eight `FileObject` methods (file_object.rs:383-1030)
+  and `syscall::write_back` (table.rs:2235) do the same. Today every caller checks `object_type`
+  first. A new caller passing an unchecked ref makes it bite: safe code builds a `FileBacked` VMA
+  holding a `MemoryObject`, and the drop decrements the low half of its `frames` pointer.
+  Demonstrated: a safe-code host test in the vmm tests. Reading the frames afterwards aborts
+  with "slice::from_raw_parts requires the pointer to be aligned", and the `MappingKind::Object`
+  control passes. Release probe `map_object(range, uprot(), file_object_ref)` panics at
+  addr_space.rs:349 with "index out of bounds: the len is 0 but the index is 0" (FileObject
+  memory read as `MemoryObject.frames`). Lenses: soundness, opportunities. Medium.
+- [ ] **kmem-d7** `kernel/src/mm/user_access.rs:177` — safe `copy_from_user<T: Copy>`
+  `assume_init`s user bytes as `T`, but `Copy` does not make every bit pattern valid (`bool`,
+  enums, `char`, `NonZero`, references), and `copy_to_user<T: Copy>` copies padding out to user
+  memory. Latent: the 3 `copy_from_user` and 8 `copy_to_user` callers use integer-only,
+  padding-free types. A `bool` in `ThreadArgs` or an enum in `IoOp` is UB, and a padded struct
+  leaks kernel stack bytes.
+  Demonstrated: Miri (nightly-2026-07-20) on a probe test, `copy_from_user(UserPtr::<bool>)`
+  over a byte holding 2, reports UB at user_access.rs:199 `out.assume_init()`. Lens: ownership.
+  Medium.
+- [ ] **kmem-d8** `kernel/src/sched/ipc.rs:527` — when a userspace server's endpoint closes,
+  `ipc_endpoint_closing` (and `us_reg_detach`, line 281) fails every pending lookup but never
+  touches `pending_fill`, so a Model B page-cache fill's PO is never completed. `wait_status`
+  (file_object.rs:1177) re-waits on anything but Signaled, process exit included, so the
+  faulting thread is stuck in the kernel for ever and its process is never reaped.
+  `PendingFill` holds the FileObject, whose producer holds the registration, which holds
+  `pending_fill`: the cycle leaks them all. Reachable through a trusted server only, and the
+  kernel builds `Producer::FsServer` for any non-block resolve reply (table.rs:2398).
+  Demonstrated: a host test in the userspace_server tests (an IpcChannel pair, one lookup and
+  one fill outstanding, server end dropped). Lookup PO signalled `true`, fill PO signalled
+  `false`. Lenses: soundness, opportunities. Medium.
+- [ ] **kmem-d9** `kernel/src/object/file_object.rs:790` — `mark_ready` (called by the Model B
+  fill reply, table.rs:2703) readies whichever page now has the index, while `settle` was made
+  to match by PO for this reason. A stale fill reply can mark a successor page Ready while its
+  own fill is pending. Page i fills (frame A, PO1), a resize retires it, a regrow and a fault
+  reserve i again (frame B, PO2). PO1's reply readies B and a third faulter maps it. PO2 then
+  fails and `settle` frees B, which is still mapped in user space: a use-after-free. Latent:
+  only Model A objects are resized today.
+  Demonstrated: a host probe in the file_object tests ran that sequence. It reported "mapped
+  PhysAddr(125966602964992); settle freed 1 frame(s); lookup(2) = None". Lenses: ownership,
+  opportunities. Medium.
+- [ ] **kmem-d10** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
+  KObjectType) -> ObjectRef` is safe but wraps the unsafe `ObjectRef::from_raw`, so any box
+  under any tag becomes an `ObjectRef` whose last drop runs `dispatch_destroy` for `ty`. The
+  private copy at io/mod.rs:161 and test copies (sched/ipc.rs:560, drivers/input/mod.rs:290) are
+  the same. A mis-tagged call among the 30-odd sites compiles with no `unsafe`, and the last
+  close destroys the allocation as the wrong type.
+  Demonstrated: a host probe compiled `adopt(MemoryObject::try_new(PAGE).unwrap(),
+  KObjectType::Timer)` with no `unsafe` and printed "adopted as Timer". The drop was not run.
+  Lens: opportunities. Medium.
+- [ ] **kmem-d11** `kernel/src/mm/heap.rs:45` — `heap::buddy_free`, `BuddyAllocator::free`
+  (buddy.rs:182) and `BuddyPager::free` are safe fns that write the free-list link through the
+  HHDM and hand the frame out again. Frame ownership is held by convention at 18 hand-written
+  free sites. A double free, or a free while a mapping or DMA still uses the frame (the shape of
+  the early free fixed in #396), corrupts memory with no `unsafe` at the call site.
+  Demonstrated: a buddy host probe on a local allocator freed a live frame with the safe call.
+  The owner's first word read 0x0 and the next `alloc` returned the same frame. Lens:
+  opportunities. Medium.
+- [ ] **kmem-d12** `kernel/src/mm/addr_space.rs:458` — `map_file_page` re-checks only that some
+  FileBacked VMA of the same object covers `addr`, not that `addr` still maps to the page index
+  `file_backing` computed in an earlier hold of the AS lock. Thread A faults at 6P in F mapped at
+  [4P,8P) (page 2) and parks on the fill. B unmaps and maps F at [5P,9P), where 6P is page 1. A's
+  `map_file_page(6P, F, frame2)` returns true and page 2's frame sits where page 1 belongs. There
+  is no use-after-free (the frame is F's own), but the process sees and writes back the wrong
+  page. The same window also makes a fault on a remapped region fatal where a retry would work.
+  Demonstrated: a host test in addr_space/tests.rs ran those steps. `map_file_page` returned
+  true and `translate(6P) == frame2` (a second probe asserts the equivalent with frame 1 at 5P).
+  Lenses: abi, ownership, concurrency. Low.
+- [ ] **kmem-d13** `kernel/src/object/file_object.rs:598` — write-back takes a page's device
+  position from its first block and writes `pages * PAGE_SIZE` contiguously from there, and
+  `block_map` (table.rs:2622) accepts block sizes under a page without refusing a run boundary
+  inside a page. The recorded `TODO(ext4-subpage-runs)` covers the fill from the wrong blocks. It
+  does not say that write-back overwrites the blocks after the page's first run, which may
+  belong to other files or metadata. For example, an ext4 with 1 KiB blocks and a file whose
+  extent ends inside a page: `sys_file_sync` writes 4 KiB from the first block, and 3 KiB land on
+  whatever follows on the device.
+  Unverified: the path is pointed at. A host test of `write_runs` with runs [file 0..2 -> lba
+  100, file 2..4 -> lba 500] at block_size 1024 should issue one 4096-byte IRP at byte 100*1024.
+  Lens: abi. Low.
+- [ ] **kmem-d14** `kernel/src/arch/x86_64/idt.rs:258` — copy-primitive recovery runs before any
+  demand fault-in, so the kernel never populates a valid but lazily backed user page (an untouched
+  stack page or an untouched FileBacked page). The copy fails with `Fault`, and `sys_channel_recv`
+  has already popped the message, so the message is destroyed and its transferred handles are
+  closed. The decision log records it as a corollary, but `deferred-decisions.md` has no entry and
+  the page cache now exists. No known caller hits it, because today's callers touch pages first.
+  Demonstrated by reading the code, not by a boot: `pf_dispatch` returns at
+  `lookup_recovery(f.rip)` before `try_fault_in`, and there is no prefault step. A boot test
+  receiving into an untouched page of a fresh file mapping would show it. Lens: abi. Low.
+- [ ] **kmem-d15** `kernel/src/arch/x86_64/idt.rs:258` — recovery matches the faulting RIP alone,
+  and `copy_bytes_raw` registers `rep movsb` for both directions, so a fault on the kernel-side
+  pointer is also turned into `UserAccessError::Fault` instead of `dump_and_halt`. A dangling
+  bounce buffer or a bad length past a kernel buffer is hidden and reported as a user error.
+  Unverified: reasoned from code (`lookup_recovery_in` compares only `fault_pc`). Check
+  `read_cr2() < USER_VIRT_END` before patching RIP, and boot with a deliberately bad kernel-side
+  pointer. Lens: abi. Low.
+- [ ] **kmem-d16** `kernel/src/arch/x86_64/cpu.rs:190` — the kernel sets and checks SMAP and SMEP
+  but never sets or checks CR0.WP. That `copy_to_user` cannot write a read-only user mapping
+  holds only because Limine sets WP on the BSP and the APs. With WP clear, a process holding a
+  read-only mapping of a shared page-cache page could have the kernel write into it through
+  `sys_clock_read` or `sys_channel_recv` out pointers.
+  Unverified: grep finds no `write_cr0` that sets bit 16. Assert `read_cr0() & (1<<16) != 0` on
+  every CPU at bring-up. It holds under Limine today. Lens: abi. Low.
+- [ ] **kmem-d17** `kernel/src/mm/kvmap.rs:111` — `remap_mmio_page` repoints a page of the shared
+  vmap and flushes only the local TLB, and its `# Safety` contract does not say that the page
+  must have been used by one CPU only. Safe today because its only caller, `pci::enumerate`
+  under `device::init` (main.rs:239), runs before `bring_up_aps` (main.rs:283). A rescan or
+  hotplug after SMP start, with the thread migrating, would read the previous function's config
+  space through a stale entry. `shootdown_page` has no callers at all.
+  Unverified: path pointed at (`unmap_page`, `map_page`, `flush_tlb_page`, no `shootdown_page`).
+  Lenses: ownership, soundness, concurrency. Low.
+- [ ] **kmem-d18** `kernel/src/object/memory_object.rs:203` — `copy_to_kvec` forms a `&[u8]` over
+  each frame under a SAFETY comment saying it is "not aliased", but MemoryObject frames are
+  mapped into user spaces by design. `file_object.rs:1043` (`read_to_kvec`) does the same over
+  cache frames, and `DmaBuffer::as_slice` and `as_mut_slice` (mm/dma.rs:78, 84) hand out
+  references to memory a device writes. A process mapping a MemoryObject writable and writing it
+  from one thread while another passes it as a spawn image gives the kernel a shared reference to
+  changing bytes, a data race in Rust's model.
+  Unverified: Miri cannot tell this from a raw copy. Copy with `ptr::copy` from raw pointers (or
+  the user-copy asm), never forming the reference, and correct the SAFETY comments.
+  Lenses: soundness, concurrency. Low.
+- [ ] **kmem-d19** `kernel/src/object/memory_object.rs:106` — `try_new_borrowed`'s `# Safety` does
+  not require the range to be HHDM-mapped, but safe accessors (`copy_in` at line 174,
+  `copy_to_kvec` at 192) and the I/O paths dereference every frame through the HHDM, and
+  `sys_process_spawn` (table.rs:360) and `sys_io_submit` (table.rs:1646) accept a Borrowed
+  object. Today the only borrowed range is the framebuffer, which Limine maps in the HHDM. A
+  second aperture (a PCI BAR) would let a holder aim device DMA at registers or make `copy_in`
+  take a kernel #PF.
+  Unverified: grep finds no `FrameOwnership` check outside memory_object.rs. A host test handing
+  a Borrowed object to `sys_io_submit`'s validation, or refusing Borrowed buffers there, would
+  settle it. Lenses: soundness, opportunities. Low.
+
+**Opportunities**
+
+- [ ] **kmem-o1** encapsulate: a type-erased `ObjectRef` is downcast by hand with `unsafe {
+  &*(r.as_ptr() as *const T) }` behind a `debug_assert` or an earlier match, fresh boxes are
+  adopted with `from_raw` or the safe `adopt<T>` helpers under any tag, and
+  `FileObject::writable_unmapped` takes `*mut ()` — 128 sites (103 production downcasts, 32 of
+  them MemoryObject/FileObject, plus 23 `ObjectRef::from_raw(KBox::into_raw` adoptions and 2 safe
+  `adopt<T>` helpers; counted with `&\*\(\s*[a-z_.]+(\.as_ptr\(\))?\s+as\s+\*(const|mut)
+  ...\)` over `kernel/src`, skipping test modules; 14 of file_object.rs's 30 unsafe blocks), such
+  as `kernel/src/mm/addr_space.rs:316`, `kernel/src/object/file_object.rs:386`,
+  `kernel/src/mm/vmm.rs:245`, `kernel/src/drivers/mod.rs:197`. `unsafe trait KObject { const
+  TYPE: KObjectType; }` (macro-implemented, with `assert!(offset_of!(T, header) == 0)`),
+  `ObjectRef::adopt<T: KObject>(KBox<T>)` (the tag comes from `T`), `ObjectRef::downcast<T:
+  KObject>(&self) -> Option<&T>` and an owning `TypedRef<T>`. `Vma`'s `mapping` and `object`
+  collapse into a private `enum Backing { Anonymous, Object(TypedRef<MemoryObject>),
+  File(TypedRef<FileObject>) }`, and `writable_unmapped` takes `&FileObject`. Checked against
+  `map_object`, `writable_mapped`, `Vma::drop` and table.rs:892's size match. It can be staged one
+  object type at a time. In `kernel/src/object/header.rs` (Backing in `kernel/src/mm/vmm.rs`).
+  Closes: type confusion between kernel objects (kmem-d6) and mis-tagged adoption (kmem-d10).
+  Also no `offset_of!(T, header) == 0` assert exists for any type, and `ObjectRef`'s unchecked
+  `unsafe impl Send/Sync` claims every object is Send + Sync while `Process` is not (VmaTree's
+  `NonNull` links), so the supertrait would force an explicit, argued impl. Depends on: nothing.
+  Lenses: abi, ownership, soundness, concurrency, opportunities. Value high, effort medium.
+- [ ] **kmem-o2** encapsulate: physical frames are bare `Copy` `PhysAddr` values from
+  `heap::buddy_alloc` and returned by hand with the safe `buddy_free(addr, order)`; the buddy
+  only `debug_assert`s a free, and 8 alloc sites carry their own unsafe zeroing block — 28 to 32
+  sites (18 or 19 production `buddy_free(` plus 10 to 13 `buddy_alloc(`; counted with `grep -rn
+  'buddy_free(' / 'buddy_alloc('` over `kernel/src`, excluding tests and the fn definitions),
+  such as `kernel/src/mm/addr_space.rs:147`, `kernel/src/object/memory_object.rs:225`,
+  `kernel/src/object/file_object.rs:781`, `kernel/src/mm/kstack.rs:204`. A `!Copy` `Frame` for
+  order 0 (and `FrameBlock { phys, order }` for order n) that frees with its own order on `Drop`,
+  with `alloc_zeroed()` as the only zeroing unsafe, `phys()`, `into_pte(self)` to hand a frame to
+  a page table and `unsafe from_pte(PhysAddr)` to take it back at unmap. `buddy_free` becomes
+  unsafe and crate-private. `MemoryObject.frames` becomes `KVec<Frame>` for Owned and a separate
+  Borrowed variant. `KernelStack` holds `[Frame; 4]` (fields drop after `Drop`'s shootdown, the
+  required order). `CachePage.frame` and `retired` become `Frame`, so `settle(false)` is
+  `drop(page)`. `DmaBuffer` holds one `FrameBlock`. Checked against `MemoryObject`,
+  `KernelStack`, `FileObject` and `DmaBuffer`. In `kernel/src/mm/heap.rs` (or a new
+  `mm/frame.rs`). Closes: frame double free, leak and wrong-order free (kmem-d11, the d3
+  large_free misroute, the Borrowed/Owned flag kept by hand, hand-written rollback loops). It
+  also lets host tests carry provenance so Miri can check frame accesses. Depends on: nothing;
+  pairs with kmem-o6. Lenses: ownership, soundness, opportunities. Value high, effort medium
+  (one lens said large).
+- [ ] **kmem-o3** encapsulate: kernel-half (vmap) mappings are made through
+  `Paging::map_page`/`unmap_page` with a caller-chosen root (`active_root()`, a process root, or
+  the root stored in `KernelStack`) and a local-only TLB flush, although the tables are shared by
+  every address space, and nothing enforces the 512 GiB pre-allocated window — 9 sites (`grep -rnE
+  "Paging::(map_page|unmap_page)\(" kernel/src --include=*.rs`, excluding tests: kstack.rs:70,78,197;
+  kvmap.rs:84,105,110; ioapic.rs:185; main.rs:775,793), such as
+  `kernel/src/mm/kstack.rs:70`, `kernel/src/mm/kstack.rs:197`, `kernel/src/mm/kvmap.rs:84`,
+  `kernel/src/arch/x86_64/ioapic.rs:185`. kvmap owns the window and takes no root:
+  `map(frames: &[(PhysAddr, PageFlags)], guard_pages) -> Result<VmapRange, AllocError>` edits the
+  template's shared tables (or walks the immortal boot root captured with the template, via a
+  `KernelHalf(PhysAddr)` token), `VmapRange::unmap(self)` runs `shootdown_all` before returning
+  the frames, a reusable window type has `repoint(&mut self, phys)` that runs `shootdown_page`,
+  and `vmap_alloc_pages` refuses VA beyond the PML4 slots pre-allocated at boot. `KernelStack`
+  drops its `root` field. Checked against `KernelStack::new`/`drop`, pci's `remap_mmio_page`
+  window and ioapic's one-frame map. In `kernel/src/mm/kvmap.rs` (boot root recorded beside
+  `KERNEL_TEMPLATE` in `arch/x86_64/paging.rs`). Closes: a kernel stack mapped in one address space
+  only (kmem-d1), `KernelStack` walking a freed PML4 (kmem-d4), stale cross-CPU translations
+  after a shared remap (kmem-d17). Depends on: nothing; pairs with kmem-o2. Lenses: ownership,
+  soundness, concurrency. Value high, effort small to medium.
+- [ ] **kmem-o4** encapsulate: each page-table unmap returns its old frame, and the caller is
+  trusted to invalidate other CPUs' TLBs before the frame or its owning object can be freed;
+  `rollback_object_map` does not — 8 sites (`grep -rn "Paging::unmap_page(" kernel/src
+  --include=*.rs`, excluding tests, the fn definition and arch/x86_64/paging.rs), such as
+  `kernel/src/mm/addr_space.rs:540`, `kernel/src/mm/addr_space.rs:623`,
+  `kernel/src/mm/kstack.rs:197`, `kernel/src/mm/kvmap.rs:105`. A TLB-gather type `struct
+  Unmapped<'a> { frames: KVec<PhysAddr>, objects: KVec<KBox<Vma>> }` returned by every unmap
+  helper. It is released only by `finish(self)`, which calls `tlb::shootdown_all()` first, or by
+  `finish_unloaded(self, _: NeverLoaded)` for an address space no CPU has loaded (ELF load,
+  `AddressSpace::drop`). Checked against `sys_memory_unmap`, `KernelStack::drop` and
+  `rollback_object_map` (which would have to finish before returning the object). In
+  `kernel/src/mm/addr_space.rs`, with `tlb.rs`. Closes: a frame, or the object owning it, freed
+  while another CPU may still cache its translation (kmem-d2). Depends on: nothing. Lens:
+  concurrency. Value high, effort medium.
+- [ ] **kmem-o5** encapsulate: frame contents are reached by hand-computing `phys +
+  hhdm_offset()` at each site, then a raw write, a copy, or a `&[u8]` slice, with each site
+  re-arguing its bounds and liveness — 44 HHDM-arithmetic sites (`grep -rn "hhdm_offset()"
+  kernel/src --include=*.rs | grep -v "tests.rs\|/tests/\|mm/heap.rs\|mm/test_support"`; other
+  lenses counted 20 to 46 with narrower filters), 14 of them content accesses to object frames,
+  such as `kernel/src/object/memory_object.rs:203`, `kernel/src/object/file_object.rs:1043`,
+  `kernel/src/syscall/table.rs:2732`, `kernel/src/mm/elf.rs:306`. A bounds-checked
+  `FrameView`/`FrameRef` reached only through an owner's borrow (or a `Frame`), with `zero`,
+  `fill`, `copy_in(off, &[u8])` and `copy_out(off, &mut [u8])`, each asserting `off + len <=
+  PAGE_SIZE` and copying with `ptr::copy_nonoverlapping`. It never forms a `&[u8]` over memory
+  another CPU or a device may write; `MemoryObject::{read_at, write_at}` sit on top. Checked
+  against `copy_to_kvec`, `read_to_kvec`, `copy_fill_into_frame`, `zero_tail`, and `reserve`'s
+  zeroing. A softer form is `unsafe fn hhdm::page(phys) -> &mut [u8; PAGE_SIZE]` so slice
+  indexing panics instead of overrunning. It would also be the place that refuses Borrowed
+  aperture frames. In `kernel/src/mm/frame.rs` (beside `heap::hhdm_offset`). Closes: off-page
+  offset or length at one of the sites, and shared references over user-shared frames
+  (kmem-d18, kmem-d19). Depends on: nothing (usable over `PhysAddr`; the `Frame` type, kmem-o2,
+  for owned frames). Lenses: abi, ownership, concurrency, opportunities. Value medium, effort
+  medium.
+- [ ] **kmem-o6** narrow: every `ArchPaging` operation takes `root: PhysAddr` under the unsafe
+  contract "a valid top-level table owned by the caller" (10 unsafe trait fns, 15 more in the
+  x86_64 impl), and safe wrappers such as `KernelStack::new(root)` forward a caller's value —
+  29 production call sites (`prodgrep` over `Paging::(map_page|unmap_page|translate|
+  attribute_index|inherit_kernel_mappings|ensure_kernel_intermediate|init_kernel_template|
+  set_page_table)\(`; 17 in this subsystem's files: addr_space 9, kstack 3, kvmap 4, elf 1), such
+  as `kernel/src/mm/addr_space.rs:163`, `kernel/src/mm/kstack.rs:70`, `kernel/src/mm/elf.rs:300`,
+  `kernel/src/mm/kvmap.rs:84`. `PageTable { root }`: owning and `!Copy`, created by
+  `new_user()` (zero plus inherit the kernel half), with `fn kernel() -> &'static PageTable` naming
+  the template root, safe `translate` and user-half `unmap`, and `map` keeping only the
+  phys/aliasing half of the contract (or taking a `Frame` and being safe). `AddressSpace` holds a
+  `PageTable` in its lock. Checked against addr_space.rs:163, kstack.rs:70/197 and elf.rs:300.
+  In `kernel/src/arch/paging.rs` (trait) and `kernel/src/mm/addr_space.rs` (owner). Closes: a
+  safe fn passing an arbitrary root to `map_page` (kmem-d4), and `load_elf` translating a live AS
+  without its lock. It also gives the 512 GiB vmap bound one place to live. Depends on: nothing;
+  best with kmem-o2. Lens: opportunities. Value medium, effort medium.
+- [ ] **kmem-o7** remove: `VmaTree` is an intrusive red-black tree over raw `NonNull<Vma>` links
+  and holds 102 of the subsystem's 139 raw derefs, plus 23 unsafe blocks and 4 unsafe fns; its
+  interval augmentation `subtree_max_end` is maintained by `recompute_max_end`,
+  `update_max_end_up_from` and both rotations, but no query reads it — 23 sites (`cargo xtask
+  unsafe-inventory kernel/src/mm/vmm.rs`; `grep -n subtree_max_end kernel/src/mm/vmm.rs` shows no
+  read outside maintenance and tests), such as `kernel/src/mm/vmm.rs:334`,
+  `kernel/src/mm/vmm.rs:483`, `kernel/src/mm/vmm.rs:594`, `kernel/src/mm/vmm.rs:697`. Step 1:
+  delete the unread augmentation. Step 2: replace the tree with a sorted `KVec<KBox<Vma>>` keyed
+  on `range.start` (binary-search lookups, neighbour overlap check, O(n) insert and remove, which
+  needs `KVec::try_insert` reserved before the AS lock as unmap's frames vector already is).
+  Checked against `insert`, `find_covering` and `iter_overlapping`. VMA counts are tens per
+  process. In `kernel/src/mm/vmm.rs` (and `kernel/src/libkern/kvec.rs`). Closes: raw-pointer link
+  corruption in the tree; it removes nearly all of the subsystem's raw-deref column. Medium only
+  because the tree already passes Miri and the decision log chose it deliberately. Depends on:
+  nothing for step 1; revisiting the decision-log VmaTree entry for step 2. Lens: opportunities.
+  Value medium, effort medium.
+- [ ] **kmem-o8** narrow: `copy_from_user`/`copy_to_user` are generic over `T: Copy`, and ABI
+  types reinterpret themselves as bytes in hand-written unsafe blocks, each with its own padding
+  claim — 21 sites (11 typed copies: `grep -rn 'copy_to_user(\|copy_from_user(' kernel/src
+  --include=*.rs | grep -v 'mm/user_access.rs\|copy_slice\|copy_cstr'`, 3 from and 8 to; plus 10
+  byte-view blocks: libkern/notification.rs:189, object/ipc_channel.rs:66 and :74,
+  libkern/device.rs:246/255/360/369, libkern/block.rs:138, libkern/framebuffer.rs:75,
+  syscall/table.rs:1829), such as `kernel/src/syscall/table.rs:342`,
+  `kernel/src/syscall/table.rs:1829`, `kernel/src/object/ipc_channel.rs:74`,
+  `kernel/src/libkern/notification.rs:189`. `pub unsafe trait UserPod: Copy + 'static`
+  (repr(C), no padding, every bit pattern valid), implemented through a macro that const-asserts
+  `size_of` equals the sum of the field sizes. Then `copy_from_user<T: UserPod>`,
+  `copy_to_user<T: UserPod>`, slice variants and one `bytes_of`/`bytes_of_mut`/`slice_as_bytes`,
+  which removes the 10 byte-view blocks. Checked against `SpawnArgs`, `ThreadArgs` (its `i8`
+  included), `IoOp`, `RegisterValues`, `HandleInfo`, `NsEntry`, `StoredMsg::as_bytes_mut` and
+  `sys_wait`'s `[IoResult]` view; all integer-only and padding-free. In
+  `kernel/src/mm/user_access.rs` (trait; impls beside the ABI types in `kernel/src/libkern`).
+  Closes: invalid-value UB from user bytes (kmem-d7) and padding leaks to user memory. Depends on:
+  nothing. Lenses: abi, ownership, soundness, opportunities. Value medium, effort small.
+- [ ] **kmem-o9** encapsulate: drivers reach `DmaBuffer` memory through the raw `virt()` pointer,
+  with their own offset arithmetic, volatile accesses and slice building, and sometimes store the
+  address as a `u64` in their own structs; `as_slice`/`as_mut_slice` hand out references over
+  memory a device may be writing — 19 sites (`grep -rn "\.virt()" kernel/src --include=*.rs |
+  grep -v ^kernel/src/mm/dma.rs` = 20, less boot_selftest.rs:539), such as
+  `kernel/src/drivers/xhci/mod.rs:229`, `kernel/src/drivers/xhci/hub.rs:905`,
+  `kernel/src/drivers/ahci.rs:600`, `kernel/src/drivers/xhci/hid.rs:446`.
+  `DmaBuffer::read::<T: UserPod>(&self, off) -> T` and `write::<T: UserPod>(&self, off, v: T)`
+  (volatile, `off + size_of::<T>() <= len()` checked) plus `copy_in`/`copy_out(off, &[u8])`;
+  `virt()` becomes crate-private and `as_slice`/`as_mut_slice` are retired. Checked against the
+  xHCI ring's `u32` read/write at an index (mod.rs:229/239), the DCBAA slot write (hub.rs:905) and
+  the AHCI command-list read (ahci.rs:600). In `kernel/src/mm/dma.rs`. Closes: a ring or context
+  offset past the buffer, references over device-written bytes, and a raw address stored in a
+  driver struct (hid.rs:446, storage.rs:861) that outlives its `DmaBuffer`. Depends on: kmem-o8's
+  marker trait. Lens: abi. Value medium, effort medium.
+- [ ] **kmem-o10** narrow: `AddressSpace` repeats `unsafe { Paging::map_page/unmap_page(root, ..)
+  }` with the same SAFETY argument ("root is this AS's PML4, lock held, the frame is fresh or the
+  object's"), though holding `&mut Inner` already proves the lock and the root — 8 sites (`grep -n
+  "unsafe { Paging::\(map_page\|unmap_page\)" kernel/src/mm/addr_space.rs`: lines 163, 264, 349,
+  467, 540, 586, 608, 623), such as `kernel/src/mm/addr_space.rs:163`,
+  `kernel/src/mm/addr_space.rs:264`, `kernel/src/mm/addr_space.rs:540`,
+  `kernel/src/mm/addr_space.rs:586`. Safe methods on the locked `Inner`: `map(&mut self, va,
+  frame, flags) -> Result<(), MapError>` and `unmap(&mut self, va) -> Option<PhysAddr>` (or a
+  `UserTables<'g>` borrowed from `&mut Inner` whose `unmap` returns `Unmapped`), keeping the arch
+  `unsafe` inside them. Checked against `map_vma`'s install loop, `fault_in`'s anonymous arm and
+  `unmap_covering_deferred`. In `kernel/src/mm/addr_space.rs`. Closes: a future AS path editing
+  tables without the lock or through the wrong root (none seen today; it makes the rank-4 lock
+  claim structural). Depends on: kmem-o2 and kmem-o4. Lenses: soundness, concurrency. Value
+  medium, effort small.
+- [ ] **kmem-o11** narrow: x86_64 page-table walks dereference `*table_ptr(x).add(index)` raw at
+  every level under a per-function SAFETY argument; `translate` and `attribute_index` duplicate
+  the same four-level walk, and shared kernel-half slots are read with plain loads but linked
+  with an atomic CAS (`ensure_table`) — 22 sites (`prodgrep '\*table_ptr\(|\*pml4\.add\(|\*leaf\b|
+  \(\*leaf\)|pt\.add\(|table\.add\(' kernel/src/arch/x86_64/paging.rs`, in 7 functions), such as
+  `kernel/src/arch/x86_64/paging.rs:174`, `kernel/src/arch/x86_64/paging.rs:281`,
+  `kernel/src/arch/x86_64/paging.rs:374`, `kernel/src/arch/x86_64/paging.rs:482`.
+  `TableRef<'a>(&'a [AtomicU64; 512])` with one `unsafe fn at(phys)` and safe `entry`, `child` and
+  `set`, plus a single `walk(root, v) -> Option<(Pte, Level)>` serving both `translate` and
+  `attribute_index`. In `kernel/src/arch/x86_64/paging.rs`. Closes: per-level SAFETY arguments
+  repeated in 7 functions, the duplicate walk, and mixed atomic and plain access to the lock-free
+  kernel-half tables. Depends on: nothing (kmem-o6 for the trait-level contract). Lens:
+  opportunities. Value low, effort small.
+
+What held up: the two asm copy primitives (register constraints, `cld`, `clac` on every exit, only
+the user-side instruction in the extable, the `max==0` guard, the linker KEEP). `UserPtr`
+validation and `validate_user_range`'s checked arithmetic, and the typed copies' all-integer,
+padding-free types with their const asserts. `sys_memory_map`'s rights, size, hint, stack-guard
+and canonical-range checks, and `sys_memory_unmap`'s order (PTEs under the AS lock, then
+`shootdown_all`, then free, then the VMA drop). `AddressSpace::drop` without a shootdown (the
+next root is loaded before any reap, no PCID, no GLOBAL user PTEs). `VmaTree` (it passes Miri on
+the two torture tests, with only HHDM int-to-pointer warnings), the buddy coalesce bitmap and
+`order > MAX_ORDER` refusal, slab geometry for `align <= 2048`, and `KBox`/`KVec` with ZSTs. The
+ELF loader's checked offsets and its copy of the image into kernel memory (no TOCTOU).
+`ensure_table`'s CAS link with the loser freeing its table (host-tested). `tlb::wait_satisfied`
+with the departed-CPU rule, and user copies running IF-masked. Page-cache frame lifetimes:
+`wait_status` is a real barrier, `settle` matches by PO, `resize` retires frames until `Drop`, and
+a Model B reply takes the pending fill exactly once. `map_file`'s writable count on every refusal
+path, `MemoryObject::try_new` rollback, `DmaBuffer`'s order handling and the zeroing of every
+frame handed to user space. The breaks tests caught are those marked Demonstrated above.
