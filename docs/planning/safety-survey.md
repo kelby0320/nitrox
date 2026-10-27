@@ -4244,3 +4244,282 @@ the device read without re-entry. Both `STORE` references are taken once, and th
 `write_at` and `forget` with no UB). `po_wait`'s early-return branch is unreachable today (see
 fs-d4). Probes were restored (`git checkout` of extent.rs and hostile_tests.rs, write_tests.rs)
 and `git status` was clean at each lens's end.
+
+### protocols — main at 135055a8, 2026-10-27
+
+Lenses: abi, ownership, soundness, opportunities; returned nothing: none.
+Defects: found 20, refuted by a boot 0, reported 20 (the 20 findings merge into 8 items below).
+Opportunities: 19 proposed, merged into 6 patterns.
+
+The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libstream userspace/libgpt`:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `userspace/librsproto` | 3518 | 10 | 0 | 0 | 0 | 10 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/libstream` | 1142 | 9 | 0 | 0 | 0 | 9 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/libgpt` | 326 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `total` | 4986 | 19 | 0 | 0 | 0 | 19 | 0 | 0 | 0 | 0 | 0 |
+
+**Defects**
+
+- [ ] **proto-d1** `userspace/nxsh/src/main.rs:292` — Every error return in
+  `NitroxHost::run`/`run_pipeline` after the first `pipe()` leaks the handles the pipeline holds
+  and leaves spawned stages blocked. The root cause is at the protocol boundary:
+  `libstream::setup::send_setup_full` documents its handles as moved, but when it fails before the
+  commit they are still the caller's, and nxsh closes only the terminal. At a prompt, type
+  `let s = "<1000 x's>"` (1,012 bytes, under LINE_MAX 1024), then `echo x (s) (s) (s) (s) (s)`.
+  The stage's argv is 5,005 bytes, so `SetupPayload::encode` returns `SetupTooLarge`
+  (setup.rs:185) before any syscall, and no handle moves. main.rs:293-297 closes `terminal` and
+  returns Err. That leaks the stage's stdout tx, stderr duplicate, rx, `setup_shell`, process
+  handle, `err_rx` and `err_tx`, and in a longer pipeline stdin, the feed and earlier stages'
+  process handles. Because `setup_shell` stays open, the spawned stage waits forever in
+  `recv_setup`'s `sys_wait` (setup.rs:391), and its process handle never reaches `children`, so it
+  can be neither terminated nor reaped. The same class occurs at main.rs:245/246 (a `pipe()`
+  failure), 259 (a spawn failure: a file starting `\x7fELF` passes the magic-only `what_runs` and
+  fails the spawn, leaving `setup_stage` open and 6+ handles per attempt) and 417 (a stage writing
+  more than MAX_CAPTURE returns before closing rx and before reap, so the tail stage blocks on a
+  full ring). Each attempt costs the long-lived login shell its handles until logout.
+  Demonstrated: a host test added to nxsh/src/eval.rs ran the two lines through `MockHost`
+  (`cargo test -p nxsh --lib --target x86_64-unknown-linux-gnu probe_survey`). `Host::run`
+  received argv lengths [4,1,1000,1000,1000,1000,1000], and `SetupPayload{streams:
+  STDOUT|STDERR, argv, terminal: true}.encode()` returned `Err(SetupTooLarge)`; the file was
+  restored. The kernel leaves the sender's handles in place on every failure before the commit
+  (kernel/src/syscall/table.rs:2045). The leak is shown by reading nxsh main.rs:220-298 and
+  404-436, not by a boot; a boot would show the hung stage and the growing handle count.
+  nxterm backend.rs:288-296 and view-broker main.rs:1484-1492 close everything in the same
+  situation. Lenses: abi, ownership, soundness, opportunities. Medium.
+- [ ] **proto-d2** `userspace/libstream/src/wire.rs:532` — `read_value` recurses once per nesting
+  level (List -> `read_list` -> `read_value`; Record -> `Schema::decode` -> `read_row_values` ->
+  `read_value`) with no depth limit, and dropping the decoded `Value` recurses the same way. A
+  nested List costs 5 input bytes per level, and docs/spec/typed-stream-format.md:93 says lists
+  "may nest arbitrarily". A stage, possibly in a restricted view, writes a one-column List stream
+  whose cell is nested 40,000 or more deep (about 200 KB, under nxsh's 1 MiB MAX_CAPTURE).
+  nxsh's `decode_output` (eval.rs:1946) calls `Table::decode` and overflows the 8 MiB user stack
+  into its guard, so the login shell faults and is suspended. `open x.tsm` (ops.rs:784, any size,
+  for example from a stick), nxfiles (main.rs:53) and clip's stdin (clip.rs:215) do the same.
+  Single-message decoders (the setup payload, logging-service `render_typed` main.rs:498,
+  view-broker `view_env` main.rs:1654) are bounded to about 800 levels by the 4,008-byte payload,
+  so any change that decodes a chunked stream in a service would let a peer crash it. Fix: a
+  depth limit carried by `ByteSource` or the decoder.
+  Demonstrated: host probes (removed) decoded nested lists on a thread with an 8 MiB stack,
+  release build. Depths of 20,000 to 30,000 decoded; depth 40,000 (200,027 bytes) aborted with
+  "thread has overflowed its stack" (SIGABRT), as did 50,000, 200,000 and 209,000 (1,045,026
+  bytes). What the target does with the fault needs a boot. Lenses: abi, ownership, soundness,
+  opportunities. Medium (soundness rated it medium as latent-high; the other three low).
+- [ ] **proto-d3** `userspace/libstream/src/wire.rs:590` — The TSM1 decoder's memory use has no
+  bound relative to its input. A Null-typed column takes 0 bytes per row, yet each row allocates a
+  `Vec<Value>` of `schema.fields.len()` entries at 32 bytes each, so one `REC_DATA` byte costs
+  32 bytes times the column count. A stage writes a schema of 1,000 empty-named Null columns
+  (about 4 KB) and then about 1M one-byte rows, which fits under nxsh's 1 MiB MAX_CAPTURE
+  (main.rs:61). `Table::decode` then needs about 33 GB and nxsh aborts on OOM; `open x.tsm`
+  (ops.rs:784) has no size cap at all. Nothing limits memory per process (rlimits are deferred,
+  docs/rationale/deferred-decisions.md:2307), so other processes' allocations may fail first
+  (unverified). Fix: a value budget carried by the decoder, or a cap of rows x columns per input
+  byte.
+  Demonstrated: a host probe with `cargo test --release -p libstream --lib`, file restored. A
+  5,017-byte stream (1,000 Null columns, 1,000 one-byte rows) decoded to 1,000 x 1,000 `Value`s,
+  at least 32,000,000 bytes, about 6,400 times the input. The system-wide effect needs a boot.
+  Lenses: abi, soundness. Medium.
+- [ ] **proto-d4** `userspace/libgpt/src/table.rs:298` — `disk_blocks: alternate_lba + 1` adds a
+  field read from an untrusted disk with no overflow check: it panics where overflow checks are on
+  and wraps `disk_blocks` to 0 where they are off. A stick whose GPT header has `alternate_lba =
+  u64::MAX` and a recomputed header CRC is read by storage-service `read_table`
+  (storage-service/src/main.rs:441) on every arriving disk, and by nxinstall (main.rs:324).
+  Today's release build has overflow checks off and no consumer reads `disk_blocks`, so nothing
+  fails. Adding `overflow-checks = true` to userspace `[profile.release]`, or any caller doing
+  arithmetic on `disk_blocks`, makes the same stick abort the storage service (`panic = "abort"`),
+  which makes it high. Fix: `checked_add` and return `ReadError::Unsupported`.
+  Demonstrated: a host test built a valid table, set header bytes 32..40 to `u64::MAX` and
+  recomputed the CRC (file restored). Debug panicked with "attempt to add with overflow" at
+  libgpt/src/table.rs:298:22; release returned Ok with `disk_blocks = 0`. Lenses: abi,
+  soundness, opportunities. Medium (abi rated it medium as latent; the others low).
+- [ ] **proto-d5** `userspace/libstream/src/setup.rs:314` — `send_setup_full` returns Err in two
+  opposite ownership states. Before the send (an encode error, or r < 0) the handles are still the
+  caller's. After a committed `SENDMODE_BLOCK` send (waited < 1 at :314, or PO status < 0 at :318)
+  the kernel has already closed them in the sender. Callers cannot tell the two apart and close
+  them on any Err. The setup message queues because the stage's ring is full, then the stage dies
+  before delivery. The PO completes PeerClosed, and nxterm (backend.rs:296) closes `terminal`
+  again while view-broker (main.rs:1489) runs `p.handles.close()` on handles that already moved.
+  The kernel's generation check makes these closes fail harmlessly today. It would bite with
+  handle-number reuse, or if a setup channel were reused for a second message.
+  Unverified: the kernel closes the handles on Sent or Queued (kernel/src/syscall/table.rs, the
+  `sys_channel_send` Block arm), and setup.rs:314-320 then returns Err. A fresh depth-4 setup
+  channel takes the message as Sent, so the Queued-then-PeerClosed order needs a gate with a full
+  ring and a stage that exits before the message is delivered. Lenses: soundness. Low.
+- [ ] **proto-d6** `userspace/libstream/src/channel.rs:114` — `ChannelReceiver::receive` appends
+  every message to one `Vec` until the producer sends `last`, with no size limit. nxsh already
+  replaced it with its own loop capped at MAX_CAPTURE (main.rs:361-412), which shows the cap
+  belongs in this API. A producer that never finishes, piped into `clip --copy`
+  (coreutils/src/bin/clip.rs:215), grows clip's heap until an allocation fails; clip compares the
+  text with MAX_CLIP_BYTES (about 3.9 KB) only afterwards. The test-harness readers use it too.
+  Unverified: found by reading channel.rs:114-121 and clip.rs:215-229. A host test with a `MsgPort`
+  whose `recv` never returns true plus a counting allocator would settle it, or a boot running
+  `<endless producer> | clip --copy`. Lenses: abi, ownership, opportunities. Low.
+- [ ] **proto-d7** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes a field name's
+  length as `f.name.len() as u16` with no range check, then writes every byte of the name;
+  `WireErrorRecord::encode` does the same with `field_name` at :733. A name of 65,536 bytes or
+  more is framed with a wrapped length, and the reader parses the rest of the name as further
+  fields, types, rows or a terminator chosen by whoever supplied the name. librsproto's encoders
+  all check `> u16::MAX` before such a cast. Only a producer that forwards a 64 KiB column name
+  from data reaches it today (whether any current producer does is unverified).
+  Demonstrated: host tests added to wire.rs, file restored. A schema with a 65,539-byte name
+  encoded Ok, and `decode_header` returned `Err(BadTypeTag(97))`, the byte after the wrapped
+  3-byte name read as a type tag. A second probe with a name whose tail spelled
+  `\x04\x00\x01\x06\x00\x00\x00forged` decoded as one field named "ok" followed by a `REC_DATA`
+  row `Ok([Str("forged")])`. Lenses: abi, soundness. Low.
+- [ ] **proto-d8** `userspace/librsproto/src/session.rs:158` — `Dir::rename` builds its request in
+  a 512-byte buffer, but two names of the maximum 255 bytes need 2+255+2+255 = 514 bytes.
+  `rename_request` (file.rs:384-387) returns None, so the rename fails client-side with
+  `DirError::Protocol`. Only test-harness calls `Dir::rename` today; real moves go through
+  `RESOLVE_RENAME`. Unverified: shown by arithmetic from the code; a host test renaming
+  255-byte names would settle it. Lenses: abi. Low.
+
+**Opportunities**
+
+- [ ] **proto-o1** encapsulate: `Dir`, `Clipboard` and `Desktop` hold their endpoint as a raw
+  `u64` with an explicit `close(self)` and no `Drop`, so every caller writes `let r = op;
+  x.close(); r` on every path. `from_endpoint` says it "takes ownership" yet its Err path neither
+  closes nor returns the endpoint, and test-harness (harness.rs:2941) uses it as a borrow. The
+  three `connect`/`open` functions repeat one NS_LOOKUP, `po_wait`, status and `endpoint == 0`
+  sequence. The documented reason for no `Drop` ("dropping cannot report a failure",
+  session.rs:50) does not hold, because `close` returns `()`. 66 construction sites, 20 outside
+  test-harness (`grep -rn 'Dir::open\|Dir::from_endpoint\|Desktop::connect\|Desktop::from_endpoint
+  \|Clipboard::connect\|Clipboard::from_endpoint' --include=*.rs userspace | grep -v librsproto/ |
+  grep -v '// \|/// ' | wc -l`); 6 of the 19 unsafe blocks are the three NS_LOOKUPs and three
+  endpoint closes (`grep -n unsafe userspace/librsproto/src/{session,clipboard,desktop}.rs`),
+  such as `userspace/librsproto/src/session.rs:64`, `userspace/librsproto/src/clipboard.rs:377`,
+  `userspace/librsproto/src/desktop.rs:180`, `userspace/libfs/src/lib.rs:470`. A
+  `session::Endpoint(u64)` that closes on drop, with `into_raw`; `from_endpoint(Endpoint, buf) ->
+  Result<Self, (Endpoint, E)>` handing the endpoint back on refusal; one `session::connect(ns,
+  path, rights) -> Result<Endpoint, WireError>` in place of three lookups; or one `Session<'a>`
+  wrapped by all three clients. Home: `librsproto::session` (a crate-local newtype, or libos
+  `Handle` on the `io` feature; session-mgr and libsession take librsproto without `io`, so
+  libos is open here, and libsurface/src/ipc.rs:106-116 already resolves a channel that way).
+  Closes: an endpoint leaked by an early return or `?` between connect and close, each leak
+  holding one of the server's MAX_SESSIONS slots (libsurface ipc.rs:121 records "a leaked
+  endpoint eventually makes /dev/draw/new fail for every process"), and a borrowed endpoint
+  closed by its new owner. Depends on: nothing (the `po_wait` wrapper in proto-o3 if it lands
+  first). Lenses: abi, ownership, soundness, opportunities. Value high, effort medium.
+- [ ] **proto-o2** encapsulate: `send_setup_full(channel, &Streams, Option<u64>, ...)` moves the
+  stream and terminal handles on success and leaves them with the caller on most failures. `Streams`
+  is `Copy` over `Option<u64>` and `pipe()` returns `(u64, u64)`, so each caller restates the rule
+  by hand and they disagree: nxsh closes only the terminal (proto-d1), nxterm closes the terminal,
+  view-broker closes everything including handles already moved (proto-d5). 26 sites: 16 `pipe()`
+  calls in 5 files plus 10 `send_setup*` callers outside libstream, 5 in production (`grep -rn
+  '[^_a-z]pipe(' userspace --include=*.rs | grep -v ^userspace/libstream | grep -v 'fn pipe\|//'
+  | wc -l`; `grep -rn 'send_setup\(_env\|_full\)\?(' userspace --include=*.rs | grep -v
+  ^userspace/libstream`), such as `userspace/libstream/src/setup.rs:270`,
+  `userspace/nxsh/src/main.rs:292`, `userspace/view-broker/src/main.rs:1483`,
+  `userspace/nxterm/src/backend.rs:281`. `send_setup_full(channel, streams: Streams, terminal:
+  Option<Endpoint>, argv, env) -> Result<(), WireError>` takes every handle by value and closes
+  what it was given on any error, as libviews::request does (libviews/src/lib.rs:103); `Streams`
+  stops being `Copy`, and `pipe` returns owning handles. Alternatively return `Err` carrying the
+  handles back only when the kernel refused before the commit (`SetupError::NotSent {..}` versus
+  `Lost`). nxterm and view-broker lose their hand-written close code; desktop-shell and libsession
+  pass empty streams. Home: `libstream::setup`. Closes: the nxsh pipeline leak and the stale
+  double close. Depends on: an owned-handle type (proto-o1's `Endpoint`, or libos). Lenses: abi,
+  ownership, soundness, opportunities. Value high, effort medium.
+- [ ] **proto-o3** encapsulate: every syscall in the subsystem is a raw `syscallN` with a
+  hand-built pointer, length and result buffer: WAIT x6 (each with a `[0u8; 24]` result decoded at
+  bytes 8..12 and 16..24), HANDLE_CLOSE x6 (3 endpoints, 3 POs), NS_LOOKUP x3, CHANNEL_SEND x3,
+  CHANNEL_CREATE x1. The `po_wait` helper (wait, close the PO, read status) is copied 15 times
+  across 14 files that disagree on what a failed wait returns, 34 `SYS_HANDLE_CLOSE, po` sites
+  repo-wide. 19 sites (`grep -n unsafe userspace/librsproto/src/*.rs userspace/libstream/src/*.rs
+  | grep -v '// SAFETY'`), such as `userspace/librsproto/src/session.rs:239`,
+  `userspace/librsproto/src/session.rs:273`, `userspace/libstream/src/channel.rs:218`,
+  `userspace/libstream/src/setup.rs:311`. Safe `Result` wrappers beside `libkern::channel_recv`:
+  `wait_one(h, deadline) -> Result<IoResult, i64>` (typed to the ABI `IoResult`),
+  `po_wait(po, deadline)` that closes the PO exactly once on every path, `ns_lookup(ns, path,
+  rights)`, `channel_send(ch, &[u8; IPC_MSG_SIZE], handles, mode, deadline)` refusing
+  `handles.len() > IPC_HANDLE_MAX`, `channel_create(depth)` and `handle_close(h)`. Checked against
+  session.rs:239/273, channel.rs:198/218 and setup.rs:293/311/391: one `wait_one` serves the four
+  waits, one `channel_send` the three sends, one `ns_lookup` the three lookups. This removes every
+  unsafe block in the subsystem. Home: libkern (its CLAUDE.md asks for safe wrappers; `channel_recv`
+  is the precedent). An owning `PendingOp` guard belongs in libos (`Op::from_po` is `pub(crate)`
+  today), but libstream is linked into session-mgr through libsession, whose "still no libos" rule
+  keeps it off libos. Closes: a result or message buffer shorter than what the kernel copies (the
+  HandleInfo 16-vs-24-byte stack smash and the 256-byte receive classes, here for sends and waits),
+  a PO leaked or closed twice, and the copies' disagreement. Depends on: nothing. Lenses: abi,
+  ownership, soundness, opportunities. Value high, effort medium.
+- [ ] **proto-o4** encapsulate: librsproto parsers check `body.len() >= CONST` and then read at
+  fixed offsets with `get_u16/32/64` or `from_le_bytes([b[i], ..])`, which panic past the end, so
+  guard and offsets agree only by hand. Three iterators validate at parse time and then index
+  unchecked: `AccountList::iter` (auth.rs:218), `ClipList::entries` (clipboard.rs:318) and
+  `views::Args::next` (views.rs:177). All 77 parsers hold today. A one-byte slip in a guard is a
+  panic in a server (storage-service `parse_mount`, auth-service, libfsserver
+  `parse_resolve_request`, the compositor's surface readers). About 220 sites (179 `get_u*` reads
+  by `awk` skipping `#[cfg(test)]`, 41 `from_le_bytes([b[..` reads), such as
+  `userspace/librsproto/src/file.rs:44`, `userspace/librsproto/src/auth.rs:107`,
+  `userspace/librsproto/src/surface.rs:219`, `userspace/librsproto/src/views.rs:177`. A
+  `pub(crate) struct Reader<'a> { b: &'a [u8], at: usize }` with `u8/u16/u32/u64/i32() ->
+  Option<_>`, `bytes(n)`, `lenpfx_u16()`, `skip(n)`, `rest()` and `finish()`, the no-alloc twin of
+  `libstream::wire::ByteSource`; iterators re-walk with the same `Reader`. Checked against
+  `parse_read_range_request`, `parse_authenticate_reply`, `WindowInfo::read` and `parse_mount`.
+  Home: librsproto `lib.rs`. Closes: a length guard that disagrees with its offsets (weakening
+  `parse_ping`'s guard by one byte made a fuzz probe panic at lib.rs:286 at once). Depends on:
+  nothing. Lenses: opportunities. Value medium, effort medium.
+- [ ] **proto-o5** encapsulate: each IO module hand-rolls its channel I/O: IPC header offsets
+  (payload_len at 4, handle_count at 8, flags at 10, payload at 24) redefined in session.rs:23-27,
+  channel.rs:148-151 and setup.rs:235-237, a hand `payload_len` write, a `buf.len() <
+  IPC_MSG_SIZE` check on a caller's `&mut [u8]`, "recv; on WouldBlock wait; loop", and `E_WOULDBLOCK
+  = -11` / `E_PEERCLOSED = -13` literals. Two ways to hold it: type the message, and give
+  libos a `Channel` marker with modes (libos.md's mode table lists Send/Recv/SendRecv but
+  `handle.rs` has none; the doc says "settle when wrapping Channel"). About 67 sites for the typed
+  handles (3 endpoint closes, 36 `IpcPort::new(`, 15 `pipe(`, 13 `send_setup*` outside libstream),
+  and 20 for the message (3 raw sends, 10 offset consts, 7 run-time length checks; repo-wide 30
+  offset constants in 22 files and about 79 raw send sites), such as
+  `userspace/librsproto/src/session.rs:212`, `userspace/libstream/src/channel.rs:183`,
+  `userspace/libstream/src/setup.rs:379`, `userspace/librsproto/src/session.rs:219`. Use the
+  existing `libkern::abi::IpcMsg` (offset asserts exist) with `set_payload(&[u8]) -> Option<()>` and
+  `payload() -> &[u8]` clamped to `IPC_PAYLOAD_SIZE`, so `Dir`, `Clipboard`, `Desktop` and
+  `round_trip` take `&mut IpcMsg` or `Box<IpcMsg>` instead of a slice and its check; with the libos
+  `Channel`, `Dir<'a> { endpoint: Handle<Channel, SendRecv> }`, `IpcPort { endpoint: Handle<..> }`,
+  `pipe(depth) -> Result<(Handle, Handle)>` and a non-`Copy` `Streams`, plus a typed `KError`
+  resolving libkern's `TODO(recv-kerror)`. Home: libkern `abi::IpcMsg` and `channel.rs` for the
+  message; libos for `Channel`. Closes: a send from a buffer shorter than a message (the kernel
+  copies a whole 4,096 bytes; the send-side twin of desktop-session-mgr's receive defect),
+  `payload_len` disagreeing with the bytes, header-offset drift across 25 files, and (with
+  exported libos mock seam) host tests for `round_trip`, `send_setup` and `recv_setup` ordering.
+  Depends on: libos gaining a `Channel`; for libstream, session-mgr's no-libos rule (via
+  libsession) must be revisited or the type lives in libstream first. Lenses: abi, soundness,
+  opportunities. Value medium, effort large.
+- [ ] **proto-o6** encapsulate: wire layouts shared across the kernel boundary are checked by
+  nothing. kernel/src/rsproto.rs copies librsproto's constants by hand (30 shared names, all equal
+  today) and `abi-sync-check` covers libkern only. The `FILE_BLOCKS` `BlockRun` layout is written
+  by hand in libfsserver and parsed by hand in the kernel with no librsproto codec.
+  `devices::RECORD_LEN = 144` is a literal whose doc says "both sides assert", but librsproto
+  asserts nothing. 32 sites (a script comparing `const NAME: ty = value;` lines found 30 shared
+  names, 0 differing; plus 1 `BlockRun` layout and 1 `RECORD_LEN`), such as
+  `kernel/src/rsproto.rs:75`, `userspace/libfsserver/src/serve.rs:240`,
+  `userspace/librsproto/src/devices.rs:26`, `tools/xtask/src/checks/abi.rs:41`. An `AbiFamily` in
+  tools/xtask/src/checks/abi.rs pairing kernel/src/rsproto.rs with librsproto's lib.rs,
+  namespace.rs, file.rs and error.rs; a `librsproto::namespace::put_block_run(out, file_block,
+  device_lba, length, flags)` for libfsserver; and `#[cfg(feature = "io")] const _: () =
+  assert!(RECORD_LEN == size_of::<libkern::device::DeviceRecord>());`, as `RS_MAX_PAYLOAD` already
+  has. Home: tools/xtask/src/checks/abi.rs and librsproto. Closes: the kernel and a userspace
+  server reading the same reply at different offsets after one side changes. Depends on: nothing.
+  Lenses: abi. Value low, effort small.
+
+What held up: all 19 unsafe blocks have SAFETY arguments that hold. Every send buffer is a whole
+4,096-byte message (a run-time check at session.rs:219, `Box<[u8; IPC_MSG_SIZE]>` in channel.rs
+and setup.rs), every wait takes count 1 with a 24-byte result buffer, every handle count is at
+most 4, and the hand-decoded `IoResult` and IPC header offsets match libkern's asserted layout.
+Every receive goes through `libkern::channel_recv`, whose `Received` guard closes a peer's
+attached handles; `recv_setup` checks `split_handles` against the kernel-attested count before
+taking any handle, and unknown bitmap bits and a terminal with no handle are refused. Each PO is
+closed exactly once on every path, a failed wait included. `librsproto::decode` checks magic and
+`body_len` with `checked_add`; the peer-claimed rsproto `handle_count` is never used to index
+outside tests (view-broker main.rs:861 compares it with what it received); every encoder checks
+its narrowing casts. Fuzz probes (about 80 librsproto decoders on 3,000,000 inputs and the
+libstream decoders on 2,000,000, debug and release) found no panic, with positive controls (a
+guard weakened by one byte panicked at once) and the probes removed afterwards; `with_capacity`
+hints are capped at 64 and `ByteSource::take` checks bounds before any allocation. `libgpt`
+bounds the header size (92..=512), entry size (128), count (1..=1024), array bounds
+(`checked_mul`/`checked_add`) and both CRCs before parsing entries, and refuses more than 8
+partitions. `libgpt::mbr` only builds tables, though the scope said it parses MBR. The 30 shared
+constants in kernel/src/rsproto.rs equal librsproto's. `session::round_trip` does not check the
+reply's request id, which is sound only while every channel it serves is strictly request/reply
+(true today). Callers of `Dir`, `Clipboard` and `Desktop` in libfs, nxedit, nxterm, nxfiles,
+desktop-shell, profile-server, nxsh and coreutils close the session on every path. The inventory
+is 19 blocks (session.rs 6, setup.rs 5, channel.rs 4, clipboard.rs 2, desktop.rs 2); the scope's
+7/6/5/3/3 counts matched `use` lines too.
