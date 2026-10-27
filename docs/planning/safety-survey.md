@@ -498,3 +498,515 @@ roll back every installed handle on each pre-commit failure. `KBox`, `KVec` and 
 (ZSTs, growth, `clear`, `remove`) and the spinlock acquire/release orderings hold, as do the
 handle-table segment publication, the seqlock reader, the `on_cpu` guard, and the bounce-buffer
 wipe in `sys_entropy_read` (checked in the built ELF with objdump).
+
+### sched — main at 135055a8, 2026-10-26
+
+Lenses: abi, ownership, soundness, concurrency, opportunities; returned nothing: none.
+Defects: found 35, refuted by a boot 0, reported 35 (the same defects merged into 15 below). Opportunities: 25 (merged into 11 below).
+
+The inventory, `cargo xtask unsafe-inventory` over its paths:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `kernel/src/sched.rs` | 337 | 25 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/sched` | 1674 | 162 | 38 | 0 | 0 | 0 | 0 | 20 | 0 | 0 | 0 |
+| `kernel/src/dpc.rs` | 60 | 1 | 0 | 2 | 0 | 0 | 0 | 1 | 0 | 0 | 0 |
+| `kernel/src/clock.rs` | 40 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/object/pending_op.rs` | 91 | 9 | 8 | 2 | 0 | 0 | 0 | 2 | 0 | 0 | 0 |
+| `kernel/src/object/notification_channel.rs` | 104 | 8 | 7 | 2 | 0 | 0 | 0 | 2 | 0 | 0 | 0 |
+| `kernel/src/object/timer.rs` | 96 | 11 | 9 | 2 | 0 | 0 | 0 | 2 | 0 | 0 | 0 |
+| `kernel/src/libkern/spinlock.rs` | 136 | 7 | 0 | 4 | 0 | 0 | 0 | 5 | 0 | 0 | 0 |
+| `kernel/src/libkern/lockrank.rs` | 262 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/arch/smp.rs` | 8 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/arch/x86_64/smp.rs` | 66 | 5 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/arch/x86_64/context.rs` | 75 | 3 | 4 | 0 | 0 | 0 | 0 | 2 | 0 | 2 | 0 |
+| `kernel/src/arch/x86_64/resched.rs` | 6 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/arch/x86_64/timer.rs` | 143 | 8 | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `total` | 3098 | 242 | 77 | 12 | 0 | 0 | 0 | 34 | 0 | 2 | 0 |
+
+**Defects**
+
+- [ ] **sched-d1** `kernel/src/sched/exit.rs:400` — `thread_exception_frame` returns the raw
+  kernel-stack address of a suspended thread's `ExceptionFrame` and drops SCHED, and
+  `sys_thread_get_registers` (`syscall/table.rs:611-613`) then reads it through the safe
+  `ArchRegisters::read_from_exception_frame(frame_ptr: usize)` (`arch/x86_64/idt.rs:692`, which
+  forms `&ExceptionFrame` from any usize) with nothing keeping the thread suspended. The SAFETY
+  argument at `idt.rs:693-697` ("the thread stays parked while suspended") does not hold.
+  Thread T (its handle has SIGNAL) faults and is suspended. Thread A gets `frame_ptr`. Thread B's
+  `sys_exception_resume`, or a sibling's `sys_process_exit` through `end_siblings`, resumes T on
+  another CPU. T's next trap or syscall lands at the same stack top and overwrites the 176 bytes. A
+  then reads them with no synchronisation: a data race on a live kernel stack, with kernel return
+  addresses and saved registers copied to user memory. There is no use-after-free, because A's
+  handle pins the Thread and its stack. The deferred ModifyAndResume write-back built the same way
+  would write into a running thread's stack, which is the ordinary change that makes this high.
+  Fix: decode `RegisterValues` under SCHED and return them, and make the frame decoder unsafe or
+  private. The decoder taking any usize is a second defect: a Miri probe with a dropped Box's
+  address reports a dangling `&ExceptionFrame` at `idt.rs:697`.
+  Demonstrated by five host tests in `sched/tests.rs`, each of which ran the real functions in
+  syscall order and then simulated the thread reusing its stack by overwriting the frame buffer.
+  `thread_exception_frame` → Some(p); `resume_suspended` or `end_siblings` → true;
+  `take_disposition`; overwrite; `read_from_exception_frame(p)` returned the overwritten word (for
+  example rip = 0xffff80000badf00d), and `thread_exception_frame` was then None. The overwrite is
+  the one simulated step, since no host test runs a thread. Miri showed the any-usize decoder.
+  abi, ownership, soundness, concurrency, opportunities. Medium.
+
+- [ ] **sched-d2** `kernel/src/sched/ipc.rs:527` — Outstanding page-cache fills
+  (`UserspaceServerReg.pending_fill`) are never completed when a userspace server dies.
+  `ipc_endpoint_closing` (`:508`, `:527`) and `us_reg_detach` (`:281`) drain only the lookups, with
+  PeerClosed. The fill's PendingOperation is never signalled, and the cycle reg →
+  `PendingFill.file_obj` → `Producer::FsServer{reg}` is never broken. A server replies
+  OBJECT_KIND_FILE (`table.rs:2398`), a client maps the file and faults, and `us_forward_originate_fill`
+  records the fill. The server dies or its binding is unbound before it replies. The faulting
+  thread loops in `file_object.rs:1177` `wait_status` (`wait_on_io(u64::MAX)`), which on an exit wake
+  sees TimedOut and waits again. It can never end, so its process never ends, no handles are swept,
+  and the registration, endpoint, FileObject, cache frame and PO leak. This is an unkillable hang
+  plus a leak. No shipping server replies OBJECT_KIND_FILE today. It is not the recorded
+  `TODO(unsupervised-fault)`, which is a fill that fails, not one that never completes. Fix: one
+  `fail_all` on the registration that drains both tables, used at all three sites.
+  Demonstrated by host tests in `object/userspace_server.rs` and `sched/ipc.rs` (since removed). A
+  channel pair (k, s) with a registration attached and one lookup and one fill outstanding, then
+  `drop(s)`: "lookup signalled=true fill signalled=false". After dropping the registration too, the
+  fill was still unsignalled. A second test with `Producer::FsServer{reg}` counted 0 destroys of
+  reg, file and PO (expected 1, 1, 1). Only `take_pending_fill_matching` (a matching reply, or
+  originate's rollback) takes `pending_fill`. abi, ownership, soundness, concurrency,
+  opportunities. Medium.
+
+- [ ] **sched-d3** `kernel/src/dpc.rs:71` — The safe `pub fn enqueue(dpc: &Dpc)` takes a borrow of
+  any lifetime and stores its address in the global queue. `run_pending` (`:122`) later turns that
+  address back into `&Dpc` and calls through it. Safe code can therefore queue a Dpc that is dead
+  by the drain. `io/mod.rs:140-141` already queues a stack-local Dpc, whose `ctx` is an
+  InterruptObject the function then drops. That is sound only because the self-test runs on the BSP
+  before `bring_up_aps`. Moving it after AP bring-up lets another CPU's tick-tail drain take the
+  address first, so the self-test returns and a CPU calls `signal_interrupt` on a freed object
+  through a dead stack slot (an indirect call in IRQ context). The 9 heap-embedded IRP DPCs hold
+  only by the convention that the IRP box is parked as its handler's last act. Fix:
+  `enqueue(&'static Dpc)` plus an `unsafe fn enqueue_raw(NonNull<Dpc>)` (see sched-o3).
+  Demonstrated: Miri on safe code only, `{ let d = dpc_for(&c); enqueue(&d); } run_pending();`
+  (also a Box dropped before the drain) reports "constructing invalid value of type &dpc::Dpc:
+  encountered a dangling reference" at `dpc.rs:122`. Control: `enqueue_then_drain_runs_handler_once`
+  passes under Miri. abi, ownership, soundness, concurrency, opportunities. Medium.
+
+- [ ] **sched-d4** `kernel/src/arch/x86_64/idt.rs:663` — An NMI (vector 2, per-CPU IST2 stack) that
+  lands in ring 3 is treated as a user fault: `exception_dispatch` → `user_fault` →
+  `suspend_with_fault(frame_ptr)` with the frame on the IST2 stack. `is_user_fault` checks only
+  `cs & 3` outside STOPPING. The thread is parked and context-switched off IST2, leaving its
+  ExceptionFrame, saved_sp and callee-saved frame on a stack the TSS hands to the CPU's next NMI.
+  `suspend_with_fault`'s premise (`exit.rs:301`, "the ExceptionFrame stays on this frozen kernel
+  stack") fails. #DF on IST1 with a ring-3 CS does the same. A BMC or chipset NMI, a future NMI
+  watchdog or a profiler arrives while a user thread runs. The thread is reported as a segfault and
+  parked on CPU X's IST2. A second NMI on X overwrites its parked context, or the thread resumes on
+  CPU Y while X takes an NMI, and `context_switch` pops a clobbered return address in ring 0:
+  kernel memory corruption. No NMI source exists today, hence medium. Fix: handle vectors 2 and 8
+  from ring 3 without suspending: log and return on the IST stack, never park.
+  Demonstrated by a QEMU boot at -smp 4 (release image, greeter driven by keystrokes). HMP `nmi`
+  is dropped because LAPIC LINT1 is masked, so a probe had the tick on CPU 0 send an APIC NMI to
+  CPUs 1-3 whenever they ran a user-owned thread, and made ring-0 NMIs return. Serial showed
+  `PROBE: NMI from ring 3` then `*** unhandled ring-3 fault ... pid 15 tid 19 segfault @ 0x41e6b3
+  ***`, and the compositor's outbox overflowed afterwards. The second-NMI overwrite was not booted;
+  it follows from the shared IST2 top. Probes reverted. concurrency. Medium.
+
+- [ ] **sched-d5** `kernel/src/dpc.rs:98` — The DPC queue is reserved to 64 on the premise that
+  the bound is the number of distinct Dpc objects, but every IRP embeds its own Dpc. The block
+  layer's refusal paths queue it from thread context with no drain: `submit_within`
+  (`io/block.rs:119`) and `forward`'s window and rebase refusals (`:515`, `:540`). Nothing bounds
+  how many accumulate between interrupt tails, and the 65th enqueue panics ("DPC queue reserve
+  exhausted"). A holder of a block DeviceNode handle with READ (the storage service, an fs server)
+  issues 65 or more `sys_io_submit` reads past the device end between two ticks (about 2.5-10 ms).
+  Each returns at once with a PO and its refused IRP queued from thread context. The result is a
+  kernel crash. A corrupt filesystem whose block map runs past the partition is the plausible
+  untrusted route; that was not shown. Fix: complete refused IRPs without a thread-context DPC (or
+  raise the completion self-interrupt as `ramdisk_submit` does), or make the IRP queue intrusive
+  and unbounded.
+  Demonstrated by a host test in `io/block.rs` (since removed). `dpc::init()`, a 64-block disk and
+  a backend that never completes, then `dispatch_block_irp(.., offset = 64*512, 512)` 65 times
+  without `run_pending`. Submits 0-63 returned Ok; submit 64 panicked at `dpc.rs:98`. concurrency.
+  Medium.
+
+- [ ] **sched-d6** `kernel/src/sched/exit.rs:437` — `reap_pending` is the only drain of the global
+  completed-IRP list (`io::block::reclaim_completed`), the char-driver reclaim lists and each CPU's
+  reap list, and it runs only from `idle_body`, `exit_thread`, `exit_process` and
+  `suspend_with_fault`. `yield_now` has no production caller, and neither the preemptive switch nor
+  blocking reaps. The claim in `lock-ordering.md` that "the next scheduler entry's `reap_pending`
+  drains the list" does not hold. An unprivileged process starts one busy-loop thread per online CPU,
+  so the idle thread never runs. Each completed block IRP's IrpBox (PO, device ref, frags, pinned
+  buffer) then piles up on RECLAIM without bound, one per page-cache fill and per `sys_io_submit`.
+  An exited thread's Thread, Process and AddressSpace wait in `reap[cpu]` until the next exit on
+  that CPU. Kernel memory grows until the load stops. Fix: drain from a thread guaranteed to run
+  (the reaper) when the lists are non-empty, or from the blocking switch path.
+  Unverified: no busy-loop program was available in the image. A reading and grep of `main` found
+  `reap_pending()` called only from `idle_body` (`spawn.rs:282`), `exit_thread`/`exit_process`
+  (`exit.rs:204`, `:216`), `suspend_with_fault` (`:269`), `yield_now` (`sched.rs:385`, no production
+  caller) and tests, and `reaper_body` only closes handle tables. To settle it, boot with N busy user
+  threads plus a file-reading loop and watch RECLAIM's length or free memory grow. concurrency.
+  Medium.
+
+- [ ] **sched-d7** `kernel/src/sched/ipc.rs:312` — `us_server_attach` overwrites an endpoint's
+  `us_reg` back-pointer unconditionally, and `sys_ns_bind` checks `us_forward_existing_reg`
+  (`syscall/table.rs:1202`) in a SCHED hold of its own before allocating and attaching (`:1223`).
+  Two binds of one endpoint can interleave and leave two registrations, both starting request ids at
+  1, with replies routed only to the one attached last. A supervisor holding BIND_NAMESPACE binds
+  server endpoint K at two paths from two threads. Both see no registration and attach in turn, so
+  `K.us_reg` = reg_b. Client A (pid 10) looks up through binding A and client B (pid 20) through
+  binding B, and both arrive at the server as request id 1. The server answers A's request, the
+  kernel routes the reply to reg_b, and B's lookup completes with the handle the server resolved
+  for A's path and base: B gains A's object. A's lookup never completes until reg_a is destroyed,
+  and a server death drains only the last-attached registration. The doc on `set_us_reg` ("Set once")
+  does not hold. Reachable only by a trusted party. Fix: check and attach in one SCHED hold
+  (attach refuses when `us_reg` is set).
+  Demonstrated by host tests (since removed) using the real sched entry points in the interleaved
+  order: `us_forward_existing_reg(k)` → None twice; two registrations attached; lookups from pid 10
+  and 20; the reply to request 1 completed pid 20's lookup (assertion: left 20, right 10). The
+  interleaving itself was shown by reading the code (two SCHED holds), not run. A second test showed
+  reg_a's lookup left unsignalled at server death. abi, ownership. Medium.
+
+- [ ] **sched-d8** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard` at
+  `:249`) holds only `&SpinLock<T>`, so it is auto-Sync and auto-Send whenever `T: Send`. Through a
+  shared `&guard`, Deref gives `&T` on several threads for a `T` that is not Sync. Sending a guard
+  to another CPU would drop it there, decrementing the wrong CPU's preempt counter or restoring that
+  CPU's IF. Safe code that locks a `SpinLock<Cell<u32>>` and shares `&guard` with two threads that
+  both call `.set()` races. No kernel path shares a guard today; the first lock over a `!Sync` value
+  whose guard is lent across CPUs reaches it. Fix: a `PhantomData<*const ()>` marker (so `!Send`)
+  plus `unsafe impl<T: Sync> Sync` on both guards, as std's `MutexGuard`.
+  Demonstrated: Miri on safe code (`SpinLock<Cell<u32>>` and an `IrqSpinLock` twin, `&guard` into
+  `std::thread::scope`) reports "Data race detected between (1) non-atomic write ... and (2)
+  non-atomic read" in `Cell::get`/`Cell::replace`. That the probe compiled shows the guard is Sync.
+  abi, ownership, soundness, concurrency, opportunities. Low.
+
+- [ ] **sched-d9** `kernel/src/object/thread.rs:716` — `Thread::fpu_area_ptr` derives the
+  `*mut ArchFpuState` it gives `switch_into` from `&raw const **area`, which goes through
+  `KBox::deref` (a shared reference). `fpu_save` (an XSAVE store) then writes through a pointer
+  whose provenance permits reads only, on every context switch. The SAFETY comment's "live,
+  64-byte-aligned images" does not establish write permission. The hardware forgives it and asm is
+  opaque to the optimiser, but a Rust-side write there would be UB. Fix: take the pointer from the
+  box's raw pointer (`&raw mut **area` through `&mut`, or keep the area as `NonNull`).
+  Demonstrated: Miri on `Thread::try_new_boot` then `fpu_init_area(Thread::fpu_area_ptr(obj))` (the
+  pure-Rust sibling with the same contract) reports "attempting a write access using <tag> ... but
+  that tag only grants SharedReadOnly permission", the tag created at `thread.rs:716`. Control:
+  deriving it as `match &mut (*p).fpu { Some(area) => &raw mut **area }` passes; the file was
+  restored. A second probe (one byte written through the pointer) gave the same report. ownership,
+  soundness. Low.
+
+- [ ] **sched-d10** `kernel/src/sched/exit.rs:50` — Whole-struct `&Thread` is formed under SCHED
+  at 13 sites (`exit.rs:24,50,104,145,221,244,286,465`, `current.rs:31,45,59,86`, `spawn.rs:263`)
+  on the argument that SCHED serialises all access. But `context_switch` stores the outgoing
+  thread's `arch.sp` after `switch_into` released SCHED, so the retag races that store. CPU B blocks
+  T (pushed to `blocked`, SCHED released) and is executing `mov [rdi], rsp`. CPU A takes SCHED in
+  `has_live_siblings`, `end_siblings`, `place_spawned` or `current_owner_pid` and retags
+  `&*(T as *const Thread)` to read `owner_pid`. The two accesses are unordered: a data race in
+  Rust's model, forgiven by the hardware because only `owner_pid` is used. The Thread accessor
+  contract ("single-CPU, SCHED serialises all access") misses that `arch.sp` is written outside
+  SCHED. Fix: read the field through a raw place (`ptr::read(&raw const (*p).owner_pid)`), or put
+  `arch` in an `UnsafeCell` (sched-o2).
+  Demonstrated: Miri on a host test in which one thread unlocks a `Mutex<SchedState>`, then writes
+  `saved_sp` through `saved_sp_mut_ptr` (as `context_switch` does) and sets a relaxed flag, while
+  the other waits on the flag, locks and calls `has_live_siblings`. It reports "Data race detected
+  between (1) non-atomic write ... and (2) retag read of type object::thread::Thread" at
+  `exit.rs:50`. Control: the same interleaving through the raw-field accessor `Thread::is_ending`
+  passes, as does moving the write before the unlock. soundness, concurrency. Low.
+
+- [ ] **sched-d11** `kernel/src/object/ipc_channel.rs:629` — `IpcChannel::drop`, `Timer::drop`
+  (`timer.rs:221`) and `UserspaceServerReg::drop` (`userspace_server.rs:489`) run with a live
+  `&mut self` (Box retag, protected Drop argument) until their closing hook acquires SCHED. Other
+  CPUs still reach the object through uncounted pointers and mutate it under SCHED: a send through
+  `peer` writes its ring, the tick's `fire_timer` writes the timer from the deadline heap, and
+  `ipc_endpoint_closing` or `try_acquire` reaches the registration through `us_reg`. Endpoint A's
+  last handle closes on CPU 1 and `IpcChannel::drop(&mut self)` spins on SCHED in
+  `ipc_endpoint_closing`. CPU 2 holds SCHED in `ipc_send_push(B)` and `b.peer` still names A, so
+  `send_push` writes A's ring (`self.len += 1`) while CPU 1's `&mut A` is live. Fix: in
+  `dispatch_destroy`, run the type's closing hook on the raw pointer before `KBox::from_raw`.
+  Demonstrated: a host test in which thread B took SCHED and set a flag then ran
+  `IpcChannel::send_push(b)`, while thread A waited on the flag and dropped the last ref to a. Miri
+  (Stacked Borrows) reports "trying to retag from <..> for SharedReadOnly permission ... tag does
+  not exist", the peer tag invalidated by the Unique retag at `kbox.rs:116`. Under Tree Borrows it
+  reports "Data race detected between (1) non-atomic write ... ipc_channel.rs:149 self.len += 1 and
+  (2) retag read of type IpcChannel ... drop_in_place". concurrency. Low.
+
+- [ ] **sched-d12** `kernel/src/object/ipc_channel.rs:283` — `IpcChannel::try_new_pair` takes each
+  peer pointer from a shared borrow (`&*b as *const Self`), then retags the box Unique through
+  `a.inner.get_mut()` / `b.inner.get_mut()`. That invalidates the pointer just stored in the other
+  endpoint, so every later `inner(peer)` reached from `sched/ipc.rs` (`send_push`, `send_or_queue`,
+  `clear_peer`) uses an invalidated tag. This is UB under Stacked Borrows, not under Tree Borrows,
+  and nothing has miscompiled. It stops Miri on any test that builds an IPC pair, which hides the
+  IPC paths from Miri. Fix: take the pointers with `&raw mut *a` after the `get_mut` writes, or from
+  `KBox::into_raw`.
+  Demonstrated: on unmodified main, `MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-ignore-leaks'
+  cargo +nightly-2026-07-20 miri test --lib --target x86_64-unknown-linux-gnu
+  sched::ipc::tests::an_endpoint_holding_another_in_a_held_send_is_refused_too` reports "trying to
+  retag from <1785035> for SharedReadOnly permission ... but that tag does not exist in the borrow
+  stack" at `ipc_channel.rs:332`, the tag created at `:283` and invalidated by the Unique retag in
+  `KBox::deref_mut` (`kbox.rs:116`). The same test passes with `-Zmiri-tree-borrows`. opportunities.
+  Low.
+
+- [ ] **sched-d13** `kernel/src/dpc.rs:107` — `run_pending_in` drains into `[0usize; DPC_RESERVE]`
+  with `buf[..n].copy_from_slice(&q)`, where `n` is the queue's length. The length is bounded by the
+  KVec's capacity, not by `DPC_RESERVE`. The two agree only because `try_reserve` from an empty KVec
+  allocates exactly the amount requested. Changing KVec growth to round up to an allocator bucket,
+  or reserving the queue larger in `init`, makes a drain with more than 64 distinct DPCs queued
+  panic at an interrupt tail with an out-of-range slice. Fix: take the buffer size from the queue's
+  type (sched-o4) or drain in chunks.
+  Demonstrated by a host test (since removed): a fresh queue reserved to `DPC_RESERVE+1` (capacity
+  128) and 65 distinct Dpcs queued panics at `dpc.rs:111`, "range end index 65 out of range for
+  slice of length 64". In production `init` reserves exactly 64 from empty. ownership. Low.
+
+- [ ] **sched-d14** `kernel/src/sched.rs:368` — `alloc_pid` uses `next_pid.wrapping_add(1)`, so
+  after 2^32-2 spawns pids come round to 0, 1, 2, and so on. `sched.rs:238` says "No pid reuse" and
+  `docs/architecture/handle-system.md:343` treats pid reuse as no hazard, yet handle ownership is
+  keyed solely by `owner_pid` (`handle/global.rs`). After about 4.29 billion
+  `sys_process_spawn` calls a child gets pid 0, whose handles `reap_pending` never sweeps
+  (`exit.rs:470` skips pid 0), then pid 1 (the boot parent) and other live pids. A child sharing a
+  live process's pid passes that process's `owner_pid` checks and gains its authority. Fix: refuse
+  to spawn at exhaustion, or widen to u64.
+  Demonstrated by a host test in `sched/tests.rs` (since removed): `SCHED.next_pid = u32::MAX`, then
+  `alloc_pid()` four times gave 0xffffffff, 0, 1, 2 ("the pid source wrapped"). The spawn count
+  needed keeps it low. abi. Low.
+
+- [ ] **sched-d15** `kernel/src/arch/x86_64/smp.rs:39` — `adopt_dense_index` matches `hw_apic_id()`
+  (CPUID.01H:EBX[31:24], 8 bits) against the 32-bit `lapic_id`s the BSP bound. An AP whose x2APIC
+  id is 256 or more and whose low byte equals another CPU's id adopts that CPU's dense index: the
+  dense-index collision class this kernel has hit before. `identity_bound()` is also false for it,
+  so its park leaves its online bit set. The comment's "sufficient while MAX_CPUS <= 255" confuses
+  the CPU count with the id values. Limine is asked with flags 0 today (`limine.rs:332`), so ids
+  are xAPIC ids of 255 or less. Once x2APIC is requested and APs start (`TODO(smp-cpu-count)`
+  records the count), an id such as 256 reads 0 and shares the BSP's GDT/TSS, scheduler slots and
+  preempt counters. Fix: read the full id from CPUID.0BH/1FH EDX, or the x2APIC ID MSR after
+  `enable_this_cpu`.
+  Unverified: reading confirms the 8-bit read (`smp.rs:21-24`) against the 32-bit binds
+  (`main.rs:416/436`). A boot with `-smp 1,sockets=2,cores=256,threads=1,maxcpus=512 -device
+  max-x86_64-cpu,socket-id=1,core-id=0,thread-id=0` gave an id-256 AP, but ACPI listed 2 CPUs and
+  the kernel brought up only `cpu 0 online ... 1 of max 8`, so the AP was never started. To settle
+  it, request x2APIC in `limine.rs` and boot that topology. concurrency. Low.
+
+**Opportunities**
+
+- [ ] **sched-o1** encapsulate: scheduler-owned state is reached through `pub(crate) unsafe fn
+  x(obj: *mut ())` accessors whose contract is "live, pinned, and SCHED held", or through `unsafe fn
+  inner<'a>(obj) -> &'a mut Inner` with an unbounded lifetime. Nothing proves the lock is held or
+  stops two `&mut Inner` from coexisting — about 169 sites (the call sites in sched outside tests:
+  86-88 Thread-accessor calls by `grep -oE 'Thread::[a-z_]+\('` over `sched.rs` and
+  `sched/{current,exit,ipc,objects,placement,preempt,spawn,timers,wait}.rs`, plus 83 calls to the
+  other types' accessors by `grep -rnoE '\b(Timer|PendingOperation|NotificationChannel|InterruptObject|IpcChannel|UserspaceServerReg)::[a-z_]+\('`
+  over the same files; they serve 94 accessor fns by `grep -c 'pub(crate) unsafe fn'` over
+  `kernel/src/object/{thread,timer,pending_op,notification_channel,ipc_channel,interrupt_object,userspace_server}.rs`
+  = 40+10+7+6+17+6+8), such as `kernel/src/object/timer.rs:86`, `kernel/src/object/thread.rs:415`,
+  `kernel/src/sched/timers.rs:81-118`. A `SchedToken` (zero-sized, a field of `SchedState`, so only
+  the SCHED guard reaches one) and `SchedCell<T>(UnsafeCell<T>)` with `fn get<'a>(&'a self, _: &'a
+  mut SchedToken) -> &'a mut T`. Each object keeps its SCHED-guarded state in one cell and its
+  accessors become safe `&self` methods taking the token. Thread splits into immutable identity, a
+  `SchedCell<ThreadSched>`, its atomics (`on_cpu`, `wait_phase`), and the asm-written `arch`/`fpu`
+  fields behind their own `UnsafeCell`, so a `&Thread` is always sound. Checked against `fire_timer`,
+  `signal_pending_op_with_result`, wait()'s registration, `Timer::add_waiter` and
+  `IpcChannel::send_push` (the peer dereference stays one narrowed unsafe): in each, every cell
+  borrow ends before the next `&mut SchedState` call. In `kernel/src/libkern` (`SchedCell`) and
+  `kernel/src/sched.rs` (`SchedToken`). Closes: an accessor called without SCHED; a `&mut Inner`
+  outliving its hold or aliased; and the `&Thread`-over-a-concurrently-written-`arch` race of
+  sched-d10; it removes most of sched's 162 unsafe blocks of this kind. Depends on: nothing for the
+  lock half; sched-o2 for the liveness half. abi, ownership, soundness, concurrency, opportunities.
+  Value high, effort large.
+
+- [ ] **sched-o2** encapsulate: scheduler entry points take a type-erased `*mut ()` (and
+  `wait_on`/`wait_on_io` take `&[usize]`) whose kind and liveness the caller promises, though nearly
+  every caller already holds a type-checked ObjectRef and passes `.as_ptr()` — about 98 sites (29
+  `pub unsafe fn` by `grep -rhoE "pub unsafe fn [a-z_]+" kernel/src/sched.rs kernel/src/sched/`; 26
+  entry points once the 3 Drop hooks are excluded; external call sites by `grep -rnE
+  "sched::(<those names>)\(" kernel/src | grep -v ^kernel/src/sched`: 92-98, of which 72-77 pass
+  `.as_ptr()`, 30 `complete_pending_op`, 10-12 `pending_op_completion`, 11 `wait_on`/`wait_on_io`;
+  plus 19 `&*(x as *const Thread|Process)` casts inside sched), such as
+  `kernel/src/syscall/table.rs:1095` (`timer_arm(ok.object.as_ptr(), ..)` after `lookup_typed`),
+  `kernel/src/object/file_object.rs:1180`, `kernel/src/sched/objects.rs:93` (`request_terminate`),
+  `kernel/src/sched/current.rs:31`. A `KObject { const TYPE }` trait and `KRef<T: KObject>(ObjectRef,
+  PhantomData<T>)` made only by `ObjectRef::downcast::<T>() -> Result<KRef<T>, ObjectRef>`
+  (or a `Typed<'r, T>` borrowed from `&'r ObjectRef`), with `Deref<Target = T>`, and a `Waitable<'a>`
+  for the five waitable kinds. The entry points become safe: `complete_pending_op(po: &KRef<PendingOperation>,
+  ..)`, `timer_arm(t: &KRef<Timer>, ..)`, `wait_on(objs: &[&ObjectRef], ..)`, and the borrow is the
+  pin. Checked against `sys_timer_set` (`lookup_typed`), `sys_wait` (`refs[]`, already type-checked),
+  `file_object.rs:1180` (`po: &ObjectRef`), `xhci::settle` and `drivers/input` `ParkedRead.po`. About
+  12 callers that hold only a raw pointer pinned by an IRP or driver struct (`io/block.rs:382`,
+  `ahci.rs:676/695/814`, `xhci/mod.rs:704/753`, `ps2/mod.rs:266`, `xhci/storage.rs:775`,
+  `io/mod.rs:29`, `syscall/table.rs:1414`, `file_object.rs:842`) keep an `unsafe fn ..._raw` or store
+  a `KRef` in the IRP. In `kernel/src/object/header.rs` (beside ObjectRef), used by `kernel/src/sched`
+  and `kernel/src/syscall/table.rs`. Closes: a wrong-kind or dangling object pointer reaching a
+  SCHED-held accessor, the class behind the stale-`us_reg` crash and the `is_live`/magic backstops.
+  Depends on: nothing. abi, ownership, soundness, concurrency, opportunities. Value high, effort
+  large.
+
+- [ ] **sched-o3** encapsulate: per-CPU statics indexed by `this_cpu()` whose correctness rests on
+  a comment that the caller cannot migrate between reading the index and using the slot — 28 sites
+  (`grep -rn "with_preempt_off(\|with_resched_pending(\|with_ending(" kernel/src | grep -v "fn
+  with_\|tests"` gives 12; `grep -n "\[cpu\]" kernel/src/libkern/lockrank.rs` gives 16), such as
+  `kernel/src/sched.rs:414`, `kernel/src/sched/preempt.rs:119`, `kernel/src/sched/exit.rs:90`,
+  `kernel/src/libkern/lockrank.rs:271`. `CpuLocal<T>` with `fn get(&self, _: &impl NoMigrate) ->
+  &T`, where `NoMigrate` is implemented by `IrqSpinLockGuard`, an `IrqsOff` RAII and a `PreemptOff`
+  RAII, and `fn remote(&self, _: &SchedToken, cpu) -> &T` for `end_siblings`' cross-CPU store. The
+  `cfg(test)` thread-local backing lives inside the type once. Checked against `on_timer_tick`
+  (guard), `preempt_disable` (mask) and `end_if_ending` (IF=0 at the return to ring 3). In
+  `kernel/src/libkern`, used by sched and lockrank. Closes: touching another CPU's slot after a
+  migration between `this_cpu()` and the access, the SMP wrong-slot class seen before. Depends on:
+  nothing (the remote accessor wants sched-o1's token). concurrency. Value medium, effort medium.
+
+- [ ] **sched-o4** narrow: `dpc::enqueue(&Dpc)` is safe for any lifetime, though statics need
+  nothing more and heap-embedded IRP DPCs are sound only by the convention that the box outlives its
+  drain — 22 sites (`grep -rn 'dpc::enqueue(' kernel/src | grep -v tests | grep -v ^kernel/src/dpc.rs`:
+  12 static, 9 IRP-embedded at `ahci.rs:572,634`, `xhci/storage.rs:751`, `io/block.rs:119,515,540,896`,
+  `io/ramdisk.rs:239`, `object/file_object.rs:1255`, and 1 stack-local at `io/mod.rs:141`), such as
+  `kernel/src/drivers/ahci.rs:669` (`&AHCI_INTR_DPC`), `kernel/src/io/block.rs:515`
+  (`&(*irp).dpc`), `kernel/src/io/mod.rs:141`, `kernel/src/drivers/ps2/mod.rs:317`. `pub fn
+  enqueue(dpc: &'static Dpc)` for the statics and `pub unsafe fn enqueue_raw(dpc: NonNull<Dpc>)`
+  with the contract "the Dpc stays valid until its handler has run" for the IRP and stub-fill ones;
+  the self-test's stack Dpc becomes a static. Checked against `AHCI_INTR_DPC`/`PIT_DPC`
+  (static, fits), the `io/block.rs` IrpBox (heap, `enqueue_raw`) and the file_object StubFillBox
+  (heap, `enqueue_raw`). In `kernel/src/dpc.rs`. Closes: the dangling-Dpc use from safe code
+  (sched-d3), and it marks each by-convention site. Depends on: nothing. abi, soundness. Value
+  medium, effort small.
+
+- [ ] **sched-o5** encapsulate: lists pushed under SCHED or at an interrupt tail are plain KVecs
+  reserved up front and pushed only with `push_within_capacity`/`push_reserved`, and the five
+  waiter pushes each say "the type should say so" — 15-21 sites (`grep -rn "push_within_capacity\|push_reserved("
+  kernel/src/sched.rs kernel/src/sched/ kernel/src/object/ kernel/src/dpc.rs | grep -v "fn
+  push_reserved\|tests"` gives 21 code lines, 10 `push_reserved` plus 11 within-capacity; 5 by
+  `grep -rn "the type should say so" kernel/src`), such as `kernel/src/sched/wait.rs:29`,
+  `kernel/src/sched/exit.rs:158`, `kernel/src/object/ipc_channel.rs:542`, `kernel/src/dpc.rs:99`.
+  `Reserved<T>(KVec<T>)` built by `with_capacity(n) -> Result<Self, AllocError>` outside the lock,
+  exposing `push(&mut self, T) -> Result<(), T>` that never grows, plus pop, remove, iter, len and
+  capacity, with no `try_push`, `try_reserve` or `Default` (so no `mem::take`). `SchedState`'s run,
+  blocked, suspended and reap lists, deadlines, `deferred_drops`, `ended_pids` and the DPC queue
+  all become `Reserved`, whose capacity is a type-level constant so the DPC drain buffer takes `CAP`
+  from it. Checked against `SchedState.blocked` (static empty, swapped for a reserved one in `init`),
+  the Timer waiter list and the DPC queue. In `kernel/src/libkern` (beside `kvec.rs`). Closes: an
+  allocation or free under the rank-1 lock or in IRQ context through a growing push, and a drain
+  buffer shorter than its list (sched-d13). Depends on: nothing. ownership, concurrency,
+  opportunities. Value medium, effort small.
+
+- [ ] **sched-o6** encapsulate: five waitable objects each keep `waiters: KVec<*mut ()>` reserved to
+  `MAX_WAITERS` = 4 and repeat `add_waiter`/`remove_waiter`/`take_waiters(obj, out: &mut [*mut ()])`
+  (the out buffer is caller-sized, checked by `debug_assert!(out.len() >= n)` only), and sched
+  repeats the take, `mark_signaled`, `try_wake`, `make_runnable` loop five times — 20-25 sites
+  (`grep -rnE 'fn (add_waiter|remove_waiter|take_waiters)\b' kernel/src/object` gives 15;
+  `grep -n 'take_waiters(' kernel/src/sched.rs kernel/src/sched/*.rs | grep -v tests` gives 5
+  wake loops; plus 5 constructor `try_reserve(Self::MAX_WAITERS)?` calls), such as
+  `kernel/src/object/timer.rs:153`, `kernel/src/object/pending_op.rs:144`,
+  `kernel/src/object/ipc_channel.rs:460`, `kernel/src/sched/objects.rs:108` (the same loop at
+  `:126`, `:151`, `:205` and `sched/timers.rs:81`). `WaiterSet<const N: usize> { slots: [*mut (); N],
+  len: u8 }`, inline with a const `new`, `add(&mut self, t) -> Result<(), Full>`,
+  `remove(&mut self, t)` and `take(&mut self)` returning an owned batch iterated by value; one
+  `wake_all(g: &mut SchedState, set, target)` in sched holds the single unsafe block and its
+  argument (each waiter is pinned in `blocked` until it unregisters under SCHED). `Thread::wait_snapshot`
+  returns `[(usize,bool); MAX_WAIT_HANDLES]` by value. Checked against Timer (KVec reserved 4 →
+  array), PendingOperation and IpcChannel `recv_waiters`: all fit. In `kernel/src/object` (new
+  `waiters.rs`) and `kernel/src/sched/objects.rs`. Closes: a short out buffer passed to
+  `take_waiters` (a panic in IRQ/DPC context under SCHED), growth under SCHED through a waiter push,
+  and drift among the five wake loops. Depends on: nothing (composes with sched-o1). abi, soundness,
+  opportunities. Value medium, effort small.
+
+- [ ] **sched-o7** encapsulate: uncounted back-pointers (`IpcChannel.peer`, `IpcChannel.us_reg`) that
+  the target's Drop clears under SCHED are followed raw, and `ipc_endpoint_closing` reads a magic
+  word through a possibly stale `us_reg` (`is_live`) as a defence — 19 sites
+  (`grep -rnoE 'IpcChannel::(peer_of|clear_peer|us_reg_of|set_us_reg)\(|UserspaceServerReg::is_live\(' kernel/src/sched.rs kernel/src/sched/*.rs`
+  excluding ipc.rs tests: peer_of 9, clear_peer 1, us_reg_of 5, set_us_reg 2, is_live 2), such as
+  `kernel/src/sched/ipc.rs:18` (`closes_a_cycle`), `ipc.rs:247` (`us_forward_reg_for_send`),
+  `ipc.rs:291` (`us_reg_detach`), `ipc.rs:504` (`ipc_endpoint_closing`). `SchedWeak<T>(Cell<*const
+  T>)` kept in the SCHED-guarded state, with `get<'a>(&self, _: &'a SchedToken) -> Option<&'a T>`
+  (sound because the target's Drop must take SCHED to clear it), `set`, `clear_if(me, &mut
+  SchedToken)` and an `upgrade` through `try_acquire` for the two sites that need an owned ref. In
+  `kernel/src/sched`. Closes: following a back-pointer after its target is freed (a stale-`us_reg`
+  crash happened here before); it also makes the `is_live` read of possibly freed memory
+  unnecessary, and a single `attach` that refuses when set would hold sched-d7. Depends on: sched-o1
+  (the token). opportunities. Value medium, effort medium.
+
+- [ ] **sched-o8** narrow: under SCHED, code clones an owned ObjectRef only to read through it
+  (`th.process_ref()`) and argues at each site that dropping the clone "is never the last
+  reference"; elsewhere it takes a raw child pointer and argues the owner keeps it alive — 12 sites
+  (`grep -n 'process_ref()\|notification_channel_ptr()\|parent_notif_ptr()\|endpoint_ptr(' kernel/src/sched.rs kernel/src/sched/*.rs | grep -v tests`
+  gives 13 lines: 5 `process_ref` clones dropped under SCHED, 3 channel-pointer reads and 4
+  `endpoint_ptr` reads; `current.rs:86` clones deliberately and is excluded), such as
+  `kernel/src/sched/exit.rs:25` (`deliver_child_exited`), `exit.rs:146` (`end_process_if_last`),
+  `spawn.rs:266` (`place_spawned`), `ipc.rs:84` (`us_forward_notify`). `Thread::process(&self) ->
+  Option<&Process>`, `Process::notification_channel(&self) -> Option<&NotificationChannel>`,
+  `Process::parent_notif(&self)` and `UserspaceServerReg::endpoint(&self) -> &IpcChannel`, each
+  borrowing the reference the owner already holds. Checked against `deliver_child_exited`,
+  `end_process_if_last`, `place_spawned` and `suspend_with_fault`, which use only `&self` Process
+  methods; the setters take `&mut self`, so the fields are immutable once shared. In
+  `kernel/src/object/{thread,process,userspace_server}.rs`. Closes: an ObjectRef dropped under SCHED
+  (the allocator under rank 1) at the clone sites, and a raw child pointer used after its owner is
+  gone. Depends on: nothing (made safe internally by sched-o2's `downcast_ref`). opportunities.
+  Value medium, effort small.
+
+- [ ] **sched-o9** encapsulate: ObjectRefs that a SCHED-held path must release are carried out of
+  the locked block by hand (`drop(g); drop(x)`, `Err(returned) => returned`, orphans arrays dropped
+  after release, `mem::forget` before a panic, a move into `deferred_drops`), each relying on the
+  author remembering that a drop under the rank-1 lock reaches the allocator spinlock — 11 sites
+  (`grep -n "drop(g);\|Err(returned) => returned\|mem::forget(returned)\|mem::forget(held)\|deferred_drops, po" kernel/src/sched.rs kernel/src/sched/*.rs kernel/src/object/ipc_channel.rs`
+  gives 12 hits, less `sched.rs:737`), such as `kernel/src/sched/ipc.rs:151`,
+  `kernel/src/sched/ipc.rs:296`, `kernel/src/sched/ipc.rs:548`, `kernel/src/sched/spawn.rs:187`,
+  `kernel/src/sched/wait.rs:53`. A `SchedGuard` wrapping `IrqSpinLockGuard<SchedState>` with
+  `fn defer(&mut self, r: ObjectRef)` into an inline bag sized for the largest burst
+  (`2*US_PENDING_MAX` plus a few); its Drop releases SCHED first, then drops the bag in thread
+  context or moves it into `deferred_drops` in interrupt context. Add a debug assertion in
+  `ObjectRef::drop` that the lock tracker holds no Sched rank. Checked against
+  `us_forward_originate` (`pl.po`), `ipc_endpoint_closing` (up to 16 orphans) and `spawn_inner` (the
+  refused ref). In `kernel/src/sched.rs`. Closes: an ObjectRef dropped under the rank-1 lock reaching
+  the allocator, the cross-CPU deadlock `make_runnable`'s comment describes, and the reason
+  `deferred_drops` exists. Depends on: nothing. ownership. Value medium, effort medium.
+
+- [ ] **sched-o10** encapsulate: the switch-away tail is written out five times — pick next or fall
+  back to idle, take current, set both states, take the saved-SP slot, park prev on a list, install
+  next, then `unsafe { switch_into(g, slot, prev, next) }`; `switch_into`'s doc says "four parking
+  dispositions" and names four callers, and `park_reaper` is a fifth — 5 sites
+  (`grep -n 'unsafe { switch_into(' kernel/src/sched.rs kernel/src/sched/*.rs`; each also has one
+  `saved_sp_mut_ptr` and two `set_state` unsafe calls), such as `kernel/src/sched.rs:678-712`
+  (`switch_to_next`), `kernel/src/sched/wait.rs:10-38` (`block_current_and_switch`),
+  `kernel/src/sched/exit.rs:168-198` (`finish_exit`), `exit.rs:526-554` (`park_reaper`; also
+  `suspend_with_fault` at `:280-334`). `enum Park { Ready, Blocked, Suspended { frame: usize },
+  Exited, Reaper }` and one safe `fn switch_away(g: IrqSpinLockGuard<'_, SchedState>, prev:
+  ObjectRef, park: Park)` that derives prev's state from `park`, parks prev, picks next (with the
+  idle fallback and a hook for suspend's stranded-fault report) and calls a private `switch_into(g,
+  prev, next)`. That `switch_into` computes the outgoing slot from prev itself (today `out_slot` is
+  always `saved_sp_mut_ptr(out_obj)`, a redundant parameter the contract must tie to `out_obj`). The
+  list bookkeeping can be split out for host tests, as `clear_online_bit` was. In
+  `kernel/src/sched.rs`. Closes: a switch path that parks prev on one list with another list's state
+  (`park_reaper` sets Blocked but parks in the reaper slot) or passes an outgoing slot belonging to a
+  different thread; it leaves a single unsafe switch call. Depends on: nothing. opportunities. Value
+  medium, effort small.
+
+- [ ] **sched-o11** narrow: deadline-heap entries carry their targets as bare `usize` (`target`,
+  `channel`, 0 when unused) beside a separate `DeadlineKind`, cast back to `*mut ()` by kind at fire
+  time and matched by `(usize, kind)` on removal — 11-12 sites (`grep -rn 'deadline::Entry
+  {\|deadline::remove(\|DeadlineKind::\(Thread\|Timer\|PendingSend\) =>' kernel/src/sched.rs kernel/src/sched/*.rs | grep -v tests`
+  gives 4 constructions, 4 removes and 3-4 fire arms), such as `kernel/src/sched/wait.rs:173`,
+  `kernel/src/sched/ipc.rs:409`, `kernel/src/sched/timers.rs:47-67` (the Thread arm
+  `top.target as *mut ()`), `timers.rs:171`. `enum Target { Thread(NonNull<Thread>),
+  Timer(NonNull<Timer>), PendingSend { po: NonNull<PendingOperation>, channel: NonNull<IpcChannel>
+  } }` held in `Entry`, with `deadline::remove` matching on `Target` equality. Checked: all three
+  constructions and the fire match fit directly. Liveness stays a protocol (removal before the
+  free). In `kernel/src/sched/deadline.rs`. Closes: a target read as the wrong kind (a Timer address
+  read as a thread) and a PendingSend entry with no channel. Depends on: nothing. abi,
+  opportunities. Value low, effort small.
+
+What held up: the `on_cpu` handoff in `switch_into` and `context_switch` (guard raised under SCHED,
+cleared only after the `saved_sp` store, spun on before `saved_sp` and the FPU image are read), the
+FPU save/restore order, and the push/pop order matching `fabricate_frame`'s seven slots were checked
+independently by four lenses and are sound on x86 TSO. Per-CPU reap lists are drained only by the CPU
+the thread switched off, so no stack is freed in use. Every ObjectRef clone dropped under SCHED is a
+Process clone whose thread still holds a reference; `push_reserved`, `make_runnable` and
+`resume_parked` `forget` before they panic; refs are carried out of locked blocks and dropped after
+the guard. `wait()` registers and blocks in one SCHED hold, unwinds partial registration, and removes
+its deadline entry on every resume; duplicate handles in `sys_wait` balance, and `sys_wait` pins
+every object across the wait. Deadline-heap entries all leave before their target (Timer in
+`Timer::drop`, PendingSend on promote or close, Thread on resume), and each blocking send's fresh PO
+keeps `(target, kind)` unique. `IpcChannel.peer` and `us_reg` never go stale (`peer` is cleared under
+SCHED, `try_acquire` refuses zero, attach only sets a registration on its own endpoint), so the
+`is_live` check is a backstop. Preemption counters, the latch, `end_if_ending`'s IF=0 read, lock
+guard drop order and rank handling, the AP bring-up under one SCHED hold, `Thread::cpu_mask`
+(held by the `MAX_CPUS <= 8` const assert), the arch timer's clamps and saturation, `sys_wait`'s
+count check and the DPC drain's handler-frees-its-own-Dpc case all hold. The unsafe `Send`/`Sync`
+impls on PendingOperation, Timer and NotificationChannel are sound on SMP because every non-test
+access is under SCHED, although their comments still say "single-CPU". `arm_kernel_stack_for` and
+`fpu_area_ptr` run after SCHED is released, against their "SCHED held" comments, and are sound
+because the fields never change after construction. Tests caught the breaks listed above:
+Miri found the any-lifetime `enqueue`, the shared-guard race, the `fpu_area_ptr` provenance, the
+`&Thread`-versus-`arch.sp` race, the `IpcChannel::drop` retag and the `try_new_pair` invalidation;
+host tests found the frame reuse, the unfailed fills, the double attach, the DPC overflow and the
+pid wrap; one boot found the ring-3 NMI. Miri (Stacked Borrows) also passed on the
+process-ending, periodic-timer, `resume_suspended` and `enqueue_then_drain_runs_handler_once` tests.
+No host test reaches `switch_into`, `context_switch`, the five switch-away tails, `thread_enter`,
+`end_if_ending` or the arch MMIO/MSR code, and Miri stops on any test that builds an IPC pair until
+sched-d12 is fixed.
