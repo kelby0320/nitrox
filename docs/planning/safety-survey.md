@@ -3036,3 +3036,410 @@ bounded by the kernel's `seal`, so the documented drop holds. The kernel's `sys_
 the path synchronously. libtime has no unsafe and bounds every field before arithmetic. The
 `Waker` fix in rt-d1 was applied as a control and passed all 19 libos tests and both Miri
 probes.
+
+### supervision — main at 135055a8, 2026-10-27
+
+Lenses: abi, ownership, soundness, opportunities; returned nothing: none.
+Defects: found 35, refuted by a boot 0, reported 14 (35 findings merged into 14 distinct defects).
+Opportunities: 12 (29 proposals merged).
+
+The inventory, `cargo xtask unsafe-inventory` over its paths:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `userspace/init` | 838 | 78 | 2 | 0 | 16 | 55 | 2 | 5 | 0 | 1 | 0 |
+| `userspace/libinittoml` | 335 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/service-mgr` | 2318 | 59 | 1 | 0 | 15 | 43 | 2 | 4 | 0 | 0 | 0 |
+| `userspace/device-mgr` | 939 | 26 | 0 | 0 | 5 | 19 | 3 | 0 | 0 | 0 | 1 |
+| `userspace/storage-service` | 2175 | 38 | 0 | 0 | 5 | 32 | 3 | 0 | 0 | 0 | 0 |
+| `userspace/logging-service` | 718 | 24 | 0 | 0 | 10 | 11 | 3 | 2 | 0 | 0 | 0 |
+| `total` | 7323 | 225 | 3 | 0 | 51 | 160 | 13 | 11 | 0 | 1 | 1 |
+
+**Defects**
+
+- [ ] **sup-d1** `userspace/logging-service/src/main.rs:392` — `received()` is a safe fn that
+  returns a `librsproto::Message<'static>` borrowed from `static mut RECV_MSG`, and the next safe
+  `recv()` has the kernel overwrite that buffer while the borrow can still be live. Any caller
+  that keeps the message across another receive reads another client's bytes behind a live shared
+  reference, which is UB. Examples are a reworked `serve_read_session` that receives the next
+  request before answering this one, or `drain_source` peeking ahead. Today's callers
+  (`serve_read_endpoint` 415, `serve_read_session` 446) drop `m` before their next `recv`.
+  Demonstrated: a probe that held `received()` across `recv(h)` in safe code built clean with
+  `cargo check --release --target ../x86_64-unknown-nitrox.json -Z build-std=core,alloc,compiler_builtins`.
+  Miri on a replica of the pair reports `Undefined Behavior: trying to retag ... for
+  SharedReadOnly permission ... that tag does not exist in the borrow stack`. Probes restored.
+  abi, ownership, soundness, opportunities. Medium.
+- [ ] **sup-d2** `userspace/storage-service/src/main.rs:1115` — `serve_dir` sizes its ReadDir body
+  buffer as the IPC payload (`MSG_LEN - PAYLOAD_OFF - 64` = 4008 bytes) instead of `RS_MAX_BODY`
+  (3980), and `let _ = send(..)` at 1128-1129 drops the refusal. A listing that fills past 3980
+  bytes sends no reply. A USB stick with a 128-entry GPT gives 130 entries. 117 pack into 3993
+  bytes, `librsproto::encode` returns `None`, and `ls`, Files or `disk` on `/svc/storage/info` or
+  `/dev/storage/info` hangs for good, because `librsproto::session` round trips wait with
+  `u64::MAX`. device-mgr (main.rs:535) and libfsserver (server.rs:68) size the same buffer to
+  `RS_MAX_BODY`. Demonstrated: a temporary host test replaying `serve_dir`'s loop over
+  `table::entries` for 1 disk + 128 partitions printed `entries=130 packed=117 body=3993
+  RS_MAX_BODY=3980 encoded=None`. The control with an `RS_MAX_BODY` buffer printed `packed=116
+  body=3958 encoded=Some(3986)`. The kernel publishes every in-use GPT entry (up to 128) and
+  device-mgr's replay depth reaches them. Test removed. abi, soundness, opportunities. Medium.
+- [ ] **sup-d3** `userspace/service-mgr/src/main.rs:1248` — an admin Start or Restart of a
+  declaration that bring-up has not reached yet is allowed, and when bring-up reaches it,
+  `start(i, true)` spawns it again and overwrites `proc_h` and `ctrl` without closing them.
+  Neither `advance()` nor `start()` checks `running`. On the test image, nxterm waits (`after`)
+  for display-selftest. An admin Start of nxterm in that window spawns it, `started` is unchanged,
+  and when display-selftest exits `advance()` returns `Step::Start(nxterm)`. The first instance's
+  process handle and control channel leak, two instances run, and the first one's exit is never
+  attributed. For a server, the first instance's Ready is never read. Unverified: a host test in
+  lib.rs showed `decide(OP_SERVICES_START, Found{running:false,..}) == Ok(Action::Start)` and
+  `bringup::next(entries, started=2, true) == Step::Start(2)`. The end-to-end overwrite is in
+  main.rs, which does not build on the host. A test-image boot whose probe sends an admin Start of
+  nxterm while display-selftest runs would print `starting service 'nxterm'` twice. The fix is to
+  skip or refuse when `running` is true. ownership. Medium.
+- [ ] **sup-d4** `userspace/service-mgr/src/main.rs:1369` — `lookup_serving` closes its lookup's
+  PendingOperation at the deadline, but the kernel still installs the server's late reply handle
+  in service-mgr's table, where nothing knows its value. `derive()` resolves device-mgr's
+  `info-endpoint` or storage-service's `session-endpoint` with `DERIVE_TIMEOUT_NS` (5 s), and
+  storage-service can block up to 30 s inside mount/wait_ready. After the deadline, the late reply
+  is installed into `pl.owner_pid` (kernel table.rs:2195-2214), and `deliver_to_client` (822-828)
+  closes it only if the owner has no threads. One handle leaks in a process that never exits. The
+  server also keeps its minted endpoint counted against its bound (`MAX_INFO_ENDPOINTS` 2,
+  session_ends 4), so two late answers leave device-mgr refusing `WouldBlock` until it restarts.
+  This repeats on each restart of the server. Siblings: init `ns_lookup_wait`:145-148, service-mgr
+  `ns_lookup`:139-140, device-mgr `lookup`:146 and storage-service `po_wait`:161 close the PO
+  without its result, but only when `sys_wait` itself fails. Unverified: code read of
+  `lookup_serving`, `complete_resolve_reply` and `deliver_to_client`. A boot where device-mgr
+  answers `info-endpoint` more than 5 s late (a probe sleep in `mint_info_endpoint`) would show
+  `info_ends.len()` at 1 after service-mgr logged "gave no info-endpoint" and service-mgr's
+  handle count growing. ownership, opportunities. Medium.
+- [ ] **sup-d5** `userspace/init/src/main.rs:420` — init discards the process handle of every
+  fs-server and of the profile server it spawns (`let _ = fs_h;`, `let _ = ps_h;` at 559), and
+  leaks it on every failure after the spawn: 377-410 and 516-553. The comments say init keeps
+  them, but no static or list holds the value. A Process drops its AddressSpace only when the
+  object drops, so an exited server's address space stays pinned in PID 1 for the life of the
+  machine. The bound is the number of `[[mount]]`s plus 1. This is reached when a server refuses
+  its disk, never sends Ready, or exits at shutdown. `init/CLAUDE.md`'s "On ChildExited, close the
+  process handle" does not happen. `spawn_eshell` (613) and `supervise` (728) do close theirs.
+  Demonstrated: `grep -n 'fs_h\|ps_h' userspace/init/src/main.rs` shows only the spawn, the `< 0`
+  test and the discard, with no store and no close. Unverified: that the frames stay pinned in a
+  running system; a boot that kills a mount's server and reads free memory would settle it. abi,
+  ownership, soundness, opportunities. Low.
+- [ ] **sup-d6** `userspace/service-mgr/src/main.rs:402` — safe functions take raw pointers that
+  they dereference, or hand to the kernel to write and then read. `spawn_with_control(root_ns,
+  path, args: *mut SpawnArgs)` writes `(*args).image`, `handles`, `handle_count` and `move_mask`.
+  logging-service `make_channel(o0: *mut u64, o1: *mut u64)` (main.rs:169) has the kernel write
+  two handles through them and then `read`s them. Safe code can pass null, dangling or a live
+  `String`'s address, and the kernel writes handle numbers over it, corrupting the heap with no
+  `unsafe` at the caller. The kernel rejects only null, misaligned or out-of-user-half pointers.
+  Today every caller passes `&raw mut` of a matching static (spawn_with_control: 549, 578;
+  make_channel: 347, 379, 425, 722). init's equivalent `spawn_program` is correctly an `unsafe
+  fn`, and the other crates' `make_channel(depth)` use locals. Demonstrated: probes calling
+  `spawn_with_control(0, b"/bin/x", core::ptr::null_mut())` and `make_channel(dangling, dangling)`
+  from safe fns built clean for `x86_64-unknown-nitrox`. A positive control in service-mgr (a
+  `u8 = "str"` mismatch) gave `E0308`, so the bin is type-checked. Probes restored. abi,
+  ownership, soundness, opportunities. Low.
+- [ ] **sup-d7** `userspace/storage-service/src/main.rs:399` — `DeviceIo::read_at`'s SAFETY
+  argument `intra + want <= span <= SCRATCH` does not hold, because the record's
+  `logical_block_size` is taken unvalidated from a USB stick's READ CAPACITY (kernel scsi.rs:96,
+  `try_new_block`). A 520-byte block at offset 0 with a 64 KiB read gives `span` = 66040 > 65536.
+  A 128 KiB block gives `span` = 131072, and at offset 70000 `SCRATCH - intra` (line 379) wraps in
+  release and panics in debug. The slice at 401 is sound only because the kernel refuses an `IoOp`
+  whose `buf_offset + length` passes the buffer (table.rs:1650) and the code requires `moved ==
+  span`, and the comment states neither. Today such a stick's reads fail with `FsError::Io`, so
+  every probe of it reads as empty. A change that maps the scratch larger than its object, or
+  drops the `moved != span` check, would read past the mapping. Demonstrated: the lines 377-380
+  arithmetic replayed in Python gives span 66000 (3000), 66040 (520) and 131072 (131072), all
+  `span<=SCRATCH` False, and True for 512 and 4096. abi, soundness, opportunities. Low.
+- [ ] **sup-d8** `userspace/init/src/main.rs:181` — init maps exactly one page of
+  `/initramfs/etc/init.toml` ("assumed to fit") and parses to the last non-NUL byte of that page,
+  while the storage service maps the object's whole `HandleInfo.size` (main.rs:313-321, 457-459),
+  so the two consumers `libinittoml` exists to keep in agreement read different text. A manifest
+  over 4096 bytes cut at an entry boundary has init mounting only the first page's entries, while
+  the storage service parses all of them, believes the rest are init's, and mounts those devices
+  nowhere. Cut mid-entry, init drops to eshell for a valid manifest. Today's manifest is about 200
+  bytes (tools/xtask/src/image.rs:38), so this is latent. Demonstrated: a temporary test in
+  `libinittoml/src/manifest.rs` with a comment-padded manifest whose first `[[mount]]` ends at
+  byte 4096, run as `cargo test -p libinittoml --lib probe_a_manifest_past_one_page`, printed
+  "init (one page) sees 1 mount(s); the storage service (whole object) sees 2". The kernel maps a
+  prefix of a larger object without complaint (table.rs:878). Test removed. abi, opportunities.
+  Low.
+- [ ] **sup-d9** `userspace/init/src/main.rs:181` — init maps the init.toml page (181/189) and
+  `/system/current-generation` (577/585) and never unmaps either, so PID 1 keeps both mappings,
+  and the second pins a root-filesystem FileObject through shutdown's sync and `Meta::Unmount` of
+  `/`. libos `Memory::map` returns a raw `*mut u8` documented "valid while `self` lives", but the
+  kernel mapping outlives the handle. read_manifest's comment at 239-240 says the mapping was kept
+  on purpose; read_current_generation has no such comment. Demonstrated: `grep -n -i
+  'unmap\|MEMORY_MAP\|\.map(' userspace/init/src/main.rs` finds the two maps and no unmap.
+  ownership, opportunities. Low.
+- [ ] **sup-d10** `userspace/device-mgr/src/main.rs:176` — `read_registry` and `read_io` (176,
+  204) and storage-service `with_mapped` (main.rs:327) unmap with size 0, which works only because
+  `sys_memory_unmap` ignores `size` today (table.rs:949, `_size` unused). syscall-abi.md:529 says
+  the size "is not yet honored" and plans to. Once honoured, every hotplug re-read, every `io.tsm`
+  resolve and every manifest read would leave a mapping that pins a snapshot object. The same
+  files pass the real length elsewhere (device-mgr 226, storage 486). Latent until that kernel
+  change. Demonstrated: the three call sites pass 0 and the kernel ignores it, by code read. No
+  test can run it today. ownership, opportunities. Low.
+- [ ] **sup-d11** `userspace/device-mgr/src/main.rs:654` — the `/dev/registry/changes` handle is
+  dropped without a close when the change page cannot be created or mapped: the struct literal
+  stores `changes: if change_at == 0 { 0 } else { changes }` and the other arm never closes it, so
+  the handle stays in device-mgr's table for its life. This is reached when `SYS_MEMORY_CREATE` or
+  `SYS_MEMORY_MAP` fails at startup. Demonstrated: code read of main.rs:637-654. ownership. Low.
+- [ ] **sup-d12** `userspace/device-mgr/src/main.rs:694` — the main loops of device-mgr (694-731)
+  and storage-service (main.rs:1477-1519) read wait record `j` lazily from `static mut
+  WAIT_RESULTS` after the handlers for earlier records have run nested waits (`lookup`, `po_wait`,
+  `wait_until`, `park`) into the same static. This is correct only because every nested wait has
+  one handle and so rewrites record 0, which the loop has already read. A nested wait that takes
+  two handles is the ordinary change that breaks it: `lookup` that also answers its endpoint while
+  it waits (the `lookup_serving` pattern service-mgr's CLAUDE.md requires), or `wait_ready` plus a
+  timer. Records j+1.. are then overwritten, and the loop dispatches on another wait's handle and
+  status, for example `follow(status)` with a lookup's status. Paths: device-mgr `follow` ->
+  `read_registry` -> `lookup` (142), `arrived` -> `lookup`, `serve_resolve(io)` -> `read_io` ->
+  `lookup`; storage `serve_resolve(File)` -> `refresh_unmounted` -> `read_at` -> `po_wait` (155),
+  `unmount` -> `held_files` -> `park` -> `wait_until` (132). service-mgr already uses a stack
+  buffer in `wait_serving`. Unverified: main.rs is not host-testable. A host test of an extracted
+  dispatch with a two-handle nested wait would settle it. abi, ownership. Low.
+- [ ] **sup-d13** `userspace/storage-service/src/main.rs:161` — `po_wait` closes the PO and
+  reports failure when `sys_wait` returns without it signalled, though the read it waited on may
+  still be in flight into the shared Scratch object. `read_at` returns `Err(Io)` and the next
+  `read_at` submits into the same buffer at offset 0 while the first IRP can still write there.
+  The `&[u8]` formed at line 401 for the second read then covers bytes the device is still
+  writing, and the probe or partition-table parse can read the first transfer's data. A trigger is
+  `sys_wait` returning `OutOfMemory` from waiter registration (kernel sched/wait.rs:182-190). This
+  is the class of #396's early `Ended`. Unverified: needs fault injection that fails
+  `obj_add_waiter` for one PO while its IRP is in flight, then a check of what the next read
+  returns. No boot was run; widening a window is not allowed. A host test faking a wait that
+  returns unsignalled and then submitting a second read into the same Scratch would show it.
+  ownership, soundness. Low.
+- [ ] **sup-d14** `userspace/init/src/main.rs:692` — handoffs are read by position, and a handoff
+  whose send fails is closed with nothing sent in its place, so every later handle shifts one
+  slot. The code sends an empty message for a zero handle but not for a failed send. Same in
+  service-mgr `send_handle` (478-481) for the nine login-chain handoffs. If init's first send
+  fails (kernel OOM on the bounce allocation, or a handle without TRANSFER, table.rs:1962-1976),
+  service-mgr takes the fs endpoint as its bind-righted root (619-623), so every bind fails. It
+  takes the profile endpoint as fs, so each session binds `/home` to the profile server, and the
+  third receive waits 30 s. A failed tty send to session-mgr shifts clip into tty, and so on.
+  Unverified: needs a send failure injected mid-sequence. Read of init main.rs:676-699 and
+  service-mgr 463-482, 556-560 and 584-586. ownership. Low.
+
+**Opportunities**
+
+- [ ] **sup-o1** encapsulate: one safe `Result`-returning wrapper per register-only, slice-input
+  or owned-out-param syscall, where each site today is its own `unsafe` block whose SAFETY
+  argument is only handle ownership — 154 sites (`grep -ohE 'syscall[0-9]\(\s*SYS_[A-Z_]+'` plus
+  `grep -A1 'syscall[0-9]\($'` for the 17 multi-line calls, over the six source files: 160 raw
+  syscalls, less the 6 `SYS_MEMORY_UNMAP`, which the mapping guard takes), such as
+  `userspace/init/src/main.rs:335`, `userspace/service-mgr/src/main.rs:597`,
+  `userspace/logging-service/src/main.rs:169`, `userspace/device-mgr/src/main.rs:156`. Of them, 78
+  are register-only (46 handle close, 9 map, 8 duplicate, 5 memory create, 2 terminate, 2 exit, 2
+  ns_create, timer x2, power, test_exit) and 76 pass pointers to locals or slices. The wrappers
+  are `handle_close(h)`, `handle_duplicate(h, rights) -> Result<u64>`, `handle_stat(h) ->
+  Result<HandleInfo>`, `channel_create(depth) -> Result<(u64, u64)>`, `clock_read(clock) ->
+  Result<u64>`, `ns_lookup/bind/unbind/sync/held(ns, &[u8], ..)`, `ns_create`, `memory_create`,
+  `process_terminate`, `notif_recv`, `timer_*`, `power`; checked against init's three channel
+  creates, logging `make_channel`, service-mgr `dup_endpoint` and device-mgr's stat-then-map.
+  Home: libos, its `sys` seam made public (it already holds 11 of these over the host mock), or
+  libkern, whose CLAUDE.md already asks for "thin Result<> wrappers" that do not exist. Five
+  crates re-implement the same helpers (22 redefinitions: `close` x4, `make_channel` x4,
+  `now_ns`/`clock_now` x4, `kprint`, `exit`). Closes: safe functions that have the kernel write
+  through a caller's raw pointer (sup-d6); static out-params; `unsafe fn`s whose contract is not
+  memory (`dup_endpoint`, `close_retained_endpoints`). It leaves `unsafe` only where memory
+  crosses: wait, send/recv, map, spawn. Depends on: Part E's syscall changes, so callers move
+  once (they would rename wrappers, not add sites). abi, soundness, opportunities. Value high,
+  effort medium.
+- [ ] **sup-o2** encapsulate: raw `u64` handles owned by convention and closed by hand at each
+  exit, in locals, struct fields, `Vec<u64>`s and handle-holding statics — 143 manual close
+  points (`grep -nE '(^|[^_a-z.])close\(' <the six files> | grep -v 'fn close('` = 101 helper
+  calls, plus `grep -n SYS_HANDLE_CLOSE` = 46 raw closes less the 4 inside the helpers = 42), such
+  as `userspace/init/src/main.rs:337-421` (`mount_one`'s five failure paths each close a different
+  subset, and none closes `fs_h`), `userspace/service-mgr/src/main.rs:1545-1575` (`reap`),
+  `userspace/storage-service/src/main.rs:1016` (Mount's `ns`, `control` and `process` closed by
+  hand at each of three ends), `userspace/device-mgr/src/main.rs:525`. Use libos's owning
+  `Handle<T, M>` (Drop closes) with the `Channel` marker and `Send/Recv/SendRecv` modes that
+  `libos.md` designs and libos lacks (`grep Channel libos/src` finds none), an owning `Received`
+  that yields `Handle`s, and a `send(msg, handles)` that consumes what it moves and returns it on
+  failure. `Mount`, `Supervised` and `Vec<Handle>` then end by drop. Home: libos (handle.rs,
+  objects.rs). Closes: handles leaked on error paths (sup-d5, sup-d11) and overwrite leaks
+  (sup-d3), and double closes made possible by copied teardown. Generation numbers already make a
+  double close harmless, so leaks are the class closed. Depends on: sup-o1 and the send API in
+  sup-o4, and Part E. ownership, opportunities. Value high, effort large.
+- [ ] **sup-o3** remove: `static mut` used as scratch, out-param, spawn block or process state
+  where a local or a struct field does the same job — 51 sites (`grep -n '^static mut'` over the
+  five mains: init 16, service-mgr 15, logging 10, device-mgr 5, storage 5), such as
+  `userspace/service-mgr/src/main.rs:182` (CTRL_OUT0/1 read back through raw pointers, while
+  `make_channel` at 686 in the same file uses locals), `userspace/init/src/main.rs:67-112` (four
+  static SpawnArgs, where storage-service `mounting.rs:24` builds a local),
+  `userspace/service-mgr/src/main.rs:169-172` (CLOCK_BUF for one clock read),
+  `userspace/init/src/main.rs:30-31`. These include 11 out-param scalars (CTRL0/1, CTRL_OUT0/1,
+  SRC_OUT0/1, CLOCK_BUF, NOTIF x2), 7 SpawnArgs, 6 state handles and 27 buffers. A classifier over
+  all 225 `unsafe {` blocks found 39 whose only unsafe operation is a static access and 55 more
+  where it is half of the unsafety. Out-params become locals, and process state becomes fields of
+  an `Init` struct like service-mgr's `Mgr`. Buffers become owned by the loop struct
+  (`Box<[u8; 4096]>`) or the stack, which is 8 MiB (kernel arch/x86_64/abi.rs:26). Home: each
+  crate's main.rs. Closes: reentrancy through a shared buffer (sup-d12), ownership by convention
+  in init's state statics, and the static that makes `received() -> Message<'static>` (sup-d1)
+  possible. Depends on: nothing. opportunities, ownership. Value high, effort medium.
+- [ ] **sup-o4** encapsulate: IPC messages through `static mut [u8; 4096]` buffers, the header
+  parsed by byte offset, the payload sliced with `from_raw_parts(add(24), len.min(4072))`, sends
+  framed by hand into `[24..]` — 34 sites (`grep -rn "channel_recv_raw("` = 10 receives, 9
+  payload slices, `grep -rn SYS_CHANNEL_SEND` = 15 sends; they serve 17 buffer statics), such as
+  `userspace/logging-service/src/main.rs:392`, `userspace/storage-service/src/main.rs:285`,
+  `userspace/service-mgr/src/main.rs:715`, `userspace/init/src/main.rs:364`. Each server owns a
+  `MsgBuf`/`Box<IpcMsg>`. libkern's `IpcMsg` gains `payload(&self) -> &[u8]` clamped to
+  `IPC_PAYLOAD_SIZE` and `frame(&mut self, op, request_id, flags, body, handle_count) ->
+  Option<()>`. `channel_recv(ch, &mut IpcMsg) -> Result<Received, i64>` hands out views borrowed
+  from the buffer. A safe `channel_send(ch, &IpcMsg, handles, mode)` hands handles back on
+  failure, with a `librsproto::Body` of exactly `RS_MAX_BODY` for writers such as
+  `DirReplyWriter`. Checked against device-mgr `send`/`recv`, init `wait_ready`, logging
+  `reply_records` and `drain_source`. Home: libkern (`channel`, `abi::IpcMsg`) beside the existing
+  `channel_recv` and `Received`, with a librsproto reply helper above it. Closes: a `'static`
+  borrow of a receive buffer held across the next receive (sup-d1), a body buffer sized as the
+  payload (sup-d2), the 4072-vs-4008 payload clamp at 10 sites including libkern `control.rs:33`,
+  stale header flags carried from a receive into the next send through one static (init
+  `IPC_MSG`), and positional handoffs with nowhere to send a placeholder (sup-d14). Depends on:
+  nothing; easier after sup-o1. abi, ownership, soundness, opportunities. Value high, effort
+  medium.
+- [ ] **sup-o5** encapsulate: `sys_wait` through static `WAIT_HANDLES`/`WAIT_RESULTS`, each
+  `IoResult` decoded by byte offset (status at 8..12, result at 16..24) — 14 sites (`grep -rn
+  SYS_WAIT` over the five src dirs: init 4, service-mgr 4, storage 3, device-mgr 2, logging 1; 13
+  through the 10 static buffers, one through locals at service-mgr:1342; 9 hand-decoders), such as
+  `userspace/init/src/main.rs:122-143`, `userspace/device-mgr/src/main.rs:692-701`,
+  `userspace/storage-service/src/main.rs:151-160`, `userspace/service-mgr/src/main.rs:1331-1346`.
+  `wait<'r>(handles: &[u64], out: &'r mut [IoResult; MAX_WAIT_HANDLES], deadline) -> Result<&'r
+  [IoResult], KError>` refuses `handles.len() > MAX_WAIT_HANDLES` and returns typed results.
+  Add a `WaitSet<const N>` whose `push(h) -> Result<(), Full>` replaces the silent drop past 32
+  (service-mgr, device-mgr, storage) and the panic past it (logging), and a `wait_one(h, deadline)`
+  for nested waits. Results come back as a borrowed slice of a caller-owned array, so the borrow
+  checker forbids a nested wait clobbering an outer loop's records. Checked against init
+  `ns_lookup_wait`, device-mgr's dispatch loop, service-mgr `wait_serving` and storage `po_wait`.
+  Home: libos (`sys::wait` exists privately, without the length check). Closes: nested waits
+  overwriting an outer loop's results (sup-d12); status read at the wrong width, as storage
+  main.rs:157 records ("read whole, AlreadyExists would never compare equal"); results buffers
+  sized by expectation; a handle dropped silently at capacity. It removes all 10 wait statics.
+  Depends on: nothing (sup-o1 helps). abi, ownership, soundness, opportunities. Value high, effort
+  medium.
+- [ ] **sup-o6** encapsulate: each server hand-writes the same reply plumbing (send, `reply_error`,
+  `reply_channel`, `reply_with_object`/`reply_table`, `reply_subnamespace`, `serve_dir`), and the
+  copies have drifted on the rules each must keep — 19 sites (`grep -nE 'fn
+  (send|send_raw|send_rs|reply_error|reply_channel|reply_with_object|reply_table|reply_subnamespace|serve_dir)\b'`;
+  15 header writes by byte offset), such as `userspace/device-mgr/src/main.rs:209`,
+  `userspace/storage-service/src/main.rs:214`, `userspace/storage-service/src/main.rs:1115`,
+  `userspace/service-mgr/src/main.rs:795`. One difference is that device-mgr's `reply_with_object`
+  and `reply_channel` callers (318-324, 352-356, 378-383) close and answer nothing on a failed
+  send, though a forwarded resolve waits with no deadline, while storage's `reply_with_handle` and
+  service-mgr's `reply_channel` answer an error. Another is that service-mgr's `refuse` uses a
+  fixed `ERROR_BODY_LEN + 160` body where storage's `error_reply` (1315) sizes to the reason after
+  a 108-byte reason was lost. A `librsproto::server` module offers `send`, `reply_error` sized to
+  the reason, `reply_object(ch, id, bytes)` (create, map, copy, unmap, narrow, send, error reply
+  on any failure), `reply_handle` that answers an error when the send fails,
+  `reply_subnamespace`, and a `serve_read_dir` bounded by `RS_MAX_BODY`. Checked against the three
+  `reply_with_object` copies, the four `reply_error` copies and the two `serve_dir`s. Home:
+  librsproto (server-side module; the four servers link it, init does not serve). Closes: bodies
+  sized against the wrong bound (sup-d2), a failed reply that hangs a forwarded resolve, and IPC
+  header bytes stamped by offset at 15 sites. Depends on: sup-o4 and sup-o7. opportunities. Value
+  medium, effort medium.
+- [ ] **sup-o7** encapsulate: memory mapped by hand (stat, map, `from_raw_parts` or
+  `copy_nonoverlapping`, unmap with a caller-supplied length, or never) — 10 map sites with 6
+  unmaps (`grep -rn "SYS_MEMORY_MAP\|SYS_MEMORY_UNMAP\|\.map(PAGE"` over the five src dirs; 6
+  mapping slices at init 189 and 585, device-mgr 170 and 201, storage 325 and 401, and 3
+  create-map-copy-unmap reply copies at service-mgr 825-861, device-mgr 209-232, storage
+  469-490), such as `userspace/init/src/main.rs:181`, `userspace/device-mgr/src/main.rs:151`,
+  `userspace/storage-service/src/main.rs:313`, `userspace/service-mgr/src/main.rs:825`. A libos
+  `Mapping` guard holds `(NonNull<u8>, len)`, derefs to `[u8]` of exactly the mapped length,
+  unmaps its own length on Drop, and does not borrow the handle (storage's Scratch legitimately
+  outlives it). `Handle<Memory, M>::map_whole(&self)` sizes from `sys_handle_stat`, and `with_mapped`
+  and `Memory::from_bytes(&[u8], rights)` (create, fill, unmap, narrow) cover the copies. It
+  replaces libos's `map -> *mut u8` and its safe `unmap(addr, len)`, which lets safe code unmap
+  any address. Checked against init `read_manifest`, device-mgr `read_registry` and storage
+  `with_mapped`. Home: libos (`objects.rs`, beside `Handle<Memory, M>::map`). Closes: mappings
+  never unmapped (sup-d9); unmaps that rely on the kernel ignoring the size (sup-d10); a one-page
+  read of a larger file (sup-d8); a slice longer than its mapping (sup-d7, sound today only by the
+  kernel's check); a slice outliving its unmap; and reply-copy drift, since service-mgr narrows
+  the object it hands out and the other two send the creation handle, harmless only because the
+  kernel installs requested and granted rights intersected. Depends on: nothing. abi, ownership,
+  soundness, opportunities. Value medium, effort small.
+- [ ] **sup-o8** encapsulate: a hand-written "`sys_ns_lookup`, wait on the PO, read the result at
+  16..24, close the PO" helper per crate, each closing the PO whether or not the lookup completed
+  — 5 sites (`grep -rnE "^fn (ns_lookup_wait|ns_lookup|lookup)\("` gives 4, plus service-mgr
+  `lookup_serving`, which must keep answering routes while it waits), such as
+  `userspace/init/src/main.rs:116`, `userspace/service-mgr/src/main.rs:110`,
+  `userspace/device-mgr/src/main.rs:133`, `userspace/storage-service/src/main.rs:304`.
+  `libfs::lookup_wait(ns, path, rights) -> (i32, u64)` (libfs/src/lib.rs:358) already exists and
+  is safe; service-mgr links libfs, and device-mgr and storage would add it. init, which libfs's
+  layer is closed to, uses libos `Namespace::lookup` + `block_on` as it already does at main.rs:570.
+  The timeout case also needs a kernel half: a forwarded lookup whose PO has no userspace handle
+  left drops its result instead of installing it. Home: libfs (existing) and libos for init, plus
+  the kernel's `complete_resolve_reply` (table.rs). Closes: three `unsafe` blocks and the
+  byte-offset status decode per copy, and results orphaned by a PO closed before completion
+  (sup-d4 and its siblings). Depends on: nothing for the dedup; a kernel change to `sys_ns_lookup`
+  completion (Part E's syscall surface) for the timeout case. ownership, soundness. Value medium,
+  effort small for the dedup, medium with the kernel half.
+- [ ] **sup-o9** encapsulate: the five event loops (init `reap_loop`, service-mgr `Mgr::run`,
+  device-mgr and storage-service `_start` loops, logging `serve_loop`) hold all 225 unsafe blocks,
+  and no host test or Miri reaches any of them — 5 sites (per-file `grep -c unsafe`: 0 in every
+  lib.rs, ready.rs, unmount.rs, probe.rs, ring.rs, path.rs, service_toml.rs and libinittoml; 225
+  in the five `#![no_main]` main.rs files plus storage `mounting.rs`), such as
+  `userspace/service-mgr/src/main.rs:1057-1112`,
+  `userspace/storage-service/src/main.rs:1456-1525`,
+  `userspace/device-mgr/src/main.rs:663-733`, `userspace/logging-service/src/main.rs:622-714`.
+  Write each loop's dispatch against libos's typed calls (sup-o5, sup-o4, sup-o7), whose `sys`
+  seam already swaps in a scriptable mock under `cfg(test)`, so each state struct (`Mgr`,
+  `Manager`, `Service`) moves into its lib and a host test or Miri drives it with scripted
+  messages, exits, late Readys and closed peers. Home: libos (the `sys` mock grown to channels and
+  multi-handle waits) and each crate's lib.rs. Closes: the absence of any CI reach into this
+  `unsafe`. It would have reached three of this survey's defects (sup-d1, sup-d2, sup-d4) without
+  a boot. Depends on: sup-o1, sup-o2, sup-o5. opportunities. Value medium, effort large.
+- [ ] **sup-o10** remove: `SpawnArgs` kept as `static mut` templates, stamped in place and spawned
+  through a raw pointer (an `unsafe fn` in init, a safe fn over `*mut` in service-mgr) — 4 spawn
+  calls carrying 7 static SpawnArgs (`grep -n 'SYS_PROCESS_SPAWN\|static mut SPAWN'`: init 166,
+  service-mgr 371 and 422, storage `mounting.rs` 36; init 4 statics, service-mgr 3), such as
+  `userspace/init/src/main.rs:157`, `userspace/service-mgr/src/main.rs:402`,
+  `userspace/service-mgr/src/main.rs:354`, `userspace/storage-service/src/mounting.rs:25`. Build
+  `SpawnArgs` as locals from `const` templates, as storage `mounting.rs` already does, and call
+  `libos::spawn(&SpawnArgs) -> Result<Handle<Process, Only>>`, which exists and is safe. An
+  optional builder over owned handles hands moved handles back on failure. The returned handle
+  owns the process, so it is stored or dropped (closed). Checked against init `spawn_program`,
+  service-mgr `spawn_service` and storage `mounting::spawn`. Home: libos (`objects::spawn`,
+  existing; device-mgr, storage, logging and service-mgr add the dependency, init has it).
+  Closes: process handles discarded unclosed (sup-d5); the safe `spawn_with_control(*mut
+  SpawnArgs)` (sup-d6); fields carried between spawns in a shared static (SPAWN_SERVICE's
+  `handles[0]`/`rights[0]` keep the previous child's values, masked today by `handle_count = 0`).
+  It removes 7 statics and 1 `unsafe fn`. Depends on: nothing (the builder wants owned handles
+  from sup-o2). abi, ownership, soundness, opportunities. Value medium, effort small.
+- [ ] **sup-o11** remove: local redefinitions of operations that already have a safe form —
+  `kprint` over raw `SYS_DEBUG_KPRINT`, `exit` over raw `SYS_PROCESS_EXIT`, and an `asm!("pause")`
+  loop — 5 sites (`grep -n 'fn kprint\|fn exit\|SYS_PROCESS_EXIT\|asm!'` over the mains), such as
+  `userspace/service-mgr/src/main.rs:94`, `userspace/logging-service/src/main.rs:141`,
+  `userspace/logging-service/src/main.rs:146`, `userspace/init/src/main.rs:1021`. Use
+  `libkern::debug::{kprint, exit}` (device-mgr and storage already do) and
+  `core::hint::spin_loop()` (service-mgr 2247 and logging 150 already do). Home: libkern::debug /
+  core. Closes: three `unsafe` blocks and the subsystem's only inline assembly. Depends on:
+  nothing. opportunities. Value low, effort small.
+- [ ] **sup-o12** encapsulate: `ChildExited` decoded by byte offset from a static `Notification`
+  (pid at body[0..4], code at body[8..12]), ignoring `ExitStatus.kind` — 2 sites (`grep -n
+  'KIND_CHILD_EXITED'` over the mains), `userspace/init/src/main.rs:777-780` and
+  `userspace/service-mgr/src/main.rs:2193-2198`, with the layout in
+  `docs/spec/notification-format.md:108-112`. `Notification::child_exited(&self) ->
+  Option<ChildExited { pid: u32, status: ExitStatus { kind, code } }>` on the libkern ABI type,
+  plus libos `Handle<Notify, Only>::recv() -> Result<Option<Notification>>` with a local
+  out-value. Home: libkern `abi.rs` (the accessor) and libos `objects.rs`. Closes:
+  byte-offset decoding of a kernel ABI body at each consumer, and the crash-read-as-exit-code
+  confusion that service-mgr's `should_restart` inherits. Depends on: nothing. opportunities.
+  Value low, effort small.
+
+What held up: every receive buffer holds a whole message (all 4096-byte, kernel copies exactly
+`IPC_MSG_SIZE`), and every `sys_wait` results buffer holds 24 bytes per waitable handle with each
+wait set within 32 (service-mgr's budget is held by a lib test). Payload slices clamp to 4072,
+the wrong bound against 4008, but harmless because `seal()` refuses over 4008 on send. Hand-decoded
+`IoResult`, `ChildExited` and init's rsproto Ready/Unmount offsets match the kernel and
+`librsproto::encode`, and init's tests pin the constants. All ten `channel_recv_raw` sites go
+through `libkern::Received`, so no arrived handle leaks. Failed NOBLOCK sends and failed spawns
+leave the sender's handles in place (kernel table.rs:1939-2015, 340-516), so every close-on-failure
+is a single close, and the 31-bit handle generation makes a stale value refused rather than
+aliasing. All five processes are single-threaded, no reference to a static is alive across a write
+to it at any current site, and entry stack alignment is right for the hard-float target. Mapped
+snapshots are sized by `HandleInfo.size` and parsed by header count, and the volatile change-page
+read follows a completed PO. `with_mapped`'s closure cannot let the slice escape. The kernel
+attenuates forwarded-reply handles to requested and granted rights intersected, so the full-rights
+handles device-mgr and storage reply with amplify nothing. The scope was wrong in three places:
+logging's ring is a process-local `Ring` and its two raw derefs (the `READ_BODY` scratch) are
+sound, storage-service `probe.rs` has no `unsafe` (the device reads are `DeviceIo` in main.rs),
+and `libinittoml`, `service_toml.rs` and every `lib.rs` are safe Rust. None of the 225 `unsafe`
+blocks is reached by a host test or Miri.
