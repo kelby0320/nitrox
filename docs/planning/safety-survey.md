@@ -5004,3 +5004,323 @@ What held up:
   crate's `main.rs` with no host test, so no test can reach desk-d1, d3, d6 to d10. desk-o1, o3 and
   o5, in libos behind its `sys.rs` mock, would make close-on-every-path and unmap-on-every-path
   testable.
+
+### shell — main at 135055a8, 2026-10-27
+
+Lenses: abi, ownership, soundness, opportunities; returned nothing: none.
+Defects: found 32, refuted by a boot 0, reported 13. Opportunities: 12.
+
+The inventory, `cargo xtask unsafe-inventory` over its paths:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `userspace/nxsh` | 7392 | 62 | 0 | 0 | 10 | 43 | 8 | 0 | 0 | 0 | 0 |
+| `userspace/coreutils` | 4340 | 40 | 0 | 0 | 6 | 35 | 2 | 0 | 0 | 0 | 0 |
+| `userspace/tty-server` | 887 | 38 | 0 | 0 | 9 | 29 | 3 | 0 | 0 | 0 | 1 |
+| `userspace/libline` | 306 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/eshell` | 291 | 23 | 0 | 0 | 2 | 18 | 2 | 0 | 0 | 1 | 1 |
+| `userspace/nxinstall` | 1155 | 22 | 1 | 0 | 7 | 15 | 3 | 4 | 0 | 0 | 0 |
+| `userspace/profile-server` | 581 | 35 | 0 | 0 | 11 | 17 | 3 | 2 | 0 | 0 | 0 |
+| `total` | 14952 | 220 | 1 | 0 | 45 | 157 | 21 | 6 | 0 | 1 | 2 |
+
+**Defects**
+
+- [ ] **sh-d1** `userspace/tty-server/src/main.rs:449` — OP_TTY_ATTACH_BACKEND puts whatever
+  handle a client sent into the serve loop's wait set without checking its object type or rights.
+  Any process holding a terminal (a session's /dev/tty, or the sibling nxsh hands each stage)
+  sends AttachBackend carrying a MemoryObject (TRANSFER but no WAIT) or a channel end restricted
+  to drop WAIT. tty-server replies OK and adds the handle to WAIT_HANDLES (569-571). Kernel
+  sys_wait looks every handle up with Rights::WAIT and fails the whole call (table.rs:1783-1793),
+  so main.rs:584 `continue`s and rebuilds the same set for ever. tty-server (essential, restart
+  never) spins at 100% CPU and serves no terminal again, the console login and nxterm windows
+  included; the bad backend is never removed because removal needs the loop to serve.
+  Demonstrated: path read on 135055a8 by all four lenses (main.rs:443-451 checks only
+  `handle != 0`; lib.rs:321-329 stores any u64; the kernel lines above); not booted. A boot gate
+  that sends AttachBackend with a memory object and then writes to a terminal would show the
+  spin. abi, ownership, soundness, opportunities. High.
+- [ ] **sh-d2** `userspace/profile-server/src/main.rs:294` — profile-server forwards the client's
+  requested rights, MAP_WRITE included, into its own root-namespace lookup of the store file and
+  re-exports the handle, so a store binary may be reachable writable by any process with /bin or
+  /applications bound. A session program calls sys_ns_lookup(session_ns, "/bin/list",
+  MAP_READ|MAP_WRITE); main.rs:599 passes requested_rights to resolve_in_store, which adds only
+  TRANSFER (294) before ns_lookup on root_ns through init's read-write mount. The caller gets a
+  MAP_WRITE handle to the shared page-cache object of a system binary, visible to every later
+  spawn, and to disk with SYS_FILE_SYNC. This contradicts
+  docs/architecture/profiles-and-namespace-projection.md (store as LOOKUP|READ|MAP_READ) and
+  sidesteps TODO(mount-write-authority). Unverified: traced on paper (kernel table.rs:1538
+  ignores binding rights for a userspace-server binding; rsproto.rs:115 file_blocks_rights keeps
+  MAP_WRITE on a writable device). To settle it, boot a session, look up /bin/<prog> with
+  MAP_WRITE, map it writable, write one byte and read it from another process; the control is
+  masking requested_rights to READ|MAP_READ|MAP_EXEC|INSPECT before line 294. opportunities.
+  High.
+- [ ] **sh-d3** `userspace/nxsh/src/main.rs:297` — Host::run's early returns close nothing and
+  stop nothing. Setup send refused after the spawn (292-297, closes only `terminal`), a capture
+  over MAX_CAPTURE (417-418, skipping rx close 424, reap 427, err_rx close 432), a pipe `?` at
+  241/245/246 and a spawn failure at 259 each leak every pipe, the diagnostic channel,
+  setup_shell and the process handles, and leave the spawned stages running. `touch /x (s)` with
+  a 4,497-byte argv: send_setup_full's encode() returns SetupTooLarge before any syscall, seven
+  handles leak, and `touch` blocks for ever in recv_setup because setup_shell is still open. A
+  stage writing over 1 MiB blocks for ever on a pipe whose reader nxsh holds, and keeps its
+  sibling terminal, one of tty-server's 14 machine-wide slots; about a dozen occurrences make
+  /dev/tty refuse every new terminal. A leftover ChildExited can also be counted by a later
+  pipeline's reap, ending it early with the wrong status (unverified). A file starting `\x7fELF`
+  that is not a static ET_EXEC makes the spawn fail and leaks the same set. Demonstrated: a
+  temporary MockHost host test (removed) handed Host::run a 4,497-byte argv and SetupPayload::
+  encode returned Err(SetupTooLarge); `list <5000 x>` reached Host::run unchecked; paths read at
+  the lines above; stranded processes and tty-server's terminal count need a boot to see.
+  abi, ownership, soundness, opportunities. Medium.
+- [ ] **sh-d4** `userspace/tty-server/src/main.rs:624` — The console read's PendingOperation is
+  never closed: each completed read sets `read_po = 0` and submits another, leaking one PO handle
+  and kernel object per console read in an essential server that is never restarted. Every
+  keystroke burst on the serial console, and every failed read, leaks one; at handle exhaustion
+  sys_io_submit fails and console input, Ctrl-C included, stops for good. Demonstrated: path
+  pointed at and grep run (`read_po` appears only at 521, 530, 542, 573-574, 616, 624, none
+  closing it); kernel sys_wait reports a PO's completion without closing it (table.rs:1763-1843);
+  eshell's po_wait (main.rs:54) and tty-server's own po_wait (172-173) close theirs. Not booted;
+  counting handles per keystroke would show it. abi, ownership, soundness, opportunities. Medium.
+- [ ] **sh-d5** `userspace/tty-server/src/main.rs:450` — attach_backend returns the previous
+  backend's channel for the caller to close, and the serve loop drops it with `Some(_)`. A second
+  AttachBackend on one terminal retires the first backend (lib.rs:327, 332-342) and tty-server
+  keeps its handle open for ever outside the wait set; the first emulator never sees PeerClosed,
+  against rsproto-tty-ops.md § Lifetime, and a loop of attaches grows the handle table without
+  bound. Demonstrated: `cargo test -p tty-server --lib re_pointing_a_terminal_hands_back_the_
+  backend_it_left` passes, asserting `Some(0xAAA)` comes back; main.rs:449-453 binds it to `_`
+  and closes only in the None arm; attach_backend's own doc says dropping it would leak.
+  abi, ownership, soundness, opportunities. Medium.
+- [ ] **sh-d6** `userspace/nxsh/src/main.rs:469` — `save` (Host::write_file) creates at
+  bytes.len() through SYS_FILE_CREATE, which only grows, so saving over a longer file keeps the
+  old tail, and a 0-byte save creates the file and then fails at the size-0 map with 'cannot
+  map'. `save` 100 bytes then 10 bytes to /home/a.txt leaves 100 bytes; `[] | save /home/e.txt`
+  reports failure for a file that now exists. The SYS_FILE_SYNC result (~504) is also discarded.
+  Demonstrated: `cargo test -p fs-server-ext4 --lib a_grows_reply_marks_the_blocks` passes,
+  asserting a grow to less answers its size (libfsserver volume.rs:81-84 states the contract);
+  nxsh main.rs:472-498 never truncates, the kernel refuses size 0 at table.rs:897, and
+  libfs::write_file (lib.rs:210-251) shrinks first and handles size 0. Not booted. abi,
+  soundness, opportunities. Low.
+- [ ] **sh-d7** `userspace/profile-server/src/main.rs:130` — read_manifest maps and parses
+  exactly one page of the manifest, with no stat of its size, and never unmaps it, so a manifest
+  over 4096 bytes is cut silently and the packages past the cut vanish from /bin while the server
+  logs 'manifest loaded'. A cut `path = "..."` loses its closing quote and is dropped; a cut
+  inside a UTF-8 sequence makes from_utf8 fail and yields no packages. Latent: today's manifest
+  is about 0.5 KiB with three packages (tools/xtask/src/image.rs:199-229); adding packages is
+  the ordinary change that triggers it. Demonstrated: a temporary test (removed) parsed the first
+  4096 bytes of a 40-package, 4,301-byte manifest as read_manifest does and got 38 packages with
+  no error; main.rs:130 maps PAGE, 137 slices PAGE, 141 closes the handle and nothing unmaps.
+  abi, ownership, soundness, opportunities. Low.
+- [ ] **sh-d8** `userspace/nxsh/src/main.rs:452` — Host::read_file maps and copies the file's
+  whole stat size into one Vec with no cap, while stage output is capped at MAX_CAPTURE and
+  libfs::read_file at MAX_COPY (8 MiB). `open` on a multi-GiB file (a sparse file grown towards
+  u32::MAX, or a disk image on a stick) asks for that allocation and may take the login shell
+  down through the panic handler. Unverified: whether the map succeeds at that size and whether
+  the failed allocation panics or aborts; a boot running `open` on a file larger than free RAM
+  settles it. abi, soundness. Low.
+- [ ] **sh-d9** `userspace/eshell/src/main.rs:286` — cmd_lsblk unmaps with size 0, as does
+  coreutils/src/bin/disk.rs:472 (device_info). This is right today only because sys_memory_unmap
+  ignores its size and drops the whole VMA (table.rs:949 takes `_size` unused). syscall-abi.md:529
+  names partial or splitting unmap as a later refinement; once it honours `size`, eshell leaks one
+  mapping per `lsblk` for the life of the shell and disk.rs one per device_info call.
+  Demonstrated: path pointed at (eshell maps info.size at 238, disk.rs maps 4096 at 463). Latent,
+  made to bite by implementing the refinement. ownership. Low.
+- [ ] **sh-d10** `userspace/nxsh/src/main.rs:294` — The SAFETY argument 'the send failed, so the
+  terminal never moved; it is ours to close' is false when send_setup_full fails after its
+  Block-mode send committed (the wait fails, or the PO completes PeerClosed because the stage
+  closed its setup endpoint while the send was held). The handles have moved, and nxsh closes a
+  value it no longer owns; generation counters make the stale value fail InvalidHandle, so it is
+  harmless today only by that. Demonstrated: path pointed at (libstream setup.rs:293-320 returns
+  Err after a committed send; syscall-abi.md § sys_channel_send; kernel ipc_channel.rs:605-620;
+  handle-encoding.md § Generation counter). soundness. Low.
+- [ ] **sh-d11** `userspace/nxsh/src/main.rs:459` — Several sites form a Rust reference over a
+  FileObject's shared page-cache mapping that another process may write at once: `&[u8]` in nxsh
+  read_file (459) and read_head (stage.rs:102), eshell cmd_cat (206), profile-server
+  read_manifest (137), and `&mut [u8]` in nxsh write_file (498). That is undefined behaviour in
+  Rust's model, though the hardware forgives it; libfs::read_file and write_file make the same
+  copies with ptr::copy_nonoverlapping and form no reference. Unverified: needs two processes
+  mapping one file with a write during the copy; no host test reaches these syscall paths and
+  Miri cannot run them. soundness. Low.
+- [ ] **sh-d12** `userspace/nxsh/src/main.rs:84` — `fn signalled(n: i64, handle: u64)` is safe but
+  walks `n` 24-byte records of the 96-byte WAIT_RESULTS through raw pointer arithmetic with no
+  bound, so any n > 4 reads past the static. Latent: every caller passes sys_wait's return for at
+  most 4 handles; waiting on a fifth handle without growing WAIT_RESULTS makes it bite.
+  Demonstrated: Miri on a verbatim copy (removed), `signalled(5, 0xdeadbeef)`, reported 'attempting
+  to access 8 bytes, but got alloc+0x60 which is at or beyond the end of the allocation of size 96
+  bytes'. opportunities. Low.
+- [ ] **sh-d13** `userspace/profile-server/src/main.rs:478` — reply_success ignores a failed
+  send, so the resolved store handle it meant to move stays in profile-server's table and the
+  forwarded resolve is never answered; tty-server open_tty (318-327) answers no error on a failed
+  send either. This breaks the rule libfsserver's send_forwarded keeps (every forwarded request
+  is answered, handles from a refused reply closed). If the kernel refused the reply (OutOfMemory,
+  a handle missing TRANSFER), the client's lookup would wait for ever, as forwarded resolves have
+  no deadline. Unverified: today the handle carries TRANSFER (requested at 294) and the forwarding
+  endpoint completes uncorrelated replies with Ok(0) (kernel table.rs:2146-2151), so no ordinary
+  failure was found; a send with a handle restricted to drop TRANSFER would settle it.
+  opportunities. Low.
+
+**Opportunities**
+
+- [ ] **sh-o1** encapsulate: raw u64 handles closed by hand on every path, and a received handle
+  taken as whatever the server assumes — 54 sites (`grep -rn 'SYS_HANDLE_CLOSE,'` over
+  userspace/{nxsh,coreutils,tty-server,eshell,nxinstall,profile-server}/src, minus imports:
+  nxsh 15, tty-server 12, coreutils 12, eshell 6, profile-server 5, nxinstall 4), such as
+  `userspace/nxsh/src/main.rs:297`, `userspace/tty-server/src/main.rs:450`,
+  `userspace/tty-server/src/main.rs:624`. Use libos's owning `Handle<T, M>` (Drop closes,
+  `into_raw` to move one into a message or spawn), grown with the kinds this subsystem holds and
+  libos lacks (Channel with `create_pair`, send and `recv` returning `Received`, and waitable;
+  `Process::terminate`; Timer; Entropy; File; `handle_stat`) and a PendingOp whose `wait(self)`
+  closes. attach_backend then returns `Option<Handle<Channel, _>>`, which closes when dropped;
+  tty-server's `read_po` becomes an `Option<Op>` that closes on replacement. With a libos `Sys`
+  seam behind it, NitroxHost::run's error paths become host-testable. Checked against
+  NitroxHost::run, disk.rs `write`'s five early-return closes and tty-server attach_backend.
+  Closes: handles and processes leaked on early returns (sh-d3, sh-d4, sh-d5) and closing a
+  handle that already moved (sh-d10). Depends on: libos gaining the wrappers above; eshell is
+  excluded by its CLAUDE.md (6 sites). abi, ownership, soundness, opportunities. Value high,
+  effort large.
+- [ ] **sh-o2** encapsulate: rsproto messages sent and received by hand through `static mut
+  [u8; 4096]` (encode at [24..], payload_len stamped at [4..8], handle_count at [8], handles in
+  a second static, raw SYS_CHANNEL_SEND; receive then `from_raw_parts(MSG + 24,
+  len.min(4096 - 24))` with an unbounded lifetime) — 22 sites (13 sends: `grep -rn
+  "\[4\.\.8\]\.copy_from_slice\|\[OFF_PAYLOAD_LEN\.\."` over the six crates; 9 receives: `grep -rnE
+  "(TTY|RECV|ERR)_MSG\[4\], "` over nxsh, tty-server, profile-server), such as
+  `userspace/tty-server/src/main.rs:415`, `userspace/tty-server/src/main.rs:245`,
+  `userspace/profile-server/src/main.rs:407`, `userspace/nxsh/src/main.rs:979`.
+  `librsproto::io::MsgBuf` (one page, boxed or in a static): `recv(&mut self, ch) ->
+  Result<(Message<'_>, Received), i64>` clamps payload_len to IPC_PAYLOAD_SIZE and borrows the
+  buffer; `send(&mut self, ch, op, request_id, flags, body, handles: &[u64], mode)` derives
+  payload_len and the handle count from its arguments and, on a refused send, hands back the
+  handles that did not move (the shape of libfsserver's send_forwarded). libprompt::ipc's
+  send/recv move down into it. Checked against tty-server serve_tty and open_sibling,
+  profile-server serve_session and nxsh tty_exchange/tty_await_reply. Closes: a message view
+  outliving the next receive into the same static (tty-server serve_tty's `body` is live across
+  perform() by call order only), a send buffer shorter than the 4096 bytes sys_channel_send
+  copies, hand-written bounds that disagree with the kernel (nxinstall raw_send clamps to 4072
+  where the kernel refuses past 4008), and moved handles stranded by a refused reply (sh-d13).
+  Removes 22 unsafe blocks and 9 statics. Depends on: nothing. abi, ownership, soundness,
+  opportunities. Value high, effort medium.
+- [ ] **sh-o3** encapsulate: raw SYS_WAIT into hand-sized buffers, IoResult decoded by byte offset
+  (handle @0, status @8, result @16), and PendingOperation lifecycles with private po_wait copies
+  — 13 call sites (`grep -rn "syscall4(SYS_WAIT\|SYS_WAIT," userspace/{nxsh,coreutils,tty-server,
+  eshell,nxinstall,profile-server}/src`, minus imports; nxsh 4, tty-server 2, profile-server 2,
+  eshell, nxinstall, sleep, disk, entropy 1 each), 7 `static mut` wait-buffer pairs, 4 private
+  po_wait definitions and 5 near-identical lookup wrappers, such as
+  `userspace/tty-server/src/main.rs:582`, `userspace/nxsh/src/main.rs:393`,
+  `userspace/nxinstall/src/main.rs:102`, `userspace/profile-server/src/main.rs:93`. Two parts.
+  In libos, make its private `sys::wait` public as `wait<'r>(handles, out: &'r mut
+  [IoResult; N], deadline) -> Result<&'r [IoResult], Error>`, or a `WaitSet<const N: usize>` with
+  `push(h) -> Result<usize, Full>` and a typed iterator, each wait owning its results; and use
+  `Op` (closes the PO on Drop) with `block_on` for one-shot waits and `Option<Op>` for a server's
+  console read. In libkern, a thin `wait(&[u64], &mut [IoResult], deadline)` that refuses
+  `results.len() < handles.len()`, so eshell can use it. Checked against nxsh's capture and reap
+  loops, tty-server serve_loop, nxinstall Io::submit and sleep's two-handle wait. Closes: a PO
+  never closed (sh-d4), a results buffer smaller than the handle count (sh-d12), and a nested
+  wait clobbering records the caller still reads (nxsh reap then drain_diagnostics ->
+  tty_await_reply; profile-server's ns_lookup shares the serve loop's buffers; tty-server added
+  PO_RESULTS after exactly this). Depends on: libos making its wait public; eshell stays on
+  libkern. abi, ownership, soundness, opportunities. Value high, effort medium.
+- [ ] **sh-o4** encapsulate: nxsh Host::run holds a dozen raw handles and a `Vec<u64>` of
+  children with cleanup written per path, missing on 6 exits — 6 sites (`sed -n 192,435p
+  userspace/nxsh/src/main.rs | grep -n 'return Err\|)?;'` gives 8 exits; 2 come before any handle
+  exists), at `userspace/nxsh/src/main.rs:245`, `userspace/nxsh/src/main.rs:259`,
+  `userspace/nxsh/src/main.rs:297`, `userspace/nxsh/src/main.rs:418` (also 241 and 246).
+  `struct Pipeline { owned: Vec<u64>, children: Vec<u64>, reaped: bool }` with `own(h)`,
+  `hand_over(h)` (forget it once a send or spawn moved it), `child(proc)`, and a Drop that closes
+  what is still owned and, unless reaped, closes the capture read end, terminates every child and
+  drains their ChildExited. It also encodes the setup payload before the spawn. Home:
+  userspace/nxsh/src/pipeline.rs (main.rs is at its size entry), beside stage.rs's `Images`.
+  Closes: handles and processes stranded by an early return (sh-d3) and the stale ChildExited
+  they leave for the next reap. Depends on: nothing; sh-o1's handle type would shrink it.
+  ownership, abi, opportunities. Value high, effort medium.
+- [ ] **sh-o5** encapsulate: map, `from_raw_parts` slice, then unmap (or forget to), with the
+  mapped, read and object lengths chosen separately — 11 sites (`grep -rn 'SYS_MEMORY_MAP,'` gives
+  12, 9 of them file reads and 1 a mapped write; `grep -rn from_raw_parts` gives 21, 11 over
+  mappings), such as `userspace/nxsh/src/main.rs:459`, `userspace/nxsh/src/stage.rs:102`,
+  `userspace/profile-server/src/main.rs:137`, `userspace/coreutils/src/bin/whoami.rs:110`.
+  A `Mapping` from `Handle<File|Memory, MapRead>::map_all()` (stat, then map exactly the size)
+  with `len()`, `copy_out(off, &mut [u8])` and `to_vec()` via copy_nonoverlapping, as
+  libfsserver's PartitionIo does, `write` for writable modes, and Drop that unmaps its own
+  (addr, len). Checked against nxsh read_file, whoami, disk device_info and write_file. Home:
+  libos objects.rs (`map` returns a raw `*mut u8` today). Closes: references over shared
+  page-cache mappings (sh-d11), mappings never unmapped (profile-server read_manifest, nxinstall
+  devices), size-0 unmaps (sh-d9) and a manifest cut at a page (sh-d7). Depends on: sh-o1, for
+  `&Handle`; eshell keeps its 2 sites. ownership, soundness, opportunities. Value medium, effort
+  medium.
+- [ ] **sh-o6** remove: nxsh's own file I/O and lookup helpers duplicate libfs, already a
+  dependency — 3 helpers, 15 unsafe blocks (`awk 'NR>=437 && NR<=508 && /unsafe/'` gives 11,
+  `NR>=747 && NR<=783` gives 4; `grep -n "SYS_MEMORY_MAP,\|SYS_FILE_CREATE,\|syscall4(SYS_NS_LOOKUP"`
+  locates them), at `userspace/nxsh/src/main.rs:437`, `userspace/nxsh/src/main.rs:469`,
+  `userspace/nxsh/src/main.rs:755`. Call `libfs::read_file` (MAX_COPY cap, copy without a
+  reference), `libfs::write_file` (truncates first, returns the sync result) and
+  `libfs::lookup_wait`; stage.rs read_head stays. libfs::read_file needs one small extension, to
+  report a directory as an error rather than as empty, which nxsh relies on. Home: libfs. Closes:
+  sh-d6, sh-d8 and the reference-over-mapping UB at main.rs:459 and :498. Depends on: that
+  extension. abi, soundness. Value medium, effort small.
+- [ ] **sh-o7** narrow: a handle received over IPC is kept as a given object type with only `!= 0`
+  checked — 3 sites (every `sent.take(` and kept `terminal`/`streams` handle in the paths), such
+  as `userspace/tty-server/src/main.rs:443`, `userspace/nxsh/src/main.rs:1089`,
+  `userspace/coreutils/src/stage.rs:129`. A checked constructor
+  `Handle::<Channel, M>::from_received(raw) -> Result<Self>` (or `Received::take_as::<T>`) that
+  calls sys_handle_stat, verifies the object type and the WAIT/SEND/RECV rights the mode needs,
+  and closes a wrong one; libos.md already anticipates it. Home: libos handle.rs, beside the
+  unchecked `unsafe fn from_raw`. Closes: a client-supplied handle of the wrong type or rights
+  poisoning a server's wait set (sh-d1). Depends on: sh-o1's Channel type. ownership,
+  opportunities. Value medium, effort small.
+- [ ] **sh-o8** remove: `static mut` used only as a syscall out-parameter, argument block or
+  per-call scratch, where a local does the job — 12 sites (`grep -rn 'static mut'` gives 45;
+  CLOCK_BUF in sleep.rs and date.rs, CTRL_OUT0/1 in tty-server and profile-server, NOTIF/NOTIF_BUF
+  in nxsh, with.rs and coreutils stage.rs, SPAWN in nxsh, FRONT/BACK in nxinstall; ownership
+  also counts TTY_HANDLES/REPLY_HANDLES), such as `userspace/tty-server/src/main.rs:57`,
+  `userspace/coreutils/src/bin/sleep.rs:34`, `userspace/nxinstall/src/main.rs:99`,
+  `userspace/coreutils/src/stage.rs:21`. Plain locals, as libstream::setup::pipe, nxsh now_ns
+  and with.rs token_deadline already do; a stack array or Vec for FRONT/BACK (sources() keeps a
+  FRONT_BYTES array on the stack). Home: each binary. Closes: two live `&mut` to one static in
+  nxinstall and about 20 unsafe blocks that only reach the statics. Depends on: nothing. abi,
+  ownership, soundness, opportunities. Value low, effort small.
+- [ ] **sh-o9** remove: profile-server keeps its state in `static mut` (INDEX, SESSION_CH,
+  SESSION_DIR, PENDING_DIR) and reborrows the index as `&'static [Entry]` — 4 sites
+  (`grep -n '^static mut \(INDEX\|SESSION_\|PENDING_DIR\)'`), at
+  `userspace/profile-server/src/main.rs:48`, `userspace/profile-server/src/main.rs:267`,
+  `userspace/profile-server/src/main.rs:595`. `struct Server { index: Vec<(String, Vec<Entry>)>,
+  sessions: [(u64, &'static str); MAX_SESSIONS] }` passed as `&mut` through serve_loop, with
+  `index(&mut self, ..) -> &[Entry]` and the pending-dir handoff as a return value; tty-server's
+  Registry is the model. Home: profile-server. Closes: a `&'static` reborrow whose soundness
+  rests on a comment (it holds today; see below). Depends on: nothing. ownership. Value low,
+  effort small.
+- [ ] **sh-o10** encapsulate: `librsproto::session::Dir` is closed by an explicit `close(self)`
+  with no Drop — 4 sites in the subsystem (`grep -rn 'Dir::open'`; 4 more in libfs), at
+  `userspace/nxsh/src/main.rs:528`, `userspace/coreutils/src/bin/mkdir.rs:134`,
+  `userspace/profile-server/src/main.rs:204`. `impl Drop for Dir` closing the endpoint, with
+  `close(self)` kept as an early release. Home: librsproto session.rs. Closes: a session endpoint
+  leaked by an early return between open and close; none found today. Depends on: nothing.
+  ownership. Value low, effort small.
+- [ ] **sh-o11** encapsulate: a coreutil opens a one-shot service session with
+  `libfs::lookup_wait(DIR_SESSION_RIGHTS)`, calls round_trip and closes the endpoint with a raw
+  syscall — 4 sites (`grep -rn 'round_trip(session' userspace/coreutils/src/bin`), at
+  `userspace/coreutils/src/bin/service.rs:216`, `userspace/coreutils/src/bin/shutdown.rs:85`,
+  `userspace/coreutils/src/bin/log.rs:95`. `librsproto::session::Session`, owning the endpoint
+  and closing it on Drop: `Session::open(ns, path) -> Result<Session, i32>` (NotFound kept
+  distinct) and `ask(&mut self, buf, op, body) -> Result<usize, WireError>`. Home: librsproto
+  session. Closes: a session endpoint leaked on an early return; removes 4 unsafe blocks.
+  Depends on: nothing. opportunities. Value low, effort small.
+- [ ] **sh-o12** remove: raw operations where core or the type already offers a safe one — 3
+  sites (the inventory's only asm, its only `unsafe fn`, and a raw slice over a local struct
+  field), at `userspace/eshell/src/main.rs:367`, `userspace/nxsh/src/main.rs:1175`,
+  `userspace/nxinstall/src/main.rs:891`. `core::hint::spin_loop()` for `asm!("pause")` (the
+  tty-server and profile-server exit loops already use it), `&entry.path[..len]` as eshell
+  main.rs:157 does, and a safe `pub extern "C" fn _start` as every other bin's is. Home: each
+  binary. Closes: nothing new; removes 3 unsafe sites and the only asm. Depends on: nothing.
+  soundness, opportunities. Value low, effort small.
+
+What held up: every receive goes through libkern's `Received` into a whole 4096-byte page, with
+every payload slice clamped to 4096-24, and every send passes a whole page within
+IPC_PAYLOAD_SIZE; unwanted handles close on drop. sys_wait results buffers fit the handle counts
+passed, and tty-server's wait set stays within 3 + 2*MAX_TTYS = 31 <= 32 (profile-server's is
+1 + 31 = 32) because a backend left with no terminal is retired; tty-server's po_wait uses its own
+PO buffers, so a nested wait cannot clobber the serve loop's records. profile-server's
+`&'static [Entry]` over `static mut INDEX` is sound: a push moves only the outer tuples, and a
+replica holding the slice across 8 reallocating pushes passes Miri under Stacked Borrows and Tree
+Borrows. PENDING_DIR and SESSION_DIR hold `&'static str` from PROJECTED, never slices of
+RECV_MSG, and `bin/../x` cannot traverse. ChildExited offsets, IoResult offsets and the NsEntry
+path clamp agree with the specs and libkern; mapped reads stay inside their mappings (the kernel
+refuses a map past the object); console read counts are clamped (64 and 256); entropy buffers are
+used only when the read returned 0. The Images guard, read_file, write_file and read_head close
+and unmap on every path, tty-server's open_tty and open_sibling reclaim both ends when the reply
+does not go out, and nothing in the subsystem creates a thread. 20,000 rounds of random bytes
+through libline::Discipline and the tty-server Registry gave no panic (probe removed).
