@@ -1440,3 +1440,628 @@ with the departed-CPU rule, and user copies running IF-masked. Page-cache frame 
 a Model B reply takes the pending fill exactly once. `map_file`'s writable count on every refusal
 path, `MemoryObject::try_new` rollback, `DmaBuffer`'s order handling and the zeroing of every
 frame handed to user space. The breaks tests caught are those marked Demonstrated above.
+
+### drivers — main at 135055a8, 2026-10-26
+
+Lenses: abi, ownership, soundness, concurrency, opportunities; returned nothing: none.
+Defects: found 38, refuted by a boot 0, reported 21 (duplicates merged). Opportunities: 18.
+
+The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci kernel/src/io kernel/src/device.rs kernel/src/arch/x86_64/ps2.rs`:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `kernel/src/drivers` | 7393 | 140 | 6 | 4 | 0 | 0 | 3 | 51 | 0 | 0 | 24 |
+| `kernel/src/pci` | 448 | 5 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
+| `kernel/src/io` | 911 | 57 | 3 | 7 | 0 | 0 | 1 | 41 | 0 | 0 | 0 |
+| `kernel/src/device.rs` | 638 | 5 | 0 | 0 | 0 | 0 | 0 | 4 | 0 | 0 | 0 |
+| `kernel/src/arch/x86_64/ps2.rs` | 185 | 14 | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `total` | 9575 | 221 | 13 | 11 | 0 | 0 | 4 | 96 | 0 | 0 | 26 |
+
+**Defects**
+
+- [ ] **drv-d1** `kernel/src/drivers/ahci.rs:590` — `on_interrupt` reads PxCI at line 661 outside
+  the port lock, and `take_retired` then swaps out whatever IRP is in flight without re-reading
+  PxCI under the lock. An interrupt that saw slot 0 idle therefore completes a command another CPU
+  issued in between. Scenario: slot 0 is idle and an interrupt arrives (an unsolicited D2H Register
+  FIS, a shared INTx line, or the COMRESET FIS after `recover()`). The ISR reads PxCI=0 and waits
+  on the port lock while a submit on another CPU, or `drain_queue`, issues a command. The ISR then
+  takes that IRP and completes it IoError with 0 bytes (a FLUSH completes Success), while the HBA
+  is still running it. The IrpBox is reclaimed, so the buffer frames can be freed or reused under
+  live DMA, and `drain_queue` rebuilds slot 0's command table under the running command.
+  Demonstrated: host tests in `ahci/tests.rs` on `fake_disk` (since removed) read PxCI (idle),
+  submitted a read, then called `take_retired`. It returned the read with PxCI=1, and after `retire`
+  and `run_pending` the status was -40 (IoError) with inflight null. The FLUSH variant gave Success
+  with PxCI=1. A second probe, after `on_interrupt` with PXIE_TFEE and `claim` + `recover`, gave the
+  same result. Control: adding `|| read32(d.port_base, PX_CI) & 1 != 0` to `take_retired`'s early
+  return made both pass, with all 15 and 16 existing AHCI tests still green. Fix: read PxCI inside
+  `take_retired`, under `pending`. Lenses: concurrency, ownership, opportunities. High.
+
+- [ ] **drv-d2** `kernel/src/dpc.rs:98` — the DPC queue reserves 64 entries on the claim that "the
+  bound is the number of distinct Dpc objects" (dpc.rs:23-25). But every IrpBox has its own inline
+  Dpc (irp.rs:291), so the number of pending DPCs is the number of IRPs completed between two
+  interrupt tails. Scenario: a process holding a block DeviceNode with READ loops
+  `sys_io_submit(Read, offset = device size, length = 512)`. `submit_within` (io/block.rs:116-120)
+  refuses each one by enqueueing that IRP's own DPC and raises no interrupt. Only a 10 ms timer tick
+  or a device IRQ drains the queue, so the 65th enqueue hits the `debug_assert` (dev profile, live
+  in every image) or the explicit `panic!` at line 101. The same follows from a `Rescan` or `Eject`
+  loop on a partition (window_refusal, block.rs:515/540), a retired window, an ejected USB unit, a
+  dead AHCI disk, and AHCI's or USB storage's full 32-entry queue (ahci.rs:634, storage.rs:751). On
+  an HDD, about 97 outstanding writes are enough. Demonstrated: host tests in `io/block.rs`, run
+  four times by four lenses and since removed: `dpc::init()`, then 65 `dispatch_block_irp(Read, past
+  the end)` calls or 100 `dispatch_block_control(Rescan)` calls on a partition, with no
+  `run_pending`. Output: submits 0..64 succeed, then "panicked at src/dpc.rs:98:5: DPC queue
+  capacity exceeded". Not booted, so whether 65 submits fit inside one tick on a running kernel is
+  untested. Fix: an intrusive link in the IrpBox the way RECLAIM links it (see drv-o5). Lenses:
+  abi, soundness, concurrency, opportunities. Medium.
+
+- [ ] **drv-d3** `kernel/src/drivers/xhci/storage.rs:1512` — `Disks::issue_hub` overwrites
+  `dev.inflight` and rewrites the wrapper page without checking that no IRP command is in flight.
+  `bind` runs hub commands for LUN 1.. after LUN 0's disk and partitions are published, with
+  `recovering` clear (`recover()` and `rescan()` take the device first; `bind` does not). Scenario:
+  a multi-LUN stick or card reader (GET MAX LUN >= 1). A filesystem server's read on LUN 0 starts
+  between LUN 1's INQUIRY, TEST UNIT READY, READ CAPACITY and read_table. Its `Owner::Irp` is
+  replaced by `Owner::Hub`. The IRP is never completed and is not handed back by `depart`, so its
+  IrpBox, PO and buffer leak and the submitter waits forever. Its data and CSW events are taken as
+  the hub command's stages. A fault recorded during bind makes `on_transfer` ignore every hub
+  command, which times out after 5 s. An IRP queued behind a hub command is never started, because
+  the `Owner::Hub` completion does not call `dev.next()`. Demonstrated: host tests in
+  `xhci/storage/tests.rs` (since removed): `take(fake.dev(..))`, submit a Read on LUN 0 (started),
+  then `issue_hub(i, po, 1, INQUIRY, 36)` returned true and inflight became `Owner::Hub { po }`.
+  `depart(i)` then handed back `queued=0 held=[None, None, None]` with the read's status still
+  Pending. Lenses: ownership, soundness, concurrency. Medium.
+
+- [ ] **drv-d4** `kernel/src/drivers/ahci/bringup.rs:167` — `drivers::probe` calls `ahci::init` for
+  every 01.06.01 function (drivers/mod.rs:36-37), and `init` stores each disk into the AHCI static
+  with no "already claimed" check (xhci::init has one at xhci/mod.rs:299). The watch thread's SAFETY
+  claim "published once, never withdrawn" (ahci.rs:687) then fails. Scenario: a machine with two
+  AHCI controllers, each with a disk. The ISR, the three static DPCs, `poll_complete_inflight` and
+  the watch thread all serve the second disk, while the first stays published with its own backend.
+  Disk 1's first IRP hangs, and its queue then refuses with IoError. Over INTx, disk 1's IS is never
+  cleared and the level line storms the BSP. Every disk 1 interrupt is also an idle-slot ISR run
+  against disk 2, which makes drv-d1 reachable continuously. Demonstrated: booted the release image
+  on q35 with its built-in AHCI holding the system disk plus a second `-device ich9-ahci` holding a
+  64 MiB disk. The log shows two "port 0 disk ready" lines and two MSI vectors (0x30, 0x31). The
+  AHCI static ended up pointing at the later controller. The first controller's disk failed its
+  boot-time partition-table read with "partitions: the table did not read" (`Unread::Io`, not "no
+  table"). Boot worked only because the system disk happened to enumerate last. No one-controller
+  control was run. Lens: concurrency. Medium.
+
+- [ ] **drv-d5** `kernel/src/io/ramdisk.rs:199` — `RamDisk::transfer` bounds-checks only
+  `irp.offset + irp.length` against the backing, then copies each fragment's own `len`. The SAFETY
+  premise "the frags sum to len" is held only by `build_frags` in io::block, and `Irp` and
+  `IrpBuffer` are pub with pub fields. Scenario: latent, since every IRP today comes from
+  `build_frags`. Two ordinary changes would make it bite: implementing
+  `TODO(block-transfer-split)` by trimming `length` per sub-command over a shared fragment array,
+  or a Tier 2 filter driver (irp-layout.md says they walk `&mut Irp`) changing `length`. A write at
+  the last block with `length` 512 and one 1024-byte fragment overruns the backing by 512 bytes. For
+  the live image the backing is the Limine root module, so the write lands in kernel memory. AHCI
+  (sector count) and USB storage (CBW length) cap at `length`; the RAM disk does not.
+  Demonstrated: host test in `io/ramdisk.rs` (since removed): a 2048-byte disk over a 2560-byte
+  Vec, Write at offset 1536 with length 512 and one 1024-byte fragment. Status 0, transferred 512,
+  and the guard bytes [2048..2560] were overwritten (they were 0xAB). Miri also reports
+  "attempting to access 1024 bytes, but got alloc...+0x600 which is only 512 bytes from the end of
+  the allocation" at ramdisk.rs:209. Fix: copy `min(f.len, remaining)`, or check the fragment sum
+  (see drv-o1). Lenses: abi, soundness, opportunities. Medium.
+
+- [ ] **drv-d6** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
+  KObjectType) -> ObjectRef` is a safe function with the whole contract of `ObjectRef::from_raw`:
+  `T` must be the type `ty` names, header first. io/mod.rs:160 has a private copy. Scenario:
+  latent. All current non-test callers (13 to 30 counted, by lens) pass the matching tag. One
+  copy-pasted tag at a new call site compiles without `unsafe`, and the last drop runs
+  `dispatch_destroy` as the wrong type, a type-confused free into the wrong slab cache.
+  Demonstrated: host tests (since removed) called `adopt(InterruptObject..., MemoryObject)` and
+  `adopt(MemoryObject, PendingOperation)` in safe code; the header said the true type and the
+  ObjectRef said the wrong one (the test forgot the ref). Under Miri,
+  `adopt(PendingOperation, MemoryObject)` then drop gives "constructing invalid value of type
+  NonNull<mm::PhysAddr>: encountered 0" at libkern/kvec.rs:218, through `dispatch_destroy`. Lenses:
+  abi, ownership, soundness, opportunities. Medium.
+
+- [ ] **drv-d7** `kernel/src/dpc.rs:71` — `pub fn enqueue(dpc: &Dpc)` is safe and takes a borrow of
+  any lifetime, but the queue keeps the address until a later drain calls its handler. Safe code
+  can queue a stack or heap Dpc that is gone by then, and the drain reads a function pointer from
+  dead memory. Scenario: `io::interrupt_object_self_test` (io/mod.rs:140-142) enqueues a stack Dpc
+  and calls `run_pending`; that is sound only because it runs before SMP with interrupts masked.
+  Moving it after AP bring-up would let another CPU's timer tail snapshot the address before this
+  function returns and call `dpc.handler` out of a dead frame. Demonstrated: Miri on a test (since
+  removed) that builds a stack Dpc, calls the public `enqueue`, returns, scribbles the stack and
+  calls `run_pending`: "constructing invalid value of type &dpc::Dpc: encountered a dangling
+  reference" at dpc.rs:122. Fix: `enqueue(&'static Dpc)` plus an `unsafe fn` for IRP-inline DPCs
+  (see drv-o12). Lens: soundness. Medium.
+
+- [ ] **drv-d8** `kernel/src/drivers/xhci/hub.rs:626` — `data_bytes(mem, len: u16)` and
+  `control_in`'s `write_bytes` (hub.rs:638) are safe functions taking any length up to 65,535 over
+  the one-page data DmaBuffer. The page bound is held only at call sites (hub.rs:459's
+  `.min(PAGE_SIZE)` and `read_interface_descriptor`'s clamp at :617). Scenario: latent. A new
+  descriptor read of a device-supplied `wTotalLength` without the clamp (a BOS descriptor), or
+  raising `CONFIG_MAX` and dropping the `.min`, would make `control_in` zero memory past the page
+  and let the USB device DMA up to 64 KiB past it. An untrusted USB device would corrupt kernel
+  memory. Demonstrated: host test in hub.rs tests (since removed): `device_mem()`, then
+  `data_bytes(&mem, 3*4096)` returned a 12,288-byte slice over a 4,096-byte page. Lens:
+  opportunities. Medium.
+
+- [ ] **drv-d9** `kernel/src/drivers/ahci/bringup.rs:156` — the boot log line computes `sectors *
+  SECTOR_SIZE as u64` unchecked. `sectors` is IDENTIFY words 100..103 read as a full u64
+  (ahci.rs:292-297), with only zero refused, and overflow checks are on in every image. Scenario: a
+  disk or HBA emulation whose IDENTIFY word 103 is non-zero (2^55 sectors or more) panics the
+  kernel inside `ahci::init` with "attempt to multiply with overflow", and the boot stops before
+  userspace. The rest of the block layer uses checked or saturating arithmetic on the same value.
+  Unverified: path read only. QEMU sizes the disk from its image, so it cannot report this. A host
+  test of a factored-out size formatter fed `words[103] = 0x0080` would settle it. Fix:
+  `saturating_mul`, or log in sectors and refuse counts above 2^48. Lens: abi. Medium.
+
+- [ ] **drv-d10** `kernel/src/drivers/ahci.rs:390` — AHCI wants word-aligned PRDT bases (DBA bit 0
+  reserved) and even byte counts (DBC bit 0 set), but the block layer accepts any `buf_offset`
+  (`whole_blocks` checks only `offset` and `length`). Scenario: a process holding a disk submits
+  Read with `buf_offset` = 4095 and length 512. `build_frags` gives [frame0+4095, len 1] and
+  [frame1, len 511]. `build_command` writes DBA = frame0+4095 and DBC = 0 (odd). AHCI 1.3.1 §4.2.3.3
+  leaves the behaviour undefined, and an HBA that honours the odd address and rounds the count up
+  would write one byte past `frame0`, into an unrelated physical page. QEMU's AHCI model is
+  byte-exact, so no gate shows it. Unverified: a host test shows `build_frags(&[0x100000,
+  0x200000], 4095, 512)` giving the odd fragments (since removed). The hardware effect needs the
+  laptop's Sunrise Point AHCI, with a read at `buf_offset` 4095 and a canary in the physically
+  adjacent frame. The boot verifier could not reproduce it under QEMU. Fix: require an even or
+  block-aligned `buf_offset` for block devices, as Linux's `queue_dma_alignment` does. Lens: abi.
+  Medium.
+
+- [ ] **drv-d11** `kernel/src/drivers/ahci/bringup.rs:105` — `init` programs PxCLB/PxFB and starts
+  the port (FRE and ST, lines 92-100) before three fallible allocations. Each failure at lines 105,
+  112 and 135 returns `declined(OUT_OF_MEMORY)` with `cmd_list`, `fis` and `cmd_table` dropped back
+  to the buddy allocator while the HBA still owns them. Scenario: out of memory at boot. The next
+  D2H, PIO or SDB FIS (a link event, a COMINIT, a hot-plug) is written at `fis`+0x20..0x60, into
+  whatever page the allocator has handed out since. xhci/mod.rs:488-493 fixed the same class by
+  boxing before RUN; AHCI was not swept. Unverified: path read only (the boot verifier read lines
+  100-135 and confirmed the order). An allocation-failure seam at line 105, followed by a check that
+  PxCMD.FRE is clear before the DmaBuffers drop, would settle it. Fix: `stop_port` first, and
+  forget the buffers when it fails (see drv-o7). Lenses: abi, ownership, soundness, opportunities.
+  Low.
+
+- [ ] **drv-d12** `kernel/src/drivers/xhci/mod.rs:579` — `stop()` discards both `wait_for` results
+  (HCH set, HCRST complete). Every decline after USBCMD.RUN (lines 500, 505, 511) then drops the
+  boxed `Xhci`, which frees the DCBAA, the scratchpad pages (the controller's own working memory),
+  the command and event rings and the ERST, even if the controller is still running. Scenario: a
+  controller that does not answer the bring-up No Op (mod.rs:503-506) and also does not halt within
+  `HALT_NS`. `stop()` writes HCRST while HCH is clear (xHCI 1.2 §5.4.1 forbids it) and returns, and
+  the controller can keep writing frames the allocator has handed out. The module doc's rule "a
+  decline after the controller started stops it first" is held by intent. Unverified: read only. It
+  needs a controller that ignores Run/Stop, which QEMU's model does not do. Fix: `stop()` returns
+  whether HCH set, and `mem::forget(boxed)` when it did not. Lenses: ownership, soundness. Low.
+
+- [ ] **drv-d13** `kernel/src/drivers/xhci/hub.rs:384` — `control_in`'s SAFETY argument (hub.rs:634-638)
+  is that any ep0 failure that can leave a transfer live "ends the device". `hid::bind` instead ends
+  only its own binding when a request is in doubt (hid.rs:501, 516, timeouts included), and
+  `hub::bind` then calls `storage::bind`, which issues GET MAX LUN on the same default endpoint and
+  data page. Scenario: a composite HID+storage device NAKs its report-descriptor GET_DESCRIPTOR past
+  `TRANSFER_NS`. `storage::bind`'s `control_in_byte` pushes new TRBs behind the stale ones and
+  zeroes `mem.data`. The stale transfer can complete into `mem.data` while `data_bytes()` hands out
+  a `&[u8]` over it, and its short-packet event writes its residual into the new Waiting record.
+  The bytes stay inside the device's own page, but the unsafe block's precondition is false and GET
+  MAX LUN reads a stale byte. Unverified: path read only (hid.rs:498-503 and 512-518,
+  hub.rs:380-385). No QEMU device is composite and slow enough to reach it. Lens: abi. Low.
+
+- [ ] **drv-d14** `kernel/src/drivers/xhci/desc.rs:187` — `Endpoint::dci()` turns a device-supplied
+  `bEndpointAddress` into a Device Context Index without rejecting endpoint number 0. Scenario: a USB
+  stick whose configuration lists bulk IN 0x81 and bulk OUT 0x00. `storage_interface` accepts it
+  with out DCI 0, and `configure_endpoints` (context.rs:196-205) writes the endpoint context over
+  the input slot context. An IN 0x80 becomes DCI 1 and overwrites the default endpoint's context.
+  Doorbell target 0 is reserved, and two classes on one composite device can share a DCI, so
+  `storage::on_transfer` swallows the HID's events. Everything stays in bounds, but a
+  device-supplied index is used without a range check. Demonstrated: host test in
+  `xhci/context.rs` (since removed): `storage_interface` over that configuration printed "out dci 0
+  in dci 3", and `configure_endpoints` printed "slot ctx dw2 0xdeadb001 add flags 0x9", failing the
+  assertion that the slot context's dword 2 is 0. Lens: abi. Low.
+
+- [ ] **drv-d15** `kernel/src/drivers/xhci/storage.rs:1271` — `run()` copies `len` bytes of the
+  binding buffer into `out` on any Passed status, ignoring the CSW residue. The buffer is never
+  cleared between commands (`issue()` zeroes only the CSW area, lines 470-479). Scenario: a stick
+  returns 8 of 18 sense bytes (residue 10) to REQUEST SENSE after an INQUIRY. `sense_answer` reads
+  ASC/ASCQ at bytes 12-13, which are stale INQUIRY bytes, and TEST UNIT READY's "no medium" test or
+  `sense_outcome` judges by them. A short READ CAPACITY likewise takes its block count and length
+  from stale bytes. `hub::control_in` zeroes its page before each transfer for exactly this reason;
+  the bulk path does not. Unverified: path read only. A host seam over `run_once` returning
+  `Passed { residue: 10 }` after a pre-filled buffer would settle it. Lens: abi. Low.
+
+- [ ] **drv-d16** `kernel/src/io/block.rs:622` — `window_of` decides that a backend's `ctx` is a
+  leaked `&'static Partition` by comparing `backend.submit as *const ()` with `partition_submit as
+  *const ()`. Rust does not guarantee function-pointer identity (identical bodies may be merged, and
+  the cast sidesteps `unpredictable_function_pointer_comparisons`). Scenario: latent. If another
+  `fn(*mut Irp, *mut ())` compiled to an identical body, LLVM's merge-functions could give both one
+  address; `window_of` would cast a RamDisk, AhciDisk or USB storage's packed integer to
+  `&Partition` and `retire_window` would store to it. Conversely a Partition could compare unequal
+  and miss its retire on rescan. Unverified: by reading (`core::ptr::fn_addr_eq`'s documentation).
+  Fix: a tag in `BlockBackend`, or `block_info().kind == BlockKind::Partition` (see drv-o14). Lens:
+  abi. Low.
+
+- [ ] **drv-d17** `kernel/src/drivers/ahci.rs:468` — `publish_disk` ignores whether `device::register`
+  took the node. `register` returns nothing and drops the node when the table cannot grow
+  (device.rs:521-526, 176-184). It then calls `Counted::attach(&r)` on the SAFETY argument that the
+  table holds the node for the kernel's lifetime. When registration failed, `r` drops at the end of
+  the function and the disk's `Counted` keeps a dangling `*const IoStats`. io/ramdisk.rs:363-365
+  (`publish_modules`) has the same shape; storage.rs:1078-1085 attaches only after `register`
+  succeeded. Scenario: OOM growing the device table. Nothing can submit to an unregistered node
+  today, so `record()` never writes the pointer; any change that reaches the backend without the
+  registry makes every completion a `fetch_add` on freed slab memory. Unverified: path pointed at.
+  A host test failing registry growth, then `Counted::record` under Miri, would settle it. Lenses:
+  soundness, opportunities. Low.
+
+- [ ] **drv-d18** `kernel/src/drivers/xhci/hid.rs:996` — `depart`'s keyboard branch offers its key
+  releases in their own reader-lock holds and only then retires the node with no releases (line
+  999). A report the DPC decoded before `depart` took the Bound entry can be pushed in between and
+  land after the releases, the case `Nodes::push`'s comment says retiring under the lock prevents.
+  The mouse branch retires with its releases in one hold and does not have the gap. Scenario: a USB
+  keyboard still typing as its departure runs (a contact bounce, which `hub::main` treats as a
+  departure then an arrival). `on_transfer` decodes a press under the hid lock, `depart` offers the
+  release, the DPC's `deliver` calls `NODES.push` (accepted, the node is not retired yet), then
+  `retire` follows. The departed node's ring ends with the key down. Demonstrated: host test in
+  `xhci/hid/tests.rs` (since removed): `readers[i].lock().offer([release 30, syn])`, then
+  `push(i, epoch, [press 30, syn])`, then `retire(i, &[])`. The ring's key events were
+  [(30,0),(30,1)], ending on a press. The existing single-hold test shows the late push dropped.
+  Lens: concurrency. Low.
+
+- [ ] **drv-d19** `kernel/src/drivers/xhci/mod.rs:647` — `xhci_dpc` can run as two concurrent
+  instances (`dpc.rs` clears `queued` before the handler, and the queue is global). Each drains a
+  16-event batch under the `events` lock and acts on it after releasing, so events from consecutive
+  batches can be acted on out of ring order. Scenario: instance A on an AP's timer tail drains a
+  batch ending in an EP0 short Data-stage event; an MSI re-enqueues the DPC and instance B on the
+  BSP drains the next batch holding that transfer's Status event. B runs `ep0_event` first, takes
+  the record with `w.short = 0` and completes the transfer as whole, so `control_in` returns `len`
+  bytes where fewer arrived. The same interleaving can deliver two HID reports in swapped order.
+  Unverified: read of `xhci_dpc`, dpc.rs:13-16, `ep0_event` and `hid::on_transfer`. A host test
+  driving two batches through `on_event` in swapped order against a Waiting record would settle it.
+  Lens: concurrency. Low.
+
+- [ ] **drv-d20** `kernel/src/drivers/xhci/ring.rs:328` — `Consumer::next` reads the whole event TRB
+  through `DmaSlots::read` (dwords 0, 1, 2, then 3, mod.rs:228-236) and only then checks the cycle
+  bit in dword 3, with no acquire fence between the cycle check and the other dwords. Linux reads
+  the cycle first, then `rmb()`, then the rest. Scenario: the DPC reads dwords 0-2 of event slot k
+  (the previous lap's), the controller's write lands, and the DPC reads dword 3 with the new cycle,
+  consuming the event with the old pointer and code. A Command Completion matching nothing leaves
+  the hub thread to time out and mark the controller wedged; a transfer event naming the wrong TRB
+  is lost and leaves a storage command to its 30 s deadline. It depends on the controller's 16-byte
+  write not being observed atomically (QEMU writes it with one `dma_memory_write`). Unverified:
+  read only. A `Slots` stand-in whose read returns dwords from two laps would settle it once the
+  reader reads dword 3 first (see drv-o11). Lens: concurrency. Low.
+
+- [ ] **drv-d21** `kernel/src/io/ramdisk.rs:132` — for an Owned backing, `RamDisk::base()` returns
+  `v.as_ptr()`. `KVec` has no inherent `as_ptr`, so this goes through Deref to a `&[u8]` and the
+  pointer carries SharedReadOnly permission; `transfer()` then writes through it for a Write IRP,
+  mutation behind a shared reference with no `UnsafeCell`, from `&self`. Scenario: latent. The
+  Owned backing is only the bring-up ramdisk, which `io::self_test` reads and never registers.
+  Registering it, or writing to it in a test, gives UB that optimisation may exploit.
+  Demonstrated: Miri on a test (since removed) that builds `RamDisk::try_new()` and transfers a
+  Write IRP with one 512-byte fragment: "attempting a write access using <tag> ... but that tag
+  only grants SharedReadOnly permission", the tag created at ramdisk.rs:132 (Stacked Borrows). Fix:
+  keep a raw pointer taken from `&mut` at construction, or wrap the bytes in `UnsafeCell`. Lens:
+  soundness. Low.
+
+**Opportunities**
+
+- [ ] **drv-o1** encapsulate: an in-flight IRP is passed as a raw `*mut Irp` through the safe
+  `fn(*mut Irp, *mut ())` of `BlockBackend::submit`. Each driver derefs it raw, rebuilds its own
+  fragment slice with its own null and zero-count handling, and completes it by hand
+  (`set_completion` + `dpc::enqueue(&(*irp).dpc)`); "completed exactly once" and "fragments sum to
+  length" are held by convention — 53 sites (46 occurrences of `*mut Irp` / `AtomicPtr<Irp>` in
+  drivers/ and io/ outside tests, plus the 7 completion sites; the 27 raw `(*irp)` lines, 3
+  non-test `from_raw_parts(.*PhysFrag` and 7 non-test `set_completion(` are subsets), such as
+  `kernel/src/io/block.rs:116`, `kernel/src/drivers/ahci.rs:630`,
+  `kernel/src/drivers/xhci/storage.rs:747`, `kernel/src/io/ramdisk.rs:195`. `pub(crate) struct
+  InFlight(NonNull<Irp>)`, not Copy, minted only by io::block's dispatch (carrying the IrpBox
+  pointer, so completion has full provenance and the tests' complete path is Miri-clean). It offers
+  safe `op()`, `range()`, `frags()` (built once, empty for count 0, sum == length asserted when
+  minted), `rebase(&mut self, off)` for a partition, `complete(self, status, transferred)` which
+  consumes it, and `keep(self)` as an explicit leak for a command a stuck device may still move. A
+  debug Drop catches a token dropped without either. `BlockBackend::submit` takes it; AHCI's
+  `PendingRing` and storage's `IrpCmd`, `Action`, `stranded`, `rescan` and `Departed` hold it. The
+  hashed Tier-2 Irp layout is unchanged. In `kernel/src/io/irp.rs` or beside IrpBox in
+  `io/block.rs`. Closes: the RAM disk overrun (drv-d5), double or lost completion (drv-d3's IRP
+  would have been a dropped token), the three variants of null and zero-count handling, and safe fn
+  pointers that dereference raw arguments. Depends on: nothing. Lenses: abi, ownership,
+  opportunities. Value high, effort medium.
+
+- [ ] **drv-o2** encapsulate: kernel objects are adopted from a `KBox` and downcast from an
+  `ObjectRef` by hand. `ObjectRef::from_raw(KBox::into_raw(x).as_ptr() as *mut (),
+  KObjectType::Y)` is written inline or through the untyped safe `adopt` helpers, and `&*(r.as_ptr()
+  as *const DeviceNode|MemoryObject)` relies on "type checked by the caller" behind safe pub fns
+  (`dispatch_block_irp`, `max_frags`, `read_blocking`, `Partition::new`, `retire_window`,
+  `window_busy`, `device::register*`, `gpt::init`) — 50 sites in the subsystem's paths (27 casts by
+  python scan of non-test code, 10 `ObjectRef::from_raw(KBox::into_raw`, 13 `adopt` helper calls;
+  108 kernel-wide; lenses counted 25 to 146 depending on pattern breadth), such as
+  `kernel/src/io/block.rs:143`, `kernel/src/device.rs:98`, `kernel/src/drivers/mod.rs:197`,
+  `kernel/src/drivers/gpt.rs:56`. `pub unsafe trait KObject { const TYPE: KObjectType; }`, sealed
+  and implemented once per header-first `#[repr(C)]` object type; safe `ObjectRef::adopt<T:
+  KObject>(KBox<T>) -> ObjectRef` taking the tag from `T`; `ObjectRef::downcast<T: KObject>(&self) ->
+  Option<&T>` checking `object_type() == T::TYPE` (what `Counted::attach` does by hand at
+  io/stats.rs:104). Better still, `TypedRef<T: KObject>(ObjectRef)` with `Deref<Target = T>`, so
+  `dispatch_block_irp` takes `&TypedRef<DeviceNode>` and the registry stores
+  `TypedRef<DeviceNode>`. `from_raw` also gains a `debug_assert` that the header's tag equals `ty`.
+  In `kernel/src/object/header.rs`. Closes: the type-confused adopt (drv-d6) and unchecked casts
+  reached from safe signatures; it removes 27 of the subsystem's 96 raw derefs. Depends on:
+  nothing. Lenses: abi, ownership, soundness, opportunities. Value high, effort medium.
+
+- [ ] **drv-o3** encapsulate: DMA memory is read and written through raw pointers from
+  `DmaBuffer::virt()`, or u64 addresses kept beside the buffer, at hand-computed offsets: AHCI
+  command FIS, PRDT, command header and IDENTIFY page, the xHCI ERST, scratchpads and DCBAA, the
+  hub's ep0 data page (`data_bytes`, `control_in`), the storage wrapper and binding pages, and the
+  HID report buffer — 28 sites (18 `.virt()` sites outside tests behind about 30 unsafe blocks;
+  grep over ahci.rs and xhci/{mod,hub,storage,hid}.rs: ahci 8, xhci/mod 6, hub 4, storage 7, hid
+  3), such as `kernel/src/drivers/ahci.rs:389`, `kernel/src/drivers/xhci/storage.rs:474`,
+  `kernel/src/drivers/xhci/hub.rs:628`, `kernel/src/drivers/xhci/mod.rs:569`. Bounds-checked
+  volatile accessors on `DmaBuffer` taking `&self`: `read<T: Copy>(off)`, `write<T: Copy>(off, v)`,
+  `copy_from`, `copy_to`, `fill`, each checking `off + len <= self.len()`; `as_slice()` dropped
+  (a `&[u8]` over device-written memory is a data race in Rust's model); IDENTIFY copied once into
+  `[u16; 256]` so `format_identity` stops being unsafe; `DmaBuffer::region() -> DmaRegion { virt,
+  phys, len }` (Copy) with the same accessors for the addresses USB storage and HID keep. In
+  `kernel/src/mm/dma.rs`. Closes: a write past a DMA structure the device then follows — the
+  demonstrated `data_bytes` slice (drv-d8), the PRDT count guarded by convention twice
+  (ahci.rs:363-366, 491), the DCBAA slot index. Depends on: nothing. Lenses: abi, opportunities.
+  Value high, effort medium.
+
+- [ ] **drv-o4** encapsulate: device memory handed to a controller, then freed by drop on a path
+  that has not proved the controller quiescent: decline paths after a port or controller was
+  started, and teardown that forgets memory by hand when a stop fails — 9 sites (read:
+  ahci/bringup.rs:105, :112, :135; ahci.rs:285 (identify forgets `data` when `stop_port` fails);
+  xhci/mod.rs:500, :505, :511; xhci/hub.rs:289, :293), such as
+  `kernel/src/drivers/ahci/bringup.rs:105`, `kernel/src/drivers/xhci/mod.rs:505`,
+  `kernel/src/drivers/xhci/hub.rs:293`, `kernel/src/drivers/ahci.rs:285`. `struct
+  Programmed<T>(ManuallyDrop<T>)`, made when an address is written to a device; its Drop leaks, and
+  it releases `T` only through `fn release(self, _: Quiesced) -> T`, where `Quiesced` is minted only
+  by a stop that verified the device halted (AHCI `stop_port` returning true, xHCI HCH observed,
+  Disable Slot succeeding). Fits AHCI bring-up (cmd_list, fis, cmd_table), xHCI init (dcbaa,
+  scratchpads, rings) and `hub::release` (DeviceMem). In `kernel/src/mm/dma.rs`. Closes: device DMA
+  into memory the allocator has handed out again (drv-d11, drv-d12); the comment at
+  xhci/mod.rs:488-490 records a fixed instance. Depends on: nothing. Lens: soundness. Value high,
+  effort medium.
+
+- [ ] **drv-o5** encapsulate: IRP completion through each IRP's own inline Dpc — `set_completion` +
+  `dpc::enqueue(&(*irp).dpc)` in every driver, so the global DPC queue holds one entry per completed
+  IRP and its fixed reserve bounds nothing — 7 sites (`grep -rn
+  'dpc::enqueue(&(\*irp).dpc)\|enqueue(unsafe { &(\*irp).dpc })'` outside tests), such as
+  `kernel/src/io/block.rs:119`, `kernel/src/io/block.rs:515`, `kernel/src/drivers/ahci.rs:634`,
+  `kernel/src/drivers/xhci/storage.rs:751`. `pub(crate) unsafe fn io::block::complete(irp: *mut Irp,
+  status: i32, transferred: u64)` pushes the IrpBox onto an intrusive COMPLETED list (the box already
+  carries a link field) under a leaf `IrqSpinLock` and enqueues one static IRP DPC, which pops and
+  signals each PO and then moves the box to RECLAIM. The DPC queue then holds only static Dpcs, so
+  `DPC_RESERVE` is a real bound. It also replaces seven hand-written pairs with one call. In
+  `kernel/src/io/block.rs`. Closes: DPC-reserve exhaustion, a kernel panic reachable by any holder of
+  a block handle (drv-d2). Depends on: nothing. Lens: concurrency. Value high, effort small.
+
+- [ ] **drv-o6** encapsulate: "a DPC must never drop an `ObjectRef`" (the same-CPU SlabCache
+  deadlock, decision log 2026-08-06, and the earlier input bug input/mod.rs cites) is held by
+  hand-rolled hand-offs: io::block's RECLAIM list, `input::Reader`'s `parked`/`to_drop`/`delivering`,
+  console.rs's copy of Reader (`Inner`, `read_now`, `take_ready`, `owe`, `reclaim`, plus its own
+  `copy_into_memobj`), PS/2's `lights_done` Waiting/Completing/Completed, and the xHCI/storage PO
+  take-back (`Waiting` + `hub::wait`, `Owner::Hub` + `run_once`); `owe` overwrites `to_drop` and so
+  drops in place if its `debug_assert` breaks in a release build — 6 sites (4 reclaim hand-offs by
+  `grep -rn 'fn owe\b\|Completion::Completing\|RECLAIM.lock()\|fn take_back'`, plus the 2 PO
+  take-back sites; `sched::reap_pending` calls each by name, sched/exit.rs:441-445), such as
+  `kernel/src/drivers/console.rs:93`, `kernel/src/drivers/input/mod.rs:154`,
+  `kernel/src/drivers/ps2/mod.rs:258`, `kernel/src/drivers/xhci/storage.rs:1602`. One
+  `Handoff<T>` / `DeferredDrop<T>`: `park(T)`, allocation-free and refusing rather than dropping in
+  place; `lend(&mut self) -> Option<Loan<T>>` under the driver's lock, where `Loan` derefs to `T`
+  and its Drop is a debug panic; `give_back(Loan<T>)`; `take_owed()`/`take_all()` for thread
+  context only, dropping outside the lock; registered once with `reap_pending`. A `PoLease` on it
+  covers the timed waits. `console` moves onto `input::Reader` generic over its ring (`trait Drain {
+  fn is_empty(&self) -> bool; fn drain_into(&mut self, &mut [u8], now: u64) -> usize; }`) and
+  deletes its `copy_into_memobj` for `input::deliver`/`deliver_now`. In `kernel/src/libkern` or
+  `kernel/src/sched` (beside `deferred_drops`), with the console half in `drivers/input/mod.rs`.
+  Closes: an `ObjectRef`'s last drop in DPC or IRQ context, and another CPU dropping what a DPC is
+  using — both have bitten this codebase. Depends on: nothing. Lenses: abi, ownership, soundness,
+  concurrency, opportunities. Value high, effort medium.
+
+- [ ] **drv-o7** narrow: MMIO accessors are safe functions that dereference whatever base and offset
+  they are given. AHCI and xHCI `read32/write32/write64(base: u64, off: u64)`, PCI
+  `MmioCfg::read32/write32(off: u16)` over a 4 KiB window with no range or alignment check, and
+  storage's doorbell write. xHCI's operational, runtime and doorbell bases come from
+  CAPLENGTH/RTSOFF/DBOFF read from the device and are never checked against BAR0's mapped size
+  (xhci/mod.rs:354-355), and PORTSC offsets come from MaxPorts — 93 call sites of the three
+  accessors (`grep -cE '\b(read32|write32|write64)\('`: ahci.rs 28, bringup.rs 13, xhci/mod.rs 45,
+  hub.rs 6, hid.rs 1) behind 7 accessor definitions (ahci.rs:204, 210; xhci/mod.rs:252, 258;
+  pci/mod.rs:49, 58; storage.rs:524), such as `kernel/src/drivers/ahci.rs:204`,
+  `kernel/src/drivers/xhci/mod.rs:252`, `kernel/src/pci/mod.rs:55`,
+  `kernel/src/drivers/xhci/hub.rs:873`. `kvmap::map_mmio` returns `Mmio { base, len }` with safe
+  `read32(off)`/`write32(off, v)` asserting `off % 4 == 0 && off + 4 <= len`, and `sub(off, len) ->
+  Option<Mmio>` so xHCI's op/rt/db windows and AHCI's port window are checked once at init; PCI's
+  `MmioCfg` becomes a 0x1000-byte `Mmio`; a `cfg(test)` `Mmio::over(&'static mut [u32])` keeps the
+  AHCI fake-register tests. In `kernel/src/mm/kvmap.rs`. Closes: a device-supplied offset (DBOFF,
+  RTSOFF, MaxPorts, a slot ID) or a wrong base turning a register access into a write to arbitrary
+  kernel memory, and out-of-window or unaligned config reads through a safe trait method. Depends
+  on: nothing. Lenses: abi, soundness, opportunities. Value medium, effort medium.
+
+- [ ] **drv-o8** encapsulate: the scheduler's object calls (`complete_pending_op`,
+  `pending_op_is_signaled`, `pending_op_completion`, `signal_interrupt`, `interrupt_consume`,
+  `wait_on`) take `*mut ()` with "pinned by a reference the caller holds", and most callers pass
+  `.as_ptr()` of an `ObjectRef` they hold, each in its own unsafe block; a sleep is spelled
+  `wait_on(&[], ...)` (hub.rs:920) — 35 sites (47 calls outside tests in drivers/, io/ and
+  device.rs, 35 passing `as_ptr()` of a held ref; other lenses counted 31 and 32; 52 kernel-wide),
+  such as `kernel/src/io/block.rs:441`, `kernel/src/drivers/xhci/hub.rs:820`,
+  `kernel/src/drivers/input/mod.rs:217`, `kernel/src/device.rs:768`. Safe typed forms over a
+  borrowed, type-checked ref: `PoRef::complete(&self, status, result)`, `is_signaled`,
+  `completion`, `IntrRef::signal`/`consume`, `sched::wait_refs(&[&ObjectRef], deadline, now)` and
+  `sched::sleep_until(deadline)`; the borrow satisfies "pinned for the call". The remaining 12
+  genuinely raw sites (xHCI `PoPtr`, storage `Owner::Hub`, `irp.completion`, PS/2 lights, AHCI's
+  leaked wake/intr) keep the unsafe fn. In `kernel/src/sched/objects.rs` and
+  `kernel/src/sched/wait.rs`. Closes: a PO or interrupt operation on a wrong-typed or already-dead
+  object address. Depends on: drv-o2 (or a runtime `object_type()` check in each wrapper). Lenses:
+  soundness, concurrency, opportunities. Value medium, effort medium.
+
+- [ ] **drv-o9** encapsulate: AHCI slot-0 state (`inflight`, `issued_at`, `dead`, `fault`) is kept
+  as atomics with comments saying "accessed under pending's lock", plus `unsafe fn issue_locked`
+  whose contract is "the caller holds `pending` and slot 0 is idle" — 23 sites (`grep -c
+  'inflight\.\|issued_at\.\|\.dead\.\|fault\.\(load\|store\|compare\)' kernel/src/drivers/ahci.rs`),
+  such as `kernel/src/drivers/ahci.rs:506`, `kernel/src/drivers/ahci.rs:596`,
+  `kernel/src/drivers/ahci.rs:610`, `kernel/src/drivers/ahci.rs:727`. `IrqSpinLock<Port { ring:
+  PendingRing, slot0: Option<NonNull<Irp>>, issued_at: u64, fault: Fault, dead: bool }>` with a
+  safe `fn issue(port: &mut Port, regs: &Regs, irp)`, since the guard is the proof. The ISR's fault
+  report, its PxCI read and the retire happen in one hold, and the lock-free peeks (`due_at`,
+  `poll_disk`) take the lock. In `kernel/src/drivers/ahci.rs`. Closes: decisions taken on device or
+  driver state read outside the port lock (drv-d1), with the lock held by structure rather than by
+  comment. Depends on: nothing. Lens: concurrency. Value medium, effort small.
+
+- [ ] **drv-o10** narrow: `dpc::enqueue(&Dpc)` is a safe API whose borrow outlives the call —
+  static DPCs, IRP-inline DPCs and one stack DPC all go through it — 22 sites (`grep -rn
+  'dpc::enqueue\|enqueue(&' kernel/src --include=*.rs` outside dpc.rs: 12 static (ioapic.rs:145,
+  console.rs:212, xhci/mod.rs:640, ps2/mod.rs x6, ahci.rs x3), 8 IRP-inline (block.rs x4,
+  ahci.rs:572/634, storage.rs:751, ramdisk.rs:239), file_object.rs:1255, io/mod.rs:141 stack), such
+  as `kernel/src/dpc.rs:71`, `kernel/src/io/mod.rs:141`, `kernel/src/io/block.rs:119`,
+  `kernel/src/drivers/xhci/mod.rs:640`. `pub fn enqueue(dpc: &'static Dpc)` (the 12 static sites
+  need no change) and `pub unsafe fn enqueue_pinned(dpc: &Dpc)` whose `# Safety` says the Dpc stays
+  at its address until its handler has run; the 9 heap/IRP sites already sit in unsafe blocks, and
+  the stack Dpc in io/mod.rs becomes a static. In `kernel/src/dpc.rs`. Closes: use-after-free of a
+  queued Dpc reached from safe code (drv-d7). Depends on: nothing. Lens: soundness. Value medium,
+  effort small.
+
+- [ ] **drv-o11** encapsulate: a static `AtomicPtr<T>` is published once, then `unsafe { &*p }` with
+  "published once, never withdrawn" at every ISR, DPC and thread entry; xHCI already has a safe
+  `controller()` accessor (xhci/mod.rs:128) that five sites bypass by hand; Partition and RamDisk
+  are leaked with `unsafe { &*KBox::into_raw(b).as_ptr() }`, and AHCI patches `(*disk).sectors`
+  through the raw pointer after leaking it — 17 sites (13 unsafe derefs of `AHCI.load`/`XHCI.load`:
+  ahci.rs 647/676/688/814/822/834, xhci/mod.rs 131/517/637/653/776, hub.rs:123, hid.rs:1030; plus
+  4 hand leaks: bringup.rs:134, block.rs:608, io/mod.rs:52, ramdisk.rs:343), such as
+  `kernel/src/drivers/ahci.rs:647`, `kernel/src/drivers/xhci/mod.rs:653`,
+  `kernel/src/drivers/xhci/hid.rs:1030`, `kernel/src/io/block.rs:608`. `pub struct Published<T: Sync
+  + 'static>(AtomicPtr<T>)` with `const fn new()`, `fn publish(&self, b: KBox<T>) ->
+  Result<&'static T, KBox<T>>` (compare-exchange from null with Release, refusing a second publish)
+  and `fn get(&self) -> Option<&'static T>` (Acquire); a plain `KBox::leak(self) -> &'static T`
+  covers RamDisk and Partition. The `Sync` bound forces an argued `unsafe impl Sync` where `Xhci`
+  today shares `DmaBuffer` fields across CPUs without one (checked sound: `dcbaa` is written only by
+  the hub thread, scratchpads and ERST never after init). In `kernel/src/libkern` (beside KBox and
+  IrqSpinLock). Closes: a second publish silently replacing the first (drv-d4), and dereferencing a
+  published pointer before initialisation finishes. Depends on: nothing. Lenses: ownership,
+  soundness, concurrency, opportunities. Value medium, effort small.
+
+- [ ] **drv-o12** encapsulate: `BlockBackend`'s `ctx: *mut ()` is re-cast at every submit and poll
+  (Partition, AhciDisk, RamDisk), or is an integer smuggled through the pointer (USB slot/lun/epoch,
+  storage.rs:136; HID and PS/2 indexes, hid.rs:75). Its `submit`, `poll` and `ctx` fields are pub,
+  so safe code can pair any ctx with any submit; `window_of` identifies a Partition by comparing
+  fn-pointer addresses (block.rs:622) — 11 sites (read: `backend.submit`/`poll` calls at
+  block.rs:114, 316, 438, 523, 533, 574; ctx dereferences at block.rs:499, 573, 627, ahci.rs:486-488,
+  ramdisk.rs:232; other lenses counted 5 and 8), such as `kernel/src/io/block.rs:622`,
+  `kernel/src/io/block.rs:499`, `kernel/src/drivers/ahci.rs:486`, `kernel/src/io/ramdisk.rs:232`.
+  `enum BlockCtx { Partition(&'static Partition), Ahci(&'static AhciDisk), Ram(&'static RamDisk),
+  Usb { slot: u8, lun: u8, epoch: u32 }, #[cfg(test)] Test(..) }` dispatched by `match`, as
+  kernel/CLAUDE.md prefers, so `window_of` becomes `matches!(ctx, BlockCtx::Partition(p))`; or
+  private fields with `unsafe fn` submit/poll called only through `BlockBackend::submit(&self,
+  irp)`. In `kernel/src/io/block.rs`. Closes: reading one backend's context as another's type, and a
+  window missed on rescan because two function addresses compare equal or unequal (drv-d16).
+  Depends on: drv-o11 (for the `'static` device refs). Lenses: ownership, soundness, opportunities.
+  Value medium, effort medium.
+
+- [ ] **drv-o13** encapsulate: the storage `Dev` and HID `Bound` table entries keep raw u64 virtual
+  addresses of rings, wrapper, binding and report pages that live in `DeviceMem.class`, owned by
+  the hub thread. `RawSlots(u64)` is a safe struct whose read and write dereference any address,
+  and every access argues the memory lives "as long as the entry is in the table"; the
+  free-after-Disable-Slot order is held by the call order of `depart` and `release`. hid's
+  `RawSlots` also lacks the Release fence that `DmaSlots` and storage's `RawSlots` put before the
+  cycle dword — 10 sites (unsafe blocks over a stored address: storage.rs 215, 224, 229, 474, 478,
+  532, 1277; hid.rs 375, 384, 817; addresses captured at storage.rs:861/870/872 and
+  hid.rs:446/463), such as `kernel/src/drivers/xhci/storage.rs:202`,
+  `kernel/src/drivers/xhci/storage.rs:1277`, `kernel/src/drivers/xhci/hid.rs:362`,
+  `kernel/src/drivers/xhci/hid.rs:817`. `Dev` and `Bound` own their DmaBuffers, moved in by `bind`;
+  `struct DmaRing { mem: DmaBuffer, producer: Producer }` with one bounds-checked `Slots` impl;
+  `storage::depart` and `hid::depart` return them in `Departed`, and `finish()` frees them only
+  when `release()` disabled the slot (`Released::Freed`), forgetting them otherwise (the idea
+  `Retired(KVec<DmaBuffer>)` + a `SlotDisabled` proof from a successful Disable Slot). The storage
+  tests' `Fake` would allocate DmaBuffers on the host heap. In `kernel/src/drivers/xhci/`
+  (`ring.rs`, `storage.rs`, `hid.rs`, `hub.rs`). Closes: a table entry outliving the memory it
+  addresses (the DPC touching a freed ring or report page), freeing a device's memory before its
+  slot is disabled, and safe `RawSlots` writes to an arbitrary address. Depends on: drv-o3 and
+  drv-o4 for the accessors and for `release` (not required). Lenses: ownership, soundness,
+  opportunities. Value medium, effort medium.
+
+- [ ] **drv-o14** remove: MemoryObject bytes are read through hand-computed HHDM pointers (frame +
+  `hhdm_offset`) instead of a bounded accessor, and `copy_into_memobj` is duplicated as an `unsafe
+  fn(*const ())` (console.rs:115, input/mod.rs:241) although every caller holds an `&ObjectRef`,
+  which pins the object just as well — 10 sites (2 `copy_into_memobj` definitions, 4 unsafe calls
+  at console.rs:156/176 and input/mod.rs:215/229, 4 HHDM frame reads at block.rs:450-458,
+  drivers/mod.rs:190-194, input/mod.rs:255-260, io/mod.rs:111-119, from `grep -rn 'hhdm_offset()'
+  kernel/src/drivers kernel/src/io`), such as `kernel/src/io/block.rs:458`,
+  `kernel/src/drivers/input/mod.rs:260`, `kernel/src/drivers/console.rs:115`,
+  `kernel/src/drivers/mod.rs:194`. `MemoryObject::copy_out(&self, offset: usize, dst: &mut [u8]) ->
+  usize`, the bounded twin of the existing `copy_in`; `copy_into_memobj` then takes `buffer:
+  &ObjectRef` and becomes safe, and the console uses the one shared helper. In
+  `kernel/src/object/memory_object.rs` and `kernel/src/drivers/input/mod.rs`. Closes: reads past a
+  MemoryObject's frames held only by `sys_io_submit`'s earlier bound, and a dangling `*const ()`
+  reaching the copy. Depends on: nothing (drv-o2 optional). Lenses: opportunities, soundness
+  (the console copy). Value medium, effort small.
+
+- [ ] **drv-o15** encapsulate: a PendingOperation is borrowed by raw pointer (`PoPtr`,
+  `Owner::Hub { po }`, `Action::Hub`) while the hub thread's `ObjectRef` pins it, and "take the
+  record back on timeout, else wait for the completion already on its way" is hand-written twice;
+  registration overwrites an armed record silently (the shape of drv-d3) — 10 sites (record
+  registration hub.rs:651, 679, 714, 791 and storage.rs:1516 (`issue_hub`); waits hub.rs:816
+  (`wait`) and storage.rs:1291 (`run_once`); DPC completions xhci/mod.rs:704, :753 and
+  storage.rs:775), such as `kernel/src/drivers/xhci/hub.rs:816`,
+  `kernel/src/drivers/xhci/storage.rs:1291`, `kernel/src/drivers/xhci/mod.rs:746`. `Armed<'po>`,
+  made by `arm(&ObjectRef, slot: &IrqSpinLock<Option<Waiting>>)`, with `wait(self, bound) ->
+  Option<(u8, u64)>` doing take-back-or-wait-out; the DPC side gets a `Completer` it must consume
+  via `complete(code, result)` after letting the lock go. The raw pointer never leaves the pair,
+  and registration refuses while a record is already armed. In `kernel/src/drivers/xhci/mod.rs`
+  (or `sched`, beside `wait_on`). Closes: completing a PO after its waiter dropped it, and one
+  record silently replacing another. Depends on: nothing. Lens: ownership. Value medium, effort
+  medium.
+
+- [ ] **drv-o16** encapsulate: three hand-written `Slots` impls over TRB ring memory (xhci/mod.rs
+  `DmaSlots`, storage.rs `RawSlots`, hid.rs `RawSlots`) disagree on ordering: `DmaSlots` and
+  storage fence(Release) before the cycle dword, hid writes all four dwords with no fence although
+  the `Slots` trait says dword 3 hands the TRB over, and all three read the cycle dword last
+  (drv-d20) — 3 sites (`grep -n 'impl Slots for' kernel/src/drivers` minus the test impl in
+  ring.rs, 9 volatile accesses between them), such as `kernel/src/drivers/xhci/mod.rs:223`,
+  `kernel/src/drivers/xhci/storage.rs:204`, `kernel/src/drivers/xhci/hid.rs:364`. One
+  `struct RingMem { virt: u64 }` in ring.rs implementing `Slots`: `read` loads dword 3, then
+  `fence(Acquire)`, then dwords 0..2; `write` stores dwords 0..2, `fence(Release)`, then dword 3;
+  built only from a `DmaBuffer` of `RING_TRBS * 16` bytes (`RingMem::of(&DmaBuffer)`), so the
+  TRB-count invariant behind every SAFETY comment holds by construction. In
+  `kernel/src/drivers/xhci/ring.rs`. Closes: accepting a torn event TRB, and a ring copy that hands
+  a TRB to the controller before its fields are in place; hid is ordered today only by x86 TSO,
+  which matters once aarch64 lands. Depends on: drv-o3's region accessors (optional). Lenses: abi,
+  concurrency. Value medium, effort small.
+
+- [ ] **drv-o17** narrow: `arch/x86_64/ps2.rs` opens a separate `unsafe { inb(..) }` or `unsafe {
+  outb(..) }` at every access to the i8042's two fixed ports, restating the same SAFETY argument —
+  12 sites (`grep -c 'unsafe { inb\|unsafe { outb' kernel/src/arch/x86_64/ps2.rs`; the other 2 of
+  14 unsafe blocks are ioapic installs), such as `kernel/src/arch/x86_64/ps2.rs:71`,
+  `kernel/src/arch/x86_64/ps2.rs:95`, `kernel/src/arch/x86_64/ps2.rs:147`,
+  `kernel/src/arch/x86_64/ps2.rs:179`. Four private fns `status() -> u8`, `read_data() -> u8`,
+  `write_cmd(u8)` and `write_data(u8)` holding the only unsafe port accesses; `pulse_reset` stays
+  `unsafe fn` for its machine-reset contract. In `kernel/src/arch/x86_64/ps2.rs`. Closes: no defect
+  class; it cuts 12 SAFETY arguments to 4. Depends on: nothing. Lenses: ownership, opportunities.
+  Value low, effort small.
+
+- [ ] **drv-o18** narrow: `unsafe fn Counted::attach(&self, node: &ObjectRef)` stores a pointer into
+  a DeviceNode's `IoStats` on the contract "registered in the device table, which holds it
+  forever", but `register()` returns nothing, so callers cannot tell when the table dropped the node
+  (drv-d17) — 3 sites (`grep -rn '\.attach(&' kernel/src | grep -v tests.rs`: ahci.rs:468,
+  ramdisk.rs:365, storage.rs:1085; device.rs:1291 is in a test), such as
+  `kernel/src/drivers/ahci.rs:468`, `kernel/src/io/ramdisk.rs:365`,
+  `kernel/src/drivers/xhci/storage.rs:1085`. Make `attach` safe: it checks the type as it already
+  does and pins the node with its own reference (`node.clone().into_raw()`, never released), so the
+  counters outlive every `record()` whatever the registry did; alternatively `register()` returns
+  `bool` and `attach` takes the registry's proof. In `kernel/src/io/stats.rs`. Closes: a dangling
+  `IoStats` pointer when registration failed under memory pressure. Depends on: nothing. Lens:
+  opportunities. Value low, effort small.
+
+What held up: IrpBox lifetime. `_po`, `_buffer` and `_device` pin every raw pointer in the Irp;
+`irp_complete_dpc` signals the PO and links the box onto the allocation-free RECLAIM list as its
+last access; `reclaim_completed` frees it in thread context exactly once; `run_pending_in` clears
+`queued` before the handler and never touches the Dpc after it. The partition Dekker pair
+(`entering` / `retired`, SeqCst on all four accesses) is host-tested through `partition_submit`.
+Fragment bounds hold on every path: `dispatch_block_irp*` refuse `max_frags` overruns before the box
+exists, `sys_io_submit` bounds `buf_offset + length` by the page-rounded `MemoryObject::size()`,
+AHCI's `MAX_PRDT_ENTRIES` is derived from `CMD_TABLE_BYTES` and USB storage clamps to `MAX_FRAGS`.
+`read_blocking` checks `pending_op_is_signaled` before trusting status 0. Parsers hold:
+`partitions.rs` (entry size 128..=512 dividing the block, capped at 32 blocks, checked counts,
+`fits()`), the xhci `desc.rs` walkers (every `bLength` bounded by `wTotalLength` and the bytes
+received, stop at zero), the HID report-descriptor walk (checked `mul`/`add`, `REPORT_BITS_LIMIT`,
+bounded push stack, reads through `get`), and PCI (capability walk masked to 0xFC and slot-bounded,
+`read_msi` refuses structures past 0x100). The AHCI FAULTED/RECOVERING protocol keeps a command
+that was really in flight retired exactly once, and a port that will not stop keeps its command and
+buffers (drv-d1 is the one path that bypasses it, for an idle slot). xHCI init boxes the controller
+before RUN, `hub::release` and `storage::finish` disable the slot before freeing or completing, and
+`hub::wait` / `run_once` take the record back under its lock or wait out the DPC's completion.
+Epoch-encoded USB disk and HID node contexts are refused under the device lock once a slot is
+reused, and `depart` removes table entries under their locks before the memory goes. The
+`input::Reader`, console and PS/2 lights hand-offs never drop an `ObjectRef` in a DPC. Lock ranks
+hold: no leaf lock is held across `complete_pending_op` or `signal_interrupt`, and
+`bind_partition_names` releases PARTITIONS before `Namespace::bind`. `device.rs` `announce` /
+`read_changes` lose no wakeup. `Xhci` is shared across CPUs without `Sync`, but `dcbaa` is written
+only by the hub thread and the scratchpads and ERST never after init, so no race. The tests caught
+the breaks in drv-d1 through drv-d8, drv-d14, drv-d18 and drv-d21, and the boot caught drv-d4.
