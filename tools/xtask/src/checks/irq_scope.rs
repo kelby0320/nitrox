@@ -1,4 +1,5 @@
-//! `check-irq-scope`: every interrupt entry stub opens the lock-ordering scope.
+//! `check-irq-scope`: every interrupt entry stub opens the lock-ordering scope, and clears DF and
+//! AC before any kernel code runs.
 
 use crate::*;
 
@@ -32,6 +33,30 @@ pub(crate) fn scope_binding(line: &str) -> ScopeBinding {
     if binding == "_" { ScopeBinding::Discarded } else { ScopeBinding::Held }
 }
 
+/// Whether the stub whose `dispatch = sym` is on line `at` opens with `entry_prologue!`, scanned
+/// back to its `naked_asm!(`; a comment naming the macro does not count.
+pub(crate) fn stub_uses_prologue(lines: &[&str], at: usize) -> bool {
+    let start = lines[..=at].iter().rposition(|l| l.contains("naked_asm!(")).unwrap_or(at);
+    lines[start..at].iter().any(|l| {
+        let t = l.trim();
+        !t.starts_with("//") && t.contains("entry_prologue!(")
+    })
+}
+
+/// Whether the `entry_prologue!` defined in `text` clears DF and AC (`cld`, `clac`) before its
+/// first push; `None` if `text` defines none. Comment lines are left out of the reading.
+pub(crate) fn prologue_clears_flags(text: &str) -> Option<bool> {
+    let start = text.find("macro_rules! entry_prologue")?;
+    let code: String = text[start..]
+        .lines()
+        .take_while(|l| *l != "}")
+        .filter(|l| !l.trim().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let head = &code[..code.find("push").unwrap_or(code.len())];
+    Some(head.contains("cld") && head.contains("clac"))
+}
+
 /// How many naked entry stubs `check-irq-scope` expects to find.
 ///
 /// A count, because a stub can leave the scan's view without leaving the kernel — by being
@@ -63,7 +88,10 @@ const SYM_OPERAND_ALLOWLIST: &[&str] = &[
 /// 1. every `dispatch = sym NAME` in a naked entry stub must name a function defined by the
 ///    `irq_dispatcher!` macro, which opens the scope itself; and
 /// 2. that macro must in fact still call `enter_interrupt` — otherwise rule 1 checks that
-///    everyone went through a door that no longer leads anywhere.
+///    everyone went through a door that no longer leads anywhere; and
+/// 3. every stub whose dispatcher that macro generated must open with `entry_prologue!`, defined
+///    in the same file, whose first instructions are `cld` and `clac`: on an interrupt nothing
+///    else clears the DF and AC ring 3 may have left (`syscall` has its SFMASK).
 ///
 /// Arch-generic: it walks `kernel/src/arch`, so an aarch64 entry path is covered the day it exists.
 ///
@@ -96,6 +124,9 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
     let mut stray_sym: Vec<(String, String)> = Vec::new();
     // Files that define the macro, and whether the definition still opens a scope.
     let mut macro_defs: Vec<(String, Option<ScopeBinding>)> = Vec::new();
+    // Stubs not opening with `entry_prologue!`, and per stub file whether that macro clears DF/AC.
+    let mut unprologued: Vec<(String, String, String)> = Vec::new();
+    let mut prologue_defs: Vec<(String, Option<bool>)> = Vec::new();
 
     visit_rs_files(&arch_dir, &mut |path| {
         let text = fs::read_to_string(path)?;
@@ -108,7 +139,14 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
             if let Some(rest) = line.split("dispatch = sym").nth(1) {
                 let name: String = rest.trim().chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
                 if !name.is_empty() {
-                    called.push((format!("{}:{}", path.display(), i + 1), path.display().to_string(), name));
+                    let site = format!("{}:{}", path.display(), i + 1);
+                    if !stub_uses_prologue(&lines, i) {
+                        unprologued.push((site.clone(), path.display().to_string(), name.clone()));
+                    }
+                    if !prologue_defs.iter().any(|(f, _)| *f == path.display().to_string()) {
+                        prologue_defs.push((path.display().to_string(), prologue_clears_flags(&text)));
+                    }
+                    called.push((site, path.display().to_string(), name));
                 }
             }
 
@@ -219,6 +257,31 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
             Some(ScopeBinding::Held) => {}
         }
     }
+    for (site, file, name) in &unprologued {
+        if generated.iter().any(|(f, g)| f == file && g == name) {
+            violations.push(format!(
+                "{site}: the interrupt stub dispatching to `{name}` does not build its frame with \
+                 `entry_prologue!`, so nothing clears DF and AC before kernel code runs: ring 3 \
+                 may have left either set"
+            ));
+        }
+    }
+    for (file, clears) in &prologue_defs {
+        let has_interrupt_stub =
+            called.iter().any(|(_, f, name)| f == file && generated.iter().any(|(gf, g)| gf == file && g == name));
+        match clears {
+            _ if !has_interrupt_stub => {}
+            None => violations.push(format!(
+                "{file}: interrupt stubs here, but no `entry_prologue!` defined beside them to \
+                 clear DF and AC"
+            )),
+            Some(false) => violations.push(format!(
+                "{file}: `entry_prologue!` does not run `cld` and `clac` before its first push, \
+                 so a stub entered from ring 3 runs with whatever DF and AC user code left"
+            )),
+            Some(true) => {}
+        }
+    }
     if called.len() != EXPECTED_ENTRY_STUBS {
         violations.push(format!(
             "found {} entry stub(s), expected {EXPECTED_ENTRY_STUBS}. A stub that leaves \
@@ -251,7 +314,7 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
     if violations.is_empty() {
         println!(
             "check-irq-scope: {} entry stub(s) → {} scoped dispatcher(s) + {} ring-3 \
-             entry point(s) ✓",
+             entry point(s); every interrupt stub clears DF and AC first ✓",
             called.len(),
             generated.len(),
             user_entry.len()
@@ -261,7 +324,8 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
         let mut msg = String::from(
             "every interrupt entry must open a lock-ordering scope — define the dispatcher \
              with the `irq_dispatcher!` macro (see kernel/src/libkern/lockrank.rs \
-             § Interrupt scopes):\n",
+             § Interrupt scopes) — and build its frame with `entry_prologue!`, which clears DF \
+             and AC first:\n",
         );
         for v in &violations {
             msg.push_str("  ");

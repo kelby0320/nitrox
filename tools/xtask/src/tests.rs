@@ -472,6 +472,47 @@ fn scope_binding_tells_a_held_guard_from_one_dropped_where_it_is_made() {
     assert_eq!(scope_binding("/// calls enter_interrupt()"), ScopeBinding::Temporary);
 }
 
+/// Rule 3: an interrupt stub builds its frame with `entry_prologue!`, and that macro clears DF and
+/// AC before its first push. Each refusal below is a way the rule could be met in name only.
+#[test]
+fn an_interrupt_stub_opens_with_a_prologue_that_clears_df_and_ac() {
+    use super::{prologue_clears_flags, stub_uses_prologue};
+
+    let stub = |body: &'static str| -> Vec<&'static str> {
+        vec![
+            "extern \"C\" fn timer_stub() {",
+            "    ::core::arch::naked_asm!(",
+            body,
+            "        \"call {dispatch}\",",
+            "        dispatch = sym timer_dispatch,",
+        ]
+    };
+    assert!(stub_uses_prologue(&stub("        entry_prologue!(\"push 0\\n\", 0x20),"), 4));
+    assert!(!stub_uses_prologue(&stub("        concat!(\"push 0\\n\", \"push rax\\n\"),"), 4));
+    assert!(!stub_uses_prologue(&stub("        // entry_prologue!(\"push 0\\n\", 0x20),"), 4));
+    // A prologue in the stub above does not count for this one.
+    let mut two = stub("        entry_prologue!(\"push 0\\n\", 0x20),");
+    two.extend(stub("        concat!(\"push rax\\n\"),"));
+    assert!(!stub_uses_prologue(&two, 9));
+
+    let def = |first: &str| {
+        format!(
+            "/// clears DF and AC\nmacro_rules! entry_prologue {{\n    ($e:literal, $v:tt) => {{\n        concat!(\n            {first}\n            $e,\n            \"push \",\n        )\n    }};\n}}\n"
+        )
+    };
+    assert_eq!(prologue_clears_flags(&def("\"cld\\nclac\\n\",")), Some(true));
+    assert_eq!(prologue_clears_flags(&def("\"cld\\n\",")), Some(false), "clac left out");
+    assert_eq!(prologue_clears_flags(&def("// \"cld\\nclac\\n\",")), Some(false), "only in a comment");
+    assert_eq!(
+        prologue_clears_flags(
+            "macro_rules! entry_prologue {\n    () => { concat!(\"push rax\\ncld\\nclac\\n\") };\n}\n"
+        ),
+        Some(false),
+        "cleared only after a push"
+    );
+    assert_eq!(prologue_clears_flags("macro_rules! other {}\n"), None);
+}
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);

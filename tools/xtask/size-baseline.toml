@@ -3,7 +3,6 @@
 # by hand, in a reviewed commit of its own that says why.
 [files]
 "kernel/src/arch/x86_64/acpi.rs" = 1040
-"kernel/src/arch/x86_64/idt.rs" = 1034
 "kernel/src/device.rs" = 1414
 "kernel/src/drivers/xhci/hid.rs" = 1106
 "kernel/src/drivers/xhci/storage.rs" = 1705
