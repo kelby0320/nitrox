@@ -3833,3 +3833,414 @@ today. Password scrubbing holds at every hop except session-mgr's `pass` and lib
 state. The broker's cached endpoints cannot go stale (restart policy `never`). No host test
 reaches any of the 175 unsafe blocks, and Miri cannot run them because each makes a syscall.
 The breaks that tests caught are sec-d1, sec-d4, sec-d8 and sec-d2.
+
+### filesystems — main at 135055a8, 2026-10-27
+
+Lenses: abi, ownership, soundness, opportunities; returned nothing: none.
+Defects: found 12, refuted by a boot 0, reported 10 (two pairs of duplicates merged). Opportunities: 11 (25 proposed, merged by pattern).
+
+The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/fs-server-fat userspace/libfsserver`:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `userspace/fs-server-ext4` | 2617 | 1 | 0 | 0 | 1 | 0 | 0 | 1 | 0 | 0 | 0 |
+| `userspace/fs-server-fat` | 2427 | 1 | 0 | 0 | 1 | 0 | 0 | 1 | 0 | 0 | 0 |
+| `userspace/libfsserver` | 1631 | 80 | 1 | 0 | 11 | 40 | 15 | 0 | 0 | 0 | 0 |
+| `total` | 6675 | 82 | 1 | 0 | 13 | 40 | 15 | 2 | 0 | 0 | 0 |
+
+**Defects**
+
+- [ ] **fs-d1** `userspace/fs-server-ext4/src/ext4.rs:870` — Block and inode bitmaps are indexed
+  by a bit number bounded by s_blocks_per_group / s_inodes_per_group. `parse_superblock`
+  (ext4.rs:292-303) never checks those against the 8*block_size bits a bitmap block holds, and
+  only `bitmap[..bs]` of the 4 KiB `[0u8; MAX_BLOCK]` scratch is read or written back. A bit past
+  32767 indexes out of the buffer and panics. A bit between bs*8 and 32767 reads the scratch's
+  unread zero tail as free, and the bit set there is never written. Panic: a 4 KiB-block ext4
+  image (a USB stick) with s_blocks_per_group = 65536, s_blocks_count = 65536, group 0's bitmap
+  all 0xFF and a nonzero bg_free_blocks_count passes `check_device`, and the server says Ready.
+  The first grow reaches `alloc_run`, which scans past bit 32767. `bit_clear` indexes
+  bitmap[4096], the server panics and exits, and every client is failed with PeerClosed. Double
+  allocation: on 1 KiB blocks, s_blocks_per_group = 16384 (the bitmap holds 8192 bits) and a full
+  group-0 bitmap. Bits 8192..16383 read as free from the zeroed tail, so the same block goes to
+  every grow. The same pattern sits at `alloc_inode` (1093/1096), `free_run` (1388/1389) and
+  `free_inode` (1329). Linux refuses both geometries in `ext4_fill_super`.
+  Demonstrated: probe tests in fs-server-ext4/src/volume/hostile_tests.rs, since removed. (a)
+  `fixture_blocks(4096, 4096, 0)`, sb+32 = 65536, sb+4 = 65536, group-0 bitmap filled with 0xFF:
+  `vol.check()` returned Ok; `vol.grow_file("/system/current-generation", 100000)` panicked with
+  'index out of bounds: the len is 4096 but the index is 4096' at ext4.rs:686:5. (b)
+  `fixture_blocks(1024, 16384, 0)`, created /a and /b, set sb+32 = 16384, filled the bitmap with
+  0xFF, bg_free_blocks_count = 100: `check()` Ok; `grow_file` on /a and /b both returned Ok(0);
+  `map_file` gave both `[BlockRun { file_block: 0, device_lba: 8193, length: 1 }]`, one block
+  given to two files, and group 1's first block, which the grow also zeroed. Run with
+  `cd userspace && cargo test -p fs-server-ext4 --lib probe_ -- --nocapture`. abi. High.
+
+- [ ] **fs-d2** `userspace/fs-server-ext4/src/ext4.rs:296` — The group-descriptor stride is read
+  from s_desc_size even though 64bit is refused. Linux and e2fsprogs use 32 whenever 64bit is off
+  (`EXT2_DESC_SIZE`). On a filesystem with s_desc_size nonzero and 64bit off, every descriptor
+  offset after group 0 (`read_inode`, `inode_offset`, `group_desc_offset`) disagrees with every
+  other tool. An ext4 filesystem that `e2fsck -fn` calls clean, with s_desc_size = 64 and 64bit
+  off: the server reads group g's descriptor at 64*g, which is Linux's group 2g. Files whose
+  inodes are in group 1 resolve NotFound. Once group 0's inodes are used up, a create takes its
+  bit from the wrong group's bitmap, hands out an inode number already in use, writes the new
+  inode over another (Linux's inode 257), and links the new name to an existing file whose link
+  count stays 1. Removing either name then frees what the other still reaches.
+  Demonstrated: probe (removed), `fixture_blocks(1024, 32768, 65536)`, 4 groups of 128 inodes,
+  s_desc_size = 0 from mke2fs. Created 200 files, then set sb+254 = 64. `e2fsck -fn` reported
+  clean. `map_file("/f126")` (inode 141, group 1) returned Err(NotFound). `create_file("/new")`
+  returned Ok with inode 129, already a file's. e2fsck afterwards, s_desc_size reset to 0: 'Inode
+  129 ref count is 1, should be 2' and 'Unattached zero-length inode 257'. Fix: desc_size = 32
+  while 64bit is refused. abi. Medium.
+
+- [ ] **fs-d3** `userspace/fs-server-ext4/src/extent.rs:685` — That each tree block has one parent
+  is held only by convention. `cut()` and `free_tree()` walk and free a child once per index
+  entry that names it, so a block named by several entries is freed repeatedly, and the work
+  multiplies by up to block_cap (340 at 4 KiB) at each level. At depth 5 that is about
+  4*340^4 = 5e10 leaf walks. A crafted ext4 file whose extent tree reuses one child block under
+  many index entries, when unlinked (`release_inode` -> `free_inode_blocks` -> truncate 0),
+  truncated, or grown (`grow_file_from` cuts past the old end first), keeps the single-threaded
+  server in the walk for practically ever. A forwarded resolve has no deadline, so every client
+  of the filesystem waits. The shared blocks are also freed many times: `free_run` tolerates that
+  by counting only bits that were set, and i_blocks is clamped.
+  Demonstrated: probe in extent.rs tests (removed). `interleaved(12)` builds a depth-1 tree with
+  one leaf of 12 extents. The root was rewritten to 4 index entries naming that same leaf.
+  `truncate(..., keep 0)` returned Ok after 156 device writes against 39 for the honest tree: 4x,
+  one walk per naming entry. Each further level multiplies by its node's entry count; `header()`
+  allows depth 5. A depth-2 tree (one index block of 340 entries naming one leaf) would settle
+  the full blowup, expected ~1360x. abi. Medium.
+
+- [ ] **fs-d4** `userspace/libfsserver/src/disk.rs:37` — `po_wait` closes the PendingOperation
+  and returns (-1, 0) whenever `sys_wait` returns anything other than one signalled record,
+  without the I/O having completed. `Disk`, `SectorDisk` and `PartitionIo` then return
+  `FsError::Io` and reuse the same scratch MemoryObject for the next transfer, while the
+  abandoned IRP still holds that object and DMAs into it. Latent: giving `po_wait` a deadline (so
+  a server does not hang on a stick pulled mid-transfer), or any new `sys_wait` failure, makes it
+  bite. A read that times out returns Err; `MetaCache::read_meta` (cache.rs:117-118) at once
+  reissues the read into the same scratch, and `Disk::read_at` builds a `&[u8]` over a page the
+  first transfer may still be writing. On `SectorDisk`: (1) READ of run A is submitted into the
+  scratch; (2) the wait returns early and the PO is closed, so `read_at` returns Io; (3) FAT's
+  'a failed write may have landed' undo calls `write_at(B)`, which copies B's bytes into the
+  scratch and submits a WRITE; (4) A's READ DMA completes into the scratch; (5) the WRITE's DMA
+  reads the scratch, and A's bytes land on disk at B. The same give-up is copied into
+  server.rs:407-414 (`forget`, where it errs safely: the file is kept), nxinstall/src/main.rs:102
+  and test-harness/src/pattern.rs:265. The kernel-side twin was #396.
+  Unverified: today the `waited != 1` branch cannot be reached. `sys_wait`
+  (kernel/src/syscall/table.rs:1763) returns early only for TimedOut (no deadline is given), for
+  OutOfMemory (`PendingOperation::add_waiter` fails only past MAX_WAITERS, and the server is the
+  PO's only waiter), or for Ended at process exit. `sys_io_cancel` is always Unsupported, and
+  the kernel `IrpBox` holds the buffer (io/block.rs:178-185). A host seam for disk.rs's two
+  syscalls (as libos/src/sys.rs has) whose wait returns TimedOut once would settle it: the next
+  submit would name the same scratch. Path: disk.rs:19-38, :106-108, :245-247, then
+  cache.rs:115-119. soundness, opportunities. Medium.
+
+- [ ] **fs-d5** `userspace/libfsserver/src/server.rs:992` — `server::run` and `server::bootstrap`
+  (server.rs:979) are safe `pub fn`s, but they reach the eleven process-global `static mut`
+  buffers (RECV_MSG, REPLY_MSG, REPLY_HANDLES, FORGET_MSG, CONTENT, WAIT_*, SESSION_*, CONTROL,
+  DIR_BODY), and every SAFETY argument rests on 'single-threaded'. Nothing in their signatures
+  stops a second thread, or a `Volume` impl called from inside `serve()`, from calling either.
+  Scenario 1: a second serve loop on another thread (one way to lift TODO(server-fanout), or to
+  serve two volumes from one process). Thread A, in `handle_forwarded_resolve`, holds
+  `req = received()`, a `&'static` over RECV_MSG, across `serve()`. Thread B's
+  `recv_on(serve_end)` has the kernel write the next message into RECV_MSG, so A parses B's
+  request. Both stamp REPLY_MSG and REPLY_HANDLES, so a reply can carry the other's memory object
+  or device duplicate, and B's `send_forwarded` failure path closes a handle A staged. Scenario
+  2: a `Volume` impl calls `bootstrap` from `map_file` or `read_file`, and the kernel overwrites
+  RECV_MSG under the live `req`. Neither server does either today. The SAFETY comments at :61,
+  :113, :122, :308, :764 and :1022 all justify themselves as 'single-threaded'. The two `_start`
+  fns are likewise safe `pub fn`s that make a `&mut` to STORE.
+  Unverified: no host test reaches `run` or `bootstrap`, since the first act of each is a raw
+  syscall, and Miri cannot run syscalls. Making both `unsafe fn` with a one-thread contract, or
+  handing the buffers out once through an AtomicBool-guarded take with a host test that a second
+  take is refused, would settle it. ownership, soundness. Medium.
+
+- [ ] **fs-d6** `userspace/fs-server-ext4/src/ext4.rs:547` — A directory session's ReadDir cursor
+  is supplied by the client (server.rs:625) and used as a raw byte offset into the directory,
+  checked only against the block's bounds, not the record grid. Bytes at a non-record offset,
+  such as the inside of a name the client chose, are parsed as a record and their inode is
+  stat'ed. A client with a session on /box mkdirs a name whose bytes form a record (inode 14,
+  rec_len 0x0C0C, name_len 1), then sends ReadDir with cursor 32, inside that name. The reply
+  holds an entry for inode 14, /system/current-generation, outside /box, with its mode, size and
+  mtime: metadata disclosure past the session's confinement, no memory unsafety. FAT's cursor is
+  a slot number and cannot land mid-entry.
+  Demonstrated: probe (removed), `fixture_blocks(4096, 4096, 0)`; `mkdir_at(2, "box")`;
+  `mkdir_at(box, <14 LE u32, 0x0C0C LE, 1, 1, 'X','Y','Z','W'>)`; `vol.read_dir(box, 12+12+8, ..)`
+  emitted `[(14, 33204, 21, [88])]`: inode 14, mode 0o100664, size 21, name "X". Fix: validate
+  the cursor by walking its block from offset 0 to it, or encode it as a block plus record
+  index. abi. Low.
+
+- [ ] **fs-d7** `userspace/fs-server-ext4/src/ext4.rs:1136` — Names entering ext4 through a
+  session are checked only for '/', '.' and '..' (libfsserver's `entry_name`, serve.rs:20, plus
+  ext4's own '/' and length checks in `dir_insert`, `mkdir_at`, `create_file`). A name containing
+  NUL bytes is written to disk, and e2fsck and Linux call it illegal. FAT's `names::valid`
+  refuses control characters. Any process with a directory session sends Mkdir (or a rename, or
+  a RESOLVE_CREATE name) containing 0x00 bytes; the server writes the entry, and `e2fsck -fn`
+  then reports the filesystem damaged.
+  Demonstrated: same probe as fs-d6: `mkdir_at(box, <name with three 0x00 bytes>)` returned Ok;
+  `e2fsck -fn` printed "Entry '^N^@^@^@^L^L^A^AXYZW' in /box (15) has illegal characters in its
+  name. Fix? no". abi. Low.
+
+- [ ] **fs-d8** `userspace/libfsserver/src/disk.rs:76` — If a later step fails, `Disk::new` and
+  `SectorDisk::new` leak what they have already made. Neither has a `Drop`, so a dropped one
+  keeps its scratch memory object and mapping (and `Disk` its 64 KiB zero span) for the life of
+  the process. `PartitionIo`, beside them, does both properly. `Disk::new`: if SYS_MEMORY_MAP
+  fails, the scratch handle stays open (disk.rs:76-78); if the zero span's SYS_MEMORY_CREATE
+  fails, the scratch handle and its mapped page stay (81-83). `SectorDisk::new`: if the map
+  fails, the 64 KiB scratch handle stays (227-229). A dropped `Disk` or `SectorDisk` leaks 4 KiB
+  + 64 KiB, or 64 KiB, plus a mapping. Not visible today: the only constructor call is
+  `server::bootstrap`, which exits on Err and never drops the disk. It bites when a second
+  consumer makes one and drops it, as nxinstall and `disk --format` already do with a
+  `PartitionIo` per partition.
+  Demonstrated by path: `grep -n 'impl Drop' userspace/libfsserver/src/disk.rs` finds only line
+  441, `PartitionIo`'s; the three returns above carry no SYS_HANDLE_CLOSE or SYS_MEMORY_UNMAP,
+  whereas `PartitionIo::new` (350-354) closes its scratch when the map fails. Of 4 maps in
+  libfsserver, the two never unmapped are `Disk`'s and `SectorDisk`'s. Not host-testable: each
+  constructor's first statement is a syscall. ownership. Low.
+
+- [ ] **fs-d9** `userspace/libfsserver/src/server.rs:607` — `serve_session` copies a session
+  request body into a 600-byte stack buffer and silently cuts a longer one. A single-name op
+  whose name is over 598 bytes, or a rename whose two names total over 596, then fails its
+  length-prefixed parse and is answered Unsupported. Yet `entry_name`'s doc (serve.rs:17-19) says
+  FAT names run to 765 bytes, and `Fat::mkdir_at` makes them; the buffer's comment is sized for
+  ext4. A client on a FAT directory session sends File::Mkdir (or Unlink or Rename) with a
+  699-byte UTF-8 name (233 CJK characters): the 701-byte body is cut to 600, the parse returns
+  None, and the server replies Unsupported, though `Fat::mkdir_at` accepts the name and
+  `fsck.fat -n` finds the image clean. A stick made on Linux can hold such a file that Nitrox
+  cannot remove or rename by that name. TODO(fat-long-utf8-names) records only the listing by
+  short alias, not session ops.
+  Demonstrated: a temporary test in fs-server-fat/src/volume/write_tests.rs (restored)
+  reproduced the copy and parse, then called `Fat::mkdir_at`; `cargo test -p fs-server-fat --lib
+  probe_session_body_cap -- --nocapture` printed `PROBE: 699-byte name: session parse None,
+  Fat::mkdir_at Ok, listed true, fsck clean`. opportunities. Low.
+
+- [ ] **fs-d10** `userspace/libfsserver/src/server.rs:339` — `try_resolve_directory` clamps a
+  suffix longer than MAX_SUFFIX to its first 1024 bytes and resolves that as a directory, while
+  `serve::resolve` (serve.rs:149), `try_resolve_rename` and `apply_size` refuse or skip the same
+  request as too long. The two guards disagree; today only the kernel's NS_PATH_MAX (1024, equal
+  to MAX_SUFFIX; kernel/src/object/namespace.rs:27, syscall/table.rs:1563-1575) keeps it
+  unreachable. Latent: raise NS_PATH_MAX (or lower MAX_SUFFIX) and a resolve of a path over 1024
+  bytes opens a directory session on whatever its first 1024 bytes name, an ancestor or a sibling
+  cut mid-component, inside the same binding, where `resolve()` would answer TooLarge.
+  Unverified: not reachable today. Moving the decode into a pure function and testing a 1100-byte
+  suffix, or a kernel change that lengthens the path, would settle it. abi. Low.
+
+**Opportunities**
+
+- [ ] **fs-o1** encapsulate: the serve loop's state lives in 11 process-global `static mut`s
+  (RECV_MSG, REPLY_MSG, REPLY_HANDLES, FORGET_MSG, CONTENT, WAIT_HANDLES, WAIT_RESULTS,
+  SESSION_CH, SESSION_DIR, CONTROL, DIR_BODY) plus each binary's `static mut STORE`. Each access
+  is its own `unsafe` block argued 'single-threaded', `received()` lends a `&'static [u8]` over
+  the buffer the next receive overwrites, and 16 implicit whole-array references
+  (`REPLY_MSG[4..8].copy_from_slice`, `&mut REPLY_MSG[24..]`, `&CONTENT[..len]`) escape edition
+  2024's `static_mut_refs` lint — 50 sites (48 of the 58 `unsafe {` blocks in server.rs touch a
+  static, found by a brace-matching classifier over `unsafe {` blocks; `grep -c '^static mut'
+  server.rs` = 11; `grep -n 'raw mut STORE' userspace/fs-server-*/src/main.rs` = 2), such as
+  `userspace/libfsserver/src/server.rs:315`, `userspace/libfsserver/src/server.rs:920`,
+  `userspace/libfsserver/src/server.rs:765`, `userspace/fs-server-ext4/src/main.rs:34`. One
+  `struct Server { inbox, out, forget, content, dir_body, wait, sessions, control, store }`, made
+  once (on `_start`'s 8 MiB stack, about 84 KiB, or in one static handed out by a take-once
+  AtomicBool cell), with every helper a `&mut self` method and `Inbox::recv(&mut self, ch) ->
+  Result<(Message<'_>, Received), i64>` borrowing the inbox so no receive can happen while a
+  message slice lives, in libfsserver::server (the take-once cell beside it, or in libos).
+  Checked against `handle_forwarded_resolve` (inbox, content, reply and forget's outbox are four
+  disjoint fields), `try_resolve_rename` and `serve_session`. Closes: a receive overwriting a
+  payload still borrowed, two live `&mut` to one static, a second `&mut` to STORE, and safe
+  `run`/`bootstrap` causing UB (fs-d5). Depends on: nothing. abi, ownership, soundness,
+  opportunities. Value high, effort medium.
+
+- [ ] **fs-o2** narrow: ext4 bitmaps live in a `[0u8; MAX_BLOCK]` scratch of which only `[..bs]` is
+  read and written back, but `bit_clear`, `bit_set` and `bit_unset` index the whole scratch with
+  a bit number derived from the disk — 9 sites (`grep -nE 'bit_(clear|set|unset)\('
+  userspace/fs-server-ext4/src/ext4.rs`, excluding the definitions and test-only `block_in_use`,
+  over 4 bitmap buffers at 851, 1082, 1327, 1375), such as
+  `userspace/fs-server-ext4/src/ext4.rs:870`, `userspace/fs-server-ext4/src/ext4.rs:1093`,
+  `userspace/fs-server-ext4/src/ext4.rs:1329`, `userspace/fs-server-ext4/src/ext4.rs:1388`.
+  `struct Bitmap<'a>(&'a mut [u8])` built from `&mut bitmap[..bs]`, with `is_free`, `set` and
+  `unset` answering Corrupt past `len * 8`, in fs-server-ext4 (ext4.rs); it complements a
+  superblock geometry check like Linux's. Checked against `alloc_run`, `alloc_inode`, `free_run`
+  and `free_inode`. Closes: a bitmap bit indexed past the bytes read from disk (fs-d1). Depends
+  on: nothing. abi. Value high, effort small.
+
+- [ ] **fs-o3** remove: a device transfer is a raw `SYS_IO_SUBMIT` followed by a hand-rolled
+  `po_wait` that decodes IoResult status@8 and result@16 by byte offset, closes whatever u64 it
+  is given, and maps an unfinished wait to a failed transfer; `forget()` repeats the wait inline,
+  `serve_loop` decodes handle@0 by hand — 8 sites (5 submits, `grep -n SYS_IO_SUBMIT
+  userspace/libfsserver/src/disk.rs`; 3 hand-parsed result sites, `grep -nE
+  'results\[(8|16)\]|WAIT_RESULTS\[off' userspace/libfsserver/src/{disk,server}.rs`), such as
+  `userspace/libfsserver/src/disk.rs:19`, `userspace/libfsserver/src/disk.rs:102`,
+  `userspace/libfsserver/src/disk.rs:241`, `userspace/libfsserver/src/server.rs:410`. Outside
+  the subsystem there are 13 more `fn po_wait` copies (coreutils/src/bin/disk.rs:512 calls this
+  one; nxinstall/src/main.rs:102, test-harness/src/pattern.rs:265). Use libos: a blocking
+  `Op::wait(self) -> Result<IoResult>` that waits again on any return that is not this PO
+  signalled and never closes a PO whose I/O is in flight, plus a public `Op::from_po` for
+  forget's send and a public typed multi-handle `wait(&[RawHandle], &mut [IoResult])`, in libos
+  (exec.rs, objects.rs). Not `block_on` as it stands: `Op::poll` waits with deadline 0 before and
+  after the blocking wait, 3 waits per 4 KiB block on `Disk`'s hot path against 1, and
+  libfsserver's CLAUDE.md asks for a measured number before the device layer's cost changes.
+  Checked against `Disk::read_block`, `SectorDisk::transfer`, `PartitionIo::submit` and
+  `forget`. Closes: a scratch reused while an abandoned IRP still DMAs into it (fs-d4); a PO
+  leaked on an early return; also makes the wait host-testable under libos's mock. Depends on:
+  libfsserver taking a libos dependency (no_std, no alloc, nothing in libfsserver's CLAUDE.md
+  forbids it). abi, ownership, soundness, opportunities. Value high, effort small.
+
+- [ ] **fs-o4** encapsulate: IPC messages are handled as `[u8; 4096]` with hand-written header
+  offsets (payload_len at [4..8], handle_count at [8]) and payload views at `PAYLOAD_OFF` with
+  length MSG_LEN - PAYLOAD_OFF = 4072, not IPC_PAYLOAD_SIZE = 4008, so they overlap the handle
+  array; the kernel's `seal()` refusing over 4008 is all that keeps that harmless — 34 sites
+  (16 header statements: `grep -nE '_MSG\[4\.\.8\]|_MSG\[8\] =|RECV_MSG\[4\]'
+  userspace/libfsserver/src/server.rs`; 18 payload views: `grep -nE
+  'add\(PAYLOAD_OFF\)|\[PAYLOAD_OFF\.\.\]|\[24\.\.\]'`), such as
+  `userspace/libfsserver/src/server.rs:164`, `userspace/libfsserver/src/server.rs:319`,
+  `userspace/libfsserver/src/server.rs:128`, `userspace/libfsserver/src/server.rs:924`. Type the
+  buffers as libkern's `#[repr(C, align(4096))] IpcMsg` with `payload(&self) -> &[u8]` bounded by
+  `payload_len.min(IPC_PAYLOAD_SIZE)` and `compose(&mut self, handles, f) -> Option<usize>`
+  stamping payload_len and handle_count together (an `Outbox::stage` over it), plus
+  `channel_recv_msg(ch, &mut IpcMsg)` beside `channel_recv`, in libkern (abi.rs, channel).
+  Checked against `send_ready` (165-166), `reply_dir_handle` (546-547) and `received` (319-323).
+  Closes: a payload view sized by the wrong bound, a header stamped at the wrong offset or left
+  stale (written separately at 7 send sites); 9 raw-slice unsafe blocks become field access.
+  Depends on: pairs with fs-o1. abi, soundness. Value medium, effort small.
+
+- [ ] **fs-o5** encapsulate: server.rs's loop makes its raw syscalls inline, so none of the rules
+  libfsserver/CLAUDE.md states for it is held by a host test, only by QEMU gates; serve.rs's pure
+  core is the only host-tested part — 25 sites (`grep -c 'syscall[0-9]'
+  userspace/libfsserver/src/server.rs` = 23, plus 2 `channel_recv_raw` at 123, 309), such as
+  `userspace/libfsserver/src/server.rs:274`, `userspace/libfsserver/src/server.rs:375`,
+  `userspace/libfsserver/src/server.rs:506`, `userspace/libfsserver/src/server.rs:421`. Make the
+  loop generic over a small `Kernel` trait (recv, send, wait, close, memory create/map,
+  duplicate, clock), or build it on the libos types with libos's sys seam exposed to downstream
+  tests, in libfsserver::server over libos, so `handle_forwarded_resolve`, `serve_session` and
+  `serve_control` run on the host through each server's volume as serve.rs does. Closes: rules
+  held only by gates (every forwarded request answered; free only after Forget; sessions end on
+  rmdir; `.` and `..` refused; rename before the session path). Depends on: fs-o1, fs-o3, fs-o4,
+  fs-o7 and fs-o8; libos's sys mock is `#[cfg(test)]` inside libos (sys.rs:118-130) with no
+  Cargo feature, so a downstream crate's tests link the real syscalls. opportunities. Value
+  medium, effort large.
+
+- [ ] **fs-o6** encapsulate: scratch and content MemoryObjects are created and mapped by hand,
+  reached through `scratch_addr as *const u8` with `from_raw_parts` or `copy_nonoverlapping`
+  (bounds held by an `assert!` or a comment), and unmapped, or never unmapped, by hand; error
+  paths leak — 20 sites (disk.rs unsafe blocks other than the 7 submit/wait ones: 6 raw
+  slice/copy at :146, :191, :257, :264, :378, :385 and 9 create/map/close/unmap at :69, :75, :80,
+  :220, :226, :342, :349, :352, :445; plus `make_content_memobj`'s 5 blocks at server.rs:217,
+  :223, :226, :230, :236; 4 create+map sequences, 1 hand-written Drop at :441), such as
+  `userspace/libfsserver/src/disk.rs:146`, `userspace/libfsserver/src/disk.rs:257`,
+  `userspace/libfsserver/src/disk.rs:446`, `userspace/libfsserver/src/server.rs:231`. A `!Sync`
+  `Mapping<M>` owning its `Handle<Memory, M>`: `new(mem, len) -> Result<Self>` (closing the
+  object if the map fails), bounds-checked `copy_in(&self, at, &[u8])` and `copy_out(&self, at,
+  &mut [u8])` as bounded raw copies through `&self` (no Rust reference over memory a device DMAs
+  into), `handle()` for `IoOp.buffer`, `into_handle(self)` that unmaps and keeps the object,
+  Drop unmapping then closing, in libos (objects.rs, beside `Handle<Memory>::map`, which returns
+  `*mut u8` today). Checked against `Disk::read_at`, `SectorDisk` copy_in/copy_out,
+  `PartitionIo` (its Drop disappears) and `make_content_memobj`. Closes: scratch handles leaked
+  on error paths and never unmapped (fs-d8); a slice taken over a mapping longer than the
+  mapping (`Disk` maps PAGE bytes and moves IO_BLOCK per transfer with nothing tying the two: a
+  probe with IO_BLOCK = 8192 built and passed the disk tests, and only the kernel's size check
+  on the preceding read stops it). Depends on: nothing (`Handle<Memory>::create/map/unmap/
+  into_read_only` exist) and libfsserver taking libos. abi, ownership, soundness, opportunities.
+  Value medium, effort small.
+
+- [ ] **fs-o7** encapsulate: handles are bare u64s closed by hand at each exit, and a message is
+  staged in REPLY_MSG/REPLY_HANDLES/FORGET_MSG and sent with raw `SYS_CHANNEL_SEND`; whether a
+  transferred handle is ours (until the send succeeds) or the kernel's is tracked by convention
+  — 18 sites (`grep -nE 'syscall[0-9]' userspace/libfsserver/src/server.rs` = 23, minus
+  `make_content_memobj`'s 5: SEND 7, CREATE 1, CLOCK_READ 1, HANDLE_CLOSE 5, DUPLICATE 1,
+  WAIT 3; 7 header stamps via `grep -n '\[4\.\.8\]\.copy_from_slice'`, 3 stagings, 2 closes after
+  a failed send), such as `userspace/libfsserver/src/server.rs:277`,
+  `userspace/libfsserver/src/server.rs:533`, `userspace/libfsserver/src/server.rs:148`,
+  `userspace/libfsserver/src/server.rs:388`. The send-side twin of `Received`: `Outgoing`
+  (handles owned, closed on drop unless sent) with `channel_send(ch, msg, payload_len, handles,
+  mode) -> Result<(), (i64, Outgoing)>`, stamping payload_len and handle_count itself and
+  returning the untaken handles on failure (the kernel's send is atomic-or-fail, table.rs:
+  1966-1979), in libkern::channel beside `Received`, or as libos `Handle<Channel, M>` with
+  `Channel::pair()`, `wait` and a clock wrapper once libos has a Channel kind (absent today:
+  libos handle.rs:19-29). Sessions then hold owned endpoints. Checked against `send_ready`,
+  `send_forwarded` (the close loop at 282 becomes `drop(unsent)`) and `open_dir_session` (the
+  close at 586). Closes: a transferred handle leaked or closed twice after a failed send (both
+  paths are right by hand today; the class seen before is 'a failed reply hangs a forwarded
+  resolve'). Depends on: nothing for libkern; libos Channel kind and Part E's syscall surface
+  for the libos form; pairs with fs-o1. ownership, soundness, opportunities. Value medium,
+  effort medium.
+
+- [ ] **fs-o8** encapsulate: the session table and control slot (SESSION_CH, SESSION_DIR,
+  CONTROL) are bare u64 endpoints and directory ids in three `static mut`s; a slot is freed by
+  writing 0 and closing the handle by hand, and the wait set's width (<= MAX_WAIT_HANDLES) holds
+  only because `session_capacity()` and the wait-set build agree, one invariant kept by two
+  guards — 12 sites (blocks naming SESSION_CH, SESSION_DIR or CONTROL, cross-checked with `grep
+  -nE '\b(SESSION_CH|SESSION_DIR|CONTROL)\b' userspace/libfsserver/src/server.rs`: 62, 496, 511,
+  562, 577, 593, 621, 765, 810, 838, 844, 1023, including the hand closes at 501 and 845), such
+  as `userspace/libfsserver/src/server.rs:60`, `userspace/libfsserver/src/server.rs:765`,
+  `userspace/libfsserver/src/server.rs:494`, `userspace/libfsserver/src/server.rs:838`. `struct
+  Sessions { slots: [Option<(Endpoint, u64)>; MAX_SESSIONS], control: Option<Endpoint> }` with
+  `open` (a full table hands the endpoint back), `slot_of`, `dir`, `end_on(dir)`,
+  `close_control()` and `wait_set(serve_end, &mut [u64; MAX_WAIT_HANDLES]) -> usize`, the one
+  place that holds the width; `rmdir_at`'s `freeing` becomes `|id| sessions.end_on(id)`; in
+  libfsserver::server (a sessions module; Endpoint from libos once it has a channel handle,
+  otherwise a local owned newtype). Checked against `open_dir_session` (562-580),
+  `end_sessions_on` (508-515) and `serve_control`'s PeerClosed arm (842-848). Closes: the width
+  invariant split across two guards; a slot cleared without its endpoint closed, or closed twice;
+  a stale handle number matching a live slot; makes capacity 30/31 and slot reuse host-testable.
+  Depends on: fs-o1 for the struct. opportunities. Value medium, effort small.
+
+- [ ] **fs-o9** narrow: counts returned by a `Volume` are trusted as slice bounds by the loop
+  (`Mapped::runs` indexes `runs[..n]`; `read_file` and `read_file_range` lengths index
+  `CONTENT[..len]`); both Volumes keep them in bounds, but a third that answers a file's size
+  rather than the bytes copied would panic the server — 3 sites (manual read of serve.rs and
+  server.rs), such as `userspace/libfsserver/src/serve.rs:171`,
+  `userspace/libfsserver/src/serve.rs:182`, `userspace/libfsserver/src/serve.rs:219`,
+  `userspace/libfsserver/src/server.rs:232`. `Volume` methods return sub-slices of the caller's
+  buffer: `fn read_file<'o>(&self, path: &[u8], out: &'o mut [u8]) -> Result<&'o [u8], FsError>`,
+  likewise `read_file_range`, and `map_file` returning `(Mapped, &'r [BlockRun])`, in libfsserver
+  (volume.rs). Closes: a Volume answering a count larger than the buffer it filled crashes the
+  server. Depends on: nothing. abi. Value low, effort small.
+
+- [ ] **fs-o10** encapsulate: test helpers build a 1 MiB Store with
+  `Box::<Store<SERVER_BLOCKS>>::new_zeroed().assume_init()`, restating outside the type that
+  all-zero is a valid Store — 3 sites (`grep -rn 'new_zeroed().assume_init'
+  userspace/fs-server-ext4 userspace/fs-server-fat`), such as
+  `userspace/fs-server-ext4/src/lib.rs:1477`,
+  `userspace/fs-server-fat/src/volume/write_tests.rs:724`,
+  `userspace/fs-server-fat/src/volume/write_tests.rs:742`. `Store::<N>::boxed() ->
+  Box<Store<N>>` behind a host-only feature (e.g. `alloc`) enabled by the server crates in
+  dev-dependencies, in libfsserver::cache. Closes: a field added to Store that zero does not
+  inhabit (an enum, a NonZero, a reference) turning all three sites into UB with no compile
+  error. Depends on: nothing. abi, soundness. Value low, effort small.
+
+- [ ] **fs-o11** narrow: each server's 1 MiB `static mut STORE` is reached once by
+  `&mut *(&raw mut STORE)`, justified only by '_start runs once'; these are the only `unsafe`
+  blocks in either server crate — 2 sites here (`grep -rn '&mut \*(&raw mut'
+  userspace/fs-server-ext4/src userspace/fs-server-fat/src`; 16 across userspace), such as
+  `userspace/fs-server-ext4/src/main.rs:34`, `userspace/fs-server-fat/src/main.rs:33`. A
+  `TakeOnce<T>(UnsafeCell<T>, AtomicBool)` with one `unsafe impl<T: Send> Sync`, `const fn
+  new(v)` and `take(&'static self) -> Option<&'static mut T>` (a second take answers None), in
+  libos, or `libfsserver::cache::server_store()` for Store alone; subsumed if fs-o1 is taken.
+  Closes: a second `&mut` to the same static, and the last `unsafe` in the two server crates.
+  Depends on: nothing. ownership, opportunities. Value low, effort small.
+
+What held up: the `unsafe` byte paths are sound. Every `recv` buffer is exactly the size the
+kernel writes (4096 bytes, at most 8 handle words in `Received`), and every send reads whole
+`StoredMsg`s from 4096-byte buffers with count <= 1 handle. The wait count stays <=
+MAX_WAIT_HANDLES (`session_capacity` leaves one slot free while CONTROL is open, and CONTROL only
+goes to zero), and WAIT_RESULTS is walked within `waited <= count`. Hand-parsed offsets agree with
+libkern's asserted `IoResult` and `IpcMsg` layouts. Every IoOp transfer fits its MemoryObject, and
+slices over a scratch are made only after `po_wait` saw completion and dropped before the next
+submit. `send_forwarded`, `forget` and `open_dir_session` close handles exactly when the kernel
+left them with the sender, since `complete_forwarded_reply` always consumes on success and every
+earlier error leaves the table unchanged. `make_content_memobj` unmaps before restricting and
+sending, and no earlier file's bytes reach a later client, because the memobj is fresh and
+page-rounded, both volumes fill `out[..n]` whole, and `StoredMsg::seal` zeroes the stale tail.
+`forget` uses `FORGET_MSG` and local wait buffers, so it cannot clobber REPLY_MSG's live `reply`
+or the WAIT_RESULTS batch. A session freed earlier in a batch is skipped by the slot lookup, and
+31-bit handle generations stop a stale value from reaching another object. `end_sessions_on`
+cannot free the calling session's own slot, though the SAFETY comment at server.rs:620 says
+more than is true. Suffix, body and reply bounds hold (`resolve`, `serve_read_range`,
+`apply_size` and `try_resolve_rename` check <= MAX_SUFFIX before copying; the kernel's forwarded
+suffix is <= 1024; `serve_session` cuts at 600 bytes and the length-prefixed parses refuse the
+cut; `DirReplyWriter` and `mark_grown` clamp to the reply). ext4 directory walks go through
+`record()`, the extent `header()` bounds entries and depth (<= 5), `descend()` and `read_node`
+check each child's depth, and `seg()`/`cut()` check each run is on the device. FAT `bpb::parse`
+validates geometry, chain walks are bounded, Lfn ordinals index a 260-unit buffer, and the
+RefCell borrows (`cache`, `ids`, `orphans`) are never doubled; `MetaCache` holds its borrow across
+the device read without re-entry. Both `STORE` references are taken once, and the test-only
+`new_zeroed().assume_init()` is sound (Miri ran a zeroed-Store probe through `read_meta`,
+`write_at` and `forget` with no UB). `po_wait`'s early-return branch is unreachable today (see
+fs-d4). Probes were restored (`git checkout` of extent.rs and hostile_tests.rs, write_tests.rs)
+and `git status` was clean at each lens's end.
