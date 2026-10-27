@@ -2065,3 +2065,542 @@ hold: no leaf lock is held across `complete_pending_op` or `signal_interrupt`, a
 `read_changes` lose no wakeup. `Xhci` is shared across CPUs without `Sync`, but `dcbaa` is written
 only by the hub thread and the scratchpads and ERST never after init, so no race. The tests caught
 the breaks in drv-d1 through drv-d8, drv-d14, drv-d18 and drv-d21, and the boot caught drv-d4.
+
+### kernel-platform — main at 135055a8, 2026-10-26
+
+Lenses: abi, ownership, soundness, concurrency, opportunities; returned nothing: none.
+Defects: found 35, refuted by a boot 0, reported 22 (13 duplicates merged). Opportunities: 15 (34 proposed, merged by pattern).
+
+The inventory, `cargo xtask unsafe-inventory` over its paths:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `kernel/src/arch` | 4299 | 216 | 141 | 0 | 12 | 0 | 6 | 18 | 1 | 54 | 7 |
+| `kernel/src/main.rs` | 756 | 57 | 1 | 0 | 9 | 0 | 0 | 17 | 0 | 0 | 0 |
+| `kernel/src/lib.rs` | 26 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/limine.rs` | 322 | 2 | 0 | 10 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
+| `kernel/src/boot_selftest.rs` | 419 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/cmdline.rs` | 63 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/handoff.rs` | 68 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/initramfs.rs` | 77 | 1 | 1 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 0 |
+| `kernel/src/fbcon` | 730 | 4 | 5 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+| `kernel/src/framebuffer.rs` | 39 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/klog.rs` | 158 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel/src/power.rs` | 97 | 7 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 |
+| `kernel/src/report.rs` | 86 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `total` | 7140 | 297 | 149 | 11 | 21 | 0 | 7 | 36 | 1 | 54 | 10 |
+
+**Defects**
+
+- [ ] **kplat-d1** `kernel/src/arch/x86_64/idt.rs:158` — No interrupt or exception entry stub
+  normalises RFLAGS.DF or AC (no `cld`/`clac`), so an entry from ring 3 runs Rust code with
+  whatever DF/AC the user left set. A ring-3 thread runs with DF set when the timer, a device
+  IRQ or an exception arrives. `timer_dispatch` and `device_irq_dispatch` reach
+  `dpc::run_pending` and `memset`, and `pf_dispatch` reaches `AddressSpace::fault_in` and
+  `memset`. The kernel's `rep movs`/`rep stos` then run backwards and write below their
+  destination. With AC set, SMAP is off for the whole handler. Only the syscall path is
+  covered, by SFMASK. All six hand-written prologues (idt.rs:158, 224, 348, 410, 451, 549) are
+  alike; objdump shows no `cld` in `memcpy`/`memset`.
+  Demonstrated by boot: init patched to run `std` then spin, debug image under QEMU. After
+  `init: up (pid 1)` the kernel took `#PF`, rip 0, cs 0x8, rflags 0x10446 (DF set), r12 =
+  the memcpy/memset address. The unpatched image boots. Any ring-3 process can crash the
+  kernel. Fix: `cld; clac` at the top of every stub (see kplat-o9). concurrency. High.
+- [ ] **kplat-d2** `kernel/src/sched.rs:756` — `thread_enter`'s ring-3 descent calls
+  `set_kernel_stack`, `set_syscall_kernel_stack` and `arm_user_entry_cpu_base` (gdt.rs:249,
+  syscall.rs:98, 114) with IF=1 and preemption on. Each reads the CPU index with RDTSCP, then
+  writes that CPU's slot (TSS.RSP0, `CpuLocal.kstack_top`, `KERNEL_GS_BASE`). New user thread T
+  reads cpu=A. A tick preempts it, A switches to T2 and arms A's RSP0 for T2, and idle CPU B
+  steals T. T resumes on B and writes A's slot (or loads A's block into B's `KERNEL_GS_BASE`).
+  T2's next ring-3 interrupt on A, or T's next syscall on B, then pushes onto T's live kernel
+  stack, or two CPUs share one `rsp_scratch`/`kstack_top`. The SAFETY argument at
+  syscall.rs:115-117 ("other CPUs touch only their own slots") does not hold. Kernel-stack
+  corruption reachable by any process that creates threads, but the window is a few
+  instructions per first run. The same hazard class is already fixed by masking IF in
+  `stop_other_cpus` (cpu.rs:55-66). `arm_kernel_stack_for` (under SCHED, IF=0) and
+  `ap_cpu_init` are safe.
+  Unverified: no host test reaches RDTSCP/WRMSR. A seam for `rdtscp_aux` in a host test, or
+  masking IF across the descent and test-qemu at `-smp 4` under thread churn, would settle
+  it. Fix: do the three writes inside `thread_enter`'s SCHED-held block (see kplat-o3).
+  ownership, concurrency. High.
+- [ ] **kplat-d3** `kernel/src/arch/x86_64/idt.rs:662` — A vector-2 NMI (IST2) or a #DF (IST1)
+  taken in ring 3 goes through `is_user_fault` to `user_fault` and `suspend_with_fault`. That
+  parks the thread with its ExceptionFrame and context on the per-CPU IST stack, not on its own
+  kernel stack, which breaks the claim at sched/exit.rs:301 ("the ExceptionFrame stays on this
+  frozen kernel stack until resume"). The next NMI on that CPU resets RSP to the same IST2 top
+  and overwrites the parked frames. A resume then returns through corrupted frames, possibly
+  on another CPU while the first reuses the stack, and `sys_thread_get_registers` reads the
+  clobbered frame, possibly another process's user registers. Latent today because only stop
+  NMIs are sent and LINT1 is never programmed. An NMI watchdog or a stop NMI sent to a CPU
+  that is not stopping would make it live.
+  Demonstrated by boot: debug image, init spinning in ring 3, a temporary probe sending an NMI
+  IPI to its CPU. Log: `exc2 cs=0x23 ... stopping=false`, then `user_fault vec=2 frame_ptr=
+  0xffffffff800d1f10`, which is inside IST2, not a 0xffffc000... thread stack. A second NMI
+  on that CPU entered at the same rsp. Probes reverted. abi, opportunities. Medium.
+- [ ] **kplat-d4** `kernel/src/arch/x86_64/idt.rs:692` — `ArchRegisters::read_from_exception_frame
+  (frame_ptr: usize)` is a safe trait fn that dereferences any address as an ExceptionFrame.
+  Its one caller, `sys_thread_get_registers` (syscall/table.rs:611-614), gets the address from
+  `thread_exception_frame` under SCHED, releases SCHED, then reads with no lock. The SAFETY
+  claim "the thread stays parked while suspended" holds only at the instant SCHED was held. A
+  process with SIGNAL on its own suspended thread T runs two threads. One calls
+  `sys_thread_get_registers(T)` and gets the address. The other calls `sys_exception_resume(T)`
+  in the window. T iretqs, and its next syscall or trap reuses that stack. The copy-out is
+  then a data race and hands user memory kernel return addresses and stack words. The stack
+  stays mapped (the Thread owns it), so this is a stale read, not a use-after-free. The
+  ModifyAndResume writeback assigned to this trait (decision-log.md:2933), written the same
+  way, would write user-chosen values onto a live kernel stack.
+  Demonstrated: host test in sched/tests.rs (removed). `resume_suspended` returned true after
+  `thread_exception_frame` gave the frame, the test overwrote words 14 and 17 as the next entry
+  would, and `read_from_exception_frame` returned rax=0xffffffff80123456
+  rip=0xffffffff80001000 (`probe_get_registers`, 1 passed). abi, ownership, concurrency,
+  opportunities. Medium.
+- [ ] **kplat-d5** `kernel/src/mm/user_access.rs:180` — `copy_from_user<T: Copy>` and
+  `copy_to_user<T: Copy>` are safe fns that accept any `Copy` type. `copy_from_user`
+  `assume_init`s user bytes as T, so a T with invalid bit patterns (bool, enum, char,
+  reference) is undefined behaviour. `copy_to_user` of a padded T copies uninitialised kernel
+  padding to user memory. Latent: every type passed today (RegisterValues, HandleInfo, NsEntry,
+  Notification, RawHandle, usize, ThreadArgs, SpawnArgs, IoOp) is padding-free with all bit
+  patterns valid. Adding a `bool` or enum field to ThreadArgs, SpawnArgs or IoOp would make a
+  user-chosen byte 0x02 an invalid value in the kernel.
+  Demonstrated: Miri (nightly-2026-07-20) on a probe test (removed) reading
+  `copy_from_user::<bool>` of byte 0x02: "constructing invalid value of type bool: encountered
+  0x02" at user_access.rs:199. Native run printed "read as false". abi. Medium.
+- [ ] **kplat-d6** `kernel/src/main.rs:145` — The kernel command line is recorded as a
+  `&'static [u8]` into Limine's bootloader-reclaimable memory (`c_bytes` returns an unbounded
+  lifetime, main.rs:543), and `/proc/cmdline` serves it on every lookup. The `'static` holds
+  only because the buddy takes `MEMMAP_USABLE` alone. Triggering change: reclaiming
+  `MEMMAP_BOOTLOADER_RECLAIMABLE` once the kernel owns its stack (decision-log ~192). The frame
+  is then handed out again, and `kernel_server.rs:163` copies `cmdline::line()` into a
+  MemoryObject, so a process resolving `/proc/cmdline` gets up to 1024 bytes of whatever lives
+  there. The same convention covers `limine_framebuffer()`'s `&'static Framebuffer`
+  (main.rs:615), the bootloader name and version strings, and the parked APs past MAX_CPUS
+  spinning on `goto_address` in Limine's memory.
+  Demonstrated: Miri on a probe test in cmdline.rs (removed): `c_bytes` over a Vec, `record()`,
+  drop the Vec, `line().to_vec()` gave "constructing invalid value of type &[u8]: encountered a
+  dangling reference (use-after-free)" at cmdline.rs:52 (`probe_recorded_line`). ownership.
+  Medium.
+- [ ] **kplat-d7** `kernel/src/arch/x86_64/paging.rs:482` — The page-table walkers (`translate`,
+  `attribute_index`, `walk_to_pt`) read PTEs with plain non-atomic loads, and `map_page`,
+  `unmap_page` and `ensure_kernel_intermediate` write leaf and PML4 slots with plain stores,
+  while the kernel half is edited lock-free and `ensure_table` links with a CAS (paging.rs:255).
+  A plain access racing the CAS on one slot is a data race, which is undefined behaviour in
+  Rust's model though x86 hardware does not tear an aligned 8-byte access. Two CPUs creating
+  kernel stacks in a fresh 2 MiB vmap region race a concurrent walk (fault-path
+  `scan_stack_candidates`/`dump_return_addresses`, `of_mapping`). A more aggressive compiler or
+  another architecture could duplicate or tear the read.
+  Demonstrated: Miri on a probe test (removed). One thread ran `map_page`, the main thread ran
+  `translate` on a fresh root. "Data race detected between non-atomic read (translate,
+  paging.rs:482) and atomic read-modify-write (ensure_table compare_exchange, paging.rs:255)".
+  Native run passed. soundness, opportunities. Medium.
+- [ ] **kplat-d8** `kernel/src/arch/x86_64/smp.rs:95` — `ArchSmp::init_this_cpu(index: u32)` is
+  safe and writes any value to IA32_TSC_AUX. Per-CPU accesses then index `static mut` arrays
+  with `.add(idx)` guarded only by a `debug_assert`, which release builds drop (gdt.rs:143-146,
+  255; syscall.rs:69). A caller passing an index of MAX_CPUS (8) or more, for example one that
+  took Limine's `SmpInfo.processor_id` as the dense index (limine.rs:353 documents it as "the
+  logical CPU index Nitrox uses") on a machine with sparse ACPI ids, makes `gdt::init`,
+  `set_kernel_stack` and `set_syscall_kernel_stack` write past `TSSES`/`GDTS`/`CPUS`, and the
+  next syscall loads RSP from an out-of-bounds block. The only caller passes 0 (main.rs:265),
+  and the AP path's `adopt_dense_index` is below MAX_CPUS by construction.
+  Demonstrated by path, read end to end. No probe was run. opportunities. Medium.
+- [ ] **kplat-d9** `kernel/src/arch/x86_64/user_access.rs:109` — `copy_cstr_raw`'s loop runs
+  `lodsb`/`stosb` before it compares the count with `max_len`. With `max_len` = 0 it writes one
+  byte into a destination its contract says has zero writable bytes, then reports
+  NoTerminator (or Ok(1) if that byte was NUL). The `cfg(test)` stub writes nothing, so host
+  tests cannot see it. Latent: the only caller, `copy_cstr_from_user`, returns early on an
+  empty buffer (mm/user_access.rs:257). A new caller of `UserAccess::copy_cstr` with an empty
+  destination gets a one-byte kernel overrun.
+  Demonstrated: host probe running the same instruction sequence without stac/clac and the
+  extable entry (removed). dst=[0xAA,0xAA], src="x\0", max_len=0 gave code 2, count 1, dst
+  [78, aa]. The stub gave [aa, aa]. A second probe gave `backing=[ee, 00, ee, ee]` with
+  `result=0 count=1`. abi, opportunities. Low.
+- [ ] **kplat-d10** `kernel/src/framebuffer.rs:52` — `record_aperture` records
+  `phys_base = address - hhdm` with no page-alignment check, but
+  `MemoryObject::try_new_borrowed` requires a page-aligned base (memory_object.rs:100). The
+  SAFETY comment at kernel_server.rs:330-334 never mentions alignment. Firmware reporting a
+  sub-page framebuffer base makes the first `/dev/framebuffer` map reach `unreachable!` in
+  `map_object` (mm/addr_space.rs:361) with the address-space lock held, and panics the kernel
+  instead of refusing.
+  Demonstrated: host probes (removed) with address 0x1000_0800 (hhdm 0) and 0x8000_0800:
+  `record_aperture` returned true, `try_new_borrowed` succeeded, and `map_object` panicked
+  "ArchPaging::map_page returned Misaligned for a page-aligned per-page address". abi,
+  ownership. Low.
+- [ ] **kplat-d11** `kernel/src/arch/x86_64/gdt.rs:18` — On the BSP, `gdt::init` (via
+  `init_tables`, main.rs:117) indexes `GDTS`, `TSSES`, `DF_STACKS` and `NMI_STACKS` by
+  `rdtscp_aux` before `init_this_cpu(0)` writes TSC_AUX (main.rs:265), so the SAFETY arguments
+  rest on firmware leaving the reset default 0, with only a `debug_assert` on the bound. With
+  TSC_AUX left at k in 1..7, the BSP loads slot k's GDT and TR while `set_kernel_stack` later
+  writes slot 0's RSP0, so ring-3 interrupts land on RSP0=0. AP k later rewrites the TSS the
+  BSP has loaded, and its own `ltr` of a busy descriptor may fault (not run). At k >= 8 a
+  release build writes past the arrays. syscall.rs:62-70 has the same pattern but runs after
+  `init_this_cpu(0)`.
+  Unverified: QEMU resets TSC_AUX to 0 in every boot run. Writing TSC_AUX=0 at the top of
+  `kernel_main` and booting firmware that leaves it nonzero, or a probe that writes it before
+  `init_tables`, would settle it. abi, ownership, concurrency. Low.
+- [ ] **kplat-d12** `kernel/src/main.rs:775` — `plain_mapping` returns None through `.ok()?`
+  when `map_page` fails at page k > 0 and does not unmap pages 0..k. `report_framebuffer_cost`
+  unmaps only on Some (main.rs:733-737), so part of the second alias of the aperture, with
+  different caching from the console's mapping, outlives the measurement, which the comment at
+  main.rs:731-732 says must not happen. The vmap VA is never reused, so it stays for the life
+  of the system. Reachable only on page-table-frame OOM during boot.
+  Unverified: by path, read end to end; a fault-injected `map_page` in a boot would settle it
+  (main.rs is the binary and has no host tests). abi, ownership, opportunities. Low.
+- [ ] **kplat-d13** `kernel/src/main.rs:493` — The SAFETY arguments for the Limine response
+  reads (main.rs:55, 493-496, 1108-1111) say a raw-pointer copy, or `static mut` itself, stops
+  the optimiser folding the pre-Limine null. Neither does. The read survives only because each
+  request is `#[used]`, and reading memory written outside the program is the job of a
+  volatile read (as `BaseRevision::supported` already does). A request static without
+  `#[used]`, or a toolchain that treats used globals differently, folds `response` to null and
+  the kernel reports "no Limine ... response" on a boot where Limine answered. 13 read sites
+  use the pattern, and main.rs:406 reads the field directly without it.
+  Demonstrated: `rustc -O` on a `static mut` in `.limine_requests` read with
+  `(&raw const R).read().is_null()`. With `#[used]` it emits `cmpq $0, R(%rip)`. Without it
+  emits `movb $1, %al`. abi. Low.
+- [ ] **kplat-d14** `kernel/src/arch/x86_64/ioapic.rs:217` — `X86IoApic::route` casts the 32-bit
+  x2APIC destination with `dest as u8`, silently truncating, where its MSI sibling
+  `irq_install::compose` refuses ids above 0xFF (test
+  `a_destination_wider_than_the_field_is_refused_rather_than_truncated`). On a machine whose
+  boot CPU's x2APIC id is 256 or more, `install_intx` and `install_isa_irq` (ioapic.rs:294,
+  irq_install.rs:50) route the line to `id & 0xFF`, another CPU or none, and the device's
+  interrupts are lost instead of the install being refused.
+  Unverified: QEMU boots use APIC id 0 or 1; it needs a machine with an x2APIC id of 256 or
+  more. abi. Low.
+- [ ] **kplat-d15** `kernel/src/klog.rs:237` — `copy_into_frames(frames: &[PhysAddr])` is a safe
+  pub fn that writes the log through the HHDM into whatever frames it is given; its SAFETY
+  comment (klog.rs:253-255, "within an owned, HHDM-mapped frame") is a claim about the caller
+  that nothing enforces. Latent: the single caller (kernel_server.rs:306) passes a fresh
+  MemoryObject's own frames. A caller passing a borrowed object's frames (the framebuffer
+  aperture), a shared MemoryObject's, or any computed PhysAddr overwrites that memory from safe
+  code. Taking `&MemoryObject` (`copy_in`, memory_object.rs:174) would remove klog's only
+  unsafe block.
+  Demonstrated: host probes (removed). A `Box<[u8; 4096]>` borrowed only immutably, its
+  PhysAddr passed with no unsafe in the test, had 11 log bytes written into it
+  (`victim[0..4]` = [112, 114, 111, 98]; `victim[0] != 0xAB`). ownership, opportunities. Low.
+- [ ] **kplat-d16** `kernel/src/main.rs:874` — `run_first_userspace` allocates pid-1
+  handle-table entries (`notif_h`, then `ns_h` and `system_control_h`) as raw u64s, then returns
+  on twelve later failure paths (main.rs:877, 888, 894, 900, 934, 943, 949, 962, 972, 980,
+  1001, 1043) without closing them. Each entry keeps its object (notification channel, root
+  namespace, system-control object) referenced forever. A boot-time OOM in `Namespace::try_new`,
+  any `bind_kernel_server`, or `spawn_user` leaks them to a process that will never exist.
+  Unverified: by path (`notif_h` at main.rs:863-871, and the early returns read). Reachable
+  only by a boot-time OOM or bind failure, not injected. ownership. Low.
+- [ ] **kplat-d17** `kernel/src/arch/x86_64/ioapic.rs:55` — IOAPIC registers use an indirect
+  IOREGSEL-then-IOWIN protocol and `set_rte_mask` is a read-modify-write, but nothing
+  serialises them, and the `ArchIrqRouter` route/mask/unmask contracts do not ask callers to
+  (7 call sites: 130, 137, 190, 199, 200, 221, 222). Correctness rests on every caller running
+  at boot on one CPU. Latent: all routes happen in `drivers::probe` on the BSP before SMP, and
+  mask/unmask have no caller outside ioapic.rs. A driver that masks its level-triggered INTx
+  line in its ISR and unmasks it in a DPC, or a post-SMP install, would interleave two CPUs'
+  IOREGSEL writes so one's IOWIN lands in the other's register. No lock appears in
+  kernel/docs/lock-ordering.md.
+  Unverified: no host seam for the MMIO; a host test with a fake register pair driven in the
+  interleaved order would settle it. concurrency. Low.
+- [ ] **kplat-d18** `kernel/src/tlb.rs:96` — `shootdown` reads `me` and `online` before
+  `preempt_disable` (line 113), then takes the sole-online-CPU fast path and invalidates
+  "locally". If the thread migrates in between, it invalidates the new CPU's TLB and the CPU
+  that holds the stale entry is never told. While APs come online, a BSP thread (for example
+  `reap_pending` dropping a KernelStack) reads online={0}, is preempted, AP1 comes online and
+  steals it, and the BSP keeps its translation of a page the caller then frees. The window
+  exists only while the online set grows (bring-up, any future hotplug).
+  Unverified: needs a host seam for the CPU id; moving the reads after `preempt_disable`
+  would settle it. concurrency. Low.
+- [ ] **kplat-d19** `kernel/src/fbcon/mod.rs:447` — `with_console_waiting`, `yield_to_userspace`
+  and `with_console` compute `me = current_cpu()+1` (fbcon/mod.rs:388-390, 446-450, 495-505)
+  before taking CONSOLE, which masks IRQs. A thread migrated in between stores another CPU's
+  number in HOLDER while it holds the lock. A `kprintln` on that other CPU then sees
+  HOLDER==me and drops its line from the grid that `reclaim_for_stop` repaints as the
+  diagnosis, and a fault inside the console on the new CPU waits PATIENCE spins instead of
+  taking the re-entry shortcut. No memory is at stake.
+  Unverified: needs a host seam for `current_cpu()`; reading the CPU after the lock is held
+  would settle it. concurrency. Low.
+- [ ] **kplat-d20** `kernel/src/arch/x86_64/serial.rs:50` — `SerialPort::new(base: u16)` is a
+  pub safe `const fn`, and `init`/`write_byte`/`read_byte`/`set_loopback`/`enable_rx_interrupt`
+  do `outb`/`inb` at base+0..7 for any base. The SAFETY arguments ("the COM1 base port, which
+  this driver exclusively owns") rely on base == COM1_BASE, which nothing enforces.
+  `arch/mod.rs:45` re-exports the module, so code outside the arch layer can call
+  `SerialPort::new(0xCF8).init()` and do port I/O on the PCI configuration mechanism with no
+  unsafe block. No code outside serial.rs uses `SerialPort` today.
+  Demonstrated by path, read end to end; grep outside serial.rs found no use. opportunities.
+  Low.
+- [ ] **kplat-d21** `kernel/src/arch/x86_64/syscall.rs:114` — `set_syscall_kernel_stack(top: u64)`
+  and `ArchCpu::set_kernel_stack(top: u64)` (arch/cpu.rs:23, TSS.RSP0) are safe, yet the value
+  becomes the stack pointer the hardware loads on the next syscall or ring-3 trap
+  (syscall.rs:194, gdt.rs:248-258). Validity (a live, mapped kstack top that outlives the
+  thread's time on this CPU) is held only by sched's `arm_kernel_stack_for`. Latent: all four
+  call sites (sched.rs:506, 507, 756, 757) pass `Thread::kstack_top` of a pinned thread. A
+  caller that "disarms" with `set_kernel_stack(0)` gets a #DF on the next ring-3 interrupt. One
+  that arms a top whose KernelStack can drop while the thread is current makes the next trap
+  push its frame into freed and reused frames, triggered from ring 3.
+  Demonstrated by path, read end to end. opportunities. Low.
+- [ ] **kplat-d22** `kernel/src/arch/x86_64/regs.rs:339` — `cli`, `sti` (regs.rs:339, 353),
+  `halt_loop`'s `cli;hlt` (cpu.rs:106) and `idle_halt`'s `sti;hlt` (cpu.rs:128) are
+  `asm!(..., options(nomem))`, which lets the compiler move or merge memory accesses across the
+  points where interrupts are masked or unmasked. An IF-only critical section around a plain
+  (non-atomic) access, such as a plain RMW of per-CPU state (preempt.rs:135-138 warns against
+  that but reasons as if the mask would bracket it), is then not a critical section. Latent: the
+  current IF-only sections (lockrank, preempt) use atomics, and `IrqSpinLock` data sits behind
+  Acquire/Release, so no current site was found affected.
+  Demonstrated: standalone probe compiled `-O` for x86_64-unknown-none. With `nomem`,
+  `window_nomem` read `*p` once before `cli` and reused it in the window (`movq (%rdi),%rax;
+  cli; leaq 1(%rax),%rcx; movq %rcx,(%rdi); sti`). With the memory clobber, `window_mem`
+  reloaded `*p` after `cli`. opportunities, soundness. Low.
+
+**Opportunities**
+
+- [ ] **kplat-o1** encapsulate: page tables reached as `root: PhysAddr` and `table_ptr(phys) ->
+  *mut Pte`, every slot read and written with plain loads and stores except `ensure_table`'s CAS,
+  and tree validity a caller obligation — 71 sites (`grep -rn 'Paging::\(map_page\|unmap_page\|
+  translate\|attribute_index\|ensure_kernel_intermediate\|inherit_kernel_mappings\|
+  set_page_table\)' kernel/src | grep -v '//'`, 36 of them translate/attribute_index; 19 PTE
+  accesses in paging.rs before its test module, counted by `grep -nE '\*table_ptr\(|\*pml4\.add|
+  \*leaf|...'`), such as `kernel/src/arch/x86_64/paging.rs:482`, `paging.rs:375`, `paging.rs:462`,
+  `kernel/src/mm/kvmap.rs:84`. A `#[repr(transparent)] struct Table([AtomicU64; 512])` with
+  safe `entry(&self, Index9) -> Pte`, `set` and `link_or_get`, behind one `unsafe fn table<'a>
+  (phys) -> &'a Table`, and typed roots (`Root::active()`, `AddressSpace::root()`) so
+  `translate` and `attribute_index` become safe. The atomic slot cell alone is medium effort;
+  typed roots make it large. Closes: the CAS-versus-plain-read data race (kplat-d7), a dangling
+  root, an out-of-range slot index. Depends on: nothing. soundness, opportunities. Value high,
+  effort large.
+- [ ] **kplat-o2** encapsulate: every Limine request read by hand (`(&raw const X).read()
+  .response`, null check, `&*`, raw `.add(i)` array walks, `c_bytes`/`CStr::from_ptr` strings,
+  each with its own SAFETY text) plus ten needless `unsafe impl Sync` on `static mut`
+  request statics — 56 sites (36 unsafe blocks counted by awk over main.rs:400-640 and
+  1048-1135 less `init_buddy`, acpi.rs:495, 501 and mm/buddy.rs:324, 328; plus `grep -c 'unsafe
+  impl Sync' kernel/src/limine.rs` = 10 and `grep -rn 'static mut .*Request' kernel/src` = 10),
+  such as `kernel/src/main.rs:406`, `main.rs:497`, `main.rs:1112`, `kernel/src/arch/x86_64/
+  acpi.rs:495`, `kernel/src/limine.rs:101`. `#[repr(C)] struct Request<R, X = ()> { id,
+  revision, response: AtomicPtr<R>, extra }` (auto-Sync, no `static mut`, no `unsafe impl`)
+  with `fn response(&self) -> Option<&'static R>` doing one volatile/Acquire load. Response
+  types get safe accessors (`MemoryMapResponse::entries()`, `SmpResponse::cpus()`,
+  `ModuleResponse::modules()`, bounded `LimineFile::path()`/`bytes()`, bootloader name and
+  version). An optional `BootToken<'b>` ties borrows to the boot phase so nothing Limine-owned
+  is stored `'static`. Removing all ten `unsafe impl Sync` was built clean (cargo check lib and
+  bins, default and `selftest,test-harness`, plus `cargo test --lib --no-run` on the host) and
+  is the zero-dependency first step; the wrapper subsumes it. Decoding moves from the bin-only
+  main.rs into the lib, where fabricated responses reach it under host tests and Miri. Closes:
+  the folded-null read (kplat-d13), the `'static` into reclaimable memory (kplat-d6), the
+  unbounded `CStr::from_ptr` on module paths (main.rs:1071), about 32 of main.rs's 57 unsafe
+  blocks. Depends on: nothing. abi, ownership, soundness, opportunities. Value high, effort
+  medium.
+- [ ] **kplat-o3** encapsulate: a CPU index read from hardware (`rdtscp_aux`/`Smp::current_cpu`)
+  and then used to index per-CPU state, with migration between read and use left to each
+  caller, the per-CPU arrays indexed through unchecked `.add(idx)`, and `init_this_cpu(u32)` a
+  safe fn — 11 sites for the read-then-use pattern (`grep -rn "rdtscp_aux()\|
+  Smp::current_cpu()" kernel/src --include=*.rs`, less comments, definitions and boot_selftest:
+  tlb.rs:96, 183; sched.rs:315; lockrank.rs:259; gdt.rs:19; syscall.rs:63; online.rs:37;
+  handle/mod.rs:106; fbcon/mod.rs:388, 447, 496) and 6 `.add(idx)` sites over 5 `static mut`
+  arrays (gdt.rs:143-146, 255; syscall.rs:69), such as `kernel/src/arch/x86_64/gdt.rs:249`,
+  `kernel/src/arch/x86_64/syscall.rs:63`, `kernel/src/fbcon/mod.rs:447`, `kernel/src/tlb.rs:96`.
+  `struct CpuIndex(u8)` constructible only as `CpuIndex::BSP` or from `adopt_dense_index` (so
+  `< MAX_CPUS` is a type invariant), `init_this_cpu(CpuIndex)`, `struct PerCpu<T>([UnsafeCell
+  <T>; MAX_CPUS])` with `slot(&self, CpuIndex) -> *mut T`, and `with_mine<R>(&'static self,
+  _off: &IrqsOff, f)` or a `Pinned<'a>` token obtainable only from an `IrqSpinLockGuard`, an
+  interrupts-masked guard or a preempt guard, required by `set_kernel_stack`,
+  `set_syscall_kernel_stack` and `arm_user_entry_cpu_base`. `thread_enter` then has to make
+  the token, which is the fix. Home: kernel/src/arch (CpuIndex, PerCpu), guard constructors in
+  libkern spinlock/preempt. Checked against `gdt::set_kernel_stack`, `syscall::this_cpu_block`,
+  fbcon (read after CONSOLE is held) and `tlb::shootdown` (move the read under the preempt
+  guard). Closes: a thread migrating between index read and write (kplat-d2, kplat-d18,
+  kplat-d19), an out-of-range TSC_AUX (kplat-d8, kplat-d11), and 5 of the arch layer's 12
+  `static mut`. Depends on: nothing. abi, ownership, concurrency, opportunities. Value high,
+  effort medium.
+- [ ] **kplat-o4** narrow: a suspended thread's ExceptionFrame location carried as a bare
+  `usize` (`Thread::exception_frame`) and dereferenced by a safe `ArchRegisters` fn after SCHED,
+  the lock that proves the thread parked, is dropped — 6 sites (`grep -rn
+  "exception_frame\|read_from_exception_frame\|frame_ptr" kernel/src --include=*.rs | grep -v
+  tests`: made at idt.rs:675, stored at sched/exit.rs:308, handed out at sched/exit.rs:400-408,
+  read at syscall/table.rs:611-613 via idt.rs:692-697; plus raw frame derefs at idt.rs:133, 255,
+  504, 654 and syscall.rs:169), such as `kernel/src/arch/x86_64/idt.rs:675`,
+  `kernel/src/sched/exit.rs:308`, `kernel/src/sched/exit.rs:407`, `kernel/src/syscall/table.rs:613`.
+  `suspend_with_fault` stores decoded `RegisterValues` in the Thread under SCHED, and
+  `suspended_registers(thread, &SchedGuard) -> Option<RegisterValues>` reads them under the lock.
+  For ModifyAndResume, keep the frame pointer private to arch with `with_suspended_frame<R>(g:
+  &mut SchedGuard, thread, f) -> Option<R>`. `irq_dispatcher!` can hand bodies `&mut
+  ExceptionFrame` converted once. Home: kernel/src/sched/exit.rs and kernel/src/arch/
+  registers.rs. Closes: reading, and later writing, a frame the thread has left (kplat-d4).
+  Depends on: nothing. ownership, opportunities. Value high, effort small.
+- [ ] **kplat-o5** encapsulate: kernel objects travel type-erased — adopted with `ObjectRef::
+  from_raw(KBox::into_raw(x).as_ptr() as *mut (), KObjectType::T)`, downcast with `&*(r.as_ptr()
+  as *const T)`, and passed to `unsafe fn f(obj: *mut ())` — 235 sites (downcasts `grep -rnE
+  '&\*\(\w+(\.\w+)*\.as_ptr\(\) as \*(const|mut) [A-Za-z_:]+\)' kernel/src` = 105; type-erased
+  unsafe fns `grep -rnE 'unsafe fn \w+(<[^>]*>)?\(\w+: \*mut \(\)' kernel/src` = 130; the one-line
+  adopt form `grep -rn "ObjectRef::from_raw(KBox::into_raw" ... | grep -v "tests\|test_support"`
+  = 50, within these), such as `kernel/src/main.rs:859`, `main.rs:1031`, `kernel/src/power.rs:151`,
+  `power.rs:374`, `kernel/src/arch/x86_64/idt.rs:311`. `trait KObject { const TYPE:
+  KObjectType; }`, safe `ObjectRef::adopt<T: KObject>(KBox<T>)` and `ObjectRef::downcast<T:
+  KObject>(&self) -> Option<&T>` (checks `object_type()`, borrow tied to the reference), and
+  pinned-pointer fns taking `&ObjectRef` or `Pinned<'a, T>`. Home: kernel/src/object/header.rs.
+  Closes: a tag that does not match the allocation (which `dispatch_destroy` would free as the
+  wrong type), a cast to the wrong concrete type, a raw pointer used after the ref that pinned
+  it drops. Depends on: nothing; spans object and sched, seen here from power.rs, idt.rs and
+  main.rs. ownership, soundness, opportunities. Value medium, effort large.
+- [ ] **kplat-o6** encapsulate: physical frames written through `(phys + hhdm_offset()) as *mut
+  u8` from a bare `PhysAddr`, ownership asserted only in a SAFETY comment — 44 sites (`grep -rn
+  'hhdm_offset()' kernel/src` less comments, the definition and tests.rs; 19 of them write, by
+  `... | grep "mut u8\|write_bytes"`; 10 in this subsystem), such as `kernel/src/klog.rs:252`,
+  `kernel/src/object/memory_object.rs:150`, `kernel/src/arch/x86_64/paging.rs:217`,
+  `kernel/src/arch/x86_64/acpi.rs:479`. An owned `Frame` from the buddy (freed on drop or
+  `into_phys`) with safe `bytes()`/`bytes_mut()`, one `unsafe fn hhdm<T>(PhysAddr) -> *mut T`
+  for borrowed cases (firmware tables, page tables), and `MemoryObject` exposing frames as views
+  so klog's fill is `memobj.copy_in(off, run)` and `copy_into_frames` takes `&mut MemoryObject`.
+  Home: kernel/src/mm. Closes: safe code writing a frame it does not own (kplat-d15). Depends
+  on: nothing. ownership, opportunities. Value medium, effort medium.
+- [ ] **kplat-o7** encapsulate: handle installation by `global::get().allocate(owner, raw_ptr,
+  ty, rights)` after `ObjectRef::into_raw`, with a manual `drop(ObjectRef::from_raw(p, t))` on
+  the error arm — 27 sites (`grep -rn "global::get().allocate(" kernel/src --include=*.rs |
+  grep -v "tests\|test_support" | wc -l` = 26: main.rs 3, syscall/table.rs 23; plus
+  handle/table.rs:589), such as `kernel/src/main.rs:863`, `main.rs:994`, `main.rs:1012`,
+  `kernel/src/syscall/table.rs:589`. `fn install(&self, owner: u32, obj: ObjectRef, rights:
+  Rights) -> Result<Handle, (HandleError, ObjectRef)>`: the table adopts the reference on
+  success and returns it on failure. Home: kernel/src/handle/global.rs. Closes: a reference
+  reclaimed twice or never on an allocate error path, a type tag that disagrees with the
+  pointer (the class behind kplat-d16). Depends on: nothing. ownership. Value medium, effort
+  medium.
+- [ ] **kplat-o8** remove: `unsafe fn`s whose whole contract is "ring 0" and whose bodies cannot
+  break memory safety (TLB flushes, `wbinvd`, masking interrupts, MTRR/PAT reads after a CPUID
+  check, walking the always-valid active root); `ArchCpu::halt` has no callers — 24 sites
+  (call sites by `grep -rnF`, less definitions and comments: `flush_tlb_page(` 7,
+  `flush_tlb_all(` 2, `regs::invlpg(` 1, `regs::wbinvd(` 2, `MemoryTypes::at(` 1, `of_mapping(`
+  1, `log_configuration(` 1, `interrupts_disable` 7, `regs::cli` 2), such as
+  `kernel/src/arch/paging.rs:150`, `kernel/src/arch/cpu.rs:111`,
+  `kernel/src/arch/memory_types.rs:75`, `kernel/src/arch/cpu.rs:85`. Make `flush_tlb_page`,
+  `flush_tlb_all`, `invlpg`, `wbinvd`, `cli`, `interrupts_disable` and `MemoryTypes::{at,
+  of_mapping, log_configuration}` plain fns, keep `unsafe` on `sti`, `interrupts_enable`/
+  `restore` and `idle_halt` (they can break the IF=0 context-switch window), and delete
+  `ArchCpu::halt`. Checked against tlb.rs:89, main.rs:777 and libkern/spinlock.rs:138. Home:
+  kernel/src/arch/{cpu.rs,paging.rs,memory_types.rs} and arch/x86_64/regs.rs. Closes: about 16
+  `unsafe fn` declarations and 24 call-site obligations whose SAFETY text is the vacuous "ring
+  0", diluting review of the ones that matter. Depends on: `of_mapping` is cleaner after the
+  typed-root part of kplat-o1; the rest on nothing. opportunities. Value medium, effort small.
+- [ ] **kplat-o9** encapsulate: the interrupt/exception entry prologue (error-code slot, vector,
+  15 GPR pushes, `mov rdi, rsp`, call, unwind, iretq) written out six times — 6 sites (`grep -c
+  'push rax\\npush rbx' kernel/src/arch/x86_64/idt.rs` = 6: `exception_stub!`, vec14,
+  `timer_stub`, `tlb_shootdown_stub`, `reschedule_ipi_stub`, `device_irq_stub!`), at
+  `kernel/src/arch/x86_64/idt.rs:158`, `idt.rs:224`, `idt.rs:348`, `idt.rs:549`. One
+  `entry_stub!(name, vector, errcode: cpu|dummy, dispatch = path)` macro emitting the shared
+  prologue (with `cld; clac` once) and epilogue; the copies differ only in the error-code push,
+  vector immediate and dispatcher symbol (checked against `timer_stub`, vec14 and
+  `device_irq_stub`). Home: kernel/src/arch/x86_64/idt.rs, beside `irq_dispatcher!`. Closes: an
+  entry path missing a flag normalisation (kplat-d1 lives in all six copies). Depends on:
+  nothing. concurrency. Value medium, effort small.
+- [ ] **kplat-o10** narrow: user copies bounded only by `T: Copy`, byte reinterpretations of
+  `#[repr(C)]` ABI types held sound by convention, and raw copy primitives taking the kernel
+  side as `(ptr, len)` — 13 sites for the type bound (`grep -n 'copy_from_user(\|
+  copy_to_user(' kernel/src/syscall/table.rs`, 3 + 8; `grep -n 'as \*const Self as \*const u8'
+  kernel/src/libkern`: framebuffer.rs:75, block.rs:138) plus 8 for the primitives (`grep -rn
+  'UserAccess::copy_bytes\|UserAccess::copy_cstr' kernel/src`: 5 in mm/user_access.rs, 2
+  forwarding impls, the trait), such as `kernel/src/syscall/table.rs:534`, `table.rs:1632`,
+  `table.rs:614`, `kernel/src/libkern/framebuffer.rs:75`, `kernel/src/mm/user_access.rs:265`.
+  `pub unsafe trait AbiPlain: Copy + 'static {}` (no padding, every bit pattern valid, backed by
+  a const size-equals-sum-of-fields assert at each impl) bounding `copy_from_user`/`copy_to_user`
+  and providing `as_bytes` once; `ArchUserAccess::copy_from(dst: &mut [u8], src: UserRange) ->
+  bool`, `copy_to(dst: UserRange, src: &[u8]) -> bool` and `copy_cstr(dst: &mut NonEmptySlice
+  <u8>, ...)` where `UserRange` is constructible only by `validate_user_range`. Checked against
+  `ThreadArgs`, `HandleInfo`, `FramebufferInfo`, `copy_slice_from_user`, `copy_cstr_from_user`
+  and `copy_from_user::<SpawnArgs>`. Home: kernel/src/libkern (trait), kernel/src/mm/
+  user_access.rs and kernel/src/arch/user_access.rs. Closes: the invalid-bool read and padding
+  leak (kplat-d5), the one-byte overrun at `max_len == 0` (kplat-d9), a kernel-side length that
+  disagrees with the buffer. Depends on: nothing. abi, opportunities. Value medium, effort
+  medium.
+- [ ] **kplat-o11** encapsulate: boot-published firmware and module tables kept as `static mut`
+  arrays or structs with a separate count/flag atomic, written once by an `unsafe fn init`
+  ("called once") and lent out as `&'static` through `from_raw_parts`, plus the device-IRQ
+  handler registry storing fn pointers as `usize` and transmuting them back — 10 sites
+  (`grep -rn "(&raw mut \(IOAPICS\|OVERRIDES\|CPU_APIC_IDS\|ECAM\|FADT\))\|(&raw const
+  \(IOAPICS\|OVERRIDES\|CPU_APIC_IDS\|ECAM\|FADT\))" kernel/src/arch/x86_64/acpi.rs` = 10; 5
+  `static mut` and 7 unsafe blocks in acpi.rs, plus the initramfs `BLOB_PTR`/`BLOB_LEN` pair
+  at initramfs.rs:18-41 and the one transmute at idt.rs:512), such as `kernel/src/arch/x86_64/
+  acpi.rs:590`, `acpi.rs:631`, `acpi.rs:467`, `kernel/src/initramfs.rs:40`. `struct BootOnce<T>
+  { state: AtomicU8, value: UnsafeCell<MaybeUninit<T>> }` with `publish(&self, v) -> Result<(),
+  T>` (Release, refuses a second call) and `get(&self) -> Option<&'static T>` (Acquire), fitting
+  IOAPICS+count, ECAM+count, FADT+flag and `BootOnce<&'static [u8]>` for the blob. For the
+  handler registry, `IrqSpinLock<[Option<extern "C" fn()>; 8]>` read in the dispatcher (already
+  IF=0), as `framebuffer::APERTURE`, `cmdline::LINE` and `partitions::BOOT_DISK` do. Home:
+  kernel/src/libkern. Closes: a second `Platform::init` mutating data behind a live `&'static`
+  slice, count/data publication drifting apart, and the subsystem's only transmute. Depends on:
+  nothing. ownership, concurrency, opportunities. Value low, effort small.
+- [ ] **kplat-o12** encapsulate: device vectors registered from a pool of eight with no release;
+  a driver that registers and then declines keeps the slot, and exhausting the pool is an assert
+  — 8 sites (`grep -rn "install_msi\|install_software\|install_intx\|install_isa_irq\|
+  register_device_handler" kernel/src --include=*.rs` call sites: serial.rs:178, ps2.rs:293,
+  295, ahci/bringup.rs:177, 209, xhci/mod.rs:454, io/ramdisk.rs:263, ioapic.rs:243), such as
+  `kernel/src/arch/x86_64/idt.rs:534`, `kernel/src/drivers/ahci/bringup.rs:177`,
+  `kernel/src/drivers/xhci/mod.rs:454`, `kernel/src/arch/x86_64/serial.rs:178`.
+  `register_device_handler(handler) -> Result<DeviceVector, PoolFull>`, where `DeviceVector`
+  clears its slot on drop unless `commit()` is called once the device is programmed;
+  `install_msi`, `install_intx` and `install_software` return the guard. Home: kernel/src/
+  arch/x86_64/idt.rs and kernel/src/arch/irq_install.rs. Closes: a vector leaked on a bring-up
+  failure path and the boot-time assert when the pool runs out (the release image already uses
+  5 or 6 slots, the test image 7, io/ramdisk.rs:35-38). Depends on: nothing. ownership. Value
+  low, effort small.
+- [ ] **kplat-o13** narrow: hardware stack pointers travel as `u64`: the TSS.RSP0 and syscall
+  stack setters are safe fns taking any `u64`, and `fabricate_frame` is an `unsafe fn` whose
+  contract is "top has 56 writable bytes below it", all three values coming from a KernelStack
+  — 6 sites (`grep -rn 'set_syscall_kernel_stack\|set_kernel_stack('` finds 4 calls: sched.rs:
+  506, 507, 756, 757; `grep -rn 'fabricate_frame('` finds 2 production calls: object/thread.rs:
+  281, 338), such as `kernel/src/arch/cpu.rs:23`, `kernel/src/arch/x86_64/syscall.rs:114`,
+  `kernel/src/arch/x86_64/context.rs:191`, `kernel/src/sched.rs:506`. `pub struct
+  KernelStackTop(u64)` returned only by `KernelStack::top(&self)` and taken by
+  `set_kernel_stack` and `set_syscall_kernel_stack` (documented "the stack must outlive this CPU
+  running its thread"); `KernelStack::fabricate(&mut self, trampoline) -> ArchThreadContext`
+  replaces the unsafe `fabricate_frame`. Checked against `arm_kernel_stack_for` and
+  `Thread::try_new_runnable`/`try_new_user`. Home: kernel/src/mm/kstack.rs with kernel/src/arch/
+  {cpu.rs, x86_64/syscall.rs, x86_64/context.rs}. Closes: loading an arbitrary or stale RSP0 or
+  syscall stack from safe code (kplat-d21). Depends on: nothing. abi, opportunities. Value low,
+  effort small.
+- [ ] **kplat-o14** encapsulate: index/data port pairs (CMOS 0x70/0x71, IOAPIC IOREGSEL/IOWIN,
+  PCI 0xCF8/0xCFC) driven by unlocked select-then-access helpers, with serialisation held by
+  callers (`clock::SETTING` for RTC writes, "called once" for the RTC read, boot-only use for
+  the IOAPIC, a stopped machine for reset) — 5 helper fns (rtc.rs:57 `read_reg`, rtc.rs:72
+  `write_reg`, ioapic.rs:55 `read_reg`, ioapic.rs:71 `write_reg`, reset.rs:137-138 the CF8/CFC
+  pair), with 7 IOAPIC call sites (ioapic.rs:130, 137, 190, 199, 200, 221, 222), such as
+  `kernel/src/arch/x86_64/rtc.rs:57`, `kernel/src/arch/x86_64/ioapic.rs:55`,
+  `kernel/src/arch/x86_64/reset.rs:137`, `kernel/src/arch/x86_64/rtc.rs:72`. `struct IndexedPort
+  { lock: IrqSpinLock<()>, .. }` with `lock(&self) -> IndexedGuard` whose `read(idx)`/
+  `write(idx, v)` select and access under one hold; for the IOAPIC, `static IOAPIC:
+  IrqSpinLock<Option<IoApicRegs>>` (a Leaf rank) with safe `read(&mut self, idx)`/`write`, and
+  `route`, `set_rte_mask` and `init` run under the guard. Home: kernel/src/arch/x86_64/regs.rs
+  and ioapic.rs. Closes: two contexts interleaving select and access so a write lands in
+  another register (kplat-d17). Depends on: nothing. ownership, concurrency. Value low, effort
+  small.
+- [ ] **kplat-o15** narrow: the FP/SIMD save area handled through raw `*mut`/`*const
+  ArchFpuState` even where the caller holds a `KBox` or `&mut` — 4 sites (`grep -rn
+  'fpu_save\|fpu_restore\|fpu_init_area' kernel/src`, less arch/mod.rs: object/thread.rs:186,
+  sched.rs:638, 642, fpu.rs:427 in the selftest), such as `kernel/src/arch/x86_64/fpu.rs:184`,
+  `fpu.rs:234`, `kernel/src/object/thread.rs:186`, `kernel/src/sched.rs:638`.
+  `ArchFpuState::initial() -> Self` (zeroed area plus FCW/MXCSR defaults, the only constructor,
+  so every value is a valid image), `fn save(&mut self)` and `fn restore(&self)`; alignment is
+  already a `#[repr(align(64))]` type invariant. Checked against `new_fpu_area` and
+  `switch_into`'s swap. Home: kernel/src/arch/x86_64/fpu.rs. Closes: restoring an uninitialised
+  or foreign image (#GP from MXCSR or XSTATE_BV) and an unaligned or dangling area pointer.
+  Depends on: nothing; the sched call sites keep raw access until kplat-o5 gives them `&Thread`.
+  opportunities. Value low, effort small.
+
+What held up: `SyscallFrame` and `ExceptionFrame` match their stubs' push and pop order, pinned
+by `offset_of!`/`size_of` asserts, and RSP is 16-byte aligned at each `call`. `sysretq` to a
+non-canonical RCX cannot happen: `USER_MAP_END` keeps the top user page unmapped and all four
+user-mapping paths check it. Every IDT gate is DPL 0, the TSS iomap base equals the TSS size,
+and STAR carries RPL 3. The user-copy asm sets `cld` before `rep movsb`, registers the right
+fault PC, and clears AC on both paths. SFMASK clears IF, DF and AC on syscall entry; NMI uses
+IST2 over both user-stack windows and the exit path does `cli` before `pop rsp`. FPU: the XSAVE
+size is re-read after XCR0 and asserted, the area is 64-byte aligned, and `init_area` seeds
+FCW/MXCSR. ACPI parsers read bounds-checked slices capped at `MAX_TABLE_BYTES`, with host tests
+for short tables, and the caches publish count-after-data with Release/Acquire. `initramfs::
+lookup` uses `checked_add` and bounds every slice. fbcon `Screen::new` refuses a null or
+misaligned base and `put()` checks x and y (Miri: `after_the_yield_nothing_is_painted_and_the_
+reclaim_repaints_everything` passed with no UB). `klog` append/runs/`copy_into_frames` stay
+inside prefix, ring and cap, and `push` uses `try_lock`. `ensure_table`'s CAS link and
+give-back of the losing table is sound (host test `a_cpu_beaten_to_an_empty_slot_takes_the_
+table_linked_first`); the defect is the plain accesses beside it. Miri passed
+`map_translate_unmap_round_trip` and `fabricate_frame_lays_out_trampoline_and_zeroed_regs`.
+Limine bindings match limine-protocol field by field; the buddy takes only `MEMMAP_USABLE`, so
+no `&'static` view of Limine, ACPI or module memory is reused today. Module paths and the
+framebuffer descriptor are copied, not retained. `unmap_plain` flushes only locally, but the
+vmap bump allocator never reuses a VA. `stop_other_cpus` masks IF before reading its APIC id,
+and `leave_online` refuses an unbound CPU. `power()` takes no lock and allocates nothing after
+the stop. `context_switch` clears `on_cpu` only after the resume RSP store, and FPU save
+precedes it. `arm_kernel_stack_for` re-arms RSP0, `kstack_top` and `KERNEL_GS_BASE` under SCHED
+with IF=0. `copy_cstr_from_user` refuses `max == 0` before the raw primitive. Every type
+copied to or from user memory today is padding-free with valid-for-all bit patterns. The
+`nomem` on `cli`/`sti` is sound under the project's atomics-for-IRQ-shared-state rule (a host
+snippet showed the compiler does move plain stores across it, so kplat-d22 stays a latent
+defect). `elapsed_ns` saturates for a cold AP. `install_msi` addresses (0xFEEx_x000) are never
+refused by `program_msi`, so the MSI-then-INTx fallback leaks no vector today.
