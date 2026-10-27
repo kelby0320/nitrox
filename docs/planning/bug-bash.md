@@ -11,7 +11,8 @@ rides with them, kmem-11. Group C fixed 2026-10-23: ext4's findings and those in
 servers share, then FAT's, with fs-3's two halves and the trials' doc claims. Group D fixed
 2026-10-24: the block layer's bounds, AHCI's recovery, a kept USB slot's commands, the shutdown's
 flush walk and the hot-plug window. Group E fixed 2026-10-25: a process's exit, which frees no
-thread in place now, and the deadline heap's slots.** Part D of
+thread in place now, and the deadline heap's slots. On 2026-10-27 ten later findings moved to
+Part I with the safety survey's defects that repeat them.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -282,6 +283,7 @@ Found 24, refuted by a boot 0, reported 13.
   refcount was 2 (the test's reference plus the stranded fill's), and nothing drains
   `pending_fill`. logic, trust-boundary. Reviewers disagreed on severity (logic: medium,
   trust-boundary: low); ranked low. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's kobj-d3, which repeats it.
 - [ ] **kobj-11** `kernel/src/syscall/table.rs:483` — When allocating the parent's Process
   handle fails after the child thread is queued, `sys_process_spawn` returns an error while the
   child runs. It skips the move-close loop at 493-497, so the parent's move_mask handles stay
@@ -289,6 +291,7 @@ Found 24, refuted by a boot 0, reported 13.
   after `spawn_user`. The parent sees a failed spawn and may retry, starting a second child.
   Unverified: needs a failure injection in the global table's segment grow and a boot to
   settle. error-paths. Low. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's kobj-d4, which repeats it.
 - [ ] **kobj-12** `kernel/src/handle/table.rs:588` — No test hands `duplicate()` a `new_rights`
   with bits the source lacks, so replacing `info.rights & new_rights` with `new_rights` passes
   the whole kernel host suite. This is a test gap, not a defect in code that works, and it is
@@ -452,6 +455,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   to 512 GiB, `KernelStack::new(A)` succeeded at 0xffffc08000001000, mapped in A and not in B. On
   small-RAM machines the recorded page-table-frame leak may exhaust memory first. Lens: logic.
   Medium. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's kmem-d1, which repeats it.
 - [ ] **kmem-10** `kernel/src/sched/ipc.rs:499` — When a server's endpoint closes
   (`ipc_endpoint_closing`, line 480) or its registration drops (`us_reg_detach`), only pending
   lookups are drained, never `pending_fill`. A Model B page-cache fill whose server dies or never
@@ -1018,6 +1022,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   IRPs queue and then fail IoError. If disk 1 holds `nitrox-root`, `/` cannot mount. Unverified:
   QEMU with two `-device ahci` controllers, each with a drive; check for the "partitions: the table
   did not read" line. No xtask gate has that configuration. Lens: trust-boundary. Medium. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's drv-d4, which repeats it.
 
 - [ ] **drv-9** `kernel/src/drivers/partitions.rs:97` — Test gap in untrusted-input guards: the GPT
   entry-size range check, the `.min(entries)` clamp on the array and the `.min(GPT_ENTRY_BLOCKS_MAX)`
@@ -1213,6 +1218,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   (100 to 150 KB) decoded. Depths of 40,000 (200 KB), 50,000, 100,000 and 200,000 (1 MB) aborted
   with 'thread has overflowed its stack' (SIGABRT). Probes removed. logic, error-paths,
   trust-boundary, tests, architecture. Medium. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's proto-d2, which repeats it.
 - [ ] **proto-8** `userspace/libstream/src/wire.rs:590` — Decoding is not proportional to input.
   A Null-typed column takes 0 bytes per row and a row is one REC_DATA byte, but
   `read_row_values` allocates a 32-byte Value per column per row, so decoding allocates
@@ -1227,6 +1233,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   (16,367×). A 64,017-byte stream (4,000 columns, 48,000 rows) aborted with 'memory allocation
   of 131072 bytes failed' against a 2 GiB cap. A 5,017-byte stream with 1,000 columns and 1,000
   rows gave ~32 MB. Probes removed. error-paths, trust-boundary, architecture. Medium. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's proto-d3, which repeats it.
 - [x] **proto-9** `userspace/libstream/src/channel.rs:234` — `IpcPort::recv` passes `recv_handles`
   and `count` to SYS_CHANNEL_RECV, which installs every transferred handle in the receiver's
   table, and never closes or returns them. nxsh's `drain_diagnostics` (main.rs:127-132) and
@@ -1299,6 +1306,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   a 65,538-byte crafted name ("ab", 0x02, 0x00, then padding) encoded Ok. `Table::decode` read
   one field "ab" of type Int and failed with Err(BadRecordTag(122)) on the next name byte
   (`cargo test -p libstream --lib`). Probe removed. logic. Low. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's proto-d7, which repeats it.
 - [ ] **proto-15** `userspace/libgpt/src/table.rs:298` — `read()` computes disk_blocks as
   header[32..40] + 1, which overflows when a valid-CRC header carries backup_lba u64::MAX. A
   build with overflow checks panics 'attempt to add with overflow' in the storage service or
@@ -1308,6 +1316,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   forged the CRC after setting the backup LBA to u64::MAX, and `cargo test -p libgpt --lib`
   panicked at table.rs:298. The release wrap is by inspection of the profile, not run. Probe
   removed. tests. Low. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's proto-d4, which repeats it.
 - [ ] **proto-16** `kernel/src/rsproto.rs:408` — Several kernel codec guards are untested:
   `forget_request`'s magic check, the u16::MAX suffix limit in `build_resolve_request`,
   `build_read_range_request` and `build_resolve_request_rename`, and the error-body minimum
@@ -1558,6 +1567,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   about 30 such logins `tty_open` fails, and the serial console loops on "no terminal for
   login" until reboot. Demonstrated by reading the code. Unverified: forcing the namespace
   failure was not run. logic. Low. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's sec-d1, which repeats it.
 
 - [ ] **sec-13** `userspace/auth-service/src/main.rs:580` — `install()` discards the status of the
   `SYS_FILE_TRUNCATE` that clears a leftover `/system/users.new`, then creates the file with
@@ -1909,6 +1919,7 @@ Found 21, refuted by a boot 0, reported 16.
   with nxterm `after = ["display-selftest"]` in the test image. Unverified: `service --start
   nxterm` during that wait, then count nxterm processes or "starting service" lines. Lenses:
   logic, error-paths (same defect). Low. **Later.**
+  Moved to Part I on 2026-10-27 with the safety survey's sup-d3, which repeats it.
 
 - [ ] **sup-10** `userspace/service-mgr/src/main.rs:1374` — `wait_codes` is meant to wait up to
   `CODE_GRACE_NS` for a dead service's exit code, but it returns false when any route wakes the

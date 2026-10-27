@@ -4,7 +4,7 @@
 //! `session-mgr` and `desktop-session-mgr` run the same sequence against different arguments: a
 //! **shared library, not a merged process** (`docs/architecture/graphical-session.md` §4).
 //! **The greeter is not here**; it starts with credentials in hand and ends with a leader that
-//! has exited. `no_std` with `alloc`, and **no `libos`** (`userspace/session-mgr/CLAUDE.md`).
+//! has exited. `no_std` with `alloc`, kept minimal as `session-mgr` links it (its `CLAUDE.md`).
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
