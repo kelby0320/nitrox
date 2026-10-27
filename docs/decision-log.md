@@ -36910,11 +36910,12 @@ that agent on its fallback model, Opus 4.8, without its earlier reasoning. The m
 The survey's thirteen runs, 354 items, were triaged with the maintainer on a page that started each
 at a suggested verdict; the maintainer kept every suggestion and made three calls.
 `safety-survey.md` holds each verdict: 221 to fix in Part I, 120 in eight layers marked plan, 10
-later. Ten bash findings Part H held repeat survey defects, and move into Part I with them. The
-calls:
+later. The other three are kmem-d12 and kmem-d14, which go into Part E with the bash's kmem-15 and
+kmem-28 they repeat, and kobj-d12, split between a fix and a plan. Ten bash findings Part H held
+repeat survey defects, and move into Part I with them. The calls:
 
-- **libos is every userspace crate's syscall layer, and the "no `libos`" rule of `session-mgr`,
-  `libsession` and `desktop-session-mgr` is lifted.** The rule began as init's and eshell's, before
+- **libos is to be every userspace crate's syscall layer, and the "no `libos`" rule of
+  `session-mgr`, `libsession` and `desktop-session-mgr` is lifted.** The rule began as init's and eshell's, before
   libos had an alloc-free core; on 2026-07-13 init's was lifted, recording that libos core is safe
   on the critical path because it has nothing to start up. `session-mgr`'s rule was written a week
   later in the same spirit and never revisited; `libsession` was built to it, and
@@ -36923,10 +36924,15 @@ calls:
   `libos.md` draws them above; the survey found the wait-and-close helper libos would share
   copied fifteen times across userspace. **The conditions:** libos stays `no_std` with an alloc-free core, `libkern` its
   only dependency, nothing to start up, and anything needing `alloc` (the multi-task executor)
-  behind a feature; the holes the survey found in it (rt-d1, rt-d2, rt-d3, rt-d8, rt-d9, rt-d10)
-  are fixed before crates move onto it; `eshell` stays on `libkern`, by the choice of 2026-07-13;
-  the safe wrappers live in libos, and `libkern` stays the raw layer, keeping `Received`, which
-  `check-recv` pins there. `librsproto` and `libstream` move onto libos with Part E.
+  behind a feature; the holes found in it are fixed before any crate moves onto it: rt-d1, rt-d2,
+  rt-d3, rt-d8, rt-d9 and rt-d10 from the survey, rt-d12 (`block_on` spinning on a wait that keeps
+  failing) and rt-d13 (a ninth operation never waited on) from PR #400's review, and rt-d6, whose
+  fix is the kernel's but whose other half is libos's: dropping an `Op` closes its PO while its
+  I/O may still write the buffer the dropped future borrowed. Two crates stay on `libkern`, the
+  agreed exceptions to the raw-syscall rule: `eshell`, by the choice of 2026-07-13, and `libheap`,
+  the allocator every crate links, which keeps the smallest surface under it. The safe wrappers
+  live in libos, and `libkern` stays the raw layer, keeping `Received`, which `check-recv` pins
+  there. `librsproto` and `libstream` move onto libos with Part E.
 - **The kernel's six layers marked plan are a part of their own, Part J**: they change no syscall.
   libos (P7) and the wire formats (P8) go into Part E's detail pass.
 - **The VMA tree stays.** Its interval augmentation is never read, and cannot help: VMAs never

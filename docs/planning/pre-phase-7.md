@@ -984,13 +984,16 @@ left out: 107,589 lines of code holding 2,795 `unsafe` blocks, 374 `unsafe fn`s,
 **221 to fix here**: first any process crashing the kernel through the flags an interrupt entry
 leaves (kplat-d1), an AHCI completion under live DMA (drv-d1) and the test heap that hides a
 use-after-free from Miri (kobj-o4), then the other high defects, then the rest. Ten of them repeat
-bash findings Part H held, which move here with them. **120 plan, in eight layers**: the kernel's
+bash findings Part H held, which move here with them; two more, holes in libos, came from this
+triage's review. **120 plan, in eight layers**: the kernel's
 six are Part J; libos (P7) and the wire formats (P8) go into Part E's detail pass. **10 later.**
 [`safety-survey.md`](safety-survey.md) holds each verdict, the layers and the calls.
 
-**libos is every userspace crate's syscall layer** (the maintainer's call, 2026-10-27): the
-"no libos" rule of `session-mgr` and `desktop-session-mgr` is lifted, `eshell` alone stays on
-`libkern`, and `librsproto` and `libstream` move onto libos. The decision log holds its conditions.
+**libos is to be every userspace crate's syscall layer** (the maintainer's call, 2026-10-27): the
+"no libos" rule of `session-mgr`, `libsession` and `desktop-session-mgr` is lifted, `eshell` and
+`libheap` stay on `libkern` as the two agreed exceptions, and `librsproto` and `libstream` move onto
+libos. The decision log holds its conditions, first among them that libos's own holes are fixed
+before any crate moves onto it.
 
 ## Part J — the kernel's typed layers
 
@@ -1068,4 +1071,5 @@ several branches at once, which waits on the gates leaving this machine.
   agreed with the maintainer.
 - Part I's survey run on its thirteen subsystems and every item triaged; its items marked fix
   fixed, its layers marked plan in Part E's plan or built in Part J, and no raw syscall outside
-  `libkern` and `libos`, or each exception agreed with the maintainer (`eshell`'s is agreed).
+  `libkern` and `libos`, or each exception agreed with the maintainer (`eshell`'s and `libheap`'s
+  are agreed).

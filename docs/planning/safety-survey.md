@@ -64,14 +64,18 @@ runs found is one.
 
 - **10 later**, past Phase 7: nine small changes with no defect behind them, and sched-d15, a CPU
   whose x2APIC id is over 255.
-- kmem-d12 and kmem-d14 are the bash's kmem-15 and kmem-28, and go with them into Part E. kobj-d12
-  is two defects: its `try_new_pair` half is fixed as sched-d12, its `Drop` half planned as
-  sched-d11.
+- The three these counts leave out: kmem-d12 and kmem-d14 are the bash's kmem-15 and kmem-28, and
+  go with them into Part E; kobj-d12 is two defects, its `try_new_pair` half fixed as sched-d12 and
+  its `Drop` half planned as sched-d11. kmem-o7 is split as well, though counted in P3: its first
+  step is there, its second later.
+- **Two more, found reviewing PR #400** (rt-d12, rt-d13, at the end): both fix, with libos's other
+  holes.
 
 The calls:
 
-- **libos is every userspace crate's syscall layer**, and the "no libos" rule of `session-mgr` and
-  `desktop-session-mgr` is lifted: the decision log, 2026-10-27, holds its conditions.
+- **libos is to be every userspace crate's syscall layer**, and the "no libos" rule of
+  `session-mgr`, `libsession` and `desktop-session-mgr` is lifted. `eshell` and `libheap` stay on
+  `libkern`, the two agreed exceptions. The decision log, 2026-10-27, holds its conditions.
 - **P1 to P6 are a part of their own**, Part J, since they change no syscall.
 - **The VMA tree stays.** kmem-o7's second step, replacing the tree with a sorted vector, is later:
   its insert cost grows with the VMA count, and a balanced tree is the maintainer's preference when
@@ -1419,7 +1423,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   corruption in the tree; it removes nearly all of the subsystem's raw-deref column. Medium only
   because the tree already passes Miri and the decision log chose it deliberately. Depends on:
   nothing for step 1; revisiting the decision-log VmaTree entry for step 2. Lens: opportunities.
-  Value medium, effort medium. **Plan**, in P3.
+  Value medium, effort medium. **Plan**, in P3,
+  for its first step, deleting the augmentation; **later** for its second, replacing the tree: the
+  maintainer's call, a balanced tree rather than a vector when it is revisited.
 - [ ] **kmem-o8** narrow: `copy_from_user`/`copy_to_user` are generic over `T: Copy`, and ABI
   types reinterpret themselves as bytes in hand-written unsafe blocks, each with its own padding
   claim — 21 sites (11 typed copies: `grep -rn 'copy_to_user(\|copy_from_user(' kernel/src
@@ -3280,6 +3286,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   returns. No boot was run; widening a window is not allowed. A host test faking a wait that
   returns unsignalled and then submitting a second read into the same Scratch would show it.
   ownership, soundness. Low. **Fix.**
+  The trigger named above cannot fire: this `po_wait` waits on one PO with no deadline, where
+  registering a waiter fails only past `MAX_WAITERS` (four, reserved at construction) and no
+  deadline entry is pushed. The item is latent, as fs-d4 says of the same helper.
 - [ ] **sup-d14** `userspace/init/src/main.rs:692` — handoffs are read by position, and a handoff
   whose send fails is closed with nothing sent in its place, so every later handle shifts one
   slot. The code sends an empty message for a zero handle but not for a failed send. Same in
@@ -5797,3 +5806,29 @@ a test caught is th-d2, by Miri on a model (th-d1 and th-d9 by a compile check a
 test; none of the probes was left in place). No host test reaches any unsafe in this crate; it is
 bins only, with no lib target, so the proposed abstractions become host-testable only behind
 libos's sys mock.
+
+### Found reviewing PR #400 — branch pre-phase-7/part-i-survey at ff6de3a3, 2026-10-27
+
+Two holes in libos the runtime's run missed, found by the review's error-paths lens and shown
+again by the author with the libos mock made faithful to the kernel, where a handle that does not
+exist fails the whole wait. Both probes were removed.
+
+- [ ] **rt-d12** `userspace/libos/src/exec.rs:122` — `Op::poll` takes any `sys_wait` return below
+  1 as "not ready", errors included, and `block_on` (:171) ignores its blocking wait's result, so a
+  wait that keeps failing is polled again for ever instead of returning its error. A PO handle
+  closed by a stale close elsewhere (the shape of rt-d8) makes every wait on it fail at once with
+  InvalidHandle, and `block_on` spins. In a supervisor that keeps the run queue from ever emptying,
+  which stops deferred handle reclamation for the whole machine. `desktop-session-mgr` reaches
+  `block_on` today through `libdraw::text::load_ui` and `libsurface::screen::read`. Demonstrated:
+  a host probe ran an `Op` whose PO was then closed under `block_on`, through a wrapper that gives
+  up after 100,000 polls; it was still re-polled after 200,000 `sys_wait`s. The control, without
+  the close, completed. Fix: `Ready(Err)` for any negative result but WouldBlock, and a failed
+  blocking wait ends `block_on`. error-paths. Medium. **Fix.**
+- [ ] **rt-d13** `userspace/libos/src/exec.rs:48` — `Reactor::register` drops every handle past the
+  eighth ("only costs an extra poll round"), but `block_on` then waits on the eight it kept with no
+  deadline, so a future pending on nine or more operations, where only a dropped one will signal,
+  blocks for ever. Latent: libos has no join, so only a hand-written future polling more than eight
+  `Op`s reaches it; the multi-task executor `libos.md` plans would. Demonstrated: a host probe
+  polled nine pending `Op`s under `block_on`, and the first blocking wait was given eight handles,
+  not the ninth. Fix: when a round drops a registration, wait with a deadline of zero, so the
+  dropped operations are polled again. error-paths. Low. **Fix.**

@@ -22,6 +22,9 @@ init's fixed bump arena (slice 4). Full design: `docs/architecture/libheap.md`.
 
 Sits directly on `libkern` (raw syscalls), below `libos`. The top-level binary
 registers `libheap::Heap` as its `#[global_allocator]`. Don't reach above libkern.
+This is one of the two agreed exceptions to "no raw syscall outside `libkern` and `libos`"
+(the decision log, 2026-10-27), with `eshell`: the allocator every crate links keeps the
+smallest surface under it.
 
 ## The two hard invariants
 
