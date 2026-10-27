@@ -163,6 +163,31 @@ fn ctx(d: &AhciDisk) -> *mut () {
 const IO_ERROR: i32 = crate::syscall::error::KError::IoError as i32;
 const PENDING: i32 = IrpStatus::Pending as i32;
 
+/// **A command issued after the interrupt read slot 0 idle is not retired**: read outside the port
+/// lock, PxCI let the ISR take the command another CPU had just issued, failing a read or passing a
+/// flush while the HBA still ran it, its buffer released under live DMA.
+#[test]
+fn a_command_issued_after_the_slot_read_idle_is_not_retired() {
+    use crate::io::irp::{IRP_BUF_NONE, IrpBuffer, IrpOp};
+    for flush in [false, true] {
+        let (_regs, d) = fake_disk();
+        let frag = PhysFrag { base: 0x10_0000, len: 512 };
+        let none = IrpBuffer { kind: IRP_BUF_NONE, count: 0, frags: 0 };
+        let mut irp = match flush {
+            false => read_irp(&frag),
+            true => Irp::new_block(IrpOp::Flush, core::ptr::null(), 0, 0, none, core::ptr::null_mut(), 0),
+        };
+        assert_eq!(read32(d.port_base, PX_CI), 0, "flush {flush}: slot 0 idle when the interrupt came");
+        submit(&mut irp, ctx(&d));
+        assert_eq!(read32(d.port_base, PX_CI), 1, "flush {flush}: issued since, on another CPU");
+        let (retired, _, _) = take_retired(&d);
+        crate::dpc::run_pending();
+        assert!(retired.is_null(), "flush {flush}: retired while the HBA runs it");
+        assert_eq!(irp.status, PENDING, "flush {flush}");
+        assert_eq!(d.inflight.load(Ordering::Acquire), &mut irp as *mut Irp, "flush {flush}: still in flight");
+    }
+}
+
 /// **A command a polled wait gave up on is failed, not retired**: it retired as done while it may
 /// have been running yet, and the next was built over its slot.
 #[test]

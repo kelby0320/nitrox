@@ -582,15 +582,20 @@ fn completion(err: bool, length: u64, moved: u32) -> (i32, u64) {
     }
 }
 
-/// Slot 0 has retired: under the port lock, take the completed IRP out of flight (capturing its
-/// error status and the bytes it moved) and mark the slot idle. Returns the IRP (`null` if already
-/// idle), whether it errored, and its header's byte count. Does **not** issue the next command:
+/// If slot 0 has retired, take its IRP out of flight under the port lock (capturing its error
+/// status and the bytes it moved) and mark the slot idle. Returns the IRP (`null` if idle or still
+/// running), whether it errored, and its header's byte count. Does **not** issue the next command:
 /// [`drain_queue`] does, from a DPC, so a fast pipelined completion cannot race the interrupt ack.
 /// The caller completes the IRP outside any lock.
 fn take_retired(d: &AhciDisk) -> (*mut Irp, bool, u32) {
     let _q = d.pending.lock();
     // Stopping the port clears PxCI, which must not read as the command finishing.
     if d.fault.load(Ordering::Acquire) != CLEAR {
+        return (core::ptr::null_mut(), false, 0);
+    }
+    // **PxCI is read under the lock a submit issues under**: read before it, slot 0 could have
+    // taken a new command since, retired here while the HBA still runs it.
+    if read32(d.port_base, PX_CI) & 1 != 0 {
         return (core::ptr::null_mut(), false, 0);
     }
     let retired = d.inflight.swap(core::ptr::null_mut(), Ordering::AcqRel);
@@ -658,13 +663,11 @@ fn on_interrupt(d: &AhciDisk) {
         crate::dpc::enqueue(&AHCI_FAULT_DPC);
     }
     // If slot 0 has retired, complete the IRP and queue the drain DPC for the next waiting command.
-    if read32(d.port_base, PX_CI) & 1 == 0 {
-        let (irp, err, moved) = take_retired(d);
-        if !irp.is_null() {
-            // SAFETY: `irp` is the retired request; set status + queue its DPC.
-            unsafe { retire(d, irp, err, moved) };
-            crate::dpc::enqueue(&AHCI_DRAIN_DPC);
-        }
+    let (irp, err, moved) = take_retired(d);
+    if !irp.is_null() {
+        // SAFETY: `irp` is the retired request; set status + queue its DPC.
+        unsafe { retire(d, irp, err, moved) };
+        crate::dpc::enqueue(&AHCI_DRAIN_DPC);
     }
     crate::dpc::enqueue(&AHCI_INTR_DPC);
 }
