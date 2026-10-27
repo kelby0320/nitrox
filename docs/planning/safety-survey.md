@@ -3443,3 +3443,393 @@ logging's ring is a process-local `Ring` and its two raw derefs (the `READ_BODY`
 sound, storage-service `probe.rs` has no `unsafe` (the device reads are `DeviceIo` in main.rs),
 and `libinittoml`, `service_toml.rs` and every `lib.rs` are safe Rust. None of the 225 `unsafe`
 blocks is reached by a host test or Miri.
+
+### security — main at 135055a8, 2026-10-27
+
+Lenses: abi, ownership, soundness, opportunities; returned nothing: none.
+Defects: found 28, refuted by a boot 0, reported 14 (28 findings merged by duplicate). Opportunities: 11 (26 merged).
+
+The inventory, `cargo xtask unsafe-inventory` over its paths:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `userspace/auth-service` | 668 | 52 | 0 | 0 | 15 | 33 | 7 | 5 | 0 | 0 | 1 |
+| `userspace/view-broker` | 2214 | 31 | 0 | 0 | 8 | 23 | 1 | 3 | 0 | 0 | 0 |
+| `userspace/session-mgr` | 322 | 17 | 0 | 0 | 7 | 11 | 1 | 0 | 0 | 0 | 0 |
+| `userspace/libsession` | 782 | 72 | 0 | 0 | 14 | 54 | 4 | 1 | 0 | 0 | 0 |
+| `userspace/libusers` | 270 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/libcrypto` | 247 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/libviews` | 168 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `userspace/libprompt` | 178 | 3 | 0 | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
+| `total` | 4849 | 175 | 0 | 0 | 44 | 124 | 13 | 9 | 0 | 0 | 1 |
+
+**Defects**
+
+- [ ] **sec-d1** `userspace/session-mgr/src/main.rs:224` — When a successful login's namespace
+  fails to build, the loop `continue`s without `tty_close`, so the terminal opened at line 187
+  leaks, and with it one of tty-server's 14 terminal slots (MAX_TTYS = (32-3)/2). A
+  /system/users record whose home the kernel refuses as a subtree base (`/home/alice/`, `/`, a
+  relative path, over 128 bytes) is accepted by auth-service with the home unchanged. On each
+  correct login libsession::build's `/home` bind fails (lib.rs:384) and build_namespace returns
+  0. A failed SYS_NS_CREATE takes the same path. After about 13 such logins tty-server answers
+  every `/dev/tty` resolve with WouldBlock: the serial login prints 'no terminal for login'
+  forever, and nxterm windows and the broker's token redeem fail too. Demonstrated: host
+  probes (restored) showed `authenticate` returning Authenticated with home `/home/alice/`,
+  `/`, `home/alice` and a 300-byte home (`cargo test -p auth-service --lib survey_probe`), and
+  the kernel's `SubtreeBase::from_path` refusing all of them and accepting `/home/alice`
+  (`cargo test --lib --target x86_64-unknown-linux-gnu survey_probe`). The only `tty_close`
+  calls are at 252-254 and 274-276, and tty-server/src/main.rs:43 and :290 refuse the 15th
+  terminal. ownership, soundness. Medium.
+- [ ] **sec-d2** `userspace/libos/src/exec.rs:133` — `Op::poll` is a safe `Future` impl that
+  turns `cx.waker().data()` into `&Reactor`. It is sound only when libos's `block_on` built the
+  Waker, so a foreign Waker makes safe code produce a null or foreign reference. libos is
+  outside the subsystem, but it is the home the opportunities below propose. Safe code that
+  submits an Op with the PO not yet complete and polls it with `Waker::noop()` runs
+  `&*(null as *const Reactor)`, and `register()` writes a 72-byte Registry through it. Under
+  another executor's Waker the write lands in that executor's data. It is latent today because
+  only `block_on` polls an Op. The multi-task executor libos.md plans, or any join that wraps
+  the Waker, would make it memory corruption in init. Demonstrated: a temporary host test
+  `probe_op_polled_by_a_foreign_waker` (scripted not-ready mock, `Waker::noop()`) aborted with
+  'panicked at libos/src/exec.rs:133:32: null reference produced'. Probe removed. opportunities.
+  Medium.
+- [ ] **sec-d3** `userspace/libsession/src/lib.rs:208` — `authenticate` (and `views_call`, line
+  252) takes the next message on a long-lived channel as the answer to its request. The request
+  id is always 1 and is never compared, and the reply's principal is never compared with
+  `user`, so a reply left unread is taken by the next call as its own. One auth channel is
+  shared by session-mgr, desktop-session-mgr and the broker. Check A (correct password) is
+  answered AUTHENTICATED, but `sys_channel_recv` fails with OutOfMemory, which it returns
+  before popping (kernel/src/syscall/table.rs:2771), so `.ok()?` returns None and the reply
+  stays queued. Check B (any user, wrong password) then pops A's reply: session-mgr logs in the
+  typed name with A's home, and the broker allows B's elevated view. Every later answer stays
+  shifted by one. `views_call` gives the next login the previous user's `/s/<id>` the same way.
+  The same bite follows from putting a deadline on these waits, when a slow PBKDF2 outruns it.
+  Contrast session-mgr `tty_request` (fresh ids) and the broker's `ask_auth` (closes the
+  channel on give-up). Unverified: fail one `sys_channel_recv` allocation on the auth channel
+  under QEMU, or add a host seam for libsession's syscalls. abi. Medium.
+- [ ] **sec-d4** `userspace/auth-service/src/main.rs:73` — `ADMIN_REPLY` is sized
+  `MSG_LEN - PAYLOAD_OFF - 64` = 4008 (a whole payload) where a reply body may be at most
+  `RS_MAX_BODY` = 3980. A List body of 3981..=4008 bytes is built as `Admin::Reply`, then
+  `send_reply`'s `encode` refuses it and returns without sending anything. A hand-written
+  /system/users of at most 4096 bytes with a few long names and homes reaches it (for example
+  10 records of `<199-byte name>::1::<199-byte home>`, 4040 bytes). The broker's List (before
+  every policy judgement, account write and `Accounts`) then stalls for ACCOUNTS_WAIT_NS (5 s),
+  drops its admin session and reports 'auth-service did not answer', on every call while the
+  file stays. The library's `ListTooLong` refusal never reaches the broker. A file written by
+  libusers cannot reach it. Demonstrated: three independent host probes (restored).
+  `serve_admin(OP_AUTH_LIST)` into a 4008-byte buffer returned `Admin::Reply(4002..4007)`,
+  `librsproto::encode` into the 4072-byte tail returned None ('list body 4007 bytes;
+  RS_MAX_BODY 3980', 'encode -> None'). Control: a reply buffer of `RS_MAX_BODY` gives
+  `Refused(ListTooLong)`. abi, soundness, opportunities. Low.
+- [ ] **sec-d5** `userspace/view-broker/src/main.rs:1447` — `let (Ok((setup_ours,
+  setup_child)), Some((life_ours, life_child))) = (pipe(1), make_channel(1)) else {..}`
+  evaluates both creates, and when exactly one fails the else arm closes `image` and `view_ns`
+  but not the pair that was created, so two channel handles leak per failed start. An allowed
+  request reaches `start()` while the kernel heap or the broker's handle table is short. The
+  pair stays in the essential broker's table for the boot, holding its kernel rings, and each
+  later failure adds two. Demonstrated by the path: both pairs are plain `u64`s with no Drop
+  (libstream setup.rs:244-253, main.rs:273-278), and the else arm at 1448-1450 names neither.
+  Not run. abi, ownership, soundness, opportunities. Low.
+- [ ] **sec-d6** `userspace/libsession/src/lib.rs:1042` — Two error paths in `spawn_leader`
+  return -1 without giving back what they took. A failed setup send leaves the leader's Process
+  handle `h` open, so the leader is unsupervised and the process pinned. A failed `pipe`
+  (lines 948-953) leaves the `image` handle (resolved at 940) open. The leader (nxsh, or
+  desktop-shell under desktop-session-mgr) dies before its setup message is sent, so the Block
+  send returns PeerClosed (or the kernel refuses the bounce buffer or PO handle). Each login
+  retry leaks one Process handle, and every caller of the function (session-mgr,
+  desktop-session-mgr, desktop-shell, service-mgr) shares it. A pipe failure leaks the image's
+  FileObject handle on every attempt. Demonstrated by the path: `h` is closed only at 1064 and
+  1081, the `sent.is_err()` return at 1042-1045 closes only `setup_mgr`, and the pipe `Err` arm
+  at 950-953 never reaches the image close at 965. Not run, since every step is a syscall.
+  ownership, soundness, opportunities. Low.
+- [ ] **sec-d7** `userspace/session-mgr/src/main.rs:299` — `login()` reads the typed password
+  into the stack array `pass: [u8; 128]` and never zeroes it, against session-mgr's CLAUDE.md
+  ('does not keep it'). `libsession::authenticate` scrubs its own two copies, and
+  desktop-session-mgr zeroes its equivalent (main.rs:383). After each attempt the password
+  stays in a dead frame of a supervisor that lives for the boot, until later frames overwrite
+  it. The tty READ_LINE reply in `RECV_MSG` is also kept if the following `tty_set_echo` send
+  fails, until the next successful receive. Demonstrated by the path: `grep scrub
+  userspace/session-mgr/src/main.rs` finds nothing, and 299-307 fill, use and drop `pass`.
+  Memory not read. abi, ownership, soundness, opportunities. Low.
+- [ ] **sec-d8** `userspace/libcrypto/src/hmac.rs:19` — `HmacSha256::new` leaves the key in `k`,
+  in `ipad` and in the `opad` field (key XOR 0x5c), and nothing zeroes them. The type has no
+  Drop, and `pbkdf2_hmac_sha256` clones it once per iteration. When PBKDF2 keys it the key is
+  the password, so auth-service's stack holds password XOR 0x5c after the request returns, and
+  `scrub_request` zeroing `RECV_MSG` does not satisfy auth-service/CLAUDE.md. Demonstrated: a
+  probe test (restored) recovered the key from `opad` XOR 0x5c; `needs_drop::<HmacSha256>()`
+  was false and a clone carried the same bytes (`cargo test -p libcrypto --lib survey_probe`:
+  1 passed). ownership. Low.
+- [ ] **sec-d9** `userspace/libsession/src/lib.rs:719` — `registry_blocks` maps the registry
+  snapshot with `info.size` (703) but unmaps it with size 0. It frees the mapping only because
+  `sys_memory_unmap` ignores its size argument today (`_size`, TODO(mm),
+  kernel/src/syscall/table.rs:946-949). Latent: implementing the partial unmap
+  (deferred-decisions.md:2343 recommends rejecting an unmap size that does not cover the VMA)
+  makes `SYS_MEMORY_UNMAP(addr, 0)` unmap nothing or fail. Every `disks` grant (view-broker
+  `start` → `rebind_block_devices_except` → `block_indices` → `registry_blocks`, as in `with
+  admin nxinstall`) would then leak a registry mapping in the broker. Demonstrated by the path:
+  every other unmap in scope passes the mapped length. Not run. soundness, opportunities. Low.
+- [ ] **sec-d10** `userspace/libsession/src/lib.rs:219` — `authenticate` copies
+  `min(home.len(), home_out.len())` bytes and still reports success. The supervisors pass
+  256-byte buffers while auth-service's reply admits a home up to about 500 bytes, so a longer
+  home is silently cut and `/home` is bound at a path the record does not name. `tty_request`
+  does the same to a typed line (session-mgr main.rs:371), so a password over the 128-byte
+  `pass` buffer is checked as its prefix. Only the trusted user database reaches it today
+  (libusers writes `/home/<name>`, at most 38 bytes). One ordinary change, such as allowing a
+  chosen home in `account add`, would make it reachable by an untrusted input. A home over 128
+  bytes is refused by the kernel (NS_SUBTREE_BASE_MAX) before the truncation matters, which
+  becomes sec-d1's path. Demonstrated by the path: `let n = r.home.len().min(home_out.len());
+  ...; (true, n)` at 219-221, and a host probe that a 300-byte home authenticates and comes
+  back whole. The wrong-/home binding itself was not run. abi, opportunities. Low.
+- [ ] **sec-d11** `userspace/view-broker/src/main.rs:1489` — `start()` treats an `Err` from
+  `send_setup_full` as 'the stream handles are still ours', which is not always true. A Block
+  send that committed closes the moved handles first, then fails to install the PO handle on a
+  full table (kernel/src/syscall/table.rs:2030-2041, 'the message was still committed') and
+  returns Err. The broker then runs `p.handles.close()` on values it no longer owns and sends
+  SYS_PROCESS_TERMINATE to a program whose setup was delivered. Handle generations make the
+  closes harmless today, so ownership is held by that check and by convention, since
+  `send_setup_full`'s Result (libstream setup.rs:293-306) cannot say whether the handles moved.
+  Unverified: a full broker handle table under QEMU, or a kernel host test of
+  `sys_channel_send`'s Block path at a full table asserting the sender's handles are gone while
+  Err is returned. abi, ownership. Low.
+- [ ] **sec-d12** `userspace/auth-service/src/main.rs:365` — `serve_session` frees the session
+  slot and closes the channel on any receive error. Its comment says a closed peer frees it,
+  but OutOfMemory, which `sys_channel_recv` returns with the message still queued, closes a
+  live client's channel too. During a transient kernel OOM auth-service's recv on session-mgr's
+  oracle channel fails and `free_session` closes it. session-mgr resolved /svc/auth once 'for
+  the life of the machine' and never re-resolves it, so every later serial login reads
+  PeerClosed and prints 'login incorrect' until reboot. The broker re-resolves `auth_ch` only
+  while it is 0, so every `with` password fails for the boot. Compare the broker's `recv_full`,
+  which treats only PeerClosed as gone. Unverified: OOM injection into one `sys_channel_recv`
+  under QEMU. abi. Low.
+- [ ] **sec-d13** `userspace/view-broker/src/main.rs:73` — The child end of the life channel is
+  spawned with every right an endpoint has: `SPAWN.rights` is `u64::MAX`, intersected with
+  `channel_endpoint_rights` (SEND|RECV|DUPLICATE|TRANSFER|INSPECT|WAIT). A program that
+  duplicates or transfers its life end to a child and exits queues its ChildExited code, but
+  its life channel never closes. The client stays Running, holding the process handle,
+  `view_ns` and the grants until its session ends, and `Exits` pairs the orphaned code with the
+  next program whose life closes, so later exits are reported with the previous program's code.
+  This is not the residual TODO(child-exit-attribution) records (two exits in one wake). The
+  premise needs checking: the program is never told the life handle's slot, so it must find it
+  by enumerating its handles. Unverified: a boot probe that runs a program duplicating its
+  handles and checks the reported codes. ownership. Low.
+- [ ] **sec-d14** `userspace/libsession/src/lib.rs:27` — Safe `pub fn`s read and write
+  process-wide `static mut` buffers (`authenticate`, `ns_lookup`, `views_open_session` and
+  `views_close_session`, `build`, `build_namespace`, `spawn_leader`, `drain_for_stop`,
+  `rebind` and `unbind_block_devices`; the statics are SEND_MSG, RECV_MSG, WAIT_HANDLES,
+  WAIT_RESULTS, NOTIF, SPAWN_SHELL and SESSION_HAS_*). Every SAFETY argument is 'single-threaded
+  supervisor', which nothing in the signatures holds. Latent: none of its five consumers
+  (view-broker, session-mgr, desktop-session-mgr, desktop-shell, service-mgr) creates a thread
+  today (grep for `SYS_THREAD_CREATE` / `thread_create` finds none outside libkern, libos and
+  test-harness). A thread in any of them (`libos::thread_create` allows it) could interleave
+  `authenticate` and `views_call` so that one sends the other's bytes, or a mix carrying a
+  password, or one's scrub zeroes the other's message. Unverified: the interleaving needs
+  syscalls, so neither a host test nor Miri reaches it; sec-o2 and sec-o5 make it structural.
+  opportunities. Low.
+
+**Opportunities**
+
+- [ ] **sec-o1** encapsulate: raw u64 handles closed by hand on every exit path, and structs of
+  handles that hold ownership only by comment — 69 sites (`grep -nE
+  "SYS_HANDLE_CLOSE|(^|[^a-z_.])close\([a-z_*]|\.close\(\)"` over auth-service/src/main.rs,
+  view-broker/src/main.rs, session-mgr/src/main.rs, libsession/src/lib.rs,
+  libprompt/src/ipc.rs and libviews/src/lib.rs, less the three helper bodies; the lenses
+  counted 63 to 69), such as `userspace/view-broker/src/main.rs:1447`,
+  `userspace/session-mgr/src/main.rs:224`, `userspace/libsession/src/lib.rs:1042`,
+  `userspace/libviews/src/lib.rs:66` (`Handed` derives Copy over owned handles). An owning
+  handle that closes on Drop and gives itself up with `into_raw()` when a send or spawn moves
+  it, so a send takes owned handles. That is libos's `Handle<T, M>` plus Channel and File
+  object types, with `Received::take` returning one. `Handles` and `Handed` become structs of
+  `Option<Handle<..>>` without Copy. Checked against view-broker `start()` (`view_ns`
+  dropped on each early return), session-mgr's per-login tty, `spawn_leader` (image and process
+  handle) and auth-service `open_auth_session`'s reclaim. Home: libos (`handle.rs`), or a
+  minimal `OwnedHandle(u64)` in libkern beside `Received` while session-mgr keeps its 'no
+  libos' rule. Closes: a handle leaked on an error path or a `continue` (sec-d1, sec-d5,
+  sec-d6), a handle closed after a send moved it (sec-d11), and a Copy struct of handles used
+  after the move. Depends on: libos gaining Channel and File types, and lifting the 'no libos'
+  rule in userspace/session-mgr/CLAUDE.md (which libsession follows), or the libkern variant.
+  ownership, soundness, opportunities. Value high, effort large.
+- [ ] **sec-o2** encapsulate: message I/O through `static mut` 4 KiB buffers, with the IpcMsg
+  header (`payload_len` at 4..8, `handle_count` at 8) stamped by hand, a `from_raw_parts`
+  payload view clamped to `MSG_LEN - PAYLOAD_OFF` (4072, not `IPC_PAYLOAD_SIZE` 4008), a raw
+  `SYS_CHANNEL_SEND` and a hand-placed scrub — 17 sites (`grep -rnE
+  "channel_recv_raw\(|SYS_CHANNEL_SEND," auth-service/src view-broker/src session-mgr/src
+  libsession/src libprompt/src | grep -v "use "`: 7 receives each with a payload
+  `from_raw_parts`, and 10 sends; they cover 12 of the 44 `static mut`s; userspace-wide the
+  pattern has 53 raw receives and 92 raw sends across 35 files), such as
+  `userspace/auth-service/src/main.rs:305`, `userspace/view-broker/src/main.rs:293`,
+  `userspace/libsession/src/lib.rs:183`, `userspace/session-mgr/src/main.rs:332`. `IpcBuf([u8;
+  IPC_MSG_SIZE])` with `recv(&mut self, ch) -> Result<(Received, &[u8]), RecvError>` (payload
+  bounded by `IPC_PAYLOAD_SIZE`, borrowed from `&mut self`), `send_rs(&mut self, ch, op, rid,
+  flags, body, handles)` (stamps the header in one place, refuses over `IPC_HANDLE_MAX`
+  handles, returns `TooLong` when `encode` refuses rather than silently, and can scrub once the
+  kernel has its copy) and `scrub()`. The buffer lives in a server's own state or on the stack,
+  as `libprompt::ipc` and `libkern::control::recv` already do. Home: libkern::channel beside
+  `Received` (alloc-free, so auth-service can use it) or libos; the rsproto envelope layer
+  (`send_rs`, `recv_rs`) in librsproto behind `io`. Checked against auth-service
+  `serve_session`, view-broker `recv_full`/`send`/`ask_auth`, libsession
+  `authenticate`/`views_call` and session-mgr `tty_request`. Closes: a payload slice that
+  outlives the next receive into the same static (auth-service holds `m.body` and `name`
+  across `install()` safely only because neither receives), the 4072 clamp held only by the
+  kernel's `seal`, a silently dropped over-long reply (sec-d4), a forgotten scrub of a
+  password-bearing send, a header `handle_count` that disagrees with the syscall's, and
+  view-broker `send`'s `REPLY_HANDLES[..handles.len()]` panic for over 8 handles. Depends on:
+  nothing for the libkern variant; libos lacks a Channel marker, and auth-service must stay
+  alloc-free. abi, ownership, soundness, opportunities. Value high, effort medium.
+- [ ] **sec-o3** encapsulate: a request/reply exchange on a long-lived channel written out by
+  hand with a fixed request id (1); some sites take the next message as the answer, others
+  match the id but must close the channel on a timeout — 8 sites (the six fixed-id sends found
+  by `grep -n "OP_AUTHENTICATE, 1,\|op, 1, 0, body\|OP_STORAGE_IN_USE, 1,\|OP_TTY_REDEEM, 1,\|
+  send(term, op, 1,\|admin, op, 1," userspace/{libsession,view-broker,libprompt}/src/*.rs`,
+  plus session-mgr `tty_request` and `libprompt::ipc::call`/`answer`, which libviews uses with
+  `REQUEST_ID = 1`), such as `userspace/libsession/src/lib.rs:170`,
+  `userspace/libsession/src/lib.rs:232`, `userspace/view-broker/src/main.rs:651`,
+  `userspace/session-mgr/src/main.rs:325`. `round_trip(ch, buf: &mut [u8; IPC_MSG_SIZE],
+  next_id: &mut u64, op, body, handles: &[u64], deadline) -> Result<(Message<'_>, Received),
+  CallError>`: it sends with a fresh id, skips replies whose id or op differ, and reports
+  `Stale` on deadline or receive failure so the caller must reopen the channel. It extends the
+  safe, length-checked `librsproto::session::round_trip` (already shared by Dir, Desktop and
+  Clipboard) with id matching, a deadline and handles. Home: librsproto::session (`io`
+  feature). Closes: a reply read by position (sec-d3, the stale AUTHENTICATED and `views_call`
+  session id) and the tty INTERRUPT bug session-mgr's CLAUDE.md records. Depends on: nothing;
+  shares its buffer type with sec-o2. abi. Value high, effort medium.
+- [ ] **sec-o4** encapsulate: how long a password lives in memory depends on hand-placed
+  `scrub()` calls; the two places without one leak it — 32 sites (`grep -nE
+  "scrub\(|scrub_request\(\)"` over auth-service, view-broker, session-mgr, libsession,
+  libprompt and libviews sources, less `fn scrub` and `use libkern`: 30 `scrub(` calls plus
+  auth-service's 2 `scrub_request()`), such as `userspace/view-broker/src/main.rs:986`,
+  `userspace/libprompt/src/lib.rs:69`, `userspace/libsession/src/lib.rs:195`,
+  `userspace/session-mgr/src/main.rs:299` (missing). `libkern::Secret<B: AsMut<[u8]>>(B)`:
+  alloc-free, volatile-zeroed on Drop, `Deref<Target = [u8]>`, no Clone, no Debug; it works for
+  `[u8; N]` and `Vec<u8>`. libcrypto's `Sha256` and `HmacSha256` implement Drop to zero their
+  own state. Fits libprompt `ask_password`'s return, the broker's `Pending.queued` and
+  `State::Changing`, and session-mgr's `pass`; the static IPC buffers are covered by
+  `IpcBuf::scrub` (sec-o2). Home: libkern (`Secret`, beside `scrub`), libcrypto (its own
+  Drop). Closes: a password copy dropped unscrubbed (sec-d7, sec-d8) and a scrub skipped by an
+  early return added later. Depends on: nothing. ownership, soundness. Value medium, effort
+  medium.
+- [ ] **sec-o5** encapsulate: sys_wait through a hand-sized results byte buffer, `IoResult`
+  decoded by byte offset (handle 0..8, status 8..12, result 16..24), and the lookup-and-wait PO
+  helper rewritten in each crate — 9 sites (`grep -rn "SYS_WAIT," auth-service/src
+  view-broker/src session-mgr/src libsession/src libprompt/src | grep -v "use "`; 7 decode by
+  offset; 8 of the `static mut`s are wait arrays; `libfs::po_wait` and
+  `librsproto::session::po_wait` are copies outside the subsystem), such as
+  `userspace/auth-service/src/main.rs:263`, `userspace/session-mgr/src/main.rs:107`,
+  `userspace/libsession/src/lib.rs:851`, `userspace/view-broker/src/main.rs:1746`.
+  `libkern::wait(handles: &[u64], results: &mut [IoResult], deadline) -> Result<&[IoResult],
+  i64>` that refuses `results.len() < handles.len()` and returns only the records written,
+  with `po_wait(po) -> (i32, u64)` closing the PO and a no-alloc `lookup(ns, path, rights)`;
+  optionally a `WaitSet<const N>` with `push`, `wait` and `fired`. libos has the same `wait`
+  privately (`sys.rs:23`), whose SAFETY holds `results.len() >= handles.len()` only 'by
+  construction at every call site'. Home: libkern (no alloc; auth-service and libsession may
+  not take libos), with libos wrapping it. Closes: a results buffer sized by expectation
+  (auth-service's const assert, session-mgr's 48 bytes, libprompt's check), offset typos (the
+  earlier HandleInfo 16-vs-24-byte stack smash), a nested wait clobbering a shared result
+  buffer, and a handle silently dropped past capacity. Removes about 13 unsafe blocks and 8
+  static muts. Depends on: nothing (a WaitSet/libos variant also needs `Op::from_po` public and
+  sec-d2 fixed). abi, ownership, soundness, opportunities. Value medium, effort small.
+- [ ] **sec-o6** encapsulate: namespace construction as raw syscalls, each in its own unsafe
+  with a 'valid namespace handle, path, endpoint' SAFETY line — 29 sites (`grep -rnE
+  "SYS_NS_BIND|SYS_NS_UNBIND|SYS_NS_CREATE|SYS_NS_DERIVE"` over the five crates, less `use`:
+  23 bind, 3 unbind, 2 create, 1 derive), such as `userspace/libsession/src/lib.rs:353`,
+  `userspace/libsession/src/lib.rs:453`, `userspace/view-broker/src/main.rs:1269`,
+  `userspace/view-broker/src/main.rs:1389`. `impl<M: CanBind> Handle<Namespace, M> {
+  bind_at(&self, path: &[u8], resource: &impl AsRaw, base: Option<&[u8]>) -> Result<()>;
+  unbind; derive }` and `Namespace::create()`, making the subtree-versus-direct choice
+  explicit rather than implied by argument count (libos's `bind(path: &str, resource)` takes
+  no base and no byte path). Checked against libsession `build` (13 binds of one shape), the
+  broker's `bind_endpoint` (with a base) and the KernelLog direct-handle bind. Home: libos
+  (`objects.rs`). Closes: the thinnest of the set; it moves (ptr, len) pairs out of the call
+  sites (none is wrong today) and keeps the resource handle borrowed across the bind. Depends
+  on: sec-o1 for typed resource handles, or accept RawHandle meanwhile. opportunities. Value
+  medium, effort small.
+- [ ] **sec-o7** encapsulate: a mapping handled by hand in three steps, `SYS_MEMORY_MAP`, then
+  `from_raw_parts` or `copy_nonoverlapping`, then `SYS_MEMORY_UNMAP(addr, size)`, with the slice
+  length and the unmap size each restated — 4 sites (`grep -rnE
+  "SYS_MEMORY_MAP|SYS_MEMORY_UNMAP"` over the five crates: 8 calls, 4 map/unmap pairs, with 3
+  raw slices and one copy), such as `userspace/auth-service/src/main.rs:149`,
+  `userspace/auth-service/src/main.rs:580`, `userspace/libsession/src/lib.rs:703`,
+  `userspace/libsession/src/lib.rs:823`. `Mapping<M> { addr: NonNull<u8>, len }`, returned by
+  `Handle<Memory|File, M: MemMode>::map(len)`, offering `bytes(&self)` and (for write modes)
+  `bytes_mut(&mut self)`, with Drop unmapping at its own `len` (an explicit drop before
+  install's `file_sync`). Checked against `load_db`, `install`, `registry_blocks` and
+  `bind_session_user`. Home: libos (`objects.rs`; `Memory::map` returns a raw `*mut u8`
+  today). Closes: an unmap whose size is not the map's (sec-d9), a slice longer than the
+  mapping (held by const asserts), a slice used after its unmap, and a mapping leaked on an
+  early return. Depends on: a File object marker in libos. ownership, opportunities. Value
+  medium, effort small.
+- [ ] **sec-o8** remove: `static mut` used only as a syscall out-parameter, argument block or
+  value set once, where a stack local, a struct field or an atomic does the same safely — 12
+  sites (read of each declaration `grep -nE '^\s*static mut'` lists in the four main files, 44
+  in all, less message buffers, wait buffers, SESSION_HAS_* and auth-service's tables:
+  auth-service ROOT_NS, ENTROPY, USER_DB_LEN, CH_OUT0/CH_OUT1; session-mgr NOTIF_CH, TTY_RID;
+  view-broker CLOCK_BUF, NOTIF, SPAWN; libsession NOTIF, SPAWN_SHELL), such as
+  `userspace/auth-service/src/main.rs:78`, `userspace/view-broker/src/main.rs:66`,
+  `userspace/session-mgr/src/main.rs:32`, `userspace/libsession/src/lib.rs:885`. Use what the
+  code already does nearby: view-broker's `make_channel` takes stack out-params where
+  auth-service uses CH_OUT0/1, and libsession's `now_ns` uses a stack `u64` where the broker
+  uses CLOCK_BUF; `SpawnArgs` (104 bytes) and `Notification` (64) are stack locals; values set
+  once become fields of a server struct (the broker's `Broker`) or `AtomicU64` (as libsession's
+  `STOP_ASKED`). Home: each crate. Closes: references to `static mut`, and the library-level
+  statics behind safe pub fns (sec-d14); drops one or two unsafe blocks per site. Depends on:
+  nothing. abi, soundness, opportunities. Value low, effort small.
+- [ ] **sec-o9** encapsulate: auth-service's state as parallel `static mut`s — 12 sites (6
+  statics, USER_DB with USER_DB_LEN, NEW_DB, ADMIN_REPLY, SESSION_CH with SESSION_ADMIN,
+  reached from 12 unsafe blocks: 3 `from_raw_parts` at 159, 391, 457, 5 raw derefs at 458,
+  463, 467, 474, and the session-table accesses; `grep -nE "raw (const|mut)
+  (USER_DB|NEW_DB|ADMIN_REPLY)\b|USER_DB_LEN =|SESSION_CH\[|SESSION_ADMIN\["
+  auth-service/src/main.rs`), such as `userspace/auth-service/src/main.rs:391`,
+  `userspace/auth-service/src/main.rs:456`, `userspace/auth-service/src/main.rs:349`.
+  `Db { bytes: [u8; DB_MAX], len }` with `get(&self) -> &[u8]` and `replace(&mut self, new:
+  &[u8]) -> Result<(), TooLarge>`, inside a `Server { db, new_db, admin_reply: [u8;
+  RS_MAX_BODY], sessions: [Option<(u64, bool)>; MAX_SESSIONS], .. }` owned by `_start`'s frame
+  (8 MiB stack, no alloc) with `&mut self` methods. Checked against `load_db`, `serve_session`,
+  `serve_admin_request` and `open_auth_session`/`free_session`. Home:
+  userspace/auth-service (main.rs). Closes: a length outgrowing its buffer (held by two
+  separate checks), a reply buffer sized by local arithmetic instead of `RS_MAX_BODY` (sec-d4),
+  and parallel arrays drifting (the failed-transfer path at 356 clears SESSION_CH but not
+  SESSION_ADMIN). Depends on: nothing. opportunities. Value low, effort small.
+- [ ] **sec-o10** remove: libsession records what the last build bound in seven `static mut
+  SESSION_HAS_*` bools read through seven safe `session_has_*()` fns, although `build()`
+  already returns the same facts as `Built` — 7 sites (`grep -n "static mut SESSION_HAS_"
+  userspace/libsession/src/lib.rs`: 7 statics, 1 writer and 7 reader unsafe blocks; `grep -rn
+  session_has_` outside libsession: 10 caller reads, 5 in session-mgr and 5 in
+  desktop-session-mgr), such as `userspace/libsession/src/lib.rs:299`,
+  `userspace/libsession/src/lib.rs:758`, `userspace/session-mgr/src/main.rs:227`,
+  `userspace/desktop-session-mgr/src/main.rs:162`. Both supervisors call `build(&spec) ->
+  Option<Built>` (or `build_namespace` returns `Built`) and read `b.bin`, `b.tty`,
+  `b.console`, `b.clipboard`, `b.views`, `b.devices`, `b.storage`; delete the seven statics and
+  the readers. Home: libsession. Closes: a flag read as 'the session's' that belongs to
+  another build, and a safe fn over `static mut`; removes 7 of libsession's 14 `static mut`s
+  and 8 unsafe blocks. Depends on: nothing. abi, ownership, soundness, opportunities. Value
+  low, effort small.
+- [ ] **sec-o11** remove: local copies of libkern helpers, each with its own unsafe: `kprint`
+  (x3), process exit (x2) and a hand-written volatile zeroing loop (x1) — 6 sites (`grep -rnE
+  "^fn kprint|^fn exit|SYS_PROCESS_EXIT|write_volatile"` over the five crates: 8 lines, one
+  comment and one fn line belonging to the same exit), such as
+  `userspace/auth-service/src/main.rs:84`, `userspace/auth-service/src/main.rs:416`,
+  `userspace/session-mgr/src/main.rs:55`, `userspace/libsession/src/lib.rs:84`.
+  `libkern::debug::kprint`, `libkern::debug::exit` (-> `!`) and `libkern::scrub`, which exist
+  and are re-exported at libkern's root. Home: libkern (exists). Closes: little beyond
+  duplicated SAFETY arguments; auth-service's `exit` spins on `spin_loop` after the syscall
+  instead of being noreturn, and `scrub_request` duplicates `libkern::scrub`'s volatile loop
+  (the volatile column's only site). Depends on: nothing. opportunities. Value low, effort
+  small.
+
+What held up: Every receive lends the kernel a whole 4096-byte buffer, every send passes a full
+page whose handle array and header count agree, and the 4072-byte payload clamp stays inside the
+page, with `StoredMsg::seal` refusing a `payload_len` over 4008. Every SYS_WAIT results buffer
+holds 24 bytes per handle waited on, and HandleInfo (24), IoResult (24), Notification (64) and
+the ChildExited offsets match the kernel. auth-service's `load_db` and `install` (size at most
+`DB_MAX` at most `PAGE`, const-asserted; mapped, copied, unmapped and closed on every path),
+`USER_DB_LEN <= DB_MAX`, and the aliasing in `serve_admin_request` (distinct statics, `USER_DB`
+written after the shared borrow ends) are sound. No RECV_MSG slice outlives the next receive:
+the broker's `recv_full` copies the body out, and no payload view reaches the handle array.
+Every handle a received message carries closes through `Received`; no site uses `let _ =`.
+Handle generations (31-bit) make stale closes fail, which the broker's handle-keyed tables
+depend on. Spawn is atomic-or-fail, so the closes after a failed spawn are correct. The rsproto
+and libusers parsers are bounds-checked with `get`/`checked_add`, `handle_count() >= 1` is
+checked before `handles[0]`, and libusers, libcrypto and libviews contain no unsafe. No
+consumer of libsession or the servers creates a thread, so the single-thread arguments hold
+today. Password scrubbing holds at every hop except session-mgr's `pass` and libcrypto's HMAC
+state. The broker's cached endpoints cannot go stale (restart policy `never`). No host test
+reaches any of the 175 unsafe blocks, and Miri cannot run them because each makes a syscall.
+The breaks that tests caught are sec-d1, sec-d4, sec-d8 and sec-d2.
