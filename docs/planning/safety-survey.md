@@ -5324,3 +5324,386 @@ used only when the read returned 0. The Images guard, read_file, write_file and 
 and unmap on every path, tty-server's open_tty and open_sibling reclaim both ends when the reply
 does not go out, and nothing in the subsystem creates a thread. 20,000 rounds of random bytes
 through libline::Discipline and the tty-server Registry gave no panic (probe removed).
+
+### test-harness — main at 135055a8, 2026-10-27
+
+Lenses: abi, ownership, soundness, opportunities; returned nothing: none.
+Defects: found 25, refuted by a boot 0, reported 25 (13 distinct once duplicates merge). Opportunities: 35 proposed (16 distinct once merged).
+
+The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
+
+| path | code lines | unsafe block | unsafe fn | unsafe impl | static mut | raw syscall | raw slice | raw deref | transmute | asm | volatile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `userspace/test-harness` | 10927 | 494 | 4 | 0 | 31 | 414 | 17 | 12 | 0 | 9 | 23 |
+| `total` | 10927 | 494 | 4 | 0 | 31 | 414 | 17 | 12 | 0 | 9 | 23 |
+
+**Defects**
+
+- [ ] **th-d1** `userspace/libos/src/objects.rs:167` — `libos::thread_create` is a safe `pub fn`
+  that starts a thread at any `entry` on any `user_sp`. Safe code can start a thread on a live
+  local array or on a mapping it later unmaps, and the new thread's frames then overwrite memory a
+  Rust reference owns. The kernel checks only that both addresses are non-null user addresses
+  (table.rs:524-541). All 5 callers (harness.rs:159, :362; stage.rs:507, :629;
+  bootprobe/exits.rs:242) map a fresh stack and never unmap it, so the invariant holds by
+  convention only. Demonstrated: a `#[forbid(unsafe_code)]` fn that passed a local `[u8; 256]` as
+  the stack and then wrote `stack[0]` built with `cargo check -Z build-std=core,alloc,compiler_builtins
+  --bin test-stage` and no error; the probe was removed. abi, soundness. Medium.
+- [ ] **th-d2** `userspace/test-harness/src/bootprobe/storage.rs:273` — `past_two_tib_test` makes
+  one `&mut [u8]` over the DMA page and keeps it live across `io(IO_OPCODE_WRITE)` and
+  `io(IO_OPCODE_READ)`, then compares through it at :284. The device's write invalidates the
+  reference, so the read is UB, and the SAFETY comment argues bounds only. Today LLVM cannot
+  exploit it. Moving the compare into a helper taking `buf: &mut [u8]` makes it a `noalias`
+  argument, and LLVM may then forward the zeros and report "what was read back past 2 TiB is not
+  what was written" on a working disk. Demonstrated: three independent Miri models of the same
+  sequence (slice over an exposed address, fill, a write through
+  `with_exposed_provenance_mut`, read) fail under Stacked Borrows ("trying to retag ... that tag
+  does not exist in the borrow stack") and Tree Borrows ("reborrow through ... is forbidden").
+  The control, with the slice made after the I/O as `RootDevice::read_at` does, passes. The models
+  are analogs, since Miri cannot run the syscall. No other site keeps a reference across a device
+  write. abi, ownership, soundness, opportunities. Low.
+- [ ] **th-d3** `userspace/test-harness/src/bootprobe/main.rs:363` — boot-probe's `receive()`
+  calls `take_all()` on `libkern::Received`, which disarms its close-on-drop, and moves the
+  handles into its own `Received` with `handles: Vec<u64>` and no `Drop`. 9 of the 20 `receive()`
+  callers never close them: views_receive (main.rs:331, behind every `views_call`),
+  exits.rs:110, views.rs:402, views.rs:456-457 (keeps the first, leaks the rest), accounts.rs:311,
+  policy.rs:51, policy.rs:183, received.rs:184 and files.rs:570. Latent, because no views or tty
+  reply carries a handle today. A broker answering Started with the program's life channel, or a
+  tty token reply carrying a channel, would leak one handle per call. Demonstrated by path:
+  main.rs:356-371 empties the guard into a `Vec<u64>`. The other 11 callers close
+  `m.handles` by hand (12 `for_each` loops). The three lenses counted the unclosed callers as
+  8 of 15 or 9 of 20; the 9-of-20 count is used here. abi (as opportunity), ownership, soundness,
+  opportunities. Low.
+- [ ] **th-d4** `userspace/test-harness/src/harness.rs:2354` — Every coreutil spawn looks up the
+  image handle and never closes it, though `sys_process_spawn` only looks the image up
+  (table.rs:352-353; process-spawn-args.md:43: "the spawner closes it after spawn").
+  `run_coreutil_in` (:2354), `run_coreutil_capture_in` (:1340), `dead_stage_closes_its_pipe_demo`
+  (:1471) and `stage_spawn_demo` (:227) leak it; stage.rs:444 (`run_grants`) does too but exits
+  at once. A test-qemu run makes about 54 to 56 such calls (42 `run_coreutil_in`, 12 capture), so
+  that many `/bin` file handles stay pinned until the harness exits. `exit_storm_demo` (:997),
+  `fp_hardfloat_demo` (:3435) and boot-probe's `spawn_stage` close theirs. Demonstrated by path:
+  `grep -n "let (st, img)\|HANDLE_CLOSE, img" harness.rs` shows 6 lookups and 2 closes. abi,
+  ownership, opportunities. Low.
+- [ ] **th-d5** `userspace/test-harness/src/bootprobe/views.rs:226` — `view_broker_test` opens
+  client channels until the broker refuses one (:218-236). Five of its six failure returns (226,
+  236, 249, 253, 258) do not close them; only the loop at :260 does. A misbehaving broker then
+  leaves boot-probe holding a whole wait set of clients. The broker counts each as two slots in
+  its machine-wide wait set (rsproto-views-ops.md:36-40), so every later views resolve is refused
+  WouldBlock. `view_grants_end_test`, `storage_grant_test`, `policy_test`, `grace_test` and
+  `accounts_test` would then fail for the wrong reason and the broker would stay wedged for the
+  boot. Demonstrated by path: the returns skip :260. Failure paths only. ownership. Low.
+- [ ] **th-d6** `userspace/test-harness/src/bootprobe/files.rs:694` — On success, `overwrite_test`
+  (:694), `grow_test` (:777) and `create_test` (:893) never close the file handle or unmap their
+  writable mapping, and `read_large_file` (:934) closes the handle but never unmaps its 32 KiB
+  mapping. `/system/rwtest` (mapped twice) and `/system/created` stay held and mapped until
+  boot-probe exits, so anything later that checks the root mount has let go of its files
+  (`sys_ns_held` on `/system`, an unmount) would see them held. Demonstrated by path: no
+  `SYS_MEMORY_UNMAP` anywhere in files.rs:684-969, and the closes are only on the failure paths
+  (698, 781, 897). ownership, soundness, opportunities. Low.
+- [ ] **th-d7** `userspace/test-harness/src/harness.rs:3727` — `forward_demo` releases nothing it
+  made on success: the namespace with the userspace-server binding (3727/3736), `send_end`
+  (3724), the resolved MemoryObject (3846) and both mappings (3782, 3853). The same success-path
+  leak is in `ns_demo` (mapping at :607), `initramfs_demo` (:864), `read_block_sector0` (:3562,
+  one DMA page per call), `worker_exception_demo` (stack object :343, mapping :349) and
+  `stream_transport_demo` (stack mapping at :144, deliberately kept). Error paths in
+  `block_send_demo` (441/448), `block_bounded_demo` (508), `ns_demo` (565-626),
+  `dev_entropy_lookup_demo` (735/745) and `proc_self_demo` (816/825/835) also return without
+  closing. Demonstrated by path: `awk 'NR>=3713 && NR<=3865 && /close\(|SYS_HANDLE_CLOSE|SYS_MEMORY_UNMAP/'
+  harness.rs` prints nothing. Bounded: the harness exits at the end of the chain. ownership,
+  soundness, opportunities. Low.
+- [ ] **th-d8** `userspace/test-harness/src/harness.rs:3156` — `rename_wait` discards
+  `sys_wait`'s return and reads the status from the shared `WAIT_RESULTS[8..12]` anyway. Its own
+  SAFETY comment says those bytes hold the result "only when it returned 1". A failed wait (for
+  example OutOfMemory from a registration over its reserve, table.rs:1840) returns the previous
+  wait's status, usually 0, so `rename_demo` takes a rename that never completed as done. Of the
+  20 sites that parse `WAIT_RESULTS[8..12]`, this is the only one that skips the check. Today the
+  deadline is `u64::MAX` on a fresh PO, so no input makes it fail. Unverified: nothing was run.
+  A host test cannot reach it, since `syscallN` runs Linux syscalls on the host. A boot with
+  `SYS_WAIT` forced to fail once after a successful lookup would settle it. abi, soundness,
+  opportunities. Low.
+- [ ] **th-d9** `userspace/test-harness/src/stage.rs:621` — The crate's user threads run on stacks
+  with no guard gap. Each stack is mapped at exactly its size with hint 0, so first-fit places it
+  directly against the previous mapping, and `EXIT_SPAWNING` carves 48 stacks from one mapping.
+  Other sites: stage.rs:487-507 (4 pages), harness.rs:132-160 (8 pages), harness.rs:337-363 (1
+  page), bootprobe/exits.rs:222-243 (4 pages). A thread body that grows (a deeper call, a debug
+  build) overruns into the next-lower thread's live stack or a libheap arena with no fault.
+  Demonstrated in part: a temporary kernel host test mapping two 4-page anonymous VMAs via
+  `find_free_range` + `map_vma_lazy` asserted `b.start == a.end` and passed (vmm.rs:413-435); the
+  probe was restored. Unverified: the overrun itself, which a boot with a thread recursing past
+  its stack would show. soundness. Low.
+- [ ] **th-d10** `userspace/test-harness/src/inputclient.rs:104` — `lookup` never closes the
+  PendingOperation that `sys_ns_lookup` returned, because this copy of `po_wait` (:72-96), unlike
+  the other 11 hand-rolled copies, does not close the PO. One PO handle leaks per
+  `Stream::open` of `/dev/input/new`. Demonstrated by path: no `SYS_HANDLE_CLOSE` in
+  inputclient.rs:72-106. harness.rs:789, bootprobe/main.rs:117/157 and pattern.rs:271 all close.
+  ownership. Low.
+- [ ] **th-d11** `userspace/test-harness/src/composebench.rs:166` — `libdraw::acquire::acquire`
+  requires that "nothing else may write the mapping" (acquire.rs:85-86), but compose-bench (and
+  display-selftest, display.rs:82) acquire the aperture while the compositor, an essential
+  service in the same image (tools/xtask/src/image.rs:158-165, kept in the bench image at
+  :184-196), also owns and writes it. compose-bench takes `&mut [u8]` over the whole aperture
+  (`fb.bytes_mut()` at :142 and :198), so a compositor damage copy racing a `frame_in_place` or
+  `copy_damage` is a cross-process data race behind a live `&mut`. In display-selftest `_fb` is
+  unused, so it is latent; hashing the screen through `_fb.bytes()` would make it bite. The two
+  SAFETY comments cover only `root_ns` being live. Unverified: the contract violation is confirmed
+  by reading; a boot of the bench image with a client committing during the E2 loop would show
+  the torn frames. soundness. Low.
+- [ ] **th-d12** `userspace/test-harness/src/bootprobe/files.rs:85` — `RootDevice::read_at`
+  hard-codes `const SECTOR: u64 = 512`, but the kernel refuses any block request that is not
+  whole logical blocks (`whole_blocks`, kernel/src/io/block.rs:97). On a device reporting
+  4096-byte blocks (xhci/storage.rs:1070 takes `block_len` from READ CAPACITY) every
+  `RootDevice` read returns InvalidArgument, and overwrite, grow, create, file_cache, unlinked and
+  the storage-admin device checks all report FAIL on a correct filesystem. RAM disk
+  (`RAMDISK_BLOCK` = 512) and AHCI are 512, so no gate reaches it. Unverified: a boot of
+  `image --live --selftest` on a QEMU usb-storage device with `logical_block_size=4096` would
+  settle it. abi. Low.
+- [ ] **th-d13** `userspace/test-harness/src/bootprobe/storage.rs:71` — Latent: 17
+  `SYS_MEMORY_UNMAP` calls pass size 0 and work only because the kernel ignores `size`
+  (`sys_memory_unmap(addr, _size)` at table.rs:949, TODO(mm); syscall-abi.md:529). If the kernel
+  made the fix `deferred-decisions.md:2343` proposes and refused a size that does not cover the
+  VMA, each call would fail unchecked and leak: storage.rs:71 and storage_admin.rs:207 would
+  keep files held, `storage_admin_test`'s unmount of nitrox-scratch would be refused WouldBlock,
+  and `RootDevice::drop` (files.rs:113) would leak a page per open. Sites: main.rs:402,
+  files.rs:113/182/183/227/229/276, storage.rs:71/286, storage_admin.rs:207, registry.rs:581/647,
+  exits.rs:91, gates.rs:208, harness.rs:3473/3505/3611. Counted by `grep -rnE "SYS_MEMORY_UNMAP,
+  [a-z_.]+( as u64)?, 0\)" userspace/test-harness/src | wc -l` = 17. Unverified: a kernel branch
+  refusing size 0 and a test-qemu run would settle it. opportunities. Low.
+
+**Opportunities**
+
+- [ ] **th-o1** encapsulate: handles are bare `u64`s closed by hand on every path, success and
+  failure — 374 sites (113 `syscall1(SYS_HANDLE_CLOSE` by `grep -rnoE
+  'syscall[14]\((libkern::)?SYS_HANDLE_CLOSE'` plus 261 `close(x)` calls by `grep -rnoE
+  '\bclose\([a-z_]' | grep -v 'fn close'`; 146 lookup calls return `(status, u64)`), such as
+  `harness.rs:2354`, `bootprobe/files.rs:688`, `bootprobe/views.rs:218`, `harness.rs:3727`.
+  Use libos's owning `Handle<T, M>` for every kind held, adding Channel, Timer, Pending and File
+  markers next to Memory/Namespace/Notify/Resource/Process/Thread, and a typed lookup
+  `lookup::<K>(ns, path, rights) -> Result<Handle<..>>` over `block_on(Op)`, so the PO and the
+  result are both owned. `into_raw()` is used only where a spawn or send moves the handle. Checked
+  on harness.rs:2354, exits.rs:102-108 and files.rs:688. In libos (handle.rs, objects.rs).
+  Closes: handles left open on success and failure paths (th-d4, th-d5, th-d6, th-d7, th-d10) and
+  double closes; removes 113 unsafe close blocks. Depends on: libos markers for
+  Channel/Timer/Pending/File; easier after th-o3. ownership, opportunities. Value high, effort
+  large.
+- [ ] **th-o2** encapsulate: a mapping is a bare address that is turned into `from_raw_parts`
+  slices or raw volatile accesses, with a hand-written unmap that some paths never reach — 38 to
+  48 sites (38 `SYS_MEMORY_MAP` by script, plus 9 `map_file(` calls; 32 unmaps, 17 of them size 0;
+  17 `from_raw_parts`; 22 `_volatile`), such as `bootprobe/storage.rs:273`, `harness.rs:3197`,
+  `bootprobe/main.rs:393`, `bootprobe/files.rs:34`. An owning `libos::Mapping<'h>` returned by
+  `Handle<Memory | File, M>::map(len)`, unmapping with its own length on drop, with `bytes()` for
+  immutable snapshots, volatile `read_at`/`write_at` for pages another party writes, and a scoped
+  `with_mut(|b: &mut [u8]| ..)` so no reference lives across a call that lets the kernel write
+  the page; `as_mut_slice` exists only for MapReadWrite. `RootDevice` holds one and
+  `composebench::write_throughput(*mut u8, len)` takes `&mut [u8]`. Checked on read_all,
+  `with_sched_stats`, write_file and gates.rs:194-209. In libos objects.rs, beside
+  `Handle<Memory,_>::map`, which returns a `*mut u8` and unmaps nothing. Closes: a `&mut` held
+  across a device write (th-d2), mappings never unmapped (th-d6, th-d7), size-0 unmaps (th-d13),
+  offsets past the mapped length. Depends on: th-o1 for the File marker. abi, ownership,
+  soundness, opportunities. Value high, effort medium.
+- [ ] **th-o3** encapsulate: out-params of kernel calls held by convention as raw pointers cast
+  to `u64` — 46 sites (20 `CHANNEL_CREATE`, 12 `CLOCK_READ`, 5 `NOTIF_RECV`, 5 `HANDLE_STAT`, 3
+  `ENTROPY_READ`, 1 `THREAD_GET_REGISTERS` by `grep -rnE "syscall[0-9]\((libkern::)?SYS_(...)"`;
+  3 hand decodes of `Notification.body[8]`), such as `harness.rs:128`, `harness.rs:800`,
+  `harness.rs:912`, `harness.rs:294`, `composebench.rs:46`. Typed libos calls:
+  `channel(depth) -> Result<(Handle, Handle)>` (libstream `setup::pipe` is already used 9 times
+  against 20 raw creates), `clock_now(ClockId) -> Result<u64>`, `handle_stat(&Handle) ->
+  Result<HandleInfo>`, `Entropy::read(&mut [u8])` with the length bound checked,
+  `Handle<Thread>::registers()`, the existing `Handle<Notify, Only>::recv`, and a libkern
+  `Notification::child_exit_code()`. Checked on harness.rs:128, :800-808 and :912. In libos
+  objects.rs, with the accessor in libkern abi.rs. Closes: an out-param smaller than what the
+  kernel writes — this crate's own HandleInfo 16-vs-24 smash (harness.rs:798) — and a clock
+  out-param shared through a static, with the 'failed read leaves its last value' reads at
+  harness.rs:2004 and inputclient.rs:478. Depends on: nothing. opportunities, soundness. Value
+  high, effort medium.
+- [ ] **th-o4** encapsulate: raw `SYS_WAIT` on a hand-sized result buffer with the `IoResult`
+  decoded from byte offsets (status at 8..12, result at 16..24), each caller checking `== 1` for
+  itself — 39 sites (35 `grep -rnE "syscall[456]\((libkern::)?SYS_WAIT,"` plus 4 multi-line;
+  17 status decodes, 12 to 13 result decodes, 10 to 14 local helper clones: `po_wait` x4,
+  `po_wait_pair`, `ns_lookup_wait`, `ns_lookup`, `wait_one`, `wait_status`, `po_poll`), such as
+  `harness.rs:760`, `harness.rs:3156`, `bootprobe/deadlines.rs:17`, `bootprobe/files.rs:507`,
+  `inputclient.rs:72`. Publish what libos has privately: a safe `libos::wait(handles: &[RawHandle],
+  out: &mut [IoResult], deadline) -> Result<usize>` that refuses `out.len() < handles.len()`
+  (today's private `sys::wait`) and `wait_one(h, deadline) -> Result<IoResult, KError>`
+  returning the record only when the kernel returned 1, with TimedOut and WouldBlock as `Err`;
+  `po_wait` is then built once. Host-testable under libos's sys mock. Checked on `ns_lookup_wait`,
+  `wait_status`, `po_poll` (deadline 0) and inputclient's pump. In libos (exec.rs, sys.rs), or a
+  thin `Result` wrapper in libkern beside `channel_recv`. Closes: a result buffer sized by
+  convention (the 16-vs-24 smash), a status read from a wait that did not return 1 (th-d8), and
+  `IoResult` byte offsets restated 17 times. Depends on: nothing. abi, ownership, soundness,
+  opportunities. Value high, effort medium.
+- [ ] **th-o5** remove: `static mut` as per-call scratch for syscall out-params, argument blocks
+  and message buffers — 31 statics (`grep -rn "static mut" userspace/test-harness/src`), 103 of
+  the 494 unsafe blocks naming one (81 in harness.rs, 10 inputclient.rs, 6 bootprobe, 3
+  restartprobe.rs, 3 stage.rs), 8 `&*(&raw const X)` derefs under 7 `clippy::deref_addrof`
+  allows, such as `harness.rs:32`, `harness.rs:1155`, `inputclient.rs:68`, `restartprobe.rs:25`,
+  `stage.rs:158`. Stack locals of the exact ABI type (`[IoResult; N]`, `u64`, `Notification`,
+  `SpawnArgs`, `ThreadArgs`, `RegisterValues`, a 4096-byte stack message), as pattern.rs:265,
+  deadlines.rs:13, exits.rs:20, stage.rs:417 and bootprobe/main.rs:302 already do;
+  `STREAM_E0` travels in `ThreadArgs.arg0` (delivered in rcx). Checked on harness `WAIT_*`,
+  restartprobe `MSG` and harness `SPAWN_STAGE`. In place, in each bin. Closes: a data race on a
+  shared static once a second thread (harness `stream_producer`, `worker_fault`; stage's exit
+  threads) calls a helper, an overrun that clobbers the neighbouring static instead of faulting,
+  and unenforced 'only this thread touches it' SAFETY claims. Depends on: th-o4 and th-o9 for the
+  `WAIT_*` and message statics (smaller once the typed wrappers land). abi, ownership,
+  soundness, opportunities. Value high, effort medium.
+- [ ] **th-o6** encapsulate: starting a thread by hand — `SYS_MEMORY_CREATE`, `SYS_MEMORY_MAP`, a
+  `ThreadArgs` literal with `_reserved: [0; 36]` and the safe `libos::thread_create`; handle and
+  pointer values travel through statics and `AtomicU64`s, while `arg0` is always 0 — 5 sites
+  (`grep -rn "thread_create(&"`), all in this crate: `harness.rs:159`, `stage.rs:487`,
+  `stage.rs:629`, `bootprobe/exits.rs:242`. An owned `Stack::map(pages)` (never unmapped) with
+  `Stack::carve(region, i)` for `exit_spawner`'s pre-mapped block, and `spawn_thread(stack, entry:
+  extern "C" fn(u64, u64, u64, u64) -> !, arg0, affinity) -> Result<Handle<Thread, Only>>`
+  consuming it; the raw `thread_create` becomes an `unsafe fn` with the stack contract written
+  down. Checked on all five sites. In libos (objects.rs). Closes: safe code starting a thread on a
+  borrowed or freed stack (th-d1), leaked stack objects and handles, and a thread reading a static
+  written after it started. Depends on: nothing for the typed entry and owned stack; for the guard
+  half (th-d9), a kernel way to keep an unmapped range below a caller-supplied stack (a reserved
+  no-access VMA, or a gap `find_free_range` leaves; Part E). abi, ownership, soundness,
+  opportunities. Value high, effort medium.
+- [ ] **th-o7** remove: private copies of a namespace lookup plus PO wait — 3 helpers, 141 callers
+  (`harness.rs:760` `ns_lookup_wait`, 29 callers; `bootprobe/main.rs:89` `ns_lookup`, 111;
+  `inputclient.rs:96` `lookup`, 1). `libfs::lookup_wait(ns, path, rights) -> (i32, u64)`, already
+  used 5 times in this crate (stage.rs:366/444, pattern.rs:209/220/245), returns the kernel
+  status unchanged (so `session_fanout_demo`'s WouldBlock and policy.rs:356's NotFound still
+  see it) and every caller already treats handle 0 as failure; it gives `(-1, 0)` where these
+  return `(0, 0)` for a handle-less success. Later this becomes the libos typed lookup (th-o1).
+  In libfs (exists). Closes: three more hand-parsed `IoResult` copies with their own static wait
+  buffers (th-d10). Depends on: nothing. abi, opportunities. Value medium, effort small.
+- [ ] **th-o8** encapsulate: boot-probe's `Received` strips `libkern::Received`'s guard — 20
+  `receive()` callers (`grep -rnE "(^|[^_a-z])receive\(" userspace/test-harness/src/bootprobe |
+  grep -v "fn receive\|views_receive\|ChannelReceiver"`), 12 closing `m.handles` by hand and 9
+  not, such as `bootprobe/main.rs:363`, `bootprobe/main.rs:331`, `bootprobe/files.rs:570`,
+  `bootprobe/storage_admin.rs:131`, `bootprobe/views.rs:457`. Keep the `libkern::Received`
+  inside the struct with `take(i) -> Option<u64>` and `count()`, so untaken handles close on
+  drop and the 12 `for_each(close)` loops go; `storage_admin.rs:131-136` and `views.rs:457` become
+  `take(0)`. Checked on those two and services.rs:29-33. In bootprobe/main.rs, or
+  `librsproto::session::recv` if th-o9 lands first. Closes: the leak at th-d3, the class
+  `libkern::Received` was written to close. Depends on: nothing. abi, ownership, opportunities.
+  Value medium, effort small.
+- [ ] **th-o9** encapsulate: IPC messages framed and parsed by hand in raw `[u8; 4096]` buffers
+  (payload length at [4..8], handle count at [8], rsproto at [24..]) and sent with a raw
+  `SYS_CHANNEL_SEND` — 14 to 15 sites (14 sends by grep; 8 `[4..8].copy_from_slice` header writes,
+  one deliberately raw at authority.rs:146; 7 header reads), such as `restartprobe.rs:53`,
+  `stage.rs:388`, `bootprobe/main.rs:302`, `harness.rs:2726`; libprompt::ipc::send is a third
+  copy outside the crate. A libkern `channel_send(ch, &[u8; IPC_MSG_SIZE], handles: &[u64], mode)`
+  (or a page-sized `MsgBuf`) as the twin of `channel_recv`, so the page the kernel copies is part
+  of the type, plus librsproto `send(ch, op, request_id, flags, body, handles) -> bool` and
+  `recv(ch, &mut [u8; IPC_MSG_SIZE]) -> Result<(Message, Received), i64>`. Checked on
+  `stage::rs_send/rs_recv`, bootprobe `rs_send/receive`, restartprobe `send` and harness
+  `tty_request`. In libkern (channel.rs) and librsproto (io, session). Closes: a send or receive
+  buffer shorter than the page the kernel copies (all 14 are 4096 today by convention; the
+  desktop-session-mgr 256-byte receive was this class), header offsets disagreeing with
+  `IpcMsgHeader`, and payload slices running past `IPC_PAYLOAD_SIZE` into the handle area.
+  Depends on: nothing. abi, opportunities. Value medium, effort medium.
+- [ ] **th-o10** encapsulate: spawning a program by path by hand (look up the image, fill
+  `SpawnArgs`, spawn, then remember to close the image; 4 of 9 sites forget) — 9 sites
+  (`grep -rnE 'syscall1\(SYS_PROCESS_SPAWN|[^_]spawn\(&'`), such as `harness.rs:2370`,
+  `harness.rs:1355`, `bootprobe/exits.rs:15`, `stage.rs:444`. `spawn_path(ns, path, args:
+  SpawnArgs) -> Result<Handle<Process, Only>>` that resolves the image, spawns and closes the
+  image on every outcome, as bootprobe `spawn_stage` does by hand; for Tier-1 stages a
+  `libstream::setup` wrapper adds the setup channel. Checked on `run_coreutil_in`, `spawn_stage`
+  and `run_grants`. In libos beside `spawn` (which already returns an owning `Handle<Process>`).
+  Closes: the never-closed spawn images (th-d4, about 56 per run). Depends on: nothing. ownership.
+  Value medium, effort small.
+- [ ] **th-o11** encapsulate: DMA buffers built by hand (an `IoOp` submitted raw on a memory
+  object that is mapped and read around the I/O, then closed whether or not the wait completed)
+  — 8 sites (`SYS_IO_SUBMIT`; three map and read the buffer: `harness.rs:3567`,
+  `bootprobe/files.rs:97`, `bootprobe/storage.rs:277`), such as `storage.rs:273`, `files.rs:84`,
+  `harness.rs:3549`, `pattern.rs:251`. `IoBuffer { mem, map }` with `read(&mut self, dev, offset,
+  len) -> Result<&[u8]>` and `write(&mut self, dev, offset, data) -> Result<usize>` over libos's
+  `Handle<Resource,_>::read/write` and `block_on`; the returned slice borrows `self` mutably, so
+  none outlives the next I/O, and a failed wait keeps the buffer. Checked on the refusal tests
+  through `Op::submit`'s `Err`. In libos. Closes: a reference held over memory a device writes
+  (th-d2), and a DMA buffer closed or unmapped while its I/O may still be in flight after a
+  failed wait (harness.rs:3568-3578, `RootDevice::drop` after a failed read). Depends on: th-o2.
+  soundness. Value medium, effort small.
+- [ ] **th-o12** encapsulate: `librsproto::session::Dir` is closed only by an explicit `.close()`
+  on every path (its doc says drop cannot report a failure, but `close()` returns `()`) — 46
+  sites (`grep -rnE "Dir::(open|from_endpoint)\("` 46; `grep -rnoE "\.close\(\)"` 46), such as
+  `harness.rs:1007`, `bootprobe/files.rs:326`, `harness.rs:3249`. A `Drop` for `Dir` that closes
+  its endpoint, with `into_endpoint()` for the one borrowing use (`harness.rs:2941`). In
+  librsproto session.rs. Closes: a session left open on an early return, holding one of a
+  server's `MAX_WAIT_HANDLES - 2` slots (`session_fanout_demo` shows the table is finite).
+  Depends on: nothing. opportunities. Value low, effort small.
+- [ ] **th-o13** narrow: `unsafe` library calls whose only contract is "this `u64` is a live
+  namespace handle I own" — 16 to 17 sites (`grep -rnE "ChannelTransport::(connect|manage)|
+  acquire::acquire\(|text::load_(ui|mono)\(|Handle::<[A-Za-z]+, *[A-Za-z]+>::(borrow|from_raw)"`
+  16, plus `load_ui`/`load_mono` at uiclient.rs:279/283), such as `uiclient.rs:185`,
+  `uiclient.rs:1111`, `inputclient.rs:277`, `display.rs:82`. Take `&Handle<Namespace, impl
+  CanLookup>`; each `_start` wraps its bootstrap register once (one unsafe `Handle::borrow`, or a
+  libos thin-entry shim per libos.md) and later calls are safe; `acquire` stays unsafe only for
+  its real clause, the exclusive writer. Checked on `connect`, `manage` and `load_ui`. In
+  libsurface ipc.rs, libdraw text.rs and acquire.rs, and libos. Closes: the copy-pasted SAFETY
+  sentence that hides the one clause that is broken (th-d11). A wrong value is a kernel
+  InvalidHandle, never UB. Depends on: the libos thin-entry shim for the full form. soundness,
+  opportunities. Value low, effort medium.
+- [ ] **th-o14** remove: inline asm with safe or intrinsic equivalents — 9 sites (`grep -rnE
+  "asm!\(\"pause\"|\"cpuid\"|\"xgetbv\""`: 5 `pause` loops, 2 `cpuid`, 2 `xgetbv`), such as
+  `stage.rs:42`, `bootprobe/gates.rs:119`, `harness.rs:114`, `stage.rs:65`. `core::hint::spin_loop()`
+  (already at exits.rs:212 and stage.rs:527); `core::arch::x86_64::__cpuid_count`, which compiled
+  with no `unsafe` on nightly-2026-07-20 in a no_std probe; `_xgetbv(0)` inside a
+  `#[target_feature(enable = "xsave")]` fn, where the call stays unsafe but the asm goes; and one
+  FP-check module shared by test-stage and boot-probe (the check is duplicated). In `core::arch`
+  and `core::hint`, and a shared module in test-harness. Closes: 7 of 9 asm sites and the
+  hand-routed `rbx` clobber. Depends on: nothing. opportunities. Value low, effort small.
+- [ ] **th-o15** encapsulate: sleeping reimplemented six times (create a timer, arm it, wait,
+  close it; or wait with a deadline on a channel or notification that is not meant to signal) —
+  6 helpers, 13 callers (`grep -rnE "fn (timer_sleep_ms|timer_nap_ms|nap|sleep_ns)\(|
+  syscall4\((libkern::)?SYS_TIMER_SET"`), such as `harness.rs:904`, `stage.rs:127`,
+  `bootprobe/registry.rs:7`, `inputclient.rs:510`. `libos::sleep_until(deadline_ns) ->
+  Result<()>` over an owning one-shot timer. Checked on harness.rs:904, stage.rs:127 and
+  services.rs:58-77. In libos. Closes: static clock scratch read after a failed read, and a sleep
+  that ends early (inputclient's `sleep_ns` waits on `notif`, which its own `wait_event_before`
+  at :496 says is never drained). Depends on: th-o3 (`clock_now`). opportunities. Value low,
+  effort small.
+- [ ] **th-o16** remove: kernel snapshot objects (`/proc/sched/stats`, `/proc/self/status`,
+  `/initramfs/etc/init.toml`) mapped at exactly one page whatever size the kernel reports, read
+  as a 4096-byte slice and unmapped by hand — 6 sites (`grep -rnE "SYS_MEMORY_MAP, mem, 0,
+  (PAGE|4096), RIGHT_MAP_READ\)"`), such as `bootprobe/gates.rs:194`, `harness.rs:2532`,
+  `harness.rs:3486`, `harness.rs:864`. `libfs::read_file(ns, path)` (used at pattern.rs:144; maps
+  the stat'd size and copies out) with `libfs::unpadded`, or boot-probe's `read_all`
+  (main.rs:393). In libfs (exists). Closes: a snapshot outgrowing one page being parsed truncated
+  (`idle_cpus` would undercount and fail `dead_log_source_demo` falsely at about 40 online CPUs;
+  `MAX_CPUS` is 8 today) and the leaked initramfs mapping. Depends on: nothing. abi. Value low,
+  effort small.
+- [ ] **th-o17** remove: kernel error discriminants copied as literals where
+  `KError::X.as_i32()` exists (harness.rs:22 already does it for TimedOut) — 3 sites (`grep -rn
+  "const KERR_\|== -[0-9]\+\b"`): `harness.rs:636` (`status2 == -10`), `harness.rs:2999`
+  (`KERR_WOULD_BLOCK = -11`), `harness.rs:3134` (`KERR_UNSUPPORTED = -52`). Use
+  `KError::NotFound.as_i32()`, `WouldBlock`, `Unsupported`. In libkern::error (exists). Closes:
+  silent drift of an ABI discriminant in a test that would then assert the wrong refusal;
+  abi-sync-check holds libkern to the kernel but not these copies. The three literals match
+  today. Depends on: nothing. abi. Value low, effort small.
+
+What held up: Every `SYS_WAIT` (39 sites) passes count 1 with a result buffer of at least 24
+bytes, and the 16-vs-24 `HandleInfo` smash at harness.rs:798 has not come back; every kernel
+out-param is the exact ABI type (HandleInfo, Notification, RegisterValues, clock `u64`, entropy
+reads within `ENTROPY_READ_MAX`). All 14 `SYS_CHANNEL_SEND` buffers are whole 4096-byte pages,
+handle arrays carry at most 2 handles, and receives go only through `channel_recv` or
+`channel_recv_raw` (check-recv holds). Payload slices clamp to `4096-24` at
+harness.rs:2759, restartprobe.rs:120, inputclient.rs:147/192, stage.rs:417 and
+bootprobe/main.rs:361; `forward_demo`'s unclamped index at :3760 is bounds-checked, so a bad
+length panics rather than overruns. Every `from_raw_parts` length equals the mapped length
+(`sys_memory_map` refuses a size past the object's, table.rs:898), and the raw byte loops stay
+below the mapping. `RootDevice::read_at` holds (a host copy over offsets 0..8191 and 11 lengths
+passed; dropping the `PAGE - intra` bound fails), and `read_all` and `block_demo` copy out before
+they unmap. `libkern::Received` closes on drop at the harness, stage, inputclient and restartprobe
+sites. Spawn is all-or-nothing, so the post-failure closes at exits.rs:105-108, 137-141, 181-185
+and received.rs:234-236 are right; `sys_ns_bind` clones its resource reference, so the closes
+after bind are right; `sys_memory_unmap` ignores size, so the `unmap(addr, 0)` calls do unmap.
+`block_send_demo` can reuse `MSGBUF` while its send is pending, since the kernel copies into a
+bounce buffer at submit (table.rs:1978). Cross-process counters (stage.rs:562/570/641,
+exits.rs:82) are `AtomicU64` on page-aligned mappings never unmapped under their users, and the
+second-thread stacks are never unmapped. Every `static mut` is touched only by its process's
+main thread (the second threads use stack buffers or one pre-written static), so there is no
+data race today, and libheap's spinlock covers the two allocating threads. The cpuid/xgetbv asm is
+correctly scoped (`xgetbv` only after OSXSAVE, `rbx` routed through `rsi`, AVX2 fns called only
+after the feature check), and the `enter_user` stack-top bias makes the callers' `base+size`
+stacks correct. Library parsers reached from here hold their bounds (libsurface `poll_event`,
+librsproto `round_trip` and `Dir::open`, libstream chunks, `Table::decode`, `BlockDeviceInfo`,
+`InputEvent`). The hand-copied `KError` literals and the `ChildExited` `body[8..12]` parse match
+the kernel and notification-format.md. uiclient's pixel stores satisfy `y*pitch + x*4 + 4 <=
+len`. Deferred and not counted: TODO(svc-auth-ungated) at bootprobe/policy.rs:312. The only break
+a test caught is th-d2, by Miri on a model (th-d1 and th-d9 by a compile check and a kernel host
+test; none of the probes was left in place). No host test reaches any unsafe in this crate; it is
+bins only, with no lib target, so the proposed abstractions become host-testable only behind
+libos's sys mock.
