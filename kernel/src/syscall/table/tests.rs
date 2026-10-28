@@ -643,7 +643,7 @@ fn a_reply_for_a_cached_file_naming_another_device_is_refused() {
     close_and_release(RawHandle(b), FILE_CLIENT);
 }
 
-/// A lookup forwarded for client `PID`, and a reply carrying a memory object built for it.
+/// A forwarded lookup, and a reply carrying a memory object built for it.
 struct Forwarded {
     reg: ObjectRef,
     po: ObjectRef,
@@ -681,12 +681,12 @@ fn forwarded_memobj_lookup() -> Forwarded {
     Forwarded { reg, po, reply, transfers, _server_end }
 }
 
-const PID: u32 = 4444;
-
 /// **A lookup closed before its reply leaves nothing behind**: no handle that nothing knows of in
 /// the client's table, and the object, freed with the PO, not pinned for the life of the client.
 #[test]
 fn a_reply_to_a_lookup_its_client_closed_makes_no_handle() {
+    // A pid of its own: the global table is every test's.
+    const PID: u32 = 4451;
     use crate::object::header::test_probe;
     init_global_heap();
     global::init_for_tests();
@@ -701,6 +701,7 @@ fn a_reply_to_a_lookup_its_client_closed_makes_no_handle() {
 /// A lookup's handle is made by its first read, into the reader's table, and is every read's after.
 #[test]
 fn a_lookup_reply_is_installed_when_its_completion_is_read() {
+    const PID: u32 = 4452;
     init_global_heap();
     global::init_for_tests();
     let mut f = forwarded_memobj_lookup();
@@ -730,6 +731,50 @@ fn a_lookup_read_while_another_installs_it_waits_for_that_handle() {
         pending_op_installed(po.as_ptr(), Ok(7));
         assert!(matches!(pending_op_take(po.as_ptr()), Completion::Read(0, 7)));
     }
+}
+
+/// A lookup whose reader's table cannot take its handle fails for good, its object released.
+#[test]
+fn a_lookup_read_into_a_full_table_fails_for_good() {
+    const PID: u32 = 4453;
+    use crate::object::header::test_probe;
+    init_global_heap();
+    global::init_for_tests();
+    test_probe::reset();
+    let po = adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+    let mem = adopt(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+    // SAFETY: `po` pins the `PendingOperation`.
+    assert!(unsafe { crate::sched::complete_lookup(po.as_ptr(), 0, Some((mem, Rights::MAP_READ))) }.is_none());
+    crate::handle::table::FAIL_NEXT_ALLOCATE.with(|f| f.set(true));
+    let failed = (map_handle_err(HandleError::OutOfMemory) as i32, 0);
+    assert_eq!(read_completion(&po, PID), failed);
+    assert_eq!(test_probe::memory_object_destroys(), 1, "released");
+    assert_eq!(read_completion(&po, PID), failed, "the same error, every read");
+    assert_eq!(global::close_all_owned_by(PID), 0);
+}
+
+/// A PO completed once keeps its first object; a second completion's comes back to its caller.
+#[test]
+fn a_lookup_completed_twice_keeps_its_first_object() {
+    const PID: u32 = 4454;
+    init_global_heap();
+    global::init_for_tests();
+    let po = adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+    let mem = || adopt(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+    let (first, second) = (mem(), mem());
+    let first_at = first.as_ptr();
+    // SAFETY: `po` pins the `PendingOperation`.
+    unsafe {
+        assert!(crate::sched::complete_lookup(po.as_ptr(), 0, Some((first, Rights::MAP_READ))).is_none());
+        let back = crate::sched::complete_lookup(po.as_ptr(), 0, Some((second, Rights::MAP_READ)));
+        assert!(back.is_some_and(|(o, _)| o.as_ptr() != first_at), "the second's own object");
+    }
+    let (status, h) = read_completion(&po, PID);
+    assert_eq!(status, 0);
+    let read = global::get().lookup(RawHandle(h), PID, Rights::MAP_READ).unwrap();
+    assert_eq!(read.object.as_ptr(), first_at);
+    drop(read);
+    assert_eq!(global::close_all_owned_by(PID), 1);
 }
 
 /// The wire carries a size in 32 bits and rename flags in 16: one past either is refused, before

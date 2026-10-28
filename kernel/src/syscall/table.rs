@@ -1377,7 +1377,8 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
     let po_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
     let po_ptr = po_ref.as_ptr();
     let (pp, pt) = po_ref.clone().into_raw();
-    let po_h = match global::get().allocate(pid, pp, pt, pending_op_rights()) {
+    // No `DUPLICATE` or `TRANSFER`: it will hold its object, which could be the ring it is moved to.
+    let po_h = match global::get().allocate(pid, pp, pt, Rights::WAIT | Rights::INSPECT) {
         Ok(h) => h,
         Err(e) => {
             // SAFETY: `allocate` did not adopt the clone; reclaim it. `po_ref` then
@@ -1834,28 +1835,27 @@ pub fn sys_notif_recv(channel_h: u64, out: u64) -> SysResult {
 }
 
 /// A completed PO's `(status, result)` for `sys_wait`. A lookup's object is installed in the
-/// reader's table on its first read, and that handle is every later read's result.
+/// reader's table on its first read, and that handle is every later read's result, or the
+/// error a table that could not take it fails the lookup with for good.
 fn read_completion(po: &ObjectRef, pid: u32) -> (i32, u64) {
     use crate::sched::Completion;
     loop {
         // SAFETY: `po` pins the `PendingOperation` its lookup type-checked.
         let (obj, rights) = match unsafe { crate::sched::pending_op_take(po.as_ptr()) } {
             Completion::Read(status, result) => return (status, result),
-            Completion::Installing => {
-                core::hint::spin_loop();
-                continue;
-            }
+            Completion::Installing => continue,
             Completion::Install(obj, rights) => (obj, rights),
         };
         let (op, ot) = obj.into_raw();
-        let (outcome, read) = match global::get().allocate(pid, op, ot, rights) {
-            Ok(h) => (Ok(h.bits()), (0, h.bits())),
-            // SAFETY: `allocate` did not adopt the reference; reclaim it, parked for a later read.
-            Err(e) => (Err((unsafe { ObjectRef::from_raw(op, ot) }, rights)), (map_handle_err(e) as i32, 0)),
-        };
+        let outcome =
+            global::get().allocate(pid, op, ot, rights).map(|h| h.bits()).map_err(|e| map_handle_err(e) as i32);
         // SAFETY: as above.
         unsafe { crate::sched::pending_op_installed(po.as_ptr(), outcome) };
-        return read;
+        if outcome.is_err() {
+            // SAFETY: `allocate` did not adopt the reference; reclaim it, outside `SCHED`.
+            drop(unsafe { ObjectRef::from_raw(op, ot) });
+        }
+        return outcome.map_or_else(|status| (status, 0), |h| (0, h));
     }
 }
 

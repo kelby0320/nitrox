@@ -174,17 +174,17 @@ impl PendingOperation {
         Ok(inner.parked.take())
     }
 
-    /// End an install: its handle is the result now, or the object is parked again for a later read.
+    /// End an install: its handle is the result now, or its error is the status, for good.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn installed(obj: *mut (), outcome: Result<u64, (ObjectRef, Rights)>) {
+    pub(crate) unsafe fn installed(obj: *mut (), outcome: Result<u64, i32>) {
         // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         inner.installing = false;
         match outcome {
             Ok(handle) => inner.result = handle,
-            Err(parked) => inner.parked = Some(parked),
+            Err(status) => inner.status = status,
         }
     }
 

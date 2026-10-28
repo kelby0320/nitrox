@@ -231,12 +231,12 @@ pub unsafe fn pending_op_take(po: *mut ()) -> Completion {
     }
 }
 
-/// End a [`Completion::Install`]: the handle made, or the object back for a later read.
+/// End a [`Completion::Install`]: the handle made, or the error the lookup now fails with.
 ///
 /// # Safety
 ///
 /// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
-pub unsafe fn pending_op_installed(po: *mut (), outcome: Result<u64, (ObjectRef, Rights)>) {
+pub unsafe fn pending_op_installed(po: *mut (), outcome: Result<u64, i32>) {
     let _g = SCHED.lock();
     // SAFETY: `po` is a live `PendingOperation` pinned by the caller; `SCHED` held.
     unsafe { PendingOperation::installed(po, outcome) };
