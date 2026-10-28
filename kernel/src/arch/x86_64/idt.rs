@@ -137,41 +137,68 @@ macro_rules! irq_dispatcher {
     };
 }
 
+/// Clear DF and AC (RFLAGS bits 10 and 18), which ring 3 may leave set: only `syscall` masks them
+/// (SFMASK). Through `popfq`, not `cld; clac`: `clac` raises #UD on a CPU without SMAP, and the IDT
+/// is live before the kernel checks for SMAP, so an early fault there would end in a triple fault.
+macro_rules! clear_entry_flags {
+    () => {
+        "pushfq\nand dword ptr [rsp], ~0x40400\npopfq\n"
+    };
+}
+
+/// Every interrupt and exception stub's first instructions: `clear_entry_flags!`, then the
+/// error-code slot, vector and 15 GPRs of an [`ExceptionFrame`], its address in RDI.
+macro_rules! entry_prologue {
+    ($errcode:literal, $vec:tt) => {
+        concat!(
+            clear_entry_flags!(),
+            $errcode,
+            "push ",
+            stringify!($vec),
+            "\n",
+            "push rax\npush rbx\npush rcx\npush rdx\n",
+            "push rsi\npush rdi\npush rbp\n",
+            "push r8\npush r9\npush r10\npush r11\n",
+            "push r12\npush r13\npush r14\npush r15\n",
+            "mov rdi, rsp\n",
+        )
+    };
+}
+
+/// Pop the 15 GPRs, drop the vector and error-code slots, and `iretq`.
+macro_rules! entry_epilogue {
+    () => {
+        concat!(
+            "pop r15\npop r14\npop r13\npop r12\n",
+            "pop r11\npop r10\npop r9\npop r8\n",
+            "pop rbp\npop rdi\npop rsi\n",
+            "pop rdx\npop rcx\npop rbx\npop rax\n",
+            "add rsp, 16\n",
+            "iretq\n",
+        )
+    };
+}
+
 /// Define a naked exception-entry stub. The `noerr` form pushes a dummy `0` error code first;
 /// `err` relies on the CPU-pushed one. Both push the vector and the 15 GPRs and call
 /// [`exception_dispatch`], which **returns** on the ring-3 `Resume` path; the stub then
 /// unwinds the frame and `iretq`s it unmodified. Kernel faults and `Terminate` diverge.
 macro_rules! exception_stub {
-    (noerr, $name:ident, $vec:expr) => {
+    (noerr, $name:ident, $vec:tt) => {
         exception_stub!(@build $name, $vec, "push 0\n");
     };
-    (err, $name:ident, $vec:expr) => {
+    (err, $name:ident, $vec:tt) => {
         exception_stub!(@build $name, $vec, "");
     };
-    (@build $name:ident, $vec:expr, $errcode:literal) => {
+    (@build $name:ident, $vec:tt, $errcode:literal) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
             ::core::arch::naked_asm!(
-                concat!(
-                    $errcode,
-                    "push ", stringify!($vec), "\n",
-                    "push rax\npush rbx\npush rcx\npush rdx\n",
-                    "push rsi\npush rdi\npush rbp\n",
-                    "push r8\npush r9\npush r10\npush r11\n",
-                    "push r12\npush r13\npush r14\npush r15\n",
-                    "mov rdi, rsp\n",
-                ),
+                entry_prologue!($errcode, $vec),
                 "call {dispatch}",
                 // Resume path: pop the GPRs, drop the vector + error-code slots
                 // (16 bytes), and `iretq` to the (unmodified) faulting RIP.
-                concat!(
-                    "pop r15\npop r14\npop r13\npop r12\n",
-                    "pop r11\npop r10\npop r9\npop r8\n",
-                    "pop rbp\npop rdi\npop rsi\n",
-                    "pop rdx\npop rcx\npop rbx\npop rax\n",
-                    "add rsp, 16\n",
-                    "iretq\n",
-                ),
+                entry_epilogue!(),
                 dispatch = sym exception_dispatch,
             );
         }
@@ -219,26 +246,12 @@ extern "C" fn vec14() {
     ::core::arch::naked_asm!(
         // The CPU pushed a #PF error code; push the vector and the 15 GPRs to build a full
         // `ExceptionFrame`, then pass its address to the dispatcher.
-        concat!(
-            "push 14\n",
-            "push rax\npush rbx\npush rcx\npush rdx\n",
-            "push rsi\npush rdi\npush rbp\n",
-            "push r8\npush r9\npush r10\npush r11\n",
-            "push r12\npush r13\npush r14\npush r15\n",
-            "mov rdi, rsp\n",
-        ),
+        entry_prologue!("", 14),
         "call {dispatch}",
         // Recovery path: the dispatcher patched `frame.rip` and returned. Pop the GPRs, drop
         // the vector + error-code slots (16 bytes), and `iretq` to the patched RIP; `iretq`
         // pops the CPU-pushed RIP/CS/RFLAGS/RSP/SS itself.
-        concat!(
-            "pop r15\npop r14\npop r13\npop r12\n",
-            "pop r11\npop r10\npop r9\npop r8\n",
-            "pop rbp\npop rdi\npop rsi\n",
-            "pop rdx\npop rcx\npop rbx\npop rax\n",
-            "add rsp, 16\n",
-            "iretq\n",
-        ),
+        entry_epilogue!(),
         dispatch = sym pf_dispatch,
     );
 }
@@ -342,27 +355,12 @@ fn try_fault_in(cr2: u64, error_code: u64) -> bool {
 extern "C" fn timer_stub() {
     ::core::arch::naked_asm!(
         // Build a full `ExceptionFrame`: dummy error code, vector, 15 GPRs.
-        concat!(
-            "push 0\n",
-            "push 0x20\n",
-            "push rax\npush rbx\npush rcx\npush rdx\n",
-            "push rsi\npush rdi\npush rbp\n",
-            "push r8\npush r9\npush r10\npush r11\n",
-            "push r12\npush r13\npush r14\npush r15\n",
-            "mov rdi, rsp\n",
-        ),
+        entry_prologue!("push 0\n", 0x20),
         "call {dispatch}",
         // The dispatcher returned: pop the GPRs, drop the vector + dummy error-code slots
         // (16 bytes), and `iretq` to the interrupted context (restoring its RIP/CS/RFLAGS/RSP/SS,
         // including IF).
-        concat!(
-            "pop r15\npop r14\npop r13\npop r12\n",
-            "pop r11\npop r10\npop r9\npop r8\n",
-            "pop rbp\npop rdi\npop rsi\n",
-            "pop rdx\npop rcx\npop rbx\npop rax\n",
-            "add rsp, 16\n",
-            "iretq\n",
-        ),
+        entry_epilogue!(),
         dispatch = sym timer_dispatch,
     );
 }
@@ -404,24 +402,9 @@ fn timer_dispatch(_frame: *mut ExceptionFrame) {
 #[unsafe(naked)]
 extern "C" fn tlb_shootdown_stub() {
     ::core::arch::naked_asm!(
-        concat!(
-            "push 0\n",
-            "push 0x40\n",
-            "push rax\npush rbx\npush rcx\npush rdx\n",
-            "push rsi\npush rdi\npush rbp\n",
-            "push r8\npush r9\npush r10\npush r11\n",
-            "push r12\npush r13\npush r14\npush r15\n",
-            "mov rdi, rsp\n",
-        ),
+        entry_prologue!("push 0\n", 0x40),
         "call {dispatch}",
-        concat!(
-            "pop r15\npop r14\npop r13\npop r12\n",
-            "pop r11\npop r10\npop r9\npop r8\n",
-            "pop rbp\npop rdi\npop rsi\n",
-            "pop rdx\npop rcx\npop rbx\npop rax\n",
-            "add rsp, 16\n",
-            "iretq\n",
-        ),
+        entry_epilogue!(),
         dispatch = sym tlb_shootdown_dispatch,
     );
 }
@@ -445,24 +428,9 @@ fn tlb_shootdown_dispatch(_frame: *mut ExceptionFrame) {
 #[unsafe(naked)]
 extern "C" fn reschedule_ipi_stub() {
     ::core::arch::naked_asm!(
-        concat!(
-            "push 0\n",
-            "push 0x41\n",
-            "push rax\npush rbx\npush rcx\npush rdx\n",
-            "push rsi\npush rdi\npush rbp\n",
-            "push r8\npush r9\npush r10\npush r11\n",
-            "push r12\npush r13\npush r14\npush r15\n",
-            "mov rdi, rsp\n",
-        ),
+        entry_prologue!("push 0\n", 0x41),
         "call {dispatch}",
-        concat!(
-            "pop r15\npop r14\npop r13\npop r12\n",
-            "pop r11\npop r10\npop r9\npop r8\n",
-            "pop rbp\npop rdi\npop rsi\n",
-            "pop rdx\npop rcx\npop rbx\npop rax\n",
-            "add rsp, 16\n",
-            "iretq\n",
-        ),
+        entry_epilogue!(),
         dispatch = sym reschedule_ipi_dispatch,
     );
 }
@@ -539,42 +507,27 @@ pub(crate) fn register_device_handler(handler: extern "C" fn()) -> u8 {
 }
 
 macro_rules! device_irq_stub {
-    ($name:ident, $vec:literal) => {
+    ($name:ident, $vec:tt) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
             ::core::arch::naked_asm!(
-                concat!(
-                    "push 0\n",
-                    "push ", $vec, "\n",
-                    "push rax\npush rbx\npush rcx\npush rdx\n",
-                    "push rsi\npush rdi\npush rbp\n",
-                    "push r8\npush r9\npush r10\npush r11\n",
-                    "push r12\npush r13\npush r14\npush r15\n",
-                    "mov rdi, rsp\n",
-                ),
+                entry_prologue!("push 0\n", $vec),
                 "call {dispatch}",
-                concat!(
-                    "pop r15\npop r14\npop r13\npop r12\n",
-                    "pop r11\npop r10\npop r9\npop r8\n",
-                    "pop rbp\npop rdi\npop rsi\n",
-                    "pop rdx\npop rcx\npop rbx\npop rax\n",
-                    "add rsp, 16\n",
-                    "iretq\n",
-                ),
+                entry_epilogue!(),
                 dispatch = sym device_irq_dispatch,
             );
         }
     };
 }
 
-device_irq_stub!(dev_irq_30, "0x30");
-device_irq_stub!(dev_irq_31, "0x31");
-device_irq_stub!(dev_irq_32, "0x32");
-device_irq_stub!(dev_irq_33, "0x33");
-device_irq_stub!(dev_irq_34, "0x34");
-device_irq_stub!(dev_irq_35, "0x35");
-device_irq_stub!(dev_irq_36, "0x36");
-device_irq_stub!(dev_irq_37, "0x37");
+device_irq_stub!(dev_irq_30, 0x30);
+device_irq_stub!(dev_irq_31, 0x31);
+device_irq_stub!(dev_irq_32, 0x32);
+device_irq_stub!(dev_irq_33, 0x33);
+device_irq_stub!(dev_irq_34, 0x34);
+device_irq_stub!(dev_irq_35, 0x35);
+device_irq_stub!(dev_irq_36, 0x36);
+device_irq_stub!(dev_irq_37, 0x37);
 
 const DEVICE_STUBS: [extern "C" fn(); DEVICE_IRQ_COUNT] =
     [dev_irq_30, dev_irq_31, dev_irq_32, dev_irq_33, dev_irq_34, dev_irq_35, dev_irq_36, dev_irq_37];
@@ -972,63 +925,4 @@ unsafe fn load_idt(ptr: &IdtPointer) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Vector 2 is the only vector that can be a stop notice, and only during a stop: a
-    /// hardware NMI outside one is a real fault, and any other vector during a stop is a fault
-    /// the stopping CPU took on its way down.
-    #[test]
-    fn is_stop_notice_is_vector_2_during_a_stop_and_nothing_else() {
-        use super::is_stop_notice;
-
-        assert!(is_stop_notice(2, true), "vector 2 during a stop is the notice");
-        assert!(!is_stop_notice(2, false), "a hardware NMI outside a stop is a real fault");
-        for v in [0u64, 1, 3, 6, 8, 13, 14, 32, 255] {
-            assert!(!is_stop_notice(v, true), "vector {v} during a stop is not the notice");
-            assert!(!is_stop_notice(v, false), "vector {v} outside a stop is not the notice");
-        }
-    }
-
-    #[test]
-    fn set_handler_splits_address() {
-        let mut e = IdtEntry::EMPTY;
-        e.set_handler(0x1234_5678_9ABC_DEF0, 1);
-        assert_eq!(e.offset_low, 0xDEF0);
-        assert_eq!(e.offset_mid, 0x9ABC);
-        assert_eq!(e.offset_high, 0x1234_5678);
-        assert_eq!(e.selector, KERNEL_CODE_SELECTOR);
-        assert_eq!(e.ist, 1);
-        assert_eq!(e.type_attr, 0x8E);
-    }
-
-    #[test]
-    fn set_handler_masks_ist_to_three_bits() {
-        let mut e = IdtEntry::EMPTY;
-        e.set_handler(0, 0xFF);
-        assert_eq!(e.ist, 0x7);
-    }
-
-    #[test]
-    fn pf_fault_kind_decodes_error_bits() {
-        assert_eq!(pf_fault_kind(0b0000), FaultKind::NotMapped); // not present
-        assert_eq!(pf_fault_kind(0b0001), FaultKind::NotReadable); // present, read
-        assert_eq!(pf_fault_kind(0b0011), FaultKind::NotWritable); // present, write
-        assert_eq!(pf_fault_kind(0b1_0001), FaultKind::NotExecutable); // present, insn fetch
-        assert_eq!(pf_fault_kind(0b1_0010), FaultKind::NotMapped);
-    }
-
-    #[test]
-    fn fault_shape_maps_vectors() {
-        assert_eq!(fault_shape(0, 0, 0xAAAA, None), (KIND_DIVIDE_BY_ZERO, 0xAAAA, FaultKind::UnknownFault));
-        assert_eq!(fault_shape(6, 0, 0xBBBB, None).0, KIND_ILLEGAL_INSN);
-        let (k, addr, fk) = fault_shape(14, 0b0011, 0xCCCC, Some(0x1000));
-        assert_eq!((k, addr, fk), (KIND_SEG_FAULT, 0x1000, FaultKind::NotWritable));
-        assert_eq!(fault_shape(13, 0, 0xDDDD, None), (KIND_SEG_FAULT, 0xDDDD, FaultKind::UnknownFault));
-    }
-
-    #[test]
-    fn stub_table_covers_all_32_vectors() {
-        assert_eq!(STUBS.len(), 32);
-    }
-}
+mod tests;

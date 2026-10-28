@@ -338,6 +338,10 @@ pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
     if !SLAB_INITIALISED.load(Ordering::Acquire) {
         panic!("kmalloc called before slab_init");
     }
+    #[cfg(test)]
+    if cfg!(miri) {
+        return miri_heap::alloc(size, align);
+    }
     let bucket_size = size.max(align);
     // Large path when the request exceeds every bucket **or** needs more alignment than a bucket
     // gives: `slab_init` caps buckets at `align_of::<u64>()`, and `bucket_size` alone misses this
@@ -373,6 +377,11 @@ pub fn kzalloc(size: usize, align: usize) -> *mut u8 {
 pub unsafe fn kfree(ptr: *mut u8) {
     if ptr.is_null() {
         return;
+    }
+    #[cfg(test)]
+    if cfg!(miri) {
+        // SAFETY: under Miri every `kmalloc` came from `miri_heap::alloc`; the caller gives it back.
+        return unsafe { miri_heap::free(ptr) };
     }
     let desc = ((ptr as usize) & SLAB_MASK) as *mut SlabDescriptor;
     // SAFETY: every non-null pointer `kmalloc` returns lies in a buddy-owned page starting with
@@ -435,6 +444,78 @@ fn large_free<P: BuddyPager>(ptr: *mut u8, pager: &P) {
     let order = BuddyAllocator::order_for_size(total);
     let phys = PhysAddr::new((page0 as u64).wrapping_sub(pager.hhdm_offset()));
     pager.free(phys, order);
+}
+
+/// **Under Miri, each `kmalloc` is a host allocation of its own**, so a use after `kfree` is one
+/// Miri reports: the slab packs objects into pages of one leaked buffer, still live when an object
+/// is freed. A header before the object records the block's layout for `free`.
+#[cfg(test)]
+mod miri_heap {
+    use std::alloc::{Layout, alloc as host_alloc, dealloc};
+
+    /// The header's bytes: the block's size, then its alignment.
+    const HEADER: usize = 2 * size_of::<usize>();
+
+    pub(super) fn alloc(size: usize, align: usize) -> *mut u8 {
+        // The object starts one alignment in, so the header fits before it and it stays aligned.
+        let align = align.max(HEADER);
+        let Some(total) = align.checked_add(size) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(layout) = Layout::from_size_align(total, align) else {
+            return core::ptr::null_mut();
+        };
+        // SAFETY: `layout` has a non-zero size, as `size` is.
+        let block = unsafe { host_alloc(layout) };
+        if block.is_null() {
+            return block;
+        }
+        // SAFETY: the block holds `align >= HEADER` bytes before the object, `usize`-aligned.
+        unsafe {
+            let obj = block.add(align);
+            obj.cast::<usize>().sub(2).write(layout.size());
+            obj.cast::<usize>().sub(1).write(layout.align());
+            obj
+        }
+    }
+
+    /// # Safety
+    /// `obj` came from [`alloc`] and is not used again.
+    pub(super) unsafe fn free(obj: *mut u8) {
+        // SAFETY: the header `alloc` wrote before `obj` describes the block, which starts one
+        // alignment before it.
+        unsafe {
+            let size = obj.cast::<usize>().sub(2).read();
+            let align = obj.cast::<usize>().sub(1).read();
+            dealloc(obj.sub(align), Layout::from_size_align_unchecked(size, align));
+        }
+    }
+
+    /// Host-run, as Miri runs nowhere in CI: each block comes back aligned with its whole size
+    /// usable, and goes back to the host allocator from where it began.
+    #[test]
+    fn a_block_is_aligned_whole_and_freed_from_its_start() {
+        for (size, align) in [(1, 1), (3, 32), (64, 8), (832, 64), (4096, 4096), (5000, 16)] {
+            let obj = alloc(size, align);
+            assert!(!obj.is_null(), "{size} bytes at {align}");
+            assert_eq!(obj as usize % align, 0, "{size} bytes at {align}");
+            // SAFETY: `alloc` gave `size` bytes at `obj`, and nothing uses them after `free`.
+            unsafe {
+                obj.write_bytes(0xA5, size);
+                free(obj);
+            }
+        }
+    }
+
+    /// A size past any layout is refused with null, as the slab refuses it.
+    #[test]
+    fn a_size_past_any_layout_is_refused() {
+        for align in [8, 4096] {
+            assert!(alloc(usize::MAX, align).is_null(), "{align}");
+            assert!(alloc(usize::MAX - align + 1, align).is_null(), "{align}: the first that overflows");
+            assert!(alloc(usize::MAX - align, align).is_null(), "{align}: the last that does not");
+        }
+    }
 }
 
 #[inline]

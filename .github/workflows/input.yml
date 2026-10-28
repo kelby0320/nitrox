@@ -51,6 +51,7 @@ on:
       # so deleting its only call raises no dead-code warning. `idt.rs` also owns the
       # documented ordering constraint that the sweep runs *before* `dpc::run_pending`.
       - 'kernel/src/arch/x86_64/idt.rs'
+      - 'kernel/src/arch/x86_64/idt/**'
       # The whole harness crate: `inputclient.rs` is what reads the nodes and prints the
       # lines this gate matches on, and `Cargo.toml` registers it.
       - 'userspace/test-harness/**'

@@ -12,6 +12,11 @@ pub(super) fn clock() -> u64 {
     })
 }
 
+/// Set this test's port clock, which its next read moves on from.
+fn set_clock(ns: u64) {
+    NOW.with(|now| now.set(ns));
+}
+
 #[test]
 fn every_op_has_its_command_and_nothing_else_does() {
     use crate::io::irp::IrpOp;
@@ -122,12 +127,24 @@ fn a_command_that_moved_less_than_its_length_fails() {
     assert_eq!(completion(true, 8192, 8192), (io_error, 0), "the drive's error, whatever moved");
 }
 
+/// Memory standing in for the ABAR, freed when the test is done with its disk.
+struct FakeRegs(*mut [u32; 96]);
+
+impl Drop for FakeRegs {
+    fn drop(&mut self) {
+        // SAFETY: `fake_disk` made the pointer with `Box::into_raw`, and nothing frees it but this.
+        drop(unsafe { std::boxed::Box::from_raw(self.0) });
+    }
+}
+
 /// **A disk on fake registers**: memory standing in for the ABAR, held while the disk is used.
-fn fake_disk() -> (std::boxed::Box<[u32; 96]>, AhciDisk) {
+/// The registers are written through `abar`, so it comes from `into_raw`, a pointer that may
+/// write, not from a shared borrow of the box.
+fn fake_disk() -> (FakeRegs, AhciDisk) {
     crate::mm::test_support::init_global_heap();
     crate::dpc::init().unwrap();
-    let regs = std::boxed::Box::new([0u32; 96]);
-    let abar = regs.as_ptr() as u64;
+    let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
+    let abar = regs.0 as u64;
     let disk = AhciDisk {
         abar,
         port_base: abar + PORT_BASE,
@@ -137,14 +154,10 @@ fn fake_disk() -> (std::boxed::Box<[u32; 96]>, AhciDisk) {
         cmd_table: DmaBuffer::alloc(CMD_TABLE_BYTES).unwrap(),
         sectors: 1 << 20,
         flush_command: ATA_FLUSH_CACHE_EXT,
-        inflight: AtomicPtr::new(core::ptr::null_mut()),
-        pending: IrqSpinLock::new(LockRank::Leaf, PendingRing::new()),
+        state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
         intr: core::ptr::null_mut(),
-        issued_at: AtomicU64::new(0),
         counted: Counted::new(),
-        fault: AtomicU8::new(CLEAR),
         wake: core::ptr::null_mut(),
-        dead: AtomicBool::new(false),
     };
     (regs, disk)
 }
@@ -163,6 +176,30 @@ fn ctx(d: &AhciDisk) -> *mut () {
 const IO_ERROR: i32 = crate::syscall::error::KError::IoError as i32;
 const PENDING: i32 = IrpStatus::Pending as i32;
 
+/// **A command issued after the interrupt read slot 0 idle is not retired**: the ISR read PxCI
+/// outside the port lock, and took the command another CPU had just issued.
+#[test]
+fn a_command_issued_after_the_slot_read_idle_is_not_retired() {
+    use crate::io::irp::{IRP_BUF_NONE, IrpBuffer, IrpOp};
+    for flush in [false, true] {
+        let (_regs, d) = fake_disk();
+        let frag = PhysFrag { base: 0x10_0000, len: 512 };
+        let none = IrpBuffer { kind: IRP_BUF_NONE, count: 0, frags: 0 };
+        let mut irp = match flush {
+            false => read_irp(&frag),
+            true => Irp::new_block(IrpOp::Flush, core::ptr::null(), 0, 0, none, core::ptr::null_mut(), 0),
+        };
+        assert_eq!(read32(d.port_base, PX_CI), 0, "flush {flush}: slot 0 idle when the interrupt came");
+        submit(&mut irp, ctx(&d));
+        assert_eq!(read32(d.port_base, PX_CI), 1, "flush {flush}: issued since, on another CPU");
+        let (retired, ..) = take_retired(&d, &mut d.state.lock());
+        crate::dpc::run_pending();
+        assert!(retired.is_null(), "flush {flush}: retired while the HBA runs it");
+        assert_eq!(irp.status, PENDING, "flush {flush}");
+        assert_eq!(d.state.lock().inflight, &mut irp as *mut Irp, "flush {flush}: still in flight");
+    }
+}
+
 /// **A command a polled wait gave up on is failed, not retired**: it retired as done while it may
 /// have been running yet, and the next was built over its slot.
 #[test]
@@ -178,8 +215,8 @@ fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
     assert_eq!(settle_polled(&d, false), Some(true));
     crate::dpc::run_pending();
     assert_eq!((first.status, first.transferred), (IO_ERROR, 0), "failed, whatever the count said");
-    assert_eq!(d.inflight.load(Ordering::Acquire), &mut second as *mut Irp, "the next issued");
-    assert_eq!(d.fault.load(Ordering::Acquire), CLEAR);
+    assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "the next issued");
+    assert_eq!(d.state.lock().fault, CLEAR);
 }
 
 /// **A task file error is recovered, its command failed and the next issued**: a real HBA keeps the
@@ -198,7 +235,7 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         on_interrupt(&d);
         crate::dpc::run_pending();
         assert_eq!(first.status, PENDING, "keeps {keeps}: not retired, the watch thread's");
-        assert_eq!(d.fault.load(Ordering::Acquire), FAULTED, "keeps {keeps}");
+        assert_eq!(d.state.lock().fault, FAULTED, "keeps {keeps}");
         let irp = claim(&d, 0, false).expect("a reported fault is claimed");
         assert_eq!(irp, &mut first as *mut Irp);
         assert_eq!(claim(&d, 0, true), None, "and only once");
@@ -213,8 +250,8 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         assert!(recover(&d, irp));
         crate::dpc::run_pending();
         assert_eq!(first.status, IO_ERROR, "keeps {keeps}");
-        assert_eq!(d.inflight.load(Ordering::Acquire), &mut second as *mut Irp, "keeps {keeps}: the next issued");
-        assert_eq!(d.fault.load(Ordering::Acquire), CLEAR, "keeps {keeps}");
+        assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "keeps {keeps}: the next issued");
+        assert_eq!(d.state.lock().fault, CLEAR, "keeps {keeps}");
         assert_eq!(read32(d.port_base, PX_SERR), !0, "keeps {keeps}: the error latched");
         assert_eq!(read32(d.port_base, PX_IS), !0, "keeps {keeps}");
         assert_eq!(read32(d.abar, HBA_IS), 1 << d.port, "keeps {keeps}");
@@ -233,14 +270,14 @@ fn a_command_past_its_deadline_is_recovered_and_failed() {
     submit(&mut second, ctx(&d));
     write32(d.port_base, PX_TFD, 0x50);
     let t = 1_000;
-    d.issued_at.store(t, Ordering::Relaxed);
+    d.state.lock().issued_at = t;
     assert_eq!(due_at(&d, t + 5), t + COMMAND_DEADLINE_NS + 1, "its deadline, before a deadline's length");
     assert_eq!(claim(&d, t + COMMAND_DEADLINE_NS, false), None, "at its deadline");
     let irp = claim(&d, t + COMMAND_DEADLINE_NS + 1, false).expect("past it");
     assert!(recover(&d, irp));
     crate::dpc::run_pending();
     assert_eq!(first.status, IO_ERROR);
-    assert_eq!(d.inflight.load(Ordering::Acquire), &mut second as *mut Irp, "the next issued");
+    assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "the next issued");
 }
 
 /// **A fault with nothing in flight holds what is submitted until the port is back**: one issued
@@ -255,15 +292,15 @@ fn a_fault_with_nothing_in_flight_holds_what_comes_until_the_port_is_back() {
     on_interrupt(&d);
     submit(&mut first, ctx(&d));
     let idle = core::ptr::null_mut();
-    assert_eq!((d.inflight.load(Ordering::Acquire), read32(d.port_base, PX_CI)), (idle, 0), "faulted: queued");
+    assert_eq!((d.state.lock().inflight, read32(d.port_base, PX_CI)), (idle, 0), "faulted: queued");
     let irp = claim(&d, 0, false).expect("a reported fault is claimed");
     assert_eq!(irp, idle, "with no command of its own");
     submit(&mut second, ctx(&d));
     drain_queue(&d);
-    assert_eq!((d.inflight.load(Ordering::Acquire), read32(d.port_base, PX_CI)), (idle, 0), "recovering: queued");
+    assert_eq!((d.state.lock().inflight, read32(d.port_base, PX_CI)), (idle, 0), "recovering: queued");
     assert!(recover(&d, irp));
     crate::dpc::run_pending();
-    assert_eq!(d.inflight.load(Ordering::Acquire), &mut first as *mut Irp, "the first issued once the port is back");
+    assert_eq!(d.state.lock().inflight, &mut first as *mut Irp, "the first issued once the port is back");
     assert_eq!(read32(d.port_base, PX_CI), 1);
     assert_eq!((first.status, second.status), (PENDING, PENDING));
 }
@@ -286,9 +323,9 @@ fn a_port_that_will_not_stop_keeps_its_command_and_fails_the_rest() {
     let (mut first, mut second, mut third) = (read_irp(&frag), read_irp(&frag), read_irp(&frag));
     given_up(&d, &mut first, &mut second);
     crate::dpc::run_pending();
-    assert!(d.dead.load(Ordering::Acquire));
+    assert!(d.state.lock().dead);
     assert_eq!(first.status, PENDING, "kept");
-    assert_eq!(d.inflight.load(Ordering::Acquire), &mut first as *mut Irp, "and still slot 0's");
+    assert_eq!(d.state.lock().inflight, &mut first as *mut Irp, "and still slot 0's");
     assert_eq!(second.status, IO_ERROR, "queued: failed");
     submit(&mut third, ctx(&d));
     crate::dpc::run_pending();
@@ -303,13 +340,13 @@ fn a_request_meeting_the_give_up_at_the_port_lock_is_refused() {
     let (mut first, mut late) = (read_irp(&frag), read_irp(&frag));
     submit(&mut first, ctx(&d));
     let late_irp = &mut late as *mut Irp as usize;
-    let mut q = d.pending.lock();
+    let mut q = d.state.lock();
     std::thread::scope(|s| {
         let d = &d;
         let waiting = s.spawn(move || submit(late_irp as *mut Irp, ctx(d)));
         // Long enough for `waiting` to be at the lock.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let _ = give_up(d, &mut q);
+        let _ = give_up(&mut q);
         drop(q);
         waiting.join().unwrap();
     });
@@ -328,4 +365,79 @@ fn a_poll_of_a_disk_given_up_waits_for_nothing() {
     let before = clock();
     assert_eq!(poll_disk(&d), None);
     assert!(clock() - before < POLL_TIMEOUT_NS, "waited {} ms", (clock() - before) / 1_000_000);
+}
+
+/// **An interrupt queues the fault DPC on a new fault and the drain DPC on a retire**, and neither
+/// otherwise: the first wakes the watch thread, the second issues the command queued behind. Every
+/// interrupt queues the one that signals the disk's interrupt object.
+#[test]
+fn an_interrupt_queues_the_fault_dpc_on_a_fault_and_the_drain_dpc_on_a_retire() {
+    let addr = |dpc: &Dpc| dpc as *const Dpc as usize;
+    let (fault, drain, intr) = (addr(&AHCI_FAULT_DPC), addr(&AHCI_DRAIN_DPC), addr(&AHCI_INTR_DPC));
+    let (_regs, d) = fake_disk();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
+    submit(&mut first, ctx(&d));
+    submit(&mut second, ctx(&d));
+    crate::dpc::take_enqueued();
+    on_interrupt(&d);
+    let queued = crate::dpc::take_enqueued();
+    assert!(!queued.contains(&drain) && !queued.contains(&fault), "a command running yet");
+    assert!(queued.contains(&intr));
+    write32(d.port_base, PX_CI, 0);
+    on_interrupt(&d);
+    let queued = crate::dpc::take_enqueued();
+    assert!(queued.contains(&drain), "a retire, with a command queued behind it");
+    assert!(!queued.contains(&fault) && queued.contains(&intr));
+    write32(d.port_base, PX_IS, PXIE_TFEE);
+    write32(d.port_base, PX_TFD, 0x51);
+    on_interrupt(&d);
+    let queued = crate::dpc::take_enqueued();
+    assert!(queued.contains(&fault), "a task file error");
+    assert!(!queued.contains(&drain) && queued.contains(&intr), "and nothing retired");
+    on_interrupt(&d);
+    assert!(!crate::dpc::take_enqueued().contains(&fault), "a fault reported already");
+    crate::dpc::run_pending();
+}
+
+/// **A command's device time runs from its issue to its retire**, whichever way it retires: by an
+/// interrupt, a polled wait or a recovery. Issued at 1,000 s and retired 5 s on.
+#[test]
+fn a_commands_device_time_runs_from_its_issue_to_its_retire() {
+    use crate::io::stats::IoStats;
+    const ISSUE: u64 = 1_000_000_000_000;
+    const ON_DEVICE: u64 = 5_000_000_000;
+    for way in ["interrupt", "polled", "recovered"] {
+        static STATS: IoStats = IoStats::new();
+        let before = STATS.record_for(0, 0).busy_ns;
+        let (_regs, d) = fake_disk();
+        d.counted.attach_static(&STATS);
+        let frag = PhysFrag { base: 0x10_0000, len: 512 };
+        let mut irp = read_irp(&frag);
+        set_clock(ISSUE);
+        submit(&mut irp, ctx(&d));
+        set_clock(ISSUE + ON_DEVICE);
+        match way {
+            "interrupt" => {
+                write32(d.port_base, PX_CI, 0);
+                on_interrupt(&d);
+            }
+            "polled" => {
+                write32(d.port_base, PX_CI, 0);
+                assert_eq!(settle_polled(&d, true), Some(true));
+            }
+            _ => {
+                write32(d.port_base, PX_IS, PXIE_TFEE);
+                write32(d.port_base, PX_TFD, 0x51);
+                on_interrupt(&d);
+                let taken = claim(&d, 0, false).expect("a reported fault is claimed");
+                write32(d.port_base, PX_CI, 0);
+                write32(d.port_base, PX_TFD, 0x50);
+                assert!(recover(&d, taken));
+            }
+        }
+        crate::dpc::run_pending();
+        let busy = STATS.record_for(0, 0).busy_ns - before;
+        assert!((ON_DEVICE..ON_DEVICE + 1_000_000_000).contains(&busy), "{way}: {busy} ns on the device");
+    }
 }

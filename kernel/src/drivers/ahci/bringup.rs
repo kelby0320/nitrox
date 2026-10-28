@@ -121,14 +121,10 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         cmd_table,
         sectors: 0,
         flush_command: ATA_FLUSH_CACHE,
-        inflight: AtomicPtr::new(core::ptr::null_mut()),
-        pending: IrqSpinLock::new(LockRank::Leaf, PendingRing::new()),
+        state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
         intr: intr_ptr,
-        issued_at: AtomicU64::new(0),
         counted: Counted::new(),
-        fault: AtomicU8::new(CLEAR),
         wake,
-        dead: AtomicBool::new(false),
     };
     let disk = match KBox::try_new(disk) {
         Ok(b) => KBox::into_raw(b).as_ptr(), // leak to 'static
