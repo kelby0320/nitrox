@@ -115,7 +115,7 @@ pub enum LockRank {
     /// must hold **no other lock** when taking it. [`acquired`] checks that separately.
     TlbShootdown = 85,
     /// Interrupt-side and bottom-of-order locks, taking nothing while held: the DPC queue,
-    /// the entropy pool, the console input buffer, the AHCI pending ring, the completed-IRP
+    /// the entropy pool, the console input buffer, the AHCI port lock, the completed-IRP
     /// reclaim list.
     Leaf = 90,
 }

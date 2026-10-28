@@ -29,7 +29,7 @@ The rank is a **mandatory** constructor argument rather than an optional
 annotation: a lock with no declared position is a lock nobody has reasoned about.
 Requiring it is what surfaced the six live locks that were missing from the table
 below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
-`CONSOLE`, and the AHCI pending ring).
+`CONSOLE`, and the AHCI port lock).
 
 ## Ranks (top to bottom acquisition)
 
@@ -52,7 +52,7 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | leaf | Entropy pool/CSPRNG (`ENTROPY`, **`IrqSpinLock`**)| live as of Phase 2 (entropy); see § The entropy lock |
 | 8    | TLB-shootdown serialiser (`tlb::LOCK`)       | live as of Phase 4 Part B. Held with interrupts *enabled* (the F1 fix), so interrupt work runs beneath it — which is ordinary now that the tracker scopes interrupts (§ Interrupt context restarts the order) and no longer needs the exemption it carried when it first landed. It additionally has a contract the rank cannot express — **no other lock held when taken** — which is asserted separately in debug builds |
 | leaf | Console input buffer (`CONSOLE`, **`IrqSpinLock`**)| live as of Phase 2; filled from the COM1 receive IRQ |
-| leaf | AHCI pending ring (per-port, **`IrqSpinLock`**)| live as of Phase 2; IRQ-side completion bookkeeping |
+| leaf | AHCI port lock (`AhciDisk::state`, per-port, **`IrqSpinLock`**)| live as of Phase 2. Slot 0's command in flight, its issue time, the fault and give-up state, and the commands queued behind it; taken by the ISR, a submit, the drain DPC, the watch thread and the boot poll, each releasing it before completing an IRP or queuing a DPC |
 | leaf | Completed-IRP reclaim list (`RECLAIM`, **`IrqSpinLock`**)| live as of Phase 4 (2026-08-06). Pushed from `irp_complete_dpc` at the interrupt-dispatch tail and drained by `reap_pending` in thread context; both sides take it with nothing else held, and the drain releases it *before* dropping, because a drop reaches the allocator. It exists because freeing the box in the DPC deadlocked against a same-CPU allocator holder |
 
 **Why the leaves are the bottom of the order, not "held alone".** They take nothing
@@ -96,8 +96,8 @@ not, because `SCHED` is at the top and an interrupt handler is exactly the thing
 it under anything; the result panicked about one boot in three and was withdrawn. See the
 decision log, 2026-07-29.
 
-`SCHED`, `SERIAL`, `KLOG`, `DPC_QUEUE`, `ENTROPY`, `CONSOLE`, and the AHCI pending
-ring are [`IrqSpinLock`]s (they mask interrupts while held); every other lock is a
+`SCHED`, `SERIAL`, `KLOG`, `DPC_QUEUE`, `ENTROPY`, `CONSOLE`, and the AHCI port
+lock are [`IrqSpinLock`]s (they mask interrupts while held); every other lock is a
 plain `SpinLock`. See § Interrupt
 semantics for why these need it.
 
