@@ -2669,7 +2669,7 @@ fn complete_read_range_reply(
                 // SAFETY: `pf.file_obj` pins the live `FileObject` (header at 0).
                 let fo: &crate::object::FileObject =
                     unsafe { &*(pf.file_obj.as_ptr() as *const crate::object::FileObject) };
-                fo.mark_ready(pf.index);
+                fo.settle(pf.index, &pf.po, true);
                 drop(tr.obj);
                 0
             }

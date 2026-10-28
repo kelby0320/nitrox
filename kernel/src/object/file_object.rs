@@ -106,7 +106,7 @@ struct CachePage {
     fill: Option<ObjectRef>,
 }
 
-enum Fault {
+pub(crate) enum Fault {
     Hit(PhysAddr),
     Fill(PhysAddr, ObjectRef),
     Wait(ObjectRef),
@@ -721,7 +721,7 @@ impl FileObject {
     /// The fault path's [`reserve`](Self::reserve): a miss also makes the fill's `PendingOperation`
     /// and records it on the page for a second faulter to wait on. Both allocations are under the
     /// lock, which ranks above the allocators.
-    fn reserve_fault(&self, index: usize) -> Fault {
+    pub(crate) fn reserve_fault(&self, index: usize) -> Fault {
         let mut g = self.inner.lock();
         if let Some(p) = g.pages.iter().find(|p| p.index == index) {
             return match (p.state, &p.fill) {
@@ -763,7 +763,7 @@ impl FileObject {
     /// afresh, and settling by index alone would call that new page ready while its own fill still
     /// ran. Matched by the PO, not the frame: every caller holds a reference to the PO, so its
     /// address cannot be reused meanwhile, where a freed frame's can.
-    fn settle(&self, index: usize, po: &ObjectRef, ok: bool) {
+    pub(crate) fn settle(&self, index: usize, po: &ObjectRef, ok: bool) {
         let taken = {
             let mut g = self.inner.lock();
             let at = g
@@ -1273,7 +1273,7 @@ fn stub_fill_dpc(ctx: *mut ()) {
     }
     // SAFETY: `bx.file_obj` pins a live `FileObject`.
     let fo: &FileObject = unsafe { &*(bx.file_obj.as_ptr() as *const FileObject) };
-    fo.mark_ready(bx.index);
+    fo.settle(bx.index, &bx.po, true);
     // SAFETY: `bx` owns the reference pinning its `PendingOperation`.
     unsafe { crate::sched::complete_pending_op(bx.po.as_ptr(), 0, 0) };
 }

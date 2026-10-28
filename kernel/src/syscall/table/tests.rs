@@ -712,3 +712,48 @@ fn a_file_size_or_rename_flags_past_what_the_wire_carries_are_refused() {
     let truncate = dispatch(SYS_FILE_TRUNCATE, 0xDEAD, path.as_ptr() as u64, 2, 0, just_over_4_gib, 0);
     assert_eq!(truncate, KError::TooLarge.as_isize(), "taken as 10 bytes, it would free the rest");
 }
+
+/// **A fill's reply readies its own page**, not whichever holds its index now: a resize can retire
+/// the page mid-fill and a fault reserve the index afresh, and readied by a stale reply, the new
+/// page is mapped while its own fill runs, and freed if that fill fails.
+#[test]
+fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
+    use crate::libkern::KVec;
+    use crate::object::file_object::Fault;
+    use crate::object::ipc_channel::StoredMsg;
+    use crate::object::{FileObject, IpcChannel, MemoryObject, PageState, Producer, UserspaceServerReg};
+    use crate::rsproto::{REQUEST_ID_OFFSET, build_read_range_request};
+    init_global_heap();
+    // SAFETY: each pointer is a fresh `into_raw`, carrying its single creation reference.
+    let adopt = |p: *mut (), t| unsafe { ObjectRef::from_raw(p, t) };
+    let (k, s) = IpcChannel::try_new_pair(4).unwrap();
+    let k = adopt(KBox::into_raw(k).as_ptr() as *mut (), KObjectType::IpcChannel);
+    let _server_end = adopt(KBox::into_raw(s).as_ptr() as *mut (), KObjectType::IpcChannel);
+    let reg = adopt(
+        KBox::into_raw(UserspaceServerReg::try_new(k).unwrap()).as_ptr() as *mut (),
+        KObjectType::UserspaceServerReg,
+    );
+    let file = FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap();
+    let file = adopt(KBox::into_raw(file).as_ptr() as *mut (), KObjectType::FileObject);
+    // SAFETY: `file` pins the `FileObject`.
+    let fo = unsafe { &*(file.as_ptr() as *const FileObject) };
+    let Fault::Fill(frame, stale) = fo.reserve_fault(0) else { panic!("a fill") };
+    // SAFETY: `reg` pins the registration, and the test is single-threaded.
+    let id = unsafe { UserspaceServerReg::begin_fill(reg.as_ptr(), &stale, &file, frame, 0) }.unwrap();
+    fo.resize(0, KVec::new()).unwrap();
+    fo.resize(PAGE_SIZE, KVec::new()).unwrap();
+    let Fault::Fill(next, _its_fill) = fo.reserve_fault(0) else { panic!("a fill afresh") };
+    // The request's envelope turned round, as a server's reply: flags REPLY, the page's length.
+    let mut reply = StoredMsg::zeroed();
+    build_read_range_request(&mut reply.payload, 0, PAGE_SIZE as u32, b"f").unwrap();
+    reply.payload[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8].copy_from_slice(&id.to_le_bytes());
+    reply.payload[16..20].copy_from_slice(&1u32.to_le_bytes());
+    reply.payload[20..24].copy_from_slice(&8u32.to_le_bytes());
+    reply.payload[28..32].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    let bytes =
+        adopt(KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut (), KObjectType::MemoryObject);
+    let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    transfers[0] = Some(TransferRef { obj: bytes, rights: Rights::MAP_READ | Rights::TRANSFER });
+    assert_eq!(complete_read_range_reply(&reg, &reply, &mut transfers, 36), Ok(0));
+    assert_eq!(fo.lookup(0), Some((next, PageState::Loading)));
+}
