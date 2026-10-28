@@ -13,7 +13,7 @@ use crate::libkern::{AllocError, KVec, SpinLock};
 use crate::object::ObjectRef;
 
 use super::entry::{WriteGuard, read_snapshot};
-use super::grace::GraceTracker;
+use super::grace::{GraceTracker, yield_for_grace};
 use super::prng::Xorshift64;
 use super::segment::{SegmentEntries, SegmentMeta, free_entries, try_alloc_initialised};
 use super::type_rights::is_rights_compatible;
@@ -35,17 +35,12 @@ std::thread_local! {
         const { core::cell::Cell::new(false) };
 }
 
-/// Backoff for `close` when the defer ring is full and `drain` freed nothing.
-/// Tests yield to the host scheduler so a reader stuck in `read_snapshot` can
-/// finish; production emits a `PAUSE`-style hint and the caller spins.
 #[cfg(test)]
-fn yield_for_grace() {
-    std::thread::yield_now();
-}
-
-#[cfg(not(test))]
-fn yield_for_grace() {
-    core::hint::spin_loop();
+std::thread_local! {
+    /// A test's stand-in for another CPU, run once between a lookup's reading the entry's object
+    /// and its taking a reference.
+    pub(crate) static BEFORE_ACQUIRE: core::cell::Cell<Option<std::boxed::Box<dyn FnOnce()>>> =
+        const { core::cell::Cell::new(None) };
 }
 
 /// Why a handle table operation failed. Syscall layers may collapse `NotOwner`
@@ -103,10 +98,9 @@ pub struct HandleStat {
 ///
 /// `close` nulls the slot but does **not** decrement the refcount: it transfers
 /// the entry's one reference to this token, which the caller must account for
-/// (normally `ObjectRef::from_raw(co.0, co.1)`, then drop). Leaving the
-/// decrement to the caller keeps a racing `lookup` safe (a concurrent
-/// `try_acquire` sees either a positive count or zero) and keeps destruction,
-/// which reaches the rank-6 allocator, out from under the rank-3 lock. The
+/// (normally `ObjectRef::from_raw(co.0, co.1)`, then drop), once `close` has waited out every
+/// lookup that read it. Leaving the decrement to the caller keeps destruction, which reaches
+/// the rank-6 allocator, out from under the rank-3 lock. The
 /// wrapper makes the `Result` `Send`; a bare `*mut ()` is not.
 #[derive(Copy, Clone, Debug)]
 pub struct ClosedObject(pub *mut (), pub KObjectType);
@@ -364,10 +358,6 @@ impl HandleTable {
     /// `required` is the rights subset the caller needs; pass
     /// [`Rights::empty()`] to merely confirm the handle is live.
     pub fn lookup(&self, h: RawHandle, caller_pid: u32, required: Rights) -> Result<LookupOk, HandleError> {
-        // Step 0: enter a read-side critical section, dropped on every exit
-        // path; while held, no slot we might reference is recycled.
-        let _read_guard = self.grace.enter_read(current_ctx_id());
-
         // Step 1: decode.
         if h.is_null() {
             return Err(HandleError::NullHandle);
@@ -396,27 +386,40 @@ impl HandleTable {
         // 1024 is a debug tripwire.
         let mut retries = 0u32;
         loop {
-            // Step 5: seqlock-protected metadata snapshot.
-            let snap = read_snapshot(entry);
+            // Steps 5 to 7 are a read section, which a close waits out before releasing. Releases
+            // come after it: a last one runs a destructor, which may close.
+            let (snap, obj, object_type) = {
+                let _read_guard = self.grace.enter_read(current_ctx_id());
 
-            // Step 6: object non-null.
-            let obj = entry.object.load(Ordering::Acquire);
-            if obj.is_null() {
-                return Err(HandleError::InvalidHandle);
-            }
+                // Step 5: seqlock-protected metadata snapshot.
+                let snap = read_snapshot(entry);
 
-            let object_type = match KObjectType::from_u32(snap.object_type) {
-                Some(t) => t,
-                None => return Err(HandleError::InvalidHandle),
+                // Step 6: object non-null.
+                let obj = entry.object.load(Ordering::Acquire);
+                if obj.is_null() {
+                    return Err(HandleError::InvalidHandle);
+                }
+
+                let object_type = match KObjectType::from_u32(snap.object_type) {
+                    Some(t) => t,
+                    None => return Err(HandleError::InvalidHandle),
+                };
+
+                #[cfg(test)]
+                if let Some(other_cpu) = BEFORE_ACQUIRE.take() {
+                    other_cpu();
+                }
+
+                // Step 7: try to bump the refcount (fails if it is already zero,
+                // i.e. the object is being torn down). The reference is adopted at
+                // step 12 or released on the retry/error paths below.
+                // SAFETY: `obj` was read from a live entry in a read section, which a close waits
+                // out, so it addresses a live object.
+                if !unsafe { try_acquire_refcount(obj, object_type) } {
+                    return Err(HandleError::InvalidHandle);
+                }
+                (snap, obj, object_type)
             };
-
-            // Step 7: try to bump the refcount (fails if it is already zero,
-            // i.e. the object is being torn down). The reference is adopted at
-            // step 12 or released on the retry/error paths below.
-            // SAFETY: `obj` was read from a live entry under the grace guard, so it addresses a live object.
-            if !unsafe { try_acquire_refcount(obj, object_type) } {
-                return Err(HandleError::InvalidHandle);
-            }
 
             // Step 8: re-read seq; if changed or odd, release and retry.
             let s2 = entry.seq.load(Ordering::Acquire);
@@ -529,6 +532,8 @@ impl HandleTable {
             yield_for_grace();
             guard = self.inner.lock();
         }
+        drop(guard);
+        self.grace.synchronize();
 
         Ok(ClosedObject(prev_obj, object_type))
     }
@@ -649,6 +654,19 @@ impl HandleTable {
     /// This is the process-exit sweep: otherwise a dead process's entries pin
     /// their objects, notably its end of every pipe, forever.
     pub fn close_owned_batch(
+        &self,
+        pid: u32,
+        cursor: &mut SweepCursor,
+        out: &mut [Option<ClosedObject>],
+    ) -> (usize, bool) {
+        let (n, more) = self.unpublish_owned_batch(pid, cursor, out);
+        if n > 0 {
+            self.grace.synchronize();
+        }
+        (n, more)
+    }
+
+    fn unpublish_owned_batch(
         &self,
         pid: u32,
         cursor: &mut SweepCursor,

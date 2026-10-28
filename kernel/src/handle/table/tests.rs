@@ -813,3 +813,50 @@ fn close_then_allocate_drains_immediately_on_single_context() {
     let h = t.allocate(1, mk_process(0xFEED), KObjectType::Process, sig()).unwrap();
     close_release(&t, h, 1).unwrap();
 }
+
+/// The object `h`'s entry holds, read without a lookup.
+fn entry_object(t: &HandleTable, h: RawHandle) -> *mut () {
+    let (seg, slot, _) = h.decode();
+    let entries = t.directory[seg as usize].load(Ordering::Acquire);
+    // SAFETY: a published segment, which outlives the table.
+    unsafe { (*entries)[slot as usize].object.load(Ordering::Acquire) }
+}
+
+/// **A closed handle's object outlives every lookup about to take a reference to it.**
+fn a_closer_waits_for_a_lookup_about_to_take_its_reference(close: fn(&HandleTable, RawHandle)) {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Arc, Mutex};
+    let t: &'static HandleTable = std::boxed::Box::leak(std::boxed::Box::new(fresh_table()));
+    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let (freed, closer) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+    let (f, c) = (freed.clone(), closer.clone());
+    BEFORE_ACQUIRE.with(|b| {
+        b.set(Some(std::boxed::Box::new(move || {
+            let f2 = f.clone();
+            *c.lock().unwrap() = Some(std::thread::spawn(move || {
+                close(t, h);
+                f2.fetch_add(test_probe::process_destroys(), SeqCst);
+            }));
+            let start = std::time::Instant::now();
+            while !entry_object(t, h).is_null() && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(f.load(SeqCst), 0, "freed under a lookup about to take a reference");
+        })))
+    });
+    let before = test_probe::process_destroys();
+    assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle);
+    closer.lock().unwrap().take().unwrap().join().unwrap();
+    assert_eq!(freed.load(SeqCst) + test_probe::process_destroys() - before, 1, "destroyed once");
+}
+
+#[test]
+fn a_close_waits_for_a_lookup_about_to_take_its_reference() {
+    a_closer_waits_for_a_lookup_about_to_take_its_reference(|t, h| close_release(t, h, 1).unwrap());
+}
+
+#[test]
+fn a_sweep_waits_for_a_lookup_about_to_take_its_reference() {
+    a_closer_waits_for_a_lookup_about_to_take_its_reference(|t, _| assert_eq!(sweep_owned(t, 1), 1));
+}

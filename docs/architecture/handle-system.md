@@ -167,8 +167,9 @@ lookup(handle, caller_pid, required_rights) -> LookupOk
 Implemented in `HandleTable::lookup`, matching spec § "Validation
 algorithm" step-for-step.
 
-1. `enter_read` on the grace tracker.
-2. `handle != NULL`.
+1. `handle != NULL`. (Numbered from 2 in the spec's own list.)
+2. Steps 6 to 8 below run in a read section on the grace tracker (`enter_read`), which every
+   close waits out. Releases come after it: a last one runs a destructor, which may close.
 3. `seg_id < DIRECTORY_LEN`.
 4. `directory[seg_id]` is non-null (Acquire load).
 5. `slot_id < SEGMENT_LEN`.
@@ -185,7 +186,7 @@ algorithm" step-for-step.
 13. Return.
 
 Every error path that has already incremented the refcount releases
-it before returning.
+it before returning, outside the read section.
 
 ### ObjectRef seam
 
@@ -218,6 +219,8 @@ close(handle, caller_pid) -> ClosedObject
    **before** draining (drain advances the epoch).
 4. `drain_expired()`. Then push the new `DeferredClose { handle,
    epoch: deferred_epoch }` onto the ring.
+5. Drop the lock and `synchronize`: wait until every read section open now has closed. Only
+   then does the caller get the reference.
 
 The returned `ClosedObject(*mut (), KObjectType)` carries the previous
 object pointer **and its type**, transferring the handle's one
@@ -225,10 +228,15 @@ reference to the caller; `close` itself does **not** decrement. The
 caller releases it via `ObjectRef::from_raw(ptr, ty)` + drop after
 `close` returns. Keeping the decrement out of `close` keeps object
 destruction (which calls `kfree`, a rank-6 allocator lock) off the
-rank-3 handle-table lock, and makes a racing `lookup` safe: the slot's
-reference is conceptually live until the caller takes it, so a
-concurrent `try_acquire` always observes a positive count (pins the
-object) or zero (object dying). The wrapper type makes
+rank-3 handle-table lock. **The wait in step 5 is what makes a racing
+`lookup` safe**: a lookup between reading the pointer and taking its
+reference is in a read section, so the caller's release cannot free the
+object under it. Until 2026-10-28 the grace period guarded only the
+slot's reuse, and a close on another CPU could free the object a lookup
+was about to count (safety survey, kobj-d1). The process-exit sweep,
+`close_owned_batch`, waits the same way. The wait spins: a reader takes
+no lock and waits on nothing, so it lasts as long as the lookups already
+in flight. The wrapper type makes
 `Result<ClosedObject, _>` Send-able for closures that span thread
 boundaries; bare `*mut ()` is `!Send` and would poison any closure
 that touched it.
@@ -277,6 +285,14 @@ writes the current epoch into its slot; on exit it sets the high
 bit (`QUIESCED_BIT`). `is_grace_period_past(deferred)` walks every
 context's slot and returns `true` only when every context is either
 quiesced or at a strictly later epoch.
+
+**The reader's announcement and the closer's unpublishing store are a
+Dekker pair**, and each is followed by a `SeqCst` fence: x86 lets a
+store pass a later load, so with either fence missing a reader can read
+the object while the closer reads its context as quiescent. A host test
+races the two a million times. A section is a CPU's, so it must not
+migrate: debug builds assert interrupts masked or preemption off, which
+every caller, a syscall, has.
 
 `current_ctx_id` is a private free function in `kernel/src/handle/mod.rs`
 with `#[cfg(not(test))]` / `#[cfg(test)]` branches. Replacing it
