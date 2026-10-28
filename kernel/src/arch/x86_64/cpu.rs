@@ -38,8 +38,8 @@ impl ArchCpu for X86Cpu {
         ensure_smap_smep();
     }
 
-    fn set_kernel_stack(top: u64) {
-        gdt::set_kernel_stack(top);
+    fn set_kernel_stack(top: crate::mm::kstack::KernelStackTop) {
+        gdt::set_kernel_stack(top.get());
     }
 
     fn stop_the_machine() -> ! {

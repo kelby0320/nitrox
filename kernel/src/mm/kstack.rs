@@ -7,6 +7,7 @@
 //! The pages are a [`VmapFrames`]: dropping one shoots it down, frees it and reuses its VA.
 
 use crate::arch::paging::PageFlags;
+use crate::arch::{ArchThreadContext, fabricate_frame};
 use crate::libkern::AllocError;
 use crate::mm::kvmap::VmapFrames;
 use crate::mm::{PAGE_SIZE, VirtAddr};
@@ -15,6 +16,17 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 pub const KERNEL_STACK_PAGES: usize = 4;
 /// Bytes of usable stack space.
 pub const KERNEL_STACK_BYTES: u64 = (KERNEL_STACK_PAGES as u64) * (PAGE_SIZE as u64);
+
+/// A kernel stack's top for a CPU's trap and syscall stacks, which only a [`KernelStack`] makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelStackTop(u64);
+
+impl KernelStackTop {
+    /// The address.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// A per-thread kernel stack: `KERNEL_STACK_PAGES` of mapped, writable, non-executable,
 /// kernel-only vmap memory above one unmapped guard page.
@@ -46,6 +58,17 @@ impl KernelStack {
     /// Exclusive top of the stack: the RSP to load for its thread.
     pub fn top(&self) -> VirtAddr {
         self.pages.end()
+    }
+
+    /// The top, to set a CPU's trap and syscall stacks to while its thread runs there.
+    pub fn stack_top(&self) -> KernelStackTop {
+        KernelStackTop(self.top().as_u64())
+    }
+
+    /// Lay out the frame the first switch into this stack's thread returns through, to `trampoline`.
+    pub fn fabricate(&mut self, trampoline: u64) -> ArchThreadContext {
+        // SAFETY: this stack's own pages, mapped writable, which `&mut self` keeps any thread off.
+        unsafe { fabricate_frame(self.top().as_u64(), trampoline) }
     }
 
     /// Inclusive base of the mapped region; the guard page below it is unmapped.

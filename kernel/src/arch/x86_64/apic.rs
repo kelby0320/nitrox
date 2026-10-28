@@ -146,8 +146,7 @@ pub(crate) unsafe fn send_ipi(target: u32, vector: u8) {
     unsafe { write_icr(((target as u64) << 32) | ICR_ASSERT | (vector as u64)) };
 }
 
-/// Write the ICR, sending an IPI, once every earlier memory access is visible: what an IPI
-/// announces (a shootdown request, a reset acknowledgement) must not arrive after it.
+/// Write the ICR, sending an IPI, once every earlier memory access is visible.
 ///
 /// # Safety
 /// Ring-0; x2APIC must be enabled on the calling CPU.

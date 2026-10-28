@@ -559,7 +559,7 @@ unsafe fn switch_into(
         // live stack's exclusive top, as `sample` requires.
         unsafe {
             let pid = Thread::owner_pid_of(out_obj);
-            crate::mm::kstack::watermark::sample(top, pid);
+            crate::mm::kstack::watermark::sample(top.get(), pid);
         }
     }
     // Wait out the incoming thread's mid-switch-out guard before touching its parked

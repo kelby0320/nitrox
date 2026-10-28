@@ -112,13 +112,13 @@ pub fn arm_user_entry_cpu_base() {
 /// Set the kernel stack the `syscall` entry stub switches to on this CPU.
 ///
 /// Called with the user thread's kernel stack top before it descends to ring 3.
-pub fn set_syscall_kernel_stack(top: u64) {
+pub fn set_syscall_kernel_stack(top: crate::mm::kstack::KernelStackTop) {
     regs::debug_assert_pinned("set_syscall_kernel_stack");
     // SAFETY: writes only the running CPU's slot, which interrupts masked keep it on. In ring 0
     // about to descend to ring 3 on this CPU, no `syscall` on this CPU can be reading
     // `kstack_top` concurrently, and other CPUs touch only their own slots.
     unsafe {
-        (&raw mut (*this_cpu_block()).kstack_top).write(top);
+        (&raw mut (*this_cpu_block()).kstack_top).write(top.get());
     }
 }
 

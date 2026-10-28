@@ -16,11 +16,11 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crate::arch::{ArchFpuState, ArchThreadContext, fabricate_frame, thread_trampoline};
+use crate::arch::{ArchFpuState, ArchThreadContext, thread_trampoline};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
 use crate::mm::PhysAddr;
-use crate::mm::kstack::KernelStack;
+use crate::mm::kstack::{KernelStack, KernelStackTop};
 use crate::object::ObjectRef;
 use crate::object::Process;
 use crate::object::header::KObjectHeader;
@@ -270,14 +270,8 @@ impl Thread {
         entry: ThreadEntry,
         arg: usize,
     ) -> Result<KBox<Self>, AllocError> {
-        let stack = KernelStack::new()?;
-        let top = stack.top().as_u64();
-        // SAFETY: a freshly allocated `KernelStack` has its top
-        // `KERNEL_STACK_PAGES` pages mapped writable in the shared kernel
-        // vmap; `fabricate_frame` writes only the seven `u64` slots in
-        // `[top - 56, top)`. `top` is page-aligned, hence 8-aligned. The
-        // returned `ArchThreadContext` is stored opaquely.
-        let arch = unsafe { fabricate_frame(top, thread_trampoline as *const () as u64) };
+        let mut stack = KernelStack::new()?;
+        let arch = stack.fabricate(thread_trampoline as *const () as u64);
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Thread),
             tid,
@@ -330,11 +324,8 @@ impl Thread {
             let root = unsafe { (*p).address_space_root() }.expect("user process must have an address space");
             (pid, root)
         };
-        let stack = KernelStack::new()?;
-        let top = stack.top().as_u64();
-        // SAFETY: as `try_new_runnable` — a fresh KernelStack top has the
-        // seven fabricated-frame slots writable; `top` is page-aligned.
-        let arch = unsafe { fabricate_frame(top, thread_trampoline as *const () as u64) };
+        let mut stack = KernelStack::new()?;
+        let arch = stack.fabricate(thread_trampoline as *const () as u64);
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Thread),
             tid,
@@ -767,11 +758,11 @@ impl Thread {
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn kstack_top(obj: *mut ()) -> Option<u64> {
+    pub(crate) unsafe fn kstack_top(obj: *mut ()) -> Option<KernelStackTop> {
         let p = obj as *mut Thread;
         // SAFETY: read the Option<KernelStack> by reference (not by value —
         // KernelStack is not Copy and owns mappings) and project to its top.
-        unsafe { (*p).stack.as_ref().map(|s| s.top().as_u64()) }
+        unsafe { (*p).stack.as_ref().map(KernelStack::stack_top) }
     }
 
     /// This thread's owning process id, or `0` for a kernel/boot thread. Raw-pointer

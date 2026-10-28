@@ -172,7 +172,9 @@ fabricated frame `ret`s into `thread_trampoline` (`context.rs`): `sti` (it did n
 arrive via an `iretq` that would restore IF), then `call thread_enter`
 (`sched.rs`). `thread_enter` reads the current thread under `SCHED`; if it is a
 **user** thread it points TSS.RSP0 + the syscall stack at this thread's kernel
-stack, re-arms `KERNEL_GS_BASE`, and `enter_user`s to ring 3 (seeding
+stack and re-arms `KERNEL_GS_BASE` (`arm_kernel_stack_for`), still under `SCHED`,
+where reading the CPU and writing its slots cannot straddle a migration; the setters
+assert interrupts are masked in debug builds. It then `enter_user`s to ring 3 (seeding
 `rdi/rsi/rdx/rcx` with the spawn hand-off — notification channel, root namespace,
 etc.). A **kernel** thread runs its body then `exit_thread`s.
 
@@ -190,7 +192,7 @@ it happens on **every** switch-in, so migration needs no special path:
 | **Syscall entry stack** | `arm_kernel_stack_for`, every switch | first `syscall` after migration lands on a stale stack |
 | **`KERNEL_GS_BASE`** | `arm_kernel_stack_for` (`arm_user_entry_cpu_base`) | `swapgs` in the syscall stub reads the wrong core's block |
 | **Syscall MSRs (`EFER.SCE`, `STAR`/`LSTAR`)** | re-armed at each ring-3 **descent** (`arm_user_entry_cpu_base`, cheap `rdmsr(EFER)` gate) | first `syscall` `#UD`s (Bug 1) |
-| **Dense index (`TSC_AUX`)** | set once at bring-up, never per-thread | see Bugs 2 & 5 |
+| **Dense index (`TSC_AUX`)** | set once at bring-up, never per-thread: the BSP's first thing in `kernel_main`, before anything reads it | see Bugs 2 & 5 |
 
 The principle: **a thread carries no per-core assumptions across a switch** — the
 switch re-establishes them from the incoming thread + the running core. This is
