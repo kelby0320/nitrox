@@ -24,12 +24,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use libkern::{Received, channel_recv_raw};
 
-use libkern::abi::{CLOCK_MONOTONIC, HandleInfo, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
+use libkern::abi::{CLOCK_MONOTONIC, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
 use libkern::handle::{RIGHT_DUPLICATE, RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_SEND, RIGHT_TRANSFER};
 use libkern::syscall::{
-    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
-    SYS_HANDLE_STAT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE, SYS_NS_LOOKUP,
-    SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE, SYS_WAIT, syscall1, syscall2, syscall3, syscall4, syscall5,
+    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
+    SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE, SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE, SYS_WAIT, syscall1,
+    syscall2, syscall3, syscall4, syscall5,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
@@ -74,7 +74,8 @@ static mut NOTIF: libkern::abi::Notification = libkern::abi::Notification { kind
 /// shared `stderr` (diagnostics appear while a stage works) and the notification channel (a
 /// shutdown's terminate request).
 static mut WAIT_HANDLES: [u64; 4] = [0; 4];
-static mut WAIT_RESULTS: [u8; 96] = [0; 96];
+const WAIT_RESULTS_LEN: usize = 96;
+static mut WAIT_RESULTS: [u8; WAIT_RESULTS_LEN] = [0; WAIT_RESULTS_LEN];
 
 /// Was `handle` among the `n` results `sys_wait` just wrote?
 ///
@@ -85,11 +86,11 @@ fn signalled(n: i64, handle: u64) -> bool {
     if n < 1 {
         return false;
     }
-    // SAFETY: the syscall wrote `n` records, and `n` is bounded by the handle count we
-    // passed, which is at most the array's length.
+    let n = (n as usize).min(WAIT_RESULTS_LEN / 24);
+    // SAFETY: the syscall wrote `n` records, and `n` is clamped to the records the array holds.
     unsafe {
         let r = &raw const WAIT_RESULTS as *const u8;
-        (0..n as usize).any(|i| {
+        (0..n).any(|i| {
             let mut bits = [0u8; 8];
             core::ptr::copy_nonoverlapping(r.add(i * 24), bits.as_mut_ptr(), 8);
             u64::from_le_bytes(bits) == handle
@@ -435,76 +436,19 @@ impl Host for NitroxHost {
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
-        let h = lookup(self.namespace, path.as_bytes()).ok_or_else(|| alloc::format!("cannot open `{path}`"))?;
-        let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
-        // SAFETY: a correctly sized `HandleInfo` out-param for a handle we own.
-        let r = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
-        if r != 0 || info.size == 0 {
-            // SAFETY: closing our own handle.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-            // An empty file has nothing to map, and is no error: it runs as an empty script. A
-            // directory stats with no size too, and is not one.
-            let file =
-                matches!(info.object_type, libkern::handle::KOBJ_FILE_OBJECT | libkern::handle::KOBJ_MEMORY_OBJECT);
-            return if r == 0 && file { Ok(Vec::new()) } else { Err(alloc::format!("cannot size `{path}`")) };
-        }
-        // SAFETY: mapping a readable file handle for exactly its own length.
-        let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ) };
-        if addr < 0 {
-            // SAFETY: closing our own handle.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-            return Err(alloc::format!("cannot read `{path}`"));
-        }
-        // SAFETY: `addr` is a live read-only mapping of `info.size` bytes.
-        let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, info.size as usize) }.to_vec();
-        // SAFETY: unmapping and closing what we just created.
-        unsafe {
-            syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size);
-            syscall1(SYS_HANDLE_CLOSE, h);
-        }
-        Ok(bytes)
+        libfs::read_file(self.namespace, path.as_bytes()).map_err(|e| match e {
+            libfs::FileError::NotFound => alloc::format!("cannot open `{path}`"),
+            libfs::FileError::TooLarge => alloc::format!("`{path}` is too large to open"),
+            _ => alloc::format!("cannot read `{path}`"),
+        })
     }
 
-    /// Create `path` at exactly `bytes.len()` and write it (`save`).
+    /// Replace `path` with `bytes` (`save`).
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        let size = bytes.len() as u64;
-        // SAFETY: valid namespace handle and path slice.
-        let po = unsafe {
-            syscall5(
-                SYS_FILE_CREATE,
-                self.namespace,
-                path.as_ptr() as u64,
-                path.len() as u64,
-                RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE,
-                size,
-            )
-        };
-        if po < 0 {
-            return Err(alloc::format!("cannot create `{path}`"));
-        }
-        let (st, fh) = po_wait(po as u64);
-        if st != 0 || fh == 0 {
-            return Err(alloc::format!("cannot create `{path}`"));
-        }
-        // SAFETY: mapping our own writable file handle for exactly its length.
-        let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, size, RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE) };
-        if addr < 0 {
-            // SAFETY: closing our own handle.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
-            return Err(alloc::format!("cannot map `{path}`"));
-        }
-        // SAFETY: `addr` is a live writable mapping of exactly `size` bytes.
-        unsafe {
-            core::slice::from_raw_parts_mut(addr as *mut u8, bytes.len()).copy_from_slice(bytes);
-        }
-        // SAFETY: unmap, flush and close what we created — unmapped before the flush, since
-        // one that begins with a writable mapping in place leaves the file dirty.
-        unsafe {
-            syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
-            syscall2(SYS_FILE_SYNC, fh, 0);
-            syscall1(SYS_HANDLE_CLOSE, fh);
-        }
-        Ok(())
+        libfs::write_file(self.namespace, path.as_bytes(), bytes).map_err(|e| match e {
+            libfs::FileError::TooLarge => alloc::format!("`{path}` is too large to save"),
+            _ => alloc::format!("cannot save `{path}`"),
+        })
     }
 
     fn exists(&mut self, path: &str) -> bool {
@@ -753,33 +697,8 @@ fn lookup(ns: u64, path: &[u8]) -> Option<u64> {
 /// A char device is not a file: `/dev/console` is read with `READ`, not `MAP_READ | INSPECT`. The
 /// wrong rights give a handle that resolves and then fails every read.
 fn lookup_rights(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
-    // SAFETY: valid namespace handle and path slice.
-    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
-    if po < 0 {
-        return None;
-    }
-    let (status, handle) = po_wait(po as u64);
+    let (status, handle) = libfs::lookup_wait(ns, path, rights);
     if status != 0 || handle == 0 { None } else { Some(handle) }
-}
-
-fn po_wait(po: u64) -> (i32, u64) {
-    // SAFETY: valid single-waiter buffers.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = po;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-    };
-    // SAFETY: closing the PO we own.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
-    if waited != 1 {
-        return (-1, 0);
-    }
-    // SAFETY: written by the syscall above.
-    unsafe {
-        let r = (&raw const WAIT_RESULTS).read();
-        let status = i32::from_le_bytes([r[8], r[9], r[10], r[11]]);
-        let value = u64::from_le_bytes([r[16], r[17], r[18], r[19], r[20], r[21], r[22], r[23]]);
-        (status, value)
-    }
 }
 
 fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record, terminal: Option<u64>) -> i64 {

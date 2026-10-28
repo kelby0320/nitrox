@@ -204,6 +204,14 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send("format(\"rows={}\", (open ./nx-login.txt | count))")?;
     s.expect("rows=2")?;
     s.expect("/home>")?;
+    // A shorter save replaces the file rather than writing over its start, and an empty one saves.
+    s.send("[3] | save ./nx-login.txt")?;
+    s.expect("/home>")?;
+    s.send("[] | save ./nx-empty.txt")?;
+    s.expect("/home>")?;
+    s.send("format(\"resaved={} empty={}\", (open ./nx-login.txt | count), (open ./nx-empty.txt | count))")?;
+    s.expect("resaved=1 empty=0")?;
+    s.expect("/home>")?;
     steps += 1;
 
     // 5c. **A directory read of the same bind finds it.** Naming the file is stronger than a

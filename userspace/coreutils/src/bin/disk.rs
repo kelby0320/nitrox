@@ -469,7 +469,7 @@ fn device_info(ns: u64, path: &str) -> Option<BlockDeviceInfo> {
     // SAFETY: `addr` maps a page read-only, and `size` is under it.
     let info = BlockDeviceInfo::read(unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size) });
     // SAFETY: unmapping what was mapped above; nothing refers to it now.
-    unsafe { libkern::syscall::syscall2(libkern::syscall::SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { libkern::syscall::syscall2(libkern::syscall::SYS_MEMORY_UNMAP, addr as u64, 4096) };
     info
 }
 
