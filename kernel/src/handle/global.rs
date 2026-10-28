@@ -68,14 +68,21 @@ pub fn init_for_tests() {
     });
 }
 
-/// The global handle table. Panics in debug builds if called before [`init`].
+/// The global handle table. Panics if called before [`init`].
 pub fn get() -> &'static HandleTable {
-    debug_assert_eq!(GLOBAL.state.load(Ordering::Acquire), READY, "handle::global::get before init",);
-    // SAFETY: `READY` (observed with `Acquire`) was published with a `Release`
-    // store after the table was fully written; the table is never moved or
-    // dropped for the kernel's lifetime, so a `'static` shared borrow is
-    // sound. See the `Sync` impl above.
-    unsafe { (*GLOBAL.slot.get()).assume_init_ref() }
+    GLOBAL.table()
+}
+
+impl GlobalTable {
+    fn table(&self) -> &HandleTable {
+        // In a release build too: before `init` the slot is uninitialised memory.
+        assert_eq!(self.state.load(Ordering::Acquire), READY, "handle::global::get before init");
+        // SAFETY: `READY` (observed with `Acquire`) was published with a `Release`
+        // store after the table was fully written; the table is never moved or
+        // dropped for the kernel's lifetime, so a `'static` shared borrow is
+        // sound. See the `Sync` impl above.
+        unsafe { (*self.slot.get()).assume_init_ref() }
+    }
 }
 
 /// Handles closed per batch by [`close_all_owned_by`]; each entry is a pointer
@@ -121,5 +128,19 @@ pub fn close_all_owned_by(pid: u32) -> usize {
         if !more {
             return closed;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Refused in every build: a release build's `get` once formed a reference to the slot's
+    /// uninitialised memory.
+    #[test]
+    #[should_panic(expected = "before init")]
+    fn the_table_is_refused_before_init() {
+        let cell = GlobalTable { state: AtomicU8::new(UNINIT), slot: UnsafeCell::new(MaybeUninit::uninit()) };
+        let _ = cell.table();
     }
 }

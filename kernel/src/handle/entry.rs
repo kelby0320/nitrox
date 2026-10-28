@@ -121,7 +121,9 @@ impl<'a> WriteGuard<'a> {
     pub(crate) fn new(entry: &'a HandleEntry) -> Self {
         let s = entry.seq.load(Ordering::Relaxed);
         debug_assert_eq!(s & 1, 0, "WriteGuard entered on odd seq — concurrent writers",);
-        entry.seq.store(s.wrapping_add(1), Ordering::Release);
+        entry.seq.store(s.wrapping_add(1), Ordering::Relaxed);
+        // Orders the odd `seq` before the field stores that follow, which a Release store cannot.
+        fence(Ordering::Release);
         Self { entry, seq_at_enter: s }
     }
 }
@@ -135,6 +137,28 @@ impl Drop for WriteGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A snapshot is never torn**: the writer's odd `seq` is ordered before its field stores, or a
+    /// weakly ordered reader sees new fields between two reads of the old even one. x86 keeps
+    /// stores in order, so only Miri's weak-memory emulation can see it.
+    #[test]
+    fn a_snapshot_is_never_torn() {
+        const WRITES: u32 = if cfg!(miri) { 300 } else { 100_000 };
+        let e = HandleEntry::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 1..=WRITES {
+                    let _wg = WriteGuard::new(&e);
+                    e.generation.store(i, Ordering::Relaxed);
+                    e.owner_pid.store(i, Ordering::Relaxed);
+                }
+            });
+            for _ in 0..WRITES {
+                let snap = read_snapshot(&e);
+                assert_eq!(snap.generation, snap.owner_pid, "a torn snapshot accepted");
+            }
+        });
+    }
 
     #[test]
     fn layout_is_exactly_64_bytes_aligned_64() {
