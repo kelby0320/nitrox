@@ -35,8 +35,7 @@ fn message() -> KBox<StoredMsg> {
     unsafe { KBox::<StoredMsg>::try_new_zeroed() }.unwrap()
 }
 
-/// **A send closes the handles it moves once its message is queued**, and only then: a send its
-/// peer's full ring refuses leaves them with their owner.
+/// **A send closes the handles it moves once its message is queued**, and only then.
 #[test]
 fn a_send_closes_the_handles_it_moves_once_its_message_is_queued() {
     const PID: u32 = 4461;
@@ -83,8 +82,7 @@ fn a_forwarded_reply_closes_the_handles_it_carries() {
     global::close_all_owned_by(PID);
 }
 
-/// **A blocking send that cannot make its PO's handle commits nothing**: it fails before the push,
-/// so its message is not in the peer's ring and its handles stay, and a retry sends it once.
+/// **A blocking send that cannot make its PO's handle commits nothing**, so a retry sends it once.
 #[test]
 fn a_blocking_send_whose_handle_cannot_be_made_sends_nothing() {
     const PID: u32 = 4464;

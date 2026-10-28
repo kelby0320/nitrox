@@ -2215,8 +2215,8 @@ fn notify_file_touched(file_obj: &ObjectRef) {
     unsafe { crate::sched::us_forward_notify(reg.as_ptr(), &mut msg) };
 }
 
-/// Build a lazy [`FileObject`] for an `OBJECT_KIND_FILE` resolve reply and install it into the
-/// caller's table; returns the `(status, handle)` the lookup PO completes with. Its producer
+/// Build a lazy [`FileObject`] for an `OBJECT_KIND_FILE` resolve reply; returns what the lookup's
+/// PO completes with ([`Resolved`]), the file and its rights parked for the read. Its producer
 /// names the file by the lookup's stored suffix, so a page fault fills it via `File::ReadRange`.
 /// `TooLarge` if the suffix overran the inline buffer, `OutOfMemory` on allocation failure.
 fn build_and_install_file(
@@ -2247,10 +2247,10 @@ fn build_and_install_file(
     (0, Some((fref, pl.requested | Rights::INSPECT)))
 }
 
-/// Build + install a **Model A** (block-fs) lazy file from a resolve reply: adopt the
+/// Build a **Model A** (block-fs) lazy file from a resolve reply, for the lookup to park: adopt the
 /// transferred block `DeviceNode` (`handles[0]`), parse the block size + `BlockRun` map from
 /// the reply body, and construct a `FileObject` whose producer fills each page zero-copy from
-/// the device. Returns `(0, handle)` or `(kerror, 0)`.
+/// the device. Returns `(0, Some((file, rights)))` or `(kerror, None)`.
 fn build_and_install_file_blocks(
     reg: &ObjectRef,
     pl: &crate::object::userspace_server::PendingLookup,

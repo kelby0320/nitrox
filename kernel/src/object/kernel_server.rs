@@ -4,7 +4,7 @@
 //! context, to produce a handle for a
 //! [`BindingTarget::KernelServer`](crate::object::namespace::BindingTarget) binding; the other
 //! kind is [`super::userspace_server`] (`docs/architecture/namespace-and-resource-servers.md`
-//! § "Kernel Servers"). The syscall installs the rights-attenuated handle and pre-signals the
+//! § "Kernel Servers"). The syscall parks the rights-attenuated object and pre-signals the
 //! lookup's `PendingOperation`, so an in-kernel lookup is synchronous.
 
 use crate::libkern::KBox;
@@ -55,7 +55,7 @@ pub enum KernelServerId {
 /// returns only [`Completed`](OpStatus::Completed) or [`Rejected`](OpStatus::Rejected);
 /// `Pending` belongs to the userspace path.
 pub enum OpStatus {
-    /// A handle to a kernel object; the caller installs it (rights-attenuated), pre-signalling `0`.
+    /// A kernel object; the caller pre-signals the lookup with it, rights-attenuated.
     Completed(ObjectRef),
     /// The lookup failed; the caller delivers `err` through the lookup PO.
     Rejected(KError),

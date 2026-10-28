@@ -274,12 +274,23 @@ immediately, pre-signalled; a resource-server binding completes it after the IPC
 round-trip — slice 3.) The `IoResult.result` word is the result-carrying
 extension noted under `sys_wait`.
 
+**The handle is made by the read.** The PO completes with the resolved object held in
+it, and the `sys_wait` that first reports the completion installs the handle in the
+caller's table; every later read reports the same handle. A PO closed before it is read
+releases the object, and no handle is made. A table that cannot take the handle fails
+the lookup **for good** with `OutOfHandles` or `OutOfMemory` in `IoResult.status`, the
+object released; every later read reports the same error, so the caller looks the path
+up again. **The PO carries only `WAIT | INSPECT`**: it cannot be duplicated, sent,
+granted or bound, so only its caller reads it, and one holding an endpoint cannot be
+moved into that endpoint's ring.
+
 **Error delivery.** *Resolution* failures — no covering binding, or a non-empty
 suffix on a direct-handle leaf — are delivered **through the PO** as a `NotFound`
 `status` (you are not told *why* a path does not resolve; it simply does not
 exist). *Argument*, *permission*, and *allocation* failures (a bad `ns` handle or
-missing `LOOKUP`, a malformed/oversize `path`, or PO/handle exhaustion) return
-**synchronously** as a negative isize, with **no** `PendingOperation` created.
+missing `LOOKUP`, a malformed/oversize `path`, or exhaustion of the PO or its handle)
+return **synchronously** as a negative isize, with **no** `PendingOperation` created;
+the resolved handle's own exhaustion comes through the PO, at the read.
 
 **The file verbs are lookups too**: `sys_file_grow(ns, path, path_len, rights, size)`,
 `sys_file_create` and `sys_file_truncate` with the same arguments, and

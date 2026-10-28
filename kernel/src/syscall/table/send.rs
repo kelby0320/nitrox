@@ -54,8 +54,7 @@ pub(super) fn deliver(
             // SAFETY: `into_raw` yields the single creation reference; adopt it.
             let po_ref =
                 unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
-            // Its handle before the push: nothing may fail once the message is committed, or a
-            // retry would send it twice.
+            // Its handle before the push: once the message is committed, nothing may fail.
             let po_h = install(pid, po_ref.clone(), pending_op_rights())?;
             // SAFETY: `ch` is the live `IpcChannel` its lookup type-checked, held across the call.
             let refused = match unsafe {

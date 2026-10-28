@@ -36995,7 +36995,11 @@ decisions:
   reader's table on the first read, and a PO freed unread releases the object. Installing at the
   reply left a handle no one knew in a client that had given up (rt-d6, sup-d4). A check of the
   PO's count at the reply was rejected for the leak it leaves when a close races the reply, and
-  deferring to Part E for the leak it leaves meanwhile.
+  deferring to Part E for the leak it leaves meanwhile. Two consequences, settled after PR #403's
+  review: the PO carries only `WAIT | INSPECT`, so one holding an endpoint cannot be moved into
+  that endpoint's ring, a cycle nothing frees, and only its caller reads it; and a read the
+  caller's table cannot take fails the lookup for good, its object released, the maintainer's
+  choice, so a PO's completion stays one-shot.
 - **The kernel refuses a block map whose run would split a page** rather than trust a server to
   avoid one: a page is filled and written back from its first block, so a split put the rest of
   the page on other blocks (kmem-d13). In-tree servers never send one.

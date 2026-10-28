@@ -165,42 +165,42 @@ lookup(handle, caller_pid, required_rights) -> LookupOk
 ```
 
 Implemented in `HandleTable::lookup`, matching spec § "Validation
-algorithm" step-for-step.
+algorithm" step-for-step, and numbered as its comments are.
 
-1. `handle != NULL`. (Numbered from 2 in the spec's own list.)
-2. Steps 6 to 8 below run in a read section on the grace tracker (`enter_read`), which every
-   close waits out. Releases come after it: a last one runs a destructor, which may close.
-3. `seg_id < DIRECTORY_LEN`.
-4. `directory[seg_id]` is non-null (Acquire load).
-5. `slot_id < SEGMENT_LEN`.
-6. `read_snapshot(entry)` — seqlock loop returning a consistent
+1. Decode; `handle != NULL`.
+2. `seg_id < DIRECTORY_LEN`.
+3. `directory[seg_id]` is non-null (Acquire load).
+4. `slot_id < SEGMENT_LEN`.
+5. `read_snapshot(entry)` — seqlock loop returning a consistent
    metadata tuple plus the observed seq value.
-7. `entry.object` is non-null (Acquire load).
-8. `try_acquire_refcount(object, type)` — the **ObjectRef seam**
+6. `entry.object` is non-null (Acquire load).
+7. `try_acquire_refcount(object, type)` — the **ObjectRef seam**
    (see below).
-9. Re-read seq; if it changed or is odd, release refcount and retry
+8. Re-read seq; if it changed or is odd, release refcount and retry
    the inner loop.
-10. `generation` matches the handle's encoded generation.
-11. **`owner_pid` matches `caller_pid`** — the security-critical step.
-12. `required ⊆ entry.rights`.
-13. Return.
+9. `generation` matches the handle's encoded generation.
+10. **`owner_pid` matches `caller_pid`** — the security-critical step.
+11. `required ⊆ entry.rights`.
+12. Return.
 
-Every error path that has already incremented the refcount releases
-it before returning, outside the read section.
+Steps 5 to 7 run in a read section on the grace tracker (`enter_read`), which every
+close waits out. Every error path that has already incremented the refcount releases
+it before returning, outside the read section: a last release runs a destructor, which
+may close.
 
 ### ObjectRef seam
 
-Step 8 calls `try_acquire_refcount(*mut (), KObjectType) -> bool`, which
+Step 7 calls `try_acquire_refcount(*mut (), KObjectType) -> bool`, which
 reads the `KObjectHeader` at offset 0 of the object pointer and bumps
 its refcount with `Arc`-upgrade semantics (failing if the count was
 already zero — the object is being torn down). Error/retry paths call
 `release_refcount(*mut (), KObjectType)`, which drops the reference and
 runs the object's destructor (dispatched on `KObjectType`) if it was the
-last. On success, step 13 wraps the acquired reference in an `ObjectRef`
+last. On success, step 12 wraps the acquired reference in an `ObjectRef`
 (the RAII holder in `kernel/src/object/`); `lookup` returns
 `LookupOk { object: ObjectRef, rights }` and dropping the `LookupOk`
 releases the reference. A `#[cfg(test)] FAIL_NEXT_ACQUIRE` flag still
-forces the step-8 failure branch deterministically. See
+forces the step-7 failure branch deterministically. See
 [`docs/spec/abi-version-hash.md`](../spec/abi-version-hash.md) for the
 `KObjectHeader` layout and `kernel/src/object/header.rs` for the
 ownership model.

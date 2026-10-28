@@ -71,8 +71,7 @@ impl GraceTracker {
         }
     }
 
-    /// Start a new epoch after the caller's unpublishing store, returning the one a reader that
-    /// may have missed that store entered under.
+    /// A new epoch after the caller's unpublishing store; the old one, a missing reader's.
     fn unpublished(&self) -> u64 {
         fence(Ordering::SeqCst);
         self.advance_epoch()

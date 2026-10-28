@@ -267,9 +267,8 @@ pub(super) fn transfer_list_test() -> bool {
     true
 }
 
-/// **A lookup's PO stays with its caller**: it comes to hold the object it resolves, so one sent
-/// into the ring of the endpoint it holds would keep both for ever, and a duplicate read in another
-/// process would put the caller's handle there. Its duplicate and its send are refused `NoAccess`.
+/// **A lookup's PO stays with its caller**: it holds the object it resolves, which could be the
+/// endpoint whose ring it is sent to. Its duplicate and its send are refused `NoAccess`.
 pub(super) fn lookup_po_stays_test(root_ns: u64) -> bool {
     use libkern::{
         KError, RIGHT_INSPECT, RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_NS_LOOKUP,

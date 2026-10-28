@@ -4,9 +4,9 @@ use super::*;
 
 /// Whether a send on `endpoint` carrying `transfers` could close a cycle of endpoints holding
 /// each other through their rings, which nothing would free: it carries the endpoint it is for,
-/// or one already holding an endpoint, as the last move of every such cycle must. A lookup's PO,
-/// which can hold an endpoint, cannot move at all. A cycle through a namespace binding is not
-/// caught: TODO(ipc-handle-cycles).
+/// or one already holding an endpoint, as the last move of every such cycle must. A cycle
+/// through a namespace binding is not caught: TODO(ipc-handle-cycles).
+/// A lookup's PO, which can hold an endpoint, cannot move at all.
 ///
 /// # Safety
 ///
