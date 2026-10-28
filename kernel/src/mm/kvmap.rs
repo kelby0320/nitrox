@@ -1,6 +1,6 @@
 //! Kernel-half virtual address allocator (the "kernel vmap").
 //!
-//! A bump pointer, never reclaimed, over the vmap region (16 TiB; layout in
+//! VA, reused only as [`VmapFrames`] give it back, over the vmap region (16 TiB; layout in
 //! `docs/architecture/overview.md`), for kernel-half mappings the boot path did not pre-establish.
 //!
 //! A vmap mapping must be visible under every address space (a stack allocated under one AS is
@@ -9,139 +9,276 @@
 //! [`init`] runs at boot **before** `init_kernel_template` and pre-allocates the vmap's top-level
 //! intermediate page tables, the template snapshots those PML4 entries, and every
 //! `AddressSpace::new` inherits them. Later `map_page` calls modify a PD/PT chain under the shared
-//! PDPTs, visible to every AS with no shootdown.
+//! PDPTs, visible to every AS with no shootdown. So VA is handed out only in that window, the
+//! tables are edited through the boot root alone, and every unmap is shot down on every CPU.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::Paging;
 use crate::arch::paging::{ArchPaging, PageFlags};
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{AllocError, SpinLock};
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
+use crate::libkern::{AllocError, KBox, SpinLock};
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
 
 /// Inclusive lower bound of the kernel vmap region (`docs/architecture/overview.md`).
 pub const KERNEL_VMAP_START: u64 = 0xFFFF_C000_0000_0000;
 /// Exclusive upper bound of the kernel vmap region (16 TiB).
 pub const KERNEL_VMAP_END: u64 = 0xFFFF_D000_0000_0000;
 
-/// Bump-pointer cursor: the next virtual byte to hand out. Never nested; lock rank 6d.
-static VMAP_NEXT: SpinLock<u64> = SpinLock::new(LockRank::KernelVmap, KERNEL_VMAP_START);
+const PDPT_SPAN: u64 = 512 << 30;
+/// PDPTs [`init`] links, from the region's start.
+const WINDOW_PDPTS: u64 = 1;
+/// Exclusive upper bound of the window, the part of the region every root shares.
+pub const VMAP_WINDOW_END: u64 = KERNEL_VMAP_START + WINDOW_PDPTS * PDPT_SPAN;
+const _: () = assert!(VMAP_WINDOW_END <= KERNEL_VMAP_END);
 
-/// Boot-time setup: pre-allocate the vmap's intermediate page tables in the live PML4 so the
-/// kernel template captures them. One PDPT covers the first 512 GiB; crossing that boundary needs
-/// another added here, before any AS exists.
+/// The boot root: never freed, as the buddy takes only usable memory, which the bootloader's
+/// tables are not.
+static ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Never nested, and nothing allocates or frees under it; lock rank 6d.
+static VMAP: SpinLock<Vmap> = SpinLock::new(LockRank::KernelVmap, Vmap::new(KERNEL_VMAP_START, VMAP_WINDOW_END));
+
+struct Vmap {
+    next: u64,
+    end: u64,
+    free: Option<KBox<Slot>>,
+}
+
+/// A reusable range, allocated with it so that giving it back allocates nothing.
+struct Slot {
+    start: u64,
+    pages: u64,
+    next: Option<KBox<Slot>>,
+}
+
+impl Vmap {
+    const fn new(start: u64, end: u64) -> Self {
+        Self { next: start, end, free: None }
+    }
+
+    fn bump(&mut self, pages: u64) -> Result<u64, AllocError> {
+        let bytes = pages.checked_mul(PAGE_SIZE as u64).ok_or(AllocError)?;
+        let end = self.next.checked_add(bytes).ok_or(AllocError)?;
+        if end > self.end {
+            return Err(AllocError);
+        }
+        Ok(core::mem::replace(&mut self.next, end))
+    }
+
+    /// A range given back, or `spare` filled; an unused spare comes back, to be freed unlocked.
+    fn take(&mut self, mut spare: KBox<Slot>) -> (Result<KBox<Slot>, AllocError>, Option<KBox<Slot>>) {
+        if let Some(reused) = unlink(&mut self.free, spare.pages) {
+            return (Ok(reused), Some(spare));
+        }
+        match self.bump(spare.pages) {
+            Ok(start) => {
+                spare.start = start;
+                (Ok(spare), None)
+            }
+            Err(e) => (Err(e), Some(spare)),
+        }
+    }
+
+    /// Only once no CPU may hold a translation for `slot`.
+    fn give_back(&mut self, mut slot: KBox<Slot>) {
+        slot.next = self.free.take();
+        self.free = Some(slot);
+    }
+}
+
+fn unlink(mut list: &mut Option<KBox<Slot>>, pages: u64) -> Option<KBox<Slot>> {
+    loop {
+        match list {
+            None => return None,
+            Some(node) if node.pages == pages => break,
+            Some(node) => list = &mut node.next,
+        }
+    }
+    let mut node = list.take()?;
+    *list = node.next.take();
+    Some(node)
+}
+
+/// Link the window's PDPTs into `boot_root`, for the kernel template, and record the root.
 ///
 /// # Safety
+/// `boot_root` must be the live root, which is never freed.
 /// Must be called after `init_memory` (HHDM required to reach the
 /// PML4 frame) and **before** [`crate::arch::init_kernel_template`]
 /// (must influence the snapshot). The single CPU running boot code
 /// is the only mutator of the live PML4 at this point.
-pub unsafe fn init() {
-    let root = Paging::active_root();
-    // SAFETY: forwarded from this function's contract. Allocating a
-    // PDPT under the PML4 entry covering KERNEL_VMAP_START is sound
-    // because (a) no AS has been built yet, so there is no captured
-    // template to disagree with, and (b) the buddy allocator is up
-    // (precondition of this function).
-    unsafe {
-        Paging::ensure_kernel_intermediate(root, VirtAddr::new(KERNEL_VMAP_START))
-            .expect("kvmap PDPT pre-allocation failed at boot");
-    }
-}
-
-/// Reserve `n_pages` consecutive vmap pages; returns the page-aligned start. The range is
-/// **not mapped**: the caller installs PTEs or leaves guard pages absent. [`AllocError`] only if
-/// the bump pointer would overflow `KERNEL_VMAP_END`.
-pub fn vmap_alloc_pages(n_pages: u64) -> Result<VirtAddr, AllocError> {
-    let bytes = n_pages.checked_mul(PAGE_SIZE as u64).ok_or(AllocError)?;
-    let mut next = VMAP_NEXT.lock();
-    let start = *next;
-    let end = start.checked_add(bytes).ok_or(AllocError)?;
-    if end > KERNEL_VMAP_END {
-        return Err(AllocError);
-    }
-    *next = end;
-    Ok(VirtAddr::new(start))
-}
-
-/// Map `n_pages` of physical MMIO from `phys` into a fresh vmap range, **uncached** and writable.
-/// **Permanent** (VA is never reclaimed). `phys` should be page-aligned.
-///
-/// # Safety
-/// - `phys .. phys + n_pages*PAGE` must be a real device MMIO range safe to map
-///   uncached, owned by the caller for the kernel's lifetime.
-/// - Ring-0; mutates the active page tables. The vmap intermediate tables are
-///   shared kernel-half (see the module docs), so the mapping is visible to every
-///   address space.
-pub unsafe fn map_mmio(phys: PhysAddr, n_pages: u64) -> Result<VirtAddr, AllocError> {
-    let base = vmap_alloc_pages(n_pages)?;
-    let root = Paging::active_root();
-    let flags = PageFlags::WRITABLE | PageFlags::NO_CACHE;
-    for i in 0..n_pages {
-        let v = VirtAddr::new(base.as_u64() + i * PAGE_SIZE as u64);
-        let p = PhysAddr(phys.as_u64() + i * PAGE_SIZE as u64);
-        // SAFETY: `v` is a fresh vmap page; `p` is a caller-owned device frame
-        // mapped uncached; intermediates are the pre-allocated shared kernel PDPTs.
+pub unsafe fn init(boot_root: PhysAddr) {
+    for i in 0..WINDOW_PDPTS {
+        // SAFETY: forwarded from this function's contract; no AS exists to disagree.
         unsafe {
-            Paging::map_page(root, v, p, flags).map_err(|_| AllocError)?;
-            Paging::flush_tlb_page(v);
+            Paging::ensure_kernel_intermediate(boot_root, VirtAddr::new(KERNEL_VMAP_START + i * PDPT_SPAN))
+                .expect("kvmap PDPT pre-allocation failed at boot");
         }
     }
-    Ok(base)
+    ROOT.store(boot_root.as_u64(), Ordering::Release);
 }
 
-/// Point one already-reserved vmap page at the MMIO frame `phys`, **uncached** and writable,
-/// flushing the stale TLB entry: for a reusable scan window reserved once with
-/// [`vmap_alloc_pages`]. `phys` must be page-aligned; the previous mapping of `virt` is dropped.
+fn root() -> PhysAddr {
+    let root = ROOT.load(Ordering::Acquire);
+    debug_assert_ne!(root, 0, "kvmap used before kvmap::init");
+    PhysAddr::new(root)
+}
+
+fn page(base: u64, i: u64) -> VirtAddr {
+    VirtAddr::new(base + i * PAGE_SIZE as u64)
+}
+
+/// Map `frames` from `base`, all or none.
 ///
 /// # Safety
-/// - `virt` must be a page handed out by [`vmap_alloc_pages`] that the caller
-///   owns and is not concurrently using under another physical frame.
-/// - `phys` must be a real MMIO frame safe to map uncached (a device window).
-/// - Ring-0; mutates the active page tables. The vmap intermediate tables are
-///   shared kernel-half (see the module docs), so the change is visible to every
-///   address space.
-pub unsafe fn remap_mmio_page(virt: VirtAddr, phys: PhysAddr) -> Result<(), AllocError> {
-    let root = Paging::active_root();
-    // SAFETY: `virt` is a caller-owned vmap page in the shared kernel half.
-    let _ = unsafe { Paging::unmap_page(root, virt) };
-    let flags = PageFlags::WRITABLE | PageFlags::NO_CACHE;
-    // SAFETY: fresh leaf for a caller-owned vmap page; `phys` is a device frame
-    // mapped uncached; intermediates are the pre-allocated shared kernel PDPTs.
-    unsafe {
-        Paging::map_page(root, virt, phys, flags).map_err(|_| AllocError)?;
-        Paging::flush_tlb_page(virt);
+/// `[base, base + frames.len() pages)` is vmap VA the caller owns, unmapped, and each frame is
+/// safe to map with `flags`.
+unsafe fn map_all(base: u64, frames: impl Iterator<Item = PhysAddr>, flags: PageFlags) -> Result<(), AllocError> {
+    for (mapped, phys) in (0..).zip(frames) {
+        // SAFETY: forwarded; the window's PDPTs are linked, so only shared PDs and PTs are made.
+        if unsafe { Paging::map_page(root(), page(base, mapped), phys, flags) }.is_err() {
+            // SAFETY: the pages just mapped, which nothing has seen.
+            unsafe { unmap_all(base, mapped) };
+            return Err(AllocError);
+        }
     }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// # Safety
+/// The range is vmap VA the caller owns and nothing uses from here on.
+unsafe fn unmap_all(base: u64, pages: u64) {
+    for i in 0..pages {
+        // SAFETY: forwarded from this function's contract.
+        let _ = unsafe { Paging::unmap_page(root(), page(base, i)) };
+    }
+    crate::tlb::shootdown_all();
+}
 
-    #[test]
-    fn allocations_are_page_aligned_and_in_vmap_region() {
-        let v = vmap_alloc_pages(1).unwrap();
-        assert!(v.is_page_aligned(), "vmap allocation not page-aligned");
-        assert!(v.as_u64() >= KERNEL_VMAP_START, "vmap allocation below region: {:#x}", v.as_u64());
-        assert!(v.as_u64() < KERNEL_VMAP_END, "vmap allocation past region: {:#x}", v.as_u64());
+/// Map `n_pages` of device memory from `phys` with `flags`, **permanently**.
+///
+/// # Safety
+/// `phys .. phys + n_pages pages` must be a real device range safe to map with `flags`, owned by
+/// the caller for as long as the mapping is used.
+pub unsafe fn map_device(phys: PhysAddr, n_pages: u64, flags: PageFlags) -> Result<VirtAddr, AllocError> {
+    let base = VMAP.lock().bump(n_pages)?;
+    let frames = (0..n_pages).map(|i| PhysAddr::new(phys.as_u64() + i * PAGE_SIZE as u64));
+    // SAFETY: fresh VA; the frames are the caller's device range, per the contract.
+    unsafe { map_all(base, frames, flags)? };
+    Ok(VirtAddr::new(base))
+}
+
+/// [`map_device`], **uncached** and writable: an MMIO window.
+///
+/// # Safety
+/// As [`map_device`].
+pub unsafe fn map_mmio(phys: PhysAddr, n_pages: u64) -> Result<VirtAddr, AllocError> {
+    // SAFETY: forwarded.
+    unsafe { map_device(phys, n_pages, PageFlags::WRITABLE | PageFlags::NO_CACHE) }
+}
+
+/// Undo [`map_device`]: clear the mapping and invalidate it on every CPU. The VA is not reused.
+///
+/// # Safety
+/// `base .. base + n_pages pages` must be a mapping [`map_device`] returned, unused from here on.
+pub unsafe fn unmap_device(base: VirtAddr, n_pages: u64) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { unmap_all(base.as_u64(), n_pages) };
+}
+
+/// One vmap page pointed at device frames in turn, uncached: a scan window.
+pub struct MmioWindow {
+    va: VirtAddr,
+    mapped: bool,
+}
+
+impl MmioWindow {
+    /// Reserve the page, mapped to nothing yet.
+    pub fn new() -> Result<Self, AllocError> {
+        Ok(Self { va: VirtAddr::new(VMAP.lock().bump(1)?), mapped: false })
     }
 
-    #[test]
-    fn back_to_back_allocations_advance_by_at_least_request_size() {
-        let pages = 4u64;
-        let a = vmap_alloc_pages(pages).unwrap();
-        let b = vmap_alloc_pages(1).unwrap();
-        assert!(
-            b.as_u64() >= a.as_u64() + pages * PAGE_SIZE as u64,
-            "second allocation overlaps first: a={:#x}, b={:#x}",
-            a.as_u64(),
-            b.as_u64()
-        );
+    /// Where the window reads.
+    pub fn va(&self) -> VirtAddr {
+        self.va
     }
 
-    #[test]
-    fn distinct_calls_return_distinct_addresses() {
-        let a = vmap_alloc_pages(1).unwrap();
-        let b = vmap_alloc_pages(1).unwrap();
-        assert_ne!(a, b);
+    /// Point the window at the device frame `phys`, invalidating the old translation on every CPU.
+    ///
+    /// # Safety
+    /// `phys` must be a real MMIO frame safe to map uncached, and nothing may use the window's
+    /// previous frame through it from here on.
+    pub unsafe fn repoint(&mut self, phys: PhysAddr) -> Result<(), AllocError> {
+        if core::mem::take(&mut self.mapped) {
+            // SAFETY: the window's own page, mapped by the previous repoint.
+            let _ = unsafe { Paging::unmap_page(root(), self.va) };
+            crate::tlb::shootdown_page(self.va);
+        }
+        // SAFETY: the window's own page, unmapped; `phys` is a device frame, per the contract.
+        unsafe { map_all(self.va.as_u64(), core::iter::once(phys), PageFlags::WRITABLE | PageFlags::NO_CACHE)? };
+        self.mapped = true;
+        Ok(())
     }
 }
+
+/// `N` frames of the kernel's own, mapped into the vmap above `guard` unmapped pages. Dropping it
+/// clears the mapping, invalidates it on every CPU, then frees the frames and gives the VA back.
+pub struct VmapFrames<const N: usize> {
+    base: VirtAddr,
+    frames: [PhysAddr; N],
+    slot: Option<KBox<Slot>>,
+}
+
+impl<const N: usize> VmapFrames<N> {
+    /// Allocate `N` frames and map them with `flags` above `guard` unmapped pages.
+    pub fn new(flags: PageFlags, guard: u64) -> Result<Self, AllocError> {
+        let spare = KBox::try_new(Slot { start: 0, pages: guard + N as u64, next: None })?;
+        let (slot, unused) = VMAP.lock().take(spare);
+        drop(unused);
+        let slot = slot?;
+        let base = VirtAddr::new(slot.start + guard * PAGE_SIZE as u64);
+        let mut frames = [PhysAddr::new(0); N];
+        for i in 0..N {
+            match heap::buddy_alloc(0) {
+                Some(f) => frames[i] = f,
+                None => {
+                    frames[..i].iter().for_each(|&f| heap::buddy_free(f, 0));
+                    VMAP.lock().give_back(slot);
+                    return Err(AllocError);
+                }
+            }
+        }
+        // SAFETY: the slot's VA is this range's alone, fresh or given back after its shootdown.
+        if unsafe { map_all(base.as_u64(), frames.iter().copied(), flags) }.is_err() {
+            frames.iter().for_each(|&f| heap::buddy_free(f, 0));
+            VMAP.lock().give_back(slot);
+            return Err(AllocError);
+        }
+        Ok(Self { base, frames, slot: Some(slot) })
+    }
+
+    /// The first mapped byte; the guard pages are below it.
+    pub fn base(&self) -> VirtAddr {
+        self.base
+    }
+
+    /// One past the last mapped byte.
+    pub fn end(&self) -> VirtAddr {
+        page(self.base.as_u64(), N as u64)
+    }
+}
+
+impl<const N: usize> Drop for VmapFrames<N> {
+    fn drop(&mut self) {
+        // SAFETY: this range's own mapping, which its owner uses no longer.
+        unsafe { unmap_all(self.base.as_u64(), N as u64) };
+        self.frames.iter().for_each(|&f| heap::buddy_free(f, 0));
+        if let Some(slot) = self.slot.take() {
+            VMAP.lock().give_back(slot);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

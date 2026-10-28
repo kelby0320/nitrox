@@ -6,7 +6,7 @@ use std::sync::Once;
 use crate::arch::Paging;
 use crate::arch::paging::ArchPaging;
 use crate::limine::{MEMMAP_USABLE, MemoryMapEntry, MemoryMapResponse};
-use crate::mm::{PAGE_SIZE, PhysAddr, heap, slab};
+use crate::mm::{PAGE_SIZE, heap, slab};
 
 static HEAP_INIT: Once = Once::new();
 
@@ -35,16 +35,16 @@ pub fn init_global_heap() {
         unsafe { heap::init_buddy(response, 0) };
         slab::slab_init();
 
-        // All-zero template so `AddressSpace::new`'s `inherit_kernel_mappings` does not panic; the
-        // 8 KiB allocation guarantees a page-aligned base.
-        let template_backing: &'static mut [u8] = vec![0u8; 2 * PAGE_SIZE].leak();
-        let raw = template_backing.as_mut_ptr() as usize;
-        let aligned = (raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        // SAFETY: `aligned` points at a leaked, zeroed, page-aligned
-        // 4 KiB region. Under the test HHDM offset of 0, the
-        // physical address equals the host virtual address, so
-        // `init_kernel_template` can read 256 entries from it
-        // through HHDM (which is a no-op offset).
-        unsafe { Paging::init_kernel_template(PhysAddr::new(aligned as u64)) };
+        // A boot root holding the vmap's window, as `paging_init` builds it, so every
+        // `AddressSpace::new` shares the window as at boot.
+        let boot_root = heap::buddy_alloc(0).expect("a frame for the test boot root");
+        // SAFETY: a fresh, unaliased frame, reachable at its own address under the test HHDM
+        // offset of 0. Zeroed, it is an empty PML4; `kvmap::init` links the window into it before
+        // the template is captured, and it is never freed.
+        unsafe {
+            core::ptr::write_bytes(boot_root.as_u64() as *mut u8, 0, PAGE_SIZE);
+            crate::mm::kvmap::init(boot_root);
+            Paging::init_kernel_template(boot_root);
+        }
     });
 }

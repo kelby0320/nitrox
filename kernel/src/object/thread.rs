@@ -16,7 +16,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crate::arch::paging::ArchPaging;
 use crate::arch::{ArchFpuState, ArchThreadContext, fabricate_frame, thread_trampoline};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
@@ -271,7 +270,7 @@ impl Thread {
         entry: ThreadEntry,
         arg: usize,
     ) -> Result<KBox<Self>, AllocError> {
-        let stack = KernelStack::new(crate::arch::Paging::active_root())?;
+        let stack = KernelStack::new()?;
         let top = stack.top().as_u64();
         // SAFETY: a freshly allocated `KernelStack` has its top
         // `KERNEL_STACK_PAGES` pages mapped writable in the shared kernel
@@ -331,7 +330,7 @@ impl Thread {
             let root = unsafe { (*p).address_space_root() }.expect("user process must have an address space");
             (pid, root)
         };
-        let stack = KernelStack::new(root)?;
+        let stack = KernelStack::new()?;
         let top = stack.top().as_u64();
         // SAFETY: as `try_new_runnable` — a fresh KernelStack top has the
         // seven fabricated-frame slots writable; `top` is page-aligned.

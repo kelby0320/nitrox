@@ -44,7 +44,7 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
-| 6d   | Kernel vmap bump pointer (`VMAP_NEXT`)       | live as of Phase 1 slice 5 (item 6)      |
+| 6d   | Kernel vmap (`VMAP`)                         | live as of Phase 1 slice 5 (item 6)      |
 | 7    | Serial port (`SERIAL`, **`IrqSpinLock`**)    | live as of Phase 1 slice 4 (diagnostics) |
 | 7.5  | Kernel log ring (`KLOG`, **`IrqSpinLock`**)  | live as of Phase 2; **below `SERIAL`** — it is teed from inside the serial `write_str`, so `SERIAL` is held when it is taken. (Its `try_lock` is for a different hazard: re-entry from a fault that strikes mid-push.) |
 | 7.6  | Framebuffer console (`fbcon::CONSOLE`, **`IrqSpinLock`**) | live as of Phase 5 Part B; **below `KLOG`** — teed from the same `write_str` (and from `sys_kprint`) with `SERIAL` held, after `KLOG` is released. Taken with a bounded `try_lock` for the fault path's sake, and a CPU already inside it returns at once rather than waiting for itself — see `kernel/src/fbcon/mod.rs` § Locking |
@@ -363,14 +363,15 @@ ordering remains slab → buddy and the lower lock cannot block waiting
 for the upper. If a future change makes the buddy depend on the slab,
 that closes the cycle and must be rejected at design review.
 
-## Kernel vmap bump pointer is a leaf
+## The kernel vmap is a leaf
 
-`VMAP_NEXT` (`kernel/src/mm/kvmap.rs`) is a `SpinLock<u64>` holding
-the next free virtual address in the kernel vmap region. Acquired
-briefly per allocation in `vmap_alloc_pages`; no other lock is taken
-inside, no other lock is held outside it during the acquire. Rank 6d
-keeps it grouped with the other constant-time leaves; like them, it
-may be acquired while holding any lock at rank 1–5.
+`VMAP` (`kernel/src/mm/kvmap.rs`) is a `SpinLock` holding the vmap's
+cursor and the ranges given back. Acquired briefly to hand out or give
+back a range; no other lock is taken inside, and nothing allocates or
+frees under it: a reusable range's node is allocated before the lock and
+an unused spare freed after. Rank 6d keeps it grouped with the other
+constant-time leaves; like them, it may be acquired while holding any
+lock at rank 1–5.
 
 ## Kernel-half PML4 template is a leaf
 

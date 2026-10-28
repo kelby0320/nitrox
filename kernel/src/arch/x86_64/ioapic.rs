@@ -11,11 +11,9 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::Cpu;
-use crate::arch::Paging;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::irq::ArchIrq;
 use crate::arch::irq_router::{ArchIrqRouter, Polarity, TriggerMode};
-use crate::arch::paging::{ArchPaging, PageFlags};
 use crate::arch::timer::ArchTimer;
 use crate::arch::x86_64::{acpi, idt, regs};
 use crate::libkern::AllocError;
@@ -176,13 +174,8 @@ impl ArchIrqRouter for X86IoApic {
             }
         };
 
-        // Map the IOAPIC register page uncached into the shared kernel vmap.
-        let va = kvmap::vmap_alloc_pages(1)?;
-        let flags = PageFlags::WRITABLE | PageFlags::NO_CACHE;
-        // SAFETY: `va` is a fresh kernel-vmap page; `io.addr` is the IOAPIC MMIO
-        // frame from the MADT; mapping into the boot root is visible from every
-        // address space (shared kernel-half PDPTs).
-        unsafe { Paging::map_page(Paging::active_root(), va, io.addr, flags) }.map_err(|_| AllocError)?;
+        // SAFETY: `io.addr` is the IOAPIC's MMIO frame from the MADT, the kernel's for good.
+        let va = unsafe { kvmap::map_mmio(io.addr, 1) }?;
         IOAPIC_BASE.store(va.as_u64(), Ordering::Relaxed);
         IOAPIC_GSI_BASE.store(io.gsi_base, Ordering::Relaxed);
 

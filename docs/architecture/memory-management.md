@@ -436,46 +436,41 @@ per-CPU data and driver MMIO — live in the kernel vmap region
 (`0xFFFF_C000_0000_0000..0xFFFF_D000_0000_0000`, 16 TiB per the
 [architecture overview](overview.md)). Two pieces split the work:
 
-[`mm/kvmap.rs`](../../kernel/src/mm/kvmap.rs) is a bump-pointer
-allocator that hands out virtual address ranges in the vmap region.
-`vmap_alloc_pages(n)` returns a page-aligned virtual address and
-advances the cursor; no freelist. 16 TiB is enough that the lack of
-reuse doesn't matter for Phase 1.
+[`mm/kvmap.rs`](../../kernel/src/mm/kvmap.rs) owns the vmap's **window**:
+the first 512 GiB of the region, the part whose PDPT `mm::kvmap::init`
+links at boot, **before** `init_kernel_template`, through
+`ArchPaging::ensure_kernel_intermediate`. The
+[shared-kernel-half rule](#kernel-half-pml4-sharing) does the rest: the
+captured template includes the PDPT pointer, every future AS inherits it,
+and later leaf edits change the shared sub-tree every AS sees. kvmap hands
+out VA only inside the window, so no mapping ever needs a PDPT of its own,
+which would be linked into one root alone. It edits the tables through the
+boot root `init` recorded, never which root happens to be loaded or a
+caller's: Limine's PML4, which is never freed, as the buddy takes only
+usable memory.
 
-`mm::kvmap::init` runs at boot **before** `init_kernel_template`. It
-calls `ArchPaging::ensure_kernel_intermediate` to pre-allocate the
-PDPT under the PML4 entry covering the vmap region (one PDPT covers
-512 GiB — well past anything Phase 1 will use). The
-[shared-kernel-half rule](#kernel-half-pml4-sharing) does the rest:
-the captured template includes the PDPT pointer, every future AS
-inherits it, and post-boot leaf installs into vmap modify the shared
-sub-tree visible to every AS without any cross-AS coordination.
+Its VA comes from a cursor over the window, and from ranges given back:
 
-[`mm/kstack.rs`](../../kernel/src/mm/kstack.rs) is the first
-consumer. `KernelStack::new(root)` reserves `KERNEL_STACK_PAGES + 1`
-virtual pages in vmap (16 KiB stack + 1 guard page), allocates frames
-for the top `KERNEL_STACK_PAGES`, installs them writable / NX /
-kernel-only via `ArchPaging::map_page`. The bottom page is the guard
-— deliberately left absent so a stack-overflow write to it
-page-faults rather than silently corrupting whatever sits below.
+- **A [`VmapFrames<N>`](../../kernel/src/mm/kvmap.rs)** is `N` frames of
+  the kernel's own mapped above some unmapped guard pages. Dropping it
+  clears the mapping, shoots it down on every CPU, frees the frames and
+  gives its VA back, for the next range of its size. Each reusable range
+  carries a node allocated with it, so giving it back allocates nothing
+  under the vmap's lock.
+- **Device mappings** (`map_mmio`, `map_device`) are permanent: their VA
+  is never given back. `unmap_device` clears one and shoots it down.
+- **An `MmioWindow`** is one page repointed at device frames in turn (the
+  PCI scan's), and each repoint shoots down the page's old translation.
 
-- **`root` is which AS to install through.** Because the PDPT is
-  shared across every AS, the PTEs end up visible to all of them
-  regardless of which `root` is passed; the parameter is stored so
-  `Drop` can clear the PTEs symmetrically and to make the
-  ownership explicit.
-- **Drop reclaims frames but not vmap.** The bump allocator has no
-  freelist, so the virtual range of a freed stack stays reserved.
-  Phase 1 kernel stacks are constructed once per thread and freed
-  at thread exit; churn is negligible. A vmap freelist is a local
-  addition if that ever changes.
-- **No production consumer today.** Threading lands in a later
-  slice; `KernelStack` is built now because the underlying
-  infrastructure (the vmap allocator + the guard-page discipline)
-  belongs with the memory subsystem rather than dragging into the
-  threading slice.
+[`mm/kstack.rs`](../../kernel/src/mm/kstack.rs) builds each thread's
+kernel stack as a `VmapFrames` of `KERNEL_STACK_PAGES` above one guard
+page: 16 KiB writable / NX / kernel-only, the guard deliberately left
+absent so a stack-overflow write page-faults rather than silently
+corrupting whatever sits below. A stack walks no root of its own, so it
+may outlive the address space it was made under, and a freed stack's VA
+is reused by the next.
 
-`VMAP_NEXT` sits at lock rank 6d alongside the allocator leaves.
+`VMAP` sits at lock rank 6d alongside the allocator leaves.
 
 ## ELF loader
 
@@ -624,12 +619,11 @@ management story.
 - No TLB flushing on map / unmap. No AS is "active" today, so the
   TLB doesn't cache its entries. The scheduler will own flushing
   once `AddressSpace::set_active` exists.
-- Kernel vmap PDPT pre-allocation covers only the first 512 GiB of
-  the 16 TiB vmap region. If a future allocation crosses that
-  boundary, the additional PDPTs must be added to the live PML4
-  *before* `init_kernel_template` snapshot — i.e., at boot. The
-  immutable-post-boot rule for kernel-half PML4 entries makes
-  late additions impossible without visiting every AS.
+- The kernel vmap hands out VA only in its window, the first 512 GiB
+  of the 16 TiB region. Growing it means linking more PDPTs into the
+  live PML4 *before* the `init_kernel_template` snapshot, at boot
+  (`WINDOW_PDPTS`): the immutable-post-boot rule for kernel-half PML4
+  entries makes late additions impossible without visiting every AS.
 - Kernel vmap allocator has no freelist; `KernelStack::Drop`
   reclaims frames but leaks the vmap region. Negligible at Phase 1
   churn; revisit if it ever isn't.

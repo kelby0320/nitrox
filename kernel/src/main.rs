@@ -761,22 +761,12 @@ fn plain_mapping(
     caching: nitrox_kernel::mm::Caching,
 ) -> Option<nitrox_kernel::mm::VirtAddr> {
     use nitrox_kernel::mm::vmm::Protection;
-    use nitrox_kernel::mm::{PhysAddr, VirtAddr, addr_space, kvmap};
+    use nitrox_kernel::mm::{addr_space, kvmap};
     // The flags come from the function that gives them to `/dev/framebuffer`, not a second copy.
     let flags = addr_space::page_flags_for(Protection::WRITE, caching);
-    let base = kvmap::vmap_alloc_pages(pages).ok()?;
-    let root = arch::Paging::active_root();
-    for i in 0..pages {
-        let v = VirtAddr::new(base.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
-        let p = PhysAddr::new(phys.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
-        // SAFETY: `v` is a fresh vmap page in the shared kernel half; `p` is a frame of the
-        // framebuffer aperture this kernel already maps; the flags are the ones a user mapping of
-        // it gets.
-        unsafe { arch::Paging::map_page(root, v, p, flags).ok()? };
-        // SAFETY: `v`'s entry has just changed.
-        unsafe { arch::Paging::flush_tlb_page(v) };
-    }
-    Some(base)
+    // SAFETY: `phys .. + pages` is the framebuffer aperture this kernel already maps; the flags
+    // are the ones a user mapping of it gets.
+    unsafe { kvmap::map_device(phys, pages, flags) }.ok()
 }
 
 /// Undo [`plain_mapping`].
@@ -784,16 +774,8 @@ fn plain_mapping(
 /// # Safety
 /// `base .. base + pages` must be the mapping [`plain_mapping`] returned, unused from here on.
 unsafe fn unmap_plain(base: nitrox_kernel::mm::VirtAddr, pages: u64) {
-    use nitrox_kernel::mm::VirtAddr;
-    let root = arch::Paging::active_root();
-    for i in 0..pages {
-        let v = VirtAddr::new(base.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
-        // SAFETY: forwarded from this function's contract.
-        unsafe {
-            let _ = arch::Paging::unmap_page(root, v);
-            arch::Paging::flush_tlb_page(v);
-        }
-    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe { nitrox_kernel::mm::kvmap::unmap_device(base, pages) };
 }
 
 /// Arm the syscall fast path, then load and launch **init** from the initramfs (`/sbin/init`) as
@@ -1178,7 +1160,7 @@ fn paging_init() {
     // allocator is live; no AS exists yet whose captured template
     // could disagree with the new PML4 entries.
     unsafe {
-        mm::kvmap::init();
+        mm::kvmap::init(arch::Paging::active_root());
         arch::Paging::init_kernel_template(arch::Paging::active_root());
     }
 }

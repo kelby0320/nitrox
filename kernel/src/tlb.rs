@@ -73,7 +73,6 @@ pub fn shootdown_page(va: VirtAddr) {
 
 /// Invalidate **all** non-global translations on this CPU and every other online
 /// CPU (a CR3 reload per CPU). For edits that touch many pages at once.
-#[allow(dead_code, reason = "for broad invalidations to come, such as an address space's teardown")]
 pub fn shootdown_all() {
     shootdown(None);
 }
@@ -93,6 +92,8 @@ unsafe fn invalidate_local(va: Option<VirtAddr>) {
 }
 
 fn shootdown(va: Option<VirtAddr>) {
+    #[cfg(test)]
+    SHOT.with(|s| s.set((s.get().0 + 1, crate::mm::heap::frames_freed_by_this_thread())));
     let me = Smp::current_cpu() as usize;
     let online = crate::sched::online_mask();
 
@@ -157,6 +158,18 @@ fn shootdown(va: Option<VirtAddr>) {
     unsafe { Cpu::interrupts_restore(prev_if) };
     // Re-enable preemption last; a reschedule latched during the window is replayed here.
     crate::sched::preempt_enable();
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SHOT: core::cell::Cell<(usize, usize)> = const { core::cell::Cell::new((0, 0)) };
+}
+
+/// This thread's shootdowns, and the frames it had freed at the last: a test of "shot down before
+/// freed" compares the second with `heap::frames_freed_by_this_thread` before the frees.
+#[cfg(test)]
+pub fn shootdowns_by_this_thread() -> (usize, usize) {
+    SHOT.with(core::cell::Cell::get)
 }
 
 /// Whether the initiator may stop waiting: every target has either acknowledged or left the online

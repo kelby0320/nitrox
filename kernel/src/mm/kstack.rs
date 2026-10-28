@@ -4,14 +4,12 @@
 //! bottom plus `KERNEL_STACK_PAGES` writable / NX / kernel-only pages above, so an overflow faults
 //! loudly instead of corrupting whatever sits below.
 //!
-//! `Drop` unmaps the PTEs and returns the frames to the buddy; the vmap range is **not**
-//! released (the bump allocator has no freelist).
+//! The pages are a [`VmapFrames`]: dropping one shoots it down, frees it and reuses its VA.
 
-use crate::arch::Paging;
-use crate::arch::paging::{ArchPaging, PageFlags};
+use crate::arch::paging::PageFlags;
 use crate::libkern::AllocError;
-use crate::mm::kvmap;
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
+use crate::mm::kvmap::VmapFrames;
+use crate::mm::{PAGE_SIZE, VirtAddr};
 
 /// Pages of usable stack space per kernel stack (16 KiB total).
 pub const KERNEL_STACK_PAGES: usize = 4;
@@ -20,75 +18,18 @@ pub const KERNEL_STACK_BYTES: u64 = (KERNEL_STACK_PAGES as u64) * (PAGE_SIZE as 
 
 /// A per-thread kernel stack: `KERNEL_STACK_PAGES` of mapped, writable, non-executable,
 /// kernel-only vmap memory above one unmapped guard page.
-///
-/// Construction takes the page-table `root` to install into; the shared vmap PDPT makes the PTEs
-/// visible to every address space, and `root` is kept for `Drop`.
 pub struct KernelStack {
-    /// Exclusive top of the stack: the initial RSP. The stack grows down from here.
-    top: VirtAddr,
-    base: VirtAddr,
-    frames: [PhysAddr; KERNEL_STACK_PAGES],
-    root: PhysAddr,
+    pages: VmapFrames<KERNEL_STACK_PAGES>,
 }
 
 impl KernelStack {
     /// Allocate a kernel stack: `KERNEL_STACK_PAGES + 1` vmap pages, frames for the top
     /// `KERNEL_STACK_PAGES`, the bottom page left unmapped as the guard. [`AllocError`] if the
     /// vmap, the buddy or page-table-frame allocation fails; a partial failure is rolled back.
-    pub fn new(root: PhysAddr) -> Result<Self, AllocError> {
-        let guard_base = kvmap::vmap_alloc_pages(KERNEL_STACK_PAGES as u64 + 1)?;
-        let base = VirtAddr::new(guard_base.as_u64() + PAGE_SIZE as u64);
-        let top = VirtAddr::new(base.as_u64() + KERNEL_STACK_BYTES);
-
-        let mut frames = [PhysAddr::new(0); KERNEL_STACK_PAGES];
-        let mut allocated_frames = 0usize;
-        for slot in &mut frames {
-            match heap::buddy_alloc(0) {
-                Some(phys) => {
-                    *slot = phys;
-                    allocated_frames += 1;
-                }
-                None => {
-                    for &f in &frames[..allocated_frames] {
-                        heap::buddy_free(f, 0);
-                    }
-                    return Err(AllocError);
-                }
-            }
-        }
-
-        // Install PTEs; on failure (out of intermediate page-table frames) unmap and free all.
-        let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
-        let mut installed = 0usize;
-        for i in 0..KERNEL_STACK_PAGES {
-            let virt = VirtAddr::new(base.as_u64() + (i as u64) * (PAGE_SIZE as u64));
-            // SAFETY: `root` is a valid PML4 owned by the caller; the
-            // vmap region's PDPT was pre-allocated at boot (see
-            // `kvmap::init`), so the PTE walk will only allocate PD /
-            // PT frames — those modifications hang off the shared
-            // PDPT and are visible to every AS.
-            let r = unsafe { Paging::map_page(root, virt, frames[i], flags) };
-            match r {
-                Ok(()) => installed += 1,
-                Err(_) => {
-                    for j in 0..installed {
-                        let v = VirtAddr::new(base.as_u64() + (j as u64) * (PAGE_SIZE as u64));
-                        // SAFETY: we just installed this PTE; unmap
-                        // returns the frame we mapped.
-                        let _ = unsafe { Paging::unmap_page(root, v) };
-                    }
-                    for f in &frames {
-                        heap::buddy_free(*f, 0);
-                    }
-                    return Err(AllocError);
-                }
-            }
-        }
-
+    pub fn new() -> Result<Self, AllocError> {
+        let pages = VmapFrames::new(PageFlags::WRITABLE | PageFlags::NO_EXECUTE, 1)?;
         // No shootdown on *install*: a not-present to present change needs no cross-CPU
-        // invalidation on x86. The vmap VA is freshly allocated (the bump allocator **never
-        // reclaims VA**, so no CPU holds a cached translation for it), and the PD/PT hang off the
-        // shared vmap hierarchy every address space sees.
+        // invalidation on x86, and the VA is fresh or was shot down when its last stack dropped.
         // Re-checked against the open intermittent `#DF` (`TODO(unexplained-df)`): it stands.
 
         // Paint the fresh stack so its high-water mark is measurable later (see `watermark`).
@@ -96,25 +37,25 @@ impl KernelStack {
         // SAFETY: the whole `[base, top)` range was just mapped writable above, and no
         // thread runs on this stack until the caller installs it.
         unsafe {
-            watermark::paint(base, KERNEL_STACK_BYTES);
+            watermark::paint(pages.base(), KERNEL_STACK_BYTES);
         }
 
-        Ok(KernelStack { top, base, frames, root })
+        Ok(KernelStack { pages })
     }
 
     /// Exclusive top of the stack: the RSP to load for its thread.
     pub fn top(&self) -> VirtAddr {
-        self.top
+        self.pages.end()
     }
 
     /// Inclusive base of the mapped region; the guard page below it is unmapped.
     pub fn base(&self) -> VirtAddr {
-        self.base
+        self.pages.base()
     }
 
     /// Base of the guard page; any access to it page-faults.
     pub fn guard_page(&self) -> VirtAddr {
-        VirtAddr::new(self.base.as_u64() - PAGE_SIZE as u64)
+        VirtAddr::new(self.base().as_u64() - PAGE_SIZE as u64)
     }
 }
 
@@ -187,99 +128,5 @@ pub mod watermark {
     }
 }
 
-impl Drop for KernelStack {
-    fn drop(&mut self) {
-        // Clear the PTEs first; the frames are freed only after the shootdown.
-        for i in 0..KERNEL_STACK_PAGES {
-            let virt = VirtAddr::new(self.base.as_u64() + (i as u64) * (PAGE_SIZE as u64));
-            // SAFETY: every page was mapped by `new` and lives in the
-            // shared kernel vmap; unmap reverses the install.
-            let _ = unsafe { Paging::unmap_page(self.root, virt) };
-        }
-        // Publish the cleared mappings to every CPU before the frames return to the allocator:
-        // the vmap is shared, so another CPU may still cache a translation, and would otherwise
-        // touch memory that now belongs to someone else.
-        crate::tlb::shootdown_all();
-        for i in 0..KERNEL_STACK_PAGES {
-            heap::buddy_free(self.frames[i], 0);
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::arch::Paging;
-    use crate::arch::paging::ArchPaging;
-    use crate::mm::addr_space::AddressSpace;
-    use crate::mm::test_support::init_global_heap;
-
-    #[test]
-    fn new_installs_stack_pages_and_leaves_guard_unmapped() {
-        init_global_heap();
-        let asp = AddressSpace::new().unwrap();
-        let stack = KernelStack::new(asp.root()).unwrap();
-
-        for i in 0..KERNEL_STACK_PAGES as u64 {
-            let v = VirtAddr::new(stack.base.as_u64() + i * PAGE_SIZE as u64);
-            // SAFETY: read-only walk against the AS we just mapped into.
-            let p = unsafe { Paging::translate(asp.root(), v) };
-            assert!(p.is_some(), "stack page {i} not mapped");
-        }
-        // SAFETY: read-only walk.
-        let guard = unsafe { Paging::translate(asp.root(), stack.guard_page()) };
-        assert!(guard.is_none(), "guard page must be unmapped");
-        // SAFETY: read-only walk.
-        let above = unsafe { Paging::translate(asp.root(), stack.top) };
-        assert!(above.is_none(), "page at top should be unmapped");
-    }
-
-    #[test]
-    fn top_is_base_plus_stack_bytes() {
-        init_global_heap();
-        let asp = AddressSpace::new().unwrap();
-        let stack = KernelStack::new(asp.root()).unwrap();
-        assert_eq!(stack.top.as_u64() - stack.base.as_u64(), KERNEL_STACK_BYTES);
-    }
-
-    #[test]
-    fn guard_page_is_one_page_below_base() {
-        init_global_heap();
-        let asp = AddressSpace::new().unwrap();
-        let stack = KernelStack::new(asp.root()).unwrap();
-        assert_eq!(stack.base.as_u64() - stack.guard_page().as_u64(), PAGE_SIZE as u64);
-    }
-
-    #[test]
-    fn multiple_stacks_have_disjoint_ranges() {
-        init_global_heap();
-        let asp = AddressSpace::new().unwrap();
-        let s1 = KernelStack::new(asp.root()).unwrap();
-        let s2 = KernelStack::new(asp.root()).unwrap();
-        let (lo, hi) = if s1.base.as_u64() < s2.base.as_u64() { (&s1, &s2) } else { (&s2, &s1) };
-        assert!(
-            lo.top.as_u64() <= hi.guard_page().as_u64(),
-            "stacks overlap: lo.top={:#x}, hi.guard={:#x}",
-            lo.top.as_u64(),
-            hi.guard_page().as_u64()
-        );
-    }
-
-    #[test]
-    fn drop_unmaps_stack_pages() {
-        init_global_heap();
-        let asp = AddressSpace::new().unwrap();
-        let base = {
-            let stack = KernelStack::new(asp.root()).unwrap();
-            // SAFETY: read-only walk.
-            assert!(
-                // SAFETY: `asp`'s root is the live page table this test built.
-                unsafe { Paging::translate(asp.root(), stack.base) }.is_some(),
-                "stack base must be mapped before drop"
-            );
-            stack.base
-        }; // stack dropped here
-        // SAFETY: read-only walk against the now-cleared mapping.
-        assert!(unsafe { Paging::translate(asp.root(), base) }.is_none(), "stack base must be unmapped after drop");
-    }
-}
+mod tests;

@@ -91,7 +91,7 @@ pub enum LockRank {
     Buddy = 62,
     /// Rank 6c — the kernel-half PML4 template.
     KernelPmlTemplate = 64,
-    /// Rank 6d — the kernel vmap bump pointer.
+    /// Rank 6d — the kernel vmap.
     KernelVmap = 66,
     /// Rank 7 — the serial port.
     Serial = 70,

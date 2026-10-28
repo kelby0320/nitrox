@@ -5,15 +5,15 @@
 //! not done. See `docs/spec/device-node.md` and `docs/architecture/drivers-and-irps.md`.
 //!
 //! Each function's 4 KiB config space is at
-//! `region.base + ((bus - bus_start) << 20 | dev << 15 | func << 12)`. The vmap allocator never
-//! reclaims VA, so enumeration reserves **one** vmap page and repoints it per function with
-//! [`kvmap::remap_mmio_page`].
+//! `region.base + ((bus - bus_start) << 20 | dev << 15 | func << 12)`. Enumeration reserves **one**
+//! vmap page, a [`MmioWindow`], and repoints it per function.
 
 use crate::arch::Platform;
 use crate::arch::platform::{ArchPlatform, EcamRegion};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec};
-use crate::mm::{PhysAddr, VirtAddr, kvmap};
+use crate::mm::PhysAddr;
+use crate::mm::kvmap::{self, MmioWindow};
 use crate::object::ObjectRef;
 use crate::object::device_node::{
     BAR_FLAG_64, BAR_FLAG_PREFETCH, BAR_IO, BAR_MMIO, BAR_NONE, BarWindow, BlockGeometry, DeviceClass, DeviceIdentity,
@@ -217,19 +217,19 @@ enum Probe {
 /// its `DeviceNode`.
 fn probe_function(
     region: &EcamRegion,
-    win: VirtAddr,
+    win: &mut MmioWindow,
     bus: u8,
     dev: u8,
     func: u8,
     out: &mut KVec<ObjectRef>,
     found: &mut usize,
 ) -> Probe {
-    // SAFETY: `win` is the enumeration scan window reserved by `enumerate`;
-    // `func_phys` is a 4 KiB-aligned config-space frame within `region`.
-    if unsafe { kvmap::remap_mmio_page(win, func_phys(region, bus, dev, func)) }.is_err() {
+    // SAFETY: `func_phys` is a 4 KiB-aligned config-space frame within `region`, and nothing reads
+    // the window's previous function after this.
+    if unsafe { win.repoint(func_phys(region, bus, dev, func)) }.is_err() {
         return Probe::Absent;
     }
-    let cfg = MmioCfg { base: win.as_u64() as *mut u8 };
+    let cfg = MmioCfg { base: win.va().as_u64() as *mut u8 };
     if (cfg.read32(REG_ID) & 0xFFFF) as u16 == VENDOR_ABSENT {
         return Probe::Absent;
     }
@@ -251,12 +251,12 @@ fn probe_function(
     Probe::Present { multifunction }
 }
 
-fn scan_device(region: &EcamRegion, win: VirtAddr, bus: u8, dev: u8, out: &mut KVec<ObjectRef>, found: &mut usize) {
-    if let Probe::Present { multifunction } = probe_function(region, win, bus, dev, 0, out, found)
+fn scan_device(region: &EcamRegion, win: &mut MmioWindow, bus: u8, dev: u8, out: &mut KVec<ObjectRef>, n: &mut usize) {
+    if let Probe::Present { multifunction } = probe_function(region, win, bus, dev, 0, out, n)
         && multifunction
     {
         for func in 1u8..8 {
-            probe_function(region, win, bus, dev, func, out, found);
+            probe_function(region, win, bus, dev, func, out, n);
         }
     }
 }
@@ -273,7 +273,7 @@ pub fn enumerate() -> KVec<ObjectRef> {
         crate::kprintln!("pci: no ECAM regions discovered");
         return out;
     }
-    let win = match kvmap::vmap_alloc_pages(1) {
+    let mut win = match MmioWindow::new() {
         Ok(v) => v,
         Err(_) => {
             crate::kprintln!("pci: scan-window allocation failed; skipping enumeration");
@@ -284,7 +284,7 @@ pub fn enumerate() -> KVec<ObjectRef> {
     for region in regions {
         for bus in region.bus_start..=region.bus_end {
             for dev in 0u8..32 {
-                scan_device(region, win, bus, dev, &mut out, &mut found);
+                scan_device(region, &mut win, bus, dev, &mut out, &mut found);
             }
         }
     }
@@ -303,7 +303,7 @@ pub(crate) enum ConfigError {
 
 /// A function's 4 KiB configuration space, mapped uncached for as long as the holder keeps it.
 ///
-/// **The mapping is permanent**: the vmap allocator never reclaims VA, so dropping a `Config`
+/// **The mapping is permanent**: a device mapping never gives its VA back, so dropping a `Config`
 /// returns nothing. A page per claimed device is cheap (Tier 1 drivers are few, bound once at
 /// boot); a shared window behind a lock would cost a lock on a post-scheduler path.
 pub(crate) struct Config {
