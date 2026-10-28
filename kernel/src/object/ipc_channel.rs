@@ -353,7 +353,7 @@ impl IpcChannel {
     }
 
     /// Mark this endpoint as the kernel's end of a Userspace Server channel, recording `reg`.
-    /// Set once, when a supervisor binds the endpoint as a `UserspaceServer`.
+    /// Set by `us_server_attach` only where no live registration is, and cleared by its drop.
     ///
     /// # Safety
     /// See the accessor contract above.

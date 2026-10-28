@@ -166,10 +166,10 @@ two from 512 to a page, or a run whose ends — `file_block + length`, `device_l
 times `block_size` — do not fit a `u64`. The resolve fails `KernelError`, as for a body too short
 for its runs. The page cache divides by the block size and multiplies a device block by it, and a
 second server is one more process whose reply reaches that arithmetic. **A page must lie within one
-run**, since the kernel fills and writes it as one device range. That one the kernel does not check,
-though the runs would let it, and a server must make it so: FAT's does, and ext4's with blocks of a
-page, but not with smaller ones (`TODO(ext4-subpage-runs)`; `filesystem-data-path.md` § *A page
-within one run*).
+run**, since the kernel fills and writes it as one device range, so a run that does not begin and
+end on a page boundary fails the resolve `KernelError` too. FAT's server never sends one, and ext4's
+only with blocks smaller than a page (`TODO(ext4-subpage-runs)`; `filesystem-data-path.md` § *A
+page within one run*).
 
 #### The `SUBNAMESPACE` body
 
@@ -211,10 +211,10 @@ discriminant (`NotFound` for a missing path, `TooLarge` past the cap,
    `PendingOperation` stays **pending**.
 2. The server resolves the suffix, reads the file, and replies — transferring the
    `MemoryObject` in `handles[0]` (success) or an `ErrorBody` (failure).
-3. The kernel installs the transferred `MemoryObject` into the **original
-   caller's** table and signals the lookup PO: `IoResult { status: 0, result: <the
-   installed handle> }`, or `status: <kerror>` on error. The client's `sys_wait`
-   returns the handle.
+3. The kernel parks the transferred `MemoryObject` in the lookup PO and signals it.
+   The client's `sys_wait` installs it in the client's table and returns
+   `IoResult { status: 0, result: <the installed handle> }`, or `status: <kerror>` on
+   error. A PO the client closed first releases the object instead.
 
    **Installed rights = `requested ∩ (the rights the server granted on the
    transferred handle)`.** Unlike a Kernel Server / direct-handle binding — whose

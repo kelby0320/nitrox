@@ -294,3 +294,21 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-28	402	8142879a	8	tests	optional	demonstrated	fixed	9f8ec770	mapped_with reads a leaf's flags back; guard_page is the reservation's start; NO_EXECUTE dropped or a guard of 0 each fail
 2026-10-28	402	8142879a	9	rules-and-docs	optional	demonstrated	fixed	e29bafc7	one 2026-10-28 entry, four decisions
 2026-10-28	402	8142879a	10	architecture	optional	demonstrated	fixed	07f9e5bc	current_cpu's comment fixed; on qemu64 the wrmsr passes and the first fault is still #UD at gdt::init's rdtscp, so the cpu-feature-check entry (e29bafc7) says both, real hardware's #GP unverified
+2026-10-28	403	2950f66e	1	error-paths	blocking	demonstrated	fixed	b22d6e4a	the three docs now say block_map refuses a run off a page boundary; grep found each before
+2026-10-28	403	2950f66e	2	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	1432b271	a lookup PO carries only WAIT|INSPECT, so it cannot be sent, granted, bound or duplicated; boot-probe lookup_po_stays_test fails with the old rights
+2026-10-28	403	2950f66e	3	logic+rules-and-docs+architecture	worth-fixing	demonstrated	fixed	b22d6e4a	namespace doc's Kernel Server section and tables, kernel_server.rs, the builders' doc comments
+2026-10-28	403	2950f66e	4	architecture	worth-fixing	demonstrated	fixed	1432b271	maintainer chose final: a read the table cannot take fails the lookup for good, object released; syscall-abi.md documents it
+2026-10-28	403	2950f66e	5	tests	worth-fixing	demonstrated	fixed	b071410c	the send's delivery is send::deliver; three host tests fail with commit_all a no-op, and the reply's and the queued send's commits each pinned; spawn's claims still boot-only
+2026-10-28	403	2950f66e	6	tests	worth-fixing	demonstrated	fixed	1432b271	a_lookup_read_into_a_full_table_fails_for_good fails with the status kept 0 or the object kept
+2026-10-28	403	2950f66e	7	tests	worth-fixing	demonstrated	fixed	1432b271	a_lookup_completed_twice_keeps_its_first_object fails without the already_signaled guard
+2026-10-28	403	2950f66e	8	tests	worth-fixing	demonstrated	fixed	f73455a0	host tests count SCHED holds and dispatch_destroy refuses one; the keep's deletion fails with 'a FileObject destroyed under SCHED'
+2026-10-28	403	2950f66e	9	logic+architecture	optional	demonstrated	fixed	1432b271	no DUPLICATE or TRANSFER on a lookup PO, so only its caller reads it
+2026-10-28	403	2950f66e	10	logic	optional	unverified	fixed	f9dcedf5	confirmed by reading; make_user_sched + start_user with the handle between; sweep found the blocking send committing before its PO handle, now tested
+2026-10-28	403	2950f66e	11	rules-and-docs	optional	unverified	fixed	b22d6e4a	syscall-abi.md has the read-time contract
+2026-10-28	403	2950f66e	12	rules-and-docs	optional	demonstrated	fixed	b22d6e4a	rsproto-file-ops.md step 2
+2026-10-28	403	2950f66e	13	rules-and-docs	optional	demonstrated	fixed	b22d6e4a	the steps numbered as the code's comments
+2026-10-28	403	2950f66e	14	tests	optional	demonstrated	fixed	9cb17fed	the test's doc says host tests run in debug, so the release check is pinned only under --release
+2026-10-28	403	2950f66e	15	tests	optional	demonstrated	fixed	9cb17fed	the litmus runs under Miri at 300 rounds: the closer's fence removed fails 4 of 4 seeds; the writer's was pinned under Miri already
+2026-10-28	403	2950f66e	16	tests	optional	demonstrated	declined		the object conjunct is reachable only by a close racing between the claim's lookup and its lock, and harmless either way (the closer released the handle's reference, so the move cannot copy); kept as the stricter answer
+2026-10-28	403	2950f66e	17	tests	optional	demonstrated	fixed	9cb17fed	zero-length run case added, fails without the exemption; stub producer's settle declined, as only host tests build it
+2026-10-28	403	2950f66e	18	architecture	optional	unverified	deferred	9cb17fed	maintainer deferred TODO(direct-bind-copy); tools test now reads lookup_typed, positive-controlled; variable rights still unseen

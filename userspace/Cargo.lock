@@ -123,6 +123,7 @@ dependencies = [
 name = "device-mgr"
 version = "0.1.0"
 dependencies = [
+ "libfs",
  "libheap",
  "libkern",
  "librsproto",
@@ -504,6 +505,7 @@ version = "0.1.0"
 dependencies = [
  "fs-server-ext4",
  "fs-server-fat",
+ "libfs",
  "libgpt",
  "libheap",
  "libinittoml",

@@ -271,7 +271,7 @@ Found 24, refuted by a boot 0, reported 13.
   Fixed in `ff52c1b0`; fails without it: `a_handle_listed_twice_is_refused_by_a_send_and_a_spawn`,
   and boot-probe's transfer check under `test-qemu`. A spawn's duplicate grant without `DUPLICATE`,
   which PR #391's review found copied a handle too, in `ddfe3b4b`: boot-probe's spawn-grant check.
-- [ ] **kobj-10** `kernel/src/sched/ipc.rs:453` — When a userspace server's endpoint dies,
+- [x] **kobj-10** `kernel/src/sched/ipc.rs:453` — When a userspace server's endpoint dies,
   `ipc_endpoint_closing` and `us_reg_detach` drain only the registration's pending lookups,
   never its pending fills (`File::ReadRange`, Model B). A thread faulting a lazy
   `OBJECT_KIND_FILE` page waits in `wait_for_fill` with `u64::MAX` and never wakes, and nor does
@@ -284,7 +284,9 @@ Found 24, refuted by a boot 0, reported 13.
   `pending_fill`. logic, trust-boundary. Reviewers disagreed on severity (logic: medium,
   trust-boundary: low); ranked low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's kobj-d3, which repeats it.
-- [ ] **kobj-11** `kernel/src/syscall/table.rs:483` — When allocating the parent's Process
+  Fixed in `7938344d`, as kobj-d3; fails without it:
+  `a_dying_server_fails_its_fills_and_frees_their_cycle`.
+- [x] **kobj-11** `kernel/src/syscall/table.rs:483` — When allocating the parent's Process
   handle fails after the child thread is queued, `sys_process_spawn` returns an error while the
   child runs. It skips the move-close loop at 493-497, so the parent's move_mask handles stay
   open although the child already holds them. This needs a handle-table segment grow to fail
@@ -292,6 +294,8 @@ Found 24, refuted by a boot 0, reported 13.
   Unverified: needs a failure injection in the global table's segment grow and a boot to
   settle. error-paths. Low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's kobj-d4, which repeats it.
+  Fixed in `39e2a5c9`, as kobj-d4: the parent's handle is allocated before the child runs.
+  Structural; the gates pass.
 - [ ] **kobj-12** `kernel/src/handle/table.rs:588` — No test hands `duplicate()` a `new_rights`
   with bits the source lacks, so replacing `info.rights & new_rights` with `new_rights` passes
   the whole kernel host suite. This is a test gap, not a defect in code that works, and it is
@@ -2471,3 +2475,31 @@ Found by the maintainer at the laptop's prompt after reinstalling, not by a run.
     `Ident("Documents")` and `Word("/hello.txt")`; `open hello.txt` and `save out.txt` refused for
     want of a path; `save Documents/out.txt` refused for the format of `/p/Documents`; and
     `open ./Documents/hello.txt` read the file. Logic. Medium. Untriaged.
+
+### Found addressing PR #402's review — main at 861bf250, 2026-10-28
+
+A host test failed once in 300 runs of the full kernel suite, on a branch that changes none of it.
+
+- [ ] **drv-17** `kernel/src/dpc.rs:66` — host tests share the one global DPC queue, so one test's
+  DPCs are dropped or run by another's, and `io::block`'s tests fail now and then.
+  - Every test that completes an IRP goes through `DPC_QUEUE`: the block layer's
+    (`io/block.rs:695-885`), AHCI's and xHCI storage's. Each calls `dpc::init`, which replaces
+    the queue with an empty one (`:66`). That drops whatever another test had queued, and leaves
+    its `queued` flag set, so that DPC is never queued again.
+  - Each test's `run_pending` also drains every other test's DPCs, so a test's own drain can find
+    the queue empty while another thread is still running its DPC.
+  - Scenario: `a_block_request_off_its_devices_blocks_reaches_no_driver` drains, then finds no
+    status on a refusal (`io/block.rs:872`). `a_blocking_read_its_device_did_not_complete_fails`
+    fails at `:913` the same way.
+  - Demonstrated: `io::block dpc` failed 42 of 1,000 loops at `861bf250` and 118 of 2,000 at
+    `49457944`, always at those two lines, with no crash. The full kernel suite failed 1 of 300.
+    - A probe logging `init` replacing a non-empty queue found it in 29 of 63 failing runs, and in
+      111 of 300 passing ones.
+    - A slower probe also logged each DPC run on a thread other than its enqueuer's. That happened
+      in 188 of 206 failing runs, and 29 runs of 1,000 crashed. Under gdb, `run_pending_in`
+      (`:140`, reached through `read_blocking`'s poll) called a handler at `0x48`: a `Dpc` read
+      from freed memory.
+  - Which test frees an IRP whose DPC is still queued is not pinned down. No kernel caller is
+    shown to: a kernel `Dpc` outlives its queued reference by design (`:30`).
+  - Tests. Low: it fails CI now and then on branches that touch none of it, and the crash shows a
+    test can run another test's freed DPC. Untriaged.

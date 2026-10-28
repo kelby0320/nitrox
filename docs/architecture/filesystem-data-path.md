@@ -98,8 +98,9 @@ range**: the page's first block, found in the runs, then `PAGE_SIZE` bytes from 
 (`model_a_start_fill` and `begin_write` in `kernel/src/object/file_object.rs`). So **no page may
 span two runs**, and the server guarantees it: FAT's by refusing clusters smaller than a page, since
 a file's clusters then start on page boundaries within it; ext4's with blocks of a page by
-construction, and with smaller blocks not at all (`TODO(ext4-subpage-runs)`). The kernel does not
-check it, though the runs a reply carries would let it.
+construction, and with smaller blocks not at all (`TODO(ext4-subpage-runs)`). The kernel checks it:
+a reply with a run that does not begin and end on a page boundary fails the resolve `KernelError`
+(`block_map`), so such a file fails to open rather than fill or write the wrong blocks.
 
 **What it does check** is the arithmetic a reply reaches (Phase 6 Part E.4): a `block_size` that is
 not a power of two from 512 to a page, or a run whose ends do not fit a `u64`, fails the resolve

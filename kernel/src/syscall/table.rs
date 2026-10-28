@@ -3,6 +3,7 @@
 //! (`docs/spec/syscall-abi.md`) count up from `0`; the **debug** syscalls sit in a high,
 //! non-stable range.
 
+use super::block_map::block_map;
 use super::error::{KError, SysResult, encode, from_elf_load, from_user_access};
 use crate::arch::Paging;
 use crate::arch::Timer;
@@ -10,7 +11,7 @@ use crate::arch::abi::USER_VIRT_END;
 use crate::arch::paging::ArchPaging;
 use crate::arch::timer::ArchTimer;
 use crate::handle::global;
-use crate::handle::table::{HandleError, HandleTable, LookupOk};
+use crate::handle::table::{Claim, HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
 use crate::rsproto::SizeChange;
 
@@ -449,10 +450,19 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     };
 
     let mut installed = [RawHandle::NULL; SPAWN_MAX_HANDLES];
+    let mut claims: [Option<Claim<'_>>; SPAWN_MAX_HANDLES] = core::array::from_fn(|_| None);
     for i in 0..count {
         // A grant not moved is a copy, and a copy needs DUPLICATE, as `sys_handle_duplicate` does.
-        let copy = if args.move_mask & (1 << i) == 0 { Rights::DUPLICATE } else { Rights::empty() };
-        let ok = match global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER | copy) {
+        // A move is claimed until the spawn commits, so a second move of it at once fails.
+        let found = if args.move_mask & (1 << i) == 0 {
+            global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER | Rights::DUPLICATE)
+        } else {
+            global::get().claim(args.handles[i], parent_pid, Rights::TRANSFER).map(|(ok, c)| {
+                claims[i] = Some(c);
+                ok
+            })
+        };
+        let ok = match found {
             Ok(ok) => ok,
             Err(e) => {
                 spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..i]);
@@ -477,32 +487,25 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
         // SAFETY: `into_raw` yielded the single creation reference; adopt it.
         unsafe { ObjectRef::from_raw(p, KObjectType::Process) }
     };
-    let proc_for_handle = proc_obj.clone();
+
+    // The parent's handle to the child before the child runs: nothing may fail once it does.
+    let parent_handle = match install(parent_pid, proc_obj.clone(), Rights::SIGNAL | Rights::TERMINATE) {
+        Ok(h) => h,
+        Err(e) => {
+            drop(proc_obj);
+            spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
+            return Err(e);
+        }
+    };
 
     let endpoint_h = if count > 0 { installed[0].bits() } else { 0 };
     let boot = [notif_h.bits(), child_ns_h.bits(), endpoint_h, args.arg0];
     if crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot).is_err() {
-        drop(proc_for_handle);
+        close_and_release(parent_handle, parent_pid);
         spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
         return Err(KError::OutOfMemory);
     }
-
-    let (pp, pt) = proc_for_handle.into_raw();
-    let parent_handle = match global::get().allocate(parent_pid, pp, pt, Rights::SIGNAL | Rights::TERMINATE) {
-        Ok(h) => h,
-        Err(e) => {
-            // The child is already running; reclaim only the process-handle reference.
-            // SAFETY: adopt + drop the reference yielded by `into_raw`.
-            drop(unsafe { ObjectRef::from_raw(pp, pt) });
-            return Err(map_handle_err(e));
-        }
-    };
-
-    for i in 0..count {
-        if (args.move_mask >> i) & 1 == 1 {
-            close_and_release(args.handles[i], parent_pid);
-        }
-    }
+    commit_all(&mut claims);
 
     Ok(parent_handle.bits() as isize)
 }
@@ -572,7 +575,7 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     let proc = crate::sched::current_process().ok_or(KError::InvalidArgument)?;
     let pid = crate::sched::current_owner_pid();
 
-    let th = crate::sched::spawn_user_sched(
+    let th = crate::sched::make_user_sched(
         proc,
         args.entry,
         args.user_sp,
@@ -584,17 +587,13 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     )
     .map_err(|_| KError::OutOfMemory)?;
 
-    let (tp, tt) = th.into_raw();
-    let rights = Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE;
-    match global::get().allocate(pid, tp, tt, rights) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // Already running; reclaim only this surplus reference, off the rank-3 table lock.
-            // SAFETY: adopt + drop the single reference `into_raw` yielded.
-            drop(unsafe { ObjectRef::from_raw(tp, tt) });
-            Err(map_handle_err(e))
-        }
+    // Its handle before it runs: nothing may fail once it does, or a retry would start another.
+    let h = install(pid, th.clone(), Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)?;
+    if crate::sched::start_user(th).is_err() {
+        close_and_release(h, pid);
+        return Err(KError::OutOfMemory);
     }
+    Ok(h.bits() as isize)
 }
 
 /// `sys_thread_get_registers(thread, out)` — write the user registers of a **suspended**
@@ -813,18 +812,6 @@ fn map_mem_map_err(e: MapError) -> KError {
         MapError::Overlap | MapError::NotCanonical | MapError::NotUserHalf => KError::InvalidArgument,
         MapError::OutOfMemory => KError::OutOfMemory,
     }
-}
-
-/// The status a forwarded reply completes with, once its handle is in client `pid`'s table. A
-/// client that exited before its reply has had its handles swept, or will: the exit marks it
-/// before the sweep, and both take the table's lock, so after the allocation one of the two sees
-/// the other. Closed here, the handle is not left in a table nothing will close.
-fn deliver_to_client(pid: u32, status: i32, handle: u64) -> i32 {
-    if status != 0 || handle == 0 || crate::sched::pid_has_threads(pid) {
-        return status;
-    }
-    close_and_release(RawHandle(handle), pid);
-    KError::PeerClosed as i32
 }
 
 /// Spawn copies an image into one allocation, so one larger than [`MAX_IMAGE_BYTES`] is refused
@@ -1150,7 +1137,7 @@ fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
 /// leave its process, so `NoAccess` without `TRANSFER`. A direct bind gives the object away
 /// (every resolve mints a handle to it), as an IPC send and a spawn grant do; `init`'s
 /// system-control object carries no `TRANSFER` so it cannot leave `init`. A **userspace-server**
-/// bind needs no right: the kernel keeps the endpoint.
+/// bind needs no right: the kernel keeps the endpoint. A bind is a copy: TODO(direct-bind-copy).
 fn direct_bindable(rights: Rights) -> Result<(), KError> {
     if rights.contains(Rights::TRANSFER) { Ok(()) } else { Err(KError::NoAccess) }
 }
@@ -1196,31 +1183,19 @@ pub fn sys_ns_bind(
     if res_ok.object.object_type() == KObjectType::IpcChannel {
         // Bind-mount semantics: an endpoint that already backs a registration is *shared*; a
         // rival would clobber the endpoint→reg reply-routing back-pointer and hijack replies.
-        // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-        if let Some(existing) = unsafe { crate::sched::us_forward_existing_reg(res_ok.object.as_ptr()) } {
-            return match ns.bind_userspace_server(path, existing, rights, base) {
-                Ok(()) => Ok(0),
-                Err((returned, e)) => {
-                    drop(returned);
-                    Err(map_ns_err(e))
-                }
-            };
-        }
         let reg_box = UserspaceServerReg::try_new(res_ok.object.clone()).map_err(|_| KError::OutOfMemory)?;
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let reg_ref = unsafe {
             ObjectRef::from_raw(KBox::into_raw(reg_box).as_ptr() as *mut (), KObjectType::UserspaceServerReg)
         };
-        // Held across the attach: an unbind on another thread can drop the binding's reference.
-        let keep = reg_ref.clone();
-        return match ns.bind_userspace_server(path, reg_ref, rights, base) {
-            Ok(()) => {
-                // Record the endpoint → registration back-pointer (only on success).
-                // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across
-                // the call.
-                unsafe { crate::sched::us_server_attach(res_ok.object.as_ptr(), &keep) };
-                Ok(0)
-            }
+        // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+        let reg = match unsafe { crate::sched::us_server_attach(res_ok.object.as_ptr(), &reg_ref) } {
+            Some(existing) => existing,
+            None => reg_ref,
+        };
+        // A failed bind drops a registration attached here, whose drop detaches it.
+        return match ns.bind_userspace_server(path, reg, rights, base) {
+            Ok(()) => Ok(0),
             Err((returned, e)) => {
                 drop(returned);
                 Err(map_ns_err(e))
@@ -1394,22 +1369,15 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
     let po_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
     let po_ptr = po_ref.as_ptr();
-    let (pp, pt) = po_ref.clone().into_raw();
-    let po_h = match global::get().allocate(pid, pp, pt, pending_op_rights()) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the clone; reclaim it. `po_ref` then
-            // drops at return, destroying the PO (no waiters yet — its assert holds).
-            drop(unsafe { ObjectRef::from_raw(pp, pt) });
-            return Err(map_handle_err(e));
-        }
-    };
+    // No `DUPLICATE` or `TRANSFER`: it will hold its object, which could be the ring it is moved to.
+    // A refusal drops `po_ref` at return, destroying the PO (no waiters yet — its assert holds).
+    let po_h = install(pid, po_ref.clone(), Rights::WAIT | Rights::INSPECT)?;
 
     // SAFETY: live `Namespace` (type verified by `lookup_typed`).
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
-    if let Some((status, result)) = resolve_and_start(ns, path, dest, fwd, requested, pid, &po_ref, 0) {
+    if let Some((status, parked)) = resolve_and_start(ns, path, dest, fwd, requested, &po_ref, 0) {
         // SAFETY: `po_ref` pins the `PendingOperation` at `po_ptr`.
-        unsafe { crate::sched::complete_pending_op(po_ptr, status, result) };
+        drop(unsafe { crate::sched::complete_lookup(po_ptr, status, parked) });
     }
     Ok(po_h.bits() as isize)
 }
@@ -1430,16 +1398,12 @@ impl ResolveOp {
     }
 }
 
-fn install_for(pid: u32, requested: Rights, obj: ObjectRef, binding_rights: Rights) -> (i32, u64) {
-    let (tptr, tty) = obj.into_raw();
-    match global::get().allocate(pid, tptr, tty, requested & binding_rights) {
-        Ok(h) => (0, h.bits()),
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
-            (map_handle_err(e) as i32, 0)
-        }
-    }
+/// What a lookup completes its PO with: a status and, on success, the object and rights its
+/// reader's handle gets ([`crate::sched::complete_lookup`]).
+type Resolved = (i32, Option<(ObjectRef, Rights)>);
+
+fn granted(requested: Rights, obj: ObjectRef, binding_rights: Rights) -> Resolved {
+    (0, Some((obj, requested & binding_rights)))
 }
 
 /// **Resolve `path` in `ns` and start the operation there**: the half of a lookup that a
@@ -1462,15 +1426,14 @@ fn resolve_and_start(
     dest: Option<&[u8]>,
     op: ForwardOp,
     requested: Rights,
-    pid: u32,
     po_ref: &ObjectRef,
     depth: u8,
-) -> Option<(i32, u64)> {
+) -> Option<Resolved> {
     let mut dest_buf = [0u8; NS_PATH_MAX];
     let mut dest_len = 0usize;
     if let ForwardOp::Rename { .. } = op {
         let Some(d) = dest else {
-            return Some((KError::InvalidArgument as i32, 0));
+            return Some((KError::InvalidArgument as i32, None));
         };
         let verdict = match (ns.resolve(path), ns.resolve(d)) {
             (
@@ -1506,30 +1469,30 @@ fn resolve_and_start(
         };
         // A refused rename short-circuits the resolve, which would hand back the source.
         if let Some(e) = verdict {
-            return Some((e as i32, 0));
+            return Some((e as i32, None));
         }
     }
 
     match ns.resolve(path) {
-        None => Some((KError::NotFound as i32, 0)),
+        None => Some((KError::NotFound as i32, None)),
         Some((ResolvedTarget::DirectHandle(target), binding_rights, suffix)) => {
             if suffix.is_empty() {
-                Some(install_for(pid, requested, target, binding_rights))
+                Some(granted(requested, target, binding_rights))
             } else {
                 drop(target);
-                Some((KError::NotFound as i32, 0))
+                Some((KError::NotFound as i32, None))
             }
         }
         // Not from a server's syscall: `/proc/self` would answer for the server.
-        Some((ResolvedTarget::KernelServer(_), _, _)) if depth > 0 => Some((KError::Unsupported as i32, 0)),
+        Some((ResolvedTarget::KernelServer(_), _, _)) if depth > 0 => Some((KError::Unsupported as i32, None)),
         Some((ResolvedTarget::KernelServer(id), binding_rights, suffix)) => {
             match kernel_server::dispatch(id, suffix, requested) {
-                OpStatus::Completed(obj) => Some(install_for(pid, requested, obj, binding_rights)),
-                OpStatus::Rejected(err) => Some((err as i32, 0)),
+                OpStatus::Completed(obj) => Some(granted(requested, obj, binding_rights)),
+                OpStatus::Rejected(err) => Some((err as i32, None)),
                 OpStatus::Pending => {
                     // A Kernel Server never forwards; an internal error, not a panic.
                     debug_assert!(false, "kernel-server dispatch returned Pending");
-                    Some((KError::KernelError as i32, 0))
+                    Some((KError::KernelError as i32, None))
                 }
             }
         }
@@ -1539,15 +1502,15 @@ fn resolve_and_start(
             // `base` and `suffix` are validated (no `.`/`..`), so the join cannot escape.
             let fwd = Forward { op, dest: &dest_buf[..dest_len], depth };
             if base.is_empty() {
-                forward_userspace_lookup(reg, po_ref, pid, requested, suffix, fwd)
+                forward_userspace_lookup(reg, po_ref, requested, suffix, fwd)
             } else {
                 let mut jbuf = [0u8; NS_PATH_MAX];
                 match join_subtree(base.as_path(), suffix, &mut jbuf) {
-                    Some(joined) => forward_userspace_lookup(reg, po_ref, pid, requested, joined, fwd),
+                    Some(joined) => forward_userspace_lookup(reg, po_ref, requested, joined, fwd),
                     None => {
                         // Overflow: drop the forwarding reference outside the namespace lock.
                         drop(reg);
-                        Some((KError::TooLarge as i32, 0))
+                        Some((KError::TooLarge as i32, None))
                     }
                 }
             }
@@ -1580,17 +1543,16 @@ fn join_subtree<'o>(base: &[u8], suffix: &[u8], out: &'o mut [u8]) -> Option<&'o
 fn forward_userspace_lookup(
     reg: ObjectRef,
     po_ref: &ObjectRef,
-    pid: u32,
     requested: Rights,
     suffix: &[u8],
     fwd: Forward<'_>,
-) -> Option<(i32, u64)> {
+) -> Option<Resolved> {
     // Heap-bounced (4 KiB, never on the stack); a grow or create request also carries the size.
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
     // in place so the 4 KiB message never lands in this frame (see `try_new_zeroed`).
     let mut msg = match unsafe { KBox::<StoredMsg>::try_new_zeroed() } {
         Ok(m) => m,
-        Err(_) => return Some((KError::OutOfMemory as i32, 0)),
+        Err(_) => return Some((KError::OutOfMemory as i32, None)),
     };
     let built = match fwd.op {
         ForwardOp::Size(new_size, change) => {
@@ -1603,7 +1565,7 @@ fn forward_userspace_lookup(
     };
     let body_len = match built {
         Some(n) => n,
-        None => return Some((KError::TooLarge as i32, 0)),
+        None => return Some((KError::TooLarge as i32, None)),
     };
     msg.header.payload_len = body_len as u32;
     msg.header.handle_count = 0;
@@ -1611,10 +1573,12 @@ fn forward_userspace_lookup(
     // The suffix is stored so a lazy `FILE` reply can name the file, and a `SUBNAMESPACE` reply
     // can continue the lookup.
     // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
-    match unsafe { crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested, suffix, fwd) } {
+    match unsafe { crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, requested, suffix, fwd) } {
         crate::sched::ForwardOutcome::Pending => None,
-        crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => Some((KError::WouldBlock as i32, 0)),
-        crate::sched::ForwardOutcome::PeerClosed => Some((KError::PeerClosed as i32, 0)),
+        crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => {
+            Some((KError::WouldBlock as i32, None))
+        }
+        crate::sched::ForwardOutcome::PeerClosed => Some((KError::PeerClosed as i32, None)),
     }
 }
 
@@ -1807,8 +1771,7 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
                     && let Some(obj) = &refs[i]
                 {
                     out[k] = if types[i] == KObjectType::PendingOperation {
-                        // SAFETY: `obj` pins the `PendingOperation` its lookup type-checked.
-                        let (status, result) = unsafe { crate::sched::pending_op_completion(obj.as_ptr()) };
+                        let (status, result) = read_completion(obj, pid);
                         IoResult::completed_with_result(handles[i], status, result)
                     } else {
                         if types[i] == KObjectType::InterruptObject {
@@ -1856,9 +1819,44 @@ pub fn sys_notif_recv(channel_h: u64, out: u64) -> SysResult {
     Ok(0)
 }
 
+/// A completed PO's `(status, result)` for `sys_wait`. A lookup's object is installed in the
+/// reader's table on its first read, and that handle is every later read's result, or the
+/// error a table that could not take it fails the lookup with for good.
+fn read_completion(po: &ObjectRef, pid: u32) -> (i32, u64) {
+    use crate::sched::Completion;
+    loop {
+        // SAFETY: `po` pins the `PendingOperation` its lookup type-checked.
+        let (obj, rights) = match unsafe { crate::sched::pending_op_take(po.as_ptr()) } {
+            Completion::Read(status, result) => return (status, result),
+            Completion::Installing => continue,
+            Completion::Install(obj, rights) => (obj, rights),
+        };
+        let (op, ot) = obj.into_raw();
+        let outcome =
+            global::get().allocate(pid, op, ot, rights).map(|h| h.bits()).map_err(|e| map_handle_err(e) as i32);
+        // SAFETY: as above.
+        unsafe { crate::sched::pending_op_installed(po.as_ptr(), outcome) };
+        if outcome.is_err() {
+            // SAFETY: `allocate` did not adopt the reference; reclaim it, outside `SCHED`.
+            drop(unsafe { ObjectRef::from_raw(op, ot) });
+        }
+        return outcome.map_or_else(|status| (status, 0), |h| (0, h));
+    }
+}
+
 /// The rights of a freshly created channel endpoint (`docs/spec/ipc-message-format.md`).
 fn channel_endpoint_rights() -> Rights {
     Rights::SEND | Rights::RECV | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT | Rights::WAIT
+}
+
+/// Install `obj` in `pid`'s table with `rights`, or release it, off the table's lock.
+fn install(pid: u32, obj: ObjectRef, rights: Rights) -> Result<RawHandle, KError> {
+    let (p, t) = obj.into_raw();
+    global::get().allocate(pid, p, t, rights).map_err(|e| {
+        // SAFETY: `allocate` did not adopt the reference; reclaim it.
+        drop(unsafe { ObjectRef::from_raw(p, t) });
+        map_handle_err(e)
+    })
 }
 
 fn close_and_release(h: RawHandle, pid: u32) {
@@ -1964,10 +1962,11 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
     // Each transferred handle needs `TRANSFER`; a failure drops the collected refs (outside SCHED)
     // and leaves the sender's table unchanged: atomic-or-fail.
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    let mut claims: [Option<Claim<'_>>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     for i in 0..count {
-        let h = RawHandle(h_raw[i]);
-        let t = global::get().lookup(h, pid, Rights::TRANSFER).map_err(map_handle_err)?;
+        let (t, claim) = global::get().claim(RawHandle(h_raw[i]), pid, Rights::TRANSFER).map_err(map_handle_err)?;
         transfers[i] = Some(TransferRef { obj: t.object, rights: t.rights });
+        claims[i] = Some(claim);
     }
 
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
@@ -1980,161 +1979,24 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
     bounce.header.handle_count = count as u8;
     bounce.handles = [0u64; IPC_HANDLE_MAX];
 
-    // A peer that is the kernel's end of a Userspace Server channel means a forwarded-lookup
-    // **reply**: complete the waiting lookup inline (nothing receives that ring), whatever
-    // `send_mode`. See `docs/spec/rsproto-namespace-ops.md`.
-    // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-    if let Some(reg) = unsafe { crate::sched::us_forward_reg_for_send(ok.object.as_ptr()) } {
-        let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
-        if let Some(file_id) = crate::rsproto::forget_request(&bounce.payload[..payload_len]) {
-            // Only `Block`: its result is a PO, and no deadline could apply.
-            if send_mode != SendMode::Block || count != 0 {
-                return Err(KError::InvalidArgument);
-            }
-            return answer_forget(&reg, file_id, pid);
-        }
-        return complete_forwarded_reply(&reg, &bounce, &mut transfers, &h_raw, count, pid);
-    }
-
-    match send_mode {
-        // `Sent` commits the transfer move; a full ring / dead peer leaves the transfers untaken.
-        SendMode::NoBlock => {
-            // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-            match unsafe { crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) } {
-                SendOutcome::Sent { .. } => {
-                    for &h in &h_raw[..count] {
-                        close_and_release(RawHandle(h), pid);
-                    }
-                    Ok(0)
-                }
-                SendOutcome::Full => Err(KError::WouldBlock),
-                SendOutcome::PeerClosed => Err(KError::PeerClosed),
-                SendOutcome::Cycle => Err(KError::InvalidArgument),
-            }
-        }
-        // Returns a `PendingOperation` that completes on delivery; the message is committed
-        // either way, so the transfer move is too. The syscall never parks (async-first).
-        SendMode::Block | SendMode::BlockBounded => {
-            let deadline_ns = if send_mode == SendMode::BlockBounded { deadline } else { u64::MAX };
-            let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-            // SAFETY: `into_raw` yields the single creation reference; adopt it.
-            let po_ref =
-                unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
-            // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-            match unsafe {
-                crate::sched::ipc_send_push_blocking(ok.object.as_ptr(), &bounce, &mut transfers, &po_ref, deadline_ns)
-            } {
-                BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
-                    for &h in &h_raw[..count] {
-                        close_and_release(RawHandle(h), pid);
-                    }
-                    let (op, ot) = po_ref.into_raw();
-                    match global::get().allocate(pid, op, ot, pending_op_rights()) {
-                        Ok(h) => Ok(h.bits() as isize),
-                        // Table full: the message was still committed. A `Queued` PO lives on via
-                        // the pending-send queue; a `Sent` one is reclaimed here.
-                        Err(e) => {
-                            // SAFETY: reclaims the reference `into_raw` gave up.
-                            drop(unsafe { ObjectRef::from_raw(op, ot) });
-                            Err(map_handle_err(e))
-                        }
-                    }
-                }
-                // Back-pressure / dead peer: nothing committed; the sender keeps its handles.
-                BlockSendOutcome::PendingFull => {
-                    drop(po_ref);
-                    Err(KError::WouldBlock)
-                }
-                BlockSendOutcome::PeerClosed => {
-                    drop(po_ref);
-                    Err(KError::PeerClosed)
-                }
-                BlockSendOutcome::Cycle => {
-                    drop(po_ref);
-                    Err(KError::InvalidArgument)
-                }
-            }
-        }
-    }
+    send::deliver(&ok.object, &bounce, &mut transfers, &mut claims, send_mode, deadline, pid)
 }
 
-/// **Answer a server's `File::Forget`**: the file `file_id` is about to be freed, and the server
-/// frees its blocks only once the kernel says nothing of it is in flight. The file's cached
-/// object is forgotten ([`forget_file`](crate::object::UserspaceServerReg::forget_file)): it
-/// starts no more device I/O, and no resolve or sync finds it again. The answer is a
-/// `PendingOperation` installed in the server's table, complete already if nothing was in
-/// flight, else when the last IRP ends; a second `Forget` meanwhile gets the same one. The
-/// server `sys_wait`s on it, so a `Forget` must be sent `Block`.
-fn answer_forget(reg: &ObjectRef, file_id: u64, pid: u32) -> SysResult {
-    use crate::object::{Forgotten, UserspaceServerReg};
-    let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let answer = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
-    // SAFETY: `reg` pins the registration the send arrived through.
-    let r: &UserspaceServerReg = unsafe { &*(reg.as_ptr() as *const UserspaceServerReg) };
-    let wait_on = match r.forget_file(file_id, &answer) {
-        Forgotten::Later(po) => po,
-        Forgotten::Now => {
-            // SAFETY: `answer` is the `PendingOperation` this created.
-            unsafe { crate::sched::complete_pending_op(answer.as_ptr(), 0, 0) };
-            answer.clone()
-        }
-    };
-    drop(answer);
-    let (op, ot) = wait_on.into_raw();
-    match global::get().allocate(pid, op, ot, pending_op_rights()) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(op, ot) });
-            Err(map_handle_err(e))
-        }
-    }
-}
-
-/// Complete a forwarded **reply** inline in the server's `sys_channel_send`: a
-/// `Namespace::Resolve` or `File::ReadRange` (page-cache fill) reply is routed by its op; one
-/// that is neither is consumed (transfers dropped, sender's handles closed). `transfers[i]` ↔
-/// the sender handle `h_raw[i]`. Runs in syscall context (no `SCHED` held), so the
-/// cross-context `allocate` and the drops are outside the lock.
-fn complete_forwarded_reply(
-    reg: &ObjectRef,
-    bounce: &StoredMsg,
-    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    h_raw: &[u64; IPC_HANDLE_MAX],
-    count: usize,
-    pid: u32,
-) -> SysResult {
-    let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
-    match crate::rsproto::reply_op(&bounce.payload[..payload_len]) {
-        Some(crate::rsproto::RESOLVE_OP) => {
-            complete_resolve_reply(reg, bounce, transfers, h_raw, count, pid, payload_len)
-        }
-        Some(crate::rsproto::READ_RANGE_OP) => {
-            complete_read_range_reply(reg, bounce, transfers, h_raw, count, pid, payload_len)
-        }
-        _ => {
-            for &h in &h_raw[..count] {
-                close_and_release(RawHandle(h), pid);
-            }
-            Ok(0)
-        }
-    }
+/// Close the handles a committed move took.
+fn commit_all(claims: &mut [Option<Claim<'_>>]) {
+    claims.iter_mut().filter_map(Option::take).for_each(Claim::commit);
 }
 
 /// Complete a forwarded `Namespace::Resolve` reply: correlate it to the registration's pending
 /// lookup and deliver its outcome through that lookup's `PendingOperation`. An
-/// `OBJECT_KIND_MEMOBJ` reply installs the transferred `MemoryObject` into the **original
-/// caller's** table (rights = `requested ∩ the rights the server granted`); an
+/// `OBJECT_KIND_MEMOBJ` reply parks the transferred `MemoryObject` there, for the reader's table
+/// (rights = `requested ∩ the rights the server granted`); an
 /// `OBJECT_KIND_FILE` reply builds a lazy [`FileObject`] pointed back at this server; an error
 /// completes the PO with a `KError`. An uncorrelated (duplicate / stale) reply is dropped.
 fn complete_resolve_reply(
     reg: &ObjectRef,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    h_raw: &[u64; IPC_HANDLE_MAX],
-    count: usize,
-    pid: u32,
     payload_len: usize,
 ) -> SysResult {
     use crate::rsproto::{
@@ -2149,35 +2011,32 @@ fn complete_resolve_reply(
         None => None,
     };
     let Some(pl) = pl else {
-        for &h in &h_raw[..count] {
-            close_and_release(RawHandle(h), pid);
-        }
         return Ok(0);
     };
     let reply = reply.expect("pending taken ⇒ reply parsed");
 
     let subnamespace =
         matches!(reply.kind, ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_SUBNAMESPACE);
-    let outcome: Option<(i32, u64)> = if subnamespace {
+    let outcome: Option<Resolved> = if subnamespace {
         continue_resolve(&pl, &bounce.payload[..payload_len], transfers)
     } else {
         Some(match reply.kind {
-            ReplyKind::Error { kerror } => (kerror, 0),
-            ReplyKind::Malformed => (KError::KernelError as i32, 0),
+            ReplyKind::Error { kerror } => (kerror, None),
+            ReplyKind::Malformed => (KError::KernelError as i32, None),
             ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE => {
                 build_and_install_file(reg, &pl, content_len)
             }
             ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE_BLOCKS => {
                 build_and_install_file_blocks(reg, &pl, content_len, &bounce.payload[..payload_len], transfers)
             }
-            ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, 0),
+            ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, None),
             ReplyKind::Success { object_kind, .. }
                 if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
             {
-                (KError::Unsupported as i32, 0)
+                (KError::Unsupported as i32, None)
             }
             ReplyKind::Success { .. } => match transfers[0].take() {
-                None => (KError::InvalidArgument as i32, 0), // success but no handle
+                None => (KError::InvalidArgument as i32, None), // success but no handle
                 // The resolved object is a capability the server hands back: a `MemoryObject`, a
                 // **re-exported** `FileObject` (an indirection server passes the store's through)
                 // or an `IpcChannel` (a live **connection**). Other types are not valid results.
@@ -2188,33 +2047,18 @@ fn complete_resolve_reply(
                     ) =>
                 {
                     drop(tr.obj);
-                    (KError::Unsupported as i32, 0)
+                    (KError::Unsupported as i32, None)
                 }
-                Some(tr) => {
-                    let attenuated = pl.requested & tr.rights;
-                    let (op, ot) = tr.obj.into_raw();
-                    match global::get().allocate(pl.owner_pid, op, ot, attenuated) {
-                        Ok(h) => (0, h.bits()),
-                        Err(e) => {
-                            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-                            drop(unsafe { ObjectRef::from_raw(op, ot) });
-                            (map_handle_err(e) as i32, 0)
-                        }
-                    }
-                }
+                Some(tr) => (0, Some((tr.obj, pl.requested & tr.rights))),
             },
         })
     };
 
-    if let Some((status, result)) = outcome {
-        let status = deliver_to_client(pl.owner_pid, status, result);
+    if let Some((status, parked)) = outcome {
         // SAFETY: `pl` owns the lookup's `PendingOperation` reference.
-        unsafe { crate::sched::complete_pending_op(pl.po.as_ptr(), status, result) };
+        drop(unsafe { crate::sched::complete_lookup(pl.po.as_ptr(), status, parked) });
     }
     drop(pl);
-    for &h in &h_raw[..count] {
-        close_and_release(RawHandle(h), pid);
-    }
     Ok(0)
 }
 
@@ -2371,58 +2215,49 @@ fn notify_file_touched(file_obj: &ObjectRef) {
     unsafe { crate::sched::us_forward_notify(reg.as_ptr(), &mut msg) };
 }
 
-/// Build a lazy [`FileObject`] for an `OBJECT_KIND_FILE` resolve reply and install it into the
-/// caller's table; returns the `(status, handle)` the lookup PO completes with. Its producer
+/// Build a lazy [`FileObject`] for an `OBJECT_KIND_FILE` resolve reply; returns what the lookup's
+/// PO completes with ([`Resolved`]), the file and its rights parked for the read. Its producer
 /// names the file by the lookup's stored suffix, so a page fault fills it via `File::ReadRange`.
 /// `TooLarge` if the suffix overran the inline buffer, `OutOfMemory` on allocation failure.
 fn build_and_install_file(
     reg: &ObjectRef,
     pl: &crate::object::userspace_server::PendingLookup,
     content_len: u32,
-) -> (i32, u64) {
+) -> Resolved {
     use crate::libkern::KString;
     use crate::object::{FileObject, Producer};
 
     let Some(suffix) = pl.suffix() else {
-        return (KError::TooLarge as i32, 0);
+        return (KError::TooLarge as i32, None);
     };
     let Ok(s) = core::str::from_utf8(suffix) else {
-        return (KError::InvalidArgument as i32, 0);
+        return (KError::InvalidArgument as i32, None);
     };
     let kstr = match KString::try_from_str(s) {
         Ok(k) => k,
-        Err(_) => return (KError::OutOfMemory as i32, 0),
+        Err(_) => return (KError::OutOfMemory as i32, None),
     };
     let fobj = match FileObject::try_new(content_len as usize, Producer::FsServer { reg: reg.clone(), suffix: kstr }) {
         Ok(f) => f,
-        Err(_) => return (KError::OutOfMemory as i32, 0),
+        Err(_) => return (KError::OutOfMemory as i32, None),
     };
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
     let fref = unsafe { ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject) };
-    let (op, ot) = fref.into_raw();
     // `INSPECT` too, so a client can `sys_handle_stat` the lazy file for its size before mapping.
-    let rights = pl.requested | Rights::INSPECT;
-    match global::get().allocate(pl.owner_pid, op, ot, rights) {
-        Ok(h) => (0, h.bits()),
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(op, ot) });
-            (map_handle_err(e) as i32, 0)
-        }
-    }
+    (0, Some((fref, pl.requested | Rights::INSPECT)))
 }
 
-/// Build + install a **Model A** (block-fs) lazy file from a resolve reply: adopt the
+/// Build a **Model A** (block-fs) lazy file from a resolve reply, for the lookup to park: adopt the
 /// transferred block `DeviceNode` (`handles[0]`), parse the block size + `BlockRun` map from
 /// the reply body, and construct a `FileObject` whose producer fills each page zero-copy from
-/// the device. Returns `(0, handle)` or `(kerror, 0)`.
+/// the device. Returns `(0, Some((file, rights)))` or `(kerror, None)`.
 fn build_and_install_file_blocks(
     reg: &ObjectRef,
     pl: &crate::object::userspace_server::PendingLookup,
     content_len: u32,
     reply_msg: &[u8],
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-) -> (i32, u64) {
+) -> Resolved {
     use crate::object::FileObject;
     use crate::object::file_object::CacheInError;
     use crate::rsproto::{file_blocks_rights, reply_body};
@@ -2431,19 +2266,19 @@ fn build_and_install_file_blocks(
         Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => (tr.obj, tr.rights),
         Some(tr) => {
             drop(tr.obj);
-            return (KError::Unsupported as i32, 0);
+            return (KError::Unsupported as i32, None);
         }
-        None => return (KError::InvalidArgument as i32, 0), // success but no device
+        None => return (KError::InvalidArgument as i32, None), // success but no device
     };
     let Some(body) = reply_body(reply_msg) else {
-        return (KError::KernelError as i32, 0);
+        return (KError::KernelError as i32, None);
     };
     let (header, runs) = match block_map(body) {
         Ok(m) => m,
-        Err(e) => return (e as i32, 0),
+        Err(e) => return (e as i32, None),
     };
     let Some(rights) = file_blocks_rights(pl.requested, header.flags, device_rights) else {
-        return (KError::NoAccess as i32, 0);
+        return (KError::NoAccess as i32, None);
     };
 
     let reg_ref = reg.clone();
@@ -2452,30 +2287,21 @@ fn build_and_install_file_blocks(
     let candidate = match new_block_file(content_len, device, header.block_size, reg_ref.clone(), header.file_id, runs)
     {
         Ok(f) => f,
-        Err(e) => return (e as i32, 0),
+        Err(e) => return (e as i32, None),
     };
     let fref = if header.file_id == 0 {
         candidate
     } else {
         match FileObject::cache_in(&reg_ref, candidate) {
             Ok(f) => f,
-            Err(CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, 0),
+            Err(CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, None),
             Err(CacheInError::BlockSizeChanged | CacheInError::DeviceChanged) => {
-                return (KError::KernelError as i32, 0);
+                return (KError::KernelError as i32, None);
             }
         }
     };
     drop(reg_ref);
-
-    let (op, ot) = fref.into_raw();
-    match global::get().allocate(pl.owner_pid, op, ot, rights) {
-        Ok(h) => (0, h.bits()),
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(op, ot) });
-            (map_handle_err(e) as i32, 0)
-        }
-    }
+    (0, Some((fref, rights)))
 }
 
 /// The deepest a lookup follows `SUBNAMESPACE` replies; the next one is `TooLarge`.
@@ -2492,48 +2318,48 @@ fn continue_resolve(
     pl: &crate::object::userspace_server::PendingLookup,
     reply_msg: &[u8],
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-) -> Option<(i32, u64)> {
+) -> Option<Resolved> {
     let ns_ref = match transfers[0].take() {
         Some(tr) if tr.obj.object_type() == KObjectType::Namespace && tr.rights.contains(Rights::LOOKUP) => tr.obj,
         Some(tr) => {
             drop(tr.obj);
-            return Some((KError::Unsupported as i32, 0));
+            return Some((KError::Unsupported as i32, None));
         }
-        None => return Some((KError::InvalidArgument as i32, 0)),
+        None => return Some((KError::InvalidArgument as i32, None)),
     };
     if pl.depth >= SUBNAMESPACE_DEPTH_MAX {
-        return Some((KError::TooLarge as i32, 0));
+        return Some((KError::TooLarge as i32, None));
     }
     let Some((consumed, base)) = crate::rsproto::reply_body(reply_msg).and_then(crate::rsproto::subnamespace_reply)
     else {
-        return Some((KError::KernelError as i32, 0));
+        return Some((KError::KernelError as i32, None));
     };
     let Some(suffix) = pl.suffix() else {
-        return Some((KError::TooLarge as i32, 0));
+        return Some((KError::TooLarge as i32, None));
     };
     let Ok(mut bufs) = KBox::try_new([[0u8; NS_PATH_MAX]; 2]) else {
-        return Some((KError::OutOfMemory as i32, 0));
+        return Some((KError::OutOfMemory as i32, None));
     };
     let [pbuf, dbuf] = &mut *bufs;
     let path = match continued_path(suffix, consumed as usize, base, pbuf) {
         Ok(p) => p,
-        Err(e) => return Some((e as i32, 0)),
+        Err(e) => return Some((e as i32, None)),
     };
     let dest = match pl.op {
         ForwardOp::Rename { .. } => {
             let Some(d) = pl.dest() else {
-                return Some((KError::TooLarge as i32, 0));
+                return Some((KError::TooLarge as i32, None));
             };
             match continued_dest(suffix, d, consumed as usize, base, dbuf) {
                 Ok(p) => Some(p),
-                Err(e) => return Some((e as i32, 0)),
+                Err(e) => return Some((e as i32, None)),
             }
         }
         _ => None,
     };
     // SAFETY: `ns_ref` pins a live `Namespace` (type checked above) across this call.
     let ns: &Namespace = unsafe { &*(ns_ref.as_ptr() as *const Namespace) };
-    let outcome = resolve_and_start(ns, path, dest, pl.op, pl.requested, pl.owner_pid, &pl.po, pl.depth + 1);
+    let outcome = resolve_and_start(ns, path, dest, pl.op, pl.requested, &pl.po, pl.depth + 1);
     drop(ns_ref);
     outcome
 }
@@ -2600,40 +2426,6 @@ fn continued_dest<'o>(
     continued_path(dest, consumed, base, out)
 }
 
-/// **A block-file reply's map**: its header and runs, or `KernelError` for one the page cache
-/// cannot use: a body too short for its runs, and
-///
-/// - **a block size that is not a power of two from a sector to a page** (the fill divides by
-///   it; `0` would divide by zero);
-/// - **a run whose ends do not fit a `u64`**: its file blocks' end, its device blocks' end, and
-///   that end in bytes. The fill and write-back add within a run and multiply by the block
-///   size, and a kernel built with overflow checks panics on either.
-///
-/// `OutOfMemory` if the runs cannot be held.
-fn block_map(
-    body: &[u8],
-) -> Result<(crate::rsproto::FileBlocksHeader, crate::libkern::KVec<crate::object::BlockRun>), KError> {
-    use crate::object::BlockRun;
-    use crate::rsproto::{file_blocks_reply_header, file_blocks_run};
-    let header = file_blocks_reply_header(body).ok_or(KError::KernelError)?;
-    let bs = header.block_size;
-    if !bs.is_power_of_two() || !(512..=PAGE_SIZE as u32).contains(&bs) {
-        return Err(KError::KernelError);
-    }
-    let mut runs = crate::libkern::KVec::new();
-    runs.try_reserve(header.run_count as usize).map_err(|_| KError::OutOfMemory)?;
-    for i in 0..header.run_count as usize {
-        let (file_block, device_lba, length, flags) = file_blocks_run(body, i).ok_or(KError::KernelError)?;
-        let fits = file_block.checked_add(length as u64).is_some()
-            && device_lba.checked_add(length as u64).and_then(|end| end.checked_mul(bs as u64)).is_some();
-        if !fits {
-            return Err(KError::KernelError);
-        }
-        let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
-    }
-    Ok((header, runs))
-}
-
 /// A new Model A `FileObject` over `device`, adopted into an `ObjectRef`: size, block size, run
 /// map, and identity (registration and file id; non-zero means cached under it).
 fn new_block_file(
@@ -2663,9 +2455,6 @@ fn complete_read_range_reply(
     reg: &ObjectRef,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    h_raw: &[u64; IPC_HANDLE_MAX],
-    count: usize,
-    pid: u32,
     payload_len: usize,
 ) -> SysResult {
     use crate::rsproto::{RangeReplyKind, parse_read_range_reply};
@@ -2677,9 +2466,6 @@ fn complete_read_range_reply(
         None => None,
     };
     let Some(pf) = pf else {
-        for &h in &h_raw[..count] {
-            close_and_release(RawHandle(h), pid);
-        }
         return Ok(0);
     };
     let reply = reply.expect("pending taken ⇒ reply parsed");
@@ -2698,7 +2484,7 @@ fn complete_read_range_reply(
                 // SAFETY: `pf.file_obj` pins the live `FileObject` (header at 0).
                 let fo: &crate::object::FileObject =
                     unsafe { &*(pf.file_obj.as_ptr() as *const crate::object::FileObject) };
-                fo.mark_ready(pf.index);
+                fo.settle(pf.index, &pf.po, true);
                 drop(tr.obj);
                 0
             }
@@ -2709,9 +2495,6 @@ fn complete_read_range_reply(
     // SAFETY: `pf` owns the fill's `PendingOperation` reference.
     unsafe { crate::sched::complete_pending_op(pf.po.as_ptr(), status, 0) };
     drop(pf);
-    for &h in &h_raw[..count] {
-        close_and_release(RawHandle(h), pid);
-    }
     Ok(0)
 }
 
@@ -2827,6 +2610,8 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     }
     Ok(0)
 }
+
+mod send;
 
 #[cfg(test)]
 mod tests;

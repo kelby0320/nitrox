@@ -6,6 +6,7 @@ use super::*;
 /// each other through their rings, which nothing would free: it carries the endpoint it is for,
 /// or one already holding an endpoint, as the last move of every such cycle must. A cycle
 /// through a namespace binding is not caught: TODO(ipc-handle-cycles).
+/// A lookup's PO, which can hold an endpoint, cannot move at all.
 ///
 /// # Safety
 ///
@@ -115,7 +116,6 @@ pub unsafe fn us_forward_originate(
     reg: *mut (),
     msg: &mut StoredMsg,
     po: &ObjectRef,
-    owner_pid: u32,
     requested: Rights,
     suffix: &[u8],
     fwd: crate::object::userspace_server::Forward<'_>,
@@ -123,7 +123,7 @@ pub unsafe fn us_forward_originate(
     let mut g = SCHED.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
     // held. Reserve the pending slot + assign a request id (None ⇒ already busy).
-    let request_id = match unsafe { UserspaceServerReg::begin_forward(reg, po, owner_pid, requested, suffix, fwd) } {
+    let request_id = match unsafe { UserspaceServerReg::begin_forward(reg, po, requested, suffix, fwd) } {
         Some(id) => id,
         None => return ForwardOutcome::Busy,
     };
@@ -257,7 +257,7 @@ pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<ObjectRe
 /// outstanding on it. Called from that type's `Drop`, before its fields drop, because two
 /// jobs must happen while the registration is intact:
 ///
-/// 1. **Complete outstanding forwarded lookups** `PeerClosed`, so their waiters wake. The
+/// 1. **Complete outstanding forwarded requests** `PeerClosed`, so their waiters wake. The
 ///    endpoint is still alive here, so the wake is well-formed.
 /// 2. **Clear the endpoint's back-pointer to us.** `IpcChannel.us_reg` is raw and uncounted
 ///    (a counted edge would cycle with the registration's ownership of the endpoint), so an
@@ -274,15 +274,9 @@ pub unsafe fn us_reg_detach(reg: *mut ()) {
     // SAFETY: called from `Drop` with the last reference gone but the object whole;
     // `SCHED` held, satisfying the accessor contract.
     let endpoint = unsafe { UserspaceServerReg::endpoint_ptr(reg) };
-    // Bounded by the pending table's size, so the drain cannot overrun this.
-    let mut orphans: [Option<ObjectRef>; US_PENDING_MAX] = core::array::from_fn(|_| None);
-    let mut n_orphans = 0usize;
+    let mut orphans = Orphans::<ORPHANS_PER_REG>::new();
     // SAFETY: as above; `SCHED` held.
-    while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg) } {
-        signal_pending_op(&mut g, pl.po.as_ptr(), crate::syscall::error::KError::PeerClosed as i32);
-        orphans[n_orphans] = Some(pl.po);
-        n_orphans += 1;
-    }
+    unsafe { fail_outstanding(&mut g, reg, &mut orphans) };
     if !endpoint.is_null() {
         // Clear only a pointer that still names *this* registration: `us_server_attach` can
         // retarget an endpoint, and stomping a live successor's pointer breaks its routing.
@@ -299,50 +293,73 @@ pub unsafe fn us_reg_detach(reg: *mut ()) {
     drop(orphans);
 }
 
+/// The references a teardown takes from registrations' tables, dropped once `SCHED` is released.
+struct Orphans<const N: usize> {
+    refs: [Option<ObjectRef>; N],
+    n: usize,
+}
+
+impl<const N: usize> Orphans<N> {
+    fn new() -> Self {
+        Self { refs: core::array::from_fn(|_| None), n: 0 }
+    }
+
+    fn keep(&mut self, r: ObjectRef) {
+        self.refs[self.n] = Some(r);
+        self.n += 1;
+    }
+}
+
+/// A registration's tables hold at most a lookup's PO, and a fill's PO and file, a slot.
+const ORPHANS_PER_REG: usize = 3 * US_PENDING_MAX;
+
+/// Fail everything `reg` has outstanding `PeerClosed`, its fills too: a faulter waits on one with
+/// no deadline, and its file may hold `reg`, a cycle its drop outside `SCHED` ends.
+///
+/// # Safety
+///
+/// `reg` is a whole `UserspaceServerReg`, live or mid-drop, and `g` is `SCHED` held.
+unsafe fn fail_outstanding<const N: usize>(g: &mut SchedState, reg: *mut (), orphans: &mut Orphans<N>) {
+    let closed = crate::syscall::error::KError::PeerClosed as i32;
+    // SAFETY: forwarded from this function's contract.
+    while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg) } {
+        signal_pending_op(g, pl.po.as_ptr(), closed);
+        orphans.keep(pl.po);
+    }
+    // SAFETY: as above.
+    while let Some(pf) = unsafe { UserspaceServerReg::take_pending_fill_next(reg) } {
+        signal_pending_op(g, pf.po.as_ptr(), closed);
+        orphans.keep(pf.po);
+        orphans.keep(pf.file_obj);
+    }
+}
+
 /// Record the endpoint → registration back-pointer that makes `endpoint` the kernel's end of
 /// a Userspace Server channel, so a reply sent to it (by the server, on its peer) is
-/// completed inline rather than enqueued. Called by `sys_ns_bind` once the binding owns the
-/// registration, with a reference of its own still held since an unbind on another thread
-/// may drop the binding's. Takes `SCHED`.
+/// completed inline rather than enqueued, unless a live registration is there already: that one
+/// comes back to share, from the same `SCHED` hold, so two binds cannot each make one.
 ///
 /// # Safety
 ///
 /// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds,
 /// and `reg` is a `UserspaceServerReg`.
-pub unsafe fn us_server_attach(endpoint: *mut (), reg: &ObjectRef) {
+pub unsafe fn us_server_attach(endpoint: *mut (), reg: &ObjectRef) -> Option<ObjectRef> {
     let _g = SCHED.lock();
+    // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
+    let existing = unsafe { IpcChannel::us_reg_of(endpoint) };
+    if !existing.is_null() {
+        // `try_acquire`, not `bump`: one mid-drop has a zero count, and is replaced.
+        // SAFETY: `existing` addresses a `UserspaceServerReg` whose header is at offset 0;
+        // `SCHED` held.
+        let header = unsafe { &*(existing as *const crate::object::header::KObjectHeader) };
+        if header.try_acquire() {
+            // SAFETY: the successful `try_acquire` above balances this adoption.
+            return Some(unsafe { ObjectRef::from_raw(existing, KObjectType::UserspaceServerReg) });
+        }
+    }
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
     unsafe { IpcChannel::set_us_reg(endpoint, reg.as_ptr()) };
-}
-
-/// If `endpoint` already backs a Userspace Server registration, return a **new owned
-/// reference** to it so another namespace binding can share the connection (*bind-mount*
-/// semantics: one endpoint, many names). `None` if not yet registered. Reusing the
-/// registration keeps reply routing correct: the endpoint→reg back-pointer stays a single
-/// target rather than being clobbered by a rival. Takes `SCHED`.
-///
-/// # Safety
-///
-/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
-pub unsafe fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
-    let _g = SCHED.lock();
-    // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
-    let reg = unsafe { IpcChannel::us_reg_of(endpoint) };
-    if reg.is_null() {
-        return None;
-    }
-    // Acquire rather than `bump`: an unconditional increment would resurrect an object whose
-    // count already reached zero. `try_acquire` refuses at zero (`Arc::upgrade` semantics);
-    // together with `us_reg_detach` clearing the back-pointer at teardown this makes the
-    // race unrepresentable rather than merely unlikely.
-    // SAFETY: `reg` addresses a `UserspaceServerReg` whose header is at offset 0;
-    // `SCHED` held.
-    let header = unsafe { &*(reg as *const crate::object::header::KObjectHeader) };
-    if !header.try_acquire() {
-        return None;
-    }
-    // SAFETY: the successful `try_acquire` above balances this adoption.
-    Some(unsafe { ObjectRef::from_raw(reg, KObjectType::UserspaceServerReg) })
+    None
 }
 
 /// Take the forwarded lookup outstanding on `reg` whose `request_id` matches a reply's, for
@@ -483,14 +500,13 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
     // SAFETY: `endpoint` is the object being dropped (still valid memory);
     // `SCHED` held.
     let peer = unsafe { IpcChannel::peer_of(endpoint) };
-    // A Userspace Server channel is losing its server: fail forwarded lookups pending on
+    // A Userspace Server channel is losing its server: fail forwarded requests pending on
     // the kernel-forwarding endpoint with `PeerClosed`, whether **this** endpoint is the
     // kernel end (registration being torn down) or its **peer** is (server process died).
     // An endpoint is shared by many bindings, so up to `US_PENDING_MAX` lookups may be in
     // flight: drain *all*. Each PO is signalled here and collected into `orphans`; the
     // references are dropped **outside** `SCHED` below.
-    let mut orphans: [Option<ObjectRef>; 2 * US_PENDING_MAX] = core::array::from_fn(|_| None);
-    let mut n_orphans = 0usize;
+    let mut orphans = Orphans::<{ 2 * ORPHANS_PER_REG }>::new();
     // SAFETY: `endpoint` is valid memory; `SCHED` held.
     let reg_self = unsafe { IpcChannel::us_reg_of(endpoint) };
     // Non-null does not prove live: `us_reg_detach` clears the back-pointer when a
@@ -505,11 +521,7 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
         // SAFETY: `reg_self` is this endpoint's owning registration (the endpoint
         // is being dropped *because* the registration is — `reg_self` is still
         // valid memory mid-drop); `SCHED` held.
-        while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg_self) } {
-            signal_pending_op(&mut g, pl.po.as_ptr(), crate::syscall::error::KError::PeerClosed as i32);
-            orphans[n_orphans] = Some(pl.po);
-            n_orphans += 1;
-        }
+        unsafe { fail_outstanding(&mut g, reg_self, &mut orphans) };
     }
     if !peer.is_null() {
         // SAFETY: `peer` is the surviving endpoint, kept alive by its own handle
@@ -524,11 +536,7 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
         if !reg_peer.is_null() && unsafe { UserspaceServerReg::is_live(reg_peer) } {
             // SAFETY: `reg_peer` is pinned by the live `peer` (its owned endpoint);
             // `SCHED` held.
-            while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg_peer) } {
-                signal_pending_op(&mut g, pl.po.as_ptr(), crate::syscall::error::KError::PeerClosed as i32);
-                orphans[n_orphans] = Some(pl.po);
-                n_orphans += 1;
-            }
+            unsafe { fail_outstanding(&mut g, reg_peer, &mut orphans) };
         }
     }
     // Complete every blocking sender held on THIS endpoint with `PeerClosed`: our receive
@@ -591,6 +599,82 @@ mod tests {
         }
         drop((a, b, c, d));
         assert_eq!(test_probe::ipc_channel_destroys(), 4, "an endpoint left holding another");
+    }
+
+    fn po() -> ObjectRef {
+        adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
+    }
+
+    /// A registration over the kernel's end of a fresh pair, attached; and the server's end.
+    fn served() -> (ObjectRef, ObjectRef) {
+        let (k, s) = pair();
+        let reg = adopt(UserspaceServerReg::try_new(k.clone()).unwrap(), KObjectType::UserspaceServerReg);
+        // SAFETY: `k` is pinned by the test's reference.
+        assert!(unsafe { us_server_attach(k.as_ptr(), &reg) }.is_none());
+        (reg, s)
+    }
+
+    /// A lookup and a fill outstanding on `reg`, their POs, and the fill's file.
+    fn outstanding(reg: &ObjectRef, producer: crate::object::Producer) -> (ObjectRef, ObjectRef, ObjectRef) {
+        let (lookup, fill) = (po(), po());
+        let file = adopt(crate::object::FileObject::try_new(4096, producer).unwrap(), KObjectType::FileObject);
+        // SAFETY: `reg` pins the registration, and the test is single-threaded.
+        unsafe {
+            UserspaceServerReg::begin(reg.as_ptr(), &lookup, Rights::MAP_READ, b"f").unwrap();
+            UserspaceServerReg::begin_fill(reg.as_ptr(), &fill, &file, crate::mm::PhysAddr::new(0x5000), 0).unwrap();
+        }
+        (lookup, fill, file)
+    }
+
+    fn failed(po: &ObjectRef) -> bool {
+        // SAFETY: `po` pins the `PendingOperation`, and the test is single-threaded.
+        unsafe {
+            pending_op_is_signaled(po.as_ptr())
+                && pending_op_completion(po.as_ptr()).0 == crate::syscall::error::KError::PeerClosed as i32
+        }
+    }
+
+    /// **A server's death fails its fills as well as its lookups**: a thread faulting a page waits
+    /// on its fill with no deadline, and the fill holds its file, which holds the registration.
+    #[test]
+    fn a_dying_server_fails_its_fills_and_frees_their_cycle() {
+        init_global_heap();
+        let (reg, server_end) = served();
+        let fs = crate::object::Producer::FsServer { reg: reg.clone(), suffix: crate::libkern::KString::new() };
+        let (lookup, fill, file) = outstanding(&reg, fs);
+        test_probe::reset();
+        // The fill's reference the last, so its drop, outside `SCHED`, destroys the file.
+        drop(file);
+        drop(server_end);
+        assert!(failed(&lookup) && failed(&fill), "the fill's faulter would wait for ever");
+        assert_eq!(test_probe::file_object_destroys(), 1, "the file, held by the fill alone");
+        drop((reg, lookup, fill));
+        assert_eq!(test_probe::userspace_server_reg_destroys(), 1, "the registration, held by the file");
+    }
+
+    /// **Two binds of one endpoint share one registration**, which every reply routes to.
+    #[test]
+    fn a_second_attach_of_an_endpoint_gets_the_first_registration() {
+        init_global_heap();
+        let (k, _server_end) = pair();
+        let new_reg = || adopt(UserspaceServerReg::try_new(k.clone()).unwrap(), KObjectType::UserspaceServerReg);
+        let (first, second) = (new_reg(), new_reg());
+        // SAFETY: `k` is pinned by the test's reference, and the test is single-threaded.
+        unsafe {
+            assert!(us_server_attach(k.as_ptr(), &first).is_none());
+            let shared = us_server_attach(k.as_ptr(), &second).expect("the first registration");
+            assert_eq!(shared.as_ptr(), first.as_ptr());
+            assert_eq!(IpcChannel::us_reg_of(k.as_ptr()), first.as_ptr(), "replies route to it");
+        }
+    }
+
+    #[test]
+    fn a_registration_dropped_fails_its_fills() {
+        init_global_heap();
+        let (reg, _server_end) = served();
+        let (lookup, fill, _file) = outstanding(&reg, crate::object::Producer::Stub { base: 0 });
+        drop(reg);
+        assert!(failed(&lookup) && failed(&fill));
     }
 
     #[test]

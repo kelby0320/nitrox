@@ -302,12 +302,8 @@ fn recv_request(ch: u64) -> Result<Option<Message>, ()> {
 }
 
 fn lookup(ns: u64, path: &[u8], rights: u64) -> (i64, u64) {
-    // SAFETY: a valid path pointer and a namespace handle this process holds.
-    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
-    if po < 0 {
-        return (po, 0);
-    }
-    po_wait(po as u64)
+    let (status, handle) = libfs::lookup_wait(ns, path, rights);
+    (status.into(), handle)
 }
 
 fn with_mapped<T>(obj: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {

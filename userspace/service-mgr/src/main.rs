@@ -108,36 +108,7 @@ fn restart_name(p: RestartPolicy) -> &'static [u8] {
 
 /// Resolve `path` in `ns`: the handle, the caller's to close, or `0` on failure.
 fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
-    // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
-    if po < 0 {
-        return 0;
-    }
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = po as u64;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-    };
-    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
-    // touches; they hold the wait's result only when it returned 1.
-    let (status, handle) = unsafe {
-        (
-            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
-            u64::from_le_bytes([
-                WAIT_RESULTS[16],
-                WAIT_RESULTS[17],
-                WAIT_RESULTS[18],
-                WAIT_RESULTS[19],
-                WAIT_RESULTS[20],
-                WAIT_RESULTS[21],
-                WAIT_RESULTS[22],
-                WAIT_RESULTS[23],
-            ]),
-        )
-    };
-    // SAFETY: closing our own PO handle (the resolved handle is separate).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-    if waited != 1 || status != 0 { 0 } else { handle }
+    libfs::lookup_wait(ns, path, rights).1
 }
 
 /// Resolve the service's log endpoint under the logging service's `system/` subtree (only a

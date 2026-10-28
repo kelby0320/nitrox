@@ -130,21 +130,9 @@ fn recv(ch: u64) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
     Ok(decode(msg).ok().map(|m| (m.op, m.request_id, m.body.to_vec())))
 }
 
+/// Resolve `path` in `ns`: the handle, the caller's to close, or `0` on failure.
 fn lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
-    // SAFETY: a valid path pointer and a namespace handle this process holds.
-    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
-    if po < 0 {
-        return 0;
-    }
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid; one waiter, no deadline.
-    let (done, status, handle) = unsafe {
-        WAIT_HANDLES[0] = po as u64;
-        let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
-        let word = |off: usize| u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]));
-        (w == 1, word(8) as u32 as i32 as i64, word(16))
-    };
-    close(po as u64);
-    if done && status == 0 { handle } else { 0 }
+    libfs::lookup_wait(ns, path, rights).1
 }
 
 /// Every node's record, from one read of `/dev/registry`, and the table's generation then.

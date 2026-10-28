@@ -267,6 +267,59 @@ pub(super) fn transfer_list_test() -> bool {
     true
 }
 
+/// **A lookup's PO stays with its caller**: it holds the object it resolves, which could be the
+/// endpoint whose ring it is sent to. Its duplicate and its send are refused `NoAccess`.
+pub(super) fn lookup_po_stays_test(root_ns: u64) -> bool {
+    use libkern::{
+        KError, RIGHT_INSPECT, RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_NS_LOOKUP,
+    };
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: lookup PO FAIL: ").s(why).end();
+        false
+    };
+    let path = b"/bin/test-stage";
+    // SAFETY: a valid path and a namespace handle this process holds.
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, root_ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ) };
+    let (mut a, mut b) = (0u64, 0u64);
+    // SAFETY: valid writable out-params.
+    let made = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, 4, 0) } == 0;
+    if po <= 0 || !made {
+        return fail(b"no lookup or channel");
+    }
+    let po = po as u64;
+    // SAFETY: register-only syscall on a handle this process holds.
+    let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, po, RIGHT_WAIT | RIGHT_INSPECT) };
+    let msg = [0u8; 4096];
+    let hs = [po];
+    // SAFETY: a valid message buffer and handle array.
+    let sent = unsafe { syscall5(SYS_CHANNEL_SEND, a, msg.as_ptr() as u64, hs.as_ptr() as u64, 1, SENDMODE_NOBLOCK) };
+    close(a);
+    close(b);
+    if dup > 0 {
+        close(dup as u64);
+    }
+    let refused = KError::NoAccess.as_i32() as i64;
+    // Read last, its handle closed: a PO the send took would be gone, its wait failing.
+    let (st, img) = po_wait(po);
+    if st == 0 && img != 0 {
+        close(img);
+    }
+    if dup != refused {
+        return fail(b"its duplicate was not refused NoAccess");
+    }
+    if sent != refused {
+        return fail(b"its send was not refused NoAccess");
+    }
+    if st != 0 || img == 0 {
+        return fail(b"the lookup it stayed for did not resolve");
+    }
+    kprint(
+        b"boot-probe: a lookup's PO is neither duplicated nor sent ok
+",
+    );
+    true
+}
+
 /// **A direct-handle bind needs `TRANSFER`**, since every resolve of the binding mints a handle
 /// to the object for whoever asked: without it, `init` could publish its system-control object,
 /// whose handle carries no `TRANSFER` so that it cannot leave `init`.

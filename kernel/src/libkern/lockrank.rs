@@ -188,23 +188,36 @@ mod inert {
     #[inline(always)]
     pub fn acquired(_rank: LockRank, _taken: super::Taken) {
         #[cfg(test)]
-        HELD.with(|h| h.set(h.get() + 1));
+        HELD.with(|h| h.set(counted(h.get(), _rank, 1)));
     }
     #[inline(always)]
     pub fn releasing(_rank: LockRank) {
         #[cfg(test)]
-        HELD.with(|h| h.set(h.get() - 1));
+        HELD.with(|h| h.set(counted(h.get(), _rank, -1)));
     }
 
     #[cfg(test)]
     std::thread_local! {
-        static HELD: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        /// The locks this thread holds, and how many of them are `SCHED`.
+        static HELD: core::cell::Cell<(usize, usize)> = const { core::cell::Cell::new((0, 0)) };
+    }
+
+    #[cfg(test)]
+    fn counted((all, sched): (usize, usize), rank: LockRank, by: isize) -> (usize, usize) {
+        let sched_by = if matches!(rank, LockRank::Sched) { by } else { 0 };
+        (all.wrapping_add_signed(by), sched.wrapping_add_signed(sched_by))
     }
 
     /// The locks this thread holds: libtest gives each test a thread of its own.
     #[cfg(test)]
     pub fn held_by_this_thread() -> usize {
-        HELD.with(core::cell::Cell::get)
+        HELD.with(|h| h.get().0)
+    }
+
+    /// Whether this thread holds `SCHED`, under which no object may be destroyed.
+    #[cfg(test)]
+    pub fn sched_held_by_this_thread() -> bool {
+        HELD.with(|h| h.get().1 > 0)
     }
     #[inline(always)]
     pub fn enter_interrupt() -> IrqScope {
@@ -216,10 +229,10 @@ mod inert {
     pub fn assert_user_entry_safe() {}
 }
 
-#[cfg(test)]
-pub use inert::held_by_this_thread;
 #[cfg(not(all(debug_assertions, not(test))))]
 pub use inert::{IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing};
+#[cfg(test)]
+pub use inert::{held_by_this_thread, sched_held_by_this_thread};
 
 #[cfg(all(debug_assertions, not(test)))]
 mod tracker {

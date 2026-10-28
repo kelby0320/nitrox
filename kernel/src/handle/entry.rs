@@ -34,8 +34,8 @@ pub(crate) struct HandleEntry {
     pub rights: AtomicU64,
     /// [`KObjectType`] discriminant.
     pub object_type: AtomicU32,
-    /// Explicit pad.
-    pub _pad1: u32,
+    /// Nonzero while a [`Claim`](super::table::Claim) moves the handle; only under the rank-3 lock.
+    pub in_transit: AtomicU32,
     /// Type-erased object pointer: null while the slot is free or in the
     /// deferred-reclaim queue. Read in step 6 as one `Acquire` load.
     pub object: AtomicPtr<()>,
@@ -66,7 +66,7 @@ impl HandleEntry {
             owner_pid: AtomicU32::new(0),
             rights: AtomicU64::new(0),
             object_type: AtomicU32::new(KObjectType::Invalid as u32),
-            _pad1: 0,
+            in_transit: AtomicU32::new(0),
             object: AtomicPtr::new(core::ptr::null_mut()),
             next_owned: AtomicU64::new(RawHandle::NULL.bits()),
             free_next: AtomicU32::new(FREE_NEXT_TAIL),
@@ -120,7 +120,9 @@ impl<'a> WriteGuard<'a> {
     pub(crate) fn new(entry: &'a HandleEntry) -> Self {
         let s = entry.seq.load(Ordering::Relaxed);
         debug_assert_eq!(s & 1, 0, "WriteGuard entered on odd seq — concurrent writers",);
-        entry.seq.store(s.wrapping_add(1), Ordering::Release);
+        entry.seq.store(s.wrapping_add(1), Ordering::Relaxed);
+        // Orders the odd `seq` before the field stores that follow, which a Release store cannot.
+        fence(Ordering::Release);
         Self { entry, seq_at_enter: s }
     }
 }
@@ -134,6 +136,26 @@ impl Drop for WriteGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A snapshot is never torn**, as Miri's weak-memory emulation shows: x86 keeps stores in order.
+    #[test]
+    fn a_snapshot_is_never_torn() {
+        const WRITES: u32 = if cfg!(miri) { 300 } else { 100_000 };
+        let e = HandleEntry::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 1..=WRITES {
+                    let _wg = WriteGuard::new(&e);
+                    e.generation.store(i, Ordering::Relaxed);
+                    e.owner_pid.store(i, Ordering::Relaxed);
+                }
+            });
+            for _ in 0..WRITES {
+                let snap = read_snapshot(&e);
+                assert_eq!(snap.generation, snap.owner_pid, "a torn snapshot accepted");
+            }
+        });
+    }
 
     #[test]
     fn layout_is_exactly_64_bytes_aligned_64() {

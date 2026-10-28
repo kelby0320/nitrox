@@ -36970,3 +36970,39 @@ decisions:
   any build.** Firmware may leave `IA32_TSC_AUX` nonzero, and `gdt::init` read it before the BSP wrote it: a
   boot with it left at 3 took a kernel #PF (kplat-d11). Every per-CPU array is indexed with the value unchecked, so the bound is
   an `assert!`; it runs once a CPU (kplat-d8).
+
+## 2026-10-28 — Before Phase 7, Part I: a close waits out lookups, a move is a claim, a lookup's handle is made by its read
+
+Groups A and B of the survey's triage, handle lifetimes and a server's registration, made four
+decisions:
+
+- **A close waits out every lookup that may have read its object, rather than parking the
+  reference.** The survey's shape for kobj-d1 parked a closed object's last reference in the
+  defer ring until a later drain. That would put each object's destruction off to the next close
+  anywhere, and a channel's peer learns `PeerClosed` only from that destruction. So `close` and
+  the exit sweep `synchronize` instead: they spin until every read section open when the entry
+  was nulled has closed, which is as long as the lookups already in flight, since a reader takes
+  no lock and waits on nothing. A read section covers a lookup's steps 5 to 7 alone, its releases
+  outside, and must not migrate, as its context is a CPU's; debug builds assert that. The reader's
+  and closer's fences are `SeqCst` (kobj-d5).
+- **A handle moves by a claim.** A lookup asking for `TRANSFER` is a copy, and asks for
+  `DUPLICATE` too; a move marks its entry in transit under the table's lock, which a second move
+  is refused by, and closes it only once the move has committed (kobj-d2, kobj-o5).
+  `HandleEntry`'s `_pad1` is that mark, so the layout keeps its 64 bytes. A spawn allocates the
+  parent's handle to the child before the child runs, so nothing fails once it does (kobj-d4).
+- **A lookup's handle is made when `sys_wait` reads its completion**, the maintainer's choice of
+  three. Its PO completes with the resolved object parked in it, the handle is installed in the
+  reader's table on the first read, and a PO freed unread releases the object. Installing at the
+  reply left a handle no one knew in a client that had given up (rt-d6, sup-d4). A check of the
+  PO's count at the reply was rejected for the leak it leaves when a close races the reply, and
+  deferring to Part E for the leak it leaves meanwhile. Two consequences, settled after PR #403's
+  review: the PO carries only `WAIT | INSPECT`, so one holding an endpoint cannot be moved into
+  that endpoint's ring, a cycle nothing frees, and only its caller reads it; and a read the
+  caller's table cannot take fails the lookup for good, its object released, the maintainer's
+  choice, so a PO's completion stays one-shot.
+- **The kernel refuses a block map whose run would split a page** rather than trust a server to
+  avoid one: a page is filled and written back from its first block, so a split put the rest of
+  the page on other blocks (kmem-d13). In-tree servers never send one.
+
+init keeps its own lookup helper (sup-o8) until libos's `block_on` stops spinning on a wait that
+keeps failing (rt-d12), the condition the 2026-10-27 entry sets for a crate moving onto libos.

@@ -4,6 +4,7 @@
 //! `docs/spec/syscall-abi.md`.
 //! ([`error`]). See `docs/spec/syscall-abi.md`.
 
+mod block_map;
 pub mod error;
 pub mod table;
 

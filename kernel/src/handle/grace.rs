@@ -45,12 +45,36 @@ impl GraceTracker {
     /// walk with `Acquire` loads sees it before freeing a deferred close.
     pub(crate) fn enter_read(&self, ctx_id: u32) -> ReadGuard<'_> {
         debug_assert!((ctx_id as usize) < MAX_CTX);
+        // The context is this CPU's, so a section that moved CPU would close another's.
+        #[cfg(not(test))]
+        debug_assert!(
+            !<crate::arch::Cpu as crate::arch::cpu::ArchCpu>::interrupts_enabled()
+                || crate::sched::preemption_disabled(),
+            "a handle read section that can migrate"
+        );
         let epoch = self.current_epoch.load(Ordering::Acquire);
         self.ctx_observed[ctx_id as usize].store(epoch, Ordering::Release);
-        // Pairs with the Release in `drain_expired`: this section observes the
-        // closes scheduled at earlier epochs.
-        fence(Ordering::Acquire);
+        // Dekker, with `synchronize`'s: either this store is seen there, or this section sees the
+        // closer's store. An Acquire fence orders no store before a later load.
+        fence(Ordering::SeqCst);
         ReadGuard { tracker: self, ctx_id }
+    }
+
+    /// Wait until every read section open now has closed: no reader keeps a pointer it read before
+    /// the caller's unpublishing store. Call with no lock held.
+    pub(crate) fn synchronize(&self) {
+        #[cfg(test)]
+        assert_eq!(crate::libkern::lockrank::held_by_this_thread(), 0, "a grace wait with a lock held");
+        let epoch = self.unpublished();
+        while !self.is_grace_period_past(epoch) {
+            yield_for_grace();
+        }
+    }
+
+    /// A new epoch after the caller's unpublishing store; the old one, a missing reader's.
+    fn unpublished(&self) -> u64 {
+        fence(Ordering::SeqCst);
+        self.advance_epoch()
     }
 
     /// Mark a context quiescent without a guard
@@ -81,6 +105,18 @@ impl GraceTracker {
             if v & QUIESCED_BIT != 0 { true } else { (v & !QUIESCED_BIT) > deferred_epoch }
         })
     }
+}
+
+/// Backoff while readers finish. Tests yield to the host scheduler so a reader stuck in
+/// `read_snapshot` can finish; production emits a `PAUSE`-style hint and the caller spins.
+#[cfg(test)]
+pub(crate) fn yield_for_grace() {
+    std::thread::yield_now();
+}
+
+#[cfg(not(test))]
+pub(crate) fn yield_for_grace() {
+    core::hint::spin_loop();
 }
 
 /// Guard from [`GraceTracker::enter_read`]; marks the context quiescent on drop.
@@ -151,6 +187,53 @@ mod tests {
         assert!(!t.is_grace_period_past(deferred));
         drop(g1);
         assert!(t.is_grace_period_past(deferred));
+    }
+
+    /// **A reader and a closer never both miss the other**: x86 lets a store pass a later load,
+    /// so without both fences a close can free what a reader holds.
+    #[test]
+    fn a_reader_and_a_closer_never_both_miss() {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        const ROUNDS: u32 = if cfg!(miri) { 300 } else { 1_000_000 };
+        let t = GraceTracker::new();
+        let (start, read, checked) = (AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0));
+        let (published, seen, past) = (AtomicBool::new(true), AtomicBool::new(false), AtomicBool::new(false));
+        let wait = |a: &AtomicU32, r: u32| {
+            while a.load(Ordering::Acquire) != r {
+                core::hint::spin_loop();
+            }
+        };
+        let mut both_missed = 0;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for r in 1..=ROUNDS {
+                    wait(&start, r);
+                    let g = t.enter_read(0);
+                    seen.store(published.load(Ordering::Acquire), Ordering::Relaxed);
+                    wait(&checked, r);
+                    drop(g);
+                    read.store(r, Ordering::Release);
+                }
+            });
+            s.spawn(|| {
+                for r in 1..=ROUNDS {
+                    wait(&start, r);
+                    published.store(false, Ordering::Release);
+                    let epoch = t.unpublished();
+                    past.store(t.is_grace_period_past(epoch), Ordering::Relaxed);
+                    checked.store(r, Ordering::Release);
+                }
+            });
+            for r in 1..=ROUNDS {
+                published.store(true, Ordering::Release);
+                start.store(r, Ordering::Release);
+                wait(&read, r);
+                if seen.load(Ordering::Relaxed) && past.load(Ordering::Relaxed) {
+                    both_missed += 1;
+                }
+            }
+        });
+        assert_eq!(both_missed, 0, "rounds of {ROUNDS} in which neither saw the other");
     }
 
     #[test]

@@ -44,7 +44,8 @@ Model B (`ReadRange`); Model A's `MapRange`/`AllocRange` are in
 2. The server replies `object_kind = OBJECT_KIND_FILE`, with `content_len` set to
    the **total file size** and **no handle** in `handles[0]`. The kernel builds a
    page-cache object (a `FileObject`) of that size, pointed back at this server,
-   and installs it into the client's handle table.
+   and parks it in the lookup's PO; the client's `sys_wait` installs it in the
+   client's table.
 3. The client `sys_memory_map`s the file handle. The mapping is **lazy** — no
    pages are resident.
 4. On the first touch of a page, the kernel's page-fault handler issues a

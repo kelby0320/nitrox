@@ -165,41 +165,42 @@ lookup(handle, caller_pid, required_rights) -> LookupOk
 ```
 
 Implemented in `HandleTable::lookup`, matching spec § "Validation
-algorithm" step-for-step.
+algorithm" step-for-step, and numbered as its comments are.
 
-1. `enter_read` on the grace tracker.
-2. `handle != NULL`.
-3. `seg_id < DIRECTORY_LEN`.
-4. `directory[seg_id]` is non-null (Acquire load).
-5. `slot_id < SEGMENT_LEN`.
-6. `read_snapshot(entry)` — seqlock loop returning a consistent
+1. Decode; `handle != NULL`.
+2. `seg_id < DIRECTORY_LEN`.
+3. `directory[seg_id]` is non-null (Acquire load).
+4. `slot_id < SEGMENT_LEN`.
+5. `read_snapshot(entry)` — seqlock loop returning a consistent
    metadata tuple plus the observed seq value.
-7. `entry.object` is non-null (Acquire load).
-8. `try_acquire_refcount(object, type)` — the **ObjectRef seam**
+6. `entry.object` is non-null (Acquire load).
+7. `try_acquire_refcount(object, type)` — the **ObjectRef seam**
    (see below).
-9. Re-read seq; if it changed or is odd, release refcount and retry
+8. Re-read seq; if it changed or is odd, release refcount and retry
    the inner loop.
-10. `generation` matches the handle's encoded generation.
-11. **`owner_pid` matches `caller_pid`** — the security-critical step.
-12. `required ⊆ entry.rights`.
-13. Return.
+9. `generation` matches the handle's encoded generation.
+10. **`owner_pid` matches `caller_pid`** — the security-critical step.
+11. `required ⊆ entry.rights`.
+12. Return.
 
-Every error path that has already incremented the refcount releases
-it before returning.
+Steps 5 to 7 run in a read section on the grace tracker (`enter_read`), which every
+close waits out. Every error path that has already incremented the refcount releases
+it before returning, outside the read section: a last release runs a destructor, which
+may close.
 
 ### ObjectRef seam
 
-Step 8 calls `try_acquire_refcount(*mut (), KObjectType) -> bool`, which
+Step 7 calls `try_acquire_refcount(*mut (), KObjectType) -> bool`, which
 reads the `KObjectHeader` at offset 0 of the object pointer and bumps
 its refcount with `Arc`-upgrade semantics (failing if the count was
 already zero — the object is being torn down). Error/retry paths call
 `release_refcount(*mut (), KObjectType)`, which drops the reference and
 runs the object's destructor (dispatched on `KObjectType`) if it was the
-last. On success, step 13 wraps the acquired reference in an `ObjectRef`
+last. On success, step 12 wraps the acquired reference in an `ObjectRef`
 (the RAII holder in `kernel/src/object/`); `lookup` returns
 `LookupOk { object: ObjectRef, rights }` and dropping the `LookupOk`
 releases the reference. A `#[cfg(test)] FAIL_NEXT_ACQUIRE` flag still
-forces the step-8 failure branch deterministically. See
+forces the step-7 failure branch deterministically. See
 [`docs/spec/abi-version-hash.md`](../spec/abi-version-hash.md) for the
 `KObjectHeader` layout and `kernel/src/object/header.rs` for the
 ownership model.
@@ -218,6 +219,8 @@ close(handle, caller_pid) -> ClosedObject
    **before** draining (drain advances the epoch).
 4. `drain_expired()`. Then push the new `DeferredClose { handle,
    epoch: deferred_epoch }` onto the ring.
+5. Drop the lock and `synchronize`: wait until every read section open now has closed. Only
+   then does the caller get the reference.
 
 The returned `ClosedObject(*mut (), KObjectType)` carries the previous
 object pointer **and its type**, transferring the handle's one
@@ -225,10 +228,15 @@ reference to the caller; `close` itself does **not** decrement. The
 caller releases it via `ObjectRef::from_raw(ptr, ty)` + drop after
 `close` returns. Keeping the decrement out of `close` keeps object
 destruction (which calls `kfree`, a rank-6 allocator lock) off the
-rank-3 handle-table lock, and makes a racing `lookup` safe: the slot's
-reference is conceptually live until the caller takes it, so a
-concurrent `try_acquire` always observes a positive count (pins the
-object) or zero (object dying). The wrapper type makes
+rank-3 handle-table lock. **The wait in step 5 is what makes a racing
+`lookup` safe**: a lookup between reading the pointer and taking its
+reference is in a read section, so the caller's release cannot free the
+object under it. Until 2026-10-28 the grace period guarded only the
+slot's reuse, and a close on another CPU could free the object a lookup
+was about to count (safety survey, kobj-d1). The process-exit sweep,
+`close_owned_batch`, waits the same way. The wait spins: a reader takes
+no lock and waits on nothing, so it lasts as long as the lookups already
+in flight. The wrapper type makes
 `Result<ClosedObject, _>` Send-able for closures that span thread
 boundaries; bare `*mut ()` is `!Send` and would poison any closure
 that touched it.
@@ -261,6 +269,24 @@ stress tests exercise the backoff path: a reader spinning on
 `read_snapshot`'s seqlock under sustained writer pressure may not
 have quiesced yet, and yielding lets it complete.
 
+## Moves
+
+A handle **moves** when an IPC send carries it, a spawn grants it with its `move_mask` bit, or a
+forwarded reply hands it to the kernel. A move is a `HandleTable::claim`: a lookup, then, under
+the rank-3 lock, the entry marked in transit (`HandleEntry::in_transit`), refused if it already
+is. The move commits into its ring, child or reply, then `Claim::commit` closes the handle; a
+move that fails drops its claim, which clears the mark and leaves the handle with its owner.
+**Two moves of one handle at once cannot both pass**: each was a lookup and a later close, and
+both receivers got the object, a copy of a handle that may lack `DUPLICATE` (safety survey,
+kobj-d2). A lookup that asks for `TRANSFER` is a copy and asks for `DUPLICATE` too; a tools test
+holds both rules over the kernel's source.
+
+A claim does not stop the handle's use meanwhile, nor its owner's close, nor the exit sweep:
+`commit` and the drop find the entry by generation, so one closed meanwhile has nothing left to
+close, and one whose slot went to another handle is left alone. A spawn allocates the parent's
+handle to the child before the child runs, so nothing fails after it does and every claim commits
+(kobj-d4).
+
 ## Grace tracking
 
 [`GraceTracker`] is keyed by **context id**, an opaque `u32`. What a
@@ -277,6 +303,14 @@ writes the current epoch into its slot; on exit it sets the high
 bit (`QUIESCED_BIT`). `is_grace_period_past(deferred)` walks every
 context's slot and returns `true` only when every context is either
 quiesced or at a strictly later epoch.
+
+**The reader's announcement and the closer's unpublishing store are a
+Dekker pair**, and each is followed by a `SeqCst` fence: x86 lets a
+store pass a later load, so with either fence missing a reader can read
+the object while the closer reads its context as quiescent. A host test
+races the two a million times. A section is a CPU's, so it must not
+migrate: debug builds assert interrupts masked or preemption off, which
+every caller, a syscall, has.
 
 `current_ctx_id` is a private free function in `kernel/src/handle/mod.rs`
 with `#[cfg(not(test))]` / `#[cfg(test)]` branches. Replacing it

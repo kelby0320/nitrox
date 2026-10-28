@@ -107,7 +107,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
 
 **Defects**
 
-- [ ] **kobj-d1** `kernel/src/handle/table.rs:417` — `HandleTable::lookup` step 7 bumps the
+- [x] **kobj-d1** `kernel/src/handle/table.rs:417` — `HandleTable::lookup` step 7 bumps the
   refcount of an object that a concurrent close may already have freed. The grace tracker defers
   only the slot's reuse. `close_on` (`syscall/table.rs:733`), `sys_handle_close` and
   `close_all_owned_by` drop the last `ObjectRef` at once, so the object is `kfree`d between step 6
@@ -131,8 +131,12 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `Vec` (see kobj-o4). Fix shape: park the `ClosedObject` in the `DeferredClose` entry and release
   it in `drain_expired` once the grace period has passed (see kobj-d5 for the barrier that fix
   needs). abi/ownership/soundness/concurrency/opportunities reviewers all found it. High. **Fix.**
+  Fixed in `fad8abff`: a close, and the exit sweep, wait out every lookup read section open when the
+  entry is nulled, before the caller releases the object; fails without either wait:
+  `a_close_waits_for_a_lookup_about_to_take_its_reference`,
+  `a_sweep_waits_for_a_lookup_about_to_take_its_reference`.
 
-- [ ] **kobj-d2** `kernel/src/syscall/table.rs:1971` — A handle move is not atomic, so two
+- [x] **kobj-d2** `kernel/src/syscall/table.rs:1971` — A handle move is not atomic, so two
   concurrent moves copy a handle that lacks `DUPLICATE`. `sys_channel_send` looks each handle up
   with `TRANSFER`, queues the message, then calls `close_and_release` (`:2008`, `:2031`), which
   ignores a failed close (`:1866`). `sys_process_spawn` does the same (lookup `:455`, close
@@ -148,8 +152,12 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   unserialised on every CPU. A two-thread `-smp 2` boot-probe that sends one `TRANSFER`-only
   handle on two channels in a loop, counting receivers that get it, would settle the timing. See
   kobj-o5. abi/ownership. High. **Fix.**
+  Fixed in `39e2a5c9`, as kobj-o5: a move claims its handle, and a second claim fails; fails without
+  the claim's check or mark: `a_claimed_handle_cannot_be_claimed_again_and_commits_to_closed`. The
+  syscall paths cannot run on the host, so `a_lookup_for_transfer_is_a_copy_and_a_move_is_a_claim`
+  (tools) holds that every move is a claim; it names spawn's move by lookup in the old source.
 
-- [ ] **kobj-d3** `kernel/src/sched/ipc.rs:481` — When a userspace server dies, outstanding
+- [x] **kobj-d3** `kernel/src/sched/ipc.rs:481` — When a userspace server dies, outstanding
   forwarded page-cache fills (`UserspaceServerReg.pending_fill`) are never completed.
   `ipc_endpoint_closing` and `us_reg_detach` (`:272`) drain and fail only pending lookups
   (`take_pending_next`). The faulting thread waits in `FileObject::wait_status`
@@ -168,8 +176,11 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   reference was dropped. The probes were removed. Fix shape: drain `pending_fill` in both
   teardown paths, completing each PO `PeerClosed`. abi/ownership/soundness/concurrency. Medium.
   **Fix**, with the bash's kobj-10, moved here from Part H.
+  Fixed in `7938344d`: `fail_outstanding` fails fills as well as lookups at all three teardown
+  sites, and drops each fill's file outside `SCHED`; fails without the fill drain:
+  `a_dying_server_fails_its_fills_and_frees_their_cycle`, `a_registration_dropped_fails_its_fills`.
 
-- [ ] **kobj-d4** `kernel/src/syscall/table.rs:491` — `sys_process_spawn` commits (the child is
+- [x] **kobj-d4** `kernel/src/syscall/table.rs:491` — `sys_process_spawn` commits (the child is
   running) and then returns `Err` if the parent's Process-handle `allocate` fails, before the move
   loop at `:501-505`. Every handle the caller asked to move stays in the parent while the child
   holds it too, so a move becomes a copy, and the parent loses its only handle to the running
@@ -180,8 +191,11 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   the path, which is deterministic with no race (`:484-499`). A host test needs a current-thread
   harness that `syscall/table/tests.rs` lacks, or a boot-probe that fills the table and spawns
   with a move. ownership. Medium. **Fix**, with the bash's kobj-11, moved here from Part H.
+  Fixed in `39e2a5c9`: the parent's Process handle is allocated before the child runs, so nothing
+  fails after it does and every claim commits. Structural; the spawn path cannot run on the host,
+  and test-qemu, test-interactive, check-login and check-storage pass.
 
-- [ ] **kobj-d5** `kernel/src/handle/grace.rs:48` — `GraceTracker::enter_read` announces the
+- [x] **kobj-d5** `kernel/src/handle/grace.rs:48` — `GraceTracker::enter_read` announces the
   reader with a Release store followed only by an Acquire fence. On x86-TSO nothing orders that
   store before the later load of `entry.object` (`table.rs:403`), which is a Dekker-style
   protocol, so `drain_expired` can see the context as quiescent while a reader still holds the
@@ -191,6 +205,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   SeqCst fence (or a locked op) after the store. Unverified. A loom or herd7 model of `enter_read`
   against close plus `drain_expired` would settle it. The writer side already gets a full barrier
   from the rank-3 spinlock. ownership. Medium. **Fix.**
+  Fixed in `fad8abff`: the reader and the closer each fence `SeqCst`; fails without the reader's:
+  `a_reader_and_a_closer_never_both_miss`, which saw rounds where each missed the other in 6 of 10
+  runs of a million rounds on x86.
 
 - [ ] **kobj-d6** `kernel/src/mm/user_access.rs:177` — `copy_from_user<T: Copy>` and `copy_to_user<T:
   Copy>` (`:205`) accept any `Copy` type. A `T` with invalid bit patterns (`bool`, an enum, `char`,
@@ -206,7 +223,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   valid enum tag" at `user_access.rs:199`. A second probe with `bool` on byte 2 failed the same
   way. The probes were removed. See kobj-o6. soundness/opportunities. Medium. **Fix.**
 
-- [ ] **kobj-d7** `kernel/src/syscall/table.rs:1202` — `sys_ns_bind`'s test for an existing
+- [x] **kobj-d7** `kernel/src/syscall/table.rs:1202` — `sys_ns_bind`'s test for an existing
   registration (`us_forward_existing_reg`) and its install of the back-pointer (`us_server_attach`,
   `:1223`) are separate SCHED holds around an allocating region. Two concurrent binds of one fresh
   endpoint each create a `UserspaceServerReg`, and the second attach clobbers the first's
@@ -220,6 +237,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   lookups and a reply: it printed `reply routed to R2` and "request 1's answer completes the lookup
   of client 200 for \"public\"". It was removed. Fix shape: one SCHED hold for check and attach.
   ownership/concurrency. Medium. **Fix.**
+  Fixed in `d43466d6`: `us_server_attach` attaches unless a live registration is there, which it
+  returns to share, in one `SCHED` hold; fails if it replaces one:
+  `a_second_attach_of_an_endpoint_gets_the_first_registration`.
 
 - [ ] **kobj-d8** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` and its private twin `io/mod.rs:160` are safe functions that wrap
@@ -303,7 +323,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   (2) non-atomic write". It was removed. Fix: `ptr::copy_nonoverlapping` into the `KVec`'s spare
   capacity (see kobj-o11). soundness/opportunities. Low. **Plan**, in P2.
 
-- [ ] **kobj-d14** `kernel/src/handle/global.rs:72` — `global::get()` is a safe `pub fn` that
+- [x] **kobj-d14** `kernel/src/handle/global.rs:72` — `global::get()` is a safe `pub fn` that
   returns `&'static HandleTable` via `assume_init_ref` and checks `READY` only with `debug_assert`
   (`:73`, `:78`). A release build calling it before `init()` forms a reference to uninitialised
   memory. Latent: only `main.rs` (after `init`, `main.rs:231`) and syscall handlers call it. Early
@@ -312,14 +332,19 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   a zero-capacity defer ring that `close()` treats as permanently full. Unverified. A release-
   profile host test calling `get()` before `init()` would settle it. Fix: check `READY`
   unconditionally, one load. soundness. Low. **Fix.**
+  Fixed in `68203f0c`: the check is an `assert`; fails without it, in a release build:
+  `the_table_is_refused_before_init`. Host tests run in debug, where the old `debug_assert` fired
+  too.
 
-- [ ] **kobj-d15** `kernel/src/handle/entry.rs:120` — The seqlock `WriteGuard` publishes the odd
+- [x] **kobj-d15** `kernel/src/handle/entry.rs:120` — The seqlock `WriteGuard` publishes the odd
   seq with a Release store but has no release fence before the Relaxed field stores that follow.
   Release orders only operations before the store, so on a weakly ordered CPU a reader can see new
   fields with the old even seq on both sides and accept a torn snapshot. Latent until the aarch64
   port, since x86 TSO keeps stores in order. Standard writer: `store(s+1, Relaxed); fence(Release);`
   field stores; `store(s+2, Release)`. Unverified. A litmus test on aarch64, or Miri's weak-memory
   emulation on a two-thread writer/reader test, would settle it. opportunities. Low. **Fix.**
+  Fixed in `68203f0c`: a Relaxed odd `seq` and a Release fence; fails without it under Miri's
+  weak-memory emulation, on 16 of 16 seeds: `a_snapshot_is_never_torn`.
 
 **Opportunities**
 
@@ -402,7 +427,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   opportunities. Value high, effort small. **Fix**, first.
   Finished in `86723eed`: under Miri, `kmalloc` and `kfree` go to the host allocator.
 
-- [ ] **kobj-o5** encapsulate: a handle move is a lookup with `TRANSFER`, a commit into a ring,
+- [x] **kobj-o5** encapsulate: a handle move is a lookup with `TRANSFER`, a commit into a ring,
   child or reply, then an ignored-failure `close_and_release`, with nothing claiming the entry in
   between — 8 sites (the move-commit `close_and_release` calls in `syscall/table.rs`, read off
   `grep close_and_release`: `:503` spawn, `:2008` and `:2031` send, `:2120`, `:2155`, `:2218`,
@@ -414,6 +439,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   restores it. Home: `kernel/src/handle/table.rs`. Closes: a move that copies (kobj-d2) and the
   spawn late-failure path (kobj-d4), where the claims would simply be committed. Depends on: nothing;
   fits best with kobj-o2. ownership. Value high, effort medium. **Fix.**
+  Fixed in `39e2a5c9`: `HandleTable::claim`, `Claim::commit` and a drop that gives the handle back,
+  at the send, the forwarded replies and the spawn; each of six mutations fails one of the claim
+  tests.
 
 - [ ] **kobj-o6** encapsulate: plain `#[repr(C)]` ABI data is reinterpreted by hand — per-type
   `as_bytes` through `from_raw_parts(self as *const Self as *const u8, size_of)`, `mem::zeroed`,
@@ -607,7 +635,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the one simulated step, since no host test runs a thread. Miri showed the any-usize decoder.
   abi, ownership, soundness, concurrency, opportunities. Medium. **Fix.**
 
-- [ ] **sched-d2** `kernel/src/sched/ipc.rs:527` — Outstanding page-cache fills
+- [x] **sched-d2** `kernel/src/sched/ipc.rs:527` — Outstanding page-cache fills
   (`UserspaceServerReg.pending_fill`) are never completed when a userspace server dies.
   `ipc_endpoint_closing` (`:508`, `:527`) and `us_reg_detach` (`:281`) drain only the lookups, with
   PeerClosed. The fill's PendingOperation is never signalled, and the cycle reg →
@@ -627,6 +655,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   reg, file and PO (expected 1, 1, 1). Only `take_pending_fill_matching` (a matching reply, or
   originate's rollback) takes `pending_fill`. abi, ownership, soundness, concurrency,
   opportunities. Medium. **Fix**, as kobj-d3.
+  Fixed in `7938344d`, as kobj-d3.
 
 - [ ] **sched-d3** `kernel/src/dpc.rs:71` — The safe `pub fn enqueue(dpc: &Dpc)` takes a borrow of
   any lifetime and stores its address in the global queue. `run_pending` (`:122`) later turns that
@@ -697,7 +726,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   threads plus a file-reading loop and watch RECLAIM's length or free memory grow. concurrency.
   Medium. **Fix.**
 
-- [ ] **sched-d7** `kernel/src/sched/ipc.rs:312` — `us_server_attach` overwrites an endpoint's
+- [x] **sched-d7** `kernel/src/sched/ipc.rs:312` — `us_server_attach` overwrites an endpoint's
   `us_reg` back-pointer unconditionally, and `sys_ns_bind` checks `us_forward_existing_reg`
   (`syscall/table.rs:1202`) in a SCHED hold of its own before allocating and attaching (`:1223`).
   Two binds of one endpoint can interleave and leave two registrations, both starting request ids at
@@ -715,6 +744,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   and 20; the reply to request 1 completed pid 20's lookup (assertion: left 20, right 10). The
   interleaving itself was shown by reading the code (two SCHED holds), not run. A second test showed
   reg_a's lookup left unsignalled at server death. abi, ownership. Medium. **Fix**, as kobj-d7.
+  Fixed in `d43466d6`, as kobj-d7.
 
 - [ ] **sched-d8** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard` at
   `:249`) holds only `&SpinLock<T>`, so it is auto-Sync and auto-Send whenever `T: Send`. Through a
@@ -1198,7 +1228,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: Miri (nightly-2026-07-20) on a probe test, `copy_from_user(UserPtr::<bool>)`
   over a byte holding 2, reports UB at user_access.rs:199 `out.assume_init()`. Lens: ownership.
   Medium. **Fix**, as kobj-d6.
-- [ ] **kmem-d8** `kernel/src/sched/ipc.rs:527` — when a userspace server's endpoint closes,
+- [x] **kmem-d8** `kernel/src/sched/ipc.rs:527` — when a userspace server's endpoint closes,
   `ipc_endpoint_closing` (and `us_reg_detach`, line 281) fails every pending lookup but never
   touches `pending_fill`, so a Model B page-cache fill's PO is never completed. `wait_status`
   (file_object.rs:1177) re-waits on anything but Signaled, process exit included, so the
@@ -1209,7 +1239,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: a host test in the userspace_server tests (an IpcChannel pair, one lookup and
   one fill outstanding, server end dropped). Lookup PO signalled `true`, fill PO signalled
   `false`. Lenses: soundness, opportunities. Medium. **Fix**, as kobj-d3.
-- [ ] **kmem-d9** `kernel/src/object/file_object.rs:790` — `mark_ready` (called by the Model B
+  Fixed in `7938344d`, as kobj-d3.
+- [x] **kmem-d9** `kernel/src/object/file_object.rs:790` — `mark_ready` (called by the Model B
   fill reply, table.rs:2703) readies whichever page now has the index, while `settle` was made
   to match by PO for this reason. A stale fill reply can mark a successor page Ready while its
   own fill is pending. Page i fills (frame A, PO1), a resize retires it, a regrow and a fault
@@ -1219,6 +1250,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: a host probe in the file_object tests ran that sequence. It reported "mapped
   PhysAddr(125966602964992); settle freed 1 frame(s); lookup(2) = None". Lenses: ownership,
   opportunities. Medium. **Fix.**
+  Fixed in `4185caef`: the reply settles the page by its fill's PO; fails with the old `mark_ready`:
+  `a_stale_fill_reply_leaves_its_indexs_next_page_loading`, through the real reply path.
 - [ ] **kmem-d10** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` is safe but wraps the unsafe `ObjectRef::from_raw`, so any box
   under any tag becomes an `ObjectRef` whose last drop runs `dispatch_destroy` for `ty`. The
@@ -1246,7 +1279,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: a host test in addr_space/tests.rs ran those steps. `map_file_page` returned
   true and `translate(6P) == frame2` (a second probe asserts the equivalent with frame 1 at 5P).
   Lenses: abi, ownership, concurrency. Low. **Plan**, as the bash's kmem-15, in Part E.
-- [ ] **kmem-d13** `kernel/src/object/file_object.rs:598` — write-back takes a page's device
+- [x] **kmem-d13** `kernel/src/object/file_object.rs:598` — write-back takes a page's device
   position from its first block and writes `pages * PAGE_SIZE` contiguously from there, and
   `block_map` (table.rs:2622) accepts block sizes under a page without refusing a run boundary
   inside a page. The recorded `TODO(ext4-subpage-runs)` covers the fill from the wrong blocks. It
@@ -1257,6 +1290,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: the path is pointed at. A host test of `write_runs` with runs [file 0..2 -> lba
   100, file 2..4 -> lba 500] at block_size 1024 should issue one 4096-byte IRP at byte 100*1024.
   Lens: abi. Low. **Fix.**
+  Fixed in `adb5f75d`: `block_map` refuses a run that does not begin and end on a page boundary;
+  fails without it, or with only the start checked:
+  `a_block_map_the_page_cache_cannot_use_is_refused`.
 - [ ] **kmem-d14** `kernel/src/arch/x86_64/idt.rs:258` — copy-primitive recovery runs before any
   demand fault-in, so the kernel never populates a valid but lazily backed user page (an untouched
   stack page or an untouched FileBacked page). The copy fails with `Fault`, and `sys_channel_recv`
@@ -2831,7 +2867,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   failing allocator, would settle it.
   ownership (demonstrated), opportunities (unverified). Low. **Fix.**
 
-- [ ] **rt-d6** `userspace/libos/src/exec.rs:141` — `Op::drop` closes an in-flight PO, but for a
+- [x] **rt-d6** `userspace/libos/src/exec.rs:141` — `Op::drop` closes an in-flight PO, but for a
   forwarded lookup the kernel still installs the resolved handle in the caller's table when the
   server replies. An abandoned lookup leaves a handle nothing holds. libfs `po_wait` and liblog
   `open_source` do the same whenever `sys_wait` does not return 1. Scenario: a `Handle::lookup`
@@ -2843,6 +2879,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: needs a boot-probe step that issues `sys_ns_lookup` against a server delaying its
   reply, closes the PO, lets the reply land, and counts handles. Not booted.
   ownership, soundness. Low. **Fix**, raised to Medium.
+  Fixed in `fc9ce772`: a lookup's object is parked in its PO and installed when `sys_wait` reads the
+  completion, the maintainer's choice; a PO freed unread releases it. Fails with the install at
+  reply time: `a_reply_to_a_lookup_its_client_closed_makes_no_handle`.
 
 - [ ] **rt-d7** `userspace/test-harness/src/inputclient.rs:72` — input-testclient's `po_wait`
   never closes its PendingOperation; the file imports no close at all. Scenario: each run
@@ -3218,7 +3257,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   nxterm while display-selftest runs would print `starting service 'nxterm'` twice. The fix is to
   skip or refuse when `running` is true. ownership. Medium.
   **Fix**, with the bash's sup-9, moved here from Part H.
-- [ ] **sup-d4** `userspace/service-mgr/src/main.rs:1369` — `lookup_serving` closes its lookup's
+- [x] **sup-d4** `userspace/service-mgr/src/main.rs:1369` — `lookup_serving` closes its lookup's
   PendingOperation at the deadline, but the kernel still installs the server's late reply handle
   in service-mgr's table, where nothing knows its value. `derive()` resolves device-mgr's
   `info-endpoint` or storage-service's `session-endpoint` with `DERIVE_TIMEOUT_NS` (5 s), and
@@ -3234,6 +3273,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   answers `info-endpoint` more than 5 s late (a probe sleep in `mint_info_endpoint`) would show
   `info_ends.len()` at 1 after service-mgr logged "gave no info-endpoint" and service-mgr's
   handle count growing. ownership, opportunities. Medium. **Fix**, as rt-d6.
+  Fixed in `fc9ce772`, as rt-d6: service-mgr's late answers no longer leave a handle or hold
+  device-mgr's endpoint slot.
 - [ ] **sup-d5** `userspace/init/src/main.rs:420` — init discards the process handle of every
   fs-server and of the profile server it spawns (`let _ = fs_h;`, `let _ = ps_h;` at 559), and
   leaks it on every failure after the spawn: 377-410 and 516-553. The comments say init keeps
@@ -3483,7 +3524,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the object it hands out and the other two send the creation handle, harmless only because the
   kernel installs requested and granted rights intersected. Depends on: nothing. abi, ownership,
   soundness, opportunities. Value medium, effort small. **Plan**, as rt-o3, in P7.
-- [ ] **sup-o8** encapsulate: a hand-written "`sys_ns_lookup`, wait on the PO, read the result at
+- [x] **sup-o8** encapsulate: a hand-written "`sys_ns_lookup`, wait on the PO, read the result at
   16..24, close the PO" helper per crate, each closing the PO whether or not the lookup completed
   — 5 sites (`grep -rnE "^fn (ns_lookup_wait|ns_lookup|lookup)\("` gives 4, plus service-mgr
   `lookup_serving`, which must keep answering routes while it waits), such as
@@ -3499,6 +3540,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (sup-d4 and its siblings). Depends on: nothing for the dedup; a kernel change to `sys_ns_lookup`
   completion (Part E's syscall surface) for the timeout case. ownership, soundness. Value medium,
   effort small for the dedup, medium with the kernel half. **Fix.**
+  Fixed in `fc9ce772`, the kernel half, and `4a1ddbd6`: service-mgr, device-mgr and storage-service
+  resolve through `libfs::lookup_wait`. init keeps its copy until libos's `block_on` stops spinning
+  on a failing wait (rt-d12, group R).
 - [ ] **sup-o9** encapsulate: the five event loops (init `reap_loop`, service-mgr `Mgr::run`,
   device-mgr and storage-service `_start` loops, logging `serve_loop`) hold all 225 unsafe blocks,
   and no host test or Miri reaches any of them — 5 sites (per-file `grep -c unsafe`: 0 in every

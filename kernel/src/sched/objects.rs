@@ -181,6 +181,67 @@ pub unsafe fn pending_op_completion(po: *mut ()) -> (i32, u64) {
     unsafe { (PendingOperation::status(po), PendingOperation::result(po)) }
 }
 
+/// Complete a lookup's [`PendingOperation`] with `status` and its object, **parked** for
+/// [`pending_op_take`]'s reader; one a PO already completed comes back, to drop outside `SCHED`.
+///
+/// # Safety
+///
+/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
+#[must_use]
+pub unsafe fn complete_lookup(
+    po: *mut (),
+    status: i32,
+    parked: Option<(ObjectRef, Rights)>,
+) -> Option<(ObjectRef, Rights)> {
+    let mut g = SCHED.lock();
+    // SAFETY: `po` is a live `PendingOperation` pinned by the caller; `SCHED` held.
+    if unsafe { PendingOperation::already_signaled(po) } {
+        return parked;
+    }
+    // SAFETY: as above.
+    unsafe { PendingOperation::park(po, parked) };
+    signal_pending_op_with_result(&mut g, po, status, 0);
+    None
+}
+
+/// What [`pending_op_take`] found in a completed [`PendingOperation`].
+pub enum Completion {
+    /// Its `(status, result)`.
+    Read(i32, u64),
+    /// A lookup's object, for the reader to install and end with [`pending_op_installed`].
+    Install(ObjectRef, Rights),
+    /// Another reader is installing it; read again.
+    Installing,
+}
+
+/// Read a completed [`PendingOperation`] for `sys_wait`, under one `SCHED` hold.
+///
+/// # Safety
+///
+/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
+pub unsafe fn pending_op_take(po: *mut ()) -> Completion {
+    let _g = SCHED.lock();
+    // SAFETY: `po` is a live `PendingOperation` pinned by the caller; `SCHED` held.
+    unsafe {
+        match PendingOperation::take_parked(po) {
+            Err(()) => Completion::Installing,
+            Ok(Some((obj, rights))) => Completion::Install(obj, rights),
+            Ok(None) => Completion::Read(PendingOperation::status(po), PendingOperation::result(po)),
+        }
+    }
+}
+
+/// End a [`Completion::Install`]: the handle made, or the error the lookup now fails with.
+///
+/// # Safety
+///
+/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
+pub unsafe fn pending_op_installed(po: *mut (), outcome: Result<u64, i32>) {
+    let _g = SCHED.lock();
+    // SAFETY: `po` is a live `PendingOperation` pinned by the caller; `SCHED` held.
+    unsafe { PendingOperation::installed(po, outcome) };
+}
+
 /// Complete a [`PendingOperation`] from **syscall context** (not a wakeup path), taking
 /// `SCHED`. A namespace direct-handle lookup **pre-signals** the PO it returns: resolution
 /// finished synchronously, the PO has no waiters yet, and the caller's later `sys_wait`

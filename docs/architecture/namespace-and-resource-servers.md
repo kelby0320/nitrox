@@ -30,8 +30,8 @@ model that rides on it. It is the contract `docs/rationale/why-supervisor-regist
 > the `KernelServer` binding target, the synchronous `OpStatus` dispatch (no IPC),
 > the registry, and the first servers (`/dev/entropy`, `/proc/self`) bound at boot.
 > **Slice 7 (userspace resource servers, with the fs-server)** adds the
-> **IPC-forwarded** path — the `UserspaceServer` binding target, cross-context handle
-> install, `librsproto`, and the Ready handshake — built when the fs-server, the
+> **IPC-forwarded** path — the `UserspaceServer` binding target, the reply's completion of
+> the caller's lookup, `librsproto`, and the Ready handshake — built when the fs-server, the
 > first userspace RS, consumes it. Each section below marks which wave it belongs to.
 > The async lookup *contract* is fixed in slice 1 (see "Lookup is asynchronous")
 > precisely so slices 3 and 7 need no ABI change.
@@ -275,20 +275,23 @@ on a completed lookup PO returns `IoResult { handle: <the PO>, status: 0,
 result: <the resolved handle> }`; on error, `status` is the negative `KError` and
 `result` is 0. Edge-style waitables (timers, channels) report `result = 0`.
 
-**Where the resolved handle is installed.**
+**Where the resolved handle is installed: by the read.** However a lookup resolves, its
+PO completes with the resolved object and rights **parked in it**, and no handle yet. The
+handle is made when `sys_wait` reports the completion, into the reader's table, and is
+every later read's `result`.
 - **Slice 1 (direct handles)** and **slice 3 (in-kernel servers):** the lookup
-  resolves entirely in the caller's syscall context (no IPC) — slice 1 returns the
-  bound `ObjectRef`; slice 3 calls the `KernelServer` to *compute* the handle — then
-  installs the rights-attenuated handle into the caller's table and returns a
-  **pre-signalled** PO whose `result` is that handle. The caller's `sys_wait` returns
-  immediately — the full async result path, synchronously, without IPC.
+  resolves entirely in the caller's syscall context (no IPC), and returns a
+  **pre-signalled** PO. The caller's `sys_wait` returns immediately: the full async
+  result path, synchronously, without IPC.
 - **Slice 7 (userspace servers):** the lookup forwards over IPC and returns a
-  *pending* PO; when the server responds, the kernel installs the handle into the
-  **original caller's** table (a cross-context install — a new mechanism that lands
-  with that wave) and signals the PO with the result.
+  *pending* PO, which the server's reply completes.
 
-Either way the userspace contract is identical: `lookup → PO → sys_wait →
-IoResult.result`.
+**A PO closed before it is read releases its object, and leaves no handle.** Until
+2026-10-28 the reply installed the handle in the original caller's table at once, so a
+client that gave up on a slow server, at a deadline or by dropping a future, was left a
+handle whose value it never learnt (safety survey rt-d6, and sup-d4: two late answers
+used up device-mgr's info endpoints). The userspace contract is unchanged:
+`lookup → PO → sys_wait → IoResult.result`.
 
 ## The capability model
 
@@ -417,12 +420,12 @@ fn lookup(suffix: &[u8], requested: Rights) -> OpStatus   // Completed(handle) |
 ```
 
 `sys_ns_lookup` resolves the path to the binding as in slice 1; for a `KernelServer`
-target it **calls the server function in the caller's syscall context**, gets a
-handle (or error), installs the rights-attenuated handle into the caller's table,
-and **pre-signals the lookup's `PendingOperation`** with the result — exactly the
-path slice-1 direct handles already take. So an in-kernel lookup is synchronous: the
-caller's `sys_wait` returns immediately with the handle in `IoResult.result`. No
-IPC, no cross-context install, no new ABI. (`OpStatus::Pending` is **reserved** for
+target it **calls the server function in the caller's syscall context**, gets an
+object (or error), and **pre-signals the lookup's `PendingOperation`** with it,
+rights-attenuated and parked for the read (§ "Where the resolved handle is
+installed") — exactly the path slice-1 direct handles already take. So an in-kernel
+lookup is synchronous: the caller's `sys_wait` returns immediately with the handle in
+`IoResult.result`. No IPC, no new ABI. (`OpStatus::Pending` is **reserved** for
 slice 7 — an in-kernel server never returns it.)
 
 **The content model: a lookup yields a handle to a kernel object.** An in-kernel
@@ -560,10 +563,10 @@ zero client change.
 
 A Userspace Server is a process reached over IPC: a `UserspaceServer` binding points
 at its endpoint, lookup **forwards** the suffix over IPC, the server answers with a
-handle, and the kernel **installs it cross-context** into the original caller's table
-(the `Pending` path — the lookup's `PendingOperation` completes when the server
-replies). This is built with the **fs-server** (the first Userspace Server) and needs:
-the `UserspaceServer` binding target, IPC-forwarded lookup, the cross-context install,
+handle, and the kernel parks it in the lookup's `PendingOperation`, which the caller's
+`sys_wait` installs (the `Pending` path — the PO completes when the server replies).
+This is built with the **fs-server** (the first Userspace Server) and needs:
+the `UserspaceServer` binding target, IPC-forwarded lookup, the parked result,
 the `librsproto` codec (`docs/spec/rsproto-wire-format.md`), and the registration
 handshake below. Kernel Servers (slice 3) need **none** of it.
 
@@ -645,7 +648,7 @@ destination, since the user pointers they arrived by are gone by the reply.
 | `KernelServer` binding target + in-kernel dispatch registry | **kernel** (slice 3) |
 | In-kernel servers (`/proc/self`, `/dev/entropy`, `/dev` stub) + boot binding | **kernel** (slice 3) |
 | Routing a resolved lookup to a server endpoint over IPC; the registry | **kernel** (slice 7) |
-| Cross-context handle install on RS response | **kernel** (slice 7) |
+| Completing the caller's lookup on an RS response | **kernel** (slice 7) |
 | Userspace Server impl: `OpStatus` codec + the rsproto wire format | **userspace** (`librsproto`, slice 7) |
 | Deciding *what* to bind *where* (system construction) | **userspace** supervisors (init/service-mgr) |
 
@@ -690,7 +693,7 @@ Numbers `22`–`25`, `30` (`sys_ns_enumerate`) and `37` (`sys_ns_derive`); pre-s
 | `BindingTarget` enum + `KernelServer` dispatch + registry | | ✅ | |
 | In-kernel servers (`/dev/entropy`, `/proc/self`, `/dev` stub) + boot binding | | ✅ | |
 | `OpStatus` (`Completed`/`Rejected`; `Pending` reserved) | | ✅ | (`Pending`) |
-| `UserspaceServer` (IPC) target + forwarded lookup + cross-context install | | | ✅ |
+| `UserspaceServer` (IPC) target + forwarded lookup + the reply's completion | | | ✅ |
 | `librsproto` codec + Ready handshake | | | ✅ |
 | Cross-process `/proc` (filtered/full) + process registry | | (deferred) | (deferred) |
 | `SubNamespace` / `Rewrite` targets | | | (designed; later) |
