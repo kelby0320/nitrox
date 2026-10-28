@@ -122,12 +122,24 @@ fn a_command_that_moved_less_than_its_length_fails() {
     assert_eq!(completion(true, 8192, 8192), (io_error, 0), "the drive's error, whatever moved");
 }
 
+/// Memory standing in for the ABAR, freed when the test is done with its disk.
+struct FakeRegs(*mut [u32; 96]);
+
+impl Drop for FakeRegs {
+    fn drop(&mut self) {
+        // SAFETY: `fake_disk` made the pointer with `Box::into_raw`, and nothing frees it but this.
+        drop(unsafe { std::boxed::Box::from_raw(self.0) });
+    }
+}
+
 /// **A disk on fake registers**: memory standing in for the ABAR, held while the disk is used.
-fn fake_disk() -> (std::boxed::Box<[u32; 96]>, AhciDisk) {
+/// The registers are written through `abar`, so it comes from `into_raw`, a pointer that may
+/// write, not from a shared borrow of the box.
+fn fake_disk() -> (FakeRegs, AhciDisk) {
     crate::mm::test_support::init_global_heap();
     crate::dpc::init().unwrap();
-    let regs = std::boxed::Box::new([0u32; 96]);
-    let abar = regs.as_ptr() as u64;
+    let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
+    let abar = regs.0 as u64;
     let disk = AhciDisk {
         abar,
         port_base: abar + PORT_BASE,
