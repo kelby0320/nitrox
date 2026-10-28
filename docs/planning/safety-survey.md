@@ -2179,9 +2179,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the memcpy/memset address. The unpatched image boots. Any ring-3 process can crash the
   kernel. Fix: `cld; clac` at the top of every stub (see kplat-o9). concurrency. High.
   **Fix**, first.
-  Fixed in `ebb1c277`: every interrupt and exception stub opens with `entry_prologue!`,
-  whose first instructions are `cld; clac`; fails without it: `check-irq-scope`'s third rule, on the
-  original `idt.rs` at all six stubs, and `an_interrupt_stub_opens_with_a_prologue_that_clears_df_and_ac`.
+  Fixed in `ebb1c277`, and in `a57a676b` with no SMAP needed: every interrupt and exception stub
+  opens with `entry_prologue!`, which opens with `clear_entry_flags!` (`pushfq; and; popfq`);
+  fails without it: `check-irq-scope`'s third rule, on the original `idt.rs` at all six stubs,
+  `an_interrupt_stub_opens_with_a_prologue_that_clears_df_and_ac`, and
+  `the_entry_flag_clear_leaves_df_and_ac_clear`.
 - [ ] **kplat-d2** `kernel/src/sched.rs:756` — `thread_enter`'s ring-3 descent calls
   `set_kernel_stack`, `set_syscall_kernel_stack` and `arm_user_entry_cpu_base` (gdt.rs:249,
   syscall.rs:98, 114) with IF=1 and preemption on. Each reads the CPU index with RDTSCP, then
