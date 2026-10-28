@@ -28,7 +28,7 @@ use librsproto::{
     OP_TTY_READ_LINE, OP_TTY_REDEEM, OP_TTY_SET_MODE, OP_TTY_TOKEN, OP_TTY_WRITE, RS_FLAG_ERROR, RS_FLAG_REPLY,
     TTY_MODE_ECHO, decode, encode,
 };
-use tty_server::routing::{Act, CONSOLE, ReadKind, Registry, Sink};
+use tty_server::routing::{Act, CONSOLE, ReadKind, Registry, Sink, backend_refusal};
 use tty_server::tokens::Tokens;
 
 #[global_allocator]
@@ -313,18 +313,17 @@ fn open_tty(serve_end: u64, request_id: u64, reg: &mut Registry) {
             (&raw const REPLY_HANDLES) as u64,
             1,
             SENDMODE_NOBLOCK,
-        ) == 0
+        )
     };
-    if sent {
+    if sent == 0 {
         reg.open(server_end);
         kprint(b"tty-server: terminal opened\n");
     } else {
-        // The reply did not go, so the client end never moved — reclaim both.
-        // SAFETY: closing our own handles.
-        unsafe {
-            syscall1(SYS_HANDLE_CLOSE, client_end);
-            syscall1(SYS_HANDLE_CLOSE, server_end);
-        }
+        // The reply did not go, so the client end never moved — reclaim both, and answer: a
+        // forwarded resolve has no deadline, and its client would wait for good.
+        close(client_end);
+        close(server_end);
+        reply_error(serve_end, OP_NS_RESOLVE, request_id, sent as i32);
     }
 }
 
@@ -345,11 +344,8 @@ fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
     };
     // Registered before the reply so the terminal exists when first used; undone if it cannot go.
     if !reg.open_sibling(server_end, of) {
-        // SAFETY: closing our own handles; neither has been sent.
-        unsafe {
-            syscall1(SYS_HANDLE_CLOSE, client_end);
-            syscall1(SYS_HANDLE_CLOSE, server_end);
-        }
+        close(client_end);
+        close(server_end);
         reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::NotFound.as_i32());
         return;
     }
@@ -367,12 +363,12 @@ fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
                     (&raw const REPLY_HANDLES) as u64,
                     1,
                     SENDMODE_NOBLOCK,
-                ) == 0
+                )
             }
-            None => false,
+            None => KError::KernelError.as_i32() as i64,
         }
     };
-    if sent {
+    if sent == 0 {
         // With the count, so a leak is visible: a stage's terminal not freed would hold one of
         // `MAX_TTYS` slots for good. `test-interactive` compares it across identical commands.
         libkern::debug::Line::new()
@@ -381,14 +377,29 @@ fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
             .s(b" open")
             .end();
     } else {
-        // The client end never moved, so nobody can use the terminal: take it back out.
+        // The client end never moved, so nobody can use the terminal: take it back out, and
+        // say so, or the shell waits for its stage's terminal for good.
         reg.close(server_end);
-        // SAFETY: closing our own handles.
-        unsafe {
-            syscall1(SYS_HANDLE_CLOSE, client_end);
-            syscall1(SYS_HANDLE_CLOSE, server_end);
-        }
+        close(client_end);
+        close(server_end);
+        reply_error(of, OP_TTY_OPEN_SIBLING, request_id, sent as i32);
     }
+}
+
+/// Close `h`, a handle this process holds; `0` is none.
+fn close(h: u64) {
+    if h != 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    }
+}
+
+/// What the kernel says of handle `h`. `None` if this process holds no such handle.
+fn stat(h: u64) -> Option<HandleInfo> {
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable `HandleInfo`, the layout the kernel writes.
+    let r = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
+    (r == 0).then_some(info)
 }
 
 /// Free terminal `i`: close its endpoint and drop it.
@@ -441,19 +452,25 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
         }
         OP_TTY_ATTACH_BACKEND => {
             let handle = sent.take(0).unwrap_or(0);
-            if handle == 0 {
-                // Succeeding silently would leave the emulator waiting for output that goes to
-                // the console.
-                reply_error(ch, op, request_id, KError::InvalidArgument.as_i32());
+            // Succeeding silently with no handle would leave the emulator waiting for output that
+            // goes to the console.
+            let refused = match stat(handle) {
+                Some(info) => backend_refusal(info.object_type, info.rights),
+                None => Some(KError::InvalidArgument),
+            };
+            if let Some(e) = refused {
+                close(handle);
+                reply_error(ch, op, request_id, e.as_i32());
             } else {
                 match reg.attach_backend(ch, handle) {
-                    Some(_) => {
+                    Some((_, left)) => {
+                        // Closed, so the emulator of the backend the terminal left sees it end.
+                        left.into_iter().for_each(close);
                         reply(ch, OP_TTY_ATTACH_BACKEND, request_id, &[]);
                         kprint(b"tty-server: terminal attached to a backend channel\n");
                     }
                     None => {
-                        // SAFETY: closing the handle we were given and did not keep.
-                        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+                        close(handle);
                         reply_error(ch, op, request_id, KError::NotFound.as_i32());
                     }
                 }
@@ -621,6 +638,7 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
                     // which stays mapped for the process's life
                     bytes.push(unsafe { ((buf_addr + k) as *const u8).read_volatile() });
                 }
+                close(read_po);
                 read_po = 0; // consumed; the next iteration submits another
                 perform(&reg.feed(CONSOLE, &bytes));
             } else if reg.channels().any(|c| c == h) {

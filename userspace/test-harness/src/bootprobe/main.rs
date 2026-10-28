@@ -50,6 +50,7 @@ mod registry;
 mod services;
 mod storage;
 mod storage_admin;
+mod tty;
 mod views;
 
 use accounts::*;
@@ -64,6 +65,7 @@ use registry::*;
 use services::*;
 use storage::*;
 use storage_admin::*;
+use tty::*;
 use views::*;
 
 /// Page size, for the mapped-file checks below.
@@ -230,6 +232,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & receive_closes_what_its_caller_does_not_take_test()
         & sessions_close_what_they_were_sent_test(root_ns)
         & tty_backend_closes_what_it_was_sent_test(root_ns)
+        & tty_refuses_a_backend_it_cannot_wait_on_test(root_ns)
+        & tty_reattach_closes_the_old_backend_test(root_ns)
         & setup_closes_what_its_fields_do_not_name_test(root_ns)
         & ipc_port_closes_what_it_was_sent_test()
         & auth_closes_what_it_was_sent_test(root_ns)
