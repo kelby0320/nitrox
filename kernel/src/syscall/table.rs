@@ -489,15 +489,12 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     };
 
     // The parent's handle to the child before the child runs: nothing may fail once it does.
-    let (pp, pt) = proc_obj.clone().into_raw();
-    let parent_handle = match global::get().allocate(parent_pid, pp, pt, Rights::SIGNAL | Rights::TERMINATE) {
+    let parent_handle = match install(parent_pid, proc_obj.clone(), Rights::SIGNAL | Rights::TERMINATE) {
         Ok(h) => h,
         Err(e) => {
-            // SAFETY: adopt + drop the reference yielded by `into_raw`.
-            drop(unsafe { ObjectRef::from_raw(pp, pt) });
             drop(proc_obj);
             spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
-            return Err(map_handle_err(e));
+            return Err(e);
         }
     };
 
@@ -578,7 +575,7 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     let proc = crate::sched::current_process().ok_or(KError::InvalidArgument)?;
     let pid = crate::sched::current_owner_pid();
 
-    let th = crate::sched::spawn_user_sched(
+    let th = crate::sched::make_user_sched(
         proc,
         args.entry,
         args.user_sp,
@@ -590,17 +587,13 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     )
     .map_err(|_| KError::OutOfMemory)?;
 
-    let (tp, tt) = th.into_raw();
-    let rights = Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE;
-    match global::get().allocate(pid, tp, tt, rights) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // Already running; reclaim only this surplus reference, off the rank-3 table lock.
-            // SAFETY: adopt + drop the single reference `into_raw` yielded.
-            drop(unsafe { ObjectRef::from_raw(tp, tt) });
-            Err(map_handle_err(e))
-        }
+    // Its handle before it runs: nothing may fail once it does, or a retry would start another.
+    let h = install(pid, th.clone(), Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)?;
+    if crate::sched::start_user(th).is_err() {
+        close_and_release(h, pid);
+        return Err(KError::OutOfMemory);
     }
+    Ok(h.bits() as isize)
 }
 
 /// `sys_thread_get_registers(thread, out)` — write the user registers of a **suspended**
@@ -1376,17 +1369,9 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
     let po_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
     let po_ptr = po_ref.as_ptr();
-    let (pp, pt) = po_ref.clone().into_raw();
     // No `DUPLICATE` or `TRANSFER`: it will hold its object, which could be the ring it is moved to.
-    let po_h = match global::get().allocate(pid, pp, pt, Rights::WAIT | Rights::INSPECT) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the clone; reclaim it. `po_ref` then
-            // drops at return, destroying the PO (no waiters yet — its assert holds).
-            drop(unsafe { ObjectRef::from_raw(pp, pt) });
-            return Err(map_handle_err(e));
-        }
-    };
+    // A refusal drops `po_ref` at return, destroying the PO (no waiters yet — its assert holds).
+    let po_h = install(pid, po_ref.clone(), Rights::WAIT | Rights::INSPECT)?;
 
     // SAFETY: live `Namespace` (type verified by `lookup_typed`).
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
@@ -1862,6 +1847,16 @@ fn read_completion(po: &ObjectRef, pid: u32) -> (i32, u64) {
 /// The rights of a freshly created channel endpoint (`docs/spec/ipc-message-format.md`).
 fn channel_endpoint_rights() -> Rights {
     Rights::SEND | Rights::RECV | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT | Rights::WAIT
+}
+
+/// Install `obj` in `pid`'s table with `rights`, or release it, off the table's lock.
+fn install(pid: u32, obj: ObjectRef, rights: Rights) -> Result<RawHandle, KError> {
+    let (p, t) = obj.into_raw();
+    global::get().allocate(pid, p, t, rights).map_err(|e| {
+        // SAFETY: `allocate` did not adopt the reference; reclaim it.
+        drop(unsafe { ObjectRef::from_raw(p, t) });
+        map_handle_err(e)
+    })
 }
 
 fn close_and_release(h: RawHandle, pid: u32) {

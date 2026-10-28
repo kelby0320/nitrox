@@ -82,3 +82,21 @@ fn a_forwarded_reply_closes_the_handles_it_carries() {
     assert!(!held(h, PID), "closed with the reply");
     global::close_all_owned_by(PID);
 }
+
+/// **A blocking send that cannot make its PO's handle commits nothing**: it fails before the push,
+/// so its message is not in the peer's ring and its handles stay, and a retry sends it once.
+#[test]
+fn a_blocking_send_whose_handle_cannot_be_made_sends_nothing() {
+    const PID: u32 = 4464;
+    init_global_heap();
+    global::init_for_tests();
+    let ((a, b), msg) = (pair(1), message());
+    let (h, mut t, mut c) = moving(PID);
+    crate::handle::table::FAIL_NEXT_ALLOCATE.with(|f| f.set(true));
+    assert_eq!(deliver(&a, &msg, &mut t, &mut c, SendMode::Block, 0, PID), Err(KError::OutOfMemory));
+    // SAFETY: `b` is pinned by the test's reference, and the test is single-threaded.
+    assert!(!unsafe { IpcChannel::already_signaled(b.as_ptr()) }, "no message for the peer");
+    drop((t, c));
+    assert!(held(h, PID), "its handle not moved");
+    global::close_all_owned_by(PID);
+}

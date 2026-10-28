@@ -206,14 +206,16 @@ fn spawn_inner(
 /// fabrication happen before the enqueue lock.
 pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64, boot_args: [u64; 4]) -> Result<ObjectRef, AllocError> {
     // Default scheduling: TimeShared, nice 0, no affinity restriction.
-    spawn_user_sched(process, entry, user_sp, boot_args, SchedClass::TimeShared, 0, 0, u8::MAX)
+    let r = make_user_sched(process, entry, user_sp, boot_args, SchedClass::TimeShared, 0, 0, u8::MAX)?;
+    // Clone the caller's handle before the enqueue moves `r` into `ready`.
+    let handle = r.clone();
+    start_user(r).map(|()| handle)
 }
 
 /// As [`spawn_user`], but with explicit scheduling parameters (the `RealTime` class is
-/// `REAL_TIME`-gated by the caller). They are set **before** the thread is enqueued, so it
-/// never runs a tick under the wrong class.
+/// `REAL_TIME`-gated by the caller), and not enqueued: [`start_user`] runs it, after what may fail.
 #[allow(clippy::too_many_arguments, reason = "a thread's process, entry, stack and scheduling")]
-pub fn spawn_user_sched(
+pub fn make_user_sched(
     process: ObjectRef,
     entry: u64,
     user_sp: u64,
@@ -240,18 +242,20 @@ pub fn spawn_user_sched(
         Thread::set_sched(obj, class, rt_priority, nice);
         Thread::set_cpu_mask(obj, cpu_mask);
     }
-    // Clone the caller's handle before the enqueue moves `r` into `ready`.
-    let handle = r.clone();
+    Ok(r)
+}
 
+/// Enqueue a thread [`make_user_sched`] made.
+pub fn start_user(r: ObjectRef) -> Result<(), AllocError> {
     let leftover = {
         let mut g = SCHED.lock();
         match place_spawned(&mut g, r) {
-            Ok(()) => return Ok(handle),
+            Ok(()) => return Ok(()),
             Err(returned) => returned, // carry out of the locked block
         }
     };
-    // Over capacity: lock released; `leftover` and `handle` drop here, freeing the stack and
-    // releasing the Process off the rank-1 lock.
+    // Over capacity: lock released; `leftover` drops here, freeing the stack and releasing the
+    // Process off the rank-1 lock.
     drop(leftover);
     Err(AllocError)
 }

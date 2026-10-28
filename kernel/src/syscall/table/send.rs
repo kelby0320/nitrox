@@ -55,37 +55,24 @@ pub(super) fn deliver(
             // SAFETY: `into_raw` yields the single creation reference; adopt it.
             let po_ref =
                 unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
-            // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-            match unsafe { crate::sched::ipc_send_push_blocking(ch.as_ptr(), bounce, transfers, &po_ref, deadline_ns) }
-            {
+            // Its handle before the push: nothing may fail once the message is committed, or a
+            // retry would send it twice.
+            let po_h = install(pid, po_ref.clone(), pending_op_rights())?;
+            // SAFETY: `ch` is the live `IpcChannel` its lookup type-checked, held across the call.
+            let refused = match unsafe {
+                crate::sched::ipc_send_push_blocking(ch.as_ptr(), bounce, transfers, &po_ref, deadline_ns)
+            } {
                 BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
                     commit_all(claims);
-                    let (op, ot) = po_ref.into_raw();
-                    match global::get().allocate(pid, op, ot, pending_op_rights()) {
-                        Ok(h) => Ok(h.bits() as isize),
-                        // Table full: the message was still committed. A `Queued` PO lives on via
-                        // the pending-send queue; a `Sent` one is reclaimed here.
-                        Err(e) => {
-                            // SAFETY: reclaims the reference `into_raw` gave up.
-                            drop(unsafe { ObjectRef::from_raw(op, ot) });
-                            Err(map_handle_err(e))
-                        }
-                    }
+                    return Ok(po_h.bits() as isize);
                 }
                 // Back-pressure / dead peer: nothing committed; the sender keeps its handles.
-                BlockSendOutcome::PendingFull => {
-                    drop(po_ref);
-                    Err(KError::WouldBlock)
-                }
-                BlockSendOutcome::PeerClosed => {
-                    drop(po_ref);
-                    Err(KError::PeerClosed)
-                }
-                BlockSendOutcome::Cycle => {
-                    drop(po_ref);
-                    Err(KError::InvalidArgument)
-                }
-            }
+                BlockSendOutcome::PendingFull => KError::WouldBlock,
+                BlockSendOutcome::PeerClosed => KError::PeerClosed,
+                BlockSendOutcome::Cycle => KError::InvalidArgument,
+            };
+            close_and_release(po_h, pid);
+            Err(refused)
         }
     }
 }
