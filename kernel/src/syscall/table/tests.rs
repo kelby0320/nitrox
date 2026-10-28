@@ -43,8 +43,8 @@ fn a_block_map_the_page_cache_cannot_use_is_refused() {
     let top = u64::MAX;
     let in_bytes = top / 512; // the last device block whose end in bytes fits
     for (run, taken, what) in [
-        ((top - 8, 2048, 8), true, "a file end of u64::MAX"),
-        ((top - 7, 2048, 8), false, "one past"),
+        ((top - 15, 2048, 8), true, "a file end at the last page below u64::MAX"),
+        ((top - 7, 2048, 8), false, "a page past"),
         ((0, top - 8, 8), false, "a device end of u64::MAX, which no block size fits in bytes"),
         ((0, top - 7, 8), false, "a device end one past u64::MAX"),
         ((0, in_bytes - 8, 8), true, "a device end in bytes of u64::MAX, to the sector"),
@@ -53,6 +53,15 @@ fn a_block_map_the_page_cache_cannot_use_is_refused() {
         assert_eq!(used(&body(512, &[run])), taken, "{what}");
     }
     assert_eq!(block_map(&body(512, &[(0, 2048, 8)])[..32 + 23]).err(), Some(KError::KernelError), "a run cut short");
+    // A page lies in one run: written back from its first block, its rest would land past the run.
+    for (runs, taken, what) in [
+        (&[(0, 100, 4), (4, 500, 4)][..], true, "1 KiB blocks, runs of whole pages"),
+        (&[(0, 100, 2), (2, 500, 2)], false, "a boundary inside a page"),
+        (&[(0, 100, 3)], false, "a run ending inside a page"),
+        (&[(1, 100, 4)], false, "a run starting inside one"),
+    ] {
+        assert_eq!(used(&body(1024, runs)), taken, "{what}");
+    }
     // 200,000 runs is 4.8 MB, past the buddy's largest block: refused before it is reserved.
     let mut claims_more = body(512, &[(0, 2048, 8)]);
     claims_more[12..16].copy_from_slice(&200_000u32.to_le_bytes());
@@ -713,9 +722,7 @@ fn a_file_size_or_rename_flags_past_what_the_wire_carries_are_refused() {
     assert_eq!(truncate, KError::TooLarge.as_isize(), "taken as 10 bytes, it would free the rest");
 }
 
-/// **A fill's reply readies its own page**, not whichever holds its index now: a resize can retire
-/// the page mid-fill and a fault reserve the index afresh, and readied by a stale reply, the new
-/// page is mapped while its own fill runs, and freed if that fill fails.
+/// **A fill's reply readies its own page**, not one a resize let a fault reserve its index for.
 #[test]
 fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     use crate::libkern::KVec;

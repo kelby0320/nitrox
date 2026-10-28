@@ -678,7 +678,7 @@ pub fn map_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [crate::BlockRun])
         return Err(FsError::TooLarge); // too fragmented to inline in the resolve reply
     }
     // TODO(ext4-subpage-runs): with blocks under a page, a run boundary inside a page is not
-    // refused, and the kernel would fill that page from one device range regardless.
+    // avoided, and the kernel refuses such a map, so the file cannot be opened.
     Ok(MappedFile { size, block_size: bs, runs: n, ino })
 }
 

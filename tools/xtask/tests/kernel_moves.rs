@@ -34,9 +34,8 @@ fn kernel_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// **A handle moves by a claim**: two moves of one handle at once would otherwise both pass their
-/// lookups, a copy without `DUPLICATE`. So a lookup asking for `TRANSFER` is a copy, asking for
-/// `DUPLICATE` too.
+/// **A handle moves by a claim**, or two moves of it at once both pass their lookups: a copy. So a
+/// lookup asking for `TRANSFER` is a copy, asking for `DUPLICATE` too.
 #[test]
 fn a_lookup_for_transfer_is_a_copy_and_a_move_is_a_claim() {
     let mut files = Vec::new();

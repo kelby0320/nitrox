@@ -10,7 +10,8 @@ use crate::syscall::error::KError;
 ///   it; `0` would divide by zero);
 /// - **a run whose ends do not fit a `u64`**: its file blocks' end, its device blocks' end, and
 ///   that end in bytes. The fill and write-back add within a run and multiply by the block
-///   size, and a kernel built with overflow checks panics on either.
+///   size, and a kernel built with overflow checks panics on either;
+/// - **a run that does not begin and end on a page boundary**.
 ///
 /// `OutOfMemory` if the runs cannot be held.
 pub(super) fn block_map(
@@ -29,7 +30,11 @@ pub(super) fn block_map(
         let (file_block, device_lba, length, flags) = file_blocks_run(body, i).ok_or(KError::KernelError)?;
         let fits = file_block.checked_add(length as u64).is_some()
             && device_lba.checked_add(length as u64).and_then(|end| end.checked_mul(bs as u64)).is_some();
-        if !fits {
+        // A page is filled and written back as one range from its first block, so in one run.
+        let per_page = (PAGE_SIZE as u32 / bs) as u64;
+        let whole_pages =
+            length == 0 || (file_block.is_multiple_of(per_page) && (length as u64).is_multiple_of(per_page));
+        if !fits || !whole_pages {
             return Err(KError::KernelError);
         }
         let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
