@@ -137,13 +137,21 @@ macro_rules! irq_dispatcher {
     };
 }
 
-/// Every interrupt and exception stub's first instructions: `cld; clac`, since ring 3 may leave DF
-/// or AC set and only `syscall` masks them (SFMASK); then the error-code slot, vector and 15 GPRs
-/// of an [`ExceptionFrame`], its address in RDI. `clac` needs SMAP, which the kernel requires.
+/// Clear DF and AC (RFLAGS bits 10 and 18), which ring 3 may leave set: only `syscall` masks them
+/// (SFMASK). Through `popfq`, not `cld; clac`: `clac` raises #UD on a CPU without SMAP, and the IDT
+/// is live before the kernel checks for SMAP, so an early fault there would end in a triple fault.
+macro_rules! clear_entry_flags {
+    () => {
+        "pushfq\nand dword ptr [rsp], ~0x40400\npopfq\n"
+    };
+}
+
+/// Every interrupt and exception stub's first instructions: `clear_entry_flags!`, then the
+/// error-code slot, vector and 15 GPRs of an [`ExceptionFrame`], its address in RDI.
 macro_rules! entry_prologue {
     ($errcode:literal, $vec:tt) => {
         concat!(
-            "cld\nclac\n",
+            clear_entry_flags!(),
             $errcode,
             "push ",
             stringify!($vec),

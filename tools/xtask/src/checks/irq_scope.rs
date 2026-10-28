@@ -33,28 +33,30 @@ pub(crate) fn scope_binding(line: &str) -> ScopeBinding {
     if binding == "_" { ScopeBinding::Discarded } else { ScopeBinding::Held }
 }
 
-/// Whether the stub whose `dispatch = sym` is on line `at` opens with `entry_prologue!`, scanned
-/// back to its `naked_asm!(`; a comment naming the macro does not count.
+/// Whether the stub whose `dispatch = sym` is on line `at` opens with `entry_prologue!`: the first
+/// operand after its `naked_asm!(`, comment lines left out.
 pub(crate) fn stub_uses_prologue(lines: &[&str], at: usize) -> bool {
-    let start = lines[..=at].iter().rposition(|l| l.contains("naked_asm!(")).unwrap_or(at);
-    lines[start..at].iter().any(|l| {
-        let t = l.trim();
-        !t.starts_with("//") && t.contains("entry_prologue!(")
-    })
+    let Some(start) = lines[..=at].iter().rposition(|l| l.contains("naked_asm!(")) else {
+        return false;
+    };
+    let rest = lines[start].split_once("naked_asm!(").map_or("", |(_, r)| r);
+    first_operand(std::iter::once(rest).chain(lines.get(start + 1..at).unwrap_or(&[]).iter().copied()))
+        .is_some_and(|t| t.starts_with("entry_prologue!("))
 }
 
-/// Whether the `entry_prologue!` defined in `text` clears DF and AC (`cld`, `clac`) before its
-/// first push; `None` if `text` defines none. Comment lines are left out of the reading.
-pub(crate) fn prologue_clears_flags(text: &str) -> Option<bool> {
+/// Whether the `entry_prologue!` defined in `text` opens with `clear_entry_flags!()`, the first
+/// operand of its `concat!`; `None` if `text` defines none.
+pub(crate) fn prologue_opens_with_clear(text: &str) -> Option<bool> {
     let start = text.find("macro_rules! entry_prologue")?;
-    let code: String = text[start..]
-        .lines()
-        .take_while(|l| *l != "}")
-        .filter(|l| !l.trim().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let head = &code[..code.find("push").unwrap_or(code.len())];
-    Some(head.contains("cld") && head.contains("clac"))
+    let body = &text[start..];
+    let body = &body[..body.find("\n}").unwrap_or(body.len())];
+    let rest = body.split_once("concat!(").map_or("", |(_, r)| r);
+    Some(first_operand(rest.lines()).is_some_and(|t| t.starts_with("clear_entry_flags!()")))
+}
+
+/// The first line of code in `lines`, trimmed, past blank and comment lines.
+fn first_operand<'a>(lines: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    lines.map(str::trim).find(|t| !t.is_empty() && !t.starts_with("//"))
 }
 
 /// How many naked entry stubs `check-irq-scope` expects to find.
@@ -90,8 +92,9 @@ const SYM_OPERAND_ALLOWLIST: &[&str] = &[
 /// 2. that macro must in fact still call `enter_interrupt` — otherwise rule 1 checks that
 ///    everyone went through a door that no longer leads anywhere; and
 /// 3. every stub whose dispatcher that macro generated must open with `entry_prologue!`, defined
-///    in the same file, whose first instructions are `cld` and `clac`: on an interrupt nothing
-///    else clears the DF and AC ring 3 may have left (`syscall` has its SFMASK).
+///    in the same file, which must open with `clear_entry_flags!()`: on an interrupt nothing else
+///    clears the DF and AC ring 3 may have left (`syscall` has its SFMASK). That the macro does
+///    clear them is the kernel's host test `the_entry_flag_clear_leaves_df_and_ac_clear`.
 ///
 /// Arch-generic: it walks `kernel/src/arch`, so an aarch64 entry path is covered the day it exists.
 ///
@@ -144,7 +147,7 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
                         unprologued.push((site.clone(), path.display().to_string(), name.clone()));
                     }
                     if !prologue_defs.iter().any(|(f, _)| *f == path.display().to_string()) {
-                        prologue_defs.push((path.display().to_string(), prologue_clears_flags(&text)));
+                        prologue_defs.push((path.display().to_string(), prologue_opens_with_clear(&text)));
                     }
                     called.push((site, path.display().to_string(), name));
                 }
@@ -260,9 +263,9 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
     for (site, file, name) in &unprologued {
         if generated.iter().any(|(f, g)| f == file && g == name) {
             violations.push(format!(
-                "{site}: the interrupt stub dispatching to `{name}` does not build its frame with \
-                 `entry_prologue!`, so nothing clears DF and AC before kernel code runs: ring 3 \
-                 may have left either set"
+                "{site}: the interrupt stub dispatching to `{name}` does not open with \
+                 `entry_prologue!`, so nothing clears DF and AC before its first instruction: ring \
+                 3 may have left either set"
             ));
         }
     }
@@ -276,8 +279,8 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
                  clear DF and AC"
             )),
             Some(false) => violations.push(format!(
-                "{file}: `entry_prologue!` does not run `cld` and `clac` before its first push, \
-                 so a stub entered from ring 3 runs with whatever DF and AC user code left"
+                "{file}: `entry_prologue!` does not open with `clear_entry_flags!()`, so a stub \
+                 entered from ring 3 runs with whatever DF and AC user code left"
             )),
             Some(true) => {}
         }

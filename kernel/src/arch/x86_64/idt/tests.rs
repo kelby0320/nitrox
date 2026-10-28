@@ -56,3 +56,34 @@ fn fault_shape_maps_vectors() {
 fn stub_table_covers_all_32_vectors() {
     assert_eq!(STUBS.len(), 32);
 }
+
+/// **The entry flag clear clears DF and AC**, run here with both set first. Ring 3 may set AC with
+/// `popfq` as it may DF, which is how a stub can find them, and how this test runs the stubs' text.
+#[test]
+#[cfg_attr(miri, ignore = "inline assembly")]
+fn the_entry_flag_clear_leaves_df_and_ac_clear() {
+    const DF_AC: u64 = 1 << 10 | 1 << 18;
+    let (set, cleared): (u64, u64);
+    // SAFETY: sets DF and AC, runs the clear, then clears both again apart from the macro, as the
+    // end of an `asm!` block requires; every push is popped, and each access aligned, as AC needs.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "or dword ptr [rsp], 0x40400",
+            "popfq",
+            "pushfq",
+            "pop {set}",
+            clear_entry_flags!(),
+            "pushfq",
+            "pop {cleared}",
+            "pushfq",
+            "and qword ptr [rsp], -0x40401",
+            "popfq",
+            "cld",
+            set = out(reg) set,
+            cleared = out(reg) cleared,
+        );
+    }
+    assert_eq!(set & DF_AC, DF_AC, "the test set both");
+    assert_eq!(cleared & DF_AC, 0, "the clear left {:#x}", cleared & DF_AC);
+}

@@ -55,7 +55,8 @@ pub(crate) fn print_help() {
            unsafe-inventory  `unsafe` and raw pointers by kind, a row per crate or kernel module,\n  \
            \x20                 tests left out; `unsafe-inventory PATH...` for those paths\n  \
            check-images    fail if a test image and a release image differ by anything new\n  \
-           check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope\n  \
+           check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope or\n  \
+           \x20               does not open by clearing DF and AC\n  \
            abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
