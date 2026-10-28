@@ -1201,31 +1201,19 @@ pub fn sys_ns_bind(
     if res_ok.object.object_type() == KObjectType::IpcChannel {
         // Bind-mount semantics: an endpoint that already backs a registration is *shared*; a
         // rival would clobber the endpoint→reg reply-routing back-pointer and hijack replies.
-        // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-        if let Some(existing) = unsafe { crate::sched::us_forward_existing_reg(res_ok.object.as_ptr()) } {
-            return match ns.bind_userspace_server(path, existing, rights, base) {
-                Ok(()) => Ok(0),
-                Err((returned, e)) => {
-                    drop(returned);
-                    Err(map_ns_err(e))
-                }
-            };
-        }
         let reg_box = UserspaceServerReg::try_new(res_ok.object.clone()).map_err(|_| KError::OutOfMemory)?;
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let reg_ref = unsafe {
             ObjectRef::from_raw(KBox::into_raw(reg_box).as_ptr() as *mut (), KObjectType::UserspaceServerReg)
         };
-        // Held across the attach: an unbind on another thread can drop the binding's reference.
-        let keep = reg_ref.clone();
-        return match ns.bind_userspace_server(path, reg_ref, rights, base) {
-            Ok(()) => {
-                // Record the endpoint → registration back-pointer (only on success).
-                // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across
-                // the call.
-                unsafe { crate::sched::us_server_attach(res_ok.object.as_ptr(), &keep) };
-                Ok(0)
-            }
+        // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+        let reg = match unsafe { crate::sched::us_server_attach(res_ok.object.as_ptr(), &reg_ref) } {
+            Some(existing) => existing,
+            None => reg_ref,
+        };
+        // A failed bind drops a registration attached here, whose drop detaches it.
+        return match ns.bind_userspace_server(path, reg, rights, base) {
+            Ok(()) => Ok(0),
             Err((returned, e)) => {
                 drop(returned);
                 Err(map_ns_err(e))
@@ -2099,9 +2087,9 @@ fn answer_forget(reg: &ObjectRef, file_id: u64, pid: u32) -> SysResult {
 
 /// Complete a forwarded **reply** inline in the server's `sys_channel_send`: a
 /// `Namespace::Resolve` or `File::ReadRange` (page-cache fill) reply is routed by its op; one
-/// that is neither is consumed (transfers dropped). The caller then closes the sender's handles,
-/// whatever the reply. Runs in syscall context (no `SCHED` held), so the cross-context
-/// `allocate` and the drops are outside the lock.
+/// that is neither is consumed (transfers dropped); the caller closes the sender's handles.
+/// Runs in syscall context (no `SCHED` held), so the
+/// cross-context `allocate` and the drops are outside the lock.
 fn complete_forwarded_reply(
     reg: &ObjectRef,
     bounce: &StoredMsg,

@@ -336,48 +336,30 @@ unsafe fn fail_outstanding<const N: usize>(g: &mut SchedState, reg: *mut (), orp
 
 /// Record the endpoint → registration back-pointer that makes `endpoint` the kernel's end of
 /// a Userspace Server channel, so a reply sent to it (by the server, on its peer) is
-/// completed inline rather than enqueued. Called by `sys_ns_bind` once the binding owns the
-/// registration, with a reference of its own still held since an unbind on another thread
-/// may drop the binding's. Takes `SCHED`.
+/// completed inline rather than enqueued, unless a live registration is there already: that one
+/// comes back to share, from the same `SCHED` hold, so two binds cannot each make one.
 ///
 /// # Safety
 ///
 /// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds,
 /// and `reg` is a `UserspaceServerReg`.
-pub unsafe fn us_server_attach(endpoint: *mut (), reg: &ObjectRef) {
+pub unsafe fn us_server_attach(endpoint: *mut (), reg: &ObjectRef) -> Option<ObjectRef> {
     let _g = SCHED.lock();
+    // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
+    let existing = unsafe { IpcChannel::us_reg_of(endpoint) };
+    if !existing.is_null() {
+        // `try_acquire`, not `bump`: one mid-drop has a zero count, and is replaced.
+        // SAFETY: `existing` addresses a `UserspaceServerReg` whose header is at offset 0;
+        // `SCHED` held.
+        let header = unsafe { &*(existing as *const crate::object::header::KObjectHeader) };
+        if header.try_acquire() {
+            // SAFETY: the successful `try_acquire` above balances this adoption.
+            return Some(unsafe { ObjectRef::from_raw(existing, KObjectType::UserspaceServerReg) });
+        }
+    }
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
     unsafe { IpcChannel::set_us_reg(endpoint, reg.as_ptr()) };
-}
-
-/// If `endpoint` already backs a Userspace Server registration, return a **new owned
-/// reference** to it so another namespace binding can share the connection (*bind-mount*
-/// semantics: one endpoint, many names). `None` if not yet registered. Reusing the
-/// registration keeps reply routing correct: the endpoint→reg back-pointer stays a single
-/// target rather than being clobbered by a rival. Takes `SCHED`.
-///
-/// # Safety
-///
-/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
-pub unsafe fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
-    let _g = SCHED.lock();
-    // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
-    let reg = unsafe { IpcChannel::us_reg_of(endpoint) };
-    if reg.is_null() {
-        return None;
-    }
-    // Acquire rather than `bump`: an unconditional increment would resurrect an object whose
-    // count already reached zero. `try_acquire` refuses at zero (`Arc::upgrade` semantics);
-    // together with `us_reg_detach` clearing the back-pointer at teardown this makes the
-    // race unrepresentable rather than merely unlikely.
-    // SAFETY: `reg` addresses a `UserspaceServerReg` whose header is at offset 0;
-    // `SCHED` held.
-    let header = unsafe { &*(reg as *const crate::object::header::KObjectHeader) };
-    if !header.try_acquire() {
-        return None;
-    }
-    // SAFETY: the successful `try_acquire` above balances this adoption.
-    Some(unsafe { ObjectRef::from_raw(reg, KObjectType::UserspaceServerReg) })
+    None
 }
 
 /// Take the forwarded lookup outstanding on `reg` whose `request_id` matches a reply's, for
@@ -628,7 +610,7 @@ mod tests {
         let (k, s) = pair();
         let reg = adopt(UserspaceServerReg::try_new(k.clone()).unwrap(), KObjectType::UserspaceServerReg);
         // SAFETY: `k` is pinned by the test's reference.
-        unsafe { us_server_attach(k.as_ptr(), &reg) };
+        assert!(unsafe { us_server_attach(k.as_ptr(), &reg) }.is_none());
         (reg, s)
     }
 
@@ -666,6 +648,22 @@ mod tests {
         drop((reg, file, lookup, fill));
         let destroyed = (test_probe::userspace_server_reg_destroys(), test_probe::file_object_destroys());
         assert_eq!(destroyed, (1, 1), "the registration and the file, held by the fill");
+    }
+
+    /// **Two binds of one endpoint share one registration**, which every reply routes to.
+    #[test]
+    fn a_second_attach_of_an_endpoint_gets_the_first_registration() {
+        init_global_heap();
+        let (k, _server_end) = pair();
+        let new_reg = || adopt(UserspaceServerReg::try_new(k.clone()).unwrap(), KObjectType::UserspaceServerReg);
+        let (first, second) = (new_reg(), new_reg());
+        // SAFETY: `k` is pinned by the test's reference, and the test is single-threaded.
+        unsafe {
+            assert!(us_server_attach(k.as_ptr(), &first).is_none());
+            let shared = us_server_attach(k.as_ptr(), &second).expect("the first registration");
+            assert_eq!(shared.as_ptr(), first.as_ptr());
+            assert_eq!(IpcChannel::us_reg_of(k.as_ptr()), first.as_ptr(), "replies route to it");
+        }
     }
 
     #[test]

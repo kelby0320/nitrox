@@ -98,9 +98,9 @@ pub struct HandleStat {
 ///
 /// `close` nulls the slot but does **not** decrement the refcount: it transfers
 /// the entry's one reference to this token, which the caller must account for
-/// (normally `ObjectRef::from_raw(co.0, co.1)`, then drop), once `close` has waited out every
-/// lookup that read it. Leaving the decrement to the caller keeps destruction, which reaches
-/// the rank-6 allocator, out from under the rank-3 lock. The
+/// (normally `ObjectRef::from_raw(co.0, co.1)`, then drop). Leaving the
+/// decrement to the caller, once `close` has waited out lookups, keeps destruction,
+/// which reaches the rank-6 allocator, out from under the rank-3 lock. The
 /// wrapper makes the `Result` `Send`; a bare `*mut ()` is not.
 #[derive(Copy, Clone, Debug)]
 pub struct ClosedObject(pub *mut (), pub KObjectType);
@@ -466,8 +466,7 @@ impl HandleTable {
     }
 
     /// Look up `h` as [`lookup`](Self::lookup) does, and claim it to be moved: until the [`Claim`]
-    /// commits or drops, another claim of it fails with `InvalidHandle`. Two moves of one handle
-    /// at once would otherwise both pass their lookups, a copy without `DUPLICATE`.
+    /// commits or drops, another claim of it fails `InvalidHandle`, so two moves cannot copy it.
     pub fn claim(&self, h: RawHandle, caller_pid: u32, required: Rights) -> Result<(LookupOk, Claim<'_>), HandleError> {
         let ok = self.lookup(h, caller_pid, required)?;
         let claimed = {

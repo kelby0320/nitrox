@@ -60,9 +60,8 @@ impl GraceTracker {
         ReadGuard { tracker: self, ctx_id }
     }
 
-    /// Wait until every read section open when this is called has closed, so no reader keeps a
-    /// pointer it read before the caller's unpublishing store. Call with no lock held: a reader
-    /// waits on nothing, so the wait is as long as the readers in flight.
+    /// Wait until every read section open now has closed: no reader keeps a pointer it read before
+    /// the caller's unpublishing store. Call with no lock held.
     pub(crate) fn synchronize(&self) {
         #[cfg(test)]
         assert_eq!(crate::libkern::lockrank::held_by_this_thread(), 0, "a grace wait with a lock held");

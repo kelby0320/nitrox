@@ -487,7 +487,7 @@ impl Drop for UserspaceServerReg {
     /// `IpcChannel.us_reg` is a raw, **uncounted** back-pointer (the registration owns the
     /// endpoint, so a counted edge back would be a cycle), and an endpoint can outlive its
     /// registration. Clearing it here keeps every consumer (`ipc_endpoint_closing`,
-    /// `us_forward_reg_for_send`, `us_forward_existing_reg`) from dereferencing freed memory or
+    /// `us_forward_reg_for_send`, `us_server_attach`) from dereferencing freed memory or
     /// resurrecting a dead object's refcount.
     ///
     /// This runs **before** the fields drop: the pending table is still populated (so its
@@ -592,7 +592,7 @@ mod tests {
         let binding =
             unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
         // SAFETY: `k_ptr` is the endpoint the registration holds.
-        unsafe { crate::sched::us_server_attach(k_ptr, &binding) };
+        assert!(unsafe { crate::sched::us_server_attach(k_ptr, &binding) }.is_none());
 
         // SAFETY: `s_ref` pins the server's end.
         let reply =
