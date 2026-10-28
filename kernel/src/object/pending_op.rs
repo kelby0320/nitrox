@@ -16,8 +16,9 @@
 
 use core::cell::UnsafeCell;
 
-use crate::libkern::handle::KObjectType;
+use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::{AllocError, KBox, KVec};
+use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 
 /// A pending-operation kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
@@ -42,6 +43,11 @@ struct PendingOpInner {
     /// Blocked threads, non-owning (each is kept alive by its own parked `ObjectRef` and removed
     /// from here before it unparks); pre-reserved to [`PendingOperation::MAX_WAITERS`].
     waiters: KVec<*mut ()>,
+    /// A lookup's resolved object, until a reader installs it: the handle is made when `sys_wait`
+    /// reports the completion, so a PO freed unread releases the object and leaves no handle.
+    parked: Option<(ObjectRef, Rights)>,
+    /// A reader is installing `parked`; another waits for the handle it makes, the `result`.
+    installing: bool,
 }
 
 // SAFETY: identical reasoning to `Timer`/`ObjectRef` — the header refcount is
@@ -66,7 +72,14 @@ impl PendingOperation {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::PendingOperation),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(PendingOpInner { signaled: false, status: 0, result: 0, waiters }),
+            inner: UnsafeCell::new(PendingOpInner {
+                signaled: false,
+                status: 0,
+                result: 0,
+                waiters,
+                parked: None,
+                installing: false,
+            }),
         })
     }
 
@@ -135,6 +148,44 @@ impl PendingOperation {
     pub(crate) unsafe fn already_signaled(obj: *mut ()) -> bool {
         // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.signaled
+    }
+
+    /// Park a lookup's object for its reader (see `parked`).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn park(obj: *mut (), parked: Option<(ObjectRef, Rights)>) {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
+        unsafe { Self::inner(obj) }.parked = parked;
+    }
+
+    /// The parked object, for a reader to install, then end with [`installed`](Self::installed);
+    /// `None` with none parked, or with another reader installing it, which `Err` says.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn take_parked(obj: *mut ()) -> Result<Option<(ObjectRef, Rights)>, ()> {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
+        let inner = unsafe { Self::inner(obj) };
+        if inner.installing {
+            return Err(());
+        }
+        inner.installing = inner.parked.is_some();
+        Ok(inner.parked.take())
+    }
+
+    /// End an install: its handle is the result now, or the object is parked again for a later read.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn installed(obj: *mut (), outcome: Result<u64, (ObjectRef, Rights)>) {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
+        let inner = unsafe { Self::inner(obj) };
+        inner.installing = false;
+        match outcome {
+            Ok(handle) => inner.result = handle,
+            Err(parked) => inner.parked = Some(parked),
+        }
     }
 
     /// Register `thread` as a waiter; `Err(())` at the cap, which callers map to `OutOfMemory`.

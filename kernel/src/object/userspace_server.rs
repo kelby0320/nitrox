@@ -79,8 +79,6 @@ pub struct PendingLookup {
     /// The lookup's `PendingOperation` (a clone of the client's), pinned so the reply can
     /// complete it even if the client closed its handle.
     pub(crate) po: ObjectRef,
-    /// The client process to install the resolved handle into (cross-context).
-    pub(crate) owner_pid: u32,
     /// The `Rights` the lookup requested; the installed handle gets `requested ∩ granted`.
     pub(crate) requested: Rights,
     /// The path suffix, inline (`suffix[..suffix_len.min(MAX)]`); `suffix_len` is the *true*
@@ -354,15 +352,9 @@ impl UserspaceServerReg {
     /// # Safety
     /// As [`begin_forward`](Self::begin_forward).
     #[cfg(test)]
-    pub(crate) unsafe fn begin(
-        reg: *mut (),
-        po: &ObjectRef,
-        owner_pid: u32,
-        requested: Rights,
-        suffix: &[u8],
-    ) -> Option<u64> {
+    pub(crate) unsafe fn begin(reg: *mut (), po: &ObjectRef, requested: Rights, suffix: &[u8]) -> Option<u64> {
         // SAFETY: the caller's contract, passed through.
-        unsafe { Self::begin_forward(reg, po, owner_pid, requested, suffix, Forward::PLAIN) }
+        unsafe { Self::begin_forward(reg, po, requested, suffix, Forward::PLAIN) }
     }
 
     /// Reserve a free pending-lookup slot, returning its new `request_id`; `None` if all
@@ -376,7 +368,6 @@ impl UserspaceServerReg {
     pub(crate) unsafe fn begin_forward(
         reg: *mut (),
         po: &ObjectRef,
-        owner_pid: u32,
         requested: Rights,
         suffix: &[u8],
         fwd: Forward<'_>,
@@ -397,7 +388,6 @@ impl UserspaceServerReg {
         inner.pending[slot] = Some(PendingLookup {
             request_id,
             po: po.clone(),
-            owner_pid,
             requested,
             suffix: sbuf,
             suffix_len: suffix.len() as u16,
@@ -654,17 +644,17 @@ mod tests {
         let po = make_po();
         for expect in 1..=US_PENDING_MAX as u64 {
             // SAFETY: `r` pins the registration, and the test is single-threaded.
-            let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") };
+            let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") };
             assert_eq!(id, Some(expect));
         }
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        assert_eq!(unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") }, None);
+        assert_eq!(unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") }, None);
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let taken = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) };
         assert_eq!(taken.as_ref().map(|p| p.request_id), Some(1));
         drop(taken);
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 9, Rights::MAP_READ, b"sys/gen") };
+        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") };
         assert_eq!(id, Some(US_PENDING_MAX as u64 + 1));
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         while unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.is_some() {}
@@ -682,8 +672,8 @@ mod tests {
         let po = make_po();
         let fwd = Forward { op: ForwardOp::Rename { flags: 1 }, dest: b"fs/l1/b", depth: 2 };
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, 4, Rights::MAP_READ, b"fs/l1/a", fwd) }
-            .unwrap();
+        let id =
+            unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, Rights::MAP_READ, b"fs/l1/a", fwd) }.unwrap();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let pl = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
         assert_eq!((pl.op, pl.dest(), pl.depth), (ForwardOp::Rename { flags: 1 }, Some(&b"fs/l1/b"[..]), 2));
@@ -692,7 +682,7 @@ mod tests {
         let long = [b'a'; LOOKUP_SUFFIX_MAX + 1];
         let fwd = Forward { op: ForwardOp::Rename { flags: 0 }, dest: &long, depth: 0 };
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, 4, Rights::MAP_READ, b"a", fwd) }.unwrap();
+        let id = unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, Rights::MAP_READ, b"a", fwd) }.unwrap();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let pl = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
         assert_eq!(pl.dest(), None, "an overlong destination is absent, not truncated");
@@ -707,17 +697,15 @@ mod tests {
         let r = reg();
         let po = make_po();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let a = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"one") }.unwrap();
+        let a = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"one") }.unwrap();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let b = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 2, Rights::MAP_READ, b"two") }.unwrap();
+        let b = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"two") }.unwrap();
         assert_ne!(a, b);
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let tb = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), b) }.unwrap();
-        assert_eq!(tb.owner_pid, 2);
         assert_eq!(tb.suffix(), Some(&b"two"[..]));
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let ta = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), a) }.unwrap();
-        assert_eq!(ta.owner_pid, 1);
         assert_eq!(ta.suffix(), Some(&b"one"[..]));
         drop(tb);
         drop(ta);
@@ -731,13 +719,12 @@ mod tests {
         let r = reg();
         let po = make_po();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 7, Rights::MAP_READ, b"sys/gen") }.unwrap();
+        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") }.unwrap();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         assert!(unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id ^ 0xFF) }.is_none());
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let taken = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
         assert_eq!(taken.request_id, id);
-        assert_eq!(taken.owner_pid, 7);
         assert_eq!(taken.requested, Rights::MAP_READ);
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         assert!(unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.is_none());
@@ -760,7 +747,7 @@ mod tests {
         let r = reg();
         let po = make_po();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 3, Rights::MAP_READ, b"a/b/c") };
+        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"a/b/c") };
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let taken = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.unwrap();
         assert_eq!(taken.suffix(), Some(&b"a/b/c"[..]));
@@ -777,7 +764,7 @@ mod tests {
         let fo = file_obj();
         let frame = PhysAddr::new(0x5000);
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let lid = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"x") }.unwrap();
+        let lid = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"x") }.unwrap();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let fid = unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 2) }.unwrap();
         assert_ne!(lid, fid); // distinct request ids
@@ -819,7 +806,7 @@ mod tests {
         let r = reg();
         let po = make_po();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
-        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"sys/gen") };
+        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") };
         assert_eq!(test_probe::pending_op_destroys(), 0);
         drop(r); // releases the pending entry's PO clone
         assert_eq!(test_probe::pending_op_destroys(), 0, "creation ref still held by `po`");

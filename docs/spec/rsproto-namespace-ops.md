@@ -211,10 +211,10 @@ discriminant (`NotFound` for a missing path, `TooLarge` past the cap,
    `PendingOperation` stays **pending**.
 2. The server resolves the suffix, reads the file, and replies — transferring the
    `MemoryObject` in `handles[0]` (success) or an `ErrorBody` (failure).
-3. The kernel installs the transferred `MemoryObject` into the **original
-   caller's** table and signals the lookup PO: `IoResult { status: 0, result: <the
-   installed handle> }`, or `status: <kerror>` on error. The client's `sys_wait`
-   returns the handle.
+3. The kernel parks the transferred `MemoryObject` in the lookup PO and signals it.
+   The client's `sys_wait` installs it in the client's table and returns
+   `IoResult { status: 0, result: <the installed handle> }`, or `status: <kerror>` on
+   error. A PO the client closed first releases the object instead.
 
    **Installed rights = `requested ∩ (the rights the server granted on the
    transferred handle)`.** Unlike a Kernel Server / direct-handle binding — whose

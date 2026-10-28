@@ -115,7 +115,6 @@ pub unsafe fn us_forward_originate(
     reg: *mut (),
     msg: &mut StoredMsg,
     po: &ObjectRef,
-    owner_pid: u32,
     requested: Rights,
     suffix: &[u8],
     fwd: crate::object::userspace_server::Forward<'_>,
@@ -123,7 +122,7 @@ pub unsafe fn us_forward_originate(
     let mut g = SCHED.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
     // held. Reserve the pending slot + assign a request id (None ⇒ already busy).
-    let request_id = match unsafe { UserspaceServerReg::begin_forward(reg, po, owner_pid, requested, suffix, fwd) } {
+    let request_id = match unsafe { UserspaceServerReg::begin_forward(reg, po, requested, suffix, fwd) } {
         Some(id) => id,
         None => return ForwardOutcome::Busy,
     };
@@ -620,7 +619,7 @@ mod tests {
         let file = adopt(crate::object::FileObject::try_new(4096, producer).unwrap(), KObjectType::FileObject);
         // SAFETY: `reg` pins the registration, and the test is single-threaded.
         unsafe {
-            UserspaceServerReg::begin(reg.as_ptr(), &lookup, 1, Rights::MAP_READ, b"f").unwrap();
+            UserspaceServerReg::begin(reg.as_ptr(), &lookup, Rights::MAP_READ, b"f").unwrap();
             UserspaceServerReg::begin_fill(reg.as_ptr(), &fill, &file, crate::mm::PhysAddr::new(0x5000), 0).unwrap();
         }
         (lookup, fill, file)

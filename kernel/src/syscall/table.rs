@@ -821,18 +821,6 @@ fn map_mem_map_err(e: MapError) -> KError {
     }
 }
 
-/// The status a forwarded reply completes with, once its handle is in client `pid`'s table. A
-/// client that exited before its reply has had its handles swept, or will: the exit marks it
-/// before the sweep, and both take the table's lock, so after the allocation one of the two sees
-/// the other. Closed here, the handle is not left in a table nothing will close.
-fn deliver_to_client(pid: u32, status: i32, handle: u64) -> i32 {
-    if status != 0 || handle == 0 || crate::sched::pid_has_threads(pid) {
-        return status;
-    }
-    close_and_release(RawHandle(handle), pid);
-    KError::PeerClosed as i32
-}
-
 /// Spawn copies an image into one allocation, so one larger than [`MAX_IMAGE_BYTES`] is refused
 /// `TooLarge`: no retry would help, where `OutOfMemory` says one might.
 fn image_fits(len: usize) -> Result<(), KError> {
@@ -1401,9 +1389,9 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
 
     // SAFETY: live `Namespace` (type verified by `lookup_typed`).
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
-    if let Some((status, result)) = resolve_and_start(ns, path, dest, fwd, requested, pid, &po_ref, 0) {
+    if let Some((status, parked)) = resolve_and_start(ns, path, dest, fwd, requested, &po_ref, 0) {
         // SAFETY: `po_ref` pins the `PendingOperation` at `po_ptr`.
-        unsafe { crate::sched::complete_pending_op(po_ptr, status, result) };
+        drop(unsafe { crate::sched::complete_lookup(po_ptr, status, parked) });
     }
     Ok(po_h.bits() as isize)
 }
@@ -1424,16 +1412,12 @@ impl ResolveOp {
     }
 }
 
-fn install_for(pid: u32, requested: Rights, obj: ObjectRef, binding_rights: Rights) -> (i32, u64) {
-    let (tptr, tty) = obj.into_raw();
-    match global::get().allocate(pid, tptr, tty, requested & binding_rights) {
-        Ok(h) => (0, h.bits()),
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
-            (map_handle_err(e) as i32, 0)
-        }
-    }
+/// What a lookup completes its PO with: a status and, on success, the object and rights its
+/// reader's handle gets ([`crate::sched::complete_lookup`]).
+type Resolved = (i32, Option<(ObjectRef, Rights)>);
+
+fn granted(requested: Rights, obj: ObjectRef, binding_rights: Rights) -> Resolved {
+    (0, Some((obj, requested & binding_rights)))
 }
 
 /// **Resolve `path` in `ns` and start the operation there**: the half of a lookup that a
@@ -1456,15 +1440,14 @@ fn resolve_and_start(
     dest: Option<&[u8]>,
     op: ForwardOp,
     requested: Rights,
-    pid: u32,
     po_ref: &ObjectRef,
     depth: u8,
-) -> Option<(i32, u64)> {
+) -> Option<Resolved> {
     let mut dest_buf = [0u8; NS_PATH_MAX];
     let mut dest_len = 0usize;
     if let ForwardOp::Rename { .. } = op {
         let Some(d) = dest else {
-            return Some((KError::InvalidArgument as i32, 0));
+            return Some((KError::InvalidArgument as i32, None));
         };
         let verdict = match (ns.resolve(path), ns.resolve(d)) {
             (
@@ -1500,30 +1483,30 @@ fn resolve_and_start(
         };
         // A refused rename short-circuits the resolve, which would hand back the source.
         if let Some(e) = verdict {
-            return Some((e as i32, 0));
+            return Some((e as i32, None));
         }
     }
 
     match ns.resolve(path) {
-        None => Some((KError::NotFound as i32, 0)),
+        None => Some((KError::NotFound as i32, None)),
         Some((ResolvedTarget::DirectHandle(target), binding_rights, suffix)) => {
             if suffix.is_empty() {
-                Some(install_for(pid, requested, target, binding_rights))
+                Some(granted(requested, target, binding_rights))
             } else {
                 drop(target);
-                Some((KError::NotFound as i32, 0))
+                Some((KError::NotFound as i32, None))
             }
         }
         // Not from a server's syscall: `/proc/self` would answer for the server.
-        Some((ResolvedTarget::KernelServer(_), _, _)) if depth > 0 => Some((KError::Unsupported as i32, 0)),
+        Some((ResolvedTarget::KernelServer(_), _, _)) if depth > 0 => Some((KError::Unsupported as i32, None)),
         Some((ResolvedTarget::KernelServer(id), binding_rights, suffix)) => {
             match kernel_server::dispatch(id, suffix, requested) {
-                OpStatus::Completed(obj) => Some(install_for(pid, requested, obj, binding_rights)),
-                OpStatus::Rejected(err) => Some((err as i32, 0)),
+                OpStatus::Completed(obj) => Some(granted(requested, obj, binding_rights)),
+                OpStatus::Rejected(err) => Some((err as i32, None)),
                 OpStatus::Pending => {
                     // A Kernel Server never forwards; an internal error, not a panic.
                     debug_assert!(false, "kernel-server dispatch returned Pending");
-                    Some((KError::KernelError as i32, 0))
+                    Some((KError::KernelError as i32, None))
                 }
             }
         }
@@ -1533,15 +1516,15 @@ fn resolve_and_start(
             // `base` and `suffix` are validated (no `.`/`..`), so the join cannot escape.
             let fwd = Forward { op, dest: &dest_buf[..dest_len], depth };
             if base.is_empty() {
-                forward_userspace_lookup(reg, po_ref, pid, requested, suffix, fwd)
+                forward_userspace_lookup(reg, po_ref, requested, suffix, fwd)
             } else {
                 let mut jbuf = [0u8; NS_PATH_MAX];
                 match join_subtree(base.as_path(), suffix, &mut jbuf) {
-                    Some(joined) => forward_userspace_lookup(reg, po_ref, pid, requested, joined, fwd),
+                    Some(joined) => forward_userspace_lookup(reg, po_ref, requested, joined, fwd),
                     None => {
                         // Overflow: drop the forwarding reference outside the namespace lock.
                         drop(reg);
-                        Some((KError::TooLarge as i32, 0))
+                        Some((KError::TooLarge as i32, None))
                     }
                 }
             }
@@ -1574,17 +1557,16 @@ fn join_subtree<'o>(base: &[u8], suffix: &[u8], out: &'o mut [u8]) -> Option<&'o
 fn forward_userspace_lookup(
     reg: ObjectRef,
     po_ref: &ObjectRef,
-    pid: u32,
     requested: Rights,
     suffix: &[u8],
     fwd: Forward<'_>,
-) -> Option<(i32, u64)> {
+) -> Option<Resolved> {
     // Heap-bounced (4 KiB, never on the stack); a grow or create request also carries the size.
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
     // in place so the 4 KiB message never lands in this frame (see `try_new_zeroed`).
     let mut msg = match unsafe { KBox::<StoredMsg>::try_new_zeroed() } {
         Ok(m) => m,
-        Err(_) => return Some((KError::OutOfMemory as i32, 0)),
+        Err(_) => return Some((KError::OutOfMemory as i32, None)),
     };
     let built = match fwd.op {
         ForwardOp::Size(new_size, change) => {
@@ -1597,7 +1579,7 @@ fn forward_userspace_lookup(
     };
     let body_len = match built {
         Some(n) => n,
-        None => return Some((KError::TooLarge as i32, 0)),
+        None => return Some((KError::TooLarge as i32, None)),
     };
     msg.header.payload_len = body_len as u32;
     msg.header.handle_count = 0;
@@ -1605,10 +1587,12 @@ fn forward_userspace_lookup(
     // The suffix is stored so a lazy `FILE` reply can name the file, and a `SUBNAMESPACE` reply
     // can continue the lookup.
     // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
-    match unsafe { crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested, suffix, fwd) } {
+    match unsafe { crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, requested, suffix, fwd) } {
         crate::sched::ForwardOutcome::Pending => None,
-        crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => Some((KError::WouldBlock as i32, 0)),
-        crate::sched::ForwardOutcome::PeerClosed => Some((KError::PeerClosed as i32, 0)),
+        crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => {
+            Some((KError::WouldBlock as i32, None))
+        }
+        crate::sched::ForwardOutcome::PeerClosed => Some((KError::PeerClosed as i32, None)),
     }
 }
 
@@ -1801,8 +1785,7 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
                     && let Some(obj) = &refs[i]
                 {
                     out[k] = if types[i] == KObjectType::PendingOperation {
-                        // SAFETY: `obj` pins the `PendingOperation` its lookup type-checked.
-                        let (status, result) = unsafe { crate::sched::pending_op_completion(obj.as_ptr()) };
+                        let (status, result) = read_completion(obj, pid);
                         IoResult::completed_with_result(handles[i], status, result)
                     } else {
                         if types[i] == KObjectType::InterruptObject {
@@ -1848,6 +1831,32 @@ pub fn sys_notif_recv(channel_h: u64, out: u64) -> SysResult {
     let n = unsafe { crate::sched::notif_try_recv(ok.object.as_ptr()) }.ok_or(KError::WouldBlock)?;
     copy_to_user(uptr, &n).map_err(from_user_access)?;
     Ok(0)
+}
+
+/// A completed PO's `(status, result)` for `sys_wait`. A lookup's object is installed in the
+/// reader's table on its first read, and that handle is every later read's result.
+fn read_completion(po: &ObjectRef, pid: u32) -> (i32, u64) {
+    use crate::sched::Completion;
+    loop {
+        // SAFETY: `po` pins the `PendingOperation` its lookup type-checked.
+        let (obj, rights) = match unsafe { crate::sched::pending_op_take(po.as_ptr()) } {
+            Completion::Read(status, result) => return (status, result),
+            Completion::Installing => {
+                core::hint::spin_loop();
+                continue;
+            }
+            Completion::Install(obj, rights) => (obj, rights),
+        };
+        let (op, ot) = obj.into_raw();
+        let (outcome, read) = match global::get().allocate(pid, op, ot, rights) {
+            Ok(h) => (Ok(h.bits()), (0, h.bits())),
+            // SAFETY: `allocate` did not adopt the reference; reclaim it, parked for a later read.
+            Err(e) => (Err((unsafe { ObjectRef::from_raw(op, ot) }, rights)), (map_handle_err(e) as i32, 0)),
+        };
+        // SAFETY: as above.
+        unsafe { crate::sched::pending_op_installed(po.as_ptr(), outcome) };
+        return read;
+    }
 }
 
 /// The rights of a freshly created channel endpoint (`docs/spec/ipc-message-format.md`).
@@ -2111,8 +2120,8 @@ fn commit_all(claims: &mut [Option<Claim<'_>>]) {
 
 /// Complete a forwarded `Namespace::Resolve` reply: correlate it to the registration's pending
 /// lookup and deliver its outcome through that lookup's `PendingOperation`. An
-/// `OBJECT_KIND_MEMOBJ` reply installs the transferred `MemoryObject` into the **original
-/// caller's** table (rights = `requested ∩ the rights the server granted`); an
+/// `OBJECT_KIND_MEMOBJ` reply parks the transferred `MemoryObject` there, for the reader's table
+/// (rights = `requested ∩ the rights the server granted`); an
 /// `OBJECT_KIND_FILE` reply builds a lazy [`FileObject`] pointed back at this server; an error
 /// completes the PO with a `KError`. An uncorrelated (duplicate / stale) reply is dropped.
 fn complete_resolve_reply(
@@ -2139,26 +2148,26 @@ fn complete_resolve_reply(
 
     let subnamespace =
         matches!(reply.kind, ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_SUBNAMESPACE);
-    let outcome: Option<(i32, u64)> = if subnamespace {
+    let outcome: Option<Resolved> = if subnamespace {
         continue_resolve(&pl, &bounce.payload[..payload_len], transfers)
     } else {
         Some(match reply.kind {
-            ReplyKind::Error { kerror } => (kerror, 0),
-            ReplyKind::Malformed => (KError::KernelError as i32, 0),
+            ReplyKind::Error { kerror } => (kerror, None),
+            ReplyKind::Malformed => (KError::KernelError as i32, None),
             ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE => {
                 build_and_install_file(reg, &pl, content_len)
             }
             ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE_BLOCKS => {
                 build_and_install_file_blocks(reg, &pl, content_len, &bounce.payload[..payload_len], transfers)
             }
-            ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, 0),
+            ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, None),
             ReplyKind::Success { object_kind, .. }
                 if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
             {
-                (KError::Unsupported as i32, 0)
+                (KError::Unsupported as i32, None)
             }
             ReplyKind::Success { .. } => match transfers[0].take() {
-                None => (KError::InvalidArgument as i32, 0), // success but no handle
+                None => (KError::InvalidArgument as i32, None), // success but no handle
                 // The resolved object is a capability the server hands back: a `MemoryObject`, a
                 // **re-exported** `FileObject` (an indirection server passes the store's through)
                 // or an `IpcChannel` (a live **connection**). Other types are not valid results.
@@ -2169,28 +2178,16 @@ fn complete_resolve_reply(
                     ) =>
                 {
                     drop(tr.obj);
-                    (KError::Unsupported as i32, 0)
+                    (KError::Unsupported as i32, None)
                 }
-                Some(tr) => {
-                    let attenuated = pl.requested & tr.rights;
-                    let (op, ot) = tr.obj.into_raw();
-                    match global::get().allocate(pl.owner_pid, op, ot, attenuated) {
-                        Ok(h) => (0, h.bits()),
-                        Err(e) => {
-                            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-                            drop(unsafe { ObjectRef::from_raw(op, ot) });
-                            (map_handle_err(e) as i32, 0)
-                        }
-                    }
-                }
+                Some(tr) => (0, Some((tr.obj, pl.requested & tr.rights))),
             },
         })
     };
 
-    if let Some((status, result)) = outcome {
-        let status = deliver_to_client(pl.owner_pid, status, result);
+    if let Some((status, parked)) = outcome {
         // SAFETY: `pl` owns the lookup's `PendingOperation` reference.
-        unsafe { crate::sched::complete_pending_op(pl.po.as_ptr(), status, result) };
+        drop(unsafe { crate::sched::complete_lookup(pl.po.as_ptr(), status, parked) });
     }
     drop(pl);
     Ok(0)
@@ -2357,37 +2354,28 @@ fn build_and_install_file(
     reg: &ObjectRef,
     pl: &crate::object::userspace_server::PendingLookup,
     content_len: u32,
-) -> (i32, u64) {
+) -> Resolved {
     use crate::libkern::KString;
     use crate::object::{FileObject, Producer};
 
     let Some(suffix) = pl.suffix() else {
-        return (KError::TooLarge as i32, 0);
+        return (KError::TooLarge as i32, None);
     };
     let Ok(s) = core::str::from_utf8(suffix) else {
-        return (KError::InvalidArgument as i32, 0);
+        return (KError::InvalidArgument as i32, None);
     };
     let kstr = match KString::try_from_str(s) {
         Ok(k) => k,
-        Err(_) => return (KError::OutOfMemory as i32, 0),
+        Err(_) => return (KError::OutOfMemory as i32, None),
     };
     let fobj = match FileObject::try_new(content_len as usize, Producer::FsServer { reg: reg.clone(), suffix: kstr }) {
         Ok(f) => f,
-        Err(_) => return (KError::OutOfMemory as i32, 0),
+        Err(_) => return (KError::OutOfMemory as i32, None),
     };
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
     let fref = unsafe { ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject) };
-    let (op, ot) = fref.into_raw();
     // `INSPECT` too, so a client can `sys_handle_stat` the lazy file for its size before mapping.
-    let rights = pl.requested | Rights::INSPECT;
-    match global::get().allocate(pl.owner_pid, op, ot, rights) {
-        Ok(h) => (0, h.bits()),
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(op, ot) });
-            (map_handle_err(e) as i32, 0)
-        }
-    }
+    (0, Some((fref, pl.requested | Rights::INSPECT)))
 }
 
 /// Build + install a **Model A** (block-fs) lazy file from a resolve reply: adopt the
@@ -2400,7 +2388,7 @@ fn build_and_install_file_blocks(
     content_len: u32,
     reply_msg: &[u8],
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-) -> (i32, u64) {
+) -> Resolved {
     use crate::object::FileObject;
     use crate::object::file_object::CacheInError;
     use crate::rsproto::{file_blocks_rights, reply_body};
@@ -2409,19 +2397,19 @@ fn build_and_install_file_blocks(
         Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => (tr.obj, tr.rights),
         Some(tr) => {
             drop(tr.obj);
-            return (KError::Unsupported as i32, 0);
+            return (KError::Unsupported as i32, None);
         }
-        None => return (KError::InvalidArgument as i32, 0), // success but no device
+        None => return (KError::InvalidArgument as i32, None), // success but no device
     };
     let Some(body) = reply_body(reply_msg) else {
-        return (KError::KernelError as i32, 0);
+        return (KError::KernelError as i32, None);
     };
     let (header, runs) = match block_map(body) {
         Ok(m) => m,
-        Err(e) => return (e as i32, 0),
+        Err(e) => return (e as i32, None),
     };
     let Some(rights) = file_blocks_rights(pl.requested, header.flags, device_rights) else {
-        return (KError::NoAccess as i32, 0);
+        return (KError::NoAccess as i32, None);
     };
 
     let reg_ref = reg.clone();
@@ -2430,30 +2418,21 @@ fn build_and_install_file_blocks(
     let candidate = match new_block_file(content_len, device, header.block_size, reg_ref.clone(), header.file_id, runs)
     {
         Ok(f) => f,
-        Err(e) => return (e as i32, 0),
+        Err(e) => return (e as i32, None),
     };
     let fref = if header.file_id == 0 {
         candidate
     } else {
         match FileObject::cache_in(&reg_ref, candidate) {
             Ok(f) => f,
-            Err(CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, 0),
+            Err(CacheInError::OutOfMemory) => return (KError::OutOfMemory as i32, None),
             Err(CacheInError::BlockSizeChanged | CacheInError::DeviceChanged) => {
-                return (KError::KernelError as i32, 0);
+                return (KError::KernelError as i32, None);
             }
         }
     };
     drop(reg_ref);
-
-    let (op, ot) = fref.into_raw();
-    match global::get().allocate(pl.owner_pid, op, ot, rights) {
-        Ok(h) => (0, h.bits()),
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(op, ot) });
-            (map_handle_err(e) as i32, 0)
-        }
-    }
+    (0, Some((fref, rights)))
 }
 
 /// The deepest a lookup follows `SUBNAMESPACE` replies; the next one is `TooLarge`.
@@ -2470,48 +2449,48 @@ fn continue_resolve(
     pl: &crate::object::userspace_server::PendingLookup,
     reply_msg: &[u8],
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-) -> Option<(i32, u64)> {
+) -> Option<Resolved> {
     let ns_ref = match transfers[0].take() {
         Some(tr) if tr.obj.object_type() == KObjectType::Namespace && tr.rights.contains(Rights::LOOKUP) => tr.obj,
         Some(tr) => {
             drop(tr.obj);
-            return Some((KError::Unsupported as i32, 0));
+            return Some((KError::Unsupported as i32, None));
         }
-        None => return Some((KError::InvalidArgument as i32, 0)),
+        None => return Some((KError::InvalidArgument as i32, None)),
     };
     if pl.depth >= SUBNAMESPACE_DEPTH_MAX {
-        return Some((KError::TooLarge as i32, 0));
+        return Some((KError::TooLarge as i32, None));
     }
     let Some((consumed, base)) = crate::rsproto::reply_body(reply_msg).and_then(crate::rsproto::subnamespace_reply)
     else {
-        return Some((KError::KernelError as i32, 0));
+        return Some((KError::KernelError as i32, None));
     };
     let Some(suffix) = pl.suffix() else {
-        return Some((KError::TooLarge as i32, 0));
+        return Some((KError::TooLarge as i32, None));
     };
     let Ok(mut bufs) = KBox::try_new([[0u8; NS_PATH_MAX]; 2]) else {
-        return Some((KError::OutOfMemory as i32, 0));
+        return Some((KError::OutOfMemory as i32, None));
     };
     let [pbuf, dbuf] = &mut *bufs;
     let path = match continued_path(suffix, consumed as usize, base, pbuf) {
         Ok(p) => p,
-        Err(e) => return Some((e as i32, 0)),
+        Err(e) => return Some((e as i32, None)),
     };
     let dest = match pl.op {
         ForwardOp::Rename { .. } => {
             let Some(d) = pl.dest() else {
-                return Some((KError::TooLarge as i32, 0));
+                return Some((KError::TooLarge as i32, None));
             };
             match continued_dest(suffix, d, consumed as usize, base, dbuf) {
                 Ok(p) => Some(p),
-                Err(e) => return Some((e as i32, 0)),
+                Err(e) => return Some((e as i32, None)),
             }
         }
         _ => None,
     };
     // SAFETY: `ns_ref` pins a live `Namespace` (type checked above) across this call.
     let ns: &Namespace = unsafe { &*(ns_ref.as_ptr() as *const Namespace) };
-    let outcome = resolve_and_start(ns, path, dest, pl.op, pl.requested, pl.owner_pid, &pl.po, pl.depth + 1);
+    let outcome = resolve_and_start(ns, path, dest, pl.op, pl.requested, &pl.po, pl.depth + 1);
     drop(ns_ref);
     outcome
 }

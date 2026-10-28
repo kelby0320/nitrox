@@ -581,7 +581,6 @@ fn file_blocks_reply(reg: &ObjectRef, file_id: u64, device: ObjectRef, rights: R
     let pl = PendingLookup {
         request_id: 1,
         po,
-        owner_pid: FILE_CLIENT,
         requested: Rights::MAP_READ | Rights::MAP_WRITE,
         suffix: [0; LOOKUP_SUFFIX_MAX],
         suffix_len: 0,
@@ -592,7 +591,10 @@ fn file_blocks_reply(reg: &ObjectRef, file_id: u64, device: ObjectRef, rights: R
     };
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     transfers[0] = Some(TransferRef { obj: device, rights });
-    build_and_install_file_blocks(reg, &pl, 4096, &msg, &mut transfers)
+    let (status, parked) = build_and_install_file_blocks(reg, &pl, 4096, &msg, &mut transfers);
+    // SAFETY: `pl.po` pins the lookup's `PendingOperation`.
+    drop(unsafe { crate::sched::complete_lookup(pl.po.as_ptr(), status, parked) });
+    read_completion(&pl.po, FILE_CLIENT)
 }
 
 /// A file-blocks reply's file is as writable as its server's hold on the device it sent: the
@@ -641,52 +643,29 @@ fn a_reply_for_a_cached_file_naming_another_device_is_refused() {
     close_and_release(RawHandle(b), FILE_CLIENT);
 }
 
-/// A reply for a client that exited first: on the host no process has threads, so every pid is
-/// such a client, and the handle installed for it is closed, its object freed.
-#[test]
-fn a_reply_for_a_client_that_exited_leaves_no_handle_behind() {
-    use crate::object::MemoryObject;
-    use crate::object::header::test_probe;
-    init_global_heap();
-    global::init_for_tests();
-    test_probe::reset();
-    const PID: u32 = 4343;
-    let mem = KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut ();
-    let h = global::get().allocate(PID, mem, KObjectType::MemoryObject, Rights::MAP_READ).unwrap();
-    assert_eq!(deliver_to_client(PID, 0, h.bits()), KError::PeerClosed as i32);
-    assert!(global::get().lookup(h, PID, Rights::empty()).is_err(), "the handle is closed");
-    assert_eq!(test_probe::memory_object_destroys(), 1);
-    assert_eq!(deliver_to_client(PID, KError::NotFound as i32, 0), KError::NotFound as i32);
-    assert_eq!(deliver_to_client(PID, 0, 0), 0, "a reply with no handle");
+/// A lookup forwarded for client `PID`, and a reply carrying a memory object built for it.
+struct Forwarded {
+    reg: ObjectRef,
+    po: ObjectRef,
+    reply: crate::object::ipc_channel::StoredMsg,
+    transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
+    _server_end: ObjectRef,
 }
 
-/// The whole path: a lookup forwarded for a client, then the server's reply carrying a memory
-/// object. The client has no threads, so the reply completes `PeerClosed` and the object, whose
-/// handle was installed and closed again, is freed rather than pinned for ever.
-#[test]
-fn a_forwarded_reply_for_a_client_that_exited_pins_nothing() {
-    use crate::object::header::test_probe;
+fn forwarded_memobj_lookup() -> Forwarded {
     use crate::object::ipc_channel::StoredMsg;
     use crate::object::userspace_server::Forward;
     use crate::object::{IpcChannel, MemoryObject, PendingOperation, UserspaceServerReg};
     use crate::rsproto::{OBJECT_KIND_MEMOBJ, build_resolve_request};
-    init_global_heap();
-    global::init_for_tests();
-    test_probe::reset();
-    // SAFETY: each pointer is a fresh `into_raw`, carrying its single creation reference.
-    let adopt = |p: *mut (), t| unsafe { ObjectRef::from_raw(p, t) };
     let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-    let k = adopt(KBox::into_raw(k).as_ptr() as *mut (), KObjectType::IpcChannel);
-    let _server_end = adopt(KBox::into_raw(s).as_ptr() as *mut (), KObjectType::IpcChannel);
-    let reg = UserspaceServerReg::try_new(k).unwrap();
-    let reg = adopt(KBox::into_raw(reg).as_ptr() as *mut (), KObjectType::UserspaceServerReg);
-    let po =
-        adopt(KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (), KObjectType::PendingOperation);
+    let (k, _server_end) = (adopt(k, KObjectType::IpcChannel), adopt(s, KObjectType::IpcChannel));
+    let reg = adopt(UserspaceServerReg::try_new(k).unwrap(), KObjectType::UserspaceServerReg);
+    let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
     let mut msg = StoredMsg::zeroed();
     msg.header.payload_len = build_resolve_request(&mut msg.payload, Rights::MAP_READ.bits(), b"f").unwrap() as u32;
     // SAFETY: `reg` and `po` are pinned by the test.
     let forwarded = unsafe {
-        crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, &po, 4444, Rights::MAP_READ, b"f", Forward::PLAIN)
+        crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, &po, Rights::MAP_READ, b"f", Forward::PLAIN)
     };
     assert_eq!(forwarded, crate::sched::ForwardOutcome::Pending);
     // The request's envelope turned round, as a server's reply: flags REPLY, a MEMOBJ body.
@@ -696,14 +675,61 @@ fn a_forwarded_reply_for_a_client_that_exited_pins_nothing() {
     reply.payload[20..24].copy_from_slice(&8u32.to_le_bytes());
     reply.payload[28..30].copy_from_slice(&OBJECT_KIND_MEMOBJ.to_le_bytes());
     reply.payload[32..36].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-    let mem =
-        adopt(KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut (), KObjectType::MemoryObject);
+    let mem = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     transfers[0] = Some(TransferRef { obj: mem, rights: Rights::MAP_READ | Rights::TRANSFER });
-    assert_eq!(complete_resolve_reply(&reg, &reply, &mut transfers, 36), Ok(0));
-    // SAFETY: `po` pins it; completed, it is stable, and no other thread reaches it.
-    assert_eq!(unsafe { PendingOperation::status(po.as_ptr()) }, KError::PeerClosed as i32);
-    assert_eq!(test_probe::memory_object_destroys(), 1, "the object pinned by a handle nothing will close");
+    Forwarded { reg, po, reply, transfers, _server_end }
+}
+
+const PID: u32 = 4444;
+
+/// **A lookup closed before its reply leaves nothing behind**: no handle that nothing knows of in
+/// the client's table, and the object, freed with the PO, not pinned for the life of the client.
+#[test]
+fn a_reply_to_a_lookup_its_client_closed_makes_no_handle() {
+    use crate::object::header::test_probe;
+    init_global_heap();
+    global::init_for_tests();
+    test_probe::reset();
+    let mut f = forwarded_memobj_lookup();
+    drop(f.po);
+    assert_eq!(complete_resolve_reply(&f.reg, &f.reply, &mut f.transfers, 36), Ok(0));
+    assert_eq!(test_probe::memory_object_destroys(), 1, "freed with the PO");
+    assert_eq!(global::close_all_owned_by(PID), 0, "no handle in the client's table");
+}
+
+/// A lookup's handle is made by its first read, into the reader's table, and is every read's after.
+#[test]
+fn a_lookup_reply_is_installed_when_its_completion_is_read() {
+    init_global_heap();
+    global::init_for_tests();
+    let mut f = forwarded_memobj_lookup();
+    assert_eq!(complete_resolve_reply(&f.reg, &f.reply, &mut f.transfers, 36), Ok(0));
+    let po = &f.po;
+    assert_eq!(global::close_all_owned_by(PID), 0, "nothing installed before the read");
+    let (status, h) = read_completion(po, PID);
+    assert_eq!(status, 0);
+    assert!(global::get().lookup(RawHandle(h), PID, Rights::MAP_READ).is_ok());
+    assert_eq!(read_completion(po, PID), (0, h), "one handle, however often it is read");
+    assert_eq!(global::close_all_owned_by(PID), 1);
+}
+
+/// A second reader while the first installs waits for its handle, rather than finding none.
+#[test]
+fn a_lookup_read_while_another_installs_it_waits_for_that_handle() {
+    use crate::sched::{Completion, complete_lookup, pending_op_installed, pending_op_take};
+    init_global_heap();
+    let po = adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+    let mem = adopt(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+    // SAFETY: `po` pins the `PendingOperation`, and the test is single-threaded.
+    unsafe {
+        assert!(complete_lookup(po.as_ptr(), 0, Some((mem, Rights::MAP_READ))).is_none());
+        let Completion::Install(obj, _) = pending_op_take(po.as_ptr()) else { panic!("its object") };
+        assert!(matches!(pending_op_take(po.as_ptr()), Completion::Installing));
+        drop(obj);
+        pending_op_installed(po.as_ptr(), Ok(7));
+        assert!(matches!(pending_op_take(po.as_ptr()), Completion::Read(0, 7)));
+    }
 }
 
 /// The wire carries a size in 32 bits and rename flags in 16: one past either is refused, before

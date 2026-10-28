@@ -275,20 +275,23 @@ on a completed lookup PO returns `IoResult { handle: <the PO>, status: 0,
 result: <the resolved handle> }`; on error, `status` is the negative `KError` and
 `result` is 0. Edge-style waitables (timers, channels) report `result = 0`.
 
-**Where the resolved handle is installed.**
+**Where the resolved handle is installed: by the read.** However a lookup resolves, its
+PO completes with the resolved object and rights **parked in it**, and no handle yet. The
+handle is made when `sys_wait` reports the completion, into the reader's table, and is
+every later read's `result`.
 - **Slice 1 (direct handles)** and **slice 3 (in-kernel servers):** the lookup
-  resolves entirely in the caller's syscall context (no IPC) — slice 1 returns the
-  bound `ObjectRef`; slice 3 calls the `KernelServer` to *compute* the handle — then
-  installs the rights-attenuated handle into the caller's table and returns a
-  **pre-signalled** PO whose `result` is that handle. The caller's `sys_wait` returns
-  immediately — the full async result path, synchronously, without IPC.
+  resolves entirely in the caller's syscall context (no IPC), and returns a
+  **pre-signalled** PO. The caller's `sys_wait` returns immediately: the full async
+  result path, synchronously, without IPC.
 - **Slice 7 (userspace servers):** the lookup forwards over IPC and returns a
-  *pending* PO; when the server responds, the kernel installs the handle into the
-  **original caller's** table (a cross-context install — a new mechanism that lands
-  with that wave) and signals the PO with the result.
+  *pending* PO, which the server's reply completes.
 
-Either way the userspace contract is identical: `lookup → PO → sys_wait →
-IoResult.result`.
+**A PO closed before it is read releases its object, and leaves no handle.** Until
+2026-10-28 the reply installed the handle in the original caller's table at once, so a
+client that gave up on a slow server, at a deadline or by dropping a future, was left a
+handle whose value it never learnt (safety survey rt-d6, and sup-d4: two late answers
+used up device-mgr's info endpoints). The userspace contract is unchanged:
+`lookup → PO → sys_wait → IoResult.result`.
 
 ## The capability model
 
@@ -560,10 +563,10 @@ zero client change.
 
 A Userspace Server is a process reached over IPC: a `UserspaceServer` binding points
 at its endpoint, lookup **forwards** the suffix over IPC, the server answers with a
-handle, and the kernel **installs it cross-context** into the original caller's table
-(the `Pending` path — the lookup's `PendingOperation` completes when the server
-replies). This is built with the **fs-server** (the first Userspace Server) and needs:
-the `UserspaceServer` binding target, IPC-forwarded lookup, the cross-context install,
+handle, and the kernel parks it in the lookup's `PendingOperation`, which the caller's
+`sys_wait` installs (the `Pending` path — the PO completes when the server replies).
+This is built with the **fs-server** (the first Userspace Server) and needs:
+the `UserspaceServer` binding target, IPC-forwarded lookup, the parked result,
 the `librsproto` codec (`docs/spec/rsproto-wire-format.md`), and the registration
 handshake below. Kernel Servers (slice 3) need **none** of it.
 
