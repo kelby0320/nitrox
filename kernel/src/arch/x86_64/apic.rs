@@ -142,7 +142,17 @@ pub(crate) unsafe fn enable_this_cpu() {
 /// poll (x2APIC removes it).
 pub(crate) unsafe fn send_ipi(target: u32, vector: u8) {
     // ICR = dest[63:32] | assert | (delivery Fixed=000, physical dest=0) | vector.
-    let icr = ((target as u64) << 32) | ICR_ASSERT | (vector as u64);
+    // SAFETY: forwarded from this function's contract.
+    unsafe { write_icr(((target as u64) << 32) | ICR_ASSERT | (vector as u64)) };
+}
+
+/// Write the ICR, sending an IPI, once every earlier memory access is visible: what an IPI
+/// announces (a shootdown request, a reset acknowledgement) must not arrive after it.
+///
+/// # Safety
+/// Ring-0; x2APIC must be enabled on the calling CPU.
+unsafe fn write_icr(icr: u64) {
+    regs::x2apic_write_fence();
     // SAFETY: writing the x2APIC ICR MSR is the architected way to send an IPI;
     // valid in ring 0 once x2APIC is enabled.
     unsafe { regs::wrmsr(MSR_X2APIC_ICR, icr) };
@@ -158,10 +168,8 @@ pub(crate) unsafe fn send_ipi(target: u32, vector: u8) {
 pub(crate) unsafe fn send_nmi(target: u32) {
     // Delivery mode is ICR[10:8]; NMI is 0b100.
     const ICR_DELIVERY_NMI: u64 = 0b100 << 8;
-    let icr = ((target as u64) << 32) | ICR_ASSERT | ICR_DELIVERY_NMI;
-    // SAFETY: writing the x2APIC ICR MSR is the architected way to send an IPI;
-    // valid in ring 0 once x2APIC is enabled.
-    unsafe { regs::wrmsr(MSR_X2APIC_ICR, icr) };
+    // SAFETY: forwarded from this function's contract.
+    unsafe { write_icr(((target as u64) << 32) | ICR_ASSERT | ICR_DELIVERY_NMI) };
 }
 
 /// `true` if **this** CPU has entered x2APIC mode, so `wrmsr` to the ICR is legal.
