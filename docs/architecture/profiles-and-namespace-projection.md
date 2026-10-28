@@ -96,6 +96,13 @@ lookup /bin/foo  (forwarded to the profile server bound at /bin)
   → NotFound
 ```
 
+**The store is read-only through a profile.** The kernel installs what the server's reply
+carries ([`rsproto-namespace-ops.md`](../spec/rsproto-namespace-ops.md)), and the store is on
+`init`'s writable mount, so the server drops the rights that write a file (`WRITE`, `MAP_WRITE`,
+`APPEND`, `TRUNCATE`) from what a client asks before it looks the program up. The rest pass on:
+what a client asks for says what it wants, and a directory session asked of a program is refused.
+A reply the kernel refuses is answered with its error, as a forwarded resolve has no deadline.
+
 **Probing, not enumeration** — this deliberately needs only *lookup*, never directory
 listing — so since 2026-07-31 the profile server **mints a directory session** for `/bin`
 itself (an empty forwarded suffix) and answers `OP_FILE_READ_DIR` from a merged index it

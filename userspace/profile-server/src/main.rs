@@ -24,8 +24,6 @@ use profile_server::projection::split_suffix;
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const PAGE: u64 = 4096;
-
 /// One projected program, with the metadata the store's own directory reported for it: the
 /// view carries real sizes and timestamps rather than inventing numbers for files it does
 /// not own.
@@ -121,24 +119,34 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
 /// which `init` has mounted before spawning this process. Empty on any failure: the server
 /// then resolves nothing.
 fn read_manifest(root_ns: u64) -> Vec<Package> {
-    let mem = ns_lookup(root_ns, b"/system/profiles/system.toml", RIGHT_MAP_READ);
+    let mem = ns_lookup(root_ns, b"/system/profiles/system.toml", RIGHT_MAP_READ | RIGHT_INSPECT);
     if mem == 0 {
         kprint(b"profile-server: no system profile manifest\n");
         return Vec::new();
     }
-    // SAFETY: `mem` is a MemoryObject handle with MAP_READ.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable `HandleInfo`, the layout the kernel writes.
+    let size = match unsafe { syscall2(SYS_HANDLE_STAT, mem, (&raw mut info) as u64) } {
+        0 => info.size,
+        _ => 0,
+    };
+    let addr = if size == 0 {
+        -1
+    } else {
+        // SAFETY: `mem` is a file handle with MAP_READ, mapped for its own size.
+        unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, size, RIGHT_MAP_READ) }
+    };
+    // SAFETY: closing our own handle; the mapping keeps the file meanwhile.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
     if addr < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        kprint(b"profile-server: the system profile manifest does not read\n");
         return Vec::new();
     }
-    // SAFETY: `addr` is a MAP_READ page holding the manifest bytes + zero padding.
-    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
-    let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    let packages = core::str::from_utf8(&bytes[..len]).map(manifest::parse).unwrap_or_default();
-    // SAFETY: closing our own handle (the mapping persists via its own reference).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+    // SAFETY: `addr` maps the manifest's `size` bytes read-only until the unmap below.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) };
+    let packages = core::str::from_utf8(bytes).map(manifest::parse).unwrap_or_default();
+    // SAFETY: unmapping what was mapped above; `packages` holds copies.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, size) };
     packages
 }
 
@@ -272,9 +280,14 @@ fn index(root_ns: u64, packages: &[Package], dir: &str) -> &'static [Entry] {
     }
 }
 
+/// What a program in the store is never looked up with: the kernel grants a resolve what this
+/// server's reply carries, and the store is on a writable mount. The rest pass on, as what is
+/// asked for says what is wanted: a directory session is refused on a file.
+const WRITE_RIGHTS: u64 = RIGHT_WRITE | RIGHT_MAP_WRITE | Rights::APPEND.bits() | Rights::TRUNCATE.bits();
+
 /// Resolve `suffix` (e.g. `bin/heartbeat`) to its store `FileObject` handle, with the requested
-/// rights plus `TRANSFER` so it can be re-exported. `0` if the profile provides no such
-/// program, or the suffix names a projection's root.
+/// rights less [`WRITE_RIGHTS`], plus `TRANSFER` so it can be re-exported. `0` if the profile
+/// provides no such program, or the suffix names a projection's root.
 ///
 /// Served from the same index as the listing so the two cannot disagree.
 fn resolve_in_store(root_ns: u64, packages: &[Package], suffix: &[u8], rights: u64) -> u64 {
@@ -291,7 +304,7 @@ fn resolve_in_store(root_ns: u64, packages: &[Package], suffix: &[u8], rights: u
         return 0;
     };
     let path = format!("{}/{dir}/{name}", packages[e.pkg].path);
-    ns_lookup(root_ns, path.as_bytes(), rights | RIGHT_TRANSFER)
+    ns_lookup(root_ns, path.as_bytes(), (rights & !WRITE_RIGHTS) | RIGHT_TRANSFER)
 }
 
 /// Free directory-session slot `slot`: close the server endpoint and mark it empty. Must be
@@ -308,31 +321,39 @@ fn free_session_at(slot: usize) {
     }
 }
 
-/// Reply to a forwarded resolve with a directory session: `client_end` moves to the caller
-/// as an `OBJECT_KIND_CHANNEL`. `true` on a successful send.
-fn reply_dir_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
+/// Reply to a forwarded resolve by moving `handle`, an object of `kind`, to the caller. `true` on
+/// a successful send; otherwise the handle is closed and the caller answered with the error, as a
+/// forwarded resolve has no deadline and its client would wait for good.
+fn reply_handle(serve_end: u64, request_id: u64, kind: u16, handle: u64) -> bool {
     let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
-    // A directory handle is a live channel to the server; `content_len` is unused.
-    let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
+    // A directory's channel is a live session with this server; `content_len` is unused.
+    let _ = resolve_reply(&mut body, kind, 0);
     // SAFETY: REPLY_MSG is a valid buffer; the reply goes at PAYLOAD_OFF and the transferred handle
     // in REPLY_HANDLES[0].
-    unsafe {
-        let rs_len = match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
-            Some(n) => n,
-            None => return false,
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = client_end;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            serve_end,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        ) == 0
+    let sent = unsafe {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
+            Some(rs_len) => {
+                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+                REPLY_MSG[8] = 1;
+                REPLY_HANDLES[0] = handle;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    serve_end,
+                    (&raw const REPLY_MSG) as u64,
+                    (&raw const REPLY_HANDLES) as u64,
+                    1,
+                    SENDMODE_NOBLOCK,
+                )
+            }
+            None => KError::KernelError.as_i32() as i64,
+        }
+    };
+    if sent != 0 {
+        // SAFETY: closing our own handle, which did not move.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+        reply_error(serve_end, request_id, OP_NS_RESOLVE, sent as i32);
     }
+    sent == 0
 }
 
 /// Open a directory session over projection `dir`: mint a channel, keep the server end in a
@@ -356,10 +377,8 @@ fn open_dir_session(serve_end: u64, request_id: u64, dir: &'static str) {
         SESSION_CH[slot] = session_end;
         SESSION_DIR[slot] = dir;
     };
-    if !reply_dir_handle(serve_end, request_id, client_end) {
+    if !reply_handle(serve_end, request_id, OBJECT_KIND_CHANNEL, client_end) {
         free_session_at(slot);
-        // SAFETY: closing our own not-yet-transferred handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, client_end) };
     }
 }
 
@@ -455,34 +474,6 @@ fn serve_session(root_ns: u64, packages: &[Package], session_ch: u64) {
                 SENDMODE_NOBLOCK,
             );
         }
-    }
-}
-
-/// Send a success reply on `serve_end` transferring the resolved handle; the kernel installs
-/// it in the caller's table inline, so the send is `NoBlock`.
-fn reply_success(serve_end: u64, request_id: u64, handle: u64) {
-    let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
-    let _ = resolve_reply(&mut body, OBJECT_KIND_MEMOBJ, 0);
-    // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset 24.
-    let rs_len = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
-            Some(n) => n,
-            None => return,
-        }
-    };
-    // SAFETY: stamp the header (payload_len @4, handle_count @8) + the handle slot.
-    unsafe {
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = handle;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            serve_end,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        );
     }
 }
 
@@ -607,7 +598,7 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
         };
 
         if ok && handle != 0 {
-            reply_success(serve_end, request_id, handle);
+            reply_handle(serve_end, request_id, OBJECT_KIND_MEMOBJ, handle);
         } else if ok && op == OP_NS_RESOLVE {
             // SAFETY: single-threaded; set by the resolve arm immediately above.
             let dir = unsafe { PENDING_DIR };

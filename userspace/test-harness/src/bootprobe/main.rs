@@ -223,6 +223,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & map_needs_read_test()
         & spawn_copy_needs_duplicate_test(root_ns)
         & lookup_po_stays_test(root_ns)
+        & store_is_read_only_test(root_ns)
         & exit_with_a_waiter_test(root_ns)
         & exit_with_a_running_sibling_test(root_ns)
         & exit_while_spawning_test(root_ns)

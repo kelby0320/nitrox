@@ -564,3 +564,32 @@ pub(super) fn ns_derive_test(root_ns: u64) -> bool {
     }
     ok
 }
+
+/// **A program in the store is not writable through `/bin`**: a lookup asking for `MAP_WRITE`
+/// gets a handle without it, and a writable mapping of the program is refused. A binary's
+/// page-cache object is every later spawn's, and a sync writes it to disk.
+pub(super) fn store_is_read_only_test(root_ns: u64) -> bool {
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: store read-only FAIL: ").s(why).end();
+        false
+    };
+    let (st, h) = ns_lookup(root_ns, b"/bin/list", RIGHT_MAP_READ | RIGHT_MAP_WRITE | libkern::RIGHT_INSPECT);
+    let info = if st == 0 { stat(h) } else { None };
+    let writable = info.and_then(|i| map_file(h, i.size, RIGHT_MAP_READ | RIGHT_MAP_WRITE).map(|a| (a, i.size)));
+    if let Some((addr, size)) = writable {
+        // SAFETY: unmapping the mapping just made, which nothing wrote through.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, addr, size) };
+    }
+    close(h);
+    let Some(info) = info else {
+        return fail(b"/bin/list did not resolve");
+    };
+    if info.rights & RIGHT_MAP_WRITE != 0 {
+        return fail(b"a lookup through /bin was granted MAP_WRITE");
+    }
+    if writable.is_some() {
+        return fail(b"a program in the store mapped writable");
+    }
+    kprint(b"boot-probe: the store is read-only through /bin ok\n");
+    true
+}

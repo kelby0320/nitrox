@@ -217,6 +217,9 @@ pub(crate) fn system_profile(mode: BuildMode) -> R<String> {
          path = \"{cu_store}\"\n"
     );
     if mode.stages_test_data() {
+        // Past a page, with the test package after it: a server reading the manifest's first page
+        // alone would lose the test programs, and the gates would fail.
+        system_profile.push_str(&"\n# The test image's manifest runs past a page.".repeat(90));
         let test_store = store_path_for_all(&test_package(), "test", "0.1.0")?;
         system_profile.push_str(&format!(
             "\n[[package]]\n\
