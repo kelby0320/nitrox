@@ -77,6 +77,12 @@ pub fn shootdown_all() {
     shootdown(None);
 }
 
+/// This CPU's index, read where the thread cannot migrate.
+fn pinned_cpu() -> usize {
+    debug_assert!(crate::sched::preemption_disabled(), "the CPU read with preemption on");
+    Smp::current_cpu() as usize
+}
+
 /// Perform the local invalidation for a request. `None` = whole TLB.
 ///
 /// # Safety
@@ -94,13 +100,16 @@ unsafe fn invalidate_local(va: Option<VirtAddr>) {
 fn shootdown(va: Option<VirtAddr>) {
     #[cfg(test)]
     SHOT.with(|s| s.set((s.get().0 + 1, crate::mm::heap::frames_freed_by_this_thread())));
-    let me = Smp::current_cpu() as usize;
+    // Preemption off before reading this CPU: the sole-online path invalidates only the one read.
+    crate::sched::preempt_disable();
+    let me = pinned_cpu();
     let online = crate::sched::online_mask();
 
     // Sole online CPU (or pre-SMP boot): invalidate locally; no other CPU holds a stale entry.
     if online & !(1u64 << me) == 0 {
         // SAFETY: ring-0; local invalidation of a caller-owned page-table change.
         unsafe { invalidate_local(va) };
+        crate::sched::preempt_enable();
         return;
     }
 
@@ -111,7 +120,6 @@ fn shootdown(va: Option<VirtAddr>) {
     // deferred; IRQ handlers, this CPU's own shootdown IPI included, still run. The initiator
     // therefore cannot migrate mid-window; the all-online target set is kept as simpler than a
     // local special case.
-    crate::sched::preempt_disable();
     let prev_if = Cpu::interrupts_enabled();
     // SAFETY: ring-0, preemptible kernel context (the caller contract); the IDT
     // and timer are live (APs are online). Restored below.
