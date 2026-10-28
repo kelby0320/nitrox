@@ -725,7 +725,7 @@ pub fn ready_is_empty() -> bool {
 /// [`context_switch`]).
 pub(crate) extern "C" fn thread_enter() -> ! {
     // Capture (under the lock) whether the current thread descends to ring 3 and its params.
-    let descent: Option<(u64, u64, u64, [u64; 4])> = {
+    let descent: Option<(u64, u64, [u64; 4])> = {
         let g = SCHED.lock();
         let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
         let obj = cur.as_ptr();
@@ -739,26 +739,21 @@ pub(crate) extern "C" fn thread_enter() -> ! {
             }
             Some((entry, user_sp)) => {
                 // SAFETY: as above.
-                let ktop = unsafe { Thread::kstack_top(obj) }.expect("a user thread has a kernel stack");
+                assert!(unsafe { Thread::kstack_top(obj) }.is_some(), "a user thread has a kernel stack");
+                // Armed under `SCHED`, where reading the CPU and writing its slots cannot straddle a
+                // migration; a switch-in re-arms them wherever the thread resumes.
+                // SAFETY: as above.
+                unsafe { arm_kernel_stack_for(obj) };
                 // SAFETY: as above.
                 let boot = unsafe { Thread::user_boot_args(obj) };
-                Some((entry, user_sp, ktop, boot))
+                Some((entry, user_sp, boot))
             }
             None => None,
         }
     };
 
     match descent {
-        Some((entry, user_sp, ktop, boot)) => {
-            // Point the ring0 trap stack (TSS.RSP0) and the per-CPU syscall stack at THIS
-            // thread's kernel stack before dropping to ring 3. CR3 is already the process
-            // address space (loaded by the scheduler on switch-in).
-            Cpu::set_kernel_stack(ktop);
-            crate::arch::set_syscall_kernel_stack(ktop);
-            // Re-assert the per-CPU base for the first `syscall`: a thread that blocked
-            // mid-syscall is switched away with the entry GS-swap still in effect, so a
-            // fresh descent must restore it or the child's first syscall faults.
-            crate::arch::arm_user_entry_cpu_base();
+        Some((entry, user_sp, boot)) => {
             // SAFETY: `entry`/`user_sp` are canonical user VAs mapped X / W
             // in the active address space; the syscall fast-path is armed.
             // `boot` seeds rdi/rsi/rdx/rcx — the spawn hand-off (notif, root

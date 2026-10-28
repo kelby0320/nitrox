@@ -95,6 +95,7 @@ pub fn init_syscall_entry() {
 /// `enter_user` does no `swapgs`; a stale `KERNEL_GS_BASE` would fault on `gs:` in the first
 /// `syscall`'s entry.
 pub fn arm_user_entry_cpu_base() {
+    regs::debug_assert_pinned("arm_user_entry_cpu_base");
     let gs_base = this_cpu_block() as u64;
     // SAFETY: architectural MSR; this CPU's `CpuLocal` slot is the block the entry
     // stub reaches through `gs:` after `swapgs`.
@@ -112,9 +113,10 @@ pub fn arm_user_entry_cpu_base() {
 ///
 /// Called with the user thread's kernel stack top before it descends to ring 3.
 pub fn set_syscall_kernel_stack(top: u64) {
-    // SAFETY: writes only the running CPU's slot. We're in ring 0 about to descend
-    // to ring 3 on this CPU, so no `syscall` on this CPU can be reading `kstack_top`
-    // concurrently, and other CPUs touch only their own slots.
+    regs::debug_assert_pinned("set_syscall_kernel_stack");
+    // SAFETY: writes only the running CPU's slot, which interrupts masked keep it on. In ring 0
+    // about to descend to ring 3 on this CPU, no `syscall` on this CPU can be reading
+    // `kstack_top` concurrently, and other CPUs touch only their own slots.
     unsafe {
         (&raw mut (*this_cpu_block()).kstack_top).write(top);
     }

@@ -325,6 +325,13 @@ pub fn read_rflags() -> u64 {
     val
 }
 
+/// Assert, in debug builds, that this CPU's interrupts are masked, so its thread cannot migrate
+/// between reading which CPU it is on and writing that CPU's slot.
+#[inline]
+pub fn debug_assert_pinned(what: &str) {
+    debug_assert!(read_rflags() & (1 << 9) == 0, "{what}: this CPU's slot written with interrupts on");
+}
+
 /// Clear the interrupt flag (`cli`), masking maskable interrupts on this CPU.
 ///
 /// # Safety

@@ -246,6 +246,7 @@ unsafe fn load_tss() {
 /// Must be set before any ring-3 entry. `syscall` does *not* consult RSP0; the entry stub loads
 /// the kernel stack itself.
 pub fn set_kernel_stack(top: u64) {
+    regs::debug_assert_pinned("set_kernel_stack");
     let cpu = this_cpu();
     // SAFETY: writes only the running CPU's TSS slot (`cpu < MAX_CPUS`), which it
     // owns exclusively with no outstanding reference. `rsp[0]` is a `u64` at a
