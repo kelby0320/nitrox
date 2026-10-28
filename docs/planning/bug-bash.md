@@ -443,7 +443,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Medium. **Fix.**
   Fixed in `badc91cd`; fails without it:
   `an_image_whose_segments_claim_more_than_the_budget_is_refused`.
-- [ ] **kmem-9** `kernel/src/mm/kvmap.rs:58` — `vmap_alloc_pages` bounds the bump pointer by
+- [x] **kmem-9** `kernel/src/mm/kvmap.rs:58` — `vmap_alloc_pages` bounds the bump pointer by
   `KERNEL_VMAP_END` (16 TiB), but only the first 512 GiB has a PDPT in the kernel template, and VA
   is never reclaimed. Past that, a new stack lands in a PML4 slot that `map_page` fills in one
   address space's PML4 only, which breaks the "every kernel stack is mapped in every root"
@@ -456,6 +456,8 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   small-RAM machines the recorded page-table-frame leak may exhaust memory first. Lens: logic.
   Medium. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's kmem-d1, which repeats it.
+  Fixed in `165dae67`, as kmem-d1; fails without it:
+  `the_last_page_the_vmap_hands_out_is_mapped_under_every_root`.
 - [ ] **kmem-10** `kernel/src/sched/ipc.rs:499` — When a server's endpoint closes
   (`ipc_endpoint_closing`, line 480) or its registration drops (`us_reg_detach`), only pending
   lookups are drained, never `pending_fill`. A Model B page-cache fill whose server dies or never
