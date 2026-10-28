@@ -297,7 +297,12 @@ tree with a top-level page-table root under a single
 [kernel/docs/lock-ordering.md](../../kernel/docs/lock-ordering.md)).
 It is the bridge between the VMM's bookkeeping (the tree) and the
 hardware MMU's actual translations (the page tables): `map_vma`
-updates both atomically; `unmap_covering` does the inverse.
+updates both atomically; `unmap_covering` does the inverse, returning
+what it took out as an `Unmapped`, which is shot down on every CPU
+before any frame, or the VMA holding the object that owns them, is
+released. `map_object`'s rollback is shot down before its object comes
+back. `map_vma` takes `&mut self`: only a space no CPU has loaded, the
+ELF loader's, is filled eagerly, so its rollback frees without one.
 
 - **Construction.** `new()` allocates a fresh 4 KiB PML4 frame from
   the buddy, zeros every entry, then calls
@@ -616,9 +621,6 @@ management story.
 - No DMA / Normal zone split in the buddy (see TODO in `buddy.rs`).
 - No allocator-rank-checker in debug builds (still on the to-do list
   in CLAUDE.md).
-- No TLB flushing on map / unmap. No AS is "active" today, so the
-  TLB doesn't cache its entries. The scheduler will own flushing
-  once `AddressSpace::set_active` exists.
 - The kernel vmap hands out VA only in its window, the first 512 GiB
   of the 16 TiB region. Growing it means linking more PDPTs into the
   live PML4 *before* the `init_kernel_template` snapshot, at boot

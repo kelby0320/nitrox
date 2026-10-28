@@ -793,7 +793,7 @@ fn run_first_userspace() {
     arch::init_syscall_entry();
     kprintln!("syscall fast-path armed");
 
-    let aspace = match AddressSpace::new() {
+    let mut aspace = match AddressSpace::new() {
         Ok(a) => a,
         Err(_) => {
             kprintln!("init: address space alloc failed");
@@ -808,7 +808,7 @@ fn run_first_userspace() {
                 return;
             }
         };
-    let info = match load_elf(&aspace, init_bytes) {
+    let info = match load_elf(&mut aspace, init_bytes) {
         Ok(i) => i,
         Err(e) => {
             kprintln!("init: ELF load failed: {:?}", e);

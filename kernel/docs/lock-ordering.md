@@ -305,7 +305,7 @@ inverting the ranking. `HandleTable::close_owned_batch` therefore returns a
 `(count, more_remain)` pair and a resume cursor rather than sweeping the whole
 process in one critical section — the same "unlink under the lock, free
 outside it" shape as `close`'s `ClosedObject` contract and
-`unmap_covering_deferred`'s deferred frame release. The drops run inside a
+`unmap_covering`'s `Unmapped`, released after the lock. The drops run inside a
 `preempt_disable`/`enable` region for the reason F12 established: a descheduled
 holder of an allocator spinlock starves every CPU spinning on it.
 

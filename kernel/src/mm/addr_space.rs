@@ -116,8 +116,9 @@ impl AddressSpace {
 
     /// Install a VMA: allocate and zero a frame per page, install each PTE, then insert the VMA,
     /// all under the AS lock so tree and page tables never disagree. The box is returned on any
-    /// rejection.
-    pub fn map_vma(&self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
+    /// rejection. `&mut`, as only a space no CPU has loaded may be filled this way: a failure
+    /// frees the frames it mapped with no shootdown.
+    pub fn map_vma(&mut self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
         let range = boxed.range;
 
         // Both endpoints must be canonical; test `end - 1` since the end is exclusive.
@@ -349,7 +350,10 @@ impl AddressSpace {
             match unsafe { Paging::map_page(root, virt, frames[i as usize], flags) } {
                 Ok(()) => installed += 1,
                 Err(ArchMapError::OutOfMemory) => {
-                    rollback_object_map(root, range.start(), installed);
+                    let unmapped = rollback_object_map(root, range.start(), installed);
+                    // Shot down before the object, which owns the frames, can be dropped.
+                    drop(guard);
+                    drop(unmapped);
                     return Err((object, MapError::OutOfMemory));
                 }
                 Err(ArchMapError::AlreadyMapped) => {
@@ -367,7 +371,9 @@ impl AddressSpace {
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             Err(mut b) => {
-                rollback_object_map(root, range.start(), installed);
+                let unmapped = rollback_object_map(root, range.start(), installed);
+                drop(guard);
+                drop(unmapped);
                 let object = b.object.take().expect("object-backed VMA carries its ObjectRef");
                 Err((object, MapError::Overlap))
             }
@@ -491,35 +497,34 @@ impl AddressSpace {
         guard.vma_tree.find_free_range(VirtAddr::new(MMAP_BASE), VirtAddr::new(MMAP_MAX), size)
     }
 
-    /// Remove the VMA covering `addr`, uninstall its PTEs and free its anonymous frames.
-    ///
-    /// **Host tests only.** Freeing in place is wrong on SMP, where another CPU may still hold
-    /// TLB translations; production uses [`unmap_covering_deferred`](Self::unmap_covering_deferred).
+    /// [`unmap_covering`](Self::unmap_covering), reserving as it asks. **Host tests only.**
     #[cfg(test)]
-    pub fn unmap_covering(&self, addr: VirtAddr) -> Option<KBox<Vma>> {
-        let mut guard = self.inner.lock();
-        let boxed = guard.vma_tree.remove_covering(addr)?;
-        free_vma_pages(guard.root, &boxed);
-        Some(boxed)
+    pub fn unmap_at(&self, addr: VirtAddr) -> Option<Unmapped> {
+        let mut frames = KVec::new();
+        loop {
+            match self.unmap_covering(addr, frames) {
+                Ok(unmapped) => return unmapped,
+                Err((mut f, pages)) => {
+                    f.try_reserve(pages as usize).expect("a host test's reserve");
+                    frames = f;
+                }
+            }
+        }
     }
 
-    /// Remove the VMA covering `addr` and uninstall its PTEs, **deferring every frame release to
-    /// the caller**: anonymous leaf frames go into `frames` (whose spare capacity must already
-    /// hold them: nothing grows under the lock) and the returned [`Vma`] keeps its backing-object
-    /// reference.
+    /// Remove the VMA covering `addr` and uninstall its PTEs. What they held, the anonymous frames
+    /// collected in `frames` and the VMA, which keeps its backing object, comes back as an
+    /// [`Unmapped`], released only after a shootdown: another CPU running this space may still
+    /// translate to it. The production unmap (`sys_memory_unmap`).
     ///
-    /// The production unmap (`sys_memory_unmap`). Another CPU running this address space may
-    /// still hold TLB translations for the range, so the caller must broadcast a TLB shootdown
-    /// after this returns, and only then free the collected frames and drop the `Vma` (whose drop
-    /// can release a `MemoryObject`'s frames).
-    ///
-    /// `Err(pages)`, tree and PTEs untouched, if `frames` has too little spare capacity; reserve
+    /// `frames`' spare capacity must hold the frames, as nothing grows under the lock: if it is
+    /// too small, `frames` comes back with the pages needed, tree and PTEs untouched, to reserve
     /// outside the lock and retry.
-    pub fn unmap_covering_deferred(
+    pub fn unmap_covering(
         &self,
         addr: VirtAddr,
-        frames: &mut KVec<PhysAddr>,
-    ) -> Result<Option<KBox<Vma>>, u64> {
+        mut frames: KVec<PhysAddr>,
+    ) -> Result<Option<Unmapped>, (KVec<PhysAddr>, u64)> {
         let mut guard = self.inner.lock();
         // Only an anonymous mapping's frames come back; reserving for a mapped 2 GiB file would
         // ask for more than the largest allocation and refuse the unmap.
@@ -529,7 +534,7 @@ impl AddressSpace {
             None => return Ok(None),
         };
         if ((frames.capacity() - frames.len()) as u64) < pages {
-            return Err(pages);
+            return Err((frames, pages));
         }
         let boxed = guard.vma_tree.remove_covering(addr).expect("find_covering matched under the same hold");
         for i in 0..boxed.range.pages() {
@@ -544,13 +549,38 @@ impl AddressSpace {
                 frames.try_push(phys).expect("within the spare capacity checked above");
             }
         }
-        Ok(Some(boxed))
+        Ok(Some(Unmapped { frames, vma: Some(boxed) }))
+    }
+}
+
+/// What an unmap took out of a live address space's page tables: anonymous frames, and a VMA
+/// whose drop can free its object's. Another CPU running the space may still translate to them,
+/// so dropping this shoots them down on every CPU before releasing anything. Drop it outside
+/// every lock, as a shootdown requires.
+pub struct Unmapped {
+    frames: KVec<PhysAddr>,
+    vma: Option<KBox<Vma>>,
+}
+
+impl Unmapped {
+    /// The VMA unmapped, if a VMA was.
+    pub fn vma(&self) -> Option<&Vma> {
+        self.vma.as_deref()
+    }
+}
+
+impl Drop for Unmapped {
+    fn drop(&mut self) {
+        crate::tlb::shootdown_all();
+        self.frames.iter().for_each(|&f| heap::buddy_free(f, 0));
+        drop(self.vma.take());
     }
 }
 
 impl Drop for AddressSpace {
     /// Tear down every VMA, drop the empty tree, then free the PML4 frame. Intermediate
-    /// page-table frames leak per the deferred decision.
+    /// page-table frames leak per the deferred decision. No shootdown: no CPU has the space
+    /// loaded, as a switch loads the next thread's root before the last one here is reaped.
     ///
     /// **`get_mut`, not `lock`, and that is a bug fix.** Dropping a VMA can drop the last
     /// reference to a `FileObject`, taking the *file's* lock; both are `LockRank::KernelObject`,
@@ -599,7 +629,8 @@ fn free_vma_pages(root: PhysAddr, vma: &Vma) {
     }
 }
 
-/// Roll back a partial `map_vma`: uninstall `installed` PTEs from `start`, freeing each frame.
+/// Roll back a partial `map_vma`: uninstall `installed` PTEs from `start`, freeing each frame, with
+/// no shootdown, as `map_vma` fills only a space no CPU has loaded.
 fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
     for i in 0..installed {
         let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
@@ -613,8 +644,9 @@ fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
 }
 
 /// Roll back a partial `map_object`: uninstall `installed` PTEs from `start` but **do not free
-/// the frames** (the `MemoryObject` owns them).
-fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) {
+/// the frames** (the `MemoryObject` owns them). The space is live, so the object may be released
+/// only once the [`Unmapped`] has been dropped, if any page was mapped.
+fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) -> Option<Unmapped> {
     for i in 0..installed {
         let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
         // SAFETY: we successfully installed exactly these `installed` pages in
@@ -622,6 +654,7 @@ fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) {
         // object's frame, which the object still owns — discard it.
         let _ = unsafe { Paging::unmap_page(root, virt) };
     }
+    (installed > 0).then(|| Unmapped { frames: KVec::new(), vma: None })
 }
 
 /// Translate the VMA-level [`Protection`] and [`Caching`] into hardware [`PageFlags`].

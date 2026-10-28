@@ -373,9 +373,9 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
         img_bytes.len() as u64,
     );
 
-    let asp = AddressSpace::new().map_err(|_| KError::OutOfMemory)?;
+    let mut asp = AddressSpace::new().map_err(|_| KError::OutOfMemory)?;
     // A spawner's ELF is untrusted input: the loader bounds-checks every offset.
-    let info = load_elf(&asp, &img_bytes).map_err(from_elf_load)?;
+    let info = load_elf(&mut asp, &img_bytes).map_err(from_elf_load)?;
     drop(img);
     let child_pid = crate::sched::alloc_pid();
 
@@ -953,21 +953,19 @@ pub fn sys_memory_unmap(addr: u64, _size: u64) -> SysResult {
     }
     let proc_ref = crate::sched::current_process().ok_or(KError::KernelError)?;
     let asp = current_address_space(&proc_ref).ok_or(KError::KernelError)?;
-    let mut frames: crate::libkern::KVec<crate::mm::PhysAddr> = crate::libkern::KVec::new();
-    let vma = loop {
-        match asp.unmap_covering_deferred(va, &mut frames) {
-            Ok(Some(vma)) => break vma,
+    let mut frames = crate::libkern::KVec::new();
+    let unmapped = loop {
+        match asp.unmap_covering(va, frames) {
+            Ok(Some(unmapped)) => break unmapped,
             Ok(None) => return Err(KError::InvalidArgument),
-            Err(pages) => frames.try_reserve(pages as usize).map_err(|_| KError::OutOfMemory)?,
+            Err((mut f, pages)) => {
+                f.try_reserve(pages as usize).map_err(|_| KError::OutOfMemory)?;
+                frames = f;
+            }
         }
     };
-    // Another CPU may still hold translations: invalidate everywhere BEFORE any frame becomes
-    // reusable, then free the frames and drop the VMA. IF-masked; `shootdown_all` is IF-robust.
-    crate::tlb::shootdown_all();
-    for &f in frames.iter() {
-        crate::mm::heap::buddy_free(f, 0);
-    }
-    drop(vma);
+    // Shot down on every CPU, then freed. IF-masked; `shootdown_all` is IF-robust.
+    drop(unmapped);
     Ok(0)
 }
 
