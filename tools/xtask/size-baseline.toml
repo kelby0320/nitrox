@@ -41,8 +41,8 @@
 "userspace/nxsh/src/ops.rs" = 1079
 "userspace/nxsh/src/parse.rs" = 1867
 "userspace/nxterm/src/lib.rs" = 2341
-"userspace/service-mgr/src/main.rs" = 2249
-"userspace/storage-service/src/main.rs" = 1531
+"userspace/service-mgr/src/main.rs" = 2220
+"userspace/storage-service/src/main.rs" = 1527
 "userspace/test-harness/src/harness.rs" = 3956
 "userspace/test-harness/src/uiclient.rs" = 1265
 "userspace/view-broker/src/lib.rs" = 1646

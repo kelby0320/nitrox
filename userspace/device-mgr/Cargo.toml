@@ -7,6 +7,7 @@ edition = "2024"
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 librsproto = { path = "../librsproto" }
+libfs = { path = "../libfs" }
 libstream = { path = "../libstream" }
 
 # The library/binary split every resource server here uses: the library is what can be wrong

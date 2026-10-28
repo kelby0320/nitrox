@@ -181,9 +181,8 @@ pub unsafe fn pending_op_completion(po: *mut ()) -> (i32, u64) {
     unsafe { (PendingOperation::status(po), PendingOperation::result(po)) }
 }
 
-/// Complete a namespace lookup's [`PendingOperation`] with `status` and its resolved object,
-/// **parked** for [`pending_op_take`]'s reader to install. An object a PO already completed
-/// cannot take comes back, to drop outside `SCHED`. Syscall context; takes `SCHED`.
+/// Complete a lookup's [`PendingOperation`] with `status` and its object, **parked** for
+/// [`pending_op_take`]'s reader; one a PO already completed comes back, to drop outside `SCHED`.
 ///
 /// # Safety
 ///

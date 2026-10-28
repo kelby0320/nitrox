@@ -34,8 +34,7 @@ pub(crate) struct HandleEntry {
     pub rights: AtomicU64,
     /// [`KObjectType`] discriminant.
     pub object_type: AtomicU32,
-    /// Nonzero while a [`Claim`](super::table::Claim) moves the handle; read and written only
-    /// under the rank-3 lock, and cleared by the next allocation of the slot.
+    /// Nonzero while a [`Claim`](super::table::Claim) moves the handle; only under the rank-3 lock.
     pub in_transit: AtomicU32,
     /// Type-erased object pointer: null while the slot is free or in the
     /// deferred-reclaim queue. Read in step 6 as one `Acquire` load.
@@ -138,8 +137,7 @@ impl Drop for WriteGuard<'_> {
 mod tests {
     use super::*;
 
-    /// **A snapshot is never torn**, under Miri's weak-memory emulation: x86 keeps stores in order,
-    /// and would pass a writer that let the fields pass its odd `seq`.
+    /// **A snapshot is never torn**, as Miri's weak-memory emulation shows: x86 keeps stores in order.
     #[test]
     fn a_snapshot_is_never_torn() {
         const WRITES: u32 = if cfg!(miri) { 300 } else { 100_000 };
