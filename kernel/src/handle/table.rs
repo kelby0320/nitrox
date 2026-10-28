@@ -336,6 +336,7 @@ impl HandleTable {
                             entry.rights.store(rights.bits(), Ordering::Relaxed);
                             entry.object_type.store(object_type as u32, Ordering::Relaxed);
                             entry.next_owned.store(RawHandle::NULL.bits(), Ordering::Relaxed);
+                            entry.in_transit.store(0, Ordering::Relaxed);
                             // Publish the object pointer LAST: the Release pairs
                             // with the Acquire in `lookup`, so a reader seeing
                             // `object != null` sees every metadata store above.
@@ -462,6 +463,37 @@ impl HandleTable {
                 rights: snap.rights,
             });
         }
+    }
+
+    /// Look up `h` as [`lookup`](Self::lookup) does, and claim it to be moved: until the [`Claim`]
+    /// commits or drops, another claim of it fails with `InvalidHandle`. Two moves of one handle
+    /// at once would otherwise both pass their lookups, a copy without `DUPLICATE`.
+    pub fn claim(&self, h: RawHandle, caller_pid: u32, required: Rights) -> Result<(LookupOk, Claim<'_>), HandleError> {
+        let ok = self.lookup(h, caller_pid, required)?;
+        let claimed = {
+            let _guard = self.inner.lock();
+            // Closed, reused or claimed since the lookup: the handle is leaving, or has left.
+            let entry = self.entry_of(h).filter(|e| {
+                e.object.load(Ordering::Relaxed) == ok.object.as_ptr() && e.in_transit.load(Ordering::Relaxed) == 0
+            });
+            entry.inspect(|e| e.in_transit.store(1, Ordering::Relaxed)).is_some()
+        };
+        if !claimed {
+            return Err(HandleError::InvalidHandle);
+        }
+        Ok((ok, Claim { table: self, handle: h, pid: caller_pid }))
+    }
+
+    /// `h`'s entry if its generation is still `h`'s. Called with the rank-3 lock held.
+    fn entry_of(&self, h: RawHandle) -> Option<&super::entry::HandleEntry> {
+        let (seg_id, slot_id, generation) = h.decode();
+        let entries = self.directory.get(seg_id as usize)?.load(Ordering::Relaxed);
+        if entries.is_null() || slot_id as usize >= SEGMENT_LEN {
+            return None;
+        }
+        // SAFETY: as in `close`; segments are published once and outlive the table.
+        let entry = unsafe { &(*entries)[slot_id as usize] };
+        (entry.generation.load(Ordering::Relaxed) == generation).then_some(entry)
     }
 
     /// Close a handle, returning a [`ClosedObject`] with the object pointer and
@@ -758,6 +790,35 @@ impl HandleTable {
         // Bump unconditionally so a reader entering after this drain is tagged
         // at a strictly later epoch than closes scheduled before it.
         self.grace.advance_epoch();
+    }
+}
+
+/// A handle being moved out of its owner's table, from [`HandleTable::claim`].
+pub struct Claim<'a> {
+    table: &'a HandleTable,
+    handle: RawHandle,
+    pid: u32,
+}
+
+impl Claim<'_> {
+    /// The move has committed: close the handle and release its reference. One its owner closed
+    /// meanwhile has nothing left to close.
+    pub fn commit(self) {
+        let this = core::mem::ManuallyDrop::new(self);
+        if let Ok(co) = this.table.close(this.handle, this.pid) {
+            // SAFETY: `close` transferred the handle's one reference into `co`.
+            drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+        }
+    }
+}
+
+/// The move failed: the handle stays with its owner.
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let _guard = self.table.inner.lock();
+        if let Some(e) = self.table.entry_of(self.handle) {
+            e.in_transit.store(0, Ordering::Relaxed);
+        }
     }
 }
 

@@ -860,3 +860,64 @@ fn a_close_waits_for_a_lookup_about_to_take_its_reference() {
 fn a_sweep_waits_for_a_lookup_about_to_take_its_reference() {
     a_closer_waits_for_a_lookup_about_to_take_its_reference(|t, _| assert_eq!(sweep_owned(t, 1), 1));
 }
+
+fn moveable() -> Rights {
+    Rights::SIGNAL | Rights::TRANSFER
+}
+
+/// **A handle moves once**: a second claim of it fails until the first commits or drops.
+#[test]
+fn a_claimed_handle_cannot_be_claimed_again_and_commits_to_closed() {
+    let t = fresh_table();
+    let h = t.allocate(1, mk_process(1), KObjectType::Process, moveable()).unwrap();
+    let before = test_probe::process_destroys();
+    let (ok, claim) = t.claim(h, 1, Rights::TRANSFER).unwrap();
+    assert_eq!(t.claim(h, 1, Rights::TRANSFER).err(), Some(HandleError::InvalidHandle));
+    assert!(t.lookup(h, 1, Rights::SIGNAL).is_ok(), "in use until the move commits");
+    claim.commit();
+    assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle);
+    assert_eq!(test_probe::process_destroys(), before, "the move's reference keeps it");
+    drop(ok);
+    assert_eq!(test_probe::process_destroys(), before + 1);
+}
+
+#[test]
+fn a_dropped_claim_gives_the_handle_back() {
+    let t = fresh_table();
+    let h = t.allocate(1, mk_process(1), KObjectType::Process, moveable()).unwrap();
+    drop(t.claim(h, 1, Rights::TRANSFER).unwrap());
+    let (_ok, claim) = t.claim(h, 1, Rights::TRANSFER).unwrap();
+    drop(claim);
+    close_release(&t, h, 1).unwrap();
+    assert_eq!(t.claim(h, 1, Rights::SIGNAL).err(), Some(HandleError::InvalidHandle));
+}
+
+/// A claim whose handle its owner closed, and whose slot went to another handle, leaves it alone.
+#[test]
+fn a_stale_claim_leaves_its_slots_next_handle_alone() {
+    let t = fresh_table();
+    for commit in [true, false] {
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, moveable()).unwrap();
+        let (_ok, stale) = t.claim(h, 1, Rights::TRANSFER).unwrap();
+        close_release(&t, h, 1).unwrap();
+        let again = t.allocate(1, mk_process(2), KObjectType::Process, moveable()).unwrap();
+        assert_eq!(again.decode().1, h.decode().1, "the slot reused");
+        let (_ok, live) = t.claim(again, 1, Rights::TRANSFER).unwrap();
+        if commit {
+            stale.commit();
+        } else {
+            drop(stale);
+        }
+        assert_eq!(t.claim(again, 1, Rights::TRANSFER).err(), Some(HandleError::InvalidHandle), "{commit}");
+        drop(live);
+        close_release(&t, again, 1).unwrap();
+    }
+}
+
+#[test]
+fn a_claim_needs_the_rights_it_asks_for() {
+    let t = fresh_table();
+    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    assert_eq!(t.claim(h, 1, Rights::TRANSFER).err(), Some(HandleError::NoAccess));
+    assert_eq!(t.claim(h, 2, Rights::empty()).err(), Some(HandleError::NotOwner));
+}

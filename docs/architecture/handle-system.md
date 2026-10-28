@@ -269,6 +269,24 @@ stress tests exercise the backoff path: a reader spinning on
 `read_snapshot`'s seqlock under sustained writer pressure may not
 have quiesced yet, and yielding lets it complete.
 
+## Moves
+
+A handle **moves** when an IPC send carries it, a spawn grants it with its `move_mask` bit, or a
+forwarded reply hands it to the kernel. A move is a `HandleTable::claim`: a lookup, then, under
+the rank-3 lock, the entry marked in transit (`HandleEntry::in_transit`), refused if it already
+is. The move commits into its ring, child or reply, then `Claim::commit` closes the handle; a
+move that fails drops its claim, which clears the mark and leaves the handle with its owner.
+**Two moves of one handle at once cannot both pass**: each was a lookup and a later close, and
+both receivers got the object, a copy of a handle that may lack `DUPLICATE` (safety survey,
+kobj-d2). A lookup that asks for `TRANSFER` is a copy and asks for `DUPLICATE` too; a tools test
+holds both rules over the kernel's source.
+
+A claim does not stop the handle's use meanwhile, nor its owner's close, nor the exit sweep:
+`commit` and the drop find the entry by generation, so one closed meanwhile has nothing left to
+close, and one whose slot went to another handle is left alone. A spawn allocates the parent's
+handle to the child before the child runs, so nothing fails after it does and every claim commits
+(kobj-d4).
+
 ## Grace tracking
 
 [`GraceTracker`] is keyed by **context id**, an opaque `u32`. What a

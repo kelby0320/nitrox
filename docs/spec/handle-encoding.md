@@ -100,7 +100,7 @@ struct HandleEntry {
     owner_pid:    u32,
     rights:       Rights,         // 8 bytes
     object_type:  KObjectType,    // 4 bytes
-    _pad1:        u32,
+    in_transit:   u32,            // nonzero while a move claims it; read only under the table lock
     object:       AtomicPtr<()>,  // 8 bytes; type-erased; dispatch via object_type
     next_owned:   RawHandle,      // 8 bytes; intrusive list for per-process cleanup
     free_next:    u32,            // index of next free slot (valid only when free)

@@ -10,7 +10,7 @@ use crate::arch::abi::USER_VIRT_END;
 use crate::arch::paging::ArchPaging;
 use crate::arch::timer::ArchTimer;
 use crate::handle::global;
-use crate::handle::table::{HandleError, HandleTable, LookupOk};
+use crate::handle::table::{Claim, HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
 use crate::rsproto::SizeChange;
 
@@ -449,10 +449,19 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     };
 
     let mut installed = [RawHandle::NULL; SPAWN_MAX_HANDLES];
+    let mut claims: [Option<Claim<'_>>; SPAWN_MAX_HANDLES] = core::array::from_fn(|_| None);
     for i in 0..count {
         // A grant not moved is a copy, and a copy needs DUPLICATE, as `sys_handle_duplicate` does.
-        let copy = if args.move_mask & (1 << i) == 0 { Rights::DUPLICATE } else { Rights::empty() };
-        let ok = match global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER | copy) {
+        // A move is claimed until the spawn commits, so a second move of it at once fails.
+        let found = if args.move_mask & (1 << i) == 0 {
+            global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER | Rights::DUPLICATE)
+        } else {
+            global::get().claim(args.handles[i], parent_pid, Rights::TRANSFER).map(|(ok, c)| {
+                claims[i] = Some(c);
+                ok
+            })
+        };
+        let ok = match found {
             Ok(ok) => ok,
             Err(e) => {
                 spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..i]);
@@ -477,32 +486,28 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
         // SAFETY: `into_raw` yielded the single creation reference; adopt it.
         unsafe { ObjectRef::from_raw(p, KObjectType::Process) }
     };
-    let proc_for_handle = proc_obj.clone();
 
-    let endpoint_h = if count > 0 { installed[0].bits() } else { 0 };
-    let boot = [notif_h.bits(), child_ns_h.bits(), endpoint_h, args.arg0];
-    if crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot).is_err() {
-        drop(proc_for_handle);
-        spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
-        return Err(KError::OutOfMemory);
-    }
-
-    let (pp, pt) = proc_for_handle.into_raw();
+    // The parent's handle to the child before the child runs: nothing may fail once it does.
+    let (pp, pt) = proc_obj.clone().into_raw();
     let parent_handle = match global::get().allocate(parent_pid, pp, pt, Rights::SIGNAL | Rights::TERMINATE) {
         Ok(h) => h,
         Err(e) => {
-            // The child is already running; reclaim only the process-handle reference.
             // SAFETY: adopt + drop the reference yielded by `into_raw`.
             drop(unsafe { ObjectRef::from_raw(pp, pt) });
+            drop(proc_obj);
+            spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
             return Err(map_handle_err(e));
         }
     };
 
-    for i in 0..count {
-        if (args.move_mask >> i) & 1 == 1 {
-            close_and_release(args.handles[i], parent_pid);
-        }
+    let endpoint_h = if count > 0 { installed[0].bits() } else { 0 };
+    let boot = [notif_h.bits(), child_ns_h.bits(), endpoint_h, args.arg0];
+    if crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot).is_err() {
+        close_and_release(parent_handle, parent_pid);
+        spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
+        return Err(KError::OutOfMemory);
     }
+    commit_all(&mut claims);
 
     Ok(parent_handle.bits() as isize)
 }
@@ -1964,10 +1969,11 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
     // Each transferred handle needs `TRANSFER`; a failure drops the collected refs (outside SCHED)
     // and leaves the sender's table unchanged: atomic-or-fail.
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    let mut claims: [Option<Claim<'_>>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     for i in 0..count {
-        let h = RawHandle(h_raw[i]);
-        let t = global::get().lookup(h, pid, Rights::TRANSFER).map_err(map_handle_err)?;
+        let (t, claim) = global::get().claim(RawHandle(h_raw[i]), pid, Rights::TRANSFER).map_err(map_handle_err)?;
         transfers[i] = Some(TransferRef { obj: t.object, rights: t.rights });
+        claims[i] = Some(claim);
     }
 
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
@@ -1993,7 +1999,10 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
             }
             return answer_forget(&reg, file_id, pid);
         }
-        return complete_forwarded_reply(&reg, &bounce, &mut transfers, &h_raw, count, pid);
+        let r = complete_forwarded_reply(&reg, &bounce, &mut transfers);
+        // A reply is consumed whatever it says.
+        commit_all(&mut claims);
+        return r;
     }
 
     match send_mode {
@@ -2002,9 +2011,7 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
             // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
             match unsafe { crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) } {
                 SendOutcome::Sent { .. } => {
-                    for &h in &h_raw[..count] {
-                        close_and_release(RawHandle(h), pid);
-                    }
+                    commit_all(&mut claims);
                     Ok(0)
                 }
                 SendOutcome::Full => Err(KError::WouldBlock),
@@ -2025,9 +2032,7 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
                 crate::sched::ipc_send_push_blocking(ok.object.as_ptr(), &bounce, &mut transfers, &po_ref, deadline_ns)
             } {
                 BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
-                    for &h in &h_raw[..count] {
-                        close_and_release(RawHandle(h), pid);
-                    }
+                    commit_all(&mut claims);
                     let (op, ot) = po_ref.into_raw();
                     match global::get().allocate(pid, op, ot, pending_op_rights()) {
                         Ok(h) => Ok(h.bits() as isize),
@@ -2094,32 +2099,25 @@ fn answer_forget(reg: &ObjectRef, file_id: u64, pid: u32) -> SysResult {
 
 /// Complete a forwarded **reply** inline in the server's `sys_channel_send`: a
 /// `Namespace::Resolve` or `File::ReadRange` (page-cache fill) reply is routed by its op; one
-/// that is neither is consumed (transfers dropped, sender's handles closed). `transfers[i]` ↔
-/// the sender handle `h_raw[i]`. Runs in syscall context (no `SCHED` held), so the
-/// cross-context `allocate` and the drops are outside the lock.
+/// that is neither is consumed (transfers dropped). The caller then closes the sender's handles,
+/// whatever the reply. Runs in syscall context (no `SCHED` held), so the cross-context
+/// `allocate` and the drops are outside the lock.
 fn complete_forwarded_reply(
     reg: &ObjectRef,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    h_raw: &[u64; IPC_HANDLE_MAX],
-    count: usize,
-    pid: u32,
 ) -> SysResult {
     let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
     match crate::rsproto::reply_op(&bounce.payload[..payload_len]) {
-        Some(crate::rsproto::RESOLVE_OP) => {
-            complete_resolve_reply(reg, bounce, transfers, h_raw, count, pid, payload_len)
-        }
-        Some(crate::rsproto::READ_RANGE_OP) => {
-            complete_read_range_reply(reg, bounce, transfers, h_raw, count, pid, payload_len)
-        }
-        _ => {
-            for &h in &h_raw[..count] {
-                close_and_release(RawHandle(h), pid);
-            }
-            Ok(0)
-        }
+        Some(crate::rsproto::RESOLVE_OP) => complete_resolve_reply(reg, bounce, transfers, payload_len),
+        Some(crate::rsproto::READ_RANGE_OP) => complete_read_range_reply(reg, bounce, transfers, payload_len),
+        _ => Ok(0),
     }
+}
+
+/// Close the handles a committed move took.
+fn commit_all(claims: &mut [Option<Claim<'_>>]) {
+    claims.iter_mut().filter_map(Option::take).for_each(Claim::commit);
 }
 
 /// Complete a forwarded `Namespace::Resolve` reply: correlate it to the registration's pending
@@ -2132,9 +2130,6 @@ fn complete_resolve_reply(
     reg: &ObjectRef,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    h_raw: &[u64; IPC_HANDLE_MAX],
-    count: usize,
-    pid: u32,
     payload_len: usize,
 ) -> SysResult {
     use crate::rsproto::{
@@ -2149,9 +2144,6 @@ fn complete_resolve_reply(
         None => None,
     };
     let Some(pl) = pl else {
-        for &h in &h_raw[..count] {
-            close_and_release(RawHandle(h), pid);
-        }
         return Ok(0);
     };
     let reply = reply.expect("pending taken ⇒ reply parsed");
@@ -2212,9 +2204,6 @@ fn complete_resolve_reply(
         unsafe { crate::sched::complete_pending_op(pl.po.as_ptr(), status, result) };
     }
     drop(pl);
-    for &h in &h_raw[..count] {
-        close_and_release(RawHandle(h), pid);
-    }
     Ok(0)
 }
 
@@ -2663,9 +2652,6 @@ fn complete_read_range_reply(
     reg: &ObjectRef,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    h_raw: &[u64; IPC_HANDLE_MAX],
-    count: usize,
-    pid: u32,
     payload_len: usize,
 ) -> SysResult {
     use crate::rsproto::{RangeReplyKind, parse_read_range_reply};
@@ -2677,9 +2663,6 @@ fn complete_read_range_reply(
         None => None,
     };
     let Some(pf) = pf else {
-        for &h in &h_raw[..count] {
-            close_and_release(RawHandle(h), pid);
-        }
         return Ok(0);
     };
     let reply = reply.expect("pending taken ⇒ reply parsed");
@@ -2709,9 +2692,6 @@ fn complete_read_range_reply(
     // SAFETY: `pf` owns the fill's `PendingOperation` reference.
     unsafe { crate::sched::complete_pending_op(pf.po.as_ptr(), status, 0) };
     drop(pf);
-    for &h in &h_raw[..count] {
-        close_and_release(RawHandle(h), pid);
-    }
     Ok(0)
 }
 

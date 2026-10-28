@@ -34,8 +34,9 @@ pub(crate) struct HandleEntry {
     pub rights: AtomicU64,
     /// [`KObjectType`] discriminant.
     pub object_type: AtomicU32,
-    /// Explicit pad.
-    pub _pad1: u32,
+    /// Nonzero while a [`Claim`](super::table::Claim) moves the handle; read and written only
+    /// under the rank-3 lock, and cleared by the next allocation of the slot.
+    pub in_transit: AtomicU32,
     /// Type-erased object pointer: null while the slot is free or in the
     /// deferred-reclaim queue. Read in step 6 as one `Acquire` load.
     pub object: AtomicPtr<()>,
@@ -66,7 +67,7 @@ impl HandleEntry {
             owner_pid: AtomicU32::new(0),
             rights: AtomicU64::new(0),
             object_type: AtomicU32::new(KObjectType::Invalid as u32),
-            _pad1: 0,
+            in_transit: AtomicU32::new(0),
             object: AtomicPtr::new(core::ptr::null_mut()),
             next_owned: AtomicU64::new(RawHandle::NULL.bits()),
             free_next: AtomicU32::new(FREE_NEXT_TAIL),

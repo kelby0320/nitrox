@@ -691,7 +691,7 @@ fn a_forwarded_reply_for_a_client_that_exited_pins_nothing() {
         adopt(KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut (), KObjectType::MemoryObject);
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     transfers[0] = Some(TransferRef { obj: mem, rights: Rights::MAP_READ | Rights::TRANSFER });
-    assert_eq!(complete_resolve_reply(&reg, &reply, &mut transfers, &[0; IPC_HANDLE_MAX], 0, 4445, 36), Ok(0));
+    assert_eq!(complete_resolve_reply(&reg, &reply, &mut transfers, 36), Ok(0));
     // SAFETY: `po` pins it; completed, it is stable, and no other thread reaches it.
     assert_eq!(unsafe { PendingOperation::status(po.as_ptr()) }, KError::PeerClosed as i32);
     assert_eq!(test_probe::memory_object_destroys(), 1, "the object pinned by a handle nothing will close");
