@@ -111,6 +111,10 @@ fn kernel_main() {
         return;
     }
 
+    // The BSP's dense index 0, before the per-CPU control tables are found by it: firmware need not
+    // leave its reset default. On the BSP, with no AP online, it cannot land on another's index.
+    arch::Smp::init_this_cpu(0);
+
     // Install the CPU control tables (x86_64: GDT + TSS, then IDT; their order lives in the arch
     // layer). First, because it prints nothing and needs nothing, and with the IDT live a bad
     // framebuffer descriptor below gives a register dump rather than a silent triple fault.
@@ -258,11 +262,7 @@ fn kernel_main() {
     // Left Shift release, so arming first delivers a phantom Shift each boot.
     nitrox_kernel::drivers::ps2::init();
 
-    // Establish the BSP's dense index 0 before the scheduler uses `current_cpu()` and before any AP
-    // is online, while the boot thread is pinned to the BSP. Later it could migrate onto an AP, and
-    // this `wrmsr(IA32_TSC_AUX, 0)` would overwrite that CPU's index, aliasing it onto the BSP's
-    // per-CPU scheduler slots. Each AP sets its own in `arch::adopt_dense_index`.
-    arch::Smp::init_this_cpu(0);
+    // The BSP's dense index was set first thing; each AP sets its own in `arch::adopt_dense_index`.
     kprintln!(
         "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
         arch::Smp::current_cpu(),

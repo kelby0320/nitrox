@@ -93,6 +93,8 @@ impl ArchSmp for X86Smp {
     }
 
     fn init_this_cpu(index: u32) {
+        // In a release build too: every per-CPU array is indexed with it, unchecked.
+        assert!((index as usize) < MAX_CPUS, "dense CPU index {index} past MAX_CPUS");
         // SAFETY: IA32_TSC_AUX is architectural on every x86-64 CPU; writing the
         // logical index there only sets the value RDTSCP/RDPID return, leaving the
         // timestamp counter untouched. Ring-0 wrmsr.
@@ -135,6 +137,14 @@ pub fn ap_cpu_init() {
 
 #[cfg(test)]
 mod tests {
+    /// Refused before `IA32_TSC_AUX`, from where every per-CPU array would be indexed with it.
+    #[test]
+    #[should_panic(expected = "past MAX_CPUS")]
+    fn an_index_past_max_cpus_is_refused() {
+        use crate::arch::smp::ArchSmp;
+        X86Smp::init_this_cpu(MAX_CPUS as u32);
+    }
+
     use super::*;
 
     #[test]

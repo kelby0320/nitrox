@@ -52,9 +52,8 @@ fn arch_files() -> Vec<PathBuf> {
     files
 }
 
-/// **An instruction that masks, unmasks or waits for interrupts is a compiler barrier**: with
-/// `nomem` the compiler may move a memory access across it, out of an interrupt-masked section,
-/// or keep a value read before a `hlt` that an interrupt handler changed.
+/// An instruction that masks, unmasks or waits for interrupts must be a compiler barrier, or a
+/// memory access can leave a masked section, or outlive a `hlt` whose interrupt changed it.
 #[test]
 fn no_cli_sti_or_hlt_is_marked_nomem() {
     let mut found = 0;

@@ -512,10 +512,9 @@ impl AddressSpace {
         }
     }
 
-    /// Remove the VMA covering `addr` and uninstall its PTEs. What they held, the anonymous frames
-    /// collected in `frames` and the VMA, which keeps its backing object, comes back as an
-    /// [`Unmapped`], released only after a shootdown: another CPU running this space may still
-    /// translate to it. The production unmap (`sys_memory_unmap`).
+    /// Remove the VMA covering `addr` and uninstall its PTEs. The anonymous frames, collected in
+    /// `frames`, and the VMA, keeping its backing object, come back as an [`Unmapped`], released
+    /// only after a shootdown. The production unmap (`sys_memory_unmap`).
     ///
     /// `frames`' spare capacity must hold the frames, as nothing grows under the lock: if it is
     /// too small, `frames` comes back with the pages needed, tree and PTEs untouched, to reserve
@@ -554,9 +553,8 @@ impl AddressSpace {
 }
 
 /// What an unmap took out of a live address space's page tables: anonymous frames, and a VMA
-/// whose drop can free its object's. Another CPU running the space may still translate to them,
-/// so dropping this shoots them down on every CPU before releasing anything. Drop it outside
-/// every lock, as a shootdown requires.
+/// whose drop can free its object's. Dropping it shoots them down on every CPU, then releases
+/// them, so it must be dropped outside every lock, as a shootdown requires.
 pub struct Unmapped {
     frames: KVec<PhysAddr>,
     vma: Option<KBox<Vma>>,

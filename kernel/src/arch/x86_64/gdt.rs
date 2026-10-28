@@ -136,7 +136,7 @@ fn tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
 pub fn init() {
     let cpu = this_cpu();
     // Raw element pointers: no bounds-check panic in the boot path.
-    // SAFETY: `cpu < MAX_CPUS` (a dense id from `this_cpu`); `add(cpu)` stays in
+    // SAFETY: `cpu < MAX_CPUS`, as both writers of the index bound it; `add(cpu)` stays in
     // bounds. No references into the `static mut`s are formed.
     let (df_ptr, nmi_ptr, tss_ptr, gdt_ptr) = unsafe {
         (
