@@ -5211,7 +5211,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Defects**
 
-- [ ] **sh-d1** `userspace/tty-server/src/main.rs:449` — OP_TTY_ATTACH_BACKEND puts whatever
+- [x] **sh-d1** `userspace/tty-server/src/main.rs:449` — OP_TTY_ATTACH_BACKEND puts whatever
   handle a client sent into the serve loop's wait set without checking its object type or rights.
   Any process holding a terminal (a session's /dev/tty, or the sibling nxsh hands each stage)
   sends AttachBackend carrying a MemoryObject (TRANSFER but no WAIT) or a channel end restricted
@@ -5224,7 +5224,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `handle != 0`; lib.rs:321-329 stores any u64; the kernel lines above); not booted. A boot gate
   that sends AttachBackend with a memory object and then writes to a terminal would show the
   spin. abi, ownership, soundness, opportunities. High. **Fix.**
-- [ ] **sh-d2** `userspace/profile-server/src/main.rs:294` — profile-server forwards the client's
+  Fixed in `6961407d`: a backend is a channel end with `SEND`, `RECV` and `WAIT`, anything else
+  refused and closed; fails without it: `tty_refuses_a_backend_it_cannot_wait_on_test` (boot-probe),
+  and `a_backend_is_a_channel_it_can_send_receive_and_wait_on` with any one right or the type check
+  left out.
+- [x] **sh-d2** `userspace/profile-server/src/main.rs:294` — profile-server forwards the client's
   requested rights, MAP_WRITE included, into its own root-namespace lookup of the store file and
   re-exports the handle, so a store binary may be reachable writable by any process with /bin or
   /applications bound. A session program calls sys_ns_lookup(session_ns, "/bin/list",
@@ -5239,6 +5243,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   MAP_WRITE, map it writable, write one byte and read it from another process; the control is
   masking requested_rights to READ|MAP_READ|MAP_EXEC|INSPECT before line 294. opportunities.
   High. **Fix.**
+  Fixed in `2af3c0df`, demonstrated first: a lookup of `/bin/list` asking for `MAP_WRITE` was
+  granted it. The server drops `WRITE`, `MAP_WRITE`, `APPEND` and `TRUNCATE` from the request; an
+  allow-list broke a program's `copy`. Fails without it: `store_is_read_only_test`.
 - [ ] **sh-d3** `userspace/nxsh/src/main.rs:297` — Host::run's early returns close nothing and
   stop nothing. Setup send refused after the spawn (292-297, closes only `terminal`), a capture
   over MAX_CAPTURE (417-418, skipping rx close 424, reap 427, err_rx close 432), a pipe `?` at
@@ -5255,7 +5262,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   encode returned Err(SetupTooLarge); `list <5000 x>` reached Host::run unchecked; paths read at
   the lines above; stranded processes and tty-server's terminal count need a boot to see.
   abi, ownership, soundness, opportunities. Medium. **Fix**, as proto-d1.
-- [ ] **sh-d4** `userspace/tty-server/src/main.rs:624` — The console read's PendingOperation is
+- [x] **sh-d4** `userspace/tty-server/src/main.rs:624` — The console read's PendingOperation is
   never closed: each completed read sets `read_po = 0` and submits another, leaking one PO handle
   and kernel object per console read in an essential server that is never restarted. Every
   keystroke burst on the serial console, and every failed read, leaks one; at handle exhaustion
@@ -5265,7 +5272,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   eshell's po_wait (main.rs:54) and tty-server's own po_wait (172-173) close theirs. Not booted;
   counting handles per keystroke would show it. abi, ownership, soundness, opportunities. Medium.
   **Fix.**
-- [ ] **sh-d5** `userspace/tty-server/src/main.rs:450` — attach_backend returns the previous
+  Fixed in `6961407d`: each consumed console read's PO is closed. A probe stat-ing it found 16 held
+  after a test-interactive run before, none after.
+- [x] **sh-d5** `userspace/tty-server/src/main.rs:450` — attach_backend returns the previous
   backend's channel for the caller to close, and the serve loop drops it with `Some(_)`. A second
   AttachBackend on one terminal retires the first backend (lib.rs:327, 332-342) and tty-server
   keeps its handle open for ever outside the wait set; the first emulator never sees PeerClosed,
@@ -5274,7 +5283,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   backend_it_left` passes, asserting `Some(0xAAA)` comes back; main.rs:449-453 binds it to `_`
   and closes only in the None arm; attach_backend's own doc says dropping it would leak.
   abi, ownership, soundness, opportunities. Medium. **Fix.**
-- [ ] **sh-d6** `userspace/nxsh/src/main.rs:469` — `save` (Host::write_file) creates at
+  Fixed in `6961407d`: the backend a re-attach retires is closed; fails without it:
+  `tty_reattach_closes_the_old_backend_test`.
+- [x] **sh-d6** `userspace/nxsh/src/main.rs:469` — `save` (Host::write_file) creates at
   bytes.len() through SYS_FILE_CREATE, which only grows, so saving over a longer file keeps the
   old tail, and a 0-byte save creates the file and then fails at the size-0 map with 'cannot
   map'. `save` 100 bytes then 10 bytes to /home/a.txt leaves 100 bytes; `[] | save /home/e.txt`
@@ -5284,7 +5295,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   nxsh main.rs:472-498 never truncates, the kernel refuses size 0 at table.rs:897, and
   libfs::write_file (lib.rs:210-251) shrinks first and handles size 0. Not booted. abi,
   soundness, opportunities. Low. **Fix.**
-- [ ] **sh-d7** `userspace/profile-server/src/main.rs:130` — read_manifest maps and parses
+  Fixed in `ee47c111`, as sh-o6: `save` goes through `libfs::write_file`; test-interactive's step 5b
+  saves one row over two and an empty list, and read "resaved=2" and "cannot map" against the old
+  nxsh.
+- [x] **sh-d7** `userspace/profile-server/src/main.rs:130` — read_manifest maps and parses
   exactly one page of the manifest, with no stat of its size, and never unmaps it, so a manifest
   over 4096 bytes is cut silently and the packages past the cut vanish from /bin while the server
   logs 'manifest loaded'. A cut `path = "..."` loses its closing quote and is dropped; a cut
@@ -5294,20 +5308,28 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   4096 bytes of a 40-package, 4,301-byte manifest as read_manifest does and got 38 packages with
   no error; main.rs:130 maps PAGE, 137 slices PAGE, 141 closes the handle and nothing unmaps.
   abi, ownership, soundness, opportunities. Low. **Fix.**
-- [ ] **sh-d8** `userspace/nxsh/src/main.rs:452` — Host::read_file maps and copies the file's
+  Fixed in `2af3c0df`: the manifest is read at its stat size and unmapped. The test image's manifest
+  runs past a page with the test package after it; with the read cut back to 4096 bytes, test-qemu
+  loses the test programs and hangs.
+- [x] **sh-d8** `userspace/nxsh/src/main.rs:452` — Host::read_file maps and copies the file's
   whole stat size into one Vec with no cap, while stage output is capped at MAX_CAPTURE and
   libfs::read_file at MAX_COPY (8 MiB). `open` on a multi-GiB file (a sparse file grown towards
   u32::MAX, or a disk image on a stick) asks for that allocation and may take the login shell
   down through the panic handler. Unverified: whether the map succeeds at that size and whether
   the failed allocation panics or aborts; a boot running `open` on a file larger than free RAM
   settles it. abi, soundness. Low. **Fix.**
-- [ ] **sh-d9** `userspace/eshell/src/main.rs:286` — cmd_lsblk unmaps with size 0, as does
+  Fixed in `ee47c111`, as sh-o6: `open` goes through `libfs::read_file`, refused past `MAX_COPY`.
+  Still unverified as the survey left it: no gate opens a file over 8 MiB.
+- [x] **sh-d9** `userspace/eshell/src/main.rs:286` — cmd_lsblk unmaps with size 0, as does
   coreutils/src/bin/disk.rs:472 (device_info). This is right today only because sys_memory_unmap
   ignores its size and drops the whole VMA (table.rs:949 takes `_size` unused). syscall-abi.md:529
   names partial or splitting unmap as a later refinement; once it honours `size`, eshell leaks one
   mapping per `lsblk` for the life of the shell and disk.rs one per device_info call.
   Demonstrated: path pointed at (eshell maps info.size at 238, disk.rs maps 4096 at 463). Latent,
   made to bite by implementing the refinement. ownership. Low. **Fix.**
+  Fixed in `ee47c111`: both unmap the size they mapped. A kernel probe logging every unmap short of
+  its mapping found none from `disk` in check-storage, whose format steps call `device_info`; no
+  gate runs eshell. The probe found the rest of the class only in sup-d10's and sec-d9's sites.
 - [ ] **sh-d10** `userspace/nxsh/src/main.rs:294` — The SAFETY argument 'the send failed, so the
   terminal never moved; it is ours to close' is false when send_setup_full fails after its
   Block-mode send committed (the wait fails, or the PO completes PeerClosed because the stage
@@ -5324,14 +5346,16 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   copies with ptr::copy_nonoverlapping and form no reference. Unverified: needs two processes
   mapping one file with a write during the copy; no host test reaches these syscall paths and
   Miri cannot run them. soundness. Low. **Plan**, in P7.
-- [ ] **sh-d12** `userspace/nxsh/src/main.rs:84` — `fn signalled(n: i64, handle: u64)` is safe but
+- [x] **sh-d12** `userspace/nxsh/src/main.rs:84` — `fn signalled(n: i64, handle: u64)` is safe but
   walks `n` 24-byte records of the 96-byte WAIT_RESULTS through raw pointer arithmetic with no
   bound, so any n > 4 reads past the static. Latent: every caller passes sys_wait's return for at
   most 4 handles; waiting on a fifth handle without growing WAIT_RESULTS makes it bite.
   Demonstrated: Miri on a verbatim copy (removed), `signalled(5, 0xdeadbeef)`, reported 'attempting
   to access 8 bytes, but got alloc+0x60 which is at or beyond the end of the allocation of size 96
   bytes'. opportunities. Low. **Fix.**
-- [ ] **sh-d13** `userspace/profile-server/src/main.rs:478` — reply_success ignores a failed
+  Fixed in `ee47c111`: `signalled` clamps its count to the records `WAIT_RESULTS` holds; Miri on a
+  verbatim model fails at `n = 5` before and passes after.
+- [x] **sh-d13** `userspace/profile-server/src/main.rs:478` — reply_success ignores a failed
   send, so the resolved store handle it meant to move stays in profile-server's table and the
   forwarded resolve is never answered; tty-server open_tty (318-327) answers no error on a failed
   send either. This breaks the rule libfsserver's send_forwarded keeps (every forwarded request
@@ -5341,6 +5365,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   endpoint completes uncorrelated replies with Ok(0) (kernel table.rs:2146-2151), so no ordinary
   failure was found; a send with a handle restricted to drop TRANSFER would settle it.
   opportunities. Low. **Fix.**
+  Fixed in `6961407d` and `2af3c0df`, demonstrated first: with `TRANSFER` dropped from the reply's
+  handle by a probe, `/bin/list`, `/bin`, `/dev/tty` and an `OpenSibling` went unanswered past 3 s.
+  A refused reply now closes what it carried and answers the send's error, `NoAccess` there; the
+  sweep added `OpenSibling` and the directory session.
 
 **Opportunities**
 
@@ -5430,7 +5458,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   devices), size-0 unmaps (sh-d9) and a manifest cut at a page (sh-d7). Depends on: sh-o1, for
   `&Handle`; eshell keeps its 2 sites. ownership, soundness, opportunities. Value medium, effort
   medium. **Plan**, as rt-o3, in P7.
-- [ ] **sh-o6** remove: nxsh's own file I/O and lookup helpers duplicate libfs, already a
+- [x] **sh-o6** remove: nxsh's own file I/O and lookup helpers duplicate libfs, already a
   dependency — 3 helpers, 15 unsafe blocks (`awk 'NR>=437 && NR<=508 && /unsafe/'` gives 11,
   `NR>=747 && NR<=783` gives 4; `grep -n "SYS_MEMORY_MAP,\|SYS_FILE_CREATE,\|syscall4(SYS_NS_LOOKUP"`
   locates them), at `userspace/nxsh/src/main.rs:437`, `userspace/nxsh/src/main.rs:469`,
@@ -5440,6 +5468,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   report a directory as an error rather than as empty, which nxsh relies on. Home: libfs. Closes:
   sh-d6, sh-d8 and the reference-over-mapping UB at main.rs:459 and :498. Depends on: that
   extension. abi, soundness. Value medium, effort small. **Fix.**
+  Done in `ee47c111`: nxsh's file helpers call `libfs::read_file`, `write_file` and `lookup_wait`.
+  The extension: `file_size` refuses a directory, as its doc said, and `read_file` looks a file up
+  once.
 - [ ] **sh-o7** narrow: a handle received over IPC is kept as a given object type with only `!= 0`
   checked — 3 sites (every `sent.take(` and kept `terminal`/`streams` handle in the paths), such
   as `userspace/tty-server/src/main.rs:443`, `userspace/nxsh/src/main.rs:1089`,
@@ -5536,7 +5567,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   convention only. Demonstrated: a `#[forbid(unsafe_code)]` fn that passed a local `[u8; 256]` as
   the stack and then wrote `stack[0]` built with `cargo check -Z build-std=core,alloc,compiler_builtins
   --bin test-stage` and no error; the probe was removed. abi, soundness. Medium. **Fix**, as rt-d3.
-- [ ] **th-d2** `userspace/test-harness/src/bootprobe/storage.rs:273` — `past_two_tib_test` makes
+- [x] **th-d2** `userspace/test-harness/src/bootprobe/storage.rs:273` — `past_two_tib_test` makes
   one `&mut [u8]` over the DMA page and keeps it live across `io(IO_OPCODE_WRITE)` and
   `io(IO_OPCODE_READ)`, then compares through it at :284. The device's write invalidates the
   reference, so the read is UB, and the SAFETY comment argues bounds only. Today LLVM cannot
@@ -5549,7 +5580,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   The control, with the slice made after the I/O as `RootDevice::read_at` does, passes. The models
   are analogs, since Miri cannot run the syscall. No other site keeps a reference across a device
   write. abi, ownership, soundness, opportunities. Low. **Fix.**
-- [ ] **th-d3** `userspace/test-harness/src/bootprobe/main.rs:363` — boot-probe's `receive()`
+  Fixed in `009c098c`: no slice over the page outlives the device's I/O; Miri on a model of the
+  sequence fails before, under Stacked and Tree Borrows, and passes after.
+- [x] **th-d3** `userspace/test-harness/src/bootprobe/main.rs:363` — boot-probe's `receive()`
   calls `take_all()` on `libkern::Received`, which disarms its close-on-drop, and moves the
   handles into its own `Received` with `handles: Vec<u64>` and no `Drop`. 9 of the 20 `receive()`
   callers never close them: views_receive (main.rs:331, behind every `views_call`),
@@ -5561,7 +5594,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `m.handles` by hand (12 `for_each` loops). The three lenses counted the unclosed callers as
   8 of 15 or 9 of 20; the 9-of-20 count is used here. abi (as opportunity), ownership, soundness,
   opportunities. Low. **Fix.**
-- [ ] **th-d4** `userspace/test-harness/src/harness.rs:2354` — Every coreutil spawn looks up the
+  Fixed in `009c098c`, as th-o8; fails without it:
+  `receive_closes_what_its_caller_does_not_take_test`.
+- [x] **th-d4** `userspace/test-harness/src/harness.rs:2354` — Every coreutil spawn looks up the
   image handle and never closes it, though `sys_process_spawn` only looks the image up
   (table.rs:352-353; process-spawn-args.md:43: "the spawner closes it after spawn").
   `run_coreutil_in` (:2354), `run_coreutil_capture_in` (:1340), `dead_stage_closes_its_pipe_demo`
@@ -5571,7 +5606,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `fp_hardfloat_demo` (:3435) and boot-probe's `spawn_stage` close theirs. Demonstrated by path:
   `grep -n "let (st, img)\|HANDLE_CLOSE, img" harness.rs` shows 6 lookups and 2 closes. abi,
   ownership, opportunities. Low. **Fix.**
-- [ ] **th-d5** `userspace/test-harness/src/bootprobe/views.rs:226` — `view_broker_test` opens
+  Fixed in `009c098c`: each spawn closes its image. `sys_ns_held` on `/system` across a test-qemu
+  run's coreutil spawns rose from 4 to 14 before, and stays at 1 after.
+- [x] **th-d5** `userspace/test-harness/src/bootprobe/views.rs:226` — `view_broker_test` opens
   client channels until the broker refuses one (:218-236). Five of its six failure returns (226,
   236, 249, 253, 258) do not close them; only the loop at :260 does. A misbehaving broker then
   leaves boot-probe holding a whole wait set of clients. The broker counts each as two slots in
@@ -5579,7 +5616,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   WouldBlock. `view_grants_end_test`, `storage_grant_test`, `policy_test`, `grace_test` and
   `accounts_test` would then fail for the wrong reason and the broker would stay wedged for the
   boot. Demonstrated by path: the returns skip :260. Failure paths only. ownership. Low. **Fix.**
-- [ ] **th-d6** `userspace/test-harness/src/bootprobe/files.rs:694` — On success, `overwrite_test`
+  Fixed in `009c098c`: the clients close as they drop. A probe failing the test with its clients
+  open left the views tests after it failing "no supervisor channel" before, none after.
+- [x] **th-d6** `userspace/test-harness/src/bootprobe/files.rs:694` — On success, `overwrite_test`
   (:694), `grow_test` (:777) and `create_test` (:893) never close the file handle or unmap their
   writable mapping, and `read_large_file` (:934) closes the handle but never unmaps its 32 KiB
   mapping. `/system/rwtest` (mapped twice) and `/system/created` stay held and mapped until
@@ -5587,6 +5626,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   (`sys_ns_held` on `/system`, an unmount) would see them held. Demonstrated by path: no
   `SYS_MEMORY_UNMAP` anywhere in files.rs:684-969, and the closes are only on the failure paths
   (698, 781, 897). ownership, soundness, opportunities. Low. **Fix.**
+  Fixed in `009c098c`: each test unmaps and closes its file. Held files across the files tests rose
+  from 3 to 6 before, 1 to 1 after.
 - [ ] **th-d7** `userspace/test-harness/src/harness.rs:3727` — `forward_demo` releases nothing it
   made on success: the namespace with the userspace-server binding (3727/3736), `send_end`
   (3724), the resolved MemoryObject (3846) and both mappings (3782, 3853). The same success-path
@@ -5598,7 +5639,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   closing. Demonstrated by path: `awk 'NR>=3713 && NR<=3865 && /close\(|SYS_HANDLE_CLOSE|SYS_MEMORY_UNMAP/'
   harness.rs` prints nothing. Bounded: the harness exits at the end of the chain. ownership,
   soundness, opportunities. Low. **Plan**, in P7.
-- [ ] **th-d8** `userspace/test-harness/src/harness.rs:3156` — `rename_wait` discards
+- [x] **th-d8** `userspace/test-harness/src/harness.rs:3156` — `rename_wait` discards
   `sys_wait`'s return and reads the status from the shared `WAIT_RESULTS[8..12]` anyway. Its own
   SAFETY comment says those bytes hold the result "only when it returned 1". A failed wait (for
   example OutOfMemory from a registration over its reserve, table.rs:1840) returns the previous
@@ -5608,6 +5649,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   A host test cannot reach it, since `syscallN` runs Linux syscalls on the host. A boot with
   `SYS_WAIT` forced to fail once after a successful lookup would settle it. abi, soundness,
   opportunities. Low. **Fix.**
+  Fixed in `009c098c`: `rename_wait` goes through `po_wait`, which checks the wait. A probe failing
+  the wait read status 0 before, -1 after.
 - [ ] **th-d9** `userspace/test-harness/src/stage.rs:621` — The crate's user threads run on stacks
   with no guard gap. Each stack is mapped at exactly its size with hint 0, so first-fit places it
   directly against the previous mapping, and `EXIT_SPAWNING` carves 48 stacks from one mapping.
@@ -5635,7 +5678,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   SAFETY comments cover only `root_ns` being live. Unverified: the contract violation is confirmed
   by reading; a boot of the bench image with a client committing during the E2 loop would show
   the torn frames. soundness. Low. **Plan**, in P7.
-- [ ] **th-d12** `userspace/test-harness/src/bootprobe/files.rs:85` — `RootDevice::read_at`
+- [x] **th-d12** `userspace/test-harness/src/bootprobe/files.rs:85` — `RootDevice::read_at`
   hard-codes `const SECTOR: u64 = 512`, but the kernel refuses any block request that is not
   whole logical blocks (`whole_blocks`, kernel/src/io/block.rs:97). On a device reporting
   4096-byte blocks (xhci/storage.rs:1070 takes `block_len` from READ CAPACITY) every
@@ -5644,7 +5687,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   (`RAMDISK_BLOCK` = 512) and AHCI are 512, so no gate reaches it. Unverified: a boot of
   `image --live --selftest` on a QEMU usb-storage device with `logical_block_size=4096` would
   settle it. abi. Low. **Fix.**
-- [ ] **th-d13** `userspace/test-harness/src/bootprobe/storage.rs:71` — Latent: 17
+  Fixed in `009c098c`: `RootDevice` reads whole pages from a page boundary, to the device's end,
+  whole blocks of any size up to a page; no `info` resolves under a `by-partlabel` name to ask. A
+  probe making the kernel ask 4 KiB blocks of its requests failed every root-device check before,
+  none after.
+- [x] **th-d13** `userspace/test-harness/src/bootprobe/storage.rs:71` — Latent: 17
   `SYS_MEMORY_UNMAP` calls pass size 0 and work only because the kernel ignores `size`
   (`sys_memory_unmap(addr, _size)` at table.rs:949, TODO(mm); syscall-abi.md:529). If the kernel
   made the fix `deferred-decisions.md:2343` proposes and refused a size that does not cover the
@@ -5655,6 +5702,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   exits.rs:91, gates.rs:208, harness.rs:3473/3505/3611. Counted by `grep -rnE "SYS_MEMORY_UNMAP,
   [a-z_.]+( as u64)?, 0\)" userspace/test-harness/src | wc -l` = 17. Unverified: a kernel branch
   refusing size 0 and a test-qemu run would settle it. opportunities. Low. **Fix.**
+  Fixed in `009c098c`: each unmap passes the size it mapped. A kernel probe logging unmaps short of
+  their mapping found boot-probe's and test-harness's before, none after.
 
 **Opportunities**
 
@@ -5757,7 +5806,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   In libfs (exists). Closes: three more hand-parsed `IoResult` copies with their own static wait
   buffers (th-d10). Depends on: nothing. abi, opportunities. Value medium, effort small.
   **Plan**, in P7.
-- [ ] **th-o8** encapsulate: boot-probe's `Received` strips `libkern::Received`'s guard — 20
+- [x] **th-o8** encapsulate: boot-probe's `Received` strips `libkern::Received`'s guard — 20
   `receive()` callers (`grep -rnE "(^|[^_a-z])receive\(" userspace/test-harness/src/bootprobe |
   grep -v "fn receive\|views_receive\|ChannelReceiver"`), 12 closing `m.handles` by hand and 9
   not, such as `bootprobe/main.rs:363`, `bootprobe/main.rs:331`, `bootprobe/files.rs:570`,
@@ -5768,6 +5817,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `librsproto::session::recv` if th-o9 lands first. Closes: the leak at th-d3, the class
   `libkern::Received` was written to close. Depends on: nothing. abi, ownership, opportunities.
   Value medium, effort small. **Fix.**
+  Done in `009c098c`: `Received` keeps `libkern::Received`, with `take` and `count`; the twelve
+  close loops go.
 - [ ] **th-o9** encapsulate: IPC messages framed and parsed by hand in raw `[u8; 4096]` buffers
   (payload length at [4..8], handle count at [8], rsproto at [24..]) and sent with a raw
   `SYS_CHANNEL_SEND` — 14 to 15 sites (14 sends by grep; 8 `[4..8].copy_from_slice` header writes,

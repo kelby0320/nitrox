@@ -37006,3 +37006,36 @@ decisions:
 
 init keeps its own lookup helper (sup-o8) until libos's `block_on` stops spinning on a wait that
 keeps failing (rt-d12), the condition the 2026-10-27 entry sets for a crate moving onto libos.
+
+## 2026-10-28 — Before Phase 7, Part I: a terminal takes only a backend it can wait on, the store is read-only, every resolve is answered
+
+Groups X and Y of the survey's triage, the shell and the test harness, made six decisions:
+
+- **A terminal's backend is a channel end with `SEND`, `RECV` and `WAIT`**, and anything else is
+  refused, `InvalidArgument` for another object and `NoAccess` for a missing right, and closed.
+  tty-server waits on every backend beside every terminal it serves, so one it could not wait on
+  failed every wait of its loop, and the console with it (sh-d1). The backend a re-attach leaves is
+  closed, which is how its emulator learns its terminal has gone (sh-d5).
+- **profile-server strips the rights that write a file from what a client asks**, rather than
+  narrowing the request to the rights a program needs. The kernel installs what a userspace
+  server's reply carries, and the store is on `init`'s writable mount, so any session could map a
+  system binary writable (sh-d2). An allow-list was tried first and broke `copy` of a program:
+  what a client asks for says what it wants, a directory session (`SEND | RECV | WAIT`) is refused
+  on a file, and the narrowed request found the file instead. check-storage alone caught it.
+- **Every forwarded resolve is answered.** A reply the kernel refuses closes what it carried and is
+  followed by the send's error, in profile-server's files and directory sessions and tty-server's
+  terminal opens, and on the same path tty-server's `OpenSibling`: a forwarded resolve has no
+  deadline, so its client waited for good (sh-d13).
+- **A directory is not a file to `libfs::file_size`**, as its doc said, and `read_file` looks a
+  file up once, so a table served fresh at each lookup cannot change size between the two. nxsh's
+  `open` and `save` go through it (sh-o6): a shorter save shrinks the file, an empty one saves, and
+  `open` refuses a file over `MAX_COPY`.
+- **boot-probe's root device reads whole pages from a page boundary, to the device's end**, rather
+  than asking the device's block size: `/dev/disk/by-partlabel/<label>` is bound to the device
+  node itself, so no `info` resolves under it, and a power-of-two block no larger than a page
+  divides one (th-d12).
+- **The test image's manifest runs past a page**, the test package after the padding, so a server
+  that reads the first page alone fails the gates (sh-d7).
+
+A kernel probe logging every unmap short of its mapping found, after these fixes, only device-mgr,
+storage-service and libsession's registry read, which are sup-d10 and sec-d9, in their groups.
