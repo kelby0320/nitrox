@@ -388,7 +388,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   liveness half stays `unsafe`). ownership/soundness/concurrency/opportunities. Value high, effort
   large. **Plan**, in P1.
 
-- [ ] **kobj-o4** encapsulate: host tests and Miri cannot see use-after-free of kernel objects.
+- [x] **kobj-o4** encapsulate: host tests and Miri cannot see use-after-free of kernel objects.
   The kernel slab sits over a leaked 16 MiB host `Vec`, so a freed object is still inside a live
   allocation — 11 `kmalloc`/`kfree` call sites outside the allocator (`grep -E '\bkmalloc\(|\bkfree\('`
   over non-test lines, excluding `mm/slab.rs` and `mm/heap.rs`: `KBox` 3, `KVec` 3,
@@ -400,6 +400,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   after free passing every host test and Miri; the kobj-d1 probe is silent under Miri today.
   Depends on: nothing, though Miri on the IPC suite also needs the kobj-d12 peer-pointer fix first.
   opportunities. Value high, effort small. **Fix**, first.
+  Finished in `86723eed`: under Miri, `kmalloc` and `kfree` go to the host allocator.
 
 - [ ] **kobj-o5** encapsulate: a handle move is a lookup with `TRANSFER`, a commit into a ring,
   child or reply, then an ignored-failure `close_and_release`, with nothing claiming the entry in
@@ -1523,7 +1524,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
 
 **Defects**
 
-- [ ] **drv-d1** `kernel/src/drivers/ahci.rs:590` — `on_interrupt` reads PxCI at line 661 outside
+- [x] **drv-d1** `kernel/src/drivers/ahci.rs:590` — `on_interrupt` reads PxCI at line 661 outside
   the port lock, and `take_retired` then swaps out whatever IRP is in flight without re-reading
   PxCI under the lock. An interrupt that saw slot 0 idle therefore completes a command another CPU
   issued in between. Scenario: slot 0 is idle and an interrupt arrives (an unsolicited D2H Register
@@ -1540,6 +1541,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   return made both pass, with all 15 and 16 existing AHCI tests still green. Fix: read PxCI inside
   `take_retired`, under `pending`. Lenses: concurrency, ownership, opportunities. High.
   **Fix**, first.
+  Fixed in `4795f961`: `take_retired` reads PxCI under the port lock; fails without it:
+  `a_command_issued_after_the_slot_read_idle_is_not_retired`.
 
 - [ ] **drv-d2** `kernel/src/dpc.rs:98` — the DPC queue reserves 64 entries on the claim that "the
   bound is the number of distinct Dpc objects" (dpc.rs:23-25). But every IrpBox has its own inline
@@ -1952,7 +1955,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   object address. Depends on: drv-o2 (or a runtime `object_type()` check in each wrapper). Lenses:
   soundness, concurrency, opportunities. Value medium, effort medium. **Plan**, as kobj-o7, in P1.
 
-- [ ] **drv-o9** encapsulate: AHCI slot-0 state (`inflight`, `issued_at`, `dead`, `fault`) is kept
+- [x] **drv-o9** encapsulate: AHCI slot-0 state (`inflight`, `issued_at`, `dead`, `fault`) is kept
   as atomics with comments saying "accessed under pending's lock", plus `unsafe fn issue_locked`
   whose contract is "the caller holds `pending` and slot 0 is idle" — 23 sites (`grep -c
   'inflight\.\|issued_at\.\|\.dead\.\|fault\.\(load\|store\|compare\)' kernel/src/drivers/ahci.rs`),
@@ -1964,6 +1967,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `poll_disk`) take the lock. In `kernel/src/drivers/ahci.rs`. Closes: decisions taken on device or
   driver state read outside the port lock (drv-d1), with the lock held by structure rather than by
   comment. Depends on: nothing. Lens: concurrency. Value medium, effort small. **Fix.**
+  Finished in `1a8de805`: slot 0's state is `PortState`, inside the port lock.
 
 - [ ] **drv-o10** narrow: `dpc::enqueue(&Dpc)` is a safe API whose borrow outlives the call —
   static DPCs, IRP-inline DPCs and one stack DPC all go through it — 22 sites (`grep -rn
@@ -2161,7 +2165,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Defects**
 
-- [ ] **kplat-d1** `kernel/src/arch/x86_64/idt.rs:158` — No interrupt or exception entry stub
+- [x] **kplat-d1** `kernel/src/arch/x86_64/idt.rs:158` — No interrupt or exception entry stub
   normalises RFLAGS.DF or AC (no `cld`/`clac`), so an entry from ring 3 runs Rust code with
   whatever DF/AC the user left set. A ring-3 thread runs with DF set when the timer, a device
   IRQ or an exception arrives. `timer_dispatch` and `device_irq_dispatch` reach
@@ -2175,6 +2179,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the memcpy/memset address. The unpatched image boots. Any ring-3 process can crash the
   kernel. Fix: `cld; clac` at the top of every stub (see kplat-o9). concurrency. High.
   **Fix**, first.
+  Fixed in `ebb1c277`: every interrupt and exception stub opens with `entry_prologue!`,
+  whose first instructions are `cld; clac`; fails without it: `check-irq-scope`'s third rule, on the
+  original `idt.rs` at all six stubs, and `an_interrupt_stub_opens_with_a_prologue_that_clears_df_and_ac`.
 - [ ] **kplat-d2** `kernel/src/sched.rs:756` — `thread_enter`'s ring-3 descent calls
   `set_kernel_stack`, `set_syscall_kernel_stack` and `arm_user_entry_cpu_base` (gdt.rs:249,
   syscall.rs:98, 114) with IF=1 and preemption on. Each reads the CPU index with RDTSCP, then
@@ -2544,7 +2551,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   0", diluting review of the ones that matter. Depends on: `of_mapping` is cleaner after the
   typed-root part of kplat-o1; the rest on nothing. opportunities. Value medium, effort small.
   **Plan**, in P6.
-- [ ] **kplat-o9** encapsulate: the interrupt/exception entry prologue (error-code slot, vector,
+- [x] **kplat-o9** encapsulate: the interrupt/exception entry prologue (error-code slot, vector,
   15 GPR pushes, `mov rdi, rsp`, call, unwind, iretq) written out six times — 6 sites (`grep -c
   'push rax\\npush rbx' kernel/src/arch/x86_64/idt.rs` = 6: `exception_stub!`, vec14,
   `timer_stub`, `tlb_shootdown_stub`, `reschedule_ipi_stub`, `device_irq_stub!`), at
@@ -2555,6 +2562,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `device_irq_stub`). Home: kernel/src/arch/x86_64/idt.rs, beside `irq_dispatcher!`. Closes: an
   entry path missing a flag normalisation (kplat-d1 lives in all six copies). Depends on:
   nothing. concurrency. Value medium, effort small. **Fix.**
+  Finished in `ebb1c277`: `entry_prologue!` and `entry_epilogue!`, the six stubs' frames.
 - [ ] **kplat-o10** narrow: user copies bounded only by `T: Copy`, byte reinterpretations of
   `#[repr(C)]` ABI types held sound by convention, and raw copy primitives taking the kernel
   side as `(ptr, len)` — 13 sites for the type bound (`grep -n 'copy_from_user(\|
