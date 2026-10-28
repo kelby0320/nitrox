@@ -456,6 +456,17 @@ impl UserspaceServerReg {
         inner.pending[slot].take()
     }
 
+    /// Take the next pending fill, as [`take_pending_next`](Self::take_pending_next) does a lookup.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn take_pending_fill_next(reg: *mut ()) -> Option<PendingFill> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
+        let inner = unsafe { Self::inner(reg) };
+        let slot = inner.pending_fill.iter().position(Option::is_some)?;
+        inner.pending_fill[slot].take()
+    }
+
     /// Take the next occupied pending lookup, for **draining** the table when the server dies:
     /// the caller loops until `None`, failing each, and drops `po` **outside** `SCHED`.
     ///

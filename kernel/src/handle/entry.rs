@@ -138,9 +138,8 @@ impl Drop for WriteGuard<'_> {
 mod tests {
     use super::*;
 
-    /// **A snapshot is never torn**: the writer's odd `seq` is ordered before its field stores, or a
-    /// weakly ordered reader sees new fields between two reads of the old even one. x86 keeps
-    /// stores in order, so only Miri's weak-memory emulation can see it.
+    /// **A snapshot is never torn**, under Miri's weak-memory emulation: x86 keeps stores in order,
+    /// and would pass a writer that let the fields pass its odd `seq`.
     #[test]
     fn a_snapshot_is_never_torn() {
         const WRITES: u32 = if cfg!(miri) { 300 } else { 100_000 };

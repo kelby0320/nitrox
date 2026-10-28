@@ -135,8 +135,7 @@ pub fn close_all_owned_by(pid: u32) -> usize {
 mod tests {
     use super::*;
 
-    /// Refused in every build: a release build's `get` once formed a reference to the slot's
-    /// uninitialised memory.
+    /// Refused in every build, not only where `debug_assert` runs.
     #[test]
     #[should_panic(expected = "before init")]
     fn the_table_is_refused_before_init() {
