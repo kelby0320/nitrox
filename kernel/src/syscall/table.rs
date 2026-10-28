@@ -3,6 +3,7 @@
 //! (`docs/spec/syscall-abi.md`) count up from `0`; the **debug** syscalls sit in a high,
 //! non-stable range.
 
+use super::block_map::block_map;
 use super::error::{KError, SysResult, encode, from_elf_load, from_user_access};
 use crate::arch::Paging;
 use crate::arch::Timer;
@@ -2575,40 +2576,6 @@ fn continued_dest<'o>(
         return Err(KError::Unsupported);
     }
     continued_path(dest, consumed, base, out)
-}
-
-/// **A block-file reply's map**: its header and runs, or `KernelError` for one the page cache
-/// cannot use: a body too short for its runs, and
-///
-/// - **a block size that is not a power of two from a sector to a page** (the fill divides by
-///   it; `0` would divide by zero);
-/// - **a run whose ends do not fit a `u64`**: its file blocks' end, its device blocks' end, and
-///   that end in bytes. The fill and write-back add within a run and multiply by the block
-///   size, and a kernel built with overflow checks panics on either.
-///
-/// `OutOfMemory` if the runs cannot be held.
-fn block_map(
-    body: &[u8],
-) -> Result<(crate::rsproto::FileBlocksHeader, crate::libkern::KVec<crate::object::BlockRun>), KError> {
-    use crate::object::BlockRun;
-    use crate::rsproto::{file_blocks_reply_header, file_blocks_run};
-    let header = file_blocks_reply_header(body).ok_or(KError::KernelError)?;
-    let bs = header.block_size;
-    if !bs.is_power_of_two() || !(512..=PAGE_SIZE as u32).contains(&bs) {
-        return Err(KError::KernelError);
-    }
-    let mut runs = crate::libkern::KVec::new();
-    runs.try_reserve(header.run_count as usize).map_err(|_| KError::OutOfMemory)?;
-    for i in 0..header.run_count as usize {
-        let (file_block, device_lba, length, flags) = file_blocks_run(body, i).ok_or(KError::KernelError)?;
-        let fits = file_block.checked_add(length as u64).is_some()
-            && device_lba.checked_add(length as u64).and_then(|end| end.checked_mul(bs as u64)).is_some();
-        if !fits {
-            return Err(KError::KernelError);
-        }
-        let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
-    }
-    Ok((header, runs))
 }
 
 /// A new Model A `FileObject` over `device`, adopted into an `ObjectRef`: size, block size, run
