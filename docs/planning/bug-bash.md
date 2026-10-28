@@ -2471,3 +2471,31 @@ Found by the maintainer at the laptop's prompt after reinstalling, not by a run.
     `Ident("Documents")` and `Word("/hello.txt")`; `open hello.txt` and `save out.txt` refused for
     want of a path; `save Documents/out.txt` refused for the format of `/p/Documents`; and
     `open ./Documents/hello.txt` read the file. Logic. Medium. Untriaged.
+
+### Found addressing PR #402's review — main at 861bf250, 2026-10-28
+
+A host test failed once in 300 runs of the full kernel suite, on a branch that changes none of it.
+
+- [ ] **drv-17** `kernel/src/dpc.rs:66` — host tests share the one global DPC queue, so one test's
+  DPCs are dropped or run by another's, and `io::block`'s tests fail now and then.
+  - Every test that completes an IRP goes through `DPC_QUEUE`: the block layer's
+    (`io/block.rs:695-885`), AHCI's and xHCI storage's. Each calls `dpc::init`, which replaces
+    the queue with an empty one (`:66`). That drops whatever another test had queued, and leaves
+    its `queued` flag set, so that DPC is never queued again.
+  - Each test's `run_pending` also drains every other test's DPCs, so a test's own drain can find
+    the queue empty while another thread is still running its DPC.
+  - Scenario: `a_block_request_off_its_devices_blocks_reaches_no_driver` drains, then finds no
+    status on a refusal (`io/block.rs:872`). `a_blocking_read_its_device_did_not_complete_fails`
+    fails at `:913` the same way.
+  - Demonstrated: `io::block dpc` failed 42 of 1,000 loops at `861bf250` and 118 of 2,000 at
+    `49457944`, always at those two lines, with no crash. The full kernel suite failed 1 of 300.
+    - A probe logging `init` replacing a non-empty queue found it in 29 of 63 failing runs, and in
+      111 of 300 passing ones.
+    - A slower probe also logged each DPC run on a thread other than its enqueuer's. That happened
+      in 188 of 206 failing runs, and 29 runs of 1,000 crashed. Under gdb, `run_pending_in`
+      (`:140`, reached through `read_blocking`'s poll) called a handler at `0x48`: a `Dpc` read
+      from freed memory.
+  - Which test frees an IRP whose DPC is still queued is not pinned down. No kernel caller is
+    shown to: a kernel `Dpc` outlives its queued reference by design (`:30`).
+  - Tests. Low: it fails CI now and then on branches that touch none of it, and the crash shows a
+    test can run another test's freed DPC. Untriaged.
