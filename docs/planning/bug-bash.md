@@ -271,7 +271,7 @@ Found 24, refuted by a boot 0, reported 13.
   Fixed in `ff52c1b0`; fails without it: `a_handle_listed_twice_is_refused_by_a_send_and_a_spawn`,
   and boot-probe's transfer check under `test-qemu`. A spawn's duplicate grant without `DUPLICATE`,
   which PR #391's review found copied a handle too, in `ddfe3b4b`: boot-probe's spawn-grant check.
-- [ ] **kobj-10** `kernel/src/sched/ipc.rs:453` — When a userspace server's endpoint dies,
+- [x] **kobj-10** `kernel/src/sched/ipc.rs:453` — When a userspace server's endpoint dies,
   `ipc_endpoint_closing` and `us_reg_detach` drain only the registration's pending lookups,
   never its pending fills (`File::ReadRange`, Model B). A thread faulting a lazy
   `OBJECT_KIND_FILE` page waits in `wait_for_fill` with `u64::MAX` and never wakes, and nor does
@@ -284,7 +284,9 @@ Found 24, refuted by a boot 0, reported 13.
   `pending_fill`. logic, trust-boundary. Reviewers disagreed on severity (logic: medium,
   trust-boundary: low); ranked low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's kobj-d3, which repeats it.
-- [ ] **kobj-11** `kernel/src/syscall/table.rs:483` — When allocating the parent's Process
+  Fixed in `7938344d`, as kobj-d3; fails without it:
+  `a_dying_server_fails_its_fills_and_frees_their_cycle`.
+- [x] **kobj-11** `kernel/src/syscall/table.rs:483` — When allocating the parent's Process
   handle fails after the child thread is queued, `sys_process_spawn` returns an error while the
   child runs. It skips the move-close loop at 493-497, so the parent's move_mask handles stay
   open although the child already holds them. This needs a handle-table segment grow to fail
@@ -292,6 +294,8 @@ Found 24, refuted by a boot 0, reported 13.
   Unverified: needs a failure injection in the global table's segment grow and a boot to
   settle. error-paths. Low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's kobj-d4, which repeats it.
+  Fixed in `39e2a5c9`, as kobj-d4: the parent's handle is allocated before the child runs.
+  Structural; the gates pass.
 - [ ] **kobj-12** `kernel/src/handle/table.rs:588` — No test hands `duplicate()` a `new_rights`
   with bits the source lacks, so replacing `info.rights & new_rights` with `new_rights` passes
   the whole kernel host suite. This is a test gap, not a defect in code that works, and it is
