@@ -36,6 +36,8 @@ pub(super) struct RootDevice {
     /// A page of scratch every read passes through, and its mapping.
     mem: u64,
     addr: u64,
+    /// The device's size in bytes, where its last read ends.
+    capacity: u64,
 }
 
 impl RootDevice {
@@ -49,9 +51,13 @@ impl RootDevice {
     /// Any device, by its path in `ns`: a disk the storage service mounted, read as the device
     /// holds it.
     pub(super) fn on(ns: u64, path: &[u8]) -> Option<RootDevice> {
-        let device = match ns_lookup(ns, path, RIGHT_READ) {
+        let device = match ns_lookup(ns, path, RIGHT_READ | libkern::RIGHT_INSPECT) {
             (0, h) if h != 0 => h,
             _ => return None,
+        };
+        let Some(capacity) = stat(device).map(|i| i.size).filter(|&c| c > 0) else {
+            close(device);
+            return None;
         };
         // SAFETY: register-only syscall.
         let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
@@ -66,7 +72,7 @@ impl RootDevice {
             close(device);
             return None;
         }
-        Some(RootDevice { device, mem: mem as u64, addr: addr as u64 })
+        Some(RootDevice { device, mem: mem as u64, addr: addr as u64, capacity })
     }
 
     /// `len` bytes of the file at `path` from `offset`, as the device holds them. `None` if the
@@ -82,14 +88,18 @@ impl RootDevice {
 
 impl fs_server_ext4::BlockReader for RootDevice {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), fs_server_ext4::FsError> {
-        const SECTOR: u64 = 512;
         let mut done = 0usize;
         while done < buf.len() {
             let at = offset + done as u64;
-            let start = at / SECTOR * SECTOR;
+            // A page from a page boundary, or to the device's end, is whole blocks of any size up
+            // to a page, which the kernel requires of a request; the device's own size goes unread.
+            let start = at / PAGE * PAGE;
+            let span = PAGE.min(self.capacity.saturating_sub(start));
             let intra = (at - start) as usize;
-            let take = (buf.len() - done).min(PAGE as usize - intra);
-            let span = (intra + take).div_ceil(SECTOR as usize) as u64 * SECTOR;
+            if intra >= span as usize {
+                return Err(fs_server_ext4::FsError::Io);
+            }
+            let take = (buf.len() - done).min(span as usize - intra);
             let op =
                 IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: self.mem, buf_offset: 0, offset: start, length: span };
             // SAFETY: `device` is a block device handle this process holds; `&op` is a valid
@@ -110,7 +120,7 @@ impl fs_server_ext4::BlockReader for RootDevice {
 impl Drop for RootDevice {
     fn drop(&mut self) {
         // SAFETY: unmapping this value's own mapping.
-        unsafe { syscall2(SYS_MEMORY_UNMAP, self.addr, 0) };
+        unsafe { syscall2(SYS_MEMORY_UNMAP, self.addr, PAGE) };
         close(self.mem);
         close(self.device);
     }
@@ -179,8 +189,8 @@ pub(super) fn file_cache_test(root_ns: u64) -> bool {
     // 2. Let go of everything without a sync; the write is kept, and `sys_ns_sync` writes it.
     // SAFETY: unmapping our own mappings.
     unsafe {
-        syscall2(SYS_MEMORY_UNMAP, wa, 0);
-        syscall2(SYS_MEMORY_UNMAP, ra, 0);
+        syscall2(SYS_MEMORY_UNMAP, wa, size);
+        syscall2(SYS_MEMORY_UNMAP, ra, size);
     }
     close(w);
     close(r);
@@ -224,9 +234,9 @@ pub(super) fn file_cache_test(root_ns: u64) -> bool {
     // Clean up: unmapped first, so the sync leaves the file clean and it goes with its handles.
     // SAFETY: unmapping our own mappings; syncing our own writable handle.
     unsafe {
-        syscall2(SYS_MEMORY_UNMAP, ha, 0);
+        syscall2(SYS_MEMORY_UNMAP, ha, size);
         if let Some(ga) = ga {
-            syscall2(SYS_MEMORY_UNMAP, ga, 0);
+            syscall2(SYS_MEMORY_UNMAP, ga, size);
         }
         syscall1(SYS_FILE_SYNC, h);
     }
@@ -273,7 +283,7 @@ pub(super) fn unlinked_file_test(root_ns: u64) -> bool {
     }
     // Let go without a sync: dirty, and kept by the kernel.
     // SAFETY: unmapping our own mapping.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, wa, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, wa, PAGE) };
     close(w);
 
     let mut runs = [fs_server_ext4::BlockRun::default(); 4];
@@ -706,8 +716,14 @@ pub(super) fn overwrite_test(root_ns: u64) -> bool {
         unsafe { ((base + i as u64) as *mut u8).write_volatile(*m) };
     }
     // 2. Flush the mapping's pages to disk (Model A write IRPs to the existing LBAs).
-    // SAFETY: `fh` is our writable FileObject handle.
-    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+    // Unmapped before the sync, so the write-back can leave the file clean.
+    // SAFETY: unmapping our own mapping; `fh` is our writable handle.
+    let synced = unsafe {
+        syscall2(SYS_MEMORY_UNMAP, base, PAGE);
+        syscall1(SYS_FILE_SYNC, fh)
+    };
+    close(fh);
+    if synced != 0 {
         kprint(b"boot-probe: rwtest sync FAIL\n");
     }
 
@@ -786,8 +802,14 @@ pub(super) fn grow_test(root_ns: u64) -> bool {
         // SAFETY: offset `PAGE + i` is in the 2nd mapped page (the appended block).
         unsafe { ((base + PAGE + i as u64) as *mut u8).write_volatile(*m) };
     }
-    // SAFETY: `fh` is our writable handle.
-    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+    // Unmapped before the sync, so the write-back can leave the file clean.
+    // SAFETY: unmapping our own mapping; `fh` is our writable handle.
+    let synced = unsafe {
+        syscall2(SYS_MEMORY_UNMAP, base, new_size);
+        syscall1(SYS_FILE_SYNC, fh)
+    };
+    close(fh);
+    if synced != 0 {
         kprint(b"boot-probe: grow sync FAIL\n");
     }
 
@@ -902,8 +924,14 @@ pub(super) fn create_test(root_ns: u64) -> bool {
         // SAFETY: offset `i` is within the mapped first page.
         unsafe { ((base + i as u64) as *mut u8).write_volatile(*m) };
     }
-    // SAFETY: `fh` is our writable handle.
-    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+    // Unmapped before the sync, so the write-back can leave the file clean.
+    // SAFETY: unmapping our own mapping; `fh` is our writable handle.
+    let synced = unsafe {
+        syscall2(SYS_MEMORY_UNMAP, base, new_size);
+        syscall1(SYS_FILE_SYNC, fh)
+    };
+    close(fh);
+    if synced != 0 {
         kprint(b"boot-probe: create sync FAIL\n");
     }
 
@@ -963,7 +991,10 @@ pub(super) fn read_large_file(root_ns: u64) -> bool {
     } else {
         Line::new().s(b"boot-probe: large.bin MISMATCH count=").u(mismatches).end();
     }
-    // SAFETY: closing our own handle (the mapping keeps the object alive meanwhile).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+    // SAFETY: unmapping our own mapping, which nothing reads now; closing our own handle.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, base, LARGE_FILE_BYTES as u64);
+        syscall1(SYS_HANDLE_CLOSE, fh);
+    }
     ok
 }

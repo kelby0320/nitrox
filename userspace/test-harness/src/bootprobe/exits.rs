@@ -88,7 +88,7 @@ fn counts_settled(page: u64) -> (u64, u64) {
 
 fn release_page(mem: u64, page: u64) {
     // SAFETY: unmapping a page `shared_page` mapped; nothing reads it after.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, page, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, page, PAGE) };
     close(mem);
 }
 

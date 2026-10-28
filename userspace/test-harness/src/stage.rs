@@ -458,6 +458,8 @@ fn run_grants(setup: &libstream::setup::Setup, ns: u64) -> ! {
         args.handles[0] = its;
         args.rights[0] = u64::MAX;
         let spawned = libos::spawn(&args).is_ok();
+        // SAFETY: closing our own image handle, which the spawn only read.
+        unsafe { libkern::syscall::syscall1(libkern::SYS_HANDLE_CLOSE, image) };
         exit(if spawned && rs_send(stdout, 2, &[], &[mine]) { 0 } else { 1 });
     }
     exit(0);

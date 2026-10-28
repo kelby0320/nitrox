@@ -227,6 +227,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & thread_exit_under_load_test(root_ns)
         & many_timers_test()
         & received_closes_what_was_not_taken_test()
+        & receive_closes_what_its_caller_does_not_take_test()
         & sessions_close_what_they_were_sent_test(root_ns)
         & tty_backend_closes_what_it_was_sent_test(root_ns)
         & setup_closes_what_its_fields_do_not_name_test(root_ns)
@@ -349,7 +350,19 @@ struct Received {
     request_id: u64,
     error: bool,
     body: alloc::vec::Vec<u8>,
-    handles: alloc::vec::Vec<u64>,
+    sent: libkern::Received,
+}
+
+impl Received {
+    /// Take handle `i` of the message: the caller's now. Those not taken close as this drops.
+    fn take(&mut self, i: usize) -> Option<u64> {
+        self.sent.take(i)
+    }
+
+    /// How many handles the message carried, taken or not.
+    fn count(&self) -> usize {
+        self.sent.count()
+    }
 }
 
 /// The next message on `ch`, waiting until `deadline` on the monotonic clock — `0` only looks.
@@ -357,17 +370,15 @@ struct Received {
 fn receive(ch: u64, deadline: u64) -> Option<Received> {
     let mut buf = [0u8; IPC_MSG_SIZE];
     loop {
-        if let Ok(mut sent) = libkern::channel_recv(ch, &mut buf) {
+        if let Ok(sent) = libkern::channel_recv(ch, &mut buf) {
             let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
             let m = librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok()?;
-            let count = sent.count();
-            let hs = sent.take_all();
             return Some(Received {
                 op: m.op,
                 request_id: m.request_id,
                 error: m.is_error(),
                 body: m.body.to_vec(),
-                handles: hs[..count].to_vec(),
+                sent,
             });
         }
         if clock_ns() >= deadline {
@@ -400,7 +411,7 @@ fn read_all(h: u64) -> Option<alloc::vec::Vec<u8>> {
     // SAFETY: `size` bytes are mapped read-only at `addr` until the unmap below.
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) }.to_vec();
     // SAFETY: unmapping what was mapped above; `bytes` is a copy.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, size) };
     Some(bytes)
 }
 

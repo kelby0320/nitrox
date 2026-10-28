@@ -124,6 +124,32 @@ pub(super) fn received_closes_what_was_not_taken_test() -> bool {
     true
 }
 
+/// **Boot-probe's `receive` closes the handles its caller does not take** from what it returns.
+pub(super) fn receive_closes_what_its_caller_does_not_take_test() -> bool {
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: receive FAIL: ").s(why).end();
+        false
+    };
+    let Some([(ours, theirs), (end, peer)]) = channels() else {
+        return fail(b"no channels");
+    };
+    if !rs_send(theirs, 1, 1, b"x", &[end]) {
+        [ours, theirs, end, peer].iter().for_each(|&h| close(h));
+        return fail(b"no send");
+    }
+    let got = receive(ours, clock_ns() + 2_000 * MS).is_some_and(|m| m.op == 1 && m.request_id == 1);
+    let closed = peer_gone_by(peer, clock_ns() + 2_000 * MS);
+    [ours, theirs, peer].iter().for_each(|&h| close(h));
+    if !got {
+        return fail(b"nothing received");
+    }
+    if !closed {
+        return fail(b"the handle its caller did not take stayed open");
+    }
+    kprint(b"boot-probe: receive closes the handles its caller does not take ok\n");
+    true
+}
+
 /// **Every server a client opens a session on closes what the client sends it on the session**:
 /// the clipboard, a terminal, the input server's consumers, `/bin`'s projection and a filesystem.
 pub(super) fn sessions_close_what_they_were_sent_test(root_ns: u64) -> bool {

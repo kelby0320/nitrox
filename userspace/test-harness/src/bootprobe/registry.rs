@@ -351,13 +351,12 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
             if m.request_id == request_id {
                 return Some(m);
             }
-            m.handles.iter().for_each(|&h| close(h));
         }
     };
     let refused = |m: &Option<Received>| {
         m.as_ref().is_some_and(|m| {
             m.error
-                && m.handles.is_empty()
+                && m.count() == 0
                 && librsproto::error::parse_error(&m.body)
                     .is_some_and(|e| e.kerror == libkern::KError::NotFound.as_i32())
         })
@@ -366,18 +365,16 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
     let minted = forward(2, b"info-endpoint");
     let listing = forward(3, b"info");
     close(endpoint);
-    for m in [&block, &minted, &listing].into_iter().flatten() {
-        m.handles.iter().for_each(|&h| close(h));
-    }
     if !refused(&block) {
         return fail(b"the info-only endpoint answered `block` as something other than NotFound");
     }
     if !refused(&minted) {
         return fail(b"the info-only endpoint minted another");
     }
-    if !listing.as_ref().is_some_and(|m| !m.error && m.handles.len() == 1) {
+    if !listing.as_ref().is_some_and(|m| !m.error && m.count() == 1) {
         return fail(b"the info-only endpoint would not open its directory");
     }
+    drop((block, minted, listing));
 
     // **The information side: the manager agrees with the registry's present records.** It
     // follows the table, so once it has caught up its directory names every present device and
@@ -578,7 +575,7 @@ pub(super) fn io_counters_test(root_ns: u64) -> bool {
         unsafe { ((addr + i) as *mut u8).write_volatile((i % 251) as u8) };
     }
     // SAFETY: unmapping this call's own mapping, before the sync, as `libfs` does.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, len) };
     // SAFETY: register-only syscall on a file handle this process holds.
     let synced = unsafe { syscall1(SYS_FILE_SYNC, fh) };
     close(fh);
@@ -644,7 +641,7 @@ pub(super) fn io_counters_test(root_ns: u64) -> bool {
         }
     }
     // SAFETY: unmapping this call's own mapping.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, at, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, at, len) };
     close(ah);
     let Some(read) = table(b"/svc/devices/info/io.tsm") else {
         return fail(b"io.tsm would not read after the read-back");
