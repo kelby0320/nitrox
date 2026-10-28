@@ -325,6 +325,13 @@ pub fn read_rflags() -> u64 {
     val
 }
 
+/// Assert, in debug builds, that this CPU's interrupts are masked, so its thread cannot migrate
+/// between reading which CPU it is on and writing that CPU's slot.
+#[inline]
+pub fn debug_assert_pinned(what: &str) {
+    debug_assert!(read_rflags() & (1 << 9) == 0, "{what}: this CPU's slot written with interrupts on");
+}
+
 /// Clear the interrupt flag (`cli`), masking maskable interrupts on this CPU.
 ///
 /// # Safety
@@ -332,11 +339,10 @@ pub fn read_rflags() -> u64 {
 /// callers must bound the masked window (see [`crate::libkern::IrqSpinLock`]).
 #[inline]
 pub unsafe fn cli() {
-    // SAFETY: `cli` clears IF; ring-0 instruction, no memory effect. IF is not
-    // one of the arithmetic flags `preserves_flags` tracks, so the option set
-    // matches the `cli` in `cpu.rs::halt_loop`.
+    // SAFETY: `cli` clears IF; ring-0 instruction. Not `nomem`: a memory access must not move
+    // out of the section it opens. IF is not one of the arithmetic flags `preserves_flags` tracks.
     unsafe {
-        asm!("cli", options(nomem, nostack, preserves_flags));
+        asm!("cli", options(nostack, preserves_flags));
     }
 }
 
@@ -347,11 +353,18 @@ pub unsafe fn cli() {
 /// established before enabling delivery.
 #[inline]
 pub unsafe fn sti() {
-    // SAFETY: `sti` sets IF; ring-0 instruction, no memory effect. See `cli`
-    // re: `preserves_flags`.
+    // SAFETY: `sti` sets IF; ring-0 instruction. See `cli` re: `nomem` and `preserves_flags`.
     unsafe {
-        asm!("sti", options(nomem, nostack, preserves_flags));
+        asm!("sti", options(nostack, preserves_flags));
     }
+}
+
+/// Order every earlier memory access before a following x2APIC MSR write, which is not
+/// serializing (SDM 3A §11.12.3): `mfence; lfence`, as Linux's `weak_wrmsr_fence`.
+#[inline]
+pub fn x2apic_write_fence() {
+    // SAFETY: fences only. Not `nomem`, so the compiler keeps its accesses before it too.
+    unsafe { asm!("mfence", "lfence", options(nostack, preserves_flags)) };
 }
 
 /// Read the Time-Stamp Counter, a 64-bit cycle counter returned across `edx:eax`.

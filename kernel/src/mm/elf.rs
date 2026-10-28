@@ -105,7 +105,7 @@ pub struct EntryInfo {
 ///
 /// On success, returns the entry point and the page-aligned, exclusive stack top. On failure `asp`
 /// may be partially populated; the caller should drop it.
-pub fn load_elf(asp: &AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLoadError> {
+pub fn load_elf(asp: &mut AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLoadError> {
     let ehdr = parse_ehdr(bytes)?;
     if ehdr.e_entry >= USER_VIRT_END {
         return Err(ElfLoadError::BadEntry);
@@ -233,7 +233,7 @@ fn read_u64(bytes: &[u8], off: usize) -> Result<u64, ElfLoadError> {
     Ok(u64::from_le_bytes(slice))
 }
 
-fn map_load_segment(asp: &AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &mut u64) -> Result<(), ElfLoadError> {
+fn map_load_segment(asp: &mut AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &mut u64) -> Result<(), ElfLoadError> {
     let page = PAGE_SIZE as u64;
 
     // `p_vaddr % PAGE == p_offset % PAGE` is mandatory: the file bytes are copied contiguously
@@ -442,53 +442,53 @@ mod tests {
     #[test]
     fn truncated_input_rejected() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
-        assert_eq!(load_elf(&asp, &[]), Err(ElfLoadError::Truncated));
-        assert_eq!(load_elf(&asp, &[0u8; 32]), Err(ElfLoadError::Truncated));
+        let mut asp = AddressSpace::new().unwrap();
+        assert_eq!(load_elf(&mut asp, &[]), Err(ElfLoadError::Truncated));
+        assert_eq!(load_elf(&mut asp, &[0u8; 32]), Err(ElfLoadError::Truncated));
     }
 
     #[test]
     fn bad_magic_rejected() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bad = vec![0x42; ELF64_EHDR_SIZE];
-        assert_eq!(load_elf(&asp, &bad), Err(ElfLoadError::BadMagic));
+        assert_eq!(load_elf(&mut asp, &bad), Err(ElfLoadError::BadMagic));
     }
 
     #[test]
     fn wrong_class_or_data_or_version_rejected() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new().class(1).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::Not64Bit));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::Not64Bit));
         let bytes = ElfBuilder::new().data(2).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::NotLittleEndian));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::NotLittleEndian));
         let bytes = ElfBuilder::new().version(0).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::NotCurrentVersion));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::NotCurrentVersion));
     }
 
     #[test]
     fn wrong_machine_or_type_rejected() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new().machine(E_MACHINE.wrapping_add(1)).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::WrongMachine));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::WrongMachine));
         let bytes = ElfBuilder::new().e_type(3).build(); // ET_DYN
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::NotExecutable));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::NotExecutable));
     }
 
     #[test]
     fn pt_interp_rejected() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new().interp_segment(0x500000).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::HasInterpreter));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::HasInterpreter));
     }
 
     #[test]
     fn single_load_segment_maps_and_copies_bytes() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         // Page-aligned base, 0x80 bytes of file, 0x100 memsz so there is BSS to check.
         let mut content = Vec::with_capacity(0x80);
         for i in 0..0x80 {
@@ -496,7 +496,7 @@ mod tests {
         }
         let bytes = ElfBuilder::new().entry(0x400010).load_segment(0x400000, PF_R, content.clone(), 0x100).build();
 
-        let info = load_elf(&asp, &bytes).expect("load must succeed");
+        let info = load_elf(&mut asp, &bytes).expect("load must succeed");
         assert_eq!(info.entry_point, VirtAddr::new(0x400010));
         assert_eq!(info.stack_top, VirtAddr::new(STACK_TOP));
 
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn segment_with_non_zero_in_page_offset_copies_correctly() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         // `p_vaddr` 0x400100 with a matching file offset: bytes 0x100..0x180 of the first page
         // hold the content.
         let mut content = Vec::new();
@@ -522,7 +522,7 @@ mod tests {
         }
         let bytes =
             ElfBuilder::new().entry(0x400100).load_segment(0x400100, PF_R | PF_W, content.clone(), 0x80).build();
-        load_elf(&asp, &bytes).expect("load must succeed");
+        load_elf(&mut asp, &bytes).expect("load must succeed");
 
         // Bytes below `p_vaddr` in the first page are zero.
         for i in 0..0x100u64 {
@@ -538,14 +538,14 @@ mod tests {
     #[test]
     fn multi_page_segment_spans_correctly() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let size = (PAGE_SIZE as u64) + 0x200;
         let mut content = Vec::with_capacity(size as usize);
         for i in 0..size {
             content.push((i & 0xFF) as u8);
         }
         let bytes = ElfBuilder::new().load_segment(0x400000, PF_R | PF_W, content.clone(), size).build();
-        load_elf(&asp, &bytes).expect("load must succeed");
+        load_elf(&mut asp, &bytes).expect("load must succeed");
 
         let probes: &[u64] = &[0, (PAGE_SIZE as u64) - 1, PAGE_SIZE as u64, size - 1];
         for &off in probes {
@@ -557,32 +557,32 @@ mod tests {
     #[test]
     fn segment_alignment_violation_rejected() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         // Mismatched `p_offset` / `p_vaddr` mod PAGE.
         let mut bytes = ElfBuilder::new().load_segment(0x400000, PF_R, vec![0u8; 4], 4).build();
         let phdr_base = ELF64_EHDR_SIZE;
         let bad_vaddr = 0x400123u64;
         bytes[phdr_base + 16..phdr_base + 24].copy_from_slice(&bad_vaddr.to_le_bytes());
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::BadSegmentAlignment));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::BadSegmentAlignment));
     }
 
     #[test]
     fn segment_in_kernel_half_rejected() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new().load_segment(0xFFFF_8000_0000_0000, PF_R, vec![0u8; 4], 4).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::BadSegmentRange));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::BadSegmentRange));
     }
 
     #[test]
     fn overlapping_segments_rejected() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new()
             .load_segment(0x400000, PF_R, vec![0u8; 0x100], 0x100)
             .load_segment(0x400500, PF_R | PF_W, vec![0u8; 0x100], 0x100)
             .build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::SegmentOverlap));
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::SegmentOverlap));
     }
 
     #[test]
@@ -590,9 +590,9 @@ mod tests {
         use crate::mm::addr_space::FaultIn;
         use crate::mm::vmm::FaultAccess;
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new().load_segment(0x400000, PF_R | PF_W, vec![0xCC; 0x40], 0x40).build();
-        let info = load_elf(&asp, &bytes).expect("load must succeed");
+        let info = load_elf(&mut asp, &bytes).expect("load must succeed");
         assert_eq!(info.stack_top, VirtAddr::new(STACK_TOP));
 
         // Lazily reserved: nothing translates until first touch.
@@ -617,11 +617,11 @@ mod tests {
     #[test]
     fn a_program_header_offset_at_the_top_of_the_range_is_truncated() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let mut bytes = ElfBuilder::new().load_segment(0x400000, PF_R, vec![0u8; 4], 4).build();
         for phoff in [u64::MAX - 8, u64::MAX - 55, u64::MAX] {
             bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
-            assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::Truncated), "e_phoff {phoff:#x}");
+            assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::Truncated), "e_phoff {phoff:#x}");
         }
     }
 
@@ -633,9 +633,9 @@ mod tests {
             (USER_VIRT_END, Err(ElfLoadError::BadEntry)),
             (0xFFFF_8000_0000_0000, Err(ElfLoadError::BadEntry)),
         ] {
-            let asp = AddressSpace::new().unwrap();
+            let mut asp = AddressSpace::new().unwrap();
             let bytes = ElfBuilder::new().entry(entry).load_segment(0x400000, PF_R, vec![0u8; 4], 4).build();
-            assert_eq!(load_elf(&asp, &bytes).map(|i| i.entry_point), want, "entry {entry:#x}");
+            assert_eq!(load_elf(&mut asp, &bytes).map(|i| i.entry_point), want, "entry {entry:#x}");
         }
     }
 
@@ -644,45 +644,45 @@ mod tests {
         init_global_heap();
         let top = USER_VIRT_END - PAGE_SIZE as u64;
         for (at, want) in [(top - PAGE_SIZE as u64, Ok(())), (top, Err(ElfLoadError::BadSegmentRange))] {
-            let asp = AddressSpace::new().unwrap();
+            let mut asp = AddressSpace::new().unwrap();
             let bytes = ElfBuilder::new().load_segment(at, PF_R | PF_X, vec![0x0f, 0x05], 2).build();
-            assert_eq!(load_elf(&asp, &bytes).map(|_| ()), want, "a segment at {at:#x}");
+            assert_eq!(load_elf(&mut asp, &bytes).map(|_| ()), want, "a segment at {at:#x}");
         }
     }
 
     #[test]
     fn an_image_whose_segments_claim_more_than_the_budget_is_refused() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new().load_segment(0x400000, PF_R | PF_W, vec![], 1 << 40).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::TooLarge));
-        let asp = AddressSpace::new().unwrap();
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::TooLarge));
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new()
             .load_segment(0x400000, PF_R, vec![0u8; 4], 4)
             .load_segment(0x1000_0000, PF_R | PF_W, vec![], MAX_LOAD_BYTES)
             .build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::TooLarge), "a page past it, over two segments");
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::TooLarge), "a page past it, over two segments");
     }
 
     #[test]
     fn a_segment_with_more_file_than_memory_or_past_the_image_is_refused() {
         init_global_heap();
-        let asp = AddressSpace::new().unwrap();
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new().load_segment(0x400000, PF_R, vec![1u8; 8], 4).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::BadSegmentRange));
-        let asp = AddressSpace::new().unwrap();
+        assert_eq!(load_elf(&mut asp, &bytes), Err(ElfLoadError::BadSegmentRange));
+        let mut asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new().load_segment(0x400000, PF_R, vec![1u8; 8], 8).build();
-        assert_eq!(load_elf(&asp, &bytes[..bytes.len() - 1]), Err(ElfLoadError::Truncated));
+        assert_eq!(load_elf(&mut asp, &bytes[..bytes.len() - 1]), Err(ElfLoadError::Truncated));
     }
 
     #[test]
     fn a_segment_is_writable_or_executable_only_as_its_flags_say() {
         init_global_heap();
         for (flags, write, exec) in [(PF_R, false, false), (PF_R | PF_W, true, false), (PF_R | PF_X, false, true)] {
-            let asp = AddressSpace::new().unwrap();
+            let mut asp = AddressSpace::new().unwrap();
             let bytes = ElfBuilder::new().load_segment(0x400000, flags, vec![0u8; 4], 4).build();
-            load_elf(&asp, &bytes).unwrap();
-            let prot = asp.unmap_covering(VirtAddr::new(0x400000)).unwrap().prot;
+            load_elf(&mut asp, &bytes).unwrap();
+            let prot = asp.unmap_at(VirtAddr::new(0x400000)).unwrap().vma().unwrap().prot;
             assert_eq!(prot.contains(Protection::WRITE), write, "flags {flags:#x}");
             assert_eq!(prot.contains(Protection::EXEC), exec, "flags {flags:#x}");
         }

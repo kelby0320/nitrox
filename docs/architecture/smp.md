@@ -172,7 +172,9 @@ fabricated frame `ret`s into `thread_trampoline` (`context.rs`): `sti` (it did n
 arrive via an `iretq` that would restore IF), then `call thread_enter`
 (`sched.rs`). `thread_enter` reads the current thread under `SCHED`; if it is a
 **user** thread it points TSS.RSP0 + the syscall stack at this thread's kernel
-stack, re-arms `KERNEL_GS_BASE`, and `enter_user`s to ring 3 (seeding
+stack and re-arms `KERNEL_GS_BASE` (`arm_kernel_stack_for`), still under `SCHED`,
+where reading the CPU and writing its slots cannot straddle a migration; the setters
+assert interrupts are masked in debug builds. It then `enter_user`s to ring 3 (seeding
 `rdi/rsi/rdx/rcx` with the spawn hand-off — notification channel, root namespace,
 etc.). A **kernel** thread runs its body then `exit_thread`s.
 
@@ -190,7 +192,7 @@ it happens on **every** switch-in, so migration needs no special path:
 | **Syscall entry stack** | `arm_kernel_stack_for`, every switch | first `syscall` after migration lands on a stale stack |
 | **`KERNEL_GS_BASE`** | `arm_kernel_stack_for` (`arm_user_entry_cpu_base`) | `swapgs` in the syscall stub reads the wrong core's block |
 | **Syscall MSRs (`EFER.SCE`, `STAR`/`LSTAR`)** | re-armed at each ring-3 **descent** (`arm_user_entry_cpu_base`, cheap `rdmsr(EFER)` gate) | first `syscall` `#UD`s (Bug 1) |
-| **Dense index (`TSC_AUX`)** | set once at bring-up, never per-thread | see Bugs 2 & 5 |
+| **Dense index (`TSC_AUX`)** | set once at bring-up, never per-thread: the BSP's first thing in `kernel_main`, before anything reads it | see Bugs 2 & 5 |
 
 The principle: **a thread carries no per-core assumptions across a switch** — the
 switch re-establishes them from the incoming thread + the running core. This is
@@ -247,7 +249,8 @@ These are the load-bearing rules. Every bug in Part 2 was a violation of one.
   the downstream symptom of Bug 4).
 - **I5 — the shared kernel vmap stays TLB-coherent across cores.** Kernel stacks
   live in a vmap region mapped in every address space; unmapping/​freeing one must
-  invalidate other cores' TLBs before the frame is reused (§8).
+  invalidate other cores' TLBs before its frames are freed or its VA is handed out
+  again (§8).
 - **I6 — a plain-spinlock holder is never descheduled** (added 2026-07-21, review
   F12). Plain `SpinLock` critical sections are no-preemption regions
   (`sched::preempt_disable`, raised by `lock()` itself): spinners — including
@@ -262,17 +265,17 @@ These are the load-bearing rules. Every bug in Part 2 was a violation of one.
 ### 8. TLB shootdown
 
 `crate::tlb` is the architecture-neutral coordinator; `arch::send_shootdown_ipi`
-(vector `0x40`) is the transport. On a kernel-vmap free (`KernelStack::Drop`):
-clear the PTEs, then `shootdown_all()` — broadcast to **every online core,
-including the initiator's own** (a self-IPI), each of which invalidates and
-acknowledges; spin until all acknowledge — *then* return the frames to the
-allocator.
+(vector `0x40`) is the transport. On a kernel-vmap free (a `VmapFrames` drop, which
+is every kernel stack's): clear the PTEs, then `shootdown_all()` — broadcast to
+**every online core, including the initiator's own** (a self-IPI), each of which
+invalidates and acknowledges; spin until all acknowledge — *then* return the frames
+to the allocator and the VA to the vmap.
 
 The request window is **IF-robust** (reworked 2026-07-21, review finding F1): the
 coordinator saves the caller's interrupt state and runs the whole window — lock
 acquisition, IPIs, ack spin — with interrupts *enabled*, restoring after. The
 original design assumed callers arrived with IF=1, but shootdowns are reached
-from `reap_pending → KernelStack::Drop` in **IF-masked** contexts (syscall bodies
+from `reap_pending` → a kernel stack's drop in **IF-masked** contexts (syscall bodies
 run masked end-to-end; the ring-3 exception path) — and an IF-masked spinner can
 never service *another* initiator's shootdown IPI, so two IF=0 initiators
 deadlocked (one holding the serialising lock spinning for an ack the other,
@@ -286,7 +289,8 @@ spinlock (never an IRQ handler/DPC — frees, the only initiators, are already
 forbidden there).
 
 **Map-side installs are not shot down** (adding a
-mapping needs no cross-core invalidation on x86; the vmap PDPT is pre-allocated) —
+mapping needs no cross-core invalidation on x86; the vmap PDPT is pre-allocated, and
+a reused VA was shot down before it was given back, so no core caches it) —
 matching Linux, which shoots down only on unmap / permission-restrict. **The tables
 below the PDPT are made on demand, under no lock**, as stacks are mapped: a slot is
 linked by compare-and-swap, so two cores mapping stacks in one fresh 2 MiB region

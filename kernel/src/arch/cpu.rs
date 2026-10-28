@@ -20,7 +20,7 @@ pub trait ArchCpu {
 
     /// Set the kernel stack the CPU loads on a ring3→ring0 trap (the neutral
     /// name for `TSS.RSP0` on x86_64).
-    fn set_kernel_stack(top: u64);
+    fn set_kernel_stack(top: crate::mm::kstack::KernelStackTop);
 
     /// Park the CPU forever: disable interrupts and `hlt` in a loop so a
     /// spurious wake-up cannot restart execution. Never returns.

@@ -111,6 +111,10 @@ fn kernel_main() {
         return;
     }
 
+    // The BSP's dense index 0, before the per-CPU control tables are found by it: firmware need not
+    // leave its reset default. On the BSP, with no AP online, it cannot land on another's index.
+    arch::Smp::init_this_cpu(0);
+
     // Install the CPU control tables (x86_64: GDT + TSS, then IDT; their order lives in the arch
     // layer). First, because it prints nothing and needs nothing, and with the IDT live a bad
     // framebuffer descriptor below gives a register dump rather than a silent triple fault.
@@ -258,11 +262,7 @@ fn kernel_main() {
     // Left Shift release, so arming first delivers a phantom Shift each boot.
     nitrox_kernel::drivers::ps2::init();
 
-    // Establish the BSP's dense index 0 before the scheduler uses `current_cpu()` and before any AP
-    // is online, while the boot thread is pinned to the BSP. Later it could migrate onto an AP, and
-    // this `wrmsr(IA32_TSC_AUX, 0)` would overwrite that CPU's index, aliasing it onto the BSP's
-    // per-CPU scheduler slots. Each AP sets its own in `arch::adopt_dense_index`.
-    arch::Smp::init_this_cpu(0);
+    // The BSP's dense index was set first thing; each AP sets its own in `arch::adopt_dense_index`.
     kprintln!(
         "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
         arch::Smp::current_cpu(),
@@ -761,22 +761,12 @@ fn plain_mapping(
     caching: nitrox_kernel::mm::Caching,
 ) -> Option<nitrox_kernel::mm::VirtAddr> {
     use nitrox_kernel::mm::vmm::Protection;
-    use nitrox_kernel::mm::{PhysAddr, VirtAddr, addr_space, kvmap};
+    use nitrox_kernel::mm::{addr_space, kvmap};
     // The flags come from the function that gives them to `/dev/framebuffer`, not a second copy.
     let flags = addr_space::page_flags_for(Protection::WRITE, caching);
-    let base = kvmap::vmap_alloc_pages(pages).ok()?;
-    let root = arch::Paging::active_root();
-    for i in 0..pages {
-        let v = VirtAddr::new(base.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
-        let p = PhysAddr::new(phys.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
-        // SAFETY: `v` is a fresh vmap page in the shared kernel half; `p` is a frame of the
-        // framebuffer aperture this kernel already maps; the flags are the ones a user mapping of
-        // it gets.
-        unsafe { arch::Paging::map_page(root, v, p, flags).ok()? };
-        // SAFETY: `v`'s entry has just changed.
-        unsafe { arch::Paging::flush_tlb_page(v) };
-    }
-    Some(base)
+    // SAFETY: `phys .. + pages` is the framebuffer aperture this kernel already maps; the flags
+    // are the ones a user mapping of it gets.
+    unsafe { kvmap::map_device(phys, pages, flags) }.ok()
 }
 
 /// Undo [`plain_mapping`].
@@ -784,16 +774,8 @@ fn plain_mapping(
 /// # Safety
 /// `base .. base + pages` must be the mapping [`plain_mapping`] returned, unused from here on.
 unsafe fn unmap_plain(base: nitrox_kernel::mm::VirtAddr, pages: u64) {
-    use nitrox_kernel::mm::VirtAddr;
-    let root = arch::Paging::active_root();
-    for i in 0..pages {
-        let v = VirtAddr::new(base.as_u64() + i * nitrox_kernel::mm::PAGE_SIZE as u64);
-        // SAFETY: forwarded from this function's contract.
-        unsafe {
-            let _ = arch::Paging::unmap_page(root, v);
-            arch::Paging::flush_tlb_page(v);
-        }
-    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe { nitrox_kernel::mm::kvmap::unmap_device(base, pages) };
 }
 
 /// Arm the syscall fast path, then load and launch **init** from the initramfs (`/sbin/init`) as
@@ -811,7 +793,7 @@ fn run_first_userspace() {
     arch::init_syscall_entry();
     kprintln!("syscall fast-path armed");
 
-    let aspace = match AddressSpace::new() {
+    let mut aspace = match AddressSpace::new() {
         Ok(a) => a,
         Err(_) => {
             kprintln!("init: address space alloc failed");
@@ -826,7 +808,7 @@ fn run_first_userspace() {
                 return;
             }
         };
-    let info = match load_elf(&aspace, init_bytes) {
+    let info = match load_elf(&mut aspace, init_bytes) {
         Ok(i) => i,
         Err(e) => {
             kprintln!("init: ELF load failed: {:?}", e);
@@ -1178,7 +1160,7 @@ fn paging_init() {
     // allocator is live; no AS exists yet whose captured template
     // could disagree with the new PML4 entries.
     unsafe {
-        mm::kvmap::init();
+        mm::kvmap::init(arch::Paging::active_root());
         arch::Paging::init_kernel_template(arch::Paging::active_root());
     }
 }

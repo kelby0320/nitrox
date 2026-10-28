@@ -128,6 +128,10 @@ pub use x86_64::entropy::X86Entropy as Entropy;
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::context::{ArchThreadContext, context_switch, fabricate_frame, thread_trampoline};
+// A host test's way to fail a page-table allocation partway through a mapping, and to read what
+// a page was mapped with.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub use x86_64::paging::{fail_page_tables_after, mapped_with};
 
 // Per-thread floating-point / SIMD register state: the opaque save area a
 // [`Thread`](crate::object::Thread) carries, the per-CPU enable, and the swap

@@ -208,6 +208,10 @@ fn table_ptr(table: PhysAddr) -> *mut Pte {
 /// Allocate one zeroed, page-aligned 4 KiB frame to use as a page table, or `None` if the
 /// physical frame allocator is exhausted.
 fn alloc_page_table() -> Option<PhysAddr> {
+    #[cfg(test)]
+    if TABLES_LEFT.with(|left| left.replace(left.get().map(|n| n.saturating_sub(1))) == Some(0)) {
+        return None;
+    }
     let frame = crate::mm::heap::buddy_alloc(0)?;
     // SAFETY: `buddy_alloc(0)` returned a fresh, exclusively-owned 4 KiB
     // frame; `table_ptr` addresses it through the HHDM. We are its only
@@ -256,6 +260,28 @@ unsafe fn ensure_table(table: *mut Pte, index: usize) -> Result<*mut Pte, MapErr
             return Ok(table_ptr(new));
         }
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TABLES_LEFT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+/// Let this thread allocate `n` more page tables, failing every one after, or any with `None`.
+#[cfg(test)]
+pub fn fail_page_tables_after(n: Option<usize>) {
+    TABLES_LEFT.with(|left| left.set(n));
+}
+
+/// Whether `virt` is a 4 KiB page under `root` mapped with `flags` and nothing else.
+///
+/// # Safety
+/// As [`walk_to_pt`].
+#[cfg(test)]
+pub unsafe fn mapped_with(root: PhysAddr, virt: VirtAddr, flags: PageFlags) -> bool {
+    // SAFETY: forwarded; `pt_index` masks to the table's 512 entries.
+    let leaf = unsafe { walk_to_pt(root, virt).map(|pt| *pt.add(pt_index(virt))) };
+    leaf.is_some_and(|pte| pte.0 & !PTE_ADDR_MASK == PTE_PRESENT | flags_to_pte_bits(flags))
 }
 
 #[cfg(test)]

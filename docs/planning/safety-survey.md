@@ -1094,7 +1094,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Defects**
 
-- [ ] **kmem-d1** `kernel/src/mm/kvmap.rs:58` — `vmap_alloc_pages` is bounded only by
+- [x] **kmem-d1** `kernel/src/mm/kvmap.rs:58` — `vmap_alloc_pages` is bounded only by
   `KERNEL_VMAP_END` (16 TiB), but `kvmap::init` templates only the first 512 GiB PDPT, so a
   kernel stack past that boundary is mapped under one root only. Each thread takes 5 vmap pages
   (20 KiB) that are never reclaimed, and `sys_thread_create` needs no authority. After about 26.8M
@@ -1110,7 +1110,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   needs a boot or 26.8M cycles. `memory-management.md:627` states the limit and no code enforces
   it. Four lenses found it independently. Lenses: ownership, soundness, concurrency,
   opportunities. High. **Fix**, with the bash's kmem-9, moved here from Part H.
-- [ ] **kmem-d2** `kernel/src/mm/addr_space.rs:617` — `map_object`'s out-of-memory rollback
+  Fixed in `165dae67`: the vmap hands out VA only inside the window `init` links, and a freed
+  stack's VA is reused; fails without it:
+  `the_last_page_the_vmap_hands_out_is_mapped_under_every_root`,
+  `a_vmap_hands_out_va_up_to_its_end_and_no_further`.
+- [x] **kmem-d2** `kernel/src/mm/addr_space.rs:617` — `map_object`'s out-of-memory rollback
   (`rollback_object_map`) clears PTEs that are live in a running address space and issues no
   TLB invalidation, and `sys_memory_map`'s error arm (syscall/table.rs:935) issues none either.
   Process P has threads on CPUs A and B. A's `sys_memory_map` installs pages 0..k, then fails
@@ -1122,7 +1126,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   that `flush_tlb_all` runs only on the Ok path. It needs SMP plus a forced page-table OOM
   mid-range. A fix is `shootdown_all` in the rollback before the object is released.
   Lens: concurrency. High. **Fix.**
-- [ ] **kmem-d3** `kernel/src/mm/slab.rs:334` — `kmalloc` accepts `align == SLAB_SIZE` (it refuses
+  Fixed in `88a5edea`: `map_object`'s rollback is shot down before its object comes back;
+  fails without it: `a_failed_object_map_is_shot_down_before_its_object_comes_back`.
+- [x] **kmem-d3** `kernel/src/mm/slab.rs:334` — `kmalloc` accepts `align == SLAB_SIZE` (it refuses
   only larger). `large_alloc` then puts the object at `align_up(32, 4096) = 4096`, the block's
   second page, but `kfree` and `large_free` find the descriptor at `ptr & SLAB_MASK`, which is
   the object's own first bytes. `KBox::<IpcMsg>::try_new_zeroed()` (libkern's
@@ -1136,7 +1142,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   were taken. `large_alloc(64, align)` finds the descriptor for 8/64/1024/2048 and not 4096.
   After `large_free`, `alloc(0)` handed out a page of the live allocation. Lenses: abi, ownership,
   soundness, opportunities. Medium. **Fix.**
-- [ ] **kmem-d4** `kernel/src/mm/kstack.rs:197` — `KernelStack` stores the `PhysAddr` root it was
+  Fixed in `fe8d7697`: a page-aligned object's descriptor is the page below it; fails without
+  it: `a_page_aligned_allocation_is_freed_whole`.
+- [x] **kmem-d4** `kernel/src/mm/kstack.rs:197` — `KernelStack` stores the `PhysAddr` root it was
   built under and walks it in `Drop`, and `KernelStack::new(root)` is a safe fn that forwards any
   frame to unsafe `map_page`. Nothing ties the root's lifetime to the stack. It holds only
   because `Thread` declares `stack` before `process` and kernel threads are spawned only under
@@ -1149,7 +1157,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `0xDEAD0001`. `KernelStack::new(memory_object.frames()[0])` with no `unsafe` wrote a PDPT link
   into the MemoryObject's data (word 384 became `0x7cae77ff0007`). Lenses: ownership, soundness,
   concurrency, opportunities. Medium. **Fix.**
-- [ ] **kmem-d5** `kernel/src/tlb.rs:125` — the shootdown publishes `REQUEST_ALL`, `REQUEST_VA`
+  Fixed in `165dae67`: a `KernelStack` keeps no root, and the vmap is edited through the boot
+  root alone; structural, held by `a_stack_outlives_the_address_space_it_was_made_under`.
+- [x] **kmem-d5** `kernel/src/tlb.rs:125` — the shootdown publishes `REQUEST_ALL`, `REQUEST_VA`
   and `ACKED=0` with plain stores, then sends the IPI with a bare x2APIC ICR WRMSR. x2APIC
   WRMSR is not serializing (SDM 3A §11.12.3 asks for `MFENCE;LFENCE` first), `regs::wrmsr` is
   `options(nomem)` so the compiler may move the stores past it, and the `Release` on `ACKED`
@@ -1163,6 +1173,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   or a litmus test settles it. The fix is `fence(SeqCst)` plus `lfence` before the ICR write, as
   Linux does with `weak_wrmsr_fence`. Lenses: ownership, soundness, concurrency, opportunities.
   Medium. **Fix.**
+  Fixed in `6d8f188c`: the ICR is written only by `write_icr`, after `mfence; lfence`; held by
+  `the_icr_is_written_once_after_the_x2apic_fence` (a tools test) and the disassembly's 18 ICR
+  writes. Unverified as before: only real SMP hardware shows the race.
 - [ ] **kmem-d6** `kernel/src/mm/vmm.rs:245` — safe functions cast an `ObjectRef` to a concrete
   type behind only a `debug_assert` on its tag, so in release a wrong-kind reference is read as
   the wrong type. `Vma::drop` calls `writable_unmapped` whenever `mapping == FileBacked` and
@@ -1268,7 +1281,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `sys_clock_read` or `sys_channel_recv` out pointers.
   Unverified: grep finds no `write_cr0` that sets bit 16. Assert `read_cr0() & (1<<16) != 0` on
   every CPU at bring-up. It holds under Limine today. Lens: abi. Low. **Fix.**
-- [ ] **kmem-d17** `kernel/src/mm/kvmap.rs:111` — `remap_mmio_page` repoints a page of the shared
+- [x] **kmem-d17** `kernel/src/mm/kvmap.rs:111` — `remap_mmio_page` repoints a page of the shared
   vmap and flushes only the local TLB, and its `# Safety` contract does not say that the page
   must have been used by one CPU only. Safe today because its only caller, `pci::enumerate`
   under `device::init` (main.rs:239), runs before `bring_up_aps` (main.rs:283). A rescan or
@@ -1276,6 +1289,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   space through a stale entry. `shootdown_page` has no callers at all.
   Unverified: path pointed at (`unmap_page`, `map_page`, `flush_tlb_page`, no `shootdown_page`).
   Lenses: ownership, soundness, concurrency. Low. **Fix.**
+  Fixed in `165dae67`: `MmioWindow::repoint` shoots down the page it changes; fails without it:
+  `a_repointed_window_reads_the_new_frame_and_shoots_down_the_old`.
 - [ ] **kmem-d18** `kernel/src/object/memory_object.rs:203` — `copy_to_kvec` forms a `&[u8]` over
   each frame under a SAFETY comment saying it is "not aliased", but MemoryObject frames are
   mapped into user spaces by design. `file_object.rs:1043` (`read_to_kvec`) does the same over
@@ -1341,7 +1356,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   also lets host tests carry provenance so Miri can check frame accesses. Depends on: nothing;
   pairs with kmem-o6. Lenses: ownership, soundness, opportunities. Value high, effort medium
   (one lens said large). **Plan**, in P2.
-- [ ] **kmem-o3** encapsulate: kernel-half (vmap) mappings are made through
+- [x] **kmem-o3** encapsulate: kernel-half (vmap) mappings are made through
   `Paging::map_page`/`unmap_page` with a caller-chosen root (`active_root()`, a process root, or
   the root stored in `KernelStack`) and a local-only TLB flush, although the tables are shared by
   every address space, and nothing enforces the 512 GiB pre-allocated window — 9 sites (`grep -rnE
@@ -1360,7 +1375,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   only (kmem-d1), `KernelStack` walking a freed PML4 (kmem-d4), stale cross-CPU translations
   after a shared remap (kmem-d17). Depends on: nothing; pairs with kmem-o2. Lenses: ownership,
   soundness, concurrency. Value high, effort small to medium. **Fix.**
-- [ ] **kmem-o4** encapsulate: each page-table unmap returns its old frame, and the caller is
+  Finished in `165dae67`: kvmap owns the window; `VmapFrames`, `MmioWindow`, `map_device`.
+- [x] **kmem-o4** encapsulate: each page-table unmap returns its old frame, and the caller is
   trusted to invalidate other CPUs' TLBs before the frame or its owning object can be freed;
   `rollback_object_map` does not — 8 sites (`grep -rn "Paging::unmap_page(" kernel/src
   --include=*.rs`, excluding tests, the fn definition and arch/x86_64/paging.rs), such as
@@ -1374,6 +1390,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `kernel/src/mm/addr_space.rs`, with `tlb.rs`. Closes: a frame, or the object owning it, freed
   while another CPU may still cache its translation (kmem-d2). Depends on: nothing. Lens:
   concurrency. Value high, effort medium. **Fix.**
+  Finished in `88a5edea`: an unmap returns an `Unmapped`, shot down before anything it held is
+  freed, and `map_vma` takes `&mut self`.
 - [ ] **kmem-o5** encapsulate: frame contents are reached by hand-computing `phys +
   hhdm_offset()` at each site, then a raw write, a copy, or a `&[u8]` slice, with each site
   re-arguing its bounds and liveness — 44 HHDM-arithmetic sites (`grep -rn "hhdm_offset()"
@@ -2184,7 +2202,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   fails without it: `check-irq-scope`'s third rule, on the original `idt.rs` at all six stubs,
   `an_interrupt_stub_opens_with_a_prologue_that_clears_df_and_ac`, and
   `the_entry_flag_clear_leaves_df_and_ac_clear`.
-- [ ] **kplat-d2** `kernel/src/sched.rs:756` — `thread_enter`'s ring-3 descent calls
+- [x] **kplat-d2** `kernel/src/sched.rs:756` — `thread_enter`'s ring-3 descent calls
   `set_kernel_stack`, `set_syscall_kernel_stack` and `arm_user_entry_cpu_base` (gdt.rs:249,
   syscall.rs:98, 114) with IF=1 and preemption on. Each reads the CPU index with RDTSCP, then
   writes that CPU's slot (TSS.RSP0, `CpuLocal.kstack_top`, `KERNEL_GS_BASE`). New user thread T
@@ -2201,6 +2219,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   masking IF across the descent and test-qemu at `-smp 4` under thread churn, would settle
   it. Fix: do the three writes inside `thread_enter`'s SCHED-held block (see kplat-o3).
   ownership, concurrency. High. **Fix.**
+  Fixed in `11128592`: the first descent arms under `SCHED`; fails without it: the setters'
+  debug assertion, which panicked `test-qemu` at the first user thread.
 - [ ] **kplat-d3** `kernel/src/arch/x86_64/idt.rs:662` — A vector-2 NMI (IST2) or a #DF (IST1)
   taken in ring 3 goes through `is_user_fault` to `user_fault` and `suspend_with_fault`. That
   parks the thread with its ExceptionFrame and context on the per-CPU IST stack, not on its own
@@ -2271,7 +2291,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `translate` on a fresh root. "Data race detected between non-atomic read (translate,
   paging.rs:482) and atomic read-modify-write (ensure_table compare_exchange, paging.rs:255)".
   Native run passed. soundness, opportunities. Medium. **Fix.**
-- [ ] **kplat-d8** `kernel/src/arch/x86_64/smp.rs:95` — `ArchSmp::init_this_cpu(index: u32)` is
+- [x] **kplat-d8** `kernel/src/arch/x86_64/smp.rs:95` — `ArchSmp::init_this_cpu(index: u32)` is
   safe and writes any value to IA32_TSC_AUX. Per-CPU accesses then index `static mut` arrays
   with `.add(idx)` guarded only by a `debug_assert`, which release builds drop (gdt.rs:143-146,
   255; syscall.rs:69). A caller passing an index of MAX_CPUS (8) or more, for example one that
@@ -2281,6 +2301,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   next syscall loads RSP from an out-of-bounds block. The only caller passes 0 (main.rs:265),
   and the AP path's `adopt_dense_index` is below MAX_CPUS by construction.
   Demonstrated by path, read end to end. No probe was run. opportunities. Medium. **Fix.**
+  Fixed in `ecb228ae`: `init_this_cpu` refuses an index past `MAX_CPUS`; fails without it:
+  `an_index_past_max_cpus_is_refused`.
 - [ ] **kplat-d9** `kernel/src/arch/x86_64/user_access.rs:109` — `copy_cstr_raw`'s loop runs
   `lodsb`/`stosb` before it compares the count with `max_len`. With `max_len` = 0 it writes one
   byte into a destination its contract says has zero writable bytes, then reports
@@ -2303,7 +2325,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `record_aperture` returned true, `try_new_borrowed` succeeded, and `map_object` panicked
   "ArchPaging::map_page returned Misaligned for a page-aligned per-page address". abi,
   ownership. Low. **Fix.**
-- [ ] **kplat-d11** `kernel/src/arch/x86_64/gdt.rs:18` — On the BSP, `gdt::init` (via
+- [x] **kplat-d11** `kernel/src/arch/x86_64/gdt.rs:18` — On the BSP, `gdt::init` (via
   `init_tables`, main.rs:117) indexes `GDTS`, `TSSES`, `DF_STACKS` and `NMI_STACKS` by
   `rdtscp_aux` before `init_this_cpu(0)` writes TSC_AUX (main.rs:265), so the SAFETY arguments
   rest on firmware leaving the reset default 0, with only a `debug_assert` on the bound. With
@@ -2315,7 +2337,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: QEMU resets TSC_AUX to 0 in every boot run. Writing TSC_AUX=0 at the top of
   `kernel_main` and booting firmware that leaves it nonzero, or a probe that writes it before
   `init_tables`, would settle it. abi, ownership, concurrency. Low. **Fix.**
-- [ ] **kplat-d12** `kernel/src/main.rs:775` — `plain_mapping` returns None through `.ok()?`
+  Fixed in `ecb228ae`: the BSP writes index 0 first thing; shown by a boot with `TSC_AUX` left at
+  3, which timed out after a kernel #PF with the old order and passes with the fix.
+- [x] **kplat-d12** `kernel/src/main.rs:775` — `plain_mapping` returns None through `.ok()?`
   when `map_page` fails at page k > 0 and does not unmap pages 0..k. `report_framebuffer_cost`
   unmaps only on Some (main.rs:733-737), so part of the second alias of the aperture, with
   different caching from the console's mapping, outlives the measurement, which the comment at
@@ -2323,6 +2347,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   of the system. Reachable only on page-table-frame OOM during boot.
   Unverified: by path, read end to end; a fault-injected `map_page` in a boot would settle it
   (main.rs is the binary and has no host tests). abi, ownership, opportunities. Low. **Fix.**
+  Fixed in `165dae67`: `plain_mapping` is `kvmap::map_device`, whose `map_all` undoes a partial
+  map; fails without the undo: `a_range_that_runs_out_of_page_tables_is_undone`, which drives
+  `map_all` through `VmapFrames` rather than `map_device`.
 - [ ] **kplat-d13** `kernel/src/main.rs:493` — The SAFETY arguments for the Limine response
   reads (main.rs:55, 493-496, 1108-1111) say a raw-pointer copy, or `static mut` itself, stops
   the optimiser folding the pre-Limine null. Neither does. The read survives only because each
@@ -2374,7 +2401,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kernel/docs/lock-ordering.md.
   Unverified: no host seam for the MMIO; a host test with a fake register pair driven in the
   interleaved order would settle it. concurrency. Low. **Fix.**
-- [ ] **kplat-d18** `kernel/src/tlb.rs:96` — `shootdown` reads `me` and `online` before
+- [x] **kplat-d18** `kernel/src/tlb.rs:96` — `shootdown` reads `me` and `online` before
   `preempt_disable` (line 113), then takes the sole-online-CPU fast path and invalidates
   "locally". If the thread migrates in between, it invalidates the new CPU's TLB and the CPU
   that holds the stale entry is never told. While APs come online, a BSP thread (for example
@@ -2383,7 +2410,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   exists only while the online set grows (bring-up, any future hotplug).
   Unverified: needs a host seam for the CPU id; moving the reads after `preempt_disable`
   would settle it. concurrency. Low. **Fix.**
-- [ ] **kplat-d19** `kernel/src/fbcon/mod.rs:447` — `with_console_waiting`, `yield_to_userspace`
+  Fixed in `dc2ad6ee`: preemption goes off before the shootdown reads its CPU; fails without it:
+  `pinned_cpu`'s assertion, in the host tests.
+- [x] **kplat-d19** `kernel/src/fbcon/mod.rs:447` — `with_console_waiting`, `yield_to_userspace`
   and `with_console` compute `me = current_cpu()+1` (fbcon/mod.rs:388-390, 446-450, 495-505)
   before taking CONSOLE, which masks IRQs. A thread migrated in between stores another CPU's
   number in HOLDER while it holds the lock. A `kprintln` on that other CPU then sees
@@ -2392,6 +2421,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   taking the re-entry shortcut. No memory is at stake.
   Unverified: needs a host seam for `current_cpu()`; reading the CPU after the lock is held
   would settle it. concurrency. Low. **Fix.**
+  Fixed in `dc2ad6ee`: `HOLDER` is read only with interrupts masked; fails without it:
+  `this_holder`'s assertion, which panicked `test-qemu` through `with_console_waiting`.
 - [ ] **kplat-d20** `kernel/src/arch/x86_64/serial.rs:50` — `SerialPort::new(base: u16)` is a
   pub safe `const fn`, and `init`/`write_byte`/`read_byte`/`set_loopback`/`enable_rx_interrupt`
   do `outb`/`inb` at base+0..7 for any base. The SAFETY arguments ("the COM1 base port, which
@@ -2401,7 +2432,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   unsafe block. No code outside serial.rs uses `SerialPort` today.
   Demonstrated by path, read end to end; grep outside serial.rs found no use. opportunities.
   Low. **Fix.**
-- [ ] **kplat-d21** `kernel/src/arch/x86_64/syscall.rs:114` — `set_syscall_kernel_stack(top: u64)`
+- [x] **kplat-d21** `kernel/src/arch/x86_64/syscall.rs:114` — `set_syscall_kernel_stack(top: u64)`
   and `ArchCpu::set_kernel_stack(top: u64)` (arch/cpu.rs:23, TSS.RSP0) are safe, yet the value
   becomes the stack pointer the hardware loads on the next syscall or ring-3 trap
   (syscall.rs:194, gdt.rs:248-258). Validity (a live, mapped kstack top that outlives the
@@ -2411,7 +2442,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   that arms a top whose KernelStack can drop while the thread is current makes the next trap
   push its frame into freed and reused frames, triggered from ring 3.
   Demonstrated by path, read end to end. opportunities. Low. **Fix.**
-- [ ] **kplat-d22** `kernel/src/arch/x86_64/regs.rs:339` — `cli`, `sti` (regs.rs:339, 353),
+  Fixed in `7be20327`: both setters take a `KernelStackTop`, which only a `KernelStack` makes;
+  structural.
+- [x] **kplat-d22** `kernel/src/arch/x86_64/regs.rs:339` — `cli`, `sti` (regs.rs:339, 353),
   `halt_loop`'s `cli;hlt` (cpu.rs:106) and `idle_halt`'s `sti;hlt` (cpu.rs:128) are
   `asm!(..., options(nomem))`, which lets the compiler move or merge memory accesses across the
   points where interrupts are masked or unmasked. An IF-only critical section around a plain
@@ -2423,6 +2456,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `window_nomem` read `*p` once before `cli` and reused it in the window (`movq (%rdi),%rax;
   cli; leaq 1(%rax),%rcx; movq %rcx,(%rdi); sti`). With the memory clobber, `window_mem`
   reloaded `*p` after `cli`. opportunities, soundness. Low. **Fix.**
+  Fixed in `6d8f188c`: no `cli`, `sti` or `hlt` is `nomem` (with `halt`'s, swept); fails without
+  it: `no_cli_sti_or_hlt_is_marked_nomem`.
 
 **Opportunities**
 
@@ -2615,7 +2650,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   failure path and the boot-time assert when the pool runs out (the release image already uses
   5 or 6 slots, the test image 7, io/ramdisk.rs:35-38). Depends on: nothing. ownership. Value
   low, effort small. **Plan**, in P5.
-- [ ] **kplat-o13** narrow: hardware stack pointers travel as `u64`: the TSS.RSP0 and syscall
+- [x] **kplat-o13** narrow: hardware stack pointers travel as `u64`: the TSS.RSP0 and syscall
   stack setters are safe fns taking any `u64`, and `fabricate_frame` is an `unsafe fn` whose
   contract is "top has 56 writable bytes below it", all three values coming from a KernelStack
   — 6 sites (`grep -rn 'set_syscall_kernel_stack\|set_kernel_stack('` finds 4 calls: sched.rs:
@@ -2630,6 +2665,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   {cpu.rs, x86_64/syscall.rs, x86_64/context.rs}. Closes: loading an arbitrary or stale RSP0 or
   syscall stack from safe code (kplat-d21). Depends on: nothing. abi, opportunities. Value low,
   effort small. **Fix.**
+  Finished in `7be20327`: `KernelStackTop`, and `KernelStack::fabricate` in place of the unsafe
+  `fabricate_frame` at its callers.
 - [ ] **kplat-o14** encapsulate: index/data port pairs (CMOS 0x70/0x71, IOAPIC IOREGSEL/IOWIN,
   PCI 0xCF8/0xCFC) driven by unlocked select-then-access helpers, with serialisation held by
   callers (`clock::SETTING` for RTC writes, "called once" for the RTC read, boot-only use for

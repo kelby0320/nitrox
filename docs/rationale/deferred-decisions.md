@@ -43,8 +43,10 @@ be read as the list of what is actually owed.
 
 **A CPU missing a required feature can die before it can say so — `TODO(cpu-feature-check)`.**
 The kernel requires RDTSCP, SMEP and SMAP, and checks SMEP and SMAP only in `paging_init`, after
-the console is up, and RDTSCP never. RDTSCP is the first thing `init_tables` runs, in
-`gdt::init`'s `this_cpu`, so a CPU without it (QEMU's `qemu64`) takes #UD with no IDT yet and
+the console is up, and RDTSCP never. A CPU with neither RDTSCP nor RDPID has no `IA32_TSC_AUX`,
+which `kernel_main` writes first thing, and its first RDTSCP is `gdt::init`'s `this_cpu`. QEMU's
+`qemu64` takes the write and then #UD at that RDTSCP (mapped from `-d int`, 2026-10-28); real
+hardware should take #GP at the write, unverified. Either way there is no IDT yet, and it
 triple-faults silently. A check alone cannot help there, as nothing can print before
 the console; it needs the console before `init_tables`, which costs the register dump a bad
 framebuffer descriptor gives today. Found reproducing an early-fault boot without SMAP
@@ -802,10 +804,11 @@ never got an open-item entry, so nothing has tracked it for three months; this e
 
 **That attribution does not survive re-checking, and this entry asserted it before checking.**
 The first draft said `KernelStack::new` needs a TLB shootdown because `drop` has one. It does not:
-`kstack.rs` argues, thirty lines below the install loop, that adding a mapping needs no cross-CPU
-invalidation on x86 — the VA is freshly allocated, so no CPU holds a cached translation for it,
-stale or otherwise. The premise holds: `kvmap`'s allocator is a bump pointer that **never reclaims
-VA**. x86 does not cache not-present translations, so there is nothing to invalidate. Linux does
+`kstack.rs` argues, beside the install, that adding a mapping needs no cross-CPU invalidation on
+x86 — the VA is fresh, or was shot down when its last stack dropped, so no CPU holds a cached
+translation for it, stale or otherwise. The premise holds: `kvmap` gives a range's VA back **only
+after its shootdown** (before 2026-10-28 it never reclaimed VA at all). x86 does not cache
+not-present translations, so there is nothing to invalidate. Linux does
 the same. So the install path is **ruled out**, and the earlier draft of this entry — plus a
 `TODO` marker placed on that loop — was wrong twice over: wrong about the mechanism, and written
 without reading the argument next to it.

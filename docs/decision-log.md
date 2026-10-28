@@ -36945,3 +36945,28 @@ repeat survey defects, and move into Part I with them. The calls:
   and a balanced tree is the maintainer's preference when the std port shows how many mappings a
   process makes. The question for then is `find_free_range`, which scans every VMA while libheap
   maps one per 64 KiB arena.
+
+## 2026-10-28 — Before Phase 7, Part I: the kernel vmap reuses VA, and the CPU index is bounded
+
+Groups K and L of the survey's triage, kernel memory and the per-CPU index (PR #402), made four
+decisions:
+
+- **The kernel vmap hands out VA only inside its window, and reuses it.** The window is the first
+  512 GiB of the 16 TiB region: the one PDPT `kvmap::init` links into the boot root before the
+  kernel template is snapshotted, so every address space shares it. Past it a mapping would be in
+  one root alone, which thread churn alone could reach (kmem-d1). One PDPT holds about 26M stacks
+  alive at once; `WINDOW_PDPTS` links more, at a page each at boot. A range given back is reused by
+  the next request of its size, and **only after its shootdown**, so an install still needs no
+  invalidation. Each range's free-list node is allocated with it, so giving VA back allocates
+  nothing under the vmap's lock. Device mappings stay permanent. Every vmap edit walks the boot
+  root, which is never freed, not the root a caller had (kmem-d4).
+- **An unmap is a value that shoots down before it frees.** `VmapFrames` and `Unmapped` drop in
+  the order clear, shoot down, free, give back, so no caller orders it by hand (kmem-o3, kmem-o4).
+  `map_vma` takes `&mut self`: only a space no CPU has loaded, the ELF loader's, unmaps without one.
+- **A CPU's kernel stack is set from a `KernelStackTop`**, which only a `KernelStack` makes, and
+  `KernelStack::fabricate` replaces the unsafe `fabricate_frame` at its callers (kplat-o13): the
+  setters cannot be handed an address that is not a stack's top (kplat-d21).
+- **The BSP writes its CPU index first thing in `kernel_main`, and no index reaches `MAX_CPUS` in
+  any build.** Firmware may leave `IA32_TSC_AUX` nonzero, and `gdt::init` read it before the BSP wrote it: a
+  boot with it left at 3 took a kernel #PF (kplat-d11). Every per-CPU array is indexed with the value unchecked, so the bound is
+  an `assert!`; it runs once a CPU (kplat-d8).

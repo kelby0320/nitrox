@@ -57,6 +57,10 @@ pub(crate) fn apic_of_dense(cpu: usize) -> Option<u32> {
     }
 }
 
+fn dense_index_ok(index: u32) -> bool {
+    (index as usize) < MAX_CPUS
+}
+
 /// The x86_64 [`ArchSmp`] implementation. Re-exported as `crate::arch::Smp`.
 pub struct X86Smp;
 
@@ -68,7 +72,7 @@ impl ArchSmp for X86Smp {
 
     #[cfg(not(test))]
     fn current_cpu() -> u32 {
-        // Reset-default 0, so the BSP reads 0 even before `init_this_cpu`.
+        // Meaningful only after `init_this_cpu`: firmware may leave the register nonzero.
         regs::rdtscp_aux()
     }
 
@@ -93,10 +97,15 @@ impl ArchSmp for X86Smp {
     }
 
     fn init_this_cpu(index: u32) {
+        // In a release build too: every per-CPU array is indexed with it, unchecked.
+        assert!(dense_index_ok(index), "dense CPU index {index} past MAX_CPUS");
+        #[cfg(not(test))]
         // SAFETY: IA32_TSC_AUX is architectural on every x86-64 CPU; writing the
         // logical index there only sets the value RDTSCP/RDPID return, leaving the
         // timestamp counter untouched. Ring-0 wrmsr.
-        unsafe { regs::wrmsr(MSR_TSC_AUX, index as u64) };
+        unsafe {
+            regs::wrmsr(MSR_TSC_AUX, index as u64)
+        };
     }
 
     unsafe fn send_ipi(target: u32, vector: u8) {
@@ -135,6 +144,20 @@ pub fn ap_cpu_init() {
 
 #[cfg(test)]
 mod tests {
+    /// Refused before `IA32_TSC_AUX`, from where every per-CPU array would be indexed with it.
+    #[test]
+    #[should_panic(expected = "past MAX_CPUS")]
+    fn an_index_past_max_cpus_is_refused() {
+        use crate::arch::smp::ArchSmp;
+        X86Smp::init_this_cpu(MAX_CPUS as u32);
+    }
+
+    #[test]
+    fn the_last_index_is_the_one_below_max_cpus() {
+        assert!(super::dense_index_ok(MAX_CPUS as u32 - 1));
+        assert!(!super::dense_index_ok(MAX_CPUS as u32));
+    }
+
     use super::*;
 
     #[test]

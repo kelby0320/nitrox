@@ -66,7 +66,7 @@ fn new_yields_empty_address_space_with_real_root() {
 #[test]
 fn map_single_page_installs_pte_translate_finds_it() {
     init_global_heap();
-    let asp = AddressSpace::new().expect("new must succeed");
+    let mut asp = AddressSpace::new().expect("new must succeed");
     let r = range(PAGE * 4, PAGE * 5);
     asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
@@ -83,7 +83,7 @@ fn map_single_page_installs_pte_translate_finds_it() {
 #[test]
 fn map_multi_page_installs_every_pte() {
     init_global_heap();
-    let asp = AddressSpace::new().expect("new must succeed");
+    let mut asp = AddressSpace::new().expect("new must succeed");
     let r = range(PAGE * 8, PAGE * 16);
     asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
@@ -103,12 +103,12 @@ fn map_multi_page_installs_every_pte() {
 #[test]
 fn map_then_unmap_removes_the_ptes() {
     init_global_heap();
-    let asp = AddressSpace::new().expect("new must succeed");
+    let mut asp = AddressSpace::new().expect("new must succeed");
     let r = range(PAGE * 4, PAGE * 8);
     asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
-    let removed = asp.unmap_covering(va(PAGE * 5)).expect("unmap must find covering vma");
-    assert_eq!(removed.range, r);
+    let removed = asp.unmap_at(va(PAGE * 5)).expect("unmap must find covering vma");
+    assert_eq!(removed.vma().unwrap().range, r);
     assert!(asp.is_empty());
 
     for i in 4..8 {
@@ -121,7 +121,7 @@ fn map_then_unmap_removes_the_ptes() {
 #[test]
 fn map_rejects_overlap_with_existing_vma() {
     init_global_heap();
-    let asp = AddressSpace::new().expect("new must succeed");
+    let mut asp = AddressSpace::new().expect("new must succeed");
     asp.map_vma(anon_box(range(PAGE * 4, PAGE * 8), Protection::WRITE | Protection::USER))
         .expect("first map must succeed");
 
@@ -144,7 +144,7 @@ fn no_way_of_mapping_reaches_the_top_page_of_the_user_half() {
     let top = USER_VIRT_END - PAGE;
     let below = range(top - PAGE, top);
     let last = range(top, USER_VIRT_END);
-    let asp = AddressSpace::new().unwrap();
+    let mut asp = AddressSpace::new().unwrap();
     assert!(matches!(asp.map_vma(anon_box(last, uprot())), Err((_, MapError::NotUserHalf))));
     assert!(matches!(asp.map_vma_lazy(anon_box(last, uprot())), Err((_, MapError::NotUserHalf))));
     let obj = into_obj(MemoryObject::try_new(PAGE as usize).unwrap());
@@ -157,7 +157,7 @@ fn no_way_of_mapping_reaches_the_top_page_of_the_user_half() {
 #[test]
 fn map_rejects_kernel_half_range() {
     init_global_heap();
-    let asp = AddressSpace::new().expect("new must succeed");
+    let mut asp = AddressSpace::new().expect("new must succeed");
     let r = VAddrRange::new(va(USER_VIRT_END - PAGE), va(USER_VIRT_END + PAGE)).unwrap();
     let err =
         asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect_err("kernel-half range must be rejected");
@@ -167,10 +167,10 @@ fn map_rejects_kernel_half_range() {
 #[test]
 fn unmap_on_address_with_no_vma_returns_none() {
     init_global_heap();
-    let asp = AddressSpace::new().expect("new must succeed");
-    assert!(asp.unmap_covering(va(PAGE * 100)).is_none());
+    let mut asp = AddressSpace::new().expect("new must succeed");
+    assert!(asp.unmap_at(va(PAGE * 100)).is_none());
     asp.map_vma(anon_box(range(PAGE * 4, PAGE * 8), Protection::WRITE | Protection::USER)).unwrap();
-    assert!(asp.unmap_covering(va(PAGE * 20)).is_none());
+    assert!(asp.unmap_at(va(PAGE * 20)).is_none());
     assert_eq!(asp.len(), 1);
 }
 
@@ -180,7 +180,7 @@ fn drop_tears_down_populated_address_space() {
     // otherwise exhaust the 16 MiB test heap.
     init_global_heap();
     for _ in 0..8 {
-        let asp = AddressSpace::new().expect("new must succeed");
+        let mut asp = AddressSpace::new().expect("new must succeed");
         for i in 0..4u64 {
             let start = (i * 8) * PAGE;
             asp.map_vma(anon_box(range(start, start + PAGE * 4), Protection::WRITE | Protection::USER))
@@ -203,13 +203,12 @@ fn uprot() -> Protection {
 #[test]
 fn unmapping_an_object_needs_no_room_for_frames_and_an_anonymous_mapping_does() {
     init_global_heap();
-    let asp = AddressSpace::new().unwrap();
+    let mut asp = AddressSpace::new().unwrap();
     let obj = into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap());
     asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).unwrap();
     asp.map_vma(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
-    let mut none = KVec::new();
-    assert!(matches!(asp.unmap_covering_deferred(va(PAGE * 5), &mut none), Ok(Some(_))));
-    assert_eq!(asp.unmap_covering_deferred(va(PAGE * 16), &mut none).err(), Some(2));
+    assert!(matches!(asp.unmap_covering(va(PAGE * 5), KVec::new()), Ok(Some(_))));
+    assert_eq!(asp.unmap_covering(va(PAGE * 16), KVec::new()).err().map(|(_, pages)| pages), Some(2));
 }
 
 #[test]
@@ -261,7 +260,7 @@ fn unmap_object_mapping_does_not_free_the_objects_frames() {
     let keep = obj.clone();
 
     asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
-    let removed = asp.unmap_covering(va(PAGE * 4)).expect("unmap must find the covering vma");
+    let removed = asp.unmap_at(va(PAGE * 4)).expect("unmap must find the covering vma");
     // SAFETY: `asp`'s root is the live page table this test built.
     assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_none());
     drop(removed);
@@ -389,7 +388,7 @@ fn unmap_file_mapping_keeps_the_objects_frames() {
     asp.map_file_page(va(PAGE * 4), &keep, frame);
     assert!(is_mapped(&asp, va(PAGE * 4)));
 
-    let removed = asp.unmap_covering(va(PAGE * 4)).expect("covering vma");
+    let removed = asp.unmap_at(va(PAGE * 4)).expect("covering vma");
     assert!(!is_mapped(&asp, va(PAGE * 4)), "PTE removed");
     drop(removed);
     assert_eq!(test_probe::file_object_destroys(), 0, "object still referenced");
@@ -415,7 +414,7 @@ fn a_writable_file_mapping_is_counted_while_its_vma_exists() {
     assert_eq!(fo().writable_maps(), 1, "a refused map leaves no count behind");
     asp.map_file(range(PAGE * 8, PAGE * 9), Protection::USER, obj.clone()).unwrap();
     assert_eq!(fo().writable_maps(), 1);
-    drop(asp.unmap_covering(va(PAGE * 4)).unwrap());
+    drop(asp.unmap_at(va(PAGE * 4)).unwrap());
     assert_eq!(fo().writable_maps(), 0);
     let asp2 = AddressSpace::new().unwrap();
     asp2.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
@@ -450,18 +449,20 @@ fn a_fault_on_a_page_another_cpu_just_mapped_is_a_retry_and_keeps_no_frame() {
 #[test]
 fn an_unmap_frees_an_anonymous_mappings_frames_and_never_an_objects() {
     init_global_heap();
-    let asp = AddressSpace::new().unwrap();
+    let mut asp = AddressSpace::new().unwrap();
     asp.map_vma(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
     let obj = into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap());
+    let keep = obj.clone();
     asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).unwrap();
-    let mut frames = KVec::new();
-    frames.try_reserve(8).unwrap();
-    asp.unmap_covering_deferred(va(PAGE * 5), &mut frames).unwrap();
-    assert!(frames.is_empty(), "an object's frames are the object's to free");
-    asp.unmap_covering_deferred(va(PAGE * 16), &mut frames).unwrap();
-    assert_eq!(frames.len(), 2);
+    let freed = heap::frames_freed_by_this_thread();
+    drop(asp.unmap_at(va(PAGE * 5)));
+    assert_eq!(heap::frames_freed_by_this_thread(), freed, "an object's frames are the object's to free");
+    drop(keep);
+    let freed = heap::frames_freed_by_this_thread();
+    drop(asp.unmap_at(va(PAGE * 16)));
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 2);
 
-    let held = AddressSpace::new().unwrap();
+    let mut held = AddressSpace::new().unwrap();
     held.map_vma(anon_box(range(PAGE * 16, PAGE * 19), uprot())).unwrap();
     let freed = heap::frames_freed_by_this_thread();
     drop(held);
@@ -530,8 +531,8 @@ fn dropping_a_partially_faulted_lazy_as_frees_only_backed_frames() {
     assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Write), FaultIn::Mapped);
     assert_eq!(asp.fault_in(va(PAGE * 6), FaultAccess::Write), FaultIn::Mapped);
 
-    let removed = asp.unmap_covering(va(PAGE * 5)).expect("covering vma");
-    assert_eq!(removed.range, r);
+    let removed = asp.unmap_at(va(PAGE * 5)).expect("covering vma");
+    assert_eq!(removed.vma().unwrap().range, r);
     assert!(asp.is_empty());
     for i in 4..8 {
         assert!(!is_mapped(&asp, va(PAGE * i)), "page {i} still mapped");
@@ -604,4 +605,44 @@ fn a_page_is_writable_executable_and_user_only_as_its_protection_says() {
         assert!(f(prot).contains(PageFlags::USER));
     }
     assert!(!f(Protection::WRITE).contains(PageFlags::USER), "a kernel mapping");
+}
+
+/// **A failed object map is shot down before its object comes back**: the caller may drop the
+/// object, and with it the frames another CPU may have cached through the pages mapped.
+#[test]
+fn a_failed_object_map_is_shot_down_before_its_object_comes_back() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    let obj = into_obj(MemoryObject::try_new(PAGE as usize * 4).unwrap());
+    // Two pages each side of 2 MiB: a fresh space's PDPT, PD and first PT, then a PT of its own.
+    let start = 0x20_0000 - 2 * PAGE;
+    let mut obj = obj;
+    for (tables, mapped) in [(0, 0), (3, 2)] {
+        crate::arch::fail_page_tables_after(Some(tables));
+        let shots = crate::tlb::shootdowns_by_this_thread().0;
+        let result = asp.map_object(range(start, start + 4 * PAGE), uprot(), obj);
+        crate::arch::fail_page_tables_after(None);
+        let (back, e) = result.unwrap_err();
+        assert_eq!(e, MapError::OutOfMemory);
+        let shot = crate::tlb::shootdowns_by_this_thread().0 - shots;
+        assert_eq!(shot, usize::from(mapped > 0), "{mapped} pages mapped first");
+        assert!(!is_mapped(&asp, va(start)) && !is_mapped(&asp, va(start + PAGE)), "rolled back");
+        obj = back;
+    }
+}
+
+#[test]
+fn an_unmap_is_shot_down_before_its_frames_or_its_object_are_freed() {
+    init_global_heap();
+    let mut asp = AddressSpace::new().unwrap();
+    asp.map_vma(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
+    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap()))
+        .unwrap();
+    for (at, frames) in [(PAGE * 16, 2), (PAGE * 4, 3)] {
+        let unmapped = asp.unmap_at(va(at)).unwrap();
+        let freed = heap::frames_freed_by_this_thread();
+        drop(unmapped);
+        assert_eq!(crate::tlb::shootdowns_by_this_thread().1, freed, "{at:#x}: none freed before it");
+        assert_eq!(heap::frames_freed_by_this_thread() - freed, frames, "{at:#x}");
+    }
 }

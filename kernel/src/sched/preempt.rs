@@ -120,6 +120,11 @@ pub fn preempt_disable() {
     preempt_irqs_restore(prev);
 }
 
+/// Whether preemption is off on this CPU, for an assertion: exact when it is.
+pub fn preemption_disabled() -> bool {
+    with_preempt_off(SchedState::this_cpu(), |c| c.load(Ordering::Relaxed) > 0)
+}
+
 /// Re-enable preemption (see [`preempt_disable`]); at depth zero, replays a reschedule that
 /// was skipped during the window. (If the thread is descheduled or migrates between the
 /// depth reaching zero and the replay, the replay's under-lock re-check makes it a no-op;

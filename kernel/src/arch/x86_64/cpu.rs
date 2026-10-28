@@ -38,8 +38,8 @@ impl ArchCpu for X86Cpu {
         ensure_smap_smep();
     }
 
-    fn set_kernel_stack(top: u64) {
-        gdt::set_kernel_stack(top);
+    fn set_kernel_stack(top: crate::mm::kstack::KernelStackTop) {
+        gdt::set_kernel_stack(top.get());
     }
 
     fn stop_the_machine() -> ! {
@@ -99,11 +99,10 @@ impl ArchCpu for X86Cpu {
         // TLB-shootdown IPI deadlocks every later shootdown (see `sched::leave_online`).
         crate::sched::leave_online();
         loop {
-            // SAFETY: `cli` and `hlt` are always valid in ring 0. Neither
-            // touches memory; both are allowed under the kernel's lock
-            // ordering since no locks are held at the call site.
+            // SAFETY: `cli` and `hlt` are always valid in ring 0, and allowed under the kernel's
+            // lock ordering since no locks are held at the call site.
             unsafe {
-                asm!("cli", "hlt", options(nomem, nostack, preserves_flags));
+                asm!("cli", "hlt", options(nostack, preserves_flags));
             }
         }
     }
@@ -114,10 +113,10 @@ impl ArchCpu for X86Cpu {
     }
 
     unsafe fn halt() {
-        // SAFETY: `hlt` is a ring-0 instruction with no memory side effects;
-        // it parks the CPU until the next interrupt. The caller owns the
+        // SAFETY: `hlt` is a ring-0 instruction; it parks the CPU until the next interrupt,
+        // whose handler may change memory, hence not `nomem`. The caller owns the
         // interrupt-flag state that governs wake-up (see the trait contract).
-        unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
+        unsafe { asm!("hlt", options(nostack, preserves_flags)) };
     }
 
     unsafe fn idle_halt() {
@@ -125,7 +124,7 @@ impl ArchCpu for X86Cpu {
         // until after the `hlt` retires, so the CPU parks with IF=1 yet cannot miss a wake
         // racing the enable. Unlike bare `halt` it does not trust the caller's IF: a CPU that
         // parked with IF=0 would sleep forever.
-        unsafe { asm!("sti; hlt", options(nomem, nostack, preserves_flags)) };
+        unsafe { asm!("sti; hlt", options(nostack, preserves_flags)) };
     }
 
     fn interrupts_enabled() -> bool {
