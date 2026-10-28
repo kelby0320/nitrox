@@ -206,6 +206,8 @@ impl Drop for ObjectRef {
 /// `ptr` must be the last live reference to an object of type `ty`,
 /// originally produced by `KBox::<Concrete>::into_raw`.
 unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
+    #[cfg(test)]
+    assert!(!crate::libkern::lockrank::sched_held_by_this_thread(), "a {ty:?} destroyed under SCHED");
     match ty {
         KObjectType::Process => {
             // SAFETY: last ref to a `Process` produced by KBox::into_raw.

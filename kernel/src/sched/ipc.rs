@@ -643,11 +643,13 @@ mod tests {
         let fs = crate::object::Producer::FsServer { reg: reg.clone(), suffix: crate::libkern::KString::new() };
         let (lookup, fill, file) = outstanding(&reg, fs);
         test_probe::reset();
+        // The fill's reference the last, so its drop, outside `SCHED`, destroys the file.
+        drop(file);
         drop(server_end);
         assert!(failed(&lookup) && failed(&fill), "the fill's faulter would wait for ever");
-        drop((reg, file, lookup, fill));
-        let destroyed = (test_probe::userspace_server_reg_destroys(), test_probe::file_object_destroys());
-        assert_eq!(destroyed, (1, 1), "the registration and the file, held by the fill");
+        assert_eq!(test_probe::file_object_destroys(), 1, "the file, held by the fill alone");
+        drop((reg, lookup, fill));
+        assert_eq!(test_probe::userspace_server_reg_destroys(), 1, "the registration, held by the file");
     }
 
     /// **Two binds of one endpoint share one registration**, which every reply routes to.
