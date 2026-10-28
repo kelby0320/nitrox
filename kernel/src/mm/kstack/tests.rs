@@ -3,6 +3,7 @@ use crate::arch::Paging;
 use crate::arch::paging::ArchPaging;
 use crate::mm::PhysAddr;
 use crate::mm::addr_space::AddressSpace;
+use crate::mm::heap;
 use crate::mm::test_support::init_global_heap;
 
 fn translate(root: PhysAddr, va: VirtAddr) -> Option<PhysAddr> {
@@ -10,6 +11,7 @@ fn translate(root: PhysAddr, va: VirtAddr) -> Option<PhysAddr> {
     unsafe { Paging::translate(root, va) }
 }
 
+/// Writable, not executable and the kernel's alone, under every root.
 #[test]
 fn a_stack_is_mapped_under_every_root_above_an_unmapped_guard() {
     init_global_heap();
@@ -19,10 +21,11 @@ fn a_stack_is_mapped_under_every_root_above_an_unmapped_guard() {
     for root in [before.root(), after.root()] {
         for i in 0..KERNEL_STACK_PAGES as u64 {
             let v = VirtAddr::new(stack.base().as_u64() + i * PAGE_SIZE as u64);
-            assert!(translate(root, v).is_some(), "stack page {i}");
+            // SAFETY: a read-only walk of a root this test holds.
+            let ok = unsafe { crate::arch::mapped_with(root, v, PageFlags::WRITABLE | PageFlags::NO_EXECUTE) };
+            assert!(ok, "stack page {i}");
         }
         assert!(translate(root, stack.guard_page()).is_none(), "the guard page");
-        assert!(translate(root, stack.top()).is_none(), "the page above the top");
     }
 }
 
@@ -50,8 +53,10 @@ fn a_stack_outlives_the_address_space_it_was_made_under() {
     let stack = KernelStack::new().unwrap();
     let other = AddressSpace::new().unwrap();
     drop(made_under);
-    let base = stack.base();
-    assert!(translate(other.root(), base).is_some());
+    assert!(translate(other.root(), stack.base()).is_some());
+    let (shots, freed) = (crate::tlb::shootdowns_by_this_thread().0, heap::frames_freed_by_this_thread());
     drop(stack);
-    assert!(translate(other.root(), base).is_none(), "unmapped under every root");
+    // Not by its VA, which another test's stack may already have.
+    assert_eq!(crate::tlb::shootdowns_by_this_thread(), (shots + 1, freed), "shot down before a frame is freed");
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, KERNEL_STACK_PAGES);
 }

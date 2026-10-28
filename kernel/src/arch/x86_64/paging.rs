@@ -273,6 +273,17 @@ pub fn fail_page_tables_after(n: Option<usize>) {
     TABLES_LEFT.with(|left| left.set(n));
 }
 
+/// Whether `virt` is a 4 KiB page under `root` mapped with `flags` and nothing else.
+///
+/// # Safety
+/// As [`walk_to_pt`].
+#[cfg(test)]
+pub unsafe fn mapped_with(root: PhysAddr, virt: VirtAddr, flags: PageFlags) -> bool {
+    // SAFETY: forwarded; `pt_index` masks to the table's 512 entries.
+    let leaf = unsafe { walk_to_pt(root, virt).map(|pt| *pt.add(pt_index(virt))) };
+    leaf.is_some_and(|pte| pte.0 & !PTE_ADDR_MASK == PTE_PRESENT | flags_to_pte_bits(flags))
+}
+
 #[cfg(test)]
 std::thread_local! {
     /// A test's stand-in for another CPU, run once between reading a slot empty and linking it.

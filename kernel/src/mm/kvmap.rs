@@ -267,6 +267,11 @@ impl<const N: usize> VmapFrames<N> {
     pub fn end(&self) -> VirtAddr {
         page(self.base.as_u64(), N as u64)
     }
+
+    /// The first reserved byte: the guard pages' base, or [`Self::base`] with none.
+    pub fn guard_base(&self) -> VirtAddr {
+        self.slot.as_ref().map_or(self.base, |s| VirtAddr::new(s.start))
+    }
 }
 
 impl<const N: usize> Drop for VmapFrames<N> {

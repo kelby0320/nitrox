@@ -78,7 +78,7 @@ impl KernelStack {
 
     /// Base of the guard page; any access to it page-faults.
     pub fn guard_page(&self) -> VirtAddr {
-        VirtAddr::new(self.base().as_u64() - PAGE_SIZE as u64)
+        self.pages.guard_base()
     }
 }
 
