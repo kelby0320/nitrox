@@ -154,9 +154,8 @@ libheap is not simply an `impl GlobalAlloc`.**
 
 - Small `dealloc` returns the slot to its size-class freelist; the arena stays
   mapped. **Arenas, once mapped, are retained** for the process lifetime (empty-arena
-  unmapping is *not* done in v1) — mirroring the kernel kstack's "bump vmap, no
-  freelist" pragmatism (`docs/architecture/memory-management.md`); userspace heap
-  arena churn is low and a whole-arena reclaimer is a local later addition.
+  unmapping is *not* done in v1): userspace heap arena churn is low, and a
+  whole-arena reclaimer is a local later addition.
 - Large `dealloc` **unmaps** its dedicated `MemoryObject` immediately — the case
   where prompt reclamation matters.
 - All backing memory is reclaimed unconditionally at process exit (the kernel tears

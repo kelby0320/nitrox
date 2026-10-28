@@ -2339,7 +2339,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `init_tables`, would settle it. abi, ownership, concurrency. Low. **Fix.**
   Fixed in `ecb228ae`: the BSP writes index 0 first thing; shown by a boot with `TSC_AUX` left at
   3, which timed out after a kernel #PF with the old order and passes with the fix.
-- [ ] **kplat-d12** `kernel/src/main.rs:775` — `plain_mapping` returns None through `.ok()?`
+- [x] **kplat-d12** `kernel/src/main.rs:775` — `plain_mapping` returns None through `.ok()?`
   when `map_page` fails at page k > 0 and does not unmap pages 0..k. `report_framebuffer_cost`
   unmaps only on Some (main.rs:733-737), so part of the second alias of the aperture, with
   different caching from the console's mapping, outlives the measurement, which the comment at
@@ -2347,6 +2347,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   of the system. Reachable only on page-table-frame OOM during boot.
   Unverified: by path, read end to end; a fault-injected `map_page` in a boot would settle it
   (main.rs is the binary and has no host tests). abi, ownership, opportunities. Low. **Fix.**
+  Fixed in `165dae67`: `plain_mapping` is `kvmap::map_device`, whose `map_all` undoes a partial
+  map; fails without the undo: `a_range_that_runs_out_of_page_tables_is_undone`, which drives
+  `map_all` through `VmapFrames` rather than `map_device`.
 - [ ] **kplat-d13** `kernel/src/main.rs:493` — The SAFETY arguments for the Limine response
   reads (main.rs:55, 493-496, 1108-1111) say a raw-pointer copy, or `static mut` itself, stops
   the optimiser folding the pre-Limine null. Neither does. The read survives only because each

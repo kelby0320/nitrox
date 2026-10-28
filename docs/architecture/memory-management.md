@@ -626,11 +626,9 @@ management story.
   live PML4 *before* the `init_kernel_template` snapshot, at boot
   (`WINDOW_PDPTS`): the immutable-post-boot rule for kernel-half PML4
   entries makes late additions impossible without visiting every AS.
-- Kernel vmap allocator has no freelist; `KernelStack::Drop`
-  reclaims frames but leaks the vmap region. Negligible at Phase 1
-  churn; revisit if it ever isn't.
-- `KernelStack` has no production consumer yet — threading lands
-  in a later slice.
+- The vmap reuses a range only for a request of the same size, and
+  ranges given back never coalesce. Only kernel stacks give VA back in
+  production, so the cursor grows with the most stacks alive at once.
 - ELF loader handles **static** binaries only: `ET_DYN` (PIE) and
   `PT_INTERP` (dynamic linking) are rejected. PIE needs base
   randomization; dynamic linking needs a userspace `ld.so`

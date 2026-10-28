@@ -2103,7 +2103,7 @@ Found 11, refuted by a boot 0, reported 11.
   that restricts a handle to MAP_WRITE and maps with `rights = 0` would settle it. Fix: always
   require MAP_READ for any mapping. Architecture. Medium. **Fix**, as kobj-8.
   Fixed in `48cecf0b`, as kobj-8; fails without it: boot-probe's `map_needs_read_test`.
-- [ ] **kmem-26** `kernel/src/mm/kvmap.rs:55` — kernel-stack virtual addresses are never reclaimed:
+- [x] **kmem-26** `kernel/src/mm/kvmap.rs:55` — kernel-stack virtual addresses are never reclaimed:
   `vmap` is a bump allocator and `KernelStack::Drop` unmaps only the leaves. Thread churn
   therefore (a) retains a page-table frame for every 2 MiB of vmap (about 102 stacks) forever, and
   (b) after about 26.8M stacks crosses the one PML4 slot whose PDPT is shared via the kernel
@@ -2121,6 +2121,10 @@ Found 11, refuted by a boot 0, reported 11.
   was visible in a second AddressSpace (true). After bumping `VMAP_NEXT` to the 512 GiB edge, a
   stack at 0xffffc08000000000 was mapped in its own AS (true) but not in a fresh AS (false); the
   count needed to get there was 26843545 stacks. Architecture. Medium. **Later**, as kmem-9.
+  Fixed in `165dae67`, as kmem-9 and kmem-d1: a freed stack's VA is reused, so the cursor and its
+  page tables grow only with the stacks alive at once; fails without it:
+  `the_last_page_the_vmap_hands_out_is_mapped_under_every_root`,
+  `a_dropped_range_gives_its_va_to_the_next_of_its_size`.
 - [x] **kmem-27** `kernel/src/mm/elf.rs:241` — PT_LOAD `p_memsz` has no cap: `map_load_segment`
   eagerly allocates and zeroes a frame for every page with `map_vma`, under the AS spinlock,
   inside `sys_process_spawn`, which runs with IF masked. This is the unpreemptable zeroing loop
