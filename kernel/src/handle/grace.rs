@@ -193,10 +193,9 @@ mod tests {
     /// **A reader and a closer never both miss the other**: x86 lets a store pass a later load,
     /// so without both fences a close can free what a reader holds.
     #[test]
-    #[cfg_attr(miri, ignore = "a million rounds")]
     fn a_reader_and_a_closer_never_both_miss() {
         use std::sync::atomic::{AtomicBool, AtomicU32};
-        const ROUNDS: u32 = 1_000_000;
+        const ROUNDS: u32 = if cfg!(miri) { 300 } else { 1_000_000 };
         let t = GraceTracker::new();
         let (start, read, checked) = (AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0));
         let (published, seen, past) = (AtomicBool::new(true), AtomicBool::new(false), AtomicBool::new(false));

@@ -59,6 +59,7 @@ fn a_block_map_the_page_cache_cannot_use_is_refused() {
         (&[(0, 100, 2), (2, 500, 2)], false, "a boundary inside a page"),
         (&[(0, 100, 3)], false, "a run ending inside a page"),
         (&[(1, 100, 4)], false, "a run starting inside one"),
+        (&[(3, 100, 0), (0, 200, 4)], true, "a run of no blocks, wherever it starts"),
     ] {
         assert_eq!(used(&body(1024, runs)), taken, "{what}");
     }

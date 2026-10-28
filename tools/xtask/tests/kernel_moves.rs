@@ -43,7 +43,8 @@ fn a_lookup_for_transfer_is_a_copy_and_a_move_is_a_claim() {
     let (mut copies, mut moves) = (0, 0);
     for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
-        for call in calls(&text, ".lookup(").into_iter().filter(|c| c.contains("TRANSFER")) {
+        let lookups = calls(&text, ".lookup(").into_iter().chain(calls(&text, "lookup_typed("));
+        for call in lookups.filter(|c| c.contains("TRANSFER")) {
             copies += 1;
             assert!(call.contains("DUPLICATE"), "{}: a move by lookup: {call}", path.display());
         }

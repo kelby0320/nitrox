@@ -1,6 +1,5 @@
-//! A send's delivery, once its message and the handles it moves are taken in: into the peer's
-//! ring, or, on a userspace server's kernel end, as a forwarded reply. The handles close only once
-//! the message is committed; a send that fails drops its claims, which give them back.
+//! A send's delivery: into the peer's ring, or as a reply on a server's kernel end. The handles it
+//! moves close only once the message is committed; a failed send's claims give them back.
 
 use super::*;
 

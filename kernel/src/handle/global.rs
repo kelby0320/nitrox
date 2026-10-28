@@ -135,7 +135,7 @@ pub fn close_all_owned_by(pid: u32) -> usize {
 mod tests {
     use super::*;
 
-    /// Refused in every build, not only where `debug_assert` runs.
+    /// Refused before init; host tests run in debug, so the release check bites under `--release`.
     #[test]
     #[should_panic(expected = "before init")]
     fn the_table_is_refused_before_init() {

@@ -1137,7 +1137,7 @@ fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
 /// leave its process, so `NoAccess` without `TRANSFER`. A direct bind gives the object away
 /// (every resolve mints a handle to it), as an IPC send and a spawn grant do; `init`'s
 /// system-control object carries no `TRANSFER` so it cannot leave `init`. A **userspace-server**
-/// bind needs no right: the kernel keeps the endpoint.
+/// bind needs no right: the kernel keeps the endpoint. A bind is a copy: TODO(direct-bind-copy).
 fn direct_bindable(rights: Rights) -> Result<(), KError> {
     if rights.contains(Rights::TRANSFER) { Ok(()) } else { Err(KError::NoAccess) }
 }

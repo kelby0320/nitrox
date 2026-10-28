@@ -1768,6 +1768,16 @@ disk that is not removable. An internal disk is partitioned by `nxinstall`, whic
 table again, as the hub thread does a stick's. **Trigger**: a second internal disk someone wants to
 use without a reboot.
 
+**A direct bind is a copy that needs no `DUPLICATE` — `TODO(direct-bind-copy)`.** `sys_ns_bind`
+binds a handle directly with `TRANSFER` alone (`direct_bindable`), and the binder keeps its handle,
+so the object then has two holders, which is a copy. The rule for moves (2026-10-28,
+`handle-system.md` § Moves) says a copy needs `DUPLICATE` too, so a supervisor holding a
+`TRANSFER`-only handle could bind it and then move it. A bind gave the object away by the earlier
+decision, and only a supervisor holding `BIND_NAMESPACE` binds. Found by PR #403's review. Deferred
+by the maintainer: asking for `DUPLICATE` changes what a supervisor may bind, and every in-tree
+direct bind must be checked first. **Trigger**: the syscall surface's pass in Part E, or a bind
+found copying a handle its holder could not duplicate.
+
 **ext4 with blocks smaller than a page — `TODO(ext4-subpage-runs)`.** The kernel fills a page as one
 device range from the page's first block, and writes it back the same way, so a page must lie
 within one run. FAT's server makes that so by refusing small clusters; **`fs-server-ext4` does not
