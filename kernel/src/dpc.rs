@@ -69,7 +69,23 @@ pub fn init() -> Result<(), AllocError> {
 
 /// Queue `dpc` to run at the next [`run_pending`]; idempotent. Safe to call from IRQ context.
 pub fn enqueue(dpc: &Dpc) {
+    #[cfg(test)]
+    ENQUEUED.with(|e| e.borrow_mut().push(dpc as *const Dpc as usize));
     enqueue_into(&DPC_QUEUE, dpc);
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Each `Dpc` this thread passed to [`enqueue`]: other tests' threads initialise and drain the
+    /// one queue meanwhile, and a `Dpc` already queued is not queued again.
+    static ENQUEUED: core::cell::RefCell<std::vec::Vec<usize>> =
+        const { core::cell::RefCell::new(std::vec::Vec::new()) };
+}
+
+/// The address of each `Dpc` this thread passed to [`enqueue`] since it last asked, then forgotten.
+#[cfg(test)]
+pub fn take_enqueued() -> std::vec::Vec<usize> {
+    ENQUEUED.with(|e| core::mem::take(&mut *e.borrow_mut()))
 }
 
 /// Run every pending DPC, looping until the queue is empty so a DPC that enqueues another is

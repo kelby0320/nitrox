@@ -12,6 +12,11 @@ pub(super) fn clock() -> u64 {
     })
 }
 
+/// Set this test's port clock, which its next read moves on from.
+fn set_clock(ns: u64) {
+    NOW.with(|now| now.set(ns));
+}
+
 #[test]
 fn every_op_has_its_command_and_nothing_else_does() {
     use crate::io::irp::IrpOp;
@@ -360,4 +365,79 @@ fn a_poll_of_a_disk_given_up_waits_for_nothing() {
     let before = clock();
     assert_eq!(poll_disk(&d), None);
     assert!(clock() - before < POLL_TIMEOUT_NS, "waited {} ms", (clock() - before) / 1_000_000);
+}
+
+/// **An interrupt queues the fault DPC on a new fault and the drain DPC on a retire**, and neither
+/// otherwise: the first wakes the watch thread, the second issues the command queued behind. Every
+/// interrupt queues the one that signals the disk's interrupt object.
+#[test]
+fn an_interrupt_queues_the_fault_dpc_on_a_fault_and_the_drain_dpc_on_a_retire() {
+    let addr = |dpc: &Dpc| dpc as *const Dpc as usize;
+    let (fault, drain, intr) = (addr(&AHCI_FAULT_DPC), addr(&AHCI_DRAIN_DPC), addr(&AHCI_INTR_DPC));
+    let (_regs, d) = fake_disk();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
+    submit(&mut first, ctx(&d));
+    submit(&mut second, ctx(&d));
+    crate::dpc::take_enqueued();
+    on_interrupt(&d);
+    let queued = crate::dpc::take_enqueued();
+    assert!(!queued.contains(&drain) && !queued.contains(&fault), "a command running yet");
+    assert!(queued.contains(&intr));
+    write32(d.port_base, PX_CI, 0);
+    on_interrupt(&d);
+    let queued = crate::dpc::take_enqueued();
+    assert!(queued.contains(&drain), "a retire, with a command queued behind it");
+    assert!(!queued.contains(&fault) && queued.contains(&intr));
+    write32(d.port_base, PX_IS, PXIE_TFEE);
+    write32(d.port_base, PX_TFD, 0x51);
+    on_interrupt(&d);
+    let queued = crate::dpc::take_enqueued();
+    assert!(queued.contains(&fault), "a task file error");
+    assert!(!queued.contains(&drain) && queued.contains(&intr), "and nothing retired");
+    on_interrupt(&d);
+    assert!(!crate::dpc::take_enqueued().contains(&fault), "a fault reported already");
+    crate::dpc::run_pending();
+}
+
+/// **A command's device time runs from its issue to its retire**, whichever way it retires: by an
+/// interrupt, a polled wait or a recovery. Issued at 1,000 s and retired 5 s on.
+#[test]
+fn a_commands_device_time_runs_from_its_issue_to_its_retire() {
+    use crate::io::stats::IoStats;
+    const ISSUE: u64 = 1_000_000_000_000;
+    const ON_DEVICE: u64 = 5_000_000_000;
+    for way in ["interrupt", "polled", "recovered"] {
+        static STATS: IoStats = IoStats::new();
+        let before = STATS.record_for(0, 0).busy_ns;
+        let (_regs, d) = fake_disk();
+        d.counted.attach_static(&STATS);
+        let frag = PhysFrag { base: 0x10_0000, len: 512 };
+        let mut irp = read_irp(&frag);
+        set_clock(ISSUE);
+        submit(&mut irp, ctx(&d));
+        set_clock(ISSUE + ON_DEVICE);
+        match way {
+            "interrupt" => {
+                write32(d.port_base, PX_CI, 0);
+                on_interrupt(&d);
+            }
+            "polled" => {
+                write32(d.port_base, PX_CI, 0);
+                assert_eq!(settle_polled(&d, true), Some(true));
+            }
+            _ => {
+                write32(d.port_base, PX_IS, PXIE_TFEE);
+                write32(d.port_base, PX_TFD, 0x51);
+                on_interrupt(&d);
+                let taken = claim(&d, 0, false).expect("a reported fault is claimed");
+                write32(d.port_base, PX_CI, 0);
+                write32(d.port_base, PX_TFD, 0x50);
+                assert!(recover(&d, taken));
+            }
+        }
+        crate::dpc::run_pending();
+        let busy = STATS.record_for(0, 0).busy_ns - before;
+        assert!((ON_DEVICE..ON_DEVICE + 1_000_000_000).contains(&busy), "{way}: {busy} ns on the device");
+    }
 }
