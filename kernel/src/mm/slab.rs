@@ -16,7 +16,8 @@
 //!
 //! The descriptor of any object `p` is at `(p as usize) & SLAB_MASK`, because the buddy hands out
 //! `SLAB_SIZE`-aligned pages and the descriptor starts each. `kfree` reads `desc.owner` to find
-//! the cache, or the large-allocation sentinel, with no external table.
+//! the cache, or the large-allocation sentinel, with no external table. A page-aligned `p` is the
+//! exception: a large allocation at `SLAB_SIZE` alignment, its descriptor the page below.
 //!
 //! ## Scope
 //!
@@ -325,10 +326,10 @@ fn size_class_index(min_size: usize) -> Option<usize> {
 /// `align > SLAB_SIZE`).
 ///
 /// `kmalloc(0, ...)` returns a non-null aligned sentinel that must never be dereferenced;
-/// passing it to [`kfree`] is harmless.
+/// passing it to [`kfree`] is not allowed.
 pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
     if size == 0 {
-        // ZST convention: a non-null aligned sentinel; `kfree` treats it as a no-op.
+        // ZST convention: a non-null aligned sentinel, which `KBox` and `KVec` never free.
         return align.max(1) as *mut u8;
     }
     if align > SLAB_SIZE {
@@ -383,7 +384,7 @@ pub unsafe fn kfree(ptr: *mut u8) {
         // SAFETY: under Miri every `kmalloc` came from `miri_heap::alloc`; the caller gives it back.
         return unsafe { miri_heap::free(ptr) };
     }
-    let desc = ((ptr as usize) & SLAB_MASK) as *mut SlabDescriptor;
+    let desc = descriptor_of(ptr);
     // SAFETY: every non-null pointer `kmalloc` returns lies in a buddy-owned page starting with
     // a valid SlabDescriptor (non-null `owner` for a slab, null for a large allocation). The ZST
     // sentinel is not such a pointer, so the caller must not free one; `KBox` / `KVec` give
@@ -399,6 +400,14 @@ pub unsafe fn kfree(ptr: *mut u8) {
     let cache = unsafe { &*owner };
     // SAFETY: `ptr` came from this cache's `alloc`, as its descriptor's `owner` says.
     unsafe { cache.free(ptr) };
+}
+
+/// The descriptor of `ptr`, from [`kmalloc`]: the page below a page-aligned object, only ever a
+/// [`large_alloc`] at `SLAB_SIZE` alignment, and otherwise the start of its own page.
+fn descriptor_of(ptr: *mut u8) -> *mut SlabDescriptor {
+    let page = (ptr as usize) & SLAB_MASK;
+    let page = if page == ptr as usize { page - SLAB_SIZE } else { page };
+    page as *mut SlabDescriptor
 }
 
 /// Allocate a buddy block holding `size`/`align` plus the descriptor header; returns the pointer
@@ -436,8 +445,8 @@ fn large_alloc<P: BuddyPager>(size: usize, align: usize, pager: &P) -> *mut u8 {
 
 /// Free a large allocation from [`large_alloc`].
 fn large_free<P: BuddyPager>(ptr: *mut u8, pager: &P) {
-    let page0 = (ptr as usize) & SLAB_MASK;
-    let desc = page0 as *mut SlabDescriptor;
+    let desc = descriptor_of(ptr);
+    let page0 = desc as usize;
     // SAFETY: large-alloc invariant — descriptor at byte 0 of the first
     // page of the block.
     let total = unsafe { (*desc).obj_size as usize };
@@ -737,6 +746,38 @@ mod tests {
         assert!(!fits.is_null());
         large_free(fits, &pager);
         assert!(large_alloc(PAGE_SIZE << crate::mm::buddy::MAX_ORDER, 8, &pager).is_null(), "exactly 4 MiB");
+    }
+
+    #[test]
+    fn a_page_aligned_allocation_is_freed_whole() {
+        crate::mm::test_support::init_global_heap();
+        for size in [64, PAGE_SIZE, 3 * PAGE_SIZE] {
+            let p = kmalloc(size, SLAB_SIZE);
+            assert!(!p.is_null(), "{size} bytes");
+            assert_eq!(p as usize % SLAB_SIZE, 0, "{size} bytes");
+            // SAFETY: `kmalloc` gave `size` writable bytes at `p`.
+            unsafe { p.write_bytes(0, size) };
+            let order = BuddyAllocator::order_for_size(SLAB_SIZE + size);
+            let freed = crate::mm::heap::frames_freed_by_this_thread();
+            // SAFETY: `p` came from `kmalloc` and is not used again.
+            unsafe { kfree(p) };
+            assert_eq!(crate::mm::heap::frames_freed_by_this_thread() - freed, 1 << order, "{size} bytes");
+        }
+    }
+
+    #[test]
+    fn a_large_allocation_finds_its_descriptor_at_every_alignment() {
+        let (_mem, pager) = make_world(PAGE_SIZE * 64);
+        for align in [8, 64, 1024, SLAB_SIZE / 2, SLAB_SIZE] {
+            let p = large_alloc(64, align, &pager);
+            assert!(!p.is_null(), "{align}");
+            let desc = descriptor_of(p);
+            // SAFETY: `desc` is the allocation's descriptor, which the test owns.
+            let (owner, size) = unsafe { ((*desc).owner, (*desc).obj_size as usize) };
+            assert!(owner.is_null(), "{align}");
+            assert!(desc as usize + size >= p as usize + 64, "{align}: the block holds the object");
+            large_free(p, &pager);
+        }
     }
 
     #[test]
