@@ -14,7 +14,7 @@ use crate::arch::smp::MAX_CPUS;
 use crate::arch::x86_64::regs;
 
 /// Dense index of the running CPU (its GDT/TSS slot), read via `RDTSCP`; an AP sets it
-/// *before* calling [`init`].
+/// *before* calling [`init`]. Nothing checks for RDTSCP first: TODO(cpu-feature-check).
 fn this_cpu() -> usize {
     let cpu = regs::rdtscp_aux() as usize;
     debug_assert!(cpu < MAX_CPUS, "cpu index out of range");

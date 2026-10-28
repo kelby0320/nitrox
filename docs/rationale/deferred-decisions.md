@@ -41,6 +41,16 @@ be read as the list of what is actually owed.
 
 **KASLR (kernel image ASLR).** The kernel image is loaded at a fixed higher-half address. User-space ASLR is implemented (28 bits of entropy for ELF, stack, and mmap arena). Kernel ASLR is a defense-in-depth measure against kernel-mode exploits. Not initially. Trigger: a security hardening pass after the system is mature.
 
+**A CPU missing a required feature can die before it can say so — `TODO(cpu-feature-check)`.**
+The kernel requires RDTSCP, SMEP and SMAP, and checks SMEP and SMAP only in `paging_init`, after
+the console is up, and RDTSCP never. RDTSCP is the first thing `init_tables` runs, in
+`gdt::init`'s `this_cpu`, so a CPU without it (QEMU's `qemu64`) takes #UD with no IDT yet and
+triple-faults silently. A check alone cannot help there, as nothing can print before
+the console; it needs the console before `init_tables`, which costs the register dump a bad
+framebuffer descriptor gives today. Found reproducing an early-fault boot without SMAP
+(2026-10-27). Trigger: a report of a silent boot on an older machine, or the arch layer's next
+change to the boot order.
+
 ### Power management
 
 **Phase 2 ACPI (ACPICA integration via FFI).** Phase 1 (pure Rust ACPI table parsing, no AML) ships first. ACPICA integration is deferred until needed. See [`why-phased-acpi.md`](why-phased-acpi.md). Triggers: laptop targeting, graceful S5 shutdown requirement, AML-only device support, CPU power management beyond `hlt`, GPE handling.
