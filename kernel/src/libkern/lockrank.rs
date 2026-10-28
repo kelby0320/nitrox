@@ -176,7 +176,7 @@ pub fn classify(rank: LockRank, held: &[u8], taken: Taken) -> Acquisition {
 #[cfg(all(debug_assertions, not(test)))]
 pub use tracker::{IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing};
 
-/// Release builds and host tests: every hook vanishes.
+/// Release builds: every hook vanishes. Host tests: each thread counts the locks it holds.
 #[cfg(not(all(debug_assertions, not(test))))]
 mod inert {
     use super::LockRank;
@@ -186,9 +186,26 @@ mod inert {
     pub struct IrqScope;
 
     #[inline(always)]
-    pub fn acquired(_rank: LockRank, _taken: super::Taken) {}
+    pub fn acquired(_rank: LockRank, _taken: super::Taken) {
+        #[cfg(test)]
+        HELD.with(|h| h.set(h.get() + 1));
+    }
     #[inline(always)]
-    pub fn releasing(_rank: LockRank) {}
+    pub fn releasing(_rank: LockRank) {
+        #[cfg(test)]
+        HELD.with(|h| h.set(h.get() - 1));
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static HELD: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    /// The locks this thread holds: libtest gives each test a thread of its own.
+    #[cfg(test)]
+    pub fn held_by_this_thread() -> usize {
+        HELD.with(core::cell::Cell::get)
+    }
     #[inline(always)]
     pub fn enter_interrupt() -> IrqScope {
         IrqScope
@@ -199,6 +216,8 @@ mod inert {
     pub fn assert_user_entry_safe() {}
 }
 
+#[cfg(test)]
+pub use inert::held_by_this_thread;
 #[cfg(not(all(debug_assertions, not(test))))]
 pub use inert::{IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing};
 

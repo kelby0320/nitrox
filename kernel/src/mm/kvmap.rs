@@ -240,7 +240,7 @@ impl<const N: usize> VmapFrames<N> {
         let base = VirtAddr::new(slot.start + guard * PAGE_SIZE as u64);
         let mut frames = [PhysAddr::new(0); N];
         for i in 0..N {
-            match heap::buddy_alloc(0) {
+            match frame() {
                 Some(f) => frames[i] = f,
                 None => {
                     frames[..i].iter().for_each(|&f| heap::buddy_free(f, 0));
@@ -272,6 +272,20 @@ impl<const N: usize> VmapFrames<N> {
     pub fn guard_base(&self) -> VirtAddr {
         self.slot.as_ref().map_or(self.base, |s| VirtAddr::new(s.start))
     }
+}
+
+/// A frame for a [`VmapFrames`], which a host test can make fail.
+fn frame() -> Option<PhysAddr> {
+    #[cfg(test)]
+    if FRAMES_LEFT.with(|left| left.replace(left.get().map(|n| n.saturating_sub(1))) == Some(0)) {
+        return None;
+    }
+    heap::buddy_alloc(0)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FRAMES_LEFT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
 }
 
 impl<const N: usize> Drop for VmapFrames<N> {

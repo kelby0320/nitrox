@@ -16,7 +16,7 @@
 //!
 //! The whole request runs with **interrupts enabled** (the caller's state is restored; decision log
 //! 2026-07-21), because callers arrive IF-masked (syscall bodies, the ring-3 exception path, via
-//! `reap_pending` and `KernelStack::Drop`) and an IF-masked spinner, on [`LOCK`] or on the acks,
+//! `reap_pending` and a `VmapFrames` drop) and an IF-masked spinner, on [`LOCK`] or on the acks,
 //! could never service another initiator's IPI: two such initiators deadlock. With IF on, anyone
 //! waiting can always take an incoming shootdown IPI.
 //!
@@ -98,8 +98,15 @@ unsafe fn invalidate_local(va: Option<VirtAddr>) {
 }
 
 fn shootdown(va: Option<VirtAddr>) {
+    // The rank tracker refuses a lock held here only where `LOCK` is taken, and not in host tests.
+    #[cfg(test)]
+    assert_eq!(crate::libkern::lockrank::held_by_this_thread(), 0, "a shootdown with a spinlock held");
     #[cfg(test)]
     SHOT.with(|s| s.set((s.get().0 + 1, crate::mm::heap::frames_freed_by_this_thread())));
+    #[cfg(test)]
+    if let Some(other_cpu) = DURING.take() {
+        other_cpu();
+    }
     // Preemption off before reading this CPU: the sole-online path invalidates only the one read.
     crate::sched::preempt_disable();
     let me = pinned_cpu();
@@ -171,6 +178,14 @@ fn shootdown(va: Option<VirtAddr>) {
 #[cfg(test)]
 std::thread_local! {
     static SHOT: core::cell::Cell<(usize, usize)> = const { core::cell::Cell::new((0, 0)) };
+    static DURING: core::cell::Cell<Option<fn()>> = const { core::cell::Cell::new(None) };
+}
+
+/// Run `other_cpu`, a test's stand-in for another CPU, while this thread's next shootdown is in
+/// flight.
+#[cfg(test)]
+pub fn during_next_shootdown(other_cpu: fn()) {
+    DURING.with(|d| d.set(Some(other_cpu)));
 }
 
 /// This thread's shootdowns, and the frames it had freed at the last: a test of "shot down before
@@ -227,5 +242,14 @@ mod tests {
         assert!(!wait_satisfied(targets, 0b1001, 0b1101));
 
         assert!(wait_satisfied(0b0011, 0b0011, 0b1111));
+    }
+
+    #[test]
+    fn a_shootdown_leaves_preemption_on_as_it_found_it() {
+        let shootdowns: [fn(); 2] = [super::shootdown_all, || super::shootdown_page(crate::mm::VirtAddr::new(0x1000))];
+        for shoot in shootdowns {
+            shoot();
+            assert!(!crate::sched::preemption_disabled());
+        }
     }
 }

@@ -104,3 +104,63 @@ fn a_dropped_range_gives_its_va_to_the_next_of_its_size() {
     let again = VmapFrames::<7>::new(PageFlags::WRITABLE, 2).unwrap();
     assert_eq!(again.base(), first);
 }
+
+/// **A range that runs out of page tables keeps nothing**: the pages mapped first are undone and
+/// shot down before a frame is freed, and the VA goes back. Sizes no other test asks for.
+#[test]
+fn a_range_that_runs_out_of_page_tables_is_undone() {
+    init_global_heap();
+    let other = AddressSpace::new().unwrap();
+    // Far past the cursor: two pages in a table made here, two past the 2 MiB boundary in none.
+    let boundary = VMAP_WINDOW_END - (64 << 20);
+    let frame = heap::buddy_alloc(0).unwrap();
+    // SAFETY: a page no test hands out, mapped only to make its table.
+    unsafe {
+        map_all(boundary - PAGE, core::iter::once(frame), PageFlags::WRITABLE).unwrap();
+        unmap_all(boundary - PAGE, 1);
+    }
+    heap::buddy_free(frame, 0);
+    VMAP.lock().give_back(KBox::try_new(Slot { start: boundary - 4 * PAGE, pages: 6, next: None }).unwrap());
+    let (shots, freed) = (crate::tlb::shootdowns_by_this_thread().0, heap::frames_freed_by_this_thread());
+    crate::arch::fail_page_tables_after(Some(0));
+    let failed = VmapFrames::<4>::new(PageFlags::WRITABLE, 2);
+    crate::arch::fail_page_tables_after(None);
+    assert!(failed.is_err());
+    let base = boundary - 2 * PAGE;
+    assert!((0..2).all(|i| translate(other.root(), base + i * PAGE).is_none()), "mapped, then undone");
+    assert_eq!(crate::tlb::shootdowns_by_this_thread(), (shots + 1, freed), "shot down before a frame is freed");
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 4);
+    assert_eq!(VmapFrames::<4>::new(PageFlags::WRITABLE, 2).unwrap().base().as_u64(), base, "its VA, given back");
+}
+
+#[test]
+fn a_range_short_of_frames_frees_those_it_took_and_gives_back_its_va() {
+    init_global_heap();
+    let first = VmapFrames::<3>::new(PageFlags::WRITABLE, 5).unwrap().base();
+    FRAMES_LEFT.with(|left| left.set(Some(2)));
+    let freed = heap::frames_freed_by_this_thread();
+    let short = VmapFrames::<3>::new(PageFlags::WRITABLE, 5);
+    FRAMES_LEFT.with(|left| left.set(None));
+    assert!(short.is_err());
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 2);
+    assert_eq!(VmapFrames::<3>::new(PageFlags::WRITABLE, 5).unwrap().base(), first);
+}
+
+std::thread_local! {
+    static TAKEN: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// **A range's VA is handed out again only after its shootdown**: until then another CPU may hold
+/// its old translations, and a new owner's writes through them would reach freed frames.
+#[test]
+fn a_dropped_range_is_handed_out_again_only_after_its_shootdown() {
+    init_global_heap();
+    let range = VmapFrames::<1>::new(PageFlags::WRITABLE, 9).unwrap();
+    let base = range.base().as_u64();
+    crate::tlb::during_next_shootdown(|| {
+        TAKEN.set(VmapFrames::<1>::new(PageFlags::WRITABLE, 9).unwrap().base().as_u64());
+    });
+    drop(range);
+    assert_ne!(TAKEN.get(), 0, "the other CPU ran");
+    assert_ne!(TAKEN.get(), base);
+}

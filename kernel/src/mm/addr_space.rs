@@ -19,7 +19,7 @@ use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_MAP
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{AllocError, KBox, KVec, SpinLock};
+use crate::libkern::{AllocError, KBox, KVec, SpinLock, SpinLockGuard};
 use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::object::{FileObject, MemoryObject, ObjectRef};
@@ -350,10 +350,7 @@ impl AddressSpace {
             match unsafe { Paging::map_page(root, virt, frames[i as usize], flags) } {
                 Ok(()) => installed += 1,
                 Err(ArchMapError::OutOfMemory) => {
-                    let unmapped = rollback_object_map(root, range.start(), installed);
-                    // Shot down before the object, which owns the frames, can be dropped.
-                    drop(guard);
-                    drop(unmapped);
+                    rollback_object_map(guard, range.start(), installed);
                     return Err((object, MapError::OutOfMemory));
                 }
                 Err(ArchMapError::AlreadyMapped) => {
@@ -371,9 +368,7 @@ impl AddressSpace {
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             Err(mut b) => {
-                let unmapped = rollback_object_map(root, range.start(), installed);
-                drop(guard);
-                drop(unmapped);
+                rollback_object_map(guard, range.start(), installed);
                 let object = b.object.take().expect("object-backed VMA carries its ObjectRef");
                 Err((object, MapError::Overlap))
             }
@@ -642,9 +637,10 @@ fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
 }
 
 /// Roll back a partial `map_object`: uninstall `installed` PTEs from `start` but **do not free
-/// the frames** (the `MemoryObject` owns them). The space is live, so the object may be released
-/// only once the [`Unmapped`] has been dropped, if any page was mapped.
-fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) -> Option<Unmapped> {
+/// the frames** (the `MemoryObject` owns them), then release the lock and shoot them down, if any
+/// page was mapped. The space is live, so the object may be released only once this returns.
+fn rollback_object_map(guard: SpinLockGuard<'_, Inner>, start: VirtAddr, installed: u64) {
+    let root = guard.root;
     for i in 0..installed {
         let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
         // SAFETY: we successfully installed exactly these `installed` pages in
@@ -652,7 +648,9 @@ fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) -> Optio
         // object's frame, which the object still owns — discard it.
         let _ = unsafe { Paging::unmap_page(root, virt) };
     }
-    (installed > 0).then(|| Unmapped { frames: KVec::new(), vma: None })
+    let unmapped = (installed > 0).then(|| Unmapped { frames: KVec::new(), vma: None });
+    drop(guard);
+    drop(unmapped);
 }
 
 /// Translate the VMA-level [`Protection`] and [`Caching`] into hardware [`PageFlags`].
