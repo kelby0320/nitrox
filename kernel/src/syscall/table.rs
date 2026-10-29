@@ -1372,134 +1372,6 @@ fn forward_userspace_lookup(
     }
 }
 
-/// `sys_io_submit(resource, op)` — initiate the [`IoOp`] `*op` against `resource` (a block
-/// [`DeviceNode`](crate::object::DeviceNode) or char device) and return a `PendingOperation`
-/// handle. Never blocks: the outcome (status + bytes transferred) arrives through the PO.
-/// Argument / permission / allocation failures return a negative `KError` synchronously with no
-/// PO; device/medium failures arrive through the PO (`docs/spec/io-operation.md`).
-pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-
-    let optr = UserPtr::<IoOp>::new(op_ptr).map_err(from_user_access)?;
-    let op = copy_from_user(optr).map_err(from_user_access)?;
-    if op.flags != 0 {
-        return Err(KError::InvalidArgument);
-    }
-    let opcode = IoOpcode::from_u32(op.opcode).ok_or(KError::InvalidArgument)?;
-
-    let (dev_right, buf_right) = match opcode {
-        IoOpcode::Read => (Rights::READ, Rights::MAP_WRITE),
-        IoOpcode::Write => (Rights::WRITE, Rights::MAP_READ),
-        IoOpcode::Flush => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Flush),
-        IoOpcode::Rescan => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Rescan),
-        IoOpcode::Eject => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Eject),
-    };
-    let dev_ok = lookup_typed(resource_h, pid, dev_right, KObjectType::DeviceNode)?;
-    let buf_ok = lookup_typed(op.buffer, pid, buf_right, KObjectType::MemoryObject)?;
-
-    // SAFETY: `buf_ok` pins a live `MemoryObject`.
-    let buffer_size = unsafe { &*(buf_ok.object.as_ptr() as *const MemoryObject) }.size() as u64;
-    let buf_end = op.buf_offset.checked_add(op.length).ok_or(KError::InvalidArgument)?;
-    if buf_end > buffer_size {
-        return Err(KError::InvalidArgument);
-    }
-
-    let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: adopt the single creation reference.
-    let po_ref =
-        unsafe { ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation) };
-    let (tptr, tty) = po_ref.clone().into_raw();
-    let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt this reference; reclaim it. Then
-            // `po_ref` drops at return, destroying the PO.
-            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
-            return Err(map_handle_err(e));
-        }
-    };
-
-    if op.length == 0 {
-        // SAFETY: `po_ref` pins the `PendingOperation`.
-        unsafe { crate::sched::complete_pending_op(po_ref.as_ptr(), 0, 0) };
-        return Ok(po_h.bits() as isize);
-    }
-
-    // A block device goes through the IRP path; a char device through its backend. On failure
-    // the PO handle is rolled back.
-    // SAFETY: `dev_ok.object` pins a live `DeviceNode` (type-checked above).
-    let dn: &DeviceNode = unsafe { &*(dev_ok.object.as_ptr() as *const DeviceNode) };
-    let dispatched: Result<(), KError> = match dn.class() {
-        DeviceClass::Block => crate::io::block::dispatch_block_irp(
-            &dev_ok.object,
-            &buf_ok.object,
-            &po_ref,
-            opcode,
-            op.offset,
-            op.buf_offset,
-            op.length,
-        ),
-        DeviceClass::Char if opcode == IoOpcode::Write => {
-            match dn.char_backend().and_then(|b| Some((b.submit_write?, b.ctx))) {
-                Some((write, ctx)) => write(&buf_ok.object, &po_ref, op.buf_offset, op.length, ctx),
-                None => Err(KError::Unsupported),
-            }
-        }
-        DeviceClass::Char if opcode == IoOpcode::Read => match dn.char_backend() {
-            Some(backend) => {
-                (backend.submit_read)(&buf_ok.object, &po_ref, op.buf_offset, op.offset, op.length, backend.ctx)
-            }
-            None => Err(KError::Unsupported),
-        },
-        DeviceClass::Char | DeviceClass::Other => Err(KError::Unsupported),
-    };
-    match dispatched {
-        Ok(()) => Ok(po_h.bits() as isize),
-        Err(e) => {
-            close_and_release(po_h, pid);
-            Err(e)
-        }
-    }
-}
-
-/// `sys_io_submit`'s **flush**: make what has been written to the block device `resource_h`
-/// durable, completing the returned `PendingOperation` once the device has written its cache.
-/// Needs `WRITE` on the device and names no buffer and no range, so each of those fields must
-/// be `0`. Not a zero-length transfer, so it never takes that path's pre-signalled no-op.
-///
-/// **And its rescan and its eject**, `irp_op` saying which, with the same rules (`WRITE`). A
-/// partition and every disk but a USB one answer `Unsupported`, through the IRP.
-fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::IrpOp) -> SysResult {
-    if op.buffer != 0 || op.buf_offset != 0 || op.offset != 0 || op.length != 0 {
-        return Err(KError::InvalidArgument);
-    }
-    let dev_ok = lookup_typed(resource_h, pid, Rights::WRITE, KObjectType::DeviceNode)?;
-    // SAFETY: `dev_ok.object` pins a live `DeviceNode` (type-checked above).
-    if unsafe { &*(dev_ok.object.as_ptr() as *const DeviceNode) }.class() != DeviceClass::Block {
-        return Err(KError::Unsupported);
-    }
-    let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: adopt the single creation reference.
-    let po_ref =
-        unsafe { ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation) };
-    let (tptr, tty) = po_ref.clone().into_raw();
-    let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt this reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
-            return Err(map_handle_err(e));
-        }
-    };
-    match crate::io::block::dispatch_block_control(&dev_ok.object, &po_ref, irp_op) {
-        Ok(()) => Ok(po_h.bits() as isize),
-        Err(e) => {
-            close_and_release(po_h, pid);
-            Err(e)
-        }
-    }
-}
-
 /// `sys_io_cancel(pending)` — request cancellation of an in-flight operation. **Always
 /// `Unsupported`**; the number is reserved.
 pub fn sys_io_cancel(_pending_h: u64) -> SysResult {
@@ -2231,78 +2103,6 @@ fn new_block_file(
     Ok(unsafe { ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject) })
 }
 
-/// Complete a forwarded `File::ReadRange` reply: correlate it to the registration's pending
-/// fill, copy the replied bytes (a transferred ≤1-page `MemoryObject`) into the cache frame,
-/// mark the page ready, and complete the fill PO (waking the parked faulter). An error or
-/// uncorrelated reply fails the PO / is dropped (transfers released, handles closed).
-fn complete_read_range_reply(
-    reg: &ObjectRef,
-    bounce: &StoredMsg,
-    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    payload_len: usize,
-) -> SysResult {
-    use crate::rsproto::{RangeReplyKind, parse_read_range_reply};
-
-    let reply = parse_read_range_reply(&bounce.payload[..payload_len]);
-    let pf = match reply {
-        // SAFETY: `reg` pins the registration the send arrived through.
-        Some(r) => unsafe { crate::sched::us_forward_take_pending_fill(reg.as_ptr(), r.request_id) },
-        None => None,
-    };
-    let Some(pf) = pf else {
-        return Ok(0);
-    };
-    let reply = reply.expect("pending taken ⇒ reply parsed");
-
-    let status: i32 = match reply.kind {
-        RangeReplyKind::Error { kerror } => kerror,
-        RangeReplyKind::Malformed => KError::KernelError as i32,
-        RangeReplyKind::Success { content_len } => match transfers[0].take() {
-            None => KError::InvalidArgument as i32, // success but no bytes
-            Some(tr) if tr.obj.object_type() != KObjectType::MemoryObject => {
-                drop(tr.obj);
-                KError::Unsupported as i32
-            }
-            Some(tr) => {
-                copy_fill_into_frame(&tr.obj, pf.frame, content_len as usize);
-                // SAFETY: `pf.file_obj` pins the live `FileObject` (header at 0).
-                let fo: &crate::object::FileObject =
-                    unsafe { &*(pf.file_obj.as_ptr() as *const crate::object::FileObject) };
-                fo.settle(pf.index, &pf.po, true);
-                drop(tr.obj);
-                0
-            }
-        },
-    };
-
-    // Complete the fill PO (one-shot); release the kernel's clones outside `SCHED`.
-    // SAFETY: `pf` owns the fill's `PendingOperation` reference.
-    unsafe { crate::sched::complete_pending_op(pf.po.as_ptr(), status, 0) };
-    drop(pf);
-    Ok(0)
-}
-
-/// Copy `n` bytes (clamped to one page) from the first frame of the transferred fill
-/// `MemoryObject` `src` into the cache frame `dst`, both via the HHDM; a no-op if `src` has no
-/// frames or `n == 0`.
-fn copy_fill_into_frame(src: &ObjectRef, dst: crate::mm::PhysAddr, n: usize) {
-    use crate::mm::{PAGE_SIZE, heap};
-    // SAFETY: `src` pins the live `MemoryObject` (header at offset 0).
-    let mo: &crate::object::MemoryObject = unsafe { &*(src.as_ptr() as *const crate::object::MemoryObject) };
-    let frames = mo.frames();
-    let n = n.min(PAGE_SIZE);
-    if frames.is_empty() || n == 0 {
-        return;
-    }
-    let src_va = (frames[0].as_u64() + heap::hhdm_offset()) as *const u8;
-    let dst_va = (dst.as_u64() + heap::hhdm_offset()) as *mut u8;
-    // SAFETY: both frames are page-aligned, HHDM-mapped, and distinct (one is the
-    // server's just-transferred object, the other the cache frame); `n ≤ PAGE`.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src_va, dst_va, n);
-    }
-}
-
 /// Close every handle a partial `sys_channel_recv` installed, so a copy-out fault or
 /// mid-install error after the dequeue doesn't leak them.
 fn recv_rollback_installed(installed: &[RawHandle], pid: u32) {
@@ -2394,9 +2194,13 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     Ok(0)
 }
 
+mod fill;
 mod send;
 mod spawn;
+mod submit;
+use fill::complete_read_range_reply;
 use spawn::sys_process_spawn;
+use submit::sys_io_submit;
 
 #[cfg(test)]
 mod tests;
