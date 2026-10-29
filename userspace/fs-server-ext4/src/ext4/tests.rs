@@ -492,3 +492,24 @@ fn a_bitmap_bit_past_its_block_is_corrupt() {
         }
     }
 }
+
+/// **Descriptors are 32 bytes apart without `64bit`, whatever `s_desc_size` says**, as Linux and
+/// e2fsprogs read them: at 64, group 1's files were not found, and a create took an inode in use.
+#[test]
+fn descriptors_are_32_bytes_apart_without_64bit() {
+    use super::{create_file, map_file};
+    use crate::test_support::{RwImage, assert_e2fsck_clean, fixture_blocks};
+    let rw = RwImage(std::cell::RefCell::new(fixture_blocks(1024, 32768, 65536, b"g\n")));
+    for i in 0..200 {
+        create_file(&rw, b"/", format!("f{i}").as_bytes(), 1_791_244_800).unwrap();
+    }
+    let mut runs = [crate::BlockRun::default(); 4];
+    let in_group_1 = map_file(&rw, b"/f190", &mut runs).unwrap().ino;
+    assert!(in_group_1 > 128, "a file whose inode is in group 1: {in_group_1}");
+    poke_sb(&mut rw.0.borrow_mut(), 254, &64u16.to_le_bytes());
+    assert_e2fsck_clean(&rw.0.borrow(), "desc-size-64");
+    assert_eq!(map_file(&rw, b"/f190", &mut runs).map(|m| m.ino), Ok(in_group_1));
+    let last = map_file(&rw, b"/f199", &mut runs).unwrap().ino;
+    assert_eq!(create_file(&rw, b"/", b"new", 1_791_244_800), Ok(last + 1), "the next inode, not one in use");
+    assert_e2fsck_clean(&rw.0.borrow(), "desc-size-64-made");
+}

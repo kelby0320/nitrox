@@ -189,10 +189,8 @@ fn parse_superblock(sb: &[u8; 1024]) -> Result<Superblock, Unservable> {
     if inodes_per_group == 0 {
         return Err(Unservable::ZeroField("s_inodes_per_group"));
     }
-    let desc_size = match rd_u16(sb, 254) as u32 {
-        0 => 32,
-        d => d,
-    };
+    // Without `64bit`, which is refused, a descriptor is 32 bytes whatever `s_desc_size` says.
+    let desc_size = 32;
     let blocks_per_group = rd_u32(sb, 32);
     let first_data_block = rd_u32(sb, 20);
     if blocks_per_group == 0 {
