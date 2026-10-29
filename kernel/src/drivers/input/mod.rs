@@ -475,8 +475,10 @@ pub(crate) mod test_support {
     ) {
         crate::mm::test_support::init_global_heap();
         let state = Arc::new(state);
-        let buf = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
-        let po = || adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+        // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
+        let buf = unsafe { adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject) };
+        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
+        let po = || unsafe { adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation) };
         assert_eq!(read(&state, &buf, &po()), Ok(()));
         let first = take(&state);
         let (done, answer) = mpsc::channel();

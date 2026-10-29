@@ -26,7 +26,6 @@ use crate::drivers::hid::{keyboard, mouse};
 use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader, Submitted};
 use crate::libkern::IrqSpinLock;
 use crate::libkern::device::DeviceKind;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::input::{EV_KEY, InputEvent, KEY_PRESS};
 use crate::libkern::lockrank::LockRank;
 use crate::mm::dma::DmaBuffer;
@@ -769,7 +768,7 @@ fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32, u32)> {
     LIGHTS_TAKEN.fetch_and(!(1u32 << index), Ordering::Relaxed);
     let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: context(index, epoch) };
     let served = DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).ok().and_then(|node| {
-        let node = crate::drivers::adopt(node, KObjectType::DeviceNode);
+        let node = crate::drivers::adopt_node(node);
         crate::device::register_input(node, kind, parent, "usb-hid")
     });
     if served.is_none() {
