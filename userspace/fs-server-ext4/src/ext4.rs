@@ -4,10 +4,12 @@
 //! descriptor's inode-table block, data via the inode's **extent tree**, and directories as a
 //! linear list of `ext4_dir_entry_2`.
 
+mod bitmap;
 mod features;
 mod listing;
 mod unservable;
 
+use bitmap::Bitmap;
 pub use listing::{read_dir, read_dir_stat};
 pub use unservable::Unservable;
 
@@ -500,34 +502,10 @@ pub fn map_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [crate::BlockRun])
     Ok(MappedFile { size, block_size: bs, runs: n, ino })
 }
 
-/// A bitmap block as read: a bit past its bytes is `Corrupt`, never an index past the buffer or
-/// into the unread tail of a larger one.
-struct Bitmap<'a>(&'a mut [u8]);
-
-impl Bitmap<'_> {
-    fn byte(&mut self, i: usize) -> Result<&mut u8, FsError> {
-        self.0.get_mut(i / 8).ok_or(FsError::Corrupt)
-    }
-    fn is_free(&mut self, i: usize) -> Result<bool, FsError> {
-        Ok(*self.byte(i)? & (1 << (i % 8)) == 0)
-    }
-    fn set(&mut self, i: usize) -> Result<(), FsError> {
-        *self.byte(i)? |= 1 << (i % 8);
-        Ok(())
-    }
-    fn unset(&mut self, i: usize) -> Result<(), FsError> {
-        *self.byte(i)? &= !(1 << (i % 8));
-        Ok(())
-    }
-    /// The first free bit below `end`.
-    fn first_free(&mut self, end: usize) -> Result<Option<usize>, FsError> {
-        for i in 0..end {
-            if self.is_free(i)? {
-                return Ok(Some(i));
-            }
-        }
-        Ok(None)
-    }
+/// Whether `name` may be written as a new entry: 1 to 255 bytes, its length being one byte, with no
+/// `/` and no control character, as FAT refuses them; `e2fsck` calls a NUL illegal.
+fn writable_name(name: &[u8]) -> bool {
+    !name.is_empty() && name.len() <= 255 && !name.iter().any(|&c| c == b'/' || c < 0x20 || c == 0x7F)
 }
 
 /// Whether block `blk`'s bit is set in its group's bitmap: what a test asks of each mapped block.
@@ -1054,7 +1032,7 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     name: &[u8],
     now: i64,
 ) -> Result<u32, FsError> {
-    if name.is_empty() || name.len() > 255 || name.contains(&b'/') {
+    if !writable_name(name) {
         return Err(FsError::Unsupported);
     }
     let sb = read_superblock(rw)?;
@@ -1327,7 +1305,7 @@ fn adjust_links<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock, ino: u3
 /// (the new `..`). `Exists` if `name` is taken; `TooLarge` if the filesystem is full. **A failed
 /// `mkdir` gives back what it took**: the inode, its block, and its own group's directory count.
 pub fn mkdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8], now: i64) -> Result<(), FsError> {
-    if name.is_empty() || name.len() > 255 || name.contains(&b'/') || name == b"." || name == b".." {
+    if !writable_name(name) || name == b"." || name == b".." {
         return Err(FsError::Unsupported);
     }
     let sb = read_superblock(rw)?;
@@ -1695,8 +1673,8 @@ fn rename<RW: BlockReader + BlockWriter>(
     if old_dir_ino == new_dir_ino && old_name == new_name {
         return Ok(None);
     }
-    if new_name.len() > 255 {
-        return Err(FsError::Unsupported); // an entry's length is one byte
+    if !writable_name(new_name) {
+        return Err(FsError::Unsupported);
     }
     let src = read_inode(rw, sb, src_ino)?;
     let src_is_dir = rd_u16(&src, 0) & S_IFMT == S_IFDIR;

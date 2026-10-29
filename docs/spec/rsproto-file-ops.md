@@ -167,7 +167,8 @@ or touch `..` would reach past the directory it is confined to. A server refuses
 request that names an entry, a rename's two names and a session's touch among them,
 `Unsupported`, before its filesystem sees them (`libfsserver::serve::entry_name`). **How long a
 name may be is the filesystem's**: ext4 refuses one past 255 bytes, `Unsupported`, and FAT one past
-255 UTF-16 units, `InvalidArgument`, which in UTF-8 can be 765 bytes.
+255 UTF-16 units, `InvalidArgument`, which in UTF-8 can be 765 bytes. **Neither writes a name with
+a control character**, a NUL among them; a name already on the disk with one is still found.
 
 ### Rename (`0x0605`)
 

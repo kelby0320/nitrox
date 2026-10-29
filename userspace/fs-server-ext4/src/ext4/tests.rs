@@ -513,3 +513,26 @@ fn descriptors_are_32_bytes_apart_without_64bit() {
     assert_eq!(create_file(&rw, b"/", b"new", 1_791_244_800), Ok(last + 1), "the next inode, not one in use");
     assert_e2fsck_clean(&rw.0.borrow(), "desc-size-64-made");
 }
+
+/// **A name with a NUL or another control character is not written**, by a create, a `mkdir` or a
+/// rename, as FAT refuses them: `e2fsck` calls a NUL illegal. A space and UTF-8 beside them are.
+#[test]
+fn a_name_with_a_control_character_is_not_written() {
+    use super::{create_file, mkdir_at, rename_at};
+    use crate::test_support::{RwImage, assert_e2fsck_clean};
+    let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    let now = 1_791_244_800;
+    create_file(&rw, b"/", b"plain", now).unwrap();
+    let before = rw.0.borrow().clone();
+    for c in [0u8, 1, 0x1F, 0x7F] {
+        let name = [b'a', c, b'b'];
+        assert_eq!(create_file(&rw, b"/", &name, now), Err(FsError::Unsupported), "create {c:#x}");
+        assert_eq!(mkdir_at(&rw, 2, &name, now), Err(FsError::Unsupported), "mkdir {c:#x}");
+        assert_eq!(rename_at(&rw, 2, b"plain", &name, now), Err(FsError::Unsupported), "rename {c:#x}");
+    }
+    assert!(*rw.0.borrow() == before, "refused, nothing was written");
+    create_file(&rw, b"/", b"a b", now).unwrap();
+    mkdir_at(&rw, 2, "caf\u{e9}".as_bytes(), now).unwrap();
+    rename_at(&rw, 2, b"plain", b"~ok", now).unwrap();
+    assert_e2fsck_clean(&rw.0.borrow(), "plain-names");
+}
