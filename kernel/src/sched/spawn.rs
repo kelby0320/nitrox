@@ -258,11 +258,10 @@ pub fn start_user(r: ObjectRef) -> Result<(), AllocError> {
 /// Place `r`, a thread just made for a process, marking it first if the process has begun to exit:
 /// a thread placed after `exit_process` marked the others is marked here instead.
 pub(super) fn place_spawned(g: &mut SchedState, r: ObjectRef) -> Result<(), ObjectRef> {
-    // SAFETY: `r` pins the new thread; `SCHED` held.
-    let th = unsafe { &*(r.as_ptr() as *const Thread) };
-    // SAFETY: the clone pins the live `Process`; the thread holds another reference, so dropping
-    // it frees nothing under `SCHED`.
-    if th.process_ref().is_some_and(|p| unsafe { &*(p.as_ptr() as *const crate::object::Process) }.ending().is_some()) {
+    // SAFETY: `r` pins the new thread, and it its `Process`; `SCHED` held.
+    let ending = unsafe { Thread::process_of(r.as_ptr()) }
+        .is_some_and(|p| unsafe { &*(p as *const crate::object::Process) }.ending().is_some());
+    if ending {
         // SAFETY: as above.
         unsafe { Thread::set_ending(r.as_ptr()) };
     }

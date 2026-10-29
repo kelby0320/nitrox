@@ -11,8 +11,9 @@
 //! [`Thread`] is shared through an [`ObjectRef`](crate::object::ObjectRef), yet the scheduler
 //! mutates `arch`, `state`, `entry` and `arg`, sound only because it does so exclusively while
 //! holding its run-queue lock. The scheduler-only accessors take a type-erased `*mut ()` and
-//! reach fields through raw pointers, never forming a `&mut Thread` that would alias the
-//! atomically-accessed [`KObjectHeader`].
+//! reach fields through raw pointers, never forming a `&Thread` or `&mut Thread` of the whole:
+//! another CPU writes a field under the lock while this one reads another, and `context_switch`
+//! writes `arch` after releasing it, so a whole-struct borrow races both.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -380,8 +381,9 @@ impl Thread {
 
     // SAFETY (shared by all): `obj` addresses a live `Thread` (pinned by an
     // `ObjectRef` the caller holds), and the scheduler invokes these only
-    // while holding its run-queue lock, which — single-CPU — serialises all
-    // access to these fields.
+    // while holding its run-queue lock, which serialises every access to these
+    // fields but the saved stack pointer `context_switch` writes after releasing
+    // it. Each reaches its own field through a raw place, so none races another.
 
     /// Read the scheduler lifecycle state. Test-only: production code sets it but never reads it.
     ///
@@ -752,17 +754,44 @@ impl Thread {
         unsafe { (*p).stack.as_ref().map(KernelStack::stack_top) }
     }
 
-    /// This thread's owning process id, or `0` for a kernel/boot thread. Raw-pointer
-    /// form of [`Thread::owner_pid`], for the scheduler's stack-watermark attribution —
-    /// a depth figure is only actionable if it names whose thread reached it.
+    /// This thread's owning process id, or `0` for a kernel/boot thread: [`Thread::owner_pid`]
+    /// through a raw place.
     ///
     /// # Safety
     /// See the accessor contract above.
-    #[cfg(feature = "test-harness")]
     pub(crate) unsafe fn owner_pid_of(obj: *mut ()) -> u32 {
-        let p = obj as *mut Thread;
         // SAFETY: `obj` is a pinned live `Thread` under the accessor contract.
-        unsafe { (*p).owner_pid() }
+        unsafe { core::ptr::read(&raw const (*(obj as *const Thread)).owner_pid) }
+    }
+
+    /// This thread's id: [`Thread::tid`] through a raw place.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn tid_of(obj: *mut ()) -> u32 {
+        // SAFETY: `obj` is a pinned live `Thread` under the accessor contract.
+        unsafe { core::ptr::read(&raw const (*(obj as *const Thread)).tid) }
+    }
+
+    /// The process a user thread belongs to, which the thread pins, retained by no new reference:
+    /// `None` for a kernel thread.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn process_of(obj: *mut ()) -> Option<*mut ()> {
+        // SAFETY: `obj` is a pinned live `Thread` under the accessor contract, and `process` is
+        // set before the thread is shared and never written after.
+        unsafe { (*(obj as *const Thread)).process.as_ref().map(ObjectRef::as_ptr) }
+    }
+
+    /// A new reference to the process a user thread belongs to: [`Thread::process_ref`] through a
+    /// raw place.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn process_ref_of(obj: *mut ()) -> Option<ObjectRef> {
+        // SAFETY: as `process_of`.
+        unsafe { (*(obj as *const Thread)).process.clone() }
     }
 
     /// Register `objs` (type-erased addresses, `len <= MAX_WAIT_HANDLES`) as this thread's wait

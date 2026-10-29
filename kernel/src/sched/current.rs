@@ -24,11 +24,8 @@ pub(super) fn current_entry() -> (ThreadEntry, usize) {
 pub fn current_owner_pid() -> u32 {
     let g = SCHED.lock();
     let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
-    // SAFETY: `current` is pinned alive (it holds a refcount on the `Thread`)
-    // and we hold the run-queue lock, which — the one global `SCHED` lock — serialises all
-    // access to the `Thread`. Forming a shared `&Thread` to read `owner_pid`
-    // is sound; no `&mut` is taken anywhere under this lock.
-    unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.owner_pid()
+    // SAFETY: `current` is pinned alive (it holds a refcount on the `Thread`); `SCHED` held.
+    unsafe { Thread::owner_pid_of(cur.as_ptr()) }
 }
 
 /// The calling thread's `(pid, tid)` under one `SCHED` hold — the capture step of the
@@ -38,15 +35,9 @@ pub fn current_owner_pid() -> u32 {
 pub fn current_pid_tid() -> Option<(u32, u32)> {
     let g = SCHED.lock();
     let cur = g.cur_ref().as_ref()?;
-    // SAFETY: `current` is pinned alive and the run-queue lock serialises
-    // Thread access; shared `&Thread` reads of the identity fields are sound.
-    // `has_process` touches no refcount, so no `ObjectRef` clone/drop happens
-    // under the rank-1 lock.
-    let t = unsafe { &*(cur.as_ptr() as *const crate::object::Thread) };
-    if !t.has_process() {
-        return None;
-    }
-    Some((t.owner_pid(), t.tid()))
+    let t = cur.as_ptr();
+    // SAFETY: `current` is pinned alive; `SCHED` held. None of these touches a refcount.
+    unsafe { Thread::process_of(t).map(|_| (Thread::owner_pid_of(t), Thread::tid_of(t))) }
 }
 
 /// The tid of the currently running thread, for the `thread` field of a fault
@@ -54,9 +45,8 @@ pub fn current_pid_tid() -> Option<(u32, u32)> {
 pub fn current_tid() -> u32 {
     let g = SCHED.lock();
     let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
-    // SAFETY: `current` is pinned alive and the run-queue lock serialises
-    // Thread access; a shared `&Thread` read of `tid` is sound.
-    unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.tid()
+    // SAFETY: `current` is pinned alive; `SCHED` held.
+    unsafe { Thread::tid_of(cur.as_ptr()) }
 }
 
 /// Pop one notification from `channel` under `SCHED` (or synthesize a dropped notice). The
@@ -80,10 +70,8 @@ pub unsafe fn notif_try_recv(channel: *mut ()) -> Option<Notification> {
 pub fn current_process() -> Option<ObjectRef> {
     let g = SCHED.lock();
     let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
-    // SAFETY: as `current_owner_pid` — `current` is pinned and the run-queue
-    // lock serialises Thread access; `process_ref` clones the stored
-    // `ObjectRef` (bumping the process refcount) under the lock.
-    unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.process_ref()
+    // SAFETY: as `current_owner_pid`; the clone bumps the process's refcount under the lock.
+    unsafe { Thread::process_ref_of(cur.as_ptr()) }
 }
 
 /// The currently running [`Thread`](crate::object::Thread), cloned as an
