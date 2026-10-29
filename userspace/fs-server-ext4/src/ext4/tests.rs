@@ -447,3 +447,48 @@ fn an_unlink_of_one_of_two_names_answers_what_it_did() {
         assert_eq!(answered.map(|o| o.is_none()), if gone { Ok(true) } else { Err(FsError::Io) }, "write {n}");
     }
 }
+
+/// **A bit past the bitmap block read is `Corrupt`, and nothing is written**, whatever geometry got
+/// past the superblock's check: each allocator and each free over a group wider than its bitmap.
+#[test]
+fn a_bitmap_bit_past_its_block_is_corrupt() {
+    use super::{Superblock, alloc_inode, alloc_run, free_inode, free_run, read_superblock};
+    use crate::rd_u32;
+    use crate::test_support::{RwImage, fixture_blocks};
+    use std::cell::RefCell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for bs in [1024u32, 4096] {
+        let img = RwImage(RefCell::new(fixture_blocks(bs, 4096, 0, b"g\n")));
+        let real = read_superblock(&img).unwrap();
+        let bits = bs * 8;
+        let first = real.first_data_block as u64;
+        let sb = Superblock {
+            blocks_per_group: 2 * bits,
+            blocks_count: first + 2 * bits as u64,
+            inodes_per_group: 2 * bits,
+            inodes_count: 2 * bits,
+            ..real
+        };
+        let gd = sb.group_desc_offset(0) as usize;
+        let mut v = img.0.borrow_mut();
+        for (map_at, count_at) in [(0, 12), (4, 14)] {
+            let map = rd_u32(&v, gd + map_at) as usize * bs as usize;
+            v[map..map + bs as usize].fill(0xFF);
+            v[gd + count_at..gd + count_at + 2].copy_from_slice(&100u16.to_le_bytes());
+        }
+        drop(v);
+        let before = img.0.borrow().clone();
+        type Call<'a> = (&'a str, &'a dyn Fn() -> Result<(), FsError>);
+        let each: [Call; 4] = [
+            ("alloc_run", &|| alloc_run(&img, &sb, first, 1).map(drop)),
+            ("free_run", &|| free_run(&img, &sb, first + bits as u64, 1)),
+            ("alloc_inode", &|| alloc_inode(&img, &sb).map(drop)),
+            ("free_inode", &|| free_inode(&img, &sb, bits + 1, false, 1_791_244_800)),
+        ];
+        for (name, f) in each {
+            let got = catch_unwind(AssertUnwindSafe(f));
+            assert!(matches!(got, Ok(Err(FsError::Corrupt))), "{bs}-byte blocks, {name}: {got:?}");
+            assert!(*img.0.borrow() == before, "{bs}-byte blocks, {name}: wrote");
+        }
+    }
+}

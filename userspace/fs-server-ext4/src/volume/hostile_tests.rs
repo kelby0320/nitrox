@@ -230,3 +230,90 @@ fn an_rmdir_takes_a_link_only_from_a_directory() {
     let sb = read_superblock(&img).unwrap();
     assert_eq!(rd_u16(&read_inode(&img, &sb, file).unwrap(), 26), 1, "the file keeps its link");
 }
+
+/// Byte offset of `group`'s descriptor in an image of `bs`-byte blocks.
+fn descriptor(bs: u32, group: u32) -> usize {
+    (if bs == 1024 { 2 } else { 1 }) * bs as usize + 32 * group as usize
+}
+
+/// **A group wider than its bitmap block is refused**, by the check and by each request, as Linux
+/// refuses it. Past the bits read, the allocator took its scratch's unread zeroes for free blocks,
+/// giving one block to two files at 1 KiB blocks, and at 4 KiB indexed past the scratch.
+#[test]
+fn a_group_wider_than_its_bitmap_block_is_refused() {
+    for (bs, blocks, per_group) in [(4096u32, 4096u32, 65536u32), (1024, 16384, 16384)] {
+        let img = RwImage(RefCell::new(fixture_blocks(bs, blocks, 0, b"g\n")));
+        let vol = Ext4(&img);
+        vol.create_file(b"/system", b"a", NOW).unwrap();
+        vol.create_file(b"/system", b"b", NOW).unwrap();
+        let mut v = img.0.borrow_mut();
+        v[1024 + 32..1024 + 36].copy_from_slice(&per_group.to_le_bytes());
+        if bs == 4096 {
+            v[1024 + 4..1024 + 8].copy_from_slice(&per_group.to_le_bytes());
+        }
+        let gd = descriptor(bs, 0);
+        let bitmap = rd_u32(&v, gd) as usize * bs as usize;
+        v[bitmap..bitmap + bs as usize].fill(0xFF);
+        v[gd + 12..gd + 14].copy_from_slice(&100u16.to_le_bytes());
+        drop(v);
+        assert_eq!(vol.check(), Err(Unservable::Geometry("s_blocks_per_group")), "{bs}-byte blocks");
+        for name in [b"/system/a" as &[u8], b"/system/b"] {
+            let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vol.grow_file(name, 100_000, NOW)));
+            assert!(matches!(grown, Ok(Err(FsError::Corrupt))), "{bs}-byte blocks: {grown:?}");
+        }
+    }
+}
+
+/// Each of the superblock's group counts is held to its bitmap and to the groups, at its edge.
+#[test]
+fn a_superblock_is_held_to_its_groups_at_each_edge() {
+    for bs in [1024u32, 4096] {
+        let good = populated(bs);
+        let sb = |v: &[u8], off: usize| rd_u32(v, 1024 + off);
+        let with = |pokes: &[(usize, u32)]| {
+            let mut v = good.clone();
+            for &(off, value) in pokes {
+                v[1024 + off..1024 + off + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ext4(&RwImage(RefCell::new(v))).check()
+        };
+        let (bits, inodes) = (bs * 8, sb(&good, 0));
+        assert_eq!(sb(&good, 32), bits, "mke2fs fills a group's bitmap");
+        assert_eq!(with(&[(32, bits + 8)]), Err(Unservable::Geometry("s_blocks_per_group")));
+        assert_eq!(with(&[(40, bits), (0, bits)]), Ok(()), "{bs}: a full inode bitmap is a group");
+        assert_eq!(with(&[(40, bits + 8), (0, bits + 8)]), Err(Unservable::Geometry("s_inodes_per_group")));
+        assert_eq!(with(&[(0, inodes + 1)]), Err(Unservable::Geometry("s_inodes_count")));
+        assert_eq!(with(&[(0, inodes - 1)]), Err(Unservable::Geometry("s_inodes_count")));
+    }
+}
+
+/// **A record naming an inode past `s_inodes_count` is `Corrupt`**, and a removal of it writes
+/// nothing: its descriptor lies past the table, so whatever was there was taken for one, and the
+/// "inode" and bitmap a removal wrote were wherever that pointed.
+#[test]
+fn a_record_naming_an_inode_past_the_last_is_corrupt() {
+    for bs in [1024u32, 4096] {
+        for past in [1u32, 0x8000_0000] {
+            let img = RwImage(RefCell::new(populated(bs)));
+            let vol = Ext4(&img);
+            let inodes = rd_u32(&img.0.borrow(), 1024);
+            let d = vol.resolve_dir(b"/d").unwrap();
+            let at = records(&img, d as u32)
+                .into_iter()
+                .map(|r| r.0 as usize)
+                .find(|&at| img.0.borrow()[at + 6] == 1 && img.0.borrow()[at + 8] == b'f')
+                .unwrap();
+            img.0.borrow_mut()[at..at + 4].copy_from_slice(&(inodes.wrapping_add(past)).to_le_bytes());
+            let before = img.0.borrow().clone();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mapped = vol.map_file(b"/d/f", &mut [BlockRun::default(); 4]).map(|_| ());
+                (mapped, vol.unlink_at(d, b"f", NOW).map(|_| ()))
+            }));
+            assert!(ran.is_ok(), "{bs}, +{past}: panicked");
+            let (mapped, removed) = ran.unwrap();
+            assert_eq!(mapped, Err(FsError::Corrupt), "{bs}, +{past}: map");
+            assert_eq!(removed, Err(FsError::Corrupt), "{bs}, +{past}: remove");
+            assert!(*img.0.borrow() == before, "{bs}, +{past}: refused, it wrote nothing");
+        }
+    }
+}

@@ -5,6 +5,9 @@
 //! linear list of `ext4_dir_entry_2`.
 
 mod features;
+mod unservable;
+
+pub use unservable::Unservable;
 
 use crate::extent::{self, Extent, Lookup};
 use crate::{BlockReader, BlockWriter, FsError, rd_u16, rd_u32};
@@ -146,121 +149,14 @@ impl Superblock {
     fn group_desc_offset(&self, group: u32) -> u64 {
         self.first_gdt_block * self.block_size as u64 + group as u64 * self.desc_size as u64
     }
-}
 
-/// Why a device cannot be served, named specifically enough for a supervisor to print.
-///
-/// The same checks every request makes: [`read_superblock`] is [`parse_superblock`] with the
-/// reason collapsed, so [`check_device`] cannot drift from the check each lookup runs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Unservable {
-    /// The superblock's bytes could not be read off the device.
-    Unreadable,
-    /// No ext4 magic where the superblock belongs — the device holds no ext4 filesystem.
-    NoMagic {
-        /// What was there instead.
-        found: u16,
-    },
-    /// 64-bit block numbers, which change the group-descriptor layout this reader walks.
-    Wide64Bit,
-    /// Blocks larger than the reader's 4 KiB scratch.
-    BlockTooLarge {
-        /// `s_log_block_size`: the block size is `1024 << log`.
-        log: u32,
-    },
-    /// A superblock field the layout divides or indexes by is zero.
-    ZeroField(&'static str),
-    /// The root's inode could not be read: its table is past the device's end, or the device
-    /// failed.
-    RootUnreadable,
-    /// Inode 2 is not a directory: the layout the superblock describes is not there.
-    RootNotDirectory {
-        /// The inode's `i_mode`.
-        mode: u16,
-    },
-    /// A writable mount could not record that it is mounted: a filesystem that changed while
-    /// looking clean would be worse than one not mounted.
-    StateUnwritable,
-    /// The journal holds changes not yet replayed: what is on disk is not the filesystem yet.
-    NeedsRecovery,
-    /// Features this server does not read: their `s_feature_incompat` bits.
-    Incompatible {
-        /// The bits.
-        features: u32,
-    },
-    /// A writable mount of a filesystem a write here would leave wrong. It can be served read-only.
-    NotWritable {
-        /// The `ro_compat` bits.
-        ro_compat: u32,
-        /// The `incompat` bits missing.
-        lacking: u32,
-    },
-}
-
-impl Unservable {
-    /// The [`FsError`] a request fails with for the same reason.
-    pub fn fs_error(self) -> FsError {
-        match self {
-            Unservable::Unreadable | Unservable::RootUnreadable | Unservable::StateUnwritable => FsError::Io,
-            Unservable::NoMagic { .. } | Unservable::ZeroField(_) | Unservable::RootNotDirectory { .. } => {
-                FsError::Corrupt
-            }
-            Unservable::Wide64Bit
-            | Unservable::BlockTooLarge { .. }
-            | Unservable::NeedsRecovery
-            | Unservable::Incompatible { .. } => FsError::Unsupported,
-            Unservable::NotWritable { .. } => FsError::ReadOnly,
+    /// Inode `ino`'s group and its index there. `Corrupt` for 0, or past `s_inodes_count`, where
+    /// the descriptor would be read from past the table.
+    fn inode_place(&self, ino: u32) -> Result<(u32, usize), FsError> {
+        if ino == 0 || ino > self.inodes_count {
+            return Err(FsError::Corrupt);
         }
-    }
-}
-
-impl core::fmt::Display for Unservable {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match *self {
-            Unservable::Unreadable => write!(f, "the superblock could not be read off the device"),
-            Unservable::NoMagic { found } => {
-                write!(f, "no ext4 filesystem: superblock magic {found:#06x}, not {SUPER_MAGIC:#06x}")
-            }
-            Unservable::Wide64Bit => write!(f, "a 64-bit ext4 filesystem, which this server does not read"),
-            // The shift is taken on a u64 and saturated, since `log` is whatever the device held.
-            Unservable::BlockTooLarge { log } => {
-                write!(f, "blocks of 2^{} bytes, over the {MAX_BLOCK} this server reads", 10u32.saturating_add(log))
-            }
-            Unservable::ZeroField(field) => write!(f, "a malformed superblock: {field} is zero"),
-            Unservable::RootUnreadable => write!(
-                f,
-                "the root directory's inode could not be read: the inode table is past the end of \
-                 the device, or the device failed"
-            ),
-            Unservable::RootNotDirectory { mode } => write!(
-                f,
-                "inode 2 is not a directory (mode {mode:#06o}): the group descriptors or the inode \
-                 table are not what the superblock describes"
-            ),
-            Unservable::StateUnwritable => {
-                write!(f, "the superblock could not be written to record the filesystem mounted")
-            }
-            Unservable::NeedsRecovery => {
-                write!(f, "its journal holds changes not yet replayed: mount it on Linux, or run e2fsck, first")
-            }
-            Unservable::Incompatible { features } => {
-                write!(f, "features this server does not read: ")?;
-                features::names(f, features, false)
-            }
-            Unservable::NotWritable { ro_compat, lacking } => {
-                write!(f, "it can only be read here: ")?;
-                if ro_compat != 0 {
-                    write!(f, "this server does not keep its ")?;
-                    features::names(f, ro_compat, true)?;
-                }
-                if lacking != 0 {
-                    write!(f, "{}it lacks ", if ro_compat != 0 { "; " } else { "" })?;
-                    features::names(f, lacking, false)?;
-                    write!(f, ", which this server's writes make")?;
-                }
-                Ok(())
-            }
-        }
+        Ok(((ino - 1) / self.inodes_per_group, ((ino - 1) % self.inodes_per_group) as usize))
     }
 }
 
@@ -302,7 +198,15 @@ fn parse_superblock(sb: &[u8; 1024]) -> Result<Superblock, Unservable> {
     if blocks_per_group == 0 {
         return Err(Unservable::ZeroField("s_blocks_per_group"));
     }
-    Ok(Superblock {
+    // A group's bitmaps are a block each, so a group holds no more than a block's bits: Linux
+    // refuses either count over it.
+    if blocks_per_group > block_size * 8 {
+        return Err(Unservable::Geometry("s_blocks_per_group"));
+    }
+    if inodes_per_group > block_size * 8 {
+        return Err(Unservable::Geometry("s_inodes_per_group"));
+    }
+    let parsed = Superblock {
         block_size,
         inodes_per_group,
         inode_size,
@@ -312,7 +216,11 @@ fn parse_superblock(sb: &[u8; 1024]) -> Result<Superblock, Unservable> {
         first_data_block,
         blocks_count: rd_u32(sb, 4) as u64,
         inodes_count: rd_u32(sb, 0),
-    })
+    };
+    if parsed.inodes_count as u64 != parsed.group_count() as u64 * inodes_per_group as u64 {
+        return Err(Unservable::Geometry("s_inodes_count"));
+    }
+    Ok(parsed)
 }
 
 /// The filesystem's block size, for a caller that places file data itself (`nxinstall`).
@@ -363,16 +271,7 @@ fn writable(sb: &[u8; 1024]) -> Result<(), Unservable> {
 
 /// Read inode `ino` into a fixed 256-byte buffer (inodes are ≤ 256 bytes here).
 pub(crate) fn read_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<[u8; 256], FsError> {
-    if ino == 0 {
-        return Err(FsError::Corrupt);
-    }
-    let group = (ino - 1) / sb.inodes_per_group;
-    let index = (ino - 1) % sb.inodes_per_group;
-    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
-    let mut gd = [0u8; 32];
-    r.read_meta(gd_off, &mut gd)?;
-    let inode_table = rd_u32(&gd, 8) as u64;
-    let off = inode_table * sb.block_size as u64 + index as u64 * sb.inode_size as u64;
+    let off = inode_offset(r, sb, ino)?;
     let mut inode = [0u8; 256];
     let n = (sb.inode_size as usize).min(256);
     r.read_meta(off, &mut inode[..n])?;
@@ -682,11 +581,34 @@ pub fn map_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [crate::BlockRun])
     Ok(MappedFile { size, block_size: bs, runs: n, ino })
 }
 
-fn bit_clear(map: &[u8], i: usize) -> bool {
-    map[i / 8] & (1 << (i % 8)) == 0
-}
-fn bit_set(map: &mut [u8], i: usize) {
-    map[i / 8] |= 1 << (i % 8);
+/// A bitmap block as read: a bit past its bytes is `Corrupt`, never an index past the buffer or
+/// into the unread tail of a larger one.
+struct Bitmap<'a>(&'a mut [u8]);
+
+impl Bitmap<'_> {
+    fn byte(&mut self, i: usize) -> Result<&mut u8, FsError> {
+        self.0.get_mut(i / 8).ok_or(FsError::Corrupt)
+    }
+    fn is_free(&mut self, i: usize) -> Result<bool, FsError> {
+        Ok(*self.byte(i)? & (1 << (i % 8)) == 0)
+    }
+    fn set(&mut self, i: usize) -> Result<(), FsError> {
+        *self.byte(i)? |= 1 << (i % 8);
+        Ok(())
+    }
+    fn unset(&mut self, i: usize) -> Result<(), FsError> {
+        *self.byte(i)? &= !(1 << (i % 8));
+        Ok(())
+    }
+    /// The first free bit below `end`.
+    fn first_free(&mut self, end: usize) -> Result<Option<usize>, FsError> {
+        for i in 0..end {
+            if self.is_free(i)? {
+                return Ok(Some(i));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Whether block `blk`'s bit is set in its group's bitmap: what a test asks of each mapped block.
@@ -698,7 +620,7 @@ pub(crate) fn block_in_use<R: BlockReader>(r: &R, sb: &Superblock, blk: u64) -> 
     r.read_at(sb.group_desc_offset(group), &mut gd[..(sb.desc_size as usize).min(64)]).unwrap();
     let mut byte = [0u8; 1];
     r.read_at(rd_u32(&gd, 0) as u64 * sb.block_size as u64 + index as u64 / 8, &mut byte).unwrap();
-    !bit_clear(&byte, index % 8)
+    !Bitmap(&mut byte).is_free(index % 8).unwrap()
 }
 
 /// Resolve an absolute path to `(inode_number, inode_bytes)`, walking from the root inode.
@@ -805,9 +727,8 @@ fn touch_inode<RW: BlockReader + BlockWriter>(
 }
 
 pub(crate) fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<u64, FsError> {
-    let group = (ino - 1) / sb.inodes_per_group;
-    let index = (ino - 1) % sb.inodes_per_group;
-    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let (group, index) = sb.inode_place(ino)?;
+    let gd_off = sb.group_desc_offset(group);
     let mut gd = [0u8; 32];
     r.read_meta(gd_off, &mut gd)?;
     let inode_table = rd_u32(&gd, 8) as u64;
@@ -861,13 +782,14 @@ pub(crate) fn alloc_run<RW: BlockReader + BlockWriter>(
         let capacity = sb.blocks_in_group(group);
         let bitmap_block = rd_u32(&gd, 0) as u64; // bg_block_bitmap_lo
         rw.read_meta(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+        let mut map = Bitmap(&mut bitmap[..bs]);
 
         let group_start = sb.group_start(group);
         let goal_idx = goal.checked_sub(group_start).unwrap_or(u64::MAX) as usize;
-        let start = if n == 0 && goal_idx < capacity && bit_clear(&bitmap, goal_idx) {
+        let start = if n == 0 && goal_idx < capacity && map.is_free(goal_idx)? {
             goal_idx
         } else {
-            match (0..capacity).find(|&i| bit_clear(&bitmap, i)) {
+            match map.first_free(capacity)? {
                 Some(i) => i,
                 // The descriptor's count disagreed with its bitmap. Not fatal, and not this
                 // function's to repair: move on rather than fail with space elsewhere.
@@ -877,8 +799,8 @@ pub(crate) fn alloc_run<RW: BlockReader + BlockWriter>(
         // No more than the descriptor says is free, so its count cannot wrap below zero.
         let most = want.max(1).min(gfree as u64) as usize;
         let mut len = 0;
-        while len < most && start + len < capacity && bit_clear(&bitmap, start + len) {
-            bit_set(&mut bitmap, start + len);
+        while len < most && start + len < capacity && map.is_free(start + len)? {
+            map.set(start + len)?;
             len += 1;
         }
         rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
@@ -1090,10 +1012,11 @@ fn alloc_inode<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock) -> Resul
         let capacity = sb.inodes_in_group(group);
         let ibitmap_block = rd_u32(&gd, 4) as u64; // bg_inode_bitmap_lo
         rw.read_meta(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
-        let Some(idx) = (0..capacity).find(|&i| bit_clear(&bitmap, i)) else {
+        let mut map = Bitmap(&mut bitmap[..bs]);
+        let Some(idx) = map.first_free(capacity)? else {
             continue; // the count disagreed with the bitmap; try the next group
         };
-        bit_set(&mut bitmap, idx);
+        map.set(idx)?;
         rw.write_at(ibitmap_block * sb.block_size as u64, &bitmap[..bs])?;
 
         // Free-inode counts: group descriptor @14 (u16) + superblock @16 (u32).
@@ -1269,10 +1192,6 @@ const DIR_LINK_MAX: i32 = 65_000;
 /// orphan-list link.
 const DELETION_TIME: u32 = 1_700_000_000;
 
-fn bit_unset(map: &mut [u8], i: usize) {
-    map[i / 8] &= !(1 << (i % 8));
-}
-
 /// Allocate one block and append it to `inode`'s tree as logical block `next_lb`, extending the
 /// last extent when the allocation continues it. Returns the physical block. The caller owns
 /// `inode`: only the in-memory copy changes. On an error the block goes back and the tree is as
@@ -1302,13 +1221,15 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     now: i64,
 ) -> Result<(), FsError> {
     let bs = sb.block_size as usize;
-    let group = (ino - 1) / sb.inodes_per_group;
-    let index = ((ino - 1) % sb.inodes_per_group) as usize;
-    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let (group, index) = sb.inode_place(ino)?;
+    let gd_off = sb.group_desc_offset(group);
     let dsz = (sb.desc_size as usize).min(64);
     let mut gd = [0u8; 64];
     rw.read_meta(gd_off, &mut gd[..dsz])?;
     let ibitmap_block = rd_u32(&gd, 4) as u64;
+    let mut bitmap = [0u8; MAX_BLOCK];
+    rw.read_meta(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+    Bitmap(&mut bitmap[..bs]).unset(index)?;
 
     // Mark the inode itself deleted: `e2fsck` decides an inode is in use from `i_links_count` +
     // `i_dtime`, *not* the bitmap. Zero `i_links_count` (@26) and stamp `i_dtime` (@20).
@@ -1323,10 +1244,6 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     inode[20..24].copy_from_slice(&dtime.to_le_bytes()); // i_dtime
     inode[26..28].copy_from_slice(&0u16.to_le_bytes()); // i_links_count = 0
     rw.write_at(ioff, &inode[..n])?;
-
-    let mut bitmap = [0u8; MAX_BLOCK];
-    rw.read_meta(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
-    bit_unset(&mut bitmap, index);
     rw.write_at(ibitmap_block * sb.block_size as u64, &bitmap[..bs])?;
 
     // Group free-inode count (@14, u16) + optionally used-dirs count (@16, u16).
@@ -1383,10 +1300,11 @@ pub(crate) fn free_run<RW: BlockReader + BlockWriter>(
         rw.read_meta(gd_off, &mut gd[..dsz])?;
         let bitmap_block = rd_u32(&gd, 0) as u64;
         rw.read_meta(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+        let mut map = Bitmap(&mut bitmap[..bs]);
         let mut cleared = 0u16;
         for i in index..index + n {
-            if !bit_clear(&bitmap, i) {
-                bit_unset(&mut bitmap, i);
+            if !map.is_free(i)? {
+                map.unset(i)?;
                 cleared += 1;
             }
         }

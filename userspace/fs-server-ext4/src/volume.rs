@@ -637,6 +637,7 @@ mod tests {
             Unservable::Wide64Bit,
             Unservable::BlockTooLarge { log: u32::MAX },
             Unservable::ZeroField("s_inodes_per_group"),
+            Unservable::Geometry("s_blocks_per_group"),
             Unservable::RootUnreadable,
             Unservable::RootNotDirectory { mode: 0xFFFF },
             Unservable::StateUnwritable,
