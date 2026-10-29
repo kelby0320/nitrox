@@ -325,3 +325,18 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-28	404	0627fab5	11	rules-and-docs	optional	unverified	fixed	9602f43e	the spec says the handle is checked before the terminal
 2026-10-28	404	0627fab5	12	rules-and-docs	optional	demonstrated	fixed	9602f43e	rewrapped
 2026-10-28	404	0627fab5	13	architecture	optional	unverified	deferred		TODO(mount-write-authority), whose trigger names a shared /store; its entry and the decision log record the case
+2026-10-28	405	2eae0653	1	tests	blocking	demonstrated	fixed	46e32fc5	session_tests.rs against a spy volume: each of entry_name's four checks removed fails it
+2026-10-28	405	2eae0653	2	logic	worth-fixing	demonstrated	fixed	46e32fc5	create_file and rename check only a new entry; a Linux-made tab name is opened and replaced
+2026-10-28	405	2eae0653	3	tests	worth-fixing	demonstrated	fixed	46e32fc5	session_tests.rs: touch, freeing, the rename's new-name check, release and the listing error each pinned
+2026-10-28	405	2eae0653	4	tests	worth-fixing	demonstrated	fixed	46e32fc5	Dir's bodies built by name_body/rename_body, sized by their return types; old constants fail the test
+2026-10-28	405	2eae0653	5	tests	worth-fixing	demonstrated	fixed	46e32fc5	sibling lists and a chain of records alone; both mutations fail
+2026-10-28	405	2eae0653	6	tests	worth-fixing	demonstrated	fixed	46e32fc5	a_start_keeps_only_its_ends_and_stages; either early close removed fails it
+2026-10-28	405	2eae0653	7	tests	worth-fixing	demonstrated	fixed	46e32fc5	the fake scripts completions; the status and byte-count halves each fail the new test
+2026-10-28	405	2eae0653	8	architecture	worth-fixing	demonstrated	fixed	46e32fc5	an absent nullable spends from the budget; the head accepted 30,000 values in 20,030 bytes
+2026-10-28	405	2eae0653	9	logic	optional	demonstrated	fixed	46e32fc5	receive_holds_the_cap_on_the_last_message; last-first fails it
+2026-10-28	405	2eae0653	10	logic	optional	demonstrated	fixed	46e32fc5	boot-probe sends to a peer already gone; test-qemu fails with the close removed
+2026-10-28	405	2eae0653	11	logic	optional	demonstrated	fixed	46e32fc5	Dir sends up to MAX_SESSION_NAME (765); the client half of the long-name path
+2026-10-28	405	2eae0653	12	logic	optional	demonstrated	fixed	46e32fc5	mkfs caps inodes per group at the bitmap's bits; 16,384 at 1 KiB on the head
+2026-10-28	405	2eae0653	13	tests	optional	demonstrated	fixed	46e32fc5	inode 0 tested; within's 512-level bound declined: predates this PR, untouched by it
+2026-10-28	405	2eae0653	14	architecture	optional	unverified	fixed	46e32fc5	send_setup_full's doc: no Err can be retried; the setup comment no longer calls SinkFull retryable
+2026-10-28	405	2eae0653	15	architecture	optional	demonstrated	fixed	46e32fc5	the crate rules say the loop's buffers are on its stack

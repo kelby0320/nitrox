@@ -157,6 +157,39 @@ mod tests {
         (buf, n)
     }
 
+    /// **A suffix over `MAX_SUFFIX` opens no directory session**, and is refused `TooLarge`: cut to
+    /// its first 1,024 bytes it named `eeee`, a sibling of the 80-byte name it asked for.
+    #[test]
+    fn a_suffix_past_the_longest_opens_no_directory() {
+        use crate::test_support::RwImage;
+        use libfsserver::serve::{MAX_SUFFIX, directory_open};
+        let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+        let vol = Ext4(&rw);
+        let mut path = Vec::new();
+        for c in *b"abcd" {
+            vol.mkdir_at(vol.resolve_dir(&path).unwrap(), &[c; 254], 0).unwrap();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(&[c; 254]);
+        }
+        vol.mkdir_at(vol.resolve_dir(&path).unwrap(), b"eeee", 0).unwrap();
+        path.push(b'/');
+        let cut = vol.resolve_dir(&[&path[..], b"eeee"].concat()).unwrap();
+        path.extend_from_slice(&[b'e'; 80]);
+        assert_eq!(path.len(), MAX_SUFFIX + 76);
+        assert_eq!(vol.resolve_dir(&path[..MAX_SUFFIX]), Ok(cut), "its first bytes name `eeee`");
+        let mut body = [0u8; 2048];
+        let n = resolve_request(&mut body, 0x8000, 0, &path).unwrap();
+        let mut req = [0u8; 4096];
+        let len = encode(&mut req, OP_NS_RESOLVE, 3, 0, &body[..n], 0).unwrap();
+        assert_eq!(directory_open(&vol, &req[..len]), None);
+        let (mut content, mut reply) = ([0u8; ext4::MAX_FILE], [0u8; 4096]);
+        let Served::Error { reply_len } = serve(&vol, &req[..len], &mut content, &mut reply) else { panic!() };
+        let e = parse_error(decode(&reply[..reply_len]).unwrap().body).unwrap();
+        assert_eq!(e.kerror, KError::TooLarge as i32);
+    }
+
     #[test]
     fn resolves_a_file_to_a_memobj_reply() {
         let r = ImageReader(fixture(1024, b"nitrox-gen-0001\n"));
@@ -637,6 +670,7 @@ mod tests {
             Unservable::Wide64Bit,
             Unservable::BlockTooLarge { log: u32::MAX },
             Unservable::ZeroField("s_inodes_per_group"),
+            Unservable::Geometry("s_blocks_per_group"),
             Unservable::RootUnreadable,
             Unservable::RootNotDirectory { mode: 0xFFFF },
             Unservable::StateUnwritable,

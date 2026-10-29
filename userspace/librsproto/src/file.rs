@@ -377,6 +377,14 @@ pub fn parse_name_request(body: &[u8]) -> Option<&[u8]> {
     Some(&body[2..2 + n])
 }
 
+/// The longest name a session request carries: a FAT name of 255 UTF-16 units, up to 765 bytes of
+/// UTF-8. A listing entry holds at most [`MAX_NAME`].
+pub const MAX_SESSION_NAME: usize = 765;
+/// The largest name request body: a name of [`MAX_SESSION_NAME`] bytes and its length.
+pub const NAME_REQUEST_MAX: usize = 2 + MAX_SESSION_NAME;
+/// The largest `Rename` request body: two names of [`MAX_SESSION_NAME`] bytes, each with its length.
+pub const RENAME_REQUEST_MAX: usize = 2 * NAME_REQUEST_MAX;
+
 /// Write a `Rename` request body: `u16 old_len + old + u16 new_len + new`.
 pub fn rename_request(out: &mut [u8], old: &[u8], new: &[u8]) -> Option<usize> {
     if old.len() > u16::MAX as usize || new.len() > u16::MAX as usize {
@@ -447,6 +455,15 @@ mod tests {
         let n = rename_request(&mut buf, b"before", b"after").unwrap();
         assert_eq!(parse_rename_request(&buf[..n]).unwrap(), (&b"before"[..], &b"after"[..]));
         assert!(parse_rename_request(&[0u8; 1]).is_none());
+    }
+
+    #[test]
+    fn rename_request_takes_two_longest_names() {
+        let name = [b'n'; MAX_SESSION_NAME];
+        let mut buf = [0u8; RENAME_REQUEST_MAX];
+        let n = rename_request(&mut buf, &name, &name).unwrap();
+        assert_eq!(n, RENAME_REQUEST_MAX);
+        assert_eq!(parse_rename_request(&buf[..n]).unwrap(), (&name[..], &name[..]));
     }
 
     #[test]

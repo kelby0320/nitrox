@@ -57,7 +57,8 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   "sector-at-a-time" until 2026-10-06), and a grow's zeroes up to 64 KiB a submit
   (`write_zeroes`, Phase 6 Part H.4) — **served through `libfsserver::cache::MetaCache`** since
   Phase 6 Part H.4, so a directory, an inode-table block or a bitmap is read from the device once.
-  **Alloc-free** — fixed `.bss` buffers, the cache's 1 MiB among them, no `#[global_allocator]`.
+  **Alloc-free** — the cache's 1 MiB in `.bss`, the loop's buffers in one `Server` on its stack, no
+  `#[global_allocator]`.
 
 ## Scope
 
@@ -119,8 +120,8 @@ holds `BIND_NAMESPACE` — the supervisor (init, or the storage service) binds i
 
 ## Forbidden
 
-- `alloc` in the library half (`ext4.rs`, `extent.rs`, `mkfs.rs`, `volume.rs`, `lib.rs`) —
-  buffer-based only.
+- `alloc` in the library half (`ext4.rs`, `extent.rs`, `mkfs.rs`, `volume.rs`, `lib.rs`, and the
+  modules under them) — buffer-based only.
   The list names every module because a rules file that enumerates three of four is one that
   permits the fourth by omission (PR #310 review).
 - Reading **file data with `read_meta`** — the kernel writes it behind the server's back, so a

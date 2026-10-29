@@ -17,13 +17,11 @@
 "userspace/compositor/src/main.rs" = 2293
 "userspace/desktop-shell/src/main.rs" = 1483
 "userspace/desktop-shell/src/panel.rs" = 1211
-"userspace/fs-server-ext4/src/ext4.rs" = 2032
-"userspace/fs-server-ext4/src/extent.rs" = 1388
+"userspace/fs-server-ext4/src/ext4.rs" = 1846
 "userspace/fs-server-ext4/src/lib.rs" = 1764
 "userspace/init/src/main.rs" = 1025
 "userspace/libdraw/src/compose.rs" = 1510
 "userspace/libdraw/src/theme.rs" = 1086
-"userspace/libfsserver/src/server.rs" = 1028
 "userspace/librsproto/src/surface.rs" = 2567
 "userspace/libsession/src/lib.rs" = 1120
 "userspace/libsurface/src/lib.rs" = 1423
@@ -37,7 +35,7 @@
 "userspace/nxfiles/src/tests.rs" = 2275
 "userspace/nxsh/src/eval.rs" = 4137
 "userspace/nxsh/src/lex.rs" = 1089
-"userspace/nxsh/src/main.rs" = 1126
+"userspace/nxsh/src/main.rs" = 1014
 "userspace/nxsh/src/ops.rs" = 1079
 "userspace/nxsh/src/parse.rs" = 1867
 "userspace/nxterm/src/lib.rs" = 2341
@@ -46,4 +44,4 @@
 "userspace/test-harness/src/harness.rs" = 3953
 "userspace/test-harness/src/uiclient.rs" = 1265
 "userspace/view-broker/src/lib.rs" = 1646
-"userspace/view-broker/src/main.rs" = 1811
+"userspace/view-broker/src/main.rs" = 1809

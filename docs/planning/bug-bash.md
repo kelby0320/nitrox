@@ -1212,7 +1212,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   end` changed to `if false`, and the header_size range, entry_len check, `count == 0` and
   `count > 1024` mutated one by one. All 19 libgpt tests passed each time. Restored. tests.
   High. **Later.**
-- [ ] **proto-7** `userspace/libstream/src/wire.rs:532` — `read_value` and `read_list` recurse
+- [x] **proto-7** `userspace/libstream/src/wire.rs:532` — `read_value` and `read_list` recurse
   with no depth limit, and so does a Record through `Schema::decode` and `read_row_values`. A
   List level costs 5 bytes and a Record level 8, and dropping or displaying a decoded value
   recurses too. The spec says values "may nest arbitrarily", and no deferral covers a depth
@@ -1225,7 +1225,8 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   with 'thread has overflowed its stack' (SIGABRT). Probes removed. logic, error-paths,
   trust-boundary, tests, architecture. Medium. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's proto-d2, which repeats it.
-- [ ] **proto-8** `userspace/libstream/src/wire.rs:590` — Decoding is not proportional to input.
+  Fixed in `10bcbb11`, as the survey's proto-d2.
+- [x] **proto-8** `userspace/libstream/src/wire.rs:590` — Decoding is not proportional to input.
   A Null-typed column takes 0 bytes per row and a row is one REC_DATA byte, but
   `read_row_values` allocates a 32-byte Value per column per row, so decoding allocates
   columns × rows × 32 bytes. A stage emits N Null columns and M bare REC_DATA bytes. nxsh's
@@ -1240,6 +1241,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   of 131072 bytes failed' against a 2 GiB cap. A 5,017-byte stream with 1,000 columns and 1,000
   rows gave ~32 MB. Probes removed. error-paths, trust-boundary, architecture. Medium. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's proto-d3, which repeats it.
+  Fixed in `10bcbb11`, as the survey's proto-d3.
 - [x] **proto-9** `userspace/libstream/src/channel.rs:234` — `IpcPort::recv` passes `recv_handles`
   and `count` to SYS_CHANNEL_RECV, which installs every transferred handle in the receiver's
   table, and never closes or returns them. nxsh's `drain_diagnostics` (main.rs:127-132) and
@@ -1303,7 +1305,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   `a_file_blocks_header_claiming_more_runs_than_its_body_holds_is_refused` and
   `a_block_map_the_page_cache_cannot_use_is_refused`; the channel depth falls to 512, the deepest
   whose ring fits.
-- [ ] **proto-14** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes
+- [x] **proto-14** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes
   `f.name.len() as u16` without refusing names over u16::MAX, and `WireErrorRecord::encode` does
   the same for `field_name` (line 733). Encoding reports Ok with a wrapped length, and the
   reader parses the rest of the name's bytes as the field's type, modifiers and the stream's
@@ -1313,7 +1315,8 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   one field "ab" of type Int and failed with Err(BadRecordTag(122)) on the next name byte
   (`cargo test -p libstream --lib`). Probe removed. logic. Low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's proto-d7, which repeats it.
-- [ ] **proto-15** `userspace/libgpt/src/table.rs:298` — `read()` computes disk_blocks as
+  Fixed in `10bcbb11`, as the survey's proto-d7.
+- [x] **proto-15** `userspace/libgpt/src/table.rs:298` — `read()` computes disk_blocks as
   header[32..40] + 1, which overflows when a valid-CRC header carries backup_lba u64::MAX. A
   build with overflow checks panics 'attempt to add with overflow' in the storage service or
   installer. In release, which userspace uses, it wraps to 0, and no production caller reads
@@ -1323,6 +1326,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   panicked at table.rs:298. The release wrap is by inspection of the profile, not run. Probe
   removed. tests. Low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's proto-d4, which repeats it.
+  Fixed in `10bcbb11`, as the survey's proto-d4.
 - [ ] **proto-16** `kernel/src/rsproto.rs:408` — Several kernel codec guards are untested:
   `forget_request`'s magic check, the u16::MAX suffix limit in `build_resolve_request`,
   `build_read_range_request` and `build_resolve_request_rename`, and the error-body minimum

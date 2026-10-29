@@ -305,7 +305,7 @@ fn run_stage_consumer(setup: &libstream::setup::Setup) -> ! {
             exit(1);
         }
     };
-    let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive() {
+    let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive(1 << 20) {
         Ok(b) => b,
         Err(_) => {
             kprint(b"test-stage: stdin receive FAIL\n");

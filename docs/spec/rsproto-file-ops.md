@@ -136,7 +136,9 @@ then `entry_count` packed entries. Each entry is a **24-byte prefix** followed b
 | 16 | `mtime` | `i64` | Modification time, seconds since the Unix epoch; `0` if unknown |
 
 `next_cursor == 0` means the listing is complete. A `cursor` is opaque to the
-client — for the ext4 server it is a byte offset into the directory's data.
+client — for the ext4 server it is a byte offset into the directory's data, and
+one that falls inside an entry, made up or left there by a removal since,
+resumes at the next entry; for FAT it counts directory slots.
 
 **Why the metadata is in the entry.** `list` reports
 `Table<{name, size, kind, modified}>`, and carrying those fields inline keeps a
@@ -165,7 +167,10 @@ or touch `..` would reach past the directory it is confined to. A server refuses
 request that names an entry, a rename's two names and a session's touch among them,
 `Unsupported`, before its filesystem sees them (`libfsserver::serve::entry_name`). **How long a
 name may be is the filesystem's**: ext4 refuses one past 255 bytes, `Unsupported`, and FAT one past
-255 UTF-16 units, `InvalidArgument`, which in UTF-8 can be 765 bytes.
+255 UTF-16 units, `InvalidArgument`, which in UTF-8 can be 765 bytes; a request carries a name up
+to that (`librsproto::file::MAX_SESSION_NAME`), though a listing entry holds at most 255. **Neither
+writes a new name with a control character**, a NUL among them; a name already on the disk with one
+is still found, opened and replaced.
 
 ### Rename (`0x0605`)
 

@@ -166,7 +166,7 @@ fn stream_transport_demo() {
     };
 
     let mut rx = ChannelReceiver::new(IpcPort::new(e1));
-    let bytes = match rx.receive() {
+    let bytes = match rx.receive(1 << 20) {
         Ok(b) => b,
         Err(_) => {
             kprint(b"test-harness: stream receive FAIL\n");
@@ -264,7 +264,7 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     };
 
     let streams = Streams { stdin: Some(stage_stdin), stdout: None, stderr: None };
-    if send_setup(setup_shell, &streams, &["stage", "500"]).is_err() {
+    if send_setup(setup_shell, streams, &["stage", "500"]).is_err() {
         kprint(b"test-harness: stage send_setup FAIL\n");
         exit(1);
     }
@@ -1373,12 +1373,12 @@ fn run_coreutil_capture_in(
         stdout: Some(list_stdout),
         stderr: None,
     };
-    if send_setup(setup_shell, &streams, argv).is_err() {
+    if send_setup(setup_shell, streams, argv).is_err() {
         return_fail(b"test-harness: list send_setup FAIL\n");
     }
 
     let out = if consume {
-        match ChannelReceiver::new(IpcPort::new(rx)).receive() {
+        match ChannelReceiver::new(IpcPort::new(rx)).receive(1 << 20) {
             Ok(b) => b,
             Err(_) => return_fail(b"test-harness: list stdout receive FAIL\n"),
         }
@@ -1498,12 +1498,12 @@ fn dead_stage_closes_its_pipe_demo(root_ns: u64, notif: u64) {
         Err(_) => return_fail(b"test-harness: dead-stage spawn FAIL\n"),
     };
     let streams = Streams { stdin: None, stdout: Some(stdout), stderr: None };
-    if send_setup(setup_shell, &streams, &["list", "/nx-no-such-directory"]).is_err() {
+    if send_setup(setup_shell, streams, &["list", "/nx-no-such-directory"]).is_err() {
         return_fail(b"test-harness: dead-stage send_setup FAIL\n");
     }
 
     // The stage writes nothing and exits non-zero: `PeerClosed`, not a hang.
-    match ChannelReceiver::new(IpcPort::new(rx)).receive() {
+    match ChannelReceiver::new(IpcPort::new(rx)).receive(1 << 20) {
         Err(WireError::PeerClosed) => {}
         Err(_) => return_fail(b"test-harness: dead-stage receive failed for the wrong reason\n"),
         Ok(_) => return_fail(b"test-harness: dead-stage produced a stream it should not have\n"),
@@ -2386,12 +2386,12 @@ fn run_coreutil_in(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], child_
         Err(_) => return_fail(b"test-harness: coreutil spawn FAIL\n"),
     };
     let streams = Streams { stdin: None, stdout: Some(stdout), stderr: None };
-    if send_setup(setup_shell, &streams, argv).is_err() {
+    if send_setup(setup_shell, streams, argv).is_err() {
         return_fail(b"test-harness: copy send_setup FAIL\n");
     }
     // Drain first, then reap. A **failing** `copy` exits without writing, so the receive must end
     // in `PeerClosed`; that needs the exit-time handle sweep, without which this call hangs.
-    let _ = ChannelReceiver::new(IpcPort::new(rx)).receive();
+    let _ = ChannelReceiver::new(IpcPort::new(rx)).receive(1 << 20);
     let code = reap_child_exit(notif);
     drop(_proc);
     // SAFETY: closing our own handles.
@@ -3392,7 +3392,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
             }
         }
         let streams = Streams { stdin: None, stdout: None, stderr: None };
-        if send_setup(setup_shell, &streams, &["fp", SEEDS[i]]).is_err() {
+        if send_setup(setup_shell, streams, &["fp", SEEDS[i]]).is_err() {
             kprint(b"test-harness: hard-float send_setup FAIL\n");
             exit(1);
         }

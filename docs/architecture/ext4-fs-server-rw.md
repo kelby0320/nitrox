@@ -123,7 +123,11 @@ the name and left an unattached inode holding its blocks.
   that held them, shortens the one across it, frees each tree block left empty, and **folds**
   what is left back into the inode while it fits: an index over one child of four entries or fewer
   takes them in its place. Without the fold a cut leaves a tree `e2fsck` calls a level too deep.
-  A file is freed whole by cutting at `0`.
+  A file is freed whole by cutting at `0`. **Every node a cut reads has its keys rising inside the
+  range its parent's entry gives it**, the root's inside all of them, and an empty node is not
+  freed. So a block holding entries has one place in the tree, and a crafted tree that names one
+  child under many entries is `Corrupt` rather than walked once per entry at every level, which
+  kept the server in one unlink for practically ever, and rather than freed while still named.
 - **Looking up** (`extent::Lookup`) reads a leaf when a walk reaches it and keeps it while the walk
   stays inside, so a block map, a directory scan or a read costs a read per leaf, not a descent
   per block.

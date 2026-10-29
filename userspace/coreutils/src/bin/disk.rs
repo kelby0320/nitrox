@@ -509,7 +509,7 @@ fn flush(device: u64) -> bool {
     // SAFETY: `device` is a block device handle with WRITE; `&op` is a valid `IoOp`.
     let po =
         unsafe { libkern::syscall::syscall2(libkern::syscall::SYS_IO_SUBMIT, device, (&op as *const IoOp) as u64) };
-    po >= 0 && libfsserver::disk::po_wait(po as u64).0 == 0
+    po >= 0 && matches!(libfsserver::disk::po_wait(po as u64), Some((0, _)))
 }
 
 /// **Wait for a ping on `watch` until `deadline`**, and take every one queued: `false` at the

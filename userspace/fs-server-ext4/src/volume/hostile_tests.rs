@@ -230,3 +230,141 @@ fn an_rmdir_takes_a_link_only_from_a_directory() {
     let sb = read_superblock(&img).unwrap();
     assert_eq!(rd_u16(&read_inode(&img, &sb, file).unwrap(), 26), 1, "the file keeps its link");
 }
+
+/// Byte offset of `group`'s descriptor in an image of `bs`-byte blocks.
+fn descriptor(bs: u32, group: u32) -> usize {
+    (if bs == 1024 { 2 } else { 1 }) * bs as usize + 32 * group as usize
+}
+
+/// **A group wider than its bitmap block is refused**, by the check and by each request, as Linux
+/// refuses it. Past the bits read, the allocator took its scratch's unread zeroes for free blocks,
+/// giving one block to two files at 1 KiB blocks, and at 4 KiB indexed past the scratch.
+#[test]
+fn a_group_wider_than_its_bitmap_block_is_refused() {
+    for (bs, blocks, per_group) in [(4096u32, 4096u32, 65536u32), (1024, 16384, 16384)] {
+        let img = RwImage(RefCell::new(fixture_blocks(bs, blocks, 0, b"g\n")));
+        let vol = Ext4(&img);
+        vol.create_file(b"/system", b"a", NOW).unwrap();
+        vol.create_file(b"/system", b"b", NOW).unwrap();
+        let mut v = img.0.borrow_mut();
+        v[1024 + 32..1024 + 36].copy_from_slice(&per_group.to_le_bytes());
+        if bs == 4096 {
+            v[1024 + 4..1024 + 8].copy_from_slice(&per_group.to_le_bytes());
+        }
+        let gd = descriptor(bs, 0);
+        let bitmap = rd_u32(&v, gd) as usize * bs as usize;
+        v[bitmap..bitmap + bs as usize].fill(0xFF);
+        v[gd + 12..gd + 14].copy_from_slice(&100u16.to_le_bytes());
+        drop(v);
+        assert_eq!(vol.check(), Err(Unservable::Geometry("s_blocks_per_group")), "{bs}-byte blocks");
+        for name in [b"/system/a" as &[u8], b"/system/b"] {
+            let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vol.grow_file(name, 100_000, NOW)));
+            assert!(matches!(grown, Ok(Err(FsError::Corrupt))), "{bs}-byte blocks: {grown:?}");
+        }
+    }
+}
+
+/// Each of the superblock's group counts is held to its bitmap and to the groups, at its edge.
+#[test]
+fn a_superblock_is_held_to_its_groups_at_each_edge() {
+    for bs in [1024u32, 4096] {
+        let good = populated(bs);
+        let sb = |v: &[u8], off: usize| rd_u32(v, 1024 + off);
+        let with = |pokes: &[(usize, u32)]| {
+            let mut v = good.clone();
+            for &(off, value) in pokes {
+                v[1024 + off..1024 + off + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ext4(&RwImage(RefCell::new(v))).check()
+        };
+        let (bits, inodes) = (bs * 8, sb(&good, 0));
+        assert_eq!(sb(&good, 32), bits, "mke2fs fills a group's bitmap");
+        assert_eq!(with(&[(32, bits + 8)]), Err(Unservable::Geometry("s_blocks_per_group")));
+        assert_eq!(with(&[(40, bits), (0, bits)]), Ok(()), "{bs}: a full inode bitmap is a group");
+        assert_eq!(with(&[(40, bits + 8), (0, bits + 8)]), Err(Unservable::Geometry("s_inodes_per_group")));
+        assert_eq!(with(&[(0, inodes + 1)]), Err(Unservable::Geometry("s_inodes_count")));
+        assert_eq!(with(&[(0, inodes - 1)]), Err(Unservable::Geometry("s_inodes_count")));
+    }
+}
+
+/// **A record naming an inode past `s_inodes_count` is `Corrupt`**, and a removal of it writes
+/// nothing: its descriptor lies past the table, so whatever was there was taken for one, and the
+/// "inode" and bitmap a removal wrote were wherever that pointed.
+#[test]
+fn a_record_naming_an_inode_past_the_last_is_corrupt() {
+    for bs in [1024u32, 4096] {
+        for past in [1u32, 0x8000_0000] {
+            let img = RwImage(RefCell::new(populated(bs)));
+            let vol = Ext4(&img);
+            let inodes = rd_u32(&img.0.borrow(), 1024);
+            let d = vol.resolve_dir(b"/d").unwrap();
+            let at = records(&img, d as u32)
+                .into_iter()
+                .map(|r| r.0 as usize)
+                .find(|&at| img.0.borrow()[at + 6] == 1 && img.0.borrow()[at + 8] == b'f')
+                .unwrap();
+            img.0.borrow_mut()[at..at + 4].copy_from_slice(&(inodes.wrapping_add(past)).to_le_bytes());
+            let before = img.0.borrow().clone();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mapped = vol.map_file(b"/d/f", &mut [BlockRun::default(); 4]).map(|_| ());
+                (mapped, vol.unlink_at(d, b"f", NOW).map(|_| ()))
+            }));
+            assert!(ran.is_ok(), "{bs}, +{past}: panicked");
+            let (mapped, removed) = ran.unwrap();
+            assert_eq!(mapped, Err(FsError::Corrupt), "{bs}, +{past}: map");
+            assert_eq!(removed, Err(FsError::Corrupt), "{bs}, +{past}: remove");
+            assert!(*img.0.borrow() == before, "{bs}, +{past}: refused, it wrote nothing");
+        }
+    }
+}
+
+/// **A ReadDir cursor inside a record resumes at the next one**, as Linux's readdir does: a cursor
+/// into a name the client chose parsed the name as a record, and stat'ed an inode outside the
+/// directory the session is confined to. A cursor on a record still starts there.
+#[test]
+fn a_cursor_inside_a_record_resumes_at_the_next() {
+    let img = RwImage(RefCell::new(fixture_blocks(4096, 4096, 0, b"g\n")));
+    let vol = Ext4(&img);
+    vol.mkdir_at(2, b"box", NOW).unwrap();
+    let boxed = vol.resolve_dir(b"/box").unwrap();
+    vol.mkdir_at(boxed, b"twelve bytes", NOW).unwrap();
+    vol.mkdir_at(boxed, b"after", NOW).unwrap();
+    let at = records(&img, boxed as u32)[2].0 as usize;
+    // The name's bytes as a record of inode 14, `/system/current-generation`, named "X".
+    img.0.borrow_mut()[at + 8..at + 20].copy_from_slice(&[14, 0, 0, 0, 0x0C, 0x0C, 1, 1, b'X', b'Y', b'Z', b'W']);
+    let listed = |cursor: u64| {
+        let mut ids = Vec::new();
+        vol.read_dir(boxed, cursor, |e| {
+            ids.push(e.id);
+            true
+        })
+        .unwrap();
+        ids
+    };
+    let after = *listed(0).last().unwrap();
+    assert_eq!(listed(at as u64 % 4096 + 8), [after], "from inside the name");
+    assert_eq!(listed(at as u64 % 4096 + 20), [after], "from the next record");
+    assert_eq!(listed(at as u64 % 4096).len(), 2, "from the record itself");
+}
+
+/// **A name already on the disk with a control character is still opened and replaced**, as Linux
+/// wrote it and `e2fsck` passes it: only a new entry is refused one.
+#[test]
+fn a_control_character_in_an_existing_name_is_still_opened_and_replaced() {
+    let img = RwImage(RefCell::new(populated(4096)));
+    let vol = Ext4(&img);
+    vol.create_file(b"/d", b"aXb", NOW).unwrap();
+    vol.grow_file(b"/d/aXb", 5000, NOW).unwrap();
+    let d = vol.resolve_dir(b"/d").unwrap();
+    let at = records(&img, d as u32)
+        .into_iter()
+        .map(|r| r.0 as usize)
+        .find(|&at| &img.0.borrow()[at + 8..at + 11] == b"aXb")
+        .unwrap();
+    img.0.borrow_mut()[at + 9] = b'\t';
+    crate::test_support::assert_e2fsck_clean(&img.0.borrow(), "tab-name");
+    let made = vol.map_file(b"/d/a\tb", &mut [BlockRun::default(); 4]).unwrap().id;
+    assert_eq!(vol.create_file(b"/d", b"a\tb", NOW), Ok(()), "a create finds it");
+    assert_eq!(vol.rename_path(b"/d/f", b"/d/a\tb", true, NOW), Ok(Some(made)), "a rename replaces it");
+    assert_eq!(vol.create_file(b"/d", b"c\td", NOW), Err(FsError::Unsupported), "a new one is refused");
+}

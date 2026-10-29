@@ -10,7 +10,8 @@
 //! another syscall.
 
 use crate::file::{
-    DIR_ENTRY_PREFIX_LEN, DirEntry, name_request, parse_read_dir_reply, read_dir_request, rename_request,
+    DIR_ENTRY_PREFIX_LEN, DirEntry, NAME_REQUEST_MAX, RENAME_REQUEST_MAX, name_request, parse_read_dir_reply,
+    read_dir_request, rename_request,
 };
 use crate::{
     OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK, RS_HEADER_LEN,
@@ -155,14 +156,12 @@ impl<'a> Dir<'a> {
 
     /// Rename `old` to `new`, both within this directory.
     pub fn rename(&mut self, old: &[u8], new: &[u8]) -> Result<()> {
-        let mut body = [0u8; 512];
-        let n = rename_request(&mut body, old, new).ok_or(DirError::Protocol)?;
+        let (body, n) = rename_body(old, new).ok_or(DirError::Protocol)?;
         self.status_op(OP_FILE_RENAME, &body[..n])
     }
 
     fn name_op(&mut self, op: u16, name: &[u8]) -> Result<()> {
-        let mut body = [0u8; 258];
-        let n = name_request(&mut body, name).ok_or(DirError::Protocol)?;
+        let (body, n) = name_body(name).ok_or(DirError::Protocol)?;
         self.status_op(op, &body[..n])
     }
 
@@ -284,9 +283,36 @@ pub(crate) fn po_wait(po: u64) -> (i32, u64) {
 /// The most entries one `ReadDir` reply can carry — what a caller sizes a per-reply array by.
 pub const MAX_REPLY_ENTRIES: usize = crate::RS_MAX_BODY / DIR_ENTRY_PREFIX_LEN;
 
+/// A name request's body for `name`, or `None` for one past [`crate::file::MAX_SESSION_NAME`].
+fn name_body(name: &[u8]) -> Option<([u8; NAME_REQUEST_MAX], usize)> {
+    let mut body = [0u8; NAME_REQUEST_MAX];
+    let n = name_request(&mut body, name)?;
+    Some((body, n))
+}
+
+/// A `Rename` request's body, or `None` for a name past [`crate::file::MAX_SESSION_NAME`].
+fn rename_body(old: &[u8], new: &[u8]) -> Option<([u8; RENAME_REQUEST_MAX], usize)> {
+    let mut body = [0u8; RENAME_REQUEST_MAX];
+    let n = rename_request(&mut body, old, new)?;
+    Some((body, n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A session sends a name as long as a FAT holds**, 765 bytes, alone or two to a rename, and
+    /// refuses one byte more before sending anything.
+    #[test]
+    fn a_name_as_long_as_a_fat_holds_is_sent() {
+        use crate::file::{MAX_SESSION_NAME, parse_name_request, parse_rename_request};
+        let (long, past) = ([b'n'; MAX_SESSION_NAME], [b'n'; MAX_SESSION_NAME + 1]);
+        let (body, n) = name_body(&long).unwrap();
+        assert_eq!(parse_name_request(&body[..n]), Some(&long[..]));
+        let (body, n) = rename_body(&long, &long).unwrap();
+        assert_eq!(parse_rename_request(&body[..n]), Some((&long[..], &long[..])));
+        assert!(name_body(&past).is_none() && rename_body(&long, &past).is_none());
+    }
 
     /// Refused before anything is sent: a message one byte short reaches no syscall.
     #[test]

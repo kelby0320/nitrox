@@ -21,6 +21,7 @@ pub mod lex;
 pub mod ops;
 pub mod parse;
 pub mod paths;
+pub mod pipeline;
 pub mod regex;
 pub mod repl;
 pub mod search;

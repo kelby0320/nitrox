@@ -33,15 +33,15 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use fs_server_ext4::mkfs;
-use libfsserver::disk::PartitionIo;
+use libfsserver::disk::{PartitionIo, Scratch, po_wait};
 use libgpt::table::{self, BACK_BYTES, BLOCK, FRONT_BYTES};
 use libkern::abi::{
     BlockDeviceInfo, BlockKind, IO_OPCODE_FLUSH, IO_OPCODE_READ, IO_OPCODE_WRITE, IPC_PAYLOAD_SIZE, IoOp,
 };
-use libkern::handle::{RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, RIGHT_WRITE};
+use libkern::handle::{RIGHT_MAP_READ, RIGHT_READ, RIGHT_WRITE};
 use libkern::syscall::{
     SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall4, syscall6,
+    SYS_MEMORY_MAP, SYS_NS_LOOKUP, syscall1, syscall2, syscall4, syscall6,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
@@ -92,32 +92,8 @@ const FS_BLOCK: u64 = 4096;
 /// small filesystems and the cap large ones.
 const BYTES_PER_INODE: u32 = 16384;
 
-static mut WAIT_HANDLES: [u64; 1] = [0; 1];
-/// `sys_wait` results: one 24-byte `IoResult`, in a buffer rounded up to 32.
-static mut WAIT_RESULTS: [u8; 32] = [0; 32];
-
 static mut FRONT: [u8; FRONT_BYTES] = [0; FRONT_BYTES];
 static mut BACK: [u8; BACK_BYTES] = [0; BACK_BYTES];
-
-fn po_wait(po: u64) -> (i32, u64) {
-    // SAFETY: valid single-waiter buffers; the PO handle is ours.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = po;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-    };
-    // SAFETY: closing the PO we own.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
-    if waited != 1 {
-        return (-1, 0);
-    }
-    // SAFETY: written by the syscall above.
-    unsafe {
-        let r = (&raw const WAIT_RESULTS).read();
-        let status = i32::from_le_bytes([r[8], r[9], r[10], r[11]]);
-        let value = u64::from_le_bytes([r[16], r[17], r[18], r[19], r[20], r[21], r[22], r[23]]);
-        (status, value)
-    }
-}
 
 fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     // SAFETY: valid namespace handle and path slice.
@@ -125,25 +101,10 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     if po < 0 {
         return None;
     }
-    let (status, handle) = po_wait(po as u64);
-    if status != 0 || handle == 0 { None } else { Some(handle) }
-}
-
-fn scratch(size: u64) -> Option<(u64, u64)> {
-    // SAFETY: register-only syscall.
-    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, size, 0, 0, 0) };
-    if mem < 0 {
-        return None;
+    match po_wait(po as u64) {
+        Some((0, handle)) if handle != 0 => Some(handle),
+        _ => None,
     }
-    let mem = mem as u64;
-    // SAFETY: register-only syscall; `mem` is ours.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if addr < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
-        return None;
-    }
-    Some((mem, addr as u64))
 }
 
 /// 16 bytes from the kernel CSPRNG, for a partition GUID.
@@ -166,7 +127,7 @@ fn random_guid() -> Option<[u8; 16]> {
         if r == 0 {
             break true;
         }
-        if r < 0 || po_wait(r as u64).0 != 0 {
+        if r < 0 || !matches!(po_wait(r as u64), Some((0, _))) {
             break false;
         }
     };
@@ -193,57 +154,32 @@ impl Device {
         String::from_utf8_lossy(self.info.name()).into_owned()
     }
 
-    fn read_at(&self, io: &Io, at: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    fn read_at(&self, io: &Scratch, at: u64, buf: &mut [u8]) -> Result<(), &'static str> {
         let mut done = 0usize;
         while done < buf.len() {
             let n = core::cmp::min(CHUNK as usize, buf.len() - done);
-            io.submit(IO_OPCODE_READ, self.handle, at + done as u64, n as u64)?;
-            // SAFETY: `io.addr` maps `CHUNK` bytes read-write and `n <= CHUNK`.
-            let src = unsafe { core::slice::from_raw_parts(io.addr as *const u8, n) };
-            buf[done..done + n].copy_from_slice(src);
+            transfer(io, IO_OPCODE_READ, self.handle, at + done as u64, n as u64)?;
+            io.copy_out(0, &mut buf[done..done + n]);
             done += n;
         }
         Ok(())
     }
 
-    fn write_at(&self, io: &Io, at: u64, buf: &[u8]) -> Result<(), &'static str> {
+    fn write_at(&self, io: &Scratch, at: u64, buf: &[u8]) -> Result<(), &'static str> {
         let mut done = 0usize;
         while done < buf.len() {
             let n = core::cmp::min(CHUNK as usize, buf.len() - done);
-            // SAFETY: `io.addr` maps `CHUNK` bytes read-write and `n <= CHUNK`.
-            let dst = unsafe { core::slice::from_raw_parts_mut(io.addr as *mut u8, n) };
-            dst.copy_from_slice(&buf[done..done + n]);
-            io.submit(IO_OPCODE_WRITE, self.handle, at + done as u64, n as u64)?;
+            io.copy_in(0, &buf[done..done + n]).map_err(|_| "the transfer buffer is lost to an abandoned transfer")?;
+            transfer(io, IO_OPCODE_WRITE, self.handle, at + done as u64, n as u64)?;
             done += n;
         }
         Ok(())
     }
 }
 
-/// The transfer buffer every copy goes through: one `MemoryObject`, mapped once.
-struct Io {
-    mem: u64,
-    addr: u64,
-}
-
-impl Io {
-    /// Submit one transfer and wait for it. `length` must be at most [`CHUNK`].
-    fn submit(&self, opcode: u32, device: u64, offset: u64, length: u64) -> Result<(), &'static str> {
-        let op = IoOp { opcode, flags: 0, buffer: self.mem, buf_offset: 0, offset, length };
-        // SAFETY: `device` is a block device handle; `&op` is a valid `IoOp`.
-        let po = unsafe { syscall2(SYS_IO_SUBMIT, device, (&op as *const IoOp) as u64) };
-        if po < 0 {
-            return Err("the device refused the transfer");
-        }
-        let (status, moved) = po_wait(po as u64);
-        if status != 0 {
-            return Err("the transfer failed");
-        }
-        if moved != length {
-            return Err("the device moved fewer bytes than asked");
-        }
-        Ok(())
-    }
+/// One transfer through `io` and its failure as a line. `length` must be at most [`CHUNK`].
+fn transfer(io: &Scratch, opcode: u32, device: u64, offset: u64, length: u64) -> Result<(), &'static str> {
+    io.transfer(device, opcode, offset, length).map_err(|_| "the transfer failed")
 }
 
 /// Every block device in `ns`, in index order. Listed, not probed: probing `0`, `1`, … would stop
@@ -305,7 +241,7 @@ struct Sources<'a> {
 
 /// Find the two sources among the RAM disks by what they contain, not what they are called: a FAT
 /// boot sector, and a partition table naming [`SOURCE_LABEL`].
-fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
+fn sources<'a>(devs: &'a [Device], io: &Scratch) -> Result<Sources<'a>, String> {
     let mut esp = None;
     let mut root = None;
     let mut root_extent = (0, 0);
@@ -348,7 +284,7 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
     reason = "the two devices, offsets and the progress hook are separate inputs of one copy"
 )]
 fn copy(
-    io: &Io,
+    io: &Scratch,
     src: &Device,
     src_at: u64,
     dst: &Device,
@@ -361,8 +297,8 @@ fn copy(
     let mut reported = 0u64;
     while done < bytes {
         let n = core::cmp::min(CHUNK, bytes - done);
-        io.submit(IO_OPCODE_READ, src.handle, src_at + done, n).map_err(|e| format!("reading {what}: {e}"))?;
-        io.submit(IO_OPCODE_WRITE, dst.handle, dst_at + done, n).map_err(|e| format!("writing {what}: {e}"))?;
+        transfer(io, IO_OPCODE_READ, src.handle, src_at + done, n).map_err(|e| format!("reading {what}: {e}"))?;
+        transfer(io, IO_OPCODE_WRITE, dst.handle, dst_at + done, n).map_err(|e| format!("writing {what}: {e}"))?;
         done += n;
         if done - reported >= 8 * 1024 * 1024 || done == bytes {
             reported = done;
@@ -396,7 +332,7 @@ fn layout_for(target: &Device, srcs: &Sources) -> Result<nxinstall::Layout, Stri
 }
 
 fn install(
-    io: &Io,
+    io: &Scratch,
     target: &Device,
     srcs: &Sources,
     layout: &nxinstall::Layout,
@@ -521,7 +457,7 @@ fn flush(device: u64) -> Result<(), &'static str> {
     if po < 0 {
         return Err("the disk refused to flush its cache");
     }
-    if po_wait(po as u64).0 != 0 {
+    if !matches!(po_wait(po as u64), Some((0, _))) {
         return Err("the disk could not flush its cache");
     }
     Ok(())
@@ -804,11 +740,10 @@ fn run(
         return Outcome::NotInstalled;
     }
 
-    let Some((mem, addr)) = scratch(CHUNK) else {
+    let Some(io) = Scratch::new(CHUNK as usize) else {
         say("could not allocate a transfer buffer.");
         return Outcome::NotInstalled;
     };
-    let io = Io { mem, addr };
 
     let srcs = match sources(&devs, &io) {
         Ok(s) => s,

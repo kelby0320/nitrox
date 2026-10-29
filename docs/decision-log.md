@@ -37043,3 +37043,41 @@ Groups X and Y of the survey's triage, the shell and the test harness, made six 
 
 A kernel probe logging every unmap short of its mapping found, after these fixes, only device-mgr,
 storage-service and libsession's registry read, which are sup-d10 and sec-d9, in their groups.
+
+## 2026-10-28 — Before Phase 7, Part I: a crafted filesystem is refused, a server's state is its own, a pipeline gives back what it makes
+
+Groups U and V of the survey's triage, the filesystems and the protocols, made nine decisions:
+
+- **ext4 checks the superblock's geometry as Linux does**: no group of more blocks or inodes than
+  a bitmap block has bits, and `s_inodes_count` what the groups hold. A `Bitmap` over the bytes
+  read answers `Corrupt` past them as well, and an inode number past the count is `Corrupt`
+  (fs-d1). Without `64bit`, which is refused, a descriptor is 32 bytes whatever `s_desc_size` says,
+  as Linux reads it (fs-d2).
+- **An extent-tree node is read only inside the key range its parent's entry gives it**, the root
+  inside all of them, and an empty node is not freed. Keys sorted within each node, or a lower
+  bound alone, still let one block be named under many entries; with both bounds, a block holding
+  entries has one place in the tree, so a cut walks and frees it once (fs-d3).
+- **A ReadDir cursor inside a record resumes at the next record**, found from its block's start,
+  as Linux's readdir does, rather than being refused: a removal since the cursor was handed out
+  can leave an honest one inside a record (fs-d6). **A new ext4 name holds no control character**,
+  as FAT's do not (fs-d7).
+- **libfsserver's loop is one `Server` on `run`'s stack**, about 84 KiB of a server's 8 MiB, not a
+  static handed out once: a request is borrowed from its inbox, so the borrow checker, not a
+  `SAFETY` comment, keeps a receive from overwriting it (fs-d5, fs-o1). A session's request and the
+  choice of which resolve opens one moved into `serve`, host-tested through each volume (fs-d9,
+  fs-d10). The 1 MiB metadata store stays in `.bss`, as a `OnceStore` (fs-o11).
+- **A disk whose wait fails without the transfer done stops for good**: its scratch is the
+  device's, so it copies nothing in and submits nothing more, and answers `Io` (fs-d4). Waiting
+  again was the alternative, and a wait that keeps failing would spin the server.
+- **The typed-stream codec bounds what input can cost**: 64 levels of nesting, at most the
+  stream's length plus 4,096 values, a name of at most 65,535 bytes; `ChannelReceiver::receive`
+  takes a cap (proto-d2, d3, d6, d7).
+- **A setup message takes its handles on every return**, closing them itself when it cannot send,
+  so no caller closes one (proto-d5). The owning handle types that would say so in the signature
+  are P7's.
+- **nxsh's pipeline bookkeeping moved into the library half, behind a `Sys` trait**, as `Host` is,
+  so a fake fails each step of a start in turn: everything a pipeline makes is given back on any
+  return, and every stage not reaped is stopped and waited for (proto-d1, sh-o4).
+- **The initramfs tripwire is 412 KiB**: growth of its four programs, not a fifth, had taken it
+  over. The room left is less than the smallest of them, so a fifth still trips it. Stripping the
+  packed copies' symbols, about 42 KB in fs-server-ext4, would make lasting room, and is not done.

@@ -4,8 +4,8 @@
 //! endpoint, directory sessions, a rename resolved ahead of a session, `File::Forget` before a
 //! file's blocks are freed, `File::Touch` by id, and `Meta::Unmount`: a fix to one fixes both.
 //!
-//! `no_std`, no `alloc`: the server loop's buffers are statics, one set per process, which is one
-//! server. See `CLAUDE.md` beside this file.
+//! `no_std`, no `alloc`: the server loop's state is one `Server` on its `run`'s stack. See
+//! `CLAUDE.md` beside this file.
 
 #![cfg_attr(not(test), no_std)]
 

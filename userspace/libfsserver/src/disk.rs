@@ -3,9 +3,10 @@
 
 use crate::{BlockReader, BlockWriter, FsError};
 use core::cell::Cell;
-use core::marker::PhantomData;
 use core::ops::Range;
 use libkern::*;
+
+mod sys;
 
 const PAGE: u64 = 4096;
 /// The [`Disk`] transfer unit: one **4 KiB filesystem block** in **one** `sys_io_submit`. The
@@ -16,11 +17,16 @@ const IO_BLOCK: usize = 4096;
 /// Wait on one `PendingOperation`, read its `(status, result)` (`IoResult`: status @8, result
 /// @16) and close it. **On buffers of its own**: it must not overwrite the batch of results the
 /// server loop is walking.
-pub fn po_wait(po: u64) -> (i32, u64) {
-    let handles = [po];
+///
+/// `None` when the wait returned anything but one signalled record: the operation is **still
+/// running**, and a buffer it was given is the device's still.
+pub fn po_wait(po: u64) -> Option<(i32, u64)> {
     let mut results = [0u8; WAIT_RESULT_SIZE];
-    // SAFETY: `handles` and `results` are valid local buffers for one waiter.
-    let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+    let waited = sys::wait_one(po, &mut results);
+    sys::handle_close(po);
+    if waited != 1 {
+        return None;
+    }
     let status = i32::from_le_bytes([results[8], results[9], results[10], results[11]]);
     let result = u64::from_le_bytes([
         results[16],
@@ -32,9 +38,89 @@ pub fn po_wait(po: u64) -> (i32, u64) {
         results[22],
         results[23],
     ]);
-    // SAFETY: closing our own PO handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
-    if waited != 1 { (-1, 0) } else { (status, result) }
+    Some((status, result))
+}
+
+/// **The one buffer a device layer moves every transfer through**, a `MemoryObject` mapped for its
+/// life. **Once a wait fails without its transfer complete it is lost**: the device may still read or
+/// write it, so nothing is copied into it and nothing is submitted through it again.
+pub struct Scratch {
+    mem: u64,
+    addr: u64,
+    len: usize,
+    lost: Cell<bool>,
+}
+
+impl Scratch {
+    /// A scratch of `len` bytes; `None` if it could not be created or mapped.
+    pub fn new(len: usize) -> Option<Scratch> {
+        let mem = sys::memory_create(len as u64);
+        if mem < 0 {
+            return None;
+        }
+        let mem = mem as u64;
+        let addr = sys::memory_map(mem, len as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
+        if addr < 0 {
+            sys::handle_close(mem);
+            return None;
+        }
+        Some(Scratch { mem, addr: addr as u64, len, lost: Cell::new(false) })
+    }
+
+    /// One transfer of `len` bytes between the scratch and `device` at `offset`, waited for.
+    /// `Io` for a refusal, a failed or short transfer, or a scratch already lost.
+    pub fn transfer(&self, device: u64, opcode: u32, offset: u64, len: u64) -> Result<(), FsError> {
+        self.submit(device, self.mem, opcode, offset, len)
+    }
+
+    /// A transfer through `buffer`, a memory object of this process's: `transfer` names the
+    /// scratch's own. A wait that fails loses the scratch whichever buffer the transfer named,
+    /// since a write of zeroes that lands late is as wrong as any other.
+    pub(crate) fn submit(&self, device: u64, buffer: u64, opcode: u32, offset: u64, len: u64) -> Result<(), FsError> {
+        if self.lost.get() {
+            return Err(FsError::Io);
+        }
+        let op = IoOp { opcode, flags: 0, buffer, buf_offset: 0, offset, length: len };
+        let po = sys::io_submit(device, &op);
+        if po < 0 {
+            return Err(FsError::Io);
+        }
+        match po_wait(po as u64) {
+            None => {
+                self.lost.set(true);
+                Err(FsError::Io)
+            }
+            Some((0, moved)) if moved == len => Ok(()),
+            Some(_) => Err(FsError::Io),
+        }
+    }
+
+    /// Copy `src` into the scratch at `from`; `Io` once it is lost, as a write still in flight
+    /// would carry the new bytes.
+    pub fn copy_in(&self, from: usize, src: &[u8]) -> Result<(), FsError> {
+        assert!(from + src.len() <= self.len);
+        if self.lost.get() {
+            return Err(FsError::Io);
+        }
+        // SAFETY: `new` mapped `len` read-write bytes at `addr`, which stay mapped until `drop`,
+        // and the range is within them; `src` is a distinct buffer of the caller's.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.addr as *mut u8).add(from), src.len()) };
+        Ok(())
+    }
+
+    /// Copy `dst.len()` bytes of the scratch from `from` into `dst`.
+    pub fn copy_out(&self, from: usize, dst: &mut [u8]) {
+        assert!(from + dst.len() <= self.len);
+        // SAFETY: as for `copy_in`, the other way.
+        unsafe { core::ptr::copy_nonoverlapping((self.addr as *const u8).add(from), dst.as_mut_ptr(), dst.len()) };
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        sys::memory_unmap(self.addr, self.len as u64);
+        sys::handle_close(self.mem);
+    }
 }
 
 /// A [`BlockReader`]/[`BlockWriter`] over the block device in **4 KiB blocks**, through a
@@ -42,13 +128,10 @@ pub fn po_wait(po: u64) -> (i32, u64) {
 /// mutation writes still goes a block at a time (`TODO(ext4-metadata-writes)`).
 pub struct Disk {
     device: u64,
-    scratch: u64,
-    scratch_addr: u64,
+    scratch: Scratch,
     /// **[`SPAN`] bytes of zeroes**, a `MemoryObject` never written, so a grow's zeroes go to the
     /// device in large commands.
     zeroes: u64,
-    /// **Not `Sync`**: every transfer passes through the one scratch.
-    _one_thread: PhantomData<Cell<()>>,
 }
 
 /// **How [`Disk`] writes `len` zeroes from `offset`**, as byte ranges `(head, whole, tail)`, any
@@ -65,70 +148,25 @@ impl Disk {
     /// A disk over `device`, with its scratch made and mapped; or why not, as the line a server
     /// prints.
     pub fn new(device: u64) -> Result<Disk, &'static [u8]> {
-        // SAFETY: register-only syscall.
-        let scratch = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-        if scratch < 0 {
+        let Some(scratch) = Scratch::new(PAGE as usize) else {
             return Err(b"fs-server: scratch create failed\n");
-        }
-        let scratch = scratch as u64;
-        // SAFETY: register-only syscall; `scratch` is ours.
-        let scratch_addr = unsafe { syscall4(SYS_MEMORY_MAP, scratch, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-        if scratch_addr < 0 {
-            return Err(b"fs-server: scratch map failed\n");
-        }
-        // SAFETY: register-only syscall; a new memory object is zeroed.
-        let zeroes = unsafe { syscall4(SYS_MEMORY_CREATE, SPAN as u64, 0, 0, 0) };
+        };
+        let zeroes = sys::memory_create(SPAN as u64);
         if zeroes < 0 {
             return Err(b"fs-server: zero span create failed\n");
         }
-        Ok(Disk { device, scratch, scratch_addr: scratch_addr as u64, zeroes: zeroes as u64, _one_thread: PhantomData })
+        Ok(Disk { device, scratch, zeroes: zeroes as u64 })
     }
 
     /// The block-device handle: what a Model A reply hands the kernel a duplicate of.
     pub fn device(&self) -> u64 {
         self.device
     }
+}
 
-    fn read_block(&self, block: u64) -> Result<(), FsError> {
-        let op = IoOp {
-            opcode: IO_OPCODE_READ,
-            flags: 0,
-            buffer: self.scratch,
-            buf_offset: 0,
-            offset: block * IO_BLOCK as u64,
-            length: IO_BLOCK as u64,
-        };
-        // SAFETY: `device` is a block DeviceNode with READ; `&op` is a valid IoOp.
-        let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
-        if po < 0 {
-            return Err(FsError::Io);
-        }
-        let (status, result) = po_wait(po as u64);
-        if status != 0 || result != IO_BLOCK as u64 {
-            return Err(FsError::Io);
-        }
-        Ok(())
-    }
-
-    fn write_block(&self, block: u64) -> Result<(), FsError> {
-        let op = IoOp {
-            opcode: IO_OPCODE_WRITE,
-            flags: 0,
-            buffer: self.scratch,
-            buf_offset: 0,
-            offset: block * IO_BLOCK as u64,
-            length: IO_BLOCK as u64,
-        };
-        // SAFETY: `device` is a block DeviceNode with WRITE; `&op` is a valid IoOp.
-        let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
-        if po < 0 {
-            return Err(FsError::Io);
-        }
-        let (status, result) = po_wait(po as u64);
-        if status != 0 || result != IO_BLOCK as u64 {
-            return Err(FsError::Io);
-        }
-        Ok(())
+impl Drop for Disk {
+    fn drop(&mut self) {
+        sys::handle_close(self.zeroes);
     }
 }
 
@@ -140,11 +178,8 @@ impl BlockReader for Disk {
             let block = cur / IO_BLOCK as u64;
             let in_block = (cur % IO_BLOCK as u64) as usize;
             let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
-            self.read_block(block)?;
-            // SAFETY: `scratch_addr` maps a full page R/W; the read block occupies
-            // `[0, 4096)`, so `[in_block, in_block + n)` is in bounds.
-            let src = unsafe { core::slice::from_raw_parts((self.scratch_addr as usize + in_block) as *const u8, n) };
-            buf[done..done + n].copy_from_slice(src);
+            self.scratch.transfer(self.device, IO_OPCODE_READ, block * IO_BLOCK as u64, IO_BLOCK as u64)?;
+            self.scratch.copy_out(in_block, &mut buf[done..done + n]);
             done += n;
         }
         Ok(())
@@ -159,17 +194,7 @@ impl BlockWriter for Disk {
         let mut at = whole.start;
         while at < whole.end {
             let n = (whole.end - at).min(SPAN as u64);
-            let op =
-                IoOp { opcode: IO_OPCODE_WRITE, flags: 0, buffer: self.zeroes, buf_offset: 0, offset: at, length: n };
-            // SAFETY: `device` is a block DeviceNode with WRITE; `&op` is a valid IoOp.
-            let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
-            if po < 0 {
-                return Err(FsError::Io);
-            }
-            let (status, result) = po_wait(po as u64);
-            if status != 0 || result != n {
-                return Err(FsError::Io);
-            }
+            self.scratch.submit(self.device, self.zeroes, IO_OPCODE_WRITE, at, n)?;
             at += n;
         }
         self.write_at(tail.start, &ZERO[..(tail.end - tail.start) as usize])
@@ -184,13 +209,10 @@ impl BlockWriter for Disk {
             let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
             // A partial block is read first so the untouched bytes are preserved.
             if n != IO_BLOCK {
-                self.read_block(block)?;
+                self.scratch.transfer(self.device, IO_OPCODE_READ, block * IO_BLOCK as u64, IO_BLOCK as u64)?;
             }
-            // SAFETY: `scratch_addr` maps a full page R/W; `[in_block, in_block + n)` is
-            // within the block region `[0, 4096)`.
-            let dst = unsafe { core::slice::from_raw_parts_mut((self.scratch_addr as usize + in_block) as *mut u8, n) };
-            dst.copy_from_slice(&buf[done..done + n]);
-            self.write_block(block)?;
+            self.scratch.copy_in(in_block, &buf[done..done + n])?;
+            self.scratch.transfer(self.device, IO_OPCODE_WRITE, block * IO_BLOCK as u64, IO_BLOCK as u64)?;
             done += n;
         }
         Ok(())
@@ -208,60 +230,21 @@ const SECTOR: u64 = 512;
 /// not sector-aligned reads its edge sectors first.
 pub struct SectorDisk {
     device: u64,
-    scratch: u64,
-    scratch_addr: u64,
-    _one_thread: PhantomData<Cell<()>>,
+    scratch: Scratch,
 }
 
 impl SectorDisk {
     /// A disk over `device`, with its 64 KiB scratch made and mapped; or why not.
     pub fn new(device: u64) -> Result<SectorDisk, &'static [u8]> {
-        // SAFETY: register-only syscall.
-        let scratch = unsafe { syscall4(SYS_MEMORY_CREATE, SPAN as u64, 0, 0, 0) };
-        if scratch < 0 {
+        let Some(scratch) = Scratch::new(SPAN) else {
             return Err(b"fs-server: scratch create failed\n");
-        }
-        let scratch = scratch as u64;
-        // SAFETY: register-only syscall; `scratch` is ours.
-        let addr = unsafe { syscall4(SYS_MEMORY_MAP, scratch, 0, SPAN as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-        if addr < 0 {
-            return Err(b"fs-server: scratch map failed\n");
-        }
-        Ok(SectorDisk { device, scratch, scratch_addr: addr as u64, _one_thread: PhantomData })
+        };
+        Ok(SectorDisk { device, scratch })
     }
 
     /// The block-device handle: what a Model A reply hands the kernel a duplicate of.
     pub fn device(&self) -> u64 {
         self.device
-    }
-
-    fn transfer(&self, opcode: u32, at: u64, len: usize) -> Result<(), FsError> {
-        let op = IoOp { opcode, flags: 0, buffer: self.scratch, buf_offset: 0, offset: at, length: len as u64 };
-        // SAFETY: `device` is a block DeviceNode with READ (and WRITE for a write); `&op` is valid.
-        let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
-        if po < 0 {
-            return Err(FsError::Io);
-        }
-        let (status, result) = po_wait(po as u64);
-        if status != 0 || result != len as u64 {
-            return Err(FsError::Io);
-        }
-        Ok(())
-    }
-
-    fn copy_out(&self, from: usize, dst: &mut [u8]) {
-        assert!(from + dst.len() <= SPAN);
-        // SAFETY: `scratch_addr` maps `SPAN` bytes R/W for this process's life, and the range is
-        // within it; `dst` is a distinct buffer of the caller's.
-        unsafe {
-            core::ptr::copy_nonoverlapping((self.scratch_addr as *const u8).add(from), dst.as_mut_ptr(), dst.len())
-        };
-    }
-
-    fn copy_in(&self, from: usize, src: &[u8]) {
-        assert!(from + src.len() <= SPAN);
-        // SAFETY: as for `copy_out`, the other way.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.scratch_addr as *mut u8).add(from), src.len()) };
     }
 
     /// **The sector-aligned chunks covering `[offset, offset + len)`**, each at most [`SPAN`]:
@@ -289,8 +272,8 @@ impl BlockReader for SectorDisk {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
         let mut done = 0usize;
         SectorDisk::chunks(offset, buf.len(), |at, n, from, take| {
-            self.transfer(IO_OPCODE_READ, at, n)?;
-            self.copy_out(from, &mut buf[done..done + take]);
+            self.scratch.transfer(self.device, IO_OPCODE_READ, at, n as u64)?;
+            self.scratch.copy_out(from, &mut buf[done..done + take]);
             done += take;
             Ok(())
         })
@@ -303,10 +286,10 @@ impl BlockWriter for SectorDisk {
         SectorDisk::chunks(offset, buf.len(), |at, n, from, take| {
             // A chunk the request does not cover whole keeps the bytes it does not write.
             if from != 0 || take != n {
-                self.transfer(IO_OPCODE_READ, at, n)?;
+                self.scratch.transfer(self.device, IO_OPCODE_READ, at, n as u64)?;
             }
-            self.copy_in(from, &buf[done..done + take]);
-            self.transfer(IO_OPCODE_WRITE, at, n)?;
+            self.scratch.copy_in(from, &buf[done..done + take])?;
+            self.scratch.transfer(self.device, IO_OPCODE_WRITE, at, n as u64)?;
             done += take;
             Ok(())
         })
@@ -321,68 +304,22 @@ pub const WINDOW_SPAN: usize = 128 * 1024;
 /// a program making a filesystem on a disk it holds. A range past the window is refused rather
 /// than reaching the neighbouring partition. Any byte range becomes sector-aligned transfers,
 /// read first where a write covers a sector only in part (a filesystem writes 32-byte
-/// descriptors, a device moves 512-byte sectors). **One scratch object for both directions**,
-/// unmapped on drop. **Not `Sync`**: every transfer passes through the one scratch.
+/// descriptors, a device moves 512-byte sectors). **One scratch object for both directions**.
+/// **Not `Sync`**: every transfer passes through the one scratch.
 pub struct PartitionIo {
     device: u64,
     /// Byte offset of the window's first sector on that device.
     base: u64,
     len: u64,
-    /// A `MemoryObject` of [`WINDOW_SPAN`] bytes.
-    scratch: u64,
-    scratch_addr: u64,
-    _one_thread: PhantomData<Cell<()>>,
+    /// A scratch of [`WINDOW_SPAN`] bytes.
+    scratch: Scratch,
 }
 
 impl PartitionIo {
     /// A window onto `device`'s `[base, base + len)` bytes, `base` sector-aligned; `None` if the
     /// scratch could not be made.
     pub fn new(device: u64, base: u64, len: u64) -> Option<PartitionIo> {
-        // SAFETY: register-only syscall.
-        let scratch = unsafe { syscall4(SYS_MEMORY_CREATE, WINDOW_SPAN as u64, 0, 0, 0) };
-        if scratch < 0 {
-            return None;
-        }
-        let scratch = scratch as u64;
-        // SAFETY: register-only syscall; `scratch` is ours.
-        let addr =
-            unsafe { syscall4(SYS_MEMORY_MAP, scratch, 0, WINDOW_SPAN as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-        if addr < 0 {
-            // SAFETY: closing our own handle.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, scratch) };
-            return None;
-        }
-        Some(PartitionIo { device, base, len, scratch, scratch_addr: addr as u64, _one_thread: PhantomData })
-    }
-
-    fn submit(&self, opcode: u32, offset: u64, length: u64) -> Result<(), FsError> {
-        let op = IoOp { opcode, flags: 0, buffer: self.scratch, buf_offset: 0, offset, length };
-        // SAFETY: `device` is a block device handle held by this process; `&op` is a valid `IoOp`
-        // naming a `MemoryObject` this process owns.
-        let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
-        if po < 0 {
-            return Err(FsError::Io);
-        }
-        let (status, moved) = po_wait(po as u64);
-        if status != 0 || moved != length {
-            return Err(FsError::Io);
-        }
-        Ok(())
-    }
-
-    fn copy_out(&self, from: usize, dst: &mut [u8]) {
-        assert!(from + dst.len() <= WINDOW_SPAN);
-        // SAFETY: `new` mapped `WINDOW_SPAN` read-write bytes at `scratch_addr`, which stay mapped
-        // until `drop`, and the range is within them; `dst` is a distinct buffer of the caller's.
-        unsafe {
-            core::ptr::copy_nonoverlapping((self.scratch_addr as *const u8).add(from), dst.as_mut_ptr(), dst.len())
-        };
-    }
-
-    fn copy_in(&self, from: usize, src: &[u8]) {
-        assert!(from + src.len() <= WINDOW_SPAN);
-        // SAFETY: as for `copy_out`, the other way.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.scratch_addr as *mut u8).add(from), src.len()) };
+        Some(PartitionIo { device, base, len, scratch: Scratch::new(WINDOW_SPAN)? })
     }
 }
 
@@ -409,9 +346,9 @@ impl BlockReader for PartitionIo {
         while done < buf.len() {
             let (start, span, intra) =
                 window(self.base, self.len, WINDOW_SPAN, offset + done as u64, buf.len() - done)?;
-            self.submit(IO_OPCODE_READ, start, span)?;
+            self.scratch.transfer(self.device, IO_OPCODE_READ, start, span)?;
             let take = (buf.len() - done).min(span as usize - intra);
-            self.copy_out(intra, &mut buf[done..done + take]);
+            self.scratch.copy_out(intra, &mut buf[done..done + take]);
             done += take;
         }
         Ok(())
@@ -428,78 +365,15 @@ impl BlockWriter for PartitionIo {
             // **Read first unless the write covers whole sectors**: a partial sector written
             // without its surroundings replaces bytes the filesystem is still using.
             if intra != 0 || take != span as usize {
-                self.submit(IO_OPCODE_READ, start, span)?;
+                self.scratch.transfer(self.device, IO_OPCODE_READ, start, span)?;
             }
-            self.copy_in(intra, &buf[done..done + take]);
-            self.submit(IO_OPCODE_WRITE, start, span)?;
+            self.scratch.copy_in(intra, &buf[done..done + take])?;
+            self.scratch.transfer(self.device, IO_OPCODE_WRITE, start, span)?;
             done += take;
         }
         Ok(())
     }
 }
 
-impl Drop for PartitionIo {
-    fn drop(&mut self) {
-        // SAFETY: our own mapping and handle, made by `new`; nothing refers to the mapping once the
-        // window is gone.
-        unsafe {
-            syscall4(SYS_MEMORY_UNMAP, self.scratch_addr, WINDOW_SPAN as u64, 0, 0);
-            syscall1(SYS_HANDLE_CLOSE, self.scratch);
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn zeroes_split_into_a_ragged_head_whole_blocks_and_a_ragged_tail() {
-        const B: u64 = IO_BLOCK as u64;
-        assert_eq!(split_zeroes(B, 32 * B), (B..B, B..33 * B, 33 * B..33 * B), "aligned: whole blocks alone");
-        assert_eq!(split_zeroes(B + 100, 2 * B), (B + 100..2 * B, 2 * B..3 * B, 3 * B..3 * B + 100));
-        assert_eq!(split_zeroes(100, 200), (100..300, 300..300, 300..300), "inside one block: a head alone");
-        assert_eq!(split_zeroes(B - 1, 2), (B - 1..B, B..B, B..B + 1), "across one boundary, no whole block");
-        assert_eq!(split_zeroes(5 * B, 0), (5 * B..5 * B, 5 * B..5 * B, 5 * B..5 * B));
-        for (offset, len) in [(0, 1), (4095, 4097), (12_345, 1_000_000), (B, B - 1)] {
-            let (h, w, t) = split_zeroes(offset, len);
-            assert!(h.start == offset && h.end == w.start && w.end == t.start && t.end == offset + len);
-            assert!(w.start % B == 0 && w.end % B == 0 && h.end - h.start < B && t.end - t.start < B);
-        }
-    }
-
-    #[test]
-    fn a_request_is_covered_by_aligned_chunks_of_at_most_a_span() {
-        for (offset, len) in
-            [(0, 512), (100, 70_000), (512, SPAN), (511, 2), (1000, SPAN + 1), (4096, 3 * SPAN), (7, 1)]
-        {
-            let mut next = offset - offset % SECTOR;
-            let mut covered = 0usize;
-            SectorDisk::chunks(offset, len, |at, n, from, take| {
-                assert_eq!(at, next, "contiguous");
-                assert_eq!(at % SECTOR, 0);
-                assert_eq!(n as u64 % SECTOR, 0);
-                assert!(n <= SPAN && from + take <= n && take > 0);
-                assert_eq!(at + from as u64, offset + covered as u64, "the request's bytes in order");
-                covered += take;
-                next = at + n as u64;
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(covered, len, "({offset}, {len})");
-        }
-    }
-
-    #[test]
-    fn a_window_refuses_past_its_end_and_moves_sector_aligned_spans() {
-        let (base, len) = (1 << 20, 10 * 512);
-        assert_eq!(window(base, len, WINDOW_SPAN, 0, len as usize + 1), Err(FsError::Io));
-        assert_eq!(window(base, len, WINDOW_SPAN, len, 1), Err(FsError::Io), "the first byte past it");
-        assert_eq!(window(base, len, WINDOW_SPAN, u64::MAX, 2), Err(FsError::Io), "no overflow");
-        assert_eq!(window(base, len, WINDOW_SPAN, len - 1, 1), Ok((base + len - 512, 512, 511)));
-        assert_eq!(window(base, len, WINDOW_SPAN, 100, 1000), Ok((base, 1536, 100)), "three sectors");
-        let big = 4 * WINDOW_SPAN as u64;
-        let (start, span, intra) = window(base, big, WINDOW_SPAN, 3, big as usize - 3).unwrap();
-        assert_eq!((start, span, intra), (base, WINDOW_SPAN as u64, 3), "at most a scratch's worth");
-    }
-}
+mod tests;

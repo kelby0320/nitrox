@@ -418,7 +418,7 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(1 + args.len());
     argv.push(program);
     argv.extend_from_slice(args);
-    let sent = libstream::setup::send_setup_env(setup_ours, &libstream::setup::Streams::default(), &argv, env).is_ok();
+    let sent = libstream::setup::send_setup_env(setup_ours, libstream::setup::Streams::default(), &argv, env).is_ok();
     // SAFETY: closing our end of the setup channel.
     unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
     if !sent {

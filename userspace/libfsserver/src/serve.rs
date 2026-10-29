@@ -3,15 +3,19 @@
 //! crate tests it through its own volume. An error reply carries the op of its request so the
 //! kernel routes it to the right pending operation (lookup vs fill).
 
-use crate::{BlockRun, FsError, Mapped, RUN_UNWRITTEN, Refusal, Volume};
+use crate::{BlockRun, DirEntry, FsError, Mapped, RUN_UNWRITTEN, Refusal, Volume};
 use libkern::KError;
 use librsproto::error::{ERROR_BODY_LEN, error_body};
-use librsproto::file::{READ_RANGE_REPLY_LEN, parse_read_range_request, read_range_reply};
+use librsproto::file::{
+    DirReplyWriter, READ_RANGE_REPLY_LEN, parse_name_request, parse_read_dir_request, parse_read_range_request,
+    parse_rename_request, read_range_reply,
+};
 use librsproto::namespace::{
     BLOCK_RUN_WIRE_LEN, FILE_BLOCKS_PREFIX_LEN, FILE_BLOCKS_READ_ONLY, OBJECT_KIND_MEMOBJ, RESOLVE_CREATE,
     RESOLVE_FILE_LAZY, RESOLVE_GROW, RESOLVE_REPLY_LEN, RESOLVE_TRUNCATE, file_blocks_prefix, parse_resolve_grow_size,
     parse_resolve_request, resolve_reply,
 };
+use librsproto::{OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK};
 use librsproto::{OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 /// **Whether a session may name `name`** in its directory: one entry, never `.` or `..`, which
@@ -43,6 +47,68 @@ pub enum Served {
 /// Largest `BlockRun` map inlined in a Model A resolve reply (1536 body bytes, inside the 4 KiB
 /// IPC payload). A more fragmented file is `TooLarge` until `TODO(map-range)` lands.
 pub const MAX_RUNS: usize = 64;
+
+/// The `(request_id, directory)` of a resolve whose suffix names a directory, which opens a session.
+/// **A suffix over [`MAX_SUFFIX`] opens none**, and [`serve`] refuses it `TooLarge`, rather than
+/// opening what its first [`MAX_SUFFIX`] bytes name, an ancestor or a sibling cut short.
+pub fn directory_open<V: Volume>(vol: &V, request: &[u8]) -> Option<(u64, u64)> {
+    let m = decode(request).ok().filter(|m| m.op == OP_NS_RESOLVE)?;
+    let r = parse_resolve_request(m.body).filter(|r| r.suffix.len() <= MAX_SUFFIX)?;
+    Some((m.request_id, vol.resolve_dir(r.suffix).ok()?))
+}
+
+/// **The reply to one request on a directory session** bound to `dir`, encoded into `reply`: its
+/// length, or `None` for a message that does not decode. Names are read where they arrived, at any
+/// length the message holds. A file whose last name goes is handed to `release`; a directory
+/// removed, to `freeing`.
+#[allow(clippy::too_many_arguments, reason = "each is a part the server's one call plays")]
+pub fn session<V: Volume>(
+    vol: &V,
+    dir: u64,
+    request: &[u8],
+    reply: &mut [u8],
+    listing: &mut [u8],
+    now: i64,
+    mut release: impl FnMut(u64),
+    freeing: impl FnOnce(u64),
+) -> Option<usize> {
+    let m = decode(request).ok()?;
+    let (op, id) = (m.op, m.request_id);
+    let r = match op {
+        OP_FILE_READ_DIR => {
+            let cursor = parse_read_dir_request(m.body).map(|r| r.cursor).unwrap_or(0);
+            let listed = DirReplyWriter::new(listing).and_then(|mut w| {
+                let next =
+                    vol.read_dir(dir, cursor, |e: &DirEntry| w.push(e.id, e.kind, e.mode, e.size, e.mtime, e.name));
+                Some(w.finish(next.ok()?))
+            });
+            // A listing too long to send is answered with an error: its client waits for exactly this.
+            let encoded = listed.and_then(|n| encode(reply, op, id, RS_FLAG_REPLY, &listing[..n], 0));
+            return Some(encoded.unwrap_or_else(|| encode_error(reply, id, KError::KernelError.as_i32(), op, b"")));
+        }
+        // Each names an entry in the bound directory, so a session can never change outside it.
+        OP_FILE_MKDIR | OP_FILE_UNLINK | OP_FILE_RMDIR | OP_FILE_TOUCH => match parse_name_request(m.body) {
+            Some(name) if entry_name(name) => match op {
+                OP_FILE_MKDIR => vol.mkdir_at(dir, name, now),
+                // The last name's removal frees the file only once the kernel has forgotten it, and
+                // before the client hears it is gone.
+                OP_FILE_UNLINK => vol.unlink_at(dir, name, now).map(|orphan| orphan.into_iter().for_each(&mut release)),
+                OP_FILE_RMDIR => vol.rmdir_at(dir, name, now, freeing),
+                _ => vol.touch_at(dir, name, now),
+            },
+            _ => Err(FsError::Unsupported),
+        },
+        OP_FILE_RENAME => match parse_rename_request(m.body) {
+            Some((old, new)) if entry_name(old) && entry_name(new) => vol.rename_at(dir, old, new, now),
+            _ => Err(FsError::Unsupported),
+        },
+        _ => return Some(encode_error(reply, id, KError::Unsupported.as_i32(), op, b"")),
+    };
+    match r {
+        Ok(()) => encode(reply, op, id, RS_FLAG_REPLY, &[], 0),
+        Err(e) => Some(encode_error(reply, id, kerror(e).as_i32(), op, reason(e))),
+    }
+}
 
 /// Serve one forwarded request: dispatch by op to [`serve_resolve`] or [`serve_read_range`]. An
 /// undecodable request or an unknown op yields an error reply.
@@ -395,3 +461,7 @@ mod tests {
         assert_eq!(t.len, MAX_REASON);
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;

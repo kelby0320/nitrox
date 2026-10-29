@@ -1480,13 +1480,11 @@ impl Broker {
             stderr: (p.handles.stderr != 0).then_some(p.handles.stderr),
         };
         let terminal = (p.handles.terminal != 0).then_some(p.handles.terminal);
-        let sent = send_setup_full(setup_ours, &streams, terminal, &argv, &env).is_ok();
+        let sent = send_setup_full(setup_ours, streams, terminal, &argv, &env).is_ok();
         close(setup_ours);
-        if sent {
-            // The setup message moved them.
-            p.handles = Handles::default();
-        } else {
-            p.handles.close();
+        // The setup message took them, sent or closed.
+        p.handles = Handles::default();
+        if !sent {
             // The program is running without its streams; ask it to stop, and report it.
             // SAFETY: a Process handle this broker owns.
             unsafe { syscall1(SYS_PROCESS_TERMINATE, process as u64) };

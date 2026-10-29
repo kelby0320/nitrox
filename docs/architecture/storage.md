@@ -110,9 +110,10 @@ stick and the disk's line came with Part D.)
 
 ## 4. What a device holds
 
-- **ext4**, if `fs-server-ext4`'s `check_device` accepts it: the superblock parses and inode 2 is
-  a directory. That is the check the server runs before it says Ready, so a device the service
-  calls ext4 is one a server would serve. Its label (`s_volume_name`, empty when `mke2fs` was
+- **ext4**, if `fs-server-ext4`'s `check_device` accepts it: the superblock parses, with no group
+  wider than its bitmap block and the inode count the groups hold, and inode 2 is a directory.
+  That is the check the server runs before it says Ready, so a device the service calls ext4 is
+  one a server would serve. Its label (`s_volume_name`, empty when `mke2fs` was
   given no `-L`, as the image builder's is) and whether it was left clean come with it.
 - **FAT**, read by `fs-server-fat`'s own check (Phase 6 Part E.5), as ext4 is by its server's:
   its label, whether it was left clean, and, if the server would refuse it, why — in the refusal's

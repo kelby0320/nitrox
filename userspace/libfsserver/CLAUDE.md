@@ -14,8 +14,9 @@ servers speak one protocol and a fix to it is a fix to both:
   service and `boot-probe` still name them as `fs_server_ext4::…`.
 - **`volume.rs`** — `Volume`, the filesystem as the protocol sees it: what each server implements
   over its library. Its methods are the calls the ext4 binary made into its library.
-- **`serve.rs`** — the pure request→reply core for a forwarded resolve or range read, generic over
-  `Volume`, and the one `FsError`→`KError` mapping. It touches no syscalls, so it is host-tested —
+- **`serve.rs`** — the pure request→reply core for a forwarded resolve or range read, which
+  resolve opens a directory session, and a session's requests, generic over `Volume`, and the one
+  `FsError`→`KError` mapping. It touches no syscalls, so it is host-tested —
   **through each server's volume**, in that server's crate, against an image its own tools built.
   A grow's reply marks what the grow added `UNWRITTEN` (`serve_grown`, Phase 6 Part H.4), which
   `Volume::grow_file` makes true by answering the size it grew from, past which everything reads
@@ -26,7 +27,11 @@ servers speak one protocol and a fix to it is a fix to both:
   FAT's uses. A server hands `server::bootstrap` the one it wants. And **`PartitionIo`** (Phase 6
   Part G.2), a window onto part of a device, for a program that makes a filesystem on a disk it
   holds rather than a server handed a partition: `nxinstall`'s until `disk --format` needed it too.
-  **None of the three is `Sync`**: each moves every transfer through one scratch mapping.
+  **None of the three is `Sync`**: each moves every transfer through one **`Scratch`**, a memory
+  object mapped for its life. **A wait that fails leaves the transfer running** (`po_wait` answers
+  `None`), so that scratch is *lost*: the device may still read or write it, and the disk answers
+  `Io` to everything after, copying nothing into it and submitting nothing through it. Its
+  syscalls go through `disk/sys.rs`, which a host test scripts.
 - **`cache.rs`** — **`MetaCache`** (Phase 6 Part H.4), the metadata cache each server serves its
   filesystem through: a fixed store of 4 KiB blocks, filled only by `BlockReader::read_meta`, every
   write through to the device and into any copy it holds, `BlockWriter::forget` letting freed blocks
@@ -41,11 +46,13 @@ servers speak one protocol and a fix to it is a fix to both:
   forwarded resolve has no deadline, so a server spinning in its handler held every client waiting
   on it for ever. An exit closes the endpoint, and the kernel fails each `PeerClosed`.
 - **Every forwarded request is answered**, for the same reason: a reply the kernel did not take
-  is answered with an error and its handles closed (`send_forwarded`, and a directory session's
+  is answered with an error and its handles closed (`Outbox::forwarded`, and a directory session's
   open). Once the kernel takes one, it completes the lookup itself, an install that fails too.
-- **`no_std`, no `alloc`.** The loop's buffers are statics: one set per process, which is one
-  server. A library holding them is no different from the binary holding them, since a server is
-  one process serving one filesystem.
+- **`no_std`, no `alloc`, and no `static mut`.** The loop's state is one `Server`, which `run`
+  makes on its own stack, so nothing else reaches it. **A request is borrowed from its inbox**, the
+  rest of the server beside it, so no receive can overwrite a request still being read; a handler
+  takes the request as `&[u8]`, never copies it to a buffer of its own size. Each binary's metadata
+  store is a `cache::OnceStore`, a `static` handed out once.
 - **Nothing filesystem-specific.** A name, a kind, a reason a device cannot be served: each comes
   through `Volume`. A rule that holds for one filesystem only belongs in that server's library.
 - **A file is freed only after the kernel has forgotten it** — `forget_then_release` — wherever
@@ -53,12 +60,12 @@ servers speak one protocol and a fix to it is a fix to both:
   (FAT's, to zero).
 - **A rename is resolved before the directory-session path**, which infers "directory open" from
   the suffix naming a directory; renaming a directory names one too.
-- **A removed directory's sessions end** (`end_sessions_on`, which `Volume::rmdir_at` is handed
+- **A removed directory's sessions end** (`Sessions::end_on`, which `Volume::rmdir_at` is handed
   and calls before it changes anything, so a removal that then fails ends them too): a session
   holds a bare id, and each filesystem gives a freed one to the next directory made. Checking the
   id still names a live directory cannot tell the old one from the new.
 - **A session names entries of its own directory, never `.` or `..`** (`serve::entry_name`, checked
-  in `serve_session` for every op that takes a name): `..` renamed was a way out of a subtree, and
+  in `serve::session` for every op that takes a name): `..` renamed was a way out of a subtree, and
   each filesystem's own refusals are not the boundary.
 - **`read_meta` is for what only the server writes**: directories, inode tables, bitmaps,
   descriptors, superblocks, extent nodes, the FAT. **Never a file's data**, which the kernel writes

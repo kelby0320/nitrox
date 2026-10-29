@@ -447,3 +447,108 @@ fn an_unlink_of_one_of_two_names_answers_what_it_did() {
         assert_eq!(answered.map(|o| o.is_none()), if gone { Ok(true) } else { Err(FsError::Io) }, "write {n}");
     }
 }
+
+/// **A bit past the bitmap block read is `Corrupt`, and nothing is written**, whatever geometry got
+/// past the superblock's check: each allocator and each free over a group wider than its bitmap.
+#[test]
+fn a_bitmap_bit_past_its_block_is_corrupt() {
+    use super::{Superblock, alloc_inode, alloc_run, free_inode, free_run, read_superblock};
+    use crate::rd_u32;
+    use crate::test_support::{RwImage, fixture_blocks};
+    use std::cell::RefCell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for bs in [1024u32, 4096] {
+        let img = RwImage(RefCell::new(fixture_blocks(bs, 4096, 0, b"g\n")));
+        let real = read_superblock(&img).unwrap();
+        let bits = bs * 8;
+        let first = real.first_data_block as u64;
+        let sb = Superblock {
+            blocks_per_group: 2 * bits,
+            blocks_count: first + 2 * bits as u64,
+            inodes_per_group: 2 * bits,
+            inodes_count: 2 * bits,
+            ..real
+        };
+        let gd = sb.group_desc_offset(0) as usize;
+        let mut v = img.0.borrow_mut();
+        for (map_at, count_at) in [(0, 12), (4, 14)] {
+            let map = rd_u32(&v, gd + map_at) as usize * bs as usize;
+            v[map..map + bs as usize].fill(0xFF);
+            v[gd + count_at..gd + count_at + 2].copy_from_slice(&100u16.to_le_bytes());
+        }
+        drop(v);
+        let before = img.0.borrow().clone();
+        type Call<'a> = (&'a str, &'a dyn Fn() -> Result<(), FsError>);
+        let each: [Call; 4] = [
+            ("alloc_run", &|| alloc_run(&img, &sb, first, 1).map(drop)),
+            ("free_run", &|| free_run(&img, &sb, first + bits as u64, 1)),
+            ("alloc_inode", &|| alloc_inode(&img, &sb).map(drop)),
+            ("free_inode", &|| free_inode(&img, &sb, bits + 1, false, 1_791_244_800)),
+        ];
+        for (name, f) in each {
+            let got = catch_unwind(AssertUnwindSafe(f));
+            assert!(matches!(got, Ok(Err(FsError::Corrupt))), "{bs}-byte blocks, {name}: {got:?}");
+            assert!(*img.0.borrow() == before, "{bs}-byte blocks, {name}: wrote");
+        }
+    }
+}
+
+/// **Descriptors are 32 bytes apart without `64bit`, whatever `s_desc_size` says**, as Linux and
+/// e2fsprogs read them: at 64, group 1's files were not found, and a create took an inode in use.
+#[test]
+fn descriptors_are_32_bytes_apart_without_64bit() {
+    use super::{create_file, map_file};
+    use crate::test_support::{RwImage, assert_e2fsck_clean, fixture_blocks};
+    let rw = RwImage(std::cell::RefCell::new(fixture_blocks(1024, 32768, 65536, b"g\n")));
+    for i in 0..200 {
+        create_file(&rw, b"/", format!("f{i}").as_bytes(), 1_791_244_800).unwrap();
+    }
+    let mut runs = [crate::BlockRun::default(); 4];
+    let in_group_1 = map_file(&rw, b"/f190", &mut runs).unwrap().ino;
+    assert!(in_group_1 > 128, "a file whose inode is in group 1: {in_group_1}");
+    poke_sb(&mut rw.0.borrow_mut(), 254, &64u16.to_le_bytes());
+    assert_e2fsck_clean(&rw.0.borrow(), "desc-size-64");
+    assert_eq!(map_file(&rw, b"/f190", &mut runs).map(|m| m.ino), Ok(in_group_1));
+    let last = map_file(&rw, b"/f199", &mut runs).unwrap().ino;
+    assert_eq!(create_file(&rw, b"/", b"new", 1_791_244_800), Ok(last + 1), "the next inode, not one in use");
+    assert_e2fsck_clean(&rw.0.borrow(), "desc-size-64-made");
+}
+
+/// **A name with a NUL or another control character is not written**, by a create, a `mkdir` or a
+/// rename, as FAT refuses them: `e2fsck` calls a NUL illegal. A space and UTF-8 beside them are.
+#[test]
+fn a_name_with_a_control_character_is_not_written() {
+    use super::{create_file, mkdir_at, rename_at};
+    use crate::test_support::{RwImage, assert_e2fsck_clean};
+    let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    let now = 1_791_244_800;
+    create_file(&rw, b"/", b"plain", now).unwrap();
+    let before = rw.0.borrow().clone();
+    for c in [0u8, 1, 0x1F, 0x7F] {
+        let name = [b'a', c, b'b'];
+        assert_eq!(create_file(&rw, b"/", &name, now), Err(FsError::Unsupported), "create {c:#x}");
+        assert_eq!(mkdir_at(&rw, 2, &name, now), Err(FsError::Unsupported), "mkdir {c:#x}");
+        assert_eq!(rename_at(&rw, 2, b"plain", &name, now), Err(FsError::Unsupported), "rename {c:#x}");
+    }
+    assert!(*rw.0.borrow() == before, "refused, nothing was written");
+    create_file(&rw, b"/", b"a b", now).unwrap();
+    mkdir_at(&rw, 2, "caf\u{e9}".as_bytes(), now).unwrap();
+    rename_at(&rw, 2, b"plain", b"~ok", now).unwrap();
+    assert_e2fsck_clean(&rw.0.borrow(), "plain-names");
+}
+
+/// **Inode 0 is no inode**: `Corrupt` to read, to place and to free, not an underflow to group
+/// `u32::MAX / per_group`.
+#[test]
+fn inode_zero_is_corrupt_everywhere_it_is_placed() {
+    use super::{free_inode, inode_offset, read_inode, read_superblock};
+    let rw = crate::test_support::RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    let sb = read_superblock(&rw).unwrap();
+    let before = rw.0.borrow().clone();
+    let each = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (read_inode(&rw, &sb, 0).map(drop), inode_offset(&rw, &sb, 0).map(drop), free_inode(&rw, &sb, 0, false, 0))
+    }));
+    let corrupt = Err(FsError::Corrupt);
+    assert!(matches!(each, Ok((ref a, ref b, ref c)) if *a == corrupt && *b == corrupt && *c == corrupt), "{each:?}");
+    assert!(*rw.0.borrow() == before, "nothing written");
+}

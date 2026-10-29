@@ -159,6 +159,8 @@ impl Geometry {
         // so a larger group would have its free count truncated on the way to disk. `Params` is
         // public, so a small `bytes_per_inode` on one group can ask for it.
         inodes_per_group = inodes_per_group.min(u16::MAX as u32 / per_block * per_block);
+        // **Nor more than its inode bitmap, one block, has bits**: Linux refuses a group that has.
+        inodes_per_group = inodes_per_group.min(p.block_size * 8);
         let itable_blocks = inodes_per_group / per_block;
 
         // **Drop a final group too short to hold its own metadata**, as `mke2fs` does.
@@ -488,6 +490,22 @@ mod tests {
         assert_eq!(g.blocks_in_group(2), 8191, "24,575 addressable does not divide by 8,192");
         let total: u64 = (0..g.groups).map(|n| g.blocks_in_group(n) as u64).sum();
         assert_eq!(total, g.blocks_count - g.first_data_block as u64);
+    }
+
+    /// **No group gets more inodes than its inode bitmap has bits**, however dense the ratio: at
+    /// 512 bytes an inode a group asked for twice what its bitmap block covers, and the reader
+    /// refuses such a filesystem.
+    #[test]
+    fn a_group_holds_no_more_inodes_than_its_bitmap_has_bits() {
+        for bs in [1024u32, 4096] {
+            let p = Params { bytes_per_inode: 512, ..params(8192, bs) };
+            let g = Geometry::new(&p).unwrap();
+            assert!(g.inodes_per_group <= bs * 8, "{bs}: {} inodes a group", g.inodes_per_group);
+            let made = crate::test_support::RwImage(std::cell::RefCell::new(vec![0u8; 8192 * bs as usize]));
+            format(&made, &p, &mut |_, _| {}).unwrap();
+            assert_eq!(crate::ext4::check_device(&made), Ok(()), "{bs}: the reader takes it");
+            crate::test_support::assert_e2fsck_clean(&made.0.borrow(), "dense-inodes");
+        }
     }
 
     /// The inode count is capped however generous the ratio.
