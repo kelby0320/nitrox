@@ -15,7 +15,7 @@
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, ArrayVec, KBox, KVec, Notification};
+use crate::libkern::{AllocError, ArrayVec, KBox, Notification, Reserved};
 use crate::object::WaitQueue;
 use crate::object::header::KObjectHeader;
 
@@ -30,7 +30,7 @@ pub struct NotificationChannel {
 
 struct Inner {
     /// FIFO of pending notifications; pre-reserved to [`NotificationChannel::QUEUE_CAP`].
-    queue: KVec<Notification>,
+    queue: Reserved<Notification>,
     /// Notifications dropped on overflow; surfaced as a synthetic `NotificationsDropped` on the
     /// next recv.
     dropped: u32,
@@ -58,8 +58,7 @@ impl NotificationChannel {
 
     /// Allocate an empty channel (refcount one), reserving its queue up front.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
-        let mut queue: KVec<Notification> = KVec::new();
-        queue.try_reserve(Self::QUEUE_CAP)?;
+        let queue = Reserved::with_capacity(Self::QUEUE_CAP)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::NotificationChannel),
             magic: Self::MAGIC,
@@ -102,14 +101,13 @@ impl NotificationChannel {
         // "Signaled" is queue non-empty or a drop pending; report the edge to avoid a double wake.
         let was_signaled = !inner.queue.is_empty() || inner.dropped > 0;
         if inner.queue.len() < Self::QUEUE_CAP {
-            // Non-growing: under `SCHED`, `try_push` would `kmalloc`. `QUEUE_CAP` is reserved at
-            // construction, so this cannot refuse.
-            let _ = inner.queue.push_within_capacity(n);
+            // `QUEUE_CAP` is reserved at construction, so this cannot refuse.
+            let _ = inner.queue.push(n);
         } else if n.is_exception() {
             // Evict the oldest non-exception entry to keep fault info.
             if let Some(i) = inner.queue.iter().position(|e| !e.is_exception()) {
                 inner.queue.remove(i);
-                let _ = inner.queue.push_within_capacity(n);
+                let _ = inner.queue.push(n);
             } else {
                 // All exceptions and full: count the drop rather than grow or lose it silently.
                 inner.dropped = inner.dropped.saturating_add(1);

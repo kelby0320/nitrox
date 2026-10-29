@@ -20,7 +20,7 @@ use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::ipc::{IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader};
-use crate::libkern::{AllocError, ArrayVec, KBox, KVec};
+use crate::libkern::{AllocError, ArrayVec, KBox, KVec, Reserved};
 use crate::object::ObjectRef;
 use crate::object::WaitQueue;
 use crate::object::header::KObjectHeader;
@@ -246,7 +246,7 @@ struct Inner {
     recv_waiters: WaitQueue<{ IpcChannel::MAX_WAITERS }>,
     /// Blocking senders awaiting space in **this** ring, FIFO, promoted into `recv` when a recv
     /// frees a slot. Pre-reserved to [`IpcChannel::MAX_PENDING_SENDS`]: no `SCHED` allocation.
-    pending_sends: KVec<PendingSend>,
+    pending_sends: Reserved<PendingSend>,
     peer: *mut IpcChannel,
     /// Non-null iff this is the **kernel's** end of a Userspace Server channel: a non-owning
     /// back-pointer to the owning [`UserspaceServerReg`](crate::object::UserspaceServerReg), which
@@ -289,13 +289,12 @@ impl IpcChannel {
         }
     }
 
-    /// Allocate one unconnected endpoint, refcount one. Ring and waiter vector are reserved up
-    /// front (the only fallible growth), so later pushes never allocate under `SCHED`.
+    /// Allocate one unconnected endpoint, refcount one. Its ring and held sends are reserved up
+    /// front, so later pushes never allocate under `SCHED`.
     fn try_new_endpoint(cap: usize) -> Result<KBox<Self>, AllocError> {
         let slots = SlotHold::reserve(Slots::Endpoint)?;
         let recv = MsgRing::with_capacity(cap)?;
-        let mut pending_sends: KVec<PendingSend> = KVec::new();
-        pending_sends.try_reserve(Self::MAX_PENDING_SENDS)?;
+        let pending_sends = Reserved::with_capacity(Self::MAX_PENDING_SENDS)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::IpcChannel),
             magic: Self::MAGIC,
@@ -515,12 +514,11 @@ impl IpcChannel {
         for i in 0..IPC_HANDLE_MAX {
             held[i] = transfers[i].take();
         }
-        // `po.clone()` bumps an atomic refcount: sound under `SCHED`. Non-growing: `try_push` drops
-        // its argument when growth fails, and its `ObjectRef` would drop under `SCHED`. Reserved to
+        // `po.clone()` bumps an atomic refcount: sound under `SCHED`. Reserved to
         // `MAX_PENDING_SENDS` and length-checked above, so it cannot refuse.
         peer_inner
             .pending_sends
-            .push_within_capacity(PendingSend { msg: *msg, transfers: held, po: po.clone(), cancelled: false })
+            .push(PendingSend { msg: *msg, transfers: held, po: po.clone(), cancelled: false })
             .unwrap_or_else(|held| {
                 // Unreachable: reserved at construction and length-checked above. Do not let
                 // `held` drop here — it owns an `ObjectRef` and `SCHED` is held.

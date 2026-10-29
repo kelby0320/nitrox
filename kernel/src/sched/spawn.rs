@@ -12,10 +12,8 @@ const REAPER_TID: u32 = u32::MAX - 1;
 
 /// A list a thread can be on — a run queue, the blocked or suspended list, a reap list — reserved
 /// to hold [`MAX_THREADS`]: every list is made here, so the boot's reserves are the tests'.
-pub(super) fn thread_list() -> Result<KVec<ObjectRef>, AllocError> {
-    let mut list = KVec::new();
-    list.try_reserve(MAX_THREADS)?;
-    Ok(list)
+pub(super) fn thread_list() -> Result<Reserved<ObjectRef>, AllocError> {
+    Reserved::with_capacity(MAX_THREADS)
 }
 
 /// Initialise the scheduler, adopting the running boot context as the first (current)
@@ -29,10 +27,8 @@ pub fn init() -> Result<(), AllocError> {
     // Build the pre-reserved queues and heap OUTSIDE the lock (the only growth); blocking and
     // timer arming stay within these reserves.
     let (ready, blocked, suspended, reap) = (thread_list()?, thread_list()?, thread_list()?, thread_list()?);
-    let mut deadlines: KVec<deadline::Entry> = KVec::new();
-    deadlines.try_reserve(deadline::HEAP_RESERVE)?;
-    let mut deferred_drops: KVec<ObjectRef> = KVec::new();
-    deferred_drops.try_reserve(DEFERRED_DROP_RESERVE)?;
+    let deadlines = Reserved::with_capacity(deadline::HEAP_RESERVE)?;
+    let deferred_drops = Reserved::with_capacity(DEFERRED_DROP_RESERVE)?;
     let boot = Thread::try_new_boot(0, 0)?;
     let boot_ref = into_objref(boot);
 
@@ -48,8 +44,7 @@ pub fn init() -> Result<(), AllocError> {
     // parks itself when it finds nothing to do.
     let reaper = Thread::try_new_runnable(REAPER_TID, 0, reaper_body, 0)?;
     let reaper_ref = into_objref(reaper);
-    let mut ended_pids: KVec<u32> = KVec::new();
-    ended_pids.try_reserve(ENDED_PIDS_RESERVE)?;
+    let ended_pids = Reserved::with_capacity(ENDED_PIDS_RESERVE)?;
 
     let mut g = SCHED.lock();
     g.ready[0] = ready; // BSP is logical CPU 0; APs reserve their own in `ap_init`.

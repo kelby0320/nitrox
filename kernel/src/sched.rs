@@ -45,7 +45,7 @@ use crate::arch::{Cpu, MAX_CPUS, Paging, context_switch};
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::ipc::IPC_HANDLE_MAX;
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
+use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, Reserved};
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::mm::PhysAddr;
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
@@ -171,21 +171,13 @@ const _: () = assert!(
      no unwinder — if this fires, a target spec has dropped panic-strategy: abort"
 );
 
-/// Push onto a pre-reserved list held under `SCHED`, refusing rather than growing.
-///
-/// **`try_push` grows, and growth under this lock is a deadlock.** At capacity it calls
-/// `kmalloc`/`kfree`, so a push under the rank-1 IRQ-acquired `SCHED` lock reaches the
-/// allocator's plain spinlock, which `kernel/docs/lock-ordering.md` forbids. A
-/// `debug_assert!(len < capacity)` would not prevent it: the growth happens first and
-/// *succeeds*, so the assertion never fires and the inversion is silent.
-///
-/// Every list here is sized so this cannot happen, so reaching it is a sizing bug: this ends
-/// the machine, but *without having allocated first*, and with a message naming the list.
-/// **The value is `forget`ten rather than dropped**: an `ObjectRef` drop reaches
-/// `dispatch_destroy` → `SlabCache::free`, the same plain spinlock under the same held lock.
+/// Push onto a list held under `SCHED` that is sized so it cannot be full: a full one is a sizing
+/// bug, which ends the machine with a message naming the list. **The value is `forget`ten rather
+/// than dropped**: an `ObjectRef` drop reaches `dispatch_destroy` → `SlabCache::free`, a plain
+/// spinlock, under the rank-1 IRQ-acquired lock.
 #[track_caller]
-fn push_reserved<T>(list: &mut KVec<T>, val: T, what: &str) {
-    if let Err(returned) = list.push_within_capacity(val) {
+fn push_reserved<T>(list: &mut Reserved<T>, val: T, what: &str) {
+    if let Err(returned) = list.push(val) {
         core::mem::forget(returned);
         panic!("{what}: reserve exhausted — this list is sized so that cannot happen");
     }
@@ -211,7 +203,7 @@ struct SchedState {
     /// while queued. A preempted thread re-homes to **its own** CPU's queue; movement
     /// happens only via placement (spawn/wake) and stealing. Pre-reserved per CPU (see
     /// [`MAX_THREADS`]), all under the one `SCHED` lock.
-    ready: [KVec<ObjectRef>; MAX_CPUS],
+    ready: [Reserved<ObjectRef>; MAX_CPUS],
     /// Which CPUs' scheduler state is initialized (and whose queues are reserved). The BSP
     /// sets bit 0 in [`init`]; each AP sets its own in [`ap_init`] in the same critical
     /// section that reserves its queues. Placement and stealing only target a CPU whose flag
@@ -227,11 +219,11 @@ struct SchedState {
     /// `switch_into`s off its stack, so freeing it from another CPU mid-switch would be a
     /// use-after-free. A **list** because several threads can end on a CPU before its next
     /// scheduler entry. Pre-reserved per CPU (see [`MAX_THREADS`]).
-    reap: [KVec<ObjectRef>; MAX_CPUS],
+    reap: [Reserved<ObjectRef>; MAX_CPUS],
     /// Threads suspended after a ring-3 fault, off the run queue with their `ExceptionFrame`
     /// on their kernel stacks. `sys_exception_resume` moves one back to `ready` or marks it
     /// for termination. Pre-reserved (see [`MAX_THREADS`]).
-    suspended: KVec<ObjectRef>,
+    suspended: Reserved<ObjectRef>,
     /// Monotonic thread-id source.
     next_tid: u32,
     /// Monotonic process-id source. The boot parent takes pid 1; spawned children take
@@ -253,9 +245,9 @@ struct SchedState {
     idle_addr: [usize; MAX_CPUS],
     /// Threads blocked in `sys_wait`, off the run queue, each holding one refcount on its
     /// `Thread`. Pre-reserved (see [`MAX_THREADS`]).
-    blocked: KVec<ObjectRef>,
+    blocked: Reserved<ObjectRef>,
     /// The deadline min-heap, drained on each tick. Never fuller than its promised slots.
-    deadlines: KVec<deadline::Entry>,
+    deadlines: Reserved<deadline::Entry>,
     /// The heap slots promised, by [`deadline::DeadlineKind`]: the threads' at [`init`], each
     /// timer's and endpoint's in its [`SlotHold`]. The heap's capacity covers their sum.
     deadline_slots: [usize; 3],
@@ -267,13 +259,13 @@ struct SchedState {
     /// (cross-CPU deadlock) or in IRQ context (self-deadlock against an interrupted
     /// allocator holder). Producers *move* refs in within the reserve (see
     /// [`DEFERRED_DROP_RESERVE`]); the only one is [`wake_entropy_seed_waiters`].
-    deferred_drops: KVec<ObjectRef>,
+    deferred_drops: Reserved<ObjectRef>,
     /// Processes whose last thread has exited and whose **handle table** still needs
     /// closing. Pushed by [`end_process_if_last`] under `SCHED`; drained by the
     /// [reaper thread](reaper_body) and, opportunistically, by [`reap_pending`].
     /// **CPU-agnostic, unlike [`reap`](Self::reap)**: closing a handle table is keyed on pid
     /// and touches no stack, so one reaper thread can serve the whole machine.
-    ended_pids: KVec<u32>,
+    ended_pids: Reserved<u32>,
     /// The reaper thread while it is parked. `None` while it is running or queued, like
     /// [`idle`](Self::idle), so a wake is a `take()`.
     reaper: Option<ObjectRef>,
@@ -285,23 +277,23 @@ struct SchedState {
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(
     LockRank::Sched,
     SchedState {
-        ready: [const { KVec::new() }; MAX_CPUS],
+        ready: [const { Reserved::unreserved() }; MAX_CPUS],
         cpu_online: [false; MAX_CPUS],
         current: [const { None }; MAX_CPUS],
-        reap: [const { KVec::new() }; MAX_CPUS],
-        suspended: KVec::new(),
+        reap: [const { Reserved::unreserved() }; MAX_CPUS],
+        suspended: Reserved::unreserved(),
         next_tid: 1,
         next_pid: 2,
         quantum: [QUANTUM_TICKS; MAX_CPUS],
         min_vruntime: [0; MAX_CPUS],
         idle: [const { None }; MAX_CPUS],
         idle_addr: [0; MAX_CPUS],
-        blocked: KVec::new(),
-        deadlines: KVec::new(),
+        blocked: Reserved::unreserved(),
+        deadlines: Reserved::unreserved(),
         deadline_slots: [0; 3],
         stats: [stats::Counters::ZERO; MAX_CPUS],
-        deferred_drops: KVec::new(),
-        ended_pids: KVec::new(),
+        deferred_drops: Reserved::unreserved(),
+        ended_pids: Reserved::unreserved(),
         reaper: None,
         threads: 0,
     },
@@ -336,13 +328,13 @@ impl SchedState {
     /// This CPU's reap list (mutable). Per-CPU so a dying thread is reclaimed only by the
     /// CPU it died on, after its `switch_into` completed.
     #[inline]
-    fn reap_slot(&mut self) -> &mut KVec<ObjectRef> {
+    fn reap_slot(&mut self) -> &mut Reserved<ObjectRef> {
         &mut self.reap[Self::this_cpu()]
     }
 
     /// This CPU's ready run queue (mutable). A preempted thread re-homes here.
     #[inline]
-    fn ready_slot(&mut self) -> &mut KVec<ObjectRef> {
+    fn ready_slot(&mut self) -> &mut Reserved<ObjectRef> {
         &mut self.ready[Self::this_cpu()]
     }
 

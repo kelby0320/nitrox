@@ -476,22 +476,20 @@ from IRQ context, any plain `SpinLock` transitively acquirable **while holding
 `SCHED`** becomes deadlock-bait — the plain lock's ordinary holders run with
 IF=1 and can be interrupted into a spin on `SCHED`. Freeing is acquiring: an
 `ObjectRef` drop can reach the slab/buddy locks, so the no-allocation rule under
-`SCHED` (and in IRQ context) extends to **no `ObjectRef` drops** there. Watch
-`KVec::try_push` growth too: a `mem::take` of a pre-reserved collection swaps in
-a zero-capacity `KVec`, and later pushes then allocate under whatever lock is
-held — drain pre-reserved `SCHED` collections by popping into fixed buffers
-instead (`sched::drain_pending_drops`).
+`SCHED` (and in IRQ context) extends to **no `ObjectRef` drops** there.
 
-**Use `KVec::push_within_capacity`, not `try_push`, for anything pushed under a
-lock or in interrupt context** (2026-08-14). `try_push` *grows*, so at the reserve
-boundary it calls `kmalloc`/`kfree` under whatever is held, and a
-`debug_assert!(len < capacity)` beside it does not prevent that — the growth
-happens first and succeeds, so the assertion never fires and the inversion is
-silent. Six `SCHED`-held pushes were in that state until the audit found them
-(C.1(c)), along with the DPC queue's push at an interrupt tail and the entropy
-seed-waiter list. `push_within_capacity` cannot allocate and hands the value back
-rather than dropping it, which matters for the same reason as the rule above: a
-returned `ObjectRef` dropped there would reach `SlabCache::free`.
+**A list pushed where nothing may allocate — under `SCHED` or an `IrqSpinLock`, or
+in interrupt or DPC context — is a `Reserved` or an `ArrayVec`, never a `KVec`**
+(`kernel/src/libkern/`; 2026-10-29). `KVec::try_push`
+*grows*, so at the reserve boundary it calls `kmalloc`/`kfree` under whatever is
+held, and a `debug_assert!(len < capacity)` beside it does not prevent that: the
+growth happens first and succeeds, so the assertion never fires. A `Reserved` is
+allocated when it is made, outside the lock, and an `ArrayVec` is inline; neither
+can grow, and each push hands a value it cannot hold back rather than dropping
+it, which matters for the same reason as the rule above: a returned `ObjectRef`
+dropped there would reach `SlabCache::free`. A `Reserved` has no `Default`, so no
+`mem::take` swaps in a list of no room; drain one by popping into a fixed buffer
+(`sched::drain_pending_drops`).
 
 ## Wait queues and the deadline heap live under rank 1 (Phase 1)
 

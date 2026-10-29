@@ -155,7 +155,7 @@ pub(super) fn end_process_if_last(g: &mut SchedState, me_obj: *mut (), status: E
     // SAFETY: as above.
     unsafe { Thread::set_process_ended(me_obj) };
     // A full queue leaves the sweep to this CPU's `reap_pending`, which `process_ended` asks for.
-    if g.ended_pids.push_within_capacity(th.owner_pid()).is_ok() {
+    if g.ended_pids.push(th.owner_pid()).is_ok() {
         wake_reaper(g);
     }
     deliver_child_exited(g, me_obj, status);
@@ -409,9 +409,8 @@ pub unsafe fn thread_exception_frame(thread: *mut ()) -> Option<usize> {
 
 /// Pop up to `buf.len()` parked refs — this CPU's `reap` list first, then the global
 /// [`SchedState::deferred_drops`] — into `buf`. **Moves only**: no drop, no allocation, and
-/// the lists keep their reserved buffers (a `mem::take` drain would leave a zero-capacity
-/// `KVec`, so every later exit-path push would *allocate under `SCHED`*). The caller drops
-/// the refs after releasing `SCHED`, in thread context.
+/// the lists keep their reserved buffers. The caller drops the refs after releasing `SCHED`, in
+/// thread context.
 pub(super) fn drain_pending_drops(g: &mut SchedState, buf: &mut [Option<ObjectRef>]) -> usize {
     let mut n = 0;
     while n < buf.len() {

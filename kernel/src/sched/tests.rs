@@ -114,27 +114,27 @@ fn inert_ref(tid: u32) -> ObjectRef {
 /// A fresh `SchedState` for data-structure tests (no idle thread; the refs are inert).
 fn test_state() -> SchedState {
     SchedState {
-        ready: [const { KVec::new() }; MAX_CPUS],
+        ready: [const { Reserved::unreserved() }; MAX_CPUS],
         cpu_online: {
             let mut o = [false; MAX_CPUS];
             o[0] = true;
             o
         },
         current: [const { None }; MAX_CPUS],
-        reap: [const { KVec::new() }; MAX_CPUS],
-        suspended: KVec::new(),
+        reap: [const { Reserved::unreserved() }; MAX_CPUS],
+        suspended: Reserved::unreserved(),
         next_tid: 1,
         next_pid: 2,
         quantum: [QUANTUM_TICKS; MAX_CPUS],
         min_vruntime: [0; MAX_CPUS],
         idle: [const { None }; MAX_CPUS],
         idle_addr: [0; MAX_CPUS],
-        blocked: KVec::new(),
-        deadlines: KVec::new(),
+        blocked: Reserved::unreserved(),
+        deadlines: Reserved::unreserved(),
         deadline_slots: [0; 3],
         stats: [stats::Counters::ZERO; MAX_CPUS],
-        deferred_drops: KVec::new(),
-        ended_pids: KVec::new(),
+        deferred_drops: Reserved::unreserved(),
+        ended_pids: Reserved::unreserved(),
         reaper: None,
         threads: 0,
     }
@@ -146,18 +146,18 @@ fn dequeue_front_is_round_robin() {
     let mut st = test_state();
     st.ready[0] = thread_list().unwrap();
     for tid in 1..=3 {
-        st.ready[0].try_push(inert_ref(tid)).unwrap();
+        assert!(st.ready[0].push(inert_ref(tid)).is_ok());
     }
     let a = dequeue_front(&mut st).unwrap();
     // SAFETY: pinned, single-threaded test.
     let a_tid = unsafe { &*(a.as_ptr() as *const Thread) }.tid();
     assert_eq!(a_tid, 1);
-    st.ready[0].try_push(a).unwrap();
+    assert!(st.ready[0].push(a).is_ok());
     let b = dequeue_front(&mut st).unwrap();
     // SAFETY: `b` pins a live `Thread`.
     let b_tid = unsafe { &*(b.as_ptr() as *const Thread) }.tid();
     assert_eq!(b_tid, 2, "round-robin must pick the next, not repeat");
-    st.ready[0].try_push(b).unwrap();
+    assert!(st.ready[0].push(b).is_ok());
 }
 
 #[test]
@@ -197,9 +197,9 @@ fn dequeue_prefers_realtime_by_priority_then_timeshared() {
         Thread::set_sched(rt_lo.as_ptr(), SchedClass::RealTime, 20, 0);
         Thread::set_sched(rt_hi.as_ptr(), SchedClass::RealTime, 5, 0);
     }
-    st.ready[0].try_push(ts).unwrap();
-    st.ready[0].try_push(rt_lo).unwrap();
-    st.ready[0].try_push(rt_hi).unwrap();
+    assert!(st.ready[0].push(ts).is_ok());
+    assert!(st.ready[0].push(rt_lo).is_ok());
+    assert!(st.ready[0].push(rt_hi).is_ok());
     assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "RealTime prio 5 first");
     assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "RealTime prio 20 next");
     assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 1, "TimeShared last");
@@ -219,9 +219,9 @@ fn dequeue_timeshared_picks_min_vruntime_and_advances_floor() {
         Thread::set_vruntime(b.as_ptr(), 100); // smallest
         Thread::set_vruntime(c.as_ptr(), 300);
     }
-    st.ready[0].try_push(a).unwrap();
-    st.ready[0].try_push(b).unwrap();
-    st.ready[0].try_push(c).unwrap();
+    assert!(st.ready[0].push(a).is_ok());
+    assert!(st.ready[0].push(b).is_ok());
+    assert!(st.ready[0].push(c).is_ok());
     assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "smallest vruntime first");
     assert_eq!(st.min_vruntime[0], 100, "floor advanced to the picked vruntime");
     assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "next-smallest vruntime");
@@ -280,8 +280,8 @@ fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
     online_n(&mut st, 4);
     let t = inert_ref(1);
 
-    st.ready[0].try_push(inert_ref(10)).unwrap();
-    st.ready[1].try_push(inert_ref(11)).unwrap();
+    assert!(st.ready[0].push(inert_ref(10)).is_ok());
+    assert!(st.ready[1].push(inert_ref(11)).is_ok());
     assert_eq!(pick_target_cpu(&st, t.as_ptr(), all_up(4)), 2);
 
     // CPU 2 parks: gone from the online set, still `true` in `cpu_online[]`.
@@ -300,7 +300,7 @@ fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
     for c in 0..MAX_CPUS {
         assert!(st.ready[c].is_empty(), "cpu {c} must start this half empty");
     }
-    st.ready[2].try_push(inert_ref(12)).unwrap();
+    assert!(st.ready[2].push(inert_ref(12)).is_ok());
 
     // Gating either path on `cpu_accepts_work` would strand the thread on CPU 2 forever.
     assert!(steal_available(&st, 0), "a parked CPU's queue must stay drainable, or this fix strands what it holds");
@@ -337,7 +337,7 @@ fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
     // runnable either (`place_thread` returns `Err`, the wake callers `panic!`), so filling
     // CPU 1 must push the choice to CPU 2.
     for i in 0..MAX_THREADS {
-        st.ready[1].try_push(inert_ref(100 + i as u32)).unwrap();
+        assert!(st.ready[1].push(inert_ref(100 + i as u32)).is_ok());
     }
     let chosen = pick_target_cpu(&st, t.as_ptr(), parked);
     assert!(cpu_accepts_work(&st, chosen, parked), "fallback picked cpu {chosen}, which does not accept work");
@@ -362,8 +362,8 @@ fn placement_least_loaded_and_respects_affinity() {
     online_n(&mut st, 4);
     let a = inert_ref(1);
     assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 0);
-    st.ready[0].try_push(inert_ref(10)).unwrap();
-    st.ready[1].try_push(inert_ref(11)).unwrap();
+    assert!(st.ready[0].push(inert_ref(10)).is_ok());
+    assert!(st.ready[1].push(inert_ref(11)).is_ok());
     assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 2);
     // SAFETY: `a` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 3) };
@@ -415,7 +415,7 @@ fn wake_placement_falls_back_when_home_queue_is_full() {
     unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
     // Fill CPU 0's queue to its reserve: the home pick must divert (not a fatal wake).
     for tid in 100..(100 + MAX_THREADS as u32) {
-        st.ready[0].try_push(inert_ref(tid)).unwrap();
+        assert!(st.ready[0].push(inert_ref(tid)).is_ok());
     }
     assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 1);
     drop(st.ready[0].pop().unwrap());
@@ -431,9 +431,9 @@ fn steal_one_skips_busiest_victim_with_no_stealable_thread() {
         let t = inert_ref(tid);
         // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 1) };
-        st.ready[1].try_push(t).unwrap();
+        assert!(st.ready[1].push(t).is_ok());
     }
-    st.ready[2].try_push(inert_ref(20)).unwrap();
+    assert!(st.ready[2].push(inert_ref(20)).is_ok());
     // Host `this_cpu()` is 0. `steal_one` must not return None when `steal_available` holds
     // (searching only the busiest victim would), which panics the idle-steal paths.
     assert!(steal_available(&st, 0));
@@ -449,9 +449,9 @@ fn steal_one_prefers_the_busiest_stealable_victim() {
     init_global_heap();
     let mut st = test_state();
     online_n(&mut st, 3);
-    st.ready[1].try_push(inert_ref(10)).unwrap();
+    assert!(st.ready[1].push(inert_ref(10)).is_ok());
     for tid in 20..22 {
-        st.ready[2].try_push(inert_ref(tid)).unwrap();
+        assert!(st.ready[2].push(inert_ref(tid)).is_ok());
     }
     let stolen = steal_one(&mut st).unwrap();
     // SAFETY: `stolen` pins a live `Thread`.
@@ -466,14 +466,14 @@ fn drain_pending_drops_moves_all_and_preserves_capacity() {
     init_global_heap();
     let mut st = test_state();
     st.reap[0] = thread_list().unwrap();
-    st.deferred_drops.try_reserve(DEFERRED_DROP_RESERVE).unwrap();
+    st.deferred_drops = Reserved::with_capacity(DEFERRED_DROP_RESERVE).unwrap();
     let reap_cap = st.reap[0].capacity();
     let dd_cap = st.deferred_drops.capacity();
     for tid in 1..=3 {
-        st.reap[0].try_push(inert_ref(tid)).unwrap();
+        assert!(st.reap[0].push(inert_ref(tid)).is_ok());
     }
     for tid in 4..=5 {
-        st.deferred_drops.try_push(inert_ref(tid)).unwrap();
+        assert!(st.deferred_drops.push(inert_ref(tid)).is_ok());
     }
     let mut buf: [Option<ObjectRef>; MAX_THREADS + DEFERRED_DROP_RESERVE] =
         [const { None }; MAX_THREADS + DEFERRED_DROP_RESERVE];
@@ -587,12 +587,12 @@ fn queue_drop_releases_every_thread_exactly_once() {
         let mut st = test_state();
         st.ready[0] = thread_list().unwrap();
         for tid in 1..=4 {
-            st.ready[0].try_push(inert_ref(tid)).unwrap();
+            assert!(st.ready[0].push(inert_ref(tid)).is_ok());
         }
         *st.cur_slot() = Some(inert_ref(5));
         st.reap[0] = thread_list().unwrap();
-        st.reap[0].try_push(inert_ref(6)).unwrap();
-        st.reap[0].try_push(inert_ref(7)).unwrap();
+        assert!(st.reap[0].push(inert_ref(6)).is_ok());
+        assert!(st.reap[0].push(inert_ref(7)).is_ok());
         assert_eq!(test_probe::thread_destroys(), 0);
     } // st dropped here — every ObjectRef drops its one reference.
     assert_eq!(test_probe::thread_destroys(), 7, "each queued/current/reaped thread destroyed exactly once",);
@@ -617,7 +617,7 @@ fn resume_suspended_moves_to_ready_and_sets_disposition() {
         Thread::set_state(obj, ThreadState::Suspended);
         Thread::set_exception_frame(obj, 0xdead_beef);
     }
-    st.suspended.try_push(th).unwrap();
+    assert!(st.suspended.push(th).is_ok());
 
     // `resume_suspended` takes the global SCHED, so mirror its list ops to stay lock-free.
     let i = st.suspended.iter().position(|r| r.as_ptr() == obj).unwrap();
@@ -627,7 +627,7 @@ fn resume_suspended_moves_to_ready_and_sets_disposition() {
         Thread::set_disposition(obj, 2, 7);
         Thread::set_state(obj, ThreadState::Ready);
     }
-    st.ready[0].try_push(r).unwrap();
+    assert!(st.ready[0].push(r).is_ok());
 
     assert!(st.suspended.is_empty());
     assert_eq!(st.ready[0].len(), 1);
@@ -646,9 +646,9 @@ fn has_live_siblings_scans_all_parked_lists() {
     st.blocked = thread_list().unwrap();
     st.suspended = thread_list().unwrap();
 
-    st.ready[0].try_push(inert_user_ref(1, 1)).unwrap();
-    st.suspended.try_push(inert_user_ref(2, 1)).unwrap();
-    st.blocked.try_push(inert_user_ref(3, 3)).unwrap();
+    assert!(st.ready[0].push(inert_user_ref(1, 1)).is_ok());
+    assert!(st.suspended.push(inert_user_ref(2, 1)).is_ok());
+    assert!(st.blocked.push(inert_user_ref(3, 3)).is_ok());
 
     assert!(has_live_siblings(&st, 1));
     assert!(has_live_siblings(&st, 3));
@@ -663,7 +663,7 @@ fn a_process_ending_marks_only_its_own_threads_and_frees_none() {
     st.ready[0] = thread_list().unwrap();
     st.reap[0] = thread_list().unwrap();
     for (tid, pid) in [(1, 1), (2, 2), (3, 1)] {
-        st.ready[0].try_push(inert_user_ref(tid, pid)).unwrap();
+        assert!(st.ready[0].push(inert_user_ref(tid, pid)).is_ok());
     }
 
     end_siblings(&mut st, 1);
@@ -706,7 +706,7 @@ fn reserved_state() -> SchedState {
     st.blocked = thread_list().unwrap();
     st.suspended = thread_list().unwrap();
     st.reap[0] = thread_list().unwrap();
-    st.deadlines.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    st.deadlines = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     st.deadline_slots = [deadline::HEAP_RESERVE / 4; 3];
     st
 }
@@ -762,7 +762,7 @@ fn a_thread_counts_from_its_first_placement_until_its_reap_is_drained() {
     place_thread(&mut st, woken, true).unwrap();
     assert_eq!(st.threads, 1, "a wake is not a new thread");
     let exited = st.ready[0].pop().unwrap();
-    st.reap[0].try_push(exited).unwrap();
+    assert!(st.reap[0].push(exited).is_ok());
     let mut buf = [const { None }; 4];
     assert_eq!(drain_pending_drops(&mut st, &mut buf), 1);
     assert_eq!(st.threads, 0);
@@ -791,13 +791,13 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
     let (b, o) = (blocked.as_ptr(), other.as_ptr());
     let thread_deadline = deadline::Entry { kind: deadline::DeadlineKind::Thread, ..entry(5_000, b as usize) };
     deadline::push(&mut st.deadlines, thread_deadline).unwrap();
-    st.blocked.try_push(blocked).unwrap();
-    st.blocked.try_push(other).unwrap();
+    assert!(st.blocked.push(blocked).is_ok());
+    assert!(st.blocked.push(other).is_ok());
     let suspended = inert_user_ref(3, 7);
     let s3 = suspended.as_ptr();
     // SAFETY: pinned by the test; single-threaded.
     unsafe { Thread::set_state(s3, ThreadState::Suspended) };
-    st.suspended.try_push(suspended).unwrap();
+    assert!(st.suspended.push(suspended).is_ok());
     let running = inert_user_ref(4, 7);
     let r4 = running.as_ptr();
     st.current[1] = Some(running);
@@ -830,7 +830,7 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
     init_global_heap();
     super::online_set::force(0b1);
     let mut st = reserved_state();
-    st.ended_pids.try_reserve(4).unwrap();
+    st.ended_pids = Reserved::with_capacity(4).unwrap();
     st.reaper = Some(inert_ref(99));
     let (process, _root) = user_process_ref(5);
     let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
@@ -846,7 +846,7 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
     }
     let me = into_objref(user_thread_no_stack(1, process.clone(), 0x40_0000, 0x7fff_f000));
     let own = ExitStatus { kind: ExitKind::Crashed as u32, code: 14 };
-    st.blocked.try_push(inert_user_ref(2, 5)).unwrap();
+    assert!(st.blocked.push(inert_user_ref(2, 5)).is_ok());
 
     assert!(!end_process_if_last(&mut st, me.as_ptr(), own), "a sibling is still live");
     assert!(st.ended_pids.is_empty() && st.reaper.is_some());
