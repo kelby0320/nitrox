@@ -131,13 +131,14 @@ The window-open / window-closed transitions live exclusively inside the copy pri
 
 ### Boot enable
 
-[`arch::init_protections`](../../kernel/src/arch/x86_64/paging.rs) is the arch-neutral entry point. `main.rs::paging_init` calls it once at boot; an SMP AP-bring-up path will call it once per AP when SMP lands. It panics if any feature the kernel hard-requires is missing from the running CPU.
+[`ArchCpu::init_protections`](../../kernel/src/arch/x86_64/cpu.rs) is the arch-neutral entry point. `main.rs::paging_init` calls it on the bootstrap CPU, and AP bring-up on each other CPU. It panics if any feature the kernel hard-requires is missing from the running CPU.
 
 On x86_64 the function:
 
 1. Sets `EFER.NXE` (so the NX bit in page tables is honoured).
-2. Reads CPUID 7.0:EBX bits 7 (SMEP) and 20 (SMAP); panics if either is absent.
-3. Reads `CR4`, ORs in `CR4.SMEP | CR4.SMAP`, writes back.
+2. Sets `CR0.WP`, so a ring-0 write through a read-only mapping faults: a copy to a user cannot write a page the user may only read, whatever the bootloader left.
+3. Reads CPUID 7.0:EBX bits 7 (SMEP) and 20 (SMAP); panics if either is absent.
+4. Reads `CR4`, ORs in `CR4.SMEP | CR4.SMAP`, writes back.
 
 On a future aarch64 port the same entry point handles PAN configuration (`SCTLR_EL1.SPAN`) and the PAN feature-flag detection (`FEAT_PAN` / `FEAT_PAN2` / `FEAT_PAN3`); PXN is per-PTE, so no global enable.
 

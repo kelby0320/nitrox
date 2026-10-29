@@ -14,6 +14,8 @@ const RFLAGS_IF: u64 = 1 << 9;
 const MSR_EFER: u32 = 0xC000_0080;
 const EFER_NXE: u64 = 1 << 11;
 
+/// CR0.WP: ring-0 writes to read-only pages `#PF`, a user's read-only mapping among them.
+const CR0_WP: u64 = 1 << 16;
 /// CR4.SMEP: ring-0 instruction fetches from user pages `#PF`.
 const CR4_SMEP: u64 = 1 << 20;
 /// CR4.SMAP: ring-0 data accesses to user pages `#PF` unless EFLAGS.AC is set (`stac`).
@@ -35,6 +37,7 @@ impl ArchCpu for X86Cpu {
 
     fn init_protections() {
         ensure_nxe();
+        ensure_write_protect();
         ensure_smap_smep();
     }
 
@@ -178,6 +181,13 @@ fn ensure_nxe() {
         let efer = regs::rdmsr(MSR_EFER);
         regs::wrmsr(MSR_EFER, efer | EFER_NXE);
     }
+}
+
+/// Set CR0.WP, so a copy to a user cannot write through a read-only mapping, of a shared file
+/// page say, whatever the bootloader left. Idempotent.
+fn ensure_write_protect() {
+    // SAFETY: WP only adds a check on ring-0 writes; no other CR0 bit changes.
+    unsafe { regs::write_cr0(regs::read_cr0() | CR0_WP) };
 }
 
 /// Enable SMEP and SMAP, panicking if either is missing on this CPU. Idempotent.

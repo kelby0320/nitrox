@@ -606,9 +606,10 @@ management story.
   fatal (a ring-3 fault becomes a `SegFault` notification + suspend;
   a kernel fault dumps and stops the machine).
 - **User-access protections enabled at boot.**
-  [`arch::init_protections`](../../kernel/src/arch/x86_64/paging.rs)
-  runs in `paging_init`. On x86_64 it enables NX, SMEP, and SMAP
-  (panicking if any are absent); a future aarch64 port will use
+  [`ArchCpu::init_protections`](../../kernel/src/arch/x86_64/cpu.rs)
+  runs in `paging_init` and on each AP. On x86_64 it enables NX,
+  write protection (`CR0.WP`), SMEP and SMAP (panicking if SMEP or
+  SMAP is absent); a future aarch64 port will use
   the same entry point to configure PAN / PXN. Phase 1
   hard-requires the protections — the dev loop runs QEMU with
   `-cpu qemu64,+smap,+smep` so TCG exposes them.
