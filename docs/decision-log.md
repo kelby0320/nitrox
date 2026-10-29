@@ -37150,3 +37150,8 @@ Group F of the survey's triage, the types the kernel trusts at its boundaries, m
 
 To make room, `sys_process_spawn`, `sys_io_submit` and a fill's reply moved out of
 `syscall/table.rs` into `spawn.rs`, `submit.rs` and `fill.rs` beside it, unchanged.
+
+One more, outside the survey, from this PR's CI: **a ring-3 fault is reported as stranding the
+scheduler only when no CPU has a thread to run**, not when the faulting CPU alone has none, and
+the notice is written under `SERIAL`. check-terminal's intermittent first-prompt hang on CI was
+that notice, false and lock-free, interleaved byte by byte with nxterm's line.
