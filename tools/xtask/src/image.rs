@@ -383,11 +383,11 @@ const INITRAMFS_PROGRAMS: &[(&str, &str)] = &[
 ];
 
 /// The largest the packed initramfs may be, in bytes: a **tripwire on the rule above**, since
-/// nothing releases the initramfs and the list drifts silently. The four programs come to ~231 KB,
-/// room to grow by half, and a fifth trips it.
-/// A failure is a question: add the program to [`INITRAMFS_PROGRAMS`] with its bootstrap reason and
-/// raise this, or put it in a store package.
-const INITRAMFS_MAX_BYTES: usize = 384 * 1024;
+/// nothing releases the initramfs and the list drifts silently. The four programs come to about
+/// 397 KB (2026-10-28), and the room left is less than the smallest of them, `eshell`'s 28 KB, so
+/// a fifth trips it. A failure is a question: add the program to [`INITRAMFS_PROGRAMS`] with its
+/// bootstrap reason and raise this, or put it in a store package.
+const INITRAMFS_MAX_BYTES: usize = 412 * 1024;
 
 /// Append one CPIO `newc` entry (NUL-padded to 4 bytes throughout) to `out`; matches
 /// `kernel/src/initramfs.rs`.
