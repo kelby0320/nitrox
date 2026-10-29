@@ -205,7 +205,7 @@ pub fn init() {
     let mut hw = 0usize;
     // Pre-reserve the seed-waiter list so `register_seed_waiter` never allocates under the lock,
     // and reserve **outside** it: allocating (slab, rank 6a) under this leaf-ranked lock is an
-    // inversion the debug lock-order tracker rejects (as in `dpc::init`). Best-effort: an
+    // inversion the debug lock-order tracker rejects. Best-effort: an
     // unreserved list reports itself full, so callers are told to retry, because the push in
     // `register_waiter` refuses instead of growing.
     let mut waiters = KVec::new();

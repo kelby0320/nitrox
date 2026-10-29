@@ -814,7 +814,6 @@ fn a_departed_devices_node_is_refused_and_its_slot_reused_under_a_new_epoch() {
 #[test]
 fn a_departure_completes_its_commands_only_once_the_slot_is_disabled() {
     init_global_heap();
-    crate::dpc::init().unwrap();
     let peer_closed = KError::PeerClosed as i32;
     let pending = crate::io::irp::IrpStatus::Pending as i32;
     for (slot, moving) in

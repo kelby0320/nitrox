@@ -195,7 +195,7 @@ static DONE: IrqSpinLock<Done> =
     IrqSpinLock::new(LockRank::Leaf, Done { head: core::ptr::null_mut(), tail: core::ptr::null_mut() });
 
 /// **The one DPC that finishes completed IRPs**, so the DPC queue holds static DPCs only and its
-/// reserve bounds them, rather than one DPC an IRP completed between two drains.
+/// capacity bounds them, rather than one DPC an IRP completed between two drains.
 static FINISH: Dpc = Dpc::new(finish_completed, core::ptr::null_mut());
 
 /// **Complete `irp` with `status` and `transferred`**, from a driver's completion, interrupt or

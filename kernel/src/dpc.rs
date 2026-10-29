@@ -6,7 +6,7 @@
 //! the scheduler lock but must not block. See `docs/architecture/drivers-and-irps.md`.
 //!
 //! A [`Dpc`] is a static, or a field of the heap object it serves, so queuing one allocates
-//! nothing: the queue is a pre-reserved list of their addresses.
+//! nothing: the queue is an inline list of their addresses.
 //!
 //! ## One queue, drained by every CPU
 //!
@@ -19,11 +19,11 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{AllocError, IrqSpinLock, KVec};
+use crate::libkern::{ArrayVec, IrqSpinLock};
 
 /// Capacity of the DPC queue. Each `Dpc` is queued at most once (its `queued` flag), so the bound
-/// is the number of distinct `Dpc` objects, and a small fixed reserve is plenty.
-const DPC_RESERVE: usize = 64;
+/// is the number of distinct `Dpc` objects, and a small fixed capacity is plenty.
+const DPC_CAPACITY: usize = 64;
 
 /// A deferred procedure call: `handler(ctx)`, run when the queue is drained.
 ///
@@ -50,28 +50,20 @@ impl Dpc {
     }
 }
 
-/// The pending-DPC queue. A leaf `IrqSpinLock`, only ever held alone (push on enqueue; the drain
-/// snapshots-and-clears under it, then runs handlers with it **released**), so it never nests with
-/// `SCHED`. See `kernel/docs/lock-ordering.md`.
-static DPC_QUEUE: IrqSpinLock<KVec<usize>> = IrqSpinLock::new(LockRank::Leaf, KVec::new());
+/// A queued DPC.
+#[derive(Clone, Copy)]
+struct Queued(NonNull<Dpc>);
 
-/// Reserve the DPC queue's backing storage, once at boot after the allocator is up and **before**
-/// interrupts are armed (the first ISR may `enqueue`). The only allocation the queue makes:
-/// `enqueue` stays within the reserve, so it never allocates in interrupt context.
-pub fn init() -> Result<(), AllocError> {
-    // Reserve **outside** the queue lock, then move the list in: reserving under it would allocate
-    // (slab, rank 6a) while holding a leaf-ranked lock, an order inversion the debug tracker
-    // rejects. The lock is only honestly a leaf if nothing under it ever allocates.
-    let mut reserved = KVec::new();
-    reserved.try_reserve(DPC_RESERVE)?;
-    // **Once**: replacing a queue already in use would drop what it holds, and a `Dpc` dropped
-    // while marked queued is never queued again.
-    let mut q = DPC_QUEUE.lock();
-    if q.capacity() < DPC_RESERVE {
-        *q = reserved;
-    }
-    Ok(())
-}
+// SAFETY: a `Queued` is only ever read as a `&Dpc`, and a `Dpc` is `Sync`.
+unsafe impl Send for Queued {}
+
+/// The queue, and so the list each drain takes: one type, so a drain holds all it takes.
+type Queue = ArrayVec<Queued, DPC_CAPACITY>;
+
+/// The pending-DPC queue. A leaf `IrqSpinLock`, only ever held alone (push on enqueue; the drain
+/// takes the whole list under it, then runs handlers with it **released**), so it never nests with
+/// `SCHED`. See `kernel/docs/lock-ordering.md`.
+static DPC_QUEUE: IrqSpinLock<Queue> = IrqSpinLock::new(LockRank::Leaf, ArrayVec::new());
 
 /// Queue `dpc` to run at the next [`run_pending`]; idempotent. Safe to call from IRQ context. A
 /// `'static` DPC outlives every drain, whichever CPU's runs it.
@@ -88,7 +80,7 @@ pub unsafe fn enqueue_raw(dpc: NonNull<Dpc>) {
     #[cfg(test)]
     ENQUEUED.with(|e| e.borrow_mut().push(dpc.as_ptr() as usize));
     // SAFETY: valid until its handler has run, by the caller's contract.
-    enqueue_into(&DPC_QUEUE, unsafe { dpc.as_ref() });
+    unsafe { enqueue_into(&DPC_QUEUE, dpc) };
 }
 
 #[cfg(test)]
@@ -115,44 +107,32 @@ pub fn run_pending() {
     run_pending_in(&DPC_QUEUE);
 }
 
-// The core logic takes the queue as a parameter so a host test can use a fresh local one. The queue
-// stores each `&Dpc` as a `usize` address: a raw `*mut Dpc` is not `Send`, so a `KVec<*mut Dpc>`
-// static would not be `Sync`.
-fn enqueue_into(queue: &IrqSpinLock<KVec<usize>>, dpc: &Dpc) {
-    if dpc.queued.swap(true, Ordering::AcqRel) {
+// The core logic takes the queue as a parameter so a host test can use a fresh local one.
+//
+// # Safety
+// `dpc` stays valid until its handler has run.
+unsafe fn enqueue_into(queue: &IrqSpinLock<Queue>, dpc: NonNull<Dpc>) {
+    // SAFETY: valid, by the contract.
+    if unsafe { dpc.as_ref() }.queued.swap(true, Ordering::AcqRel) {
         return; // already queued
     }
-    let addr = dpc as *const Dpc as usize;
-    let mut q = queue.lock();
-    // Bounded by the number of distinct DPCs (dedup above), so it stays within the reserve.
-    // **Enforced by the push, not by the assertion beside it**: `try_push` *grows*, and `kmalloc`
-    // under the queue lock at an interrupt tail is forbidden outright; the `debug_assert` would not
-    // fire, as growth happens first and succeeds.
-    debug_assert!(q.len() < q.capacity(), "DPC queue capacity exceeded");
-    if q.push_within_capacity(addr).is_err() {
+    if queue.lock().try_push(Queued(dpc)).is_err() {
         // Losing a DPC would strand whatever it was going to complete, so this is fatal.
-        panic!("DPC queue reserve exhausted — more distinct DPCs than the queue was sized for");
+        panic!("DPC queue full — more distinct DPCs than it holds");
     }
 }
 
-fn run_pending_in(queue: &IrqSpinLock<KVec<usize>>) {
+fn run_pending_in(queue: &IrqSpinLock<Queue>) {
     loop {
-        let mut buf = [0usize; DPC_RESERVE];
-        let n = {
-            let mut q = queue.lock();
-            let n = q.len();
-            buf[..n].copy_from_slice(&q);
-            q.clear();
-            n
-        };
-        if n == 0 {
+        let batch = core::mem::take(&mut *queue.lock());
+        if batch.is_empty() {
             break;
         }
-        for &addr in &buf[..n] {
-            // SAFETY: `addr` is a live `&Dpc` registered by `enqueue`, whose fields never change
-            // but the atomic `queued`. Clear `queued` BEFORE running so the handler may
-            // re-enqueue this same DPC.
-            let dpc = unsafe { &*(addr as *const Dpc) };
+        for &Queued(dpc) in batch.iter() {
+            // SAFETY: queued by `enqueue`, so `'static`, or by `enqueue_raw`, so valid until this
+            // handler has run; its fields never change but the atomic `queued`. Clear `queued`
+            // BEFORE running so the handler may re-enqueue this same DPC.
+            let dpc = unsafe { dpc.as_ref() };
             dpc.queued.store(false, Ordering::Release);
             (dpc.handler)(dpc.ctx);
         }
@@ -162,14 +142,16 @@ fn run_pending_in(queue: &IrqSpinLock<KVec<usize>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mm::test_support::init_global_heap;
     use core::sync::atomic::AtomicU32;
 
-    fn fresh_queue() -> IrqSpinLock<KVec<usize>> {
-        init_global_heap();
-        let q = IrqSpinLock::new(LockRank::Leaf, KVec::new());
-        q.lock().try_reserve(DPC_RESERVE).unwrap();
-        q
+    fn fresh_queue() -> IrqSpinLock<Queue> {
+        IrqSpinLock::new(LockRank::Leaf, ArrayVec::new())
+    }
+
+    /// Queue `d` on `q`; each test drains `q` before `d` goes.
+    fn enqueue_into(q: &IrqSpinLock<Queue>, d: &Dpc) {
+        // SAFETY: drained while `d` lives.
+        unsafe { super::enqueue_into(q, NonNull::from(d)) }
     }
 
     /// A handler that increments the `AtomicU32` its `ctx` points at.
@@ -230,6 +212,29 @@ mod tests {
         enqueue_into(&q, &d);
         run_pending_in(&q);
         assert_eq!(c.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_queue_of_its_capacity_drains_whole() {
+        let q = fresh_queue();
+        let counters: [AtomicU32; DPC_CAPACITY] = core::array::from_fn(|_| AtomicU32::new(0));
+        let dpcs = counters.each_ref().map(dpc_for);
+        for d in &dpcs {
+            enqueue_into(&q, d);
+        }
+        run_pending_in(&q);
+        assert!(counters.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "DPC queue full")]
+    fn a_dpc_past_the_capacity_is_fatal() {
+        let q = fresh_queue();
+        let c = AtomicU32::new(0);
+        let dpcs: [Dpc; DPC_CAPACITY + 1] = core::array::from_fn(|_| dpc_for(&c));
+        for d in &dpcs {
+            enqueue_into(&q, d);
+        }
     }
 
     #[test]

@@ -104,7 +104,6 @@ fn an_all_padding_field_comes_back_empty() {
 fn a_rescan_and_an_eject_are_refused_without_touching_a_disk() {
     use crate::io::irp::{IrpBuffer, IrpOp};
     crate::mm::test_support::init_global_heap();
-    crate::dpc::init().unwrap();
     for op in [IrpOp::Rescan, IrpOp::Eject] {
         let mut irp = Irp::new_block(op, core::ptr::null(), 0, 0, IrpBuffer::NONE, core::ptr::null_mut(), 0);
         submit(&mut irp, core::ptr::null_mut());
@@ -142,7 +141,6 @@ impl Drop for FakeRegs {
 /// write, not from a shared borrow of the box.
 fn fake_disk() -> (FakeRegs, AhciDisk) {
     crate::mm::test_support::init_global_heap();
-    crate::dpc::init().unwrap();
     let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
     let abar = regs.0 as u64;
     let disk = AhciDisk {

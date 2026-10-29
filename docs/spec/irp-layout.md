@@ -83,7 +83,7 @@ carries everything down and back up.
   allocation in IRQ context, per `kernel/CLAUDE.md`), which runs each IRP's `on_complete`. The
   block layer's signals `completion` and hands its box to thread context to free. One DPC for
   every IRP, rather than one inline in each, keeps the DPC queue to static DPCs, which its fixed
-  reserve bounds (2026-10-29).
+  capacity bounds (2026-10-29).
 - **`stack`** — the [`IrpStack`](#irpstack) of per-layer frames.
 
 ## IrpOp

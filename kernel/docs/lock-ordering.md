@@ -172,18 +172,18 @@ Two corollaries:
 but it is a **leaf** — nothing is acquired while it is held, so it imposes no
 rank-ordering constraint beyond "acquire no other lock while holding it":
 
-- **`enqueue`** takes the lock, pushes one node pointer (within the pre-reserved
-  capacity — no allocation), and releases. It touches no other subsystem.
-- **`run_pending`** takes the lock, snapshots-and-clears the queue into a stack
-  buffer, **releases the lock**, and only *then* runs the handlers. A handler may
+- **`enqueue`** takes the lock, pushes one node pointer (into an inline list of
+  fixed capacity — no allocation), and releases. It touches no other subsystem.
+- **`run_pending`** takes the lock, takes the whole list by value, **releases the
+  lock**, and only *then* runs the handlers. A handler may
   take `SCHED` (to make a thread runnable) or `SERIAL` (to log) — but always
   *after* the queue lock is dropped, so `DPC_QUEUE` never nests with them.
 
 Because it holds nothing, it ranks below every other lock: it is legal to
 `enqueue` while holding `SCHED` (rank 1), and the drain re-acquires the
 higher-ranked `SCHED` inside a handler only after releasing `DPC_QUEUE`. Like the
-deadline heap and the per-object waiter lists, the queue is pre-reserved at boot
-(`dpc::init`) so `enqueue` never allocates in interrupt context.
+per-object waiter lists, the queue is held inline, so `enqueue` never allocates in
+interrupt context.
 
 ## The entropy lock is a leaf
 

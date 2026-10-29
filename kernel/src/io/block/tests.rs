@@ -50,7 +50,6 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     use core::cell::RefCell;
     init_global_heap();
     // The global queue's reserve, as the boot makes it: a refusal completes through a DPC.
-    crate::dpc::init().unwrap();
     /// What reached the disk: each IRP's op and disk-absolute offset.
     struct Seen(RefCell<std::vec::Vec<(u32, u64)>>);
     fn disk_submit(irp: *mut Irp, ctx: *mut ()) {
@@ -173,7 +172,6 @@ fn a_block_request_off_its_devices_blocks_reaches_no_driver() {
     use crate::object::{MemoryObject, PendingOperation};
     use core::cell::RefCell;
     init_global_heap();
-    crate::dpc::init().unwrap();
     /// Each IRP that reached the device.
     struct Seen(RefCell<std::vec::Vec<*mut Irp>>);
     fn disk_submit(irp: *mut Irp, ctx: *mut ()) {
@@ -237,7 +235,6 @@ fn a_blocking_read_its_device_did_not_complete_fails() {
     use crate::libkern::handle::KObjectType;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
     init_global_heap();
-    crate::dpc::init().unwrap();
     fn kept(_: *mut Irp, _: *mut ()) {}
     fn completes(irp: *mut Irp, _: *mut ()) {
         // SAFETY: the test's live IRP, this backend's to complete.
@@ -334,7 +331,6 @@ fn more_refusals_than_the_dpc_queue_holds_each_complete() {
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
     use crate::object::{MemoryObject, PendingOperation};
     init_global_heap();
-    crate::dpc::init().unwrap();
     fn disk_submit(_: *mut Irp, _: *mut ()) {}
     fn disk_poll(_: *mut ()) {}
     let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: core::ptr::null_mut(), max_frags: 8 };
