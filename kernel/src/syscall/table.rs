@@ -35,7 +35,8 @@ use crate::libkern::{ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notificatio
 use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::elf::{MAX_IMAGE_BYTES, load_elf};
 use crate::mm::user_access::{
-    UserMutPtr, UserPtr, copy_from_user, copy_slice_from_user, copy_slice_to_user, copy_to_user,
+    UserMutPtr, UserPtr, copy_array_from_user, copy_array_to_user, copy_from_user, copy_slice_from_user,
+    copy_slice_to_user, copy_to_user,
 };
 use crate::mm::vmm::{Protection, VAddrRange};
 use crate::mm::{PAGE_SIZE, VirtAddr};
@@ -1394,12 +1395,8 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
     let hptr = UserPtr::<u8>::new(handles_ptr).map_err(from_user_access)?;
     let rptr = UserMutPtr::<u8>::new(results_ptr).map_err(from_user_access)?;
 
-    let mut hbytes = [0u8; MAX_WAIT_HANDLES * 8];
-    copy_slice_from_user(&mut hbytes[..count * 8], hptr).map_err(from_user_access)?;
     let mut handles = [0u64; MAX_WAIT_HANDLES];
-    for i in 0..count {
-        handles[i] = u64::from_ne_bytes(hbytes[i * 8..i * 8 + 8].try_into().unwrap());
-    }
+    copy_array_from_user(&mut handles[..count], hptr).map_err(from_user_access)?;
 
     let pid = crate::sched::current_owner_pid();
     let mut refs: [Option<ObjectRef>; MAX_WAIT_HANDLES] = core::array::from_fn(|_| None);
@@ -1445,7 +1442,7 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
                     k += 1;
                 }
             }
-            copy_slice_to_user(rptr, crate::libkern::pod::slice_bytes(&out[..k])).map_err(from_user_access)?;
+            copy_array_to_user(rptr, &out[..k]).map_err(from_user_access)?;
             Ok(k as isize)
         }
         crate::sched::WaitResult::TimedOut => {
@@ -1603,11 +1600,7 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
     let mut h_raw = [0u64; IPC_HANDLE_MAX];
     if count > 0 {
         let hptr = UserPtr::<u8>::new(handles).map_err(from_user_access)?;
-        let mut hbytes = [0u8; IPC_HANDLE_MAX * 8];
-        copy_slice_from_user(&mut hbytes[..count * 8], hptr).map_err(from_user_access)?;
-        for i in 0..count {
-            h_raw[i] = u64::from_ne_bytes(hbytes[i * 8..i * 8 + 8].try_into().unwrap());
-        }
+        copy_array_from_user(&mut h_raw[..count], hptr).map_err(from_user_access)?;
     }
     if (1..count).any(|i| h_raw[..i].contains(&h_raw[i])) {
         return Err(KError::InvalidArgument);
@@ -2178,11 +2171,7 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
             recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
             from_user_access(e)
         })?;
-        let mut hbytes = [0u8; IPC_HANDLE_MAX * 8];
-        for i in 0..n.min(IPC_HANDLE_MAX) {
-            hbytes[i * 8..i * 8 + 8].copy_from_slice(&installed[i].bits().to_le_bytes());
-        }
-        if let Err(e) = copy_slice_to_user(hptr, &hbytes[..n * 8]) {
+        if let Err(e) = copy_array_to_user(hptr, &installed[..n]) {
             recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
             return Err(from_user_access(e));
         }

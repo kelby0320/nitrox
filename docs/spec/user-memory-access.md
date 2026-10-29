@@ -35,7 +35,12 @@ pub struct UserMutPtr<T> { /* opaque u64 + phantom T */ }
 | `copy_to_user<T: Pod>` | kernel → user | `(dst: UserMutPtr<T>, src: &T) -> Result<(), _>` |
 | `copy_slice_from_user` | user → kernel | `(dst: &mut [u8], src: UserPtr<u8>) -> Result<(), _>` |
 | `copy_slice_to_user` | kernel → user | `(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), _>` |
+| `copy_array_from_user<T: Pod>` | user → kernel | `(dst: &mut [T], src: UserPtr<u8>) -> Result<(), _>` |
+| `copy_array_to_user<T: Pod>` | kernel → user | `(dst: UserMutPtr<u8>, src: &[T]) -> Result<(), _>` |
 | `copy_cstr_from_user` | user → kernel | `(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], _>` |
+
+The array variants copy a run of plain data, a handle array say, through the slice variants: the
+user's side is bytes, so it needs no alignment for `T`.
 
 **`T` is plain data** (`libkern::Pod`, implemented through `pod!`, which checks a struct's fields
 fill it): no padding, so a copy out shows no kernel bytes, and every bit pattern a value, so a
@@ -67,8 +72,8 @@ pub enum UserAccessError {
 
 `rep movsb` may make progress before faulting. Specifically:
 
-- `copy_from_user` / `copy_slice_from_user`: on `Fault`, the kernel-side destination may hold a partial copy. The caller observes `Err` and discards the destination.
-- `copy_to_user` / `copy_slice_to_user`: on `Fault`, the user-side destination may hold a partial copy. The kernel cannot undo the write; the user observes whatever bytes landed before the fault. Callers that need atomicity must layer their own check (or accept partial writes — for syscall returns, "argument validation failed" usually means the syscall did not happen, even if a partial write occurred).
+- `copy_from_user` / `copy_slice_from_user` / `copy_array_from_user`: on `Fault`, the kernel-side destination may hold a partial copy. The caller observes `Err` and discards the destination.
+- `copy_to_user` / `copy_slice_to_user` / `copy_array_to_user`: on `Fault`, the user-side destination may hold a partial copy. The kernel cannot undo the write; the user observes whatever bytes landed before the fault. Callers that need atomicity must layer their own check (or accept partial writes — for syscall returns, "argument validation failed" usually means the syscall did not happen, even if a partial write occurred).
 - `copy_cstr_from_user`: on `Fault`, the kernel-side destination may hold a partial copy. The returned `Err` carries no length.
 
 ## Exception table
@@ -154,7 +159,7 @@ Named CPU models like `Haswell-v4` or `Broadwell-v4` also work as a base, but TC
 
 The subsystem is split into an arch-neutral half and an arch-specific half:
 
-- [`kernel/src/mm/user_access.rs`](../../kernel/src/mm/user_access.rs) — the arch-neutral half. Owns `UserPtr<T>`, `UserMutPtr<T>`, `UserAccessError`, the validation helpers, the five public `copy_*_user` primitives, the `ExtableEntry` struct, and the `lookup_recovery` function called by the `#PF` handler.
+- [`kernel/src/mm/user_access.rs`](../../kernel/src/mm/user_access.rs) — the arch-neutral half. Owns `UserPtr<T>`, `UserMutPtr<T>`, `UserAccessError`, the validation helpers, the seven public `copy_*_user` primitives, the `ExtableEntry` struct, and the `lookup_recovery` function called by the `#PF` handler.
 - [`kernel/src/arch/x86_64/user_access.rs`](../../kernel/src/arch/x86_64/user_access.rs) — the x86_64 half. Owns `copy_bytes_raw(dst, src, len) -> bool` and `copy_cstr_raw(dst, src, max) -> CstrCopyOutcome`, which copies a byte before it compares the count: `ArchUserAccess::copy_cstr` takes the destination as a slice and refuses an empty one before it. The inline asm with `stac` / `clac` / `rep movsb` / `lodsb`, and the `.pushsection .user_access_table` entry emission, all live here.
 
 The arch primitives return simple signals (`bool` for byte copies, an `enum` for cstr) and never reference `UserAccessError`. The mm layer maps those signals to its richer error type. This keeps the arch layer free of upward dependencies.

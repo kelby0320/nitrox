@@ -1,7 +1,7 @@
 //! User memory access: the arch-neutral half.
 //!
 //! The single sanctioned interface for reading or writing user memory from kernel code: the
-//! opaque [`UserPtr<T>`] / [`UserMutPtr<T>`], [`UserAccessError`], the five copy primitives and
+//! opaque [`UserPtr<T>`] / [`UserMutPtr<T>`], [`UserAccessError`], the seven copy primitives and
 //! the exception-table lookup the `#PF` handler walks. The raw byte copy under SMAP/PAN lives in
 //! `kernel/src/arch/<arch>/user_access.rs` ([`crate::arch::user_access`]).
 //!
@@ -30,7 +30,7 @@ use core::mem::{align_of, size_of};
 use crate::arch::UserAccess;
 use crate::arch::abi::USER_VIRT_END;
 use crate::arch::user_access::{ArchUserAccess, CstrCopyOutcome};
-use crate::libkern::pod::{Pod, bytes_of, bytes_of_mut};
+use crate::libkern::pod::{Pod, bytes_of, bytes_of_mut, slice_bytes, slice_bytes_mut};
 
 /// One entry in `.user_access_table`: a (fault_pc, recovery_pc) pair. The copy primitives' inline
 /// asm emits entries with `.quad`, so Rust and asm must agree on the layout: `#[repr(C)]`.
@@ -240,6 +240,17 @@ pub fn copy_slice_to_user(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), UserAcc
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
+/// Fill `dst` with plain data from the user's bytes at `src`. Bytewise, so `src` needs no
+/// alignment for `T`, as a handle array's never has.
+pub fn copy_array_from_user<T: Pod>(dst: &mut [T], src: UserPtr<u8>) -> Result<(), UserAccessError> {
+    copy_slice_from_user(slice_bytes_mut(dst), src)
+}
+
+/// Copy the plain data `src` into the user's bytes at `dst`, which need no alignment for `T`.
+pub fn copy_array_to_user<T: Pod>(dst: UserMutPtr<u8>, src: &[T]) -> Result<(), UserAccessError> {
+    copy_slice_to_user(dst, slice_bytes(src))
+}
+
 /// Copy a NUL-terminated string from user memory into `dst`, stopping after the first NUL or when
 /// `dst` is full.
 ///
@@ -268,6 +279,7 @@ pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], Us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libkern::handle::RawHandle;
 
     /// A user address the table's tests fault on.
     const USER: u64 = 0x1000;
@@ -461,6 +473,20 @@ mod tests {
         // SAFETY: host buffers stand in for user memory.
         let outcome = unsafe { UserAccess::copy_cstr(&mut buf[..0], src.as_ptr()) };
         assert_eq!((outcome, buf), (CstrCopyOutcome::NoTerminator, [0xAA, 0xAA]));
+    }
+
+    /// **A handle array is copied from and to user bytes at any alignment**, as the syscalls taking
+    /// one always have: only the kernel's side is typed.
+    #[test]
+    fn an_array_is_copied_through_user_bytes_at_any_alignment() {
+        let mut user = [0u8; 17];
+        let at = user.as_mut_ptr() as u64 + 1;
+        let src = [RawHandle(0x1122_3344_5566_7788), RawHandle(9)];
+        copy_array_to_user(UserMutPtr::new(at).unwrap(), &src).unwrap();
+        assert_eq!(&user[1..9], &0x1122_3344_5566_7788u64.to_ne_bytes());
+        let mut dst = [RawHandle(0); 2];
+        copy_array_from_user(&mut dst, UserPtr::new(at).unwrap()).unwrap();
+        assert_eq!(dst, src);
     }
 
     #[test]

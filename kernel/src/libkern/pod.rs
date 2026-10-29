@@ -79,6 +79,12 @@ pub fn slice_bytes<T: Pod>(s: &[T]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(s.as_ptr().cast::<u8>(), core::mem::size_of_val(s)) }
 }
 
+/// [`slice_bytes`], writable: any bytes written there leave `T`s.
+pub fn slice_bytes_mut<T: Pod>(s: &mut [T]) -> &mut [u8] {
+    // SAFETY: as `slice_bytes`, and every bit pattern is a `T`, so no write leaves an invalid one.
+    unsafe { core::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<u8>(), core::mem::size_of_val(s)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +105,8 @@ mod tests {
         assert_eq!(p.a, 0x0403_0209);
         assert_eq!(Pair::zeroed(), Pair { a: 0, b: [0; 4] });
         assert_eq!(slice_bytes(&[1u16, 2]), &[1, 0, 2, 0]);
+        let mut pairs = [0u16; 2];
+        slice_bytes_mut(&mut pairs).copy_from_slice(&[3, 0, 4, 0]);
+        assert_eq!(pairs, [3, 4]);
     }
 }

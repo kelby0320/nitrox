@@ -582,11 +582,13 @@ management story.
   public `as_ptr`, and the raw `u64` is crate-private. Construction
   rejects addresses in the kernel half (`addr >= USER_VIRT_END`) and
   misalignments for `T`. Everything outside this module that needs
-  to touch user memory does so through the five copy primitives.
-- **Five copy primitives.** `copy_from_user<T: Pod>`,
+  to touch user memory does so through the seven copy primitives.
+- **Seven copy primitives.** `copy_from_user<T: Pod>`,
   `copy_to_user<T: Pod>` (`T` plain data: no padding, every bit
   pattern a value), `copy_slice_from_user`,
-  `copy_slice_to_user`, `copy_cstr_from_user`. All return
+  `copy_slice_to_user`, `copy_array_from_user` and
+  `copy_array_to_user` (a run of plain data, through the slice
+  variants), `copy_cstr_from_user`. All return
   `Result<_, UserAccessError>`. The slice variants use `rep movsb`
   under `stac` / `clac`; the cstr variant uses a byte-at-a-time
   `lodsb` / `stosb` loop, also under SMAP discipline.
