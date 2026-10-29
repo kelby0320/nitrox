@@ -259,9 +259,9 @@ extern "C" fn vec14() {
 }
 
 irq_dispatcher! {
-/// `#PF` dispatcher. Looks up the faulting RIP and address in the user-access exception table; on
-/// a match, patches `frame.rip` to the recovery PC and returns so the stub can `iretq` to it. On
-/// a miss, calls [`dump_and_halt`]. `&mut` because recovery writes the new RIP in place.
+/// `#PF` dispatcher. Looks up the faulting RIP in the user-access exception table; on a match,
+/// patches `frame.rip` to the recovery PC and returns so the stub can `iretq` to it. On a
+/// miss, calls [`dump_and_halt`]. `&mut` because recovery writes the new RIP in place.
 fn pf_dispatch(f: &mut ExceptionFrame) {
     debug_assert_eq!(f.vector, 14);
     let cr2 = regs::read_cr2();

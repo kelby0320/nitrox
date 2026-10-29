@@ -14,10 +14,10 @@
 //!    ([`crate::arch::ensure_smap_smep`] on x86_64). The instructions bracketing each user access
 //!    live only inside the arch primitives, never as Rust-visible wrappers.
 //! 3. **Fault recovery.** Each raw arch primitive registers a `(fault_pc, recovery_pc)` pair in
-//!    `.user_access_table`. On a `#PF` whose RIP matches a fault site and whose address is in the
-//!    user half, the arch `#PF` handler patches RIP to the recovery PC, which closes the protection
-//!    window and signals failure: a user-side fault becomes [`UserAccessError::Fault`], not a
-//!    kernel halt. A fault on the copy's kernel side is a kernel bug, and still halts.
+//!    `.user_access_table`. On a `#PF` whose RIP matches a fault site, the arch `#PF` handler
+//!    patches RIP to the recovery PC, which closes the protection window and signals failure: a
+//!    user-side fault becomes [`UserAccessError::Fault`], not a kernel halt.
+//!    A fault on the kernel side is a kernel bug, and halts: only a user address recovers.
 //!
 //! ## Why absolute u64 entries
 //!
@@ -46,8 +46,8 @@ pub(crate) struct ExtableEntry {
 const _: () = assert!(size_of::<ExtableEntry>() == 16);
 const _: () = assert!(align_of::<ExtableEntry>() == 8);
 
-/// Search the exception table for `fault_pc`; the recovery PC on a match, if `fault_addr`, the
-/// address the access faulted on, is a user one.
+/// Search the exception table for `fault_pc`; the recovery PC on a match.
+/// Only a fault on a user address, `fault_addr`, recovers.
 ///
 /// A linear scan: one entry per copy primitive, and it runs only on the rare faulting path.
 pub fn lookup_recovery(fault_pc: u64, fault_addr: u64) -> Option<u64> {
@@ -145,7 +145,6 @@ impl<T> UserPtr<T> {
         self.addr
     }
 
-    /// The same address, as the user's bytes.
     fn bytes(self) -> UserPtr<u8> {
         UserPtr { addr: self.addr, _phantom: PhantomData }
     }
@@ -163,7 +162,6 @@ impl<T> UserMutPtr<T> {
         self.addr
     }
 
-    /// The same address, as the user's bytes.
     fn bytes(self) -> UserMutPtr<u8> {
         UserMutPtr { addr: self.addr, _phantom: PhantomData }
     }
@@ -189,8 +187,7 @@ fn validate_user_range(addr: u64, len: u64) -> Result<(), UserAccessError> {
 }
 
 /// Copy a `T` out of user memory; [`UserAccessError::Fault`] commits no kernel-side state. A
-/// zero-sized `T` yields its only value without touching the pointer. `T` is plain data, so the
-/// user's bytes, whatever they are, are a `T`.
+/// zero-sized `T` yields its only value without touching the pointer.
 pub fn copy_from_user<T: Pod>(src: UserPtr<T>) -> Result<T, UserAccessError> {
     let mut out = T::zeroed();
     copy_slice_from_user(bytes_of_mut(&mut out), src.bytes())?;
@@ -231,8 +228,7 @@ pub fn copy_slice_to_user(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), UserAcc
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
-/// Fill `dst` with plain data from the user's bytes at `src`. Bytewise, so `src` needs no
-/// alignment for `T`, as a handle array's never has.
+/// Fill `dst` with plain data from the user's bytes at `src`, which need no alignment for `T`.
 pub fn copy_array_from_user<T: Pod>(dst: &mut [T], src: UserPtr<u8>) -> Result<(), UserAccessError> {
     copy_slice_from_user(slice_bytes_mut(dst), src)
 }
@@ -272,7 +268,6 @@ mod tests {
     use super::*;
     use crate::libkern::handle::RawHandle;
 
-    /// A user address the table's tests fault on.
     const USER: u64 = 0x1000;
 
     #[test]
@@ -312,8 +307,7 @@ mod tests {
         assert_eq!(lookup_recovery_in(&table, 0x1000, USER), Some(0xAAAA));
     }
 
-    /// **A fault on the copy's kernel side is not recovered**: it is a kernel bug, and halts,
-    /// rather than reaching the caller as a user's bad pointer.
+    /// **A fault on the copy's kernel side is not recovered**: it is a kernel bug, and halts.
     #[test]
     fn only_a_fault_on_a_user_address_is_recovered() {
         let table = [ExtableEntry { fault_pc: 0x1000, recovery_pc: 0x2000 }];
@@ -466,8 +460,7 @@ mod tests {
         assert_eq!((outcome, buf), (CstrCopyOutcome::NoTerminator, [0xAA, 0xAA]));
     }
 
-    /// **A typed copy moves exactly its value's bytes**, to user memory and back, its neighbours
-    /// untouched.
+    /// **A typed copy moves exactly its value's bytes**, to user memory and back.
     #[test]
     fn a_typed_copy_moves_exactly_its_values_bytes() {
         let mut user = [u64::MAX; 3];
@@ -478,8 +471,7 @@ mod tests {
         assert_eq!(copy_from_user(UserPtr::<[u8; 0]>::new(at).unwrap()), Ok([]));
     }
 
-    /// **A handle array is copied from and to user bytes at any alignment**, as the syscalls taking
-    /// one always have: only the kernel's side is typed.
+    /// **A handle array crosses user bytes at any alignment**, as the syscalls always allowed.
     #[test]
     fn an_array_is_copied_through_user_bytes_at_any_alignment() {
         let mut user = [0u8; 17];

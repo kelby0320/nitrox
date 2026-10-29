@@ -35,10 +35,10 @@ static APERTURE: IrqSpinLock<Option<FramebufferAperture>> = IrqSpinLock::new(Loc
 
 /// Record Limine's framebuffer as a userspace-mappable aperture.
 ///
-/// Refused, with the reason, when there is nothing usable: a depth other than 32 bits, an address
-/// outside the HHDM, or a physical base inside a page, which a mapping of whole pages would put at
-/// an offset no client is told of. Refusing is a boot-time diagnosis, where a client rendering
-/// into a 16- or 24-bit buffer is an artefact to puzzle over later.
+/// Refused, with the reason, for a depth other than 32 bits, an address outside the HHDM, or a
+/// physical base inside a page, which no mapping of whole pages can show.
+/// Refusing an unsupported depth is a boot-time diagnosis, where a client rendering into a 16- or
+/// 24-bit buffer is an artefact to puzzle over later.
 ///
 /// # Safety
 ///
@@ -107,8 +107,7 @@ mod tests {
         }
     }
 
-    /// **Only a page-aligned base is recorded**: one inside a page would reach a client's mapping
-    /// misaligned, and stop the kernel there with the address-space lock held.
+    /// **Only a page-aligned base is recorded**: a client's map of one inside a page would panic.
     #[test]
     fn an_aperture_is_recorded_only_from_a_page_aligned_base_in_the_hhdm() {
         // SAFETY: only the descriptors' fields are read; nothing reaches the addresses they give.

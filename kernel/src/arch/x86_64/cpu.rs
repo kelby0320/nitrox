@@ -183,8 +183,7 @@ fn ensure_nxe() {
     }
 }
 
-/// Set CR0.WP, so a copy to a user cannot write through a read-only mapping, of a shared file
-/// page say, whatever the bootloader left. Idempotent.
+/// Set CR0.WP, whatever the bootloader left, so a copy cannot write a user's read-only mapping.
 fn ensure_write_protect() {
     // SAFETY: WP only adds a check on ring-0 writes; no other CR0 bit changes.
     unsafe { regs::write_cr0(regs::read_cr0() | CR0_WP) };

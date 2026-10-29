@@ -647,8 +647,7 @@ fn an_unmap_is_shot_down_before_its_frames_or_its_object_are_freed() {
     }
 }
 
-/// **Mapping a file as a memory object stops at its type**, in a release build as in a debug one,
-/// rather than reading the file as a memory object's frames.
+/// **Mapping a file as a memory object stops at its type**, in a release build too.
 #[test]
 #[should_panic(expected = "left == right")]
 fn a_file_mapped_as_a_memory_object_stops_at_its_type() {

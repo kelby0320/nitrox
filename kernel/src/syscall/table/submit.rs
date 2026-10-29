@@ -97,8 +97,7 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 ///
 /// **And its rescan and its eject**, `irp_op` saying which, with the same rules (`WRITE`). A
 /// partition and every disk but a USB one answer `Unsupported`, through the IRP.
-/// The size of an I/O buffer, whose frames the kernel and the device reach: a borrowed one is
-/// refused, as for a spawn's image.
+/// An I/O buffer's size; a borrowed one is refused, as the kernel and the device reach its frames.
 pub(super) fn io_buffer_size(buf: &ObjectRef) -> Result<u64, KError> {
     assert_eq!(buf.object_type(), KObjectType::MemoryObject);
     // SAFETY: `buf` pins a live `MemoryObject`, its type just checked.

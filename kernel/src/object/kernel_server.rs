@@ -329,9 +329,9 @@ fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     match suffix {
         b"" => {
             // SAFETY: `phys_base .. + byte_len` is the firmware-reported display
-            // aperture, recorded once at boot, page-aligned. It is device memory outside every
-            // region the buddy allocator manages (Limine reports it as framebuffer, not usable
-            // RAM), and it stays mapped for the life of the system.
+            // aperture, recorded once at boot. It is device memory outside every region
+            // the buddy allocator manages (Limine reports it as framebuffer, not usable
+            // RAM), and it stays mapped for the life of the system, its base page-aligned.
             match unsafe {
                 MemoryObject::try_new_borrowed(
                     phys_base,

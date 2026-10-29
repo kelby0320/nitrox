@@ -572,8 +572,7 @@ fn drop_releases_every_owned_box() {
     }
 }
 
-/// **A file-backed VMA over another kind of object stops at its drop**, rather than counting
-/// an unmapped writer into that object's fields.
+/// **A file-backed VMA over another kind of object stops at its drop.**
 #[test]
 #[should_panic(expected = "left == right")]
 fn a_file_backed_vma_over_another_kind_of_object_stops_at_its_drop() {

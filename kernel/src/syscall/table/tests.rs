@@ -837,9 +837,7 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     assert_eq!(fo.lookup(0), Some((next, PageState::Loading)));
 }
 
-/// **A borrowed memory object is refused wherever the kernel reaches its frames itself**: a
-/// spawn's image, an I/O buffer, and a fill's reply. Its range need not be in the HHDM, nor be
-/// memory; mapping it into a user is what it is for.
+/// **A borrowed memory object is refused wherever the kernel reaches its frames itself.**
 #[test]
 fn a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames() {
     use crate::mm::{Caching, PAGE_SIZE, PhysAddr, heap};

@@ -32,9 +32,8 @@ pub const fn field_size<S, T: Pod>(_: fn(&S) -> &T) -> usize {
     size_of::<T>()
 }
 
-/// Implement [`Pod`] for the struct `$ty`, naming every field. It compiles only if every field is
-/// plain data and their sizes sum to the struct's, so it has no padding: a field left out, named
-/// twice, or not plain data fails the build.
+/// Implement [`Pod`] for the struct `$ty`, naming every field. The build fails if one is not plain
+/// data, or if their sizes do not fill the struct, as a field left out or padding leaves them.
 macro_rules! pod {
     ($ty:ty { $($field:tt),+ $(,)? }) => {
         // SAFETY: the assertion below: every field is `Pod`, and the fields fill the struct.

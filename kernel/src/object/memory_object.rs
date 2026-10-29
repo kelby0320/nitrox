@@ -25,8 +25,7 @@ use crate::object::header::KObjectHeader;
 pub enum FrameOwnership {
     /// Frames came from the buddy allocator and are freed on drop.
     Owned,
-    /// A fixed physical range this object does not own (a device aperture); never freed, and
-    /// only mapped: see [`MemoryObject::kernel_reachable`].
+    /// A fixed physical range this object does not own (a device aperture); never freed.
     Borrowed,
 }
 

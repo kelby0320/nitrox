@@ -193,8 +193,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     Ok(parent_handle.bits() as isize)
 }
 
-/// A spawn's image as one buffer for the loader: a memory object's bytes, or a file's, read whole.
-/// The kernel reads a memory object's through the HHDM, so a borrowed one is refused.
+/// A spawn's image as one buffer for the loader, read through the HHDM: a borrowed one is refused.
 pub(super) fn image_bytes(img: &ObjectRef) -> Result<KVec<u8>, KError> {
     match img.object_type() {
         KObjectType::MemoryObject => {
