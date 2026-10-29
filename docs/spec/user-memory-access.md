@@ -107,7 +107,7 @@ The `<fault_pc>` is a local numeric label inside the same `asm!` block, sitting 
 
 ### Lookup
 
-The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. On a match, the handler writes `entry.recovery_pc` into `frame.rip` and returns. The naked stub then `iretq`s to the recovery PC. On a miss, the handler falls through to `dump_and_halt` — a `#PF` outside a registered window is a kernel bug, not a recoverable condition.
+The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. On a match whose faulting address (`CR2`) is below `USER_VIRT_END`, the handler writes `entry.recovery_pc` into `frame.rip` and returns. The naked stub then `iretq`s to the recovery PC. Otherwise the handler falls through to `dump_and_halt`: a `#PF` outside a registered window, or one on the copy's kernel-side pointer, is a kernel bug, not a recoverable condition.
 
 The lookup is linear over the table. The Phase 1 entry count is one per copy primitive (5 today), easily fits in a single cacheline, and runs only on the rare faulting path. A sorted table + binary search would be theoretical work; revisit if Phase 2 ever pushes the entry count past a few dozen.
 

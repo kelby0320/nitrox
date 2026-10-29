@@ -594,7 +594,9 @@ management story.
   a `(fault_pc, recovery_pc)` pair in the `.user_access_table`
   rodata section (bracketed by linker symbols). The `#PF` handler
   ([`arch::idt::pf_dispatch`](../../kernel/src/arch/x86_64/idt.rs))
-  consults the table on every fault: on match it patches the saved
+  consults the table on every fault: on a match whose address is a
+  user one (`CR2` below `USER_VIRT_END`; a fault on the kernel side
+  is a kernel bug) it patches the saved
   RIP to the recovery PC and `iretq`s. The recovery code closes the
   SMAP window and signals failure to the Rust wrapper. On a table
   miss the handler branches on the fault: a **not-present ring-3**

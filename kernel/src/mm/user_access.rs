@@ -14,9 +14,10 @@
 //!    ([`crate::arch::ensure_smap_smep`] on x86_64). The instructions bracketing each user access
 //!    live only inside the arch primitives, never as Rust-visible wrappers.
 //! 3. **Fault recovery.** Each raw arch primitive registers a `(fault_pc, recovery_pc)` pair in
-//!    `.user_access_table`. On a `#PF` whose RIP matches a fault site, the arch `#PF` handler
-//!    patches RIP to the recovery PC, which closes the protection window and signals failure: a
-//!    user-side fault becomes [`UserAccessError::Fault`], not a kernel halt.
+//!    `.user_access_table`. On a `#PF` whose RIP matches a fault site and whose address is in the
+//!    user half, the arch `#PF` handler patches RIP to the recovery PC, which closes the protection
+//!    window and signals failure: a user-side fault becomes [`UserAccessError::Fault`], not a
+//!    kernel halt. A fault on the copy's kernel side is a kernel bug, and still halts.
 //!
 //! ## Why absolute u64 entries
 //!
@@ -45,21 +46,25 @@ pub(crate) struct ExtableEntry {
 const _: () = assert!(size_of::<ExtableEntry>() == 16);
 const _: () = assert!(align_of::<ExtableEntry>() == 8);
 
-/// Search the exception table for `fault_pc`; the recovery PC on a match.
+/// Search the exception table for `fault_pc`; the recovery PC on a match, if `fault_addr`, the
+/// address the access faulted on, is a user one.
 ///
 /// A linear scan: one entry per copy primitive, and it runs only on the rare faulting path.
-pub fn lookup_recovery(fault_pc: u64) -> Option<u64> {
+pub fn lookup_recovery(fault_pc: u64, fault_addr: u64) -> Option<u64> {
     // SAFETY: the linker provides matching `__start_user_access_table`
     // and `__stop_user_access_table` symbols, both within the kernel
     // image; the slice is rodata for the lifetime of the kernel.
     // Under `cfg(test)` the function returns an empty slice (no
     // linker symbols in host builds).
     let table = unsafe { exception_table() };
-    lookup_recovery_in(table, fault_pc)
+    lookup_recovery_in(table, fault_pc, fault_addr)
 }
 
 /// Lookup against an explicit table, so host tests can inject entries without linker symbols.
-fn lookup_recovery_in(table: &[ExtableEntry], fault_pc: u64) -> Option<u64> {
+fn lookup_recovery_in(table: &[ExtableEntry], fault_pc: u64, fault_addr: u64) -> Option<u64> {
+    if fault_addr >= USER_VIRT_END {
+        return None;
+    }
     for entry in table {
         if entry.fault_pc == fault_pc {
             return Some(entry.recovery_pc);
@@ -264,19 +269,22 @@ pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], Us
 mod tests {
     use super::*;
 
+    /// A user address the table's tests fault on.
+    const USER: u64 = 0x1000;
+
     #[test]
     fn empty_table_returns_none() {
         let table: [ExtableEntry; 0] = [];
-        assert_eq!(lookup_recovery_in(&table, 0), None);
-        assert_eq!(lookup_recovery_in(&table, 0xDEAD_BEEF), None);
+        assert_eq!(lookup_recovery_in(&table, 0, USER), None);
+        assert_eq!(lookup_recovery_in(&table, 0xDEAD_BEEF, USER), None);
     }
 
     #[test]
     fn single_entry_hit_and_miss() {
         let table = [ExtableEntry { fault_pc: 0x1000, recovery_pc: 0x2000 }];
-        assert_eq!(lookup_recovery_in(&table, 0x1000), Some(0x2000));
-        assert_eq!(lookup_recovery_in(&table, 0x0FFF), None);
-        assert_eq!(lookup_recovery_in(&table, 0x1001), None);
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER), Some(0x2000));
+        assert_eq!(lookup_recovery_in(&table, 0x0FFF, USER), None);
+        assert_eq!(lookup_recovery_in(&table, 0x1001, USER), None);
     }
 
     #[test]
@@ -286,10 +294,10 @@ mod tests {
             ExtableEntry { fault_pc: 0x2000, recovery_pc: 0xB000 },
             ExtableEntry { fault_pc: 0x3000, recovery_pc: 0xC000 },
         ];
-        assert_eq!(lookup_recovery_in(&table, 0x1000), Some(0xA000));
-        assert_eq!(lookup_recovery_in(&table, 0x2000), Some(0xB000));
-        assert_eq!(lookup_recovery_in(&table, 0x3000), Some(0xC000));
-        assert_eq!(lookup_recovery_in(&table, 0x4000), None);
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER), Some(0xA000));
+        assert_eq!(lookup_recovery_in(&table, 0x2000, USER), Some(0xB000));
+        assert_eq!(lookup_recovery_in(&table, 0x3000, USER), Some(0xC000));
+        assert_eq!(lookup_recovery_in(&table, 0x4000, USER), None);
     }
 
     #[test]
@@ -298,13 +306,24 @@ mod tests {
             ExtableEntry { fault_pc: 0x1000, recovery_pc: 0xAAAA },
             ExtableEntry { fault_pc: 0x1000, recovery_pc: 0xBBBB },
         ];
-        assert_eq!(lookup_recovery_in(&table, 0x1000), Some(0xAAAA));
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER), Some(0xAAAA));
+    }
+
+    /// **A fault on the copy's kernel side is not recovered**: it is a kernel bug, and halts,
+    /// rather than reaching the caller as a user's bad pointer.
+    #[test]
+    fn only_a_fault_on_a_user_address_is_recovered() {
+        let table = [ExtableEntry { fault_pc: 0x1000, recovery_pc: 0x2000 }];
+        assert_eq!(lookup_recovery_in(&table, 0x1000, 0), Some(0x2000));
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER_VIRT_END - 1), Some(0x2000));
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER_VIRT_END), None);
+        assert_eq!(lookup_recovery_in(&table, 0x1000, 0xFFFF_CF00_0000_0000), None);
     }
 
     #[test]
     fn host_build_sees_empty_table() {
-        assert_eq!(lookup_recovery(0), None);
-        assert_eq!(lookup_recovery(0xDEAD_BEEF), None);
+        assert_eq!(lookup_recovery(0, USER), None);
+        assert_eq!(lookup_recovery(0xDEAD_BEEF, USER), None);
     }
 
     #[test]
