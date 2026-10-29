@@ -177,15 +177,14 @@ extern "C" fn spinner(_: usize) {
     SPIN_DONE.fetch_add(1, Ordering::Release);
 }
 
-/// **Completed block IRPs are freed with every CPU busy.** Two threads spinning on each CPU keep
-/// every idle thread from running, and the boot thread reads the ramdisk without reaping, so only
-/// the reaper can drain the completed boxes. Panics, failing a test boot, when it does not.
+/// **Completed block IRPs stay bounded with every CPU busy.** Two threads spin on each CPU and the
+/// boot thread reads without reaping, so only the reaper, woken at [`block::RECLAIM_WAKE_AT`], can
+/// bring the backlog below it. Panics, failing a test boot, when it does not or cannot set up.
 pub fn reclaim_under_load_self_test() {
     use crate::arch::timer::ArchTimer;
     const READS: usize = 4 * block::RECLAIM_WAKE_AT;
     let Some((device, buffer)) = ramdisk_and_buffer() else {
-        crate::kprintln!("io: reclaim-under-load self-test SKIP (alloc failed)");
-        return;
+        panic!("io: reclaim-under-load self-test: no memory for its disk");
     };
     let mask = crate::sched::online_mask();
     let mut spinners = 0;
@@ -199,18 +198,25 @@ pub fn reclaim_under_load_self_test() {
         while !done() && crate::arch::Timer::read_ns() - start < 2_000_000_000 {
             core::hint::spin_loop();
         }
+        done()
     };
-    wait(&|| SPIN_STARTED.load(Ordering::Acquire) == spinners);
-    let before = block::reclaim_backlog();
-    for _ in 0..READS {
-        let Ok(po) = PendingOperation::try_new().map(|po| adopt(po, KObjectType::PendingOperation)) else { break };
-        if block::dispatch_block_irp(&device, &buffer, &po, IoOpcode::Read, 0, 0, 512).is_ok() {
-            // SAFETY: `po` pins its live `PendingOperation`.
-            wait(&|| unsafe { crate::sched::pending_op_is_signaled(po.as_ptr()) });
-        }
+    if spinners != 2 * mask.count_ones() || !wait(&|| SPIN_STARTED.load(Ordering::Acquire) == spinners) {
+        panic!("io: reclaim-under-load self-test: {spinners} spinners made, not two a CPU, or not all ran");
     }
-    let peak = block::reclaim_backlog();
-    wait(&|| block::reclaim_backlog() == 0);
+    let before = block::reclaim_backlog();
+    let mut peak = before;
+    for _ in 0..READS {
+        let Ok(po) = PendingOperation::try_new().map(|po| adopt(po, KObjectType::PendingOperation)) else {
+            panic!("io: reclaim-under-load self-test: no memory for an operation");
+        };
+        let sent = block::dispatch_block_irp(&device, &buffer, &po, IoOpcode::Read, 0, 0, 512).is_ok();
+        // SAFETY: `po` pins its live `PendingOperation`.
+        if !sent || !wait(&|| unsafe { crate::sched::pending_op_is_signaled(po.as_ptr()) }) {
+            panic!("io: reclaim-under-load self-test: a read was refused or never completed");
+        }
+        peak = peak.max(block::reclaim_backlog());
+    }
+    let drained = wait(&|| block::reclaim_backlog() < block::RECLAIM_WAKE_AT);
     let left = block::reclaim_backlog();
     SPIN_STOP.store(true, Ordering::Release);
     while SPIN_DONE.load(Ordering::Acquire) < spinners {
@@ -218,11 +224,11 @@ pub fn reclaim_under_load_self_test() {
         core::hint::spin_loop();
     }
     crate::sched::reap_pending();
-    if left > 0 {
-        panic!("io: {left} of {READS} completed IRPs left unreclaimed with every CPU busy");
+    if peak < block::RECLAIM_WAKE_AT || !drained {
+        panic!("io: completed IRPs unbounded with every CPU busy: {left} left of a peak of {peak}");
     }
     crate::kprintln!(
-        "io: reclaim-under-load self-test OK ({READS} reads under {spinners} spinners; backlog {before} -> {peak} -> 0)"
+        "io: reclaim-under-load self-test OK ({READS} reads under {spinners} spinners; backlog {before} -> {peak} -> {left})"
     );
 }
 

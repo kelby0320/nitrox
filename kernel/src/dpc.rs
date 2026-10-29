@@ -50,7 +50,6 @@ impl Dpc {
     }
 }
 
-/// A queued DPC.
 #[derive(Clone, Copy)]
 struct Queued(NonNull<Dpc>);
 
@@ -65,8 +64,7 @@ type Queue = ArrayVec<Queued, DPC_CAPACITY>;
 /// `SCHED`. See `kernel/docs/lock-ordering.md`.
 static DPC_QUEUE: IrqSpinLock<Queue> = IrqSpinLock::new(LockRank::Leaf, ArrayVec::new());
 
-/// Queue `dpc` to run at the next [`run_pending`]; idempotent. Safe to call from IRQ context. A
-/// `'static` DPC outlives every drain, whichever CPU's runs it.
+/// Queue `dpc` to run at the next [`run_pending`]; idempotent, and safe from IRQ context.
 pub fn enqueue(dpc: &'static Dpc) {
     // SAFETY: a `'static` DPC is valid for good.
     unsafe { enqueue_raw(NonNull::from(dpc)) }
@@ -104,7 +102,69 @@ pub fn take_enqueued() -> std::vec::Vec<usize> {
 /// re-entrancy guard is needed. A handler may take `SCHED` briefly (the queue lock is released
 /// first) but must not block.
 pub fn run_pending() {
+    #[cfg(test)]
+    assert_exclusive();
     run_pending_in(&DPC_QUEUE);
+}
+
+#[cfg(test)]
+static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+std::thread_local! {
+    static HOLDS_EXCLUSIVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// **A host test that drains the queue or completes an IRP holds this**, or another test's drain
+/// could finish its IRPs, stack ones included, after its frame is gone.
+#[cfg(test)]
+pub struct Exclusive {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Take [`Exclusive`], waiting for any other test holding it.
+#[cfg(test)]
+pub fn exclusive() -> Exclusive {
+    let guard = EXCLUSIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    HOLDS_EXCLUSIVE.with(|h| h.set(true));
+    Exclusive { _held: guard }
+}
+
+#[cfg(test)]
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        HOLDS_EXCLUSIVE.with(|h| h.set(false));
+        match std::thread::panicking() {
+            true => crate::io::irp::forget_completed(),
+            false => assert!(crate::io::irp::none_completed(), "a test drains the IRPs it completes"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Exclusive {
+    /// Let a scoped thread of the same test drain and complete under this hold, while it borrows it.
+    pub fn share(&self) -> Shared<'_> {
+        HOLDS_EXCLUSIVE.with(|h| h.set(true));
+        Shared(core::marker::PhantomData)
+    }
+}
+
+/// A thread's share of a test's [`Exclusive`].
+#[cfg(test)]
+pub struct Shared<'a>(core::marker::PhantomData<&'a Exclusive>);
+
+#[cfg(test)]
+impl Drop for Shared<'_> {
+    fn drop(&mut self) {
+        HOLDS_EXCLUSIVE.with(|h| h.set(false));
+    }
+}
+
+/// Panic unless this test thread holds [`Exclusive`].
+#[cfg(test)]
+pub fn assert_exclusive() {
+    assert!(HOLDS_EXCLUSIVE.with(|h| h.get()), "a test that drains DPCs or completes an IRP holds dpc::exclusive()");
 }
 
 // The core logic takes the queue as a parameter so a host test can use a fresh local one.
@@ -148,7 +208,6 @@ mod tests {
         IrqSpinLock::new(LockRank::Leaf, ArrayVec::new())
     }
 
-    /// Queue `d` on `q`; each test drains `q` before `d` goes.
     fn enqueue_into(q: &IrqSpinLock<Queue>, d: &Dpc) {
         // SAFETY: drained while `d` lives.
         unsafe { super::enqueue_into(q, NonNull::from(d)) }
@@ -190,16 +249,24 @@ mod tests {
 
     #[test]
     fn drain_runs_all_pending_in_order() {
+        struct Stamp<'a> {
+            clock: &'a AtomicU32,
+            at: AtomicU32,
+        }
+        fn stamp(ctx: *mut ()) {
+            // SAFETY: the test passes its live `Stamp`.
+            let s = unsafe { &*(ctx as *const Stamp<'_>) };
+            s.at.store(s.clock.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        }
         let q = fresh_queue();
-        let counters = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
-        let dpcs = [dpc_for(&counters[0]), dpc_for(&counters[1]), dpc_for(&counters[2])];
+        let clock = AtomicU32::new(0);
+        let stamps: [Stamp<'_>; 3] = core::array::from_fn(|_| Stamp { clock: &clock, at: AtomicU32::new(0) });
+        let dpcs = stamps.each_ref().map(|s| Dpc::new(stamp, s as *const Stamp<'_> as *mut ()));
         for d in &dpcs {
             enqueue_into(&q, d);
         }
         run_pending_in(&q);
-        for c in &counters {
-            assert_eq!(c.load(Ordering::Relaxed), 1);
-        }
+        assert_eq!(stamps.each_ref().map(|s| s.at.load(Ordering::Relaxed)), [1, 2, 3], "in the order queued");
     }
 
     #[test]
@@ -235,6 +302,29 @@ mod tests {
         for d in &dpcs {
             enqueue_into(&q, d);
         }
+    }
+
+    /// **A DPC a handler queues runs in the same drain**, not at the next interrupt.
+    #[test]
+    fn a_dpc_a_handler_queues_runs_in_the_same_drain() {
+        struct Chain<'a> {
+            q: &'a IrqSpinLock<Queue>,
+            then: &'a Dpc,
+        }
+        fn chain(ctx: *mut ()) {
+            // SAFETY: the test passes its live `Chain`, which outlives the drain.
+            let c = unsafe { &*(ctx as *const Chain<'_>) };
+            enqueue_into(c.q, c.then);
+        }
+        let q = fresh_queue();
+        let c = AtomicU32::new(0);
+        let then = dpc_for(&c);
+        let link = Chain { q: &q, then: &then };
+        let first = Dpc::new(chain, &link as *const Chain<'_> as *mut ());
+        enqueue_into(&q, &first);
+        run_pending_in(&q);
+        assert_eq!(c.load(Ordering::Relaxed), 1, "the DPC its handler queued ran");
+        assert_eq!(q.lock().len(), 0);
     }
 
     #[test]

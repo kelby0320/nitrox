@@ -162,9 +162,10 @@ Two corollaries:
   (the ring-3 exception path) delivers the fault notification + parks the
   thread in `suspended` and context-switches away — all under one `SCHED`
   hold, no allocation (the queue pre-reserved, the waiters inline), mirroring
-  `block_current_and_switch`. The supervisor's `sys_thread_get_registers`
-  reads the captured frame and copies it to user memory **outside** `SCHED`
-  (the thread stays parked, so the frame is stable).
+  `block_current_and_switch`. It records the registers the thread faulted
+  with in the `Thread`, under that hold; the supervisor's
+  `sys_thread_get_registers` copies them out under `SCHED`, then to user
+  memory **outside** it, so a resume racing the copy-out cannot change them.
 
 ## The DPC queue lock is a leaf
 

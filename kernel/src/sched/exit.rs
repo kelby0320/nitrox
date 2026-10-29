@@ -539,8 +539,7 @@ fn park_reaper() {
     unsafe { switch_into(g, me_slot, me_obj, next_obj) };
 }
 
-/// Wake the reaper to drain the completed-IRP list, which no idle CPU has drained: from a DPC,
-/// holding nothing.
+/// Wake the reaper to drain the completed-IRP list: from a DPC, holding nothing.
 pub fn wake_reaper_to_reclaim() {
     wake_reaper(&mut SCHED.lock());
 }

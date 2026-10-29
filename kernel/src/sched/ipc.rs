@@ -677,6 +677,7 @@ mod tests {
         assert!(failed(&lookup) && failed(&fill));
     }
 
+    // TODO(miri-provenance-tests): it fails only under Miri, which no CI job runs yet.
     #[test]
     fn an_endpoint_holding_another_in_a_held_send_is_refused_too() {
         init_global_heap();

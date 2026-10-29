@@ -180,10 +180,9 @@ fn table_ptr(table: PhysAddr) -> *mut Pte {
     (table.as_u64() + crate::mm::heap::hhdm_offset()) as *mut Pte
 }
 
-/// A page table at `level` of a tree: 4 for a PML4, down to 1 for a page table, whose entries are
-/// leaves. Every entry is read and written atomically: the kernel half's tables are shared by
-/// every address space and edited under no lock. **Its invariant**: each present entry above
-/// level 1 that is not huge names a live table one level down.
+/// A page table at `level` (4 a PML4, 1 a table of leaves), each entry atomic: the kernel half is
+/// shared and edited under no lock. **Invariant**: a present entry above level 1 that is not huge
+/// names a live table one level down.
 #[derive(Clone, Copy)]
 struct TableRef<'a> {
     entries: &'a [AtomicU64; PAGE_TABLE_ENTRIES],
@@ -219,19 +218,16 @@ impl<'a> TableRef<'a> {
         self.entries[index].store(pte.0, Ordering::Release);
     }
 
-    /// Store `new` at `index` if no entry is present there, in one step; `false` if one is.
-    fn set_if_absent(self, index: usize, new: Pte) -> bool {
-        let old = self.entry(index);
-        !old.is_present()
-            && self.entries[index].compare_exchange(old.0, new.0, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    /// Store `new` at `index` if it still holds `old`, as read empty; `false` if another CPU won.
+    fn link(self, index: usize, old: Pte, new: Pte) -> bool {
+        self.entries[index].compare_exchange(old.0, new.0, Ordering::AcqRel, Ordering::Acquire).is_ok()
     }
 
-    /// What slot `index` holds, from one read of it: a walk that read it twice could take a
-    /// table linked between the reads for a huge page.
+    /// What slot `index` holds, from one read: a second could see a table linked since.
     fn slot(self, index: usize) -> Slot<'a> {
         let e = self.entry(index);
         match (e.is_present(), self.level > 1 && !e.is_huge()) {
-            (false, _) => Slot::Empty,
+            (false, _) => Slot::Empty(e),
             // SAFETY: the type's invariant: such an entry names a live table one level down.
             (true, true) => Slot::Table(unsafe { Self::at(e.phys(), self.level - 1) }),
             (true, false) => Slot::Leaf(e),
@@ -249,16 +245,14 @@ impl<'a> TableRef<'a> {
     }
 }
 
-/// A slot of a [`TableRef`], as one read found it.
 enum Slot<'a> {
-    Empty,
+    Empty(Pte),
     Table(TableRef<'a>),
     Leaf(Pte),
 }
 
-/// The leaf entry mapping `virt` under `root`, and its level: 1 for a 4 KiB page, 2 for a 2 MiB
-/// one, 3 for 1 GiB. `None` if `virt` is not mapped. Understands huge pages, so it is correct
-/// against the bootloader's live tables.
+/// The leaf entry mapping `virt` under `root`, and its level (1 a 4 KiB page, 2 a 2 MiB one, 3 a
+/// 1 GiB one), huge pages included, as on the bootloader's tables; `None` if `virt` is unmapped.
 ///
 /// # Safety
 /// As [`TableRef::root`].
@@ -272,7 +266,7 @@ unsafe fn walk(root: PhysAddr, virt: VirtAddr) -> Option<(Pte, u8)> {
         match table.slot(table.index_of(virt)) {
             Slot::Table(next) => table = next,
             Slot::Leaf(leaf) => return (table.level < 4).then_some((leaf, table.level)),
-            Slot::Empty => return None,
+            Slot::Empty(_) => return None,
         }
     }
 }
@@ -295,8 +289,7 @@ fn alloc_page_table() -> Option<PhysAddr> {
     Some(frame)
 }
 
-/// The child table slot `index` of `table` names, allocating and linking a fresh zeroed table if
-/// the slot is empty. `AlreadyMapped` if it holds a huge page.
+/// The child table slot `index` of `table` names, linking a fresh one if it is empty.
 fn ensure_table(table: TableRef<'_>, index: usize) -> Result<TableRef<'_>, MapError> {
     // The kernel half's tables are shared and edited under no lock: two CPUs making kernel
     // stacks in one fresh region can find a slot empty together. The link is a compare-and-swap,
@@ -304,17 +297,18 @@ fn ensure_table(table: TableRef<'_>, index: usize) -> Result<TableRef<'_>, MapEr
     debug_assert!(table.level > 1, "a page table's entries are leaves");
     let mut child = None;
     loop {
-        let found = match table.slot(index) {
-            Slot::Empty => None,
-            Slot::Table(t) => Some(Ok(t)),
-            Slot::Leaf(_) => Some(Err(MapError::AlreadyMapped)),
-        };
-        if let Some(found) = found {
-            if let Some(unused) = child {
-                heap::buddy_free(unused, 0);
+        let empty = match table.slot(index) {
+            Slot::Empty(e) => e,
+            found => {
+                if let Some(unused) = child {
+                    heap::buddy_free(unused, 0);
+                }
+                return match found {
+                    Slot::Table(t) => Ok(t),
+                    _ => Err(MapError::AlreadyMapped),
+                };
             }
-            return found;
-        }
+        };
         let new = match child {
             Some(c) => c,
             None => alloc_page_table().ok_or(MapError::OutOfMemory)?,
@@ -324,7 +318,7 @@ fn ensure_table(table: TableRef<'_>, index: usize) -> Result<TableRef<'_>, MapEr
         if let Some(other_cpu) = BEFORE_LINK.take() {
             other_cpu(&table.entries[index]);
         }
-        if table.set_if_absent(index, Pte::new_table(new)) {
+        if table.link(index, empty, Pte::new_table(new)) {
             // SAFETY: a fresh zeroed table, which holds no entries, now linked one level down.
             return Ok(unsafe { TableRef::at(new, table.level - 1) });
         }
@@ -359,8 +353,7 @@ std::thread_local! {
     static BEFORE_LINK: core::cell::Cell<Option<fn(&AtomicU64)>> = const { core::cell::Cell::new(None) };
 }
 
-/// The page table holding the leaf entry for `virt` under `root`, or `None` if a table above it
-/// is absent or a huge page maps it.
+/// The page table holding `virt`'s leaf under `root`, or `None` if none does.
 ///
 /// # Safety
 /// As [`TableRef::root`].
@@ -428,9 +421,10 @@ impl ArchPaging for X86Paging {
         // SAFETY: the caller guarantees `root` is a valid, caller-owned top-level table.
         let pml4 = unsafe { TableRef::root(root) };
         let pt = ensure_table(ensure_table(ensure_table(pml4, pml4_index(virt))?, pdpt_index(virt))?, pd_index(virt))?;
-        match pt.set_if_absent(pt_index(virt), Pte::new_leaf(phys, flags)) {
-            true => Ok(()),
-            false => Err(MapError::AlreadyMapped),
+        let i = pt_index(virt);
+        match pt.slot(i) {
+            Slot::Empty(old) if pt.link(i, old, Pte::new_leaf(phys, flags)) => Ok(()),
+            _ => Err(MapError::AlreadyMapped),
         }
     }
 
@@ -861,9 +855,7 @@ mod tests {
         assert_eq!(attribute_of(bits, false), 2);
     }
 
-    /// **A walk ends at a huge leaf**, at either level, as on the bootloader's tables: the offset
-    /// is the page's, and a 4 KiB map inside one is refused rather than taking its frame for a
-    /// table.
+    /// **A walk ends at a huge leaf, at either level, and a 4 KiB map inside one is refused.**
     #[test]
     fn a_walk_ends_at_a_huge_page_and_a_map_inside_one_is_refused() {
         init_global_heap();
@@ -889,9 +881,7 @@ mod tests {
         }
     }
 
-    /// **A walk while another CPU maps in the same tree reads every entry atomically**, as the
-    /// mapper links it: the kernel half is edited under no lock, so a plain read of a slot the
-    /// mapper links by compare-and-swap is a data race, which Miri reports and hardware forgives.
+    /// **A walk beside a mapper in one tree reads each slot atomically**: a race Miri reports.
     #[test]
     fn a_walk_beside_a_mapper_in_one_tree_reads_what_is_linked() {
         init_global_heap();

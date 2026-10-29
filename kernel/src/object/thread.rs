@@ -147,8 +147,7 @@ pub struct Thread {
     wait_count: u8,
     wait_has_deadline: bool,
     wait_phase: AtomicU8,
-    /// The user registers this thread last faulted with in ring 3, copied out of its exception
-    /// frame as it suspended (meaningful only while `Suspended`), for its supervisor to read.
+    /// The user registers it last faulted with, copied as it suspended; meaningful while `Suspended`.
     fault_regs: RegisterValues,
     /// Resume disposition set by `sys_exception_resume`: `0` = Resume, `2` = Terminate.
     disp_tag: u8,
@@ -754,8 +753,7 @@ impl Thread {
         unsafe { (*p).stack.as_ref().map(KernelStack::stack_top) }
     }
 
-    /// This thread's owning process id, or `0` for a kernel/boot thread: [`Thread::owner_pid`]
-    /// through a raw place.
+    /// [`Thread::owner_pid`] through a raw place: `0` for a kernel/boot thread.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -773,8 +771,7 @@ impl Thread {
         unsafe { core::ptr::read(&raw const (*(obj as *const Thread)).tid) }
     }
 
-    /// The process a user thread belongs to, which the thread pins, retained by no new reference:
-    /// `None` for a kernel thread.
+    /// The process a user thread belongs to, pinned by it and given no new reference.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -784,8 +781,7 @@ impl Thread {
         unsafe { (*(obj as *const Thread)).process.as_ref().map(ObjectRef::as_ptr) }
     }
 
-    /// A new reference to the process a user thread belongs to: [`Thread::process_ref`] through a
-    /// raw place.
+    /// [`Thread::process_ref`] through a raw place.
     ///
     /// # Safety
     /// See the accessor contract above.

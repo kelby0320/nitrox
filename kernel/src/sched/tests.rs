@@ -920,3 +920,14 @@ fn a_thread_made_for_a_process_that_has_begun_to_exit_is_placed_marked() {
         assert_eq!(unsafe { Thread::is_ending(obj) }, marked);
     }
 }
+
+/// **The calling thread's identity is its pid, then its tid**; a kernel thread has none.
+#[test]
+fn the_current_identity_is_its_pid_then_its_tid() {
+    use crate::object::thread::test_support::{user_process_ref, user_thread_no_stack};
+    init_global_heap();
+    let (process, _root) = user_process_ref(9);
+    let me = into_objref(user_thread_no_stack(7, process, 0x40_0000, 0x7fff_f000));
+    assert_eq!(with_current(me, current_pid_tid), Some((9, 7)));
+    assert_eq!(with_current(inert_ref(3), current_pid_tid), None);
+}

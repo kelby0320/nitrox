@@ -4,9 +4,8 @@ use core::ops::{Deref, DerefMut};
 
 use crate::libkern::{AllocError, KVec};
 
-/// A list holding at most the capacity it was made with: a push past it hands the value back
-/// rather than growing, so one may run under any lock or in an interrupt. It has no `Default`, so
-/// a `mem::take` cannot leave a list of no room behind by accident.
+/// A list holding at most the capacity it was made with, a push past it handed back, so one may run
+/// under any lock or in an interrupt. No `Default`, so no `mem::take` leaves one of no room.
 pub struct Reserved<T>(KVec<T>);
 
 impl<T> Reserved<T> {

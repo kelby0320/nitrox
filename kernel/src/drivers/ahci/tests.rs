@@ -102,6 +102,7 @@ fn an_all_padding_field_comes_back_empty() {
 
 #[test]
 fn a_rescan_and_an_eject_are_refused_without_touching_a_disk() {
+    let _exclusive = crate::dpc::exclusive();
     use crate::io::irp::{IrpBuffer, IrpOp};
     crate::mm::test_support::init_global_heap();
     for op in [IrpOp::Rescan, IrpOp::Eject] {
@@ -178,6 +179,7 @@ const PENDING: i32 = IrpStatus::Pending as i32;
 /// outside the port lock, and took the command another CPU had just issued.
 #[test]
 fn a_command_issued_after_the_slot_read_idle_is_not_retired() {
+    let _exclusive = crate::dpc::exclusive();
     use crate::io::irp::{IRP_BUF_NONE, IrpBuffer, IrpOp};
     for flush in [false, true] {
         let (_regs, d) = fake_disk();
@@ -202,6 +204,7 @@ fn a_command_issued_after_the_slot_read_idle_is_not_retired() {
 /// have been running yet, and the next was built over its slot.
 #[test]
 fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
+    let _exclusive = crate::dpc::exclusive();
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
@@ -221,6 +224,7 @@ fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
 /// command's bit in PxCI, so the request waited for ever; QEMU clears it, so both are taken.
 #[test]
 fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
+    let _exclusive = crate::dpc::exclusive();
     for keeps in [true, false] {
         let (_regs, d) = fake_disk();
         let frag = PhysFrag { base: 0x10_0000, len: 512 };
@@ -260,6 +264,7 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
 /// **A command past its deadline is recovered and failed**, held at the deadline's neighbours.
 #[test]
 fn a_command_past_its_deadline_is_recovered_and_failed() {
+    let _exclusive = crate::dpc::exclusive();
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
@@ -282,6 +287,7 @@ fn a_command_past_its_deadline_is_recovered_and_failed() {
 /// onto the stopping port was forgotten when the recovery cleared slot 0.
 #[test]
 fn a_fault_with_nothing_in_flight_holds_what_comes_until_the_port_is_back() {
+    let _exclusive = crate::dpc::exclusive();
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
@@ -316,6 +322,7 @@ fn given_up(d: &AhciDisk, first: &mut Irp, second: &mut Irp) {
 /// be written, so it is never completed; what was queued, and what comes after, fails.
 #[test]
 fn a_port_that_will_not_stop_keeps_its_command_and_fails_the_rest() {
+    let _exclusive = crate::dpc::exclusive();
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second, mut third) = (read_irp(&frag), read_irp(&frag), read_irp(&frag));
@@ -333,6 +340,7 @@ fn a_port_that_will_not_stop_keeps_its_command_and_fails_the_rest() {
 /// **A request meeting the give-up at the port lock is refused**, not queued behind a kept one.
 #[test]
 fn a_request_meeting_the_give_up_at_the_port_lock_is_refused() {
+    let exclusive = crate::dpc::exclusive();
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut late) = (read_irp(&frag), read_irp(&frag));
@@ -340,8 +348,11 @@ fn a_request_meeting_the_give_up_at_the_port_lock_is_refused() {
     let late_irp = &mut late as *mut Irp as usize;
     let mut q = d.state.lock();
     std::thread::scope(|s| {
-        let d = &d;
-        let waiting = s.spawn(move || submit(late_irp as *mut Irp, ctx(d)));
+        let (d, exclusive) = (&d, &exclusive);
+        let waiting = s.spawn(move || {
+            let _shared = exclusive.share();
+            submit(late_irp as *mut Irp, ctx(d))
+        });
         // Long enough for `waiting` to be at the lock.
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = give_up(&mut q);
@@ -355,6 +366,7 @@ fn a_request_meeting_the_give_up_at_the_port_lock_is_refused() {
 /// **A poll of a disk given up waits for nothing**: the command it keeps will not finish.
 #[test]
 fn a_poll_of_a_disk_given_up_waits_for_nothing() {
+    let _exclusive = crate::dpc::exclusive();
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
@@ -370,6 +382,7 @@ fn a_poll_of_a_disk_given_up_waits_for_nothing() {
 /// interrupt queues the one that signals the disk's interrupt object.
 #[test]
 fn an_interrupt_queues_the_fault_dpc_on_a_fault_and_the_drain_dpc_on_a_retire() {
+    let _exclusive = crate::dpc::exclusive();
     let addr = |dpc: &Dpc| dpc as *const Dpc as usize;
     let (fault, drain, intr) = (addr(&AHCI_FAULT_DPC), addr(&AHCI_DRAIN_DPC), addr(&AHCI_INTR_DPC));
     let (_regs, d) = fake_disk();
@@ -402,6 +415,7 @@ fn an_interrupt_queues_the_fault_dpc_on_a_fault_and_the_drain_dpc_on_a_retire() 
 /// interrupt, a polled wait or a recovery. Issued at 1,000 s and retired 5 s on.
 #[test]
 fn a_commands_device_time_runs_from_its_issue_to_its_retire() {
+    let _exclusive = crate::dpc::exclusive();
     use crate::io::stats::IoStats;
     const ISSUE: u64 = 1_000_000_000_000;
     const ON_DEVICE: u64 = 5_000_000_000;

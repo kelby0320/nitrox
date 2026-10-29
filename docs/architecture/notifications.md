@@ -45,8 +45,9 @@ kernel stays alive. A kernel-mode fault is still fatal (it dumps and halts).
 A **supervisor** — a sibling thread holding the faulter's `Thread` handle (from
 `sys_thread_create`) — then decides the outcome:
 
-- `sys_thread_get_registers(thread, out)` reads the suspended thread's captured
-  registers (from the frame on its kernel stack) for diagnosis.
+- `sys_thread_get_registers(thread, out)` reads the registers the suspended
+  thread faulted with, copied from its exception frame as it suspended, for
+  diagnosis.
 - `sys_exception_resume(thread, disposition, code)` either **resumes** it
   (disposition `0`: the thread re-enters the faulting instruction — meaningful
   once the supervisor has repaired the fault's cause) or **terminates** it

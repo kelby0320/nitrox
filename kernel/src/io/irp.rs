@@ -128,9 +128,8 @@ pub struct Irp {
     pub completion: u64,
     /// The next completed IRP while this one waits to be finished: [`complete`]'s alone.
     pub next: *mut Irp,
-    /// What finishing this IRP does once [`complete`] has recorded its outcome, at the next DPC
-    /// drain: its dispatcher's to set. [`Irp::new_block`]'s does nothing.
-    pub on_complete: unsafe fn(*mut Irp),
+    /// Finishing this IRP, at the DPC drain after [`complete`]: its dispatcher's to set.
+    pub on_complete: unsafe extern "C" fn(*mut Irp),
     /// The per-layer stack frames.
     pub stack: [IrpStackFrame; IRP_MAX_STACK],
 }
@@ -170,8 +169,7 @@ impl Irp {
         }
     }
 
-    /// Record the terminal `status` and `transferred` count on a completed IRP: [`complete`]'s
-    /// first step.
+    /// Record the terminal `status` and `transferred` count: [`complete`]'s first step.
     pub fn set_completion(&mut self, status: i32, transferred: u64) {
         self.status = status;
         self.transferred = transferred;
@@ -179,7 +177,7 @@ impl Irp {
 }
 
 /// [`Irp::new_block`]'s `on_complete`: an IRP no dispatcher owns, a test's, needs no finishing.
-unsafe fn finish_nothing(_: *mut Irp) {}
+unsafe extern "C" fn finish_nothing(_: *mut Irp) {}
 
 /// Completed IRPs waiting for [`FINISH`], first to last.
 struct Done {
@@ -194,19 +192,20 @@ unsafe impl Send for Done {}
 static DONE: IrqSpinLock<Done> =
     IrqSpinLock::new(LockRank::Leaf, Done { head: core::ptr::null_mut(), tail: core::ptr::null_mut() });
 
-/// **The one DPC that finishes completed IRPs**, so the DPC queue holds static DPCs only and its
-/// capacity bounds them, rather than one DPC an IRP completed between two drains.
+/// **The one DPC that finishes completed IRPs**, so the DPC queue's capacity bounds what it holds.
 static FINISH: Dpc = Dpc::new(finish_completed, core::ptr::null_mut());
 
-/// **Complete `irp` with `status` and `transferred`**, from a driver's completion, interrupt or
-/// refusal, in any context; its `on_complete` runs at the next DPC drain.
+/// **Complete `irp` with `status` and `transferred`**, in any context; `on_complete` runs later.
 ///
 /// # Safety
 /// `irp` is live and in flight, completed this once, and touched by nothing else until its
 /// `on_complete` has run.
 pub unsafe fn complete(irp: *mut Irp, status: i32, transferred: u64) {
+    #[cfg(test)]
+    crate::dpc::assert_exclusive();
     // SAFETY: the caller's contract; `DONE` serialises the list's links.
     unsafe {
+        debug_assert_eq!((*irp).status, IrpStatus::Pending as i32, "an IRP completed twice");
         (*irp).set_completion(status, transferred);
         (*irp).next = core::ptr::null_mut();
         let mut done = DONE.lock();
@@ -217,6 +216,17 @@ pub unsafe fn complete(irp: *mut Irp, status: i32, transferred: u64) {
         done.tail = irp;
     }
     crate::dpc::enqueue(&FINISH);
+}
+
+#[cfg(test)]
+pub(crate) fn none_completed() -> bool {
+    DONE.lock().head.is_null()
+}
+
+#[cfg(test)]
+pub(crate) fn forget_completed() {
+    let mut done = DONE.lock();
+    (done.head, done.tail) = (core::ptr::null_mut(), core::ptr::null_mut());
 }
 
 /// [`FINISH`]'s handler: take every completed IRP and run its `on_complete`, in completion order.
@@ -264,6 +274,44 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bare(offset: u64) -> Irp {
+        Irp::new_block(IrpOp::Read, core::ptr::null(), offset, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0)
+    }
+
+    /// **Completed IRPs finish in the order they completed.**
+    #[test]
+    fn completed_irps_finish_in_completion_order() {
+        std::thread_local! {
+            static FINISHED: core::cell::RefCell<std::vec::Vec<u64>> =
+                const { core::cell::RefCell::new(std::vec::Vec::new()) };
+        }
+        unsafe extern "C" fn record(irp: *mut Irp) {
+            // SAFETY: a live IRP of the test, finished once.
+            FINISHED.with(|f| f.borrow_mut().push(unsafe { (*irp).offset }));
+        }
+        let _exclusive = crate::dpc::exclusive();
+        let mut irps: [Irp; 3] = core::array::from_fn(|i| Irp { on_complete: record, ..bare(i as u64 * 512) });
+        for irp in &mut irps {
+            // SAFETY: each is live and in flight, completed once.
+            unsafe { complete(irp, IrpStatus::Success as i32, 512) };
+        }
+        crate::dpc::run_pending();
+        assert_eq!(FINISHED.with(|f| f.take()), [0, 512, 1024]);
+    }
+
+    /// **An IRP completed twice stops a debug build**, before it links itself after itself.
+    #[test]
+    #[should_panic(expected = "an IRP completed twice")]
+    fn an_irp_completed_twice_is_stopped() {
+        let _exclusive = crate::dpc::exclusive();
+        let mut irp = bare(0);
+        // SAFETY: live and in flight; the second completion is the defect under test.
+        unsafe {
+            complete(&mut irp, IrpStatus::Success as i32, 512);
+            complete(&mut irp, IrpStatus::Success as i32, 512);
+        }
+    }
 
     #[test]
     fn irp_op_and_status_discriminants() {

@@ -480,7 +480,7 @@ Restricts which CPUs `thread` may run on. Requires `SIGNAL` right.
 ```rust
 fn sys_thread_get_registers(thread: RawHandle, out: UserMutPtr<RegisterValues>) -> isize
 ```
-Writes the saved user register state of `thread` to `*out` (the 16 GPRs plus `rip`/`rflags`; see [RegisterValues](#registervalues)). The thread must be **suspended on a fault** (else `InvalidArgument`); the captured frame lives on its kernel stack and is stable while it stays parked. Requires `SIGNAL` right and a `Thread` handle. (Syscall number `20`.)
+Writes the saved user register state of `thread` to `*out` (the 16 GPRs plus `rip`/`rflags`; see [RegisterValues](#registervalues)). The thread must be **suspended on a fault** (else `InvalidArgument`); the registers are those it faulted with, copied out of its exception frame as it suspended and read under the scheduler lock, so a resume racing the call cannot change them. Requires `SIGNAL` right and a `Thread` handle. (Syscall number `20`.)
 
 ```rust
 fn sys_exception_resume(thread: RawHandle, disposition: u64, code: u64) -> isize

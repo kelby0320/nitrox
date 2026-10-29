@@ -62,8 +62,7 @@ pub const RAMDISK_BLOCK: u32 = 512;
 
 /// Where a ramdisk's bytes live.
 enum Backing {
-    /// Allocated and owned by the device — the bring-up disk — and reached through `base`, taken
-    /// from it mutably once: one taken through a shared borrow would allow reads only.
+    /// The device's own, the bring-up disk, reached through `base`, taken from it mutably once.
     Owned { bytes: KVec<u8>, base: *mut u8 },
     /// Memory the bootloader loaded: a Limine module, never reclaimed.
     Borrowed { base: *mut u8, len: usize },
@@ -404,8 +403,8 @@ mod tests {
         assert!(module[..512].iter().all(|&x| x == 0), "and nowhere else");
     }
 
-    /// **The disk it owns takes writes**, through a pointer that may write: one taken from its
-    /// bytes through a shared borrow allowed reads only, so under Miri a write was undefined.
+    /// **The disk it owns takes writes**, through a pointer that may write.
+    // TODO(miri-provenance-tests): it fails only under Miri, which no CI job runs yet.
     #[test]
     fn a_disk_over_its_own_bytes_writes_and_reads_them_back() {
         init_global_heap();

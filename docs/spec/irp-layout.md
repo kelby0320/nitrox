@@ -40,8 +40,8 @@ pub struct Irp {
     pub transferred: u64,            // offset 48  — bytes actually transferred (set on completion)
     pub buffer:      IrpBuffer,      // offset 56  — the data buffer (physical reference, 16 B)
     pub completion:  u64,            // offset 72  — *mut PendingOperation (kernel ptr; 0 if none)
-    pub next:        *mut Irp,       // offset 80  — the next completed IRP, while it waits (kernel-internal)
-    pub on_complete: unsafe fn(*mut Irp), // offset 88 — what finishing it does (its dispatcher's)
+    pub next:        *mut Irp,       // offset 80  — the next completed IRP, while it waits
+    pub on_complete: CompleteFn,     // offset 88  — `unsafe extern "C" fn(*mut Irp)`: finishing it
     pub stack:       IrpStack,       // offset 96  — the per-layer frames
 }
 ```
@@ -83,7 +83,9 @@ carries everything down and back up.
   allocation in IRQ context, per `kernel/CLAUDE.md`), which runs each IRP's `on_complete`. The
   block layer's signals `completion` and hands its box to thread context to free. One DPC for
   every IRP, rather than one inline in each, keeps the DPC queue to static DPCs, which its fixed
-  capacity bounds (2026-10-29).
+  capacity bounds (2026-10-29). **`on_complete` runs last**, after the stack's per-frame
+  completion routines, when those run (no layer sets one yet, and nothing walks them); it is
+  `extern "C"`, a stable ABI for a Tier 2 module built apart from the kernel.
 - **`stack`** — the [`IrpStack`](#irpstack) of per-layer frames.
 
 ## IrpOp
@@ -157,8 +159,9 @@ pub struct IrpStackFrame {
 ```
 
 Each frame names the [`DeviceNode`](device-node.md) that layer drives, an
-optional **completion routine** run (in DPC context) as the IRP unwinds upward,
-and a per-layer `context` word. The partition (GPT) layer stores the partition's
+optional **completion routine**, to run (in DPC context) as the IRP unwinds upward
+before its `on_complete` (no layer sets one yet, and nothing runs them), and a
+per-layer `context` word. The partition (GPT) layer stores the partition's
 starting offset in `context`, adds it to `Irp.offset` on the way down, and needs
 no completion routine; the AHCI layer at the bottom programs the hardware and
 returns `Pending`. A completion routine **cannot** reference a returned stack

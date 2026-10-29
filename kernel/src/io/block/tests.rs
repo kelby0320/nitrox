@@ -45,6 +45,7 @@ fn a_window_refuses_a_rescan_and_once_retired_everything() {
 /// nothing more reaches the disk and no submit is left counted in.
 #[test]
 fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
+    let _exclusive = crate::dpc::exclusive();
     use crate::libkern::block::BlockKind;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
     use core::cell::RefCell;
@@ -166,6 +167,7 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
 /// **A block request off its device's blocks reaches no driver**, through both dispatches.
 #[test]
 fn a_block_request_off_its_devices_blocks_reaches_no_driver() {
+    let _exclusive = crate::dpc::exclusive();
     use crate::libkern::block::BlockKind;
     use crate::libkern::handle::KObjectType;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
@@ -231,6 +233,7 @@ fn a_block_request_off_its_devices_blocks_reaches_no_driver() {
 /// **A blocking read succeeds only once its device completed it.**
 #[test]
 fn a_blocking_read_its_device_did_not_complete_fails() {
+    let _exclusive = crate::dpc::exclusive();
     use crate::libkern::block::BlockKind;
     use crate::libkern::handle::KObjectType;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
@@ -258,6 +261,8 @@ fn a_blocking_read_its_device_did_not_complete_fails() {
     assert!(read(completes, runs, 0), "a read its device completed");
     assert!(!read(kept, runs, 0), "a command its device kept");
     assert!(!read(completes, idle, 64), "past the end, refused through a DPC no poll ran");
+    crate::dpc::run_pending();
+    reclaim_completed();
 }
 
 #[test]
@@ -326,6 +331,7 @@ fn an_unaligned_start_costs_an_extra_fragment() {
 /// IRP queued its own DPC, so the 65th refusal before a drain panicked the kernel.
 #[test]
 fn more_refusals_than_the_dpc_queue_holds_each_complete() {
+    let _exclusive = crate::dpc::exclusive();
     use crate::libkern::block::BlockKind;
     use crate::libkern::handle::KObjectType;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
@@ -357,14 +363,7 @@ fn more_refusals_than_the_dpc_queue_holds_each_complete() {
     let settled = |po: &ObjectRef| unsafe {
         PendingOperation::already_signaled(po.as_ptr()).then(|| PendingOperation::status(po.as_ptr()))
     };
-    // Other tests' threads drain the one queue too, and may be finishing these meanwhile.
-    for _ in 0..10_000 {
-        crate::dpc::run_pending();
-        if pos.iter().all(|po| settled(po).is_some()) {
-            break;
-        }
-        std::thread::yield_now();
-    }
+    crate::dpc::run_pending();
     reclaim_completed();
     for po in &pos {
         assert_eq!(settled(po), Some(KError::InvalidArgument as i32));

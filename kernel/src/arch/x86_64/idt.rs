@@ -131,9 +131,8 @@ macro_rules! irq_dispatcher {
             // SAFETY: the naked stub built a complete `ExceptionFrame` at the stack top and passed
             // its address in RDI: valid, 8-byte aligned, and not aliased for the body's call.
             body(unsafe { &mut *$frame });
-            // SAFETY: the stub-built frame in RDI, valid for this call. An IST stack is no place to
-            // end a thread from: the next NMI or #DF reuses it.
-            if unsafe { (*$frame).cs & 3 == 3 && ist_slot((*$frame).vector) == 0 } {
+            // SAFETY: the stub-built frame in RDI, valid for this call.
+            if ends_on_return(unsafe { &*$frame }) {
                 crate::sched::end_if_ending();
             }
         }
@@ -599,23 +598,42 @@ irq_dispatcher! {
 /// ring-3 #DF, whose saved CS and RIP are undefined, and a **ring-0** fault are fatal
 /// ([`dump_and_halt`]).
 fn exception_dispatch(f: &mut ExceptionFrame) {
-    // The stop notice, before anything else: an NMI while `STOPPING` is set is this CPU being
-    // told the machine is going down. Checked ahead of the ring test because the CPUs most
-    // worth stopping are in ring 0, spinning on a lock the faulting CPU holds; the generic
-    // ring-0 path would send each through `dump_and_halt` and bury the diagnosis.
-    if is_stop_notice(f.vector, STOPPING.load(Ordering::Acquire)) {
-        stop_notice();
+    match taken(f, STOPPING.load(Ordering::Acquire)) {
+        Taken::Stop => stop_notice(),
+        Taken::UserFault => user_fault(f, None),
+        Taken::UserNmi => crate::kprintln!("nmi: from ring 3 at rip {:#x}; resumed", f.rip),
+        Taken::Fatal => dump_and_halt(f),
     }
-    if is_user_fault(f) {
-        user_fault(f, None);
-        return;
-    }
-    if is_user_nmi(f) {
-        crate::kprintln!("nmi: from ring 3 at rip {:#x}; resumed", f.rip);
-        return;
-    }
-    dump_and_halt(f);
 }
+}
+
+/// What [`exception_dispatch`] does with an exception.
+#[derive(Debug, PartialEq, Eq)]
+enum Taken {
+    Stop,
+    UserFault,
+    UserNmi,
+    Fatal,
+}
+
+/// How an exception is taken, `stopping` the machine or not. **The stop is decided first**: the
+/// CPUs most worth stopping spin in ring 0 on a lock the faulting CPU holds.
+fn taken(f: &ExceptionFrame, stopping: bool) -> Taken {
+    if is_stop_notice(f.vector, stopping) {
+        Taken::Stop
+    } else if is_user_fault(f) {
+        Taken::UserFault
+    } else if is_user_nmi(f) {
+        Taken::UserNmi
+    } else {
+        Taken::Fatal
+    }
+}
+
+/// Whether an interrupt's return may end its thread: from ring 3, and not on an IST stack, which the
+/// next NMI or #DF reuses.
+fn ends_on_return(f: &ExceptionFrame) -> bool {
+    f.cs & 3 == 3 && ist_slot(f.vector) == 0
 }
 
 /// Shared ring-3 fault handler: suspend the thread with a fault [`Notification`], then act on

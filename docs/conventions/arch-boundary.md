@@ -62,8 +62,8 @@ unchanged.
   is re-exported from `arch/mod.rs` under a neutral alias. Today:
   `arch::paging` (`ArchPaging` → `Paging`), `arch::irq` (`ArchIrq` → `Irq`),
   `arch::cpu` (`ArchCpu` → `Cpu`), `arch::user_access` (`ArchUserAccess` →
-  `UserAccess`), `arch::smp` (`ArchSmp` → `Smp`), `arch::timer` (`ArchTimer` → `Timer`), `arch::irq_router` (`ArchIrqRouter` →
-  `IrqRouter`), `arch::irq_install` (`ArchIrqInstall` → `IrqInstall`),
+  `UserAccess`), `arch::smp` (`ArchSmp` → `Smp`), `arch::timer` (`ArchTimer` →
+  `Timer`), `arch::irq_router` (`ArchIrqRouter` → `IrqRouter`), `arch::irq_install` (`ArchIrqInstall` → `IrqInstall`),
   `arch::platform` (`ArchPlatform` → `Platform`), `arch::entropy`
   (`ArchEntropy` → `Entropy`), `arch::memory_types` (`ArchMemoryTypes` →
   `MemoryTypes`); future `arch::fpu`.

@@ -40,7 +40,7 @@
 "userspace/nxterm/src/lib.rs" = 2341
 "userspace/service-mgr/src/main.rs" = 2220
 "userspace/storage-service/src/main.rs" = 1527
-"userspace/test-harness/src/harness.rs" = 3953
+"userspace/test-harness/src/harness.rs" = 3854
 "userspace/test-harness/src/uiclient.rs" = 1265
 "userspace/view-broker/src/lib.rs" = 1646
 "userspace/view-broker/src/main.rs" = 1809

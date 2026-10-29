@@ -325,8 +325,7 @@ struct ReclaimHead(*mut IrpBox);
 /// The boxes on [`RECLAIM`]: written under it, read without it.
 static RECLAIM_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// The backlog at which a completion wakes the reaper to drain [`RECLAIM`]; an idle CPU drains it
-/// sooner.
+/// The backlog at which a completion wakes the reaper to drain [`RECLAIM`].
 pub const RECLAIM_WAKE_AT: usize = 32;
 
 /// How many completed boxes wait for [`reclaim_completed`].
@@ -383,7 +382,7 @@ pub(crate) unsafe fn complete_for_test(irp: *mut Irp) {
 ///
 /// # Safety
 /// `irp` is the IRP of a box a dispatch here made, completed once.
-unsafe fn finish(irp: *mut Irp) {
+unsafe extern "C" fn finish(irp: *mut Irp) {
     let bx_ptr = irp as *mut IrpBox;
     // SAFETY: the box is live until this reclaims it (the IRP completes exactly once).
     let (status, transferred, po) = unsafe {
@@ -415,8 +414,10 @@ unsafe fn finish(irp: *mut Irp) {
 /// Read `count` 512-byte sectors from `lba` of the block `device`
 /// **synchronously** into `dst`, by polling, for kernel-internal reads at boot
 /// before interrupts are enabled (the GPT driver). Returns `false` on any
-/// failure (allocation, bad device, short `dst`, device error).
+/// failure (allocation, bad device, short `dst`, device error). **Before the other CPUs come up**:
+/// another CPU's drain could take its IRP first.
 pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -> bool {
+    debug_assert!(crate::sched::online_mask().count_ones() <= 1, "read_blocking with other CPUs online");
     // SAFETY: `device` pins a live `DeviceNode`.
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     let Some(backend) = dn.block_backend() else {

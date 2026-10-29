@@ -2,8 +2,7 @@
 
 use crate::libkern::ArrayVec;
 
-/// At most `N` threads waiting on one object, held inline in it: adding one under `SCHED` never
-/// allocates, and the list a wake takes is the same type, so it cannot be cut short.
+/// At most `N` threads waiting on one object, inline, so adding one under `SCHED` never allocates.
 pub(crate) struct WaitQueue<const N: usize>(ArrayVec<*mut (), N>);
 
 impl<const N: usize> WaitQueue<N> {

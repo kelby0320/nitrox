@@ -415,6 +415,7 @@ mod tests {
         HeapEngine::new()
     }
 
+    // TODO(miri-provenance-tests): it fails only under Miri, which no CI job runs yet.
     #[test]
     fn basic_alloc_is_nonnull_aligned_writable() {
         let e = engine();

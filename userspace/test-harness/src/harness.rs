@@ -16,6 +16,8 @@ use libkern::*;
 use libos::{Handle, Namespace, NsMutable, spawn, thread_create};
 use librsproto::session::{Dir, DirError};
 
+mod fault_demo;
+
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -26,8 +28,6 @@ const ENDPOINT_RIGHTS: u64 = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLIC
 
 /// One page; the worker thread's stack size.
 const PAGE: u64 = 4096;
-/// `sys_exception_resume` disposition: terminate the thread with a code.
-const DISPOSITION_TERMINATE: u64 = 2;
 
 static mut END0: u64 = 0;
 static mut END1: u64 = 0;
@@ -50,17 +50,6 @@ static mut STORM_SPAWN: SpawnArgs = SpawnArgs {
 };
 /// A zeroed 4096-byte IPC message for the blocking-send demos, used for both send and recv.
 static mut MSGBUF: [u8; 4096] = [0; 4096];
-static mut WORKER_ARGS: ThreadArgs = ThreadArgs {
-    entry: 0,
-    user_sp: 0,
-    arg0: 0,
-    class: 0, // TimeShared
-    rt_priority: 0,
-    nice: 0,
-    cpu_affinity: 0, // no restriction
-    _reserved: [0; 36],
-};
-static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
 
 static mut STREAM_ARGS: ThreadArgs = ThreadArgs {
     entry: 0,
@@ -325,94 +314,6 @@ static mut FWD_SEND: u64 = 0;
 static mut FWD_REQ: [u8; 4096] = [0; 4096];
 static mut FWD_REPLY: [u8; 4096] = [0; 4096];
 static mut FWD_REPLY_H: [u64; 8] = [0; 8];
-
-/// The worker's entry: store to an unmapped address, so the kernel suspends the thread and delivers
-/// a `SegFault`.
-extern "C" fn worker_fault() -> ! {
-    // SAFETY: this is the whole point — `0xdead_0000` is an unmapped user
-    // address, so the store traps. The kernel never lets the store complete.
-    unsafe { core::ptr::write_volatile(0xdead_0000usize as *mut u64, 0xc0ffee) };
-    loop {
-        // SAFETY: `pause` is always valid in ring 3 and has no effects.
-        unsafe { asm!("pause", options(nomem, nostack)) };
-    }
-}
-
-/// The exception demo: a second thread faults; we see the `SegFault` on `notif`, inspect its
-/// registers, and terminate it.
-fn worker_exception_demo(notif: u64) {
-    kprint(b"test-harness: mapping a worker stack\n");
-    // SAFETY: register-only syscalls with valid arguments.
-    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    if mem < 0 {
-        kprint(b"test-harness: worker stack create FAIL\n");
-        exit(1);
-    }
-    // SAFETY: maps the memory object read/write at a kernel-chosen address.
-    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if base < 0 {
-        kprint(b"test-harness: worker stack map FAIL\n");
-        exit(1);
-    }
-    let stack_top = base as u64 + PAGE; // stacks grow down from the top
-
-    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: WORKER_ARGS is our static, exclusively initialised here, then lent to the wrapper.
-    let worker = match unsafe {
-        WORKER_ARGS.entry = worker_fault as *const () as usize as u64;
-        WORKER_ARGS.user_sp = stack_top;
-        WORKER_ARGS.arg0 = 0;
-        thread_create(&*(&raw const WORKER_ARGS))
-    } {
-        Ok(w) => w,
-        Err(_) => {
-            kprint(b"test-harness: thread_create FAIL\n");
-            exit(1);
-        }
-    };
-    kprint(b"test-harness: created worker thread; awaiting its fault\n");
-
-    loop {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = notif;
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-        };
-        if waited < 1 {
-            kprint(b"test-harness: wait FAIL\n");
-            exit(1);
-        }
-        // SAFETY: NOTIF is a valid 64-byte writable out-param.
-        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-        if r != 0 {
-            continue; // WouldBlock: re-block on the channel
-        }
-        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-        let kind = unsafe { (&raw const NOTIF.kind).read() };
-        if kind == KIND_SEG_FAULT {
-            break;
-        }
-    }
-
-    // SAFETY: WORKER_REGS is a valid writable RegisterValues out-param.
-    let gr = unsafe { syscall4(SYS_THREAD_GET_REGISTERS, worker.raw().0, (&raw mut WORKER_REGS) as u64, 0, 0) };
-    // SAFETY: the kernel wrote the 18-register snapshot into WORKER_REGS, or nothing, a zero rip.
-    let rip = unsafe { (&raw const WORKER_REGS.regs[REG_RIP]).read() };
-    if gr != 0 || rip == 0 {
-        kprint(b"test-harness: get_registers FAIL\n");
-        exit(1);
-    }
-    Line::new().s(b"test-harness: worker faulted @ rip=").x(rip).s(b" ; terminating").end();
-
-    // SAFETY: register-only syscall.
-    let er = unsafe { syscall4(SYS_EXCEPTION_RESUME, worker.raw().0, DISPOSITION_TERMINATE, 7, 0) };
-    if er != 0 {
-        kprint(b"test-harness: exception_resume FAIL\n");
-        exit(1);
-    }
-    // The worker is not this process's last thread, so its termination produces no `ChildExited`.
-    kprint(b"test-harness: worker terminated\n");
-}
 
 /// The blocking-send / `PendingOperation` path: with a ring full, a `Block` send returns a PO (the
 /// message held in-kernel); a recv frees a slot, completing it with status 0.
@@ -3874,7 +3775,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     stage_spawn_demo(root_ns, notif);
 
-    worker_exception_demo(notif);
+    fault_demo::run(notif);
 
     fp_hardfloat_demo(root_ns, notif);
 

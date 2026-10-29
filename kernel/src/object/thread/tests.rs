@@ -121,6 +121,7 @@ fn wait_bookkeeping_round_trips() {
 
 /// **The switch path's save-area pointer may write**: `XSAVE` stores through it on every switch,
 /// and one taken through a shared borrow of the area's box allowed reads only.
+// TODO(miri-provenance-tests): it fails only under Miri, which no CI job runs yet.
 #[test]
 fn the_fpu_area_pointer_may_be_written_through() {
     init_global_heap();
