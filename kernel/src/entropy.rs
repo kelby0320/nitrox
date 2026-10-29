@@ -17,7 +17,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{ChaCha20Rng, IrqSpinLock, KVec};
+use crate::libkern::{ChaCha20Rng, IrqSpinLock, Reserved};
 use crate::object::ObjectRef;
 
 /// Pool size in bytes: one ChaCha key.
@@ -77,7 +77,7 @@ struct EntropyState {
     bytes_since_reseed: u32,
     /// `PendingOperation`s parked on the pool seeding. Pre-reserved in [`init`]; the subsystem owns
     /// these refs until the timer-tick drain moves them out to be signalled and dropped.
-    seed_waiters: KVec<ObjectRef>,
+    seed_waiters: Reserved<ObjectRef>,
 }
 
 impl EntropyState {
@@ -92,7 +92,7 @@ impl EntropyState {
             seeded: false,
             csprng: ChaCha20Rng::from_seed([0; 32]),
             bytes_since_reseed: 0,
-            seed_waiters: KVec::new(),
+            seed_waiters: Reserved::unreserved(),
         }
     }
 
@@ -145,10 +145,7 @@ impl EntropyState {
     /// Queue `po` to be woken on seeding, or hand it back (see [`SeedWaitReg`]); refs are moved,
     /// never dropped, here.
     ///
-    /// **The push refuses rather than growing.** [`init`]'s reserve is best-effort: if it fails,
-    /// `len() >= SEED_WAITERS_MAX` is `0 >= 4`, false, so control reaches the push on an unreserved
-    /// list, and `try_push` would `kmalloc` under this leaf-ranked lock. `push_within_capacity`
-    /// cannot allocate, so an unreserved list reports itself full, which the caller handles.
+    /// [`init`]'s reserve is best-effort, and a list it could not reserve reports itself full.
     fn register_waiter(&mut self, po: ObjectRef) -> SeedWaitReg {
         if self.seeded {
             return SeedWaitReg::AlreadySeeded(po);
@@ -156,7 +153,7 @@ impl EntropyState {
         if self.seed_waiters.len() >= SEED_WAITERS_MAX {
             return SeedWaitReg::Full(po);
         }
-        match self.seed_waiters.push_within_capacity(po) {
+        match self.seed_waiters.push(po) {
             Ok(()) => SeedWaitReg::Queued,
             // The reserve did not happen. Hand the ref back rather than dropping it here:
             // an `ObjectRef` drop under this lock is the same inversion one step further on.
@@ -203,13 +200,9 @@ pub fn init() {
 
     let source = crate::arch::Entropy::source();
     let mut hw = 0usize;
-    // Pre-reserve the seed-waiter list so `register_seed_waiter` never allocates under the lock,
-    // and reserve **outside** it: allocating (slab, rank 6a) under this leaf-ranked lock is an
-    // inversion the debug lock-order tracker rejects (as in `dpc::init`). Best-effort: an
-    // unreserved list reports itself full, so callers are told to retry, because the push in
-    // `register_waiter` refuses instead of growing.
-    let mut waiters = KVec::new();
-    let _ = waiters.try_reserve(SEED_WAITERS_MAX);
+    // Reserved **outside** the lock: allocating (slab, rank 6a) under this leaf-ranked lock is an
+    // inversion the debug lock-order tracker rejects.
+    let waiters = Reserved::with_capacity(SEED_WAITERS_MAX).unwrap_or(Reserved::unreserved());
     let mut g = ENTROPY.lock();
     g.seed_waiters = waiters;
     for _ in 0..HW_DRAWS {
@@ -395,7 +388,7 @@ mod tests {
     fn reserved_state() -> EntropyState {
         crate::mm::test_support::init_global_heap();
         let mut s = EntropyState::new();
-        s.seed_waiters.try_reserve(SEED_WAITERS_MAX).unwrap();
+        s.seed_waiters = Reserved::with_capacity(SEED_WAITERS_MAX).unwrap();
         s
     }
 

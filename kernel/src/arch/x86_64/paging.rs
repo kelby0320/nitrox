@@ -16,11 +16,13 @@ use crate::arch::x86_64::regs;
 use crate::libkern::SpinLock;
 use crate::libkern::lockrank::LockRank;
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const PAGE_TABLE_ENTRIES: usize = 512;
 
 // One page table is exactly one page frame, which the HHDM walk and `alloc_page_table` rely on.
 const _: () = assert!(size_of::<[Pte; PAGE_TABLE_ENTRIES]>() == PAGE_SIZE);
+const _: () = assert!(size_of::<[AtomicU64; PAGE_TABLE_ENTRIES]>() == PAGE_SIZE);
 
 // --- Page-table-entry bits ---
 
@@ -133,8 +135,9 @@ const fn pt_index(v: VirtAddr) -> usize {
     ((v.as_u64() >> 12) & 0x1FF) as usize
 }
 
-const fn page_offset(v: VirtAddr) -> u64 {
-    v.as_u64() & 0xFFF
+/// The offset of `v` in the page a leaf at `level` maps: 4 KiB, 2 MiB or 1 GiB.
+const fn leaf_offset(level: u8, v: VirtAddr) -> u64 {
+    v.as_u64() & ((1 << (12 + 9 * (level as u32 - 1))) - 1)
 }
 
 // --- Leaf entries, whose bits move with the page size ---
@@ -163,38 +166,10 @@ const fn attribute_of(raw: u64, huge: bool) -> u8 {
 /// is not mapped. The bit arithmetic is [`attribute_of`]'s.
 ///
 /// # Safety
-/// `root` must be a live page-table root reachable through the HHDM.
+/// As [`TableRef::root`].
 pub(crate) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8> {
-    if !virt.is_canonical() {
-        return None;
-    }
-    // SAFETY: as `translate`'s walk, which this mirrors: present non-huge entries point at real
-    // tables reachable through the HHDM, and every index is masked to 0..512.
-    unsafe {
-        let pml4e = *table_ptr(root).add(pml4_index(virt));
-        if !pml4e.is_present() {
-            return None;
-        }
-        let pdpte = *table_ptr(pml4e.phys()).add(pdpt_index(virt));
-        if !pdpte.is_present() {
-            return None;
-        }
-        if pdpte.is_huge() {
-            return Some(attribute_of(pdpte.0, true));
-        }
-        let pde = *table_ptr(pdpte.phys()).add(pd_index(virt));
-        if !pde.is_present() {
-            return None;
-        }
-        if pde.is_huge() {
-            return Some(attribute_of(pde.0, true));
-        }
-        let pte = *table_ptr(pde.phys()).add(pt_index(virt));
-        if !pte.is_present() {
-            return None;
-        }
-        Some(attribute_of(pte.0, false))
-    }
+    // SAFETY: forwarded.
+    unsafe { walk(root, virt) }.map(|(leaf, level)| attribute_of(leaf.0, level > 1))
 }
 
 // --- Table access -------------------------------------------------------
@@ -203,6 +178,97 @@ pub(crate) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u
 /// is sound only while `table` holds a live page-table frame.
 fn table_ptr(table: PhysAddr) -> *mut Pte {
     (table.as_u64() + crate::mm::heap::hhdm_offset()) as *mut Pte
+}
+
+/// A page table at `level` (4 a PML4, 1 a table of leaves), each entry atomic: the kernel half is
+/// shared and edited under no lock. **Invariant**: a present entry above level 1 that is not huge
+/// names a live table one level down.
+#[derive(Clone, Copy)]
+struct TableRef<'a> {
+    entries: &'a [AtomicU64; PAGE_TABLE_ENTRIES],
+    level: u8,
+}
+
+impl<'a> TableRef<'a> {
+    /// The top-level table at `root`.
+    ///
+    /// # Safety
+    /// `root` is a live PML4 reachable through the HHDM for `'a`, and each present entry above
+    /// level 1 that is not huge, anywhere in its tree, names a live table one level down.
+    unsafe fn root(root: PhysAddr) -> Self {
+        // SAFETY: forwarded.
+        unsafe { Self::at(root, 4) }
+    }
+
+    /// The table at `table`, at `level` of a tree as [`root`](Self::root)'s.
+    ///
+    /// # Safety
+    /// As [`root`](Self::root), for the table at `table`.
+    unsafe fn at(table: PhysAddr, level: u8) -> Self {
+        // SAFETY: by the contract, a live table: one page of 512 aligned `u64`s, the layout of
+        // `[AtomicU64; 512]`, written by others only atomically.
+        Self { entries: unsafe { &*table_ptr(table).cast::<[AtomicU64; PAGE_TABLE_ENTRIES]>() }, level }
+    }
+
+    fn entry(self, index: usize) -> Pte {
+        Pte(self.entries[index].load(Ordering::Acquire))
+    }
+
+    fn set(self, index: usize, pte: Pte) {
+        self.entries[index].store(pte.0, Ordering::Release);
+    }
+
+    /// Store `new` at `index` if it still holds `old`, as read empty; `false` if another CPU won.
+    fn link(self, index: usize, old: Pte, new: Pte) -> bool {
+        self.entries[index].compare_exchange(old.0, new.0, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    /// What slot `index` holds, from one read: a second could see a table linked since.
+    fn slot(self, index: usize) -> Slot<'a> {
+        let e = self.entry(index);
+        match (e.is_present(), self.level > 1 && !e.is_huge()) {
+            (false, _) => Slot::Empty(e),
+            // SAFETY: the type's invariant: such an entry names a live table one level down.
+            (true, true) => Slot::Table(unsafe { Self::at(e.phys(), self.level - 1) }),
+            (true, false) => Slot::Leaf(e),
+        }
+    }
+
+    /// The slot of `virt` in this table.
+    fn index_of(self, virt: VirtAddr) -> usize {
+        match self.level {
+            4 => pml4_index(virt),
+            3 => pdpt_index(virt),
+            2 => pd_index(virt),
+            _ => pt_index(virt),
+        }
+    }
+}
+
+enum Slot<'a> {
+    Empty(Pte),
+    Table(TableRef<'a>),
+    Leaf(Pte),
+}
+
+/// The leaf entry mapping `virt` under `root`, and its level (1 a 4 KiB page, 2 a 2 MiB one, 3 a
+/// 1 GiB one), huge pages included, as on the bootloader's tables; `None` if `virt` is unmapped.
+///
+/// # Safety
+/// As [`TableRef::root`].
+unsafe fn walk(root: PhysAddr, virt: VirtAddr) -> Option<(Pte, u8)> {
+    if !virt.is_canonical() {
+        return None;
+    }
+    // SAFETY: forwarded.
+    let mut table = unsafe { TableRef::root(root) };
+    loop {
+        match table.slot(table.index_of(virt)) {
+            Slot::Table(next) => table = next,
+            Slot::Leaf(leaf) => return (table.level < 4).then_some((leaf, table.level)),
+            Slot::Empty(_) => return None,
+        }
+    }
 }
 
 /// Allocate one zeroed, page-aligned 4 KiB frame to use as a page table, or `None` if the
@@ -223,28 +289,26 @@ fn alloc_page_table() -> Option<PhysAddr> {
     Some(frame)
 }
 
-/// Return the child table referenced by slot `index` of `table`, allocating and linking a
-/// fresh zeroed table if the slot is empty.
-///
-/// # Safety
-/// `table` must point at a valid 512-entry page table reachable through
-/// the HHDM, and `index` must be `< 512`.
-unsafe fn ensure_table(table: *mut Pte, index: usize) -> Result<*mut Pte, MapError> {
+/// The child table slot `index` of `table` names, linking a fresh one if it is empty.
+fn ensure_table(table: TableRef<'_>, index: usize) -> Result<TableRef<'_>, MapError> {
     // The kernel half's tables are shared and edited under no lock: two CPUs making kernel
     // stacks in one fresh region can find a slot empty together. The link is a compare-and-swap,
     // and the CPU that loses gives its table back and takes the winner's.
-    // SAFETY: the caller guarantees `table` is a valid 512-entry table and `index < 512`, so
-    // the slot is in bounds; a `Pte` is a `u64`, aligned as one, so it can be read as an atomic.
-    let slot = unsafe { core::sync::atomic::AtomicU64::from_ptr(table.add(index).cast::<u64>()) };
+    debug_assert!(table.level > 1, "a page table's entries are leaves");
     let mut child = None;
     loop {
-        let entry = Pte(slot.load(core::sync::atomic::Ordering::Acquire));
-        if entry.is_present() {
-            if let Some(unused) = child {
-                heap::buddy_free(unused, 0);
+        let empty = match table.slot(index) {
+            Slot::Empty(e) => e,
+            found => {
+                if let Some(unused) = child {
+                    heap::buddy_free(unused, 0);
+                }
+                return match found {
+                    Slot::Table(t) => Ok(t),
+                    _ => Err(MapError::AlreadyMapped),
+                };
             }
-            return Ok(table_ptr(entry.phys()));
-        }
+        };
         let new = match child {
             Some(c) => c,
             None => alloc_page_table().ok_or(MapError::OutOfMemory)?,
@@ -252,12 +316,11 @@ unsafe fn ensure_table(table: *mut Pte, index: usize) -> Result<*mut Pte, MapErr
         child = Some(new);
         #[cfg(test)]
         if let Some(other_cpu) = BEFORE_LINK.take() {
-            other_cpu(slot);
+            other_cpu(&table.entries[index]);
         }
-        let linked = Pte::new_table(new).0;
-        let ordering = (core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
-        if slot.compare_exchange(entry.0, linked, ordering.0, ordering.1).is_ok() {
-            return Ok(table_ptr(new));
+        if table.link(index, empty, Pte::new_table(new)) {
+            // SAFETY: a fresh zeroed table, which holds no entries, now linked one level down.
+            return Ok(unsafe { TableRef::at(new, table.level - 1) });
         }
     }
 }
@@ -276,48 +339,32 @@ pub fn fail_page_tables_after(n: Option<usize>) {
 /// Whether `virt` is a 4 KiB page under `root` mapped with `flags` and nothing else.
 ///
 /// # Safety
-/// As [`walk_to_pt`].
+/// As [`TableRef::root`].
 #[cfg(test)]
 pub unsafe fn mapped_with(root: PhysAddr, virt: VirtAddr, flags: PageFlags) -> bool {
-    // SAFETY: forwarded; `pt_index` masks to the table's 512 entries.
-    let leaf = unsafe { walk_to_pt(root, virt).map(|pt| *pt.add(pt_index(virt))) };
+    // SAFETY: forwarded.
+    let leaf = unsafe { walk_to_pt(root, virt) }.map(|pt| pt.entry(pt_index(virt)));
     leaf.is_some_and(|pte| pte.0 & !PTE_ADDR_MASK == PTE_PRESENT | flags_to_pte_bits(flags))
 }
 
 #[cfg(test)]
 std::thread_local! {
     /// A test's stand-in for another CPU, run once between reading a slot empty and linking it.
-    static BEFORE_LINK: core::cell::Cell<Option<fn(&core::sync::atomic::AtomicU64)>> =
-        const { core::cell::Cell::new(None) };
+    static BEFORE_LINK: core::cell::Cell<Option<fn(&AtomicU64)>> = const { core::cell::Cell::new(None) };
 }
 
-/// Walk PML4 → PDPT → PD in the tree rooted at `root`, returning the page table that holds
-/// the leaf entry for `virt`, or `None` if an intermediate table is absent.
+/// The page table holding `virt`'s leaf under `root`, or `None` if none does.
 ///
 /// # Safety
-/// `root` must be the physical base of a valid top-level page table
-/// reachable through the HHDM, with no huge-page entries (the property
-/// every tree built by this module has).
-unsafe fn walk_to_pt(root: PhysAddr, virt: VirtAddr) -> Option<*mut Pte> {
-    // SAFETY: per the contract `root` is a valid table; each present
-    // entry therefore points at a real child table, also HHDM-reachable.
-    // Every `.add(index)` is in bounds — the index helpers mask to
-    // 0..512 and each table is exactly 512 entries.
-    unsafe {
-        let pml4e = *table_ptr(root).add(pml4_index(virt));
-        if !pml4e.is_present() {
-            return None;
-        }
-        let pdpte = *table_ptr(pml4e.phys()).add(pdpt_index(virt));
-        if !pdpte.is_present() {
-            return None;
-        }
-        let pde = *table_ptr(pdpte.phys()).add(pd_index(virt));
-        if !pde.is_present() {
-            return None;
-        }
-        Some(table_ptr(pde.phys()))
+/// As [`TableRef::root`].
+unsafe fn walk_to_pt<'a>(root: PhysAddr, virt: VirtAddr) -> Option<TableRef<'a>> {
+    // SAFETY: forwarded.
+    let mut table = unsafe { TableRef::root(root) };
+    while table.level > 1 {
+        let Slot::Table(next) = table.slot(table.index_of(virt)) else { return None };
+        table = next;
     }
+    Some(table)
 }
 
 // --- Kernel-half PML4 template ---
@@ -338,39 +385,23 @@ static KERNEL_TEMPLATE: SpinLock<Option<[u64; KERNEL_PML4_COUNT]>> = SpinLock::n
 /// Read entries `256..512` from the PML4 at `root` into a fresh array.
 ///
 /// # Safety
-/// `root` must be the physical base of a valid PML4 reachable through
-/// the HHDM.
+/// As [`TableRef::root`].
 unsafe fn read_kernel_half_entries(root: PhysAddr) -> [u64; KERNEL_PML4_COUNT] {
-    // SAFETY: forwarded from this function's contract; we read 256
-    // 8-byte entries from a 512-entry page-aligned table.
-    unsafe {
-        let pml4 = (root.as_u64() + heap::hhdm_offset()) as *const u64;
-        let mut out = [0u64; KERNEL_PML4_COUNT];
-        let mut i = 0;
-        while i < KERNEL_PML4_COUNT {
-            out[i] = *pml4.add(KERNEL_PML4_BASE + i);
-            i += 1;
-        }
-        out
-    }
+    // SAFETY: forwarded.
+    let pml4 = unsafe { TableRef::root(root) };
+    core::array::from_fn(|i| pml4.entry(KERNEL_PML4_BASE + i).0)
 }
 
 /// Write `entries` into the kernel-half slots of the PML4 at `root`.
 /// Entries `0..256` (the user half) are left untouched.
 ///
 /// # Safety
-/// `root` must be the physical base of a writable PML4 reachable
-/// through the HHDM and owned by the caller.
+/// As [`TableRef::root`], for a PML4 the caller owns, and `entries` are a live PML4's.
 unsafe fn write_kernel_half_entries(root: PhysAddr, entries: &[u64; KERNEL_PML4_COUNT]) {
-    // SAFETY: forwarded from this function's contract; we write 256
-    // entries into a 512-entry page-aligned table.
-    unsafe {
-        let pml4 = (root.as_u64() + heap::hhdm_offset()) as *mut u64;
-        let mut i = 0;
-        while i < KERNEL_PML4_COUNT {
-            *pml4.add(KERNEL_PML4_BASE + i) = entries[i];
-            i += 1;
-        }
+    // SAFETY: forwarded.
+    let pml4 = unsafe { TableRef::root(root) };
+    for (i, &e) in entries.iter().enumerate() {
+        pml4.set(KERNEL_PML4_BASE + i, Pte(e));
     }
 }
 
@@ -387,45 +418,30 @@ impl ArchPaging for X86Paging {
         if !virt.is_canonical() || !virt.is_page_aligned() || !phys.is_page_aligned() {
             return Err(MapError::Misaligned);
         }
-        // SAFETY: the caller guarantees `root` is a valid, caller-owned
-        // top-level table reachable via the HHDM. `ensure_table`
-        // allocates and links any missing child and returns a valid
-        // 512-entry table, so each indexed access stays in bounds. The
-        // tree holds no huge pages (this API never creates them), so
-        // every present non-leaf entry is genuinely a table.
-        unsafe {
-            let pdpt = ensure_table(table_ptr(root), pml4_index(virt))?;
-            let pd = ensure_table(pdpt, pdpt_index(virt))?;
-            let pt = ensure_table(pd, pd_index(virt))?;
-            let leaf = pt.add(pt_index(virt));
-            if (*leaf).is_present() {
-                return Err(MapError::AlreadyMapped);
-            }
-            *leaf = Pte::new_leaf(phys, flags);
+        // SAFETY: the caller guarantees `root` is a valid, caller-owned top-level table.
+        let pml4 = unsafe { TableRef::root(root) };
+        let pt = ensure_table(ensure_table(ensure_table(pml4, pml4_index(virt))?, pdpt_index(virt))?, pd_index(virt))?;
+        let i = pt_index(virt);
+        match pt.slot(i) {
+            Slot::Empty(old) if pt.link(i, old, Pte::new_leaf(phys, flags)) => Ok(()),
+            _ => Err(MapError::AlreadyMapped),
         }
-        Ok(())
     }
 
     unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, UnmapError> {
         if !virt.is_canonical() || !virt.is_page_aligned() {
             return Err(UnmapError::Misaligned);
         }
-        // SAFETY: the caller guarantees `root` is a valid, caller-owned
-        // top-level table reachable via the HHDM with no huge pages.
-        // `walk_to_pt` returns a valid 512-entry table; `pt_index` masks
-        // to 0..512, so the leaf access is in bounds.
-        unsafe {
-            let pt = walk_to_pt(root, virt).ok_or(UnmapError::NotMapped)?;
-            let leaf = pt.add(pt_index(virt));
-            let entry = *leaf;
-            if !entry.is_present() {
-                return Err(UnmapError::NotMapped);
-            }
-            *leaf = Pte::empty();
-            // TODO: reclaim intermediate tables that are now empty —
-            // deferred (see docs/rationale/deferred-decisions.md).
-            Ok(entry.phys())
+        // SAFETY: the caller guarantees `root` is a valid, caller-owned top-level table.
+        let pt = unsafe { walk_to_pt(root, virt) }.ok_or(UnmapError::NotMapped)?;
+        let entry = pt.entry(pt_index(virt));
+        if !entry.is_present() {
+            return Err(UnmapError::NotMapped);
         }
+        pt.set(pt_index(virt), Pte::empty());
+        // TODO: reclaim intermediate tables that are now empty —
+        // deferred (see docs/rationale/deferred-decisions.md).
+        Ok(entry.phys())
     }
 
     #[cfg(not(test))]
@@ -480,57 +496,15 @@ impl ArchPaging for X86Paging {
     }
 
     unsafe fn ensure_kernel_intermediate(root: PhysAddr, virt: VirtAddr) -> Result<(), MapError> {
-        let index = pml4_index(virt);
         // SAFETY: forwarded from `ArchPaging::ensure_kernel_intermediate` —
         // `root` is a valid PML4 reachable through HHDM.
-        unsafe {
-            let pml4 = table_ptr(root);
-            let entry = *pml4.add(index);
-            if entry.is_present() {
-                return Ok(());
-            }
-            let new_pdpt = alloc_page_table().ok_or(MapError::OutOfMemory)?;
-            *pml4.add(index) = Pte::new_table(new_pdpt);
-            Ok(())
-        }
+        ensure_table(unsafe { TableRef::root(root) }, pml4_index(virt)).map(|_| ())
     }
 
     unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
-        if !virt.is_canonical() {
-            return None;
-        }
-        // SAFETY: per the contract `root` is a valid table; each present
-        // non-huge entry points at a real child table reachable via the
-        // HHDM. Indices are masked to 0..512, so every access is in bounds.
-        // Understands 2 MiB / 1 GiB huge pages, so it is correct against the
-        // bootloader's live tables.
-        unsafe {
-            let pml4e = *table_ptr(root).add(pml4_index(virt));
-            if !pml4e.is_present() {
-                return None;
-            }
-            let pdpte = *table_ptr(pml4e.phys()).add(pdpt_index(virt));
-            if !pdpte.is_present() {
-                return None;
-            }
-            if pdpte.is_huge() {
-                // 1 GiB page: frame base in bits 51:30, offset in bits 29:0.
-                return Some(PhysAddr::new(frame_base(pdpte.0, true) | (virt.as_u64() & 0x3FFF_FFFF)));
-            }
-            let pde = *table_ptr(pdpte.phys()).add(pd_index(virt));
-            if !pde.is_present() {
-                return None;
-            }
-            if pde.is_huge() {
-                // 2 MiB page: frame base in bits 51:21, offset in bits 20:0.
-                return Some(PhysAddr::new(frame_base(pde.0, true) | (virt.as_u64() & 0x1F_FFFF)));
-            }
-            let pte = *table_ptr(pde.phys()).add(pt_index(virt));
-            if !pte.is_present() {
-                return None;
-            }
-            Some(PhysAddr::new(pte.phys().as_u64() | page_offset(virt)))
-        }
+        // SAFETY: forwarded from the trait's contract.
+        let (leaf, level) = unsafe { walk(root, virt) }?;
+        Some(PhysAddr::new(frame_base(leaf.0, level > 1) | leaf_offset(level, virt)))
     }
 
     unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8> {
@@ -573,12 +547,12 @@ mod tests {
         let parent = alloc_page_table().unwrap();
         BEFORE_LINK.set(Some(other_cpu_links_first));
         let freed = heap::frames_freed_by_this_thread();
-        // SAFETY: `parent` is a fresh, zeroed table only this test touches; slot 7 is in bounds.
-        let got = unsafe { ensure_table(table_ptr(parent), 7) }.unwrap();
+        // SAFETY: `parent` is a fresh, zeroed table only this test touches.
+        let parent_table = unsafe { TableRef::root(parent) };
+        let got = ensure_table(parent_table, 7).unwrap();
         let first = PhysAddr::new(OTHER_CPUS_TABLE.get());
-        // SAFETY: as above.
-        assert_eq!(unsafe { *table_ptr(parent).add(7) }.phys(), first, "the first table was unlinked");
-        assert_eq!(got, table_ptr(first));
+        assert_eq!(parent_table.entry(7).phys(), first, "the first table was unlinked");
+        assert_eq!(got.entries.as_ptr(), table_ptr(first).cast(), "the first table is the one taken");
         assert_eq!(heap::frames_freed_by_this_thread() - freed, 1, "the second table goes back");
         heap::buddy_free(first, 0);
         heap::buddy_free(parent, 0);
@@ -591,7 +565,9 @@ mod tests {
         assert_eq!(pdpt_index(v), 2);
         assert_eq!(pd_index(v), 3);
         assert_eq!(pt_index(v), 4);
-        assert_eq!(page_offset(v), 0x5);
+        assert_eq!(leaf_offset(1, v), 0x5);
+        assert_eq!(leaf_offset(2, v), (4 << 12) | 0x5);
+        assert_eq!(leaf_offset(3, v), (3 << 21) | (4 << 12) | 0x5);
     }
 
     #[test]
@@ -601,7 +577,7 @@ mod tests {
         assert_eq!(pdpt_index(v), 0x1FF);
         assert_eq!(pd_index(v), 0x1FF);
         assert_eq!(pt_index(v), 0x1FF);
-        assert_eq!(page_offset(v), 0xFFF);
+        assert_eq!((leaf_offset(1, v), leaf_offset(2, v), leaf_offset(3, v)), (0xFFF, 0x1F_FFFF, 0x3FFF_FFFF));
     }
 
     #[test]
@@ -877,5 +853,61 @@ mod tests {
         let bits = flags_to_pte_bits(PageFlags::NO_CACHE);
         assert_eq!(bits, PTE_PCD);
         assert_eq!(attribute_of(bits, false), 2);
+    }
+
+    /// **A walk ends at a huge leaf, at either level, and a 4 KiB map inside one is refused.**
+    #[test]
+    fn a_walk_ends_at_a_huge_page_and_a_map_inside_one_is_refused() {
+        init_global_heap();
+        let (root, pdpt, pd) = (alloc_page_table().unwrap(), alloc_page_table().unwrap(), alloc_page_table().unwrap());
+        // SAFETY: fresh tables only this test touches, linked into one tree here.
+        let (l4, l3, l2) = unsafe { (TableRef::root(root), TableRef::at(pdpt, 3), TableRef::at(pd, 2)) };
+        l4.set(0, Pte::new_table(pdpt));
+        l3.set(1, Pte(0x4000_0000 | PTE_HUGE | PTE_PRESENT));
+        l3.set(2, Pte::new_table(pd));
+        l2.set(3, Pte(HUGE_WC));
+        let (gib, mib) = (VirtAddr::new((1 << 30) | 0x1234_5678), VirtAddr::new((2 << 30) | (3 << 21) | 0x1_2345));
+        // SAFETY: `root` is the live tree built above.
+        unsafe {
+            assert_eq!(X86Paging::translate(root, gib), Some(PhysAddr::new(0x5234_5678)));
+            assert_eq!(X86Paging::translate(root, mib), Some(PhysAddr::new(0x8001_2345)));
+            assert_eq!((attribute_index(root, gib), attribute_index(root, mib)), (Some(0), Some(5)));
+            let inside = VirtAddr::new((1 << 30) | 0x1000);
+            let target = PhysAddr::new(0x10_0000);
+            assert_eq!(X86Paging::map_page(root, inside, target, PageFlags::WRITABLE), Err(MapError::AlreadyMapped));
+        }
+        for t in [pd, pdpt, root] {
+            heap::buddy_free(t, 0);
+        }
+    }
+
+    /// **A walk beside a mapper in one tree reads each slot atomically**: a race Miri reports.
+    #[test]
+    fn a_walk_beside_a_mapper_in_one_tree_reads_what_is_linked() {
+        init_global_heap();
+        let root = alloc_page_table().unwrap();
+        let frames: std::vec::Vec<PhysAddr> = (0..4).map(|_| alloc_page_table().unwrap()).collect();
+        let virt = |i: usize| VirtAddr::new(0xFFFF_C000_0000_0000 + (i as u64) * 0x20_0000);
+        let mapper = std::thread::spawn({
+            let frames = frames.clone();
+            move || {
+                for (i, &f) in frames.iter().enumerate() {
+                    // SAFETY: `root` is a live table this test owns, and each `virt(i)` is fresh.
+                    unsafe { X86Paging::map_page(root, virt(i), f, PageFlags::WRITABLE) }.unwrap();
+                }
+            }
+        });
+        for _ in 0..16 {
+            for (i, &f) in frames.iter().enumerate() {
+                // SAFETY: as above; a walk reads the tree as the mapper builds it.
+                let at = unsafe { X86Paging::translate(root, virt(i)) };
+                assert!(at.is_none() || at == Some(f));
+            }
+        }
+        mapper.join().unwrap();
+        for (i, &f) in frames.iter().enumerate() {
+            // SAFETY: as above.
+            assert_eq!(unsafe { X86Paging::translate(root, virt(i)) }, Some(f));
+        }
     }
 }

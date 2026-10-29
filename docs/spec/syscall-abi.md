@@ -480,7 +480,7 @@ Restricts which CPUs `thread` may run on. Requires `SIGNAL` right.
 ```rust
 fn sys_thread_get_registers(thread: RawHandle, out: UserMutPtr<RegisterValues>) -> isize
 ```
-Writes the saved user register state of `thread` to `*out` (the 16 GPRs plus `rip`/`rflags`; see [RegisterValues](#registervalues)). The thread must be **suspended on a fault** (else `InvalidArgument`); the captured frame lives on its kernel stack and is stable while it stays parked. Requires `SIGNAL` right and a `Thread` handle. (Syscall number `20`.)
+Writes the saved user register state of `thread` to `*out` (the 16 GPRs plus `rip`/`rflags`; see [RegisterValues](#registervalues)). The thread must be **suspended on a fault** (else `InvalidArgument`); the registers are those it faulted with, copied out of its exception frame as it suspended and read under the scheduler lock, so a resume racing the call cannot change them. Requires `SIGNAL` right and a `Thread` handle. (Syscall number `20`.)
 
 ```rust
 fn sys_exception_resume(thread: RawHandle, disposition: u64, code: u64) -> isize
@@ -697,7 +697,7 @@ Argument types referenced above are defined in `libkern`:
 - `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`. (`sys_exception_resume` currently takes the disposition as a raw `u64` — `0` Resume / `2` Terminate — pending the full `Disposition` enum in Phase 2.)
 
 <a id="registervalues"></a>
-- `RegisterValues`: `#[repr(C)]` snapshot a faulted thread's registers are read into by `sys_thread_get_registers`. On x86_64: 18 `u64`s = the 16 GPRs in the order `rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8..r15` (offsets 0–120), then `rip` (offset 128) and `rflags` (offset 136); 144 bytes, 8-aligned. aarch64 will define its own ordering when that arch lands. **This is a per-architecture type** — it lives behind the arch boundary in `kernel/src/arch/<arch>/registers.rs` (exposed neutrally as `crate::arch::RegisterValues`, read via the `ArchRegisters` trait), not in `libkern`, because the register set itself is arch-specific. **An ABI-version-hash input** (a cross-boundary layout, like `SpawnArgs` / `ThreadArgs`); its hashed layout is the active architecture's.
+- `RegisterValues`: `#[repr(C)]` snapshot a faulted thread's registers are read into by `sys_thread_get_registers`. On x86_64: 18 `u64`s = the 16 GPRs in the order `rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8..r15` (offsets 0–120), then `rip` (offset 128) and `rflags` (offset 136); 144 bytes, 8-aligned. aarch64 will define its own ordering when that arch lands. **This is a per-architecture type** — it lives behind the arch boundary in `kernel/src/arch/<arch>/registers.rs` (exposed neutrally as `crate::arch::RegisterValues`, decoded by the arch's fault path and copied into the `Thread` as it suspends), not in `libkern`, because the register set itself is arch-specific. **An ABI-version-hash input** (a cross-boundary layout, like `SpawnArgs` / `ThreadArgs`); its hashed layout is the active architecture's.
 
 ## Stability
 

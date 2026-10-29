@@ -1248,11 +1248,11 @@ fn stub_start_fill(file_obj: &ObjectRef, index: usize, frame: PhysAddr, po: &Obj
         Err(_) => return false,
     };
     let bx_ptr = KBox::into_raw(bx).as_ptr();
-    // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned box; point its DPC at
-    // itself (now that it has a stable address) and queue it.
+    // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned box; point its DPC at itself (now that
+    // it has a stable address) and queue it. The box lives until that DPC's handler frees it.
     unsafe {
         (*bx_ptr).dpc = Dpc::new(stub_fill_dpc, bx_ptr as *mut ());
-        crate::dpc::enqueue(&(*bx_ptr).dpc);
+        crate::dpc::enqueue_raw(NonNull::new_unchecked(&raw mut (*bx_ptr).dpc));
     }
     true
 }

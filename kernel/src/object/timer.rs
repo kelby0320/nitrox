@@ -17,7 +17,8 @@ use crate::sched::{SlotHold, Slots};
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, KVec};
+use crate::libkern::{AllocError, ArrayVec, KBox};
+use crate::object::WaitQueue;
 use crate::object::header::KObjectHeader;
 
 /// A timer kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
@@ -38,8 +39,8 @@ struct TimerInner {
     /// `true` while this timer has a live entry in the scheduler deadline heap.
     in_heap: bool,
     /// Blocked threads, non-owning (each is kept alive by its own parked `ObjectRef` and removed
-    /// from here before it unparks); pre-reserved to [`Timer::MAX_WAITERS`].
-    waiters: KVec<*mut ()>,
+    /// from here before it unparks); at most [`Timer::MAX_WAITERS`].
+    waiters: WaitQueue<{ Timer::MAX_WAITERS }>,
 }
 
 // SAFETY: identical reasoning to `ObjectRef`/`Thread` — the header refcount is
@@ -53,19 +54,22 @@ impl Timer {
     /// Sentinel written into [`Timer::magic`] at construction.
     pub const MAGIC: u64 = 0x54_69_6d_65_72_21_21_21; // "Timer!!!"
 
-    /// Maximum simultaneous waiters; the reserve keeps `add_waiter` from allocating under `SCHED`.
+    /// Maximum simultaneous waiters.
     pub const MAX_WAITERS: usize = 4;
 
-    /// Allocate an unarmed `Timer` (refcount one), reserving the waiter vector and its slot in
-    /// the deadline heap up front.
+    /// Allocate an unarmed `Timer` (refcount one), reserving its slot in the deadline heap up
+    /// front.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         let slot = SlotHold::reserve(Slots::Timer)?;
-        let mut waiters: KVec<*mut ()> = KVec::new();
-        waiters.try_reserve(Self::MAX_WAITERS)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Timer),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(TimerInner { deadline_ns: 0, interval_ns: 0, in_heap: false, waiters }),
+            inner: UnsafeCell::new(TimerInner {
+                deadline_ns: 0,
+                interval_ns: 0,
+                in_heap: false,
+                waiters: WaitQueue::new(),
+            }),
             _slot: slot,
         })
     }
@@ -153,18 +157,7 @@ impl Timer {
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if inner.waiters.len() < Self::MAX_WAITERS {
-            inner
-                .waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`, and `try_push`
-                // grows, which is `kmalloc` under the rank-1 lock. Construction reserves
-                // `MAX_WAITERS`, so `len < MAX ⟹ len < cap`; the type should say so.
-                .push_within_capacity(thread)
-                .expect("within reserved waiter capacity");
-            Ok(())
-        } else {
-            Err(())
-        }
+        inner.waiters.add(thread)
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
@@ -175,9 +168,7 @@ impl Timer {
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if let Some(i) = inner.waiters.iter().position(|&w| w == thread) {
-            inner.waiters.remove(i);
-        }
+        inner.waiters.remove(thread);
     }
 
     /// `true` iff the timer is armed and its deadline is at or before `now`, or it is a one-shot
@@ -194,21 +185,15 @@ impl Timer {
         inner.deadline_ns != 0 && (inner.deadline_ns <= now_ns || fired)
     }
 
-    /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
+    /// Take every waiter, leaving none.
     ///
     /// # Safety
     ///
     /// See the accessor contract.
-    pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { Timer::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        let n = inner.waiters.len();
-        debug_assert!(out.len() >= n);
-        for (i, &w) in inner.waiters.iter().enumerate() {
-            out[i] = w;
-        }
-        inner.waiters.clear();
-        n
+        inner.waiters.take()
     }
 }
 
@@ -278,11 +263,8 @@ mod tests {
             assert!(Timer::add_waiter(obj, 0xDEAD as *mut ()).is_err());
             Timer::remove_waiter(obj, ths[1]);
             assert!(Timer::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
-            let mut buf = [core::ptr::null_mut(); Timer::MAX_WAITERS];
-            let n = Timer::take_waiters(obj, &mut buf);
-            assert_eq!(n, Timer::MAX_WAITERS);
-            let mut buf2 = [core::ptr::null_mut(); Timer::MAX_WAITERS];
-            assert_eq!(Timer::take_waiters(obj, &mut buf2), 0);
+            assert_eq!(&Timer::take_waiters(obj)[..], &[ths[0], ths[2], ths[3], 0xBEEF as *mut ()]);
+            assert!(Timer::take_waiters(obj).is_empty());
             drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));
         }
     }

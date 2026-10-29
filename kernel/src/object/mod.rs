@@ -32,6 +32,7 @@ pub mod system_control;
 pub mod thread;
 pub mod timer;
 pub mod userspace_server;
+pub mod wait_queue;
 
 pub use device_node::DeviceNode;
 pub use entropy_object::EntropyObject;
@@ -49,3 +50,4 @@ pub use system_control::SystemControl;
 pub use thread::{MAX_WAIT_HANDLES, SchedClass, Thread, ThreadEntry, ThreadState, WaitPhase};
 pub use timer::Timer;
 pub use userspace_server::UserspaceServerReg;
+pub(crate) use wait_queue::WaitQueue;

@@ -17,8 +17,9 @@
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
-use crate::libkern::{AllocError, KBox, KVec};
+use crate::libkern::{AllocError, ArrayVec, KBox};
 use crate::object::ObjectRef;
+use crate::object::WaitQueue;
 use crate::object::header::KObjectHeader;
 
 /// A pending-operation kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
@@ -41,8 +42,8 @@ struct PendingOpInner {
     /// `0` for status-only completions.
     result: u64,
     /// Blocked threads, non-owning (each is kept alive by its own parked `ObjectRef` and removed
-    /// from here before it unparks); pre-reserved to [`PendingOperation::MAX_WAITERS`].
-    waiters: KVec<*mut ()>,
+    /// from here before it unparks); at most [`PendingOperation::MAX_WAITERS`].
+    waiters: WaitQueue<{ PendingOperation::MAX_WAITERS }>,
     /// A lookup's resolved object, until a reader installs it: the handle is made when `sys_wait`
     /// reports the completion, so a PO freed unread releases the object and leaves no handle.
     parked: Option<(ObjectRef, Rights)>,
@@ -61,14 +62,11 @@ impl PendingOperation {
     /// Sentinel written into [`PendingOperation::magic`] at construction.
     pub const MAGIC: u64 = 0x50_65_6e_64_4f_70_21_21; // "PendOp!!"
 
-    /// Maximum simultaneous waiters; the reserve keeps `add_waiter` from allocating under
-    /// `SCHED`. A PO almost always has one (the submitter).
+    /// Maximum simultaneous waiters. A PO almost always has one (the submitter).
     pub const MAX_WAITERS: usize = 4;
 
-    /// Allocate an unsignalled `PendingOperation` (refcount one), reserving waiters up front.
+    /// Allocate an unsignalled `PendingOperation` (refcount one).
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
-        let mut waiters: KVec<*mut ()> = KVec::new();
-        waiters.try_reserve(Self::MAX_WAITERS)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::PendingOperation),
             magic: Self::MAGIC,
@@ -76,7 +74,7 @@ impl PendingOperation {
                 signaled: false,
                 status: 0,
                 result: 0,
-                waiters,
+                waiters: WaitQueue::new(),
                 parked: None,
                 installing: false,
             }),
@@ -195,18 +193,7 @@ impl PendingOperation {
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
         // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if inner.waiters.len() < Self::MAX_WAITERS {
-            inner
-                .waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`, and `try_push`
-                // grows, which is `kmalloc` under the rank-1 lock. Construction reserves
-                // `MAX_WAITERS`, so `len < MAX ⟹ len < cap`; the type should say so.
-                .push_within_capacity(thread)
-                .expect("within reserved waiter capacity");
-            Ok(())
-        } else {
-            Err(())
-        }
+        inner.waiters.add(thread)
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
@@ -216,25 +203,17 @@ impl PendingOperation {
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
         // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if let Some(i) = inner.waiters.iter().position(|&w| w == thread) {
-            inner.waiters.remove(i);
-        }
+        inner.waiters.remove(thread);
     }
 
-    /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
+    /// Take every waiter, leaving none.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { PendingOperation::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        let n = inner.waiters.len();
-        debug_assert!(out.len() >= n);
-        for (i, &w) in inner.waiters.iter().enumerate() {
-            out[i] = w;
-        }
-        inner.waiters.clear();
-        n
+        inner.waiters.take()
     }
 }
 
@@ -335,10 +314,8 @@ mod tests {
             assert!(PendingOperation::add_waiter(obj, 0xDEAD as *mut ()).is_err());
             PendingOperation::remove_waiter(obj, ths[1]);
             assert!(PendingOperation::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
-            let mut buf = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
-            assert_eq!(PendingOperation::take_waiters(obj, &mut buf), PendingOperation::MAX_WAITERS);
-            let mut buf2 = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
-            assert_eq!(PendingOperation::take_waiters(obj, &mut buf2), 0);
+            assert_eq!(&PendingOperation::take_waiters(obj)[..], &[ths[0], ths[2], ths[3], 0xBEEF as *mut ()]);
+            assert!(PendingOperation::take_waiters(obj).is_empty());
         }
         free(obj);
     }

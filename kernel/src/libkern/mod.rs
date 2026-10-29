@@ -12,6 +12,7 @@
 //! [`KVec`], and [`KString`] call the slab allocator directly and report exhaustion as
 //! [`AllocError`]. See the decision log entry of 2026-05-20.
 
+pub mod arrayvec;
 pub mod block;
 pub mod chacha;
 pub mod clock;
@@ -30,12 +31,14 @@ pub mod memory;
 pub mod notification;
 pub mod power;
 pub mod printable;
+pub mod reserved;
 pub mod spawn;
 pub mod spinlock;
 pub mod syscaps;
 pub mod thread;
 pub mod timer_flags;
 
+pub use arrayvec::ArrayVec;
 pub use chacha::ChaCha20Rng;
 pub use clock::ClockId;
 pub use handle::{KObjectType, RawHandle, Rights};
@@ -47,6 +50,7 @@ pub use kstring::KString;
 pub use kvec::KVec;
 pub use memory::MemFlags;
 pub use notification::{ExitKind, ExitStatus, FaultKind, Notification};
+pub use reserved::Reserved;
 pub use spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
 pub use spinlock::{IrqSpinLock, IrqSpinLockGuard, SpinLock, SpinLockGuard};
 pub use syscaps::SysCaps;

@@ -27,7 +27,7 @@ UEFI firmware (OVMF under QEMU)
               ├─ initramfs module registered
               ├─ platform discovery (ACPI: PCIe ECAM, interrupt routing)
               ├─ local APIC (x2APIC), TSC + LAPIC timer calibration
-              ├─ DPC queue, interrupt router (IOAPIC)
+              ├─ interrupt router (IOAPIC)
               ├─ global handle table
               ├─ scheduler, then AP bring-up (SMP)
               └─► first userspace process
@@ -246,7 +246,7 @@ each step's rationale is in the source comments:
 7. **Platform discovery** — ACPI on x86_64: the PCIe ECAM window and the interrupt-routing
    topology. Missing or malformed tables are logged, not fatal.
 8. **Local APIC** (x2APIC), then **TSC + LAPIC timer calibration** against the legacy PIT.
-9. **DPC queue**, then the **interrupt router** (IOAPIC).
+9. **The interrupt router** (IOAPIC). The DPC queue it reaches needs no setup: it is a static.
 10. **Global handle table.**
 11. **Scheduler** (`sched_bringup`), then **AP bring-up** (`bring_up_aps`) via Limine's SMP
     response — capped at `MAX_CPUS`, extras left parked (a supported configuration, not a

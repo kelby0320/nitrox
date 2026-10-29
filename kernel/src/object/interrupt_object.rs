@@ -10,7 +10,8 @@
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, KVec};
+use crate::libkern::{AllocError, ArrayVec, KBox};
+use crate::object::WaitQueue;
 use crate::object::header::KObjectHeader;
 
 /// A hardware-interrupt waitable (`#[repr(C)]`, [`KObjectHeader`] first).
@@ -26,7 +27,7 @@ struct InterruptInner {
     /// Pending unconsumed interrupts (saturating); `> 0` ⇒ the waitable is signaled.
     pending: u32,
     /// Blocked threads, non-owning (each is kept alive by its own parked `ObjectRef`).
-    waiters: KVec<*mut ()>,
+    waiters: WaitQueue<{ InterruptObject::MAX_WAITERS }>,
 }
 
 // SAFETY: identical reasoning to `PendingOperation` — the header refcount is
@@ -40,18 +41,15 @@ impl InterruptObject {
     /// Sentinel written into [`InterruptObject::magic`] at construction.
     pub const MAGIC: u64 = 0x49_6e_74_72_4f_62_6a_21; // "IntrObj!"
 
-    /// Maximum simultaneous waiters; a device IRQ almost always has one. The reserve bounds
-    /// `add_waiter` so it never allocates under `SCHED`.
+    /// Maximum simultaneous waiters; a device IRQ almost always has one.
     pub const MAX_WAITERS: usize = 4;
 
     /// Allocate an unsignalled `InterruptObject` with a refcount of one.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
-        let mut waiters: KVec<*mut ()> = KVec::new();
-        waiters.try_reserve(Self::MAX_WAITERS)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::InterruptObject),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(InterruptInner { pending: 0, waiters }),
+            inner: UnsafeCell::new(InterruptInner { pending: 0, waiters: WaitQueue::new() }),
         })
     }
 
@@ -116,18 +114,7 @@ impl InterruptObject {
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
         // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if inner.waiters.len() < Self::MAX_WAITERS {
-            inner
-                .waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`, and `try_push`
-                // grows, which is `kmalloc` under the rank-1 lock. Construction reserves
-                // `MAX_WAITERS`, so `len < MAX ⟹ len < cap`; the type should say so.
-                .push_within_capacity(thread)
-                .expect("within reserved waiter capacity");
-            Ok(())
-        } else {
-            Err(())
-        }
+        inner.waiters.add(thread)
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
@@ -137,25 +124,17 @@ impl InterruptObject {
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
         // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if let Some(i) = inner.waiters.iter().position(|&w| w == thread) {
-            inner.waiters.remove(i);
-        }
+        inner.waiters.remove(thread);
     }
 
-    /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
+    /// Take every waiter, leaving none.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { InterruptObject::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        let n = inner.waiters.len();
-        debug_assert!(out.len() >= n);
-        for (i, &w) in inner.waiters.iter().enumerate() {
-            out[i] = w;
-        }
-        inner.waiters.clear();
-        n
+        inner.waiters.take()
     }
 }
 
@@ -220,10 +199,7 @@ mod tests {
             assert!(InterruptObject::add_waiter(p, t1).is_ok());
             assert!(InterruptObject::add_waiter(p, t2).is_ok());
             InterruptObject::remove_waiter(p, t1);
-            let mut buf = [core::ptr::null_mut(); InterruptObject::MAX_WAITERS];
-            let n = InterruptObject::take_waiters(p, &mut buf);
-            assert_eq!(n, 1);
-            assert_eq!(buf[0], t2);
+            assert_eq!(&InterruptObject::take_waiters(p)[..], &[t2]);
         }
         // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
         drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });

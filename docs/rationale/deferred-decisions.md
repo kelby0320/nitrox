@@ -2427,6 +2427,17 @@ is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware
 CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
 survive rather than merely diagnose.
 
+**Four provenance tests fail only under Miri, which no CI job runs — `TODO(miri-provenance-tests)`.**
+Each pins a pointer derived so that a later borrow cannot retire it (2026-10-29), and natively it
+passes on the old code as on the new, since the hardware cannot see provenance. Run by hand, from
+`kernel/` with `cargo +nightly-2026-07-20 miri test --lib --target x86_64-unknown-linux-gnu` and
+`MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-ignore-leaks'`:
+`the_fpu_area_pointer_may_be_written_through`, `a_disk_over_its_own_bytes_writes_and_reads_them_back`
+and `an_endpoint_holding_another_in_a_held_send_is_refused_too`; and libheap's, from
+`userspace/libheap/` with `cargo miri test --target x86_64-unknown-linux-gnu` and
+`MIRIFLAGS='-Zmiri-strict-provenance'`. Trigger: Part I's Miri job
+(`docs/planning/pre-phase-7.md` § Part I, scheduled and by hand), which takes them on.
+
 **`libkern` mock-syscall test mode.** `userspace/libkern/CLAUDE.md` describes a feature-flagged mock that records and replays syscalls for host-side tests of layers above. The crate is a `cargo new` placeholder in Phase 0. Trigger: real syscalls are defined.
 
 ### Auditing and observability

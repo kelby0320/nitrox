@@ -213,6 +213,7 @@ pub(crate) fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_display_selftest(&transcript)?;
             check_ahci_msi_path(&transcript)?;
             check_block_read_selftest(&transcript)?;
+            check_reclaim_selftest(&transcript)?;
             check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
             check_servers_are_service_mgrs(&transcript)?;
@@ -434,6 +435,17 @@ fn check_block_read_selftest(transcript: &[u8]) -> R<()> {
     Err("the AHCI read self-test did not run — expected an \"ahci: read self-test\" line in \
          the transcript. It is skipped when no block device was discovered, or when the probe \
          could not allocate its buffer."
+        .into())
+}
+
+/// Assert that the kernel's reclaim-under-load self-test ran: a boot that skipped it passes.
+fn check_reclaim_selftest(transcript: &[u8]) -> R<()> {
+    if String::from_utf8_lossy(transcript).contains("io: reclaim-under-load self-test OK") {
+        println!("xtask: completed IRPs stayed bounded with every CPU busy ✓");
+        return Ok(());
+    }
+    Err("the kernel's reclaim-under-load self-test printed no OK line: it runs in every \
+         test-harness boot, after the APs come up, and a failure panics with its reason"
         .into())
 }
 

@@ -15,7 +15,8 @@
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, KVec, Notification};
+use crate::libkern::{AllocError, ArrayVec, KBox, Notification, Reserved};
+use crate::object::WaitQueue;
 use crate::object::header::KObjectHeader;
 
 /// A per-process notification queue (`#[repr(C)]`, [`KObjectHeader`] first).
@@ -29,13 +30,13 @@ pub struct NotificationChannel {
 
 struct Inner {
     /// FIFO of pending notifications; pre-reserved to [`NotificationChannel::QUEUE_CAP`].
-    queue: KVec<Notification>,
+    queue: Reserved<Notification>,
     /// Notifications dropped on overflow; surfaced as a synthetic `NotificationsDropped` on the
     /// next recv.
     dropped: u32,
-    /// Blocked threads (type-erased, non-owning, removed before a waiter unparks); reserved to
+    /// Blocked threads (type-erased, non-owning, removed before a waiter unparks); at most
     /// [`NotificationChannel::MAX_WAITERS`].
-    waiters: KVec<*mut ()>,
+    waiters: WaitQueue<{ NotificationChannel::MAX_WAITERS }>,
 }
 
 // SAFETY: identical reasoning to `Timer`/`ObjectRef` — the header refcount is
@@ -52,20 +53,16 @@ impl NotificationChannel {
     /// Bounded queue depth (default per `docs/spec/notification-format.md`).
     pub const QUEUE_CAP: usize = 64;
 
-    /// Maximum simultaneous waiters; the reserve keeps `add_waiter` from allocating under
-    /// `SCHED`.
+    /// Maximum simultaneous waiters.
     pub const MAX_WAITERS: usize = 4;
 
-    /// Allocate an empty channel (refcount one), reserving queue and waiters up front.
+    /// Allocate an empty channel (refcount one), reserving its queue up front.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
-        let mut queue: KVec<Notification> = KVec::new();
-        queue.try_reserve(Self::QUEUE_CAP)?;
-        let mut waiters: KVec<*mut ()> = KVec::new();
-        waiters.try_reserve(Self::MAX_WAITERS)?;
+        let queue = Reserved::with_capacity(Self::QUEUE_CAP)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::NotificationChannel),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(Inner { queue, dropped: 0, waiters }),
+            inner: UnsafeCell::new(Inner { queue, dropped: 0, waiters: WaitQueue::new() }),
         })
     }
 
@@ -104,14 +101,13 @@ impl NotificationChannel {
         // "Signaled" is queue non-empty or a drop pending; report the edge to avoid a double wake.
         let was_signaled = !inner.queue.is_empty() || inner.dropped > 0;
         if inner.queue.len() < Self::QUEUE_CAP {
-            // Non-growing: under `SCHED`, `try_push` would `kmalloc`. `QUEUE_CAP` is reserved at
-            // construction, so this cannot refuse.
-            let _ = inner.queue.push_within_capacity(n);
+            // `QUEUE_CAP` is reserved at construction, so this cannot refuse.
+            let _ = inner.queue.push(n);
         } else if n.is_exception() {
             // Evict the oldest non-exception entry to keep fault info.
             if let Some(i) = inner.queue.iter().position(|e| !e.is_exception()) {
                 inner.queue.remove(i);
-                let _ = inner.queue.push_within_capacity(n);
+                let _ = inner.queue.push(n);
             } else {
                 // All exceptions and full: count the drop rather than grow or lose it silently.
                 inner.dropped = inner.dropped.saturating_add(1);
@@ -155,18 +151,7 @@ impl NotificationChannel {
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
         // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if inner.waiters.len() < Self::MAX_WAITERS {
-            inner
-                .waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`, and
-                // `try_push` grows, which is `kmalloc` under the rank-1 lock. Construction
-                // reserves `MAX_WAITERS`, so `len < MAX ⟹ len < cap`; the type should say so.
-                .push_within_capacity(thread)
-                .expect("within reserved waiter capacity");
-            Ok(())
-        } else {
-            Err(())
-        }
+        inner.waiters.add(thread)
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
@@ -176,25 +161,17 @@ impl NotificationChannel {
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
         // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if let Some(i) = inner.waiters.iter().position(|&w| w == thread) {
-            inner.waiters.remove(i);
-        }
+        inner.waiters.remove(thread);
     }
 
-    /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
+    /// Take every waiter, leaving none.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { NotificationChannel::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        let n = inner.waiters.len();
-        debug_assert!(out.len() >= n);
-        for (i, &w) in inner.waiters.iter().enumerate() {
-            out[i] = w;
-        }
-        inner.waiters.clear();
-        n
+        inner.waiters.take()
     }
 }
 
@@ -327,10 +304,8 @@ mod tests {
             assert!(NotificationChannel::add_waiter(obj, 0xDEAD as *mut ()).is_err());
             NotificationChannel::remove_waiter(obj, ths[0]);
             assert!(NotificationChannel::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
-            let mut buf = [core::ptr::null_mut(); NotificationChannel::MAX_WAITERS];
-            assert_eq!(NotificationChannel::take_waiters(obj, &mut buf), NotificationChannel::MAX_WAITERS);
-            let mut buf2 = [core::ptr::null_mut(); NotificationChannel::MAX_WAITERS];
-            assert_eq!(NotificationChannel::take_waiters(obj, &mut buf2), 0);
+            assert_eq!(&NotificationChannel::take_waiters(obj)[..], &[ths[1], ths[2], ths[3], 0xBEEF as *mut ()]);
+            assert!(NotificationChannel::take_waiters(obj).is_empty());
         }
         drop_chan(obj);
     }

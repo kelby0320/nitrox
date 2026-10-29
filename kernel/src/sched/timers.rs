@@ -79,10 +79,9 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
 /// Fire one timer: signal + wake all its waiters, then re-arm if periodic. Caller holds
 /// `SCHED`.
 fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
-    let mut buf = [core::ptr::null_mut(); Timer::MAX_WAITERS];
     // SAFETY: live Timer, `SCHED` held — drains its waiter list.
-    let n = unsafe { Timer::take_waiters(timer, &mut buf) };
-    for &th in &buf[..n] {
+    let waiters = unsafe { Timer::take_waiters(timer) };
+    for &th in waiters.iter() {
         // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
         // `blocked`; `SCHED` held. Mark this timer's slot signaled, then claim
         // the thread for wakeup (CAS); the first claimer makes it runnable.

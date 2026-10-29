@@ -123,14 +123,16 @@ const _: () = assert!(core::mem::offset_of!(ExceptionFrame, rip) == 17 * 8);
 /// It is every interrupt's way back to ring 3, so it ends a thread whose process is exiting there
 /// ([`crate::sched::end_if_ending`]); the body is a function of its own, so a `return` comes back.
 macro_rules! irq_dispatcher {
-    ($(#[$attr:meta])* fn $name:ident($frame:ident: *mut ExceptionFrame) $body:block) => {
+    ($(#[$attr:meta])* fn $name:ident($frame:ident: &mut ExceptionFrame) $body:block) => {
         $(#[$attr])*
         extern "C" fn $name($frame: *mut ExceptionFrame) {
             let _lock_scope = crate::libkern::lockrank::enter_interrupt();
-            fn body($frame: *mut ExceptionFrame) $body
-            body($frame);
+            fn body($frame: &mut ExceptionFrame) $body
+            // SAFETY: the naked stub built a complete `ExceptionFrame` at the stack top and passed
+            // its address in RDI: valid, 8-byte aligned, and not aliased for the body's call.
+            body(unsafe { &mut *$frame });
             // SAFETY: the stub-built frame in RDI, valid for this call.
-            if unsafe { (*$frame).cs } & 3 == 3 {
+            if ends_on_return(unsafe { &*$frame }) {
                 crate::sched::end_if_ending();
             }
         }
@@ -259,13 +261,8 @@ extern "C" fn vec14() {
 irq_dispatcher! {
 /// `#PF` dispatcher. Looks up the faulting RIP in the user-access exception table; on a match,
 /// patches `frame.rip` to the recovery PC and returns so the stub can `iretq` to it. On a
-/// miss, calls [`dump_and_halt`]. `*mut ExceptionFrame` because recovery writes the new RIP
-/// in place.
-fn pf_dispatch(frame: *mut ExceptionFrame) {
-    // SAFETY: the naked stub built a complete `ExceptionFrame` at the
-    // stack top and passed its address in RDI. It is valid, 8-byte
-    // aligned, and not aliased for the duration of this call.
-    let f = unsafe { &mut *frame };
+/// miss, calls [`dump_and_halt`]. `&mut` because recovery writes the new RIP in place.
+fn pf_dispatch(f: &mut ExceptionFrame) {
     debug_assert_eq!(f.vector, 14);
 
     if let Some(recovery) = crate::mm::user_access::lookup_recovery(f.rip) {
@@ -377,7 +374,7 @@ irq_dispatcher! {
 /// return to this frame for a long time, and a late EOI would block all further timer delivery.
 /// Runs with IF=0, so it never nests and may take the interrupt-safe run-queue lock. The frame
 /// is unused.
-fn timer_dispatch(_frame: *mut ExceptionFrame) {
+fn timer_dispatch(_frame: &mut ExceptionFrame) {
     // Sample interrupt-timing jitter first, before the EOI/DPC/tick work perturbs it.
     crate::entropy::on_irq_sample(regs::rdtsc());
     // SAFETY: ring-0, only ever reached from the timer IRQ after `Irq::init`
@@ -412,7 +409,7 @@ extern "C" fn tlb_shootdown_stub() {
 irq_dispatcher! {
 /// TLB-shootdown IPI dispatcher: invalidate and acknowledge (in [`crate::tlb`]), then EOI.
 /// The frame is unused. Its body never reschedules or blocks.
-fn tlb_shootdown_dispatch(_frame: *mut ExceptionFrame) {
+fn tlb_shootdown_dispatch(_frame: &mut ExceptionFrame) {
     crate::tlb::on_ipi();
     // SAFETY: ring-0 IPI context; a single write acknowledges the local APIC.
     // `Irq::init` has run on this CPU (IPIs arrive only after bring-up).
@@ -439,7 +436,7 @@ irq_dispatcher! {
 /// Reschedule IPI dispatcher: EOI **first** (the scheduler may switch away and not return
 /// promptly, so a late EOI would stall further IPIs), then drive the scheduler. The frame is
 /// unused.
-fn reschedule_ipi_dispatch(_frame: *mut ExceptionFrame) {
+fn reschedule_ipi_dispatch(_frame: &mut ExceptionFrame) {
     // SAFETY: ring-0 IPI context; a single write acknowledges the local APIC.
     unsafe { crate::arch::Irq::eoi() };
     crate::sched::on_reschedule_ipi();
@@ -465,11 +462,10 @@ static NEXT_DEVICE_SLOT: AtomicUsize = AtomicUsize::new(0);
 irq_dispatcher! {
 /// Shared dispatcher for every device-IRQ vector: runs the registered handler, then signals
 /// end-of-interrupt to the local controller.
-fn device_irq_dispatch(frame: *mut ExceptionFrame) {
+fn device_irq_dispatch(frame: &mut ExceptionFrame) {
     crate::entropy::on_irq_sample(regs::rdtsc());
-    // SAFETY: `frame` is the stub-built `ExceptionFrame` in RDI; `vector` is the
-    // immediate the stub pushed, always in `DEVICE_IRQ_BASE..+COUNT`.
-    let vector = unsafe { (*frame).vector } as usize;
+    // `vector` is the immediate the stub pushed, always in `DEVICE_IRQ_BASE..+COUNT`.
+    let vector = frame.vector as usize;
     let slot = vector.wrapping_sub(DEVICE_IRQ_BASE as usize);
     if slot < DEVICE_IRQ_COUNT {
         let h = DEVICE_HANDLERS[slot].load(Ordering::Acquire);
@@ -598,26 +594,46 @@ fn stop_notice() -> ! {
 irq_dispatcher! {
 /// Common handler for every CPU exception except `#PF`. A **ring-3** fault suspends the
 /// thread and acts on the supervisor's disposition via [`user_fault`]: it returns on `Resume`
-/// (the stub `iretq`s the unmodified frame) or diverges on `Terminate`. A **ring-0** fault is
-/// fatal ([`dump_and_halt`]).
-fn exception_dispatch(frame: *mut ExceptionFrame) {
-    // SAFETY: the naked stub built a complete `ExceptionFrame` at the
-    // stack top and passed its address in RDI. It is valid, 8-byte
-    // aligned, and not aliased for the duration of this call.
-    let f = unsafe { &mut *frame };
-    // The stop notice, before anything else: an NMI while `STOPPING` is set is this CPU being
-    // told the machine is going down. Checked ahead of the ring test because the CPUs most
-    // worth stopping are in ring 0, spinning on a lock the faulting CPU holds; the generic
-    // ring-0 path would send each through `dump_and_halt` and bury the diagnosis.
-    if is_stop_notice(f.vector, STOPPING.load(Ordering::Acquire)) {
-        stop_notice();
+/// (the stub `iretq`s the unmodified frame) or diverges on `Terminate`. A ring-3 NMI returns; a
+/// ring-3 #DF, whose saved CS and RIP are undefined, and a **ring-0** fault are fatal
+/// ([`dump_and_halt`]).
+fn exception_dispatch(f: &mut ExceptionFrame) {
+    match taken(f, STOPPING.load(Ordering::Acquire)) {
+        Taken::Stop => stop_notice(),
+        Taken::UserFault => user_fault(f, None),
+        Taken::UserNmi => crate::kprintln!("nmi: from ring 3 at rip {:#x}; resumed", f.rip),
+        Taken::Fatal => dump_and_halt(f),
     }
-    if is_user_fault(f) {
-        user_fault(f, None);
-        return;
-    }
-    dump_and_halt(f);
 }
+}
+
+/// What [`exception_dispatch`] does with an exception.
+#[derive(Debug, PartialEq, Eq)]
+enum Taken {
+    Stop,
+    UserFault,
+    UserNmi,
+    Fatal,
+}
+
+/// How an exception is taken, `stopping` the machine or not. **The stop is decided first**: the
+/// CPUs most worth stopping spin in ring 0 on a lock the faulting CPU holds.
+fn taken(f: &ExceptionFrame, stopping: bool) -> Taken {
+    if is_stop_notice(f.vector, stopping) {
+        Taken::Stop
+    } else if is_user_fault(f) {
+        Taken::UserFault
+    } else if is_user_nmi(f) {
+        Taken::UserNmi
+    } else {
+        Taken::Fatal
+    }
+}
+
+/// Whether an interrupt's return may end its thread: from ring 3, and not on an IST stack, which the
+/// next NMI or #DF reuses.
+fn ends_on_return(f: &ExceptionFrame) -> bool {
+    f.cs & 3 == 3 && ist_slot(f.vector) == 0
 }
 
 /// Shared ring-3 fault handler: suspend the thread with a fault [`Notification`], then act on
@@ -625,8 +641,7 @@ fn exception_dispatch(frame: *mut ExceptionFrame) {
 /// `Resume` returns and the instruction retries. `cr2` is the faulting address for `#PF`.
 fn user_fault(f: &mut ExceptionFrame, cr2: Option<u64>) {
     let notif = notif_for_vector(f, cr2);
-    let frame_ptr = f as *mut ExceptionFrame as usize;
-    match crate::sched::suspend_with_fault(frame_ptr, notif) {
+    match crate::sched::suspend_with_fault(registers_of(f), notif) {
         crate::sched::ResumeDisposition::Terminate(code) => {
             crate::sched::exit_thread(crate::libkern::ExitStatus {
                 kind: crate::libkern::ExitKind::Crashed as u32,
@@ -637,42 +652,48 @@ fn user_fault(f: &mut ExceptionFrame, cr2: Option<u64>) {
     }
 }
 
-/// Reads a suspended thread's user registers out of the private [`ExceptionFrame`]; the impl
-/// lives here so the frame stays private (behind `sys_thread_get_registers`).
-impl crate::arch::registers::ArchRegisters for super::registers::X86Registers {
-    type Values = RegisterValues;
-
-    fn read_from_exception_frame(frame_ptr: usize) -> RegisterValues {
-        // SAFETY: `frame_ptr` is the kernel-stack address of a suspended
-        // thread's `ExceptionFrame` (the thread stays parked while suspended, so
-        // the frame is stable); read-only, 8-byte aligned. The caller pins the
-        // thread.
-        let f = unsafe { &*(frame_ptr as *const ExceptionFrame) };
-        RegisterValues {
-            rax: f.rax,
-            rbx: f.rbx,
-            rcx: f.rcx,
-            rdx: f.rdx,
-            rsi: f.rsi,
-            rdi: f.rdi,
-            rbp: f.rbp,
-            rsp: f.rsp,
-            r8: f.r8,
-            r9: f.r9,
-            r10: f.r10,
-            r11: f.r11,
-            r12: f.r12,
-            r13: f.r13,
-            r14: f.r14,
-            r15: f.r15,
-            rip: f.rip,
-            rflags: f.rflags,
-        }
+/// The user registers captured in `f`.
+fn registers_of(f: &ExceptionFrame) -> RegisterValues {
+    RegisterValues {
+        rax: f.rax,
+        rbx: f.rbx,
+        rcx: f.rcx,
+        rdx: f.rdx,
+        rsi: f.rsi,
+        rdi: f.rdi,
+        rbp: f.rbp,
+        rsp: f.rsp,
+        r8: f.r8,
+        r9: f.r9,
+        r10: f.r10,
+        r11: f.r11,
+        r12: f.r12,
+        r13: f.r13,
+        r14: f.r14,
+        r15: f.r15,
+        rip: f.rip,
+        rflags: f.rflags,
     }
 }
 
+/// The IST slot `vector` is delivered on: #DF on IST1, NMI on IST2 (see [`init`]).
+const fn ist_slot(vector: u64) -> u8 {
+    match vector {
+        8 => 1,
+        2 => 2,
+        _ => 0,
+    }
+}
+
+/// A fault from ring 3, delivered on the thread's own kernel stack: one the thread may park on.
+/// An NMI or #DF arrives on a per-CPU IST stack, which the next one reuses.
 fn is_user_fault(f: &ExceptionFrame) -> bool {
-    f.cs & 3 == 3
+    f.cs & 3 == 3 && ist_slot(f.vector) == 0
+}
+
+/// An NMI that is not a stop notice, taken in ring 3, where this CPU holds no kernel lock.
+fn is_user_nmi(f: &ExceptionFrame) -> bool {
+    f.vector == 2 && f.cs & 3 == 3
 }
 
 fn notif_for_vector(f: &ExceptionFrame, cr2: Option<u64>) -> Notification {
@@ -875,12 +896,7 @@ pub fn init() {
         // `pop rsp` and `sysretq`; there a `cli` masks `IF`, but `cli` does not mask NMI, so IST2
         // is again the only cover. SFMASK alone does not make IST2 redundant: it reaches only the
         // entry half.
-        let ist = match vector {
-            8 => 1,
-            2 => 2,
-            _ => 0,
-        };
-        idt[vector].set_handler(stub as usize as u64, ist);
+        idt[vector].set_handler(stub as usize as u64, ist_slot(vector as u64));
     }
 
     // Both IST0: the timer can fire from ring 3 (landing on TSS.RSP0) or ring 0.

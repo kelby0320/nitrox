@@ -18,7 +18,6 @@ use nitrox_kernel::arch::paging::ArchPaging;
 use nitrox_kernel::arch::platform::ArchPlatform;
 use nitrox_kernel::arch::smp::ArchSmp;
 use nitrox_kernel::arch::timer::ArchTimer;
-use nitrox_kernel::dpc;
 use nitrox_kernel::fbcon;
 use nitrox_kernel::framebuffer;
 use nitrox_kernel::kprintln;
@@ -204,14 +203,6 @@ fn kernel_main() {
     match nitrox_kernel::clock::init() {
         Some(epoch) => kprintln!("wall clock: anchored at {} (Unix epoch seconds, UTC)", epoch),
         None => kprintln!("wall clock: no readable RTC — CLOCK_REALTIME stays unsupported"),
-    }
-
-    // Reserve the DPC queue before any interrupt can enqueue: the IOAPIC self-test routes the PIT,
-    // whose ISR queues a DPC. It reserves its list once (needs the allocator) and never allocates
-    // again.
-    if dpc::init().is_err() {
-        kprintln!("DPC queue init failed — halting");
-        return;
     }
 
     // The IOAPIC router, then an end-to-end self-test. After `Irq::init` (routed interrupts land on

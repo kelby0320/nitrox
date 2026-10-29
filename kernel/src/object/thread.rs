@@ -11,12 +11,13 @@
 //! [`Thread`] is shared through an [`ObjectRef`](crate::object::ObjectRef), yet the scheduler
 //! mutates `arch`, `state`, `entry` and `arg`, sound only because it does so exclusively while
 //! holding its run-queue lock. The scheduler-only accessors take a type-erased `*mut ()` and
-//! reach fields through raw pointers, never forming a `&mut Thread` that would alias the
-//! atomically-accessed [`KObjectHeader`].
+//! reach fields through raw pointers, never forming a `&Thread` or `&mut Thread` of the whole:
+//! another CPU writes a field under the lock while this one reads another, and `context_switch`
+//! writes `arch` after releasing it, so a whole-struct borrow races both.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crate::arch::{ArchFpuState, ArchThreadContext, thread_trampoline};
+use crate::arch::{ArchFpuState, ArchThreadContext, RegisterValues, thread_trampoline};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
 use crate::mm::PhysAddr;
@@ -146,9 +147,8 @@ pub struct Thread {
     wait_count: u8,
     wait_has_deadline: bool,
     wait_phase: AtomicU8,
-    /// Kernel-stack address of the `ExceptionFrame` captured when this thread faulted in ring 3
-    /// (meaningful only while `Suspended`); the supervisor reads it, the thread unwinds it.
-    exception_frame: usize,
+    /// The user registers it last faulted with, copied as it suspended; meaningful while `Suspended`.
+    fault_regs: RegisterValues,
     /// Resume disposition set by `sys_exception_resume`: `0` = Resume, `2` = Terminate.
     disp_tag: u8,
     disp_code: i32,
@@ -176,14 +176,10 @@ pub struct Thread {
     fpu: Option<KBox<ArchFpuState>>,
 }
 
-/// Allocate and initialise a thread's FP/SIMD save area to the architectural power-on state (it
-/// is restored on the first switch-in, so merely zeroed would not do).
+/// A thread's FP/SIMD save area, at the architectural power-on state: it is restored on the first
+/// switch-in.
 fn new_fpu_area() -> Result<KBox<ArchFpuState>, AllocError> {
-    let mut area = KBox::try_new(ArchFpuState::zeroed())?;
-    // SAFETY: `area` is a live, uniquely owned, correctly aligned `ArchFpuState`
-    // (`KBox` allocates at `align_of::<ArchFpuState>()` = 64).
-    unsafe { crate::arch::fpu_init_area(&raw mut *area) };
-    Ok(area)
+    KBox::try_new(ArchFpuState::initial())
 }
 
 extern "C" fn inert_entry(_arg: usize) {}
@@ -211,7 +207,7 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
+            fault_regs: RegisterValues::default(),
             disp_tag: 0,
             disp_code: 0,
             class: SchedClass::TimeShared,
@@ -248,7 +244,7 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
+            fault_regs: RegisterValues::default(),
             disp_tag: 0,
             disp_code: 0,
             class: SchedClass::TimeShared,
@@ -292,7 +288,7 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
+            fault_regs: RegisterValues::default(),
             disp_tag: 0,
             disp_code: 0,
             class: SchedClass::TimeShared,
@@ -346,7 +342,7 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
+            fault_regs: RegisterValues::default(),
             disp_tag: 0,
             disp_code: 0,
             class: SchedClass::TimeShared,
@@ -384,8 +380,9 @@ impl Thread {
 
     // SAFETY (shared by all): `obj` addresses a live `Thread` (pinned by an
     // `ObjectRef` the caller holds), and the scheduler invokes these only
-    // while holding its run-queue lock, which — single-CPU — serialises all
-    // access to these fields.
+    // while holding its run-queue lock, which serialises every access to these
+    // fields but the saved stack pointer `context_switch` writes after releasing
+    // it. Each reaches its own field through a raw place, so none races another.
 
     /// Read the scheduler lifecycle state. Test-only: production code sets it but never reads it.
     ///
@@ -566,27 +563,24 @@ impl Thread {
         unsafe { core::ptr::read(&raw const (*p).state) }
     }
 
-    /// Record the kernel-stack address of the faulting `ExceptionFrame` when this
-    /// thread suspends.
+    /// Record the registers this thread faulted with, as it suspends.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn set_exception_frame(obj: *mut (), frame: usize) {
+    pub(crate) unsafe fn set_fault_registers(obj: *mut (), regs: RegisterValues) {
         let p = obj as *mut Thread;
         // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
-        unsafe { core::ptr::write(&raw mut (*p).exception_frame, frame) }
+        unsafe { core::ptr::write(&raw mut (*p).fault_regs, regs) }
     }
 
-    /// The stored `ExceptionFrame` address, or `None` if this thread is not
-    /// suspended on a fault.
+    /// The registers this thread last faulted with: its fault's while it is `Suspended`.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn exception_frame(obj: *mut ()) -> Option<usize> {
+    pub(crate) unsafe fn fault_registers(obj: *mut ()) -> RegisterValues {
         let p = obj as *mut Thread;
         // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
-        let v = unsafe { core::ptr::read(&raw const (*p).exception_frame) };
-        if v == 0 { None } else { Some(v) }
+        unsafe { core::ptr::read(&raw const (*p).fault_regs) }
     }
 
     /// Set the resume disposition (`sys_exception_resume`): tag `0` = Resume,
@@ -603,21 +597,15 @@ impl Thread {
         }
     }
 
-    /// Read the resume disposition `(tag, code)` set by `sys_exception_resume`,
-    /// and clear the stored frame (the thread is unwinding it). Read when a
-    /// suspended thread resumes.
+    /// Read the resume disposition `(tag, code)` set by `sys_exception_resume`, when a suspended
+    /// thread resumes.
     ///
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_disposition(obj: *mut ()) -> (u8, i32) {
         let p = obj as *mut Thread;
         // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
-        unsafe {
-            let tag = core::ptr::read(&raw const (*p).disp_tag);
-            let code = core::ptr::read(&raw const (*p).disp_code);
-            core::ptr::write(&raw mut (*p).exception_frame, 0);
-            (tag, code)
-        }
+        unsafe { (core::ptr::read(&raw const (*p).disp_tag), core::ptr::read(&raw const (*p).disp_code)) }
     }
 
     /// Read the saved stack pointer of this thread's parked context.
@@ -699,11 +687,11 @@ impl Thread {
     /// already protects `saved_sp` — the FP image is part of the same parked context.
     pub(crate) unsafe fn fpu_area_ptr(obj: *mut ()) -> *mut ArchFpuState {
         let p = obj as *mut Thread;
-        // SAFETY: `obj` is a live Thread. Reading the `Option`'s payload pointer
-        // does not move or alias the box; a `None` yields null.
+        // SAFETY: `obj` is a live Thread. The pointer comes from a mutable place, since a save
+        // writes through it; it does not move or alias the box, and a `None` yields null.
         unsafe {
-            match &(*p).fpu {
-                Some(area) => &raw const **area as *mut ArchFpuState,
+            match &mut (*p).fpu {
+                Some(area) => &raw mut **area,
                 None => core::ptr::null_mut(),
             }
         }
@@ -765,17 +753,41 @@ impl Thread {
         unsafe { (*p).stack.as_ref().map(KernelStack::stack_top) }
     }
 
-    /// This thread's owning process id, or `0` for a kernel/boot thread. Raw-pointer
-    /// form of [`Thread::owner_pid`], for the scheduler's stack-watermark attribution —
-    /// a depth figure is only actionable if it names whose thread reached it.
+    /// [`Thread::owner_pid`] through a raw place: `0` for a kernel/boot thread.
     ///
     /// # Safety
     /// See the accessor contract above.
-    #[cfg(feature = "test-harness")]
     pub(crate) unsafe fn owner_pid_of(obj: *mut ()) -> u32 {
-        let p = obj as *mut Thread;
         // SAFETY: `obj` is a pinned live `Thread` under the accessor contract.
-        unsafe { (*p).owner_pid() }
+        unsafe { core::ptr::read(&raw const (*(obj as *const Thread)).owner_pid) }
+    }
+
+    /// This thread's id: [`Thread::tid`] through a raw place.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn tid_of(obj: *mut ()) -> u32 {
+        // SAFETY: `obj` is a pinned live `Thread` under the accessor contract.
+        unsafe { core::ptr::read(&raw const (*(obj as *const Thread)).tid) }
+    }
+
+    /// The process a user thread belongs to, pinned by it and given no new reference.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn process_of(obj: *mut ()) -> Option<*mut ()> {
+        // SAFETY: `obj` is a pinned live `Thread` under the accessor contract, and `process` is
+        // set before the thread is shared and never written after.
+        unsafe { (*(obj as *const Thread)).process.as_ref().map(ObjectRef::as_ptr) }
+    }
+
+    /// [`Thread::process_ref`] through a raw place.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn process_ref_of(obj: *mut ()) -> Option<ObjectRef> {
+        // SAFETY: as `process_of`.
+        unsafe { (*(obj as *const Thread)).process.clone() }
     }
 
     /// Register `objs` (type-erased addresses, `len <= MAX_WAIT_HANDLES`) as this thread's wait
@@ -894,125 +906,4 @@ impl Thread {
 pub(crate) mod test_support;
 
 #[cfg(test)]
-mod tests {
-    use super::test_support::*;
-    use super::*;
-    use crate::mm::test_support::init_global_heap;
-
-    #[test]
-    fn inert_thread_has_no_stack_and_is_ready() {
-        init_global_heap();
-        let t = Thread::try_new(7, 3).unwrap();
-        assert_eq!(t.tid(), 7);
-        assert_eq!(t.owner_pid(), 3);
-        assert!(t.stack.is_none());
-        assert_eq!(t.state, ThreadState::Ready);
-    }
-
-    #[test]
-    fn boot_thread_is_running_with_no_stack() {
-        init_global_heap();
-        let t = Thread::try_new_boot(0, 0).unwrap();
-        assert_eq!(t.state, ThreadState::Running);
-        assert!(t.stack.is_none());
-    }
-
-    #[test]
-    fn state_accessors_round_trip() {
-        init_global_heap();
-        let t = Thread::try_new(1, 1).unwrap();
-        let obj = KBox::into_raw(t).as_ptr() as *mut ();
-        // SAFETY: `obj` is a live Thread; this test is single-threaded and
-        // holds the only reference, satisfying the accessor contract.
-        unsafe {
-            assert_eq!(Thread::state(obj), ThreadState::Ready);
-            Thread::set_state(obj, ThreadState::Running);
-            assert_eq!(Thread::state(obj), ThreadState::Running);
-            Thread::set_state(obj, ThreadState::Exited);
-            assert_eq!(Thread::state(obj), ThreadState::Exited);
-            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
-        }
-    }
-
-    #[test]
-    fn saved_sp_accessor_reads_and_writes_through_slot() {
-        init_global_heap();
-        let t = Thread::try_new(1, 1).unwrap();
-        let obj = KBox::into_raw(t).as_ptr() as *mut ();
-        // SAFETY: as above.
-        unsafe {
-            assert_eq!(Thread::saved_sp(obj), 0);
-            *Thread::saved_sp_mut_ptr(obj) = 0xDEAD_0000;
-            assert_eq!(Thread::saved_sp(obj), 0xDEAD_0000);
-            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
-        }
-    }
-
-    #[test]
-    fn user_thread_records_descent_params_and_root() {
-        init_global_heap();
-        let (proc_ref, root) = user_process_ref(1);
-        let t = user_thread_no_stack(1, proc_ref, 0x40_0000, 0x7fff_f000);
-        let obj = KBox::into_raw(t).as_ptr() as *mut ();
-        // SAFETY: live Thread, single-threaded test.
-        unsafe {
-            assert_eq!(Thread::user_entry(obj), Some((0x40_0000, 0x7fff_f000)));
-            assert_eq!(Thread::addr_space_root(obj), Some(root));
-            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
-        }
-    }
-
-    #[test]
-    fn dropping_a_user_thread_releases_its_process_no_cycle() {
-        use crate::object::header::test_probe;
-        init_global_heap();
-        test_probe::reset();
-        let (proc_ref, _root) = user_process_ref(1);
-        let t = user_thread_no_stack(1, proc_ref, 0x40_0000, 0x7fff_f000);
-        let tref = {
-            let ptr = KBox::into_raw(t).as_ptr() as *mut ();
-            // SAFETY: into_raw yielded the single creation ref; adopt it.
-            unsafe { ObjectRef::from_raw(ptr, KObjectType::Thread) }
-        };
-        assert_eq!(test_probe::process_destroys(), 0);
-        assert_eq!(test_probe::thread_destroys(), 0);
-        drop(tref);
-        assert_eq!(test_probe::thread_destroys(), 1);
-        assert_eq!(test_probe::process_destroys(), 1);
-    }
-
-    #[test]
-    fn wait_bookkeeping_round_trips() {
-        init_global_heap();
-        let t = Thread::try_new(1, 1).unwrap();
-        let obj = KBox::into_raw(t).as_ptr() as *mut ();
-        // SAFETY: live Thread, single-threaded test (stands in for SCHED).
-        unsafe {
-            assert_eq!(Thread::wait_phase(obj), WaitPhase::Running as u8);
-
-            Thread::wait_register(obj, &[0xAA, 0xBB], true);
-            assert_eq!(Thread::wait_phase(obj), WaitPhase::Waiting as u8);
-            assert!(Thread::wait_has_deadline(obj));
-
-            assert!(Thread::wait_mark_signaled(obj, 0xBB));
-            assert!(!Thread::wait_mark_signaled(obj, 0xCC));
-
-            let mut out = [(0usize, false); MAX_WAIT_HANDLES];
-            let n = Thread::wait_snapshot(obj, &mut out);
-            assert_eq!(n, 2);
-            assert_eq!(out[0], (0xAA, false));
-            assert_eq!(out[1], (0xBB, true));
-
-            assert!(Thread::wait_try_wake(obj));
-            assert!(!Thread::wait_try_wake(obj));
-            assert_eq!(Thread::wait_phase(obj), WaitPhase::Woken as u8);
-
-            Thread::wait_clear(obj);
-            assert_eq!(Thread::wait_phase(obj), WaitPhase::Running as u8);
-            assert!(!Thread::wait_has_deadline(obj));
-            assert_eq!(Thread::wait_snapshot(obj, &mut out), 0);
-
-            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
-        }
-    }
-}
+mod tests;

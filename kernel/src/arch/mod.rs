@@ -32,7 +32,6 @@ pub mod irq_router;
 pub mod memory_types;
 pub mod paging;
 pub mod platform;
-pub mod registers;
 pub mod smp;
 pub mod timer;
 pub mod user_access;
@@ -139,8 +138,8 @@ pub use x86_64::paging::{fail_page_tables_after, mapped_with};
 // separate FP/SIMD register file needs this shape, so the names stay neutral.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::fpu::{
-    ArchFpuState, area_bytes as fpu_area_bytes, init_area as fpu_init_area, init_cpu as fpu_init_cpu,
-    restore as fpu_restore, save as fpu_save, vector_bits as fpu_vector_bits,
+    ArchFpuState, area_bytes as fpu_area_bytes, init_cpu as fpu_init_cpu, restore as fpu_restore, save as fpu_save,
+    vector_bits as fpu_vector_bits,
 };
 // Vector-register self-test primitives (`selftest` builds only): load/store the whole
 // vector register file through an image buffer, so a neutral test can stamp a pattern,
@@ -164,9 +163,8 @@ pub use x86_64::syscall::{arm_user_entry_cpu_base, enter_user, init_syscall_entr
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::X86Paging as Paging;
 
-// Suspended-thread register snapshot (behind `sys_thread_get_registers`): the
-// `ArchRegisters` trait's active impl + its `#[repr(C)]` ABI value type. The
-// `impl` lives in `idt.rs` (where the private exception frame is); this module
-// owns the type + marker. See `arch::registers`.
+// The user-register snapshot a ring-3 fault hands `sched::suspend_with_fault`, behind
+// `sys_thread_get_registers`: a `#[repr(C)]` ABI type, decoded where the private exception
+// frame is (`idt.rs`).
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::registers::{RegisterValues, X86Registers as Registers};
+pub use x86_64::registers::RegisterValues;

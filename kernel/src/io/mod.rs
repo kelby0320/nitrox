@@ -21,12 +21,19 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::io_op::IoOpcode;
 use crate::mm::heap::hhdm_offset;
 use crate::object::{InterruptObject, MemoryObject, ObjectRef, PendingOperation};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
-/// The DPC handler for the [`InterruptObject`] self-test: signal the object whose
-/// pointer is its `ctx`, exactly as a device ISR's completion DPC would.
-fn intr_test_dpc(ctx: *mut ()) {
-    // SAFETY: the self-test queued this DPC with its live `InterruptObject` as `ctx`.
-    unsafe { crate::sched::signal_interrupt(ctx) };
+/// The [`InterruptObject`] self-test's DPC, a static as every queued DPC must outlive its drain.
+static INTR_TEST_DPC: Dpc = Dpc::new(intr_test_dpc, core::ptr::null_mut());
+/// The object [`INTR_TEST_DPC`] signals, set by the self-test before it queues it.
+static INTR_TEST_OBJ: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// The DPC handler for the [`InterruptObject`] self-test: signal its object, exactly as a device
+/// ISR's DPC would.
+fn intr_test_dpc(_: *mut ()) {
+    // SAFETY: the self-test set its live `InterruptObject` before queuing this, and drains it
+    // before letting the object go, on the one CPU there is before the APs come up.
+    unsafe { crate::sched::signal_interrupt(INTR_TEST_OBJ.load(Ordering::Acquire)) };
 }
 
 /// Boot self-test for the I/O spine. Proves, without real hardware:
@@ -137,8 +144,8 @@ fn interrupt_object_self_test() {
             return;
         }
     };
-    let dpc = Dpc::new(intr_test_dpc, irq.as_ptr());
-    crate::dpc::enqueue(&dpc);
+    INTR_TEST_OBJ.store(irq.as_ptr(), Ordering::Release);
+    crate::dpc::enqueue(&INTR_TEST_DPC);
     crate::dpc::run_pending();
 
     // SAFETY: `irq` is a live `InterruptObject` reference held across the call.
@@ -154,6 +161,83 @@ fn interrupt_object_self_test() {
         return;
     }
     crate::kprintln!("io: interrupt self-test OK (DPC signal -> latch -> consume)");
+}
+
+/// Set to stop [`reclaim_under_load_self_test`]'s spinners.
+static SPIN_STOP: AtomicBool = AtomicBool::new(false);
+/// Its spinners started, and those since stopped.
+static SPIN_STARTED: AtomicU32 = AtomicU32::new(0);
+static SPIN_DONE: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn spinner(_: usize) {
+    SPIN_STARTED.fetch_add(1, Ordering::AcqRel);
+    while !SPIN_STOP.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    SPIN_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// **Completed block IRPs stay bounded with every CPU busy.** Two threads spin on each CPU and the
+/// boot thread reads without reaping, so only the reaper, woken at [`block::RECLAIM_WAKE_AT`], can
+/// bring the backlog below it. Panics, failing a test boot, when it does not or cannot set up.
+pub fn reclaim_under_load_self_test() {
+    use crate::arch::timer::ArchTimer;
+    const READS: usize = 4 * block::RECLAIM_WAKE_AT;
+    let Some((device, buffer)) = ramdisk_and_buffer() else {
+        panic!("io: reclaim-under-load self-test: no memory for its disk");
+    };
+    let mask = crate::sched::online_mask();
+    let mut spinners = 0;
+    for cpu in (0..crate::arch::MAX_CPUS).filter(|c| mask & (1 << c) != 0) {
+        for _ in 0..2 {
+            spinners += crate::sched::spawn_with_affinity(spinner, 0, 1 << cpu).is_ok() as u32;
+        }
+    }
+    let wait = |done: &dyn Fn() -> bool| {
+        let start = crate::arch::Timer::read_ns();
+        while !done() && crate::arch::Timer::read_ns() - start < 2_000_000_000 {
+            core::hint::spin_loop();
+        }
+        done()
+    };
+    if spinners != 2 * mask.count_ones() || !wait(&|| SPIN_STARTED.load(Ordering::Acquire) == spinners) {
+        panic!("io: reclaim-under-load self-test: {spinners} spinners made, not two a CPU, or not all ran");
+    }
+    let before = block::reclaim_backlog();
+    let mut peak = before;
+    for _ in 0..READS {
+        let Ok(po) = PendingOperation::try_new().map(|po| adopt(po, KObjectType::PendingOperation)) else {
+            panic!("io: reclaim-under-load self-test: no memory for an operation");
+        };
+        let sent = block::dispatch_block_irp(&device, &buffer, &po, IoOpcode::Read, 0, 0, 512).is_ok();
+        // SAFETY: `po` pins its live `PendingOperation`.
+        if !sent || !wait(&|| unsafe { crate::sched::pending_op_is_signaled(po.as_ptr()) }) {
+            panic!("io: reclaim-under-load self-test: a read was refused or never completed");
+        }
+        peak = peak.max(block::reclaim_backlog());
+    }
+    let drained = wait(&|| block::reclaim_backlog() < block::RECLAIM_WAKE_AT);
+    let left = block::reclaim_backlog();
+    SPIN_STOP.store(true, Ordering::Release);
+    while SPIN_DONE.load(Ordering::Acquire) < spinners {
+        crate::sched::reap_pending();
+        core::hint::spin_loop();
+    }
+    crate::sched::reap_pending();
+    if peak < block::RECLAIM_WAKE_AT || !drained {
+        panic!("io: completed IRPs unbounded with every CPU busy: {left} left of a peak of {peak}");
+    }
+    crate::kprintln!(
+        "io: reclaim-under-load self-test OK ({READS} reads under {spinners} spinners; backlog {before} -> {peak} -> {left})"
+    );
+}
+
+/// A fresh ramdisk's device, and a buffer for one block.
+fn ramdisk_and_buffer() -> Option<(ObjectRef, ObjectRef)> {
+    // SAFETY: leak the box to obtain a 'static reference for the device.
+    let rd = unsafe { &*(KBox::into_raw(ramdisk::RamDisk::try_new().ok()?).as_ptr()) };
+    let device = adopt(ramdisk::try_new_device(rd, b"io reclaim self-test ramdisk").ok()?, KObjectType::DeviceNode);
+    Some((device, adopt(MemoryObject::try_new(crate::mm::PAGE_SIZE).ok()?, KObjectType::MemoryObject)))
 }
 
 /// Adopt a freshly-created kernel object box into an owning [`ObjectRef`].

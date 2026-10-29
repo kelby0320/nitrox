@@ -3,8 +3,7 @@ use super::*;
 #[test]
 fn heap_pops_in_deadline_order() {
     init_global_heap();
-    let mut h: KVec<deadline::Entry> = KVec::new();
-    h.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    let mut h = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     for &d in &[50u64, 10, 30, 20, 40] {
         deadline::push(&mut h, entry(d, d as usize)).unwrap();
     }
@@ -20,8 +19,7 @@ fn heap_pops_in_deadline_order() {
 #[test]
 fn heap_peek_is_min_and_remove_targets() {
     init_global_heap();
-    let mut h: KVec<deadline::Entry> = KVec::new();
-    h.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    let mut h = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     deadline::push(&mut h, entry(30, 0xC)).unwrap();
     deadline::push(&mut h, entry(10, 0xA)).unwrap();
     deadline::push(&mut h, entry(20, 0xB)).unwrap();
@@ -37,8 +35,7 @@ fn heap_peek_is_min_and_remove_targets() {
 #[test]
 fn heap_remove_distinguishes_kind_for_same_target() {
     init_global_heap();
-    let mut h: KVec<deadline::Entry> = KVec::new();
-    h.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    let mut h = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     // The same `target` can hold entries of different kinds, each removable by `(target, kind)`.
     deadline::push(
         &mut h,
@@ -62,8 +59,7 @@ fn heap_remove_distinguishes_kind_for_same_target() {
 #[test]
 fn heap_push_refuses_over_reserve() {
     init_global_heap();
-    let mut h: KVec<deadline::Entry> = KVec::new();
-    h.try_reserve(2).unwrap();
+    let mut h = Reserved::with_capacity(2).unwrap();
     // Fill to the actual capacity (try_reserve may round up), then the next
     // push must refuse rather than grow under the (eventual) lock.
     let cap = h.capacity();
@@ -77,8 +73,7 @@ fn heap_push_refuses_over_reserve() {
 #[test]
 fn removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap_ordered() {
     init_global_heap();
-    let mut h: KVec<deadline::Entry> = KVec::new();
-    h.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    let mut h = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     for (i, d) in [1u64, 10, 5, 11, 12, 6, 7].into_iter().enumerate() {
         deadline::push(&mut h, entry(d, i)).unwrap();
     }
@@ -93,7 +88,7 @@ fn removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap
 
 fn heap_with(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> SchedState {
     let mut st = test_state();
-    st.deadlines.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    st.deadlines = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 1;
     deadline::push(&mut st.deadlines, entry(deadline_ns, timer as usize)).unwrap();
     // SAFETY: the caller pins `timer`; single-threaded test.
@@ -155,8 +150,7 @@ fn a_periodic_timer_whose_next_fire_would_wrap_waits_for_ever_instead() {
 
 /// `timer_arm` and `Timer::drop` take the global `SCHED`, whose heap only `init` reserves.
 fn reserve_global_deadlines() {
-    let mut h: KVec<deadline::Entry> = KVec::new();
-    h.try_reserve(deadline::HEAP_RESERVE).unwrap();
+    let mut h = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     let mut g = SCHED.lock();
     if g.deadlines.capacity() == 0 {
         core::mem::swap(&mut g.deadlines, &mut h);
@@ -209,17 +203,14 @@ fn a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it() {
 #[test]
 fn a_regrown_heap_keeps_its_entries_in_order_and_hands_back_the_smaller_buffer() {
     init_global_heap();
-    let mut h: KVec<deadline::Entry> = KVec::new();
-    h.try_reserve(4).unwrap();
+    let mut h = Reserved::with_capacity(4).unwrap();
     for d in [40u64, 10, 30, 20] {
         deadline::push(&mut h, entry(d, d as usize)).unwrap();
     }
-    let mut bigger = KVec::new();
-    bigger.try_reserve(64).unwrap();
+    let bigger = Reserved::with_capacity(64).unwrap();
     let spare = deadline::regrow(&mut h, bigger);
     assert!(h.capacity() >= 64 && spare.capacity() < 64);
-    let mut smaller = KVec::new();
-    smaller.try_reserve(8).unwrap();
+    let smaller = Reserved::with_capacity(8).unwrap();
     assert!(deadline::regrow(&mut h, smaller).capacity() < 64, "a smaller buffer comes straight back");
     let order: std::vec::Vec<u64> = core::iter::from_fn(|| deadline::pop_min(&mut h)).map(|e| e.deadline_ns).collect();
     assert_eq!(order, [10, 20, 30, 40]);
@@ -230,7 +221,7 @@ fn a_regrown_heap_keeps_its_entries_in_order_and_hands_back_the_smaller_buffer()
 fn an_entry_of_a_kind_with_every_slot_taken_stops_a_debug_build() {
     init_global_heap();
     let mut st = test_state();
-    st.deadlines.try_reserve(8).unwrap();
+    st.deadlines = Reserved::with_capacity(8).unwrap();
     st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 1;
     deadline::push_promised(&mut st, entry(10, 1)).unwrap();
     let _ = deadline::push_promised(&mut st, entry(20, 2));

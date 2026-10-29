@@ -20,8 +20,9 @@ use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::ipc::{IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader};
-use crate::libkern::{AllocError, KBox, KVec};
+use crate::libkern::{AllocError, ArrayVec, KBox, KVec, Reserved};
 use crate::object::ObjectRef;
+use crate::object::WaitQueue;
 use crate::object::header::KObjectHeader;
 
 /// A queued message in kernel storage: the natural-alignment twin of
@@ -240,12 +241,12 @@ pub struct IpcChannel {
 
 struct Inner {
     recv: MsgRing,
-    /// Threads blocked recv-ing (type-erased, non-owning; removed before a waiter unparks).
-    /// Pre-reserved to [`IpcChannel::MAX_WAITERS`] so `add_waiter` never allocates under `SCHED`.
-    recv_waiters: KVec<*mut ()>,
+    /// Threads blocked recv-ing (type-erased, non-owning; removed before a waiter unparks), at most
+    /// [`IpcChannel::MAX_WAITERS`].
+    recv_waiters: WaitQueue<{ IpcChannel::MAX_WAITERS }>,
     /// Blocking senders awaiting space in **this** ring, FIFO, promoted into `recv` when a recv
     /// frees a slot. Pre-reserved to [`IpcChannel::MAX_PENDING_SENDS`]: no `SCHED` allocation.
-    pending_sends: KVec<PendingSend>,
+    pending_sends: Reserved<PendingSend>,
     peer: *mut IpcChannel,
     /// Non-null iff this is the **kernel's** end of a Userspace Server channel: a non-owning
     /// back-pointer to the owning [`UserspaceServerReg`](crate::object::UserspaceServerReg), which
@@ -276,31 +277,30 @@ impl IpcChannel {
     /// `1..=IPC_MAX_QUEUE_DEPTH`). Each returned `KBox` holds one creation reference.
     pub fn try_new_pair(depth: u32) -> Result<(KBox<Self>, KBox<Self>), AllocError> {
         let cap = depth.clamp(1, IPC_MAX_QUEUE_DEPTH) as usize;
-        let mut a = Self::try_new_endpoint(cap)?;
-        let mut b = Self::try_new_endpoint(cap)?;
-        // Both boxes are still private here: plain writes are sound; no `SCHED` needed.
-        let a_ptr = (&*a as *const Self) as *mut Self;
-        let b_ptr = (&*b as *const Self) as *mut Self;
-        a.inner.get_mut().peer = b_ptr;
-        b.inner.get_mut().peer = a_ptr;
-        Ok((a, b))
+        let (a, b) = (Self::try_new_endpoint(cap)?, Self::try_new_endpoint(cap)?);
+        let (a, b) = (KBox::into_raw(a), KBox::into_raw(b));
+        // Each peer is the other box's own pointer, so no later borrow of that box retires it.
+        // SAFETY: both endpoints are this function's alone, so `SCHED` is not needed, and each
+        // write goes through its box's own pointer; each box is rebuilt from the pointer it gave.
+        unsafe {
+            (*UnsafeCell::raw_get(&raw const (*a.as_ptr()).inner)).peer = b.as_ptr();
+            (*UnsafeCell::raw_get(&raw const (*b.as_ptr()).inner)).peer = a.as_ptr();
+            Ok((KBox::from_raw(a), KBox::from_raw(b)))
+        }
     }
 
-    /// Allocate one unconnected endpoint, refcount one. Ring and waiter vector are reserved up
-    /// front (the only fallible growth), so later pushes never allocate under `SCHED`.
+    /// Allocate one unconnected endpoint, refcount one. Its ring and held sends are reserved up
+    /// front, so later pushes never allocate under `SCHED`.
     fn try_new_endpoint(cap: usize) -> Result<KBox<Self>, AllocError> {
         let slots = SlotHold::reserve(Slots::Endpoint)?;
         let recv = MsgRing::with_capacity(cap)?;
-        let mut recv_waiters: KVec<*mut ()> = KVec::new();
-        recv_waiters.try_reserve(Self::MAX_WAITERS)?;
-        let mut pending_sends: KVec<PendingSend> = KVec::new();
-        pending_sends.try_reserve(Self::MAX_PENDING_SENDS)?;
+        let pending_sends = Reserved::with_capacity(Self::MAX_PENDING_SENDS)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::IpcChannel),
             magic: Self::MAGIC,
             inner: UnsafeCell::new(Inner {
                 recv,
-                recv_waiters,
+                recv_waiters: WaitQueue::new(),
                 pending_sends,
                 peer: core::ptr::null_mut(),
                 us_reg: core::ptr::null_mut(),
@@ -460,19 +460,7 @@ impl IpcChannel {
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if inner.recv_waiters.len() < Self::MAX_WAITERS {
-            inner
-                .recv_waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED` and `try_push`
-                // grows (`kmalloc` under the rank-1 lock). Construction reserves `MAX_WAITERS`, so
-                // it cannot fail; the type should say so, since a new waiter list copies this
-                // shape.
-                .push_within_capacity(thread)
-                .expect("within reserved waiter capacity");
-            Ok(())
-        } else {
-            Err(())
-        }
+        inner.recv_waiters.add(thread)
     }
 
     /// Remove `thread` from the receiver set if present (idempotent).
@@ -482,25 +470,17 @@ impl IpcChannel {
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if let Some(i) = inner.recv_waiters.iter().position(|&w| w == thread) {
-            inner.recv_waiters.remove(i);
-        }
+        inner.recv_waiters.remove(thread);
     }
 
-    /// Drain every receiver into `out`, returning the count; `out` is at least `MAX_WAITERS` long.
+    /// Take every receiver, leaving none.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { IpcChannel::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        let n = inner.recv_waiters.len();
-        debug_assert!(out.len() >= n);
-        for (i, &w) in inner.recv_waiters.iter().enumerate() {
-            out[i] = w;
-        }
-        inner.recv_waiters.clear();
-        n
+        inner.recv_waiters.take()
     }
 
     /// Blocking-send entry: deliver `msg` straight into the **peer**'s ring, or if full **hold**
@@ -534,12 +514,11 @@ impl IpcChannel {
         for i in 0..IPC_HANDLE_MAX {
             held[i] = transfers[i].take();
         }
-        // `po.clone()` bumps an atomic refcount: sound under `SCHED`. Non-growing: `try_push` drops
-        // its argument when growth fails, and its `ObjectRef` would drop under `SCHED`. Reserved to
+        // `po.clone()` bumps an atomic refcount: sound under `SCHED`. Reserved to
         // `MAX_PENDING_SENDS` and length-checked above, so it cannot refuse.
         peer_inner
             .pending_sends
-            .push_within_capacity(PendingSend { msg: *msg, transfers: held, po: po.clone(), cancelled: false })
+            .push(PendingSend { msg: *msg, transfers: held, po: po.clone(), cancelled: false })
             .unwrap_or_else(|held| {
                 // Unreachable: reserved at construction and length-checked above. Do not let
                 // `held` drop here — it owns an `ObjectRef` and `SCHED` is held.

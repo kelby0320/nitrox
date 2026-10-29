@@ -745,11 +745,8 @@ impl Disks {
 }
 
 fn complete(irp: *mut Irp, status: i32, transferred: u64) {
-    // SAFETY: `irp` is live and uniquely this driver's until its DPC runs.
-    unsafe {
-        (*irp).set_completion(status, transferred);
-        crate::dpc::enqueue(&(*irp).dpc);
-    }
+    // SAFETY: `irp` is live and uniquely this driver's, completed here once.
+    unsafe { crate::io::irp::complete(irp, status, transferred) };
 }
 
 /// Do what an [`Action`] says. No lock held. `x` is the controller, to wake the hub thread through:

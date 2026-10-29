@@ -51,6 +51,7 @@ pub fn pre_smp() {
 /// Post-SMP demos (after AP bring-up): work distribution and affinity, and the FP/SIMD isolation
 /// proof, worth running only with several CPUs.
 pub fn post_smp() {
+    nitrox_kernel::io::reclaim_under_load_self_test();
     smp_distribution_demo();
     smp_affinity_demo();
     fp_isolation_demo();
@@ -180,7 +181,7 @@ extern "C" fn fp_worker(arg: usize) {
 fn fp_swap_cost() {
     // Boxed rather than a stack local: a kilobyte of 64-byte-aligned scratch on the boot thread's
     // stack is avoidable, and `KBox` gives the alignment.
-    let mut scratch = match KBox::try_new(arch::ArchFpuState::zeroed()) {
+    let mut scratch = match KBox::try_new(arch::ArchFpuState::initial()) {
         Ok(s) => s,
         Err(_) => {
             kprintln!("fp: swap-cost scratch alloc failed");

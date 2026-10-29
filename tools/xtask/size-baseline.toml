@@ -5,13 +5,12 @@
 "kernel/src/arch/x86_64/acpi.rs" = 1040
 "kernel/src/device.rs" = 1414
 "kernel/src/drivers/xhci/hid.rs" = 1106
-"kernel/src/drivers/xhci/storage.rs" = 1705
-"kernel/src/main.rs" = 1195
+"kernel/src/drivers/xhci/storage.rs" = 1702
+"kernel/src/main.rs" = 1186
 "kernel/src/mm/vmm.rs" = 1560
 "kernel/src/object/file_object.rs" = 2460
-"kernel/src/object/thread.rs" = 1018
 "kernel/src/pci/mod.rs" = 1045
-"kernel/src/syscall/table.rs" = 2617
+"kernel/src/syscall/table.rs" = 2613
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
 "userspace/compositor/src/main.rs" = 2293
@@ -41,7 +40,7 @@
 "userspace/nxterm/src/lib.rs" = 2341
 "userspace/service-mgr/src/main.rs" = 2220
 "userspace/storage-service/src/main.rs" = 1527
-"userspace/test-harness/src/harness.rs" = 3953
+"userspace/test-harness/src/harness.rs" = 3854
 "userspace/test-harness/src/uiclient.rs" = 1265
 "userspace/view-broker/src/lib.rs" = 1646
 "userspace/view-broker/src/main.rs" = 1809

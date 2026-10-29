@@ -1,5 +1,5 @@
 use super::{MAX_CPUS, MAX_THREADS, SCHED, SchedState, push_reserved};
-use crate::libkern::{AllocError, KVec};
+use crate::libkern::{AllocError, Reserved};
 use crate::mm::PAGE_SIZE;
 use crate::mm::buddy::MAX_ORDER;
 use crate::object::IpcChannel;
@@ -98,8 +98,7 @@ pub(super) fn reserve_slots(slots: Slots) -> Result<(), AllocError> {
             }
             grown_capacity(promised, g.deadlines.capacity()).ok_or(AllocError)?
         };
-        let mut grown = KVec::new();
-        grown.try_reserve(want)?;
+        let grown = Reserved::with_capacity(want)?;
         let spare = regrow(&mut SCHED.lock().deadlines, grown);
         drop(spare);
     }
@@ -127,7 +126,7 @@ pub(crate) fn slots_held_here() -> isize {
 }
 
 /// Leave the larger of `h` and `grown` in `h`, entries in order; return the other, to drop later.
-pub(super) fn regrow(h: &mut KVec<Entry>, mut grown: KVec<Entry>) -> KVec<Entry> {
+pub(super) fn regrow(h: &mut Reserved<Entry>, mut grown: Reserved<Entry>) -> Reserved<Entry> {
     if grown.capacity() <= h.capacity() {
         return grown;
     }
@@ -148,13 +147,13 @@ pub(super) fn push_promised(g: &mut SchedState, e: Entry) -> Result<(), AllocErr
 }
 
 /// The earliest entry, or `None` if empty.
-pub(super) fn peek(h: &KVec<Entry>) -> Option<Entry> {
+pub(super) fn peek(h: &Reserved<Entry>) -> Option<Entry> {
     h.first().copied()
 }
 
 /// Insert `e`, sifting up by `deadline_ns`. `Err` if at reserve (the caller
 /// maps it to an out-of-memory failure; never grows under the lock).
-pub(super) fn push(h: &mut KVec<Entry>, e: Entry) -> Result<(), AllocError> {
+pub(super) fn push(h: &mut Reserved<Entry>, e: Entry) -> Result<(), AllocError> {
     if h.len() >= h.capacity() {
         return Err(AllocError);
     }
@@ -174,7 +173,7 @@ pub(super) fn push(h: &mut KVec<Entry>, e: Entry) -> Result<(), AllocError> {
 
 /// Remove and return the earliest entry, sifting the moved-up last element
 /// down. `None` if empty.
-pub(super) fn pop_min(h: &mut KVec<Entry>) -> Option<Entry> {
+pub(super) fn pop_min(h: &mut Reserved<Entry>) -> Option<Entry> {
     let n = h.len();
     if n == 0 {
         return None;
@@ -189,7 +188,7 @@ pub(super) fn pop_min(h: &mut KVec<Entry>) -> Option<Entry> {
 /// was removed. Used when a `sys_wait` resumes (drop its deadline), a timer
 /// is re-armed (drop its stale entry), or a `BlockBounded` send is delivered
 /// early / its endpoint closes (drop its pending-send deadline).
-pub(super) fn remove(h: &mut KVec<Entry>, target: usize, kind: DeadlineKind) -> bool {
+pub(super) fn remove(h: &mut Reserved<Entry>, target: usize, kind: DeadlineKind) -> bool {
     // TODO(deadline-heap-scan): a scan, under `SCHED`, of a heap one process can fill.
     let Some(i) = h.iter().position(|e| e.target == target && e.kind == kind) else {
         return false;
@@ -208,7 +207,7 @@ pub(super) fn remove(h: &mut KVec<Entry>, target: usize, kind: DeadlineKind) -> 
     true
 }
 
-fn sift_up(h: &mut KVec<Entry>, mut i: usize) {
+fn sift_up(h: &mut Reserved<Entry>, mut i: usize) {
     while i > 0 {
         let parent = (i - 1) / 2;
         if h[i].deadline_ns < h[parent].deadline_ns {
@@ -220,7 +219,7 @@ fn sift_up(h: &mut KVec<Entry>, mut i: usize) {
     }
 }
 
-fn sift_down(h: &mut KVec<Entry>, mut i: usize) {
+fn sift_down(h: &mut Reserved<Entry>, mut i: usize) {
     let n = h.len();
     loop {
         let l = 2 * i + 1;

@@ -21,13 +21,10 @@ pub enum ResumeDisposition {
 fn deliver_child_exited(g: &mut SchedState, me_obj: *mut (), status: ExitStatus) {
     let info: Option<(*mut (), u32)> = {
         // SAFETY: `me_obj` is the running thread, pinned, lock held.
-        let th = unsafe { &*(me_obj as *const Thread) };
-        th.process_ref().and_then(|p| {
-            // SAFETY: `p` pins a live Process; read its parent channel + pid.
-            let proc = unsafe { &*(p.as_ptr() as *const crate::object::Process) };
+        unsafe { Thread::process_of(me_obj) }.and_then(|p| {
+            // SAFETY: the thread pins its live Process; read its parent channel + pid.
+            let proc = unsafe { &*(p as *const crate::object::Process) };
             proc.parent_notif_ptr().map(|chan| (chan, proc.pid_u32()))
-            // `p` (a cloned ObjectRef, never the last) drops here: a plain atomic
-            // decrement, no destructor, safe under SCHED.
         })
     };
     if let Some((chan, child_pid)) = info {
@@ -47,7 +44,7 @@ fn deliver_child_exited(g: &mut SchedState, me_obj: *mut (), status: ExitStatus)
 pub(super) fn has_live_siblings(g: &SchedState, my_pid: u32) -> bool {
     // SAFETY: each entry pins a live Thread; `SCHED` held — a shared read of
     // `owner_pid` is sound (no `&mut` taken).
-    let same = |r: &ObjectRef| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid;
+    let same = |r: &ObjectRef| unsafe { Thread::owner_pid_of(r.as_ptr()) } == my_pid;
     g.ready.iter().any(|q| q.iter().any(same))
         || g.blocked.iter().any(same)
         || g.suspended.iter().any(same)
@@ -101,7 +98,7 @@ pub fn end_if_ending() {
 /// **None is freed here**: only its own unwinding lets go of what its kernel stack holds.
 pub(super) fn end_siblings(g: &mut SchedState, pid: u32) {
     // SAFETY: each entry pins a live Thread; `SCHED` held.
-    let same = |r: &ObjectRef| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == pid;
+    let same = |r: &ObjectRef| unsafe { Thread::owner_pid_of(r.as_ptr()) } == pid;
     let me = SchedState::this_cpu();
     for c in 0..MAX_CPUS {
         for r in g.ready[c].iter().filter(|r| same(r)) {
@@ -142,20 +139,18 @@ pub(super) fn end_siblings(g: &mut SchedState, pid: u32) {
 /// `ChildExited` with the status a `sys_process_exit` recorded, else `status`.
 pub(super) fn end_process_if_last(g: &mut SchedState, me_obj: *mut (), status: ExitStatus) -> bool {
     // SAFETY: `me_obj` is the exiting thread, pinned by its caller; `SCHED` held.
-    let th = unsafe { &*(me_obj as *const Thread) };
-    let Some(process) = th.process_ref() else {
+    let (Some(process), pid) = (unsafe { Thread::process_of(me_obj) }, unsafe { Thread::owner_pid_of(me_obj) }) else {
         return false;
     };
-    if has_live_siblings(g, th.owner_pid()) {
+    if has_live_siblings(g, pid) {
         return false;
     }
-    // SAFETY: `process` pins the live `Process`. Dropping this clone is never the last
-    // reference (the thread holds one), so it frees nothing under `SCHED`.
-    let status = unsafe { &*(process.as_ptr() as *const crate::object::Process) }.ending().unwrap_or(status);
+    // SAFETY: the thread pins its live `Process`.
+    let status = unsafe { &*(process as *const crate::object::Process) }.ending().unwrap_or(status);
     // SAFETY: as above.
     unsafe { Thread::set_process_ended(me_obj) };
     // A full queue leaves the sweep to this CPU's `reap_pending`, which `process_ended` asks for.
-    if g.ended_pids.push_within_capacity(th.owner_pid()).is_ok() {
+    if g.ended_pids.push(pid).is_ok() {
         wake_reaper(g);
     }
     deliver_child_exited(g, me_obj, status);
@@ -218,12 +213,11 @@ pub fn exit_process(status: ExitStatus) -> ! {
     let mut g = SCHED.lock();
     let me = g.cur_slot().take().expect("current set");
     // SAFETY: `me` is the running thread, pinned, lock held.
-    let th = unsafe { &*(me.as_ptr() as *const Thread) };
-    if let Some(process) = th.process_ref() {
-        // SAFETY: `process` pins the live `Process`; dropping this clone frees nothing (the
-        // thread holds a reference), so it may drop under `SCHED`.
-        unsafe { &*(process.as_ptr() as *const crate::object::Process) }.begin_ending(status);
-        end_siblings(&mut g, th.owner_pid());
+    if let Some(process) = unsafe { Thread::process_of(me.as_ptr()) } {
+        // SAFETY: the thread pins its live `Process`.
+        unsafe { &*(process as *const crate::object::Process) }.begin_ending(status);
+        // SAFETY: as above.
+        end_siblings(&mut g, unsafe { Thread::owner_pid_of(me.as_ptr()) });
     }
     end_process_if_last(&mut g, me.as_ptr(), status);
     finish_exit(g, me);
@@ -241,7 +235,7 @@ fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
     use crate::libkern::notification::{KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, KIND_STACK_OVERFLOW};
     use core::fmt::Write;
     // SAFETY: `me_obj` is the running (faulting) thread, pinned, `SCHED` held.
-    let th = unsafe { &*(me_obj as *const Thread) };
+    let (pid, tid) = unsafe { (Thread::owner_pid_of(me_obj), Thread::tid_of(me_obj)) };
     let kind = match notif.kind() {
         KIND_SEG_FAULT => "segfault",
         KIND_ILLEGAL_INSN => "illegal-instruction",
@@ -253,18 +247,18 @@ fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
     let _ = writeln!(
         w,
         "\n*** unhandled ring-3 fault (no thread left to resume it): pid {} tid {} {} @ {:#018x} ***",
-        th.owner_pid(),
-        th.tid(),
+        pid,
+        tid,
         kind,
         notif.fault_addr(),
     );
 }
 
 /// Suspend the **current thread** after a ring-3 fault: deliver `notif` to its process's
-/// notification channel (waking the supervisor), record the `ExceptionFrame` at `frame_ptr`
-/// on this thread's kernel stack, park in `suspended`, and switch away. Returns the
-/// [`ResumeDisposition`] the supervisor chose once the thread is runnable again.
-pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDisposition {
+/// notification channel (waking the supervisor), record the user registers `regs` it faulted
+/// with, park in `suspended`, and switch away. Returns the [`ResumeDisposition`] the supervisor
+/// chose once the thread is runnable again.
+pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification) -> ResumeDisposition {
     // Reclaim earlier exited threads first, off the rank-1 lock.
     reap_pending();
 
@@ -283,11 +277,9 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
         // Deliver the fault notification (borrowed pointer — no destructor under `SCHED`).
         let chan: Option<*mut ()> = {
             // SAFETY: `me` is the running thread, pinned, lock held.
-            let th = unsafe { &*(me_obj as *const Thread) };
-            th.process_ref().and_then(|p| {
-                // SAFETY: `p` pins a live Process; read its channel pointer.
-                let proc = unsafe { &*(p.as_ptr() as *const crate::object::Process) };
-                proc.notification_channel_ptr()
+            unsafe { Thread::process_of(me_obj) }.and_then(|p| {
+                // SAFETY: the thread pins its live Process; read its channel pointer.
+                unsafe { &*(p as *const crate::object::Process) }.notification_channel_ptr()
             })
         };
         if let Some(c) = chan {
@@ -298,14 +290,14 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
             signal_channel(&mut g, c);
         }
 
-        // Record the frame, mark Suspended, park off the run queue; the `ExceptionFrame`
+        // Record the registers, mark Suspended, park off the run queue; the `ExceptionFrame`
         // stays on this frozen kernel stack until resume.
         // TODO(unsupervised-fault): nothing supervises an ordinary program, so with
         // the thirty-second auto-terminate deferred its thread stays here for the
         // boot — first reached by a pulled stick's failed fill.
         // SAFETY: `me` is the running thread, pinned, lock held.
         unsafe {
-            Thread::set_exception_frame(me_obj, frame_ptr);
+            Thread::set_fault_registers(me_obj, regs);
             Thread::set_state(me_obj, ThreadState::Suspended);
         }
         // SAFETY: as above.
@@ -390,28 +382,22 @@ fn resume_parked(g: &mut SchedState, r: ObjectRef, disp_tag: u8, disp_code: i32)
     }
 }
 
-/// The kernel-stack address of `thread`'s captured `ExceptionFrame`, or `None` if it is not
-/// `Suspended`. Used by `sys_thread_get_registers`; a suspended thread stays parked, so the
-/// frame is stable after this returns (the caller drops `SCHED` before the user copy-out).
+/// The user registers `thread` faulted with, or `None` if it is not `Suspended`: a copy, taken
+/// under `SCHED`, so a resume that races the caller's copy-out cannot change it.
 ///
 /// # Safety
 ///
 /// `thread` points at a live `Thread`, pinned for the call by a reference the caller holds.
-pub unsafe fn thread_exception_frame(thread: *mut ()) -> Option<usize> {
+pub unsafe fn suspended_registers(thread: *mut ()) -> Option<crate::arch::RegisterValues> {
     let _g = SCHED.lock();
     // SAFETY: the caller pins `thread` via its Thread handle; `SCHED` held.
-    if unsafe { Thread::state_now(thread) } != ThreadState::Suspended {
-        return None;
-    }
-    // SAFETY: same.
-    unsafe { Thread::exception_frame(thread) }
+    unsafe { (Thread::state_now(thread) == ThreadState::Suspended).then(|| Thread::fault_registers(thread)) }
 }
 
 /// Pop up to `buf.len()` parked refs — this CPU's `reap` list first, then the global
 /// [`SchedState::deferred_drops`] — into `buf`. **Moves only**: no drop, no allocation, and
-/// the lists keep their reserved buffers (a `mem::take` drain would leave a zero-capacity
-/// `KVec`, so every later exit-path push would *allocate under `SCHED`*). The caller drops
-/// the refs after releasing `SCHED`, in thread context.
+/// the lists keep their reserved buffers. The caller drops the refs after releasing `SCHED`, in
+/// thread context.
 pub(super) fn drain_pending_drops(g: &mut SchedState, buf: &mut [Option<ObjectRef>]) -> usize {
     let mut n = 0;
     while n < buf.len() {
@@ -461,10 +447,7 @@ pub fn reap_pending() {
             }
             // SAFETY: the `ObjectRef` pins this `Thread`; nothing else mutates a
             // reaped thread's fields.
-            let (ended, pid) = unsafe {
-                let t = &*(r.as_ptr() as *const Thread);
-                (Thread::process_ended(r.as_ptr()), t.owner_pid())
-            };
+            let (ended, pid) = unsafe { (Thread::process_ended(r.as_ptr()), Thread::owner_pid_of(r.as_ptr())) };
             // `pid == 0` is a kernel/idle thread, which owns no handles and whose pid must
             // never be swept.
             if ended && pid != 0 {
@@ -489,8 +472,8 @@ pub fn reap_pending() {
     }
 }
 
-/// The reaper thread body: close the handle tables of processes that have exited, then
-/// park until there are more.
+/// The reaper thread body: close the handle tables of processes that have exited, and drain the
+/// completed-IRP list when no idle CPU has, then park until there is more.
 ///
 /// **Why a thread at all.** If reclamation ran only at `exit_*`/`yield_now`/
 /// `suspend_with_fault` and in the idle loop, a system where nothing exits or yields and no
@@ -499,11 +482,14 @@ pub fn reap_pending() {
 /// `PeerClosed` only reclamation can deliver. A schedulable thread removes the dependency
 /// on scheduling luck.
 ///
-/// It closes **handle tables only**. Kernel stacks stay with the per-CPU [`reap`](SchedState::reap)
-/// path: a thread parks itself there and then switches off its own stack, so freeing it
-/// from another CPU is a use-after-free, and the reaper runs wherever it is scheduled.
+/// Kernel stacks stay with the per-CPU [`reap`](SchedState::reap) path: a thread parks itself
+/// there and then switches off its own stack, so freeing it from another CPU is a use-after-free,
+/// and the reaper drains only the list of the CPU it runs on.
 pub(super) extern "C" fn reaper_body(_arg: usize) {
     loop {
+        if crate::io::block::reclaim_backlog() > 0 {
+            reap_pending();
+        }
         // Take one pid at a time: `close_all_owned_by` drops object references, which must
         // happen with `SCHED` released.
         let next = {
@@ -520,12 +506,12 @@ pub(super) extern "C" fn reaper_body(_arg: usize) {
     }
 }
 
-/// Park the reaper until [`wake_reaper`] runs. Re-checks the queue **under `SCHED`** before
-/// parking, which closes the lost-wakeup window: a pid pushed between the reaper's last
-/// drain and this park would otherwise wake nothing.
+/// Park the reaper until [`wake_reaper`] runs. Re-checks its work **under `SCHED`** before
+/// parking, which closes the lost-wakeup window: a pid pushed, or a completed IRP's box parked,
+/// between the reaper's last drain and this park would otherwise wake nothing.
 fn park_reaper() {
     let mut g = SCHED.lock();
-    if !g.ended_pids.is_empty() {
+    if !g.ended_pids.is_empty() || crate::io::block::reclaim_backlog() > 0 {
         return; // work arrived while we were draining — go round again
     }
     let me = g.cur_slot().take().expect("current set");
@@ -551,6 +537,11 @@ fn park_reaper() {
     // Resumes here, lock-free, when `wake_reaper` re-queues us.
     // SAFETY: `me_slot` is our own (now-parked) saved-SP slot; both threads pinned.
     unsafe { switch_into(g, me_slot, me_obj, next_obj) };
+}
+
+/// Wake the reaper to drain the completed-IRP list: from a DPC, holding nothing.
+pub fn wake_reaper_to_reclaim() {
+    wake_reaper(&mut SCHED.lock());
 }
 
 /// Make the reaper runnable, if it is parked. Caller holds `SCHED`. A no-op when it is

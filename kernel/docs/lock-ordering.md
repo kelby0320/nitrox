@@ -53,7 +53,8 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | 8    | TLB-shootdown serialiser (`tlb::LOCK`)       | live as of Phase 4 Part B. Held with interrupts *enabled* (the F1 fix), so interrupt work runs beneath it — which is ordinary now that the tracker scopes interrupts (§ Interrupt context restarts the order) and no longer needs the exemption it carried when it first landed. It additionally has a contract the rank cannot express — **no other lock held when taken** — which is asserted separately in debug builds |
 | leaf | Console input buffer (`CONSOLE`, **`IrqSpinLock`**)| live as of Phase 2; filled from the COM1 receive IRQ |
 | leaf | AHCI port lock (`AhciDisk::state`, per-port, **`IrqSpinLock`**)| live as of Phase 2. Slot 0's command in flight, its issue time, the fault and give-up state, and the commands queued behind it; taken by the ISR, a submit, the drain DPC, the watch thread and the boot poll, each releasing it before completing an IRP or queuing a DPC |
-| leaf | Completed-IRP reclaim list (`RECLAIM`, **`IrqSpinLock`**)| live as of Phase 4 (2026-08-06). Pushed from `irp_complete_dpc` at the interrupt-dispatch tail and drained by `reap_pending` in thread context; both sides take it with nothing else held, and the drain releases it *before* dropping, because a drop reaches the allocator. It exists because freeing the box in the DPC deadlocked against a same-CPU allocator holder |
+| leaf | Completed-IRP reclaim list (`RECLAIM`, **`IrqSpinLock`**)| live as of Phase 4 (2026-08-06). Pushed from the block layer's `finish` at the interrupt-dispatch tail and drained by `reap_pending` in thread context: an idle CPU's, or the reaper's, which the push that brings it to `RECLAIM_WAKE_AT` wakes; both sides take it with nothing else held, and the drain releases it *before* dropping, because a drop reaches the allocator. It exists because freeing the box in the DPC deadlocked against a same-CPU allocator holder |
+| leaf | Completed-IRP list (`io::irp::DONE`, **`IrqSpinLock`**) | live as of 2026-10-29. Pushed by `io::irp::complete` from a driver's ISR, DPC or refusal, and taken whole by the one completion DPC, each with nothing else held: the DPC queue's lock is taken only after it is released |
 
 **Why the leaves are the bottom of the order, not "held alone".** They take nothing
 while held, so ranking them last costs nothing and reads more simply than a separate
@@ -149,21 +150,22 @@ Two corollaries:
   descent out of the hot path entirely.
 - **Reaping runs outside rank 1.** An exited thread cannot free its own
   kernel stack (it is still running on it), so `exit_thread`/`exit_process`
-  park it in the `reap` list; the next scheduler entry's `reap_pending`
-  drains the list (`mem::take`) under the lock and drops the threads *after*
-  releasing — `KernelStack`'s `Drop` unmaps and returns frames to the buddy
-  (rank 6), which must not happen under rank 1. `reap` is a `KVec` (not one
-  slot) because several threads can end on one CPU before its next scheduler
-  entry; the drain still happens off the lock. No thread parks another: a
+  park it in its CPU's `reap` list; that CPU's next `reap_pending` (its idle
+  loop, or the next exit there) pops the list under the lock and drops the
+  threads *after* releasing — `KernelStack`'s `Drop` unmaps and returns frames
+  to the buddy (rank 6), which must not happen under rank 1. `reap` is a list
+  (not one slot) because several threads can end on one CPU before its next
+  drain; the drain still happens off the lock. No thread parks another: a
   process's exit only marks its siblings, and each ends itself on its way back
   to ring 3, its kernel stack unwound.
 - **Suspend obeys the block-and-switch discipline.** `suspend_with_fault`
   (the ring-3 exception path) delivers the fault notification + parks the
   thread in `suspended` and context-switches away — all under one `SCHED`
-  hold, no allocation (queue/waiters pre-reserved), mirroring
-  `block_current_and_switch`. The supervisor's `sys_thread_get_registers`
-  reads the captured frame and copies it to user memory **outside** `SCHED`
-  (the thread stays parked, so the frame is stable).
+  hold, no allocation (the queue pre-reserved, the waiters inline), mirroring
+  `block_current_and_switch`. It records the registers the thread faulted
+  with in the `Thread`, under that hold; the supervisor's
+  `sys_thread_get_registers` copies them out under `SCHED`, then to user
+  memory **outside** it, so a resume racing the copy-out cannot change them.
 
 ## The DPC queue lock is a leaf
 
@@ -171,18 +173,18 @@ Two corollaries:
 but it is a **leaf** — nothing is acquired while it is held, so it imposes no
 rank-ordering constraint beyond "acquire no other lock while holding it":
 
-- **`enqueue`** takes the lock, pushes one node pointer (within the pre-reserved
-  capacity — no allocation), and releases. It touches no other subsystem.
-- **`run_pending`** takes the lock, snapshots-and-clears the queue into a stack
-  buffer, **releases the lock**, and only *then* runs the handlers. A handler may
+- **`enqueue`** takes the lock, pushes one node pointer (into an inline list of
+  fixed capacity — no allocation), and releases. It touches no other subsystem.
+- **`run_pending`** takes the lock, takes the whole list by value, **releases the
+  lock**, and only *then* runs the handlers. A handler may
   take `SCHED` (to make a thread runnable) or `SERIAL` (to log) — but always
   *after* the queue lock is dropped, so `DPC_QUEUE` never nests with them.
 
 Because it holds nothing, it ranks below every other lock: it is legal to
 `enqueue` while holding `SCHED` (rank 1), and the drain re-acquires the
 higher-ranked `SCHED` inside a handler only after releasing `DPC_QUEUE`. Like the
-deadline heap and the per-object waiter lists, the queue is pre-reserved at boot
-(`dpc::init`) so `enqueue` never allocates in interrupt context.
+per-object waiter lists, the queue is held inline, so `enqueue` never allocates in
+interrupt context.
 
 ## The entropy lock is a leaf
 
@@ -475,22 +477,20 @@ from IRQ context, any plain `SpinLock` transitively acquirable **while holding
 `SCHED`** becomes deadlock-bait — the plain lock's ordinary holders run with
 IF=1 and can be interrupted into a spin on `SCHED`. Freeing is acquiring: an
 `ObjectRef` drop can reach the slab/buddy locks, so the no-allocation rule under
-`SCHED` (and in IRQ context) extends to **no `ObjectRef` drops** there. Watch
-`KVec::try_push` growth too: a `mem::take` of a pre-reserved collection swaps in
-a zero-capacity `KVec`, and later pushes then allocate under whatever lock is
-held — drain pre-reserved `SCHED` collections by popping into fixed buffers
-instead (`sched::drain_pending_drops`).
+`SCHED` (and in IRQ context) extends to **no `ObjectRef` drops** there.
 
-**Use `KVec::push_within_capacity`, not `try_push`, for anything pushed under a
-lock or in interrupt context** (2026-08-14). `try_push` *grows*, so at the reserve
-boundary it calls `kmalloc`/`kfree` under whatever is held, and a
-`debug_assert!(len < capacity)` beside it does not prevent that — the growth
-happens first and succeeds, so the assertion never fires and the inversion is
-silent. Six `SCHED`-held pushes were in that state until the audit found them
-(C.1(c)), along with the DPC queue's push at an interrupt tail and the entropy
-seed-waiter list. `push_within_capacity` cannot allocate and hands the value back
-rather than dropping it, which matters for the same reason as the rule above: a
-returned `ObjectRef` dropped there would reach `SlabCache::free`.
+**A list pushed where nothing may allocate — under `SCHED` or an `IrqSpinLock`, or
+in interrupt or DPC context — is a `Reserved` or an `ArrayVec`, never a `KVec`**
+(`kernel/src/libkern/`; 2026-10-29). `KVec::try_push`
+*grows*, so at the reserve boundary it calls `kmalloc`/`kfree` under whatever is
+held, and a `debug_assert!(len < capacity)` beside it does not prevent that: the
+growth happens first and succeeds, so the assertion never fires. A `Reserved` is
+allocated when it is made, outside the lock, and an `ArrayVec` is inline; neither
+can grow, and each push hands a value it cannot hold back rather than dropping
+it, which matters for the same reason as the rule above: a returned `ObjectRef`
+dropped there would reach `SlabCache::free`. A `Reserved` has no `Default`, so no
+`mem::take` swaps in a list of no room; drain one by popping into a fixed buffer
+(`sched::drain_pending_drops`).
 
 ## Wait queues and the deadline heap live under rank 1 (Phase 1)
 

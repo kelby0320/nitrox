@@ -108,6 +108,9 @@ struct Inner {
     /// Per-size-class freelist heads (a free slot stores the next pointer in its
     /// first 8 bytes; every class is `>= 16` bytes, so there is room).
     class_heads: [*mut u8; 8],
+    /// The current arena's mapping, which every slot carved from it is derived from, so a slot's
+    /// pointer carries the arena's provenance; null before the first arena maps.
+    arena_base: *mut u8,
     /// Next carve address in the current arena (`0` before the first arena maps).
     arena_cur: usize,
     arena_end: usize,
@@ -116,7 +119,13 @@ struct Inner {
 
 impl Inner {
     const fn new() -> Self {
-        Inner { class_heads: [core::ptr::null_mut(); 8], arena_cur: 0, arena_end: 0, arena_list: core::ptr::null_mut() }
+        Inner {
+            class_heads: [core::ptr::null_mut(); 8],
+            arena_base: core::ptr::null_mut(),
+            arena_cur: 0,
+            arena_end: 0,
+            arena_list: core::ptr::null_mut(),
+        }
     }
 }
 
@@ -222,10 +231,10 @@ impl<S: ArenaSource> HeapEngine<S> {
                 return core::ptr::null_mut();
             }
             inner.arena_cur = aligned + class_size;
-            return aligned as *mut u8;
+            return inner.arena_base.with_addr(aligned);
         }
         inner.arena_cur = aligned + class_size;
-        aligned as *mut u8
+        inner.arena_base.with_addr(aligned)
     }
 
     /// Map a new arena, make it current and link it into the list. Lock held.
@@ -234,14 +243,15 @@ impl<S: ArenaSource> HeapEngine<S> {
             Some(m) => m,
             None => return false,
         };
-        let base = m.ptr as usize;
-        let hdr = m.ptr as *mut ArenaHeader;
+        let base = m.ptr.addr();
+        let hdr = m.ptr.cast::<ArenaHeader>();
         // SAFETY: `m.ptr` is a fresh writable mapping of `ARENA_SIZE >= size_of
         // ArenaHeader`; nothing else references it yet.
         unsafe {
             hdr.write(ArenaHeader { next: inner.arena_list, token: m.token, size: ARENA_SIZE });
         }
         inner.arena_list = hdr;
+        inner.arena_base = m.ptr;
         inner.arena_cur = base + size_of::<ArenaHeader>();
         inner.arena_end = base + ARENA_SIZE;
         true
@@ -262,20 +272,19 @@ impl<S: ArenaSource> HeapEngine<S> {
             Some(m) => m,
             None => return core::ptr::null_mut(),
         };
-        let base = m.ptr as usize;
         // Aligned user pointer with at least `hdr` bytes of header room below it.
-        let p = round_up(base + hdr, align);
+        let p = round_up(m.ptr.addr() + hdr, align);
         // SAFETY: `p - hdr >= base` and `p + size <= base + map_len` (map_len bounds
         // hdr + align + size), so the header write is inside the fresh mapping.
         unsafe {
-            ((p - hdr) as *mut LargeHeader).write(LargeHeader {
+            m.ptr.with_addr(p - hdr).cast::<LargeHeader>().write(LargeHeader {
                 base: m.ptr,
                 token: m.token,
                 map_len,
                 magic: LARGE_MAGIC,
             });
         }
-        p as *mut u8
+        m.ptr.with_addr(p)
     }
 
     /// Free a large allocation: recover its header and unmap.
@@ -285,7 +294,7 @@ impl<S: ArenaSource> HeapEngine<S> {
     unsafe fn dealloc_large(&self, ptr: *mut u8) {
         let hdr_size = size_of::<LargeHeader>();
         // SAFETY: `alloc_large` wrote a `LargeHeader` at `ptr - hdr_size`.
-        let hdr = unsafe { &*((ptr as usize - hdr_size) as *const LargeHeader) };
+        let hdr = unsafe { &*ptr.map_addr(|a| a - hdr_size).cast::<LargeHeader>() };
         debug_assert_eq!(hdr.magic, LARGE_MAGIC, "libheap: large free corruption");
         let m = Mapping { ptr: hdr.base, token: hdr.token };
         // SAFETY: `m`/`map_len` are the exact pair `alloc_large` mapped.
@@ -309,7 +318,7 @@ impl<S: ArenaSource> Drop for HeapEngine<S> {
             let (next, token, size) = (hdr.next, hdr.token, hdr.size);
             // SAFETY: `(base, size)` is the exact pair `grow` mapped for this arena.
             unsafe {
-                S::unmap(Mapping { ptr: a as *mut u8, token }, size);
+                S::unmap(Mapping { ptr: a.cast::<u8>(), token }, size);
             }
             a = next;
         }
@@ -342,14 +351,16 @@ unsafe impl ArenaSource for SyscallSource {
             unsafe { libkern::syscall1(libkern::SYS_HANDLE_CLOSE, h as u64) };
             return None;
         }
-        Some(Mapping { ptr: addr as usize as *mut u8, token: h as u64 })
+        // The one place an address becomes a pointer: the kernel's mapping, which no Rust
+        // allocation gave.
+        Some(Mapping { ptr: core::ptr::with_exposed_provenance_mut(addr as usize), token: h as u64 })
     }
 
     unsafe fn unmap(m: Mapping, size: usize) {
         // SAFETY: unmap the region then close the backing object — unmap-before-close
         // so no mapping outlives the object's frames.
         unsafe {
-            libkern::syscall2(libkern::SYS_MEMORY_UNMAP, m.ptr as usize as u64, size as u64);
+            libkern::syscall2(libkern::SYS_MEMORY_UNMAP, m.ptr.addr() as u64, size as u64);
             libkern::syscall1(libkern::SYS_HANDLE_CLOSE, m.token);
         }
     }
@@ -404,6 +415,7 @@ mod tests {
         HeapEngine::new()
     }
 
+    // TODO(miri-provenance-tests): it fails only under Miri, which no CI job runs yet.
     #[test]
     fn basic_alloc_is_nonnull_aligned_writable() {
         let e = engine();

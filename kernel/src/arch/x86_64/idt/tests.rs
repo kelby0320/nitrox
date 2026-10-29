@@ -87,3 +87,114 @@ fn the_entry_flag_clear_leaves_df_and_ac_clear() {
     assert_eq!(set & DF_AC, DF_AC, "the test set both");
     assert_eq!(cleared & DF_AC, 0, "the clear left {:#x}", cleared & DF_AC);
 }
+
+/// **A vector delivered on an IST stack is never a user fault**, from ring 3 or not: suspending
+/// would park the thread, and its context, on the per-CPU stack the next NMI or #DF reuses.
+#[test]
+fn an_nmi_or_double_fault_from_ring_3_is_not_a_user_fault() {
+    let frame = |vector, cs| {
+        // SAFETY: every field is a `u64`, for which zero is valid.
+        let mut f: ExceptionFrame = unsafe { core::mem::zeroed() };
+        (f.vector, f.cs) = (vector, cs);
+        f
+    };
+    for vector in [2, 8] {
+        assert!(!is_user_fault(&frame(vector, 0x23)), "vector {vector} from ring 3");
+    }
+    for vector in [0, 6, 13, 14] {
+        assert!(is_user_fault(&frame(vector, 0x23)), "vector {vector} from ring 3");
+        assert!(!is_user_fault(&frame(vector, 0x08)), "vector {vector} from ring 0");
+    }
+    assert!(is_user_nmi(&frame(2, 0x23)) && !is_user_nmi(&frame(2, 0x08)) && !is_user_nmi(&frame(8, 0x23)));
+}
+
+/// **A fault's registers are its frame's, field for field**, each of the 18 a distinct value.
+#[test]
+fn a_faults_registers_are_its_frames_field_for_field() {
+    let f = ExceptionFrame {
+        r15: 16,
+        r14: 15,
+        r13: 14,
+        r12: 13,
+        r11: 12,
+        r10: 11,
+        r9: 10,
+        r8: 9,
+        rbp: 7,
+        rdi: 6,
+        rsi: 5,
+        rdx: 4,
+        rcx: 3,
+        rbx: 2,
+        rax: 1,
+        vector: 13,
+        error_code: 0,
+        rip: 17,
+        cs: 0x23,
+        rflags: 18,
+        rsp: 8,
+        ss: 0x1b,
+    };
+    let expected = RegisterValues {
+        rax: 1,
+        rbx: 2,
+        rcx: 3,
+        rdx: 4,
+        rsi: 5,
+        rdi: 6,
+        rbp: 7,
+        rsp: 8,
+        r8: 9,
+        r9: 10,
+        r10: 11,
+        r11: 12,
+        r12: 13,
+        r13: 14,
+        r14: 15,
+        r15: 16,
+        rip: 17,
+        rflags: 18,
+    };
+    assert_eq!(registers_of(&f), expected);
+}
+
+fn frame_at(vector: u64, cs: u64) -> ExceptionFrame {
+    // SAFETY: every field is a `u64`, for which zero is valid.
+    let mut f: ExceptionFrame = unsafe { core::mem::zeroed() };
+    (f.vector, f.cs) = (vector, cs);
+    f
+}
+
+/// **Each exception is taken as its vector, ring and the stop say.**
+#[test]
+fn each_exception_is_taken_as_its_vector_ring_and_the_stop_say() {
+    use Taken::*;
+    let cases = [
+        ((2, 0x23, true), Stop),
+        ((2, 0x08, true), Stop),
+        ((2, 0x23, false), UserNmi),
+        ((2, 0x08, false), Fatal),
+        ((8, 0x23, false), Fatal),
+        ((8, 0x23, true), Fatal),
+        ((13, 0x23, false), UserFault),
+        ((6, 0x23, true), UserFault),
+        ((13, 0x08, false), Fatal),
+    ];
+    for ((vector, cs, stopping), expected) in cases {
+        assert_eq!(
+            taken(&frame_at(vector, cs), stopping),
+            expected,
+            "vector {vector}, cs {cs:#x}, stopping {stopping}"
+        );
+    }
+}
+
+/// **Only a ring-3 interrupt off an IST stack may end its thread on its return.**
+#[test]
+fn only_a_ring_3_interrupt_off_an_ist_stack_ends_its_thread_on_return() {
+    for (vector, cs, ends) in
+        [(32, 0x23, true), (13, 0x23, true), (2, 0x23, false), (8, 0x23, false), (32, 0x08, false)]
+    {
+        assert_eq!(ends_on_return(&frame_at(vector, cs)), ends, "vector {vector}, cs {cs:#x}");
+    }
+}

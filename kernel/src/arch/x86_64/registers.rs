@@ -1,17 +1,5 @@
-//! x86_64 user-register snapshot ([`RegisterValues`]) and the
-//! [`ArchRegisters`](crate::arch::registers::ArchRegisters) marker
-//! [`X86Registers`].
-//!
-//! The `impl ArchRegisters for X86Registers` lives in [`idt`](super::idt),
-//! where the private `ExceptionFrame` it decodes is defined — so reading a
-//! suspended thread's registers needs no widening of that frame's visibility.
-//! This module owns only the data type and the marker; `crate::arch`
-//! re-exports them as `RegisterValues` and `Registers`.
-
-/// The x86_64 marker implementing
-/// [`ArchRegisters`](crate::arch::registers::ArchRegisters); re-exported as
-/// [`crate::arch::Registers`].
-pub struct X86Registers;
+//! x86_64 user-register snapshot ([`RegisterValues`]), re-exported as `crate::arch::RegisterValues`.
+//! A ring-3 fault decodes it in [`idt`](super::idt), where the private `ExceptionFrame` is.
 
 /// A snapshot of an x86_64 thread's user register state, written by
 /// `sys_thread_get_registers` for a suspended (faulted) thread.
