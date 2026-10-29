@@ -82,6 +82,7 @@ pub struct BlockDeviceInfo {
     /// recognises the thing they are about to lose.
     pub name: [u8; MAX_DEVICE_NAME],
 }
+crate::libkern::pod::pod!(BlockDeviceInfo { kind, logical_block_size, block_count, name_len, _reserved, name });
 
 const _: () = assert!(size_of::<BlockDeviceInfo>() == 96);
 const _: () = assert!(align_of::<BlockDeviceInfo>() == 8);
@@ -133,9 +134,7 @@ impl BlockDeviceInfo {
 
     /// Reinterpret as bytes, for copying into a `MemoryObject`.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `Self` is `#[repr(C)]` with every offset and the total size pinned by the
-        // asserts above, holds no pointers, and is valid for `size_of::<Self>()` bytes.
-        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+        crate::libkern::pod::bytes_of(self)
     }
 }
 

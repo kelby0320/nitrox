@@ -57,6 +57,7 @@ pub struct SpawnArgs {
     /// `docs/architecture/syscaps.md`.
     pub syscaps: u64,
 }
+crate::libkern::pod::pod!(SpawnArgs { image, handle_count, move_mask, arg0, handles, rights, namespace, syscaps });
 
 const _: () = assert!(core::mem::size_of::<SpawnArgs>() == 24 + 16 * SPAWN_MAX_HANDLES + 16);
 const _: () = assert!(core::mem::align_of::<SpawnArgs>() == 8);

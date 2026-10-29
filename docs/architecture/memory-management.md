@@ -583,8 +583,9 @@ management story.
   rejects addresses in the kernel half (`addr >= USER_VIRT_END`) and
   misalignments for `T`. Everything outside this module that needs
   to touch user memory does so through the five copy primitives.
-- **Five copy primitives.** `copy_from_user<T: Copy>`,
-  `copy_to_user<T: Copy>`, `copy_slice_from_user`,
+- **Five copy primitives.** `copy_from_user<T: Pod>`,
+  `copy_to_user<T: Pod>` (`T` plain data: no padding, every bit
+  pattern a value), `copy_slice_from_user`,
   `copy_slice_to_user`, `copy_cstr_from_user`. All return
   `Result<_, UserAccessError>`. The slice variants use `rep movsb`
   under `stac` / `clac`; the cstr variant uses a byte-at-a-time

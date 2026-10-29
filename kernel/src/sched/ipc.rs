@@ -585,8 +585,7 @@ mod tests {
     fn a_send_that_could_close_a_cycle_of_endpoints_is_refused() {
         init_global_heap();
         test_probe::reset();
-        // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value.
-        let msg = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.unwrap();
+        let msg = KBox::<StoredMsg>::try_new_zeroed().unwrap();
         let ((a, b), (c, d)) = (pair(), pair());
         let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
         // SAFETY: every endpoint and the PO are pinned by the test's references.
@@ -681,8 +680,7 @@ mod tests {
     #[test]
     fn an_endpoint_holding_another_in_a_held_send_is_refused_too() {
         init_global_heap();
-        // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value.
-        let msg = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.unwrap();
+        let msg = KBox::<StoredMsg>::try_new_zeroed().unwrap();
         let ((a, b), (c, d)) = (pair(), pair());
         let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
         let mut none: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);

@@ -1544,9 +1544,8 @@ fn forward_userspace_lookup(
     fwd: Forward<'_>,
 ) -> Option<Resolved> {
     // Heap-bounced (4 KiB, never on the stack); a grow or create request also carries the size.
-    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
-    // in place so the 4 KiB message never lands in this frame (see `try_new_zeroed`).
-    let mut msg = match unsafe { KBox::<StoredMsg>::try_new_zeroed() } {
+    // Zeroed in place, so the 4 KiB message never lands in this frame.
+    let mut msg = match KBox::<StoredMsg>::try_new_zeroed() {
         Ok(m) => m,
         Err(_) => return Some((KError::OutOfMemory as i32, None)),
     };
@@ -1779,12 +1778,7 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
                     k += 1;
                 }
             }
-            // SAFETY: `IoResult` is `#[repr(C)]` with every byte initialised and
-            // no padding (asserted in `libkern::io_result`); reinterpret the
-            // first `k` records as a byte slice to copy out.
-            let bytes =
-                unsafe { core::slice::from_raw_parts(out.as_ptr() as *const u8, k * core::mem::size_of::<IoResult>()) };
-            copy_slice_to_user(rptr, bytes).map_err(from_user_access)?;
+            copy_slice_to_user(rptr, crate::libkern::pod::slice_bytes(&out[..k])).map_err(from_user_access)?;
             Ok(k as isize)
         }
         crate::sched::WaitResult::TimedOut => {
@@ -1965,9 +1959,8 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
         claims[i] = Some(claim);
     }
 
-    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
-    // in place — a stack temporary here would be 4 KiB on every send.
-    let mut bounce = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
+    // Zeroed in place: a stack temporary here would be 4 KiB on every send.
+    let mut bounce = KBox::<StoredMsg>::try_new_zeroed().map_err(|_| KError::OutOfMemory)?;
     copy_slice_from_user(bounce.as_bytes_mut(), mptr).map_err(from_user_access)?;
     bounce.seal().ok_or(KError::InvalidArgument)?;
     bounce.header.sender_pid = pid;
@@ -2196,10 +2189,9 @@ fn notify_file_touched(file_obj: &ObjectRef) {
         return; // not a cached Model A file — nothing to notify
     };
     // Heap-bounced: a 4 KiB `StoredMsg` does not belong on a measured kernel stack.
-    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed in
-    // place — the by-value form would put 4 KiB in this frame, on a sync path that is
+    // Zeroed in place: the by-value form would put 4 KiB in this frame, on a sync path that is
     // already among the deepest in the kernel.
-    let Ok(mut msg) = (unsafe { KBox::<crate::object::ipc_channel::StoredMsg>::try_new_zeroed() }) else {
+    let Ok(mut msg) = KBox::<crate::object::ipc_channel::StoredMsg>::try_new_zeroed() else {
         return;
     };
     let Some(body_len) = crate::rsproto::build_touch_request(&mut msg.payload, file_id) else {
@@ -2543,9 +2535,8 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
         RecvState::PeerClosed => return Err(KError::PeerClosed),
         RecvState::HasMsg => {}
     }
-    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed in
-    // place — a stack temporary here would be 4 KiB on every recv.
-    let mut bounce = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
+    // Zeroed in place: a stack temporary here would be 4 KiB on every recv.
+    let mut bounce = KBox::<StoredMsg>::try_new_zeroed().map_err(|_| KError::OutOfMemory)?;
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     // Popping frees a ring slot, so a held blocking sender may be promoted into it; its PO and
     // any timed-out (`BlockBounded`) sends drop at scope exit, **outside** `SCHED`.

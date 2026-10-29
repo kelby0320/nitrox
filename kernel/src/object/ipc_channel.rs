@@ -37,17 +37,16 @@ pub struct StoredMsg {
     /// Transferable-handle slots.
     pub handles: [u64; crate::libkern::ipc::IPC_HANDLE_MAX],
 }
+crate::libkern::pod::pod!(StoredMsg { header, payload, handles });
 
 const _: () = assert!(core::mem::size_of::<StoredMsg>() == IPC_MSG_SIZE);
 // `IpcMsg` and `StoredMsg` share field offsets (`IpcMsg`'s page alignment adds no padding).
 const _: () = assert!(core::mem::offset_of!(StoredMsg, payload) == 24);
 
 impl StoredMsg {
-    /// An all-zero message (a valid bit pattern).
+    /// An all-zero message.
     pub fn zeroed() -> Self {
-        // SAFETY: `StoredMsg` is `#[repr(C)]` over `u32`/`u8`/`u16`/`u64`
-        // (arrays included); the all-zero bit pattern is a valid value.
-        unsafe { core::mem::zeroed() }
+        <Self as crate::libkern::Pod>::zeroed()
     }
 
     /// Zero what a receiver is promised zeroed, the header's padding and the payload past
@@ -64,16 +63,12 @@ impl StoredMsg {
 
     /// The 4096 wire bytes, for `copy_slice_to_user`.
     pub fn as_bytes(&self) -> &[u8; IPC_MSG_SIZE] {
-        // SAFETY: `#[repr(C)]`, size 4096 (asserted), no interior padding (the
-        // three regions tile the size exactly — see `libkern::ipc`), every byte
-        // initialised, so reinterpreting as `[u8; 4096]` exposes only defined bytes.
-        unsafe { &*(self as *const Self as *const [u8; IPC_MSG_SIZE]) }
+        crate::libkern::pod::byte_array_of(self)
     }
 
     /// The 4096 wire bytes, mutably, for `copy_slice_from_user`.
     pub fn as_bytes_mut(&mut self) -> &mut [u8; IPC_MSG_SIZE] {
-        // SAFETY: as [`as_bytes`](Self::as_bytes); `&mut self` proves exclusivity.
-        unsafe { &mut *(self as *mut Self as *mut [u8; IPC_MSG_SIZE]) }
+        crate::libkern::pod::byte_array_of_mut(self)
     }
 }
 

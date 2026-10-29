@@ -112,6 +112,7 @@ pub struct RegistryHeader {
     /// thing. `/dev/registry/changes` answers in the same terms.
     pub generation: u64,
 }
+crate::libkern::pod::pod!(RegistryHeader { magic, version, count, record_size, generation });
 
 const _: () = assert!(size_of::<RegistryHeader>() == 24);
 const _: () = assert!(align_of::<RegistryHeader>() == 8);
@@ -184,6 +185,32 @@ pub struct DeviceRecord {
     /// device's product and serial (or `vvvv:pppp` when it has no strings).
     pub name: [u8; MAX_DEVICE_NAME],
 }
+crate::libkern::pod::pod!(DeviceRecord {
+    id,
+    class,
+    kind,
+    served,
+    parent,
+    outcome,
+    vendor,
+    device,
+    pci_class,
+    subclass,
+    prog_if,
+    revision,
+    seg,
+    bus,
+    dev,
+    func,
+    port,
+    speed,
+    flags,
+    logical_block_size,
+    name_len,
+    block_count,
+    driver,
+    name
+});
 
 const _: () = assert!(size_of::<DeviceRecord>() == 144);
 const _: () = assert!(align_of::<DeviceRecord>() == 8);
@@ -241,18 +268,14 @@ impl Default for DeviceRecord {
 impl RegistryHeader {
     /// The header's bytes, as they go on the wire.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `RegistryHeader` is `repr(C)`, four `u32`s then a `u64` at offset 16, so no
-        // padding, fully initialised.
-        unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
+        crate::libkern::pod::bytes_of(self)
     }
 }
 
 impl DeviceRecord {
     /// The record's bytes, as they go on the wire.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `DeviceRecord` is `repr(C)` and its `flags` byte leaves no implicit padding
-        // (the offset asserts above account for every byte), so every byte is initialised.
-        unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
+        crate::libkern::pod::bytes_of(self)
     }
 }
 
@@ -291,6 +314,16 @@ pub struct CacheCounts {
     /// The pages the fills brought in (version 2).
     pub fill_pages: u64,
 }
+crate::libkern::pod::pod!(CacheCounts {
+    fills,
+    fill_ns,
+    hole_fills,
+    hits,
+    writeback_pages,
+    writeback_irps,
+    writeback_ns,
+    fill_pages
+});
 
 const _: () = assert!(size_of::<CacheCounts>() == 64);
 const _: () = assert!(align_of::<CacheCounts>() == 8);
@@ -310,6 +343,7 @@ pub struct IoHeader {
     /// The page cache's counters.
     pub cache: CacheCounts,
 }
+crate::libkern::pod::pod!(IoHeader { magic, version, count, record_size, cache });
 
 const _: () = assert!(size_of::<IoHeader>() == 80);
 const _: () = assert!(align_of::<IoHeader>() == 8);
@@ -343,6 +377,7 @@ pub struct IoRecord {
     /// Nanoseconds commands were on the device, from issue to retirement.
     pub busy_ns: u64,
 }
+crate::libkern::pod::pod!(IoRecord { id, flags, reads, writes, flushes, errors, read_bytes, written_bytes, busy_ns });
 
 const _: () = assert!(size_of::<IoRecord>() == 64);
 const _: () = assert!(align_of::<IoRecord>() == 8);
@@ -355,17 +390,13 @@ const _: () = assert!(offset_of!(IoRecord, busy_ns) == 56);
 impl IoHeader {
     /// The header's bytes, as they go on the wire.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `IoHeader` is `repr(C)`, four `u32`s then seven `u64`s, so no padding, fully
-        // initialised.
-        unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
+        crate::libkern::pod::bytes_of(self)
     }
 }
 
 impl IoRecord {
     /// The record's bytes, as they go on the wire.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `IoRecord` is `repr(C)`, two `u32`s then seven `u64`s, so no padding, fully
-        // initialised.
-        unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>()) }
+        crate::libkern::pod::bytes_of(self)
     }
 }

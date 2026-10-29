@@ -8,9 +8,9 @@
 "kernel/src/drivers/xhci/storage.rs" = 1702
 "kernel/src/main.rs" = 1186
 "kernel/src/mm/vmm.rs" = 1560
-"kernel/src/object/file_object.rs" = 2460
+"kernel/src/object/file_object.rs" = 2459
 "kernel/src/pci/mod.rs" = 1045
-"kernel/src/syscall/table.rs" = 2613
+"kernel/src/syscall/table.rs" = 2604
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
 "userspace/compositor/src/main.rs" = 2293

@@ -40,6 +40,7 @@ pub struct ThreadArgs {
     /// Reserved; must be zero (offset 28).
     pub _reserved: [u8; 36],
 }
+crate::libkern::pod::pod!(ThreadArgs { entry, user_sp, arg0, class, rt_priority, nice, cpu_affinity, _reserved });
 
 /// `ThreadArgs::class` — the default cooperative/fair class (a zeroed block).
 pub const THREAD_CLASS_TIMESHARED: u8 = 0;

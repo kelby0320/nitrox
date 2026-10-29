@@ -105,6 +105,7 @@ pub struct Notification {
     kind: u32,
     body: [u8; 60],
 }
+crate::libkern::pod::pod!(Notification { kind, body });
 
 const _: () = assert!(core::mem::size_of::<Notification>() == 64);
 const _: () = assert!(core::mem::align_of::<Notification>() == 8);
@@ -186,10 +187,7 @@ impl Notification {
 
     /// The 64 wire bytes, for `copy_to_user`.
     pub fn as_bytes(&self) -> &[u8; 64] {
-        // SAFETY: `#[repr(C, align(8))]` with size 64 (asserted above); every
-        // byte is initialised (`u32` + `[u8; 60]`) with no interior padding, so
-        // reinterpreting as `[u8; 64]` exposes only defined bytes.
-        unsafe { &*(self as *const Self as *const [u8; 64]) }
+        crate::libkern::pod::byte_array_of(self)
     }
 }
 

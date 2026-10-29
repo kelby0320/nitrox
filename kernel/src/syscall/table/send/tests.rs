@@ -31,8 +31,7 @@ fn held(h: RawHandle, pid: u32) -> bool {
 }
 
 fn message() -> KBox<StoredMsg> {
-    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value.
-    unsafe { KBox::<StoredMsg>::try_new_zeroed() }.unwrap()
+    KBox::<StoredMsg>::try_new_zeroed().unwrap()
 }
 
 /// **A send closes the handles it moves once its message is queued**, and only then.

@@ -31,12 +31,11 @@ pub trait ArchUserAccess {
     /// the arch's access protection must be enabled.
     unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize) -> bool;
 
-    /// Byte-by-byte copy of a NUL-terminated user string, stopping at the
-    /// first NUL or when `max_len` bytes have been read.
+    /// Byte-by-byte copy of a NUL-terminated user string into `dst`, stopping at the first NUL or
+    /// when `dst` is full. An empty `dst` is [`CstrCopyOutcome::NoTerminator`], touching nothing.
     ///
     /// # Safety
-    /// Same contract as [`copy_bytes`](ArchUserAccess::copy_bytes): `src`
-    /// points into user memory, `dst` provides `max_len` writable kernel
-    /// bytes, the arch's access protection is enabled.
-    unsafe fn copy_cstr(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome;
+    /// As [`copy_bytes`](ArchUserAccess::copy_bytes): `src` points into user memory for
+    /// `dst.len()` bytes, and the arch's access protection is enabled.
+    unsafe fn copy_cstr(dst: &mut [u8], src: *const u8) -> CstrCopyOutcome;
 }

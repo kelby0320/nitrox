@@ -1150,8 +1150,7 @@ impl FileObject {
         let len = remaining.min(PAGE_SIZE) as u32;
         // A heap-bounced message, allocated zeroed **in place**: building it on the stack takes 4
         // KiB of kernel stack.
-        // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value.
-        let mut msg = match unsafe { KBox::<StoredMsg>::try_new_zeroed() } {
+        let mut msg = match KBox::<StoredMsg>::try_new_zeroed() {
             Ok(m) => m,
             Err(_) => return false,
         };

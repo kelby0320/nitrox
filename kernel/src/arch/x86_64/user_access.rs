@@ -84,11 +84,11 @@ pub enum CstrCopyOutcome {
 }
 
 /// Byte-by-byte copy of a NUL-terminated user string, stopping at the first NUL or after
-/// `max_len` bytes.
+/// `max_len` bytes. **It copies a byte before it compares the count**, so `max_len` is at least 1.
 ///
 /// # Safety
 /// Same contract as [`copy_bytes_raw`]: `src` points into user
-/// memory, `dst` provides `max_len` writable kernel bytes, SMAP is
+/// memory, `dst` provides `max_len` writable kernel bytes, `max_len` is not 0, SMAP is
 /// enabled.
 #[cfg(not(test))]
 pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome {
@@ -157,23 +157,27 @@ std::thread_local! {
         const { core::cell::Cell::new(false) };
 }
 
-/// Host-test stand-in for the asm [`copy_cstr_raw`], with a forced-fault hook.
+/// Host-test stand-in for the asm [`copy_cstr_raw`], with a forced-fault hook: the same loop, a
+/// byte copied before the count is compared, reading no further than the asm.
 #[cfg(test)]
 pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome {
     if FAIL_NEXT_CSTR_COPY.with(|f| f.replace(false)) {
         return CstrCopyOutcome::Fault;
     }
-    // SAFETY: forwarded; host tests use ordinary in-process buffers.
-    let src_slice = unsafe { core::slice::from_raw_parts(src, max_len) };
-    // SAFETY: as above.
-    let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, max_len) };
-    for i in 0..max_len {
-        dst_slice[i] = src_slice[i];
-        if src_slice[i] == 0 {
-            return CstrCopyOutcome::Ok(i + 1);
+    let mut n = 0;
+    loop {
+        // SAFETY: forwarded; host tests use ordinary in-process buffers.
+        let b = unsafe { *src.add(n) };
+        // SAFETY: as above.
+        unsafe { *dst.add(n) = b };
+        n += 1;
+        if b == 0 {
+            return CstrCopyOutcome::Ok(n);
+        }
+        if n >= max_len {
+            return CstrCopyOutcome::NoTerminator;
         }
     }
-    CstrCopyOutcome::NoTerminator
 }
 
 /// The x86_64 [`ArchUserAccess`](crate::arch::user_access::ArchUserAccess) implementation,
@@ -186,8 +190,12 @@ impl crate::arch::user_access::ArchUserAccess for X86UserAccess {
         unsafe { copy_bytes_raw(dst, src, len) }
     }
 
-    unsafe fn copy_cstr(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome {
-        // SAFETY: forwarded verbatim to `copy_cstr_raw`'s contract.
-        unsafe { copy_cstr_raw(dst, src, max_len) }
+    unsafe fn copy_cstr(dst: &mut [u8], src: *const u8) -> CstrCopyOutcome {
+        if dst.is_empty() {
+            return CstrCopyOutcome::NoTerminator;
+        }
+        // SAFETY: forwarded to `copy_cstr_raw`'s contract; `dst` is its `len()` writable bytes,
+        // and not empty.
+        unsafe { copy_cstr_raw(dst.as_mut_ptr(), src, dst.len()) }
     }
 }

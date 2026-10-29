@@ -24,11 +24,12 @@
 //! simpler and the per-entry cost (16 vs 8 bytes) is negligible.
 
 use core::marker::PhantomData;
-use core::mem::{MaybeUninit, align_of, size_of};
+use core::mem::{align_of, size_of};
 
 use crate::arch::UserAccess;
 use crate::arch::abi::USER_VIRT_END;
 use crate::arch::user_access::{ArchUserAccess, CstrCopyOutcome};
+use crate::libkern::pod::{Pod, bytes_of, bytes_of_mut};
 
 /// One entry in `.user_access_table`: a (fault_pc, recovery_pc) pair. The copy primitives' inline
 /// asm emits entries with `.quad`, so Rust and asm must agree on the layout: `#[repr(C)]`.
@@ -173,47 +174,36 @@ fn validate_user_range(addr: u64, len: u64) -> Result<(), UserAccessError> {
 }
 
 /// Copy a `T` out of user memory; [`UserAccessError::Fault`] commits no kernel-side state. A
-/// zero-sized `T` yields its only value without touching the pointer.
-pub fn copy_from_user<T: Copy>(src: UserPtr<T>) -> Result<T, UserAccessError> {
+/// zero-sized `T` yields its only value without touching the pointer. `T` is plain data, so the
+/// user's bytes, whatever they are, are a `T`.
+pub fn copy_from_user<T: Pod>(src: UserPtr<T>) -> Result<T, UserAccessError> {
     let addr = src.as_u64();
+    let mut out = T::zeroed();
     let n = size_of::<T>();
     if n == 0 {
-        // SAFETY: `T` is zero-sized, so there is only one possible
-        // value and no bytes need be initialised.
-        #[allow(clippy::uninit_assumed_init, reason = "a zero-sized T has no bytes to initialise")]
-        return Ok(unsafe { MaybeUninit::<T>::uninit().assume_init() });
+        return Ok(out);
     }
     validate_user_range(addr, n as u64)?;
-    let mut out = MaybeUninit::<T>::uninit();
-    // SAFETY: `out` is properly-aligned local storage of exactly `n`
-    // bytes; `addr` was validated user-half and aligned-for-T; the
-    // copy goes through `arch::user_access::copy_bytes_raw`, which
-    // opens the SMAP window and registers an exception-table entry
-    // for the read.
-    let faulted = unsafe { UserAccess::copy_bytes(out.as_mut_ptr().cast::<u8>(), addr as *const u8, n) };
-    if faulted {
-        return Err(UserAccessError::Fault);
-    }
-    // SAFETY: `copy_bytes_raw` returning `false` means every byte
-    // landed; `out` is fully initialised as a `T`.
-    Ok(unsafe { out.assume_init() })
+    // SAFETY: `out` is `n` writable bytes; `addr` was validated user-half and aligned-for-T; the
+    // copy goes through `arch::user_access::copy_bytes_raw`, which opens the SMAP window and
+    // registers an exception-table entry for the read.
+    let faulted = unsafe { UserAccess::copy_bytes(bytes_of_mut(&mut out).as_mut_ptr(), addr as *const u8, n) };
+    if faulted { Err(UserAccessError::Fault) } else { Ok(out) }
 }
 
 /// Copy a `T` from kernel memory into user memory. [`UserAccessError::Fault`] on a fault, after
 /// which a prefix of the bytes may already be visible to the user; `src` is untouched. A no-op
-/// for zero-sized `T`.
-pub fn copy_to_user<T: Copy>(dst: UserMutPtr<T>, src: &T) -> Result<(), UserAccessError> {
+/// for zero-sized `T`. `T` is plain data, so no padding carries kernel bytes out.
+pub fn copy_to_user<T: Pod>(dst: UserMutPtr<T>, src: &T) -> Result<(), UserAccessError> {
     let addr = dst.as_u64();
     let n = size_of::<T>();
     if n == 0 {
         return Ok(());
     }
     validate_user_range(addr, n as u64)?;
-    let src_ptr = (src as *const T).cast::<u8>();
-    // SAFETY: `src_ptr` is a valid `n`-byte read source (it is
-    // `src`'s own backing storage); `addr` was validated user-half +
+    // SAFETY: `src`'s bytes are a valid `n`-byte read source; `addr` was validated user-half +
     // aligned-for-T. `copy_bytes_raw` handles SMAP/exception-table.
-    let faulted = unsafe { UserAccess::copy_bytes(addr as *mut u8, src_ptr, n) };
+    let faulted = unsafe { UserAccess::copy_bytes(addr as *mut u8, bytes_of(src).as_ptr(), n) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
@@ -262,7 +252,7 @@ pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], Us
     // `max` writable bytes. The arch raw primitive walks user memory
     // one byte at a time, registering only the user-side load as a
     // fault site.
-    let outcome = unsafe { UserAccess::copy_cstr(dst.as_mut_ptr(), addr as *const u8, max) };
+    let outcome = unsafe { UserAccess::copy_cstr(dst, addr as *const u8) };
     match outcome {
         CstrCopyOutcome::Ok(count) => Ok(&dst[..count]),
         CstrCopyOutcome::Fault => Err(UserAccessError::Fault),
@@ -441,6 +431,17 @@ mod tests {
             assert_eq!(out, b"hello\0");
             assert_eq!(out.len(), 6);
         }
+    }
+
+    /// **A string copy into an empty destination writes nothing**: the routine copies a byte
+    /// before it compares the count, so an empty destination is refused before it.
+    #[test]
+    fn a_string_copy_into_an_empty_destination_writes_nothing() {
+        let src = *b"x\0";
+        let mut buf = [0xAAu8; 2];
+        // SAFETY: host buffers stand in for user memory.
+        let outcome = unsafe { UserAccess::copy_cstr(&mut buf[..0], src.as_ptr()) };
+        assert_eq!((outcome, buf), (CstrCopyOutcome::NoTerminator, [0xAA, 0xAA]));
     }
 
     #[test]

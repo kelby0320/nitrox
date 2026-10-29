@@ -23,6 +23,7 @@ pub struct IoOp {
     /// Bytes to transfer.
     pub length: u64,
 }
+crate::libkern::pod::pod!(IoOp { opcode, flags, buffer, buf_offset, offset, length });
 
 /// [`IoOpcode::Read`]'s value — named, so `abi-sync-check` can pair it with `libkern`'s.
 pub const IO_OPCODE_READ: u32 = 0;

@@ -58,6 +58,7 @@ pub struct IpcMsgHeader {
     /// Monotonic nanoseconds at enqueue; set by the kernel (offset 16).
     pub timestamp: u64,
 }
+crate::libkern::pod::pod!(IpcMsgHeader { sender_pid, payload_len, handle_count, _pad1, flags, _pad2, timestamp });
 
 /// One IPC message: header + inline payload + transferable-handle array.
 /// `#[repr(C, align(4096))]` — exactly one page.

@@ -34,6 +34,7 @@ use core::ops::{BitAnd, BitOr, BitOrAssign};
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct RawHandle(pub u64);
+crate::libkern::pod::pod!(RawHandle { 0 });
 
 impl RawHandle {
     /// The reserved invalid handle. Never issued by the kernel; safe for userspace to use as
@@ -318,6 +319,7 @@ pub struct HandleInfo {
     /// The referenced object's byte size for sized resources, else `0`.
     pub size: u64,
 }
+crate::libkern::pod::pod!(HandleInfo { rights, object_type, generation, size });
 
 const _: () = assert!(core::mem::size_of::<HandleInfo>() == 24);
 const _: () = assert!(core::mem::align_of::<HandleInfo>() == 8);
@@ -363,6 +365,7 @@ pub struct NsEntry {
     /// The binding path bytes (`path[..min(path_len, NS_ENTRY_PATH_MAX)]`).
     pub path: [u8; NS_ENTRY_PATH_MAX],
 }
+crate::libkern::pod::pod!(NsEntry { path_len, kind, rights, path });
 
 const _: () = assert!(core::mem::size_of::<NsEntry>() == 16 + NS_ENTRY_PATH_MAX);
 const _: () = assert!(core::mem::align_of::<NsEntry>() == 8);
