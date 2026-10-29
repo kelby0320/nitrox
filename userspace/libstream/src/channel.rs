@@ -425,6 +425,16 @@ mod tests {
         assert!(rx.into_port().recvs <= 65);
     }
 
+    /// The cap holds on the last message too: a stream ending one byte past it is refused, and
+    /// one ending on it is not.
+    #[test]
+    fn receive_holds_the_cap_on_the_last_message() {
+        let mut rx = ChannelReceiver::new(Endless { recvs: 0, total: 10 });
+        assert_eq!(rx.receive(10 * 1024 - 1), Err(WireError::TooLarge));
+        let mut rx = ChannelReceiver::new(Endless { recvs: 0, total: 10 });
+        assert_eq!(rx.receive(10 * 1024).map(|b| b.len()), Ok(10 * 1024));
+    }
+
     #[test]
     fn receive_returns_everything_under_a_cap_above_the_total() {
         let mut rx = ChannelReceiver::new(Endless { recvs: 0, total: 1000 });

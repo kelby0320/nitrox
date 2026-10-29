@@ -176,3 +176,48 @@ fn an_error_record_field_name_of_u16_max_round_trips() {
     assert_eq!(src.u8(), Ok(REC_ERROR));
     assert_eq!(WireErrorRecord::decode_body(&mut src), Ok(rec));
 }
+
+/// **An absent nullable value spends from the budget too**, as the spec says every value does: a
+/// row of an absent nullable `Int` and two `Null`s is three values in two bytes.
+#[test]
+fn an_absent_nullable_value_spends_from_the_budget() {
+    let schema = Schema::new()
+        .field("a", TypeTag::Int, TypeModifiers::NULLABLE)
+        .field("b", TypeTag::Null, TypeModifiers::NONE)
+        .field("c", TypeTag::Null, TypeModifiers::NONE);
+    let rows = |n: usize| {
+        let mut buf = Vec::new();
+        encode_header(&mut buf, StreamFlags::NONE, &schema).unwrap();
+        for _ in 0..n {
+            buf.extend_from_slice(&[REC_DATA, 0]);
+        }
+        encode_terminator(&mut buf, 0).unwrap();
+        buf
+    };
+    let past = rows(10_000);
+    assert!(3 * 10_000 > past.len() + VALUE_FLOOR);
+    assert_eq!(Table::decode(&past).map(|t| t.rows.len()), Err(WireError::TooLarge));
+    let within = rows(4_000);
+    assert!(3 * 4_000 <= within.len() + VALUE_FLOOR);
+    assert_eq!(Table::decode(&within).map(|t| t.rows.len()), Ok(4_000));
+}
+
+/// **Depth is a value's nesting, not a stream's count of nested values**: a list of 100 lists
+/// decodes, each level given back when its value ends.
+#[test]
+fn sibling_lists_give_their_level_back() {
+    let siblings = Value::List(Arc::from((0..100).map(|_| nested_lists(2)).collect::<Vec<_>>()));
+    let mut buf = Vec::new();
+    write_value(&mut buf, &siblings).unwrap();
+    assert_eq!(decode(&buf, TypeTag::List), Ok(siblings));
+}
+
+/// **A chain of records alone is held to the depth**, as a chain of lists is.
+#[test]
+fn a_chain_of_records_is_held_to_the_depth() {
+    let chain = |levels: usize| (1..levels).fold(record_of(Value::Int(1)), |v, _| record_of(v));
+    let mut buf = Vec::new();
+    write_value(&mut buf, &chain(MAX_DEPTH)).unwrap();
+    assert_eq!(decode(&buf, TypeTag::Record), Ok(chain(MAX_DEPTH)));
+    assert_eq!(write_value(&mut Vec::new(), &chain(MAX_DEPTH + 1)), Err(WireError::TooLarge));
+}

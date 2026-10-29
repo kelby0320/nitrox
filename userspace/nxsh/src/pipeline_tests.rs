@@ -120,3 +120,21 @@ fn a_started_pipeline_gives_everything_back_left_or_reaped() {
     drop(p);
     given_back(&f, true, "reaped");
 }
+
+/// **A started pipeline holds only the ends it hands back, and its stages**: each setup end and its
+/// own copy of the diagnostic sink are closed as it starts, or the sink's read end would never see
+/// its last writer go.
+#[test]
+fn a_start_keeps_only_its_ends_and_stages() {
+    let mut f = Fake::failing(None);
+    let mut p = Pipeline::new(&mut f);
+    let ends = p.start(&NAMES, true).unwrap();
+    let fake = &p.sys;
+    let open = |h: &&u64| !fake.closed.contains(h) && !fake.moved.contains(h);
+    let mut held: Vec<u64> = fake.made.iter().filter(open).copied().collect();
+    let mut want = vec![ends.feed.unwrap(), ends.capture.unwrap(), ends.diagnostics];
+    want.extend(&fake.children);
+    held.sort();
+    want.sort();
+    assert_eq!(held, want);
+}

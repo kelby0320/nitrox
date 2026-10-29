@@ -88,6 +88,18 @@ fn assert_moves_bytes<D: BlockReader + BlockWriter>(disk: &D) {
     assert_eq!(sys::with(|f| f.device[4096..8192].to_vec()), [2; 4096]);
 }
 
+/// **A transfer that completes failed, or short, answers `Io`** but leaves the disk usable: its
+/// buffer is the disk's again, so the next transfer goes.
+#[test]
+fn a_failed_or_short_transfer_is_an_error_but_not_a_loss() {
+    for (status, moved) in [(libkern::KError::IoError as i32, 4096), (0, 512)] {
+        let disk = sector_disk();
+        sys::with(|f| f.completions.push_back((status, moved)));
+        assert_eq!(disk.write_at(0, &[1; 4096]), Err(FsError::Io), "status {status}, {moved} moved");
+        assert_eq!(disk.write_at(0, &[1; 4096]), Ok(()), "status {status}, {moved} moved: then usable");
+    }
+}
+
 fn disk() -> Disk {
     Disk::new(7).ok().unwrap()
 }

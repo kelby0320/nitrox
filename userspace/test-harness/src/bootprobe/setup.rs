@@ -23,6 +23,18 @@ pub(super) fn a_refused_setup_message_closes_its_handles_test() -> bool {
     let sent = send_setup_full(ours, streams, None, &["stage"], &Record::default());
     let moved = stat(rx).is_none();
     [ours, theirs, peer].into_iter().for_each(close);
+    // The kernel refusing the send, the stage's end gone, before it takes anything.
+    let (Ok((dead, theirs)), Ok((x, x_peer))) = (pipe(4), pipe(4)) else {
+        return fail(b"no channel");
+    };
+    close(theirs);
+    let streams = Streams { stdin: None, stdout: Some(x), stderr: None };
+    let peerless = send_setup_full(dead, streams, None, &["stage"], &Record::default());
+    let closed = stat(x).is_none();
+    [dead, x_peer].into_iter().for_each(close);
+    if peerless.is_ok() || !closed {
+        return fail(b"a send the kernel refused left its handle open");
+    }
     if refused != Err(WireError::SetupTooLarge) {
         return fail(b"a 5,000-byte argv was not refused SetupTooLarge");
     }

@@ -346,3 +346,25 @@ fn a_cursor_inside_a_record_resumes_at_the_next() {
     assert_eq!(listed(at as u64 % 4096 + 20), [after], "from the next record");
     assert_eq!(listed(at as u64 % 4096).len(), 2, "from the record itself");
 }
+
+/// **A name already on the disk with a control character is still opened and replaced**, as Linux
+/// wrote it and `e2fsck` passes it: only a new entry is refused one.
+#[test]
+fn a_control_character_in_an_existing_name_is_still_opened_and_replaced() {
+    let img = RwImage(RefCell::new(populated(4096)));
+    let vol = Ext4(&img);
+    vol.create_file(b"/d", b"aXb", NOW).unwrap();
+    vol.grow_file(b"/d/aXb", 5000, NOW).unwrap();
+    let d = vol.resolve_dir(b"/d").unwrap();
+    let at = records(&img, d as u32)
+        .into_iter()
+        .map(|r| r.0 as usize)
+        .find(|&at| &img.0.borrow()[at + 8..at + 11] == b"aXb")
+        .unwrap();
+    img.0.borrow_mut()[at + 9] = b'\t';
+    crate::test_support::assert_e2fsck_clean(&img.0.borrow(), "tab-name");
+    let made = vol.map_file(b"/d/a\tb", &mut [BlockRun::default(); 4]).unwrap().id;
+    assert_eq!(vol.create_file(b"/d", b"a\tb", NOW), Ok(()), "a create finds it");
+    assert_eq!(vol.rename_path(b"/d/f", b"/d/a\tb", true, NOW), Ok(Some(made)), "a rename replaces it");
+    assert_eq!(vol.create_file(b"/d", b"c\td", NOW), Err(FsError::Unsupported), "a new one is refused");
+}

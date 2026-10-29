@@ -82,6 +82,8 @@ mod fake {
         pub submits: Script,
         /// What `wait_one` returns instead of 1; its record is then left untouched.
         pub waits: Script,
+        /// The `(status, bytes moved)` a wait that completes reports in place of a full transfer.
+        pub completions: VecDeque<(i32, u64)>,
         pub submitted: Vec<Submit>,
         pub closes: Vec<u64>,
         pub unmaps: Vec<(u64, u64)>,
@@ -135,8 +137,9 @@ mod fake {
             if let Some(Some(v)) = f.waits.pop_front() {
                 return v;
             }
-            let moved = f.pending.get(&po).copied().unwrap_or(0);
-            out[8..12].copy_from_slice(&0i32.to_le_bytes());
+            let full = f.pending.get(&po).copied().unwrap_or(0);
+            let (status, moved) = f.completions.pop_front().unwrap_or((0, full));
+            out[8..12].copy_from_slice(&status.to_le_bytes());
             out[16..24].copy_from_slice(&moved.to_le_bytes());
             1
         })

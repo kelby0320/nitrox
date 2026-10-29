@@ -1032,9 +1032,6 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     name: &[u8],
     now: i64,
 ) -> Result<u32, FsError> {
-    if !writable_name(name) {
-        return Err(FsError::Unsupported);
-    }
     let sb = read_superblock(rw)?;
     let (_, parent_inode) = resolve_path_ino(rw, &sb, parent_path)?;
     if rd_u16(&parent_inode, 0) & S_IFMT != S_IFDIR {
@@ -1042,6 +1039,9 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     }
     if let Ok(existing) = dir_lookup(rw, &sb, &parent_inode, name) {
         return Ok(existing); // already exists — idempotent
+    }
+    if !writable_name(name) {
+        return Err(FsError::Unsupported);
     }
 
     let ino = alloc_inode(rw, &sb)?;
@@ -1673,9 +1673,6 @@ fn rename<RW: BlockReader + BlockWriter>(
     if old_dir_ino == new_dir_ino && old_name == new_name {
         return Ok(None);
     }
-    if !writable_name(new_name) {
-        return Err(FsError::Unsupported);
-    }
     let src = read_inode(rw, sb, src_ino)?;
     let src_is_dir = rd_u16(&src, 0) & S_IFMT == S_IFDIR;
     let moves_up = src_is_dir && old_dir_ino != new_dir_ino;
@@ -1697,7 +1694,9 @@ fn rename<RW: BlockReader + BlockWriter>(
             }
             Some((dest_ino, dest))
         }
-        Err(FsError::NotFound) => None,
+        // Only a name not on the disk yet is written, so only it is held to what may be written.
+        Err(FsError::NotFound) if writable_name(new_name) => None,
+        Err(FsError::NotFound) => return Err(FsError::Unsupported),
         Err(e) => return Err(e),
     };
 

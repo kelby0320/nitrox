@@ -251,6 +251,12 @@ impl<'a> ByteSource<'a> {
         ByteSource { buf, pos: 0, depth: 0, budget: buf.len().saturating_add(VALUE_FLOOR) }
     }
 
+    /// One more value out of the budget [`new`](Self::new) set, or `TooLarge` past it.
+    fn spend(&mut self) -> Result<()> {
+        self.budget = self.budget.checked_sub(1).ok_or(WireError::TooLarge)?;
+        Ok(())
+    }
+
     /// Bytes not yet consumed.
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
@@ -556,7 +562,7 @@ fn write_list(sink: &mut impl ByteSink, items: &[Value], depth: usize) -> Result
 /// Decode a value of the given `tag`. Does not consume a `NULLABLE` presence byte; the
 /// record layer reads presence, then calls this. The `Error` tag is [`WireError::Unsupported`].
 pub fn read_value(src: &mut ByteSource, tag: TypeTag) -> Result<Value> {
-    src.budget = src.budget.checked_sub(1).ok_or(WireError::TooLarge)?;
+    src.spend()?;
     let nests = matches!(tag, TypeTag::List | TypeTag::Record);
     if nests {
         if src.depth >= MAX_DEPTH {
@@ -637,7 +643,12 @@ pub fn read_row_values(src: &mut ByteSource, schema: &Schema) -> Result<Vec<Valu
     let mut out = Vec::with_capacity(schema.fields.len().min(SCHEMA_FIELD_HINT_CAP));
     for f in &schema.fields {
         let nullable = f.modifiers.contains(TypeModifiers::NULLABLE);
-        let value = if nullable && src.u8()? == 0 { Value::Null } else { read_value(src, f.ty)? };
+        let value = if nullable && src.u8()? == 0 {
+            src.spend()?;
+            Value::Null
+        } else {
+            read_value(src, f.ty)?
+        };
         out.push(value);
     }
     Ok(out)

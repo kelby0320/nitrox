@@ -536,3 +536,19 @@ fn a_name_with_a_control_character_is_not_written() {
     rename_at(&rw, 2, b"plain", b"~ok", now).unwrap();
     assert_e2fsck_clean(&rw.0.borrow(), "plain-names");
 }
+
+/// **Inode 0 is no inode**: `Corrupt` to read, to place and to free, not an underflow to group
+/// `u32::MAX / per_group`.
+#[test]
+fn inode_zero_is_corrupt_everywhere_it_is_placed() {
+    use super::{free_inode, inode_offset, read_inode, read_superblock};
+    let rw = crate::test_support::RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
+    let sb = read_superblock(&rw).unwrap();
+    let before = rw.0.borrow().clone();
+    let each = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (read_inode(&rw, &sb, 0).map(drop), inode_offset(&rw, &sb, 0).map(drop), free_inode(&rw, &sb, 0, false, 0))
+    }));
+    let corrupt = Err(FsError::Corrupt);
+    assert!(matches!(each, Ok((ref a, ref b, ref c)) if *a == corrupt && *b == corrupt && *c == corrupt), "{each:?}");
+    assert!(*rw.0.borrow() == before, "nothing written");
+}

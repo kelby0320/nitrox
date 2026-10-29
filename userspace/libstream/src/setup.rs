@@ -270,7 +270,8 @@ mod io_stage {
     /// handle array; see [`SetupPayload::terminal`]. Other callers pass `None`.
     ///
     /// **Every handle given is gone on every return**: moved by a send the kernel took, or closed
-    /// here when the message could not be made or the kernel refused it. A caller never closes one.
+    /// here when the message could not be made or the kernel refused it. A caller never closes one,
+    /// and no `Err` can be retried, `SinkFull` included.
     pub fn send_setup_full(
         channel: u64,
         streams: Streams,
@@ -290,8 +291,7 @@ mod io_stage {
         let owned: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
         let payload =
             SetupPayload { streams: streams.bitmap(), argv: owned, env: env.clone(), terminal: terminal.is_some() }
-                // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge`, not the
-                // retryable `SinkFull`.
+                // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge`, not `SinkFull`.
                 .encode();
         let payload = match payload {
             Ok(p) => p,

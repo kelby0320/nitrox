@@ -461,3 +461,7 @@ mod tests {
         assert_eq!(t.len, MAX_REASON);
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;
