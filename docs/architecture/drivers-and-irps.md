@@ -215,7 +215,7 @@ one, so the caller's next `sys_wait` returns without ever blocking. Callers thus
 have one code path regardless of whether the work was sync or async.
 
 > **Reconciliation with Phase 1.** The wait mechanism is the one Phase 1
-> actually built — a pre-reserved **waiter list per waitable** plus a fixed
+> actually built — an inline **waiter list per waitable** (`WaitQueue`) plus a fixed
 > 8-slot wait array on each `Thread` (`MAX_WAIT_HANDLES`), dispatched by `match`
 > on `KObjectType` in `kernel/src/sched/objects.rs` (`obj_already_signaled` /
 > `obj_add_waiter` / `obj_remove_waiter`; the `_ => …` arms are the extension

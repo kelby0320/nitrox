@@ -164,8 +164,8 @@ fn waiters_add_remove_take_caps_at_max() {
         assert!(IpcChannel::add_waiter(a, 0xDEAD as *mut ()).is_err());
         IpcChannel::remove_waiter(a, ths[0]);
         assert!(IpcChannel::add_waiter(a, 0xBEEF as *mut ()).is_ok());
-        let mut buf = [core::ptr::null_mut(); IpcChannel::MAX_WAITERS];
-        assert_eq!(IpcChannel::take_waiters(a, &mut buf), IpcChannel::MAX_WAITERS);
+        assert_eq!(&IpcChannel::take_waiters(a)[..], &[ths[1], ths[2], ths[3], 0xBEEF as *mut ()]);
+        assert!(IpcChannel::take_waiters(a).is_empty());
     }
     drop_endpoint(a);
     drop_endpoint(b);

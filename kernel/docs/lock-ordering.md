@@ -161,7 +161,7 @@ Two corollaries:
 - **Suspend obeys the block-and-switch discipline.** `suspend_with_fault`
   (the ring-3 exception path) delivers the fault notification + parks the
   thread in `suspended` and context-switches away — all under one `SCHED`
-  hold, no allocation (queue/waiters pre-reserved), mirroring
+  hold, no allocation (the queue pre-reserved, the waiters inline), mirroring
   `block_current_and_switch`. The supervisor's `sys_thread_get_registers`
   reads the captured frame and copies it to user memory **outside** `SCHED`
   (the thread stays parked, so the frame is stable).

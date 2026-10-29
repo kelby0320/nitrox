@@ -106,10 +106,9 @@ pub unsafe fn request_terminate(process: *mut ()) -> bool {
 /// Wake every thread blocked on `channel` (its queue just went non-empty). Caller holds
 /// `SCHED`. No allocation, no blocking — safe from the fault path.
 pub(super) fn signal_channel(g: &mut SchedState, channel: *mut ()) {
-    let mut buf = [core::ptr::null_mut(); NotificationChannel::MAX_WAITERS];
     // SAFETY: live channel, `SCHED` held — drains its waiter list.
-    let n = unsafe { NotificationChannel::take_waiters(channel, &mut buf) };
-    for &th in &buf[..n] {
+    let waiters = unsafe { NotificationChannel::take_waiters(channel) };
+    for &th in waiters.iter() {
         // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
         // `blocked`; `SCHED` held.
         unsafe {
@@ -124,10 +123,9 @@ pub(super) fn signal_channel(g: &mut SchedState, channel: *mut ()) {
 /// Wake every thread blocked recv-ing on `endpoint` (a message just arrived in its inbox,
 /// or its peer just closed). Caller holds `SCHED`. No allocation, no blocking.
 pub(super) fn signal_ipc_endpoint(g: &mut SchedState, endpoint: *mut ()) {
-    let mut buf = [core::ptr::null_mut(); IpcChannel::MAX_WAITERS];
     // SAFETY: live endpoint, `SCHED` held — drains its recv-waiter list.
-    let n = unsafe { IpcChannel::take_waiters(endpoint, &mut buf) };
-    for &th in &buf[..n] {
+    let waiters = unsafe { IpcChannel::take_waiters(endpoint) };
+    for &th in waiters.iter() {
         // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
         // `blocked`; `SCHED` held.
         unsafe {
@@ -153,10 +151,9 @@ pub(super) fn signal_pending_op_with_result(g: &mut SchedState, po: *mut (), sta
     if !unsafe { PendingOperation::signal_with_result(po, status, result) } {
         return; // already completed — its waiters were handled the first time
     }
-    let mut buf = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
     // SAFETY: live PO, `SCHED` held — drains its waiter list.
-    let n = unsafe { PendingOperation::take_waiters(po, &mut buf) };
-    for &th in &buf[..n] {
+    let waiters = unsafe { PendingOperation::take_waiters(po) };
+    for &th in waiters.iter() {
         // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
         // `blocked`; `SCHED` held.
         unsafe {
@@ -267,10 +264,9 @@ pub unsafe fn signal_interrupt(irq: *mut ()) {
     let mut g = SCHED.lock();
     // SAFETY: live `InterruptObject`, `SCHED` held — latches a pending interrupt.
     unsafe { InterruptObject::signal(irq) };
-    let mut buf = [core::ptr::null_mut(); InterruptObject::MAX_WAITERS];
     // SAFETY: live object, `SCHED` held — drains its waiter list.
-    let n = unsafe { InterruptObject::take_waiters(irq, &mut buf) };
-    for &th in &buf[..n] {
+    let waiters = unsafe { InterruptObject::take_waiters(irq) };
+    for &th in waiters.iter() {
         // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
         // `blocked`; `SCHED` held.
         unsafe {

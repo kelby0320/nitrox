@@ -20,8 +20,9 @@ use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::ipc::{IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader};
-use crate::libkern::{AllocError, KBox, KVec};
+use crate::libkern::{AllocError, ArrayVec, KBox, KVec};
 use crate::object::ObjectRef;
+use crate::object::WaitQueue;
 use crate::object::header::KObjectHeader;
 
 /// A queued message in kernel storage: the natural-alignment twin of
@@ -240,9 +241,9 @@ pub struct IpcChannel {
 
 struct Inner {
     recv: MsgRing,
-    /// Threads blocked recv-ing (type-erased, non-owning; removed before a waiter unparks).
-    /// Pre-reserved to [`IpcChannel::MAX_WAITERS`] so `add_waiter` never allocates under `SCHED`.
-    recv_waiters: KVec<*mut ()>,
+    /// Threads blocked recv-ing (type-erased, non-owning; removed before a waiter unparks), at most
+    /// [`IpcChannel::MAX_WAITERS`].
+    recv_waiters: WaitQueue<{ IpcChannel::MAX_WAITERS }>,
     /// Blocking senders awaiting space in **this** ring, FIFO, promoted into `recv` when a recv
     /// frees a slot. Pre-reserved to [`IpcChannel::MAX_PENDING_SENDS`]: no `SCHED` allocation.
     pending_sends: KVec<PendingSend>,
@@ -293,8 +294,6 @@ impl IpcChannel {
     fn try_new_endpoint(cap: usize) -> Result<KBox<Self>, AllocError> {
         let slots = SlotHold::reserve(Slots::Endpoint)?;
         let recv = MsgRing::with_capacity(cap)?;
-        let mut recv_waiters: KVec<*mut ()> = KVec::new();
-        recv_waiters.try_reserve(Self::MAX_WAITERS)?;
         let mut pending_sends: KVec<PendingSend> = KVec::new();
         pending_sends.try_reserve(Self::MAX_PENDING_SENDS)?;
         KBox::try_new(Self {
@@ -302,7 +301,7 @@ impl IpcChannel {
             magic: Self::MAGIC,
             inner: UnsafeCell::new(Inner {
                 recv,
-                recv_waiters,
+                recv_waiters: WaitQueue::new(),
                 pending_sends,
                 peer: core::ptr::null_mut(),
                 us_reg: core::ptr::null_mut(),
@@ -462,19 +461,7 @@ impl IpcChannel {
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if inner.recv_waiters.len() < Self::MAX_WAITERS {
-            inner
-                .recv_waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED` and `try_push`
-                // grows (`kmalloc` under the rank-1 lock). Construction reserves `MAX_WAITERS`, so
-                // it cannot fail; the type should say so, since a new waiter list copies this
-                // shape.
-                .push_within_capacity(thread)
-                .expect("within reserved waiter capacity");
-            Ok(())
-        } else {
-            Err(())
-        }
+        inner.recv_waiters.add(thread)
     }
 
     /// Remove `thread` from the receiver set if present (idempotent).
@@ -484,25 +471,17 @@ impl IpcChannel {
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if let Some(i) = inner.recv_waiters.iter().position(|&w| w == thread) {
-            inner.recv_waiters.remove(i);
-        }
+        inner.recv_waiters.remove(thread);
     }
 
-    /// Drain every receiver into `out`, returning the count; `out` is at least `MAX_WAITERS` long.
+    /// Take every receiver, leaving none.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { IpcChannel::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        let n = inner.recv_waiters.len();
-        debug_assert!(out.len() >= n);
-        for (i, &w) in inner.recv_waiters.iter().enumerate() {
-            out[i] = w;
-        }
-        inner.recv_waiters.clear();
-        n
+        inner.recv_waiters.take()
     }
 
     /// Blocking-send entry: deliver `msg` straight into the **peer**'s ring, or if full **hold**

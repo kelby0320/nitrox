@@ -818,9 +818,8 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
     assert!(with_ending(1, |e| e.load(Ordering::Acquire)), "CPU 1 ends its running thread on the way out");
     assert!(st.deadlines.iter().any(|e| e.target == b as usize), "left for its own wait_on to remove");
     assert!(st.reap.iter().all(|q| q.is_empty()));
-    let mut waiters = [core::ptr::null_mut(); Timer::MAX_WAITERS];
     // SAFETY: pinned by `t1`; single-threaded. What each thread's own `wait_on` would undo.
-    assert_eq!(unsafe { Timer::take_waiters(t1.as_ptr(), &mut waiters) }, 2, "both still registered");
+    assert_eq!(unsafe { Timer::take_waiters(t1.as_ptr()) }.len(), 2, "both still registered");
 }
 
 /// The last thread out of a process, however it left, hands the process's handles to the reaper
