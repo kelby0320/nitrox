@@ -276,14 +276,16 @@ impl IpcChannel {
     /// `1..=IPC_MAX_QUEUE_DEPTH`). Each returned `KBox` holds one creation reference.
     pub fn try_new_pair(depth: u32) -> Result<(KBox<Self>, KBox<Self>), AllocError> {
         let cap = depth.clamp(1, IPC_MAX_QUEUE_DEPTH) as usize;
-        let mut a = Self::try_new_endpoint(cap)?;
-        let mut b = Self::try_new_endpoint(cap)?;
-        // Both boxes are still private here: plain writes are sound; no `SCHED` needed.
-        let a_ptr = (&*a as *const Self) as *mut Self;
-        let b_ptr = (&*b as *const Self) as *mut Self;
-        a.inner.get_mut().peer = b_ptr;
-        b.inner.get_mut().peer = a_ptr;
-        Ok((a, b))
+        let (a, b) = (Self::try_new_endpoint(cap)?, Self::try_new_endpoint(cap)?);
+        let (a, b) = (KBox::into_raw(a), KBox::into_raw(b));
+        // Each peer is the other box's own pointer, so no later borrow of that box retires it.
+        // SAFETY: both endpoints are this function's alone, so `SCHED` is not needed, and each
+        // write goes through its box's own pointer; each box is rebuilt from the pointer it gave.
+        unsafe {
+            (*UnsafeCell::raw_get(&raw const (*a.as_ptr()).inner)).peer = b.as_ptr();
+            (*UnsafeCell::raw_get(&raw const (*b.as_ptr()).inner)).peer = a.as_ptr();
+            Ok((KBox::from_raw(a), KBox::from_raw(b)))
+        }
     }
 
     /// Allocate one unconnected endpoint, refcount one. Ring and waiter vector are reserved up
