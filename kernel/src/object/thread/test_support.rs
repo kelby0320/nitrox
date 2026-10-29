@@ -41,7 +41,7 @@ pub(crate) fn user_thread_no_stack(tid: u32, process: ObjectRef, entry: u64, use
         wait_count: 0,
         wait_has_deadline: false,
         wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-        exception_frame: 0,
+        fault_regs: crate::arch::RegisterValues::default(),
         disp_tag: 0,
         disp_code: 0,
         class: SchedClass::TimeShared,

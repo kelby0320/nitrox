@@ -27,7 +27,6 @@ pub enum ResolveOp {
     Rename { dest_ptr: u64, dest_len: usize, flags: u64 },
 }
 use crate::arch::RegisterValues;
-use crate::arch::registers::ArchRegisters;
 use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
 use crate::libkern::io_op::{IoOp, IoOpcode};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
@@ -598,8 +597,7 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
 
 /// `sys_thread_get_registers(thread, out)` — write the user registers of a **suspended**
 /// (faulted) thread into the [`RegisterValues`] at `out`. Needs `SIGNAL`; a thread not
-/// suspended on a fault is `InvalidArgument`. The frame lives on the parked thread's kernel
-/// stack, so it is stable across the lock-free copy-out.
+/// suspended on a fault is `InvalidArgument`.
 pub fn sys_thread_get_registers(thread_h: u64, out_ptr: u64) -> SysResult {
     let uptr = UserMutPtr::<RegisterValues>::new(out_ptr).map_err(from_user_access)?;
 
@@ -607,9 +605,7 @@ pub fn sys_thread_get_registers(thread_h: u64, out_ptr: u64) -> SysResult {
     let ok = lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
 
     // SAFETY: `ok.object` is the live `Thread` its lookup type-checked, held across the call.
-    let frame_ptr =
-        unsafe { crate::sched::thread_exception_frame(ok.object.as_ptr()) }.ok_or(KError::InvalidArgument)?;
-    let regs: RegisterValues = crate::arch::Registers::read_from_exception_frame(frame_ptr);
+    let regs = unsafe { crate::sched::suspended_registers(ok.object.as_ptr()) }.ok_or(KError::InvalidArgument)?;
     copy_to_user(uptr, &regs).map_err(from_user_access)?;
     Ok(0)
 }

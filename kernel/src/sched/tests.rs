@@ -613,10 +613,7 @@ fn resume_suspended_moves_to_ready_and_sets_disposition() {
     let th = inert_user_ref(1, 1);
     let obj = th.as_ptr();
     // SAFETY: pinned, single-threaded test; mimic a suspended thread.
-    unsafe {
-        Thread::set_state(obj, ThreadState::Suspended);
-        Thread::set_exception_frame(obj, 0xdead_beef);
-    }
+    unsafe { Thread::set_state(obj, ThreadState::Suspended) };
     assert!(st.suspended.push(th).is_ok());
 
     // `resume_suspended` takes the global SCHED, so mirror its list ops to stay lock-free.
@@ -631,11 +628,32 @@ fn resume_suspended_moves_to_ready_and_sets_disposition() {
 
     assert!(st.suspended.is_empty());
     assert_eq!(st.ready[0].len(), 1);
-    // SAFETY: pinned. take_disposition reads (tag, code) and clears the frame.
+    // SAFETY: pinned.
     let (tag, code) = unsafe { Thread::take_disposition(obj) };
     assert_eq!((tag, code), (2, 7));
-    // SAFETY: pinned — the frame was cleared by take_disposition.
-    assert!(unsafe { Thread::exception_frame(obj) }.is_none());
+}
+
+/// **A suspended thread's registers are a copy of its fault's**, taken under `SCHED`: the
+/// thread's next trap reuses its stack, so a read of the frame there, after the lock, could take
+/// a resumed thread's live state instead. A thread not suspended has none to read.
+#[test]
+fn a_suspended_threads_registers_are_its_faults_until_it_resumes() {
+    init_global_heap();
+    let th = inert_user_ref(1, 1);
+    let obj = th.as_ptr();
+    let regs = crate::arch::RegisterValues { rip: 0x40_1000, ..Default::default() };
+    // SAFETY: pinned, single-threaded; as `suspend_with_fault` records them.
+    unsafe {
+        Thread::set_fault_registers(obj, regs);
+        Thread::set_state(obj, ThreadState::Suspended);
+    }
+    // SAFETY: pinned by `th`.
+    let read = unsafe { suspended_registers(obj) };
+    assert_eq!(read, Some(regs));
+    // SAFETY: pinned. The resume.
+    unsafe { Thread::set_state(obj, ThreadState::Ready) };
+    // SAFETY: pinned by `th`.
+    assert_eq!(unsafe { suspended_registers(obj) }, None);
 }
 
 #[test]
@@ -877,7 +895,9 @@ fn a_thread_its_process_marked_waits_for_nothing_but_its_io() {
 #[test]
 fn a_thread_its_process_marked_terminates_at_a_fault_instead_of_suspending() {
     init_global_heap();
-    let disposition = with_current(an_ending_thread(), || suspend_with_fault(0, Notification::divide_by_zero(1, 0x10)));
+    let disposition = with_current(an_ending_thread(), || {
+        suspend_with_fault(Default::default(), Notification::divide_by_zero(1, 0x10))
+    });
     assert!(matches!(disposition, ResumeDisposition::Terminate(0)));
 }
 

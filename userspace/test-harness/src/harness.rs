@@ -396,12 +396,12 @@ fn worker_exception_demo(notif: u64) {
 
     // SAFETY: WORKER_REGS is a valid writable RegisterValues out-param.
     let gr = unsafe { syscall4(SYS_THREAD_GET_REGISTERS, worker.raw().0, (&raw mut WORKER_REGS) as u64, 0, 0) };
-    if gr != 0 {
+    // SAFETY: the kernel wrote the 18-register snapshot into WORKER_REGS, or nothing, a zero rip.
+    let rip = unsafe { (&raw const WORKER_REGS.regs[REG_RIP]).read() };
+    if gr != 0 || rip == 0 {
         kprint(b"test-harness: get_registers FAIL\n");
         exit(1);
     }
-    // SAFETY: the kernel wrote the 18-register snapshot into WORKER_REGS.
-    let rip = unsafe { (&raw const WORKER_REGS.regs[REG_RIP]).read() };
     Line::new().s(b"test-harness: worker faulted @ rip=").x(rip).s(b" ; terminating").end();
 
     // SAFETY: register-only syscall.

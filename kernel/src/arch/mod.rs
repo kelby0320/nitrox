@@ -32,7 +32,6 @@ pub mod irq_router;
 pub mod memory_types;
 pub mod paging;
 pub mod platform;
-pub mod registers;
 pub mod smp;
 pub mod timer;
 pub mod user_access;
@@ -164,9 +163,8 @@ pub use x86_64::syscall::{arm_user_entry_cpu_base, enter_user, init_syscall_entr
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::X86Paging as Paging;
 
-// Suspended-thread register snapshot (behind `sys_thread_get_registers`): the
-// `ArchRegisters` trait's active impl + its `#[repr(C)]` ABI value type. The
-// `impl` lives in `idt.rs` (where the private exception frame is); this module
-// owns the type + marker. See `arch::registers`.
+// The user-register snapshot a ring-3 fault hands `sched::suspend_with_fault`, behind
+// `sys_thread_get_registers`: a `#[repr(C)]` ABI type, decoded where the private exception
+// frame is (`idt.rs`).
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::registers::{RegisterValues, X86Registers as Registers};
+pub use x86_64::registers::RegisterValues;

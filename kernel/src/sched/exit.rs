@@ -261,10 +261,10 @@ fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
 }
 
 /// Suspend the **current thread** after a ring-3 fault: deliver `notif` to its process's
-/// notification channel (waking the supervisor), record the `ExceptionFrame` at `frame_ptr`
-/// on this thread's kernel stack, park in `suspended`, and switch away. Returns the
-/// [`ResumeDisposition`] the supervisor chose once the thread is runnable again.
-pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDisposition {
+/// notification channel (waking the supervisor), record the user registers `regs` it faulted
+/// with, park in `suspended`, and switch away. Returns the [`ResumeDisposition`] the supervisor
+/// chose once the thread is runnable again.
+pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification) -> ResumeDisposition {
     // Reclaim earlier exited threads first, off the rank-1 lock.
     reap_pending();
 
@@ -298,14 +298,14 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
             signal_channel(&mut g, c);
         }
 
-        // Record the frame, mark Suspended, park off the run queue; the `ExceptionFrame`
+        // Record the registers, mark Suspended, park off the run queue; the `ExceptionFrame`
         // stays on this frozen kernel stack until resume.
         // TODO(unsupervised-fault): nothing supervises an ordinary program, so with
         // the thirty-second auto-terminate deferred its thread stays here for the
         // boot — first reached by a pulled stick's failed fill.
         // SAFETY: `me` is the running thread, pinned, lock held.
         unsafe {
-            Thread::set_exception_frame(me_obj, frame_ptr);
+            Thread::set_fault_registers(me_obj, regs);
             Thread::set_state(me_obj, ThreadState::Suspended);
         }
         // SAFETY: as above.
@@ -390,21 +390,16 @@ fn resume_parked(g: &mut SchedState, r: ObjectRef, disp_tag: u8, disp_code: i32)
     }
 }
 
-/// The kernel-stack address of `thread`'s captured `ExceptionFrame`, or `None` if it is not
-/// `Suspended`. Used by `sys_thread_get_registers`; a suspended thread stays parked, so the
-/// frame is stable after this returns (the caller drops `SCHED` before the user copy-out).
+/// The user registers `thread` faulted with, or `None` if it is not `Suspended`: a copy, taken
+/// under `SCHED`, so a resume that races the caller's copy-out cannot change it.
 ///
 /// # Safety
 ///
 /// `thread` points at a live `Thread`, pinned for the call by a reference the caller holds.
-pub unsafe fn thread_exception_frame(thread: *mut ()) -> Option<usize> {
+pub unsafe fn suspended_registers(thread: *mut ()) -> Option<crate::arch::RegisterValues> {
     let _g = SCHED.lock();
     // SAFETY: the caller pins `thread` via its Thread handle; `SCHED` held.
-    if unsafe { Thread::state_now(thread) } != ThreadState::Suspended {
-        return None;
-    }
-    // SAFETY: same.
-    unsafe { Thread::exception_frame(thread) }
+    unsafe { (Thread::state_now(thread) == ThreadState::Suspended).then(|| Thread::fault_registers(thread)) }
 }
 
 /// Pop up to `buf.len()` parked refs — this CPU's `reap` list first, then the global

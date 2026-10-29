@@ -8,8 +8,7 @@
 //!
 //! `ThreadArgs` is arch-**neutral** (`entry`/`user_sp` are just user VAs, `arg0` is opaque).
 //! The faulted-register snapshot a supervisor reads back, `RegisterValues`, is arch-specific
-//! and lives behind the arch boundary as `crate::arch::RegisterValues` (see
-//! `crate::arch::registers::ArchRegisters`).
+//! and lives behind the arch boundary as `crate::arch::RegisterValues`.
 
 /// The argument block `sys_thread_create` reads from userspace to start a new thread in the
 /// calling process.

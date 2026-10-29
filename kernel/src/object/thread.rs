@@ -16,7 +16,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crate::arch::{ArchFpuState, ArchThreadContext, thread_trampoline};
+use crate::arch::{ArchFpuState, ArchThreadContext, RegisterValues, thread_trampoline};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
 use crate::mm::PhysAddr;
@@ -146,9 +146,9 @@ pub struct Thread {
     wait_count: u8,
     wait_has_deadline: bool,
     wait_phase: AtomicU8,
-    /// Kernel-stack address of the `ExceptionFrame` captured when this thread faulted in ring 3
-    /// (meaningful only while `Suspended`); the supervisor reads it, the thread unwinds it.
-    exception_frame: usize,
+    /// The user registers this thread last faulted with in ring 3, copied out of its exception
+    /// frame as it suspended (meaningful only while `Suspended`), for its supervisor to read.
+    fault_regs: RegisterValues,
     /// Resume disposition set by `sys_exception_resume`: `0` = Resume, `2` = Terminate.
     disp_tag: u8,
     disp_code: i32,
@@ -207,7 +207,7 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
+            fault_regs: RegisterValues::default(),
             disp_tag: 0,
             disp_code: 0,
             class: SchedClass::TimeShared,
@@ -244,7 +244,7 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
+            fault_regs: RegisterValues::default(),
             disp_tag: 0,
             disp_code: 0,
             class: SchedClass::TimeShared,
@@ -288,7 +288,7 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
+            fault_regs: RegisterValues::default(),
             disp_tag: 0,
             disp_code: 0,
             class: SchedClass::TimeShared,
@@ -342,7 +342,7 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
-            exception_frame: 0,
+            fault_regs: RegisterValues::default(),
             disp_tag: 0,
             disp_code: 0,
             class: SchedClass::TimeShared,
@@ -562,27 +562,24 @@ impl Thread {
         unsafe { core::ptr::read(&raw const (*p).state) }
     }
 
-    /// Record the kernel-stack address of the faulting `ExceptionFrame` when this
-    /// thread suspends.
+    /// Record the registers this thread faulted with, as it suspends.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn set_exception_frame(obj: *mut (), frame: usize) {
+    pub(crate) unsafe fn set_fault_registers(obj: *mut (), regs: RegisterValues) {
         let p = obj as *mut Thread;
         // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
-        unsafe { core::ptr::write(&raw mut (*p).exception_frame, frame) }
+        unsafe { core::ptr::write(&raw mut (*p).fault_regs, regs) }
     }
 
-    /// The stored `ExceptionFrame` address, or `None` if this thread is not
-    /// suspended on a fault.
+    /// The registers this thread last faulted with: its fault's while it is `Suspended`.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn exception_frame(obj: *mut ()) -> Option<usize> {
+    pub(crate) unsafe fn fault_registers(obj: *mut ()) -> RegisterValues {
         let p = obj as *mut Thread;
         // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
-        let v = unsafe { core::ptr::read(&raw const (*p).exception_frame) };
-        if v == 0 { None } else { Some(v) }
+        unsafe { core::ptr::read(&raw const (*p).fault_regs) }
     }
 
     /// Set the resume disposition (`sys_exception_resume`): tag `0` = Resume,
@@ -599,21 +596,15 @@ impl Thread {
         }
     }
 
-    /// Read the resume disposition `(tag, code)` set by `sys_exception_resume`,
-    /// and clear the stored frame (the thread is unwinding it). Read when a
-    /// suspended thread resumes.
+    /// Read the resume disposition `(tag, code)` set by `sys_exception_resume`, when a suspended
+    /// thread resumes.
     ///
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_disposition(obj: *mut ()) -> (u8, i32) {
         let p = obj as *mut Thread;
         // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
-        unsafe {
-            let tag = core::ptr::read(&raw const (*p).disp_tag);
-            let code = core::ptr::read(&raw const (*p).disp_code);
-            core::ptr::write(&raw mut (*p).exception_frame, 0);
-            (tag, code)
-        }
+        unsafe { (core::ptr::read(&raw const (*p).disp_tag), core::ptr::read(&raw const (*p).disp_code)) }
     }
 
     /// Read the saved stack pointer of this thread's parked context.
