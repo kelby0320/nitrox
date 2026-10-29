@@ -139,8 +139,8 @@ pub use x86_64::paging::{fail_page_tables_after, mapped_with};
 // separate FP/SIMD register file needs this shape, so the names stay neutral.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::fpu::{
-    ArchFpuState, area_bytes as fpu_area_bytes, init_area as fpu_init_area, init_cpu as fpu_init_cpu,
-    restore as fpu_restore, save as fpu_save, vector_bits as fpu_vector_bits,
+    ArchFpuState, area_bytes as fpu_area_bytes, init_cpu as fpu_init_cpu, restore as fpu_restore, save as fpu_save,
+    vector_bits as fpu_vector_bits,
 };
 // Vector-register self-test primitives (`selftest` builds only): load/store the whole
 // vector register file through an image buffer, so a neutral test can stamp a pattern,

@@ -180,7 +180,7 @@ extern "C" fn fp_worker(arg: usize) {
 fn fp_swap_cost() {
     // Boxed rather than a stack local: a kilobyte of 64-byte-aligned scratch on the boot thread's
     // stack is avoidable, and `KBox` gives the alignment.
-    let mut scratch = match KBox::try_new(arch::ArchFpuState::zeroed()) {
+    let mut scratch = match KBox::try_new(arch::ArchFpuState::initial()) {
         Ok(s) => s,
         Err(_) => {
             kprintln!("fp: swap-cost scratch alloc failed");

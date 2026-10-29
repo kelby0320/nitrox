@@ -50,9 +50,20 @@ pub struct ArchFpuState {
 const _: () = assert!(core::mem::align_of::<ArchFpuState>() == FPU_AREA_ALIGN);
 
 impl ArchFpuState {
-    /// An all-zero area. **Not** a usable FP state: run [`init_area`] before [`restore`].
-    pub const fn zeroed() -> Self {
-        Self { bytes: [0; FPU_AREA_BYTES] }
+    /// The architectural power-on state: zeroes, with FCW and MXCSR at their defaults, since
+    /// `XRSTOR` loads MXCSR unconditionally and a zero one unmasks every SIMD exception. **The only
+    /// constructor**, so every area is an image [`restore`] can load.
+    pub const fn initial() -> Self {
+        let mut bytes = [0; FPU_AREA_BYTES];
+        let (fcw, mxcsr) = (FCW_DEFAULT.to_le_bytes(), MXCSR_DEFAULT.to_le_bytes());
+        bytes[FCW_OFFSET] = fcw[0];
+        bytes[FCW_OFFSET + 1] = fcw[1];
+        let mut i = 0;
+        while i < 4 {
+            bytes[MXCSR_OFFSET + i] = mxcsr[i];
+            i += 1;
+        }
+        Self { bytes }
     }
 }
 
@@ -173,26 +184,6 @@ pub fn vector_bits() -> usize {
     VECTOR_BITS.load(Ordering::Relaxed)
 }
 
-/// Write the power-on FP state into `area`, making it safe to hand to [`restore`].
-///
-/// A zeroed area is *not* sufficient: `XRSTOR` loads `MXCSR` from the image unconditionally, and
-/// a zero `MXCSR` unmasks every SIMD exception. Both formats put `FCW` and `MXCSR` at the same
-/// offsets, so one write path serves both.
-///
-/// # Safety
-/// `area` must point to a valid, writable, 64-byte-aligned [`ArchFpuState`].
-pub unsafe fn init_area(area: *mut ArchFpuState) {
-    // SAFETY: the caller guarantees `area` is a valid, writable `ArchFpuState`;
-    // we write only within its `FPU_AREA_BYTES` bytes.
-    unsafe {
-        let base = (&raw mut (*area).bytes).cast::<u8>();
-        core::ptr::write_bytes(base, 0, FPU_AREA_BYTES);
-        // Unaligned: the offsets carry no alignment guarantee of their own.
-        base.add(FCW_OFFSET).cast::<u16>().write_unaligned(FCW_DEFAULT);
-        base.add(MXCSR_OFFSET).cast::<u32>().write_unaligned(MXCSR_DEFAULT);
-    }
-}
-
 /// Save the CPU's live FP/SIMD register file into `area`.
 ///
 /// # Safety
@@ -228,7 +219,7 @@ pub unsafe fn save(area: *mut ArchFpuState) {
 ///
 /// # Safety
 /// `area` must point to a valid, 64-byte-aligned [`ArchFpuState`] holding an image from [`save`]
-/// or [`init_area`] **in the format this CPU selected in [`init_cpu`]**, and `init_cpu` must
+/// or [`ArchFpuState::initial`] **in the format this CPU selected in [`init_cpu`]**, and `init_cpu` must
 /// have run. A foreign or uninitialised image can `#GP` (reserved `MXCSR` bits, `XSTATE_BV`
 /// naming a component outside `XCR0`).
 pub unsafe fn restore(area: *const ArchFpuState) {
@@ -418,13 +409,8 @@ mod tests {
     }
 
     #[test]
-    fn init_area_writes_the_architectural_defaults() {
-        let mut state = ArchFpuState::zeroed();
-        state.bytes[MXCSR_OFFSET] = 0xAA;
-        state.bytes[900] = 0xAA;
-
-        // SAFETY: `state` is a live, writable, correctly aligned area.
-        unsafe { init_area(&raw mut state) };
+    fn the_initial_area_is_the_architectural_defaults() {
+        let state = ArchFpuState::initial();
 
         let fcw = u16::from_le_bytes([state.bytes[FCW_OFFSET], state.bytes[FCW_OFFSET + 1]]);
         assert_eq!(fcw, FCW_DEFAULT, "FCW must be the architectural default");
