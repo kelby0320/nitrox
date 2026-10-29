@@ -50,6 +50,7 @@ paths = [
   "kernel/src/pci/",
   "kernel/src/io/",
   "kernel/src/device.rs",
+  "kernel/src/device/",
   "kernel/src/arch/x86_64/ps2.rs",
 ]
 
