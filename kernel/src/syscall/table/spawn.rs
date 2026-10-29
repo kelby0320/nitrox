@@ -1,4 +1,7 @@
+//! `sys_process_spawn`: a child process from an image, and the handles it starts with.
+
 use super::*;
+use crate::libkern::KVec;
 
 /// Close every child-side handle a partly-built spawn allocated; `ns_h` is `NULL` if none.
 fn spawn_rollback_child_handles(child_pid: u32, notif_h: RawHandle, ns_h: RawHandle, installed: &[RawHandle]) {
@@ -47,21 +50,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     let img =
         global::get().lookup(RawHandle(args.image.bits()), parent_pid, Rights::MAP_READ).map_err(map_handle_err)?;
     let image_started = Timer::read_ns();
-    let img_bytes = match img.object.object_type() {
-        KObjectType::MemoryObject => {
-            // SAFETY: type checked above; `img.object` pins it live.
-            let mo = unsafe { &*(img.object.as_ptr() as *const MemoryObject) };
-            image_fits(mo.size())?;
-            mo.copy_to_kvec().map_err(|_| KError::OutOfMemory)?
-        }
-        // Blocks on each fill — sound on the syscall thread, which holds no AS/cache lock.
-        KObjectType::FileObject => {
-            // SAFETY: type checked above; `img.object` pins it live.
-            image_fits(unsafe { &*(img.object.as_ptr() as *const FileObject) }.size())?;
-            FileObject::read_to_kvec(&img.object).map_err(|_| KError::OutOfMemory)?
-        }
-        _ => return Err(KError::InvalidArgument),
-    };
+    let img_bytes = image_bytes(&img.object)?;
     spawn_stats::record(
         0, // the whole-call duration is added by the wrapper
         Timer::read_ns().saturating_sub(image_started),
@@ -202,4 +191,27 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     commit_all(&mut claims);
 
     Ok(parent_handle.bits() as isize)
+}
+
+/// A spawn's image as one buffer for the loader: a memory object's bytes, or a file's, read whole.
+/// The kernel reads a memory object's through the HHDM, so a borrowed one is refused.
+pub(super) fn image_bytes(img: &ObjectRef) -> Result<KVec<u8>, KError> {
+    match img.object_type() {
+        KObjectType::MemoryObject => {
+            // SAFETY: type checked above; `img` pins it live.
+            let mo = unsafe { &*(img.as_ptr() as *const MemoryObject) };
+            if !mo.kernel_reachable() {
+                return Err(KError::InvalidArgument);
+            }
+            image_fits(mo.size())?;
+            mo.copy_to_kvec().map_err(|_| KError::OutOfMemory)
+        }
+        // Blocks on each fill — sound on the syscall thread, which holds no AS/cache lock.
+        KObjectType::FileObject => {
+            // SAFETY: type checked above; `img` pins it live.
+            image_fits(unsafe { &*(img.as_ptr() as *const FileObject) }.size())?;
+            FileObject::read_to_kvec(img).map_err(|_| KError::OutOfMemory)
+        }
+        _ => Err(KError::InvalidArgument),
+    }
 }

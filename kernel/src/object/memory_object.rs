@@ -25,7 +25,8 @@ use crate::object::header::KObjectHeader;
 pub enum FrameOwnership {
     /// Frames came from the buddy allocator and are freed on drop.
     Owned,
-    /// A fixed physical range this object does not own (a device aperture); never freed.
+    /// A fixed physical range this object does not own (a device aperture); never freed, and
+    /// only mapped: see [`MemoryObject::kernel_reachable`].
     Borrowed,
 }
 
@@ -126,6 +127,12 @@ impl MemoryObject {
     /// Whether this object's frames are freed when it drops.
     pub fn ownership(&self) -> FrameOwnership {
         self.ownership
+    }
+
+    /// Whether the kernel may reach these frames itself, through the HHDM or a device: only those
+    /// it owns. A borrowed range need not be in the HHDM, nor be memory, so it is for mapping.
+    pub fn kernel_reachable(&self) -> bool {
+        self.ownership == FrameOwnership::Owned
     }
 
     /// How every mapping of this object is cached.

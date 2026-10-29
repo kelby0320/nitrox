@@ -1,3 +1,5 @@
+//! A server's reply to a page-cache fill: its bytes copied into the cache frame, the fill settled.
+
 use super::*;
 
 /// Complete a forwarded `File::ReadRange` reply: correlate it to the registration's pending
@@ -28,19 +30,20 @@ pub(super) fn complete_read_range_reply(
         RangeReplyKind::Malformed => KError::KernelError as i32,
         RangeReplyKind::Success { content_len } => match transfers[0].take() {
             None => KError::InvalidArgument as i32, // success but no bytes
-            Some(tr) if tr.obj.object_type() != KObjectType::MemoryObject => {
-                drop(tr.obj);
-                KError::Unsupported as i32
-            }
-            Some(tr) => {
-                copy_fill_into_frame(&tr.obj, pf.frame, content_len as usize);
-                // SAFETY: `pf.file_obj` pins the live `FileObject` (header at 0).
-                let fo: &crate::object::FileObject =
-                    unsafe { &*(pf.file_obj.as_ptr() as *const crate::object::FileObject) };
-                fo.settle(pf.index, &pf.po, true);
-                drop(tr.obj);
-                0
-            }
+            Some(tr) => match copy_fill_into_frame(&tr.obj, pf.frame, content_len as usize) {
+                Ok(()) => {
+                    // SAFETY: `pf.file_obj` pins the live `FileObject` (header at 0).
+                    let fo: &crate::object::FileObject =
+                        unsafe { &*(pf.file_obj.as_ptr() as *const crate::object::FileObject) };
+                    fo.settle(pf.index, &pf.po, true);
+                    drop(tr.obj);
+                    0
+                }
+                Err(e) => {
+                    drop(tr.obj);
+                    e as i32
+                }
+            },
         },
     };
 
@@ -53,15 +56,21 @@ pub(super) fn complete_read_range_reply(
 
 /// Copy `n` bytes (clamped to one page) from the first frame of the transferred fill
 /// `MemoryObject` `src` into the cache frame `dst`, both via the HHDM; a no-op if `src` has no
-/// frames or `n == 0`.
-fn copy_fill_into_frame(src: &ObjectRef, dst: crate::mm::PhysAddr, n: usize) {
+/// frames or `n == 0`. `Unsupported` for any other kind of object, or a borrowed one.
+pub(super) fn copy_fill_into_frame(src: &ObjectRef, dst: crate::mm::PhysAddr, n: usize) -> Result<(), KError> {
     use crate::mm::{PAGE_SIZE, heap};
-    // SAFETY: `src` pins the live `MemoryObject` (header at offset 0).
+    if src.object_type() != KObjectType::MemoryObject {
+        return Err(KError::Unsupported);
+    }
+    // SAFETY: `src` pins the live `MemoryObject` (header at offset 0), its type just checked.
     let mo: &crate::object::MemoryObject = unsafe { &*(src.as_ptr() as *const crate::object::MemoryObject) };
+    if !mo.kernel_reachable() {
+        return Err(KError::Unsupported);
+    }
     let frames = mo.frames();
     let n = n.min(PAGE_SIZE);
     if frames.is_empty() || n == 0 {
-        return;
+        return Ok(());
     }
     let src_va = (frames[0].as_u64() + heap::hhdm_offset()) as *const u8;
     let dst_va = (dst.as_u64() + heap::hhdm_offset()) as *mut u8;
@@ -70,4 +79,5 @@ fn copy_fill_into_frame(src: &ObjectRef, dst: crate::mm::PhysAddr, n: usize) {
     unsafe {
         core::ptr::copy_nonoverlapping(src_va, dst_va, n);
     }
+    Ok(())
 }

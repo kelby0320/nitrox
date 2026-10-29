@@ -88,7 +88,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   destination for `Read`, the source for `Write`. The handle must carry the
   matching `MAP_*` right (`MAP_WRITE` for `Read` — the kernel writes device data
   into it; `MAP_READ` for `Write`). The kernel addresses the object's frames
-  directly for DMA; the caller need not have it mapped. A `buffer` of
+  directly for DMA; the caller need not have it mapped. A borrowed object, one
+  over a device aperture such as `/dev/framebuffer`, is refused with
+  `InvalidArgument`: its frames are only for mapping. A `buffer` of
   `RawHandle::NULL` is valid only for a zero-`length` request.
 - **`buf_offset`** — byte offset into `buffer` where the transfer begins.
   `buf_offset + length` must not exceed the object's size, else

@@ -836,3 +836,37 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     assert_eq!(complete_read_range_reply(&reg, &reply, &mut transfers, 36), Ok(0));
     assert_eq!(fo.lookup(0), Some((next, PageState::Loading)));
 }
+
+/// **A borrowed memory object is refused wherever the kernel reaches its frames itself**: a
+/// spawn's image, an I/O buffer, and a fill's reply. Its range need not be in the HHDM, nor be
+/// memory; mapping it into a user is what it is for.
+#[test]
+fn a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames() {
+    use crate::mm::{Caching, PAGE_SIZE, PhysAddr, heap};
+    use crate::object::{MemoryObject, PendingOperation};
+    init_global_heap();
+    let adopt = |mo| {
+        // SAFETY: a fresh `MemoryObject`, under its own tag.
+        unsafe { crate::drivers::adopt(mo, KObjectType::MemoryObject) }
+    };
+    // SAFETY: a range the test heap never holds; nothing maps it, and a read of it would fault.
+    let aperture = unsafe { MemoryObject::try_new_borrowed(PhysAddr::new(0xF000_0000), PAGE_SIZE, Caching::Normal) };
+    let aperture = adopt(aperture.unwrap());
+    let owned = adopt(MemoryObject::try_new_filled(b"\x7fELF").unwrap());
+    let cache = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap());
+    // SAFETY: `cache` pins the live `MemoryObject`.
+    let frame = unsafe { &*(cache.as_ptr() as *const MemoryObject) }.frames()[0];
+    // SAFETY: a fresh `PendingOperation`, under its own tag.
+    let po = unsafe { crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation) };
+
+    assert_eq!(spawn::image_bytes(&aperture).err(), Some(KError::InvalidArgument));
+    assert_eq!(&spawn::image_bytes(&owned).unwrap()[..4], b"\x7fELF");
+    assert_eq!(submit::io_buffer_size(&aperture), Err(KError::InvalidArgument));
+    assert_eq!(submit::io_buffer_size(&owned), Ok(PAGE_SIZE as u64));
+    assert_eq!(fill::copy_fill_into_frame(&aperture, frame, 4), Err(KError::Unsupported));
+    assert_eq!(fill::copy_fill_into_frame(&po, frame, 4), Err(KError::Unsupported));
+    assert_eq!(fill::copy_fill_into_frame(&owned, frame, 4), Ok(()));
+    // SAFETY: the cache frame is the test heap's, reachable through its HHDM offset.
+    let filled = unsafe { core::slice::from_raw_parts((frame.as_u64() + heap::hhdm_offset()) as *const u8, 4) };
+    assert_eq!(filled, b"\x7fELF");
+}
