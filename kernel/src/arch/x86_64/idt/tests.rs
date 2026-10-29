@@ -87,3 +87,23 @@ fn the_entry_flag_clear_leaves_df_and_ac_clear() {
     assert_eq!(set & DF_AC, DF_AC, "the test set both");
     assert_eq!(cleared & DF_AC, 0, "the clear left {:#x}", cleared & DF_AC);
 }
+
+/// **A vector delivered on an IST stack is never a user fault**, from ring 3 or not: suspending
+/// would park the thread, and its context, on the per-CPU stack the next NMI or #DF reuses.
+#[test]
+fn an_nmi_or_double_fault_from_ring_3_is_not_a_user_fault() {
+    let frame = |vector, cs| {
+        // SAFETY: every field is a `u64`, for which zero is valid.
+        let mut f: ExceptionFrame = unsafe { core::mem::zeroed() };
+        (f.vector, f.cs) = (vector, cs);
+        f
+    };
+    for vector in [2, 8] {
+        assert!(!is_user_fault(&frame(vector, 0x23)), "vector {vector} from ring 3");
+    }
+    for vector in [0, 6, 13, 14] {
+        assert!(is_user_fault(&frame(vector, 0x23)), "vector {vector} from ring 3");
+        assert!(!is_user_fault(&frame(vector, 0x08)), "vector {vector} from ring 0");
+    }
+    assert!(is_user_nmi(&frame(2, 0x23)) && !is_user_nmi(&frame(2, 0x08)) && !is_user_nmi(&frame(8, 0x23)));
+}

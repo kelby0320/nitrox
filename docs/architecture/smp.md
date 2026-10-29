@@ -352,7 +352,9 @@ Three things about it are load-bearing and easy to get wrong:
   Fixed-delivery IPI reaches every CPU *except* those.
 - **Vector 2 runs on IST2.** An IST=0 gate does not switch stacks, and NMI can arrive while RSP
   is still the user stack (`syscall_entry`'s window after `swapgs`), which would `#PF` and then
-  `#DF`.
+  `#DF`. So an NMI or #DF taken in ring 3 never suspends or ends the thread, whose context would
+  then be parked on the stack the CPU's next one reuses: an NMI that is not a stop notice is
+  logged and returned from, and a #DF is fatal.
 - **"Online" is narrower than "executing".** A core joins the online set in `sched::ap_init`,
   so one partway through bring-up is not a target. It checks `arch::stopping()` in `ap_entry`
   before making itself schedulable rather than being signalled.

@@ -131,8 +131,9 @@ macro_rules! irq_dispatcher {
             // SAFETY: the naked stub built a complete `ExceptionFrame` at the stack top and passed
             // its address in RDI: valid, 8-byte aligned, and not aliased for the body's call.
             body(unsafe { &mut *$frame });
-            // SAFETY: the stub-built frame in RDI, valid for this call.
-            if unsafe { (*$frame).cs } & 3 == 3 {
+            // SAFETY: the stub-built frame in RDI, valid for this call. An IST stack is no place to
+            // end a thread from: the next NMI or #DF reuses it.
+            if unsafe { (*$frame).cs & 3 == 3 && ist_slot((*$frame).vector) == 0 } {
                 crate::sched::end_if_ending();
             }
         }
@@ -594,8 +595,9 @@ fn stop_notice() -> ! {
 irq_dispatcher! {
 /// Common handler for every CPU exception except `#PF`. A **ring-3** fault suspends the
 /// thread and acts on the supervisor's disposition via [`user_fault`]: it returns on `Resume`
-/// (the stub `iretq`s the unmodified frame) or diverges on `Terminate`. A **ring-0** fault is
-/// fatal ([`dump_and_halt`]).
+/// (the stub `iretq`s the unmodified frame) or diverges on `Terminate`. A ring-3 NMI returns; a
+/// ring-3 #DF, whose saved CS and RIP are undefined, and a **ring-0** fault are fatal
+/// ([`dump_and_halt`]).
 fn exception_dispatch(f: &mut ExceptionFrame) {
     // The stop notice, before anything else: an NMI while `STOPPING` is set is this CPU being
     // told the machine is going down. Checked ahead of the ring test because the CPUs most
@@ -606,6 +608,10 @@ fn exception_dispatch(f: &mut ExceptionFrame) {
     }
     if is_user_fault(f) {
         user_fault(f, None);
+        return;
+    }
+    if is_user_nmi(f) {
+        crate::kprintln!("nmi: from ring 3 at rip {:#x}; resumed", f.rip);
         return;
     }
     dump_and_halt(f);
@@ -652,8 +658,24 @@ fn registers_of(f: &ExceptionFrame) -> RegisterValues {
     }
 }
 
+/// The IST slot `vector` is delivered on: #DF on IST1, NMI on IST2 (see [`init`]).
+const fn ist_slot(vector: u64) -> u8 {
+    match vector {
+        8 => 1,
+        2 => 2,
+        _ => 0,
+    }
+}
+
+/// A fault from ring 3, delivered on the thread's own kernel stack: one the thread may park on.
+/// An NMI or #DF arrives on a per-CPU IST stack, which the next one reuses.
 fn is_user_fault(f: &ExceptionFrame) -> bool {
-    f.cs & 3 == 3
+    f.cs & 3 == 3 && ist_slot(f.vector) == 0
+}
+
+/// An NMI that is not a stop notice, taken in ring 3, where this CPU holds no kernel lock.
+fn is_user_nmi(f: &ExceptionFrame) -> bool {
+    f.vector == 2 && f.cs & 3 == 3
 }
 
 fn notif_for_vector(f: &ExceptionFrame, cr2: Option<u64>) -> Notification {
@@ -856,12 +878,7 @@ pub fn init() {
         // `pop rsp` and `sysretq`; there a `cli` masks `IF`, but `cli` does not mask NMI, so IST2
         // is again the only cover. SFMASK alone does not make IST2 redundant: it reaches only the
         // entry half.
-        let ist = match vector {
-            8 => 1,
-            2 => 2,
-            _ => 0,
-        };
-        idt[vector].set_handler(stub as usize as u64, ist);
+        idt[vector].set_handler(stub as usize as u64, ist_slot(vector as u64));
     }
 
     // Both IST0: the timer can fire from ring 3 (landing on TSS.RSP0) or ring 0.
