@@ -317,3 +317,32 @@ fn a_record_naming_an_inode_past_the_last_is_corrupt() {
         }
     }
 }
+
+/// **A ReadDir cursor inside a record resumes at the next one**, as Linux's readdir does: a cursor
+/// into a name the client chose parsed the name as a record, and stat'ed an inode outside the
+/// directory the session is confined to. A cursor on a record still starts there.
+#[test]
+fn a_cursor_inside_a_record_resumes_at_the_next() {
+    let img = RwImage(RefCell::new(fixture_blocks(4096, 4096, 0, b"g\n")));
+    let vol = Ext4(&img);
+    vol.mkdir_at(2, b"box", NOW).unwrap();
+    let boxed = vol.resolve_dir(b"/box").unwrap();
+    vol.mkdir_at(boxed, b"twelve bytes", NOW).unwrap();
+    vol.mkdir_at(boxed, b"after", NOW).unwrap();
+    let at = records(&img, boxed as u32)[2].0 as usize;
+    // The name's bytes as a record of inode 14, `/system/current-generation`, named "X".
+    img.0.borrow_mut()[at + 8..at + 20].copy_from_slice(&[14, 0, 0, 0, 0x0C, 0x0C, 1, 1, b'X', b'Y', b'Z', b'W']);
+    let listed = |cursor: u64| {
+        let mut ids = Vec::new();
+        vol.read_dir(boxed, cursor, |e| {
+            ids.push(e.id);
+            true
+        })
+        .unwrap();
+        ids
+    };
+    let after = *listed(0).last().unwrap();
+    assert_eq!(listed(at as u64 % 4096 + 8), [after], "from inside the name");
+    assert_eq!(listed(at as u64 % 4096 + 20), [after], "from the next record");
+    assert_eq!(listed(at as u64 % 4096).len(), 2, "from the record itself");
+}

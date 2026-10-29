@@ -136,7 +136,9 @@ then `entry_count` packed entries. Each entry is a **24-byte prefix** followed b
 | 16 | `mtime` | `i64` | Modification time, seconds since the Unix epoch; `0` if unknown |
 
 `next_cursor == 0` means the listing is complete. A `cursor` is opaque to the
-client — for the ext4 server it is a byte offset into the directory's data.
+client — for the ext4 server it is a byte offset into the directory's data, and
+one that falls inside an entry, made up or left there by a removal since,
+resumes at the next entry; for FAT it counts directory slots.
 
 **Why the metadata is in the entry.** `list` reports
 `Table<{name, size, kind, modified}>`, and carrying those fields inline keeps a

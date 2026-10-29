@@ -119,8 +119,8 @@ holds `BIND_NAMESPACE` — the supervisor (init, or the storage service) binds i
 
 ## Forbidden
 
-- `alloc` in the library half (`ext4.rs`, `extent.rs`, `mkfs.rs`, `volume.rs`, `lib.rs`) —
-  buffer-based only.
+- `alloc` in the library half (`ext4.rs`, `extent.rs`, `mkfs.rs`, `volume.rs`, `lib.rs`, and the
+  modules under them) — buffer-based only.
   The list names every module because a rules file that enumerates three of four is one that
   permits the fourth by omission (PR #310 review).
 - Reading **file data with `read_meta`** — the kernel writes it behind the server's back, so a
