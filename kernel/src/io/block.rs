@@ -15,6 +15,7 @@ use crate::libkern::{IrqSpinLock, KBox, KVec};
 use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// A block device's I/O entry point, stored on its [`DeviceNode`]. `submit`
 /// takes the in-flight `*mut Irp` and the backend's `ctx`, programs the device
@@ -321,6 +322,18 @@ static RECLAIM: IrqSpinLock<ReclaimHead> = IrqSpinLock::new(LockRank::Leaf, Recl
 /// Head of the intrusive reclaim list.
 struct ReclaimHead(*mut IrpBox);
 
+/// The boxes on [`RECLAIM`]: written under it, read without it.
+static RECLAIM_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// The backlog at which a completion wakes the reaper to drain [`RECLAIM`]; an idle CPU drains it
+/// sooner.
+pub const RECLAIM_WAKE_AT: usize = 32;
+
+/// How many completed boxes wait for [`reclaim_completed`].
+pub fn reclaim_backlog() -> usize {
+    RECLAIM_LEN.load(Ordering::Acquire)
+}
+
 // SAFETY: the pointer is an `IrpBox` this module allocated and owns exclusively from the
 // moment its IRP completes; it is reachable only under `RECLAIM`, and the thread-context
 // drain takes the whole list before touching any of it. Same reasoning as `BlockBackend`
@@ -330,13 +343,14 @@ unsafe impl Send for ReclaimHead {}
 /// Drop every completed IRP box. **Thread context only**: the frees
 /// [`finish`] must not do happen here, called from
 /// `sched::reap_pending`. Each parked box pins its `_buffer`, so until a drain a
-/// machine holds every completed transfer's buffer object; this is bounded by
-/// completions since the last `reap_pending`, which `idle_body` keeps small.
+/// machine holds every completed transfer's buffer object: an idle CPU drains them, and with
+/// none idle, the reaper once [`RECLAIM_WAKE_AT`] wait.
 pub fn reclaim_completed() {
     // Take the whole list in one swap and drop outside the lock: a drop reaches
     // the allocator, which an IRQ-masking lock must not be held across.
     let mut head = {
         let mut g = RECLAIM.lock();
+        RECLAIM_LEN.store(0, Ordering::Release);
         core::mem::replace(&mut g.0, core::ptr::null_mut())
     };
     while !head.is_null() {
@@ -387,10 +401,14 @@ unsafe fn finish(irp: *mut Irp) {
     // "freeing counts as allocating".
     // SAFETY: the box is live and owned by this completion; nothing else references it
     // once the IRP has completed, so writing its link and publishing it is sound.
-    unsafe {
+    let backlog = unsafe {
         let mut g = RECLAIM.lock();
         (*bx_ptr).reclaim_next = g.0;
         g.0 = bx_ptr;
+        RECLAIM_LEN.fetch_add(1, Ordering::AcqRel) + 1
+    };
+    if backlog == RECLAIM_WAKE_AT {
+        crate::sched::wake_reaper_to_reclaim();
     }
 }
 

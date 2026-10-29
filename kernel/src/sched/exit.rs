@@ -488,8 +488,8 @@ pub fn reap_pending() {
     }
 }
 
-/// The reaper thread body: close the handle tables of processes that have exited, then
-/// park until there are more.
+/// The reaper thread body: close the handle tables of processes that have exited, and drain the
+/// completed-IRP list when no idle CPU has, then park until there is more.
 ///
 /// **Why a thread at all.** If reclamation ran only at `exit_*`/`yield_now`/
 /// `suspend_with_fault` and in the idle loop, a system where nothing exits or yields and no
@@ -498,11 +498,14 @@ pub fn reap_pending() {
 /// `PeerClosed` only reclamation can deliver. A schedulable thread removes the dependency
 /// on scheduling luck.
 ///
-/// It closes **handle tables only**. Kernel stacks stay with the per-CPU [`reap`](SchedState::reap)
-/// path: a thread parks itself there and then switches off its own stack, so freeing it
-/// from another CPU is a use-after-free, and the reaper runs wherever it is scheduled.
+/// Kernel stacks stay with the per-CPU [`reap`](SchedState::reap) path: a thread parks itself
+/// there and then switches off its own stack, so freeing it from another CPU is a use-after-free,
+/// and the reaper drains only the list of the CPU it runs on.
 pub(super) extern "C" fn reaper_body(_arg: usize) {
     loop {
+        if crate::io::block::reclaim_backlog() > 0 {
+            reap_pending();
+        }
         // Take one pid at a time: `close_all_owned_by` drops object references, which must
         // happen with `SCHED` released.
         let next = {
@@ -519,12 +522,12 @@ pub(super) extern "C" fn reaper_body(_arg: usize) {
     }
 }
 
-/// Park the reaper until [`wake_reaper`] runs. Re-checks the queue **under `SCHED`** before
-/// parking, which closes the lost-wakeup window: a pid pushed between the reaper's last
-/// drain and this park would otherwise wake nothing.
+/// Park the reaper until [`wake_reaper`] runs. Re-checks its work **under `SCHED`** before
+/// parking, which closes the lost-wakeup window: a pid pushed, or a completed IRP's box parked,
+/// between the reaper's last drain and this park would otherwise wake nothing.
 fn park_reaper() {
     let mut g = SCHED.lock();
-    if !g.ended_pids.is_empty() {
+    if !g.ended_pids.is_empty() || crate::io::block::reclaim_backlog() > 0 {
         return; // work arrived while we were draining — go round again
     }
     let me = g.cur_slot().take().expect("current set");
@@ -550,6 +553,12 @@ fn park_reaper() {
     // Resumes here, lock-free, when `wake_reaper` re-queues us.
     // SAFETY: `me_slot` is our own (now-parked) saved-SP slot; both threads pinned.
     unsafe { switch_into(g, me_slot, me_obj, next_obj) };
+}
+
+/// Wake the reaper to drain the completed-IRP list, which no idle CPU has drained: from a DPC,
+/// holding nothing.
+pub fn wake_reaper_to_reclaim() {
+    wake_reaper(&mut SCHED.lock());
 }
 
 /// Make the reaper runnable, if it is parked. Caller holds `SCHED`. A no-op when it is

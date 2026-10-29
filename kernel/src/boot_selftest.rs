@@ -51,6 +51,7 @@ pub fn pre_smp() {
 /// Post-SMP demos (after AP bring-up): work distribution and affinity, and the FP/SIMD isolation
 /// proof, worth running only with several CPUs.
 pub fn post_smp() {
+    nitrox_kernel::io::reclaim_under_load_self_test();
     smp_distribution_demo();
     smp_affinity_demo();
     fp_isolation_demo();
