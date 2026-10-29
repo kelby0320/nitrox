@@ -5,8 +5,8 @@
 //! when [`run_pending`] drains the queue at the interrupt-dispatch tail. A handler may briefly take
 //! the scheduler lock but must not block. See `docs/architecture/drivers-and-irps.md`.
 //!
-//! A [`Dpc`] is embedded **inline** in its owning struct, so queuing one allocates nothing: the
-//! queue is a pre-reserved list of node pointers.
+//! A [`Dpc`] is a static, or a field of the heap object it serves, so queuing one allocates
+//! nothing: the queue is a pre-reserved list of their addresses.
 //!
 //! ## One queue, drained by every CPU
 //!
@@ -15,6 +15,7 @@
 //! a DPC queued again while it runs can run on a second CPU at the same time: a handler must
 //! tolerate a concurrent instance of itself.
 
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::lockrank::LockRank;
@@ -26,8 +27,8 @@ const DPC_RESERVE: usize = 64;
 
 /// A deferred procedure call: `handler(ctx)`, run when the queue is drained.
 ///
-/// Embed it inline in an owning struct and `'static`-place it (or own it within a heap object that
-/// outlives any queued reference); [`Dpc::new`] is `const` so a `static Dpc` is possible.
+/// A `static` ([`Dpc::new`] is `const`), queued with [`enqueue`]; or a field of a heap object that
+/// outlives its handler, queued with [`enqueue_raw`].
 pub struct Dpc {
     handler: fn(*mut ()),
     ctx: *mut (),
@@ -72,11 +73,22 @@ pub fn init() -> Result<(), AllocError> {
     Ok(())
 }
 
-/// Queue `dpc` to run at the next [`run_pending`]; idempotent. Safe to call from IRQ context.
-pub fn enqueue(dpc: &Dpc) {
+/// Queue `dpc` to run at the next [`run_pending`]; idempotent. Safe to call from IRQ context. A
+/// `'static` DPC outlives every drain, whichever CPU's runs it.
+pub fn enqueue(dpc: &'static Dpc) {
+    // SAFETY: a `'static` DPC is valid for good.
+    unsafe { enqueue_raw(NonNull::from(dpc)) }
+}
+
+/// [`enqueue`] a DPC that is not `'static`, one inside a heap object.
+///
+/// # Safety
+/// `dpc` stays valid until its handler has run, on whichever CPU drains it.
+pub unsafe fn enqueue_raw(dpc: NonNull<Dpc>) {
     #[cfg(test)]
-    ENQUEUED.with(|e| e.borrow_mut().push(dpc as *const Dpc as usize));
-    enqueue_into(&DPC_QUEUE, dpc);
+    ENQUEUED.with(|e| e.borrow_mut().push(dpc.as_ptr() as usize));
+    // SAFETY: valid until its handler has run, by the caller's contract.
+    enqueue_into(&DPC_QUEUE, unsafe { dpc.as_ref() });
 }
 
 #[cfg(test)]

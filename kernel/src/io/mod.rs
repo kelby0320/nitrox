@@ -21,12 +21,19 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::io_op::IoOpcode;
 use crate::mm::heap::hhdm_offset;
 use crate::object::{InterruptObject, MemoryObject, ObjectRef, PendingOperation};
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-/// The DPC handler for the [`InterruptObject`] self-test: signal the object whose
-/// pointer is its `ctx`, exactly as a device ISR's completion DPC would.
-fn intr_test_dpc(ctx: *mut ()) {
-    // SAFETY: the self-test queued this DPC with its live `InterruptObject` as `ctx`.
-    unsafe { crate::sched::signal_interrupt(ctx) };
+/// The [`InterruptObject`] self-test's DPC, a static as every queued DPC must outlive its drain.
+static INTR_TEST_DPC: Dpc = Dpc::new(intr_test_dpc, core::ptr::null_mut());
+/// The object [`INTR_TEST_DPC`] signals, set by the self-test before it queues it.
+static INTR_TEST_OBJ: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// The DPC handler for the [`InterruptObject`] self-test: signal its object, exactly as a device
+/// ISR's DPC would.
+fn intr_test_dpc(_: *mut ()) {
+    // SAFETY: the self-test set its live `InterruptObject` before queuing this, and drains it
+    // before letting the object go, on the one CPU there is before the APs come up.
+    unsafe { crate::sched::signal_interrupt(INTR_TEST_OBJ.load(Ordering::Acquire)) };
 }
 
 /// Boot self-test for the I/O spine. Proves, without real hardware:
@@ -137,8 +144,8 @@ fn interrupt_object_self_test() {
             return;
         }
     };
-    let dpc = Dpc::new(intr_test_dpc, irq.as_ptr());
-    crate::dpc::enqueue(&dpc);
+    INTR_TEST_OBJ.store(irq.as_ptr(), Ordering::Release);
+    crate::dpc::enqueue(&INTR_TEST_DPC);
     crate::dpc::run_pending();
 
     // SAFETY: `irq` is a live `InterruptObject` reference held across the call.
