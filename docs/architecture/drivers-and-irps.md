@@ -72,9 +72,9 @@ order. This is the foundation everything else rests on.
   in `sys_wait`. The bulk of a driver's logic that *can* block lives here (for a
   userspace driver, this is the driver process's own threads).
 
-A **`DpcNode`** is an inline field of its owning structure (an `Irp`, a `Timer`)
-— a linked-list node plus a handler pointer — so queuing a DPC on the completion
-fast path allocates nothing. This matters: per `kernel/CLAUDE.md`, allocation in
+A **`Dpc`** is a field of its owning structure, a static or a `Timer`: a handler pointer and a
+queued flag, so queuing a DPC on the completion fast path allocates nothing. An IRP carries none
+of its own: a completed IRP is linked onto one list, drained by one static DPC. This matters: per `kernel/CLAUDE.md`, allocation in
 IRQ/DPC context is forbidden.
 
 > **Reconciliation with Phase 1.** Phase 1 wakes `sys_wait`ers *directly* from
@@ -163,7 +163,7 @@ struct Irp {
     params:     IrpParams,
     stack:      IrpStack,          // the driver stack this IRP descends
     status:     IrpStatus,
-    dpc:        DpcNode,           // inline — no heap alloc to queue completion
+    next:       *mut Irp,          // the completed-IRP list's link — no heap alloc to complete
 }
 ```
 
@@ -176,8 +176,8 @@ struct Irp {
    hardware and returns *Pending*.
 3. The thread `sys_wait`s on the `PendingOperation` (alongside any other
    waitables) — it does **not** block inside the I/O call.
-4. The completion **IRQ** fires; the ISR acknowledges the device and queues the
-   IRP's `DpcNode`.
+4. The completion **IRQ** fires; the ISR acknowledges the device and completes the IRP
+   (`io::irp::complete`), which links it for the completion DPC.
 5. The **DPC** runs the stack's completion routines **up** from the bottom — this
    is where Rust's ownership model pays off: a completion routine cannot hold a
    reference to a stack frame that has already returned. The DPC signals the
@@ -415,8 +415,8 @@ own memory with no copy, before `drivers::probe`'s GPT pass, so its partitions g
 `/dev/disk/by-partlabel/` names from the same code as a SATA disk's. The live image's root arrives
 this way.
 
-- **Completion.** `submit` performs the transfer and queues the IRP's completion DPC, then raises
-  the RAM disk's software vector on its own CPU, so the DPC drains at the device-interrupt tail and
+- **Completion.** `submit` performs the transfer and completes the IRP, which queues the completion
+  DPC, then raises the RAM disk's software vector on its own CPU, so the DPC drains at the device-interrupt tail and
   `resched_if_idle` runs — exactly AHCI's path. Without the interrupt every completion waited for
   the 10 ms tick: mount to greeter on the live image took 3,082 ms under KVM against 39 ms with it
   (`cargo xtask check-live` bounds it).

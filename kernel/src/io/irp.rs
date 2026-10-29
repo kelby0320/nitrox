@@ -9,6 +9,8 @@
 //! `Irp`.
 
 use crate::dpc::Dpc;
+use crate::libkern::IrqSpinLock;
+use crate::libkern::lockrank::LockRank;
 
 /// `IRP_MAX_STACK` — the deepest driver stack built (GPT-over-AHCI = 2); the
 /// headroom avoids a reallocation seam (`docs/spec/irp-layout.md`).
@@ -124,8 +126,11 @@ pub struct Irp {
     pub buffer: IrpBuffer,
     /// `*mut PendingOperation` signalled on completion (kernel pointer; 0 = none).
     pub completion: u64,
-    /// Inline completion DPC — queuing it allocates nothing.
-    pub dpc: Dpc,
+    /// The next completed IRP while this one waits to be finished: [`complete`]'s alone.
+    pub next: *mut Irp,
+    /// What finishing this IRP does once [`complete`] has recorded its outcome, at the next DPC
+    /// drain: its dispatcher's to set. [`Irp::new_block`]'s does nothing.
+    pub on_complete: unsafe fn(*mut Irp),
     /// The per-layer stack frames.
     pub stack: [IrpStackFrame; IRP_MAX_STACK],
 }
@@ -133,9 +138,8 @@ pub struct Irp {
 impl Irp {
     /// Build a single-layer IRP targeting `device` for `length` bytes at
     /// `offset` against `buffer`, completing `completion` (a
-    /// `*mut PendingOperation`). The inline DPC is left unarmed until
-    /// [`arm_completion`](Self::arm_completion) sets it at the IRP's final
-    /// address; `status` starts `Pending`.
+    /// `*mut PendingOperation`); `status` starts `Pending`, and `on_complete` does nothing until
+    /// its dispatcher sets it.
     pub fn new_block(
         op: IrpOp,
         device: *const (),
@@ -160,22 +164,78 @@ impl Irp {
             transferred: 0,
             buffer,
             completion: completion as u64,
-            // Placeholder; replaced by `arm_completion` after final placement.
-            dpc: Dpc::new(noop_dpc, core::ptr::null_mut()),
+            next: core::ptr::null_mut(),
+            on_complete: finish_nothing,
             stack,
         }
     }
 
-    /// Record the terminal `status` and `transferred` count on a completed IRP.
-    /// Called by a device backend (in DPC or completion context) before the
-    /// completion DPC signals the PO.
+    /// Record the terminal `status` and `transferred` count on a completed IRP: [`complete`]'s
+    /// first step.
     pub fn set_completion(&mut self, status: i32, transferred: u64) {
         self.status = status;
         self.transferred = transferred;
     }
 }
 
-fn noop_dpc(_ctx: *mut ()) {}
+/// [`Irp::new_block`]'s `on_complete`: an IRP no dispatcher owns, a test's, needs no finishing.
+unsafe fn finish_nothing(_: *mut Irp) {}
+
+/// Completed IRPs waiting for [`FINISH`], first to last.
+struct Done {
+    head: *mut Irp,
+    tail: *mut Irp,
+}
+
+// SAFETY: the IRPs are reached only under `DONE`, from `complete` until `finish_completed` takes
+// the list, and each is the completing driver's to hand on.
+unsafe impl Send for Done {}
+
+static DONE: IrqSpinLock<Done> =
+    IrqSpinLock::new(LockRank::Leaf, Done { head: core::ptr::null_mut(), tail: core::ptr::null_mut() });
+
+/// **The one DPC that finishes completed IRPs**, so the DPC queue holds static DPCs only and its
+/// reserve bounds them, rather than one DPC an IRP completed between two drains.
+static FINISH: Dpc = Dpc::new(finish_completed, core::ptr::null_mut());
+
+/// **Complete `irp` with `status` and `transferred`**, from a driver's completion, interrupt or
+/// refusal, in any context; its `on_complete` runs at the next DPC drain.
+///
+/// # Safety
+/// `irp` is live and in flight, completed this once, and touched by nothing else until its
+/// `on_complete` has run.
+pub unsafe fn complete(irp: *mut Irp, status: i32, transferred: u64) {
+    // SAFETY: the caller's contract; `DONE` serialises the list's links.
+    unsafe {
+        (*irp).set_completion(status, transferred);
+        (*irp).next = core::ptr::null_mut();
+        let mut done = DONE.lock();
+        match done.tail.is_null() {
+            true => done.head = irp,
+            false => (*done.tail).next = irp,
+        }
+        done.tail = irp;
+    }
+    crate::dpc::enqueue(&FINISH);
+}
+
+/// [`FINISH`]'s handler: take every completed IRP and run its `on_complete`, in completion order.
+fn finish_completed(_: *mut ()) {
+    let mut irp = {
+        let mut done = DONE.lock();
+        done.tail = core::ptr::null_mut();
+        core::mem::replace(&mut done.head, core::ptr::null_mut())
+    };
+    while !irp.is_null() {
+        // SAFETY: `irp` came off the list `complete` built, `next` written before it was pushed,
+        // and is this drain's alone; its `on_complete` may end it, so `next` is read first.
+        unsafe {
+            let next = (*irp).next;
+            ((*irp).on_complete)(irp);
+            irp = next;
+        }
+    }
+}
 
 // --- Layout pinning (docs/spec/irp-layout.md) ---------------------------------
 
@@ -192,8 +252,9 @@ const _: () = {
     assert!(offset_of!(Irp, transferred) == 48);
     assert!(offset_of!(Irp, buffer) == 56);
     assert!(offset_of!(Irp, completion) == 72);
-    // `dpc` follows at 80, then `stack`; the tail offset depends on `Dpc`'s
-    // kernel-internal size, so only the hashed fields and sub-type sizes are asserted.
+    assert!(offset_of!(Irp, next) == 80);
+    assert!(offset_of!(Irp, on_complete) == 88);
+    assert!(offset_of!(Irp, stack) == 96);
     assert!(size_of::<PhysFrag>() == 16);
     assert!(size_of::<IrpBuffer>() == 16);
     assert!(size_of::<IrpStackFrame>() == 24);

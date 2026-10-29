@@ -63,7 +63,12 @@ pub fn init() -> Result<(), AllocError> {
     // rejects. The lock is only honestly a leaf if nothing under it ever allocates.
     let mut reserved = KVec::new();
     reserved.try_reserve(DPC_RESERVE)?;
-    *DPC_QUEUE.lock() = reserved;
+    // **Once**: replacing a queue already in use would drop what it holds, and a `Dpc` dropped
+    // while marked queued is never queued again.
+    let mut q = DPC_QUEUE.lock();
+    if q.capacity() < DPC_RESERVE {
+        *q = reserved;
+    }
     Ok(())
 }
 

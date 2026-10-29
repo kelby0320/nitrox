@@ -461,7 +461,7 @@ pub fn on_reschedule_ipi() {
 
 /// Resume an idle CPU into the scheduler after a **same-CPU wake** that sent no reschedule
 /// IPI — the device-IRQ counterpart of [`on_reschedule_ipi`], called from the device-IRQ
-/// dispatch tail. An I/O-completion DPC (e.g. AHCI `irp_complete_dpc` →
+/// dispatch tail. An I/O-completion DPC (the IRP's `on_complete` →
 /// `complete_pending_op`) can make a thread runnable on *this* CPU, and `place_thread`
 /// sends an IPI only for *cross-CPU* placements, so without this an idle CPU `iretq`s
 /// straight back into `hlt` and the woken thread waits for the next tick, serialising every

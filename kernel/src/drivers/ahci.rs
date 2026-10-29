@@ -571,16 +571,15 @@ unsafe fn issue_locked(d: &AhciDisk, p: &mut PortState, irp: *mut Irp) -> bool {
 /// on the device since `issued_at`, when [`issue_locked`] stamped it.
 ///
 /// # Safety
-/// `irp` is the IRP [`take_retired`] just took out of flight: live, and uniquely this driver's
-/// until its DPC runs.
+/// `irp` is the IRP [`take_retired`] just took out of flight: live, and uniquely this driver's to
+/// complete.
 unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool, moved: u32, issued_at: u64) {
     let ns = clock().saturating_sub(issued_at);
     // SAFETY: as the contract says.
     unsafe {
         let (status, transferred) = completion(err, (*irp).length, moved);
         d.counted.record((*irp).op, status == IrpStatus::Success as i32, transferred, ns);
-        (*irp).set_completion(status, transferred);
-        crate::dpc::enqueue(&(*irp).dpc);
+        crate::io::irp::complete(irp, status, transferred);
     }
 }
 
@@ -639,15 +638,12 @@ fn drain_queue(d: &AhciDisk) {
 
 /// Complete `irp` with `error`, outside the port lock.
 fn refuse(irp: *mut Irp, error: crate::syscall::error::KError) {
-    // SAFETY: `irp` is a live IRP not in flight or queued, so uniquely ours.
-    unsafe {
-        (*irp).set_completion(error as i32, 0);
-        crate::dpc::enqueue(&(*irp).dpc);
-    }
+    // SAFETY: `irp` is a live IRP not in flight or queued, so uniquely ours to complete.
+    unsafe { crate::io::irp::complete(irp, error as i32, 0) };
 }
 
 /// The AHCI completion ISR (device-IRQ context): acknowledges the controller, completes the
-/// in-flight IRP via its DPC and queues the `InterruptObject` signal.
+/// in-flight IRP and queues the `InterruptObject` signal.
 extern "C" fn isr() {
     let disk = AHCI.load(Ordering::Acquire);
     if disk.is_null() {
@@ -679,7 +675,7 @@ fn on_interrupt(d: &AhciDisk) {
     }
     // If slot 0 has retired, complete the IRP and queue the drain DPC for the next waiting command.
     if !irp.is_null() {
-        // SAFETY: `irp` is the retired request; set status + queue its DPC.
+        // SAFETY: `irp` is the retired request, completed here once.
         unsafe { retire(d, irp, err, moved, issued_at) };
         crate::dpc::enqueue(&AHCI_DRAIN_DPC);
     }

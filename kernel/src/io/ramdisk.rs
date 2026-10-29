@@ -224,20 +224,17 @@ static COMPLETION_VECTOR: AtomicU8 = AtomicU8::new(0);
 /// only so that tail runs.
 extern "C" fn ramdisk_completion_isr() {}
 
-/// The ramdisk's [`BlockBackend::submit`]: transfer now (a ramdisk has no DMA engine), queue the
-/// IRP's completion DPC, and raise the completion interrupt so the DPC drains at once rather than
-/// at the next timer tick.
+/// The ramdisk's [`BlockBackend::submit`]: transfer now (a ramdisk has no DMA engine), complete the
+/// IRP, and raise the completion interrupt so its DPC drains at once rather than at the next timer
+/// tick.
 fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
     // SAFETY: `ctx` is the `*const RamDisk` installed in the backend; the device
     // outlives the IRP.
     let rd = unsafe { &*(ctx as *const RamDisk) };
     // SAFETY: `irp` is the live in-flight IRP from `dispatch_block_irp`.
     let (status, transferred) = rd.serve(unsafe { &*irp }, crate::arch::Timer::read_ns);
-    // SAFETY: as above; record the outcome before queuing completion.
-    unsafe { (*irp).set_completion(status, transferred) };
-    // SAFETY: the inline DPC was armed in `dispatch_block_irp`; the IRP outlives
-    // the drain (it is reclaimed by the completion handler).
-    crate::dpc::enqueue(unsafe { &(*irp).dpc });
+    // SAFETY: as above, and completed here once.
+    unsafe { crate::io::irp::complete(irp, status, transferred) };
     let vector = COMPLETION_VECTOR.load(Ordering::Acquire);
     if vector != 0 {
         // SAFETY: ring 0, and this CPU's local controller is up. The first submits come from

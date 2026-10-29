@@ -40,8 +40,9 @@ pub struct Irp {
     pub transferred: u64,            // offset 48  — bytes actually transferred (set on completion)
     pub buffer:      IrpBuffer,      // offset 56  — the data buffer (physical reference, 16 B)
     pub completion:  u64,            // offset 72  — *mut PendingOperation (kernel ptr; 0 if none)
-    pub dpc:         DpcNode,        // offset 80  — inline; queues completion with no alloc
-    pub stack:       IrpStack,       // after dpc  — the per-layer frames (size depends on DpcNode)
+    pub next:        *mut Irp,       // offset 80  — the next completed IRP, while it waits (kernel-internal)
+    pub on_complete: unsafe fn(*mut Irp), // offset 88 — what finishing it does (its dispatcher's)
+    pub stack:       IrpStack,       // offset 96  — the per-layer frames
 }
 ```
 
@@ -76,10 +77,13 @@ carries everything down and back up.
 - **`completion`** — a kernel pointer to the `PendingOperation` that
   `sys_io_submit` returned and the completion DPC signals. `0` for an internal
   IRP with no userspace waiter (none in Phase 2).
-- **`dpc`** — an **inline** [`DpcNode`](../../kernel/src/dpc.rs). The completion
-  ISR queues *this* node (no heap allocation in IRQ context, per
-  `kernel/CLAUDE.md`); the drained DPC runs the completion routines and signals
-  `completion`.
+- **`next`** and **`on_complete`** — a driver completes an IRP with
+  `io::irp::complete(irp, status, transferred)`, from its ISR, a DPC or a refusal: that records
+  the outcome and links the IRP by `next` onto one list, drained by **one static DPC** (no heap
+  allocation in IRQ context, per `kernel/CLAUDE.md`), which runs each IRP's `on_complete`. The
+  block layer's signals `completion` and hands its box to thread context to free. One DPC for
+  every IRP, rather than one inline in each, keeps the DPC queue to static DPCs, which its fixed
+  reserve bounds (2026-10-29).
 - **`stack`** — the [`IrpStack`](#irpstack) of per-layer frames.
 
 ## IrpOp
@@ -175,9 +179,9 @@ In layout terms:
    (e.g. partition rebases `offset`), decrements `stack_index`, and forwards.
 3. The bottom layer programs the device (DMA against `buffer.frags`) and leaves
    the IRP `Pending`.
-4. The completion IRQ's ISR acknowledges the device and queues `irp.dpc`.
-5. The drained DPC runs completion routines up (`stack_index` rising), sets
-   `status`/`transferred`, and signals `completion`.
+4. The completion IRQ's ISR acknowledges the device and calls `io::irp::complete`, which sets
+   `status`/`transferred` and links the IRP for the completion DPC.
+5. The drained DPC runs the IRP's `on_complete`, which signals `completion`.
 6. The initiator's `sys_wait` returns; `IoResult.status = irp.status`,
    `IoResult.result = irp.transferred`.
 
