@@ -340,3 +340,18 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-28	405	2eae0653	13	tests	optional	demonstrated	fixed	46e32fc5	inode 0 tested; within's 512-level bound declined: predates this PR, untouched by it
 2026-10-28	405	2eae0653	14	architecture	optional	unverified	fixed	46e32fc5	send_setup_full's doc: no Err can be retried; the setup comment no longer calls SinkFull retryable
 2026-10-28	405	2eae0653	15	architecture	optional	demonstrated	fixed	46e32fc5	the crate rules say the loop's buffers are on its stack
+2026-10-29	406	e6db9aa7	1	logic	worth-fixing	demonstrated	fixed	2d06cd54	self-test asserts the bound (reached 32, fell below); 40 + pause + 20 failed before, passes now; no wake fails it
+2026-10-29	406	e6db9aa7	2	error-paths	worth-fixing	demonstrated	fixed	2d06cd54	tests that drain or complete hold dpc::exclusive, checked in run_pending/complete; 4/600 under load before, 0/600 + 0/300 full after
+2026-10-29	406	e6db9aa7	3	tests	worth-fixing	demonstrated	fixed	2d06cd54	ensure_table CASes against the value read before allocating; link as a plain store fails the lost-race test
+2026-10-29	406	e6db9aa7	4	tests	worth-fixing	demonstrated	fixed	2d06cd54	a handler queuing a DPC runs in the same drain; a break after the drain's for fails it
+2026-10-29	406	e6db9aa7	5	tests	worth-fixing	demonstrated	fixed	2d06cd54	partly refuted (rip was checked); worker faults with 12 marked registers, harness checks each; no store fails test-qemu
+2026-10-29	406	e6db9aa7	6	tests	worth-fixing	demonstrated	fixed	2d06cd54	test-qemu requires the OK line, self-test panics on set-up; park_reaper's re-check stays uncovered (cross-CPU window)
+2026-10-29	406	e6db9aa7	7	tests	worth-fixing	demonstrated	deferred		maintainer's call: TODO(miri-provenance-tests) for Part I's Miri job; all four run under Miri by hand
+2026-10-29	406	e6db9aa7	8	rules-and-docs	worth-fixing	demonstrated	fixed	2d06cd54	three docs say the registers are copied at the fault; no Timer holds a Dpc; sweep for the old names empty
+2026-10-29	406	e6db9aa7	9	error-paths	optional	demonstrated	fixed	2d06cd54	complete debug-asserts Pending; without it an_irp_completed_twice_is_stopped does not panic as expected
+2026-10-29	406	e6db9aa7	10	logic	optional	demonstrated	fixed	2d06cd54	taken() and ends_on_return() tested, match exhaustive; the dispatcher's one ends_on_return call untested
+2026-10-29	406	e6db9aa7	11	tests	optional	demonstrated	fixed	2d06cd54	DPC drain order and on_complete order pinned; .rev() and head insertion each fail
+2026-10-29	406	e6db9aa7	12	tests	optional	demonstrated	fixed	2d06cd54	registers_of field by field over 18 distinct values; rbx: f.rax fails it
+2026-10-29	406	e6db9aa7	13	tests	optional	demonstrated	fixed	2d06cd54	pid 9 tid 7 through with_current; the swapped tuple fails it
+2026-10-29	406	e6db9aa7	14	architecture	optional	demonstrated	fixed	2d06cd54	on_complete extern "C"; irp-layout and drivers-and-irps state it runs after per-frame routines, which nothing runs yet
+2026-10-29	406	e6db9aa7	15	rules-and-docs	optional	demonstrated	fixed	2d06cd54	long doc lines rewrapped to 100 columns; table rows left long
