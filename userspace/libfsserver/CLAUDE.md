@@ -27,7 +27,11 @@ servers speak one protocol and a fix to it is a fix to both:
   FAT's uses. A server hands `server::bootstrap` the one it wants. And **`PartitionIo`** (Phase 6
   Part G.2), a window onto part of a device, for a program that makes a filesystem on a disk it
   holds rather than a server handed a partition: `nxinstall`'s until `disk --format` needed it too.
-  **None of the three is `Sync`**: each moves every transfer through one scratch mapping.
+  **None of the three is `Sync`**: each moves every transfer through one **`Scratch`**, a memory
+  object mapped for its life. **A wait that fails leaves the transfer running** (`po_wait` answers
+  `None`), so that scratch is *lost*: the device may still read or write it, and the disk answers
+  `Io` to everything after, copying nothing into it and submitting nothing through it. Its
+  syscalls go through `disk/sys.rs`, which a host test scripts.
 - **`cache.rs`** — **`MetaCache`** (Phase 6 Part H.4), the metadata cache each server serves its
   filesystem through: a fixed store of 4 KiB blocks, filled only by `BlockReader::read_meta`, every
   write through to the device and into any copy it holds, `BlockWriter::forget` letting freed blocks
