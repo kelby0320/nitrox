@@ -209,7 +209,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `a_reader_and_a_closer_never_both_miss`, which saw rounds where each missed the other in 6 of 10
   runs of a million rounds on x86.
 
-- [ ] **kobj-d6** `kernel/src/mm/user_access.rs:177` — `copy_from_user<T: Copy>` and `copy_to_user<T:
+- [x] **kobj-d6** `kernel/src/mm/user_access.rs:177` — `copy_from_user<T: Copy>` and `copy_to_user<T:
   Copy>` (`:205`) accept any `Copy` type. A `T` with invalid bit patterns (`bool`, an enum, `char`,
   `NonZero`) built from user bytes is undefined behaviour, and a `T` with padding copies
   uninitialised kernel stack bytes to user memory. Latent: the 3 `copy_from_user` types
@@ -222,6 +222,11 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   probe_copy_from_user` gave "constructing invalid value ... encountered 0x00000007, but expected a
   valid enum tag" at `user_access.rs:199`. A second probe with `bool` on byte 2 failed the same
   way. The probes were removed. See kobj-o6. soundness/opportunities. Medium. **Fix.**
+  Fixed in `efb315e2`: `libkern::Pod`, implemented through `pod!`, which fails the build unless
+  every field is `Pod` and the fields fill the struct, bounds `copy_from_user` and `copy_to_user`,
+  and a copy starts from `T::zeroed()`. Fails without it: the survey's probe, a struct holding a
+  `bool` read from bytes of 7, is undefined behaviour under Miri on the old code, and with this does
+  not compile (E0277). `pod!` fails a padded struct, a `bool` field and a field not named.
 
 - [x] **kobj-d7** `kernel/src/syscall/table.rs:1202` — `sys_ns_bind`'s test for an existing
   registration (`us_forward_existing_reg`) and its install of the back-pointer (`us_server_attach`,
@@ -241,7 +246,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   returns to share, in one `SCHED` hold; fails if it replaces one:
   `a_second_attach_of_an_endpoint_gets_the_first_registration`.
 
-- [ ] **kobj-d8** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
+- [x] **kobj-d8** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` and its private twin `io/mod.rs:160` are safe functions that wrap
   `ObjectRef::from_raw` for any `T` under any tag. Sibling: `HandleTable::allocate(&self, pid,
   object: *mut (), ..)` is safe and stores any pointer, which lookup step 7 dereferences. Safe code
@@ -253,6 +258,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   destroyed through the `SystemControl` arm (`cargo test --lib --target x86_64-unknown-linux-gnu
   probe_safe_adopt`). It was removed. See kobj-o1 and kobj-o2. soundness/opportunities. Medium.
   **Fix.**
+  Fixed in `9a28d4b0`: `drivers::adopt` and io's twin are `unsafe`, their contract the pairing, and
+  `adopt_node` stays safe, its type fixing the tag. Fails without it: safe code adopting a
+  `NotificationChannel` under the `EntropyObject` tag ran the wrong destructor (destroy counts `(0,
+  1)`); with this it needs an `unsafe` block. The sibling `HandleTable::allocate` is left to P1.
 
 - [x] **kobj-d9** `kernel/src/syscall/table.rs:611` — `sys_thread_get_registers` takes the
   suspended thread's `ExceptionFrame` address under SCHED (`thread_exception_frame`,
@@ -270,7 +279,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   **Fix**, as sched-d1.
   Fixed in `3d1174b5`, as sched-d1.
 
-- [ ] **kobj-d10** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard`,
+- [x] **kobj-d10** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard`,
   `:249`) get auto `Send` and `Sync` from `&'a SpinLock<T>`, so a guard over a `Send + !Sync` value
   such as a `Cell` is `Sync`, and a guard can be dropped on another CPU than the one whose preempt
   count and lock rank it raised (std's `MutexGuard` is `!Send`, and `Sync` only for `T: Sync`).
@@ -280,6 +289,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   Miri as `probe_guard_shares`, reported "Data race detected" in `Cell::get`. They were removed.
   Fix: `unsafe impl<T: Sync> Sync` and a `PhantomData<*const ()>` marker for `!Send`.
   ownership/soundness. Low. **Fix.**
+  Fixed in `ef7cf4fd`: both guards carry a `PhantomData<*const ()>`, so neither is `Send`, and are
+  `Sync` only for `T: Sync`; compile-time checks beside them hold all four properties. Fails without
+  it: an unconditional `Send`, or `Sync` without the bound, fails the build (E0283).
 
 - [x] **kobj-d11** `kernel/src/sched/current.rs:31` — Shared `&Thread` is formed in 13 places
   (`sched/current.rs:31,45,59,86`; `sched/exit.rs:24,50,104,145,221,244,286,465`;
@@ -450,7 +462,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   at the send, the forwarded replies and the spawn; each of six mutations fails one of the claim
   tests.
 
-- [ ] **kobj-o6** encapsulate: plain `#[repr(C)]` ABI data is reinterpreted by hand — per-type
+- [x] **kobj-o6** encapsulate: plain `#[repr(C)]` ABI data is reinterpreted by hand — per-type
   `as_bytes` through `from_raw_parts(self as *const Self as *const u8, size_of)`, `mem::zeroed`,
   `unsafe KBox::try_new_zeroed` for `StoredMsg` with its restated SAFETY at each call, and
   hand-rolled `[u8; N*8]` loops for handle and `IoResult` arrays. The user-copy primitives bound `T`
@@ -469,6 +481,13 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   values built from user bytes (kobj-d6) and kernel padding copied out. It also removes the 9-10
   `as_bytes` unsafe blocks and `sys_wait`'s `from_raw_parts`. Depends on: nothing. abi/ownership/
   soundness/opportunities. Value medium, effort small. **Fix.**
+  Fixed in `efb315e2`, `d4b1fa5e` and `f114be3b`: `Pod` and `pod!`, with `bytes_of`, `bytes_of_mut`,
+  `byte_array_of`, `slice_bytes` and `slice_bytes_mut`. The ten byte views and `sys_wait`'s cast go,
+  `KBox::try_new_zeroed` is safe for a `Pod`, and `copy_array_from_user` and `copy_array_to_user`
+  replace the hand-built handle arrays, their user side bytes as before. Pinned by `pod!`'s compile
+  checks, `plain_data_round_trips_through_its_bytes`,
+  `an_array_is_copied_through_user_bytes_at_any_alignment` and
+  `a_typed_copy_moves_exactly_its_values_bytes`.
 
 - [ ] **kobj-o7** narrow: the scheduler's entry points take a type-erased `*mut ()` with the
   contract "a live `T` pinned by the caller's reference", so every syscall site writes `unsafe {
@@ -778,7 +797,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   reg_a's lookup left unsignalled at server death. abi, ownership. Medium. **Fix**, as kobj-d7.
   Fixed in `d43466d6`, as kobj-d7.
 
-- [ ] **sched-d8** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard` at
+- [x] **sched-d8** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard` at
   `:249`) holds only `&SpinLock<T>`, so it is auto-Sync and auto-Send whenever `T: Send`. Through a
   shared `&guard`, Deref gives `&T` on several threads for a `T` that is not Sync. Sending a guard
   to another CPU would drop it there, decrementing the wrong CPU's preempt counter or restoring that
@@ -790,6 +809,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `std::thread::scope`) reports "Data race detected between (1) non-atomic write ... and (2)
   non-atomic read" in `Cell::get`/`Cell::replace`. That the probe compiled shows the guard is Sync.
   abi, ownership, soundness, concurrency, opportunities. Low. **Fix**, as kobj-d10.
+  Fixed in `ef7cf4fd`, as kobj-d10.
 
 - [x] **sched-d9** `kernel/src/object/thread.rs:716` — `Thread::fpu_area_ptr` derives the
   `*mut ArchFpuState` it gives `switch_into` from `&raw const **area`, which goes through
@@ -1255,7 +1275,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `6d8f188c`: the ICR is written only by `write_icr`, after `mfence; lfence`; held by
   `the_icr_is_written_once_after_the_x2apic_fence` (a tools test) and the disassembly's 18 ICR
   writes. Unverified as before: only real SMP hardware shows the race.
-- [ ] **kmem-d6** `kernel/src/mm/vmm.rs:245` — safe functions cast an `ObjectRef` to a concrete
+- [x] **kmem-d6** `kernel/src/mm/vmm.rs:245` — safe functions cast an `ObjectRef` to a concrete
   type behind only a `debug_assert` on its tag, so in release a wrong-kind reference is read as
   the wrong type. `Vma::drop` calls `writable_unmapped` whenever `mapping == FileBacked` and
   WRITE is set, and `mapping` and `object` are `pub` fields no type ties together.
@@ -1268,7 +1288,13 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   control passes. Release probe `map_object(range, uprot(), file_object_ref)` panics at
   addr_space.rs:349 with "index out of bounds: the len is 0 but the index is 0" (FileObject
   memory read as `MemoryObject.frames`). Lenses: soundness, opportunities. Medium. **Fix.**
-- [ ] **kmem-d7** `kernel/src/mm/user_access.rs:177` — safe `copy_from_user<T: Copy>`
+  Fixed in `054c54d2`: the 14 `debug_assert_eq!` type checks before a downcast are `assert_eq!`, and
+  `write_back` and `Vma::drop` gain one. Fails without it:
+  `a_file_mapped_as_a_memory_object_stops_at_its_type`, in a release build with `map_object`'s check
+  debug-only, panics on an index out of bounds rather than the assertion, and
+  `a_file_backed_vma_over_another_kind_of_object_stops_at_its_drop` aborts the test process without
+  `Vma::drop`'s.
+- [x] **kmem-d7** `kernel/src/mm/user_access.rs:177` — safe `copy_from_user<T: Copy>`
   `assume_init`s user bytes as `T`, but `Copy` does not make every bit pattern valid (`bool`,
   enums, `char`, `NonZero`, references), and `copy_to_user<T: Copy>` copies padding out to user
   memory. Latent: the 3 `copy_from_user` and 8 `copy_to_user` callers use integer-only,
@@ -1277,6 +1303,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: Miri (nightly-2026-07-20) on a probe test, `copy_from_user(UserPtr::<bool>)`
   over a byte holding 2, reports UB at user_access.rs:199 `out.assume_init()`. Lens: ownership.
   Medium. **Fix**, as kobj-d6.
+  Fixed in `efb315e2`, as kobj-d6.
 - [x] **kmem-d8** `kernel/src/sched/ipc.rs:527` — when a userspace server's endpoint closes,
   `ipc_endpoint_closing` (and `us_reg_detach`, line 281) fails every pending lookup but never
   touches `pending_fill`, so a Model B page-cache fill's PO is never completed. `wait_status`
@@ -1301,7 +1328,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   opportunities. Medium. **Fix.**
   Fixed in `4185caef`: the reply settles the page by its fill's PO; fails with the old `mark_ready`:
   `a_stale_fill_reply_leaves_its_indexs_next_page_loading`, through the real reply path.
-- [ ] **kmem-d10** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
+- [x] **kmem-d10** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` is safe but wraps the unsafe `ObjectRef::from_raw`, so any box
   under any tag becomes an `ObjectRef` whose last drop runs `dispatch_destroy` for `ty`. The
   private copy at io/mod.rs:161 and test copies (sched/ipc.rs:560, drivers/input/mod.rs:290) are
@@ -1310,6 +1337,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: a host probe compiled `adopt(MemoryObject::try_new(PAGE).unwrap(),
   KObjectType::Timer)` with no `unsafe` and printed "adopted as Timer". The drop was not run.
   Lens: opportunities. Medium. **Fix**, as kobj-d8.
+  Fixed in `9a28d4b0`, as kobj-d8.
 - [ ] **kmem-d11** `kernel/src/mm/heap.rs:45` — `heap::buddy_free`, `BuddyAllocator::free`
   (buddy.rs:182) and `BuddyPager::free` are safe fns that write the free-list link through the
   HHDM and hand the frame out again. Frame ownership is held by convention at 18 hand-written
@@ -1352,20 +1380,27 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `lookup_recovery(f.rip)` before `try_fault_in`, and there is no prefault step. A boot test
   receiving into an untouched page of a fresh file mapping would show it. Lens: abi. Low.
   **Plan**, as the bash's kmem-28, in Part E.
-- [ ] **kmem-d15** `kernel/src/arch/x86_64/idt.rs:258` — recovery matches the faulting RIP alone,
+- [x] **kmem-d15** `kernel/src/arch/x86_64/idt.rs:258` — recovery matches the faulting RIP alone,
   and `copy_bytes_raw` registers `rep movsb` for both directions, so a fault on the kernel-side
   pointer is also turned into `UserAccessError::Fault` instead of `dump_and_halt`. A dangling
   bounce buffer or a bad length past a kernel buffer is hidden and reported as a user error.
   Unverified: reasoned from code (`lookup_recovery_in` compares only `fault_pc`). Check
   `read_cr2() < USER_VIRT_END` before patching RIP, and boot with a deliberately bad kernel-side
   pointer. Lens: abi. Low. **Fix.**
-- [ ] **kmem-d16** `kernel/src/arch/x86_64/cpu.rs:190` — the kernel sets and checks SMAP and SMEP
+  Fixed in `593803be`: `lookup_recovery` takes the faulting address too, and recovers only one in
+  the user half. Fails without it: a boot probe copying from an unmapped kernel address printed
+  "recovered as a user fault: true" and booted on; with this it stops at the `#PF` dump.
+  `only_a_fault_on_a_user_address_is_recovered` fails at `USER_VIRT_END` without the check.
+- [x] **kmem-d16** `kernel/src/arch/x86_64/cpu.rs:190` — the kernel sets and checks SMAP and SMEP
   but never sets or checks CR0.WP. That `copy_to_user` cannot write a read-only user mapping
   holds only because Limine sets WP on the BSP and the APs. With WP clear, a process holding a
   read-only mapping of a shared page-cache page could have the kernel write into it through
   `sys_clock_read` or `sys_channel_recv` out pointers.
   Unverified: grep finds no `write_cr0` that sets bit 16. Assert `read_cr0() & (1<<16) != 0` on
   every CPU at bring-up. It holds under Limine today. Lens: abi. Low. **Fix.**
+  Fixed in `6c8efd4b`: `init_protections` sets CR0.WP on every CPU. Fails without it: with a probe
+  clearing WP first, as a bootloader might, every CPU ran with WP 0 and a write to a read-only
+  static landed; with this the write faults.
 - [x] **kmem-d17** `kernel/src/mm/kvmap.rs:111` — `remap_mmio_page` repoints a page of the shared
   vmap and flushes only the local TLB, and its `# Safety` contract does not say that the page
   must have been used by one CPU only. Safe today because its only caller, `pci::enumerate`
@@ -1386,7 +1421,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: Miri cannot tell this from a raw copy. Copy with `ptr::copy` from raw pointers (or
   the user-copy asm), never forming the reference, and correct the SAFETY comments.
   Lenses: soundness, concurrency. Low. **Plan**, as kobj-d13, in P2.
-- [ ] **kmem-d19** `kernel/src/object/memory_object.rs:106` — `try_new_borrowed`'s `# Safety` does
+- [x] **kmem-d19** `kernel/src/object/memory_object.rs:106` — `try_new_borrowed`'s `# Safety` does
   not require the range to be HHDM-mapped, but safe accessors (`copy_in` at line 174,
   `copy_to_kvec` at 192) and the I/O paths dereference every frame through the HHDM, and
   `sys_process_spawn` (table.rs:360) and `sys_io_submit` (table.rs:1646) accept a Borrowed
@@ -1396,6 +1431,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: grep finds no `FrameOwnership` check outside memory_object.rs. A host test handing
   a Borrowed object to `sys_io_submit`'s validation, or refusing Borrowed buffers there, would
   settle it. Lenses: soundness, opportunities. Low. **Fix.**
+  Fixed in `a36786e9`, its code moved first in `f74d100c` and `ac6255a9`:
+  `MemoryObject::kernel_reachable`, and a spawn's image and an I/O buffer refuse a borrowed object
+  with `InvalidArgument`, a fill's reply with `Unsupported`. Fails without it:
+  `a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames` crashes the test process
+  (SIGSEGV) without the image's or the fill's check, and fails without the buffer's.
 
 **Opportunities**
 
@@ -1530,7 +1570,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Value medium, effort medium. **Plan**, in P3,
   for its first step, deleting the augmentation; **later** for its second, replacing the tree: the
   maintainer's call, a balanced tree rather than a vector when it is revisited.
-- [ ] **kmem-o8** narrow: `copy_from_user`/`copy_to_user` are generic over `T: Copy`, and ABI
+- [x] **kmem-o8** narrow: `copy_from_user`/`copy_to_user` are generic over `T: Copy`, and ABI
   types reinterpret themselves as bytes in hand-written unsafe blocks, each with its own padding
   claim — 21 sites (11 typed copies: `grep -rn 'copy_to_user(\|copy_from_user(' kernel/src
   --include=*.rs | grep -v 'mm/user_access.rs\|copy_slice\|copy_cstr'`, 3 from and 8 to; plus 10
@@ -1549,6 +1589,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Closes: invalid-value UB from user bytes (kmem-d7) and padding leaks to user memory. Depends on:
   nothing. Lenses: abi, ownership, soundness, opportunities. Value medium, effort small.
   **Fix**, as kobj-o6.
+  Fixed in `efb315e2` and `d4b1fa5e`, as kobj-o6.
 - [ ] **kmem-o9** encapsulate: drivers reach `DmaBuffer` memory through the raw `virt()` pointer,
   with their own offset arithmetic, volatile accesses and slice building, and sometimes store the
   address as a `u64` in their own structs; `as_slice`/`as_mut_slice` hand out references over
@@ -1719,7 +1760,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   the allocation" at ramdisk.rs:209. Fix: copy `min(f.len, remaining)`, or check the fragment sum
   (see drv-o1). Lenses: abi, soundness, opportunities. Medium. **Fix.**
 
-- [ ] **drv-d6** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
+- [x] **drv-d6** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` is a safe function with the whole contract of `ObjectRef::from_raw`:
   `T` must be the type `ty` names, header first. io/mod.rs:160 has a private copy. Scenario:
   latent. All current non-test callers (13 to 30 counted, by lens) pass the matching tag. One
@@ -1731,6 +1772,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `adopt(PendingOperation, MemoryObject)` then drop gives "constructing invalid value of type
   NonNull<mm::PhysAddr>: encountered 0" at libkern/kvec.rs:218, through `dispatch_destroy`. Lenses:
   abi, ownership, soundness, opportunities. Medium. **Fix**, as kobj-d8.
+  Fixed in `9a28d4b0`, as kobj-d8.
 
 - [x] **drv-d7** `kernel/src/dpc.rs:71` — `pub fn enqueue(dpc: &Dpc)` is safe and takes a borrow of
   any lifetime, but the queue keeps the address until a later drain calls its handler. Safe code
@@ -2351,7 +2393,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   rip=0xffffffff80001000 (`probe_get_registers`, 1 passed). abi, ownership, concurrency,
   opportunities. Medium. **Fix**, as sched-d1.
   Fixed in `3d1174b5`, as sched-d1.
-- [ ] **kplat-d5** `kernel/src/mm/user_access.rs:180` — `copy_from_user<T: Copy>` and
+- [x] **kplat-d5** `kernel/src/mm/user_access.rs:180` — `copy_from_user<T: Copy>` and
   `copy_to_user<T: Copy>` are safe fns that accept any `Copy` type. `copy_from_user`
   `assume_init`s user bytes as T, so a T with invalid bit patterns (bool, enum, char,
   reference) is undefined behaviour. `copy_to_user` of a padded T copies uninitialised kernel
@@ -2362,6 +2404,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: Miri (nightly-2026-07-20) on a probe test (removed) reading
   `copy_from_user::<bool>` of byte 0x02: "constructing invalid value of type bool: encountered
   0x02" at user_access.rs:199. Native run printed "read as false". abi. Medium. **Fix**, as kobj-d6.
+  Fixed in `efb315e2`, as kobj-d6.
 - [ ] **kplat-d6** `kernel/src/main.rs:145` — The kernel command line is recorded as a
   `&'static [u8]` into Limine's bootloader-reclaimable memory (`c_bytes` returns an unbounded
   lifetime, main.rs:543), and `/proc/cmdline` serves it on every lookup. The `'static` holds
@@ -2405,7 +2448,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path, read end to end. No probe was run. opportunities. Medium. **Fix.**
   Fixed in `ecb228ae`: `init_this_cpu` refuses an index past `MAX_CPUS`; fails without it:
   `an_index_past_max_cpus_is_refused`.
-- [ ] **kplat-d9** `kernel/src/arch/x86_64/user_access.rs:109` — `copy_cstr_raw`'s loop runs
+- [x] **kplat-d9** `kernel/src/arch/x86_64/user_access.rs:109` — `copy_cstr_raw`'s loop runs
   `lodsb`/`stosb` before it compares the count with `max_len`. With `max_len` = 0 it writes one
   byte into a destination its contract says has zero writable bytes, then reports
   NoTerminator (or Ok(1) if that byte was NUL). The `cfg(test)` stub writes nothing, so host
@@ -2416,7 +2459,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   extable entry (removed). dst=[0xAA,0xAA], src="x\0", max_len=0 gave code 2, count 1, dst
   [78, aa]. The stub gave [aa, aa]. A second probe gave `backing=[ee, 00, ee, ee]` with
   `result=0 count=1`. abi, opportunities. Low. **Fix.**
-- [ ] **kplat-d10** `kernel/src/framebuffer.rs:52` — `record_aperture` records
+  Fixed in `efb315e2`: `ArchUserAccess::copy_cstr` takes its destination as a slice and refuses an
+  empty one before the routine, and the host stub runs the routine's loop byte by byte. Fails
+  without it: `a_string_copy_into_an_empty_destination_writes_nothing` reads `[0x78, 0xAA]`.
+- [x] **kplat-d10** `kernel/src/framebuffer.rs:52` — `record_aperture` records
   `phys_base = address - hhdm` with no page-alignment check, but
   `MemoryObject::try_new_borrowed` requires a page-aligned base (memory_object.rs:100). The
   SAFETY comment at kernel_server.rs:330-334 never mentions alignment. Firmware reporting a
@@ -2427,6 +2473,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `record_aperture` returned true, `try_new_borrowed` succeeded, and `map_object` panicked
   "ArchPaging::map_page returned Misaligned for a page-aligned per-page address". abi,
   ownership. Low. **Fix.**
+  Fixed in `66583f92`: `record_aperture` refuses a base inside a page, and returns its reason, which
+  the boot logs. Fails without it:
+  `an_aperture_is_recorded_only_from_a_page_aligned_base_in_the_hhdm` records a base a byte below a
+  page.
 - [x] **kplat-d11** `kernel/src/arch/x86_64/gdt.rs:18` — On the BSP, `gdt::init` (via
   `init_tables`, main.rs:117) indexes `GDTS`, `TSSES`, `DF_STACKS` and `NMI_STACKS` by
   `rdtscp_aux` before `init_this_cpu(0)` writes TSC_AUX (main.rs:265), so the SAFETY arguments
@@ -2705,7 +2755,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   entry path missing a flag normalisation (kplat-d1 lives in all six copies). Depends on:
   nothing. concurrency. Value medium, effort small. **Fix.**
   Finished in `ebb1c277`: `entry_prologue!` and `entry_epilogue!`, the six stubs' frames.
-- [ ] **kplat-o10** narrow: user copies bounded only by `T: Copy`, byte reinterpretations of
+- [x] **kplat-o10** narrow: user copies bounded only by `T: Copy`, byte reinterpretations of
   `#[repr(C)]` ABI types held sound by convention, and raw copy primitives taking the kernel
   side as `(ptr, len)` — 13 sites for the type bound (`grep -n 'copy_from_user(\|
   copy_to_user(' kernel/src/syscall/table.rs`, 3 + 8; `grep -n 'as \*const Self as \*const u8'
@@ -2724,6 +2774,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   leak (kplat-d5), the one-byte overrun at `max_len == 0` (kplat-d9), a kernel-side length that
   disagrees with the buffer. Depends on: nothing. abi, opportunities. Value medium, effort
   medium. **Fix**, as kobj-o6.
+  Fixed in `efb315e2`, `d4b1fa5e` and `f114be3b`, as kobj-o6. The arch copy is `copy_in(&mut [u8],
+  src)` and `copy_out(dst, &[u8])`, and `copy_cstr` takes a slice, so no kernel-side length can
+  disagree with its buffer. No `UserRange` is made: the user side stays an address its caller
+  validates.
 - [ ] **kplat-o11** encapsulate: boot-published firmware and module tables kept as `static mut`
   arrays or structs with a separate count/flag atomic, written once by an `unsafe fn init`
   ("called once") and lent out as `&'static` through `from_raw_parts`, plus the device-IRQ

@@ -37117,3 +37117,36 @@ made eight decisions:
 - **Page-table entries are read and written atomically, through a `TableRef`**, a table's
   `[AtomicU64; 512]` and its level, with one walk for `translate` and `attribute_index`, each slot
   read once (kplat-d7, kmem-o11). A 4 KiB map inside a huge page is refused.
+
+## 2026-10-29 — Before Phase 7, Part I: plain data at the user boundary, and the kernel's casts checked
+
+Group F of the survey's triage, the types the kernel trusts at its boundaries, made nine decisions:
+
+- **What crosses to or from user memory as a value is `Pod`**, a marker trait in `libkern`: no
+  padding, every bit pattern a value (kobj-d6, kobj-o6). A struct implements it through `pod!`,
+  which names every field and fails the build unless each is `Pod` and their sizes sum to the
+  struct's. `copy_from_user`, `copy_to_user` and the byte views (`bytes_of`, `byte_array_of`,
+  `slice_bytes` and their `_mut` twins) take it, and a copy starts from `T::zeroed()`. `bytemuck`
+  does the same, and the kernel takes no crates; a derive would need a proc-macro crate.
+- **An array crosses through `copy_array_from_user` and `copy_array_to_user`**: the kernel's side
+  typed, the user's a byte address, so a handle array still needs no alignment for its type.
+- **The arch user copy takes the kernel's side as a slice**, `copy_in` and `copy_out`, so the
+  length is the buffer's; only the user's address is the caller's claim (kplat-o10, kplat-d9).
+- **Pairing a box with a destructor is `unsafe`**: `drivers::adopt` and io's twin are, and
+  `adopt_node` stays safe, its type fixing the tag (kobj-d8). `HandleTable::allocate`, which stores
+  any pointer under any type, is left to P1, which ties tag and pointer.
+- **A downcast's type check holds in a release build**: a wrong kind stops the kernel at an
+  assertion, where it was read as the wrong type (kmem-d6). P1 makes the checks types.
+- **A spinlock guard is not `Send`, and is `Sync` only over a `Sync` value**, as std's
+  `MutexGuard` (kobj-d10).
+- **A user copy recovers only from a fault on a user address**: a fault on its kernel side is a
+  kernel bug and halts (kmem-d15). **The kernel sets CR0.WP on every CPU** rather than trusting
+  the bootloader to (kmem-d16).
+- **A borrowed `MemoryObject` is only mapped**: a spawn's image, an I/O buffer and a fill's reply
+  refuse one, since the kernel would reach its frames through the HHDM or a device, and an
+  aperture need be neither in the HHDM nor memory (kmem-d19).
+- **A framebuffer whose physical base is inside a page is refused at boot**, and the boot logs why
+  it refused one, which had said "unsupported depth" for every refusal (kplat-d10).
+
+To make room, `sys_process_spawn`, `sys_io_submit` and a fill's reply moved out of
+`syscall/table.rs` into `spawn.rs`, `submit.rs` and `fill.rs` beside it, unchanged.
