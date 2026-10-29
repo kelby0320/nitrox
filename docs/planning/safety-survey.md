@@ -254,7 +254,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   probe_safe_adopt`). It was removed. See kobj-o1 and kobj-o2. soundness/opportunities. Medium.
   **Fix.**
 
-- [ ] **kobj-d9** `kernel/src/syscall/table.rs:611` — `sys_thread_get_registers` takes the
+- [x] **kobj-d9** `kernel/src/syscall/table.rs:611` — `sys_thread_get_registers` takes the
   suspended thread's `ExceptionFrame` address under SCHED (`thread_exception_frame`,
   `sched/exit.rs:400-408`), releases SCHED, then reads 144 bytes through the safe trait fn
   `read_from_exception_frame(frame_ptr: usize)` (`idt.rs:692`, `registers.rs:39`), which forms
@@ -268,6 +268,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   for values T never held, would settle it. Fix: copy `RegisterValues` out while SCHED is held, and
   make the frame read `unsafe` or take a typed frame. abi/ownership/soundness/opportunities. Low.
   **Fix**, as sched-d1.
+  Fixed in `3d1174b5`, as sched-d1.
 
 - [ ] **kobj-d10** `kernel/src/libkern/spinlock.rs:91` — `SpinLockGuard` (and `IrqSpinLockGuard`,
   `:249`) get auto `Send` and `Sync` from `&'a SpinLock<T>`, so a guard over a `Send + !Sync` value
@@ -280,7 +281,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   Fix: `unsafe impl<T: Sync> Sync` and a `PhantomData<*const ()>` marker for `!Send`.
   ownership/soundness. Low. **Fix.**
 
-- [ ] **kobj-d11** `kernel/src/sched/current.rs:31` — Shared `&Thread` is formed in 13 places
+- [x] **kobj-d11** `kernel/src/sched/current.rs:31` — Shared `&Thread` is formed in 13 places
   (`sched/current.rs:31,45,59,86`; `sched/exit.rs:24,50,104,145,221,244,286,465`;
   `sched/spawn.rs:263`) while other CPUs write `Thread`'s plain, non-`UnsafeCell` scheduler fields
   through raw pointers under SCHED (`set_cpu_mask`, `set_ending`, `set_process_ended`). The module
@@ -293,6 +294,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   under Miri with "trying to retag from ... for SharedReadOnly ... that tag does not exist" at
   `exit.rs:158`, though it passes natively. Hardware forgives it. See kobj-o3. soundness/
   opportunities. Low. **Fix**, raised to Medium.
+  Fixed in `f34e8a4f`: the 13 sites read `owner_pid`, `tid` and `process` through raw-place
+  accessors, and `owner_pid_of` no longer calls the `&self` method; fails without it, under Miri:
+  `the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_recorded`, at
+  `exit.rs:158`. All 61 `sched::` tests pass under Miri.
 
 - [ ] **kobj-d12** `kernel/src/object/ipc_channel.rs:627` — `IpcChannel::drop(&mut self)` (and
   `Timer::drop`, `timer.rs:215`, same shape) unlinks itself only inside its body, under SCHED.
@@ -312,6 +317,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   soundness/opportunities. Low.
   **Fix** for its `try_new_pair` half, as sched-d12, and **plan** for its `Drop` half, as sched-d11,
   in P1.
+  Its `try_new_pair` half fixed in `656f7e02`, as sched-d12, and its `fpu_area_ptr` sibling in
+  `aaceb893`, as sched-d9; the `Drop` half stays planned.
 
 - [ ] **kobj-d13** `kernel/src/object/memory_object.rs:203` — `MemoryObject::copy_to_kvec` (and
   `FileObject::read_to_kvec`, `file_object.rs:1043`) forms `&[u8]` over frames while a writable
@@ -479,7 +486,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   blocks from `syscall/table.rs`. Depends on: kobj-o1. ownership/soundness. Value medium, effort
   medium. **Plan**, in P1.
 
-- [ ] **kobj-o8** encapsulate: bounded lists pushed under SCHED rely on a `try_reserve` at
+- [x] **kobj-o8** encapsulate: bounded lists pushed under SCHED rely on a `try_reserve` at
   construction matching a separate `MAX` constant, and the waiter list (`add_waiter`/`remove_waiter`/
   `take_waiters` over `KVec<*mut ()>` plus `push_within_capacity().expect`) is copied into five
   object types — 36 sites (`grep -cE 'unsafe fn (add_waiter|remove_waiter|take_waiters)'` = 15, plus
@@ -492,6 +499,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `WaitQueue` in `kernel/src/object/mod.rs`. Closes: a reserve that drifts from its constant, so a
   push refuses or drops, or grows under rank-1 SCHED. Depends on: nothing. opportunities. Value
   medium, effort small. **Fix**, as sched-o5.
+  Fixed in `978ba2dc`: a waitable's waiters are a `WaitQueue` over an inline `ArrayVec`, whose
+  capacity is its type, and a wake takes the list itself; the five waiter tests pin the order taken,
+  and a `take` that keeps the list fails all five.
 
 - [ ] **kobj-o9** encapsulate: handles installed partway through a syscall are rolled back by hand
   on each later early return — 17 sites (`grep -E
@@ -611,7 +621,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Defects**
 
-- [ ] **sched-d1** `kernel/src/sched/exit.rs:400` — `thread_exception_frame` returns the raw
+- [x] **sched-d1** `kernel/src/sched/exit.rs:400` — `thread_exception_frame` returns the raw
   kernel-stack address of a suspended thread's `ExceptionFrame` and drops SCHED, and
   `sys_thread_get_registers` (`syscall/table.rs:611-613`) then reads it through the safe
   `ArchRegisters::read_from_exception_frame(frame_ptr: usize)` (`arch/x86_64/idt.rs:692`, which
@@ -634,6 +644,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   example rip = 0xffff80000badf00d), and `thread_exception_frame` was then None. The overwrite is
   the one simulated step, since no host test runs a thread. Miri showed the any-usize decoder.
   abi, ownership, soundness, concurrency, opportunities. Medium. **Fix.**
+  Fixed in `3d1174b5`: with kplat-o4, the arch fault path decodes the registers,
+  `suspend_with_fault` stores them in the `Thread` under `SCHED`, and `suspended_registers` copies
+  them out under it; fails without it: a host test on the old API (not kept, its API gone) read the
+  overwrite, rip 0xbdbd_bdbd_bdbd_bdbd, after a resume.
+  `a_suspended_threads_registers_are_its_faults_until_it_resumes`, and test-harness fails a read
+  whose rip is 0.
 
 - [x] **sched-d2** `kernel/src/sched/ipc.rs:527` — Outstanding page-cache fills
   (`UserspaceServerReg.pending_fill`) are never completed when a userspace server dies.
@@ -657,7 +673,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   opportunities. Medium. **Fix**, as kobj-d3.
   Fixed in `7938344d`, as kobj-d3.
 
-- [ ] **sched-d3** `kernel/src/dpc.rs:71` — The safe `pub fn enqueue(dpc: &Dpc)` takes a borrow of
+- [x] **sched-d3** `kernel/src/dpc.rs:71` — The safe `pub fn enqueue(dpc: &Dpc)` takes a borrow of
   any lifetime and stores its address in the global queue. `run_pending` (`:122`) later turns that
   address back into `&Dpc` and calls through it. Safe code can therefore queue a Dpc that is dead
   by the drain. `io/mod.rs:140-141` already queues a stack-local Dpc, whose `ctx` is an
@@ -671,8 +687,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (also a Box dropped before the drain) reports "constructing invalid value of type &dpc::Dpc:
   encountered a dangling reference" at `dpc.rs:122`. Control: `enqueue_then_drain_runs_handler_once`
   passes under Miri. abi, ownership, soundness, concurrency, opportunities. Medium. **Fix.**
+  Fixed in `1b7057f2`: `enqueue` takes `&'static Dpc`, and the unsafe `enqueue_raw` queues a heap
+  DPC valid until its handler runs; the self-test's DPC is a static. The survey's program is
+  undefined behaviour under Miri on the old code (a dangling `&Dpc` at `dpc.rs:143`) and does not
+  compile with this (E0597), so it is not kept as a test.
 
-- [ ] **sched-d4** `kernel/src/arch/x86_64/idt.rs:663` — An NMI (vector 2, per-CPU IST2 stack) that
+- [x] **sched-d4** `kernel/src/arch/x86_64/idt.rs:663` — An NMI (vector 2, per-CPU IST2 stack) that
   lands in ring 3 is treated as a user fault: `exception_dispatch` → `user_fault` →
   `suspend_with_fault(frame_ptr)` with the frame on the IST2 stack. `is_user_fault` checks only
   `cs & 3` outside STOPPING. The thread is parked and context-switched off IST2, leaving its
@@ -690,8 +710,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `PROBE: NMI from ring 3` then `*** unhandled ring-3 fault ... pid 15 tid 19 segfault @ 0x41e6b3
   ***`, and the compositor's outbox overflowed afterwards. The second-NMI overwrite was not booted;
   it follows from the shared IST2 top. Probes reverted. concurrency. Medium. **Fix.**
+  Fixed in `21059535`: a fault is a user fault only from ring 3 and on the thread's own stack: a
+  ring-3 NMI is logged and returned from, a ring-3 #DF is fatal, and no thread is ended from an IST
+  stack; fails without it: `an_nmi_or_double_fault_from_ring_3_is_not_a_user_fault`, at "vector 2
+  from ring 3". The NMI path is not booted.
 
-- [ ] **sched-d5** `kernel/src/dpc.rs:98` — The DPC queue is reserved to 64 on the premise that
+- [x] **sched-d5** `kernel/src/dpc.rs:98` — The DPC queue is reserved to 64 on the premise that
   the bound is the number of distinct Dpc objects, but every IRP embeds its own Dpc. The block
   layer's refusal paths queue it from thread context with no drain: `submit_within`
   (`io/block.rs:119`) and `forward`'s window and rebase refusals (`:515`, `:540`). Nothing bounds
@@ -707,8 +731,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   a backend that never completes, then `dispatch_block_irp(.., offset = 64*512, 512)` 65 times
   without `run_pending`. Submits 0-63 returned Ok; submit 64 panicked at `dpc.rs:98`. concurrency.
   Medium. **Fix.**
+  Fixed in `b54b5e30`: with drv-o5, a completed IRP is linked onto one list that one static DPC
+  drains, so the queue holds static DPCs only; fails without it:
+  `more_refusals_than_the_dpc_queue_holds_each_complete`, whose 65th refused read before a drain
+  panicked at `dpc.rs:114`.
 
-- [ ] **sched-d6** `kernel/src/sched/exit.rs:437` — `reap_pending` is the only drain of the global
+- [x] **sched-d6** `kernel/src/sched/exit.rs:437` — `reap_pending` is the only drain of the global
   completed-IRP list (`io::block::reclaim_completed`), the char-driver reclaim lists and each CPU's
   reap list, and it runs only from `idle_body`, `exit_thread`, `exit_process` and
   `suspend_with_fault`. `yield_now` has no production caller, and neither the preemptive switch nor
@@ -725,6 +753,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   caller) and tests, and `reaper_body` only closes handle tables. To settle it, boot with N busy user
   threads plus a file-reading loop and watch RECLAIM's length or free memory grow. concurrency.
   Medium. **Fix.**
+  Fixed in `588fcaaf`: the completion that brings the completed-IRP list to 32 boxes wakes the
+  reaper, which drains it and re-checks it before parking; fails without it:
+  `reclaim_under_load_self_test`, two threads spinning on every CPU, which panicked test-qemu with
+  "128 of 128 completed IRPs left unreclaimed".
 
 - [x] **sched-d7** `kernel/src/sched/ipc.rs:312` — `us_server_attach` overwrites an endpoint's
   `us_reg` back-pointer unconditionally, and `sys_ns_bind` checks `us_forward_existing_reg`
@@ -759,7 +791,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   non-atomic read" in `Cell::get`/`Cell::replace`. That the probe compiled shows the guard is Sync.
   abi, ownership, soundness, concurrency, opportunities. Low. **Fix**, as kobj-d10.
 
-- [ ] **sched-d9** `kernel/src/object/thread.rs:716` — `Thread::fpu_area_ptr` derives the
+- [x] **sched-d9** `kernel/src/object/thread.rs:716` — `Thread::fpu_area_ptr` derives the
   `*mut ArchFpuState` it gives `switch_into` from `&raw const **area`, which goes through
   `KBox::deref` (a shared reference). `fpu_save` (an XSAVE store) then writes through a pointer
   whose provenance permits reads only, on every context switch. The SAFETY comment's "live,
@@ -772,8 +804,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   deriving it as `match &mut (*p).fpu { Some(area) => &raw mut **area }` passes; the file was
   restored. A second probe (one byte written through the pointer) gave the same report. ownership,
   soundness. Low. **Fix.**
+  Fixed in `aaceb893`: `fpu_area_ptr` derives the area's pointer from `&mut`, and
+  `ArchFpuState::initial()` is its only constructor; fails without it, under Miri:
+  `the_fpu_area_pointer_may_be_written_through`.
 
-- [ ] **sched-d10** `kernel/src/sched/exit.rs:50` — Whole-struct `&Thread` is formed under SCHED
+- [x] **sched-d10** `kernel/src/sched/exit.rs:50` — Whole-struct `&Thread` is formed under SCHED
   at 13 sites (`exit.rs:24,50,104,145,221,244,286,465`, `current.rs:31,45,59,86`, `spawn.rs:263`)
   on the argument that SCHED serialises all access. But `context_switch` stores the outgoing
   thread's `arch.sp` after `switch_into` released SCHED, so the retag races that store. CPU B blocks
@@ -791,6 +826,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `exit.rs:50`. Control: the same interleaving through the raw-field accessor `Thread::is_ending`
   passes, as does moving the write before the unlock. soundness, concurrency. Low.
   **Fix**, as kobj-d11.
+  Fixed in `f34e8a4f`, as kobj-d11.
 
 - [ ] **sched-d11** `kernel/src/object/ipc_channel.rs:629` — `IpcChannel::drop`, `Timer::drop`
   (`timer.rs:221`) and `UserspaceServerReg::drop` (`userspace_server.rs:489`) run with a live
@@ -809,7 +845,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   reports "Data race detected between (1) non-atomic write ... ipc_channel.rs:149 self.len += 1 and
   (2) retag read of type IpcChannel ... drop_in_place". concurrency. Low. **Plan**, in P1.
 
-- [ ] **sched-d12** `kernel/src/object/ipc_channel.rs:283` — `IpcChannel::try_new_pair` takes each
+- [x] **sched-d12** `kernel/src/object/ipc_channel.rs:283` — `IpcChannel::try_new_pair` takes each
   peer pointer from a shared borrow (`&*b as *const Self`), then retags the box Unique through
   `a.inner.get_mut()` / `b.inner.get_mut()`. That invalidates the pointer just stored in the other
   endpoint, so every later `inner(peer)` reached from `sched/ipc.rs` (`send_push`, `send_or_queue`,
@@ -824,8 +860,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   stack" at `ipc_channel.rs:332`, the tag created at `:283` and invalidated by the Unique retag in
   `KBox::deref_mut` (`kbox.rs:116`). The same test passes with `-Zmiri-tree-borrows`. opportunities.
   Low. **Fix.**
+  Fixed in `656f7e02`: `try_new_pair` gives each endpoint the other box's own pointer, from
+  `KBox::into_raw`, so no later borrow of a box retires it; fails without it, under Miri's Stacked
+  Borrows: `an_endpoint_holding_another_in_a_held_send_is_refused_too`, which now passes there with
+  the 17 `ipc_channel` tests.
 
-- [ ] **sched-d13** `kernel/src/dpc.rs:107` — `run_pending_in` drains into `[0usize; DPC_RESERVE]`
+- [x] **sched-d13** `kernel/src/dpc.rs:107` — `run_pending_in` drains into `[0usize; DPC_RESERVE]`
   with `buf[..n].copy_from_slice(&q)`, where `n` is the queue's length. The length is bounded by the
   KVec's capacity, not by `DPC_RESERVE`. The two agree only because `try_reserve` from an empty KVec
   allocates exactly the amount requested. Changing KVec growth to round up to an allocator bucket,
@@ -835,6 +875,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by a host test (since removed): a fresh queue reserved to `DPC_RESERVE+1` (capacity
   128) and 65 distinct Dpcs queued panics at `dpc.rs:111`, "range end index 65 out of range for
   slice of length 64". In production `init` reserves exactly 64 from empty. ownership. Low. **Fix.**
+  Fixed in `aa9a89e2`: the DPC queue is an `ArrayVec` in its static, and a drain takes the list by
+  value, so the batch is the queue's type; `a_queue_of_its_capacity_drains_whole` and
+  `a_dpc_past_the_capacity_is_fatal` hold the bound at both sides. The survey's reproduction, a
+  queue reserved larger than its drain buffer, cannot be written now.
 
 - [ ] **sched-d14** `kernel/src/sched.rs:368` — `alloc_pid` uses `next_pid.wrapping_add(1)`, so
   after 2^32-2 spawns pids come round to 0, 1, 2, and so on. `sched.rs:238` says "No pid reuse" and
@@ -932,7 +976,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   nothing (the remote accessor wants sched-o1's token). concurrency. Value medium, effort medium.
   **Plan**, as kplat-o3, in P4.
 
-- [ ] **sched-o4** narrow: `dpc::enqueue(&Dpc)` is safe for any lifetime, though statics need
+- [x] **sched-o4** narrow: `dpc::enqueue(&Dpc)` is safe for any lifetime, though statics need
   nothing more and heap-embedded IRP DPCs are sound only by the convention that the box outlives its
   drain — 22 sites (`grep -rn 'dpc::enqueue(' kernel/src | grep -v tests | grep -v ^kernel/src/dpc.rs`:
   12 static, 9 IRP-embedded at `ahci.rs:572,634`, `xhci/storage.rs:751`, `io/block.rs:119,515,540,896`,
@@ -946,8 +990,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (heap, `enqueue_raw`). In `kernel/src/dpc.rs`. Closes: the dangling-Dpc use from safe code
   (sched-d3), and it marks each by-convention site. Depends on: nothing. abi, soundness. Value
   medium, effort small. **Fix.**
+  Fixed in `1b7057f2`: as sched-d3.
 
-- [ ] **sched-o5** encapsulate: lists pushed under SCHED or at an interrupt tail are plain KVecs
+- [x] **sched-o5** encapsulate: lists pushed under SCHED or at an interrupt tail are plain KVecs
   reserved up front and pushed only with `push_within_capacity`/`push_reserved`, and the five
   waiter pushes each say "the type should say so" — 15-21 sites (`grep -rn "push_within_capacity\|push_reserved("
   kernel/src/sched.rs kernel/src/sched/ kernel/src/object/ kernel/src/dpc.rs | grep -v "fn
@@ -964,6 +1009,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   allocation or free under the rank-1 lock or in IRQ context through a growing push, and a drain
   buffer shorter than its list (sched-d13). Depends on: nothing. ownership, concurrency,
   opportunities. Value medium, effort small. **Fix.**
+  Fixed in `18823fdf`: with `978ba2dc` and `aa9a89e2`: the scheduler's lists, the entropy seed
+  waiters, an endpoint's held sends and a notification queue are `Reserved`, which cannot grow, the
+  waiters and the DPC queue `ArrayVec`s; `Reserved`'s and `ArrayVec`'s tests, the latter under Miri
+  with strict provenance.
 
 - [ ] **sched-o6** encapsulate: five waitable objects each keep `waiters: KVec<*mut ()>` reserved to
   `MAX_WAITERS` = 4 and repeat `add_waiter`/`remove_waiter`/`take_waiters(obj, out: &mut [*mut ()])`
@@ -1529,7 +1578,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   tables without the lock or through the wrong root (none seen today; it makes the rank-4 lock
   claim structural). Depends on: kmem-o2 and kmem-o4. Lenses: soundness, concurrency. Value
   medium, effort small. **Plan**, in P3.
-- [ ] **kmem-o11** narrow: x86_64 page-table walks dereference `*table_ptr(x).add(index)` raw at
+- [x] **kmem-o11** narrow: x86_64 page-table walks dereference `*table_ptr(x).add(index)` raw at
   every level under a per-function SAFETY argument; `translate` and `attribute_index` duplicate
   the same four-level walk, and shared kernel-half slots are read with plain loads but linked
   with an atomic CAS (`ensure_table`) — 22 sites (`prodgrep '\*table_ptr\(|\*pml4\.add\(|\*leaf\b|
@@ -1542,6 +1591,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   repeated in 7 functions, the duplicate walk, and mixed atomic and plain access to the lock-free
   kernel-half tables. Depends on: nothing (kmem-o6 for the trait-level contract). Lens:
   opportunities. Value low, effort small. **Fix.**
+  Fixed in `991a8726`: a `TableRef` (an `[AtomicU64; 512]` and its level, one `unsafe fn at`) and
+  one walk, reading each slot once, serve `translate` and `attribute_index`;
+  `a_walk_ends_at_a_huge_page_and_a_map_inside_one_is_refused`.
 
 What held up: the two asm copy primitives (register constraints, `cld`, `clac` on every exit, only
 the user-side instruction in the extable, the `max==0` guard, the linker KEEP). `UserPtr`
@@ -1598,7 +1650,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   Fixed in `4795f961`: `take_retired` reads PxCI under the port lock; fails without it:
   `a_command_issued_after_the_slot_read_idle_is_not_retired`.
 
-- [ ] **drv-d2** `kernel/src/dpc.rs:98` — the DPC queue reserves 64 entries on the claim that "the
+- [x] **drv-d2** `kernel/src/dpc.rs:98` — the DPC queue reserves 64 entries on the claim that "the
   bound is the number of distinct Dpc objects" (dpc.rs:23-25). But every IrpBox has its own inline
   Dpc (irp.rs:291), so the number of pending DPCs is the number of IRPs completed between two
   interrupt tails. Scenario: a process holding a block DeviceNode with READ loops
@@ -1615,6 +1667,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   capacity exceeded". Not booted, so whether 65 submits fit inside one tick on a running kernel is
   untested. Fix: an intrusive link in the IrpBox the way RECLAIM links it (see drv-o5). Lenses:
   abi, soundness, concurrency, opportunities. Medium. **Fix**, as sched-d5.
+  Fixed in `b54b5e30`, as sched-d5.
 
 - [ ] **drv-d3** `kernel/src/drivers/xhci/storage.rs:1512` — `Disks::issue_hub` overwrites
   `dev.inflight` and rewrites the wrapper page without checking that no IRP command is in flight.
@@ -1679,7 +1732,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   NonNull<mm::PhysAddr>: encountered 0" at libkern/kvec.rs:218, through `dispatch_destroy`. Lenses:
   abi, ownership, soundness, opportunities. Medium. **Fix**, as kobj-d8.
 
-- [ ] **drv-d7** `kernel/src/dpc.rs:71` — `pub fn enqueue(dpc: &Dpc)` is safe and takes a borrow of
+- [x] **drv-d7** `kernel/src/dpc.rs:71` — `pub fn enqueue(dpc: &Dpc)` is safe and takes a borrow of
   any lifetime, but the queue keeps the address until a later drain calls its handler. Safe code
   can queue a stack or heap Dpc that is gone by then, and the drain reads a function pointer from
   dead memory. Scenario: `io::interrupt_object_self_test` (io/mod.rs:140-142) enqueues a stack Dpc
@@ -1690,6 +1743,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   calls `run_pending`: "constructing invalid value of type &dpc::Dpc: encountered a dangling
   reference" at dpc.rs:122. Fix: `enqueue(&'static Dpc)` plus an `unsafe fn` for IRP-inline DPCs
   (see drv-o12). Lens: soundness. Medium. **Fix**, as sched-d3.
+  Fixed in `1b7057f2`, as sched-d3.
 
 - [ ] **drv-d8** `kernel/src/drivers/xhci/hub.rs:626` — `data_bytes(mem, len: u16)` and
   `control_in`'s `write_bytes` (hub.rs:638) are safe functions taking any length up to 65,535 over
@@ -1845,7 +1899,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   read only. A `Slots` stand-in whose read returns dwords from two laps would settle it once the
   reader reads dword 3 first (see drv-o11). Lens: concurrency. Low. **Fix.**
 
-- [ ] **drv-d21** `kernel/src/io/ramdisk.rs:132` — for an Owned backing, `RamDisk::base()` returns
+- [x] **drv-d21** `kernel/src/io/ramdisk.rs:132` — for an Owned backing, `RamDisk::base()` returns
   `v.as_ptr()`. `KVec` has no inherent `as_ptr`, so this goes through Deref to a `&[u8]` and the
   pointer carries SharedReadOnly permission; `transfer()` then writes through it for a Write IRP,
   mutation behind a shared reference with no `UnsafeCell`, from `&self`. Scenario: latent. The
@@ -1856,6 +1910,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   only grants SharedReadOnly permission", the tag created at ramdisk.rs:132 (Stacked Borrows). Fix:
   keep a raw pointer taken from `&mut` at construction, or wrap the bytes in `UnsafeCell`. Lens:
   soundness. Low. **Fix.**
+  Fixed in `3eb3defd`: the RAM disk takes the base of the bytes it owns once, through a pointer that
+  may write; fails without it, under Miri: `a_disk_over_its_own_bytes_writes_and_reads_them_back`.
 
 **Opportunities**
 
@@ -1936,7 +1992,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   xhci/mod.rs:488-490 records a fixed instance. Depends on: nothing. Lens: soundness. Value high,
   effort medium. **Fix.**
 
-- [ ] **drv-o5** encapsulate: IRP completion through each IRP's own inline Dpc — `set_completion` +
+- [x] **drv-o5** encapsulate: IRP completion through each IRP's own inline Dpc — `set_completion` +
   `dpc::enqueue(&(*irp).dpc)` in every driver, so the global DPC queue holds one entry per completed
   IRP and its fixed reserve bounds nothing — 7 sites (`grep -rn
   'dpc::enqueue(&(\*irp).dpc)\|enqueue(unsafe { &(\*irp).dpc })'` outside tests), such as
@@ -1949,6 +2005,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `kernel/src/io/block.rs`. Closes: DPC-reserve exhaustion, a kernel panic reachable by any holder of
   a block handle (drv-d2). Depends on: nothing. Lens: concurrency. Value high, effort small.
   **Fix.**
+  Fixed in `b54b5e30`: drivers complete with `io::irp::complete`, which links the IRP by `next` for
+  one static `FINISH` DPC and its `on_complete`; the `Irp` loses its inline `dpc`, an ABI-hash
+  change. `more_refusals_than_the_dpc_queue_holds_each_complete`.
 
 - [ ] **drv-o6** encapsulate: "a DPC must never drop an `ObjectRef`" (the same-CPU SlabCache
   deadlock, decision log 2026-08-06, and the earlier input bug input/mod.rs cites) is held by
@@ -2023,7 +2082,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   comment. Depends on: nothing. Lens: concurrency. Value medium, effort small. **Fix.**
   Finished in `1a8de805`: slot 0's state is `PortState`, inside the port lock.
 
-- [ ] **drv-o10** narrow: `dpc::enqueue(&Dpc)` is a safe API whose borrow outlives the call —
+- [x] **drv-o10** narrow: `dpc::enqueue(&Dpc)` is a safe API whose borrow outlives the call —
   static DPCs, IRP-inline DPCs and one stack DPC all go through it — 22 sites (`grep -rn
   'dpc::enqueue\|enqueue(&' kernel/src --include=*.rs` outside dpc.rs: 12 static (ioapic.rs:145,
   console.rs:212, xhci/mod.rs:640, ps2/mod.rs x6, ahci.rs x3), 8 IRP-inline (block.rs x4,
@@ -2035,6 +2094,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   the stack Dpc in io/mod.rs becomes a static. In `kernel/src/dpc.rs`. Closes: use-after-free of a
   queued Dpc reached from safe code (drv-d7). Depends on: nothing. Lens: soundness. Value medium,
   effort small. **Fix**, as sched-o4.
+  Fixed in `1b7057f2`, as sched-o4.
 
 - [ ] **drv-o11** encapsulate: a static `AtomicPtr<T>` is published once, then `unsafe { &*p }` with
   "published once, never withdrawn" at every ISR, DPC and thread entry; xHCI already has a safe
@@ -2257,7 +2317,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   ownership, concurrency. High. **Fix.**
   Fixed in `11128592`: the first descent arms under `SCHED`; fails without it: the setters'
   debug assertion, which panicked `test-qemu` at the first user thread.
-- [ ] **kplat-d3** `kernel/src/arch/x86_64/idt.rs:662` — A vector-2 NMI (IST2) or a #DF (IST1)
+- [x] **kplat-d3** `kernel/src/arch/x86_64/idt.rs:662` — A vector-2 NMI (IST2) or a #DF (IST1)
   taken in ring 3 goes through `is_user_fault` to `user_fault` and `suspend_with_fault`. That
   parks the thread with its ExceptionFrame and context on the per-CPU IST stack, not on its own
   kernel stack, which breaks the claim at sched/exit.rs:301 ("the ExceptionFrame stays on this
@@ -2272,7 +2332,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   0xffffffff800d1f10`, which is inside IST2, not a 0xffffc000... thread stack. A second NMI
   on that CPU entered at the same rsp. Probes reverted. abi, opportunities. Medium.
   **Fix**, as sched-d4.
-- [ ] **kplat-d4** `kernel/src/arch/x86_64/idt.rs:692` — `ArchRegisters::read_from_exception_frame
+  Fixed in `21059535`, as sched-d4.
+- [x] **kplat-d4** `kernel/src/arch/x86_64/idt.rs:692` — `ArchRegisters::read_from_exception_frame
   (frame_ptr: usize)` is a safe trait fn that dereferences any address as an ExceptionFrame.
   Its one caller, `sys_thread_get_registers` (syscall/table.rs:611-614), gets the address from
   `thread_exception_frame` under SCHED, releases SCHED, then reads with no lock. The SAFETY
@@ -2289,6 +2350,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   would, and `read_from_exception_frame` returned rax=0xffffffff80123456
   rip=0xffffffff80001000 (`probe_get_registers`, 1 passed). abi, ownership, concurrency,
   opportunities. Medium. **Fix**, as sched-d1.
+  Fixed in `3d1174b5`, as sched-d1.
 - [ ] **kplat-d5** `kernel/src/mm/user_access.rs:180` — `copy_from_user<T: Copy>` and
   `copy_to_user<T: Copy>` are safe fns that accept any `Copy` type. `copy_from_user`
   `assume_init`s user bytes as T, so a T with invalid bit patterns (bool, enum, char,
@@ -2314,7 +2376,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   drop the Vec, `line().to_vec()` gave "constructing invalid value of type &[u8]: encountered a
   dangling reference (use-after-free)" at cmdline.rs:52 (`probe_recorded_line`). ownership.
   Medium. **Fix.**
-- [ ] **kplat-d7** `kernel/src/arch/x86_64/paging.rs:482` — The page-table walkers (`translate`,
+- [x] **kplat-d7** `kernel/src/arch/x86_64/paging.rs:482` — The page-table walkers (`translate`,
   `attribute_index`, `walk_to_pt`) read PTEs with plain non-atomic loads, and `map_page`,
   `unmap_page` and `ensure_kernel_intermediate` write leaf and PML4 slots with plain stores,
   while the kernel half is edited lock-free and `ensure_table` links with a CAS (paging.rs:255).
@@ -2327,6 +2389,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `translate` on a fresh root. "Data race detected between non-atomic read (translate,
   paging.rs:482) and atomic read-modify-write (ensure_table compare_exchange, paging.rs:255)".
   Native run passed. soundness, opportunities. Medium. **Fix.**
+  Fixed in `991a8726`: with kmem-o11, every entry is read and written atomically through a
+  `TableRef`; fails without it, under Miri:
+  `a_walk_beside_a_mapper_in_one_tree_reads_what_is_linked`, a data race at `translate` against
+  `ensure_table`'s CAS.
 - [x] **kplat-d8** `kernel/src/arch/x86_64/smp.rs:95` — `ArchSmp::init_this_cpu(index: u32)` is
   safe and writes any value to IA32_TSC_AUX. Per-CPU accesses then index `static mut` arrays
   with `.add(idx)` guarded only by a `debug_assert`, which release builds drop (gdt.rs:143-146,
@@ -2554,7 +2620,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kplat-d19), an out-of-range TSC_AUX (kplat-d8, kplat-d11), and 5 of the arch layer's 12
   `static mut`. Depends on: nothing. abi, ownership, concurrency, opportunities. Value high,
   effort medium. **Plan**, in P4.
-- [ ] **kplat-o4** narrow: a suspended thread's ExceptionFrame location carried as a bare
+- [x] **kplat-o4** narrow: a suspended thread's ExceptionFrame location carried as a bare
   `usize` (`Thread::exception_frame`) and dereferenced by a safe `ArchRegisters` fn after SCHED,
   the lock that proves the thread parked, is dropped — 6 sites (`grep -rn
   "exception_frame\|read_from_exception_frame\|frame_ptr" kernel/src --include=*.rs | grep -v
@@ -2569,6 +2635,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   ExceptionFrame` converted once. Home: kernel/src/sched/exit.rs and kernel/src/arch/
   registers.rs. Closes: reading, and later writing, a frame the thread has left (kplat-d4).
   Depends on: nothing. ownership, opportunities. Value high, effort small. **Fix.**
+  Fixed in `3d1174b5`: as sched-d1: no frame address leaves the arch layer, `ArchRegisters` and its
+  any-`usize` decoder are gone, and `irq_dispatcher!` hands its bodies a `&mut ExceptionFrame`
+  converted once.
 - [ ] **kplat-o5** encapsulate: kernel objects travel type-erased — adopted with `ObjectRef::
   from_raw(KBox::into_raw(x).as_ptr() as *mut (), KObjectType::T)`, downcast with `&*(r.as_ptr()
   as *const T)`, and passed to `unsafe fn f(obj: *mut ())` — 235 sites (downcasts `grep -rnE
@@ -2718,7 +2787,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   and ioapic.rs. Closes: two contexts interleaving select and access so a write lands in
   another register (kplat-d17). Depends on: nothing. ownership, concurrency. Value low, effort
   small. **Fix.**
-- [ ] **kplat-o15** narrow: the FP/SIMD save area handled through raw `*mut`/`*const
+- [x] **kplat-o15** narrow: the FP/SIMD save area handled through raw `*mut`/`*const
   ArchFpuState` even where the caller holds a `KBox` or `&mut` — 4 sites (`grep -rn
   'fpu_save\|fpu_restore\|fpu_init_area' kernel/src`, less arch/mod.rs: object/thread.rs:186,
   sched.rs:638, 642, fpu.rs:427 in the selftest), such as `kernel/src/arch/x86_64/fpu.rs:184`,
@@ -2730,6 +2799,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   or foreign image (#GP from MXCSR or XSTATE_BV) and an unaligned or dangling area pointer.
   Depends on: nothing; the sched call sites keep raw access until kplat-o5 gives them `&Thread`.
   opportunities. Value low, effort small. **Fix.**
+  Fixed in `aaceb893`: `ArchFpuState::initial()` is a const fn with the architectural defaults and
+  the only constructor, so every area is an image `restore` can load;
+  `the_initial_area_is_the_architectural_defaults`.
 
 What held up: `SyscallFrame` and `ExceptionFrame` match their stubs' push and pop order, pinned
 by `offset_of!`/`size_of` asserts, and RSP is 16-byte aligned at each `call`. `sysretq` to a
@@ -3151,7 +3223,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the mock hides, and the shape of the rt-d2 defect. Depends on: rt-o3 for `memory_unmap`.
   abi, ownership, soundness, opportunities. Value low, effort small. **Fix.**
 
-- [ ] **rt-o12** narrow: libheap's engine turns `usize` addresses back into pointers with `as *mut`,
+- [x] **rt-o12** narrow: libheap's engine turns `usize` addresses back into pointers with `as *mut`,
   so pointers it hands out carry only exposed provenance and Miri runs it only in permissive
   mode — 5 sites (`grep -nE "\) as \*(mut|const) [A-Za-z]|[a-z_]+ as \*mut u8"
   userspace/libheap/src/lib.rs`: lines 225, 228, 271, 278, 288; :345 is the kernel's address
@@ -3162,6 +3234,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   dependent UB the host tests cannot see; today Miri with `-Zmiri-strict-provenance` stops at
   lib.rs:225 on `many_allocations_grow_arenas_without_overlap`. Depends on: nothing.
   soundness, opportunities. Value low, effort small. **Fix.**
+  Fixed in `d49969f0`: every pointer libheap hands out is derived from its mapping's pointer, and
+  the one address-to-pointer step is the kernel's mapping; fails without it, under Miri's strict
+  provenance: the crate's 9 tests, which stopped at `lib.rs:225`.
 
 - [ ] **rt-o13** remove: `DeviceRecord::read` and `as_bytes` reinterpret bytes as the struct with
   `unsafe`, while the same file's `IoSnapshot::get` and abi.rs's `FramebufferInfo::from_bytes`

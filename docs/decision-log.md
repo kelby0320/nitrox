@@ -37081,3 +37081,39 @@ Groups U and V of the survey's triage, the filesystems and the protocols, made n
 - **The initramfs tripwire is 412 KiB**: growth of its four programs, not a fifth, had taken it
   over. The room left is less than the smallest of them, so a fifth still trips it. Stripping the
   packed copies' symbols, about 42 KB in fs-server-ext4, would make lasting room, and is not done.
+
+## 2026-10-29 — Before Phase 7, Part I: one completion DPC, lists whose bound is their type, and the scheduler's borrows narrowed
+
+Groups C, D and E of the survey's triage, the scheduler, the DPC queue and the kernel's borrows,
+made eight decisions:
+
+- **A completed IRP is finished by one static DPC**, not its own: `io::irp::complete` records the
+  outcome and links the IRP by a new `next` onto one list, which `FINISH` drains, running each
+  IRP's `on_complete` (drv-o5). The DPC queue then holds static DPCs only, so its fixed capacity
+  bounds it, where one DPC an IRP completed between two drains could exhaust it (sched-d5). **This
+  changes the ABI hash**: the hashed `Irp` loses its inline `dpc` for `next` and `on_complete`.
+  An intrusive DPC queue was the alternative, and would have kept every IRP its own DPC.
+- **`dpc::enqueue` takes a `&'static Dpc`**; a DPC inside a heap object is queued by the unsafe
+  `enqueue_raw`, valid until its handler has run (sched-d3).
+- **A list pushed where nothing may allocate is a `Reserved` or an `ArrayVec`, never a `KVec`**:
+  a `Reserved` is allocated when made and never grows, an `ArrayVec` is inline, and each hands back
+  a value it cannot hold (sched-o5, kobj-o8). A waitable's waiters are a `WaitQueue` on an
+  `ArrayVec`, the DPC queue is an `ArrayVec` in its static, so its drain's batch is its own type
+  (sched-d13), and `dpc::init` is gone.
+- **The reaper drains the completed-IRP list once it holds 32 boxes**, woken by the completion
+  that brings it there, and an idle CPU drains it sooner (sched-d6): a bound, not a wake a
+  completion. Each CPU's reap list stays its own. A thread's `on_cpu` guard would make a
+  cross-CPU reap sound, but every exit drains its CPU's list first, so that list holds about the
+  last thread to exit there, and the invariant is not worth trading for it.
+- **A suspended thread's registers are copied from its fault**, under `SCHED`, and no frame
+  address leaves the arch layer (sched-d1, kplat-o4). `ArchRegisters` is gone with its decoder. A
+  `ModifyAndResume`, when it comes, is applied by the faulted thread to its own frame.
+- **An NMI or #DF taken in ring 3 is not a user fault**: no thread is parked or ended on an IST
+  stack. Such an NMI is logged and returned from; such a #DF is fatal, its saved CS and RIP
+  undefined (sched-d4). A ring-0 NMI that is not a stop stays fatal.
+- **The scheduler reads a `Thread`'s fields through raw places**, never borrowing the whole
+  struct, which raced other CPUs' field writes and `context_switch`'s store after the lock
+  (kobj-d11).
+- **Page-table entries are read and written atomically, through a `TableRef`**, a table's
+  `[AtomicU64; 512]` and its level, with one walk for `translate` and `attribute_index`, each slot
+  read once (kplat-d7, kmem-o11). A 4 KiB map inside a huge page is refused.
