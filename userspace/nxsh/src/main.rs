@@ -33,9 +33,10 @@ use libkern::syscall::{
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
-use libstream::setup::{Streams, bootstrap, bootstrap_arg0, pipe, send_setup_full};
+use libstream::setup::{bootstrap, bootstrap_arg0, pipe, send_setup_full};
 use libstream::wire::ByteSink;
 use nxsh::host::{Host, PipelineRun, StageSpec, StageStatus};
+use nxsh::pipeline::Pipeline;
 use nxsh::{Interp, RunMode};
 
 #[global_allocator]
@@ -154,6 +155,7 @@ static mut SPAWN: SpawnArgs = SpawnArgs {
 };
 
 mod stage;
+mod stages;
 
 struct NitroxHost {
     namespace: u64,
@@ -219,103 +221,10 @@ impl Host for NitroxHost {
             }
         }
 
-        let mut upstream: Option<u64> = None;
-        let mut feed: Option<u64> = None;
-        if input.is_some() {
-            let (rx, tx) = pipe(4).map_err(|_| String::from("could not create an input pipe"))?;
-            upstream = Some(rx);
-            feed = Some(tx);
-        }
-
-        let mut spawned = 0usize;
-        // Held until reaped, closed in `reap`: the authority `strict` and §11h's interrupt need.
-        let mut children: Vec<u64> = Vec::new();
-        let mut capture: Option<u64> = None;
-
-        // One `stderr` for the whole pipeline (§1's shared diagnostic sink): a stage's diagnostics
-        // bypass the pipe, and the shell drains them to its terminal.
-        //
-        // The slack is 36 messages, and that is a bound: a stage sends with `SENDMODE_BLOCK`, so
-        // once the ring and the kernel's pending-sender queue (`IpcChannel::MAX_PENDING_SENDS`, 4)
-        // are full it blocks, at its 37th unread diagnostic. The shell must be draining by then; it
-        // drains at every wait, and the one window left is named at the feed below.
-        let (err_rx, err_tx) = pipe(32).map_err(|_| String::from("could not create a diagnostic channel"))?;
-
-        for (i, spec) in stages.iter().enumerate() {
-            let last = i + 1 == stages.len();
-            let (rx, tx) = pipe(4).map_err(|_| String::from("could not create a pipe"))?;
-            let (setup_shell, setup_stage) = pipe(4).map_err(|_| String::from("could not create a setup channel"))?;
-
-            // SAFETY: `SPAWN` is our static, filled in immediately before use; this
-            // process is single-threaded so spawns are sequential.
-            let proc = unsafe {
-                SPAWN.image = images.0[i];
-                SPAWN.handles[0] = setup_stage;
-                SPAWN.arg0 = bootstrap_arg0(true);
-                SPAWN.namespace = 0; // inherit a LOOKUP-only view of ours
-                syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN) as u64)
-            };
-            images.release(i);
-            if proc < 0 {
-                return Err(alloc::format!("could not spawn `{}`", spec.program));
-            }
-            spawned += 1;
-
-            // A duplicate per stage, because a setup message moves its handles.
-            //
-            // With `DUPLICATE`, because a stage may hand its `stderr` on: `with` gives its program
-            // a duplicate and keeps one to report on. Without the right the program starts with no
-            // `stderr` and its lines go to the kernel log, which on a laptop is nowhere.
-            // SAFETY: register-only syscall on a channel endpoint this shell owns.
-            let err_dup =
-                unsafe { syscall2(SYS_HANDLE_DUPLICATE, err_tx, RIGHT_SEND | RIGHT_TRANSFER | RIGHT_DUPLICATE) };
-            if err_dup <= 0 {
-                // Say so rather than degrade quietly: a stage without `stderr` falls back to
-                // `kprint`, which reaches nobody on a laptop. The stage still runs; losing its
-                // diagnostics is not worth refusing.
-                self.say(&alloc::format!(
-                    "nxsh: `{}` gets no diagnostic channel; its errors go to the kernel log\n",
-                    spec.program
-                ));
-            }
-            let streams = Streams {
-                stdin: upstream.take(),
-                stdout: Some(tx),
-                // §1: diagnostics bypass the pipe; they go to the shell's shared sink.
-                stderr: (err_dup > 0).then_some(err_dup as u64),
-            };
-            let argv: Vec<&str> = argvs[i].iter().map(|s| s.as_str()).collect();
-            // A terminal of its own, a sibling on the same window, so a stage that must ask
-            // something (`with`, for a password) asks where the person is typing. The shell keeps
-            // its own and `Ctrl-C`; `/dev/tty` would mint one on the console.
-            let terminal = if self.tty != 0 { tty_open_sibling(self.tty) } else { None };
-            // The same environment to every stage, arguments as written.
-            if send_setup_full(setup_shell, &streams, terminal, &argv, env).is_err() {
-                if let Some(t) = terminal {
-                    // SAFETY: the send failed, so the terminal never moved; it is ours to close.
-                    unsafe { syscall1(SYS_HANDLE_CLOSE, t) };
-                }
-                return Err(alloc::format!("could not hand `{}` its streams", spec.program));
-            }
-            // Keep the process handle for the pipeline's life: `strict` and §11h need the authority
-            // to terminate the rest.
-            children.push(proc as u64);
-            // SAFETY: closing our end of the setup channel; the stage holds its own.
-            unsafe {
-                syscall1(SYS_HANDLE_CLOSE, setup_shell);
-            }
-
-            if last {
-                capture = Some(rx);
-            } else {
-                upstream = Some(rx);
-            }
-        }
-
-        // Close the shell's own write end before anything else can block: the read end reports
-        // end-of-stream only once every writer, the shell included, is gone.
-        // SAFETY: closing our own handle; the stages hold their duplicates.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, err_tx) };
+        let (notif, tty) = (self.notif, self.tty);
+        let names: Vec<&str> = stages.iter().map(|s| s.program.as_str()).collect();
+        let mut p = Pipeline::new(stages::Stages { host: self, images, argvs: &argvs, env });
+        let ends = p.start(&names, input.is_some())?;
 
         // An interrupt that arrived during setup: handing a stage its terminal is a tty exchange,
         // and `tty_await_reply` records a `Ctrl-C` there rather than leaving it queued, so the
@@ -323,10 +232,7 @@ impl Host for NitroxHost {
         // step 19). The flag stays set for the evaluator's checkpoint.
         // SAFETY: INTERRUPTED is a process-wide flag read and written only from this thread
         if unsafe { (&raw const INTERRUPTED).read() } {
-            for &c in &children {
-                // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
-                unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
-            }
+            terminate_all(p.parts().0);
         }
 
         // Feed the head stage only once everything downstream is running.
@@ -334,25 +240,23 @@ impl Host for NitroxHost {
         // The one window where the shell is not draining: `put` blocks on a depth-4 pipe, so a head
         // stage that stops reading `stdin` stops the shell, and a stage blocked on its 37th unread
         // diagnostic is such a stage. Closing it needs an interleaved send in `ChannelSink`.
-        if let (Some(tx), Some(bytes)) = (feed, input) {
-            drain_diagnostics(err_rx, self.tty);
+        if let (Some(tx), Some(bytes)) = (ends.feed, input) {
+            drain_diagnostics(ends.diagnostics, tty);
             let mut sender = ChannelSink::new(IpcPort::new(tx), libkern::abi::IPC_PAYLOAD_SIZE);
             let _ = sender.put(bytes);
             let _ = sender.finish();
-            // SAFETY: closing our write end so the stage sees the stream end.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, tx) };
-            drain_diagnostics(err_rx, self.tty);
+            // Closed, so the stage sees the stream end.
+            p.close(tx);
+            drain_diagnostics(ends.diagnostics, tty);
         }
 
         // Read the tail *before* reaping: a stage that has filled its channel is waiting
         // for this reader, so reaping first would deadlock any producer larger than one
         // pipe's worth.
         let mut output: Option<Vec<u8>> = None;
-        // Exits read off the notification channel for `reap`, and whether a terminate was passed
-        // on.
-        let mut early: Vec<(i32, bool)> = Vec::new();
+        // Whether a terminate was passed on; the exits read here are kept for `reap`.
         let mut stop_sent = false;
-        if let Some(rx) = capture {
+        if let Some(rx) = ends.capture {
             // The terminal is watched here, not only in `reap` (§11h): the tail's output does not
             // close until the last stage exits, so `sleep 60 | …` blocks here. Diagnostics are
             // drained here too, with or without a terminal, or a long job's progress would arrive
@@ -368,25 +272,23 @@ impl Host for NitroxHost {
             loop {
                 // The notification channel too: a terminate request must reach the stages during
                 // this wait, and a stage's exit read here is kept for `reap`.
-                drain_notifications(self.notif, &children, &mut stop_sent, &mut early);
+                let (children, exits) = p.parts();
+                drain_notifications(notif, children, &mut stop_sent, exits);
                 // Poll before blocking: a waiter arriving after a message was enqueued never sees
                 // that edge, and the tty queues the interrupt in the same console read as the line
                 // that started the pipeline.
-                drain_diagnostics(err_rx, self.tty);
-                if self.tty != 0 && drain_tty_interrupt(self.tty) {
-                    for &c in &children {
-                        // SAFETY: a Process handle this shell owns, SIGNAL from spawn.
-                        unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
-                    }
+                drain_diagnostics(ends.diagnostics, tty);
+                if tty != 0 && drain_tty_interrupt(tty) {
+                    terminate_all(p.parts().0);
                     continue;
                 }
                 // SAFETY: valid waiter buffers; three or four handles.
                 let waited = unsafe {
                     WAIT_HANDLES[0] = rx;
-                    WAIT_HANDLES[1] = err_rx;
-                    WAIT_HANDLES[2] = self.notif;
-                    let n = if self.tty != 0 {
-                        WAIT_HANDLES[3] = self.tty;
+                    WAIT_HANDLES[1] = ends.diagnostics;
+                    WAIT_HANDLES[2] = notif;
+                    let n = if tty != 0 {
+                        WAIT_HANDLES[3] = tty;
                         4
                     } else {
                         3
@@ -414,23 +316,23 @@ impl Host for NitroxHost {
                     }
                 }
             }
-            drain_diagnostics(err_rx, self.tty);
+            drain_diagnostics(ends.diagnostics, tty);
             if overflowed {
                 return Err(String::from("a stage produced more output than nxsh will hold"));
             }
             if complete && !bytes.is_empty() {
                 output = Some(bytes);
             }
-            // SAFETY: closing our read end.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, rx) };
+            p.close(rx);
         }
 
-        let reaped = reap(self.notif, self.tty, err_rx, &children, stages, spawned, strict, early, stop_sent);
+        let (children, exits) = p.parts();
+        let reaped = reap(notif, tty, ends.diagnostics, children, stages, strict, exits, stop_sent);
+        p.reaped();
         // One last drain, after every stage is gone: a program's final word can be sent just before
         // `exit`, after the wait that noticed the exit returned.
-        drain_diagnostics(err_rx, self.tty);
-        // SAFETY: closing our read end; every writer is gone.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, err_rx) };
+        drain_diagnostics(ends.diagnostics, tty);
+        p.close(ends.diagnostics);
 
         Ok(PipelineRun { stages: reaped, output })
     }
@@ -590,15 +492,13 @@ fn reap(
     err: u64,
     children: &[u64],
     stages: &[StageSpec],
-    spawned: usize,
     strict: bool,
     // Exits the capture wait read before this ran, and whether it passed a terminate request on.
-    early: Vec<(i32, bool)>,
+    seen: &mut Vec<(i32, bool)>,
     stop_sent: bool,
 ) -> Vec<StageStatus> {
-    let mut seen: Vec<(i32, bool)> = early;
     let mut asked = stop_sent;
-    while seen.len() < spawned {
+    while seen.len() < children.len() {
         // Wait on the terminal as well as the children: this is the only place `Ctrl-C` is noticed
         // while a stage is slow (§11h). Diagnostics are drained here too: a pipeline with nothing
         // on its tail spends the whole job in this loop.
@@ -619,23 +519,13 @@ fn reap(
         if waited < 1 {
             continue;
         }
-        // Poll before blocking, for the same reason as the capture wait above.
+        // Poll before blocking, for the same reason as the capture wait above. Every stage is asked
+        // to stop, once; a stage that ignores the request is still waited for.
         if tty != 0 && !asked && drain_tty_interrupt(tty) {
             asked = true;
-            for &c in children {
-                // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
-                unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
-            }
+            terminate_all(children);
         }
-        // Ask every stage to stop, once; a stage that ignores the request is still waited for.
-        if tty != 0 && !asked && drain_tty_interrupt(tty) {
-            asked = true;
-            for &c in children {
-                // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
-                unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
-            }
-        }
-        drain_notifications(notif, children, &mut asked, &mut seen);
+        drain_notifications(notif, children, &mut asked, seen);
     }
 
     let mut out = Vec::with_capacity(stages.len());
@@ -649,18 +539,19 @@ fn reap(
         if strict && (code != 0 || crashed) {
             aborted = true;
             // §1's eager abort: the later stages are asked to stop.
-            for &c in children {
-                // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
-                unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
-            }
+            terminate_all(children);
         }
         out.push(StageStatus { command: s.program.clone(), exit_status: code, crashed, cancelled: false });
     }
-    for &c in children {
-        // SAFETY: the shell's own handles, no longer needed now every stage has exited
-        unsafe { syscall1(SYS_HANDLE_CLOSE, c) };
-    }
     out
+}
+
+/// Ask every stage to stop: a request, which a stage may take its time over.
+fn terminate_all(children: &[u64]) {
+    for &c in children {
+        // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
+        unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+    }
 }
 
 /// Take a pending `Ctrl-C` from the terminal without blocking, setting the flag the evaluator's
@@ -1048,10 +939,7 @@ fn drain_notifications(notif: u64, children: &[u64], asked: &mut bool, exits: &m
             unsafe { (&raw mut STOP_ASKED).write(true) };
             if !*asked {
                 *asked = true;
-                for &c in children {
-                    // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
-                    unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
-                }
+                terminate_all(children);
             }
         } else if kind == KIND_CHILD_EXITED {
             let exit_kind = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);

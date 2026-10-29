@@ -48,10 +48,9 @@ pub enum Served {
 /// IPC payload). A more fragmented file is `TooLarge` until `TODO(map-range)` lands.
 pub const MAX_RUNS: usize = 64;
 
-/// The `(request_id, directory)` of a resolve to open a directory session on: one whose suffix
-/// names a directory, since resolve flags are not plumbed from userspace. **A suffix over
-/// [`MAX_SUFFIX`] opens none**, and [`serve`] refuses it `TooLarge`, rather than opening what its
-/// first [`MAX_SUFFIX`] bytes name, an ancestor or a sibling cut short.
+/// The `(request_id, directory)` of a resolve whose suffix names a directory, which opens a session.
+/// **A suffix over [`MAX_SUFFIX`] opens none**, and [`serve`] refuses it `TooLarge`, rather than
+/// opening what its first [`MAX_SUFFIX`] bytes name, an ancestor or a sibling cut short.
 pub fn directory_open<V: Volume>(vol: &V, request: &[u8]) -> Option<(u64, u64)> {
     let m = decode(request).ok().filter(|m| m.op == OP_NS_RESOLVE)?;
     let r = parse_resolve_request(m.body).filter(|r| r.suffix.len() <= MAX_SUFFIX)?;
@@ -59,10 +58,9 @@ pub fn directory_open<V: Volume>(vol: &V, request: &[u8]) -> Option<(u64, u64)> 
 }
 
 /// **The reply to one request on a directory session** bound to `dir`, encoded into `reply`: its
-/// length, or `None` for a message that does not decode, which gets none. The names a request
-/// carries are read where they arrived, at any length the message holds. `listing` is scratch for
-/// a `ReadDir`'s entries. A file whose last name goes is handed to `release`, which frees it once
-/// the kernel has forgotten it; a directory removed is handed to `freeing`, which ends its sessions.
+/// length, or `None` for a message that does not decode. Names are read where they arrived, at any
+/// length the message holds. A file whose last name goes is handed to `release`; a directory
+/// removed, to `freeing`.
 #[allow(clippy::too_many_arguments, reason = "each is a part the server's one call plays")]
 pub fn session<V: Volume>(
     vol: &V,

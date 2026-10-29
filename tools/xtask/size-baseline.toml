@@ -35,7 +35,7 @@
 "userspace/nxfiles/src/tests.rs" = 2275
 "userspace/nxsh/src/eval.rs" = 4137
 "userspace/nxsh/src/lex.rs" = 1089
-"userspace/nxsh/src/main.rs" = 1126
+"userspace/nxsh/src/main.rs" = 1014
 "userspace/nxsh/src/ops.rs" = 1079
 "userspace/nxsh/src/parse.rs" = 1867
 "userspace/nxterm/src/lib.rs" = 2341
@@ -44,4 +44,4 @@
 "userspace/test-harness/src/harness.rs" = 3953
 "userspace/test-harness/src/uiclient.rs" = 1265
 "userspace/view-broker/src/lib.rs" = 1646
-"userspace/view-broker/src/main.rs" = 1811
+"userspace/view-broker/src/main.rs" = 1809

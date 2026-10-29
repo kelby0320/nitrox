@@ -18,11 +18,13 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
 - **`src/lib.rs` and friends — the language.** `lex`, `parse`, `ast`, `eval`, `value`,
   `ops`, `repl`, `regex`, `complete`, `timing` (`time`'s line, Phase 6 Part H.2), `paths`
   (resolving and `~`, where a `use` reads, the chain of files loading), `exec` (what a file
-  named as a program runs as), `search` (Ctrl-R) and `editor` (what each byte typed at the prompt
-  writes and runs). **No syscalls.** Host-tested (`cargo test -p nxsh --lib --target
-  x86_64-unknown-linux-gnu`) in a second rather than through a 90-second boot.
+  named as a program runs as), `search` (Ctrl-R), `editor` (what each byte typed at the prompt
+  writes and runs) and `pipeline` (every handle and stage a pipeline makes, given back on any
+  return, its syscalls behind `pipeline::Sys`). **No syscalls.** Host-tested (`cargo test -p nxsh
+  --lib --target x86_64-unknown-linux-gnu`) in a second rather than through a 90-second boot.
 - **`src/main.rs` — the host.** `_start`, spawning stages, wiring pipes, the console
-  reader, the filesystem; and `src/stage.rs`, a stage's image read and decided by `exec`.
+  reader, the filesystem; `src/stage.rs`, a stage's image read and decided by `exec`; and
+  `src/stages.rs`, the `pipeline::Sys` that starts and stops stages.
   **`eval.rs`, `parse.rs` and `main.rs` are at their size entries**: new code goes in a module
   of its own.
 

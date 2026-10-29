@@ -983,7 +983,7 @@ pub fn spawn_leader(
     let argv: &[&str] = &argv_buf;
 
     // No streams: a leader's I/O is what its namespace gives it, not a stream it was handed.
-    let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
+    let sent = send_setup_env(setup_mgr, Streams::default(), argv, &session_env());
     // **One message per extra, in order, after the setup message.** Only `handles[0]` reaches a
     // child, so the rest arrive *over* the setup channel; a leader binding resources needs the
     // endpoints themselves, as a *binding* never resolves back to one.

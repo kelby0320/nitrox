@@ -67,7 +67,6 @@ struct Outbox {
 }
 
 impl Outbox {
-    /// Where the rsproto message goes.
     fn payload(&mut self) -> &mut [u8] {
         &mut self.msg[PAYLOAD_OFF..]
     }

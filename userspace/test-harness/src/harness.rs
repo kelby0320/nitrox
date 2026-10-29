@@ -264,7 +264,7 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     };
 
     let streams = Streams { stdin: Some(stage_stdin), stdout: None, stderr: None };
-    if send_setup(setup_shell, &streams, &["stage", "500"]).is_err() {
+    if send_setup(setup_shell, streams, &["stage", "500"]).is_err() {
         kprint(b"test-harness: stage send_setup FAIL\n");
         exit(1);
     }
@@ -1373,7 +1373,7 @@ fn run_coreutil_capture_in(
         stdout: Some(list_stdout),
         stderr: None,
     };
-    if send_setup(setup_shell, &streams, argv).is_err() {
+    if send_setup(setup_shell, streams, argv).is_err() {
         return_fail(b"test-harness: list send_setup FAIL\n");
     }
 
@@ -1498,7 +1498,7 @@ fn dead_stage_closes_its_pipe_demo(root_ns: u64, notif: u64) {
         Err(_) => return_fail(b"test-harness: dead-stage spawn FAIL\n"),
     };
     let streams = Streams { stdin: None, stdout: Some(stdout), stderr: None };
-    if send_setup(setup_shell, &streams, &["list", "/nx-no-such-directory"]).is_err() {
+    if send_setup(setup_shell, streams, &["list", "/nx-no-such-directory"]).is_err() {
         return_fail(b"test-harness: dead-stage send_setup FAIL\n");
     }
 
@@ -2386,7 +2386,7 @@ fn run_coreutil_in(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], child_
         Err(_) => return_fail(b"test-harness: coreutil spawn FAIL\n"),
     };
     let streams = Streams { stdin: None, stdout: Some(stdout), stderr: None };
-    if send_setup(setup_shell, &streams, argv).is_err() {
+    if send_setup(setup_shell, streams, argv).is_err() {
         return_fail(b"test-harness: copy send_setup FAIL\n");
     }
     // Drain first, then reap. A **failing** `copy` exits without writing, so the receive must end
@@ -3392,7 +3392,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
             }
         }
         let streams = Streams { stdin: None, stdout: None, stderr: None };
-        if send_setup(setup_shell, &streams, &["fp", SEEDS[i]]).is_err() {
+        if send_setup(setup_shell, streams, &["fp", SEEDS[i]]).is_err() {
             kprint(b"test-harness: hard-float send_setup FAIL\n");
             exit(1);
         }

@@ -49,6 +49,7 @@ mod policy;
 mod received;
 mod registry;
 mod services;
+mod setup;
 mod storage;
 mod storage_admin;
 mod tty;
@@ -65,6 +66,7 @@ use policy::*;
 use received::*;
 use registry::*;
 use services::*;
+use setup::*;
 use storage::*;
 use storage_admin::*;
 use tty::*;
@@ -215,6 +217,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & unlinked_file_test(root_ns)
         & libfs_refuses_a_directory_and_a_large_file_test(root_ns)
         & save_leaves_the_file_when_it_fails_test(root_ns)
+        & a_refused_setup_message_closes_its_handles_test()
         & flush_test(root_ns)
         & block_bounds_test(root_ns)
         & dot_entries_test(root_ns)

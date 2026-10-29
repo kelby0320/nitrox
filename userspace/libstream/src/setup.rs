@@ -253,13 +253,14 @@ mod io_stage {
     }
 
     /// Send the **setup message** on `channel` (the shell's end of the stage's bootstrap
-    /// endpoint): the present stream handles (canonical order) are **moved** to the stage.
-    pub fn send_setup(channel: u64, streams: &Streams, argv: &[&str]) -> Result<()> {
+    /// endpoint): the present stream handles (canonical order) are **moved** to the stage, and
+    /// gone on every return, as [`send_setup_full`] says.
+    pub fn send_setup(channel: u64, streams: Streams, argv: &[&str]) -> Result<()> {
         send_setup_env(channel, streams, argv, &Record::default())
     }
 
     /// As [`send_setup`], with an environment.
-    pub fn send_setup_env(channel: u64, streams: &Streams, argv: &[&str], env: &Record) -> Result<()> {
+    pub fn send_setup_env(channel: u64, streams: Streams, argv: &[&str], env: &Record) -> Result<()> {
         send_setup_full(channel, streams, None, argv, env)
     }
 
@@ -267,23 +268,35 @@ mod io_stage {
     ///
     /// The terminal handle is **moved** like the streams, and rides *after* them in the
     /// handle array; see [`SetupPayload::terminal`]. Other callers pass `None`.
+    ///
+    /// **Every handle given is gone on every return**: moved by a send the kernel took, or closed
+    /// here when the message could not be made or the kernel refused it. A caller never closes one.
     pub fn send_setup_full(
         channel: u64,
-        streams: &Streams,
+        streams: Streams,
         terminal: Option<u64>,
         argv: &[&str],
         env: &Record,
     ) -> Result<()> {
+        let mut handles = streams.ordered();
+        handles.extend(terminal);
+        let refused = |e: WireError, handles: &[u64]| {
+            // SAFETY: closing handles the caller gave this call, which no send moved.
+            handles.iter().for_each(|&h| unsafe {
+                syscall1(SYS_HANDLE_CLOSE, h);
+            });
+            Err(e)
+        };
         let owned: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
         let payload =
             SetupPayload { streams: streams.bitmap(), argv: owned, env: env.clone(), terminal: terminal.is_some() }
                 // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge`, not the
                 // retryable `SinkFull`.
-                .encode()?;
-        let mut handles = streams.ordered();
-        if let Some(t) = terminal {
-            handles.push(t);
-        }
+                .encode();
+        let payload = match payload {
+            Ok(p) => p,
+            Err(e) => return refused(e, &handles),
+        };
         let mut buf: Box<[u8; IPC_MSG_SIZE]> = Box::new([0u8; IPC_MSG_SIZE]);
         buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         buf[OFF_HANDLE_COUNT] = handles.len() as u8;
@@ -302,8 +315,9 @@ mod io_stage {
             )
         };
         if r < 0 {
-            return Err(map_err(r));
+            return refused(map_err(r), &handles);
         }
+        // Past here the kernel has taken the handles, whatever the wait says.
         let po = r as u64;
         let wh = [po];
         let mut result = [0u8; 24];

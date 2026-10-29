@@ -41,11 +41,9 @@ pub fn po_wait(po: u64) -> Option<(i32, u64)> {
     Some((status, result))
 }
 
-/// **The one buffer a device layer moves every transfer through**: a `MemoryObject` of `len`
-/// bytes, mapped read-write for the scratch's life and unmapped and closed on drop. Not `Sync`.
-///
-/// **Once a wait fails without its transfer complete the scratch is lost**: the device may still
-/// read or write it, so nothing is copied into it and nothing is submitted through it again.
+/// **The one buffer a device layer moves every transfer through**, a `MemoryObject` mapped for its
+/// life. **Once a wait fails without its transfer complete it is lost**: the device may still read or
+/// write it, so nothing is copied into it and nothing is submitted through it again.
 pub struct Scratch {
     mem: u64,
     addr: u64,

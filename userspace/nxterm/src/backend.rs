@@ -278,7 +278,7 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Re
         return child;
     }
     let streams = libstream::setup::Streams::default();
-    let sent = libstream::setup::send_setup_full(setup_ours, &streams, Some(terminal), &["nxsh"], env).is_ok();
+    let sent = libstream::setup::send_setup_full(setup_ours, streams, Some(terminal), &["nxsh"], env).is_ok();
     if sent {
         // Logged beside the send: this count is what the shell is handed, and the only link in
         // the chain a release image shows. `check-login`'s clipboard gate waits on this line.
@@ -291,9 +291,7 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Re
     // SAFETY: closing our end of the setup channel.
     unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
     if !sent {
-        // On failure the handle is still ours and must be closed here; a successful send closes it.
-        // SAFETY: the send failed, so the terminal handle is still ours.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, terminal) };
+        // The terminal went with the attempt, sent or closed: it is not ours to close.
         kprint(b"nxterm: the shell's setup message did not send\n");
         return -1;
     }
