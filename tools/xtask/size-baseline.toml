@@ -6,7 +6,6 @@
 "kernel/src/drivers/xhci/hid.rs" = 1105
 "kernel/src/drivers/xhci/storage.rs" = 1701
 "kernel/src/main.rs" = 1186
-"kernel/src/mm/vmm.rs" = 1560
 "kernel/src/object/file_object.rs" = 2459
 "kernel/src/pci/mod.rs" = 1045
 "kernel/src/syscall/table.rs" = 2604

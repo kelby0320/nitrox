@@ -821,10 +821,9 @@ fn round_up_page(n: u64) -> u64 {
 }
 
 fn current_address_space(proc_ref: &ObjectRef) -> Option<&AddressSpace> {
-    debug_assert_eq!(proc_ref.object_type(), KObjectType::Process);
-    // SAFETY: `proc_ref` references a live `Process` (its `KObjectHeader` is at
-    // offset 0), pinned by the current user thread for the syscall's duration.
-    // The returned borrow is tied to `proc_ref`'s lifetime.
+    assert_eq!(proc_ref.object_type(), KObjectType::Process);
+    // SAFETY: `proc_ref` references a live `Process`, its type just checked, pinned by the current
+    // user thread for the syscall; the returned borrow is tied to `proc_ref`'s lifetime.
     let proc: &Process = unsafe { &*(proc_ref.as_ptr() as *const Process) };
     proc.address_space()
 }
@@ -2064,7 +2063,8 @@ fn sys_file_sync(handle: u64) -> SysResult {
 /// Write one file's pages back, tell its server, and unpin it if no writable mapping appeared.
 fn write_back(file_obj: &ObjectRef) -> Result<(), KError> {
     use crate::object::FileObject;
-    // SAFETY: `file_obj` pins a live `FileObject` (both callers checked the type).
+    assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+    // SAFETY: `file_obj` pins a live `FileObject`, its type just checked.
     let mark = unsafe { &*(file_obj.as_ptr() as *const FileObject) }.clean_mark();
     match FileObject::writeback(file_obj) {
         crate::object::file_object::WriteBack::Written => {}

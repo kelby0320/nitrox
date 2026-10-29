@@ -185,7 +185,7 @@ impl UserspaceServerReg {
     /// empty pending tables. The caller installs the back-pointer from `endpoint` to this
     /// object (under `SCHED`) and binds it as a `UserspaceServer` target.
     pub fn try_new(endpoint: ObjectRef) -> Result<KBox<Self>, AllocError> {
-        debug_assert_eq!(endpoint.object_type(), KObjectType::IpcChannel);
+        assert_eq!(endpoint.object_type(), KObjectType::IpcChannel);
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::UserspaceServerReg),
             magic: Self::MAGIC,
@@ -206,7 +206,7 @@ impl UserspaceServerReg {
     /// entered under `id` (replacing a mid-teardown entry) and `Ok(None)` returned. `Err` only if
     /// the index cannot grow. A forgotten entry is passed by: its file is freed or about to be.
     pub fn cache_get_or_insert(&self, id: u64, obj: &ObjectRef) -> Result<Option<ObjectRef>, AllocError> {
-        debug_assert_eq!(obj.object_type(), KObjectType::FileObject);
+        assert_eq!(obj.object_type(), KObjectType::FileObject);
         let mut g = self.files.lock();
         if let Some(e) = g.iter_mut().find(|e| e.id == id && !e.forgotten) {
             // SAFETY: the entry's object is live — its `Drop` removes the entry under this

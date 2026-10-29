@@ -646,3 +646,14 @@ fn an_unmap_is_shot_down_before_its_frames_or_its_object_are_freed() {
         assert_eq!(heap::frames_freed_by_this_thread() - freed, frames, "{at:#x}");
     }
 }
+
+/// **Mapping a file as a memory object stops at its type**, in a release build as in a debug one,
+/// rather than reading the file as a memory object's frames.
+#[test]
+#[should_panic(expected = "left == right")]
+fn a_file_mapped_as_a_memory_object_stops_at_its_type() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    let file = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
+    let _ = asp.map_object(range(0x40_0000, 0x40_1000), uprot(), file);
+}

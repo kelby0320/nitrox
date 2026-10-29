@@ -311,7 +311,7 @@ impl AddressSpace {
             return Err((object, MapError::NotUserHalf));
         }
 
-        debug_assert_eq!(object.object_type(), KObjectType::MemoryObject);
+        assert_eq!(object.object_type(), KObjectType::MemoryObject);
         // SAFETY: `object` holds a reference to a live `MemoryObject` (its
         // header is at offset 0); we only read its frame list.
         let mobj = unsafe { &*(object.as_ptr() as *const MemoryObject) };
@@ -388,7 +388,7 @@ impl AddressSpace {
         prot: Protection,
         object: ObjectRef,
     ) -> Result<(), (ObjectRef, MapError)> {
-        debug_assert_eq!(object.object_type(), KObjectType::FileObject);
+        assert_eq!(object.object_type(), KObjectType::FileObject);
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((object, MapError::NotCanonical));
