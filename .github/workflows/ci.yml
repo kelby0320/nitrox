@@ -428,7 +428,9 @@ jobs:
           name: nitrox-kernel-${{ matrix.group }}
           # The licence goes with the ELF: the kernel embeds Terminus Font (SIL OFL), whose
           # terms require the notice to accompany every copy.
+          # And every gate's guest transcript: a hang leaves nothing else to read.
           path: |
             kernel/target/x86_64-unknown-none/debug/nitrox-kernel
             assets/fonts/LICENSE-Terminus.txt
+            tools/build-cache/guest-transcript-*.log
           if-no-files-found: warn

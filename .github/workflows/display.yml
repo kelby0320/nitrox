@@ -138,5 +138,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: screendump
-          path: tools/build-cache/screendump.ppm
+          path: |
+            tools/build-cache/screendump.ppm
+            tools/build-cache/guest-transcript-*.log
           if-no-files-found: ignore
