@@ -62,8 +62,9 @@ pub const RAMDISK_BLOCK: u32 = 512;
 
 /// Where a ramdisk's bytes live.
 enum Backing {
-    /// Allocated and owned by the device — the bring-up disk.
-    Owned(KVec<u8>),
+    /// Allocated and owned by the device — the bring-up disk — and reached through `base`, taken
+    /// from it mutably once: one taken through a shared borrow would allow reads only.
+    Owned { bytes: KVec<u8>, base: *mut u8 },
     /// Memory the bootloader loaded: a Limine module, never reclaimed.
     Borrowed { base: *mut u8, len: usize },
 }
@@ -103,8 +104,9 @@ impl RamDisk {
         for i in 0..RAMDISK_BYTES {
             backing.try_push(Self::pattern_byte(i)).expect("within reserved ramdisk capacity");
         }
+        let base = backing.as_mut_ptr();
         KBox::try_new(RamDisk {
-            backing: Backing::Owned(backing),
+            backing: Backing::Owned { bytes: backing, base },
             block_size: RAMDISK_BLOCK,
             busy: IrqSpinLock::new(LockRank::Leaf, ()),
             counted: Counted::new(),
@@ -129,15 +131,14 @@ impl RamDisk {
 
     fn base(&self) -> *mut u8 {
         match &self.backing {
-            Backing::Owned(v) => v.as_ptr() as *mut u8,
-            Backing::Borrowed { base, .. } => *base,
+            Backing::Owned { base, .. } | Backing::Borrowed { base, .. } => *base,
         }
     }
 
     /// Capacity in bytes.
     pub fn capacity(&self) -> usize {
         match &self.backing {
-            Backing::Owned(v) => v.len(),
+            Backing::Owned { bytes, .. } => bytes.len(),
             Backing::Borrowed { len, .. } => *len,
         }
     }
@@ -404,6 +405,22 @@ mod tests {
         drop(rd);
         assert!(module[512..1024].iter().all(|&x| x == 0xAB), "the write landed in the module");
         assert!(module[..512].iter().all(|&x| x == 0), "and nowhere else");
+    }
+
+    /// **The disk it owns takes writes**, through a pointer that may write: one taken from its
+    /// bytes through a shared borrow allowed reads only, so under Miri a write was undefined.
+    #[test]
+    fn a_disk_over_its_own_bytes_writes_and_reads_them_back() {
+        init_global_heap();
+        let rd = RamDisk::try_new().unwrap();
+        let mut out = [0x5A_u8; 512];
+        assert_eq!(rd.transfer(&irp(IrpOp::Write, 1024, &[frag(&mut out)])), (IrpStatus::Success as i32, 512));
+        let mut back = [0u8; 512];
+        assert_eq!(rd.transfer(&irp(IrpOp::Read, 1024, &[frag(&mut back)])), (IrpStatus::Success as i32, 512));
+        assert_eq!(back, [0x5A; 512]);
+        let mut before = [0u8; 512];
+        rd.transfer(&irp(IrpOp::Read, 512, &[frag(&mut before)]));
+        assert!(before.iter().enumerate().all(|(i, &b)| b == RamDisk::pattern_byte(512 + i)), "and nowhere else");
     }
 
     /// A RAM disk counts what it serves: each transfer by its op, the bytes it
