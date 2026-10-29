@@ -224,16 +224,14 @@ pub fn exit_process(status: ExitStatus) -> ! {
 }
 
 /// Emit a last-ditch kernel diagnostic for a ring-3 fault that **stranded the scheduler**:
-/// no runnable thread is left to receive the fault notification and call
+/// no CPU has a thread left to receive the fault notification and call
 /// `sys_exception_resume`, so the system would idle forever (notably an init crash). Called
-/// only from the no-runnable-thread branch of [`suspend_with_fault`].
+/// only once [`nothing_to_run`] holds: a supervisor woken onto another CPU is not stranded.
 ///
-/// Uses the unsynchronized emergency serial writer, lock-free like `dump_and_halt`. Sound
-/// here: a userspace fault never holds `SERIAL`, and the caller holds `SCHED` so interrupts
-/// are masked. Reads only neutral data, staying out of the arch-private `ExceptionFrame`.
+/// Written under `SERIAL`, taken after `SCHED` as their ranks order, so it never interleaves
+/// with a line another CPU is printing. Reads only neutral data, not the `ExceptionFrame`.
 fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
     use crate::libkern::notification::{KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, KIND_STACK_OVERFLOW};
-    use core::fmt::Write;
     // SAFETY: `me_obj` is the running (faulting) thread, pinned, `SCHED` held.
     let (pid, tid) = unsafe { (Thread::owner_pid_of(me_obj), Thread::tid_of(me_obj)) };
     let kind = match notif.kind() {
@@ -243,9 +241,7 @@ fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
         KIND_STACK_OVERFLOW => "stack-overflow",
         _ => "fault",
     };
-    let mut w = crate::arch::serial::emergency_writer();
-    let _ = writeln!(
-        w,
+    crate::kprintln!(
         "\n*** unhandled ring-3 fault (no thread left to resume it): pid {} tid {} {} @ {:#018x} ***",
         pid,
         tid,
@@ -304,13 +300,15 @@ pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification
         let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
         push_reserved(&mut g.suspended, me, "suspended list");
 
-        // Switch to the next runnable thread. If none, this fault **stranded the scheduler**
-        // (see `report_stranded_fault`). A serviced fault — the supervisor's waiter was just
-        // woken by `signal_channel` above — takes the `Some` branch and stays quiet.
+        // Switch to the next runnable thread. If none here and none anywhere, this fault
+        // **stranded the scheduler** (see `report_stranded_fault`). A serviced fault's woken
+        // supervisor is queued or running on some CPU, so it stays quiet.
         let next = match pick_next(&mut g) {
             Some(n) => n,
             None => {
-                report_stranded_fault(me_obj, &notif);
+                if nothing_to_run(&g) {
+                    report_stranded_fault(me_obj, &notif);
+                }
                 g.idle_slot().take().expect("idle thread exists after init")
             }
         };

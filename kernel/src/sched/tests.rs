@@ -931,3 +931,32 @@ fn the_current_identity_is_its_pid_then_its_tid() {
     assert_eq!(with_current(me, current_pid_tid), Some((9, 7)));
     assert_eq!(with_current(inert_ref(3), current_pid_tid), None);
 }
+
+/// **A fault strands the system only when no CPU has a thread to run**: a supervisor woken onto
+/// another CPU, queued there or already running, is not stranded.
+#[test]
+fn nothing_is_left_to_run_only_when_every_cpu_idles_with_an_empty_queue() {
+    init_global_heap();
+    let mut st = test_state();
+    online_n(&mut st, 3);
+    let idle = inert_ref(90);
+    st.idle_addr[1] = idle.as_ptr() as usize;
+    st.current[1] = Some(idle);
+    assert!(nothing_to_run(&st), "CPU 1 idles and CPU 2 has nothing current");
+
+    st.current[2] = Some(inert_ref(91));
+    assert!(!nothing_to_run(&st), "CPU 2 runs a thread");
+    st.current[2] = None;
+
+    assert!(st.ready[2].push(inert_ref(92)).is_ok());
+    assert!(!nothing_to_run(&st), "CPU 2 has a thread queued");
+    drop(st.ready[2].pop());
+    assert!(st.ready[0].push(inert_ref(93)).is_ok());
+    assert!(!nothing_to_run(&st), "this CPU has a thread queued");
+    drop(st.ready[0].pop());
+
+    st.ready[3] = thread_list().unwrap();
+    assert!(st.ready[3].push(inert_ref(94)).is_ok());
+    st.current[3] = Some(inert_ref(95));
+    assert!(nothing_to_run(&st), "CPU 3 is offline");
+}
