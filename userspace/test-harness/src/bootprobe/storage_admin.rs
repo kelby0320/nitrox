@@ -102,7 +102,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         let deadline = clock_ns() + 30_000_000_000;
         loop {
             let m = receive(admin, deadline)?;
-            m.handles.iter().for_each(|&h| close(h));
             if m.request_id == next {
                 return Some(m);
             }
@@ -128,12 +127,11 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         if !rs_send(endpoint, librsproto::OP_NS_RESOLVE, 1, &req[..n], &[]) {
             return None;
         }
-        let m = receive(endpoint, clock_ns() + 5_000_000_000)?;
-        if m.error || m.handles.len() != 1 {
-            m.handles.iter().for_each(|&h| close(h));
+        let mut m = receive(endpoint, clock_ns() + 5_000_000_000)?;
+        if m.error || m.count() != 1 {
             return None;
         }
-        Some(m.handles[0])
+        m.take(0)
     };
     let (watch, media) =
         if st == 0 && endpoint != 0 { (open(b"info/watch"), open(b"info/media")) } else { (None, None) };
@@ -152,7 +150,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     let pinged = |deadline: u64| {
         let mut any = false;
         while let Some(m) = receive(watch, if any { 0 } else { deadline }) {
-            m.handles.iter().for_each(|&h| close(h));
             any |= is_changed(m.op, &m.body);
         }
         any
@@ -204,7 +201,7 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         unsafe { ((addr + i) as *mut u8).write_volatile(pattern(i)) };
     }
     // SAFETY: unmapping this call's own mapping; the handle goes too, with no sync.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, LEN) };
     close(fh);
 
     // 4. Unmount, then the label is gone — and the watch is told.
@@ -305,9 +302,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     let asked = rs_send(session, librsproto::OP_NS_RESOLVE, 1, &req[..n], &[]);
     let reply = if asked { receive(session, clock_ns() + 5_000_000_000) } else { None };
     close(session);
-    if let Some(m) = &reply {
-        m.handles.iter().for_each(|&h| close(h));
-    }
     if !refused(&reply, KError::NotFound) {
         return finish(fail(b"a session endpoint answered admin-endpoint"));
     }
@@ -319,7 +313,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
             return None;
         }
         let m = receive(media, clock_ns() + 30_000_000_000)?;
-        m.handles.iter().for_each(|&h| close(h));
         Some(m)
     };
     if !refused(&eject(1, b"nitrox-scratch"), KError::NoAccess) {

@@ -283,7 +283,7 @@ fn cmd_lsblk(root_ns: u64) {
         kprint(b"(no block devices)\r\n");
     }
     // SAFETY: unmapping our mapping (eshell runs forever — don't leak); the records were printed.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
 }
 
 /// Trim leading/trailing ASCII spaces.

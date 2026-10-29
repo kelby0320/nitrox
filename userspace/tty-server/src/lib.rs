@@ -23,6 +23,21 @@ pub mod routing {
         OP_TTY_SET_MODE as OP_SET_MODE, OP_TTY_WRITE as OP_WRITE,
     };
 
+    /// Why a handle of `object_type` with `rights` cannot be a terminal's backend, if it cannot:
+    /// the server sends on it, receives from it and waits on it beside every handle it serves,
+    /// and learns what it is by a stat, which needs `INSPECT`.
+    pub fn backend_refusal(object_type: u32, rights: u64) -> Option<KError> {
+        use libkern::handle::{KOBJ_IPC_CHANNEL, RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
+        const NEEDED: u64 = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT;
+        if object_type != KOBJ_IPC_CHANNEL {
+            Some(KError::InvalidArgument)
+        } else if rights & NEEDED != NEEDED {
+            Some(KError::NoAccess)
+        } else {
+            None
+        }
+    }
+
     /// Where a terminal's bytes come from and go to: a serial port, or a terminal emulator
     /// holding the master half of a pty. The discipline cannot tell which.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -708,6 +723,23 @@ mod routing_tests {
         let got = replies_to(&acts, 1);
         assert_eq!(got[0], (OP_TTY_READ, b"ab".to_vec()), "the bytes before the interrupt");
         assert!(got.iter().any(|(op, _)| *op == OP_TTY_INTERRUPT), "the interrupt was swallowed as data: {got:?}",);
+    }
+
+    /// A backend is a channel end the server can send on, receive from and wait on; lacking any
+    /// one of the three is refused, and so is any other object holding them all.
+    #[test]
+    fn a_backend_is_a_channel_it_can_send_receive_and_wait_on() {
+        use libkern::error::KError;
+        use libkern::handle::{
+            KOBJ_IPC_CHANNEL, KOBJ_MEMORY_OBJECT, RIGHT_RECV, RIGHT_SEND, RIGHT_TRANSFER, RIGHT_WAIT,
+        };
+        let all = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT;
+        assert_eq!(backend_refusal(KOBJ_IPC_CHANNEL, all), None);
+        assert_eq!(backend_refusal(KOBJ_IPC_CHANNEL, all | RIGHT_TRANSFER), None);
+        for right in [RIGHT_SEND, RIGHT_RECV, RIGHT_WAIT] {
+            assert_eq!(backend_refusal(KOBJ_IPC_CHANNEL, all & !right), Some(KError::NoAccess), "{right:#x}");
+        }
+        assert_eq!(backend_refusal(KOBJ_MEMORY_OBJECT, all), Some(KError::InvalidArgument));
     }
 
     #[test]

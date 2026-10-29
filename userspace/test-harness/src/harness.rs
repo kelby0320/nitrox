@@ -246,12 +246,15 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     };
 
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: SPAWN_STAGE is our static, initialised here; `setup_stage` is moved to the stage.
+    // SAFETY: SPAWN_STAGE is our static, initialised here; `setup_stage` is moved to the stage; `img`
+    // is ours, and the spawn only read it.
     let _stage = match unsafe {
         SPAWN_STAGE.image = img;
         SPAWN_STAGE.handles[0] = setup_stage;
         SPAWN_STAGE.arg0 = bootstrap_arg0(true);
-        spawn(&*(&raw const SPAWN_STAGE))
+        let p = spawn(&*(&raw const SPAWN_STAGE));
+        syscall1(SYS_HANDLE_CLOSE, img);
+        p
     } {
         Ok(p) => p,
         Err(_) => {
@@ -1350,13 +1353,14 @@ fn run_coreutil_capture_in(
         Err(_) => return_fail(b"test-harness: list setup chan FAIL\n"),
     };
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: SPAWN_LIST is our static, initialised here; spawns are sequential.
+    // SAFETY: SPAWN_LIST is our static, initialised here; spawns are sequential; `img` is ours.
     let _proc = match unsafe {
         SPAWN_LIST.image = img;
         SPAWN_LIST.handles[0] = setup_stage;
         SPAWN_LIST.arg0 = bootstrap_arg0(true);
         SPAWN_LIST.namespace = child_ns;
         let p = spawn(&*(&raw const SPAWN_LIST));
+        syscall1(SYS_HANDLE_CLOSE, img);
         SPAWN_LIST.namespace = 0;
         p
     } {
@@ -1481,12 +1485,14 @@ fn dead_stage_closes_its_pipe_demo(root_ns: u64, notif: u64) {
         Err(_) => return_fail(b"test-harness: dead-stage setup chan FAIL\n"),
     };
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: SPAWN_LIST is our static; the coreutil spawns are sequential.
+    // SAFETY: SPAWN_LIST is our static; the coreutil spawns are sequential; `img` is ours.
     let _proc = match unsafe {
         SPAWN_LIST.image = img;
         SPAWN_LIST.handles[0] = setup_stage;
         SPAWN_LIST.arg0 = bootstrap_arg0(true);
-        spawn(&*(&raw const SPAWN_LIST))
+        let p = spawn(&*(&raw const SPAWN_LIST));
+        syscall1(SYS_HANDLE_CLOSE, img);
+        p
     } {
         Ok(p) => p,
         Err(_) => return_fail(b"test-harness: dead-stage spawn FAIL\n"),
@@ -2365,13 +2371,14 @@ fn run_coreutil_in(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], child_
     };
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: SPAWN_LIST is our static (shared by the coreutil spawns, which are
-    // sequential); initialised here for this spawn.
+    // sequential); initialised here for this spawn; `img` is ours.
     let _proc = match unsafe {
         SPAWN_LIST.image = img;
         SPAWN_LIST.handles[0] = setup_stage;
         SPAWN_LIST.arg0 = bootstrap_arg0(true);
         SPAWN_LIST.namespace = child_ns;
         let p = spawn(&*(&raw const SPAWN_LIST));
+        syscall1(SYS_HANDLE_CLOSE, img);
         SPAWN_LIST.namespace = 0; // restore the shared default for later spawns
         p
     } {
@@ -3150,17 +3157,7 @@ fn rename_wait(ns: u64, src: &[u8], dst: &[u8], flags: u64) -> i32 {
     if po < 0 {
         return po as i32;
     }
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
-    unsafe {
-        WAIT_HANDLES[0] = po as u64;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
-    }
-    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
-    // touches; they hold the wait's result only when it returned 1.
-    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
-    // SAFETY: closing our own PO handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-    status
+    po_wait(po as u64).0
 }
 
 /// Whether `path` resolves; [`file_matches`] cannot tell *absent* from *present with other
@@ -3470,7 +3467,7 @@ fn sched_stats_demo(root_ns: u64) {
     // SAFETY: unmapping the page we mapped above (`text` is not used past here); closing our own
     // handle.
     unsafe {
-        syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, PAGE);
         syscall1(SYS_HANDLE_CLOSE, mem);
     }
 
@@ -3502,7 +3499,7 @@ fn sched_stats_demo(root_ns: u64) {
         // SAFETY: unmapping the page mapped above (`text` is not used past
         // here); closing our own handle (each lookup minted a fresh snapshot).
         unsafe {
-            syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
+            syscall2(SYS_MEMORY_UNMAP, addr as u64, PAGE);
             syscall1(SYS_HANDLE_CLOSE, mem);
         }
         if done {
@@ -3608,7 +3605,7 @@ fn block_demo(root_ns: u64) {
                 .map(|rs| rs.filter_map(|r| r.block_index().map(|n| (n, r.kind()))).collect())
                 .unwrap_or_default();
             // SAFETY: unmapping what was mapped above; `out` holds copies.
-            unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+            unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
             out
         } else {
             alloc::vec::Vec::new()

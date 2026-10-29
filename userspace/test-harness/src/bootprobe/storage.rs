@@ -68,7 +68,7 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
     }
     // Unmapped before the sync, as `libfs` does, so the write-back can leave the file clean.
     // SAFETY: unmapping this call's own mapping.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, LEN) };
     // SAFETY: register-only syscall on a file handle this process holds.
     let synced = unsafe { syscall1(SYS_FILE_SYNC, fh) };
     close(fh);
@@ -269,21 +269,34 @@ pub(super) fn past_two_tib_test(root_ns: u64) -> bool {
     let want: alloc::vec::Vec<u8> = (0..512u32)
         .map(|i| if (i as usize) < PAST_TWO_TIB.len() { PAST_TWO_TIB[i as usize] } else { (i * 31 + 7) as u8 })
         .collect();
-    // SAFETY: `addr` maps PAGE writable bytes, and 512 are written.
-    let buf = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 512) };
     let io = |opcode: u32| {
         let op = IoOp { opcode, flags: 0, buffer: page, buf_offset: 0, offset: PAST_TWO_TIB_BLOCK * 512, length: 512 };
         // SAFETY: a valid `IoOp`; `dev` and `page` are handles this process holds.
         let po = unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) };
         po > 0 && po_wait(po as u64) == (0, 512)
     };
-    buf.copy_from_slice(&want);
+    {
+        // SAFETY: `addr` maps PAGE writable bytes, 512 are written, and no device is using the
+        // page: this slice is dead before the write is submitted.
+        let buf = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 512) };
+        buf.copy_from_slice(&want);
+    }
     let wrote = io(libkern::abi::IO_OPCODE_WRITE);
-    buf.fill(0);
+    {
+        // SAFETY: as above; the write has completed, and this slice is dead before the read is
+        // submitted.
+        let buf = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 512) };
+        buf.fill(0);
+    }
     let read = wrote && io(IO_OPCODE_READ);
-    let same = read && buf == &want[..];
+    let same = read && {
+        // SAFETY: `addr` maps PAGE bytes; the read has completed, so the device writes the page
+        // no more and this slice is made only now.
+        let got = unsafe { core::slice::from_raw_parts(addr as *const u8, 512) };
+        got == &want[..]
+    };
     // SAFETY: unmapping this call's own mapping.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, PAGE) };
     close(page);
     close(dev);
     if !wrote {

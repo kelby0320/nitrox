@@ -113,8 +113,13 @@ grouping, and `Ctrl-C` typed in one window has no business interrupting a progra
 
 ### `AttachBackend` (`0x0B06`)
 
-Request: empty body, **one moved handle** — a channel whose far end the sender keeps. Reply:
-empty on success; `InvalidArgument` if no handle was moved, `NotFound` if the terminal is gone.
+Request: empty body, **one moved handle** — a channel whose far end the sender keeps, with
+`SEND`, `RECV`, `WAIT` and `INSPECT`. Reply: empty on success; `InvalidArgument` if no handle was
+moved or it is not a channel end, `NoAccess` if it lacks one of the four rights, and `NotFound` if
+the terminal is gone. The handle is checked first, so a gone terminal sent a bad one answers for
+the handle. A refused handle is closed. The server sends output on the channel, receives input
+from it, and waits on it beside every terminal it serves, so one it could not wait on would fail
+every wait of its loop; it learns what it was given by a stat, which needs `INSPECT`.
 
 From then on the terminal's output arrives on that channel as `Output`, and its input is whatever
 comes back as `Input`, instead of the serial console.
@@ -154,7 +159,9 @@ password prompt that turns echo off on a sibling leaves the terminal it was mint
 
 Refused with `WouldBlock` when the server has no terminal to spare. Every terminal is a slot in
 the server's wait set, and the cap is the resolve's. A shell answers the refusal by running the
-stage without a terminal, which is what every stage had before this op.
+stage without a terminal, which is what every stage had before this op. A reply that cannot carry
+the channel is answered with the send's error instead, and no terminal is made; a ring too full
+for the reply is too full for the error, which is lost with it.
 
 ### `Token` (`0x0B0A`)
 
@@ -185,8 +192,9 @@ tokens at most; past that the oldest goes, which costs its holder a password pro
 - A **terminal** ends when its holder exits (`PeerClosed`), or on `Close`. A sibling is an
   ordinary terminal in this respect: a stage's ends when the stage does, and its backend stays
   while any terminal remains on it.
-- A **backend** is dropped when the last terminal on it is gone; if it was a channel, the server
-  closes its end, which is how an emulator learns its terminal has ended.
+- A **backend** is dropped when the last terminal on it is gone or has been attached to another;
+  if it was a channel, the server closes its end, which is how an emulator learns its terminal
+  has ended.
 - An **emulator** going away ends every terminal on its backend. A terminal whose window has
   closed cannot be interacted with, and leaving it alive would give its programs a `/dev/tty`
   that silently discards — the failure that looks like a hang.

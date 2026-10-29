@@ -13,7 +13,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use libkern::abi::{HandleInfo, NS_ENTRY_PATH_MAX, NS_KIND_MOUNT, NsEntry};
 use libkern::error::KError;
-use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_MAP_WRITE};
+use libkern::handle::{KOBJ_FILE_OBJECT, KOBJ_MEMORY_OBJECT, RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_MAP_WRITE};
 use libkern::syscall::{
     SYS_FILE_CREATE, SYS_FILE_RENAME, SYS_FILE_SYNC, SYS_FILE_TRUNCATE, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT,
     SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_ENUMERATE, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall3,
@@ -48,17 +48,25 @@ pub enum FileError {
 /// A copy through `sys_io_submit` will (`copy-limit` in `deferred-decisions.md`).
 pub const MAX_COPY: u64 = 8 * 1024 * 1024;
 
-/// Resolve `path` and return its size, or `None` if it does not resolve to a file (a directory
-/// does not).
-pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
-    let handle = lookup(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT).ok()?;
+/// The size of the file `handle` names, or `None` if it does not stat as a file or memory
+/// object; a directory's session endpoint stats with size 0.
+fn file_handle_size(handle: u64) -> Option<u64> {
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a valid, correctly sized `HandleInfo` out-param. (Never a
     // hand-sized byte array — see the 2026-07-24 stack-smash entry in the decision log.)
     let r = unsafe { syscall2(SYS_HANDLE_STAT, handle, (&raw mut info) as u64) };
+    let file = matches!(info.object_type, KOBJ_FILE_OBJECT | KOBJ_MEMORY_OBJECT);
+    if r == 0 && file { Some(info.size) } else { None }
+}
+
+/// Resolve `path` and return its size, or `None` if it does not resolve to a file (a directory
+/// does not).
+pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
+    let handle = lookup(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT).ok()?;
+    let size = file_handle_size(handle);
     // SAFETY: closing the handle we just resolved.
     unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
-    if r != 0 { None } else { Some(info.size) }
+    size
 }
 
 /// Copy the regular file at `src` to `dst`, returning the bytes copied.
@@ -171,14 +179,20 @@ fn truncate(ns: u64, path: &[u8], size: u64) -> Result<(), FileError> {
 /// An empty file is `Ok(empty)`: there is nothing to map. Lives here rather than with its one
 /// consumer because it is mechanism over this module's private primitives, not policy.
 pub fn read_file(ns: u64, path: &[u8]) -> Result<Vec<u8>, FileError> {
-    let size = file_size(ns, path).ok_or(FileError::NotFound)?;
-    if size > MAX_COPY {
-        return Err(FileError::TooLarge);
-    }
+    let handle = lookup(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT).map_err(|_| FileError::NotFound)?;
+    let size = match file_handle_size(handle) {
+        Some(size) if size <= MAX_COPY => size,
+        other => {
+            // SAFETY: closing our own handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+            return Err(if other.is_some() { FileError::TooLarge } else { FileError::NotFound });
+        }
+    };
     if size == 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
         return Ok(Vec::new());
     }
-    let handle = lookup(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT).map_err(FileError::Io)?;
     // SAFETY: mapping an object we hold a handle to, with a right it carries.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, size, RIGHT_MAP_READ) };
     if addr < 0 {
@@ -206,7 +220,7 @@ pub fn unpadded(bytes: &[u8]) -> &[u8] {
 /// Write `bytes` to `path`, replacing whatever was there, shrinking first as [`copy_file`] does.
 ///
 /// Not a safe save: a failure after the truncate leaves a file shorter than both versions.
-/// Write a temporary and [`rename`] it instead.
+/// [`save_file`] is one.
 pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     let size = bytes.len() as u64;
     if size > MAX_COPY {
@@ -245,6 +259,36 @@ pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
     if synced != 0 {
         return Err(FileError::Io(synced as i32));
+    }
+    Ok(())
+}
+
+/// The suffix of [`save_file`]'s temporary. Beside the file it replaces, as a rename is only
+/// atomic within one filesystem.
+pub const SAVE_SUFFIX: &str = ".save-tmp";
+
+/// Which step of [`save_file`] failed; either way the file is as it was.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SaveError {
+    /// The temporary could not be written.
+    Write(FileError),
+    /// The temporary could not be renamed over the file.
+    Replace(FileError),
+}
+
+/// Replace the file at `path` with `bytes` the safe way: a temporary beside it, written whole,
+/// then renamed over it. A failure at either step leaves `path` as it was and removes the
+/// temporary, so no file is left holding neither version.
+pub fn save_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), SaveError> {
+    let mut temp = path.to_vec();
+    temp.extend_from_slice(SAVE_SUFFIX.as_bytes());
+    if let Err(e) = write_file(ns, &temp, bytes) {
+        let _ = unlink_at(ns, &temp);
+        return Err(SaveError::Write(e));
+    }
+    if let Err(e) = rename(ns, &temp, path, true) {
+        let _ = unlink_at(ns, &temp);
+        return Err(SaveError::Replace(e));
     }
     Ok(())
 }

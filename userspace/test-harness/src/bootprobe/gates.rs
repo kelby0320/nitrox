@@ -205,7 +205,7 @@ pub(super) fn sched_gate(root_ns: u64) -> bool {
     // SAFETY: unmapping the page mapped above (`text` is not used past here); closing our own
     // handle.
     unsafe {
-        syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, 4096);
         syscall1(SYS_HANDLE_CLOSE, mem);
     }
     if active >= 2 {

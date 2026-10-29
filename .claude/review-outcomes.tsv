@@ -312,3 +312,16 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-28	403	2950f66e	16	tests	optional	demonstrated	declined		the object conjunct is reachable only by a close racing between the claim's lookup and its lock, and harmless either way (the closer released the handle's reference, so the move cannot copy); kept as the stricter answer
 2026-10-28	403	2950f66e	17	tests	optional	demonstrated	fixed	9cb17fed	zero-length run case added, fails without the exemption; stub producer's settle declined, as only host tests build it
 2026-10-28	403	2950f66e	18	architecture	optional	unverified	deferred	9cb17fed	maintainer deferred TODO(direct-bind-copy); tools test now reads lookup_typed, positive-controlled; variable rights still unseen
+2026-10-28	404	0627fab5	1	logic+error-paths+architecture	blocking	demonstrated	fixed	9602f43e	a backend needs INSPECT; a stat refused NoAccess answers NoAccess; the boot test asserts each code and failed at INSPECT on the head
+2026-10-28	404	0627fab5	2	logic+error-paths	worth-fixing	demonstrated	fixed	9602f43e	the no-WAIT end keeps INSPECT and must answer NoAccess; the call site's rights wired out passed the head's tests and fails the new one
+2026-10-28	404	0627fab5	3	tests	worth-fixing	unverified	fixed	9602f43e	reproduced: both mutations passed test-qemu on the head; libfs_refuses_a_directory_and_a_large_file_test fails under each
+2026-10-28	404	0627fab5	4	architecture	worth-fixing	demonstrated	fixed	9602f43e	both store docs say the profile server alone keeps the store read-only today
+2026-10-28	404	0627fab5	5	logic+error-paths	optional	unverified	fixed	9602f43e	the encode failure joins the failed-send path, whose control is the sh-d13 probe; the encode itself cannot fail
+2026-10-28	404	0627fab5	6	logic	optional	unverified	fixed	9602f43e	shell-language.md gives save's cap
+2026-10-28	404	0627fab5	7	error-paths	optional	unverified	fixed	9602f43e	libfs::save_file (nxedit's temporary + rename) for nxsh and nxedit; the save test fails with an in-place save; a failure after a truncate cannot be produced
+2026-10-28	404	0627fab5	8	error-paths	optional	unverified	declined		a full ring drops the error as it dropped the reply, as before; comment and spec now say so
+2026-10-28	404	0627fab5	9	tests	optional	unverified	declined		run: deleting either close fails the boot test on the head; no host test reaches a close
+2026-10-28	404	0627fab5	10	tests	optional	unverified	declined		no deterministic trigger without a fault seam; probe controls run in 6961407d
+2026-10-28	404	0627fab5	11	rules-and-docs	optional	unverified	fixed	9602f43e	the spec says the handle is checked before the terminal
+2026-10-28	404	0627fab5	12	rules-and-docs	optional	demonstrated	fixed	9602f43e	rewrapped
+2026-10-28	404	0627fab5	13	architecture	optional	unverified	deferred		TODO(mount-write-authority), whose trigger names a shared /store; its entry and the decision log record the case

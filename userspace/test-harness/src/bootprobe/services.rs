@@ -29,7 +29,6 @@ pub(super) fn restart_test(root_ns: u64) -> bool {
         let m = receive(ch, clock_ns() + 5_000_000_000);
         close(ch);
         let m = m?;
-        m.handles.iter().for_each(|&h| close(h));
         Some(u64::from_le_bytes(m.body.get(..8)?.try_into().ok()?))
     };
     let Some(first) = token(root_ns) else {
@@ -169,7 +168,6 @@ pub(super) fn services_test(root_ns: u64) -> bool {
         let deadline = clock_ns() + 40_000_000_000;
         loop {
             let m = receive(admin, deadline)?;
-            m.handles.iter().for_each(|&h| close(h));
             if m.request_id == next {
                 return Some(m);
             }
@@ -324,7 +322,6 @@ pub(super) fn power_endpoint_test(root_ns: u64) -> bool {
         let deadline = clock_ns() + 10_000_000_000;
         loop {
             let m = receive(session, deadline)?;
-            m.handles.iter().for_each(|&h| close(h));
             if m.request_id == id {
                 return Some(if m.error {
                     librsproto::error::parse_error(&m.body).map_or(-1, |e| e.kerror)
@@ -429,7 +426,6 @@ pub(super) fn logs_test(root_ns: u64) -> bool {
         let deadline = clock_ns() + 5_000_000_000;
         loop {
             let m = receive(session, deadline)?;
-            m.handles.iter().for_each(|&h| close(h));
             if m.request_id == id {
                 return Some(m);
             }

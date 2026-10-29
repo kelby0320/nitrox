@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Client channels to the broker, closed as this drops, so no return leaves them open.
+struct Clients(alloc::vec::Vec<u64>);
+
+impl Drop for Clients {
+    fn drop(&mut self) {
+        self.0.iter().for_each(|&ch| close(ch));
+    }
+}
+
 /// **The view broker, through its own protocol**, before any shell or
 /// `with` exists to drive it. `boot-probe` holds the unscoped root namespace, so it can be both a
 /// supervisor — opening a session for the demo account — and a client in that session, at
@@ -215,27 +224,27 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
     // 4. **A client let in can always start its program.** Open clients until the broker refuses
     // one, then start a program on the last it let in: its exit must still be heard (admitting by
     // what was open left its life channel no slot).
-    let mut filled = alloc::vec::Vec::new();
+    let mut filled = Clients(alloc::vec::Vec::new());
     let refused = loop {
         let (st, ch) = ns_lookup(root_ns, client_path.as_bytes(), chan);
         if st != 0 || ch == 0 {
             break st;
         }
-        filled.push(ch);
-        if filled.len() > libkern::MAX_WAIT_HANDLES {
+        filled.0.push(ch);
+        if filled.0.len() > libkern::MAX_WAIT_HANDLES {
             return fail(b"the broker never refused a client");
         }
     };
     if refused != libkern::KError::WouldBlock.as_i32() {
         Line::new()
             .s(b"boot-probe: view broker: client ")
-            .u(filled.len() as u64 + 1)
+            .u(filled.0.len() as u64 + 1)
             .s(b" refused with ")
             .i(refused as i64)
             .end();
         return fail(b"a client was refused for something other than room");
     }
-    let Some(&last) = filled.last() else {
+    let Some(&last) = filled.0.last() else {
         return fail(b"no client was let in");
     };
     // SAFETY: a namespace handle this process holds.
@@ -254,13 +263,10 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
     }
     let heard = exited.pop().or_else(|| views_receive(last, 0, &mut exited).map(|r| r.1));
     if heard.as_deref().and_then(parse_exited).is_none() {
-        Line::new().s(b"boot-probe: view broker: ").u(filled.len() as u64).s(b" clients let in").end();
+        Line::new().s(b"boot-probe: view broker: ").u(filled.0.len() as u64).s(b" clients let in").end();
         return fail(b"the exit of the last client's program was never heard");
     }
-    for ch in filled {
-        // SAFETY: closing our own handles.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
-    }
+    drop(filled);
 
     // 5. Two more requests, `b` and `c`. `b` fails; then a password goes on each before the
     // delay ends. Both are held, and when the first fails it holds the second, so they are
@@ -454,7 +460,7 @@ pub(super) fn view_grants_end_test(root_ns: u64) -> bool {
             // The child's channel, then the broker's word that the program exited, after which the
             // child asks what still resolves.
             let child = rs_send(in_w, 2, 2, &[], &[]).then(|| receive(out_r, clock_ns() + 10_000_000_000)).flatten();
-            let child = child.and_then(|m| m.handles.first().copied()).unwrap_or(0);
+            let child = child.and_then(|mut m| m.take(0)).unwrap_or(0);
             let heard = exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)).is_some();
             let mask = (child != 0 && heard && rs_send(child, 1, 1, &[], &[])).then(|| mask_on(child)).flatten();
             close(child);
@@ -464,11 +470,7 @@ pub(super) fn view_grants_end_test(root_ns: u64) -> bool {
             let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 9, &close_body, &[], &mut exited);
             let mask = rs_send(in_w, 1, 4, &[], &[]).then(|| mask_on(out_r)).flatten();
             // Leaves a child waiting on a channel this closes below, and exits.
-            if let Some(m) =
-                rs_send(in_w, 2, 5, &[], &[]).then(|| receive(out_r, clock_ns() + 10_000_000_000)).flatten()
-            {
-                m.handles.iter().for_each(|&h| close(h));
-            }
+            let _ = rs_send(in_w, 2, 5, &[], &[]).then(|| receive(out_r, clock_ns() + 10_000_000_000));
             mask
         };
         for h in [in_w, out_r, cli] {
