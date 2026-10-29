@@ -42,6 +42,9 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
+/// Cap on the upstream stream read before rendering; the same as nxsh's capture cap.
+const MAX_CAPTURE: usize = 1 << 20;
+
 const COPY: Flag = Flag::new("copy", 'c', "read stdin and push it onto the ring");
 const LIST: Flag = Flag::new("list", 'l', "describe the ring: index, kind, length");
 
@@ -212,7 +215,7 @@ fn do_copy(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
         // will never arrive.
         stage.die(b"clip: --copy needs something upstream (try `... | clip --copy`)\n", EXIT_USAGE);
     };
-    let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive() {
+    let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive(MAX_CAPTURE) {
         Ok(b) => b,
         Err(_) => stage.die(b"clip: could not read the upstream stream\n", EXIT_FAILURE),
     };

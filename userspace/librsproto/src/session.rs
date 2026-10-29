@@ -10,7 +10,8 @@
 //! another syscall.
 
 use crate::file::{
-    DIR_ENTRY_PREFIX_LEN, DirEntry, name_request, parse_read_dir_reply, read_dir_request, rename_request,
+    DIR_ENTRY_PREFIX_LEN, DirEntry, RENAME_REQUEST_MAX, name_request, parse_read_dir_reply, read_dir_request,
+    rename_request,
 };
 use crate::{
     OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK, RS_HEADER_LEN,
@@ -155,7 +156,7 @@ impl<'a> Dir<'a> {
 
     /// Rename `old` to `new`, both within this directory.
     pub fn rename(&mut self, old: &[u8], new: &[u8]) -> Result<()> {
-        let mut body = [0u8; 512];
+        let mut body = [0u8; RENAME_REQUEST_MAX];
         let n = rename_request(&mut body, old, new).ok_or(DirError::Protocol)?;
         self.status_op(OP_FILE_RENAME, &body[..n])
     }

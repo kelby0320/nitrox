@@ -483,7 +483,7 @@ fn in_admin_view(
         Some((false, ref body)) if matches!(parse_outcome(body), Some((Outcome::Started, _)))
     );
     let listing = if asked {
-        libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive().ok()
+        libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive(1 << 20).ok()
     } else {
         None
     };

@@ -19,7 +19,7 @@
 
 use alloc::vec::Vec;
 
-use crate::wire::{ByteSink, Result};
+use crate::wire::{ByteSink, Result, WireError};
 
 /// A message-oriented transport for one TSM1 stream: send/receive one framed message
 /// at a time.
@@ -110,11 +110,16 @@ impl<P: MsgPort> ChannelReceiver<P> {
     }
 
     /// Receive messages until the `last` marker, returning the reassembled byte stream.
-    /// Propagates [`WireError::PeerClosed`] if the producer closed before finishing.
-    pub fn receive(&mut self) -> Result<Vec<u8>> {
+    /// Propagates [`WireError::PeerClosed`] if the producer closed before finishing, and
+    /// fails with [`WireError::TooLarge`] as soon as the stream exceeds `max` bytes.
+    pub fn receive(&mut self, max: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
-            if self.port.recv(&mut out)? {
+            let last = self.port.recv(&mut out)?;
+            if out.len() > max {
+                return Err(WireError::TooLarge);
+            }
+            if last {
                 return Ok(out);
             }
         }
@@ -357,7 +362,7 @@ mod tests {
         sink.put(&payload).unwrap();
         sink.finish().unwrap();
         let mut rx = ChannelReceiver::new(sink.into_port());
-        assert_eq!(rx.receive().unwrap(), payload);
+        assert_eq!(rx.receive(usize::MAX).unwrap(), payload);
     }
 
     #[test]
@@ -375,7 +380,7 @@ mod tests {
         let mut sink = tw.into_sink();
         sink.finish().unwrap();
 
-        let bytes = ChannelReceiver::new(sink.into_port()).receive().unwrap();
+        let bytes = ChannelReceiver::new(sink.into_port()).receive(usize::MAX).unwrap();
         let mut tr = TableReader::new(&bytes).unwrap();
         assert_eq!(tr.schema(), &schema);
         assert!(matches!(tr.next(), Some(Ok(Item::Row(r))) if r[0] == Value::Int(1)));
@@ -394,6 +399,35 @@ mod tests {
     fn receiver_reports_peer_closed_if_producer_never_finishes() {
         let mut port = Loopback::default();
         port.send(b"partial", false).unwrap();
-        assert_eq!(ChannelReceiver::new(port).receive(), Err(WireError::PeerClosed));
+        assert_eq!(ChannelReceiver::new(port).receive(usize::MAX), Err(WireError::PeerClosed));
+    }
+
+    struct Endless {
+        recvs: usize,
+        total: usize,
+    }
+
+    impl MsgPort for Endless {
+        fn send(&mut self, _payload: &[u8], _last: bool) -> Result<()> {
+            Ok(())
+        }
+        fn recv(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+            self.recvs += 1;
+            out.extend_from_slice(&[0u8; 1024]);
+            Ok(self.recvs == self.total)
+        }
+    }
+
+    #[test]
+    fn receive_stops_once_the_stream_passes_the_cap() {
+        let mut rx = ChannelReceiver::new(Endless { recvs: 0, total: 1000 });
+        assert_eq!(rx.receive(64 * 1024), Err(WireError::TooLarge));
+        assert!(rx.into_port().recvs <= 65);
+    }
+
+    #[test]
+    fn receive_returns_everything_under_a_cap_above_the_total() {
+        let mut rx = ChannelReceiver::new(Endless { recvs: 0, total: 1000 });
+        assert_eq!(rx.receive(1000 * 1024).unwrap().len(), 1000 * 1024);
     }
 }

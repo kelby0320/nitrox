@@ -21,6 +21,13 @@ pub const MAGIC: [u8; 4] = *b"TSM1";
 /// errors out on EOF.
 const SCHEMA_FIELD_HINT_CAP: usize = 64;
 
+/// The deepest `List`/`Record` nesting the codec reads or writes; a `List` and a `Record`
+/// each count one level.
+pub const MAX_DEPTH: usize = 64;
+
+/// Values a decoder allows beyond one per input byte.
+const VALUE_FLOOR: usize = 4096;
+
 /// Structural type of a schema field / value. The byte values are **pinned here** —
 /// the spec defers them to `libstream`. The value-level `Error` tag is reserved.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -158,6 +165,9 @@ pub enum WireError {
     SchemaMismatch,
     /// A typed read (`read_record`) hit an in-stream error record; carries its code.
     StreamError(i32),
+    /// The input nests deeper than [`MAX_DEPTH`], holds more values than its bytes allow, or
+    /// a length does not fit its field.
+    TooLarge,
 }
 
 /// Codec result.
@@ -229,12 +239,16 @@ impl ByteSink for SliceSink<'_> {
 pub struct ByteSource<'a> {
     buf: &'a [u8],
     pos: usize,
+    depth: usize,
+    budget: usize,
 }
 
 impl<'a> ByteSource<'a> {
-    /// Wrap a buffer.
+    /// Wrap a buffer. Decoding through it may yield at most `buf.len() + 4096` values.
     pub fn new(buf: &'a [u8]) -> Self {
-        ByteSource { buf, pos: 0 }
+        // Every value but a non-nullable `Null` costs an input byte, so this only bites on
+        // streams of zero-byte cells and keeps decoded memory proportional to the input.
+        ByteSource { buf, pos: 0, depth: 0, budget: buf.len().saturating_add(VALUE_FLOOR) }
     }
 
     /// Bytes not yet consumed.
@@ -498,6 +512,10 @@ impl Value {
 /// presence byte is written by the record layer). A [`Value::Table`] is refused with
 /// [`WireError::NestedTable`]; use [`Table::encode`].
 pub fn write_value(sink: &mut impl ByteSink, v: &Value) -> Result<()> {
+    write_value_at(sink, v, 0)
+}
+
+fn write_value_at(sink: &mut impl ByteSink, v: &Value, depth: usize) -> Result<()> {
     match v {
         Value::Null => Ok(()),
         Value::Bool(b) => put_u8(sink, *b as u8),
@@ -506,10 +524,18 @@ pub fn write_value(sink: &mut impl ByteSink, v: &Value) -> Result<()> {
         Value::Str(s) => put_lenpfx(sink, s.as_bytes()),
         Value::Bytes(b) => put_lenpfx(sink, b),
         Value::Handle(h) => sink.put(&h.to_le_bytes()),
-        Value::List(items) => write_list(sink, items),
+        Value::List(items) => {
+            if depth >= MAX_DEPTH {
+                return Err(WireError::TooLarge);
+            }
+            write_list(sink, items, depth + 1)
+        }
         Value::Record(r) => {
+            if depth >= MAX_DEPTH {
+                return Err(WireError::TooLarge);
+            }
             r.schema.encode(sink)?;
-            write_row_values(sink, &r.schema, &r.values)
+            write_row_values_at(sink, &r.schema, &r.values, depth + 1)
         }
         Value::Table(_) => Err(WireError::NestedTable),
     }
@@ -517,12 +543,12 @@ pub fn write_value(sink: &mut impl ByteSink, v: &Value) -> Result<()> {
 
 /// Encode a list body: `u32` count, then each element as a `u8` [`TypeTag`] + its bytes.
 /// A [`Value::Table`] element is refused ([`WireError::NestedTable`]).
-fn write_list(sink: &mut impl ByteSink, items: &[Value]) -> Result<()> {
+fn write_list(sink: &mut impl ByteSink, items: &[Value], depth: usize) -> Result<()> {
     put_u32(sink, items.len() as u32)?;
     for e in items {
         let tag = e.type_tag().ok_or(WireError::NestedTable)?;
         put_u8(sink, tag.to_u8())?;
-        write_value(sink, e)?;
+        write_value_at(sink, e, depth)?;
     }
     Ok(())
 }
@@ -530,6 +556,22 @@ fn write_list(sink: &mut impl ByteSink, items: &[Value]) -> Result<()> {
 /// Decode a value of the given `tag`. Does not consume a `NULLABLE` presence byte; the
 /// record layer reads presence, then calls this. The `Error` tag is [`WireError::Unsupported`].
 pub fn read_value(src: &mut ByteSource, tag: TypeTag) -> Result<Value> {
+    src.budget = src.budget.checked_sub(1).ok_or(WireError::TooLarge)?;
+    let nests = matches!(tag, TypeTag::List | TypeTag::Record);
+    if nests {
+        if src.depth >= MAX_DEPTH {
+            return Err(WireError::TooLarge);
+        }
+        src.depth += 1;
+    }
+    let v = read_value_body(src, tag);
+    if nests {
+        src.depth -= 1;
+    }
+    v
+}
+
+fn read_value_body(src: &mut ByteSource, tag: TypeTag) -> Result<Value> {
     Ok(match tag {
         TypeTag::Null => Value::Null,
         TypeTag::Bool => Value::Bool(src.u8()? != 0),
@@ -564,6 +606,10 @@ fn read_list(src: &mut ByteSource) -> Result<Value> {
 /// Encode a row of `values` against `schema`: a `NULLABLE` presence byte where the column
 /// declares it, then the value's bytes. Errors on a count / type / nullness mismatch.
 pub fn write_row_values(sink: &mut impl ByteSink, schema: &Schema, values: &[Value]) -> Result<()> {
+    write_row_values_at(sink, schema, values, 0)
+}
+
+fn write_row_values_at(sink: &mut impl ByteSink, schema: &Schema, values: &[Value], depth: usize) -> Result<()> {
     if values.len() != schema.fields.len() {
         return Err(WireError::SchemaMismatch);
     }
@@ -581,7 +627,7 @@ pub fn write_row_values(sink: &mut impl ByteSink, schema: &Schema, values: &[Val
         if value.type_tag() != Some(f.ty) {
             return Err(WireError::SchemaMismatch);
         }
-        write_value(sink, value)?;
+        write_value_at(sink, value, depth)?;
     }
     Ok(())
 }
@@ -663,6 +709,9 @@ impl Schema {
 
     /// Encode `field_count` then each field (`name_len`, `name`, `type`, `modifiers`).
     pub fn encode(&self, sink: &mut impl ByteSink) -> Result<()> {
+        if self.fields.iter().any(|f| f.name.len() > usize::from(u16::MAX)) {
+            return Err(WireError::TooLarge);
+        }
         put_u32(sink, self.fields.len() as u32)?;
         for f in &self.fields {
             put_u16(sink, f.name.len() as u16)?;
@@ -727,6 +776,9 @@ pub struct WireErrorRecord {
 impl WireErrorRecord {
     /// Encode the record **including** its `0x02` tag.
     pub fn encode(&self, sink: &mut impl ByteSink) -> Result<()> {
+        if self.field_name.len() > usize::from(u16::MAX) {
+            return Err(WireError::TooLarge);
+        }
         put_u8(sink, REC_ERROR)?;
         put_i32(sink, self.code)?;
         put_lenpfx(sink, self.message.as_bytes())?;
@@ -745,214 +797,7 @@ impl WireErrorRecord {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::vec;
+mod limit_tests;
 
-    #[test]
-    fn type_tag_round_trips_and_rejects_unknown() {
-        for tag in [
-            TypeTag::Null,
-            TypeTag::Bool,
-            TypeTag::Int,
-            TypeTag::Float,
-            TypeTag::String,
-            TypeTag::Bytes,
-            TypeTag::Handle,
-            TypeTag::List,
-            TypeTag::Record,
-            TypeTag::Error,
-        ] {
-            assert_eq!(TypeTag::from_u8(tag.to_u8()), Some(tag));
-        }
-        assert_eq!(TypeTag::from_u8(0x0A), None);
-        assert_eq!(TypeTag::from_u8(0xFF), None);
-    }
-
-    #[test]
-    fn flags_and_modifiers() {
-        let f = StreamFlags::TEXT_FALLBACK.union(StreamFlags::COMPRESSED);
-        assert!(f.contains(StreamFlags::TEXT_FALLBACK));
-        assert!(f.contains(StreamFlags::COMPRESSED));
-        assert!(!StreamFlags::NONE.contains(StreamFlags::TEXT_FALLBACK));
-        assert!(TypeModifiers::NULLABLE.contains(TypeModifiers::NULLABLE));
-        assert!(!TypeModifiers::NONE.contains(TypeModifiers::NULLABLE));
-    }
-
-    fn value_round_trip(v: Value) {
-        let tag = v.type_tag().expect("cell value has a tag");
-        let mut buf = Vec::new();
-        write_value(&mut buf, &v).unwrap();
-        let mut src = ByteSource::new(&buf);
-        let got = read_value(&mut src, tag).unwrap();
-        assert_eq!(got, v);
-        assert!(src.is_empty(), "value left trailing bytes");
-    }
-
-    #[test]
-    fn values_round_trip() {
-        value_round_trip(Value::Bool(true));
-        value_round_trip(Value::Bool(false));
-        value_round_trip(Value::Int(-9_000_000_000));
-        value_round_trip(Value::Int(i64::MIN));
-        value_round_trip(Value::Float(3.5));
-        value_round_trip(Value::Float(-0.0));
-        value_round_trip(Value::Str(String::from("héllo, TSM1")));
-        value_round_trip(Value::Str(String::new()));
-        value_round_trip(Value::Bytes(vec![0, 1, 2, 254, 255]));
-        value_round_trip(Value::Handle(0xDEAD_BEEF_0000_0042));
-    }
-
-    #[test]
-    fn list_values_round_trip() {
-        value_round_trip(Value::List(Arc::from(&[][..])));
-        value_round_trip(Value::List(Arc::from(&[Value::Int(1), Value::Int(2), Value::Int(3)][..])));
-        value_round_trip(Value::List(Arc::from(
-            &[Value::Int(7), Value::Str(String::from("mix")), Value::Bool(true), Value::Null][..],
-        )));
-        value_round_trip(Value::List(Arc::from(
-            &[Value::List(Arc::from(&[Value::Int(1)][..])), Value::List(Arc::from(&[][..]))][..],
-        )));
-    }
-
-    #[test]
-    fn record_values_round_trip() {
-        let schema = Schema::new()
-            .field("name", TypeTag::String, TypeModifiers::NONE)
-            .field("size", TypeTag::Int, TypeModifiers::NONE)
-            .field("note", TypeTag::String, TypeModifiers::NULLABLE);
-        value_round_trip(Value::Record(Arc::new(Record {
-            schema: schema.clone(),
-            values: vec![Value::Str(String::from("a")), Value::Int(10), Value::Str(String::from("ok"))],
-        })));
-        value_round_trip(Value::Record(Arc::new(Record {
-            schema,
-            values: vec![Value::Str(String::from("b")), Value::Int(20), Value::Null],
-        })));
-        let nested = Schema::new().field("tags", TypeTag::List, TypeModifiers::NONE);
-        value_round_trip(Value::Record(Arc::new(Record {
-            schema: nested,
-            values: vec![Value::List(Arc::from(&[Value::Str(String::from("x")), Value::Str(String::from("y"))][..]))],
-        })));
-    }
-
-    #[test]
-    fn table_value_round_trips_as_a_stream() {
-        let schema = Schema::new()
-            .field("pid", TypeTag::Int, TypeModifiers::NONE)
-            .field("name", TypeTag::String, TypeModifiers::NONE)
-            .field("parent", TypeTag::Handle, TypeModifiers::NULLABLE);
-        let table = Table {
-            flags: StreamFlags::NONE,
-            schema,
-            rows: vec![
-                vec![Value::Int(1), Value::Str(String::from("init")), Value::Null],
-                vec![Value::Int(2), Value::Str(String::from("fs")), Value::Handle(0x40)],
-            ],
-        };
-        let mut buf = Vec::new();
-        table.encode(&mut buf).unwrap();
-        assert_eq!(&buf[..4], b"TSM1"); // a table serialises as a whole stream
-        assert_eq!(Table::decode(&buf).unwrap(), table);
-    }
-
-    #[test]
-    fn table_is_not_a_cell_value() {
-        let table = Value::Table(Arc::new(Table::default()));
-        assert_eq!(table.type_tag(), None);
-        let mut buf = Vec::new();
-        assert_eq!(write_value(&mut buf, &table), Err(WireError::NestedTable));
-        let list = Value::List(Arc::from(&[table][..]));
-        assert_eq!(write_value(&mut Vec::new(), &list), Err(WireError::NestedTable));
-    }
-
-    #[test]
-    fn error_value_tag_is_unsupported() {
-        let buf = [0u8; 8];
-        let mut src = ByteSource::new(&buf);
-        assert_eq!(read_value(&mut src, TypeTag::Error), Err(WireError::Unsupported(TypeTag::Error)));
-    }
-
-    #[test]
-    fn header_and_schema_round_trip() {
-        let schema = Schema::new()
-            .field("pid", TypeTag::Int, TypeModifiers::NONE)
-            .field("name", TypeTag::String, TypeModifiers::NONE)
-            .field("parent", TypeTag::Handle, TypeModifiers::NULLABLE);
-        let flags = StreamFlags::TEXT_FALLBACK;
-
-        let mut buf = Vec::new();
-        encode_header(&mut buf, flags, &schema).unwrap();
-
-        assert_eq!(&buf[..4], b"TSM1");
-
-        let mut src = ByteSource::new(&buf);
-        let (got_flags, got_schema) = decode_header(&mut src).unwrap();
-        assert_eq!(got_flags, flags);
-        assert_eq!(got_schema, schema);
-        assert!(src.is_empty());
-    }
-
-    #[test]
-    fn empty_schema_is_valid() {
-        let mut buf = Vec::new();
-        encode_header(&mut buf, StreamFlags::NONE, &Schema::new()).unwrap();
-        let mut src = ByteSource::new(&buf);
-        let (_, schema) = decode_header(&mut src).unwrap();
-        assert!(schema.fields.is_empty());
-    }
-
-    #[test]
-    fn bad_magic_is_rejected() {
-        let buf = *b"XSM1\x00\x00\x00\x00";
-        let mut src = ByteSource::new(&buf);
-        assert_eq!(decode_header(&mut src), Err(WireError::BadMagic));
-    }
-
-    #[test]
-    fn truncated_input_is_eof_not_panic() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&MAGIC);
-        put_u32(&mut buf, 0).unwrap(); // flags
-        put_u32(&mut buf, 1).unwrap(); // field_count = 1
-        put_u16(&mut buf, 5).unwrap(); // name_len = 5, but no name bytes follow
-        let mut src = ByteSource::new(&buf);
-        assert_eq!(decode_header(&mut src), Err(WireError::UnexpectedEof));
-    }
-
-    #[test]
-    fn unknown_type_tag_in_schema_is_rejected() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&MAGIC);
-        put_u32(&mut buf, 0).unwrap(); // flags
-        put_u32(&mut buf, 1).unwrap(); // one field
-        put_u16(&mut buf, 1).unwrap();
-        buf.push(b'x'); // name "x"
-        buf.push(0x7E); // bogus type tag
-        buf.push(0); // modifiers
-        let mut src = ByteSource::new(&buf);
-        assert_eq!(decode_header(&mut src), Err(WireError::BadTypeTag(0x7E)));
-    }
-
-    #[test]
-    fn terminator_round_trips() {
-        let mut buf = Vec::new();
-        encode_terminator(&mut buf, -7).unwrap();
-        let mut src = ByteSource::new(&buf);
-        assert_eq!(src.u8().unwrap(), REC_TERMINATOR);
-        assert_eq!(src.i32().unwrap(), -7);
-        assert!(src.is_empty());
-    }
-
-    #[test]
-    fn error_record_round_trips() {
-        let rec =
-            WireErrorRecord { code: -13, message: String::from("type mismatch"), field_name: String::from("cpu") };
-        let mut buf = Vec::new();
-        rec.encode(&mut buf).unwrap();
-        let mut src = ByteSource::new(&buf);
-        assert_eq!(src.u8().unwrap(), REC_ERROR); // record loop reads the tag...
-        assert_eq!(WireErrorRecord::decode_body(&mut src).unwrap(), rec); // ...then the body
-        assert!(src.is_empty());
-    }
-}
+#[cfg(test)]
+mod tests;

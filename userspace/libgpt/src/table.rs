@@ -294,8 +294,11 @@ pub fn read(front: &[u8]) -> Result<Table, ReadError> {
         return Err(ReadError::ArrayChecksum);
     }
 
+    let alternate_lba = u64::from_le_bytes(header[32..40].try_into().unwrap());
+    let disk_blocks = alternate_lba.checked_add(1).ok_or(ReadError::Unsupported)?;
+
     let mut table = Table {
-        disk_blocks: u64::from_le_bytes(header[32..40].try_into().unwrap()) + 1,
+        disk_blocks,
         first_usable: u64::from_le_bytes(header[40..48].try_into().unwrap()),
         last_usable: u64::from_le_bytes(header[48..56].try_into().unwrap()),
         partitions: [Partition::new([0; 16], [0; 16], 0, 0, b""); MAX_PARTITIONS],
@@ -418,6 +421,16 @@ mod tests {
         assert_eq!(read(&bad_entry), Err(ReadError::ArrayChecksum));
 
         assert_eq!(read(&good[..BLOCK]), Err(ReadError::Truncated));
+    }
+
+    #[test]
+    fn an_alternate_header_at_the_last_possible_block_is_unsupported_not_a_panic() {
+        let mut disk = build_disk(&two_partitions());
+        disk[BLOCK + 32..BLOCK + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+        disk[BLOCK + 16..BLOCK + 20].copy_from_slice(&0u32.to_le_bytes());
+        let crc = crc32(&disk[BLOCK..BLOCK + HEADER_LEN]);
+        disk[BLOCK + 16..BLOCK + 20].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(read(&disk).map(|_| ()), Err(ReadError::Unsupported));
     }
 
     #[test]

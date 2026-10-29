@@ -174,7 +174,7 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
         Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _))) => {}
         _ => return fail(b"nxinstall with a stdout did not start"),
     }
-    let listing = libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive();
+    let listing = libstream::channel::ChannelReceiver::new(libstream::channel::IpcPort::new(out_r)).receive(1 << 20);
     close(out_r);
     let code = match exited.pop().or_else(|| views_receive(cli, 0, &mut exited).map(|r| r.1)) {
         Some(body) => parse_exited(&body),

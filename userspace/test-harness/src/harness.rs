@@ -166,7 +166,7 @@ fn stream_transport_demo() {
     };
 
     let mut rx = ChannelReceiver::new(IpcPort::new(e1));
-    let bytes = match rx.receive() {
+    let bytes = match rx.receive(1 << 20) {
         Ok(b) => b,
         Err(_) => {
             kprint(b"test-harness: stream receive FAIL\n");
@@ -1378,7 +1378,7 @@ fn run_coreutil_capture_in(
     }
 
     let out = if consume {
-        match ChannelReceiver::new(IpcPort::new(rx)).receive() {
+        match ChannelReceiver::new(IpcPort::new(rx)).receive(1 << 20) {
             Ok(b) => b,
             Err(_) => return_fail(b"test-harness: list stdout receive FAIL\n"),
         }
@@ -1503,7 +1503,7 @@ fn dead_stage_closes_its_pipe_demo(root_ns: u64, notif: u64) {
     }
 
     // The stage writes nothing and exits non-zero: `PeerClosed`, not a hang.
-    match ChannelReceiver::new(IpcPort::new(rx)).receive() {
+    match ChannelReceiver::new(IpcPort::new(rx)).receive(1 << 20) {
         Err(WireError::PeerClosed) => {}
         Err(_) => return_fail(b"test-harness: dead-stage receive failed for the wrong reason\n"),
         Ok(_) => return_fail(b"test-harness: dead-stage produced a stream it should not have\n"),
@@ -2391,7 +2391,7 @@ fn run_coreutil_in(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], child_
     }
     // Drain first, then reap. A **failing** `copy` exits without writing, so the receive must end
     // in `PeerClosed`; that needs the exit-time handle sweep, without which this call hangs.
-    let _ = ChannelReceiver::new(IpcPort::new(rx)).receive();
+    let _ = ChannelReceiver::new(IpcPort::new(rx)).receive(1 << 20);
     let code = reap_child_exit(notif);
     drop(_proc);
     // SAFETY: closing our own handles.
