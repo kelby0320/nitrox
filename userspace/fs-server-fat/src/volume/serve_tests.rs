@@ -210,3 +210,41 @@ fn every_reason_fits_a_refusal_uncut() {
     }
     assert_eq!(format!("{}", Unservable::SmallClusters { bytes: 512 }), "512-byte clusters, smaller than a page");
 }
+
+/// **A session's request is read where it arrived, at any length a message holds**: a name of 233
+/// CJK characters, 699 bytes, which a FAT holds and Linux makes, was cut at 600 bytes and refused,
+/// so the file could be neither removed nor renamed by its name.
+#[test]
+fn a_session_takes_a_name_as_long_as_a_fat_holds() {
+    use libfsserver::serve::session;
+    use librsproto::file::{name_request, rename_request};
+    use librsproto::{OP_FILE_MKDIR, OP_FILE_RENAME, OP_FILE_RMDIR, RS_MAX_BODY};
+    let img = mformat(64, &["-F", "-c", "8"]);
+    let disk = FileImage::open(&img);
+    let fat = Fat::new(&disk);
+    let root = fat.resolve_dir(b"").unwrap();
+    let (long, other) = ("\u{4e2d}".repeat(233), "\u{6587}".repeat(233));
+    let ask = |op: u16, body: &[u8]| {
+        let mut req = [0u8; 4096];
+        let len = encode(&mut req, op, 5, 0, body, 0).unwrap();
+        let (mut reply, mut listing) = ([0u8; 4096], [0u8; RS_MAX_BODY]);
+        let n = session(&fat, root, &req[..len], &mut reply, &mut listing, 0, |_| {}, |_| {}).unwrap();
+        let m = decode(&reply[..n]).unwrap();
+        if m.is_error() { Err(parse_error(m.body).unwrap().kerror) } else { Ok(()) }
+    };
+    let named = |name: &str| {
+        let mut body = [0u8; 2048];
+        let n = name_request(&mut body, name.as_bytes()).unwrap();
+        body[..n].to_vec()
+    };
+    let mut renamed = [0u8; 2048];
+    let n = rename_request(&mut renamed, long.as_bytes(), other.as_bytes()).unwrap();
+    assert_eq!(long.len(), 699);
+    assert_eq!(ask(OP_FILE_MKDIR, &named(&long)), Ok(()));
+    assert!(fat.resolve_dir(long.as_bytes()).is_ok(), "made under its long name");
+    assert_eq!(ask(OP_FILE_RENAME, &renamed[..n]), Ok(()));
+    assert_eq!(ask(OP_FILE_RMDIR, &named(&other)), Ok(()));
+    assert_eq!(fat.resolve_dir(other.as_bytes()), Err(FsError::NotFound), "and removed by it");
+    let (status, out) = crate::test_support::fsck(&img);
+    assert_eq!(status, 0, "{out}");
+}

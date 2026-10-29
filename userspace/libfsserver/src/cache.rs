@@ -10,7 +10,8 @@
 //! block makes room.
 
 use crate::{BlockReader, BlockWriter, FsError};
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, RefCell, UnsafeCell};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// The cache's unit: a 4 KiB block of the device.
 pub const BLOCK: usize = 4096;
@@ -56,6 +57,39 @@ impl<const N: usize> Store<N> {
 impl<const N: usize> Default for Store<N> {
     fn default() -> Store<N> {
         Store::new()
+    }
+}
+
+/// **A server's [`Store`], handed out once**: as a `static` it is all zeroes, so `.bss`, and
+/// [`take`](OnceStore::take) gives the one `&mut` a [`MetaCache`] needs, which a second would alias.
+pub struct OnceStore {
+    taken: AtomicBool,
+    store: UnsafeCell<Store<SERVER_BLOCKS>>,
+}
+
+// SAFETY: the store is reached only through `take`, which lets one caller past, ever.
+unsafe impl Sync for OnceStore {}
+
+impl OnceStore {
+    /// A store not yet taken.
+    pub const fn new() -> OnceStore {
+        OnceStore { taken: AtomicBool::new(false), store: UnsafeCell::new(Store::new()) }
+    }
+
+    /// The store, the first time it is asked for; `None` after.
+    #[allow(clippy::mut_from_ref, reason = "the one `&mut` there is, handed out once")]
+    pub fn take(&'static self) -> Option<&'static mut Store<SERVER_BLOCKS>> {
+        if self.taken.swap(true, Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: the swap lets one caller past, ever, so this is the only reference the store has.
+        Some(unsafe { &mut *self.store.get() })
+    }
+}
+
+impl Default for OnceStore {
+    fn default() -> OnceStore {
+        OnceStore::new()
     }
 }
 
@@ -177,6 +211,16 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    /// **A server's store is handed out once**: a second `&mut` to it would alias the first.
+    #[test]
+    fn a_store_is_taken_once() {
+        static STORE: OnceStore = OnceStore::new();
+        let store = STORE.take().expect("the first take");
+        store.tags[0] = 7;
+        assert!(STORE.take().is_none(), "the second take");
+        assert_eq!(store.tags[0], 7);
+    }
 
     /// An image in memory that counts the reads and writes reaching it.
     struct Device {

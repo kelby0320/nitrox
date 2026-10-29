@@ -164,7 +164,7 @@ Phase 6 Part H). Its zeroes are `TODO(grow-zeroes)`:
   `.` naming it, and refuses `NotFound` otherwise. **That check cannot see the cluster reused** by
   a new directory, which begins with its own `.`. So `rmdir` gives the protocol the id before it
   changes anything, and the protocol ends every session holding it (`libfsserver`'s
-  `end_sessions_on`), whether the removal then succeeds or not: the client's next request meets
+  `Sessions::end_on`), whether the removal then succeeds or not: the client's next request meets
   `PeerClosed`.
 - **A rename** writes the new name first — new entries, or a replaced file's entry pointed at the
   source — then a moved directory's `..`, then deletes the old name, so a crash leaves the file
