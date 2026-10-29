@@ -37011,17 +37011,20 @@ keeps failing (rt-d12), the condition the 2026-10-27 entry sets for a crate movi
 
 Groups X and Y of the survey's triage, the shell and the test harness, made six decisions:
 
-- **A terminal's backend is a channel end with `SEND`, `RECV` and `WAIT`**, and anything else is
-  refused, `InvalidArgument` for another object and `NoAccess` for a missing right, and closed.
-  tty-server waits on every backend beside every terminal it serves, so one it could not wait on
-  failed every wait of its loop, and the console with it (sh-d1). The backend a re-attach leaves is
+- **A terminal's backend is a channel end with `SEND`, `RECV`, `WAIT` and `INSPECT`**, and
+  anything else is refused, `InvalidArgument` for another object and `NoAccess` for a missing
+  right, and closed. tty-server waits on every backend beside every terminal it serves, so one it
+  could not wait on failed every wait of its loop, and the console with it (sh-d1); it learns what
+  it was given by a stat, which needs `INSPECT`, so a backend without it is refused too. The backend a re-attach leaves is
   closed, which is how its emulator learns its terminal has gone (sh-d5).
 - **profile-server strips the rights that write a file from what a client asks**, rather than
   narrowing the request to the rights a program needs. The kernel installs what a userspace
   server's reply carries, and the store is on `init`'s writable mount, so any session could map a
   system binary writable (sh-d2). An allow-list was tried first and broke `copy` of a program:
   what a client asks for says what it wants, a directory session (`SEND | RECV | WAIT`) is refused
-  on a file, and the narrowed request found the file instead. check-storage alone caught it.
+  on a file, and the narrowed request found the file instead. check-storage alone caught it. A
+  process holding the root namespace can still resolve a store path writable: a binding's rights
+  cannot cap a userspace server's reply, which is `TODO(mount-write-authority)`'s case.
 - **Every forwarded resolve is answered.** A reply the kernel refuses closes what it carried and is
   followed by the send's error, in profile-server's files and directory sessions and tty-server's
   terminal opens, and on the same path tty-server's `OpenSibling`: a forwarded resolve has no
@@ -37029,7 +37032,8 @@ Groups X and Y of the survey's triage, the shell and the test harness, made six 
 - **A directory is not a file to `libfs::file_size`**, as its doc said, and `read_file` looks a
   file up once, so a table served fresh at each lookup cannot change size between the two. nxsh's
   `open` and `save` go through it (sh-o6): a shorter save shrinks the file, an empty one saves, and
-  `open` refuses a file over `MAX_COPY`.
+  `open` refuses a file over `MAX_COPY`. A save writes a temporary and renames it over the file,
+  nxedit's way, now `libfs::save_file`, so one that fails leaves the file as it was.
 - **boot-probe's root device reads whole pages from a page boundary, to the device's end**, rather
   than asking the device's block size: `/dev/disk/by-partlabel/<label>` is bound to the device
   node itself, so no `info` resolves under it, and a power-of-two block no larger than a page

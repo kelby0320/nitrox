@@ -1443,6 +1443,11 @@ at its server, whoever resolves through it, and `init.toml`'s `"ro"` sets it. Wh
 the case the flag cannot express: one writable mount reached read-only by some processes and
 writable by others, which needs authority on the binding rather than the server.
 
+**The store is that case today** (2026-10-28). It is on the root filesystem's one writable mount,
+so `profile-server` strips the rights that write a file from every lookup it forwards, which keeps
+a program read-only through `/bin` and `/applications`; a process holding the root namespace, as a
+service spawned with it does, can still resolve `/store/...` with `MAP_WRITE` and map it so.
+
 **Per-stage attribution in `PipelineStatus` — `TODO(pipeline-stage-attribution)`.**
 §1 makes `PipelineStatus` a headline: a composite exit status with one `StageStatus` per stage, in
 pipeline order, so a script can ask *which* stage failed rather than making do with a bash-style

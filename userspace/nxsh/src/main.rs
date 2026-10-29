@@ -445,8 +445,8 @@ impl Host for NitroxHost {
 
     /// Replace `path` with `bytes` (`save`).
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        libfs::write_file(self.namespace, path.as_bytes(), bytes).map_err(|e| match e {
-            libfs::FileError::TooLarge => alloc::format!("`{path}` is too large to save"),
+        libfs::save_file(self.namespace, path.as_bytes(), bytes).map_err(|e| match e {
+            libfs::SaveError::Write(libfs::FileError::TooLarge) => alloc::format!("`{path}` is too large to save"),
             _ => alloc::format!("cannot save `{path}`"),
         })
     }

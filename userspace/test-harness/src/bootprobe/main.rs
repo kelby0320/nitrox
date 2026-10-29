@@ -42,6 +42,7 @@ mod accounts;
 mod authority;
 mod deadlines;
 mod exits;
+mod filelib;
 mod files;
 mod gates;
 mod policy;
@@ -57,6 +58,7 @@ use accounts::*;
 use authority::*;
 use deadlines::*;
 use exits::*;
+use filelib::*;
 use files::*;
 use gates::*;
 use policy::*;
@@ -211,6 +213,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & copy_into_itself_test(root_ns)
         & file_cache_test(root_ns)
         & unlinked_file_test(root_ns)
+        & libfs_refuses_a_directory_and_a_large_file_test(root_ns)
+        & save_leaves_the_file_when_it_fails_test(root_ns)
         & flush_test(root_ns)
         & block_bounds_test(root_ns)
         & dot_entries_test(root_ns)

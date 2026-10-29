@@ -220,7 +220,7 @@ pub fn unpadded(bytes: &[u8]) -> &[u8] {
 /// Write `bytes` to `path`, replacing whatever was there, shrinking first as [`copy_file`] does.
 ///
 /// Not a safe save: a failure after the truncate leaves a file shorter than both versions.
-/// Write a temporary and [`rename`] it instead.
+/// [`save_file`] is one.
 pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     let size = bytes.len() as u64;
     if size > MAX_COPY {
@@ -259,6 +259,36 @@ pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
     if synced != 0 {
         return Err(FileError::Io(synced as i32));
+    }
+    Ok(())
+}
+
+/// The suffix of [`save_file`]'s temporary. Beside the file it replaces, as a rename is only
+/// atomic within one filesystem.
+pub const SAVE_SUFFIX: &str = ".save-tmp";
+
+/// Which step of [`save_file`] failed; either way the file is as it was.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SaveError {
+    /// The temporary could not be written.
+    Write(FileError),
+    /// The temporary could not be renamed over the file.
+    Replace(FileError),
+}
+
+/// Replace the file at `path` with `bytes` the safe way: a temporary beside it, written whole,
+/// then renamed over it. A failure at either step leaves `path` as it was and removes the
+/// temporary, so no file is left holding neither version.
+pub fn save_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), SaveError> {
+    let mut temp = path.to_vec();
+    temp.extend_from_slice(SAVE_SUFFIX.as_bytes());
+    if let Err(e) = write_file(ns, &temp, bytes) {
+        let _ = unlink_at(ns, &temp);
+        return Err(SaveError::Write(e));
+    }
+    if let Err(e) = rename(ns, &temp, path, true) {
+        let _ = unlink_at(ns, &temp);
+        return Err(SaveError::Replace(e));
     }
     Ok(())
 }

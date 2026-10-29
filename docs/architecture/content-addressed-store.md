@@ -63,9 +63,16 @@ needs fs-server RW + the package manager, both deferred.)
 
 ## Immutability is a namespace-rights property
 
-The store is immutable, but not via a filesystem "immutable" flag. **Immutability is
+The store is immutable, but not via a filesystem "immutable" flag. **Immutability is to be
 enforced at the namespace level** — the same "policy lives in namespace bindings"
-pattern as [supervisor-mediated registration](../rationale/why-supervisor-registration.md):
+pattern as [supervisor-mediated registration](../rationale/why-supervisor-registration.md).
+
+**Today it is enforced by the profile server alone.** A binding's rights do not cap what a
+userspace server's reply carries (`TODO(mount-write-authority)`), and the root filesystem is one
+writable mount, so `profile-server` strips the rights that write a file from every lookup it
+forwards ([`profiles-and-namespace-projection.md`](profiles-and-namespace-projection.md)). That
+keeps a program read-only through `/bin` and `/applications`; a process holding the root
+namespace can still resolve a store path writable. The design below is what the deferral builds:
 
 - **Every normal process's namespace binds `/store` with `LOOKUP | READ | MAP_READ`
   — but not `WRITE` or `MAP_WRITE`.** The kernel attenuates rights at lookup time

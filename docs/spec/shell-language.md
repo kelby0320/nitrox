@@ -337,7 +337,9 @@ pipeline model to begin with. Format inferred from extension (`.csv`, `.json`, `
 **Text ends at its last character that is not a NUL** (PR #371 review): a snapshot such as the
 kernel's `/dev/log` is read whole, its last page padded with NULs, which were a last line of them.
 **`save` replaces what the file held**, a shorter value shrinking it and an empty one leaving it
-empty. **`open` reads a file of at most 8 MiB**, `libfs`'s `MAX_COPY`, and refuses a larger one.
+empty: it writes a temporary beside the file and renames it over, so a save that fails leaves the
+file as it was. **`open` and `save` take a file of at most 8 MiB**, `libfs`'s `MAX_COPY`, and
+refuse a larger one.
 
 **`open` accepts multiple paths, concatenating them into one stream** — `open a.txt b.txt`. This
 absorbs `cat`'s job entirely (§10a); "open these paths as one stream" is a more natural reading of

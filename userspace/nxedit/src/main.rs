@@ -39,10 +39,6 @@ static ALLOC: libheap::Heap = libheap::Heap;
 
 const BUFFERS: usize = 2;
 
-/// The suffix a save's temporary carries. Beside the target, as a rename is only atomic
-/// within one filesystem.
-const TEMP_SUFFIX: &str = ".nxedit-tmp";
-
 fn fail(msg: &[u8]) -> ! {
     kprint(msg);
     // SAFETY: under the test-harness kernel this terminates QEMU; elsewhere it is
@@ -97,22 +93,14 @@ fn window_title(path: &str) -> &str {
     if path.is_empty() { "untitled" } else { libfs::basename_str(path) }
 }
 
-/// Write `bytes` to `path` the safe way: a temporary beside it, then a rename over it.
-///
-/// A failure at either step leaves the target as it was and removes the temporary, so no stray
-/// file sits beside the one being edited. The error is the sentence the status strip shows.
+/// Write `bytes` to `path` with [`libfs::save_file`]. The error is the sentence the status strip
+/// shows.
 fn save(ns: u64, path: &str, bytes: &[u8]) -> Result<usize, &'static str> {
-    let mut temp = String::from(path);
-    temp.push_str(TEMP_SUFFIX);
-    if libfs::write_file(ns, temp.as_bytes(), bytes).is_err() {
-        let _ = libfs::unlink_at(ns, temp.as_bytes());
-        return Err("the file could not be written");
+    match libfs::save_file(ns, path.as_bytes(), bytes) {
+        Ok(()) => Ok(bytes.len()),
+        Err(libfs::SaveError::Write(_)) => Err("the file could not be written"),
+        Err(libfs::SaveError::Replace(_)) => Err("the file could not be replaced"),
     }
-    if libfs::rename(ns, temp.as_bytes(), path.as_bytes(), true).is_err() {
-        let _ = libfs::unlink_at(ns, temp.as_bytes());
-        return Err("the file could not be replaced");
-    }
-    Ok(bytes.len())
 }
 
 fn wait_one(h: u64) {

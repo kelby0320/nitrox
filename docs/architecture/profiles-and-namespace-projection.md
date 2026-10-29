@@ -31,7 +31,7 @@ The projected set is a fixed list in the server, not "whatever a package happens
 package is data, and what appears in a namespace is policy.
 
 The **system profile** is projected at `/bin`
-from a manifest over the read-only store by `userspace/profile-server`, which `init`
+from a manifest over the store by `userspace/profile-server`, which `init`
 spawns and whose endpoint it hands to `service-mgr`. Per-user profile overlays, runtime
 generation switching, and rollback are designed here but **not built**. Verified 2026-08-05.
 
@@ -51,16 +51,16 @@ adding one line to a manifest; the projected `/bin` updates as a consequence.
 A profile server is a **userspace resource server** (like the fs-server):
 
 - It **loads a profile manifest** (TOML — see [Manifest schema](#manifest-schema)).
-- It holds a **read handle to the store** (a namespace handle that resolves `/store`,
-  granted by the supervisor at spawn).
+- It holds **`init`'s root namespace**, through which it resolves the store, on the root
+  filesystem's writable mount; what keeps a program read-only is the server itself (below).
 - It **responds to forwarded lookups** by resolving into the store and returning a
   handle (a "forwarding address" into the store, exactly like the fs-server's
   forwarding — see [namespace-and-resource-servers](namespace-and-resource-servers.md)).
 - It is **bound into a namespace by a supervisor** (init for the system profile;
   session-mgr layers user profiles later). It **never self-registers** and does **not**
   hold `BIND_NAMESPACE` (it consumes namespace, it doesn't construct it).
-- It performs **no access control**. Security is in namespace construction — which
-  profile a process's namespace includes, and with what rights, is decided when the
+- It performs **no access control** beyond keeping the store read-only. Security is in
+  namespace construction — which profile a process's namespace includes is decided when the
   namespace is built, not by the profile server.
 
 ### The index

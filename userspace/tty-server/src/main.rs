@@ -299,21 +299,22 @@ fn open_tty(serve_end: u64, request_id: u64, reg: &mut Registry) {
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
     // SAFETY: REPLY_MSG is a valid buffer; the channel rides in handles[0].
     let sent = unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
-        else {
-            return;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = client_end;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            serve_end,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        )
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
+            Some(rs_len) => {
+                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+                REPLY_MSG[8] = 1;
+                REPLY_HANDLES[0] = client_end;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    serve_end,
+                    (&raw const REPLY_MSG) as u64,
+                    (&raw const REPLY_HANDLES) as u64,
+                    1,
+                    SENDMODE_NOBLOCK,
+                )
+            }
+            None => KError::KernelError.as_i32() as i64,
+        }
     };
     if sent == 0 {
         reg.open(server_end);
@@ -378,7 +379,7 @@ fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
             .end();
     } else {
         // The client end never moved, so nobody can use the terminal: take it back out, and
-        // say so, or the shell waits for its stage's terminal for good.
+        // say so. A ring too full for the reply drops this too, and the shell keeps waiting.
         reg.close(server_end);
         close(client_end);
         close(server_end);
@@ -394,12 +395,12 @@ fn close(h: u64) {
     }
 }
 
-/// What the kernel says of handle `h`. `None` if this process holds no such handle.
-fn stat(h: u64) -> Option<HandleInfo> {
+/// What the kernel says of handle `h`, or the stat's error.
+fn stat(h: u64) -> Result<HandleInfo, i64> {
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a writable `HandleInfo`, the layout the kernel writes.
     let r = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
-    (r == 0).then_some(info)
+    if r == 0 { Ok(info) } else { Err(r) }
 }
 
 /// Free terminal `i`: close its endpoint and drop it.
@@ -455,8 +456,10 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
             // Succeeding silently with no handle would leave the emulator waiting for output that
             // goes to the console.
             let refused = match stat(handle) {
-                Some(info) => backend_refusal(info.object_type, info.rights),
-                None => Some(KError::InvalidArgument),
+                Ok(info) => backend_refusal(info.object_type, info.rights),
+                // Without `INSPECT` the server cannot see what it was given, so cannot take it.
+                Err(e) if e == KError::NoAccess.as_i32() as i64 => Some(KError::NoAccess),
+                Err(_) => Some(KError::InvalidArgument),
             };
             if let Some(e) = refused {
                 close(handle);

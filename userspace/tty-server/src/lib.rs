@@ -23,9 +23,9 @@ pub mod routing {
         OP_TTY_SET_MODE as OP_SET_MODE, OP_TTY_WRITE as OP_WRITE,
     };
 
-    /// Why a handle of `object_type` with `rights` cannot be a terminal's backend, if it cannot.
-    /// The server sends output on it, receives input from it, and waits on it beside every other
-    /// handle it serves, so one it cannot wait on fails every wait of the loop.
+    /// Why a handle of `object_type` with `rights` cannot be a terminal's backend, if it cannot:
+    /// the server sends on it, receives from it and waits on it beside every handle it serves,
+    /// and learns what it is by a stat, which needs `INSPECT`.
     pub fn backend_refusal(object_type: u32, rights: u64) -> Option<KError> {
         use libkern::handle::{KOBJ_IPC_CHANNEL, RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
         const NEEDED: u64 = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT;

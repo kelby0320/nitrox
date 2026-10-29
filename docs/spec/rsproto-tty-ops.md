@@ -113,11 +113,13 @@ grouping, and `Ctrl-C` typed in one window has no business interrupting a progra
 
 ### `AttachBackend` (`0x0B06`)
 
-Request: empty body, **one moved handle** — a channel whose far end the sender keeps. Reply:
-empty on success; `InvalidArgument` if no handle was moved or it is not a channel end, `NoAccess`
-if it lacks `SEND`, `RECV` or `WAIT`, and `NotFound` if the terminal is gone. A refused handle is
-closed. The server sends output on the channel, receives input from it, and waits on it beside
-every terminal it serves, so one it could not wait on would fail every wait of its loop.
+Request: empty body, **one moved handle** — a channel whose far end the sender keeps, with
+`SEND`, `RECV`, `WAIT` and `INSPECT`. Reply: empty on success; `InvalidArgument` if no handle was
+moved or it is not a channel end, `NoAccess` if it lacks one of the four rights, and `NotFound` if
+the terminal is gone. The handle is checked first, so a gone terminal sent a bad one answers for
+the handle. A refused handle is closed. The server sends output on the channel, receives input
+from it, and waits on it beside every terminal it serves, so one it could not wait on would fail
+every wait of its loop; it learns what it was given by a stat, which needs `INSPECT`.
 
 From then on the terminal's output arrives on that channel as `Output`, and its input is whatever
 comes back as `Input`, instead of the serial console.
@@ -156,9 +158,10 @@ terminal waiting on it, `Ctrl-C` goes to every one, and each has its own echo se
 password prompt that turns echo off on a sibling leaves the terminal it was minted from echoing.
 
 Refused with `WouldBlock` when the server has no terminal to spare. Every terminal is a slot in
-the server's wait set, and the cap is the resolve's. A reply that cannot carry the channel is
-answered with the send's error instead, and no terminal is made. A shell answers the refusal by running the
-stage without a terminal, which is what every stage had before this op.
+the server's wait set, and the cap is the resolve's. A shell answers the refusal by running the
+stage without a terminal, which is what every stage had before this op. A reply that cannot carry
+the channel is answered with the send's error instead, and no terminal is made; a ring too full
+for the reply is too full for the error, which is lost with it.
 
 ### `Token` (`0x0B0A`)
 
