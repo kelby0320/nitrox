@@ -4026,7 +4026,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
 
 **Defects**
 
-- [ ] **fs-d1** `userspace/fs-server-ext4/src/ext4.rs:870` — Block and inode bitmaps are indexed
+- [x] **fs-d1** `userspace/fs-server-ext4/src/ext4.rs:870` — Block and inode bitmaps are indexed
   by a bit number bounded by s_blocks_per_group / s_inodes_per_group. `parse_superblock`
   (ext4.rs:292-303) never checks those against the 8*block_size bits a bitmap block holds, and
   only `bitmap[..bs]` of the 4 KiB `[0u8; MAX_BLOCK]` scratch is read or written back. A bit past
@@ -4049,8 +4049,15 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   `map_file` gave both `[BlockRun { file_block: 0, device_lba: 8193, length: 1 }]`, one block
   given to two files, and group 1's first block, which the grow also zeroed. Run with
   `cd userspace && cargo test -p fs-server-ext4 --lib probe_ -- --nocapture`. abi. High. **Fix.**
+  Fixed in `8bd6f2d1`: the superblock is refused, as Linux refuses it, for a group of more blocks or
+  inodes than a bitmap block has bits, or an inode count the groups do not hold; a `Bitmap` over the
+  bytes read answers `Corrupt` past them (fs-o2); and the class swept, an inode number past
+  `s_inodes_count` is `Corrupt`. Fails without it: `a_group_wider_than_its_bitmap_block_is_refused`
+  (the survey's two geometries, a panic at 4 KiB and block 8193 to both files at 1 KiB on the old
+  code), `a_superblock_is_held_to_its_groups_at_each_edge`, `a_bitmap_bit_past_its_block_is_corrupt`
+  and `a_record_naming_an_inode_past_the_last_is_corrupt`, each with only its own guard removed.
 
-- [ ] **fs-d2** `userspace/fs-server-ext4/src/ext4.rs:296` — The group-descriptor stride is read
+- [x] **fs-d2** `userspace/fs-server-ext4/src/ext4.rs:296` — The group-descriptor stride is read
   from s_desc_size even though 64bit is refused. Linux and e2fsprogs use 32 whenever 64bit is off
   (`EXT2_DESC_SIZE`). On a filesystem with s_desc_size nonzero and 64bit off, every descriptor
   offset after group 0 (`read_inode`, `inode_offset`, `group_desc_offset`) disagrees with every
@@ -4066,8 +4073,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   returned Ok with inode 129, already a file's. e2fsck afterwards, s_desc_size reset to 0: 'Inode
   129 ref count is 1, should be 2' and 'Unattached zero-length inode 257'. Fix: desc_size = 32
   while 64bit is refused. abi. Medium. **Fix.**
+  Fixed in `997d1ed0`: a descriptor is 32 bytes while `64bit` is refused. Fails without it:
+  `descriptors_are_32_bytes_apart_without_64bit` (s_desc_size 64 after 200 creates: `/f190` read
+  `NotFound` on the old code).
 
-- [ ] **fs-d3** `userspace/fs-server-ext4/src/extent.rs:685` — That each tree block has one parent
+- [x] **fs-d3** `userspace/fs-server-ext4/src/extent.rs:685` — That each tree block has one parent
   is held only by convention. `cut()` and `free_tree()` walk and free a child once per index
   entry that names it, so a block named by several entries is freed repeatedly, and the work
   multiplies by up to block_cap (340 at 4 KiB) at each level. At depth 5 that is about
@@ -4083,8 +4093,16 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   one walk per naming entry. Each further level multiplies by its node's entry count; `header()`
   allows depth 5. A depth-2 tree (one index block of 340 entries naming one leaf) would settle
   the full blowup, expected ~1360x. abi. Medium. **Fix.**
+  Fixed in `150ec40a`: every node a cut reads has its keys rising inside the range its parent's
+  entry gives it, the root's inside all of them, and an empty node is not freed, so a block holding
+  entries has one place in the tree. Fails without it:
+  `a_leaf_named_by_four_entries_is_corrupt_to_cut` (156 writes against 39 on the old code),
+  `a_leaf_named_by_every_entry_of_an_index_block_is_corrupt_to_cut` (3,279 against 41),
+  `a_leaf_named_below_its_keys_is_corrupt_to_cut`,
+  `an_empty_leaf_named_twice_is_not_freed_while_named` and
+  `a_root_whose_keys_do_not_rise_is_corrupt_to_cut`, each with only its own guard removed.
 
-- [ ] **fs-d4** `userspace/libfsserver/src/disk.rs:37` — `po_wait` closes the PendingOperation
+- [x] **fs-d4** `userspace/libfsserver/src/disk.rs:37` — `po_wait` closes the PendingOperation
   and returns (-1, 0) whenever `sys_wait` returns anything other than one signalled record,
   without the I/O having completed. `Disk`, `SectorDisk` and `PartitionIo` then return
   `FsError::Io` and reuse the same scratch MemoryObject for the next transfer, while the
@@ -4107,8 +4125,13 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   syscalls (as libos/src/sys.rs has) whose wait returns TimedOut once would settle it: the next
   submit would name the same scratch. Path: disk.rs:19-38, :106-108, :245-247, then
   cache.rs:115-119. soundness, opportunities. Medium. **Fix.**
+  Fixed in `9630a10c` (delegated): `po_wait` answers `None` for a failed wait, and a disk's
+  `Scratch` that sees one is lost, copying nothing into it and submitting nothing through it again;
+  nxinstall's buffer is a `Scratch` too. Fails without it: disk/tests.rs, through a syscall seam: a
+  wait failing on each disk and on `Disk`'s zeroes, then nothing submitted and the scratch as it
+  was.
 
-- [ ] **fs-d5** `userspace/libfsserver/src/server.rs:992` — `server::run` and `server::bootstrap`
+- [x] **fs-d5** `userspace/libfsserver/src/server.rs:992` — `server::run` and `server::bootstrap`
   (server.rs:979) are safe `pub fn`s, but they reach the eleven process-global `static mut`
   buffers (RECV_MSG, REPLY_MSG, REPLY_HANDLES, FORGET_MSG, CONTENT, WAIT_*, SESSION_*, CONTROL,
   DIR_BODY), and every SAFETY argument rests on 'single-threaded'. Nothing in their signatures
@@ -4127,8 +4150,12 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   syscall, and Miri cannot run syscalls. Making both `unsafe fn` with a one-thread contract, or
   handing the buffers out once through an AtomicBool-guarded take with a host test that a second
   take is refused, would settle it. ownership, soundness. Medium. **Fix.**
+  Fixed in `4eb4e046`, with fs-o1: the loop's state is one `Server` on `run`'s stack and a request
+  is borrowed from its inbox, so server.rs has no `static mut` and the borrow checker forbids a
+  receive while a request lives. Structural, so no runtime control; test-qemu serves the root
+  filesystem through it.
 
-- [ ] **fs-d6** `userspace/fs-server-ext4/src/ext4.rs:547` — A directory session's ReadDir cursor
+- [x] **fs-d6** `userspace/fs-server-ext4/src/ext4.rs:547` — A directory session's ReadDir cursor
   is supplied by the client (server.rs:625) and used as a raw byte offset into the directory,
   checked only against the block's bounds, not the record grid. Bytes at a non-record offset,
   such as the inside of a name the client chose, are parsed as a record and their inode is
@@ -4142,8 +4169,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   emitted `[(14, 33204, 21, [88])]`: inode 14, mode 0o100664, size 21, name "X". Fix: validate
   the cursor by walking its block from offset 0 to it, or encode it as a block plus record
   index. abi. Low. **Fix**, raised to Medium.
+  Fixed in `d4bd688a`: a cursor inside a block resumes at the first record at or past it, found from
+  the block's start, as Linux's readdir does. Fails without it:
+  `a_cursor_inside_a_record_resumes_at_the_next` (the survey's name read `[14]` on the old code).
 
-- [ ] **fs-d7** `userspace/fs-server-ext4/src/ext4.rs:1136` — Names entering ext4 through a
+- [x] **fs-d7** `userspace/fs-server-ext4/src/ext4.rs:1136` — Names entering ext4 through a
   session are checked only for '/', '.' and '..' (libfsserver's `entry_name`, serve.rs:20, plus
   ext4's own '/' and length checks in `dir_insert`, `mkdir_at`, `create_file`). A name containing
   NUL bytes is written to disk, and e2fsck and Linux call it illegal. FAT's `names::valid`
@@ -4153,8 +4183,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   Demonstrated: same probe as fs-d6: `mkdir_at(box, <name with three 0x00 bytes>)` returned Ok;
   `e2fsck -fn` printed "Entry '^N^@^@^@^L^L^A^AXYZW' in /box (15) has illegal characters in its
   name. Fix? no". abi. Low. **Fix.**
+  Fixed in `f632efcb`: a create, a `mkdir` and a rename's new name refuse a control character, NUL
+  among them, as FAT does. Fails without it: `a_name_with_a_control_character_is_not_written`, at
+  each of the three writers.
 
-- [ ] **fs-d8** `userspace/libfsserver/src/disk.rs:76` — If a later step fails, `Disk::new` and
+- [x] **fs-d8** `userspace/libfsserver/src/disk.rs:76` — If a later step fails, `Disk::new` and
   `SectorDisk::new` leak what they have already made. Neither has a `Drop`, so a dropped one
   keeps its scratch memory object and mapping (and `Disk` its 64 KiB zero span) for the life of
   the process. `PartitionIo`, beside them, does both properly. `Disk::new`: if SYS_MEMORY_MAP
@@ -4170,8 +4203,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   whereas `PartitionIo::new` (350-354) closes its scratch when the map fails. Of 4 maps in
   libfsserver, the two never unmapped are `Disk`'s and `SectorDisk`'s. Not host-testable: each
   constructor's first statement is a syscall. ownership. Low. **Fix.**
+  Fixed in `9630a10c` (delegated): `Scratch` owns its object and mapping and gives both back on
+  drop, and `Disk` closes its zero span. Fails without it: disk/tests.rs's failed-create and drop
+  tests.
 
-- [ ] **fs-d9** `userspace/libfsserver/src/server.rs:607` — `serve_session` copies a session
+- [x] **fs-d9** `userspace/libfsserver/src/server.rs:607` — `serve_session` copies a session
   request body into a 600-byte stack buffer and silently cuts a longer one. A single-name op
   whose name is over 598 bytes, or a rename whose two names total over 596, then fails its
   length-prefixed parse and is answered Unsupported. Yet `entry_name`'s doc (serve.rs:17-19) says
@@ -4186,8 +4222,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   reproduced the copy and parse, then called `Fat::mkdir_at`; `cargo test -p fs-server-fat --lib
   probe_session_body_cap -- --nocapture` printed `PROBE: 699-byte name: session parse None,
   Fat::mkdir_at Ok, listed true, fsck clean`. opportunities. Low. **Fix.**
+  Fixed in `4eb4e046`: a session's request is answered by `serve::session` from the message as
+  received, with no copy. Fails without it: `a_session_takes_a_name_as_long_as_a_fat_holds` (a
+  699-byte name made, renamed and removed; refused with the 600-byte cut back).
 
-- [ ] **fs-d10** `userspace/libfsserver/src/server.rs:339` — `try_resolve_directory` clamps a
+- [x] **fs-d10** `userspace/libfsserver/src/server.rs:339` — `try_resolve_directory` clamps a
   suffix longer than MAX_SUFFIX to its first 1024 bytes and resolves that as a directory, while
   `serve::resolve` (serve.rs:149), `try_resolve_rename` and `apply_size` refuse or skip the same
   request as too long. The two guards disagree; today only the kernel's NS_PATH_MAX (1024, equal
@@ -4197,10 +4236,13 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   cut mid-component, inside the same binding, where `resolve()` would answer TooLarge.
   Unverified: not reachable today. Moving the decode into a pure function and testing a 1100-byte
   suffix, or a kernel change that lengthens the path, would settle it. abi. Low. **Fix.**
+  Fixed in `4eb4e046`: `serve::directory_open` opens no session for a suffix over `MAX_SUFFIX`,
+  which `serve` refuses `TooLarge`. Fails without it: `a_suffix_past_the_longest_opens_no_directory`
+  (with the clamp back, a 1,100-byte suffix opened its cut sibling).
 
 **Opportunities**
 
-- [ ] **fs-o1** encapsulate: the serve loop's state lives in 11 process-global `static mut`s
+- [x] **fs-o1** encapsulate: the serve loop's state lives in 11 process-global `static mut`s
   (RECV_MSG, REPLY_MSG, REPLY_HANDLES, FORGET_MSG, CONTENT, WAIT_HANDLES, WAIT_RESULTS,
   SESSION_CH, SESSION_DIR, CONTROL, DIR_BODY) plus each binary's `static mut STORE`. Each access
   is its own `unsafe` block argued 'single-threaded', `received()` lends a `&'static [u8]` over
@@ -4221,8 +4263,10 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   payload still borrowed, two live `&mut` to one static, a second `&mut` to STORE, and safe
   `run`/`bootstrap` causing UB (fs-d5). Depends on: nothing. abi, ownership, soundness,
   opportunities. Value high, effort medium. **Fix.**
+  Fixed in `4eb4e046`: one `Server`, made by `run` on its stack, an `Inbox` and a `State` of
+  endpoints, outboxes, buffers and sessions, in place of eleven `static mut`s.
 
-- [ ] **fs-o2** narrow: ext4 bitmaps live in a `[0u8; MAX_BLOCK]` scratch of which only `[..bs]` is
+- [x] **fs-o2** narrow: ext4 bitmaps live in a `[0u8; MAX_BLOCK]` scratch of which only `[..bs]` is
   read and written back, but `bit_clear`, `bit_set` and `bit_unset` index the whole scratch with
   a bit number derived from the disk — 9 sites (`grep -nE 'bit_(clear|set|unset)\('
   userspace/fs-server-ext4/src/ext4.rs`, excluding the definitions and test-only `block_in_use`,
@@ -4234,6 +4278,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   superblock geometry check like Linux's. Checked against `alloc_run`, `alloc_inode`, `free_run`
   and `free_inode`. Closes: a bitmap bit indexed past the bytes read from disk (fs-d1). Depends
   on: nothing. abi. Value high, effort small. **Fix.**
+  Fixed in `8bd6f2d1`, with fs-d1: `Bitmap`, held by `a_bitmap_bit_past_its_block_is_corrupt`.
 
 - [ ] **fs-o3** remove: a device transfer is a raw `SYS_IO_SUBMIT` followed by a hand-rolled
   `po_wait` that decodes IoResult status@8 and result@16 by byte offset, closes whatever u64 it
@@ -4381,7 +4426,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   inhabit (an enum, a NonZero, a reference) turning all three sites into UB with no compile
   error. Depends on: nothing. abi, soundness. Value low, effort small. **Later.**
 
-- [ ] **fs-o11** narrow: each server's 1 MiB `static mut STORE` is reached once by
+- [x] **fs-o11** narrow: each server's 1 MiB `static mut STORE` is reached once by
   `&mut *(&raw mut STORE)`, justified only by '_start runs once'; these are the only `unsafe`
   blocks in either server crate — 2 sites here (`grep -rn '&mut \*(&raw mut'
   userspace/fs-server-ext4/src userspace/fs-server-fat/src`; 16 across userspace), such as
@@ -4391,6 +4436,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/fs-server-ext4 userspace/
   libos, or `libfsserver::cache::server_store()` for Store alone; subsumed if fs-o1 is taken.
   Closes: a second `&mut` to the same static, and the last `unsafe` in the two server crates.
   Depends on: nothing. ownership, opportunities. Value low, effort small. **Fix.**
+  Fixed in `4eb4e046`: each binary's store is a `cache::OnceStore`, its one `&mut` handed out once.
+  Fails without it: `a_store_is_taken_once`.
 
 What held up: the `unsafe` byte paths are sound. Every `recv` buffer is exactly the size the
 kernel writes (4096 bytes, at most 8 handle words in `Received`), and every send reads whole
@@ -4439,7 +4486,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
 
 **Defects**
 
-- [ ] **proto-d1** `userspace/nxsh/src/main.rs:292` — Every error return in
+- [x] **proto-d1** `userspace/nxsh/src/main.rs:292` — Every error return in
   `NitroxHost::run`/`run_pipeline` after the first `pipe()` leaks the handles the pipeline holds
   and leaves spawned stages blocked. The root cause is at the protocol boundary:
   `libstream::setup::send_setup_full` documents its handles as moved, but when it fails before the
@@ -4465,7 +4512,12 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   404-436, not by a boot; a boot would show the hung stage and the growing handle count.
   nxterm backend.rs:288-296 and view-broker main.rs:1484-1492 close everything in the same
   situation. Lenses: abi, ownership, soundness, opportunities. Medium. **Fix.**
-- [ ] **proto-d2** `userspace/libstream/src/wire.rs:532` — `read_value` recurses once per nesting
+  Fixed in `2991d0dc`, with sh-o4 and proto-o2: every pipe, spawn and duplicate nxsh makes is made
+  through `nxsh::pipeline::Pipeline`, whose drop closes what it still holds, then stops and waits
+  for every stage not reaped, and `send_setup_full` takes its handles on every return. Fails without
+  it: `a_start_failing_at_any_call_gives_everything_back` (each of a three-stage start's 20 calls
+  failing in turn) and `a_started_pipeline_gives_everything_back_left_or_reaped`.
+- [x] **proto-d2** `userspace/libstream/src/wire.rs:532` — `read_value` recurses once per nesting
   level (List -> `read_list` -> `read_value`; Record -> `Schema::decode` -> `read_row_values` ->
   `read_value`) with no depth limit, and dropping the decoded `Value` recurses the same way. A
   nested List costs 5 input bytes per level, and docs/spec/typed-stream-format.md:93 says lists
@@ -4484,7 +4536,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   bytes). What the target does with the fault needs a boot. Lenses: abi, ownership, soundness,
   opportunities. Medium (soundness rated it medium as latent-high; the other three low).
   **Fix**, with the bash's proto-7, moved here from Part H.
-- [ ] **proto-d3** `userspace/libstream/src/wire.rs:590` — The TSM1 decoder's memory use has no
+  Fixed in `10bcbb11` (delegated): the codec reads and writes at most 64 levels of `List` and
+  `Record`, refusing deeper `TooLarge`. Fails without it:
+  `a_very_deep_list_is_refused_without_overflowing_the_stack` (aborts on the old code),
+  `one_level_past_max_depth_is_refused_both_ways` and `records_and_lists_count_together`.
+- [x] **proto-d3** `userspace/libstream/src/wire.rs:590` — The TSM1 decoder's memory use has no
   bound relative to its input. A Null-typed column takes 0 bytes per row, yet each row allocates a
   `Vec<Value>` of `schema.fields.len()` entries at 32 bytes each, so one `REC_DATA` byte costs
   32 bytes times the column count. A stage writes a schema of 1,000 empty-named Null columns
@@ -4498,7 +4554,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   5,017-byte stream (1,000 Null columns, 1,000 one-byte rows) decoded to 1,000 x 1,000 `Value`s,
   at least 32,000,000 bytes, about 6,400 times the input. The system-wide effect needs a boot.
   Lenses: abi, soundness. Medium. **Fix**, with the bash's proto-8, moved here from Part H.
-- [ ] **proto-d4** `userspace/libgpt/src/table.rs:298` — `disk_blocks: alternate_lba + 1` adds a
+  Fixed in `10bcbb11` (delegated): a `ByteSource` yields at most its length plus 4,096 values. Fails
+  without it: `zero_byte_cells_cannot_outgrow_the_input` and `the_value_budget_is_exact`.
+- [x] **proto-d4** `userspace/libgpt/src/table.rs:298` — `disk_blocks: alternate_lba + 1` adds a
   field read from an untrusted disk with no overflow check: it panics where overflow checks are on
   and wraps `disk_blocks` to 0 where they are off. A stick whose GPT header has `alternate_lba =
   u64::MAX` and a recomputed header CRC is read by storage-service `read_table`
@@ -4512,7 +4570,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   libgpt/src/table.rs:298:22; release returned Ok with `disk_blocks = 0`. Lenses: abi,
   soundness, opportunities. Medium (abi rated it medium as latent; the others low).
   **Fix**, with the bash's proto-15, moved here from Part H.
-- [ ] **proto-d5** `userspace/libstream/src/setup.rs:314` — `send_setup_full` returns Err in two
+  Fixed in `10bcbb11` (delegated): `alternate_lba.checked_add(1)`, `Unsupported` on overflow. Fails
+  without it: `an_alternate_header_at_the_last_possible_block_is_unsupported_not_a_panic`.
+- [x] **proto-d5** `userspace/libstream/src/setup.rs:314` — `send_setup_full` returns Err in two
   opposite ownership states. Before the send (an encode error, or r < 0) the handles are still the
   caller's. After a committed `SENDMODE_BLOCK` send (waited < 1 at :314, or PO status < 0 at :318)
   the kernel has already closed them in the sender. Callers cannot tell the two apart and close
@@ -4525,7 +4585,12 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   `sys_channel_send` Block arm), and setup.rs:314-320 then returns Err. A fresh depth-4 setup
   channel takes the message as Sent, so the Queued-then-PeerClosed order needs a gate with a full
   ring and a stage that exits before the message is delivered. Lenses: soundness. Low. **Fix.**
-- [ ] **proto-d6** `userspace/libstream/src/channel.rs:114` — `ChannelReceiver::receive` appends
+  Fixed in `2991d0dc`: `send_setup_full` takes its handles by value and consumes them on every
+  return, closing them itself when the message could not be made or the kernel refused it; nxsh,
+  nxterm and the view broker close none. Fails without it: boot-probe's
+  `a_refused_setup_message_closes_its_handles_test` (test-qemu fails with the close removed). The
+  committed half, the double close, has no deterministic trigger; it ends because no caller closes.
+- [x] **proto-d6** `userspace/libstream/src/channel.rs:114` — `ChannelReceiver::receive` appends
   every message to one `Vec` until the producer sends `last`, with no size limit. nxsh already
   replaced it with its own loop capped at MAX_CAPTURE (main.rs:361-412), which shows the cap
   belongs in this API. A producer that never finishes, piped into `clip --copy`
@@ -4534,7 +4599,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   Unverified: found by reading channel.rs:114-121 and clip.rs:215-229. A host test with a `MsgPort`
   whose `recv` never returns true plus a counting allocator would settle it, or a boot running
   `<endless producer> | clip --copy`. Lenses: abi, ownership, opportunities. Low. **Fix.**
-- [ ] **proto-d7** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes a field name's
+  Fixed in `10bcbb11` (delegated): `receive` takes a cap and fails `TooLarge` past it; clip and the
+  harness pass 1 MiB. Fails without it: `receive_stops_once_the_stream_passes_the_cap`.
+- [x] **proto-d7** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes a field name's
   length as `f.name.len() as u16` with no range check, then writes every byte of the name;
   `WireErrorRecord::encode` does the same with `field_name` at :733. A name of 65,536 bytes or
   more is framed with a wrapped length, and the reader parses the rest of the name as further
@@ -4547,12 +4614,16 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   `\x04\x00\x01\x06\x00\x00\x00forged` decoded as one field named "ok" followed by a `REC_DATA`
   row `Ok([Str("forged")])`. Lenses: abi, soundness. Low.
   **Fix**, with the bash's proto-14, moved here from Part H.
-- [ ] **proto-d8** `userspace/librsproto/src/session.rs:158` — `Dir::rename` builds its request in
+  Fixed in `10bcbb11` (delegated): both encoders refuse a name over 65,535 bytes before writing.
+  Fails without it: the two `*_name_over_u16_is_refused_before_any_write` tests.
+- [x] **proto-d8** `userspace/librsproto/src/session.rs:158` — `Dir::rename` builds its request in
   a 512-byte buffer, but two names of the maximum 255 bytes need 2+255+2+255 = 514 bytes.
   `rename_request` (file.rs:384-387) returns None, so the rename fails client-side with
   `DirError::Protocol`. Only test-harness calls `Dir::rename` today; real moves go through
   `RESOLVE_RENAME`. Unverified: shown by arithmetic from the code; a host test renaming
   255-byte names would settle it. Lenses: abi. Low. **Fix.**
+  Fixed in `10bcbb11` (delegated): the buffer is `RENAME_REQUEST_MAX`. Fails without it:
+  `rename_request_takes_two_longest_names`.
 
 **Opportunities**
 
@@ -4581,7 +4652,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   closed by its new owner. Depends on: nothing (the `po_wait` wrapper in proto-o3 if it lands
   first). Lenses: abi, ownership, soundness, opportunities. Value high, effort medium.
   **Plan**, as sup-o2, in P7.
-- [ ] **proto-o2** encapsulate: `send_setup_full(channel, &Streams, Option<u64>, ...)` moves the
+- [x] **proto-o2** encapsulate: `send_setup_full(channel, &Streams, Option<u64>, ...)` moves the
   stream and terminal handles on success and leaves them with the caller on most failures. `Streams`
   is `Copy` over `Option<u64>` and `pipe()` returns `(u64, u64)`, so each caller restates the rule
   by hand and they disagree: nxsh closes only the terminal (proto-d1), nxterm closes the terminal,
@@ -4600,6 +4671,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   pass empty streams. Home: `libstream::setup`. Closes: the nxsh pipeline leak and the stale
   double close. Depends on: an owned-handle type (proto-o1's `Endpoint`, or libos). Lenses: abi,
   ownership, soundness, opportunities. Value high, effort medium. **Fix.**
+  Fixed in `2991d0dc`: the handles are taken by value and gone on every return. Owning handle types
+  are P7's (proto-o1), so `Streams` stays `Copy` until then.
 - [ ] **proto-o3** encapsulate: every syscall in the subsystem is a raw `syscallN` with a
   hand-built pointer, length and result buffer: WAIT x6 (each with a `[0u8; 24]` result decoded at
   bytes 8..12 and 16..24), HANDLE_CLOSE x6 (3 endpoints, 3 POs), NS_LOOKUP x3, CHANNEL_SEND x3,
@@ -5246,7 +5319,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `2af3c0df`, demonstrated first: a lookup of `/bin/list` asking for `MAP_WRITE` was
   granted it. The server drops `WRITE`, `MAP_WRITE`, `APPEND` and `TRUNCATE` from the request; an
   allow-list broke a program's `copy`. Fails without it: `store_is_read_only_test`.
-- [ ] **sh-d3** `userspace/nxsh/src/main.rs:297` — Host::run's early returns close nothing and
+- [x] **sh-d3** `userspace/nxsh/src/main.rs:297` — Host::run's early returns close nothing and
   stop nothing. Setup send refused after the spawn (292-297, closes only `terminal`), a capture
   over MAX_CAPTURE (417-418, skipping rx close 424, reap 427, err_rx close 432), a pipe `?` at
   241/245/246 and a spawn failure at 259 each leak every pipe, the diagnostic channel,
@@ -5262,6 +5335,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   encode returned Err(SetupTooLarge); `list <5000 x>` reached Host::run unchecked; paths read at
   the lines above; stranded processes and tty-server's terminal count need a boot to see.
   abi, ownership, soundness, opportunities. Medium. **Fix**, as proto-d1.
+  Fixed in `2991d0dc`, as proto-d1.
 - [x] **sh-d4** `userspace/tty-server/src/main.rs:624` — The console read's PendingOperation is
   never closed: each completed read sets `read_po = 0` and submits another, leaking one PO handle
   and kernel object per console read in an essential server that is never restarted. Every
@@ -5330,7 +5404,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `ee47c111`: both unmap the size they mapped. A kernel probe logging every unmap short of
   its mapping found none from `disk` in check-storage, whose format steps call `device_info`; no
   gate runs eshell. The probe found the rest of the class only in sup-d10's and sec-d9's sites.
-- [ ] **sh-d10** `userspace/nxsh/src/main.rs:294` — The SAFETY argument 'the send failed, so the
+- [x] **sh-d10** `userspace/nxsh/src/main.rs:294` — The SAFETY argument 'the send failed, so the
   terminal never moved; it is ours to close' is false when send_setup_full fails after its
   Block-mode send committed (the wait fails, or the PO completes PeerClosed because the stage
   closed its setup endpoint while the send was held). The handles have moved, and nxsh closes a
@@ -5338,6 +5412,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   harmless today only by that. Demonstrated: path pointed at (libstream setup.rs:293-320 returns
   Err after a committed send; syscall-abi.md § sys_channel_send; kernel ipc_channel.rs:605-620;
   handle-encoding.md § Generation counter). soundness. Low. **Fix**, as proto-d5.
+  Fixed in `2991d0dc`, as proto-d5: nxsh closes nothing a setup message took.
 - [ ] **sh-d11** `userspace/nxsh/src/main.rs:459` — Several sites form a Rust reference over a
   FileObject's shared page-cache mapping that another process may write at once: `&[u8]` in nxsh
   read_file (459) and read_head (stage.rs:102), eshell cmd_cat (206), profile-server
@@ -5431,7 +5506,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   PO_RESULTS after exactly this). Depends on: libos making its wait public; eshell stays on
   libkern. abi, ownership, soundness, opportunities. Value high, effort medium.
   **Plan**, as rt-o2, in P7.
-- [ ] **sh-o4** encapsulate: nxsh Host::run holds a dozen raw handles and a `Vec<u64>` of
+- [x] **sh-o4** encapsulate: nxsh Host::run holds a dozen raw handles and a `Vec<u64>` of
   children with cleanup written per path, missing on 6 exits — 6 sites (`sed -n 192,435p
   userspace/nxsh/src/main.rs | grep -n 'return Err\|)?;'` gives 8 exits; 2 come before any handle
   exists), at `userspace/nxsh/src/main.rs:245`, `userspace/nxsh/src/main.rs:259`,
@@ -5444,6 +5519,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Closes: handles and processes stranded by an early return (sh-d3) and the stale ChildExited
   they leave for the next reap. Depends on: nothing; sh-o1's handle type would shrink it.
   ownership, abi, opportunities. Value high, effort medium. **Fix.**
+  Fixed in `2991d0dc`: `nxsh::pipeline::Pipeline`, in the library half behind `pipeline::Sys` so it
+  is host-tested; the binary's `Sys` is src/stages.rs.
 - [ ] **sh-o5** encapsulate: map, `from_raw_parts` slice, then unmap (or forget to), with the
   mapped, read and object lengths chosen separately — 11 sites (`grep -rn 'SYS_MEMORY_MAP,'` gives
   12, 9 of them file reads and 1 a mapped write; `grep -rn from_raw_parts` gives 21, 11 over
