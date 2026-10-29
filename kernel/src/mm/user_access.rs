@@ -144,6 +144,11 @@ impl<T> UserPtr<T> {
     pub(crate) fn as_u64(&self) -> u64 {
         self.addr
     }
+
+    /// The same address, as the user's bytes.
+    fn bytes(self) -> UserPtr<u8> {
+        UserPtr { addr: self.addr, _phantom: PhantomData }
+    }
 }
 
 impl<T> UserMutPtr<T> {
@@ -156,6 +161,11 @@ impl<T> UserMutPtr<T> {
     /// The raw address, crate-internal.
     pub(crate) fn as_u64(&self) -> u64 {
         self.addr
+    }
+
+    /// The same address, as the user's bytes.
+    fn bytes(self) -> UserMutPtr<u8> {
+        UserMutPtr { addr: self.addr, _phantom: PhantomData }
     }
 }
 
@@ -182,34 +192,16 @@ fn validate_user_range(addr: u64, len: u64) -> Result<(), UserAccessError> {
 /// zero-sized `T` yields its only value without touching the pointer. `T` is plain data, so the
 /// user's bytes, whatever they are, are a `T`.
 pub fn copy_from_user<T: Pod>(src: UserPtr<T>) -> Result<T, UserAccessError> {
-    let addr = src.as_u64();
     let mut out = T::zeroed();
-    let n = size_of::<T>();
-    if n == 0 {
-        return Ok(out);
-    }
-    validate_user_range(addr, n as u64)?;
-    // SAFETY: `out` is `n` writable bytes; `addr` was validated user-half and aligned-for-T; the
-    // copy goes through `arch::user_access::copy_bytes_raw`, which opens the SMAP window and
-    // registers an exception-table entry for the read.
-    let faulted = unsafe { UserAccess::copy_bytes(bytes_of_mut(&mut out).as_mut_ptr(), addr as *const u8, n) };
-    if faulted { Err(UserAccessError::Fault) } else { Ok(out) }
+    copy_slice_from_user(bytes_of_mut(&mut out), src.bytes())?;
+    Ok(out)
 }
 
 /// Copy a `T` from kernel memory into user memory. [`UserAccessError::Fault`] on a fault, after
 /// which a prefix of the bytes may already be visible to the user; `src` is untouched. A no-op
 /// for zero-sized `T`. `T` is plain data, so no padding carries kernel bytes out.
 pub fn copy_to_user<T: Pod>(dst: UserMutPtr<T>, src: &T) -> Result<(), UserAccessError> {
-    let addr = dst.as_u64();
-    let n = size_of::<T>();
-    if n == 0 {
-        return Ok(());
-    }
-    validate_user_range(addr, n as u64)?;
-    // SAFETY: `src`'s bytes are a valid `n`-byte read source; `addr` was validated user-half +
-    // aligned-for-T. `copy_bytes_raw` handles SMAP/exception-table.
-    let faulted = unsafe { UserAccess::copy_bytes(addr as *mut u8, bytes_of(src).as_ptr(), n) };
-    if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
+    copy_slice_to_user(dst.bytes(), bytes_of(src))
 }
 
 /// Copy `dst.len()` bytes from user memory into `dst`. Byte-granular; an empty `dst` is a no-op.
@@ -220,9 +212,9 @@ pub fn copy_slice_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<(), User
     if n == 0 {
         return Ok(());
     }
-    // SAFETY: `addr` was validated user-half + `n` bytes; `dst` is
-    // exactly `n` writable bytes of caller storage.
-    let faulted = unsafe { UserAccess::copy_bytes(dst.as_mut_ptr(), addr as *const u8, n) };
+    // SAFETY: `addr` was validated user-half for `n` bytes, `dst`'s length; the arch copy opens
+    // the access window and recovers a fault on the user side.
+    let faulted = unsafe { UserAccess::copy_in(dst, addr as *const u8) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
@@ -234,9 +226,8 @@ pub fn copy_slice_to_user(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), UserAcc
     if n == 0 {
         return Ok(());
     }
-    // SAFETY: `addr` was validated user-half + `n` bytes; `src` is
-    // exactly `n` readable bytes of caller storage.
-    let faulted = unsafe { UserAccess::copy_bytes(addr as *mut u8, src.as_ptr(), n) };
+    // SAFETY: `addr` was validated user-half for `n` bytes, `src`'s length; as above.
+    let faulted = unsafe { UserAccess::copy_out(addr as *mut u8, src) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
@@ -473,6 +464,18 @@ mod tests {
         // SAFETY: host buffers stand in for user memory.
         let outcome = unsafe { UserAccess::copy_cstr(&mut buf[..0], src.as_ptr()) };
         assert_eq!((outcome, buf), (CstrCopyOutcome::NoTerminator, [0xAA, 0xAA]));
+    }
+
+    /// **A typed copy moves exactly its value's bytes**, to user memory and back, its neighbours
+    /// untouched.
+    #[test]
+    fn a_typed_copy_moves_exactly_its_values_bytes() {
+        let mut user = [u64::MAX; 3];
+        let at = user.as_mut_ptr() as u64 + 8;
+        copy_to_user(UserMutPtr::new(at).unwrap(), &RawHandle(0x0102_0304_0506_0708)).unwrap();
+        assert_eq!(user, [u64::MAX, 0x0102_0304_0506_0708, u64::MAX]);
+        assert_eq!(copy_from_user(UserPtr::<RawHandle>::new(at).unwrap()), Ok(RawHandle(0x0102_0304_0506_0708)));
+        assert_eq!(copy_from_user(UserPtr::<[u8; 0]>::new(at).unwrap()), Ok([]));
     }
 
     /// **A handle array is copied from and to user bytes at any alignment**, as the syscalls taking

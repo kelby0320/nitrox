@@ -185,9 +185,14 @@ pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize)
 pub struct X86UserAccess;
 
 impl crate::arch::user_access::ArchUserAccess for X86UserAccess {
-    unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize) -> bool {
-        // SAFETY: forwarded verbatim to `copy_bytes_raw`'s contract.
-        unsafe { copy_bytes_raw(dst, src, len) }
+    unsafe fn copy_in(dst: &mut [u8], src: *const u8) -> bool {
+        // SAFETY: forwarded to `copy_bytes_raw`'s contract; `dst` is its `len()` writable bytes.
+        unsafe { copy_bytes_raw(dst.as_mut_ptr(), src, dst.len()) }
+    }
+
+    unsafe fn copy_out(dst: *mut u8, src: &[u8]) -> bool {
+        // SAFETY: forwarded to `copy_bytes_raw`'s contract; `src` is its `len()` readable bytes.
+        unsafe { copy_bytes_raw(dst, src.as_ptr(), src.len()) }
     }
 
     unsafe fn copy_cstr(dst: &mut [u8], src: *const u8) -> CstrCopyOutcome {
