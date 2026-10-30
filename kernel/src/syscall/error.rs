@@ -17,7 +17,7 @@ pub enum KError {
     NoAccess = -2,
     /// The handle table is full.
     OutOfHandles = -3,
-    /// The kernel heap is exhausted.
+    /// The kernel heap is exhausted, or another kernel resource: process ids, for a spawn.
     OutOfMemory = -4,
     /// A named resource does not exist.
     NotFound = -10,
