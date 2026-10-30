@@ -29,6 +29,9 @@ pub enum FrameOwnership {
     Borrowed,
 }
 
+/// Why the kernel refuses to reach a borrowed object's frames itself.
+const BORROWED_ONLY_MAPPED: &str = "a borrowed object's frames are only mapped";
+
 /// An anonymous memory kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct MemoryObject {
@@ -128,6 +131,12 @@ impl MemoryObject {
         self.ownership
     }
 
+    /// Whether the kernel may reach these frames itself, through the HHDM or a device: only those
+    /// it owns. A borrowed range need not be in the HHDM, nor be memory, so it is for mapping.
+    pub fn kernel_reachable(&self) -> bool {
+        self.ownership == FrameOwnership::Owned
+    }
+
     /// How every mapping of this object is cached.
     pub fn caching(&self) -> Caching {
         self.caching
@@ -164,14 +173,22 @@ impl MemoryObject {
         self.frames.len()
     }
 
-    /// The object's backing frames; `frames()[i]` backs page `i`.
+    /// The object's backing frames, for the kernel to reach itself; `frames()[i]` backs page `i`.
+    /// A borrowed object's stop here, being only mapped: see [`Self::frames_to_map`].
     pub fn frames(&self) -> &[PhysAddr] {
+        assert!(self.kernel_reachable(), "{BORROWED_ONLY_MAPPED}");
+        &self.frames
+    }
+
+    /// The object's frames for a mapping into a user's address space, a borrowed object's too.
+    pub fn frames_to_map(&self) -> &[PhysAddr] {
         &self.frames
     }
 
     /// **Copy `src` into the object at byte `offset`** through the HHDM; a range past the last
     /// frame is cut short, as the caller (`sys_io_submit`) has bounds-checked it.
     pub fn copy_in(&self, offset: usize, src: &[u8]) {
+        assert!(self.kernel_reachable(), "{BORROWED_ONLY_MAPPED}");
         let hhdm = heap::hhdm_offset();
         for (i, &b) in src.iter().enumerate() {
             let pos = offset + i;
@@ -179,8 +196,8 @@ impl MemoryObject {
                 break;
             };
             let dst = (frame.as_u64() + hhdm) as *mut u8;
-            // SAFETY: within one of this object's frames, which the HHDM maps and the object
-            // owns or borrows for as long as `self` is alive.
+            // SAFETY: within one of this object's frames, which it owns, as just checked, and the
+            // HHDM maps for as long as `self` is alive.
             unsafe { *dst.add(pos % PAGE_SIZE) = b };
         }
     }
@@ -190,6 +207,7 @@ impl MemoryObject {
     /// [`MAX_IMAGE_BYTES`](crate::mm::elf::MAX_IMAGE_BYTES), 4 MiB less a page. Mapping the frames
     /// into a temporary kernel VMA would avoid the copy; see `docs/rationale/deferred-decisions.md`.
     pub fn copy_to_kvec(&self) -> Result<KVec<u8>, AllocError> {
+        assert!(self.kernel_reachable(), "{BORROWED_ONLY_MAPPED}");
         let mut buf = KVec::new();
         buf.try_reserve(self.size)?;
         let mut remaining = self.size;
@@ -198,7 +216,7 @@ impl MemoryObject {
                 break;
             }
             let n = core::cmp::min(PAGE_SIZE, remaining);
-            // SAFETY: `f` is a live, HHDM-reachable frame owned by `self`, not aliased;
+            // SAFETY: `f` is a live, HHDM-reachable frame owned by `self`, as just checked;
             // reading `n <= PAGE_SIZE` bytes from its HHDM mapping is sound.
             let page = unsafe { core::slice::from_raw_parts((f.as_u64() + heap::hhdm_offset()) as *const u8, n) };
             buf.try_extend_from_slice(page)?;
@@ -266,9 +284,28 @@ mod tests {
         assert_eq!(m.ownership(), FrameOwnership::Borrowed);
         assert_eq!(m.size(), 4 * PAGE_SIZE, "size rounds up to whole pages");
         assert_eq!(m.npages(), 4);
-        for (i, &f) in m.frames().iter().enumerate() {
+        for (i, &f) in m.frames_to_map().iter().enumerate() {
             assert_eq!(f.as_u64(), base.as_u64() + (i * PAGE_SIZE) as u64, "frame {i}");
         }
+    }
+
+    /// **The kernel does not reach a borrowed object's frames itself**: copying in or out, or
+    /// taking its frames for the HHDM or a device, stops; only a mapping takes them.
+    #[test]
+    fn the_kernel_does_not_reach_a_borrowed_objects_frames_itself() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        init_global_heap();
+        let base = PhysAddr::new(0xF000_0000);
+        // SAFETY: a range the test heap never holds; nothing below reads or writes it.
+        let m = unsafe { MemoryObject::try_new_borrowed(base, PAGE_SIZE, Caching::Normal).unwrap() };
+        let stops = |f: &dyn Fn()| {
+            let stopped = catch_unwind(AssertUnwindSafe(f));
+            stopped.is_err_and(|e| e.downcast_ref::<String>().is_some_and(|s| s.contains(BORROWED_ONLY_MAPPED)))
+        };
+        assert!(stops(&|| assert!(!m.frames().is_empty())), "frames");
+        assert!(stops(&|| m.copy_in(0, b"x")), "copy_in");
+        assert!(stops(&|| drop(m.copy_to_kvec())), "copy_to_kvec");
+        assert_eq!(m.frames_to_map(), &[base]);
     }
 
     #[test]

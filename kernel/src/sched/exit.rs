@@ -223,17 +223,25 @@ pub fn exit_process(status: ExitStatus) -> ! {
     finish_exit(g, me);
 }
 
-/// Emit a last-ditch kernel diagnostic for a ring-3 fault that **stranded the scheduler**:
-/// no runnable thread is left to receive the fault notification and call
-/// `sys_exception_resume`, so the system would idle forever (notably an init crash). Called
-/// only from the no-runnable-thread branch of [`suspend_with_fault`].
+/// Queue a fault's notification on its process's channel, if it has one: whether that woke a
+/// thread waiting to hear it, wherever the thread then runs. Caller holds `SCHED`.
 ///
-/// Uses the unsynchronized emergency serial writer, lock-free like `dump_and_halt`. Sound
-/// here: a userspace fault never holds `SERIAL`, and the caller holds `SCHED` so interrupts
-/// are masked. Reads only neutral data, staying out of the arch-private `ExceptionFrame`.
-fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
+/// # Safety
+/// `chan`, if any, is a live `NotificationChannel` whose queue has room reserved.
+pub(super) unsafe fn deliver_fault(g: &mut SchedState, chan: Option<*mut ()>, notif: Notification) -> bool {
+    let Some(c) = chan else { return false };
+    // SAFETY: a live channel with room reserved, by the contract; `SCHED` held.
+    let _edge = unsafe { NotificationChannel::enqueue(c, notif) };
+    signal_channel(g, c)
+}
+
+/// Say that a ring-3 fault **woke no waiting thread**: unless one reads the notification later
+/// and calls `sys_exception_resume`, the faulting thread stays suspended (notably an init crash).
+///
+/// Written under `SERIAL`, taken after `SCHED` as their ranks order, so it never interleaves
+/// with a line another CPU is printing. Reads only neutral data, not the `ExceptionFrame`.
+fn report_unwaited_fault(me_obj: *mut (), notif: &Notification) {
     use crate::libkern::notification::{KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, KIND_STACK_OVERFLOW};
-    use core::fmt::Write;
     // SAFETY: `me_obj` is the running (faulting) thread, pinned, `SCHED` held.
     let (pid, tid) = unsafe { (Thread::owner_pid_of(me_obj), Thread::tid_of(me_obj)) };
     let kind = match notif.kind() {
@@ -243,10 +251,8 @@ fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
         KIND_STACK_OVERFLOW => "stack-overflow",
         _ => "fault",
     };
-    let mut w = crate::arch::serial::emergency_writer();
-    let _ = writeln!(
-        w,
-        "\n*** unhandled ring-3 fault (no thread left to resume it): pid {} tid {} {} @ {:#018x} ***",
+    crate::kprintln!(
+        "\n*** unhandled ring-3 fault (no thread waiting to resume it): pid {} tid {} {} @ {:#018x} ***",
         pid,
         tid,
         kind,
@@ -282,12 +288,10 @@ pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification
                 unsafe { &*(p as *const crate::object::Process) }.notification_channel_ptr()
             })
         };
-        if let Some(c) = chan {
-            // SAFETY: `c` is the channel the current Process owns a ref on (alive
-            // at least until this thread is reaped); SCHED held; queue
-            // pre-reserved.
-            let _edge = unsafe { NotificationChannel::enqueue(c, notif) };
-            signal_channel(&mut g, c);
+        // SAFETY: `chan` is the channel the current Process owns a ref on (alive at least until
+        // this thread is reaped), its queue pre-reserved; SCHED held.
+        if !unsafe { deliver_fault(&mut g, chan, notif) } {
+            report_unwaited_fault(me_obj, &notif);
         }
 
         // Record the registers, mark Suspended, park off the run queue; the `ExceptionFrame`
@@ -304,15 +308,9 @@ pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification
         let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
         push_reserved(&mut g.suspended, me, "suspended list");
 
-        // Switch to the next runnable thread. If none, this fault **stranded the scheduler**
-        // (see `report_stranded_fault`). A serviced fault — the supervisor's waiter was just
-        // woken by `signal_channel` above — takes the `Some` branch and stays quiet.
         let next = match pick_next(&mut g) {
             Some(n) => n,
-            None => {
-                report_stranded_fault(me_obj, &notif);
-                g.idle_slot().take().expect("idle thread exists after init")
-            }
+            None => g.idle_slot().take().expect("idle thread exists after init"),
         };
         let next_obj = next.as_ptr();
         // SAFETY: next is pinned, becoming current; lock held.

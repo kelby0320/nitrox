@@ -31,11 +31,21 @@ pub struct UserMutPtr<T> { /* opaque u64 + phantom T */ }
 
 | Function | Direction | Signature |
 |---|---|---|
-| `copy_from_user<T: Copy>` | user → kernel | `(src: UserPtr<T>) -> Result<T, UserAccessError>` |
-| `copy_to_user<T: Copy>` | kernel → user | `(dst: UserMutPtr<T>, src: &T) -> Result<(), _>` |
+| `copy_from_user<T: Pod>` | user → kernel | `(src: UserPtr<T>) -> Result<T, UserAccessError>` |
+| `copy_to_user<T: Pod>` | kernel → user | `(dst: UserMutPtr<T>, src: &T) -> Result<(), _>` |
 | `copy_slice_from_user` | user → kernel | `(dst: &mut [u8], src: UserPtr<u8>) -> Result<(), _>` |
 | `copy_slice_to_user` | kernel → user | `(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), _>` |
+| `copy_array_from_user<T: Pod>` | user → kernel | `(dst: &mut [T], src: UserPtr<u8>) -> Result<(), _>` |
+| `copy_array_to_user<T: Pod>` | kernel → user | `(dst: UserMutPtr<u8>, src: &[T]) -> Result<(), _>` |
 | `copy_cstr_from_user` | user → kernel | `(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], _>` |
+
+The array variants copy a run of plain data, a handle array say, through the slice variants: the
+user's side is bytes, so it needs no alignment for `T`.
+
+**`T` is plain data** (`libkern::Pod`, implemented through `pod!`, which checks a struct's fields
+fill it): no padding, so a copy out shows no kernel bytes, and every bit pattern a value, so a
+copy in makes one from whatever bytes the user wrote. A `bool`, an enum or a padded struct does
+not compile.
 
 Every primitive runs three steps in order:
 
@@ -62,8 +72,8 @@ pub enum UserAccessError {
 
 `rep movsb` may make progress before faulting. Specifically:
 
-- `copy_from_user` / `copy_slice_from_user`: on `Fault`, the kernel-side destination may hold a partial copy. The caller observes `Err` and discards the destination.
-- `copy_to_user` / `copy_slice_to_user`: on `Fault`, the user-side destination may hold a partial copy. The kernel cannot undo the write; the user observes whatever bytes landed before the fault. Callers that need atomicity must layer their own check (or accept partial writes — for syscall returns, "argument validation failed" usually means the syscall did not happen, even if a partial write occurred).
+- `copy_from_user` / `copy_slice_from_user` / `copy_array_from_user`: on `Fault`, the kernel-side destination may hold a partial copy. The caller observes `Err` and discards the destination.
+- `copy_to_user` / `copy_slice_to_user` / `copy_array_to_user`: on `Fault`, the user-side destination may hold a partial copy. The kernel cannot undo the write; the user observes whatever bytes landed before the fault. Callers that need atomicity must layer their own check (or accept partial writes — for syscall returns, "argument validation failed" usually means the syscall did not happen, even if a partial write occurred).
 - `copy_cstr_from_user`: on `Fault`, the kernel-side destination may hold a partial copy. The returned `Err` carries no length.
 
 ## Exception table
@@ -102,9 +112,9 @@ The `<fault_pc>` is a local numeric label inside the same `asm!` block, sitting 
 
 ### Lookup
 
-The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. On a match, the handler writes `entry.recovery_pc` into `frame.rip` and returns. The naked stub then `iretq`s to the recovery PC. On a miss, the handler falls through to `dump_and_halt` — a `#PF` outside a registered window is a kernel bug, not a recoverable condition.
+The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. On a match whose faulting address (`CR2`) is below `USER_VIRT_END`, the handler writes `entry.recovery_pc` into `frame.rip` and returns. The naked stub then `iretq`s to the recovery PC. Otherwise the handler falls through to `dump_and_halt`: a `#PF` outside a registered window, or one on the copy's kernel-side pointer, is a kernel bug, not a recoverable condition.
 
-The lookup is linear over the table. The Phase 1 entry count is one per copy primitive (5 today), easily fits in a single cacheline, and runs only on the rare faulting path. A sorted table + binary search would be theoretical work; revisit if Phase 2 ever pushes the entry count past a few dozen.
+The lookup is linear over the table. The table holds one entry per raw copy routine (two today, `copy_bytes_raw` and `copy_cstr_raw`), easily fits in a single cacheline, and runs only on the rare faulting path. A sorted table + binary search would be theoretical work; revisit if Phase 2 ever pushes the entry count past a few dozen.
 
 ### Recovery contract
 
@@ -126,13 +136,14 @@ The window-open / window-closed transitions live exclusively inside the copy pri
 
 ### Boot enable
 
-[`arch::init_protections`](../../kernel/src/arch/x86_64/paging.rs) is the arch-neutral entry point. `main.rs::paging_init` calls it once at boot; an SMP AP-bring-up path will call it once per AP when SMP lands. It panics if any feature the kernel hard-requires is missing from the running CPU.
+[`ArchCpu::init_protections`](../../kernel/src/arch/x86_64/cpu.rs) is the arch-neutral entry point. `main.rs::paging_init` calls it on the bootstrap CPU, and AP bring-up on each other CPU. It panics if any feature the kernel hard-requires is missing from the running CPU.
 
 On x86_64 the function:
 
 1. Sets `EFER.NXE` (so the NX bit in page tables is honoured).
-2. Reads CPUID 7.0:EBX bits 7 (SMEP) and 20 (SMAP); panics if either is absent.
-3. Reads `CR4`, ORs in `CR4.SMEP | CR4.SMAP`, writes back.
+2. Sets `CR0.WP`, so a ring-0 write through a read-only mapping faults: a copy to a user cannot write a page the user may only read, whatever the bootloader left.
+3. Reads CPUID 7.0:EBX bits 7 (SMEP) and 20 (SMAP); panics if either is absent.
+4. Reads `CR4`, ORs in `CR4.SMEP | CR4.SMAP`, writes back.
 
 On a future aarch64 port the same entry point handles PAN configuration (`SCTLR_EL1.SPAN`) and the PAN feature-flag detection (`FEAT_PAN` / `FEAT_PAN2` / `FEAT_PAN3`); PXN is per-PTE, so no global enable.
 
@@ -140,7 +151,7 @@ Phase 1's hard requirement on these features keeps the copy-primitive asm straig
 
 ### CPU model requirement under QEMU
 
-The `xtask qemu` command runs QEMU with `-cpu qemu64,+smap,+smep`. The base `qemu64` model carries long mode, NX, and basic SSE; the `+smap,+smep` opt-ins add what the kernel actually requires. Default `qemu64` (no opts) lacks SMAP, and the kernel's `init_protections` would panic at boot.
+The `xtask qemu` command runs QEMU with `-cpu qemu64,+smap,+smep`. The base `qemu64` model carries long mode, NX, and basic SSE; the `+smap,+smep` opt-ins add what the kernel actually requires. Default `qemu64` (no opts) lacks SMAP, and `ArchCpu::init_protections` would panic at boot.
 
 Named CPU models like `Haswell-v4` or `Broadwell-v4` also work as a base, but TCG silently drops five features those models advertise (PCID, x2APIC, TSC-deadline, INVPCID, SPEC-CTRL), printing warnings on every boot. The kernel doesn't use those features today, so the minimalist `qemu64,+features` form is preferred: as future slices introduce real dependencies (`ArchTimer` will want `+tsc-deadline`, etc.), the xtask command grows by one flag at a time and stays a self-documenting record of which CPU features the kernel requires. (`ArchIrq` brings the local APIC up in xAPIC/MMIO mode precisely *because* TCG drops `x2apic`, so it needs no flag — see the decision log.)
 
@@ -148,14 +159,14 @@ Named CPU models like `Haswell-v4` or `Broadwell-v4` also work as a base, but TC
 
 The subsystem is split into an arch-neutral half and an arch-specific half:
 
-- [`kernel/src/mm/user_access.rs`](../../kernel/src/mm/user_access.rs) — the arch-neutral half. Owns `UserPtr<T>`, `UserMutPtr<T>`, `UserAccessError`, the validation helpers, the five public `copy_*_user` primitives, the `ExtableEntry` struct, and the `lookup_recovery` function called by the `#PF` handler.
-- [`kernel/src/arch/x86_64/user_access.rs`](../../kernel/src/arch/x86_64/user_access.rs) — the x86_64 half. Owns `copy_bytes_raw(dst, src, len) -> bool` and `copy_cstr_raw(dst, src, max) -> CstrCopyOutcome`. The inline asm with `stac` / `clac` / `rep movsb` / `lodsb`, and the `.pushsection .user_access_table` entry emission, all live here.
+- [`kernel/src/mm/user_access.rs`](../../kernel/src/mm/user_access.rs) — the arch-neutral half. Owns `UserPtr<T>`, `UserMutPtr<T>`, `UserAccessError`, the validation helpers, the seven public `copy_*_user` primitives, the `ExtableEntry` struct, and the `lookup_recovery` function called by the `#PF` handler.
+- [`kernel/src/arch/x86_64/user_access.rs`](../../kernel/src/arch/x86_64/user_access.rs) — the x86_64 half. Owns `copy_bytes_raw(dst, src, len) -> bool` and `copy_cstr_raw(dst, src, max) -> CstrCopyOutcome`, which copies a byte before it compares the count: `ArchUserAccess::copy_cstr` takes the destination as a slice and refuses an empty one before it. The inline asm with `stac` / `clac` / `rep movsb` / `lodsb`, and the `.pushsection .user_access_table` entry emission, all live here.
 
 The arch primitives return simple signals (`bool` for byte copies, an `enum` for cstr) and never reference `UserAccessError`. The mm layer maps those signals to its richer error type. This keeps the arch layer free of upward dependencies.
 
-When aarch64 is implemented its raw primitives live in `kernel/src/arch/aarch64/user_access.rs` <!-- check-docs: allow-missing --> and use the equivalents called out in the [User-access protection](#user-access-protection) section above: PAN replaces SMAP, PXN replaces SMEP, and a bytewise `ldrb` / `strb` loop replaces `rep movsb` / `lodsb`. Boot enable goes through the same arch-neutral `arch::init_protections` entry point — it configures `SCTLR_EL1.SPAN` and checks `FEAT_PAN` rather than touching `CR4`.
+When aarch64 is implemented its raw primitives live in `kernel/src/arch/aarch64/user_access.rs` <!-- check-docs: allow-missing --> and use the equivalents called out in the [User-access protection](#user-access-protection) section above: PAN replaces SMAP, PXN replaces SMEP, and a bytewise `ldrb` / `strb` loop replaces `rep movsb` / `lodsb`. Boot enable goes through the same arch-neutral `ArchCpu::init_protections` entry point — it configures `SCTLR_EL1.SPAN` and checks `FEAT_PAN` rather than touching `CR4`.
 
-The public surface (`UserPtr<T>`, `UserMutPtr<T>`, the five copy primitives, `UserAccessError`) is arch-neutral and does not change for that port. The shape of the arch-private interface (`copy_bytes_raw`, `copy_cstr_raw`, `CstrCopyOutcome`) is what each arch implements. An `ArchUserAccess` trait — listed in [docs/planning/implementation-plan.md](../planning/implementation-plan.md#L379) under "Architecture trait completion" — would be a thin formalisation once a second arch exists.
+The public surface (`UserPtr<T>`, `UserMutPtr<T>`, the seven copy primitives, `UserAccessError`) is arch-neutral and does not change for that port. Each arch implements the `ArchUserAccess` trait ([`kernel/src/arch/user_access.rs`](../../kernel/src/arch/user_access.rs)): `copy_in`, `copy_out` and `copy_cstr`, each taking the kernel's side as a slice, over its own raw routines (`copy_bytes_raw` and `copy_cstr_raw` on x86_64).
 
 ## Out of scope
 

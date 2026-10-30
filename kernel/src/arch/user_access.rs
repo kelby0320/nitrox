@@ -19,24 +19,27 @@ pub(crate) use crate::arch::x86_64::user_access::FAIL_NEXT_CSTR_COPY;
 
 /// Raw user/kernel copy primitives operating under the arch's access window.
 pub trait ArchUserAccess {
-    /// Copy `len` bytes from `src` to `dst` under the access window. Returns
-    /// `true` if a `#PF` occurred inside the window (the kernel-side bytes are
-    /// partially copied; the caller treats the operation as failed).
+    /// Fill `dst` from the user address `src` under the access window. Returns `true` if a `#PF`
+    /// occurred inside the window: `dst` holds a partial copy, and the caller treats the
+    /// operation as failed.
     ///
     /// # Safety
-    /// Exactly one of `src`/`dst` points into user memory; the other is a
-    /// valid kernel pointer for the direction. `len` bytes must be reachable
-    /// for that direction — the user side may fault, which the recovery path
-    /// converts into the `true` return. The two regions must not overlap, and
-    /// the arch's access protection must be enabled.
-    unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize) -> bool;
+    /// `src` is a user address for `dst.len()` bytes, which may fault: the recovery path turns a
+    /// fault into the `true` return. The arch's access protection is enabled.
+    unsafe fn copy_in(dst: &mut [u8], src: *const u8) -> bool;
 
-    /// Byte-by-byte copy of a NUL-terminated user string, stopping at the
-    /// first NUL or when `max_len` bytes have been read.
+    /// Copy `src` to the user address `dst` under the access window; `true` on a `#PF`, after
+    /// which a prefix of `src` may have landed.
     ///
     /// # Safety
-    /// Same contract as [`copy_bytes`](ArchUserAccess::copy_bytes): `src`
-    /// points into user memory, `dst` provides `max_len` writable kernel
-    /// bytes, the arch's access protection is enabled.
-    unsafe fn copy_cstr(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome;
+    /// As [`copy_in`](ArchUserAccess::copy_in): `dst` is a user address for `src.len()` bytes.
+    unsafe fn copy_out(dst: *mut u8, src: &[u8]) -> bool;
+
+    /// Byte-by-byte copy of a NUL-terminated user string into `dst`, stopping at the first NUL or
+    /// when `dst` is full. An empty `dst` is [`CstrCopyOutcome::NoTerminator`], touching nothing.
+    ///
+    /// # Safety
+    /// As [`copy_in`](ArchUserAccess::copy_in): `src` is a user address for `dst.len()` bytes,
+    /// and the arch's access protection is enabled.
+    unsafe fn copy_cstr(dst: &mut [u8], src: *const u8) -> CstrCopyOutcome;
 }

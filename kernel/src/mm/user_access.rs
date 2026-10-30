@@ -1,7 +1,7 @@
 //! User memory access: the arch-neutral half.
 //!
 //! The single sanctioned interface for reading or writing user memory from kernel code: the
-//! opaque [`UserPtr<T>`] / [`UserMutPtr<T>`], [`UserAccessError`], the five copy primitives and
+//! opaque [`UserPtr<T>`] / [`UserMutPtr<T>`], [`UserAccessError`], the seven copy primitives and
 //! the exception-table lookup the `#PF` handler walks. The raw byte copy under SMAP/PAN lives in
 //! `kernel/src/arch/<arch>/user_access.rs` ([`crate::arch::user_access`]).
 //!
@@ -17,6 +17,7 @@
 //!    `.user_access_table`. On a `#PF` whose RIP matches a fault site, the arch `#PF` handler
 //!    patches RIP to the recovery PC, which closes the protection window and signals failure: a
 //!    user-side fault becomes [`UserAccessError::Fault`], not a kernel halt.
+//!    A fault on the kernel side is a kernel bug, and halts: only a user address recovers.
 //!
 //! ## Why absolute u64 entries
 //!
@@ -24,11 +25,12 @@
 //! simpler and the per-entry cost (16 vs 8 bytes) is negligible.
 
 use core::marker::PhantomData;
-use core::mem::{MaybeUninit, align_of, size_of};
+use core::mem::{align_of, size_of};
 
 use crate::arch::UserAccess;
 use crate::arch::abi::USER_VIRT_END;
 use crate::arch::user_access::{ArchUserAccess, CstrCopyOutcome};
+use crate::libkern::pod::{Pod, bytes_of, bytes_of_mut, slice_bytes, slice_bytes_mut};
 
 /// One entry in `.user_access_table`: a (fault_pc, recovery_pc) pair. The copy primitives' inline
 /// asm emits entries with `.quad`, so Rust and asm must agree on the layout: `#[repr(C)]`.
@@ -45,20 +47,24 @@ const _: () = assert!(size_of::<ExtableEntry>() == 16);
 const _: () = assert!(align_of::<ExtableEntry>() == 8);
 
 /// Search the exception table for `fault_pc`; the recovery PC on a match.
+/// Only a fault on a user address, `fault_addr`, recovers.
 ///
 /// A linear scan: one entry per copy primitive, and it runs only on the rare faulting path.
-pub fn lookup_recovery(fault_pc: u64) -> Option<u64> {
+pub fn lookup_recovery(fault_pc: u64, fault_addr: u64) -> Option<u64> {
     // SAFETY: the linker provides matching `__start_user_access_table`
     // and `__stop_user_access_table` symbols, both within the kernel
     // image; the slice is rodata for the lifetime of the kernel.
     // Under `cfg(test)` the function returns an empty slice (no
     // linker symbols in host builds).
     let table = unsafe { exception_table() };
-    lookup_recovery_in(table, fault_pc)
+    lookup_recovery_in(table, fault_pc, fault_addr)
 }
 
 /// Lookup against an explicit table, so host tests can inject entries without linker symbols.
-fn lookup_recovery_in(table: &[ExtableEntry], fault_pc: u64) -> Option<u64> {
+fn lookup_recovery_in(table: &[ExtableEntry], fault_pc: u64, fault_addr: u64) -> Option<u64> {
+    if fault_addr >= USER_VIRT_END {
+        return None;
+    }
     for entry in table {
         if entry.fault_pc == fault_pc {
             return Some(entry.recovery_pc);
@@ -138,6 +144,10 @@ impl<T> UserPtr<T> {
     pub(crate) fn as_u64(&self) -> u64 {
         self.addr
     }
+
+    fn bytes(self) -> UserPtr<u8> {
+        UserPtr { addr: self.addr, _phantom: PhantomData }
+    }
 }
 
 impl<T> UserMutPtr<T> {
@@ -150,6 +160,10 @@ impl<T> UserMutPtr<T> {
     /// The raw address, crate-internal.
     pub(crate) fn as_u64(&self) -> u64 {
         self.addr
+    }
+
+    fn bytes(self) -> UserMutPtr<u8> {
+        UserMutPtr { addr: self.addr, _phantom: PhantomData }
     }
 }
 
@@ -174,47 +188,17 @@ fn validate_user_range(addr: u64, len: u64) -> Result<(), UserAccessError> {
 
 /// Copy a `T` out of user memory; [`UserAccessError::Fault`] commits no kernel-side state. A
 /// zero-sized `T` yields its only value without touching the pointer.
-pub fn copy_from_user<T: Copy>(src: UserPtr<T>) -> Result<T, UserAccessError> {
-    let addr = src.as_u64();
-    let n = size_of::<T>();
-    if n == 0 {
-        // SAFETY: `T` is zero-sized, so there is only one possible
-        // value and no bytes need be initialised.
-        #[allow(clippy::uninit_assumed_init, reason = "a zero-sized T has no bytes to initialise")]
-        return Ok(unsafe { MaybeUninit::<T>::uninit().assume_init() });
-    }
-    validate_user_range(addr, n as u64)?;
-    let mut out = MaybeUninit::<T>::uninit();
-    // SAFETY: `out` is properly-aligned local storage of exactly `n`
-    // bytes; `addr` was validated user-half and aligned-for-T; the
-    // copy goes through `arch::user_access::copy_bytes_raw`, which
-    // opens the SMAP window and registers an exception-table entry
-    // for the read.
-    let faulted = unsafe { UserAccess::copy_bytes(out.as_mut_ptr().cast::<u8>(), addr as *const u8, n) };
-    if faulted {
-        return Err(UserAccessError::Fault);
-    }
-    // SAFETY: `copy_bytes_raw` returning `false` means every byte
-    // landed; `out` is fully initialised as a `T`.
-    Ok(unsafe { out.assume_init() })
+pub fn copy_from_user<T: Pod>(src: UserPtr<T>) -> Result<T, UserAccessError> {
+    let mut out = T::zeroed();
+    copy_slice_from_user(bytes_of_mut(&mut out), src.bytes())?;
+    Ok(out)
 }
 
 /// Copy a `T` from kernel memory into user memory. [`UserAccessError::Fault`] on a fault, after
 /// which a prefix of the bytes may already be visible to the user; `src` is untouched. A no-op
-/// for zero-sized `T`.
-pub fn copy_to_user<T: Copy>(dst: UserMutPtr<T>, src: &T) -> Result<(), UserAccessError> {
-    let addr = dst.as_u64();
-    let n = size_of::<T>();
-    if n == 0 {
-        return Ok(());
-    }
-    validate_user_range(addr, n as u64)?;
-    let src_ptr = (src as *const T).cast::<u8>();
-    // SAFETY: `src_ptr` is a valid `n`-byte read source (it is
-    // `src`'s own backing storage); `addr` was validated user-half +
-    // aligned-for-T. `copy_bytes_raw` handles SMAP/exception-table.
-    let faulted = unsafe { UserAccess::copy_bytes(addr as *mut u8, src_ptr, n) };
-    if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
+/// for zero-sized `T`. `T` is plain data, so no padding carries kernel bytes out.
+pub fn copy_to_user<T: Pod>(dst: UserMutPtr<T>, src: &T) -> Result<(), UserAccessError> {
+    copy_slice_to_user(dst.bytes(), bytes_of(src))
 }
 
 /// Copy `dst.len()` bytes from user memory into `dst`. Byte-granular; an empty `dst` is a no-op.
@@ -225,9 +209,9 @@ pub fn copy_slice_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<(), User
     if n == 0 {
         return Ok(());
     }
-    // SAFETY: `addr` was validated user-half + `n` bytes; `dst` is
-    // exactly `n` writable bytes of caller storage.
-    let faulted = unsafe { UserAccess::copy_bytes(dst.as_mut_ptr(), addr as *const u8, n) };
+    // SAFETY: `addr` was validated user-half for `n` bytes, `dst`'s length; the arch copy opens
+    // the access window and recovers a fault on the user side.
+    let faulted = unsafe { UserAccess::copy_in(dst, addr as *const u8) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
@@ -239,10 +223,19 @@ pub fn copy_slice_to_user(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), UserAcc
     if n == 0 {
         return Ok(());
     }
-    // SAFETY: `addr` was validated user-half + `n` bytes; `src` is
-    // exactly `n` readable bytes of caller storage.
-    let faulted = unsafe { UserAccess::copy_bytes(addr as *mut u8, src.as_ptr(), n) };
+    // SAFETY: `addr` was validated user-half for `n` bytes, `src`'s length; as above.
+    let faulted = unsafe { UserAccess::copy_out(addr as *mut u8, src) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
+}
+
+/// Fill `dst` with plain data from the user's bytes at `src`, which need no alignment for `T`.
+pub fn copy_array_from_user<T: Pod>(dst: &mut [T], src: UserPtr<u8>) -> Result<(), UserAccessError> {
+    copy_slice_from_user(slice_bytes_mut(dst), src)
+}
+
+/// Copy the plain data `src` into the user's bytes at `dst`, which need no alignment for `T`.
+pub fn copy_array_to_user<T: Pod>(dst: UserMutPtr<u8>, src: &[T]) -> Result<(), UserAccessError> {
+    copy_slice_to_user(dst, slice_bytes(src))
 }
 
 /// Copy a NUL-terminated string from user memory into `dst`, stopping after the first NUL or when
@@ -262,7 +255,7 @@ pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], Us
     // `max` writable bytes. The arch raw primitive walks user memory
     // one byte at a time, registering only the user-side load as a
     // fault site.
-    let outcome = unsafe { UserAccess::copy_cstr(dst.as_mut_ptr(), addr as *const u8, max) };
+    let outcome = unsafe { UserAccess::copy_cstr(dst, addr as *const u8) };
     match outcome {
         CstrCopyOutcome::Ok(count) => Ok(&dst[..count]),
         CstrCopyOutcome::Fault => Err(UserAccessError::Fault),
@@ -273,20 +266,23 @@ pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], Us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libkern::handle::RawHandle;
+
+    const USER: u64 = 0x1000;
 
     #[test]
     fn empty_table_returns_none() {
         let table: [ExtableEntry; 0] = [];
-        assert_eq!(lookup_recovery_in(&table, 0), None);
-        assert_eq!(lookup_recovery_in(&table, 0xDEAD_BEEF), None);
+        assert_eq!(lookup_recovery_in(&table, 0, USER), None);
+        assert_eq!(lookup_recovery_in(&table, 0xDEAD_BEEF, USER), None);
     }
 
     #[test]
     fn single_entry_hit_and_miss() {
         let table = [ExtableEntry { fault_pc: 0x1000, recovery_pc: 0x2000 }];
-        assert_eq!(lookup_recovery_in(&table, 0x1000), Some(0x2000));
-        assert_eq!(lookup_recovery_in(&table, 0x0FFF), None);
-        assert_eq!(lookup_recovery_in(&table, 0x1001), None);
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER), Some(0x2000));
+        assert_eq!(lookup_recovery_in(&table, 0x0FFF, USER), None);
+        assert_eq!(lookup_recovery_in(&table, 0x1001, USER), None);
     }
 
     #[test]
@@ -296,10 +292,10 @@ mod tests {
             ExtableEntry { fault_pc: 0x2000, recovery_pc: 0xB000 },
             ExtableEntry { fault_pc: 0x3000, recovery_pc: 0xC000 },
         ];
-        assert_eq!(lookup_recovery_in(&table, 0x1000), Some(0xA000));
-        assert_eq!(lookup_recovery_in(&table, 0x2000), Some(0xB000));
-        assert_eq!(lookup_recovery_in(&table, 0x3000), Some(0xC000));
-        assert_eq!(lookup_recovery_in(&table, 0x4000), None);
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER), Some(0xA000));
+        assert_eq!(lookup_recovery_in(&table, 0x2000, USER), Some(0xB000));
+        assert_eq!(lookup_recovery_in(&table, 0x3000, USER), Some(0xC000));
+        assert_eq!(lookup_recovery_in(&table, 0x4000, USER), None);
     }
 
     #[test]
@@ -308,13 +304,23 @@ mod tests {
             ExtableEntry { fault_pc: 0x1000, recovery_pc: 0xAAAA },
             ExtableEntry { fault_pc: 0x1000, recovery_pc: 0xBBBB },
         ];
-        assert_eq!(lookup_recovery_in(&table, 0x1000), Some(0xAAAA));
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER), Some(0xAAAA));
+    }
+
+    /// **A fault on the copy's kernel side is not recovered**: it is a kernel bug, and halts.
+    #[test]
+    fn only_a_fault_on_a_user_address_is_recovered() {
+        let table = [ExtableEntry { fault_pc: 0x1000, recovery_pc: 0x2000 }];
+        assert_eq!(lookup_recovery_in(&table, 0x1000, 0), Some(0x2000));
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER_VIRT_END - 1), Some(0x2000));
+        assert_eq!(lookup_recovery_in(&table, 0x1000, USER_VIRT_END), None);
+        assert_eq!(lookup_recovery_in(&table, 0x1000, 0xFFFF_CF00_0000_0000), None);
     }
 
     #[test]
     fn host_build_sees_empty_table() {
-        assert_eq!(lookup_recovery(0), None);
-        assert_eq!(lookup_recovery(0xDEAD_BEEF), None);
+        assert_eq!(lookup_recovery(0, USER), None);
+        assert_eq!(lookup_recovery(0xDEAD_BEEF, USER), None);
     }
 
     #[test]
@@ -441,6 +447,41 @@ mod tests {
             assert_eq!(out, b"hello\0");
             assert_eq!(out.len(), 6);
         }
+    }
+
+    /// **A string copy into an empty destination writes nothing**: the routine copies a byte
+    /// before it compares the count, so an empty destination is refused before it.
+    #[test]
+    fn a_string_copy_into_an_empty_destination_writes_nothing() {
+        let src = *b"x\0";
+        let mut buf = [0xAAu8; 2];
+        // SAFETY: host buffers stand in for user memory.
+        let outcome = unsafe { UserAccess::copy_cstr(&mut buf[..0], src.as_ptr()) };
+        assert_eq!((outcome, buf), (CstrCopyOutcome::NoTerminator, [0xAA, 0xAA]));
+    }
+
+    /// **A typed copy moves exactly its value's bytes**, to user memory and back.
+    #[test]
+    fn a_typed_copy_moves_exactly_its_values_bytes() {
+        let mut user = [u64::MAX; 3];
+        let at = user.as_mut_ptr() as u64 + 8;
+        copy_to_user(UserMutPtr::new(at).unwrap(), &RawHandle(0x0102_0304_0506_0708)).unwrap();
+        assert_eq!(user, [u64::MAX, 0x0102_0304_0506_0708, u64::MAX]);
+        assert_eq!(copy_from_user(UserPtr::<RawHandle>::new(at).unwrap()), Ok(RawHandle(0x0102_0304_0506_0708)));
+        assert_eq!(copy_from_user(UserPtr::<[u8; 0]>::new(at).unwrap()), Ok([]));
+    }
+
+    /// **A handle array crosses user bytes at any alignment**, as the syscalls always allowed.
+    #[test]
+    fn an_array_is_copied_through_user_bytes_at_any_alignment() {
+        let mut user = [0u8; 17];
+        let at = user.as_mut_ptr() as u64 + 1;
+        let src = [RawHandle(0x1122_3344_5566_7788), RawHandle(9)];
+        copy_array_to_user(UserMutPtr::new(at).unwrap(), &src).unwrap();
+        assert_eq!(&user[1..9], &0x1122_3344_5566_7788u64.to_ne_bytes());
+        let mut dst = [RawHandle(0); 2];
+        copy_array_from_user(&mut dst, UserPtr::new(at).unwrap()).unwrap();
+        assert_eq!(dst, src);
     }
 
     #[test]

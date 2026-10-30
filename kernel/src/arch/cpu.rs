@@ -12,8 +12,8 @@ pub trait ArchCpu {
     /// with its TSS, then the IDT — the order is fixed inside the impl).
     fn init_tables();
 
-    /// Enable every CPU-level memory-protection feature the kernel depends on
-    /// (on x86_64: NX paging via `EFER.NXE`, plus SMEP and SMAP). Panics if a
+    /// Enable every CPU-level memory-protection feature the kernel depends on (on x86_64: NX
+    /// paging via `EFER.NXE`, write protection via `CR0.WP`, SMEP and SMAP). Panics if a
     /// required feature is missing on the running CPU. A future aarch64 port
     /// configures PAN/PXN/equivalents here; the boot caller is unchanged.
     fn init_protections();

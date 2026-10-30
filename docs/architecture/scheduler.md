@@ -160,7 +160,7 @@ slices 0–1 keep the one global queue, only the *current/idle/cpu_id* go per-CP
 - **AP startup via Limine.** Wire Limine's SMP request; for each AP, Limine jumps it
   to a kernel entry with its own stack. Each AP loads its **per-CPU GDT/TSS/IDT**,
   programs its **GS base** to its `CPUS[i]` block, enables required features
-  (SMEP/SMAP, x2APIC — below), starts its **per-CPU APIC timer**, and enters its
+  (NX, CR0.WP, SMEP/SMAP, x2APIC — below), starts its **per-CPU APIC timer**, and enters its
   per-CPU idle loop until the scheduler hands it work.
 - **`MAX_CPUS`** is fixed at **8** for now (sizes the `CPUS` array and bitmasks);
   raising it is a constant change. QEMU is exercised with `-smp 4`.

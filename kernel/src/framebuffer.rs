@@ -7,7 +7,7 @@ use crate::libkern::framebuffer::FramebufferInfo;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::spinlock::IrqSpinLock;
 use crate::limine::Framebuffer;
-use crate::mm::{Caching, PhysAddr};
+use crate::mm::{Caching, PAGE_SIZE, PhysAddr};
 
 /// The system framebuffer's physical extent and pixel layout, captured once at boot.
 ///
@@ -35,7 +35,8 @@ static APERTURE: IrqSpinLock<Option<FramebufferAperture>> = IrqSpinLock::new(Loc
 
 /// Record Limine's framebuffer as a userspace-mappable aperture.
 ///
-/// Returns `false` when there is nothing usable: no framebuffer, or a depth other than 32 bits.
+/// Refused, with the reason, for a depth other than 32 bits, an address outside the HHDM, or a
+/// physical base inside a page, which no mapping of whole pages can show.
 /// Refusing an unsupported depth is a boot-time diagnosis, where a client rendering into a 16- or
 /// 24-bit buffer is an artefact to puzzle over later.
 ///
@@ -43,14 +44,17 @@ static APERTURE: IrqSpinLock<Option<FramebufferAperture>> = IrqSpinLock::new(Loc
 ///
 /// `fb` must be Limine's live framebuffer descriptor, and `hhdm_offset` the offset
 /// Limine reported, so that `address - hhdm_offset` is the aperture's physical base.
-pub unsafe fn record_aperture(fb: &Framebuffer, hhdm_offset: u64, caching: Caching) -> bool {
+pub unsafe fn record_aperture(fb: &Framebuffer, hhdm_offset: u64, caching: Caching) -> Result<(), &'static str> {
     if fb.bpp != 32 {
-        return false;
+        return Err("unsupported depth");
     }
     let virt = fb.address as u64;
     if virt < hhdm_offset {
-        // Not an HHDM address; without a physical base there is nothing to hand out.
-        return false;
+        return Err("not an HHDM address");
+    }
+    let phys_base = virt - hhdm_offset;
+    if !phys_base.is_multiple_of(PAGE_SIZE as u64) {
+        return Err("base not page-aligned");
     }
     let byte_len = fb.pitch.saturating_mul(fb.height);
     let info = FramebufferInfo {
@@ -66,11 +70,54 @@ pub unsafe fn record_aperture(fb: &Framebuffer, hhdm_offset: u64, caching: Cachi
         blue_shift: fb.blue_mask_shift,
         blue_size: fb.blue_mask_size,
     };
-    *APERTURE.lock() = Some(FramebufferAperture { phys_base: PhysAddr::new(virt - hhdm_offset), info, caching });
-    true
+    *APERTURE.lock() = Some(FramebufferAperture { phys_base: PhysAddr::new(phys_base), info, caching });
+    Ok(())
 }
 
 /// The captured aperture's physical base, geometry and caching, if one was recorded.
 pub fn aperture() -> Option<(PhysAddr, FramebufferInfo, Caching)> {
     APERTURE.lock().as_ref().map(|a| (a.phys_base, a.info, a.caching))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HHDM: u64 = 0xFFFF_8000_0000_0000;
+
+    fn at(address: u64, bpp: u16) -> Framebuffer {
+        Framebuffer {
+            address: address as *mut u8,
+            width: 1024,
+            height: 768,
+            pitch: 4096,
+            bpp,
+            memory_model: 1,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+            _unused: [0; 7],
+            edid_size: 0,
+            edid: core::ptr::null_mut(),
+            mode_count: 0,
+            modes: core::ptr::null_mut(),
+        }
+    }
+
+    /// **Only a page-aligned base is recorded**: a client's map of one inside a page would panic.
+    #[test]
+    fn an_aperture_is_recorded_only_from_a_page_aligned_base_in_the_hhdm() {
+        // SAFETY: only the descriptors' fields are read; nothing reaches the addresses they give.
+        let record = |fb: Framebuffer| unsafe { record_aperture(&fb, HHDM, Caching::Normal) };
+        assert_eq!(record(at(HHDM + 0x8000_0FFF, 32)), Err("base not page-aligned"));
+        assert_eq!(record(at(HHDM + 0x8000_1001, 32)), Err("base not page-aligned"));
+        assert_eq!(record(at(HHDM - PAGE_SIZE as u64, 32)), Err("not an HHDM address"));
+        assert_eq!(record(at(HHDM + 0x8000_1000, 24)), Err("unsupported depth"));
+        assert!(aperture().is_none());
+        assert_eq!(record(at(HHDM + 0x8000_1000, 32)), Ok(()));
+        assert_eq!(aperture().map(|(base, ..)| base), Some(PhysAddr::new(0x8000_1000)));
+    }
 }

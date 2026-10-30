@@ -4,7 +4,7 @@ use core::mem;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
 
-use crate::libkern::AllocError;
+use crate::libkern::{AllocError, Pod};
 use crate::mm::slab::{kfree, kmalloc};
 
 /// A fallible, owned heap allocation — the kernel's analogue of `alloc::boxed::Box`.
@@ -49,36 +49,6 @@ impl<T> KBox<T> {
         Ok(KBox { ptr })
     }
 
-    /// Allocate a **zero-filled** `T` on the kernel heap, without ever materialising one
-    /// on the stack.
-    ///
-    /// [`try_new`](Self::try_new) takes `val` **by value**, so `KBox::try_new(Big::zeroed())`
-    /// builds the whole `Big` in the caller's frame first. For a 4 KiB `StoredMsg` that was
-    /// the difference between a 58 % and an 83 % high-water mark on a 16 KiB stack, and a stack
-    /// budget should not rest on the optimiser eliding the temporary. This zeroes the allocation
-    /// in place instead.
-    ///
-    /// # Safety
-    ///
-    /// An all-zero bit pattern must be a valid `T`. True for plain data (`#[repr(C)]`
-    /// structs of integers and arrays, like the IPC message types this exists for); **not**
-    /// true for anything with a niche, a reference, a `NonNull`, or an enum without a
-    /// zero-valued variant.
-    pub unsafe fn try_new_zeroed() -> Result<Self, AllocError> {
-        let ptr = if mem::size_of::<T>() == 0 {
-            NonNull::<T>::dangling()
-        } else {
-            let raw = kmalloc(mem::size_of::<T>(), mem::align_of::<T>()) as *mut T;
-            let nn = NonNull::new(raw).ok_or(AllocError)?;
-            // SAFETY: `raw` addresses `size_of::<T>()` freshly-allocated writable bytes
-            // that nothing else aliases. The caller's contract makes all-zero a valid `T`,
-            // so this initialises the allocation.
-            unsafe { ptr::write_bytes(raw as *mut u8, 0, mem::size_of::<T>()) };
-            nn
-        };
-        Ok(KBox { ptr })
-    }
-
     /// Consume the box and yield its raw pointer, suppressing the destructor. The caller owns
     /// the allocation and must reconstitute it via [`KBox::from_raw`] (or free it directly).
     /// Used by intrusive containers that thread the allocation through raw pointers.
@@ -96,6 +66,30 @@ impl<T> KBox<T> {
     /// The pointee must still be initialised and not aliased.
     pub unsafe fn from_raw(ptr: NonNull<T>) -> Self {
         Self { ptr }
+    }
+}
+
+impl<T: Pod> KBox<T> {
+    /// Allocate a **zero-filled** `T` on the kernel heap, without ever materialising one
+    /// on the stack.
+    ///
+    /// [`try_new`](Self::try_new) takes `val` **by value**, so `KBox::try_new(Big::zeroed())`
+    /// builds the whole `Big` in the caller's frame first. For a 4 KiB `StoredMsg` that was
+    /// the difference between a 58 % and an 83 % high-water mark on a 16 KiB stack, and a stack
+    /// budget should not rest on the optimiser eliding the temporary. This zeroes the allocation
+    /// in place instead.
+    pub fn try_new_zeroed() -> Result<Self, AllocError> {
+        let ptr = if mem::size_of::<T>() == 0 {
+            NonNull::<T>::dangling()
+        } else {
+            let raw = kmalloc(mem::size_of::<T>(), mem::align_of::<T>()) as *mut T;
+            let nn = NonNull::new(raw).ok_or(AllocError)?;
+            // SAFETY: `raw` addresses `size_of::<T>()` freshly-allocated writable bytes
+            // that nothing else aliases, and all zeros is a `T`, which is plain data.
+            unsafe { ptr::write_bytes(raw as *mut u8, 0, mem::size_of::<T>()) };
+            nn
+        };
+        Ok(KBox { ptr })
     }
 }
 

@@ -120,7 +120,7 @@ impl ArchSmp for X86Smp {
 ///
 /// [`X86Smp::init_this_cpu`] must already have set this CPU's index, so `current_cpu()` is
 /// correct for the per-CPU GDT/TSS and syscall block. Loads the GDT/TSS and shared IDT, enables
-/// NX/SMEP/SMAP, enters x2APIC, and arms the syscall MSRs. Leaves interrupts masked.
+/// NX/WP/SMEP/SMAP, enters x2APIC, and arms the syscall MSRs. Leaves interrupts masked.
 pub fn ap_cpu_init() {
     use crate::arch::cpu::ArchCpu;
     super::gdt::init();

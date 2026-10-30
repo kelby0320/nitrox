@@ -12,6 +12,7 @@
 
 use crate::libkern::lockrank::{LockRank, Taken};
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,7 +60,7 @@ impl<T> SpinLock<T> {
         loop {
             if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 crate::libkern::lockrank::acquired(self.rank, Taken::Waiting);
-                return SpinLockGuard { lock: self };
+                return SpinLockGuard { lock: self, _here: PhantomData };
             }
             // Spin on a relaxed read, not the CAS, so the cacheline is not bus-locked.
             while self.locked.load(Ordering::Relaxed) {
@@ -90,7 +91,12 @@ impl<T> SpinLock<T> {
 /// `&mut T` to the inner value.
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    /// Not `Send`: it is released on the CPU whose preemption count and lock ranks it raised.
+    _here: PhantomData<*const ()>,
 }
+
+// SAFETY: a shared guard gives out `&T` only, so it may be shared where `T` may.
+unsafe impl<T: Sync> Sync for SpinLockGuard<'_, T> {}
 
 impl<T> Deref for SpinLockGuard<'_, T> {
     type Target = T;
@@ -210,7 +216,7 @@ impl<T> IrqSpinLock<T> {
         loop {
             if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 crate::libkern::lockrank::acquired(self.rank, Taken::Waiting);
-                return IrqSpinLockGuard { lock: self, prev_if };
+                return IrqSpinLockGuard { lock: self, prev_if, _here: PhantomData };
             }
             while self.locked.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
@@ -230,7 +236,7 @@ impl<T> IrqSpinLock<T> {
         let prev_if = irq_backend::disable();
         if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             crate::libkern::lockrank::acquired(self.rank, Taken::WithoutWaiting);
-            Some(IrqSpinLockGuard { lock: self, prev_if })
+            Some(IrqSpinLockGuard { lock: self, prev_if, _here: PhantomData })
         } else {
             irq_backend::restore(prev_if);
             None
@@ -250,7 +256,12 @@ pub struct IrqSpinLockGuard<'a, T> {
     lock: &'a IrqSpinLock<T>,
     /// Interrupt-enable state captured at acquire, restored on drop.
     prev_if: bool,
+    /// Not `Send`: it restores the interrupt state of the CPU it was taken on.
+    _here: PhantomData<*const ()>,
 }
+
+// SAFETY: as `SpinLockGuard`'s.
+unsafe impl<T: Sync> Sync for IrqSpinLockGuard<'_, T> {}
 
 impl<'a, T> IrqSpinLockGuard<'a, T> {
     /// Release the lock but **keep interrupts masked**, returning the prior interrupt state
@@ -298,6 +309,30 @@ impl<T> Drop for IrqSpinLockGuard<'_, T> {
         irq_backend::restore(self.prev_if);
     }
 }
+
+/// Fail the build if `$t` implements `$tr`: the probe's call is ambiguous exactly when it does.
+macro_rules! assert_not_impl {
+    ($t:ty: $tr:path) => {
+        const _: fn() = || {
+            trait AmbiguousIfImpl<A> {
+                fn probe() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            struct Implements;
+            impl<T: ?Sized + $tr> AmbiguousIfImpl<Implements> for T {}
+            <$t as AmbiguousIfImpl<_>>::probe();
+        };
+    };
+}
+assert_not_impl!(SpinLockGuard<'static, u32>: Send);
+assert_not_impl!(IrqSpinLockGuard<'static, u32>: Send);
+assert_not_impl!(SpinLockGuard<'static, core::cell::Cell<u32>>: Sync);
+assert_not_impl!(IrqSpinLockGuard<'static, core::cell::Cell<u32>>: Sync);
+const _: fn() = || {
+    fn shared<T: Sync>() {}
+    shared::<SpinLockGuard<'static, u32>>();
+    shared::<IrqSpinLockGuard<'static, u32>>();
+};
 
 #[cfg(test)]
 mod tests {

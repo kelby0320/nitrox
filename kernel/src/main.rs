@@ -656,21 +656,21 @@ fn record_framebuffer() {
     };
     // SAFETY: `fb` is Limine's live descriptor and `hhdm_offset()` is the offset Limine
     // reported for this boot, so `address - offset` is the aperture's physical base.
-    if unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset(), caching) } {
-        // The padding as a number: the bytes each row carries past its last pixel.
-        let padding = fb.pitch as i64 - (fb.width * (fb.bpp as u64).div_ceil(8)) as i64;
-        kprintln!(
-            "framebuffer: {}x{} pitch {} padding {} bpp {} — /dev/framebuffer available",
-            fb.width,
-            fb.height,
-            fb.pitch,
-            padding,
-            fb.bpp
-        );
-        report_framebuffer_cost(fb.address as u64);
-    } else {
-        kprintln!("framebuffer: unsupported depth ({} bpp) — /dev/framebuffer unavailable", fb.bpp);
+    if let Err(why) = unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset(), caching) } {
+        kprintln!("framebuffer: {why} ({} bpp at {:#x}) — /dev/framebuffer unavailable", fb.bpp, fb.address as u64);
+        return;
     }
+    // The padding as a number: the bytes each row carries past its last pixel.
+    let padding = fb.pitch as i64 - (fb.width * (fb.bpp as u64).div_ceil(8)) as i64;
+    kprintln!(
+        "framebuffer: {}x{} pitch {} padding {} bpp {} — /dev/framebuffer available",
+        fb.width,
+        fb.height,
+        fb.pitch,
+        padding,
+        fb.bpp
+    );
+    report_framebuffer_cost(fb.address as u64);
 }
 
 /// What writing to the screen costs on this machine, and why: the caching the firmware set for
@@ -1109,7 +1109,7 @@ fn init_memory() -> bool {
 
 /// One-time paging setup that must run before any `AddressSpace::new`:
 ///
-/// 1. Enable every CPU memory-protection feature the kernel depends on (x86_64: NX, SMEP, SMAP).
+/// 1. Enable every CPU memory-protection feature the kernel needs (x86_64: NX, WP, SMEP, SMAP).
 /// 2. Pre-allocate the kernel-vmap region's intermediate page tables in the live PML4.
 /// 3. Capture the kernel-half PML4 entries into the template every new address space inherits.
 ///

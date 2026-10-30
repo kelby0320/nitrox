@@ -931,3 +931,39 @@ fn the_current_identity_is_its_pid_then_its_tid() {
     assert_eq!(with_current(me, current_pid_tid), Some((9, 7)));
     assert_eq!(with_current(inert_ref(3), current_pid_tid), None);
 }
+
+/// **A fault is reported unwaited only when its notification wakes no thread**: a supervisor
+/// blocked on the channel is woken, wherever it then runs; a channel with no waiter, or no channel,
+/// wakes nobody. The notification is queued either way, for whoever reads it.
+#[test]
+fn a_fault_wakes_the_thread_waiting_on_its_channel_or_none() {
+    use crate::libkern::notification::FaultKind;
+    init_global_heap();
+    super::online_set::force(0b1);
+    let mut st = reserved_state();
+    let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
+    // SAFETY: `into_raw` yielded the single creation reference; adopt it.
+    let _pinned = unsafe { ObjectRef::from_raw(chan, KObjectType::NotificationChannel) };
+    let notif = Notification::seg_fault(7, 0xdead_0000, FaultKind::NotWritable);
+    // SAFETY: the test's own live channel, its queue room reserved by `try_new`; single-threaded.
+    unsafe {
+        assert!(!deliver_fault(&mut st, None, notif), "no channel");
+        assert!(!deliver_fault(&mut st, Some(chan), notif), "no thread waiting");
+    }
+    let supervisor = inert_user_ref(1, 7);
+    let s = supervisor.as_ptr();
+    // SAFETY: pinned by the test; single-threaded.
+    unsafe {
+        Thread::wait_register(s, &[chan as usize], true);
+        NotificationChannel::add_waiter(chan, s).unwrap();
+        Thread::set_state(s, ThreadState::Blocked);
+    }
+    assert!(st.blocked.push(supervisor).is_ok());
+    // SAFETY: as above.
+    assert!(unsafe { deliver_fault(&mut st, Some(chan), notif) }, "the supervisor was waiting");
+    assert!(st.ready.iter().any(|q| q.iter().any(|r| r.as_ptr() == s)), "and is woken to run");
+    for _ in 0..2 {
+        // SAFETY: as above.
+        assert!(unsafe { NotificationChannel::try_recv(chan) }.is_some(), "each fault was queued");
+    }
+}

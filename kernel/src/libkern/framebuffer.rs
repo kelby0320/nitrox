@@ -51,6 +51,19 @@ pub struct FramebufferInfo {
     /// Blue channel width in bits.
     pub blue_size: u8,
 }
+crate::libkern::pod::pod!(FramebufferInfo {
+    width,
+    height,
+    pitch,
+    byte_len,
+    bits_per_pixel,
+    red_shift,
+    red_size,
+    green_shift,
+    green_size,
+    blue_shift,
+    blue_size
+});
 
 const _: () = assert!(size_of::<FramebufferInfo>() == 32);
 const _: () = assert!(align_of::<FramebufferInfo>() == 8);
@@ -69,10 +82,7 @@ const _: () = assert!(offset_of!(FramebufferInfo, blue_size) == 31);
 impl FramebufferInfo {
     /// Reinterpret the struct as bytes, for copying into a `MemoryObject`.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `Self` is `#[repr(C)]` with no padding holes (the asserts above pin
-        // every offset and the total size), contains no pointers or references, and is
-        // valid for reads of `size_of::<Self>()` bytes for the borrow's lifetime.
-        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+        crate::libkern::pod::bytes_of(self)
     }
 }
 

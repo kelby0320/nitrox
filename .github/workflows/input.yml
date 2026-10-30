@@ -26,6 +26,7 @@ on:
       # table's served index — served in `kernel_server.rs`, and bound in `main.rs`. Any of the
       # three can make the raw nodes unresolvable without touching the driver.
       - 'kernel/src/device.rs'
+      - 'kernel/src/device/**'
       - 'kernel/src/object/kernel_server.rs'
       - 'kernel/src/main.rs'
       # **Everything between the table and the merged stream** (administration Part B): the

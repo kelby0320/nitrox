@@ -29,6 +29,7 @@ pub struct IoResult {
     /// for any error completion. See `docs/spec/syscall-abi.md` § `sys_wait` / `sys_ns_lookup`.
     pub result: u64,
 }
+crate::libkern::pod::pod!(IoResult { handle, status, reserved, result });
 
 const _: () = assert!(core::mem::size_of::<IoResult>() == 24);
 const _: () = assert!(core::mem::align_of::<IoResult>() == 8);

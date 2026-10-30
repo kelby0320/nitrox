@@ -258,7 +258,8 @@ each step's rationale is in the source comments:
     A.2): after the APs, not during their bring-up, the scheduler's most delicate moment.
 12. **Display aperture** — record Limine's framebuffer (physical base, geometry, channel
     layout) so `/dev/framebuffer` can serve it. Must precede the first userspace process, which
-    binds that path into init's namespace.
+    binds that path into init's namespace. A depth other than 32 bpp, an address outside the
+    HHDM or a base inside a page is refused, the reason logged, and `/dev/framebuffer` is absent.
 13. **`drivers::settle`** waits, up to two seconds, for the hub thread's first round, so the report
     below lists what USB has attached and a device present at boot is in the registry before
     userspace reads it (Phase 6 Part A.3). On a machine with nothing attached it costs the

@@ -45,7 +45,6 @@ use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpOp, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::printable::Printable;
 use crate::libkern::{IrqSpinLock, KVec};
@@ -1071,7 +1070,7 @@ impl Binding<'_> {
             crate::kprintln!("usb: port {port}: no memory for its disk's node");
             return false;
         };
-        let node = crate::drivers::adopt(node, KObjectType::DeviceNode);
+        let node = crate::drivers::adopt_node(node);
         let Some(id) = crate::device::register_block_under(node.clone(), parent, "usb-storage") else {
             return false;
         };

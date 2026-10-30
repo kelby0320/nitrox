@@ -393,7 +393,7 @@ fn record(x: &Xhci, port: u8, facts: UsbFacts) -> Option<u32> {
         crate::kprintln!("usb: port {port}: no memory for its node; it is not in the registry");
         return None;
     };
-    crate::device::register_usb(crate::drivers::adopt(node, KObjectType::DeviceNode), &x.pci, "xhci", facts)
+    crate::device::register_usb(crate::drivers::adopt_node(node), &x.pci, "xhci", facts)
 }
 
 /// The longest configuration descriptor kept for the class drivers: QEMU's devices' are 34 to 93
@@ -840,7 +840,8 @@ fn wait(x: &Xhci, po: &ObjectRef, bound_ns: u64) -> Option<(u8, u64)> {
 /// A fresh operation for one wait.
 pub(super) fn new_operation() -> Result<ObjectRef, Failed> {
     let po = PendingOperation::try_new().map_err(|_| Failed::NoMemory)?;
-    Ok(crate::drivers::adopt(po, KObjectType::PendingOperation))
+    // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
+    Ok(unsafe { crate::drivers::adopt(po, KObjectType::PendingOperation) })
 }
 
 /// **Enable `port`**: a USB 2 port is reset and given its recovery time; a USB 3 port is enabled

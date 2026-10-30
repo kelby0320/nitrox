@@ -264,14 +264,14 @@ irq_dispatcher! {
 /// miss, calls [`dump_and_halt`]. `&mut` because recovery writes the new RIP in place.
 fn pf_dispatch(f: &mut ExceptionFrame) {
     debug_assert_eq!(f.vector, 14);
+    let cr2 = regs::read_cr2();
 
-    if let Some(recovery) = crate::mm::user_access::lookup_recovery(f.rip) {
+    if let Some(recovery) = crate::mm::user_access::lookup_recovery(f.rip, cr2) {
         f.rip = recovery;
         return;
     }
 
     if is_user_fault(f) {
-        let cr2 = regs::read_cr2();
 
         // Demand paging: a not-present ring-3 fault may fall in a reserved-but-unbacked
         // anonymous VMA. Try to fault it in; on success the stub `iretq`s and the access retries.

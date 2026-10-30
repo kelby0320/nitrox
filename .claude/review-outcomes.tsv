@@ -355,3 +355,17 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-29	406	e6db9aa7	13	tests	optional	demonstrated	fixed	2d06cd54	pid 9 tid 7 through with_current; the swapped tuple fails it
 2026-10-29	406	e6db9aa7	14	architecture	optional	demonstrated	fixed	2d06cd54	on_complete extern "C"; irp-layout and drivers-and-irps state it runs after per-frame routines, which nothing runs yet
 2026-10-29	406	e6db9aa7	15	rules-and-docs	optional	demonstrated	fixed	2d06cd54	long doc lines rewrapped to 100 columns; table rows left long
+2026-10-29	407	ac2f0efc	1	logic+tests	blocking	demonstrated	fixed	c553e5a1	a source scan fails any debug_assert reading object_type(); a sweep stops each of 17 checks by name (io_buffer_size in ca149be6); every deletion and downgrade caught
+2026-10-29	407	ac2f0efc	2	logic+architecture	worth-fixing	demonstrated	fixed	a60951f7	pod! destructures each named field: pod!(Bad { a, a }) fails E0025; a field left out, padding and a bool still fail
+2026-10-29	407	ac2f0efc	3	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	c332fdd9	io_buffer_size after submit_control; the per-commit doc-orphan sweep flags only a36786e9, nothing after
+2026-10-29	407	ac2f0efc	4	logic+rules-and-docs	worth-fixing	demonstrated	fixed	c1209b9e	the four spec lines corrected; a sweep found no other stale count or name
+2026-10-29	407	ac2f0efc	5	error-paths	worth-fixing	demonstrated	fixed	ccd31a0b	a borrowed and a wrong object through complete_read_range_reply; the settle mutation fails it; the wrong-kind half bites only under Miri, added to miri-provenance-tests
+2026-10-29	407	ac2f0efc	6	tests	worth-fixing	demonstrated	fixed	597f3c45	nothing_to_run removed with finding 9; the deliver_fault test fails both ways signal_channel can lie
+2026-10-29	407	ac2f0efc	7	tests	worth-fixing	unverified	fixed	432bb586	test-qemu copies to a read-only page: fails with WP clear and with RIP passed for CR2; a kernel-side fault cannot pass a boot, pinned on the host
+2026-10-29	407	ac2f0efc	8	architecture	worth-fixing	unverified	fixed	24b98d0a	frames, copy_in and copy_to_kvec assert owned frames; map_object takes frames_to_map; removing each assert fails the test
+2026-10-29	407	ac2f0efc	9	error-paths	optional	unverified	fixed	597f3c45	maintainer chose: report when no waiter was woken; busy-supervisor boot: old rule silent, new prints whole; demo worker naps, 0 of 5 boots noisy
+2026-10-29	407	ac2f0efc	10	logic	optional	unverified	fixed	597f3c45	nothing_to_run gone; the notice says no thread was waiting, not that the system would idle forever; a heuristic by nature
+2026-10-29	407	ac2f0efc	11	tests	optional	unverified	fixed	597f3c45	deliver_fault host test, both mutations fail it; boot probes show old silent and new printing
+2026-10-29	407	ac2f0efc	12	architecture	optional	demonstrated	fixed	c1209b9e	lock-ordering names the SERIAL exception: a fault with no waiter, under SCHED
+2026-10-29	407	ac2f0efc	13	architecture	optional	demonstrated	fixed	c1209b9e	CR0.WP in the ArchCpu contract, ap_cpu_init, paging_init, cpu.rs and scheduler.md
+2026-10-29	407	ac2f0efc	14	tests	optional	demonstrated	fixed	c553e5a1	folded into 1: the release claim is pinned by the scan

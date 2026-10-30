@@ -311,13 +311,13 @@ impl AddressSpace {
             return Err((object, MapError::NotUserHalf));
         }
 
-        debug_assert_eq!(object.object_type(), KObjectType::MemoryObject);
+        assert_eq!(object.object_type(), KObjectType::MemoryObject, "map_object");
         // SAFETY: `object` holds a reference to a live `MemoryObject` (its
         // header is at offset 0); we only read its frame list.
         let mobj = unsafe { &*(object.as_ptr() as *const MemoryObject) };
         // `frames` borrows through the raw pointer, not `object`, so `object` can move into the VMA
         // below while the install loop still reads it; the object stays alive throughout.
-        let frames = mobj.frames();
+        let frames = mobj.frames_to_map();
         let caching = mobj.caching();
         let npages = range.pages();
         debug_assert!(frames.len() as u64 >= npages, "object too small for range");
@@ -388,7 +388,7 @@ impl AddressSpace {
         prot: Protection,
         object: ObjectRef,
     ) -> Result<(), (ObjectRef, MapError)> {
-        debug_assert_eq!(object.object_type(), KObjectType::FileObject);
+        assert_eq!(object.object_type(), KObjectType::FileObject, "map_file");
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((object, MapError::NotCanonical));

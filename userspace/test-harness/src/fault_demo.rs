@@ -36,8 +36,26 @@ const fn mark(index: usize) -> u64 {
 /// The registers the worker sets, by index: all an `asm!` may name but `rax`, the address.
 const MARKED: [usize; 12] = [2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
 
-/// The worker's entry: fault on a store with each register in [`MARKED`] at its [`mark`].
+/// Wait `ns` on a channel nothing signals, `sys_wait`'s deadline its only way out.
+fn nap(ns: u64) {
+    let (mut now, mut ours, mut theirs) = (0u64, 0u64, 0u64);
+    let mut result = [0u8; 24];
+    // SAFETY: each pointer is a valid writable out-parameter, and each handle this thread's own.
+    unsafe {
+        syscall2(SYS_CLOCK_READ, abi::CLOCK_MONOTONIC, (&raw mut now) as u64);
+        if syscall4(SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) != 0 {
+            return;
+        }
+        syscall4(SYS_WAIT, (&raw const ours) as u64, 1, result.as_mut_ptr() as u64, now.saturating_add(ns));
+        syscall1(SYS_HANDLE_CLOSE, ours);
+        syscall1(SYS_HANDLE_CLOSE, theirs);
+    }
+}
+
+/// The worker's entry: fault on a store with each register in [`MARKED`] at its [`mark`], once
+/// the main thread has had time to reach its wait, so the fault finds it waiting.
 extern "C" fn worker_fault() -> ! {
+    nap(10_000_000);
     // SAFETY: this is the whole point — `FAULT_ADDR` is an unmapped user address, so the store
     // traps; the kernel never lets it complete, and the registers it sets are only inputs.
     unsafe {
@@ -55,8 +73,31 @@ extern "C" fn worker_fault() -> ! {
     }
 }
 
+/// **The kernel cannot write through a read-only user mapping**: a syscall's copy-out to one
+/// faults on the user side, and recovery answers `FaultFromUser`, the page untouched.
+fn a_copy_out_to_a_read_only_page_is_refused() {
+    // SAFETY: register-only syscalls with valid arguments.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    // SAFETY: maps the memory object read-only at a kernel-chosen address.
+    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem.max(0) as u64, 0, PAGE, RIGHT_MAP_READ) };
+    if mem < 0 || base < 0 {
+        kprint(b"test-harness: read-only page FAIL\n");
+        exit(1);
+    }
+    // SAFETY: the clock's out-parameter is `base`, a mapped user page this process may only read.
+    let read = unsafe { syscall2(SYS_CLOCK_READ, abi::CLOCK_MONOTONIC, base as u64) };
+    // SAFETY: `base` is mapped readable for a page.
+    let after = unsafe { core::ptr::read_volatile(base as *const u64) };
+    if read != KError::FaultFromUser as i64 || after != 0 {
+        Line::new().s(b"test-harness: a copy to a read-only page landed: ").i(read).s(b" FAIL").end();
+        exit(1);
+    }
+    kprint(b"test-harness: a copy to a read-only page is refused ok\n");
+}
+
 /// The exception demo: see the worker's `SegFault` on `notif`, check its registers, terminate it.
 pub(crate) fn run(notif: u64) {
+    a_copy_out_to_a_read_only_page_is_refused();
     kprint(b"test-harness: mapping a worker stack\n");
     // SAFETY: register-only syscalls with valid arguments.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };

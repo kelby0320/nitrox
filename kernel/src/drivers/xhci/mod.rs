@@ -476,8 +476,10 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: ev_mem, ring: Consumer::new() }),
         _erst: erst,
         port_changes: AtomicU32::new(0),
-        hub_wake: crate::drivers::adopt(wake, KObjectType::InterruptObject),
-        first_round: crate::drivers::adopt(first, KObjectType::PendingOperation),
+        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
+        hub_wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
+        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
+        first_round: unsafe { crate::drivers::adopt(first, KObjectType::PendingOperation) },
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
         pci: desc,

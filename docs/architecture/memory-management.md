@@ -582,10 +582,13 @@ management story.
   public `as_ptr`, and the raw `u64` is crate-private. Construction
   rejects addresses in the kernel half (`addr >= USER_VIRT_END`) and
   misalignments for `T`. Everything outside this module that needs
-  to touch user memory does so through the five copy primitives.
-- **Five copy primitives.** `copy_from_user<T: Copy>`,
-  `copy_to_user<T: Copy>`, `copy_slice_from_user`,
-  `copy_slice_to_user`, `copy_cstr_from_user`. All return
+  to touch user memory does so through the seven copy primitives.
+- **Seven copy primitives.** `copy_from_user<T: Pod>`,
+  `copy_to_user<T: Pod>` (`T` plain data: no padding, every bit
+  pattern a value), `copy_slice_from_user`,
+  `copy_slice_to_user`, `copy_array_from_user` and
+  `copy_array_to_user` (a run of plain data, through the slice
+  variants), `copy_cstr_from_user`. All return
   `Result<_, UserAccessError>`. The slice variants use `rep movsb`
   under `stac` / `clac`; the cstr variant uses a byte-at-a-time
   `lodsb` / `stosb` loop, also under SMAP discipline.
@@ -593,7 +596,9 @@ management story.
   a `(fault_pc, recovery_pc)` pair in the `.user_access_table`
   rodata section (bracketed by linker symbols). The `#PF` handler
   ([`arch::idt::pf_dispatch`](../../kernel/src/arch/x86_64/idt.rs))
-  consults the table on every fault: on match it patches the saved
+  consults the table on every fault: on a match whose address is a
+  user one (`CR2` below `USER_VIRT_END`; a fault on the kernel side
+  is a kernel bug) it patches the saved
   RIP to the recovery PC and `iretq`s. The recovery code closes the
   SMAP window and signals failure to the Rust wrapper. On a table
   miss the handler branches on the fault: a **not-present ring-3**
@@ -603,9 +608,10 @@ management story.
   fatal (a ring-3 fault becomes a `SegFault` notification + suspend;
   a kernel fault dumps and stops the machine).
 - **User-access protections enabled at boot.**
-  [`arch::init_protections`](../../kernel/src/arch/x86_64/paging.rs)
-  runs in `paging_init`. On x86_64 it enables NX, SMEP, and SMAP
-  (panicking if any are absent); a future aarch64 port will use
+  [`ArchCpu::init_protections`](../../kernel/src/arch/x86_64/cpu.rs)
+  runs in `paging_init` and on each AP. On x86_64 it enables NX,
+  write protection (`CR0.WP`), SMEP and SMAP (panicking if SMEP or
+  SMAP is absent); a future aarch64 port will use
   the same entry point to configure PAN / PXN. Phase 1
   hard-requires the protections — the dev loop runs QEMU with
   `-cpu qemu64,+smap,+smep` so TCG exposes them.
