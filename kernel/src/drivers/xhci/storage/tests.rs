@@ -176,7 +176,7 @@ impl Fake {
             rings: [DmaBuffer::alloc(RING_TRBS * 16).unwrap(), DmaBuffer::alloc(RING_TRBS * 16).unwrap()],
             wrap: zeroed(512),
             data: zeroed(BIND_DATA / 8),
-            db: zeroed(32),
+            db: zeroed(256),
         }
     }
 
@@ -294,7 +294,7 @@ fn a_reads_status_is_asked_for_when_its_data_ends_and_the_next_starts_at_its_sta
     let at = csw_trb(&disks, i);
     assert_eq!(
         disks.on_transfer(9, 3, code::SUCCESS, at, 1),
-        Some(Action::Complete { irp: &mut first, status: 0, transferred: 8192 })
+        Some(Action::Complete { irp: &raw mut first, status: 0, transferred: 8192 })
     );
     assert_eq!(fake.trb(1, 1).0[2] & 0x1_FFFF, CBW_LEN as u32, "the next command's wrapper");
     assert_eq!(fake.trb(1, 2).0[0], 0x10_000, "and its data, on OUT for a write");
@@ -374,14 +374,14 @@ fn a_rescan_takes_the_device_only_once_its_queue_has_drained() {
     let mut again = irp(IrpOp::Rescan, 0, 0, &[]);
     assert_eq!(
         disks.submit(&mut again, ctx, 0),
-        Action::Complete { irp: &mut again, status: KError::WouldBlock as i32, transferred: 0 }
+        Action::Complete { irp: &raw mut again, status: KError::WouldBlock as i32, transferred: 0 }
     );
     assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "a command in flight, and one queued");
     disks.on_transfer(5, 3, code::SUCCESS, 0x10_000, 1);
     fake.answer(1, 0);
     let at = csw_trb(&disks, i);
     let ended = disks.on_transfer(5, 3, code::SUCCESS, at, 1);
-    assert_eq!(ended, Some(Action::Complete { irp: &mut first, status: 0, transferred: 512 }));
+    assert_eq!(ended, Some(Action::Complete { irp: &raw mut first, status: 0, transferred: 512 }));
     {
         let d = disks.devs[i].lock();
         let dev = d.as_ref().unwrap();
@@ -392,7 +392,7 @@ fn a_rescan_takes_the_device_only_once_its_queue_has_drained() {
     fake.answer(2, 0);
     let at = csw_trb(&disks, i);
     let ended = disks.on_transfer(5, 3, code::SUCCESS, at, 2);
-    assert_eq!(ended, Some(Action::Complete { irp: &mut later, status: 0, transferred: 512 }));
+    assert_eq!(ended, Some(Action::Complete { irp: &raw mut later, status: 0, transferred: 512 }));
     // **A command queued keeps it waiting by itself**, with nothing in flight: no path here leaves
     // one so, and a rescan taking the device over it would issue it after the new table.
     let mut stuck = irp(IrpOp::Read, 2048, 512, &frags);
@@ -406,7 +406,7 @@ fn a_rescan_takes_the_device_only_once_its_queue_has_drained() {
     assert!(disks.devs[i].lock().as_mut().unwrap().queue.pop().is_some());
     let unit = Lun { blocks: 2048, block_len: 512, record: Some(7), ..Lun::default() };
     assert_eq!(disks.rescan_unit(i), Some(unit), "the unit the hub thread retires the windows of");
-    assert_eq!(disks.begin_rescan(i), BeginRescan::Ready { irp: &mut rescan, lun: 0, unit });
+    assert_eq!(disks.begin_rescan(i), BeginRescan::Ready { irp: &raw mut rescan, lun: 0, unit });
     assert!(disks.devs[i].lock().as_ref().unwrap().recovering, "the device is held");
     assert_eq!(disks.begin_rescan(i), BeginRescan::Nothing, "taken");
     let mut held = irp(IrpOp::Read, 1024, 512, &frags);
@@ -417,12 +417,12 @@ fn a_rescan_takes_the_device_only_once_its_queue_has_drained() {
     let mut stray = irp(IrpOp::Rescan, 0, 0, &[]);
     assert_eq!(
         disks.submit(&mut stray, context(i, 1, epoch), 0),
-        Action::Complete { irp: &mut stray, status: KError::Unsupported as i32, transferred: 0 }
+        Action::Complete { irp: &raw mut stray, status: KError::Unsupported as i32, transferred: 0 }
     );
     let mut waiting = irp(IrpOp::Rescan, 0, 0, &[]);
     disks.submit(&mut waiting, ctx, 0);
     let (_, held) = disks.depart(i);
-    assert_eq!(held[2], Some(&mut waiting as *mut Irp));
+    assert_eq!(held[2], Some(&raw mut waiting));
 }
 
 /// A rescan waiting on a device a failed recovery stranded ends the device.
@@ -444,8 +444,8 @@ fn a_rescan_on_a_stranded_device_ends_it() {
     assert_eq!(disks.end_recovery(i, cmd, End::Stranded, 2), Action::None);
     assert_eq!(disks.begin_rescan(i), BeginRescan::Ended, "to be ended, not waited for");
     let (_, held) = disks.depart(i);
-    assert_eq!(held[1], Some(&mut read as *mut Irp), "the departure completes the stranded read");
-    assert_eq!(held[2], Some(&mut rescan as *mut Irp), "and the rescan");
+    assert_eq!(held[1], Some(&raw mut read), "the departure completes the stranded read");
+    assert_eq!(held[2], Some(&raw mut rescan), "and the rescan");
 }
 
 /// **An eject goes as `START STOP UNIT`, and a unit that stopped is gone**; another runs on.
@@ -467,12 +467,12 @@ fn a_unit_that_stopped_refuses_everything_after_and_says_so_once() {
     disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
     fake.answer(1, 0);
     let done = disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 2);
-    assert_eq!(done, Some(Action::Stopped { irp: &mut eject }));
+    assert_eq!(done, Some(Action::Stopped { irp: &raw mut eject }));
 
     let mut read = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
-    assert_eq!(disks.submit(&mut read, ctx, 3), Action::Ejected { irp: &mut read, said: Some((5, 0)) });
+    assert_eq!(disks.submit(&mut read, ctx, 3), Action::Ejected { irp: &raw mut read, said: Some((5, 0)) });
     let mut rescan = irp(IrpOp::Rescan, 0, 0, &[]);
-    assert_eq!(disks.submit(&mut rescan, ctx, 3), Action::Ejected { irp: &mut rescan, said: None }, "said once");
+    assert_eq!(disks.submit(&mut rescan, ctx, 3), Action::Ejected { irp: &raw mut rescan, said: None }, "said once");
     let mut flush = irp(IrpOp::Flush, 0, 0, &[]);
     assert_eq!(disks.submit(&mut flush, other, 3), Action::None, "the other unit runs on");
 }
@@ -501,17 +501,17 @@ fn what_waited_behind_an_eject_is_never_started_and_answered_by_the_hub_thread()
     disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
     fake.answer(1, 0);
     let done = disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 2);
-    assert_eq!(done, Some(Action::Stopped { irp: &mut eject }));
+    assert_eq!(done, Some(Action::Stopped { irp: &raw mut eject }));
     let inflight = disks.devs[i].lock().as_ref().unwrap().inflight.unwrap().owner;
     assert!(matches!(inflight, Owner::Irp { cmd, .. } if core::ptr::eq(cmd.irp, &theirs)), "the other unit's read");
     assert!(disks.due(2)[i].is_some(), "the hub thread looks at it");
-    assert_eq!(disks.take_stopped(i), Some(Action::Ejected { irp: &mut read, said: Some((5, 0)) }), "said once");
-    assert_eq!(disks.take_stopped(i), Some(Action::Complete { irp: &mut flush, status: 0, transferred: 0 }));
-    assert_eq!(disks.take_stopped(i), Some(Action::Ejected { irp: &mut rescan, said: None }), "the held rescan");
+    assert_eq!(disks.take_stopped(i), Some(Action::Ejected { irp: &raw mut read, said: Some((5, 0)) }), "said once");
+    assert_eq!(disks.take_stopped(i), Some(Action::Complete { irp: &raw mut flush, status: 0, transferred: 0 }));
+    assert_eq!(disks.take_stopped(i), Some(Action::Ejected { irp: &raw mut rescan, said: None }), "the held rescan");
     assert_eq!(disks.take_stopped(i), None);
     assert_eq!(disks.begin_rescan(i), BeginRescan::Nothing, "the rescan went with them");
     let mut after = irp(IrpOp::Flush, 0, 0, &[]);
-    assert_eq!(disks.submit(&mut after, ctx, 3), Action::Complete { irp: &mut after, status: 0, transferred: 0 });
+    assert_eq!(disks.submit(&mut after, ctx, 3), Action::Complete { irp: &raw mut after, status: 0, transferred: 0 });
 }
 
 /// **An eject the unit refuses leaves it running**, completed by the hub thread from the sense.
@@ -610,11 +610,11 @@ fn a_deadline_marked_as_its_command_ends_is_not_charged_to_the_next() {
     assert_eq!(disks.on_transfer(5, 4, code::SUCCESS, 0, DEADLINE_NS + 2), Some(Action::None));
     fake.answer(1, 0);
     let done = disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), DEADLINE_NS + 2);
-    assert_eq!(done, Some(Action::Complete { irp: &mut a, status: 0, transferred: 0 }), "it made it");
+    assert_eq!(done, Some(Action::Complete { irp: &raw mut a, status: 0, transferred: 0 }), "it made it");
     assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, None, "the mark went with it");
     assert!(disks.begin_recovery(i).is_none(), "nothing for the hub thread to recover");
     let running = disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.owner);
-    let b_ptr = &mut b as *mut Irp;
+    let b_ptr = &raw mut b;
     assert!(matches!(running, Some(Owner::Irp { cmd, .. }) if cmd.irp == b_ptr), "the next left running");
     assert_eq!(disks.due(DEADLINE_NS + 3)[i], None, "inside its own deadline");
 }
@@ -647,17 +647,17 @@ fn a_retry_is_in_flight_with_the_submit_that_waited_behind_it() {
     fake.answer(1, 1);
     assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));
     let (fault, cmd, retried) = disks.begin_recovery(i).unwrap();
-    assert_eq!((fault, cmd.irp, retried), (Fault::Status(Status::Failed), &mut a as *mut Irp, false));
+    assert_eq!((fault, cmd.irp, retried), (Fault::Status(Status::Failed), &raw mut a, false));
     let mut b = irp(IrpOp::Flush, 0, 0, &[]);
     assert_eq!(disks.submit(&mut b, ctx, 2), Action::None);
     assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "it waits behind the recovery");
     assert_eq!(disks.end_recovery(i, cmd, End::Retry, 3), Action::None);
     let running = disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.owner);
-    let a_ptr = &mut a as *mut Irp;
+    let a_ptr = &raw mut a;
     assert!(matches!(running, Some(Owner::Irp { cmd, retried: true }) if cmd.irp == a_ptr), "the retry runs");
     let (q, held) = disks.depart(i);
-    assert_eq!((q[0], q[1]), (Some(&mut b as *mut Irp), None), "the one that waited, handed back");
-    assert_eq!(held, [Some(&mut a as *mut Irp), None, None], "and the retry");
+    assert_eq!((q[0], q[1]), (Some(&raw mut b), None), "the one that waited, handed back");
+    assert_eq!(held, [Some(&raw mut a), None, None], "and the retry");
 }
 
 #[test]
@@ -677,8 +677,8 @@ fn a_stranded_command_waits_for_the_departure() {
     disks.submit(&mut b, ctx, DEADLINE_NS + 3);
     assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "nothing starts on a device being ended");
     let (q, held) = disks.depart(i);
-    assert_eq!(q[0], Some(&mut b as *mut Irp));
-    let want = [None, Some(&mut a as *mut Irp), None];
+    assert_eq!(q[0], Some(&raw mut b));
+    let want = [None, Some(&raw mut a), None];
     assert_eq!(held, want, "the stranded command, for after the slot is disabled");
 }
 
@@ -792,12 +792,12 @@ fn a_departed_devices_node_is_refused_and_its_slot_reused_under_a_new_epoch() {
     disks.submit(&mut inflight, old, 0);
     disks.submit(&mut queued, old, 0);
     let (q, f) = disks.depart(disks.slot_of(14).unwrap());
-    assert_eq!(q[0], Some(&mut queued as *mut Irp), "the queue handed back");
-    assert_eq!(f, [Some(&mut inflight as *mut Irp), None, None], "and the command in flight");
+    assert_eq!(q[0], Some(&raw mut queued), "the queue handed back");
+    assert_eq!(f, [Some(&raw mut inflight), None, None], "and the command in flight");
     let mut late = irp(IrpOp::Flush, 0, 0, &[]);
     assert_eq!(
         disks.submit(&mut late, old, 0),
-        Action::Complete { irp: &mut late, status: KError::PeerClosed as i32, transferred: 0 }
+        Action::Complete { irp: &raw mut late, status: KError::PeerClosed as i32, transferred: 0 }
     );
 
     let (again, new_epoch) = disks.take(fake.dev(50)).unwrap();
@@ -806,7 +806,7 @@ fn a_departed_devices_node_is_refused_and_its_slot_reused_under_a_new_epoch() {
     let mut stale = irp(IrpOp::Flush, 0, 0, &[]);
     assert_eq!(
         disks.submit(&mut stale, old, 0),
-        Action::Complete { irp: &mut stale, status: KError::PeerClosed as i32, transferred: 0 },
+        Action::Complete { irp: &raw mut stale, status: KError::PeerClosed as i32, transferred: 0 },
         "the old node reaches nothing of the new device"
     );
     let mut fresh = irp(IrpOp::Flush, 0, 0, &[]);

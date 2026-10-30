@@ -213,7 +213,7 @@ fn a_command_issued_after_the_slot_read_idle_is_not_retired() {
         crate::dpc::run_pending();
         assert!(retired.is_null(), "flush {flush}: retired while the HBA runs it");
         assert_eq!(irp.status, PENDING, "flush {flush}");
-        assert_eq!(d.state.lock().inflight, &mut irp as *mut Irp, "flush {flush}: still in flight");
+        assert!(core::ptr::eq(d.state.lock().inflight, &irp), "flush {flush}: still in flight");
     }
 }
 
@@ -233,7 +233,7 @@ fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
     assert_eq!(settle_polled(&d, false), Some(true));
     crate::dpc::run_pending();
     assert_eq!((first.status, first.transferred), (IO_ERROR, 0), "failed, whatever the count said");
-    assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "the next issued");
+    assert!(core::ptr::eq(d.state.lock().inflight, &second), "the next issued");
     assert_eq!(d.state.lock().fault, CLEAR);
 }
 
@@ -256,7 +256,7 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         assert_eq!(first.status, PENDING, "keeps {keeps}: not retired, the watch thread's");
         assert_eq!(d.state.lock().fault, FAULTED, "keeps {keeps}");
         let irp = claim(&d, 0, false).expect("a reported fault is claimed");
-        assert_eq!(irp, &mut first as *mut Irp);
+        assert!(core::ptr::eq(irp, &first));
         assert_eq!(claim(&d, 0, true), None, "and only once");
         write32(d.port_base, PX_CI, 0);
         write32(d.port_base, PX_TFD, 0x50);
@@ -269,7 +269,7 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         assert!(recover(&d, irp));
         crate::dpc::run_pending();
         assert_eq!(first.status, IO_ERROR, "keeps {keeps}");
-        assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "keeps {keeps}: the next issued");
+        assert!(core::ptr::eq(d.state.lock().inflight, &second), "keeps {keeps}: the next issued");
         assert_eq!(d.state.lock().fault, CLEAR, "keeps {keeps}");
         assert_eq!(read32(d.port_base, PX_SERR), !0, "keeps {keeps}: the error latched");
         assert_eq!(read32(d.port_base, PX_IS), !0, "keeps {keeps}");
@@ -297,7 +297,7 @@ fn a_command_past_its_deadline_is_recovered_and_failed() {
     assert!(recover(&d, irp));
     crate::dpc::run_pending();
     assert_eq!(first.status, IO_ERROR);
-    assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "the next issued");
+    assert!(core::ptr::eq(d.state.lock().inflight, &second), "the next issued");
 }
 
 /// **A fault with nothing in flight holds what is submitted until the port is back**: one issued
@@ -321,7 +321,7 @@ fn a_fault_with_nothing_in_flight_holds_what_comes_until_the_port_is_back() {
     assert_eq!((d.state.lock().inflight, read32(d.port_base, PX_CI)), (idle, 0), "recovering: queued");
     assert!(recover(&d, irp));
     crate::dpc::run_pending();
-    assert_eq!(d.state.lock().inflight, &mut first as *mut Irp, "the first issued once the port is back");
+    assert!(core::ptr::eq(d.state.lock().inflight, &first), "the first issued once the port is back");
     assert_eq!(read32(d.port_base, PX_CI), 1);
     assert_eq!((first.status, second.status), (PENDING, PENDING));
 }
@@ -347,7 +347,7 @@ fn a_port_that_will_not_stop_keeps_its_command_and_fails_the_rest() {
     crate::dpc::run_pending();
     assert!(d.state.lock().dead);
     assert_eq!(first.status, PENDING, "kept");
-    assert_eq!(d.state.lock().inflight, &mut first as *mut Irp, "and still slot 0's");
+    assert!(core::ptr::eq(d.state.lock().inflight, &first), "and still slot 0's");
     assert_eq!(second.status, IO_ERROR, "queued: failed");
     submit(&mut third, ctx(&d));
     crate::dpc::run_pending();
