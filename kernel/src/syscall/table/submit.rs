@@ -97,17 +97,6 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 ///
 /// **And its rescan and its eject**, `irp_op` saying which, with the same rules (`WRITE`). A
 /// partition and every disk but a USB one answer `Unsupported`, through the IRP.
-/// An I/O buffer's size; a borrowed one is refused, as the kernel and the device reach its frames.
-pub(super) fn io_buffer_size(buf: &ObjectRef) -> Result<u64, KError> {
-    assert_eq!(buf.object_type(), KObjectType::MemoryObject);
-    // SAFETY: `buf` pins a live `MemoryObject`, its type just checked.
-    let mo = unsafe { &*(buf.as_ptr() as *const MemoryObject) };
-    if !mo.kernel_reachable() {
-        return Err(KError::InvalidArgument);
-    }
-    Ok(mo.size() as u64)
-}
-
 fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::IrpOp) -> SysResult {
     if op.buffer != 0 || op.buf_offset != 0 || op.offset != 0 || op.length != 0 {
         return Err(KError::InvalidArgument);
@@ -137,4 +126,15 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
             Err(e)
         }
     }
+}
+
+/// An I/O buffer's size; a borrowed one is refused, as the kernel and the device reach its frames.
+pub(super) fn io_buffer_size(buf: &ObjectRef) -> Result<u64, KError> {
+    assert_eq!(buf.object_type(), KObjectType::MemoryObject);
+    // SAFETY: `buf` pins a live `MemoryObject`, its type just checked.
+    let mo = unsafe { &*(buf.as_ptr() as *const MemoryObject) };
+    if !mo.kernel_reachable() {
+        return Err(KError::InvalidArgument);
+    }
+    Ok(mo.size() as u64)
 }
