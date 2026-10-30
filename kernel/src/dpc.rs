@@ -213,7 +213,13 @@ impl OneAtATime {
     }
 
     /// Run `body` round after round while others ask, or have the running instance do it.
-    pub fn run(&self, mut body: impl FnMut()) {
+    pub fn run(&self, body: impl FnMut()) {
+        self.run_releasing(body, || {});
+    }
+
+    /// [`run`](Self::run), calling `releasing` between an instance's last round and its letting go:
+    /// an ask there is caught only by the re-check after it.
+    fn run_releasing(&self, mut body: impl FnMut(), mut releasing: impl FnMut()) {
         // `SeqCst`: each side stores then loads (ask, then check running; release, then re-check),
         // and only one order of all four keeps both instances from missing the other.
         self.again.store(true, Ordering::SeqCst);
@@ -221,6 +227,7 @@ impl OneAtATime {
             while self.again.swap(false, Ordering::SeqCst) {
                 body();
             }
+            releasing();
             self.running.store(false, Ordering::SeqCst);
             if !self.again.load(Ordering::SeqCst) {
                 break;
@@ -259,6 +266,21 @@ mod tests {
         assert_eq!(*rounds.borrow(), [1, 1], "a round each, one after the other");
         instance(&s, &depth, &rounds, false);
         assert_eq!(rounds.borrow().len(), 3, "and the next instance runs alone");
+    }
+
+    /// **An instance asking as the running one lets go is still served**, by the running one's
+    /// re-check: without it, its work stayed in the ring with nothing to run it.
+    #[test]
+    fn an_instance_asking_as_the_running_one_lets_go_is_still_served() {
+        use core::cell::Cell;
+        let (s, rounds, asked) = (OneAtATime::new(), Cell::new(0), Cell::new(false));
+        let ask = || {
+            if !asked.replace(true) {
+                s.run(|| unreachable!("a round beside the running one"));
+            }
+        };
+        s.run_releasing(|| rounds.set(rounds.get() + 1), ask);
+        assert_eq!(rounds.get(), 2, "a round for the ask, after the first");
     }
 
     /// **Two CPUs, each running it after its work arrived**: no two rounds overlap, which Miri's
