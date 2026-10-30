@@ -32,12 +32,15 @@ pub const fn field_size<S, T: Pod>(_: fn(&S) -> &T) -> usize {
     size_of::<T>()
 }
 
-/// Implement [`Pod`] for the struct `$ty`, naming every field. The build fails if one is not plain
-/// data, or if their sizes do not fill the struct, as a field left out or padding leaves them.
+/// Implement [`Pod`] for the struct `$ty`, naming each field once. The build fails on a field left
+/// out or named twice, on one not plain data, and on padding, which leaves the sizes short.
 macro_rules! pod {
-    ($ty:ty { $($field:tt),+ $(,)? }) => {
-        // SAFETY: the assertion below: every field is `Pod`, and the fields fill the struct.
+    ($ty:path { $($field:tt),+ $(,)? }) => {
+        // SAFETY: the checks below: each field named once, each `Pod`, and together the struct.
         unsafe impl $crate::libkern::pod::Pod for $ty {}
+        const _: fn($ty) = |v| {
+            let $ty { $($field: _),+ } = v;
+        };
         const _: () = assert!(
             core::mem::size_of::<$ty>() == 0 $(+ $crate::libkern::pod::field_size(|s: &$ty| &s.$field))+,
             "a field not named, or padding"
