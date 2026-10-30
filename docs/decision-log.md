@@ -37205,3 +37205,35 @@ to fix here): **a block IRP's pointer is made from its box's pointer**, so `fini
 whole box through it. Made from a borrow of the `irp` field, it carried that field's provenance
 alone, and `finish`'s write of the box's reclaim link, past the field, was undefined behaviour on
 every block completion. Natively nothing showed it.
+
+## 2026-10-30 — Before Phase 7, Part I: Limine's responses through one type, ports behind owners
+
+Groups N and H of the survey's triage, boot and the platform with the pid source, made seven
+decisions:
+
+- **Every Limine request is a `limine::Request<R, X>`**, a plain `static` whose response is an
+  `AtomicPtr`, read volatile (kplat-o2, kplat-d13): without `#[used]`, `rustc -O` folds a plain or
+  `Relaxed` atomic load of a static the program never writes to its null. The responses' pointers
+  are private behind safe accessors that walk to the count and cut strings at a bound.
+- **Nothing kept past boot points into Limine's memory**: the command line is copied, up to 1024
+  bytes (kplat-d6), as the module paths and the framebuffer's layout already were. No `BootToken`
+  type: the borrows that remain end at boot. The stacks the processors started on and the APs
+  parked past `MAX_CPUS` are still Limine's, and reclaiming its memory must first move both.
+- **The IOAPIC's registers are reached only under a leaf lock**, a route's whole entry and a mask's
+  read-modify-write in one hold (kplat-d17). Any CPU, or an ISR, may route, mask or unmask.
+- **An IOAPIC route refuses what its entry cannot hold**: a destination wider than eight bits, or a
+  GSI it has no entry for (kplat-d14). `install_intx` and `install_isa_irq` return `Option<u8>`,
+  asked before a vector is taken, as `install_msi` does; AHCI declines the controller, the console
+  leaves RX unarmed, and PS/2 is polled.
+- **The RTC is one `arch::Rtc`, held by `clock::RTC`**, which replaces `clock::SETTING` (kplat-o14).
+  Its reads are safe; a write stays unsafe for its register. No shared index/data type: the
+  IOAPIC's, the CMOS's and the PCI configuration pair share neither width nor rule, and the last's
+  one user is the reset, on a stopped machine, where a lock could only deadlock it.
+- **A frame is written only through the object that owns it**: `klog` copies into a
+  `&MemoryObject` (kplat-d15), and **a `SerialPort` is COM1's**, made only in serial.rs (kplat-d20).
+- **A spawn is refused once the pids are spent**, with `OutOfMemory` (sched-d14), rather than pids
+  widened to 64 bits, which would change `ChildExited` and every pid in the ABI. No new error code:
+  error-codes.md's `OutOfMemory` names process ids too.
+
+sched-d15, an AP whose x2APIC id is 256 or more, stays **later**, as triaged; kplat-d12 was fixed
+before this group.

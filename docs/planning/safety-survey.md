@@ -900,7 +900,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `a_dpc_past_the_capacity_is_fatal` hold the bound at both sides. The survey's reproduction, a
   queue reserved larger than its drain buffer, cannot be written now.
 
-- [ ] **sched-d14** `kernel/src/sched.rs:368` — `alloc_pid` uses `next_pid.wrapping_add(1)`, so
+- [x] **sched-d14** `kernel/src/sched.rs:368` — `alloc_pid` uses `next_pid.wrapping_add(1)`, so
   after 2^32-2 spawns pids come round to 0, 1, 2, and so on. `sched.rs:238` says "No pid reuse" and
   `docs/architecture/handle-system.md:343` treats pid reuse as no hazard, yet handle ownership is
   keyed solely by `owner_pid` (`handle/global.rs`). After about 4.29 billion
@@ -911,6 +911,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by a host test in `sched/tests.rs` (since removed): `SCHED.next_pid = u32::MAX`, then
   `alloc_pid()` four times gave 0xffffffff, 0, 1, 2 ("the pid source wrapped"). The spawn count
   needed keeps it low. abi. Low. **Fix.**
+  Fixed in `3fe982fa`: `take_pid` refuses once the pids are spent, and a spawn is refused
+  `OutOfMemory`; fails without it: `pids_are_refused_once_spent_never_reused` (a wrapping add, or a
+  saturating one).
 
 - [ ] **sched-d15** `kernel/src/arch/x86_64/smp.rs:39` — `adopt_dense_index` matches `hw_apic_id()`
   (CPUID.01H:EBX[31:24], 8 bits) against the 32-bit `lapic_id`s the BSP bound. An AP whose x2APIC
@@ -2454,7 +2457,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `copy_from_user::<bool>` of byte 0x02: "constructing invalid value of type bool: encountered
   0x02" at user_access.rs:199. Native run printed "read as false". abi. Medium. **Fix**, as kobj-d6.
   Fixed in `efb315e2`, as kobj-d6.
-- [ ] **kplat-d6** `kernel/src/main.rs:145` — The kernel command line is recorded as a
+- [x] **kplat-d6** `kernel/src/main.rs:145` — The kernel command line is recorded as a
   `&'static [u8]` into Limine's bootloader-reclaimable memory (`c_bytes` returns an unbounded
   lifetime, main.rs:543), and `/proc/cmdline` serves it on every lookup. The `'static` holds
   only because the buddy takes `MEMMAP_USABLE` alone. Triggering change: reclaiming
@@ -2468,6 +2471,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   drop the Vec, `line().to_vec()` gave "constructing invalid value of type &[u8]: encountered a
   dangling reference (use-after-free)" at cmdline.rs:52 (`probe_recorded_line`). ownership.
   Medium. **Fix.**
+  Fixed in `018a00a4`: `cmdline::record` copies the line, up to 1024 bytes, into the kernel's own
+  memory; fails without it: `the_kept_line_is_a_copy_cut_at_its_bound`, whose shape run on the old
+  `record`, given `c_bytes`'s unbounded lifetime, read the overwritten source. The framebuffer's
+  layout and the module paths were already copied. The stacks the processors started on and the
+  APs parked past `MAX_CPUS` still live in Limine's memory, which boot-flow.md now says.
 - [x] **kplat-d7** `kernel/src/arch/x86_64/paging.rs:482` — The page-table walkers (`translate`,
   `attribute_index`, `walk_to_pt`) read PTEs with plain non-atomic loads, and `map_page`,
   `unmap_page` and `ensure_kernel_intermediate` write leaf and PML4 slots with plain stores,
@@ -2551,7 +2559,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `165dae67`: `plain_mapping` is `kvmap::map_device`, whose `map_all` undoes a partial
   map; fails without the undo: `a_range_that_runs_out_of_page_tables_is_undone`, which drives
   `map_all` through `VmapFrames` rather than `map_device`.
-- [ ] **kplat-d13** `kernel/src/main.rs:493` — The SAFETY arguments for the Limine response
+- [x] **kplat-d13** `kernel/src/main.rs:493` — The SAFETY arguments for the Limine response
   reads (main.rs:55, 493-496, 1108-1111) say a raw-pointer copy, or `static mut` itself, stops
   the optimiser folding the pre-Limine null. Neither does. The read survives only because each
   request is `#[used]`, and reading memory written outside the program is the job of a
@@ -2562,7 +2570,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: `rustc -O` on a `static mut` in `.limine_requests` read with
   `(&raw const R).read().is_null()`. With `#[used]` it emits `cmpq $0, R(%rip)`. Without it
   emits `movb $1, %al`. abi. Low. **Fix.**
-- [ ] **kplat-d14** `kernel/src/arch/x86_64/ioapic.rs:217` — `X86IoApic::route` casts the 32-bit
+  Fixed in `018a00a4`, with kplat-o2: `Request::response` reads volatile. Shown by `rustc -O` with
+  no `#[used]`: the volatile read stays `cmpq $0, A+40(%rip)`, where the old raw-pointer copy and a
+  `Relaxed` atomic load both fold to `movb $1, %al`.
+- [x] **kplat-d14** `kernel/src/arch/x86_64/ioapic.rs:217` — `X86IoApic::route` casts the 32-bit
   x2APIC destination with `dest as u8`, silently truncating, where its MSI sibling
   `irq_install::compose` refuses ids above 0xFF (test
   `a_destination_wider_than_the_field_is_refused_rather_than_truncated`). On a machine whose
@@ -2571,7 +2582,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   interrupts are lost instead of the install being refused.
   Unverified: QEMU boots use APIC id 0 or 1; it needs a machine with an x2APIC id of 256 or
   more. abi. Low. **Fix.**
-- [ ] **kplat-d15** `kernel/src/klog.rs:237` — `copy_into_frames(frames: &[PhysAddr])` is a safe
+  Fixed in `a53111c5`: `route` names the destination with `u8::try_from` and says whether it
+  routed, and `install_intx` and `install_isa_irq` ask before taking a vector and return
+  `Option<u8>`: AHCI declines, the console leaves RX unarmed, PS/2 polls. Fails without it:
+  `a_destination_wider_than_the_entry_is_refused_rather_than_truncated`. Boot probes drove each
+  refusal through its caller. Still unverified on a boot CPU with an x2APIC id of 256 or more.
+- [x] **kplat-d15** `kernel/src/klog.rs:237` — `copy_into_frames(frames: &[PhysAddr])` is a safe
   pub fn that writes the log through the HHDM into whatever frames it is given; its SAFETY
   comment (klog.rs:253-255, "within an owned, HHDM-mapped frame") is a claim about the caller
   that nothing enforces. Latent: the single caller (kernel_server.rs:306) passes a fresh
@@ -2583,6 +2599,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   PhysAddr passed with no unsafe in the test, had 11 log bytes written into it
   (`victim[0..4]` = [112, 114, 111, 98]; `victim[0] != 0xAB`). ownership, opportunities. Low.
   **Fix.**
+  Fixed in `5ac6215f`: `klog::copy_into_object(&MemoryObject)` writes through `copy_in`, and
+  klog.rs has no unsafe left; fails without it: `the_log_is_copied_into_its_object_cut_at_its_size`
+  (a cap past the object, or every run at offset 0).
 - [ ] **kplat-d16** `kernel/src/main.rs:874` — `run_first_userspace` allocates pid-1
   handle-table entries (`notif_h`, then `ns_h` and `system_control_h`) as raw u64s, then returns
   on twelve later failure paths (main.rs:877, 888, 894, 900, 934, 943, 949, 962, 972, 980,
@@ -2591,7 +2610,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   any `bind_kernel_server`, or `spawn_user` leaks them to a process that will never exist.
   Unverified: by path (`notif_h` at main.rs:863-871, and the early returns read). Reachable
   only by a boot-time OOM or bind failure, not injected. ownership. Low. **Plan**, in P1.
-- [ ] **kplat-d17** `kernel/src/arch/x86_64/ioapic.rs:55` — IOAPIC registers use an indirect
+- [x] **kplat-d17** `kernel/src/arch/x86_64/ioapic.rs:55` — IOAPIC registers use an indirect
   IOREGSEL-then-IOWIN protocol and `set_rte_mask` is a read-modify-write, but nothing
   serialises them, and the `ArchIrqRouter` route/mask/unmask contracts do not ask callers to
   (7 call sites: 130, 137, 190, 199, 200, 221, 222). Correctness rests on every caller running
@@ -2602,6 +2621,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kernel/docs/lock-ordering.md.
   Unverified: no host seam for the MMIO; a host test with a fake register pair driven in the
   interleaved order would settle it. concurrency. Low. **Fix.**
+  Fixed in `b3040217`: the registers are an `IoApic` in `IOAPIC: IrqSpinLock<Option<..>>`, a leaf,
+  reached only through its guard; a route writes its entry, and a mask its read-modify-write, in
+  one hold. Structural, so no test drives the interleaving; the rewritten entry bound has
+  `an_ioapic_serves_its_gsis_and_neither_neighbour`.
 - [x] **kplat-d18** `kernel/src/tlb.rs:96` — `shootdown` reads `me` and `online` before
   `preempt_disable` (line 113), then takes the sole-online-CPU fast path and invalidates
   "locally". If the thread migrates in between, it invalidates the new CPU's TLB and the CPU
@@ -2624,7 +2647,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   would settle it. concurrency. Low. **Fix.**
   Fixed in `dc2ad6ee`: `HOLDER` is read only with interrupts masked; fails without it:
   `this_holder`'s assertion, which panicked `test-qemu` through `with_console_waiting`.
-- [ ] **kplat-d20** `kernel/src/arch/x86_64/serial.rs:50` — `SerialPort::new(base: u16)` is a
+- [x] **kplat-d20** `kernel/src/arch/x86_64/serial.rs:50` — `SerialPort::new(base: u16)` is a
   pub safe `const fn`, and `init`/`write_byte`/`read_byte`/`set_loopback`/`enable_rx_interrupt`
   do `outb`/`inb` at base+0..7 for any base. The SAFETY arguments ("the COM1 base port, which
   this driver exclusively owns") rely on base == COM1_BASE, which nothing enforces.
@@ -2633,6 +2656,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   unsafe block. No code outside serial.rs uses `SerialPort` today.
   Demonstrated by path, read end to end; grep outside serial.rs found no use. opportunities.
   Low. **Fix.**
+  Fixed in `08f925b0`: `SerialPort` holds nothing and only serial.rs makes one;
+  `SerialPort::new(0xCF8)` and `SerialPort(())` from drivers/ no longer compile (E0599, E0603).
 - [x] **kplat-d21** `kernel/src/arch/x86_64/syscall.rs:114` — `set_syscall_kernel_stack(top: u64)`
   and `ArchCpu::set_kernel_stack(top: u64)` (arch/cpu.rs:23, TSS.RSP0) are safe, yet the value
   becomes the stack pointer the hardware loads on the next syscall or ring-3 trap
@@ -2676,7 +2701,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   typed roots make it large. Closes: the CAS-versus-plain-read data race (kplat-d7), a dangling
   root, an out-of-range slot index. Depends on: nothing. soundness, opportunities. Value high,
   effort large. **Plan**, in P3.
-- [ ] **kplat-o2** encapsulate: every Limine request read by hand (`(&raw const X).read()
+- [x] **kplat-o2** encapsulate: every Limine request read by hand (`(&raw const X).read()
   .response`, null check, `&*`, raw `.add(i)` array walks, `c_bytes`/`CStr::from_ptr` strings,
   each with its own SAFETY text) plus ten needless `unsafe impl Sync` on `static mut`
   request statics — 56 sites (36 unsafe blocks counted by awk over main.rs:400-640 and
@@ -2697,6 +2722,13 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   unbounded `CStr::from_ptr` on module paths (main.rs:1071), about 32 of main.rs's 57 unsafe
   blocks. Depends on: nothing. abi, ownership, soundness, opportunities. Value high, effort
   medium. **Fix.**
+  Done in `018a00a4`: one `limine::Request<R, X>`, its response an `AtomicPtr`, with no `static
+  mut` and no `unsafe impl Sync`; the responses' pointers private behind safe accessors that walk
+  to the count and cut strings at a bound; the buddy's memory-map walks safe. Unsafe blocks in
+  main.rs, acpi.rs, buddy.rs and limine.rs went from 100 to 66. Tests:
+  `a_request_reads_the_response_limine_wrote`, `an_array_is_walked_to_its_count_past_its_nulls`
+  (a walk that stops at a null, or one past the count, fails it). No `BootToken`: nothing kept past
+  boot borrows Limine's memory.
 - [ ] **kplat-o3** encapsulate: a CPU index read from hardware (`rdtscp_aux`/`Smp::current_cpu`)
   and then used to index per-CPU state, with migration between read and use left to each
   caller, the per-CPU arrays indexed through unchecked `.add(idx)`, and `init_this_cpu(u32)` a
@@ -2875,7 +2907,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   effort small. **Fix.**
   Finished in `7be20327`: `KernelStackTop`, and `KernelStack::fabricate` in place of the unsafe
   `fabricate_frame` at its callers.
-- [ ] **kplat-o14** encapsulate: index/data port pairs (CMOS 0x70/0x71, IOAPIC IOREGSEL/IOWIN,
+- [x] **kplat-o14** encapsulate: index/data port pairs (CMOS 0x70/0x71, IOAPIC IOREGSEL/IOWIN,
   PCI 0xCF8/0xCFC) driven by unlocked select-then-access helpers, with serialisation held by
   callers (`clock::SETTING` for RTC writes, "called once" for the RTC read, boot-only use for
   the IOAPIC, a stopped machine for reset) — 5 helper fns (rtc.rs:57 `read_reg`, rtc.rs:72
@@ -2890,6 +2922,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   and ioapic.rs. Closes: two contexts interleaving select and access so a write lands in
   another register (kplat-d17). Depends on: nothing. ownership, concurrency. Value low, effort
   small. **Fix.**
+  Done in `b3040217` for the IOAPIC and `1dec3728` for the CMOS pair: `arch::Rtc` is the one value
+  that reaches it, held by `clock::RTC`, which replaces `clock::SETTING`. No shared `IndexedPort`:
+  the pairs share neither width nor rule (the CMOS keeps its NMI bit). The PCI configuration pair's
+  one user is the reset, on a stopped machine, so it takes no lock.
 - [x] **kplat-o15** narrow: the FP/SIMD save area handled through raw `*mut`/`*const
   ArchFpuState` even where the caller holds a `KBox` or `&mut` — 4 sites (`grep -rn
   'fpu_save\|fpu_restore\|fpu_init_area' kernel/src`, less arch/mod.rs: object/thread.rs:186,
