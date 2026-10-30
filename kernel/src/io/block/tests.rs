@@ -180,6 +180,7 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
 
 /// **A block request off its device's blocks, or at an odd buffer offset, reaches no driver**,
 /// through both dispatches.
+// TODO(miri-provenance-tests): its IRP pointer's provenance bites only under Miri; see the entry.
 #[test]
 fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     let _exclusive = crate::dpc::exclusive();

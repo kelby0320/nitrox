@@ -116,7 +116,8 @@ pub(in crate::drivers::xhci) fn bind(
         fault: None,
         hub_result: None,
         // **Held while it binds**, as a rescan holds it: a unit published before the next is bound
-        // takes submits, and they queue rather than start under the binding's commands.
+        // takes submits, and they queue rather than start under the binding's commands. Held
+        // across every unit, `TODO(usb-bind-hold-per-unit)`.
         recovering: true,
         stranded: None,
         rescan: None,

@@ -409,6 +409,15 @@ The shipped binaries are 176–539 KB.
 > (`FileObject::begin_fill`), and a write-back writes a run of pages an IRP. Model B still fills a
 > page a `ReadRange`, and has no consumer.
 
+**A USB stick is held across all its units while it binds — `TODO(usb-bind-hold-per-unit)`.** The
+binding holds the device, as a rescan does, so a unit already published takes submits that queue
+rather than start under the binding's commands (2026-10-30). It holds it until every unit is bound,
+so a card reader whose later slots are slow (TEST UNIT READY retried for up to five seconds a unit)
+keeps its first unit's I/O waiting meanwhile, and a 33rd request is refused `IoError` by the
+32-deep queue. A hold per unit, taken once nothing is in flight and let go after the unit is
+published, would bound the wait by one unit. QEMU's `usb-storage` has one unit, so no gate shows
+it. Trigger: a multi-unit reader on a machine, or a bind that refuses a request.
+
 **A departed USB device keeps its record — `TODO(usb-departed-records)`.** Phase 6 Part A registers
 a node and a record for every arrival, and a record's id is its place, which `/dev/registry/<id>`
 and `device-mgr`'s `usb-<id>` both index by — so removing one would shift every later id. **Part C
@@ -2429,7 +2438,7 @@ is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware
 CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
 survive rather than merely diagnose.
 
-**Four provenance tests fail only under Miri, which no CI job runs — `TODO(miri-provenance-tests)`.**
+**Five provenance tests fail only under Miri, which no CI job runs — `TODO(miri-provenance-tests)`.**
 Each pins a pointer derived so that a later borrow cannot retire it (2026-10-29), and natively it
 passes on the old code as on the new, since the hardware cannot see provenance. So does one half
 of `a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loading`: without
@@ -2437,8 +2446,11 @@ of `a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_lo
 uninitialised byte it reads natively happens to refuse. Run by hand, from
 `kernel/` with `cargo +nightly-2026-07-20 miri test --lib --target x86_64-unknown-linux-gnu` and
 `MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-ignore-leaks'`:
-`the_fpu_area_pointer_may_be_written_through`, `a_disk_over_its_own_bytes_writes_and_reads_them_back`
-and `an_endpoint_holding_another_in_a_held_send_is_refused_too`; and libheap's, from
+`the_fpu_area_pointer_may_be_written_through`, `a_disk_over_its_own_bytes_writes_and_reads_them_back`,
+`an_endpoint_holding_another_in_a_held_send_is_refused_too` and
+`a_block_request_off_its_devices_blocks_or_words_reaches_no_driver`, whose IRP pointer, made from a
+borrow of the `irp` field rather than from its box's pointer, Miri refuses (2026-10-30); and
+libheap's, from
 `userspace/libheap/` with `cargo miri test --target x86_64-unknown-linux-gnu` and
 `MIRIFLAGS='-Zmiri-strict-provenance'`. Trigger: Part I's Miri job
 (`docs/planning/pre-phase-7.md` § Part I, scheduled and by hand), which takes them on.
