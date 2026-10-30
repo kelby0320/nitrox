@@ -51,7 +51,8 @@ pub trait ArchIrqRouter {
     /// identified by local-controller id `dest`, with the given trigger mode and
     /// polarity, and **unmask** it. `irq` is the platform line number (a GSI on
     /// x86, a SPI number on aarch64); resolving a legacy/device IRQ to that line
-    /// number is the architecture's own concern.
+    /// number is the architecture's own concern. Any CPU may call it, or `mask`
+    /// and `unmask`, an ISR included: the router serialises its own registers.
     ///
     /// # Safety
     /// Ring-0 only; valid after [`init`](ArchIrqRouter::init). The caller must

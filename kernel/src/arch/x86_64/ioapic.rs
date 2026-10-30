@@ -8,7 +8,7 @@
 //! neutral [`ArchIrqRouter`] takes a resolved line and vector. [`encode_rte`] and
 //! [`resolve_isa_irq`] are host-tested; the rest runs on-target via [`X86IoApic::self_test`].
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::Cpu;
 use crate::arch::cpu::ArchCpu;
@@ -16,7 +16,8 @@ use crate::arch::irq::ArchIrq;
 use crate::arch::irq_router::{ArchIrqRouter, Polarity, TriggerMode};
 use crate::arch::timer::ArchTimer;
 use crate::arch::x86_64::{acpi, idt, regs};
-use crate::libkern::AllocError;
+use crate::libkern::lockrank::LockRank;
+use crate::libkern::{AllocError, IrqSpinLock};
 use crate::mm::kvmap;
 
 // --- IOAPIC MMIO indirect registers ---
@@ -38,41 +39,55 @@ const PIT_INPUT_HZ: u32 = 1_193_182;
 #[allow(clippy::unusual_byte_groupings, reason = "grouped by the register's fields")]
 const PIT_CH0_MODE2: u8 = 0b00_11_010_0;
 
-static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
-static IOAPIC_GSI_BASE: AtomicU32 = AtomicU32::new(0);
-static IOAPIC_MAX_ENTRIES: AtomicU32 = AtomicU32::new(0);
+/// The IOAPIC once mapped; `None` before [`X86IoApic::init`], or on a machine without one.
+static IOAPIC: IrqSpinLock<Option<IoApic>> = IrqSpinLock::new(LockRank::Leaf, None);
 static PIT_TICKS: AtomicU32 = AtomicU32::new(0);
 static PIT_DPC_RUNS: AtomicU32 = AtomicU32::new(0);
 /// The self-test's DPC; a `static`, so queuing it allocates nothing.
 static PIT_DPC: crate::dpc::Dpc = crate::dpc::Dpc::new(pit_dpc_handler, core::ptr::null_mut());
 
-/// Read an IOAPIC register by index (IOREGSEL, then IOWIN).
-///
-/// # Safety
-/// [`X86IoApic::init`] must have mapped the MMIO page; `idx` a valid register.
-unsafe fn read_reg(idx: u32) -> u32 {
-    let base = IOAPIC_BASE.load(Ordering::Relaxed);
-    debug_assert!(base != 0, "IOAPIC accessed before init");
-    // SAFETY: `base` is the mapped uncached IOAPIC page; select then read the
-    // 32-bit window — the defined indirect-access protocol.
-    unsafe {
-        core::ptr::write_volatile((base + IOREGSEL) as *mut u32, idx);
-        core::ptr::read_volatile((base + IOWIN) as *const u32)
-    }
+/// **The IOAPIC's registers**, each selected (IOREGSEL), then read or written (IOWIN). Reached
+/// only through [`IOAPIC`]'s guard, so no access lands between another's select and its window.
+struct IoApic {
+    base: u64,
+    gsi_base: u32,
+    entries: u32,
 }
 
-/// Write an IOAPIC register by index.
-///
-/// # Safety
-///
-/// As [`read_reg`].
-unsafe fn write_reg(idx: u32, val: u32) {
-    let base = IOAPIC_BASE.load(Ordering::Relaxed);
-    debug_assert!(base != 0, "IOAPIC accessed before init");
-    // SAFETY: as `read_reg`, for a 32-bit indirect write.
-    unsafe {
-        core::ptr::write_volatile((base + IOREGSEL) as *mut u32, idx);
-        core::ptr::write_volatile((base + IOWIN) as *mut u32, val);
+impl IoApic {
+    fn read(&mut self, idx: u32) -> u32 {
+        // SAFETY: `base` is the uncached page `init` mapped for good, and only `init` makes one.
+        unsafe {
+            core::ptr::write_volatile((self.base + IOREGSEL) as *mut u32, idx);
+            core::ptr::read_volatile((self.base + IOWIN) as *const u32)
+        }
+    }
+
+    fn write(&mut self, idx: u32, val: u32) {
+        // SAFETY: as `read`, for a 32-bit write.
+        unsafe {
+            core::ptr::write_volatile((self.base + IOREGSEL) as *mut u32, idx);
+            core::ptr::write_volatile((self.base + IOWIN) as *mut u32, val);
+        }
+    }
+
+    /// The redirection entry serving `gsi`, if this IOAPIC has one.
+    fn entry(&self, gsi: u32) -> Option<u32> {
+        gsi.checked_sub(self.gsi_base).filter(|&idx| idx < self.entries)
+    }
+
+    /// Write entry `idx`, its destination first, so its mask bit takes effect last.
+    fn write_entry(&mut self, idx: u32, (low, high): (u32, u32)) {
+        self.write(REG_REDTBL_BASE + 2 * idx + 1, high);
+        self.write(REG_REDTBL_BASE + 2 * idx, low);
+    }
+
+    fn set_mask(&mut self, gsi: u32, masked: bool) {
+        if let Some(idx) = self.entry(gsi) {
+            let low = self.read(REG_REDTBL_BASE + 2 * idx);
+            let low = if masked { low | 1 << 16 } else { low & !(1 << 16) };
+            self.write(REG_REDTBL_BASE + 2 * idx, low);
+        }
     }
 }
 
@@ -109,31 +124,6 @@ fn resolve_isa_irq(irq: u8, overrides: &[acpi::SourceOverride]) -> (u32, Polarit
         }
     }
     (irq as u32, Polarity::ActiveHigh, TriggerMode::Edge)
-}
-
-fn rte_index(gsi: u32) -> Option<u32> {
-    let base = IOAPIC_GSI_BASE.load(Ordering::Relaxed);
-    let max = IOAPIC_MAX_ENTRIES.load(Ordering::Relaxed);
-    if gsi >= base && gsi < base + max { Some(gsi - base) } else { None }
-}
-
-/// Set or clear an entry's mask bit in place.
-///
-/// # Safety
-///
-/// Ring-0, post-`init`.
-unsafe fn set_rte_mask(gsi: u32, masked: bool) {
-    if let Some(idx) = rte_index(gsi) {
-        // SAFETY: valid index, MMIO mapped.
-        let mut low = unsafe { read_reg(REG_REDTBL_BASE + 2 * idx) };
-        if masked {
-            low |= 1 << 16;
-        } else {
-            low &= !(1 << 16);
-        }
-        // SAFETY: as above.
-        unsafe { write_reg(REG_REDTBL_BASE + 2 * idx, low) };
-    }
 }
 
 /// The self-test interrupt handler: count PIT ticks (EOI is the dispatcher's).
@@ -176,23 +166,14 @@ impl ArchIrqRouter for X86IoApic {
 
         // SAFETY: `io.addr` is the IOAPIC's MMIO frame from the MADT, the kernel's for good.
         let va = unsafe { kvmap::map_mmio(io.addr, 1) }?;
-        IOAPIC_BASE.store(va.as_u64(), Ordering::Relaxed);
-        IOAPIC_GSI_BASE.store(io.gsi_base, Ordering::Relaxed);
-
-        // SAFETY: MMIO now mapped; the version register reports the entry count.
-        let ver = unsafe { read_reg(REG_VER) };
-        let max_entries = ((ver >> 16) & 0xFF) + 1;
-        IOAPIC_MAX_ENTRIES.store(max_entries, Ordering::Relaxed);
-
-        // Mask every redirection entry.
-        let (masked_low, masked_high) = encode_rte(0, 0, Polarity::ActiveHigh, TriggerMode::Edge, true);
-        for idx in 0..max_entries {
-            // SAFETY: idx < max_entries; MMIO mapped.
-            unsafe {
-                write_reg(REG_REDTBL_BASE + 2 * idx + 1, masked_high);
-                write_reg(REG_REDTBL_BASE + 2 * idx, masked_low);
-            }
+        let mut ioapic = IoApic { base: va.as_u64(), gsi_base: io.gsi_base, entries: 0 };
+        ioapic.entries = ((ioapic.read(REG_VER) >> 16) & 0xFF) + 1;
+        let masked = encode_rte(0, 0, Polarity::ActiveHigh, TriggerMode::Edge, true);
+        for idx in 0..ioapic.entries {
+            ioapic.write_entry(idx, masked);
         }
+        let max_entries = ioapic.entries;
+        *IOAPIC.lock() = Some(ioapic);
 
         // Mask the legacy 8259 PICs so external IRQs flow only via the IOAPIC.
         // SAFETY: ring-0 writes to the PIC data ports; `0xFF` masks all lines.
@@ -206,29 +187,27 @@ impl ArchIrqRouter for X86IoApic {
     }
 
     unsafe fn route(irq: u32, vector: u8, dest: u32, trigger: TriggerMode, polarity: Polarity) {
-        if let Some(idx) = rte_index(irq) {
-            let (low, high) = encode_rte(vector, dest as u8, polarity, trigger, false);
-            // SAFETY: valid index, MMIO mapped. Write the high (destination)
-            // dword first, then the low dword — which clears the mask bit last.
-            unsafe {
-                write_reg(REG_REDTBL_BASE + 2 * idx + 1, high);
-                write_reg(REG_REDTBL_BASE + 2 * idx, low);
-            }
+        if let Some(io) = IOAPIC.lock().as_mut()
+            && let Some(idx) = io.entry(irq)
+        {
+            io.write_entry(idx, encode_rte(vector, dest as u8, polarity, trigger, false));
         }
     }
 
     unsafe fn mask(irq: u32) {
-        // SAFETY: ring-0, post-init.
-        unsafe { set_rte_mask(irq, true) };
+        if let Some(io) = IOAPIC.lock().as_mut() {
+            io.set_mask(irq, true);
+        }
     }
 
     unsafe fn unmask(irq: u32) {
-        // SAFETY: ring-0, post-init.
-        unsafe { set_rte_mask(irq, false) };
+        if let Some(io) = IOAPIC.lock().as_mut() {
+            io.set_mask(irq, false);
+        }
     }
 
     unsafe fn self_test() {
-        if IOAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        if IOAPIC.lock().is_none() {
             return; // no IOAPIC to test
         }
         let bsp = crate::arch::Irq::id();
@@ -315,6 +294,17 @@ mod tests {
         assert_ne!(low & (1 << 15), 0, "level => trigger bit set");
         assert_ne!(low & (1 << 16), 0, "masked => mask bit set");
         assert_eq!(high >> 24, 3, "dest in bits 56:63 (high dword 31:24)");
+    }
+
+    /// **An IOAPIC serves the GSIs from its base to its count**, and neither neighbour.
+    #[test]
+    fn an_ioapic_serves_its_gsis_and_neither_neighbour() {
+        let io = IoApic { base: 0, gsi_base: 24, entries: 24 };
+        assert_eq!(io.entry(23), None);
+        assert_eq!(io.entry(24), Some(0));
+        assert_eq!(io.entry(47), Some(23));
+        assert_eq!(io.entry(48), None);
+        assert_eq!(IoApic { base: 0, gsi_base: u32::MAX, entries: 24 }.entry(0), None);
     }
 
     #[test]
