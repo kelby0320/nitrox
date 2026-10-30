@@ -112,7 +112,9 @@ pub(in crate::drivers::xhci) fn bind(
         inflight: None,
         fault: None,
         hub_result: None,
-        recovering: false,
+        // **Held while it binds**, as a rescan holds it: a unit published before the next is bound
+        // takes submits, and they queue rather than start under the binding's commands.
+        recovering: true,
         stranded: None,
         rescan: None,
         queue: Queue::new(),
@@ -153,6 +155,8 @@ pub(in crate::drivers::xhci) fn bind(
     }
     if published == 0 {
         retire(i);
+    } else {
+        act(DISKS.let_go(i, crate::arch::Timer::read_ns()), Some(x));
     }
 }
 

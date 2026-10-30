@@ -247,6 +247,12 @@ fn irp(op: IrpOp, offset: u64, length: u64, frags: &[PhysFrag]) -> Irp {
     Irp::new_block(op, core::ptr::null(), offset, length, buffer, core::ptr::null_mut(), 0)
 }
 
+/// `dev`, held by the hub thread, as its binding holds it.
+fn held(mut dev: Dev) -> Dev {
+    dev.recovering = true;
+    dev
+}
+
 fn csw_trb(d: &Disks, i: usize) -> u64 {
     match d.devs[i].lock().as_ref().unwrap().inflight.unwrap().stage {
         Stage::Status { csw_trb, .. } => csw_trb,
@@ -406,7 +412,7 @@ fn a_rescan_takes_the_device_only_once_its_queue_has_drained() {
     let mut held = irp(IrpOp::Read, 1024, 512, &frags);
     assert_eq!(disks.submit(&mut held, ctx, 3), Action::None);
     assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "queued while the rescan runs");
-    assert_eq!(disks.end_rescan(i, 4), Action::None);
+    assert_eq!(disks.let_go(i, 4), Action::None);
     assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_some(), "and started at its end");
     let mut stray = irp(IrpOp::Rescan, 0, 0, &[]);
     assert_eq!(
@@ -681,12 +687,12 @@ fn a_hub_command_the_dpc_reached_is_waited_for() {
     init_global_heap();
     let disks = Disks::new();
     let mut fake = Fake::new();
-    let (i, _) = disks.take(fake.dev(5)).unwrap();
+    let (i, _) = disks.take(held(fake.dev(5))).unwrap();
     let po = 0x1234 as *mut ();
-    assert!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0));
+    assert_eq!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0), Ok(()));
     assert_eq!(disks.take_back(i), TakeBack::Taken, "before the DPC reached it");
     assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none());
-    assert!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0));
+    assert_eq!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0), Ok(()));
     disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
     fake.answer(2, 0);
     assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Hub { po }));
@@ -758,9 +764,9 @@ fn a_short_read_whose_status_says_nothing_is_missing_fails() {
     assert_eq!(disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));
     assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Short), "left for reset recovery");
 
-    let (j, _) = disks.take(fake.dev(5)).unwrap();
+    let (j, _) = disks.take(held(fake.dev(5))).unwrap();
     let po = 0x1234 as *mut ();
-    assert!(disks.issue_hub(j, po, 0, &scsi::inquiry(), 36, false, 0));
+    assert_eq!(disks.issue_hub(j, po, 0, &scsi::inquiry(), 36, false, 0), Ok(()));
     disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
     assert_eq!(disks.on_transfer(5, 3, code::SHORT_PACKET, 0, 1), Some(Action::None));
     fake.answer(1, 0);
@@ -828,4 +834,52 @@ fn a_departure_completes_its_commands_only_once_the_slot_is_disabled() {
         assert_eq!((a.status, b.status), (moving, moving), "the command in flight and the stranded one");
         assert_eq!(c.status, peer_closed, "a rescan moves nothing, so it completes either way");
     }
+}
+
+/// **A hub command goes only on a device the hub thread holds, and never replaces a read**: a
+/// stick's next unit was bound with its first unit's read in flight, and the read never completed.
+/// Held, as a binding holds it, a read queues behind the hub's commands and starts when it lets go.
+#[test]
+fn a_hub_command_goes_only_on_a_held_device_and_never_replaces_a_read() {
+    init_global_heap();
+    let disks = Disks::new();
+    let mut fake = Fake::new();
+    let (i, epoch) = disks.take(fake.dev(5)).unwrap();
+    let po = 0x1234 as *mut ();
+    let tur = scsi::test_unit_ready();
+    assert_eq!(disks.issue_hub(i, po, 1, &tur, 0, false, 0), Err("its device is not held"), "idle");
+    let frags = [PhysFrag { base: 0x10_000, len: 512 }];
+    let mut r = irp(IrpOp::Read, 0, 512, &frags);
+    disks.submit(&mut r, context(i, 0, epoch), 0);
+    assert_eq!(disks.issue_hub(i, po, 1, &tur, 0, false, 0), Err("its device is not held"));
+    disks.devs[i].lock().as_mut().unwrap().recovering = true;
+    assert_eq!(disks.issue_hub(i, po, 1, &tur, 0, false, 0), Err("its device is not held"), "a read in flight");
+    let owner = disks.devs[i].lock().as_ref().unwrap().inflight.unwrap().owner;
+    assert!(matches!(owner, Owner::Irp { cmd, .. } if core::ptr::eq(cmd.irp, &r)), "the read still in flight");
+
+    let mut other = Fake::new();
+    let (j, epoch) = disks.take(held(other.dev(6))).unwrap();
+    let mut q = irp(IrpOp::Read, 0, 512, &frags);
+    disks.submit(&mut q, context(j, 0, epoch), 0);
+    assert!(disks.devs[j].lock().as_ref().unwrap().inflight.is_none(), "queued behind the binding");
+    assert_eq!(disks.issue_hub(j, po, 1, &tur, 0, false, 0), Ok(()));
+    disks.on_transfer(6, 4, code::SUCCESS, 0, 1);
+    other.answer(1, 0);
+    assert_eq!(disks.on_transfer(6, 3, code::SUCCESS, csw_trb(&disks, j), 1), Some(Action::Hub { po }));
+    assert_eq!(disks.let_go(j, 2), Action::None);
+    let owner = disks.devs[j].lock().as_ref().unwrap().inflight.unwrap().owner;
+    assert!(matches!(owner, Owner::Irp { cmd, .. } if core::ptr::eq(cmd.irp, &q)), "started at the let-go");
+}
+
+/// **A hub command's buffer is cleared before it is sent**: a short answer left the last command's
+/// bytes where its own fell short, and a sense key was judged by an INQUIRY's.
+#[test]
+fn a_hub_commands_buffer_is_cleared_before_it_is_sent() {
+    init_global_heap();
+    let disks = Disks::new();
+    let mut fake = Fake::new();
+    fake.data.iter_mut().for_each(|w| *w = u64::MAX);
+    let (i, _) = disks.take(held(fake.dev(5))).unwrap();
+    assert_eq!(disks.issue_hub(i, 0x1234 as *mut (), 0, &scsi::request_sense(), 18, false, 0), Ok(()));
+    assert_eq!(fake.data[..4], [0, 0, u64::MAX << 16, u64::MAX], "its 18 bytes, and no more");
 }

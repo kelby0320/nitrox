@@ -357,11 +357,14 @@ read it whole, and how many before it came back short or stalled. A session read
 
 ## Mass storage (Part D)
 
-**A bulk-only interface binds as a disk** (`kernel/src/drivers/xhci/storage.rs`), during
+**A bulk-only interface binds as a disk** (`kernel/src/drivers/xhci/storage/bind.rs`), during
 enumeration and in the hub thread: `GET MAX LUN` (a stall means one unit), then for each unit
 `INQUIRY` — a direct-access device, or it is left alone — `TEST UNIT READY` with `REQUEST SENSE`
 between tries for up to five seconds, and `READ CAPACITY(10)`. **Every command at binding is the
-hub thread's own, waited for and bounded at five seconds**, and a stall is recovered in line. A unit
+hub thread's own, waited for and bounded at five seconds**, and a stall is recovered in line. **The
+device is held while it binds**, as a rescan holds it: a unit published before the next is bound
+takes submits, which queue until the binding ends, and a hub command goes on the rings only of a
+held device with no submit's command in flight, its buffer cleared first. A unit
 that is not ready (an empty card reader's slot), or not a block device, is said and left alone.
 
 **A unit of 2³² blocks or more** (Part G): `READ CAPACITY(10)` answers that it cannot say —

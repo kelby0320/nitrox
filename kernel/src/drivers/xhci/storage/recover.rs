@@ -95,7 +95,7 @@ pub(in crate::drivers::xhci) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut D
         }
         None => None,
     };
-    act(DISKS.end_rescan(i, crate::arch::Timer::read_ns()), Some(x));
+    act(DISKS.let_go(i, crate::arch::Timer::read_ns()), Some(x));
     match found {
         Some(Some(n)) => complete(irp, 0, n as u64),
         Some(None) => complete(irp, KError::IoError as i32, 0),
@@ -163,9 +163,7 @@ fn dev_field<T: Default>(i: usize, f: impl FnOnce(&Dev) -> T) -> T {
 fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Result<HubResult, Failed> {
     let po = hub::new_operation()?;
     let now = crate::arch::Timer::read_ns();
-    if !DISKS.issue_hub(i, po.as_ptr(), lun, cdb, len, status_only, now) {
-        return Err(Failed::Device("its device has gone"));
-    }
+    DISKS.issue_hub(i, po.as_ptr(), lun, cdb, len, status_only, now).map_err(Failed::Device)?;
     let at = crate::arch::Timer::read_ns();
     let signalled = matches!(
         // SAFETY: `po` pins the `PendingOperation` waited on.
@@ -378,8 +376,9 @@ impl Disks {
     }
 
     /// **Put one of the hub thread's commands on device `i`'s rings**, its operation at `po`: `cdb`
-    /// for unit `lun`, its data, `len` bytes, into the binding buffer — or, `status_only`, a status
-    /// wrapper alone, for the command last sent. Whether the device is still there.
+    /// for unit `lun`, its data, `len` bytes, into the binding buffer, cleared first — or,
+    /// `status_only`, a status wrapper alone, for the command last sent. **Only on a device the hub
+    /// thread holds** with no submit's command in flight, which it would replace.
     #[allow(clippy::too_many_arguments, reason = "a command's device, operation, unit, CDB, length and stage")]
     pub(super) fn issue_hub(
         &self,
@@ -390,9 +389,12 @@ impl Disks {
         len: u32,
         status_only: bool,
         now: u64,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         let mut d = self.devs[i].lock();
-        let Some(dev) = d.as_mut() else { return false };
+        let Some(dev) = d.as_mut() else { return Err("its device has gone") };
+        if !dev.recovering || matches!(dev.inflight, Some(Command { owner: Owner::Irp { .. }, .. })) {
+            return Err("its device is not held");
+        }
         dev.hub_result = None;
         let owner = Owner::Hub { po };
         if status_only {
@@ -401,11 +403,14 @@ impl Disks {
                 Some(Command { owner, tag, stage: Stage::Data { dci: 0 }, deadline: now + BIND_NS, started: now });
             dev.ask_status(false);
         } else {
+            let len = len.min(BIND_DATA as u32);
+            // SAFETY: the binding buffer holds `BIND_DATA` bytes, and no transfer is using it.
+            unsafe { core::ptr::write_bytes(dev.data_virt as *mut u8, 0, len as usize) };
             let frags = [PhysFrag { base: dev.data_phys, len: len as u64 }];
             let frags = if len == 0 { &frags[..0] } else { &frags[..] };
             dev.issue(owner, lun, cdb, len, len > 0, frags, now);
         }
-        true
+        Ok(())
     }
 
     /// **The unit device `i`'s waiting rescan names**, for the hub thread to retire its partitions'
@@ -418,7 +423,7 @@ impl Disks {
     }
 
     /// **Begin device `i`'s rescan**: once nothing is in flight, queued or recovering, its `Rescan`
-    /// taken and the device held — every submit queued — until [`Disks::end_rescan`]. **`Ended` for
+    /// taken and the device held — every submit queued — until [`Disks::let_go`]. **`Ended` for
     /// a device a failed recovery stranded**, which nothing will make quiet: the hub thread ends
     /// it, and the departure completes the rescan.
     pub(super) fn begin_rescan(&self, i: usize) -> BeginRescan {
@@ -438,8 +443,9 @@ impl Disks {
         BeginRescan::Ready { irp, lun, unit: dev.luns.get(lun as usize).copied().unwrap_or_default() }
     }
 
-    /// **End device `i`'s rescan**: submits start again, and the first queued behind it now.
-    pub(super) fn end_rescan(&self, i: usize, now: u64) -> Action {
+    /// **Let go of device `i`**, held by its binding or a rescan: submits start again, and the first
+    /// queued behind it now.
+    pub(super) fn let_go(&self, i: usize, now: u64) -> Action {
         let mut d = self.devs[i].lock();
         let Some(dev) = d.as_mut() else { return Action::None };
         dev.recovering = false;
