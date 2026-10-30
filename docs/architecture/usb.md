@@ -60,8 +60,10 @@ controller**; a second is declined.
 **Every wait is bounded, and a failure declines the function with its reason** — no USB is a
 diagnosable failure, a hang on a machine with no serial port is not. A decline after the
 controller started halts and resets it first, since it would otherwise go on writing to memory the
-driver frees; **one that will not halt is not reset, and keeps its memory for good**. `usb=off` on the command line declines the controller outright; the installed system
-has no boot menu to type it at, but the live stick's does.
+driver frees. **One that will not halt is not reset, and keeps that memory for good.**
+
+`usb=off` on the command line declines the controller outright; the installed system has no boot
+menu to type it at, but the live stick's does.
 
 **MSI only.** The laptop's controller has MSI with eight vectors and no MSI-X, and the driver
 takes that. **Every gate's controller is QEMU's `nec-usb-xhci` with `msi=on,msix=off`**

@@ -2196,9 +2196,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   IrqSpinLock). Closes: a second publish silently replacing the first (drv-d4), and dereferencing a
   published pointer before initialisation finishes. Depends on: nothing. Lenses: ownership,
   soundness, concurrency, opportunities. Value medium, effort small. **Fix.**
-  Fixed in `ea25abea`: `libkern::Published`, AHCI's and xHCI's statics, the 13 derefs gone. The
-  three hand leaks of a RAM disk and a partition window stay, as kernel/CLAUDE.md forbids a
-  `KBox::leak`. Fails without it: `a_value_is_published_once_and_a_second_is_refused`.
+  Fixed in `ea25abea`: `libkern::Published`, AHCI's and xHCI's statics, the 13 derefs gone, and
+  kernel/CLAUDE.md names it. The hand leaks of the RAM disks and partition windows stay: many
+  values, where a `Published` holds one. Fails without it:
+  `a_value_is_published_once_and_a_second_is_refused`.
 
 - [ ] **drv-o12** encapsulate: `BlockBackend`'s `ctx: *mut ()` is re-cast at every submit and poll
   (Partition, AhciDisk, RamDisk), or is an integer smuggled through the pointer (USB slot/lun/epoch,

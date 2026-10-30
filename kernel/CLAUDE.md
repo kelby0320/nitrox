@@ -90,7 +90,10 @@ This is intentional — strict equality matching prevents subtle ABI mismatches.
   `kernel/docs/lock-ordering.md` § The AddressSpace lock), and a thread ending
   itself at an interrupt's return to ring 3 (§ A thread ends itself).
 - Holding a spinlock across a function call that might allocate or block.
-- Manual `Box::leak` patterns. If you need a `'static` reference, the design is wrong.
+- Manual `Box::leak` patterns. State that lives as long as the kernel is held by an owner that
+  never frees it: a Tier 1 controller's by a `libkern::Published`, which takes its box once, and
+  an object's by a reference kept to it, as a disk's counters keep their node. Short of those, if
+  you need a `'static` reference, the design is wrong.
 - Direct hardware port I/O outside the arch layer.
 - Referencing architecture internals (`arch::x86_64::*`) from code outside
   `kernel/src/arch/`. The `x86_64` submodule is private; reach the arch

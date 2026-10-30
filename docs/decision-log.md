@@ -37173,9 +37173,11 @@ Group M of the survey's triage, the drivers, made ten decisions:
 - **A Tier 1 controller's state is `libkern::Published`**: boxed once, never withdrawn, a second
   publish refused (drv-o11). **A second AHCI controller is declined before it is touched**, as
   xHCI's second is (drv-d4, the bash's drv-8), since one static served neither; a boot disk behind
-  a second controller is not served until multi-controller support, deferred as before. The RAM
-  disk's and the partition windows' leaks to `'static` stay: kernel/CLAUDE.md forbids a
-  `KBox::leak`.
+  a second controller is not served until multi-controller support, deferred as before.
+  kernel/CLAUDE.md names `Published`, and a reference kept to an object as a disk's counters keep
+  their node, as the ways to hold state for the kernel's life (the maintainer's call). The RAM
+  disks' and the partition windows' leaks to `'static` stay as they were: many values, where a
+  `Published` holds one.
 - **Every xHCI ring is a `RingMem`**, which reads a TRB's cycle dword first and writes it last,
   each across a fence (drv-o16, drv-d20).
 - **A DPC whose work must stay in order runs it through `dpc::OneAtATime`**, which makes a second
