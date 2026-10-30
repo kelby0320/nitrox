@@ -93,16 +93,15 @@ impl Nodes {
         Some((index, self.epochs[index].load(Ordering::Acquire)))
     }
 
-    /// **Retire slot `index`'s node**, its device gone: push `releases`, answer a waiting read with
-    /// them, or refuse it if there are none, and complete a waiting lights write `PeerClosed`.
-    /// Thread context, no lock held: completing takes the scheduler's lock, and a drop may free.
-    pub(super) fn retire(&self, index: usize, releases: &[InputEvent], now: u64) {
+    /// **Retire slot `index`'s node**, its device gone: what `releases` pushes, in the hold that
+    /// retires it, answers a waiting read, which is refused if there is nothing; and a waiting
+    /// lights write is completed `PeerClosed`. Thread context, no lock held: completing takes the
+    /// scheduler's lock, and a drop may free.
+    pub(super) fn retire(&self, index: usize, releases: impl FnOnce(&mut Reader), now: u64) {
         let mut scratch = [0u8; DRAIN_MAX];
         let (ready, refused) = {
             let mut r = self.readers[index].lock();
-            if !releases.is_empty() {
-                r.ring.push_group(releases);
-            }
+            releases(&mut r);
             r.retire(&mut scratch, now)
         };
         if let Some((read, n)) = ready {

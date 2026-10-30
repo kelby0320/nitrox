@@ -715,22 +715,24 @@ pub(super) fn depart(x: &Xhci, slot: u8) {
         }
     }
     for (node, decoder) in gone.into_iter().flatten() {
-        match decoder {
-            // **Its keys in batches**, every one pushed before the node retires.
-            Decoder::Keyboard { mut held, .. } => {
-                each_batch(
-                    |out| Some(keyboard::release_all(&mut held, now, out)),
-                    |events| {
-                        NODES.readers[node].lock().offer(events);
-                    },
-                );
-                NODES.retire(node, &[], now);
-            }
-            Decoder::Mouse { buttons, .. } => {
-                let mut released = [InputEvent::default(); mouse::EVENTS_MAX];
-                let n = mouse::release_all(buttons, now, &mut released);
-                NODES.retire(node, &released[..n], now);
-            }
+        let_go(&NODES, node, decoder, now);
+    }
+}
+
+/// **Node `node`'s device has gone**: what `decoder` holds released and the node retired, in one
+/// hold of its reader, so a report the DPC decoded before cannot land after the releases.
+fn let_go(nodes: &Nodes, node: usize, decoder: Decoder, now: u64) {
+    match decoder {
+        // **Its keys in batches**, every one pushed before the node retires.
+        Decoder::Keyboard { mut held, .. } => nodes.retire(
+            node,
+            |r| each_batch(|out| Some(keyboard::release_all(&mut held, now, out)), |e| r.ring.push_group(e)),
+            now,
+        ),
+        Decoder::Mouse { buttons, .. } => {
+            let mut released = [InputEvent::default(); mouse::EVENTS_MAX];
+            let n = mouse::release_all(buttons, now, &mut released);
+            nodes.retire(node, |r| r.ring.push_group(&released[..n]), now);
         }
     }
 }
