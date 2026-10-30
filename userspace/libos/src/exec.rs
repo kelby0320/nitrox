@@ -69,13 +69,15 @@ impl Reactor {
 // --- the Waker: a thin handle onto the reactor ----------------------------
 //
 // The Waker's data pointer references the `block_on` `Reactor`; `Op::poll` reads it
-// back via `cx.waker().data()`. `wake`/`clone`/`drop` are no-ops: `block_on` re-polls
-// after every `sys_wait` (the wait is the wake), and the Waker never escapes it.
+// back via `cx.waker().data()`, but only from a waker whose vtable is `VTABLE`, which only
+// `block_on` makes. A clone gets `CLONE_VTABLE`, since it may outlive the reactor. `wake` and
+// `drop` are no-ops: `block_on` re-polls after every `sys_wait` (the wait is the wake).
 
 static VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_noop, waker_noop, waker_noop);
+static CLONE_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_noop, waker_noop, waker_noop);
 
 unsafe fn waker_clone(data: *const ()) -> RawWaker {
-    RawWaker::new(data, &VTABLE)
+    RawWaker::new(data, &CLONE_VTABLE)
 }
 
 unsafe fn waker_noop(_data: *const ()) {}
@@ -128,9 +130,15 @@ impl Future for Op {
             }
             return Poll::Ready(Ok(res));
         }
-        // SAFETY: libos's `block_on` is the only thing that constructs the Waker, and
-        // it always sets the data pointer to a live `Reactor` for the poll's duration.
-        let reactor = unsafe { &*(cx.waker().data() as *const Reactor) };
+        let waker = cx.waker();
+        if !core::ptr::eq(waker.vtable(), &VTABLE) {
+            // Another executor's waker, or a clone of `block_on`'s: be polled again, unregistered.
+            waker.wake_by_ref();
+            return Poll::Pending;
+        }
+        // SAFETY: only `block_on` makes a waker with `VTABLE`, its data a `Reactor` that lives
+        // for the poll.
+        let reactor = unsafe { &*(waker.data() as *const Reactor) };
         reactor.register(this.po);
         Poll::Pending
     }
@@ -219,6 +227,32 @@ mod tests {
         let mut one = zeroed_results::<1>();
         assert_eq!(sys::wait(&[a.po, b.po], &mut one, 0), 1);
         assert_eq!(sys::last_wait_count(), 1);
+    }
+
+    /// **An `Op` reads no waker's data but `block_on`'s**: another executor's waker keeps its
+    /// data untouched, and a clone kept past `block_on` reads no reactor gone with it.
+    #[test]
+    fn an_op_reads_no_wakers_data_but_block_ons() {
+        static FOREIGN: RawWakerVTable = RawWakerVTable::new(foreign_clone, waker_noop, waker_noop, waker_noop);
+        unsafe fn foreign_clone(data: *const ()) -> RawWaker {
+            RawWaker::new(data, &FOREIGN)
+        }
+        sys::reset();
+        sys::script_next(0, 1, false);
+        let mut op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let state = [0u64; 9];
+        // SAFETY: `FOREIGN`'s functions are no-ops, and `state` outlives the waker.
+        let foreign = unsafe { Waker::from_raw(RawWaker::new(state.as_ptr().cast(), &FOREIGN)) };
+        assert!(Pin::new(&mut op).poll(&mut Context::from_waker(&foreign)).is_pending());
+        assert_eq!(state, [0; 9]);
+
+        let mut kept = None;
+        block_on(core::future::poll_fn(|cx| {
+            kept = Some(cx.waker().clone());
+            Poll::Ready(())
+        }));
+        let kept = kept.unwrap();
+        assert!(Pin::new(&mut op).poll(&mut Context::from_waker(&kept)).is_pending());
     }
 
     #[test]
