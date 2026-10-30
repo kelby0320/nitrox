@@ -130,7 +130,7 @@ pub use mock::{
 };
 
 #[cfg(test)]
-pub use mock::{counts, fail_next_bind, fail_next_submit, last_wait_count, reset, script_next};
+pub use mock::{closed_in_flight, counts, fail_next_bind, fail_next_submit, last_wait_count, reset, script_next};
 
 #[cfg(test)]
 mod mock {
@@ -160,6 +160,7 @@ mod mock {
         closes: u32,
         /// How many handles the last `wait` was handed, as the kernel would be.
         last_wait_count: usize,
+        closed_in_flight: u32,
     }
 
     fn fresh() -> Mock {
@@ -185,9 +186,8 @@ mod mock {
         })
     }
 
-    /// As the kernel answers: `InvalidArgument` for no handles, `InvalidHandle` for one it does
-    /// not hold, and `WouldBlock` for a poll that finds nothing ready. A `results` shorter than
-    /// `handles` panics, where the kernel would write past it.
+    /// As the kernel answers: `InvalidArgument`, `InvalidHandle`, `WouldBlock` for an empty poll.
+    /// A `results` shorter than `handles` panics, where the kernel would write past it.
     pub fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
@@ -226,7 +226,9 @@ mod mock {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
             m.closes += 1;
-            m.pos.remove(&h);
+            if m.pos.remove(&h).is_some_and(|po| !po.ready) {
+                m.closed_in_flight += 1;
+            }
         });
     }
 
@@ -312,6 +314,11 @@ mod mock {
     /// Force the next `ns_bind` to fail with `status` (e.g. `-2` = NoAccess).
     pub fn fail_next_bind(status: i32) {
         MOCK.with(|m| m.borrow_mut().bind_err = Some(status));
+    }
+
+    /// How many POs were closed before they signalled.
+    pub fn closed_in_flight() -> u32 {
+        MOCK.with(|m| m.borrow().closed_in_flight)
     }
 
     /// How many handles the last `wait` was handed.

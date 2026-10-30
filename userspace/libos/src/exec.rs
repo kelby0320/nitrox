@@ -11,7 +11,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use libkern::{IoOp, IoResult, RawHandle};
+use libkern::{IoOp, IoResult, KError, RawHandle};
 
 use crate::error::{Error, Result};
 use crate::sys;
@@ -69,9 +69,8 @@ impl Reactor {
 // --- the Waker: a thin handle onto the reactor ----------------------------
 //
 // The Waker's data pointer references the `block_on` `Reactor`; `Op::poll` reads it
-// back via `cx.waker().data()`, but only from a waker whose vtable is `VTABLE`, which only
-// `block_on` makes. A clone gets `CLONE_VTABLE`, since it may outlive the reactor. `wake` and
-// `drop` are no-ops: `block_on` re-polls after every `sys_wait` (the wait is the wake).
+// back via `cx.waker().data()`, only from a waker with `VTABLE`, which only `block_on` makes; a
+// clone may outlive the reactor, so it gets `CLONE_VTABLE`. Waking is a no-op: the wait wakes.
 
 static VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_noop, waker_noop, waker_noop);
 static CLONE_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_noop, waker_noop, waker_noop);
@@ -84,13 +83,17 @@ unsafe fn waker_noop(_data: *const ()) {}
 
 // --- Op: the core future --------------------------------------------------
 
-/// A future over an in-flight `PendingOperation`: resolves to its [`IoResult`], or an
-/// [`Error`] if it completed with a negative status. Closes the PO on drop.
+/// A future over an in-flight `PendingOperation`, resolving to its [`IoResult`] or an [`Error`].
+/// Closes the PO on drop, **first waiting out an unfinished I/O**: the kernel cannot cancel one,
+/// and its device may still be using the buffer the caller gets back.
 #[must_use = "an Op does nothing unless awaited or passed to block_on"]
 #[derive(Debug)]
 pub struct Op {
     po: u64,
-    /// Set once resolved, so a stray re-poll after `Ready` is a no-op.
+    /// Whether the PO is an I/O's, whose drop must wait for it, rather than a lookup's.
+    io: bool,
+    finished: bool,
+    /// Whether `poll` has returned `Ready`, so its result is handed out once.
     done: bool,
 }
 
@@ -105,13 +108,12 @@ impl Op {
         if po < 0 {
             return Err(Error::from_status(po as i32));
         }
-        Ok(Op::from_po(po as u64))
+        Ok(Op { po: po as u64, io: true, finished: false, done: false })
     }
 
-    /// Wrap an already-submitted `PendingOperation` handle (e.g. from `sys_ns_lookup`)
-    /// as a future; it takes ownership and closes it on drop.
+    /// Wrap a lookup's PO; its drop closes it at once, as the kernel frees a lookup closed unread.
     pub(crate) fn from_po(po: u64) -> Op {
-        Op { po, done: false }
+        Op { po, io: false, finished: false, done: false }
     }
 }
 
@@ -120,15 +122,24 @@ impl Future for Op {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut(); // `Op: Unpin` — no self-referential state.
+        if this.done {
+            // Handed out already: a second `Ok` would give its handle two owners.
+            return Poll::Ready(Err(Error::from_status(KError::InvalidHandle as i32)));
+        }
         let mut r = zeroed_results::<1>();
         let n = sys::wait(&[this.po], &mut r, 0);
         if n >= 1 {
+            this.finished = true;
             this.done = true;
             let res = r[0];
             if res.status < 0 {
                 return Poll::Ready(Err(Error::from_status(res.status)));
             }
             return Poll::Ready(Ok(res));
+        }
+        if n != KError::WouldBlock as i64 {
+            this.done = true;
+            return Poll::Ready(Err(Error::from_status(n as i32)));
         }
         let waker = cx.waker();
         if !core::ptr::eq(waker.vtable(), &VTABLE) {
@@ -146,6 +157,9 @@ impl Future for Op {
 
 impl Drop for Op {
     fn drop(&mut self) {
+        if self.io && !self.finished {
+            sys::wait(&[self.po], &mut zeroed_results::<1>(), u64::MAX);
+        }
         sys::handle_close(self.po);
     }
 }
@@ -253,6 +267,45 @@ mod tests {
         }));
         let kept = kept.unwrap();
         assert!(Pin::new(&mut op).poll(&mut Context::from_waker(&kept)).is_pending());
+    }
+
+    /// **A completed `Op` hands its result out once**, and waits on nothing for a second poll.
+    #[test]
+    fn a_completed_op_hands_its_result_out_once() {
+        sys::reset();
+        sys::script_next(0, 777, true);
+        let mut op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(Pin::new(&mut op).poll(&mut cx), Poll::Ready(Ok(r)) if r.result == 777));
+        let (_s, waits, _c) = sys::counts();
+        assert!(matches!(Pin::new(&mut op).poll(&mut cx), Poll::Ready(Err(_))));
+        assert_eq!(sys::counts().1, waits);
+    }
+
+    /// **An `Op` whose wait fails completes with the error**, where it was polled again for ever.
+    #[test]
+    fn an_op_whose_wait_fails_completes_with_the_error() {
+        sys::reset();
+        sys::script_next(0, 1, false);
+        let mut op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::handle_close(op.po);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(Pin::new(&mut op).poll(&mut cx), Poll::Ready(Err(_))));
+        let mut op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::handle_close(op.po);
+        assert!(block_on(&mut op).is_err());
+    }
+
+    /// **A dropped I/O waits for its device**, and a dropped lookup does not.
+    #[test]
+    fn a_dropped_io_is_waited_out_and_a_lookup_is_not() {
+        sys::reset();
+        sys::script_next(0, 1, false);
+        drop(Op::submit(RawHandle(1), &read_op()).unwrap());
+        assert_eq!(sys::closed_in_flight(), 0);
+        sys::script_next(0, 2, false);
+        drop(Op::from_po(sys::ns_lookup(1, b"/x", 0) as u64));
+        assert_eq!(sys::closed_in_flight(), 1);
     }
 
     #[test]
