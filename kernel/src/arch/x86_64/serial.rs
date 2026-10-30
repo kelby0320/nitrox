@@ -37,8 +37,7 @@ const IER_RX_AVAIL: u8 = 0x01;
 const MCR_NORMAL: u8 = 0x0B;
 const MCR_LOOPBACK: u8 = 0x10;
 
-/// **COM1's 16550 UART**, which this driver owns. Made only here, so its port I/O reaches COM1
-/// alone; `Copy`, holding nothing, so the emergency path can mint one for free.
+/// **COM1's UART**, made only here so its port I/O reaches COM1 alone; `Copy`, holding nothing.
 #[derive(Clone, Copy)]
 pub struct SerialPort(());
 

@@ -46,8 +46,7 @@ static PIT_DPC_RUNS: AtomicU32 = AtomicU32::new(0);
 /// The self-test's DPC; a `static`, so queuing it allocates nothing.
 static PIT_DPC: crate::dpc::Dpc = crate::dpc::Dpc::new(pit_dpc_handler, core::ptr::null_mut());
 
-/// **The IOAPIC's registers**, each selected (IOREGSEL), then read or written (IOWIN). Reached
-/// only through [`IOAPIC`]'s guard, so no access lands between another's select and its window.
+/// **The IOAPIC's registers**, reached (IOREGSEL, then IOWIN) only under [`IOAPIC`]'s guard.
 struct IoApic {
     base: u64,
     gsi_base: u32,
@@ -271,20 +270,29 @@ impl ArchIrqRouter for X86IoApic {
 /// Ring-0, after [`X86IoApic::init`]. `handler` must stay valid for the kernel's
 /// lifetime; the caller must be ready to receive the IRQ once interrupts are enabled.
 pub(crate) unsafe fn install_isa_irq(isa_irq: u8, handler: extern "C" fn()) -> Option<u8> {
-    let bsp = crate::arch::Irq::id();
     let (gsi, polarity, trigger) = resolve_isa_irq(isa_irq, acpi::source_overrides());
-    if !reaches(gsi, bsp) {
+    // SAFETY: forwarded from this fn's contract.
+    unsafe { install(gsi, crate::arch::Irq::id(), handler, trigger, polarity) }
+}
+
+/// **Route `gsi` to `dest` on a fresh vector for `handler`**; `None`, taking none, if it cannot.
+///
+/// # Safety
+/// As [`install_isa_irq`].
+pub(super) unsafe fn install(
+    gsi: u32,
+    dest: u32,
+    handler: extern "C" fn(),
+    trigger: TriggerMode,
+    polarity: Polarity,
+) -> Option<u8> {
+    if !IOAPIC.lock().as_ref().is_some_and(|io| io.names(gsi, dest).is_some()) {
         return None;
     }
     let vector = idt::register_device_handler(handler);
     // SAFETY: forwarded from this fn's contract; the handler for `vector` was just
     // registered, so the routed interrupt has somewhere to land.
-    unsafe { X86IoApic::route(gsi, vector, bsp, trigger, polarity) }.then_some(vector)
-}
-
-/// Whether [`X86IoApic::route`] can route `gsi` to `dest`, asked before a vector is taken.
-pub(super) fn reaches(gsi: u32, dest: u32) -> bool {
-    IOAPIC.lock().as_ref().is_some_and(|io| io.names(gsi, dest).is_some())
+    unsafe { X86IoApic::route(gsi, vector, dest, trigger, polarity) }.then_some(vector)
 }
 
 #[cfg(test)]
@@ -329,6 +337,25 @@ mod tests {
         assert_eq!(io.names(9, 0xFF), Some((9, 0xFF)));
         assert_eq!(io.names(9, 0x100), None);
         assert_eq!(io.names(24, 0), None);
+    }
+
+    /// **A refused install takes no vector**, and one that routes takes one.
+    #[test]
+    fn a_refused_install_takes_no_vector() {
+        extern "C" fn handler() {}
+        let mut regs = [0u32; 8];
+        *IOAPIC.lock() = Some(IoApic { base: regs.as_mut_ptr() as u64, gsi_base: 0, entries: 24 });
+        let taken = idt::device_slots_taken();
+        let install = |gsi, dest| {
+            // SAFETY: a host test, where nothing delivers the interrupt.
+            unsafe { install(gsi, dest, handler, TriggerMode::Level, Polarity::ActiveLow) }
+        };
+        assert_eq!(install(9, 0x100), None);
+        assert_eq!(install(24, 0), None);
+        assert_eq!(idt::device_slots_taken(), taken);
+        assert!(install(9, 0).is_some());
+        assert_eq!(idt::device_slots_taken(), taken + 1);
+        *IOAPIC.lock() = None;
     }
 
     #[test]
