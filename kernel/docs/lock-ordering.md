@@ -55,6 +55,8 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | leaf | AHCI port lock (`AhciDisk::state`, per-port, **`IrqSpinLock`**)| live as of Phase 2. Slot 0's command in flight, its issue time, the fault and give-up state, and the commands queued behind it; taken by the ISR, a submit, the drain DPC, the watch thread and the boot poll, each releasing it before completing an IRP or queuing a DPC |
 | leaf | Completed-IRP reclaim list (`RECLAIM`, **`IrqSpinLock`**)| live as of Phase 4 (2026-08-06). Pushed from the block layer's `finish` at the interrupt-dispatch tail and drained by `reap_pending` in thread context: an idle CPU's, or the reaper's, which the push that brings it to `RECLAIM_WAKE_AT` wakes; both sides take it with nothing else held, and the drain releases it *before* dropping, because a drop reaches the allocator. It exists because freeing the box in the DPC deadlocked against a same-CPU allocator holder |
 | leaf | Completed-IRP list (`io::irp::DONE`, **`IrqSpinLock`**) | live as of 2026-10-29. Pushed by `io::irp::complete` from a driver's ISR, DPC or refusal, and taken whole by the one completion DPC, each with nothing else held: the DPC queue's lock is taken only after it is released |
+| leaf | IOAPIC registers (`ioapic::IOAPIC`, **`IrqSpinLock`**) | live as of 2026-10-30. Every register access selects (IOREGSEL) and reads or writes (IOWIN) under one hold, as does a whole redirection entry, so neither a second CPU nor an ISR can land between a select and its window. Held for MMIO alone |
+| leaf | The RTC (`clock::RTC`, a `SpinLock` holding the one `arch::Rtc`) | live as of 2026-10-30 (`clock::SETTING` before it). Held by the boot's read of the wall clock and by `clock::set` across its write and read-back, so two sets cannot leave the clock and the chip disagreeing, and no CMOS select lands between another's and its data. Port I/O alone; never from an interrupt |
 
 **Why the leaves are the bottom of the order, not "held alone".** They take nothing
 while held, so ranking them last costs nothing and reads more simply than a separate
@@ -97,10 +99,10 @@ not, because `SCHED` is at the top and an interrupt handler is exactly the thing
 it under anything; the result panicked about one boot in three and was withdrawn. See the
 decision log, 2026-07-29.
 
-`SCHED`, `SERIAL`, `KLOG`, `DPC_QUEUE`, `ENTROPY`, `CONSOLE`, and the AHCI port
-lock are [`IrqSpinLock`]s (they mask interrupts while held); every other lock is a
-plain `SpinLock`. See § Interrupt
-semantics for why these need it.
+A lock an interrupt handler or a DPC takes must be an [`IrqSpinLock`] (it masks interrupts while
+held); others may be plain `SpinLock`s. The table marks the `IrqSpinLock`s it lists, and
+not every driver's leaf is listed (xHCI's, PS/2's, the module disks', the framebuffer aperture's).
+See § Interrupt semantics for why these need it.
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
@@ -455,8 +457,8 @@ Two lock families coexist:
   handle-table segment locks (3) all stay plain `SpinLock`.
 - **[`IrqSpinLock`]** — captures the prior interrupt state and `cli`s **before**
   acquiring, restoring it after releasing. Required for data shared between
-  thread and IRQ context: `SCHED` (the timer reschedules) and `SERIAL` (a
-  thread may be printing when the timer fires). These are the **only** two.
+  thread and IRQ context, as `SCHED` (the timer reschedules) and `SERIAL` (a
+  thread may be printing when the timer fires) are. The table marks those it lists.
 
 **Single-CPU deadlock-freedom.** Because an `IrqSpinLock` masks interrupts for
 its whole hold window, a thread holding `SCHED`/`SERIAL` cannot be preempted, so

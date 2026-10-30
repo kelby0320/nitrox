@@ -502,6 +502,11 @@ pub(crate) fn register_device_handler(handler: extern "C" fn()) -> u8 {
     DEVICE_IRQ_BASE + slot as u8
 }
 
+#[cfg(test)]
+pub(crate) fn device_slots_taken() -> usize {
+    NEXT_DEVICE_SLOT.load(Ordering::Relaxed)
+}
+
 macro_rules! device_irq_stub {
     ($name:ident, $vec:tt) => {
         #[unsafe(naked)]

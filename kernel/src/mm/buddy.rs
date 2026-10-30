@@ -67,21 +67,18 @@ impl BuddyAllocator {
     pub unsafe fn new(memory_map: &MemoryMapResponse, hhdm_offset: u64) -> Self {
         let mut min_base = u64::MAX;
         let mut max_end = 0u64;
-        // SAFETY: caller asserts `memory_map` is valid.
-        unsafe {
-            for_each_usable(memory_map, |entry| {
-                let (start, end) = clip_to_managed(entry);
-                if end == 0 {
-                    return;
-                }
-                if start < min_base {
-                    min_base = start;
-                }
-                if end > max_end {
-                    max_end = end;
-                }
-            });
-        }
+        for_each_usable(memory_map, |entry| {
+            let (start, end) = clip_to_managed(entry);
+            if end == 0 {
+                return;
+            }
+            if start < min_base {
+                min_base = start;
+            }
+            if end > max_end {
+                max_end = end;
+            }
+        });
         assert!(min_base < max_end, "buddy: no usable RAM above 1 MiB in Limine memory map");
 
         // `(frame - base_frame) >> (order + 1)` assumes `base_frame` aligns with the pair
@@ -109,8 +106,7 @@ impl BuddyAllocator {
         // pass 2's skip could strip frames from the *next* usable entry.
         let bitmap_reservation = (bitmap_pages * PAGE_SIZE) as u64;
 
-        // SAFETY: caller asserts `memory_map` is valid.
-        let bitmap_phys = unsafe { find_bitmap_region(memory_map, bitmap_reservation) }
+        let bitmap_phys = find_bitmap_region(memory_map, bitmap_reservation)
             .expect("buddy: no usable region large enough for coalesce bitmap");
         let bitmap_phys_end = bitmap_phys + bitmap_reservation;
 
@@ -134,26 +130,21 @@ impl BuddyAllocator {
 
         // TODO: zone split (DMA below 16 MiB, Normal) per docs/architecture/memory-management.md.
 
-        // SAFETY: caller asserts `memory_map` is valid.
-        unsafe {
-            for_each_usable(memory_map, |entry| {
-                let (start, end) = clip_to_managed(entry);
-                if end == 0 {
-                    return;
+        for_each_usable(memory_map, |entry| {
+            let (start, end) = clip_to_managed(entry);
+            if end == 0 {
+                return;
+            }
+            let mut p = start;
+            while p < end {
+                let inside_bitmap = p >= bitmap_phys && p < bitmap_phys_end;
+                if !inside_bitmap {
+                    // A Usable page above 1 MiB, not the bitmap's: the allocator being built owns it.
+                    alloc.free_frame(PhysAddr(p), 0);
                 }
-                let mut p = start;
-                while p < end {
-                    let inside_bitmap = p >= bitmap_phys && p < bitmap_phys_end;
-                    if !inside_bitmap {
-                        // SAFETY: `p` is a page inside a Usable entry,
-                        // above 1 MiB, not occupied by the bitmap. The
-                        // allocator-under-construction owns it.
-                        alloc.free_frame(PhysAddr(p), 0);
-                    }
-                    p += PAGE_SIZE as u64;
-                }
-            });
-        }
+                p += PAGE_SIZE as u64;
+            }
+        });
 
         alloc
     }
@@ -311,27 +302,8 @@ impl BuddyAllocator {
 }
 
 /// Run `f` on every `Usable` entry of `memory_map`.
-///
-/// # Safety
-/// `memory_map` must be a valid Limine response (see
-/// `BuddyAllocator::new`).
-unsafe fn for_each_usable<F: FnMut(&MemoryMapEntry)>(memory_map: &MemoryMapResponse, mut f: F) {
-    let count = memory_map.entry_count as usize;
-    let mut i = 0;
-    while i < count {
-        // SAFETY: caller asserts `entries` references an array of `count`
-        // valid pointers.
-        let entry_ptr = unsafe { *memory_map.entries.add(i) };
-        if !entry_ptr.is_null() {
-            // SAFETY: caller asserts each pointer references a valid
-            // entry that outlives this call.
-            let entry = unsafe { &*entry_ptr };
-            if entry.kind == MEMMAP_USABLE {
-                f(entry);
-            }
-        }
-        i += 1;
-    }
+fn for_each_usable<F: FnMut(&MemoryMapEntry)>(memory_map: &MemoryMapResponse, f: F) {
+    memory_map.entries().filter(|e| e.kind == MEMMAP_USABLE).for_each(f);
 }
 
 /// The page-aligned `[start, end)` of a usable entry above `LOW_MEMORY_LIMIT`; `(0, 0)` if empty.
@@ -348,26 +320,20 @@ fn clip_to_managed(entry: &MemoryMapEntry) -> (u64, u64) {
 
 /// A page-aligned, above-1-MiB physical address inside a Usable entry with room for
 /// `reservation_bytes` (the page-rounded size, so every bitmap page is contained).
-///
-/// # Safety
-/// `memory_map` must be a valid Limine response.
-unsafe fn find_bitmap_region(memory_map: &MemoryMapResponse, reservation_bytes: u64) -> Option<u64> {
+fn find_bitmap_region(memory_map: &MemoryMapResponse, reservation_bytes: u64) -> Option<u64> {
     let mut chosen: Option<u64> = None;
-    // SAFETY: caller asserts `memory_map` is valid.
-    unsafe {
-        for_each_usable(memory_map, |entry| {
-            if chosen.is_some() {
-                return;
-            }
-            let (start, end) = clip_to_managed(entry);
-            if end == 0 {
-                return;
-            }
-            if end - start >= reservation_bytes {
-                chosen = Some(start);
-            }
-        });
-    }
+    for_each_usable(memory_map, |entry| {
+        if chosen.is_some() {
+            return;
+        }
+        let (start, end) = clip_to_managed(entry);
+        if end == 0 {
+            return;
+        }
+        if end - start >= reservation_bytes {
+            chosen = Some(start);
+        }
+    });
     chosen
 }
 
@@ -395,7 +361,8 @@ mod tests {
             let mut entry_ptrs: Vec<*mut MemoryMapEntry> = vec![entries_ptr];
             let entry_ptrs_ptr = entry_ptrs.as_mut_ptr();
 
-            let response = Box::new(MemoryMapResponse { revision: 0, entry_count: 1, entries: entry_ptrs_ptr });
+            // SAFETY: one entry, which the fixture keeps as long as the map.
+            let response = Box::new(unsafe { MemoryMapResponse::fabricated(1, entry_ptrs_ptr) });
 
             Self { _backing: backing, _entries: entries, _entry_ptrs: entry_ptrs, response }
         }

@@ -36,7 +36,7 @@ code depends on — nothing computes a category from a range.
 | `-1` | `InvalidHandle` | The supplied handle is not live in the caller's table. |
 | `-2` | `NoAccess` | The handle is live but lacks a right the operation requires. |
 | `-3` | `OutOfHandles` | The caller's handle table is full. |
-| `-4` | `OutOfMemory` | The kernel heap is exhausted. |
+| `-4` | `OutOfMemory` | The kernel heap is exhausted, or another kernel resource: process ids, for a spawn. |
 
 ### Naming, waiting, and existence
 

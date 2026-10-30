@@ -561,7 +561,8 @@ mod tests {
             let entries_ptr: *mut MemoryMapEntry = entries.as_mut_ptr();
             let mut entry_ptrs: Vec<*mut MemoryMapEntry> = vec![entries_ptr];
             let entry_ptrs_ptr = entry_ptrs.as_mut_ptr();
-            let response = Box::new(MemoryMapResponse { revision: 0, entry_count: 1, entries: entry_ptrs_ptr });
+            // SAFETY: one entry, which the fixture keeps as long as the map.
+            let response = Box::new(unsafe { MemoryMapResponse::fabricated(1, entry_ptrs_ptr) });
             Self { _backing: backing, _entries: entries, _entry_ptrs: entry_ptrs, response }
         }
 

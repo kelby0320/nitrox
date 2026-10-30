@@ -967,3 +967,14 @@ fn a_fault_wakes_the_thread_waiting_on_its_channel_or_none() {
         assert!(unsafe { NotificationChannel::try_recv(chan) }.is_some(), "each fault was queued");
     }
 }
+
+/// **A pid is never handed out twice**: the last before the ids run out, then a refusal, again.
+#[test]
+fn pids_are_refused_once_spent_never_reused() {
+    let mut s = test_state();
+    assert_eq!(s.take_pid(), Some(2));
+    s.next_pid = u32::MAX - 1;
+    assert_eq!(s.take_pid(), Some(u32::MAX - 1));
+    assert_eq!(s.take_pid(), None);
+    assert_eq!(s.take_pid(), None);
+}

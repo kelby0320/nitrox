@@ -21,8 +21,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-use crate::arch::Timer;
 use crate::arch::timer::ArchTimer;
+use crate::arch::{Rtc, Timer};
 use crate::libkern::SpinLock;
 use crate::libkern::lockrank::LockRank;
 
@@ -41,14 +41,17 @@ const SETTABLE_FROM_SECS: i64 = 946_684_800;
 /// another century at the next boot.
 const SETTABLE_UNTIL_SECS: i64 = 4_102_444_800;
 
-/// Serializes [`set`]: two sets could leave the running clock at one value and the chip at the
-/// other, and interleave the RTC's index/data port pair.
-static SETTING: SpinLock<()> = SpinLock::new(LockRank::Leaf, ());
+/// The RTC, held across [`init`]'s read and [`set`], so two sets cannot leave clock and chip apart.
+static RTC: SpinLock<Rtc> = SpinLock::new(
+    LockRank::Leaf,
+    // SAFETY: the one `Rtc`.
+    unsafe { Rtc::claim() },
+);
 
 /// Anchor the wall clock from the hardware RTC, once during boot after the monotonic timer is up.
 /// Returns the epoch seconds it anchored to, or `None` if no usable clock was found.
 pub fn init() -> Option<i64> {
-    let epoch_secs = crate::arch::wall_clock_seconds()?;
+    let epoch_secs = RTC.lock().wall_clock_seconds()?;
     let offset = epoch_secs.checked_mul(NS_PER_SEC)? - Timer::read_ns() as i64;
     OFFSET_NS.store(offset, Ordering::Relaxed);
     // `Release` pairs with the `Acquire` in `realtime_ns`: a reader that sees the clock set also
@@ -72,12 +75,12 @@ pub fn settable(ns: u64) -> Option<i64> {
 /// **It steps the clock**, backwards as readily as forwards, and anchors a clock the boot could not
 /// read.
 pub fn set(ns: u64) -> bool {
-    let _setting = SETTING.lock();
+    let mut rtc = RTC.lock();
     // The offset first, from the counter as it reads now: the RTC write and read-back take a
     // millisecond or more and must not be charged to the time that was asked for.
     OFFSET_NS.store(ns as i64 - Timer::read_ns() as i64, Ordering::Relaxed);
     IS_SET.store(true, Ordering::Release);
-    crate::arch::set_wall_clock_seconds((ns / NS_PER_SEC as u64) as i64)
+    rtc.set_wall_clock_seconds((ns / NS_PER_SEC as u64) as i64)
 }
 
 /// Current wall-clock time in nanoseconds since the Unix epoch, or `None` if never anchored.

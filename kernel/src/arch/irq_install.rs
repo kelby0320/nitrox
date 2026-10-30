@@ -53,13 +53,13 @@ pub trait ArchIrqInstall {
     /// Install a **PCI INTx** interrupt end to end: register `handler` for a
     /// fresh device vector, route `gsi` to it on the boot CPU with the PCI INTx
     /// convention (level-triggered, active-low), and unmask the line. Returns
-    /// the assigned vector.
+    /// the assigned vector, or `None`, taking none, if `gsi` cannot reach the boot CPU.
     ///
     /// # Safety
     /// Ring-0, after the router is up. `handler` must stay valid for the
     /// kernel's lifetime, and the caller must be ready to receive `gsi` once
     /// interrupts are enabled.
-    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> u8;
+    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> Option<u8>;
 
     /// Register `handler` for a fresh device vector and return the message a
     /// device must write to raise it on the calling CPU. Nothing is routed:

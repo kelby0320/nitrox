@@ -160,7 +160,7 @@ fn proc_cmdline(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
     }
-    match MemoryObject::try_new_filled(crate::cmdline::line()) {
+    match MemoryObject::try_new_filled(crate::cmdline::line().as_bytes()) {
         Ok(obj) => complete_with_memobj(obj),
         Err(_) => OpStatus::Rejected(KError::OutOfMemory),
     }
@@ -303,7 +303,7 @@ fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         Ok(m) => m,
         Err(_) => return OpStatus::Rejected(KError::OutOfMemory),
     };
-    crate::klog::copy_into_frames(memobj.frames());
+    crate::klog::copy_into_object(&memobj);
     complete_with_memobj(memobj)
 }
 

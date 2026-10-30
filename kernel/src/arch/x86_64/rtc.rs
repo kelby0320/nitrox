@@ -50,131 +50,113 @@ struct Raw {
     century: Option<u8>,
 }
 
-/// Read one CMOS register.
-///
-/// # Safety
-/// Port I/O. Reads a status/time register only; never writes CMOS state.
-unsafe fn read_reg(reg: u8) -> u8 {
-    // Preserve the NMI-disable bit (bit 7) as the firmware left it.
-    // SAFETY: reading the current index, then selecting `reg` and reading data.
-    unsafe {
-        let nmi = inb(CMOS_ADDR) & 0x80;
-        outb(CMOS_ADDR, nmi | (reg & 0x7F));
-        inb(CMOS_DATA)
-    }
-}
+/// **The RTC**: its CMOS index/data pair is reached only through this one value, held mutably.
+pub struct Rtc(());
 
-/// Write one CMOS register.
-///
-/// # Safety
-/// Port I/O. `reg` must be a time register, status B, or the FADT's century
-/// register, and the caller must serialize writers ([`crate::clock`] does).
-unsafe fn write_reg(reg: u8, value: u8) {
-    // SAFETY: selecting `reg`, preserving the NMI-disable bit as `read_reg` does, and writing it.
-    unsafe {
-        let nmi = inb(CMOS_ADDR) & 0x80;
-        outb(CMOS_ADDR, nmi | (reg & 0x7F));
-        outb(CMOS_DATA, value);
+impl Rtc {
+    /// # Safety
+    /// At most one `Rtc` exists.
+    pub const unsafe fn claim() -> Rtc {
+        Rtc(())
     }
-}
 
-/// Read the six time registers once.
-///
-/// # Safety
-/// As [`read_reg`].
-unsafe fn read_raw(century: Option<u8>) -> Raw {
-    // SAFETY: all six are plain time registers, and the century register's index is the FADT's.
-    unsafe {
+    /// Read one CMOS register, keeping the NMI-disable bit (bit 7 of the index) as it was.
+    fn read(&mut self, reg: u8) -> u8 {
+        // SAFETY: the CMOS pair, which only the one `Rtc` drives; a read changes no CMOS state.
+        unsafe {
+            let nmi = inb(CMOS_ADDR) & 0x80;
+            outb(CMOS_ADDR, nmi | (reg & 0x7F));
+            inb(CMOS_DATA)
+        }
+    }
+
+    /// # Safety
+    /// `reg` is a time register, status B, or the FADT's century register, not the firmware's.
+    unsafe fn write(&mut self, reg: u8, value: u8) {
+        // SAFETY: as `read`, at a register the caller vouches for.
+        unsafe {
+            let nmi = inb(CMOS_ADDR) & 0x80;
+            outb(CMOS_ADDR, nmi | (reg & 0x7F));
+            outb(CMOS_DATA, value);
+        }
+    }
+
+    /// Read the six time registers once.
+    fn read_raw(&mut self, century: Option<u8>) -> Raw {
         Raw {
-            second: read_reg(REG_SECONDS),
-            minute: read_reg(REG_MINUTES),
-            hour: read_reg(REG_HOURS),
-            day: read_reg(REG_DAY),
-            month: read_reg(REG_MONTH),
-            year: read_reg(REG_YEAR),
-            century: century.map(|index| read_reg(index)),
+            second: self.read(REG_SECONDS),
+            minute: self.read(REG_MINUTES),
+            hour: self.read(REG_HOURS),
+            day: self.read(REG_DAY),
+            month: self.read(REG_MONTH),
+            year: self.read(REG_YEAR),
+            century: century.map(|index| self.read(index)),
         }
     }
-}
 
-/// Seconds since the Unix epoch from the RTC, or `None` if it could not be read consistently or
-/// reports an implausible date. Called once, from [`crate::clock::init`].
-pub fn wall_clock_seconds() -> Option<i64> {
-    let century = super::acpi::fadt().and_then(|f| f.century);
-    let (raw, status_b) = read_stable(century)?;
-    decode(raw, status_b)
-}
-
-/// **Write `secs` to the RTC**, and say whether it holds it: read back within two seconds of
-/// what was written, since the chip goes on counting.
-///
-/// Called only from [`crate::clock::set`], which serializes callers. `false` for a time the chip
-/// cannot hold (before 2000, or from 2100 without a century register) or did not keep.
-pub fn set_wall_clock_seconds(secs: i64) -> bool {
-    let century = super::acpi::fadt().and_then(|f| f.century);
-    // SAFETY: status B is a plain configuration register.
-    let status_b = unsafe { read_reg(REG_STATUS_B) } & !STATUS_B_SET;
-    let Some((raw, weekday)) = encode(secs, status_b, century.is_some()) else {
-        return false;
-    };
-    // SAFETY: port I/O on the time registers, status B and the FADT's century register, with
-    // updates stopped for the write; `crate::clock` holds its lock around this call.
-    unsafe {
-        write_reg(REG_STATUS_B, status_b | STATUS_B_SET);
-        write_reg(REG_SECONDS, raw.second);
-        write_reg(REG_MINUTES, raw.minute);
-        write_reg(REG_HOURS, raw.hour);
-        write_reg(REG_WEEKDAY, weekday);
-        write_reg(REG_DAY, raw.day);
-        write_reg(REG_MONTH, raw.month);
-        write_reg(REG_YEAR, raw.year);
-        if let (Some(index), Some(value)) = (century, raw.century) {
-            write_reg(index, value);
-        }
-        write_reg(REG_STATUS_B, status_b);
+    /// Seconds since the Unix epoch from the RTC; `None` if it reads inconsistently or implausibly.
+    pub fn wall_clock_seconds(&mut self) -> Option<i64> {
+        let century = super::acpi::fadt().and_then(|f| f.century);
+        let (raw, status_b) = self.read_stable(century)?;
+        decode(raw, status_b)
     }
-    read_stable(century).and_then(|(raw, status_b)| decode(raw, status_b)).is_some_and(|read| (read - secs).abs() <= 2)
-}
 
-/// One stable reading of the time registers, and status B. `None` for a chip that never settles.
-fn read_stable(century: Option<u8>) -> Option<(Raw, u8)> {
-    // Two identical readings prove stability: an update can start after the `UIP` check.
-    let mut spins = 0u32;
-    // SAFETY: port I/O against the CMOS index/data pair; reads only.
-    let mut prev = unsafe {
-        while read_reg(REG_STATUS_A) & STATUS_A_UIP != 0 {
-            spins += 1;
-            if spins > UIP_SPIN_LIMIT {
-                return None; // no RTC, or one stuck mid-update
+    /// **Write `secs` to the RTC**, and say whether it reads back within two seconds, as the chip
+    /// counts on: never a time before 2000, or from 2100 without a century register.
+    pub fn set_wall_clock_seconds(&mut self, secs: i64) -> bool {
+        let century = super::acpi::fadt().and_then(|f| f.century);
+        let status_b = self.read(REG_STATUS_B) & !STATUS_B_SET;
+        let Some((raw, weekday)) = encode(secs, status_b, century.is_some()) else {
+            return false;
+        };
+        // SAFETY: the time registers, status B and the FADT's century register, updates stopped.
+        unsafe {
+            self.write(REG_STATUS_B, status_b | STATUS_B_SET);
+            self.write(REG_SECONDS, raw.second);
+            self.write(REG_MINUTES, raw.minute);
+            self.write(REG_HOURS, raw.hour);
+            self.write(REG_WEEKDAY, weekday);
+            self.write(REG_DAY, raw.day);
+            self.write(REG_MONTH, raw.month);
+            self.write(REG_YEAR, raw.year);
+            if let (Some(index), Some(value)) = (century, raw.century) {
+                self.write(index, value);
             }
+            self.write(REG_STATUS_B, status_b);
         }
-        read_raw(century)
-    };
-    let mut tries = 0u32;
-    loop {
-        // SAFETY: as above.
-        let next = unsafe {
-            while read_reg(REG_STATUS_A) & STATUS_A_UIP != 0 {
+        self.read_stable(century)
+            .and_then(|(raw, status_b)| decode(raw, status_b))
+            .is_some_and(|read| (read - secs).abs() <= 2)
+    }
+
+    /// One stable reading of the time registers, and status B; `None` for a chip that never settles.
+    fn read_stable(&mut self, century: Option<u8>) -> Option<(Raw, u8)> {
+        // Two identical readings prove stability: an update can start after the `UIP` check.
+        let mut spins = 0u32;
+        let mut settled = |rtc: &mut Rtc| {
+            while rtc.read(REG_STATUS_A) & STATUS_A_UIP != 0 {
                 spins += 1;
                 if spins > UIP_SPIN_LIMIT {
-                    return None;
+                    return None; // no RTC, or one stuck mid-update
                 }
             }
-            read_raw(century)
+            Some(rtc.read_raw(century))
         };
-        if next == prev {
-            break;
+        let mut prev = settled(self)?;
+        let mut tries = 0u32;
+        loop {
+            let next = settled(self)?;
+            if next == prev {
+                break;
+            }
+            prev = next;
+            tries += 1;
+            if tries > 8 {
+                return None; // never settled — treat as unreadable
+            }
         }
-        prev = next;
-        tries += 1;
-        if tries > 8 {
-            return None; // never settled — treat as unreadable
-        }
+        Some((prev, self.read(REG_STATUS_B)))
     }
-
-    // SAFETY: status B is a plain configuration register.
-    let status_b = unsafe { read_reg(REG_STATUS_B) };
-    Some((prev, status_b))
 }
 
 /// Convert a stable register reading into Unix epoch seconds, honouring the BCD/binary and

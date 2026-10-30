@@ -269,7 +269,7 @@ boot log. The trade-off: on a long-running or verbose system it stops capturing
 recent messages — the opposite of what `dmesg` usually wants for "what just happened."
 A keep-recent **ring** (overwrite-oldest, linearised on snapshot) is the refinement;
 deferred until the system runs long enough to overflow 16 KiB (eshell/services beyond
-boot). The snapshot fill (`copy_into_frames`) already handles the segmented copy a
+boot). The snapshot fill (`klog::copy_into_object`) already handles the segmented copy a
 ring would need.
 
 **AHCI NCQ (multiple in-flight commands).** The driver issues **one command at a time**

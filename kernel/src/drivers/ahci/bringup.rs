@@ -79,7 +79,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         }
     }
 
-    let (disk, name, name_len) = match claim_port(abar, port) {
+    let (mut disk, name, name_len) = match claim_port(abar, port) {
         Ok(claimed) => claimed,
         Err(why) => {
             crate::kprintln!("ahci: port {}: {}", port, why);
@@ -101,7 +101,15 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         if disk.flush_command == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" }
     );
 
-    // Published once the disk answered, so a controller declined above gets no watch thread.
+    // **Every step that can fail precedes the publish**, which nothing undoes (a watch thread runs).
+    let Some(node) = disk_node(controller, sectors, &name[..name_len], &disk) else {
+        give_back(&mut disk);
+        return declined("the disk's device node could not be allocated");
+    };
+    let Some(signal) = install_signal(&cfg, desc.interrupt.line as u32) else {
+        give_back(&mut disk);
+        return declined("no interrupt can reach the boot CPU");
+    };
     let disk = match AHCI.publish(disk) {
         Ok(disk) => disk,
         Err(mut disk) => {
@@ -110,10 +118,20 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         }
     };
 
-    // Prefer MSI: it does not depend on the PCI interrupt-line register, which QEMU's firmware
-    // programs and real UEFI often leaves meaningless. INTx is the fallback.
-    let mut signal = None;
-    if let Some(cfg) = &cfg
+    write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
+    write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
+
+    // SAFETY: adopt the creation reference into the device table.
+    let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+    crate::device::register(r.clone(), "ahci");
+    disk.counted.attach(&r);
+    Outcome::Claimed { driver: DRIVER, signal }
+}
+
+/// **The controller's interrupt**: MSI, which needs no interrupt-line register (UEFI often leaves
+/// it meaningless), else INTx from `gsi`; `None`, logged, if neither reaches the boot CPU.
+fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Option<Signal> {
+    if let Some(cfg) = cfg
         && let Some(msi) = crate::pci::read_msi(cfg)
     {
         // SAFETY: ring-0, post-Irq::init; `isr` stays valid for the kernel's
@@ -133,7 +151,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
                     if msi.addr64 { 64 } else { 32 },
                     msi.off
                 );
-                signal = Some(Signal::Msi { vector: msg.vector });
+                return Some(Signal::Msi { vector: msg.vector });
             }
             Some(_) => crate::kprintln!(
                 "ahci: MSI declined — the capability cannot hold the message address; \
@@ -142,31 +160,17 @@ pub fn init(controller: &ObjectRef) -> Outcome {
             None => crate::kprintln!("ahci: MSI declined — this CPU cannot be named in a message; falling back"),
         }
     }
-    let signal = match signal {
-        Some(signal) => signal,
-        None => {
-            // The GSI comes from the PCI interrupt-line register (firmware-programmed
-            // on QEMU; ACPI `_PRT` routing is deferred).
-            let gsi = desc.interrupt.line as u32;
-            // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the
-            // kernel's lifetime.
-            let vec = unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) };
-            if let Some(cfg) = &cfg {
-                crate::pci::set_intx_disabled(cfg, false);
-            }
-            crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vec);
-            Signal::Intx { gsi, vector: vec }
-        }
+    // The GSI is the PCI interrupt-line register's (ACPI `_PRT` routing is deferred).
+    // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the kernel's lifetime.
+    let Some(vec) = (unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) }) else {
+        crate::kprintln!("ahci: GSI {} cannot be routed to the boot CPU", gsi);
+        return None;
     };
-
-    write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
-    write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
-
-    if publish_disk(controller, sectors, &name[..name_len], disk) {
-        Outcome::Claimed { driver: DRIVER, signal }
-    } else {
-        declined("the disk's device node could not be allocated")
+    if let Some(cfg) = cfg {
+        crate::pci::set_intx_disabled(cfg, false);
     }
+    crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vec);
+    Some(Signal::Intx { gsi, vector: vec })
 }
 
 /// A claimed disk, and its name's bytes and length.

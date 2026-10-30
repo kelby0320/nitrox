@@ -5,10 +5,10 @@
 //! device-vector registry.
 
 use super::idt;
-use super::ioapic::X86IoApic;
+use super::ioapic;
 use crate::arch::irq::ArchIrq;
 use crate::arch::irq_install::{ArchIrqInstall, MsiMessage};
-use crate::arch::irq_router::{ArchIrqRouter, Polarity, TriggerMode};
+use crate::arch::irq_router::{Polarity, TriggerMode};
 
 /// Base of the local-APIC message address range; a write in `0xFEE0_0000..0xFEF0_0000` is
 /// interpreted by the CPU's interrupt hardware rather than reaching memory.
@@ -41,15 +41,10 @@ fn compose(vector: u8, dest: u32) -> Option<MsiMessage> {
 }
 
 impl ArchIrqInstall for X86IrqInstall {
-    /// Composite over the device-vector registry ([`idt`]), the local controller
-    /// ([`ArchIrq::id`], the destination CPU) and the router ([`X86IoApic::route`]).
-    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> u8 {
-        let bsp = crate::arch::Irq::id();
-        let vector = idt::register_device_handler(handler);
-        // SAFETY: forwarded from this fn's contract; the handler for `vector`
-        // was just registered, so the routed interrupt has somewhere to land.
-        unsafe { X86IoApic::route(gsi, vector, bsp, TriggerMode::Level, Polarity::ActiveLow) };
-        vector
+    /// Composite over the local controller ([`ArchIrq::id`]) and [`ioapic::install`].
+    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> Option<u8> {
+        // SAFETY: forwarded from this fn's contract.
+        unsafe { ioapic::install(gsi, crate::arch::Irq::id(), handler, TriggerMode::Level, Polarity::ActiveLow) }
     }
 
     /// No router involvement. The destination is checked **before** a vector is taken, so a
