@@ -208,6 +208,19 @@ mod tests {
         assert!(waits >= 2, "expected a poll + a blocking wait, got {waits}");
     }
 
+    /// **A wait takes no more handles than its results hold**: two ready operations, room for one.
+    #[test]
+    fn a_wait_takes_no_more_handles_than_its_results_hold() {
+        sys::reset();
+        sys::script_next(0, 1, true);
+        sys::script_next(0, 2, true);
+        let a = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let b = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let mut one = zeroed_results::<1>();
+        assert_eq!(sys::wait(&[a.po, b.po], &mut one, 0), 1);
+        assert_eq!(sys::last_wait_count(), 1);
+    }
+
     #[test]
     fn negative_status_maps_to_error_kind() {
         sys::reset();

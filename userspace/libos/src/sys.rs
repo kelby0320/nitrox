@@ -5,7 +5,7 @@
 //! `cfg(test)` swaps in a scriptable mock. All returns are the kernel's `i64`:
 //! negative = a `KError` discriminant.
 
-use libkern::{IoOp, IoResult};
+use libkern::{IoOp, IoResult, Notification, NsEntry};
 
 // --- target: real syscalls ------------------------------------------------
 
@@ -17,17 +17,23 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
     unsafe { libkern::syscall2(libkern::SYS_IO_SUBMIT, resource, op as *const IoOp as u64) }
 }
 
-/// `sys_wait` — returns the count of signaled handles (one `IoResult` each), or an error.
-/// `deadline`: `0` = poll (non-blocking), `u64::MAX` = forever.
-#[cfg(not(test))]
+/// `sys_wait` on as many of `handles` as `results` has room for — returns the count of signaled
+/// handles (one `IoResult` each), or an error. `deadline`: `0` = poll, `u64::MAX` = forever.
 pub fn wait(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
-    // SAFETY: `handles`/`results` are live slices; `results.len() >= handles.len()`
-    // by construction at every call site. The kernel writes at most `count` results.
+    let count = handles.len().min(results.len());
+    wait_exact(&handles[..count], &mut results[..count], deadline)
+}
+
+#[cfg(not(test))]
+fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
+    let count = handles.len().min(results.len());
+    // SAFETY: the kernel reads `count` handles and writes at most `count` results, and both
+    // slices hold at least that many.
     unsafe {
         libkern::syscall4(
             libkern::SYS_WAIT,
             handles.as_ptr() as u64,
-            handles.len() as u64,
+            count as u64,
             results.as_mut_ptr() as u64,
             deadline,
         )
@@ -73,30 +79,30 @@ pub fn memory_unmap(addr: u64, size: u64) -> i64 {
 
 /// `sys_ns_lookup` — returns a `PendingOperation` whose completion carries the handle.
 #[cfg(not(test))]
-pub fn ns_lookup(ns: u64, path: u64, path_len: u64, rights: u64) -> i64 {
-    // SAFETY: `path`/`path_len` name a live UTF-8 buffer; `ns` is a namespace handle.
-    unsafe { libkern::syscall4(libkern::SYS_NS_LOOKUP, ns, path, path_len, rights) }
+pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
+    // SAFETY: `path` is a live buffer of its length, which the kernel copies in.
+    unsafe { libkern::syscall4(libkern::SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) }
 }
 
 /// `sys_ns_enumerate` — writes an `NsEntry` to `out`; `NotFound` past the end.
 #[cfg(not(test))]
-pub fn ns_enumerate(ns: u64, index: u64, out: u64) -> i64 {
-    // SAFETY: `out` points at a live `NsEntry`; `ns` is a namespace handle.
-    unsafe { libkern::syscall3(libkern::SYS_NS_ENUMERATE, ns, index, out) }
+pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
+    // SAFETY: `out` is a live `NsEntry`, which the kernel writes whole or not at all.
+    unsafe { libkern::syscall3(libkern::SYS_NS_ENUMERATE, ns, index, out as *mut NsEntry as u64) }
 }
 
 /// `sys_notif_recv` — writes a `Notification` to `out`; `WouldBlock` if empty.
 #[cfg(not(test))]
-pub fn notif_recv(queue: u64, out: u64) -> i64 {
-    // SAFETY: `out` points at a live `Notification`; `queue` is a notif-channel handle.
-    unsafe { libkern::syscall2(libkern::SYS_NOTIF_RECV, queue, out) }
+pub fn notif_recv(queue: u64, out: &mut Notification) -> i64 {
+    // SAFETY: `out` is a live `Notification`, which the kernel writes whole or not at all.
+    unsafe { libkern::syscall2(libkern::SYS_NOTIF_RECV, queue, out as *mut Notification as u64) }
 }
 
 /// `sys_ns_bind` — gated by the `BIND` handle right *and* the `BIND_NAMESPACE` syscap.
 #[cfg(not(test))]
-pub fn ns_bind(ns: u64, path: u64, path_len: u64, resource: u64) -> i64 {
-    // SAFETY: `path`/`path_len` name a live buffer; `ns`/`resource` are live handles.
-    unsafe { libkern::syscall4(libkern::SYS_NS_BIND, ns, path, path_len, resource) }
+pub fn ns_bind(ns: u64, path: &[u8], resource: u64) -> i64 {
+    // SAFETY: `path` is a live buffer of its length, which the kernel copies in.
+    unsafe { libkern::syscall4(libkern::SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, resource) }
 }
 
 /// `sys_process_spawn(&args)` — spawn a child process; returns a `Process` handle.
@@ -116,13 +122,15 @@ pub fn thread_create(args: &libkern::ThreadArgs) -> i64 {
 // --- host tests: a scriptable mock kernel ---------------------------------
 
 #[cfg(test)]
+use mock::wait_exact;
+#[cfg(test)]
 pub use mock::{
     handle_close, handle_restrict, io_submit, memory_create, memory_map, memory_unmap, notif_recv, ns_bind,
-    ns_enumerate, ns_lookup, process_spawn, thread_create, wait,
+    ns_enumerate, ns_lookup, process_spawn, thread_create,
 };
 
 #[cfg(test)]
-pub use mock::{counts, fail_next_bind, fail_next_submit, reset, script_next};
+pub use mock::{counts, fail_next_bind, fail_next_submit, last_wait_count, reset, script_next};
 
 #[cfg(test)]
 mod mock {
@@ -150,6 +158,8 @@ mod mock {
         submits: u32,
         waits: u32,
         closes: u32,
+        /// How many handles the last `wait` was handed, as the kernel would be.
+        last_wait_count: usize,
     }
 
     fn fresh() -> Mock {
@@ -175,10 +185,20 @@ mod mock {
         })
     }
 
-    pub fn wait(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
+    /// As the kernel answers: `InvalidArgument` for no handles, `InvalidHandle` for one it does
+    /// not hold, and `WouldBlock` for a poll that finds nothing ready. A `results` shorter than
+    /// `handles` panics, where the kernel would write past it.
+    pub fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
             m.waits += 1;
+            m.last_wait_count = handles.len();
+            if handles.is_empty() {
+                return -30;
+            }
+            if handles.iter().any(|h| !m.pos.contains_key(h)) {
+                return -1;
+            }
             let mut n = 0usize;
             for &h in handles {
                 if let Some(po) = m.pos.get(&h)
@@ -190,7 +210,7 @@ mod mock {
             }
             // A blocking wait with nothing ready completes the first handle, so block_on
             // makes progress; a poll (deadline == 0) never fabricates a completion.
-            if n == 0 && deadline != 0 && !handles.is_empty() {
+            if n == 0 && deadline != 0 {
                 let h = handles[0];
                 if let Some(po) = m.pos.get_mut(&h) {
                     po.ready = true;
@@ -198,7 +218,7 @@ mod mock {
                     n = 1;
                 }
             }
-            n as i64
+            if n == 0 { -11 } else { n as i64 }
         })
     }
 
@@ -231,21 +251,21 @@ mod mock {
         0
     }
 
-    pub fn ns_lookup(_ns: u64, _path: u64, _plen: u64, _rights: u64) -> i64 {
+    pub fn ns_lookup(_ns: u64, _path: &[u8], _rights: u64) -> i64 {
         // The scripted completion's `result` is the resolved handle.
         let dummy = IoOp { opcode: 0, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
         io_submit(0, &dummy)
     }
 
-    pub fn ns_enumerate(_ns: u64, _index: u64, _out: u64) -> i64 {
+    pub fn ns_enumerate(_ns: u64, _index: u64, _out: &mut NsEntry) -> i64 {
         -10 // KError::NotFound (past the end)
     }
 
-    pub fn notif_recv(_queue: u64, _out: u64) -> i64 {
+    pub fn notif_recv(_queue: u64, _out: &mut Notification) -> i64 {
         -11 // KError::WouldBlock (empty)
     }
 
-    pub fn ns_bind(_ns: u64, _path: u64, _plen: u64, _resource: u64) -> i64 {
+    pub fn ns_bind(_ns: u64, _path: &[u8], _resource: u64) -> i64 {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
             match m.bind_err.take() {
@@ -292,6 +312,11 @@ mod mock {
     /// Force the next `ns_bind` to fail with `status` (e.g. `-2` = NoAccess).
     pub fn fail_next_bind(status: i32) {
         MOCK.with(|m| m.borrow_mut().bind_err = Some(status));
+    }
+
+    /// How many handles the last `wait` was handed.
+    pub fn last_wait_count() -> usize {
+        MOCK.with(|m| m.borrow().last_wait_count)
     }
 
     /// `(submits, waits, closes)` issued since the last `reset`.

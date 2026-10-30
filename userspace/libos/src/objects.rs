@@ -94,7 +94,7 @@ impl<M: CanLookup> Handle<Namespace, M> {
     /// The caller asserts the resolved object is of type `T2` with mode `M2` (the same
     /// trust assertion as [`Handle::from_raw`]).
     pub async unsafe fn lookup<T2, M2>(&self, path: &str, rights: Rights) -> Result<Handle<T2, M2>> {
-        let po = sys::ns_lookup(self.raw().0, path.as_ptr() as u64, path.len() as u64, rights.bits());
+        let po = sys::ns_lookup(self.raw().0, path.as_bytes(), rights.bits());
         if po < 0 {
             return Err(Error::from_status(po as i32));
         }
@@ -108,7 +108,7 @@ impl<M: CanLookup> Handle<Namespace, M> {
     /// Write the `index`-th binding into `out`. `Ok(true)` if written, `Ok(false)`
     /// past the end. Iterate `0, 1, 2, …` until `false` (the `mounts`/`lsblk` shape).
     pub fn enumerate(&self, index: u32, out: &mut NsEntry) -> Result<bool> {
-        let r = sys::ns_enumerate(self.raw().0, index as u64, out as *mut NsEntry as u64);
+        let r = sys::ns_enumerate(self.raw().0, index as u64, out);
         if r < 0 {
             let e = Error::from_status(r as i32);
             return if e.kind() == ErrorKind::NotFound { Ok(false) } else { Err(e) };
@@ -124,7 +124,7 @@ impl Handle<Notify, Only> {
     /// if the queue is empty. To block, `sys_wait` on this handle first (the queue is
     /// waitable).
     pub fn recv(&self, out: &mut Notification) -> Result<bool> {
-        let r = sys::notif_recv(self.raw().0, out as *mut Notification as u64);
+        let r = sys::notif_recv(self.raw().0, out);
         if r < 0 {
             let e = Error::from_status(r as i32);
             return if e.kind() == ErrorKind::WouldBlock { Ok(false) } else { Err(e) };
@@ -139,7 +139,7 @@ impl<M: CanBind> Handle<Namespace, M> {
     /// — a caller without it gets `Err` with [`ErrorKind::PermissionDenied`]. See
     /// `docs/architecture/syscaps.md`.
     pub fn bind(&self, path: &str, resource: RawHandle) -> Result<()> {
-        let r = sys::ns_bind(self.raw().0, path.as_ptr() as u64, path.len() as u64, resource.0);
+        let r = sys::ns_bind(self.raw().0, path.as_bytes(), resource.0);
         if r < 0 {
             return Err(Error::from_status(r as i32));
         }
