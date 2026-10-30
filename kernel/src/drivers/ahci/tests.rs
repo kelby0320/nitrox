@@ -160,9 +160,9 @@ fn fake_disk() -> (FakeRegs, AhciDisk) {
         abar,
         port_base: abar + PORT_BASE,
         port: 0,
-        cmd_list: DmaBuffer::alloc(1024).unwrap(),
-        _fis: DmaBuffer::alloc(256).unwrap(),
-        cmd_table: DmaBuffer::alloc(CMD_TABLE_BYTES).unwrap(),
+        cmd_list: Programmed::new(DmaBuffer::alloc(1024).unwrap()),
+        _fis: Programmed::new(DmaBuffer::alloc(256).unwrap()),
+        cmd_table: Programmed::new(DmaBuffer::alloc(CMD_TABLE_BYTES).unwrap()),
         sectors: 1 << 20,
         flush_command: ATA_FLUSH_CACHE_EXT,
         state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
@@ -476,16 +476,24 @@ fn a_commands_device_time_runs_from_its_issue_to_its_retire() {
 #[test]
 fn a_declined_disk_frees_its_memory_only_once_its_port_stopped() {
     crate::mm::test_support::init_global_heap();
+    let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
+    let freed = crate::mm::heap::frames_freed_by_this_thread();
+    let claimed = claim_port(regs.0 as u64, 0).map(|_| ());
+    assert_eq!(claimed, Err("IDENTIFY failed"), "nothing answers on fake registers");
+    let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
+    assert_eq!(gave, 4, "its three port pages and IDENTIFY's, the port stopped");
     for stops in [true, false] {
-        let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
-        let abar = regs.0 as u64;
+        let (_regs, mut d) = fake_disk();
         if !stops {
-            write32(abar + PORT_BASE, PX_CMD, CMD_CR);
+            write32(d.port_base, PX_CMD, CMD_CR);
         }
         let freed = crate::mm::heap::frames_freed_by_this_thread();
-        let claimed = claim_port(abar, 0).map(|_| ());
-        assert_eq!(claimed, Err("IDENTIFY failed"), "stops {stops}: nothing answers on fake registers");
+        let data = Programmed::new(DmaBuffer::alloc(SECTOR_SIZE as usize).unwrap());
+        // SAFETY: the fake disk, polled, with no interrupt.
+        assert!(unsafe { identify(&d, data, &mut [0; MAX_DEVICE_NAME]) }.is_none());
+        give_back(&mut d);
+        drop(d);
         let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
-        assert_eq!(gave, if stops { 4 } else { 0 }, "stops {stops}: its three port pages and IDENTIFY's");
+        assert_eq!(gave, if stops { 4 } else { 0 }, "stops {stops}: IDENTIFY's page and the port's three");
     }
 }

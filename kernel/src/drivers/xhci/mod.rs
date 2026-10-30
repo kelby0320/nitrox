@@ -145,13 +145,13 @@ pub struct Xhci {
     caps: caps::ExtCaps,
     /// The device context base array, whose slot entries the hub thread writes, and the
     /// scratchpad buffers and their array, which are the controller's from here on.
-    dcbaa: DmaBuffer,
+    dcbaa: Programmed,
     _scratch: Scratchpads,
     /// The command ring. The hub thread writes it; probe's No Op is its first TRB.
     cmd: IrqSpinLock<CommandRing>,
     /// The event ring and its segment table, which only the DPC reads after bring-up.
     events: IrqSpinLock<EventRing>,
-    _erst: DmaBuffer,
+    _erst: Programmed,
     port_changes: AtomicU32,
     /// **What wakes the hub thread**: the DPC signals it on every port change. Latching, so a
     /// change that lands while the thread is busy is counted, not lost.
@@ -208,20 +208,32 @@ struct PoPtr(*mut ());
 unsafe impl Send for PoPtr {}
 
 struct CommandRing {
-    mem: DmaBuffer,
+    mem: Programmed,
     ring: Producer,
 }
 
 struct EventRing {
-    mem: DmaBuffer,
+    mem: Programmed,
     ring: Consumer,
 }
 
 /// The scratchpad buffers: the controller's own working memory, which it asks for and the driver
 /// hands it through slot 0 of the device context base array.
 struct Scratchpads {
-    _array: Option<DmaBuffer>,
-    _pages: KVec<DmaBuffer>,
+    array: Option<Programmed>,
+    pages: KVec<Programmed>,
+}
+
+impl Xhci {
+    /// It halted: what it was given is freed with it.
+    fn release(&mut self, halted: &Quiesced) {
+        self.dcbaa.release(halted);
+        self._erst.release(halted);
+        self.cmd.lock().mem.release(halted);
+        self.events.lock().mem.release(halted);
+        let Scratchpads { array, pages } = &mut self._scratch;
+        array.iter_mut().chain(pages.iter_mut()).for_each(|p| p.release(halted));
+    }
 }
 
 #[inline]
@@ -458,11 +470,11 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         max_ports,
         layout: context::Layout::new(hcc1 & HCC_CSZ != 0),
         caps: ext,
-        dcbaa,
+        dcbaa: Programmed::new(dcbaa),
         _scratch: scratch,
-        cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: cmd_mem, ring: cmd_ring }),
-        events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: ev_mem, ring: Consumer::new() }),
-        _erst: erst,
+        cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: Programmed::new(cmd_mem), ring: cmd_ring }),
+        events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(ev_mem), ring: Consumer::new() }),
+        _erst: Programmed::new(erst),
         port_changes: AtomicU32::new(0),
         // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
         hub_wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
@@ -478,35 +490,33 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     // **Boxed before the controller runs**, so no failure after it starts can free what it writes
     // to while it writes: a box that cannot be had is declined here, with nothing running. Boxing
     // after the No Op let a failed allocation drop the rings with the controller still running.
-    let Ok(boxed) = KBox::try_new(x) else {
+    let Ok(mut boxed) = KBox::try_new(x) else {
         return declined(OUT_OF_MEMORY);
     };
-    let boxed = Programmed::new(boxed);
 
     // **Run, and prove the rings with a No Op**, polled: interrupts are masked here, and the
     // interrupter is not on yet. Any port's change event that lands first is counted and passed.
     // A decline from here gives the box back only once the controller has stopped.
     write32(op, USBCMD, CMD_RUN);
     if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH == 0) {
-        give_back(op, boxed);
+        give_back(op, |halted| boxed.release(halted));
         return declined("it did not start running");
     }
     let answer = no_op(&boxed);
     let Some(code) = answer else {
-        give_back(op, boxed);
+        give_back(op, |halted| boxed.release(halted));
         return declined("its command ring did not answer a No Op");
     };
     if code != code::SUCCESS {
-        give_back(op, boxed);
+        give_back(op, |halted| boxed.release(halted));
         crate::kprintln!("xhci: {at}: a No Op completed with code {code}");
         return declined("a No Op did not complete with Success");
     }
 
-    // SAFETY: published, it is never freed; refused, it is `Programmed` again at once.
-    let x = match XHCI.publish(unsafe { boxed.keep() }) {
+    let x = match XHCI.publish(boxed) {
         Ok(x) => x,
-        Err(boxed) => {
-            give_back(op, Programmed::new(boxed));
+        Err(mut boxed) => {
+            give_back(op, |halted| boxed.release(halted));
             return declined("another xHCI controller is already claimed");
         }
     };
@@ -552,21 +562,21 @@ const OUT_OF_MEMORY: &str = "out of memory";
 /// `None` when memory ran out.
 fn scratchpads_for(count: u32, dcbaa: &DmaBuffer) -> Option<Scratchpads> {
     if count == 0 {
-        return Some(Scratchpads { _array: None, _pages: KVec::new() });
+        return Some(Scratchpads { array: None, pages: KVec::new() });
     }
-    let array = DmaBuffer::alloc(count as usize * 8).ok()?;
-    let mut pages: KVec<DmaBuffer> = KVec::new();
+    let array = Programmed::new(DmaBuffer::alloc(count as usize * 8).ok()?);
+    let mut pages: KVec<Programmed> = KVec::new();
     pages.try_reserve(count as usize).ok()?;
     let a = array.virt() as *mut u64;
     for i in 0..count as usize {
-        let page = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
+        let page = Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?);
         // SAFETY: `array` holds `count` entries.
         unsafe { core::ptr::write_volatile(a.add(i), page.phys().as_u64()) };
         pages.try_push(page).ok()?;
     }
     // SAFETY: `dcbaa` holds at least one entry; slot 0 is the scratchpad array's.
     unsafe { core::ptr::write_volatile(dcbaa.virt() as *mut u64, array.phys().as_u64()) };
-    Some(Scratchpads { _array: Some(array), _pages: pages })
+    Some(Scratchpads { array: Some(array), pages })
 }
 
 /// Stop a controller that was started, before a decline frees what it writes to: halt it, then
@@ -583,10 +593,11 @@ fn stop(op: u64) -> Option<Quiesced> {
     Some(unsafe { Quiesced::assume() })
 }
 
-/// **Decline a started controller**: `mem` freed once it has stopped, kept for good if it did not.
-fn give_back<T>(op: u64, mem: Programmed<T>) {
-    if let Some(stopped) = stop(op) {
-        drop(mem.release(stopped));
+/// **Decline a started controller**: its memory `release`d once it has stopped, so freed when
+/// dropped, and kept for good if it did not stop.
+fn give_back(op: u64, release: impl FnOnce(&Quiesced)) {
+    if let Some(halted) = stop(op) {
+        release(&halted);
     }
 }
 
@@ -831,7 +842,9 @@ mod tests {
             let op = regs.as_mut_ptr() as u64;
             write32(op, USBSTS, if halts { STS_HCH } else { 0 });
             let freed = crate::mm::heap::frames_freed_by_this_thread();
-            give_back(op, Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).unwrap()));
+            let mut mem = Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).unwrap());
+            give_back(op, |halted| mem.release(halted));
+            drop(mem);
             let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
             assert_eq!(gave, halts as usize, "halts {halts}: its memory freed");
             assert_eq!(read32(op, USBCMD), if halts { CMD_HCRST } else { 0 }, "halts {halts}: reset");

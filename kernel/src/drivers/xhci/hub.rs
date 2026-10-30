@@ -97,7 +97,7 @@ struct Attached {
     slot: u8,
     /// Its `UsbDevice` record's id, which departs with it; `None` when the table could not take it.
     record: Option<u32>,
-    _mem: Programmed<DeviceMem>,
+    _mem: DeviceMem,
 }
 
 /// One device's input and output contexts, its default endpoint's ring, a page for what its
@@ -105,12 +105,22 @@ struct Attached {
 /// report buffers, a storage interface's rings, wrapper page and binding buffer — which are freed
 /// with the rest, only after its slot is disabled.
 pub(super) struct DeviceMem {
-    pub(super) input: DmaBuffer,
-    output: DmaBuffer,
-    ep0: DmaBuffer,
+    pub(super) input: Programmed,
+    output: Programmed,
+    ep0: Programmed,
     ring: Producer,
-    data: DmaBuffer,
-    pub(super) class: KVec<DmaBuffer>,
+    data: Programmed,
+    pub(super) class: KVec<Programmed>,
+}
+
+impl DeviceMem {
+    /// Its slot disabled, or never enabled: all of it is freed with it.
+    fn release(&mut self, stopped: &Quiesced) {
+        for b in [&mut self.input, &mut self.output, &mut self.ep0, &mut self.data] {
+            b.release(stopped);
+        }
+        self.class.iter_mut().for_each(|b| b.release(stopped));
+    }
 }
 
 /// The thread.
@@ -281,7 +291,7 @@ pub(super) enum Released {
 /// allocator's while the controller still writes them. So a slot that does not disable — the
 /// command failed, or nothing more may be asked of a wedged controller — keeps its memory forever:
 /// a few pages leaked is the price of not handing the controller memory it may yet write.
-fn release(x: &Xhci, slot: u8, mem: Programmed<DeviceMem>) -> Released {
+fn release(x: &Xhci, slot: u8, mut mem: DeviceMem) -> Released {
     if x.wedged.load(Ordering::Relaxed) {
         return Released::Kept("the command ring went unanswered earlier, so nothing more is asked");
     }
@@ -290,7 +300,7 @@ fn release(x: &Xhci, slot: u8, mem: Programmed<DeviceMem>) -> Released {
     }
     set_slot_context(x, slot, 0);
     // SAFETY: Disable Slot completed: the controller reads and writes none of the slot's memory.
-    drop(mem.release(unsafe { Quiesced::assume() }));
+    mem.release(&unsafe { Quiesced::assume() });
     Released::Freed
 }
 
@@ -304,22 +314,22 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
         return Err(());
     }
     let speed_id = speed_of(portsc(x, port));
-    let Some(mem) = device_mem() else {
+    let Some(mut mem) = device_mem() else {
         crate::kprintln!("usb: port {port}: no memory for its contexts");
         return Err(());
     };
     let slot = match command(x, Trb::of_kind(kind::ENABLE_SLOT)) {
         Ok(slot) if slot != 0 => slot,
-        Ok(_) => {
-            crate::kprintln!("usb: port {port}: Enable Slot named no slot");
-            return Err(());
-        }
-        Err(e) => {
-            crate::kprintln!("usb: port {port}: Enable Slot failed: {e}");
+        failed => {
+            match failed {
+                Ok(_) => crate::kprintln!("usb: port {port}: Enable Slot named no slot"),
+                Err(e) => crate::kprintln!("usb: port {port}: Enable Slot failed: {e}"),
+            }
+            // SAFETY: no slot was enabled, so the controller was given none of `mem`.
+            mem.release(&unsafe { Quiesced::assume() });
             return Err(());
         }
     };
-    let mut mem = Programmed::new(mem);
     set_slot_context(x, slot, mem.output.phys().as_u64());
     let mut config = [0u8; CONFIG_MAX];
     let mut serial = [0u8; SERIAL_MAX];
@@ -414,6 +424,7 @@ fn device_mem() -> Option<DeviceMem> {
     let ep0 = DmaBuffer::alloc(super::RING_TRBS * 16).ok()?;
     let data = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
     let ring = Producer::new(&mut RingMem::of(&ep0), ep0.phys().as_u64());
+    let [input, output, ep0, data] = [input, output, ep0, data].map(Programmed::new);
     Some(DeviceMem { input, output, ep0, ring, data, class: KVec::new() })
 }
 
@@ -917,7 +928,7 @@ fn set_slot_context(x: &Xhci, slot: u8, output: u64) {
 }
 
 /// The input context's bytes, cleared for a new command.
-pub(super) fn input_bytes<'a>(input: &'a mut DmaBuffer, x: &Xhci) -> &'a mut [u8] {
+pub(super) fn input_bytes<'a>(input: &'a mut Programmed, x: &Xhci) -> &'a mut [u8] {
     let len = x.layout.input_len();
     let bytes = &mut input.as_mut_slice()[..len];
     bytes.fill(0);

@@ -69,11 +69,12 @@ pub(in crate::drivers::xhci) fn prepare(port: u8, mem: &mut DeviceMem, config: &
         data_virt: data.virt() as u64,
         data_phys: data.phys().as_u64(),
     };
+    if mem.class.try_reserve(4).is_err() {
+        crate::kprintln!("usb: port {port}: no memory for its storage endpoints; not bound");
+        return None;
+    }
     for b in [rin, rout, wrap, data] {
-        if mem.class.try_push(b).is_err() {
-            crate::kprintln!("usb: port {port}: no memory for its storage endpoints; not bound");
-            return None;
-        }
+        let _ = mem.class.push_within_capacity(Programmed::new(b));
     }
     Some(p)
 }

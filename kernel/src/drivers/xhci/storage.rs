@@ -49,7 +49,7 @@ use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::printable::Printable;
 use crate::libkern::{IrqSpinLock, KVec};
-use crate::mm::dma::DmaBuffer;
+use crate::mm::dma::{DmaBuffer, Programmed};
 use crate::object::device_node::{BlockGeometry, DeviceNode, ResourceDescriptor};
 use crate::syscall::error::KError;
 

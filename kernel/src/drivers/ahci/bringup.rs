@@ -102,14 +102,10 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     );
 
     // Published once the disk answered, so a controller declined above gets no watch thread.
-    // SAFETY: published, it is never freed; refused, it is `Programmed` again at once.
-    let disk = match AHCI.publish(unsafe { disk.keep() }) {
+    let disk = match AHCI.publish(disk) {
         Ok(disk) => disk,
-        Err(disk) => {
-            let disk = Programmed::new(disk);
-            if let Some(stopped) = stop_port(disk.port_base) {
-                drop(disk.release(stopped));
-            }
+        Err(mut disk) => {
+            give_back(&mut disk);
             return declined("another AHCI controller is already claimed");
         }
     };
@@ -174,15 +170,18 @@ pub fn init(controller: &ObjectRef) -> Outcome {
 }
 
 /// A claimed disk, and its name's bytes and length.
-pub(super) type Claimed = (Programmed<KBox<AhciDisk>>, [u8; MAX_DEVICE_NAME], usize);
+pub(super) type Claimed = (KBox<AhciDisk>, [u8; MAX_DEVICE_NAME], usize);
 
 /// **Claim the SATA disk on `port`**: every allocation made first, so none fails with the port
 /// running, then the port started and the disk identified; or why not, its memory freed if it stopped.
 pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> {
     let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
-    let (Ok(cmd_list), Ok(fis), Ok(cmd_table)) =
-        (DmaBuffer::alloc(1024), DmaBuffer::alloc(256), DmaBuffer::alloc(CMD_TABLE_BYTES))
-    else {
+    let (Ok(cmd_list), Ok(fis), Ok(cmd_table), Ok(data)) = (
+        DmaBuffer::alloc(1024),
+        DmaBuffer::alloc(256),
+        DmaBuffer::alloc(CMD_TABLE_BYTES),
+        DmaBuffer::alloc(SECTOR_SIZE as usize),
+    ) else {
         return Err(OUT_OF_MEMORY);
     };
     let (Ok(intr), Ok(wake)) = (InterruptObject::try_new(), InterruptObject::try_new()) else {
@@ -192,9 +191,9 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         abar,
         port_base,
         port,
-        cmd_list,
-        _fis: fis,
-        cmd_table,
+        cmd_list: Programmed::new(cmd_list),
+        _fis: Programmed::new(fis),
+        cmd_table: Programmed::new(cmd_table),
         sectors: 0,
         flush_command: ATA_FLUSH_CACHE,
         state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
@@ -204,10 +203,9 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         // SAFETY: as above.
         wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
     };
-    let Ok(disk) = KBox::try_new(disk) else {
+    let Ok(mut disk) = KBox::try_new(disk) else {
         return Err(OUT_OF_MEMORY);
     };
-    let mut disk = Programmed::new(disk);
 
     stop_port(port_base);
     write32(port_base, PX_CLB, disk.cmd_list.phys().as_u64() as u32);
@@ -221,10 +219,8 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
 
     let mut name = [0u8; MAX_DEVICE_NAME];
     // SAFETY: `disk` is the live state, not yet published: IDENTIFY is polled.
-    let Some((sectors, name_len, flush)) = (unsafe { identify(&mut disk, &mut name) }) else {
-        if let Some(stopped) = stop_port(port_base) {
-            drop(disk.release(stopped));
-        }
+    let Some((sectors, name_len, flush)) = (unsafe { identify(&disk, Programmed::new(data), &mut name) }) else {
+        give_back(&mut disk);
         return Err("IDENTIFY failed");
     };
     disk.sectors = sectors;

@@ -184,9 +184,9 @@ pub struct AhciDisk {
     abar: u64,      // mapped ABAR kernel-virtual base
     port_base: u64, // abar + 0x100 + port*0x80
     port: u32,
-    cmd_list: DmaBuffer,  // 1 KiB command list; slot 0's header first
-    _fis: DmaBuffer,      // 256 B received-FIS area
-    cmd_table: DmaBuffer, // CFIS + PRDT for slot 0
+    cmd_list: Programmed,  // 1 KiB command list; slot 0's header first
+    _fis: Programmed,      // 256 B received-FIS area
+    cmd_table: Programmed, // CFIS + PRDT for slot 0
     sectors: u64,
     flush_command: u8,
     /// The port lock: slot 0 and its queue, taken from thread context and the ISR alike.
@@ -203,6 +203,23 @@ pub struct AhciDisk {
 unsafe impl Send for AhciDisk {}
 // SAFETY: as above.
 unsafe impl Sync for AhciDisk {}
+
+impl AhciDisk {
+    /// Its port stopped: the memory it gave the port is freed with it.
+    fn release(&mut self, stopped: &Quiesced) {
+        for b in [&mut self.cmd_list, &mut self._fis, &mut self.cmd_table] {
+            b.release(stopped);
+        }
+    }
+}
+
+/// **Decline a disk whose port started**: its memory freed with it once the port has stopped, and
+/// kept for good if it will not.
+fn give_back(disk: &mut AhciDisk) {
+    if let Some(stopped) = stop_port(disk.port_base) {
+        disk.release(&stopped);
+    }
+}
 
 static AHCI: Published<AhciDisk> = Published::new();
 
@@ -286,25 +303,28 @@ fn wait_clear(pb: u64, off: u64, mask: u32) {
     }
 }
 
-/// Run `IDENTIFY DEVICE` (polled) and return the LBA48 sector count, the length of the
-/// identity written to `name`, and the flush command the drive takes.
+/// Run `IDENTIFY DEVICE` (polled) into `data`, a sector's page, and return the LBA48 sector count,
+/// the length of the identity written to `name`, and the flush command the drive takes.
 ///
 /// # Safety
 /// `disk` is the live, brought-up disk state; called at bring-up with no IRQ.
-unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Option<(u64, usize, u8)> {
-    let data = Programmed::new(DmaBuffer::alloc(SECTOR_SIZE as usize).ok()?);
+unsafe fn identify(
+    disk: &AhciDisk,
+    mut data: Programmed,
+    name: &mut [u8; MAX_DEVICE_NAME],
+) -> Option<(u64, usize, u8)> {
     let frags = [PhysFrag { base: data.phys().as_u64(), len: SECTOR_SIZE as u64 }];
     build_command(disk, ATA_IDENTIFY, 0, 0, &frags, false);
     issue(disk);
     if !wait_command_polled(disk, COMMAND_DEADLINE_NS) {
         // The command may be running yet: its buffer goes only once the port has stopped it.
         if let Some(stopped) = stop_port(disk.port_base) {
-            drop(data.release(stopped));
+            data.release(&stopped);
         }
         return None;
     }
     // SAFETY: the command retired, PxCI read clear, and the next one rewrites the table.
-    let data = data.release(unsafe { Quiesced::assume() });
+    data.release(&unsafe { Quiesced::assume() });
     // SAFETY: `data` is a page holding the 512-byte, 256-word IDENTIFY result, aligned for words.
     identity(unsafe { &*(data.virt() as *const [u16; 256]) }, name)
 }

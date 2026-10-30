@@ -28,7 +28,7 @@ use crate::libkern::IrqSpinLock;
 use crate::libkern::device::DeviceKind;
 use crate::libkern::input::{EV_KEY, InputEvent, KEY_PRESS};
 use crate::libkern::lockrank::LockRank;
-use crate::mm::dma::DmaBuffer;
+use crate::mm::dma::{DmaBuffer, Programmed};
 use crate::object::ObjectRef;
 use crate::object::device_node::{CharBackend, DeviceNode, ResourceDescriptor};
 use crate::syscall::error::KError;
@@ -191,9 +191,12 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
             buf_virt: buf.virt() as u64,
         });
         // **The device's memory**: freed with it, and only after its slot is disabled.
-        if mem.class.try_push(ring).is_err() || mem.class.try_push(buf).is_err() {
+        if mem.class.try_reserve(2).is_err() {
             crate::kprintln!("usb: port {port}: no memory for its endpoints; not bound");
             return None;
+        }
+        for b in [ring, buf] {
+            let _ = mem.class.push_within_capacity(Programmed::new(b));
         }
     }
     Some(HidPrepared { prepared, eps, n })

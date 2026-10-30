@@ -37164,9 +37164,10 @@ wait gets the line too, so the harness's fault demo lets its supervisor reach it
 
 Group M of the survey's triage, the drivers, made ten decisions:
 
-- **Memory a device was given is freed only with the proof the device stopped**:
-  `mm::dma::Programmed` leaks on drop and frees through `release`, which takes a `Quiesced`, minted
+- **Memory a device was given is freed only with the proof the device stopped**: each buffer is a
+  `mm::dma::Programmed`, which leaks on drop unless released first with a `Quiesced`, minted
   (unsafe) where a stop is seen to take or the one command holding the memory to retire (drv-o4).
+  It gives no `&mut DmaBuffer`, so replacing one, or clearing a list of them, leaks it too.
   A declined AHCI disk, a declined xHCI controller that will not halt, and a USB slot that will not
   disable keep their memory for good (drv-d11, drv-d12). AHCI allocates all before its port starts.
 - **A Tier 1 controller's state is `libkern::Published`**: boxed once, never withdrawn, a second

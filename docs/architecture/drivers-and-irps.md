@@ -368,14 +368,15 @@ describes the requested byte range as a physical fragment list, one fragment per
 touched, and the driver turns that into the device's scatter-gather form (for AHCI, a
 PRDT). No bounce buffer, no copy.
 
-**Memory a device was given is freed only once the device has stopped with it.** A driver wraps it
-in [`mm::dma::Programmed`](../../kernel/src/mm/dma.rs) before writing its address to the device.
-Dropped, a `Programmed` is leaked; only `release` frees it, and that takes a `Quiesced`, the proof
-minted where a stop is seen to take: an AHCI port's command list and FIS receive seen stopped, or
-the one command that held the memory seen to retire; an xHCI controller seen halted; a USB slot
-disabled. So a disk or controller declined after it started, and a slot that would not disable,
-keep their memory for good, and an allocation that fails cannot free memory a device writes: AHCI
-makes every allocation before it starts its port.
+**Memory a device was given is freed only once the device has stopped with it.** A driver wraps
+each such buffer in [`mm::dma::Programmed`](../../kernel/src/mm/dma.rs) before writing its address
+to the device. Dropped, a `Programmed` is leaked unless it was released first with a `Quiesced`,
+the proof minted where a stop is seen to take: an AHCI port's command list and FIS receive seen
+stopped, or the one command that held the memory seen to retire; an xHCI controller seen halted; a
+USB slot disabled. Nothing hands out a `&mut DmaBuffer` through one, so replacing a buffer or
+clearing a list of them leaks it too. A disk or controller declined after it started, and a slot
+that would not disable, keep their memory for good, and an allocation that fails cannot free memory
+a device writes: AHCI makes every allocation, IDENTIFY's page included, before it starts its port.
 
 **A command succeeds only if it moved its whole length**, since a page-cache fill marks every
 page of a successful IRP filled, and a page the device skipped would be read as data holding

@@ -16,7 +16,7 @@
 //! need clean/invalidate around device access (a future `ArchDma` hook).
 
 use core::mem::ManuallyDrop;
-use core::ops::{Deref, DerefMut};
+use core::ops::Deref;
 use core::ptr::{self, NonNull};
 
 use crate::libkern::AllocError;
@@ -106,38 +106,44 @@ impl Quiesced {
     }
 }
 
-/// **Memory whose address a device was given**: dropped, it is leaked, as the device may still
-/// write it; freed only by [`release`](Self::release), with the proof the device stopped.
-pub struct Programmed<T>(ManuallyDrop<T>);
+/// **A DMA buffer whose address a device was given.** Dropped, it is leaked, as the device may still
+/// write it, unless [`release`](Self::release)d first with the proof the device stopped. No
+/// `&mut DmaBuffer` is to be had through it, so nothing replaces it but a drop.
+pub struct Programmed {
+    buffer: ManuallyDrop<DmaBuffer>,
+    released: bool,
+}
 
-impl<T> Programmed<T> {
-    /// `value`, whose address a device is about to be given.
-    pub fn new(value: T) -> Self {
-        Programmed(ManuallyDrop::new(value))
+impl Programmed {
+    /// `buffer`, whose address a device is about to be given.
+    pub fn new(buffer: DmaBuffer) -> Self {
+        Programmed { buffer: ManuallyDrop::new(buffer), released: false }
     }
 
-    /// The value back, the device having stopped with it: freed as any value is, when dropped.
-    pub fn release(self, _stopped: Quiesced) -> T {
-        ManuallyDrop::into_inner(self.0)
+    /// The device stopped with it: it is freed when dropped, as any buffer is.
+    pub fn release(&mut self, _stopped: &Quiesced) {
+        self.released = true;
     }
 
-    /// # Safety
-    /// The value is not dropped while the device may use the memory.
-    pub unsafe fn keep(self) -> T {
-        ManuallyDrop::into_inner(self.0)
+    /// Its bytes, to write what the device will read.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.buffer.as_mut_slice()
     }
 }
 
-impl<T> Deref for Programmed<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
+impl Deref for Programmed {
+    type Target = DmaBuffer;
+    fn deref(&self) -> &DmaBuffer {
+        &self.buffer
     }
 }
 
-impl<T> DerefMut for Programmed<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
+impl Drop for Programmed {
+    fn drop(&mut self) {
+        if self.released {
+            // SAFETY: dropped once, here, and never used again.
+            unsafe { ManuallyDrop::drop(&mut self.buffer) };
+        }
     }
 }
 
@@ -154,17 +160,22 @@ mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
 
-    /// **Memory a device was given is freed only with the proof it stopped**: dropped, it leaks.
+    /// **A buffer a device was given is freed only with the proof it stopped**: dropped, or cleared
+    /// from a list, it leaks; released, it is freed when dropped.
     #[test]
     fn programmed_memory_is_freed_only_once_its_device_stopped() {
         init_global_heap();
         let freed = heap::frames_freed_by_this_thread();
-        let _ = Programmed::new(DmaBuffer::alloc(PAGE_SIZE).unwrap());
+        let mut list = crate::libkern::KVec::new();
+        list.try_push(Programmed::new(DmaBuffer::alloc(PAGE_SIZE).unwrap())).unwrap();
+        drop(list);
+        drop(Programmed::new(DmaBuffer::alloc(PAGE_SIZE).unwrap()));
         assert_eq!(heap::frames_freed_by_this_thread(), freed, "dropped while the device may write it");
         let mut kept = Programmed::new(DmaBuffer::alloc(2 * PAGE_SIZE).unwrap());
         kept.as_mut_slice()[0] = 1;
         // SAFETY: no device was given it.
-        drop(kept.release(unsafe { Quiesced::assume() }));
+        kept.release(&unsafe { Quiesced::assume() });
+        drop(kept);
         assert_eq!(heap::frames_freed_by_this_thread(), freed + 2, "released, then freed");
     }
 
