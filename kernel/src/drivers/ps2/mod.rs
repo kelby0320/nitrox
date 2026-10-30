@@ -536,14 +536,26 @@ pub fn init() {
     // unreachable.
     PRESENT.store(true, Ordering::Release);
     crate::kprintln!(
-        "ps2: {}{}{}armed (kbd vec{:#x}, aux vec{:#x})",
+        "ps2: {}{}{}armed (kbd {}, aux {})",
         if present.keyboard { "keyboard " } else { "" },
         if present.mouse { "mouse " } else { "" },
         // Logged because it changes how every mouse packet is *framed*.
         if present.wheel { "wheel " } else { "" },
-        kbd_vec,
-        aux_vec
+        Routed(kbd_vec),
+        Routed(aux_vec)
     );
+}
+
+/// A line's vector for the log, or that it could not be routed.
+struct Routed(Option<u8>);
+
+impl core::fmt::Display for Routed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(vector) => write!(f, "vec{vector:#x}"),
+            None => f.write_str("unrouted"),
+        }
+    }
 }
 
 #[cfg(test)]

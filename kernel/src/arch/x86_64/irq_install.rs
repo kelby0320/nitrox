@@ -5,7 +5,7 @@
 //! device-vector registry.
 
 use super::idt;
-use super::ioapic::X86IoApic;
+use super::ioapic::{self, X86IoApic};
 use crate::arch::irq::ArchIrq;
 use crate::arch::irq_install::{ArchIrqInstall, MsiMessage};
 use crate::arch::irq_router::{ArchIrqRouter, Polarity, TriggerMode};
@@ -43,13 +43,15 @@ fn compose(vector: u8, dest: u32) -> Option<MsiMessage> {
 impl ArchIrqInstall for X86IrqInstall {
     /// Composite over the device-vector registry ([`idt`]), the local controller
     /// ([`ArchIrq::id`], the destination CPU) and the router ([`X86IoApic::route`]).
-    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> u8 {
+    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> Option<u8> {
         let bsp = crate::arch::Irq::id();
+        if !ioapic::reaches(gsi, bsp) {
+            return None;
+        }
         let vector = idt::register_device_handler(handler);
         // SAFETY: forwarded from this fn's contract; the handler for `vector`
         // was just registered, so the routed interrupt has somewhere to land.
-        unsafe { X86IoApic::route(gsi, vector, bsp, TriggerMode::Level, Polarity::ActiveLow) };
-        vector
+        unsafe { X86IoApic::route(gsi, vector, bsp, TriggerMode::Level, Polarity::ActiveLow) }.then_some(vector)
     }
 
     /// No router involvement. The destination is checked **before** a vector is taken, so a

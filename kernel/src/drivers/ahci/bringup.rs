@@ -150,7 +150,10 @@ pub fn init(controller: &ObjectRef) -> Outcome {
             let gsi = desc.interrupt.line as u32;
             // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the
             // kernel's lifetime.
-            let vec = unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) };
+            let Some(vec) = (unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) }) else {
+                crate::kprintln!("ahci: GSI {} cannot be routed to the boot CPU", gsi);
+                return declined("no interrupt can reach the boot CPU");
+            };
             if let Some(cfg) = &cfg {
                 crate::pci::set_intx_disabled(cfg, false);
             }

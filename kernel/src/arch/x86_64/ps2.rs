@@ -280,14 +280,14 @@ fn reset_to_three_bytes() -> bool {
 }
 
 /// Route the keyboard and aux interrupts to `kbd`/`aux` and enable them in the controller,
-/// returning the assigned IDT vectors.
+/// returning the assigned IDT vectors, `None` for a line that cannot be routed (polled instead).
 ///
 /// # Safety
 ///
 /// Ring-0, after the interrupt router is initialised and after [`init`]; both handlers must
 /// stay valid for the kernel's lifetime, and the caller must be ready to receive the
 /// interrupts once they are unmasked.
-pub unsafe fn arm(kbd: extern "C" fn(), aux: extern "C" fn()) -> (u8, u8) {
+pub unsafe fn arm(kbd: extern "C" fn(), aux: extern "C" fn()) -> (Option<u8>, Option<u8>) {
     // SAFETY: forwarded from this fn's contract. `install_isa_irq` is the x86 IOAPIC
     // routing primitive, kept inside the arch layer (`arch/mod.rs` refuses to surface it).
     let kbd_vec = unsafe { ioapic::install_isa_irq(KBD_IRQ, kbd) };

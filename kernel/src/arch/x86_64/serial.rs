@@ -163,7 +163,7 @@ pub fn console_rx_read() -> u8 {
 }
 
 /// Arm console receive interrupts: route the console UART's interrupt to `handler` and enable
-/// its received-data-available interrupt. Returns the assigned IDT vector.
+/// its received-data-available interrupt. Returns the IDT vector, or `None` if it cannot be routed.
 ///
 /// The neutral operation hides the platform wiring (here COM1 ISA IRQ 4 through the IOAPIC).
 ///
@@ -171,13 +171,13 @@ pub fn console_rx_read() -> u8 {
 /// Ring-0, after the interrupt router is initialised; `handler` must stay valid for
 /// the kernel's lifetime; the caller must be ready to receive the IRQ once interrupts
 /// are enabled. Call **after** [`console_rx_loopback_selftest`] (which polls).
-pub unsafe fn console_arm_rx(handler: extern "C" fn()) -> u8 {
+pub unsafe fn console_arm_rx(handler: extern "C" fn()) -> Option<u8> {
     // SAFETY: forwarded from this fn's contract (ring-0, post-router-init; `handler`
     // valid for the kernel's lifetime). `install_isa_irq` is the x86 IOAPIC routing
     // primitive, kept inside the arch layer.
-    let vector = unsafe { super::ioapic::install_isa_irq(COM1_IRQ, handler) };
+    let vector = unsafe { super::ioapic::install_isa_irq(COM1_IRQ, handler) }?;
     SerialPort::new(COM1_BASE).enable_rx_interrupt();
-    vector
+    Some(vector)
 }
 
 /// `true` if a UART answers at COM1.

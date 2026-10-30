@@ -114,7 +114,9 @@ installing an interrupt spans both plus the handler registry.
   stub enters a registered kernel ISR. (`phase-2/ioapic`, building on
   `phase-2/acpi-tables`.) The GSI comes from the PCI interrupt-line register,
   which is the part that does not survive contact with real hardware — and the
-  reason MSI is preferred.
+  reason MSI is preferred. An install the IOAPIC cannot route, for a GSI it has
+  no entry for or a boot CPU whose x2APIC id is wider than an entry's eight bits,
+  is refused before it takes a vector, and the AHCI driver declines the controller.
 
 - **A software vector**, for a backend with no hardware of its own whose completions must still
   run where a device's do. `install_software` registers a handler for a fresh device vector that

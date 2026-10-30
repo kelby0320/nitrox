@@ -76,6 +76,11 @@ impl IoApic {
         gsi.checked_sub(self.gsi_base).filter(|&idx| idx < self.entries)
     }
 
+    /// `gsi`'s entry, and `dest` in its eight bits: a wider id needs interrupt remapping, not enabled.
+    fn names(&self, gsi: u32, dest: u32) -> Option<(u32, u8)> {
+        Some((self.entry(gsi)?, u8::try_from(dest).ok()?))
+    }
+
     /// Write entry `idx`, its destination first, so its mask bit takes effect last.
     fn write_entry(&mut self, idx: u32, (low, high): (u32, u32)) {
         self.write(REG_REDTBL_BASE + 2 * idx + 1, high);
@@ -186,12 +191,12 @@ impl ArchIrqRouter for X86IoApic {
         Ok(())
     }
 
-    unsafe fn route(irq: u32, vector: u8, dest: u32, trigger: TriggerMode, polarity: Polarity) {
-        if let Some(io) = IOAPIC.lock().as_mut()
-            && let Some(idx) = io.entry(irq)
-        {
-            io.write_entry(idx, encode_rte(vector, dest as u8, polarity, trigger, false));
-        }
+    unsafe fn route(irq: u32, vector: u8, dest: u32, trigger: TriggerMode, polarity: Polarity) -> bool {
+        let mut guard = IOAPIC.lock();
+        let Some(io) = guard.as_mut() else { return false };
+        let Some((idx, dest)) = io.names(irq, dest) else { return false };
+        io.write_entry(idx, encode_rte(vector, dest, polarity, trigger, false));
+        true
     }
 
     unsafe fn mask(irq: u32) {
@@ -218,7 +223,10 @@ impl ArchIrqRouter for X86IoApic {
 
         // Route the PIT's GSI to our vector on the boot CPU and start the PIT.
         // SAFETY: ring-0, post-init; the handler for `vector` is registered.
-        unsafe { Self::route(gsi, vector, bsp, trigger, polarity) };
+        if !unsafe { Self::route(gsi, vector, bsp, trigger, polarity) } {
+            crate::kprintln!("ioapic: the PIT's GSI{} cannot be routed to the boot CPU", gsi);
+            return;
+        }
         // SAFETY: ring-0; we own the PIT.
         unsafe { pit_ch0_periodic((PIT_INPUT_HZ / 100) as u16) };
 
@@ -251,7 +259,7 @@ impl ArchIrqRouter for X86IoApic {
 /// Install a legacy **ISA** interrupt end-to-end for an in-kernel driver: resolve the ISA IRQ
 /// to its GSI and trigger/polarity (honouring ACPI source overrides), register `handler` for a
 /// fresh device-interrupt vector, route the GSI to it on the boot CPU, and leave the line
-/// unmasked. Returns the IDT vector.
+/// unmasked. Returns the IDT vector, or `None`, taking none, if the GSI cannot reach the boot CPU.
 ///
 /// Arch-internal (`pub(crate)`, not re-exported by `crate::arch`): "ISA" is x86-only, so a
 /// fixed legacy device wires its interrupt through its own arch module (the serial console via
@@ -262,14 +270,21 @@ impl ArchIrqRouter for X86IoApic {
 /// # Safety
 /// Ring-0, after [`X86IoApic::init`]. `handler` must stay valid for the kernel's
 /// lifetime; the caller must be ready to receive the IRQ once interrupts are enabled.
-pub(crate) unsafe fn install_isa_irq(isa_irq: u8, handler: extern "C" fn()) -> u8 {
+pub(crate) unsafe fn install_isa_irq(isa_irq: u8, handler: extern "C" fn()) -> Option<u8> {
     let bsp = crate::arch::Irq::id();
     let (gsi, polarity, trigger) = resolve_isa_irq(isa_irq, acpi::source_overrides());
+    if !reaches(gsi, bsp) {
+        return None;
+    }
     let vector = idt::register_device_handler(handler);
     // SAFETY: forwarded from this fn's contract; the handler for `vector` was just
     // registered, so the routed interrupt has somewhere to land.
-    unsafe { X86IoApic::route(gsi, vector, bsp, trigger, polarity) };
-    vector
+    unsafe { X86IoApic::route(gsi, vector, bsp, trigger, polarity) }.then_some(vector)
+}
+
+/// Whether [`X86IoApic::route`] can route `gsi` to `dest`, asked before a vector is taken.
+pub(super) fn reaches(gsi: u32, dest: u32) -> bool {
+    IOAPIC.lock().as_ref().is_some_and(|io| io.names(gsi, dest).is_some())
 }
 
 #[cfg(test)]
@@ -305,6 +320,15 @@ mod tests {
         assert_eq!(io.entry(47), Some(23));
         assert_eq!(io.entry(48), None);
         assert_eq!(IoApic { base: 0, gsi_base: u32::MAX, entries: 24 }.entry(0), None);
+    }
+
+    /// **A destination wider than the entry's eight bits is refused**, not truncated.
+    #[test]
+    fn a_destination_wider_than_the_entry_is_refused_rather_than_truncated() {
+        let io = IoApic { base: 0, gsi_base: 0, entries: 24 };
+        assert_eq!(io.names(9, 0xFF), Some((9, 0xFF)));
+        assert_eq!(io.names(9, 0x100), None);
+        assert_eq!(io.names(24, 0), None);
     }
 
     #[test]

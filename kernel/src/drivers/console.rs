@@ -262,8 +262,10 @@ pub fn init() {
     // 3. Arm RX; which IRQ and how it is routed stays inside the arch console module.
     // SAFETY: ring-0, after `IrqRouter::init`; `console_isr` is valid for the
     // kernel's lifetime and we are ready to receive the IRQ.
-    let vector = unsafe { crate::arch::serial::console_arm_rx(console_isr) };
-    crate::kprintln!("console: RX armed (vec{:#x})", vector);
+    match unsafe { crate::arch::serial::console_arm_rx(console_isr) } {
+        Some(vector) => crate::kprintln!("console: RX armed (vec{:#x})", vector),
+        None => crate::kprintln!("console: RX not armed — its interrupt cannot reach the boot CPU"),
+    }
 }
 
 #[cfg(test)]
