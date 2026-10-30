@@ -26,8 +26,8 @@ use core::sync::atomic::Ordering;
 use super::context::{self, DCI_EP0, speed};
 use super::desc;
 use super::hid::LightsTo;
-use super::ring::{Producer, Trb, code, kind};
-use super::{Awaited, CommandRing, DmaSlots, PoPtr, Waiting, XHCI, Xhci, read32, write32};
+use super::ring::{Producer, RingMem, Trb, code, kind};
+use super::{Awaited, CommandRing, PoPtr, Waiting, XHCI, Xhci, read32, write32};
 use crate::arch::timer::ArchTimer;
 use crate::device::UsbFacts;
 use crate::libkern::KVec;
@@ -404,7 +404,7 @@ fn device_mem() -> Option<DeviceMem> {
     let output = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
     let ep0 = DmaBuffer::alloc(super::RING_TRBS * 16).ok()?;
     let data = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
-    let ring = Producer::new(&mut DmaSlots(&ep0), ep0.phys().as_u64());
+    let ring = Producer::new(&mut RingMem::of(&ep0), ep0.phys().as_u64());
     Some(DeviceMem { input, output, ep0, ring, data, class: KVec::new() })
 }
 
@@ -646,7 +646,7 @@ fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u1
         base + probe as u64 * 16
     };
     *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
-    let mut slots = DmaSlots(&mem.ep0);
+    let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, true));
     mem.ring.push(&mut slots, Trb::data_in(mem.data.phys().as_u64(), len as u32));
     let at = mem.ring.push(&mut slots, Trb::status(true));
@@ -674,7 +674,7 @@ pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8;
     let status_slot = if next + 1 == super::RING_TRBS - 1 { 0 } else { next + 1 };
     let status_at = base + status_slot as u64 * 16;
     *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
-    let mut slots = DmaSlots(&mem.ep0);
+    let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, false));
     let at = mem.ring.push(&mut slots, Trb::status(false));
     debug_assert_eq!(base + at as u64 * 16, status_at);
@@ -709,7 +709,7 @@ pub(super) fn control_out_data(
         base + probe as u64 * 16
     };
     *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
-    let mut slots = DmaSlots(&mem.ep0);
+    let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup_out(request));
     mem.ring.push(&mut slots, Trb::data_out(mem.data.phys().as_u64(), len as u32));
     let at = mem.ring.push(&mut slots, Trb::status(false));
@@ -789,7 +789,7 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
     {
         let mut c = x.cmd.lock();
         let CommandRing { mem, ring } = &mut *c;
-        ring.push(&mut DmaSlots(mem), trb);
+        ring.push(&mut RingMem::of(mem), trb);
     }
     write32(x.db, 0, 0);
     match wait(x, &po, COMMAND_NS) {

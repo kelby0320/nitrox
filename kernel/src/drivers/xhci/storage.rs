@@ -39,7 +39,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use super::context;
 use super::desc;
 use super::hub::{self, DeviceMem, Failed};
-use super::ring::{Producer, Slots, Trb, code, kind};
+use super::ring::{Producer, RingMem, Trb, code, kind};
 use super::{RING_TRBS, Xhci};
 use crate::arch::timer::ArchTimer;
 use crate::io::block::BlockBackend;
@@ -195,44 +195,13 @@ enum HubResult {
     Fault(Fault),
 }
 
+/// A bulk endpoint's ring: written by the DPC and by `submit`, which hold where its memory is, the
+/// hub thread holding the memory while the device is in the table.
 #[derive(Debug)]
 struct Ring {
     producer: Producer,
-    virt: u64,
+    mem: RingMem,
     phys: u64,
-}
-
-/// A ring's TRBs at a virtual address — written by the DPC and by `submit`, which hold the address
-/// rather than the buffer the hub thread owns.
-struct RawSlots(u64);
-
-impl Slots for RawSlots {
-    fn len(&self) -> usize {
-        RING_TRBS
-    }
-
-    fn read(&self, i: usize) -> Trb {
-        let p = self.0 as *const u32;
-        let mut d = [0u32; 4];
-        for (n, dw) in d.iter_mut().enumerate() {
-            // SAFETY: `i < RING_TRBS`, and the ring at this address holds that many TRBs for as long
-            // as its device is in the table.
-            *dw = unsafe { core::ptr::read_volatile(p.add(i * 4 + n)) };
-        }
-        Trb(d)
-    }
-
-    fn write(&mut self, i: usize, trb: Trb) {
-        let p = self.0 as *mut u32;
-        for n in 0..3 {
-            // SAFETY: as for `read`.
-            unsafe { core::ptr::write_volatile(p.add(i * 4 + n), trb.0[n]) };
-        }
-        // The cycle bit hands the TRB over, so it is written last.
-        core::sync::atomic::fence(Ordering::Release);
-        // SAFETY: as for `read`.
-        unsafe { core::ptr::write_volatile(p.add(i * 4 + 3), trb.0[3]) };
-    }
 }
 
 impl Ring {
@@ -241,11 +210,11 @@ impl Ring {
     fn push_td(&mut self, trbs: &[Trb], mut each: impl FnMut(usize, u64)) {
         if self.producer.room_before_link(RING_TRBS) < trbs.len() {
             while self.producer.room_before_link(RING_TRBS) != RING_TRBS - 1 {
-                self.producer.push(&mut RawSlots(self.virt), Trb::no_op());
+                self.producer.push(&mut self.mem, Trb::no_op());
             }
         }
         for (k, t) in trbs.iter().enumerate() {
-            let at = self.producer.push(&mut RawSlots(self.virt), *t);
+            let at = self.producer.push(&mut self.mem, *t);
             each(k, self.phys + at as u64 * 16);
         }
     }

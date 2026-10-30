@@ -55,8 +55,8 @@ pub(in crate::drivers::xhci) fn prepare(port: u8, mem: &mut DeviceMem, config: &
         return None;
     };
     let ring = |b: &DmaBuffer| {
-        let (virt, phys) = (b.virt() as u64, b.phys().as_u64());
-        Ring { producer: Producer::new(&mut RawSlots(virt), phys), virt, phys }
+        let (mut mem, phys) = (RingMem::of(b), b.phys().as_u64());
+        Ring { producer: Producer::new(&mut mem, phys), mem, phys }
     };
     let p = Prepared {
         interface: s.number,

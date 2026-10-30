@@ -1,4 +1,5 @@
 use super::*;
+use crate::drivers::xhci::ring::Slots;
 use crate::io::irp::IrpBuffer;
 use crate::mm::test_support::init_global_heap;
 
@@ -154,7 +155,7 @@ fn a_usb_disk_is_named_by_its_model_and_serial() {
 /// Heap memory standing in for a device's rings, wrapper page, binding buffer and the doorbell
 /// array: its "physical" addresses are its virtual ones.
 struct Fake {
-    rings: [crate::libkern::KVec<u64>; 2],
+    rings: [DmaBuffer; 2],
     wrap: crate::libkern::KVec<u64>,
     data: crate::libkern::KVec<u64>,
     db: crate::libkern::KVec<u32>,
@@ -172,7 +173,7 @@ fn zeroed<T: Copy + Default>(n: usize) -> crate::libkern::KVec<T> {
 impl Fake {
     fn new() -> Fake {
         Fake {
-            rings: [zeroed(RING_TRBS * 2), zeroed(RING_TRBS * 2)],
+            rings: [DmaBuffer::alloc(RING_TRBS * 16).unwrap(), DmaBuffer::alloc(RING_TRBS * 16).unwrap()],
             wrap: zeroed(512),
             data: zeroed(BIND_DATA / 8),
             db: zeroed(32),
@@ -180,11 +181,10 @@ impl Fake {
     }
 
     fn dev(&mut self, slot: u8) -> Dev {
-        let ring = |v: &mut crate::libkern::KVec<u64>| {
-            let at = v.as_mut_ptr() as u64;
-            Ring { producer: Producer::new(&mut RawSlots(at), at), virt: at, phys: at }
+        let ring = |b: &DmaBuffer| {
+            let mut mem = RingMem::of(b);
+            Ring { producer: Producer::new(&mut mem, b.virt() as u64), mem, phys: b.virt() as u64 }
         };
-        let (r0, r1) = self.rings.split_at_mut(1);
         let wrap = self.wrap.as_mut_ptr() as u64;
         let data = self.data.as_mut_ptr() as u64;
         Dev {
@@ -196,8 +196,8 @@ impl Fake {
             out_address: 0x02,
             in_mps: 512,
             out_mps: 512,
-            bulk_in: ring(&mut r0[0]),
-            bulk_out: ring(&mut r1[0]),
+            bulk_in: ring(&self.rings[0]),
+            bulk_out: ring(&self.rings[1]),
             wrap_virt: wrap,
             wrap_phys: wrap,
             data_virt: data,
@@ -234,7 +234,7 @@ impl Fake {
     }
 
     fn trb(&self, r: usize, i: usize) -> Trb {
-        RawSlots(self.rings[r].as_ptr() as u64).read(i)
+        RingMem::of(&self.rings[r]).read(i)
     }
 }
 
@@ -622,7 +622,7 @@ fn a_command_left_for_the_hub_thread_ignores_its_later_events() {
     let mut r = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
     disks.submit(&mut r, context(i, 0, epoch), 0);
     assert_eq!(disks.on_transfer(5, 4, code::STALL, 0, 1), Some(Action::Wake), "the command wrapper stalls");
-    let data_trb = fake.rings[0].as_ptr() as u64;
+    let data_trb = fake.rings[0].virt() as u64;
     assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, data_trb, 1), Some(Action::None), "the data's, ignored");
     assert_eq!(fake.trb(0, 1), Trb::default(), "no status asked for");
     assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Transfer { dci: 4, code: code::STALL }));
@@ -702,7 +702,7 @@ fn a_transfer_that_would_straddle_the_link_goes_after_it() {
     let mut fake = Fake::new();
     let mut dev = fake.dev(5);
     while dev.bulk_in.producer.room_before_link(RING_TRBS) > 2 {
-        dev.bulk_in.producer.push(&mut RawSlots(dev.bulk_in.virt), Trb::no_op());
+        dev.bulk_in.producer.push(&mut dev.bulk_in.mem, Trb::no_op());
     }
     let before = dev.bulk_in.producer.next_slot();
     let (i, epoch) = disks.take(dev).unwrap();
@@ -726,7 +726,7 @@ fn a_short_reads_last_data_event_is_not_its_status() {
     let frags = [PhysFrag { base: 0x10_000, len: 4096 }, PhysFrag { base: 0x20_000, len: 4096 }];
     let mut r = irp(IrpOp::Read, 0, 8192, &frags);
     disks.submit(&mut r, context(i, 0, epoch), 0);
-    let in_ring = fake.rings[0].as_ptr() as u64;
+    let in_ring = fake.rings[0].virt() as u64;
     assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, in_ring, 1), Some(Action::None), "short at the first");
     fake.answer_short(1, 4096, 0);
     let last = in_ring + 16;
@@ -752,7 +752,7 @@ fn a_short_read_whose_status_says_nothing_is_missing_fails() {
     let frags = [PhysFrag { base: 0x10_000, len: 4096 }, PhysFrag { base: 0x20_000, len: 4096 }];
     let mut r = irp(IrpOp::Read, 0, 8192, &frags);
     disks.submit(&mut r, context(i, 0, epoch), 0);
-    let in_ring = fake.rings[0].as_ptr() as u64;
+    let in_ring = fake.rings[0].virt() as u64;
     assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, in_ring, 1), Some(Action::None));
     fake.answer(1, 0);
     assert_eq!(disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));

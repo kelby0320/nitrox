@@ -482,8 +482,11 @@ supervises.
 ## The code, and what tests it
 
 - **`drivers::xhci::ring`** — TRBs, the producer ring (the command ring; transfer rings from A.2)
-  and the event ring's consumer, as arithmetic over a `Slots` trait. Host tests read a producer
-  ring back with a model of the controller written from the specification, across three wraps.
+  and the event ring's consumer, as arithmetic over a `Slots` trait; and `RingMem`, every ring's
+  memory, the controller's and each device's, which reads a TRB's cycle dword before the rest and
+  writes it after them, each across a fence. Host tests read a producer ring back with a model of
+  the controller written from the specification, across three wraps, and take an event whose write
+  lands between the reader's loads whole or not at all.
 - **`drivers::xhci::caps`** — the extended-capability walk, bounded by the register window and an
   entry count. Host tests on register images.
 - **`drivers::xhci::context`** — input and device contexts at both entry sizes, and the speeds.

@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use super::context;
 use super::hub::{self, DeviceMem, Failed};
-use super::ring::{Producer, Slots, Trb, code, kind};
+use super::ring::{Producer, RingMem, Trb, code, kind};
 use super::{RING_TRBS, Xhci, write32};
 use crate::arch::timer::ArchTimer;
 use crate::drivers::hid::{keyboard, mouse};
@@ -89,7 +89,7 @@ pub(super) struct Bound {
     epoch: u32,
     decoder: Decoder,
     ring: Producer,
-    ring_virt: u64,
+    ring_mem: RingMem,
     ring_phys: u64,
     buf_phys: u64,
     buf_virt: u64,
@@ -111,35 +111,6 @@ impl Table {
     /// An empty table.
     pub(super) fn new() -> Table {
         Table { entries: core::array::from_fn(|_| None) }
-    }
-}
-
-/// A ring's TRBs at a virtual address: an interrupt endpoint's, written by the DPC, which holds the
-/// address rather than the buffer the hub thread owns.
-struct RawSlots(u64);
-
-impl Slots for RawSlots {
-    fn len(&self) -> usize {
-        RING_TRBS
-    }
-
-    fn read(&self, i: usize) -> Trb {
-        let p = self.0 as *const u32;
-        let mut d = [0u32; 4];
-        for (n, dw) in d.iter_mut().enumerate() {
-            // SAFETY: `i < RING_TRBS`, and the ring at this address holds that many TRBs for as long
-            // as its endpoint is bound.
-            *dw = unsafe { core::ptr::read_volatile(p.add(i * 4 + n)) };
-        }
-        Trb(d)
-    }
-
-    fn write(&mut self, i: usize, trb: Trb) {
-        let p = self.0 as *mut u32;
-        for n in [0, 1, 2, 3] {
-            // SAFETY: as for `read`; dword 3, the cycle bit, last.
-            unsafe { core::ptr::write_volatile(p.add(i * 4 + n), trb.0[n]) };
-        }
     }
 }
 
@@ -200,9 +171,9 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
             crate::kprintln!("usb: port {port}: no memory for its endpoints; not bound");
             return None;
         };
-        let ring_virt = ring.virt() as u64;
+        let mut ring_mem = RingMem::of(&ring);
         let ring_phys = ring.phys().as_u64();
-        let producer = Producer::new(&mut RawSlots(ring_virt), ring_phys);
+        let producer = Producer::new(&mut ring_mem, ring_phys);
         eps[i] = context::Interrupt {
             dci: c.endpoint.dci(),
             max_packet: c.endpoint.max_packet,
@@ -214,7 +185,7 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
         prepared[i] = Some(Prepared {
             c,
             producer,
-            ring_virt,
+            ring_mem,
             ring_phys,
             buf_phys: buf.phys().as_u64(),
             buf_virt: buf.virt() as u64,
@@ -318,7 +289,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
             epoch,
             decoder,
             ring: p.producer,
-            ring_virt: p.ring_virt,
+            ring_mem: p.ring_mem,
             ring_phys: p.ring_phys,
             buf_phys: p.buf_phys,
             buf_virt: p.buf_virt,
@@ -497,7 +468,7 @@ fn report_bytes(layout: &mouse::Layout) -> u16 {
 struct Prepared {
     c: Candidate,
     producer: Producer,
-    ring_virt: u64,
+    ring_mem: RingMem,
     ring_phys: u64,
     buf_phys: u64,
     buf_virt: u64,
@@ -548,7 +519,7 @@ fn start(x: &Xhci, mut bound: Bound) -> bool {
 }
 
 fn queue(x: &Xhci, b: &mut Bound) {
-    b.ring.push(&mut RawSlots(b.ring_virt), Trb::normal(b.buf_phys, b.len as u32));
+    b.ring.push(&mut b.ring_mem, Trb::normal(b.buf_phys, b.len as u32));
     write32(x.db, 4 * b.slot as u64, b.dci as u32);
 }
 

@@ -44,7 +44,7 @@ use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
 use crate::object::{InterruptObject, ObjectRef, PendingOperation};
-use ring::{Consumer, Producer, Slots, Trb, code, kind};
+use ring::{Consumer, Producer, RingMem, Trb, code, kind};
 
 /// PCI class, subclass and programming interface of an xHCI controller.
 pub const PCI_CLASS: (u8, u8, u8) = (0x0C, 0x03, 0x30);
@@ -220,36 +220,6 @@ struct EventRing {
 struct Scratchpads {
     _array: Option<DmaBuffer>,
     _pages: KVec<DmaBuffer>,
-}
-
-struct DmaSlots<'a>(&'a DmaBuffer);
-
-impl Slots for DmaSlots<'_> {
-    fn len(&self) -> usize {
-        RING_TRBS
-    }
-
-    fn read(&self, i: usize) -> Trb {
-        let p = self.0.virt() as *const u32;
-        let mut d = [0u32; 4];
-        for (n, dw) in d.iter_mut().enumerate() {
-            // SAFETY: `i < RING_TRBS`, and the buffer holds `RING_TRBS` TRBs of four dwords.
-            *dw = unsafe { core::ptr::read_volatile(p.add(i * 4 + n)) };
-        }
-        Trb(d)
-    }
-
-    fn write(&mut self, i: usize, trb: Trb) {
-        let p = self.0.virt() as *mut u32;
-        for n in 0..3 {
-            // SAFETY: as `read`.
-            unsafe { core::ptr::write_volatile(p.add(i * 4 + n), trb.0[n]) };
-        }
-        // The cycle bit hands the TRB over, so it is written last and after the rest.
-        core::sync::atomic::fence(Ordering::Release);
-        // SAFETY: as `read`.
-        unsafe { core::ptr::write_volatile(p.add(i * 4 + 3), trb.0[3]) };
-    }
 }
 
 #[inline]
@@ -443,7 +413,7 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     else {
         return declined(OUT_OF_MEMORY);
     };
-    let cmd_ring = Producer::new(&mut DmaSlots(&cmd_mem), cmd_mem.phys().as_u64());
+    let cmd_ring = Producer::new(&mut RingMem::of(&cmd_mem), cmd_mem.phys().as_u64());
     // The event ring's one segment: its base and size, in the table the controller reads.
     let e = erst.virt() as *mut u64;
     // SAFETY: `erst` is a page, which holds one 16-byte segment-table entry.
@@ -626,7 +596,7 @@ fn no_op(x: &Xhci) -> Option<u8> {
     let sent = {
         let mut c = x.cmd.lock();
         let CommandRing { mem, ring } = &mut *c;
-        let slot = ring.push(&mut DmaSlots(mem), Trb::of_kind(kind::NO_OP_COMMAND));
+        let slot = ring.push(&mut RingMem::of(mem), Trb::of_kind(kind::NO_OP_COMMAND));
         mem.phys().as_u64() + slot as u64 * 16
     };
     // Doorbell 0 is the command ring's, and its target is zero.
@@ -654,7 +624,7 @@ fn drain_counting(x: &Xhci) {
 fn drain(x: &Xhci, mut seen: impl FnMut(&Trb)) {
     let mut ev = x.events.lock();
     let EventRing { mem, ring } = &mut *ev;
-    while let Some(trb) = ring.next(&DmaSlots(mem)) {
+    while let Some(trb) = ring.next(&RingMem::of(mem)) {
         if trb.kind() == kind::PORT_STATUS_CHANGE {
             x.port_changes.fetch_add(1, Ordering::Relaxed);
         }
@@ -689,7 +659,7 @@ fn xhci_dpc(_ctx: *mut ()) {
             let mut ev = x.events.lock();
             let EventRing { mem, ring } = &mut *ev;
             while n < BATCH {
-                let Some(trb) = ring.next(&DmaSlots(mem)) else { break };
+                let Some(trb) = ring.next(&RingMem::of(mem)) else { break };
                 batch[n] = trb;
                 n += 1;
             }
