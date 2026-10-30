@@ -37196,3 +37196,9 @@ Group M of the survey's triage, the drivers, made ten decisions:
 To make room, USB storage's binding and its hub-thread side moved from `storage.rs` into
 `storage/bind.rs` and `storage/recover.rs`, and the HID nodes' slots into `hid/nodes.rs`,
 unchanged; both files lost their size entries.
+
+One more, outside the survey, found running Miri over this group's modules (the maintainer's call
+to fix here): **a block IRP's pointer is made from its box's pointer**, so `finish` may reach the
+whole box through it. Made from a borrow of the `irp` field, it carried that field's provenance
+alone, and `finish`'s write of the box's reclaim link, past the field, was undefined behaviour on
+every block completion. Natively nothing showed it.

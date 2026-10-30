@@ -51,7 +51,8 @@ unsafe impl Sync for BlockBackend {}
 
 /// The owning wrapper around an in-flight [`Irp`]. `#[repr(C)]` with `irp`
 /// **first**, so `*mut IrpBox` and `*mut Irp` share an address and the
-/// completion's [`finish`] recovers the box from the `irp` pointer. Its `ObjectRef`s keep
+/// completion's [`finish`] recovers the box from the `irp` pointer, which a dispatch makes from
+/// the box's, so that it reaches the whole box. Its `ObjectRef`s keep
 /// the raw pointers inside `irp` valid; `frags` backs `irp.buffer`. None of this is the
 /// hashed `Irp` layout: a Tier 2 module only ever sees `*mut Irp`.
 #[repr(C)]
@@ -196,7 +197,7 @@ pub fn dispatch_block_irp(
         bx.irp.buffer =
             IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
         bx.irp.on_complete = finish;
-        &mut bx.irp as *mut Irp
+        &raw mut (*bx_ptr).irp
     };
 
     // Completes asynchronously: the backend, or its completion interrupt, calls `irp::complete`.
@@ -275,7 +276,7 @@ pub fn dispatch_block_irp_into_frames(
         bx.irp.buffer =
             IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
         bx.irp.on_complete = finish;
-        &mut bx.irp as *mut Irp
+        &raw mut (*bx_ptr).irp
     };
     submit_within(dn, backend, irp_ptr);
     Ok(())
@@ -313,7 +314,7 @@ pub fn dispatch_block_control(device: &ObjectRef, po: &ObjectRef, op: IrpOp) -> 
     let irp_ptr = unsafe {
         let bx = &mut *bx_ptr;
         bx.irp.on_complete = finish;
-        &mut bx.irp as *mut Irp
+        &raw mut (*bx_ptr).irp
     };
     (backend.submit)(irp_ptr, backend.ctx);
     Ok(())
