@@ -68,3 +68,22 @@ fn a_default_endpoint_in_doubt_is_asked_nothing_more() {
     assert_eq!(mem.ring.next_slot(), next, "nothing on the ring");
     assert!(mem.data.as_slice().iter().all(|&b| b == 0xAB), "and the page untouched");
 }
+
+/// **A device's memory is freed only once released, its classes' buffers with it**: dropped, all
+/// of it leaks, as its slot may not have been disabled.
+#[test]
+fn a_devices_memory_is_freed_only_once_released() {
+    crate::mm::test_support::init_global_heap();
+    for released in [false, true] {
+        let mut mem = device_mem().unwrap();
+        mem.class.try_push(Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).unwrap())).unwrap();
+        let freed = crate::mm::heap::frames_freed_by_this_thread();
+        if released {
+            // SAFETY: no controller was given it.
+            mem.release(&unsafe { Quiesced::assume() });
+        }
+        drop(mem);
+        let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
+        assert_eq!(gave, if released { 5 } else { 0 }, "released {released}: its four pages and a class's");
+    }
+}
