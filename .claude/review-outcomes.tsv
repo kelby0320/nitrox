@@ -385,3 +385,11 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-30	408	61089be1	14	tests	optional	unverified	declined		AHCI's decline boot-shown; publish-refused branches unreachable at boot; doubt now tested in 5
 2026-10-30	408	61089be1	15	rules-and-docs	optional	demonstrated	fixed	bb6235d6	kernel/CLAUDE.md names Published and a kept reference (maintainer's call); log reason corrected
 2026-10-30	408	61089be1	16	rules-and-docs	optional	demonstrated	fixed	bb6235d6	usb.md and deferred-decisions.md rewrapped
+2026-10-30	409	4aa384ef	1	logic	worth-fixing	demonstrated	fixed	a5eefa66	every fallible step (node, interrupt) before AHCI.publish; boot probe published=true -> false; old publish_disk decline fixed too
+2026-10-30	409	4aa384ef	2	logic	worth-fixing	unverified	fixed	99f145f2	boot probe: live PML4 and PML4[256]/[511] tables are bootloader-reclaimable; three docs name them
+2026-10-30	409	4aa384ef	3	error-paths	optional	demonstrated	fixed	aeb3ed12	null array walks empty; null-array case panicked before, again without the check; null entries still skipped
+2026-10-30	409	4aa384ef	4	rules-and-docs	optional	demonstrated	fixed	a8de6665	syscall-abi.md spawn contract and both KError::OutOfMemory docs name spent pids
+2026-10-30	409	4aa384ef	5	architecture	optional	demonstrated	fixed	b4bea305	both passages state the IrqSpinLock rule and point to the table, which says it is partial
+2026-10-30	409	4aa384ef	6	tests	optional	unverified	declined		no host test reaches past spawn's image lookup; boot with next_pid 6 short: refused at the caller, no reuse
+2026-10-30	409	4aa384ef	7	tests	optional	unverified	fixed	0f709668	one ioapic::install checks before taking a vector; a_refused_install_takes_no_vector; reversed order fails it
+2026-10-30	409	4aa384ef	8	rules-and-docs	optional	unverified	declined		the only host test touching LINE (grep); latent until a second one
