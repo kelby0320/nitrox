@@ -116,6 +116,12 @@ fn every_cast_of_an_object_ref_stops_another_kind_at_its_type_check() {
             }),
         ),
         (
+            "io_buffer_size",
+            Box::new(|| {
+                let _ = submit::io_buffer_size(&file);
+            }),
+        ),
+        (
             "Vma::drop",
             Box::new(|| {
                 let mut v = Vma::new_object(range, Protection::WRITE, mo.clone(), Caching::Normal);
