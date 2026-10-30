@@ -883,3 +883,16 @@ fn a_hub_commands_buffer_is_cleared_before_it_is_sent() {
     assert_eq!(disks.issue_hub(i, 0x1234 as *mut (), 0, &scsi::request_sense(), 18, false, 0), Ok(()));
     assert_eq!(fake.data[..4], [0, 0, u64::MAX << 16, u64::MAX], "its 18 bytes, and no more");
 }
+
+/// **A hub command's data is cut to the binding buffer**: a longer one was asked of the device, and
+/// cleared, past the buffer.
+#[test]
+fn a_hub_commands_data_is_cut_to_the_binding_buffer() {
+    init_global_heap();
+    let disks = Disks::new();
+    let mut fake = Fake::new();
+    let (i, _) = disks.take(held(fake.dev(5))).unwrap();
+    let len = BIND_DATA as u32 + 512;
+    assert_eq!(disks.issue_hub(i, 0x1234 as *mut (), 0, &scsi::inquiry(), len, false, 0), Ok(()));
+    assert_eq!(fake.trb(0, 0).0[2] & 0x1_FFFF, BIND_DATA as u32, "the data stage's length");
+}

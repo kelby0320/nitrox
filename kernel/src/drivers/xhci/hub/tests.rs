@@ -31,3 +31,15 @@ fn a_read_of_the_data_page_stops_at_the_page() {
     assert_eq!(data_bytes(&mem, 3 * 4096).len(), crate::mm::PAGE_SIZE);
     assert_eq!(data_bytes(&mem, 18).len(), 18);
 }
+
+/// **A control transfer's page is cleared, and asked for, no further than the page**, whatever
+/// length the device gave.
+#[test]
+fn a_control_transfer_is_cut_to_the_data_page() {
+    crate::mm::test_support::init_global_heap();
+    let mut mem = device_mem().unwrap();
+    mem.data.as_mut_slice().fill(0xAB);
+    assert_eq!(clear_for(&mut mem, 3 * 4096), crate::mm::PAGE_SIZE as u16);
+    assert!(mem.data.as_slice().iter().all(|&b| b == 0), "the whole page cleared");
+    assert_eq!(clear_for(&mut mem, 18), 18);
+}

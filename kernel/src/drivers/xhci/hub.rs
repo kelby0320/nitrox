@@ -651,12 +651,7 @@ fn data_bytes(mem: &DeviceMem, len: u16) -> &[u8] {
 /// and a wait for the Status stage's completion or an error on any stage. **How many bytes
 /// arrived**: `len` less what a short Data stage did not move.
 fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u16) -> Result<u16, Failed> {
-    let len = len.min(mem.data.len() as u16);
-    // SAFETY: `data` is a page the controller writes only during a transfer, and none is running on
-    // this endpoint: every failure that can leave one live — a timeout, any error but a stall — ends
-    // the device, or what asks this endpoint after a HID binding, and a stall's remains are skipped
-    // by `recover_ep0` before another starts.
-    unsafe { core::ptr::write_bytes(mem.data.virt(), 0, len as usize) };
+    let len = clear_for(mem, len);
     let base = mem.ep0.phys().as_u64();
     let po = new_operation()?;
     // **Registered before the TRBs are written**, and the Status stage's address known first, so
@@ -681,6 +676,17 @@ fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u1
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),
     }
+}
+
+/// **The data page cleared for a read of `len` bytes**, cut to the page: the length to ask for.
+fn clear_for(mem: &mut DeviceMem, len: u16) -> u16 {
+    let len = len.min(mem.data.len() as u16);
+    // SAFETY: `data` is a page the controller writes only during a transfer, and none is running on
+    // this endpoint: every failure that can leave one live — a timeout, any error but a stall — ends
+    // the device, or what asks this endpoint after a HID binding, and a stall's remains are skipped
+    // by `recover_ep0` before another starts.
+    unsafe { core::ptr::write_bytes(mem.data.virt(), 0, len as usize) };
+    len
 }
 
 /// **A control transfer reading one byte**: bulk-only's `GET MAX LUN`.
