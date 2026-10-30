@@ -971,8 +971,7 @@ mod tests {
         assert_eq!(connect_change(|| reg.get(), |_| unreachable!()), None, "no change, no write");
     }
 
-    /// **A read of the data page stops at the page**: a length from a device's `wTotalLength`
-    /// that missed its clamp gave a slice past it, and a transfer the device could fill past it.
+    /// **A read of the data page stops at the page**, whatever length the device gave.
     #[test]
     fn a_read_of_the_data_page_stops_at_the_page() {
         crate::mm::test_support::init_global_heap();

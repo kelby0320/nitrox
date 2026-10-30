@@ -243,14 +243,12 @@ pub trait Slots {
     fn write(&mut self, i: usize, trb: Trb);
 }
 
-/// **A ring's TRBs in device memory**: [`RING_TRBS`](super::RING_TRBS) of them, at the address of
-/// a buffer that holds that many. Every ring, the controller's and each device's, is one.
+/// **A ring's TRBs in device memory**: every ring's, the controller's and each device's.
 #[derive(Copy, Clone, Debug)]
 pub struct RingMem(u64);
 
 impl RingMem {
-    /// The ring in `buffer`, which must hold a ring's TRBs. The owner of `buffer` keeps it while
-    /// the ring is used.
+    /// The ring in `buffer`, which holds a ring's TRBs and which its owner keeps while it is used.
     pub fn of(buffer: &DmaBuffer) -> RingMem {
         assert!(buffer.len() >= super::RING_TRBS * 16, "a ring's buffer holds its TRBs");
         RingMem(buffer.virt() as u64)
@@ -276,9 +274,8 @@ impl Slots for RingMem {
     }
 }
 
-/// **A TRB read as its reader must**: dword 3, the cycle bit's, first, then the rest after an
-/// acquire, so a TRB whose cycle bit says it is new is read whole, never last lap's fields under
-/// this lap's cycle bit. `load` reads a dword of it.
+/// **A TRB read cycle dword first**, then the rest after an acquire, so one whose cycle bit is new
+/// is read whole, never last lap's fields under it. `load` reads a dword of it.
 fn read_trb(mut load: impl FnMut(usize) -> u32) -> Trb {
     let cycle = load(3);
     fence(Ordering::Acquire);

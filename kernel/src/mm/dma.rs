@@ -94,25 +94,20 @@ impl Drop for DmaBuffer {
     }
 }
 
-/// **Proof a device has stopped using the memory it was given**, which [`Programmed::release`]
-/// takes: minted only where a stop was seen to take, or the one command that held the memory's
-/// address was seen to retire.
+/// **Proof a device stopped using the memory it was given**: minted only where its stop, or the
+/// retiring of the one command holding the memory, was seen.
 pub struct Quiesced(());
 
 impl Quiesced {
-    /// The proof, for a device seen to stop.
-    ///
     /// # Safety
-    /// The device given the memory this releases was seen to stop with it — halted, its port or
-    /// slot stopped, or the command that held its address retired — and is not given it again.
+    /// The device given the memory was seen to stop with it, and is not given it again.
     pub unsafe fn assume() -> Quiesced {
         Quiesced(())
     }
 }
 
-/// **Memory whose address a device was given.** Dropped, it is leaked, since the device may still
-/// write it; it is freed only through [`release`](Self::release), with the proof the device
-/// stopped. Wrapped before the address is written to the device.
+/// **Memory whose address a device was given**: dropped, it is leaked, as the device may still
+/// write it; freed only by [`release`](Self::release), with the proof the device stopped.
 pub struct Programmed<T>(ManuallyDrop<T>);
 
 impl<T> Programmed<T> {
@@ -126,8 +121,6 @@ impl<T> Programmed<T> {
         ManuallyDrop::into_inner(self.0)
     }
 
-    /// The value back, for an owner that never frees it: one publishing it for the kernel's life.
-    ///
     /// # Safety
     /// The value is not dropped while the device may use the memory.
     pub unsafe fn keep(self) -> T {

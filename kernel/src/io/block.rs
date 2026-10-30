@@ -141,8 +141,7 @@ pub fn dispatch_block_irp(
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
     whole_blocks(dn, dev_offset, length)?;
-    // **A disk moves 16-bit words**: an odd offset gives a fragment an odd address and count, which
-    // AHCI's PRDT cannot describe, and an HBA rounding the count up writes a byte past the frame.
+    // **A disk moves 16-bit words**: an odd offset makes an odd address and count, which no PRDT holds.
     if !buf_offset.is_multiple_of(2) {
         return Err(KError::InvalidArgument);
     }

@@ -212,12 +212,10 @@ impl OneAtATime {
         OneAtATime { running: AtomicBool::new(false), again: AtomicBool::new(false) }
     }
 
-    /// Run `body` here, round after round while others ask; or, with another instance running,
-    /// have it run once more and return.
+    /// Run `body` round after round while others ask, or have the running instance do it.
     pub fn run(&self, mut body: impl FnMut()) {
-        // `SeqCst` throughout: the asking store then the running check, and the release then the
-        // re-check, are a store-then-load on each side, and only one order of all four keeps
-        // both instances from missing the other.
+        // `SeqCst`: each side stores then loads (ask, then check running; release, then re-check),
+        // and only one order of all four keeps both instances from missing the other.
         self.again.store(true, Ordering::SeqCst);
         while !self.running.swap(true, Ordering::SeqCst) {
             while self.again.swap(false, Ordering::SeqCst) {
@@ -242,8 +240,7 @@ mod tests {
     use super::*;
     use core::sync::atomic::AtomicU32;
 
-    /// **An instance that arrives while the body runs is served by a second round**, after the
-    /// first, never beside it: two CPUs running it at once acted on its batches out of order.
+    /// **An instance arriving while the body runs is served by a second round, not beside it.**
     #[test]
     fn an_instance_arriving_meanwhile_is_run_after_the_first_not_beside_it() {
         use core::cell::{Cell, RefCell};

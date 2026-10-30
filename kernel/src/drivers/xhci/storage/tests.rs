@@ -836,9 +836,8 @@ fn a_departure_completes_its_commands_only_once_the_slot_is_disabled() {
     }
 }
 
-/// **A hub command goes only on a device the hub thread holds, and never replaces a read**: a
-/// stick's next unit was bound with its first unit's read in flight, and the read never completed.
-/// Held, as a binding holds it, a read queues behind the hub's commands and starts when it lets go.
+/// **A hub command goes only on a held device, never replacing a read**: one bound a stick's next
+/// unit over its first's read, which never completed; held, a read queues until the let-go.
 #[test]
 fn a_hub_command_goes_only_on_a_held_device_and_never_replaces_a_read() {
     init_global_heap();

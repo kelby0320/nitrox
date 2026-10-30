@@ -270,8 +270,7 @@ fn a_report_pushed_after_its_device_departed_is_dropped() {
 }
 
 /// **A departing keyboard's releases end its ring, whatever the DPC pushes meanwhile**: pushed in
-/// holds of their own before the one that retired the node, a press decoded before the departure
-/// could land between, and the ring ended with its key down.
+/// holds of their own, a press could land before the retiring one, leaving its key down.
 #[test]
 fn a_departing_keyboards_releases_end_its_ring_whatever_the_dpc_pushes() {
     use crate::drivers::hid::keyboard::{self, Held, Layout};

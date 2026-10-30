@@ -171,10 +171,9 @@ pub struct Xhci {
     hid_lights: AtomicBool,
 }
 
-// SAFETY: shared across CPUs once published. Its register bases and descriptions never change,
-// and every field that does is atomic or behind a lock of its own, but for DMA memory: the
-// scratchpads and the event ring's segment table are never touched after bring-up, and the device
-// context base array is written by the hub thread alone.
+// SAFETY: shared once published. Its bases and descriptions never change, and every field that
+// does is atomic or locked, but for DMA memory: the scratchpads and the segment table go untouched
+// after bring-up, and the device context base array is the hub thread's alone.
 unsafe impl Sync for Xhci {}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -571,8 +570,7 @@ fn scratchpads_for(count: u32, dcbaa: &DmaBuffer) -> Option<Scratchpads> {
 }
 
 /// Stop a controller that was started, before a decline frees what it writes to: halt it, then
-/// reset it, each within its bound. The proof it halted, or `None`: then it is not reset either,
-/// since a reset while running is forbidden (xHCI 1.2 §5.4.1), and what it was given is kept.
+/// reset it, each within its bound. The proof it halted, or `None`, and no reset (xHCI 1.2 §5.4.1).
 fn stop(op: u64) -> Option<Quiesced> {
     write32(op, USBCMD, 0);
     if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH != 0) {
@@ -585,8 +583,7 @@ fn stop(op: u64) -> Option<Quiesced> {
     Some(unsafe { Quiesced::assume() })
 }
 
-/// **Decline a controller that was started**: `mem`, what it was given, freed once it has stopped,
-/// and kept for good if it did not.
+/// **Decline a started controller**: `mem` freed once it has stopped, kept for good if it did not.
 fn give_back<T>(op: u64, mem: Programmed<T>) {
     if let Some(stopped) = stop(op) {
         drop(mem.release(stopped));
@@ -646,7 +643,6 @@ extern "C" fn isr() {
     crate::dpc::enqueue(&XHCI_DPC);
 }
 
-/// The interrupt's DPC: [`drain_events`], on one CPU at a time.
 fn xhci_dpc(_ctx: *mut ()) {
     if let Some(x) = XHCI.get() {
         DRAIN.run(|| drain_events(x));
@@ -826,8 +822,7 @@ impl fmt::Display for Ranges<'_> {
 mod tests {
     use super::*;
 
-    /// **A started controller declined is given back its memory only once it halted**: one that
-    /// will not halt keeps it, and is not reset while it runs.
+    /// **A declined controller's memory is freed only once it halted**, and one running is not reset.
     #[test]
     fn a_declined_controller_frees_its_memory_only_once_halted() {
         crate::mm::test_support::init_global_heap();

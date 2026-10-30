@@ -3,8 +3,7 @@ use super::*;
 /// Probe and initialise an AHCI controller `DeviceNode`, publishing its first SATA disk; returns
 /// its fate (claimed, or declined with why).
 pub fn init(controller: &ObjectRef) -> Outcome {
-    // **One controller's disk is served**: its interrupt, DPCs and watch thread find it through
-    // `AHCI`. A second controller is declined before it is touched.
+    // **One controller's disk is served**, through `AHCI`: a second is declined before it is touched.
     if AHCI.get().is_some() {
         crate::kprintln!("ahci: another controller's disk is served already; this one is declined");
         return declined("another AHCI controller is already claimed");
@@ -178,8 +177,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
 pub(super) type Claimed = (Programmed<KBox<AhciDisk>>, [u8; MAX_DEVICE_NAME], usize);
 
 /// **Claim the SATA disk on `port`**: every allocation made first, so none fails with the port
-/// running; then the port given the disk's memory and started, and the disk identified. The disk,
-/// its memory the port's, with its name; or why not, its memory freed only if the port stopped.
+/// running, then the port started and the disk identified; or why not, its memory freed if it stopped.
 pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> {
     let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
     let (Ok(cmd_list), Ok(fis), Ok(cmd_table)) =

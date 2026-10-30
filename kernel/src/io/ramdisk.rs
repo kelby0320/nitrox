@@ -194,8 +194,7 @@ impl RamDisk {
             // IRP's box for the IRP's lifetime (see `io::block`).
             unsafe { core::slice::from_raw_parts(irp.buffer.frags as *const PhysFrag, irp.buffer.count as usize) }
         };
-        // **The fragments must hold `len`**, and only `len` of them is moved: the range checked is
-        // the IRP's, and a fragment's own length is no bound on the disk.
+        // **The fragments must hold `len`, and only `len` moves**: a fragment's length bounds no disk.
         if frags.iter().try_fold(0u64, |sum, f| sum.checked_add(f.len)).is_none_or(|sum| sum < len) {
             return (KError::InvalidArgument as i32, 0);
         }
@@ -409,9 +408,8 @@ mod tests {
         assert!(module[..512].iter().all(|&x| x == 0), "and nowhere else");
     }
 
-    /// **A transfer moves its IRP's length and no more**, whatever its fragments hold: a write at
-    /// the last block through one fragment twice its length overran the disk into the memory past
-    /// it, the root module's neighbour on the live image. Fragments short of it are refused.
+    /// **A transfer moves its IRP's length and no more**: a write at the last block through one
+    /// fragment twice its length overran the disk. Fragments short of it are refused.
     #[test]
     fn a_transfer_moves_its_length_whatever_its_fragments_hold() {
         init_global_heap();

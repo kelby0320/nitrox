@@ -5,9 +5,8 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use super::KBox;
 
-/// **A value published once and never withdrawn**: a Tier 1 controller's state, which its
-/// interrupt, its DPCs and its threads reach on any CPU. A reader before the publish sees nothing,
-/// and a second publish is refused, its box handed back.
+/// **A value published once and never withdrawn**, as a Tier 1 controller's state is: a reader
+/// before the publish sees nothing, and a second publish is refused, its box handed back.
 pub struct Published<T: Sync + 'static>(AtomicPtr<T>);
 
 impl<T: Sync + 'static> Published<T> {
@@ -16,8 +15,7 @@ impl<T: Sync + 'static> Published<T> {
         Published(AtomicPtr::new(core::ptr::null_mut()))
     }
 
-    /// **Publish `boxed`, for good**: its value, shared from here on; or `boxed` back, unchanged,
-    /// if a value was published already.
+    /// **Publish `boxed`, for good**, or hand it back if a value was published already.
     pub fn publish(&self, boxed: KBox<T>) -> Result<&'static T, KBox<T>> {
         let p = KBox::into_raw(boxed);
         match self.0.compare_exchange(core::ptr::null_mut(), p.as_ptr(), Ordering::AcqRel, Ordering::Acquire) {
@@ -30,8 +28,7 @@ impl<T: Sync + 'static> Published<T> {
 
     /// What was published, if anything yet.
     pub fn get(&self) -> Option<&'static T> {
-        // SAFETY: only `publish` stores here, once, a box's value it never frees; this `Acquire`
-        // pairs with its `Release`, so the value is whole.
+        // SAFETY: stored once by `publish`, a box never freed; `Acquire` pairs with its `Release`.
         NonNull::new(self.0.load(Ordering::Acquire)).map(|p| unsafe { p.as_ref() })
     }
 }

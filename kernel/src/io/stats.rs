@@ -167,8 +167,7 @@ mod tests {
         assert_eq!((IO.record_for(0, 0).reads, IO.record_for(0, 0).read_bytes), (1, 4096));
     }
 
-    /// **Attaching pins the node the counters are in**: a registration that failed dropped its
-    /// node, and the counters attached to it were then written after the node was freed.
+    /// **Attaching pins the node the counters are in**, which a failed registration dropped.
     #[test]
     fn attaching_pins_the_node_its_counters_are_in() {
         use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};

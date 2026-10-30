@@ -309,9 +309,8 @@ unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Opt
     identity(unsafe { &*(data.virt() as *const [u16; 256]) }, name)
 }
 
-/// **What an IDENTIFY result says**: the LBA48 sector count from words 100..=103, the length of
-/// the identity it writes into `name`, and the flush the drive takes. `None` for no sectors, or
-/// more than LBA48 addresses, which overflowed the sizes taken from them.
+/// **What an IDENTIFY result says**: its LBA48 sector count, the length of the identity written into
+/// `name`, and its flush. `None` for no sectors, or more than LBA48 addresses, which overflowed.
 fn identity(words: &[u16; 256], name: &mut [u8; MAX_DEVICE_NAME]) -> Option<(u64, usize, u8)> {
     let n = words[100..=103].iter().rev().fold(0u64, |n, &w| n << 16 | w as u64);
     let len = format_identity(words, name);
