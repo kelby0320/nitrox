@@ -303,7 +303,7 @@ fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         Ok(m) => m,
         Err(_) => return OpStatus::Rejected(KError::OutOfMemory),
     };
-    crate::klog::copy_into_frames(memobj.frames());
+    crate::klog::copy_into_object(&memobj);
     complete_with_memobj(memobj)
 }
 

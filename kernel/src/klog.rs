@@ -13,7 +13,7 @@
 //!   *latest* output.
 //!
 //! Neither property is traded for the other; what is lost is the *middle*, and the reader is told
-//! how much (see [`copy_into_frames`]). `PREFIX_CAP` is sized from a measurement: a full
+//! how much (see [`copy_into_object`]). `PREFIX_CAP` is sized from a measurement: a full
 //! integration boot captured 3801 bytes and dropped nothing.
 //!
 //! ## Tests
@@ -28,12 +28,12 @@
 //! All state is behind an [`IrqSpinLock`]. [`push`] uses **`try_lock`** and skips the line if
 //! contended, so teeing from the panic/exception path (which also flows through `write_str`) can
 //! never deadlock against a fault that strikes while the ring lock is held. The reader paths
-//! ([`len`] with [`copy_into_frames`] for `/dev/log`, [`copy_into`] for the hardware report) are
+//! ([`len`] with [`copy_into_object`] for `/dev/log`, [`copy_into`] for the hardware report) are
 //! thread context and block on the lock normally.
 
 use crate::libkern::IrqSpinLock;
 use crate::libkern::lockrank::LockRank;
-use crate::mm::{PAGE_SIZE, PhysAddr, heap};
+use crate::object::MemoryObject;
 
 /// Total capacity of the kernel log buffer (bytes). 16 KiB = 4 pages.
 pub const KLOG_CAP: usize = 16 * 1024;
@@ -98,7 +98,7 @@ impl Klog {
     /// The snapshot's byte runs, in order: boot prefix, elision notice, then the ring oldest-first
     /// (in two runs when wrapped). Empty runs are included so the shape is fixed.
     ///
-    /// **The single definition of the snapshot's layout**, consumed by [`copy_into_frames`] and the
+    /// **The single definition of the snapshot's layout**, consumed by [`copy_into_object`] and the
     /// host tests alike: a test that re-derived the layout it checks would pass while production
     /// got it wrong.
     fn runs<'a>(&'a self, notice: &'a [u8]) -> [&'a [u8]; 4] {
@@ -124,17 +124,25 @@ impl Klog {
         self.prefix_len + self.notice_len() + self.ring_len
     }
 
-    /// Copy the linearised snapshot (the same [`runs`](Self::runs)) into `out`, stopping when full.
-    fn copy_into(&self, out: &mut [u8]) -> usize {
+    /// Hand the snapshot (the same [`runs`](Self::runs)) to `put` as `(offset, bytes)`, up to `cap`.
+    fn copy_with(&self, cap: usize, mut put: impl FnMut(usize, &[u8])) -> usize {
         let mut notice = [0u8; NOTICE_MAX];
         let notice_len = if self.elided == 0 { 0 } else { format_notice(self.elided, &mut notice) };
         let mut written = 0;
         for run in self.runs(&notice[..notice_len]) {
-            let n = run.len().min(out.len() - written);
-            out[written..written + n].copy_from_slice(&run[..n]);
+            let n = run.len().min(cap - written);
+            put(written, &run[..n]);
             written += n;
         }
         written
+    }
+
+    fn copy_into(&self, out: &mut [u8]) -> usize {
+        self.copy_with(out.len(), |at, run| out[at..at + run.len()].copy_from_slice(run))
+    }
+
+    fn copy_into_object(&self, obj: &MemoryObject) -> usize {
+        self.copy_with(obj.size(), |at, run| obj.copy_in(at, run))
     }
 
     /// Length of the elision notice (`0` when nothing has been overwritten).
@@ -218,15 +226,14 @@ pub fn stats() -> (usize, usize, usize) {
     (g.prefix_len, g.ring_len, g.elided)
 }
 
-/// Copy the linearised log into `out`, as [`copy_into_frames`] lays it out, stopping when `out` is
+/// Copy the linearised log into `out`, as [`copy_into_object`] lays it out, stopping when `out` is
 /// full. Returns the bytes copied. The hardware report's read; size `out` with [`len`]. Runs under
 /// the ring lock, which masks interrupts for the copy: at most [`KLOG_CAP`] bytes and a notice.
 pub fn copy_into(out: &mut [u8]) -> usize {
     KLOG.lock().copy_into(out)
 }
 
-/// Copy the linearised log into `frames` (one page each, via the HHDM): the `/dev/log` snapshot
-/// fill. Copies `min(snapshot_len, frames * PAGE)` bytes and returns the count.
+/// Copy the linearised log into `obj`, the `/dev/log` snapshot, up to its size; returns the count.
 ///
 /// The layout is boot prefix, then a `[klog: N bytes elided]` notice if any middle was overwritten,
 /// then the ring oldest-first: a gap the reader cannot see is a log that lies about being complete.
@@ -234,31 +241,8 @@ pub fn copy_into(out: &mut [u8]) -> usize {
 /// Runs under the ring lock (no allocation). A concurrent `push` may advance the ring between
 /// [`len`] and this call; the copy is bounded by both, so the result is a possibly-truncated
 /// snapshot, never an overrun.
-pub fn copy_into_frames(frames: &[PhysAddr]) -> usize {
-    let g = KLOG.lock();
-    let cap = frames.len() * PAGE_SIZE;
-    let hhdm = heap::hhdm_offset();
-
-    let mut notice = [0u8; NOTICE_MAX];
-    let notice_len = if g.elided == 0 { 0 } else { format_notice(g.elided, &mut notice) };
-
-    let mut written = 0usize;
-    for src in g.runs(&notice[..notice_len]) {
-        let mut off = 0usize;
-        while off < src.len() && written < cap {
-            let page = written / PAGE_SIZE;
-            let intra = written % PAGE_SIZE;
-            let chunk = (PAGE_SIZE - intra).min(src.len() - off).min(cap - written);
-            let dst = (frames[page].as_u64() + hhdm + intra as u64) as *mut u8;
-            // SAFETY: `dst..dst+chunk` is within an owned, HHDM-mapped frame (`page <
-            // frames.len()` because `written < cap`, and `intra + chunk <= PAGE`); the
-            // source is `chunk` bytes inside this run's slice.
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr().add(off), dst, chunk) };
-            off += chunk;
-            written += chunk;
-        }
-    }
-    written
+pub fn copy_into_object(obj: &MemoryObject) -> usize {
+    KLOG.lock().copy_into_object(obj)
 }
 
 #[cfg(test)]
@@ -356,6 +340,28 @@ mod tests {
         let mut short = vec![0u8; PREFIX_CAP + 5];
         assert_eq!(k.copy_into(&mut short), PREFIX_CAP + 5);
         assert_eq!(&short[..], &whole[..PREFIX_CAP + 5]);
+    }
+
+    /// **The `/dev/log` fill writes its object and nothing else**, cut at the object's size.
+    #[test]
+    fn the_log_is_copied_into_its_object_cut_at_its_size() {
+        use crate::mm::PAGE_SIZE;
+        crate::mm::test_support::init_global_heap();
+        let mut k = fresh();
+        k.append(&[b'P'; PREFIX_CAP]);
+        k.append(b"after");
+        let whole = linearise(&k);
+        assert!(whole.len() > PAGE_SIZE);
+
+        let page = MemoryObject::try_new(PAGE_SIZE).unwrap();
+        assert_eq!(k.copy_into_object(&page), PAGE_SIZE);
+        assert_eq!(page.copy_to_kvec().unwrap()[..], whole[..PAGE_SIZE]);
+
+        let room = MemoryObject::try_new(whole.len() + 1).unwrap();
+        assert_eq!(k.copy_into_object(&room), whole.len());
+        let back = room.copy_to_kvec().unwrap();
+        assert_eq!(back[..whole.len()], whole[..]);
+        assert!(back[whole.len()..].iter().all(|&b| b == 0));
     }
 
     #[test]
