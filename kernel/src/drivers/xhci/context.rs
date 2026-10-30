@@ -200,7 +200,7 @@ pub fn configure_endpoints(
     bulks: &[Bulk],
 ) -> bool {
     let mut dcis = bulks.iter().map(|b| b.dci).chain(endpoints.iter().map(|e| e.dci));
-    let unique = |seen: u32, dci: u8| (DCI_EP0 < dci && dci < 32 && seen & 1 << dci == 0).then_some(seen | 1 << dci);
+    let unique = |seen: u32, dci: u8| (DCI_EP0 < dci && dci < 32 && seen & 1 << dci == 0).then(|| seen | 1 << dci);
     if dcis.try_fold(0, unique).is_none() {
         return false;
     }
@@ -379,6 +379,7 @@ mod tests {
             (&[][..], [bulk(3, true), bulk(0, false)], "bulk OUT 0x00"),
             (&[], [bulk(1, true), bulk(4, false)], "bulk IN 0x80"),
             (&[], [bulk(3, true), bulk(3, true)], "one index twice"),
+            (&[], [bulk(3, true), bulk(32, false)], "an index past the last context"),
             (&[kbd], [bulk(3, true), bulk(4, false)], "a keyboard's and a stick's"),
         ] {
             let mut ctx = vec![0u8; l.input_len()];
