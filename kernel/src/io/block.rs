@@ -51,7 +51,8 @@ unsafe impl Sync for BlockBackend {}
 
 /// The owning wrapper around an in-flight [`Irp`]. `#[repr(C)]` with `irp`
 /// **first**, so `*mut IrpBox` and `*mut Irp` share an address and the
-/// completion's [`finish`] recovers the box from the `irp` pointer. Its `ObjectRef`s keep
+/// completion's [`finish`] recovers the box from the `irp` pointer, which a dispatch makes from
+/// the box's, so that it reaches the whole box. Its `ObjectRef`s keep
 /// the raw pointers inside `irp` valid; `frags` backs `irp.buffer`. None of this is the
 /// hashed `Irp` layout: a Tier 2 module only ever sees `*mut Irp`.
 #[repr(C)]
@@ -125,8 +126,9 @@ fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: *mut Irp) {
 ///
 /// Returns `Err` **before the operation starts**, so the caller rolls back `po`:
 /// `OutOfMemory`, `Unsupported` without a block backend, `InvalidArgument` if
-/// the transfer is not whole blocks or needs more fragments than the device can describe in one
-/// command. A range past the device's end completes `po` `InvalidArgument`.
+/// the transfer is not whole blocks, starts at an odd `buf_offset`, or needs more fragments than
+/// the device can describe in one command. A range past the device's end completes `po`
+/// `InvalidArgument`.
 pub fn dispatch_block_irp(
     device: &ObjectRef,
     buffer: &ObjectRef,
@@ -140,6 +142,10 @@ pub fn dispatch_block_irp(
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
     whole_blocks(dn, dev_offset, length)?;
+    // **A disk moves 16-bit words**: an odd offset makes an odd address and count, which no PRDT holds.
+    if !buf_offset.is_multiple_of(2) {
+        return Err(KError::InvalidArgument);
+    }
 
     // SAFETY: `buffer` pins a live `MemoryObject` (type checked by the caller).
     let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
@@ -191,7 +197,7 @@ pub fn dispatch_block_irp(
         bx.irp.buffer =
             IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
         bx.irp.on_complete = finish;
-        &mut bx.irp as *mut Irp
+        &raw mut (*bx_ptr).irp
     };
 
     // Completes asynchronously: the backend, or its completion interrupt, calls `irp::complete`.
@@ -270,7 +276,7 @@ pub fn dispatch_block_irp_into_frames(
         bx.irp.buffer =
             IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
         bx.irp.on_complete = finish;
-        &mut bx.irp as *mut Irp
+        &raw mut (*bx_ptr).irp
     };
     submit_within(dn, backend, irp_ptr);
     Ok(())
@@ -308,7 +314,7 @@ pub fn dispatch_block_control(device: &ObjectRef, po: &ObjectRef, op: IrpOp) -> 
     let irp_ptr = unsafe {
         let bx = &mut *bx_ptr;
         bx.irp.on_complete = finish;
-        &mut bx.irp as *mut Irp
+        &raw mut (*bx_ptr).irp
     };
     (backend.submit)(irp_ptr, backend.ctx);
     Ok(())
@@ -628,14 +634,7 @@ impl Partition {
 /// The partition window behind `node`, if `node` is one: a disk's node is not.
 fn window_of(node: &ObjectRef) -> Option<&'static Partition> {
     // SAFETY: `node` pins a live `DeviceNode`.
-    let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
-    let backend = dn.block_backend()?;
-    if backend.submit as *const () != partition_submit as *const () {
-        return None;
-    }
-    // SAFETY: a backend whose `submit` is `partition_submit` has a leaked `'static` `Partition` as
-    // its context (`partition_backend`).
-    Some(unsafe { &*(backend.ctx as *const Partition) })
+    unsafe { &*(node.as_ptr() as *const DeviceNode) }.window()
 }
 
 /// **Retire the partition window behind `node`**: every IRP is refused from

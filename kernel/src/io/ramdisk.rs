@@ -194,22 +194,28 @@ impl RamDisk {
             // IRP's box for the IRP's lifetime (see `io::block`).
             unsafe { core::slice::from_raw_parts(irp.buffer.frags as *const PhysFrag, irp.buffer.count as usize) }
         };
+        // **The fragments must hold `len`, and only `len` moves**: a fragment's length bounds no disk.
+        if frags.iter().try_fold(0u64, |sum, f| sum.checked_add(f.len)).is_none_or(|sum| sum < len) {
+            return (KError::InvalidArgument as i32, 0);
+        }
         let hhdm = crate::mm::heap::hhdm_offset();
-        let mut dev_pos = dev_off;
+        let (mut dev_pos, mut left) = (dev_off, len);
         for f in frags {
+            let n = f.len.min(left);
             let buf_va = (f.base + hhdm) as *mut u8;
-            // SAFETY: `dev_pos + f.len <= len` (the total was bounds-checked and
-            // the frags sum to `len`); `buf_va` is the HHDM alias of an owned
-            // buffer frame; the regions do not overlap.
+            // SAFETY: `dev_pos + n <= dev_off + len`, which was bounds-checked against the
+            // capacity; `buf_va` is the HHDM alias of an owned buffer frame of at least `n` bytes;
+            // the regions do not overlap.
             unsafe {
                 let dev_ptr = base.add(dev_pos as usize);
                 if is_read {
-                    core::ptr::copy_nonoverlapping(dev_ptr, buf_va, f.len as usize);
+                    core::ptr::copy_nonoverlapping(dev_ptr, buf_va, n as usize);
                 } else {
-                    core::ptr::copy_nonoverlapping(buf_va as *const u8, dev_ptr, f.len as usize);
+                    core::ptr::copy_nonoverlapping(buf_va as *const u8, dev_ptr, n as usize);
                 }
             }
-            dev_pos += f.len;
+            dev_pos += n;
+            left -= n;
         }
         (IrpStatus::Success as i32, len)
     }
@@ -358,8 +364,7 @@ pub fn publish_modules() {
         let node_ref =
             unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
         crate::device::register(node_ref.clone(), "ramdisk");
-        // SAFETY: `node_ref` was just registered, and the table holds it for the kernel's lifetime.
-        unsafe { rd.counted().attach(&node_ref) };
+        rd.counted().attach(&node_ref);
         crate::kprintln!("ramdisk: module {} ({}), {} bytes, as a block device", disk.index, path, disk.len);
     }
 }
@@ -401,6 +406,27 @@ mod tests {
         drop(rd);
         assert!(module[512..1024].iter().all(|&x| x == 0xAB), "the write landed in the module");
         assert!(module[..512].iter().all(|&x| x == 0), "and nowhere else");
+    }
+
+    /// **A transfer moves its IRP's length and no more**: a write at the last block through one
+    /// fragment twice its length overran the disk. Fragments short of it are refused.
+    #[test]
+    fn a_transfer_moves_its_length_whatever_its_fragments_hold() {
+        init_global_heap();
+        let mut module = vec![0xCD_u8; 2560];
+        // SAFETY: `module` outlives `rd`, which is over its first 2048 bytes alone.
+        let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), 2048) }.unwrap();
+        let mut long = [0xAB_u8; 1024];
+        let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: &frag(&mut long) as *const PhysFrag as u64 };
+        let write = Irp::new_block(IrpOp::Write, core::ptr::null(), 1536, 512, buffer, core::ptr::null_mut(), 0);
+        assert_eq!(rd.transfer(&write), (IrpStatus::Success as i32, 512));
+        let mut short = [0u8; 256];
+        let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: &frag(&mut short) as *const PhysFrag as u64 };
+        let read = Irp::new_block(IrpOp::Read, core::ptr::null(), 0, 512, buffer, core::ptr::null_mut(), 0);
+        assert_eq!(rd.transfer(&read), (KError::InvalidArgument as i32, 0), "fragments short of it");
+        drop(rd);
+        assert!(module[1536..2048].iter().all(|&x| x == 0xAB), "the last block written");
+        assert!(module[2048..].iter().all(|&x| x == 0xCD), "and not a byte past the disk");
     }
 
     /// **The disk it owns takes writes**, through a pointer that may write.

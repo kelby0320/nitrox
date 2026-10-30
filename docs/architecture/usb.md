@@ -60,8 +60,10 @@ controller**; a second is declined.
 **Every wait is bounded, and a failure declines the function with its reason** — no USB is a
 diagnosable failure, a hang on a machine with no serial port is not. A decline after the
 controller started halts and resets it first, since it would otherwise go on writing to memory the
-driver frees. `usb=off` on the command line declines the controller outright; the installed system
-has no boot menu to type it at, but the live stick's does.
+driver frees. **One that will not halt is not reset, and keeps that memory for good.**
+
+`usb=off` on the command line declines the controller outright; the installed system has no boot
+menu to type it at, but the live stick's does.
 
 **MSI only.** The laptop's controller has MSI with eight vectors and no MSI-X, and the driver
 takes that. **Every gate's controller is QEMU's `nec-usb-xhci` with `msi=on,msix=off`**
@@ -136,7 +138,11 @@ enumerated; a disconnection disables the device's slot and frees its memory.
    mass storage `08/06/50`, a hub (listed, not supported), or nothing this kernel drives;
 6. **the classes bound, in one configuration** (Part D): each binding class's endpoints prepared,
    then one *Configure Endpoint* adding all of them and one `SET_CONFIGURATION` — a second would
-   reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own requests.
+   reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own requests. **The
+   endpoints' context indices are the device's word**, so a set naming the default endpoint's, or
+   one index twice, is refused with nothing written; and **a default endpoint left in doubt is asked
+   nothing more**: any request on it but a stall's answer may still be on its ring, so every later
+   one, a class's binding, a recovery or a keyboard's lights, is refused.
 
 **Every command and transfer has a one-second deadline.** A device that misses a transfer's is
 abandoned and its slot disabled. A command that goes unanswered leaves the command ring in doubt —
@@ -357,11 +363,14 @@ read it whole, and how many before it came back short or stalled. A session read
 
 ## Mass storage (Part D)
 
-**A bulk-only interface binds as a disk** (`kernel/src/drivers/xhci/storage.rs`), during
+**A bulk-only interface binds as a disk** (`kernel/src/drivers/xhci/storage/bind.rs`), during
 enumeration and in the hub thread: `GET MAX LUN` (a stall means one unit), then for each unit
 `INQUIRY` — a direct-access device, or it is left alone — `TEST UNIT READY` with `REQUEST SENSE`
 between tries for up to five seconds, and `READ CAPACITY(10)`. **Every command at binding is the
-hub thread's own, waited for and bounded at five seconds**, and a stall is recovered in line. A unit
+hub thread's own, waited for and bounded at five seconds**, and a stall is recovered in line. **The
+device is held while it binds**, as a rescan holds it: a unit published before the next is bound
+takes submits, which queue until the binding ends, and a hub command goes on the rings only of a
+held device with no submit's command in flight, its buffer cleared first. A unit
 that is not ready (an empty card reader's slot), or not a block device, is said and left alone.
 
 **A unit of 2³² blocks or more** (Part G): `READ CAPACITY(10)` answers that it cannot say —
@@ -482,8 +491,11 @@ supervises.
 ## The code, and what tests it
 
 - **`drivers::xhci::ring`** — TRBs, the producer ring (the command ring; transfer rings from A.2)
-  and the event ring's consumer, as arithmetic over a `Slots` trait. Host tests read a producer
-  ring back with a model of the controller written from the specification, across three wraps.
+  and the event ring's consumer, as arithmetic over a `Slots` trait; and `RingMem`, every ring's
+  memory, the controller's and each device's, which reads a TRB's cycle dword before the rest and
+  writes it after them, each across a fence. Host tests read a producer ring back with a model of
+  the controller written from the specification, across three wraps, and take an event whose write
+  lands between the reader's loads whole or not at all.
 - **`drivers::xhci::caps`** — the extended-capability walk, bounded by the register window and an
   entry count. Host tests on register images.
 - **`drivers::xhci::context`** — input and device contexts at both entry sizes, and the speeds.

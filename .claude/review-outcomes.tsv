@@ -369,3 +369,19 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-29	407	ac2f0efc	12	architecture	optional	demonstrated	fixed	c1209b9e	lock-ordering names the SERIAL exception: a fault with no waiter, under SCHED
 2026-10-29	407	ac2f0efc	13	architecture	optional	demonstrated	fixed	c1209b9e	CR0.WP in the ArchCpu contract, ap_cpu_init, paging_init, cpu.rs and scheduler.md
 2026-10-29	407	ac2f0efc	14	tests	optional	demonstrated	fixed	c553e5a1	folded into 1: the release claim is pinned by the scan
+2026-10-30	408	61089be1	1	logic	worth-fixing	demonstrated	fixed	823c7188	RingMem<'a> borrows its buffer; endpoint rings by unsafe kept(); the probe fails E0597
+2026-10-30	408	61089be1	2	logic	worth-fixing	demonstrated	fixed	d0d01224	run_releasing seam; deterministic test of the re-check; break in its place fails it
+2026-10-30	408	61089be1	3	logic	worth-fixing	demonstrated	fixed	062e4965	per-buffer Programmed, no DerefMut, release(&Quiesced) marks; *p = probe fails E0594; releases tested in 3a9baa69, 465e3630 (maintainer's call)
+2026-10-30	408	61089be1	4	logic	worth-fixing	demonstrated	fixed	062e4965	the claim made true: IDENTIFY's page allocated before the port starts
+2026-10-30	408	61089be1	5	error-paths	worth-fixing	unverified	fixed	3a9baa69	DeviceMem.in_doubt: any class's doubt refuses every later control transfer; fake Xhci test
+2026-10-30	408	61089be1	6	tests	worth-fixing	demonstrated	fixed	a1cafd3d	clear_for and issue_hub's cut each tested; deleting either fails its test
+2026-10-30	408	61089be1	7	tests	worth-fixing	demonstrated	fixed	d97e7be7	let_go_meanwhile seam; the two-hold order fails 5 of 5, deterministically
+2026-10-30	408	61089be1	8	logic	optional	unverified	declined		unreachable: bind, recover and rescan all hold the device; a run() test needs the scheduler
+2026-10-30	408	61089be1	9	logic	optional	unverified	deferred		TODO(usb-bind-hold-per-unit): a hold per unit; QEMU's usb-storage has one unit
+2026-10-30	408	61089be1	10	error-paths	optional	demonstrated	fixed	9038e14f	a port that will not stop is declined before it is given anything; fake-register test
+2026-10-30	408	61089be1	11	logic	optional	demonstrated	fixed	0d5d3f25	2^48 refused in the test; <= fails it
+2026-10-30	408	61089be1	12	tests	optional	demonstrated	fixed	0d5d3f25	index 32 refused in the test, which found an eager then_some overflow, now lazy
+2026-10-30	408	61089be1	13	tests	optional	demonstrated	deferred		TODO(miri-provenance-tests): only Miri sees it; the test joins the entry
+2026-10-30	408	61089be1	14	tests	optional	unverified	declined		AHCI's decline boot-shown; publish-refused branches unreachable at boot; doubt now tested in 5
+2026-10-30	408	61089be1	15	rules-and-docs	optional	demonstrated	fixed	bb6235d6	kernel/CLAUDE.md names Published and a kept reference (maintainer's call); log reason corrected
+2026-10-30	408	61089be1	16	rules-and-docs	optional	demonstrated	fixed	bb6235d6	usb.md and deferred-decisions.md rewrapped

@@ -37159,3 +37159,49 @@ interleaved byte by byte with nxterm's line. The review found that "no CPU has a
 this PR's first answer, silenced an init crash on a busy SMP system, which the 2026-06-22
 decision promised a line for; the maintainer chose the waiter rule. A supervisor not yet at its
 wait gets the line too, so the harness's fault demo lets its supervisor reach its wait first.
+
+## 2026-10-30 — Before Phase 7, Part I: a device's memory kept until it stops, and ordered rings
+
+Group M of the survey's triage, the drivers, made ten decisions:
+
+- **Memory a device was given is freed only with the proof the device stopped**: each buffer is a
+  `mm::dma::Programmed`, which leaks on drop unless released first with a `Quiesced`, minted
+  (unsafe) where a stop is seen to take or the one command holding the memory to retire (drv-o4).
+  It gives no `&mut DmaBuffer`, so replacing one, or clearing a list of them, leaks it too.
+  A declined AHCI disk, a declined xHCI controller that will not halt, and a USB slot that will not
+  disable keep their memory for good (drv-d11, drv-d12). AHCI allocates all before its port starts.
+- **A Tier 1 controller's state is `libkern::Published`**: boxed once, never withdrawn, a second
+  publish refused (drv-o11). **A second AHCI controller is declined before it is touched**, as
+  xHCI's second is (drv-d4, the bash's drv-8), since one static served neither; a boot disk behind
+  a second controller is not served until multi-controller support, deferred as before.
+  kernel/CLAUDE.md names `Published`, and a reference kept to an object as a disk's counters keep
+  their node, as the ways to hold state for the kernel's life (the maintainer's call). The RAM
+  disks' and the partition windows' leaks to `'static` stay as they were: many values, where a
+  `Published` holds one.
+- **Every xHCI ring is a `RingMem`**, which reads a TRB's cycle dword first and writes it last,
+  each across a fence (drv-o16, drv-d20).
+- **A DPC whose work must stay in order runs it through `dpc::OneAtATime`**, which makes a second
+  instance hand its round to the running one rather than spin (drv-d19); `xhci_dpc` does. Its
+  orderings are `SeqCst` on the store-buffering argument; no control shows weaker ones losing.
+- **A USB stick is held while it binds**, as during a rescan, and a hub command goes only on a
+  held device with no submit's command in flight, its buffer cleared first (drv-d3, drv-d15).
+- **A device's endpoint indices are the device's word**: a set naming the default endpoint's, or
+  one twice, binds nothing (drv-d14); and **a default endpoint left in doubt is asked nothing
+  more**: after any failure but a stall, every later control transfer on it is refused (drv-d13).
+- **A departing keyboard's releases are pushed in the hold that retires its node** (drv-d18).
+- **A disk's counters pin the node they are in**, so attaching them is safe (drv-o18, drv-d17), and
+  **a partition's node carries its window**, set only where it is made (drv-d16).
+- **A block request at an odd `buf_offset` is refused**, synchronously, with `InvalidArgument`
+  (drv-d10): AHCI cannot describe an odd address or count. io-operation.md says so.
+- **A RAM disk moves an IRP's length and no more** (drv-d5); **an IDENTIFY count past LBA48 is
+  refused** (drv-d9); **a read of a USB device's data page stops at the page** (drv-d8).
+
+To make room, USB storage's binding and its hub-thread side moved from `storage.rs` into
+`storage/bind.rs` and `storage/recover.rs`, and the HID nodes' slots into `hid/nodes.rs`,
+unchanged; both files lost their size entries.
+
+One more, outside the survey, found running Miri over this group's modules (the maintainer's call
+to fix here): **a block IRP's pointer is made from its box's pointer**, so `finish` may reach the
+whole box through it. Made from a borrow of the `irp` field, it carried that field's provenance
+alone, and `finish`'s write of the box's reclaim link, past the field, was undefined behaviour on
+every block completion. Natively nothing showed it.

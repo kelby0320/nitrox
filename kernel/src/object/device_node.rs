@@ -6,7 +6,7 @@
 //! hardware-facing fields never cross to userspace, where a handle is an opaque capability.
 //! Normative shapes: `docs/spec/device-node.md`.
 
-use crate::io::block::BlockBackend;
+use crate::io::block::{BlockBackend, Partition, partition_backend};
 use crate::io::stats::IoStats;
 use crate::libkern::block::{BlockDeviceInfo, BlockKind};
 use crate::libkern::handle::KObjectType;
@@ -227,6 +227,8 @@ pub struct DeviceNode {
     block_info: BlockDeviceInfo,
     /// The block I/O entry point, present iff a driver has claimed this `Block` node.
     block_backend: Option<BlockBackend>,
+    /// **The window a partition's node is over**, which a rescan of its disk retires.
+    window: Option<&'static Partition>,
     /// The character I/O entry point, present iff this is a `Char` node (the console).
     char_backend: Option<CharBackend>,
     /// **What the device has done**, served by `/dev/registry/io`. On the node, since a node is
@@ -252,6 +254,7 @@ impl DeviceNode {
             geometry,
             block_info: BlockDeviceInfo::default(),
             block_backend: None,
+            window: None,
             char_backend: None,
             io: IoStats::new(),
         })
@@ -267,6 +270,7 @@ impl DeviceNode {
             geometry: BlockGeometry::ZERO,
             block_info: BlockDeviceInfo::default(),
             block_backend: None,
+            window: None,
             char_backend: Some(backend),
             io: IoStats::new(),
         })
@@ -291,9 +295,28 @@ impl DeviceNode {
             // partition table over a mounted root.
             block_info: BlockDeviceInfo::new(kind, geometry.logical_block_size, geometry.block_count, name),
             block_backend: Some(backend),
+            window: None,
             char_backend: None,
             io: IoStats::new(),
         })
+    }
+
+    /// Allocate a partition's node over `window` on its disk, the one way a node gets a window.
+    pub fn try_new_partition(
+        descriptor: ResourceDescriptor,
+        geometry: BlockGeometry,
+        name: &[u8],
+        window: &'static Partition,
+    ) -> Result<KBox<Self>, AllocError> {
+        let mut node =
+            Self::try_new_block(descriptor, geometry, BlockKind::Partition, name, partition_backend(window))?;
+        node.window = Some(window);
+        Ok(node)
+    }
+
+    /// The window a partition's node is over; `None` for any other node.
+    pub fn window(&self) -> Option<&'static Partition> {
+        self.window
     }
 
     /// `true` iff the self-check sentinel is intact.

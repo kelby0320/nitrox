@@ -200,7 +200,7 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     assert_eq!(nodes.take(true), None, "every slot bound");
 
     // The keyboard in slot 5 departs holding a key, and a lights write is left waiting.
-    nodes.retire(5, &[InputEvent::key(30, KEY_RELEASE, 1)], 1);
+    nodes.retire(5, |r| r.ring.push_group(&[InputEvent::key(30, KEY_RELEASE, 1)]), 1);
     // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
     let lights = unsafe { crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation) };
     nodes.lights.lock()[5] = Some((lights.clone(), 1));
@@ -249,7 +249,7 @@ fn a_report_pushed_after_its_device_departed_is_dropped() {
     assert!(nodes.push(index, epoch, &press, &mut scratch, 1).is_none(), "no read waiting");
     assert!(!nodes.readers[index].lock().ring.is_empty(), "pushed while the keyboard is here");
 
-    nodes.retire(index, &[InputEvent::key(30, KEY_RELEASE, 2), InputEvent::syn(2)], 2);
+    nodes.retire(index, |r| r.ring.push_group(&[InputEvent::key(30, KEY_RELEASE, 2), InputEvent::syn(2)]), 2);
     // What the ring holds, drained: how many events, and the last key among them.
     let held = |n: &Nodes| {
         let mut out = [0u8; DRAIN_MAX];
@@ -267,4 +267,30 @@ fn a_report_pushed_after_its_device_departed_is_dropped() {
     assert!(nodes.readers[index].lock().ring.is_empty(), "the old node's report reaches no new ring");
     nodes.push(index, now, &[InputEvent::rel(REL_X, 3, 5)], &mut scratch, 5);
     assert_eq!(held(&nodes), (1, None), "the new device's own does");
+}
+
+/// **A departing keyboard's releases end its ring, whatever the DPC pushes meanwhile**: a press it
+/// decoded before the departure, pushed between the releases' hold and the retiring one, left the
+/// key down. Here the DPC pushes the moment it can take the node's lock after the releases.
+#[test]
+fn a_departing_keyboards_releases_end_its_ring_whatever_the_dpc_pushes() {
+    use crate::drivers::hid::keyboard::{self, Held, Layout};
+    init_global_heap();
+    let nodes = Nodes::new();
+    let (index, epoch) = nodes.take(true).expect("a free slot");
+    let (mut held, mut out) = (Held::NONE, [InputEvent::default(); keyboard::EVENTS_MAX]);
+    keyboard::decode(&Layout::BOOT, &mut held, &[0, 0, 0x04, 0, 0, 0, 0, 0], 1, &mut out);
+    let press = [InputEvent::key(30, KEY_PRESS, 1), InputEvent::syn(1)];
+    let dpc = || {
+        if let Some(mut r) = nodes.readers[index].try_lock() {
+            r.offer(&press);
+        }
+    };
+    let_go_meanwhile(&nodes, index, Decoder::Keyboard { layout: Layout::BOOT, held }, 2, dpc);
+    nodes.push(index, epoch, &press, &mut [0u8; DRAIN_MAX], 3);
+    let mut bytes = [0u8; DRAIN_MAX];
+    let len = nodes.readers[index].lock().ring.drain_into(&mut bytes, 4);
+    let mut events = bytes[..len].chunks(INPUT_EVENT_LEN).filter_map(InputEvent::read);
+    let last = events.rfind(|e| e.kind == EV_KEY).map(|e| (e.code, e.value));
+    assert_eq!(last, Some((30, KEY_RELEASE)), "the key left down");
 }

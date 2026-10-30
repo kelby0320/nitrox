@@ -10,8 +10,13 @@
 //! - **A [`Consumer`]** is a ring the controller writes and software reads: the event ring. A
 //!   one-segment event ring wraps at its end, with no Link TRB, and the reader flips its state there.
 //!
-//! Where the TRBs live is [`Slots`]': device memory written volatile in the kernel, a `Vec` in a
-//! test. Everything here is the arithmetic, so the host tests are tests of it.
+//! Where the TRBs live is [`Slots`]': device memory, [`RingMem`], in the kernel, a `Vec` in a test.
+//! Everything else here is the arithmetic, so the host tests are tests of it.
+
+use core::marker::PhantomData;
+use core::sync::atomic::{Ordering, fence};
+
+use crate::mm::dma::DmaBuffer;
 
 /// One Transfer Request Block: four dwords, the fourth holding the cycle bit and the type.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -239,6 +244,68 @@ pub trait Slots {
     fn write(&mut self, i: usize, trb: Trb);
 }
 
+/// **A ring's TRBs in device memory**: every ring's, the controller's and each device's, for as
+/// long as `'a` holds the buffer.
+#[derive(Copy, Clone, Debug)]
+pub struct RingMem<'a>(u64, PhantomData<&'a DmaBuffer>);
+
+impl<'a> RingMem<'a> {
+    /// The ring in `buffer`, which holds a ring's TRBs.
+    pub fn of(buffer: &'a DmaBuffer) -> RingMem<'a> {
+        assert!(buffer.len() >= super::RING_TRBS * 16, "a ring's buffer holds its TRBs");
+        RingMem(buffer.virt() as u64, PhantomData)
+    }
+}
+
+impl RingMem<'static> {
+    /// The ring in `buffer`, held by its address where no borrow can be: an endpoint's, which the
+    /// DPC writes while the hub thread owns the buffer.
+    ///
+    /// # Safety
+    /// `buffer` is not freed while the ring is used.
+    pub unsafe fn kept(buffer: &DmaBuffer) -> RingMem<'static> {
+        let RingMem(at, _) = RingMem::of(buffer);
+        RingMem(at, PhantomData)
+    }
+}
+
+impl Slots for RingMem<'_> {
+    fn len(&self) -> usize {
+        super::RING_TRBS
+    }
+
+    fn read(&self, i: usize) -> Trb {
+        let p = self.0 as *const u32;
+        // SAFETY: `i < RING_TRBS`, as `Producer` and `Consumer` index, and the buffer holds that
+        // many TRBs of four dwords while its owner keeps it.
+        read_trb(|n| unsafe { core::ptr::read_volatile(p.add(i * 4 + n)) })
+    }
+
+    fn write(&mut self, i: usize, trb: Trb) {
+        let p = self.0 as *mut u32;
+        // SAFETY: as `read`.
+        write_trb(trb, |n, dw| unsafe { core::ptr::write_volatile(p.add(i * 4 + n), dw) });
+    }
+}
+
+/// **A TRB read cycle dword first**, then the rest after an acquire, so one whose cycle bit is new
+/// is read whole, never last lap's fields under it. `load` reads a dword of it.
+fn read_trb(mut load: impl FnMut(usize) -> u32) -> Trb {
+    let cycle = load(3);
+    fence(Ordering::Acquire);
+    Trb([load(0), load(1), load(2), cycle])
+}
+
+/// **A TRB written as its writer must**: dwords 0 to 2, then dword 3, whose cycle bit hands the TRB
+/// over, after a release. `store` writes a dword of it.
+fn write_trb(trb: Trb, mut store: impl FnMut(usize, u32)) {
+    for n in 0..3 {
+        store(n, trb.0[n]);
+    }
+    fence(Ordering::Release);
+    store(3, trb.0[3]);
+}
+
 /// A ring software writes: the command ring, or a transfer ring.
 #[derive(Debug)]
 pub struct Producer {
@@ -390,6 +457,49 @@ mod tests {
 
     fn numbered(n: u32) -> Trb {
         Trb([n, 0, 0, kind::NO_OP_COMMAND << 10])
+    }
+
+    /// **The controller's write of an event lands between the reader's loads**: the event is taken
+    /// whole, or not yet; read cycle dword last, it was taken with last lap's pointer and code.
+    #[test]
+    fn an_event_written_while_it_is_read_is_taken_whole_or_not_yet() {
+        struct Landing {
+            old: Trb,
+            new: Trb,
+            after: usize,
+            loads: core::cell::Cell<usize>,
+        }
+        impl Slots for Landing {
+            fn len(&self) -> usize {
+                4
+            }
+            fn read(&self, _: usize) -> Trb {
+                read_trb(|n| {
+                    let k = self.loads.replace(self.loads.get() + 1);
+                    if k < self.after { self.old.0[n] } else { self.new.0[n] }
+                })
+            }
+            fn write(&mut self, _: usize, _: Trb) {
+                unreachable!()
+            }
+        }
+        let old = Trb([0x1000, 0, 0, kind::TRANSFER_EVENT << 10]);
+        let new = Trb([0x2000, 1, (code::SUCCESS as u32) << 24, kind::COMMAND_COMPLETION << 10 | 1]);
+        for after in 0..=4 {
+            let at = Landing { old, new, after, loads: core::cell::Cell::new(0) };
+            match Consumer::new().next(&at) {
+                Some(t) => assert_eq!(t, new, "lands after {after} loads: taken torn"),
+                None => assert!(after > 0, "lands before the read, and not taken"),
+            }
+        }
+    }
+
+    /// **A TRB is written cycle dword last**: the dword that hands it over goes after the rest.
+    #[test]
+    fn a_trb_is_handed_over_by_its_last_store() {
+        let mut order = Vec::new();
+        write_trb(numbered(5).with_cycle(true), |n, _| order.push(n));
+        assert_eq!(order, [0, 1, 2, 3]);
     }
 
     #[test]

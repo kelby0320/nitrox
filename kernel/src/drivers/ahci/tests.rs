@@ -65,9 +65,23 @@ fn identity_of(model: &[u8], serial: &[u8]) -> ([u8; MAX_DEVICE_NAME], usize) {
     put_field(&mut words, 27, 20, model);
     put_field(&mut words, 10, 10, serial);
     let mut out = [0u8; MAX_DEVICE_NAME];
-    // SAFETY: `words` is a full 256-word IDENTIFY result, which is the contract.
-    let n = unsafe { format_identity(words.as_ptr(), &mut out) };
+    let n = format_identity(&words, &mut out);
     (out, n)
+}
+
+/// **A sector count past LBA48 is refused**: read whole, a non-zero word 103 gave 2^55 sectors or
+/// more, and the boot log's size in MiB overflowed and stopped the boot.
+#[test]
+fn a_sector_count_past_lba48_is_refused() {
+    let (mut words, mut name) = ([0u16; 256], [0u8; MAX_DEVICE_NAME]);
+    words[100..=103].copy_from_slice(&[0xFFFF, 0xFFFF, 0xFFFF, 0]);
+    assert_eq!(identity(&words, &mut name).map(|i| i.0), Some((1 << 48) - 1), "the most LBA48 addresses");
+    words[100..=103].copy_from_slice(&[0, 0, 0, 1]);
+    assert_eq!(identity(&words, &mut name), None, "2^48, one past it");
+    words[103] = 0x0080;
+    assert_eq!(identity(&words, &mut name), None);
+    words[100..=103].fill(0);
+    assert_eq!(identity(&words, &mut name), None, "no sectors");
 }
 
 fn assert_identity(model: &[u8], serial: &[u8], want: &[u8]) {
@@ -148,17 +162,22 @@ fn fake_disk() -> (FakeRegs, AhciDisk) {
         abar,
         port_base: abar + PORT_BASE,
         port: 0,
-        cmd_list: DmaBuffer::alloc(1024).unwrap(),
-        _fis: DmaBuffer::alloc(256).unwrap(),
-        cmd_table: DmaBuffer::alloc(CMD_TABLE_BYTES).unwrap(),
+        cmd_list: Programmed::new(DmaBuffer::alloc(1024).unwrap()),
+        _fis: Programmed::new(DmaBuffer::alloc(256).unwrap()),
+        cmd_table: Programmed::new(DmaBuffer::alloc(CMD_TABLE_BYTES).unwrap()),
         sectors: 1 << 20,
         flush_command: ATA_FLUSH_CACHE_EXT,
         state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
-        intr: core::ptr::null_mut(),
+        intr: interrupt_object(),
         counted: Counted::new(),
-        wake: core::ptr::null_mut(),
+        wake: interrupt_object(),
     };
     (regs, disk)
+}
+
+fn interrupt_object() -> ObjectRef {
+    // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
+    unsafe { crate::drivers::adopt(InterruptObject::try_new().unwrap(), KObjectType::InterruptObject) }
 }
 
 /// A read of one sector into `frag`.
@@ -196,7 +215,7 @@ fn a_command_issued_after_the_slot_read_idle_is_not_retired() {
         crate::dpc::run_pending();
         assert!(retired.is_null(), "flush {flush}: retired while the HBA runs it");
         assert_eq!(irp.status, PENDING, "flush {flush}");
-        assert_eq!(d.state.lock().inflight, &mut irp as *mut Irp, "flush {flush}: still in flight");
+        assert!(core::ptr::eq(d.state.lock().inflight, &irp), "flush {flush}: still in flight");
     }
 }
 
@@ -216,7 +235,7 @@ fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
     assert_eq!(settle_polled(&d, false), Some(true));
     crate::dpc::run_pending();
     assert_eq!((first.status, first.transferred), (IO_ERROR, 0), "failed, whatever the count said");
-    assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "the next issued");
+    assert!(core::ptr::eq(d.state.lock().inflight, &second), "the next issued");
     assert_eq!(d.state.lock().fault, CLEAR);
 }
 
@@ -239,7 +258,7 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         assert_eq!(first.status, PENDING, "keeps {keeps}: not retired, the watch thread's");
         assert_eq!(d.state.lock().fault, FAULTED, "keeps {keeps}");
         let irp = claim(&d, 0, false).expect("a reported fault is claimed");
-        assert_eq!(irp, &mut first as *mut Irp);
+        assert!(core::ptr::eq(irp, &first));
         assert_eq!(claim(&d, 0, true), None, "and only once");
         write32(d.port_base, PX_CI, 0);
         write32(d.port_base, PX_TFD, 0x50);
@@ -252,7 +271,7 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         assert!(recover(&d, irp));
         crate::dpc::run_pending();
         assert_eq!(first.status, IO_ERROR, "keeps {keeps}");
-        assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "keeps {keeps}: the next issued");
+        assert!(core::ptr::eq(d.state.lock().inflight, &second), "keeps {keeps}: the next issued");
         assert_eq!(d.state.lock().fault, CLEAR, "keeps {keeps}");
         assert_eq!(read32(d.port_base, PX_SERR), !0, "keeps {keeps}: the error latched");
         assert_eq!(read32(d.port_base, PX_IS), !0, "keeps {keeps}");
@@ -280,7 +299,7 @@ fn a_command_past_its_deadline_is_recovered_and_failed() {
     assert!(recover(&d, irp));
     crate::dpc::run_pending();
     assert_eq!(first.status, IO_ERROR);
-    assert_eq!(d.state.lock().inflight, &mut second as *mut Irp, "the next issued");
+    assert!(core::ptr::eq(d.state.lock().inflight, &second), "the next issued");
 }
 
 /// **A fault with nothing in flight holds what is submitted until the port is back**: one issued
@@ -304,7 +323,7 @@ fn a_fault_with_nothing_in_flight_holds_what_comes_until_the_port_is_back() {
     assert_eq!((d.state.lock().inflight, read32(d.port_base, PX_CI)), (idle, 0), "recovering: queued");
     assert!(recover(&d, irp));
     crate::dpc::run_pending();
-    assert_eq!(d.state.lock().inflight, &mut first as *mut Irp, "the first issued once the port is back");
+    assert!(core::ptr::eq(d.state.lock().inflight, &first), "the first issued once the port is back");
     assert_eq!(read32(d.port_base, PX_CI), 1);
     assert_eq!((first.status, second.status), (PENDING, PENDING));
 }
@@ -330,7 +349,7 @@ fn a_port_that_will_not_stop_keeps_its_command_and_fails_the_rest() {
     crate::dpc::run_pending();
     assert!(d.state.lock().dead);
     assert_eq!(first.status, PENDING, "kept");
-    assert_eq!(d.state.lock().inflight, &mut first as *mut Irp, "and still slot 0's");
+    assert!(core::ptr::eq(d.state.lock().inflight, &first), "and still slot 0's");
     assert_eq!(second.status, IO_ERROR, "queued: failed");
     submit(&mut third, ctx(&d));
     crate::dpc::run_pending();
@@ -452,4 +471,43 @@ fn a_commands_device_time_runs_from_its_issue_to_its_retire() {
         let busy = STATS.record_for(0, 0).busy_ns - before;
         assert!((ON_DEVICE..ON_DEVICE + 1_000_000_000).contains(&busy), "{way}: {busy} ns on the device");
     }
+}
+
+/// **A disk declined after its port started frees its memory only once the port stopped**: a
+/// command list still running may yet write the received-FIS area or move IDENTIFY's data.
+#[test]
+fn a_declined_disk_frees_its_memory_only_once_its_port_stopped() {
+    crate::mm::test_support::init_global_heap();
+    let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
+    let freed = crate::mm::heap::frames_freed_by_this_thread();
+    let claimed = claim_port(regs.0 as u64, 0).map(|_| ());
+    assert_eq!(claimed, Err("IDENTIFY failed"), "nothing answers on fake registers");
+    let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
+    assert_eq!(gave, 4, "its three port pages and IDENTIFY's, the port stopped");
+    for stops in [true, false] {
+        let (_regs, mut d) = fake_disk();
+        if !stops {
+            write32(d.port_base, PX_CMD, CMD_CR);
+        }
+        let freed = crate::mm::heap::frames_freed_by_this_thread();
+        let data = Programmed::new(DmaBuffer::alloc(SECTOR_SIZE as usize).unwrap());
+        // SAFETY: the fake disk, polled, with no interrupt.
+        assert!(unsafe { identify(&d, data, &mut [0; MAX_DEVICE_NAME]) }.is_none());
+        give_back(&mut d);
+        drop(d);
+        let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
+        assert_eq!(gave, if stops { 4 } else { 0 }, "stops {stops}: IDENTIFY's page and the port's three");
+    }
+}
+
+/// **A port that will not stop is given nothing**: its command list was programmed and IDENTIFY
+/// issued on a command engine still running, which a list may be given only once it has stopped.
+#[test]
+fn a_port_that_will_not_stop_is_given_no_command_list() {
+    crate::mm::test_support::init_global_heap();
+    let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
+    let pb = regs.0 as u64 + PORT_BASE;
+    write32(pb, PX_CMD, CMD_CR);
+    assert_eq!(claim_port(regs.0 as u64, 0).map(|_| ()), Err("its port would not stop"));
+    assert_eq!((read32(pb, PX_CLB), read32(pb, PX_FB), read32(pb, PX_CI)), (0, 0, 0), "nothing given");
 }

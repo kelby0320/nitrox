@@ -93,19 +93,17 @@ impl Counted {
         Self(AtomicPtr::new(core::ptr::null_mut()))
     }
 
-    /// Hold `node`'s counters.
-    ///
-    /// # Safety
-    /// `node` is a `DeviceNode` registered in the device table, which holds an owning reference to
-    /// every node for the kernel's lifetime — a departed one included — so its counters outlive
-    /// every command recorded into them.
-    pub unsafe fn attach(&self, node: &ObjectRef) {
+    /// Hold `node`'s counters, **pinning the node for good**: they outlive every command recorded
+    /// into them, whatever became of its registration.
+    pub fn attach(&self, node: &ObjectRef) {
         if node.object_type() != KObjectType::DeviceNode {
             return;
         }
-        // SAFETY: a `DeviceNode`, by its type; live, by the caller's contract.
-        let io = unsafe { &*(node.as_ptr() as *const DeviceNode) }.io();
+        let pinned = node.clone();
+        // SAFETY: a `DeviceNode`, by its type, which `pinned` keeps from here on.
+        let io = unsafe { &*(pinned.as_ptr() as *const DeviceNode) }.io();
         self.0.store(io as *const IoStats as *mut IoStats, Ordering::Release);
+        core::mem::forget(pinned);
     }
 
     /// Hold counters that live as long as the kernel: a host test's.
@@ -117,8 +115,8 @@ impl Counted {
     pub fn record(&self, op: u32, ok: bool, bytes: u64, ns: u64) {
         let io = self.0.load(Ordering::Acquire);
         if !io.is_null() {
-            // SAFETY: only `attach` and `attach_static` store here, each a pointer to counters that
-            // live for the kernel's lifetime.
+            // SAFETY: only `attach`, which pins the node holding them, and `attach_static` store
+            // here, each a pointer to counters that live for the kernel's lifetime.
             unsafe { &*io }.record(op, ok, bytes, ns);
         }
     }
@@ -167,5 +165,21 @@ mod tests {
         c.attach_static(&IO);
         c.record(IrpOp::Read as u32, true, 4096, 1);
         assert_eq!((IO.record_for(0, 0).reads, IO.record_for(0, 0).read_bytes), (1, 4096));
+    }
+
+    /// **Attaching pins the node the counters are in**, which a failed registration dropped.
+    #[test]
+    fn attaching_pins_the_node_its_counters_are_in() {
+        use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
+        crate::mm::test_support::init_global_heap();
+        let node = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
+        let node = crate::drivers::adopt_node(node);
+        let c = Counted::new();
+        c.attach(&node);
+        // SAFETY: `node` holds the object here.
+        let refs = unsafe { &*(node.as_ptr() as *const crate::object::KObjectHeader) }.refcount();
+        assert_eq!(refs, 2, "the caller's reference and the pin");
+        drop(node);
+        c.record(IrpOp::Read as u32, true, 512, 1);
     }
 }

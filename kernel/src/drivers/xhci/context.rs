@@ -189,8 +189,21 @@ pub struct Bulk {
 /// as *Interrupt IN* (three retries, maximum packet and burst, interval, ring, Max ESIT Payload,
 /// and an Average TRB Length of its maximum packet), and each in `bulks` as Bulk IN or OUT (three
 /// retries, maximum packet and burst, no streams, ring, bulk's average TRB length). `ctx` must be
-/// `input_len` bytes, zeroed.
-pub fn configure_endpoints(ctx: &mut [u8], l: Layout, port: u8, speed_id: u8, endpoints: &[Interrupt], bulks: &[Bulk]) {
+/// `input_len` bytes, zeroed. **`false`, with nothing written, when an endpoint's index is the
+/// default endpoint's or another's**: the indices are the device's word.
+pub fn configure_endpoints(
+    ctx: &mut [u8],
+    l: Layout,
+    port: u8,
+    speed_id: u8,
+    endpoints: &[Interrupt],
+    bulks: &[Bulk],
+) -> bool {
+    let mut dcis = bulks.iter().map(|b| b.dci).chain(endpoints.iter().map(|e| e.dci));
+    let unique = |seen: u32, dci: u8| (DCI_EP0 < dci && dci < 32 && seen & 1 << dci == 0).then(|| seen | 1 << dci);
+    if dcis.try_fold(0, unique).is_none() {
+        return false;
+    }
     let mut add = ADD_SLOT;
     let mut entries = 1u32;
     for b in bulks {
@@ -218,6 +231,7 @@ pub fn configure_endpoints(ctx: &mut [u8], l: Layout, port: u8, speed_id: u8, en
     put(ctx, 4, add);
     put(ctx, l.slot(), (speed_id as u32) << 20 | entries << 27);
     put(ctx, l.slot() + 4, (port as u32) << 16);
+    true
 }
 
 #[cfg(test)]
@@ -270,7 +284,7 @@ mod tests {
         let kbd = Interrupt { dci: 3, max_packet: 8, burst: 0, interval: 6, ring: 0x5000, cycle: true };
         let bulk_in = Bulk { dci: 5, input: true, max_packet: 1024, burst: 15, ring: 0x2_0000_7000, cycle: false };
         let bulk_out = Bulk { dci: 4, input: false, max_packet: 512, burst: 0, ring: 0x8000, cycle: true };
-        configure_endpoints(&mut ctx, l, 2, speed::SUPER, &[kbd], &[bulk_in, bulk_out]);
+        assert!(configure_endpoints(&mut ctx, l, 2, speed::SUPER, &[kbd], &[bulk_in, bulk_out]));
         assert_eq!(dword(&ctx, 4), 1 | 1 << 3 | 1 << 4 | 1 << 5, "the slot and the three endpoints");
         assert_eq!(dword(&ctx, 32) >> 27, 5, "entries up to index 5");
         let i = l.endpoint(5);
@@ -310,7 +324,7 @@ mod tests {
             let mut ctx = vec![0u8; l.input_len()];
             let kbd = Interrupt { dci: 3, max_packet: 8, burst: 0, interval: 6, ring: 0x1_0000_5000, cycle: true };
             let mouse = Interrupt { dci: 5, max_packet: 4, burst: 1, interval: 3, ring: 0x6000, cycle: false };
-            configure_endpoints(&mut ctx, l, 9, speed::HIGH, &[kbd, mouse], &[]);
+            assert!(configure_endpoints(&mut ctx, l, 9, speed::HIGH, &[kbd, mouse], &[]));
             assert_eq!(dword(&ctx, 0), 0, "nothing dropped");
             assert_eq!(dword(&ctx, 4), 1 | 1 << 3 | 1 << 5, "A0, A3 and A5");
             assert_eq!(dword(&ctx, entry), 3 << 20 | 5 << 27, "high speed, entries to DCI 5");
@@ -337,7 +351,7 @@ mod tests {
         let l = Layout::new(false);
         let mut ctx = vec![0u8; l.input_len()];
         let big = Interrupt { dci: 3, max_packet: 0xFFFF, burst: 15, interval: 0, ring: 0, cycle: false };
-        configure_endpoints(&mut ctx, l, 1, speed::HIGH, &[big], &[]);
+        assert!(configure_endpoints(&mut ctx, l, 1, speed::HIGH, &[big], &[]));
         let payload = 0xFFFF * 16;
         assert_eq!(dword(&ctx, 4 * 32) >> 24, payload >> 16, "Max ESIT Payload Hi");
         assert_eq!(dword(&ctx, 4 * 32 + 16) >> 16, payload & 0xFFFF, "Max ESIT Payload Lo");
@@ -352,5 +366,27 @@ mod tests {
         assert!(speed::is_super(speed::SUPER_PLUS) && !speed::is_super(speed::HIGH));
         assert_eq!(speed::name(speed::FULL), "full-speed");
         assert_eq!(speed::name(9), "an unknown speed");
+    }
+
+    /// **Endpoints are refused, with nothing written, when one names the default endpoint's index
+    /// or two name one**: a stick's bulk OUT endpoint 0 wrote its context over the slot's.
+    #[test]
+    fn endpoints_naming_the_default_index_or_one_twice_are_refused_unwritten() {
+        let l = Layout::new(false);
+        let bulk = |dci, input| Bulk { dci, input, max_packet: 512, ..Bulk::default() };
+        let kbd = Interrupt { dci: 3, max_packet: 8, ..Interrupt::default() };
+        for (ints, bulks, why) in [
+            (&[][..], [bulk(3, true), bulk(0, false)], "bulk OUT 0x00"),
+            (&[], [bulk(1, true), bulk(4, false)], "bulk IN 0x80"),
+            (&[], [bulk(3, true), bulk(3, true)], "one index twice"),
+            (&[], [bulk(3, true), bulk(32, false)], "an index past the last context"),
+            (&[kbd], [bulk(3, true), bulk(4, false)], "a keyboard's and a stick's"),
+        ] {
+            let mut ctx = vec![0u8; l.input_len()];
+            assert!(!configure_endpoints(&mut ctx, l, 1, speed::HIGH, ints, &bulks), "{why}");
+            assert!(ctx.iter().all(|&b| b == 0), "{why}: nothing written");
+        }
+        let mut ctx = vec![0u8; l.input_len()];
+        assert!(configure_endpoints(&mut ctx, l, 1, speed::HIGH, &[], &[bulk(31, true), bulk(2, false)]));
     }
 }

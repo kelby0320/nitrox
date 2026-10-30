@@ -3,6 +3,11 @@ use super::*;
 /// Probe and initialise an AHCI controller `DeviceNode`, publishing its first SATA disk; returns
 /// its fate (claimed, or declined with why).
 pub fn init(controller: &ObjectRef) -> Outcome {
+    // **One controller's disk is served**, through `AHCI`: a second is declined before it is touched.
+    if AHCI.get().is_some() {
+        crate::kprintln!("ahci: another controller's disk is served already; this one is declined");
+        return declined("another AHCI controller is already claimed");
+    }
     // SAFETY: `controller` pins a live `DeviceNode`.
     let dn: &DeviceNode = unsafe { &*(controller.as_ptr() as *const DeviceNode) };
     let desc = dn.descriptor();
@@ -50,8 +55,6 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         crate::kprintln!("ahci: no SATA disk on any implemented port");
         return declined(NO_SATA_DISK);
     }
-    let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
-
     let cfg = match crate::pci::Config::map(desc) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -76,75 +79,14 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         }
     }
 
-    let cmd_list = match DmaBuffer::alloc(1024) {
-        Ok(b) => b,
-        Err(_) => return declined(OUT_OF_MEMORY),
-    };
-    let fis = match DmaBuffer::alloc(256) {
-        Ok(b) => b,
-        Err(_) => return declined(OUT_OF_MEMORY),
-    };
-    let cmd_table = match DmaBuffer::alloc(CMD_TABLE_BYTES) {
-        Ok(b) => b,
-        Err(_) => return declined(OUT_OF_MEMORY),
-    };
-
-    stop_port(port_base);
-    write32(port_base, PX_CLB, cmd_list.phys().as_u64() as u32);
-    write32(port_base, PX_CLBU, (cmd_list.phys().as_u64() >> 32) as u32);
-    write32(port_base, PX_FB, fis.phys().as_u64() as u32);
-    write32(port_base, PX_FBU, (fis.phys().as_u64() >> 32) as u32);
-    write32(port_base, PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
-    write32(port_base, PX_IS, 0xFFFF_FFFF);
-    write32(port_base, PX_IE, PXIE_DHRE | PX_FATAL);
-    start_port(port_base);
-
-    let intr = match InterruptObject::try_new() {
-        // SAFETY: `into_raw` yields the box's single creation reference, which this adopts.
-        Ok(io) => unsafe { ObjectRef::from_raw(KBox::into_raw(io).as_ptr() as *mut (), KObjectType::InterruptObject) },
-        Err(_) => return declined(OUT_OF_MEMORY),
-    };
-    let intr_ptr = intr.as_ptr();
-    core::mem::forget(intr);
-    let wake = match InterruptObject::try_new() {
-        // SAFETY: `into_raw` yields the box's single creation reference, which the disk keeps.
-        Ok(io) => KBox::into_raw(io).as_ptr() as *mut (),
-        Err(_) => return declined(OUT_OF_MEMORY),
-    };
-
-    let disk = AhciDisk {
-        abar,
-        port_base,
-        port,
-        cmd_list,
-        _fis: fis,
-        cmd_table,
-        sectors: 0,
-        flush_command: ATA_FLUSH_CACHE,
-        state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
-        intr: intr_ptr,
-        counted: Counted::new(),
-        wake,
-    };
-    let disk = match KBox::try_new(disk) {
-        Ok(b) => KBox::into_raw(b).as_ptr(), // leak to 'static
-        Err(_) => return declined(OUT_OF_MEMORY),
-    };
-
-    let mut name = [0u8; MAX_DEVICE_NAME];
-    // SAFETY: `disk` is the live state, not yet published: IDENTIFY is polled.
-    let (sectors, name_len, flush) = match unsafe { identify(&mut *disk, &mut name) } {
-        Some(s) => s,
-        None => {
-            crate::kprintln!("ahci: IDENTIFY failed on port {}", port);
-            return declined("IDENTIFY failed");
+    let (disk, name, name_len) = match claim_port(abar, port) {
+        Ok(claimed) => claimed,
+        Err(why) => {
+            crate::kprintln!("ahci: port {}: {}", port, why);
+            return declined(why);
         }
     };
-    // SAFETY: exclusive at bring-up (no IRQ, no other CPU).
-    unsafe {
-        (*disk).sectors = sectors;
-        (*disk).flush_command = flush;
-    }
+    let sectors = disk.sectors;
     crate::kprintln!(
         "ahci: port {} disk ready ({} sectors, {} MiB): {}",
         port,
@@ -156,11 +98,17 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     crate::kprintln!(
         "ahci: port {} flushes with {}",
         port,
-        if flush == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" }
+        if disk.flush_command == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" }
     );
 
     // Published once the disk answered, so a controller declined above gets no watch thread.
-    AHCI.store(disk, Ordering::Release);
+    let disk = match AHCI.publish(disk) {
+        Ok(disk) => disk,
+        Err(mut disk) => {
+            give_back(&mut disk);
+            return declined("another AHCI controller is already claimed");
+        }
+    };
 
     // Prefer MSI: it does not depend on the PCI interrupt-line register, which QEMU's firmware
     // programs and real UEFI often leaves meaningless. INTx is the fallback.
@@ -219,4 +167,67 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     } else {
         declined("the disk's device node could not be allocated")
     }
+}
+
+/// A claimed disk, and its name's bytes and length.
+pub(super) type Claimed = (KBox<AhciDisk>, [u8; MAX_DEVICE_NAME], usize);
+
+/// **Claim the SATA disk on `port`**: every allocation made first, so none fails with the port
+/// running, then the port started and the disk identified; or why not, its memory freed if it stopped.
+pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> {
+    let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
+    // **A port that will not stop is given nothing**: a command list may be given only to a stopped
+    // port, and the one running may be the firmware's.
+    if stop_port(port_base).is_none() {
+        return Err("its port would not stop");
+    }
+    let (Ok(cmd_list), Ok(fis), Ok(cmd_table), Ok(data)) = (
+        DmaBuffer::alloc(1024),
+        DmaBuffer::alloc(256),
+        DmaBuffer::alloc(CMD_TABLE_BYTES),
+        DmaBuffer::alloc(SECTOR_SIZE as usize),
+    ) else {
+        return Err(OUT_OF_MEMORY);
+    };
+    let (Ok(intr), Ok(wake)) = (InterruptObject::try_new(), InterruptObject::try_new()) else {
+        return Err(OUT_OF_MEMORY);
+    };
+    let disk = AhciDisk {
+        abar,
+        port_base,
+        port,
+        cmd_list: Programmed::new(cmd_list),
+        _fis: Programmed::new(fis),
+        cmd_table: Programmed::new(cmd_table),
+        sectors: 0,
+        flush_command: ATA_FLUSH_CACHE,
+        state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
+        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
+        intr: unsafe { crate::drivers::adopt(intr, KObjectType::InterruptObject) },
+        counted: Counted::new(),
+        // SAFETY: as above.
+        wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
+    };
+    let Ok(mut disk) = KBox::try_new(disk) else {
+        return Err(OUT_OF_MEMORY);
+    };
+
+    write32(port_base, PX_CLB, disk.cmd_list.phys().as_u64() as u32);
+    write32(port_base, PX_CLBU, (disk.cmd_list.phys().as_u64() >> 32) as u32);
+    write32(port_base, PX_FB, disk._fis.phys().as_u64() as u32);
+    write32(port_base, PX_FBU, (disk._fis.phys().as_u64() >> 32) as u32);
+    write32(port_base, PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
+    write32(port_base, PX_IS, 0xFFFF_FFFF);
+    write32(port_base, PX_IE, PXIE_DHRE | PX_FATAL);
+    start_port(port_base);
+
+    let mut name = [0u8; MAX_DEVICE_NAME];
+    // SAFETY: `disk` is the live state, not yet published: IDENTIFY is polled.
+    let Some((sectors, name_len, flush)) = (unsafe { identify(&disk, Programmed::new(data), &mut name) }) else {
+        give_back(&mut disk);
+        return Err("IDENTIFY failed");
+    };
+    disk.sectors = sectors;
+    disk.flush_command = flush;
+    Ok((disk, name, name_len))
 }

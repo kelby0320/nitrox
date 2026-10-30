@@ -31,20 +31,20 @@ pub mod storage;
 pub use hub::FIRST_ROUND_NS;
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
-use crate::dpc::Dpc;
+use crate::dpc::{Dpc, OneAtATime};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{IrqSpinLock, KBox, KVec};
-use crate::mm::dma::DmaBuffer;
+use crate::libkern::{IrqSpinLock, KBox, KVec, Published};
+use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
 use crate::object::{InterruptObject, ObjectRef, PendingOperation};
-use ring::{Consumer, Producer, Slots, Trb, code, kind};
+use ring::{Consumer, Producer, RingMem, Trb, code, kind};
 
 /// PCI class, subclass and programming interface of an xHCI controller.
 pub const PCI_CLASS: (u8, u8, u8) = (0x0C, 0x03, 0x30);
@@ -119,16 +119,17 @@ const RESET_NS: u64 = 1_000_000_000;
 const NO_OP_NS: u64 = 100_000_000;
 
 /// The one controller this driver brought up, for the interrupt and its DPC.
-static XHCI: AtomicPtr<Xhci> = AtomicPtr::new(core::ptr::null_mut());
+static XHCI: Published<Xhci> = Published::new();
 
 static XHCI_DPC: Dpc = Dpc::new(xhci_dpc, core::ptr::null_mut());
+
+/// The DPC's drain, on one CPU at a time: events must be acted on in the ring's order.
+static DRAIN: OneAtATime = OneAtATime::new();
 
 /// **The controller, once brought up**: for a storage submit to wake the hub thread through, with a
 /// rescan for it. `None` before then, when no USB disk exists to submit to.
 pub(super) fn controller() -> Option<&'static Xhci> {
-    let x = XHCI.load(Ordering::Acquire);
-    // SAFETY: a published controller is leaked to `'static` and never freed.
-    (!x.is_null()).then(|| unsafe { &*x })
+    XHCI.get()
 }
 
 /// A brought-up controller. Leaked to `'static` once published, as AHCI's disk is: a Tier 1
@@ -144,13 +145,13 @@ pub struct Xhci {
     caps: caps::ExtCaps,
     /// The device context base array, whose slot entries the hub thread writes, and the
     /// scratchpad buffers and their array, which are the controller's from here on.
-    dcbaa: DmaBuffer,
+    dcbaa: Programmed,
     _scratch: Scratchpads,
     /// The command ring. The hub thread writes it; probe's No Op is its first TRB.
     cmd: IrqSpinLock<CommandRing>,
     /// The event ring and its segment table, which only the DPC reads after bring-up.
     events: IrqSpinLock<EventRing>,
-    _erst: DmaBuffer,
+    _erst: Programmed,
     port_changes: AtomicU32,
     /// **What wakes the hub thread**: the DPC signals it on every port change. Latching, so a
     /// change that lands while the thread is busy is counted, not lost.
@@ -169,6 +170,11 @@ pub struct Xhci {
     hid_halted: AtomicBool,
     hid_lights: AtomicBool,
 }
+
+// SAFETY: shared once published. Its bases and descriptions never change, and every field that
+// does is atomic or locked, but for DMA memory: the scratchpads and the segment table go untouched
+// after bring-up, and the device context base array is the hub thread's alone.
+unsafe impl Sync for Xhci {}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Awaited {
@@ -202,49 +208,31 @@ struct PoPtr(*mut ());
 unsafe impl Send for PoPtr {}
 
 struct CommandRing {
-    mem: DmaBuffer,
+    mem: Programmed,
     ring: Producer,
 }
 
 struct EventRing {
-    mem: DmaBuffer,
+    mem: Programmed,
     ring: Consumer,
 }
 
 /// The scratchpad buffers: the controller's own working memory, which it asks for and the driver
 /// hands it through slot 0 of the device context base array.
 struct Scratchpads {
-    _array: Option<DmaBuffer>,
-    _pages: KVec<DmaBuffer>,
+    array: Option<Programmed>,
+    pages: KVec<Programmed>,
 }
 
-struct DmaSlots<'a>(&'a DmaBuffer);
-
-impl Slots for DmaSlots<'_> {
-    fn len(&self) -> usize {
-        RING_TRBS
-    }
-
-    fn read(&self, i: usize) -> Trb {
-        let p = self.0.virt() as *const u32;
-        let mut d = [0u32; 4];
-        for (n, dw) in d.iter_mut().enumerate() {
-            // SAFETY: `i < RING_TRBS`, and the buffer holds `RING_TRBS` TRBs of four dwords.
-            *dw = unsafe { core::ptr::read_volatile(p.add(i * 4 + n)) };
-        }
-        Trb(d)
-    }
-
-    fn write(&mut self, i: usize, trb: Trb) {
-        let p = self.0.virt() as *mut u32;
-        for n in 0..3 {
-            // SAFETY: as `read`.
-            unsafe { core::ptr::write_volatile(p.add(i * 4 + n), trb.0[n]) };
-        }
-        // The cycle bit hands the TRB over, so it is written last and after the rest.
-        core::sync::atomic::fence(Ordering::Release);
-        // SAFETY: as `read`.
-        unsafe { core::ptr::write_volatile(p.add(i * 4 + 3), trb.0[3]) };
+impl Xhci {
+    /// It halted: what it was given is freed with it.
+    fn release(&mut self, halted: &Quiesced) {
+        self.dcbaa.release(halted);
+        self._erst.release(halted);
+        self.cmd.lock().mem.release(halted);
+        self.events.lock().mem.release(halted);
+        let Scratchpads { array, pages } = &mut self._scratch;
+        array.iter_mut().chain(pages.iter_mut()).for_each(|p| p.release(halted));
     }
 }
 
@@ -266,13 +254,25 @@ fn write64(base: u64, off: u64, val: u64) {
     write32(base, off + 4, (val >> 32) as u32);
 }
 
+/// **Bring-up's clock.** A host test's moves on as it is read, where the host's reads 0.
+#[cfg(not(test))]
+fn clock() -> u64 {
+    crate::arch::Timer::read_ns()
+}
+
+#[cfg(test)]
+fn clock() -> u64 {
+    std::thread_local!(static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(0) });
+    NOW.with(|now| now.replace(now.get() + 1_000_000))
+}
+
 fn wait_for(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {
-    let start = crate::arch::Timer::read_ns();
+    let start = clock();
     loop {
         if done() {
             return true;
         }
-        if crate::arch::Timer::read_ns().wrapping_sub(start) > bound_ns {
+        if clock().wrapping_sub(start) > bound_ns {
             return done();
         }
         core::hint::spin_loop();
@@ -280,8 +280,8 @@ fn wait_for(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {
 }
 
 fn pause(ns: u64) {
-    let start = crate::arch::Timer::read_ns();
-    while crate::arch::Timer::read_ns().wrapping_sub(start) < ns {
+    let start = clock();
+    while clock().wrapping_sub(start) < ns {
         core::hint::spin_loop();
     }
 }
@@ -296,7 +296,7 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     if usb_off {
         return declined("usb=off on the command line");
     }
-    if !XHCI.load(Ordering::Acquire).is_null() {
+    if XHCI.get().is_some() {
         return declined("another xHCI controller is already claimed");
     }
     // SAFETY: `controller` pins a live `DeviceNode`.
@@ -427,7 +427,7 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     else {
         return declined(OUT_OF_MEMORY);
     };
-    let cmd_ring = Producer::new(&mut DmaSlots(&cmd_mem), cmd_mem.phys().as_u64());
+    let cmd_ring = Producer::new(&mut RingMem::of(&cmd_mem), cmd_mem.phys().as_u64());
     // The event ring's one segment: its base and size, in the table the controller reads.
     let e = erst.virt() as *mut u64;
     // SAFETY: `erst` is a page, which holds one 16-byte segment-table entry.
@@ -470,11 +470,11 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         max_ports,
         layout: context::Layout::new(hcc1 & HCC_CSZ != 0),
         caps: ext,
-        dcbaa,
+        dcbaa: Programmed::new(dcbaa),
         _scratch: scratch,
-        cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: cmd_mem, ring: cmd_ring }),
-        events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: ev_mem, ring: Consumer::new() }),
-        _erst: erst,
+        cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: Programmed::new(cmd_mem), ring: cmd_ring }),
+        events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(ev_mem), ring: Consumer::new() }),
+        _erst: Programmed::new(erst),
         port_changes: AtomicU32::new(0),
         // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
         hub_wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
@@ -490,33 +490,36 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     // **Boxed before the controller runs**, so no failure after it starts can free what it writes
     // to while it writes: a box that cannot be had is declined here, with nothing running. Boxing
     // after the No Op let a failed allocation drop the rings with the controller still running.
-    let Ok(boxed) = KBox::try_new(x) else {
+    let Ok(mut boxed) = KBox::try_new(x) else {
         return declined(OUT_OF_MEMORY);
     };
 
     // **Run, and prove the rings with a No Op**, polled: interrupts are masked here, and the
     // interrupter is not on yet. Any port's change event that lands first is counted and passed.
-    // A decline from here stops the controller **before** the box drops.
+    // A decline from here gives the box back only once the controller has stopped.
     write32(op, USBCMD, CMD_RUN);
     if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH == 0) {
-        stop(op);
+        give_back(op, |halted| boxed.release(halted));
         return declined("it did not start running");
     }
     let answer = no_op(&boxed);
     let Some(code) = answer else {
-        stop(op);
+        give_back(op, |halted| boxed.release(halted));
         return declined("its command ring did not answer a No Op");
     };
     if code != code::SUCCESS {
-        stop(op);
+        give_back(op, |halted| boxed.release(halted));
         crate::kprintln!("xhci: {at}: a No Op completed with code {code}");
         return declined("a No Op did not complete with Success");
     }
 
-    let x = KBox::into_raw(boxed).as_ptr();
-    XHCI.store(x, Ordering::Release);
-    // SAFETY: just published, and nothing else holds it yet.
-    let x = unsafe { &*x };
+    let x = match XHCI.publish(boxed) {
+        Ok(x) => x,
+        Err(mut boxed) => {
+            give_back(op, |halted| boxed.release(halted));
+            return declined("another xHCI controller is already claimed");
+        }
+    };
 
     // **The interrupter on, without touching Interrupt Pending**, then the controller's interrupts,
     // then **one more drain**. An event posted after the No Op's drain set IP and Event Handler
@@ -559,31 +562,43 @@ const OUT_OF_MEMORY: &str = "out of memory";
 /// `None` when memory ran out.
 fn scratchpads_for(count: u32, dcbaa: &DmaBuffer) -> Option<Scratchpads> {
     if count == 0 {
-        return Some(Scratchpads { _array: None, _pages: KVec::new() });
+        return Some(Scratchpads { array: None, pages: KVec::new() });
     }
-    let array = DmaBuffer::alloc(count as usize * 8).ok()?;
-    let mut pages: KVec<DmaBuffer> = KVec::new();
+    let array = Programmed::new(DmaBuffer::alloc(count as usize * 8).ok()?);
+    let mut pages: KVec<Programmed> = KVec::new();
     pages.try_reserve(count as usize).ok()?;
     let a = array.virt() as *mut u64;
     for i in 0..count as usize {
-        let page = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
+        let page = Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?);
         // SAFETY: `array` holds `count` entries.
         unsafe { core::ptr::write_volatile(a.add(i), page.phys().as_u64()) };
         pages.try_push(page).ok()?;
     }
     // SAFETY: `dcbaa` holds at least one entry; slot 0 is the scratchpad array's.
     unsafe { core::ptr::write_volatile(dcbaa.virt() as *mut u64, array.phys().as_u64()) };
-    Some(Scratchpads { _array: Some(array), _pages: pages })
+    Some(Scratchpads { array: Some(array), pages })
 }
 
 /// Stop a controller that was started, before a decline frees what it writes to: halt it, then
-/// reset it, each within its bound.
-fn stop(op: u64) {
+/// reset it, each within its bound. The proof it halted, or `None`, and no reset (xHCI 1.2 §5.4.1).
+fn stop(op: u64) -> Option<Quiesced> {
     write32(op, USBCMD, 0);
-    let _ = wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH != 0);
+    if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH != 0) {
+        return None;
+    }
     write32(op, USBCMD, CMD_HCRST);
     pause(1_000_000);
     let _ = wait_for(RESET_NS, || read32(op, USBCMD) & CMD_HCRST == 0);
+    // SAFETY: HCH read set: the controller halted, and a halted one touches no memory.
+    Some(unsafe { Quiesced::assume() })
+}
+
+/// **Decline a started controller**: its memory `release`d once it has stopped, so freed when
+/// dropped, and kept for good if it did not stop.
+fn give_back(op: u64, release: impl FnOnce(&Quiesced)) {
+    if let Some(halted) = stop(op) {
+        release(&halted);
+    }
 }
 
 /// Send a No Op through the command ring and poll the event ring for its completion code, or
@@ -592,7 +607,7 @@ fn no_op(x: &Xhci) -> Option<u8> {
     let sent = {
         let mut c = x.cmd.lock();
         let CommandRing { mem, ring } = &mut *c;
-        let slot = ring.push(&mut DmaSlots(mem), Trb::of_kind(kind::NO_OP_COMMAND));
+        let slot = ring.push(&mut RingMem::of(mem), Trb::of_kind(kind::NO_OP_COMMAND));
         mem.phys().as_u64() + slot as u64 * 16
     };
     // Doorbell 0 is the command ring's, and its target is zero.
@@ -620,7 +635,7 @@ fn drain_counting(x: &Xhci) {
 fn drain(x: &Xhci, mut seen: impl FnMut(&Trb)) {
     let mut ev = x.events.lock();
     let EventRing { mem, ring } = &mut *ev;
-    while let Some(trb) = ring.next(&DmaSlots(mem)) {
+    while let Some(trb) = ring.next(&RingMem::of(mem)) {
         if trb.kind() == kind::PORT_STATUS_CHANGE {
             x.port_changes.fetch_add(1, Ordering::Relaxed);
         }
@@ -631,28 +646,25 @@ fn drain(x: &Xhci, mut seen: impl FnMut(&Trb)) {
 
 /// The interrupt: acknowledge it, and leave the event ring to the DPC.
 extern "C" fn isr() {
-    let x = XHCI.load(Ordering::Acquire);
-    if x.is_null() {
+    let Some(x) = XHCI.get() else {
         return;
-    }
-    // SAFETY: published once, never withdrawn.
-    let x = unsafe { &*x };
+    };
     write32(x.rt + IR0, IMAN, IMAN_IP | IMAN_IE);
     write32(x.op, USBSTS, STS_EINT);
     crate::dpc::enqueue(&XHCI_DPC);
+}
+
+fn xhci_dpc(_ctx: *mut ()) {
+    if let Some(x) = XHCI.get() {
+        DRAIN.run(|| drain_events(x));
+    }
 }
 
 /// Drain the event ring a batch at a time, telling the controller where each drain stopped, and
 /// act on each event **with the ring's lock released**: completing an operation takes the
 /// scheduler's lock, which no leaf lock may be held across. No allocation, and no freeing: a DPC
 /// may do neither.
-fn xhci_dpc(_ctx: *mut ()) {
-    let x = XHCI.load(Ordering::Acquire);
-    if x.is_null() {
-        return;
-    }
-    // SAFETY: as `isr`.
-    let x = unsafe { &*x };
+fn drain_events(x: &Xhci) {
     const BATCH: usize = 16;
     loop {
         let mut batch = [Trb::default(); BATCH];
@@ -661,7 +673,7 @@ fn xhci_dpc(_ctx: *mut ()) {
             let mut ev = x.events.lock();
             let EventRing { mem, ring } = &mut *ev;
             while n < BATCH {
-                let Some(trb) = ring.next(&DmaSlots(mem)) else { break };
+                let Some(trb) = ring.next(&RingMem::of(mem)) else { break };
                 batch[n] = trb;
                 n += 1;
             }
@@ -758,7 +770,7 @@ fn complete_if(x: &Xhci, matches: impl Fn(Awaited) -> bool, code: u8, result: u6
 
 /// **Start the hub thread**, if a controller was claimed. After the scheduler and the APs are up.
 pub fn start() {
-    if XHCI.load(Ordering::Acquire).is_null() {
+    if XHCI.get().is_none() {
         return;
     }
     if crate::sched::spawn(hub::main, 0).is_err() {
@@ -770,12 +782,9 @@ pub fn start() {
 /// is attached and the registry holds it before userspace reads it. A bound that passes is said;
 /// whatever is still enumerating arrives later.
 pub fn settle(bound_ns: u64) {
-    let x = XHCI.load(Ordering::Acquire);
-    if x.is_null() {
+    let Some(x) = XHCI.get() else {
         return;
-    }
-    // SAFETY: published once, never withdrawn.
-    let x = unsafe { &*x };
+    };
     let now = crate::arch::Timer::read_ns();
     let po = x.first_round.as_ptr();
     // SAFETY: `x.first_round` pins the `PendingOperation` at `po` for the controller's life.
@@ -820,9 +829,63 @@ impl fmt::Display for Ranges<'_> {
     }
 }
 
+/// A controller over `regs`, host memory standing in for its registers: its rings made, its memory
+/// its own, nothing running.
+#[cfg(test)]
+fn fake(regs: u64) -> Xhci {
+    let page = || DmaBuffer::alloc(RING_TRBS * 16).unwrap();
+    let cmd_mem = page();
+    let ring = Producer::new(&mut RingMem::of(&cmd_mem), cmd_mem.phys().as_u64());
+    Xhci {
+        op: regs,
+        rt: regs,
+        db: regs,
+        max_ports: 1,
+        layout: context::Layout::new(false),
+        caps: caps::ExtCaps::default(),
+        dcbaa: Programmed::new(page()),
+        _scratch: Scratchpads { array: None, pages: KVec::new() },
+        cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: Programmed::new(cmd_mem), ring }),
+        events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(page()), ring: Consumer::new() }),
+        _erst: Programmed::new(page()),
+        port_changes: AtomicU32::new(0),
+        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
+        hub_wake: unsafe { crate::drivers::adopt(InterruptObject::try_new().unwrap(), KObjectType::InterruptObject) },
+        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
+        first_round: unsafe {
+            crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
+        },
+        waiting: IrqSpinLock::new(LockRank::Leaf, None),
+        wedged: AtomicBool::new(false),
+        pci: ResourceDescriptor::ZERO,
+        hid: IrqSpinLock::new(LockRank::Leaf, hid::Table::new()),
+        hid_halted: AtomicBool::new(false),
+        hid_lights: AtomicBool::new(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A declined controller's memory is freed only once it halted**, all of it from one stop:
+    /// its context base array, both rings and the segment table. One running is not reset.
+    #[test]
+    fn a_declined_controller_frees_its_memory_only_once_halted() {
+        crate::mm::test_support::init_global_heap();
+        for halts in [false, true] {
+            let mut regs = std::boxed::Box::new([0u32; 4]);
+            let op = regs.as_mut_ptr() as u64;
+            write32(op, USBSTS, if halts { STS_HCH } else { 0 });
+            let mut x = fake(op);
+            let freed = crate::mm::heap::frames_freed_by_this_thread();
+            give_back(op, |halted| x.release(halted));
+            drop(x);
+            let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
+            assert_eq!(gave, if halts { 4 } else { 0 }, "halts {halts}: its memory freed");
+            assert_eq!(read32(op, USBCMD), if halts { CMD_HCRST } else { 0 }, "halts {halts}: reset");
+        }
+    }
 
     /// A transfer on `slot`'s default endpoint waiting for its Status stage at `status`.
     fn transfer(slot: u8, status: u64) -> Option<Waiting> {

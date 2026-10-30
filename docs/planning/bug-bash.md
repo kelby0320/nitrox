@@ -1019,7 +1019,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   commands, never completed, a rescan alone completing; fails without it:
   `a_departure_completes_its_commands_only_once_the_slot_is_disabled`.
 
-- [ ] **drv-8** `kernel/src/drivers/ahci.rs:321` — `drivers::probe` calls `ahci::init` for every
+- [x] **drv-8** `kernel/src/drivers/ahci.rs:321` — `drivers::probe` calls `ahci::init` for every
   AHCI-class function, but `AHCI.store(disk)` is unconditional and the ISR, `ahci_poll` (which
   ignores its ctx argument), `poll_complete_inflight` and the DPCs all read that single global. A
   machine has two AHCI controllers with a disk each. Disk 2 overwrites disk 1, so disk 1's polled
@@ -1029,6 +1029,8 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   QEMU with two `-device ahci` controllers, each with a drive; check for the "partitions: the table
   did not read" line. No xtask gate has that configuration. Lens: trust-boundary. Medium. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's drv-d4, which repeats it.
+  Fixed in `ea25abea`, as drv-d4: a second AHCI controller is declined before it is touched, shown
+  by a boot with one behind a root port.
 
 - [ ] **drv-9** `kernel/src/drivers/partitions.rs:97` — Test gap in untrusted-input guards: the GPT
   entry-size range check, the `.min(entries)` clamp on the array and the `.min(GPT_ENTRY_BLOCKS_MAX)`
