@@ -421,7 +421,10 @@ The panic handler and the CPU exception handlers do **not** take this
 lock. They write through `serial::emergency_writer()`, an unsynchronised
 path that drives the UART directly. The lock cannot be force-unlocked,
 so a handler that tried to lock `SERIAL` after a fault that struck while
-the lock was held would deadlock. Bypassing the lock is sound only
+the lock was held would deadlock. **One fault path does take it**: a ring-3 fault that leaves its
+thread with no waiter reports it with `kprintln!` from `suspend_with_fault`, under `SCHED` (rank 1,
+then 7, in order). A ring-3 fault holds no lock on its CPU, so it cannot find `SERIAL` held by the
+context it interrupted. Bypassing the lock is sound only
 because Phase 1 is single-CPU: at fault time no other context can be driving
 the UART. Under SMP this can garble diagnostics (another CPU's locked writes interleave). Since
 2026-08-19 a panicking CPU **does** stop the others — `Cpu::stop_the_machine` broadcasts an NMI

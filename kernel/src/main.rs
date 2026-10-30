@@ -1109,7 +1109,7 @@ fn init_memory() -> bool {
 
 /// One-time paging setup that must run before any `AddressSpace::new`:
 ///
-/// 1. Enable every CPU memory-protection feature the kernel depends on (x86_64: NX, SMEP, SMAP).
+/// 1. Enable every CPU memory-protection feature the kernel needs (x86_64: NX, WP, SMEP, SMAP).
 /// 2. Pre-allocate the kernel-vmap region's intermediate page tables in the live PML4.
 /// 3. Capture the kernel-half PML4 entries into the template every new address space inherits.
 ///

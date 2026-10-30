@@ -1,4 +1,4 @@
-//! x86_64 CPU control and feature detection ([`ArchCpu`] impl): GDT/IDT install, the NX, SMEP
+//! x86_64 CPU control and feature detection ([`ArchCpu`] impl): GDT/IDT install, the NX, WP, SMEP
 //! and SMAP enables, the trap kernel-stack setter, halting, and CPUID queries.
 
 use core::arch::asm;

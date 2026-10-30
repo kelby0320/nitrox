@@ -114,7 +114,7 @@ The `<fault_pc>` is a local numeric label inside the same `asm!` block, sitting 
 
 The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. On a match whose faulting address (`CR2`) is below `USER_VIRT_END`, the handler writes `entry.recovery_pc` into `frame.rip` and returns. The naked stub then `iretq`s to the recovery PC. Otherwise the handler falls through to `dump_and_halt`: a `#PF` outside a registered window, or one on the copy's kernel-side pointer, is a kernel bug, not a recoverable condition.
 
-The lookup is linear over the table. The Phase 1 entry count is one per copy primitive (5 today), easily fits in a single cacheline, and runs only on the rare faulting path. A sorted table + binary search would be theoretical work; revisit if Phase 2 ever pushes the entry count past a few dozen.
+The lookup is linear over the table. The table holds one entry per raw copy routine (two today, `copy_bytes_raw` and `copy_cstr_raw`), easily fits in a single cacheline, and runs only on the rare faulting path. A sorted table + binary search would be theoretical work; revisit if Phase 2 ever pushes the entry count past a few dozen.
 
 ### Recovery contract
 
@@ -151,7 +151,7 @@ Phase 1's hard requirement on these features keeps the copy-primitive asm straig
 
 ### CPU model requirement under QEMU
 
-The `xtask qemu` command runs QEMU with `-cpu qemu64,+smap,+smep`. The base `qemu64` model carries long mode, NX, and basic SSE; the `+smap,+smep` opt-ins add what the kernel actually requires. Default `qemu64` (no opts) lacks SMAP, and the kernel's `init_protections` would panic at boot.
+The `xtask qemu` command runs QEMU with `-cpu qemu64,+smap,+smep`. The base `qemu64` model carries long mode, NX, and basic SSE; the `+smap,+smep` opt-ins add what the kernel actually requires. Default `qemu64` (no opts) lacks SMAP, and `ArchCpu::init_protections` would panic at boot.
 
 Named CPU models like `Haswell-v4` or `Broadwell-v4` also work as a base, but TCG silently drops five features those models advertise (PCID, x2APIC, TSC-deadline, INVPCID, SPEC-CTRL), printing warnings on every boot. The kernel doesn't use those features today, so the minimalist `qemu64,+features` form is preferred: as future slices introduce real dependencies (`ArchTimer` will want `+tsc-deadline`, etc.), the xtask command grows by one flag at a time and stays a self-documenting record of which CPU features the kernel requires. (`ArchIrq` brings the local APIC up in xAPIC/MMIO mode precisely *because* TCG drops `x2apic`, so it needs no flag — see the decision log.)
 
@@ -164,9 +164,9 @@ The subsystem is split into an arch-neutral half and an arch-specific half:
 
 The arch primitives return simple signals (`bool` for byte copies, an `enum` for cstr) and never reference `UserAccessError`. The mm layer maps those signals to its richer error type. This keeps the arch layer free of upward dependencies.
 
-When aarch64 is implemented its raw primitives live in `kernel/src/arch/aarch64/user_access.rs` <!-- check-docs: allow-missing --> and use the equivalents called out in the [User-access protection](#user-access-protection) section above: PAN replaces SMAP, PXN replaces SMEP, and a bytewise `ldrb` / `strb` loop replaces `rep movsb` / `lodsb`. Boot enable goes through the same arch-neutral `arch::init_protections` entry point — it configures `SCTLR_EL1.SPAN` and checks `FEAT_PAN` rather than touching `CR4`.
+When aarch64 is implemented its raw primitives live in `kernel/src/arch/aarch64/user_access.rs` <!-- check-docs: allow-missing --> and use the equivalents called out in the [User-access protection](#user-access-protection) section above: PAN replaces SMAP, PXN replaces SMEP, and a bytewise `ldrb` / `strb` loop replaces `rep movsb` / `lodsb`. Boot enable goes through the same arch-neutral `ArchCpu::init_protections` entry point — it configures `SCTLR_EL1.SPAN` and checks `FEAT_PAN` rather than touching `CR4`.
 
-The public surface (`UserPtr<T>`, `UserMutPtr<T>`, the five copy primitives, `UserAccessError`) is arch-neutral and does not change for that port. The shape of the arch-private interface (`copy_bytes_raw`, `copy_cstr_raw`, `CstrCopyOutcome`) is what each arch implements. An `ArchUserAccess` trait — listed in [docs/planning/implementation-plan.md](../planning/implementation-plan.md#L379) under "Architecture trait completion" — would be a thin formalisation once a second arch exists.
+The public surface (`UserPtr<T>`, `UserMutPtr<T>`, the seven copy primitives, `UserAccessError`) is arch-neutral and does not change for that port. Each arch implements the `ArchUserAccess` trait ([`kernel/src/arch/user_access.rs`](../../kernel/src/arch/user_access.rs)): `copy_in`, `copy_out` and `copy_cstr`, each taking the kernel's side as a slice, over its own raw routines (`copy_bytes_raw` and `copy_cstr_raw` on x86_64).
 
 ## Out of scope
 
