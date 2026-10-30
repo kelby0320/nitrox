@@ -1710,7 +1710,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   abi, soundness, concurrency, opportunities. Medium. **Fix**, as sched-d5.
   Fixed in `b54b5e30`, as sched-d5.
 
-- [ ] **drv-d3** `kernel/src/drivers/xhci/storage.rs:1512` — `Disks::issue_hub` overwrites
+- [x] **drv-d3** `kernel/src/drivers/xhci/storage.rs:1512` — `Disks::issue_hub` overwrites
   `dev.inflight` and rewrites the wrapper page without checking that no IRP command is in flight.
   `bind` runs hub commands for LUN 1.. after LUN 0's disk and partitions are published, with
   `recovering` clear (`recover()` and `rescan()` take the device first; `bind` does not). Scenario:
@@ -1725,8 +1725,12 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   then `issue_hub(i, po, 1, INQUIRY, 36)` returned true and inflight became `Owner::Hub { po }`.
   `depart(i)` then handed back `queued=0 held=[None, None, None]` with the read's status still
   Pending. Lenses: ownership, soundness, concurrency. Medium. **Fix.**
+  Fixed in `e1202620`: the binding holds the device, as a rescan does, and `issue_hub` refuses one
+  not held or with a submit's command in flight; fails without it:
+  `a_hub_command_goes_only_on_a_held_device_and_never_replaces_a_read`, and `check-live --kvm`
+  fails without the binding's hold.
 
-- [ ] **drv-d4** `kernel/src/drivers/ahci/bringup.rs:167` — `drivers::probe` calls `ahci::init` for
+- [x] **drv-d4** `kernel/src/drivers/ahci/bringup.rs:167` — `drivers::probe` calls `ahci::init` for
   every 01.06.01 function (drivers/mod.rs:36-37), and `init` stores each disk into the AHCI static
   with no "already claimed" check (xhci::init has one at xhci/mod.rs:299). The watch thread's SAFETY
   claim "published once, never withdrawn" (ahci.rs:687) then fails. Scenario: a machine with two
@@ -1742,8 +1746,11 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   table"). Boot worked only because the system disk happened to enumerate last. No one-controller
   control was run. Lens: concurrency. Medium.
   **Fix**, with the bash's drv-8, moved here from Part H.
+  Fixed in `ea25abea`, with drv-o11: a second controller is declined before it is touched. Shown
+  by a boot with a second `ich9-ahci` behind a root port: on main the system disk's table did not
+  read and / did not mount; here the second is declined and / mounts.
 
-- [ ] **drv-d5** `kernel/src/io/ramdisk.rs:199` — `RamDisk::transfer` bounds-checks only
+- [x] **drv-d5** `kernel/src/io/ramdisk.rs:199` — `RamDisk::transfer` bounds-checks only
   `irp.offset + irp.length` against the backing, then copies each fragment's own `len`. The SAFETY
   premise "the frags sum to len" is held only by `build_frags` in io::block, and `Irp` and
   `IrpBuffer` are pub with pub fields. Scenario: latent, since every IRP today comes from
@@ -1759,6 +1766,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   "attempting to access 1024 bytes, but got alloc...+0x600 which is only 512 bytes from the end of
   the allocation" at ramdisk.rs:209. Fix: copy `min(f.len, remaining)`, or check the fragment sum
   (see drv-o1). Lenses: abi, soundness, opportunities. Medium. **Fix.**
+  Fixed in `2bdc48f7`: fragments short of the length are refused and only the length moves; fails
+  without it: `a_transfer_moves_its_length_whatever_its_fragments_hold`.
 
 - [x] **drv-d6** `kernel/src/drivers/mod.rs:197` — `pub(crate) fn adopt<T>(obj: KBox<T>, ty:
   KObjectType) -> ObjectRef` is a safe function with the whole contract of `ObjectRef::from_raw`:
@@ -1787,7 +1796,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   (see drv-o12). Lens: soundness. Medium. **Fix**, as sched-d3.
   Fixed in `1b7057f2`, as sched-d3.
 
-- [ ] **drv-d8** `kernel/src/drivers/xhci/hub.rs:626` — `data_bytes(mem, len: u16)` and
+- [x] **drv-d8** `kernel/src/drivers/xhci/hub.rs:626` — `data_bytes(mem, len: u16)` and
   `control_in`'s `write_bytes` (hub.rs:638) are safe functions taking any length up to 65,535 over
   the one-page data DmaBuffer. The page bound is held only at call sites (hub.rs:459's
   `.min(PAGE_SIZE)` and `read_interface_descriptor`'s clamp at :617). Scenario: latent. A new
@@ -1797,8 +1806,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   memory. Demonstrated: host test in hub.rs tests (since removed): `device_mem()`, then
   `data_bytes(&mem, 3*4096)` returned a 12,288-byte slice over a 4,096-byte page. Lens:
   opportunities. Medium. **Fix.**
+  Fixed in `7558d42d`: both cut the length to the page; fails without it:
+  `a_read_of_the_data_page_stops_at_the_page`.
 
-- [ ] **drv-d9** `kernel/src/drivers/ahci/bringup.rs:156` — the boot log line computes `sectors *
+- [x] **drv-d9** `kernel/src/drivers/ahci/bringup.rs:156` — the boot log line computes `sectors *
   SECTOR_SIZE as u64` unchecked. `sectors` is IDENTIFY words 100..103 read as a full u64
   (ahci.rs:292-297), with only zero refused, and overflow checks are on in every image. Scenario: a
   disk or HBA emulation whose IDENTIFY word 103 is non-zero (2^55 sectors or more) panics the
@@ -1807,8 +1818,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   Unverified: path read only. QEMU sizes the disk from its image, so it cannot report this. A host
   test of a factored-out size formatter fed `words[103] = 0x0080` would settle it. Fix:
   `saturating_mul`, or log in sectors and refuse counts above 2^48. Lens: abi. Medium. **Fix.**
+  Fixed in `378ba883`: a safe `identity` refuses a count past LBA48; fails without it:
+  `a_sector_count_past_lba48_is_refused`.
 
-- [ ] **drv-d10** `kernel/src/drivers/ahci.rs:390` — AHCI wants word-aligned PRDT bases (DBA bit 0
+- [x] **drv-d10** `kernel/src/drivers/ahci.rs:390` — AHCI wants word-aligned PRDT bases (DBA bit 0
   reserved) and even byte counts (DBC bit 0 set), but the block layer accepts any `buf_offset`
   (`whole_blocks` checks only `offset` and `length`). Scenario: a process holding a disk submits
   Read with `buf_offset` = 4095 and length 512. `build_frags` gives [frame0+4095, len 1] and
@@ -1821,8 +1834,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   adjacent frame. The boot verifier could not reproduce it under QEMU. Fix: require an even or
   block-aligned `buf_offset` for block devices, as Linux's `queue_dma_alignment` does. Lens: abi.
   Medium. **Fix.**
+  Fixed in `aa6170b1`: `dispatch_block_irp` refuses an odd `buf_offset`; fails without it:
+  `a_block_request_off_its_devices_blocks_or_words_reaches_no_driver`. Still unverified on hardware.
 
-- [ ] **drv-d11** `kernel/src/drivers/ahci/bringup.rs:105` — `init` programs PxCLB/PxFB and starts
+- [x] **drv-d11** `kernel/src/drivers/ahci/bringup.rs:105` — `init` programs PxCLB/PxFB and starts
   the port (FRE and ST, lines 92-100) before three fallible allocations. Each failure at lines 105,
   112 and 135 returns `declined(OUT_OF_MEMORY)` with `cmd_list`, `fis` and `cmd_table` dropped back
   to the buddy allocator while the HBA still owns them. Scenario: out of memory at boot. The next
@@ -1833,8 +1848,11 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   PxCMD.FRE is clear before the DmaBuffers drop, would settle it. Fix: `stop_port` first, and
   forget the buffers when it fails (see drv-o7). Lenses: abi, ownership, soundness, opportunities.
   Low. **Fix.**
+  Fixed in `f540c17f`, with drv-o4: every allocation comes before the port starts, and the disk
+  is `Programmed` from then on; `a_declined_disk_frees_its_memory_only_once_its_port_stopped` shows
+  the stop's proof decides the free. An allocation failure itself has no host seam.
 
-- [ ] **drv-d12** `kernel/src/drivers/xhci/mod.rs:579` — `stop()` discards both `wait_for` results
+- [x] **drv-d12** `kernel/src/drivers/xhci/mod.rs:579` — `stop()` discards both `wait_for` results
   (HCH set, HCRST complete). Every decline after USBCMD.RUN (lines 500, 505, 511) then drops the
   boxed `Xhci`, which frees the DCBAA, the scratchpad pages (the controller's own working memory),
   the command and event rings and the ERST, even if the controller is still running. Scenario: a
@@ -1845,8 +1863,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   needs a controller that ignores Run/Stop, which QEMU's model does not do. Fix: `stop()` returns
   whether HCH set, and `mem::forget(boxed)` when it did not. Lenses: ownership, soundness. Low.
   **Fix.**
+  Fixed in `f540c17f`, with drv-o4: `stop` resets, and gives the proof, only once HCH is set; fails
+  without it: `a_declined_controller_frees_its_memory_only_once_halted`.
 
-- [ ] **drv-d13** `kernel/src/drivers/xhci/hub.rs:384` — `control_in`'s SAFETY argument (hub.rs:634-638)
+- [x] **drv-d13** `kernel/src/drivers/xhci/hub.rs:384` — `control_in`'s SAFETY argument (hub.rs:634-638)
   is that any ep0 failure that can leave a transfer live "ends the device". `hid::bind` instead ends
   only its own binding when a request is in doubt (hid.rs:501, 516, timeouts included), and
   `hub::bind` then calls `storage::bind`, which issues GET MAX LUN on the same default endpoint and
@@ -1857,8 +1877,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   The bytes stay inside the device's own page, but the unsafe block's precondition is false and GET
   MAX LUN reads a stale byte. Unverified: path read only (hid.rs:498-503 and 512-518,
   hub.rs:380-385). No QEMU device is composite and slow enough to reach it. Lens: abi. Low. **Fix.**
+  Fixed in `53963f71`: `hid::bind` says whether the default endpoint is clear, and storage is not
+  bound on one in doubt. No control: no QEMU device is composite and slow enough.
 
-- [ ] **drv-d14** `kernel/src/drivers/xhci/desc.rs:187` — `Endpoint::dci()` turns a device-supplied
+- [x] **drv-d14** `kernel/src/drivers/xhci/desc.rs:187` — `Endpoint::dci()` turns a device-supplied
   `bEndpointAddress` into a Device Context Index without rejecting endpoint number 0. Scenario: a USB
   stick whose configuration lists bulk IN 0x81 and bulk OUT 0x00. `storage_interface` accepts it
   with out DCI 0, and `configure_endpoints` (context.rs:196-205) writes the endpoint context over
@@ -1869,8 +1891,11 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `xhci/context.rs` (since removed): `storage_interface` over that configuration printed "out dci 0
   in dci 3", and `configure_endpoints` printed "slot ctx dw2 0xdeadb001 add flags 0x9", failing the
   assertion that the slot context's dword 2 is 0. Lens: abi. Low. **Fix.**
+  Fixed in `53963f71`: `configure_endpoints` refuses an index below 2, or one twice, writing
+  nothing; fails without it:
+  `endpoints_naming_the_default_index_or_one_twice_are_refused_unwritten`.
 
-- [ ] **drv-d15** `kernel/src/drivers/xhci/storage.rs:1271` — `run()` copies `len` bytes of the
+- [x] **drv-d15** `kernel/src/drivers/xhci/storage.rs:1271` — `run()` copies `len` bytes of the
   binding buffer into `out` on any Passed status, ignoring the CSW residue. The buffer is never
   cleared between commands (`issue()` zeroes only the CSW area, lines 470-479). Scenario: a stick
   returns 8 of 18 sense bytes (residue 10) to REQUEST SENSE after an INQUIRY. `sense_answer` reads
@@ -1879,8 +1904,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   from stale bytes. `hub::control_in` zeroes its page before each transfer for exactly this reason;
   the bulk path does not. Unverified: path read only. A host seam over `run_once` returning
   `Passed { residue: 10 }` after a pre-filled buffer would settle it. Lens: abi. Low. **Fix.**
+  Fixed in `e1202620`: `issue_hub` clears the bytes it asks for; fails without it:
+  `a_hub_commands_buffer_is_cleared_before_it_is_sent`.
 
-- [ ] **drv-d16** `kernel/src/io/block.rs:622` — `window_of` decides that a backend's `ctx` is a
+- [x] **drv-d16** `kernel/src/io/block.rs:622` — `window_of` decides that a backend's `ctx` is a
   leaked `&'static Partition` by comparing `backend.submit as *const ()` with `partition_submit as
   *const ()`. Rust does not guarantee function-pointer identity (identical bodies may be merged, and
   the cast sidesteps `unpredictable_function_pointer_comparisons`). Scenario: latent. If another
@@ -1890,8 +1917,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   and miss its retire on rescan. Unverified: by reading (`core::ptr::fn_addr_eq`'s documentation).
   Fix: a tag in `BlockBackend`, or `block_info().kind == BlockKind::Partition` (see drv-o14). Lens:
   abi. Low. **Fix.**
+  Fixed in `086cbccd`: a partition's node carries its window, set only by `try_new_partition`;
+  fails without it: `a_node_is_a_window_by_what_made_it_not_by_its_backends_function`.
 
-- [ ] **drv-d17** `kernel/src/drivers/ahci.rs:468` — `publish_disk` ignores whether `device::register`
+- [x] **drv-d17** `kernel/src/drivers/ahci.rs:468` — `publish_disk` ignores whether `device::register`
   took the node. `register` returns nothing and drops the node when the table cannot grow
   (device.rs:521-526, 176-184). It then calls `Counted::attach(&r)` on the SAFETY argument that the
   table holds the node for the kernel's lifetime. When registration failed, `r` drops at the end of
@@ -1902,8 +1931,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   registry makes every completion a `fetch_add` on freed slab memory. Unverified: path pointed at.
   A host test failing registry growth, then `Counted::record` under Miri, would settle it. Lenses:
   soundness, opportunities. Low. **Fix.**
+  Fixed in `9e422204`, as drv-o18.
 
-- [ ] **drv-d18** `kernel/src/drivers/xhci/hid.rs:996` — `depart`'s keyboard branch offers its key
+- [x] **drv-d18** `kernel/src/drivers/xhci/hid.rs:996` — `depart`'s keyboard branch offers its key
   releases in their own reader-lock holds and only then retires the node with no releases (line
   999). A report the DPC decoded before `depart` took the Bound entry can be pushed in between and
   land after the releases, the case `Nodes::push`'s comment says retiring under the lock prevents.
@@ -1916,8 +1946,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `push(i, epoch, [press 30, syn])`, then `retire(i, &[])`. The ring's key events were
   [(30,0),(30,1)], ending on a press. The existing single-hold test shows the late push dropped.
   Lens: concurrency. Low. **Fix.**
+  Fixed in `f077ec46`: `Nodes::retire` pushes the releases in the hold that retires the node;
+  fails without it: `a_departing_keyboards_releases_end_its_ring_whatever_the_dpc_pushes`.
 
-- [ ] **drv-d19** `kernel/src/drivers/xhci/mod.rs:647` — `xhci_dpc` can run as two concurrent
+- [x] **drv-d19** `kernel/src/drivers/xhci/mod.rs:647` — `xhci_dpc` can run as two concurrent
   instances (`dpc.rs` clears `queued` before the handler, and the queue is global). Each drains a
   16-event batch under the `events` lock and acts on it after releasing, so events from consecutive
   batches can be acted on out of ring order. Scenario: instance A on an AP's timer tail drains a
@@ -1928,8 +1960,11 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   Unverified: read of `xhci_dpc`, dpc.rs:13-16, `ep0_event` and `hid::on_transfer`. A host test
   driving two batches through `on_event` in swapped order against a Waiting record would settle it.
   Lens: concurrency. Low. **Fix.**
+  Fixed in `06bd48dc`: `xhci_dpc` drains through `dpc::OneAtATime`; fails without it:
+  `an_instance_arriving_meanwhile_is_run_after_the_first_not_beside_it`, and under Miri
+  `every_instances_work_is_taken_by_a_round_after_it`.
 
-- [ ] **drv-d20** `kernel/src/drivers/xhci/ring.rs:328` — `Consumer::next` reads the whole event TRB
+- [x] **drv-d20** `kernel/src/drivers/xhci/ring.rs:328` — `Consumer::next` reads the whole event TRB
   through `DmaSlots::read` (dwords 0, 1, 2, then 3, mod.rs:228-236) and only then checks the cycle
   bit in dword 3, with no acquire fence between the cycle check and the other dwords. Linux reads
   the cycle first, then `rmb()`, then the rest. Scenario: the DPC reads dwords 0-2 of event slot k
@@ -1940,6 +1975,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   write not being observed atomically (QEMU writes it with one `dma_memory_write`). Unverified:
   read only. A `Slots` stand-in whose read returns dwords from two laps would settle it once the
   reader reads dword 3 first (see drv-o11). Lens: concurrency. Low. **Fix.**
+  Fixed in `dec4dcbb`, with drv-o16: `RingMem` reads dword 3 first, then an acquire; fails
+  without it: `an_event_written_while_it_is_read_is_taken_whole_or_not_yet`.
 
 - [x] **drv-d21** `kernel/src/io/ramdisk.rs:132` — for an Owned backing, `RamDisk::base()` returns
   `v.as_ptr()`. `KVec` has no inherent `as_ptr`, so this goes through Deref to a `&[u8]` and the
@@ -2018,7 +2055,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   (ahci.rs:363-366, 491), the DCBAA slot index. Depends on: nothing. Lenses: abi, opportunities.
   Value high, effort medium. **Plan**, in P5.
 
-- [ ] **drv-o4** encapsulate: device memory handed to a controller, then freed by drop on a path
+- [x] **drv-o4** encapsulate: device memory handed to a controller, then freed by drop on a path
   that has not proved the controller quiescent: decline paths after a port or controller was
   started, and teardown that forgets memory by hand when a stop fails — 9 sites (read:
   ahci/bringup.rs:105, :112, :135; ahci.rs:285 (identify forgets `data` when `stop_port` fails);
@@ -2033,6 +2070,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   into memory the allocator has handed out again (drv-d11, drv-d12); the comment at
   xhci/mod.rs:488-490 records a fixed instance. Depends on: nothing. Lens: soundness. Value high,
   effort medium. **Fix.**
+  Fixed in `f540c17f`: `mm::dma::Programmed` and `Quiesced`, at AHCI's bring-up and IDENTIFY,
+  xHCI's declines after RUN and `hub::release`; fails without it:
+  `programmed_memory_is_freed_only_once_its_device_stopped`.
 
 - [x] **drv-o5** encapsulate: IRP completion through each IRP's own inline Dpc — `set_completion` +
   `dpc::enqueue(&(*irp).dpc)` in every driver, so the global DPC queue holds one entry per completed
@@ -2138,7 +2178,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   effort small. **Fix**, as sched-o4.
   Fixed in `1b7057f2`, as sched-o4.
 
-- [ ] **drv-o11** encapsulate: a static `AtomicPtr<T>` is published once, then `unsafe { &*p }` with
+- [x] **drv-o11** encapsulate: a static `AtomicPtr<T>` is published once, then `unsafe { &*p }` with
   "published once, never withdrawn" at every ISR, DPC and thread entry; xHCI already has a safe
   `controller()` accessor (xhci/mod.rs:128) that five sites bypass by hand; Partition and RamDisk
   are leaked with `unsafe { &*KBox::into_raw(b).as_ptr() }`, and AHCI patches `(*disk).sectors`
@@ -2156,6 +2196,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   IrqSpinLock). Closes: a second publish silently replacing the first (drv-d4), and dereferencing a
   published pointer before initialisation finishes. Depends on: nothing. Lenses: ownership,
   soundness, concurrency, opportunities. Value medium, effort small. **Fix.**
+  Fixed in `ea25abea`: `libkern::Published`, AHCI's and xHCI's statics, the 13 derefs gone. The
+  three hand leaks of a RAM disk and a partition window stay, as kernel/CLAUDE.md forbids a
+  `KBox::leak`. Fails without it: `a_value_is_published_once_and_a_second_is_refused`.
 
 - [ ] **drv-o12** encapsulate: `BlockBackend`'s `ctx: *mut ()` is re-cast at every submit and poll
   (Partition, AhciDisk, RamDisk), or is an integer smuggled through the pointer (USB slot/lun/epoch,
@@ -2228,7 +2271,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   record silently replacing another. Depends on: nothing. Lens: ownership. Value medium, effort
   medium. **Plan**, in P5.
 
-- [ ] **drv-o16** encapsulate: three hand-written `Slots` impls over TRB ring memory (xhci/mod.rs
+- [x] **drv-o16** encapsulate: three hand-written `Slots` impls over TRB ring memory (xhci/mod.rs
   `DmaSlots`, storage.rs `RawSlots`, hid.rs `RawSlots`) disagree on ordering: `DmaSlots` and
   storage fence(Release) before the cycle dword, hid writes all four dwords with no fence although
   the `Slots` trait says dword 3 hands the TRB over, and all three read the cycle dword last
@@ -2243,6 +2286,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   a TRB to the controller before its fields are in place; hid is ordered today only by x86 TSO,
   which matters once aarch64 lands. Depends on: drv-o3's region accessors (optional). Lenses: abi,
   concurrency. Value medium, effort small. **Fix.**
+  Fixed in `dec4dcbb`: `ring::RingMem`, the one `Slots` over ring memory; fails without its order:
+  `a_trb_is_handed_over_by_its_last_store`.
 
 - [ ] **drv-o17** narrow: `arch/x86_64/ps2.rs` opens a separate `unsafe { inb(..) }` or `unsafe {
   outb(..) }` at every access to the i8042's two fixed ports, restating the same SAFETY argument —
@@ -2255,7 +2300,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   class; it cuts 12 SAFETY arguments to 4. Depends on: nothing. Lenses: ownership, opportunities.
   Value low, effort small. **Later.**
 
-- [ ] **drv-o18** narrow: `unsafe fn Counted::attach(&self, node: &ObjectRef)` stores a pointer into
+- [x] **drv-o18** narrow: `unsafe fn Counted::attach(&self, node: &ObjectRef)` stores a pointer into
   a DeviceNode's `IoStats` on the contract "registered in the device table, which holds it
   forever", but `register()` returns nothing, so callers cannot tell when the table dropped the node
   (drv-d17) — 3 sites (`grep -rn '\.attach(&' kernel/src | grep -v tests.rs`: ahci.rs:468,
@@ -2267,6 +2312,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `bool` and `attach` takes the registry's proof. In `kernel/src/io/stats.rs`. Closes: a dangling
   `IoStats` pointer when registration failed under memory pressure. Depends on: nothing. Lens:
   opportunities. Value low, effort small. **Fix.**
+  Fixed in `9e422204`: `Counted::attach` is safe and pins its node; fails without it:
+  `attaching_pins_the_node_its_counters_are_in`.
 
 What held up: IrpBox lifetime. `_po`, `_buffer` and `_device` pin every raw pointer in the Irp;
 `irp_complete_dpc` signals the PO and links the box onto the allocation-free RECLAIM list as its
