@@ -178,9 +178,10 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
     reclaim_completed();
 }
 
-/// **A block request off its device's blocks reaches no driver**, through both dispatches.
+/// **A block request off its device's blocks, or at an odd buffer offset, reaches no driver**,
+/// through both dispatches.
 #[test]
-fn a_block_request_off_its_devices_blocks_reaches_no_driver() {
+fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     let _exclusive = crate::dpc::exclusive();
     use crate::libkern::block::BlockKind;
     use crate::libkern::handle::KObjectType;
@@ -237,6 +238,10 @@ fn a_block_request_off_its_devices_blocks_reaches_no_driver() {
     assert!(seen.0.borrow().is_empty(), "nothing reached the device");
     let last = (Ok(()), None);
     assert_eq!(both(span - 512, 512), (last, last), "the last block goes down, for the device to complete");
+    let at = |buf_offset| dispatch_block_irp(&disk, &buffer, &po(), IoOpcode::Read, 0, buf_offset, 512);
+    assert_eq!(at(PAGE_SIZE as u64 - 1), Err(KError::InvalidArgument), "an odd buffer offset");
+    assert_eq!(seen.0.borrow().len(), 2, "and it reached no driver");
+    assert_eq!(at(PAGE_SIZE as u64 - 2), Ok(()), "an even one across a page goes down");
     for irp in seen.0.borrow_mut().drain(..) {
         // SAFETY: each the IRP of a box a dispatch made, completed once.
         unsafe { finish(irp) };

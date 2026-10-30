@@ -125,8 +125,9 @@ fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: *mut Irp) {
 ///
 /// Returns `Err` **before the operation starts**, so the caller rolls back `po`:
 /// `OutOfMemory`, `Unsupported` without a block backend, `InvalidArgument` if
-/// the transfer is not whole blocks or needs more fragments than the device can describe in one
-/// command. A range past the device's end completes `po` `InvalidArgument`.
+/// the transfer is not whole blocks, starts at an odd `buf_offset`, or needs more fragments than
+/// the device can describe in one command. A range past the device's end completes `po`
+/// `InvalidArgument`.
 pub fn dispatch_block_irp(
     device: &ObjectRef,
     buffer: &ObjectRef,
@@ -140,6 +141,11 @@ pub fn dispatch_block_irp(
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
     whole_blocks(dn, dev_offset, length)?;
+    // **A disk moves 16-bit words**: an odd offset gives a fragment an odd address and count, which
+    // AHCI's PRDT cannot describe, and an HBA rounding the count up writes a byte past the frame.
+    if !buf_offset.is_multiple_of(2) {
+        return Err(KError::InvalidArgument);
+    }
 
     // SAFETY: `buffer` pins a live `MemoryObject` (type checked by the caller).
     let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };

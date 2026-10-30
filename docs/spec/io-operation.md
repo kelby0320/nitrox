@@ -41,7 +41,7 @@ resource-agnostic so future resource kinds (char devices, sockets) reuse them.
 - **Returns a negative `KError` synchronously**, with **no** PO created, for
   *argument*, *permission*, and *allocation* failures: a bad `resource` handle or
   one lacking the required right, a malformed `IoOp` (unknown opcode, reserved
-  flag set, misaligned `offset`/`length` for a block device, a `length` below one
+  flag set, misaligned `offset`/`length` or an odd `buf_offset` for a block device, a `length` below one
   record for a **record-stream** char device), a `buffer` that is not a
   `MemoryObject` or is too small for `buf_offset + length`, **a block request
   needing more physical fragments than the device can describe in one command**
@@ -94,7 +94,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   `RawHandle::NULL` is valid only for a zero-`length` request.
 - **`buf_offset`** — byte offset into `buffer` where the transfer begins.
   `buf_offset + length` must not exceed the object's size, else
-  `InvalidArgument`.
+  `InvalidArgument`. For a block device it must be even, else `InvalidArgument`:
+  a disk moves 16-bit words, and AHCI's scatter-gather list takes neither an odd
+  address nor an odd count.
 - **`offset`** — byte offset **within the resource** (the device) at which to
   read or write. For a block device it must be a multiple of the device's
   logical block size (a range, `offset + length`, past the device's end completes
