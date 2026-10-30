@@ -99,10 +99,10 @@ not, because `SCHED` is at the top and an interrupt handler is exactly the thing
 it under anything; the result panicked about one boot in three and was withdrawn. See the
 decision log, 2026-07-29.
 
-`SCHED`, `SERIAL`, `KLOG`, `DPC_QUEUE`, `ENTROPY`, `CONSOLE`, and the AHCI port
-lock are [`IrqSpinLock`]s (they mask interrupts while held); every other lock is a
-plain `SpinLock`. See § Interrupt
-semantics for why these need it.
+A lock an interrupt handler or a DPC takes must be an [`IrqSpinLock`] (it masks interrupts while
+held); others may be plain `SpinLock`s. The table marks the `IrqSpinLock`s it lists, and
+not every driver's leaf is listed (xHCI's, PS/2's, the module disks', the framebuffer aperture's).
+See § Interrupt semantics for why these need it.
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
@@ -457,8 +457,8 @@ Two lock families coexist:
   handle-table segment locks (3) all stay plain `SpinLock`.
 - **[`IrqSpinLock`]** — captures the prior interrupt state and `cli`s **before**
   acquiring, restoring it after releasing. Required for data shared between
-  thread and IRQ context: `SCHED` (the timer reschedules) and `SERIAL` (a
-  thread may be printing when the timer fires). These are the **only** two.
+  thread and IRQ context, as `SCHED` (the timer reschedules) and `SERIAL` (a
+  thread may be printing when the timer fires) are. The table marks those it lists.
 
 **Single-CPU deadlock-freedom.** Because an `IrqSpinLock` masks interrupts for
 its whole hold window, a thread holding `SCHED`/`SERIAL` cannot be preempted, so
