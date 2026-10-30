@@ -3,6 +3,12 @@ use super::*;
 /// Probe and initialise an AHCI controller `DeviceNode`, publishing its first SATA disk; returns
 /// its fate (claimed, or declined with why).
 pub fn init(controller: &ObjectRef) -> Outcome {
+    // **One controller's disk is served**: its interrupt, DPCs and watch thread find it through
+    // `AHCI`. A second controller is declined before it is touched.
+    if AHCI.get().is_some() {
+        crate::kprintln!("ahci: another controller's disk is served already; this one is declined");
+        return declined("another AHCI controller is already claimed");
+    }
     // SAFETY: `controller` pins a live `DeviceNode`.
     let dn: &DeviceNode = unsafe { &*(controller.as_ptr() as *const DeviceNode) };
     let desc = dn.descriptor();
@@ -97,9 +103,17 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     );
 
     // Published once the disk answered, so a controller declined above gets no watch thread.
-    // SAFETY: published, it is never freed.
-    let disk = KBox::into_raw(unsafe { disk.keep() }).as_ptr();
-    AHCI.store(disk, Ordering::Release);
+    // SAFETY: published, it is never freed; refused, it is `Programmed` again at once.
+    let disk = match AHCI.publish(unsafe { disk.keep() }) {
+        Ok(disk) => disk,
+        Err(disk) => {
+            let disk = Programmed::new(disk);
+            if let Some(stopped) = stop_port(disk.port_base) {
+                drop(disk.release(stopped));
+            }
+            return declined("another AHCI controller is already claimed");
+        }
+    };
 
     // Prefer MSI: it does not depend on the PCI interrupt-line register, which QEMU's firmware
     // programs and real UEFI often leaves meaningless. INTx is the fallback.

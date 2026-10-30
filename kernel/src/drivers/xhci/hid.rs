@@ -783,9 +783,7 @@ static LIGHTS_TAKEN: AtomicU32 = AtomicU32::new(0);
 /// `IoError`; one that comes while another waits replaces it, which is completed as done, its
 /// lights being older than the ones that will be set. [`Nodes::write`], on the boot's.
 fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError> {
-    // SAFETY: the controller is published once and never withdrawn; null before.
-    let x = unsafe { super::XHCI.load(Ordering::Acquire).as_ref() };
-    NODES.write(x, buffer, po, buf_offset, len, ctx)
+    NODES.write(super::controller(), buffer, po, buf_offset, len, ctx)
 }
 
 /// Where a keyboard's waiting lights go.

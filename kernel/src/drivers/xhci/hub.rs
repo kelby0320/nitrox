@@ -115,12 +115,9 @@ pub(super) struct DeviceMem {
 
 /// The thread.
 pub(super) extern "C" fn main(_arg: usize) {
-    let x = XHCI.load(Ordering::Acquire);
-    if x.is_null() {
+    let Some(x) = XHCI.get() else {
         return;
-    }
-    // SAFETY: published once, never withdrawn.
-    let x: &'static Xhci = unsafe { &*x };
+    };
     let mut attached: KVec<Option<Attached>> = KVec::new();
     if attached.try_reserve(x.max_ports as usize + 1).is_err() {
         crate::kprintln!("usb: no memory for the hub thread's ports; nothing is enumerated");

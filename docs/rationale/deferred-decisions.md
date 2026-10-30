@@ -204,7 +204,8 @@ to a stick, is where a bigger transfer would first pay.
 **AHCI driver scope.** The Phase 2 AHCI driver (Part 3) supports a **single
 controller, single SATA disk, one command *issued* at a time** (slot 0). Multi-port /
 multi-disk, multiple controllers, and port multipliers are deferred to when a
-configuration needs them. It resolves the controller's GSI from the **PCI
+configuration needs them; **a second controller is declined before it is touched**, as xHCI's
+is (2026-10-30), since serving both through one static served neither. It resolves the controller's GSI from the **PCI
 interrupt-line register** (firmware-programmed on QEMU); proper ACPI `_PRT` routing
 (which needs AML) is deferred — see `device-node.md`. The read self-test brings up
 against the existing AHCI boot disk; the dedicated `xtask build-disk` + ext4 test disk

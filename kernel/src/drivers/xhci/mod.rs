@@ -31,7 +31,7 @@ pub mod storage;
 pub use hub::FIRST_ROUND_NS;
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
@@ -39,7 +39,7 @@ use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{IrqSpinLock, KBox, KVec};
+use crate::libkern::{IrqSpinLock, KBox, KVec, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
@@ -119,16 +119,14 @@ const RESET_NS: u64 = 1_000_000_000;
 const NO_OP_NS: u64 = 100_000_000;
 
 /// The one controller this driver brought up, for the interrupt and its DPC.
-static XHCI: AtomicPtr<Xhci> = AtomicPtr::new(core::ptr::null_mut());
+static XHCI: Published<Xhci> = Published::new();
 
 static XHCI_DPC: Dpc = Dpc::new(xhci_dpc, core::ptr::null_mut());
 
 /// **The controller, once brought up**: for a storage submit to wake the hub thread through, with a
 /// rescan for it. `None` before then, when no USB disk exists to submit to.
 pub(super) fn controller() -> Option<&'static Xhci> {
-    let x = XHCI.load(Ordering::Acquire);
-    // SAFETY: a published controller is leaked to `'static` and never freed.
-    (!x.is_null()).then(|| unsafe { &*x })
+    XHCI.get()
 }
 
 /// A brought-up controller. Leaked to `'static` once published, as AHCI's disk is: a Tier 1
@@ -169,6 +167,12 @@ pub struct Xhci {
     hid_halted: AtomicBool,
     hid_lights: AtomicBool,
 }
+
+// SAFETY: shared across CPUs once published. Its register bases and descriptions never change,
+// and every field that does is atomic or behind a lock of its own, but for DMA memory: the
+// scratchpads and the event ring's segment table are never touched after bring-up, and the device
+// context base array is written by the hub thread alone.
+unsafe impl Sync for Xhci {}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Awaited {
@@ -308,7 +312,7 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     if usb_off {
         return declined("usb=off on the command line");
     }
-    if !XHCI.load(Ordering::Acquire).is_null() {
+    if XHCI.get().is_some() {
         return declined("another xHCI controller is already claimed");
     }
     // SAFETY: `controller` pins a live `DeviceNode`.
@@ -526,11 +530,14 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         return declined("a No Op did not complete with Success");
     }
 
-    // SAFETY: published, it is never freed.
-    let x = KBox::into_raw(unsafe { boxed.keep() }).as_ptr();
-    XHCI.store(x, Ordering::Release);
-    // SAFETY: just published, and nothing else holds it yet.
-    let x = unsafe { &*x };
+    // SAFETY: published, it is never freed; refused, it is `Programmed` again at once.
+    let x = match XHCI.publish(unsafe { boxed.keep() }) {
+        Ok(x) => x,
+        Err(boxed) => {
+            give_back(op, Programmed::new(boxed));
+            return declined("another xHCI controller is already claimed");
+        }
+    };
 
     // **The interrupter on, without touching Interrupt Pending**, then the controller's interrupts,
     // then **one more drain**. An event posted after the No Op's drain set IP and Event Handler
@@ -658,12 +665,9 @@ fn drain(x: &Xhci, mut seen: impl FnMut(&Trb)) {
 
 /// The interrupt: acknowledge it, and leave the event ring to the DPC.
 extern "C" fn isr() {
-    let x = XHCI.load(Ordering::Acquire);
-    if x.is_null() {
+    let Some(x) = XHCI.get() else {
         return;
-    }
-    // SAFETY: published once, never withdrawn.
-    let x = unsafe { &*x };
+    };
     write32(x.rt + IR0, IMAN, IMAN_IP | IMAN_IE);
     write32(x.op, USBSTS, STS_EINT);
     crate::dpc::enqueue(&XHCI_DPC);
@@ -674,12 +678,9 @@ extern "C" fn isr() {
 /// scheduler's lock, which no leaf lock may be held across. No allocation, and no freeing: a DPC
 /// may do neither.
 fn xhci_dpc(_ctx: *mut ()) {
-    let x = XHCI.load(Ordering::Acquire);
-    if x.is_null() {
+    let Some(x) = XHCI.get() else {
         return;
-    }
-    // SAFETY: as `isr`.
-    let x = unsafe { &*x };
+    };
     const BATCH: usize = 16;
     loop {
         let mut batch = [Trb::default(); BATCH];
@@ -785,7 +786,7 @@ fn complete_if(x: &Xhci, matches: impl Fn(Awaited) -> bool, code: u8, result: u6
 
 /// **Start the hub thread**, if a controller was claimed. After the scheduler and the APs are up.
 pub fn start() {
-    if XHCI.load(Ordering::Acquire).is_null() {
+    if XHCI.get().is_none() {
         return;
     }
     if crate::sched::spawn(hub::main, 0).is_err() {
@@ -797,12 +798,9 @@ pub fn start() {
 /// is attached and the registry holds it before userspace reads it. A bound that passes is said;
 /// whatever is still enumerating arrives later.
 pub fn settle(bound_ns: u64) {
-    let x = XHCI.load(Ordering::Acquire);
-    if x.is_null() {
+    let Some(x) = XHCI.get() else {
         return;
-    }
-    // SAFETY: published once, never withdrawn.
-    let x = unsafe { &*x };
+    };
     let now = crate::arch::Timer::read_ns();
     let po = x.first_round.as_ptr();
     // SAFETY: `x.first_round` pins the `PendingOperation` at `po` for the controller's life.

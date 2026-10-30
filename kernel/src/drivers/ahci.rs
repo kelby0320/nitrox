@@ -1,4 +1,5 @@
 //! AHCI (SATA) block driver: a single controller and SATA disk, one command at a time (slot 0).
+//! A second controller is declined before it is touched.
 //!
 //! Brings up the class-`01.06.01` HBA that PCI enumeration found, maps its ABAR uncached, runs
 //! `IDENTIFY DEVICE` on the first SATA disk and publishes it as a block [`DeviceNode`] backed by a
@@ -9,7 +10,6 @@
 
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::printable::Printable;
-use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::arch::irq_install::ArchIrqInstall;
 use crate::device::{Outcome, Signal};
@@ -19,7 +19,7 @@ use crate::io::irp::{Irp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{IrqSpinLock, KBox};
+use crate::libkern::{IrqSpinLock, KBox, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{
@@ -204,7 +204,7 @@ unsafe impl Send for AhciDisk {}
 // SAFETY: as above.
 unsafe impl Sync for AhciDisk {}
 
-static AHCI: AtomicPtr<AhciDisk> = AtomicPtr::new(core::ptr::null_mut());
+static AHCI: Published<AhciDisk> = Published::new();
 
 static AHCI_INTR_DPC: Dpc = Dpc::new(ahci_intr_dpc, core::ptr::null_mut());
 
@@ -449,13 +449,13 @@ fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
     read32(disk.port_base, PX_TFD) & (TFD_ERR | TFD_BSY | TFD_DRQ) == 0
 }
 
-fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut AhciDisk) -> bool {
+fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: &'static AhciDisk) -> bool {
     // SAFETY: `controller` pins a live `DeviceNode`.
     let cdesc = unsafe { &*(controller.as_ptr() as *const DeviceNode) }.descriptor();
     let backend = BlockBackend {
         submit,
         poll: ahci_poll,
-        ctx: disk as *mut (),
+        ctx: disk as *const AhciDisk as *mut (),
         // One command table, one page, so one command describes this many fragments.
         max_frags: MAX_PRDT_ENTRIES,
     };
@@ -482,9 +482,8 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut Ah
             // SAFETY: adopt the creation reference into the device table.
             let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
             crate::device::register(r.clone(), "ahci");
-            // SAFETY: `disk` is the live published state; `r` was just registered, and the table
-            // holds it for the kernel's lifetime.
-            unsafe { (*disk).counted.attach(&r) };
+            // SAFETY: `r` was just registered, and the table holds it for the kernel's lifetime.
+            unsafe { disk.counted.attach(&r) };
             true
         }
         Err(_) => false,
@@ -650,13 +649,9 @@ fn refuse(irp: *mut Irp, error: crate::syscall::error::KError) {
 /// The AHCI completion ISR (device-IRQ context): acknowledges the controller, completes the
 /// in-flight IRP and queues the `InterruptObject` signal.
 extern "C" fn isr() {
-    let disk = AHCI.load(Ordering::Acquire);
-    if disk.is_null() {
-        return;
+    if let Some(d) = AHCI.get() {
+        on_interrupt(d);
     }
-    // SAFETY: `disk` was leaked to `'static` before its `Release` store, which this `Acquire`
-    // load pairs with; `AhciDisk` is `Sync`, so a shared borrow on any CPU is sound.
-    on_interrupt(unsafe { &*disk });
 }
 
 /// [`isr`]'s body: acknowledge, report a fault to the watch thread, or retire slot 0.
@@ -688,22 +683,18 @@ fn on_interrupt(d: &AhciDisk) {
 }
 
 fn ahci_fault_dpc(_ctx: *mut ()) {
-    let disk = AHCI.load(Ordering::Acquire);
-    if !disk.is_null() {
-        // SAFETY: live published state; its `wake` a live `InterruptObject`.
-        unsafe { crate::sched::signal_interrupt((*disk).wake.as_ptr()) };
+    if let Some(d) = AHCI.get() {
+        // SAFETY: `d.wake` pins the disk's `InterruptObject`.
+        unsafe { crate::sched::signal_interrupt(d.wake.as_ptr()) };
     }
 }
 
 /// **The watch thread**: asleep until slot 0's command is due or a fault wakes it, never longer
 /// than a deadline, so no command needs a wake of its own.
 extern "C" fn watch(_arg: usize) {
-    let disk = AHCI.load(Ordering::Acquire);
-    if disk.is_null() {
+    let Some(d) = AHCI.get() else {
         return;
-    }
-    // SAFETY: published once, never withdrawn.
-    let d: &'static AhciDisk = unsafe { &*disk };
+    };
     while !d.state.lock().dead {
         let now = clock();
         // SAFETY: `d.wake` pins the disk's `InterruptObject`.
@@ -720,7 +711,7 @@ extern "C" fn watch(_arg: usize) {
 
 /// **Start the watch thread**, if a disk was claimed: after the scheduler and the APs are up.
 pub fn start() {
-    if AHCI.load(Ordering::Acquire).is_null() {
+    if AHCI.get().is_none() {
         return;
     }
     if crate::sched::spawn(watch, 0).is_err() {
@@ -828,30 +819,24 @@ fn ahci_poll(_ctx: *mut ()) {
 }
 
 fn ahci_intr_dpc(_ctx: *mut ()) {
-    let disk = AHCI.load(Ordering::Acquire);
-    if !disk.is_null() {
-        // SAFETY: `disk` is live published state, and its `intr` a live `InterruptObject`.
-        unsafe { crate::sched::signal_interrupt((*disk).intr.as_ptr()) };
+    if let Some(d) = AHCI.get() {
+        // SAFETY: `d.intr` pins the disk's `InterruptObject`.
+        unsafe { crate::sched::signal_interrupt(d.intr.as_ptr()) };
     }
 }
 
 fn ahci_drain_dpc(_ctx: *mut ()) {
-    let disk = AHCI.load(Ordering::Acquire);
-    if !disk.is_null() {
-        // SAFETY: live published state.
-        drain_queue(unsafe { &*disk });
+    if let Some(d) = AHCI.get() {
+        drain_queue(d);
     }
 }
 
 /// Poll the in-flight command to completion and complete its IRP — the boot self-test's fallback
 /// when the IRQ does not fire. Returns `true` if a command was completed this way.
 pub fn poll_complete_inflight() -> bool {
-    let disk = AHCI.load(Ordering::Acquire);
-    if disk.is_null() {
+    let Some(d) = AHCI.get() else {
         return false;
-    }
-    // SAFETY: live published state.
-    let d = unsafe { &*disk };
+    };
     let settled = poll_disk(d);
     if let Some((false, working)) = settled {
         said(d, working);
