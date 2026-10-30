@@ -105,9 +105,10 @@ pub unsafe fn request_terminate(process: *mut ()) -> bool {
 
 /// Wake every thread blocked on `channel` (its queue just went non-empty). Caller holds
 /// `SCHED`. No allocation, no blocking — safe from the fault path.
-pub(super) fn signal_channel(g: &mut SchedState, channel: *mut ()) {
+pub(super) fn signal_channel(g: &mut SchedState, channel: *mut ()) -> bool {
     // SAFETY: live channel, `SCHED` held — drains its waiter list.
     let waiters = unsafe { NotificationChannel::take_waiters(channel) };
+    let mut woke = false;
     for &th in waiters.iter() {
         // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
         // `blocked`; `SCHED` held.
@@ -115,9 +116,11 @@ pub(super) fn signal_channel(g: &mut SchedState, channel: *mut ()) {
             Thread::wait_mark_signaled(th, channel as usize);
             if Thread::wait_try_wake(th) {
                 make_runnable(g, th);
+                woke = true;
             }
         }
     }
+    woke
 }
 
 /// Wake every thread blocked recv-ing on `endpoint` (a message just arrived in its inbox,

@@ -37151,7 +37151,11 @@ Group F of the survey's triage, the types the kernel trusts at its boundaries, m
 To make room, `sys_process_spawn`, `sys_io_submit` and a fill's reply moved out of
 `syscall/table.rs` into `spawn.rs`, `submit.rs` and `fill.rs` beside it, unchanged.
 
-One more, outside the survey, from this PR's CI: **a ring-3 fault is reported as stranding the
-scheduler only when no CPU has a thread to run**, not when the faulting CPU alone has none, and
-the notice is written under `SERIAL`. check-terminal's intermittent first-prompt hang on CI was
-that notice, false and lock-free, interleaved byte by byte with nxterm's line.
+One more, outside the survey, from this PR's CI: **a ring-3 fault is reported when its
+notification woke no waiting thread**, wherever the CPUs stand, where it was reported when the
+faulting CPU found nothing else to run; and the notice is written under `SERIAL`.
+check-terminal's intermittent first-prompt hang on CI was that notice, false and lock-free,
+interleaved byte by byte with nxterm's line. The review found that "no CPU has a thread to run",
+this PR's first answer, silenced an init crash on a busy SMP system, which the 2026-06-22
+decision promised a line for; the maintainer chose the waiter rule. A supervisor not yet at its
+wait gets the line too, so the harness's fault demo lets its supervisor reach its wait first.

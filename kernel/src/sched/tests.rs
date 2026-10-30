@@ -932,31 +932,38 @@ fn the_current_identity_is_its_pid_then_its_tid() {
     assert_eq!(with_current(inert_ref(3), current_pid_tid), None);
 }
 
-/// **A fault strands the system only when no CPU has a thread to run**: a supervisor woken onto
-/// another CPU, queued there or already running, is not stranded.
+/// **A fault is reported unwaited only when its notification wakes no thread**: a supervisor
+/// blocked on the channel is woken, wherever it then runs; a channel with no waiter, or no channel,
+/// wakes nobody. The notification is queued either way, for whoever reads it.
 #[test]
-fn nothing_is_left_to_run_only_when_every_cpu_idles_with_an_empty_queue() {
+fn a_fault_wakes_the_thread_waiting_on_its_channel_or_none() {
+    use crate::libkern::notification::FaultKind;
     init_global_heap();
-    let mut st = test_state();
-    online_n(&mut st, 3);
-    let idle = inert_ref(90);
-    st.idle_addr[1] = idle.as_ptr() as usize;
-    st.current[1] = Some(idle);
-    assert!(nothing_to_run(&st), "CPU 1 idles and CPU 2 has nothing current");
-
-    st.current[2] = Some(inert_ref(91));
-    assert!(!nothing_to_run(&st), "CPU 2 runs a thread");
-    st.current[2] = None;
-
-    assert!(st.ready[2].push(inert_ref(92)).is_ok());
-    assert!(!nothing_to_run(&st), "CPU 2 has a thread queued");
-    drop(st.ready[2].pop());
-    assert!(st.ready[0].push(inert_ref(93)).is_ok());
-    assert!(!nothing_to_run(&st), "this CPU has a thread queued");
-    drop(st.ready[0].pop());
-
-    st.ready[3] = thread_list().unwrap();
-    assert!(st.ready[3].push(inert_ref(94)).is_ok());
-    st.current[3] = Some(inert_ref(95));
-    assert!(nothing_to_run(&st), "CPU 3 is offline");
+    super::online_set::force(0b1);
+    let mut st = reserved_state();
+    let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
+    // SAFETY: `into_raw` yielded the single creation reference; adopt it.
+    let _pinned = unsafe { ObjectRef::from_raw(chan, KObjectType::NotificationChannel) };
+    let notif = Notification::seg_fault(7, 0xdead_0000, FaultKind::NotWritable);
+    // SAFETY: the test's own live channel, its queue room reserved by `try_new`; single-threaded.
+    unsafe {
+        assert!(!deliver_fault(&mut st, None, notif), "no channel");
+        assert!(!deliver_fault(&mut st, Some(chan), notif), "no thread waiting");
+    }
+    let supervisor = inert_user_ref(1, 7);
+    let s = supervisor.as_ptr();
+    // SAFETY: pinned by the test; single-threaded.
+    unsafe {
+        Thread::wait_register(s, &[chan as usize], true);
+        NotificationChannel::add_waiter(chan, s).unwrap();
+        Thread::set_state(s, ThreadState::Blocked);
+    }
+    assert!(st.blocked.push(supervisor).is_ok());
+    // SAFETY: as above.
+    assert!(unsafe { deliver_fault(&mut st, Some(chan), notif) }, "the supervisor was waiting");
+    assert!(st.ready.iter().any(|q| q.iter().any(|r| r.as_ptr() == s)), "and is woken to run");
+    for _ in 0..2 {
+        // SAFETY: as above.
+        assert!(unsafe { NotificationChannel::try_recv(chan) }.is_some(), "each fault was queued");
+    }
 }

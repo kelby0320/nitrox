@@ -36,8 +36,26 @@ const fn mark(index: usize) -> u64 {
 /// The registers the worker sets, by index: all an `asm!` may name but `rax`, the address.
 const MARKED: [usize; 12] = [2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
 
-/// The worker's entry: fault on a store with each register in [`MARKED`] at its [`mark`].
+/// Wait `ns` on a channel nothing signals, `sys_wait`'s deadline its only way out.
+fn nap(ns: u64) {
+    let (mut now, mut ours, mut theirs) = (0u64, 0u64, 0u64);
+    let mut result = [0u8; 24];
+    // SAFETY: each pointer is a valid writable out-parameter, and each handle this thread's own.
+    unsafe {
+        syscall2(SYS_CLOCK_READ, abi::CLOCK_MONOTONIC, (&raw mut now) as u64);
+        if syscall4(SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) != 0 {
+            return;
+        }
+        syscall4(SYS_WAIT, (&raw const ours) as u64, 1, result.as_mut_ptr() as u64, now.saturating_add(ns));
+        syscall1(SYS_HANDLE_CLOSE, ours);
+        syscall1(SYS_HANDLE_CLOSE, theirs);
+    }
+}
+
+/// The worker's entry: fault on a store with each register in [`MARKED`] at its [`mark`], once
+/// the main thread has had time to reach its wait, so the fault finds it waiting.
 extern "C" fn worker_fault() -> ! {
+    nap(10_000_000);
     // SAFETY: this is the whole point — `FAULT_ADDR` is an unmapped user address, so the store
     // traps; the kernel never lets it complete, and the registers it sets are only inputs.
     unsafe {

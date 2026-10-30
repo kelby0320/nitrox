@@ -248,17 +248,6 @@ pub(super) fn steal_one(g: &mut SchedState) -> Option<ObjectRef> {
     Some(g.ready[victim].remove(victim_pos))
 }
 
-/// `true` if no online CPU has a thread to run: every ready queue is empty, and every other CPU
-/// runs its idle thread. This CPU's current thread is the caller's to have taken. Caller holds
-/// `SCHED`.
-pub(super) fn nothing_to_run(g: &SchedState) -> bool {
-    let me = SchedState::this_cpu();
-    (0..MAX_CPUS).filter(|&c| g.cpu_online[c]).all(|c| {
-        g.ready[c].is_empty()
-            && (c == me || g.current[c].as_ref().is_none_or(|t| t.as_ptr() as usize == g.idle_addr[c]))
-    })
-}
-
 /// `true` if some other online CPU holds a thread this CPU (`me`) may run — the cheap
 /// precondition for the idle-tick steal. Caller holds `SCHED`.
 pub(super) fn steal_available(g: &SchedState, me: usize) -> bool {
