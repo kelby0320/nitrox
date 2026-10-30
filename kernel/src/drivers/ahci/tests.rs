@@ -65,9 +65,21 @@ fn identity_of(model: &[u8], serial: &[u8]) -> ([u8; MAX_DEVICE_NAME], usize) {
     put_field(&mut words, 27, 20, model);
     put_field(&mut words, 10, 10, serial);
     let mut out = [0u8; MAX_DEVICE_NAME];
-    // SAFETY: `words` is a full 256-word IDENTIFY result, which is the contract.
-    let n = unsafe { format_identity(words.as_ptr(), &mut out) };
+    let n = format_identity(&words, &mut out);
     (out, n)
+}
+
+/// **A sector count past LBA48 is refused**: read whole, a non-zero word 103 gave 2^55 sectors or
+/// more, and the boot log's size in MiB overflowed and stopped the boot.
+#[test]
+fn a_sector_count_past_lba48_is_refused() {
+    let (mut words, mut name) = ([0u16; 256], [0u8; MAX_DEVICE_NAME]);
+    words[100..=103].copy_from_slice(&[0xFFFF, 0xFFFF, 0xFFFF, 0]);
+    assert_eq!(identity(&words, &mut name).map(|i| i.0), Some((1 << 48) - 1), "the most LBA48 addresses");
+    words[103] = 0x0080;
+    assert_eq!(identity(&words, &mut name), None);
+    words[100..=103].fill(0);
+    assert_eq!(identity(&words, &mut name), None, "no sectors");
 }
 
 fn assert_identity(model: &[u8], serial: &[u8], want: &[u8]) {

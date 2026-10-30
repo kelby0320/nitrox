@@ -305,35 +305,27 @@ unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Opt
     }
     // SAFETY: the command retired, PxCI read clear, and the next one rewrites the table.
     let data = data.release(unsafe { Quiesced::assume() });
-    // IDENTIFY words 100..104 hold the 48-bit max-LBA sector count.
-    let words = data.virt() as *const u16;
-    // SAFETY: `data` holds the 512-byte IDENTIFY result; word 100..=103 in range.
-    let n = unsafe {
-        (words.add(100).read() as u64)
-            | (words.add(101).read() as u64) << 16
-            | (words.add(102).read() as u64) << 32
-            | (words.add(103).read() as u64) << 48
-    };
-    // The model and serial: words 10..=19 are the serial and 27..=46 the model, ASCII in
-    // **byte-swapped pairs** (the wire order of the old 16-bit register interface); a person about
-    // to lose a disk confirms it by this string.
-    // SAFETY: as above; words 10..=46 are inside the 512-byte result.
-    let len = unsafe { format_identity(words, name) };
-    // SAFETY: as above; word 83 is inside the 512-byte result.
-    let flush = flush_command(unsafe { words.add(83).read() });
-    if n == 0 { None } else { Some((n, len, flush)) }
+    // SAFETY: `data` is a page holding the 512-byte, 256-word IDENTIFY result, aligned for words.
+    identity(unsafe { &*(data.virt() as *const [u16; 256]) }, name)
 }
 
-/// Write `model (serial)` from an IDENTIFY result into `out`, returning its length.
-///
-/// # Safety
-/// `words` must address a complete 512-byte IDENTIFY result.
-unsafe fn format_identity(words: *const u16, out: &mut [u8; MAX_DEVICE_NAME]) -> usize {
+/// **What an IDENTIFY result says**: the LBA48 sector count from words 100..=103, the length of
+/// the identity it writes into `name`, and the flush the drive takes. `None` for no sectors, or
+/// more than LBA48 addresses, which overflowed the sizes taken from them.
+fn identity(words: &[u16; 256], name: &mut [u8; MAX_DEVICE_NAME]) -> Option<(u64, usize, u8)> {
+    let n = words[100..=103].iter().rev().fold(0u64, |n, &w| n << 16 | w as u64);
+    let len = format_identity(words, name);
+    (n != 0 && n < 1 << 48).then_some((n, len, flush_command(words[83])))
+}
+
+/// Write `model (serial)` from an IDENTIFY result into `out`, returning its length. Words 10..=19
+/// are the serial and 27..=46 the model, ASCII in **byte-swapped pairs** (the wire order of the
+/// old 16-bit register interface); a person about to lose a disk confirms it by this string.
+fn format_identity(words: &[u16; 256], out: &mut [u8; MAX_DEVICE_NAME]) -> usize {
     let field = |first: usize, words_len: usize, dst: &mut [u8]| -> usize {
         let mut n = 0;
         for i in 0..words_len {
-            // SAFETY: `first + i` is within the 256-word result, per the caller's contract.
-            let w = unsafe { words.add(first + i).read() };
+            let w = words[first + i];
             for b in [(w >> 8) as u8, w as u8] {
                 if n < dst.len() {
                     dst[n] = if b.is_ascii_graphic() || b == b' ' { b } else { b'?' };
