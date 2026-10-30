@@ -36,7 +36,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
-use crate::dpc::Dpc;
+use crate::dpc::{Dpc, OneAtATime};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec, Published};
@@ -122,6 +122,9 @@ const NO_OP_NS: u64 = 100_000_000;
 static XHCI: Published<Xhci> = Published::new();
 
 static XHCI_DPC: Dpc = Dpc::new(xhci_dpc, core::ptr::null_mut());
+
+/// The DPC's drain, on one CPU at a time: events must be acted on in the ring's order.
+static DRAIN: OneAtATime = OneAtATime::new();
 
 /// **The controller, once brought up**: for a storage submit to wake the hub thread through, with a
 /// rescan for it. `None` before then, when no USB disk exists to submit to.
@@ -643,14 +646,18 @@ extern "C" fn isr() {
     crate::dpc::enqueue(&XHCI_DPC);
 }
 
+/// The interrupt's DPC: [`drain_events`], on one CPU at a time.
+fn xhci_dpc(_ctx: *mut ()) {
+    if let Some(x) = XHCI.get() {
+        DRAIN.run(|| drain_events(x));
+    }
+}
+
 /// Drain the event ring a batch at a time, telling the controller where each drain stopped, and
 /// act on each event **with the ring's lock released**: completing an operation takes the
 /// scheduler's lock, which no leaf lock may be held across. No allocation, and no freeing: a DPC
 /// may do neither.
-fn xhci_dpc(_ctx: *mut ()) {
-    let Some(x) = XHCI.get() else {
-        return;
-    };
+fn drain_events(x: &Xhci) {
     const BATCH: usize = 16;
     loop {
         let mut batch = [Trb::default(); BATCH];

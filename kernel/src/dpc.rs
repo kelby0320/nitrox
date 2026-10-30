@@ -13,7 +13,7 @@
 //! The queue is global and every CPU drains it at its interrupt tails (the timer's and a device's),
 //! so a DPC runs on whichever CPU gets to it first. `queued` is cleared before the handler runs, so
 //! a DPC queued again while it runs can run on a second CPU at the same time: a handler must
-//! tolerate a concurrent instance of itself.
+//! tolerate a concurrent instance of itself, or run its body through [`OneAtATime`].
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -199,10 +199,94 @@ fn run_pending_in(queue: &IrqSpinLock<Queue>) {
     }
 }
 
+/// **A handler's body run on one CPU at a time**, for one whose work must stay in order. An
+/// instance that finds another running asks it to go round again, and returns: it never spins.
+pub struct OneAtATime {
+    running: AtomicBool,
+    again: AtomicBool,
+}
+
+impl OneAtATime {
+    /// Nothing running.
+    pub const fn new() -> Self {
+        OneAtATime { running: AtomicBool::new(false), again: AtomicBool::new(false) }
+    }
+
+    /// Run `body` here, round after round while others ask; or, with another instance running,
+    /// have it run once more and return.
+    pub fn run(&self, mut body: impl FnMut()) {
+        // `SeqCst` throughout: the asking store then the running check, and the release then the
+        // re-check, are a store-then-load on each side, and only one order of all four keeps
+        // both instances from missing the other.
+        self.again.store(true, Ordering::SeqCst);
+        while !self.running.swap(true, Ordering::SeqCst) {
+            while self.again.swap(false, Ordering::SeqCst) {
+                body();
+            }
+            self.running.store(false, Ordering::SeqCst);
+            if !self.again.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    }
+}
+
+impl Default for OneAtATime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::sync::atomic::AtomicU32;
+
+    /// **An instance that arrives while the body runs is served by a second round**, after the
+    /// first, never beside it: two CPUs running it at once acted on its batches out of order.
+    #[test]
+    fn an_instance_arriving_meanwhile_is_run_after_the_first_not_beside_it() {
+        use core::cell::{Cell, RefCell};
+        fn instance(s: &OneAtATime, depth: &Cell<u32>, rounds: &RefCell<Vec<u32>>, arrive: bool) {
+            s.run(|| {
+                depth.set(depth.get() + 1);
+                rounds.borrow_mut().push(depth.get());
+                if arrive && rounds.borrow().len() == 1 {
+                    instance(s, depth, rounds, false);
+                }
+                depth.set(depth.get() - 1);
+            });
+        }
+        let (s, depth, rounds) = (OneAtATime::new(), Cell::new(0), RefCell::new(Vec::new()));
+        instance(&s, &depth, &rounds, true);
+        assert_eq!(*rounds.borrow(), [1, 1], "a round each, one after the other");
+        instance(&s, &depth, &rounds, false);
+        assert_eq!(rounds.borrow().len(), 3, "and the next instance runs alone");
+    }
+
+    /// **Two CPUs, each running it after its work arrived**: no two rounds overlap, which Miri's
+    /// threads find without it, and a round after the last arrival takes all of it.
+    #[test]
+    fn every_instances_work_is_taken_by_a_round_after_it() {
+        use std::sync::atomic::AtomicUsize;
+        let s = OneAtATime::new();
+        let (posted, taken, inside) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicBool::new(false));
+        std::thread::scope(|t| {
+            for _ in 0..2 {
+                t.spawn(|| {
+                    for _ in 0..3 {
+                        posted.fetch_add(1, Ordering::Relaxed);
+                        s.run(|| {
+                            assert!(!inside.swap(true, Ordering::Relaxed), "two rounds at once");
+                            taken.store(posted.load(Ordering::Relaxed), Ordering::Relaxed);
+                            inside.store(false, Ordering::Relaxed);
+                        });
+                    }
+                });
+            }
+        });
+        assert_eq!(taken.load(Ordering::Relaxed), 6, "work arrived after the last round");
+    }
 
     fn fresh_queue() -> IrqSpinLock<Queue> {
         IrqSpinLock::new(LockRank::Leaf, ArrayVec::new())
