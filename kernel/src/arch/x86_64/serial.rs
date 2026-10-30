@@ -37,33 +37,27 @@ const IER_RX_AVAIL: u8 = 0x01;
 const MCR_NORMAL: u8 = 0x0B;
 const MCR_LOOPBACK: u8 = 0x10;
 
-/// A 16550 UART addressed by its base I/O port.
-///
-/// `Copy`, holding only the port number, so the emergency path can mint one for free.
+/// **COM1's 16550 UART**, which this driver owns. Made only here, so its port I/O reaches COM1
+/// alone; `Copy`, holding nothing, so the emergency path can mint one for free.
 #[derive(Clone, Copy)]
-pub struct SerialPort {
-    base: u16,
-}
+pub struct SerialPort(());
+
+const COM1: SerialPort = SerialPort(());
 
 impl SerialPort {
-    /// Bind a `SerialPort` to the UART at `base`. Touches no hardware.
-    pub const fn new(base: u16) -> Self {
-        SerialPort { base }
-    }
-
     /// Program the UART: 115200 baud, 8N1, FIFOs on, interrupts off.
     pub fn init(&self) {
         // SAFETY: every write targets a 16550 register at the COM1 base
         // port, which this driver exclusively owns. The values and their
         // ordering follow the standard 16550 programming sequence.
         unsafe {
-            regs::outb(self.base + REG_IER, 0x00); // interrupts off — polled
-            regs::outb(self.base + REG_LCR, 0x80); // DLAB on: expose divisor
-            regs::outb(self.base + REG_DATA, 0x01); // divisor low  = 1 (115200)
-            regs::outb(self.base + REG_IER, 0x00); // divisor high = 0
-            regs::outb(self.base + REG_LCR, 0x03); // DLAB off, 8 bits, no parity, 1 stop
-            regs::outb(self.base + REG_FCR, 0xC7); // FIFO on, cleared, 14-byte trigger
-            regs::outb(self.base + REG_MCR, 0x0B); // DTR, RTS, OUT2
+            regs::outb(COM1_BASE + REG_IER, 0x00); // interrupts off — polled
+            regs::outb(COM1_BASE + REG_LCR, 0x80); // DLAB on: expose divisor
+            regs::outb(COM1_BASE + REG_DATA, 0x01); // divisor low  = 1 (115200)
+            regs::outb(COM1_BASE + REG_IER, 0x00); // divisor high = 0
+            regs::outb(COM1_BASE + REG_LCR, 0x03); // DLAB off, 8 bits, no parity, 1 stop
+            regs::outb(COM1_BASE + REG_FCR, 0xC7); // FIFO on, cleared, 14-byte trigger
+            regs::outb(COM1_BASE + REG_MCR, 0x0B); // DTR, RTS, OUT2
         }
     }
 
@@ -78,42 +72,42 @@ impl SerialPort {
         // SAFETY: `REG_LSR` and `REG_DATA` are 16550 registers at the
         // COM1 base port, owned exclusively by this driver.
         unsafe {
-            while regs::inb(self.base + REG_LSR) & LSR_THR_EMPTY == 0 {
+            while regs::inb(COM1_BASE + REG_LSR) & LSR_THR_EMPTY == 0 {
                 spins += 1;
                 if spins >= POLL_CAP {
                     return;
                 }
                 core::hint::spin_loop();
             }
-            regs::outb(self.base + REG_DATA, byte);
+            regs::outb(COM1_BASE + REG_DATA, byte);
         }
     }
 
     /// `true` iff the UART has a received byte ready in `REG_DATA`.
     pub fn read_ready(&self) -> bool {
         // SAFETY: `REG_LSR` is a 16550 register at this driver's COM1 base port.
-        unsafe { regs::inb(self.base + REG_LSR) & LSR_DATA_READY != 0 }
+        unsafe { regs::inb(COM1_BASE + REG_LSR) & LSR_DATA_READY != 0 }
     }
 
     /// Read one received byte from `REG_DATA`. The caller must have observed
     /// [`read_ready`](Self::read_ready); reading clears the received-data interrupt condition.
     pub fn read_byte(&self) -> u8 {
         // SAFETY: `REG_DATA` is a 16550 register at this driver's COM1 base port.
-        unsafe { regs::inb(self.base + REG_DATA) }
+        unsafe { regs::inb(COM1_BASE + REG_DATA) }
     }
 
     /// Enable the received-data-available interrupt. `OUT2` is already set by
     /// [`init`](Self::init), so the IRQ line reaches the interrupt controller.
     pub fn enable_rx_interrupt(&self) {
         // SAFETY: `REG_IER` is a 16550 register at this driver's COM1 base port.
-        unsafe { regs::outb(self.base + REG_IER, IER_RX_AVAIL) };
+        unsafe { regs::outb(COM1_BASE + REG_IER, IER_RX_AVAIL) };
     }
 
     /// Set or clear internal loopback (`MCR` bit 4): TX feeds RX without touching the wire.
     pub fn set_loopback(&self, on: bool) {
         let mcr = if on { MCR_NORMAL | MCR_LOOPBACK } else { MCR_NORMAL };
         // SAFETY: `REG_MCR` is a 16550 register at this driver's COM1 base port.
-        unsafe { regs::outb(self.base + REG_MCR, mcr) };
+        unsafe { regs::outb(COM1_BASE + REG_MCR, mcr) };
     }
 }
 
@@ -137,7 +131,7 @@ impl fmt::Write for SerialPort {
 }
 
 /// The kernel's COM1 serial port behind a spin lock, driven by `kprint!` / `kprintln!`.
-pub static SERIAL: IrqSpinLock<SerialPort> = IrqSpinLock::new(LockRank::Serial, SerialPort::new(COM1_BASE));
+pub static SERIAL: IrqSpinLock<SerialPort> = IrqSpinLock::new(LockRank::Serial, COM1);
 
 /// Initialise the COM1 UART, before the first `kprintln!`.
 pub fn init() {
@@ -149,17 +143,17 @@ pub fn init() {
 /// It bypasses [`SERIAL`]'s lock so a handler can print even if the lock was held when the fault
 /// occurred.
 pub fn emergency_writer() -> SerialPort {
-    SerialPort::new(COM1_BASE)
+    COM1
 }
 
 /// `true` iff COM1 has a received byte ready.
 pub fn console_rx_ready() -> bool {
-    SerialPort::new(COM1_BASE).read_ready()
+    COM1.read_ready()
 }
 
 /// Read one received byte from COM1 (also clears the RX interrupt condition).
 pub fn console_rx_read() -> u8 {
-    SerialPort::new(COM1_BASE).read_byte()
+    COM1.read_byte()
 }
 
 /// Arm console receive interrupts: route the console UART's interrupt to `handler` and enable
@@ -176,7 +170,7 @@ pub unsafe fn console_arm_rx(handler: extern "C" fn()) -> Option<u8> {
     // valid for the kernel's lifetime). `install_isa_irq` is the x86 IOAPIC routing
     // primitive, kept inside the arch layer.
     let vector = unsafe { super::ioapic::install_isa_irq(COM1_IRQ, handler) }?;
-    SerialPort::new(COM1_BASE).enable_rx_interrupt();
+    COM1.enable_rx_interrupt();
     Some(vector)
 }
 
@@ -202,7 +196,7 @@ pub fn console_present() -> bool {
 /// **before** RX interrupts are armed so the polled read, not an ISR, consumes the byte.
 pub fn console_rx_loopback_selftest() -> bool {
     const TEST_BYTE: u8 = 0x5A;
-    let p = SerialPort::new(COM1_BASE);
+    let p = COM1;
     p.set_loopback(true);
     p.write_byte(TEST_BYTE);
     let mut spins: u32 = 0;
