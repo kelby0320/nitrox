@@ -1877,8 +1877,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   The bytes stay inside the device's own page, but the unsafe block's precondition is false and GET
   MAX LUN reads a stale byte. Unverified: path read only (hid.rs:498-503 and 512-518,
   hub.rs:380-385). No QEMU device is composite and slow enough to reach it. Lens: abi. Low. **Fix.**
-  Fixed in `53963f71`: `hid::bind` says whether the default endpoint is clear, and storage is not
-  bound on one in doubt. No control: no QEMU device is composite and slow enough.
+  Fixed in `53963f71` for HID, then for every class in `3a9baa69`: a default endpoint left in
+  doubt is refused every later control transfer; fails without it:
+  `a_default_endpoint_in_doubt_is_asked_nothing_more`.
 
 - [x] **drv-d14** `kernel/src/drivers/xhci/desc.rs:187` — `Endpoint::dci()` turns a device-supplied
   `bEndpointAddress` into a Device Context Index without rejecting endpoint number 0. Scenario: a USB
