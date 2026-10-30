@@ -2474,8 +2474,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `018a00a4`: `cmdline::record` copies the line, up to 1024 bytes, into the kernel's own
   memory; fails without it: `the_kept_line_is_a_copy_cut_at_its_bound`, whose shape run on the old
   `record`, given `c_bytes`'s unbounded lifetime, read the overwritten source. The framebuffer's
-  layout and the module paths were already copied. The stacks the processors started on and the
-  APs parked past `MAX_CPUS` still live in Limine's memory, which boot-flow.md now says.
+  layout and the module paths were already copied. Limine's page tables, the stacks the
+  processors started on and the APs parked past `MAX_CPUS` still live in its memory, which
+  boot-flow.md now says.
 - [x] **kplat-d7** `kernel/src/arch/x86_64/paging.rs:482` — The page-table walkers (`translate`,
   `attribute_index`, `walk_to_pt`) read PTEs with plain non-atomic loads, and `map_page`,
   `unmap_page` and `ensure_kernel_intermediate` write leaf and PML4 slots with plain stores,

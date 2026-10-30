@@ -37217,8 +37217,9 @@ decisions:
   are private behind safe accessors that walk to the count and cut strings at a bound.
 - **Nothing kept past boot points into Limine's memory**: the command line is copied, up to 1024
   bytes (kplat-d6), as the module paths and the framebuffer's layout already were. No `BootToken`
-  type: the borrows that remain end at boot. The stacks the processors started on and the APs
-  parked past `MAX_CPUS` are still Limine's, and reclaiming its memory must first move both.
+  type: the borrows that remain end at boot. Limine's page tables, whose upper half every address
+  space shares, the stacks the processors started on and the APs parked past `MAX_CPUS` are still
+  in its memory, and reclaiming it must first move all three.
 - **The IOAPIC's registers are reached only under a leaf lock**, a route's whole entry and a mask's
   read-modify-write in one hold (kplat-d17). Any CPU, or an ISR, may route, mask or unmask.
 - **An IOAPIC route refuses what its entry cannot hold**: a destination wider than eight bits, or a

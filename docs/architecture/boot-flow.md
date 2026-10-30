@@ -205,9 +205,10 @@ All but `BASE_REVISION` are a `limine::Request`, a plain `static`. Limine writes
 other load of a static the program never writes, atomic or not, folds to the null it started
 as. The response types' accessors walk Limine's arrays to their counts and cut its strings at a
 bound. What the kernel keeps past boot is copied out of Limine's memory: the command line (up
-to 1024 bytes, `cmdline::record`), the module paths and the framebuffer's layout. Two things
-still live there: the stack each processor started on, where its boot or idle thread still
-runs, and the APs past `MAX_CPUS`, parked on Limine's `goto_address`.
+to 1024 bytes, `cmdline::record`), the module paths and the framebuffer's layout. Three things
+still live there: the page tables Limine built, which the kernel still runs on and whose upper
+half every address space shares; the stack each processor started on, where its boot or idle
+thread still runs; and the APs past `MAX_CPUS`, parked on Limine's `goto_address`.
 
 `kernel_main` then brings the system up in this order — the ordering is load-bearing, and
 each step's rationale is in the source comments:
