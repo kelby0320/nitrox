@@ -136,7 +136,10 @@ enumerated; a disconnection disables the device's slot and frees its memory.
    mass storage `08/06/50`, a hub (listed, not supported), or nothing this kernel drives;
 6. **the classes bound, in one configuration** (Part D): each binding class's endpoints prepared,
    then one *Configure Endpoint* adding all of them and one `SET_CONFIGURATION` — a second would
-   reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own requests.
+   reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own requests. **The
+   endpoints' context indices are the device's word**, so a set naming the default endpoint's, or
+   one index twice, is refused with nothing written; and **a HID binding that leaves a request in
+   doubt on the default endpoint ends the device's storage binding too**, which would ask it more.
 
 **Every command and transfer has a one-second deadline.** A device that misses a transfer's is
 abandoned and its slot disabled. A command that goes unanswered leaves the command ring in doubt —

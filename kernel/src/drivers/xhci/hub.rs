@@ -365,7 +365,10 @@ fn bind(
     let interrupts = hid.as_ref().map_or(&[][..], |h| h.endpoints());
     let bulks = storage.as_ref().map(|s| s.endpoints());
     let bulks = bulks.as_ref().map_or(&[][..], |b| &b[..]);
-    context::configure_endpoints(input_bytes(&mut mem.input, x), x.layout, port, speed_id, interrupts, bulks);
+    if !context::configure_endpoints(input_bytes(&mut mem.input, x), x.layout, port, speed_id, interrupts, bulks) {
+        crate::kprintln!("usb: port {port}: its endpoints name the default endpoint's index, or one twice; not bound");
+        return;
+    }
     if let Err(e) = command(x, Trb::with_input(kind::CONFIGURE_ENDPOINT, mem.input.phys().as_u64(), slot)) {
         crate::kprintln!("usb: port {port}: Configure Endpoint failed: {e}; not bound");
         return;
@@ -374,8 +377,14 @@ fn bind(
         crate::kprintln!("usb: port {port}: SET_CONFIGURATION failed: {e}; not bound");
         return;
     }
-    if let Some(h) = hid {
-        super::hid::bind(x, port, slot, mem, h, record);
+    // **A request HID left in doubt on the default endpoint ends what asks it more**: storage's
+    // `GET MAX LUN` would go on the ring behind it and share its data page.
+    if let Some(h) = hid
+        && !super::hid::bind(x, port, slot, mem, h, record)
+        && storage.is_some()
+    {
+        crate::kprintln!("usb: port {port}: a request is in doubt on its default endpoint; its storage is not bound");
+        return;
     }
     if let Some(s) = storage {
         super::storage::bind(x, port, slot, mem, s, record, serial);
@@ -631,7 +640,8 @@ fn data_bytes(mem: &DeviceMem, len: u16) -> &[u8] {
 fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u16) -> Result<u16, Failed> {
     // SAFETY: `data` is a page the controller writes only during a transfer, and none is running on
     // this endpoint: every failure that can leave one live — a timeout, any error but a stall — ends
-    // the device, and a stall's remains are skipped by `recover_ep0` before another starts.
+    // the device, or what asks this endpoint after a HID binding, and a stall's remains are skipped
+    // by `recover_ep0` before another starts.
     unsafe { core::ptr::write_bytes(mem.data.virt(), 0, len as usize) };
     let base = mem.ep0.phys().as_u64();
     let po = new_operation()?;
