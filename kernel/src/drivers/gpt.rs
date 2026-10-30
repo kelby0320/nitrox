@@ -15,7 +15,7 @@
 //! validated; the header and array CRCs are not (`TODO(gpt-crc)`).
 
 use super::partitions::{self, PartKind, Scheme, Table, Unread};
-use crate::io::block::{Partition, partition_backend, read_blocking};
+use crate::io::block::{Partition, read_blocking};
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
@@ -116,7 +116,6 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names, boot_
     let Some(part) = Partition::new(disk, p.first_lba, p.count, SECTOR) else {
         return false;
     };
-    let backend = partition_backend(part);
     // SAFETY: `disk` pins a live `DeviceNode`; copy its bus identity.
     let dd = unsafe { &*(disk.as_ptr() as *const DeviceNode) }.descriptor();
     let descriptor = ResourceDescriptor {
@@ -163,7 +162,7 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names, boot_
             w.len()
         }
     };
-    let node = match DeviceNode::try_new_block(descriptor, geometry, BlockKind::Partition, &name[..name_len], backend) {
+    let node = match DeviceNode::try_new_partition(descriptor, geometry, &name[..name_len], part) {
         Ok(n) => n,
         Err(_) => return false,
     };

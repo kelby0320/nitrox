@@ -75,10 +75,7 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(8192), BlockKind::Disk, b"disk", backend).unwrap(),
     );
     let window = Partition::new(&disk, 2048, 100, 512).unwrap();
-    let wb = partition_backend(window);
-    let part = adopt(
-        DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(100), BlockKind::Partition, b"p", wb).unwrap(),
-    );
+    let part = adopt(DeviceNode::try_new_partition(ResourceDescriptor::ZERO, geometry(100), b"p", window).unwrap());
     // An IRP through the partition node's backend; returns its status after
     // any refusal's completion has run.
     let submit = |op: IrpOp, offset: u64| {
@@ -104,6 +101,23 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     assert_eq!(seen.0.borrow().len(), 1, "nothing more reached the disk");
     assert!(!window_busy(&part), "every submit counted out");
     assert!(!window_busy(&disk));
+}
+
+/// **A node is a window by what made it, not by its backend's function**: one whose `submit` was
+/// the partitions' was taken for a window, and retiring it wrote into whatever its context was.
+#[test]
+fn a_node_is_a_window_by_what_made_it_not_by_its_backends_function() {
+    use crate::libkern::block::BlockKind;
+    use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
+    init_global_heap();
+    let mut not_a_window = [0u64; 8];
+    let ctx = not_a_window.as_mut_ptr() as *mut ();
+    let backend = BlockBackend { submit: partition_submit, poll: partition_poll, ctx, max_frags: 8 };
+    let geometry = BlockGeometry { logical_block_size: 512, block_count: 100 };
+    let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Partition, b"p", backend);
+    let node = crate::drivers::adopt_node(node.unwrap());
+    assert!(!retire_window(&node), "no window made it");
+    assert_eq!(not_a_window, [0; 8], "nothing written through its context");
 }
 
 /// Page-cache frames go to the device as one IRP, in order; more than it takes

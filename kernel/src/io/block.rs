@@ -628,14 +628,7 @@ impl Partition {
 /// The partition window behind `node`, if `node` is one: a disk's node is not.
 fn window_of(node: &ObjectRef) -> Option<&'static Partition> {
     // SAFETY: `node` pins a live `DeviceNode`.
-    let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
-    let backend = dn.block_backend()?;
-    if backend.submit as *const () != partition_submit as *const () {
-        return None;
-    }
-    // SAFETY: a backend whose `submit` is `partition_submit` has a leaked `'static` `Partition` as
-    // its context (`partition_backend`).
-    Some(unsafe { &*(backend.ctx as *const Partition) })
+    unsafe { &*(node.as_ptr() as *const DeviceNode) }.window()
 }
 
 /// **Retire the partition window behind `node`**: every IRP is refused from
