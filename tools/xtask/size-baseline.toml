@@ -4,7 +4,6 @@
 [files]
 "kernel/src/arch/x86_64/acpi.rs" = 1040
 "kernel/src/drivers/xhci/hid.rs" = 1105
-"kernel/src/drivers/xhci/storage.rs" = 1701
 "kernel/src/main.rs" = 1186
 "kernel/src/object/file_object.rs" = 2459
 "kernel/src/pci/mod.rs" = 1045
