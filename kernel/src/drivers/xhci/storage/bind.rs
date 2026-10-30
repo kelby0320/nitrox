@@ -290,8 +290,7 @@ impl Binding<'_> {
         // Kept with the unit, for a rescan to depart the disk's partitions by, and its counters.
         if let Some(dev) = DISKS.devs[self.i].lock().as_mut() {
             dev.luns[lun as usize].record = Some(id);
-            // SAFETY: `node` was just registered, and the table holds it for the kernel's lifetime.
-            unsafe { dev.counted[lun as usize].attach(&node) };
+            dev.counted[lun as usize].attach(&node);
         }
         crate::kprintln!(
             "usb: port {port}: LUN {lun}: disk \"{}\", {} blocks of {} bytes, record {id}",

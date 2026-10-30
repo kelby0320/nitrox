@@ -482,8 +482,7 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: &'stati
             // SAFETY: adopt the creation reference into the device table.
             let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
             crate::device::register(r.clone(), "ahci");
-            // SAFETY: `r` was just registered, and the table holds it for the kernel's lifetime.
-            unsafe { disk.counted.attach(&r) };
+            disk.counted.attach(&r);
             true
         }
         Err(_) => false,

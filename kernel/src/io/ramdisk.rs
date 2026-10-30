@@ -358,8 +358,7 @@ pub fn publish_modules() {
         let node_ref =
             unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
         crate::device::register(node_ref.clone(), "ramdisk");
-        // SAFETY: `node_ref` was just registered, and the table holds it for the kernel's lifetime.
-        unsafe { rd.counted().attach(&node_ref) };
+        rd.counted().attach(&node_ref);
         crate::kprintln!("ramdisk: module {} ({}), {} bytes, as a block device", disk.index, path, disk.len);
     }
 }

@@ -360,8 +360,7 @@ fn the_io_records_are_every_disks_counters_and_no_partitions() {
     init_global_heap();
     let (mut r, disk, _) = booted();
     let counted = crate::io::stats::Counted::new();
-    // SAFETY: `disk` is held by `r` for the rest of the test, which is all this needs.
-    unsafe { counted.attach(&disk) };
+    counted.attach(&disk);
     counted.record(crate::io::irp::IrpOp::Read as u32, true, 4096, 100);
     counted.record(crate::io::irp::IrpOp::Write as u32, true, 512, 50);
     let recs = r.io_records().unwrap();
