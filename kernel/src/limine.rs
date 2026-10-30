@@ -107,13 +107,14 @@ impl<R, X> Request<R, X> {
     }
 }
 
-/// **The `count` entries of a Limine array of pointers**, those that are not null.
+/// **The `count` entries of a Limine array of pointers**, the non-null ones; none if it is null.
 ///
 /// # Safety
-/// `array` points to `count` pointers, each null or to a valid `T`, all as long-lived as `'a`.
+/// `array` is null or points to `count` pointers, each null or to a valid `T` living for `'a`.
 unsafe fn entries<'a, T: 'a>(array: *const *mut T, count: u64) -> impl Iterator<Item = &'a T> {
-    // SAFETY: `i < count`, and each pointer is null or valid, by the contract.
-    (0..count as usize).filter_map(move |i| unsafe { (*array.add(i)).as_ref() })
+    let count = if array.is_null() { 0 } else { count as usize };
+    // SAFETY: `i < count`, so `array` is not null; each pointer is null or valid, by the contract.
+    (0..count).filter_map(move |i| unsafe { (*array.add(i)).as_ref() })
 }
 
 /// A Limine string, cut at `max` bytes; empty where there is none.
@@ -560,7 +561,7 @@ mod tests {
         assert_eq!(req.response().map(|r| r.offset), Some(0xffff_8000_0000_0000));
     }
 
-    /// **A Limine array is walked to its count**, its null entries passed over.
+    /// **A Limine array is walked to its count**, past its null entries; a null array is empty.
     #[test]
     fn an_array_is_walked_to_its_count_past_its_nulls() {
         let (mut a, mut b) =
@@ -569,5 +570,8 @@ mod tests {
         // SAFETY: the first three pointers, null or to entries that outlive the map.
         let map = unsafe { MemoryMapResponse::fabricated(3, ptrs.as_mut_ptr()) };
         assert_eq!(map.entries().map(|e| e.base).collect::<std::vec::Vec<_>>(), [1, 3]);
+        // SAFETY: a null array, which no entry is read through.
+        let none = unsafe { MemoryMapResponse::fabricated(1, ptr::null_mut()) };
+        assert_eq!(none.entries().count(), 0);
     }
 }
