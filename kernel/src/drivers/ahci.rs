@@ -460,7 +460,8 @@ fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
     read32(disk.port_base, PX_TFD) & (TFD_ERR | TFD_BSY | TFD_DRQ) == 0
 }
 
-fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: &'static AhciDisk) -> bool {
+/// **The disk's block node**, its backend pointing at `disk`, published before the node is.
+fn disk_node(controller: &ObjectRef, sectors: u64, name: &[u8], disk: &AhciDisk) -> Option<KBox<DeviceNode>> {
     // SAFETY: `controller` pins a live `DeviceNode`.
     let cdesc = unsafe { &*(controller.as_ptr() as *const DeviceNode) }.descriptor();
     let backend = BlockBackend {
@@ -488,16 +489,7 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: &'stati
         func: cdesc.func,
         _pad: [0; 3],
     };
-    match DeviceNode::try_new_block(descriptor, geometry, BlockKind::Disk, name, backend) {
-        Ok(node) => {
-            // SAFETY: adopt the creation reference into the device table.
-            let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
-            crate::device::register(r.clone(), "ahci");
-            disk.counted.attach(&r);
-            true
-        }
-        Err(_) => false,
-    }
+    DeviceNode::try_new_block(descriptor, geometry, BlockKind::Disk, name, backend).ok()
 }
 
 /// [`BlockBackend::submit`] for an AHCI disk: builds a `READ DMA EXT` (or write or flush) against
