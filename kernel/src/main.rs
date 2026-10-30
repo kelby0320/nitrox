@@ -21,7 +21,7 @@ use nitrox_kernel::arch::timer::ArchTimer;
 use nitrox_kernel::fbcon;
 use nitrox_kernel::framebuffer;
 use nitrox_kernel::kprintln;
-use nitrox_kernel::libkern::printable::{Printable, c_bytes};
+use nitrox_kernel::libkern::printable::Printable;
 use nitrox_kernel::limine::{
     BaseRevision, BootloaderInfoRequest, DateAtBootRequest, ExecutableCmdlineRequest, FirmwareTypeRequest, Framebuffer,
     FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker, SmpInfo,
@@ -49,44 +49,42 @@ static BASE_REVISION: BaseRevision = BaseRevision::new(BASE_REVISION_WANTED);
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
-
-// `static mut`: Limine writes `response` after load, and a plain `static` could be constant-folded
-// to its null initialiser, silently breaking `init_memory`. `BASE_REVISION` reads volatile.
-#[used]
-#[unsafe(link_section = ".limine_requests")]
-static mut MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+static MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 // The initramfs module (`boot/initramfs`, `MEMMAP_KERNEL_AND_MODULES`, mapped in the HHDM).
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
 // SMP: Limine starts and parks the APs; the kernel launches each by writing its `goto_address`.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut SMP_REQUEST: SmpRequest = SmpRequest::new();
+static SMP_REQUEST: SmpRequest = SmpRequest::new();
 
 // Handoff facts a boot reports and nothing else reads: bootloader, firmware, date, command line.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut BOOTLOADER_INFO_REQUEST: BootloaderInfoRequest = BootloaderInfoRequest::new();
+static BOOTLOADER_INFO_REQUEST: BootloaderInfoRequest = BootloaderInfoRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
+static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut DATE_AT_BOOT_REQUEST: DateAtBootRequest = DateAtBootRequest::new();
+static DATE_AT_BOOT_REQUEST: DateAtBootRequest = DateAtBootRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+static CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
@@ -392,16 +390,10 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
 /// 0; APs 1, 2, ..., capped at `MAX_CPUS`), then wait until all are online. No-op if Limine reports
 /// no SMP support. The BSP must already have the scheduler, IDT, APIC and timer up.
 fn bring_up_aps() {
-    // SAFETY: `static mut` Limine request; Limine wrote `response` before `_start`,
-    // and we read it single-threaded here (no AP is running yet).
-    let resp = unsafe { SMP_REQUEST.response };
-    if resp.is_null() {
+    let Some(resp) = SMP_REQUEST.response() else {
         kprintln!("smp: no Limine SMP response — staying single-CPU");
         return;
-    }
-    // SAFETY: non-null Limine response, valid for 'static.
-    let resp = unsafe { &*resp };
-    let total = resp.cpu_count;
+    };
     let bsp = resp.bsp_lapic_id;
     let cap = arch::MAX_CPUS as u32;
 
@@ -410,11 +402,7 @@ fn bring_up_aps() {
     arch::bind_cpu_identity(0, bsp);
 
     let mut next_idx: u32 = 1; // 0 is the BSP.
-    for i in 0..total {
-        // SAFETY: `cpus` points at `cpu_count` valid `*mut SmpInfo`.
-        let info_ptr: *mut SmpInfo = unsafe { *resp.cpus.add(i as usize) };
-        // SAFETY: a valid Limine `SmpInfo` for the lifetime of the kernel.
-        let info = unsafe { &*info_ptr };
+    for info in resp.cpus() {
         if info.lapic_id == bsp {
             continue; // the boot processor is already running.
         }
@@ -481,25 +469,12 @@ const BUILD_COMMIT: &str = match option_env!("NITROX_COMMIT") {
 /// Reads only Limine's responses, so it runs before the allocators; an absent response is said, not
 /// skipped. Returns the command line's bytes (empty if none), for [`parse_cmdline`].
 fn log_handoff() -> &'static [u8] {
-    // SAFETY: for every request read below, the statics are written by Limine before `_start` and
-    // only read afterwards; reading through a raw-pointer copy stops the optimiser folding the
-    // pre-Limine null. A non-null response is a valid response of its type, and its strings
-    // live in bootloader-reclaimable memory, which this kernel never reclaims.
-    let info = unsafe { (&raw const BOOTLOADER_INFO_REQUEST).read().response };
-    let (name, version) = if info.is_null() {
-        (&b"unidentified bootloader"[..], &b""[..])
-    } else {
-        // SAFETY: as above; both strings are NUL-terminated.
-        unsafe { (c_bytes((*info).name, 64), c_bytes((*info).version, 64)) }
+    let (name, version) = match BOOTLOADER_INFO_REQUEST.response() {
+        Some(info) => (info.name(), info.version()),
+        None => (&b"unidentified bootloader"[..], &b""[..]),
     };
-    // SAFETY: as above.
-    let firmware = unsafe { (&raw const FIRMWARE_TYPE_REQUEST).read().response };
-    let firmware = if firmware.is_null() {
-        "unreported firmware"
-    } else {
-        // SAFETY: as above.
-        nitrox_kernel::handoff::firmware_name(unsafe { (*firmware).firmware_type })
-    };
+    let firmware = FIRMWARE_TYPE_REQUEST.response().map(|f| nitrox_kernel::handoff::firmware_name(f.firmware_type));
+    let firmware = firmware.unwrap_or("unreported firmware");
     match BASE_REVISION.loaded() {
         Some(rev) => {
             kprintln!("boot: {} {} on {}, base revision {}", Printable(name), Printable(version), firmware, rev)
@@ -513,26 +488,9 @@ fn log_handoff() -> &'static [u8] {
         ),
     }
 
-    // SAFETY: as above.
-    let hhdm = unsafe { (&raw const HHDM_REQUEST).read().response };
-    let hhdm = if hhdm.is_null() {
-        0
-    } else {
-        // SAFETY: as above — a non-null response Limine wrote.
-        unsafe { (*hhdm).offset }
-    };
-    // SAFETY: as above.
-    let date = unsafe { (&raw const DATE_AT_BOOT_REQUEST).read().response };
-    // SAFETY: as above.
-    let date = (!date.is_null()).then(|| unsafe { (*date).timestamp });
-    // SAFETY: as above.
-    let cmdline = unsafe { (&raw const CMDLINE_REQUEST).read().response };
-    let cmdline = if cmdline.is_null() {
-        None
-    } else {
-        // SAFETY: as above; the command line is NUL-terminated.
-        Some(unsafe { c_bytes((*cmdline).cmdline, CMDLINE_MAX) })
-    };
+    let hhdm = HHDM_REQUEST.response().map_or(0, |h| h.offset);
+    let date = DATE_AT_BOOT_REQUEST.response().map(|d| d.timestamp);
+    let cmdline = CMDLINE_REQUEST.response().map(|c| c.line(nitrox_kernel::cmdline::MAX));
     match (date, cmdline) {
         (Some(d), Some(c)) => {
             kprintln!("boot: HHDM {:#x}, date {}, cmdline \"{}\"", hhdm, d, CmdlineShown(c))
@@ -544,30 +502,21 @@ fn log_handoff() -> &'static [u8] {
         (None, None) => kprintln!("boot: HHDM {:#x}, date unreported, cmdline unreported", hhdm),
     }
 
-    // SAFETY: as above.
-    let memmap = unsafe { (&raw const MEMMAP_REQUEST).read().response };
-    if memmap.is_null() {
+    let Some(memmap) = MEMMAP_REQUEST.response() else {
         kprintln!("memmap: no Limine memory map");
         return cmdline.unwrap_or(&[]);
-    }
-    // SAFETY: as above.
-    let memmap = unsafe { &*memmap };
+    };
     let mut tally = nitrox_kernel::handoff::MemoryTally::default();
-    for i in 0..memmap.entry_count as usize {
-        // SAFETY: `entries` is an array of `entry_count` pointers to valid entries.
-        let e = unsafe { &**memmap.entries.add(i) };
+    for e in memmap.entries() {
         tally.add(e.kind, e.length);
     }
     kprintln!("memmap: {}", tally);
     cmdline.unwrap_or(&[])
 }
 
-/// The longest command line read. Limine sets no limit; a boot-menu entry is a line of text.
-const CMDLINE_MAX: usize = 1024;
-
 /// Parse the boot entry's command line, logging what it asks for and each word it ignores. A
 /// command line never stops a boot (see `nitrox_kernel::cmdline`).
-fn parse_cmdline(line: &'static [u8]) -> nitrox_kernel::cmdline::Flags {
+fn parse_cmdline(line: &[u8]) -> nitrox_kernel::cmdline::Flags {
     use nitrox_kernel::cmdline::{self, Ignored};
     let flags = cmdline::parse(line, |ignored| match ignored {
         // Not "ignored": passed on. The kernel serves the whole line at `/proc/cmdline`, so a word
@@ -604,25 +553,8 @@ impl core::fmt::Display for CmdlineShown<'_> {
 
 /// Limine's framebuffer descriptor, or why there is none.
 fn limine_framebuffer() -> Result<&'static Framebuffer, &'static str> {
-    // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before jumping to
-    // `_start`; the kernel only ever reads it.
-    let response = unsafe { (&raw const FRAMEBUFFER_REQUEST).read().response };
-    if response.is_null() {
-        return Err("no Limine framebuffer response");
-    }
-    // SAFETY: a non-null response pointer guarantees a valid `FramebufferResponse`.
-    let response = unsafe { &*response };
-    if response.framebuffer_count == 0 || response.framebuffers.is_null() {
-        return Err("Limine reported no framebuffer");
-    }
-    // SAFETY: the array is dense; slot 0 is present when `framebuffer_count > 0`.
-    let fb_ptr = unsafe { *response.framebuffers };
-    if fb_ptr.is_null() {
-        return Err("Limine reported no framebuffer");
-    }
-    // SAFETY: Limine's descriptors stay valid until bootloader-reclaimable memory is
-    // reclaimed, which this kernel never does.
-    Ok(unsafe { &*fb_ptr })
+    let response = FRAMEBUFFER_REQUEST.response().ok_or("no Limine framebuffer response")?;
+    response.first().ok_or("Limine reported no framebuffer")
 }
 
 /// Whether this CPU has a cache-attribute table, recorded by `paging_init` for
@@ -1020,39 +952,20 @@ fn run_first_userspace() {
 
 /// Record the first Limine module as the `/initramfs` blob; non-fatal if none was configured.
 fn init_initramfs() {
-    // SAFETY: `MODULE_REQUEST` lives in `.limine_requests`; Limine wrote its
-    // `response` before `_start`. Read through a raw-pointer copy.
-    let resp = unsafe { (&raw const MODULE_REQUEST).read().response };
-    if resp.is_null() {
+    let mut modules = MODULE_REQUEST.response().into_iter().flat_map(|r| r.modules());
+    let Some(file) = modules.next() else {
         kprintln!("initramfs: no module loaded");
         return;
-    }
-    // SAFETY: a non-null response is a valid Limine `ModuleResponse`.
-    let resp = unsafe { &*resp };
-    if resp.module_count == 0 || resp.modules.is_null() {
-        kprintln!("initramfs: no module loaded");
-        return;
-    }
+    };
     // Every module after the first is a disk (the live image's root), recorded while the responses
     // are fresh and published by `drivers::probe` once the device and interrupt tables exist.
-    for index in 1..resp.module_count as usize {
-        // SAFETY: `modules` points at `module_count` non-null `*mut LimineFile`s, in
-        // never-reclaimed memory.
-        let file = unsafe { &**resp.modules.add(index) };
-        // SAFETY: Limine's `path` is a NUL-terminated string in bootloader memory the kernel never
-        // reclaims.
-        let path = unsafe { core::ffi::CStr::from_ptr(file.path as *const core::ffi::c_char) };
+    for (index, disk) in (1..).zip(modules) {
         // SAFETY: the module's `address..address + size` is HHDM-mapped, never reclaimed, and
         // nothing else uses it — this kernel reads modules through nothing but these two paths.
-        if !unsafe {
-            nitrox_kernel::io::ramdisk::record_module(index, file.address, file.size as usize, path.to_bytes())
-        } {
+        if !unsafe { nitrox_kernel::io::ramdisk::record_module(index, disk.address, disk.size as usize, disk.path()) } {
             kprintln!("initramfs: module {} ignored — more modules than disks the kernel keeps", index);
         }
     }
-    // SAFETY: `modules` points at an array of `module_count` `*mut LimineFile`;
-    // the first is the initramfs.
-    let file = unsafe { &**resp.modules };
     // The disk the machine started from: the first module came off it, and its GPT GUID is what the
     // partition pass compares every disk's with.
     nitrox_kernel::drivers::partitions::set_boot_disk(file.gpt_disk_uuid);
@@ -1078,31 +991,11 @@ fn init_initramfs() {
 /// Bring up the buddy allocator and the slab on top of it. Returns false
 /// if Limine didn't populate either of the requests we depend on.
 fn init_memory() -> bool {
-    // SAFETY: `MEMMAP_REQUEST` and `HHDM_REQUEST` live in
-    // `.limine_requests*`. Limine writes the response pointer into each
-    // before jumping to `_start`. Reading through a raw-pointer copy
-    // avoids the optimiser caching the pre-Limine null.
-    let memmap_resp = unsafe { (&raw const MEMMAP_REQUEST).read().response };
-    if memmap_resp.is_null() {
+    let (Some(memmap), Some(hhdm)) = (MEMMAP_REQUEST.response(), HHDM_REQUEST.response()) else {
         return false;
-    }
-    // SAFETY: as above.
-    let hhdm_resp = unsafe { (&raw const HHDM_REQUEST).read().response };
-    if hhdm_resp.is_null() {
-        return false;
-    }
-    // SAFETY: Each non-null response pointer guarantees Limine populated
-    // a valid response of the corresponding type. The responses live in
-    // bootloader-reclaimable memory which we have not yet reclaimed.
-    let memmap = unsafe { &*memmap_resp };
-    // SAFETY: as above.
-    let hhdm_offset = unsafe { (*hhdm_resp).offset };
-    // SAFETY: `memmap` is a live Limine response and `hhdm_offset` is
-    // the bootloader's HHDM base — together they satisfy the contract
-    // of `BuddyAllocator::new` (see `kernel/src/mm/buddy.rs`).
-    unsafe {
-        mm::heap::init_buddy(memmap, hhdm_offset);
-    }
+    };
+    // SAFETY: Limine's memory map and its HHDM base satisfy `BuddyAllocator::new`'s contract.
+    unsafe { mm::heap::init_buddy(memmap, hhdm.offset) };
     mm::slab::slab_init();
     true
 }

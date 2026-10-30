@@ -26,7 +26,8 @@ pub fn init_global_heap() {
             vec![MemoryMapEntry { base: aligned as u64, length: HEAP_BYTES as u64, kind: MEMMAP_USABLE }].leak();
         let entry_ptrs: &'static mut [*mut MemoryMapEntry] = vec![entries.as_mut_ptr()].leak();
         let response: &'static MemoryMapResponse =
-            Box::leak(Box::new(MemoryMapResponse { revision: 0, entry_count: 1, entries: entry_ptrs.as_mut_ptr() }));
+            // SAFETY: one entry, leaked as its map is.
+            Box::leak(Box::new(unsafe { MemoryMapResponse::fabricated(1, entry_ptrs.as_mut_ptr()) }));
 
         // SAFETY: `response` describes one usable region that is a live,
         // leaked, page-aligned host allocation; an HHDM offset of 0 is

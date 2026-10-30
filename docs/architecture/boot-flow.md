@@ -200,8 +200,14 @@ into `.limine_requests*` by `kernel/linker.ld` (the ACPI RSDP request is the arc
   — facts the boot reports (step 3) and nothing else reads.
 - `REQUESTS_START` / `REQUESTS_END` — mandatory under base revision 6.
 
-All but `BASE_REVISION` are `static mut`: Limine writes their `response` field after the
-binary is loaded, and a plain `static` would let rustc constant-fold the read.
+All but `BASE_REVISION` are a `limine::Request`, a plain `static`. Limine writes the
+`response` field after the binary is loaded, so `Request::response` reads it volatile: any
+other load of a static the program never writes, atomic or not, folds to the null it started
+as. The response types' accessors walk Limine's arrays to their counts and cut its strings at a
+bound. What the kernel keeps past boot is copied out of Limine's memory: the command line (up
+to 1024 bytes, `cmdline::record`), the module paths and the framebuffer's layout. Two things
+still live there: the stack each processor started on, where its boot or idle thread still
+runs, and the APs past `MAX_CPUS`, parked on Limine's `goto_address`.
 
 `kernel_main` then brings the system up in this order — the ordering is load-bearing, and
 each step's rationale is in the source comments:

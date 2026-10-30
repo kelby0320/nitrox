@@ -160,7 +160,7 @@ fn proc_cmdline(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
     }
-    match MemoryObject::try_new_filled(crate::cmdline::line()) {
+    match MemoryObject::try_new_filled(crate::cmdline::line().as_bytes()) {
         Ok(obj) => complete_with_memobj(obj),
         Err(_) => OpStatus::Rejected(KError::OutOfMemory),
     }

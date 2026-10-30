@@ -36,19 +36,39 @@ pub enum Ignored<'a> {
     BadSwitch(&'a [u8]),
 }
 
+/// The longest command line kept. Limine sets no limit; a boot-menu entry is a line of text.
+pub const MAX: usize = 1024;
+
+/// A command line of at most [`MAX`] bytes, held in the kernel's own memory.
+#[derive(Copy, Clone)]
+pub struct Line {
+    bytes: [u8; MAX],
+    len: usize,
+}
+
+impl Line {
+    /// Its bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 /// The command line this boot was given, for `/proc/cmdline` to serve whole: the kernel reads only
 /// the words it acts on ([`Flags`]) and each other reader looks for its own. No program looks for
-/// one today.
-static LINE: crate::libkern::SpinLock<&'static [u8]> =
-    crate::libkern::SpinLock::new(crate::libkern::lockrank::LockRank::Leaf, &[]);
+/// one today. A copy, since the bootloader's is in memory the kernel may one day reclaim.
+static LINE: crate::libkern::SpinLock<Line> =
+    crate::libkern::SpinLock::new(crate::libkern::lockrank::LockRank::Leaf, Line { bytes: [0; MAX], len: 0 });
 
-/// Remember the line this boot was given. Called once, at boot, before userspace.
-pub fn record(line: &'static [u8]) {
-    *LINE.lock() = line;
+/// Keep a copy of the line this boot was given, cut at [`MAX`] bytes; called once, at boot.
+pub fn record(line: &[u8]) {
+    let len = line.len().min(MAX);
+    let mut kept = LINE.lock();
+    kept.bytes[..len].copy_from_slice(&line[..len]);
+    kept.len = len;
 }
 
 /// The line this boot was given, empty if there was none.
-pub fn line() -> &'static [u8] {
+pub fn line() -> Line {
     *LINE.lock()
 }
 
@@ -159,5 +179,20 @@ mod tests {
         let (flags, ignored) = parsed(b"hwreports hwreport_x");
         assert_eq!(flags.hwreport, None);
         assert_eq!(ignored.len(), 2);
+    }
+
+    /// **The kept line is a copy**, cut at its bound.
+    #[test]
+    fn the_kept_line_is_a_copy_cut_at_its_bound() {
+        let mut given = std::vec![b'a'; MAX + 1];
+        record(&given[..3]);
+        given[..3].copy_from_slice(b"xyz");
+        assert_eq!(line().as_bytes(), b"aaa");
+
+        record(&given[..MAX]);
+        assert_eq!(line().as_bytes().len(), MAX);
+        record(&given);
+        assert_eq!(line().as_bytes().len(), MAX);
+        assert_eq!(line().as_bytes()[..3], *b"xyz");
     }
 }

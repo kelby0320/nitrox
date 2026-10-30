@@ -28,7 +28,7 @@ use crate::mm::{PhysAddr, heap};
 // every object, so the bootloader finds a request declared in a submodule.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static mut RSDP_REQUEST: crate::limine::RsdpRequest = crate::limine::RsdpRequest::new();
+static RSDP_REQUEST: crate::limine::RsdpRequest = crate::limine::RsdpRequest::new();
 
 // --- Caps on the fixed static caches (no dynamic allocation) ---
 const MAX_ECAM: usize = 8;
@@ -490,15 +490,11 @@ pub struct X86Platform;
 impl ArchPlatform for X86Platform {
     unsafe fn init() -> Result<(), AllocError> {
         // 1. Obtain the RSDP address from Limine.
-        // SAFETY: the request static is written once by Limine before `_start`;
-        // single-threaded boot read.
-        let resp = unsafe { (&raw const RSDP_REQUEST).read().response };
-        if resp.is_null() {
+        let Some(resp) = RSDP_REQUEST.response() else {
             crate::kprintln!("acpi: bootloader provided no RSDP — skipping table parse");
             return Ok(());
-        }
-        // SAFETY: non-null response written by Limine.
-        let address = unsafe { (*resp).address };
+        };
+        let address = resp.address;
 
         // Translate to a kernel-virtual pointer via the HHDM; Limine returns a physical address,
         // but an already-virtual one (far above a physical RSDP) is tolerated.

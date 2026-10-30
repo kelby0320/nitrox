@@ -19,7 +19,7 @@
 #![allow(clippy::new_without_default, reason = "each request is built once, as a static, with its protocol ID")]
 
 use core::ptr;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicPtr, AtomicU64};
 
 /// First two ID `u64`s shared by every Limine request.
 pub const COMMON_MAGIC_0: u64 = 0xc7b1dd30df4c8b88;
@@ -79,6 +79,52 @@ impl RequestsEndMarker {
     }
 }
 
+/// **A Limine request**, carrying `X` after the response Limine writes before `_start`.
+#[repr(C)]
+pub struct Request<R, X = ()> {
+    id: [u64; 4],
+    revision: u64,
+    response: AtomicPtr<R>,
+    extra: X,
+}
+
+impl<R, X> Request<R, X> {
+    const fn with(id_2: u64, id_3: u64, extra: X) -> Self {
+        Request {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, id_2, id_3],
+            revision: 0,
+            response: AtomicPtr::new(ptr::null_mut()),
+            extra,
+        }
+    }
+
+    /// **The response Limine wrote**, if any: read volatile, so nothing folds it to its first null.
+    pub fn response(&self) -> Option<&R> {
+        // SAFETY: this request's own pointer field, aligned, which nothing in the program writes.
+        let p = unsafe { ptr::read_volatile(self.response.as_ptr()) };
+        // SAFETY: Limine writes null or a valid `R` before `_start`, in memory never reclaimed.
+        unsafe { p.as_ref() }
+    }
+}
+
+/// **The `count` entries of a Limine array of pointers**, those that are not null.
+///
+/// # Safety
+/// `array` points to `count` pointers, each null or to a valid `T`, all as long-lived as `'a`.
+unsafe fn entries<'a, T: 'a>(array: *const *mut T, count: u64) -> impl Iterator<Item = &'a T> {
+    // SAFETY: `i < count`, and each pointer is null or valid, by the contract.
+    (0..count as usize).filter_map(move |i| unsafe { (*array.add(i)).as_ref() })
+}
+
+/// A Limine string, cut at `max` bytes; empty where there is none.
+///
+/// # Safety
+/// `p` is null or a NUL-terminated string as long-lived as `'a`.
+unsafe fn string<'a>(p: *const u8, max: usize) -> &'a [u8] {
+    // SAFETY: by the contract; `c_bytes` stops at `max`.
+    unsafe { crate::libkern::printable::c_bytes(p, max) }
+}
+
 // --- Framebuffer request -------------------------------------------------
 
 const FB_ID_2: u64 = 0x9d5827dcd881dd75;
@@ -88,30 +134,27 @@ const FB_ID_3: u64 = 0xa3148604f6fab11b;
 /// Limine emits today). Other values are reserved for future use.
 pub const FB_MODEL_RGB: u8 = 1;
 
-#[repr(C)]
-pub struct FramebufferRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut FramebufferResponse,
-}
-
-// SAFETY: The request lives in a `static`, accessed only after Limine has
-// finished writing it before jumping to the kernel. The raw pointer is read
-// by a single-threaded boot context.
-unsafe impl Sync for FramebufferRequest {}
+pub type FramebufferRequest = Request<FramebufferResponse>;
 
 impl FramebufferRequest {
     pub const fn new() -> Self {
-        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, FB_ID_2, FB_ID_3], revision: 0, response: ptr::null_mut() }
+        Request::with(FB_ID_2, FB_ID_3, ())
     }
 }
 
 #[repr(C)]
 pub struct FramebufferResponse {
-    pub revision: u64,
-    pub framebuffer_count: u64,
-    /// Pointer to an array of `framebuffer_count` `*mut Framebuffer`.
-    pub framebuffers: *mut *mut Framebuffer,
+    revision: u64,
+    framebuffer_count: u64,
+    framebuffers: *mut *mut Framebuffer,
+}
+
+impl FramebufferResponse {
+    /// The first framebuffer, the one the kernel draws on, if Limine reported any.
+    pub fn first(&self) -> Option<&Framebuffer> {
+        // SAFETY: Limine's array of `framebuffer_count` framebuffers.
+        unsafe { entries(self.framebuffers, self.framebuffer_count) }.next()
+    }
 }
 
 /// Per-framebuffer descriptor. Layout matches `struct limine_framebuffer`
@@ -166,30 +209,36 @@ pub const MEMMAP_FRAMEBUFFER: u64 = 7;
 /// Reserved, but mapped in the HHDM anyway (`LIMINE_MEMMAP_RESERVED_MAPPED`).
 pub const MEMMAP_RESERVED_MAPPED: u64 = 8;
 
-#[repr(C)]
-pub struct MemoryMapRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut MemoryMapResponse,
-}
-
-// SAFETY: identical reasoning to `FramebufferRequest` — the request lives
-// in a `static`, is written exactly once by Limine before `_start`, and is
-// thereafter read by single-threaded boot code.
-unsafe impl Sync for MemoryMapRequest {}
+pub type MemoryMapRequest = Request<MemoryMapResponse>;
 
 impl MemoryMapRequest {
     pub const fn new() -> Self {
-        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, MEMMAP_ID_2, MEMMAP_ID_3], revision: 0, response: ptr::null_mut() }
+        Request::with(MEMMAP_ID_2, MEMMAP_ID_3, ())
     }
 }
 
 #[repr(C)]
 pub struct MemoryMapResponse {
-    pub revision: u64,
-    pub entry_count: u64,
-    /// Pointer to an array of `entry_count` `*mut MemoryMapEntry`.
-    pub entries: *mut *mut MemoryMapEntry,
+    revision: u64,
+    entry_count: u64,
+    entries: *mut *mut MemoryMapEntry,
+}
+
+impl MemoryMapResponse {
+    /// Its entries, in Limine's order.
+    pub fn entries(&self) -> impl Iterator<Item = &MemoryMapEntry> {
+        // SAFETY: Limine's array of `entry_count` entries.
+        unsafe { entries(self.entries, self.entry_count) }
+    }
+
+    /// A memory map over `count` entries at `entries`, for a host test.
+    ///
+    /// # Safety
+    /// As Limine's: `entries` points to `count` pointers to entries that outlive the map.
+    #[cfg(test)]
+    pub unsafe fn fabricated(count: u64, entries: *mut *mut MemoryMapEntry) -> Self {
+        MemoryMapResponse { revision: 0, entry_count: count, entries }
+    }
 }
 
 #[repr(C)]
@@ -210,20 +259,11 @@ pub struct MemoryMapEntry {
 const HHDM_ID_2: u64 = 0x48dcf1cb8ad2b852;
 const HHDM_ID_3: u64 = 0x63984e959a98244b;
 
-#[repr(C)]
-pub struct HhdmRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut HhdmResponse,
-}
-
-// SAFETY: same single-writer, static-lifetime reasoning as the other
-// requests in this file.
-unsafe impl Sync for HhdmRequest {}
+pub type HhdmRequest = Request<HhdmResponse>;
 
 impl HhdmRequest {
     pub const fn new() -> Self {
-        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, HHDM_ID_2, HHDM_ID_3], revision: 0, response: ptr::null_mut() }
+        Request::with(HHDM_ID_2, HHDM_ID_3, ())
     }
 }
 
@@ -243,29 +283,27 @@ pub struct HhdmResponse {
 const MODULE_ID_2: u64 = 0x3e7e279702be32af;
 const MODULE_ID_3: u64 = 0xca1c4f3bd1280cee;
 
-#[repr(C)]
-pub struct ModuleRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut ModuleResponse,
-}
-
-// SAFETY: same single-writer, static-lifetime reasoning as the other requests —
-// written once by Limine before `_start`, read by single-threaded boot code.
-unsafe impl Sync for ModuleRequest {}
+pub type ModuleRequest = Request<ModuleResponse>;
 
 impl ModuleRequest {
     pub const fn new() -> Self {
-        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, MODULE_ID_2, MODULE_ID_3], revision: 0, response: ptr::null_mut() }
+        Request::with(MODULE_ID_2, MODULE_ID_3, ())
     }
 }
 
 #[repr(C)]
 pub struct ModuleResponse {
-    pub revision: u64,
-    pub module_count: u64,
-    /// Pointer to an array of `module_count` `*mut LimineFile`.
-    pub modules: *mut *mut LimineFile,
+    revision: u64,
+    module_count: u64,
+    modules: *mut *mut LimineFile,
+}
+
+impl ModuleResponse {
+    /// The modules, in the order the boot entry names them: the initramfs first.
+    pub fn modules(&self) -> impl Iterator<Item = &LimineFile> {
+        // SAFETY: Limine's array of `module_count` files.
+        unsafe { entries(self.modules, self.module_count) }
+    }
 }
 
 /// A loaded module descriptor (`struct limine_file`). `address` is an HHDM-virtual pointer,
@@ -280,9 +318,9 @@ pub struct LimineFile {
     pub revision: u64,
     pub address: *mut u8,
     pub size: u64,
-    pub path: *const u8,
+    path: *const u8,
     /// The module's string (its `cmdline` before protocol 8); unread.
-    pub string: *const u8,
+    string: *const u8,
     /// `0` generic, `1` optical, `2` TFTP.
     pub media_type: u32,
     pub unused: u32,
@@ -294,6 +332,14 @@ pub struct LimineFile {
     pub gpt_disk_uuid: [u8; 16],
     pub gpt_part_uuid: [u8; 16],
     pub part_uuid: [u8; 16],
+}
+
+impl LimineFile {
+    /// The path it was loaded from, cut at 4 KiB.
+    pub fn path(&self) -> &[u8] {
+        // SAFETY: Limine's string, NUL-terminated and never reclaimed.
+        unsafe { string(self.path, 4096) }
+    }
 }
 
 // --- SMP / MP (multiprocessor) request -----------------------------------
@@ -310,27 +356,12 @@ pub struct LimineFile {
 const SMP_ID_2: u64 = 0x95a67b819a1b857e;
 const SMP_ID_3: u64 = 0xa0b61b723b6a73e0;
 
-#[repr(C)]
-pub struct SmpRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut SmpResponse,
-    /// Bit 0: ask Limine to enable x2APIC. Left clear — the kernel does it.
-    pub flags: u64,
-}
-
-// SAFETY: same single-writer, static-lifetime reasoning as the other requests —
-// Limine writes `response` once before `_start`; the kernel then reads it.
-unsafe impl Sync for SmpRequest {}
+/// The SMP request, its `flags` after the response: 0, as the kernel enables x2APIC itself.
+pub type SmpRequest = Request<SmpResponse, u64>;
 
 impl SmpRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, SMP_ID_2, SMP_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-            flags: 0,
-        }
+        Request::with(SMP_ID_2, SMP_ID_3, 0)
     }
 }
 
@@ -342,9 +373,16 @@ pub struct SmpResponse {
     pub flags: u32,
     /// The boot processor's local-APIC id.
     pub bsp_lapic_id: u32,
-    pub cpu_count: u64,
-    /// Array of `cpu_count` `*mut SmpInfo` (including the BSP's entry).
-    pub cpus: *mut *mut SmpInfo,
+    cpu_count: u64,
+    cpus: *mut *mut SmpInfo,
+}
+
+impl SmpResponse {
+    /// Every CPU, the boot processor's entry included.
+    pub fn cpus(&self) -> impl Iterator<Item = &SmpInfo> {
+        // SAFETY: Limine's array of `cpu_count` CPUs.
+        unsafe { entries(self.cpus, self.cpu_count) }
+    }
 }
 
 /// `struct limine_mp_info` (x86_64) — one per logical CPU.
@@ -375,21 +413,11 @@ pub struct SmpInfo {
 const RSDP_ID_2: u64 = 0xc5e77b6b397e7b43;
 const RSDP_ID_3: u64 = 0x27637845accdcf3c;
 
-#[repr(C)]
-pub struct RsdpRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut RsdpResponse,
-}
-
-// SAFETY: same single-writer, static-lifetime reasoning as the other requests
-// in this file — written once by Limine before `_start`, read by single-
-// threaded boot code thereafter.
-unsafe impl Sync for RsdpRequest {}
+pub type RsdpRequest = Request<RsdpResponse>;
 
 impl RsdpRequest {
     pub const fn new() -> Self {
-        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, RSDP_ID_2, RSDP_ID_3], revision: 0, response: ptr::null_mut() }
+        Request::with(RSDP_ID_2, RSDP_ID_3, ())
     }
 }
 
@@ -409,34 +437,33 @@ pub struct RsdpResponse {
 const BOOTLOADER_INFO_ID_2: u64 = 0xf55038d8e2a1202f;
 const BOOTLOADER_INFO_ID_3: u64 = 0x279426fcf5f59740;
 
-#[repr(C)]
-pub struct BootloaderInfoRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut BootloaderInfoResponse,
-}
-
-// SAFETY: same single-writer, static-lifetime reasoning as the other requests
-// in this file.
-unsafe impl Sync for BootloaderInfoRequest {}
+pub type BootloaderInfoRequest = Request<BootloaderInfoResponse>;
 
 impl BootloaderInfoRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, BOOTLOADER_INFO_ID_2, BOOTLOADER_INFO_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Request::with(BOOTLOADER_INFO_ID_2, BOOTLOADER_INFO_ID_3, ())
     }
 }
 
 #[repr(C)]
 pub struct BootloaderInfoResponse {
-    pub revision: u64,
-    /// NUL-terminated bootloader name.
-    pub name: *const u8,
-    /// NUL-terminated bootloader version.
-    pub version: *const u8,
+    revision: u64,
+    name: *const u8,
+    version: *const u8,
+}
+
+impl BootloaderInfoResponse {
+    /// The bootloader's name, cut at 64 bytes.
+    pub fn name(&self) -> &[u8] {
+        // SAFETY: as `path`.
+        unsafe { string(self.name, 64) }
+    }
+
+    /// Its version, cut at 64 bytes.
+    pub fn version(&self) -> &[u8] {
+        // SAFETY: as `path`.
+        unsafe { string(self.version, 64) }
+    }
 }
 
 // --- Firmware type request -----------------------------------------------
@@ -453,24 +480,11 @@ pub const FIRMWARE_EFI64: u64 = 2;
 /// Booted by a RISC-V SBI implementation.
 pub const FIRMWARE_SBI: u64 = 3;
 
-#[repr(C)]
-pub struct FirmwareTypeRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut FirmwareTypeResponse,
-}
-
-// SAFETY: same single-writer, static-lifetime reasoning as the other requests
-// in this file.
-unsafe impl Sync for FirmwareTypeRequest {}
+pub type FirmwareTypeRequest = Request<FirmwareTypeResponse>;
 
 impl FirmwareTypeRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, FIRMWARE_TYPE_ID_2, FIRMWARE_TYPE_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Request::with(FIRMWARE_TYPE_ID_2, FIRMWARE_TYPE_ID_3, ())
     }
 }
 
@@ -486,24 +500,11 @@ pub struct FirmwareTypeResponse {
 const DATE_AT_BOOT_ID_2: u64 = 0x502746e184c088aa;
 const DATE_AT_BOOT_ID_3: u64 = 0xfbc5ec83e6327893;
 
-#[repr(C)]
-pub struct DateAtBootRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut DateAtBootResponse,
-}
-
-// SAFETY: same single-writer, static-lifetime reasoning as the other requests
-// in this file.
-unsafe impl Sync for DateAtBootRequest {}
+pub type DateAtBootRequest = Request<DateAtBootResponse>;
 
 impl DateAtBootRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, DATE_AT_BOOT_ID_2, DATE_AT_BOOT_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Request::with(DATE_AT_BOOT_ID_2, DATE_AT_BOOT_ID_3, ())
     }
 }
 
@@ -522,30 +523,51 @@ pub struct DateAtBootResponse {
 const EXECUTABLE_CMDLINE_ID_2: u64 = 0x4b161536e598651e;
 const EXECUTABLE_CMDLINE_ID_3: u64 = 0xb390ad4a2f1f303a;
 
-#[repr(C)]
-pub struct ExecutableCmdlineRequest {
-    pub id: [u64; 4],
-    pub revision: u64,
-    pub response: *mut ExecutableCmdlineResponse,
-}
-
-// SAFETY: same single-writer, static-lifetime reasoning as the other requests
-// in this file.
-unsafe impl Sync for ExecutableCmdlineRequest {}
+pub type ExecutableCmdlineRequest = Request<ExecutableCmdlineResponse>;
 
 impl ExecutableCmdlineRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, EXECUTABLE_CMDLINE_ID_2, EXECUTABLE_CMDLINE_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Request::with(EXECUTABLE_CMDLINE_ID_2, EXECUTABLE_CMDLINE_ID_3, ())
     }
 }
 
 #[repr(C)]
 pub struct ExecutableCmdlineResponse {
-    pub revision: u64,
-    /// NUL-terminated command line; empty (not null) when the entry sets none.
-    pub cmdline: *const u8,
+    revision: u64,
+    cmdline: *const u8,
+}
+
+impl ExecutableCmdlineResponse {
+    /// The command line, cut at `max` bytes; empty when the entry sets none.
+    pub fn line(&self, max: usize) -> &[u8] {
+        // SAFETY: as `path`.
+        unsafe { string(self.cmdline, max) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    /// **A request reads the response Limine wrote**: none before it answers, then that one.
+    #[test]
+    fn a_request_reads_the_response_limine_wrote() {
+        let req = HhdmRequest::new();
+        assert!(req.response().is_none());
+        let mut resp = HhdmResponse { revision: 0, offset: 0xffff_8000_0000_0000 };
+        req.response.store(&mut resp, Ordering::Relaxed);
+        assert_eq!(req.response().map(|r| r.offset), Some(0xffff_8000_0000_0000));
+    }
+
+    /// **A Limine array is walked to its count**, its null entries passed over.
+    #[test]
+    fn an_array_is_walked_to_its_count_past_its_nulls() {
+        let (mut a, mut b) =
+            (MemoryMapEntry { base: 1, length: 2, kind: 0 }, MemoryMapEntry { base: 3, length: 4, kind: 5 });
+        let mut ptrs = [&raw mut a, ptr::null_mut(), &raw mut b, &raw mut a];
+        // SAFETY: the first three pointers, null or to entries that outlive the map.
+        let map = unsafe { MemoryMapResponse::fabricated(3, ptrs.as_mut_ptr()) };
+        assert_eq!(map.entries().map(|e| e.base).collect::<std::vec::Vec<_>>(), [1, 3]);
+    }
 }
