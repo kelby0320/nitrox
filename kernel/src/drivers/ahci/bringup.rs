@@ -176,6 +176,11 @@ pub(super) type Claimed = (KBox<AhciDisk>, [u8; MAX_DEVICE_NAME], usize);
 /// running, then the port started and the disk identified; or why not, its memory freed if it stopped.
 pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> {
     let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
+    // **A port that will not stop is given nothing**: a command list may be given only to a stopped
+    // port, and the one running may be the firmware's.
+    if stop_port(port_base).is_none() {
+        return Err("its port would not stop");
+    }
     let (Ok(cmd_list), Ok(fis), Ok(cmd_table), Ok(data)) = (
         DmaBuffer::alloc(1024),
         DmaBuffer::alloc(256),
@@ -207,7 +212,6 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         return Err(OUT_OF_MEMORY);
     };
 
-    stop_port(port_base);
     write32(port_base, PX_CLB, disk.cmd_list.phys().as_u64() as u32);
     write32(port_base, PX_CLBU, (disk.cmd_list.phys().as_u64() >> 32) as u32);
     write32(port_base, PX_FB, disk._fis.phys().as_u64() as u32);

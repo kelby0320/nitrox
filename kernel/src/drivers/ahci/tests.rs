@@ -497,3 +497,15 @@ fn a_declined_disk_frees_its_memory_only_once_its_port_stopped() {
         assert_eq!(gave, if stops { 4 } else { 0 }, "stops {stops}: IDENTIFY's page and the port's three");
     }
 }
+
+/// **A port that will not stop is given nothing**: its command list was programmed and IDENTIFY
+/// issued on a command engine still running, which a list may be given only once it has stopped.
+#[test]
+fn a_port_that_will_not_stop_is_given_no_command_list() {
+    crate::mm::test_support::init_global_heap();
+    let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
+    let pb = regs.0 as u64 + PORT_BASE;
+    write32(pb, PX_CMD, CMD_CR);
+    assert_eq!(claim_port(regs.0 as u64, 0).map(|_| ()), Err("its port would not stop"));
+    assert_eq!((read32(pb, PX_CLB), read32(pb, PX_FB), read32(pb, PX_CI)), (0, 0, 0), "nothing given");
+}
