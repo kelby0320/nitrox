@@ -381,7 +381,7 @@ impl FileObject {
     /// [`writable_unmapped`](Self::writable_unmapped). The pin is kept even then: a spurious dirty
     /// mark costs one write-back of clean pages, where a missing one costs data.
     pub fn writable_mapped(file_obj: &ObjectRef) {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "writable_mapped");
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         let mut g = fo.inner.lock();
@@ -419,7 +419,7 @@ impl FileObject {
     /// After a successful write-back that began at `mark`: **clean**, unless a writable mapping
     /// was made since. Clean drops the self-pin outside the lock, as it may be the last reference.
     pub fn unpin_if_clean(file_obj: &ObjectRef, mark: u64) {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "unpin_if_clean");
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         let pin = {
@@ -476,8 +476,8 @@ impl FileObject {
     /// device is not the cached object's, with nothing resized: the reply's runs were checked
     /// against its own block size, and its rights were decided by its own device.
     pub fn cache_in(reg: &ObjectRef, candidate: ObjectRef) -> Result<ObjectRef, CacheInError> {
-        assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
-        assert_eq!(candidate.object_type(), KObjectType::FileObject);
+        assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg, "cache_in's registration");
+        assert_eq!(candidate.object_type(), KObjectType::FileObject, "cache_in's candidate");
         // SAFETY: both references pin live objects of the asserted types (header at offset 0).
         let (r, cand) = unsafe {
             (&*(reg.as_ptr() as *const crate::object::UserspaceServerReg), &*(candidate.as_ptr() as *const FileObject))
@@ -820,7 +820,7 @@ impl FileObject {
         wait: &mut dyn FnMut(&ObjectRef) -> bool,
         park: &mut dyn FnMut(),
     ) -> Option<PhysAddr> {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "fault_in_page_with");
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         // Whether this fault's fill may read ahead, and whether a failed fill may be tried again:
@@ -897,7 +897,7 @@ impl FileObject {
     /// succeeded, [`WriteBack::Gone`] when the device refused one `PeerClosed` (it has left, and no
     /// later write-back can do better), else [`WriteBack::Failed`].
     pub fn writeback(file_obj: &ObjectRef) -> WriteBack {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "writeback");
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         // The producer is immutable; the run map is read under the lock with the pages.
@@ -990,7 +990,7 @@ impl FileObject {
     /// **Not marked dead**, as a `Forget` marks it: a dead file's fill reads a hole, but a fill of
     /// a departed device's file must fail (refused `PeerClosed`), not read as zeros.
     pub fn let_go(file_obj: &ObjectRef) -> usize {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "let_go");
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         let (pin, pages) = {
@@ -1007,7 +1007,7 @@ impl FileObject {
     /// a server *without* a resolve — by id, since a cached object outlives the resolve that named
     /// it. The clone pins the registration across the send.
     pub fn touch_target(file_obj: &ObjectRef) -> Option<(ObjectRef, u64)> {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "touch_target");
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         // A forgotten file's id may already name another file.
@@ -1025,7 +1025,7 @@ impl FileObject {
     /// is allowed (a syscall thread, not a DPC/IRQ). `sys_process_spawn` loads an ELF with it.
     /// `AllocError` on a buffer-allocation or fill failure.
     pub fn read_to_kvec(file_obj: &ObjectRef) -> Result<KVec<u8>, AllocError> {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "read_to_kvec");
         // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         let size = fo.size();

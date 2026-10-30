@@ -242,7 +242,7 @@ impl Drop for Vma {
             && let Some(obj) = self.object.as_ref()
         {
             // Nothing ties `mapping` to the object's kind, so it is checked before the cast.
-            assert_eq!(obj.object_type(), crate::libkern::handle::KObjectType::FileObject);
+            assert_eq!(obj.object_type(), crate::libkern::handle::KObjectType::FileObject, "Vma::drop");
             // SAFETY: `obj` is the VMA's reference to its `FileObject`, its type just checked.
             unsafe { crate::object::FileObject::writable_unmapped(obj.as_ptr()) };
         }

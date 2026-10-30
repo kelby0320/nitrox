@@ -4,6 +4,8 @@ use crate::libkern::handle::KObjectType;
 use crate::mm::test_support::init_global_heap;
 use crate::object::Process;
 
+mod object_casts;
+
 /// **A block map the page cache cannot use is refused**, each bound at the values either
 /// side of it: block sizes 256..8192 (and 0, and a non-power of two), and a run whose file
 /// end, device end or device end in bytes is `u64::MAX` (taken) or one past (refused).
