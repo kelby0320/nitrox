@@ -55,7 +55,9 @@ pub(in crate::drivers::xhci) fn prepare(port: u8, mem: &mut DeviceMem, config: &
         return None;
     };
     let ring = |b: &DmaBuffer| {
-        let (mut mem, phys) = (RingMem::of(b), b.phys().as_u64());
+        // SAFETY: `b` goes into the device's memory, freed only once its slot is disabled and it is
+        // out of the table, after which nothing uses its rings.
+        let (mut mem, phys) = (unsafe { RingMem::kept(b) }, b.phys().as_u64());
         Ring { producer: Producer::new(&mut mem, phys), mem, phys }
     };
     let p = Prepared {

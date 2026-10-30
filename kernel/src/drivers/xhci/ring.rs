@@ -13,6 +13,7 @@
 //! Where the TRBs live is [`Slots`]': device memory, [`RingMem`], in the kernel, a `Vec` in a test.
 //! Everything else here is the arithmetic, so the host tests are tests of it.
 
+use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, fence};
 
 use crate::mm::dma::DmaBuffer;
@@ -243,19 +244,32 @@ pub trait Slots {
     fn write(&mut self, i: usize, trb: Trb);
 }
 
-/// **A ring's TRBs in device memory**: every ring's, the controller's and each device's.
+/// **A ring's TRBs in device memory**: every ring's, the controller's and each device's, for as
+/// long as `'a` holds the buffer.
 #[derive(Copy, Clone, Debug)]
-pub struct RingMem(u64);
+pub struct RingMem<'a>(u64, PhantomData<&'a DmaBuffer>);
 
-impl RingMem {
-    /// The ring in `buffer`, which holds a ring's TRBs and which its owner keeps while it is used.
-    pub fn of(buffer: &DmaBuffer) -> RingMem {
+impl<'a> RingMem<'a> {
+    /// The ring in `buffer`, which holds a ring's TRBs.
+    pub fn of(buffer: &'a DmaBuffer) -> RingMem<'a> {
         assert!(buffer.len() >= super::RING_TRBS * 16, "a ring's buffer holds its TRBs");
-        RingMem(buffer.virt() as u64)
+        RingMem(buffer.virt() as u64, PhantomData)
     }
 }
 
-impl Slots for RingMem {
+impl RingMem<'static> {
+    /// The ring in `buffer`, held by its address where no borrow can be: an endpoint's, which the
+    /// DPC writes while the hub thread owns the buffer.
+    ///
+    /// # Safety
+    /// `buffer` is not freed while the ring is used.
+    pub unsafe fn kept(buffer: &DmaBuffer) -> RingMem<'static> {
+        let RingMem(at, _) = RingMem::of(buffer);
+        RingMem(at, PhantomData)
+    }
+}
+
+impl Slots for RingMem<'_> {
     fn len(&self) -> usize {
         super::RING_TRBS
     }

@@ -200,7 +200,7 @@ enum HubResult {
 #[derive(Debug)]
 struct Ring {
     producer: Producer,
-    mem: RingMem,
+    mem: RingMem<'static>,
     phys: u64,
 }
 

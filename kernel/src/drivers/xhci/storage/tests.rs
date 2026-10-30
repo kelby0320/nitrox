@@ -182,7 +182,8 @@ impl Fake {
 
     fn dev(&mut self, slot: u8) -> Dev {
         let ring = |b: &DmaBuffer| {
-            let mut mem = RingMem::of(b);
+            // SAFETY: the fake's buffers outlive every device it makes.
+            let mut mem = unsafe { RingMem::kept(b) };
             Ring { producer: Producer::new(&mut mem, b.virt() as u64), mem, phys: b.virt() as u64 }
         };
         let wrap = self.wrap.as_mut_ptr() as u64;

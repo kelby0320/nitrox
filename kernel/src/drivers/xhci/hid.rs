@@ -89,7 +89,7 @@ pub(super) struct Bound {
     epoch: u32,
     decoder: Decoder,
     ring: Producer,
-    ring_mem: RingMem,
+    ring_mem: RingMem<'static>,
     ring_phys: u64,
     buf_phys: u64,
     buf_virt: u64,
@@ -171,7 +171,9 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
             crate::kprintln!("usb: port {port}: no memory for its endpoints; not bound");
             return None;
         };
-        let mut ring_mem = RingMem::of(&ring);
+        // SAFETY: `ring` goes into the device's memory, freed only once its slot is disabled and
+        // its endpoints are out of the table, after which nothing uses it.
+        let mut ring_mem = unsafe { RingMem::kept(&ring) };
         let ring_phys = ring.phys().as_u64();
         let producer = Producer::new(&mut ring_mem, ring_phys);
         eps[i] = context::Interrupt {
@@ -473,7 +475,7 @@ fn report_bytes(layout: &mouse::Layout) -> u16 {
 struct Prepared {
     c: Candidate,
     producer: Producer,
-    ring_mem: RingMem,
+    ring_mem: RingMem<'static>,
     ring_phys: u64,
     buf_phys: u64,
     buf_virt: u64,
