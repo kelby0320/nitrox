@@ -729,17 +729,32 @@ pub(super) fn depart(x: &Xhci, slot: u8) {
 /// **Node `node`'s device has gone**: what `decoder` holds released and the node retired, in one
 /// hold of its reader, so a report the DPC decoded before cannot land after the releases.
 fn let_go(nodes: &Nodes, node: usize, decoder: Decoder, now: u64) {
+    let_go_meanwhile(nodes, node, decoder, now, || {});
+}
+
+/// [`let_go`], calling `meanwhile` once the releases are pushed and before the node retires.
+fn let_go_meanwhile(nodes: &Nodes, node: usize, decoder: Decoder, now: u64, mut meanwhile: impl FnMut()) {
     match decoder {
         // **Its keys in batches**, every one pushed before the node retires.
         Decoder::Keyboard { mut held, .. } => nodes.retire(
             node,
-            |r| each_batch(|out| Some(keyboard::release_all(&mut held, now, out)), |e| r.ring.push_group(e)),
+            |r| {
+                each_batch(|out| Some(keyboard::release_all(&mut held, now, out)), |e| r.ring.push_group(e));
+                meanwhile();
+            },
             now,
         ),
         Decoder::Mouse { buttons, .. } => {
             let mut released = [InputEvent::default(); mouse::EVENTS_MAX];
             let n = mouse::release_all(buttons, now, &mut released);
-            nodes.retire(node, |r| r.ring.push_group(&released[..n]), now);
+            nodes.retire(
+                node,
+                |r| {
+                    r.ring.push_group(&released[..n]);
+                    meanwhile();
+                },
+                now,
+            );
         }
     }
 }

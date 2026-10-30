@@ -269,42 +269,28 @@ fn a_report_pushed_after_its_device_departed_is_dropped() {
     assert_eq!(held(&nodes), (1, None), "the new device's own does");
 }
 
-/// **A departing keyboard's releases end its ring, whatever the DPC pushes meanwhile**: pushed in
-/// holds of their own, a press could land before the retiring one, leaving its key down.
+/// **A departing keyboard's releases end its ring, whatever the DPC pushes meanwhile**: a press it
+/// decoded before the departure, pushed between the releases' hold and the retiring one, left the
+/// key down. Here the DPC pushes the moment it can take the node's lock after the releases.
 #[test]
 fn a_departing_keyboards_releases_end_its_ring_whatever_the_dpc_pushes() {
     use crate::drivers::hid::keyboard::{self, Held, Layout};
-    use core::sync::atomic::AtomicBool;
     init_global_heap();
-    for round in 0..200 {
-        let nodes = Nodes::new();
-        let (index, epoch) = nodes.take(true).expect("a free slot");
-        let (mut held, mut out) = (Held::NONE, [InputEvent::default(); keyboard::EVENTS_MAX]);
-        keyboard::decode(&Layout::BOOT, &mut held, &[0, 0, 0x04, 0, 0, 0, 0, 0], 1, &mut out);
-        let (pushing, gone) = (AtomicBool::new(false), AtomicBool::new(false));
-        std::thread::scope(|t| {
-            t.spawn(|| {
-                let (mut scratch, press) = ([0u8; DRAIN_MAX], [InputEvent::key(30, KEY_PRESS, 1), InputEvent::syn(1)]);
-                while !gone.load(Ordering::Acquire) {
-                    nodes.push(index, epoch, &press, &mut scratch, 1);
-                    pushing.store(true, Ordering::Release);
-                }
-            });
-            while !pushing.load(Ordering::Acquire) {
-                core::hint::spin_loop();
-            }
-            let_go(&nodes, index, Decoder::Keyboard { layout: Layout::BOOT, held }, 2);
-            gone.store(true, Ordering::Release);
-        });
-        let (mut last, mut bytes) = (None, [0u8; DRAIN_MAX]);
-        loop {
-            let len = nodes.readers[index].lock().ring.drain_into(&mut bytes, 3);
-            if len == 0 {
-                break;
-            }
-            let mut events = bytes[..len].chunks(INPUT_EVENT_LEN).filter_map(InputEvent::read);
-            last = events.rfind(|e| e.kind == EV_KEY).map(|e| (e.code, e.value)).or(last);
+    let nodes = Nodes::new();
+    let (index, epoch) = nodes.take(true).expect("a free slot");
+    let (mut held, mut out) = (Held::NONE, [InputEvent::default(); keyboard::EVENTS_MAX]);
+    keyboard::decode(&Layout::BOOT, &mut held, &[0, 0, 0x04, 0, 0, 0, 0, 0], 1, &mut out);
+    let press = [InputEvent::key(30, KEY_PRESS, 1), InputEvent::syn(1)];
+    let dpc = || {
+        if let Some(mut r) = nodes.readers[index].try_lock() {
+            r.offer(&press);
         }
-        assert_eq!(last, Some((30, KEY_RELEASE)), "round {round}: the key left down");
-    }
+    };
+    let_go_meanwhile(&nodes, index, Decoder::Keyboard { layout: Layout::BOOT, held }, 2, dpc);
+    nodes.push(index, epoch, &press, &mut [0u8; DRAIN_MAX], 3);
+    let mut bytes = [0u8; DRAIN_MAX];
+    let len = nodes.readers[index].lock().ring.drain_into(&mut bytes, 4);
+    let mut events = bytes[..len].chunks(INPUT_EVENT_LEN).filter_map(InputEvent::read);
+    let last = events.rfind(|e| e.kind == EV_KEY).map(|e| (e.code, e.value));
+    assert_eq!(last, Some((30, KEY_RELEASE)), "the key left down");
 }
