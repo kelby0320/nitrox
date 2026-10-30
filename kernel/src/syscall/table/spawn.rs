@@ -61,7 +61,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     // A spawner's ELF is untrusted input: the loader bounds-checks every offset.
     let info = load_elf(&mut asp, &img_bytes).map_err(from_elf_load)?;
     drop(img);
-    let child_pid = crate::sched::alloc_pid();
+    let child_pid = crate::sched::alloc_pid().ok_or(KError::OutOfMemory)?;
 
     // `child = parent & requested` syscaps (`docs/architecture/syscaps.md`); no owning Process
     // yields an unprivileged child.

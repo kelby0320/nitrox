@@ -374,8 +374,9 @@ The mechanism, and why it is shaped this way:
   rank-1 `SCHED` to wake receivers, a `Timer`'s to leave the deadline heap). `close_owned_batch` therefore takes a
   resume cursor and returns `(count, more_remain)`.
 
-Pid reuse is not a hazard: pids are monotonic and never reused, so a sweep
-that runs after the process is gone cannot hit a live process's entries.
+Pid reuse is not a hazard: pids are monotonic and never reused (a spawn is
+refused `OutOfMemory` once they are spent), so a sweep that runs after the
+process is gone cannot hit a live process's entries.
 
 ### Why a scan, not the `next_owned` list
 

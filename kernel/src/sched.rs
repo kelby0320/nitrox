@@ -300,6 +300,13 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(
 );
 
 impl SchedState {
+    /// The next pid, or `None` once spent: never one given before, as pids key handle ownership.
+    fn take_pid(&mut self) -> Option<u32> {
+        let pid = self.next_pid;
+        self.next_pid = pid.checked_add(1)?;
+        Some(pid)
+    }
+
     /// Dense index of the running CPU's per-CPU scheduler slots.
     #[inline]
     fn this_cpu() -> usize {
@@ -354,11 +361,8 @@ impl SchedState {
 
 /// Allocate the next process id (monotonic, no reuse). Takes only the rank-1 lock briefly;
 /// `sys_process_spawn` calls this before touching the rank-3 handle table.
-pub fn alloc_pid() -> u32 {
-    let mut g = SCHED.lock();
-    let pid = g.next_pid;
-    g.next_pid = g.next_pid.wrapping_add(1);
-    pid
+pub fn alloc_pid() -> Option<u32> {
+    SCHED.lock().take_pid()
 }
 
 /// Adopt a freshly created `Thread` into an [`ObjectRef`] without a refcount change.
