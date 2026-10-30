@@ -829,11 +829,47 @@ impl fmt::Display for Ranges<'_> {
     }
 }
 
+/// A controller over `regs`, host memory standing in for its registers: its rings made, its memory
+/// its own, nothing running.
+#[cfg(test)]
+fn fake(regs: u64) -> Xhci {
+    let page = || DmaBuffer::alloc(RING_TRBS * 16).unwrap();
+    let cmd_mem = page();
+    let ring = Producer::new(&mut RingMem::of(&cmd_mem), cmd_mem.phys().as_u64());
+    Xhci {
+        op: regs,
+        rt: regs,
+        db: regs,
+        max_ports: 1,
+        layout: context::Layout::new(false),
+        caps: caps::ExtCaps::default(),
+        dcbaa: Programmed::new(page()),
+        _scratch: Scratchpads { array: None, pages: KVec::new() },
+        cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: Programmed::new(cmd_mem), ring }),
+        events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(page()), ring: Consumer::new() }),
+        _erst: Programmed::new(page()),
+        port_changes: AtomicU32::new(0),
+        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
+        hub_wake: unsafe { crate::drivers::adopt(InterruptObject::try_new().unwrap(), KObjectType::InterruptObject) },
+        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
+        first_round: unsafe {
+            crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
+        },
+        waiting: IrqSpinLock::new(LockRank::Leaf, None),
+        wedged: AtomicBool::new(false),
+        pci: ResourceDescriptor::ZERO,
+        hid: IrqSpinLock::new(LockRank::Leaf, hid::Table::new()),
+        hid_halted: AtomicBool::new(false),
+        hid_lights: AtomicBool::new(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// **A declined controller's memory is freed only once it halted**, and one running is not reset.
+    /// **A declined controller's memory is freed only once it halted**, all of it from one stop:
+    /// its context base array, both rings and the segment table. One running is not reset.
     #[test]
     fn a_declined_controller_frees_its_memory_only_once_halted() {
         crate::mm::test_support::init_global_heap();
@@ -841,12 +877,12 @@ mod tests {
             let mut regs = std::boxed::Box::new([0u32; 4]);
             let op = regs.as_mut_ptr() as u64;
             write32(op, USBSTS, if halts { STS_HCH } else { 0 });
+            let mut x = fake(op);
             let freed = crate::mm::heap::frames_freed_by_this_thread();
-            let mut mem = Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).unwrap());
-            give_back(op, |halted| mem.release(halted));
-            drop(mem);
+            give_back(op, |halted| x.release(halted));
+            drop(x);
             let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
-            assert_eq!(gave, halts as usize, "halts {halts}: its memory freed");
+            assert_eq!(gave, if halts { 4 } else { 0 }, "halts {halts}: its memory freed");
             assert_eq!(read32(op, USBCMD), if halts { CMD_HCRST } else { 0 }, "halts {halts}: reset");
         }
     }

@@ -207,8 +207,7 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
 /// **Bind the prepared HID interfaces `p` of the device in `slot`**, its configuration set: set
 /// each to boot protocol, ask keyboards to report on change only, register a node for each, and
 /// start polling. `parent` is its `UsbDevice` record. Logged (`phase-6-usb.md` has the detail).
-/// **Whether the default endpoint is clear**: `false` when a request on it was left in doubt.
-pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrepared, parent: Option<u32>) -> bool {
+pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrepared, parent: Option<u32>) {
     let HidPrepared { prepared, .. } = p;
 
     // **Each interface's steps**: a stall ends that interface alone. **Any other failure on the
@@ -313,7 +312,6 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
     if in_doubt_at {
         lights_dead(x, slot);
     }
-    !in_doubt_at
 }
 
 /// **Whether a failure on the default endpoint leaves it in doubt**: any failure but a stall may

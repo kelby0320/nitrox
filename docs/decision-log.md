@@ -37184,8 +37184,8 @@ Group M of the survey's triage, the drivers, made ten decisions:
 - **A USB stick is held while it binds**, as during a rescan, and a hub command goes only on a
   held device with no submit's command in flight, its buffer cleared first (drv-d3, drv-d15).
 - **A device's endpoint indices are the device's word**: a set naming the default endpoint's, or
-  one twice, binds nothing (drv-d14); and **a HID binding that leaves a request in doubt on the
-  default endpoint ends its device's storage binding** (drv-d13).
+  one twice, binds nothing (drv-d14); and **a default endpoint left in doubt is asked nothing
+  more**: after any failure but a stall, every later control transfer on it is refused (drv-d13).
 - **A departing keyboard's releases are pushed in the hold that retires its node** (drv-d18).
 - **A disk's counters pin the node they are in**, so attaching them is safe (drv-o18, drv-d17), and
   **a partition's node carries its window**, set only where it is made (drv-d16).

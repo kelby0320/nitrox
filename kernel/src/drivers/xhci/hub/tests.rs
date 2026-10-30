@@ -43,3 +43,28 @@ fn a_control_transfer_is_cut_to_the_data_page() {
     assert!(mem.data.as_slice().iter().all(|&b| b == 0), "the whole page cleared");
     assert_eq!(clear_for(&mut mem, 18), 18);
 }
+
+/// **A default endpoint left in doubt is asked nothing more**: a request may still be on its ring,
+/// to complete into the data page. HID's in doubt stopped only HID, so storage's `GET MAX LUN`
+/// went on the ring behind it, and storage's in doubt left the keyboard its lights.
+#[test]
+fn a_default_endpoint_in_doubt_is_asked_nothing_more() {
+    crate::mm::test_support::init_global_heap();
+    let mut regs = std::boxed::Box::new([0u32; 64]);
+    let x = super::super::fake(regs.as_mut_ptr() as u64);
+    for (failure, doubt) in [(Failed::Code(code::STALL), false), (Failed::Code(4), true), (Failed::Timeout, true)] {
+        let mut mem = device_mem().unwrap();
+        assert!(mem.settled::<()>(Err(failure)).is_err());
+        assert_eq!(mem.in_doubt, doubt, "{failure}");
+    }
+    let mut mem = device_mem().unwrap();
+    let _ = mem.settled::<()>(Err(Failed::Timeout));
+    mem.data.as_mut_slice().fill(0xAB);
+    let next = mem.ring.next_slot();
+    let refused = |r: Result<(), Failed>| matches!(r, Err(Failed::Device(why)) if why.contains("in doubt"));
+    assert!(refused(control_in(&x, 1, &mut mem, [0; 8], 18).map(|_| ())), "a read");
+    assert!(refused(control_out(&x, 1, &mut mem, [0; 8])), "a request with no data");
+    assert!(refused(control_out_data(&x, 1, &mut mem, [0; 8], &[1])), "a keyboard's lights");
+    assert_eq!(mem.ring.next_slot(), next, "nothing on the ring");
+    assert!(mem.data.as_slice().iter().all(|&b| b == 0xAB), "and the page untouched");
+}

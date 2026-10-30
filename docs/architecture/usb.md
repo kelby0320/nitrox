@@ -138,8 +138,9 @@ enumerated; a disconnection disables the device's slot and frees its memory.
    then one *Configure Endpoint* adding all of them and one `SET_CONFIGURATION` — a second would
    reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own requests. **The
    endpoints' context indices are the device's word**, so a set naming the default endpoint's, or
-   one index twice, is refused with nothing written; and **a HID binding that leaves a request in
-   doubt on the default endpoint ends the device's storage binding too**, which would ask it more.
+   one index twice, is refused with nothing written; and **a default endpoint left in doubt is asked
+   nothing more**: any request on it but a stall's answer may still be on its ring, so every later
+   one, a class's binding, a recovery or a keyboard's lights, is refused.
 
 **Every command and transfer has a one-second deadline.** A device that misses a transfer's is
 abandoned and its slot disabled. A command that goes unanswered leaves the command ring in doubt —

@@ -111,6 +111,9 @@ pub(super) struct DeviceMem {
     ring: Producer,
     data: Programmed,
     pub(super) class: KVec<Programmed>,
+    /// **A request may still be on the default endpoint's ring**, to complete into the data page
+    /// whenever it does: nothing more is asked of the endpoint.
+    in_doubt: bool,
 }
 
 impl DeviceMem {
@@ -121,7 +124,18 @@ impl DeviceMem {
         }
         self.class.iter_mut().for_each(|b| b.release(stopped));
     }
+
+    /// **What a control transfer came to**, its endpoint left in doubt by any failure but a stall,
+    /// which is the request's answer.
+    fn settled<T>(&mut self, answer: Result<T, Failed>) -> Result<T, Failed> {
+        self.in_doubt |=
+            matches!(answer, Err(Failed::Timeout)) || matches!(answer, Err(Failed::Code(c)) if c != code::STALL);
+        answer
+    }
 }
+
+/// What a control transfer on a default endpoint in doubt is refused with.
+const IN_DOUBT: Failed = Failed::Device("a request is in doubt on its default endpoint");
 
 /// The thread.
 pub(super) extern "C" fn main(_arg: usize) {
@@ -387,14 +401,8 @@ fn bind(
         crate::kprintln!("usb: port {port}: SET_CONFIGURATION failed: {e}; not bound");
         return;
     }
-    // **A request HID left in doubt on the default endpoint ends what asks it more**: storage's
-    // `GET MAX LUN` would go on the ring behind it and share its data page.
-    if let Some(h) = hid
-        && !super::hid::bind(x, port, slot, mem, h, record)
-        && storage.is_some()
-    {
-        crate::kprintln!("usb: port {port}: a request is in doubt on its default endpoint; its storage is not bound");
-        return;
+    if let Some(h) = hid {
+        super::hid::bind(x, port, slot, mem, h, record);
     }
     if let Some(s) = storage {
         super::storage::bind(x, port, slot, mem, s, record, serial);
@@ -425,7 +433,7 @@ fn device_mem() -> Option<DeviceMem> {
     let data = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
     let ring = Producer::new(&mut RingMem::of(&ep0), ep0.phys().as_u64());
     let [input, output, ep0, data] = [input, output, ep0, data].map(Programmed::new);
-    Some(DeviceMem { input, output, ep0, ring, data, class: KVec::new() })
+    Some(DeviceMem { input, output, ep0, ring, data, class: KVec::new(), in_doubt: false })
 }
 
 /// Address the device in `slot` and read what it is, in `mem`: what its record carries and how much
@@ -651,6 +659,9 @@ fn data_bytes(mem: &DeviceMem, len: u16) -> &[u8] {
 /// and a wait for the Status stage's completion or an error on any stage. **How many bytes
 /// arrived**: `len` less what a short Data stage did not move.
 fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u16) -> Result<u16, Failed> {
+    if mem.in_doubt {
+        return Err(IN_DOUBT);
+    }
     let len = clear_for(mem, len);
     let base = mem.ep0.phys().as_u64();
     let po = new_operation()?;
@@ -671,20 +682,21 @@ fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u1
     let at = mem.ring.push(&mut slots, Trb::status(true));
     debug_assert_eq!(base + at as u64 * 16, status_at);
     write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
-    match wait(x, &po, TRANSFER_NS) {
+    let answer = match wait(x, &po, TRANSFER_NS) {
         Some((code::SUCCESS, short)) => Ok(len - short.min(len as u64) as u16),
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),
-    }
+    };
+    mem.settled(answer)
 }
 
 /// **The data page cleared for a read of `len` bytes**, cut to the page: the length to ask for.
 fn clear_for(mem: &mut DeviceMem, len: u16) -> u16 {
     let len = len.min(mem.data.len() as u16);
     // SAFETY: `data` is a page the controller writes only during a transfer, and none is running on
-    // this endpoint: every failure that can leave one live — a timeout, any error but a stall — ends
-    // the device, or what asks this endpoint after a HID binding, and a stall's remains are skipped
-    // by `recover_ep0` before another starts.
+    // this endpoint: every failure that can leave one live — a timeout, any error but a stall —
+    // leaves it in doubt, and nothing more is asked of it; a stall's remains are skipped by
+    // `recover_ep0` before another starts.
     unsafe { core::ptr::write_bytes(mem.data.virt(), 0, len as usize) };
     len
 }
@@ -697,6 +709,9 @@ pub(super) fn control_in_byte(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: 
 
 /// **A control transfer with no data stage**: Setup, then an IN Status stage, waited for.
 pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8]) -> Result<(), Failed> {
+    if mem.in_doubt {
+        return Err(IN_DOUBT);
+    }
     let base = mem.ep0.phys().as_u64();
     let po = new_operation()?;
     // **Registered before the TRBs are written**, as `control_in`'s: the Status stage is one slot on.
@@ -709,11 +724,12 @@ pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8;
     let at = mem.ring.push(&mut slots, Trb::status(false));
     debug_assert_eq!(base + at as u64 * 16, status_at);
     write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
-    match wait(x, &po, TRANSFER_NS) {
+    let answer = match wait(x, &po, TRANSFER_NS) {
         Some((code::SUCCESS, _)) => Ok(()),
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),
-    }
+    };
+    mem.settled(answer)
 }
 
 /// **A control transfer writing `data`**: Setup, an OUT Data stage from the device's data page, and
@@ -725,9 +741,12 @@ pub(super) fn control_out_data(
     request: [u8; 8],
     data: &[u8],
 ) -> Result<(), Failed> {
+    if mem.in_doubt {
+        return Err(IN_DOUBT);
+    }
     let len = data.len().min(crate::mm::PAGE_SIZE);
     // SAFETY: `data` is a page no transfer is using: the default endpoint runs one at a time, and
-    // every failure that could leave one live ends the device or its lights.
+    // every failure that could leave one live leaves it in doubt, asked nothing more.
     unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), mem.data.virt(), len) };
     let base = mem.ep0.phys().as_u64();
     let po = new_operation()?;
@@ -745,11 +764,12 @@ pub(super) fn control_out_data(
     let at = mem.ring.push(&mut slots, Trb::status(false));
     debug_assert_eq!(base + at as u64 * 16, status_at);
     write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
-    match wait(x, &po, TRANSFER_NS) {
+    let answer = match wait(x, &po, TRANSFER_NS) {
         Some((code::SUCCESS, _)) => Ok(()),
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),
-    }
+    };
+    mem.settled(answer)
 }
 
 /// **Send the keyboards' lights that wait**: each as a `SET_REPORT` of one byte
