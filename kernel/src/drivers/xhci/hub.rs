@@ -629,15 +629,18 @@ fn get_descriptor(kind: u8, index: u8, lang: u16, len: u16) -> [u8; 8] {
     [0x80, 6, index, kind, lang as u8, (lang >> 8) as u8, len as u8, (len >> 8) as u8]
 }
 
+/// The first `len` bytes of the device's data page, and no more than it holds.
 fn data_bytes(mem: &DeviceMem, len: u16) -> &[u8] {
-    // SAFETY: `data` is a page, and `len` is at most a page; the transfer that wrote it is done.
-    unsafe { core::slice::from_raw_parts(mem.data.virt() as *const u8, len as usize) }
+    let len = (len as usize).min(mem.data.len());
+    // SAFETY: `data` holds `len` bytes, and the transfer that wrote them is done.
+    unsafe { core::slice::from_raw_parts(mem.data.virt() as *const u8, len) }
 }
 
 /// **A control transfer reading `len` bytes** into the device's data page: Setup, Data, Status,
 /// and a wait for the Status stage's completion or an error on any stage. **How many bytes
 /// arrived**: `len` less what a short Data stage did not move.
 fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u16) -> Result<u16, Failed> {
+    let len = len.min(mem.data.len() as u16);
     // SAFETY: `data` is a page the controller writes only during a transfer, and none is running on
     // this endpoint: every failure that can leave one live — a timeout, any error but a stall — ends
     // the device, or what asks this endpoint after a HID binding, and a stall's remains are skipped
@@ -966,5 +969,15 @@ mod tests {
         assert_eq!(connect_change(|| reg.get(), write), Some(false), "a stale change on an empty port");
         assert_eq!(reg.get() & PORT_CSC, 0, "and it is cleared");
         assert_eq!(connect_change(|| reg.get(), |_| unreachable!()), None, "no change, no write");
+    }
+
+    /// **A read of the data page stops at the page**: a length from a device's `wTotalLength`
+    /// that missed its clamp gave a slice past it, and a transfer the device could fill past it.
+    #[test]
+    fn a_read_of_the_data_page_stops_at_the_page() {
+        crate::mm::test_support::init_global_heap();
+        let mem = device_mem().unwrap();
+        assert_eq!(data_bytes(&mem, 3 * 4096).len(), crate::mm::PAGE_SIZE);
+        assert_eq!(data_bytes(&mem, 18).len(), 18);
     }
 }
