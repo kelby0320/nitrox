@@ -317,7 +317,7 @@ impl AddressSpace {
         let mobj = unsafe { &*(object.as_ptr() as *const MemoryObject) };
         // `frames` borrows through the raw pointer, not `object`, so `object` can move into the VMA
         // below while the install loop still reads it; the object stays alive throughout.
-        let frames = mobj.frames();
+        let frames = mobj.frames_to_map();
         let caching = mobj.caching();
         let npages = range.pages();
         debug_assert!(frames.len() as u64 >= npages, "object too small for range");
