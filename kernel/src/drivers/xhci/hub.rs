@@ -34,7 +34,7 @@ use crate::libkern::KVec;
 use crate::libkern::block::MAX_DEVICE_NAME;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::printable::Printable;
-use crate::mm::dma::DmaBuffer;
+use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::object::device_node::{BlockGeometry, DeviceClass, DeviceNode, ResourceDescriptor};
 use crate::object::{ObjectRef, PendingOperation};
 use crate::syscall::error::KError;
@@ -97,7 +97,7 @@ struct Attached {
     slot: u8,
     /// Its `UsbDevice` record's id, which departs with it; `None` when the table could not take it.
     record: Option<u32>,
-    _mem: DeviceMem,
+    _mem: Programmed<DeviceMem>,
 }
 
 /// One device's input and output contexts, its default endpoint's ring, a page for what its
@@ -284,17 +284,16 @@ pub(super) enum Released {
 /// allocator's while the controller still writes them. So a slot that does not disable — the
 /// command failed, or nothing more may be asked of a wedged controller — keeps its memory forever:
 /// a few pages leaked is the price of not handing the controller memory it may yet write.
-fn release(x: &Xhci, slot: u8, mem: DeviceMem) -> Released {
+fn release(x: &Xhci, slot: u8, mem: Programmed<DeviceMem>) -> Released {
     if x.wedged.load(Ordering::Relaxed) {
-        core::mem::forget(mem);
         return Released::Kept("the command ring went unanswered earlier, so nothing more is asked");
     }
     if command(x, Trb::disable_slot(slot)).is_err() {
-        core::mem::forget(mem);
         return Released::Kept("it did not disable, so its memory may still be the controller's");
     }
     set_slot_context(x, slot, 0);
-    drop(mem);
+    // SAFETY: Disable Slot completed: the controller reads and writes none of the slot's memory.
+    drop(mem.release(unsafe { Quiesced::assume() }));
     Released::Freed
 }
 
@@ -308,7 +307,7 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
         return Err(());
     }
     let speed_id = speed_of(portsc(x, port));
-    let Some(mut mem) = device_mem() else {
+    let Some(mem) = device_mem() else {
         crate::kprintln!("usb: port {port}: no memory for its contexts");
         return Err(());
     };
@@ -323,6 +322,7 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
             return Err(());
         }
     };
+    let mut mem = Programmed::new(mem);
     set_slot_context(x, slot, mem.output.phys().as_u64());
     let mut config = [0u8; CONFIG_MAX];
     let mut serial = [0u8; SERIAL_MAX];

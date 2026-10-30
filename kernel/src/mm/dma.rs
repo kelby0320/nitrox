@@ -15,6 +15,8 @@
 //! x86_64 DMA to write-back HHDM memory is hardware-coherent. A non-coherent architecture will
 //! need clean/invalidate around device access (a future `ArchDma` hook).
 
+use core::mem::ManuallyDrop;
+use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
 
 use crate::libkern::AllocError;
@@ -92,6 +94,60 @@ impl Drop for DmaBuffer {
     }
 }
 
+/// **Proof a device has stopped using the memory it was given**, which [`Programmed::release`]
+/// takes: minted only where a stop was seen to take, or the one command that held the memory's
+/// address was seen to retire.
+pub struct Quiesced(());
+
+impl Quiesced {
+    /// The proof, for a device seen to stop.
+    ///
+    /// # Safety
+    /// The device given the memory this releases was seen to stop with it — halted, its port or
+    /// slot stopped, or the command that held its address retired — and is not given it again.
+    pub unsafe fn assume() -> Quiesced {
+        Quiesced(())
+    }
+}
+
+/// **Memory whose address a device was given.** Dropped, it is leaked, since the device may still
+/// write it; it is freed only through [`release`](Self::release), with the proof the device
+/// stopped. Wrapped before the address is written to the device.
+pub struct Programmed<T>(ManuallyDrop<T>);
+
+impl<T> Programmed<T> {
+    /// `value`, whose address a device is about to be given.
+    pub fn new(value: T) -> Self {
+        Programmed(ManuallyDrop::new(value))
+    }
+
+    /// The value back, the device having stopped with it: freed as any value is, when dropped.
+    pub fn release(self, _stopped: Quiesced) -> T {
+        ManuallyDrop::into_inner(self.0)
+    }
+
+    /// The value back, for an owner that never frees it: one publishing it for the kernel's life.
+    ///
+    /// # Safety
+    /// The value is not dropped while the device may use the memory.
+    pub unsafe fn keep(self) -> T {
+        ManuallyDrop::into_inner(self.0)
+    }
+}
+
+impl<T> Deref for Programmed<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for Programmed<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 /// The smallest buddy `order` whose block holds `size` bytes, or `None` if that exceeds
 /// [`MAX_ORDER`]. A request of at most one page is order 0.
 fn order_for(size: usize) -> Option<usize> {
@@ -104,6 +160,20 @@ fn order_for(size: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
+
+    /// **Memory a device was given is freed only with the proof it stopped**: dropped, it leaks.
+    #[test]
+    fn programmed_memory_is_freed_only_once_its_device_stopped() {
+        init_global_heap();
+        let freed = heap::frames_freed_by_this_thread();
+        let _ = Programmed::new(DmaBuffer::alloc(PAGE_SIZE).unwrap());
+        assert_eq!(heap::frames_freed_by_this_thread(), freed, "dropped while the device may write it");
+        let mut kept = Programmed::new(DmaBuffer::alloc(2 * PAGE_SIZE).unwrap());
+        kept.as_mut_slice()[0] = 1;
+        // SAFETY: no device was given it.
+        drop(kept.release(unsafe { Quiesced::assume() }));
+        assert_eq!(heap::frames_freed_by_this_thread(), freed + 2, "released, then freed");
+    }
 
     #[test]
     fn order_for_rounds_up_to_power_of_two_pages() {

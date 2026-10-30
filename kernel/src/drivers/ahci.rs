@@ -20,7 +20,7 @@ use crate::io::stats::Counted;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox};
-use crate::mm::dma::DmaBuffer;
+use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
@@ -191,10 +191,10 @@ pub struct AhciDisk {
     flush_command: u8,
     /// The port lock: slot 0 and its queue, taken from thread context and the ISR alike.
     state: IrqSpinLock<PortState>,
-    intr: *mut (),
+    intr: ObjectRef,
     counted: Counted,
-    /// What wakes the watch thread: a fault's DPC signals it. An `InterruptObject`, leaked.
-    wake: *mut (),
+    /// What wakes the watch thread: a fault's DPC signals it. An `InterruptObject`.
+    wake: ObjectRef,
 }
 
 // SAFETY: the disk state is set up once at boot and is immutable thereafter except for `state`,
@@ -227,6 +227,8 @@ fn write32(base: u64, off: u64, val: u32) {
 }
 
 mod bringup;
+#[cfg(test)]
+use bringup::claim_port;
 pub use bringup::init;
 
 const DRIVER: &str = "ahci";
@@ -239,9 +241,9 @@ fn declined(why: &'static str) -> Outcome {
     Outcome::Declined { driver: DRIVER, why }
 }
 
-/// Stop the port: clear ST then FRE, waiting for CR/FR to clear. Whether they did: a command list
-/// still running may still move a command's data.
-fn stop_port(pb: u64) -> bool {
+/// Stop the port: clear ST then FRE, waiting for CR/FR to clear. The proof they did, or `None`: a
+/// command list still running may still move a command's data.
+fn stop_port(pb: u64) -> Option<Quiesced> {
     let mut cmd = read32(pb, PX_CMD);
     cmd &= !CMD_ST;
     write32(pb, PX_CMD, cmd);
@@ -250,7 +252,8 @@ fn stop_port(pb: u64) -> bool {
     cmd &= !CMD_FRE;
     write32(pb, PX_CMD, cmd);
     wait_clear(pb, PX_CMD, CMD_FR);
-    read32(pb, PX_CMD) & (CMD_CR | CMD_FR) == 0
+    // SAFETY: CR and FR read clear: the port fetches no command and receives no FIS.
+    (read32(pb, PX_CMD) & (CMD_CR | CMD_FR) == 0).then(|| unsafe { Quiesced::assume() })
 }
 
 /// Start the port: set FRE then ST (FRE must precede ST).
@@ -289,17 +292,19 @@ fn wait_clear(pb: u64, off: u64, mask: u32) {
 /// # Safety
 /// `disk` is the live, brought-up disk state; called at bring-up with no IRQ.
 unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Option<(u64, usize, u8)> {
-    let data = DmaBuffer::alloc(SECTOR_SIZE as usize).ok()?;
+    let data = Programmed::new(DmaBuffer::alloc(SECTOR_SIZE as usize).ok()?);
     let frags = [PhysFrag { base: data.phys().as_u64(), len: SECTOR_SIZE as u64 }];
     build_command(disk, ATA_IDENTIFY, 0, 0, &frags, false);
     issue(disk);
     if !wait_command_polled(disk, COMMAND_DEADLINE_NS) {
         // The command may be running yet: its buffer goes only once the port has stopped it.
-        if !stop_port(disk.port_base) {
-            core::mem::forget(data);
+        if let Some(stopped) = stop_port(disk.port_base) {
+            drop(data.release(stopped));
         }
         return None;
     }
+    // SAFETY: the command retired, PxCI read clear, and the next one rewrites the table.
+    let data = data.release(unsafe { Quiesced::assume() });
     // IDENTIFY words 100..104 hold the 48-bit max-LBA sector count.
     let words = data.virt() as *const u16;
     // SAFETY: `data` holds the 512-byte IDENTIFY result; word 100..=103 in range.
@@ -686,7 +691,7 @@ fn ahci_fault_dpc(_ctx: *mut ()) {
     let disk = AHCI.load(Ordering::Acquire);
     if !disk.is_null() {
         // SAFETY: live published state; its `wake` a live `InterruptObject`.
-        unsafe { crate::sched::signal_interrupt((*disk).wake) };
+        unsafe { crate::sched::signal_interrupt((*disk).wake.as_ptr()) };
     }
 }
 
@@ -701,11 +706,11 @@ extern "C" fn watch(_arg: usize) {
     let d: &'static AhciDisk = unsafe { &*disk };
     while !d.state.lock().dead {
         let now = clock();
-        // SAFETY: `d.wake` is the disk's `InterruptObject`, leaked with it.
-        let woke = unsafe { crate::sched::wait_on(&[d.wake as usize], due_at(d, now), now) };
+        // SAFETY: `d.wake` pins the disk's `InterruptObject`.
+        let woke = unsafe { crate::sched::wait_on(&[d.wake.as_ptr() as usize], due_at(d, now), now) };
         if let crate::sched::WaitResult::Signaled(_) = woke {
             // SAFETY: as above.
-            unsafe { crate::sched::interrupt_consume(d.wake) };
+            unsafe { crate::sched::interrupt_consume(d.wake.as_ptr()) };
         }
         if let Some(irp) = claim(d, clock(), false) {
             said(d, recover(d, irp));
@@ -755,7 +760,7 @@ fn claim(d: &AhciDisk, now: u64, forced: bool) -> Option<*mut Irp> {
 /// may print under a host test.
 fn recover(d: &AhciDisk, irp: *mut Irp) -> bool {
     let pb = d.port_base;
-    if !stop_port(pb) {
+    if stop_port(pb).is_none() {
         let mut refused = give_up(&mut d.state.lock());
         loop {
             let next = refused.pop();
@@ -826,7 +831,7 @@ fn ahci_intr_dpc(_ctx: *mut ()) {
     let disk = AHCI.load(Ordering::Acquire);
     if !disk.is_null() {
         // SAFETY: `disk` is live published state, and its `intr` a live `InterruptObject`.
-        unsafe { crate::sched::signal_interrupt((*disk).intr) };
+        unsafe { crate::sched::signal_interrupt((*disk).intr.as_ptr()) };
     }
 }
 

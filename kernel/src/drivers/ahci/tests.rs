@@ -154,11 +154,16 @@ fn fake_disk() -> (FakeRegs, AhciDisk) {
         sectors: 1 << 20,
         flush_command: ATA_FLUSH_CACHE_EXT,
         state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
-        intr: core::ptr::null_mut(),
+        intr: interrupt_object(),
         counted: Counted::new(),
-        wake: core::ptr::null_mut(),
+        wake: interrupt_object(),
     };
     (regs, disk)
+}
+
+fn interrupt_object() -> ObjectRef {
+    // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
+    unsafe { crate::drivers::adopt(InterruptObject::try_new().unwrap(), KObjectType::InterruptObject) }
 }
 
 /// A read of one sector into `frag`.
@@ -451,5 +456,24 @@ fn a_commands_device_time_runs_from_its_issue_to_its_retire() {
         crate::dpc::run_pending();
         let busy = STATS.record_for(0, 0).busy_ns - before;
         assert!((ON_DEVICE..ON_DEVICE + 1_000_000_000).contains(&busy), "{way}: {busy} ns on the device");
+    }
+}
+
+/// **A disk declined after its port started frees its memory only once the port stopped**: a
+/// command list still running may yet write the received-FIS area or move IDENTIFY's data.
+#[test]
+fn a_declined_disk_frees_its_memory_only_once_its_port_stopped() {
+    crate::mm::test_support::init_global_heap();
+    for stops in [true, false] {
+        let regs = FakeRegs(std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 96])));
+        let abar = regs.0 as u64;
+        if !stops {
+            write32(abar + PORT_BASE, PX_CMD, CMD_CR);
+        }
+        let freed = crate::mm::heap::frames_freed_by_this_thread();
+        let claimed = claim_port(abar, 0).map(|_| ());
+        assert_eq!(claimed, Err("IDENTIFY failed"), "stops {stops}: nothing answers on fake registers");
+        let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
+        assert_eq!(gave, if stops { 4 } else { 0 }, "stops {stops}: its three port pages and IDENTIFY's");
     }
 }

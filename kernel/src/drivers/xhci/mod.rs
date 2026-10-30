@@ -40,7 +40,7 @@ use crate::dpc::Dpc;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec};
-use crate::mm::dma::DmaBuffer;
+use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
 use crate::object::{InterruptObject, ObjectRef, PendingOperation};
@@ -266,13 +266,25 @@ fn write64(base: u64, off: u64, val: u64) {
     write32(base, off + 4, (val >> 32) as u32);
 }
 
+/// **Bring-up's clock.** A host test's moves on as it is read, where the host's reads 0.
+#[cfg(not(test))]
+fn clock() -> u64 {
+    crate::arch::Timer::read_ns()
+}
+
+#[cfg(test)]
+fn clock() -> u64 {
+    std::thread_local!(static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(0) });
+    NOW.with(|now| now.replace(now.get() + 1_000_000))
+}
+
 fn wait_for(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {
-    let start = crate::arch::Timer::read_ns();
+    let start = clock();
     loop {
         if done() {
             return true;
         }
-        if crate::arch::Timer::read_ns().wrapping_sub(start) > bound_ns {
+        if clock().wrapping_sub(start) > bound_ns {
             return done();
         }
         core::hint::spin_loop();
@@ -280,8 +292,8 @@ fn wait_for(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {
 }
 
 fn pause(ns: u64) {
-    let start = crate::arch::Timer::read_ns();
-    while crate::arch::Timer::read_ns().wrapping_sub(start) < ns {
+    let start = clock();
+    while clock().wrapping_sub(start) < ns {
         core::hint::spin_loop();
     }
 }
@@ -493,27 +505,29 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     let Ok(boxed) = KBox::try_new(x) else {
         return declined(OUT_OF_MEMORY);
     };
+    let boxed = Programmed::new(boxed);
 
     // **Run, and prove the rings with a No Op**, polled: interrupts are masked here, and the
     // interrupter is not on yet. Any port's change event that lands first is counted and passed.
-    // A decline from here stops the controller **before** the box drops.
+    // A decline from here gives the box back only once the controller has stopped.
     write32(op, USBCMD, CMD_RUN);
     if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH == 0) {
-        stop(op);
+        give_back(op, boxed);
         return declined("it did not start running");
     }
     let answer = no_op(&boxed);
     let Some(code) = answer else {
-        stop(op);
+        give_back(op, boxed);
         return declined("its command ring did not answer a No Op");
     };
     if code != code::SUCCESS {
-        stop(op);
+        give_back(op, boxed);
         crate::kprintln!("xhci: {at}: a No Op completed with code {code}");
         return declined("a No Op did not complete with Success");
     }
 
-    let x = KBox::into_raw(boxed).as_ptr();
+    // SAFETY: published, it is never freed.
+    let x = KBox::into_raw(unsafe { boxed.keep() }).as_ptr();
     XHCI.store(x, Ordering::Release);
     // SAFETY: just published, and nothing else holds it yet.
     let x = unsafe { &*x };
@@ -577,13 +591,26 @@ fn scratchpads_for(count: u32, dcbaa: &DmaBuffer) -> Option<Scratchpads> {
 }
 
 /// Stop a controller that was started, before a decline frees what it writes to: halt it, then
-/// reset it, each within its bound.
-fn stop(op: u64) {
+/// reset it, each within its bound. The proof it halted, or `None`: then it is not reset either,
+/// since a reset while running is forbidden (xHCI 1.2 §5.4.1), and what it was given is kept.
+fn stop(op: u64) -> Option<Quiesced> {
     write32(op, USBCMD, 0);
-    let _ = wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH != 0);
+    if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH != 0) {
+        return None;
+    }
     write32(op, USBCMD, CMD_HCRST);
     pause(1_000_000);
     let _ = wait_for(RESET_NS, || read32(op, USBCMD) & CMD_HCRST == 0);
+    // SAFETY: HCH read set: the controller halted, and a halted one touches no memory.
+    Some(unsafe { Quiesced::assume() })
+}
+
+/// **Decline a controller that was started**: `mem`, what it was given, freed once it has stopped,
+/// and kept for good if it did not.
+fn give_back<T>(op: u64, mem: Programmed<T>) {
+    if let Some(stopped) = stop(op) {
+        drop(mem.release(stopped));
+    }
 }
 
 /// Send a No Op through the command ring and poll the event ring for its completion code, or
@@ -823,6 +850,23 @@ impl fmt::Display for Ranges<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A started controller declined is given back its memory only once it halted**: one that
+    /// will not halt keeps it, and is not reset while it runs.
+    #[test]
+    fn a_declined_controller_frees_its_memory_only_once_halted() {
+        crate::mm::test_support::init_global_heap();
+        for halts in [false, true] {
+            let mut regs = std::boxed::Box::new([0u32; 4]);
+            let op = regs.as_mut_ptr() as u64;
+            write32(op, USBSTS, if halts { STS_HCH } else { 0 });
+            let freed = crate::mm::heap::frames_freed_by_this_thread();
+            give_back(op, Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).unwrap()));
+            let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
+            assert_eq!(gave, halts as usize, "halts {halts}: its memory freed");
+            assert_eq!(read32(op, USBCMD), if halts { CMD_HCRST } else { 0 }, "halts {halts}: reset");
+        }
+    }
 
     /// A transfer on `slot`'s default endpoint waiting for its Status stage at `status`.
     fn transfer(slot: u8, status: u64) -> Option<Waiting> {
