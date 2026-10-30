@@ -839,6 +839,65 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     assert_eq!(fo.lookup(0), Some((next, PageState::Loading)));
 }
 
+/// **A fill answered with bytes the kernel may not read fails**: a borrowed memory object, or
+/// another kind of object, completes the fill `Unsupported` and leaves its page unready.
+// TODO(miri-provenance-tests): the other kind's case bites only under Miri; see the entry.
+#[test]
+fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loading() {
+    use crate::mm::{Caching, PhysAddr};
+    use crate::object::file_object::Fault;
+    use crate::object::ipc_channel::StoredMsg;
+    use crate::object::{
+        FileObject, IpcChannel, MemoryObject, PageState, PendingOperation, Producer, UserspaceServerReg,
+    };
+    use crate::rsproto::{REQUEST_ID_OFFSET, build_read_range_request};
+    init_global_heap();
+    let refused = |answer: ObjectRef| {
+        // SAFETY: each a fresh object, adopted under its own tag.
+        let (reg, _server_end, file) = unsafe {
+            let (k, s) = IpcChannel::try_new_pair(4).unwrap();
+            let k = crate::drivers::adopt(k, KObjectType::IpcChannel);
+            (
+                crate::drivers::adopt(UserspaceServerReg::try_new(k).unwrap(), KObjectType::UserspaceServerReg),
+                crate::drivers::adopt(s, KObjectType::IpcChannel),
+                crate::drivers::adopt(
+                    FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap(),
+                    KObjectType::FileObject,
+                ),
+            )
+        };
+        // SAFETY: `file` pins the `FileObject`.
+        let fo = unsafe { &*(file.as_ptr() as *const FileObject) };
+        let Fault::Fill(frame, po) = fo.reserve_fault(0) else { panic!("a fill") };
+        // SAFETY: `reg` pins the registration, and the test is single-threaded.
+        let id = unsafe { UserspaceServerReg::begin_fill(reg.as_ptr(), &po, &file, frame, 0) }.unwrap();
+        let mut reply = StoredMsg::zeroed();
+        build_read_range_request(&mut reply.payload, 0, PAGE_SIZE as u32, b"f").unwrap();
+        reply.payload[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8].copy_from_slice(&id.to_le_bytes());
+        reply.payload[16..20].copy_from_slice(&1u32.to_le_bytes());
+        reply.payload[20..24].copy_from_slice(&8u32.to_le_bytes());
+        reply.payload[28..32].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        transfers[0] = Some(TransferRef { obj: answer, rights: Rights::MAP_READ | Rights::TRANSFER });
+        assert_eq!(complete_read_range_reply(&reg, &reply, &mut transfers, 36), Ok(0));
+        // SAFETY: `po` pins the fill's `PendingOperation`.
+        let (status, _) = unsafe { crate::sched::pending_op_completion(po.as_ptr()) };
+        (status, fo.lookup(0).map(|(_, state)| state))
+    };
+    let unsupported = (KError::Unsupported as i32, Some(PageState::Loading));
+    // SAFETY: a range the test heap never holds; nothing maps it, and a read of it would fault.
+    let aperture = unsafe { MemoryObject::try_new_borrowed(PhysAddr::new(0xF000_0000), PAGE_SIZE, Caching::Normal) };
+    // SAFETY: fresh objects, adopted under their own tags.
+    let (aperture, po) = unsafe {
+        (
+            crate::drivers::adopt(aperture.unwrap(), KObjectType::MemoryObject),
+            crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation),
+        )
+    };
+    assert_eq!(refused(aperture), unsupported, "a borrowed memory object");
+    assert_eq!(refused(po), unsupported, "another kind of object");
+}
+
 /// **A borrowed memory object is refused wherever the kernel reaches its frames itself.**
 #[test]
 fn a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames() {

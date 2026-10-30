@@ -2429,7 +2429,10 @@ survive rather than merely diagnose.
 
 **Four provenance tests fail only under Miri, which no CI job runs — `TODO(miri-provenance-tests)`.**
 Each pins a pointer derived so that a later borrow cannot retire it (2026-10-29), and natively it
-passes on the old code as on the new, since the hardware cannot see provenance. Run by hand, from
+passes on the old code as on the new, since the hardware cannot see provenance. So does one half
+of `a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loading`: without
+`copy_fill_into_frame`'s kind check it reads a `PendingOperation` as a `MemoryObject`, and the
+uninitialised byte it reads natively happens to refuse. Run by hand, from
 `kernel/` with `cargo +nightly-2026-07-20 miri test --lib --target x86_64-unknown-linux-gnu` and
 `MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-ignore-leaks'`:
 `the_fpu_area_pointer_may_be_written_through`, `a_disk_over_its_own_bytes_writes_and_reads_them_back`
