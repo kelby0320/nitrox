@@ -228,11 +228,13 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
                 let reg = reactor.take();
                 let handles = &reg.handles[..reg.count];
                 let mut results = zeroed_results::<MAX_WAIT>();
-                if reg.count == 0 {
-                    idle.sleep();
-                } else if reg.dropped || UNWATCHED.load(Relaxed) != unwatched {
-                    sys::wait(handles, &mut results, Idle::soon());
-                } else if sys::wait(handles, &mut results, u64::MAX) < 0 {
+                let short = reg.dropped || UNWATCHED.load(Relaxed) != unwatched;
+                let deadline = if short { Idle::soon() } else { u64::MAX };
+                let waited = reg.count > 0 && {
+                    let n = sys::wait(handles, &mut results, deadline);
+                    n >= 0 || n == KError::TimedOut as i64
+                };
+                if !waited {
                     idle.sleep();
                 }
             }
@@ -396,7 +398,33 @@ mod tests {
     #[test]
     fn a_ninth_operation_is_polled_again() {
         sys::reset();
-        let mut ops: std::vec::Vec<Op> = (0..9)
+        let mut ops = eight_never_and_a_ninth();
+        let first = block_on(core::future::poll_fn(|cx| first_ready(&mut ops, cx)));
+        assert_eq!(first.unwrap().result, 9);
+        assert_eq!(sys::sleeps(), 1, "a deadline wait that timed out, which is no failure");
+        // The other eight never finish, so their drops would wait for ever.
+        core::mem::forget(ops);
+    }
+
+    /// **A failed wait in a round that left a handle out sleeps** before the next poll too.
+    #[test]
+    fn a_failed_wait_past_the_eighth_sleeps_before_the_next_poll() {
+        sys::reset();
+        let mut ops = eight_never_and_a_ninth();
+        sys::fail_next_wait(-4);
+        let mut slept = std::vec::Vec::new();
+        block_on(core::future::poll_fn(|cx| {
+            slept.push(sys::sleeps());
+            first_ready(&mut ops, cx)
+        }))
+        .unwrap();
+        assert_eq!(slept, [0, 1]);
+        core::mem::forget(ops);
+    }
+
+    /// Nine `Op`s, the first eight never signalling and the ninth on the next wait.
+    fn eight_never_and_a_ninth() -> std::vec::Vec<Op> {
+        (0..9)
             .map(|i| {
                 if i < 8 {
                     sys::script_never()
@@ -405,18 +433,16 @@ mod tests {
                 }
                 Op::submit(RawHandle(1), &read_op()).unwrap()
             })
-            .collect();
-        let first = block_on(core::future::poll_fn(|cx| {
-            ops.iter_mut()
-                .find_map(|op| match Pin::new(op).poll(cx) {
-                    Poll::Ready(r) => Some(Poll::Ready(r)),
-                    Poll::Pending => None,
-                })
-                .unwrap_or(Poll::Pending)
-        }));
-        assert_eq!(first.unwrap().result, 9);
-        // The other eight never finish, so their drops would wait for ever.
-        core::mem::forget(ops);
+            .collect()
+    }
+
+    fn first_ready(ops: &mut [Op], cx: &mut Context<'_>) -> Poll<Result<IoResult>> {
+        ops.iter_mut()
+            .find_map(|op| match Pin::new(op).poll(cx) {
+                Poll::Ready(r) => Some(Poll::Ready(r)),
+                Poll::Pending => None,
+            })
+            .unwrap_or(Poll::Pending)
     }
 
     /// **`block_on` sleeps with nothing to wait on**, where it spun on a wait the kernel refuses.
