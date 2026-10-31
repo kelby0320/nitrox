@@ -58,17 +58,6 @@ const E_PEER_CLOSED: i64 = -13;
 const READ_ENDPOINT: &str = "read-endpoint";
 const READ_BODY_CAP: usize = IPC_PAYLOAD_SIZE - RS_HEADER_LEN;
 
-static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE] = [0; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE];
-static mut CTRL_OUT0: u64 = 0;
-static mut CTRL_OUT1: u64 = 0;
-static mut SRC_OUT0: u64 = 0;
-static mut SRC_OUT1: u64 = 0;
-static mut READ_BODY: [u8; READ_BODY_CAP] = [0; READ_BODY_CAP];
-
 /// A per-principal log channel the server holds the read end of.
 struct Source {
     /// The kept (read) endpoint.
@@ -166,21 +155,49 @@ fn wall_now() -> Option<u64> {
     (r == 0).then_some(out)
 }
 
-fn make_channel(o0: *mut u64, o1: *mut u64) -> Option<(u64, u64)> {
-    // SAFETY: o0/o1 are valid writable out-params.
-    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, o0 as u64, o1 as u64, 4, 0) };
-    if cr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel wrote both endpoint handles.
-    Some(unsafe { (o0.read(), o1.read()) })
+/// A channel pair of depth 4: `(a, b)`.
+fn make_channel() -> Option<(u64, u64)> {
+    let (mut a, mut b) = (0u64, 0u64);
+    // SAFETY: valid writable out-params.
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, 4, 0) };
+    (cr == 0).then_some((a, b))
 }
 
-/// Receive one message on `endpoint` into `RECV_MSG`. Nothing sent to this service needs a handle,
-/// so whatever came is closed as the [`Received`] drops.
-fn recv(endpoint: u64) -> Result<Received, i64> {
-    // SAFETY: single-threaded; `RECV_MSG` is this service's own buffer, lent for the call.
-    unsafe { channel_recv_raw(endpoint, &raw mut RECV_MSG) }
+/// **The receive buffer**, one whole message, which [`Inbox::recv`] fills. What it holds is lent
+/// borrowed from it, so the next receive cannot overwrite a message still being read.
+struct Inbox([u8; MSG_LEN]);
+
+impl Inbox {
+    /// Receive one message on `endpoint`; any handle it brought closes as the [`Received`] drops.
+    fn recv(&mut self, endpoint: u64) -> Result<Received, i64> {
+        channel_recv(endpoint, &mut self.0)
+    }
+
+    /// The payload of the message last received.
+    fn payload(&self) -> &[u8] {
+        let len = u32::from_le_bytes([self.0[4], self.0[5], self.0[6], self.0[7]]) as usize;
+        &self.0[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)]
+    }
+
+    /// The rsproto message last received.
+    fn message(&self) -> Option<librsproto::Message<'_>> {
+        decode(self.payload()).ok()
+    }
+}
+
+/// Send `body` on `ch`, moving `handles`, from a whole message's buffer, as the kernel copies one.
+/// NoBlock: a reader that does not read its replies loses them, and never holds this service up.
+fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
+    let (mut msg, mut carried) = ([0u8; MSG_LEN], [0u64; 8]);
+    let Some(rs_len) = encode(&mut msg[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16) else {
+        return false;
+    };
+    msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+    msg[8] = handles.len() as u8;
+    carried[..handles.len()].copy_from_slice(handles);
+    let (msg, carried) = (msg.as_ptr() as u64, carried.as_ptr() as u64);
+    // SAFETY: a whole message, and the handles it carries, which this process holds.
+    unsafe { syscall5(SYS_CHANNEL_SEND, ch, msg, carried, handles.len() as u64, SENDMODE_NOBLOCK) == 0 }
 }
 
 /// Send `Meta::Ready` on the control channel, transferring `kernel_end` (the endpoint the
@@ -191,32 +208,7 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
         Some(n) => n,
         None => return false,
     };
-    // SAFETY: REPLY_MSG is a valid 4 KiB buffer; the rsproto message goes at offset 24.
-    let rs_len = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1) {
-            Some(n) => n,
-            None => return false,
-        }
-    };
-    // SAFETY: stamp the `IpcMsg` header (payload_len @4, handle_count @8) and the handle slot.
-    unsafe {
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = kernel_end;
-    }
-    // SAFETY: valid endpoint + message + 1-handle transfer. NoBlock: the control inbox
-    // starts empty.
-    let sr = unsafe {
-        syscall5(
-            SYS_CHANNEL_SEND,
-            control,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    sr == 0
+    send(control, librsproto::OP_READY, 0, 0, &body[..body_len], &[kernel_end])
 }
 
 /// Reply to a forwarded resolve, transferring `write_end` as the resolved channel. `true` once
@@ -224,53 +216,13 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
 fn reply_channel(serve_end: u64, request_id: u64, write_end: u64) -> bool {
     let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
-    // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset 24.
-    let rs_len = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
-            Some(n) => n,
-            None => return false,
-        }
-    };
-    // SAFETY: stamp the header + the transferred-handle slot.
-    let sr = unsafe {
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = write_end;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            serve_end,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    sr == 0
+    send(serve_end, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, &[write_end])
 }
 
 fn reply_error(serve_end: u64, request_id: u64, op: u16, kerror: i32) {
     let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
     let elen = error_body(&mut ebody, kerror, 0, b"").unwrap_or(0);
-    // SAFETY: REPLY_MSG is a valid buffer.
-    let rs_len = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody[..elen], 0) {
-            Some(n) => n,
-            None => return,
-        }
-    };
-    // SAFETY: stamp the header; no transferred handles.
-    unsafe {
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            serve_end,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        );
-    }
+    let _ = send(serve_end, op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody[..elen], &[]);
 }
 
 /// What a forwarded resolve on the serving endpoint asked for.
@@ -284,53 +236,43 @@ enum Asked {
 /// Handle one forwarded `Namespace::Resolve`: `read-endpoint` mints a read endpoint; anything
 /// else is classified as a log path and mints a per-principal channel (keep the read end tagged,
 /// transfer the write end). Bad paths and over-capacity get an error reply.
-fn process_resolve(serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Vec<u64>) {
-    // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG.
-    let (request_id, asked) = unsafe {
-        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
-        match decode(req) {
-            Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
-                Some(r) => match core::str::from_utf8(r.suffix).ok() {
-                    Some(suffix) if suffix.trim_matches('/') == READ_ENDPOINT => {
-                        (m.request_id, Some(Asked::ReadEndpoint))
+fn process_resolve(inbox: &Inbox, serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Vec<u64>) {
+    let (request_id, asked) = match decode(inbox.payload()) {
+        Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
+            Some(r) => match core::str::from_utf8(r.suffix).ok() {
+                Some(suffix) if suffix.trim_matches('/') == READ_ENDPOINT => (m.request_id, Some(Asked::ReadEndpoint)),
+                Some(suffix) => match path::classify(suffix) {
+                    // A principal is identity, so one too long to keep whole is refused,
+                    // not cut.
+                    Some(c) if c.principal.len() > NAME_MAX || c.source.is_some_and(|l| l.len() > NAME_MAX) => {
+                        reply_error(serve_end, m.request_id, m.op, KError::InvalidArgument.as_i32());
+                        (m.request_id, None)
                     }
-                    Some(suffix) => match path::classify(suffix) {
-                        // A principal is identity, so one too long to keep whole is refused,
-                        // not cut.
-                        Some(c) if c.principal.len() > NAME_MAX || c.source.is_some_and(|l| l.len() > NAME_MAX) => {
-                            reply_error(serve_end, m.request_id, m.op, KError::InvalidArgument.as_i32());
-                            (m.request_id, None)
-                        }
-                        Some(c) => {
-                            // Owned copies: `c` borrows the receive buffer the next message reuses.
-                            let label = c.source.map(String::from);
-                            (m.request_id, Some(Asked::Source(c.tier, String::from(c.principal), label)))
-                        }
-                        None => {
-                            reply_error(serve_end, m.request_id, m.op, KError::NotFound.as_i32());
-                            (m.request_id, None)
-                        }
-                    },
+                    Some(c) => {
+                        // Owned copies: `c` borrows the receive buffer the next message reuses.
+                        let label = c.source.map(String::from);
+                        (m.request_id, Some(Asked::Source(c.tier, String::from(c.principal), label)))
+                    }
                     None => {
                         reply_error(serve_end, m.request_id, m.op, KError::NotFound.as_i32());
                         (m.request_id, None)
                     }
                 },
                 None => {
-                    reply_error(serve_end, m.request_id, m.op, KError::InvalidArgument.as_i32());
+                    reply_error(serve_end, m.request_id, m.op, KError::NotFound.as_i32());
                     (m.request_id, None)
                 }
             },
-            Ok(m) => {
-                reply_error(serve_end, m.request_id, m.op, KError::Unsupported.as_i32());
+            None => {
+                reply_error(serve_end, m.request_id, m.op, KError::InvalidArgument.as_i32());
                 (m.request_id, None)
             }
-            Err(_) => (0, None),
+        },
+        Ok(m) => {
+            reply_error(serve_end, m.request_id, m.op, KError::Unsupported.as_i32());
+            (m.request_id, None)
         }
+        Err(_) => (0, None),
     };
     let (tier, principal, label) = match asked {
         Some(Asked::Source(tier, principal, label)) => (tier, principal, label),
@@ -344,7 +286,7 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Ve
         return;
     }
 
-    let (read_end, write_end) = match make_channel(&raw mut SRC_OUT0, &raw mut SRC_OUT1) {
+    let (read_end, write_end) = match make_channel() {
         Some(pair) => pair,
         None => {
             reply_error(serve_end, request_id, OP_NS_RESOLVE, KError::KernelError.as_i32());
@@ -376,7 +318,7 @@ fn mint_read_endpoint(serve_end: u64, request_id: u64, read_ends: &mut Vec<u64>)
     if read_ends.len() >= MAX_READ_ENDPOINTS {
         return reply_error(serve_end, request_id, OP_NS_RESOLVE, KError::WouldBlock.as_i32());
     }
-    let Some((ours, theirs)) = make_channel(&raw mut SRC_OUT0, &raw mut SRC_OUT1) else {
+    let Some((ours, theirs)) = make_channel() else {
         return reply_error(serve_end, request_id, OP_NS_RESOLVE, KError::KernelError.as_i32());
     };
     if reply_channel(serve_end, request_id, theirs) {
@@ -388,31 +330,17 @@ fn mint_read_endpoint(serve_end: u64, request_id: u64, read_ends: &mut Vec<u64>)
     }
 }
 
-/// The rsproto message in `RECV_MSG`.
-fn received() -> Option<librsproto::Message<'static>> {
-    // SAFETY: written by the `recv` that filled RECV_MSG; this process is single-threaded, so
-    // nothing writes it while the slice below is read.
-    unsafe {
-        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
-        decode(req).ok()
-    }
-}
-
 /// **A resolve on a read endpoint opens a read session**, whatever its suffix, at most
 /// [`MAX_READ_SESSIONS`] at once. `false` once the binding is gone, so the endpoint leaves the
 /// wait set rather than being signalled forever.
-fn serve_read_endpoint(from: u64, sessions: &mut Vec<u64>) -> bool {
+fn serve_read_endpoint(inbox: &mut Inbox, from: u64, sessions: &mut Vec<u64>) -> bool {
     loop {
-        let _sent = match recv(from) {
+        let _sent = match inbox.recv(from) {
             Ok(sent) => sent,
             Err(E_PEER_CLOSED) => return false,
             Err(_) => return true,
         };
-        let Some(m) = received() else { continue };
+        let Some(m) = inbox.message() else { continue };
         let (op, request_id) = (m.op, m.request_id);
         if op != OP_NS_RESOLVE {
             reply_error(from, request_id, op, KError::Unsupported.as_i32());
@@ -422,7 +350,7 @@ fn serve_read_endpoint(from: u64, sessions: &mut Vec<u64>) -> bool {
             reply_error(from, request_id, op, KError::WouldBlock.as_i32());
             continue;
         }
-        let Some((ours, theirs)) = make_channel(&raw mut SRC_OUT0, &raw mut SRC_OUT1) else {
+        let Some((ours, theirs)) = make_channel() else {
             reply_error(from, request_id, op, KError::KernelError.as_i32());
             continue;
         };
@@ -436,14 +364,14 @@ fn serve_read_endpoint(from: u64, sessions: &mut Vec<u64>) -> bool {
 }
 
 /// **A read session**: each `Log::Read` answered from the ring. `false` once its reader closed it.
-fn serve_read_session(h: u64, ring: &Ring) -> bool {
+fn serve_read_session(inbox: &mut Inbox, h: u64, ring: &Ring) -> bool {
     loop {
-        let _sent = match recv(h) {
+        let _sent = match inbox.recv(h) {
             Ok(sent) => sent,
             Err(E_PEER_CLOSED) => return false,
             Err(_) => return true,
         };
-        let Some(m) = received() else { continue };
+        let Some(m) = inbox.message() else { continue };
         let (op, request_id) = (m.op, m.request_id);
         if op != OP_LOG_READ {
             reply_error(h, request_id, op, KError::Unsupported.as_i32());
@@ -459,36 +387,11 @@ fn serve_read_session(h: u64, ring: &Ring) -> bool {
 /// Answer a `Read` with [`Ring::fill_reply`]. None left is an empty reply, which is how a
 /// reader knows it has read to the end.
 fn reply_records(to: u64, request_id: u64, ring: &Ring, after: u64, max: u32) {
-    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: READ_BODY is this single-threaded service's scratch, used by no one else.
-    let body = unsafe { &mut *(&raw mut READ_BODY) };
-    let Some(len) = ring.fill_reply(after, max, body) else {
+    let mut body = [0u8; READ_BODY_CAP];
+    let Some(len) = ring.fill_reply(after, max, &mut body) else {
         return reply_error(to, request_id, OP_LOG_READ, KError::KernelError.as_i32());
     };
-    // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset 24, and READ_BODY is
-    // not REPLY_MSG.
-    let rs_len = unsafe {
-        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-        let body = &(&*(&raw const READ_BODY))[..len];
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_LOG_READ, request_id, RS_FLAG_REPLY, body, 0) {
-            Some(n) => n,
-            None => return,
-        }
-    };
-    // SAFETY: stamp the header; no transferred handles. NoBlock: a reader that does not read its
-    // replies loses them, and never holds this service up.
-    unsafe {
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            to,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        );
-    }
+    let _ = send(to, OP_LOG_READ, request_id, RS_FLAG_REPLY, &body[..len], &[]);
 }
 
 /// Decode a `TSM1` typed-stream message and render each row as a `name=value …` record, after a
@@ -572,14 +475,14 @@ fn format_typed_row(schema: &libstream::Schema, values: &[libstream::Value]) -> 
 }
 
 /// Drain and stamp every queued `LogRecord` on source channel `h`. `true` once its writer is gone.
-fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
+fn drain_source(inbox: &mut Inbox, h: u64, sources: &[Source], log: &mut Log) -> bool {
     let (principal, tier, chan_label) = match sources.iter().find(|s| s.handle == h) {
         Some(s) => (s.principal.clone(), s.tier, s.label.clone()),
         // An unknown handle is no live source: reported dead, it leaves the wait set.
         None => return true,
     };
     loop {
-        let rc = recv(h);
+        let rc = inbox.recv(h);
         if rc.as_ref().is_err_and(|&e| e == E_PEER_CLOSED) {
             // **Terminal, and never retried.** A closed peer is permanently `signaled`, so a
             // dead handle left in the wait set makes `sys_wait` return at once, forever: this
@@ -590,14 +493,7 @@ fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
         let Ok(_sent) = rc else {
             break; // WouldBlock: drained
         };
-        // SAFETY: read payload_len, then a bounded read-only slice over RECV_MSG.
-        let body: &[u8] = unsafe {
-            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            core::slice::from_raw_parts(
-                ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-                payload_len.min(MSG_LEN - PAYLOAD_OFF),
-            )
-        };
+        let body = inbox.payload();
         // A TSM1 typed stream is rendered; anything else is a text `LogRecord` append.
         if body.starts_with(&libstream::wire::MAGIC) {
             render_typed(body, &principal, tier, &chan_label, log);
@@ -625,13 +521,15 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
     let mut read_ends: Vec<u64> = Vec::new();
     let mut sessions: Vec<u64> = Vec::new();
     let mut dead: Vec<u64> = Vec::new();
+    let mut inbox = Inbox([0; MSG_LEN]);
     loop {
-        // SAFETY: WAIT_HANDLES has MAX_WAIT_HANDLES slots, and each list is capped (the sources at
-        // MAX_SOURCES, what is left after the rest), so `count` never passes it.
-        let count = unsafe {
+        // Each list is capped (the sources at MAX_SOURCES, what is left after the rest), so `count`
+        // never passes MAX_WAIT_HANDLES.
+        let (mut handles, mut results) = ([0u64; MAX_WAIT_HANDLES], [0u8; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE]);
+        let count = {
             let mut count = 0;
             let mut put = |h: u64| {
-                WAIT_HANDLES[count] = h;
+                handles[count] = h;
                 count += 1;
             };
             put(serve_end);
@@ -642,31 +540,15 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
             sources.iter().for_each(|s| put(s.handle));
             count
         };
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for `count`.
-        let waited = unsafe {
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, count as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-        };
+        // SAFETY: `count` handles, and room for as many results.
+        let waited =
+            unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, count as u64, results.as_mut_ptr() as u64, u64::MAX) };
         if waited < 1 {
             continue;
         }
         // Each signaled handle is one 24-byte `IoResult` (handle @0).
         let signalled: Vec<u64> = (0..waited as usize)
-            .map(|j| {
-                let off = j * 24;
-                // SAFETY: `waited` records were written; `off + 8` stays inside WAIT_RESULTS.
-                unsafe {
-                    u64::from_le_bytes([
-                        WAIT_RESULTS[off],
-                        WAIT_RESULTS[off + 1],
-                        WAIT_RESULTS[off + 2],
-                        WAIT_RESULTS[off + 3],
-                        WAIT_RESULTS[off + 4],
-                        WAIT_RESULTS[off + 5],
-                        WAIT_RESULTS[off + 6],
-                        WAIT_RESULTS[off + 7],
-                    ])
-                }
-            })
+            .map(|j| u64::from_le_bytes(results[j * 24..j * 24 + 8].try_into().unwrap_or([0; 8])))
             .collect();
         // **Closes before resolves, in every wake**: a reader that lets go of a session or an
         // endpoint and asks for another at once must find the first retired, or it is refused a
@@ -677,7 +559,7 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
                 match libkern::control::recv(control) {
                     libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
                         for s in &sources {
-                            drain_source(s.handle, &sources, log);
+                            drain_source(&mut inbox, s.handle, &sources, log);
                         }
                         kprint(b"logging-service: asked to stop, exiting\n");
                         exit(0);
@@ -686,11 +568,11 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
                     _ => {}
                 }
             } else if sessions.contains(&h) {
-                if !serve_read_session(h, &log.ring) {
+                if !serve_read_session(&mut inbox, h, &log.ring) {
                     sessions.retain(|&e| e != h);
                     close(h);
                 }
-            } else if h != serve_end && !read_ends.contains(&h) && drain_source(h, &sources, log) {
+            } else if h != serve_end && !read_ends.contains(&h) && drain_source(&mut inbox, h, &sources, log) {
                 dead.push(h);
             }
         }
@@ -700,14 +582,14 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
             close(h);
         }
         for &h in &signalled {
-            if read_ends.contains(&h) && !serve_read_endpoint(h, &mut sessions) {
+            if read_ends.contains(&h) && !serve_read_endpoint(&mut inbox, h, &mut sessions) {
                 read_ends.retain(|&e| e != h);
                 close(h);
             }
         }
         if signalled.contains(&serve_end) {
-            while let Ok(_sent) = recv(serve_end) {
-                process_resolve(serve_end, &mut sources, &mut read_ends);
+            while let Ok(_sent) = inbox.recv(serve_end) {
+                process_resolve(&inbox, serve_end, &mut sources, &mut read_ends);
             }
         }
     }
@@ -719,7 +601,7 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
 pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"logging-service: up\n");
 
-    let (kernel_end, serve_end) = match make_channel(&raw mut CTRL_OUT0, &raw mut CTRL_OUT1) {
+    let (kernel_end, serve_end) = match make_channel() {
         Some(pair) => pair,
         None => {
             kprint(b"logging-service: channel create FAIL\n");
