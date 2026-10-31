@@ -74,7 +74,16 @@ pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
 /// [`FileError::Exists`] if `dst` exists and `overwrite` is false. A longer `dst` is shrunk first,
 /// else its old tail would survive.
 pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64, FileError> {
-    let size = file_size(ns, src).ok_or(FileError::NotFound)?;
+    let src_handle = lookup(ns, src, RIGHT_MAP_READ | RIGHT_INSPECT).map_err(|_| FileError::NotFound)?;
+    let result = copy_from(ns, src_handle, dst, overwrite);
+    // SAFETY: closing the handle resolved above.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, src_handle) };
+    result
+}
+
+/// [`copy_file`] from the file `src_handle` names, stated and mapped through that one handle.
+fn copy_from(ns: u64, src_handle: u64, dst: &[u8], overwrite: bool) -> Result<u64, FileError> {
+    let size = file_handle_size(src_handle).ok_or(FileError::NotFound)?;
     if size > MAX_COPY {
         return Err(FileError::TooLarge);
     }
@@ -99,22 +108,10 @@ pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64
         return Ok(0);
     }
 
-    let src_handle = lookup(ns, src, RIGHT_MAP_READ | RIGHT_INSPECT).map_err(FileError::Io)?;
-    let dst_handle = match create(ns, dst, size) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: closing our own handle before bailing.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, src_handle) };
-            return Err(e);
-        }
-    };
-
+    let dst_handle = create(ns, dst, size)?;
     let result = map_copy(src_handle, dst_handle, size);
-    // SAFETY: closing handles this function owns.
-    unsafe {
-        syscall1(SYS_HANDLE_CLOSE, src_handle);
-        syscall1(SYS_HANDLE_CLOSE, dst_handle);
-    }
+    // SAFETY: closing the handle `create` gave us.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, dst_handle) };
     result.map(|()| size)
 }
 
