@@ -1877,8 +1877,8 @@ impl Mgr {
         let found = core::str::from_utf8(body).ok().and_then(named);
         let facts = found.map(|i| {
             let s = &self.svcs[i];
-            let restart_due = s.restart_at.is_some();
-            services::Found { essential: s.decl.essential, running: s.running, restart_due, reached: i < self.started }
+            let (restart_due, reached) = (s.restart_at.is_some(), bringup::reached(i, self.started));
+            services::Found { essential: s.decl.essential, running: s.running, restart_due, reached }
         });
         let action = match services::decide(op, facts) {
             Ok(a) => a,

@@ -41,6 +41,11 @@ pub mod bringup {
         Done,
     }
 
+    /// Whether declaration `i` has been started by bring-up, which starts them in order.
+    pub fn reached(i: usize, started: usize) -> bool {
+        i < started
+    }
+
     /// The next step; the caller asks only when nothing is being waited for.
     pub fn next(entries: &[Entry], started: usize, chain_started: bool) -> Step {
         if !chain_started && started >= chain_at(entries) {
@@ -317,15 +322,15 @@ pub mod services {
             return Err((KError::NotFound, "no service is declared by that name"));
         };
         match op {
+            OP_SERVICES_STOP | OP_SERVICES_RESTART if essential => Err((
+                KError::NoAccess,
+                "it is essential: without it the system cannot be administered, or loses what it holds",
+            )),
             OP_SERVICES_START | OP_SERVICES_RESTART if !reached => {
                 Err((KError::WouldBlock, "bring-up has not reached it yet"))
             }
             OP_SERVICES_START if running => Err((KError::AlreadyExists, "it is already running")),
             OP_SERVICES_START => Ok(Action::Start),
-            OP_SERVICES_STOP | OP_SERVICES_RESTART if essential => Err((
-                KError::NoAccess,
-                "it is essential: without it the system cannot be administered, or loses what it holds",
-            )),
             OP_SERVICES_STOP if !running && restart_due => Ok(Action::CancelRestart),
             OP_SERVICES_STOP if !running => Err((KError::InvalidArgument, "it is not running")),
             OP_SERVICES_STOP => Ok(Action::Stop),
@@ -427,6 +432,10 @@ mod tests {
             assert_eq!(decide(op, Some(ahead)).map_err(|e| e.0), Err(KError::WouldBlock));
         }
         assert_eq!(decide(START, Some(Found { reached: true, ..ahead })), Ok(Action::Start));
+        let essential = Found { essential: true, ..ahead };
+        assert_eq!(decide(RESTART, Some(essential)).map_err(|e| e.0), Err(KError::NoAccess));
+        assert_eq!(decide(START, Some(essential)).map_err(|e| e.0), Err(KError::WouldBlock));
+        assert!(!super::bringup::reached(2, 2) && super::bringup::reached(2, 3));
     }
 
     #[test]
