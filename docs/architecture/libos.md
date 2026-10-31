@@ -145,8 +145,11 @@ scratch, and resolves to `R` (bytes transferred, a resolved handle, `()`). It is
   result, which may be a handle, is handed out once.
 - **`Drop`** closes the PO, **first waiting for an unfinished I/O**: `sys_io_cancel` is
   `Unsupported`, and the device may still be writing the buffer the dropped future borrowed,
-  which the caller would otherwise get back while it is written. A lookup's PO is closed at
-  once, since the kernel releases a lookup whose PO is closed unread.
+  which the caller would otherwise get back while it is written. A wait refused with
+  `OutOfMemory` (the PO's waiter queue full) is slept on and tried again; any other refusal is
+  for good. A lookup waits for nothing, since the kernel releases a lookup whose PO is closed
+  unread; but a wait that read the PO has installed its handle, so the drop polls once and
+  closes the handle a successful lookup reports.
 
 **`block_on` — the single-threaded reactor.** Alloc-free; drives one future to
 completion:
@@ -157,10 +160,12 @@ pub fn block_on<F: Future>(fut: F) -> F::Output;
 
 It polls `fut`; on `Pending`, it `sys_wait`s for ever on the waitable handles the pending
 `Op`s registered this round, then re-polls. A round can register eight (the kernel's
-`MAX_WAIT_HANDLES` is larger, but `block_on` keeps eight); one that had to leave a handle out
-waits only until a deadline a millisecond off, so the operation left out is polled again. A
-round with nothing registered, or whose wait failed, sleeps that millisecond on a timer it makes
-the first time it needs one, rather than spinning.
+`MAX_WAIT_HANDLES` is larger, but `block_on` keeps eight). One that had to leave a handle out,
+or in which an `Op` was polled through another waker and so registered nothing, waits only
+until a deadline a millisecond off, so that operation is polled again. A round with nothing
+registered, or whose wait failed, sleeps that millisecond rather than spinning, in a `sys_wait`
+on no handles, which the kernel never refuses. Deadlines resolve on the kernel's 10 ms tick, so
+each of these takes up to a tick.
 This *is* the executor for a single task — the same poll/wait loop a multi-task version
 would run, minus the ready-queue. It collapses the copy-pasted `po_wait`: init and
 eshell call `handle.read(buf).block_on()?` (or a `deadline`-bounded variant) instead of
@@ -171,8 +176,10 @@ hand-rolling submit/wait/decode/close.
 `RawWakerVTable` / `Waker::from_raw`) whose data pointer is a small **reactor** holding the
 handles pending futures want waited on. **`Op::poll` reads that pointer only from a waker
 whose vtable is `block_on`'s own**, which nothing else can name; another executor's waker, or
-`Waker::noop()`, is woken instead, with nothing registered. A clone of `block_on`'s waker gets
-a vtable of its own, since it may outlive the reactor, and so is never read as one.
+`Waker::noop()`, is woken instead, with nothing registered, and the poll is counted, so
+`block_on` waits with a deadline that round. A clone of `block_on`'s waker gets a vtable of its
+own, since it may outlive the reactor, and so is never read as one. The reactor's slots are
+atomics, as the `Waker` is `Sync` and an `Op` may be polled with it on another thread.
 
 **Why a future at all, if slice 5 only `block_on`s one at a time?** Because `Op:
 Future` is what a later multi-task executor drives, and what `async`/`await` desugars
@@ -194,8 +201,9 @@ host-testable with no kernel. Its functions take typed arguments (a path as `&[u
 more handles than its results hold, cutting both in code the host build runs too.
 `cfg(not(test))` → the real libkern `syscallN` calls; `cfg(test)` → a scriptable mock that
 **answers as the kernel does** (`InvalidHandle` for a handle it does not hold, `WouldBlock`
-for a poll that finds nothing ready), lets time pass in a wait with a deadline, panics on a
-wait for ever that nothing will end, and records calls. Host tests then cover: `Op` decodes
+for a poll that finds nothing ready, a lookup's handle installed by the first wait that reads
+it, a sleep on no handles), lets time pass in a wait with a deadline, panics on a wait for ever
+that nothing will end or a loop of waits that never does, and records calls. Host tests then cover: `Op` decodes
 `IoResult` correctly; `block_on` polls→waits→completes; a pre-signalled PO returns without
 waiting; error status → `Error` mapping; a foreign waker is never read; a dropped I/O is
 waited out; `Handle` attenuation issues the right `restrict`. (Typestate *misuse* is verified by

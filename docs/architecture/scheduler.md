@@ -357,7 +357,8 @@ thread, woken at once, and its parent hears `ChildExited`.
 
 **Every deadline has its slot before it is pushed.** The heap reserves one slot per thread at
 init (`MAX_THREADS` placed threads and a boot thread per CPU, each waiting on one deadline at
-most); a `Timer` brings one more, and an IPC endpoint one per `BlockBounded` send it can hold.
+most), so a `sys_wait` on no handles, a sleep on that slot alone, is never refused; a `Timer`
+brings one more, and an IPC endpoint one per `BlockBounded` send it can hold.
 Each reserves at creation, growing the heap outside `SCHED` if every slot is promised, and gives
 back at destruction. So a push never finds the heap full: a process holding many timers pays at
 creation, and fails no one else's wait. Its removals are a scan, so holding very many still

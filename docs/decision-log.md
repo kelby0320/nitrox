@@ -37241,24 +37241,33 @@ before this group.
 
 ## 2026-10-30 — Before Phase 7, Part I: libos's holes closed, its executor's edges defined
 
-Group R of the survey's triage, the userspace runtime, made six decisions, and with them every
+Group R of the survey's triage, the userspace runtime, made seven decisions, and with them every
 hole the 2026-10-27 entry listed as the condition for a crate moving onto libos is fixed:
 
 - **An `Op` reads no waker's data but `block_on`'s own** (rt-d1): `block_on`'s waker has a vtable
   nothing else names, its clones another, and `Op::poll` reads a reactor only through the first.
   Any other waker is woken, with nothing registered, so a foreign executor polls again rather
-  than having its data written.
+  than having its data written; the poll is counted, so `block_on` waits with a deadline that
+  round. The reactor's slots are atomics, as the `Waker` that reaches them is `Sync`.
 - **An `Op` completes on any wait error but a poll's `WouldBlock`, and hands its result out
   once** (rt-d12, rt-d8): a second poll after `Ready` is an error, rather than a panic, which PID 1
   must not reach, or the same result twice, which gave a lookup's handle two owners.
 - **Dropping an unfinished I/O waits for it** (rt-d6's libos half, the maintainer's call): the
   kernel cannot cancel I/O, and the device may still be using the buffer the dropped future
-  borrowed. A lookup's drop closes at once, as the kernel releases a lookup closed unread.
+  borrowed. A wait refused for now (`OutOfMemory`, a full waiter queue) is tried again. A
+  lookup's drop waits for nothing, as the kernel releases a lookup closed unread, but closes
+  the handle a wait that read it installed.
 - **`block_on` never waits for ever on less than it was asked to wait on, and never spins**
-  (rt-d13, rt-d9): a round that left a handle out past the eighth waits only until a deadline a
-  millisecond off; a round with nothing registered, or whose wait failed, sleeps that millisecond
-  on a timer it makes the first time. It keeps eight handles a round, under the kernel's 32, for
-  its stack.
+  (rt-d13, rt-d9): a round that left a handle out past the eighth, or an `Op` unregistered,
+  waits only until a deadline a millisecond off; a round with nothing registered, or whose wait
+  failed, sleeps that millisecond. Each takes up to the kernel's 10 ms tick. It keeps eight
+  handles a round, under the kernel's 32, for its stack.
+- **`sys_wait` on no handles sleeps until a finite deadline** (the maintainer's call, from the
+  review of the group's PR), where it was `InvalidArgument`: the deadline takes the slot every
+  thread holds, so the sleep is never refused, and libos sleeps that way rather than on a timer
+  it might not be able to make. A process out of handles or kernel memory spun in `block_on`,
+  and a spinning supervisor starves the idle thread that reclaims exited processes. A poll or a
+  wait for ever on no handles stays `InvalidArgument`; the ABI hash does not change.
 - **`unmap` and `thread_create` are `unsafe fn`s now** (rt-d2, rt-d3), as the triage chose; the
   owning `Mapping` and `Thread::start` stay P7's. libos's seam takes typed arguments, `wait` no
   more handles than its results hold, and its mock answers as the kernel does (rt-d10, rt-o11).
