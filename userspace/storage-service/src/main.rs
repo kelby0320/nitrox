@@ -44,7 +44,7 @@ use libkern::debug::Line;
 use libkern::device::{DeviceKind, DeviceRecord};
 use libkern::*;
 use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed};
-use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, DirReplyWriter, parse_read_dir_request};
+use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, parse_read_dir_request};
 use librsproto::meta::{FS_SETUP_READ_ONLY, fs_setup};
 use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, SUBNAMESPACE_PREFIX_LEN, parse_resolve_request,
@@ -1108,21 +1108,11 @@ impl Service {
                 .collect(),
             Listing::Mounts => self.mounted.iter().map(|x| (x.label.clone(), DIRENT_KIND_DIR, 0)).collect(),
         };
-        let mut out = [0u8; MSG_LEN - PAYLOAD_OFF - 64];
-        let Some(mut w) = DirReplyWriter::new(&mut out) else {
-            return reply_error(ch, m.op, m.request_id, KError::KernelError);
-        };
-        let mut i = cursor;
-        while i < entries.len() {
-            let (name, kind, size) = &entries[i];
-            if !w.push(i as u32 + 1, *kind, 0, *size, 0, name.as_bytes()) {
-                break;
-            }
-            i += 1;
+        let sent = storage_service::fit::dir_page(&entries, cursor)
+            .is_some_and(|(body, _)| send(ch, OP_FILE_READ_DIR, m.request_id, RS_FLAG_REPLY, &body, &[]));
+        if !sent {
+            reply_error(ch, m.op, m.request_id, KError::KernelError);
         }
-        let next = if i >= entries.len() { 0 } else { i as u64 };
-        let n = w.finish(next);
-        let _ = send(ch, OP_FILE_READ_DIR, m.request_id, RS_FLAG_REPLY, &out[..n], &[]);
     }
 
     /// A mount's control channel: its server sends nothing on it unasked, so a message is dropped,
