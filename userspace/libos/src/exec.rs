@@ -376,6 +376,8 @@ mod tests {
         let (_s, waits, _c) = sys::counts();
         assert!(matches!(Pin::new(&mut op).poll(&mut cx), Poll::Ready(Err(_))));
         assert_eq!(sys::counts().1, waits);
+        drop(op);
+        assert_eq!(sys::counts().1, waits, "a finished I/O's drop waits on nothing");
     }
 
     /// **An `Op` whose wait fails completes with the error**, where it was polled again for ever.
@@ -502,7 +504,26 @@ mod tests {
             if polls < 3 { Poll::Pending } else { Poll::Ready(()) }
         }));
         assert_eq!(sys::sleeps(), 2);
+        assert_eq!(sys::timers_made(), 1, "one timer, slept on twice");
         assert_eq!(sys::counts().2, 1, "its timer closed");
+    }
+
+    /// **An `Op` polled twice in a round is waited on once**, its handle registered once.
+    #[test]
+    fn an_op_polled_twice_in_a_round_is_waited_on_once() {
+        sys::reset();
+        sys::script_next(0, 3, false);
+        let mut op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let mut handed = std::vec::Vec::new();
+        let r = block_on(core::future::poll_fn(|cx| {
+            handed.push(sys::last_wait_count());
+            match Pin::new(&mut op).poll(cx) {
+                Poll::Ready(r) => Poll::Ready(r),
+                Poll::Pending => Pin::new(&mut op).poll(cx),
+            }
+        }));
+        assert_eq!(r.unwrap().result, 3);
+        assert_eq!(handed, [0, 1]);
     }
 
     /// **A failed wait sleeps before the next poll**, rather than polling again at once.
