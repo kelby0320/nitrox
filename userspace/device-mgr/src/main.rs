@@ -161,7 +161,7 @@ fn read_registry(root_ns: u64) -> Option<(Vec<DeviceRecord>, u64)> {
         (rs.collect(), generation)
     });
     // SAFETY: unmapping what was mapped above; `out` holds copies.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
     out
 }
 
@@ -189,7 +189,7 @@ fn read_io(root_ns: u64) -> Option<(CacheCounts, Vec<IoRecord>)> {
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };
     let out = io(bytes).ok().map(|snap| (snap.cache, snap.iter().collect()));
     // SAFETY: unmapping what was mapped above; `out` holds copies.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
     out
 }
 

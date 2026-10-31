@@ -293,7 +293,7 @@ fn with_mapped<T>(obj: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
     // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
     let out = f(unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) });
     // SAFETY: unmapping what was mapped above; nothing refers to it after `f` returned.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
     Some(out)
 }
 
