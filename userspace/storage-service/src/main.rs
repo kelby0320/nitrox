@@ -124,28 +124,26 @@ fn wait_until(h: u64, deadline: u64) -> bool {
     unsafe { syscall4(SYS_WAIT, (&raw const h) as u64, 1, result.as_mut_ptr() as u64, deadline) == 1 }
 }
 
-/// Park this thread for `ns`: a one-shot timer, since `sys_wait` takes no empty handle list, so a
-/// deadline alone is not a sleep. Returns at once if no timer can be made.
+/// Park this thread for `ns`, in a wait on no handles, which the kernel never refuses.
 fn park(ns: u64) {
-    // SAFETY: register-only syscall; returns a handle or a negative KError.
-    let timer = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
-    if timer < 0 {
-        return;
-    }
-    // SAFETY: arming this process's own timer, one-shot at an absolute monotonic time.
-    unsafe { syscall4(SYS_TIMER_SET, timer as u64, now_ns().saturating_add(ns), 0, 0) };
-    wait_until(timer as u64, u64::MAX);
-    close(timer as u64);
+    // SAFETY: no handles and no results, so the kernel reads and writes neither.
+    unsafe { syscall4(SYS_WAIT, 0, 0, 0, now_ns().saturating_add(ns)) };
 }
 
 /// Wait for a pending operation and return its `(status, value)`.
+/// Only once done: a full waiter queue refuses a wait for now, while the I/O may run on.
 fn po_wait(po: u64) -> (i64, u64) {
     let mut r = [0u8; 24];
-    // SAFETY: one handle, and room for its one result.
-    let done = unsafe { syscall4(SYS_WAIT, (&raw const po) as u64, 1, r.as_mut_ptr() as u64, u64::MAX) } == 1;
+    let done = loop {
+        // SAFETY: one handle, and room for its one result.
+        let waited = unsafe { syscall4(SYS_WAIT, (&raw const po) as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
+        if waited != KError::OutOfMemory.as_i32() as i64 {
+            break waited == 1;
+        }
+        park(HELD_PARK_NS);
+    };
     let word = |off: usize| u64::from_le_bytes(r[off..off + 8].try_into().unwrap_or([0; 8]));
-    // The status is an `i32`, beside a zero reserved word: read whole, `AlreadyExists` would never
-    // compare equal.
+    // The status is an `i32` beside a zero word: read whole, `AlreadyExists` would never match.
     let (status, value) = (word(8) as u32 as i32 as i64, word(16));
     close(po);
     if done { (status, value) } else { (-1, 0) }
@@ -1394,7 +1392,6 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN`. `0` once `service-mgr` is gone.
     let mut control = control;
     loop {
-        // Each kind refuses past its bound. The records are the loop's own, out of handlers' reach.
         let (mut handles, mut results) = ([0u64; MAX_WAIT_HANDLES], [0u8; 24 * MAX_WAIT_HANDLES]);
         let waited = {
             let mut n = 0usize;
@@ -1427,7 +1424,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             for &(d, _) in &s.dirs {
                 push(d);
             }
-            // SAFETY: `n` handles, and room for as many results.
+            // SAFETY: `n` handles, and room for as many results; each kind refuses past its bound.
             unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, u64::MAX) }
         };
         // **What a watch is told**: the names mounted and the devices there are before this turn,

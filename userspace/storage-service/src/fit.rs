@@ -54,7 +54,6 @@ mod tests {
     use librsproto::{OP_FILE_READ_DIR, RS_FLAG_REPLY, encode};
     use std::format;
 
-    /// **A full GPT's listing pages into replies that encode**, where its first page did not.
     #[test]
     fn a_full_gpts_listing_pages_into_replies_that_encode() {
         let names = core::iter::once(String::from("all.tsm")).chain((0..129).map(|n| format!("blk-{n}.tsm")));
@@ -73,7 +72,6 @@ mod tests {
         assert_eq!(entries.len(), 130);
     }
 
-    /// **A read never spans more than the scratch**, whatever block size divides it.
     #[test]
     fn a_read_never_spans_more_than_the_scratch() {
         for block in [512, 2048, 4096, 65_536] {
