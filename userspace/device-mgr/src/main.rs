@@ -376,9 +376,18 @@ impl Manager {
                 .i(po)
                 .s(b"); no longer following")
                 .end();
-            close(self.changes);
-            self.changes = 0;
+            self.stop_following();
         }
+    }
+
+    fn stop_following(&mut self) {
+        close(core::mem::take(&mut self.changes));
+        if self.change_at != 0 {
+            // SAFETY: unmapping the change page, which no read is writing: each caller's was
+            // refused or has completed.
+            unsafe { syscall2(SYS_MEMORY_UNMAP, core::mem::take(&mut self.change_at), PAGE) };
+        }
+        close(core::mem::take(&mut self.change_buf));
     }
 
     /// **The table changed**: read it again, diff it against the records held, and tell each
@@ -396,12 +405,11 @@ impl Manager {
                 .i(status)
                 .s(b"); no longer following")
                 .end();
-            close(self.changes);
-            self.changes = 0;
+            self.stop_following();
             return;
         }
         let Some((now, generation)) = read_registry(self.root_ns) else {
-            // SAFETY: `change_at` maps the change page read-only for the life of the manager, and the
+            // SAFETY: `change_at` maps the change page read-only while the manager follows, and the
             // kernel wrote its first eight bytes before completing the read just waited on.
             let answered = unsafe { core::ptr::read_volatile(self.change_at as *const u64) };
             self.past = self.past.max(answered);

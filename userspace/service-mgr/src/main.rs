@@ -131,13 +131,6 @@ fn send_msg(ch: u64, payload: &[u8], handle: u64) -> i64 {
     }
 }
 
-/// Move the log endpoint to a service as its first control message; closed if that failed.
-fn send_log_handoff(ctrl: u64, log_ep: u64) {
-    if send_msg(ctrl, &[], log_ep) != 0 {
-        close(log_ep);
-    }
-}
-
 fn send_control(ctrl: u64, op: u8) {
     if ctrl != 0 {
         send_msg(ctrl, &[op], 0);
@@ -280,13 +273,11 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (Option<Han
         return (None, 0);
     };
     // The spawn ABI delivers one handle to a register, so the log endpoint follows on the
-    // control channel.
-    if log_ep != 0 {
-        if smgr_end != 0 {
-            send_log_handoff(smgr_end, log_ep);
-        } else {
-            close(log_ep);
-        }
+    // control channel, as a non-server's first message: empty without one, as heartbeat takes it.
+    if decl.endpoint.is_none() && smgr_end != 0 {
+        send_handle(smgr_end, log_ep);
+    } else {
+        close(log_ep);
     }
     (Some(process), smgr_end)
 }

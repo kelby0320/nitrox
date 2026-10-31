@@ -17,7 +17,7 @@
 "userspace/libdraw/src/compose.rs" = 1510
 "userspace/libdraw/src/theme.rs" = 1086
 "userspace/librsproto/src/surface.rs" = 2567
-"userspace/libsession/src/lib.rs" = 1120
+"userspace/libsession/src/lib.rs" = 1119
 "userspace/libsurface/src/lib.rs" = 1423
 "userspace/libterm/src/grid.rs" = 1600
 "userspace/libui/src/route.rs" = 1235
@@ -33,7 +33,7 @@
 "userspace/nxsh/src/ops.rs" = 1079
 "userspace/nxsh/src/parse.rs" = 1867
 "userspace/nxterm/src/lib.rs" = 2341
-"userspace/service-mgr/src/main.rs" = 2079
+"userspace/service-mgr/src/main.rs" = 2070
 "userspace/storage-service/src/main.rs" = 1481
 "userspace/test-harness/src/harness.rs" = 3854
 "userspace/test-harness/src/uiclient.rs" = 1265
