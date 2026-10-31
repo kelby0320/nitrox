@@ -406,3 +406,14 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-31	410	86fb6af7	11	tests	optional	unverified	declined		raw libkern syscalls the host cannot mock; the leaks were shown by boots (Logger 18/40 -> 40/40, unmap probe), in the commits
 2026-10-31	410	86fb6af7	12	tests	optional	unverified	declined		unchanged from base: file_size made the same lookup and mapped every failure to NotFound
 2026-10-31	410	86fb6af7	13	rules-and-docs	optional	unverified	refuted		cargo doc renders thread_create's Safety as an h2: a CommonMark ATX heading interrupts a paragraph
+2026-10-31	412	ed39a552	1	tests	worth-fixing	demonstrated	fixed	210eaa6b	paging test decodes each page: names in order once each, cookies, next cursor; cursor+1 mutation fails it
+2026-10-31	412	ed39a552	2	rules-and-docs+architecture	worth-fixing	demonstrated	fixed	3abe6d30	six of 49 link libos (libos.md, userspace/CLAUDE.md); init/CLAUDE.md Reaping: no child handle kept, loop only logs
+2026-10-31	412	ed39a552	3	logic+error-paths+tests+architecture	optional	demonstrated	fixed	67c2e896	bringup::reached with its edge tested (<= fails it); the main.rs call stays untested: no declaration waits behind boot-probe
+2026-10-31	412	ed39a552	4	logic+architecture	optional	demonstrated	fixed	67c2e896	essential refusal before the reached one; old order answered WouldBlock to an essential restart
+2026-10-31	412	ed39a552	5	logic+architecture	optional	unverified	fixed	8cf587b9	a non-server's first control message is always its log handoff (endpoint or empty), via send_handle; by reading heartbeat
+2026-10-31	412	ed39a552	6	error-paths	optional	unverified	fixed	8cf587b9	refused extra followed by the empty message a missing one sends; by reading
+2026-10-31	412	ed39a552	7	error-paths	optional	demonstrated	fixed	18084225	test manifest opens past a page: one-page init failed test-qemu ("init.toml parse error"), whole object passes
+2026-10-31	412	ed39a552	8	error-paths	optional	unverified	fixed	8cf587b9	stop_following closes the node, unmaps the page and closes its handle on both runtime give-up paths; by reading
+2026-10-31	412	ed39a552	9	tests	optional	demonstrated	fixed	210eaa6b	cookies asserted in the paging test; cookie 0 fails it
+2026-10-31	412	ed39a552	10	tests	optional	demonstrated	fixed	210eaa6b	text of an object with no NUL asserted; unwrap_or(0) fails it
+2026-10-31	412	ed39a552	11	logic	optional	demonstrated	fixed	3abe6d30	SPAWN_SERVER and SPAWN_SUPERVISOR docs say they serve both programs
