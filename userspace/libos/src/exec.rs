@@ -22,6 +22,9 @@ const MAX_WAIT: usize = 8;
 /// How long `block_on` sleeps with nothing to wait on, before it polls again.
 const IDLE_NS: u64 = 1_000_000;
 
+/// Polls that left a pending `Op` registered with no reactor, so `block_on` must poll again.
+static UNWATCHED: AtomicUsize = AtomicUsize::new(0);
+
 /// An `[IoResult; N]` of zeroes (no `Copy`/`Default` bound needed).
 fn zeroed_results<const N: usize>() -> [IoResult; N] {
     core::array::from_fn(|_| IoResult { handle: 0, status: 0, reserved: 0, result: 0 })
@@ -180,6 +183,7 @@ impl Future for Op {
         let waker = cx.waker();
         if !core::ptr::eq(waker.vtable(), &VTABLE) {
             // Another executor's waker, or a clone of `block_on`'s: be polled again, unregistered.
+            UNWATCHED.fetch_add(1, Relaxed);
             waker.wake_by_ref();
             return Poll::Pending;
         }
@@ -206,7 +210,7 @@ impl Drop for Op {
 /// between polls. Alloc-free.
 ///
 /// On `Pending`, waits on the handles this round's `Op`s registered, then re-polls; it sleeps
-/// [`IDLE_NS`] with none or a failed wait, and waits no longer when one was left out.
+/// [`IDLE_NS`] with none or a failed wait, and waits no longer when an `Op` went unregistered.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     let reactor = Reactor::new();
     let raw = RawWaker::new(&reactor as *const Reactor as *const (), &VTABLE);
@@ -217,6 +221,7 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
     let mut fut = core::pin::pin!(fut);
     let mut idle = Idle { timer: None };
     loop {
+        let unwatched = UNWATCHED.load(Relaxed);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return v,
             Poll::Pending => {
@@ -225,7 +230,7 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
                 let mut results = zeroed_results::<MAX_WAIT>();
                 if reg.count == 0 {
                     idle.sleep();
-                } else if reg.dropped {
+                } else if reg.dropped || UNWATCHED.load(Relaxed) != unwatched {
                     sys::wait(handles, &mut results, Idle::soon());
                 } else if sys::wait(handles, &mut results, u64::MAX) < 0 {
                     idle.sleep();
@@ -304,7 +309,29 @@ mod tests {
             Poll::Ready(())
         }));
         let kept = kept.unwrap();
+        let unwatched = UNWATCHED.load(Relaxed);
         assert!(Pin::new(&mut op).poll(&mut Context::from_waker(&kept)).is_pending());
+        assert_ne!(UNWATCHED.load(Relaxed), unwatched);
+    }
+
+    /// **An `Op` polled through another waker is polled again**, where `block_on` waited for ever
+    /// on those that registered.
+    #[test]
+    fn an_op_polled_through_another_waker_is_polled_again() {
+        sys::reset();
+        sys::script_next(0, 11, false);
+        let mut a = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::script_never();
+        let mut b = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let got = block_on(core::future::poll_fn(|cx| {
+            let clone = cx.waker().clone();
+            if let Poll::Ready(r) = Pin::new(&mut a).poll(&mut Context::from_waker(&clone)) {
+                return Poll::Ready(r);
+            }
+            Pin::new(&mut b).poll(cx)
+        }));
+        assert_eq!(got.unwrap().result, 11);
+        core::mem::forget(b);
     }
 
     /// **Ops polled on other threads with `block_on`'s waker**, which is `Sync`, race on nothing.
