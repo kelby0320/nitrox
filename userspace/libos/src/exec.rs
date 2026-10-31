@@ -198,7 +198,11 @@ impl Future for Op {
 impl Drop for Op {
     fn drop(&mut self) {
         if self.io && !self.finished {
-            sys::wait(&[self.po], &mut zeroed_results::<1>(), u64::MAX);
+            let mut idle = Idle { timer: None };
+            // A full waiter queue refuses the wait for now; any other refusal is for good.
+            while sys::wait(&[self.po], &mut zeroed_results::<1>(), u64::MAX) == KError::OutOfMemory as i64 {
+                idle.sleep();
+            }
         }
         sys::handle_close(self.po);
     }
@@ -392,6 +396,18 @@ mod tests {
         sys::script_next(0, 2, false);
         drop(Op::from_po(sys::ns_lookup(1, b"/x", 0) as u64));
         assert_eq!(sys::closed_in_flight(), 1);
+    }
+
+    /// **A dropped I/O whose wait is refused for now waits again**, rather than closing in flight.
+    #[test]
+    fn a_dropped_io_whose_wait_is_refused_for_now_waits_again() {
+        sys::reset();
+        sys::script_next(0, 1, false);
+        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::fail_next_wait(KError::OutOfMemory as i64);
+        drop(op);
+        assert_eq!(sys::closed_in_flight(), 0);
+        assert_eq!(sys::sleeps(), 1);
     }
 
     /// **A ninth operation is polled again**, where `block_on` waited for ever on its first eight.

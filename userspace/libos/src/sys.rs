@@ -221,6 +221,7 @@ mod mock {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
             m.waits += 1;
+            assert!(m.waits < 10_000, "a loop of waits that never ends");
             m.last_wait_count = handles.len();
             if handles.is_empty() {
                 return -30;
