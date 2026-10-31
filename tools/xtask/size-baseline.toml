@@ -14,7 +14,6 @@
 "userspace/desktop-shell/src/panel.rs" = 1211
 "userspace/fs-server-ext4/src/ext4.rs" = 1846
 "userspace/fs-server-ext4/src/lib.rs" = 1764
-"userspace/init/src/main.rs" = 1025
 "userspace/libdraw/src/compose.rs" = 1510
 "userspace/libdraw/src/theme.rs" = 1086
 "userspace/librsproto/src/surface.rs" = 2567
@@ -35,7 +34,7 @@
 "userspace/nxsh/src/parse.rs" = 1867
 "userspace/nxterm/src/lib.rs" = 2341
 "userspace/service-mgr/src/main.rs" = 2079
-"userspace/storage-service/src/main.rs" = 1485
+"userspace/storage-service/src/main.rs" = 1481
 "userspace/test-harness/src/harness.rs" = 3854
 "userspace/test-harness/src/uiclient.rs" = 1265
 "userspace/view-broker/src/lib.rs" = 1646

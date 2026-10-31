@@ -421,13 +421,9 @@ fn read_manifest(root_ns: u64) -> Result<manifest::Manifest, &'static [u8]> {
     if st != 0 || obj == 0 {
         return Err(b"it did not resolve");
     }
-    let parsed = with_mapped(obj, |bytes| {
-        // The object is page-sized; the manifest ends at its first NUL.
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        match core::str::from_utf8(&bytes[..end]) {
-            Ok(text) => manifest::parse(text).map_err(|_| b"it did not parse".as_slice()),
-            Err(_) => Err(b"it is not UTF-8".as_slice()),
-        }
+    let parsed = with_mapped(obj, |bytes| match manifest::text(bytes) {
+        Ok(text) => manifest::parse(text).map_err(|_| b"it did not parse".as_slice()),
+        Err(_) => Err(b"it is not UTF-8".as_slice()),
     });
     close(obj);
     parsed.unwrap_or(Err(b"it would not map"))
