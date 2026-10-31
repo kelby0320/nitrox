@@ -623,24 +623,31 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     // The change node, and a page for its answers, mapped for the life of the manager so an
     // answer can be read when the table cannot.
     let changes = lookup(root_ns, b"/dev/registry/changes", RIGHT_READ | RIGHT_INSPECT);
-    // SAFETY: register-only syscall.
-    let change_buf = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }.max(0) as u64;
+    let change_buf = if changes == 0 {
+        0
+    } else {
+        // SAFETY: register-only syscall.
+        unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }.max(0) as u64
+    };
     let change_at = if change_buf == 0 {
         0
     } else {
         // SAFETY: register-only syscall; an object this process just created, mapped read-only.
         unsafe { syscall4(SYS_MEMORY_MAP, change_buf, 0, PAGE, RIGHT_MAP_READ) }.max(0) as u64
     };
-    if changes == 0 || change_at == 0 {
+    let following = change_at != 0;
+    if !following {
         kprint(b"device-mgr: no /dev/registry/changes to follow; devices plugged in later will not be handed over\n");
+        close(changes);
+        close(change_buf);
     }
     let mut m = Manager {
         serve_end,
         root_ns,
         records,
         past: generation,
-        changes: if change_at == 0 { 0 } else { changes },
-        change_buf,
+        changes: if following { changes } else { 0 },
+        change_buf: if following { change_buf } else { 0 },
         change_at,
         change_po: 0,
         nodes,
