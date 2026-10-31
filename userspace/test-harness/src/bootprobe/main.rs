@@ -236,6 +236,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & exit_while_spawning_test(root_ns)
         & thread_exit_under_load_test(root_ns)
         & many_timers_test()
+        & wait_on_nothing_test()
         & received_closes_what_was_not_taken_test()
         & receive_closes_what_its_caller_does_not_take_test()
         & sessions_close_what_they_were_sent_test(root_ns)

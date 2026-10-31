@@ -39,6 +39,39 @@ fn bounded_send_to_a_full_channel() -> Result<i32, i64> {
     outcome
 }
 
+/// **A wait on no handles sleeps until its deadline**, and a poll or a wait for ever on none is
+/// refused.
+pub(super) fn wait_on_nothing_test() -> bool {
+    // SAFETY: no handles and no results, so the kernel reads and writes neither.
+    let wait = |deadline: u64| unsafe { syscall4(SYS_WAIT, 0, 0, 0, deadline) };
+    let invalid = i64::from(KError::InvalidArgument.as_i32());
+    let (poll, forever) = (wait(0), wait(u64::MAX));
+    let start = clock_ns();
+    let slept = wait(start + 20 * MS);
+    let took = clock_ns() - start;
+    if poll != invalid || forever != invalid {
+        Line::new()
+            .s(b"boot-probe: a wait on nothing FAIL: a poll answered ")
+            .i(poll)
+            .s(b", for ever ")
+            .i(forever)
+            .end();
+        return false;
+    }
+    if slept != i64::from(KError::TimedOut.as_i32()) || took < 20 * MS {
+        Line::new()
+            .s(b"boot-probe: a wait on nothing FAIL: 20 ms answered ")
+            .i(slept)
+            .s(b" in ")
+            .u(took / MS)
+            .s(b" ms")
+            .end();
+        return false;
+    }
+    kprint(b"boot-probe: a wait on no handles sleeps until its deadline ok\n");
+    true
+}
+
 /// **Holding many armed timers starves no one's deadline.** With [`TIMERS`] armed for an hour, every
 /// one arms, a wait with a deadline times out, and a bounded send's deadline still fires.
 pub(super) fn many_timers_test() -> bool {

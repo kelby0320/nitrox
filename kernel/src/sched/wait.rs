@@ -1,6 +1,7 @@
 //! Blocking on objects, and waking.
 
 use super::*;
+use crate::syscall::error::{KError, SysResult};
 
 /// Park the current thread (`Blocked`, into `blocked`) and switch to the next runnable one,
 /// mirroring [`switch_to_next`]'s IF-bracket but **not** re-enqueuing it. The caller
@@ -106,6 +107,20 @@ pub enum WaitResult {
 pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
     // SAFETY: the caller's contract.
     unsafe { wait(objs, deadline_ns, now, true) }
+}
+
+/// `sys_wait` on no handles: sleep until `deadline_ns`, on the deadline slot every thread holds,
+/// so it is never refused, and answer `TimedOut`. A poll or a wait for ever on nothing is
+/// `InvalidArgument`.
+pub fn sleep_until(deadline_ns: u64, now: u64) -> SysResult {
+    if deadline_ns == 0 || deadline_ns == u64::MAX {
+        return Err(KError::InvalidArgument);
+    }
+    // SAFETY: an empty wait set has no object to pin.
+    match unsafe { wait_on(&[], deadline_ns, now) } {
+        WaitResult::OutOfMemory => Err(KError::OutOfMemory),
+        _ => Err(KError::TimedOut),
+    }
 }
 
 /// [`wait_on`] for a wait that I/O in flight depends on: it never answers [`WaitResult::Ended`],
