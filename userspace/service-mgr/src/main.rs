@@ -44,7 +44,7 @@ const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
 /// Spawn args for `session-mgr`: its control endpoint is moved in at `handles[0]`, and it is
 /// re-delegated `BIND_NAMESPACE` to construct per-session namespaces.
-/// Spawn args for `desktop-session-mgr`. **The two supervisors are unaware of each other**, so
+/// `desktop-session-mgr`'s too. **The two supervisors are unaware of each other**, so
 /// serial stays the recovery path; the same user may be logged in twice.
 const SPAWN_SUPERVISOR: SpawnArgs = SpawnArgs {
     image: 0,

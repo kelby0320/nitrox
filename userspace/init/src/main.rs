@@ -26,8 +26,7 @@ const PAGE: u64 = 4096;
 /// Bounded wait for an fs-server's Ready: init must not wait forever for a server.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
-/// **What a shutdown's [`finish`] needs**: `init`'s own mounts, in the order made, each with its
-/// server's control channel, and the system-control object, or 0 without one.
+/// What a shutdown's [`finish`] needs: init's mounts, as made, and the system-control object or 0.
 struct Finish {
     mounts: Vec<Kept>,
     system_control: u64,
@@ -44,7 +43,7 @@ struct Kept {
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
 /// Spawn args for an `fs-server-ext4`: the control channel in `handles[0]` (`rdx`), a LOOKUP root.
-/// Spawn args for the system `profile-server`: the control channel in `handles[0]`, a LOOKUP root.
+/// The system `profile-server`'s too.
 const SPAWN_SERVER: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 1,
