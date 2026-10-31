@@ -2018,7 +2018,7 @@ impl Mgr {
         let facts = found.map(|i| {
             let s = &self.svcs[i];
             let restart_due = s.restart_at.is_some();
-            services::Found { essential: s.decl.essential, running: s.running, restart_due }
+            services::Found { essential: s.decl.essential, running: s.running, restart_due, reached: i < self.started }
         });
         let action = match services::decide(op, facts) {
             Ok(a) => a,
