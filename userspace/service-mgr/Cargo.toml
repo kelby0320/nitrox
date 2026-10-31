@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
+# The safe spawn, whose handle owns the process it started.
+libos = { path = "../libos" }
 # The resource-server protocol: `Meta::Ready` from the servers it starts, and the resolves its
 # endpoint answers with `SUBNAMESPACE` into its registry (administration Part E.1).
 librsproto = { path = "../librsproto" }

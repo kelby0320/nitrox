@@ -37,8 +37,9 @@ and the slice plan all live there.
 - **Layering:** unlike `init`/`eshell`, service-mgr **is** allowed the stateful
   runtime — it runs after the ecosystem is coming up, not in the pre-allocator
   critical path. Trajectory: `libkern` + `libheap` + `libos` + `librsproto` + `libstream`,
-  eventual `std`. **Today it links `libkern`, `libheap`, `librsproto`, `libfs` and
-  `libstream`**: `librsproto` and `libfs` since administration Part E.1a, for the `SUBNAMESPACE`
+  eventual `std`. **Today it links `libkern`, `libheap`, `librsproto`, `libfs`, `libstream` and
+  `libos`**: `libos` for its safe `spawn`, whose handle owns the process it started;
+  `librsproto` and `libfs` since administration Part E.1a, for the `SUBNAMESPACE`
   replies its endpoint answers and for reading its declarations, and `libstream` since Part E.2a,
   for the table `/svc/services/all.tsm`.
 

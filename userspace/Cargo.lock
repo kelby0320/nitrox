@@ -484,6 +484,7 @@ dependencies = [
  "libfs",
  "libheap",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
 ]
