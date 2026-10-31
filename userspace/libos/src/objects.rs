@@ -31,7 +31,7 @@ impl Handle<Memory, MapReadWrite> {
 
 impl<M: MemMode> Handle<Memory, M> {
     /// Map the object into the address space (kernel-chosen address), returning the
-    /// base pointer. Mapped with the mode's `MAP_*` rights. Valid while `self` lives.
+    /// base pointer. Mapped with the mode's `MAP_*` rights, until [`unmap`](Self::unmap).
     pub fn map(&self, len: usize) -> Result<*mut u8> {
         let addr = sys::memory_map(self.raw().0, 0, len as u64, M::map_rights());
         if addr < 0 {
@@ -41,8 +41,13 @@ impl<M: MemMode> Handle<Memory, M> {
     }
 
     /// Unmap a region previously returned by [`map`](Self::map).
-    pub fn unmap(&self, addr: *mut u8, len: usize) -> Result<()> {
-        let r = sys::memory_unmap(addr as usize as u64, len as u64);
+    ///
+    /// # Safety
+    /// Nothing still uses the mapping covering `addr`, which the kernel unmaps whole, whatever
+    /// `len` and the handle say.
+    pub unsafe fn unmap(&self, addr: *mut u8, len: usize) -> Result<()> {
+        // SAFETY: forwarded from this fn's contract.
+        let r = unsafe { sys::memory_unmap(addr as usize as u64, len as u64) };
         if r < 0 {
             return Err(Error::from_status(r as i32));
         }
@@ -164,8 +169,12 @@ pub fn spawn(args: &SpawnArgs) -> Result<Handle<Process, Only>> {
 /// Start a thread in this process from `args` (a libkern [`ThreadArgs`]), returning an
 /// owning handle. The `RealTime` class in `args` requires the `REAL_TIME` syscap
 /// (else `Err`). The kernel grants `SIGNAL | TERMINATE | INSPECT | DUPLICATE`.
-pub fn thread_create(args: &ThreadArgs) -> Result<Handle<Thread, Only>> {
-    let h = sys::thread_create(args);
+/// # Safety
+/// `args.entry` is an `extern "C"` function that never returns, and `args.user_sp` tops a stack
+/// that nothing else uses, mapped for as long as the thread runs.
+pub unsafe fn thread_create(args: &ThreadArgs) -> Result<Handle<Thread, Only>> {
+    // SAFETY: forwarded from this fn's contract.
+    let h = unsafe { sys::thread_create(args) };
     if h < 0 {
         return Err(Error::from_status(h as i32));
     }
@@ -220,7 +229,8 @@ mod tests {
     #[test]
     fn thread_create_returns_an_owning_handle() {
         sys::reset();
-        let t = thread_create(&zeroed_thread()).unwrap();
+        // SAFETY: the mock starts no thread.
+        let t = unsafe { thread_create(&zeroed_thread()) }.unwrap();
         drop(t);
         let (_s, _w, closes) = sys::counts();
         assert_eq!(closes, 1);

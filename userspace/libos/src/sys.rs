@@ -87,9 +87,11 @@ pub fn memory_map(h: u64, hint: u64, size: u64, rights: u64) -> i64 {
 }
 
 /// `sys_memory_unmap(addr, size)` — unmap the region covering `addr`.
+/// # Safety
+/// Nothing still uses that mapping.
 #[cfg(not(test))]
-pub fn memory_unmap(addr: u64, size: u64) -> i64 {
-    // SAFETY: `addr` is a previously-mapped region base in this address space.
+pub unsafe fn memory_unmap(addr: u64, size: u64) -> i64 {
+    // SAFETY: forwarded from this fn's contract.
     unsafe { libkern::syscall2(libkern::SYS_MEMORY_UNMAP, addr, size) }
 }
 
@@ -129,9 +131,11 @@ pub fn process_spawn(args: &libkern::SpawnArgs) -> i64 {
 }
 
 /// `sys_thread_create(&args)` — start a thread in this process; returns a `Thread` handle.
+/// # Safety
+/// As [`crate::thread_create`].
 #[cfg(not(test))]
-pub fn thread_create(args: &libkern::ThreadArgs) -> i64 {
-    // SAFETY: `args` is a live `ThreadArgs`; the kernel copies it in.
+pub unsafe fn thread_create(args: &libkern::ThreadArgs) -> i64 {
+    // SAFETY: forwarded from this fn's contract; the kernel copies `args` in.
     unsafe { libkern::syscall1(libkern::SYS_THREAD_CREATE, args as *const _ as u64) }
 }
 
@@ -293,7 +297,7 @@ mod mock {
         0x1_0000_0000i64
     }
 
-    pub fn memory_unmap(_addr: u64, _size: u64) -> i64 {
+    pub unsafe fn memory_unmap(_addr: u64, _size: u64) -> i64 {
         0
     }
 
@@ -325,7 +329,7 @@ mod mock {
         mint_handle()
     }
 
-    pub fn thread_create(_args: &libkern::ThreadArgs) -> i64 {
+    pub unsafe fn thread_create(_args: &libkern::ThreadArgs) -> i64 {
         mint_handle()
     }
 

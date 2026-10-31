@@ -138,8 +138,8 @@ fn stream_transport_demo() {
     let stack_top = base as u64 + stack_bytes;
 
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: STREAM_E0/STREAM_ARGS are our statics; we initialise them, then hand a
-    // shared reference to the wrapper.
+    // SAFETY: STREAM_E0/STREAM_ARGS are our statics; we initialise them, then hand a shared
+    // reference to the wrapper. `stream_producer` never returns, on a stack mapped for it alone.
     let _producer = match unsafe {
         STREAM_E0 = e0;
         STREAM_ARGS.entry = stream_producer as *const () as u64;

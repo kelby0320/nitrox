@@ -115,6 +115,7 @@ pub(crate) fn run(notif: u64) {
 
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: WORKER_ARGS is our static, exclusively initialised here, then lent to the wrapper.
+    // `worker_fault` faults rather than returning, on a stack mapped for it alone.
     let worker = match unsafe {
         WORKER_ARGS.entry = worker_fault as *const () as usize as u64;
         WORKER_ARGS.user_sp = stack_top;
