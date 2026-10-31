@@ -14,7 +14,8 @@ extern crate alloc;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::{
-    RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
+    RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall1, syscall2,
+    syscall4, syscall5,
 };
 use librsproto::surface::{CreateWindowRequest, KeyEvent, PointerEvent, Role};
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
@@ -75,6 +76,8 @@ fn po_wait(po: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: closing our own PO, whose result, if any, is in `WAIT_RESULTS`.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
     if waited != 1 {
         return (-1, 0);
     }
