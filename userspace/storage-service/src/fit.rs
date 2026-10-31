@@ -50,7 +50,7 @@ pub fn scratch_read(at: u64, left: usize, block: u64) -> Option<ScratchRead> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use librsproto::file::DIRENT_KIND_FILE;
+    use librsproto::file::{DIRENT_KIND_FILE, parse_read_dir_reply};
     use librsproto::{OP_FILE_READ_DIR, RS_FLAG_REPLY, encode};
     use std::format;
 
@@ -58,18 +58,21 @@ mod tests {
     fn a_full_gpts_listing_pages_into_replies_that_encode() {
         let names = core::iter::once(String::from("all.tsm")).chain((0..129).map(|n| format!("blk-{n}.tsm")));
         let entries: Vec<_> = names.map(|n| (n, DIRENT_KIND_FILE, 1 << 40)).collect();
-        let mut cursor = 0;
+        let (mut cursor, mut listed) = (0, Vec::new());
         loop {
             let (body, next) = dir_page(&entries, cursor).unwrap();
             let mut payload = [0u8; 4096 - 24];
             assert!(encode(&mut payload, OP_FILE_READ_DIR, 1, RS_FLAG_REPLY, &body, 0).is_some());
+            let (header, page) = parse_read_dir_reply(&body).unwrap();
+            assert_eq!(header.next_cursor, next);
+            listed.extend(page.map(|e| (e.inode, String::from_utf8(e.name.to_vec()).unwrap())));
             if next == 0 {
                 break;
             }
-            assert!(next as usize > cursor);
             cursor = next as usize;
         }
-        assert_eq!(entries.len(), 130);
+        let expected: Vec<_> = entries.iter().enumerate().map(|(i, e)| (i as u32 + 1, e.0.clone())).collect();
+        assert_eq!(listed, expected, "every entry once, in order, each with its cookie");
     }
 
     #[test]

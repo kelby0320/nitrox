@@ -223,6 +223,7 @@ mod tests {
         let manifest = parse(text(&object).unwrap()).unwrap();
         assert_eq!(manifest.mounts.len(), 2);
         assert_eq!(text(b"a = 1\0b = 2\0\0").unwrap(), "a = 1");
+        assert_eq!(text(b"a = 1").unwrap(), "a = 1", "an object full to its end has no NUL");
     }
 
     /// **init's copy of the read-only flag is the server's**: the byte `"ro"` sends parses, on the
