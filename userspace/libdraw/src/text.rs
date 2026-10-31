@@ -241,13 +241,14 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
     }
     let size = info.size as usize;
 
-    let addr = obj.map(size).map_err(|_| LoadError::Unmappable)?;
     let mut data = Vec::new();
-    // Reserve up front: growing by doubling would fault the demand-paged file in twice.
+    // Reserve first: a refusal then leaves no mapping, and doubling would fault the file in twice.
     data.try_reserve_exact(size).map_err(|_| LoadError::ImpossibleSize(info.size))?;
+    let addr = obj.map(size).map_err(|_| LoadError::Unmappable)?;
     // SAFETY: `map` returned a mapping of at least `size` readable bytes.
     data.extend_from_slice(unsafe { core::slice::from_raw_parts(addr as *const u8, size) });
-    let _ = obj.unmap(addr, size);
+    // SAFETY: `addr` is the mapping made above, and the slice copied out of it is done with.
+    let _ = unsafe { obj.unmap(addr, size) };
 
     Font::from_bytes(data).ok_or(LoadError::NotAFont)
 }

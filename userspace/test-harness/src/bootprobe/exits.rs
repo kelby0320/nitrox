@@ -239,7 +239,8 @@ fn start_spinner(cpu: u8) -> bool {
         cpu_affinity: 1 << cpu,
         _reserved: [0; 36],
     };
-    base >= 0 && libos::thread_create(&args).is_ok()
+    // SAFETY: `spin` never returns, and the stack just mapped is never unmapped or used again.
+    base >= 0 && unsafe { libos::thread_create(&args) }.is_ok()
 }
 
 /// **A last thread's `sys_thread_exit` closes its process's handles at once, with every CPU busy**:

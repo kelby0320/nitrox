@@ -34,7 +34,8 @@ pub unsafe fn read(root_ns: u64) -> Result<ScreenInfo, UiError> {
     let info = ScreenInfo::read(bytes);
     // The compositor mints an object per resolve; a mapping left behind holds its frames for the
     // life of this process.
-    let _ = obj.unmap(addr, SCREEN_INFO_LEN);
+    // SAFETY: `addr` is the mapping made above, and `bytes`, its one use, is done with.
+    let _ = unsafe { obj.unmap(addr, SCREEN_INFO_LEN) };
     match info {
         Some(s) if s.width > 0 && s.height > 0 => Ok(s),
         _ => Err(UiError::Malformed),

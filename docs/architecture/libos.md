@@ -137,12 +137,16 @@ scratch, and resolves to `R` (bytes transferred, a resolved handle, `()`). It is
 - **Constructed by** the async method (`handle.read(buf)`), which issues
   `sys_io_submit` immediately (the submit never blocks) and holds the returned PO.
   (A pre-signalled PO — zero-length / cache hit — is handled uniformly.)
-- **`poll`**: reads the PO's completion. If complete, decode the 24-byte `IoResult`
-  (`status@8`, `result@16`) into `Ready(Result<R>)`; else register the PO handle with
-  the reactor (via the `Waker`) and return `Pending`.
-- **`Drop`** closes the PO (and, for a still-in-flight op, is where `sys_io_cancel`
-  would go once it's supported — today it's `Unsupported`, so drop-before-completion
-  just closes the PO).
+- **`poll`**: reads the PO's completion with a non-blocking `sys_wait`. If complete, decode
+  the 24-byte `IoResult` (`status@8`, `result@16`) into `Ready(Result<R>)`. If the wait
+  answers `WouldBlock`, register the PO handle with the reactor (via the `Waker`) and return
+  `Pending`; any other error completes the op with it, so a PO that can no longer be waited on
+  is not polled for ever. A second poll after `Ready` is an error and waits on nothing: the
+  result, which may be a handle, is handed out once.
+- **`Drop`** closes the PO, **first waiting for an unfinished I/O**: `sys_io_cancel` is
+  `Unsupported`, and the device may still be writing the buffer the dropped future borrowed,
+  which the caller would otherwise get back while it is written. A lookup's PO is closed at
+  once, since the kernel releases a lookup whose PO is closed unread.
 
 **`block_on` — the single-threaded reactor.** Alloc-free; drives one future to
 completion:
@@ -151,8 +155,12 @@ completion:
 pub fn block_on<F: Future>(fut: F) -> F::Output;
 ```
 
-It polls `fut`; on `Pending`, it `sys_wait`s (deadline = forever, or a caller-supplied
-one) on the waitable handles the pending `Op`s registered this round, then re-polls.
+It polls `fut`; on `Pending`, it `sys_wait`s for ever on the waitable handles the pending
+`Op`s registered this round, then re-polls. A round can register eight (the kernel's
+`MAX_WAIT_HANDLES` is larger, but `block_on` keeps eight); one that had to leave a handle out
+waits only until a deadline a millisecond off, so the operation left out is polled again. A
+round with nothing registered, or whose wait failed, sleeps that millisecond on a timer it makes
+the first time it needs one, rather than spinning.
 This *is* the executor for a single task — the same poll/wait loop a multi-task version
 would run, minus the ready-queue. It collapses the copy-pasted `po_wait`: init and
 eshell call `handle.read(buf).block_on()?` (or a `deadline`-bounded variant) instead of
@@ -160,11 +168,11 @@ hand-rolling submit/wait/decode/close.
 
 **The future↔reactor handoff** goes through the standard `Waker`: libos owns both the
 `Op` future and `block_on`, so it constructs the `Waker` (via stable `RawWaker` /
-`RawWakerVTable` / `Waker::from_raw`) to reference a small **reactor** holding the
-handles pending futures want waited on. *Implementation checkpoint (Part B):* confirm
-the exact stable-Rust mechanism for a pending `Op` to hand its PO handle to `block_on`'s
-`sys_wait` (Waker data pointer vs. a reactor reference threaded at `Op` construction) —
-both are alloc-free; pick the one that stays on stable and reads cleanly.
+`RawWakerVTable` / `Waker::from_raw`) whose data pointer is a small **reactor** holding the
+handles pending futures want waited on. **`Op::poll` reads that pointer only from a waker
+whose vtable is `block_on`'s own**, which nothing else can name; another executor's waker, or
+`Waker::noop()`, is woken instead, with nothing registered. A clone of `block_on`'s waker gets
+a vtable of its own, since it may outlive the reactor, and so is never read as one.
 
 **Why a future at all, if slice 5 only `block_on`s one at a time?** Because `Op:
 Future` is what a later multi-task executor drives, and what `async`/`await` desugars
@@ -180,23 +188,17 @@ facade re-exports rather than adapts (the "std-shaped where free" rule).
 
 ## The host-test syscall seam
 
-Like `libheap`'s `ArenaSource`, the calls libos makes to the kernel are abstracted
-behind a trait so the async machinery is host-testable with no kernel:
-
-```rust
-pub trait Sys {
-    fn io_submit(res: RawHandle, op: &IoOp) -> isize;
-    fn wait(handles: &[RawHandle], results: &mut [IoResult], deadline: u64) -> isize;
-    fn handle_close(h: RawHandle);
-    // …object-op calls as the wrappers need them
-}
-```
-
-`cfg(not(test))` → the real libkern `syscallN` calls; `cfg(test)` → a scriptable mock
-that completes POs after N polls, returns canned `IoResult`s, and records calls. Host
-tests then cover: `Op` decodes `IoResult` correctly; `block_on` polls→waits→completes;
-a pre-signalled PO returns without waiting; error status → `Error` mapping; `Handle`
-attenuation issues the right `restrict`. (Typestate *misuse* is verified by
+The calls libos makes to the kernel are a private module, `sys`, so the async machinery is
+host-testable with no kernel. Its functions take typed arguments (a path as `&[u8]`, an
+`&mut NsEntry`), so what the kernel is handed is what the types say; `sys::wait` waits on no
+more handles than its results hold, cutting both in code the host build runs too.
+`cfg(not(test))` → the real libkern `syscallN` calls; `cfg(test)` → a scriptable mock that
+**answers as the kernel does** (`InvalidHandle` for a handle it does not hold, `WouldBlock`
+for a poll that finds nothing ready), lets time pass in a wait with a deadline, panics on a
+wait for ever that nothing will end, and records calls. Host tests then cover: `Op` decodes
+`IoResult` correctly; `block_on` polls→waits→completes; a pre-signalled PO returns without
+waiting; error status → `Error` mapping; a foreign waker is never read; a dropped I/O is
+waited out; `Handle` attenuation issues the right `restrict`. (Typestate *misuse* is verified by
 compile-fail intent, not runtime tests — the type system is the test.)
 
 ## The alloc-free constraint

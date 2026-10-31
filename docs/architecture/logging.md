@@ -264,9 +264,10 @@ each where it is.
 Emitting should be a one-liner, not hand-rolled record encoding or raw `sys_channel_send`.
 A small client surface — `log!`/`info!`/`warn!`/`error!` over a held endpoint, plus an
 `open_source(label)` helper that resolves `<principal>/<label>` and returns a named-stream
-handle — lives alongside the syscall layer so any process can use it. Exact crate placement
-(a `liblog`, or a module in libos) is settled when the client is written; the only
-constraint is that it depend no higher than the layer its callers sit at.
+handle — lives alongside the syscall layer so any process can use it. It is `liblog`: its
+`open_source` returns a `Logger` that owns its endpoint and closes it when dropped, which
+frees the source's slot in the service, and `Logger::borrowing` wraps an endpoint its caller
+keeps, as a supervisor-given one is.
 
 ## Slice 1 scope
 

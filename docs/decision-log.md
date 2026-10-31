@@ -37238,3 +37238,34 @@ decisions:
 
 sched-d15, an AP whose x2APIC id is 256 or more, stays **later**, as triaged; kplat-d12 was fixed
 before this group.
+
+## 2026-10-30 — Before Phase 7, Part I: libos's holes closed, its executor's edges defined
+
+Group R of the survey's triage, the userspace runtime, made six decisions, and with them every
+hole the 2026-10-27 entry listed as the condition for a crate moving onto libos is fixed:
+
+- **An `Op` reads no waker's data but `block_on`'s own** (rt-d1): `block_on`'s waker has a vtable
+  nothing else names, its clones another, and `Op::poll` reads a reactor only through the first.
+  Any other waker is woken, with nothing registered, so a foreign executor polls again rather
+  than having its data written.
+- **An `Op` completes on any wait error but a poll's `WouldBlock`, and hands its result out
+  once** (rt-d12, rt-d8): a second poll after `Ready` is an error, rather than a panic, which PID 1
+  must not reach, or the same result twice, which gave a lookup's handle two owners.
+- **Dropping an unfinished I/O waits for it** (rt-d6's libos half, the maintainer's call): the
+  kernel cannot cancel I/O, and the device may still be using the buffer the dropped future
+  borrowed. A lookup's drop closes at once, as the kernel releases a lookup closed unread.
+- **`block_on` never waits for ever on less than it was asked to wait on, and never spins**
+  (rt-d13, rt-d9): a round that left a handle out past the eighth waits only until a deadline a
+  millisecond off; a round with nothing registered, or whose wait failed, sleeps that millisecond
+  on a timer it makes the first time. It keeps eight handles a round, under the kernel's 32, for
+  its stack.
+- **`unmap` and `thread_create` are `unsafe fn`s now** (rt-d2, rt-d3), as the triage chose; the
+  owning `Mapping` and `Thread::start` stay P7's. libos's seam takes typed arguments, `wait` no
+  more handles than its results hold, and its mock answers as the kernel does (rt-d10, rt-o11).
+- **A `Logger` owns the source `open_source` resolved** and closes it on drop, freeing the
+  logging service's slot; `Logger::borrowing` wraps an endpoint its caller keeps (rt-d4).
+
+The rest are fixes: four mappings unmapped once read, init's two among them (rt-d5); the one
+`po_wait` that kept its PO (rt-d7); and `copy_file` stats and maps one resolve (rt-d11). init's own
+lookup helper, kept until `block_on` stopped spinning on a failing wait (2026-10-28), may now go
+when init moves onto libos.

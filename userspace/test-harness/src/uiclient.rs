@@ -155,8 +155,8 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
     // SAFETY: the compositor serves exactly `N` bytes of `WindowInfo` here.
     let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, N) };
     let info = librsproto::surface::WindowInfo::read(bytes);
-    // `info` mints a fresh object per resolve; unmap so polling does not leak a page each time.
-    let _ = obj.unmap(addr, N);
+    // SAFETY: the mapping made above, `bytes` done with; each poll maps a fresh object to unmap.
+    let _ = unsafe { obj.unmap(addr, N) };
     info
 }
 

@@ -2995,7 +2995,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Defects**
 
-- [ ] **rt-d1** `userspace/libos/src/exec.rs:133` — `Op` is a public, safe `Future`, but
+- [x] **rt-d1** `userspace/libos/src/exec.rs:133` — `Op` is a public, safe `Future`, but
   `Op::poll` casts the data pointer of whatever `Waker` polls it to `&Reactor` and writes a
   72-byte `Registry` through it. Its SAFETY claim, that only `block_on` builds the waker, is not
   enforced. Scenario: an `Op` that is still pending is polled with `Waker::noop()`, a
@@ -3014,8 +3014,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   else `wake_by_ref` and return `Pending`. With that change both probes pass under Miri and all
   19 libos tests pass.
   abi, ownership, soundness, opportunities. Medium. **Fix.**
+  Fixed in `aedd2368`: `block_on`'s waker has a vtable nothing else names and its clones another;
+  `Op::poll` reads a reactor only through the first, else wakes and returns `Pending`. Fails
+  without it: `an_op_reads_no_wakers_data_but_block_ons` (a foreign waker's data written); with
+  clones on `VTABLE`, Miri reports the dangling `&Reactor`.
 
-- [ ] **rt-d2** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
+- [x] **rt-d2** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
   is a safe fn that never reads `self` and passes any address to `sys_memory_unmap`. The kernel
   ignores `len` and the handle and unmaps the whole VMA covering `addr` (table.rs:949-966). The
   doc on `map`, 'valid while `self` lives', is untrue in both directions. Scenario: safe code
@@ -3031,8 +3035,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   boot-probe step would settle it: Box a value, unmap its page, read it. Fix: make `unmap`
   unsafe, or return an owning `Mapping` (see rt-o3).
   abi, ownership, soundness, opportunities. Medium. **Fix.**
+  Fixed in `670a3414`: `unmap` is an `unsafe fn` with its contract, as the triage chose ahead of
+  P7's `Mapping`; a `#[forbid(unsafe_code)]` probe unmapping a `Vec`'s page no longer compiles
+  (E0133).
 
-- [ ] **rt-d3** `userspace/libos/src/objects.rs:167` — `thread_create(&ThreadArgs)` is a safe fn
+- [x] **rt-d3** `userspace/libos/src/objects.rs:167` — `thread_create(&ThreadArgs)` is a safe fn
   that starts a thread at any `entry` on any `user_sp`. The kernel checks only that both are
   non-zero user-half addresses (table.rs:538-542; 'that they are mapped is the caller's
   responsibility'). Scenario: safe code sets `user_sp` to the end of a `Vec`'s buffer or into its
@@ -3047,8 +3054,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   table.rs:538-542. Fix: `unsafe fn` with a `# Safety` section, or a typed
   `Thread::start(extern "C" fn(u64) -> !, Stack, arg0)` (see rt-o6).
   abi (medium), soundness (low), opportunities (low). Medium. **Fix.**
+  Fixed in `670a3414`: `thread_create` is an `unsafe fn` with its contract, ahead of P7's
+  `Thread::start`; a probe starting a thread on a `Vec` no longer compiles (E0133). `spawn`'s
+  `move_mask` stays with rt-o6.
 
-- [ ] **rt-d4** `userspace/liblog/src/lib.rs:103` — `open_source` resolves a SEND endpoint into
+- [x] **rt-d4** `userspace/liblog/src/lib.rs:103` — `open_source` resolves a SEND endpoint into
   `Logger`, which is `#[derive(Copy, Clone)]` with no `Drop`, and nothing in the crate ever
   closes it. `Logger::new` also wraps endpoints the caller still owns (heartbeat main.rs:217),
   so the type cannot say which handles it owns. Scenario: bootprobe/services.rs:399, heartbeat
@@ -3063,8 +3073,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   userspace` finds the 3 callers. Fix: an owning, non-`Copy` `Logger` closing on drop, plus a
   borrowing constructor for endpoints a supervisor hands over.
   abi, ownership, soundness. Low. **Fix.**
+  Fixed in `b67e9959`: `Logger` is not `Copy`; one `open_source` resolved closes on drop, and
+  `Logger::borrowing` wraps an endpoint its caller keeps. A boot opening and dropping 40 sources
+  resolved 18, with 22 "source table full", without the drop; 40 of 40 with it.
 
-- [ ] **rt-d5** `userspace/libdraw/src/text.rs:247` — libos `Handle::map` returns a bare pointer
+- [x] **rt-d5** `userspace/libdraw/src/text.rs:247` — libos `Handle::map` returns a bare pointer
   with no owner, and three callers leave mappings behind. In `load`, the `?` on
   `data.try_reserve_exact(size)` returns between `obj.map` (line 244) and `obj.unmap` (line
   250). Scenario: a font up to MAX_FONT_BYTES (8 MiB) loads while the heap cannot reserve it.
@@ -3078,6 +3091,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   no host test reaches `load`; an OOM-injected boot, or a host test behind a libos seam with a
   failing allocator, would settle it.
   ownership (demonstrated), opportunities (unverified). Low. **Fix.**
+  Fixed in `2cde6627`: init unmaps both pages once read, libdraw's `read_info` once its record is
+  copied, and the font load reserves before it maps. A boot logging each unmap showed init's two
+  and the compositor's two, each succeeding; the reorder is shown by reading.
 
 - [x] **rt-d6** `userspace/libos/src/exec.rs:141` — `Op::drop` closes an in-flight PO, but for a
   forwarded lookup the kernel still installs the resolved handle in the caller's table when the
@@ -3095,15 +3111,17 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   completion, the maintainer's choice; a PO freed unread releases it. Fails with the install at
   reply time: `a_reply_to_a_lookup_its_client_closed_makes_no_handle`.
 
-- [ ] **rt-d7** `userspace/test-harness/src/inputclient.rs:72` — input-testclient's `po_wait`
+- [x] **rt-d7** `userspace/test-harness/src/inputclient.rs:72` — input-testclient's `po_wait`
   never closes its PendingOperation; the file imports no close at all. Scenario: each run
   resolves /dev/input/new, waits and decodes, and the PO stays in the table. It is the only one
   of the 15 `fn po_wait*` clones that does.
   Demonstrated: `grep -n 'HANDLE_CLOSE\|syscall1\|fn close' inputclient.rs` finds nothing; all
   15 bodies dumped with awk, and each of the other 14 closes `po` on both paths.
   ownership. Low. **Fix.**
+  Fixed in `aea50b2c`: its `po_wait` closes the PO after the wait; every `fn po_wait*` found
+  (thirteen) now closes its PO.
 
-- [ ] **rt-d8** `userspace/libos/src/exec.rs:122` — `Op::poll` sets `done` but never reads it, so
+- [x] **rt-d8** `userspace/libos/src/exec.rs:122` — `Op::poll` sets `done` but never reads it, so
   a re-poll after `Ready` waits on the still-open PO again and returns the same `IoResult`,
   contrary to the field's comment ('a stray re-poll after Ready is a no-op'). Scenario: a
   combinator re-polls a completed lookup `Op`. It gets a second `Ready(Ok(IoResult { result:
@@ -3115,8 +3133,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   777 }))`, and the assertion that the second poll is `Pending` failed. Fix: return `Pending` or
   panic when `done`, or take the PO out on `Ready`.
   abi. Low. **Fix.**
+  Fixed in `d22ea05c`: a second poll after `Ready` is an error and waits on nothing. Fails
+  without it: `a_completed_op_hands_its_result_out_once`.
 
-- [ ] **rt-d9** `userspace/libos/src/exec.rs:169` — when no `Op` registered a handle, `block_on`
+- [x] **rt-d9** `userspace/libos/src/exec.rs:169` — when no `Op` registered a handle, `block_on`
   calls `sys::wait(&[], .., 0)` as a 'poll-yield, not a tight spin', but the kernel refuses count
   0 at once with `InvalidArgument` (table.rs:1764-1766) before any scheduling. Scenario: a
   hand-written future returns `Pending` without registering anything (it waits on a flag
@@ -3125,8 +3145,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: path pointed at (exec.rs:167-169 passes an empty slice; kernel check quoted
   above). Not run on target.
   abi. Low. **Fix.**
+  Fixed in `fae8cbf5`: with nothing registered, `block_on` sleeps 1 ms on a timer it makes once.
+  Fails without it: `block_on_sleeps_with_nothing_to_wait_on`.
 
-- [ ] **rt-d10** `userspace/libos/src/sys.rs:23` — `sys::wait(handles, results, deadline)` is a safe
+- [x] **rt-d10** `userspace/libos/src/sys.rs:23` — `sys::wait(handles, results, deadline)` is a safe
   fn that passes `handles.len()` as the count and `results` with no length. The kernel writes
   one 24-byte record per signalled handle, so a shorter `results` is overrun. Scenario: a new
   libos wait (the planned multi-task executor's wait-any, or a two-handle poll) passes
@@ -3138,8 +3160,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   bounds-checks, panicked 'index out of bounds: the len is 1 but the index is 1' at sys.rs:187.
   The target body (sys.rs:27-33) has no such check.
   ownership. Low. **Fix.**
+  Fixed in `904504f0`, with rt-o11: `sys::wait` cuts both slices to the shorter in code the host
+  build runs. Fails without it: `a_wait_takes_no_more_handles_than_its_results_hold`.
 
-- [ ] **rt-d11** `userspace/libfs/src/lib.rs:181` — `read_file` and `copy_file` stat one resolve
+- [x] **rt-d11** `userspace/libfs/src/lib.rs:181` — `read_file` and `copy_file` stat one resolve
   of the path (`file_size`, which closes its handle) and then map a second, independent resolve
   using that stale size, so the size crosses from one object to another. Scenario: between
   `file_size` (lines 174 and 69) and the second lookup (181 and 94), another process renames a
@@ -3152,6 +3176,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `read_file`; libfs issues raw syscalls, so no host test reaches it. Fix: one lookup with
   MAP_READ|INSPECT, then stat and map that same handle, as libdraw text.rs:233-244 does.
   abi. Low. **Fix.**
+  Fixed in `af5778a2`: `copy_file` resolves the source once and stats and maps that handle;
+  `read_file` already did. Structural; no host test reaches libfs's raw syscalls.
 
 **Opportunities**
 
@@ -3348,7 +3374,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   for the CLOCK/STAT statics to lose their remaining `unsafe` and not just the `static`.
   soundness, opportunities. Value low, effort small. **Plan**, in P7.
 
-- [ ] **rt-o11** narrow: 6 of libos's 13 `cfg(not(test))` seam functions in `sys.rs` are safe but
+- [x] **rt-o11** narrow: 6 of libos's 13 `cfg(not(test))` seam functions in `sys.rs` are safe but
   take an address as `u64` or rely on an unchecked length: `wait` (`results.len() >=
   handles.len()` held by comment), `memory_unmap(addr)`, `ns_lookup(path, len)`, `ns_bind(path,
   len)`, `ns_enumerate(out)`, `notif_recv(out)` — 6 sites (read of sys.rs, not a grep; the
@@ -3362,6 +3388,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   tests exercise what the real call is handed. Home: libos sys.rs. Closes: the rt-d10 overrun
   the mock hides, and the shape of the rt-d2 defect. Depends on: rt-o3 for `memory_unmap`.
   abi, ownership, soundness, opportunities. Value low, effort small. **Fix.**
+  Done in `904504f0`: `ns_lookup` and `ns_bind` take `&[u8]`, `ns_enumerate` an `&mut NsEntry`,
+  `notif_recv` an `&mut Notification`, `wait` cuts its slices; `memory_unmap` is unsafe with
+  rt-d2. The mock answers as the kernel does and records what a wait was handed.
 
 - [x] **rt-o12** narrow: libheap's engine turns `usize` addresses back into pointers with `as *mut`,
   so pointers it hands out carry only exposed provenance and Miri runs it only in permissive
@@ -3541,7 +3570,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   "init (one page) sees 1 mount(s); the storage service (whole object) sees 2". The kernel maps a
   prefix of a larger object without complaint (table.rs:878). Test removed. abi, opportunities.
   Low. **Fix.**
-- [ ] **sup-d9** `userspace/init/src/main.rs:181` — init maps the init.toml page (181/189) and
+- [x] **sup-d9** `userspace/init/src/main.rs:181` — init maps the init.toml page (181/189) and
   `/system/current-generation` (577/585) and never unmaps either, so PID 1 keeps both mappings,
   and the second pins a root-filesystem FileObject through shutdown's sync and `Meta::Unmount` of
   `/`. libos `Memory::map` returns a raw `*mut u8` documented "valid while `self` lives", but the
@@ -3549,6 +3578,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   on purpose; read_current_generation has no such comment. Demonstrated: `grep -n -i
   'unmap\|MEMORY_MAP\|\.map(' userspace/init/src/main.rs` finds the two maps and no unmap.
   ownership, opportunities. Low. **Fix**, as rt-d5.
+  Fixed with rt-d5, in `2cde6627`: init unmaps both pages once read.
 - [ ] **sup-d10** `userspace/device-mgr/src/main.rs:176` — `read_registry` and `read_io` (176,
   204) and storage-service `with_mapped` (main.rs:327) unmap with size 0, which works only because
   `sys_memory_unmap` ignores `size` today (table.rs:949, `_size` unused). syscall-abi.md:529 says
@@ -3868,7 +3898,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (`cargo test --lib --target x86_64-unknown-linux-gnu survey_probe`). The only `tty_close`
   calls are at 252-254 and 274-276, and tty-server/src/main.rs:43 and :290 refuse the 15th
   terminal. ownership, soundness. Medium. **Fix**, with the bash's sec-12, moved here from Part H.
-- [ ] **sec-d2** `userspace/libos/src/exec.rs:133` — `Op::poll` is a safe `Future` impl that
+- [x] **sec-d2** `userspace/libos/src/exec.rs:133` — `Op::poll` is a safe `Future` impl that
   turns `cx.waker().data()` into `&Reactor`. It is sound only when libos's `block_on` built the
   Waker, so a foreign Waker makes safe code produce a null or foreign reference. libos is
   outside the subsystem, but it is the home the opportunities below propose. Safe code that
@@ -3880,6 +3910,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `probe_op_polled_by_a_foreign_waker` (scripted not-ready mock, `Waker::noop()`) aborted with
   'panicked at libos/src/exec.rs:133:32: null reference produced'. Probe removed. opportunities.
   Medium. **Fix**, as rt-d1.
+  Fixed with rt-d1, in `aedd2368`.
 - [ ] **sec-d3** `userspace/libsession/src/lib.rs:208` — `authenticate` (and `views_call`, line
   252) takes the next message on a long-lived channel as the answer to its request. The request
   id is always 1 and is never compared, and the reply's principal is never compared with
@@ -5057,7 +5088,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kernel returns `parent_handle.bits()` (table.rs:491-509), and desktop-shell's `launch` closes
   the same value (apps.rs:390/416). abi, ownership. Medium. **Fix.**
 
-- [ ] **desk-d4** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
+- [x] **desk-d4** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
   is a safe fn, but the kernel unmaps the whole VMA covering `addr` and ignores both the size and
   the handle (`sys_memory_unmap` -> `unmap_covering_deferred`, table.rs:949). Safe code can
   therefore unmap memory a live reference points into (heap, stack, another mapping). Latent. The
@@ -5066,6 +5097,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   or after another `map()` reused the range.
   Demonstrated by reading the signature and the kernel handler. The unsafe is not on the signature.
   ownership. Medium. **Fix**, as rt-d2.
+  Fixed with rt-d2, in `670a3414`.
 
 - [ ] **desk-d5** `userspace/compositor/src/main.rs:1576` — `map_attached_buffer` maps whatever
   object the client transferred, though the spec says `AttachBuffer` carries a MemoryObject, and
@@ -5081,7 +5113,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   boot would test the fix, refusing `object_type != MemoryObject` before the map. abi, soundness.
   Medium (would be high if the compositor counts as a critical service). **Fix.**
 
-- [ ] **desk-d6** `userspace/libdraw/src/acquire.rs:52` — `read_info` maps the FramebufferInfo
+- [x] **desk-d6** `userspace/libdraw/src/acquire.rs:52` — `read_info` maps the FramebufferInfo
   object and never unmaps it, and the kernel mints a fresh object per resolve
   (kernel_server.rs:361). The compositor calls it twice at start (main.rs:2214 and inside
   `acquire`, :89), so two info pages and their objects stay pinned for the process's life. A
@@ -5091,6 +5123,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path: `grep -n unmap userspace/libdraw/src/acquire.rs` is empty, while
   `libsurface/src/screen.rs:37-39` unmaps the same kind of object and says why. abi, ownership,
   soundness, opportunities. Low. **Fix**, as rt-d5.
+  Fixed with rt-d5, in `2cde6627`.
 
 - [ ] **desk-d7** `userspace/libdraw/src/acquire.rs:99` — `acquire` maps `info.byte_len` bytes but
   wraps them in `RawFramebuffer::new`, whose contract needs `geometry.byte_len()` = pitch x
@@ -5850,7 +5883,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
 
 **Defects**
 
-- [ ] **th-d1** `userspace/libos/src/objects.rs:167` — `libos::thread_create` is a safe `pub fn`
+- [x] **th-d1** `userspace/libos/src/objects.rs:167` — `libos::thread_create` is a safe `pub fn`
   that starts a thread at any `entry` on any `user_sp`. Safe code can start a thread on a live
   local array or on a mapping it later unmaps, and the new thread's frames then overwrite memory a
   Rust reference owns. The kernel checks only that both addresses are non-null user addresses
@@ -5859,6 +5892,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   convention only. Demonstrated: a `#[forbid(unsafe_code)]` fn that passed a local `[u8; 256]` as
   the stack and then wrote `stack[0]` built with `cargo check -Z build-std=core,alloc,compiler_builtins
   --bin test-stage` and no error; the probe was removed. abi, soundness. Medium. **Fix**, as rt-d3.
+  Fixed with rt-d3, in `670a3414`.
 - [x] **th-d2** `userspace/test-harness/src/bootprobe/storage.rs:273` — `past_two_tib_test` makes
   one `&mut [u8]` over the DMA page and keeps it live across `io(IO_OPCODE_WRITE)` and
   `io(IO_OPCODE_READ)`, then compares through it at :284. The device's write invalidates the
@@ -5953,12 +5987,13 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `find_free_range` + `map_vma_lazy` asserted `b.start == a.end` and passed (vmm.rs:413-435); the
   probe was restored. Unverified: the overrun itself, which a boot with a thread recursing past
   its stack would show. soundness. Low. **Plan**, in P7.
-- [ ] **th-d10** `userspace/test-harness/src/inputclient.rs:104` — `lookup` never closes the
+- [x] **th-d10** `userspace/test-harness/src/inputclient.rs:104` — `lookup` never closes the
   PendingOperation that `sys_ns_lookup` returned, because this copy of `po_wait` (:72-96), unlike
   the other 11 hand-rolled copies, does not close the PO. One PO handle leaks per
   `Stream::open` of `/dev/input/new`. Demonstrated by path: no `SYS_HANDLE_CLOSE` in
   inputclient.rs:72-106. harness.rs:789, bootprobe/main.rs:117/157 and pattern.rs:271 all close.
   ownership. Low. **Fix**, as rt-d7.
+  Fixed with rt-d7, in `aea50b2c`.
 - [ ] **th-d11** `userspace/test-harness/src/composebench.rs:166` — `libdraw::acquire::acquire`
   requires that "nothing else may write the mapping" (acquire.rs:85-86), but compose-bench (and
   display-selftest, display.rs:82) acquire the aperture while the compositor, an essential
@@ -6247,7 +6282,7 @@ Two holes in libos the runtime's run missed, found by the review's error-paths l
 again by the author with the libos mock made faithful to the kernel, where a handle that does not
 exist fails the whole wait. Both probes were removed.
 
-- [ ] **rt-d12** `userspace/libos/src/exec.rs:122` — `Op::poll` takes any `sys_wait` return below
+- [x] **rt-d12** `userspace/libos/src/exec.rs:122` — `Op::poll` takes any `sys_wait` return below
   1 as "not ready", errors included, and `block_on` (:171) ignores its blocking wait's result, so a
   wait that keeps failing is polled again for ever instead of returning its error. A PO handle
   closed by a stale close elsewhere (the shape of rt-d8) makes every wait on it fail at once with
@@ -6258,7 +6293,11 @@ exist fails the whole wait. Both probes were removed.
   up after 100,000 polls; it was still re-polled after 200,000 `sys_wait`s. The control, without
   the close, completed. Fix: `Ready(Err)` for any negative result but WouldBlock, and a failed
   blocking wait ends `block_on`. error-paths. Medium. **Fix.**
-- [ ] **rt-d13** `userspace/libos/src/exec.rs:48` — `Reactor::register` drops every handle past the
+  Fixed in `d22ea05c` and `fae8cbf5`: only a poll's `WouldBlock` is "not ready", any other wait
+  error completes the `Op`, and a failed blocking wait sleeps before the next round. Fail without
+  them: `an_op_whose_wait_fails_completes_with_the_error`,
+  `a_failed_wait_sleeps_before_the_next_poll`.
+- [x] **rt-d13** `userspace/libos/src/exec.rs:48` — `Reactor::register` drops every handle past the
   eighth ("only costs an extra poll round"), but `block_on` then waits on the eight it kept with no
   deadline, so a future pending on nine or more operations, where only a dropped one will signal,
   blocks for ever. Latent: libos has no join, so only a hand-written future polling more than eight
@@ -6266,3 +6305,6 @@ exist fails the whole wait. Both probes were removed.
   polled nine pending `Op`s under `block_on`, and the first blocking wait was given eight handles,
   not the ninth. Fix: when a round drops a registration, wait with a deadline of zero, so the
   dropped operations are polled again. error-paths. Low. **Fix.**
+  Fixed in `fae8cbf5`: a round that left a handle out waits until a deadline 1 ms off. Fails
+  without it: `a_ninth_operation_is_polled_again`, through a mock that panics on a wait for
+  ever nothing will end.

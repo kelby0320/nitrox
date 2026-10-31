@@ -506,7 +506,8 @@ fn start_thread(entry: extern "C" fn() -> !, affinity: u8) -> bool {
         cpu_affinity: affinity,
         _reserved: [0; 36],
     };
-    base >= 0 && libos::thread_create(&args).is_ok()
+    // SAFETY: `entry` never returns, and the stack just mapped is never unmapped or used again.
+    base >= 0 && unsafe { libos::thread_create(&args) }.is_ok()
 }
 
 fn thread_exit() -> ! {
@@ -628,7 +629,9 @@ extern "C" fn exit_spawner() -> ! {
             cpu_affinity: 0,
             _reserved: [0; 36],
         };
-        if libos::thread_create(&args).is_err() {
+        // SAFETY: `spawn_waiter` never returns, and each waiter has its own slice of the stacks,
+        // which are never unmapped.
+        if unsafe { libos::thread_create(&args) }.is_err() {
             break;
         }
         SPAWNED.fetch_add(1, Ordering::Release);
