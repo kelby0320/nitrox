@@ -236,9 +236,12 @@ fn read_manifest(root_ns: u64) -> Option<Manifest> {
             None
         }
     };
-    // SAFETY: closing our own handle; the mapping kept the object alive, and the
-    // parsed mounts own their strings, so the mapped bytes are no longer needed.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+    // SAFETY: the page mapped above, which the parsed mounts no longer borrow (they own their
+    // strings), then our own handle.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, PAGE);
+        syscall1(SYS_HANDLE_CLOSE, mem);
+    }
     result
 }
 
@@ -567,25 +570,22 @@ fn read_current_generation(root_ns: u64) {
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read-mappable file object (asserted by the `Memory, MapRead`
     // type arguments).
-    let mem = match block_on(unsafe { ns.lookup::<Memory, MapRead>("/system/current-generation", Rights::MAP_READ) }) {
-        Ok(m) => m,
-        Err(_) => {
-            kprint(b"init: /system/current-generation lookup FAIL\n");
-            return;
-        }
+    let Ok(mem) = block_on(unsafe { ns.lookup::<Memory, MapRead>("/system/current-generation", Rights::MAP_READ) })
+    else {
+        kprint(b"init: /system/current-generation lookup FAIL\n");
+        return;
     };
-    let addr = match mem.map(PAGE as usize) {
-        Ok(a) => a,
-        Err(_) => {
-            kprint(b"init: current-generation map FAIL\n");
-            return; // `mem` drops here → closes the resolved handle
-        }
+    let Ok(addr) = mem.map(PAGE as usize) else {
+        kprint(b"init: current-generation map FAIL\n");
+        return; // `mem` drops here → closes the resolved handle
     };
     // SAFETY: `addr` maps a page of the file bytes + zero padding; trim the tail.
     let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, PAGE as usize) };
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     kprint(b"init: /system/current-generation = ");
     kprint(&bytes[..len]); // the file content ends in '\n'
+    // SAFETY: the page mapped above, which `bytes` was the last use of.
+    let _ = unsafe { mem.unmap(addr, PAGE as usize) };
 }
 
 /// Report the run's verdict to `xtask test-qemu` via `SYS_TEST_EXIT`, which ends QEMU under the

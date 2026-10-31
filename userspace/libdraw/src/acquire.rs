@@ -53,7 +53,10 @@ pub unsafe fn read_info(root_ns: u64) -> Result<FramebufferInfo, AcquireError> {
     // SAFETY: `map` returned a mapping of at least the requested length, and the
     // kernel serves this leaf as exactly one `FramebufferInfo` followed by zero padding.
     let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, core::mem::size_of::<FramebufferInfo>()) };
-    FramebufferInfo::from_bytes(bytes).ok_or(AcquireError::InfoTruncated)
+    let info = FramebufferInfo::from_bytes(bytes);
+    // SAFETY: the mapping made above, which `info`, a copy, no longer borrows.
+    let _ = unsafe { obj.unmap(addr, core::mem::size_of::<FramebufferInfo>()) };
+    info.ok_or(AcquireError::InfoTruncated)
 }
 
 /// Turn a firmware geometry report into a [`Geometry`].
