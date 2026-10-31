@@ -20,6 +20,9 @@ use crate::sys;
 /// the kernel's `MAX_WAIT_HANDLES`.
 const MAX_WAIT: usize = 8;
 
+/// How long `block_on` sleeps with nothing to wait on, before it polls again.
+const IDLE_NS: u64 = 1_000_000;
+
 /// An `[IoResult; N]` of zeroes (no `Copy`/`Default` bound needed).
 fn zeroed_results<const N: usize>() -> [IoResult; N] {
     core::array::from_fn(|_| IoResult { handle: 0, status: 0, reserved: 0, result: 0 })
@@ -31,6 +34,8 @@ fn zeroed_results<const N: usize>() -> [IoResult; N] {
 struct Registry {
     handles: [u64; MAX_WAIT],
     count: usize,
+    /// Whether a handle past the `MAX_WAIT`th was left out.
+    dropped: bool,
 }
 
 /// Per-`block_on` set of waitable handles the current poll round registered. A `Cell`
@@ -41,11 +46,10 @@ struct Reactor {
 
 impl Reactor {
     fn new() -> Self {
-        Reactor { reg: Cell::new(Registry { handles: [0; MAX_WAIT], count: 0 }) }
+        Reactor { reg: Cell::new(Registry { handles: [0; MAX_WAIT], count: 0, dropped: false }) }
     }
 
-    /// Register a waitable handle for this poll round (deduplicated; capped at
-    /// `MAX_WAIT` — excess is dropped, which only costs an extra poll round).
+    /// Register a waitable handle for this poll round (deduplicated; capped at `MAX_WAIT`).
     fn register(&self, h: u64) {
         let mut r = self.reg.get();
         if r.handles[..r.count].contains(&h) {
@@ -54,15 +58,46 @@ impl Reactor {
         if r.count < MAX_WAIT {
             r.handles[r.count] = h;
             r.count += 1;
-            self.reg.set(r);
+        } else {
+            r.dropped = true;
         }
+        self.reg.set(r);
     }
 
     /// Take and clear the round's registrations.
     fn take(&self) -> Registry {
-        let r = self.reg.get();
-        self.reg.set(Registry { handles: [0; MAX_WAIT], count: 0 });
-        r
+        self.reg.replace(Registry { handles: [0; MAX_WAIT], count: 0, dropped: false })
+    }
+}
+
+/// A timer `block_on` sleeps on, made the first time it has nothing to wait on.
+struct Idle {
+    timer: Option<u64>,
+}
+
+impl Idle {
+    /// A deadline [`IDLE_NS`] from now; a poll if the clock cannot be read.
+    fn soon() -> u64 {
+        sys::monotonic_ns().map_or(0, |now| now.saturating_add(IDLE_NS))
+    }
+
+    /// Sleep [`IDLE_NS`]; not at all if no timer can be made.
+    fn sleep(&mut self) {
+        if self.timer.is_none() {
+            let t = sys::timer_create();
+            self.timer = (t >= 0).then_some(t as u64);
+        }
+        if let Some(t) = self.timer {
+            sys::wait(&[t], &mut zeroed_results::<1>(), Self::soon());
+        }
+    }
+}
+
+impl Drop for Idle {
+    fn drop(&mut self) {
+        if let Some(t) = self.timer {
+            sys::handle_close(t);
+        }
     }
 }
 
@@ -169,9 +204,8 @@ impl Drop for Op {
 /// Drive one future to completion on the current thread, blocking in `sys_wait`
 /// between polls. Alloc-free.
 ///
-/// On `Pending`, does one blocking `sys_wait` on the handles the pending `Op`s
-/// registered this round, then re-polls. Assumes futures do not keep the `Waker` past
-/// the call (true for libos `Op`s).
+/// On `Pending`, waits on the handles this round's `Op`s registered, then re-polls; it sleeps
+/// [`IDLE_NS`] with none or a failed wait, and waits no longer when one was left out.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     let reactor = Reactor::new();
     let raw = RawWaker::new(&reactor as *const Reactor as *const (), &VTABLE);
@@ -180,17 +214,20 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
     let mut fut = core::pin::pin!(fut);
+    let mut idle = Idle { timer: None };
     loop {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return v,
             Poll::Pending => {
                 let reg = reactor.take();
+                let handles = &reg.handles[..reg.count];
                 let mut results = zeroed_results::<MAX_WAIT>();
                 if reg.count == 0 {
-                    // Nothing registered (only a hand-written future): poll-yield, not a tight spin.
-                    sys::wait(&[], &mut results, 0);
-                } else {
-                    sys::wait(&reg.handles[..reg.count], &mut results, u64::MAX);
+                    idle.sleep();
+                } else if reg.dropped {
+                    sys::wait(handles, &mut results, Idle::soon());
+                } else if sys::wait(handles, &mut results, u64::MAX) < 0 {
+                    idle.sleep();
                 }
             }
         }
@@ -306,6 +343,57 @@ mod tests {
         sys::script_next(0, 2, false);
         drop(Op::from_po(sys::ns_lookup(1, b"/x", 0) as u64));
         assert_eq!(sys::closed_in_flight(), 1);
+    }
+
+    /// **A ninth operation is polled again**, where `block_on` waited for ever on its first eight.
+    #[test]
+    fn a_ninth_operation_is_polled_again() {
+        sys::reset();
+        let mut ops: std::vec::Vec<Op> = (0..9)
+            .map(|i| {
+                if i < 8 {
+                    sys::script_never()
+                } else {
+                    sys::script_next(0, 9, false)
+                }
+                Op::submit(RawHandle(1), &read_op()).unwrap()
+            })
+            .collect();
+        let first = block_on(core::future::poll_fn(|cx| {
+            ops.iter_mut()
+                .find_map(|op| match Pin::new(op).poll(cx) {
+                    Poll::Ready(r) => Some(Poll::Ready(r)),
+                    Poll::Pending => None,
+                })
+                .unwrap_or(Poll::Pending)
+        }));
+        assert_eq!(first.unwrap().result, 9);
+        // The other eight never finish, so their drops would wait for ever.
+        core::mem::forget(ops);
+    }
+
+    /// **`block_on` sleeps with nothing to wait on**, where it spun on a wait the kernel refuses.
+    #[test]
+    fn block_on_sleeps_with_nothing_to_wait_on() {
+        sys::reset();
+        let mut polls = 0;
+        block_on(core::future::poll_fn(|_| {
+            polls += 1;
+            if polls < 3 { Poll::Pending } else { Poll::Ready(()) }
+        }));
+        assert_eq!(sys::sleeps(), 2);
+        assert_eq!(sys::counts().2, 1, "its timer closed");
+    }
+
+    /// **A failed wait sleeps before the next poll**, rather than polling again at once.
+    #[test]
+    fn a_failed_wait_sleeps_before_the_next_poll() {
+        sys::reset();
+        sys::script_next(0, 5, false);
+        sys::fail_next_wait(-4);
+        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        assert_eq!(block_on(op).unwrap().result, 5);
+        assert_eq!(sys::sleeps(), 1);
     }
 
     #[test]

@@ -40,6 +40,22 @@ fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
     }
 }
 
+/// `sys_clock_read(CLOCK_MONOTONIC)` — nanoseconds since boot, if the clock could be read.
+#[cfg(not(test))]
+pub fn monotonic_ns() -> Option<u64> {
+    let mut ns = 0u64;
+    // SAFETY: `ns` is a live `u64`, which the kernel writes.
+    let r = unsafe { libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::CLOCK_MONOTONIC, &raw mut ns as u64) };
+    (r >= 0).then_some(ns)
+}
+
+/// `sys_timer_create(0)` — an unarmed timer, which a wait with a deadline sleeps on.
+#[cfg(not(test))]
+pub fn timer_create() -> i64 {
+    // SAFETY: a plain create; `flags = 0`.
+    unsafe { libkern::syscall1(libkern::SYS_TIMER_CREATE, 0) }
+}
+
 /// `sys_handle_close(h)` — release the caller's reference to a handle.
 #[cfg(not(test))]
 pub fn handle_close(h: u64) {
@@ -125,22 +141,26 @@ pub fn thread_create(args: &libkern::ThreadArgs) -> i64 {
 use mock::wait_exact;
 #[cfg(test)]
 pub use mock::{
-    handle_close, handle_restrict, io_submit, memory_create, memory_map, memory_unmap, notif_recv, ns_bind,
-    ns_enumerate, ns_lookup, process_spawn, thread_create,
+    handle_close, handle_restrict, io_submit, memory_create, memory_map, memory_unmap, monotonic_ns, notif_recv,
+    ns_bind, ns_enumerate, ns_lookup, process_spawn, thread_create, timer_create,
 };
 
 #[cfg(test)]
-pub use mock::{closed_in_flight, counts, fail_next_bind, fail_next_submit, last_wait_count, reset, script_next};
+pub use mock::{
+    closed_in_flight, counts, fail_next_bind, fail_next_submit, fail_next_wait, last_wait_count, reset, script_never,
+    script_next, sleeps,
+};
 
 #[cfg(test)]
 mod mock {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-    /// One in-flight `PendingOperation` in the mock.
+    /// One in-flight `PendingOperation` in the mock: signalled, or not yet, or never.
     struct Po {
         ready: bool,
+        never: bool,
         status: i32,
         result: u64,
     }
@@ -149,8 +169,13 @@ mod mock {
     struct Mock {
         next_handle: u64,
         pos: BTreeMap<u64, Po>,
-        /// Completions armed for upcoming `io_submit`s: `(status, result, ready_now)`.
-        script: VecDeque<(i32, u64, bool)>,
+        /// Completions armed for upcoming `io_submit`s: `(status, result, ready_now, never)`.
+        script: VecDeque<(i32, u64, bool, bool)>,
+        timers: BTreeSet<u64>,
+        fail_wait: Option<i64>,
+        /// Waits that slept until a deadline, neither polls nor waits for ever.
+        sleeps: u32,
+        clock: u64,
         /// A one-shot forced `io_submit` failure (negative status).
         fail_submit: Option<i32>,
         /// A one-shot forced `ns_bind` failure (negative status).
@@ -178,16 +203,16 @@ mod mock {
             if let Some(status) = m.fail_submit.take() {
                 return status as i64;
             }
-            let (status, result, ready_now) = m.script.pop_front().unwrap_or((0, 0, true));
+            let (status, result, ready, never) = m.script.pop_front().unwrap_or((0, 0, true, false));
             let h = m.next_handle;
             m.next_handle += 1;
-            m.pos.insert(h, Po { ready: ready_now, status, result });
+            m.pos.insert(h, Po { ready, never, status, result });
             h as i64
         })
     }
 
-    /// As the kernel answers: `InvalidArgument`, `InvalidHandle`, `WouldBlock` for an empty poll.
-    /// A `results` shorter than `handles` panics, where the kernel would write past it.
+    /// As the kernel answers (`InvalidArgument`, `InvalidHandle`, an empty poll's `WouldBlock`); a
+    /// short `results` panics. A deadline lets time pass; a wait for ever that nothing ends panics.
     pub fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
@@ -196,8 +221,14 @@ mod mock {
             if handles.is_empty() {
                 return -30;
             }
-            if handles.iter().any(|h| !m.pos.contains_key(h)) {
+            if handles.iter().any(|h| !m.pos.contains_key(h) && !m.timers.contains(h)) {
                 return -1;
+            }
+            if deadline != 0 {
+                if let Some(e) = m.fail_wait.take() {
+                    return e;
+                }
+                m.pos.values_mut().filter(|po| !po.never).for_each(|po| po.ready = true);
             }
             let mut n = 0usize;
             for &h in handles {
@@ -208,24 +239,37 @@ mod mock {
                     n += 1;
                 }
             }
-            // A blocking wait with nothing ready completes the first handle, so block_on
-            // makes progress; a poll (deadline == 0) never fabricates a completion.
-            if n == 0 && deadline != 0 {
-                let h = handles[0];
-                if let Some(po) = m.pos.get_mut(&h) {
-                    po.ready = true;
-                    results[0] = IoResult { handle: h, status: po.status, reserved: 0, result: po.result };
-                    n = 1;
+            match (n, deadline) {
+                (0, 0) => -11,
+                (0, u64::MAX) => panic!("a wait for ever on handles none of which will signal"),
+                (0, _) => {
+                    m.sleeps += 1;
+                    -12
                 }
+                _ => n as i64,
             }
-            if n == 0 { -11 } else { n as i64 }
         })
+    }
+
+    pub fn monotonic_ns() -> Option<u64> {
+        MOCK.with(|m| {
+            let mut m = m.borrow_mut();
+            m.clock += 1_000;
+            Some(m.clock)
+        })
+    }
+
+    pub fn timer_create() -> i64 {
+        let h = mint_handle();
+        MOCK.with(|m| m.borrow_mut().timers.insert(h as u64));
+        h
     }
 
     pub fn handle_close(h: u64) {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
             m.closes += 1;
+            m.timers.remove(&h);
             if m.pos.remove(&h).is_some_and(|po| !po.ready) {
                 m.closed_in_flight += 1;
             }
@@ -303,7 +347,22 @@ mod mock {
     /// Arm the next `io_submit` with a completion. `ready_now` = the PO is signaled
     /// immediately (a poll finds it); otherwise it completes on the next blocking wait.
     pub fn script_next(status: i32, result: u64, ready_now: bool) {
-        MOCK.with(|m| m.borrow_mut().script.push_back((status, result, ready_now)));
+        MOCK.with(|m| m.borrow_mut().script.push_back((status, result, ready_now, false)));
+    }
+
+    /// Arm the next `io_submit` with a PO that never signals.
+    pub fn script_never() {
+        MOCK.with(|m| m.borrow_mut().script.push_back((0, 0, false, true)));
+    }
+
+    /// Fail the next wait with a deadline with `status`.
+    pub fn fail_next_wait(status: i64) {
+        MOCK.with(|m| m.borrow_mut().fail_wait = Some(status));
+    }
+
+    /// Waits that slept until their deadline.
+    pub fn sleeps() -> u32 {
+        MOCK.with(|m| m.borrow().sleeps)
     }
 
     /// Force the next `io_submit` to fail with `status`.
