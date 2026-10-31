@@ -2,23 +2,10 @@
 
 use super::*;
 
-/// **Wait `ns`**, on a channel of its own that nothing signals: `sys_wait` takes an absolute deadline
-/// and answers `TimedOut`.
+/// **Wait `ns`**, in a wait on no handles, which the kernel never refuses.
 pub(super) fn nap(ns: u64) {
-    let (mut ours, mut theirs) = (0u64, 0u64);
-    // SAFETY: valid writable out-params.
-    let cr = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) };
-    if cr != 0 {
-        return;
-    }
-    let handles = [ours];
-    let mut results = [0u8; 24];
-    // SAFETY: one handle this process holds, and room for one result.
-    unsafe {
-        syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, clock_ns().saturating_add(ns));
-    }
-    close(ours);
-    close(theirs);
+    // SAFETY: no handles and no results, so the kernel reads and writes neither.
+    unsafe { syscall4(SYS_WAIT, 0, 0, 0, clock_ns().saturating_add(ns)) };
 }
 
 /// **The device registry, through its binding.** The kernel's host tests see its table as a

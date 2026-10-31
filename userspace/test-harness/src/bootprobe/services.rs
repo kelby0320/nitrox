@@ -51,35 +51,15 @@ pub(super) fn restart_test(root_ns: u64) -> bool {
     if st == 0 {
         return fail(b"asking restart-probe to exit was not refused, as the probe answers it");
     }
-    // Its backoff is 100 ms. Resolve until the next instance answers, or give up — pausing
-    // twenty milliseconds between tries on a timer, since a wait on no handles is refused at once.
-    // SAFETY: register-only syscall; a one-shot timer this process owns.
-    let timer = unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) };
+    // Its backoff is 100 ms. Resolve until the next instance answers, or give up.
     let deadline = clock_ns() + 10_000_000_000;
     let second = loop {
         match token(root_ns) {
             Some(t) if t != first => break Some(t),
             _ if clock_ns() > deadline => break None,
-            _ if timer > 0 => {
-                let at = clock_ns() + 20_000_000;
-                let handles = [timer as u64];
-                let mut results = [0u8; 24];
-                // SAFETY: arming our own timer, then a one-entry wait on it, bounded besides.
-                unsafe {
-                    syscall4(libkern::SYS_TIMER_SET, timer as u64, at, 0, 0);
-                    syscall4(
-                        libkern::SYS_WAIT,
-                        handles.as_ptr() as u64,
-                        1,
-                        results.as_mut_ptr() as u64,
-                        at + 1_000_000_000,
-                    );
-                }
-            }
-            _ => {}
+            _ => nap(20_000_000),
         }
     };
-    close(if timer > 0 { timer as u64 } else { 0 });
     let Some(second) = second else {
         close(copy);
         return fail(b"no new instance answered at /svc/restart-probe within 10 s of the old one exiting");
@@ -231,34 +211,14 @@ pub(super) fn services_test(root_ns: u64) -> bool {
         return finish(fail(b"a second admin session would not take a restart"));
     }
     close(second);
-    // Twenty milliseconds between reads, on a timer: a wait on no handles is refused at once.
-    // SAFETY: register-only syscall; a one-shot timer this process owns.
-    let timer = unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) };
     let deadline = clock_ns() + 15_000_000_000;
     let restarted = loop {
         match row("clipboard-server") {
             Some((s, n)) if s == "running" && n == before + 1 => break true,
             _ if clock_ns() > deadline => break false,
-            _ if timer > 0 => {
-                let at = clock_ns() + 20_000_000;
-                let handles = [timer as u64];
-                let mut results = [0u8; 24];
-                // SAFETY: arming our own timer, then a one-entry wait on it, bounded besides.
-                unsafe {
-                    syscall4(libkern::SYS_TIMER_SET, timer as u64, at, 0, 0);
-                    syscall4(
-                        libkern::SYS_WAIT,
-                        handles.as_ptr() as u64,
-                        1,
-                        results.as_mut_ptr() as u64,
-                        at + 1_000_000_000,
-                    );
-                }
-            }
-            _ => {}
+            _ => nap(20_000_000),
         }
     };
-    close(if timer > 0 { timer as u64 } else { 0 });
     if !restarted {
         return finish(fail(b"a restart whose session closed at once did not start clipboard-server again"));
     }
