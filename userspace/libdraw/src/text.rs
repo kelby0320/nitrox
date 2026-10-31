@@ -242,8 +242,7 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
     let size = info.size as usize;
 
     let mut data = Vec::new();
-    // Reserve up front, before the map, so a refusal leaves no mapping behind: growing by doubling
-    // would fault the demand-paged file in twice.
+    // Reserve first: a refusal then leaves no mapping, and doubling would fault the file in twice.
     data.try_reserve_exact(size).map_err(|_| LoadError::ImpossibleSize(info.size))?;
     let addr = obj.map(size).map_err(|_| LoadError::Unmappable)?;
     // SAFETY: `map` returned a mapping of at least `size` readable bytes.

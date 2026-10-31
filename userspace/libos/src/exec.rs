@@ -16,8 +16,7 @@ use libkern::{IoOp, IoResult, KError, RawHandle};
 use crate::error::{Error, Result};
 use crate::sys;
 
-/// Max handles a single `sys_wait` (and thus one poll round) can register — mirrors
-/// the kernel's `MAX_WAIT_HANDLES`.
+/// Max handles one poll round registers, under the kernel's 32 to keep `block_on`'s stack small.
 const MAX_WAIT: usize = 8;
 
 /// How long `block_on` sleeps with nothing to wait on, before it polls again.
