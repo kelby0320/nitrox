@@ -75,35 +75,14 @@ impl Reactor {
     }
 }
 
-/// A timer `block_on` sleeps on, made the first time it has nothing to wait on.
-struct Idle {
-    timer: Option<u64>,
+/// A deadline [`IDLE_NS`] from now; a poll if the clock cannot be read.
+fn soon() -> u64 {
+    sys::monotonic_ns().map_or(0, |now| now.saturating_add(IDLE_NS))
 }
 
-impl Idle {
-    /// A deadline [`IDLE_NS`] from now; a poll if the clock cannot be read.
-    fn soon() -> u64 {
-        sys::monotonic_ns().map_or(0, |now| now.saturating_add(IDLE_NS))
-    }
-
-    /// Sleep [`IDLE_NS`]; not at all if no timer can be made.
-    fn sleep(&mut self) {
-        if self.timer.is_none() {
-            let t = sys::timer_create();
-            self.timer = (t >= 0).then_some(t as u64);
-        }
-        if let Some(t) = self.timer {
-            sys::wait(&[t], &mut zeroed_results::<1>(), Self::soon());
-        }
-    }
-}
-
-impl Drop for Idle {
-    fn drop(&mut self) {
-        if let Some(t) = self.timer {
-            sys::handle_close(t);
-        }
-    }
+/// Sleep [`IDLE_NS`], in a wait on no handles, which the kernel never refuses.
+fn sleep() {
+    sys::wait(&[], &mut [], soon());
 }
 
 // --- the Waker: a thin handle onto the reactor ----------------------------
@@ -198,10 +177,9 @@ impl Future for Op {
 impl Drop for Op {
     fn drop(&mut self) {
         if self.io && !self.finished {
-            let mut idle = Idle { timer: None };
             // A full waiter queue refuses the wait for now; any other refusal is for good.
             while sys::wait(&[self.po], &mut zeroed_results::<1>(), u64::MAX) == KError::OutOfMemory as i64 {
-                idle.sleep();
+                sleep();
             }
         } else if !self.io && !self.done {
             // A wait that read the lookup installed its handle, which nothing else would close.
@@ -229,7 +207,6 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
     let mut fut = core::pin::pin!(fut);
-    let mut idle = Idle { timer: None };
     loop {
         let unwatched = UNWATCHED.load(Relaxed);
         match fut.as_mut().poll(&mut cx) {
@@ -239,13 +216,13 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
                 let handles = &reg.handles[..reg.count];
                 let mut results = zeroed_results::<MAX_WAIT>();
                 let short = reg.dropped || UNWATCHED.load(Relaxed) != unwatched;
-                let deadline = if short { Idle::soon() } else { u64::MAX };
+                let deadline = if short { soon() } else { u64::MAX };
                 let waited = reg.count > 0 && {
                     let n = sys::wait(handles, &mut results, deadline);
                     n >= 0 || n == KError::TimedOut as i64
                 };
                 if !waited {
-                    idle.sleep();
+                    sleep();
                 }
             }
         }
@@ -504,8 +481,7 @@ mod tests {
             if polls < 3 { Poll::Pending } else { Poll::Ready(()) }
         }));
         assert_eq!(sys::sleeps(), 2);
-        assert_eq!(sys::timers_made(), 1, "one timer, slept on twice");
-        assert_eq!(sys::counts().2, 1, "its timer closed");
+        assert_eq!(sys::last_wait_count(), 0, "a sleep on no handle, which none can refuse");
     }
 
     /// **An `Op` polled twice in a round is waited on once**, its handle registered once.
