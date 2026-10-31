@@ -18,7 +18,8 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
 }
 
 /// `sys_wait` on as many of `handles` as `results` has room for — returns the count of signaled
-/// handles (one `IoResult` each), or an error. `deadline`: `0` = poll, `u64::MAX` = forever.
+/// handles (one `IoResult` each), or an error. `deadline`: `0` = poll, `u64::MAX` = forever; on
+/// no handles, a sleep until a deadline between, which the kernel never refuses.
 pub fn wait(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
     let count = handles.len().min(results.len());
     wait_exact(&handles[..count], &mut results[..count], deadline)
@@ -47,13 +48,6 @@ pub fn monotonic_ns() -> Option<u64> {
     // SAFETY: `ns` is a live `u64`, which the kernel writes.
     let r = unsafe { libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::CLOCK_MONOTONIC, &raw mut ns as u64) };
     (r >= 0).then_some(ns)
-}
-
-/// `sys_timer_create(0)` — an unarmed timer, which a wait with a deadline sleeps on.
-#[cfg(not(test))]
-pub fn timer_create() -> i64 {
-    // SAFETY: a plain create; `flags = 0`.
-    unsafe { libkern::syscall1(libkern::SYS_TIMER_CREATE, 0) }
 }
 
 /// `sys_handle_close(h)` — release the caller's reference to a handle.
@@ -146,13 +140,13 @@ use mock::wait_exact;
 #[cfg(test)]
 pub use mock::{
     handle_close, handle_restrict, io_submit, memory_create, memory_map, memory_unmap, monotonic_ns, notif_recv,
-    ns_bind, ns_enumerate, ns_lookup, process_spawn, thread_create, timer_create,
+    ns_bind, ns_enumerate, ns_lookup, process_spawn, thread_create,
 };
 
 #[cfg(test)]
 pub use mock::{
-    closed_in_flight, counts, fail_next_bind, fail_next_submit, fail_next_wait, last_wait_count, reset, script_never,
-    script_next, sleeps,
+    closed_in_flight, counts, fail_next_bind, fail_next_submit, fail_next_wait, installed, last_wait_count, reset,
+    script_never, script_next, sleeps,
 };
 
 #[cfg(test)]
@@ -165,6 +159,7 @@ mod mock {
     struct Po {
         ready: bool,
         never: bool,
+        lookup: bool,
         status: i32,
         result: u64,
     }
@@ -175,7 +170,8 @@ mod mock {
         pos: BTreeMap<u64, Po>,
         /// Completions armed for upcoming `io_submit`s: `(status, result, ready_now, never)`.
         script: VecDeque<(i32, u64, bool, bool)>,
-        timers: BTreeSet<u64>,
+        /// Handles lookups resolved to, installed by the first wait that read them, as the kernel's.
+        installed: BTreeSet<u64>,
         fail_wait: Option<i64>,
         /// Waits that slept until a deadline, neither polls nor waits for ever.
         sleeps: u32,
@@ -201,6 +197,10 @@ mod mock {
     }
 
     pub fn io_submit(_resource: u64, _op: &IoOp) -> i64 {
+        submit(false)
+    }
+
+    fn submit(lookup: bool) -> i64 {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
             m.submits += 1;
@@ -210,22 +210,23 @@ mod mock {
             let (status, result, ready, never) = m.script.pop_front().unwrap_or((0, 0, true, false));
             let h = m.next_handle;
             m.next_handle += 1;
-            m.pos.insert(h, Po { ready, never, status, result });
+            m.pos.insert(h, Po { ready, never, lookup, status, result });
             h as i64
         })
     }
 
-    /// As the kernel answers (`InvalidArgument`, `InvalidHandle`, an empty poll's `WouldBlock`); a
-    /// short `results` panics. A deadline lets time pass; a wait for ever that nothing ends panics.
+    /// As the kernel answers (`InvalidArgument`, `InvalidHandle`, an empty poll's `WouldBlock`, a
+    /// sleep on no handles); a short `results` panics. A deadline lets time pass; a wait for ever that nothing ends panics.
     pub fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
         MOCK.with(|m| {
-            let mut m = m.borrow_mut();
+            let m = &mut *m.borrow_mut();
             m.waits += 1;
+            assert!(m.waits < 10_000, "a loop of waits that never ends");
             m.last_wait_count = handles.len();
-            if handles.is_empty() {
+            if handles.is_empty() && (deadline == 0 || deadline == u64::MAX) {
                 return -30;
             }
-            if handles.iter().any(|h| !m.pos.contains_key(h) && !m.timers.contains(h)) {
+            if handles.iter().any(|h| !m.pos.contains_key(h)) {
                 return -1;
             }
             if deadline != 0 {
@@ -241,6 +242,9 @@ mod mock {
                 {
                     results[n] = IoResult { handle: h, status: po.status, reserved: 0, result: po.result };
                     n += 1;
+                    if po.lookup && po.status == 0 {
+                        m.installed.insert(po.result);
+                    }
                 }
             }
             match (n, deadline) {
@@ -263,17 +267,11 @@ mod mock {
         })
     }
 
-    pub fn timer_create() -> i64 {
-        let h = mint_handle();
-        MOCK.with(|m| m.borrow_mut().timers.insert(h as u64));
-        h
-    }
-
     pub fn handle_close(h: u64) {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();
             m.closes += 1;
-            m.timers.remove(&h);
+            m.installed.remove(&h);
             if m.pos.remove(&h).is_some_and(|po| !po.ready) {
                 m.closed_in_flight += 1;
             }
@@ -303,8 +301,7 @@ mod mock {
 
     pub fn ns_lookup(_ns: u64, _path: &[u8], _rights: u64) -> i64 {
         // The scripted completion's `result` is the resolved handle.
-        let dummy = IoOp { opcode: 0, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
-        io_submit(0, &dummy)
+        submit(true)
     }
 
     pub fn ns_enumerate(_ns: u64, _index: u64, _out: &mut NsEntry) -> i64 {
@@ -382,6 +379,11 @@ mod mock {
     /// How many POs were closed before they signalled.
     pub fn closed_in_flight() -> u32 {
         MOCK.with(|m| m.borrow().closed_in_flight)
+    }
+
+    /// Whether a lookup's handle `h` was installed by a wait and not yet closed.
+    pub fn installed(h: u64) -> bool {
+        MOCK.with(|m| m.borrow().installed.contains(&h))
     }
 
     /// How many handles the last `wait` was handed.

@@ -266,6 +266,7 @@ mod tests {
             // SAFETY: the mock resolves any path to the scripted handle, so the asserted type and mode are never checked against a real object.
             block_on(unsafe { ns.lookup::<Resource, ReadOnly>("/dev/console", Rights::READ) }).unwrap();
         assert_eq!(resolved.raw(), RawHandle(777));
+        assert!(sys::installed(777), "the handle handed out stays open");
     }
 
     #[test]

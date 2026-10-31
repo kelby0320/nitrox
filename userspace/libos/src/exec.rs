@@ -6,9 +6,9 @@
 //! one blocking `sys_wait` on the registered handles and re-polls. There is no ready
 //! queue (deferred; see `docs/architecture/libos.md`).
 
-use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use libkern::{IoOp, IoResult, KError, RawHandle};
@@ -21,6 +21,9 @@ const MAX_WAIT: usize = 8;
 
 /// How long `block_on` sleeps with nothing to wait on, before it polls again.
 const IDLE_NS: u64 = 1_000_000;
+
+/// Polls that left a pending `Op` registered with no reactor, so `block_on` must poll again.
+static UNWATCHED: AtomicUsize = AtomicUsize::new(0);
 
 /// An `[IoResult; N]` of zeroes (no `Copy`/`Default` bound needed).
 fn zeroed_results<const N: usize>() -> [IoResult; N] {
@@ -37,67 +40,49 @@ struct Registry {
     dropped: bool,
 }
 
-/// Per-`block_on` set of waitable handles the current poll round registered. A `Cell`
-/// because it is shared through the `Waker`'s data pointer *and* `block_on`.
+/// Per-`block_on` set of waitable handles the current poll round registered, reached through the
+/// `Waker`'s data pointer; atomic, as the `Waker` is `Sync`.
 struct Reactor {
-    reg: Cell<Registry>,
+    handles: [AtomicU64; MAX_WAIT],
+    /// Slots claimed this round, past `MAX_WAIT` if a handle was left out.
+    claimed: AtomicUsize,
 }
 
 impl Reactor {
     fn new() -> Self {
-        Reactor { reg: Cell::new(Registry { handles: [0; MAX_WAIT], count: 0, dropped: false }) }
+        Reactor { handles: core::array::from_fn(|_| AtomicU64::new(0)), claimed: AtomicUsize::new(0) }
     }
 
     /// Register a waitable handle for this poll round (deduplicated; capped at `MAX_WAIT`).
     fn register(&self, h: u64) {
-        let mut r = self.reg.get();
-        if r.handles[..r.count].contains(&h) {
+        let n = self.claimed.load(Relaxed).min(MAX_WAIT);
+        if self.handles[..n].iter().any(|s| s.load(Relaxed) == h) {
             return;
         }
-        if r.count < MAX_WAIT {
-            r.handles[r.count] = h;
-            r.count += 1;
-        } else {
-            r.dropped = true;
+        if let Some(slot) = self.handles.get(self.claimed.fetch_add(1, Relaxed)) {
+            slot.store(h, Relaxed);
         }
-        self.reg.set(r);
     }
 
     /// Take and clear the round's registrations.
     fn take(&self) -> Registry {
-        self.reg.replace(Registry { handles: [0; MAX_WAIT], count: 0, dropped: false })
+        let n = self.claimed.swap(0, Relaxed);
+        let mut r = Registry { handles: [0; MAX_WAIT], count: n.min(MAX_WAIT), dropped: n > MAX_WAIT };
+        for (to, from) in r.handles.iter_mut().zip(&self.handles) {
+            *to = from.swap(0, Relaxed);
+        }
+        r
     }
 }
 
-/// A timer `block_on` sleeps on, made the first time it has nothing to wait on.
-struct Idle {
-    timer: Option<u64>,
+/// A deadline [`IDLE_NS`] from now; a poll if the clock cannot be read.
+fn soon() -> u64 {
+    sys::monotonic_ns().map_or(0, |now| now.saturating_add(IDLE_NS))
 }
 
-impl Idle {
-    /// A deadline [`IDLE_NS`] from now; a poll if the clock cannot be read.
-    fn soon() -> u64 {
-        sys::monotonic_ns().map_or(0, |now| now.saturating_add(IDLE_NS))
-    }
-
-    /// Sleep [`IDLE_NS`]; not at all if no timer can be made.
-    fn sleep(&mut self) {
-        if self.timer.is_none() {
-            let t = sys::timer_create();
-            self.timer = (t >= 0).then_some(t as u64);
-        }
-        if let Some(t) = self.timer {
-            sys::wait(&[t], &mut zeroed_results::<1>(), Self::soon());
-        }
-    }
-}
-
-impl Drop for Idle {
-    fn drop(&mut self) {
-        if let Some(t) = self.timer {
-            sys::handle_close(t);
-        }
-    }
+/// Sleep [`IDLE_NS`], in a wait on no handles, which the kernel never refuses.
+fn sleep() {
+    sys::wait(&[], &mut [], soon());
 }
 
 // --- the Waker: a thin handle onto the reactor ----------------------------
@@ -144,7 +129,7 @@ impl Op {
         Ok(Op { po: po as u64, io: true, finished: false, done: false })
     }
 
-    /// Wrap a lookup's PO; its drop closes it at once, as the kernel frees a lookup closed unread.
+    /// Wrap a lookup's PO; its drop waits for nothing, as the kernel frees a lookup closed unread.
     pub(crate) fn from_po(po: u64) -> Op {
         Op { po, io: false, finished: false, done: false }
     }
@@ -177,11 +162,12 @@ impl Future for Op {
         let waker = cx.waker();
         if !core::ptr::eq(waker.vtable(), &VTABLE) {
             // Another executor's waker, or a clone of `block_on`'s: be polled again, unregistered.
+            UNWATCHED.fetch_add(1, Relaxed);
             waker.wake_by_ref();
             return Poll::Pending;
         }
-        // SAFETY: only `block_on` makes a waker with `VTABLE`, its data a `Reactor` that lives
-        // for the poll.
+        // SAFETY: only `block_on` makes a waker with `VTABLE`, its data a `Sync` `Reactor` that
+        // lives for the poll.
         let reactor = unsafe { &*(waker.data() as *const Reactor) };
         reactor.register(this.po);
         Poll::Pending
@@ -191,7 +177,16 @@ impl Future for Op {
 impl Drop for Op {
     fn drop(&mut self) {
         if self.io && !self.finished {
-            sys::wait(&[self.po], &mut zeroed_results::<1>(), u64::MAX);
+            // A full waiter queue refuses the wait for now; any other refusal is for good.
+            while sys::wait(&[self.po], &mut zeroed_results::<1>(), u64::MAX) == KError::OutOfMemory as i64 {
+                sleep();
+            }
+        } else if !self.io && !self.done {
+            // A wait that read the lookup installed its handle, which nothing else would close.
+            let mut r = zeroed_results::<1>();
+            if sys::wait(&[self.po], &mut r, 0) == 1 && r[0].status == 0 {
+                sys::handle_close(r[0].result);
+            }
         }
         sys::handle_close(self.po);
     }
@@ -203,7 +198,7 @@ impl Drop for Op {
 /// between polls. Alloc-free.
 ///
 /// On `Pending`, waits on the handles this round's `Op`s registered, then re-polls; it sleeps
-/// [`IDLE_NS`] with none or a failed wait, and waits no longer when one was left out.
+/// [`IDLE_NS`] with none or a failed wait, and waits no longer when an `Op` went unregistered.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     let reactor = Reactor::new();
     let raw = RawWaker::new(&reactor as *const Reactor as *const (), &VTABLE);
@@ -212,20 +207,22 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
     let mut fut = core::pin::pin!(fut);
-    let mut idle = Idle { timer: None };
     loop {
+        let unwatched = UNWATCHED.load(Relaxed);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return v,
             Poll::Pending => {
                 let reg = reactor.take();
                 let handles = &reg.handles[..reg.count];
                 let mut results = zeroed_results::<MAX_WAIT>();
-                if reg.count == 0 {
-                    idle.sleep();
-                } else if reg.dropped {
-                    sys::wait(handles, &mut results, Idle::soon());
-                } else if sys::wait(handles, &mut results, u64::MAX) < 0 {
-                    idle.sleep();
+                let short = reg.dropped || UNWATCHED.load(Relaxed) != unwatched;
+                let deadline = if short { soon() } else { u64::MAX };
+                let waited = reg.count > 0 && {
+                    let n = sys::wait(handles, &mut results, deadline);
+                    n >= 0 || n == KError::TimedOut as i64
+                };
+                if !waited {
+                    sleep();
                 }
             }
         }
@@ -301,7 +298,48 @@ mod tests {
             Poll::Ready(())
         }));
         let kept = kept.unwrap();
+        let unwatched = UNWATCHED.load(Relaxed);
         assert!(Pin::new(&mut op).poll(&mut Context::from_waker(&kept)).is_pending());
+        assert_ne!(UNWATCHED.load(Relaxed), unwatched);
+    }
+
+    /// **An `Op` polled through another waker is polled again**, where `block_on` waited for ever
+    /// on those that registered.
+    #[test]
+    fn an_op_polled_through_another_waker_is_polled_again() {
+        sys::reset();
+        sys::script_next(0, 11, false);
+        let mut a = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::script_never();
+        let mut b = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let got = block_on(core::future::poll_fn(|cx| {
+            let clone = cx.waker().clone();
+            if let Poll::Ready(r) = Pin::new(&mut a).poll(&mut Context::from_waker(&clone)) {
+                return Poll::Ready(r);
+            }
+            Pin::new(&mut b).poll(cx)
+        }));
+        assert_eq!(got.unwrap().result, 11);
+        core::mem::forget(b);
+    }
+
+    /// **Ops polled on other threads with `block_on`'s waker**, which is `Sync`, race on nothing.
+    #[test]
+    fn ops_polled_on_other_threads_race_on_nothing() {
+        sys::reset();
+        block_on(core::future::poll_fn(|cx| {
+            let waker = cx.waker();
+            std::thread::scope(|s| {
+                for _ in 0..2 {
+                    s.spawn(|| {
+                        sys::script_next(0, 1, false);
+                        let mut op = Op::submit(RawHandle(1), &read_op()).unwrap();
+                        assert!(Pin::new(&mut op).poll(&mut Context::from_waker(waker)).is_pending());
+                    });
+                }
+            });
+            Poll::Ready(())
+        }));
     }
 
     /// **A completed `Op` hands its result out once**, and waits on nothing for a second poll.
@@ -315,6 +353,8 @@ mod tests {
         let (_s, waits, _c) = sys::counts();
         assert!(matches!(Pin::new(&mut op).poll(&mut cx), Poll::Ready(Err(_))));
         assert_eq!(sys::counts().1, waits);
+        drop(op);
+        assert_eq!(sys::counts().1, waits, "a finished I/O's drop waits on nothing");
     }
 
     /// **An `Op` whose wait fails completes with the error**, where it was polled again for ever.
@@ -343,11 +383,74 @@ mod tests {
         assert_eq!(sys::closed_in_flight(), 1);
     }
 
+    /// **A dropped I/O whose wait is refused for now waits again**, rather than closing in flight.
+    #[test]
+    fn a_dropped_io_whose_wait_is_refused_for_now_waits_again() {
+        sys::reset();
+        sys::script_next(0, 1, false);
+        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::fail_next_wait(KError::OutOfMemory as i64);
+        drop(op);
+        assert_eq!(sys::closed_in_flight(), 0);
+        assert_eq!(sys::sleeps(), 1);
+    }
+
+    /// **A dropped lookup closes the handle a wait installed**, which nothing else would close.
+    #[test]
+    fn a_dropped_lookup_closes_the_handle_a_wait_installed() {
+        sys::reset();
+        sys::script_next(0, 777, false);
+        let mut lookup = Op::from_po(sys::ns_lookup(1, b"/x", 0) as u64);
+        sys::script_next(0, 5, false);
+        let mut io = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let mut first = true;
+        block_on(core::future::poll_fn(|cx| {
+            if core::mem::take(&mut first) {
+                assert!(Pin::new(&mut lookup).poll(cx).is_pending());
+            }
+            Pin::new(&mut io).poll(cx)
+        }))
+        .unwrap();
+        assert!(sys::installed(777));
+        drop(lookup);
+        assert!(!sys::installed(777));
+        sys::script_next(KError::NotFound as i32, 778, true);
+        let closes = sys::counts().2;
+        drop(Op::from_po(sys::ns_lookup(1, b"/y", 0) as u64));
+        assert_eq!(sys::counts().2, closes + 1, "a failed lookup's PO, and no handle");
+    }
+
     /// **A ninth operation is polled again**, where `block_on` waited for ever on its first eight.
     #[test]
     fn a_ninth_operation_is_polled_again() {
         sys::reset();
-        let mut ops: std::vec::Vec<Op> = (0..9)
+        let mut ops = eight_never_and_a_ninth();
+        let first = block_on(core::future::poll_fn(|cx| first_ready(&mut ops, cx)));
+        assert_eq!(first.unwrap().result, 9);
+        assert_eq!(sys::sleeps(), 1, "a deadline wait that timed out, which is no failure");
+        // The other eight never finish, so their drops would wait for ever.
+        core::mem::forget(ops);
+    }
+
+    /// **A failed wait in a round that left a handle out sleeps** before the next poll too.
+    #[test]
+    fn a_failed_wait_past_the_eighth_sleeps_before_the_next_poll() {
+        sys::reset();
+        let mut ops = eight_never_and_a_ninth();
+        sys::fail_next_wait(-4);
+        let mut slept = std::vec::Vec::new();
+        block_on(core::future::poll_fn(|cx| {
+            slept.push(sys::sleeps());
+            first_ready(&mut ops, cx)
+        }))
+        .unwrap();
+        assert_eq!(slept, [0, 1]);
+        core::mem::forget(ops);
+    }
+
+    /// Nine `Op`s, the first eight never signalling and the ninth on the next wait.
+    fn eight_never_and_a_ninth() -> std::vec::Vec<Op> {
+        (0..9)
             .map(|i| {
                 if i < 8 {
                     sys::script_never()
@@ -356,18 +459,16 @@ mod tests {
                 }
                 Op::submit(RawHandle(1), &read_op()).unwrap()
             })
-            .collect();
-        let first = block_on(core::future::poll_fn(|cx| {
-            ops.iter_mut()
-                .find_map(|op| match Pin::new(op).poll(cx) {
-                    Poll::Ready(r) => Some(Poll::Ready(r)),
-                    Poll::Pending => None,
-                })
-                .unwrap_or(Poll::Pending)
-        }));
-        assert_eq!(first.unwrap().result, 9);
-        // The other eight never finish, so their drops would wait for ever.
-        core::mem::forget(ops);
+            .collect()
+    }
+
+    fn first_ready(ops: &mut [Op], cx: &mut Context<'_>) -> Poll<Result<IoResult>> {
+        ops.iter_mut()
+            .find_map(|op| match Pin::new(op).poll(cx) {
+                Poll::Ready(r) => Some(Poll::Ready(r)),
+                Poll::Pending => None,
+            })
+            .unwrap_or(Poll::Pending)
     }
 
     /// **`block_on` sleeps with nothing to wait on**, where it spun on a wait the kernel refuses.
@@ -380,7 +481,25 @@ mod tests {
             if polls < 3 { Poll::Pending } else { Poll::Ready(()) }
         }));
         assert_eq!(sys::sleeps(), 2);
-        assert_eq!(sys::counts().2, 1, "its timer closed");
+        assert_eq!(sys::last_wait_count(), 0, "a sleep on no handle, which none can refuse");
+    }
+
+    /// **An `Op` polled twice in a round is waited on once**, its handle registered once.
+    #[test]
+    fn an_op_polled_twice_in_a_round_is_waited_on_once() {
+        sys::reset();
+        sys::script_next(0, 3, false);
+        let mut op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let mut handed = std::vec::Vec::new();
+        let r = block_on(core::future::poll_fn(|cx| {
+            handed.push(sys::last_wait_count());
+            match Pin::new(&mut op).poll(cx) {
+                Poll::Ready(r) => Poll::Ready(r),
+                Poll::Pending => Pin::new(&mut op).poll(cx),
+            }
+        }));
+        assert_eq!(r.unwrap().result, 3);
+        assert_eq!(handed, [0, 1]);
     }
 
     /// **A failed wait sleeps before the next poll**, rather than polling again at once.

@@ -276,3 +276,10 @@ fn a_periodic_timers_re_push_is_held_to_its_slot() {
     st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 0;
     fire_expired_deadlines(&mut st, 1_100);
 }
+
+#[test]
+fn a_wait_on_nothing_refuses_a_poll_and_a_wait_for_ever() {
+    use crate::syscall::error::KError;
+    assert_eq!(sleep_until(0, 0), Err(KError::InvalidArgument));
+    assert_eq!(sleep_until(u64::MAX, 0), Err(KError::InvalidArgument));
+}

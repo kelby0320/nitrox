@@ -1384,10 +1384,10 @@ pub fn sys_io_cancel(_pending_h: u64) -> SysResult {
 /// Each handle needs `WAIT` and must be a `Timer`, `NotificationChannel`, `IpcChannel`,
 /// `PendingOperation` or `InterruptObject` (else `Unsupported`). Writes one [`IoResult`] per
 /// signaled handle to `results` and returns the count signaled (≥1), or `TimedOut` /
-/// `WouldBlock`.
+/// `WouldBlock`. On no handles it sleeps until a finite `deadline` ([`crate::sched::sleep_until`]).
 pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u64) -> SysResult {
     if count == 0 {
-        return Err(KError::InvalidArgument);
+        return crate::sched::sleep_until(deadline_ns, Timer::read_ns());
     }
     if count > MAX_WAIT_HANDLES {
         return Err(KError::TooLarge);

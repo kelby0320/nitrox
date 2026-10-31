@@ -393,3 +393,16 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-30	409	4aa384ef	6	tests	optional	unverified	declined		no host test reaches past spawn's image lookup; boot with next_pid 6 short: refused at the caller, no reuse
 2026-10-30	409	4aa384ef	7	tests	optional	unverified	fixed	0f709668	one ioapic::install checks before taking a vector; a_refused_install_takes_no_vector; reversed order fails it
 2026-10-30	409	4aa384ef	8	rules-and-docs	optional	unverified	declined		the only host test touching LINE (grep); latent until a second one
+2026-10-31	410	86fb6af7	1	logic	worth-fixing	demonstrated	fixed	069d6de2	unregistered polls counted; a round where the count moved waits to a deadline; clone+never test panicked on a wait for ever without
+2026-10-31	410	86fb6af7	2	error-paths	worth-fixing	demonstrated	fixed	aac051f8	drop sleeps and retries OutOfMemory only; closed in flight 1 -> 0; retrying every refusal hangs a lost PO (mock now panics on a wait loop)
+2026-10-31	410	86fb6af7	3	tests	worth-fixing	demonstrated	fixed	267163e8	completed-op test asserts the drop waits on nothing; finished=true removed fails it
+2026-10-31	410	86fb6af7	4	rules-and-docs	worth-fixing	demonstrated	fixed	46ff9b09	session-mgr CLAUDE.md says the holes are fixed; no other rules file names the condition
+2026-10-31	410	86fb6af7	5	logic+error-paths	optional	unverified	fixed	0489791d	mock installs a lookup's handle on first read: drop left it installed; drop now polls and closes it; failed lookup closes nothing
+2026-10-31	410	86fb6af7	6	logic	optional	demonstrated	fixed	9381aada	every round sleeps after a failed wait; sleeps at each poll [0,0,1] -> [0,1]; a timeout is not slept on twice
+2026-10-31	410	86fb6af7	7	error-paths	optional	demonstrated	fixed	b26e0875	maintainer's call: sys_wait on no handles sleeps (boot probe: -30 in 0 ms before, TimedOut after); libos sleeps so, no timer (2f719ccc)
+2026-10-31	410	86fb6af7	8	error-paths	optional	demonstrated	fixed	267163e8	test asserted one timer made (a timer per sleep failed it); the timer itself then went with finding 7 (2f719ccc)
+2026-10-31	410	86fb6af7	9	tests	optional	demonstrated	fixed	267163e8	an op polled twice a round hands the wait one handle; dedup removed hands it two
+2026-10-31	410	86fb6af7	10	logic	optional	unverified	fixed	a78f2504	Miri: data race between two scoped threads' polls on the Cell; reactor slots now atomics, Miri clean
+2026-10-31	410	86fb6af7	11	tests	optional	unverified	declined		raw libkern syscalls the host cannot mock; the leaks were shown by boots (Logger 18/40 -> 40/40, unmap probe), in the commits
+2026-10-31	410	86fb6af7	12	tests	optional	unverified	declined		unchanged from base: file_size made the same lookup and mapped every failure to NotFound
+2026-10-31	410	86fb6af7	13	rules-and-docs	optional	unverified	refuted		cargo doc renders thread_create's Safety as an h2: a CommonMark ATX heading interrupts a paragraph
