@@ -6,9 +6,9 @@
 //! one blocking `sys_wait` on the registered handles and re-polls. There is no ready
 //! queue (deferred; see `docs/architecture/libos.md`).
 
-use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use libkern::{IoOp, IoResult, KError, RawHandle};
@@ -37,35 +37,38 @@ struct Registry {
     dropped: bool,
 }
 
-/// Per-`block_on` set of waitable handles the current poll round registered. A `Cell`
-/// because it is shared through the `Waker`'s data pointer *and* `block_on`.
+/// Per-`block_on` set of waitable handles the current poll round registered, reached through the
+/// `Waker`'s data pointer; atomic, as the `Waker` is `Sync`.
 struct Reactor {
-    reg: Cell<Registry>,
+    handles: [AtomicU64; MAX_WAIT],
+    /// Slots claimed this round, past `MAX_WAIT` if a handle was left out.
+    claimed: AtomicUsize,
 }
 
 impl Reactor {
     fn new() -> Self {
-        Reactor { reg: Cell::new(Registry { handles: [0; MAX_WAIT], count: 0, dropped: false }) }
+        Reactor { handles: core::array::from_fn(|_| AtomicU64::new(0)), claimed: AtomicUsize::new(0) }
     }
 
     /// Register a waitable handle for this poll round (deduplicated; capped at `MAX_WAIT`).
     fn register(&self, h: u64) {
-        let mut r = self.reg.get();
-        if r.handles[..r.count].contains(&h) {
+        let n = self.claimed.load(Relaxed).min(MAX_WAIT);
+        if self.handles[..n].iter().any(|s| s.load(Relaxed) == h) {
             return;
         }
-        if r.count < MAX_WAIT {
-            r.handles[r.count] = h;
-            r.count += 1;
-        } else {
-            r.dropped = true;
+        if let Some(slot) = self.handles.get(self.claimed.fetch_add(1, Relaxed)) {
+            slot.store(h, Relaxed);
         }
-        self.reg.set(r);
     }
 
     /// Take and clear the round's registrations.
     fn take(&self) -> Registry {
-        self.reg.replace(Registry { handles: [0; MAX_WAIT], count: 0, dropped: false })
+        let n = self.claimed.swap(0, Relaxed);
+        let mut r = Registry { handles: [0; MAX_WAIT], count: n.min(MAX_WAIT), dropped: n > MAX_WAIT };
+        for (to, from) in r.handles.iter_mut().zip(&self.handles) {
+            *to = from.swap(0, Relaxed);
+        }
+        r
     }
 }
 
@@ -180,8 +183,8 @@ impl Future for Op {
             waker.wake_by_ref();
             return Poll::Pending;
         }
-        // SAFETY: only `block_on` makes a waker with `VTABLE`, its data a `Reactor` that lives
-        // for the poll.
+        // SAFETY: only `block_on` makes a waker with `VTABLE`, its data a `Sync` `Reactor` that
+        // lives for the poll.
         let reactor = unsafe { &*(waker.data() as *const Reactor) };
         reactor.register(this.po);
         Poll::Pending
@@ -302,6 +305,25 @@ mod tests {
         }));
         let kept = kept.unwrap();
         assert!(Pin::new(&mut op).poll(&mut Context::from_waker(&kept)).is_pending());
+    }
+
+    /// **Ops polled on other threads with `block_on`'s waker**, which is `Sync`, race on nothing.
+    #[test]
+    fn ops_polled_on_other_threads_race_on_nothing() {
+        sys::reset();
+        block_on(core::future::poll_fn(|cx| {
+            let waker = cx.waker();
+            std::thread::scope(|s| {
+                for _ in 0..2 {
+                    s.spawn(|| {
+                        sys::script_next(0, 1, false);
+                        let mut op = Op::submit(RawHandle(1), &read_op()).unwrap();
+                        assert!(Pin::new(&mut op).poll(&mut Context::from_waker(waker)).is_pending());
+                    });
+                }
+            });
+            Poll::Ready(())
+        }));
     }
 
     /// **A completed `Op` hands its result out once**, and waits on nothing for a second poll.
