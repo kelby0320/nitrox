@@ -104,12 +104,6 @@ const READY_TIMEOUT_NS: u64 = 30_000_000_000;
 const HELD_ASKS: u32 = 3;
 const HELD_PARK_NS: u64 = 5_000_000;
 
-static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * MAX_WAIT_HANDLES] = [0; 24 * MAX_WAIT_HANDLES];
-
 fn close(h: u64) {
     if h != 0 {
         // SAFETY: closing a handle this process holds.
@@ -125,11 +119,9 @@ fn now_ns() -> u64 {
 }
 
 fn wait_until(h: u64, deadline: u64) -> bool {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid; one waiter.
-    unsafe {
-        WAIT_HANDLES[0] = h;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline) == 1
-    }
+    let mut result = [0u8; 24];
+    // SAFETY: one handle, and room for its one result.
+    unsafe { syscall4(SYS_WAIT, (&raw const h) as u64, 1, result.as_mut_ptr() as u64, deadline) == 1 }
 }
 
 /// Park this thread for `ns`: a one-shot timer, since `sys_wait` takes no empty handle list, so a
@@ -148,15 +140,13 @@ fn park(ns: u64) {
 
 /// Wait for a pending operation and return its `(status, value)`.
 fn po_wait(po: u64) -> (i64, u64) {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid; one waiter, no deadline.
-    let (done, status, value) = unsafe {
-        WAIT_HANDLES[0] = po;
-        let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
-        let word = |off: usize| u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]));
-        // The status is an `i32`, beside a zero reserved word: read whole, `AlreadyExists` would
-        // never compare equal.
-        (w == 1, word(8) as u32 as i32 as i64, word(16))
-    };
+    let mut r = [0u8; 24];
+    // SAFETY: one handle, and room for its one result.
+    let done = unsafe { syscall4(SYS_WAIT, (&raw const po) as u64, 1, r.as_mut_ptr() as u64, u64::MAX) } == 1;
+    let word = |off: usize| u64::from_le_bytes(r[off..off + 8].try_into().unwrap_or([0; 8]));
+    // The status is an `i32`, beside a zero reserved word: read whole, `AlreadyExists` would never
+    // compare equal.
+    let (status, value) = (word(8) as u32 as i32 as i64, word(16));
     close(po);
     if done { (status, value) } else { (-1, 0) }
 }
@@ -165,27 +155,19 @@ fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u
     send_raw(ch, op, request_id, flags, body, handles) == 0
 }
 
-/// [`send`], answering the syscall's own result. **Through `REPLY_MSG`**, whole: the kernel
+/// [`send`], answering the syscall's own result. **Through a whole message's buffer**: the kernel
 /// copies a full message from the pointer it is given, so a smaller buffer would be read past.
 fn send_raw(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> i64 {
-    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
-    unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
-        else {
-            return KError::InvalidArgument.as_i32() as i64;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = handles.len() as u8;
-        REPLY_HANDLES[..handles.len()].copy_from_slice(handles);
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            handles.len() as u64,
-            SENDMODE_NOBLOCK,
-        )
-    }
+    let (mut msg, mut carried) = ([0u8; MSG_LEN], [0u64; 8]);
+    let Some(rs_len) = encode(&mut msg[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16) else {
+        return KError::InvalidArgument.as_i32() as i64;
+    };
+    msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+    msg[8] = handles.len() as u8;
+    carried[..handles.len()].copy_from_slice(handles);
+    let (msg, carried) = (msg.as_ptr() as u64, carried.as_ptr() as u64);
+    // SAFETY: a whole message, and the handles it carries, which this process holds.
+    unsafe { syscall5(SYS_CHANNEL_SEND, ch, msg, carried, handles.len() as u64, SENDMODE_NOBLOCK) }
 }
 
 /// **Ping a watch**: a bare `Changed`, never blocking. A full queue is a ping already waiting, and
@@ -274,20 +256,14 @@ struct Message {
 /// Receive one message on `ch`, and the handles it carried, closed with the [`libkern::Received`]
 /// unless taken. `Ok(None)` if nothing was queued, `Err(())` if the peer has gone.
 fn recv(ch: u64) -> Result<Option<(Message, libkern::Received)>, ()> {
-    // SAFETY: single-threaded service; `RECV_MSG` is lent for the call.
-    let sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+    let mut buf = [0u8; MSG_LEN];
+    let sent = match channel_recv(ch, &mut buf) {
         Ok(sent) => sent,
         Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
         Err(_) => return Ok(None),
     };
-    // SAFETY: bounded read of the payload the kernel just wrote.
-    let msg = unsafe {
-        let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            len.min(MSG_LEN - PAYLOAD_OFF),
-        )
-    };
+    let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    let msg = &buf[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)];
     // A message that does not decode closes what it carried, as `sent` drops.
     Ok(decode(msg)
         .ok()
@@ -1418,13 +1394,13 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN`. `0` once `service-mgr` is gone.
     let mut control = control;
     loop {
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the subscription, the
-        // control channel, and at most each kind's bound more — each refuses past it.
-        let waited = unsafe {
+        // Each kind refuses past its bound. The records are the loop's own, out of handlers' reach.
+        let (mut handles, mut results) = ([0u64; MAX_WAIT_HANDLES], [0u8; 24 * MAX_WAIT_HANDLES]);
+        let waited = {
             let mut n = 0usize;
             let mut push = |h: u64| {
                 if h != 0 && n < MAX_WAIT_HANDLES {
-                    WAIT_HANDLES[n] = h;
+                    handles[n] = h;
                     n += 1;
                 }
             };
@@ -1451,18 +1427,16 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             for &(d, _) in &s.dirs {
                 push(d);
             }
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+            // SAFETY: `n` handles, and room for as many results.
+            unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, u64::MAX) }
         };
         // **What a watch is told**: the names mounted and the devices there are before this turn,
         // against after it. Compared here, once, rather than at each place that mounts, unmounts
         // or follows a device, so no path can miss a ping.
         let before = s.watched();
         for j in 0..waited.max(0) as usize {
-            // SAFETY: `waited` records were written; the handle is the first word of each.
-            let h = unsafe {
-                let off = j * 24;
-                u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]))
-            };
+            // The handle is the first word of each record.
+            let h = u64::from_le_bytes(results[j * 24..j * 24 + 8].try_into().unwrap_or([0; 8]));
             if h == s.serve_end {
                 // A root endpoint with no peer is the end of this service, not a message to skip:
                 // the kernel keeps a peer-closed channel signalled, so going round again would spin

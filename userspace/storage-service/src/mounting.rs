@@ -45,22 +45,15 @@ fn spawn(root_ns: u64, path: &[u8], control_end: u64) -> Option<u64> {
 /// Send a filesystem server its **setup message**: the device in `handles[0]`, and one flags byte.
 /// Not rsproto-framed — it precedes everything else on the channel (`rsproto-wire-format.md`).
 fn send_setup(control: u64, device: u64, flags: u8) -> bool {
-    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
+    let mut msg = [0u8; MSG_LEN];
+    let Some(n) = fs_setup(&mut msg[PAYLOAD_OFF..], flags) else {
+        return false;
+    };
+    msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+    msg[8] = 1;
+    // SAFETY: a whole message, carrying one handle this process holds.
     unsafe {
-        let Some(n) = fs_setup(&mut REPLY_MSG[PAYLOAD_OFF..], flags) else {
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = device;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            control,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        ) == 0
+        syscall5(SYS_CHANNEL_SEND, control, msg.as_ptr() as u64, (&raw const device) as u64, 1, SENDMODE_NOBLOCK) == 0
     }
 }
 
