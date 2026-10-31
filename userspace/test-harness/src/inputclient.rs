@@ -224,7 +224,7 @@ impl Stream {
 
 /// Entry point; `root_ns` is the process's root namespace.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
+pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"input-testclient: up\n");
 
     let Some(mut stream) = Stream::open(root_ns) else {
@@ -247,7 +247,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 // wait.
                 if core::mem::take(&mut stream.start_requested) {
                     kprint(b"input-testclient: input stalled\n");
-                    sleep_ns(notif, INPUT_STALL_NS);
+                    sleep_ns(INPUT_STALL_NS);
                     let (dx, dy, announced, widest) = stream.sum_motion();
                     Line::new()
                         .s(b"input-testclient: motion sum dx=")
@@ -438,7 +438,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // harness floods motion until the 16-slot ring is full, then injects a key. On waking it must
     // still arrive; drop-on-refusal would lose it, and park-with-no-wakeup would never re-send it.
     kprint(b"input-testclient: stalling\n");
-    sleep_ns(notif, STALL_NS);
+    sleep_ns(STALL_NS);
 
     let mut saw_late_key = false;
     while !saw_late_key {
@@ -509,18 +509,15 @@ fn wait_event_before(
     }
 }
 
-/// Sleep for `ns` by waiting on a handle that never signals.
-fn sleep_ns(notif: u64, ns: u64) {
+/// Sleep for `ns`, in a wait on no handles: the kernel never refuses it, and no signal ends it.
+fn sleep_ns(ns: u64) {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
     // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
     // leaves its last value.
     let deadline = unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns);
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
-    unsafe {
-        WAIT_HANDLES[0] = notif;
-        syscall5(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline, 0);
-    }
+    // SAFETY: no handles and no results, so the kernel reads and writes neither.
+    unsafe { syscall5(SYS_WAIT, 0, 0, 0, deadline, 0) };
 }
 
 #[panic_handler]

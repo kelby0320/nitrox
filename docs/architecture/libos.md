@@ -32,7 +32,7 @@ libos depends on `libkern` (raw syscalls + ABI types) and `core` only. It is
 **`#![no_std]` and uses no `alloc`** — see "The alloc-free constraint" — so the
 heap-free binaries (eshell, parent, fs-server) can adopt it, not just init.
 
-**It is to be every userspace crate's syscall layer** (decision log, 2026-10-27); today five of 49
+**It is to be every userspace crate's syscall layer** (decision log, 2026-10-27); today six of 49
 crates link it. `eshell` and `libheap` stay on `libkern`, by choice. `libstream` and `librsproto`
 are drawn above it, which is where they belong, but today their `io` features reach `libkern`
 directly; pre-Phase-7 Part E moves them onto libos.

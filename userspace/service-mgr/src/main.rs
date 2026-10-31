@@ -22,6 +22,7 @@ use alloc::string::String;
 
 use libkern::debug::Line;
 use libkern::*;
+use libos::{Handle, Only, Process};
 use service_mgr::bringup::{self, Entry, Failed, Step};
 use service_mgr::registry;
 use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
@@ -36,40 +37,16 @@ static ALLOC: libheap::Heap = libheap::Heap;
 const MAX_SERVICES: usize = 24;
 const WAIT_MAX: usize = libkern::abi::MAX_WAIT_HANDLES;
 
-/// The wait set [`Mgr::run`] builds.
-static mut WAIT_HANDLES: [u64; WAIT_MAX] = [0; WAIT_MAX];
-static mut WAIT_RESULTS: [u8; 24 * WAIT_MAX] = [0; 24 * WAIT_MAX];
-static mut SRV_MSG: [u8; 4096] = [0; 4096];
-/// The login supervisors' process and control handles, kept for a shutdown.
-static mut SUPERVISORS: [u64; 4] = [0; 4];
 /// How deep each route is: a full ring answers the resolver `WouldBlock` at once.
 const SERVE_DEPTH: u64 = 64;
-static mut NOTIF: Notification = Notification::zeroed();
-static mut CLOCK_BUF: u64 = 0;
-static mut CTRL_OUT0: u64 = 0;
-static mut CTRL_OUT1: u64 = 0;
-static mut SEND_MSG: IpcMsg = IpcMsg::ZEROED;
-static mut SEND_HANDLES: [u64; 8] = [0; 8];
-static mut RDY_MSG: [u8; 4096] = [0; 4096];
 
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
 /// Spawn args for `session-mgr`: its control endpoint is moved in at `handles[0]`, and it is
 /// re-delegated `BIND_NAMESPACE` to construct per-session namespaces.
-static mut SPAWN_SESSION: SpawnArgs = SpawnArgs {
-    image: 0,
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0,
-    syscaps: SYSCAP_BIND_NAMESPACE,
-};
-
-/// Spawn args for `desktop-session-mgr`. **The two supervisors are unaware of each other**, so
+/// `desktop-session-mgr`'s too. **The two supervisors are unaware of each other**, so
 /// serial stays the recovery path; the same user may be logged in twice.
-static mut SPAWN_DESKTOP_SESSION: SpawnArgs = SpawnArgs {
+const SPAWN_SUPERVISOR: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 1,
     move_mask: 1,
@@ -78,17 +55,6 @@ static mut SPAWN_DESKTOP_SESSION: SpawnArgs = SpawnArgs {
     rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
-};
-
-static mut SPAWN_SERVICE: SpawnArgs = SpawnArgs {
-    image: 0,
-    handle_count: 0,
-    move_mask: 0,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [0; 4],
-    namespace: 0,
-    syscaps: 0,
 };
 
 fn kprint(msg: &[u8]) {
@@ -137,10 +103,10 @@ fn should_restart(policy: RestartPolicy, code: i32) -> bool {
 }
 
 fn now_ns() -> u64 {
-    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: on success the kernel wrote the ns count into CLOCK_BUF.
-    unsafe { (&raw const CLOCK_BUF).read() }
+    let mut now = 0u64;
+    // SAFETY: `now` is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    now
 }
 
 fn create_control_channel() -> Option<(u64, u64)> {
@@ -149,53 +115,25 @@ fn create_control_channel() -> Option<(u64, u64)> {
     // than the number of them does not block — it **drops the last handle silently**, and the
     // send reports success. Nine handoffs go to `desktop-session-mgr`, so it is ten deep for one
     // spare. `libsession::spawn_leader` carries the same warning.
-    // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 10, 0) };
-    if cr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel wrote both endpoint handles.
-    let (a, b) = unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) };
-    Some((a, b))
+    make_channel(10)
 }
 
-/// Move the log endpoint to a service as its first control message; closed if that failed.
-fn send_log_handoff(ctrl: u64, log_ep: u64) {
-    // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; transfer one handle, empty payload.
-    let sr = unsafe {
-        (&raw mut SEND_MSG.header.payload_len).write(0);
-        SEND_HANDLES[0] = log_ep;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ctrl,
-            (&raw const SEND_MSG) as u64,
-            (&raw const SEND_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    if sr != 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, log_ep) };
+/// Send `payload`, and `handle` unless it is `0`, on `ch` as an unframed message of its own; the
+/// kernel's answer. On a refusal nothing moved.
+fn send_msg(ch: u64, payload: &[u8], handle: u64) -> i64 {
+    let mut msg = IpcMsg::ZEROED;
+    msg.header.payload_len = payload.len() as u32;
+    msg.payload[..payload.len()].copy_from_slice(payload);
+    let count = (handle != 0) as u64;
+    // SAFETY: a whole message, and the one handle it may carry, which this process holds.
+    unsafe {
+        syscall5(SYS_CHANNEL_SEND, ch, (&raw const msg) as u64, (&raw const handle) as u64, count, SENDMODE_NOBLOCK)
     }
 }
 
 fn send_control(ctrl: u64, op: u8) {
-    if ctrl == 0 {
-        return;
-    }
-    // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; write the 1-byte control payload.
-    unsafe {
-        (&raw mut SEND_MSG.header.payload_len).write(1);
-        (&raw mut SEND_MSG.payload[0]).write(op);
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ctrl,
-            (&raw const SEND_MSG) as u64,
-            (&raw const SEND_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        );
+    if ctrl != 0 {
+        send_msg(ctrl, &[op], 0);
     }
 }
 
@@ -204,20 +142,7 @@ fn send_finish(terminal: u64, reboot: bool) {
         kprint(b"service-mgr: no terminal channel, so init cannot be told to finish\n");
         return;
     }
-    // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; a two-byte payload and no handles.
-    unsafe {
-        (&raw mut SEND_MSG.header.payload_len).write(2);
-        (&raw mut SEND_MSG.payload[0]).write(TERMINAL_OP_FINISH);
-        (&raw mut SEND_MSG.payload[1]).write(reboot as u8);
-        syscall5(
-            SYS_CHANNEL_SEND,
-            terminal,
-            (&raw const SEND_MSG) as u64,
-            (&raw const SEND_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        );
-    }
+    send_msg(terminal, &[TERMINAL_OP_FINISH, reboot as u8], 0);
 }
 
 /// Read + parse the declarations from `/system/services.toml` on the root filesystem, which
@@ -277,11 +202,11 @@ fn load_declarations(root_ns: u64) -> (alloc::vec::Vec<ServiceDecl>, bool) {
 
 /// Spawn the service `decl` names with a fresh control channel; returns `(proc_handle,
 /// control_end)`, the latter `0` if there is no channel.
-fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) {
+fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (Option<Handle<Process, Only>>, u64) {
     let image = ns_lookup(root_ns, decl.executable.as_bytes(), RIGHT_MAP_READ);
     if image == 0 {
         Line::new().s(b"service-mgr: image not found: ").s(decl.executable.as_bytes()).end();
-        return (-1, 0);
+        return (None, 0);
     }
     let (smgr_end, svc_end) = match create_control_channel() {
         Some(pair) => pair,
@@ -320,89 +245,65 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
             .s(b" (the kernel grants the subset service-mgr holds)")
             .end();
     }
-    // SAFETY: SPAWN_SERVICE is this process's spawn block, owned by this single thread; `image`
-    // and `svc_end` are handles we hold, and the kernel copies the block during the call
-    let h = unsafe {
-        SPAWN_SERVICE.image = image;
-        SPAWN_SERVICE.syscaps = decl.syscaps;
-        if svc_end != 0 {
-            SPAWN_SERVICE.handles[0] = svc_end;
-            SPAWN_SERVICE.handle_count = 1;
-            SPAWN_SERVICE.move_mask = 1;
-            // A server sends `Meta::Ready`; any other service's end is one-way.
-            SPAWN_SERVICE.rights[0] = if decl.endpoint.is_some() {
-                RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT
-            } else {
-                RIGHT_RECV | RIGHT_WAIT
-            };
-        } else {
-            SPAWN_SERVICE.handle_count = 0;
-            SPAWN_SERVICE.move_mask = 0;
-        }
-        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SERVICE) as u64)
+    // A server sends `Meta::Ready`; any other service's end is one-way.
+    let rights = if decl.endpoint.is_some() {
+        RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT
+    } else {
+        RIGHT_RECV | RIGHT_WAIT
     };
-    // SAFETY: the kernel copied the ELF during spawn; closing our own image handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
-    if h < 0 {
+    let moved = (svc_end != 0) as u32;
+    let args = SpawnArgs {
+        image,
+        handle_count: moved,
+        move_mask: moved,
+        arg0: 0,
+        handles: [svc_end, 0, 0, 0],
+        rights: [rights, 0, 0, 0],
+        namespace: 0,
+        syscaps: decl.syscaps,
+    };
+    let process = libos::spawn(&args).ok();
+    // The kernel copied the ELF during the spawn.
+    close(image);
+    let Some(process) = process else {
         kprint(b"service-mgr: spawn FAIL\n");
-        // SAFETY: closing our own handles (0 is ignored by the kernel).
-        unsafe {
-            if smgr_end != 0 {
-                syscall1(SYS_HANDLE_CLOSE, smgr_end);
-                syscall1(SYS_HANDLE_CLOSE, svc_end);
-            }
-            if log_ep != 0 {
-                syscall1(SYS_HANDLE_CLOSE, log_ep);
-            }
-        }
-        return (h, 0);
-    }
+        close(smgr_end);
+        close(svc_end);
+        close(log_ep);
+        return (None, 0);
+    };
     // The spawn ABI delivers one handle to a register, so the log endpoint follows on the
-    // control channel.
-    if log_ep != 0 {
-        if smgr_end != 0 {
-            send_log_handoff(smgr_end, log_ep);
-        } else {
-            // SAFETY: closing our own handle.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, log_ep) };
-        }
+    // control channel, as a non-server's first message: empty without one, as heartbeat takes it.
+    if decl.endpoint.is_none() && smgr_end != 0 {
+        send_handle(smgr_end, log_ep);
+    } else {
+        close(log_ep);
     }
-    (h, smgr_end)
+    (Some(process), smgr_end)
 }
 
-fn spawn_with_control(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> (i64, u64) {
+/// Spawn `path` from `template` with a fresh control channel's end moved in at `handles[0]`: its
+/// process and this manager's end.
+fn spawn_with_control(root_ns: u64, path: &[u8], template: SpawnArgs) -> Option<(Handle<Process, Only>, u64)> {
     let image = ns_lookup(root_ns, path, RIGHT_MAP_READ);
     if image == 0 {
         kprint(b"service-mgr: image not found (login chain)\n");
-        return (-1, 0);
+        return None;
     }
-    let (smgr_end, child_end) = match create_control_channel() {
-        Some(pair) => pair,
-        None => {
-            // SAFETY: closing our own image handle.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
-            return (-1, 0);
-        }
+    let Some((smgr_end, child_end)) = create_control_channel() else {
+        close(image);
+        return None;
     };
-    // SAFETY: `args` is a valid writable arg block; move the control end into the child.
-    let h = unsafe {
-        (*args).image = image;
-        (*args).handles[0] = child_end;
-        (*args).handle_count = 1;
-        (*args).move_mask = 1;
-        syscall1(SYS_PROCESS_SPAWN, args as u64)
-    };
-    // SAFETY: the kernel copied the ELF during spawn; close our image handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
-    if h < 0 {
-        // SAFETY: closing our own handles.
-        unsafe {
-            syscall1(SYS_HANDLE_CLOSE, smgr_end);
-            syscall1(SYS_HANDLE_CLOSE, child_end);
-        }
-        return (h, 0);
+    let mut args = SpawnArgs { image, handle_count: 1, move_mask: 1, ..template };
+    args.handles[0] = child_end;
+    let process = libos::spawn(&args).ok();
+    // The kernel copied the ELF during the spawn.
+    close(image);
+    if process.is_none() {
+        close(smgr_end);
+        close(child_end);
     }
-    (h, smgr_end)
+    Some((process?, smgr_end))
 }
 
 /// Receive one handle from init's handoff channel; `0` if the message was empty or the receive
@@ -412,44 +313,28 @@ fn recv_handoff(ctrl: u64) -> u64 {
     // SAFETY: `&now` is a valid u64 out-param
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
     let deadline = now.saturating_add(READY_TIMEOUT_NS);
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS valid; one waiter, bounded deadline.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = ctrl;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
-    };
+    let mut result = [0u8; 24];
+    // SAFETY: one handle, and room for its one result.
+    let waited = unsafe { syscall4(SYS_WAIT, (&raw const ctrl) as u64, 1, result.as_mut_ptr() as u64, deadline) };
     if waited < 1 {
         kprint(b"service-mgr: handoff timeout\n");
         return 0;
     }
     // The one handle a handoff brings; any more close as `sent` drops.
-    // SAFETY: single-threaded; `RDY_MSG` is lent for the call.
-    match unsafe { channel_recv_raw(ctrl, &raw mut RDY_MSG) } {
+    match channel_recv(ctrl, &mut [0u8; IPC_MSG_SIZE]) {
         Ok(mut sent) => sent.take(0).unwrap_or(0),
         Err(_) => 0,
     }
 }
 
-/// Move `handle` to a child over its control channel; closed if the send fails. A zero `handle`
+/// Move `handle` to a child over its control channel; one refused is closed, and as a zero `handle`
 /// sends **an empty message**: the receiver reads the handoffs positionally.
 fn send_handle(ctrl: u64, handle: u64) {
-    let count = if handle == 0 { 0 } else { 1 };
-    // SAFETY: SEND_MSG/SEND_HANDLES valid; transfer `count` handles, empty payload.
-    let sr = unsafe {
-        (&raw mut SEND_MSG.header.payload_len).write(0);
-        SEND_HANDLES[0] = handle;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ctrl,
-            (&raw const SEND_MSG) as u64,
-            (&raw const SEND_HANDLES) as u64,
-            count,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    if sr != 0 && handle != 0 {
-        // SAFETY: the transfer failed; reclaim the handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+    if handle != 0 && send_msg(ctrl, &[], handle) == 0 {
+        return;
     }
+    close(handle);
+    send_msg(ctrl, &[], 0);
 }
 
 /// **What the login supervisors are handed**, in order. `fs` and `profile` are `init`'s servers'
@@ -504,11 +389,12 @@ impl ChainEndpoints {
 /// Bring up the login chain: `session-mgr`, then `desktop-session-mgr`, each handed its
 /// endpoints over its control channel. **The serial set is duplicated before it is sent**, since
 /// `send_handle` moves: a failure here then costs the graphical login, not both.
-fn bring_up_login_chain(root_ns: u64, chain: ChainEndpoints) {
+fn bring_up_login_chain(root_ns: u64, chain: ChainEndpoints) -> [Supervisor; 2] {
+    let mut supervisors = [None, None];
     if chain.fs == 0 {
         kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
         chain.close();
-        return;
+        return supervisors;
     }
     if chain.profile == 0 {
         kprint(b"service-mgr: no profile endpoint; sessions will have no /bin\n");
@@ -517,50 +403,44 @@ fn bring_up_login_chain(root_ns: u64, chain: ChainEndpoints) {
     let draw = core::mem::take(&mut serial.draw);
     let mut desktop = serial.duplicate();
     desktop.draw = draw;
-    let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
-    if sess_h < 0 || sess_ctrl == 0 {
+    let Some((sess_h, sess_ctrl)) = spawn_with_control(root_ns, b"/bin/session-mgr", SPAWN_SUPERVISOR) else {
         kprint(b"service-mgr: session-mgr spawn FAIL\n");
         serial.close();
         desktop.close();
-        return;
-    }
+        return supervisors;
+    };
     // **Positional**: a reorder silently makes a session bind its home to the profile server.
     let s = &serial;
     for h in [s.fs, s.profile, s.tty, s.clip, s.views, s.devices, s.storage, s.services] {
         send_handle(sess_ctrl, h);
     }
     // Kept, not closed: shutdown asks the supervisors to end their sessions.
-    // SAFETY: single-threaded; the supervisors' slots.
-    unsafe {
-        SUPERVISORS[0] = sess_h as u64;
-        SUPERVISORS[1] = sess_ctrl;
-    }
-    if !bring_up_desktop_session(root_ns, desktop) {
+    supervisors[0] = Some((sess_h, sess_ctrl));
+    supervisors[1] = bring_up_desktop_session(root_ns, desktop);
+    if supervisors[1].is_none() {
         kprint(b"service-mgr: no graphical login (serial login is unaffected)\n");
     }
     kprint(b"service-mgr: login chain up (auth-service + session-mgr)\n");
+    supervisors
 }
 
-fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> bool {
+/// A login supervisor's process and control channel, kept for a shutdown.
+type Supervisor = Option<(Handle<Process, Only>, u64)>;
+
+fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> Supervisor {
     if set.fs == 0 {
         set.close();
-        return false;
+        return None;
     }
-    let (h, ctrl) = spawn_with_control(root_ns, b"/bin/desktop-session-mgr", &raw mut SPAWN_DESKTOP_SESSION);
-    if h < 0 || ctrl == 0 {
+    let Some((h, ctrl)) = spawn_with_control(root_ns, b"/bin/desktop-session-mgr", SPAWN_SUPERVISOR) else {
         kprint(b"service-mgr: desktop-session-mgr spawn FAIL\n");
         set.close();
-        return false;
+        return None;
+    };
+    for handle in set.all() {
+        send_handle(ctrl, handle);
     }
-    for h in set.all() {
-        send_handle(ctrl, h);
-    }
-    // SAFETY: single-threaded; the supervisors' slots.
-    unsafe {
-        SUPERVISORS[2] = h as u64;
-        SUPERVISORS[3] = ctrl;
-    }
-    true
+    Some((h, ctrl))
 }
 
 /// # Safety
@@ -610,7 +490,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
         .into_iter()
         .map(|decl| Supervised {
             decl,
-            proc_h: 0,
+            proc_h: None,
             ctrl: 0,
             attempts: 0,
             running: false,
@@ -643,6 +523,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
         halted: false,
         reported: false,
         shutdown: None,
+        supervisors: [None, None],
     };
     // **A file that has lost its critical servers starts nothing**: bring-up would reach a login
     // chain with no `auth-service` behind it, and no critical server would be there to fail.
@@ -681,26 +562,17 @@ fn unbind(ns: u64, path: &[u8]) {
     unsafe { syscall3(SYS_NS_UNBIND, ns, path.as_ptr() as u64, path.len() as u64) };
 }
 
-static mut REPLY_BUF: [u8; 4096] = [0; 4096];
-
+/// Send `body` on `ch`, moving `handles`, from a whole message's buffer, as the kernel copies one.
 fn send_rs(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
-    // SAFETY: REPLY_BUF is this process's; single-threaded.
-    unsafe {
-        let count = handles.len() as u16;
-        let Some(n) = librsproto::encode(&mut REPLY_BUF[24..], op, request_id, flags, body, count) else {
-            return false;
-        };
-        REPLY_BUF[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-        REPLY_BUF[8] = handles.len() as u8;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const REPLY_BUF) as u64,
-            handles.as_ptr() as u64,
-            handles.len() as u64,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
+    let mut msg = [0u8; IPC_MSG_SIZE];
+    let Some(n) = librsproto::encode(&mut msg[24..], op, request_id, flags, body, handles.len() as u16) else {
+        return false;
+    };
+    msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+    msg[8] = handles.len() as u8;
+    let (msg, carried) = (msg.as_ptr() as u64, handles.as_ptr() as u64);
+    // SAFETY: a whole message, and the handles it carries, which this process holds.
+    unsafe { syscall5(SYS_CHANNEL_SEND, ch, msg, carried, handles.len() as u64, SENDMODE_NOBLOCK) == 0 }
 }
 
 /// An error reply: the whole twelve-byte `ErrorBody`, since a shorter one reaches a forwarded
@@ -743,19 +615,14 @@ fn recv_serve(ch: u64) -> Option<(u16, u64, alloc::vec::Vec<u8>)> {
 /// [`recv_serve`], telling **a peer that has gone** apart: `Err(())`. A closed channel stays
 /// signalled, so a caller must drop it or the wait loop would spin. A route's cannot close.
 fn recv_request(ch: u64) -> Result<Option<(u16, u64, alloc::vec::Vec<u8>)>, ()> {
+    let mut buf = [0u8; IPC_MSG_SIZE];
     loop {
-        // SAFETY: single-threaded; `SRV_MSG` is lent for the call.
-        let _sent = match unsafe { channel_recv_raw(ch, &raw mut SRV_MSG) } {
+        let _sent = match channel_recv(ch, &mut buf) {
             Ok(sent) => sent,
             Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
             Err(_) => return Ok(None),
         };
-        // SAFETY: bounded read of the payload the kernel just wrote.
-        let msg = unsafe {
-            let len = u32::from_le_bytes([SRV_MSG[4], SRV_MSG[5], SRV_MSG[6], SRV_MSG[7]]) as usize;
-            core::slice::from_raw_parts(((&raw const SRV_MSG) as *const u8).add(24), len.min(4096 - 24))
-        };
-        if let Ok(m) = librsproto::decode(msg) {
+        if let Ok(m) = librsproto::decode(payload(&buf)) {
             return Ok(Some((m.op, m.request_id, m.body.to_vec())));
         }
     }
@@ -840,19 +707,20 @@ enum Ready {
     Closed,
 }
 
+/// The payload of a message received into `buf`, bounded by the header's length.
+fn payload(buf: &[u8; IPC_MSG_SIZE]) -> &[u8] {
+    let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    &buf[24..24 + len.min(IPC_MSG_SIZE - 24)]
+}
+
 fn take_ready(ctrl: u64) -> Ready {
-    // SAFETY: single-threaded; `RDY_MSG` is lent for the call.
-    let mut sent = match unsafe { channel_recv_raw(ctrl, &raw mut RDY_MSG) } {
+    let mut buf = [0u8; IPC_MSG_SIZE];
+    let mut sent = match channel_recv(ctrl, &mut buf) {
         Ok(sent) => sent,
         Err(rr) if rr == KError::PeerClosed as i64 => return Ready::Closed,
         Err(_) => return Ready::Nothing,
     };
-    // SAFETY: bounded read of the payload the kernel just wrote.
-    let msg = unsafe {
-        let len = u32::from_le_bytes([RDY_MSG[4], RDY_MSG[5], RDY_MSG[6], RDY_MSG[7]]) as usize;
-        core::slice::from_raw_parts(((&raw const RDY_MSG) as *const u8).add(24), len.min(4096 - 24))
-    };
-    let decoded = librsproto::decode(msg).ok().map(|m| (m.op, m.flags, m.body.to_vec()));
+    let decoded = librsproto::decode(payload(&buf)).ok().map(|m| (m.op, m.flags, m.body.to_vec()));
     let endpoint = decoded.as_ref().and_then(|d| service_mgr::ready::kept(d.0, d.1)).and_then(|i| sent.take(i));
     let refused = |why: &[u8]| Ready::Refused(alloc::string::String::from_utf8_lossy(why).into_owned());
     match decoded {
@@ -965,7 +833,8 @@ struct Services {
 /// One supervised service: its declaration, its child, and the state its restart policy needs.
 struct Supervised {
     decl: ServiceDecl,
-    proc_h: i64,
+    /// Its process while it runs; dropping it closes the handle.
+    proc_h: Option<Handle<Process, Only>>,
     /// service-mgr's end of the child's control channel, or `0` when it is not running or the
     /// channel could not be created. **This is the exit discriminator** — see [`Mgr::poll`].
     ctrl: u64,
@@ -1022,6 +891,8 @@ struct Mgr {
     halted: bool,
     reported: bool,
     shutdown: Option<Shutdown>,
+    /// The login supervisors, `session-mgr`'s first, kept for a shutdown.
+    supervisors: [Supervisor; 2],
 }
 
 impl Mgr {
@@ -1031,12 +902,11 @@ impl Mgr {
             // **The notification channel, every route, and the servers still starting** — whose
             // `Ready` is the one thing a control channel brings. A death needs no slot: it queues
             // `ChildExited`, and each pass looks at every channel ([`Mgr::poll`]).
-            let mut count = 0usize;
-            // SAFETY: WAIT_HANDLES holds WAIT_MAX slots, and `push` stops there.
-            unsafe {
+            let (mut count, mut handles, mut results) = (0usize, [0u64; WAIT_MAX], [0u8; 24 * WAIT_MAX]);
+            {
                 let mut push = |h: u64| {
                     if h != 0 && count < WAIT_MAX {
-                        WAIT_HANDLES[count] = h;
+                        handles[count] = h;
                         count += 1;
                     }
                 };
@@ -1059,16 +929,8 @@ impl Mgr {
                 }
             }
             let deadline = self.next_deadline();
-            // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid for `count` entries.
-            unsafe {
-                syscall4(
-                    SYS_WAIT,
-                    (&raw const WAIT_HANDLES) as u64,
-                    count as u64,
-                    (&raw mut WAIT_RESULTS) as u64,
-                    deadline,
-                )
-            };
+            // SAFETY: `count` handles, and room for as many results.
+            unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, count as u64, results.as_mut_ptr() as u64, deadline) };
             self.serve_resolves();
             self.serve_services();
             let mut codes = alloc::vec::Vec::new();
@@ -1215,7 +1077,7 @@ impl Mgr {
         let server = self.svcs[i].decl.endpoint.is_some();
         let (h, ctrl) = spawn_service(self.root_ns, self.registry, &self.svcs[i].decl);
         let s = &mut self.svcs[i];
-        if h > 0 {
+        if h.is_some() {
             s.proc_h = h;
             s.ctrl = ctrl;
             s.running = true;
@@ -1513,11 +1375,8 @@ impl Mgr {
         let was = self.svcs[i].phase;
         {
             let s = &mut self.svcs[i];
-            if s.proc_h > 0 {
-                close(s.proc_h as u64);
-            }
             close(s.ctrl);
-            s.proc_h = 0;
+            s.proc_h = None;
             s.ctrl = 0;
             s.running = false;
             s.phase = Phase::Down;
@@ -1906,13 +1765,9 @@ impl Mgr {
         // The sessions first: each supervisor ends its session and exits, and its control channel
         // closing is how that is seen.
         kprint(b"service-mgr: asking the login supervisors to end their sessions\n");
-        for k in [0, 2] {
-            // SAFETY: single-threaded; the supervisors' slots.
-            let h = unsafe { SUPERVISORS[k] };
-            if h != 0 {
-                // SAFETY: a register-only syscall on a process handle this manager holds.
-                unsafe { syscall1(SYS_PROCESS_TERMINATE, h) };
-            }
+        for (process, _) in self.supervisors.iter().flatten() {
+            // SAFETY: a register-only syscall on a process handle this manager holds.
+            unsafe { syscall1(SYS_PROCESS_TERMINATE, process.raw().0) };
         }
         let until = now_ns().saturating_add(SESSIONS_TIMEOUT_NS);
         self.shutdown = Some(Shutdown { reboot, stage: Stage::Sessions { until } });
@@ -1928,12 +1783,8 @@ impl Mgr {
         let now = now_ns();
         let below = match stage {
             Stage::Sessions { until } => {
-                let gone = |k: usize| {
-                    // SAFETY: single-threaded; SUPERVISORS has four slots and `k` is 1 or 3
-                    let c = unsafe { SUPERVISORS[k] };
-                    c == 0 || channel_peer_closed(c)
-                };
-                let (text, desktop) = (gone(1), gone(3));
+                let gone = |k: usize| self.supervisors[k].as_ref().is_none_or(|&(_, c)| channel_peer_closed(c));
+                let (text, desktop) = (gone(0), gone(1));
                 if !(text && desktop) && now < until {
                     return;
                 }
@@ -2017,8 +1868,8 @@ impl Mgr {
         let found = core::str::from_utf8(body).ok().and_then(named);
         let facts = found.map(|i| {
             let s = &self.svcs[i];
-            let restart_due = s.restart_at.is_some();
-            services::Found { essential: s.decl.essential, running: s.running, restart_due }
+            let (restart_due, reached) = (s.restart_at.is_some(), bringup::reached(i, self.started));
+            services::Found { essential: s.decl.essential, running: s.running, restart_due, reached }
         });
         let action = match services::decide(op, facts) {
             Ok(a) => a,
@@ -2133,7 +1984,7 @@ impl Mgr {
             // SAFETY: a channel end this process holds, or `0`.
             services: unsafe { dup_endpoint(self.services.session_client) },
         };
-        bring_up_login_chain(self.root_ns, chain);
+        self.supervisors = bring_up_login_chain(self.root_ns, chain);
     }
 }
 
@@ -2154,14 +2005,14 @@ const CODE_GRACE_NS: u64 = 1_000_000_000;
 
 /// Take every `ChildExited` queued on `notif`, logging each, and append its code to `codes`.
 fn drain_codes(notif: u64, codes: &mut alloc::vec::Vec<i32>) {
+    let mut n = Notification::zeroed();
     loop {
-        // SAFETY: NOTIF is a valid 64-byte writable out-param.
-        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        // SAFETY: `n` is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut n) as u64, 0, 0) };
         if r != 0 {
             break; // WouldBlock: drained
         }
-        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-        let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+        let (kind, body) = (n.kind, n.body);
         if kind != KIND_CHILD_EXITED {
             continue;
         }
@@ -2193,9 +2044,8 @@ fn drain_codes(notif: u64, codes: &mut alloc::vec::Vec<i32>) {
 /// closed ends itself — its exit is then attributed here, as any other's.
 fn channel_peer_closed(ch: u64) -> bool {
     loop {
-        // SAFETY: single-threaded; `RDY_MSG` is lent for the call. What came closes as `sent`
-        // drops, at the end of this pass.
-        let sent = match unsafe { channel_recv_raw(ch, &raw mut RDY_MSG) } {
+        // What came closes as `sent` drops, at the end of this pass.
+        let sent = match channel_recv(ch, &mut [0u8; IPC_MSG_SIZE]) {
             Ok(sent) => sent,
             Err(r) if r == KError::PeerClosed as i64 => return true,
             Err(_) => return false, // WouldBlock (alive and quiet), or an error we cannot act on

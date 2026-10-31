@@ -1007,6 +1007,7 @@ pub fn spawn_leader(
             kprint(b"libsession: could not duplicate the leader's extra handle\n");
         }
         let count: u64 = if moved > 0 { 1 } else { 0 };
+        let (msg, handles) = ((&raw const SEND_MSG) as u64, (&raw const SEND_HANDLES) as u64);
         {
             // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
             let r = unsafe {
@@ -1016,20 +1017,18 @@ pub fn spawn_leader(
                 SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
                 SEND_MSG[8] = count as u8;
                 SEND_HANDLES[0] = if count == 1 { moved as u64 } else { 0 };
-                syscall5(
-                    SYS_CHANNEL_SEND,
-                    setup_mgr,
-                    (&raw const SEND_MSG) as u64,
-                    (&raw const SEND_HANDLES) as u64,
-                    count,
-                    SENDMODE_NOBLOCK,
-                )
+                syscall5(SYS_CHANNEL_SEND, setup_mgr, msg, handles, count, SENDMODE_NOBLOCK)
             };
             if r != 0 {
                 kprint(b"libsession: the leader's extra handle was not delivered\n");
                 if count == 1 {
-                    // SAFETY: the send failed, so the duplicate is still ours.
-                    unsafe { syscall1(SYS_HANDLE_CLOSE, moved as u64) };
+                    // SAFETY: the send failed, so the duplicate is still ours; then the empty
+                    // message a missing endpoint sends, in its place, from the same buffers.
+                    unsafe {
+                        syscall1(SYS_HANDLE_CLOSE, moved as u64);
+                        SEND_MSG[8] = 0;
+                        syscall5(SYS_CHANNEL_SEND, setup_mgr, msg, handles, 0, SENDMODE_NOBLOCK);
+                    }
                 }
             } else if count == 0 {
                 // The leader cannot tell this from an endpoint that was never wanted.

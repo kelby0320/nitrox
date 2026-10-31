@@ -486,6 +486,12 @@ pub(crate) enum RootDevice {
     Live,
 }
 
+/// A **test** manifest opens with comments past a page, so a one-page reader finds no mount.
+fn test_preamble() -> String {
+    let line = "# A test manifest runs past a page: init and the storage service read it whole.\n";
+    line.repeat(4096 / line.len() + 1)
+}
+
 /// [`build_initramfs`], for either kind of root. The live image's initramfs is the release one
 /// with a single manifest line changed — `check-images` holds it to exactly that.
 pub(crate) fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
@@ -499,7 +505,7 @@ pub(crate) fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice)
         init_toml = init_toml.replace(&disk, &format!("device = \"gpt-partlabel:{LIVE_ROOT_PARTLABEL}\""));
     }
     if mode.stages_test_data() {
-        init_toml.push_str(TEST_BINDS_TOML);
+        init_toml = format!("{}{init_toml}{TEST_BINDS_TOML}", test_preamble());
     }
     cpio_entry(&mut buf, 1, "etc/init.toml", init_toml.as_bytes());
     // The declarations and the profile manifest are on the root, as this archive on the FAT ESP is

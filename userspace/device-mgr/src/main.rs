@@ -59,12 +59,6 @@ const PAGE: u64 = 4096;
 /// the most any class needs — the storage service writes.
 const NODE_RIGHTS: u64 = RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
 
-static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * MAX_WAIT_HANDLES] = [0; 24 * MAX_WAIT_HANDLES];
-
 fn close(h: u64) {
     if h != 0 {
         // SAFETY: closing a handle this process holds.
@@ -72,26 +66,18 @@ fn close(h: u64) {
     }
 }
 
-/// Send `body` on `ch`, moving `handles`.
+/// Send `body` on `ch`, moving `handles`, from a whole message's buffer, as the kernel copies one.
 fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
-    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
-    unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
-        else {
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = handles.len() as u8;
-        REPLY_HANDLES[..handles.len()].copy_from_slice(handles);
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            handles.len() as u64,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
+    let (mut msg, mut carried) = ([0u8; MSG_LEN], [0u64; 8]);
+    let Some(rs_len) = encode(&mut msg[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16) else {
+        return false;
+    };
+    msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+    msg[8] = handles.len() as u8;
+    carried[..handles.len()].copy_from_slice(handles);
+    let (msg, carried) = (msg.as_ptr() as u64, carried.as_ptr() as u64);
+    // SAFETY: a whole message, and the handles it carries, which this process holds.
+    unsafe { syscall5(SYS_CHANNEL_SEND, ch, msg, carried, handles.len() as u64, SENDMODE_NOBLOCK) == 0 }
 }
 
 /// An error reply: a whole twelve-byte `ErrorBody`, which the kernel reads a refusal from.
@@ -113,20 +99,14 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
 /// **Whatever handles came with it are closed here** — nothing a client sends this manager
 /// carries a handle it wants, and one kept would be kept for good.
 fn recv(ch: u64) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
-    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-    let _sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+    let mut buf = [0u8; MSG_LEN];
+    let _sent = match channel_recv(ch, &mut buf) {
         Ok(sent) => sent,
         Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
         Err(_) => return Ok(None),
     };
-    // SAFETY: bounded read of the payload the kernel just wrote.
-    let msg = unsafe {
-        let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            len.min(MSG_LEN - PAYLOAD_OFF),
-        )
-    };
+    let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    let msg = &buf[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)];
     Ok(decode(msg).ok().map(|m| (m.op, m.request_id, m.body.to_vec())))
 }
 
@@ -161,7 +141,7 @@ fn read_registry(root_ns: u64) -> Option<(Vec<DeviceRecord>, u64)> {
         (rs.collect(), generation)
     });
     // SAFETY: unmapping what was mapped above; `out` holds copies.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
     out
 }
 
@@ -189,7 +169,7 @@ fn read_io(root_ns: u64) -> Option<(CacheCounts, Vec<IoRecord>)> {
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };
     let out = io(bytes).ok().map(|snap| (snap.cache, snap.iter().collect()));
     // SAFETY: unmapping what was mapped above; `out` holds copies.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
     out
 }
 
@@ -396,9 +376,18 @@ impl Manager {
                 .i(po)
                 .s(b"); no longer following")
                 .end();
-            close(self.changes);
-            self.changes = 0;
+            self.stop_following();
         }
+    }
+
+    fn stop_following(&mut self) {
+        close(core::mem::take(&mut self.changes));
+        if self.change_at != 0 {
+            // SAFETY: unmapping the change page, which no read is writing: each caller's was
+            // refused or has completed.
+            unsafe { syscall2(SYS_MEMORY_UNMAP, core::mem::take(&mut self.change_at), PAGE) };
+        }
+        close(core::mem::take(&mut self.change_buf));
     }
 
     /// **The table changed**: read it again, diff it against the records held, and tell each
@@ -416,12 +405,11 @@ impl Manager {
                 .i(status)
                 .s(b"); no longer following")
                 .end();
-            close(self.changes);
-            self.changes = 0;
+            self.stop_following();
             return;
         }
         let Some((now, generation)) = read_registry(self.root_ns) else {
-            // SAFETY: `change_at` maps the change page read-only for the life of the manager, and the
+            // SAFETY: `change_at` maps the change page read-only while the manager follows, and the
             // kernel wrote its first eight bytes before completing the read just waited on.
             let answered = unsafe { core::ptr::read_volatile(self.change_at as *const u64) };
             self.past = self.past.max(answered);
@@ -623,24 +611,31 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     // The change node, and a page for its answers, mapped for the life of the manager so an
     // answer can be read when the table cannot.
     let changes = lookup(root_ns, b"/dev/registry/changes", RIGHT_READ | RIGHT_INSPECT);
-    // SAFETY: register-only syscall.
-    let change_buf = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }.max(0) as u64;
+    let change_buf = if changes == 0 {
+        0
+    } else {
+        // SAFETY: register-only syscall.
+        unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }.max(0) as u64
+    };
     let change_at = if change_buf == 0 {
         0
     } else {
         // SAFETY: register-only syscall; an object this process just created, mapped read-only.
         unsafe { syscall4(SYS_MEMORY_MAP, change_buf, 0, PAGE, RIGHT_MAP_READ) }.max(0) as u64
     };
-    if changes == 0 || change_at == 0 {
+    let following = change_at != 0;
+    if !following {
         kprint(b"device-mgr: no /dev/registry/changes to follow; devices plugged in later will not be handed over\n");
+        close(changes);
+        close(change_buf);
     }
     let mut m = Manager {
         serve_end,
         root_ns,
         records,
         past: generation,
-        changes: if change_at == 0 { 0 } else { changes },
-        change_buf,
+        changes: if following { changes } else { 0 },
+        change_buf: if following { change_buf } else { 0 },
         change_at,
         change_po: 0,
         nodes,
@@ -650,14 +645,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     };
     loop {
         m.arm_changes();
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the control channel,
-        // the read waiting on the change node, the info-only endpoints, an owner per class, and at
-        // most MAX_DIRS sessions — `mint_info_endpoint` and `open_dir` refuse past their bounds.
-        let waited = unsafe {
+        let (mut handles, mut results) = ([0u64; MAX_WAIT_HANDLES], [0u8; 24 * MAX_WAIT_HANDLES]);
+        let waited = {
             let mut n = 0usize;
             let mut push = |h: u64| {
                 if n < MAX_WAIT_HANDLES {
-                    WAIT_HANDLES[n] = h;
+                    handles[n] = h;
                     n += 1;
                 }
             };
@@ -677,17 +670,16 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             for &d in &m.dirs {
                 push(d);
             }
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+            // SAFETY: `n` handles, and room for as many results: the endpoint, the control channel,
+            // the read waiting on the change node, the info-only endpoints, an owner per class, and
+            // at most MAX_DIRS sessions — `mint_info_endpoint` and `open_dir` refuse past their
+            // bounds.
+            unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, u64::MAX) }
         };
         for j in 0..waited.max(0) as usize {
-            // SAFETY: `waited` records were written; the handle is the first word of each, and a
-            // completed operation's status the low half of the second — an `i32`, beside a zero
-            // reserved word.
-            let (h, status) = unsafe {
-                let off = j * 24;
-                let word = |at: usize| u64::from_le_bytes(WAIT_RESULTS[at..at + 8].try_into().unwrap_or([0; 8]));
-                (word(off), word(off + 8) as u32 as i32 as i64)
-            };
+            // A record's first word is its handle; the low half of the second, an I/O's status.
+            let word = |at: usize| u64::from_le_bytes(results[at..at + 8].try_into().unwrap_or([0; 8]));
+            let (h, status) = (word(j * 24), word(j * 24 + 8) as u32 as i32 as i64);
             if m.change_po != 0 && h == m.change_po {
                 m.follow(status);
             } else if h == m.serve_end {

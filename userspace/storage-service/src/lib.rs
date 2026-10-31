@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+pub mod fit;
 pub mod probe;
 
 pub mod sources {

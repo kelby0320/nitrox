@@ -37278,3 +37278,35 @@ The rest are fixes: four mappings unmapped once read, init's two among them (rt-
 `po_wait` that kept its PO (rt-d7); and `copy_file` stats and maps one resolve (rt-d11). init's own
 lookup helper, kept until `block_on` stopped spinning on a failing wait (2026-10-28), may now go
 when init moves onto libos.
+
+## 2026-10-31 — Before Phase 7, Part I: supervision keeps no static mut, and owns its children
+
+Group S of the survey's triage, the supervisors and their servers (init, service-mgr, device-mgr,
+storage-service, logging-service), made five decisions:
+
+- **An admin Start of a declaration bring-up has not reached is refused** (sup-d3, with the bash's
+  sup-9; the maintainer's call), `WouldBlock`, rather than bring-up skipping one an admin started:
+  bring-up stays the only first start, so its order and its wait for a server's Ready need no
+  hand-over from an instance it did not spawn.
+- **A spawned child's handle is libos's owning `Handle<Process>`** (sup-o10, sup-d5): service-mgr
+  links libos for its safe `spawn`, keeps a service's handle while it runs and drops it at the
+  exit; init drops each at once, as it did eshell's and service-mgr's, since nothing maps a pid to
+  a handle and a kept one only pinned an exited server's address space. Spawn blocks are `const`
+  templates copied into locals.
+- **`init.toml` is read one way**: the whole object, to its first NUL, through
+  `libinittoml::manifest::text`, by both init and the storage service (sup-d8), where init read
+  one page to its last non-NUL byte.
+- **A handoff read by position always takes its place** (sup-d14): a handle whose send is refused
+  is closed and an empty message sent for it, as for a zero one, in init's and service-mgr's.
+- **Every sleep is a wait on no handles**, now that the kernel sleeps there (2026-10-30): the
+  storage service's, session-mgr's (whose panic path and failed-login pause each returned at once
+  without a timer), and the test harness's, which slept on handles made for it or on one that
+  could signal.
+
+The rest are fixes, each in its crate. The 51 `static mut`s of the five crates are gone (sup-o3):
+logging-service lends a message only borrowed from its `Inbox`, so the borrow checker refuses a
+receive while one is held (sup-d1); the main loops' wait records are their own, out of a handler's
+reach (sup-d12); and no safe function takes a pointer for the kernel to write (sup-d6). Storage's
+ReadDir replies fit `RS_MAX_BODY` (sup-d2), a stick's block size must divide its scratch (sup-d7),
+and a read is reported only once complete (sup-d13); every unmap names its length (sup-d10); and
+device-mgr closes what it cannot follow (sup-d11).

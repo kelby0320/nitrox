@@ -239,7 +239,7 @@ fn tree_problems(
 
 /// The initramfs files a **test** image is allowed to differ from a **release** image in.
 ///
-/// `init.toml` alone, whose test copy adds two binds; the rest are on the root's list,
+/// `init.toml` alone, whose test copy adds binds and a preamble; the rest are on the root's list,
 /// [`ROOT_DIVERGENCE_ALLOWED`]. **Everything else must be byte-identical**: the software under
 /// test is the software that ships.
 const IMAGE_DIVERGENCE_ALLOWED: &[&str] = &["etc/init.toml"];

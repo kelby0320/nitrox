@@ -44,7 +44,7 @@ use libkern::debug::Line;
 use libkern::device::{DeviceKind, DeviceRecord};
 use libkern::*;
 use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed};
-use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, DirReplyWriter, parse_read_dir_request};
+use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, parse_read_dir_request};
 use librsproto::meta::{FS_SETUP_READ_ONLY, fs_setup};
 use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, SUBNAMESPACE_PREFIX_LEN, parse_resolve_request,
@@ -55,6 +55,7 @@ use librsproto::storage::{
     build_in_use, build_mounted, parse_mount,
 };
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
+use storage_service::fit::{SCRATCH, ScratchRead, scratch_read};
 use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
 use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
@@ -102,14 +103,6 @@ const READY_TIMEOUT_NS: u64 = 30_000_000_000;
 /// long it parks between: long enough for an IRP's completion on another CPU to finish.
 const HELD_ASKS: u32 = 3;
 const HELD_PARK_NS: u64 = 5_000_000;
-/// The scratch every device read passes through: enough for a partition table's front in one.
-const SCRATCH: usize = 64 * 1024;
-
-static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * MAX_WAIT_HANDLES] = [0; 24 * MAX_WAIT_HANDLES];
 
 fn close(h: u64) {
     if h != 0 {
@@ -126,38 +119,32 @@ fn now_ns() -> u64 {
 }
 
 fn wait_until(h: u64, deadline: u64) -> bool {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid; one waiter.
-    unsafe {
-        WAIT_HANDLES[0] = h;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline) == 1
-    }
+    let mut result = [0u8; 24];
+    // SAFETY: one handle, and room for its one result.
+    unsafe { syscall4(SYS_WAIT, (&raw const h) as u64, 1, result.as_mut_ptr() as u64, deadline) == 1 }
 }
 
-/// Park this thread for `ns`: a one-shot timer, since `sys_wait` takes no empty handle list, so a
-/// deadline alone is not a sleep. Returns at once if no timer can be made.
+/// Park this thread for `ns`, in a wait on no handles, which the kernel never refuses.
 fn park(ns: u64) {
-    // SAFETY: register-only syscall; returns a handle or a negative KError.
-    let timer = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
-    if timer < 0 {
-        return;
-    }
-    // SAFETY: arming this process's own timer, one-shot at an absolute monotonic time.
-    unsafe { syscall4(SYS_TIMER_SET, timer as u64, now_ns().saturating_add(ns), 0, 0) };
-    wait_until(timer as u64, u64::MAX);
-    close(timer as u64);
+    // SAFETY: no handles and no results, so the kernel reads and writes neither.
+    unsafe { syscall4(SYS_WAIT, 0, 0, 0, now_ns().saturating_add(ns)) };
 }
 
 /// Wait for a pending operation and return its `(status, value)`.
+/// Only once done: a full waiter queue refuses a wait for now, while the I/O may run on.
 fn po_wait(po: u64) -> (i64, u64) {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid; one waiter, no deadline.
-    let (done, status, value) = unsafe {
-        WAIT_HANDLES[0] = po;
-        let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
-        let word = |off: usize| u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]));
-        // The status is an `i32`, beside a zero reserved word: read whole, `AlreadyExists` would
-        // never compare equal.
-        (w == 1, word(8) as u32 as i32 as i64, word(16))
+    let mut r = [0u8; 24];
+    let done = loop {
+        // SAFETY: one handle, and room for its one result.
+        let waited = unsafe { syscall4(SYS_WAIT, (&raw const po) as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
+        if waited != KError::OutOfMemory.as_i32() as i64 {
+            break waited == 1;
+        }
+        park(HELD_PARK_NS);
     };
+    let word = |off: usize| u64::from_le_bytes(r[off..off + 8].try_into().unwrap_or([0; 8]));
+    // The status is an `i32` beside a zero word: read whole, `AlreadyExists` would never match.
+    let (status, value) = (word(8) as u32 as i32 as i64, word(16));
     close(po);
     if done { (status, value) } else { (-1, 0) }
 }
@@ -166,27 +153,19 @@ fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u
     send_raw(ch, op, request_id, flags, body, handles) == 0
 }
 
-/// [`send`], answering the syscall's own result. **Through `REPLY_MSG`**, whole: the kernel
+/// [`send`], answering the syscall's own result. **Through a whole message's buffer**: the kernel
 /// copies a full message from the pointer it is given, so a smaller buffer would be read past.
 fn send_raw(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> i64 {
-    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
-    unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
-        else {
-            return KError::InvalidArgument.as_i32() as i64;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = handles.len() as u8;
-        REPLY_HANDLES[..handles.len()].copy_from_slice(handles);
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            handles.len() as u64,
-            SENDMODE_NOBLOCK,
-        )
-    }
+    let (mut msg, mut carried) = ([0u8; MSG_LEN], [0u64; 8]);
+    let Some(rs_len) = encode(&mut msg[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16) else {
+        return KError::InvalidArgument.as_i32() as i64;
+    };
+    msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+    msg[8] = handles.len() as u8;
+    carried[..handles.len()].copy_from_slice(handles);
+    let (msg, carried) = (msg.as_ptr() as u64, carried.as_ptr() as u64);
+    // SAFETY: a whole message, and the handles it carries, which this process holds.
+    unsafe { syscall5(SYS_CHANNEL_SEND, ch, msg, carried, handles.len() as u64, SENDMODE_NOBLOCK) }
 }
 
 /// **Ping a watch**: a bare `Changed`, never blocking. A full queue is a ping already waiting, and
@@ -275,20 +254,14 @@ struct Message {
 /// Receive one message on `ch`, and the handles it carried, closed with the [`libkern::Received`]
 /// unless taken. `Ok(None)` if nothing was queued, `Err(())` if the peer has gone.
 fn recv(ch: u64) -> Result<Option<(Message, libkern::Received)>, ()> {
-    // SAFETY: single-threaded service; `RECV_MSG` is lent for the call.
-    let sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
+    let mut buf = [0u8; MSG_LEN];
+    let sent = match channel_recv(ch, &mut buf) {
         Ok(sent) => sent,
         Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
         Err(_) => return Ok(None),
     };
-    // SAFETY: bounded read of the payload the kernel just wrote.
-    let msg = unsafe {
-        let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            len.min(MSG_LEN - PAYLOAD_OFF),
-        )
-    };
+    let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    let msg = &buf[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)];
     // A message that does not decode closes what it carried, as `sent` drops.
     Ok(decode(msg)
         .ok()
@@ -320,7 +293,7 @@ fn with_mapped<T>(obj: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
     // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
     let out = f(unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) });
     // SAFETY: unmapping what was mapped above; nothing refers to it after `f` returned.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
     Some(out)
 }
 
@@ -369,11 +342,8 @@ impl BlockReader for DeviceIo<'_> {
         }
         let mut done = 0usize;
         while done < buf.len() {
-            let at = offset + done as u64;
-            let start = at / self.sector * self.sector;
-            let intra = (at - start) as usize;
-            let want = (buf.len() - done).min(SCRATCH - intra);
-            let span = ((intra + want) as u64).div_ceil(self.sector) * self.sector;
+            let ScratchRead { start, intra, want, span } =
+                scratch_read(offset + done as u64, buf.len() - done, self.sector).ok_or(FsError::Io)?;
             let op = IoOp {
                 opcode: IO_OPCODE_READ,
                 flags: 0,
@@ -392,8 +362,9 @@ impl BlockReader for DeviceIo<'_> {
             if status != 0 || moved != span {
                 return Err(FsError::Io);
             }
-            // SAFETY: `scratch.addr` maps SCRATCH read-write bytes for the life of the service, and
-            // `intra + want <= span <= SCRATCH`; single-threaded, so nothing else holds a reference.
+            // SAFETY: `scratch.addr` maps SCRATCH read-write bytes for the life of the service,
+            // `scratch_read` keeps `intra + want <= span <= SCRATCH`, and the device has moved all
+            // `span`; single-threaded, so nothing else holds a reference.
             let src = unsafe { core::slice::from_raw_parts(self.scratch.addr as *const u8, span as usize) };
             buf[done..done + want].copy_from_slice(&src[intra..intra + want]);
             done += want;
@@ -450,13 +421,9 @@ fn read_manifest(root_ns: u64) -> Result<manifest::Manifest, &'static [u8]> {
     if st != 0 || obj == 0 {
         return Err(b"it did not resolve");
     }
-    let parsed = with_mapped(obj, |bytes| {
-        // The object is page-sized; the manifest ends at its first NUL.
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        match core::str::from_utf8(&bytes[..end]) {
-            Ok(text) => manifest::parse(text).map_err(|_| b"it did not parse".as_slice()),
-            Err(_) => Err(b"it is not UTF-8".as_slice()),
-        }
+    let parsed = with_mapped(obj, |bytes| match manifest::text(bytes) {
+        Ok(text) => manifest::parse(text).map_err(|_| b"it did not parse".as_slice()),
+        Err(_) => Err(b"it is not UTF-8".as_slice()),
     });
     close(obj);
     parsed.unwrap_or(Err(b"it would not map"))
@@ -1108,21 +1075,11 @@ impl Service {
                 .collect(),
             Listing::Mounts => self.mounted.iter().map(|x| (x.label.clone(), DIRENT_KIND_DIR, 0)).collect(),
         };
-        let mut out = [0u8; MSG_LEN - PAYLOAD_OFF - 64];
-        let Some(mut w) = DirReplyWriter::new(&mut out) else {
-            return reply_error(ch, m.op, m.request_id, KError::KernelError);
-        };
-        let mut i = cursor;
-        while i < entries.len() {
-            let (name, kind, size) = &entries[i];
-            if !w.push(i as u32 + 1, *kind, 0, *size, 0, name.as_bytes()) {
-                break;
-            }
-            i += 1;
+        let sent = storage_service::fit::dir_page(&entries, cursor)
+            .is_some_and(|(body, _)| send(ch, OP_FILE_READ_DIR, m.request_id, RS_FLAG_REPLY, &body, &[]));
+        if !sent {
+            reply_error(ch, m.op, m.request_id, KError::KernelError);
         }
-        let next = if i >= entries.len() { 0 } else { i as u64 };
-        let n = w.finish(next);
-        let _ = send(ch, OP_FILE_READ_DIR, m.request_id, RS_FLAG_REPLY, &out[..n], &[]);
     }
 
     /// A mount's control channel: its server sends nothing on it unasked, so a message is dropped,
@@ -1431,13 +1388,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN`. `0` once `service-mgr` is gone.
     let mut control = control;
     loop {
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the subscription, the
-        // control channel, and at most each kind's bound more — each refuses past it.
-        let waited = unsafe {
+        let (mut handles, mut results) = ([0u64; MAX_WAIT_HANDLES], [0u8; 24 * MAX_WAIT_HANDLES]);
+        let waited = {
             let mut n = 0usize;
             let mut push = |h: u64| {
                 if h != 0 && n < MAX_WAIT_HANDLES {
-                    WAIT_HANDLES[n] = h;
+                    handles[n] = h;
                     n += 1;
                 }
             };
@@ -1464,18 +1420,16 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             for &(d, _) in &s.dirs {
                 push(d);
             }
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+            // SAFETY: `n` handles, and room for as many results; each kind refuses past its bound.
+            unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, u64::MAX) }
         };
         // **What a watch is told**: the names mounted and the devices there are before this turn,
         // against after it. Compared here, once, rather than at each place that mounts, unmounts
         // or follows a device, so no path can miss a ping.
         let before = s.watched();
         for j in 0..waited.max(0) as usize {
-            // SAFETY: `waited` records were written; the handle is the first word of each.
-            let h = unsafe {
-                let off = j * 24;
-                u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]))
-            };
+            // The handle is the first word of each record.
+            let h = u64::from_le_bytes(results[j * 24..j * 24 + 8].try_into().unwrap_or([0; 8]));
             if h == s.serve_end {
                 // A root endpoint with no peer is the end of this service, not a message to skip:
                 // the kernel keeps a peer-closed channel signalled, so going round again would spin

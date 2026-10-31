@@ -145,13 +145,16 @@ beside its notification channel:
 
 Init is the eventual parent of all orphaned processes (creator-based reparenting). It receives `Notification::ChildExited` for every process it directly created and for every orphan that gets reparented to it.
 
+**It holds no child's process handle**: each is closed as the child is spawned (libos's `spawn`
+hands back an owning handle, which init drops), since nothing maps a `ChildExited` pid to a handle,
+and a handle kept would pin an exited child's address space for the life of the machine.
+
 The reaping loop:
 
-1. `sys_wait` on the notification channel
-2. On `ChildExited`, close the process handle (this is "reaping")
-3. Log the exit if it was abnormal
+1. `sys_wait` on the notification channel, and the terminal channel beside it
+2. On `ChildExited`, log the pid and its exit code
 
-That's it. Init doesn't do supervision (the service manager does that for services); it just reaps to release process resources.
+That's it. Init doesn't do supervision (the service manager does that for services).
 
 ## Testing
 

@@ -3462,7 +3462,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Defects**
 
-- [ ] **sup-d1** `userspace/logging-service/src/main.rs:392` — `received()` is a safe fn that
+- [x] **sup-d1** `userspace/logging-service/src/main.rs:392` — `received()` is a safe fn that
   returns a `librsproto::Message<'static>` borrowed from `static mut RECV_MSG`, and the next safe
   `recv()` has the kernel overwrite that buffer while the borrow can still be live. Any caller
   that keeps the message across another receive reads another client's bytes behind a live shared
@@ -3474,7 +3474,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Miri on a replica of the pair reports `Undefined Behavior: trying to retag ... for
   SharedReadOnly permission ... that tag does not exist in the borrow stack`. Probes restored.
   abi, ownership, soundness, opportunities. Medium. **Fix.**
-- [ ] **sup-d2** `userspace/storage-service/src/main.rs:1115` — `serve_dir` sizes its ReadDir body
+  Fixed in `48235002`: the receive buffer is an `Inbox` the serve loop owns, whose `message()` and
+  `payload()` borrow from it, so no receive can happen while one is held. A compile probe holding a
+  message across `inbox.recv` fails with E0502.
+- [x] **sup-d2** `userspace/storage-service/src/main.rs:1115` — `serve_dir` sizes its ReadDir body
   buffer as the IPC payload (`MSG_LEN - PAYLOAD_OFF - 64` = 4008 bytes) instead of `RS_MAX_BODY`
   (3980), and `let _ = send(..)` at 1128-1129 drops the refusal. A listing that fills past 3980
   bytes sends no reply. A USB stick with a 128-entry GPT gives 130 entries. 117 pack into 3993
@@ -3487,7 +3490,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   body=3958 encoded=Some(3986)`. The kernel publishes every in-use GPT entry (up to 128) and
   device-mgr's replay depth reaches them. Test removed. abi, soundness, opportunities. Medium.
   **Fix.**
-- [ ] **sup-d3** `userspace/service-mgr/src/main.rs:1248` — an admin Start or Restart of a
+  Fixed in `796a06cf`: the page is `fit::dir_page`, in the library, sized to `RS_MAX_BODY`, and a
+  reply not sent is answered with an error. `a_full_gpts_listing_pages_into_replies_that_encode`
+  fails with the old 4008-byte buffer.
+- [x] **sup-d3** `userspace/service-mgr/src/main.rs:1248` — an admin Start or Restart of a
   declaration that bring-up has not reached yet is allowed, and when bring-up reaches it,
   `start(i, true)` spawns it again and overwrites `proc_h` and `ctrl` without closing them.
   Neither `advance()` nor `start()` checks `running`. On the test image, nxterm waits (`after`)
@@ -3501,6 +3507,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   nxterm while display-selftest runs would print `starting service 'nxterm'` twice. The fix is to
   skip or refuse when `running` is true. ownership. Medium.
   **Fix**, with the bash's sup-9, moved here from Part H.
+  Fixed in `106601be`, with sup-9: `decide` refuses a Start, or the Restart of a service not
+  running, that bring-up has not reached, with `WouldBlock`; the maintainer's choice of the two.
+  `a_start_bring_up_has_not_reached_is_refused` fails without it.
 - [x] **sup-d4** `userspace/service-mgr/src/main.rs:1369` — `lookup_serving` closes its lookup's
   PendingOperation at the deadline, but the kernel still installs the server's late reply handle
   in service-mgr's table, where nothing knows its value. `derive()` resolves device-mgr's
@@ -3519,7 +3528,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   handle count growing. ownership, opportunities. Medium. **Fix**, as rt-d6.
   Fixed in `fc9ce772`, as rt-d6: service-mgr's late answers no longer leave a handle or hold
   device-mgr's endpoint slot.
-- [ ] **sup-d5** `userspace/init/src/main.rs:420` — init discards the process handle of every
+- [x] **sup-d5** `userspace/init/src/main.rs:420` — init discards the process handle of every
   fs-server and of the profile server it spawns (`let _ = fs_h;`, `let _ = ps_h;` at 559), and
   leaks it on every failure after the spawn: 377-410 and 516-553. The comments say init keeps
   them, but no static or list holds the value. A Process drops its AddressSpace only when the
@@ -3531,7 +3540,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   test and the discard, with no store and no close. Unverified: that the frames stay pinned in a
   running system; a boot that kills a mount's server and reads free memory would settle it. abi,
   ownership, soundness, opportunities. Low. **Fix.**
-- [ ] **sup-d6** `userspace/service-mgr/src/main.rs:402` — safe functions take raw pointers that
+  Fixed in `e6a4ecf2`: every spawn goes through libos's safe `spawn`, and init drops each process
+  handle at once, as it already closed eshell's and service-mgr's, so a server's exit frees it.
+  Structural; the gates pass.
+- [x] **sup-d6** `userspace/service-mgr/src/main.rs:402` — safe functions take raw pointers that
   they dereference, or hand to the kernel to write and then read. `spawn_with_control(root_ns,
   path, args: *mut SpawnArgs)` writes `(*args).image`, `handles`, `handle_count` and `move_mask`.
   logging-service `make_channel(o0: *mut u64, o1: *mut u64)` (main.rs:169) has the kernel write
@@ -3545,7 +3557,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   from safe fns built clean for `x86_64-unknown-nitrox`. A positive control in service-mgr (a
   `u8 = "str"` mismatch) gave `E0308`, so the bin is type-checked. Probes restored. abi,
   ownership, soundness, opportunities. Low. **Fix.**
-- [ ] **sup-d7** `userspace/storage-service/src/main.rs:399` — `DeviceIo::read_at`'s SAFETY
+  Fixed in `f013319d` and `48235002`: `spawn_with_control` takes its `SpawnArgs` by value and spawns
+  through libos, and logging-service's `make_channel` takes no pointers.
+- [x] **sup-d7** `userspace/storage-service/src/main.rs:399` — `DeviceIo::read_at`'s SAFETY
   argument `intra + want <= span <= SCRATCH` does not hold, because the record's
   `logical_block_size` is taken unvalidated from a USB stick's READ CAPACITY (kernel scsi.rs:96,
   `try_new_block`). A 520-byte block at offset 0 with a 64 KiB read gives `span` = 66040 > 65536.
@@ -3557,7 +3571,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   drops the `moved != span` check, would read past the mapping. Demonstrated: the lines 377-380
   arithmetic replayed in Python gives span 66000 (3000), 66040 (520) and 131072 (131072), all
   `span<=SCRATCH` False, and True for 512 and 4096. abi, soundness, opportunities. Low. **Fix.**
-- [ ] **sup-d8** `userspace/init/src/main.rs:181` — init maps exactly one page of
+  Fixed in `4ddff7dd`: the arithmetic is `fit::scratch_read`, in the library, which refuses a block
+  that does not divide the scratch, and the SAFETY comment names what holds it.
+  `a_block_that_does_not_divide_the_scratch_is_refused` fails on 520 without the check.
+- [x] **sup-d8** `userspace/init/src/main.rs:181` — init maps exactly one page of
   `/initramfs/etc/init.toml` ("assumed to fit") and parses to the last non-NUL byte of that page,
   while the storage service maps the object's whole `HandleInfo.size` (main.rs:313-321, 457-459),
   so the two consumers `libinittoml` exists to keep in agreement read different text. A manifest
@@ -3570,6 +3587,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   "init (one page) sees 1 mount(s); the storage service (whole object) sees 2". The kernel maps a
   prefix of a larger object without complaint (table.rs:878). Test removed. abi, opportunities.
   Low. **Fix.**
+  Fixed in `e6a4ecf2`: init maps the whole object, and both consumers read its text through
+  `libinittoml::manifest::text`. `a_manifest_past_one_page_is_read_whole` fails with `text` cut to a
+  page, or ended after the last non-NUL as init did.
 - [x] **sup-d9** `userspace/init/src/main.rs:181` — init maps the init.toml page (181/189) and
   `/system/current-generation` (577/585) and never unmaps either, so PID 1 keeps both mappings,
   and the second pins a root-filesystem FileObject through shutdown's sync and `Meta::Unmount` of
@@ -3579,7 +3599,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   'unmap\|MEMORY_MAP\|\.map(' userspace/init/src/main.rs` finds the two maps and no unmap.
   ownership, opportunities. Low. **Fix**, as rt-d5.
   Fixed with rt-d5, in `2cde6627`: init unmaps both pages once read.
-- [ ] **sup-d10** `userspace/device-mgr/src/main.rs:176` — `read_registry` and `read_io` (176,
+- [x] **sup-d10** `userspace/device-mgr/src/main.rs:176` — `read_registry` and `read_io` (176,
   204) and storage-service `with_mapped` (main.rs:327) unmap with size 0, which works only because
   `sys_memory_unmap` ignores `size` today (table.rs:949, `_size` unused). syscall-abi.md:529 says
   the size "is not yet honored" and plans to. Once honoured, every hotplug re-read, every `io.tsm`
@@ -3587,13 +3607,17 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   files pass the real length elsewhere (device-mgr 226, storage 486). Latent until that kernel
   change. Demonstrated: the three call sites pass 0 and the kernel ignores it, by code read. No
   test can run it today. ownership, opportunities. Low. **Fix.**
-- [ ] **sup-d11** `userspace/device-mgr/src/main.rs:654` — the `/dev/registry/changes` handle is
+  Fixed in `4a9835ee`: each passes `info.size`, what it mapped. Latent until the kernel honours the
+  size, so no test reaches it.
+- [x] **sup-d11** `userspace/device-mgr/src/main.rs:654` — the `/dev/registry/changes` handle is
   dropped without a close when the change page cannot be created or mapped: the struct literal
   stores `changes: if change_at == 0 { 0 } else { changes }` and the other arm never closes it, so
   the handle stays in device-mgr's table for its life. This is reached when `SYS_MEMORY_CREATE` or
   `SYS_MEMORY_MAP` fails at startup. Demonstrated: code read of main.rs:637-654. ownership. Low.
   **Fix.**
-- [ ] **sup-d12** `userspace/device-mgr/src/main.rs:694` — the main loops of device-mgr (694-731)
+  Fixed in `fcc30620`: the page is made only once the node resolved, and both handles are closed if
+  it cannot be mapped. Reached only by a failed create or map at startup.
+- [x] **sup-d12** `userspace/device-mgr/src/main.rs:694` — the main loops of device-mgr (694-731)
   and storage-service (main.rs:1477-1519) read wait record `j` lazily from `static mut
   WAIT_RESULTS` after the handlers for earlier records have run nested waits (`lookup`, `po_wait`,
   `wait_until`, `park`) into the same static. This is correct only because every nested wait has
@@ -3607,7 +3631,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `unmount` -> `held_files` -> `park` -> `wait_until` (132). service-mgr already uses a stack
   buffer in `wait_serving`. Unverified: main.rs is not host-testable. A host test of an extracted
   dispatch with a two-handle nested wait would settle it. abi, ownership. Low. **Fix.**
-- [ ] **sup-d13** `userspace/storage-service/src/main.rs:161` — `po_wait` closes the PO and
+  Fixed in `796c3add` (storage) and `c96ba220` (device-mgr): each loop's wait records are a local
+  array of its own, out of any handler's reach. Structural.
+- [x] **sup-d13** `userspace/storage-service/src/main.rs:161` — `po_wait` closes the PO and
   reports failure when `sys_wait` returns without it signalled, though the read it waited on may
   still be in flight into the shared Scratch object. `read_at` returns `Err(Io)` and the next
   `read_at` submits into the same buffer at offset 0 while the first IRP can still write there.
@@ -3622,7 +3648,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   The trigger named above cannot fire: this `po_wait` waits on one PO with no deadline, where
   registering a waiter fails only past `MAX_WAITERS` (four, reserved at construction) and no
   deadline entry is pushed. The item is latent, as fs-d4 says of the same helper.
-- [ ] **sup-d14** `userspace/init/src/main.rs:692` — handoffs are read by position, and a handoff
+  Fixed in `951a71f0`: `po_wait` waits again while the answer is `OutOfMemory`, so it reports a read
+  only once it has completed. Structural, and latent, as noted above.
+- [x] **sup-d14** `userspace/init/src/main.rs:692` — handoffs are read by position, and a handoff
   whose send fails is closed with nothing sent in its place, so every later handle shifts one
   slot. The code sends an empty message for a zero handle but not for a failed send. Same in
   service-mgr `send_handle` (478-481) for the nine login-chain handoffs. If init's first send
@@ -3632,6 +3660,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   third receive waits 30 s. A failed tty send to session-mgr shifts clip into tty, and so on.
   Unverified: needs a send failure injected mid-sequence. Read of init main.rs:676-699 and
   service-mgr 463-482, 556-560 and 584-586. ownership. Low. **Fix.**
+  Fixed in `f013319d` (service-mgr) and `e6a4ecf2` (init): a refused handle is closed and an empty
+  message sent in its place, as for a zero one. Structural: no test injects a send failure.
 
 **Opportunities**
 
@@ -3674,7 +3704,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (sup-d3), and double closes made possible by copied teardown. Generation numbers already make a
   double close harmless, so leaks are the class closed. Depends on: sup-o1 and the send API in
   sup-o4, and Part E. ownership, opportunities. Value high, effort large. **Plan**, in P7.
-- [ ] **sup-o3** remove: `static mut` used as scratch, out-param, spawn block or process state
+- [x] **sup-o3** remove: `static mut` used as scratch, out-param, spawn block or process state
   where a local or a struct field does the same job — 51 sites (`grep -n '^static mut'` over the
   five mains: init 16, service-mgr 15, logging 10, device-mgr 5, storage 5), such as
   `userspace/service-mgr/src/main.rs:182` (CTRL_OUT0/1 read back through raw pointers, while
@@ -3690,6 +3720,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   crate's main.rs. Closes: reentrancy through a shared buffer (sup-d12), ownership by convention
   in init's state statics, and the static that makes `received() -> Message<'static>` (sup-d1)
   possible. Depends on: nothing. opportunities, ownership. Value high, effort medium. **Fix.**
+  Fixed in each crate's commit: storage `796c3add`, device-mgr `c96ba220`, logging `48235002`,
+  service-mgr `f013319d`, init `e6a4ecf2`. Each static is a local, a field or a value passed down;
+  none of the 51 is left.
 - [ ] **sup-o4** encapsulate: IPC messages through `static mut [u8; 4096]` buffers, the header
   parsed by byte offset, the payload sliced with `from_raw_parts(add(24), len.min(4072))`, sends
   framed by hand into `[24..]` — 34 sites (`grep -rn "channel_recv_raw("` = 10 receives, 9
@@ -3804,7 +3837,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `unsafe`. It would have reached three of this survey's defects (sup-d1, sup-d2, sup-d4) without
   a boot. Depends on: sup-o1, sup-o2, sup-o5. opportunities. Value medium, effort large.
   **Plan**, in P7.
-- [ ] **sup-o10** remove: `SpawnArgs` kept as `static mut` templates, stamped in place and spawned
+- [x] **sup-o10** remove: `SpawnArgs` kept as `static mut` templates, stamped in place and spawned
   through a raw pointer (an `unsafe fn` in init, a safe fn over `*mut` in service-mgr) — 4 spawn
   calls carrying 7 static SpawnArgs (`grep -n 'SYS_PROCESS_SPAWN\|static mut SPAWN'`: init 166,
   service-mgr 371 and 422, storage `mounting.rs` 36; init 4 statics, service-mgr 3), such as
@@ -3821,6 +3854,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `handles[0]`/`rights[0]` keep the previous child's values, masked today by `handle_count = 0`).
   It removes 7 statics and 1 `unsafe fn`. Depends on: nothing (the builder wants owned handles
   from sup-o2). abi, ownership, soundness, opportunities. Value medium, effort small. **Fix.**
+  Fixed in `f013319d` and `e6a4ecf2`: `const` templates copied into locals, spawned through libos's
+  `spawn`, which service-mgr now links. Storage's spawn already built a local and closes its handle
+  on every path, so it is left.
 - [ ] **sup-o11** remove: local redefinitions of operations that already have a safe form —
   `kprint` over raw `SYS_DEBUG_KPRINT`, `exit` over raw `SYS_PROCESS_EXIT`, and an `asm!("pause")`
   loop — 5 sites (`grep -n 'fn kprint\|fn exit\|SYS_PROCESS_EXIT\|asm!'` over the mains), such as

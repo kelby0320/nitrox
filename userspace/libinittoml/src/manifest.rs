@@ -99,6 +99,13 @@ pub enum ManifestError {
     BindUnknownSource { index: usize },
 }
 
+/// **The manifest an `init.toml` object holds**: its bytes to the first NUL, as the object is
+/// page-sized. Both consumers read it so, over the whole object, or they would disagree.
+pub fn text(object: &[u8]) -> Result<&str, core::str::Utf8Error> {
+    let end = object.iter().position(|&b| b == 0).unwrap_or(object.len());
+    core::str::from_utf8(&object[..end])
+}
+
 /// Parse + validate `init.toml`: the mounts in shallowest-first order, and the binds in file
 /// order, each checked to name a mount as its source.
 pub fn parse(input: &str) -> Result<Manifest, ManifestError> {
@@ -203,6 +210,21 @@ pub fn device_ns_path(device: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A manifest past one page is read whole**, to its first NUL: its second mount, wholly on
+    /// the second page, is there.
+    #[test]
+    fn a_manifest_past_one_page_is_read_whole() {
+        let first = SINGLE_ROOT;
+        let second = SINGLE_ROOT.replace("mount_point  = \"/\"", "mount_point  = \"/a\"");
+        let padding = "#".repeat(4096 - first.len() - 1) + "\n";
+        let mut object = std::format!("{first}{padding}{second}").into_bytes();
+        object.resize(8192, 0);
+        let manifest = parse(text(&object).unwrap()).unwrap();
+        assert_eq!(manifest.mounts.len(), 2);
+        assert_eq!(text(b"a = 1\0b = 2\0\0").unwrap(), "a = 1");
+        assert_eq!(text(b"a = 1").unwrap(), "a = 1", "an object full to its end has no NUL");
+    }
 
     /// **init's copy of the read-only flag is the server's**: the byte `"ro"` sends parses, on the
     /// server's side, as read-only, and `"rw"`'s as writable.

@@ -41,6 +41,11 @@ pub mod bringup {
         Done,
     }
 
+    /// Whether declaration `i` has been started by bring-up, which starts them in order.
+    pub fn reached(i: usize, started: usize) -> bool {
+        i < started
+    }
+
     /// The next step; the caller asks only when nothing is being waited for.
     pub fn next(entries: &[Entry], started: usize, chain_started: bool) -> Step {
         if !chain_started && started >= chain_at(entries) {
@@ -306,21 +311,26 @@ pub mod services {
         pub running: bool,
         /// Whether its policy has a restart scheduled: it exited, and its backoff is not over.
         pub restart_due: bool,
+        /// Whether bring-up has started it: until then, a start would be bring-up's second.
+        pub reached: bool,
     }
 
     /// What to do for request `op` on the service `found`, or why not.
     pub fn decide(op: u16, found: Option<Found>) -> Result<Action, (KError, &'static str)> {
         use librsproto::services::{OP_SERVICES_RESTART, OP_SERVICES_START, OP_SERVICES_STOP};
-        let Some(Found { essential, running, restart_due }) = found else {
+        let Some(Found { essential, running, restart_due, reached }) = found else {
             return Err((KError::NotFound, "no service is declared by that name"));
         };
         match op {
-            OP_SERVICES_START if running => Err((KError::AlreadyExists, "it is already running")),
-            OP_SERVICES_START => Ok(Action::Start),
             OP_SERVICES_STOP | OP_SERVICES_RESTART if essential => Err((
                 KError::NoAccess,
                 "it is essential: without it the system cannot be administered, or loses what it holds",
             )),
+            OP_SERVICES_START | OP_SERVICES_RESTART if !reached => {
+                Err((KError::WouldBlock, "bring-up has not reached it yet"))
+            }
+            OP_SERVICES_START if running => Err((KError::AlreadyExists, "it is already running")),
+            OP_SERVICES_START => Ok(Action::Start),
             OP_SERVICES_STOP if !running && restart_due => Ok(Action::CancelRestart),
             OP_SERVICES_STOP if !running => Err((KError::InvalidArgument, "it is not running")),
             OP_SERVICES_STOP => Ok(Action::Stop),
@@ -385,7 +395,7 @@ mod tests {
         use librsproto::services::{
             OP_SERVICES_RESTART as RESTART, OP_SERVICES_START as START, OP_SERVICES_STOP as STOP,
         };
-        let found = |essential, running, restart_due| Some(Found { essential, running, restart_due });
+        let found = |essential, running, restart_due| Some(Found { essential, running, restart_due, reached: true });
         let (plain_up, plain_down) = (found(false, true, false), found(false, false, false));
         let essential_up = found(true, true, false);
         assert_eq!(decide(START, plain_down), Ok(Action::Start));
@@ -408,6 +418,24 @@ mod tests {
         assert_eq!(decide(STOP, found(true, false, true)).map_err(|e| e.0), Err(KError::NoAccess));
         assert_eq!(decide(STOP, None).map_err(|e| e.0), Err(KError::NotFound));
         assert_eq!(decide(0x1103, plain_up).map_err(|e| e.0), Err(KError::Unsupported));
+    }
+
+    /// **A start bring-up has not reached is refused**, where bring-up later spawned a second
+    /// instance over the first's process handle and control channel.
+    #[test]
+    fn a_start_bring_up_has_not_reached_is_refused() {
+        use super::services::{Action, Found, decide};
+        use libkern::error::KError;
+        use librsproto::services::{OP_SERVICES_RESTART as RESTART, OP_SERVICES_START as START};
+        let ahead = Found { essential: false, running: false, restart_due: false, reached: false };
+        for op in [START, RESTART] {
+            assert_eq!(decide(op, Some(ahead)).map_err(|e| e.0), Err(KError::WouldBlock));
+        }
+        assert_eq!(decide(START, Some(Found { reached: true, ..ahead })), Ok(Action::Start));
+        let essential = Found { essential: true, ..ahead };
+        assert_eq!(decide(RESTART, Some(essential)).map_err(|e| e.0), Err(KError::NoAccess));
+        assert_eq!(decide(START, Some(essential)).map_err(|e| e.0), Err(KError::WouldBlock));
+        assert!(!super::bringup::reached(2, 2) && super::bringup::reached(2, 3));
     }
 
     #[test]

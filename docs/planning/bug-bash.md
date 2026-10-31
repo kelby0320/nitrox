@@ -1920,7 +1920,7 @@ Found 21, refuted by a boot 0, reported 16.
   `unfit = Some("a critical declaration could not be read")`. The appended block gave
   `NoExecutable` and the same result. The probe was removed. Lens: error-paths. Low. **Later.**
 
-- [ ] **sup-9** `userspace/service-mgr/src/main.rs:1231` — bring-up's `Step::Start` calls
+- [x] **sup-9** `userspace/service-mgr/src/main.rs:1231` — bring-up's `Step::Start` calls
   `start(i, true)` without checking `running`. An admin Start of a declaration bring-up has not
   reached (`start_asked` via `decide`, main.rs:2121-2123) spawns it early. Bring-up later spawns a
   second instance, and `start` overwrites `proc_h` and `ctrl` (1297-1300). The first instance's
@@ -1932,6 +1932,8 @@ Found 21, refuted by a boot 0, reported 16.
   nxterm` during that wait, then count nxterm processes or "starting service" lines. Lenses:
   logic, error-paths (same defect). Low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's sup-d3, which repeats it.
+  Fixed in `106601be`, as sup-d3: an admin Start bring-up has not reached is refused.
+  `a_start_bring_up_has_not_reached_is_refused` fails without it.
 
 - [ ] **sup-10** `userspace/service-mgr/src/main.rs:1374` — `wait_codes` is meant to wait up to
   `CODE_GRACE_NS` for a dead service's exit code, but it returns false when any route wakes the

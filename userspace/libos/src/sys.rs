@@ -170,7 +170,7 @@ mod mock {
         pos: BTreeMap<u64, Po>,
         /// Completions armed for upcoming `io_submit`s: `(status, result, ready_now, never)`.
         script: VecDeque<(i32, u64, bool, bool)>,
-        /// Handles lookups resolved to, installed by the first wait that read them, as the kernel's.
+        /// Lookups' handles, installed by the first wait that read them, as the kernel's are.
         installed: BTreeSet<u64>,
         fail_wait: Option<i64>,
         /// Waits that slept until a deadline, neither polls nor waits for ever.
@@ -216,7 +216,7 @@ mod mock {
     }
 
     /// As the kernel answers (`InvalidArgument`, `InvalidHandle`, an empty poll's `WouldBlock`, a
-    /// sleep on no handles); a short `results` panics. A deadline lets time pass; a wait for ever that nothing ends panics.
+    /// sleep on no handles); a deadline lets time pass; a short `results` or endless wait panics.
     pub fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
         MOCK.with(|m| {
             let m = &mut *m.borrow_mut();

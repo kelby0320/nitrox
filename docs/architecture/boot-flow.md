@@ -316,9 +316,11 @@ binds it anywhere, and `init` cannot give it away.
 that `rdx` holds a system-control object and keeps it, saying `init: holds the system-control
 object`, then:
 
-1. **Read the manifest** — `/initramfs/etc/init.toml`, parsed into an ordered list of
+1. **Read the manifest** — `/initramfs/etc/init.toml`, the whole object to its first NUL, as the
+   storage service reads it (`libinittoml::manifest::text`), parsed into an ordered list of
    mounts (shallowest first). Unreadable, unparseable or non-UTF-8 → the emergency path.
-2. **Mount the critical path.** Per entry: resolve the device, spawn the fs-server, hand
+2. **Mount the critical path.** Per entry: resolve the device, spawn the fs-server (closing its
+   process handle at once, as for every child `init` starts, so its exit frees it), hand
    over the device handle — with `WRITE` only for an `"rw"` mount, and for a `"ro"` one the
    read-only flag too (`init::device_rights`) — wait for its `Ready`
    message carrying the server's endpoint, and bind that endpoint at the mount point, **keeping the

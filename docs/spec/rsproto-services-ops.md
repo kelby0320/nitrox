@@ -71,7 +71,7 @@ or refused.
 | `AlreadyExists` | it is already running |
 | `KernelError` | it could not be spawned |
 | `TimedOut` | a server that did not come up: no `Ready` within 30 s, a refusal, or an exit first |
-| `WouldBlock` | it is being started or stopped already |
+| `WouldBlock` | it is being started or stopped already, or **bring-up has not reached it yet**: bring-up starts every declaration first, and would start a second instance over the first |
 
 ### `Stop` (`0x1101`)
 

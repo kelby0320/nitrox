@@ -63,32 +63,13 @@ fn park() -> ! {
     }
 }
 
-/// Sleep `ms` on a one-shot timer; best-effort, as every caller only paces.
+/// Sleep `ms`, in a wait on no handles, which the kernel never refuses.
 fn sleep_ms(ms: u64) {
-    // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
-    let th = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
-    if th < 0 {
-        return;
-    }
-    let th = th as u64;
     let mut now: u64 = 0;
     // SAFETY: `now` is a valid writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
-    let fire_at = now + ms * 1_000_000;
-    // SAFETY: arming our own timer handle (absolute monotonic, one-shot).
-    unsafe { syscall4(SYS_TIMER_SET, th, fire_at, 0, 0) };
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
-    unsafe {
-        WAIT_HANDLES[0] = th;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            fire_at + 1_000_000_000,
-        );
-        syscall1(SYS_HANDLE_CLOSE, th);
-    }
+    // SAFETY: no handles and no results, so the kernel reads and writes neither.
+    unsafe { syscall4(SYS_WAIT, 0, 0, 0, now.saturating_add(ms * 1_000_000)) };
 }
 
 /// Block on `handle`; `true` if it signalled. The notification channel is watched beside it, so a
