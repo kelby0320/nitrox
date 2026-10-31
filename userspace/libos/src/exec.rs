@@ -119,8 +119,7 @@ unsafe fn waker_noop(_data: *const ()) {}
 // --- Op: the core future --------------------------------------------------
 
 /// A future over an in-flight `PendingOperation`, resolving to its [`IoResult`] or an [`Error`].
-/// Closes the PO on drop, **first waiting out an unfinished I/O**: the kernel cannot cancel one,
-/// and its device may still be using the buffer the caller gets back.
+/// Its drop **waits out an unfinished I/O**, whose device may still use the buffer, then closes it.
 #[must_use = "an Op does nothing unless awaited or passed to block_on"]
 #[derive(Debug)]
 pub struct Op {

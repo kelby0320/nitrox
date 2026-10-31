@@ -214,7 +214,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     // Receive the log endpoint service-mgr transfers over the control channel, then log
     // through it. `0` (no handoff) → the logger is a no-op and beats fall back to kprint.
     let log_ep = if control != 0 { recv_log_handoff(control) } else { 0 };
-    let logger = Logger::new(log_ep);
+    let logger = Logger::borrowing(log_ep);
     if control != 0 {
         run_daemon(control, log_ep, &logger, root_ns);
     }

@@ -13,15 +13,15 @@ const PAYLOAD_OFF: usize = 24;
 const BUF: usize = 4096;
 
 /// A log endpoint; a zero (absent) handle makes every emit a no-op.
-#[derive(Copy, Clone)]
 pub struct Logger {
     handle: u64,
+    owned: bool,
 }
 
 impl Logger {
-    /// Wrap a log-endpoint handle.
-    pub const fn new(handle: u64) -> Self {
-        Self { handle }
+    /// Log through `handle`, which the caller keeps owning: the logger closes nothing.
+    pub const fn borrowing(handle: u64) -> Self {
+        Self { handle, owned: false }
     }
 
     /// Whether the endpoint is present.
@@ -99,13 +99,22 @@ impl Logger {
     }
 }
 
-/// Resolve a log path in `ns` to a [`Logger`]; an unresolvable path yields an invalid one.
+impl Drop for Logger {
+    fn drop(&mut self) {
+        if self.owned && self.handle != 0 {
+            // SAFETY: the endpoint `open_source` resolved, which this logger alone holds.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, self.handle) };
+        }
+    }
+}
+
+/// Resolve a log path in `ns` to a [`Logger`] that owns its endpoint, or to an invalid one.
 pub fn open_source(ns: u64, path: &[u8]) -> Logger {
     // SAFETY: valid path pointer + namespace handle.
     let po =
         unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_SEND | RIGHT_TRANSFER) };
     if po < 0 {
-        return Logger::new(0);
+        return Logger::borrowing(0);
     }
     let wh = [po as u64];
     let mut wr = [0u8; 24];
@@ -116,5 +125,5 @@ pub fn open_source(ns: u64, path: &[u8]) -> Logger {
     let handle = u64::from_le_bytes([wr[16], wr[17], wr[18], wr[19], wr[20], wr[21], wr[22], wr[23]]);
     // SAFETY: closing our own PO handle (the resolved handle is separate).
     unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-    if waited != 1 || status != 0 { Logger::new(0) } else { Logger::new(handle) }
+    if waited != 1 || status != 0 { Logger::borrowing(0) } else { Logger { handle, owned: true } }
 }
