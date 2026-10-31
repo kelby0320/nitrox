@@ -55,6 +55,7 @@ use librsproto::storage::{
     build_in_use, build_mounted, parse_mount,
 };
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
+use storage_service::fit::{SCRATCH, ScratchRead, scratch_read};
 use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
 use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
@@ -102,8 +103,6 @@ const READY_TIMEOUT_NS: u64 = 30_000_000_000;
 /// long it parks between: long enough for an IRP's completion on another CPU to finish.
 const HELD_ASKS: u32 = 3;
 const HELD_PARK_NS: u64 = 5_000_000;
-/// The scratch every device read passes through: enough for a partition table's front in one.
-const SCRATCH: usize = 64 * 1024;
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
@@ -369,11 +368,8 @@ impl BlockReader for DeviceIo<'_> {
         }
         let mut done = 0usize;
         while done < buf.len() {
-            let at = offset + done as u64;
-            let start = at / self.sector * self.sector;
-            let intra = (at - start) as usize;
-            let want = (buf.len() - done).min(SCRATCH - intra);
-            let span = ((intra + want) as u64).div_ceil(self.sector) * self.sector;
+            let ScratchRead { start, intra, want, span } =
+                scratch_read(offset + done as u64, buf.len() - done, self.sector).ok_or(FsError::Io)?;
             let op = IoOp {
                 opcode: IO_OPCODE_READ,
                 flags: 0,
@@ -392,8 +388,9 @@ impl BlockReader for DeviceIo<'_> {
             if status != 0 || moved != span {
                 return Err(FsError::Io);
             }
-            // SAFETY: `scratch.addr` maps SCRATCH read-write bytes for the life of the service, and
-            // `intra + want <= span <= SCRATCH`; single-threaded, so nothing else holds a reference.
+            // SAFETY: `scratch.addr` maps SCRATCH read-write bytes for the life of the service,
+            // `scratch_read` keeps `intra + want <= span <= SCRATCH`, and the device has moved all
+            // `span`; single-threaded, so nothing else holds a reference.
             let src = unsafe { core::slice::from_raw_parts(self.scratch.addr as *const u8, span as usize) };
             buf[done..done + want].copy_from_slice(&src[intra..intra + want]);
             done += want;
