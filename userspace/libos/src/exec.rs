@@ -150,7 +150,7 @@ impl Op {
         Ok(Op { po: po as u64, io: true, finished: false, done: false })
     }
 
-    /// Wrap a lookup's PO; its drop closes it at once, as the kernel frees a lookup closed unread.
+    /// Wrap a lookup's PO; its drop waits for nothing, as the kernel frees a lookup closed unread.
     pub(crate) fn from_po(po: u64) -> Op {
         Op { po, io: false, finished: false, done: false }
     }
@@ -202,6 +202,12 @@ impl Drop for Op {
             // A full waiter queue refuses the wait for now; any other refusal is for good.
             while sys::wait(&[self.po], &mut zeroed_results::<1>(), u64::MAX) == KError::OutOfMemory as i64 {
                 idle.sleep();
+            }
+        } else if !self.io && !self.done {
+            // A wait that read the lookup installed its handle, which nothing else would close.
+            let mut r = zeroed_results::<1>();
+            if sys::wait(&[self.po], &mut r, 0) == 1 && r[0].status == 0 {
+                sys::handle_close(r[0].result);
             }
         }
         sys::handle_close(self.po);
@@ -408,6 +414,31 @@ mod tests {
         drop(op);
         assert_eq!(sys::closed_in_flight(), 0);
         assert_eq!(sys::sleeps(), 1);
+    }
+
+    /// **A dropped lookup closes the handle a wait installed**, which nothing else would close.
+    #[test]
+    fn a_dropped_lookup_closes_the_handle_a_wait_installed() {
+        sys::reset();
+        sys::script_next(0, 777, false);
+        let mut lookup = Op::from_po(sys::ns_lookup(1, b"/x", 0) as u64);
+        sys::script_next(0, 5, false);
+        let mut io = Op::submit(RawHandle(1), &read_op()).unwrap();
+        let mut first = true;
+        block_on(core::future::poll_fn(|cx| {
+            if core::mem::take(&mut first) {
+                assert!(Pin::new(&mut lookup).poll(cx).is_pending());
+            }
+            Pin::new(&mut io).poll(cx)
+        }))
+        .unwrap();
+        assert!(sys::installed(777));
+        drop(lookup);
+        assert!(!sys::installed(777));
+        sys::script_next(KError::NotFound as i32, 778, true);
+        let closes = sys::counts().2;
+        drop(Op::from_po(sys::ns_lookup(1, b"/y", 0) as u64));
+        assert_eq!(sys::counts().2, closes + 1, "a failed lookup's PO, and no handle");
     }
 
     /// **A ninth operation is polled again**, where `block_on` waited for ever on its first eight.
