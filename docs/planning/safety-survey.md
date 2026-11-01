@@ -5203,10 +5203,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   file as buffer 0, commits, ejects the stick (check-media's flow) and forces a repaint. The same
   boot would test the fix, refusing `object_type != MemoryObject` before the map. abi, soundness.
   Medium (would be high if the compositor counts as a critical service). **Fix.**
-  Fixed in `d30b02dc` and `241e6477`: an attach that is not a `MemoryObject` as long as its geometry is refused
-  before `dispatch`, which needs `INSPECT` (`rsproto-surface-ops.md`), and `Capture` asks the same.
-  `a_session_takes_memory_and_whole_bodies_test` is a client on `/dev/draw/new`, and fails without
-  it. No stick was pulled.
+  Fixed in `d30b02dc` and `241e6477`: an attach that is not a `MemoryObject` as long as its geometry
+  is refused before `dispatch`, which needs `INSPECT` (`rsproto-surface-ops.md`), and `Capture` asks
+  the same. `a_session_takes_memory_and_whole_bodies_test` is a client on `/dev/draw/new`, and fails
+  without it. No stick was pulled.
 
 - [x] **desk-d6** `userspace/libdraw/src/acquire.rs:52` — `read_info` maps the FramebufferInfo
   object and never unmaps it, and the kernel mints a fresh object per resolve
@@ -5309,8 +5309,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path: `grep -n 'buffers.retain' userspace/compositor/src/main.rs` finds only
   those three lines, none inside `handle_manager_request` (:1291-1481). ownership, soundness. Low.
   **Fix.**
-  Fixed in `d30b02dc` and `241e6477`: `drain_stack_events`, which every removal passes through, drops them
-  through `forget_window`, and the two hand-placed `retain`s go. Fails without it:
+  Fixed in `d30b02dc` and `241e6477`: `drain_stack_events`, which every removal passes through,
+  drops them through `forget_window`, and the two hand-placed `retain`s go. Fails without it:
   `a_window_that_goes_takes_its_memory_and_its_owner_s_claim`. A one-off probe under check-logout
   read 0 mappings of gone windows after a close, and 10 with the line removed.
 
@@ -5324,9 +5324,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path: server.rs:182-189, lib.rs:724-726, main.rs:1916. The existing test
   `a_short_buffer_is_skipped_rather_than_read_past_its_end` covers the readers, not this
   producer. ownership. Low. **Fix.**
-  Fixed in `d30b02dc` and `241e6477`: an attach with no memory is refused before `dispatch`, and whatever a
-  failed map replaced goes, so the stack's geometry is never over the wrong memory. A map that
-  fails on good memory stands and draws nothing, as a client cannot hear a refusal.
+  Fixed in `d30b02dc` and `241e6477`: an attach with no memory is refused before `dispatch`, and
+  whatever a failed map replaced goes, so the stack's geometry is never over the wrong memory. A map
+  that fails on good memory stands and draws nothing, as a client cannot hear a refusal.
   `a_session_takes_memory_and_whole_bodies_test` fails without it.
 
 - [x] **desk-d15** `userspace/compositor/src/main.rs:2121` — when the supervisor's control channel
@@ -5336,8 +5336,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   closes it.
   Demonstrated by path (`Control::Closed => control = 0` with no `SYS_HANDLE_CLOSE`). ownership.
   Low. **Fix.**
-  Fixed in `660b2e6c` and `65ffef4d`: `control::recv` closes it, for all ten callers, and auth-service
-  closes its endpoint the same way. Fails without it: `only_a_channel_closed_for_good_is_closed`.
+  Fixed in `660b2e6c` and `65ffef4d`: `control::recv` closes it, for all ten callers, and
+  auth-service closes its endpoint the same way. Fails without it:
+  `only_a_channel_closed_for_good_is_closed`.
 
 - [x] **desk-d16** `userspace/compositor/src/server.rs:113` — `static mut TITLE_TRUNCATED_LOGGED`
   lives in the compositor library and is read and written without synchronisation by the safe

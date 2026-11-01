@@ -431,3 +431,15 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-01	413	efbbb67b	12	rules-and-docs	optional	demonstrated	fixed	ebff95d5	sentence re-wrapped at 100
 2026-11-01	413	efbbb67b	13	architecture	optional	demonstrated	fixed	ebff95d5	spec names the dependency on no grant giving BIND_NAMESPACE
 2026-11-01	413	efbbb67b	14	architecture	optional	demonstrated	fixed	8089064a	(a) abi-sync-check pairs HOME_MAX, fails at 129; boot test binds each home, fails naming /home/../a; (b) in ff45350a: Secret<N> private array, derefs to a slice, so *s and .0 no longer copy out
+2026-11-01	414	a67d5be4	1	logic+architecture	worth-fixing	demonstrated	fixed	241e6477	then_some built the Mapping eagerly; probe under a forced map failure read Drop unmapping -30; with then it reads nothing
+2026-11-01	414	a67d5be4	2	error-paths+logic+architecture	worth-fixing	demonstrated	fixed	241e6477	forced map failure of buffer 1 froze the release greeter at redraw 2; a failed map now stands and draws nothing, same run logs in after 55 redraws; check-login still fails later on a thumbnail count, correctly; attach stays unanswered
+2026-11-01	414	a67d5be4	3	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	65ffef4d	recv takes &mut u64 and zeroes it, ten hand-written arms go; only_a_channel_closed_for_good_is_closed fails if the caller's copy survives
+2026-11-01	414	a67d5be4	4	architecture	worth-fixing	demonstrated	fixed	241e6477	refuse_attach says NotFound first, spec states what is refused; boot test names both, reverted
+2026-11-01	414	a67d5be4	5	tests	worth-fixing	unverified	fixed	241e6477	attach decisions generic in server.rs; removing the Applied guard, the replaced-memory retain or forget_window's retain each fails a host test; the bin's calls to them are by reading
+2026-11-01	414	a67d5be4	6	error-paths+architecture	optional	unverified	fixed	241e6477	one-off from ui-testclient, the image's real manager: capture into a writable file TAKEN without holds, refused with it
+2026-11-01	414	a67d5be4	7	error-paths	optional	unverified	deferred		under TODO(recv-kerror), read only; needs the registration gone, which takes service-mgr with it, and P7's receive and WaitSet
+2026-11-01	414	a67d5be4	8	tests	optional	demonstrated	fixed	241e6477	20,000 collisions: a lost swap fails natively in under a second, passes under Miri; first version hung on failure, caught by its own control
+2026-11-01	414	a67d5be4	9	tests	optional	unverified	declined		bin code with no host reach; the cap is unreachable today and the closes were shown by one-off probes
+2026-11-01	414	a67d5be4	10	rules-and-docs+tests	optional	unverified	declined		reviewers found it unreachable; the old inline read also defaulted to 0; every boot runs both wrappers
+2026-11-01	414	a67d5be4	11	rules-and-docs	optional	unverified	fixed	241e6477	SAFETY comment says why the &mut is unique; comment only
+2026-11-01	414	a67d5be4	12	architecture	optional	demonstrated	fixed	65ffef4d	channel_create returns Result<_, KError>, callers take .ok(); by signature
