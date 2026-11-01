@@ -49,6 +49,29 @@ pub fn scrub(bytes: &mut [u8]) {
     }
 }
 
+/// **Bytes [`scrub`]bed when dropped**, so a password, or a buffer one passed through, is zeroed on
+/// every way out of the scope that holds it. Neither `Clone` nor `Debug`.
+pub struct Secret<B: AsMut<[u8]>>(pub B);
+
+impl<B: AsMut<[u8]>> Drop for Secret<B> {
+    fn drop(&mut self) {
+        scrub(self.0.as_mut());
+    }
+}
+
+impl<B: AsMut<[u8]>> core::ops::Deref for Secret<B> {
+    type Target = B;
+    fn deref(&self) -> &B {
+        &self.0
+    }
+}
+
+impl<B: AsMut<[u8]>> core::ops::DerefMut for Secret<B> {
+    fn deref_mut(&mut self) -> &mut B {
+        &mut self.0
+    }
+}
+
 #[cfg(test)]
 mod scrub_tests {
     #[test]
@@ -56,5 +79,16 @@ mod scrub_tests {
         let mut b = [0xA5u8; 9];
         super::scrub(&mut b[1..8]);
         assert_eq!(b, [0xA5, 0, 0, 0, 0, 0, 0, 0, 0xA5]);
+    }
+
+    #[test]
+    fn a_dropped_secret_is_zeroed() {
+        let mut s = core::mem::MaybeUninit::new(super::Secret([0xA5u8; 9]));
+        // SAFETY: dropped once, in place; the bytes stay readable as the plain data they are.
+        let bytes = unsafe {
+            core::ptr::drop_in_place(s.as_mut_ptr());
+            *(s.as_ptr() as *const [u8; 9])
+        };
+        assert_eq!(bytes, [0; 9]);
     }
 }

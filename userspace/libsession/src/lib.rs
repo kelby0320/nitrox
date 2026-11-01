@@ -11,20 +11,17 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use libkern::channel_recv_raw;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::auth::{build_authenticate_request, parse_authenticate_reply};
-use librsproto::{OP_AUTHENTICATE, decode, encode};
+use librsproto::{OP_AUTHENTICATE, decode};
 
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 /// The largest IPC message this crate sends or receives.
 const MSG_LEN: usize = 4096;
 
-/// **This crate's own message buffers**, not the caller's, so the two conversations cannot collide.
-static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
@@ -168,103 +165,39 @@ pub struct Built {
 /// Authenticate `(user, pass)` against auth-service over `auth_ch`, copying the home path into
 /// `home_out`. `Some(home_len)` if AUTHENTICATED, `None` if DENIED or on any protocol error.
 pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> Option<usize> {
-    let mut body = [0u8; 512];
-    let body_len = build_authenticate_request(&mut body, user, pass);
-    // SAFETY: SEND_MSG is a valid 4 KiB buffer; the envelope goes at offset 24.
-    let rs_len =
-        body_len.and_then(|n| unsafe { encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_AUTHENTICATE, 1, 0, &body[..n], 0) });
-    // **Both copies of the password go as soon as it is sent**, sent or not: `SEND_MSG` outlives
-    // this frame, and a supervisor lives as long as the machine.
-    let Some(rs_len) = rs_len else {
-        scrub(&mut body);
-        return None;
-    };
-    // SAFETY: stamp the IpcMsg header (payload_len @4, handle_count @8 = 0) and send.
-    let sr = unsafe {
-        SEND_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        SEND_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            auth_ch,
-            (&raw const SEND_MSG) as u64,
-            (&raw const SEND_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    scrub(&mut body);
-    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: the crate's buffer; the kernel copied the message during the send.
-    unsafe {
-        scrub(&mut *(&raw mut SEND_MSG))
-    };
-    if sr != 0 {
-        return None;
-    }
-    if !wait_one(auth_ch) {
-        return None;
-    }
-    // SAFETY: single-threaded supervisor; `RECV_MSG` is lent for the call.
-    let _sent = unsafe { channel_recv_raw(auth_ch, &raw mut RECV_MSG) }.ok()?;
-    // SAFETY: read payload_len + form a bounded slice over the reply payload.
-    let (result_ok, home_len) = unsafe {
-        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let reply = core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
-        match decode(reply) {
-            Ok(m) if m.op == OP_AUTHENTICATE => match parse_authenticate_reply(m.body) {
-                Some(r) if r.is_authenticated() => {
-                    let n = r.home.len().min(home_out.len());
-                    home_out[..n].copy_from_slice(&r.home[..n]);
-                    (true, n)
-                }
-                _ => (false, 0),
-            },
-            _ => (false, 0),
-        }
-    };
-    if result_ok { Some(home_len) } else { None }
+    // **Both copies of the password go on every return**: a supervisor's stack outlives the call.
+    let mut body = Secret([0u8; 512]);
+    let n = build_authenticate_request(&mut *body, user, pass)?;
+    let mut buf = Secret([0u8; MSG_LEN]);
+    let reply = call(auth_ch, OP_AUTHENTICATE, &body[..n], &mut buf)?;
+    home_of(reply, home_out)
 }
 
-/// One request to the view broker on `ch`; `None` if it failed or the broker answered an error.
-fn views_call(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
-    // SAFETY: SEND_MSG is a valid buffer; single-threaded supervisor.
-    let rs_len = unsafe { encode(&mut SEND_MSG[PAYLOAD_OFF..], op, 1, 0, body, 0)? };
-    // SAFETY: as above; a valid endpoint and a zero-handle send.
-    let sr = unsafe {
-        SEND_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        SEND_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const SEND_MSG) as u64,
-            (&raw const SEND_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    if sr != 0 || !wait_one(ch) {
-        return None;
-    }
-    // SAFETY: single-threaded supervisor; `RECV_MSG` is lent for the call.
-    let _sent = unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) }.ok()?;
-    // SAFETY: bounded read of the reply the kernel just wrote.
-    let reply = unsafe {
-        let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            len.min(MSG_LEN - PAYLOAD_OFF),
-        )
-    };
+/// The home an `Authenticate` reply names, copied into `home_out`; `None` unless AUTHENTICATED with
+/// a home that fits, which is never cut short.
+fn home_of(reply: &[u8], home_out: &mut [u8]) -> Option<usize> {
     let m = decode(reply).ok()?;
-    if m.op != op || m.is_error() {
-        return None;
-    }
-    let n = m.body.len().min(out.len());
-    out[..n].copy_from_slice(&m.body[..n]);
-    Some(n)
+    let r = parse_authenticate_reply(m.body).filter(|r| r.is_authenticated())?;
+    home_out.get_mut(..r.home.len())?.copy_from_slice(r.home);
+    Some(r.home.len())
+}
+
+/// The request id of the next [`call`], so one left unanswered never answers a later one.
+static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+/// One request on `ch`, its own id, through `buf`: the reply's rsproto payload.
+fn call<'a>(ch: u64, op: u16, body: &[u8], buf: &'a mut [u8; MSG_LEN]) -> Option<&'a [u8]> {
+    let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+    let n = librsproto::session::round_trip(ch, &mut buf[..], id, op, body).ok()?;
+    Some(&buf[PAYLOAD_OFF..PAYLOAD_OFF + n])
+}
+
+/// One request to the view broker on `ch`: `None` if it failed, was refused or will not fit `out`.
+fn views_call(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut buf = [0u8; MSG_LEN];
+    let m = decode(call(ch, op, body, &mut buf)?).ok().filter(|m| !m.is_error())?;
+    out.get_mut(..m.body.len())?.copy_from_slice(m.body);
+    Some(m.body.len())
 }
 
 /// Open a session with the view broker for `principal` over `sup`, writing its base `/s/<id>` into
@@ -1094,7 +1027,30 @@ pub fn spawn_leader(
 
 #[cfg(test)]
 mod tests {
-    use super::blk_binding_index;
+    use super::{OP_AUTHENTICATE, blk_binding_index, home_of};
+    use librsproto::auth::{AUTH_RESULT_AUTHENTICATED, build_authenticate_reply, build_denied_reply};
+
+    /// An `Authenticate` reply as auth-service sends it, from a reply body built by `make`.
+    fn reply(make: impl Fn(&mut [u8]) -> Option<usize>) -> std::vec::Vec<u8> {
+        let mut body = [0u8; 512];
+        let n = make(&mut body).unwrap();
+        let mut out = std::vec![0u8; 600];
+        let len = librsproto::encode(&mut out, OP_AUTHENTICATE, 1, librsproto::RS_FLAG_REPLY, &body[..n], 0).unwrap();
+        out.truncate(len);
+        out
+    }
+
+    /// A home is copied whole or refused: one past the caller's buffer is never cut short.
+    #[test]
+    fn a_home_that_does_not_fit_is_refused() {
+        let home = [b'h'; 300];
+        let ok = reply(|b| build_authenticate_reply(b, AUTH_RESULT_AUTHENTICATED, b"alice", &home));
+        let (mut short, mut fits) = ([0u8; 299], [0u8; 300]);
+        assert_eq!(home_of(&ok, &mut short), None);
+        assert_eq!(home_of(&ok, &mut fits), Some(300));
+        assert_eq!(fits, home);
+        assert_eq!(home_of(&reply(build_denied_reply), &mut fits), None);
+    }
 
     /// A binding is a device only at exactly `/dev/blk/<n>`; lookalikes must not be (un)bound.
     #[test]
