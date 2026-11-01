@@ -10,6 +10,8 @@
 //! otherwise the authority to create windows would be the authority to destroy anyone else's.
 
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering::Relaxed;
 
 use librsproto::surface::{
     ConfigureEvent, OP_ATTACH_BUFFER, OP_COMMIT, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_SET_TITLE,
@@ -110,17 +112,18 @@ pub enum SurfaceError {
 }
 
 /// Whether an over-long title has already been reported.
-static mut TITLE_TRUNCATED_LOGGED: bool = false;
+static TITLE_TRUNCATED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this is the first over-long title.
+fn first_truncation() -> bool {
+    !TITLE_TRUNCATED_LOGGED.swap(true, Relaxed)
+}
 
 /// Report the **first** over-long title only: a serial write per request is too costly on this
 /// path, and one line explains a title that came back shorter than it went out.
 fn note_title_truncated(len: usize) {
-    // SAFETY: single-threaded server; the same access pattern as the input diagnostics.
-    unsafe {
-        if TITLE_TRUNCATED_LOGGED {
-            return;
-        }
-        TITLE_TRUNCATED_LOGGED = true;
+    if !first_truncation() {
+        return;
     }
     let mut l = libkern::debug::Line::new();
     l.s(b"compositor: title of ")
@@ -318,6 +321,12 @@ fn parent_of(role: &librsproto::surface::Role) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at_most_one_thread_reports_a_title_truncated() {
+        let (a, b) = (std::thread::spawn(first_truncation), std::thread::spawn(first_truncation));
+        assert!(!(a.join().unwrap() && b.join().unwrap()));
+    }
 
     #[track_caller]
     fn assert_applied(o: Outcome, release: Option<(u32, u32)>) {

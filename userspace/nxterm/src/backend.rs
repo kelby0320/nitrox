@@ -8,8 +8,8 @@
 use libkern::abi::SpawnArgs;
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_TRANSFER, RIGHT_WAIT};
 use libkern::{
-    SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, kprint,
-    syscall1, syscall4, syscall5,
+    SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, kprint, syscall1, syscall4,
+    syscall5,
 };
 use librsproto::{OP_TTY_ATTACH_BACKEND, OP_TTY_INPUT, OP_TTY_OUTPUT, RS_FLAG_REPLY, decode, encode};
 
@@ -23,8 +23,6 @@ static mut MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; 4] = [0; 4];
 static mut WAIT_RESULTS: [u8; 24 * 4] = [0; 24 * 4];
-static mut CH0: u64 = 0;
-static mut CH1: u64 = 0;
 
 /// The terminal half this process keeps: the backend channel.
 pub struct Backend {
@@ -89,13 +87,7 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
 
 /// A connected channel pair, or `None`.
 fn make_channel() -> Option<(u64, u64)> {
-    // SAFETY: CH0/CH1 are valid writable out-params.
-    let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CH0) as u64, (&raw mut CH1) as u64, 8, 0) };
-    if r != 0 {
-        return None;
-    }
-    // SAFETY: the kernel wrote both out-params.
-    Some(unsafe { (CH0, CH1) })
+    libkern::channel_create(8)
 }
 
 /// Send one rsproto message on `ch`, optionally moving a handle.

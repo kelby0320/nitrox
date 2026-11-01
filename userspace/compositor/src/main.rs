@@ -21,6 +21,8 @@ use compositor::manager::{self, MgrOutcome};
 use compositor::outbox::{MgrEvent, MgrOutbox, Outbound, Outbox};
 use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
 use compositor::{BufferSource, WindowStack};
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::Relaxed;
 use libdraw::format::Rgb;
 use libdraw::framebuffer::RawFramebuffer;
 use libdraw::geom::{Point, Rect};
@@ -31,8 +33,8 @@ use libkern::debug::Line;
 use libkern::error::KError;
 use libkern::{Received, channel_recv_raw};
 use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE,
-    SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
+    SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
+    SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
@@ -73,8 +75,6 @@ const MAX_LOGGED_ROUTES: u32 = 8;
 /// logged. Generous, since any gate needs a handful, but not absent: serial is slow.
 const MAX_LOGGED_INPUT_DIAGS: u32 = 256;
 
-static mut CTRL_OUT0: u64 = 0;
-static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
@@ -82,9 +82,8 @@ static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
 /// The manager's channel, or `0`. One, not a table: two managers placing windows race with no
 /// arbiter, so a second resolve is refused.
 static mut MANAGER_CH: u64 = 0;
-static mut ROUTES_LOGGED: u32 = 0;
-static mut INPUT_DIAGS_LOGGED: u32 = 0;
-static mut CLOCK_BUF: u64 = 0;
+static ROUTES_LOGGED: AtomicU32 = AtomicU32::new(0);
+static INPUT_DIAGS_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 /// How long to sleep before retrying a parked message, in nanoseconds.
 ///
@@ -166,21 +165,11 @@ impl BufferSource for Server {
 const SESSION_QUEUE_DEPTH: u64 = 16;
 
 fn now_ns() -> u64 {
-    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: on success the kernel wrote the ns count.
-    unsafe { (&raw const CLOCK_BUF).read() }
+    libkern::clock_read(CLOCK_MONOTONIC).unwrap_or(0)
 }
 
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
-    // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr =
-        unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, depth, 0) };
-    if cr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel wrote both endpoint handles.
-    Some(unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) })
+    libkern::channel_create(depth)
 }
 
 fn send_ready(control: u64, kernel_end: u64) -> bool {
@@ -325,13 +314,11 @@ fn log_route(rec: &Outbound) {
     // the only evidence the compositor acted (`check-login` waits on `drop win=`, `dismissed
     // win=`).
     if !matches!(rec, Outbound::Dropped { .. } | Outbound::Dismissed { .. }) {
-        // SAFETY: single-threaded server; this counter is touched only from the serve loop.
-        let n = unsafe { ROUTES_LOGGED };
+        let n = ROUTES_LOGGED.load(Relaxed);
         if n > MAX_LOGGED_ROUTES {
             return;
         }
-        // SAFETY: as above.
-        unsafe { ROUTES_LOGGED = n + 1 };
+        ROUTES_LOGGED.store(n + 1, Relaxed);
         if n == MAX_LOGGED_ROUTES {
             kprint(b"compositor: (further routed input not logged)\n");
             return;
@@ -891,158 +878,152 @@ fn route_one_batch(
     msg: &[u8],
     now: u64,
 ) {
-    // SAFETY: the input-diagnostics counter below is a `static mut` touched only from the serve
-    // loop of this single-threaded server.
-    unsafe {
-        let Ok(m) = decode(msg) else {
-            return;
+    let Ok(m) = decode(msg) else {
+        return;
+    };
+    if m.op != librsproto::OP_INPUT_EVENTS {
+        return;
+    }
+    for raw in m.body.as_chunks::<INPUT_EVENT_LEN>().0 {
+        let Some(ev) = InputEvent::read(raw) else {
+            continue;
         };
-        if m.op != librsproto::OP_INPUT_EVENTS {
-            return;
-        }
-        for raw in m.body.as_chunks::<INPUT_EVENT_LEN>().0 {
-            let Some(ev) = InputEvent::read(raw) else {
-                continue;
-            };
-            let mut logical = [libinput::Logical::Dropped { time_ns: 0 }; libinput::MAX_PER_GROUP];
-            let n = srv.interp.feed(ev, &mut logical);
-            for l in &logical[..n] {
-                let routed = srv.router.route(l, &mut srv.stack, out);
-                if let Some(r) = routed.restacked {
+        let mut logical = [libinput::Logical::Dropped { time_ns: 0 }; libinput::MAX_PER_GROUP];
+        let n = srv.interp.feed(ev, &mut logical);
+        for l in &logical[..n] {
+            let routed = srv.router.route(l, &mut srv.stack, out);
+            if let Some(r) = routed.restacked {
+                damage.push(r);
+            }
+            if let Some(r) = routed.moved {
+                damage.push(r);
+            }
+            // The outline's damage is its edges: repainting the union per motion starves input.
+            if let Some(o) = routed.outline {
+                srv.outline = o.now;
+                for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
                     damage.push(r);
                 }
-                if let Some(r) = routed.moved {
-                    damage.push(r);
-                }
-                // The outline's damage is its edges: repainting the union per motion starves input.
-                if let Some(o) = routed.outline {
-                    srv.outline = o.now;
-                    for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
-                        damage.push(r);
-                    }
-                }
-                // A press landed outside a popup, so its owner is told. Reported, not acted on:
-                // whether a dismissal ends what it offered is the client's to decide.
-                if let Some(window) = routed.dismissed
-                    && let Some(slot) = srv.session_of(window)
-                {
-                    // `log_route` and `enqueue`, as at every site here, or no gate can see it
-                    // (`check-login`).
-                    let rec = Outbound::Dismissed { window };
-                    log_route(&rec);
-                    enqueue(srv, slot, rec);
-                }
-                // One event for the gesture, at the release; the manager answers with a
-                // `Configure`, so a window's geometry has one path.
-                if let Some(e) = routed.ended {
-                    let (a, f) = (e.asked, e.from);
-                    Line::new()
-                        .s(b"compositor: gesture on window ")
-                        .u(e.window as u64)
-                        .s(b" ended at ")
-                        .i(a.origin.x as i64)
-                        .s(b",")
-                        .i(a.origin.y as i64)
-                        .s(b" ")
-                        .u(a.size.w as u64)
-                        .s(b"x")
-                        .u(a.size.h as u64)
-                        .end();
-                    let rect = |r: libdraw::geom::Rect| ConfigureEvent {
-                        window: e.window,
-                        width: r.size.w,
-                        height: r.size.h,
-                        x: r.origin.x,
-                        y: r.origin.y,
-                    };
-                    let flags = if e.moved { librsproto::surface::DRAG_ENDED_MOVED } else { 0 };
-                    let ended = librsproto::surface::MgrDragEnded { asked: rect(a), from: rect(f), flags };
-                    mgr_emit(srv, MgrEvent::DragEnded(ended));
-                }
-                // Drained per event: a chord and the window events it causes must reach the manager
-                // in order.
-                for hk in srv.router.take_hotkeys() {
-                    mgr_emit(srv, MgrEvent::Hotkey(hk));
-                }
-                // Diagnostics always, not through `log_route`, whose cap is spent by the time a
-                // gate moves the cursor and which never sees a press that hit no window. A dropped
-                // batch too: nothing else prints a `SYN_DROPPED`. `Super` arriving separates the
-                // host keeping the keystroke from the guest matching no chord; the modifier only,
-                // never the keycode, which would log passwords.
-                // `check-input`, `check-login` and `check-install` match the press and Super lines.
-                let meta_change = match *l {
-                    libinput::Logical::Key { keycode, pressed, .. }
-                        if keycode == libkern::abi::KEY_LEFTMETA || keycode == libkern::abi::KEY_RIGHTMETA =>
-                    {
-                        Some(pressed)
-                    }
-                    _ => None,
+            }
+            // A press landed outside a popup, so its owner is told. Reported, not acted on:
+            // whether a dismissal ends what it offered is the client's to decide.
+            if let Some(window) = routed.dismissed
+                && let Some(slot) = srv.session_of(window)
+            {
+                // `log_route` and `enqueue`, as at every site here, or no gate can see it
+                // (`check-login`).
+                let rec = Outbound::Dismissed { window };
+                log_route(&rec);
+                enqueue(srv, slot, rec);
+            }
+            // One event for the gesture, at the release; the manager answers with a
+            // `Configure`, so a window's geometry has one path.
+            if let Some(e) = routed.ended {
+                let (a, f) = (e.asked, e.from);
+                Line::new()
+                    .s(b"compositor: gesture on window ")
+                    .u(e.window as u64)
+                    .s(b" ended at ")
+                    .i(a.origin.x as i64)
+                    .s(b",")
+                    .i(a.origin.y as i64)
+                    .s(b" ")
+                    .u(a.size.w as u64)
+                    .s(b"x")
+                    .u(a.size.h as u64)
+                    .end();
+                let rect = |r: libdraw::geom::Rect| ConfigureEvent {
+                    window: e.window,
+                    width: r.size.w,
+                    height: r.size.h,
+                    x: r.origin.x,
+                    y: r.origin.y,
                 };
-                // Releases as well as presses, so a lost release is told from a client that ignored
-                // the click (`check-login`). A button is not a keystroke.
-                let diag = meta_change.is_some()
-                    || matches!(*l, libinput::Logical::Button { .. } | libinput::Logical::Dropped { .. });
-                // Inside the enclosing `unsafe` block: single-threaded, touched only from the serve
-                // loop.
-                let logged = INPUT_DIAGS_LOGGED;
-                if diag && logged < MAX_LOGGED_INPUT_DIAGS {
-                    INPUT_DIAGS_LOGGED = logged + 1;
-                    let mut pl = Line::new();
-                    match *l {
-                        _ if meta_change == Some(true) => {
-                            pl.s(b"compositor: Super down");
-                        }
-                        _ if meta_change == Some(false) => {
-                            pl.s(b"compositor: Super up");
-                        }
-                        // A press whose release never appears was QEMU holding it (its PS/2 queue
-                        // holds a packet until the next injected event); the gates flush with
-                        // `expect_after_pointer`.
-                        libinput::Logical::Dropped { .. } => {
-                            pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
-                        }
-                        _ => {
-                            let p = srv.router.pointer();
-                            let down = matches!(*l, libinput::Logical::Button { pressed: true, .. });
-                            pl.s(if down {
-                                b"compositor: press at x=".as_slice()
-                            } else {
-                                b"compositor: release at x=".as_slice()
-                            })
-                            .i(p.x as i64)
-                            .s(b" y=")
-                            .i(p.y as i64);
-                            match srv.router.grab() {
-                                Some(w) => {
-                                    pl.s(b" win=").u(w as u64);
-                                }
-                                None => {
-                                    pl.s(b" win=none");
-                                }
+                let flags = if e.moved { librsproto::surface::DRAG_ENDED_MOVED } else { 0 };
+                let ended = librsproto::surface::MgrDragEnded { asked: rect(a), from: rect(f), flags };
+                mgr_emit(srv, MgrEvent::DragEnded(ended));
+            }
+            // Drained per event: a chord and the window events it causes must reach the manager
+            // in order.
+            for hk in srv.router.take_hotkeys() {
+                mgr_emit(srv, MgrEvent::Hotkey(hk));
+            }
+            // Diagnostics always, not through `log_route`, whose cap is spent by the time a
+            // gate moves the cursor and which never sees a press that hit no window. A dropped
+            // batch too: nothing else prints a `SYN_DROPPED`. `Super` arriving separates the
+            // host keeping the keystroke from the guest matching no chord; the modifier only,
+            // never the keycode, which would log passwords.
+            // `check-input`, `check-login` and `check-install` match the press and Super lines.
+            let meta_change = match *l {
+                libinput::Logical::Key { keycode, pressed, .. }
+                    if keycode == libkern::abi::KEY_LEFTMETA || keycode == libkern::abi::KEY_RIGHTMETA =>
+                {
+                    Some(pressed)
+                }
+                _ => None,
+            };
+            // Releases as well as presses, so a lost release is told from a client that ignored
+            // the click (`check-login`). A button is not a keystroke.
+            let diag = meta_change.is_some()
+                || matches!(*l, libinput::Logical::Button { .. } | libinput::Logical::Dropped { .. });
+            let logged = INPUT_DIAGS_LOGGED.load(Relaxed);
+            if diag && logged < MAX_LOGGED_INPUT_DIAGS {
+                INPUT_DIAGS_LOGGED.store(logged + 1, Relaxed);
+                let mut pl = Line::new();
+                match *l {
+                    _ if meta_change == Some(true) => {
+                        pl.s(b"compositor: Super down");
+                    }
+                    _ if meta_change == Some(false) => {
+                        pl.s(b"compositor: Super up");
+                    }
+                    // A press whose release never appears was QEMU holding it (its PS/2 queue
+                    // holds a packet until the next injected event); the gates flush with
+                    // `expect_after_pointer`.
+                    libinput::Logical::Dropped { .. } => {
+                        pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
+                    }
+                    _ => {
+                        let p = srv.router.pointer();
+                        let down = matches!(*l, libinput::Logical::Button { pressed: true, .. });
+                        pl.s(if down {
+                            b"compositor: press at x=".as_slice()
+                        } else {
+                            b"compositor: release at x=".as_slice()
+                        })
+                        .i(p.x as i64)
+                        .s(b" y=")
+                        .i(p.y as i64);
+                        match srv.router.grab() {
+                            Some(w) => {
+                                pl.s(b" win=").u(w as u64);
+                            }
+                            None => {
+                                pl.s(b" win=none");
                             }
                         }
                     }
-                    pl.end();
                 }
-                // Repeat follows the physical key, except a consumed chord: `fire_repeat` bypasses
-                // the router and would type it into the focused window.
-                if let libinput::Logical::Key { keycode, pressed, modifiers, locks, .. } = *l
-                    && !routed.consumed
-                {
-                    srv.repeat = compositor::Repeat::after_key(
-                        srv.repeat,
-                        keycode,
-                        pressed,
-                        modifiers,
-                        locks,
-                        srv.stack.focus_candidate(),
-                        now,
-                    );
-                }
-                // A `SYN_DROPPED` makes the held-key set a guess, so a repeat from it is too.
-                if matches!(l, libinput::Logical::Dropped { .. }) {
-                    srv.repeat = None;
-                }
+                pl.end();
+            }
+            // Repeat follows the physical key, except a consumed chord: `fire_repeat` bypasses
+            // the router and would type it into the focused window.
+            if let libinput::Logical::Key { keycode, pressed, modifiers, locks, .. } = *l
+                && !routed.consumed
+            {
+                srv.repeat = compositor::Repeat::after_key(
+                    srv.repeat,
+                    keycode,
+                    pressed,
+                    modifiers,
+                    locks,
+                    srv.stack.focus_candidate(),
+                    now,
+                );
+            }
+            // A `SYN_DROPPED` makes the held-key set a guess, so a repeat from it is too.
+            if matches!(l, libinput::Logical::Dropped { .. }) {
+                srv.repeat = None;
             }
         }
     }
@@ -1971,10 +1952,7 @@ fn handle_session_request(
                 .is_some_and(|w| matches!(w.role, librsproto::surface::Role::Popup { .. }));
             // SAFETY: reading our own manager slot.
             if sent && !placed_by_creator && unsafe { MANAGER_CH } != 0 {
-                let mut now: u64 = 0;
-                // SAFETY: a valid out-pointer for one u64.
-                unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
-                srv.pending_configure.push((configure.window, now.saturating_add(CONFIGURE_DEADLINE_NS)));
+                srv.pending_configure.push((configure.window, now_ns().saturating_add(CONFIGURE_DEADLINE_NS)));
             } else {
                 let mut cfg = [0u8; core::mem::size_of::<ConfigureEvent>()];
                 srv.stack.mark_configured(configure.window);

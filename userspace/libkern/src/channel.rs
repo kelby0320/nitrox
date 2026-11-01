@@ -4,8 +4,9 @@
 //! closes, when it drops, every handle not taken from it: a receiver forgets nothing by ignoring it.
 
 use crate::abi::{CLOCK_MONOTONIC, IPC_HANDLE_MAX, IPC_MSG_SIZE};
+use crate::clock::clock_read;
 use crate::error::KError;
-use crate::syscall::{SYS_CHANNEL_RECV, SYS_CLOCK_READ, SYS_WAIT, syscall2, syscall4};
+use crate::syscall::{SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_WAIT, syscall4};
 
 /// The handles one message brought, closed when this drops unless taken.
 pub struct Received {
@@ -86,11 +87,18 @@ const HELD_PAUSE_NS: u64 = 10_000_000;
 
 /// Wait out a [`RecvFailure::Held`], on no handles, which the kernel never refuses.
 pub fn pause_held() {
-    let mut now = 0u64;
-    // SAFETY: `now` is a writable u64 out-param on this frame.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    let now = clock_read(CLOCK_MONOTONIC).unwrap_or(0);
     // SAFETY: no handles and no results, so the kernel reads and writes neither.
     unsafe { syscall4(SYS_WAIT, 0, 0, 0, now.saturating_add(HELD_PAUSE_NS)) };
+}
+
+/// Create a connected channel pair whose rings hold `depth` messages each. `None` if the kernel
+/// refused.
+pub fn channel_create(depth: u64) -> Option<(u64, u64)> {
+    let (mut a, mut b) = (0u64, 0u64);
+    // SAFETY: `a` and `b` are writable u64 out-params on this frame.
+    let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, depth, 0) };
+    (r == 0).then_some((a, b))
 }
 
 /// Receive one message on `ch` into `msg`. `Err` with the syscall's status: `WouldBlock` for an

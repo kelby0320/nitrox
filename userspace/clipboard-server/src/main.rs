@@ -49,8 +49,6 @@ static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
-static mut CH_OUT0: u64 = 0;
-static mut CH_OUT1: u64 = 0;
 static mut REPLY_BODY: [u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES] = [0; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES];
 
 fn kprint(msg: &[u8]) {
@@ -68,13 +66,7 @@ fn exit(code: i64) -> ! {
 
 /// Create a connected channel pair (depth 4). Returns `(client_end, serve_end)`.
 fn make_channel() -> Option<(u64, u64)> {
-    // SAFETY: CH_OUT0/CH_OUT1 are valid writable out-params.
-    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0) };
-    if cr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel wrote both endpoint handles.
-    Some(unsafe { ((&raw const CH_OUT0).read(), (&raw const CH_OUT1).read()) })
+    libkern::channel_create(4)
 }
 
 fn send_ready(control: u64, client_end: u64) -> bool {

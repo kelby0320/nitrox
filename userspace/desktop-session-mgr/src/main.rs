@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::Relaxed;
 use desktop_session_mgr::{GREETER_H, GREETER_PITCH, GREETER_W, Greeter, KEY_ENTER, greeter_theme};
 use libdraw::text::Font;
 use libkern::debug::Line;
@@ -24,7 +26,7 @@ const BUFFERS: usize = 2;
 
 const MAX_REDRAWS_LOGGED: u32 = 512;
 
-static mut REDRAWS: u32 = 0;
+static REDRAWS: AtomicU32 = AtomicU32::new(0);
 
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
@@ -453,12 +455,10 @@ fn present(
     // A redraw counter paces the gate between keystrokes. It is a count, never the fields:
     // reporting what was typed would put a password on the console, and its length would leak it
     // more slowly. Capped like the compositor's press diagnostics.
-    // SAFETY: single-threaded supervisor; one redraw at a time.
-    unsafe {
-        if REDRAWS < MAX_REDRAWS_LOGGED {
-            REDRAWS += 1;
-            Line::new().s(b"desktop-session-mgr: greeter redraw ").u(REDRAWS as u64).end();
-        }
+    let redraws = REDRAWS.load(Relaxed);
+    if redraws < MAX_REDRAWS_LOGGED {
+        REDRAWS.store(redraws + 1, Relaxed);
+        Line::new().s(b"desktop-session-mgr: greeter redraw ").u(redraws as u64 + 1).end();
     }
     ok
 }

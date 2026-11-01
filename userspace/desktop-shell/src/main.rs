@@ -125,12 +125,12 @@ fn stop() -> ! {
 fn stop_asked(notif: u64) -> bool {
     let mut asked = false;
     loop {
-        // SAFETY: NOTIF is a valid 64-byte writable out-param.
-        if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) } != 0 {
+        let mut n = Notification::zeroed();
+        // SAFETY: `n` is a valid 64-byte writable out-param on this frame.
+        if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut n) as u64, 0, 0) } != 0 {
             return asked;
         }
-        // SAFETY: the kernel wrote a Notification into NOTIF.
-        asked |= unsafe { (&raw const NOTIF.kind).read() } == libkern::abi::KIND_TERMINATE_REQUESTED;
+        asked |= n.kind == libkern::abi::KIND_TERMINATE_REQUESTED;
     }
 }
 
@@ -198,7 +198,6 @@ static mut RECV_MSG: [u8; 4096] = [0; 4096];
 /// while a power action runs.
 static mut WAIT_HANDLES: [u64; 5 + MAX_DESKTOP_SESSIONS] = [0; 5 + MAX_DESKTOP_SESSIONS];
 static mut SHELL_NOTIF: u64 = 0;
-static mut NOTIF: Notification = Notification::zeroed();
 /// One 24-byte `IoResult` per handle in the set: `sys_wait` takes no length and writes one record
 /// per signalled handle (`kernel/src/syscall/table.rs`), so a smaller buffer overruns a static.
 static mut WAIT_RESULTS: [u8; 24 * (5 + MAX_DESKTOP_SESSIONS)] = [0; 24 * (5 + MAX_DESKTOP_SESSIONS)];
@@ -1454,22 +1453,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     }
 }
 
-static mut CLOCK_BUF: u64 = 0;
-
 /// The monotonic clock, in nanoseconds, or `None` if it will not answer.
 ///
 /// Every caller treats `None` as nothing to do this round, not zero: a deadline nothing can
 /// evaluate is a wait that returns immediately for ever, a spin harmful machine-wide.
 fn now_ns() -> Option<u64> {
-    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    let r = unsafe {
-        libkern::syscall::syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64)
-    };
-    if r != 0 {
-        return None;
-    }
-    // SAFETY: the call succeeded, so the kernel wrote the ns count.
-    Some(unsafe { (&raw const CLOCK_BUF).read() })
+    libkern::clock_read(libkern::abi::CLOCK_MONOTONIC).ok()
 }
 
 #[panic_handler]

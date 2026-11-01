@@ -215,18 +215,10 @@ pub(super) static mut DESKTOP_SESSIONS: [u64; MAX_DESKTOP_SESSIONS] = [0; MAX_DE
 static mut DS_MSG: [u8; 4096] = [0; 4096];
 static mut DS_REPLY: [u8; 4096] = [0; 4096];
 static mut DS_REPLY_HANDLES: [u64; 4] = [0; 4];
-static mut CH_OUT0: u64 = 0;
-static mut CH_OUT1: u64 = 0;
 
 /// Create a channel pair. `(client_end, server_end)`.
 pub(super) fn make_channel() -> Option<(u64, u64)> {
-    // SAFETY: CH_OUT0/CH_OUT1 are valid writable out-params.
-    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0) };
-    if cr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel wrote both endpoint handles.
-    Some(unsafe { ((&raw const CH_OUT0).read(), (&raw const CH_OUT1).read()) })
+    libkern::channel_create(4)
 }
 
 fn ds_reply(ch: u64, op: u16, request_id: u64, body: &[u8], handle: u64, err: bool) -> bool {

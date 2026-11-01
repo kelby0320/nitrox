@@ -1,10 +1,12 @@
 //! Placing, snapping, raising and minimizing windows.
 
 use super::*;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::Relaxed;
 use desktop_shell::cascade;
 use desktop_shell::snap::{Answer, declined, forget, snap_zones, state_requested};
 
-static mut GEOMETRY_LOGGED: u32 = 0;
+static GEOMETRY_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 /// How many window-geometry lines to print before going quiet: the event is client-driven, and
 /// `check-login` reads one after each of its moves, maximises and restores.
@@ -328,11 +330,7 @@ pub(super) fn place_new_windows(
                     // Once per move and no more than sixteen times (a drag reports one event):
                     // the only place a gate can read where a drag put a window. Bounded because
                     // the event is client-driven.
-                    // SAFETY: single-threaded process; this counter is touched only here.
-                    let seen = unsafe {
-                        GEOMETRY_LOGGED += 1;
-                        GEOMETRY_LOGGED
-                    };
+                    let seen = GEOMETRY_LOGGED.fetch_add(1, Relaxed) + 1;
                     if seen > MAX_LOGGED_GEOMETRY {
                         continue;
                     }
