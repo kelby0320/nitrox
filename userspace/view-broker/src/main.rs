@@ -46,6 +46,7 @@ use view_broker::pacing::{Held, MAX_FAILURES};
 use view_broker::policy::{self, Auth, Decision, Grant};
 use view_broker::sessions::Sessions;
 use view_broker::slots::Load;
+use view_broker::spawning::{both_pairs, program_args};
 use view_broker::suffix::{self, Suffix};
 
 #[global_allocator]
@@ -1433,27 +1434,11 @@ impl Broker {
             return fail(self, &mut p, "there is no such program");
         }
         let (setup, life) = (pipe(1).ok(), make_channel(1));
-        let (Some((setup_ours, setup_child)), Some((life_ours, life_child))) = (setup, life) else {
-            // **The pair that was made goes too**: either create can fail alone.
-            let made = setup.into_iter().chain(life).flat_map(|(ours, child)| [ours, child]);
-            made.chain([image, view_ns]).for_each(close);
+        let Some(((setup_ours, setup_child), (life_ours, life_child))) = both_pairs(setup, life, close) else {
+            [image, view_ns].into_iter().for_each(close);
             return fail(self, &mut p, "out of channels");
         };
-        let args = SpawnArgs {
-            image,
-            handle_count: 2,
-            move_mask: 0b11,
-            arg0: bootstrap_arg0(true),
-            // **The life channel**: a handle the program never learns about, so it stays open
-            // until the program exits — which is how the broker learns *which* program it was
-            // (`TODO(child-exit-attribution)`, as `service-mgr` does it).
-            handles: [setup_child, life_child, 0, 0],
-            // **No right on it**: one it could duplicate or move would outlive it.
-            rights: [u64::MAX, 0, 0, 0],
-            namespace: view_ns,
-            // No ambient authority but what a grant says.
-            syscaps,
-        };
+        let args = program_args(image, bootstrap_arg0(true), setup_child, life_child, view_ns, syscaps);
         // SAFETY: a valid spawn block on this frame.
         let process = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const args) as u64) };
         close(image);

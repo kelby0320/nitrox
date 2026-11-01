@@ -12,7 +12,7 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-
+pub mod spawning;
 pub mod policy {
     //! `/system/views.toml` — profiles, and the rules that say who may use them for what.
     //!
