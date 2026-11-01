@@ -22,25 +22,23 @@ const PAYLOAD_OFF: usize = 24;
 /// The largest IPC message this crate sends or receives.
 const MSG_LEN: usize = 4096;
 
-static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut SEND_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
-
-static mut WAIT_HANDLES: [u64; 1] = [0; 1];
-
-fn wait_one(handle: u64) -> bool {
+fn wait_one(handle: u64) -> Option<IoResult> {
     wait_until(handle, u64::MAX)
 }
 
-/// [`wait_one`], giving up at `deadline` (absolute monotonic ns). `false` if it passed first.
-fn wait_until(handle: u64, deadline: u64) -> bool {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = handle;
-        let (handles, results) = ((&raw const WAIT_HANDLES) as u64, (&raw mut WAIT_RESULTS) as u64);
-        syscall4(SYS_WAIT, handles, 1, results, deadline)
-    };
-    waited == 1
+/// [`wait_one`], giving up at `deadline` (absolute monotonic ns). `None` if it passed first.
+fn wait_until(handle: u64, deadline: u64) -> Option<IoResult> {
+    let mut r = IoResult { handle: 0, status: 0, reserved: 0, result: 0 };
+    // SAFETY: one handle and room for its one result, both on this frame.
+    let waited = unsafe { syscall4(SYS_WAIT, (&raw const handle) as u64, 1, (&raw mut r) as u64, deadline) };
+    (waited == 1).then_some(r)
+}
+
+/// The next notification queued on `notif`, if there is one.
+fn next_notification(notif: u64) -> Option<Notification> {
+    let mut n = Notification::zeroed();
+    // SAFETY: `n` is a writable `Notification`, the 64 bytes the kernel writes.
+    (unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut n) as u64, 0, 0) } == 0).then_some(n)
 }
 
 fn now_ns() -> u64 {
@@ -65,17 +63,12 @@ pub fn stop_asked() -> bool {
 /// Drain `notif`, saying whether a terminate request was among it; for a supervisor between
 /// sessions, with no child whose `ChildExited` could be dropped.
 pub fn drain_for_stop(notif: u64) -> bool {
-    loop {
-        // SAFETY: NOTIF is a valid 64-byte writable out-param.
-        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-        if r != 0 {
-            return stop_asked();
-        }
-        // SAFETY: the kernel wrote a Notification into NOTIF.
-        if unsafe { (&raw const NOTIF.kind).read() } == KIND_TERMINATE_REQUESTED {
+    while let Some(n) = next_notification(notif) {
+        if n.kind == KIND_TERMINATE_REQUESTED {
             STOP_ASKED.store(true, Ordering::Relaxed);
         }
     }
+    stop_asked()
 }
 
 fn kprint(msg: &[u8]) {
@@ -221,24 +214,6 @@ pub fn views_close_session(sup: u64, id: u64) {
     if let Some(n) = librsproto::views::build_session_id(&mut body, id) {
         let _ = views_call(sup, librsproto::views::OP_VIEWS_CLOSE_SESSION, &body[..n], &mut [0u8; 1]);
     }
-}
-
-/// [`build`] a session namespace, recording what bound for [`session_has_bin`] and its siblings.
-/// Returns the namespace handle, or `0` on failure. **Absence is the sandbox**: `/dev/blk` is
-/// omitted from every session; a disk is reached only through the view broker's `disks` grant.
-pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
-    let Some(b) = build(spec) else { return 0 };
-    // SAFETY: single-threaded supervisor; one namespace is built at a time.
-    unsafe {
-        SESSION_HAS_BIN = b.bin;
-        SESSION_HAS_TTY = b.tty;
-        SESSION_HAS_CONSOLE = b.console;
-        SESSION_HAS_CLIPBOARD = b.clipboard;
-        SESSION_HAS_VIEWS = b.views;
-        SESSION_HAS_DEVICES = b.devices;
-        SESSION_HAS_STORAGE = b.storage;
-    }
-    b.ns
 }
 
 /// **Build a namespace from `spec`** and say what bound. `None` if a member it cannot do without
@@ -686,63 +661,6 @@ fn blk_path(n: u32, info: bool) -> alloc::string::String {
     if info { alloc::format!("/dev/blk/{n}/info") } else { alloc::format!("/dev/blk/{n}") }
 }
 
-/// Whether the last-built session namespace got its `/bin`. The `session_has_*` readers exist so
-/// a log line can say "no".
-pub fn session_has_bin() -> bool {
-    // SAFETY: single-threaded session-mgr.
-    unsafe { SESSION_HAS_BIN }
-}
-
-static mut SESSION_HAS_BIN: bool = false;
-
-/// Whether the last [`build_namespace`] bound `/dev/console`.
-pub fn session_has_console() -> bool {
-    // SAFETY: single-threaded supervisor; one namespace is built at a time.
-    unsafe { SESSION_HAS_CONSOLE }
-}
-
-/// Whether the last [`build_namespace`] bound `/dev/clipboard`.
-pub fn session_has_clipboard() -> bool {
-    // SAFETY: single-threaded supervisor; one namespace is built at a time.
-    unsafe { SESSION_HAS_CLIPBOARD }
-}
-
-static mut SESSION_HAS_CLIPBOARD: bool = false;
-
-/// Whether the last [`build_namespace`] bound `/dev/views`.
-pub fn session_has_views() -> bool {
-    // SAFETY: single-threaded supervisor; one namespace is built at a time.
-    unsafe { SESSION_HAS_VIEWS }
-}
-
-static mut SESSION_HAS_VIEWS: bool = false;
-
-/// Whether the last [`build_namespace`] bound `/dev/devices`.
-pub fn session_has_devices() -> bool {
-    // SAFETY: single-threaded supervisor; one namespace is built at a time.
-    unsafe { SESSION_HAS_DEVICES }
-}
-
-static mut SESSION_HAS_DEVICES: bool = false;
-
-/// Whether the last [`build_namespace`] bound `/storage` and `/dev/storage`.
-pub fn session_has_storage() -> bool {
-    // SAFETY: single-threaded supervisor; one namespace is built at a time.
-    unsafe { SESSION_HAS_STORAGE }
-}
-
-static mut SESSION_HAS_STORAGE: bool = false;
-
-static mut SESSION_HAS_CONSOLE: bool = false;
-
-/// Whether the last-built session namespace got a terminal.
-pub fn session_has_tty() -> bool {
-    // SAFETY: single-threaded session-mgr.
-    unsafe { SESSION_HAS_TTY }
-}
-
-static mut SESSION_HAS_TTY: bool = false;
-
 /// Publish `user` at `/session/user` in `ns`, as a read-only memory object. Non-fatal.
 fn bind_session_user(ns: u64, user: &[u8]) {
     // SAFETY: a page-sized anonymous object; the syscall returns a handle or a negative error.
@@ -787,45 +705,11 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     if po < 0 {
         return (po as i32, 0);
     }
-    if !wait_one(po as u64) {
-        // SAFETY: closing our own PO.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-        return (-1, 0);
-    }
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns it
-    let (status, handle) = unsafe {
-        (
-            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
-            u64::from_le_bytes([
-                WAIT_RESULTS[16],
-                WAIT_RESULTS[17],
-                WAIT_RESULTS[18],
-                WAIT_RESULTS[19],
-                WAIT_RESULTS[20],
-                WAIT_RESULTS[21],
-                WAIT_RESULTS[22],
-                WAIT_RESULTS[23],
-            ]),
-        )
-    };
+    let r = wait_one(po as u64);
     // SAFETY: closing our own PO handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-    (status, handle)
+    r.map_or((-1, 0), |r| (r.status, r.result))
 }
-
-static mut NOTIF: Notification = Notification::zeroed();
-
-static mut SPAWN_SHELL: SpawnArgs = SpawnArgs {
-    image: 0,
-    // One handle: the setup channel, through which a Tier-1 stage gets `argv` and environment.
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [u64::MAX; 4],
-    namespace: 0, // set at spawn = the session namespace
-    syscaps: 0,   // set at spawn — see `spawn_leader`
-};
 
 /// The user's home *as seen from inside the session*; the outside path is not nameable.
 const SESSION_HOME: &str = "/home";
@@ -885,15 +769,19 @@ pub fn spawn_leader(
             return -1;
         }
     };
-    // SAFETY: SPAWN_SHELL is a valid writable arg block; run in the session namespace.
-    let h = unsafe {
-        SPAWN_SHELL.image = image;
-        SPAWN_SHELL.namespace = session_ns;
-        SPAWN_SHELL.syscaps = syscaps;
-        SPAWN_SHELL.handles[0] = setup_shell;
-        SPAWN_SHELL.arg0 = bootstrap_arg0(true);
-        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SHELL) as u64)
+    let args = SpawnArgs {
+        image,
+        // One handle: the setup channel, through which a Tier-1 stage gets `argv` and environment.
+        handle_count: 1,
+        move_mask: 1,
+        arg0: bootstrap_arg0(true),
+        handles: [setup_shell, 0, 0, 0],
+        rights: [u64::MAX; 4],
+        namespace: session_ns,
+        syscaps,
     };
+    // SAFETY: a valid spawn block on this frame.
+    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const args) as u64) };
     // SAFETY: the kernel copied the ELF during spawn; close our image handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
@@ -940,33 +828,27 @@ pub fn spawn_leader(
             kprint(b"libsession: could not duplicate the leader's extra handle\n");
         }
         let count: u64 = if moved > 0 { 1 } else { 0 };
-        let (msg, handles) = ((&raw const SEND_MSG) as u64, (&raw const SEND_HANDLES) as u64);
-        {
-            // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
-            let r = unsafe {
-                // **Scrub the payload first**: restamping only the header would send all `MSG_LEN`
-                // bytes of whatever was sent last, such as an `Authenticate` request.
-                SEND_MSG[PAYLOAD_OFF..].fill(0);
-                SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
-                SEND_MSG[8] = count as u8;
-                SEND_HANDLES[0] = if count == 1 { moved as u64 } else { 0 };
-                syscall5(SYS_CHANNEL_SEND, setup_mgr, msg, handles, count, SENDMODE_NOBLOCK)
-            };
-            if r != 0 {
-                kprint(b"libsession: the leader's extra handle was not delivered\n");
-                if count == 1 {
-                    // SAFETY: the send failed, so the duplicate is still ours; then the empty
-                    // message a missing endpoint sends, in its place, from the same buffers.
-                    unsafe {
-                        syscall1(SYS_HANDLE_CLOSE, moved as u64);
-                        SEND_MSG[8] = 0;
-                        syscall5(SYS_CHANNEL_SEND, setup_mgr, msg, handles, 0, SENDMODE_NOBLOCK);
-                    }
+        let handles = [moved.max(0) as u64];
+        let mut msg = [0u8; MSG_LEN];
+        msg[8] = count as u8;
+        // SAFETY: a whole message and `count` handles, both on this frame; no payload.
+        let r = unsafe {
+            syscall5(SYS_CHANNEL_SEND, setup_mgr, msg.as_ptr() as u64, handles.as_ptr() as u64, count, SENDMODE_NOBLOCK)
+        };
+        if r != 0 {
+            kprint(b"libsession: the leader's extra handle was not delivered\n");
+            if count == 1 {
+                msg[8] = 0;
+                // SAFETY: the send failed, so the duplicate is still ours; then the empty
+                // message a missing endpoint sends, in its place.
+                unsafe {
+                    syscall1(SYS_HANDLE_CLOSE, moved as u64);
+                    syscall5(SYS_CHANNEL_SEND, setup_mgr, msg.as_ptr() as u64, 0, 0, SENDMODE_NOBLOCK);
                 }
-            } else if count == 0 {
-                // The leader cannot tell this from an endpoint that was never wanted.
-                kprint(b"libsession: an endpoint the leader expects is absent (placeholder sent)\n");
             }
+        } else if count == 0 {
+            // The leader cannot tell this from an endpoint that was never wanted.
+            kprint(b"libsession: an endpoint the leader expects is absent (placeholder sent)\n");
         }
     }
     // SAFETY: closing our end of the setup channel; the shell holds its own.
@@ -985,7 +867,7 @@ pub fn spawn_leader(
     // without it — a stop is a request, and there is no forcible kill.
     let mut until = u64::MAX;
     loop {
-        if !wait_until(notif, until) {
+        if wait_until(notif, until).is_none() {
             if until != u64::MAX && now_ns() >= until {
                 Line::new()
                     .s(b"libsession: ")
@@ -998,15 +880,7 @@ pub fn spawn_leader(
             }
             continue;
         }
-        loop {
-            // SAFETY: NOTIF is a valid 64-byte writable out-param.
-            let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-            if r != 0 {
-                break;
-            }
-            // SAFETY: the recv above returned 0, so the kernel wrote a whole Notification into
-            // NOTIF; this thread owns the static
-            let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+        while let Some(Notification { kind, body }) = next_notification(notif) {
             if kind == KIND_CHILD_EXITED {
                 let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
                 // SAFETY: closing our reference to the exited shell (reaping).

@@ -13,7 +13,7 @@ use libdraw::text::Font;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::surface::{CreateWindowRequest, Role};
-use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_leader};
+use libsession::{NamespaceSpec, authenticate, ns_lookup, spawn_leader};
 use libsurface::Session;
 use libsurface::ipc::ChannelTransport;
 
@@ -120,7 +120,7 @@ fn run_session(
     let base_len = opened.map_or(0, |v| v.1);
 
     // No `/dev/console`: a binding is authority, and the console is the serial column's recovery path.
-    let session_ns = build_namespace(&NamespaceSpec {
+    let built = libsession::build(&NamespaceSpec {
         root_ns,
         fs_endpoint: fs,
         profile_endpoint: profile,
@@ -140,13 +140,14 @@ fn run_session(
         draw_endpoint: 0,
         desktop_endpoint: 0,
     });
-    if session_ns == 0 {
+    let Some(built) = built else {
         kprint(b"desktop-session-mgr: session namespace FAIL\n");
         if let Some((id, _)) = opened {
             libsession::views_close_session(views_sup, id);
         }
         return true;
-    }
+    };
+    let session_ns = built.ns;
     // Unscoped, so the shell resolves `manage` as well as `new`; applications get `new` alone.
     if draw != 0 {
         let path = b"/dev/draw";
@@ -159,27 +160,27 @@ fn run_session(
         }
     }
     // Reported from what was bound, not from what was asked for, so the gate's assertion can fail.
-    if libsession::session_has_console() {
+    if built.console {
         kprint(b"desktop-session-mgr: session namespace built (WITH /dev/console)\n");
     } else {
         kprint(b"desktop-session-mgr: session namespace built (no /dev/console)\n");
     }
-    if libsession::session_has_clipboard() {
+    if built.clipboard {
         kprint(b"desktop-session-mgr: session has /dev/clipboard\n");
     } else {
         kprint(b"desktop-session-mgr: session has NO /dev/clipboard\n");
     }
-    if libsession::session_has_views() {
+    if built.views {
         kprint(b"desktop-session-mgr: session has /dev/views\n");
     } else {
         kprint(b"desktop-session-mgr: session has NO /dev/views\n");
     }
-    if libsession::session_has_devices() {
+    if built.devices {
         kprint(b"desktop-session-mgr: session has /dev/devices\n");
     } else {
         kprint(b"desktop-session-mgr: session has NO /dev/devices\n");
     }
-    if libsession::session_has_storage() {
+    if built.storage {
         kprint(b"desktop-session-mgr: session has /storage\n");
     } else {
         kprint(b"desktop-session-mgr: session has NO /storage\n");

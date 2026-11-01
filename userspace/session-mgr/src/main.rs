@@ -14,7 +14,7 @@ use libkern::*;
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 use librsproto::{decode, encode};
-use libsession::{NamespaceSpec, authenticate, ns_lookup, session_has_bin, session_has_tty, spawn_leader};
+use libsession::{NamespaceSpec, authenticate, ns_lookup, spawn_leader};
 
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
@@ -176,7 +176,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 } else {
                     None
                 };
-                let session_ns = libsession::build_namespace(&NamespaceSpec {
+                let built = libsession::build(&NamespaceSpec {
                     root_ns,
                     fs_endpoint,
                     profile_endpoint,
@@ -197,27 +197,28 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     draw_endpoint: 0,
                     desktop_endpoint: 0,
                 });
-                if session_ns == 0 {
+                let Some(built) = built else {
                     kprint(b"session-mgr: session namespace FAIL\n");
                     if let Some((id, _)) = views {
                         libsession::views_close_session(views_sup, id);
                     }
                     continue;
-                }
+                };
+                let session_ns = built.ns;
                 kprint(b"session-mgr: session namespace built (/home subtree + /dev/console");
-                if session_has_bin() {
+                if built.bin {
                     kprint(b" + /bin");
                 }
-                if session_has_tty() {
+                if built.tty {
                     kprint(b" + /dev/tty");
                 }
-                if libsession::session_has_views() {
+                if built.views {
                     kprint(b" + /dev/views");
                 }
-                if libsession::session_has_devices() {
+                if built.devices {
                     kprint(b" + /dev/devices");
                 }
-                if libsession::session_has_storage() {
+                if built.storage {
                     kprint(b" + /storage");
                 }
                 kprint(b")\n");

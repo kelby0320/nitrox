@@ -138,7 +138,7 @@ Like the fs-server, the profile server and the logging service: spawned by a sup
 into namespaces by a supervisor, never self-registering. It holds `/dev/console` and is bound
 at **`/dev/tty`** in each session namespace by whichever supervisor built it — `session-mgr`
 for the serial column and, since M7 Part D, `desktop-session-mgr` for the graphical one. Both
-bind it through the same `libsession::build_namespace`.
+bind it through the same `libsession::build`.
 
 **A graphical session gets `/dev/tty` but not `/dev/console`**, and the two are less different
 than that reads: a tty minted through this server sits on the **console backend**, so a

@@ -994,7 +994,7 @@ window instead reaches the session's console.
 
 **What changed:** M7 Part D built `desktop-session-mgr`, so the graphical session namespace this
 entry was waiting on now exists — and it binds `/dev/tty`, because
-`libsession::build_namespace` binds it for both columns whenever a tty endpoint was handed
+`libsession::build` binds it for both columns whenever a tty endpoint was handed
 down.
 
 **The sharp edge, which Part D's own reasoning did not cover.** That session deliberately has
