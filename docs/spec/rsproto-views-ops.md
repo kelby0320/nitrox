@@ -148,9 +148,11 @@ on its own namespace outlives it, and then resolves nothing new through them; on
 copy keeps them, as at `CloseSession`.
 
 The code is matched to the program by **which program's life channel closed** — a handle the
-program never learns of, moved to it at spawn with no rights, so no copy outlives it — and taken from the notification queue in arrival
-order: exact about *which*, and able to swap two codes only if two of the broker's programs exit
-in one wake (`TODO(child-exit-attribution)`). **The close can come first.** A process's handles
+program never learns of, moved to it at spawn with no rights, so no copy outlives it while no grant
+gives a program `BIND_NAMESPACE`, the one way to keep a handle that has none — and taken from the
+notification queue in arrival order: exact about *which*, and able to swap two codes only if two of
+the broker's programs exit in one wake (`TODO(child-exit-attribution)`). **The close can come
+first.** A process's handles
 are closed before its `ChildExited` is queued, so the broker holds a closed life until its code
 arrives, and does not wait on it meanwhile (`view_broker::exits`).
 

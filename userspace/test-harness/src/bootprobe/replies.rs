@@ -44,7 +44,7 @@ pub(super) fn a_reply_is_its_requests_test(root_ns: u64) -> bool {
     let no_len = build_denied_reply(&mut no).unwrap_or(0);
     let mut home = [0u8; 16];
     // The first `libsession` call in this process is id 1, and the next is 2. A first reply left
-    // queued must not answer the second, as an earlier check's AUTHENTICATED answered a wrong password.
+    // queued must not answer the second, as an earlier AUTHENTICATED answered a wrong password.
     let first = rs_send(server, OP_AUTHENTICATE, 1, &yes[..yes_len], &[])
         && libsession::authenticate(client, DEMO_USER, b"x", &mut home).is_some();
     let second = rs_send(server, OP_AUTHENTICATE, 1, &yes[..yes_len], &[])

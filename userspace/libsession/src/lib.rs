@@ -860,7 +860,8 @@ pub fn spawn_leader(
     // without it — a stop is a request, and there is no forcible kill.
     let mut until = u64::MAX;
     if sent.is_err() {
-        // **Stopped and waited for**: its exit, arriving later, would end the next session.
+        // **Stopped and waited for**: its exit, arriving later, would end the next session
+        // (past the wait, `TODO(child-exit-attribution)`).
         kprint(b"libsession: setup message FAIL; asking the leader to stop\n");
         // SAFETY: a register-only syscall on the leader's process handle, which we hold.
         unsafe { syscall1(SYS_PROCESS_TERMINATE, h as u64) };
