@@ -351,11 +351,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // Copied out before the fields are cleared, and cleared before the session runs:
             // the password must not still be in the greeter while a session is on screen.
             let mut user = [0u8; 64];
-            let mut pass = [0u8; 128];
+            let mut pass = Secret([0u8; 128]);
             let ul = greeter.user.text().len().min(user.len());
-            let pl = greeter.password.text().len().min(pass.len());
             user[..ul].copy_from_slice(&greeter.user.text().as_bytes()[..ul]);
-            pass[..pl].copy_from_slice(&greeter.password.text().as_bytes()[..pl]);
+            // One past the buffer is not cut to a prefix that may be a password: it is no password.
+            let typed = greeter.password.text().as_bytes();
+            let pl = pass.get_mut(..typed.len()).map_or(0, |p| {
+                p.copy_from_slice(typed);
+                typed.len()
+            });
             greeter.reset();
             // The window is destroyed for the session, not hidden (the protocol has no "hide"):
             // left mapped, it sits under the session and covers the shell's top bar once raised.
@@ -379,9 +383,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 &user[..ul],
                 &pass[..pl],
             );
-            // SAFETY: a local buffer this function owns; zeroed so a refused password does
-            // not sit in this process's stack for the machine's lifetime.
-            unsafe { core::ptr::write_volatile(&mut pass, [0u8; 128]) };
+            drop(pass);
             if libsession::stop_asked() {
                 stop();
             }
