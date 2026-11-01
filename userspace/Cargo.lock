@@ -532,6 +532,7 @@ dependencies = [
  "libsurface",
  "libterm",
  "libui",
+ "libusers",
 ]
 
 [[package]]

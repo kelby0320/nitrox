@@ -129,6 +129,7 @@ const ABI_PAIRS: &[(&str, &str, &str, &str)] = &[
     ("kernel/src/object/thread.rs", "MAX_WAIT_HANDLES", "userspace/libkern/src/abi.rs", "MAX_WAIT_HANDLES"),
     ("kernel/src/libkern/ipc.rs", "IPC_HANDLE_MAX", "userspace/libkern/src/abi.rs", "IPC_HANDLE_MAX"),
     ("kernel/src/libkern/ipc.rs", "IPC_MAX_QUEUE_DEPTH", "userspace/libkern/src/abi.rs", "IPC_MAX_QUEUE_DEPTH"),
+    ("kernel/src/object/namespace.rs", "NS_SUBTREE_BASE_MAX", "userspace/libusers/src/lib.rs", "HOME_MAX"),
 ];
 
 fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {

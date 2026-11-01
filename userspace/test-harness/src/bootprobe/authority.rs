@@ -453,6 +453,61 @@ pub(super) fn subtree_bind_test(root_ns: u64) -> bool {
     }
 }
 
+/// **`libusers::valid_home` is the kernel's rule for a subtree base**: each home is bound as one,
+/// and the kernel's answer must be the library's. Not the empty base, which binds unscoped.
+pub(super) fn home_rules_are_the_kernels_test() -> bool {
+    use libkern::{SYS_NS_BIND, SYS_NS_CREATE};
+    let mut longest = [b'a'; libusers::HOME_MAX];
+    longest[0] = b'/';
+    let mut one_past = [b'a'; libusers::HOME_MAX + 1];
+    one_past[0] = b'/';
+    let homes: [&[u8]; 13] = [
+        b"/home/alice",
+        b"/home",
+        b"/a/b/c",
+        &longest,
+        &one_past,
+        b"/",
+        b"relative",
+        b"/home/",
+        b"/home//a",
+        b"/home/./a",
+        b"/home/../a",
+        b"/home/a/.",
+        b"/..",
+    ];
+    // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    let Some((endpoint, peer)) = channel() else {
+        return false;
+    };
+    let mut agree = ns > 0;
+    for (i, home) in homes.iter().enumerate() {
+        let at = alloc::format!("/h{i}");
+        // SAFETY: a namespace this process created, valid path and base, an endpoint it holds.
+        let bound = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                ns as u64,
+                at.as_ptr() as u64,
+                at.len() as u64,
+                endpoint,
+                home.as_ptr() as u64,
+                home.len() as u64,
+            )
+        };
+        if (bound == 0) != libusers::valid_home(home) {
+            Line::new().s(b"boot-probe: homes: the kernel disagrees on ").s(home).end();
+            agree = false;
+        }
+    }
+    [ns.max(0) as u64, endpoint, peer].iter().for_each(|&h| close(h));
+    if agree {
+        kprint(b"boot-probe: a home is what the kernel takes as a subtree base ok\n");
+    }
+    agree
+}
+
 /// Prove `auth-service` serves **more than one client**.
 ///
 /// `session-mgr` resolves `/svc/auth` at startup and holds its session for the machine's life,
