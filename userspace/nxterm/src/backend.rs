@@ -5,6 +5,7 @@
 //! keystrokes out. The terminal is handed down, not resolved, as `/dev/tty` is one binding per
 //! session and would reach the session's console (`docs/spec/process-spawn-args.md`).
 
+use alloc::boxed::Box;
 use libkern::abi::SpawnArgs;
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_TRANSFER, RIGHT_WAIT};
 use libkern::{
@@ -19,8 +20,6 @@ const MSG_LEN: usize = 4096;
 /// The most terminal input one message carries ([`librsproto::RS_MAX_BODY`]); a paste reaches it.
 const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
-static mut MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; 4] = [0; 4];
 static mut WAIT_RESULTS: [u8; 24 * 4] = [0; 24 * 4];
 
@@ -30,6 +29,8 @@ pub struct Backend {
     pub channel: u64,
     /// The server has closed its end; learned only from [`output`](Backend::output)'s receive.
     gone: bool,
+    /// What [`output`](Backend::output) lends out, so holding it holds this `Backend`.
+    msg: Box<[u8; MSG_LEN]>,
 }
 
 impl Drop for Backend {
@@ -92,31 +93,18 @@ fn make_channel() -> Option<(u64, u64)> {
 
 /// Send one rsproto message on `ch`, optionally moving a handle.
 fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handle: Option<u64>) -> bool {
-    // SAFETY: MSG/HANDLES are valid buffers owned by this module.
+    let mut msg = [0u8; MSG_LEN];
+    let Some(rs_len) = encode(&mut msg[PAYLOAD_OFF..], op, request_id, flags, body, 0) else {
+        return false;
+    };
+    msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+    let count = handle.is_some() as u64;
+    msg[8] = count as u8;
+    let handles = [handle.unwrap_or(0)];
+    // SAFETY: a whole message and `count` handles, both on this frame.
     unsafe {
-        let Some(rs_len) = encode(&mut MSG[PAYLOAD_OFF..], op, request_id, flags, body, 0) else {
-            return false;
-        };
-        MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        let n = match handle {
-            Some(h) => {
-                MSG[8] = 1;
-                HANDLES[0] = h;
-                1
-            }
-            None => {
-                MSG[8] = 0;
-                0
-            }
-        };
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const MSG) as u64,
-            (&raw const HANDLES) as u64,
-            n,
-            libkern::SENDMODE_NOBLOCK,
-        ) == 0
+        syscall5(SYS_CHANNEL_SEND, ch, msg.as_ptr() as u64, handles.as_ptr() as u64, count, libkern::SENDMODE_NOBLOCK)
+            == 0
     }
 }
 
@@ -134,7 +122,11 @@ pub unsafe fn attach(root_ns: u64) -> Option<(u64, Backend)> {
         kprint(b"nxterm: /dev/tty did not resolve\n");
         return None;
     }
-    let (near, far) = make_channel()?;
+    let Some((near, far)) = make_channel() else {
+        // SAFETY: closing our own terminal channel, which nothing else has been given.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, tty) };
+        return None;
+    };
     // `far` is moved: once the server owns it, its close is how this process learns the terminal
     // ended.
     if !send(tty, OP_TTY_ATTACH_BACKEND, 1, 0, &[], Some(far)) {
@@ -163,24 +155,22 @@ pub unsafe fn attach(root_ns: u64) -> Option<(u64, Backend)> {
         }
         return None;
     }
-    Some((tty, Backend { channel: near, gone: false }))
+    Some((tty, Backend { channel: near, gone: false, msg: Box::new([0; MSG_LEN]) }))
+}
+
+/// The rsproto payload of the message in `msg`, as long as its header says, within the message.
+fn payload(msg: &[u8; MSG_LEN]) -> &[u8] {
+    let len = u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize;
+    &msg[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)]
 }
 
 /// Receive one message on `ch` and report whether it is a non-error reply.
 fn recv_is_ok(ch: u64) -> bool {
-    // SAFETY: single-threaded; `MSG` is this module's buffer, lent for the call.
-    let Ok(_sent) = (unsafe { libkern::channel_recv_raw(ch, &raw mut MSG) }) else {
+    let mut msg = [0u8; MSG_LEN];
+    let Ok(_sent) = libkern::channel_recv(ch, &mut msg) else {
         return false;
     };
-    // SAFETY: bounded read-only slice over the just-received message.
-    unsafe {
-        let payload_len = u32::from_le_bytes([MSG[4], MSG[5], MSG[6], MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            ((&raw const MSG) as *const u8).add(PAYLOAD_OFF),
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
-        matches!(decode(req), Ok(m) if m.flags & RS_FLAG_REPLY != 0 && m.flags & librsproto::RS_FLAG_ERROR == 0)
-    }
+    matches!(decode(payload(&msg)), Ok(m) if m.flags & RS_FLAG_REPLY != 0 && m.flags & librsproto::RS_FLAG_ERROR == 0)
 }
 
 impl Backend {
@@ -195,27 +185,17 @@ impl Backend {
     /// `sys_channel_recv` has no peek, so a separate probe would dequeue a message and the channel,
     /// no longer signalled, would never wake to retry. `PeerClosed` is recorded here for
     /// [`is_gone`](Self::is_gone).
-    pub fn output(&mut self) -> Option<&'static [u8]> {
-        // SAFETY: single-threaded; `MSG` is this module's buffer, lent for the call.
-        let _sent = match unsafe { libkern::channel_recv_raw(self.channel, &raw mut MSG) } {
+    pub fn output(&mut self) -> Option<&[u8]> {
+        let _sent = match libkern::channel_recv(self.channel, &mut self.msg) {
             Ok(sent) => sent,
             Err(rr) => {
                 self.gone = rr == libkern::error::KError::PeerClosed.as_i32() as i64;
                 return None;
             }
         };
-        // SAFETY: bounded read-only slice over the just-received message. `'static` holds because
-        // `MSG` is a module static and the caller consumes the bytes before the next receive.
-        unsafe {
-            let payload_len = u32::from_le_bytes([MSG[4], MSG[5], MSG[6], MSG[7]]) as usize;
-            let req = core::slice::from_raw_parts(
-                ((&raw const MSG) as *const u8).add(PAYLOAD_OFF),
-                payload_len.min(MSG_LEN - PAYLOAD_OFF),
-            );
-            match decode(req) {
-                Ok(m) if m.op == OP_TTY_OUTPUT && !m.body.is_empty() => Some(m.body),
-                _ => None,
-            }
+        match decode(payload(&self.msg)) {
+            Ok(m) if m.op == OP_TTY_OUTPUT && !m.body.is_empty() => Some(m.body),
+            _ => None,
         }
     }
 
@@ -227,24 +207,29 @@ impl Backend {
 
 /// Spawn `/bin/nxsh` on `terminal`, handing the terminal down in its setup message.
 ///
-/// The terminal handle is **moved**: keeping a second reference would stop the server seeing
-/// `PeerClosed` when the shell exits.
+/// The terminal handle is **moved**, on every path: keeping a second reference would stop the
+/// server seeing `PeerClosed` when the shell exits. `false` if the shell did not start.
 ///
 /// # Safety
 ///
 /// `root_ns` must be this process's live root namespace and `terminal` a channel it owns.
 /// `env` is forwarded from this terminal's own setup message so the shell has the same
 /// `$env.HOME` a serial login's does.
-pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Record) -> i64 {
+pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Record) -> bool {
     let image = ns_lookup(root_ns, b"/bin/nxsh", libkern::RIGHT_MAP_READ);
     if image == 0 {
         kprint(b"nxterm: /bin/nxsh not found\n");
-        return -1;
+        // SAFETY: no shell took the terminal, so it is still ours.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, terminal) };
+        return false;
     }
     let Some((setup_ours, setup_theirs)) = make_channel() else {
-        // SAFETY: closing our own image handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
-        return -1;
+        // SAFETY: closing our own image handle, and the terminal no shell took.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, image);
+            syscall1(SYS_HANDLE_CLOSE, terminal);
+        }
+        return false;
     };
     let mut args = SpawnArgs {
         image,
@@ -267,7 +252,7 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Re
             syscall1(SYS_HANDLE_CLOSE, setup_theirs);
             syscall1(SYS_HANDLE_CLOSE, terminal);
         }
-        return child;
+        return false;
     }
     let streams = libstream::setup::Streams::default();
     let sent = libstream::setup::send_setup_full(setup_ours, streams, Some(terminal), &["nxsh"], env).is_ok();
@@ -280,12 +265,15 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Re
             .s(b" fields)")
             .end();
     }
-    // SAFETY: closing our end of the setup channel.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
+    // SAFETY: closing our end of the setup channel, and our reference to the shell: nothing here
+    // waits on it, and its terminal closing is what ends it.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, setup_ours);
+        syscall1(SYS_HANDLE_CLOSE, child as u64);
+    }
     if !sent {
         // The terminal went with the attempt, sent or closed: it is not ours to close.
         kprint(b"nxterm: the shell's setup message did not send\n");
-        return -1;
     }
-    child
+    sent
 }

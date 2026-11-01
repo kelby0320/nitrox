@@ -331,7 +331,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // SAFETY: `terminal` is a channel this process owns until the spawn moves it.
                     // Said on success too: a release image could not otherwise tell a hosting
                     // terminal from an empty window.
-                    if unsafe { backend::spawn_shell(root_ns, terminal, env) } < 0 {
+                    if !unsafe { backend::spawn_shell(root_ns, terminal, env) } {
                         kprint(b"nxterm: no shell\n");
                     }
                     backends.push(TabBackend { key, backend: b });
