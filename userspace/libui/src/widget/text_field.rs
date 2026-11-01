@@ -67,6 +67,18 @@ impl TextFieldState {
         self.cursor = 0;
     }
 
+    /// [`clear`](Self::clear), and zero the allocation, which it leaves as it was. For a password.
+    pub fn scrub(&mut self) {
+        // SAFETY: empty, the text is valid UTF-8 whatever its spare capacity holds.
+        let bytes = unsafe { self.text.as_mut_vec() };
+        bytes.clear();
+        for byte in bytes.spare_capacity_mut() {
+            // SAFETY: `byte` is a valid, exclusive reference to one byte of the allocation.
+            unsafe { core::ptr::write_volatile(byte, core::mem::MaybeUninit::new(0)) };
+        }
+        self.cursor = 0;
+    }
+
     /// Insert `c` at the caret and step over it.
     pub fn insert(&mut self, c: char) {
         self.text.insert(self.cursor, c);

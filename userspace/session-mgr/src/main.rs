@@ -262,10 +262,10 @@ fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Op
         let ulen = tty_read_line(tty, &mut user);
 
         tty_write(tty, b"password: ");
-        let mut pass = Secret([0u8; 128]);
+        let mut pass = Secret::<128>::zeroed();
         // The server stops echoing and erasing, so a backspace reveals nothing of the length.
         tty_set_echo(tty, false);
-        let plen = tty_read_line(tty, &mut *pass);
+        let plen = tty_read_line(tty, &mut pass);
         tty_set_echo(tty, true);
         // The password's newline was not echoed either: supply it.
         tty_write(tty, b"\r\n");
@@ -299,12 +299,12 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
         return None;
     }
     // Scrubbed on every return: a line read under the password prompt is the password.
-    let mut reply = Secret([0u8; MSG_LEN]);
+    let mut reply = Secret::<MSG_LEN>::zeroed();
     loop {
         if !wait_one(ch) {
             return None;
         }
-        let _sent = channel_recv(ch, &mut reply).ok()?;
+        let _sent = channel_recv(ch, reply.array_mut()).ok()?;
         let payload_len = u32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]) as usize;
         let m = decode(reply.get(PAYLOAD_OFF..PAYLOAD_OFF + payload_len)?).ok()?;
         // **Not this request's**: `tty-server`'s unsolicited `INTERRUPT` after a Ctrl-C, request id

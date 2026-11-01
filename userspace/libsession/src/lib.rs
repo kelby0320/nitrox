@@ -159,10 +159,10 @@ pub struct Built {
 /// `home_out`. `Some(home_len)` if AUTHENTICATED, `None` if DENIED or on any protocol error.
 pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> Option<usize> {
     // **Both copies of the password go on every return**: a supervisor's stack outlives the call.
-    let mut body = Secret([0u8; 512]);
-    let n = build_authenticate_request(&mut *body, user, pass)?;
-    let mut buf = Secret([0u8; MSG_LEN]);
-    let reply = call(auth_ch, OP_AUTHENTICATE, &body[..n], &mut buf)?;
+    let mut body = Secret::<512>::zeroed();
+    let n = build_authenticate_request(&mut body, user, pass)?;
+    let mut buf = Secret::<MSG_LEN>::zeroed();
+    let reply = call(auth_ch, OP_AUTHENTICATE, &body[..n], buf.array_mut())?;
     home_of(reply, home_out)
 }
 

@@ -95,8 +95,10 @@ all share. Receive through `channel_recv`, or
 `cargo xtask check-recv` fails any other userspace file that names it.
 
 **The other is `Secret`** (pre-Phase-7 Part I, group T): bytes `scrub`bed when they drop, for a
-password and the buffers it passes through, so an early return cannot skip the scrub. It sits beside
-`scrub` for the same reason `Received` is here: `auth-service` and the login supervisors share it.
+password and the buffers it passes through, so an early return cannot skip the scrub. It scrubs
+where it lies, so its life ends with a scope and never with `drop`, which is a move and scrubs a
+copy. It sits beside `scrub` for the same reason `Received` is here: `auth-service` and the login
+supervisors share it.
 
 ## Testing
 

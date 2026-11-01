@@ -49,25 +49,38 @@ pub fn scrub(bytes: &mut [u8]) {
     }
 }
 
-/// **Bytes [`scrub`]bed when dropped**, so a password, or a buffer one passed through, is zeroed on
-/// every way out of the scope that holds it. Neither `Clone` nor `Debug`.
-pub struct Secret<B: AsMut<[u8]>>(pub B);
+/// **Bytes [`scrub`]bed when dropped, where they lie**: a password, or a buffer one passed through,
+/// is zeroed on every way out of its scope, and `drop` is a move, which scrubs a copy. Neither
+/// `Clone` nor `Debug`, and `*secret` is a slice.
+pub struct Secret<const N: usize>([u8; N]);
 
-impl<B: AsMut<[u8]>> Drop for Secret<B> {
-    fn drop(&mut self) {
-        scrub(self.0.as_mut());
+impl<const N: usize> Secret<N> {
+    /// All zeroes, to be read or written into.
+    pub const fn zeroed() -> Self {
+        Self([0; N])
+    }
+
+    /// The whole array, for a call that takes one.
+    pub fn array_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
     }
 }
 
-impl<B: AsMut<[u8]>> core::ops::Deref for Secret<B> {
-    type Target = B;
-    fn deref(&self) -> &B {
+impl<const N: usize> Drop for Secret<N> {
+    fn drop(&mut self) {
+        scrub(&mut self.0);
+    }
+}
+
+impl<const N: usize> core::ops::Deref for Secret<N> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
         &self.0
     }
 }
 
-impl<B: AsMut<[u8]>> core::ops::DerefMut for Secret<B> {
-    fn deref_mut(&mut self) -> &mut B {
+impl<const N: usize> core::ops::DerefMut for Secret<N> {
+    fn deref_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }
 }
@@ -83,9 +96,11 @@ mod scrub_tests {
 
     #[test]
     fn a_dropped_secret_is_zeroed() {
-        let mut s = core::mem::MaybeUninit::new(super::Secret([0xA5u8; 9]));
-        // SAFETY: dropped once, in place; the bytes stay readable as the plain data they are.
+        let mut s = core::mem::MaybeUninit::new(super::Secret::<9>::zeroed());
+        // SAFETY: initialised above and dropped once, in place; the bytes stay readable as the
+        // plain data they are.
         let bytes = unsafe {
+            (*s.as_mut_ptr()).fill(0xA5);
             core::ptr::drop_in_place(s.as_mut_ptr());
             *(s.as_ptr() as *const [u8; 9])
         };

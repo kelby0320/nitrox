@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
@@ -36,6 +37,16 @@ const LABEL_W: u32 = 74;
 const USER_KEYS: (u64, u64) = (1, 2);
 const PASSWORD_KEYS: (u64, u64) = (3, 4);
 const REFUSAL_H: u32 = 16;
+/// Room kept in the password field, so typing one never grows it: a grown `String` gives its old
+/// allocation back with the password in it, past any scrub.
+const PASSWORD_ROOM: usize = 256;
+
+fn copy_whole(out: &mut [u8], typed: &str) -> usize {
+    out.get_mut(..typed.len()).map_or(0, |o| {
+        o.copy_from_slice(typed.as_bytes());
+        typed.len()
+    })
+}
 
 /// The theme the greeter draws with and loads its font from: always the built-in one, because a
 /// theme lives in a user's home and this runs before there is a user.
@@ -78,7 +89,8 @@ impl Default for Greeter {
 impl Greeter {
     /// An empty greeter, caret in the username field.
     pub fn new() -> Self {
-        Self { user: TextFieldState::new(), password: TextFieldState::new(), focus: Focus::User, denied: false }
+        let password = TextFieldState::with_text(String::with_capacity(PASSWORD_ROOM));
+        Self { user: TextFieldState::new(), password, focus: Focus::User, denied: false }
     }
 
     /// The element tree for the current state, in the theme the caller paints it with.
@@ -139,13 +151,19 @@ impl Greeter {
     /// Clear both fields and put the caret back, after a session ends and after a refusal.
     ///
     /// The password leaves the screen the moment it has been read, whichever way the attempt
-    /// went, so none sits in the field behind a session. Not a scrub: `String::clear` leaves the
-    /// bytes in the allocation, so this is a claim about what is displayed, not about memory.
-    /// The caller's stack copy is volatile-zeroed after the session ends.
+    /// went, so none sits in the field behind a session.
     pub fn reset(&mut self) {
         self.user.clear();
-        self.password.clear();
+        self.password.scrub();
         self.focus = Focus::User;
+    }
+
+    /// **What was typed**, copied into `user` and `password` and gone from the fields: the two
+    /// lengths. A field past its buffer reads as empty, so a prefix of it is never what is checked.
+    pub fn take_credentials(&mut self, user: &mut [u8], password: &mut [u8]) -> (usize, usize) {
+        let taken = (copy_whole(user, self.user.text()), copy_whole(password, self.password.text()));
+        self.reset();
+        taken
     }
 
     /// Render the current state into a fresh framebuffer.
@@ -214,6 +232,42 @@ mod tests {
         g.reset();
         assert_eq!((g.user.text(), g.password.text()), ("", ""), "nothing typed is left behind");
         assert_eq!(g.focus, Focus::User, "and the caret is back where a login starts");
+    }
+
+    #[test]
+    fn a_field_past_its_buffer_reads_as_empty() {
+        let mut g = Greeter::new();
+        let (mut user, mut pass) = ([0u8; 4], [0u8; 4]);
+        (g.user, g.password) = (TextFieldState::with_text("abcd"), TextFieldState::with_text("wxyz"));
+        assert_eq!(g.take_credentials(&mut user, &mut pass), (4, 4));
+        assert_eq!((&user, &pass), (b"abcd", b"wxyz"));
+        assert_eq!((g.user.text(), g.password.text()), ("", ""), "taken, not copied");
+        (g.user, g.password) = (TextFieldState::with_text("abcde"), TextFieldState::with_text("vwxyz"));
+        assert_eq!(g.take_credentials(&mut user, &mut pass), (0, 0));
+        assert_eq!((g.user.text(), g.password.text()), ("", ""), "refused, and still taken");
+    }
+
+    #[test]
+    fn typing_a_password_leaves_no_old_allocation_behind() {
+        let mut g = Greeter::new();
+        let at = g.password.text().as_ptr();
+        for _ in 0..128 {
+            g.password.insert('a');
+        }
+        assert_eq!(g.password.text().as_ptr(), at);
+    }
+
+    #[test]
+    fn a_reset_leaves_no_password_in_the_field() {
+        let mut g = Greeter::new();
+        for _ in 0..16 {
+            g.password.insert('a');
+        }
+        let at = g.password.text().as_ptr();
+        g.reset();
+        // SAFETY: the field keeps its allocation, and those sixteen bytes were written.
+        let left = unsafe { core::slice::from_raw_parts(at, 16) };
+        assert_eq!(left, [0; 16]);
     }
 
     /// Painted, because a tree inspection passes against a refusal in the body colour too.

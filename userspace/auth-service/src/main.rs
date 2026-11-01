@@ -160,7 +160,7 @@ fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handle: u64)
 }
 
 /// The rsproto payload of the message in `msg`, as long as its header says, within the message.
-fn payload(msg: &[u8; MSG_LEN]) -> &[u8] {
+fn payload(msg: &[u8]) -> &[u8] {
     let len = u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize;
     &msg[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)]
 }
@@ -286,8 +286,8 @@ fn open_auth_session(srv: &mut Server, serve_end: u64, request_id: u64, admin: b
 
 fn serve_session(srv: &mut Server, ch: u64) {
     // **Zeroed on every return**: an `Authenticate`, `Add` or `SetPassword` carries a password.
-    let mut msg = Secret([0u8; MSG_LEN]);
-    match channel_recv(ch, &mut msg) {
+    let mut msg = Secret::<MSG_LEN>::zeroed();
+    match channel_recv(ch, msg.array_mut()) {
         Ok(_sent) => {}
         // **A closed peer frees the slot.** Without this a supervisor that exited would hold
         // one forever, and the set of clients would shrink by one per logout.

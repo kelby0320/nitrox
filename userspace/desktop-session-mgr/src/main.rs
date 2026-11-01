@@ -89,12 +89,11 @@ fn recv_handoff(ctrl: u64) -> u64 {
 
 static mut RECV_MSG: [u8; IPC_MSG_SIZE] = [0; IPC_MSG_SIZE];
 
-/// One login attempt, run to the session's end. `false` if the credentials were refused.
+/// One session of `user`'s, authenticated with `home`, run to its end.
 #[allow(clippy::too_many_arguments, reason = "the session's handles, one for each service it is given")]
 fn run_session(
     root_ns: u64,
     notif: u64,
-    auth_ch: u64,
     fs: u64,
     profile: u64,
     tty: u64,
@@ -106,14 +105,9 @@ fn run_session(
     storage: u64,
     services: u64,
     user: &[u8],
-    password: &[u8],
-) -> bool {
-    let mut home = [0u8; 256];
-    let Some(hl) = authenticate(auth_ch, user, password, &mut home) else {
-        kprint(b"desktop-session-mgr: login denied\n");
-        return false;
-    };
-    Line::new().s(b"desktop-session-mgr: login ok -> home=").s(&home[..hl]).end();
+    home: &[u8],
+) {
+    Line::new().s(b"desktop-session-mgr: login ok -> home=").s(home).end();
     // Before the namespace: the broker's base is part of what it binds.
     let mut views_base = [0u8; 24];
     let opened = if views_sup != 0 { libsession::views_open_session(views_sup, user, &mut views_base) } else { None };
@@ -126,7 +120,7 @@ fn run_session(
         profile_endpoint: profile,
         tty_endpoint: tty,
         clipboard_endpoint: clipboard,
-        home: &home[..hl],
+        home,
         user,
         bind_fonts: true,
         bind_console: false,
@@ -145,7 +139,7 @@ fn run_session(
         if let Some((id, _)) = opened {
             libsession::views_close_session(views_sup, id);
         }
-        return true;
+        return;
     };
     let session_ns = built.ns;
     // Unscoped, so the shell resolves `manage` as well as `new`; applications get `new` alone.
@@ -189,7 +183,7 @@ fn run_session(
     // Endpoints are passed as endpoints, since a binding never resolves back to one. The home is
     // an argument because the shell's own `/home` cannot tell it the base an application's bind
     // needs; not authority, the fs endpoint is.
-    let home_str = core::str::from_utf8(&home[..hl]).unwrap_or("");
+    let home_str = core::str::from_utf8(home).unwrap_or("");
     // The view base, for the home's reason; empty when the broker gave no session.
     let base_str = core::str::from_utf8(&views_base[..base_len]).unwrap_or("");
     let views_for_shell = if opened.is_some() { views } else { 0 };
@@ -212,7 +206,6 @@ fn run_session(
     // SAFETY: closing the namespace we created for this session.
     unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
     Line::new().s(b"desktop-session-mgr: session ended (leader exit ").i(code as i64).s(b")").end();
-    true
 }
 
 /// Bootstrap registers: `rdi` the notification channel the leader is reaped on, `rsi` the
@@ -348,47 +341,45 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             }
         }
         if submit {
-            // Copied out before the fields are cleared, and cleared before the session runs:
-            // the password must not still be in the greeter while a session is on screen.
-            let mut user = [0u8; 64];
-            let mut pass = Secret([0u8; 128]);
-            let ul = greeter.user.text().len().min(user.len());
-            user[..ul].copy_from_slice(&greeter.user.text().as_bytes()[..ul]);
-            // One past the buffer is not cut to a prefix that may be a password: it is no password.
-            let typed = greeter.password.text().as_bytes();
-            let pl = pass.get_mut(..typed.len()).map_or(0, |p| {
-                p.copy_from_slice(typed);
-                typed.len()
-            });
-            greeter.reset();
             // The window is destroyed for the session, not hidden (the protocol has no "hide"):
             // left mapped, it sits under the session and covers the shell's top bar once raised.
             if let Some(w) = session.window(window) {
                 let _ = w.destroy();
             }
-            let ok = run_session(
-                root_ns,
-                notif,
-                auth_ch,
-                fs_endpoint,
-                profile_endpoint,
-                tty_endpoint,
-                draw_endpoint,
-                clipboard_endpoint,
-                views_endpoint,
-                views_sup,
-                devices_endpoint,
-                storage_endpoint,
-                services_endpoint,
-                &user[..ul],
-                &pass[..pl],
-            );
-            drop(pass);
+            let mut user = [0u8; 64];
+            let mut home = [0u8; 256];
+            // **The password's block ends before the session starts**, which outlives any use of
+            // it; `Secret` scrubs where it lies, so an earlier `drop` would scrub a copy.
+            let (ul, authed) = {
+                let mut pass = Secret::<128>::zeroed();
+                let (ul, pl) = greeter.take_credentials(&mut user, &mut pass);
+                (ul, authenticate(auth_ch, &user[..ul], &pass[..pl], &mut home))
+            };
+            if let Some(hl) = authed {
+                run_session(
+                    root_ns,
+                    notif,
+                    fs_endpoint,
+                    profile_endpoint,
+                    tty_endpoint,
+                    draw_endpoint,
+                    clipboard_endpoint,
+                    views_endpoint,
+                    views_sup,
+                    devices_endpoint,
+                    storage_endpoint,
+                    services_endpoint,
+                    &user[..ul],
+                    &home[..hl],
+                );
+            } else {
+                kprint(b"desktop-session-mgr: login denied\n");
+            }
             if libsession::stop_asked() {
                 stop();
             }
             // Before the window is drawn: `open_greeter` presents, and `view()` reads `denied`.
-            greeter.denied = !ok;
+            greeter.denied = authed.is_none();
             match open_greeter(&mut session, &font, &greeter, &mut addrs, len, origin) {
                 Some(id) => {
                     window = id;
