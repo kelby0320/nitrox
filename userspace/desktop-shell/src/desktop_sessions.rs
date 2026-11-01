@@ -218,7 +218,7 @@ static mut DS_REPLY_HANDLES: [u64; 4] = [0; 4];
 
 /// Create a channel pair. `(client_end, server_end)`.
 pub(super) fn make_channel() -> Option<(u64, u64)> {
-    libkern::channel_create(4)
+    libkern::channel_create(4).ok()
 }
 
 fn ds_reply(ch: u64, op: u16, request_id: u64, body: &[u8], handle: u64, err: bool) -> bool {

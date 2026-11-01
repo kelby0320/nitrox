@@ -271,7 +271,7 @@ fn po_completion(po: u64) -> (i32, u64) {
 
 /// Returns `(kernel_end, serve_end)`, each with a `depth`-message ring.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
-    libkern::channel_create(depth)
+    libkern::channel_create(depth).ok()
 }
 
 fn send_ready(control: u64, kernel_end: u64) -> bool {
@@ -799,13 +799,9 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             if h == serve_end {
                 forward_pending = true;
             } else if srv.control != 0 && h == srv.control {
-                match libkern::control::recv(srv.control) {
-                    Control::Op(CTRL_OP_SHUTDOWN) => {
-                        kprint(b"input-server: asked to stop, exiting\n");
-                        exit(0);
-                    }
-                    Control::Closed => srv.control = 0,
-                    _ => {}
+                if let Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut srv.control) {
+                    kprint(b"input-server: asked to stop, exiting\n");
+                    exit(0);
                 }
             } else if srv.subscription != 0 && h == srv.subscription {
                 notices_pending = true;

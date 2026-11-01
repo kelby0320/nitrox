@@ -211,13 +211,9 @@ fn serve_loop(srv: &mut Server, mut serve_end: u64, mut control: u64) -> ! {
                     serve_end = 0;
                 }
             } else if h == control {
-                match libkern::control::recv(control) {
-                    libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
-                        kprint(b"auth-service: asked to stop, exiting\n");
-                        exit(0);
-                    }
-                    libkern::control::Control::Closed => control = 0,
-                    _ => {}
+                if let libkern::control::Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
+                    kprint(b"auth-service: asked to stop, exiting\n");
+                    exit(0);
                 }
             } else {
                 serve_session(srv, h);

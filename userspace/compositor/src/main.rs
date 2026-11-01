@@ -167,7 +167,7 @@ fn now_ns() -> u64 {
 }
 
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
-    libkern::channel_create(depth)
+    libkern::channel_create(depth).ok()
 }
 
 fn send_ready(control: u64, kernel_end: u64) -> bool {
@@ -2089,13 +2089,11 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             // `service --stop`: every window goes with this process and its clients find their
             // channels closed; a restarted compositor takes the screen again.
             if control != 0 && h == control {
-                match libkern::control::recv(control) {
-                    libkern::control::Control::Op(libkern::abi::CTRL_OP_SHUTDOWN) => {
-                        kprint(b"compositor: asked to stop, exiting\n");
-                        exit(0);
-                    }
-                    libkern::control::Control::Closed => control = 0,
-                    _ => {}
+                if let libkern::control::Control::Op(libkern::abi::CTRL_OP_SHUTDOWN) =
+                    libkern::control::recv(&mut control)
+                {
+                    kprint(b"compositor: asked to stop, exiting\n");
+                    exit(0);
                 }
                 continue;
             }

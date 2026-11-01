@@ -1747,13 +1747,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 } else if h == control {
                     // Nothing to save on the way out: every write to the policy file is made whole
                     // before it is answered, as `auth-service`'s to the users file are.
-                    match libkern::control::recv(control) {
-                        libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
-                            kprint(b"view-broker: asked to stop, exiting\n");
-                            exit(0);
-                        }
-                        libkern::control::Control::Closed => control = 0,
-                        _ => {}
+                    if let libkern::control::Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
+                        kprint(b"view-broker: asked to stop, exiting\n");
+                        exit(0);
                     }
                 } else if let Some(i) = b.supervisors.iter().position(|&s| s == h) {
                     b.serve_supervisor(i);

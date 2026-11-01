@@ -5,7 +5,7 @@
 
 use crate::abi::{CLOCK_MONOTONIC, IPC_HANDLE_MAX, IPC_MSG_SIZE};
 use crate::clock::clock_read;
-use crate::error::KError;
+use crate::error::{KError, from_raw};
 use crate::syscall::{SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_WAIT, syscall4};
 
 /// The handles one message brought, closed when this drops unless taken.
@@ -47,9 +47,9 @@ impl Drop for Received {
 #[cfg(not(test))]
 pub(crate) fn close(h: u64) {
     use crate::syscall::{SYS_HANDLE_CLOSE, syscall1};
-    // SAFETY: a handle the kernel installed in this process for this message. `take` and
-    // `take_all` zero each handle they hand out, so one still here is no one else's, and this
-    // closes it once.
+    // SAFETY: a handle of this process's with no other copy to use it again, so this closes it
+    // once: `take` and `take_all` zero each handle they hand out of a `Received`, and
+    // `control::recv` zeroes its caller's.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
 }
 
@@ -92,13 +92,13 @@ pub fn pause_held() {
     unsafe { syscall4(SYS_WAIT, 0, 0, 0, now.saturating_add(HELD_PAUSE_NS)) };
 }
 
-/// Create a connected channel pair whose rings hold `depth` messages each. `None` if the kernel
-/// refused.
-pub fn channel_create(depth: u64) -> Option<(u64, u64)> {
+/// Create a connected channel pair whose rings hold `depth` messages each. `Err` with the kernel's
+/// refusal.
+pub fn channel_create(depth: u64) -> Result<(u64, u64), KError> {
     let (mut a, mut b) = (0u64, 0u64);
     // SAFETY: `a` and `b` are writable u64 out-params on this frame.
     let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, depth, 0) };
-    (r == 0).then_some((a, b))
+    from_raw(r).map(|_| (a, b))
 }
 
 /// Receive one message on `ch` into `msg`. `Err` with the syscall's status: `WouldBlock` for an

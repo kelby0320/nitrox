@@ -1441,10 +1441,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             } else if h == s.subscription {
                 s.serve_subscription();
             } else if h == control {
-                match libkern::control::recv(control) {
-                    libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => s.shut_down(),
-                    libkern::control::Control::Closed => control = 0,
-                    _ => {}
+                if let libkern::control::Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
+                    s.shut_down();
                 }
             } else if let Some(i) = s.session_ends.iter().position(|&e| e == h) {
                 // Every holder of this endpoint has let it go, its bindings included.

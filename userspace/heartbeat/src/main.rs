@@ -165,7 +165,7 @@ fn recv_log_handoff(control: u64) -> u64 {
 }
 
 /// The daemon loop: beat on a deadline, exit on a control shutdown.
-fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
+fn run_daemon(mut control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
     kprint(b"heartbeat: up (daemon)\n");
     // The app-facing path: records on this source carry source="worker" from the path label.
     if root_ns != 0 {
@@ -189,7 +189,7 @@ fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
         };
         if waited >= 1 {
-            match libkern::control::recv(control) {
+            match libkern::control::recv(&mut control) {
                 Control::Op(CTRL_OP_SHUTDOWN) => {
                     kprint(b"heartbeat: shutdown requested, exiting\n");
                     exit(0);

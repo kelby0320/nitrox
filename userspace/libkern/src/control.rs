@@ -20,11 +20,11 @@ pub enum Control {
     Closed,
 }
 
-/// Take one message from `control` without blocking. Any handle it carried is closed: no op here
-/// carries one.
-pub fn recv(control: u64) -> Control {
+/// Take one message from `*control` without blocking. Any handle it carried is closed: no op here
+/// carries one. **[`Control::Closed`] consumes the handle**, closing it and zeroing `*control`.
+pub fn recv(control: &mut u64) -> Control {
     let mut msg = [0u8; IPC_MSG_SIZE];
-    let _sent = match channel_recv(control, &mut msg) {
+    let _sent = match channel_recv(*control, &mut msg) {
         Ok(sent) => sent,
         Err(status) => return failed(control, status, pause_held),
     };
@@ -32,12 +32,12 @@ pub fn recv(control: u64) -> Control {
     op_of(&msg[IPC_HEADER_SIZE..IPC_HEADER_SIZE + len.min(IPC_MSG_SIZE - IPC_HEADER_SIZE)])
 }
 
-/// What a receive on `control` that failed with `status` means, `pause` run first if its message
-/// is queued. A channel that is closed for good is this process's to close.
-fn failed(control: u64, status: i64, pause: impl FnOnce()) -> Control {
+/// What a receive on `*control` that failed with `status` means, `pause` run first if its message
+/// is queued. A channel closed for good is this process's to close.
+fn failed(control: &mut u64, status: i64, pause: impl FnOnce()) -> Control {
     match RecvFailure::of(status) {
         RecvFailure::Closed => {
-            close(control);
+            close(core::mem::take(control));
             Control::Closed
         }
         RecvFailure::Empty => Control::Nothing,
@@ -72,7 +72,7 @@ mod tests {
         let status = |e: KError| e.as_i32() as i64;
         let paused = |s: i64| {
             let mut ran = false;
-            (failed(7, s, || ran = true), ran)
+            (failed(&mut 7, s, || ran = true), ran)
         };
         assert_eq!(paused(status(KError::OutOfMemory)), (Control::Nothing, true));
         assert_eq!(paused(status(KError::WouldBlock)), (Control::Nothing, false));
@@ -82,10 +82,11 @@ mod tests {
     #[test]
     fn only_a_channel_closed_for_good_is_closed() {
         let status = |e: KError| e.as_i32() as i64;
-        failed(7, status(KError::OutOfMemory), || ());
-        failed(7, status(KError::WouldBlock), || ());
-        assert_eq!(closed(), []);
-        failed(7, status(KError::PeerClosed), || ());
-        assert_eq!(closed(), [7]);
+        let mut control = 7;
+        failed(&mut control, status(KError::OutOfMemory), || ());
+        failed(&mut control, status(KError::WouldBlock), || ());
+        assert_eq!((closed(), control), (std::vec![], 7));
+        failed(&mut control, status(KError::PeerClosed), || ());
+        assert_eq!((closed(), control), (std::vec![7], 0), "closed once, with no copy left");
     }
 }

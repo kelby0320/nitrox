@@ -556,16 +556,12 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
         // serving endpoint.
         for &h in &signalled {
             if h == control {
-                match libkern::control::recv(control) {
-                    libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
-                        for s in &sources {
-                            drain_source(&mut inbox, s.handle, &sources, log);
-                        }
-                        kprint(b"logging-service: asked to stop, exiting\n");
-                        exit(0);
+                if let libkern::control::Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
+                    for s in &sources {
+                        drain_source(&mut inbox, s.handle, &sources, log);
                     }
-                    libkern::control::Control::Closed => control = 0,
-                    _ => {}
+                    kprint(b"logging-service: asked to stop, exiting\n");
+                    exit(0);
                 }
             } else if sessions.contains(&h) {
                 if !serve_read_session(&mut inbox, h, &log.ring) {

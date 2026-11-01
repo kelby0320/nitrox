@@ -88,7 +88,7 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
 
 /// A connected channel pair, or `None`.
 fn make_channel() -> Option<(u64, u64)> {
-    libkern::channel_create(8)
+    libkern::channel_create(8).ok()
 }
 
 /// Send one rsproto message on `ch`, optionally moving a handle.

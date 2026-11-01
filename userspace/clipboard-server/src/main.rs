@@ -66,7 +66,7 @@ fn exit(code: i64) -> ! {
 
 /// Create a connected channel pair (depth 4). Returns `(client_end, serve_end)`.
 fn make_channel() -> Option<(u64, u64)> {
-    libkern::channel_create(4)
+    libkern::channel_create(4).ok()
 }
 
 fn send_ready(control: u64, client_end: u64) -> bool {
@@ -362,13 +362,9 @@ fn serve_loop(serve_end: u64, mut control: u64) -> ! {
             if h == serve_end {
                 serve_resolve(serve_end);
             } else if h == control {
-                match libkern::control::recv(control) {
-                    Control::Op(CTRL_OP_SHUTDOWN) => {
-                        kprint(b"clipboard-server: asked to stop, exiting\n");
-                        exit(0);
-                    }
-                    Control::Closed => control = 0,
-                    _ => {}
+                if let Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
+                    kprint(b"clipboard-server: asked to stop, exiting\n");
+                    exit(0);
                 }
             } else {
                 serve_session(h);
