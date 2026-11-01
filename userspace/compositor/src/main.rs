@@ -28,10 +28,12 @@ use libdraw::framebuffer::RawFramebuffer;
 use libdraw::geom::{Point, Rect};
 use libinput::Interpreter;
 use libkern::abi::CLOCK_MONOTONIC;
+use libkern::abi::HandleInfo;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::error::KError;
-use libkern::{Received, channel_recv_raw};
+use libkern::handle::KObjectType;
+use libkern::{Received, SYS_HANDLE_STAT, channel_recv_raw};
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
     SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
@@ -52,12 +54,8 @@ const PAYLOAD_OFF: usize = 24;
 /// `scene::BACKGROUND`, so the two must be one constant.
 const BACKGROUND: Rgb = libdraw::scene::BACKGROUND;
 
-/// Largest Surface request body, sized by `SetTitle`, the only variable-length one; the assertion
-/// below ties it to `MAX_TITLE`.
-///
-/// A smaller body cut titles at a raw byte offset, which failed `Malformed` mid-character.
-const MAX_BODY: usize = 4 + librsproto::surface::MAX_TITLE;
-const _: () = assert!(MAX_BODY >= 4 + librsproto::surface::MAX_TITLE);
+/// Largest Surface request body: whatever one message carries, so no op's is ever cut.
+const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
 /// Four less than the wait limit: the forwarding, input, manager and control channels.
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 4;
@@ -513,6 +511,7 @@ fn drain_stack_events(srv: &mut Server) {
         for conn in srv.conns.iter_mut() {
             conn.disown(window);
         }
+        srv.buffers.retain(|b| b.window != window);
         mgr_emit(srv, MgrEvent::Destroyed { window });
     }
 }
@@ -1536,35 +1535,35 @@ fn close_session(slot: usize, srv: &mut Server) {
     srv.outbox[slot].clear();
     disconnect(&mut srv.conns[slot], &mut srv.stack);
     drain_stack_events(srv);
-    srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
     announce_focus(srv);
 }
 
-/// Map a client's transferred `MemoryObject` and record it for `BufferSource`, once at attach.
-/// Always consumes `handle`, on every path.
-fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
-    let Some(req) = librsproto::surface::parse_attach_buffer_request(body) else {
-        // SAFETY: we are not mapping it, so drop it rather than leaking the object.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        return false;
-    };
-    let len = req.pitch as usize * req.height as usize;
-    // The replaced mapping goes first: `dispatch` accepted the new geometry, and a failed map must
-    // leave no pixels, not the wrong ones.
-    srv.buffers.retain(|b| !(b.window == req.window && b.buffer == req.buffer));
-    // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
-    // with the size its own geometry declares.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };
-    if addr <= 0 {
-        // SAFETY: the map failed, so nothing references the object; drop our handle rather
-        // than leaking it for the compositor's life.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        return false;
+/// Whether `handle` is a `MemoryObject`. A file maps too, faulted in through its server on this
+/// thread, and a fill that fails there ends the compositor.
+fn is_memory(handle: u64) -> bool {
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable `HandleInfo` on this frame.
+    let stat = unsafe { syscall2(SYS_HANDLE_STAT, handle, (&raw mut info) as u64) };
+    stat == 0 && info.object_type == KObjectType::MemoryObject as u32
+}
+
+/// Map a client's transferred `MemoryObject`, once at attach; `None` for anything else, no handle
+/// included. Always consumes `handle`, on every path.
+fn map_attached_buffer(body: &[u8], handle: u64) -> Option<MappedBuffer> {
+    if handle == 0 {
+        return None;
     }
-    srv.buffers.push(MappedBuffer { window: req.window, buffer: req.buffer, addr: addr as *mut u8, len });
-    // SAFETY: closing our reference; the mapping outlives it.
+    let req = librsproto::surface::parse_attach_buffer_request(body).filter(|_| is_memory(handle));
+    let mapped = req.and_then(|req| {
+        let len = req.pitch as usize * req.height as usize;
+        // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
+        // with the size its own geometry declares.
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };
+        (addr > 0).then_some(MappedBuffer { window: req.window, buffer: req.buffer, addr: addr as *mut u8, len })
+    });
+    // SAFETY: closing our reference; a mapping outlives it.
     unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-    true
+    mapped
 }
 
 /// Recomposite the whole screen: the fallback for `Applied { dirty: None }` and the first frame.
@@ -1667,7 +1666,7 @@ fn handle_session_request(
     screen: &mut Screen<RawFramebuffer>,
     mut sent: Received,
 ) -> bool {
-    // Copied out to avoid two live `static mut` borrows. `MAX_BODY` fits a whole `SetTitle`, so
+    // Copied out to avoid two live `static mut` borrows. `MAX_BODY` fits any message's body, so
     // this `min` is a bounds check, not a policy.
     let mut body_buf = [0u8; MAX_BODY];
     // SAFETY: RECV_MSG was filled by the recv in the caller; the slice is clamped to the payload
@@ -1886,23 +1885,26 @@ fn handle_session_request(
         };
     }
 
-    // SAFETY: a bounded mutable slice over the reply buffer; `body` is a local copy.
-    let outcome =
-        unsafe { dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut REPLY_MSG[PAYLOAD_OFF + 16..]) };
-    drain_stack_events(srv);
-
-    // Map only after `dispatch` accepted the attach, or a rejected one would record the client's
-    // memory under ids it does not own. The handle is disposed of exactly once.
-    let mut consumed = false;
-    if op == OP_ATTACH_BUFFER && handle != 0 && matches!(outcome, Outcome::Applied { .. }) {
-        consumed = true;
-        if !map_attached_buffer(srv, body, handle) {
-            return true;
-        }
-    }
-    if handle != 0 && !consumed {
+    // **An attach is its memory**: mapped before `dispatch`, so the stack never holds geometry with
+    // none behind it, and recorded after, as a rejected one would put the client's memory under
+    // ids it does not own. The handle is disposed of exactly once.
+    let memory = if op == OP_ATTACH_BUFFER { map_attached_buffer(body, handle) } else { None };
+    if op != OP_ATTACH_BUFFER && handle != 0 {
         // SAFETY: closing a handle this process owns and will not use.
         unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+    }
+    let outcome = if op == OP_ATTACH_BUFFER && memory.is_none() {
+        Outcome::Failed(SurfaceError::Malformed)
+    } else {
+        // SAFETY: a bounded mutable slice over the reply buffer; `body` is a local copy.
+        unsafe { dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut REPLY_MSG[PAYLOAD_OFF + 16..]) }
+    };
+    drain_stack_events(srv);
+    if let Some(m) = memory
+        && matches!(outcome, Outcome::Applied { .. })
+    {
+        srv.buffers.retain(|b| !(b.window == m.window && b.buffer == m.buffer));
+        srv.buffers.push(m);
     }
 
     match outcome {
@@ -1964,10 +1966,6 @@ fn handle_session_request(
             }
         }
         Outcome::Applied { release, dirty } => {
-            // A destroy is transitive, so drop every mapping whose window is gone, or a looping
-            // client grows the compositor's address space.
-            srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
-
             // Paint before releasing: a `Release` tells the client the frame is done, and pacing
             // off that would see an unpainted screen.
             match dirty {

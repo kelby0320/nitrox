@@ -418,6 +418,11 @@ whatever the framebuffer last held, which reads as a slightly wrong colour rathe
 error. So a client built against a newer compositor is refused by an older one instead of drawn
 incorrectly, and a client built against an older one keeps sending `0` and is unaffected.
 
+**The handle must be a `MemoryObject`, and carry `INSPECT` so the compositor can see that it is.**
+Anything else, no handle included, is refused `InvalidArgument` and changes nothing. A file would
+map, but it faults in through its server on the compositor's one thread, and a fill that fails
+there ends the compositor.
+
 The client picks the buffer id so it can name it in a later `Commit` without waiting for a
 reply. A `pitch` too small to hold a row is **rejected**: accepting it would alias rows in
 a buffer the client owns, which the compositor cannot detect any other way.
