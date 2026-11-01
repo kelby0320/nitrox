@@ -43,6 +43,7 @@ use desktop_shell::{
 use librsproto::surface::{
     CreateWindowRequest, Edge, MgrLayout, OP_MGR_QUERY_LAYOUT, OP_MGR_SET_WINDOW_DESKTOP, Role, STICKY_DESKTOP,
 };
+use libsurface::buffers::BufferPool;
 use libsurface::ipc::ChannelTransport;
 use libsurface::{Session, Transport};
 use libui::element::{Element, Insets, custom, fill, offset, padding, row, sized, stack, text};
@@ -517,7 +518,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let ending_anchor = ending_anchor(&shown_clock, &theme, &font, screen);
     let mut name = TextFieldState::new();
     let mut overview: Option<u32> = None;
-    let mut over_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    let mut over_pool: Option<BufferPool> = None;
     let mut shots: alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
     let mut dragging: Option<u32> = None;
     let mut overview_dirty = false;
@@ -1123,7 +1124,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     && k.pressed != 0
                     && k.keycode == KEY_ESC
                 {
-                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_addrs, screen);
+                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_pool);
                     continue;
                 }
                 if let libsurface::WindowEvent::Pointer(p) = event
@@ -1175,8 +1176,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                             &mut overview,
                                             &mut shots,
                                             &mut dragging,
-                                            &mut over_addrs,
-                                            screen,
+                                            &mut over_pool,
                                         );
                                     }
                                 }
@@ -1208,21 +1208,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                             &mut overview,
                                             &mut shots,
                                             &mut dragging,
-                                            &mut over_addrs,
-                                            screen,
+                                            &mut over_pool,
                                         );
                                     }
                                 }
                             }
                             (None, Some(i)) if desktops[i].id == current_desktop => {
-                                close_overview(
-                                    &mut session,
-                                    &mut overview,
-                                    &mut shots,
-                                    &mut dragging,
-                                    &mut over_addrs,
-                                    screen,
-                                );
+                                close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_pool);
                             }
                             (None, Some(i)) => {
                                 if let Some(m) = manager.as_mut() {
@@ -1243,14 +1235,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             // A click on the overview's background dismisses it; it covers the
                             // bar, so a second click on the desktop's name lands here.
                             (None, None) => {
-                                close_overview(
-                                    &mut session,
-                                    &mut overview,
-                                    &mut shots,
-                                    &mut dragging,
-                                    &mut over_addrs,
-                                    screen,
-                                );
+                                close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_pool);
                             }
                             _ => {}
                         }
@@ -1349,7 +1334,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 &desktops,
                                 current_desktop,
                                 &entries,
-                                &mut over_addrs,
+                                &mut over_pool,
                                 wallpaper.as_ref().map(|w| w.picture.as_slice()),
                                 screen,
                             );
@@ -1438,7 +1423,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     &desktops,
                     current_desktop,
                     &entries,
-                    &over_addrs,
+                    &mut over_pool,
                     wallpaper.as_ref().map(|w| w.picture.as_slice()),
                     screen,
                 );

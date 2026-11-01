@@ -1226,15 +1226,13 @@ The trigger this entry named — "the first client with two windows" — arrived
 predicted, at Part C's menus. Filed at the PR #184 re-review on 2026-08-11 and closed nine days
 later without the intervening milestones having to guess.
 
-**A refused capture leaks its buffer — `TODO(capture-refused-leak)`.** `desktop-shell`'s
-`capture_window` maps a shared buffer, sends its handle with the request, and unmaps it only on
-success: a refusal — a window closed between the overview's list and its capture — leaves up to
-144 KiB mapped for the session. A failed send also leaves the handle, since
-`libsurface::Transport::request` moves a handle only on a successful send and says nothing of who
-closes it otherwise; `Window::attach`, its other caller with a handle, has the same gap. Found by
-reading in PR #380's review (finding 6). **Trigger**: Part D's bug bash — settle `request`'s
-handle contract (consumed on every path is the simplest for callers), then unmap on every path out
-of `capture_window`, held by a boot that destroys a window as the overview opens.
+**A capture that fails to send leaks its handle — `TODO(capture-refused-leak)`.** `desktop-shell`'s
+`capture_window` sends a shared buffer's handle with its request, and a failed send leaves the
+handle, since `libsurface::Transport::request` moves one only on a successful send and says nothing
+of who closes it otherwise; `Window::attach`, its other caller with a handle, has the same gap. The
+mapping goes on every path. Found by reading in PR #380's review (finding 6). **Trigger**: P7's
+channel send, which settles `request`'s handle contract (desk-o1): consumed on every path is the
+simplest for callers.
 
 ### Processes and memory
 

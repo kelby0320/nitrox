@@ -69,29 +69,14 @@ pub(super) fn open_wallpaper(
     };
     // Everything past `create` unwinds through one exit, because the window now exists: returning
     // `None` would leave a full-screen, hit-testable `panel` with nothing committed, for the life
-    // of the process.
-    let mut ok = true;
-    for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
-            kprint(b"desktop-shell: wallpaper buffer alloc FAILED\n");
-            ok = false;
-            break;
-        };
-        // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
-        // are distinct allocations, so they cannot overlap.
-        unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
-        let Some(mut w) = session.window(id) else {
-            kprint(b"desktop-shell: wallpaper window vanished\n");
-            ok = false;
-            break;
-        };
-        if w.attach(i as u32, screen.width, screen.height, pitch as u32, handle).is_err() {
-            kprint(b"desktop-shell: wallpaper AttachBuffer FAILED\n");
-            ok = false;
-            break;
-        }
-    }
-    if ok {
+    // of the process. The pool goes on every path: nothing here writes the picture twice, and the
+    // compositor's mappings keep what it shows.
+    let size = libdraw::geom::Size::new(screen.width, screen.height);
+    let mut pool = session.window(id).and_then(|mut w| BufferPool::new(&mut w, size, BUFFERS));
+    let mut ok = pool.as_mut().is_some_and(|p| (0..BUFFERS as u32).all(|i| p.write(i, &picture)));
+    if !ok {
+        kprint(b"desktop-shell: wallpaper buffers FAILED\n");
+    } else {
         match session.window(id) {
             Some(mut w) => {
                 if w.commit(0, (0, 0, screen.width, screen.height)).is_err() {
