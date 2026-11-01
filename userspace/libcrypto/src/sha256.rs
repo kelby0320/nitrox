@@ -49,6 +49,23 @@ impl Default for Sha256 {
     }
 }
 
+/// **Zeroed when dropped**: keyed by HMAC its state follows from a password, and a long key's tail
+/// waits in `buf`.
+impl Drop for Sha256 {
+    fn drop(&mut self) {
+        wipe(&mut self.state, [0; 8]);
+        wipe(&mut self.buf, [0; BLOCK_LEN]);
+        wipe(&mut self.buf_len, 0);
+        wipe(&mut self.total_len, 0);
+    }
+}
+
+/// Overwrite `place` with `zero` in a write the optimiser keeps, though nothing reads it again.
+pub(crate) fn wipe<T: Copy>(place: &mut T, zero: T) {
+    // SAFETY: `place` is a valid, exclusive reference, and a `Copy` value has nothing to drop.
+    unsafe { core::ptr::write_volatile(place, zero) };
+}
+
 impl Sha256 {
     /// A fresh hasher over the empty message.
     pub const fn new() -> Self {
@@ -229,6 +246,20 @@ mod tests {
         h.update(&msg[10..11]);
         h.update(&msg[11..]);
         assert_eq!(h.finalize(), one);
+    }
+
+    /// Dropped, a hasher holds nothing of what it read; the field-by-field drop is the control.
+    #[test]
+    fn a_dropped_hasher_is_zeroed() {
+        let mut h = core::mem::MaybeUninit::new(Sha256::new());
+        // SAFETY: `h` was initialised above.
+        unsafe { (*h.as_mut_ptr()).update(b"the tail of a long key") };
+        // SAFETY: dropped once, in place; the bytes stay readable as the plain data they are.
+        let bytes = unsafe {
+            core::ptr::drop_in_place(h.as_mut_ptr());
+            core::slice::from_raw_parts(h.as_ptr() as *const u8, size_of::<Sha256>())
+        };
+        assert!(bytes.iter().all(|&b| b == 0), "{bytes:?}");
     }
 
     #[test]
