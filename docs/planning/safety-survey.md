@@ -1,7 +1,8 @@
 # The safety survey: defects, opportunities and their triage
 
 **Status: planned 2026-10-26 (the maintainer's call); its thirteen subsystems surveyed
-2026-10-26 and 2026-10-27, and triaged 2026-10-27 with the maintainer.** Part I of
+2026-10-26 and 2026-10-27, and triaged 2026-10-27 with the maintainer; every item marked fix fixed
+by 2026-11-01.** Part I of
 [`pre-phase-7.md`](pre-phase-7.md) filled it, a `/safety-survey` run a section, and fixes what is
 marked fix.
 
@@ -5134,7 +5135,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Defects**
 
-- [ ] **desk-d1** `userspace/desktop-session-mgr/src/main.rs:421` — `open_greeter` maps two new
+- [x] **desk-d1** `userspace/desktop-session-mgr/src/main.rs:421` — `open_greeter` maps two new
   shared buffers on every call and overwrites `addrs[i]` without unmapping the old pair. The crate
   has no `SYS_MEMORY_UNMAP` anywhere. Someone at the greeter types a wrong password and presses
   Enter repeatedly (logins and logouts do the same). Each submit destroys the window (:362), then
@@ -5145,8 +5146,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   while the same grep finds `overview.rs:40` in desktop-shell (positive control). `open_greeter`
   runs after every submit and at startup (:301). Not booted. Counting free frames across N refused
   logins would put a number on it. abi, ownership, soundness, opportunities. Medium. **Fix.**
+  Fixed in `e07bd09d`, with desk-o6: the pool goes when the window does. A probe under
+  check-logout read addresses climbing through a boot, and reads the same two after every logout.
 
-- [ ] **desk-d2** `userspace/nxterm/src/backend.rs:206` — `Backend::output` is a safe fn returning
+- [x] **desk-d2** `userspace/nxterm/src/backend.rs:206` — `Backend::output` is a safe fn returning
   `Option<&'static [u8]>` into `static mut MSG`. `output()`, `typed()`/`send()` and `recv_is_ok`
   on any tab's `Backend` overwrite `MSG`, so safe code can hold the slice across a write. That is
   an aliasing violation, and the bytes change underneath it. The only caller today (main.rs:580)
@@ -5161,8 +5164,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the held slice reads `XYllo` after a send and `WORLD` after a second receive. The reproduction
   is out of tree because `backend.rs` is in the bin crate. The probe was restored. abi, ownership,
   soundness, opportunities. Medium. **Fix.**
+  Fixed in `a818ddbe`: each `Backend` owns its buffer and `output` borrows from `&mut self`.
+  Holding the slice across `typed` is `E0502`, where the old signature compiled.
 
-- [ ] **desk-d3** `userspace/nxterm/src/main.rs:334` — `spawn_shell` returns the shell's process
+- [x] **desk-d3** `userspace/nxterm/src/main.rs:334` — `spawn_shell` returns the shell's process
   handle (SIGNAL|TERMINATE) and `reconcile_backends` only tests it `< 0` and drops it. Every tab
   leaks a Process handle in nxterm's table and pins the exited shell's Process object. Opening
   and closing tabs or windows (`open_window` also calls `reconcile_backends`) grows the table
@@ -5171,6 +5176,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   returns it. `grep -rn 'spawn_shell(' userspace` finds only the definition and this caller. The
   kernel returns `parent_handle.bits()` (table.rs:491-509), and desktop-shell's `launch` closes
   the same value (apps.rs:390/416). abi, ownership. Medium. **Fix.**
+  Fixed in `a818ddbe`: `spawn_shell` closes it and says only whether the shell started. A
+  probe closing what the old one returned found it open every time.
 
 - [x] **desk-d4** `userspace/libos/src/objects.rs:44` — `Handle<Memory, M>::unmap(&self, addr, len)`
   is a safe fn, but the kernel unmaps the whole VMA covering `addr` and ignores both the size and
@@ -5183,7 +5190,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   ownership. Medium. **Fix**, as rt-d2.
   Fixed with rt-d2, in `670a3414`.
 
-- [ ] **desk-d5** `userspace/compositor/src/main.rs:1576` — `map_attached_buffer` maps whatever
+- [x] **desk-d5** `userspace/compositor/src/main.rs:1576` — `map_attached_buffer` maps whatever
   object the client transferred, though the spec says `AttachBuffer` carries a MemoryObject, and
   the SAFETY comment claims "a MemoryObject". Nothing checks the type (no `SYS_HANDLE_STAT`;
   `HandleInfo.object_type` exists). An app resolves a file with `MAP_READ|TRANSFER`, sends it as
@@ -5196,6 +5203,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   file as buffer 0, commits, ejects the stick (check-media's flow) and forces a repaint. The same
   boot would test the fix, refusing `object_type != MemoryObject` before the map. abi, soundness.
   Medium (would be high if the compositor counts as a critical service). **Fix.**
+  Fixed in `d30b02dc`: an attach that is not a `MemoryObject` is refused before `dispatch`,
+  which needs `INSPECT` (`rsproto-surface-ops.md`). `a_session_takes_memory_and_whole_bodies_test`
+  is a client on `/dev/draw/new`, and fails without it. No stick was pulled.
 
 - [x] **desk-d6** `userspace/libdraw/src/acquire.rs:52` — `read_info` maps the FramebufferInfo
   object and never unmaps it, and the kernel mints a fresh object per resolve
@@ -5209,7 +5219,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   soundness, opportunities. Low. **Fix**, as rt-d5.
   Fixed with rt-d5, in `2cde6627`.
 
-- [ ] **desk-d7** `userspace/libdraw/src/acquire.rs:99` — `acquire` maps `info.byte_len` bytes but
+- [x] **desk-d7** `userspace/libdraw/src/acquire.rs:99` — `acquire` maps `info.byte_len` bytes but
   wraps them in `RawFramebuffer::new`, whose contract needs `geometry.byte_len()` = pitch x
   height. `geometry_from` (:62-76) never reads `byte_len`, so the SAFETY argument ("maps byte_len
   writable bytes") names the wrong quantity. It holds only because the kernel computes
@@ -5220,8 +5230,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   structural.
   Demonstrated by path (acquire.rs:61-76, :99; framebuffer.rs:337-343). abi, soundness. Low.
   **Fix.**
+  Fixed in `d240d674`: `geometry_from` refuses it. Fails without it:
+  `an_aperture_short_of_its_last_row_is_refused`.
 
-- [ ] **desk-d8** `userspace/desktop-shell/src/wallpaper.rs:88` — `open_wallpaper` unmaps none of
+- [x] **desk-d8** `userspace/desktop-shell/src/wallpaper.rs:88` — `open_wallpaper` unmaps none of
   its shared buffers on any path. On a failed attach, a refused commit (:98) or a vanished window
   (the `!ok` exit, :108-112), the screen-sized mappings (about 4 MB each at 1280x800) stay mapped
   for the shell's life. On success both stay too, though nothing writes them after the copy.
@@ -5230,8 +5242,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path: nothing in `wallpaper.rs` calls `SYS_MEMORY_UNMAP` or `release_buffer`;
   `overview.rs:209-213` releases on the same kind of failure. abi, soundness, opportunities. Low.
   **Fix.**
+  Fixed in `e07bd09d`, with desk-o6: the pool goes on every path, success included. By
+  reading: nothing forces these paths in a boot.
 
-- [ ] **desk-d9** `userspace/desktop-shell/src/overview.rs:196` — when `attach_with_format` fails in
+- [x] **desk-d9** `userspace/desktop-shell/src/overview.rs:196` — when `attach_with_format` fails in
   `open_overview` (and `open_wallpaper`, wallpaper.rs:88), the MemoryObject handle is left open.
   The cleanup unmaps and destroys the window but never closes `handle`. libsurface transfers the
   handle only on a successful send (buffers.rs:113-114), so a refused NOBLOCK send (session ring
@@ -5240,8 +5254,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: read, not booted. A boot with the attach send forced to fail, counting handles,
   would settle it. `libsurface/src/buffers.rs:install` shows the correct cleanup for the same
   failure. ownership. Low. **Fix.**
+  Fixed in `e07bd09d`, with desk-o6, whose `install` closes the handle. By reading: nothing
+  forces a failed attach in a boot.
 
-- [ ] **desk-d10** `userspace/nxterm/src/backend.rs:250` — `spawn_shell` documents `terminal` as
+- [x] **desk-d10** `userspace/nxterm/src/backend.rs:250` — `spawn_shell` documents `terminal` as
   moved, but its early `return -1` paths (no `/bin/nxsh` at :248-250, setup-channel failure at
   :252-255) never close it, unlike the spawn-failure (:276) and send-failure (:296) paths.
   `attach`'s `make_channel()?` at :145 returns without closing the `tty` resolved at :140.
@@ -5250,8 +5266,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   a failed channel create, and each further tab leaks another handle.
   Demonstrated by path (the two close-sites and the early returns, side by side). abi, ownership,
   opportunities. Low. **Fix.**
+  Fixed in `a818ddbe`: each early return closes it. With `/bin/nxsh` made to miss and each
+  `Backend` kept, a probe ran out of terminals at round 13, and has one in all 20 now.
 
-- [ ] **desk-d11** `userspace/nxterm/src/main.rs:695` — the wait set spans the session channel plus
+- [x] **desk-d11** `userspace/nxterm/src/main.rs:695` — the wait set spans the session channel plus
   every backend of every window, but `MAX_TABS` (MAX_WAIT_HANDLES - 1) caps tabs per window only.
   Two windows of 31 tabs give 63 handles, and 32 windows of one tab give 33. The kernel refuses
   a wait over 32 (table.rs:1767), `wait_any` returns false and :696 calls `fail(...)`, which exits
@@ -5260,8 +5278,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (`1 + a.tabs().len() + b.tabs().len() <= MAX_WAIT_HANDLES`; "waits on 63 handles", and 33 with
   15 per window). The const assert at lib.rs:2317 checks one window. Probe restored. ownership,
   opportunities. Low. **Fix.**
+  Fixed in `55b2cd35`: `MAX_TABS` counts the process's windows, and a window past it is
+  refused. Not reachable today, as a tab gets a handle only with a terminal and the tty server has
+  14. Fails without it, and with the bound moved by one:
+  `the_cap_counts_the_process_s_other_windows`. What `main` passes in is by reading.
 
-- [ ] **desk-d12** `userspace/compositor/src/main.rs:1704` — `handle_session_request` copies each
+- [x] **desk-d12** `userspace/compositor/src/main.rs:1704` — `handle_session_request` copies each
   request body into `MAX_BODY` = 4 + `MAX_TITLE` = 260 bytes, sized for SetTitle, the comment
   calling the min "a bounds check, not a policy". StartDrag allows 12 + 512 + 64 = 588 bytes
   (rsproto-surface-ops.md:1442-1443), and libsurface sizes it that way (lib.rs:574). nxfiles
@@ -5273,8 +5295,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   but `StartDrag::read` on the first 260 bytes was `None`. A 278-byte StartDrag failed
   `assert_eq!(whole, cut)`, with the name 60 vs 42 'n'. A second probe in librsproto's tests
   found the same: 300-byte path `None`, 200+64 gives a 48-byte name. abi, soundness. Low. **Fix.**
+  Fixed in `d30b02dc`: `MAX_BODY` is `RS_MAX_BODY`. `a_session_takes_memory_and_whole_bodies_test`
+  fails with the old bound, a 300-byte path answered `InvalidArgument` rather than `NotFound`.
 
-- [ ] **desk-d13** `userspace/compositor/src/main.rs:1354` — `Manage::Close` (desktop-shell's
+- [x] **desk-d13** `userspace/compositor/src/main.rs:1354` — `Manage::Close` (desktop-shell's
   insist_on_close) destroys a window and its popups through the manager path, which never drops
   their `MappedBuffer`s. `srv.buffers.retain` runs only at :1558 (close_session), :1573 and :1991
   (after a session request is Applied). A hung app force-closed by a double middle-click keeps its
@@ -5284,8 +5308,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path: `grep -n 'buffers.retain' userspace/compositor/src/main.rs` finds only
   those three lines, none inside `handle_manager_request` (:1291-1481). ownership, soundness. Low.
   **Fix.**
+  Fixed in `d30b02dc`: `drain_stack_events`, which every removal passes through, drops them,
+  and the two hand-placed `retain`s go. A one-off probe under check-logout read 0 mappings of gone
+  windows after a close, and 10 with that line removed.
 
-- [ ] **desk-d14** `userspace/compositor/src/main.rs:1916` — an AttachBuffer carrying no handle is
+- [x] **desk-d14** `userspace/compositor/src/main.rs:1916` — an AttachBuffer carrying no handle is
   still applied: `dispatch` records the new geometry for (window, buffer), but the mapping is
   replaced only `if op == OP_ATTACH_BUFFER && handle != 0`. A client attaches (W,B) at 8x8 with
   memory, re-attaches (W,B) at 4096x4096 without a handle and commits. The stack says 64 MiB
@@ -5295,16 +5322,21 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated by path: server.rs:182-189, lib.rs:724-726, main.rs:1916. The existing test
   `a_short_buffer_is_skipped_rather_than_read_past_its_end` covers the readers, not this
   producer. ownership. Low. **Fix.**
+  Fixed in `d30b02dc`: an attach with no memory is refused, and memory is mapped before
+  `dispatch`, so the stack never holds geometry with none behind it.
+  `a_session_takes_memory_and_whole_bodies_test` fails without it.
 
-- [ ] **desk-d15** `userspace/compositor/src/main.rs:2121` — when the supervisor's control channel
+- [x] **desk-d15** `userspace/compositor/src/main.rs:2121` — when the supervisor's control channel
   reads `Closed`, it is dropped from the wait set (`control = 0`) and the handle is never closed.
   The same in `input-server/src/main.rs:825` and `clipboard-server/src/main.rs:378`.
   `libkern::control::recv` does not close it. Bounded at one handle per process, but no path ever
   closes it.
   Demonstrated by path (`Control::Closed => control = 0` with no `SYS_HANDLE_CLOSE`). ownership.
   Low. **Fix.**
+  Fixed in `660b2e6c`: `control::recv` closes it, for all ten callers, and auth-service
+  closes its endpoint the same way. Fails without it: `only_a_channel_closed_for_good_is_closed`.
 
-- [ ] **desk-d16** `userspace/compositor/src/server.rs:113` — `static mut TITLE_TRUNCATED_LOGGED`
+- [x] **desk-d16** `userspace/compositor/src/server.rs:113` — `static mut TITLE_TRUNCATED_LOGGED`
   lives in the compositor library and is read and written without synchronisation by the safe
   `pub fn dispatch` (via `note_title_truncated`). The "single-threaded server" argument holds for
   the binary but not for libtest, which gives every test its own thread. Today only
@@ -5314,6 +5346,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   reported "Data race detected between (1) non-atomic write on thread `server::title_t` and (2)
   non-atomic read on thread `unnamed-2`" at server.rs:120/123. Probe removed, `git status` clean.
   soundness, opportunities. Low. **Fix.**
+  Fixed in `d188a633`, with desk-o7: an `AtomicBool`.
+  `at_most_one_thread_reports_a_title_truncated` passes under Miri, which reports a data race on
+  the old `static mut`.
 
 - [ ] **desk-d17** `userspace/compositor/src/main.rs:159` — `BufferSource::pixels` builds a `&[u8]`
   over a mapping the client holds read-write (libsurface maps `MAP_READ|MAP_WRITE`,
@@ -5437,7 +5472,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   nothing (the handle that moves at attach shares desk-o1's send contract). abi, ownership,
   soundness, opportunities. Value high, effort medium. **Plan**, as rt-o3, in P7.
 
-- [ ] **desk-o6** remove: desktop-session-mgr and desktop-shell hand-roll shared window buffers
+- [x] **desk-o6** remove: desktop-session-mgr and desktop-shell hand-roll shared window buffers
   (own `shared_buffer`, raw `*mut u8` arrays, `copy_nonoverlapping`, manual release) where
   `libsurface::buffers::BufferPool` already does it safely and libui uses it (`window.rs:83`) — 3
   buffer sets, counted by `grep -n 'copy_nonoverlapping\|fn shared_buffer\|shared_buffer(len)'
@@ -5452,8 +5487,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   release, which leaked 9 MB once in 77f5aeff). `install` also closes and unmaps on a failed
   attach, which closes desk-d9 for these sites. Depends on: nothing. opportunities. Value high,
   effort small. **Fix.**
+  Finished in `e07bd09d`. Also the mapping half of `TODO(capture-refused-leak)`.
 
-- [ ] **desk-o7** remove: `static mut` used as syscall out-params and diagnostic counters where a
+- [x] **desk-o7** remove: `static mut` used as syscall out-params and diagnostic counters where a
   local or an atomic serves — 21 sites (of 57 `static mut`), counted by `grep -rnE 'static mut
   (CTRL_OUT[01]|CH_OUT[01]|CH[01]|CLOCK_BUF|[A-Z_]*LOGGED|REDRAWS)\b'` (19) plus `SPAWN_APP`,
   `NOTIF` and `OVERRUNS_LOGGED`: 14 out-params (CLOCK_BUF x3, CTRL_OUT0/1 x2, CH_OUT0/1 x2,
@@ -5470,6 +5506,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (main.rs:896-1048) exists only for `INPUT_DIAGS_LOGGED`; about 45 of the 302 unsafe blocks wrap
   these statics. Depends on: nothing. abi, ownership, soundness, opportunities. Value medium,
   effort small. **Fix.**
+  Finished in `d188a633`, by the implementer. `libkern` gains `channel_create` and
+  `clock_read`, used by the desktop's crates; the others' helpers move with P7.
 
 - [ ] **desk-o8** encapsulate: server state kept in `static mut` tables whose "nothing else holds
   it" claim rests on call order — 10 statics (SESSION_CH and MANAGER_CH in the compositor;

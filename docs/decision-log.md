@@ -37350,3 +37350,35 @@ session-mgr closes its terminal on every path (sec-d1, with the bash's sec-12); 
 setup fails is stopped and waited for, and the image is closed when the pipe fails (sec-d6); the
 broker closes a pair one failed create left (sec-d5); and the registry snapshot is unmapped at its
 length (sec-d9). sec-d11 was fixed in PR #403's review.
+
+## 2026-11-01 — Before Phase 7, Part I: an attach is its memory, and the survey's fix list ends
+
+Group W of the survey's triage, the desktop, was the last of the 221 items marked fix. It made six
+decisions:
+
+- **An attach is its memory** (desk-d5, desk-d14): the compositor refuses an `AttachBuffer` whose
+  handle is not a `MemoryObject`, no handle included, and maps before `dispatch`, so a stack entry
+  always has memory behind it. A file would have mapped and faulted in on the compositor's one
+  thread, where a failed fill ends the session. Asking what a handle is needs `INSPECT`, which the
+  spec now requires of a buffer, and every buffer in-tree has.
+- **A mapping goes with its window, in one place** (desk-d13): `drain_stack_events`, which every
+  removal passes through, in place of a `retain` beside each path that destroys one.
+- **A request's body is as long as a message's** (desk-d12): `MAX_BODY` is `RS_MAX_BODY`, not the
+  longest op's, so an op added later cannot be cut.
+- **Tabs are the process's, not a window's** (desk-d11): `MAX_TABS` counts every window, as they
+  share one `sys_wait`, and a window past it is refused. Not reachable today, as the tty server's
+  14 terminals run out first; it is the bound the kernel holds, ahead of the day that one rises.
+- **`control::recv` closes a channel closed for good** (desk-d15), for all ten of its callers,
+  which read `Closed` as never touching it again.
+- **`libkern` gains `channel_create` and `clock_read`** (desk-o7), the first of the thin safe
+  wrappers rt-o9 plans. The desktop's crates use them, and the others' copies move with P7.
+
+The rest are fixes. The greeter, the wallpaper and the overview draw through `BufferPool`, which
+closes their leaked mappings and handle (desk-o6, desk-d1, desk-d8, desk-d9), and a refused capture
+unmaps, the handle half of `TODO(capture-refused-leak)` waiting on P7's send. Each nxterm `Backend`
+owns the buffer `output` lends (desk-d2), and `spawn_shell` closes what each path owns
+(desk-d3, desk-d10). `acquire` refuses an aperture short of its rows (desk-d7). The desktop's
+out-params and diagnostic counters stop being `static mut` (desk-o7, desk-d16).
+
+**Part I is not finished by this**: its Miri job is still to build, and libos, the layer it pointed
+at, is Part E's.
