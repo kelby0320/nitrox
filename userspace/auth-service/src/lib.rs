@@ -39,7 +39,10 @@ const DUMMY_VERIFIER: [u8; VERIFIER_LEN] = [0u8; VERIFIER_LEN];
 /// runs a dummy verify (constant work) and returns [`AuthOutcome::Denied`].
 pub fn authenticate<'a>(db: &'a [u8], username: &[u8], password: &[u8]) -> AuthOutcome<'a> {
     match libusers::find(db, username) {
-        Some(rec) if rec.verifies(password) => AuthOutcome::Authenticated { principal: rec.name, home: rec.home },
+        // A home no session can bind logs no one in, decided after the derivation as a password is.
+        Some(rec) if rec.verifies(password) && libusers::valid_home(rec.home) => {
+            AuthOutcome::Authenticated { principal: rec.name, home: rec.home }
+        }
         Some(_) => AuthOutcome::Denied,
         None => {
             // Unknown user: run an equivalent derivation so timing does not distinguish it.
@@ -262,6 +265,21 @@ mod tests {
         let n = libusers::write_record_with(&mut out, user.as_bytes(), home.as_bytes(), password.as_bytes(), salt, IT)
             .unwrap();
         std::string::String::from_utf8(out[..n].to_vec()).unwrap()
+    }
+
+    /// A home the kernel refuses as a subtree base is refused here, and one of 128 bytes is not.
+    #[test]
+    fn a_home_no_session_can_bind_logs_no_one_in() {
+        let longest = format!("/{}", "h".repeat(libusers::HOME_MAX - 1));
+        let past = format!("{longest}h");
+        for (home, ok) in [("/home/alice", true), (&longest, true), (&past, false), ("/home/alice/", false)]
+            .into_iter()
+            .chain(["/", "home/alice", "/home//alice", "/home/./alice", "/home/../etc", ""].map(|h| (h, false)))
+        {
+            let db = cheap_line("alice", "pw", b"s1", home);
+            let got = authenticate(db.as_bytes(), b"alice", b"pw");
+            assert_eq!(got != AuthOutcome::Denied, ok, "{home:?}");
+        }
     }
 
     fn admin(op: u16, body: &[u8], db: &str) -> (Admin, std::string::String) {
