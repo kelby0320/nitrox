@@ -3919,7 +3919,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Defects**
 
-- [ ] **sec-d1** `userspace/session-mgr/src/main.rs:224` — When a successful login's namespace
+- [x] **sec-d1** `userspace/session-mgr/src/main.rs:224` — When a successful login's namespace
   fails to build, the loop `continue`s without `tty_close`, so the terminal opened at line 187
   leaks, and with it one of tty-server's 14 terminal slots (MAX_TTYS = (32-3)/2). A
   /system/users record whose home the kernel refuses as a subtree base (`/home/alice/`, `/`, a
@@ -3934,6 +3934,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (`cargo test --lib --target x86_64-unknown-linux-gnu survey_probe`). The only `tty_close`
   calls are at 252-254 and 274-276, and tty-server/src/main.rs:43 and :290 refuse the 15th
   terminal. ownership, soundness. Medium. **Fix**, with the bash's sec-12, moved here from Part H.
+  Fixed in `fa31e763` and `cbbf09e0`, with sec-12: session-mgr's session is a labelled block the
+  namespace failure breaks out of, and the terminal is closed once, after it, on every path; and
+  auth-service answers `Denied` for a record whose home `libusers::valid_home` refuses, the kernel's
+  subtree-base rules, after the derivation (the maintainer's choice of where). The close is
+  structural; `a_home_no_session_can_bind_logs_no_one_in` fails without the check, or with its bound
+  moved by one.
 - [x] **sec-d2** `userspace/libos/src/exec.rs:133` — `Op::poll` is a safe `Future` impl that
   turns `cx.waker().data()` into `&Reactor`. It is sound only when libos's `block_on` built the
   Waker, so a foreign Waker makes safe code produce a null or foreign reference. libos is
@@ -3947,7 +3953,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   'panicked at libos/src/exec.rs:133:32: null reference produced'. Probe removed. opportunities.
   Medium. **Fix**, as rt-d1.
   Fixed with rt-d1, in `aedd2368`.
-- [ ] **sec-d3** `userspace/libsession/src/lib.rs:208` — `authenticate` (and `views_call`, line
+- [x] **sec-d3** `userspace/libsession/src/lib.rs:208` — `authenticate` (and `views_call`, line
   252) takes the next message on a long-lived channel as the answer to its request. The request
   id is always 1 and is never compared, and the reply's principal is never compared with
   `user`, so a reply left unread is taken by the next call as its own. One auth channel is
@@ -3961,7 +3967,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Contrast session-mgr `tty_request` (fresh ids) and the broker's `ask_auth` (closes the
   channel on give-up). Unverified: fail one `sys_channel_recv` allocation on the auth channel
   under QEMU, or add a host seam for libsession's syscalls. abi. Medium. **Fix.**
-- [ ] **sec-d4** `userspace/auth-service/src/main.rs:73` — `ADMIN_REPLY` is sized
+  Fixed in `d8ecec11`, with sec-o3 (`15982e22`): `authenticate` and `views_call` go through
+  `round_trip`, which skips a reply to any request but its own, each call with an id of its own,
+  the broker's checks included. `a_reply_to_another_request_is_skipped` fails with either half of
+  the comparison removed; the loop around it makes syscalls.
+- [x] **sec-d4** `userspace/auth-service/src/main.rs:73` — `ADMIN_REPLY` is sized
   `MSG_LEN - PAYLOAD_OFF - 64` = 4008 (a whole payload) where a reply body may be at most
   `RS_MAX_BODY` = 3980. A List body of 3981..=4008 bytes is built as `Admin::Reply`, then
   `send_reply`'s `encode` refuses it and returns without sending anything. A hand-written
@@ -3975,7 +3985,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `librsproto::encode` into the 4072-byte tail returned None ('list body 4007 bytes;
   RS_MAX_BODY 3980', 'encode -> None'). Control: a reply buffer of `RS_MAX_BODY` gives
   `Refused(ListTooLong)`. abi, soundness, opportunities. Low. **Fix.**
-- [ ] **sec-d5** `userspace/view-broker/src/main.rs:1447` — `let (Ok((setup_ours,
+  Fixed in `8a210a6f`, with sec-o9: `serve_admin` takes its reply as a `[u8; RS_MAX_BODY]`, so no
+  other size compiles. `a_list_that_does_not_fit_is_refused` lists exactly `RS_MAX_BODY` bytes and
+  encodes them, and has one byte more refused; with the 4008-byte buffer it is answered again.
+- [x] **sec-d5** `userspace/view-broker/src/main.rs:1447` — `let (Ok((setup_ours,
   setup_child)), Some((life_ours, life_child))) = (pipe(1), make_channel(1)) else {..}`
   evaluates both creates, and when exactly one fails the else arm closes `image` and `view_ns`
   but not the pair that was created, so two channel handles leak per failed start. An allowed
@@ -3984,7 +3997,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   later failure adds two. Demonstrated by the path: both pairs are plain `u64`s with no Drop
   (libstream setup.rs:244-253, main.rs:273-278), and the else arm at 1448-1450 names neither.
   Not run. abi, ownership, soundness, opportunities. Low. **Fix.**
-- [ ] **sec-d6** `userspace/libsession/src/lib.rs:1042` — Two error paths in `spawn_leader`
+  Fixed in `4d11c253`: the pair that was made is closed with the image and the view. Structural.
+- [x] **sec-d6** `userspace/libsession/src/lib.rs:1042` — Two error paths in `spawn_leader`
   return -1 without giving back what they took. A failed setup send leaves the leader's Process
   handle `h` open, so the leader is unsupervised and the process pinned. A failed `pipe`
   (lines 948-953) leaves the `image` handle (resolved at 940) open. The leader (nxsh, or
@@ -3996,7 +4010,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   1081, the `sent.is_err()` return at 1042-1045 closes only `setup_mgr`, and the pipe `Err` arm
   at 950-953 never reaches the image close at 965. Not run, since every step is a syscall.
   ownership, soundness, opportunities. Low. **Fix.**
-- [ ] **sec-d7** `userspace/session-mgr/src/main.rs:299` — `login()` reads the typed password
+  Fixed in `991ad0e1`: a failed pipe closes the image, and a failed setup asks the leader to stop
+  and waits for its exit, as a shutdown does, since its `ChildExited` would otherwise end the next
+  session. Structural; test-interactive passes.
+- [x] **sec-d7** `userspace/session-mgr/src/main.rs:299` — `login()` reads the typed password
   into the stack array `pass: [u8; 128]` and never zeroes it, against session-mgr's CLAUDE.md
   ('does not keep it'). `libsession::authenticate` scrubs its own two copies, and
   desktop-session-mgr zeroes its equivalent (main.rs:383). After each attempt the password
@@ -4005,7 +4022,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   fails, until the next successful receive. Demonstrated by the path: `grep scrub
   userspace/session-mgr/src/main.rs` finds nothing, and 299-307 fill, use and drop `pass`.
   Memory not read. abi, ownership, soundness, opportunities. Low. **Fix.**
-- [ ] **sec-d8** `userspace/libcrypto/src/hmac.rs:19` — `HmacSha256::new` leaves the key in `k`,
+  Fixed in `fa31e763`, with sec-o4: the password and the tty reply buffer are `Secret`s, zeroed on
+  every return; desktop-session-mgr's password too. Structural.
+- [x] **sec-d8** `userspace/libcrypto/src/hmac.rs:19` — `HmacSha256::new` leaves the key in `k`,
   in `ipad` and in the `opad` field (key XOR 0x5c), and nothing zeroes them. The type has no
   Drop, and `pbkdf2_hmac_sha256` clones it once per iteration. When PBKDF2 keys it the key is
   the password, so auth-service's stack holds password XOR 0x5c after the request returns, and
@@ -4013,7 +4032,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   probe test (restored) recovered the key from `opad` XOR 0x5c; `needs_drop::<HmacSha256>()`
   was false and a clone carried the same bytes (`cargo test -p libcrypto --lib survey_probe`:
   1 passed). ownership. Low. **Fix.**
-- [ ] **sec-d9** `userspace/libsession/src/lib.rs:719` — `registry_blocks` maps the registry
+  Fixed in `7ba29c27`: `Sha256` and `HmacSha256` zero their state when dropped, and `new` its
+  locals. `a_dropped_mac_is_zeroed` and `a_dropped_hasher_is_zeroed` read a dropped value back as
+  zeroes, and fail with any of the wipes removed; both pass under Miri.
+- [x] **sec-d9** `userspace/libsession/src/lib.rs:719` — `registry_blocks` maps the registry
   snapshot with `info.size` (703) but unmaps it with size 0. It frees the mapping only because
   `sys_memory_unmap` ignores its size argument today (`_size`, TODO(mm),
   kernel/src/syscall/table.rs:946-949). Latent: implementing the partial unmap
@@ -4023,7 +4045,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   admin nxinstall`) would then leak a registry mapping in the broker. Demonstrated by the path:
   every other unmap in scope passes the mapped length. Not run. soundness, opportunities. Low.
   **Fix.**
-- [ ] **sec-d10** `userspace/libsession/src/lib.rs:219` — `authenticate` copies
+  Fixed in `991ad0e1`: the unmap passes `info.size`, the class's last site in userspace.
+- [x] **sec-d10** `userspace/libsession/src/lib.rs:219` — `authenticate` copies
   `min(home.len(), home_out.len())` bytes and still reports success. The supervisors pass
   256-byte buffers while auth-service's reply admits a home up to about 500 bytes, so a longer
   home is silently cut and `/home` is bound at a path the record does not name. `tty_request`
@@ -4035,7 +4058,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   becomes sec-d1's path. Demonstrated by the path: `let n = r.home.len().min(home_out.len());
   ...; (true, n)` at 219-221, and a host probe that a 300-byte home authenticates and comes
   back whole. The wrong-/home binding itself was not run. abi, opportunities. Low. **Fix.**
-- [ ] **sec-d11** `userspace/view-broker/src/main.rs:1489` — `start()` treats an `Err` from
+  Fixed in `d8ecec11` and `fa31e763`: a home, a broker answer or a typed line past its buffer is
+  refused, never cut, and an over-long typed password is checked as empty and denied.
+  `a_home_that_does_not_fit_is_refused` fails with the old copy.
+- [x] **sec-d11** `userspace/view-broker/src/main.rs:1489` — `start()` treats an `Err` from
   `send_setup_full` as 'the stream handles are still ours', which is not always true. A Block
   send that committed closes the moved handles first, then fails to install the PO handle on a
   full table (kernel/src/syscall/table.rs:2030-2041, 'the message was still committed') and
@@ -4046,7 +4072,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: a full broker handle table under QEMU, or a kernel host test of
   `sys_channel_send`'s Block path at a full table asserting the sender's handles are gone while
   Err is returned. abi, ownership. Low. **Fix.**
-- [ ] **sec-d12** `userspace/auth-service/src/main.rs:365` — `serve_session` frees the session
+  Fixed in `f9dcedf5`, PR #403's review: a blocking send makes its PO's handle before the push and
+  closes it if the push is refused, so an `Err` moves nothing. The broker's half went with proto-o2
+  in `2991d0dc`: `send_setup_full` takes every handle on every return.
+- [x] **sec-d12** `userspace/auth-service/src/main.rs:365` — `serve_session` frees the session
   slot and closes the channel on any receive error. Its comment says a closed peer frees it,
   but OutOfMemory, which `sys_channel_recv` returns with the message still queued, closes a
   live client's channel too. During a transient kernel OOM auth-service's recv on session-mgr's
@@ -4056,7 +4085,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   while it is 0, so every `with` password fails for the boot. Compare the broker's `recv_full`,
   which treats only PeerClosed as gone. Unverified: OOM injection into one `sys_channel_recv`
   under QEMU. abi. Low. **Fix.**
-- [ ] **sec-d13** `userspace/view-broker/src/main.rs:73` — The child end of the life channel is
+  Fixed in `8a210a6f`: only `PeerClosed` frees a session; any other failure parks 10 ms and keeps
+  it, and the forwarding endpoint's receive parks too. Structural.
+- [x] **sec-d13** `userspace/view-broker/src/main.rs:73` — The child end of the life channel is
   spawned with every right an endpoint has: `SPAWN.rights` is `u64::MAX`, intersected with
   `channel_endpoint_rights` (SEND|RECV|DUPLICATE|TRANSFER|INSPECT|WAIT). A program that
   duplicates or transfers its life end to a child and exits queues its ChildExited code, but
@@ -4067,7 +4098,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   premise needs checking: the program is never told the life handle's slot, so it must find it
   by enumerating its handles. Unverified: a boot probe that runs a program duplicating its
   handles and checks the reported codes. ownership. Low. **Fix.**
-- [ ] **sec-d14** `userspace/libsession/src/lib.rs:27` — Safe `pub fn`s read and write
+  Fixed in `4d11c253`: the life end is spawned with no rights, so it can be neither duplicated nor
+  moved, and no grant gives a program the syscap a bind needs. Structural; test-interactive's
+  programs are reported exited with their codes.
+- [x] **sec-d14** `userspace/libsession/src/lib.rs:27` — Safe `pub fn`s read and write
   process-wide `static mut` buffers (`authenticate`, `ns_lookup`, `views_open_session` and
   `views_close_session`, `build`, `build_namespace`, `spawn_leader`, `drain_for_stop`,
   `rebind` and `unbind_block_devices`; the statics are SEND_MSG, RECV_MSG, WAIT_HANDLES,
@@ -4080,6 +4114,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   password, or one's scrub zeroes the other's message. Unverified: the interleaving needs
   syscalls, so neither a host test nor Miri reaches it; sec-o2 and sec-o5 make it structural.
   opportunities. Low. **Fix.**
+  Fixed in `0039c4bb`, with sec-o8 and sec-o10, and the buffers too (the maintainer's call):
+  libsession has no `static mut`. Structural.
 
 **Opportunities**
 
@@ -4131,7 +4167,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   nothing for the libkern variant; libos lacks a Channel marker, and auth-service must stay
   alloc-free. abi, ownership, soundness, opportunities. Value high, effort medium.
   **Plan**, as rt-o5, in P7.
-- [ ] **sec-o3** encapsulate: a request/reply exchange on a long-lived channel written out by
+- [x] **sec-o3** encapsulate: a request/reply exchange on a long-lived channel written out by
   hand with a fixed request id (1); some sites take the next message as the answer, others
   match the id but must close the channel on a timeout — 8 sites (the six fixed-id sends found
   by `grep -n "OP_AUTHENTICATE, 1,\|op, 1, 0, body\|OP_STORAGE_IN_USE, 1,\|OP_TTY_REDEEM, 1,\|
@@ -4148,7 +4184,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   feature). Closes: a reply read by position (sec-d3, the stale AUTHENTICATED and `views_call`
   session id) and the tty INTERRUPT bug session-mgr's CLAUDE.md records. Depends on: nothing;
   shares its buffer type with sec-o2. abi. Value high, effort medium. **Fix.**
-- [ ] **sec-o4** encapsulate: how long a password lives in memory depends on hand-placed
+  Fixed in `15982e22`: `round_trip` waits again past a reply whose id or op is not its request's.
+  No deadline: no caller wants one.
+- [x] **sec-o4** encapsulate: how long a password lives in memory depends on hand-placed
   `scrub()` calls; the two places without one leak it — 32 sites (`grep -nE
   "scrub\(|scrub_request\(\)"` over auth-service, view-broker, session-mgr, libsession,
   libprompt and libviews sources, less `fn scrub` and `use libkern`: 30 `scrub(` calls plus
@@ -4163,6 +4201,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Drop). Closes: a password copy dropped unscrubbed (sec-d7, sec-d8) and a scrub skipped by an
   early return added later. Depends on: nothing. ownership, soundness. Value medium, effort
   medium. **Fix.**
+  Fixed in `d8ecec11` (`libkern::Secret`, `a_dropped_secret_is_zeroed`) and `7ba29c27`
+  (libcrypto's own drop), on the login paths: libsession's request buffers, session-mgr's
+  password and tty reply, desktop-session-mgr's password and auth-service's request buffer. The
+  broker's and libprompt's scrubs stay for P7 (the maintainer's call).
 - [ ] **sec-o5** encapsulate: sys_wait through a hand-sized results byte buffer, `IoResult`
   decoded by byte offset (handle 0..8, status 8..12, result 16..24), and the lookup-and-wait PO
   helper rewritten in each crate — 9 sites (`grep -rn "SYS_WAIT," auth-service/src
@@ -4214,7 +4256,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   mapping (held by const asserts), a slice used after its unmap, and a mapping leaked on an
   early return. Depends on: a File object marker in libos. ownership, opportunities. Value
   medium, effort small. **Plan**, as rt-o3, in P7.
-- [ ] **sec-o8** remove: `static mut` used only as a syscall out-parameter, argument block or
+- [x] **sec-o8** remove: `static mut` used only as a syscall out-parameter, argument block or
   value set once, where a stack local, a struct field or an atomic does the same safely — 12
   sites (read of each declaration `grep -nE '^\s*static mut'` lists in the four main files, 44
   in all, less message buffers, wait buffers, SESSION_HAS_* and auth-service's tables:
@@ -4229,7 +4271,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `STOP_ASKED`). Home: each crate. Closes: references to `static mut`, and the library-level
   statics behind safe pub fns (sec-d14); drops one or two unsafe blocks per site. Depends on:
   nothing. abi, soundness, opportunities. Value low, effort small. **Fix.**
-- [ ] **sec-o9** encapsulate: auth-service's state as parallel `static mut`s — 12 sites (6
+  Fixed in `0039c4bb`, `fa31e763`, `8a210a6f` and `4d11c253`: every site named, each now a local,
+  a field or an atomic.
+- [x] **sec-o9** encapsulate: auth-service's state as parallel `static mut`s — 12 sites (6
   statics, USER_DB with USER_DB_LEN, NEW_DB, ADMIN_REPLY, SESSION_CH with SESSION_ADMIN,
   reached from 12 unsafe blocks: 3 `from_raw_parts` at 159, 391, 457, 5 raw derefs at 458,
   463, 467, 474, and the session-table accesses; `grep -nE "raw (const|mut)
@@ -4245,7 +4289,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   separate checks), a reply buffer sized by local arithmetic instead of `RS_MAX_BODY` (sec-d4),
   and parallel arrays drifting (the failed-transfer path at 356 clears SESSION_CH but not
   SESSION_ADMIN). Depends on: nothing. opportunities. Value low, effort small. **Fix.**
-- [ ] **sec-o10** remove: libsession records what the last build bound in seven `static mut
+  Fixed in `8a210a6f`: one `Server` in `_start`'s frame, its session table `Option<(channel,
+  admin)>`; auth-service has no `static mut`.
+- [x] **sec-o10** remove: libsession records what the last build bound in seven `static mut
   SESSION_HAS_*` bools read through seven safe `session_has_*()` fns, although `build()`
   already returns the same facts as `Built` — 7 sites (`grep -n "static mut SESSION_HAS_"
   userspace/libsession/src/lib.rs`: 7 statics, 1 writer and 7 reader unsafe blocks; `grep -rn
@@ -4259,6 +4305,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   another build, and a safe fn over `static mut`; removes 7 of libsession's 14 `static mut`s
   and 8 unsafe blocks. Depends on: nothing. abi, ownership, soundness, opportunities. Value
   low, effort small. **Fix.**
+  Fixed in `0039c4bb`: both supervisors read the `Built` that `build` returns, and the flags,
+  their readers and `build_namespace` are gone.
 - [ ] **sec-o11** remove: local copies of libkern helpers, each with its own unsafe: `kprint`
   (x3), process exit (x2) and a hand-written volatile zeroing loop (x1) — 6 sites (`grep -rnE
   "^fn kprint|^fn exit|SYS_PROCESS_EXIT|write_volatile"` over the five crates: 8 lines, one
