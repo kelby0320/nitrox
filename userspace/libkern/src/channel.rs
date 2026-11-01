@@ -3,8 +3,9 @@
 //! that leaves them lets any sender fill its table, and keep alive whatever they pin. [`Received`]
 //! closes, when it drops, every handle not taken from it: a receiver forgets nothing by ignoring it.
 
-use crate::abi::{IPC_HANDLE_MAX, IPC_MSG_SIZE};
-use crate::syscall::{SYS_CHANNEL_RECV, syscall4};
+use crate::abi::{CLOCK_MONOTONIC, IPC_HANDLE_MAX, IPC_MSG_SIZE};
+use crate::error::KError;
+use crate::syscall::{SYS_CHANNEL_RECV, SYS_CLOCK_READ, SYS_WAIT, syscall2, syscall4};
 
 /// The handles one message brought, closed when this drops unless taken.
 pub struct Received {
@@ -55,6 +56,41 @@ fn close(h: u64) {
 #[cfg(test)]
 fn close(h: u64) {
     tests::CLOSED.with(|c| c.borrow_mut().push(h));
+}
+
+/// **What a failed receive says about its channel.**
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RecvFailure {
+    /// The peer has gone and the ring is empty, for good: stop waiting on the channel.
+    Closed,
+    /// The ring is empty and the peer is there.
+    Empty,
+    /// Anything else: `OutOfMemory` leaves the message queued, so a wait on the channel fires
+    /// again at once. [`pause_held`] before it, or that wait is a spin.
+    Held,
+}
+
+impl RecvFailure {
+    /// The failure a receive's `status` means.
+    pub fn of(status: i64) -> Self {
+        match status {
+            s if s == KError::PeerClosed.as_i32() as i64 => Self::Closed,
+            s if s == KError::WouldBlock.as_i32() as i64 => Self::Empty,
+            _ => Self::Held,
+        }
+    }
+}
+
+/// How long a [`RecvFailure::Held`] pauses.
+const HELD_PAUSE_NS: u64 = 10_000_000;
+
+/// Wait out a [`RecvFailure::Held`], on no handles, which the kernel never refuses.
+pub fn pause_held() {
+    let mut now = 0u64;
+    // SAFETY: `now` is a writable u64 out-param on this frame.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    // SAFETY: no handles and no results, so the kernel reads and writes neither.
+    unsafe { syscall4(SYS_WAIT, 0, 0, 0, now.saturating_add(HELD_PAUSE_NS)) };
 }
 
 /// Receive one message on `ch` into `msg`. `Err` with the syscall's status: `WouldBlock` for an

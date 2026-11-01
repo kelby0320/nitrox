@@ -31,7 +31,7 @@ pub mod syscaps;
 pub mod mem;
 
 pub use abi::*;
-pub use channel::{Received, channel_recv, channel_recv_raw};
+pub use channel::{Received, RecvFailure, channel_recv, channel_recv_raw, pause_held};
 pub use debug::{exit, kprint, kprint_hex, kprint_u64};
 pub use error::{KError, from_raw};
 pub use handle::*;

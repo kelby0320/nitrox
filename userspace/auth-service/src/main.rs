@@ -54,9 +54,6 @@ const USERS_NEW: &[u8] = b"/system/users.new";
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
 const _: () = assert!(2 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
 
-/// How long a failed receive, its message still queued, pauses: its wait fires again at once.
-const HELD_PARK_NS: u64 = 10_000_000;
-
 /// **This server's state**, in `_start`'s frame rather than in `static mut`s.
 struct Server {
     /// The user database, copied from `/system/users` at startup, and its length.
@@ -165,15 +162,6 @@ fn payload(msg: &[u8]) -> &[u8] {
     &msg[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)]
 }
 
-/// Wait out [`HELD_PARK_NS`], on no handles, which the kernel never refuses.
-fn park() {
-    let mut now = 0u64;
-    // SAFETY: `now` is a writable u64 out-param on this frame.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
-    // SAFETY: no handles and no results, so the kernel reads and writes neither.
-    unsafe { syscall4(SYS_WAIT, 0, 0, 0, now.saturating_add(HELD_PARK_NS)) };
-}
-
 /// Send `Meta::Ready` on the control channel, transferring `client_end`. `false` on any failure.
 fn send_ready(control: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
@@ -196,7 +184,7 @@ fn send_reply(serve_end: u64, op: u16, request_id: u64, body: &[u8], error: bool
 /// **It exits on `CTRL_OP_SHUTDOWN`**, which a shutdown sends every service (`service --stop`
 /// never does: `auth-service` is `essential`). Nothing needs saving: every write to the users
 /// file is made whole — a new file, synced, then renamed over — before its answer is sent.
-fn serve_loop(srv: &mut Server, serve_end: u64, mut control: u64) -> ! {
+fn serve_loop(srv: &mut Server, mut serve_end: u64, mut control: u64) -> ! {
     kprint(b"auth-service: serving Auth::Authenticate over /svc/auth, and administration at /svc/auth/admin\n");
     loop {
         let mut handles = [0u64; libkern::abi::MAX_WAIT_HANDLES];
@@ -217,7 +205,9 @@ fn serve_loop(srv: &mut Server, serve_end: u64, mut control: u64) -> ! {
         for r in &results[..waited as usize] {
             let h = r.handle;
             if h == serve_end {
-                serve_resolve(srv, serve_end);
+                if !serve_resolve(srv, serve_end) {
+                    serve_end = 0;
+                }
             } else if h == control {
                 match libkern::control::recv(control) {
                     libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
@@ -235,12 +225,20 @@ fn serve_loop(srv: &mut Server, serve_end: u64, mut control: u64) -> ! {
 }
 
 /// Answer a resolve of `/svc/auth` by minting a session channel for the caller, so one oracle
-/// serves several supervisors (`docs/architecture/session-and-auth.md`).
-fn serve_resolve(srv: &mut Server, serve_end: u64) {
+/// serves several supervisors (`docs/architecture/session-and-auth.md`). `false` once its peer has
+/// gone, when the endpoint is signalled for good and must leave the wait set.
+fn serve_resolve(srv: &mut Server, serve_end: u64) -> bool {
     let mut msg = [0u8; MSG_LEN];
-    let Ok(_sent) = channel_recv(serve_end, &mut msg) else {
-        return park();
-    };
+    if let Err(status) = channel_recv(serve_end, &mut msg) {
+        return match RecvFailure::of(status) {
+            RecvFailure::Closed => false,
+            RecvFailure::Empty => true,
+            RecvFailure::Held => {
+                pause_held();
+                true
+            }
+        };
+    }
     let (op, request_id, ok) = {
         match decode(payload(&msg)) {
             // **Two suffixes, nothing else**: empty is the oracle, `admin` the administrative one.
@@ -255,9 +253,10 @@ fn serve_resolve(srv: &mut Server, serve_end: u64) {
     };
     let Some(admin) = ok else {
         reply_resolve_error(serve_end, request_id, op, KError::NotFound.as_i32());
-        return;
+        return true;
     };
     open_auth_session(srv, serve_end, request_id, admin);
+    true
 }
 
 /// Mint an oracle or `admin` session channel and hand its client end back in the resolve reply.
@@ -287,13 +286,15 @@ fn open_auth_session(srv: &mut Server, serve_end: u64, request_id: u64, admin: b
 fn serve_session(srv: &mut Server, ch: u64) {
     // **Zeroed on every return**: an `Authenticate`, `Add` or `SetPassword` carries a password.
     let mut msg = Secret::<MSG_LEN>::zeroed();
-    match channel_recv(ch, msg.array_mut()) {
-        Ok(_sent) => {}
-        // **A closed peer frees the slot.** Without this a supervisor that exited would hold
-        // one forever, and the set of clients would shrink by one per logout.
-        Err(e) if e == KError::PeerClosed.as_i32() as i64 => return free_session(srv, ch),
-        // **Nothing else does**: `OutOfMemory` leaves the message queued for a live client.
-        Err(_) => return park(),
+    if let Err(status) = channel_recv(ch, msg.array_mut()) {
+        return match RecvFailure::of(status) {
+            // **A closed peer frees the slot.** Without this a supervisor that exited would hold
+            // one forever, and the set of clients would shrink by one per logout.
+            RecvFailure::Closed => free_session(srv, ch),
+            RecvFailure::Empty => {}
+            // **Nothing else does**: `OutOfMemory` leaves the message queued for a live client.
+            RecvFailure::Held => pause_held(),
+        };
     }
     let serve_end = ch;
     if srv.sessions.iter().flatten().any(|&(c, admin)| c == ch && admin) {

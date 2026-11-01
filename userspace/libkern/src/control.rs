@@ -6,8 +6,7 @@
 //! says to take it out of the wait set.
 
 use crate::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE};
-use crate::channel::channel_recv;
-use crate::error::KError;
+use crate::channel::{RecvFailure, channel_recv, pause_held};
 
 /// What a control channel held.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -15,7 +14,7 @@ pub enum Control {
     /// An op byte: [`CTRL_OP_SHUTDOWN`](crate::abi::CTRL_OP_SHUTDOWN), or one this service does
     /// not know and should ignore.
     Op(u8),
-    /// A message with no op in it, or nothing queued.
+    /// A message with no op in it, nothing queued, or a receive that failed and has paused.
     Nothing,
     /// The supervisor's end has gone: stop waiting on this channel.
     Closed,
@@ -27,11 +26,22 @@ pub fn recv(control: u64) -> Control {
     let mut msg = [0u8; IPC_MSG_SIZE];
     let _sent = match channel_recv(control, &mut msg) {
         Ok(sent) => sent,
-        Err(r) if r == KError::PeerClosed.as_i32() as i64 => return Control::Closed,
-        Err(_) => return Control::Nothing,
+        Err(status) => return failed(status, pause_held),
     };
     let len = u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize;
     op_of(&msg[IPC_HEADER_SIZE..IPC_HEADER_SIZE + len.min(IPC_MSG_SIZE - IPC_HEADER_SIZE)])
+}
+
+/// What a receive that failed with `status` means, `pause` run first if its message is queued.
+fn failed(status: i64, pause: impl FnOnce()) -> Control {
+    match RecvFailure::of(status) {
+        RecvFailure::Closed => Control::Closed,
+        RecvFailure::Empty => Control::Nothing,
+        RecvFailure::Held => {
+            pause();
+            Control::Nothing
+        }
+    }
 }
 
 /// A control message's payload as an op: its first byte, if it has one.
@@ -43,11 +53,24 @@ pub fn op_of(payload: &[u8]) -> Control {
 mod tests {
     use super::*;
     use crate::abi::CTRL_OP_SHUTDOWN;
+    use crate::error::KError;
 
     #[test]
     fn a_payload_is_its_first_byte() {
         assert_eq!(op_of(&[CTRL_OP_SHUTDOWN]), Control::Op(CTRL_OP_SHUTDOWN));
         assert_eq!(op_of(&[7, 1]), Control::Op(7));
         assert_eq!(op_of(&[]), Control::Nothing);
+    }
+
+    #[test]
+    fn only_a_held_receive_pauses() {
+        let status = |e: KError| e.as_i32() as i64;
+        let paused = |s: i64| {
+            let mut ran = false;
+            (failed(s, || ran = true), ran)
+        };
+        assert_eq!(paused(status(KError::OutOfMemory)), (Control::Nothing, true));
+        assert_eq!(paused(status(KError::WouldBlock)), (Control::Nothing, false));
+        assert_eq!(paused(status(KError::PeerClosed)), (Control::Closed, false));
     }
 }
