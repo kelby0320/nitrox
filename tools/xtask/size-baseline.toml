@@ -9,7 +9,7 @@
 "kernel/src/syscall/table.rs" = 2195
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
-"userspace/compositor/src/main.rs" = 2267
+"userspace/compositor/src/main.rs" = 2259
 "userspace/desktop-shell/src/main.rs" = 1457
 "userspace/desktop-shell/src/panel.rs" = 1211
 "userspace/fs-server-ext4/src/ext4.rs" = 1846

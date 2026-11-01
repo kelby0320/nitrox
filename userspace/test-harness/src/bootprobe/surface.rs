@@ -22,10 +22,10 @@ fn answer_to(ch: u64, id: u64) -> Option<Received> {
     }
 }
 
-/// Whether the compositor refused an attach, sent as request `id` with `handles`. An attach that
-/// holds is not answered, so a `StartMove` of no window follows it: every session request is
-/// answered in order, and that answer arriving first says this one was taken.
-fn attach_refused(ch: u64, id: u64, req: &AttachBufferRequest, handles: &[u64]) -> Option<bool> {
+/// The `KError` the compositor refused an attach with, sent as request `id` with `handles`, or
+/// `0` if it took it. An attach that holds is not answered, so a `StartMove` of no window follows
+/// it: every session request is answered in order, and that answer arriving first says it held.
+fn attach_refused(ch: u64, id: u64, req: &AttachBufferRequest, handles: &[u64]) -> Option<i32> {
     let mut attach = [0u8; 32];
     let n = build_attach_buffer_request(&mut attach, req)?;
     let mut probe = [0u8; 8];
@@ -39,10 +39,10 @@ fn attach_refused(ch: u64, id: u64, req: &AttachBufferRequest, handles: &[u64]) 
     loop {
         let m = receive(ch, deadline)?;
         if m.request_id == id {
-            return Some(m.error);
+            return Some(parse_error(&m.body).map_or(-1, |e| e.kerror));
         }
         if m.request_id == id + 1 {
-            return Some(false);
+            return Some(0);
         }
     }
 }
@@ -83,23 +83,29 @@ pub(super) fn a_session_takes_memory_and_whole_bodies_test(root_ns: u64) -> bool
         return fail(b"no memory object");
     }
     let memory = memory as u64;
-    let held = attach_refused(session, 10, &at(8, 8, 0), &[memory]) == Some(false);
+    let invalid = Some(KError::InvalidArgument.as_i32());
+    let held = attach_refused(session, 10, &at(8, 8, 0), &[memory]) == Some(0);
 
-    let none = attach_refused(session, 20, &at(1024, 1024, 0), &[]) == Some(true);
+    let none = attach_refused(session, 20, &at(1024, 1024, 0), &[]) == invalid;
+    let foreign = AttachBufferRequest { window: u32::MAX, ..at(8, 8, 0) };
+    let not_found = KError::NotFound.as_i32();
+    let not_owned = attach_refused(session, 22, &foreign, &[]) == Some(not_found);
+    // SAFETY: a plain anonymous object of one page.
+    let short = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    let too_short = short > 0 && attach_refused(session, 24, &at(1024, 1024, 3), &[short as u64]) == invalid;
 
     let (st, file) = ns_lookup(root_ns, b"/system/current-generation", RIGHT_MAP_READ | RIGHT_TRANSFER | RIGHT_INSPECT);
-    let file_refused = st == 0 && file != 0 && attach_refused(session, 30, &at(1, 1, 1), &[file]) == Some(true);
+    let file_refused = st == 0 && file != 0 && attach_refused(session, 30, &at(1, 1, 1), &[file]) == invalid;
 
     // SAFETY: a plain anonymous object of one page.
     let blind = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     // SAFETY: attenuating a handle this process holds; it cannot amplify.
     let narrowed =
         blind > 0 && unsafe { syscall2(SYS_HANDLE_RESTRICT, blind as u64, RIGHT_MAP_READ | RIGHT_TRANSFER) } == 0;
-    let blind_refused = narrowed && attach_refused(session, 40, &at(8, 8, 2), &[blind as u64]) == Some(true);
+    let blind_refused = narrowed && attach_refused(session, 40, &at(8, 8, 2), &[blind as u64]) == invalid;
 
     // A body past `SetTitle`'s length, read whole: no grab is `NotFound`, and cut it is malformed.
     let mut drag = [0u8; StartDrag::HEAD + MAX_DROP_PATH + MAX_DROP_NAME];
-    let not_found = KError::NotFound.as_i32();
     let whole = StartDrag { window, kind: DROP_KIND_FILE, path_len: 0 }
         .write(&mut drag, &[b'p'; 300], b"name")
         .filter(|&n| rs_send(session, OP_START_DRAG, 50, &drag[..n], &[]))
@@ -111,6 +117,8 @@ pub(super) fn a_session_takes_memory_and_whole_bodies_test(root_ns: u64) -> bool
     for (held, why) in [
         (held, &b"an attach of memory was refused"[..]),
         (none, b"an attach with no memory was taken"),
+        (not_owned, b"a refused attach on no window of this client's was not NotFound"),
+        (too_short, b"memory short of its geometry was taken"),
         (file_refused, b"a file was taken for a buffer"),
         (blind_refused, b"a handle that cannot say what it is was taken for a buffer"),
         (whole, b"a long request's body was cut"),

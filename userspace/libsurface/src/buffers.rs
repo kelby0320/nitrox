@@ -8,9 +8,10 @@
 //!
 //! [`WindowRef::attach`] does not await a reply, so the geometry is recorded whether or not the
 //! compositor accepted it. That is unreachable here: the only attach is on a buffer `next_free`
-//! returned, the client's `busy` set is a superset of the compositor's `committed`, and the only
-//! refusal for a replace is the committed buffer. A caller attaching outside this path would not
-//! inherit that argument.
+//! returned, the client's `busy` set is a superset of the compositor's `committed`, the only
+//! refusal for a replace is the committed buffer, and this memory is what an attach asks for, which
+//! a compositor that cannot map draws as nothing rather than refuse. A caller attaching outside
+//! this path would not inherit that argument.
 
 use alloc::vec::Vec;
 

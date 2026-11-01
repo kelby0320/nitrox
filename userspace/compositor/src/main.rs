@@ -19,7 +19,10 @@ use compositor::Screen;
 use compositor::input::InputRouter;
 use compositor::manager::{self, MgrOutcome};
 use compositor::outbox::{MgrEvent, MgrOutbox, Outbound, Outbox};
-use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
+use compositor::server::{
+    Attached, Connection, Outcome, SurfaceError, attach_memory, disconnect, dispatch, forget_window, holds,
+    record_attach, refuse_attach,
+};
 use compositor::{BufferSource, WindowStack};
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::Relaxed;
@@ -32,7 +35,6 @@ use libkern::abi::HandleInfo;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::error::KError;
-use libkern::handle::KObjectType;
 use libkern::{Received, SYS_HANDLE_STAT, channel_recv_raw};
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
@@ -97,14 +99,12 @@ const MAX_LOGGED_OVERFLOWS: u32 = 8;
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 
-struct MappedBuffer {
-    window: u32,
-    buffer: u32,
+struct Mapping {
     addr: *mut u8,
     len: usize,
 }
 
-impl Drop for MappedBuffer {
+impl Drop for Mapping {
     /// Unmap when the record goes away: the `Vec::retain` calls that shrink `Server::buffers` rely
     /// on it.
     fn drop(&mut self) {
@@ -117,7 +117,7 @@ impl Drop for MappedBuffer {
 struct Server {
     stack: WindowStack,
     conns: [Connection; MAX_SESSIONS],
-    buffers: alloc::vec::Vec<MappedBuffer>,
+    buffers: alloc::vec::Vec<Attached<Mapping>>,
     /// Device triples → logical events. Reset by a `SYN_DROPPED` the server forwards.
     interp: Interpreter,
     router: InputRouter,
@@ -148,9 +148,9 @@ impl Server {
 
 impl BufferSource for Server {
     fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]> {
-        let b = self.buffers.iter().find(|b| b.window == window && b.buffer == buffer)?;
+        let b = &self.buffers.iter().find(|b| b.window == window && b.buffer == buffer)?.memory;
         // SAFETY: `addr`/`len` come from a successful `sys_memory_map` of the client's
-        // `MemoryObject`. The mapping lives exactly as long as its `MappedBuffer` record —
+        // `MemoryObject`. The mapping lives exactly as long as its `Mapping` record —
         // `Drop` unmaps — and this slice borrows `&self`, so no `&mut` path that could drop
         // the record can run while it is alive.
         Some(unsafe { core::slice::from_raw_parts(b.addr, b.len) })
@@ -506,12 +506,7 @@ fn drain_stack_events(srv: &mut Server) {
         mgr_emit(srv, MgrEvent::Geometry(ev));
     }
     for window in srv.stack.take_removed() {
-        // The owner stops claiming it, whoever removed it: a manager's `Manage::Close` or a
-        // transitive destroy bypasses the client's inline prune. See [`Connection::disown`].
-        for conn in srv.conns.iter_mut() {
-            conn.disown(window);
-        }
-        srv.buffers.retain(|b| b.window != window);
+        forget_window(&mut srv.conns, &mut srv.buffers, window);
         mgr_emit(srv, MgrEvent::Destroyed { window });
     }
 }
@@ -1214,6 +1209,9 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
         }
     };
     let len = dst_geom.byte_len();
+    if !stat(obj).is_some_and(|info| holds(&info, len)) {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+    }
     // SAFETY: mapping an object the manager sent, writable, for exactly its own length.
     let addr =
         unsafe { syscall4(SYS_MEMORY_MAP, obj, 0, len as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) };
@@ -1538,32 +1536,28 @@ fn close_session(slot: usize, srv: &mut Server) {
     announce_focus(srv);
 }
 
-/// Whether `handle` is a `MemoryObject`. A file maps too, faulted in through its server on this
-/// thread, and a fill that fails there ends the compositor.
-fn is_memory(handle: u64) -> bool {
+/// What the kernel says `handle` is; `None` if it will not, as of a handle without `INSPECT`.
+fn stat(handle: u64) -> Option<HandleInfo> {
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a writable `HandleInfo` on this frame.
-    let stat = unsafe { syscall2(SYS_HANDLE_STAT, handle, (&raw mut info) as u64) };
-    stat == 0 && info.object_type == KObjectType::MemoryObject as u32
+    (unsafe { syscall2(SYS_HANDLE_STAT, handle, (&raw mut info) as u64) } == 0).then_some(info)
 }
 
-/// Map a client's transferred `MemoryObject`, once at attach; `None` for anything else, no handle
-/// included. Always consumes `handle`, on every path.
-fn map_attached_buffer(body: &[u8], handle: u64) -> Option<MappedBuffer> {
+/// Map a client's transferred `MemoryObject` at attach, as [`attach_memory`] rules, no handle
+/// refused with the rest. Always consumes `handle`, on every path.
+fn map_attached_buffer(body: &[u8], handle: u64) -> Option<Attached<Option<Mapping>>> {
     if handle == 0 {
         return None;
     }
-    let req = librsproto::surface::parse_attach_buffer_request(body).filter(|_| is_memory(handle));
-    let mapped = req.and_then(|req| {
-        let len = req.pitch as usize * req.height as usize;
-        // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
-        // with the size its own geometry declares.
+    let attached = attach_memory(body, stat(handle).as_ref(), |len| {
+        // SAFETY: `handle` is a `MemoryObject` the client transferred, of at least `len` bytes;
+        // mapping it read-only with the size its own geometry declares.
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };
-        (addr > 0).then_some(MappedBuffer { window: req.window, buffer: req.buffer, addr: addr as *mut u8, len })
+        (addr > 0).then(|| Mapping { addr: addr as *mut u8, len })
     });
     // SAFETY: closing our reference; a mapping outlives it.
     unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-    mapped
+    attached
 }
 
 /// Recomposite the whole screen: the fallback for `Applied { dirty: None }` and the first frame.
@@ -1885,26 +1879,24 @@ fn handle_session_request(
         };
     }
 
-    // **An attach is its memory**: mapped before `dispatch`, so the stack never holds geometry with
-    // none behind it, and recorded after, as a rejected one would put the client's memory under
-    // ids it does not own. The handle is disposed of exactly once.
-    let memory = if op == OP_ATTACH_BUFFER { map_attached_buffer(body, handle) } else { None };
+    // **An attach brings memory, or it is refused**: asked before `dispatch`, so the stack takes no
+    // geometry without it, and recorded after, as a rejected one would put the client's memory
+    // under ids it does not own. The handle is disposed of exactly once.
+    let attached = if op == OP_ATTACH_BUFFER { map_attached_buffer(body, handle) } else { None };
     if op != OP_ATTACH_BUFFER && handle != 0 {
         // SAFETY: closing a handle this process owns and will not use.
         unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
     }
-    let outcome = if op == OP_ATTACH_BUFFER && memory.is_none() {
-        Outcome::Failed(SurfaceError::Malformed)
+    let outcome = if op == OP_ATTACH_BUFFER && attached.is_none() {
+        refuse_attach(&srv.conns[slot], body)
     } else {
-        // SAFETY: a bounded mutable slice over the reply buffer; `body` is a local copy.
+        // SAFETY: single-threaded, and nothing else borrows `REPLY_MSG` across this call, so the
+        // `&mut` is unique; `body` is a local copy, so it does not alias it.
         unsafe { dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut REPLY_MSG[PAYLOAD_OFF + 16..]) }
     };
     drain_stack_events(srv);
-    if let Some(m) = memory
-        && matches!(outcome, Outcome::Applied { .. })
-    {
-        srv.buffers.retain(|b| !(b.window == m.window && b.buffer == m.buffer));
-        srv.buffers.push(m);
+    if let Some(attached) = attached {
+        record_attach(&mut srv.buffers, &outcome, attached);
     }
 
     match outcome {
