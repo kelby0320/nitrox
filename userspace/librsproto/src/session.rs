@@ -207,8 +207,9 @@ impl From<WireError> for DirError {
 /// Send one request on `endpoint` and receive its reply into `buf`, returning the reply's
 /// rsproto payload length. Shared by [`Dir`] and [`crate::desktop::Desktop`], so the
 /// send/wait/recv/handle sweep has one copy. A `buf` shorter than [`IPC_MSG_SIZE`] is refused
-/// `Protocol`: the kernel copies a whole message from it. **A message that is not this request's
-/// reply is skipped**, by id and op, or one an earlier call left queued would answer this request.
+/// `Protocol`: the kernel copies a whole message from it. **A message with another id is skipped**,
+/// or one an earlier call left queued would answer this request; this id on another op is
+/// `Protocol`.
 pub fn round_trip(
     endpoint: u64,
     buf: &mut [u8],
@@ -249,7 +250,8 @@ pub fn round_trip(
     }
 }
 
-/// The payload length of the message in `buf` if it answers `request_id`'s `op`, else `None`.
+/// The payload length of the message in `buf` if it answers `request_id`'s `op`, `None` if it has
+/// another id, and `Protocol` for this id on another op: no call left that, and none follows it.
 fn reply_to(buf: &[u8], request_id: u64, op: u16) -> core::result::Result<Option<usize>, WireError> {
     let payload_len = u32::from_le_bytes([
         buf[OFF_PAYLOAD_LEN],
@@ -261,7 +263,13 @@ fn reply_to(buf: &[u8], request_id: u64, op: u16) -> core::result::Result<Option
         return Err(WireError::Protocol);
     }
     let m = crate::decode(&buf[PAYLOAD_OFF..PAYLOAD_OFF + payload_len]).map_err(|_| WireError::Protocol)?;
-    Ok((m.request_id == request_id && m.op == op).then_some(payload_len))
+    if m.request_id != request_id {
+        return Ok(None);
+    }
+    if m.op != op {
+        return Err(WireError::Protocol);
+    }
+    Ok(Some(payload_len))
 }
 
 /// The `KError` an error reply carries, or a generic failure if the body is malformed.
@@ -332,7 +340,7 @@ mod tests {
         buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(n as u32).to_le_bytes());
         assert_eq!(reply_to(&buf, 7, crate::OP_FILE_MKDIR), Ok(Some(n)));
         assert_eq!(reply_to(&buf, 8, crate::OP_FILE_MKDIR), Ok(None));
-        assert_eq!(reply_to(&buf, 7, crate::OP_FILE_RMDIR), Ok(None));
+        assert_eq!(reply_to(&buf, 7, crate::OP_FILE_RMDIR), Err(WireError::Protocol));
         buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(IPC_MSG_SIZE as u32).to_le_bytes());
         assert_eq!(reply_to(&buf, 7, crate::OP_FILE_MKDIR), Err(WireError::Protocol));
     }

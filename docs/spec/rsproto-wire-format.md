@@ -52,6 +52,11 @@ bitflags! {
 
 A reply has `REPLY` set and (optionally) `ERROR`. A streaming response has `REPLY` set on each message; the last message also has `LAST_IN_STREAM` set.
 
+**A reply carries its request's `op` and `request_id`, an error reply too.** That is what ties it
+to its request: `librsproto::session::round_trip` skips a message with another id, which an earlier
+call may have left queued, and refuses one with this id and another op. Its wait has no deadline,
+so a server that stamps any other id on a reply hangs its client, as one that never answers does.
+
 ## Operation discriminant
 
 The 16-bit `op` field decomposes:

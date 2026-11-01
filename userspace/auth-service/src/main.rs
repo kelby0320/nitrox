@@ -302,23 +302,23 @@ fn serve_session(srv: &mut Server, ch: u64) {
 
     let mut reply_body = [0u8; 512];
     let db = &srv.db[..srv.db_len];
-    let (request_id, reply_len, error) = match decode(payload(&msg)) {
+    let (op, request_id, reply_len, error) = match decode(payload(&msg)) {
         Ok(m) if m.op == OP_AUTHENTICATE => match serve_authenticate(m.body, db, &mut reply_body) {
-            Some(n) => (m.request_id, n, false),
+            Some(n) => (m.op, m.request_id, n, false),
             None => {
                 let n = build_denied_reply(&mut reply_body).unwrap_or(0);
-                (m.request_id, n, true)
+                (m.op, m.request_id, n, true)
             }
         },
         // A non-Auth op on this channel: deny + error (wrong protocol).
         Ok(m) => {
             let n = build_denied_reply(&mut reply_body).unwrap_or(0);
-            (m.request_id, n, true)
+            (m.op, m.request_id, n, true)
         }
-        Err(_) => (0, 0, true),
+        Err(_) => (0, 0, 0, true),
     };
     if reply_len > 0 {
-        send_reply(serve_end, OP_AUTHENTICATE, request_id, &reply_body[..reply_len], error);
+        send_reply(serve_end, op, request_id, &reply_body[..reply_len], error);
     }
 }
 

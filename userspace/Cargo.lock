@@ -527,6 +527,7 @@ dependencies = [
  "liblog",
  "libos",
  "librsproto",
+ "libsession",
  "libstream",
  "libsurface",
  "libterm",

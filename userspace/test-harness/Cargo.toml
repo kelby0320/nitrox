@@ -31,6 +31,8 @@ libfs = { path = "../libfs" }
 # A log source of `boot-probe`'s own, whose record it reads back through `Log::Read`
 # (administration Part E.6).
 liblog = { path = "../liblog" }
+# The login path's two calls, on channels `boot-probe` queues replies on.
+libsession = { path = "../libsession" }
 
 [[bin]]
 name = "test-harness"

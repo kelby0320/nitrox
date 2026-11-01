@@ -37321,9 +37321,11 @@ libsession, the view broker and libcrypto), made six decisions:
   `Denied` for a correct password whose record's home is not one, after the same derivation. The
   record still parses, so List shows it and `account remove` clears it.
 - **A request on a long-lived channel takes only its own reply** (sec-d3, sec-o3):
-  `librsproto::session::round_trip` skips a message whose request id or op is not its request's,
-  and libsession's `authenticate` and `views_call` use it with an id per call. A reply left queued
-  by a failed receive is skipped by the next call rather than answering it.
+  `librsproto::session::round_trip` skips a message with another request id, and refuses one with
+  this id and another op, and libsession's `authenticate` and `views_call` use it with an id per
+  call. A reply left queued by a failed receive is skipped by the next call rather than answering
+  it. **A reply echoes its request's op and id, refusals included**: the wire spec says so, and a
+  server that breaks it on the id hangs its client, as one that never answers does.
 - **Bytes that held a password are zeroed when dropped** (sec-o4, sec-d7, sec-d8):
   `libkern::Secret`, beside `scrub`, on the login paths (libsession's request buffers, both
   supervisors' passwords, session-mgr's tty reply and auth-service's request buffer); libcrypto's
