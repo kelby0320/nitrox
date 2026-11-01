@@ -24,7 +24,8 @@ before M7 Part D was `selftest`-gated.
   one, and `cargo xtask check-login` drives the real thing.
 - **Never store, log, or echo a password.** The redraw diagnostic is a **count**. Reporting
   what was typed would put a credential on the console; reporting its *length* would leak it
-  more slowly. `String::clear` on a field is not a scrub — it is a claim about the screen.
+  more slowly. `String::clear` on a field is not a scrub — it is a claim about the screen;
+  `TextFieldState::scrub` is one, and the password's block ends before the session starts.
 - **No hardcoded credential**, in source or in tests. The demo user is a build input.
 - **Never spin.** Block on the event channel. A spinning supervisor keeps a run queue
   non-empty, so the idle thread never runs and deferred handle reclamation stops for the whole

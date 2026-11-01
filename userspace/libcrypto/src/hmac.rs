@@ -2,7 +2,7 @@
 //! [`crate::pbkdf2`] and available on its own. No `alloc`: the key is folded into
 //! two fixed 64-byte pads.
 
-use crate::sha256::{BLOCK_LEN, DIGEST_LEN, Sha256};
+use crate::sha256::{BLOCK_LEN, DIGEST_LEN, Sha256, wipe};
 
 /// A streaming HMAC-SHA256. Construct with a key, `update` the message, `finalize`.
 #[derive(Clone)]
@@ -19,22 +19,23 @@ impl HmacSha256 {
     pub fn new(key: &[u8]) -> Self {
         let mut k = [0u8; BLOCK_LEN];
         if key.len() > BLOCK_LEN {
-            let d = crate::sha256::sha256(key);
+            let mut d = crate::sha256::sha256(key);
             k[..DIGEST_LEN].copy_from_slice(&d);
+            wipe(&mut d, [0; DIGEST_LEN]);
         } else {
             k[..key.len()].copy_from_slice(key);
         }
 
         let mut ipad = [0x36u8; BLOCK_LEN];
-        let mut opad = [0x5cu8; BLOCK_LEN];
+        let mut mac = HmacSha256 { inner: Sha256::new(), opad: [0x5cu8; BLOCK_LEN] };
         for i in 0..BLOCK_LEN {
             ipad[i] ^= k[i];
-            opad[i] ^= k[i];
+            mac.opad[i] ^= k[i];
         }
-
-        let mut inner = Sha256::new();
-        inner.update(&ipad);
-        HmacSha256 { inner, opad }
+        mac.inner.update(&ipad);
+        wipe(&mut k, [0; BLOCK_LEN]);
+        wipe(&mut ipad, [0; BLOCK_LEN]);
+        mac
     }
 
     /// Absorb message bytes.
@@ -43,12 +44,20 @@ impl HmacSha256 {
     }
 
     /// Finish and return the 32-byte MAC.
-    pub fn finalize(self) -> [u8; DIGEST_LEN] {
-        let inner = self.inner.finalize();
+    pub fn finalize(mut self) -> [u8; DIGEST_LEN] {
+        let inner = core::mem::take(&mut self.inner).finalize();
         let mut outer = Sha256::new();
         outer.update(&self.opad);
         outer.update(&inner);
         outer.finalize()
+    }
+}
+
+/// **Zeroed when dropped**: `opad` is the key XOR a constant, and under PBKDF2 the key is the
+/// password.
+impl Drop for HmacSha256 {
+    fn drop(&mut self) {
+        wipe(&mut self.opad, [0; BLOCK_LEN]);
     }
 }
 
@@ -98,6 +107,18 @@ mod tests {
             hex(&hmac_sha256(&key, b"Test Using Larger Than Block-Size Key - Hash Key First")),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
+    }
+
+    /// Dropped, a MAC holds nothing of its key: neither `opad` nor the inner hash keyed by it.
+    #[test]
+    fn a_dropped_mac_is_zeroed() {
+        let mut m = core::mem::MaybeUninit::new(HmacSha256::new(b"a locally made key"));
+        // SAFETY: dropped once, in place; the bytes stay readable as the plain data they are.
+        let bytes = unsafe {
+            core::ptr::drop_in_place(m.as_mut_ptr());
+            core::slice::from_raw_parts(m.as_ptr() as *const u8, size_of::<HmacSha256>())
+        };
+        assert!(bytes.iter().all(|&b| b == 0), "{bytes:?}");
     }
 
     #[test]

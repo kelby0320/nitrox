@@ -417,3 +417,17 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-31	412	ed39a552	9	tests	optional	demonstrated	fixed	210eaa6b	cookies asserted in the paging test; cookie 0 fails it
 2026-10-31	412	ed39a552	10	tests	optional	demonstrated	fixed	210eaa6b	text of an object with no NUL asserted; unwrap_or(0) fails it
 2026-10-31	412	ed39a552	11	logic	optional	demonstrated	fixed	3abe6d30	SPAWN_SERVER and SPAWN_SUPERVISOR docs say they serve both programs
+2026-11-01	413	efbbb67b	1	logic	worth-fixing	demonstrated	fixed	ff45350a	password scrubbed before the session; probe at pass's address in the release image, 28 bytes at session start to 0 at block end; found drop(pass) scrubbed a copy (14 bytes left) and the greeter's String kept all 28, both fixed
+2026-11-01	413	efbbb67b	2	architecture+error-paths+tests	worth-fixing	demonstrated	fixed	9f3068f1	wire spec states the rule; auth-service echoes the op; this id on another op is Protocol; boot test hung test-qemu before, names each mutation after; no deadline added
+2026-11-01	413	efbbb67b	3	tests	worth-fixing	demonstrated	fixed	5e1c1103	reverted mask passed check-login and test-qemu; rights and half pair host-tested, classification and broker answers in df3eccde and 9f3068f1; tty close by one-off probe, 30 rounds vs out at 15; serial over-long line by reading
+2026-11-01	413	efbbb67b	4	logic	optional	unverified	fixed	ff45350a	Greeter::take_credentials: a field past its buffer reads as empty; truncating copy fails a_field_past_its_buffer_reads_as_empty
+2026-11-01	413	efbbb67b	5	logic	optional	unverified	deferred		TODO(child-exit-attribution) entry names it; needs a leader ignoring a terminate and a closed setup channel; a life channel would attribute it
+2026-11-01	413	efbbb67b	6	error-paths	optional	unverified	fixed	df3eccde	control::recv pauses on a held receive, all ten services; only_a_held_receive_pauses fails without it; no OOM injected into a live receive; other servers' session receives under TODO(recv-kerror)
+2026-11-01	413	efbbb67b	7	error-paths	optional	unverified	fixed	df3eccde	endpoint leaves the wait set on Closed; dead-endpoint probe 5300 passes in 90 s to 2
+2026-11-01	413	efbbb67b	8	tests	optional	demonstrated	fixed	9f3068f1	a_reply_is_its_requests_test drives round_trip and libsession on queued replies; loop removed and constant id each fail test-qemu naming the line
+2026-11-01	413	efbbb67b	9	tests	optional	demonstrated	declined		locals of a returned frame: a test would read dead stack; same wipe() the Drop tests hold
+2026-11-01	413	efbbb67b	10	tests	optional	unverified	declined		which buffer holds a secret is a judgement no test sees, and the sites are bin code; found by review, as drop(pass) was
+2026-11-01	413	efbbb67b	11	rules-and-docs	optional	demonstrated	fixed	ebff95d5	Cargo.toml comment; the only .bss left under auth-service is user.ld's section
+2026-11-01	413	efbbb67b	12	rules-and-docs	optional	demonstrated	fixed	ebff95d5	sentence re-wrapped at 100
+2026-11-01	413	efbbb67b	13	architecture	optional	demonstrated	fixed	ebff95d5	spec names the dependency on no grant giving BIND_NAMESPACE
+2026-11-01	413	efbbb67b	14	architecture	optional	demonstrated	fixed	8089064a	(a) abi-sync-check pairs HOME_MAX, fails at 129; boot test binds each home, fails naming /home/../a; (b) in ff45350a: Secret<N> private array, derefs to a slice, so *s and .0 no longer copy out

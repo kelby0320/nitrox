@@ -78,7 +78,7 @@ home_len = 0` and body length is `8`.
 | `result` | Value | Meaning |
 |---|---|---|
 | `AUTHENTICATED` | `1` | The credential is valid. `principal` names the canonical identity; `home` is the absolute path to the principal's home directory (the session's writable root). |
-| `DENIED` | `0` | The credential is invalid (wrong password, unknown user, or a malformed/over-long field). No detail is returned — the reason is deliberately not disclosed. |
+| `DENIED` | `0` | The credential is invalid (wrong password, unknown user, or a malformed/over-long field), or the account's home is one no session can bind (below). No detail is returned — the reason is deliberately not disclosed. |
 
 - **`principal`** is the canonical username the session is built for. It need not
   equal the request's `username` byte-for-byte (a server may canonicalise), but for
@@ -86,6 +86,10 @@ home_len = 0` and body length is `8`.
   scoped entirely to userspace.
 - **`home`** is what the session manager binds as the writable session root (the
   `/home/<user>` subtree). The server, not the client, is authoritative for it.
+  **It is a path the kernel takes as a subtree base** (`libusers::valid_home`): absolute, at
+  most 128 bytes, not `/`, and with no empty, `.` or `..` component, so no trailing `/`. A
+  correct password for a record whose home is not one is answered `DENIED`, after the same
+  derivation: authenticated, its login would fail at the namespace instead.
 
 ### Error reply
 

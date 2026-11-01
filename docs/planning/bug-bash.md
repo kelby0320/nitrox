@@ -1570,7 +1570,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   and leaves the session's windows open, as the code does; the spec's sentence is narrowed to
   `with`'s password.
 
-- [ ] **sec-12** `userspace/session-mgr/src/main.rs:236` — When the session namespace fails to
+- [x] **sec-12** `userspace/session-mgr/src/main.rs:236` — When the session namespace fails to
   build after a successful login, the loop `continue`s without `tty_close`. The success path
   (264-266) and the denied path (286-288) both close the terminal. Scenario: a login whose
   namespace build fails (`sys_ns_create` out of memory, or an account home in `/system/users`
@@ -1580,6 +1580,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   login" until reboot. Demonstrated by reading the code. Unverified: forcing the namespace
   failure was not run. logic. Low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's sec-d1, which repeats it.
+  Fixed with sec-d1 in `fa31e763`: the terminal is closed once, after the session, on every path.
 
 - [ ] **sec-13** `userspace/auth-service/src/main.rs:580` — `install()` discards the status of the
   `SYS_FILE_TRUNCATE` that clears a leftover `/system/users.new`, then creates the file with

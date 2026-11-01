@@ -8,28 +8,23 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use libkern::debug::Line;
 use libkern::*;
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 use librsproto::{decode, encode};
-use libsession::{NamespaceSpec, authenticate, ns_lookup, session_has_bin, session_has_tty, spawn_leader};
+use libsession::{NamespaceSpec, authenticate, ns_lookup, spawn_leader};
 
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
 
-/// Room for what a wait waits for and, beside it, the notification channel ([`wait_one`]).
-static mut WAIT_HANDLES: [u64; 2] = [0; 2];
-static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 /// This supervisor's notification channel, where a shutdown's terminate request arrives.
-static mut NOTIF_CH: u64 = 0;
-static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut SEND_HANDLES: [u64; 8] = [0; 8];
+static NOTIF_CH: AtomicU64 = AtomicU64::new(0);
 /// The request id the last tty request was sent with: each its own, so its reply is told apart.
-static mut TTY_RID: u64 = 0;
+static TTY_RID: AtomicU64 = AtomicU64::new(0);
 
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
@@ -75,27 +70,21 @@ fn sleep_ms(ms: u64) {
 /// Block on `handle`; `true` if it signalled. The notification channel is watched beside it, so a
 /// shutdown's terminate request reaches a supervisor at the prompt, which [`stop`]s.
 fn wait_one(handle: u64) -> bool {
-    // SAFETY: single-threaded; set once at startup.
-    let notif = unsafe { NOTIF_CH };
+    let notif = NOTIF_CH.load(Ordering::Relaxed);
     loop {
         let watch = notif != 0 && handle != notif;
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers for two waiters.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = handle;
-            WAIT_HANDLES[1] = notif;
-            let n = if watch { 2 } else { 1 };
-            let (handles, results) = ((&raw const WAIT_HANDLES) as u64, (&raw mut WAIT_RESULTS) as u64);
-            syscall4(SYS_WAIT, handles, n, results, u64::MAX)
-        };
+        let handles = [handle, notif];
+        let mut results = [IoResult { handle: 0, status: 0, reserved: 0, result: 0 }; 2];
+        let n = if watch { 2 } else { 1 };
+        // SAFETY: `n` handles, and room for a result each, all on this frame.
+        let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, n, results.as_mut_ptr() as u64, u64::MAX) };
         if waited < 1 {
             return false;
         }
         if !watch {
             return true;
         }
-        // SAFETY: `waited` 24-byte results were written; the handle is the first word of each.
-        let fired =
-            |h: u64| unsafe { (0..waited as usize).any(|k| WAIT_RESULTS[24 * k..24 * k + 8] == h.to_le_bytes()) };
+        let fired = |h: u64| results[..waited as usize].iter().any(|r| r.handle == h);
         if fired(notif) && libsession::drain_for_stop(notif) {
             stop();
         }
@@ -111,8 +100,7 @@ fn recv_handoff(ctrl: u64) -> u64 {
         return 0;
     }
     // The one handle a handoff brings; any more close as `sent` drops.
-    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-    match unsafe { channel_recv_raw(ctrl, &raw mut RECV_MSG) } {
+    match channel_recv(ctrl, &mut [0u8; MSG_LEN]) {
         Ok(mut sent) => sent.take(0).unwrap_or(0),
         Err(_) => 0,
     }
@@ -124,8 +112,7 @@ fn recv_handoff(ctrl: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"session-mgr: up\n");
-    // SAFETY: single-threaded; written once, here, before any wait reads it.
-    unsafe { NOTIF_CH = notif };
+    NOTIF_CH.store(notif, Ordering::Relaxed);
     // Positional: service-mgr sends an empty message (`0`) for an endpoint that did not come up,
     // so none shifts. All but the first two are `service-mgr`'s routes, which outlive a restart.
     let fs_endpoint = recv_handoff(control);
@@ -168,7 +155,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         let tty = tty_open(root_ns);
 
         match login(tty, auth_ch, &mut home, &mut user) {
-            Some((hl, ul)) => {
+            Some((hl, ul)) => 'session: {
                 Line::new().s(b"session-mgr: login ok -> home=").s(&home[..hl]).end();
                 let mut views_base = [0u8; 24];
                 let views = if views_sup != 0 {
@@ -176,7 +163,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 } else {
                     None
                 };
-                let session_ns = libsession::build_namespace(&NamespaceSpec {
+                let built = libsession::build(&NamespaceSpec {
                     root_ns,
                     fs_endpoint,
                     profile_endpoint,
@@ -197,27 +184,28 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     draw_endpoint: 0,
                     desktop_endpoint: 0,
                 });
-                if session_ns == 0 {
+                let Some(built) = built else {
                     kprint(b"session-mgr: session namespace FAIL\n");
                     if let Some((id, _)) = views {
                         libsession::views_close_session(views_sup, id);
                     }
-                    continue;
-                }
+                    break 'session;
+                };
+                let session_ns = built.ns;
                 kprint(b"session-mgr: session namespace built (/home subtree + /dev/console");
-                if session_has_bin() {
+                if built.bin {
                     kprint(b" + /bin");
                 }
-                if session_has_tty() {
+                if built.tty {
                     kprint(b" + /dev/tty");
                 }
-                if libsession::session_has_views() {
+                if built.views {
                     kprint(b" + /dev/views");
                 }
-                if libsession::session_has_devices() {
+                if built.devices {
                     kprint(b" + /dev/devices");
                 }
-                if libsession::session_has_storage() {
+                if built.storage {
                     kprint(b" + /storage");
                 }
                 kprint(b")\n");
@@ -230,10 +218,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 // The shell is reaped, so this drops the last reference and every binding with it.
                 // SAFETY: closing the namespace we created for this session.
                 unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
-                if tty != 0 {
-                    tty_close(tty);
-                }
-
                 {
                     // One `kprint`: another process logging between calls would tear the line.
                     let mut line = alloc::string::String::from("session-mgr: session ended (shell exit ");
@@ -246,19 +230,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     line.push_str(")\n");
                     kprint(line.as_bytes());
                 }
-                if libsession::stop_asked() {
-                    stop();
-                }
             }
             None => {
                 kprint(b"session-mgr: login denied\n");
-                if tty != 0 {
-                    tty_close(tty);
-                }
                 // Re-prompt, never lock out (a serial console has no other way in); the pause
                 // denies a free brute-force oracle.
                 sleep_ms(2000);
             }
+        }
+        // **On every path**: each terminal kept would hold one of tty-server's 14 for good.
+        if tty != 0 {
+            tty_close(tty);
+        }
+        if libsession::stop_asked() {
+            stop();
         }
     }
 }
@@ -277,7 +262,7 @@ fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Op
         let ulen = tty_read_line(tty, &mut user);
 
         tty_write(tty, b"password: ");
-        let mut pass = [0u8; 128];
+        let mut pass = Secret::<128>::zeroed();
         // The server stops echoing and erasing, so a backspace reveals nothing of the length.
         tty_set_echo(tty, false);
         let plen = tty_read_line(tty, &mut pass);
@@ -302,45 +287,26 @@ fn tty_open(root_ns: u64) -> u64 {
 }
 
 /// Send one tty request and wait for its reply. Returns the reply body length written into
-/// `out` (`0` for the acknowledgement-only ops), or `None` on any failure.
+/// `out` (`0` for the acknowledgement-only ops), or `None` on any failure, a reply past `out`
+/// included: a line is never cut short, so a password past it is no prefix of one.
 fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
-    // SAFETY: single-threaded; each request takes the next id.
-    let rid = unsafe {
-        TTY_RID += 1;
-        TTY_RID
-    };
-    // SAFETY: SEND_MSG is a valid buffer; the rsproto message goes at offset 24.
-    let sent = unsafe {
-        let rs_len = encode(&mut SEND_MSG[PAYLOAD_OFF..], op, rid, 0, body, 0)?;
-        SEND_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        SEND_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const SEND_MSG) as u64,
-            (&raw const SEND_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    };
-    if !sent {
+    let rid = TTY_RID.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut msg = [0u8; MSG_LEN];
+    let rs_len = encode(&mut msg[PAYLOAD_OFF..], op, rid, 0, body, 0)?;
+    msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+    // SAFETY: a whole message on this frame, and no handles.
+    if unsafe { syscall5(SYS_CHANNEL_SEND, ch, msg.as_ptr() as u64, 0, 0, SENDMODE_NOBLOCK) } != 0 {
         return None;
     }
+    // Scrubbed on every return: a line read under the password prompt is the password.
+    let mut reply = Secret::<MSG_LEN>::zeroed();
     loop {
         if !wait_one(ch) {
             return None;
         }
-        // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-        let _sent = unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) }.ok()?;
-        // SAFETY: bounded read-only slice over the reply.
-        let rep = unsafe {
-            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            core::slice::from_raw_parts(
-                ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-                payload_len.min(MSG_LEN - PAYLOAD_OFF),
-            )
-        };
-        let m = decode(rep).ok()?;
+        let _sent = channel_recv(ch, reply.array_mut()).ok()?;
+        let payload_len = u32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]) as usize;
+        let m = decode(reply.get(PAYLOAD_OFF..PAYLOAD_OFF + payload_len)?).ok()?;
         // **Not this request's**: `tty-server`'s unsolicited `INTERRUPT` after a Ctrl-C, request id
         // 0. Taken as the reply, it left every later request reading the one before's.
         if m.request_id != rid {
@@ -349,9 +315,8 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
         if m.op != op || m.is_error() {
             return None;
         }
-        let n = m.body.len().min(out.len());
-        out[..n].copy_from_slice(&m.body[..n]);
-        return Some(n);
+        out.get_mut(..m.body.len())?.copy_from_slice(m.body);
+        return Some(m.body.len());
     }
 }
 

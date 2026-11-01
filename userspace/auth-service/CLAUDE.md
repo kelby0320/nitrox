@@ -48,7 +48,7 @@ account write a person asks it for; the root namespace can reach it too, the bou
   `Meta::Ready` handing the supervisor the client endpoint, then serve; and for an
   admin request, draw a salt from the entropy source and **install** a new file
   atomically — `users.new`, synced, renamed over — before its copy in memory changes.
-  **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
+  **Alloc-free** — fixed buffers in `_start`'s frame, no `static mut` and no `#[global_allocator]`.
 
 ## Rules
 
@@ -65,7 +65,7 @@ account write a person asks it for; the root namespace can reach it too, the bou
   verify so it is timing- and shape-indistinguishable from a wrong password (no
   enumeration oracle) — keep it that way.
 - **Constant-time verifier compare** (via `libcrypto::ct_eq`), never `==` on secrets.
-- **Memory follows the file, never the other way.** An admin write changes `USER_DB` only
+- **Memory follows the file, never the other way.** An admin write changes the server's copy only
   once the rename has held; a failed install leaves both as they were.
 - **The request buffer is zeroed after every session request**: `Authenticate`, `Add` and
   `SetPassword` carry passwords.

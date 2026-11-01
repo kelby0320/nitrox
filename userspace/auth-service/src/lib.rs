@@ -14,6 +14,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use libkern::KError;
+use librsproto::RS_MAX_BODY;
 use librsproto::auth::{
     AUTH_RESULT_AUTHENTICATED, AccountListWriter, OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE, OP_AUTH_SET_PASSWORD,
     build_authenticate_reply, build_denied_reply, parse_account_request, parse_authenticate_request,
@@ -39,7 +40,10 @@ const DUMMY_VERIFIER: [u8; VERIFIER_LEN] = [0u8; VERIFIER_LEN];
 /// runs a dummy verify (constant work) and returns [`AuthOutcome::Denied`].
 pub fn authenticate<'a>(db: &'a [u8], username: &[u8], password: &[u8]) -> AuthOutcome<'a> {
     match libusers::find(db, username) {
-        Some(rec) if rec.verifies(password) => AuthOutcome::Authenticated { principal: rec.name, home: rec.home },
+        // A home no session can bind logs no one in, decided after the derivation as a password is.
+        Some(rec) if rec.verifies(password) && libusers::valid_home(rec.home) => {
+            AuthOutcome::Authenticated { principal: rec.name, home: rec.home }
+        }
         Some(_) => AuthOutcome::Denied,
         None => {
             // Unknown user: run an equivalent derivation so timing does not distinguish it.
@@ -128,7 +132,7 @@ pub fn serve_admin(
     db: &[u8],
     salt: &[u8; libusers::SALT_LEN],
     new_db: &mut [u8],
-    reply: &mut [u8],
+    reply: &mut [u8; RS_MAX_BODY],
 ) -> Admin {
     serve_admin_with(op, body, db, salt, libusers::ITERATIONS, new_db, reply)
 }
@@ -142,7 +146,7 @@ pub fn serve_admin_with(
     salt: &[u8; libusers::SALT_LEN],
     iterations: u32,
     new_db: &mut [u8],
-    reply: &mut [u8],
+    reply: &mut [u8; RS_MAX_BODY],
 ) -> Admin {
     let edit = |r: Result<usize, libusers::Refusal>| match r {
         Ok(n) => Admin::Write(n),
@@ -153,7 +157,7 @@ pub fn serve_admin_with(
             if !body.is_empty() {
                 return Admin::Refused(Refused::Malformed);
             }
-            let Some(mut w) = AccountListWriter::new(reply) else {
+            let Some(mut w) = AccountListWriter::new(&mut reply[..]) else {
                 return Admin::Refused(Refused::ListTooLong);
             };
             for r in libusers::records(db) {
@@ -264,9 +268,24 @@ mod tests {
         std::string::String::from_utf8(out[..n].to_vec()).unwrap()
     }
 
+    /// A home the kernel refuses as a subtree base is refused here, and one of 128 bytes is not.
+    #[test]
+    fn a_home_no_session_can_bind_logs_no_one_in() {
+        let longest = format!("/{}", "h".repeat(libusers::HOME_MAX - 1));
+        let past = format!("{longest}h");
+        for (home, ok) in [("/home/alice", true), (&longest, true), (&past, false), ("/home/alice/", false)]
+            .into_iter()
+            .chain(["/", "home/alice", "/home//alice", "/home/./alice", "/home/../etc", ""].map(|h| (h, false)))
+        {
+            let db = cheap_line("alice", "pw", b"s1", home);
+            let got = authenticate(db.as_bytes(), b"alice", b"pw");
+            assert_eq!(got != AuthOutcome::Denied, ok, "{home:?}");
+        }
+    }
+
     fn admin(op: u16, body: &[u8], db: &str) -> (Admin, std::string::String) {
         let mut new_db = [0u8; libusers::MAX_FILE];
-        let mut reply = [0u8; 4096];
+        let mut reply = [0u8; RS_MAX_BODY];
         let a = serve_admin_with(op, body, db.as_bytes(), &SALT, IT, &mut new_db, &mut reply);
         let file = match a {
             Admin::Write(n) => std::string::String::from_utf8(new_db[..n].to_vec()).unwrap(),
@@ -315,7 +334,7 @@ mod tests {
             cheap_line("bob", "b", b"s2", "/home/bob")
         );
         let mut new_db = [0u8; libusers::MAX_FILE];
-        let mut reply = [0u8; 4096];
+        let mut reply = [0u8; RS_MAX_BODY];
         let Admin::Reply(n) = serve_admin(OP_AUTH_LIST, &[], db.as_bytes(), &SALT, &mut new_db, &mut reply) else {
             panic!("a list replies");
         };
@@ -365,11 +384,23 @@ mod tests {
     /// A list too long for the reply buffer is refused, not cut: a partial one reads as whole.
     #[test]
     fn a_list_that_does_not_fit_is_refused() {
-        let db = cheap_line("alice", "a", b"s1", "/home/alice");
-        let mut new_db = [0u8; libusers::MAX_FILE];
-        let mut reply = [0u8; 8];
+        // Nine records of 398 bytes listed and one of 396, with the count: `RS_MAX_BODY` exactly.
+        let file = |last_home: usize| {
+            let mut f = std::string::String::new();
+            for i in 0..10 {
+                let (name, home) = if i < 9 { (198, 198) } else { (197, last_home) };
+                f.push_str(&format!("{}{i}::1::/{}\n", "n".repeat(name - 1), "h".repeat(home - 1)));
+            }
+            f
+        };
+        let (mut new_db, mut reply) = ([0u8; libusers::MAX_FILE], [0u8; RS_MAX_BODY]);
+        let fits = file(197);
+        assert_eq!(serve_admin(OP_AUTH_LIST, &[], fits.as_bytes(), &SALT, &mut new_db, &mut reply), Admin::Reply(3980));
+        let mut msg = [0u8; libkern::abi::IPC_PAYLOAD_SIZE];
+        assert!(librsproto::encode(&mut msg, OP_AUTH_LIST, 1, librsproto::RS_FLAG_REPLY, &reply, 0).is_some());
+        let past = file(198);
         assert_eq!(
-            serve_admin(OP_AUTH_LIST, &[], db.as_bytes(), &SALT, &mut new_db, &mut reply),
+            serve_admin(OP_AUTH_LIST, &[], past.as_bytes(), &SALT, &mut new_db, &mut reply),
             Admin::Refused(Refused::ListTooLong)
         );
     }

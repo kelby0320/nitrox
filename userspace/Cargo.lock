@@ -527,10 +527,12 @@ dependencies = [
  "liblog",
  "libos",
  "librsproto",
+ "libsession",
  "libstream",
  "libsurface",
  "libterm",
  "libui",
+ "libusers",
 ]
 
 [[package]]

@@ -28,6 +28,8 @@ pub const MAX_FILE: usize = 4096;
 pub const NAME_MAX: usize = 32;
 /// The longest password.
 pub const PASSWORD_MAX: usize = 128;
+/// The longest home: the kernel's `NS_SUBTREE_BASE_MAX`.
+pub const HOME_MAX: usize = 128;
 /// The salt a new password is given.
 pub const SALT_LEN: usize = 16;
 /// The longest salt a record may hold.
@@ -172,6 +174,13 @@ pub fn valid_name(name: &[u8]) -> bool {
 /// stored, so no byte of it can break the file.
 pub fn valid_password(password: &[u8]) -> bool {
     (1..=PASSWORD_MAX).contains(&password.len())
+}
+
+/// **Whether `home` may be an account's home**: a subtree base the kernel takes, as a session binds
+/// `/home` at it. Absolute, at most [`HOME_MAX`] bytes, not `/`, no empty, `.` or `..` component.
+pub fn valid_home(home: &[u8]) -> bool {
+    let parts = home.strip_prefix(b"/").filter(|p| !p.is_empty() && home.len() <= HOME_MAX);
+    parts.is_some_and(|p| p.split(|&c| c == b'/').all(|c| !c.is_empty() && c != b"." && c != b".."))
 }
 
 /// An account's home, `/home/<name>`, written into `out`; its length.

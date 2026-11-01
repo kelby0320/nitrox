@@ -253,7 +253,7 @@ a `MemoryObject`: a lookup attenuates to the binding's rights, so without it the
 and cannot be read. It means nothing on a `DeviceNode`, which is not mappable.
 
 **Reaching the binding at all is authority.** It lives in init's root namespace and
-`libsession::build_namespace` deliberately omits it, so an ordinary session cannot resolve
+`libsession::build` deliberately omits it, so an ordinary session cannot resolve
 `/dev/blk` however its rights read — see [`administration.md`](../planning/administration.md).
 
 ## The registry: `/dev/registry`

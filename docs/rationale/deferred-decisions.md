@@ -738,6 +738,13 @@ the codes can swap, which matters only to `on-failure` (`never` and `always` do 
 code). A service found dead with no code queued is treated as a failure, since a crash that
 outruns its notification is the case worth restarting.
 
+**`libsession::spawn_leader` gives up on a leader after `LEADER_STOP_NS`**, on a shutdown and when
+its setup message fails, and returns with that leader's `ChildExited` still to come. The next
+`spawn_leader` takes the first it sees as its own, so a leader that outlasts its five seconds ends
+the next session under a running shell. Reachable only by a leader that ignores both a terminate
+and its closed setup channel, which neither `nxsh` nor `desktop-shell` does. A life channel, as
+the broker and `service-mgr` hold, would attribute it.
+
 **The view broker lives with the same residual** (administration Part A.3, 2026-09-23), and it
 matters a little more there: its programs belong to different sessions, and each code goes to a
 different `with`, so a swap would tell one person their elevated command failed when someone else's
@@ -994,7 +1001,7 @@ window instead reaches the session's console.
 
 **What changed:** M7 Part D built `desktop-session-mgr`, so the graphical session namespace this
 entry was waiting on now exists — and it binds `/dev/tty`, because
-`libsession::build_namespace` binds it for both columns whenever a tty endpoint was handed
+`libsession::build` binds it for both columns whenever a tty endpoint was handed
 down.
 
 **The sharp edge, which Part D's own reasoning did not cover.** That session deliberately has
@@ -2259,7 +2266,10 @@ matches by hand — `KError::PeerClosed.as_i32() as i64`, `KError::PeerClosed as
 `E_PEER_CLOSED` — and a wrong constant compiles. A `KError` would make each a checked match. It
 waits for the receive's move to libos, whose wrappers return its typed `Error`, so the forty-odd
 callers change once: the move the safety survey's plan, in PR #398, proposes. Trigger: that move,
-or a status mismatched at a call site.
+or a status mismatched at a call site. **The same callers read a held receive as nothing queued.**
+`OutOfMemory` leaves the message queued, so their wait fires again at once and they spin until
+memory returns, which keeps the idle thread's reclamation from freeing any. `control::recv` and
+`auth-service` pause on `RecvFailure::Held`; the move gives every other server that.
 
 **vDSO-equivalent for `sys_clock_read`.** On modern Linux, `clock_gettime` is implemented in vDSO — userspace reads TSC directly, no syscall. Nitrox initially does one syscall per `sys_clock_read`. The API shape leaves room for this optimization later (the `ClockId` enum can map to fixed memory locations) without changing call sites.
 

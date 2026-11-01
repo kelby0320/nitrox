@@ -37310,3 +37310,43 @@ reach (sup-d12); and no safe function takes a pointer for the kernel to write (s
 ReadDir replies fit `RS_MAX_BODY` (sup-d2), a stick's block size must divide its scratch (sup-d7),
 and a read is reported only once complete (sup-d13); every unmap names its length (sup-d10); and
 device-mgr closes what it cannot follow (sup-d11).
+
+## 2026-10-31 — Before Phase 7, Part I: a password lives no longer than its use, and a reply is its request's
+
+Group T of the survey's triage, security (auth-service, session-mgr, desktop-session-mgr,
+libsession, the view broker and libcrypto), made six decisions:
+
+- **A home no session can bind logs no one in** (sec-d1; the maintainer's call of where):
+  `libusers::valid_home` holds the kernel's rules for a subtree base, and auth-service answers
+  `Denied` for a correct password whose record's home is not one, after the same derivation. The
+  record still parses, so List shows it and `account remove` clears it. `abi-sync-check` pairs
+  `HOME_MAX` with the kernel's bound, and `boot-probe` binds each case to hold the rules to it.
+- **A request on a long-lived channel takes only its own reply** (sec-d3, sec-o3):
+  `librsproto::session::round_trip` skips a message with another request id, and refuses one with
+  this id and another op, and libsession's `authenticate` and `views_call` use it with an id per
+  call. A reply left queued by a failed receive is skipped by the next call rather than answering
+  it. **A reply echoes its request's op and id, refusals included**: the wire spec says so, and a
+  server that breaks it on the id hangs its client, as one that never answers does.
+- **Bytes that held a password are zeroed when dropped, where they lie** (sec-o4, sec-d7, sec-d8):
+  `libkern::Secret`, beside `scrub`, on the login paths (libsession's request buffers, both
+  supervisors' passwords, session-mgr's tty reply and auth-service's request buffer); libcrypto's
+  `Sha256` and `HmacSha256` zero their own state. **A `Secret`'s life ends with a scope**: `drop` is
+  a move, and one left a denied password on desktop-session-mgr's stack. That supervisor's password
+  goes before the session starts, and `TextFieldState::scrub` zeroes the greeter's field. The
+  broker's and libprompt's hand scrubs stay for P7 (the maintainer's call).
+- **Nothing is cut to fit and called whole** (sec-d10): a home, a broker answer or a typed line past
+  its buffer is refused, and a typed password past it is denied, where a prefix of it was checked.
+- **A receive that fails leaves its message queued** (sec-d12): only `PeerClosed` ends an
+  auth-service session or takes its endpoint out of the wait set; any other failure pauses 10 ms,
+  so the wait that fires again is no spin. `libkern::RecvFailure` says which, and `control::recv`
+  pauses too, for every service. Other servers' session receives wait for `TODO(recv-kerror)`.
+- **A program's life channel carries no rights** (sec-d13): the broker spawns it with an empty
+  mask, so the program can neither duplicate nor move it, and its close is its exit.
+
+The rest are fixes. libsession, session-mgr and auth-service keep no `static mut` (sec-d14, sec-o8,
+sec-o9, sec-o10, the buffers too by the maintainer's call): what a build bound is the `Built` it
+returns, and auth-service's state is one `Server`, its admin reply sized `RS_MAX_BODY` (sec-d4).
+session-mgr closes its terminal on every path (sec-d1, with the bash's sec-12); a leader whose
+setup fails is stopped and waited for, and the image is closed when the pipe fails (sec-d6); the
+broker closes a pair one failed create left (sec-d5); and the registry snapshot is unmapped at its
+length (sec-d9). sec-d11 was fixed in PR #403's review.

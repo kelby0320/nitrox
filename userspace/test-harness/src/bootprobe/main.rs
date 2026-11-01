@@ -48,6 +48,7 @@ mod gates;
 mod policy;
 mod received;
 mod registry;
+mod replies;
 mod services;
 mod setup;
 mod storage;
@@ -65,6 +66,7 @@ use gates::*;
 use policy::*;
 use received::*;
 use registry::*;
+use replies::*;
 use services::*;
 use setup::*;
 use storage::*;
@@ -249,7 +251,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & log_closes_what_it_was_sent_test(root_ns)
         & continuation_test(root_ns)
         & subtree_bind_test(root_ns)
+        & home_rules_are_the_kernels_test()
         & auth_multi_client_test(root_ns)
+        & a_reply_is_its_requests_test(root_ns)
         & ns_derive_test(root_ns)
         & view_broker_test(root_ns)
         & view_grants_end_test(root_ns)

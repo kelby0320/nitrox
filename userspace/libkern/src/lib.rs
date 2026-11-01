@@ -31,7 +31,7 @@ pub mod syscaps;
 pub mod mem;
 
 pub use abi::*;
-pub use channel::{Received, channel_recv, channel_recv_raw};
+pub use channel::{Received, RecvFailure, channel_recv, channel_recv_raw, pause_held};
 pub use debug::{exit, kprint, kprint_hex, kprint_u64};
 pub use error::{KError, from_raw};
 pub use handle::*;
@@ -49,6 +49,42 @@ pub fn scrub(bytes: &mut [u8]) {
     }
 }
 
+/// **Bytes [`scrub`]bed when dropped, where they lie**: a password, or a buffer one passed through,
+/// is zeroed on every way out of its scope, and `drop` is a move, which scrubs a copy. Neither
+/// `Clone` nor `Debug`, and `*secret` is a slice.
+pub struct Secret<const N: usize>([u8; N]);
+
+impl<const N: usize> Secret<N> {
+    /// All zeroes, to be read or written into.
+    pub const fn zeroed() -> Self {
+        Self([0; N])
+    }
+
+    /// The whole array, for a call that takes one.
+    pub fn array_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
+    }
+}
+
+impl<const N: usize> Drop for Secret<N> {
+    fn drop(&mut self) {
+        scrub(&mut self.0);
+    }
+}
+
+impl<const N: usize> core::ops::Deref for Secret<N> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for Secret<N> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
 #[cfg(test)]
 mod scrub_tests {
     #[test]
@@ -56,5 +92,18 @@ mod scrub_tests {
         let mut b = [0xA5u8; 9];
         super::scrub(&mut b[1..8]);
         assert_eq!(b, [0xA5, 0, 0, 0, 0, 0, 0, 0, 0xA5]);
+    }
+
+    #[test]
+    fn a_dropped_secret_is_zeroed() {
+        let mut s = core::mem::MaybeUninit::new(super::Secret::<9>::zeroed());
+        // SAFETY: initialised above and dropped once, in place; the bytes stay readable as the
+        // plain data they are.
+        let bytes = unsafe {
+            (*s.as_mut_ptr()).fill(0xA5);
+            core::ptr::drop_in_place(s.as_mut_ptr());
+            *(s.as_ptr() as *const [u8; 9])
+        };
+        assert_eq!(bytes, [0; 9]);
     }
 }

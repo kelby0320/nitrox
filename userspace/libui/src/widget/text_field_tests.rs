@@ -164,3 +164,15 @@ fn row_children<Msg>(e: &Element<Msg>) -> usize {
     }
     find(e).expect("the field has a content row")
 }
+
+#[test]
+fn a_scrub_leaves_nothing_in_the_allocation() {
+    let mut f = TextFieldState::with_text("secret");
+    let at = f.text().as_ptr();
+    assert!(f.backspace());
+    f.scrub();
+    assert_eq!((f.text(), f.cursor()), ("", 0));
+    // SAFETY: a scrub keeps the allocation, and those six bytes were written.
+    let left = unsafe { core::slice::from_raw_parts(at, 6) };
+    assert_eq!(left, [0; 6]);
+}

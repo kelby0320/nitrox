@@ -79,20 +79,26 @@ Don't skip step 4. The spec doc is part of the contract.
 |---|---|
 | Raw syscall functions | Async executors |
 | ABI types (`#[repr(C)]`) | Typed handles (`Handle<T, M>`) |
-| `UserPtr<T>` wrappers | RAII guards, but the one below |
+| `UserPtr<T>` wrappers | RAII guards, but the two below |
 | `KError`, `Rights`, etc. | Path resolution helpers |
 | Thin `Result<>` wrappers | Stream readers/writers |
 | Constants (sizes, limits) | Custom data structures |
 
 If something doesn't strictly belong here but you find yourself wanting to put it here, the answer is almost always "put it in `libos` instead."
 
-**The one guard here is `channel::Received`** (pre-Phase-7 Part D, group F): the handles a message
+**One guard here is `channel::Received`** (pre-Phase-7 Part D, group F): the handles a message
 brought, closed when it drops unless taken. `sys_channel_recv` installs whatever a sender attaches,
 so every receiver must close what it did not ask for, those that do not depend on libos
 (`auth-service`, `librsproto`, `libstream`) included, and the lowest layer is the only one they
 all share. Receive through `channel_recv`, or
 `channel_recv_raw` into a `static mut` buffer, never a raw `SYS_CHANNEL_RECV`:
 `cargo xtask check-recv` fails any other userspace file that names it.
+
+**The other is `Secret`** (pre-Phase-7 Part I, group T): bytes `scrub`bed when they drop, for a
+password and the buffers it passes through, so an early return cannot skip the scrub. It scrubs
+where it lies, so its life ends with a scope and never with `drop`, which is a move and scrubs a
+copy. It sits beside `scrub` for the same reason `Received` is here: `auth-service` and the login
+supervisors share it.
 
 ## Testing
 
