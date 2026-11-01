@@ -207,7 +207,8 @@ impl From<WireError> for DirError {
 /// Send one request on `endpoint` and receive its reply into `buf`, returning the reply's
 /// rsproto payload length. Shared by [`Dir`] and [`crate::desktop::Desktop`], so the
 /// send/wait/recv/handle sweep has one copy. A `buf` shorter than [`IPC_MSG_SIZE`] is refused
-/// `Protocol`: the kernel copies a whole message from it.
+/// `Protocol`: the kernel copies a whole message from it. **A message that is not this request's
+/// reply is skipped**, by id and op, or one an earlier call left queued would answer this request.
 pub fn round_trip(
     endpoint: u64,
     buf: &mut [u8],
@@ -231,17 +232,25 @@ pub fn round_trip(
         return Err(WireError::Transport(sent as i32));
     }
 
-    // `sys_wait` is where the thread blocks, never the send or the recv.
-    let handles = [endpoint];
-    let mut results = [0u8; 24];
-    // SAFETY: valid handle array + result out-buffer for one waiter.
-    let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
-    if waited != 1 {
-        return Err(WireError::Transport(waited as i32));
+    loop {
+        // `sys_wait` is where the thread blocks, never the send or the recv.
+        let handles = [endpoint];
+        let mut results = [0u8; 24];
+        // SAFETY: valid handle array + result out-buffer for one waiter.
+        let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+        if waited != 1 {
+            return Err(WireError::Transport(waited as i32));
+        }
+        let msg: &mut [u8; IPC_MSG_SIZE] = (&mut buf[..IPC_MSG_SIZE]).try_into().map_err(|_| WireError::Protocol)?;
+        let _sent = libkern::channel_recv(endpoint, msg).map_err(|got| WireError::Transport(got as i32))?;
+        if let Some(payload_len) = reply_to(buf, request_id, op)? {
+            return Ok(payload_len);
+        }
     }
+}
 
-    let msg: &mut [u8; IPC_MSG_SIZE] = (&mut buf[..IPC_MSG_SIZE]).try_into().map_err(|_| WireError::Protocol)?;
-    let _sent = libkern::channel_recv(endpoint, msg).map_err(|got| WireError::Transport(got as i32))?;
+/// The payload length of the message in `buf` if it answers `request_id`'s `op`, else `None`.
+fn reply_to(buf: &[u8], request_id: u64, op: u16) -> core::result::Result<Option<usize>, WireError> {
     let payload_len = u32::from_le_bytes([
         buf[OFF_PAYLOAD_LEN],
         buf[OFF_PAYLOAD_LEN + 1],
@@ -251,7 +260,8 @@ pub fn round_trip(
     if payload_len < RS_HEADER_LEN || PAYLOAD_OFF + payload_len > buf.len() {
         return Err(WireError::Protocol);
     }
-    Ok(payload_len)
+    let m = crate::decode(&buf[PAYLOAD_OFF..PAYLOAD_OFF + payload_len]).map_err(|_| WireError::Protocol)?;
+    Ok((m.request_id == request_id && m.op == op).then_some(payload_len))
 }
 
 /// The `KError` an error reply carries, or a generic failure if the body is malformed.
@@ -312,6 +322,19 @@ mod tests {
         let (body, n) = rename_body(&long, &long).unwrap();
         assert_eq!(parse_rename_request(&body[..n]), Some((&long[..], &long[..])));
         assert!(name_body(&past).is_none() && rename_body(&long, &past).is_none());
+    }
+
+    /// Only the request's own reply is taken, and a message whose length does not fit is refused.
+    #[test]
+    fn a_reply_to_another_request_is_skipped() {
+        let mut buf = [0u8; IPC_MSG_SIZE];
+        let n = crate::encode(&mut buf[PAYLOAD_OFF..], crate::OP_FILE_MKDIR, 7, crate::RS_FLAG_REPLY, b"x", 0).unwrap();
+        buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(n as u32).to_le_bytes());
+        assert_eq!(reply_to(&buf, 7, crate::OP_FILE_MKDIR), Ok(Some(n)));
+        assert_eq!(reply_to(&buf, 8, crate::OP_FILE_MKDIR), Ok(None));
+        assert_eq!(reply_to(&buf, 7, crate::OP_FILE_RMDIR), Ok(None));
+        buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(IPC_MSG_SIZE as u32).to_le_bytes());
+        assert_eq!(reply_to(&buf, 7, crate::OP_FILE_MKDIR), Err(WireError::Protocol));
     }
 
     /// Refused before anything is sent: a message one byte short reaches no syscall.
