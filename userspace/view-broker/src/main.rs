@@ -62,24 +62,12 @@ static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * MAX_WAIT_HANDLES] = [0; 24 * MAX_WAIT_HANDLES];
-static mut NOTIF: Notification = Notification::zeroed();
-static mut CLOCK_BUF: u64 = 0;
-static mut SPAWN: SpawnArgs = SpawnArgs {
-    image: 0,
-    handle_count: 2,
-    move_mask: 0b11,
-    arg0: 0,
-    handles: [0; SPAWN_MAX_HANDLES],
-    rights: [u64::MAX; SPAWN_MAX_HANDLES],
-    namespace: 0,
-    syscaps: 0,
-};
 
 fn now_ns() -> u64 {
-    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: on success the kernel wrote the ns count.
-    unsafe { (&raw const CLOCK_BUF).read() }
+    let mut now = 0u64;
+    // SAFETY: `now` is a writable u64 out-param on this frame.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    now
 }
 
 fn close(h: u64) {
@@ -1444,25 +1432,30 @@ impl Broker {
             close(view_ns);
             return fail(self, &mut p, "there is no such program");
         }
-        let (Ok((setup_ours, setup_child)), Some((life_ours, life_child))) = (pipe(1), make_channel(1)) else {
-            close(image);
-            close(view_ns);
+        let (setup, life) = (pipe(1).ok(), make_channel(1));
+        let (Some((setup_ours, setup_child)), Some((life_ours, life_child))) = (setup, life) else {
+            // **The pair that was made goes too**: either create can fail alone.
+            let made = setup.into_iter().chain(life).flat_map(|(ours, child)| [ours, child]);
+            made.chain([image, view_ns]).for_each(close);
             return fail(self, &mut p, "out of channels");
         };
-        // SAFETY: SPAWN is our static, filled immediately before use; single-threaded.
-        let process = unsafe {
-            SPAWN.image = image;
-            SPAWN.handles[0] = setup_child;
+        let args = SpawnArgs {
+            image,
+            handle_count: 2,
+            move_mask: 0b11,
+            arg0: bootstrap_arg0(true),
             // **The life channel**: a handle the program never learns about, so it stays open
             // until the program exits — which is how the broker learns *which* program it was
             // (`TODO(child-exit-attribution)`, as `service-mgr` does it).
-            SPAWN.handles[1] = life_child;
-            SPAWN.namespace = view_ns;
+            handles: [setup_child, life_child, 0, 0],
+            // **No right on it**: one it could duplicate or move would outlive it.
+            rights: [u64::MAX, 0, 0, 0],
+            namespace: view_ns,
             // No ambient authority but what a grant says.
-            SPAWN.syscaps = syscaps;
-            SPAWN.arg0 = bootstrap_arg0(true);
-            syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN) as u64)
+            syscaps,
         };
+        // SAFETY: a valid spawn block on this frame.
+        let process = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const args) as u64) };
         close(image);
         if process < 0 {
             for h in [setup_ours, setup_child, life_ours, life_child, view_ns] {
@@ -1555,13 +1548,12 @@ impl Broker {
 
     fn drain_notifications(&mut self) {
         loop {
-            // SAFETY: NOTIF is a valid 64-byte out-param.
-            let r = unsafe { syscall4(SYS_NOTIF_RECV, self.notif, (&raw mut NOTIF) as u64, 0, 0) };
-            if r != 0 {
+            let mut n = Notification::zeroed();
+            // SAFETY: `n` is a writable `Notification`, the 64 bytes the kernel writes.
+            if unsafe { syscall4(SYS_NOTIF_RECV, self.notif, (&raw mut n) as u64, 0, 0) } != 0 {
                 break;
             }
-            // SAFETY: the kernel wrote a notification into NOTIF.
-            let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+            let Notification { kind, body } = n;
             if kind == KIND_CHILD_EXITED {
                 let exit_kind = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
                 let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
