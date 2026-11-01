@@ -43,9 +43,9 @@ impl Drop for Received {
     }
 }
 
-/// Close `h`, one of a message's handles that no one took.
+/// Close `h`, a handle of this process's that nothing will use again.
 #[cfg(not(test))]
-fn close(h: u64) {
+pub(crate) fn close(h: u64) {
     use crate::syscall::{SYS_HANDLE_CLOSE, syscall1};
     // SAFETY: a handle the kernel installed in this process for this message. `take` and
     // `take_all` zero each handle they hand out, so one still here is no one else's, and this
@@ -55,7 +55,7 @@ fn close(h: u64) {
 
 /// On the host, where handle-close is Linux's `read`, a close is recorded instead.
 #[cfg(test)]
-fn close(h: u64) {
+pub(crate) fn close(h: u64) {
     tests::CLOSED.with(|c| c.borrow_mut().push(h));
 }
 
@@ -134,7 +134,7 @@ fn settle(rr: i64, handles: [u64; IPC_HANDLE_MAX], count: usize) -> Result<Recei
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::vec::Vec;
@@ -144,7 +144,7 @@ mod tests {
         pub(super) static CLOSED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn closed() -> Vec<u64> {
+    pub(crate) fn closed() -> Vec<u64> {
         CLOSED.with(|c| c.borrow().clone())
     }
 

@@ -206,6 +206,8 @@ fn serve_loop(srv: &mut Server, mut serve_end: u64, mut control: u64) -> ! {
             let h = r.handle;
             if h == serve_end {
                 if !serve_resolve(srv, serve_end) {
+                    // SAFETY: closing our own endpoint, which leaves the wait set here.
+                    unsafe { syscall1(SYS_HANDLE_CLOSE, serve_end) };
                     serve_end = 0;
                 }
             } else if h == control {
