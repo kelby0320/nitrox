@@ -624,7 +624,7 @@ fn registry_blocks(ns: u64) -> Option<alloc::vec::Vec<(u32, u32)>> {
         Err(_) => alloc::vec::Vec::new(),
     };
     // SAFETY: unmapping what was mapped above; `out` holds copies.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
+    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
     Some(out)
 }
 
@@ -734,7 +734,7 @@ pub fn session_env() -> libstream::wire::Record {
 }
 
 /// Spawn the leader `program` into `session_ns`, then block on `notif` for its `ChildExited` and
-/// return its exit code. `-1` if it could not be spawned.
+/// return its exit code. `-1` if it could not be spawned or set up.
 ///
 /// **`syscaps` is the caller's to choose.** The serial leader gets `0`, **and `0` is what every
 /// command in the session gets**: `nxsh` passes each stage whatever it holds. The graphical
@@ -766,6 +766,8 @@ pub fn spawn_leader(
         Ok(p) => p,
         Err(_) => {
             kprint(b"libsession: setup channel FAIL\n");
+            // SAFETY: closing our own image handle; nothing was spawned from it.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
             return -1;
         }
     };
@@ -853,19 +855,23 @@ pub fn spawn_leader(
     }
     // SAFETY: closing our end of the setup channel; the shell holds its own.
     unsafe { syscall1(SYS_HANDLE_CLOSE, setup_mgr) };
-    if sent.is_err() {
-        kprint(b"libsession: setup message FAIL\n");
-        return -1;
-    }
-    Line::new()
-        .s(b"libsession: ")
-        .s(program.as_bytes())
-        .s(b" spawned into the session namespace with its environment")
-        .end();
     // **A terminate request is passed on**: a shutdown asks the supervisor, and the session is the
     // leader's to end. It has [`LEADER_STOP_NS`] to exit, and past that the supervisor goes on
     // without it — a stop is a request, and there is no forcible kill.
     let mut until = u64::MAX;
+    if sent.is_err() {
+        // **Stopped and waited for**: its exit, arriving later, would end the next session.
+        kprint(b"libsession: setup message FAIL; asking the leader to stop\n");
+        // SAFETY: a register-only syscall on the leader's process handle, which we hold.
+        unsafe { syscall1(SYS_PROCESS_TERMINATE, h as u64) };
+        until = now_ns().saturating_add(LEADER_STOP_NS);
+    } else {
+        Line::new()
+            .s(b"libsession: ")
+            .s(program.as_bytes())
+            .s(b" spawned into the session namespace with its environment")
+            .end();
+    }
     loop {
         if wait_until(notif, until).is_none() {
             if until != u64::MAX && now_ns() >= until {
@@ -885,10 +891,12 @@ pub fn spawn_leader(
                 let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
                 // SAFETY: closing our reference to the exited shell (reaping).
                 unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-                return code;
+                return if sent.is_ok() { code } else { -1 };
+            }
+            if kind == KIND_TERMINATE_REQUESTED {
+                STOP_ASKED.store(true, Ordering::Relaxed);
             }
             if kind == KIND_TERMINATE_REQUESTED && until == u64::MAX {
-                STOP_ASKED.store(true, Ordering::Relaxed);
                 let mut l = Line::new();
                 l.s(b"libsession: asked to stop; passing it on to ").s(program.as_bytes()).end();
                 // SAFETY: a register-only syscall on the leader's process handle, which we hold.
