@@ -2267,7 +2267,11 @@ callers change once: the move the safety survey's plan, in PR #398, proposes. Tr
 or a status mismatched at a call site. **The same callers read a held receive as nothing queued.**
 `OutOfMemory` leaves the message queued, so their wait fires again at once and they spin until
 memory returns, which keeps the idle thread's reclamation from freeing any. `control::recv` and
-`auth-service` pause on `RecvFailure::Held`; the move gives every other server that.
+`auth-service` pause on `RecvFailure::Held`; the move gives every other server that. **And a
+forwarding endpoint whose peer has gone**: the compositor's, the clipboard server's and the tty
+server's stay signalled and `sys_wait` fires again at once, a spin for the rest of the boot, where
+`auth-service`'s leaves the wait set and `storage-service`'s and `device-mgr`'s exit. Only the
+registration going reaches it, which takes `service-mgr` with it.
 
 **vDSO-equivalent for `sys_clock_read`.** On modern Linux, `clock_gettime` is implemented in vDSO — userspace reads TSC directly, no syscall. Nitrox initially does one syscall per `sys_clock_read`. The API shape leaves room for this optimization later (the `ClockId` enum can map to fixed memory locations) without changing call sites.
 
