@@ -359,6 +359,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a mebibyte of an interpreted cipher")]
     fn reseed_fires_past_the_byte_threshold() {
         let mut s = EntropyState::new();
         s.absorb(0x9999);

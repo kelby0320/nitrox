@@ -97,7 +97,7 @@ behaviour in host-testable code: run one test under it, never a suite, as
 `MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly-2026-07-20 miri test -p <crate> --lib --target
 x86_64-unknown-linux-gnu <name>` in `userspace/`, or `... miri test --lib --target
 x86_64-unknown-linux-gnu <name>` in `kernel/`. It is 10 to 100 times slower than a native run, and
-cannot run inline assembly, so nothing that makes a syscall.
+cannot run inline assembly, so every syscall is refused `Unsupported`: a path past one needs a boot.
 
 ## Builds
 

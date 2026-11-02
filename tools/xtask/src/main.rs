@@ -25,6 +25,7 @@ mod help;
 mod host_test;
 mod image;
 mod live_image;
+mod miri;
 mod preview;
 mod qemu;
 mod qmp;
@@ -436,6 +437,7 @@ fn main() -> ExitCode {
         Some("check-size") => size::cmd_check_size(&qargs),
         Some("unsafe-inventory") => unsafe_inventory::cmd_unsafe_inventory(&qargs),
         Some("check-images") => cmd_check_images(),
+        Some("miri") => miri::cmd_miri(&qargs),
         // The first *positional* argument: `qargs` has the global flags stripped.
         Some("tune") => cmd_tune(&qargs),
         Some("preview") => cmd_preview(qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all")),

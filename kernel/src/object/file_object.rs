@@ -1497,9 +1497,9 @@ mod tests {
             Reserve::New(fr) => fr,
             o => panic!("{o:?}"),
         };
-        for off in 0..PAGE_SIZE {
-            write_frame_byte(frame, off, byte);
-        }
+        let page = (frame.as_u64() + heap::hhdm_offset()) as *mut u8;
+        // SAFETY: `frame` is a live, HHDM-reachable, unaliased cache frame, a page long.
+        unsafe { page.write_bytes(byte, PAGE_SIZE) };
         f.mark_ready(index);
         frame
     }

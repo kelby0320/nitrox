@@ -850,8 +850,7 @@ mod tests {
         assert_eq!(click(&view, bounds, &m, cx, cy), [RefusalMsg::Close]);
     }
 
-    /// Every refusal the shell can say fits the dialog's width: a longer line is cut off
-    /// mid-reason.
+    /// Every refusal the shell can say fits the dialog's width, or it is cut off mid-reason.
     #[test]
     fn every_refusal_the_shell_says_fits_the_dialog() {
         use crate::ending::failed;
@@ -1044,6 +1043,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "every width and label of every theme, in interpreted glyphs")]
     fn no_task_is_ever_laid_out_under_the_switcher() {
         let f = font();
         for theme in themes() {
@@ -1078,11 +1078,11 @@ mod tests {
         }
     }
 
-    /// `check-login`'s bottom-bar aims, as literals: show-desktop at x 20; the first task's
-    /// middle at 141 and the next at 331; the empty stretch at 600; the desktop's name 30 in from
-    /// the right; the forward arrow and first cell measured from the right edge. All at half the
-    /// bar.
+    /// `check-login`'s bottom-bar aims at half the bar, as literals: show-desktop at x 20; the
+    /// first task's middle at 141 and the next at 331; the empty stretch at 600; the desktop's name
+    /// 30 in from the right; the forward arrow and first cell measured from the right edge.
     #[test]
+    #[cfg_attr(miri, ignore = "every width and label of every theme, in interpreted glyphs")]
     fn the_gates_bottom_bar_aims_land_on_what_they_name() {
         let f = font();
         for theme in themes() {

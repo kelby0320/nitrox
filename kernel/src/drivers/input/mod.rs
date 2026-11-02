@@ -484,7 +484,7 @@ pub(crate) mod test_support {
         let (done, answer) = mpsc::channel();
         let (second, buf2, po2) = (state.clone(), buf.clone(), po());
         std::thread::spawn(move || done.send(read(&second, &buf2, &po2)).unwrap());
-        std::thread::sleep(Duration::from_millis(50));
+        crate::mm::test_support::settle();
         assert!(!parked(&state), "parked beside a delivery in flight");
         owe(&state, first);
         let r = answer.recv_timeout(Duration::from_secs(10)).expect("still waiting once the first was handed back");

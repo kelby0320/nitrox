@@ -37,7 +37,7 @@ cargo xtask qemu           # build, assemble the image, and launch under QEMU
 cargo xtask qemu --grab    # …with the window holding the pointer and keyboard
 cargo xtask qemu --selftest # …with the boot self-tests / demos compiled in
 cargo xtask qemu-debug     # launch QEMU with the GDB stub enabled
-cargo xtask test           # host-side unit tests
+cargo xtask test           # host-side unit tests (`cargo xtask miri`: under Miri, nightly in CI, not per PR)
 cargo xtask test-qemu      # boot a headless self-test image; pass/fail via isa-debug-exit
 cargo xtask test-interactive # boot the RELEASE image and drive a real login + shell
 cargo xtask preview        # render the toolkit on the host to a PNG — no boot, no QEMU

@@ -651,6 +651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "many thousands of interpreted pixels")]
     fn scale_two_paints_every_glyph_pixel_as_a_block() {
         let mut fake = Fake::new(2056, 1600, 0);
         let mut console = Box::new(Console::new());
@@ -661,6 +662,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "many thousands of interpreted pixels")]
     fn a_report_page_is_what_the_screen_shows_until_the_report_ends() {
         let mut fake = Fake::new(80, 64, 0); // 10x4 cells
         let mut console = Box::new(Console::new());
@@ -722,6 +724,7 @@ mod tests {
 
     /// **A power operation's last line is the bottom row, on a row of its own.**
     #[test]
+    #[cfg_attr(miri, ignore = "many thousands of interpreted pixels")]
     fn the_last_line_is_a_row_of_its_own() {
         const SAFE: &[u8] = b"It is now safe to turn off your computer.";
         let mut fake = Fake::new(400, 50, 0);

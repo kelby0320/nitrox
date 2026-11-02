@@ -500,8 +500,7 @@ mod miri_heap {
         }
     }
 
-    /// Host-run, as Miri runs nowhere in CI: each block comes back aligned with its whole size
-    /// usable, and goes back to the host allocator from where it began.
+    /// Each block comes back aligned and whole, and goes back to the host from where it began.
     #[test]
     fn a_block_is_aligned_whole_and_freed_from_its_start() {
         for (size, align) in [(1, 1), (3, 32), (64, 8), (832, 64), (4096, 4096), (5000, 16)] {
@@ -750,6 +749,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "`kmalloc` is the host's under Miri, and frees no frame")]
     fn a_page_aligned_allocation_is_freed_whole() {
         crate::mm::test_support::init_global_heap();
         for size in [64, PAGE_SIZE, 3 * PAGE_SIZE] {

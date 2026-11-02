@@ -371,6 +371,7 @@ pub fn x2apic_write_fence() {
 ///
 /// Safe in ring 0. **Not** serializing: the CPU may reorder it a few instructions, a skew far
 /// below the monotonic clock's nanosecond resolution.
+#[cfg(not(miri))]
 #[inline]
 pub fn rdtsc() -> u64 {
     let low: u32;
@@ -382,6 +383,13 @@ pub fn rdtsc() -> u64 {
              options(nomem, nostack, preserves_flags));
     }
     ((high as u64) << 32) | (low as u64)
+}
+
+/// [`rdtsc`] under Miri, which runs no assembly. A host test's clock is never calibrated, so it
+/// reads 0 whatever this answers.
+#[cfg(miri)]
+pub fn rdtsc() -> u64 {
+    0
 }
 
 /// Read `IA32_TSC_AUX` (the per-CPU logical id the kernel programs there) via `RDTSCP`,

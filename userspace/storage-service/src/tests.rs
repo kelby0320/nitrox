@@ -587,6 +587,7 @@ fn in_use_is_each_mount_and_its_disk() {
 /// **A FAT is read by its server's own check**: 512-byte clusters are refused, and say why; 4 KiB
 /// sectors, which the library cannot parse but [`fat_label`] recognises, are still a FAT.
 #[test]
+#[cfg_attr(miri, ignore = "spawns mkfs.fat")]
 fn a_fat_is_read_by_its_servers_own_check() {
     let served = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "NXSTICK"]);
     assert_eq!(probe(&served), Found::Fat { label: String::from("NXSTICK"), clean: Some(true), refused: None });
@@ -685,6 +686,7 @@ fn mbr_entry_over(img: &Image, kind: u8, first: u32, count: u32) {
 /// FAT is reported and refused, an ext4 superblock at 1024 holds nothing. The same bytes as a
 /// partition are a FAT like any other.
 #[test]
+#[cfg_attr(miri, ignore = "spawns mkfs.fat")]
 fn a_whole_disk_with_partition_entries_is_never_mounted_whole() {
     use crate::probe::{STALE_FAT, probe_record};
     let blocks = 131_072u64;
@@ -712,6 +714,7 @@ fn a_whole_disk_with_partition_entries_is_never_mounted_whole() {
 /// **A FAT made whole on a stick is still served**: `mkfs.fat` leaves zeros where a table's
 /// entries would be, and Windows' boot code puts text there, whose bytes are no entry's status.
 #[test]
+#[cfg_attr(miri, ignore = "spawns mkfs.fat")]
 fn a_fat_made_on_a_whole_stick_is_still_served() {
     use crate::probe::probe_record;
     let disk = on_usb(rec(20, DeviceKind::Disk, 3, 19, "a stick", 4096));

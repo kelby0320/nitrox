@@ -37387,3 +37387,58 @@ out-params and diagnostic counters stop being `static mut` (desk-o7, desk-d16).
 
 **Part I is not finished by this**: its Miri job is still to build, and libos, the layer it pointed
 at, is Part E's.
+
+## 2026-11-01 — Before Phase 7, Part I: Miri runs nightly, over the kernel and the services
+
+`cargo xtask miri` runs the kernel's unit tests and 33 userspace crates' under Miri. CI runs it in
+`.github/workflows/miri.yml`, nightly and by hand as the maintainer chose (2026-10-26), and on a
+change to the job itself, which is how a schedule on `main` is proved before it lands. The kernel
+and userspace are a runner each, and every target runs and reports, so one failing hides none
+behind it. They run 1,152 tests and 1,640, in 43 minutes and 22 on CI's runners, and in 54 and 46
+side by side here. With the provenance tests it was built for now in the job,
+`TODO(miri-provenance-tests)` is closed.
+
+**It found no undefined behaviour outside a test.** The survey's fixes had been checked under it
+one by one, and the whole suite agrees. The one report was in the tests of the greeter's password
+scrub, here and in `libui`: a pointer taken through `text()` reached only the text it came from, and
+the scrub's own `&mut` retired it, so the read-back that shows the password gone was the undefined
+behaviour. `TextFieldState::allocation` hands out the `Vec`'s own pointer, which a scrub leaves
+good.
+
+Seven decisions:
+
+- **A list, not the host suite.** Miri finds undefined behaviour in the `unsafe` a test reaches,
+  and only there, so a target with none of its own would pay its minutes for nothing. Ten of the 43
+  are left out: `auth-service`, both filesystem servers, `libgpt`, `nxinstall` and `libterm`, whose
+  own code has no `unsafe` a test reaches; `libui`, whose `unsafe` is the scrub
+  `desktop-session-mgr`'s test reaches, against half an hour of its own; and `nxterm`, `nxedit` and
+  `nxfiles`, which are applications, and which all passed when measured. A test holds the two lists
+  to `cargo xtask test`'s, so a crate added to the suite is added here or says why not. A list of
+  the job's, not of what may run: `cargo xtask miri <crate>` runs one left out, and says why it is.
+- **Under Miri a syscall is refused, not attempted.** `libkern`'s `syscall6` has a `cfg(miri)` twin
+  answering `Unsupported`, as the assembly stopped the whole target at the first test that reached
+  one, and `exit`, which cannot answer, panics, failing only its test. `rdtsc` has a twin too,
+  reading 0: a host test's clock is never calibrated, so it reads 0 whatever that answers. None is
+  a syscall mock: no test can steer one.
+- **`libdraw` gains a `soft-floats` feature**, `libm`'s `sqrtf` as arithmetic rather than inline
+  assembly, passed only by this job. It opened `desktop-shell`, `desktop-session-mgr` and `libdraw`'s
+  text tests, and a build of an image never asks for it.
+- **A test Miri cannot run or finish says so beside itself**, with
+  `#[cfg_attr(miri, ignore = "...")]`, so a rename cannot leave a name behind in a list: 22 of them,
+  one from before the job, for a host tool spawned, inline assembly, tens of thousands of
+  interpreted rounds or pixels, or, in two kernel tests, the buddy allocator that `kmalloc` leaves
+  for the host's under Miri (kobj-o4).
+- **The concurrency tests stay, with fewer rounds, counted and not timed.** Under Miri threads crawl
+  past a real clock. A 40 ms bound left the handle table's headline test one duplicate a worker, and
+  a refcount made to lose updates passed three runs in eight; counted, it fails all eight. A 50 ms
+  window closed before a sweep reached what it watches, so with the grace wait removed that test
+  passed; `mm::test_support::settle` gives such a window two seconds under Miri.
+- **Strict provenance for `libheap` alone**, as its allocator hands out addresses and its test pins
+  how. The kernel's HHDM and page tables are integers by nature, and run under the default.
+  **Leaks are checked but for two**, the kernel, whose tests leak its heap, and `libos`, whose
+  forget reads that never end. The other 32 targets have none, so one found there fails the job.
+- **Nightly, and not cut to fit a PR.** The cost in a test was usually one helper rather than the
+  logic: `fill` wrote a page a byte at a time through a fresh integer-cast pointer, six seconds a
+  page under Miri, and one `write_bytes` took an hour off the run.
+
+Part I's own list ends here. libos, the layer it pointed at, is Part E's detail pass.

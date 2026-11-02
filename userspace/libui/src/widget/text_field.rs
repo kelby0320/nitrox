@@ -79,6 +79,14 @@ impl TextFieldState {
         self.cursor = 0;
     }
 
+    /// Where the allocation starts, by a pointer a later [`scrub`](Self::scrub) leaves good, as one
+    /// from [`text`](Self::text) reaches only the text it was taken from, and only until then.
+    /// For a test reading a scrub back: it grants no read that `text` does not.
+    pub fn allocation(&mut self) -> *const u8 {
+        // SAFETY: the text is read for its pointer alone, and stays as it is.
+        unsafe { self.text.as_mut_vec() }.as_ptr()
+    }
+
     /// Insert `c` at the caret and step over it.
     pub fn insert(&mut self, c: char) {
         self.text.insert(self.cursor, c);

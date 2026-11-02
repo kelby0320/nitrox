@@ -443,3 +443,14 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-01	414	a67d5be4	10	rules-and-docs+tests	optional	unverified	declined		reviewers found it unreachable; the old inline read also defaulted to 0; every boot runs both wrappers
 2026-11-01	414	a67d5be4	11	rules-and-docs	optional	unverified	fixed	241e6477	SAFETY comment says why the &mut is unique; comment only
 2026-11-01	414	a67d5be4	12	architecture	optional	demonstrated	fixed	65ffef4d	channel_create returns Result<_, KError>, callers take .ok(); by signature
+2026-11-02	415	fc655540	1	logic	worth-fixing	demonstrated	fixed	aac5554d	workers counted under Miri (30 duplicates each, was 1); lost-update refcount: new fails 8/8, old 5/8; sweep found three 50 ms windows, settle() 2 s, sweep test missed a removed grace wait at 50 ms
+2026-11-02	415	fc655540	2	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	be3f6679	twin reads 0 and says why; read_ns 0 reproduced; 1,152 kernel tests pass on the constant; a hang left to the job timeout, as it hangs natively first
+2026-11-02	415	fc655540	3	error-paths	optional	demonstrated	fixed	d57b3d03	ignore-leaks for kernel and libos only; other 32 targets clean; a Box::leak in libtime passes old job, fails new
+2026-11-02	415	fc655540	4	logic	optional	demonstrated	fixed	d57b3d03	a left-out crate runs by name and says why; libterm 140 and libui 292 tests by xtask; mutation fails the test
+2026-11-02	415	fc655540	5	error-paths	optional	demonstrated	fixed	d57b3d03	a second word is refused; old binary reproduced with stand-in cargo; mutation fails the test
+2026-11-02	415	fc655540	6	error-paths+architecture	optional	demonstrated	fixed	d57b3d03	require_miri: one refusal, one cargo call, was 34; a failed target prints run reason; by stand-in cargo, no host test
+2026-11-02	415	fc655540	7	error-paths+architecture	optional	demonstrated	fixed	5360a223	exit twin panics, failing its test alone; twin removed aborts the target; rules.md and libkern CLAUDE.md corrected, deferred entry reworded
+2026-11-02	415	fc655540	8	tests	optional	unverified	fixed	5360a223	Miri-only test: a wrapper reaching a syscall gets Err(Unsupported); twin answering 0 fails it
+2026-11-02	415	fc655540	9	rules-and-docs	optional	demonstrated	fixed	5360a223	Safety section says it has none of its own; comment only
+2026-11-02	415	fc655540	10	rules-and-docs	optional	demonstrated	fixed	cae8ea4c	entry says one of the 22 predates the job; 21 in the diff, 22 in the tree; doc only
+2026-11-02	415	fc655540	11	architecture	optional	demonstrated	fixed	cae8ea4c	doc says it is for a test read-back and grants no new read; pub stays, a second crate calls it; doc only

@@ -10,6 +10,12 @@ use crate::mm::{PAGE_SIZE, heap, slab};
 
 static HEAP_INIT: Once = Once::new();
 
+/// Give another thread time to reach what a test then asserts it did not do. Under Miri threads
+/// crawl past a clock that does not: 50 ms has ended before some have reached it.
+pub fn settle() {
+    std::thread::sleep(std::time::Duration::from_millis(if cfg!(miri) { 2_000 } else { 50 }));
+}
+
 /// Boot the global buddy and slab allocators once, against a leaked 16 MiB host buffer. Idempotent
 /// and thread-safe; the HHDM offset is `0` because fake physical addresses are host addresses.
 pub fn init_global_heap() {

@@ -51,6 +51,8 @@ libkern = { path = "../libkern", optional = true }
 [features]
 # `acquire::*`: read `/dev/framebuffer/info` and map `/dev/framebuffer`.
 io = ["dep:libos", "dep:libkern"]
+# `libm`'s `sqrtf` as arithmetic, for Miri, which runs no inline assembly.
+soft-floats = ["libm/force-soft-floats"]
 
 [lib]
 name = "libdraw"

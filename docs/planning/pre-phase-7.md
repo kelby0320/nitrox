@@ -11,7 +11,7 @@ the laptop; C.5 built 2026-10-20 — Part C built; the stick's light confirmed o
 for what it left (the maintainer's call); Part I added 2026-10-26, a safety survey (the
 maintainer's call), its thirteen runs done 2026-10-26 and 2026-10-27 and triaged 2026-10-27, and
 Part J added for the kernel layers it plans (the maintainer's call); Part I's items marked fix all
-fixed 2026-11-01, its Miri job still to build.** Each later part gets its
+fixed 2026-11-01, and its Miri job built the same day.** Each later part gets its
 detail pass when it is next. Ten parts, A–J, in the order below: Part I between D and E, and Part J
 after I. Part E is the syscall-surface consolidation, planned separately in
 [`syscall-surface.md`](syscall-surface.md).
@@ -974,7 +974,9 @@ std port**, which builds on what it leaves.
   Measured first: 27 of 44 host-test targets passed under it, 29 minutes against 4.8 s natively;
   the rest stopped at a test past 20 minutes, `libm`'s inline `sqrtf`, a host tool spawned, a
   host test making a real syscall, or, in the kernel, undefined behaviour in an AHCI test's fake
-  registers. Making its targets' tests run under it is part of this part.
+  registers. Making its targets' tests run under it is part of this part. **Built 2026-11-01**:
+  `cargo xtask miri`, nightly and by hand, over the kernel and 33 of the 43 userspace targets, each
+  of the other ten left out with its reason.
 
 Measured on `main` at `6ffc1173`, after group F, with `cargo xtask unsafe-inventory`, test code
 left out: 107,589 lines of code holding 2,795 `unsafe` blocks, 374 `unsafe fn`s, 274

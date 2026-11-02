@@ -630,7 +630,7 @@ fn concurrent_allocate_lookup_close_pid_isolation() {
 
     let t = Arc::new(fresh_table());
     const N_THREADS: usize = 8;
-    const ITERS: usize = 2000;
+    const ITERS: usize = if cfg!(miri) { 20 } else { 2000 };
 
     let workers: Vec<_> = (0..N_THREADS)
         .map(|tid| {
@@ -672,6 +672,8 @@ fn concurrent_torn_read_torture() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
+    // Under Miri a clock bounds nothing: threads crawl past it, and 30 ms was one cycle.
+    const READS: u32 = if cfg!(miri) { 10 } else { 1_000 };
     let t = Arc::new(fresh_table());
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -708,7 +710,7 @@ fn concurrent_torn_read_torture() {
         let stop = Arc::clone(&stop);
         readers.push(thread::spawn(move || {
             let mut iterations = 0u32;
-            while !stop.load(Ordering::Relaxed) && iterations < 1_000 {
+            while !stop.load(Ordering::Relaxed) && iterations < READS {
                 for slot in 0..4u32 {
                     for pid in 1..8u32 {
                         for generation in 1..8u32 {
@@ -728,12 +730,15 @@ fn concurrent_torn_read_torture() {
         }));
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    stop.store(true, Ordering::Relaxed);
-    writer.join().unwrap();
+    if !cfg!(miri) {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        stop.store(true, Ordering::Relaxed);
+    }
     for r in readers {
         r.join().unwrap();
     }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
 }
 
 /// **Headline TOCTOU test.** Workers hammer `duplicate(H)` on one long-lived
@@ -747,19 +752,21 @@ fn concurrent_duplicate_vs_close_toctou_torture() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
+    // As `concurrent_torn_read_torture`: 40 ms was one duplicate a worker.
+    const DUPLICATES: u32 = if cfg!(miri) { 30 } else { u32::MAX };
     let t = Arc::new(fresh_table());
     test_probe::reset();
     let h0 = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::DUPLICATE).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
 
-    let mut workers = Vec::new();
+    let mut duplicators = Vec::new();
     for _ in 0..3 {
         let t = Arc::clone(&t);
         let stop = Arc::clone(&stop);
-        workers.push(thread::spawn(move || {
+        duplicators.push(thread::spawn(move || {
             let src = h0;
             test_probe::reset();
-            while !stop.load(Ordering::Relaxed) {
+            for _ in (0..DUPLICATES).take_while(|_| !stop.load(Ordering::Relaxed)) {
                 if let Ok(dup) = t.duplicate(src, 1, Rights::SIGNAL | Rights::DUPLICATE) {
                     if let Ok(ok) = t.lookup(dup, 1, Rights::SIGNAL) {
                         assert!(process_magic_ok(&ok.object), "UAF via duplicate");
@@ -771,10 +778,11 @@ fn concurrent_duplicate_vs_close_toctou_torture() {
             test_probe::process_destroys()
         }));
     }
+    let mut lookups = Vec::new();
     for _ in 0..2 {
         let t = Arc::clone(&t);
         let stop = Arc::clone(&stop);
-        workers.push(thread::spawn(move || {
+        lookups.push(thread::spawn(move || {
             let src = h0;
             test_probe::reset();
             while !stop.load(Ordering::Relaxed) {
@@ -787,10 +795,16 @@ fn concurrent_duplicate_vs_close_toctou_torture() {
         }));
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(40));
-    stop.store(true, Ordering::Relaxed);
+    if !cfg!(miri) {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        stop.store(true, Ordering::Relaxed);
+    }
     let mut worker_destroys = 0usize;
-    for w in workers {
+    for w in duplicators {
+        worker_destroys += w.join().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in lookups {
         worker_destroys += w.join().unwrap();
     }
     assert_eq!(worker_destroys, 0, "object destroyed while H was held");
@@ -841,7 +855,7 @@ fn a_closer_waits_for_a_lookup_about_to_take_its_reference(close: fn(&HandleTabl
             while !entry_object(t, h).is_null() && start.elapsed().as_secs() < 5 {
                 std::thread::yield_now();
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            crate::mm::test_support::settle();
             assert_eq!(f.load(SeqCst), 0, "freed under a lookup about to take a reference");
         })))
     });

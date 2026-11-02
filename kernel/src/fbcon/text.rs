@@ -618,6 +618,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "many thousands of interpreted pixels")]
     fn every_page_fits_without_scrolling_and_together_they_are_the_whole_log() {
         let mut log = Vec::new();
         for i in 0..200usize {

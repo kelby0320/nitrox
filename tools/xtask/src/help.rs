@@ -54,6 +54,8 @@ pub(crate) fn print_help() {
            check-moves     fail if a commit (default HEAD) changes anything but code it moves\n  \
            unsafe-inventory  `unsafe` and raw pointers by kind, a row per crate or kernel module,\n  \
            \x20                 tests left out; `unsafe-inventory PATH...` for those paths\n  \
+           miri            the kernel and the system services under Miri, as CI does nightly:\n  \
+           \x20               an hour, not seconds; `miri kernel`, `miri userspace` or `miri <crate>`\n  \
            check-images    fail if a test image and a release image differ by anything new\n  \
            check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope or\n  \
            \x20               does not open by clearing DF and AC\n  \

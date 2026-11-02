@@ -34,6 +34,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "thousands of rounds of an interpreted hash")]
     fn derive_then_verify_roundtrip() {
         let salt = b"\x01\x02\x03\x04\x05\x06\x07\x08";
         let v = derive(b"correct horse", salt, DEFAULT_ITERATIONS);
@@ -42,6 +43,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "thousands of rounds of an interpreted hash")]
     fn salt_changes_verifier() {
         let a = derive(b"same-password", b"salt-aaaa", DEFAULT_ITERATIONS);
         let b = derive(b"same-password", b"salt-bbbb", DEFAULT_ITERATIONS);
@@ -49,6 +51,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "thousands of rounds of an interpreted hash")]
     fn wrong_length_expected_rejected() {
         let salt = b"saltsalt";
         let v = derive(b"pw", salt, DEFAULT_ITERATIONS);
