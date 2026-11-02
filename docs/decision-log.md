@@ -37442,3 +37442,12 @@ Seven decisions:
   page under Miri, and one `write_bytes` took an hour off the run.
 
 Part I's own list ends here. libos, the layer it pointed at, is Part E's detail pass.
+
+## 2026-11-02 — CI's runners are pinned to Ubuntu 24.04
+
+GitHub's `ubuntu-latest` began moving to Ubuntu 26 on 2026-10-19, by its own notice on the Miri
+job's first run. Every job here took that label, and CI's QEMU and filesystem tools are that image's
+packages, so a move would change what the gates boot on with nothing changed in the tree. They have
+been caught by that difference before: TCG's x2APIC from QEMU 9.0, and the device properties of 8.2
+against a local 11. Every job now names `ubuntu-24.04`, the image they already ran on. Moving is a
+change of its own, checked first against that release's QEMU in a container.
