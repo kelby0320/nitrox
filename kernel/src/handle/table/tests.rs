@@ -630,7 +630,7 @@ fn concurrent_allocate_lookup_close_pid_isolation() {
 
     let t = Arc::new(fresh_table());
     const N_THREADS: usize = 8;
-    const ITERS: usize = 2000;
+    const ITERS: usize = if cfg!(miri) { 20 } else { 2000 };
 
     let workers: Vec<_> = (0..N_THREADS)
         .map(|tid| {

@@ -8,6 +8,7 @@
 //! Registers: `rax` = number, args in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`; `rcx`/`r11` are
 //! clobbered by `syscall`; the `isize` result returns in `rax`.
 
+#[cfg(not(miri))]
 use core::arch::asm;
 
 // --- Stable ABI syscall numbers (mirror kernel/src/syscall/table.rs) -------
@@ -140,6 +141,7 @@ pub const TEST_EXIT_FAILURE: u32 = 0x11;
 /// # Safety
 /// `nr` must be a valid syscall number and `a0..a5` valid for it (including any
 /// pointers being live user buffers of the required size/alignment).
+#[cfg(not(miri))]
 #[inline]
 pub unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     let ret;
@@ -161,6 +163,15 @@ pub unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         );
     }
     ret
+}
+
+/// [`syscall6`] under Miri, which runs no assembly: a host test that reaches a syscall is refused.
+///
+/// # Safety
+/// None it needs, but the caller's as above.
+#[cfg(miri)]
+pub unsafe fn syscall6(_nr: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
+    crate::error::KError::Unsupported.as_i32() as i64
 }
 
 /// Zero-argument syscall.

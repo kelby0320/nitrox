@@ -70,6 +70,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "thousands of rounds of an interpreted hash")]
     fn rfc7914_c2() {
         // RFC 7914 §11: PBKDF2-HMAC-SHA-256(P="Password", S="NaCl", c=80000, dkLen=64).
         let mut out = [0u8; 64];
@@ -82,6 +83,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "thousands of rounds of an interpreted hash")]
     fn known_c4096_32() {
         // Widely-published vector: P="password", S="salt", c=4096, dkLen=32.
         let mut out = [0u8; 32];
@@ -90,6 +92,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "thousands of rounds of an interpreted hash")]
     fn partial_block_output() {
         // A 20-byte request (< one 32-byte block) must equal the truncation of a
         // full-block derivation with the same parameters.

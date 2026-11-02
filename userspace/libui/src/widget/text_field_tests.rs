@@ -168,7 +168,7 @@ fn row_children<Msg>(e: &Element<Msg>) -> usize {
 #[test]
 fn a_scrub_leaves_nothing_in_the_allocation() {
     let mut f = TextFieldState::with_text("secret");
-    let at = f.text().as_ptr();
+    let at = f.allocation();
     assert!(f.backspace());
     f.scrub();
     assert_eq!((f.text(), f.cursor()), ("", 0));

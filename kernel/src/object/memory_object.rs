@@ -403,6 +403,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "`kmalloc` is the host's under Miri, with no largest block")]
     fn copying_an_image_past_the_largest_block_is_refused() {
         init_global_heap();
         let big = MemoryObject::try_new((PAGE_SIZE << crate::mm::buddy::MAX_ORDER) + PAGE_SIZE).unwrap();

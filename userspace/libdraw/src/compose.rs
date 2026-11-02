@@ -826,9 +826,9 @@ mod tests {
         assert!(!covers(&SurfaceRef::new(og, oo, &opx[..4])), "a short buffer covers nothing");
     }
 
-    /// `subtract_from` never loses a pixel and never invents one, at any capacity, including the
-    /// overflow path the shipped bound of 16 rarely reaches.
+    /// `subtract_from` neither loses nor invents a pixel at any capacity, overflow path included.
     #[test]
+    #[cfg_attr(miri, ignore = "an exhaustive scan of every pixel at every capacity")]
     fn subtracting_never_loses_a_pixel_at_any_capacity() {
         fn covered(region: &[Option<Rect>]) -> alloc::vec::Vec<(i32, i32)> {
             let mut out = alloc::vec::Vec::new();
@@ -1035,10 +1035,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "many thousands of interpreted pixels")]
     fn the_span_skipping_shadow_draws_exactly_what_the_per_pixel_one_did() {
-        // Byte for byte: every gate's expected picture is drawn by this function. Cases: corners
-        // of every size, an offset past and inside the radius, a clip inside the skipped span, a
-        // window exactly `2c` across, one partly off screen.
+        // Byte for byte, as every gate's expected picture is drawn by this. Corners of every size,
+        // an offset past and inside the radius, a clip in the skipped span, a window `2c` across.
         let g = screen_geom();
         let (pg, ground) = patterned(64, 48, 64 * 4, 0x33);
         for corner in [0u32, 1, 3, 6, 8, 20] {

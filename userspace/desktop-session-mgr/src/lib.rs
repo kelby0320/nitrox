@@ -263,7 +263,7 @@ mod tests {
         for _ in 0..16 {
             g.password.insert('a');
         }
-        let at = g.password.text().as_ptr();
+        let at = g.password.allocation();
         g.reset();
         // SAFETY: the field keeps its allocation, and those sixteen bytes were written.
         let left = unsafe { core::slice::from_raw_parts(at, 16) };

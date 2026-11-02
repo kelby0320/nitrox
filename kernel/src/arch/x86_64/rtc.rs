@@ -416,6 +416,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "five centuries of interpreted days")]
     fn civil_from_days_inverts_days_from_civil() {
         for days in -200 * 365..300 * 365 {
             let (y, m, d) = civil_from_days(days);
