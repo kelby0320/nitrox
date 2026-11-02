@@ -24,7 +24,8 @@ pub enum AcquireError {
     InfoTruncated,
     /// Firmware reported a depth this crate does not render (only 32 bpp is supported).
     UnsupportedDepth(u16),
-    /// Firmware reported a pitch too small to hold a row, which would alias rows.
+    /// Firmware reported a pitch too small to hold a row, which would alias rows, or an aperture
+    /// too short for its rows, which would write past the mapping.
     ImpossibleGeometry,
     /// The aperture resolved but could not be mapped.
     ApertureUnmappable,
@@ -75,7 +76,9 @@ pub fn geometry_from(info: &FramebufferInfo) -> Result<Geometry, AcquireError> {
         // hardware leaves it zero, so a blend would paint nothing.
         alpha: None,
     };
-    Geometry::with_pitch(info.width, info.height, info.pitch as usize, format).ok_or(AcquireError::ImpossibleGeometry)
+    Geometry::with_pitch(info.width, info.height, info.pitch as usize, format)
+        .filter(|g| info.byte_len >= g.byte_len() as u64)
+        .ok_or(AcquireError::ImpossibleGeometry)
 }
 
 /// Map the framebuffer and wrap it as a writable [`RawFramebuffer`].
@@ -100,8 +103,9 @@ pub unsafe fn acquire(root_ns: u64) -> Result<(RawFramebuffer, FramebufferInfo),
             .map_err(|_| AcquireError::NoBinding)?;
 
     let addr = obj.map(info.byte_len as usize).map_err(|_| AcquireError::ApertureUnmappable)?;
-    // SAFETY: `addr` maps `byte_len` writable bytes of the aperture, which stays mapped
-    // for the life of the address space; the caller's contract forbids a second writer.
+    // SAFETY: `addr` maps `byte_len` writable bytes of the aperture, at least `geometry`'s as
+    // `geometry_from` checked, which stays mapped for the life of the address space; the caller's
+    // contract forbids a second writer.
     Ok((unsafe { RawFramebuffer::new(geometry, addr) }, info))
 }
 
@@ -156,6 +160,13 @@ mod tests {
     fn an_unsupported_depth_is_refused_rather_than_rendered_wrong() {
         assert_eq!(geometry_from(&info(24, 3840)), Err(AcquireError::UnsupportedDepth(24)));
         assert_eq!(geometry_from(&info(16, 2560)), Err(AcquireError::UnsupportedDepth(16)));
+    }
+
+    #[test]
+    fn an_aperture_short_of_its_last_row_is_refused() {
+        let mut i = info(32, 5120);
+        i.byte_len -= 1;
+        assert_eq!(geometry_from(&i), Err(AcquireError::ImpossibleGeometry));
     }
 
     #[test]

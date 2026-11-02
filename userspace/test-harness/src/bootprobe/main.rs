@@ -53,6 +53,7 @@ mod services;
 mod setup;
 mod storage;
 mod storage_admin;
+mod surface;
 mod tty;
 mod views;
 
@@ -71,6 +72,7 @@ use services::*;
 use setup::*;
 use storage::*;
 use storage_admin::*;
+use surface::*;
 use tty::*;
 use views::*;
 
@@ -254,6 +256,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & home_rules_are_the_kernels_test()
         & auth_multi_client_test(root_ns)
         & a_reply_is_its_requests_test(root_ns)
+        & a_session_takes_memory_and_whole_bodies_test(root_ns)
         & ns_derive_test(root_ns)
         & view_broker_test(root_ns)
         & view_grants_end_test(root_ns)

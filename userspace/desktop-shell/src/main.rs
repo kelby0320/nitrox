@@ -43,6 +43,7 @@ use desktop_shell::{
 use librsproto::surface::{
     CreateWindowRequest, Edge, MgrLayout, OP_MGR_QUERY_LAYOUT, OP_MGR_SET_WINDOW_DESKTOP, Role, STICKY_DESKTOP,
 };
+use libsurface::buffers::BufferPool;
 use libsurface::ipc::ChannelTransport;
 use libsurface::{Session, Transport};
 use libui::element::{Element, Insets, custom, fill, offset, padding, row, sized, stack, text};
@@ -125,12 +126,12 @@ fn stop() -> ! {
 fn stop_asked(notif: u64) -> bool {
     let mut asked = false;
     loop {
-        // SAFETY: NOTIF is a valid 64-byte writable out-param.
-        if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) } != 0 {
+        let mut n = Notification::zeroed();
+        // SAFETY: `n` is a valid 64-byte writable out-param on this frame.
+        if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut n) as u64, 0, 0) } != 0 {
             return asked;
         }
-        // SAFETY: the kernel wrote a Notification into NOTIF.
-        asked |= unsafe { (&raw const NOTIF.kind).read() } == libkern::abi::KIND_TERMINATE_REQUESTED;
+        asked |= n.kind == libkern::abi::KIND_TERMINATE_REQUESTED;
     }
 }
 
@@ -198,7 +199,6 @@ static mut RECV_MSG: [u8; 4096] = [0; 4096];
 /// while a power action runs.
 static mut WAIT_HANDLES: [u64; 5 + MAX_DESKTOP_SESSIONS] = [0; 5 + MAX_DESKTOP_SESSIONS];
 static mut SHELL_NOTIF: u64 = 0;
-static mut NOTIF: Notification = Notification::zeroed();
 /// One 24-byte `IoResult` per handle in the set: `sys_wait` takes no length and writes one record
 /// per signalled handle (`kernel/src/syscall/table.rs`), so a smaller buffer overruns a static.
 static mut WAIT_RESULTS: [u8; 24 * (5 + MAX_DESKTOP_SESSIONS)] = [0; 24 * (5 + MAX_DESKTOP_SESSIONS)];
@@ -518,7 +518,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let ending_anchor = ending_anchor(&shown_clock, &theme, &font, screen);
     let mut name = TextFieldState::new();
     let mut overview: Option<u32> = None;
-    let mut over_addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
+    let mut over_pool: Option<BufferPool> = None;
     let mut shots: alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
     let mut dragging: Option<u32> = None;
     let mut overview_dirty = false;
@@ -1124,7 +1124,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     && k.pressed != 0
                     && k.keycode == KEY_ESC
                 {
-                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_addrs, screen);
+                    close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_pool);
                     continue;
                 }
                 if let libsurface::WindowEvent::Pointer(p) = event
@@ -1176,8 +1176,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                             &mut overview,
                                             &mut shots,
                                             &mut dragging,
-                                            &mut over_addrs,
-                                            screen,
+                                            &mut over_pool,
                                         );
                                     }
                                 }
@@ -1209,21 +1208,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                             &mut overview,
                                             &mut shots,
                                             &mut dragging,
-                                            &mut over_addrs,
-                                            screen,
+                                            &mut over_pool,
                                         );
                                     }
                                 }
                             }
                             (None, Some(i)) if desktops[i].id == current_desktop => {
-                                close_overview(
-                                    &mut session,
-                                    &mut overview,
-                                    &mut shots,
-                                    &mut dragging,
-                                    &mut over_addrs,
-                                    screen,
-                                );
+                                close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_pool);
                             }
                             (None, Some(i)) => {
                                 if let Some(m) = manager.as_mut() {
@@ -1244,14 +1235,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             // A click on the overview's background dismisses it; it covers the
                             // bar, so a second click on the desktop's name lands here.
                             (None, None) => {
-                                close_overview(
-                                    &mut session,
-                                    &mut overview,
-                                    &mut shots,
-                                    &mut dragging,
-                                    &mut over_addrs,
-                                    screen,
-                                );
+                                close_overview(&mut session, &mut overview, &mut shots, &mut dragging, &mut over_pool);
                             }
                             _ => {}
                         }
@@ -1350,7 +1334,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 &desktops,
                                 current_desktop,
                                 &entries,
-                                &mut over_addrs,
+                                &mut over_pool,
                                 wallpaper.as_ref().map(|w| w.picture.as_slice()),
                                 screen,
                             );
@@ -1439,7 +1423,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     &desktops,
                     current_desktop,
                     &entries,
-                    &over_addrs,
+                    &mut over_pool,
                     wallpaper.as_ref().map(|w| w.picture.as_slice()),
                     screen,
                 );
@@ -1454,22 +1438,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     }
 }
 
-static mut CLOCK_BUF: u64 = 0;
-
 /// The monotonic clock, in nanoseconds, or `None` if it will not answer.
 ///
 /// Every caller treats `None` as nothing to do this round, not zero: a deadline nothing can
 /// evaluate is a wait that returns immediately for ever, a spin harmful machine-wide.
 fn now_ns() -> Option<u64> {
-    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    let r = unsafe {
-        libkern::syscall::syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64)
-    };
-    if r != 0 {
-        return None;
-    }
-    // SAFETY: the call succeeded, so the kernel wrote the ns count.
-    Some(unsafe { (&raw const CLOCK_BUF).read() })
+    libkern::clock_read(libkern::abi::CLOCK_MONOTONIC).ok()
 }
 
 #[panic_handler]

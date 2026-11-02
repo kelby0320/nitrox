@@ -171,46 +171,18 @@ pub(super) fn open_overview(
     desktops: &[Desktop],
     current: u32,
     entries: &[WinEntry],
-    addrs: &mut [*mut u8; BUFFERS],
+    pool: &mut Option<BufferPool>,
     wallpaper: Option<&[u8]>,
     screen: Screen,
 ) -> Option<u32> {
-    let len = screen.pitch() * screen.height as usize;
     let id =
         session.create(&CreateWindowRequest::new(screen.width, screen.height, Role::Popup { parent }), BUFFERS).ok()?;
     // Every failure past `create` destroys the window: otherwise the compositor holds a popup
     // this process has forgotten, with a live mapping, and repeats exhaust
     // `MAX_WINDOWS_PER_CONNECTION`.
-    let mut ok = true;
-    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
-    for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
-            ok = false;
-            break;
-        };
-        addrs[i] = addr;
-        let Some(mut w) = session.window(id) else {
-            ok = false;
-            break;
-        };
-        if w.attach_with_format(
-            i as u32,
-            screen.width,
-            screen.height,
-            screen.pitch() as u32,
-            handle,
-            PixelFormat::ARGB8888,
-        )
-        .is_err()
-        {
-            ok = false;
-            break;
-        }
-    }
-    if !ok {
-        for a in addrs.iter_mut() {
-            release_buffer(a, len);
-        }
+    let size = libdraw::geom::Size::new(screen.width, screen.height);
+    *pool = session.window(id).and_then(|mut w| BufferPool::in_format(&mut w, size, BUFFERS, PixelFormat::ARGB8888));
+    if pool.is_none() {
         if let Some(w) = session.window(id) {
             let _ = w.destroy();
         }
@@ -224,7 +196,7 @@ pub(super) fn open_overview(
     } else {
         kprint(b"desktop-shell: overview ground is the desktop colour\n");
     }
-    present_overview(session, id, theme, font, shots, desktops, current, entries, addrs, wallpaper, screen);
+    present_overview(session, id, theme, font, shots, desktops, current, entries, pool, wallpaper, screen);
     Some(id)
 }
 
@@ -238,25 +210,16 @@ pub(super) fn present_overview(
     desktops: &[Desktop],
     current: u32,
     entries: &[WinEntry],
-    addrs: &[*mut u8; BUFFERS],
+    pool: &mut Option<BufferPool>,
     wallpaper: Option<&[u8]>,
     screen: Screen,
 ) {
-    let len = screen.pitch() * screen.height as usize;
     let bytes = render_overview(theme, font, shots, desktops, current, entries, wallpaper, screen).into_bytes();
-    if bytes.len() != len {
-        return;
-    }
     let Some(mut w) = session.window(id) else { return };
     let Ok(slot) = w.acquire() else { return };
-    let addr = addrs[slot as usize % BUFFERS];
-    if addr.is_null() {
-        return;
+    if pool.as_mut().is_some_and(|p| p.write(slot, &bytes)) {
+        let _ = w.commit(slot, (0, 0, screen.width, screen.height));
     }
-    // SAFETY: `addr` maps `len` writable bytes and `bytes` holds exactly `len`; distinct
-    // allocations, so they cannot overlap.
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr, len) };
-    let _ = w.commit(slot, (0, 0, screen.width, screen.height));
 }
 
 pub(super) fn close_overview(
@@ -264,17 +227,14 @@ pub(super) fn close_overview(
     overview: &mut Option<u32>,
     shots: &mut alloc::vec::Vec<(u32, u32, u32, alloc::vec::Vec<u8>)>,
     dragging: &mut Option<u32>,
-    addrs: &mut [*mut u8; BUFFERS],
-    screen: Screen,
+    pool: &mut Option<BufferPool>,
 ) {
     if let Some(id) = overview.take() {
         if let Some(w) = session.window(id) {
             let _ = w.destroy();
         }
         // Unmapped, not merely forgotten: destroying the window drops only the compositor's side.
-        for a in addrs.iter_mut() {
-            release_buffer(a, screen.pitch() * screen.height as usize);
-        }
+        *pool = None;
         shots.clear();
         *dragging = None;
         Line::new().s(b"desktop-shell: overview closed, window ").u(id as u64).end();
@@ -400,7 +360,7 @@ fn capture_window(
     let h = want.1.min(size.1.max(1));
     let pitch = (w as usize) * 4;
     let len = pitch * h as usize;
-    let (handle, addr) = shared_buffer(len)?;
+    let (handle, mut addr) = shared_buffer(len)?;
     let req = MgrCapture { window, width: w, height: h, pitch: pitch as u32 };
     let mut body = [0u8; core::mem::size_of::<MgrCapture>()];
     req.write(&mut body)?;
@@ -408,7 +368,8 @@ fn capture_window(
     let ok = mgr.request(OP_MGR_CAPTURE, &body, Some(handle), &mut reply).is_ok();
     if !ok {
         Line::new().s(b"desktop-shell: Capture refused for window ").u(window as u64).end();
-        // TODO(capture-refused-leak): this leaves the mapping, and a failed send the handle too.
+        release_buffer(&mut addr, len);
+        // TODO(capture-refused-leak): a failed send leaves the handle.
         return None;
     }
     // SAFETY: `addr` maps `len` readable bytes the compositor has just written.
@@ -417,7 +378,6 @@ fn capture_window(
     // anything, so a black rectangle looks like a dark window to every gate. `shared_buffer` is
     // zeroed, so "some pixel is non-zero" is the question. The copy is taken, so the mapping is
     // released.
-    let mut addr = addr;
     release_buffer(&mut addr, len);
     let lit = px.as_chunks::<4>().0.iter().filter(|c| **c != [0, 0, 0, 0]).count();
     if lit == 0 {

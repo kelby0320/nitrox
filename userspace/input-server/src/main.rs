@@ -17,6 +17,8 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::Relaxed;
 use input_server::devices::{Arrival, Notice, Table, notice};
 use input_server::leaving::{Act, Leaving};
 use input_server::{
@@ -30,9 +32,8 @@ use libkern::device::DeviceKind;
 use libkern::error::KError;
 use libkern::{
     CLOCK_MONOTONIC, IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_RECV, RIGHT_SEND,
-    RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE,
-    SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
-    syscall2, syscall4, syscall5,
+    RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP,
+    SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::{OP_INPUT_LIGHTS, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -68,31 +69,21 @@ const CONTROL_QUEUE_DEPTH: u64 = 4;
 /// Overruns to report before going quiet; a stopped consumer would print one every 5 ms.
 const MAX_LOGGED_OVERRUNS: u32 = 16;
 
-static mut OVERRUNS_LOGGED: u32 = 0;
+static OVERRUNS_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 /// Retry interval for a consumer holding deferred motion: short enough that a person cannot see
 /// the catch-up, long enough that a stalled one costs a handful of wakeups rather than a spin
 /// (about twenty across a ~100 ms emulated recompose).
 const FLUSH_INTERVAL_NS: u64 = 5_000_000;
 
-static mut CLOCK_BUF: u64 = 0;
-
 /// The monotonic clock in nanoseconds, or `None` if the read failed.
 ///
-/// Checked because a failed read would leave `CLOCK_BUF` stale, the flush deadline in the past
+/// Checked because a failed read has no time to give, so the flush deadline would be in the past
 /// and the 5 ms retry a spin; callers turn `None` into "wait indefinitely".
 fn now_ns() -> Option<u64> {
-    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    if r != 0 {
-        return None;
-    }
-    // SAFETY: the call succeeded, so the kernel wrote the ns count.
-    Some(unsafe { (&raw const CLOCK_BUF).read() })
+    libkern::clock_read(CLOCK_MONOTONIC).ok()
 }
 
-static mut CTRL_OUT0: u64 = 0;
-static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
@@ -280,14 +271,7 @@ fn po_completion(po: u64) -> (i32, u64) {
 
 /// Returns `(kernel_end, serve_end)`, each with a `depth`-message ring.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
-    // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr =
-        unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, depth, 0) };
-    if cr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel wrote both endpoint handles.
-    Some(unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) })
+    libkern::channel_create(depth).ok()
 }
 
 fn send_ready(control: u64, kernel_end: u64) -> bool {
@@ -533,18 +517,16 @@ fn forward(srv: &mut Server, batch: &[InputEvent], now_ns: u64) {
             Some(n) => {
                 // Deferral hides an overrun from the consumer, so a gate that asserts motion
                 // survived one needs this line to know the ring really filled.
-                // SAFETY: single-threaded server; the counter is touched only from this loop.
-                unsafe {
-                    if OVERRUNS_LOGGED < MAX_LOGGED_OVERRUNS {
-                        OVERRUNS_LOGGED += 1;
-                        libkern::debug::Line::new()
-                            .s(b"input-server: consumer ")
-                            .u(i as u64)
-                            .s(b" overran; ")
-                            .u(n as u64)
-                            .s(b" records deferred")
-                            .end();
-                    }
+                let logged = OVERRUNS_LOGGED.load(Relaxed);
+                if logged < MAX_LOGGED_OVERRUNS {
+                    OVERRUNS_LOGGED.store(logged + 1, Relaxed);
+                    libkern::debug::Line::new()
+                        .s(b"input-server: consumer ")
+                        .u(i as u64)
+                        .s(b" overran; ")
+                        .u(n as u64)
+                        .s(b" records deferred")
+                        .end();
                 }
                 srv.consumers[i].defer(&framed[..n])
             }
@@ -817,13 +799,9 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             if h == serve_end {
                 forward_pending = true;
             } else if srv.control != 0 && h == srv.control {
-                match libkern::control::recv(srv.control) {
-                    Control::Op(CTRL_OP_SHUTDOWN) => {
-                        kprint(b"input-server: asked to stop, exiting\n");
-                        exit(0);
-                    }
-                    Control::Closed => srv.control = 0,
-                    _ => {}
+                if let Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut srv.control) {
+                    kprint(b"input-server: asked to stop, exiting\n");
+                    exit(0);
                 }
             } else if srv.subscription != 0 && h == srv.subscription {
                 notices_pending = true;

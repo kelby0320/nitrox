@@ -181,7 +181,7 @@ pub struct Resized {
     pub evicted: usize,
 }
 
-/// The most tabs one window can hold, derived from `MAX_WAIT_HANDLES`.
+/// The most tabs this process can hold across its windows, derived from `MAX_WAIT_HANDLES`.
 ///
 /// `main` waits on the compositor plus one handle per tab in one `sys_wait`, and the kernel rejects
 /// a larger count.
@@ -256,6 +256,8 @@ pub struct App {
     /// The next key to hand out; monotonic, so a stale message never names a replacement tab.
     next_key: u64,
     new_window: bool,
+    /// Tabs in this process's other windows, which [`MAX_TABS`] counts too.
+    tabs_elsewhere: usize,
     quit: bool,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
     pub menus: MenuState,
@@ -292,6 +294,7 @@ impl App {
             current: TAB_KEY_BASE,
             next_key: TAB_KEY_BASE + 1,
             new_window: false,
+            tabs_elsewhere: 0,
             quit: false,
             // Zero: the length is set every frame by `set_anchors`.
             menus: MenuState::new(0),
@@ -486,9 +489,9 @@ impl App {
 
     /// Open a tab and make it current, returning its key.
     pub fn open_tab(&mut self) -> u64 {
-        if self.tabs.len() >= MAX_TABS {
+        if self.tabs.len() + self.tabs_elsewhere >= MAX_TABS {
             // Said rather than silently refused.
-            self.feed(b"\r\nnxterm: no more tabs in this window\r\n");
+            self.feed(b"\r\nnxterm: no more tabs\r\n");
             return self.current;
         }
         let key = self.next_key;
@@ -601,6 +604,11 @@ impl App {
     /// Whether another window has been asked for. Clears the record.
     pub fn take_new_window(&mut self) -> bool {
         core::mem::take(&mut self.new_window)
+    }
+
+    /// Say how many tabs this process's other windows hold.
+    pub fn set_tabs_elsewhere(&mut self, tabs: usize) {
+        self.tabs_elsewhere = tabs;
     }
 
     /// Whether a quit has been asked for. Clears the record.
@@ -976,6 +984,9 @@ pub fn rows_in(clip: Rect, grid_origin: libdraw::geom::Point, m: &Metrics, rows:
 }
 
 #[cfg(test)]
+mod tab_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use libdraw::text::Font;
@@ -984,7 +995,7 @@ mod tests {
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
 
-    fn app() -> App {
+    pub(super) fn app() -> App {
         let f = Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses");
         App::new(20, 6, Metrics::new(&f, 16.0))
     }
@@ -1340,7 +1351,7 @@ mod tests {
         );
     }
 
-    fn line(a: &App, row: usize) -> alloc::string::String {
+    pub(super) fn line(a: &App, row: usize) -> alloc::string::String {
         let s: alloc::string::String =
             (0..a.grid().cols()).map(|c| a.grid().view_cell(a.view_line(), row, c).map_or(' ', |x| x.ch)).collect();
         s.trim_end().into()
@@ -2303,19 +2314,6 @@ mod tests {
         );
         a.update(Msg::NewTab);
         assert_eq!((a.grid().cols(), a.grid().rows()), now);
-    }
-
-    /// The cap is `MAX_WAIT_HANDLES - 1`: past it the kernel rejects the wait and the render loop
-    /// spins. Holding `Ctrl+Shift+T` reaches it.
-    #[test]
-    fn a_window_holds_at_most_max_tabs() {
-        let mut a = app();
-        for _ in 0..MAX_TABS * 2 {
-            a.update(Msg::NewTab);
-        }
-        assert_eq!(a.tabs().len(), MAX_TABS, "the cap did not hold");
-        const { assert!(MAX_TABS < libkern::abi::MAX_WAIT_HANDLES, "…and it leaves room for the window") };
-        assert!((0..a.grid().rows()).any(|r| line(&a, r).contains("no more tabs")), "the refusal was silent");
     }
 
     #[test]

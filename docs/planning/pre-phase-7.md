@@ -10,7 +10,8 @@ the laptop; C.5 built 2026-10-20 — Part C built; the stick's light confirmed o
 2026-10-20 — Part C complete; Part D's bash run 2026-10-20 and triaged 2026-10-22, Part H added
 for what it left (the maintainer's call); Part I added 2026-10-26, a safety survey (the
 maintainer's call), its thirteen runs done 2026-10-26 and 2026-10-27 and triaged 2026-10-27, and
-Part J added for the kernel layers it plans (the maintainer's call).** Each later part gets its
+Part J added for the kernel layers it plans (the maintainer's call); Part I's items marked fix all
+fixed 2026-11-01, its Miri job still to build.** Each later part gets its
 detail pass when it is next. Ten parts, A–J, in the order below: Part I between D and E, and Part J
 after I. Part E is the syscall-surface consolidation, planned separately in
 [`syscall-surface.md`](syscall-surface.md).

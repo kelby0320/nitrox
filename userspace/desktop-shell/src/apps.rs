@@ -289,18 +289,6 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     (status, if status == 0 { handle } else { 0 })
 }
 
-/// Spawn args for a launched application: the namespace this shell constructed, and no syscaps.
-static mut SPAWN_APP: SpawnArgs = SpawnArgs {
-    image: 0,
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 0,
-    handles: [0; 4],
-    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
-    namespace: 0, // set per launch = the namespace built for it
-    syscaps: 0,   // empty, and it stays empty
-};
-
 /// Everything a launch needs: the authority this shell holds to start an application.
 pub(super) struct Launcher<'a> {
     /// The session's namespace, which is where `/bin/<program>` is resolved from.
@@ -385,14 +373,19 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
         }
         return false;
     };
-    // SAFETY: SPAWN_APP is a valid writable arg block.
-    let h = unsafe {
-        SPAWN_APP.image = image;
-        SPAWN_APP.namespace = app_ns;
-        SPAWN_APP.handles[0] = setup_theirs;
-        SPAWN_APP.arg0 = libstream::setup::bootstrap_arg0(true);
-        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_APP) as u64)
+    // The namespace this shell constructed, and no syscaps: the child's stay empty.
+    let spawn = SpawnArgs {
+        image,
+        handle_count: 1,
+        move_mask: 1,
+        arg0: libstream::setup::bootstrap_arg0(true),
+        handles: [setup_theirs, 0, 0, 0],
+        rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
+        namespace: app_ns,
+        syscaps: 0,
     };
+    // SAFETY: `spawn` is a valid arg block on this frame.
+    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const spawn) as u64) };
     // The kernel copied the ELF during spawn, and the namespace is the child's now.
     // SAFETY: closing our own handles.
     unsafe {

@@ -4,8 +4,9 @@
 //! closes, when it drops, every handle not taken from it: a receiver forgets nothing by ignoring it.
 
 use crate::abi::{CLOCK_MONOTONIC, IPC_HANDLE_MAX, IPC_MSG_SIZE};
-use crate::error::KError;
-use crate::syscall::{SYS_CHANNEL_RECV, SYS_CLOCK_READ, SYS_WAIT, syscall2, syscall4};
+use crate::clock::clock_read;
+use crate::error::{KError, from_raw};
+use crate::syscall::{SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_WAIT, syscall4};
 
 /// The handles one message brought, closed when this drops unless taken.
 pub struct Received {
@@ -42,19 +43,19 @@ impl Drop for Received {
     }
 }
 
-/// Close `h`, one of a message's handles that no one took.
+/// Close `h`, a handle of this process's that nothing will use again.
 #[cfg(not(test))]
-fn close(h: u64) {
+pub(crate) fn close(h: u64) {
     use crate::syscall::{SYS_HANDLE_CLOSE, syscall1};
-    // SAFETY: a handle the kernel installed in this process for this message. `take` and
-    // `take_all` zero each handle they hand out, so one still here is no one else's, and this
-    // closes it once.
+    // SAFETY: a handle of this process's with no other copy to use it again, so this closes it
+    // once: `take` and `take_all` zero each handle they hand out of a `Received`, and
+    // `control::recv` zeroes its caller's.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
 }
 
 /// On the host, where handle-close is Linux's `read`, a close is recorded instead.
 #[cfg(test)]
-fn close(h: u64) {
+pub(crate) fn close(h: u64) {
     tests::CLOSED.with(|c| c.borrow_mut().push(h));
 }
 
@@ -86,11 +87,18 @@ const HELD_PAUSE_NS: u64 = 10_000_000;
 
 /// Wait out a [`RecvFailure::Held`], on no handles, which the kernel never refuses.
 pub fn pause_held() {
-    let mut now = 0u64;
-    // SAFETY: `now` is a writable u64 out-param on this frame.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    let now = clock_read(CLOCK_MONOTONIC).unwrap_or(0);
     // SAFETY: no handles and no results, so the kernel reads and writes neither.
     unsafe { syscall4(SYS_WAIT, 0, 0, 0, now.saturating_add(HELD_PAUSE_NS)) };
+}
+
+/// Create a connected channel pair whose rings hold `depth` messages each. `Err` with the kernel's
+/// refusal.
+pub fn channel_create(depth: u64) -> Result<(u64, u64), KError> {
+    let (mut a, mut b) = (0u64, 0u64);
+    // SAFETY: `a` and `b` are writable u64 out-params on this frame.
+    let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, depth, 0) };
+    from_raw(r).map(|_| (a, b))
 }
 
 /// Receive one message on `ch` into `msg`. `Err` with the syscall's status: `WouldBlock` for an
@@ -126,7 +134,7 @@ fn settle(rr: i64, handles: [u64; IPC_HANDLE_MAX], count: usize) -> Result<Recei
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::vec::Vec;
@@ -136,7 +144,7 @@ mod tests {
         pub(super) static CLOSED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn closed() -> Vec<u64> {
+    pub(crate) fn closed() -> Vec<u64> {
         CLOSED.with(|c| c.borrow().clone())
     }
 

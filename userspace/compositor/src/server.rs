@@ -10,7 +10,11 @@
 //! otherwise the authority to create windows would be the authority to destroy anyone else's.
 
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering::Relaxed;
 
+use libkern::abi::HandleInfo;
+use libkern::handle::KObjectType;
 use librsproto::surface::{
     ConfigureEvent, OP_ATTACH_BUFFER, OP_COMMIT, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_SET_TITLE,
     build_create_window_reply, parse_attach_buffer_request, parse_commit_request, parse_create_window_request,
@@ -110,17 +114,18 @@ pub enum SurfaceError {
 }
 
 /// Whether an over-long title has already been reported.
-static mut TITLE_TRUNCATED_LOGGED: bool = false;
+static TITLE_TRUNCATED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this is the first over-long title.
+fn first_truncation() -> bool {
+    !TITLE_TRUNCATED_LOGGED.swap(true, Relaxed)
+}
 
 /// Report the **first** over-long title only: a serial write per request is too costly on this
 /// path, and one line explains a title that came back shorter than it went out.
 fn note_title_truncated(len: usize) {
-    // SAFETY: single-threaded server; the same access pattern as the input diagnostics.
-    unsafe {
-        if TITLE_TRUNCATED_LOGGED {
-            return;
-        }
-        TITLE_TRUNCATED_LOGGED = true;
+    if !first_truncation() {
+        return;
     }
     let mut l = libkern::debug::Line::new();
     l.s(b"compositor: title of ")
@@ -129,6 +134,70 @@ fn note_title_truncated(len: usize) {
         .u(librsproto::surface::MAX_TITLE as u64)
         .s(b" (further truncations not logged)");
     l.end();
+}
+
+/// One client buffer's memory: a mapping in the binary, plain bytes in a host test.
+pub struct Attached<M> {
+    /// The window it was attached to.
+    pub window: u32,
+    /// The client's id for it.
+    pub buffer: u32,
+    /// What backs it.
+    pub memory: M,
+}
+
+/// Whether a handle `info` describes is a `MemoryObject` of at least `len` bytes. A file maps too,
+/// faulted in through its server on this thread, and a fill that fails there ends the compositor.
+pub fn holds(info: &HandleInfo, len: usize) -> bool {
+    info.object_type == KObjectType::MemoryObject as u32 && info.size >= len as u64
+}
+
+/// The memory an `AttachBuffer` in `body` brought, whose handle `info` describes, mapped by `map`.
+/// `None` is a refusal, the client's fault. A `None` memory is a failed map, this compositor's
+/// shortage and no fault of a client that cannot hear a refusal: the attach stands, and draws
+/// nothing.
+pub fn attach_memory<M>(
+    body: &[u8],
+    info: Option<&HandleInfo>,
+    map: impl FnOnce(usize) -> Option<M>,
+) -> Option<Attached<Option<M>>> {
+    let req = parse_attach_buffer_request(body)?;
+    let len = req.pitch as usize * req.height as usize;
+    info.filter(|i| holds(i, len))?;
+    Some(Attached { window: req.window, buffer: req.buffer, memory: map(len) })
+}
+
+/// The answer to an attach [`attach_memory`] refused: what `dispatch` says of a window this
+/// connection does not own comes first, as it does for every op.
+pub fn refuse_attach(conn: &Connection, body: &[u8]) -> Outcome {
+    match parse_attach_buffer_request(body) {
+        Some(req) if !conn.owns(req.window) => Outcome::Failed(SurfaceError::NotFound),
+        _ => Outcome::Failed(SurfaceError::Malformed),
+    }
+}
+
+/// Keep an attach's memory if `outcome` accepted it, under ids `dispatch` checked; a rejected one
+/// drops here. The memory it replaces goes either way it came: a failed map must leave no pixels,
+/// not the wrong ones.
+pub fn record_attach<M>(buffers: &mut Vec<Attached<M>>, outcome: &Outcome, attached: Attached<Option<M>>) {
+    if !matches!(outcome, Outcome::Applied { .. }) {
+        return;
+    }
+    let Attached { window, buffer, memory } = attached;
+    buffers.retain(|b| !(b.window == window && b.buffer == buffer));
+    if let Some(memory) = memory {
+        buffers.push(Attached { window, buffer, memory });
+    }
+}
+
+/// Everything a removed window leaves, whoever removed it: its owner's claim, as a manager's
+/// `Manage::Close` or a transitive destroy bypasses the client's inline prune
+/// ([`Connection::disown`]), and its memory.
+pub fn forget_window<M>(conns: &mut [Connection], buffers: &mut Vec<Attached<M>>, window: u32) {
+    for conn in conns.iter_mut() {
+        conn.disown(window);
+    }
+    buffers.retain(|b| b.window != window);
 }
 
 /// Dispatch one Surface-category request arriving on `conn`.
@@ -318,6 +387,121 @@ fn parent_of(role: &librsproto::surface::Role) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Native runs can catch a lost `swap` only if the threads collide, so they collide many times.
+    #[test]
+    fn at_most_one_thread_reports_a_title_truncated() {
+        use core::sync::atomic::AtomicU32;
+        use std::sync::Barrier;
+        let rounds = if cfg!(miri) { 2 } else { 20_000 };
+        let (start, done, firsts) = (Barrier::new(3), Barrier::new(3), AtomicU32::new(0));
+        let race = || {
+            for _ in 0..rounds {
+                start.wait();
+                firsts.fetch_add(first_truncation() as u32, Relaxed);
+                done.wait();
+            }
+        };
+        let most = std::thread::scope(|s| {
+            s.spawn(race);
+            s.spawn(race);
+            (0..rounds).fold(0, |most, _| {
+                TITLE_TRUNCATED_LOGGED.store(false, Relaxed);
+                firsts.store(0, Relaxed);
+                start.wait();
+                done.wait();
+                most.max(firsts.load(Relaxed))
+            })
+        });
+        assert!(most <= 1, "two threads each saw themselves first");
+    }
+
+    fn info(object: KObjectType, size: u64) -> HandleInfo {
+        HandleInfo { rights: 0, object_type: object as u32, generation: 0, size }
+    }
+
+    fn attach_body(window: u32, buffer: u32) -> ([u8; ATTACH_BUFFER_REQUEST_LEN], usize) {
+        let mut body = [0u8; ATTACH_BUFFER_REQUEST_LEN];
+        let req =
+            AttachBufferRequest { window, buffer, width: 8, height: 8, pitch: 32, format: SURFACE_FORMAT_XRGB8888 };
+        let n = build_attach_buffer_request(&mut body, &req).unwrap();
+        (body, n)
+    }
+
+    /// `8 * 8 * 4`, the geometry [`attach_body`] asks for.
+    const ATTACH_LEN: u64 = 256;
+
+    #[test]
+    fn only_memory_that_holds_the_geometry_is_mapped() {
+        let (body, n) = attach_body(1, 0);
+        let mapped = |i: Option<&HandleInfo>| attach_memory(&body[..n], i, Some).map(|a| a.memory);
+        assert_eq!(mapped(Some(&info(KObjectType::MemoryObject, ATTACH_LEN))), Some(Some(ATTACH_LEN as usize)));
+        assert_eq!(mapped(Some(&info(KObjectType::MemoryObject, ATTACH_LEN - 1))), None, "short of the geometry");
+        assert_eq!(mapped(Some(&info(KObjectType::FileObject, ATTACH_LEN))), None, "a file is not memory");
+        assert_eq!(mapped(None), None, "no handle, or one that cannot say what it is");
+    }
+
+    #[test]
+    fn a_map_that_fails_is_no_refusal() {
+        let (body, n) = attach_body(1, 0);
+        let good = info(KObjectType::MemoryObject, ATTACH_LEN);
+        let a = attach_memory::<u8>(&body[..n], Some(&good), |_| None).expect("the client did nothing wrong");
+        assert!(a.memory.is_none());
+    }
+
+    #[test]
+    fn a_refused_attach_on_a_foreign_window_is_not_found() {
+        let (mut stack, mut mine, other) = (WindowStack::new(), Connection::new(), Connection::new());
+        let w = create(&mut mine, &mut stack, Role::Normal).unwrap();
+        let (body, n) = attach_body(w, 0);
+        assert!(matches!(refuse_attach(&mine, &body[..n]), Outcome::Failed(SurfaceError::Malformed)));
+        assert!(matches!(refuse_attach(&other, &body[..n]), Outcome::Failed(SurfaceError::NotFound)));
+    }
+
+    fn table() -> Vec<Attached<u8>> {
+        alloc::vec![Attached { window: 1, buffer: 0, memory: 10 }, Attached { window: 2, buffer: 0, memory: 20 }]
+    }
+
+    fn memory_of(buffers: &[Attached<u8>]) -> Vec<(u32, u8)> {
+        buffers.iter().map(|b| (b.window, b.memory)).collect()
+    }
+
+    const APPLIED: Outcome = Outcome::Applied { release: None, dirty: None };
+
+    #[test]
+    fn a_rejected_attach_records_nothing_and_takes_nothing() {
+        let mut t = table();
+        let refused = Outcome::Failed(SurfaceError::NotFound);
+        record_attach(&mut t, &refused, Attached { window: 2, buffer: 0, memory: Some(99) });
+        assert_eq!(memory_of(&t), [(1, 10), (2, 20)], "a foreign window's memory is not replaced");
+    }
+
+    #[test]
+    fn an_applied_attach_replaces_its_buffer() {
+        let mut t = table();
+        record_attach(&mut t, &APPLIED, Attached { window: 2, buffer: 0, memory: Some(99) });
+        assert_eq!(memory_of(&t), [(1, 10), (2, 99)]);
+    }
+
+    #[test]
+    fn a_failed_map_leaves_no_pixels_rather_than_the_wrong_ones() {
+        let mut t = table();
+        record_attach(&mut t, &APPLIED, Attached { window: 2, buffer: 0, memory: None });
+        assert_eq!(memory_of(&t), [(1, 10)]);
+    }
+
+    #[test]
+    fn a_window_that_goes_takes_its_memory_and_its_owner_s_claim() {
+        let (mut stack, mut conns) = (WindowStack::new(), [Connection::new(), Connection::new()]);
+        let w = create(&mut conns[0], &mut stack, Role::Normal).unwrap();
+        let mut t = alloc::vec![
+            Attached { window: w, buffer: 0, memory: 10 },
+            Attached { window: w + 1, buffer: 0, memory: 20 }
+        ];
+        forget_window(&mut conns, &mut t, w);
+        assert!(!conns[0].owns(w));
+        assert_eq!(memory_of(&t), [(w + 1, 20)]);
+    }
 
     #[track_caller]
     fn assert_applied(o: Outcome, release: Option<(u32, u32)>) {

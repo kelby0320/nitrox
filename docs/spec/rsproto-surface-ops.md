@@ -418,6 +418,17 @@ whatever the framebuffer last held, which reads as a slightly wrong colour rathe
 error. So a client built against a newer compositor is refused by an older one instead of drawn
 incorrectly, and a client built against an older one keeps sending `0` and is unaffected.
 
+**The handle must be a `MemoryObject` of at least `pitch * height` bytes, and carry `INSPECT` so the
+compositor can see that it is.** Anything else, no handle included, is refused `InvalidArgument`,
+or `NotFound` for a window this client does not own, and changes nothing. A file would map, but it
+faults in through its server on the compositor's one thread, and a fill that fails there ends the
+compositor.
+
+**A failed map is not a refusal.** An attach is not answered, so a client cannot hear one, and
+memory the compositor cannot map for want of its own resources is no fault of the client's: the
+attach stands, whatever that buffer held before is gone, and it draws nothing. The client's next
+commit of it is answered as usual.
+
 The client picks the buffer id so it can name it in a later `Commit` without waiting for a
 reply. A `pitch` too small to hold a row is **rejected**: accepting it would alias rows in
 a buffer the client owns, which the compositor cannot detect any other way.
@@ -1183,7 +1194,8 @@ handle**: a writable memory object the *manager* allocated, at least `pitch * he
 compositor box-downscales the window's committed buffer into it and replies with an empty body.
 
 `NotFound` if no such window. `Malformed` if the body is short, no handle came with it, or a
-dimension is zero. `Rejected` if the object is smaller than `pitch * height`, or if the requested
+dimension is zero. `Rejected` if the object is not a `MemoryObject`, for the reason an attach's must
+be, cannot say so for want of `INSPECT`, or is smaller than `pitch * height`, or if the requested
 size is **larger** than the window in either axis — this scales down, and a caller asking to
 scale up has misunderstood what it is for.
 

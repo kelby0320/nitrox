@@ -691,13 +691,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                     exit(1);
                 }
             } else if h == control {
-                match libkern::control::recv(control) {
-                    libkern::control::Control::Op(CTRL_OP_SHUTDOWN) => {
-                        kprint(b"device-mgr: asked to stop, exiting\n");
-                        exit(0);
-                    }
-                    libkern::control::Control::Closed => control = 0,
-                    _ => {}
+                if let libkern::control::Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
+                    kprint(b"device-mgr: asked to stop, exiting\n");
+                    exit(0);
                 }
             } else if let Some(i) = m.info_ends.iter().position(|&e| e == h) {
                 if !m.serve_resolve(h, true) {

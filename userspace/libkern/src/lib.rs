@@ -17,6 +17,7 @@
 
 pub mod abi;
 pub mod channel;
+pub mod clock;
 pub mod control;
 pub mod debug;
 pub mod device;
@@ -31,7 +32,8 @@ pub mod syscaps;
 pub mod mem;
 
 pub use abi::*;
-pub use channel::{Received, RecvFailure, channel_recv, channel_recv_raw, pause_held};
+pub use channel::{Received, RecvFailure, channel_create, channel_recv, channel_recv_raw, pause_held};
+pub use clock::clock_read;
 pub use debug::{exit, kprint, kprint_hex, kprint_u64};
 pub use error::{KError, from_raw};
 pub use handle::*;

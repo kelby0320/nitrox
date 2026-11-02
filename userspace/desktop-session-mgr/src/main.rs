@@ -8,13 +8,17 @@
 
 extern crate alloc;
 
-use desktop_session_mgr::{GREETER_H, GREETER_PITCH, GREETER_W, Greeter, KEY_ENTER, greeter_theme};
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::Relaxed;
+use desktop_session_mgr::{GREETER_H, GREETER_W, Greeter, KEY_ENTER, greeter_theme};
+use libdraw::geom::Size;
 use libdraw::text::Font;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::surface::{CreateWindowRequest, Role};
 use libsession::{NamespaceSpec, authenticate, ns_lookup, spawn_leader};
 use libsurface::Session;
+use libsurface::buffers::BufferPool;
 use libsurface::ipc::ChannelTransport;
 
 #[global_allocator]
@@ -24,7 +28,7 @@ const BUFFERS: usize = 2;
 
 const MAX_REDRAWS_LOGGED: u32 = 512;
 
-static mut REDRAWS: u32 = 0;
+static REDRAWS: AtomicU32 = AtomicU32::new(0);
 
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
@@ -49,22 +53,6 @@ fn fail(msg: &[u8]) -> ! {
     loop {
         core::hint::spin_loop();
     }
-}
-
-fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
-    // SAFETY: a plain anonymous object of `len` bytes.
-    let h = unsafe { syscall4(SYS_MEMORY_CREATE, len as u64, 0, 0, 0) };
-    if h <= 0 {
-        return None;
-    }
-    // SAFETY: maps the object read/write at a kernel-chosen address.
-    let base = unsafe { syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if base < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-        return None;
-    }
-    Some((h as u64, base as usize as *mut u8))
 }
 
 /// Receive the next control message's one moved handle; `0` on failure. Positional: `service-mgr`
@@ -290,10 +278,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     };
     // Created before every other client's window: the gates' reference windows stack above it.
     let mut greeter = Greeter::new();
-    let len = GREETER_PITCH * GREETER_H as usize;
-    let mut addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
-    let mut window = match open_greeter(&mut session, &font, &greeter, &mut addrs, len, origin) {
-        Some(id) => id,
+    let (mut window, mut pool) = match open_greeter(&mut session, &font, &greeter, origin) {
+        Some(opened) => opened,
         None => fail(b"desktop-session-mgr: greeter could not be drawn\n"),
     };
     Line::new()
@@ -346,6 +332,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             if let Some(w) = session.window(window) {
                 let _ = w.destroy();
             }
+            drop(pool);
             let mut user = [0u8; 64];
             let mut home = [0u8; 256];
             // **The password's block ends before the session starts**, which outlives any use of
@@ -380,9 +367,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             }
             // Before the window is drawn: `open_greeter` presents, and `view()` reads `denied`.
             greeter.denied = authed.is_none();
-            match open_greeter(&mut session, &font, &greeter, &mut addrs, len, origin) {
-                Some(id) => {
+            match open_greeter(&mut session, &font, &greeter, origin) {
+                Some((id, reopened)) => {
                     window = id;
+                    pool = reopened;
                     // `check-logout` waits for this line after each logout.
                     Line::new().s(b"desktop-session-mgr: greeter presented again, window ").u(id as u64).end();
                 }
@@ -390,7 +378,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             }
             dirty = false;
         }
-        if dirty && !present(&mut session, window, &greeter, &font, &addrs, len) {
+        if dirty && !present(&mut session, window, &greeter, &font, &mut pool) {
             fail(b"desktop-session-mgr: greeter redraw FAILED\n");
         }
     }
@@ -401,27 +389,17 @@ fn open_greeter(
     session: &mut Session<ChannelTransport>,
     font: &Font,
     greeter: &Greeter,
-    addrs: &mut [*mut u8; BUFFERS],
-    len: usize,
     origin: (i32, i32),
-) -> Option<u32> {
+) -> Option<(u32, BufferPool)> {
     // The window asks for its origin rather than being placed: nothing manages windows yet, so a
     // `normal` window's request is honoured when the compositor stops waiting for a manager.
     let (x, y) = origin;
     let window = session.create(&CreateWindowRequest::at(GREETER_W, GREETER_H, Role::Normal, x, y), BUFFERS).ok()?;
-    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
-    for i in 0..BUFFERS {
-        let (handle, addr) = shared_buffer(len)?;
-        addrs[i] = addr;
-        let mut w = session.window(window)?;
-        if w.attach(i as u32, GREETER_W, GREETER_H, GREETER_PITCH as u32, handle).is_err() {
-            return None;
-        }
-    }
-    if !present(session, window, greeter, font, addrs, len) {
+    let mut pool = BufferPool::new(&mut session.window(window)?, Size::new(GREETER_W, GREETER_H), BUFFERS)?;
+    if !present(session, window, greeter, font, &mut pool) {
         return None;
     }
-    Some(window)
+    Some((window, pool))
 }
 
 /// Render the greeter into a free buffer and commit it. `false` if the compositor refused.
@@ -430,13 +408,9 @@ fn present(
     window: u32,
     greeter: &Greeter,
     font: &Font,
-    addrs: &[*mut u8; BUFFERS],
-    len: usize,
+    pool: &mut BufferPool,
 ) -> bool {
     let picture = greeter.render(font).into_bytes();
-    if picture.len() != len {
-        return false;
-    }
     let Some(mut w) = session.window(window) else {
         return false;
     };
@@ -445,20 +419,14 @@ fn present(
     let Ok(slot) = w.acquire() else {
         return false;
     };
-    let addr = addrs[slot as usize % BUFFERS];
-    // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two are
-    // distinct allocations, so they cannot overlap.
-    unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
-    let ok = w.commit(slot, (0, 0, GREETER_W, GREETER_H)).is_ok();
+    let ok = pool.write(slot, &picture) && w.commit(slot, (0, 0, GREETER_W, GREETER_H)).is_ok();
     // A redraw counter paces the gate between keystrokes. It is a count, never the fields:
     // reporting what was typed would put a password on the console, and its length would leak it
     // more slowly. Capped like the compositor's press diagnostics.
-    // SAFETY: single-threaded supervisor; one redraw at a time.
-    unsafe {
-        if REDRAWS < MAX_REDRAWS_LOGGED {
-            REDRAWS += 1;
-            Line::new().s(b"desktop-session-mgr: greeter redraw ").u(REDRAWS as u64).end();
-        }
+    let redraws = REDRAWS.load(Relaxed);
+    if redraws < MAX_REDRAWS_LOGGED {
+        REDRAWS.store(redraws + 1, Relaxed);
+        Line::new().s(b"desktop-session-mgr: greeter redraw ").u(redraws as u64 + 1).end();
     }
     ok
 }

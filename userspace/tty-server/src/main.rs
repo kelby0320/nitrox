@@ -623,15 +623,11 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
             if h == serve_end {
                 drain_resolves(serve_end, &mut reg);
             } else if control != 0 && h == control {
-                match libkern::control::recv(control) {
-                    // Every terminal ends with this process; its programs' next read or write
-                    // finds the channel closed.
-                    Control::Op(CTRL_OP_SHUTDOWN) => {
-                        kprint(b"tty-server: asked to stop, exiting\n");
-                        exit(0);
-                    }
-                    Control::Closed => control = 0,
-                    _ => {}
+                // Every terminal ends with this process; its programs' next read or write
+                // finds the channel closed.
+                if let Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
+                    kprint(b"tty-server: asked to stop, exiting\n");
+                    exit(0);
                 }
             } else if read_po != 0 && h == read_po {
                 let n = console_bytes(off);

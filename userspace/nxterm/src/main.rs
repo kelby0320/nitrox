@@ -331,7 +331,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // SAFETY: `terminal` is a channel this process owns until the spawn moves it.
                     // Said on success too: a release image could not otherwise tell a hosting
                     // terminal from an empty window.
-                    if unsafe { backend::spawn_shell(root_ns, terminal, env) } < 0 {
+                    if !unsafe { backend::spawn_shell(root_ns, terminal, env) } {
                         kprint(b"nxterm: no shell\n");
                     }
                     backends.push(TabBackend { key, backend: b });
@@ -623,9 +623,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
         // After every window is serviced: a window cannot be created or destroyed mid-iteration.
         let mut opened = 0usize;
+        let open: usize = wins.iter().map(|w| w.app.tabs().len()).sum();
         for w in wins.iter_mut() {
             if w.app.take_new_window() {
-                opened += 1;
+                if open + opened < nxterm::MAX_TABS {
+                    opened += 1;
+                } else {
+                    let tab = w.app.current_tab();
+                    w.app.feed_tab(tab, b"\r\nnxterm: no more tabs\r\n");
+                }
             }
             if w.app.take_quit() {
                 kprint(b"nxterm: quitting\n");
@@ -714,7 +720,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             else {
                 continue;
             };
+            // A process's tabs, not a window's: each is a handle in the one `sys_wait`.
+            let open: usize = wins.iter().map(|w| w.app.tabs().len()).sum();
+            let elsewhere = open - wins[wi].app.tabs().len();
             let Win { top, app, backends: _, bounds, popup, menu_shown: _, menu_hovered: _ } = &mut wins[wi];
+            app.set_tabs_elsewhere(elsewhere);
             let window_id = top.id();
             // Rebuilt for this window, as routing is against its tree. No layout here:
             // `Child::route` lays out.

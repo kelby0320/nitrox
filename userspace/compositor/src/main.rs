@@ -19,20 +19,26 @@ use compositor::Screen;
 use compositor::input::InputRouter;
 use compositor::manager::{self, MgrOutcome};
 use compositor::outbox::{MgrEvent, MgrOutbox, Outbound, Outbox};
-use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
+use compositor::server::{
+    Attached, Connection, Outcome, SurfaceError, attach_memory, disconnect, dispatch, forget_window, holds,
+    record_attach, refuse_attach,
+};
 use compositor::{BufferSource, WindowStack};
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::Relaxed;
 use libdraw::format::Rgb;
 use libdraw::framebuffer::RawFramebuffer;
 use libdraw::geom::{Point, Rect};
 use libinput::Interpreter;
 use libkern::abi::CLOCK_MONOTONIC;
+use libkern::abi::HandleInfo;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::error::KError;
-use libkern::{Received, channel_recv_raw};
+use libkern::{Received, SYS_HANDLE_STAT, channel_recv_raw};
 use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE,
-    SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
+    SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
+    SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
@@ -50,12 +56,8 @@ const PAYLOAD_OFF: usize = 24;
 /// `scene::BACKGROUND`, so the two must be one constant.
 const BACKGROUND: Rgb = libdraw::scene::BACKGROUND;
 
-/// Largest Surface request body, sized by `SetTitle`, the only variable-length one; the assertion
-/// below ties it to `MAX_TITLE`.
-///
-/// A smaller body cut titles at a raw byte offset, which failed `Malformed` mid-character.
-const MAX_BODY: usize = 4 + librsproto::surface::MAX_TITLE;
-const _: () = assert!(MAX_BODY >= 4 + librsproto::surface::MAX_TITLE);
+/// Largest Surface request body: whatever one message carries, so no op's is ever cut.
+const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
 /// Four less than the wait limit: the forwarding, input, manager and control channels.
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 4;
@@ -73,8 +75,6 @@ const MAX_LOGGED_ROUTES: u32 = 8;
 /// logged. Generous, since any gate needs a handful, but not absent: serial is slow.
 const MAX_LOGGED_INPUT_DIAGS: u32 = 256;
 
-static mut CTRL_OUT0: u64 = 0;
-static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
@@ -82,9 +82,8 @@ static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
 /// The manager's channel, or `0`. One, not a table: two managers placing windows race with no
 /// arbiter, so a second resolve is refused.
 static mut MANAGER_CH: u64 = 0;
-static mut ROUTES_LOGGED: u32 = 0;
-static mut INPUT_DIAGS_LOGGED: u32 = 0;
-static mut CLOCK_BUF: u64 = 0;
+static ROUTES_LOGGED: AtomicU32 = AtomicU32::new(0);
+static INPUT_DIAGS_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 /// How long to sleep before retrying a parked message, in nanoseconds.
 ///
@@ -100,14 +99,12 @@ const MAX_LOGGED_OVERFLOWS: u32 = 8;
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 
-struct MappedBuffer {
-    window: u32,
-    buffer: u32,
+struct Mapping {
     addr: *mut u8,
     len: usize,
 }
 
-impl Drop for MappedBuffer {
+impl Drop for Mapping {
     /// Unmap when the record goes away: the `Vec::retain` calls that shrink `Server::buffers` rely
     /// on it.
     fn drop(&mut self) {
@@ -120,7 +117,7 @@ impl Drop for MappedBuffer {
 struct Server {
     stack: WindowStack,
     conns: [Connection; MAX_SESSIONS],
-    buffers: alloc::vec::Vec<MappedBuffer>,
+    buffers: alloc::vec::Vec<Attached<Mapping>>,
     /// Device triples → logical events. Reset by a `SYN_DROPPED` the server forwards.
     interp: Interpreter,
     router: InputRouter,
@@ -151,9 +148,9 @@ impl Server {
 
 impl BufferSource for Server {
     fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]> {
-        let b = self.buffers.iter().find(|b| b.window == window && b.buffer == buffer)?;
+        let b = &self.buffers.iter().find(|b| b.window == window && b.buffer == buffer)?.memory;
         // SAFETY: `addr`/`len` come from a successful `sys_memory_map` of the client's
-        // `MemoryObject`. The mapping lives exactly as long as its `MappedBuffer` record —
+        // `MemoryObject`. The mapping lives exactly as long as its `Mapping` record —
         // `Drop` unmaps — and this slice borrows `&self`, so no `&mut` path that could drop
         // the record can run while it is alive.
         Some(unsafe { core::slice::from_raw_parts(b.addr, b.len) })
@@ -166,21 +163,11 @@ impl BufferSource for Server {
 const SESSION_QUEUE_DEPTH: u64 = 16;
 
 fn now_ns() -> u64 {
-    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: on success the kernel wrote the ns count.
-    unsafe { (&raw const CLOCK_BUF).read() }
+    libkern::clock_read(CLOCK_MONOTONIC).unwrap_or(0)
 }
 
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
-    // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr =
-        unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, depth, 0) };
-    if cr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel wrote both endpoint handles.
-    Some(unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) })
+    libkern::channel_create(depth).ok()
 }
 
 fn send_ready(control: u64, kernel_end: u64) -> bool {
@@ -325,13 +312,11 @@ fn log_route(rec: &Outbound) {
     // the only evidence the compositor acted (`check-login` waits on `drop win=`, `dismissed
     // win=`).
     if !matches!(rec, Outbound::Dropped { .. } | Outbound::Dismissed { .. }) {
-        // SAFETY: single-threaded server; this counter is touched only from the serve loop.
-        let n = unsafe { ROUTES_LOGGED };
+        let n = ROUTES_LOGGED.load(Relaxed);
         if n > MAX_LOGGED_ROUTES {
             return;
         }
-        // SAFETY: as above.
-        unsafe { ROUTES_LOGGED = n + 1 };
+        ROUTES_LOGGED.store(n + 1, Relaxed);
         if n == MAX_LOGGED_ROUTES {
             kprint(b"compositor: (further routed input not logged)\n");
             return;
@@ -521,11 +506,7 @@ fn drain_stack_events(srv: &mut Server) {
         mgr_emit(srv, MgrEvent::Geometry(ev));
     }
     for window in srv.stack.take_removed() {
-        // The owner stops claiming it, whoever removed it: a manager's `Manage::Close` or a
-        // transitive destroy bypasses the client's inline prune. See [`Connection::disown`].
-        for conn in srv.conns.iter_mut() {
-            conn.disown(window);
-        }
+        forget_window(&mut srv.conns, &mut srv.buffers, window);
         mgr_emit(srv, MgrEvent::Destroyed { window });
     }
 }
@@ -891,158 +872,152 @@ fn route_one_batch(
     msg: &[u8],
     now: u64,
 ) {
-    // SAFETY: the input-diagnostics counter below is a `static mut` touched only from the serve
-    // loop of this single-threaded server.
-    unsafe {
-        let Ok(m) = decode(msg) else {
-            return;
+    let Ok(m) = decode(msg) else {
+        return;
+    };
+    if m.op != librsproto::OP_INPUT_EVENTS {
+        return;
+    }
+    for raw in m.body.as_chunks::<INPUT_EVENT_LEN>().0 {
+        let Some(ev) = InputEvent::read(raw) else {
+            continue;
         };
-        if m.op != librsproto::OP_INPUT_EVENTS {
-            return;
-        }
-        for raw in m.body.as_chunks::<INPUT_EVENT_LEN>().0 {
-            let Some(ev) = InputEvent::read(raw) else {
-                continue;
-            };
-            let mut logical = [libinput::Logical::Dropped { time_ns: 0 }; libinput::MAX_PER_GROUP];
-            let n = srv.interp.feed(ev, &mut logical);
-            for l in &logical[..n] {
-                let routed = srv.router.route(l, &mut srv.stack, out);
-                if let Some(r) = routed.restacked {
+        let mut logical = [libinput::Logical::Dropped { time_ns: 0 }; libinput::MAX_PER_GROUP];
+        let n = srv.interp.feed(ev, &mut logical);
+        for l in &logical[..n] {
+            let routed = srv.router.route(l, &mut srv.stack, out);
+            if let Some(r) = routed.restacked {
+                damage.push(r);
+            }
+            if let Some(r) = routed.moved {
+                damage.push(r);
+            }
+            // The outline's damage is its edges: repainting the union per motion starves input.
+            if let Some(o) = routed.outline {
+                srv.outline = o.now;
+                for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
                     damage.push(r);
                 }
-                if let Some(r) = routed.moved {
-                    damage.push(r);
-                }
-                // The outline's damage is its edges: repainting the union per motion starves input.
-                if let Some(o) = routed.outline {
-                    srv.outline = o.now;
-                    for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
-                        damage.push(r);
-                    }
-                }
-                // A press landed outside a popup, so its owner is told. Reported, not acted on:
-                // whether a dismissal ends what it offered is the client's to decide.
-                if let Some(window) = routed.dismissed
-                    && let Some(slot) = srv.session_of(window)
-                {
-                    // `log_route` and `enqueue`, as at every site here, or no gate can see it
-                    // (`check-login`).
-                    let rec = Outbound::Dismissed { window };
-                    log_route(&rec);
-                    enqueue(srv, slot, rec);
-                }
-                // One event for the gesture, at the release; the manager answers with a
-                // `Configure`, so a window's geometry has one path.
-                if let Some(e) = routed.ended {
-                    let (a, f) = (e.asked, e.from);
-                    Line::new()
-                        .s(b"compositor: gesture on window ")
-                        .u(e.window as u64)
-                        .s(b" ended at ")
-                        .i(a.origin.x as i64)
-                        .s(b",")
-                        .i(a.origin.y as i64)
-                        .s(b" ")
-                        .u(a.size.w as u64)
-                        .s(b"x")
-                        .u(a.size.h as u64)
-                        .end();
-                    let rect = |r: libdraw::geom::Rect| ConfigureEvent {
-                        window: e.window,
-                        width: r.size.w,
-                        height: r.size.h,
-                        x: r.origin.x,
-                        y: r.origin.y,
-                    };
-                    let flags = if e.moved { librsproto::surface::DRAG_ENDED_MOVED } else { 0 };
-                    let ended = librsproto::surface::MgrDragEnded { asked: rect(a), from: rect(f), flags };
-                    mgr_emit(srv, MgrEvent::DragEnded(ended));
-                }
-                // Drained per event: a chord and the window events it causes must reach the manager
-                // in order.
-                for hk in srv.router.take_hotkeys() {
-                    mgr_emit(srv, MgrEvent::Hotkey(hk));
-                }
-                // Diagnostics always, not through `log_route`, whose cap is spent by the time a
-                // gate moves the cursor and which never sees a press that hit no window. A dropped
-                // batch too: nothing else prints a `SYN_DROPPED`. `Super` arriving separates the
-                // host keeping the keystroke from the guest matching no chord; the modifier only,
-                // never the keycode, which would log passwords.
-                // `check-input`, `check-login` and `check-install` match the press and Super lines.
-                let meta_change = match *l {
-                    libinput::Logical::Key { keycode, pressed, .. }
-                        if keycode == libkern::abi::KEY_LEFTMETA || keycode == libkern::abi::KEY_RIGHTMETA =>
-                    {
-                        Some(pressed)
-                    }
-                    _ => None,
+            }
+            // A press landed outside a popup, so its owner is told. Reported, not acted on:
+            // whether a dismissal ends what it offered is the client's to decide.
+            if let Some(window) = routed.dismissed
+                && let Some(slot) = srv.session_of(window)
+            {
+                // `log_route` and `enqueue`, as at every site here, or no gate can see it
+                // (`check-login`).
+                let rec = Outbound::Dismissed { window };
+                log_route(&rec);
+                enqueue(srv, slot, rec);
+            }
+            // One event for the gesture, at the release; the manager answers with a
+            // `Configure`, so a window's geometry has one path.
+            if let Some(e) = routed.ended {
+                let (a, f) = (e.asked, e.from);
+                Line::new()
+                    .s(b"compositor: gesture on window ")
+                    .u(e.window as u64)
+                    .s(b" ended at ")
+                    .i(a.origin.x as i64)
+                    .s(b",")
+                    .i(a.origin.y as i64)
+                    .s(b" ")
+                    .u(a.size.w as u64)
+                    .s(b"x")
+                    .u(a.size.h as u64)
+                    .end();
+                let rect = |r: libdraw::geom::Rect| ConfigureEvent {
+                    window: e.window,
+                    width: r.size.w,
+                    height: r.size.h,
+                    x: r.origin.x,
+                    y: r.origin.y,
                 };
-                // Releases as well as presses, so a lost release is told from a client that ignored
-                // the click (`check-login`). A button is not a keystroke.
-                let diag = meta_change.is_some()
-                    || matches!(*l, libinput::Logical::Button { .. } | libinput::Logical::Dropped { .. });
-                // Inside the enclosing `unsafe` block: single-threaded, touched only from the serve
-                // loop.
-                let logged = INPUT_DIAGS_LOGGED;
-                if diag && logged < MAX_LOGGED_INPUT_DIAGS {
-                    INPUT_DIAGS_LOGGED = logged + 1;
-                    let mut pl = Line::new();
-                    match *l {
-                        _ if meta_change == Some(true) => {
-                            pl.s(b"compositor: Super down");
-                        }
-                        _ if meta_change == Some(false) => {
-                            pl.s(b"compositor: Super up");
-                        }
-                        // A press whose release never appears was QEMU holding it (its PS/2 queue
-                        // holds a packet until the next injected event); the gates flush with
-                        // `expect_after_pointer`.
-                        libinput::Logical::Dropped { .. } => {
-                            pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
-                        }
-                        _ => {
-                            let p = srv.router.pointer();
-                            let down = matches!(*l, libinput::Logical::Button { pressed: true, .. });
-                            pl.s(if down {
-                                b"compositor: press at x=".as_slice()
-                            } else {
-                                b"compositor: release at x=".as_slice()
-                            })
-                            .i(p.x as i64)
-                            .s(b" y=")
-                            .i(p.y as i64);
-                            match srv.router.grab() {
-                                Some(w) => {
-                                    pl.s(b" win=").u(w as u64);
-                                }
-                                None => {
-                                    pl.s(b" win=none");
-                                }
+                let flags = if e.moved { librsproto::surface::DRAG_ENDED_MOVED } else { 0 };
+                let ended = librsproto::surface::MgrDragEnded { asked: rect(a), from: rect(f), flags };
+                mgr_emit(srv, MgrEvent::DragEnded(ended));
+            }
+            // Drained per event: a chord and the window events it causes must reach the manager
+            // in order.
+            for hk in srv.router.take_hotkeys() {
+                mgr_emit(srv, MgrEvent::Hotkey(hk));
+            }
+            // Diagnostics always, not through `log_route`, whose cap is spent by the time a
+            // gate moves the cursor and which never sees a press that hit no window. A dropped
+            // batch too: nothing else prints a `SYN_DROPPED`. `Super` arriving separates the
+            // host keeping the keystroke from the guest matching no chord; the modifier only,
+            // never the keycode, which would log passwords.
+            // `check-input`, `check-login` and `check-install` match the press and Super lines.
+            let meta_change = match *l {
+                libinput::Logical::Key { keycode, pressed, .. }
+                    if keycode == libkern::abi::KEY_LEFTMETA || keycode == libkern::abi::KEY_RIGHTMETA =>
+                {
+                    Some(pressed)
+                }
+                _ => None,
+            };
+            // Releases as well as presses, so a lost release is told from a client that ignored
+            // the click (`check-login`). A button is not a keystroke.
+            let diag = meta_change.is_some()
+                || matches!(*l, libinput::Logical::Button { .. } | libinput::Logical::Dropped { .. });
+            let logged = INPUT_DIAGS_LOGGED.load(Relaxed);
+            if diag && logged < MAX_LOGGED_INPUT_DIAGS {
+                INPUT_DIAGS_LOGGED.store(logged + 1, Relaxed);
+                let mut pl = Line::new();
+                match *l {
+                    _ if meta_change == Some(true) => {
+                        pl.s(b"compositor: Super down");
+                    }
+                    _ if meta_change == Some(false) => {
+                        pl.s(b"compositor: Super up");
+                    }
+                    // A press whose release never appears was QEMU holding it (its PS/2 queue
+                    // holds a packet until the next injected event); the gates flush with
+                    // `expect_after_pointer`.
+                    libinput::Logical::Dropped { .. } => {
+                        pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
+                    }
+                    _ => {
+                        let p = srv.router.pointer();
+                        let down = matches!(*l, libinput::Logical::Button { pressed: true, .. });
+                        pl.s(if down {
+                            b"compositor: press at x=".as_slice()
+                        } else {
+                            b"compositor: release at x=".as_slice()
+                        })
+                        .i(p.x as i64)
+                        .s(b" y=")
+                        .i(p.y as i64);
+                        match srv.router.grab() {
+                            Some(w) => {
+                                pl.s(b" win=").u(w as u64);
+                            }
+                            None => {
+                                pl.s(b" win=none");
                             }
                         }
                     }
-                    pl.end();
                 }
-                // Repeat follows the physical key, except a consumed chord: `fire_repeat` bypasses
-                // the router and would type it into the focused window.
-                if let libinput::Logical::Key { keycode, pressed, modifiers, locks, .. } = *l
-                    && !routed.consumed
-                {
-                    srv.repeat = compositor::Repeat::after_key(
-                        srv.repeat,
-                        keycode,
-                        pressed,
-                        modifiers,
-                        locks,
-                        srv.stack.focus_candidate(),
-                        now,
-                    );
-                }
-                // A `SYN_DROPPED` makes the held-key set a guess, so a repeat from it is too.
-                if matches!(l, libinput::Logical::Dropped { .. }) {
-                    srv.repeat = None;
-                }
+                pl.end();
+            }
+            // Repeat follows the physical key, except a consumed chord: `fire_repeat` bypasses
+            // the router and would type it into the focused window.
+            if let libinput::Logical::Key { keycode, pressed, modifiers, locks, .. } = *l
+                && !routed.consumed
+            {
+                srv.repeat = compositor::Repeat::after_key(
+                    srv.repeat,
+                    keycode,
+                    pressed,
+                    modifiers,
+                    locks,
+                    srv.stack.focus_candidate(),
+                    now,
+                );
+            }
+            // A `SYN_DROPPED` makes the held-key set a guess, so a repeat from it is too.
+            if matches!(l, libinput::Logical::Dropped { .. }) {
+                srv.repeat = None;
             }
         }
     }
@@ -1234,6 +1209,9 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
         }
     };
     let len = dst_geom.byte_len();
+    if !stat(obj).is_some_and(|info| holds(&info, len)) {
+        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+    }
     // SAFETY: mapping an object the manager sent, writable, for exactly its own length.
     let addr =
         unsafe { syscall4(SYS_MEMORY_MAP, obj, 0, len as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) };
@@ -1555,35 +1533,31 @@ fn close_session(slot: usize, srv: &mut Server) {
     srv.outbox[slot].clear();
     disconnect(&mut srv.conns[slot], &mut srv.stack);
     drain_stack_events(srv);
-    srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
     announce_focus(srv);
 }
 
-/// Map a client's transferred `MemoryObject` and record it for `BufferSource`, once at attach.
-/// Always consumes `handle`, on every path.
-fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
-    let Some(req) = librsproto::surface::parse_attach_buffer_request(body) else {
-        // SAFETY: we are not mapping it, so drop it rather than leaking the object.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        return false;
-    };
-    let len = req.pitch as usize * req.height as usize;
-    // The replaced mapping goes first: `dispatch` accepted the new geometry, and a failed map must
-    // leave no pixels, not the wrong ones.
-    srv.buffers.retain(|b| !(b.window == req.window && b.buffer == req.buffer));
-    // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
-    // with the size its own geometry declares.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };
-    if addr <= 0 {
-        // SAFETY: the map failed, so nothing references the object; drop our handle rather
-        // than leaking it for the compositor's life.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        return false;
+/// What the kernel says `handle` is; `None` if it will not, as of a handle without `INSPECT`.
+fn stat(handle: u64) -> Option<HandleInfo> {
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `info` is a writable `HandleInfo` on this frame.
+    (unsafe { syscall2(SYS_HANDLE_STAT, handle, (&raw mut info) as u64) } == 0).then_some(info)
+}
+
+/// Map a client's transferred `MemoryObject` at attach, as [`attach_memory`] rules, no handle
+/// refused with the rest. Always consumes `handle`, on every path.
+fn map_attached_buffer(body: &[u8], handle: u64) -> Option<Attached<Option<Mapping>>> {
+    if handle == 0 {
+        return None;
     }
-    srv.buffers.push(MappedBuffer { window: req.window, buffer: req.buffer, addr: addr as *mut u8, len });
-    // SAFETY: closing our reference; the mapping outlives it.
+    let attached = attach_memory(body, stat(handle).as_ref(), |len| {
+        // SAFETY: `handle` is a `MemoryObject` the client transferred, of at least `len` bytes;
+        // mapping it read-only with the size its own geometry declares.
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };
+        (addr > 0).then(|| Mapping { addr: addr as *mut u8, len })
+    });
+    // SAFETY: closing our reference; a mapping outlives it.
     unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-    true
+    attached
 }
 
 /// Recomposite the whole screen: the fallback for `Applied { dirty: None }` and the first frame.
@@ -1686,7 +1660,7 @@ fn handle_session_request(
     screen: &mut Screen<RawFramebuffer>,
     mut sent: Received,
 ) -> bool {
-    // Copied out to avoid two live `static mut` borrows. `MAX_BODY` fits a whole `SetTitle`, so
+    // Copied out to avoid two live `static mut` borrows. `MAX_BODY` fits any message's body, so
     // this `min` is a bounds check, not a policy.
     let mut body_buf = [0u8; MAX_BODY];
     // SAFETY: RECV_MSG was filled by the recv in the caller; the slice is clamped to the payload
@@ -1905,23 +1879,24 @@ fn handle_session_request(
         };
     }
 
-    // SAFETY: a bounded mutable slice over the reply buffer; `body` is a local copy.
-    let outcome =
-        unsafe { dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut REPLY_MSG[PAYLOAD_OFF + 16..]) };
-    drain_stack_events(srv);
-
-    // Map only after `dispatch` accepted the attach, or a rejected one would record the client's
-    // memory under ids it does not own. The handle is disposed of exactly once.
-    let mut consumed = false;
-    if op == OP_ATTACH_BUFFER && handle != 0 && matches!(outcome, Outcome::Applied { .. }) {
-        consumed = true;
-        if !map_attached_buffer(srv, body, handle) {
-            return true;
-        }
-    }
-    if handle != 0 && !consumed {
+    // **An attach brings memory, or it is refused**: asked before `dispatch`, so the stack takes no
+    // geometry without it, and recorded after, as a rejected one would put the client's memory
+    // under ids it does not own. The handle is disposed of exactly once.
+    let attached = if op == OP_ATTACH_BUFFER { map_attached_buffer(body, handle) } else { None };
+    if op != OP_ATTACH_BUFFER && handle != 0 {
         // SAFETY: closing a handle this process owns and will not use.
         unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+    }
+    let outcome = if op == OP_ATTACH_BUFFER && attached.is_none() {
+        refuse_attach(&srv.conns[slot], body)
+    } else {
+        // SAFETY: single-threaded, and nothing else borrows `REPLY_MSG` across this call, so the
+        // `&mut` is unique; `body` is a local copy, so it does not alias it.
+        unsafe { dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut REPLY_MSG[PAYLOAD_OFF + 16..]) }
+    };
+    drain_stack_events(srv);
+    if let Some(attached) = attached {
+        record_attach(&mut srv.buffers, &outcome, attached);
     }
 
     match outcome {
@@ -1971,10 +1946,7 @@ fn handle_session_request(
                 .is_some_and(|w| matches!(w.role, librsproto::surface::Role::Popup { .. }));
             // SAFETY: reading our own manager slot.
             if sent && !placed_by_creator && unsafe { MANAGER_CH } != 0 {
-                let mut now: u64 = 0;
-                // SAFETY: a valid out-pointer for one u64.
-                unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
-                srv.pending_configure.push((configure.window, now.saturating_add(CONFIGURE_DEADLINE_NS)));
+                srv.pending_configure.push((configure.window, now_ns().saturating_add(CONFIGURE_DEADLINE_NS)));
             } else {
                 let mut cfg = [0u8; core::mem::size_of::<ConfigureEvent>()];
                 srv.stack.mark_configured(configure.window);
@@ -1986,10 +1958,6 @@ fn handle_session_request(
             }
         }
         Outcome::Applied { release, dirty } => {
-            // A destroy is transitive, so drop every mapping whose window is gone, or a looping
-            // client grows the compositor's address space.
-            srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
-
             // Paint before releasing: a `Release` tells the client the frame is done, and pacing
             // off that would see an unpainted screen.
             match dirty {
@@ -2113,13 +2081,11 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             // `service --stop`: every window goes with this process and its clients find their
             // channels closed; a restarted compositor takes the screen again.
             if control != 0 && h == control {
-                match libkern::control::recv(control) {
-                    libkern::control::Control::Op(libkern::abi::CTRL_OP_SHUTDOWN) => {
-                        kprint(b"compositor: asked to stop, exiting\n");
-                        exit(0);
-                    }
-                    libkern::control::Control::Closed => control = 0,
-                    _ => {}
+                if let libkern::control::Control::Op(libkern::abi::CTRL_OP_SHUTDOWN) =
+                    libkern::control::recv(&mut control)
+                {
+                    kprint(b"compositor: asked to stop, exiting\n");
+                    exit(0);
                 }
                 continue;
             }
