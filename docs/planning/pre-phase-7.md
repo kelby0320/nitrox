@@ -11,9 +11,10 @@ the laptop; C.5 built 2026-10-20 — Part C built; the stick's light confirmed o
 for what it left (the maintainer's call); Part I added 2026-10-26, a safety survey (the
 maintainer's call), its thirteen runs done 2026-10-26 and 2026-10-27 and triaged 2026-10-27, and
 Part J added for the kernel layers it plans (the maintainer's call); Part I's items marked fix all
-fixed 2026-11-01, and its Miri job built the same day.** Each later part gets its
-detail pass when it is next. Ten parts, A–J, in the order below: Part I between D and E, and Part J
-after I. Part E is the syscall-surface consolidation, planned separately in
+fixed 2026-11-01, and its Miri job built the same day; Part E detailed 2026-11-02.** Each later
+part gets its detail pass when it is next. Ten parts, A–J, in the order below: Part I between D
+and E, and **Part J between Part E's two halves** (the maintainer's call, 2026-11-02). Part E is
+the syscall-surface consolidation, planned separately in
 [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
@@ -1006,18 +1007,25 @@ reference, its tag and pointer tied and its liveness and the scheduler lock held
 owned frames and a bounded view of their bytes (P2); typed page tables (P3); per-CPU state (P4);
 device memory and I/O, with in-flight IRPs, DMA and MMIO accessors and device teardown (P5); and
 the `unsafe fn`s whose only contract is "ring 0" (P6). [`safety-survey.md`](safety-survey.md)
-names each one's items. They change no syscall, so they are a part of their own; P1 reaches nearly
-every syscall Part E rewrites, so Part E's detail pass settles which of the two comes first.
+names each one's items. They change no syscall, so they are a part of their own. **It runs between
+Part E's two halves** (the maintainer's call, 2026-11-02): after every crate is on libos, and before
+the surface's new kernel code, which wants P1 and P2 under it
+([`syscall-surface.md`](syscall-surface.md) § *The order*). Its detail pass comes then.
 
 ## Part E — the syscall surface
 
-As [`syscall-surface.md`](syscall-surface.md) plans it, after its own detail pass. **With it, four
-of the bash's findings** ([`bug-bash.md`](bug-bash.md)): `sys_file_sync`'s name and lookup binding
-it to files (kmem-30), and three in the memory-mapping path that Phase 7's threads and loader reach
-first: two hint-less maps racing for one range (kmem-29), a kernel copy from a page not yet faulted
-in failing (kmem-28), and a refault after a remap (kmem-15). **With it too, Part I's two layers for
-userspace**: libos, the safe syscall layer every crate moves onto (P7), and the wire formats (P8),
-in [`safety-survey.md`](safety-survey.md).
+As [`syscall-surface.md`](syscall-surface.md) plans it, **detailed 2026-11-02: eleven sub-parts in
+two halves, Part J between them.** E.1 to E.5 put every crate on libos, with the wire formats: a
+ratchet on raw syscalls, the libraries, the supervisors and servers, the programs, the test harness.
+E.6 to E.11 then take the surface from forty-two syscalls to twenty-eight, changing one crate of
+userspace.
+
+**With it, four of the bash's findings** ([`bug-bash.md`](bug-bash.md)): `sys_file_sync`'s name and
+lookup binding it to files (kmem-30), and three in the memory-mapping path that Phase 7's threads
+and loader reach first: two hint-less maps racing for one range (kmem-29), a kernel copy from a page
+not yet faulted in failing (kmem-28), and a refault after a remap (kmem-15). **With it too, Part I's
+two layers for userspace**: libos, the safe syscall layer every crate moves onto (P7), and the wire
+formats (P8), in [`safety-survey.md`](safety-survey.md).
 
 ## Part F — context menus
 
@@ -1074,5 +1082,5 @@ several branches at once, which waits on the gates leaving this machine.
   agreed with the maintainer.
 - Part I's survey run on its thirteen subsystems and every item triaged; its items marked fix
   fixed, its layers marked plan in Part E's plan or built in Part J, and no raw syscall outside
-  `libkern` and `libos`, or each exception agreed with the maintainer (`eshell`'s and `libheap`'s
-  are agreed).
+  `libkern` and `libos`, or each exception agreed with the maintainer (`eshell`'s, `libheap`'s and
+  the test harness's deliberate refusals are agreed).
