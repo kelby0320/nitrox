@@ -102,9 +102,12 @@ supervisors share it.
 
 ## Testing
 
-`libkern` is testable on the host with a mock syscall implementation. The `libkern_test` feature (or similar) replaces real syscalls with a recorded/replayable mock so unit tests can run in `cargo test`.
+There is no syscall mock (`docs/rationale/deferred-decisions.md`). On the host a syscall is Linux's
+of that number, so a test stops short of the first one, and `libos::sys` is the seam for code
+above this crate. Under Miri `cfg(miri)` twins stand in for the assembly: `syscall6` refuses every
+syscall `Unsupported`, and `exit` panics, failing the test that reaches it.
 
-For tests that need real syscalls, use the QEMU integration test harness — but most `libkern` tests should be doable host-side.
+For tests that need real syscalls, use the QEMU integration test harness.
 
 ## Forbidden patterns
 

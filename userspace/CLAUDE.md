@@ -204,7 +204,7 @@ Don't introduce YAML, JSON5, or custom parsers. The TOML crate (project-internal
 - There is no syscall mock yet (`docs/rationale/deferred-decisions.md`): keep logic free of syscalls
   to test it on the host, and test the paths that make them in a QEMU gate.
 - `cargo xtask miri` runs the services' unit tests under Miri, nightly in CI, where every syscall is
-  refused `Unsupported`. A test it cannot run or finish says why beside itself, with
+  refused `Unsupported` and an `exit` fails its test. A test it cannot run or finish says why beside itself, with
   `#[cfg_attr(miri, ignore = "...")]`, and a new crate's target goes on its list or says why not.
 
 ## Forbidden patterns

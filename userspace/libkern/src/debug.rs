@@ -1,7 +1,6 @@
 //! Debug output helpers: `kprint`, `exit`, and no-alloc integer formatters.
 
-use crate::syscall::{SYS_DEBUG_KPRINT, SYS_PROCESS_EXIT, syscall4};
-use core::arch::asm;
+use crate::syscall::{SYS_DEBUG_KPRINT, syscall4};
 
 /// Write `msg` to the kernel serial log (`sys_kprint`).
 ///
@@ -16,17 +15,24 @@ pub fn kprint(msg: &[u8]) {
 }
 
 /// Terminate the calling process with `status`. Diverges (never returns).
+#[cfg(not(miri))]
 pub fn exit(status: i64) -> ! {
     // SAFETY: `sys_process_exit` diverges in the kernel; control never returns,
     // so `options(noreturn)` is sound.
     unsafe {
-        asm!(
+        core::arch::asm!(
             "syscall",
-            in("rax") SYS_PROCESS_EXIT,
+            in("rax") crate::syscall::SYS_PROCESS_EXIT,
             in("rdi") status,
             options(noreturn, nostack),
         );
     }
+}
+
+/// [`exit`] under Miri, which runs no assembly: the host test that reaches it fails, and no other.
+#[cfg(miri)]
+pub fn exit(status: i64) -> ! {
+    panic!("exit({status})")
 }
 
 /// Format `v` as decimal into `buf`, returning the written suffix. No alloc.
@@ -187,6 +193,19 @@ impl Line {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(miri)]
+    #[test]
+    fn under_miri_a_syscall_is_refused() {
+        assert_eq!(crate::channel_create(1), Err(crate::error::KError::Unsupported));
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[should_panic(expected = "exit(3)")]
+    fn under_miri_an_exit_fails_its_own_test() {
+        exit(3)
+    }
 
     #[test]
     fn a_line_assembles_in_order_with_one_newline() {
