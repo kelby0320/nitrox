@@ -373,7 +373,7 @@ fn a_request_meeting_the_give_up_at_the_port_lock_is_refused() {
             submit(late_irp as *mut Irp, ctx(d))
         });
         // Long enough for `waiting` to be at the lock.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        crate::mm::test_support::settle();
         let _ = give_up(&mut q);
         drop(q);
         waiting.join().unwrap();
