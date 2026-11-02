@@ -385,12 +385,11 @@ pub fn rdtsc() -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-/// [`rdtsc`] under Miri, which runs no assembly: a counter, moving on every read to end a deadline.
+/// [`rdtsc`] under Miri, which runs no assembly. A host test's clock is never calibrated, so it
+/// reads 0 whatever this answers.
 #[cfg(miri)]
 pub fn rdtsc() -> u64 {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1_000, Ordering::Relaxed)
+    0
 }
 
 /// Read `IA32_TSC_AUX` (the per-CPU logical id the kernel programs there) via `RDTSCP`,
