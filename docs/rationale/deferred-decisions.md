@@ -2450,23 +2450,6 @@ is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware
 CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
 survive rather than merely diagnose.
 
-**Five provenance tests fail only under Miri, which no CI job runs — `TODO(miri-provenance-tests)`.**
-Each pins a pointer derived so that a later borrow cannot retire it (2026-10-29), and natively it
-passes on the old code as on the new, since the hardware cannot see provenance. So does one half
-of `a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loading`: without
-`copy_fill_into_frame`'s kind check it reads a `PendingOperation` as a `MemoryObject`, and the
-uninitialised byte it reads natively happens to refuse. Run by hand, from
-`kernel/` with `cargo +nightly-2026-07-20 miri test --lib --target x86_64-unknown-linux-gnu` and
-`MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-ignore-leaks'`:
-`the_fpu_area_pointer_may_be_written_through`, `a_disk_over_its_own_bytes_writes_and_reads_them_back`,
-`an_endpoint_holding_another_in_a_held_send_is_refused_too` and
-`a_block_request_off_its_devices_blocks_or_words_reaches_no_driver`, whose IRP pointer, made from a
-borrow of the `irp` field rather than from its box's pointer, Miri refuses (2026-10-30); and
-libheap's, from
-`userspace/libheap/` with `cargo miri test --target x86_64-unknown-linux-gnu` and
-`MIRIFLAGS='-Zmiri-strict-provenance'`. Trigger: Part I's Miri job
-(`docs/planning/pre-phase-7.md` § Part I, scheduled and by hand), which takes them on.
-
 **`libkern` mock-syscall test mode.** `userspace/libkern/CLAUDE.md` describes a feature-flagged mock that records and replays syscalls for host-side tests of layers above. The crate is a `cargo new` placeholder in Phase 0. Trigger: real syscalls are defined.
 
 ### Auditing and observability
@@ -2485,6 +2468,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Five provenance tests that only Miri can fail (`miri-provenance-tests`) | 2026-11-01 | **The Miri job**, `cargo xtask miri`, nightly and by hand: each pins a pointer's provenance, which the hardware cannot see, so natively it passes on the old code as on the new, and half of a sixth, a fill answered with the wrong kind of object, reads uninitialised bytes that happen to refuse. All of them now run in that job. |
 | `REAP_RESERVE`, a userspace-reachable cap that aborts when crossed | 2026-10-25 | The sweep it capped is gone: a process's exit only marks its threads, and each parks itself on the reap list of the CPU it ends on, as a lone thread's exit always did. The reap lists hold `MAX_THREADS` since 2026-10-22, and nothing pushes more than one thread at a time. |
 | `copy` and `remove` slow on a real disk (`fs-throughput`) | 2026-10-13 | **Phase 6 Part H**, measured on the laptop beside Linux on the same machine and fixed until it was not the bottleneck: ext4 allocating and freeing in runs, a grow's blocks not read back, each server caching its metadata, and more than a page a command — 6.7 times Linux's time to 0.73 over fifteen runs. The number went into Phase 6's Definition of Done (Part H.5, the maintainer's call); the two costs left are `TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`, above. |
 | Extent-tree splitting and index nodes (`fs-server-ext4`) | 2026-10-08 | **Phase 6 Part H.1**, `userspace/fs-server-ext4/src/extent.rs`: a tree appended to, split and deepened as ext4's own appends leave one, cut and folded back into the inode, and freed whole, at any depth; held to `debugfs`' reading of every map and to `e2fsck -fn`. **The trigger arrived on review**: the entry said creating *files* in one directory was unbounded, which held for empty files only — with data, the PR #370 review's probe and its author's stopped at about the 815th, and Part H's tree to copy holds 4,096. Checking it found four more in the same code, fixed with it: a removed file with a tree freed nothing, a failed grow kept every block it took, a 32,768-block extent read as a hole, and an unwritten extent as its blocks' old contents ([`ext4-fs-server-rw.md`](../architecture/ext4-fs-server-rw.md) § *The extent tree*). |

@@ -841,7 +841,6 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
 
 /// **A fill answered with bytes the kernel may not read fails**: a borrowed memory object, or
 /// another kind of object, completes the fill `Unsupported` and leaves its page unready.
-// TODO(miri-provenance-tests): the other kind's case bites only under Miri; see the entry.
 #[test]
 fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loading() {
     use crate::mm::{Caching, PhysAddr};

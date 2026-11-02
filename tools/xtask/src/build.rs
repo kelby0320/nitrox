@@ -150,7 +150,7 @@ const USERSPACE_TARGET: &str = "x86_64-unknown-nitrox";
 /// A `cargo` command for the **userspace** workspace, resolved against
 /// `userspace/rust-toolchain.toml`: `cargo run` exports `RUSTUP_TOOLCHAIN` (and `RUSTC`/`RUSTDOC`),
 /// which would keep the child on the stable toolchain.
-fn userspace_cargo() -> Command {
+pub(crate) fn userspace_cargo() -> Command {
     let mut c = Command::new("cargo");
     c.env_remove("RUSTUP_TOOLCHAIN").env_remove("RUSTC").env_remove("RUSTDOC");
     c

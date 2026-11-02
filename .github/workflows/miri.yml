@@ -1,0 +1,57 @@
+name: Miri
+
+# Miri on the kernel and the system services (`cargo xtask miri`). Not on every PR: it interprets,
+# so it takes the better part of an hour where the host suite takes a minute (the maintainer's
+# call, the decision log, 2026-10-26). Nightly and by hand, and on a change to the job itself,
+# which a schedule on `main` could not otherwise prove before it landed.
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/miri.yml'
+      - 'tools/xtask/src/miri.rs'
+
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    name: Miri (${{ matrix.part }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [kernel, userspace]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # As in `ci.yml`, with Miri on the nightly: the kernel's stable has none, so `cargo xtask miri`
+      # names that toolchain.
+      - name: Install Rust (pinned stable for tools, pinned nightly with Miri)
+        run: |
+          rustup toolchain install "$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)" \
+            --profile minimal --component rustfmt --component clippy --target x86_64-unknown-none --no-self-update
+          rustup toolchain install "$(grep -oP 'channel\s*=\s*"\K[^"]+' userspace/rust-toolchain.toml)" \
+            --profile minimal --component rust-src --component rustfmt --component clippy --component miri --no-self-update
+
+      - name: Cache cargo registry and build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/miri
+            kernel/target
+            tools/target
+            userspace/target
+          key: ${{ runner.os }}-miri-${{ matrix.part }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}
+
+      - name: cargo xtask miri ${{ matrix.part }}
+        run: cargo xtask miri ${{ matrix.part }}

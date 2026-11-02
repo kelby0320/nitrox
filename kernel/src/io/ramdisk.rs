@@ -430,7 +430,6 @@ mod tests {
     }
 
     /// **The disk it owns takes writes**, through a pointer that may write.
-    // TODO(miri-provenance-tests): it fails only under Miri, which no CI job runs yet.
     #[test]
     fn a_disk_over_its_own_bytes_writes_and_reads_them_back() {
         init_global_heap();
