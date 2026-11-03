@@ -113,7 +113,8 @@ impl Scratch {
     /// Copy `dst.len()` bytes of the scratch from `from` into `dst`.
     pub fn copy_out(&self, from: usize, dst: &mut [u8]) {
         assert!(from + dst.len() <= self.view.borrow().len());
-        self.view.borrow().read_into(from, dst).expect("a copy within the scratch");
+        let copied = self.view.borrow().read_into(from, dst);
+        assert!(copied.is_ok(), "a copy within the scratch");
     }
 }
 

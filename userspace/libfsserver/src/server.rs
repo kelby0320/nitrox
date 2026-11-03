@@ -83,7 +83,8 @@ impl Outbox {
     }
 
     fn stage(&mut self, len: usize) {
-        self.msg.set_len(len).expect("an encoded payload fits the message it was written into");
+        let staged = self.msg.set_len(len);
+        assert!(staged.is_ok(), "an encoded payload fits the message it was written into");
     }
 
     fn attach<T, M>(&mut self, handle: Handle<T, M>) {
@@ -531,7 +532,7 @@ impl State<'_> {
         let mut raw = [0; MAX_WAIT_HANDLES];
         let sessions = self.sessions.0.iter().flatten().map(|s| &s.ch);
         for ch in core::iter::once(&self.serve_end).chain(self.control.as_ref()).chain(sessions) {
-            let at = set.add(ch).expect("the sessions and the two channels fit one wait");
+            let Ok(at) = set.add(ch) else { panic!("the sessions and the two channels fit one wait") };
             raw[at] = ch.raw().0;
         }
         (set, raw)
