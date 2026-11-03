@@ -22,7 +22,6 @@
 "userspace/libheap" = 5
 "userspace/libprompt" = 4
 "userspace/libsession" = 59
-"userspace/libstream" = 12
 "userspace/libsurface" = 14
 "userspace/logging-service" = 10
 "userspace/nxedit" = 61

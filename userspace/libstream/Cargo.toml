@@ -13,10 +13,14 @@ edition = "2024"
 # host-testing with no dependency. Off by default; a userspace bin that moves streams
 # over a real IPC channel enables it (`libstream = { …, features = ["io"] }`).
 libkern = { path = "../libkern", optional = true }
+libos = { path = "../libos", optional = true }
 
 [features]
 # The syscall-backed transport: `channel::IpcPort` over `sys_channel_send`/`recv`.
-io = ["dep:libkern"]
+io = ["dep:libkern", "dep:libos"]
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }
 
 [lib]
 name = "libstream"

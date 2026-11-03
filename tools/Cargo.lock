@@ -183,6 +183,7 @@ name = "libstream"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
 ]
 
 [[package]]

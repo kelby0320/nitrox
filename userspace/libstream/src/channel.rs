@@ -133,6 +133,8 @@ impl<P: MsgPort> ChannelReceiver<P> {
 
 #[cfg(feature = "io")]
 pub use self::io_port::IpcPort;
+#[cfg(feature = "io")]
+pub(crate) use self::io_port::{recv_msg, send_msg};
 
 /// The concrete [`MsgPort`] over a real IPC channel endpoint, behind the `io` feature so
 /// the framing above stays dependency-free.
@@ -142,132 +144,133 @@ mod io_port {
     use crate::wire::{Result, WireError};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
-    use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, SENDMODE_BLOCK};
-    use libkern::syscall::{SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall6};
-
-    const E_WOULDBLOCK: i64 = -11;
-    const E_PEERCLOSED: i64 = -13;
-
-    // `IpcMsgHeader` field byte offsets (see `libkern::abi::IpcMsgHeader`), so the buffer
-    // can be a plain byte array.
-    const OFF_PAYLOAD_LEN: usize = 4;
-    const OFF_HANDLE_COUNT: usize = 8;
-    const OFF_FLAGS: usize = 10;
-    const OFF_PAYLOAD: usize = 24;
+    use libkern::{KError, RawHandle, Rights};
+    use libos::{Carried, Channel, Deadline, Handle, Msg, Only, Ref, WaitSet, block_on};
 
     /// Transport flag in the IPC header's `flags`: the final message of a stream. The
     /// kernel passes `flags` through untouched.
     const MSG_FLAG_LAST: u16 = 1 << 0;
 
+    /// The endpoint a port sends and receives on.
+    enum End {
+        /// One the port owns, closed with it.
+        Owned(Handle<Channel, Only>),
+        /// One its caller owns and keeps open while the port lives.
+        Borrowed(u64),
+    }
+
+    impl End {
+        fn as_ref(&self) -> Ref<'_, Channel, Only> {
+            match self {
+                End::Owned(h) => h.as_ref(),
+                // SAFETY: `IpcPort::new`'s caller keeps the endpoint open while the port lives.
+                End::Borrowed(raw) => unsafe { Ref::from_raw(RawHandle(*raw), Rights::empty()) },
+            }
+        }
+    }
+
     /// A [`MsgPort`] over one IPC channel endpoint, owning a reusable one-page message
     /// buffer. A full ring blocks the send; a closed peer fails it.
     pub struct IpcPort {
-        endpoint: u64,
-        buf: Box<[u8; IPC_MSG_SIZE]>,
+        end: End,
+        buf: Box<Msg>,
     }
 
     impl IpcPort {
-        /// Wrap a channel-endpoint handle.
-        pub fn new(endpoint: u64) -> Self {
-            IpcPort { endpoint, buf: Box::new([0u8; IPC_MSG_SIZE]) }
+        /// A port that owns `endpoint` and closes it when dropped.
+        pub fn owning(endpoint: Handle<Channel, Only>) -> Self {
+            IpcPort { end: End::Owned(endpoint), buf: Box::new(Msg::new()) }
         }
-        /// The endpoint handle this port sends/receives on.
+
+        /// Wrap a channel-endpoint handle the caller keeps owning: the port closes nothing. For
+        /// callers not yet on libos; the typed form is [`owning`](Self::owning).
+        // TODO(raw-handle-shims): goes when its last caller is on libos.
+        pub fn new(endpoint: u64) -> Self {
+            IpcPort { end: End::Borrowed(endpoint), buf: Box::new(Msg::new()) }
+        }
+
+        /// The endpoint this port sends and receives on.
+        pub fn channel(&self) -> Ref<'_, Channel, Only> {
+            self.end.as_ref()
+        }
+
+        /// The endpoint handle this port sends/receives on, still owned by whoever owned it. For
+        /// callers not yet on libos; the typed form is [`channel`](Self::channel).
+        // TODO(raw-handle-shims): goes when its last caller is on libos.
         pub fn endpoint(&self) -> u64 {
-            self.endpoint
+            self.channel().raw().0
+        }
+
+        /// As [`MsgPort::send`], giving up once the ring has stayed full to `deadline`: a message
+        /// held that long is dropped, and the send fails [`WireError::SinkFull`].
+        pub fn send_by(&mut self, payload: &[u8], last: bool, deadline: Deadline) -> Result<()> {
+            self.buf.set(payload).map_err(|_| WireError::SinkFull)?;
+            self.buf.set_flags(if last { MSG_FLAG_LAST } else { 0 });
+            send_msg(self.channel(), &self.buf, &mut Carried::new(), deadline)
+        }
+
+        /// As [`MsgPort::recv`], giving up at `deadline`: `None` if no message came by then.
+        pub fn recv_by(&mut self, out: &mut Vec<u8>, deadline: Deadline) -> Result<Option<bool>> {
+            // Whatever handles the message brought close as they drop: a frame carries none.
+            if recv_msg(self.end.as_ref(), &mut self.buf, deadline)?.is_none() {
+                return Ok(None);
+            }
+            out.extend_from_slice(self.buf.payload());
+            Ok(Some(self.buf.flags() & MSG_FLAG_LAST != 0))
         }
     }
 
-    fn map_err(r: i64) -> WireError {
-        match r {
-            E_PEERCLOSED => WireError::PeerClosed,
-            _ => WireError::SinkFull, // WouldBlock / pending-queue-full / other
+    /// How a transport refusal reads on the wire: a closed peer is `PeerClosed`; a full ring or
+    /// anything else, `SinkFull`.
+    pub(crate) fn map_err(e: libos::Error) -> WireError {
+        match e.code() {
+            KError::PeerClosed => WireError::PeerClosed,
+            _ => WireError::SinkFull,
+        }
+    }
+
+    /// Send `msg` and `handles` on `ep`, waiting for the peer to take it: for ever on
+    /// [`Deadline::NEVER`], else until `deadline`, when it is dropped with its handles and the
+    /// send fails `SinkFull`. The handles move once the kernel holds the message, whatever the
+    /// wait then says; a refusal before that leaves them in `handles`.
+    pub(crate) fn send_msg(
+        ep: Ref<'_, Channel, Only>,
+        msg: &Msg,
+        handles: &mut Carried,
+        deadline: Deadline,
+    ) -> Result<()> {
+        let op =
+            if deadline == Deadline::NEVER { ep.send_held(msg, handles) } else { ep.send_by(msg, handles, deadline) };
+        block_on(op.map_err(map_err)?).map(|_| ()).map_err(map_err)
+    }
+
+    /// Receive into `msg` from `ep`, waiting for one if the ring is empty: `None` if none came by
+    /// `deadline`. `PeerClosed` once the peer has gone and nothing is left.
+    pub(crate) fn recv_msg(ep: Ref<'_, Channel, Only>, msg: &mut Msg, deadline: Deadline) -> Result<Option<Carried>> {
+        loop {
+            match ep.recv(msg) {
+                Ok(handles) => return Ok(Some(handles)),
+                Err(e) if e.code() == KError::WouldBlock => {
+                    let mut set = WaitSet::<1>::new();
+                    set.add(ep).map_err(|_| WireError::PeerClosed)?;
+                    match set.wait(deadline) {
+                        Ok(s) if s.is_empty() && deadline != Deadline::NEVER => return Ok(None),
+                        Ok(_) => {}
+                        Err(_) => return Err(WireError::PeerClosed),
+                    }
+                }
+                Err(e) => return Err(map_err(e)),
+            }
         }
     }
 
     impl MsgPort for IpcPort {
         fn send(&mut self, payload: &[u8], last: bool) -> Result<()> {
-            if payload.len() > IPC_PAYLOAD_SIZE {
-                return Err(WireError::SinkFull);
-            }
-            let flags: u16 = if last { MSG_FLAG_LAST } else { 0 };
-            self.buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-            self.buf[OFF_HANDLE_COUNT] = 0;
-            self.buf[OFF_FLAGS..OFF_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
-            self.buf[OFF_PAYLOAD..OFF_PAYLOAD + payload.len()].copy_from_slice(payload);
-
-            let no_handles = [0u64; 1];
-            // Block-mode send returns a PendingOperation handle (delivery; a full ring
-            // blocks here) or a negative `KError`; a handle means the message is committed.
-            // SAFETY: `buf` is a valid IPC_MSG_SIZE buffer;
-            // `no_handles` is a valid (empty) handle array with count 0.
-            let r = unsafe {
-                syscall6(
-                    SYS_CHANNEL_SEND,
-                    self.endpoint,
-                    self.buf.as_ptr() as u64,
-                    no_handles.as_ptr() as u64,
-                    0,
-                    SENDMODE_BLOCK,
-                    u64::MAX,
-                )
-            };
-            if r < 0 {
-                return Err(map_err(r));
-            }
-            // Wait for the delivery PO, then release it.
-            let po = r as u64;
-            let wait_handles = [po];
-            let mut result = [0u8; 24]; // one IoResult
-            // SAFETY: valid handle + result out-buffers.
-            let waited =
-                unsafe { syscall4(SYS_WAIT, wait_handles.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX) };
-            // SAFETY: closing the PO handle we own.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
-            if waited < 1 {
-                return Err(WireError::PeerClosed);
-            }
-            // IoResult.status is an i32 at offset 8; negative ⇒ the peer died while queued.
-            let status = i32::from_le_bytes([result[8], result[9], result[10], result[11]]);
-            if status < 0 {
-                return Err(map_err(status as i64));
-            }
-            Ok(())
+            self.send_by(payload, last, Deadline::NEVER)
         }
 
         fn recv(&mut self, out: &mut Vec<u8>) -> Result<bool> {
-            loop {
-                let r = match libkern::channel_recv(self.endpoint, &mut self.buf) {
-                    Ok(_sent) => {
-                        let n = u32::from_le_bytes([
-                            self.buf[OFF_PAYLOAD_LEN],
-                            self.buf[OFF_PAYLOAD_LEN + 1],
-                            self.buf[OFF_PAYLOAD_LEN + 2],
-                            self.buf[OFF_PAYLOAD_LEN + 3],
-                        ]) as usize;
-                        if n > IPC_PAYLOAD_SIZE {
-                            return Err(WireError::UnexpectedEof);
-                        }
-                        out.extend_from_slice(&self.buf[OFF_PAYLOAD..OFF_PAYLOAD + n]);
-                        let flags = u16::from_le_bytes([self.buf[OFF_FLAGS], self.buf[OFF_FLAGS + 1]]);
-                        return Ok(flags & MSG_FLAG_LAST != 0);
-                    }
-                    Err(r) => r,
-                };
-                if r == E_WOULDBLOCK {
-                    // Empty ring: block until a message (or the peer's close) signals it.
-                    let wait_handles = [self.endpoint];
-                    let mut result = [0u8; 24];
-                    // SAFETY: valid handle + result out-buffers.
-                    let waited = unsafe {
-                        syscall4(SYS_WAIT, wait_handles.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX)
-                    };
-                    if waited < 1 {
-                        return Err(WireError::PeerClosed);
-                    }
-                    continue;
-                }
-                return Err(map_err(r));
-            }
+            self.recv_by(out, Deadline::NEVER).map(|last| last.unwrap_or(false))
         }
     }
 }
