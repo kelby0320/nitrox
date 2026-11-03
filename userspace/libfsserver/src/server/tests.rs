@@ -6,7 +6,7 @@ use crate::serve::session_tests::{Never, Spy};
 use libos::mock;
 use librsproto::error::parse_error;
 use librsproto::meta::{FS_SETUP_READ_ONLY, fs_setup, parse_ready};
-use librsproto::namespace::{RESOLVE_FILE_LAZY, resolve_request};
+use librsproto::namespace::{RESOLVE_FILE_LAZY, parse_resolve_reply, resolve_request};
 use librsproto::{OP_READY, decode, encode};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::vec::Vec;
@@ -59,6 +59,17 @@ fn resolve(id: u64, flags: u32) -> Vec<u8> {
     let n = resolve_request(&mut body, 0, flags, b"f").unwrap();
     let mut req = [0u8; 128];
     let len = encode(&mut req, OP_NS_RESOLVE, id, 0, &body[..n], 0).unwrap();
+    req[..len].to_vec()
+}
+
+/// A forwarded rename of `/a` to `/<to>`, laid out as the kernel lays it out.
+fn rename(id: u64, to: &[u8], flags: u16) -> Vec<u8> {
+    let mut body = [0u8; 64];
+    let n = resolve_request(&mut body, 0, RESOLVE_FILE_LAZY | RESOLVE_RENAME, b"a").unwrap();
+    let tail = [&(to.len() as u16).to_le_bytes()[..], &flags.to_le_bytes(), to].concat();
+    body[n..n + tail.len()].copy_from_slice(&tail);
+    let mut req = [0u8; 128];
+    let len = encode(&mut req, OP_NS_RESOLVE, id, 0, &body[..n + tail.len()], 0).unwrap();
     req[..len].to_vec()
 }
 
@@ -171,7 +182,8 @@ fn a_lazy_resolve_with_an_unsendable_device_is_answered_with_an_error() {
     let mut vol = Spy::default();
     vol.file = true;
     let without = Rights::READ | Rights::WRITE | Rights::DUPLICATE;
-    for (rights, taken) in [(without, false), (without | Rights::TRANSFER, true)] {
+    let undoubled = Rights::READ | Rights::WRITE | Rights::TRANSFER;
+    for (rights, taken) in [(without, false), (undoubled, false), (without | Rights::TRANSFER, true)] {
         let (serve_end, kernel) = pair();
         let dev = own::<Resource, ReadWrite>(mock::with_rights(mock::device(), rights));
         let mut s = state(serve_end, dev.as_ref(), None);
@@ -209,6 +221,86 @@ fn an_eager_resolve_replies_a_read_only_copy_of_the_file() {
     assert_eq!(mock::mappings(), 0, "the server's own view is gone");
 }
 
+/// A resolve whose object cannot be made is answered with why, and carries nothing.
+#[test]
+fn an_eager_resolve_whose_object_cannot_be_made_is_answered_out_of_memory() {
+    let mut vol = Spy::default();
+    vol.file = true;
+    let (serve_end, kernel) = pair();
+    let dev = own::<Resource, ReadWrite>(mock::device());
+    let mut s = state(serve_end, dev.as_ref(), None);
+    let open = mock::open_handles();
+    mock::fail_next_create(KError::OutOfMemory.as_i32());
+    s.forwarded(&vol, &resolve(6, 0));
+    let (msg, brought) = take(&kernel);
+    assert_eq!(error_of(&msg), (6, OP_NS_RESOLVE, KError::OutOfMemory.as_i32()));
+    assert!(brought.is_empty());
+    assert_eq!((mock::open_handles(), mock::mappings()), (open, 0));
+}
+
+/// A forwarded rename is the volume's, never a directory open, and every one is answered: a
+/// refusal with its code, a malformed one, and one done with no object. A file it replaced is
+/// forgotten before it is freed.
+#[test]
+fn a_rename_resolve_is_answered_whatever_comes_of_it() {
+    let dev = own::<Resource, ReadWrite>(mock::device());
+    let (serve_end, kernel) = pair();
+    let mut vol = Spy::default();
+    let mut s = state(serve_end, dev.as_ref(), None);
+    s.forwarded(&vol, &rename(7, b"b", 0));
+    assert_eq!(error_of(&take(&kernel).0), (7, OP_NS_RESOLVE, KError::NotFound.as_i32()));
+    assert_eq!(*vol.calls.borrow(), ["rename_path /a /b"]);
+    s.forwarded(&vol, &rename(8, b"", 0));
+    assert_eq!(error_of(&take(&kernel).0), (8, OP_NS_RESOLVE, KError::InvalidArgument.as_i32()));
+
+    (vol.renames, vol.orphan) = (true, Some(42));
+    s.forwarded(&vol, &rename(9, b"c", RENAME_REPLACE));
+    let (forget, _) = take(&kernel);
+    let m = decode(forget.payload()).unwrap();
+    assert_eq!((m.op, m.body), (OP_FILE_FORGET, &42u64.to_le_bytes()[..]));
+    let (reply, brought) = take(&kernel);
+    let m = decode(reply.payload()).unwrap();
+    assert_eq!((m.request_id, m.is_error(), brought.len()), (9, false, 0));
+    assert_eq!(parse_resolve_reply(m.body).unwrap().object_kind, OBJECT_KIND_NONE);
+    assert_eq!(vol.calls.borrow().last().unwrap(), "rename_path! /a /c");
+    assert_eq!(kernel.recv(&mut Msg::new()).err().unwrap().code(), KError::WouldBlock, "one answer each");
+}
+
+/// A touch stamps the file it names and is never answered, a malformed one too: nothing waits on
+/// either.
+#[test]
+fn a_touch_is_the_volumes_and_is_not_answered() {
+    let vol = Spy::default();
+    let dev = own::<Resource, ReadWrite>(mock::device());
+    let (serve_end, kernel) = pair();
+    let mut s = state(serve_end, dev.as_ref(), None);
+    let mut req = [0u8; 64];
+    let len = encode(&mut req, OP_FILE_TOUCH, 0, 0, &42u64.to_le_bytes(), 0).unwrap();
+    s.forwarded(&vol, &req[..len]);
+    let len = encode(&mut req, OP_FILE_TOUCH, 0, 0, &[1, 2], 0).unwrap();
+    s.forwarded(&vol, &req[..len]);
+    assert_eq!(*vol.calls.borrow(), ["touch 42"]);
+    assert_eq!(kernel.recv(&mut Msg::new()).err().unwrap().code(), KError::WouldBlock);
+}
+
+/// A directory session whose reply does not go is undone, and the resolve answered: the kernel
+/// took nothing, so the lookup would wait for ever.
+#[test]
+fn a_session_whose_reply_did_not_go_is_undone_and_answered() {
+    let vol = Spy::default();
+    let dev = own::<Resource, ReadWrite>(mock::device());
+    let (serve_end, kernel) = pair();
+    let mut s = state(serve_end, dev.as_ref(), None);
+    let open = mock::open_handles();
+    mock::fail_next_send(KError::OutOfMemory.as_i32());
+    s.forwarded(&vol, &resolve(11, 0));
+    let (msg, brought) = take(&kernel);
+    assert_eq!(error_of(&msg), (11, OP_NS_RESOLVE, KError::KernelError.as_i32()));
+    assert!(brought.is_empty());
+    assert!(s.sessions.0.iter().all(Option::is_none), "no session left in a slot");
+    assert_eq!((mock::open_handles(), mock::stray_closes()), (open, 0), "both ends closed, once");
+}
+
 #[test]
 fn a_forget_is_complete_when_the_kernel_has_it() {
     let mut out = Outbox::new();
@@ -221,6 +313,11 @@ fn a_forget_is_complete_when_the_kernel_has_it() {
     let forwarding = own::<Channel, Only>(mock::forwarding());
     assert!(forget(&mut out, forwarding.as_ref(), 43), "the kernel takes it within the call");
     assert_eq!(mock::stray_closes(), 0, "and no wait on handle 0 follows");
+
+    mock::answer_next_send(KError::InvalidArgument.as_i32());
+    assert!(!forget(&mut out, forwarding.as_ref(), 45), "a forget refused is not one done");
+    mock::answer_next_send(KError::InvalidArgument.as_i32());
+    assert!(!forget(&mut out, serve_end.as_ref(), 46));
 
     drop(kernel);
     assert!(!forget(&mut out, serve_end.as_ref(), 44), "a kernel that is gone has not forgotten");

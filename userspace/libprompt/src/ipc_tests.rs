@@ -74,6 +74,19 @@ fn a_message_that_does_not_fit_is_refused_and_keeps_its_handles() {
     assert!(is_open(c) && receive(&b).unwrap().is_none(), "nothing sent, nothing lost");
 }
 
+/// More handles than a message carries is refused before the kernel, every one still the caller's.
+#[test]
+fn a_send_of_more_handles_than_a_message_carries_keeps_them_all() {
+    let (a, b) = pair();
+    let ends: Vec<_> = (0..=libkern::IPC_HANDLE_MAX).map(|_| End::pair(2).unwrap()).collect();
+    let raw: Vec<u64> = ends.iter().map(|(c, _)| c.raw().0).collect();
+    assert!(!send(a.raw().0, 1, 1, b"", &raw));
+    assert!(raw.iter().all(|&h| is_open(h)), "none closed by the shim");
+    assert_eq!(b.recv(&mut WireMsg::new()).err().unwrap().code(), libkern::KError::WouldBlock, "and none sent");
+    drop(ends);
+    assert_eq!(mock::stray_closes(), 0);
+}
+
 #[test]
 fn a_send_moves_its_handles_and_a_refused_one_hands_them_back() {
     let (a, b) = pair();

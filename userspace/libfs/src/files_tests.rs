@@ -165,6 +165,22 @@ fn a_copy_resolves_its_destination_at_most_twice() {
     assert_eq!(n, 2, "a write looks once and shrinks, and does not look again");
 }
 
+/// A shrink the server did not make fails the copy or the write, which would keep the old tail.
+#[test]
+fn a_shrink_that_did_not_happen_is_refused() {
+    let ns = fresh();
+    put(&ns, "/src", b"short");
+    for writes in [false, true] {
+        put(&ns, "/dst", b"a destination longer than its source");
+        mock::ignore_next_truncate();
+        let (r, leaked) = leaks(|| match writes {
+            false => copy(&ns, "/src", "/dst", true).map(|_| ()),
+            true => write(&ns, "/dst", b"ab"),
+        });
+        assert_eq!((r, leaked), (Err(FileError::TruncateFailed), false), "writes: {writes}");
+    }
+}
+
 #[test]
 fn nothing_is_left_open_or_mapped() {
     let ns = fresh();
@@ -299,4 +315,17 @@ fn a_raw_lookup_gives_a_handle_the_caller_closes() {
     let (status, h) = lookup_wait(raw, b"/none", Rights::MAP_READ.bits());
     assert_eq!((status, h), (libkern::error::KError::NotFound.as_i32(), 0));
     assert_eq!(mock::open_handles(), open, "a refusal leaves nothing open");
+}
+
+/// A server's table, as `librsproto::server` hands it on, is a file this crate can read.
+#[test]
+fn a_served_table_reads_back() {
+    use libos::{Channel, Memory, Msg, Only};
+    let ns = fresh();
+    let (ours, peer) = Handle::<Channel, Only>::pair(2).unwrap();
+    assert!(librsproto::server::reply_object(&ours, 1, b"a table"));
+    let table: Handle<Memory, libos::MapRead> = peer.recv(&mut Msg::new()).unwrap().take(0).unwrap();
+    ns.bind("/t", &table).unwrap();
+    assert_eq!(file_len(&ns, "/t"), Some(4096));
+    assert_eq!(unpadded(&get(&ns, "/t")), b"a table");
 }

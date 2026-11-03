@@ -353,7 +353,8 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
     })
 }
 
-/// Publish `user` at `/session/user` in `ns`, as a memory object. Non-fatal.
+/// Publish `user` at `/session/user` in `ns`, as a read-only memory object: a session's processes
+/// read who it is for, and none may rewrite it. Non-fatal.
 fn bind_session_user(ns: &Handle<Namespace, NsMutable>, user: &[u8]) {
     let Ok(mem) = Handle::<Memory, MapReadWrite>::create(4096) else {
         log::write(b"libsession: /session/user create FAIL\n");
@@ -368,7 +369,10 @@ fn bind_session_user(ns: &Handle<Namespace, NsMutable>, user: &[u8]) {
         log::write(b"libsession: /session/user map FAIL\n");
         return;
     }
-    if ns.bind("/session/user", &mem).is_err() {
+    // A reader's rights, and the `TRANSFER` a direct bind needs.
+    let snapshot =
+        mem.duplicate(Rights::MAP_READ | Rights::INSPECT | Rights::TRANSFER).and_then(Handle::into_read_only);
+    if snapshot.and_then(|s| ns.bind("/session/user", &s)).is_err() {
         log::write(b"libsession: /session/user bind FAIL (whoami will report no identity)\n");
     }
 }

@@ -35,6 +35,34 @@ fn lead(w: &World, program: &str, syscaps: SysCaps, extras: &[Option<Ref<'_, Cha
     run_leader(lookup_only(&w.root), &w.session, &w.notif, program, &["/home/alice"], syscaps, extras)
 }
 
+/// **An extra that cannot be passed on leaves an empty message in its place**, as a missing one
+/// does, so each later extra keeps its slot: a duplicate refused, or a send refused, which leaves
+/// the duplicate to close.
+#[test]
+fn an_extra_that_cannot_go_leaves_an_empty_message_in_its_place() {
+    mock::reset();
+    let (setup, leader) = Handle::<Channel, Only>::pair(4).unwrap();
+    let (extra, _peer) = Handle::<Channel, Only>::pair(4).unwrap();
+    // SAFETY: a handle the mock has just made for the test, which nothing else holds.
+    let fixed: Handle<Channel, Only> =
+        unsafe { Handle::from_raw(RawHandle(mock::with_rights(extra.raw().0, Rights::TRANSFER)), Rights::empty()) };
+    let open = mock::open_handles();
+    send_extra(setup.as_ref(), Some(fixed.as_ref()));
+    mock::fail_next_send(libkern::KError::OutOfMemory.as_i32());
+    send_extra(setup.as_ref(), Some(extra.as_ref()));
+    for _ in 0..2 {
+        assert!(leader.recv(&mut Msg::new()).unwrap().is_empty(), "an empty message for each");
+    }
+    assert!(leader.recv(&mut Msg::new()).is_err(), "and nothing more");
+    assert_eq!((mock::open_handles(), mock::stray_closes()), (open, 0), "the duplicate that did not go, closed");
+    assert_eq!(
+        mock::logged(),
+        b"libsession: could not duplicate the leader's extra handle\n\
+          libsession: an endpoint the leader expects is absent (placeholder sent)\n\
+          libsession: the leader's extra handle was not delivered\n"
+    );
+}
+
 /// The leader is spawned into the session namespace with the setup channel as its one moved
 /// grant, the caps it was given and the bootstrap descriptor that says a setup is pending.
 #[test]

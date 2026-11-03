@@ -28,7 +28,7 @@ pub fn authenticate_on<'a>(
     let mut body = Secret::<512>::zeroed();
     let n = build_authenticate_request(&mut body, user, pass)?;
     let mut msg = Scrubbed(Msg::new());
-    let reply = call(auth_ch.into(), OP_AUTHENTICATE, &body[..n], &mut msg.0)?;
+    let reply = call(auth_ch.into(), OP_AUTHENTICATE, &body[..n], &mut msg)?;
     home_of(reply, home_out)
 }
 
@@ -51,16 +51,17 @@ pub(crate) fn home_of(reply: &[u8], home_out: &mut [u8]) -> Option<usize> {
 /// The request id of the next [`call`], so one left unanswered never answers a later one.
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
-/// One request on `ch`, its own id, through `msg`: the reply's rsproto payload.
-fn call<'m>(ch: Ref<'_, Channel, Only>, op: u16, body: &[u8], msg: &'m mut Msg) -> Option<&'m [u8]> {
+/// One request on `ch`, its own id, through `msg`: the reply's rsproto payload. A [`Scrubbed`]
+/// message, so a request that carries a password cannot be sent through one that is not.
+fn call<'m>(ch: Ref<'_, Channel, Only>, op: u16, body: &[u8], msg: &'m mut Scrubbed) -> Option<&'m [u8]> {
     let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
-    let n = librsproto::session::exchange(ch, msg, id, op, body).ok()?;
-    Some(&msg.payload()[..n])
+    let n = librsproto::session::exchange(ch, &mut msg.0, id, op, body).ok()?;
+    Some(&msg.0.payload()[..n])
 }
 
 /// One request to the view broker on `ch`: `None` if it failed, was refused or will not fit `out`.
 fn views_call(ch: Ref<'_, Channel, Only>, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut msg = Msg::new();
+    let mut msg = Scrubbed(Msg::new());
     let m = decode(call(ch, op, body, &mut msg)?).ok().filter(|m| !m.is_error())?;
     out.get_mut(..m.body.len())?.copy_from_slice(m.body);
     Some(m.body.len())

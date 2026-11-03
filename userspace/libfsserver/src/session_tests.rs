@@ -7,17 +7,20 @@ use librsproto::error::parse_error;
 use librsproto::file::{name_request, parse_read_dir_reply, read_dir_request, rename_request};
 use librsproto::{RS_MAX_BODY, decode};
 use std::cell::RefCell;
-use std::string::String;
+use std::string::{String, ToString};
 use std::vec::Vec;
 
 /// What a session asked of the volume, each call as a line.
 #[derive(Default)]
 pub(crate) struct Spy {
     pub(crate) calls: RefCell<Vec<String>>,
-    orphan: Option<u64>,
+    /// The id an unlink, or a rename over a file, leaves without a name.
+    pub(crate) orphan: Option<u64>,
     entries: usize,
     /// Whether every path is a file of five bytes, rather than a directory.
     pub(crate) file: bool,
+    /// Whether a rename by path succeeds, rather than finding nothing.
+    pub(crate) renames: bool,
 }
 
 pub(crate) struct Never;
@@ -120,10 +123,12 @@ impl Volume for Spy {
         self.log("rename", &[old, b" ", new].concat());
         Ok(())
     }
-    fn rename_path(&self, _: &[u8], _: &[u8], _: bool, _: i64) -> Result<Option<u64>, FsError> {
-        Err(FsError::NotFound)
+    fn rename_path(&self, from: &[u8], to: &[u8], replace: bool, _: i64) -> Result<Option<u64>, FsError> {
+        self.log(if replace { "rename_path!" } else { "rename_path" }, &[from, b" ", to].concat());
+        if self.renames { Ok(self.orphan) } else { Err(FsError::NotFound) }
     }
-    fn touch_file(&self, _: u64, _: i64) -> Result<(), FsError> {
+    fn touch_file(&self, id: u64, _: i64) -> Result<(), FsError> {
+        self.log("touch", id.to_string().as_bytes());
         Ok(())
     }
     fn release(&self, _: u64, _: i64) -> Result<(), FsError> {

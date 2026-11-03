@@ -254,6 +254,20 @@ fn the_user_is_published_nul_ended() {
     assert_eq!((long[254], long[255], long[256]), (b'a', 0, 0), "255 bytes and the terminator");
 }
 
+/// **No process in the session can rewrite who it is for**: `/session/user` resolves for reading
+/// and stating, and not for writing.
+#[test]
+fn the_published_user_cannot_be_rewritten() {
+    mock::reset();
+    let built = build_namespace(&Members { user: b"alice", ..bare() }).unwrap();
+    let rw: Handle<Memory, MapReadWrite> =
+        crate::resolve(built.ns.as_ref(), "/session/user", Rights::MAP_READ | Rights::MAP_WRITE).unwrap();
+    assert_eq!(rw.map(4096).err().map(|e| e.code()), Some(KError::NoAccess));
+    let ro: Handle<Memory, MapRead> =
+        crate::resolve(built.ns.as_ref(), "/session/user", Rights::MAP_READ | Rights::INSPECT).unwrap();
+    assert_eq!(ro.stat().map(|s| s.size).ok(), Some(4096), "a reader sizes it");
+}
+
 /// Everything the build opened on the way is closed, and the namespace is the caller's alone.
 #[test]
 fn a_build_leaves_only_its_namespace_open() {

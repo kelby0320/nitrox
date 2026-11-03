@@ -99,13 +99,15 @@ pub fn reply_object<'e>(ch: impl Into<Ref<'e, Channel, Only>>, request_id: u64, 
     }
 }
 
-/// `bytes` in a fresh memory object that can only be mapped for reading and moved. It is filled
-/// through a mapping that is gone before this returns: one left would pin every object served.
+/// `bytes` in a fresh memory object that can only be mapped for reading, stated and moved: a
+/// reader sizes a file by its stat. It is filled through a mapping that is gone before this
+/// returns: one left would pin every object served.
 fn content_object(bytes: &[u8]) -> Result<Handle<Memory, MapRead>, KError> {
     let size = bytes.len().max(1).div_ceil(PAGE) * PAGE;
     let mem = Handle::<Memory, MapReadWrite>::create(size).map_err(|_| KError::OutOfMemory)?;
     mem.map(size).and_then(|mut view| view.write_from(0, bytes)).map_err(|_| KError::OutOfMemory)?;
-    mem.duplicate(Rights::MAP_READ | Rights::TRANSFER).and_then(Handle::into_read_only).map_err(|_| KError::KernelError)
+    let rights = Rights::MAP_READ | Rights::INSPECT | Rights::TRANSFER;
+    mem.duplicate(rights).and_then(Handle::into_read_only).map_err(|_| KError::KernelError)
 }
 
 fn resolved(kind: u16, content_len: u32) -> [u8; RESOLVE_REPLY_LEN] {
@@ -347,7 +349,7 @@ mod tests {
         mem.map(bytes.len()).unwrap().read_into(0, &mut back).unwrap();
         assert_eq!(back, bytes);
         assert_eq!(code(mem.duplicate(Rights::MAP_READ)), Some(KError::NoAccess), "no duplicate");
-        assert_eq!(code(mem.stat()), Some(KError::NoAccess), "and no stat");
+        assert_eq!(mem.stat().map(|s| s.size).ok(), Some(8192), "a stat, for its size");
         let (onward, far) = Handle::<Channel, Only>::pair(2).unwrap();
         let mut carried = Carried::new();
         carried.push(mem).ok().unwrap();
@@ -427,6 +429,23 @@ mod tests {
         assert!(reply_subnamespace(&ch, 6, ns.as_ref(), 65_535, b"/"), "the largest consumed is allowed");
         assert_eq!(read(&peer).flags, RS_FLAG_REPLY);
         assert_eq!(mock::open_handles(), open, "no duplicate made for a refusal");
+    }
+
+    /// A namespace the server cannot pass on is answered, not left for the lookup to wait on.
+    #[test]
+    fn reply_subnamespace_of_a_namespace_it_cannot_duplicate_answers_an_error() {
+        let (ch, peer) = pair();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        // SAFETY: a handle the mock has just made for the test, which nothing else holds.
+        let held: Handle<Namespace, NsMutable> = unsafe {
+            Handle::from_raw(libkern::RawHandle(mock::with_rights(ns.raw().0, Rights::LOOKUP)), Rights::empty())
+        };
+        let open = mock::open_handles();
+        assert!(reply_subnamespace(&ch, 7, held.as_ref(), 1, b"/"));
+        let got = read(&peer);
+        assert_eq!((got.request_id, got.flags, got.handle_count), (7, ERR, 0));
+        assert_eq!(parse_error(&got.body).unwrap().kerror, KError::KernelError.as_i32());
+        assert_eq!(mock::open_handles(), open);
     }
 
     /// `n` entries named to fill several pages.
