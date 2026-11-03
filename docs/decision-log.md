@@ -37475,8 +37475,8 @@ The maintainer's calls:
 - **The order: libos and every crate on it, then Part J, then the surface.** The detail pass was to
   say which of Parts E and J comes first, and neither does. P1's 196 sites hardly overlap what this
   part rewrites, about 11, so reach settled nothing. What did is that callers should move once: with
-  every crate on libos, a surface change is one crate's, and the userspace half needs nothing from
-  Part J. The surface's new kernel code is its most delicate, threads holding files and buffers and
+  every crate on libos, a call that changes shape is one crate's change, and the userspace half
+  needs nothing from Part J. The surface's new kernel code is its most delicate, threads holding files and buffers and
   copying between frames, which is what P1 and P2 are for.
 - **One authority model, a handle.** `clock_set` and `power` become `Write`s to kernel char nodes,
   as a keyboard's lights are, `SYSTEM_CLOCK` and `SystemControl` go, and the two privileged
@@ -37491,9 +37491,25 @@ The maintainer's calls:
 
 Decided in the pass, for the maintainer's eye:
 
-- **What blocks runs on a kernel thread of its own, an operation each**, so a stick that has stopped
-  answering holds up no other flush, as one worker's queue would.
+- **What blocks runs on a kernel thread of its own, an operation each, under a budget per mount**,
+  so a stick that has stopped answering holds up no other mount's flush, as one worker's queue or
+  one cap would.
 - **Entropy gains a binding in every namespace.** It is ambient today, and as a node it would need
   one, or Phase 7's `HashMap` would fail in a sandbox. It grants what every process has now.
 - **`release_initramfs` and `exception_extend_timeout` leave the design**, having no consumer. The
   ring stays in it, wanting a measurement, and `device_map_mmio` waits on Phase 8.
+
+And after its review, which found the plan's gaps and no fault in its order:
+
+- **A kernel copy fetches nothing from a device.** kmem-28 serves an anonymous page and a resident
+  file page. A file page not resident still fails at once, as fetching it would stop a thread
+  inside a syscall with no `PendingOperation`, and the rule outranks the finding.
+- **On a file, `Flush` keeps `file_sync`'s meaning**: on the device, and not out of its cache, which
+  stays the device's own `Flush`.
+- **A `Write` over a hole is refused**, as write-back skips such a page and answers `Written`.
+- **`IO_NOCACHE` is a hint.** Its pages go only if nothing maps the object, no other op holds its
+  frames, the write-back succeeded and no `Write` began since.
+- **A launch costs one more copy of its image**, the price of a spawn that cannot stop on a device.
+- **`copy-limit` becomes 4 GiB**, a file's size being a `u32` on the wire.
+- **The clock is sendable once it is a binding**, as a disk is, where a syscap was not. That is the
+  cost of one authority model.
