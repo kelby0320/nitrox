@@ -21,7 +21,6 @@
 "userspace/libfsserver" = 36
 "userspace/libheap" = 5
 "userspace/libprompt" = 4
-"userspace/librsproto" = 11
 "userspace/libsession" = 59
 "userspace/libstream" = 12
 "userspace/libsurface" = 14
