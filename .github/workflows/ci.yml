@@ -14,7 +14,7 @@ concurrency:
 jobs:
   build-and-test:
     name: Build kernel + host tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       # The whole history: check-comments diffs the branch from its merge base with main.
@@ -163,7 +163,7 @@ jobs:
   # minutes before the first boot). Balanced by the durations each gate prints.
   integration:
     name: QEMU integration (${{ matrix.group }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -183,7 +183,7 @@ jobs:
       #
       # The boot runs under **KVM**, not TCG, and that is a requirement rather than an
       # optimisation: the kernel is x2APIC-only (decision log, 2026-06-26) and QEMU's
-      # TCG only emulates x2APIC from 9.0, while ubuntu-latest ships 8.2 — under TCG
+      # TCG only emulates x2APIC from 9.0, while ubuntu-24.04 ships 8.2 — under TCG
       # the guest panics with "CPU lacks x2APIC". KVM's in-kernel APIC has no such
       # limit, and it is also several times faster. `xtask test-qemu --kvm` preflights
       # /dev/kvm and fails with that explanation if it is missing.
