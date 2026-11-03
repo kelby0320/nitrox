@@ -2293,6 +2293,16 @@ call, 2026-11-03). A shim's `u64` is its caller's claim, as it always was: borro
 `unsafe` it adds. Trigger: a shim's last caller moving onto libos, and E.5 at the latest, by when
 none is left.
 
+**A resource-server reply's field offsets are literals on both sides — `TODO(rsproto-offsets)`.**
+`abi-sync-check` holds the kernel's rsproto constants to `librsproto`'s (the safety survey's
+proto-o6), and `put_block_run` writes a block run at the offsets the kernel reads, pinned by bytes.
+The fields around it are written at literal offsets by `librsproto` and read at literal offsets by
+the kernel: a `FILE_BLOCKS` reply's block size, run count, file id and flags at 8, 12, 16 and 24, a
+`SUBNAMESPACE` reply's `consumed` and base length at 8 and 10, and a `ResolveReply`'s `content_len`
+at 4. The check compares named values, so naming each on both sides would let it hold them. Part
+E.7 of [`syscall-surface.md`](../planning/syscall-surface.md) rewrites the resolve and its replies,
+and names them there rather than now and again then. Trigger: E.7.
+
 **A thread's stack has no guard below it — `TODO(thread-stack-guard)`.** `libos::thread::Stack`
 is a mapping of its own, but a mapping placed without a hint lies flush against the one below, so
 a thread that overruns its stack writes into that mapping rather than faulting. The main thread's
@@ -2479,10 +2489,10 @@ survive rather than merely diagnose.
 
 ~~**`libkern` mock-syscall test mode.**~~ **Built 2026-11-03, in libos rather than libkern**
 (pre-Phase-7 Part E.2): libos's `sys` seam selects a model of the kernel under its own tests, and
-under its `mock` feature in a test build, so a crate above it takes the model as a dev-dependency and
-its paths through libos run in host tests. It answers as the kernel does rather than replaying a
-record (`docs/architecture/libos.md` § *The host-test syscall seam*). A crate that calls `libkern`
-directly still has none, which the move onto libos ends.
+under its `mock` feature in a test build, so a crate above it takes the model as a dev-dependency
+and its paths through libos run in host tests. It answers as the kernel does rather than replaying
+a record (`docs/architecture/libos.md` § *The host-test syscall seam*). A crate that calls
+`libkern` directly still has none, which the move onto libos ends.
 
 ### Auditing and observability
 

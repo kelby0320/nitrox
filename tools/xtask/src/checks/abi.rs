@@ -125,6 +125,8 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U64Const,
         one_sided: &[],
     },
+    // TODO(rsproto-offsets): the reply bodies' field offsets are literals on both sides, which a
+    // family cannot compare.
     // The resource-server protocol. The kernel keeps its copy in one file; `librsproto` spreads
     // the same names over four. The comparison runs from the kernel's names: a name the kernel
     // reads that `librsproto` lacks or has changed is the drift that matters, while the many
@@ -163,8 +165,23 @@ const ABI_PAIRS: &[(&str, &str, &str, &str)] = &[
     ("kernel/src/object/namespace.rs", "NS_SUBTREE_BASE_MAX", "userspace/libusers/src/lib.rs", "HOME_MAX"),
 ];
 
-fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
-    let mut out = BTreeMap::new();
+/// What a file declares in one shape: each value read, and each name whose value was not.
+#[derive(Debug, Default)]
+struct Consts {
+    read: BTreeMap<String, i128>,
+    /// Names whose value is neither an integer nor another constant's name, which nothing compares.
+    unread: Vec<String>,
+}
+
+fn extract_consts(text: &str, shape: AbiShape) -> Consts {
+    let mut out = Consts::default();
+    let mut take = |name: &str, val: &str| match parse_int(val) {
+        Some(v) => {
+            out.read.insert(name.to_string(), v);
+        }
+        None if !is_alias(val) => out.unread.push(name.to_string()),
+        None => {}
+    };
     for line in text.lines() {
         let t = line.trim();
         if t.starts_with("//") {
@@ -178,9 +195,7 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 if ty.trim() != "u64" {
                     continue;
                 }
-                if let Some(v) = parse_int(val) {
-                    out.insert(name.trim().to_string(), v);
-                }
+                take(name.trim(), val);
             }
             AbiShape::U32Const => {
                 let Some(rest) = t.strip_prefix("pub const ") else { continue };
@@ -189,9 +204,7 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 if ty.trim() != "u32" {
                     continue;
                 }
-                if let Some(v) = parse_int(val) {
-                    out.insert(name.trim().to_string(), v);
-                }
+                take(name.trim(), val);
             }
             AbiShape::U16Const => {
                 // pub const NAME: u16 = <int>;  (and the i32 `KEY_*` values alongside them)
@@ -201,9 +214,7 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 if ty.trim() != "u16" && ty.trim() != "i32" {
                     continue;
                 }
-                if let Some(v) = parse_int(val) {
-                    out.insert(name.trim().to_string(), v);
-                }
+                take(name.trim(), val);
             }
             AbiShape::WireConst => {
                 let rest = t.strip_prefix("pub ").unwrap_or(t);
@@ -213,9 +224,7 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 if !matches!(ty.trim(), "u16" | "u32" | "usize") {
                     continue;
                 }
-                if let Some(v) = parse_int(val) {
-                    out.insert(name.trim().to_string(), v);
-                }
+                take(name.trim(), val);
             }
             AbiShape::EnumVariant => {
                 let Some(body) = t.strip_suffix(',') else { continue };
@@ -227,9 +236,7 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 {
                     continue;
                 }
-                if let Some(v) = parse_int(val) {
-                    out.insert(name.to_string(), v);
-                }
+                take(name, val);
             }
             AbiShape::RightsBit => {
                 let Some(rest) = t.strip_prefix("pub const ") else { continue };
@@ -240,7 +247,7 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 let Some((_, shifted)) = tail.split_once("1 <<") else { continue };
                 let digits: String = shifted.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(k) = digits.parse::<u32>() {
-                    out.insert(name.trim().to_string(), 1i128 << k);
+                    take(name.trim(), &format!("1 << {k}"));
                 }
             }
         }
@@ -248,8 +255,20 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
     out
 }
 
+/// The value as written, without its trailing `;` or `,` and any comment after it.
+fn bare(s: &str) -> &str {
+    s.split_once("//").map_or(s, |(v, _)| v).trim().trim_end_matches([';', ',']).trim()
+}
+
+/// Whether the value names another constant, which is compared under its own name.
+fn is_alias(s: &str) -> bool {
+    let t = bare(s);
+    t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
 fn parse_int(s: &str) -> Option<i128> {
-    let t = s.trim().trim_end_matches([';', ',']).trim().replace('_', "");
+    let t = bare(s).replace('_', "");
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         return i128::from_str_radix(hex, 16).ok();
     }
@@ -279,11 +298,17 @@ fn extract_named(text: &str, want: &str) -> Option<i128> {
 /// appending each disagreement to `problems`. Returns how many names agree.
 fn compare_family(fam: &AbiFamily, kernel_text: &str, user_texts: &[&str], problems: &mut Vec<String>) -> usize {
     let user_files = fam.user_files.join(", ");
-    let k = extract_consts(kernel_text, fam.shape);
+    let Consts { read: k, unread } = extract_consts(kernel_text, fam.shape);
+    for name in unread {
+        problems.push(format!(
+            "{}: {} in {} has a value the check cannot read — write it as an integer",
+            fam.what, name, fam.kernel_file
+        ));
+    }
     // A name two user files give different values would compare against whichever came last.
     let mut u = BTreeMap::new();
     for (file, ut) in fam.user_files.iter().zip(user_texts) {
-        for (name, v) in extract_consts(ut, fam.shape) {
+        for (name, v) in extract_consts(ut, fam.shape).read {
             if let Some((was, other)) = u.insert(name.clone(), (v, *file))
                 && was != v
             {
@@ -392,7 +417,7 @@ fn check_kerror_decode_table(root: &Path) -> Result<usize, Vec<String>> {
     let kt = read(KERNEL)?;
     let ut = read(USER)?;
 
-    let kernel = extract_consts(&kt, AbiShape::EnumVariant);
+    let kernel = extract_consts(&kt, AbiShape::EnumVariant).read;
     if kernel.is_empty() {
         return Err(vec![format!(
             "KError decode: extracted no variants from {KERNEL} — the checker's pattern has \
@@ -470,11 +495,30 @@ mod tests {
         let text = "const A: u32 = 0x5253_4D47;\npub const B: u16 = 7;\n    const C: usize = 24;\n\
                     pub const D: u32 = 1 << 2;\nconst E: u16 = OP_A;\nconst F: u64 = 3;\n// const G: u16 = 1;\n";
         let got = extract_consts(text, AbiShape::WireConst);
-        assert_eq!(got.get("A"), Some(&0x5253_4D47));
-        assert_eq!(got.get("B"), Some(&7));
-        assert_eq!(got.get("C"), Some(&24));
-        assert_eq!(got.get("D"), Some(&4));
-        assert_eq!(got.len(), 4, "an alias, a u64 and a comment are not read: {got:?}");
+        assert_eq!(got.read.get("A"), Some(&0x5253_4D47));
+        assert_eq!(got.read.get("B"), Some(&7));
+        assert_eq!(got.read.get("C"), Some(&24));
+        assert_eq!(got.read.get("D"), Some(&4));
+        assert_eq!(got.read.len(), 4, "an alias, a u64 and a comment are not read: {got:?}");
+        assert!(got.unread.is_empty(), "{got:?}");
+    }
+
+    /// A kernel value the check cannot read is named, never left out of the comparison: a comment
+    /// after it is read past, and an expression or a cast is a finding.
+    #[test]
+    fn a_kernel_value_the_check_cannot_read_is_a_finding() {
+        let user = ["pub const A: u32 = 64;\npub const B: u16 = 3;\n", ""];
+        let mut problems = Vec::new();
+        compare_family(&family(&[]), "const A: u32 = 1 << 6; // moved\nconst B: u16 = 3;\n", &user, &mut problems);
+        assert!(problems.is_empty(), "{problems:?}");
+        compare_family(&family(&[]), "const A: u32 = 1 << 7; // moved\nconst B: u16 = 3;\n", &user, &mut problems);
+        assert_eq!(problems.len(), 1, "the value past the comment is compared: {problems:?}");
+        for kernel in ["const A: u32 = (1 << 6) | 0;\n", "const A: u32 = 64 as u32;\n"] {
+            let mut problems = Vec::new();
+            compare_family(&family(&[]), &[kernel, "const B: u16 = 3;\n"].concat(), &user, &mut problems);
+            assert_eq!(problems.len(), 1, "{kernel}");
+            assert!(problems[0].contains("A in k.rs has a value the check cannot read"), "{problems:?}");
+        }
     }
 
     #[test]
