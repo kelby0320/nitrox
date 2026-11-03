@@ -17,7 +17,6 @@
 "userspace/init" = 99
 "userspace/input-server" = 56
 "userspace/libheap" = 5
-"userspace/libsession" = 59
 "userspace/logging-service" = 10
 "userspace/nxedit" = 61
 "userspace/nxfiles" = 61
