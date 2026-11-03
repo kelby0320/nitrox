@@ -64,9 +64,7 @@ Application                              ← user code
   ↓
 libviews                                 ← the view broker's client (asking to run in a view)
   ↓
-libprompt                                ← asking a person on a terminal; the scrubbing plumbing
-  ↓
-libfs                                    ← whole-file + path helpers (no protocol of its own)
+libprompt  libfs                         ← asking a person on a terminal; whole-file + path helpers
   ↓
 libstream  librsproto                    ← typed I/O, RS protocol
   ↓
@@ -93,7 +91,8 @@ it too. `with`, `account` and `desktop-shell` use it. It owns no wire format —
 their program was handed — a line, a password, a new password twice — was `coreutils::prompt`
 until `nxinstall`, which is not a coreutil and never talks to the broker, needed it for the first
 account. The channel plumbing a password crosses, scrubbed after every send, moved with it from
-`libviews`, which speaks through it; it sits above `libfs`, whose `lookup_wait` its `lookup` uses.
+`libviews`, which speaks through it. It sits beside `libfs` rather than above it since pre-Phase-7
+Part E.2, when its lookup moved onto libos.
 **Which question to ask, and when, stays with each caller**; how a question is put to a terminal is
 `libprompt`'s.
 

@@ -19,7 +19,6 @@
 "userspace/libfs" = 32
 "userspace/libfsserver" = 36
 "userspace/libheap" = 5
-"userspace/libprompt" = 4
 "userspace/libsession" = 59
 "userspace/libsurface" = 14
 "userspace/logging-service" = 10
