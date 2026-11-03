@@ -12,7 +12,9 @@ struct AbiFamily {
     /// Human name for the report.
     what: &'static str,
     kernel_file: &'static str,
-    user_file: &'static str,
+    /// The user-side files, whose constants are merged: one kernel file may mirror names that
+    /// the user side keeps in several.
+    user_files: &'static [&'static str],
     /// Which line shape to extract. See [`extract_consts`].
     shape: AbiShape,
     /// Names legitimately present on **one** side only, each with the reason. An
@@ -33,6 +35,10 @@ enum AbiShape {
     U16Const,
     /// `pub const NAME: u32 = <int>;` — the device registry's constants.
     U32Const,
+    /// `const NAME: u16|u32|usize = <int>;` or `<int> << <int>`, with or without `pub` — the
+    /// resource-server protocol's constants. A value naming another constant is an alias and is
+    /// not read.
+    WireConst,
 }
 
 /// The ABI surfaces `userspace/libkern` mirrors by hand, and therefore the ones that can
@@ -42,35 +48,35 @@ const ABI_FAMILIES: &[AbiFamily] = &[
     AbiFamily {
         what: "syscall numbers",
         kernel_file: "kernel/src/syscall/table.rs",
-        user_file: "userspace/libkern/src/syscall.rs",
+        user_files: &["userspace/libkern/src/syscall.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[("SYS_TEST_EXIT", "kernel test-harness builds only; userspace mirrors it for the harness")],
     },
     AbiFamily {
         what: "KError discriminants",
         kernel_file: "kernel/src/syscall/error.rs",
-        user_file: "userspace/libkern/src/error.rs",
+        user_files: &["userspace/libkern/src/error.rs"],
         shape: AbiShape::EnumVariant,
         one_sided: &[],
     },
     AbiFamily {
         what: "Rights bits",
         kernel_file: "kernel/src/libkern/handle.rs",
-        user_file: "userspace/libkern/src/handle.rs",
+        user_files: &["userspace/libkern/src/handle.rs"],
         shape: AbiShape::RightsBit,
         one_sided: &[],
     },
     AbiFamily {
         what: "input event classes and codes",
         kernel_file: "kernel/src/libkern/input.rs",
-        user_file: "userspace/libkern/src/abi.rs",
+        user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U16Const,
         one_sided: &[],
     },
     AbiFamily {
         what: "KObjectType discriminants",
         kernel_file: "kernel/src/libkern/handle.rs",
-        user_file: "userspace/libkern/src/handle.rs",
+        user_files: &["userspace/libkern/src/handle.rs"],
         shape: AbiShape::EnumVariant,
         one_sided: &[],
     },
@@ -79,14 +85,14 @@ const ABI_FAMILIES: &[AbiFamily] = &[
     AbiFamily {
         what: "device registry kinds",
         kernel_file: "kernel/src/libkern/device.rs",
-        user_file: "userspace/libkern/src/device.rs",
+        user_files: &["userspace/libkern/src/device.rs"],
         shape: AbiShape::EnumVariant,
         one_sided: &[],
     },
     AbiFamily {
         what: "device registry constants",
         kernel_file: "kernel/src/libkern/device.rs",
-        user_file: "userspace/libkern/src/device.rs",
+        user_files: &["userspace/libkern/src/device.rs"],
         shape: AbiShape::U32Const,
         one_sided: &[],
     },
@@ -96,7 +102,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
     AbiFamily {
         what: "I/O opcodes",
         kernel_file: "kernel/src/libkern/io_op.rs",
-        user_file: "userspace/libkern/src/abi.rs",
+        user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U32Const,
         one_sided: &[],
     },
@@ -105,7 +111,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
     AbiFamily {
         what: "power operations",
         kernel_file: "kernel/src/libkern/power.rs",
-        user_file: "userspace/libkern/src/syscall.rs",
+        user_files: &["userspace/libkern/src/syscall.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[],
     },
@@ -115,9 +121,32 @@ const ABI_FAMILIES: &[AbiFamily] = &[
     AbiFamily {
         what: "clock-set results",
         kernel_file: "kernel/src/libkern/clock.rs",
-        user_file: "userspace/libkern/src/abi.rs",
+        user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[],
+    },
+    // The resource-server protocol. The kernel keeps its copy in one file; `librsproto` spreads
+    // the same names over four. The comparison runs from the kernel's names: a name the kernel
+    // reads that `librsproto` lacks or has changed is the drift that matters, while the many
+    // names only `librsproto` uses are not the kernel's to mirror.
+    AbiFamily {
+        what: "resource-server protocol constants",
+        kernel_file: "kernel/src/rsproto.rs",
+        user_files: &[
+            "userspace/librsproto/src/lib.rs",
+            "userspace/librsproto/src/namespace.rs",
+            "userspace/librsproto/src/file.rs",
+            "userspace/librsproto/src/error.rs",
+        ],
+        shape: AbiShape::WireConst,
+        one_sided: &[
+            (
+                "REQUEST_ID_OFFSET",
+                "the kernel stamps the request id itself; librsproto's encoder writes it at a fixed offset",
+            ),
+            ("FORGET_LEN", "librsproto names it FORGET_REQUEST_LEN; paired in ABI_PAIRS"),
+            ("TOUCH_BY_ID_LEN", "librsproto names it TOUCH_REQUEST_LEN; paired in ABI_PAIRS"),
+        ],
     },
 ];
 
@@ -129,6 +158,8 @@ const ABI_PAIRS: &[(&str, &str, &str, &str)] = &[
     ("kernel/src/object/thread.rs", "MAX_WAIT_HANDLES", "userspace/libkern/src/abi.rs", "MAX_WAIT_HANDLES"),
     ("kernel/src/libkern/ipc.rs", "IPC_HANDLE_MAX", "userspace/libkern/src/abi.rs", "IPC_HANDLE_MAX"),
     ("kernel/src/libkern/ipc.rs", "IPC_MAX_QUEUE_DEPTH", "userspace/libkern/src/abi.rs", "IPC_MAX_QUEUE_DEPTH"),
+    ("kernel/src/rsproto.rs", "FORGET_LEN", "userspace/librsproto/src/file.rs", "FORGET_REQUEST_LEN"),
+    ("kernel/src/rsproto.rs", "TOUCH_BY_ID_LEN", "userspace/librsproto/src/file.rs", "TOUCH_REQUEST_LEN"),
     ("kernel/src/object/namespace.rs", "NS_SUBTREE_BASE_MAX", "userspace/libusers/src/lib.rs", "HOME_MAX"),
 ];
 
@@ -174,6 +205,18 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                     out.insert(name.trim().to_string(), v);
                 }
             }
+            AbiShape::WireConst => {
+                let rest = t.strip_prefix("pub ").unwrap_or(t);
+                let Some(rest) = rest.strip_prefix("const ") else { continue };
+                let Some((name, tail)) = rest.split_once(':') else { continue };
+                let Some((ty, val)) = tail.split_once('=') else { continue };
+                if !matches!(ty.trim(), "u16" | "u32" | "usize") {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.trim().to_string(), v);
+                }
+            }
             AbiShape::EnumVariant => {
                 let Some(body) = t.strip_suffix(',') else { continue };
                 let Some((name, val)) = body.split_once('=') else { continue };
@@ -210,13 +253,18 @@ fn parse_int(s: &str) -> Option<i128> {
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         return i128::from_str_radix(hex, 16).ok();
     }
+    if let Some((base, shift)) = t.split_once("<<") {
+        let (base, shift) = (base.trim().parse::<i128>().ok()?, shift.trim().parse::<u32>().ok()?);
+        return base.checked_shl(shift);
+    }
     t.parse::<i128>().ok()
 }
 
 fn extract_named(text: &str, want: &str) -> Option<i128> {
     for line in text.lines() {
         let t = line.trim();
-        let Some(rest) = t.strip_prefix("pub const ") else { continue };
+        let rest = t.strip_prefix("pub ").unwrap_or(t);
+        let Some(rest) = rest.strip_prefix("const ") else { continue };
         let Some((name, tail)) = rest.split_once(':') else { continue };
         if name.trim() != want {
             continue;
@@ -225,6 +273,51 @@ fn extract_named(text: &str, want: &str) -> Option<i128> {
         return parse_int(val);
     }
     None
+}
+
+/// Compare one family's kernel text with its user texts (one per entry of `user_files`),
+/// appending each disagreement to `problems`. Returns how many names agree.
+fn compare_family(fam: &AbiFamily, kernel_text: &str, user_texts: &[&str], problems: &mut Vec<String>) -> usize {
+    let user_files = fam.user_files.join(", ");
+    let k = extract_consts(kernel_text, fam.shape);
+    // A name two user files give different values would compare against whichever came last.
+    let mut u = BTreeMap::new();
+    for (file, ut) in fam.user_files.iter().zip(user_texts) {
+        for (name, v) in extract_consts(ut, fam.shape) {
+            if let Some((was, other)) = u.insert(name.clone(), (v, *file))
+                && was != v
+            {
+                problems.push(format!("{}: {} is {} in {} but {} in {}", fam.what, name, was, other, v, file));
+            }
+        }
+    }
+    if k.is_empty() {
+        problems.push(format!(
+            "{}: extracted nothing from {} — the checker's pattern has gone stale, \
+             which silently disables this family",
+            fam.what, fam.kernel_file
+        ));
+        return 0;
+    }
+    let mut compared = 0;
+    for (name, kv) in &k {
+        match u.get(name) {
+            Some((uv, _)) if uv == kv => compared += 1,
+            Some((uv, file)) => {
+                problems.push(format!("{}: {} is {} in {} but {} in {}", fam.what, name, kv, fam.kernel_file, uv, file))
+            }
+            None => {
+                if !fam.one_sided.iter().any(|(n, _)| n == name) {
+                    problems.push(format!(
+                        "{}: {} exists in {} but not in {} — mirror it, or record it in \
+                         the checker's `one_sided` list with a reason",
+                        fam.what, name, fam.kernel_file, user_files
+                    ));
+                }
+            }
+        }
+    }
+    compared
 }
 
 /// `cargo xtask abi-sync-check` — verify `userspace/libkern` still mirrors the kernel ABI.
@@ -241,35 +334,12 @@ pub(crate) fn cmd_abi_sync_check() -> R<()> {
     for fam in ABI_FAMILIES {
         let kt =
             fs::read_to_string(root.join(fam.kernel_file)).map_err(|e| format!("read {}: {e}", fam.kernel_file))?;
-        let ut = fs::read_to_string(root.join(fam.user_file)).map_err(|e| format!("read {}: {e}", fam.user_file))?;
-        let k = extract_consts(&kt, fam.shape);
-        let u = extract_consts(&ut, fam.shape);
-        if k.is_empty() {
-            problems.push(format!(
-                "{}: extracted nothing from {} — the checker's pattern has gone stale, \
-                 which silently disables this family",
-                fam.what, fam.kernel_file
-            ));
-            continue;
+        let mut uts = Vec::new();
+        for f in fam.user_files {
+            uts.push(fs::read_to_string(root.join(f)).map_err(|e| format!("read {f}: {e}"))?);
         }
-        for (name, kv) in &k {
-            match u.get(name) {
-                Some(uv) if uv == kv => compared += 1,
-                Some(uv) => problems.push(format!(
-                    "{}: {} is {} in {} but {} in {}",
-                    fam.what, name, kv, fam.kernel_file, uv, fam.user_file
-                )),
-                None => {
-                    if !fam.one_sided.iter().any(|(n, _)| n == name) {
-                        problems.push(format!(
-                            "{}: {} exists in {} but not in {} — mirror it, or record it in \
-                             the checker's `one_sided` list with a reason",
-                            fam.what, name, fam.kernel_file, fam.user_file
-                        ));
-                    }
-                }
-            }
-        }
+        let user: Vec<&str> = uts.iter().map(String::as_str).collect();
+        compared += compare_family(fam, &kt, &user, &mut problems);
     }
 
     match check_kerror_decode_table(&root) {
@@ -292,7 +362,7 @@ pub(crate) fn cmd_abi_sync_check() -> R<()> {
 
     if !problems.is_empty() {
         let mut msg = String::from(
-            "userspace/libkern must mirror the kernel ABI exactly (docs/spec/syscall-abi.md); \
+            "userspace/libkern and librsproto must mirror the kernel ABI exactly (docs/spec/syscall-abi.md); \
              these disagree:\n",
         );
         for p in &problems {
@@ -302,7 +372,7 @@ pub(crate) fn cmd_abi_sync_check() -> R<()> {
         }
         return Err(msg.into());
     }
-    println!("abi-sync-check: {compared} ABI value(s) agree between the kernel and libkern ✓");
+    println!("abi-sync-check: {compared} ABI value(s) agree between the kernel and userspace ✓");
     Ok(())
 }
 
@@ -379,4 +449,97 @@ fn check_kerror_decode_table(root: &Path) -> Result<usize, Vec<String>> {
         }
     }
     if problems.is_empty() { Ok(kernel.len()) } else { Err(problems) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn family(one_sided: &'static [(&'static str, &'static str)]) -> AbiFamily {
+        AbiFamily {
+            what: "test",
+            kernel_file: "k.rs",
+            user_files: &["a.rs", "b.rs"],
+            shape: AbiShape::WireConst,
+            one_sided,
+        }
+    }
+
+    #[test]
+    fn wire_const_reads_each_integer_form() {
+        let text = "const A: u32 = 0x5253_4D47;\npub const B: u16 = 7;\n    const C: usize = 24;\n\
+                    pub const D: u32 = 1 << 2;\nconst E: u16 = OP_A;\nconst F: u64 = 3;\n// const G: u16 = 1;\n";
+        let got = extract_consts(text, AbiShape::WireConst);
+        assert_eq!(got.get("A"), Some(&0x5253_4D47));
+        assert_eq!(got.get("B"), Some(&7));
+        assert_eq!(got.get("C"), Some(&24));
+        assert_eq!(got.get("D"), Some(&4));
+        assert_eq!(got.len(), 4, "an alias, a u64 and a comment are not read: {got:?}");
+    }
+
+    #[test]
+    fn user_files_are_merged_so_a_name_may_live_in_either() {
+        let fam = family(&[]);
+        let mut problems = Vec::new();
+        let n = compare_family(
+            &fam,
+            "const A: u16 = 1;\nconst B: u16 = 2;\n",
+            &["pub const A: u16 = 1;\n", "pub const B: u16 = 2;\n"],
+            &mut problems,
+        );
+        assert_eq!((n, problems.len()), (2, 0), "{problems:?}");
+    }
+
+    #[test]
+    fn a_value_differing_on_the_user_side_is_named() {
+        let fam = family(&[]);
+        let mut problems = Vec::new();
+        compare_family(&fam, "const A: u16 = 1;\n", &["", "pub const A: u16 = 2;\n"], &mut problems);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains(" A ") && problems[0].ends_with("in b.rs"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_name_two_user_files_disagree_on_is_a_finding_whichever_the_kernel_matches() {
+        for user in [
+            ["pub const A: u16 = 1;\n", "pub const A: u16 = 2;\n"],
+            ["pub const A: u16 = 2;\n", "pub const A: u16 = 1;\n"],
+        ] {
+            let mut problems = Vec::new();
+            compare_family(&family(&[]), "const A: u16 = 1;\n", &user, &mut problems);
+            assert!(problems.iter().any(|p| p.contains("a.rs") && p.contains("b.rs")), "{problems:?}");
+        }
+    }
+
+    #[test]
+    fn an_unlisted_kernel_only_name_is_a_finding_and_a_listed_one_is_not() {
+        let kernel = "const A: u16 = 1;\nconst ONLY: usize = 8;\n";
+        let user = ["pub const A: u16 = 1;\n", ""];
+        let mut problems = Vec::new();
+        compare_family(&family(&[]), kernel, &user, &mut problems);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("ONLY"));
+        let mut problems = Vec::new();
+        compare_family(&family(&[("ONLY", "reason")]), kernel, &user, &mut problems);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_user_only_name_is_not_a_finding() {
+        let mut problems = Vec::new();
+        compare_family(
+            &family(&[]),
+            "const A: u16 = 1;\n",
+            &["pub const A: u16 = 1;\npub const EXTRA: u16 = 9;\n", ""],
+            &mut problems,
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_kernel_file_yielding_nothing_is_a_finding() {
+        let mut problems = Vec::new();
+        compare_family(&family(&[]), "fn f() {}\n", &["", ""], &mut problems);
+        assert_eq!(problems.len(), 1);
+    }
 }

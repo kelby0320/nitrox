@@ -13,7 +13,7 @@ use librsproto::file::{
 use librsproto::namespace::{
     BLOCK_RUN_WIRE_LEN, FILE_BLOCKS_PREFIX_LEN, FILE_BLOCKS_READ_ONLY, OBJECT_KIND_MEMOBJ, RESOLVE_CREATE,
     RESOLVE_FILE_LAZY, RESOLVE_GROW, RESOLVE_REPLY_LEN, RESOLVE_TRUNCATE, file_blocks_prefix, parse_resolve_grow_size,
-    parse_resolve_request, resolve_reply,
+    parse_resolve_request, put_block_run, resolve_reply,
 };
 use librsproto::{OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK};
 use librsproto::{OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -303,11 +303,7 @@ fn model_a_reply(reply: &mut [u8], request_id: u64, m: &Mapped, runs: &[BlockRun
     let mut body = [0u8; FILE_BLOCKS_PREFIX_LEN + MAX_RUNS * BLOCK_RUN_WIRE_LEN];
     let mut off = file_blocks_prefix(&mut body, m.size as u32, m.block_size, runs.len() as u32, m.id, flags)?;
     for r in runs {
-        body[off..off + 8].copy_from_slice(&r.file_block.to_le_bytes());
-        body[off + 8..off + 16].copy_from_slice(&r.device_lba.to_le_bytes());
-        body[off + 16..off + 20].copy_from_slice(&r.length.to_le_bytes());
-        body[off + 20..off + 24].copy_from_slice(&r.flags.to_le_bytes());
-        off += BLOCK_RUN_WIRE_LEN;
+        off += put_block_run(&mut body[off..], r.file_block, r.device_lba, r.length, r.flags)?;
     }
     encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..off], 1)
 }

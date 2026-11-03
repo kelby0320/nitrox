@@ -138,6 +138,19 @@ pub const FILE_BLOCKS_PREFIX_LEN: usize = 32;
 /// Bytes of one `BlockRun` in a `FILE_BLOCKS` reply: `file_block: u64`, `device_lba: u64`,
 /// `length: u32`, `flags: u32`.
 pub const BLOCK_RUN_WIRE_LEN: usize = 24;
+/// Write one `BlockRun` of a `FILE_BLOCKS` reply into `out`, returning [`BLOCK_RUN_WIRE_LEN`]; `None`
+/// if `out` is too small.
+pub fn put_block_run(out: &mut [u8], file_block: u64, device_lba: u64, length: u32, flags: u32) -> Option<usize> {
+    if out.len() < BLOCK_RUN_WIRE_LEN {
+        return None;
+    }
+    put_u64(out, 0, file_block);
+    put_u64(out, 8, device_lba);
+    put_u32(out, 16, length);
+    put_u32(out, 20, flags);
+    Some(BLOCK_RUN_WIRE_LEN)
+}
+
 /// `FILE_BLOCKS` flag: a file that may not be written, a read-only mount's or one resolved on a
 /// mount refusing changes; the kernel installs it without `MAP_WRITE`.
 pub const FILE_BLOCKS_READ_ONLY: u32 = 1 << 0;
@@ -210,6 +223,21 @@ pub fn parse_resolve_rename(body: &[u8]) -> Option<(&[u8], u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_run_is_written_at_the_offsets_the_kernel_reads() {
+        let mut out = [0xEEu8; 28];
+        assert_eq!(
+            put_block_run(&mut out, 0x0102_0304_0506_0708, 0x1112_1314_1516_1718, 0x2122_2324, 0x3132_3334),
+            Some(24)
+        );
+        assert_eq!(&out[0..8], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(&out[8..16], &[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]);
+        assert_eq!(&out[16..20], &[0x24, 0x23, 0x22, 0x21]);
+        assert_eq!(&out[20..24], &[0x34, 0x33, 0x32, 0x31]);
+        assert_eq!(&out[24..], &[0xEE; 4], "nothing past the run is touched");
+        assert_eq!(put_block_run(&mut out[..23], 1, 2, 3, 4), None);
+    }
 
     #[test]
     fn resolve_request_round_trips() {

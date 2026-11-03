@@ -22,8 +22,11 @@ pub const OP_DEVICES_SETTLED: u16 = 0x0F01;
 /// Manager → owner, unsolicited: a device has gone. Body [`build_departed`]: its registry id.
 pub const OP_DEVICES_DEPARTED: u16 = 0x0F02;
 
-/// Bytes of a registry record — `libkern::device::DeviceRecord`'s size, which both sides assert.
+/// Bytes of a registry record — `libkern::device::DeviceRecord`'s size, which `librsproto` asserts
+/// under its `io` feature.
 pub const RECORD_LEN: usize = 144;
+#[cfg(feature = "io")]
+const _: () = assert!(RECORD_LEN == core::mem::size_of::<libkern::device::DeviceRecord>());
 /// Bytes of a `Settled` or `Departed` body.
 pub const WORD_LEN: usize = 4;
 
