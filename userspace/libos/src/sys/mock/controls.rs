@@ -48,6 +48,26 @@ pub fn fail_next_recv(status: i32) {
     with(|m| m.fail_recv = Some(status));
 }
 
+/// Refuse the next `channel_send` with `status`, taking nothing, as `OutOfMemory` is.
+pub fn fail_next_send(status: i32) {
+    with(|m| m.fail_send = Some(status));
+}
+
+/// Complete the next send's operation at once with `status`, as a kernel answering it so would.
+pub fn answer_next_send(status: i32) {
+    with(|m| m.answer_send = Some(status));
+}
+
+/// Refuse the next `memory_create` with `status`.
+pub fn fail_next_create(status: i32) {
+    with(|m| m.fail_create = Some(status));
+}
+
+/// Let the next truncate leave the file's size as it was, as a server ignoring it would.
+pub fn ignore_next_truncate() {
+    with(|m| m.ignore_truncate = true);
+}
+
 /// Answer the next successful rename with a handle, as a server answering it so would.
 pub fn rename_with_handle() {
     with(|m| m.rename_handle = true);

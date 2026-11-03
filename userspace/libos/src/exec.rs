@@ -529,7 +529,6 @@ mod tests {
         assert_eq!(sys::closed_in_flight(), 1);
     }
 
-    /// **A dropped I/O whose wait is refused for now waits again**, rather than closing in flight.
     /// **A completion is told from a failed wait**: an I/O the device failed is finished, its
     /// status carried, where a wait refused for good says it may still run.
     #[test]
@@ -550,6 +549,7 @@ mod tests {
         assert_eq!(sys::counts().2, closes + 1, "closed, and not waited on again");
     }
 
+    /// **A dropped I/O whose wait is refused for now waits again**, rather than closing in flight.
     #[test]
     fn a_dropped_io_whose_wait_is_refused_for_now_waits_again() {
         sys::reset();

@@ -107,11 +107,13 @@ impl<M: CanMapWrite> Mapping<M> {
     }
 
     /// Copy `len` bytes from `src` at `src_at` to `at` here; `InvalidArgument` past either end.
+    /// **Ranges that overlap in one object copy in no defined order**: its two mappings have
+    /// addresses of their own, so the copy cannot see that it reads what it has written.
     pub fn copy_from<S>(&mut self, at: usize, src: &Mapping<S>, src_at: usize, len: usize) -> Result<()> {
         self.within(at, len)?;
         src.within(src_at, len)?;
         // SAFETY: both ranges lie in mappings that live for the call, and a copy forms no reference
-        // into either; `copy`, not `copy_nonoverlapping`, as two mappings of one object overlap.
+        // into either; `copy`, as libos's model maps every mapping of an object at one address.
         unsafe { core::ptr::copy(src.base.as_ptr().add(src_at), self.base.as_ptr().add(at), len) };
         Ok(())
     }
@@ -198,9 +200,9 @@ mod tests {
         let refused = |r: Result<()>| r.err().map(|e| e.code()) == Some(KError::InvalidArgument);
         assert!(refused(to.copy_from(4093, &from, 0, 4)) && refused(to.copy_from(0, &from, 4093, 4)));
         let mut again = a.map(4096).unwrap();
-        again.copy_from(1, &from, 0, 5).unwrap();
-        from.read_into(0, &mut out).unwrap();
-        assert_eq!(&out, b"aabc", "two mappings of one object overlap, and copy as memmove does");
+        again.copy_from(100, &from, 0, 4).unwrap();
+        from.read_into(100, &mut out).unwrap();
+        assert_eq!(&out, b"abcd", "two mappings of one object, at ranges apart in it");
     }
 
     #[test]

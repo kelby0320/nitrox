@@ -123,6 +123,12 @@ struct Mock {
     fail_sync: Option<i32>,
     fail_thread: Option<i32>,
     fail_recv: Option<i32>,
+    fail_send: Option<i32>,
+    fail_create: Option<i32>,
+    /// The status the next send's operation completes with at once.
+    answer_send: Option<i32>,
+    /// Whether the next truncate leaves the size as it was, as a server ignoring it would.
+    ignore_truncate: bool,
     /// Whether the next rename's answer carries a handle, as a server's could.
     rename_handle: bool,
     submitted: Vec<IoOp>,
@@ -153,7 +159,6 @@ thread_local! {
     static MOCK: RefCell<Mock> = RefCell::new(fresh());
 }
 
-/// An empty model, but for handles `1` and `2`, devices `io_submit` takes.
 /// A path bound in a namespace, and the base a server's lookups under it are prefixed with.
 #[derive(Clone)]
 struct Binding {
@@ -169,6 +174,7 @@ impl Binding {
     }
 }
 
+/// An empty model, but for handles `1` and `2`, devices `io_submit` takes.
 fn fresh() -> Mock {
     let mut m = Mock { next_handle: 1, ..Default::default() };
     for _ in 0..2 {
@@ -451,10 +457,11 @@ pub fn handle_stat(h: u64, out: &mut HandleInfo) -> i64 {
 }
 
 pub fn memory_create(size: u64) -> i64 {
-    with(|m| match size {
-        0 => e(KError::InvalidArgument),
-        s if s > MEMORY_MAX => e(KError::TooLarge),
-        s => {
+    with(|m| match (m.fail_create.take(), size) {
+        (Some(status), _) => status as i64,
+        (None, 0) => e(KError::InvalidArgument),
+        (None, s) if s > MEMORY_MAX => e(KError::TooLarge),
+        (None, s) => {
             let bytes = Pages::new(s as usize);
             let all = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
             m.mint(Object::Memory(bytes), all | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER)
@@ -573,12 +580,16 @@ pub fn channel_send(ch: u64, msg: &IpcMsg, handles: &[u64], mode: u64, _deadline
         if msg.header.payload_len as usize > IPC_PAYLOAD_SIZE {
             return e(KError::InvalidArgument);
         }
+        if let Some(status) = m.fail_send.take() {
+            return status as i64;
+        }
+        let answer = m.answer_send.take();
         if forward {
             // A reply the kernel consumes within the call, whatever the mode.
             for h in handles {
                 m.table.remove(h);
             }
-            return 0;
+            return answer.map_or(0, |status| m.po(Po { ready: true, never: false, status, result: 0, lookup: None }));
         }
         if !m.held(peer) {
             return e(KError::PeerClosed);
@@ -595,8 +606,9 @@ pub fn channel_send(ch: u64, msg: &IpcMsg, handles: &[u64], mode: u64, _deadline
         for h in handles {
             m.table.remove(h);
         }
+        let (ready, status) = answer.map_or((!full, 0), |status| (true, status));
         let po = (mode != libkern::SENDMODE_NOBLOCK)
-            .then(|| m.po(Po { ready: !full, never: false, status: 0, result: 0, lookup: None }));
+            .then(|| m.po(Po { ready, never: false, status, result: 0, lookup: None }));
         let po_obj = po.map(|po| m.table[&(po as u64)].0);
         let Object::Channel { ring, held, .. } = &mut m.objects[peer] else { unreachable!("a channel's peer") };
         match po_obj {
@@ -796,9 +808,11 @@ pub fn file_resize(verb: Resize, ns: u64, path: &[u8], rights: u64, size: u64) -
             (Some(got), _) => Some(got),
         };
         let Some((obj, bound)) = found else { return m.lookup_po(Err(KError::NotFound)) };
+        let ignored = verb == Resize::Truncate && core::mem::take(&mut m.ignore_truncate);
         if let Object::File { size: now, .. } = &mut m.objects[obj] {
             *now = match verb {
                 Resize::Create | Resize::Grow => (*now).max(size),
+                Resize::Truncate if ignored => *now,
                 Resize::Truncate => (*now).min(size),
             };
         }
