@@ -32,6 +32,9 @@ being speculative work.
       supersedes 2026-07-13.
 - [ ] **Dynamic linking** — a userspace `ld.so`: map segments over the file-backed path, walk
       the dependency graph, apply relocations, resolve symbols.
+- [ ] **`thread_set_affinity` and `io_cancel`, if the port wants them.** Pre-Phase-7 Part E removes
+      both, as nothing calls them, and they need implementing: `io_cancel` has only ever answered
+      `Unsupported` ([`syscall-surface.md`](syscall-surface.md); the maintainer's call, 2026-11-02).
 
 ### The dynamic-linking premise has expired, and that is the argument for doing it
 

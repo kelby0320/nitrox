@@ -454,3 +454,29 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-02	415	fc655540	9	rules-and-docs	optional	demonstrated	fixed	5360a223	Safety section says it has none of its own; comment only
 2026-11-02	415	fc655540	10	rules-and-docs	optional	demonstrated	fixed	cae8ea4c	entry says one of the 22 predates the job; 21 in the diff, 22 in the tree; doc only
 2026-11-02	415	fc655540	11	architecture	optional	demonstrated	fixed	cae8ea4c	doc says it is for a test read-back and grants no new read; pub stays, a second crate calls it; doc only
+2026-11-02	417	a10d89cf	1	logic+error-paths	worth-fixing	unverified	fixed	dddb0204	IO_NOCACHE a hint: no other op, no mapping, Written, no Write since; two-op host test named for E.8
+2026-11-02	417	a10d89cf	2	logic+error-paths	worth-fixing	unverified	fixed	dddb0204	FILE_OPS_MAX per mount, sixteen; libos retries WouldBlock under the deadline; a stopped stick fills its own budget only
+2026-11-02	417	a10d89cf	3	logic	worth-fixing	demonstrated	fixed	dddb0204	traced write_back, no device flush; a file's Flush keeps file_sync's meaning, and the spec says the two apart
+2026-11-02	417	a10d89cf	4	logic	worth-fixing	demonstrated	fixed	dddb0204	traced image_bytes; plan states one more copy and allocation per launch, spawn_stats reads the cost
+2026-11-02	417	a10d89cf	5	logic	worth-fixing	demonstrated	fixed	dddb0204	sup-o6 moved to librsproto in E.2, its home in the survey; removed from E.1's table
+2026-11-02	417	a10d89cf	6	logic	worth-fixing	unverified	fixed	dddb0204	a control channel that can still bring a message stays looked at; host test of a wake's reads named for E.3
+2026-11-02	417	a10d89cf	7	logic	worth-fixing	demonstrated	fixed	dddb0204	claim replaced in pre-phase-7, the plan and the log: a call's shape is one crate's change, what moves between processes is not
+2026-11-02	417	a10d89cf	8	logic+rules-and-docs	worth-fixing	demonstrated	fixed	dddb0204	row rewritten: twenty-eight, two halves, Part J
+2026-11-02	417	a10d89cf	9	logic	worth-fixing	demonstrated	fixed	dddb0204	kernel half in E.6, a gap below a hint-less map; user half in E.5; grep finds th-d9 in the plan
+2026-11-02	417	a10d89cf	10	error-paths	worth-fixing	demonstrated	fixed	dddb0204	reproduced: Op drop panics the mock on a never-ending read; Op::abandon, no Meta::Unmount after an unfinished flush, 60 s floor
+2026-11-02	417	a10d89cf	11	error-paths	worth-fixing	unverified	fixed	dddb0204	E.8 defines result, page order, source before destination, dirty mark for the whole op, stat check in Spawn
+2026-11-02	417	a10d89cf	12	logic+error-paths	worth-fixing	demonstrated	fixed	dddb0204	reproduced: a_run_ends_at_a_gap passes, Written over a hole with no IRP; such a Write is refused
+2026-11-02	417	a10d89cf	13	error-paths	worth-fixing	unverified	fixed	dddb0204	read main.rs: Down keeps running true; a Down running ctrl stays looked at, late Ready drained
+2026-11-02	417	a10d89cf	14	error-paths	worth-fixing	unverified	fixed	dddb0204	kmem-28 narrowed to what needs no wait; a file page not resident still fails at once; E.8's and E.10's claims now hold
+2026-11-02	417	a10d89cf	15	logic	optional	demonstrated	fixed	dddb0204	grep counts 27 docs; E.11 names them and ends on a grep; userspace/CLAUDE.md says three agreed
+2026-11-02	417	a10d89cf	16	logic	optional	demonstrated	fixed	dddb0204	read table.rs and rsproto.rs; plan says 4 GiB less a byte; widening named as its own change
+2026-11-02	417	a10d89cf	17	logic	optional	demonstrated	fixed	dddb0204	read copy_from; at most two resolves, with counts as its control
+2026-11-02	417	a10d89cf	18	logic	optional	demonstrated	fixed	dddb0204	read direct_bindable; stated in E.10 and the decision log as the cost of one authority model
+2026-11-02	417	a10d89cf	19	logic	optional	demonstrated	fixed	dddb0204	reproduced: unsafe-inventory exits 1 at kernel/src/device; ratchet counts libkern's wrappers too, entries by crate or module
+2026-11-02	417	a10d89cf	20	error-paths	optional	unverified	fixed	dddb0204	power node's Write acts before the PO, from a buffer made at boot; bad byte refused with no PO as control
+2026-11-02	417	a10d89cf	21	error-paths	optional	unverified	fixed	dddb0204	thread drops its references before completing the PO; Held asked once as control
+2026-11-02	417	a10d89cf	22	tests	optional	unverified	fixed	dddb0204	grep: harness.rs calls both removed numbers; demos move, and a kernel host test covers the unseeded read
+2026-11-02	417	a10d89cf	23	tests	optional	unverified	fixed	dddb0204	E.1 commits the probe as cargo xtask syscall-counts, on demand; no CI guard, as a pinned count fails on honest change
+2026-11-02	417	a10d89cf	24	tests	optional	unverified	fixed	dddb0204	control now has a bound, two windows; the review had refuted the E.10 half
+2026-11-02	417	a10d89cf	25	rules-and-docs	optional	demonstrated	fixed	dddb0204	fifth register stated, syscall4 zeroes it; struct replaces the kernel enum
+2026-11-02	417	a10d89cf	26	rules-and-docs	optional	demonstrated	fixed	dddb0204	note on the overtaken section with heading links; E.10 writes each hop as a move

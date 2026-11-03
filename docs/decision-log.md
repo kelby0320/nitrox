@@ -37451,3 +37451,65 @@ packages, so a move would change what the gates boot on with nothing changed in 
 been caught by that difference before: TCG's x2APIC from QEMU 9.0, and the device properties of 8.2
 against a local 11. Every job now names `ubuntu-24.04`, the image they already ran on. Moving is a
 change of its own, checked first against that release's QEMU in a container.
+
+## 2026-11-02 — Before Phase 7, Part E detailed: libos first, Part J, then twenty-eight syscalls
+
+Part E's detail pass, in `syscall-surface.md`, measured the surface it was to change and answered
+the review's open questions. It found the surface unchanged at forty-two, and four things the
+review had drawn that do not hold. **A namespace cannot be an `io_submit` resource**: a mount has no
+handle, so `ns_sync` and `ns_held` become resolves, which the review's own "a resolve that carries
+an operation" fits better. **`ns_held` cannot ride on the flush**: the storage service asks it again
+with nothing to flush. **Spawn need not wait**: it takes a memory object already, so it takes
+nothing else, and the `Read` is the caller's, under a deadline. **And unmapping lets no page go**,
+which a copy of a large file needs, so a window of one says so with `IO_NOCACHE`.
+
+**The heavy paths are not the surface.** The maintainer's second question was what a common
+operation costs, and counted per process in a real session, 65% of all calls are `send`, `wait` and
+`recv`, where the ten numbers the review folds are a rounding error. So the folds are for a smaller
+surface and not for speed, and this adds no call for speed: a combined call would have to earn its
+place by a measured time. Three redundancies go with their crates: `ns_children`'s call per binding,
+`service-mgr`'s `recv` on every service for each wake, and `copy_from`'s resolves.
+
+The maintainer's calls:
+
+- **The order: libos and every crate on it, then Part J, then the surface.** The detail pass was to
+  say which of Parts E and J comes first, and neither does. P1's 196 sites hardly overlap what this
+  part rewrites, about 11, so reach settled nothing. What did is that callers should move once: with
+  every crate on libos, a call that changes shape is one crate's change, and the userspace half
+  needs nothing from Part J. The surface's new kernel code is its most delicate, threads holding files and buffers and
+  copying between frames, which is what P1 and P2 are for.
+- **One authority model, a handle.** `clock_set` and `power` become `Write`s to kernel char nodes,
+  as a keyboard's lights are, `SYSTEM_CLOCK` and `SystemControl` go, and the two privileged
+  operations that chose differently (finding 5) stop doing so. Neither node is bound in the root
+  namespace.
+- **The test harness's plumbing moves onto libos, and its refusals stay raw**: a call that passes
+  what a safe wrapper cannot express is the test. This is the exception the Definition of Done asked
+  to be agreed, beside `eshell`'s and `libheap`'s.
+- **`thread_set_affinity` and `io_cancel` are removed for now, and need implementing**, perhaps with
+  the `std` port. Neither has a caller, and `io_cancel` has only ever answered `Unsupported`. Both
+  are on Phase 7's list.
+
+Decided in the pass, for the maintainer's eye:
+
+- **What blocks runs on a kernel thread of its own, an operation each, under a budget per mount**,
+  so a stick that has stopped answering holds up no other mount's flush, as one worker's queue or
+  one cap would.
+- **Entropy gains a binding in every namespace.** It is ambient today, and as a node it would need
+  one, or Phase 7's `HashMap` would fail in a sandbox. It grants what every process has now.
+- **`release_initramfs` and `exception_extend_timeout` leave the design**, having no consumer. The
+  ring stays in it, wanting a measurement, and `device_map_mmio` waits on Phase 8.
+
+And after its review, which found the plan's gaps and no fault in its order:
+
+- **A kernel copy fetches nothing from a device.** kmem-28 serves an anonymous page and a resident
+  file page. A file page not resident still fails at once, as fetching it would stop a thread
+  inside a syscall with no `PendingOperation`, and the rule outranks the finding.
+- **On a file, `Flush` keeps `file_sync`'s meaning**: on the device, and not out of its cache, which
+  stays the device's own `Flush`.
+- **A `Write` over a hole is refused**, as write-back skips such a page and answers `Written`.
+- **`IO_NOCACHE` is a hint.** Its pages go only if nothing maps the object, no other op holds its
+  frames, the write-back succeeded and no `Write` began since.
+- **A launch costs one more copy of its image**, the price of a spawn that cannot stop on a device.
+- **`copy-limit` becomes 4 GiB**, a file's size being a `u32` on the wire.
+- **The clock is sendable once it is a binding**, as a disk is, where a syscap was not. That is the
+  cost of one authority model.
