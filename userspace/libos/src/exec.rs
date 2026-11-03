@@ -144,6 +144,29 @@ impl Op {
     fn of(po: u64, kind: Kind) -> Op {
         Op { po, kind, finished: false, done: false }
     }
+
+    /// Wait for the operation to finish, here: its completion, whatever status it carries, or the
+    /// error that refused the wait for good, when the operation may still be running.
+    ///
+    /// Where [`block_on`] answers both as an `Err`, this tells a device's failed I/O, after which
+    /// the buffer it borrowed is the caller's again, from a wait that failed, after which it may
+    /// still be the device's.
+    pub fn wait_out(mut self) -> Result<IoResult> {
+        let mut r = zeroed_results::<1>();
+        loop {
+            match sys::wait(&[self.po], &mut r, u64::MAX) {
+                1 => break,
+                n if n == KError::OutOfMemory as i64 => sleep(),
+                n => {
+                    // The drop must not wait for it again: that wait is what was just refused.
+                    (self.finished, self.done) = (true, true);
+                    return Err(Error::from_status(n as i32));
+                }
+            }
+        }
+        (self.finished, self.done) = (true, true);
+        Ok(r[0])
+    }
 }
 
 /// What a PO's drop has to see to: an I/O may still use its buffer, a lookup read may have
@@ -410,6 +433,26 @@ mod tests {
     }
 
     /// **A dropped I/O whose wait is refused for now waits again**, rather than closing in flight.
+    /// **A completion is told from a failed wait**: an I/O the device failed is finished, its
+    /// status carried, where a wait refused for good says it may still run.
+    #[test]
+    fn waiting_out_an_op_tells_a_failed_io_from_a_failed_wait() {
+        sys::reset();
+        sys::script_next(KError::IoError as i32, 3, false);
+        let done = Op::submit(RawHandle(1), &read_op()).unwrap().wait_out().unwrap();
+        assert_eq!((done.status, done.result), (KError::IoError as i32, 3));
+        sys::script_next(0, 1, false);
+        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::fail_next_wait(KError::OutOfMemory as i64);
+        assert_eq!(op.wait_out().unwrap().result, 1, "a full waiter queue is waited out");
+        sys::script_never();
+        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::fail_next_wait(KError::InvalidHandle as i64);
+        let closes = sys::counts().2;
+        assert_eq!(op.wait_out().err().unwrap().code(), KError::InvalidHandle);
+        assert_eq!(sys::counts().2, closes + 1, "closed, and not waited on again");
+    }
+
     #[test]
     fn a_dropped_io_whose_wait_is_refused_for_now_waits_again() {
         sys::reset();
