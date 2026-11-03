@@ -190,6 +190,11 @@ The startup protocol for any resource server:
 
 Don't have an RS try to register itself. Don't grant `BIND_NAMESPACE` to an RS. See `docs/rationale/why-supervisor-registration.md`.
 
+**A server's replies are `librsproto::server`'s** (its `io` feature): an error sized to its reason, a
+handle or a memory object whose failed send is answered with an error, a continuation, a directory
+page. A forwarded resolve waits with no deadline, so a reply that fails and goes unanswered hangs
+its caller for good; the servers still writing their own move onto it in pre-Phase-7 Part E.3.
+
 ## Configuration files
 
 User-facing configuration is TOML. Service declarations follow `docs/spec/service-toml-schema.md`. Parsing should be tolerant of unknown fields (forward compatibility) but strict about types and required fields.

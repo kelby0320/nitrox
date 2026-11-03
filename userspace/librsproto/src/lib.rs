@@ -20,6 +20,8 @@ pub mod log;
 pub mod meta;
 pub mod namespace;
 pub mod path;
+#[cfg(feature = "io")]
+pub mod server;
 pub mod services;
 #[cfg(feature = "io")]
 pub mod session;
@@ -227,20 +229,34 @@ impl Message<'_> {
 /// receiver. The caller sets `IpcMsg.header.payload_len` to the returned length and
 /// `handle_count` itself.
 pub fn encode(out: &mut [u8], op: u16, request_id: u64, flags: u32, body: &[u8], handle_count: u16) -> Option<usize> {
-    let total = RS_HEADER_LEN.checked_add(body.len())?;
-    if out.len() < total || total > RS_MAX_PAYLOAD {
-        return None;
-    }
-    put_u32(out, 0, RS_MAGIC);
-    put_u16(out, 4, RS_VERSION);
-    put_u16(out, 6, op);
-    put_u64(out, 8, request_id);
-    put_u32(out, 16, flags);
-    put_u32(out, 20, body.len() as u32);
-    put_u16(out, 24, handle_count);
-    put_u16(out, 26, 0); // _reserved
-    out[RS_HEADER_LEN..total].copy_from_slice(body);
-    Some(total)
+    encode_with(out, op, request_id, flags, handle_count, |room| {
+        room.get_mut(..body.len())?.copy_from_slice(body);
+        Some(body.len())
+    })
+}
+
+/// [`encode`] with the body built where it goes: `fill` is handed the room the body has (the
+/// message less its envelope, never more than a message carries) and answers the body's length.
+pub(crate) fn encode_with(
+    out: &mut [u8],
+    op: u16,
+    request_id: u64,
+    flags: u32,
+    handle_count: u16,
+    fill: impl FnOnce(&mut [u8]) -> Option<usize>,
+) -> Option<usize> {
+    let room = out.len().min(RS_MAX_PAYLOAD).checked_sub(RS_HEADER_LEN)?;
+    let (head, body) = out.split_at_mut(RS_HEADER_LEN);
+    let len = fill(&mut body[..room]).filter(|&n| n <= room)?;
+    put_u32(head, 0, RS_MAGIC);
+    put_u16(head, 4, RS_VERSION);
+    put_u16(head, 6, op);
+    put_u64(head, 8, request_id);
+    put_u32(head, 16, flags);
+    put_u32(head, 20, len as u32);
+    put_u16(head, 24, handle_count);
+    put_u16(head, 26, 0); // _reserved
+    Some(RS_HEADER_LEN + len)
 }
 
 /// Parse a received `IpcMsg` payload into its envelope + body, checking magic and `body_len`.
