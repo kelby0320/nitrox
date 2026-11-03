@@ -27,9 +27,9 @@ fn e(k: KError) -> i64 {
 
 /// One kernel object.
 enum Object {
-    Memory(Box<[u8]>),
+    Memory(Pages),
     File {
-        bytes: Box<[u8]>,
+        bytes: Pages,
         size: u64,
     },
     Namespace(Vec<(Vec<u8>, usize, u64)>),
@@ -64,6 +64,27 @@ impl Object {
             Object::Thread => KObjectType::Thread,
             Object::Entropy => KObjectType::EntropyObject,
         }
+    }
+}
+
+/// An object's bytes, in whole pages as the kernel maps them, so a mapping starts on a page.
+struct Pages(Box<[Page]>);
+
+#[repr(C, align(4096))]
+#[derive(Clone, Copy)]
+struct Page([u8; PAGE]);
+
+impl Pages {
+    fn new(bytes: usize) -> Pages {
+        Pages(vec![Page([0; PAGE]); bytes.div_ceil(PAGE)].into_boxed_slice())
+    }
+
+    fn len(&self) -> usize {
+        self.0.len() * PAGE
+    }
+
+    fn base(&mut self) -> u64 {
+        self.0.as_mut_ptr() as u64
     }
 }
 
@@ -390,7 +411,7 @@ pub fn memory_create(size: u64) -> i64 {
         0 => e(KError::InvalidArgument),
         s if s > MEMORY_MAX => e(KError::TooLarge),
         s => {
-            let bytes = vec![0u8; (s as usize).next_multiple_of(PAGE)].into_boxed_slice();
+            let bytes = Pages::new(s as usize);
             let all = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
             m.mint(Object::Memory(bytes), all | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER)
         }
@@ -416,7 +437,7 @@ pub fn memory_map(h: u64, _hint: u64, size: u64, rights: u64) -> i64 {
             return e(KError::InvalidArgument);
         }
         let base = match &mut m.objects[obj] {
-            Object::Memory(b) | Object::File { bytes: b, .. } => b.as_mut_ptr() as u64,
+            Object::Memory(b) | Object::File { bytes: b, .. } => b.base(),
             _ => unreachable!("checked mappable"),
         };
         m.maps.entry(base).and_modify(|(_, n)| *n += 1).or_insert((obj, 1));
@@ -588,7 +609,7 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
         if let Ok((server, _)) = found
             && matches!(m.objects[server], Object::Server)
         {
-            let answer = m.object(Object::Memory(vec![0; PAGE].into_boxed_slice()));
+            let answer = m.object(Object::Memory(Pages::new(PAGE)));
             let lookup = Some((answer, rights));
             return m.po(Po { ready: false, never: false, status: 0, result: 0, lookup });
         }
@@ -694,7 +715,7 @@ pub fn file_resize(verb: Resize, ns: u64, path: &[u8], rights: u64, size: u64) -
         }
         let found = match (m.file_at(ns, path), verb) {
             (None, Resize::Create) => {
-                let obj = m.object(Object::File { bytes: vec![0; FILE_ROOM].into_boxed_slice(), size: 0 });
+                let obj = m.object(Object::File { bytes: Pages::new(FILE_ROOM), size: 0 });
                 let all = Rights::MAP_READ | Rights::MAP_WRITE | Rights::INSPECT | Rights::TRANSFER | Rights::DUPLICATE;
                 m.bindings(ns).push((path.to_vec(), obj, all.bits()));
                 Some((obj, all.bits()))
