@@ -3789,7 +3789,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   medium, effort medium. **Plan**, in P7.
   Done in `e44c8493`: `librsproto::server`, under `io` and on libos's types: `send`, `reply_error`
   sized to its reason and cut to fit, `reply_handle` and `reply_channel` answering `KernelError`
-  on a failed send, `reply_object` handing on exactly `MAP_READ | TRANSFER`, `reply_subnamespace`
+  on a failed send, `reply_object` handing on `MAP_READ | INSPECT | TRANSFER`, `reply_subnamespace`
   with its base, and `serve_read_dir` within `RS_MAX_BODY`, building only the entries a page
   reaches. It has no caller yet: E.3 moves the servers onto it.
 - [ ] **sup-o7** encapsulate: memory mapped by hand (stat, map, `from_raw_parts` or
@@ -5103,7 +5103,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   the kernel's names, as librsproto's own are not the kernel's to mirror; an alias is not read,
   two names spelt differently are paired, and a name two user files give different values is a
   finding. `put_block_run` writes a run at the kernel's offsets, pinned by bytes, and libfsserver
-  writes with it. `RECORD_LEN` is asserted against `DeviceRecord` under `io`.
+  writes with it. `RECORD_LEN` is asserted against `DeviceRecord` under `io`. A kernel value the
+  check cannot read is a finding. The other fields of a reply are still read and written at literal
+  offsets on both sides, which no text check can compare: `TODO(rsproto-offsets)`, for E.7.
 
 What held up: all 19 unsafe blocks have SAFETY arguments that hold. Every send buffer is a whole
 4,096-byte message (a run-time check at session.rs:219, `Box<[u8; IPC_MSG_SIZE]>` in channel.rs

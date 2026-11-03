@@ -39,7 +39,8 @@ servers speak one protocol and a fix to it is a fix to both:
   go. A server keeps its `Store` in a `static` (`SERVER_BLOCKS`, 1 MiB, `.bss`).
 - **`server.rs`** — the bootstrap and the loop, on libos and host-tested through its model of the
   kernel: the setup message, `Ready` or a refusal, the forwarding endpoint, directory sessions and
-  their wait slots, a rename resolved ahead of a session, `File::Forget` before a file is freed, `File::Touch` by id, and `Meta::Unmount`.
+  their wait slots, a rename resolved ahead of a session, `File::Forget` before a file is freed,
+  `File::Touch` by id, and `Meta::Unmount`.
 
 ## Rules
 

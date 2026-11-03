@@ -146,10 +146,10 @@ a held send's.
   `IoResult` (`status@8`, `result@16`) into `Ready(Result<R>)`. A poll that finds nothing read
   for it, and every poll under another executor, reads the completion with a non-blocking
   `sys_wait`: complete is `Ready`, `WouldBlock` registers again, and any other error completes
-  the op with it, so a PO that can no longer be waited on is not polled for ever. Reading a
-  completion twice would cost a second wait, the third of a round trip, and nothing else: a
-  lookup's handle is installed by the first read, which every later one reports. A second poll after `Ready` is an error and waits on nothing: the
-  result, which may be a handle, is handed out once.
+  the op with it, so a PO that can no longer be waited on is not polled for ever. A completion
+  read twice costs only the second wait: a lookup's handle is installed by the first read, and
+  every later read reports the same handle. A second poll after `Ready` is an error and waits on
+  nothing: the result, which may be a handle, is handed out once.
 - **`Drop`** closes the PO, **first waiting for an unfinished I/O**: `sys_io_cancel` is
   `Unsupported`, and the device may still be writing the buffer the dropped future borrowed,
   which the caller would otherwise get back while it is written. A wait refused with

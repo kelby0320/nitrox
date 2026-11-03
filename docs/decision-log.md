@@ -37593,11 +37593,18 @@ Decided in the part, for the maintainer's eye:
   say more, an exact length, a cap, a power of two, stayed.
 - **A server's replies are `librsproto::server`'s**, landed with no caller: E.3's servers move
   onto it, each keeping its own loop. Where their copies disagreed it follows those that answer an
-  error when a reply fails and size an error to its reason. A directory name no page can hold is
-  left out, where both copies stopped at it and a client would ask again for ever.
+  error when a reply fails and size an error to its reason, and hands a table on as `service-mgr`'s
+  did, to be mapped for reading, stated and moved: a reader sizes a file by its stat. A directory
+  name no page can hold is left out, where both copies stopped at it and a client would ask again
+  for ever.
 - **`abi-sync-check` holds the kernel's rsproto constants to librsproto's**, from the kernel's
   names: each must exist in one of librsproto's four files with its value, or be listed one-sided
-  with its reason. librsproto's own names are not the kernel's to mirror.
+  with its reason, and a kernel value it cannot read is a finding. librsproto's own names are not
+  the kernel's to mirror. The fields around a block run are still at literal offsets on both sides,
+  which a text check cannot compare: `TODO(rsproto-offsets)`, for E.7, which rewrites the resolve.
+- **`/session/user` is bound read-only**, with a reader's rights and the `TRANSFER` a direct bind
+  needs, where every process in the session could resolve it writable and rewrite who the session
+  is for.
 - **The initramfs ceiling is 440 KiB.** The four programs grew with the libraries under them, the
   root's server by 7.9 KB and the profile server by 11.3 KB; 5.9 KB more had been `Debug`
   formatting that three `expect`s linked into both filesystem servers, now gone. The ceiling still
