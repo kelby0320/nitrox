@@ -26,6 +26,7 @@ pub(crate) fn print_help() {
            check-media       the live desktop: a stick plugged in, shown in Files, saved to, ejected\n  \
            check-shutdown    `with power shutdown` on a test disk; the host checks it; then a reboot\n  \
            check-resolutions run four display gates at five screen sizes; on demand, not in CI\n  \
+           syscall-counts    a login and the shell's commands, each one's syscalls; on demand, not in CI\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
            \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
            \x20                tick-driven recovery sweep is the only path input takes\n  \
@@ -42,6 +43,8 @@ pub(crate) fn print_help() {
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-recv    fail if userspace receives raw, past libkern's `channel_recv`\n  \
+           check-syscalls  fail if a crate's raw syscalls rise past raw-syscalls.toml; `--update`\n  \
+           \x20               lowers stale entries, `--list` prints the counts and libkern's wrappers\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
            check-docs      fail if a doc links to, or cites, a path that does not exist\n  \
            check-comments  fail if new comments exceed 0.15 of new code plus 3, or cite a PR or part;\n  \

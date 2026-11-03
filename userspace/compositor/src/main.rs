@@ -741,16 +741,12 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
 /// no i8042 has no input server, and the display is still worth having.
 fn connect_input(root_ns: u64) -> Option<u64> {
     use libkern::handle::{RawHandle, Rights};
-    use libos::{Handle, Namespace, NsReadOnly, Only, Resource, block_on};
+    use libos::{Channel, Namespace, NsReadOnly, Only, Ref, block_on};
 
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run; `borrow`
-    // never closes it.
-    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-    // SAFETY: `/dev/input/new` resolves to a channel endpoint — the input server mints one
-    // consumer per resolve, exactly as `/dev/draw/new` mints one session.
-    let ch =
-        block_on(unsafe { ns.lookup::<Resource, Only>("/dev/input/new", Rights::RECV | Rights::SEND | Rights::WAIT) })
-            .ok()?;
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+    // The input server mints one consumer per resolve, exactly as `/dev/draw/new` mints one session.
+    let ch = block_on(ns.lookup::<Channel, Only>("/dev/input/new", Rights::RECV | Rights::SEND | Rights::WAIT)).ok()?;
     Some(ch.into_raw().0)
 }
 

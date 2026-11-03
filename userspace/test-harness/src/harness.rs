@@ -13,7 +13,7 @@ extern crate alloc;
 use core::arch::asm;
 use libkern::debug::Line;
 use libkern::*;
-use libos::{Handle, Namespace, NsMutable, spawn, thread_create};
+use libos::{Handle, MapReadWrite, Memory, Namespace, NsMutable, Ref, spawn, thread_create};
 use librsproto::session::{Dir, DirError};
 
 mod fault_demo;
@@ -451,21 +451,18 @@ fn ns_demo() {
     let ns = ns as u64;
     kprint(b"test-harness: ns_create ok\n");
 
-    // SAFETY: register-only syscall.
-    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    if mem < 0 {
+    let Ok(mem) = Handle::<Memory, MapReadWrite>::create(PAGE as usize) else {
         kprint(b"test-harness: ns-demo mem create FAIL\n");
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
         return;
-    }
-    let mem = mem as u64;
+    };
 
     // Bind via `Namespace::bind`, gated by the BIND right and the BIND_NAMESPACE syscap.
     let path = b"/store";
-    // SAFETY: `ns` is parent's live namespace handle; borrow is non-owning (won't close it).
-    let ns_h = unsafe { Handle::<Namespace, NsMutable>::borrow(RawHandle(ns), Rights::BIND) };
-    if ns_h.bind("/store", RawHandle(mem)).is_err() {
+    // SAFETY: `ns` is this process's live namespace handle, closed only at the end.
+    let ns_h = unsafe { Ref::<Namespace, NsMutable>::from_raw(RawHandle(ns), Rights::BIND) };
+    if ns_h.bind("/store", &mem).is_err() {
         kprint(b"test-harness: ns_bind FAIL\n");
         return;
     }
@@ -548,7 +545,6 @@ fn ns_demo() {
         syscall1(SYS_HANDLE_CLOSE, po as u64);
         syscall1(SYS_HANDLE_CLOSE, po2 as u64);
         syscall1(SYS_HANDLE_CLOSE, resolved);
-        syscall1(SYS_HANDLE_CLOSE, mem);
         syscall1(SYS_HANDLE_CLOSE, ns);
     }
     kprint(b"test-harness: ns-demo done\n");

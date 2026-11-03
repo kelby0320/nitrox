@@ -15,7 +15,7 @@ use core::arch::asm;
 use init::manifest::{self, BindSpec, Manifest, Mode, MountSpec};
 use libkern::debug::Line;
 use libkern::*;
-use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, Only, Process, block_on};
+use libos::{File, Handle, MapRead, Namespace, NsReadOnly, Only, Process, Ref, block_on};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -470,27 +470,21 @@ fn bind_profile_server(root_ns: u64) -> Option<u64> {
 
 /// Read and log `/system/current-generation` through the root fs-server: the stack end to end.
 fn read_current_generation(root_ns: u64) {
-    // SAFETY: `root_ns` is init's live root namespace, owned for its whole run; a
-    // borrowed Handle is a non-owning view and never closes it.
-    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-    // SAFETY: the path resolves to a read-mappable file object (asserted by the `Memory, MapRead`
-    // type arguments).
-    let Ok(mem) = block_on(unsafe { ns.lookup::<Memory, MapRead>("/system/current-generation", Rights::MAP_READ) })
-    else {
+    // SAFETY: `root_ns` is init's live root namespace, owned for its whole run.
+    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+    let Ok(mem) = block_on(ns.lookup::<File, MapRead>("/system/current-generation", Rights::MAP_READ)) else {
         kprint(b"init: /system/current-generation lookup FAIL\n");
         return;
     };
-    let Ok(addr) = mem.map(PAGE as usize) else {
+    // A page of the file's bytes and zero padding; the tail trimmed.
+    let mut bytes = [0u8; PAGE as usize];
+    if mem.map(PAGE as usize).and_then(|m| m.read_into(0, &mut bytes)).is_err() {
         kprint(b"init: current-generation map FAIL\n");
-        return; // `mem` drops here → closes the resolved handle
-    };
-    // SAFETY: `addr` maps a page of the file bytes + zero padding; trim the tail.
-    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, PAGE as usize) };
+        return;
+    }
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     kprint(b"init: /system/current-generation = ");
     kprint(&bytes[..len]); // the file content ends in '\n'
-    // SAFETY: the page mapped above, which `bytes` was the last use of.
-    let _ = unsafe { mem.unmap(addr, PAGE as usize) };
 }
 
 /// Report the run's verdict to `xtask test-qemu` via `SYS_TEST_EXIT`, which ends QEMU under the

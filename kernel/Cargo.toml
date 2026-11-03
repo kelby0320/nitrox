@@ -52,6 +52,9 @@ ps2-hold-gate = []
 # or halting. Never in a production kernel. See
 # `docs/conventions/qemu-integration-tests.md`.
 test-harness = ["selftest", "ps2-hold-gate"]
+# **Count each process's syscalls**, and write every count to the console at each spawn and exit,
+# for `cargo xtask syscall-counts`. Never in a shipped kernel.
+syscall-counts = []
 
 [dependencies]
 

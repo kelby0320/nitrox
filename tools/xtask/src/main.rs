@@ -35,6 +35,7 @@ mod screen;
 mod scsi_trace;
 mod session;
 mod shot;
+mod syscall_counts;
 mod throughput;
 mod usb;
 
@@ -240,13 +241,16 @@ enum BuildMode {
     /// which holds the screen still at two moments and panics on F10: a sampling gate needs frames
     /// that hold, and a machine that stops after userspace has drawn.
     FbconGate,
+    /// `syscall-counts`: [`Normal`](Self::Normal) userspace over a kernel built with
+    /// `syscall-counts`, which writes every process's counts at each spawn and exit.
+    SyscallCounts,
 }
 
 impl BuildMode {
     /// The mode's test feature, as the **kernel** takes it; `nxterm` takes `test-harness` alone.
     fn features(self) -> Option<&'static str> {
         match self {
-            BuildMode::Normal | BuildMode::FbconGate => None,
+            BuildMode::Normal | BuildMode::FbconGate | BuildMode::SyscallCounts => None,
             BuildMode::Selftest => Some("selftest"),
             BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench => Some("test-harness"),
         }
@@ -270,6 +274,7 @@ impl BuildMode {
         match self {
             BuildMode::TestHarnessNoPs2Irq => Some("test-harness,no-ps2-irq"),
             BuildMode::FbconGate => Some("fbcon-gate"),
+            BuildMode::SyscallCounts => Some("syscall-counts"),
             other => other.features(),
         }
     }
@@ -434,6 +439,7 @@ fn main() -> ExitCode {
         Some("check-docs") => docs::cmd_check_docs(),
         Some("check-comments") => comments::cmd_check_comments(&qargs),
         Some("check-moves") => moves::cmd_check_moves(&qargs),
+        Some("check-syscalls") => syscalls::cmd_check_syscalls(&qargs),
         Some("check-size") => size::cmd_check_size(&qargs),
         Some("unsafe-inventory") => unsafe_inventory::cmd_unsafe_inventory(&qargs),
         Some("check-images") => cmd_check_images(),
@@ -457,6 +463,7 @@ fn main() -> ExitCode {
         Some("check-recovery") => cmd_check_recovery(accel, gate_size),
         Some("check-report") => cmd_check_report(accel, usb, gate_size),
         Some("check-resolutions") => cmd_check_resolutions(accel),
+        Some("syscall-counts") => syscall_counts::cmd_syscall_counts(accel),
         Some("bench-compose") => cmd_bench_compose(accel, gate_size),
         Some("throughput-stick") => cmd_throughput_stick(&qargs),
         Some("check-input") => cmd_check_input(accel, no_ps2_irq, usb, gate_size),

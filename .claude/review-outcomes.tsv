@@ -480,3 +480,23 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-02	417	a10d89cf	24	tests	optional	unverified	fixed	dddb0204	control now has a bound, two windows; the review had refuted the E.10 half
 2026-11-02	417	a10d89cf	25	rules-and-docs	optional	demonstrated	fixed	dddb0204	fifth register stated, syscall4 zeroes it; struct replaces the kernel enum
 2026-11-02	417	a10d89cf	26	rules-and-docs	optional	demonstrated	fixed	dddb0204	note on the overtaken section with heading links; E.10 writes each hop as a move
+2026-11-03	418	fea437aa	1	logic	worth-fixing	demonstrated	fixed	c95ab125	a group named by a file holds it; every subsystems.toml subsystem inventories
+2026-11-03	418	fea437aa	2	logic+architecture	worth-fixing	demonstrated	fixed	c95ab125	a libkern type whose method syscalls counts at each Line::new(; heartbeat's three now fail 12/9; baseline raised to 2,262
+2026-11-03	418	fea437aa	3	logic+architecture	worth-fixing	demonstrated	fixed	21030e0f	an Op of 0 is complete; mock models a forwarding endpoint; test fails without it
+2026-11-03	418	fea437aa	4	error-paths+logic+architecture	worth-fixing	demonstrated	fixed	cac50167	a row written once with its dump's seq; a broken or orphan row fails the run; real pid shown
+2026-11-03	418	fea437aa	5	architecture	worth-fixing	demonstrated	fixed	21030e0f	doc: no namespace() shares the root, LOOKUP only; libos.md too
+2026-11-03	418	fea437aa	6	architecture+logic	worth-fixing	demonstrated	fixed	21030e0f	mock binds an endpoint as a server, no TRANSFER, base taken, syscap first; bind_server tested
+2026-11-03	418	fea437aa	7	tests	worth-fixing	demonstrated	fixed	21030e0f	four copies then a grant handed back; the guard's mutation fails it
+2026-11-03	418	fea437aa	8	tests	worth-fixing	demonstrated	fixed	21030e0f	mock records submitted ops; read and write asserted; opcode and offset mutations fail it
+2026-11-03	418	fea437aa	9	tests	worth-fixing	demonstrated	fixed	21030e0f	NEVER sleeps once, POLL makes no call; both guards' mutations fail it
+2026-11-03	418	fea437aa	10	tests+rules-and-docs	worth-fixing	demonstrated	fixed	cac50167	host tests of slots, row and name; parser reads the kernel's example row; CI-build half refuted: all-features clippy fails a broken counts.rs
+2026-11-03	418	fea437aa	11	rules-and-docs	worth-fixing	unverified	fixed	21030e0f	find_free_range takes the lowest gap, flush; doc says no guard below
+2026-11-03	418	fea437aa	12	logic	optional	demonstrated	fixed	21030e0f	docs: a copy needs TRANSFER and DUPLICATE
+2026-11-03	418	fea437aa	13	error-paths	optional	unverified	fixed	21030e0f	rename waits as a lookup and closes an answered handle; mock rename_with_handle; leak without it
+2026-11-03	418	fea437aa	14	error-paths	optional	unverified	fixed	21030e0f	recv doc names the queued-message refusal; mock refuses OutOfMemory leaving the message, tested
+2026-11-03	418	fea437aa	15	architecture	optional	demonstrated	fixed	21030e0f	enter_user aligns; start hands the top; decision log corrected in place
+2026-11-03	418	fea437aa	16	rules-and-docs	optional	unverified	fixed	21030e0f	checked rounding, TooLarge; the unchecked form panics the test
+2026-11-03	418	fea437aa	17	architecture	optional	unverified	fixed	cac50167	the two last slots named kprint and other, not numbered; no label to swap
+2026-11-03	418	fea437aa	18	error-paths	optional	demonstrated	fixed	21030e0f	test renamed; a refused restrict tested, its mutation fails it
+2026-11-03	418	fea437aa	19	tests	optional	demonstrated	fixed	21030e0f	each clamp tested at its bound; wait keeps only results in its set
+2026-11-03	418	fea437aa	20	tests	optional	demonstrated	fixed	c95ab125	a listed crate with no Rust tested, the mutation fails it; tests of the cmd_ wrappers declined

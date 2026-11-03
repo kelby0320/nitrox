@@ -1,18 +1,17 @@
 # libos — the typed, async userspace runtime
 
-**Status:** Implemented (Phase 3 slice 5). `userspace/libos` provides `Handle<T, M>`, the
-`Op` future over `sys_wait`, and `block_on`; `init` and the test harness build on it.
-Slice 7 landed too: `Handle<Process>`, `Handle<Thread>` and the authority-gated `ns_bind`
-are all present. Living document — update as implementation reveals subtleties. Sections
-still marked *deferred* (chiefly the multi-task executor) are genuinely unbuilt.
-Verified 2026-08-05.
+**Status:** Implemented. `userspace/libos` is the safe layer every userspace crate is to reach the
+kernel through: typed handles and borrows, messages, waits, mappings, namespaces and files,
+spawning and threads, the clocks, the log and the bootstrap registers, over the `Op` future and
+`block_on`. Eight crates use it today; the rest move onto it in pre-Phase-7 Part E.2–E.5, and
+`cargo xtask check-syscalls` holds each crate's raw syscalls to its count as they do. Sections
+marked *deferred* (chiefly the multi-task executor) are genuinely unbuilt. Verified 2026-11-03.
 
-`libos` is the **typed, async face of the syscall surface**. Before it, every userspace
-binary called the raw `libkern` surface directly: bare `u64` handles, `IoResult` decoded
-by byte offset, and a `po_wait` helper (submit → `sys_wait` → decode → close)
-**copy-pasted verbatim into init, eshell, parent, and fs-server**. libos replaced that
-with (a) `Handle<T, M>` typestate wrappers that make rights errors compile failures, and
-(b) an `Op` future + `block_on` so an async I/O reads as `handle.read(buf).block_on()?`.
+`libos` is the **typed, async face of the syscall surface**. Before it, every userspace binary
+called the raw `libkern` surface directly: bare `u64` handles closed by hand on every path,
+`IoResult` decoded by byte offset, a `po_wait` helper copied into fifteen crates, messages built in
+`static mut [u8; 4096]` buffers, and mappings kept as bare addresses. libos makes each of those a
+type that cannot be misused, or whose misuse needs `unsafe`.
 
 ## Position in the stack
 
@@ -21,120 +20,124 @@ Application / services
   ↓
 libstream   librsproto                 ← typed streams (TSM1), RS protocol
   ↓
-libos                                  ← THIS: Handle<T,M>, Op future, block_on
+libos                                  ← THIS
   ↓
 libkern    libheap                     ← raw syscalls; the #[global_allocator]
   ↓
 syscall instruction
 ```
 
-libos depends on `libkern` (raw syscalls + ABI types) and `core` only. It is
-**`#![no_std]` and uses no `alloc`** — see "The alloc-free constraint" — so the
-heap-free binaries (eshell, parent, fs-server) can adopt it, not just init.
+libos depends on `libkern` (raw syscalls + ABI types) and `core` only. It is **`#![no_std]` and
+uses no `alloc`**, keeps nothing that must be started, and makes no call until asked: what makes
+it fit for supervisors and PID 1 (decision log, 2026-10-27). `eshell` and `libheap` stay on
+`libkern` by choice, and so do the test harness's refusals, a call that passes what a safe wrapper
+cannot express; `tools/xtask/raw-syscalls.toml` lists them.
 
-**It is to be every userspace crate's syscall layer** (decision log, 2026-10-27); today six of 49
-crates link it. `eshell` and `libheap` stay on `libkern`, by choice. `libstream` and `librsproto`
-are drawn above it, which is where they belong, but today their `io` features reach `libkern`
-directly; pre-Phase-7 Part E moves them onto libos.
-Its alloc-free core, `libkern` as its only dependency, and nothing to start up are what make it fit
-for supervisors and PID 1, so they stay: anything that needs `alloc`, such as the multi-task
-executor, comes behind a feature.
+**It is written to the syscall surface Part E ends with** (`docs/planning/syscall-surface.md`),
+over today's calls, so a caller is written once: `Namespace::flush` and `fs::flush` are `async`
+though today's calls answer within themselves, `Spawn::path` hands the kernel a file it reads
+within the spawn, and `entropy::fill` makes a source for each call. Each is
+`TODO(surface-shape)`, and changes underneath as its sub-part lands.
 
-## Scope (slice 5) and non-scope
-
-**In:** `Handle<T, M>` wrappers over the *solid* objects (Memory, IpcChannel,
-Namespace, NotificationChannel, Entropy, PendingOperation); the `Op` future over
-`sys_wait`; single-op async methods (`read`/`write`/`ns_lookup`/…); `block_on`; an
-`io::Error`-shaped error.
-
-**Out (deferred, deliberately):**
-- **The multi-task `spawn`/run-loop executor.** It needs `alloc` (heterogeneous task
-  storage) and has no consumer — init is sequential, eshell is a single read loop, and
-  today's fs-server handles one request at a time. It lands with the first
-  concurrency-heavy service. `block_on` (drive *one* future) covers every current
-  caller. The design below is shaped so the multi-task executor is a clean addition,
-  not a rewrite.
-- **`libstream`** (typed structured I/O) — consumer-less until the shell/service-mgr
-  era; wants its own wire-protocol/streaming design pass.
-
-`Handle<Process>` / `Handle<Thread>` and the authority-gated `ns_bind` were deferred
-here in slice 5 (their ABIs finalized in slice 6, SysCaps) and **landed in slice 7** —
-see the slice 7 section below; all three are in `userspace/libos/src/objects.rs` today.
-
-## The `Handle<T, M>` typestate model
-
-The design is the one already committed on paper (`docs/archive/os-design-v5.1.md`
-§ "Handle typestate"); libos implements it. A handle is:
+## Handles: owned, borrowed, and in flight
 
 ```rust
-pub struct Handle<T, M> {
-    raw: RawHandle,          // the 64-bit capability (libkern)
-    extra: Rights,           // generic + modifier rights, checked at runtime
-    _t: PhantomData<T>,      // object-type marker
-    _m: PhantomData<M>,      // mode marker (principal rights, checked at compile time)
-}
+pub struct Handle<T, M> { raw: RawHandle, extra: Rights, .. }   // owned: closed on drop
+pub struct Ref<'a, T, M> { raw: RawHandle, extra: Rights, .. }  // borrowed: Copy, closes nothing
+pub struct Handles<const N: usize>                               // owned, on their way somewhere
 ```
 
-- **`T` — the object-type marker.** One zero-sized type per kernel object libos wraps:
-  `Memory`, `Channel`, `Namespace`, `Notify`, `Entropy`, `Pending`. `T` fixes which
-  operations *exist* (`Handle<Channel, _>` has `send`/`recv`; `Handle<Memory, _>` has
-  `map`).
-- **`M` — the mode marker.** Encodes the object's **principal** rights as a type, so
-  the wrong operation is a *compile* error. Per-type mode tables (from v5.1):
-  | Object | Modes |
-  |---|---|
-  | `Memory` | `MapRead`, `MapReadWrite`, `MapExec` |
-  | `Channel` | `Send`, `Recv`, `SendRecv` |
-  | `Namespace` | `NsReadOnly`, `NsMutable` |
-  | `Notify` / `Entropy` / `Pending` | `Only` |
-- **`extra: Rights` — the runtime band.** Generic rights (`DUPLICATE`/`TRANSFER`/
-  `INSPECT`/`WAIT`) and modifier rights (`SEEK`/`APPEND`/…) are checked at runtime
-  against `extra`, not encoded in `M`. They don't fit the mode lattice cleanly and the
-  kernel re-validates every call anyway, so encoding them as types buys little. This is
-  the deliberate compile-time/runtime split from v5.1.
+- **`T` — the object-type marker**: `Memory`, `File`, `Namespace`, `Notify`, `Channel`,
+  `Resource`, `Process`, `Thread`. It fixes which operations exist.
+- **`M` — the mode marker**, the object's **principal** rights as a type, so the wrong
+  operation is a compile error: `MapRead`/`MapReadWrite`/`MapExec` for memory and files,
+  `NsReadOnly`/`NsMutable` for namespaces, `ReadOnly`/`WriteOnly`/`ReadWrite` for a resource, and
+  `Only` where no consumer distinguishes modes (a channel, a process, a thread). Operations are
+  gated by sealed traits (`CanLookup`, `CanBind`, `CanMapWrite`, …).
+- **`extra: Rights` — the runtime band**: the generic and modifier rights, which the kernel
+  checks on every call.
 
-**Operation gating — sealed marker traits.** Operations are gated by sealed traits the
-mode types implement:
+**A `Handle` owns, a `Ref` borrows.** A `Ref` is `Copy`, has no `Drop`, and lives no longer than
+the handle it borrows (`Handle::as_ref`, or `From<&Handle>`); it cannot attenuate, so no borrow
+narrows its owner's capability in place. Every operation is written once for both, by the
+`both!` macro in `handle.rs`. Building either from a raw value is `unsafe` for its **ownership**
+claim, as `std`'s `OwnedFd::from_raw_fd` and `BorrowedFd::borrow_raw` are: a wrong `T` or `M`
+claims nothing memory rests on, as the kernel type- and rights-checks every call, so `lookup` is
+safe and a mistaken type answers `Err` at its first use.
 
-```rust
-pub trait CanRead: sealed::Sealed {}      // MapRead, MapReadWrite, Recv, SendRecv, …
-pub trait CanWrite: sealed::Sealed {}     // MapReadWrite, Send, SendRecv, NsMutable, …
+**Attenuation consumes `self`**, through `sys_handle_restrict`: `without_transfer`,
+`without_duplicate`, and `into_read_only` for memory and files. `duplicate(&self, rights)` makes
+a second handle, needing `DUPLICATE`; `stat(&self)` reads `HandleInfo`, needing `INSPECT`.
 
-impl<M: CanRecv> Handle<Channel, M> {
-    pub fn recv<'b>(&self, buf: &'b mut IpcBuf) -> Op<'b, RecvOutcome> { … }
-}
-```
+**`Handles<N>` holds handles a send or a spawn moves, or a receive brought**, and closes each
+still there when it drops. `push` takes a `Handle` (handed back when full); `take::<T, M>(i)`
+gives one out once.
 
-A `Handle<Channel, Send>` simply has no `recv` method in scope — misuse is caught by
-the type checker. Sealing (`sealed::Sealed`) keeps the trait set closed to libos.
+## The safe layer
 
-**Attenuation consumes `self`.** Narrowing rights returns a new, more-restricted handle
-and invalidates the old one, backed by `sys_handle_restrict`:
+| Module | What it holds |
+|---|---|
+| `memory` | `Handle<Memory, MapReadWrite>::create`, and `map(len) -> Mapping<M>` on memory or a file |
+| `channel` | `Msg`, and a `Channel` endpoint's `pair`, `send`, `send_held`, `send_by` and `recv` |
+| `wait` | `WaitSet<N>`, borrowing up to `N` handles, and `Signalled`, which of them a wait found |
+| `ns` | a namespace's `create`, `lookup`, `copy`, `bind`, `bind_server`, `unbind`, `bindings`, `flush` and `held` |
+| `fs` | `create`, `grow`, `truncate`, `rename` and `flush`: a file by path |
+| `process` | `Spawn`, by image or by path, and `exit` |
+| `thread` | `Stack`, and `start` |
+| `time` | `now`, `wall`, `sleep`, `sleep_until`, and `Deadline` |
+| `log` | `write`, and `Line`, one write a line |
+| `entropy` | `fill` |
+| `boot` | `Start`: `_start`'s four registers, owned and typed |
+| `io` | a `Resource`'s `read` and `write`, and a notification queue's `recv` |
 
-```rust
-impl Handle<Memory, MapReadWrite> {
-    pub fn into_read_only(self) -> Result<Handle<Memory, MapRead>>;  // sys_handle_restrict
-}
-// generic, any T/M:
-pub fn without_transfer(self) -> Result<Self>;
-pub fn without_duplicate(self) -> Result<Self>;
-```
+**A `Mapping` lends no reference to its bytes.** Another process mapping the same object, or a
+device the kernel lent it to, may write them at any time, and a Rust reference promises nothing
+does while it lives. So it copies: `read_into`, `write_from` and `fill`, each refused
+`InvalidArgument` past the end. A caller who knows nothing else writes them takes a slice with
+`unsafe fn assume_unshared`. It unmaps itself on drop; `into_raw` keeps it for the process's
+life, as the framebuffer's aperture is kept.
 
-**Construction / raw interop.** `Handle` is created from a `RawHandle` + `Rights` at the
-trust boundary — the `_start` bootstrap words, an `ns_lookup` result, a received IPC
-handle. These are `unsafe` constructors (`Handle::from_raw(raw, rights)`) because the
-caller asserts the object type matches `T`; libos can `sys_handle_stat` to check the
-type where it's cheap. `raw()`/`into_raw()` drop back to `RawHandle` for the raw paths
-(spawn ABIs, IPC handle transfer) that still need it.
+**A send never loses a handle, and a receive never leaks one.** `send` takes the handles from a
+`Handles`, which the kernel moves only when the message is queued or held; a refused send leaves
+them there, to retry or to close. `recv` answers what the message brought as a `Handles`, so a
+handle a sender attached and the receiver never asked for is closed, and its failure is a
+`KError`: `WouldBlock` for an empty ring, `PeerClosed` once the peer has gone and nothing is left.
+Any other refusal, such as `OutOfMemory` for a full handle table, leaves the message queued, so a
+wait on the channel fires again at once, and a loop that waits again without a pause spins.
+`Msg::payload` is bounded by what a message holds whatever its header says, and `set_len` refuses
+past it. `send_held` and `send_by` answer an `Op` that completes when the peer has the message,
+at once for a reply on a server's forwarding endpoint, which the kernel takes within the call;
+`send_by`'s, given up at its deadline, completes `TimedOut`, the message and its handles dropped.
+
+**A `WaitSet` borrows what it waits on**, so nothing in it closes while it is waited on, holds at
+most `MAX_WAIT_HANDLES`, by a compile-time check, and refuses a handle twice. Its `wait` answers
+the indices that signalled, with each one's `IoResult`; a poll that found nothing and a deadline
+that passed are empty answers, not errors.
+
+**A spawn moves its grants or hands them back.** `Spawn::grant` takes a `Handle`, which leaves
+this process when the child starts and comes back in `Refused` if the kernel refuses: it starts a
+child whole or not at all. `grant_copy` borrows one, which needs `TRANSFER` and `DUPLICATE`. The
+first grant is the child's `rdx`. **Without `namespace()`, the child shares this process's root**,
+`LOOKUP` only: it is not a copy, so a later bind in it reaches the child. The older
+`spawn(&SpawnArgs)` stays for the callers not yet moved.
+
+**A thread's stack is its own for the rest of the process's life**: nothing tells a process that
+a thread of its has ended, so nothing could give the stack back safely. `Stack::new` is one
+mapping each, and `start` hands the kernel its top, which enters every thread with `rsp` 8 below a
+16-byte boundary, as a `call` would leave it (`enter_user`). A thread's entry is `extern "C"
+fn(u64, u64, u64, u64) -> !`, `rcx` its `arg0`. An overrun lands in the mapping below until a
+hint-less map leaves a gap there, `TODO(thread-stack-guard)`.
 
 ## The async model
 
-**`Op<'b, R>` — the core future.** Every potentially-blocking call returns an `Op`: a
-future that wraps an in-flight `PendingOperation` handle plus the borrowed completion
-scratch, and resolves to `R` (bytes transferred, a resolved handle, `()`). It is
-`#[must_use]`, borrows its output buffer for `'b`, and impls `core::future::Future`:
+**`Op` — the core future.** Every potentially-blocking call is an `Op`, or an `async fn` that
+awaits one: a future that wraps an in-flight `PendingOperation` handle and resolves to its
+`IoResult`, which the method turns into what it answers (bytes transferred, a resolved handle,
+`()`). It is `#[must_use]` and impls `core::future::Future`. It is one of three kinds, by what
+its drop must see to: an I/O's, a lookup's, or one whose completion is a status alone, such as
+a held send's.
 
-- **Constructed by** the async method (`handle.read(buf)`), which issues
+- **Constructed by** the async method (`handle.read(..)`), which issues
   `sys_io_submit` immediately (the submit never blocks) and holds the returned PO.
   (A pre-signalled PO — zero-length / cache hit — is handled uniformly.)
 - **`poll`**: reads the PO's completion with a non-blocking `sys_wait`. If complete, decode
@@ -167,9 +170,8 @@ registered, or whose wait failed, sleeps that millisecond rather than spinning, 
 on no handles, which the kernel never refuses. Deadlines resolve on the kernel's 10 ms tick, so
 each of these takes up to a tick.
 This *is* the executor for a single task — the same poll/wait loop a multi-task version
-would run, minus the ready-queue. It collapses the copy-pasted `po_wait`: init and
-eshell call `handle.read(buf).block_on()?` (or a `deadline`-bounded variant) instead of
-hand-rolling submit/wait/decode/close.
+would run, minus the ready-queue. A sequential caller writes `block_on(handle.read(..))?` in
+place of a hand-rolled submit, wait, decode and close.
 
 **The future↔reactor handoff** goes through the standard `Waker`: libos owns both the
 `Op` future and `block_on`, so it constructs the `Waker` (via stable `RawWaker` /
@@ -195,127 +197,50 @@ facade re-exports rather than adapts (the "std-shaped where free" rule).
 
 ## The host-test syscall seam
 
-The calls libos makes to the kernel are a private module, `sys`, so the async machinery is
-host-testable with no kernel. Its functions take typed arguments (a path as `&[u8]`, an
-`&mut NsEntry`), so what the kernel is handed is what the types say; `sys::wait` waits on no
-more handles than its results hold, cutting both in code the host build runs too.
-`cfg(not(test))` → the real libkern `syscallN` calls; `cfg(test)` → a scriptable mock that
-**answers as the kernel does** (`InvalidHandle` for a handle it does not hold, `WouldBlock`
-for a poll that finds nothing ready, a lookup's handle installed by the first wait that reads
-it, a sleep on no handles), lets time pass in a wait with a deadline, panics on a wait for ever
-that nothing will end or a loop of waits that never does, and records calls. Host tests then cover: `Op` decodes
-`IoResult` correctly; `block_on` polls→waits→completes; a pre-signalled PO returns without
-waiting; error status → `Error` mapping; a foreign waker is never read; a dropped I/O is
-waited out; `Handle` attenuation issues the right `restrict`. (Typestate *misuse* is verified by
-compile-fail intent, not runtime tests — the type system is the test.)
+The calls libos makes to the kernel are a private module, `sys`, so everything above it is
+host-testable with no kernel. Its functions take typed arguments (a path as `&[u8]`, an `&mut
+NsEntry`), so what the kernel is handed is what the types say; `sys::wait` waits on no more
+handles than its results hold, cutting both in code the host build runs too. `cfg(not(test))` →
+the real `libkern` `syscallN` calls, and a receive through `libkern::channel_recv_raw`, the one
+place `check-recv` allows; `cfg(test)` → `sys/mock.rs`, **a small model of the kernel that
+answers as it does**: a handle table, objects whose bytes are real host memory a mapping reads,
+channels with rings and peers and a server's forwarding endpoint, namespaces of direct bindings
+and of servers, an endpoint bound as one and its lookups forwarded, which complete when time
+passes, and each call's refusals in the kernel's order — `InvalidHandle`, then `NoAccess` for a
+missing right, then `InvalidArgument`. It panics on a wait for ever that nothing
+will end, a loop of waits that never does, and an `exit`, and counts a close of a handle that is
+not there. Every wrapper is tested through it, and each guarantee above has had its test run
+against a copy of the code with that guarantee removed. (Typestate *misuse* is verified by
+compile-fail intent, not runtime tests: the type system is the test.)
 
 ## The alloc-free constraint
 
-libos core is `#![no_std]` with **no `alloc`**. `Handle<T,M>` is a `RawHandle` + `Rights`
-+ `PhantomData`; the `Op` future lives on the caller's stack; `block_on` polls on the
-stack. Nothing here needs a heap. This is a deliberate reach: the survey shows eshell,
-parent, and fs-server are all heap-free (fixed `.bss`), and keeping libos core heap-free
-lets them adopt `Handle<T,M>` + `block_on` without pulling in `libheap`. The one part
-that genuinely needs `alloc` — the multi-task executor's task storage — is exactly the
-deferred part; when it lands it is an `alloc`-gated module, not a change to the core.
-
-## The thin-entry seam (design note, not slice-5 scope)
-
-Today each bare binary rolls its own `_start` + `#[panic_handler]` (survey §6), with the
-bootstrap register ABI (`rdi`=notif, `rsi`=root-ns, `rdx`=handle0/control, `rcx`=arg0)
-hand-decoded per crate. A future consolidation of that glue into a thin libos entry
-shim is where a std port's `lang_start` cutover would localize (std owns the real
-entry/pre-main init). This slice does **not** consolidate `_start` — it dogfoods init/
-eshell onto `Handle`/`block_on` — but the design records the seam so the eventual move
-is one place, not five. (Note the load-bearing libkern `mem*` intrinsics any entry glue
-must preserve.)
+libos core is `#![no_std]` with **no `alloc`**. `Handle<T,M>` is a `RawHandle` + `Rights` +
+`PhantomData`; the `Op` future lives on the caller's stack; `block_on` polls on the stack; a
+`Msg` is one 4 KiB page, on the stack too. Nothing here needs a heap, so the filesystem servers and
+`auth-service` can adopt it without `libheap`. The one part that needs `alloc` — the
+multi-task executor's task storage — is the deferred part; when it lands it is an `alloc`-gated
+module, not a change to the core.
 
 ## ABI and dependencies
 
 - **Not part of the kernel ABI version hash** — pure userspace over the public syscalls.
 - Depends on `core` + `libkern`. **No `alloc`** in the core.
-- Consumes only *solid*-tier syscalls (handles, memory, `sys_wait`, `io_submit`,
-  notifications, channels, ns, entropy). The thread/process/authority calls it will
-  wrap later depend on ABIs that finalize in slices 6–7.
-
-## Consumers (dogfood)
-
-- **init** migrates to `Handle<T,M>` + `block_on` for its sequential bootstrap and
-  reaping loop — replacing raw `u64` handles, byte-offset `IoResult`/`Notification`
-  decoding, and its `po_wait`/`ns_lookup_wait` copies. init keeps its critical-path
-  rules (no panic/unwrap); libos surfaces errors as `Result`, never panics.
-- **eshell**'s console read loop moves onto libos byte I/O + `block_on`, staying
-  alloc-free.
-
-## Process, thread, and authority spawning (slice 7 — landed)
-
-The pieces held back from slice 5, unblocked once `SpawnArgs`/`ThreadArgs` + SysCaps were
-settled (slice 6). All of this is implemented. Two new object markers — **`Process`**, **`Thread`** — each with the
-`Only` mode (their granted rights live in `extra`; the v5.1 `ProcObserve`/`Control`/
-`Terminate` mode lattice is a later refinement, no consumer distinguishes them yet).
-
-**Typed spawn/create wrappers** — thin over the raw syscalls, returning **owning**
-handles (so a child Process or Thread handle closes on drop — init's reaping loop
-becomes "drop the handle", and a spawned child auto-reaps):
-
-```rust
-// process.rs
-pub fn spawn(args: &SpawnArgs) -> Result<Handle<Process, Only>>;   // sys_process_spawn
-// thread.rs
-pub fn create(args: &ThreadArgs) -> Result<Handle<Thread, Only>>;  // sys_thread_create
-```
-
-`SpawnArgs`/`ThreadArgs` are the libkern ABI structs (the caller fills `image`,
-handles/rights, `namespace`, `syscaps`, or the scheduling fields). The wrapper is
-deliberately thin — it types the *return* (an owning `Handle`) and maps errors; it does
-**not** hide the ABI struct. A fluent builder (`Spawn::new(image).syscaps(…).spawn()`)
-is an ergonomic layer we add if a consumer wants it; the raw-args wrapper is the
-consumer-minimal core that de-hacks the `syscall1(SYS_PROCESS_SPAWN, &args)` +
-raw-`u64`-handle + manual-close pattern in init/parent today.
-
-**The authority-gated `ns_bind`** — completes the Namespace surface (deferred in slice
-5). Gated by a sealed `CanBind` trait (only `NsMutable`), *and*, at runtime, by the
-`BIND_NAMESPACE` syscap the kernel now enforces (slice 6):
-
-```rust
-impl<M: CanBind> Handle<Namespace, M> {
-    pub fn bind(&self, path: &str, resource: RawHandle) -> Result<()>;  // sys_ns_bind
-}
-```
-
-The wrapper just issues `sys_ns_bind`; the syscap check lives in the kernel, so a caller
-without `BIND_NAMESPACE` gets `Err(NoAccess)` — surfaced as a normal `Result`.
-
-**Not in scope (still consumer-less):** a runtime `set_affinity` wrapper (affinity is
-set at creation via `ThreadArgs`; no user re-pins a running thread); the `Process` mode
-lattice; a `terminate` wrapper (no cross-process terminate syscall — reaping is
-handle-close on `ChildExited`). The `Sys` seam grows `process_spawn`/`thread_create`/
-`ns_bind` (real + mock), like slice 5.
-
-**Dogfood:** `parent` exercises all three (it spawns children, creates a worker thread,
-and `ns_create` + `ns_bind`s) and is a demo (lower-risk than init) — so it adopts the
-wrappers (staying alloc-free; the wrappers need no heap). init's spawns/reaping migrate
-where the change stays surgical.
 
 ## Open questions / deferred
 
-- The exact stable-Rust `Waker`↔reactor plumbing (Part B checkpoint above).
-- Whether the mode lattice needs `SendRecv`-style "both" modes as distinct types or a
-  trait-bound union — settle when wrapping `Channel`.
-- Multi-task executor (`spawn`, ready-queue, `select`-like joins) — deferred to the
-  first concurrent consumer; `alloc`-gated.
-- `libstream` — separate slice + wire-protocol design pass.
-- Consolidating `_start`/panic glue into a libos entry shim — future, tied to the std
-  port seam.
+- Multi-task executor (`spawn`, ready-queue, `select`-like joins) — deferred to the first
+  concurrent consumer; `alloc`-gated.
+- A `Process` mode lattice, and a channel's: no consumer distinguishes them yet.
+- Consolidating `_start`/panic glue into a libos entry shim — `boot::Start` takes the registers,
+  but each crate still writes its own `_start`, the seam a `std` port's `lang_start` replaces.
 
 ## References
 
-- `docs/archive/os-design-v5.1.md` § Handle typestate — the authoritative `Handle<T,M>`
-  design libos implements.
+- `docs/archive/os-design-v5.1.md` § Handle typestate — the `Handle<T,M>` design libos implements.
 - `docs/architecture/handle-system.md`, `docs/spec/handle-encoding.md` — the kernel
   handle table + `Rights` this wraps.
-- `docs/spec/syscall-abi.md` — `sys_wait`, `sys_io_submit`, `IoOp`/`IoResult`.
+- `docs/spec/syscall-abi.md` — every call the seam makes.
 - `docs/rationale/why-async-syscalls.md` — the async-first model libos surfaces.
-- `docs/architecture/overview.md` § Runtime libraries; `docs/planning/implementation-plan.md`
-  slice 5; the 2026-07-13 decision-log entries (userspace-runtime sequencing; libstream
-  + multi-task-executor deferral).
+- `docs/planning/safety-survey.md` § P7 — the classes the safe layer answers;
+  `docs/planning/syscall-surface.md` § E.1 — this layer, and the ratchet.

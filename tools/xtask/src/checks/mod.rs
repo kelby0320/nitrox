@@ -12,6 +12,7 @@ pub(crate) mod moves;
 mod nightly;
 mod recv;
 pub(crate) mod size;
+pub(crate) mod syscalls;
 pub(crate) mod unsafe_inventory;
 
 pub(crate) use abi::*;

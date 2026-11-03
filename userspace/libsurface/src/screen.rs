@@ -21,21 +21,17 @@ pub const SCREEN_PATH: &str = "/dev/draw/screen";
 /// `root_ns` must be a live namespace handle owned by the caller.
 pub unsafe fn read(root_ns: u64) -> Result<ScreenInfo, UiError> {
     use libkern::handle::{RawHandle, Rights};
-    use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
+    use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, Ref, block_on};
 
-    // SAFETY: the caller guarantees `root_ns` is live and owned; `borrow` never closes.
-    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-    // SAFETY: the path resolves to a read-mappable object holding one `ScreenInfo`.
-    let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(SCREEN_PATH, Rights::MAP_READ) })
-        .map_err(|_| UiError::Transport)?;
-    let addr = obj.map(SCREEN_INFO_LEN).map_err(|_| UiError::Transport)?;
-    // SAFETY: the compositor serves exactly `SCREEN_INFO_LEN` bytes here, mapped just above.
-    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, SCREEN_INFO_LEN) };
-    let info = ScreenInfo::read(bytes);
-    // The compositor mints an object per resolve; a mapping left behind holds its frames for the
-    // life of this process.
-    // SAFETY: `addr` is the mapping made above, and `bytes`, its one use, is done with.
-    let _ = unsafe { obj.unmap(addr, SCREEN_INFO_LEN) };
+    // SAFETY: the caller guarantees `root_ns` is live and owned.
+    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+    let obj: Handle<Memory, MapRead> =
+        block_on(ns.lookup(SCREEN_PATH, Rights::MAP_READ)).map_err(|_| UiError::Transport)?;
+    // The compositor mints an object per resolve; a mapping left behind would hold its frames for
+    // the life of this process.
+    let mut bytes = [0u8; SCREEN_INFO_LEN];
+    obj.map(SCREEN_INFO_LEN).and_then(|m| m.read_into(0, &mut bytes)).map_err(|_| UiError::Transport)?;
+    let info = ScreenInfo::read(&bytes);
     match info {
         Some(s) if s.width > 0 && s.height > 0 => Ok(s),
         _ => Err(UiError::Malformed),

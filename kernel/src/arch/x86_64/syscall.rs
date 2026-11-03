@@ -22,7 +22,6 @@ use core::arch::naked_asm;
 use core::mem::offset_of;
 
 use super::{gdt, regs};
-use crate::syscall::table;
 
 const MSR_EFER: u32 = 0xC000_0080;
 const EFER_SCE: u64 = 1 << 0; // syscall enable
@@ -154,7 +153,7 @@ const _: () = assert!(offset_of!(SyscallFrame, rax) == 14 * 8);
 const _: () = assert!(offset_of!(SyscallFrame, user_rsp) == 15 * 8);
 
 /// Reached from [`syscall_entry`] with `rdi = &mut frame`. Routes the frame through
-/// [`table::dispatch`]; the stub stores the returned `isize` into the frame's `rax` slot.
+/// [`crate::syscall::dispatch`]; the stub stores the returned `isize` into the frame's `rax` slot.
 ///
 /// # Safety
 /// `frame` must point at a fully-initialised [`SyscallFrame`] on the current
@@ -169,7 +168,7 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
     // SAFETY: the stub built a complete frame at the kernel stack top and
     // passed its address; valid, aligned, and unaliased for this call.
     let f = unsafe { &mut *frame };
-    let ret = table::dispatch(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
+    let ret = crate::syscall::dispatch(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
     crate::sched::end_if_ending();
     // **A syscall body must not return with interrupts enabled**: the stub's `cli` makes the
     // `pop rsp` / `sysretq` window safe regardless, and this catches the *cause*.

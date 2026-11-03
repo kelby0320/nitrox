@@ -9,7 +9,7 @@
 "kernel/src/syscall/table.rs" = 2195
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
-"userspace/compositor/src/main.rs" = 2259
+"userspace/compositor/src/main.rs" = 2255
 "userspace/desktop-shell/src/main.rs" = 1457
 "userspace/desktop-shell/src/panel.rs" = 1211
 "userspace/fs-server-ext4/src/ext4.rs" = 1846
@@ -34,7 +34,7 @@
 "userspace/nxterm/src/lib.rs" = 2339
 "userspace/service-mgr/src/main.rs" = 2070
 "userspace/storage-service/src/main.rs" = 1479
-"userspace/test-harness/src/harness.rs" = 3854
-"userspace/test-harness/src/uiclient.rs" = 1265
+"userspace/test-harness/src/harness.rs" = 3850
+"userspace/test-harness/src/uiclient.rs" = 1260
 "userspace/view-broker/src/lib.rs" = 1646
 "userspace/view-broker/src/main.rs" = 1782

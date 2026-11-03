@@ -1232,7 +1232,9 @@ handle, since `libsurface::Transport::request` moves one only on a successful se
 of who closes it otherwise; `Window::attach`, its other caller with a handle, has the same gap. The
 mapping goes on every path. Found by reading in PR #380's review (finding 6). **Trigger**: P7's
 channel send, which settles `request`'s handle contract (desk-o1): consumed on every path is the
-simplest for callers.
+simplest for callers. **libos has it since Part E.1**: its `send` takes the handles from a
+`Handles`, which keeps them on a refusal and closes them when it drops, so this ends when
+`libsurface`'s transport moves onto it, in E.2.
 
 ### Processes and memory
 
@@ -2263,7 +2265,8 @@ and `channel_recv_raw` return `Result<Received, i64>`, so each caller spells the
 matches by hand — `KError::PeerClosed.as_i32() as i64`, `KError::PeerClosed as i64`, or a local
 `E_PEER_CLOSED` — and a wrong constant compiles. A `KError` would make each a checked match. It
 waits for the receive's move to libos, whose wrappers return its typed `Error`, so the forty-odd
-callers change once: the move the safety survey's plan, in PR #398, proposes. Trigger: that move,
+callers change once: the move the safety survey's plan, in PR #398, proposes. **libos's `recv`
+answers a `KError` since Part E.1**, and the callers move onto it in E.2–E.5. Trigger: that move,
 or a status mismatched at a call site. **The same callers read a held receive as nothing queued.**
 `OutOfMemory` leaves the message queued, so their wait fires again at once and they spin until
 memory returns, which keeps the idle thread's reclamation from freeing any. `control::recv` and
@@ -2272,6 +2275,22 @@ forwarding endpoint whose peer has gone**: the compositor's, the clipboard serve
 server's stay signalled and `sys_wait` fires again at once, a spin for the rest of the boot, where
 `auth-service`'s leaves the wait set and `storage-service`'s and `device-mgr`'s exit. Only the
 registration going reaches it, which takes `service-mgr` with it.
+
+**libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
+`Namespace::flush` and `fs::flush` are `async` though `sys_ns_sync` and `sys_file_sync` answer
+within the call; `Spawn::path` hands the kernel a file, which it reads within the spawn;
+`entropy::fill` makes an `EntropyObject` for each call. Each caller is written once, against the
+shape it will keep, and the call under it changes as its sub-part of
+[`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 makes both flushes resolves or an
+`io_submit`, E.8 makes `Spawn` read the image into memory first, and E.9 makes entropy a node.
+Trigger: each of those sub-parts.
+
+**A thread's stack has no guard below it — `TODO(thread-stack-guard)`.** `libos::thread::Stack`
+is a mapping of its own, but a mapping placed without a hint lies flush against the one below, so
+a thread that overruns its stack writes into that mapping rather than faulting. The main thread's
+stack has a guard gap; no other does. The kernel's half of the safety survey's th-d9, planned in
+Part E.6 of [`syscall-surface.md`](../planning/syscall-surface.md): `find_free_range` leaves an
+unmapped page below what a hint-less map places. Trigger: E.6.
 
 **vDSO-equivalent for `sys_clock_read`.** On modern Linux, `clock_gettime` is implemented in vDSO — userspace reads TSC directly, no syscall. Nitrox initially does one syscall per `sys_clock_read`. The API shape leaves room for this optimization later (the `ClockId` enum can map to fixed memory locations) without changing call sites.
 

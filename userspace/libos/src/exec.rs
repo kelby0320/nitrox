@@ -77,7 +77,7 @@ impl Reactor {
 
 /// A deadline [`IDLE_NS`] from now; a poll if the clock cannot be read.
 fn soon() -> u64 {
-    sys::monotonic_ns().map_or(0, |now| now.saturating_add(IDLE_NS))
+    crate::time::now().map_or(0, |now| now.saturating_add(IDLE_NS))
 }
 
 /// Sleep [`IDLE_NS`], in a wait on no handles, which the kernel never refuses.
@@ -108,8 +108,7 @@ unsafe fn waker_noop(_data: *const ()) {}
 #[derive(Debug)]
 pub struct Op {
     po: u64,
-    /// Whether the PO is an I/O's, whose drop must wait for it, rather than a lookup's.
-    io: bool,
+    kind: Kind,
     finished: bool,
     /// Whether `poll` has returned `Ready`, so its result is handed out once.
     done: bool,
@@ -126,13 +125,34 @@ impl Op {
         if po < 0 {
             return Err(Error::from_status(po as i32));
         }
-        Ok(Op { po: po as u64, io: true, finished: false, done: false })
+        Ok(Op::of(po as u64, Kind::Io))
     }
 
     /// Wrap a lookup's PO; its drop waits for nothing, as the kernel frees a lookup closed unread.
     pub(crate) fn from_po(po: u64) -> Op {
-        Op { po, io: false, finished: false, done: false }
+        Op::of(po, Kind::Lookup)
     }
+
+    /// Wrap a PO whose completion is its status alone, such as a held send's; `0`, a send the
+    /// kernel delivered within the call, is complete already.
+    pub(crate) fn status(po: u64) -> Op {
+        let mut op = Op::of(po, Kind::Status);
+        op.finished = po == 0;
+        op
+    }
+
+    fn of(po: u64, kind: Kind) -> Op {
+        Op { po, kind, finished: false, done: false }
+    }
+}
+
+/// What a PO's drop has to see to: an I/O may still use its buffer, a lookup read may have
+/// installed a handle, and a status is only itself.
+#[derive(Debug, PartialEq, Eq)]
+enum Kind {
+    Io,
+    Lookup,
+    Status,
 }
 
 impl Future for Op {
@@ -143,6 +163,10 @@ impl Future for Op {
         if this.done {
             // Handed out already: a second `Ok` would give its handle two owners.
             return Poll::Ready(Err(Error::from_status(KError::InvalidHandle as i32)));
+        }
+        if this.po == 0 {
+            this.done = true;
+            return Poll::Ready(Ok(IoResult { handle: 0, status: 0, reserved: 0, result: 0 }));
         }
         let mut r = zeroed_results::<1>();
         let n = sys::wait(&[this.po], &mut r, 0);
@@ -176,19 +200,21 @@ impl Future for Op {
 
 impl Drop for Op {
     fn drop(&mut self) {
-        if self.io && !self.finished {
+        if self.kind == Kind::Io && !self.finished {
             // A full waiter queue refuses the wait for now; any other refusal is for good.
             while sys::wait(&[self.po], &mut zeroed_results::<1>(), u64::MAX) == KError::OutOfMemory as i64 {
                 sleep();
             }
-        } else if !self.io && !self.done {
+        } else if self.kind == Kind::Lookup && !self.done {
             // A wait that read the lookup installed its handle, which nothing else would close.
             let mut r = zeroed_results::<1>();
             if sys::wait(&[self.po], &mut r, 0) == 1 && r[0].status == 0 {
                 sys::handle_close(r[0].result);
             }
         }
-        sys::handle_close(self.po);
+        if self.po != 0 {
+            sys::handle_close(self.po);
+        }
     }
 }
 
@@ -378,8 +404,8 @@ mod tests {
         sys::script_next(0, 1, false);
         drop(Op::submit(RawHandle(1), &read_op()).unwrap());
         assert_eq!(sys::closed_in_flight(), 0);
-        sys::script_next(0, 2, false);
-        drop(Op::from_po(sys::ns_lookup(1, b"/x", 0) as u64));
+        let ns = sys::served("/x");
+        drop(Op::from_po(sys::ns_lookup(ns, b"/x", 0) as u64));
         assert_eq!(sys::closed_in_flight(), 1);
     }
 
@@ -399,8 +425,8 @@ mod tests {
     #[test]
     fn a_dropped_lookup_closes_the_handle_a_wait_installed() {
         sys::reset();
-        sys::script_next(0, 777, false);
-        let mut lookup = Op::from_po(sys::ns_lookup(1, b"/x", 0) as u64);
+        let ns = sys::served("/x");
+        let mut lookup = Op::from_po(sys::ns_lookup(ns, b"/x", 0) as u64);
         sys::script_next(0, 5, false);
         let mut io = Op::submit(RawHandle(1), &read_op()).unwrap();
         let mut first = true;
@@ -411,12 +437,11 @@ mod tests {
             Pin::new(&mut io).poll(cx)
         }))
         .unwrap();
-        assert!(sys::installed(777));
+        let open = sys::open_handles();
         drop(lookup);
-        assert!(!sys::installed(777));
-        sys::script_next(KError::NotFound as i32, 778, true);
+        assert_eq!(sys::open_handles(), open - 2, "its PO, and the handle its wait installed");
         let closes = sys::counts().2;
-        drop(Op::from_po(sys::ns_lookup(1, b"/y", 0) as u64));
+        drop(Op::from_po(sys::ns_lookup(ns, b"/y", 0) as u64));
         assert_eq!(sys::counts().2, closes + 1, "a failed lookup's PO, and no handle");
     }
 

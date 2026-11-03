@@ -1,0 +1,100 @@
+//! Threads in this process, each on a [`Stack`] of its own.
+
+use libkern::{RawHandle, Rights, ThreadArgs};
+
+use crate::error::{Error, Result, check};
+use crate::handle::{Handle, MapReadWrite, Memory, Only, Thread};
+use crate::memory::Mapping;
+use crate::sys;
+use libkern::KError;
+
+/// Where a thread begins: `rdi`, `rsi` and `rdx` are `0`, and `rcx`, the fourth, its `arg0`.
+pub type Entry = extern "C" fn(u64, u64, u64, u64) -> !;
+
+/// A thread's stack: a mapping of its own, which nothing below it guards, as yet.
+pub struct Stack(Mapping<MapReadWrite>);
+
+impl Stack {
+    /// `bytes` of stack, rounded up to a page.
+    // TODO(thread-stack-guard): a hint-less map places a mapping flush against the one below, so an
+    // overrun lands in it rather than faulting.
+    pub fn new(bytes: usize) -> Result<Stack> {
+        let len = bytes.checked_next_multiple_of(4096).ok_or(Error::from(KError::TooLarge))?;
+        Ok(Stack(Handle::<Memory, MapReadWrite>::create(len)?.map(len)?))
+    }
+}
+
+/// Start a thread at `entry` on `stack`, its fourth argument `arg0`.
+///
+/// **The stack is the thread's for the rest of the process's life**: nothing tells a process that
+/// a thread of its has ended, so nothing could give the stack back safely.
+pub fn start(entry: Entry, stack: Stack, arg0: u64) -> Result<Handle<Thread, Only>> {
+    let top = stack.0.as_ptr() as u64 + stack.0.len() as u64;
+    let args = ThreadArgs {
+        entry: entry as usize as u64,
+        // The top: the kernel enters with `rsp` 8 below a 16-byte boundary, as after a `call`.
+        user_sp: top,
+        arg0,
+        class: 0,
+        rt_priority: 0,
+        nice: 0,
+        cpu_affinity: 0,
+        _reserved: [0; 36],
+    };
+    // SAFETY: `entry` never returns and takes the registers the kernel sets, and the stack is this
+    // thread's alone from here on: forgotten below, never unmapped.
+    let h = check(unsafe { sys::thread_create(&args) })?;
+    let _kept = stack.0.into_raw();
+    Ok(Handle::fresh(h, Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE))
+}
+
+/// Start a thread in this process from `args` (a libkern [`ThreadArgs`]), returning an
+/// owning handle. The `RealTime` class in `args` requires the `REAL_TIME` syscap
+/// (else `Err`). The kernel grants `SIGNAL | TERMINATE | INSPECT | DUPLICATE`.
+/// # Safety
+/// `args.entry` is an `extern "C"` function that never returns, and `args.user_sp` tops a stack
+/// that nothing else uses, mapped for as long as the thread runs.
+pub unsafe fn thread_create(args: &ThreadArgs) -> Result<Handle<Thread, Only>> {
+    // SAFETY: forwarded from this fn's contract.
+    let h = check(unsafe { sys::thread_create(args) })?;
+    // SAFETY: `sys_thread_create` returned a fresh thread handle we own.
+    Ok(unsafe {
+        Handle::from_raw(RawHandle(h), Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" fn worker(_: u64, _: u64, _: u64, _arg0: u64) -> ! {
+        unreachable!("the mock starts no thread")
+    }
+
+    #[test]
+    fn a_thread_keeps_its_stack_and_is_handed_its_top() {
+        sys::reset();
+        let stack = Stack::new(5000).unwrap();
+        let (base, len) = (stack.0.as_ptr() as u64, stack.0.len() as u64);
+        assert_eq!(len, 8192);
+        let t = start(worker, stack, 42).unwrap();
+        let args = sys::threads().pop().unwrap();
+        assert_eq!((args.user_sp, args.arg0), (base + len, 42));
+        drop(t);
+        assert_eq!(sys::mappings(), 1, "the stack outlives the handle");
+    }
+
+    #[test]
+    fn a_stack_too_large_to_round_is_refused() {
+        sys::reset();
+        assert_eq!(Stack::new(usize::MAX).err().unwrap().code(), KError::TooLarge);
+    }
+
+    #[test]
+    fn a_refused_thread_gives_its_stack_back() {
+        sys::reset();
+        sys::fail_next_thread(libkern::KError::NoAccess as i32);
+        assert!(start(worker, Stack::new(4096).unwrap(), 0).is_err());
+        assert_eq!(sys::mappings(), 0, "no thread runs on it");
+    }
+}

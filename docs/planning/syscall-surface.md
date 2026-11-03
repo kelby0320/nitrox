@@ -154,7 +154,7 @@ Part J between them.**
 
 ### The heavy paths
 
-Measured with per-process counters in `dispatch`, in a probe not kept, which E.1 brings back: the
+Measured with per-process counters in `dispatch`, in a probe E.1 kept as `cargo xtask syscall-counts`: the
 release image under KVM, a real login, then each command typed at `nxsh`. The table is exact: a dump
 at each spawn and exit bounds a program's run.
 
@@ -267,6 +267,12 @@ this commits it: the counters behind a `syscall-counts` feature no shipped image
 xtask syscall-counts`, which boots that image, runs the table's commands and prints it. On demand
 and not in CI, as `check-resolutions` is: a count pinned in CI would fail on any honest change to a
 path, so E.2, E.3 and E.9 each quote its before and after. Author; `/pr-review`.
+
+**Built 2026-11-03.** Every class above is in libos, each wrapper tested through a mock that is
+now a model of the kernel, and each guarantee shown to fail its test with the guarantee removed.
+The eight crates already on libos moved onto `Ref` and the safe `lookup`; libdraw's one raw
+syscall went, leaving its two log lines. The ratchet starts at 2,262 raw syscalls in 35 entries,
+the test harness's 863 the largest. The probe's first run reproduced *The heavy paths*' table, and 3,431 calls in the session.
 
 ### E.2 The libraries, and the wire formats (P8)
 

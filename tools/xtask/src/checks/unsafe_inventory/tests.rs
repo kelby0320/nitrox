@@ -112,5 +112,32 @@ fn the_default_groups_are_tracked_crates_and_kernel_entries() {
         "kernel/src/tlb.rs",
         "kernel/src/fbcon/font.psf",
     ];
-    assert_eq!(default_groups(&tracked), ["kernel/src/sched", "kernel/src/tlb.rs", "userspace/libos"]);
+    assert_eq!(default_groups(&tracked), ["kernel/src/sched", "kernel/src/tlb", "userspace/libos"]);
+}
+
+#[test]
+fn a_kernel_module_file_and_its_directory_are_one_group() {
+    let tracked = ["kernel/src/device.rs", "kernel/src/device/tests.rs", "kernel/src/device/pci.rs"];
+    assert_eq!(default_groups(&tracked), ["kernel/src/device"]);
+}
+
+#[test]
+fn a_group_holds_its_file_and_its_directory_and_no_neighbour() {
+    let tracked = [
+        "kernel/src/device.rs",
+        "kernel/src/device/tests.rs",
+        "kernel/src/device/a/b.rs",
+        "kernel/src/device_other.rs",
+        "kernel/src/devices/x.rs",
+        "kernel/src/devicex/y.rs",
+    ];
+    let held: Vec<&str> = tracked.iter().copied().filter(|p| in_group(p, "kernel/src/device")).collect();
+    assert_eq!(held, ["kernel/src/device.rs", "kernel/src/device/tests.rs", "kernel/src/device/a/b.rs"]);
+}
+
+#[test]
+fn a_group_named_by_its_file_holds_that_file() {
+    let tracked = ["kernel/src/tlb.rs", "kernel/src/tlb/x.rs", "kernel/src/tlbx.rs"];
+    let held: Vec<&str> = tracked.iter().copied().filter(|p| in_group(p, "kernel/src/tlb.rs")).collect();
+    assert_eq!(held, ["kernel/src/tlb.rs"]);
 }
