@@ -4,6 +4,10 @@
 use super::comment_budget::git;
 use crate::*;
 
+/// The markers of a raw syscall: the `syscallN` functions of `libkern`.
+pub(super) const SYSCALLS: &[&str] =
+    &["syscall0(", "syscall1(", "syscall2(", "syscall3(", "syscall4(", "syscall5(", "syscall6("];
+
 /// Each kind, and the text that marks one in a line of code with its comments removed and its
 /// literals blanked. A raw deref counts only inside an `unsafe` block.
 const KINDS: &[(&str, &[&str])] = &[
@@ -11,7 +15,7 @@ const KINDS: &[(&str, &[&str])] = &[
     ("unsafe fn", &["unsafe fn "]),
     ("unsafe impl", &["unsafe impl"]),
     ("static mut", &["static mut "]),
-    ("raw syscall", &["syscall0(", "syscall1(", "syscall2(", "syscall3(", "syscall4(", "syscall5(", "syscall6("]),
+    ("raw syscall", SYSCALLS),
     ("raw slice", &["from_raw_parts"]),
     ("raw deref", &["&*", "&mut *", "(*"]),
     ("transmute", &["transmute"]),
@@ -38,14 +42,14 @@ impl Counts {
 
 /// Whether `path` holds only test code by its name: a `tests.rs`, a `*_tests.rs`, a
 /// `test_support.rs`, or anything under a `tests/` directory.
-fn is_test_file(path: &str) -> bool {
+pub(super) fn is_test_file(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name == "tests.rs" || name.ends_with("_tests.rs") || name == "test_support.rs" || path.contains("/tests/")
 }
 
 /// `text` with its `//` comments removed and each string and character literal's contents
 /// replaced by `x`, line for line, so a brace or a marker inside a literal is not code.
-fn blanked(text: &str) -> Vec<String> {
+pub(super) fn blanked(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
     let blank = |out: &mut String, cs: &[char]| out.extend(cs.iter().map(|&c| if c == '\n' { '\n' } else { 'x' }));
@@ -99,7 +103,7 @@ fn blanked(text: &str) -> Vec<String> {
 
 /// `lines` with every `#[cfg(test)]` item taken out: the attribute's next item, to the `}` that
 /// closes it or, with no brace, to its `;` or `,`. An item still open at the end is an error.
-fn non_test_lines(lines: Vec<String>) -> Result<Vec<String>, String> {
+pub(super) fn non_test_lines(lines: Vec<String>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -139,7 +143,7 @@ fn non_test_lines(lines: Vec<String>) -> Result<Vec<String>, String> {
 /// How often `marker` occurs in `line` where no identifier runs into it from the left, so
 /// `my_syscall1(` is not a raw syscall and `transmute_copy` still is a transmute. `(*` counts only
 /// as a place, `(*p).field`.
-fn occurrences(line: &str, marker: &str) -> usize {
+pub(super) fn occurrences(line: &str, marker: &str) -> usize {
     let mut n = 0;
     let mut from = 0;
     while let Some(at) = line[from..].find(marker) {
@@ -222,7 +226,8 @@ fn count(text: &str) -> Result<Counts, String> {
 }
 
 /// The groups to count with no paths given, from `tracked`, the tracked files: each userspace
-/// crate whose `Cargo.toml` is tracked, and each entry of `kernel/src` holding tracked Rust.
+/// crate whose `Cargo.toml` is tracked, and each module of `kernel/src` holding tracked Rust: the
+/// name without `.rs`, so `device.rs` and `device/` are `kernel/src/device`.
 fn default_groups(tracked: &[&str]) -> Vec<String> {
     let mut groups = std::collections::BTreeSet::new();
     for path in tracked {
@@ -231,12 +236,18 @@ fn default_groups(tracked: &[&str]) -> Vec<String> {
                 groups.insert(format!("userspace/{krate}"));
             }
             ["kernel", "src", entry, ..] if path.ends_with(".rs") => {
-                groups.insert(format!("kernel/src/{entry}"));
+                groups.insert(format!("kernel/src/{}", entry.strip_suffix(".rs").unwrap_or(entry)));
             }
             _ => {}
         }
     }
     groups.into_iter().collect()
+}
+
+/// Whether `path` belongs to `group`: the module file `<group>.rs` or anything under `<group>/`,
+/// so a kernel module `x.rs` and its directory `x/` are one group and `x_other.rs` is not in it.
+pub(super) fn in_group(path: &str, group: &str) -> bool {
+    path.strip_prefix(group).is_some_and(|rest| rest == ".rs" || rest.starts_with('/'))
 }
 
 /// The groups `args` name, a trailing `/` dropped so `kernel/src/mm/` and `kernel/src/mm` are one.
@@ -270,7 +281,8 @@ pub(crate) fn cmd_unsafe_inventory(args: &[String]) -> R<()> {
     let mut rows = Vec::new();
     for g in groups {
         let mut files = Vec::new();
-        for f in git(&["ls-files", "--", &g])?.lines().filter(|f| f.ends_with(".rs")) {
+        let listing = git(&["ls-files", "--", &g, &format!("{g}.rs")])?;
+        for f in listing.lines().filter(|f| f.ends_with(".rs") && in_group(f, &g)) {
             let text = fs::read_to_string(root.join(f)).map_err(|e| format!("unsafe-inventory: {f}: {e}"))?;
             files.push((f.to_string(), text));
         }
