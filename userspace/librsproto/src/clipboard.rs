@@ -28,7 +28,7 @@
 //! Counts, serials, lengths and kinds — never bytes: a clipboard eventually holds a password,
 //! and the serial console is a log file.
 
-use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+use crate::{Reader, put_u16, put_u32, put_u64};
 
 /// `Clipboard::Copy` — push an entry onto the ring. Body: [`ClipEntry`] without its serial.
 ///
@@ -202,18 +202,15 @@ impl<'a> ClipEntry<'a> {
     ///
     /// **The declared length is checked against what arrived**, not trusted.
     pub fn read(b: &'a [u8]) -> Option<ClipEntry<'a>> {
-        if b.len() < CLIP_ENTRY_HEAD {
+        let mut r = Reader::new(b);
+        let serial = r.u64()?;
+        let kind = r.u16()?;
+        let len = r.u32()? as usize;
+        r.skip(2)?;
+        if len > MAX_CLIP_BYTES {
             return None;
         }
-        let len = get_u32(b, 10) as usize;
-        if len > MAX_CLIP_BYTES || b.len() < CLIP_ENTRY_HEAD + len {
-            return None;
-        }
-        Some(ClipEntry {
-            serial: get_u64(b, 0),
-            kind: get_u16(b, 8),
-            bytes: &b[CLIP_ENTRY_HEAD..CLIP_ENTRY_HEAD + len],
-        })
+        Some(ClipEntry { serial, kind, bytes: r.bytes(len)? })
     }
 }
 
@@ -244,10 +241,10 @@ impl ClipPaste {
 
     /// Parse from `b`.
     pub fn read(b: &[u8]) -> Option<ClipPaste> {
-        if b.len() < CLIP_PASTE_LEN {
-            return None;
-        }
-        Some(ClipPaste { index: get_u32(b, 0), expect: get_u64(b, 8) })
+        let mut r = Reader::new(b);
+        let index = r.u32()?;
+        r.skip(4)?;
+        Some(ClipPaste { index, expect: r.u64()? })
     }
 }
 
@@ -299,14 +296,14 @@ impl<'a> ClipList<'a> {
     /// **The declared count is checked against the bytes that arrived** (a peer-controlled
     /// length).
     pub fn read(b: &'a [u8]) -> Option<ClipList<'a>> {
-        if b.len() < CLIP_LIST_HEAD {
+        let mut r = Reader::new(b);
+        let serial = r.u64()?;
+        let count = r.u32()? as usize;
+        r.skip(4)?;
+        if count > CLIP_RING {
             return None;
         }
-        let count = get_u32(b, 8) as usize;
-        if count > CLIP_RING || b.len() < CLIP_LIST_HEAD + count * CLIP_INFO_LEN {
-            return None;
-        }
-        Some(ClipList { serial: get_u64(b, 0), rows: &b[CLIP_LIST_HEAD..], count })
+        Some(ClipList { serial, rows: r.bytes(count * CLIP_INFO_LEN)?, count })
     }
 
     /// How many entries the ring holds.
@@ -316,9 +313,11 @@ impl<'a> ClipList<'a> {
 
     /// The rows, newest first.
     pub fn entries(&self) -> impl Iterator<Item = ClipInfo> + '_ {
-        (0..self.count).map(move |i| {
-            let o = i * CLIP_INFO_LEN;
-            ClipInfo { kind: get_u16(self.rows, o), len: get_u32(self.rows, o + 4) }
+        let mut r = Reader::new(self.rows);
+        (0..self.count).map_while(move |_| {
+            let kind = r.u16()?;
+            r.skip(2)?;
+            Some(ClipInfo { kind, len: r.u32()? })
         })
     }
 }
@@ -498,6 +497,19 @@ impl<'a> Clipboard<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 64];
+        let n = ClipEntry { serial: 4, kind: CLIP_KIND_TEXT, bytes: b"hello" }.write(&mut b).unwrap();
+        refuses_every_prefix(&b[..n], |x| ClipEntry::read(x).is_some());
+        let n = ClipPaste { index: 2, expect: 7 }.write(&mut b).unwrap();
+        refuses_every_prefix(&b[..n], |x| ClipPaste::read(x).is_some());
+        let rows = [ClipInfo { kind: CLIP_KIND_TEXT, len: 5 }, ClipInfo { kind: CLIP_KIND_TEXT, len: 9 }];
+        let n = write_list(&mut b, 3, &rows).unwrap();
+        refuses_every_prefix(&b[..n], |x| ClipList::read(x).map(|l| l.entries().count()).is_some());
+    }
 
     #[test]
     fn paths_round_trip() {

@@ -8,7 +8,7 @@
 //! **The desktop shell serves this**, so it is the one process that both serves a resource and
 //! constructs namespaces (`graphical-session.md` §3).
 
-use crate::{get_u32, put_u32};
+use crate::{Reader, put_u32};
 
 /// Longest desktop name on the wire, in bytes.
 ///
@@ -63,10 +63,7 @@ impl DesktopIndex {
 
     /// Parse from the first 4 bytes of a body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 4 {
-            return None;
-        }
-        Some(Self { index: get_u32(b, 0) })
+        Some(Self { index: Reader::new(b).u32()? })
     }
 }
 
@@ -121,29 +118,29 @@ pub struct DesktopList<'a> {
 impl<'a> DesktopList<'a> {
     /// Parse a `List` reply.
     pub fn read(b: &'a [u8]) -> Option<Self> {
-        if b.len() < 12 {
-            return None;
-        }
-        Some(Self { body: &b[12..], count: get_u32(b, 0), current: get_u32(b, 4), truncated: get_u32(b, 8) != 0 })
+        let mut r = Reader::new(b);
+        let (count, current, truncated) = (r.u32()?, r.u32()?, r.u32()? != 0);
+        Some(Self { body: r.rest(), count, current, truncated })
     }
 
     /// Walk the entries. Stops early on a malformed one rather than guessing at its length.
     pub fn entries(&self) -> impl Iterator<Item = DesktopEntry<'a>> {
-        let mut rest = self.body;
+        let mut r = Reader::new(self.body);
         let mut left = self.count;
         core::iter::from_fn(move || {
-            if left == 0 || rest.len() < 8 {
+            if left == 0 {
                 return None;
             }
-            let id = get_u32(rest, 0);
-            let len = get_u32(rest, 4) as usize;
-            if rest.len() < 8 + len || len > MAX_DESKTOP_NAME {
-                return None;
-            }
-            let name = core::str::from_utf8(&rest[8..8 + len]).ok()?;
-            rest = &rest[8 + len..];
-            left -= 1;
-            Some(DesktopEntry { id, name })
+            let entry = (|| {
+                let id = r.u32()?;
+                let len = r.u32()? as usize;
+                if len > MAX_DESKTOP_NAME {
+                    return None;
+                }
+                Some(DesktopEntry { id, name: core::str::from_utf8(r.bytes(len)?).ok()? })
+            })();
+            left = if entry.is_some() { left - 1 } else { 0 };
+            entry
         })
     }
 }
@@ -325,6 +322,23 @@ mod tests {
         DesktopIndex { index: 3 }.write(&mut b).unwrap();
         assert_eq!(DesktopIndex::read(&b).unwrap().index, 3);
         assert_eq!(DesktopIndex::read(&b[..3]), None);
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 64];
+        let n = DesktopIndex { index: 3 }.write(&mut b).unwrap();
+        refuses_every_prefix(&b[..n], |x| DesktopIndex::read(x).is_some());
+        let n = write_list(&mut b, 1, &[DesktopEntry { id: 1, name: "one" }, DesktopEntry { id: 2, name: "" }], false)
+            .unwrap();
+        for k in 0..12 {
+            assert!(DesktopList::read(&b[..k]).is_none());
+        }
+        let walk = |x: &[u8]| DesktopList::read(x).map(|l| l.entries().count());
+        survives_corruption(&b[..n], |x| walk(x).is_some());
+        assert_eq!(walk(&b[..n]), Some(2));
+        assert_eq!(walk(&b[..n - 1]), Some(1), "a cut-off second header is dropped");
     }
 
     #[cfg(feature = "io")]

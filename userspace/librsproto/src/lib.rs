@@ -245,25 +245,14 @@ pub fn encode(out: &mut [u8], op: u16, request_id: u64, flags: u32, body: &[u8],
 
 /// Parse a received `IpcMsg` payload into its envelope + body, checking magic and `body_len`.
 pub fn decode(buf: &[u8]) -> Result<Message<'_>, RsError> {
-    if buf.len() < RS_HEADER_LEN {
-        return Err(RsError::Truncated);
-    }
-    if get_u32(buf, 0) != RS_MAGIC {
+    let mut r = Reader::new(buf);
+    let header = (|| Some((r.u32()?, r.u16()?, r.u16()?, r.u64()?, r.u32()?, r.u32()?, r.u16()?, r.skip(2)?)))();
+    let (magic, version, op, request_id, flags, body_len, handle_count, ()) = header.ok_or(RsError::Truncated)?;
+    if magic != RS_MAGIC {
         return Err(RsError::BadMagic);
     }
-    let body_len = get_u32(buf, 20) as usize;
-    let end = RS_HEADER_LEN.checked_add(body_len).ok_or(RsError::BadLength)?;
-    if buf.len() < end {
-        return Err(RsError::BadLength);
-    }
-    Ok(Message {
-        version: get_u16(buf, 4),
-        op: get_u16(buf, 6),
-        request_id: get_u64(buf, 8),
-        flags: get_u32(buf, 16),
-        handle_count: get_u16(buf, 24),
-        body: &buf[RS_HEADER_LEN..end],
-    })
+    let body = r.bytes(body_len as usize).ok_or(RsError::BadLength)?;
+    Ok(Message { version, op, request_id, flags, handle_count, body })
 }
 
 pub(crate) fn put_u16(b: &mut [u8], off: usize, v: u16) {
@@ -275,21 +264,132 @@ pub(crate) fn put_u32(b: &mut [u8], off: usize, v: u32) {
 pub(crate) fn put_u64(b: &mut [u8], off: usize, v: u64) {
     b[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
-pub(crate) fn get_u16(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([b[off], b[off + 1]])
+/// A bounds-checked cursor over a received body: every read answers `None` past the end, so a
+/// parser cannot index beyond the bytes it was handed whatever its length guard says.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
 }
-pub(crate) fn get_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-pub(crate) fn get_u64(b: &[u8], off: usize) -> u64 {
-    let mut v = [0u8; 8];
-    v.copy_from_slice(&b[off..off + 8]);
-    u64::from_le_bytes(v)
+
+impl<'a> Reader<'a> {
+    /// A reader at the start of `b`.
+    pub(crate) fn new(b: &'a [u8]) -> Self {
+        Reader { b, at: 0 }
+    }
+
+    /// The next `n` bytes, or `None` (nothing consumed) if fewer remain.
+    pub(crate) fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(n)?;
+        let s = self.b.get(self.at..end)?;
+        self.at = end;
+        Some(s)
+    }
+
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.bytes(N)?.try_into().ok()
+    }
+
+    /// One byte.
+    pub(crate) fn u8(&mut self) -> Option<u8> {
+        Some(self.array::<1>()?[0])
+    }
+    /// A little-endian `u16`.
+    pub(crate) fn u16(&mut self) -> Option<u16> {
+        self.array().map(u16::from_le_bytes)
+    }
+    /// A little-endian `u32`.
+    pub(crate) fn u32(&mut self) -> Option<u32> {
+        self.array().map(u32::from_le_bytes)
+    }
+    /// A little-endian `u64`.
+    pub(crate) fn u64(&mut self) -> Option<u64> {
+        self.array().map(u64::from_le_bytes)
+    }
+    /// A little-endian `i32`.
+    pub(crate) fn i32(&mut self) -> Option<i32> {
+        self.array().map(i32::from_le_bytes)
+    }
+    /// A `u8` length, then that many bytes.
+    pub(crate) fn lenpfx_u8(&mut self) -> Option<&'a [u8]> {
+        let n = self.u8()?;
+        self.bytes(n as usize)
+    }
+    /// A `u16` length, then that many bytes.
+    pub(crate) fn lenpfx_u16(&mut self) -> Option<&'a [u8]> {
+        let n = self.u16()?;
+        self.bytes(n as usize)
+    }
+    /// Step over `n` bytes.
+    pub(crate) fn skip(&mut self, n: usize) -> Option<()> {
+        self.bytes(n).map(|_| ())
+    }
+    /// Everything not yet read; consumes it.
+    pub(crate) fn rest(&mut self) -> &'a [u8] {
+        let s = &self.b[self.at..];
+        self.at = self.b.len();
+        s
+    }
+    /// Bytes read so far.
+    pub(crate) fn at(&self) -> usize {
+        self.at
+    }
+    /// `Some(())` only if every byte has been read.
+    pub(crate) fn finish(&self) -> Option<()> {
+        (self.at == self.b.len()).then_some(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each read succeeds at exactly its width and answers `None`, consuming nothing, one byte short.
+    #[test]
+    fn reader_reads_at_the_exact_length_and_refuses_one_short() {
+        let b = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(Reader::new(&b[..1]).u8(), Some(1));
+        assert_eq!(Reader::new(&b[..2]).u16(), Some(0x0201));
+        assert_eq!(Reader::new(&b[..4]).u32(), Some(0x0403_0201));
+        assert_eq!(Reader::new(&b).u64(), Some(0x0807_0605_0403_0201));
+        assert_eq!(Reader::new(&[0xFE, 0xFF, 0xFF, 0xFF]).i32(), Some(-2));
+        assert_eq!(Reader::new(&b[..3]).bytes(3), Some(&b[..3]));
+        assert_eq!(Reader::new(&b[..3]).skip(3), Some(()));
+        assert_eq!(Reader::new(&[]).u8(), None);
+        assert_eq!(Reader::new(&b[..1]).u16(), None);
+        assert_eq!(Reader::new(&b[..3]).u32(), None);
+        assert_eq!(Reader::new(&b[..7]).u64(), None);
+        assert_eq!(Reader::new(&b[..3]).i32(), None);
+        assert_eq!(Reader::new(&b[..2]).bytes(3), None);
+        assert_eq!(Reader::new(&b[..2]).skip(3), None);
+        let mut r = Reader::new(&b[..3]);
+        assert_eq!(r.u32(), None);
+        assert_eq!(r.at(), 0, "a refused read consumes nothing");
+    }
+
+    #[test]
+    fn reader_length_prefix_past_the_end_is_refused() {
+        assert_eq!(Reader::new(&[2, 0, 7, 8]).lenpfx_u16(), Some(&[7u8, 8][..]));
+        assert_eq!(Reader::new(&[2, 0, 7]).lenpfx_u16(), None);
+        assert_eq!(Reader::new(&[0xFF, 0xFF, 7]).lenpfx_u16(), None);
+        assert_eq!(Reader::new(&[2]).lenpfx_u16(), None);
+        assert_eq!(Reader::new(&[2, 7, 8]).lenpfx_u8(), Some(&[7u8, 8][..]));
+        assert_eq!(Reader::new(&[3, 7, 8]).lenpfx_u8(), None);
+        assert_eq!(Reader::new(&[0, 0]).lenpfx_u16(), Some(&[][..]));
+        assert_eq!(Reader::new(&[]).bytes(usize::MAX), None);
+    }
+
+    #[test]
+    fn reader_tracks_position_rest_and_finish() {
+        let mut r = Reader::new(&[1, 2, 3, 4]);
+        assert_eq!(r.finish(), None);
+        assert_eq!(r.u16(), Some(0x0201));
+        assert_eq!(r.at(), 2);
+        assert_eq!(r.rest(), &[3, 4]);
+        assert_eq!(r.at(), 4);
+        assert_eq!(r.finish(), Some(()));
+        assert_eq!(r.rest(), &[] as &[u8]);
+    }
 
     #[test]
     fn envelope_round_trips() {
@@ -331,5 +431,37 @@ mod tests {
         assert_eq!(RS_MAX_BODY, 3980);
         assert!(encode(&mut page, OP_PING, 0, 0, &body[..RS_MAX_BODY + 1], 0).is_none());
         assert_eq!(encode(&mut page, OP_PING, 0, 0, &body[..RS_MAX_BODY], 0), Some(RS_MAX_PAYLOAD));
+    }
+}
+
+/// Truncation and corruption drivers shared by the modules' parser tests.
+#[cfg(test)]
+pub(crate) mod fuzz {
+    /// Feed `accepts` every prefix of `valid` and require `false` for each strict prefix: for a
+    /// body that is only valid whole.
+    pub(crate) fn refuses_every_prefix(valid: &[u8], accepts: impl Fn(&[u8]) -> bool) {
+        assert!(accepts(valid), "the whole body must parse");
+        for n in 0..valid.len() {
+            assert!(!accepts(&valid[..n]), "prefix of {n} of {} bytes was accepted", valid.len());
+        }
+        survives_corruption(valid, accepts);
+    }
+
+    /// Feed `parse` every prefix of `valid`, and of `valid` with each byte in turn flipped to
+    /// `0xFF`, `0x80` and `0x00`: it must answer, never panic.
+    pub(crate) fn survives_corruption(valid: &[u8], parse: impl Fn(&[u8]) -> bool) {
+        let mut buf = valid.to_vec();
+        for i in 0..valid.len() {
+            for flip in [0xFFu8, 0x80, 0x00] {
+                buf.copy_from_slice(valid);
+                buf[i] = flip;
+                for n in 0..=buf.len() {
+                    parse(&buf[..n]);
+                }
+            }
+        }
+        for n in 0..=valid.len() {
+            parse(&valid[..n]);
+        }
     }
 }

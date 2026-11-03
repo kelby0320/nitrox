@@ -7,7 +7,7 @@
 //! resolved lazily (`Namespace::Resolve` with `RESOLVE_FILE_LAZY`, reply `OBJECT_KIND_FILE`),
 //! distinct from `Stream` (`0x02`) and `Block` (`0x03`).
 
-use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+use crate::{Reader, put_u16, put_u32, put_u64};
 
 /// Fixed prefix of a `ReadRangeRequest` (before the suffix bytes).
 pub const READ_RANGE_REQUEST_PREFIX_LEN: usize = 16;
@@ -42,19 +42,12 @@ pub fn read_range_request(out: &mut [u8], offset: u64, len: u32, suffix: &[u8]) 
 
 /// Parse a `ReadRangeRequest` body.
 pub fn parse_read_range_request(body: &[u8]) -> Option<ReadRangeRequest<'_>> {
-    if body.len() < READ_RANGE_REQUEST_PREFIX_LEN {
-        return None;
-    }
-    let suffix_len = get_u16(body, 12) as usize;
-    let end = READ_RANGE_REQUEST_PREFIX_LEN.checked_add(suffix_len)?;
-    if body.len() < end {
-        return None;
-    }
-    Some(ReadRangeRequest {
-        offset: get_u64(body, 0),
-        len: get_u32(body, 8),
-        suffix: &body[READ_RANGE_REQUEST_PREFIX_LEN..end],
-    })
+    let mut r = Reader::new(body);
+    let offset = r.u64()?;
+    let len = r.u32()?;
+    let suffix_len = r.u16()?;
+    r.skip(2)?;
+    Some(ReadRangeRequest { offset, len, suffix: r.bytes(suffix_len as usize)? })
 }
 
 /// `ReadRangeReply` wire length (the filled bytes ride in `handles[0]` as a read-only page).
@@ -79,10 +72,10 @@ pub fn read_range_reply(out: &mut [u8], content_len: u32) -> Option<usize> {
 
 /// Parse a success `ReadRangeReply` body.
 pub fn parse_read_range_reply(body: &[u8]) -> Option<ReadRangeReply> {
-    if body.len() < READ_RANGE_REPLY_LEN {
-        return None;
-    }
-    Some(ReadRangeReply { content_len: get_u32(body, 0) })
+    let mut r = Reader::new(body);
+    let content_len = r.u32()?;
+    r.skip(4)?;
+    Some(ReadRangeReply { content_len })
 }
 
 //
@@ -121,10 +114,7 @@ pub fn read_dir_request(out: &mut [u8], cursor: u64) -> Option<usize> {
 
 /// Parse a `ReadDirRequest` body.
 pub fn parse_read_dir_request(body: &[u8]) -> Option<ReadDirRequest> {
-    if body.len() < READ_DIR_REQUEST_LEN {
-        return None;
-    }
-    Some(ReadDirRequest { cursor: get_u64(body, 0) })
+    Some(ReadDirRequest { cursor: Reader::new(body).u64()? })
 }
 
 /// Parse a `File::Touch` request body: the `file_id: u64` the file's `FILE_BLOCKS` reply
@@ -132,10 +122,7 @@ pub fn parse_read_dir_request(body: &[u8]) -> Option<ReadDirRequest> {
 /// server's **forwarding endpoint**, from the **kernel**, with **no reply**; the server stamps
 /// `mtime` from **its own** clock (`rsproto-file-ops.md` § Touch).
 pub fn parse_touch_request(body: &[u8]) -> Option<u64> {
-    if body.len() < TOUCH_REQUEST_LEN {
-        return None;
-    }
-    Some(get_u64(body, 0))
+    Reader::new(body).u64()
 }
 
 /// Bytes of a `File::Touch` request body: the file id.
@@ -308,18 +295,17 @@ impl<'a> DirReplyWriter<'a> {
 
 /// Parse a `ReadDirReply` body into its header and an [`iterator`](DirEntryIter) over entries.
 pub fn parse_read_dir_reply(body: &[u8]) -> Option<(ReadDirReplyHeader, DirEntryIter<'_>)> {
-    if body.len() < READ_DIR_REPLY_HEADER_LEN {
-        return None;
-    }
-    let header = ReadDirReplyHeader { next_cursor: get_u64(body, 0), entry_count: get_u16(body, 8) };
-    Some((header, DirEntryIter { body: &body[READ_DIR_REPLY_HEADER_LEN..], remaining: header.entry_count }))
+    let mut r = Reader::new(body);
+    let header = ReadDirReplyHeader { next_cursor: r.u64()?, entry_count: r.u16()? };
+    r.skip(2)?;
+    Some((header, DirEntryIter { entries: r, remaining: header.entry_count }))
 }
 
 /// Iterator over the packed entries of a `ReadDirReply`. Yields `None` early (ending the
 /// iteration) if the body is truncated mid-entry — a malformed reply drops its tail
 /// rather than panicking.
 pub struct DirEntryIter<'a> {
-    body: &'a [u8],
+    entries: Reader<'a>,
     remaining: u16,
 }
 
@@ -327,26 +313,25 @@ impl<'a> Iterator for DirEntryIter<'a> {
     type Item = DirEntry<'a>;
 
     fn next(&mut self) -> Option<DirEntry<'a>> {
-        if self.remaining == 0 || self.body.len() < DIR_ENTRY_PREFIX_LEN {
+        if self.remaining == 0 {
             return None;
         }
-        let name_len = self.body[5] as usize;
-        let end = DIR_ENTRY_PREFIX_LEN + name_len;
-        if self.body.len() < end {
-            self.remaining = 0;
-            return None;
-        }
-        let entry = DirEntry {
-            inode: get_u32(self.body, 0),
-            kind: self.body[4],
-            mode: get_u16(self.body, 6),
-            size: get_u64(self.body, 8),
-            mtime: get_u64(self.body, 16) as i64,
-            name: &self.body[DIR_ENTRY_PREFIX_LEN..end],
-        };
-        self.body = &self.body[end..];
-        self.remaining -= 1;
-        Some(entry)
+        let entry = self.read();
+        self.remaining = if entry.is_some() { self.remaining - 1 } else { 0 };
+        entry
+    }
+}
+
+impl<'a> DirEntryIter<'a> {
+    fn read(&mut self) -> Option<DirEntry<'a>> {
+        let r = &mut self.entries;
+        let inode = r.u32()?;
+        let kind = r.u8()?;
+        let name_len = r.u8()?;
+        let mode = r.u16()?;
+        let size = r.u64()?;
+        let mtime = r.u64()? as i64;
+        Some(DirEntry { inode, kind, mode, size, mtime, name: r.bytes(name_len as usize)? })
     }
 }
 
@@ -367,14 +352,7 @@ pub fn name_request(out: &mut [u8], name: &[u8]) -> Option<usize> {
 
 /// Parse a single-name request body.
 pub fn parse_name_request(body: &[u8]) -> Option<&[u8]> {
-    if body.len() < 2 {
-        return None;
-    }
-    let n = get_u16(body, 0) as usize;
-    if body.len() < 2 + n {
-        return None;
-    }
-    Some(&body[2..2 + n])
+    Reader::new(body).lenpfx_u16()
 }
 
 /// The longest name a session request carries: a FAT name of 255 UTF-16 units, up to 765 bytes of
@@ -404,19 +382,8 @@ pub fn rename_request(out: &mut [u8], old: &[u8], new: &[u8]) -> Option<usize> {
 
 /// Parse a `Rename` request body into `(old, new)`.
 pub fn parse_rename_request(body: &[u8]) -> Option<(&[u8], &[u8])> {
-    if body.len() < 2 {
-        return None;
-    }
-    let old_len = get_u16(body, 0) as usize;
-    let o = 2 + old_len;
-    if body.len() < o + 2 {
-        return None;
-    }
-    let new_len = get_u16(body, o) as usize;
-    if body.len() < o + 2 + new_len {
-        return None;
-    }
-    Some((&body[2..o], &body[o + 2..o + 2 + new_len]))
+    let mut r = Reader::new(body);
+    Some((r.lenpfx_u16()?, r.lenpfx_u16()?))
 }
 
 #[cfg(test)]
@@ -594,5 +561,34 @@ mod tests {
         super::put_u16(&mut buf, 12, 50);
         assert!(parse_read_range_request(&buf).is_none());
         assert!(parse_read_range_reply(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 128];
+        let n = read_range_request(&mut b, 0x2000, 4096, b"system/f").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_read_range_request(x).is_some());
+        let n = read_range_reply(&mut b, 4096).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_read_range_reply(x).is_some());
+        let n = read_dir_request(&mut b, 9).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_read_dir_request(x).is_some());
+        refuses_every_prefix(&b[..n], |x| parse_touch_request(x).is_some());
+        let n = name_request(&mut b, b"name").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_name_request(x).is_some());
+        let n = rename_request(&mut b, b"old", b"new").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_rename_request(x).is_some());
+
+        let mut w = DirReplyWriter::new(&mut b).unwrap();
+        assert!(w.push(2, DIRENT_KIND_DIR, 0o755, 10, 20, b"a"));
+        assert!(w.push(3, DIRENT_KIND_DIR, 0o644, 11, 21, b"bc"));
+        let n = w.finish(4);
+        for k in 0..READ_DIR_REPLY_HEADER_LEN {
+            assert!(parse_read_dir_reply(&b[..k]).is_none());
+        }
+        let walk = |x: &[u8]| parse_read_dir_reply(x).map(|(_, it)| it.count());
+        survives_corruption(&b[..n], |x| walk(x).is_some());
+        assert_eq!(walk(&b[..n]), Some(2));
+        assert_eq!(walk(&b[..n - 1]), Some(1), "a cut-off second entry is dropped");
     }
 }

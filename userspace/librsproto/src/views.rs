@@ -15,7 +15,7 @@
 //! the broker never touches a terminal. When the program exits the broker sends `Exited`,
 //! unsolicited.
 
-use crate::{TTY_TOKEN_LEN, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+use crate::{Reader, TTY_TOKEN_LEN, put_u16, put_u32, put_u64};
 
 /// Supervisor → broker: open a session for the principal in the body. Reply: the id (`u64`).
 pub const OP_VIEWS_OPEN_SESSION: u16 = 0x0E00;
@@ -112,15 +112,17 @@ pub fn build_outcome(out: &mut [u8], outcome: Outcome, reason: &[u8]) -> Option<
 
 /// Parse an outcome body; `None` for an unknown kind, a retry byte not 0 or 1, or a bad length.
 pub fn parse_outcome(body: &[u8]) -> Option<(Outcome, &[u8])> {
-    if body.len() < OUTCOME_PREFIX_LEN || body[1] > 1 {
+    let mut r = Reader::new(body);
+    let (kind, retry) = (r.u8()?, r.u8()?);
+    if retry > 1 {
         return None;
     }
-    let len = get_u16(body, 2) as usize;
-    let reason = body.get(OUTCOME_PREFIX_LEN..OUTCOME_PREFIX_LEN + len)?;
-    let outcome = match body[0] {
+    let len = r.u16()?;
+    let reason = r.bytes(len as usize)?;
+    let outcome = match kind {
         OUTCOME_STARTED => Outcome::Started,
         OUTCOME_NEED_PASSWORD => Outcome::NeedPassword,
-        OUTCOME_DENIED => Outcome::Denied { retry: body[1] == 1 },
+        OUTCOME_DENIED => Outcome::Denied { retry: retry == 1 },
         _ => return None,
     };
     Some((outcome, reason))
@@ -158,7 +160,7 @@ pub struct ViewRequest<'a> {
 impl<'a> ViewRequest<'a> {
     /// The program's arguments, not including its name.
     pub fn args(&self) -> Args<'a> {
-        Args { left: self.argc, rest: self.args }
+        Args { left: self.argc, rest: Reader::new(self.args) }
     }
 
     /// How many handles the message should carry: the namespace, and one per bit set.
@@ -171,7 +173,7 @@ impl<'a> ViewRequest<'a> {
 #[derive(Copy, Clone, Debug)]
 pub struct Args<'a> {
     left: u16,
-    rest: &'a [u8],
+    rest: Reader<'a>,
 }
 
 impl<'a> Iterator for Args<'a> {
@@ -180,13 +182,9 @@ impl<'a> Iterator for Args<'a> {
         if self.left == 0 {
             return None;
         }
-        // `parse_request` walked every argument before handing this out, so each length
-        // prefix is known to fit; a short read here would be a bug in that walk.
-        let len = get_u16(self.rest, 0) as usize;
-        let arg = &self.rest[2..2 + len];
-        self.rest = &self.rest[2 + len..];
-        self.left -= 1;
-        Some(arg)
+        let arg = self.rest.lenpfx_u16();
+        self.left = if arg.is_some() { self.left - 1 } else { 0 };
+        arg
     }
 }
 
@@ -254,32 +252,25 @@ pub fn build_request(
 /// body, an empty view or program, a token field whose length byte is not [`TTY_TOKEN_LEN`] or
 /// whose bytes are not all there, or bytes left over at the end.
 pub fn parse_request(body: &[u8]) -> Option<ViewRequest<'_>> {
-    let handles = *body.first()?;
+    let mut r = Reader::new(body);
+    let handles = r.u8()?;
     if handles & !REQ_KNOWN != 0 {
         return None;
     }
-    let mut at = 1usize;
-    let take = |at: &mut usize| -> Option<&[u8]> {
-        let len = get_u16(body.get(*at..*at + 2)?, 0) as usize;
-        let b = body.get(*at + 2..*at + 2 + len)?;
-        *at += 2 + len;
-        Some(b)
-    };
-    let view = take(&mut at)?;
-    let program = take(&mut at)?;
+    let view = r.lenpfx_u16()?;
+    let program = r.lenpfx_u16()?;
     if view.is_empty() || program.is_empty() {
         return None;
     }
-    let argc = get_u16(body.get(at..at + 2)?, 0);
-    at += 2;
-    let args_start = at;
+    let argc = r.u16()?;
+    let mut walked = r;
     for _ in 0..argc {
-        take(&mut at)?;
+        r.lenpfx_u16()?;
     }
-    let args = &body[args_start..at];
-    let env_len = get_u32(body.get(at..at + 4)?, 0) as usize;
-    let env = body.get(at + 4..at + 4 + env_len)?;
-    let token = match &body[at + 4 + env_len..] {
+    let args = walked.bytes(r.at() - walked.at())?;
+    let env_len = r.u32()?;
+    let env = r.bytes(env_len as usize)?;
+    let token = match r.rest() {
         [] => None,
         [len, t @ ..] if *len as usize == TTY_TOKEN_LEN && t.len() == TTY_TOKEN_LEN => {
             let mut token = [0u8; TTY_TOKEN_LEN];
@@ -302,7 +293,10 @@ pub fn build_session_id(out: &mut [u8], id: u64) -> Option<usize> {
 
 /// Parse a session id. `None` unless the body is exactly eight bytes.
 pub fn parse_session_id(body: &[u8]) -> Option<u64> {
-    (body.len() == 8).then(|| get_u64(body, 0))
+    let mut r = Reader::new(body);
+    let id = r.u64()?;
+    r.finish()?;
+    Some(id)
 }
 
 /// Length of an `Exited` body: the code, and whether the program crashed rather than exiting.
@@ -320,10 +314,11 @@ pub fn build_exited(out: &mut [u8], code: i32, crashed: bool) -> Option<usize> {
 
 /// Parse an `Exited` body into `(code, crashed)`; `None` unless [`EXITED_LEN`] bytes, flag 0 or 1.
 pub fn parse_exited(body: &[u8]) -> Option<(i32, bool)> {
-    if body.len() != EXITED_LEN || body[4] > 1 {
-        return None;
-    }
-    Some((get_u32(body, 0) as i32, body[4] == 1))
+    let mut r = Reader::new(body);
+    let code = r.i32()?;
+    let crashed = r.u8()?;
+    r.finish()?;
+    (crashed <= 1).then_some((code, crashed == 1))
 }
 
 /// One row of `List`'s reply: a view this principal may use, the programs it may run there,
@@ -349,7 +344,7 @@ pub fn push_row(out: &mut [u8], at: &mut usize, row: &Row<'_>) -> Option<()> {
     if row.view.len() > u16::MAX as usize || row.run.len() > u16::MAX as usize || out.len() < *at + need {
         return None;
     }
-    let count = get_u16(out, 0).checked_add(1)?;
+    let count = Reader::new(out).u16()?.checked_add(1)?;
     put_u16(out, *at, row.view.len() as u16);
     out[*at + 2..*at + 2 + row.view.len()].copy_from_slice(row.view);
     let r = *at + 2 + row.view.len();
@@ -363,22 +358,19 @@ pub fn push_row(out: &mut [u8], at: &mut usize, row: &Row<'_>) -> Option<()> {
 
 /// Parse a `List` reply; `None` if a row runs past the body, a bool byte is bad or bytes remain.
 pub fn parse_rows(body: &[u8], mut each: impl FnMut(Row<'_>)) -> Option<usize> {
-    let n = get_u16(body.get(..2)?, 0) as usize;
-    let mut at = 2usize;
+    let mut r = Reader::new(body);
+    let n = r.u16()?;
     for _ in 0..n {
-        let vl = get_u16(body.get(at..at + 2)?, 0) as usize;
-        let view = body.get(at + 2..at + 2 + vl)?;
-        let r = at + 2 + vl;
-        let rl = get_u16(body.get(r..r + 2)?, 0) as usize;
-        let run = body.get(r + 2..r + 2 + rl)?;
-        let p = *body.get(r + 2 + rl)?;
-        if p > 1 {
+        let view = r.lenpfx_u16()?;
+        let run = r.lenpfx_u16()?;
+        let password = r.u8()?;
+        if password > 1 {
             return None;
         }
-        each(Row { view, run, password: p == 1 });
-        at = r + 2 + rl + 1;
+        each(Row { view, run, password: password == 1 });
     }
-    (at == body.len()).then_some(n)
+    r.finish()?;
+    Some(n as usize)
 }
 
 /// One row of `Accounts`' reply.
@@ -407,7 +399,7 @@ pub fn push_account(out: &mut [u8], at: &mut usize, row: &AccountRow<'_>) -> Opt
     if out.len() < *at + need {
         return None;
     }
-    let count = get_u16(out, 0).checked_add(1)?;
+    let count = Reader::new(out).u16()?.checked_add(1)?;
     let mut w = *at;
     out[w] = row.name.len() as u8;
     out[w + 1..w + 1 + row.name.len()].copy_from_slice(row.name);
@@ -424,24 +416,20 @@ pub fn push_account(out: &mut [u8], at: &mut usize, row: &AccountRow<'_>) -> Opt
 
 /// Parse an `Accounts` reply; `None` if a row overruns the body, a bool is bad, or bytes remain.
 pub fn parse_accounts(body: &[u8], mut each: impl FnMut(AccountRow<'_>)) -> Option<usize> {
-    let n = get_u16(body.get(..2)?, 0) as usize;
-    let mut at = 2usize;
+    let mut r = Reader::new(body);
+    let n = r.u16()?;
     for _ in 0..n {
-        let nl = *body.get(at)? as usize;
-        let name = body.get(at + 1..at + 1 + nl)?;
-        let h = at + 1 + nl;
-        let hl = *body.get(h)? as usize;
-        let home = body.get(h + 1..h + 1 + hl)?;
-        let s = h + 1 + hl;
-        let sessions = get_u16(body.get(s..s + 2)?, 0);
-        let administers = *body.get(s + 2)?;
+        let name = r.lenpfx_u8()?;
+        let home = r.lenpfx_u8()?;
+        let sessions = r.u16()?;
+        let administers = r.u8()?;
         if administers > 1 {
             return None;
         }
         each(AccountRow { name, home, sessions, administers: administers == 1 });
-        at = s + 3;
     }
-    (at == body.len()).then_some(n)
+    r.finish()?;
+    Some(n as usize)
 }
 
 /// Write a `ChangePassword` body: the current password, then the new one, as `Auth::Add` lays out.
@@ -470,12 +458,10 @@ pub fn build_decide(out: &mut [u8], view: &[u8], program: &[u8]) -> Option<usize
 
 /// Parse a `Decide` body into `(view, program)`, **accounted for exactly** (else `None`).
 pub fn parse_decide(body: &[u8]) -> Option<(&[u8], &[u8])> {
-    let vl = get_u16(body.get(..2)?, 0) as usize;
-    let view = body.get(2..2 + vl)?;
-    let at = 2 + vl;
-    let pl = get_u16(body.get(at..at + 2)?, 0) as usize;
-    let program = body.get(at + 2..at + 2 + pl)?;
-    (at + 2 + pl == body.len()).then_some((view, program))
+    let mut r = Reader::new(body);
+    let (view, program) = (r.lenpfx_u16()?, r.lenpfx_u16()?);
+    r.finish()?;
+    Some((view, program))
 }
 
 /// `RemoveAccount`'s flag: remove the account's home too. Without it the home is kept.
@@ -672,7 +658,7 @@ mod tests {
         let mut small = [0u8; 2 + 1 + 5 + 1 + 11 + 2];
         let mut at = 2;
         assert!(push_account(&mut small, &mut at, &alice).is_none(), "one byte short");
-        assert_eq!((at, get_u16(&small, 0)), (2, 0), "and nothing written");
+        assert_eq!((at, u16::from_le_bytes([small[0], small[1]])), (2, 0), "and nothing written");
     }
 
     #[test]
@@ -717,5 +703,36 @@ mod tests {
         let mut long = buf[..n].to_vec();
         long.push(b'x');
         assert!(parse_password_change(&long).is_none(), "a byte left over");
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 256];
+        let n = build_outcome(&mut b, Outcome::Denied { retry: true }, b"wrong").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_outcome(x).is_some());
+        let args: [&[u8]; 2] = [b"--list", b""];
+        let n = build_request(&mut b, REQ_STDOUT, b"admin", b"date", &args, b"ENV", None).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_request(x).map(|r| r.args().count()).is_some());
+        let n = build_request(&mut b, 0, b"admin", b"date", &args, b"ENV", Some(&[7; TTY_TOKEN_LEN])).unwrap();
+        survives_corruption(&b[..n], |x| parse_request(x).map(|r| r.args().count()).is_some());
+        let n = build_session_id(&mut b, 9).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_session_id(x).is_some());
+        let n = build_exited(&mut b, -3, true).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_exited(x).is_some());
+
+        let mut at = 2;
+        b[..2].fill(0);
+        push_row(&mut b, &mut at, &Row { view: b"admin", run: b"*", password: true }).unwrap();
+        push_row(&mut b, &mut at, &Row { view: b"v", run: b"", password: false }).unwrap();
+        refuses_every_prefix(&b[..at], |x| parse_rows(x, |_| {}).is_some());
+        let mut at = 2;
+        b[..2].fill(0);
+        let row = AccountRow { name: b"alice", home: b"/home/alice", sessions: 2, administers: true };
+        push_account(&mut b, &mut at, &row).unwrap();
+        push_account(&mut b, &mut at, &AccountRow { name: b"", home: b"", sessions: 0, administers: false }).unwrap();
+        refuses_every_prefix(&b[..at], |x| parse_accounts(x, |_| {}).is_some());
+        let n = build_decide(&mut b, b"admin", b"date").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_decide(x).is_some());
     }
 }
