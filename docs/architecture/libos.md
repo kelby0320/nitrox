@@ -213,6 +213,13 @@ not there. Every wrapper is tested through it, and each guarantee above has had 
 against a copy of the code with that guarantee removed. (Typestate *misuse* is verified by
 compile-fail intent, not runtime tests: the type system is the test.)
 
+**A crate above libos takes the same model for its own host tests**, through the `mock` feature in
+its dev-dependencies: `libos = { path = "../libos", features = ["mock"] }`. `libos::mock` then
+holds the model's controls. **Only an unwinding build takes it**: the model needs `std`, which a
+binary cannot link beside its own panic handler, and every binary here aborts, so a build with
+every feature on still links the real calls into each one. A test build always unwinds. A host
+test thread starts with a fresh model, as libtest gives each test a thread of its own.
+
 ## The alloc-free constraint
 
 libos core is `#![no_std]` with **no `alloc`**. `Handle<T,M>` is a `RawHandle` + `Rights` +

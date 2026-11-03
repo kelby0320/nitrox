@@ -165,6 +165,26 @@ mod tests {
     }
 
     #[test]
+    fn a_server_can_answer_with_an_endpoint_whose_peer_reads_what_is_sent() {
+        sys::reset();
+        let (root, peer) = sys::answering("/log/x");
+        // SAFETY: the mock's handles, open for the test.
+        let (root, peer) = unsafe {
+            (
+                Ref::<Namespace, NsReadOnly>::from_raw(libkern::RawHandle(root), Rights::empty()),
+                Ref::<Channel, Only>::from_raw(libkern::RawHandle(peer), Rights::empty()),
+            )
+        };
+        let ep: Handle<Channel, Only> = block_on(root.lookup("/log/x", Rights::SEND)).unwrap();
+        let mut m = crate::Msg::new();
+        m.set(b"hi").unwrap();
+        ep.send(&m, &mut crate::Carried::new()).unwrap();
+        let mut got = crate::Msg::new();
+        peer.recv(&mut got).unwrap();
+        assert_eq!(got.payload(), b"hi");
+    }
+
+    #[test]
     fn bindings_list_in_order_then_end_and_unbind_removes() {
         sys::reset();
         let ns = ns();

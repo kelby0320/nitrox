@@ -201,8 +201,10 @@ Don't introduce YAML, JSON5, or custom parsers. The TOML crate (project-internal
 
 - Unit tests in `#[cfg(test)]` modules where possible.
 - Integration tests for services run in QEMU.
-- There is no syscall mock yet (`docs/rationale/deferred-decisions.md`): keep logic free of syscalls
-  to test it on the host, and test the paths that make them in a QEMU gate.
+- **A path through libos runs on the host against its model of the kernel**: take `libos` among a
+  crate's dev-dependencies with `features = ["mock"]`, and drive it with `libos::mock`'s controls.
+  A raw `libkern` syscall has no mock: keep that logic free of syscalls, and test the path in a
+  QEMU gate.
 - `cargo xtask miri` runs the services' unit tests under Miri, nightly in CI, where every syscall is
   refused `Unsupported` and an `exit` fails its test. A test it cannot run or finish says why beside itself, with
   `#[cfg_attr(miri, ignore = "...")]`, and a new crate's target goes on its list or says why not.

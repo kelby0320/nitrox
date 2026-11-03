@@ -46,6 +46,9 @@ enum Object {
     Device,
     /// A userspace server: a lookup through it waits for its answer, a fresh memory object.
     Server,
+    /// A userspace server that answers every lookup at once with the object it names, as the
+    /// logging service answers with an endpoint.
+    Answers(usize),
     Process,
     Thread,
     Entropy,
@@ -61,7 +64,7 @@ impl Object {
             Object::Po(_) => KObjectType::PendingOperation,
             Object::Notify(_) => KObjectType::NotificationChannel,
             Object::Device => KObjectType::DeviceNode,
-            Object::Server => KObjectType::UserspaceServerReg,
+            Object::Server | Object::Answers(_) => KObjectType::UserspaceServerReg,
             Object::Process => KObjectType::Process,
             Object::Thread => KObjectType::Thread,
             Object::Entropy => KObjectType::EntropyObject,
@@ -136,6 +139,7 @@ struct Mock {
     closed_in_flight: u32,
     /// Closes of a handle not in the table: one already closed, or moved away.
     stray_closes: u32,
+    terminated: u32,
     log: Vec<u8>,
     spawned: Vec<SpawnArgs>,
     threads: Vec<ThreadArgs>,
@@ -200,6 +204,7 @@ impl Mock {
         self.table.values().any(|&(o, _)| o == obj)
             || self.objects.iter().any(|o| match o {
                 Object::Namespace(b) => b.iter().any(|&(_, o, _)| o == obj),
+                Object::Answers(target) => *target == obj,
                 Object::Channel { ring, held, .. } => {
                     ring.iter().chain(held.iter().map(|(q, ..)| q)).any(|q| q.handles.iter().any(|&(o, _)| o == obj))
                 }
@@ -248,7 +253,7 @@ impl Mock {
 
     /// Whether `obj` is a server: a lookup through it is forwarded, and waits for an answer.
     fn serves(&self, obj: usize) -> bool {
-        matches!(self.objects[obj], Object::Server | Object::Channel { .. })
+        matches!(self.objects[obj], Object::Server | Object::Answers(_) | Object::Channel { .. })
     }
 
     /// The server whose binding is the longest prefix of `path`, as the kernel resolves one.
@@ -635,7 +640,10 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
         if !valid_path(path) {
             return e(KError::InvalidArgument);
         }
-        if m.server_for(ns, path).is_some() {
+        if let Some(server) = m.server_for(ns, path) {
+            if let Object::Answers(target) = m.objects[server] {
+                return m.lookup_po(Ok((target, rights)));
+            }
             let answer = m.object(Object::Memory(Pages::new(PAGE)));
             let lookup = Some((answer, rights));
             return m.po(Po { ready: false, never: false, status: 0, result: 0, lookup });
@@ -838,6 +846,17 @@ pub fn process_spawn(args: &SpawnArgs) -> i64 {
         }
         m.spawned.push(*args);
         m.mint(Object::Process, Rights::SIGNAL | Rights::TERMINATE)
+    })
+}
+
+/// A request the model records and the child, which never runs, ignores.
+pub fn process_terminate(process: u64) -> i64 {
+    with(|m| match m.typed(process, Rights::SIGNAL, KObjectType::Process) {
+        Ok(_) => {
+            m.terminated += 1;
+            0
+        }
+        Err(r) => r,
     })
 }
 

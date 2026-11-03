@@ -2469,7 +2469,12 @@ is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware
 CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
 survive rather than merely diagnose.
 
-**`libkern` mock-syscall test mode.** A feature-flagged mock that records and replays syscalls for host-side tests of layers above. The crate is a `cargo new` placeholder in Phase 0. Trigger: real syscalls are defined.
+~~**`libkern` mock-syscall test mode.**~~ **Built 2026-11-03, in libos rather than libkern**
+(pre-Phase-7 Part E.2): libos's `sys` seam selects a model of the kernel under its own tests, and
+under its `mock` feature in a test build, so a crate above it takes the model as a dev-dependency and
+its paths through libos run in host tests. It answers as the kernel does rather than replaying a
+record (`docs/architecture/libos.md` § *The host-test syscall seam*). A crate that calls `libkern`
+directly still has none, which the move onto libos ends.
 
 ### Auditing and observability
 

@@ -3,7 +3,9 @@
 use libkern::{KError, RawHandle, Rights, SPAWN_MAX_HANDLES, SpawnArgs, SysCaps};
 
 use crate::error::{Error, Result, check};
-use crate::handle::{CanLookup, CanMapRead, File, Handle, Handles, MapRead, Mappable, Namespace, Only, Process, Ref};
+use crate::handle::{
+    CanLookup, CanMapRead, File, Handle, Handles, MapRead, Mappable, Namespace, Only, Process, Ref, both,
+};
 use crate::sys;
 
 /// A child process to start: its image, its namespace, the handles it is given and its `arg0`.
@@ -127,6 +129,14 @@ impl<'a> Spawn<'a> {
     }
 }
 
+both!([] Process, Only {
+    /// Ask the process to exit: a `TerminateRequested` on its queue, which it may ignore, as no
+    /// process is stopped from outside. Needs `SIGNAL`; `Unsupported` if it has no queue.
+    pub fn terminate(&self) -> Result<()> {
+        check(sys::process_terminate(self.raw().0)).map(|_| ())
+    }
+});
+
 /// End this process with `status`, closing every handle it holds.
 pub fn exit(status: i32) -> ! {
     sys::process_exit(status)
@@ -217,6 +227,20 @@ mod tests {
         assert!(sys::is_open(back.raw().0));
         assert!(s.spawn().is_ok());
         assert_eq!(sys::spawned()[0].handle_count as usize, SPAWN_MAX_HANDLES);
+    }
+
+    #[test]
+    fn a_terminate_asks_and_needs_signal() {
+        sys::reset();
+        let (_ns, image) = program();
+        let child = Spawn::new(&image).spawn().ok().unwrap();
+        child.terminate().unwrap();
+        assert_eq!(sys::terminated(), 1);
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        // SAFETY: the mock answers for a handle of the wrong type; nothing uses it as memory.
+        let wrong = unsafe { Ref::<Process, Only>::from_raw(ns.raw(), Rights::empty()) };
+        assert_eq!(wrong.terminate().err().unwrap().code(), KError::NoAccess, "rights before type");
+        assert_eq!(sys::terminated(), 1);
     }
 
     #[test]

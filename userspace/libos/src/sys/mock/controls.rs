@@ -78,6 +78,20 @@ pub fn device() -> u64 {
     with(|m| m.mint(Object::Device, Rights::READ | Rights::WRITE) as u64)
 }
 
+/// A namespace whose server at `path` answers each lookup at once with one end of a channel, and
+/// the other end, for the test to read what is sent.
+pub fn answering(path: &str) -> (u64, u64) {
+    let mut ends = [0; 2];
+    channel_create(4, &mut ends);
+    with(|m| {
+        let (ours, _) = m.table[&ends[0]];
+        m.table.remove(&ends[0]);
+        let server = m.object(Object::Answers(ours));
+        let ns = m.object(Object::Namespace(vec![(path.as_bytes().to_vec(), server, u64::MAX)]));
+        (m.install(ns, Rights::LOOKUP.bits()), ends[1])
+    })
+}
+
 /// A server's forwarding endpoint, on which the kernel takes a reply within the send.
 pub fn forwarding() -> u64 {
     with(|m| {
@@ -148,6 +162,11 @@ pub fn sleeps() -> u32 {
 /// How many POs were closed before they signalled.
 pub fn closed_in_flight() -> u32 {
     with(|m| m.closed_in_flight)
+}
+
+/// How many processes were asked to exit.
+pub fn terminated() -> u32 {
+    with(|m| m.terminated)
 }
 
 /// How many closes named a handle that was not there.
