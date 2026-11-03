@@ -298,6 +298,15 @@ new server flag. **The control is `copy`'s row in the counts.**
 
 The implementer, a crate at a time, its diff read; the `Reader` to the same brief. `/pr-review`.
 
+**Built 2026-11-03.** The nine libraries make no raw syscall: the ratchet fell by their 175, to
+2,087 in 26 entries, every other crate's count as it was, as each raw function stayed as a shim
+over its typed form, `TODO(raw-handle-shims)`, for E.5. P8 went with them: the `Reader`, the
+kernel's constants held by `abi-sync-check`, and `librsproto::server`. **The probe found libos's
+executor reading each operation three times**, a poll, the wait and a poll again, which E.1's
+counts could not show with nothing yet on it: fixed, the session's programs make 293 calls where
+`main` made 299. **The copy's control is a copy over a larger file**, added to the probe: 43 calls
+of its own and 43 of the server's, from 49 and 52; a copy to a new file resolved twice before.
+
 ### E.3 The supervisors and the servers
 
 `init`, `service-mgr`, `device-mgr`, `storage-service`, `auth-service`, `tty-server`,

@@ -3767,7 +3767,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   sized by expectation; a handle dropped silently at capacity. It removes all 10 wait statics.
   Depends on: nothing (sup-o1 helps). abi, ownership, soundness, opportunities. Value high, effort
   medium. **Plan**, as rt-o2, in P7.
-- [ ] **sup-o6** encapsulate: each server hand-writes the same reply plumbing (send, `reply_error`,
+- [x] **sup-o6** encapsulate: each server hand-writes the same reply plumbing (send, `reply_error`,
   `reply_channel`, `reply_with_object`/`reply_table`, `reply_subnamespace`, `serve_dir`), and the
   copies have drifted on the rules each must keep — 19 sites (`grep -nE 'fn
   (send|send_raw|send_rs|reply_error|reply_channel|reply_with_object|reply_table|reply_subnamespace|serve_dir)\b'`;
@@ -3787,6 +3787,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   sized against the wrong bound (sup-d2), a failed reply that hangs a forwarded resolve, and IPC
   header bytes stamped by offset at 15 sites. Depends on: sup-o4 and sup-o7. opportunities. Value
   medium, effort medium. **Plan**, in P7.
+  Done in `e44c8493`: `librsproto::server`, under `io` and on libos's types: `send`, `reply_error`
+  sized to its reason and cut to fit, `reply_handle` and `reply_channel` answering `KernelError`
+  on a failed send, `reply_object` handing on exactly `MAP_READ | TRANSFER`, `reply_subnamespace`
+  with its base, and `serve_read_dir` within `RS_MAX_BODY`, building only the entries a page
+  reaches. It has no caller yet: E.3 moves the servers onto it.
 - [ ] **sup-o7** encapsulate: memory mapped by hand (stat, map, `from_raw_parts` or
   `copy_nonoverlapping`, unmap with a caller-supplied length, or never) — 10 map sites with 6
   unmaps (`grep -rn "SYS_MEMORY_MAP\|SYS_MEMORY_UNMAP\|\.map(PAGE"` over the five src dirs; 6
@@ -5030,7 +5035,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   HandleInfo 16-vs-24-byte stack smash and the 256-byte receive classes, here for sends and waits),
   a PO leaked or closed twice, and the copies' disagreement. Depends on: nothing. Lenses: abi,
   ownership, soundness, opportunities. Value high, effort medium. **Plan**, in P7.
-- [ ] **proto-o4** encapsulate: librsproto parsers check `body.len() >= CONST` and then read at
+- [x] **proto-o4** encapsulate: librsproto parsers check `body.len() >= CONST` and then read at
   fixed offsets with `get_u16/32/64` or `from_le_bytes([b[i], ..])`, which panic past the end, so
   guard and offsets agree only by hand. Three iterators validate at parse time and then index
   unchecked: `AccountList::iter` (auth.rs:218), `ClipList::entries` (clipboard.rs:318) and
@@ -5047,6 +5052,12 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   Home: librsproto `lib.rs`. Closes: a length guard that disagrees with its offsets (weakening
   `parse_ping`'s guard by one byte made a fuzz probe panic at lib.rs:286 at once). Depends on:
   nothing. Lenses: opportunities. Value medium, effort medium. **Plan**, in P8.
+  Done in `662163e6`: every parser reads through `Reader`, whose reads answer `None` past the
+  end and consume nothing when they do. The guards that only said how long a body must be went;
+  an exact length is `finish`, and the checks that say more stayed. The three iterators re-walk
+  with a reader. Each parser's test feeds every prefix of a body its encoder built and each byte
+  corrupted; against the old code with a guard weakened by one the same drivers panicked, and
+  `parse_ping` on 7 bytes now answers `None`.
 - [ ] **proto-o5** encapsulate: each IO module hand-rolls its channel I/O: IPC header offsets
   (payload_len at 4, handle_count at 8, flags at 10, payload at 24) redefined in session.rs:23-27,
   channel.rs:148-151 and setup.rs:235-237, a hand `payload_len` write, a `buf.len() <
@@ -5072,7 +5083,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   Depends on: libos gaining a `Channel`; for libstream, session-mgr's no-libos rule (via
   libsession) must be revisited or the type lives in libstream first. Lenses: abi, soundness,
   opportunities. Value medium, effort large. **Plan**, in P7.
-- [ ] **proto-o6** encapsulate: wire layouts shared across the kernel boundary are checked by
+- [x] **proto-o6** encapsulate: wire layouts shared across the kernel boundary are checked by
   nothing. kernel/src/rsproto.rs copies librsproto's constants by hand (30 shared names, all equal
   today) and `abi-sync-check` covers libkern only. The `FILE_BLOCKS` `BlockRun` layout is written
   by hand in libfsserver and parsed by hand in the kernel with no librsproto codec.
@@ -5088,6 +5099,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/librsproto userspace/libs
   has. Home: tools/xtask/src/checks/abi.rs and librsproto. Closes: the kernel and a userspace
   server reading the same reply at different offsets after one side changes. Depends on: nothing.
   Lenses: abi. Value low, effort small. **Plan**, in P8.
+  Done in `1f155f41`: a family pairs `kernel/src/rsproto.rs` with the four librsproto files, from
+  the kernel's names, as librsproto's own are not the kernel's to mirror; an alias is not read,
+  two names spelt differently are paired, and a name two user files give different values is a
+  finding. `put_block_run` writes a run at the kernel's offsets, pinned by bytes, and libfsserver
+  writes with it. `RECORD_LEN` is asserted against `DeviceRecord` under `io`.
 
 What held up: all 19 unsafe blocks have SAFETY arguments that hold. Every send buffer is a whole
 4,096-byte message (a run-time check at session.rs:219, `Box<[u8; IPC_MSG_SIZE]>` in channel.rs
