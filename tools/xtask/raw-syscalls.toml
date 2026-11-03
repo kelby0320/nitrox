@@ -16,7 +16,6 @@
 "userspace/hello" = 58
 "userspace/init" = 99
 "userspace/input-server" = 56
-"userspace/libdraw" = 2
 "userspace/libfs" = 32
 "userspace/libfsserver" = 36
 "userspace/libheap" = 5

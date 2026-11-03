@@ -205,25 +205,21 @@ impl LoadError {
     }
 }
 
-/// Load a font from `path` in `root_ns`.
+/// Load a font from `path` in `ns`.
 ///
 /// Authority is the namespace binding, as for [`acquire`](crate::acquire). It maps, copies and
 /// unmaps rather than holding the mapping: [`Font`] owns its bytes, and `ab_glyph`'s parser keeps
 /// references into them.
-///
-/// # Safety
-///
-/// `root_ns` must be a live namespace handle owned by the caller for the duration of the
-/// call. It is borrowed, never closed.
 #[cfg(feature = "io")]
-pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
-    use libkern::handle::{RawHandle, Rights};
-    use libos::{File, Handle, MapRead, Namespace, NsReadOnly, Ref, block_on};
+pub fn load_font<'a, M: libos::CanLookup + 'a>(
+    ns: impl Into<libos::Ref<'a, libos::Namespace, M>>,
+    path: &str,
+) -> Result<Font, LoadError> {
+    use libkern::handle::Rights;
+    use libos::{File, Handle, MapRead, block_on};
 
-    // SAFETY: the caller guarantees `root_ns` is live and owned.
-    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
     let obj: Handle<File, MapRead> =
-        block_on(ns.lookup(path, Rights::MAP_READ | Rights::INSPECT)).map_err(|_| LoadError::NoBinding)?;
+        block_on(ns.into().lookup(path, Rights::MAP_READ | Rights::INSPECT)).map_err(|_| LoadError::NoBinding)?;
 
     // The exact byte length: mapping is page-granular and would pad the last page with zeros.
     let info = obj.stat().map_err(|_| LoadError::Unstattable)?;
@@ -241,29 +237,49 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
     Font::from_bytes(data).ok_or(LoadError::NotAFont)
 }
 
+/// Borrow the caller's own namespace handle for one call.
+#[cfg(feature = "io")]
+fn borrowed<'a>(root_ns: u64) -> libos::Ref<'a, libos::Namespace, libos::NsReadOnly> {
+    // SAFETY: the caller's own namespace handle, open for the call, as the raw functions have
+    // always asked.
+    unsafe { libos::Ref::from_raw(libkern::handle::RawHandle(root_ns), libkern::handle::Rights::LOOKUP) }
+}
+
+/// Load a font from `path` in `root_ns`. For callers not yet on libos; the typed form is
+/// [`load_font`].
+///
+/// # Safety
+///
+/// `root_ns` must be a live namespace handle owned by the caller for the duration of the
+/// call. It is borrowed, never closed.
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+#[cfg(feature = "io")]
+pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
+    load_font(borrowed(root_ns), path)
+}
+
 /// Load the proportional face a theme names, falling back to the built-in one.
 ///
 /// Returns the face and the path it actually came from, which may not be the theme's; a caller
 /// reporting the font in use must report this one. `who` prefixes the console line a fallback
 /// prints.
-///
-/// # Safety
-///
-/// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
 #[cfg(feature = "io")]
-pub unsafe fn load_ui(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {
+pub fn load_ui_font<'a, M: libos::CanLookup + 'a>(
+    ns: impl Into<libos::Ref<'a, libos::Namespace, M>>,
+    theme: &crate::theme::Theme,
+    who: &[u8],
+) -> Result<(Font, ThemePath), LoadError> {
+    let ns = ns.into();
     let builtin = crate::theme::Theme::light().font_ui;
-    // SAFETY: forwarded from this function's own contract.
-    let (face, from) = unsafe { load_themed(root_ns, theme.font_ui, builtin, who) }?;
+    let (face, from) = load_themed(ns, theme.font_ui, builtin, who)?;
     // The built-in face gets its bold; a missing bold costs only the titles their weight.
     if from != builtin {
         return Ok((face, from));
     }
-    // SAFETY: as above.
-    match unsafe { load(root_ns, UI_BOLD_FONT_PATH) } {
+    match load_font(ns, UI_BOLD_FONT_PATH) {
         Ok(bold) => Ok((face.with_bold(bold), from)),
         Err(e) => {
-            libkern::debug::Line::new()
+            libos::log::Line::new()
                 .s(who)
                 .s(b": bold face ")
                 .s(UI_BOLD_FONT_PATH.as_bytes())
@@ -276,16 +292,39 @@ pub unsafe fn load_ui(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> 
     }
 }
 
-/// Load the fixed-advance face a theme names, falling back to the built-in one; returns the path
-/// it came from, as [`load_ui`] does.
+/// Load the proportional face a theme names. For callers not yet on libos; the typed form is
+/// [`load_ui_font`].
 ///
 /// # Safety
 ///
 /// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+#[cfg(feature = "io")]
+pub unsafe fn load_ui(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {
+    load_ui_font(borrowed(root_ns), theme, who)
+}
+
+/// Load the fixed-advance face a theme names, falling back to the built-in one; returns the path
+/// it came from, as [`load_ui_font`] does.
+#[cfg(feature = "io")]
+pub fn load_mono_font<'a, M: libos::CanLookup + 'a>(
+    ns: impl Into<libos::Ref<'a, libos::Namespace, M>>,
+    theme: &crate::theme::Theme,
+    who: &[u8],
+) -> Result<(Font, ThemePath), LoadError> {
+    load_themed(ns.into(), theme.font_mono, crate::theme::Theme::light().font_mono, who)
+}
+
+/// Load the fixed-advance face a theme names. For callers not yet on libos; the typed form is
+/// [`load_mono_font`].
+///
+/// # Safety
+///
+/// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
+// TODO(raw-handle-shims): goes when its last caller is on libos.
 #[cfg(feature = "io")]
 pub unsafe fn load_mono(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {
-    // SAFETY: forwarded from this function's own contract.
-    unsafe { load_themed(root_ns, theme.font_mono, crate::theme::Theme::light().font_mono, who) }
+    load_mono_font(borrowed(root_ns), theme, who)
 }
 
 /// `wanted`, or `builtin` if `wanted` will not load, with the path actually opened.
@@ -295,20 +334,19 @@ pub unsafe fn load_mono(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -
 /// application's namespace, so the check is here. The fallback is said aloud: silence looks like
 /// a theme that never arrived.
 #[cfg(feature = "io")]
-unsafe fn load_themed(
-    root_ns: u64,
+fn load_themed<'a, M: libos::CanLookup + 'a>(
+    ns: libos::Ref<'a, libos::Namespace, M>,
     wanted: ThemePath,
     builtin: ThemePath,
     who: &[u8],
 ) -> Result<(Font, ThemePath), LoadError> {
-    // SAFETY: forwarded from the caller's contract.
-    match unsafe { load(root_ns, wanted.as_str()) } {
+    match load_font(ns, wanted.as_str()) {
         Ok(f) => Ok((f, wanted)),
         // The built-in path itself: nothing to fall back to, and a retry reaches the same answer.
         Err(e) if wanted == builtin => Err(e),
         Err(e) => {
             // `s` rather than `untrusted`: a `ThemePath` cannot hold a control byte.
-            libkern::debug::Line::new()
+            libos::log::Line::new()
                 .s(who)
                 .s(b": theme font ")
                 .s(wanted.as_str().as_bytes())
@@ -317,8 +355,7 @@ unsafe fn load_themed(
                 .s(b"; using ")
                 .s(builtin.as_str().as_bytes())
                 .end();
-            // SAFETY: as above.
-            unsafe { load(root_ns, builtin.as_str()) }.map(|f| (f, builtin))
+            load_font(ns, builtin.as_str()).map(|f| (f, builtin))
         }
     }
 }
@@ -537,5 +574,46 @@ mod tests {
     fn garbage_is_refused_rather_than_parsed() {
         assert!(Font::from_bytes(alloc::vec![0u8; 64]).is_none());
         assert!(Font::from_bytes(Vec::new()).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "io"))]
+mod io_tests {
+    use super::*;
+    use libkern::handle::RawHandle;
+    use libkern::handle::Rights;
+    use libos::{Namespace, NsReadOnly, Ref, mock};
+
+    fn root() -> Ref<'static, Namespace, NsReadOnly> {
+        let (ns, _peer) = mock::answering("/nothing/here");
+        // SAFETY: the mock's handle, open for the test's life.
+        unsafe { Ref::from_raw(RawHandle(ns), Rights::LOOKUP) }
+    }
+
+    #[test]
+    fn a_theme_font_that_does_not_resolve_says_so_and_falls_back() {
+        mock::reset();
+        let mut theme = crate::theme::Theme::light();
+        theme.font_ui = ThemePath::new("/home/Fancy.ttf");
+        let ns = root();
+        assert_eq!(load_ui_font(ns, &theme, b"t").err(), Some(LoadError::NoBinding));
+        let said = std::string::String::from_utf8(mock::logged()).unwrap();
+        assert!(said.starts_with("t: theme font /home/Fancy.ttf did not resolve"), "{said}");
+        assert!(said.ends_with(&std::format!("; using {}\n", UI_FONT_PATH)), "{said}");
+
+        mock::reset();
+        // SAFETY: the mock's handle, open for the test's life.
+        assert_eq!(unsafe { load_ui(ns.raw().0, &theme, b"t") }.err(), Some(LoadError::NoBinding));
+        assert!(!mock::logged().is_empty(), "the raw form says it too");
+    }
+
+    #[test]
+    fn the_built_in_face_missing_is_an_error_and_says_nothing() {
+        mock::reset();
+        let ns = root();
+        let theme = crate::theme::Theme::light();
+        assert_eq!(load_mono_font(ns, &theme, b"t").err(), Some(LoadError::NoBinding));
+        assert!(mock::logged().is_empty());
+        assert_eq!(load_font(ns, "/x").err(), Some(LoadError::NoBinding));
     }
 }

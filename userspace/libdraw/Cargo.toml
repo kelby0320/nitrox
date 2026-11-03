@@ -48,6 +48,9 @@ miniz_oxide = { version = "0.9", default-features = false, features = ["with-all
 libos = { path = "../libos", optional = true }
 libkern = { path = "../libkern", optional = true }
 
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }
+
 [features]
 # `acquire::*`: read `/dev/framebuffer/info` and map `/dev/framebuffer`.
 io = ["dep:libos", "dep:libkern"]
