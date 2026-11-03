@@ -20,7 +20,6 @@
 "userspace/libfsserver" = 36
 "userspace/libheap" = 5
 "userspace/libsession" = 59
-"userspace/libsurface" = 14
 "userspace/logging-service" = 10
 "userspace/nxedit" = 61
 "userspace/nxfiles" = 61
