@@ -38,6 +38,8 @@ enum Object {
         ring: VecDeque<Queued>,
         held: VecDeque<(Queued, usize, bool)>,
         depth: usize,
+        /// A server's forwarding endpoint, whose sends the kernel takes within the call.
+        forward: bool,
     },
     Po(Po),
     Notify(VecDeque<Notification>),
@@ -117,6 +119,10 @@ struct Mock {
     fail_bind: Option<i32>,
     fail_sync: Option<i32>,
     fail_thread: Option<i32>,
+    fail_recv: Option<i32>,
+    /// Whether the next rename's answer carries a handle, as a server's could.
+    rename_handle: bool,
+    submitted: Vec<IoOp>,
     /// What `ns_sync` and `ns_held` answer for a mount path: `(written, held)`.
     mounts: BTreeMap<Vec<u8>, (i64, i64)>,
     unseeded: u32,
@@ -239,6 +245,19 @@ impl Mock {
     fn file_at(&mut self, ns: usize, path: &[u8]) -> Option<(usize, u64)> {
         self.bindings(ns).iter().find(|(p, ..)| p == path).map(|&(_, o, r)| (o, r))
     }
+
+    /// Whether `obj` is a server: a lookup through it is forwarded, and waits for an answer.
+    fn serves(&self, obj: usize) -> bool {
+        matches!(self.objects[obj], Object::Server | Object::Channel { .. })
+    }
+
+    /// The server whose binding is the longest prefix of `path`, as the kernel resolves one.
+    fn server_for(&mut self, ns: usize, path: &[u8]) -> Option<usize> {
+        let under = |bound: &[u8]| bound == b"/" || path == bound || path.starts_with(&[bound, b"/"].concat());
+        let found =
+            self.bindings(ns).iter().filter(|(p, ..)| under(p)).max_by_key(|(p, ..)| p.len()).map(|(_, o, _)| *o);
+        found.filter(|&o| self.serves(o))
+    }
 }
 
 /// A path the kernel takes: absolute, `/`-separated, short enough, no empty, `.` or `..` part.
@@ -250,9 +269,10 @@ fn valid_path(path: &[u8]) -> bool {
 
 // --- the calls --------------------------------------------------------------
 
-pub fn io_submit(resource: u64, _op: &IoOp) -> i64 {
+pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
     with(|m| {
         m.submits += 1;
+        m.submitted.push(*op);
         if let Some(status) = m.fail_submit.take() {
             return status as i64;
         }
@@ -486,8 +506,8 @@ pub fn channel_create(depth: u64, ends: &mut [u64; 2]) -> i64 {
         let depth = if depth == 0 { 16 } else { depth as usize };
         let a = m.objects.len();
         let ring = || VecDeque::new();
-        m.object(Object::Channel { peer: a + 1, ring: ring(), held: VecDeque::new(), depth });
-        m.object(Object::Channel { peer: a, ring: ring(), held: VecDeque::new(), depth });
+        m.object(Object::Channel { peer: a + 1, ring: ring(), held: VecDeque::new(), depth, forward: false });
+        m.object(Object::Channel { peer: a, ring: ring(), held: VecDeque::new(), depth, forward: false });
         let rights =
             Rights::SEND | Rights::RECV | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT | Rights::WAIT;
         *ends = [m.install(a, rights.bits()), m.install(a + 1, rights.bits())];
@@ -510,7 +530,7 @@ pub fn channel_send(ch: u64, msg: &IpcMsg, handles: &[u64], mode: u64, _deadline
             Ok((o, _)) => o,
             Err(r) => return r,
         };
-        let Object::Channel { peer, .. } = m.objects[ours] else { unreachable!("checked") };
+        let Object::Channel { peer, forward, .. } = m.objects[ours] else { unreachable!("checked") };
         let mut moved = Vec::new();
         for &h in handles {
             match m.get(h, Rights::TRANSFER) {
@@ -521,6 +541,13 @@ pub fn channel_send(ch: u64, msg: &IpcMsg, handles: &[u64], mode: u64, _deadline
         }
         if msg.header.payload_len as usize > IPC_PAYLOAD_SIZE {
             return e(KError::InvalidArgument);
+        }
+        if forward {
+            // A reply the kernel consumes within the call, whatever the mode.
+            for h in handles {
+                m.table.remove(h);
+            }
+            return 0;
         }
         if !m.held(peer) {
             return e(KError::PeerClosed);
@@ -555,6 +582,9 @@ pub fn channel_recv(ch: u64, msg: &mut IpcMsg, handles: &mut [u64; IPC_HANDLE_MA
             Ok((o, _)) => o,
             Err(r) => return r,
         };
+        if let Some(status) = m.fail_recv.take() {
+            return status as i64;
+        }
         let Object::Channel { peer, ring, held, .. } = &mut m.objects[ours] else { unreachable!("checked") };
         let peer = *peer;
         let Some(q) = ring.pop_front() else {
@@ -605,33 +635,41 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
         if !valid_path(path) {
             return e(KError::InvalidArgument);
         }
-        let found = m.file_at(ns, path).map(|(o, bound)| (o, bound & rights)).ok_or(KError::NotFound);
-        if let Ok((server, _)) = found
-            && matches!(m.objects[server], Object::Server)
-        {
+        if m.server_for(ns, path).is_some() {
             let answer = m.object(Object::Memory(Pages::new(PAGE)));
             let lookup = Some((answer, rights));
             return m.po(Po { ready: false, never: false, status: 0, result: 0, lookup });
         }
+        let found = m.file_at(ns, path).map(|(o, bound)| (o, bound & rights)).ok_or(KError::NotFound);
         m.lookup_po(found)
     })
 }
 
+/// As the kernel's: the syscap, the namespace, the paths, then the resource. An endpoint binds as
+/// a server, needing no right and taking a base; anything else directly, needing `TRANSFER`.
 pub fn ns_bind(ns: u64, path: &[u8], resource: u64, base: &[u8]) -> i64 {
     with(|m| {
+        if let Some(status) = m.fail_bind.take() {
+            return status as i64;
+        }
         let ns = match m.namespace(ns, Rights::BIND) {
             Ok(o) => o,
             Err(r) => return r,
         };
-        if let Some(status) = m.fail_bind.take() {
-            return status as i64;
+        if !valid_path(path) || !(base.is_empty() || (valid_path(base) && base != b"/" && base.len() <= 128)) {
+            return e(KError::InvalidArgument);
         }
-        let (obj, rights) = match m.get(resource, Rights::TRANSFER) {
+        let (obj, rights) = match m.get(resource, Rights::empty()) {
             Ok(got) => got,
             Err(r) => return r,
         };
-        if !base.is_empty() || !valid_path(path) {
-            return e(KError::InvalidArgument);
+        if !matches!(m.objects[obj], Object::Channel { .. }) {
+            if !base.is_empty() {
+                return e(KError::InvalidArgument);
+            }
+            if !Rights::from_bits(rights).contains(Rights::TRANSFER) {
+                return e(KError::NoAccess);
+            }
         }
         if m.file_at(ns, path).is_some() {
             return e(KError::AlreadyExists);
@@ -753,7 +791,9 @@ pub fn file_rename(ns: u64, from: &[u8], to: &[u8], _flags: u64) -> i64 {
             }
             None => KError::NotFound as i32,
         };
-        m.po(Po { ready: true, never: false, status, result: 0, lookup: None })
+        let lookup = (status == 0 && core::mem::take(&mut m.rename_handle))
+            .then(|| (m.object(Object::Memory(Pages::new(PAGE))), Rights::MAP_READ.bits()));
+        m.po(Po { ready: true, never: false, status, result: 0, lookup })
     })
 }
 
@@ -850,142 +890,5 @@ pub fn kprint(bytes: &[u8]) {
     with(|m| m.log.extend_from_slice(bytes));
 }
 
-// --- test controls ----------------------------------------------------------
-
-/// Start the model again, empty.
-pub fn reset() {
-    MOCK.with(|m| *m.borrow_mut() = fresh());
-}
-
-/// Arm the next `io_submit` with a completion. `ready_now` = the PO is signaled
-/// immediately (a poll finds it); otherwise it completes on the next wait with a deadline.
-pub fn script_next(status: i32, result: u64, ready_now: bool) {
-    with(|m| m.script.push_back((status, result, ready_now, false)));
-}
-
-/// Arm the next `io_submit` with a PO that never signals.
-pub fn script_never() {
-    with(|m| m.script.push_back((0, 0, false, true)));
-}
-
-/// Fail the next wait with a deadline with `status`.
-pub fn fail_next_wait(status: i64) {
-    with(|m| m.fail_wait = Some(status));
-}
-
-/// Force the next `io_submit` to fail with `status`.
-pub fn fail_next_submit(status: i32) {
-    with(|m| m.fail_submit = Some(status));
-}
-
-/// Refuse the next `ns_bind` past its namespace with `status`, as a missing `BIND_NAMESPACE` is.
-pub fn fail_next_bind(status: i32) {
-    with(|m| m.fail_bind = Some(status));
-}
-
-/// Fail the next `file_sync` or `ns_sync` with `status`.
-pub fn fail_next_sync(status: i32) {
-    with(|m| m.fail_sync = Some(status));
-}
-
-/// Refuse the next `thread_create` with `status`, as a `RealTime` one without `REAL_TIME` is.
-pub fn fail_next_thread(status: i32) {
-    with(|m| m.fail_thread = Some(status));
-}
-
-/// Answer `ns_sync` of `path` with `written` and `ns_held` with `held`.
-pub fn mount(path: &str, written: i64, held: i64) {
-    with(|m| m.mounts.insert(path.as_bytes().to_vec(), (written, held)));
-}
-
-/// Let the next `reads` entropy reads find the pool unseeded.
-pub fn unseeded(reads: u32) {
-    with(|m| m.unseeded = reads);
-}
-
-/// Set the wall clock, which reads `Unsupported` until then.
-pub fn set_realtime(ns: u64) {
-    with(|m| m.realtime = Some(ns));
-}
-
-/// A handle to a device that `io_submit` takes, with `READ | WRITE`.
-pub fn device() -> u64 {
-    with(|m| m.mint(Object::Device, Rights::READ | Rights::WRITE) as u64)
-}
-
-/// A namespace with a server bound at `path`, whose lookups complete when time passes.
-pub fn served(path: &str) -> u64 {
-    with(|m| {
-        let server = m.object(Object::Server);
-        let ns = m.object(Object::Namespace(vec![(path.as_bytes().to_vec(), server, u64::MAX)]));
-        m.install(ns, Rights::LOOKUP.bits())
-    })
-}
-
-/// A handle to a notification queue holding `queued`.
-pub fn notify(queued: &[Notification]) -> u64 {
-    with(|m| m.mint(Object::Notify(queued.iter().copied().collect()), Rights::WAIT) as u64)
-}
-
-/// A handle to `h`'s object with exactly `rights`, as one a process was given would be.
-pub fn with_rights(h: u64, rights: Rights) -> u64 {
-    with(|m| {
-        let obj = m.table[&h].0;
-        m.install(obj, rights.bits())
-    })
-}
-
-/// Whether `h` names something in the table.
-pub fn is_open(h: u64) -> bool {
-    with(|m| m.table.contains_key(&h))
-}
-
-/// How many handles are open.
-pub fn open_handles() -> usize {
-    with(|m| m.table.len())
-}
-
-/// How many mappings are in place.
-pub fn mappings() -> usize {
-    with(|m| m.maps.values().map(|(_, n)| n).sum())
-}
-
-/// What was logged.
-pub fn logged() -> Vec<u8> {
-    with(|m| m.log.clone())
-}
-
-/// Every spawn's arguments, in order.
-pub fn spawned() -> Vec<SpawnArgs> {
-    with(|m| m.spawned.clone())
-}
-
-/// Every thread's arguments, in order.
-pub fn threads() -> Vec<ThreadArgs> {
-    with(|m| m.threads.clone())
-}
-
-/// Waits that slept until their deadline.
-pub fn sleeps() -> u32 {
-    with(|m| m.sleeps)
-}
-
-/// How many POs were closed before they signalled.
-pub fn closed_in_flight() -> u32 {
-    with(|m| m.closed_in_flight)
-}
-
-/// How many closes named a handle that was not there.
-pub fn stray_closes() -> u32 {
-    with(|m| m.stray_closes)
-}
-
-/// How many handles the last `wait` was handed.
-pub fn last_wait_count() -> usize {
-    with(|m| m.last_wait_count)
-}
-
-/// `(submits, waits, closes)` issued since the last `reset`.
-pub fn counts() -> (u32, u32, u32) {
-    with(|m| (m.submits, m.waits, m.closes))
-}
+mod controls;
+pub use controls::*;

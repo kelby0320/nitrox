@@ -79,8 +79,17 @@ mod tests {
         sys::reset();
         sleep(5_000_000).unwrap();
         assert_eq!((sys::sleeps(), sys::last_wait_count()), (1, 0));
+        let waits = sys::counts().1;
         sleep_until(Deadline::POLL);
-        assert_eq!(sys::sleeps(), 1, "a poll sleeps for nothing");
+        assert_eq!(sys::counts().1, waits, "a poll sleeps for nothing, and makes no call");
+        sleep_until(Deadline::NEVER);
+        assert_eq!(sys::sleeps(), 2, "for ever is the last tick, which the kernel takes");
+    }
+
+    #[test]
+    fn a_deadline_past_the_end_of_time_is_never() {
+        sys::reset();
+        assert_eq!(Deadline::after(u64::MAX).unwrap(), Deadline::NEVER);
     }
 
     #[test]

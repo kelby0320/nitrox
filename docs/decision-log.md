@@ -37535,12 +37535,13 @@ Decided in the part, for the maintainer's eye:
   pays a copy, which for a font or a file read whole it already made.
 - **A thread's stack is never given back.** Nothing tells a process that a thread of its ended, so
   nothing could unmap the stack safely: `thread::start` keeps it for the process's life, as every
-  caller does today by hand. Its `rsp` starts 8 below the stack's top, where the ABI has a function
-  find it after a `call`; the kernel starts a process's first thread on the 16-byte boundary itself,
-  which was not examined here.
+  caller does today by hand. It hands the kernel the stack's top, as `thread-args.md` asks: the
+  kernel enters every thread, the first included, with `rsp` 8 below a 16-byte boundary, as a
+  `call` leaves it.
 - **The ratchet counts `libkern`'s own wrappers**, `kprint` and `exit` among them, derived from
-  `libkern`'s source each run, so its 1,930 counts every call of a wrapper that makes one beside
-  the `syscallN`s the detail pass counted. A crate moved onto libos takes those too.
+  `libkern`'s source each run, and the making of a `libkern` type whose own method makes a
+  syscall, each `debug::Line::new(`, as its `end` prints. So its 2,262 counts those beside the
+  `syscallN`s the detail pass counted, and a crate moved onto libos takes them too.
 - **The probe names a process by its first console line**, as the kernel keeps no name: a program
   that never logs is `-`, and both filesystem servers are `fs-server`.
 - **Three things are in the target's shape over today's calls**, `TODO(surface-shape)`: the two

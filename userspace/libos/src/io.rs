@@ -42,18 +42,29 @@ both!([] Notify, Only {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MapReadWrite, ReadOnly, Ref, block_on};
+    use crate::{MapReadWrite, ReadWrite, Ref, block_on};
     use libkern::{RawHandle, Rights};
 
     #[test]
-    fn a_read_builds_an_op_and_completes() {
+    fn a_read_and_a_write_build_their_ops_and_complete() {
         sys::reset();
-        sys::script_next(0, 12, true);
         let dev = sys::device();
         // SAFETY: the mock's device, open for the test.
-        let res = unsafe { Ref::<Resource, ReadOnly>::from_raw(RawHandle(dev), Rights::READ) };
-        let buf = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
-        assert_eq!(block_on(res.read(&buf, 0, 0, 64)).unwrap(), 12);
+        let res = unsafe { Ref::<Resource, ReadWrite>::from_raw(RawHandle(dev), Rights::READ) };
+        let buf = Handle::<Memory, MapReadWrite>::create(8192).unwrap();
+        sys::script_next(0, 12, true);
+        assert_eq!(block_on(res.read(&buf, 100, 4096, 64)).unwrap(), 12);
+        sys::script_next(0, 7, true);
+        assert_eq!(block_on(res.write(&buf, 200, 512, 7)).unwrap(), 7);
+        let op = |opcode, buf_offset, offset, length| IoOp {
+            opcode,
+            flags: 0,
+            buffer: buf.raw().0,
+            buf_offset,
+            offset,
+            length,
+        };
+        assert_eq!(sys::submitted(), [op(IO_OPCODE_READ, 100, 4096, 64), op(IO_OPCODE_WRITE, 200, 512, 7)]);
     }
 
     #[test]

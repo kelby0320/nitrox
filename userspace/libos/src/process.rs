@@ -10,7 +10,7 @@ use crate::sys;
 ///
 /// **A grant moves or copies.** [`grant`](Spawn::grant) takes a handle, which the child has
 /// once it starts and which comes back in [`Refused`] if it does not; [`grant_copy`]
-/// (Spawn::grant_copy) borrows one, which needs `DUPLICATE`. The first grant is the child's
+/// (Spawn::grant_copy) borrows one, which needs `TRANSFER` and `DUPLICATE`. The first grant is the child's
 /// `rdx` at entry.
 pub struct Spawn<'a> {
     image: u64,
@@ -63,8 +63,8 @@ impl<'a> Spawn<'a> {
         Ok(Spawn::of(image.raw().0, Some(image)))
     }
 
-    /// The child's root: a namespace it may only look up in. Without one, a copy of this
-    /// process's root.
+    /// The child's root: a namespace it may only look up in. Without one, this process's own root,
+    /// shared and not copied: a later bind in it reaches the child too.
     pub fn namespace<M: CanLookup + 'a>(&mut self, ns: impl Into<Ref<'a, Namespace, M>>) -> &mut Self {
         self.args.namespace = ns.into().raw().0;
         self
@@ -96,8 +96,8 @@ impl<'a> Spawn<'a> {
         Ok(self)
     }
 
-    /// Give the child a copy of `h`, with at most `rights`; this process keeps its own.
-    /// `TooLarge` once [`SPAWN_MAX_HANDLES`] are granted.
+    /// Give the child a copy of `h`, with at most `rights`, which needs `TRANSFER` and `DUPLICATE`;
+    /// this process keeps its own. `TooLarge` once [`SPAWN_MAX_HANDLES`] are granted.
     pub fn grant_copy<T: 'a, M: 'a>(&mut self, h: impl Into<Ref<'a, T, M>>, rights: Rights) -> Result<&mut Self> {
         let i = self.args.handle_count as usize;
         if i == SPAWN_MAX_HANDLES {
@@ -199,6 +199,24 @@ mod tests {
         assert!(s.grant(Handle::<Memory, MapReadWrite>::create(4096).unwrap(), Rights::empty()).is_err());
         assert_eq!(s.grant_copy(&image, Rights::empty()).err().unwrap().code(), KError::TooLarge);
         assert!(block_on(Spawn::path(&ns, "/bin/y")).err().unwrap().is_not_found());
+    }
+
+    /// **A grant after four copies is handed back**: the copies fill the slots the moves' list
+    /// still has room for.
+    #[test]
+    fn a_grant_after_four_copies_is_handed_back() {
+        sys::reset();
+        let (_ns, image) = program();
+        let copies: std::vec::Vec<_> =
+            (0..SPAWN_MAX_HANDLES).map(|_| Handle::<Memory, MapReadWrite>::create(4096).unwrap()).collect();
+        let mut s = Spawn::new(&image);
+        for c in &copies {
+            s.grant_copy(c, Rights::empty()).unwrap();
+        }
+        let back = s.grant(Handle::<Memory, MapReadWrite>::create(4096).unwrap(), Rights::empty()).err().unwrap();
+        assert!(sys::is_open(back.raw().0));
+        assert!(s.spawn().is_ok());
+        assert_eq!(sys::spawned()[0].handle_count as usize, SPAWN_MAX_HANDLES);
     }
 
     #[test]

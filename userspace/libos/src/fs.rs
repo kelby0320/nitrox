@@ -60,7 +60,12 @@ pub async fn rename<'a, M: CanLookup + 'a>(
     flags: u16,
 ) -> Result<()> {
     let po = check(sys::file_rename(ns.into().raw().0, from.as_bytes(), to.as_bytes(), flags as u64))?;
-    Op::status(po).await.map(|_| ())
+    // A lookup's: a server may answer with a handle, which this closes.
+    let done = Op::from_po(po).await?;
+    if done.result != 0 {
+        sys::handle_close(done.result);
+    }
+    Ok(())
 }
 
 /// Put every page of `file` on the device; needs `MAP_WRITE`.
@@ -106,6 +111,17 @@ mod tests {
         assert!(block_on(ns.lookup::<File, MapRead>("/a", Rights::MAP_READ)).err().unwrap().is_not_found());
         assert!(block_on(ns.lookup::<File, MapRead>("/b", Rights::MAP_READ)).is_ok());
         assert!(block_on(rename(&ns, "/a", "/c", 0)).err().unwrap().is_not_found());
+    }
+
+    #[test]
+    fn a_rename_answered_with_a_handle_leaves_none_open() {
+        sys::reset();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        let _f: Handle<File, MapReadWrite> = block_on(create(&ns, "/a", 1, rw())).unwrap();
+        let open = sys::open_handles();
+        sys::rename_with_handle();
+        block_on(rename(&ns, "/a", "/b", 0)).unwrap();
+        assert_eq!(sys::open_handles(), open);
     }
 
     #[test]

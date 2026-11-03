@@ -102,8 +102,11 @@ life, as the framebuffer's aperture is kept.
 them there, to retry or to close. `recv` answers what the message brought as a `Handles`, so a
 handle a sender attached and the receiver never asked for is closed, and its failure is a
 `KError`: `WouldBlock` for an empty ring, `PeerClosed` once the peer has gone and nothing is left.
+Any other refusal, such as `OutOfMemory` for a full handle table, leaves the message queued, so a
+wait on the channel fires again at once, and a loop that waits again without a pause spins.
 `Msg::payload` is bounded by what a message holds whatever its header says, and `set_len` refuses
-past it. `send_held` and `send_by` answer an `Op` that completes when the peer has the message;
+past it. `send_held` and `send_by` answer an `Op` that completes when the peer has the message,
+at once for a reply on a server's forwarding endpoint, which the kernel takes within the call;
 `send_by`'s, given up at its deadline, completes `TimedOut`, the message and its handles dropped.
 
 **A `WaitSet` borrows what it waits on**, so nothing in it closes while it is waited on, holds at
@@ -113,14 +116,17 @@ that passed are empty answers, not errors.
 
 **A spawn moves its grants or hands them back.** `Spawn::grant` takes a `Handle`, which leaves
 this process when the child starts and comes back in `Refused` if the kernel refuses: it starts a
-child whole or not at all. `grant_copy` borrows one, which needs `DUPLICATE`. The first grant is
-the child's `rdx`. The older `spawn(&SpawnArgs)` stays for the callers not yet moved.
+child whole or not at all. `grant_copy` borrows one, which needs `TRANSFER` and `DUPLICATE`. The
+first grant is the child's `rdx`. **Without `namespace()`, the child shares this process's root**,
+`LOOKUP` only: it is not a copy, so a later bind in it reaches the child. The older
+`spawn(&SpawnArgs)` stays for the callers not yet moved.
 
 **A thread's stack is its own for the rest of the process's life**: nothing tells a process that
 a thread of its has ended, so nothing could give the stack back safely. `Stack::new` is one
-mapping each, and `start` sets `rsp` 8 below the top, as a `call` would leave it. A thread's entry
-is `extern "C" fn(u64, u64, u64, u64) -> !`, `rcx` its `arg0`. An overrun lands in the mapping
-below until a hint-less map leaves a gap there, `TODO(thread-stack-guard)`.
+mapping each, and `start` hands the kernel its top, which enters every thread with `rsp` 8 below a
+16-byte boundary, as a `call` would leave it (`enter_user`). A thread's entry is `extern "C"
+fn(u64, u64, u64, u64) -> !`, `rcx` its `arg0`. An overrun lands in the mapping below until a
+hint-less map leaves a gap there, `TODO(thread-stack-guard)`.
 
 ## The async model
 
@@ -198,9 +204,10 @@ handles than its results hold, cutting both in code the host build runs too. `cf
 the real `libkern` `syscallN` calls, and a receive through `libkern::channel_recv_raw`, the one
 place `check-recv` allows; `cfg(test)` → `sys/mock.rs`, **a small model of the kernel that
 answers as it does**: a handle table, objects whose bytes are real host memory a mapping reads,
-channels with rings and peers, namespaces of direct bindings, a server binding whose lookups
-complete when time passes, and each call's refusals in the kernel's order — `InvalidHandle`, then
-`NoAccess` for a missing right, then `InvalidArgument`. It panics on a wait for ever that nothing
+channels with rings and peers and a server's forwarding endpoint, namespaces of direct bindings
+and of servers, an endpoint bound as one and its lookups forwarded, which complete when time
+passes, and each call's refusals in the kernel's order — `InvalidHandle`, then `NoAccess` for a
+missing right, then `InvalidArgument`. It panics on a wait for ever that nothing
 will end, a loop of waits that never does, and an `exit`, and counts a close of a handle that is
 not there. Every wrapper is tested through it, and each guarantee above has had its test run
 against a copy of the code with that guarantee removed. (Typestate *misuse* is verified by

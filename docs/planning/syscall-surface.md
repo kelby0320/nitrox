@@ -270,9 +270,9 @@ path, so E.2, E.3 and E.9 each quote its before and after. Author; `/pr-review`.
 
 **Built 2026-11-03.** Every class above is in libos, each wrapper tested through a mock that is
 now a model of the kernel, and each guarantee shown to fail its test with the guarantee removed.
-The eight crates already on libos moved onto `Ref` and the safe `lookup`; libdraw makes no raw
-syscall now. The ratchet starts at 1,930 raw syscalls in 34 entries, the test harness's 793 the
-largest. The probe's first run reproduced *The heavy paths*' table, and 3,431 calls in the session.
+The eight crates already on libos moved onto `Ref` and the safe `lookup`; libdraw's one raw
+syscall went, leaving its two log lines. The ratchet starts at 2,262 raw syscalls in 35 entries,
+the test harness's 863 the largest. The probe's first run reproduced *The heavy paths*' table, and 3,431 calls in the session.
 
 ### E.2 The libraries, and the wire formats (P8)
 

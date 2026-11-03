@@ -100,7 +100,7 @@ both!([] Channel, Only {
     }
 
     /// Send `msg` and `handles`, held by the kernel while the ring is full: the `Op` completes
-    /// when the peer has it.
+    /// when the peer has it, at once for a reply to the kernel on a server's endpoint.
     pub fn send_held(&self, msg: &Msg, handles: &mut Carried) -> Result<Op> {
         send(self.raw().0, msg, handles, SENDMODE_BLOCK, 0).map(Op::status)
     }
@@ -112,7 +112,9 @@ both!([] Channel, Only {
     }
 
     /// Receive one message into `msg`, and the handles it brought. `WouldBlock` while the ring
-    /// is empty; `PeerClosed` once the peer has gone and nothing is left.
+    /// is empty; `PeerClosed` once the peer has gone and nothing is left. Any other refusal, such
+    /// as `OutOfMemory` for a full handle table, leaves the message queued, so a wait on the
+    /// channel fires again at once: sleep before waiting again, or the loop spins.
     pub fn recv(&self, msg: &mut Msg) -> Result<Carried> {
         let mut raw = [0; IPC_HANDLE_MAX];
         let mut count = 0;
@@ -206,6 +208,34 @@ mod tests {
         let op = a.send_by(&Msg::new(), &mut out, Deadline::after(1).unwrap()).unwrap();
         assert!(out.is_empty() && !sys::is_open(held), "the kernel took them at the hold");
         assert_eq!(block_on(op).err().unwrap().code(), KError::TimedOut);
+    }
+
+    #[test]
+    fn a_held_reply_the_kernel_takes_in_the_call_is_complete() {
+        sys::reset();
+        let ep: Handle<Channel, Only> = Handle::fresh(sys::forwarding(), Rights::empty());
+        let mut out = Carried::new();
+        out.push(Handle::<Memory, MapReadWrite>::create(4096).unwrap()).ok().unwrap();
+        let sent = out.raw()[0];
+        let op = ep.send_held(&Msg::new(), &mut out).unwrap();
+        assert!(block_on(op).is_ok(), "delivered, not a wait on handle 0");
+        assert!(out.is_empty() && !sys::is_open(sent));
+        assert!(block_on(ep.send_by(&Msg::new(), &mut Carried::new(), Deadline::NEVER).unwrap()).is_ok());
+        assert_eq!(sys::stray_closes(), 0, "no close of handle 0");
+    }
+
+    #[test]
+    fn a_receive_refused_for_want_of_memory_leaves_the_message() {
+        sys::reset();
+        let (a, b) = pair();
+        let mut m = Msg::new();
+        m.set(b"kept").unwrap();
+        a.send(&m, &mut Carried::new()).unwrap();
+        sys::fail_next_recv(KError::OutOfMemory as i32);
+        assert_eq!(b.recv(&mut Msg::new()).err().unwrap().code(), KError::OutOfMemory);
+        let mut got = Msg::new();
+        b.recv(&mut got).unwrap();
+        assert_eq!(got.payload(), b"kept");
     }
 
     #[test]

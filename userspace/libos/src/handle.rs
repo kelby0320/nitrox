@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn attenuation_restricts_in_place_and_a_refusal_closes() {
+    fn attenuation_restricts_in_place() {
         sys::reset();
         let h = memory().without_transfer().unwrap();
         assert!(!h.extra_rights().contains(Rights::TRANSFER));
@@ -377,6 +377,21 @@ mod tests {
         assert_eq!(h.stat().unwrap().rights & Rights::TRANSFER.bits(), 0, "the kernel's rights, not just ours");
         let ro = h.into_read_only().unwrap();
         assert_eq!(ro.stat().unwrap().rights & Rights::MAP_WRITE.bits(), 0);
+    }
+
+    #[test]
+    fn a_refused_restrict_is_an_error() {
+        sys::reset();
+        let h = memory();
+        sys::handle_close(h.raw().0);
+        assert_eq!(h.without_transfer().err().unwrap().code(), libkern::KError::InvalidHandle);
+    }
+
+    #[test]
+    fn what_arrived_is_held_to_the_room_there_is() {
+        sys::reset();
+        let hs = Handles::<2>::arrived([0; 2], 5);
+        assert_eq!((hs.len(), hs.raw().len()), (2, 2));
     }
 
     #[test]

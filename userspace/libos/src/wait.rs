@@ -68,9 +68,14 @@ impl<'a, const N: usize> WaitSet<'a, N> {
             n if n == KError::TimedOut as i64 || n == KError::WouldBlock as i64 => {}
             n => return Err(Error::from_status(n as i32)),
         }
+        let mut kept = 0;
         for k in 0..s.count {
-            s.index[k] = handles.iter().position(|&h| h == s.results[k].handle).unwrap_or(usize::MAX);
+            if let Some(i) = handles.iter().position(|&h| h == s.results[k].handle) {
+                (s.index[kept], s.results[kept]) = (i, s.results[k]);
+                kept += 1;
+            }
         }
+        s.count = kept;
         Ok(s)
     }
 }
@@ -133,6 +138,19 @@ mod tests {
         set.add(&a).unwrap();
         assert_eq!(set.add(&a).err().unwrap().code(), KError::InvalidArgument);
         assert_eq!(set.add(&b).err().unwrap().code(), KError::TooLarge);
+    }
+
+    /// **A count past the set's room, or a result naming no handle in it**, answers only what the
+    /// set holds.
+    #[test]
+    fn a_wait_answers_no_more_than_the_set_holds() {
+        sys::reset();
+        let (a, _b) = Handle::<Channel, Only>::pair(4).unwrap();
+        let mut set = WaitSet::<2>::new();
+        set.add(&a).unwrap();
+        sys::fail_next_wait(5);
+        let s = set.wait(Deadline::after(1).unwrap()).unwrap();
+        assert!(s.iter().all(|(i, _)| i < set.len()) && s.len() <= set.len());
     }
 
     #[test]

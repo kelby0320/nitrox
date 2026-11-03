@@ -133,9 +133,12 @@ impl Op {
         Op::of(po, Kind::Lookup)
     }
 
-    /// Wrap a PO whose completion is its status alone, such as a held send's.
+    /// Wrap a PO whose completion is its status alone, such as a held send's; `0`, a send the
+    /// kernel delivered within the call, is complete already.
     pub(crate) fn status(po: u64) -> Op {
-        Op::of(po, Kind::Status)
+        let mut op = Op::of(po, Kind::Status);
+        op.finished = po == 0;
+        op
     }
 
     fn of(po: u64, kind: Kind) -> Op {
@@ -160,6 +163,10 @@ impl Future for Op {
         if this.done {
             // Handed out already: a second `Ok` would give its handle two owners.
             return Poll::Ready(Err(Error::from_status(KError::InvalidHandle as i32)));
+        }
+        if this.po == 0 {
+            this.done = true;
+            return Poll::Ready(Ok(IoResult { handle: 0, status: 0, reserved: 0, result: 0 }));
         }
         let mut r = zeroed_results::<1>();
         let n = sys::wait(&[this.po], &mut r, 0);
@@ -205,7 +212,9 @@ impl Drop for Op {
                 sys::handle_close(r[0].result);
             }
         }
-        sys::handle_close(self.po);
+        if self.po != 0 {
+            sys::handle_close(self.po);
+        }
     }
 }
 

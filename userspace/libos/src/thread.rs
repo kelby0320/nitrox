@@ -2,15 +2,16 @@
 
 use libkern::{RawHandle, Rights, ThreadArgs};
 
-use crate::error::{Result, check};
+use crate::error::{Error, Result, check};
 use crate::handle::{Handle, MapReadWrite, Memory, Only, Thread};
 use crate::memory::Mapping;
 use crate::sys;
+use libkern::KError;
 
 /// Where a thread begins: `rdi`, `rsi` and `rdx` are `0`, and `rcx`, the fourth, its `arg0`.
 pub type Entry = extern "C" fn(u64, u64, u64, u64) -> !;
 
-/// A thread's stack: a mapping of its own, so the guard gap below one stack is not another's.
+/// A thread's stack: a mapping of its own, which nothing below it guards, as yet.
 pub struct Stack(Mapping<MapReadWrite>);
 
 impl Stack {
@@ -18,7 +19,7 @@ impl Stack {
     // TODO(thread-stack-guard): a hint-less map places a mapping flush against the one below, so an
     // overrun lands in it rather than faulting.
     pub fn new(bytes: usize) -> Result<Stack> {
-        let len = bytes.next_multiple_of(4096);
+        let len = bytes.checked_next_multiple_of(4096).ok_or(Error::from(KError::TooLarge))?;
         Ok(Stack(Handle::<Memory, MapReadWrite>::create(len)?.map(len)?))
     }
 }
@@ -31,9 +32,8 @@ pub fn start(entry: Entry, stack: Stack, arg0: u64) -> Result<Handle<Thread, Onl
     let top = stack.0.as_ptr() as u64 + stack.0.len() as u64;
     let args = ThreadArgs {
         entry: entry as usize as u64,
-        // As if a `call` had pushed a return address: the ABI has a function find `rsp` 8 below a
-        // 16-byte boundary.
-        user_sp: top - 8,
+        // The top: the kernel enters with `rsp` 8 below a 16-byte boundary, as after a `call`.
+        user_sp: top,
         arg0,
         class: 0,
         rt_priority: 0,
@@ -72,17 +72,22 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_keeps_its_stack_and_starts_8_below_its_top() {
+    fn a_thread_keeps_its_stack_and_is_handed_its_top() {
         sys::reset();
         let stack = Stack::new(5000).unwrap();
         let (base, len) = (stack.0.as_ptr() as u64, stack.0.len() as u64);
         assert_eq!(len, 8192);
         let t = start(worker, stack, 42).unwrap();
         let args = sys::threads().pop().unwrap();
-        assert_eq!((args.user_sp, args.arg0), (base + len - 8, 42));
-        assert_eq!(args.user_sp % 16, 8);
+        assert_eq!((args.user_sp, args.arg0), (base + len, 42));
         drop(t);
         assert_eq!(sys::mappings(), 1, "the stack outlives the handle");
+    }
+
+    #[test]
+    fn a_stack_too_large_to_round_is_refused() {
+        sys::reset();
+        assert_eq!(Stack::new(usize::MAX).err().unwrap().code(), KError::TooLarge);
     }
 
     #[test]

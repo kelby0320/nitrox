@@ -51,13 +51,14 @@ both!([M: CanLookup] Namespace, M {
 
 both!([M: CanBind] Namespace, M {
     /// Bind `resource` at `path`, so every lookup there resolves to its object with at most its
-    /// rights; it needs `TRANSFER`, and this process `BIND_NAMESPACE`.
+    /// rights; it needs `TRANSFER`, and this process `BIND_NAMESPACE`. A channel endpoint binds as
+    /// a server instead, as [`bind_server`](Self::bind_server) does with no base.
     pub fn bind<'h, T: 'h, M2: 'h>(&self, path: &str, resource: impl Into<Ref<'h, T, M2>>) -> Result<()> {
         check(sys::ns_bind(self.raw().0, path.as_bytes(), resource.into().raw().0, b"")).map(|_| ())
     }
 
     /// Bind the server at `endpoint` at `path`, reaching only its tree under `base` when that is
-    /// not empty.
+    /// not empty: a lookup under `path` is forwarded to it, and the endpoint needs no right.
     pub fn bind_server(&self, path: &str, endpoint: Ref<'_, Channel, Only>, base: &str) -> Result<()> {
         check(sys::ns_bind(self.raw().0, path.as_bytes(), endpoint.raw().0, base.as_bytes())).map(|_| ())
     }
@@ -142,6 +143,25 @@ mod tests {
         assert_eq!(ns.bind("/m", &mem).err().unwrap().code(), KError::AlreadyExists);
         sys::fail_next_bind(KError::NoAccess as i32);
         assert_eq!(ns.bind("/k", &mem).err().unwrap().code(), KError::NoAccess, "no BIND_NAMESPACE");
+    }
+
+    #[test]
+    fn a_server_binds_with_no_right_and_a_base_and_answers_under_its_path() {
+        sys::reset();
+        let ns = ns();
+        let (ep, _theirs) = Handle::<Channel, Only>::pair(4).unwrap();
+        let ep = ep.without_transfer().unwrap();
+        ns.bind_server("/srv", ep.as_ref(), "/home/alice").unwrap();
+        ns.bind("/srv2", &ep).unwrap();
+        let got: Handle<Memory, MapRead> = block_on(ns.lookup("/srv/notes", Rights::MAP_READ)).unwrap();
+        assert!(got.map(4096).is_ok(), "the server's answer");
+        let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        assert_eq!(
+            sys::ns_bind(ns.raw().0, b"/m", mem.raw().0, b"/x"),
+            KError::InvalidArgument as i64,
+            "a base on a direct bind"
+        );
+        assert_eq!(ns.bind_server("/srv3", ep.as_ref(), "/").err().unwrap().code(), KError::InvalidArgument);
     }
 
     #[test]
