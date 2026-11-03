@@ -1,0 +1,45 @@
+# The raw syscalls each userspace crate or module makes: a `syscallN(` or a call of one of
+# libkern's own wrappers, counted by `cargo xtask check-syscalls`. A count only falls: reach the
+# kernel through libos. `--update` lowers or removes entries; a raise is by hand, in a reviewed
+# commit of its own that says why. `[agreed]` names the crates the maintainer agreed may stay
+# on libkern, each with its reason; their counts are still held here.
+[counts]
+"userspace/auth-service" = 34
+"userspace/clipboard-server" = 13
+"userspace/compositor" = 74
+"userspace/coreutils" = 137
+"userspace/desktop-session-mgr" = 9
+"userspace/desktop-shell" = 43
+"userspace/device-mgr" = 35
+"userspace/eshell" = 40
+"userspace/heartbeat" = 9
+"userspace/hello" = 58
+"userspace/init" = 78
+"userspace/input-server" = 46
+"userspace/libdraw" = 1
+"userspace/libfs" = 32
+"userspace/libfsserver" = 36
+"userspace/libheap" = 5
+"userspace/liblog" = 5
+"userspace/libprompt" = 4
+"userspace/librsproto" = 11
+"userspace/libsession" = 53
+"userspace/libstream" = 12
+"userspace/libsurface" = 14
+"userspace/logging-service" = 10
+"userspace/nxedit" = 40
+"userspace/nxfiles" = 41
+"userspace/nxinstall" = 17
+"userspace/nxsh" = 33
+"userspace/nxterm" = 65
+"userspace/profile-server" = 19
+"userspace/service-mgr" = 27
+"userspace/session-mgr" = 10
+"userspace/storage-service" = 51
+"userspace/test-harness" = 795
+"userspace/tty-server" = 42
+"userspace/view-broker" = 34
+
+[agreed]
+"userspace/eshell" = "the recovery shell, on libkern by choice"
+"userspace/libheap" = "the allocator under everything, on libkern by choice"

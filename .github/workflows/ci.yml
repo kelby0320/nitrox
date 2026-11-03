@@ -66,6 +66,11 @@ jobs:
       - name: cargo xtask check-recv
         run: cargo xtask check-recv
 
+      # No userspace crate makes more raw syscalls than tools/xtask/raw-syscalls.toml lists for it;
+      # new code reaches the kernel through libos.
+      - name: cargo xtask check-syscalls
+        run: cargo xtask check-syscalls
+
       # Each workspace formatted by `cargo fmt` with its pinned toolchain and the root rustfmt.toml.
       - name: cargo fmt --check
         run: |
