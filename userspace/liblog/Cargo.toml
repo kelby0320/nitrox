@@ -5,7 +5,11 @@ edition = "2024"
 
 [dependencies]
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 librsproto = { path = "../librsproto" }
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }
 
 [lib]
 name = "liblog"

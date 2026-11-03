@@ -20,7 +20,6 @@
 "userspace/libfs" = 32
 "userspace/libfsserver" = 36
 "userspace/libheap" = 5
-"userspace/liblog" = 5
 "userspace/libprompt" = 4
 "userspace/librsproto" = 11
 "userspace/libsession" = 59

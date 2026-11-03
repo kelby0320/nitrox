@@ -2285,6 +2285,14 @@ shape it will keep, and the call under it changes as its sub-part of
 `io_submit`, E.8 makes `Spawn` read the image into memory first, and E.9 makes entropy a node.
 Trigger: each of those sub-parts.
 
+**A library's raw-handle functions stay beside its typed ones — `TODO(raw-handle-shims)`.** Part
+E.2 gives each library moved onto libos a typed API (`Ref`, `Handle`), and keeps each function
+that took or gave a raw `u64` handle as a thin shim over it, so the crates that call it move once,
+onto the typed form, in E.3 to E.5, rather than once now and once again then (the maintainer's
+call, 2026-11-03). A shim's `u64` is its caller's claim, as it always was: borrowing it is the one
+`unsafe` it adds. Trigger: a shim's last caller moving onto libos, and E.5 at the latest, by when
+none is left.
+
 **A thread's stack has no guard below it — `TODO(thread-stack-guard)`.** `libos::thread::Stack`
 is a mapping of its own, but a mapping placed without a hint lies flush against the one below, so
 a thread that overruns its stack writes into that mapping rather than faulting. The main thread's

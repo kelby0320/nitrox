@@ -144,6 +144,7 @@ name = "liblog"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
  "librsproto",
 ]
 
