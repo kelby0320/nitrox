@@ -4,8 +4,9 @@
 //! `docs/spec/syscall-abi.md`.
 
 mod block_map;
-#[cfg(feature = "syscall-counts")]
-mod counts;
+#[cfg(any(test, feature = "syscall-counts"))]
+#[cfg_attr(not(feature = "syscall-counts"), allow(dead_code, reason = "host-tested for its format alone"))]
+pub(crate) mod counts;
 pub mod error;
 pub mod table;
 
