@@ -245,9 +245,10 @@ fn default_groups(tracked: &[&str]) -> Vec<String> {
 }
 
 /// Whether `path` belongs to `group`: the module file `<group>.rs` or anything under `<group>/`,
-/// so a kernel module `x.rs` and its directory `x/` are one group and `x_other.rs` is not in it.
+/// so a kernel module `x.rs` and its directory `x/` are one group and `x_other.rs` is not in it;
+/// or `path` itself, for a group named by a file.
 pub(super) fn in_group(path: &str, group: &str) -> bool {
-    path.strip_prefix(group).is_some_and(|rest| rest == ".rs" || rest.starts_with('/'))
+    path.strip_prefix(group).is_some_and(|rest| rest.is_empty() || rest == ".rs" || rest.starts_with('/'))
 }
 
 /// The groups `args` name, a trailing `/` dropped so `kernel/src/mm/` and `kernel/src/mm` are one.

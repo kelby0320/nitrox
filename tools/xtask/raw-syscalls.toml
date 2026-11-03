@@ -4,40 +4,41 @@
 # commit of its own that says why. `[agreed]` names the crates the maintainer agreed may stay
 # on libkern, each with its reason; their counts are still held here.
 [counts]
-"userspace/auth-service" = 34
-"userspace/clipboard-server" = 13
-"userspace/compositor" = 74
-"userspace/coreutils" = 137
-"userspace/desktop-session-mgr" = 9
-"userspace/desktop-shell" = 43
-"userspace/device-mgr" = 35
-"userspace/eshell" = 40
+"userspace/auth-service" = 36
+"userspace/clipboard-server" = 14
+"userspace/compositor" = 95
+"userspace/coreutils" = 153
+"userspace/desktop-session-mgr" = 16
+"userspace/desktop-shell" = 73
+"userspace/device-mgr" = 48
+"userspace/eshell" = 44
 "userspace/heartbeat" = 9
 "userspace/hello" = 58
-"userspace/init" = 78
-"userspace/input-server" = 46
+"userspace/init" = 99
+"userspace/input-server" = 56
+"userspace/libdraw" = 2
 "userspace/libfs" = 32
 "userspace/libfsserver" = 36
 "userspace/libheap" = 5
 "userspace/liblog" = 5
 "userspace/libprompt" = 4
 "userspace/librsproto" = 11
-"userspace/libsession" = 53
+"userspace/libsession" = 59
 "userspace/libstream" = 12
 "userspace/libsurface" = 14
 "userspace/logging-service" = 10
-"userspace/nxedit" = 40
-"userspace/nxfiles" = 41
+"userspace/nxedit" = 61
+"userspace/nxfiles" = 61
 "userspace/nxinstall" = 17
-"userspace/nxsh" = 33
-"userspace/nxterm" = 65
-"userspace/profile-server" = 19
-"userspace/service-mgr" = 27
-"userspace/session-mgr" = 10
-"userspace/storage-service" = 51
-"userspace/test-harness" = 793
-"userspace/tty-server" = 42
-"userspace/view-broker" = 34
+"userspace/nxsh" = 35
+"userspace/nxterm" = 82
+"userspace/profile-server" = 20
+"userspace/service-mgr" = 71
+"userspace/session-mgr" = 11
+"userspace/storage-service" = 69
+"userspace/test-harness" = 863
+"userspace/tty-server" = 43
+"userspace/view-broker" = 38
 
 [agreed]
 "userspace/eshell" = "the recovery shell, on libkern by choice"

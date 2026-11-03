@@ -4,14 +4,16 @@ fn api(wrappers: &[(&str, &str, bool)], modules: &[&str]) -> Api {
     Api {
         wrappers: wrappers
             .iter()
-            .map(|(m, n, top)| Wrapper { module: m.to_string(), name: n.to_string(), top: *top })
+            .map(|(m, n, top)| Wrapper { module: m.to_string(), name: n.to_string(), top: *top, ctor: false })
             .collect(),
         modules: modules.iter().map(|m| m.to_string()).collect(),
     }
 }
 
 fn std_api() -> Api {
-    api(&[("debug", "kprint", true), ("control", "recv", false)], &["debug", "control", "abi"])
+    let mut a = api(&[("debug", "kprint", true), ("control", "recv", false)], &["debug", "control", "abi"]);
+    a.wrappers.push(Wrapper { module: "debug".into(), name: "Line".into(), top: false, ctor: true });
+    a
 }
 
 fn count(text: &str) -> usize {
@@ -41,6 +43,7 @@ fn the_wrapper_list_is_derived_from_libkern() {
         "channel::pause_held",
         "clock::clock_read",
         "control::recv",
+        "debug::Line::new",
         "debug::exit",
         "debug::kprint",
         "debug::kprint_hex",
@@ -66,8 +69,39 @@ fn a_wrapper_is_found_through_a_chain_of_calls() {
     let got = derive_api(&files).unwrap();
     let mut names: Vec<String> = got.wrappers.iter().map(Wrapper::path).collect();
     names.sort();
-    assert_eq!(names, ["a::low", "a::mid", "a::top"], "no method, test item or pure function");
+    assert_eq!(
+        names,
+        ["a::S::new", "a::low", "a::mid", "a::top"],
+        "a type by its method; no test item or pure function"
+    );
     assert!(got.wrappers.iter().all(|w| w.top), "`pub use a::*` re-exports them");
+}
+
+#[test]
+fn a_type_counts_by_its_own_methods_and_not_a_trait_impls() {
+    let files = [file(
+        "k/src/a.rs",
+        "pub fn low() {\n    unsafe { syscall1(1, 2) };\n}\nimpl<const N: usize> G<N> {\n    pub fn m(&self) { low(); }\n}\n\
+         impl Drop for D {\n    fn drop(&mut self) { low(); }\n}\nimpl P {\n    pub fn m(&self) {}\n}\n",
+    )];
+    let mut names: Vec<String> = derive_api(&files).unwrap().wrappers.iter().map(Wrapper::path).collect();
+    names.sort();
+    assert_eq!(names, ["a::G::new", "a::low"], "a generic type by its call; a drop or a pure type not");
+}
+
+#[test]
+fn making_a_type_whose_method_makes_a_syscall_counts_once() {
+    assert_eq!(count("use libkern::debug::Line;\nfn f() { Line::new().s(b\"a\").end(); }\n"), 1);
+    assert_eq!(count("fn f() { libkern::debug::Line::new().end(); }\n"), 1);
+    assert_eq!(count("use libkern::debug;\nfn f() { debug::Line::new().end(); }\n"), 1);
+    assert_eq!(count("use libkern::debug::*;\nfn f() { Line::new().end(); }\n"), 1);
+    assert_eq!(count("use libos::log::Line;\nfn f() { Line::new().end(); }\n"), 0, "libos's own");
+    assert_eq!(count("use libkern::*;\nfn f() { Line::new().end(); }\n"), 0, "the root does not re-export it");
+    assert_eq!(count("use libkern::debug::Line;\nfn f() { Other::new(); new(); x.new(); }\n"), 0);
+    let local = "use libkern::debug::*;\nstruct Line;\nfn f() { Line::new().end(); }\n";
+    let locals = BTreeSet::from(["Line".to_string()]);
+    assert_eq!(count_file(local, &std_api(), &locals).unwrap(), 0, "a type of the crate's own shadows a glob");
+    assert_eq!(defined_type("pub(crate) struct Line<'a> {"), Some("Line".to_string()));
 }
 
 #[test]
@@ -184,6 +218,17 @@ fn an_entry_with_no_file_has_no_count() {
     let files = [file("userspace/x/src/lib.rs", "fn f() {}\n")];
     let got = measured(&files, &["userspace/x/src/gone", "userspace/x"]);
     assert_eq!(got, BTreeMap::from([("userspace/x".to_string(), 0)]));
+}
+
+#[test]
+fn a_listed_crate_whose_code_is_gone_has_no_count() {
+    let files = [file("userspace/x/src/lib.rs", "fn f() { syscall1(1, 2); }\n")];
+    let crates = ["userspace/x".to_string(), "userspace/y".to_string()];
+    let entries = BTreeSet::from(["userspace/x".to_string(), "userspace/y".to_string()]);
+    let got = measure(&files, &crates, &std_api(), &entries).unwrap();
+    assert_eq!(got, BTreeMap::from([("userspace/x".to_string(), 1)]), "y has a manifest and no Rust");
+    let failed = failures(&got, &base(&[("userspace/x", 1), ("userspace/y", 3)], &[]));
+    assert!(failed.len() == 1 && failed[0].contains("no counted crate or module is there"), "{failed:?}");
 }
 
 fn base(counts: &[(&str, usize)], agreed: &[(&str, &str)]) -> Baseline {

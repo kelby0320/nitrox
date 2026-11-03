@@ -1,10 +1,12 @@
 //! `check-syscalls`: the raw syscalls each userspace crate makes only fall, against
 //! `tools/xtask/raw-syscalls.toml`.
 //!
-//! A raw syscall is a `syscallN(` as `unsafe-inventory` counts it, or a call of a free function of
-//! `libkern` that makes one. That list is derived from `libkern`'s source each run: a `pub fn` at
-//! the top level of a file whose non-test body calls `syscallN(`, issues one by inline `asm!` naming
-//! a `SYS_` number, or calls another function on the list.
+//! A raw syscall is a `syscallN(` as `unsafe-inventory` counts it, a call of a free function of
+//! `libkern` that makes one, or the making of a `libkern` type one of whose own methods makes one,
+//! as `debug::Line`'s `end` does: each `Line::new(` counts once. That list is derived from
+//! `libkern`'s source each run: a `pub fn` at the top level of a file whose non-test body calls
+//! `syscallN(`, issues one by inline `asm!` naming a `SYS_` number, or calls another function on the
+//! list, and a type with an inherent `impl` whose body does any of those.
 //! `libkern` and `libos`, the syscall layer itself, are not counted.
 //!
 //! A wrapper call counts when it is written `libkern::name(` or `libkern::module::name(`; as
@@ -83,7 +85,8 @@ fn format_baseline(b: &Baseline) -> String {
     out
 }
 
-/// A free function of `libkern` that makes a syscall.
+/// A free function of `libkern` that makes a syscall, or a type whose method does, counted where
+/// it is made.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Wrapper {
     /// The file it is in, without `.rs`; empty in `lib.rs`.
@@ -91,11 +94,14 @@ struct Wrapper {
     name: String,
     /// Whether `libkern`'s root re-exports it, so `libkern::name(` and a glob of `libkern` reach it.
     top: bool,
+    /// Whether `name` is a type, each `name::new(` a call.
+    ctor: bool,
 }
 
 impl Wrapper {
     fn path(&self) -> String {
-        if self.module.is_empty() { self.name.clone() } else { format!("{}::{}", self.module, self.name) }
+        let item = if self.ctor { format!("{}::new", self.name) } else { self.name.clone() };
+        if self.module.is_empty() { item } else { format!("{}::{item}", self.module) }
     }
 }
 
@@ -171,6 +177,43 @@ fn top_level_fns(lines: &[String]) -> Vec<(String, Vec<&str>)> {
     out
 }
 
+/// Each inherent `impl` at the top level of `lines`: its type's name and its body's lines.
+fn inherent_impls(lines: &[String]) -> Vec<(String, Vec<&str>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(rest) = lines[i].strip_prefix("impl") else {
+            i += 1;
+            continue;
+        };
+        let head = lines[i].split('{').next().unwrap_or("");
+        let after = match rest.strip_prefix('<') {
+            Some(g) => g.split_once("> ").map_or("", |(_, t)| t),
+            None => rest.trim_start(),
+        };
+        let name: String = after.chars().take_while(|&c| is_ident(c)).collect();
+        let (mut depth, mut opened, mut body) = (0i64, false, Vec::new());
+        while i < lines.len() && !(opened && depth <= 0) {
+            body.push(lines[i].as_str());
+            for c in lines[i].chars() {
+                match c {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        if !name.is_empty() && !head.contains(" for ") {
+            out.push((name, body));
+        }
+    }
+    out
+}
+
 /// The `use` statements in `lines`, each as its tree and whether it is `pub`, joined across lines.
 fn use_statements(lines: &[String]) -> Vec<(bool, String)> {
     let mut out = Vec::new();
@@ -240,6 +283,7 @@ fn expand(prefix: &[String], tree: &str) -> Vec<Vec<String>> {
 /// `libkern`'s wrappers and modules from its source files, each a path and its text.
 fn derive_api(files: &[(String, String)]) -> R<Api> {
     let mut fns = Vec::new();
+    let mut impls = Vec::new();
     let (mut modules, mut reexports) = (BTreeSet::new(), Vec::new());
     for (path, text) in files.iter().filter(|(p, _)| p.ends_with(".rs") && !is_test_file(p)) {
         let stem = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".rs");
@@ -258,6 +302,9 @@ fn derive_api(files: &[(String, String)]) -> R<Api> {
             if !(name.starts_with("syscall") && name[7..].chars().all(|c| c.is_ascii_digit())) {
                 fns.push((module.to_string(), name, body.join("\n")));
             }
+        }
+        for (name, body) in inherent_impls(&lines) {
+            impls.push((module.to_string(), name, body.join("\n")));
         }
     }
     let makes_syscall = |body: &str| {
@@ -280,17 +327,33 @@ fn derive_api(files: &[(String, String)]) -> R<Api> {
             break;
         }
     }
+    let names: BTreeSet<&str> = listed.iter().map(|(_, n)| n.as_str()).collect();
+    let types: BTreeSet<(String, String)> = impls
+        .iter()
+        .filter(|(_, _, body)| {
+            makes_syscall(body) || names.iter().any(|n| body.lines().any(|l| !call_sites(l, n).is_empty()))
+        })
+        .map(|(m, n, _)| (m.clone(), n.clone()))
+        .collect();
+    let reexported = |module: &str, name: &str| {
+        module.is_empty() || reexports.iter().any(|p| p[..] == [module, name] || p[..] == [module, "*"])
+    };
     let wrappers = listed
         .into_iter()
-        .map(|(module, name)| {
-            let top = module.is_empty()
-                || reexports
-                    .iter()
-                    .any(|p| p[..] == [module.clone(), name.clone()] || p[..] == [module.clone(), "*".into()]);
-            Wrapper { module, name, top }
-        })
+        .map(|(module, name)| (module, name, false))
+        .chain(types.into_iter().map(|(module, name)| (module, name, true)))
+        .map(|(module, name, ctor)| Wrapper { top: reexported(&module, &name), module, name, ctor })
         .collect();
     Ok(Api { wrappers, modules })
+}
+
+/// The name of the type a line declares: a `struct`, an `enum` or a `type`.
+fn defined_type(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace().skip_while(|t| *t == "pub" || t.starts_with("pub("));
+    matches!(tokens.next()?, "struct" | "enum" | "type")
+        .then(|| tokens.next().map(|t| t.chars().take_while(|&c| is_ident(c)).collect()))
+        .flatten()
+        .filter(|n: &String| !n.is_empty())
 }
 
 /// The name of the free function a line declares, if it declares one rather than a method.
@@ -360,12 +423,16 @@ fn count_file(text: &str, api: &Api, locals: &BTreeSet<String>) -> Result<usize,
     for line in &lines {
         n += SYSCALLS.iter().map(|m| occurrences(line, m)).sum::<usize>();
         for w in &api.wrappers {
-            for at in call_sites(line, &w.name) {
-                let counts = match path_before(line, at).as_slice() {
+            for at in call_sites(line, if w.ctor { "new" } else { &w.name }) {
+                let mut path = path_before(line, at);
+                if w.ctor && path.pop() != Some(w.name.as_str()) {
+                    continue;
+                }
+                let counts = match path.as_slice() {
                     [] => {
                         !locals.contains(&w.name)
                             && (imp.names.contains(&w.name)
-                                || imp.names.contains(&w.path())
+                                || imp.names.contains(&format!("{}::{}", w.module, w.name))
                                 || (imp.root_glob && w.top)
                                 || imp.globs.contains(&w.module))
                     }
@@ -397,7 +464,7 @@ fn measure(
         let mut locals = BTreeSet::new();
         for (path, text) in &own {
             let lines = non_test_lines(blanked(text)).map_err(|e| format!("{path}: {e}"))?;
-            locals.extend(lines.iter().filter_map(|l| defined_fn(l)));
+            locals.extend(lines.iter().filter_map(|l| defined_fn(l).or_else(|| defined_type(l))));
         }
         let mut here: BTreeMap<String, usize> = BTreeMap::new();
         for (path, text) in &own {

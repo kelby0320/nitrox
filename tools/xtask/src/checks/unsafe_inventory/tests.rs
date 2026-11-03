@@ -134,3 +134,10 @@ fn a_group_holds_its_file_and_its_directory_and_no_neighbour() {
     let held: Vec<&str> = tracked.iter().copied().filter(|p| in_group(p, "kernel/src/device")).collect();
     assert_eq!(held, ["kernel/src/device.rs", "kernel/src/device/tests.rs", "kernel/src/device/a/b.rs"]);
 }
+
+#[test]
+fn a_group_named_by_its_file_holds_that_file() {
+    let tracked = ["kernel/src/tlb.rs", "kernel/src/tlb/x.rs", "kernel/src/tlbx.rs"];
+    let held: Vec<&str> = tracked.iter().copied().filter(|p| in_group(p, "kernel/src/tlb.rs")).collect();
+    assert_eq!(held, ["kernel/src/tlb.rs"]);
+}
