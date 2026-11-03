@@ -391,7 +391,7 @@ guarantees it, so no xAPIC fallback is carried), which puts a floor on the host:
 On an older QEMU under TCG the guest panics with `CPU lacks x2APIC`, which reads
 like a kernel bug and is not one. `xtask` **preflights** this: it checks the QEMU
 version (TCG) or `/dev/kvm` (KVM) *before* launching and fails with an actionable
-message instead. This is why CI runs `--kvm` — GitHub's `ubuntu-latest` ships
+message instead. This is why CI runs `--kvm` — GitHub's `ubuntu-24.04` ships
 QEMU 8.2.
 
 `--kvm` is also the fast path, which matters for boot-loop campaigns: the project
