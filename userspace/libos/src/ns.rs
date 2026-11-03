@@ -153,6 +153,8 @@ mod tests {
         let ep = ep.without_transfer().unwrap();
         ns.bind_server("/srv", ep.as_ref(), "/home/alice").unwrap();
         ns.bind("/srv2", &ep).unwrap();
+        assert_eq!(sys::bound_base(ns.raw().0, "/srv").as_deref(), Some(&b"/home/alice"[..]));
+        assert_eq!(sys::bound_base(ns.raw().0, "/srv2").as_deref(), Some(&b""[..]));
         let got: Handle<Memory, MapRead> = block_on(ns.lookup("/srv/notes", Rights::MAP_READ)).unwrap();
         assert!(got.map(4096).is_ok(), "the server's answer");
         let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();

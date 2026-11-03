@@ -32,7 +32,7 @@ enum Object {
         bytes: Pages,
         size: u64,
     },
-    Namespace(Vec<(Vec<u8>, usize, u64)>),
+    Namespace(Vec<Binding>),
     Channel {
         peer: usize,
         ring: VecDeque<Queued>,
@@ -142,6 +142,10 @@ struct Mock {
     terminated: u32,
     log: Vec<u8>,
     spawned: Vec<SpawnArgs>,
+    /// What each spawn's child holds, in spawn order: its grants, which never run to close.
+    children: Vec<Vec<(usize, u64)>>,
+    /// Whether the next child exits before anything reaches it, holding nothing.
+    exit_next_child: bool,
     threads: Vec<ThreadArgs>,
 }
 
@@ -150,6 +154,21 @@ thread_local! {
 }
 
 /// An empty model, but for handles `1` and `2`, devices `io_submit` takes.
+/// A path bound in a namespace, and the base a server's lookups under it are prefixed with.
+#[derive(Clone)]
+struct Binding {
+    path: Vec<u8>,
+    obj: usize,
+    rights: u64,
+    base: Vec<u8>,
+}
+
+impl Binding {
+    fn new(path: &[u8], obj: usize, rights: u64) -> Self {
+        Binding { path: path.to_vec(), obj, rights, base: Vec::new() }
+    }
+}
+
 fn fresh() -> Mock {
     let mut m = Mock { next_handle: 1, ..Default::default() };
     for _ in 0..2 {
@@ -202,8 +221,9 @@ impl Mock {
     /// Whether anything still holds `obj`: a handle, a binding or a message in a ring.
     fn held(&self, obj: usize) -> bool {
         self.table.values().any(|&(o, _)| o == obj)
+            || self.children.iter().flatten().any(|&(o, _)| o == obj)
             || self.objects.iter().any(|o| match o {
-                Object::Namespace(b) => b.iter().any(|&(_, o, _)| o == obj),
+                Object::Namespace(b) => b.iter().any(|b| b.obj == obj),
                 Object::Answers(target) => *target == obj,
                 Object::Channel { ring, held, .. } => {
                     ring.iter().chain(held.iter().map(|(q, ..)| q)).any(|q| q.handles.iter().any(|&(o, _)| o == obj))
@@ -239,7 +259,7 @@ impl Mock {
         self.typed(ns, need, KObjectType::Namespace).map(|(o, _)| o)
     }
 
-    fn bindings(&mut self, ns: usize) -> &mut Vec<(Vec<u8>, usize, u64)> {
+    fn bindings(&mut self, ns: usize) -> &mut Vec<Binding> {
         match &mut self.objects[ns] {
             Object::Namespace(b) => b,
             _ => unreachable!("checked a namespace"),
@@ -248,7 +268,7 @@ impl Mock {
 
     /// A file's object and rights at `path` in `ns`, bound as a direct binding.
     fn file_at(&mut self, ns: usize, path: &[u8]) -> Option<(usize, u64)> {
-        self.bindings(ns).iter().find(|(p, ..)| p == path).map(|&(_, o, r)| (o, r))
+        self.bindings(ns).iter().find(|b| b.path == path).map(|b| (b.obj, b.rights))
     }
 
     /// Whether `obj` is a server: a lookup through it is forwarded, and waits for an answer.
@@ -259,8 +279,7 @@ impl Mock {
     /// The server whose binding is the longest prefix of `path`, as the kernel resolves one.
     fn server_for(&mut self, ns: usize, path: &[u8]) -> Option<usize> {
         let under = |bound: &[u8]| bound == b"/" || path == bound || path.starts_with(&[bound, b"/"].concat());
-        let found =
-            self.bindings(ns).iter().filter(|(p, ..)| under(p)).max_by_key(|(p, ..)| p.len()).map(|(_, o, _)| *o);
+        let found = self.bindings(ns).iter().filter(|b| under(&b.path)).max_by_key(|b| b.path.len()).map(|b| b.obj);
         found.filter(|&o| self.serves(o))
     }
 }
@@ -689,7 +708,7 @@ pub fn ns_bind(ns: u64, path: &[u8], resource: u64, base: &[u8]) -> i64 {
         if m.file_at(ns, path).is_some() {
             return e(KError::AlreadyExists);
         }
-        m.bindings(ns).push((path.to_vec(), obj, rights));
+        m.bindings(ns).push(Binding { path: path.to_vec(), obj, rights, base: base.to_vec() });
         0
     })
 }
@@ -701,7 +720,7 @@ pub fn ns_unbind(ns: u64, path: &[u8]) -> i64 {
             Err(r) => return r,
         };
         let b = m.bindings(ns);
-        match b.iter().position(|(p, ..)| p == path) {
+        match b.iter().position(|x| x.path == path) {
             Some(i) => {
                 b.remove(i);
                 0
@@ -717,7 +736,7 @@ pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
             Ok(o) => o,
             Err(r) => return r,
         };
-        let Some((path, _, rights)) = m.bindings(ns).get(index as usize) else { return e(KError::NotFound) };
+        let Some(Binding { path, rights, .. }) = m.bindings(ns).get(index as usize) else { return e(KError::NotFound) };
         *out = NsEntry::zeroed();
         let n = path.len().min(out.path.len());
         out.path[..n].copy_from_slice(&path[..n]);
@@ -770,7 +789,7 @@ pub fn file_resize(verb: Resize, ns: u64, path: &[u8], rights: u64, size: u64) -
             (None, Resize::Create) => {
                 let obj = m.object(Object::File { bytes: Pages::new(FILE_ROOM), size: 0 });
                 let all = Rights::MAP_READ | Rights::MAP_WRITE | Rights::INSPECT | Rights::TRANSFER | Rights::DUPLICATE;
-                m.bindings(ns).push((path.to_vec(), obj, all.bits()));
+                m.bindings(ns).push(Binding::new(path, obj, all.bits()));
                 Some((obj, all.bits()))
             }
             (None, _) => None,
@@ -797,11 +816,11 @@ pub fn file_rename(ns: u64, from: &[u8], to: &[u8], _flags: u64) -> i64 {
             return e(KError::InvalidArgument);
         }
         let b = m.bindings(ns);
-        let status = match b.iter().position(|(p, ..)| p == from) {
+        let status = match b.iter().position(|x| x.path == from) {
             Some(i) => {
-                b.retain(|(p, ..)| p != to);
-                let i = b.iter().position(|(p, ..)| p == from).unwrap_or(i);
-                b[i].0 = to.to_vec();
+                b.retain(|x| x.path != to);
+                let i = b.iter().position(|x| x.path == from).unwrap_or(i);
+                b[i].path = to.to_vec();
                 0
             }
             None => KError::NotFound as i32,
@@ -846,11 +865,18 @@ pub fn process_spawn(args: &SpawnArgs) -> i64 {
         {
             return r;
         }
+        let mut child = Vec::new();
         for (i, h) in hs.iter().enumerate() {
+            let (obj, rights) = m.table[h];
+            child.push((obj, rights & args.rights[i]));
             if args.move_mask & (1 << i) != 0 {
                 m.table.remove(h);
             }
         }
+        if core::mem::take(&mut m.exit_next_child) {
+            child.clear();
+        }
+        m.children.push(child);
         m.spawned.push(*args);
         m.mint(Object::Process, Rights::SIGNAL | Rights::TERMINATE)
     })

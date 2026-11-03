@@ -182,6 +182,35 @@ mod tests {
         assert_eq!(sys::stray_closes(), 0, "nothing closed twice, the moved grant least of all");
     }
 
+    /// **A child holds its grants**: a moved end's peer still sends to it, and it reads with the
+    /// rights it was granted, no more.
+    #[test]
+    fn a_spawned_child_holds_what_it_was_granted() {
+        sys::reset();
+        let (ns, _image) = program();
+        let (ours, theirs) = Handle::<Channel, Only>::pair(4).unwrap();
+        let mut s = block_on(Spawn::path(&ns, "/bin/x")).unwrap();
+        s.grant(theirs, Rights::RECV).ok().unwrap();
+        let _child = s.spawn().ok().unwrap();
+        let mut msg = crate::Msg::new();
+        msg.set(b"hi").unwrap();
+        ours.send(&msg, &mut crate::Carried::new()).unwrap();
+        // SAFETY: a handle the mock has just made for the test.
+        let theirs = unsafe { Handle::<Channel, Only>::from_raw(RawHandle(sys::granted(0, 0)), Rights::empty()) };
+        let mut got = crate::Msg::new();
+        theirs.recv(&mut got).unwrap();
+        assert_eq!(got.payload(), b"hi");
+        let refused = theirs.send(&msg, &mut crate::Carried::new()).err().unwrap().code();
+        assert_eq!(refused, KError::NoAccess, "granted RECV alone");
+        let (ours, theirs) = Handle::<Channel, Only>::pair(4).unwrap();
+        let mut s = block_on(Spawn::path(&ns, "/bin/x")).unwrap();
+        s.grant(theirs, Rights::RECV).ok().unwrap();
+        sys::exit_next_child();
+        let _gone = s.spawn().ok().unwrap();
+        let closed = ours.send(&msg, &mut crate::Carried::new()).err().unwrap().code();
+        assert_eq!(closed, KError::PeerClosed, "a child that exited holds nothing");
+    }
+
     #[test]
     fn a_refused_spawn_hands_back_what_it_would_have_moved() {
         sys::reset();

@@ -87,7 +87,7 @@ pub fn answering(path: &str) -> (u64, u64) {
         let (ours, _) = m.table[&ends[0]];
         m.table.remove(&ends[0]);
         let server = m.object(Object::Answers(ours));
-        let ns = m.object(Object::Namespace(vec![(path.as_bytes().to_vec(), server, u64::MAX)]));
+        let ns = m.object(Object::Namespace(vec![Binding::new(path.as_bytes(), server, u64::MAX)]));
         (m.install(ns, Rights::LOOKUP.bits()), ends[1])
     })
 }
@@ -106,7 +106,7 @@ pub fn forwarding() -> u64 {
 pub fn served(path: &str) -> u64 {
     with(|m| {
         let server = m.object(Object::Server);
-        let ns = m.object(Object::Namespace(vec![(path.as_bytes().to_vec(), server, u64::MAX)]));
+        let ns = m.object(Object::Namespace(vec![Binding::new(path.as_bytes(), server, u64::MAX)]));
         m.install(ns, Rights::LOOKUP.bits())
     })
 }
@@ -147,6 +147,34 @@ pub fn logged() -> Vec<u8> {
 /// Every spawn's arguments, in order.
 pub fn spawned() -> Vec<SpawnArgs> {
     with(|m| m.spawned.clone())
+}
+
+/// Whether `a` and `b` are handles on one object, which no call reports.
+pub fn same_object(a: u64, b: u64) -> bool {
+    with(|m| matches!((m.table.get(&a), m.table.get(&b)), (Some(x), Some(y)) if x.0 == y.0))
+}
+
+/// Make the next spawn's child exit before anything reaches it: it holds none of its grants.
+pub fn exit_next_child() {
+    with(|m| m.exit_next_child = true);
+}
+
+/// A handle on what the `n`th spawn granted its child at `i`, with the rights it was installed
+/// with, for a test that plays the child.
+pub fn granted(n: usize, i: usize) -> u64 {
+    with(|m| {
+        let (obj, rights) = m.children[n][i];
+        m.install(obj, rights)
+    })
+}
+
+/// The base `path` was bound in `ns` with, which no enumerate reports; `None` if nothing is bound
+/// there.
+pub fn bound_base(ns: u64, path: &str) -> Option<Vec<u8>> {
+    with(|m| {
+        let ns = m.namespace(ns, Rights::empty()).ok()?;
+        m.bindings(ns).iter().find(|b| b.path == path.as_bytes()).map(|b| b.base.clone())
+    })
 }
 
 /// Every thread's arguments, in order.
