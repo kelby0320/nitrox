@@ -1232,7 +1232,9 @@ handle, since `libsurface::Transport::request` moves one only on a successful se
 of who closes it otherwise; `Window::attach`, its other caller with a handle, has the same gap. The
 mapping goes on every path. Found by reading in PR #380's review (finding 6). **Trigger**: P7's
 channel send, which settles `request`'s handle contract (desk-o1): consumed on every path is the
-simplest for callers.
+simplest for callers. **libos has it since Part E.1**: its `send` takes the handles from a
+`Handles`, which keeps them on a refusal and closes them when it drops, so this ends when
+`libsurface`'s transport moves onto it, in E.2.
 
 ### Processes and memory
 
@@ -2263,7 +2265,8 @@ and `channel_recv_raw` return `Result<Received, i64>`, so each caller spells the
 matches by hand — `KError::PeerClosed.as_i32() as i64`, `KError::PeerClosed as i64`, or a local
 `E_PEER_CLOSED` — and a wrong constant compiles. A `KError` would make each a checked match. It
 waits for the receive's move to libos, whose wrappers return its typed `Error`, so the forty-odd
-callers change once: the move the safety survey's plan, in PR #398, proposes. Trigger: that move,
+callers change once: the move the safety survey's plan, in PR #398, proposes. **libos's `recv`
+answers a `KError` since Part E.1**, and the callers move onto it in E.2–E.5. Trigger: that move,
 or a status mismatched at a call site. **The same callers read a held receive as nothing queued.**
 `OutOfMemory` leaves the message queued, so their wait fires again at once and they spin until
 memory returns, which keeps the idle thread's reclamation from freeing any. `control::recv` and

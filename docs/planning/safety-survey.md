@@ -3326,7 +3326,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   its owner and the per-crate unsafe raw-namespace contracts. Depends on: the entry/std-port
   seam decision (`libos.md`). opportunities. Value medium, effort large. **Plan**, in P7.
 
-- [ ] **rt-o8** narrow: `Handle::borrow(raw, rights)` yields a full `Handle` with no lifetime, on
+- [x] **rt-o8** narrow: `Handle::borrow(raw, rights)` yields a full `Handle` with no lifetime, on
   which safe `without_transfer`, `without_duplicate`, `into_read_only` and `into_raw` act on a
   handle the borrow does not own, while `from_raw`, `borrow` and `Namespace::lookup` are `unsafe`
   on a type/mode claim that no memory safety rests on (a wrong `T` or `M` only yields `Err`,
@@ -3345,6 +3345,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   borrow outliving its owner, and `unsafe` blocks that hold no memory obligation and dilute
   those that do. Depends on: nothing. ownership, soundness. Value medium, effort small.
   **Plan**, in P7.
+  Done in `c4ea2540`: `Ref<'a, T, M>`, `Copy`, with no `Drop` and nothing that attenuates, and
+  `Handle::as_ref`; `borrow` is gone, every operation is written once for both, and `lookup` is
+  safe. `from_raw` stays `unsafe` for its ownership claim, as `std`'s `OwnedFd` is. The 17 sites
+  moved with it.
 
 - [ ] **rt-o9** remove: local re-implementations of `kprint` and `exit` over raw
   `SYS_DEBUG_KPRINT` / `SYS_PROCESS_EXIT` although `libkern::debug::{kprint, exit}` exist (`exit` is

@@ -1019,7 +1019,8 @@ two halves, Part J between them.** E.1 to E.5 put every crate on libos, with the
 ratchet on raw syscalls, the libraries, the supervisors and servers, the programs, the test harness.
 E.6 to E.11 then take the surface from forty-two syscalls to twenty-eight. A call that changes shape
 is then one crate's change, while what moves between processes, entropy's binding and the clock's
-and power's handles, stays with the supervisors that hold them.
+and power's handles, stays with the supervisors that hold them. **E.1 built 2026-11-03**: libos's
+safe layer, the ratchet on raw syscalls in CI, and the counts' probe kept.
 
 **With it, four of the bash's findings** ([`bug-bash.md`](bug-bash.md)): `sys_file_sync`'s name and
 lookup binding it to files (kmem-30), and three in the memory-mapping path that Phase 7's threads

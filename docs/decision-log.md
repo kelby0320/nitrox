@@ -37513,3 +37513,45 @@ And after its review, which found the plan's gaps and no fault in its order:
 - **`copy-limit` becomes 4 GiB**, a file's size being a `u32` on the wire.
 - **The clock is sendable once it is a binding**, as a disk is, where a syscap was not. That is the
   cost of one authority model.
+
+## 2026-11-03 — Before Phase 7, E.1: libos's safe layer, a ratchet on raw syscalls, the counts kept
+
+E.1 builds what every crate moves onto in E.2 to E.5: every class the safety survey's P7 lists, as a
+type or a function in libos, still `no_std`, alloc-free and over `libkern` alone. It moves no crate
+but the eight already on libos, whose borrows and lookups changed shape. **The ratchet**, `cargo
+xtask check-syscalls`, holds each crate to its count of raw syscalls in
+`tools/xtask/raw-syscalls.toml` from this PR, and **the probe** behind the plan's heavy paths is
+kept, as `cargo xtask syscall-counts` over a `syscall-counts` kernel no image ships.
+
+Decided in the part, for the maintainer's eye:
+
+- **Building a handle or a borrow from a raw value stays `unsafe`; a lookup is safe.** The survey
+  (rt-o8) asked for both safe, as a wrong type or mode claims nothing memory rests on. The type
+  claim is harmless, but the ownership claim is not: a handle closed by two owners, or borrowed past
+  its close, is what `std`'s I/O safety makes `OwnedFd::from_raw_fd` and `BorrowedFd::borrow_raw`
+  `unsafe` for.
+- **A `Mapping` lends no reference to its bytes.** Another process or a device may write them, so
+  it copies, and a slice takes `unsafe fn assume_unshared`, as desk-o5 drew it. Every reader then
+  pays a copy, which for a font or a file read whole it already made.
+- **A thread's stack is never given back.** Nothing tells a process that a thread of its ended, so
+  nothing could unmap the stack safely: `thread::start` keeps it for the process's life, as every
+  caller does today by hand. Its `rsp` starts 8 below the stack's top, where the ABI has a function
+  find it after a `call`; the kernel starts a process's first thread on the 16-byte boundary itself,
+  which was not examined here.
+- **The ratchet counts `libkern`'s own wrappers**, `kprint` and `exit` among them, derived from
+  `libkern`'s source each run, so its 1,930 counts every call of a wrapper that makes one beside
+  the `syscallN`s the detail pass counted. A crate moved onto libos takes those too.
+- **The probe names a process by its first console line**, as the kernel keeps no name: a program
+  that never logs is `-`, and both filesystem servers are `fs-server`.
+- **Three things are in the target's shape over today's calls**, `TODO(surface-shape)`: the two
+  flushes are `async` though their calls answer in place, `Spawn::path` hands the kernel a file, and
+  `entropy::fill` makes a source per call. **A thread's stack has no guard below it** until E.6's
+  gap, `TODO(thread-stack-guard)`.
+- **The raw-argument `spawn` and `thread_create` stay** for the callers not yet moved, which E.3 and
+  E.5 take onto `Spawn` and `thread::start`.
+
+**The mock under libos's tests became a model of the kernel**: a handle table, real host memory
+behind a mapping, channels with rings and peers, direct bindings, and each call's refusals in the
+kernel's order. Each guarantee was shown to fail its test with the guarantee removed, 23 controls;
+two passed at first, a moved grant closed twice and a bootstrap handle never closed, until the mock
+counted closes of handles not there and the test reached the drop.
