@@ -217,25 +217,16 @@ impl LoadError {
 /// call. It is borrowed, never closed.
 #[cfg(feature = "io")]
 pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
-    use libkern::abi::HandleInfo;
     use libkern::handle::{RawHandle, Rights};
-    use libkern::{SYS_HANDLE_STAT, syscall2};
-    use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
+    use libos::{File, Handle, MapRead, Namespace, NsReadOnly, Ref, block_on};
 
-    // SAFETY: the caller guarantees `root_ns` is live and owned; `borrow` yields a
-    // non-owning view that never closes it.
-    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-    // SAFETY: the path resolves to a read-mappable file object, or it does not resolve.
-    let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ | Rights::INSPECT) })
-        .map_err(|_| LoadError::NoBinding)?;
+    // SAFETY: the caller guarantees `root_ns` is live and owned.
+    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+    let obj: Handle<File, MapRead> =
+        block_on(ns.lookup(path, Rights::MAP_READ | Rights::INSPECT)).map_err(|_| LoadError::NoBinding)?;
 
     // The exact byte length: mapping is page-granular and would pad the last page with zeros.
-    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
-    // SAFETY: `&mut info` is a valid 24-byte `HandleInfo` out-param, and `obj` is live.
-    let sr = unsafe { syscall2(SYS_HANDLE_STAT, obj.raw().0, (&mut info as *mut HandleInfo) as u64) };
-    if sr < 0 {
-        return Err(LoadError::Unstattable);
-    }
+    let info = obj.stat().map_err(|_| LoadError::Unstattable)?;
     if info.size == 0 || info.size as usize > MAX_FONT_BYTES {
         return Err(LoadError::ImpossibleSize(info.size));
     }
@@ -244,11 +235,8 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
     let mut data = Vec::new();
     // Reserve first: a refusal then leaves no mapping, and doubling would fault the file in twice.
     data.try_reserve_exact(size).map_err(|_| LoadError::ImpossibleSize(info.size))?;
-    let addr = obj.map(size).map_err(|_| LoadError::Unmappable)?;
-    // SAFETY: `map` returned a mapping of at least `size` readable bytes.
-    data.extend_from_slice(unsafe { core::slice::from_raw_parts(addr as *const u8, size) });
-    // SAFETY: `addr` is the mapping made above, and the slice copied out of it is done with.
-    let _ = unsafe { obj.unmap(addr, size) };
+    data.resize(size, 0);
+    obj.map(size).and_then(|m| m.read_into(0, &mut data)).map_err(|_| LoadError::Unmappable)?;
 
     Font::from_bytes(data).ok_or(LoadError::NotAFont)
 }

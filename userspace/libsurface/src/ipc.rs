@@ -105,12 +105,11 @@ impl ChannelTransport {
     /// `root_ns` must be a live namespace handle owned by the caller.
     unsafe fn resolve(root_ns: u64, path: &str) -> Result<Self, UiError> {
         use libkern::handle::{RawHandle, Rights};
-        use libos::{Handle, Namespace, NsReadOnly, Only, Resource, block_on};
+        use libos::{Channel, Namespace, NsReadOnly, Only, Ref, block_on};
 
-        // SAFETY: the caller guarantees `root_ns` is live and owned; `borrow` never closes.
-        let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-        // SAFETY: both paths resolve to a channel endpoint, asserted by the type arguments.
-        let ch = block_on(unsafe { ns.lookup::<Resource, Only>(path, Rights::SEND | Rights::RECV | Rights::WAIT) })
+        // SAFETY: the caller guarantees `root_ns` is live and owned.
+        let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+        let ch = block_on(ns.lookup::<Channel, Only>(path, Rights::SEND | Rights::RECV | Rights::WAIT))
             .map_err(|_| UiError::Transport)?;
         // SAFETY: a live endpoint this process now owns.
         Ok(unsafe { Self::new(ch.into_raw().0) })

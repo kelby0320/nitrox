@@ -16,7 +16,6 @@
 "userspace/hello" = 58
 "userspace/init" = 78
 "userspace/input-server" = 46
-"userspace/libdraw" = 1
 "userspace/libfs" = 32
 "userspace/libfsserver" = 36
 "userspace/libheap" = 5
@@ -36,7 +35,7 @@
 "userspace/service-mgr" = 27
 "userspace/session-mgr" = 10
 "userspace/storage-service" = 51
-"userspace/test-harness" = 795
+"userspace/test-harness" = 793
 "userspace/tty-server" = 42
 "userspace/view-broker" = 34
 

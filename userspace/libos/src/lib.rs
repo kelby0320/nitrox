@@ -1,4 +1,4 @@
-//! `libos` — the typed, async userspace runtime for Nitrox.
+//! `libos` — the typed, async userspace runtime for Nitrox, and every crate's way to the kernel.
 //!
 //! The typed/async face of the raw `libkern` syscall surface. Design contract:
 //! `docs/architecture/libos.md`.
@@ -22,16 +22,34 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod boot;
+mod channel;
+pub mod entropy;
 mod error;
 mod exec;
+pub mod fs;
 mod handle;
-mod objects;
+mod io;
+pub mod log;
+mod memory;
+mod ns;
+mod process;
 mod sys;
+pub mod thread;
+pub mod time;
+mod wait;
 
+pub use channel::{Carried, Msg};
 pub use error::{Error, ErrorKind, Result};
 pub use exec::{Op, block_on};
 pub use handle::{
-    CanBind, CanLookup, CanMapRead, CanMapWrite, CanRead, CanWrite, Handle, MapExec, MapRead, MapReadWrite, Memory,
-    Namespace, Notify, NsMutable, NsReadOnly, Only, Process, ReadOnly, ReadWrite, Resource, Thread, WriteOnly,
+    CanBind, CanLookup, CanMapRead, CanMapWrite, CanRead, CanWrite, Channel, File, Handle, Handles, MapExec, MapRead,
+    MapReadWrite, Mappable, Memory, Namespace, Notify, NsMutable, NsReadOnly, Only, Process, ReadOnly, ReadWrite, Ref,
+    Resource, Thread, WriteOnly,
 };
-pub use objects::{spawn, thread_create};
+pub use memory::Mapping;
+pub use ns::Bindings;
+pub use process::{Refused, Spawn, exit, spawn};
+pub use thread::thread_create;
+pub use time::Deadline;
+pub use wait::{Signalled, WaitSet};

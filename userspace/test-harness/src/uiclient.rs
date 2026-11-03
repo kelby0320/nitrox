@@ -120,7 +120,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
 /// Resolve `/dev/draw/<id>/info`, map it, and return the snapshot.
 fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::WindowInfo> {
     use libkern::handle::{RawHandle, Rights};
-    use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
+    use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, Ref, block_on};
 
     let mut path = [0u8; 32];
     let prefix = b"/dev/draw/";
@@ -146,18 +146,13 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
     let path = core::str::from_utf8(&path[..n]).ok()?;
 
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-    // SAFETY: the path resolves to a read-mappable object holding one `WindowInfo`.
-    let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ) }).ok()?;
+    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+    let obj: Handle<Memory, MapRead> = block_on(ns.lookup(path, Rights::MAP_READ)).ok()?;
     // **The constant, not a literal**: a stale length would silently make this return `None`.
     const N: usize = librsproto::surface::WINDOW_INFO_LEN;
-    let addr = obj.map(N).ok()?;
-    // SAFETY: the compositor serves exactly `N` bytes of `WindowInfo` here.
-    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, N) };
-    let info = librsproto::surface::WindowInfo::read(bytes);
-    // SAFETY: the mapping made above, `bytes` done with; each poll maps a fresh object to unmap.
-    let _ = unsafe { obj.unmap(addr, N) };
-    info
+    let mut bytes = [0u8; N];
+    obj.map(N).and_then(|m| m.read_into(0, &mut bytes)).ok()?;
+    librsproto::surface::WindowInfo::read(&bytes)
 }
 
 fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {

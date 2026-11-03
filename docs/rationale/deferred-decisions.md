@@ -2273,6 +2273,22 @@ server's stay signalled and `sys_wait` fires again at once, a spin for the rest 
 `auth-service`'s leaves the wait set and `storage-service`'s and `device-mgr`'s exit. Only the
 registration going reaches it, which takes `service-mgr` with it.
 
+**libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
+`Namespace::flush` and `fs::flush` are `async` though `sys_ns_sync` and `sys_file_sync` answer
+within the call; `Spawn::path` hands the kernel a file, which it reads within the spawn;
+`entropy::fill` makes an `EntropyObject` for each call. Each caller is written once, against the
+shape it will keep, and the call under it changes as its sub-part of
+[`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 makes both flushes resolves or an
+`io_submit`, E.8 makes `Spawn` read the image into memory first, and E.9 makes entropy a node.
+Trigger: each of those sub-parts.
+
+**A thread's stack has no guard below it — `TODO(thread-stack-guard)`.** `libos::thread::Stack`
+is a mapping of its own, but a mapping placed without a hint lies flush against the one below, so
+a thread that overruns its stack writes into that mapping rather than faulting. The main thread's
+stack has a guard gap; no other does. The kernel's half of the safety survey's th-d9, planned in
+Part E.6 of [`syscall-surface.md`](../planning/syscall-surface.md): `find_free_range` leaves an
+unmapped page below what a hint-less map places. Trigger: E.6.
+
 **vDSO-equivalent for `sys_clock_read`.** On modern Linux, `clock_gettime` is implemented in vDSO — userspace reads TSC directly, no syscall. Nitrox initially does one syscall per `sys_clock_read`. The API shape leaves room for this optimization later (the `ClockId` enum can map to fixed memory locations) without changing call sites.
 
 ### Concurrency primitives

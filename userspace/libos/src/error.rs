@@ -34,6 +34,11 @@ impl Error {
     }
 }
 
+/// A syscall's return as its value, or the `KError` a negative one is.
+pub(crate) fn check(r: i64) -> Result<u64> {
+    if r < 0 { Err(Error::from_status(r as i32)) } else { Ok(r as u64) }
+}
+
 impl From<KError> for Error {
     fn from(code: KError) -> Error {
         Error { code }

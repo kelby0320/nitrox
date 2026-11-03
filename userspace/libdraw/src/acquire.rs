@@ -8,7 +8,7 @@
 
 use libkern::abi::FramebufferInfo;
 use libkern::handle::{RawHandle, Rights};
-use libos::{Handle, MapRead, MapReadWrite, Memory, Namespace, NsReadOnly, block_on};
+use libos::{Handle, MapRead, MapReadWrite, Memory, Namespace, NsReadOnly, Ref, block_on};
 
 use crate::format::{Channel, PixelFormat};
 use crate::framebuffer::{Geometry, RawFramebuffer};
@@ -43,21 +43,16 @@ pub const FRAMEBUFFER_INFO_PATH: &str = "/dev/framebuffer/info";
 /// `root_ns` must be a live namespace handle owned by the caller for the call; it is borrowed,
 /// never closed.
 pub unsafe fn read_info(root_ns: u64) -> Result<FramebufferInfo, AcquireError> {
-    // SAFETY: the caller guarantees `root_ns` is live and owned; `borrow` yields a
-    // non-owning view that never closes it.
-    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-    // SAFETY: the path resolves to a read-mappable object holding one FramebufferInfo.
-    let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(FRAMEBUFFER_INFO_PATH, Rights::MAP_READ) })
-        .map_err(|_| AcquireError::NoBinding)?;
+    // SAFETY: the caller guarantees `root_ns` is live and owned.
+    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+    let obj: Handle<Memory, MapRead> =
+        block_on(ns.lookup(FRAMEBUFFER_INFO_PATH, Rights::MAP_READ)).map_err(|_| AcquireError::NoBinding)?;
 
-    let addr = obj.map(core::mem::size_of::<FramebufferInfo>()).map_err(|_| AcquireError::InfoUnmappable)?;
-    // SAFETY: `map` returned a mapping of at least the requested length, and the
-    // kernel serves this leaf as exactly one `FramebufferInfo` followed by zero padding.
-    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, core::mem::size_of::<FramebufferInfo>()) };
-    let info = FramebufferInfo::from_bytes(bytes);
-    // SAFETY: the mapping made above, which `info`, a copy, no longer borrows.
-    let _ = unsafe { obj.unmap(addr, core::mem::size_of::<FramebufferInfo>()) };
-    info.ok_or(AcquireError::InfoTruncated)
+    // The kernel serves this leaf as exactly one `FramebufferInfo` followed by zero padding.
+    let mut bytes = [0u8; core::mem::size_of::<FramebufferInfo>()];
+    let mapping = obj.map(bytes.len()).map_err(|_| AcquireError::InfoUnmappable)?;
+    mapping.read_into(0, &mut bytes).map_err(|_| AcquireError::InfoUnmappable)?;
+    FramebufferInfo::from_bytes(&bytes).ok_or(AcquireError::InfoTruncated)
 }
 
 /// Turn a firmware geometry report into a [`Geometry`].
@@ -95,14 +90,12 @@ pub unsafe fn acquire(root_ns: u64) -> Result<(RawFramebuffer, FramebufferInfo),
     let info = unsafe { read_info(root_ns) }?;
     let geometry = geometry_from(&info)?;
 
-    // SAFETY: as above — borrowed, never closed.
-    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-    // SAFETY: the path resolves to a read/write-mappable MemoryObject over the aperture.
-    let obj =
-        block_on(unsafe { ns.lookup::<Memory, MapReadWrite>(FRAMEBUFFER_PATH, Rights::MAP_READ | Rights::MAP_WRITE) })
-            .map_err(|_| AcquireError::NoBinding)?;
+    // SAFETY: as above.
+    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+    let obj: Handle<Memory, MapReadWrite> = block_on(ns.lookup(FRAMEBUFFER_PATH, Rights::MAP_READ | Rights::MAP_WRITE))
+        .map_err(|_| AcquireError::NoBinding)?;
 
-    let addr = obj.map(info.byte_len as usize).map_err(|_| AcquireError::ApertureUnmappable)?;
+    let (addr, _) = obj.map(info.byte_len as usize).map_err(|_| AcquireError::ApertureUnmappable)?.into_raw();
     // SAFETY: `addr` maps `byte_len` writable bytes of the aperture, at least `geometry`'s as
     // `geometry_from` checked, which stays mapped for the life of the address space; the caller's
     // contract forbids a second writer.
