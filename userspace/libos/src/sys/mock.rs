@@ -455,7 +455,14 @@ pub fn memory_map(h: u64, _hint: u64, size: u64, rights: u64) -> i64 {
         }
         let room = match &mut m.objects[obj] {
             Object::Memory(b) => b.len(),
-            Object::File { size, .. } => (*size as usize).next_multiple_of(PAGE),
+            Object::File { size, bytes } => {
+                let room = (*size as usize).next_multiple_of(PAGE);
+                assert!(
+                    room <= bytes.len(),
+                    "the mock backs a file with {FILE_ROOM} bytes; a map past them is the test's"
+                );
+                room
+            }
             _ => return e(KError::InvalidArgument),
         };
         if size == 0 || size as usize > room {
