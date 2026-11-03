@@ -14,4 +14,8 @@ path = "src/lib.rs"
 
 [dependencies]
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 librsproto = { path = "../librsproto" }
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }

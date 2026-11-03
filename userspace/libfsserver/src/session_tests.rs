@@ -12,13 +12,15 @@ use std::vec::Vec;
 
 /// What a session asked of the volume, each call as a line.
 #[derive(Default)]
-struct Spy {
-    calls: RefCell<Vec<String>>,
+pub(crate) struct Spy {
+    pub(crate) calls: RefCell<Vec<String>>,
     orphan: Option<u64>,
     entries: usize,
+    /// Whether every path is a file of five bytes, rather than a directory.
+    pub(crate) file: bool,
 }
 
-struct Never;
+pub(crate) struct Never;
 
 impl core::fmt::Display for Never {
     fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -61,9 +63,16 @@ impl Volume for Spy {
         Ok(())
     }
     fn map_file(&self, _: &[u8], _: &mut [BlockRun]) -> Result<Mapped, FsError> {
+        if self.file {
+            return Ok(Mapped { size: 5, block_size: 4096, runs: 0, id: 9 });
+        }
         Err(FsError::NotFound)
     }
-    fn read_file(&self, _: &[u8], _: &mut [u8]) -> Result<usize, FsError> {
+    fn read_file(&self, _: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
+        if self.file {
+            out[..5].copy_from_slice(b"hello");
+            return Ok(5);
+        }
         Err(FsError::NotFound)
     }
     fn read_file_range(&self, _: &[u8], _: u64, _: usize, _: &mut [u8]) -> Result<usize, FsError> {
@@ -79,7 +88,7 @@ impl Volume for Spy {
         Err(FsError::NotFound)
     }
     fn resolve_dir(&self, _: &[u8]) -> Result<u64, FsError> {
-        Ok(7)
+        if self.file { Err(FsError::NotFound) } else { Ok(7) }
     }
     fn read_dir(&self, _: u64, _: u64, mut emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError> {
         let name = [b'n'; 200];
