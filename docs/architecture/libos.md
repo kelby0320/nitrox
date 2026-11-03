@@ -140,11 +140,15 @@ a held send's.
 - **Constructed by** the async method (`handle.read(..)`), which issues
   `sys_io_submit` immediately (the submit never blocks) and holds the returned PO.
   (A pre-signalled PO — zero-length / cache hit — is handled uniformly.)
-- **`poll`**: reads the PO's completion with a non-blocking `sys_wait`. If complete, decode
-  the 24-byte `IoResult` (`status@8`, `result@16`) into `Ready(Result<R>)`. If the wait
-  answers `WouldBlock`, register the PO handle with the reactor (via the `Waker`) and return
-  `Pending`; any other error completes the op with it, so a PO that can no longer be waited on
-  is not polled for ever. A second poll after `Ready` is an error and waits on nothing: the
+- **`poll`**: **under `block_on`, an operation costs one wait.** The first poll registers the PO
+  with the reactor (via the `Waker`) and returns `Pending`, making no call: the wait after it reads
+  a PO done already. A later poll takes what that wait read for its PO and decodes the 24-byte
+  `IoResult` (`status@8`, `result@16`) into `Ready(Result<R>)`. A poll that finds nothing read
+  for it, and every poll under another executor, reads the completion with a non-blocking
+  `sys_wait`: complete is `Ready`, `WouldBlock` registers again, and any other error completes
+  the op with it, so a PO that can no longer be waited on is not polled for ever. Reading a
+  completion twice would cost a second wait, the third of a round trip, and nothing else: a
+  lookup's handle is installed by the first read, which every later one reports. A second poll after `Ready` is an error and waits on nothing: the
   result, which may be a handle, is handed out once.
 - **`Drop`** closes the PO, **first waiting for an unfinished I/O**: `sys_io_cancel` is
   `Unsupported`, and the device may still be writing the buffer the dropped future borrowed,
@@ -162,7 +166,8 @@ pub fn block_on<F: Future>(fut: F) -> F::Output;
 ```
 
 It polls `fut`; on `Pending`, it `sys_wait`s for ever on the waitable handles the pending
-`Op`s registered this round, then re-polls. A round can register eight (the kernel's
+`Op`s registered this round, keeps what that wait read for the poll after it alone, then
+re-polls. A round can register eight (the kernel's
 `MAX_WAIT_HANDLES` is larger, but `block_on` keeps eight). One that had to leave a handle out,
 or in which an `Op` was polled through another waker and so registered nothing, waits only
 until a deadline a millisecond off, so that operation is polled again. A round with nothing
