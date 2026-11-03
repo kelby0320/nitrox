@@ -35,10 +35,20 @@ pub(crate) fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `io` holds the stage plumbing and its tests, through libos's model of the kernel.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
         .arg("libstream")
+        .arg("--features")
+        .arg("io")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("liblog")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
