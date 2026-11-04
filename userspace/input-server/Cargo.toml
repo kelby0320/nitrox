@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
-librsproto = { path = "../librsproto" }
+libos = { path = "../libos" }
+librsproto = { path = "../librsproto", features = ["io"] }
 
 # A library + binary split, like `tty-server` and `compositor`: the library holds the
 # host-testable merge — the part with all the behaviour and none of the syscalls.
