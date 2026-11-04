@@ -1,6 +1,6 @@
 //! The session namespace: which members it binds, and with what.
 
-use crate::{borrow, resolve};
+use crate::resolve;
 use libkern::Rights;
 use libos::{
     Channel, Handle, MapReadWrite, Mapping, Memory, Namespace, NsMutable, NsReadOnly, Only, ReadOnly, Ref, Resource,
@@ -8,86 +8,8 @@ use libos::{
 };
 
 /// What a session's namespace — **or an application's** — is built from: both login supervisors
-/// and `desktop-shell` (per application) build with this, so they cannot drift.
-pub struct NamespaceSpec<'a> {
-    /// The namespace direct handles are resolved from: the supervisor's own — the root namespace —
-    /// for a session, and **the session's** for an application.
-    pub root_ns: u64,
-    /// The fs-server endpoint, bound at `/home` scoped to the user's subtree.
-    pub fs_endpoint: u64,
-    /// The profile-server endpoint, bound whole-tree at `/bin`.
-    pub profile_endpoint: u64,
-    /// The tty server's, bound at `/dev/tty`. **This and every server endpoint below is
-    /// `service-mgr`'s route to the server**, not its own, so a session survives a restart. Each
-    /// route reaches one server and nothing else, which is what lets `desktop-shell` hold them.
-    pub tty_endpoint: u64,
-    /// The clipboard server's, bound at `/dev/clipboard` in **both columns**, as a pipeline uses it
-    /// as a path. `0` binds nothing.
-    pub clipboard_endpoint: u64,
-    /// The user's home directory, as the subtree base for `/home`.
-    pub home: &'a [u8],
-    /// The user's name, snapshotted at `/session/user`.
-    pub user: &'a [u8],
-    /// Bind `/system/fonts` read-only; **a flag** because a member bound for nothing is still
-    /// authority held (`session-mgr/CLAUDE.md`).
-    pub bind_fonts: bool,
-    /// Bind `/dev/console`. **False for a graphical session** (`graphical-session.md`, governing
-    /// decision 3); the serial column binds it as its terminal.
-    pub bind_console: bool,
-    /// The view broker's, bound at `/dev/views` with [`views_base`](Self::views_base) as its base.
-    /// `0` binds nothing. **The base is the session's identity**: the broker learns whose request
-    /// it is from the suffix, and no program here can choose another — except `desktop-shell`,
-    /// handed this endpoint to bind into applications.
-    pub views_endpoint: u64,
-    /// `/s/<session>`, from [`open_views_session`](crate::open_views_session). Empty binds nothing.
-    pub views_base: &'a [u8],
-    /// An **info-only** endpoint of the device manager's, bound at `/dev/devices` with the base
-    /// `/info`. `0` binds nothing. **The endpoint keeps a session from taking a device**: the
-    /// manager answers only its tables on it, whatever suffix arrives.
-    pub devices_endpoint: u64,
-    /// A **session endpoint** of the storage service's, bound at `/storage` (base `/fs`) and
-    /// `/dev/storage` (base `/info`). `0` binds nothing. **The endpoint keeps a session from
-    /// mounting**: `admin-endpoint` is `NotFound` there, so even `desktop-shell` cannot mint one.
-    pub storage_endpoint: u64,
-    /// `service-mgr`'s **session endpoint**, bound at `/dev/services`; it answers only the table.
-    /// `0` binds nothing.
-    pub services_endpoint: u64,
-    /// Bind `/applications`: **true for a session**, **false for an application**.
-    pub bind_applications: bool,
-    /// The compositor's forwarding endpoint, bound at **`/dev/draw/new` alone**, with the base
-    /// `/new`: an application may open windows, and `manage` is unreachable. `0` binds nothing
-    /// (the graphical supervisor binds `/dev/draw` whole for `desktop-shell`). **Required when
-    /// asked for**: the build fails if it does not bind.
-    pub draw_endpoint: u64,
-    /// `desktop-shell`'s own endpoint, bound at `/dev/desktop`. `0` binds nothing.
-    pub desktop_endpoint: u64,
-}
-
-/// **What a namespace built from a [`NamespaceSpec`] holds**: it, and which optional members bound.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Built {
-    /// The namespace handle.
-    pub ns: u64,
-    /// `/bin` bound.
-    pub bin: bool,
-    /// `/dev/tty` bound.
-    pub tty: bool,
-    /// `/dev/console` bound.
-    pub console: bool,
-    /// `/dev/clipboard` bound.
-    pub clipboard: bool,
-    /// `/dev/views` bound, at the session's base.
-    pub views: bool,
-    /// `/dev/devices` bound.
-    pub devices: bool,
-    /// `/storage` and `/dev/storage` both bound.
-    pub storage: bool,
-    /// `/dev/desktop` bound.
-    pub desktop: bool,
-}
-
-/// [`NamespaceSpec`] with its endpoints borrowed: `None` binds nothing. Each is as that field of
-/// the spec says.
+/// and `desktop-shell` (per application) build with this, so they cannot drift. `None` binds
+/// nothing.
 #[derive(Clone, Copy)]
 pub struct Members<'a> {
     /// The namespace direct handles are resolved from; `None` binds no console.
@@ -292,7 +214,7 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
     }
 
     // `/dev/console` → a direct-handle bind, resolved from our own namespace. **Skipped for a
-    // graphical session** (see [`NamespaceSpec::bind_console`]): the console is shared.
+    // graphical session** (see [`Members::bind_console`]): the console is shared.
     if bind_console
         && let Some(root) = root_ns
         && let Ok(console) = resolve::<Resource, ReadOnly, _>(root, "/dev/console", Rights::READ | Rights::TRANSFER)
@@ -310,47 +232,6 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
         }
     }
     Some(Constructed { ns, bound })
-}
-
-/// [`build_namespace`] from a [`NamespaceSpec`] of raw handles the caller keeps open; the namespace
-/// is the caller's to close. For callers not yet on libos; the typed form is [`build_namespace`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
-    fn text(bytes: &[u8]) -> Option<&str> {
-        core::str::from_utf8(bytes).ok()
-    }
-    let members = Members {
-        root_ns: borrow(spec.root_ns),
-        fs_endpoint: borrow(spec.fs_endpoint),
-        profile_endpoint: borrow(spec.profile_endpoint),
-        tty_endpoint: borrow(spec.tty_endpoint),
-        clipboard_endpoint: borrow(spec.clipboard_endpoint),
-        // A home that is not text cannot be a base, and a session with a home needs its bind.
-        home: text(spec.home)?,
-        user: spec.user,
-        bind_fonts: spec.bind_fonts,
-        bind_console: spec.bind_console,
-        views_endpoint: borrow(spec.views_endpoint),
-        views_base: text(spec.views_base).unwrap_or(""),
-        devices_endpoint: borrow(spec.devices_endpoint),
-        storage_endpoint: borrow(spec.storage_endpoint),
-        services_endpoint: borrow(spec.services_endpoint),
-        bind_applications: spec.bind_applications,
-        draw_endpoint: borrow(spec.draw_endpoint),
-        desktop_endpoint: borrow(spec.desktop_endpoint),
-    };
-    let Constructed { ns, bound } = build_namespace(&members)?;
-    Some(Built {
-        ns: ns.into_raw().0,
-        bin: bound.bin,
-        tty: bound.tty,
-        console: bound.console,
-        clipboard: bound.clipboard,
-        views: bound.views,
-        devices: bound.devices,
-        storage: bound.storage,
-        desktop: bound.desktop,
-    })
 }
 
 /// Publish `user` at `/session/user` in `ns`, as a read-only memory object: a session's processes

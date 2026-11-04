@@ -187,8 +187,7 @@ fn nothing_is_left_open_or_mapped() {
     put(&ns, "/src", b"source");
     put(&ns, "/longer", b"a destination longer than its source");
     put(&ns, "/empty", b"");
-    let raw = ns.raw().0;
-    let ops: [(&str, &dyn Fn() -> bool); 11] = [
+    let ops: [(&str, &dyn Fn() -> bool); 10] = [
         ("copy to missing", &|| copy(&ns, "/src", "/m", false).is_ok()),
         ("copy to longer", &|| copy(&ns, "/src", "/longer", true).is_ok()),
         ("copy refused", &|| copy(&ns, "/src", "/m", false).is_err()),
@@ -199,7 +198,6 @@ fn nothing_is_left_open_or_mapped() {
         ("write", &|| write(&ns, "/w", b"bytes").is_ok()),
         ("save", &|| save(&ns, "/w", b"saved").is_ok()),
         ("size", &|| file_len(&ns, "/src").is_some()),
-        ("raw copy", &|| copy_file(raw, b"/src", b"/raw", true).is_ok()),
     ];
     for (what, op) in ops {
         let (ok, leaked) = leaks(op);
@@ -246,7 +244,7 @@ fn a_rename_moves_the_file_and_names_a_missing_source() {
     rename_path(&ns, "/c", "/b", true).unwrap();
     assert_eq!(get(&ns, "/b"), b"other");
     assert_eq!(rename_path(&ns, "/a", "/z", false), Err(FileError::NotFound));
-    assert_eq!(rename(ns.raw().0, b"/b", b"/d", false), Ok(()));
+    assert_eq!(rename_path(&ns, "/b", "/d", false), Ok(()));
     assert_eq!(file_len(&ns, "/d"), Some(5));
 }
 
@@ -275,13 +273,9 @@ fn the_raw_forms_do_what_the_typed_ones_do() {
     write_file(raw, b"/f", b"raw bytes").unwrap();
     assert_eq!(read_file(raw, b"/f").unwrap(), b"raw bytes");
     assert_eq!(file_size(raw, b"/f"), Some(9));
-    assert_eq!(copy_file(raw, b"/f", b"/g", false), Ok(9));
-    assert_eq!(copy_file(raw, b"/f", b"/g", false), Err(FileError::Exists));
     assert_eq!(read_file(raw, b"/none"), Err(FileError::NotFound));
-    create_file(raw, b"/e").unwrap();
     save_file(raw, b"/g", b"saved").unwrap();
     assert_eq!(get(&ns, "/g"), b"saved");
-    assert_eq!(file_size(raw, b"/e"), Some(0));
     assert_eq!(unpadded(&get(&ns, "/g")), b"saved");
 }
 
@@ -292,11 +286,8 @@ fn a_path_that_is_not_text_resolves_to_nothing() {
     let bad: &[u8] = b"/\xff";
     assert_eq!(file_size(raw, bad), None);
     assert_eq!(read_file(raw, bad), Err(FileError::NotFound));
-    assert_eq!(copy_file(raw, bad, b"/d", true), Err(FileError::NotFound));
     put(&ns, "/s", b"x");
-    assert!(matches!(copy_file(raw, b"/s", bad, true), Err(FileError::Io(_))));
     assert!(matches!(write_file(raw, bad, b"x"), Err(FileError::Io(_))));
-    assert!(matches!(rename(raw, b"/s", bad, false), Err(FileError::Io(_))));
     assert_eq!(lookup_wait(raw, bad, Rights::MAP_READ.bits()).1, 0);
 }
 

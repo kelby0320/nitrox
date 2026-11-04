@@ -288,21 +288,6 @@ pub fn is_dir(ns: u64, path: &[u8]) -> bool {
     text(path).is_some_and(|path| is_directory(borrowed(ns), path))
 }
 
-/// [`bindings_under`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`bindings_under`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
-    bindings_under(borrowed(ns), &String::from_utf8_lossy(path))
-}
-
-/// [`list_directory`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`list_directory`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn list_dir(ns: u64, path: &[u8]) -> Result<Vec<OwnedEntry>, DirError> {
-    let path = text(path).ok_or(DirError::Transport(KError::InvalidArgument.as_i32()))?;
-    list_directory(borrowed(ns), path)
-}
-
 /// [`copy_recursive`] for a raw namespace handle. For callers not yet on libos; the typed form is
 /// [`copy_recursive`].
 // TODO(raw-handle-shims): goes when its last caller is on libos.
@@ -392,7 +377,6 @@ mod tests {
         let want = alloc::vec![(String::from("b"), DIRENT_KIND_DIR), (String::from("d"), DIRENT_KIND_FILE)];
         assert_eq!(bindings_under(&ns, "/a"), want);
         assert_eq!(bindings_under(&ns, "/a//"), want, "trailing slashes do not matter");
-        assert_eq!(ns_children(ns.raw().0, b"/a"), want);
         assert_eq!(bindings_under(&ns, "/none"), Vec::new());
     }
 }

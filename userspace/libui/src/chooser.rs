@@ -1,7 +1,7 @@
 //! The file chooser: a dialog for picking a file to open, or naming one to save.
 //!
 //! **A widget over a listing, not a browser**: `libui` cannot make a syscall, so entries are
-//! *given*, listed by the application with [`libfs::list_dir`] and ordered with `libfs::sort`.
+//! *given*, listed by the application with [`libfs::list_directory`] and ordered with `libfs::sort`.
 //!
 //! **One widget for both jobs**: Open and Save As differ in whether there is a name field and what
 

@@ -5,7 +5,7 @@ use crate::{BlockReader, BlockWriter, FsError};
 use core::cell::{Cell, RefCell};
 use core::ops::Range;
 use libkern::{IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, RawHandle, Rights};
-use libos::{Handle, Notify, Only, Op, ReadWrite, Ref, Resource, WaitSet};
+use libos::{Handle, Op, ReadWrite, Ref, Resource};
 use sys::{Device, Object, View, Waited};
 
 mod sys;
@@ -23,18 +23,6 @@ pub fn wait_transfer(op: Op) -> Option<(i32, u64)> {
         Waited::Finished { status, moved } => Some((status, moved)),
         Waited::Unfinished => None,
     }
-}
-
-/// [`wait_transfer`] on a raw `PendingOperation`, which it closes. For callers not yet on libos.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn po_wait(po: u64) -> Option<(i32, u64)> {
-    // SAFETY: the caller's own `PendingOperation`, which this has always closed.
-    let po: Handle<Notify, Only> = unsafe { Handle::from_raw(RawHandle(po), Rights::empty()) };
-    let mut set = WaitSet::<1>::new();
-    set.add(&po).ok()?;
-    let signalled = set.wait(libos::Deadline::NEVER).ok()?;
-    let (_, done) = signalled.iter().next()?;
-    Some((done.status, done.result))
 }
 
 /// **The one buffer a device layer moves every transfer through**, a `MemoryObject` mapped for its
@@ -64,14 +52,6 @@ impl Scratch {
         len: u64,
     ) -> Result<(), FsError> {
         self.submit(device.into(), &self.mem, opcode, offset, len)
-    }
-
-    /// [`exchange`](Self::exchange) on a raw device handle. For callers not yet on libos.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn transfer(&self, device: u64, opcode: u32, offset: u64, len: u64) -> Result<(), FsError> {
-        // SAFETY: the caller's own device handle, open for the call, as this has always asked.
-        let device = unsafe { Device::from_raw(RawHandle(device), Rights::empty()) };
-        self.exchange(device, opcode, offset, len)
     }
 
     /// A transfer through `buffer`: the scratch's own, or the zero span. A wait that fails loses
@@ -339,15 +319,6 @@ impl<'a> PartitionIo<'a> {
     /// scratch could not be made.
     pub fn window(device: impl Into<Device<'a>>, base: u64, len: u64) -> Option<PartitionIo<'a>> {
         Some(PartitionIo { device: device.into(), base, len, scratch: Scratch::new(WINDOW_SPAN)? })
-    }
-
-    /// [`window`](Self::window) onto a raw `device`. For callers not yet on libos.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn new(device: u64, base: u64, len: u64) -> Option<PartitionIo<'a>> {
-        // SAFETY: the caller's own device handle, which stays open while the window lives, as this
-        // has always asked.
-        let device = unsafe { Device::from_raw(RawHandle(device), Rights::empty()) };
-        PartitionIo::window(device, base, len)
     }
 }
 

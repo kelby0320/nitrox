@@ -172,7 +172,7 @@ pub const MONO_FONT_PATH: &str = "/system/fonts/DejaVuSansMono.ttf";
 /// naming another UI face draws titles in that face's regular weight. Not a theme key.
 pub const UI_BOLD_FONT_PATH: &str = "/system/fonts/DejaVuSans-Bold.ttf";
 
-/// The largest font file [`load`] will read; the size comes from a file this process does not own.
+/// The largest font file [`load_font`] will read; the size comes from a file this process does not own.
 pub const MAX_FONT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Why loading a font from the namespace failed.
@@ -245,19 +245,6 @@ fn borrowed<'a>(root_ns: u64) -> libos::Ref<'a, libos::Namespace, libos::NsReadO
     unsafe { libos::Ref::from_raw(libkern::handle::RawHandle(root_ns), libkern::handle::Rights::LOOKUP) }
 }
 
-/// Load a font from `path` in `root_ns`. For callers not yet on libos; the typed form is
-/// [`load_font`].
-///
-/// # Safety
-///
-/// `root_ns` must be a live namespace handle owned by the caller for the duration of the
-/// call. It is borrowed, never closed.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-#[cfg(feature = "io")]
-pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
-    load_font(borrowed(root_ns), path)
-}
-
 /// Load the proportional face a theme names, falling back to the built-in one.
 ///
 /// Returns the face and the path it actually came from, which may not be the theme's; a caller
@@ -297,7 +284,7 @@ pub fn load_ui_font<'a, M: libos::CanLookup + 'a>(
 ///
 /// # Safety
 ///
-/// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
+/// `root_ns` must be a live namespace handle owned by the caller.
 // TODO(raw-handle-shims): goes when its last caller is on libos.
 #[cfg(feature = "io")]
 pub unsafe fn load_ui(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {
@@ -320,7 +307,7 @@ pub fn load_mono_font<'a, M: libos::CanLookup + 'a>(
 ///
 /// # Safety
 ///
-/// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
+/// `root_ns` must be a live namespace handle owned by the caller.
 // TODO(raw-handle-shims): goes when its last caller is on libos.
 #[cfg(feature = "io")]
 pub unsafe fn load_mono(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {

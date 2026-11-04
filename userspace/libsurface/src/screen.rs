@@ -4,8 +4,8 @@
 //! A client that places or sizes something against the screen asks here rather than writing a
 //! size down: a hard-coded 1280×800 put a window list below the last row of a 768-row screen.
 
-use libkern::handle::{RawHandle, Rights};
-use libos::{CanLookup, Handle, MapRead, Memory, Namespace, NsReadOnly, Ref, block_on};
+use libkern::handle::Rights;
+use libos::{CanLookup, Handle, MapRead, Memory, Namespace, Ref, block_on};
 use librsproto::surface::{SCREEN_INFO_LEN, ScreenInfo};
 
 use crate::UiError;
@@ -30,21 +30,11 @@ pub fn info<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>) -> Resu
     }
 }
 
-/// [`info`] for a raw namespace handle. For callers not yet on libos.
-///
-/// # Safety
-///
-/// `root_ns` must be a live namespace handle owned by the caller.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub unsafe fn read(root_ns: u64) -> Result<ScreenInfo, UiError> {
-    // SAFETY: the caller guarantees `root_ns` is live and owned.
-    info(unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libos::{MapReadWrite, NsMutable, fs, mock};
+    use libkern::handle::RawHandle;
+    use libos::{MapReadWrite, NsMutable, NsReadOnly, fs, mock};
 
     /// A namespace whose `/dev/draw/screen` is a file holding `info`.
     fn screen_with(info: ScreenInfo) -> Handle<Namespace, NsMutable> {
@@ -78,12 +68,5 @@ mod tests {
         // SAFETY: the mock's handle, open for the test.
         let served = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(served), Rights::LOOKUP) };
         assert_eq!(info(served), Err(UiError::Transport), "nothing answers /dev/draw/screen");
-    }
-
-    #[test]
-    fn the_raw_form_reads_the_same_screen() {
-        let ns = screen_with(ScreenInfo { width: 640, height: 480 });
-        // SAFETY: `ns` is live and owned by this test.
-        assert_eq!(unsafe { read(ns.raw().0) }, Ok(ScreenInfo { width: 640, height: 480 }));
     }
 }

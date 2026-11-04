@@ -194,13 +194,6 @@ mod io_port {
             self.end.as_ref()
         }
 
-        /// The endpoint handle this port sends/receives on, still owned by whoever owned it. For
-        /// callers not yet on libos; the typed form is [`channel`](Self::channel).
-        // TODO(raw-handle-shims): goes when its last caller is on libos.
-        pub fn endpoint(&self) -> u64 {
-            self.channel().raw().0
-        }
-
         /// As [`MsgPort::send`], giving up once the ring has stayed full to `deadline`: a message
         /// held that long is dropped, and the send fails [`WireError::SinkFull`].
         pub fn send_by(&mut self, payload: &[u8], last: bool, deadline: Deadline) -> Result<()> {

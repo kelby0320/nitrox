@@ -104,7 +104,7 @@ pub trait Host {
     }
 
     /// What is directly under `dir` (absolute), each name with whether it is a directory.
-    /// Best-effort like [`commands`](Self::commands); the real host calls `libfs::list_dir`, the
+    /// Best-effort like [`commands`](Self::commands); the real host calls `libfs::list_directory`, the
     /// filesystem-and-namespace union `list` shows.
     fn list_dir(&mut self, dir: &str) -> Vec<(String, bool)> {
         let _ = dir;

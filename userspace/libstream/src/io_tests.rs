@@ -53,7 +53,7 @@ fn a_port_closes_the_endpoint_it_owns_and_not_one_it_borrows() {
     assert!(!mock::is_open(raw));
     let raw = b.raw().0;
     let port = IpcPort::new(raw);
-    assert_eq!(port.endpoint(), raw);
+    assert_eq!(port.channel().raw().0, raw);
     drop(port);
     assert!(mock::is_open(raw), "the caller's endpoint stays open");
     assert_eq!(mock::stray_closes(), 0);

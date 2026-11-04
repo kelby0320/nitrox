@@ -118,8 +118,14 @@ fn sector_disk() -> SectorDisk {
     SectorDisk::new(device()).ok().unwrap()
 }
 
+/// The test's own device handle, lent to a window that must leave it open.
+fn borrowed_device(raw: u64) -> Device<'static> {
+    // SAFETY: the mock's device, open for the test, which outlives the window.
+    unsafe { Device::from_raw(RawHandle(raw), Rights::empty()) }
+}
+
 fn partition() -> PartitionIo<'static> {
-    PartitionIo::new(device(), 0, 1 << 20).unwrap()
+    PartitionIo::window(borrowed_device(device()), 0, 1 << 20).unwrap()
 }
 
 #[test]
@@ -214,7 +220,7 @@ fn dropping_a_sector_disk_unmaps_its_scratch_and_closes_it_and_its_device() {
 fn dropping_a_partition_unmaps_its_scratch_and_closes_it_but_not_its_device() {
     let dev = device();
     let before = mock::open_handles();
-    drop(PartitionIo::new(dev, 0, 1 << 20).unwrap());
+    drop(PartitionIo::window(borrowed_device(dev), 0, 1 << 20).unwrap());
     assert_eq!((mock::open_handles(), mock::mappings(), mock::stray_closes()), (before, 0, 0));
     assert!(mock::is_open(dev));
 }
