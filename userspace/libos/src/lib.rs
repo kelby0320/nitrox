@@ -24,6 +24,7 @@
 
 pub mod boot;
 mod channel;
+pub mod control;
 pub mod entropy;
 mod error;
 mod exec;
