@@ -6,7 +6,7 @@
 //! `service-mgr` binds `/svc/auth` to reach it and it mints a session channel per caller that
 //! resolves there, which is what lets `session-mgr` and `desktop-session-mgr` each hold one. The
 //! credential logic is the host-tested `auth_service` library; this binary is the bare-target
-//! syscall plumbing: read `/system/users`, hand the supervisor a client endpoint via
+//! `libos` plumbing: read `/system/users`, hand the supervisor a client endpoint via
 //! `Meta::Ready`, then serve.
 //!
 //! **And the database's only writer.** A resolve of `/svc/auth/admin` opens an *admin* session,
@@ -24,38 +24,66 @@
 #![no_main]
 
 use auth_service::{Admin, serve_admin, serve_authenticate};
-use libkern::debug::Line;
-use libkern::*;
+use libkern::{CTRL_OP_SHUTDOWN, KError, MAX_WAIT_HANDLES, Rights, scrub};
+use libos::boot::Start;
+use libos::control::{self, Control};
+use libos::log::{self, Line};
+use libos::{
+    Carried, Channel, Deadline, File, Handle, MapRead, MapReadWrite, Msg, Namespace, NsReadOnly, Only, WaitSet,
+    block_on, entropy, fs, time,
+};
 use librsproto::auth::{
     OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE, OP_AUTH_SET_PASSWORD, build_denied_reply, parse_account_request,
 };
-use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, RENAME_REPLACE, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply,
-};
-use librsproto::{OP_AUTHENTICATE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, RS_MAX_BODY, decode, encode};
+use librsproto::namespace::{RENAME_REPLACE, parse_resolve_request};
+use librsproto::{OP_AUTHENTICATE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, RS_MAX_BODY, decode, server};
 
 /// One page; the map granularity for reading the user DB.
-const PAGE: u64 = 4096;
-/// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
-const PAYLOAD_OFF: usize = 24;
-const MSG_LEN: usize = 4096;
+const PAGE: usize = 4096;
 /// Largest user database we hold: one page, and `libusers`' bound, so no writer of the file can
 /// make one this server will not load.
 const DB_MAX: usize = libusers::MAX_FILE;
-const _: () = assert!(DB_MAX as u64 <= PAGE);
+const _: () = assert!(DB_MAX <= PAGE);
 /// The file, and the name a new copy is written under before it is renamed over it.
-const USERS: &[u8] = b"/system/users";
-const USERS_NEW: &[u8] = b"/system/users.new";
+const USERS: &str = "/system/users";
+const USERS_NEW: &str = "/system/users.new";
 
 /// How many clients may hold an auth session at once.
 ///
 /// Two slots go to the forwarding endpoint and the control channel; the rest are sessions. The
 /// limit is the wait set's, so it costs nothing to be generous.
-const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
-const _: () = assert!(2 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
+const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 2;
+const _: () = assert!(2 + MAX_SESSIONS <= MAX_WAIT_HANDLES);
 
-/// **This server's state**, in `_start`'s frame rather than in `static mut`s.
-struct Server {
+type Endpoint = Handle<Channel, Only>;
+
+/// A message scrubbed where it lies when it goes out of scope, on every way out: a password came
+/// through it, and a move of the message would leave a copy.
+struct Scrubbed(Msg);
+
+impl Drop for Scrubbed {
+    fn drop(&mut self) {
+        scrub(self.0.payload_mut());
+    }
+}
+
+/// What a wait's index names.
+#[derive(Copy, Clone)]
+enum Waited {
+    Resolve,
+    Control,
+    Session(usize),
+}
+
+/// One client's session channel, and whether it is an **admin** one, which answers only the
+/// administrative ops, or an oracle one.
+struct Session {
+    ch: Endpoint,
+    admin: bool,
+}
+
+/// The user database and what it is read and written through.
+struct Store {
     /// The user database, copied from `/system/users` at startup, and its length.
     db: [u8; DB_MAX],
     db_len: usize,
@@ -63,267 +91,223 @@ struct Server {
     new_db: [u8; DB_MAX],
     /// An admin reply's body — the account list is the long one.
     admin_reply: [u8; RS_MAX_BODY],
-    /// Open auth sessions, one per client that resolved `/svc/auth`, each with whether it is an
-    /// **admin** one, which answers only the administrative ops, or an oracle one.
-    sessions: [Option<(u64, bool)>; MAX_SESSIONS],
     /// The namespace the file is read and written through: the inherited root.
-    root_ns: u64,
-    /// The kernel's entropy source, where a new password's salt comes from. `0` if it would not
-    /// open, and then every request that needs a salt is refused.
-    entropy: u64,
+    root: Handle<Namespace, NsReadOnly>,
 }
 
-fn kprint(msg: &[u8]) {
-    // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
-    unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
+/// **This server's state**, in `_start`'s frame rather than in `static mut`s.
+struct Server {
+    store: Store,
+    /// The forwarding endpoint; `None` once its peer has gone, when it would stay signalled for good.
+    serve_end: Option<Endpoint>,
+    /// The control channel, for `service --stop`; `None` once its supervisor has gone, when it
+    /// would stay signalled for good.
+    control: Option<Endpoint>,
+    /// Open auth sessions, one per client that resolved `/svc/auth`.
+    sessions: [Option<Session>; MAX_SESSIONS],
 }
 
-fn exit(code: i64) -> ! {
-    // SAFETY: SYS_PROCESS_EXIT terminates this process.
-    unsafe { syscall1(SYS_PROCESS_EXIT, code as u64) };
-    loop {
-        core::hint::spin_loop();
+/// Add `h` to `set` as `what`.
+fn watch<'a>(set: &mut WaitSet<'a, MAX_WAIT_HANDLES>, names: &mut [Waited], h: &'a Endpoint, what: Waited) {
+    if let Ok(i) = set.add(h) {
+        names[i] = what;
     }
 }
 
-/// Resolve `path` in `ns` requesting `rights`; the resolved handle, or `0`. Closes the PO.
-fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
-    // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
-    if po < 0 {
-        return 0;
-    }
-    let (status, handle) = po_wait(po as u64);
-    if status != 0 { 0 } else { handle }
+/// How long a receive that left its message queued pauses, as a wait on the channel would fire
+/// again at once.
+const HELD_PAUSE_NS: u64 = 10_000_000;
+
+/// What a failed receive on `ch` means for it.
+enum Recv {
+    /// The peer has gone and the ring is empty, for good.
+    Closed,
+    /// Nothing queued.
+    Empty,
+    /// Anything else: `OutOfMemory` leaves the message queued for a live client, and has been
+    /// paused for already.
+    Held,
 }
 
-/// Read `/system/users` into the server's copy, recording its length. `false` on any
+/// Receive one message from `ch` into `msg`; on a failure, what it says about the channel.
+fn recv_on(ch: &Endpoint, msg: &mut Msg) -> Result<(), Recv> {
+    match ch.recv(msg) {
+        Ok(_carried) => Ok(()),
+        Err(e) if e.code() == KError::PeerClosed => Err(Recv::Closed),
+        Err(e) if e.code() == KError::WouldBlock => Err(Recv::Empty),
+        Err(_) => {
+            let _ = time::sleep(HELD_PAUSE_NS);
+            Err(Recv::Held)
+        }
+    }
+}
+
+/// Read `/system/users` into the store's copy, recording its length. `false` on any
 /// failure: a missing DB must never authenticate.
-fn load_db(srv: &mut Server, root_ns: u64) -> bool {
-    let fh = ns_lookup(root_ns, b"/system/users", RIGHT_MAP_READ | RIGHT_INSPECT);
-    if fh == 0 {
+fn load_db(store: &mut Store) -> bool {
+    let Ok(file) = block_on(store.root.lookup::<File, MapRead>(USERS, Rights::MAP_READ | Rights::INSPECT)) else {
+        return false;
+    };
+    let size = match file.stat() {
+        Ok(info) if info.size != 0 && info.size as usize <= DB_MAX => info.size as usize,
+        _ => return false,
+    };
+    let Ok(mapping) = file.map(PAGE) else {
+        return false;
+    };
+    // `size` <= DB_MAX <= PAGE, so the copy lies in the mapping.
+    if mapping.read_into(0, &mut store.db[..size]).is_err() {
         return false;
     }
-    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
-    // SAFETY: `&mut info` is a valid 24-byte HandleInfo out-param.
-    let sr = unsafe { syscall2(SYS_HANDLE_STAT, fh, (&mut info as *mut HandleInfo) as u64) };
-    if sr < 0 || info.size == 0 || info.size as usize > DB_MAX {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
-        return false;
-    }
-    let size = info.size as usize;
-    // SAFETY: `fh` is a mappable file handle with MAP_READ.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ) };
-    if addr < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
-        return false;
-    }
-    // SAFETY: `addr..addr+size` maps `size` valid bytes of the DB (size ≤ DB_MAX ≤ PAGE);
-    // copy them into our owned buffer, then unmap + close.
-    unsafe {
-        srv.db[..size].copy_from_slice(core::slice::from_raw_parts(addr as u64 as *const u8, size));
-        syscall2(SYS_MEMORY_UNMAP, addr as u64, PAGE);
-        syscall1(SYS_HANDLE_CLOSE, fh);
-    }
-    srv.db_len = size;
+    store.db_len = size;
     true
 }
 
-/// Create a connected channel pair (depth 4), `(client_end, serve_end)`. `None` on failure.
-fn make_channel() -> Option<(u64, u64)> {
-    let (mut client, mut serve) = (0u64, 0u64);
-    // SAFETY: two writable out-params on this frame.
-    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut client) as u64, (&raw mut serve) as u64, 4, 0) };
-    (cr == 0).then_some((client, serve))
-}
-
-/// Send one rsproto message on `ch`, moving `handle` with it unless it is `0`. `false` on failure.
-fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handle: u64) -> bool {
-    let mut msg = [0u8; MSG_LEN];
-    let count = u16::from(handle != 0);
-    let Some(rs_len) = encode(&mut msg[PAYLOAD_OFF..], op, request_id, flags, body, count) else {
-        return false;
-    };
-    msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-    msg[8] = count as u8;
-    let handles = [handle];
-    // SAFETY: a whole message, and `count` handles, both on this frame.
-    let sr = unsafe {
-        syscall5(SYS_CHANNEL_SEND, ch, msg.as_ptr() as u64, handles.as_ptr() as u64, count as u64, SENDMODE_NOBLOCK)
-    };
-    sr == 0
-}
-
-/// The rsproto payload of the message in `msg`, as long as its header says, within the message.
-fn payload(msg: &[u8]) -> &[u8] {
-    let len = u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]) as usize;
-    &msg[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)]
-}
-
-/// Send `Meta::Ready` on the control channel, transferring `client_end`. `false` on any failure.
-fn send_ready(control: u64, client_end: u64) -> bool {
-    let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
-    let body_len = match librsproto::meta::ready(&mut body, b"auth-service") {
-        Some(n) => n,
-        None => return false,
-    };
-    // NoBlock: the control inbox starts empty.
-    send(control, librsproto::OP_READY, 0, 0, &body[..body_len], client_end)
-}
-
-/// Send a reply body for `op` on `serve_end`, echoing `request_id`; no handles are transferred.
-fn send_reply(serve_end: u64, op: u16, request_id: u64, body: &[u8], error: bool) {
+fn send_reply(ch: &Endpoint, op: u16, request_id: u64, body: &[u8], error: bool) {
     let flags = if error { RS_FLAG_REPLY | RS_FLAG_ERROR } else { RS_FLAG_REPLY };
-    send(serve_end, op, request_id, flags, body, 0);
+    let _ = server::send(ch, op, request_id, flags, body, &mut Carried::new());
 }
 
-/// The serve loop. Never returns.
-///
-/// **It exits on `CTRL_OP_SHUTDOWN`**, which a shutdown sends every service (`service --stop`
-/// never does: `auth-service` is `essential`). Nothing needs saving: every write to the users
-/// file is made whole — a new file, synced, then renamed over — before its answer is sent.
-fn serve_loop(srv: &mut Server, mut serve_end: u64, mut control: u64) -> ! {
-    kprint(b"auth-service: serving Auth::Authenticate over /svc/auth, and administration at /svc/auth/admin\n");
-    loop {
-        let mut handles = [0u64; libkern::abi::MAX_WAIT_HANDLES];
-        let sessions = srv.sessions.iter().flatten().map(|&(ch, _)| ch);
-        let mut n = 0;
-        for h in [serve_end, control].into_iter().filter(|&h| h != 0).chain(sessions) {
-            handles[n] = h;
-            n += 1;
-        }
-        let mut results = [IoResult { handle: 0, status: 0, reserved: 0, result: 0 }; libkern::abi::MAX_WAIT_HANDLES];
-        // SAFETY: `n` handles, and room for a result each, all on this frame; `n` is at most
-        // `2 + MAX_SESSIONS`, the wait's limit by construction (asserted above).
-        let waited =
-            unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, u64::MAX) };
-        if waited < 1 {
-            continue;
-        }
-        for r in &results[..waited as usize] {
-            let h = r.handle;
-            if h == serve_end {
-                if !serve_resolve(srv, serve_end) {
-                    // SAFETY: closing our own endpoint, which leaves the wait set here.
-                    unsafe { syscall1(SYS_HANDLE_CLOSE, serve_end) };
-                    serve_end = 0;
+impl Server {
+    /// The serve loop. Never returns.
+    ///
+    /// **It exits on `CTRL_OP_SHUTDOWN`**, which a shutdown sends every service (`service --stop`
+    /// never does: `auth-service` is `essential`). Nothing needs saving: every write to the users
+    /// file is made whole — a new file, synced, then renamed over — before its answer is sent.
+    fn serve_loop(&mut self) -> ! {
+        log::write(b"auth-service: serving Auth::Authenticate over /svc/auth, and administration at /svc/auth/admin\n");
+        loop {
+            let mut names = [Waited::Resolve; MAX_WAIT_HANDLES];
+            let signalled = {
+                let mut set = WaitSet::new();
+                if let Some(e) = &self.serve_end {
+                    watch(&mut set, &mut names, e, Waited::Resolve);
                 }
-            } else if h == control {
-                if let libkern::control::Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
-                    kprint(b"auth-service: asked to stop, exiting\n");
-                    exit(0);
+                if let Some(c) = &self.control {
+                    watch(&mut set, &mut names, c, Waited::Control);
                 }
-            } else {
-                serve_session(srv, h);
+                for (slot, s) in self.sessions.iter().enumerate() {
+                    if let Some(s) = s {
+                        watch(&mut set, &mut names, &s.ch, Waited::Session(slot));
+                    }
+                }
+                set.wait(Deadline::NEVER)
+            };
+            let Ok(signalled) = signalled else { continue };
+            for (i, _) in signalled.iter() {
+                match names[i] {
+                    Waited::Resolve => self.serve_resolve(),
+                    Waited::Control => {
+                        if control::recv(&mut self.control) == Control::Op(CTRL_OP_SHUTDOWN) {
+                            log::write(b"auth-service: asked to stop, exiting\n");
+                            libos::exit(0);
+                        }
+                    }
+                    Waited::Session(slot) => self.serve_session(slot),
+                }
             }
         }
     }
-}
 
-/// Answer a resolve of `/svc/auth` by minting a session channel for the caller, so one oracle
-/// serves several supervisors (`docs/architecture/session-and-auth.md`). `false` once its peer has
-/// gone, when the endpoint is signalled for good and must leave the wait set.
-fn serve_resolve(srv: &mut Server, serve_end: u64) -> bool {
-    let mut msg = [0u8; MSG_LEN];
-    if let Err(status) = channel_recv(serve_end, &mut msg) {
-        return match RecvFailure::of(status) {
-            RecvFailure::Closed => false,
-            RecvFailure::Empty => true,
-            RecvFailure::Held => {
-                pause_held();
-                true
+    /// Answer a resolve of `/svc/auth` by minting a session channel for the caller, so one oracle
+    /// serves several supervisors (`docs/architecture/session-and-auth.md`). Once its peer has
+    /// gone the endpoint is signalled for good and leaves the wait set.
+    fn serve_resolve(&mut self) {
+        let Some(serve_end) = &self.serve_end else { return };
+        let mut msg = Msg::new();
+        if let Err(failure) = recv_on(serve_end, &mut msg) {
+            if matches!(failure, Recv::Closed) {
+                self.serve_end = None;
+            }
+            return;
+        }
+        let (op, request_id, ok) = {
+            match decode(msg.payload()) {
+                // **Two suffixes, nothing else**: empty is the oracle, `admin` the administrative one.
+                Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
+                    Some(r) if r.suffix.is_empty() => (m.op, m.request_id, Some(false)),
+                    Some(r) if r.suffix == b"admin" => (m.op, m.request_id, Some(true)),
+                    _ => (m.op, m.request_id, None),
+                },
+                Ok(m) => (m.op, m.request_id, None),
+                Err(_) => (0, 0, None),
             }
         };
+        let Some(admin) = ok else {
+            server::reply_error(serve_end, op, request_id, KError::NotFound, b"");
+            return;
+        };
+        open_auth_session(&mut self.sessions, serve_end, request_id, admin);
     }
-    let (op, request_id, ok) = {
-        match decode(payload(&msg)) {
-            // **Two suffixes, nothing else**: empty is the oracle, `admin` the administrative one.
-            Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
-                Some(r) if r.suffix.is_empty() => (m.op, m.request_id, Some(false)),
-                Some(r) if r.suffix == b"admin" => (m.op, m.request_id, Some(true)),
-                _ => (m.op, m.request_id, None),
-            },
-            Ok(m) => (m.op, m.request_id, None),
-            Err(_) => (0, 0, None),
+
+    fn serve_session(&mut self, slot: usize) {
+        let Some(Session { ch, admin }) = &self.sessions[slot] else { return };
+        // **Scrubbed on every return**: an `Authenticate`, `Add` or `SetPassword` carries a password.
+        let mut msg = Scrubbed(Msg::new());
+        if let Err(failure) = recv_on(ch, &mut msg.0) {
+            // **A closed peer frees the slot.** Without this a supervisor that exited would hold
+            // one forever, and the set of clients would shrink by one per logout. **Nothing else
+            // does**: `OutOfMemory` leaves the message queued for a live client.
+            if matches!(failure, Recv::Closed) {
+                self.sessions[slot] = None;
+            }
+            return;
         }
-    };
-    let Some(admin) = ok else {
-        reply_resolve_error(serve_end, request_id, op, KError::NotFound.as_i32());
-        return true;
-    };
-    open_auth_session(srv, serve_end, request_id, admin);
-    true
+        if *admin {
+            return serve_admin_request(&mut self.store, ch, msg.0.payload());
+        }
+
+        let mut reply_body = [0u8; 512];
+        let store = &self.store;
+        let db = &store.db[..store.db_len];
+        let (op, request_id, reply_len, error) = match decode(msg.0.payload()) {
+            Ok(m) if m.op == OP_AUTHENTICATE => match serve_authenticate(m.body, db, &mut reply_body) {
+                Some(n) => (m.op, m.request_id, n, false),
+                None => {
+                    let n = build_denied_reply(&mut reply_body).unwrap_or(0);
+                    (m.op, m.request_id, n, true)
+                }
+            },
+            // A non-Auth op on this channel: deny + error (wrong protocol).
+            Ok(m) => {
+                let n = build_denied_reply(&mut reply_body).unwrap_or(0);
+                (m.op, m.request_id, n, true)
+            }
+            Err(_) => (0, 0, 0, true),
+        };
+        if reply_len > 0 {
+            send_reply(ch, op, request_id, &reply_body[..reply_len], error);
+        }
+    }
 }
 
 /// Mint an oracle or `admin` session channel and hand its client end back in the resolve reply.
-fn open_auth_session(srv: &mut Server, serve_end: u64, request_id: u64, admin: bool) {
-    let Some(slot) = srv.sessions.iter().position(Option::is_none) else {
+fn open_auth_session(
+    sessions: &mut [Option<Session>; MAX_SESSIONS],
+    serve_end: &Endpoint,
+    request_id: u64,
+    admin: bool,
+) {
+    let Some(slot) = sessions.iter().position(Option::is_none) else {
         // Every slot in use — ask the caller to retry rather than denying a login outright.
-        reply_resolve_error(serve_end, request_id, OP_NS_RESOLVE, KError::WouldBlock.as_i32());
+        server::reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::WouldBlock, b"");
         return;
     };
-    let Some((client_end, session_end)) = make_channel() else {
-        reply_resolve_error(serve_end, request_id, OP_NS_RESOLVE, KError::KernelError.as_i32());
+    let Ok((client_end, session_end)) = Handle::pair(4) else {
+        server::reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::KernelError, b"");
         return;
     };
     // Bind the slot *before* replying, so a fast client's first request cannot arrive before
     // the slot is live.
-    srv.sessions[slot] = Some((session_end, admin));
-    if !reply_session_handle(serve_end, request_id, client_end) {
-        srv.sessions[slot] = None;
-        // SAFETY: the transfer failed; reclaim both ends.
-        unsafe {
-            syscall1(SYS_HANDLE_CLOSE, session_end);
-            syscall1(SYS_HANDLE_CLOSE, client_end);
-        }
-    }
-}
-
-fn serve_session(srv: &mut Server, ch: u64) {
-    // **Zeroed on every return**: an `Authenticate`, `Add` or `SetPassword` carries a password.
-    let mut msg = Secret::<MSG_LEN>::zeroed();
-    if let Err(status) = channel_recv(ch, msg.array_mut()) {
-        return match RecvFailure::of(status) {
-            // **A closed peer frees the slot.** Without this a supervisor that exited would hold
-            // one forever, and the set of clients would shrink by one per logout.
-            RecvFailure::Closed => free_session(srv, ch),
-            RecvFailure::Empty => {}
-            // **Nothing else does**: `OutOfMemory` leaves the message queued for a live client.
-            RecvFailure::Held => pause_held(),
-        };
-    }
-    let serve_end = ch;
-    if srv.sessions.iter().flatten().any(|&(c, admin)| c == ch && admin) {
-        return serve_admin_request(srv, ch, payload(&msg));
-    }
-
-    let mut reply_body = [0u8; 512];
-    let db = &srv.db[..srv.db_len];
-    let (op, request_id, reply_len, error) = match decode(payload(&msg)) {
-        Ok(m) if m.op == OP_AUTHENTICATE => match serve_authenticate(m.body, db, &mut reply_body) {
-            Some(n) => (m.op, m.request_id, n, false),
-            None => {
-                let n = build_denied_reply(&mut reply_body).unwrap_or(0);
-                (m.op, m.request_id, n, true)
-            }
-        },
-        // A non-Auth op on this channel: deny + error (wrong protocol).
-        Ok(m) => {
-            let n = build_denied_reply(&mut reply_body).unwrap_or(0);
-            (m.op, m.request_id, n, true)
-        }
-        Err(_) => (0, 0, 0, true),
-    };
-    if reply_len > 0 {
-        send_reply(serve_end, op, request_id, &reply_body[..reply_len], error);
+    sessions[slot] = Some(Session { ch: session_end, admin });
+    if !server::reply_channel(serve_end, request_id, client_end) {
+        sessions[slot] = None;
     }
 }
 
 /// **Serve one administrator's request** on an admin session. A write is installed before it is
 /// answered, and the copy in memory changes only once the install holds.
-fn serve_admin_request(srv: &mut Server, ch: u64, req: &[u8]) {
+fn serve_admin_request(store: &mut Store, ch: &Endpoint, req: &[u8]) {
     let Ok(m) = decode(req) else {
         return;
     };
@@ -335,19 +319,20 @@ fn serve_admin_request(srv: &mut Server, ch: u64, req: &[u8]) {
         _ => &[],
     };
     let needs_salt = matches!(m.op, OP_AUTH_ADD | OP_AUTH_SET_PASSWORD);
-    let salt = if needs_salt { fresh_salt(srv.entropy) } else { Some([0u8; libusers::SALT_LEN]) };
+    let salt = if needs_salt { fresh_salt() } else { Some([0u8; libusers::SALT_LEN]) };
     let Some(salt) = salt else {
         return refuse_admin(ch, m.op, m.request_id, name, KError::IoError, b"no entropy for a salt");
     };
-    let outcome = serve_admin(m.op, m.body, &srv.db[..srv.db_len], &salt, &mut srv.new_db, &mut srv.admin_reply);
+    let outcome =
+        serve_admin(m.op, m.body, &store.db[..store.db_len], &salt, &mut store.new_db, &mut store.admin_reply);
     match outcome {
-        Admin::Reply(n) => send_reply(ch, m.op, m.request_id, &srv.admin_reply[..n], false),
+        Admin::Reply(n) => send_reply(ch, m.op, m.request_id, &store.admin_reply[..n], false),
         Admin::Write(n) => {
-            if let Err(why) = install(srv.root_ns, &srv.new_db[..n]) {
+            if let Err(why) = install(&store.root, &store.new_db[..n]) {
                 return refuse_admin(ch, m.op, m.request_id, name, KError::IoError, why);
             }
-            srv.db[..n].copy_from_slice(&srv.new_db[..n]);
-            srv.db_len = n;
+            store.db[..n].copy_from_slice(&store.new_db[..n]);
+            store.db_len = n;
             let did: &[u8] = match m.op {
                 OP_AUTH_ADD => b"added ",
                 OP_AUTH_REMOVE => b"removed ",
@@ -361,7 +346,7 @@ fn serve_admin_request(srv: &mut Server, ch: u64, req: &[u8]) {
 }
 
 /// Refuse an administrator's request with `err` and `why`, and say so in the log.
-fn refuse_admin(ch: u64, op: u16, request_id: u64, name: &[u8], err: KError, why: &[u8]) {
+fn refuse_admin(ch: &Endpoint, op: u16, request_id: u64, name: &[u8], err: KError, why: &[u8]) {
     let asked: &[u8] = match op {
         OP_AUTH_LIST => b"List",
         OP_AUTH_ADD => b"Add",
@@ -375,178 +360,90 @@ fn refuse_admin(ch: u64, op: u16, request_id: u64, name: &[u8], err: KError, why
         l.s(b" for ").untrusted(name);
     }
     l.s(b": ").s(why).end();
-    let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 128];
-    let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, &why[..why.len().min(128)]).unwrap_or(0);
-    send_reply(ch, op, request_id, &body[..n], true);
+    server::reply_error(ch, op, request_id, err, why);
 }
 
-/// A new password's salt, from the kernel's entropy source; `None` if it is not open or fails.
-fn fresh_salt(ent: u64) -> Option<[u8; libusers::SALT_LEN]> {
-    if ent == 0 {
-        return None;
-    }
+/// A new password's salt, from the kernel's generator; `None` if it cannot be made or fails.
+fn fresh_salt() -> Option<[u8; libusers::SALT_LEN]> {
     let mut salt = [0u8; libusers::SALT_LEN];
-    loop {
-        // SAFETY: a valid out-buffer of SALT_LEN bytes, and an entropy handle with READ.
-        let r = unsafe { syscall3(SYS_ENTROPY_READ, ent, salt.as_mut_ptr() as u64, salt.len() as u64) };
-        if r == 0 {
-            return Some(salt);
-        }
-        if r < 0 {
-            return None;
-        }
-        // Not yet seeded: the answer is a PendingOperation to wait on, then read again.
-        let (status, _) = po_wait(r as u64);
-        if status != 0 {
-            return None;
-        }
-    }
-}
-
-fn po_wait(po: u64) -> (i32, u64) {
-    let handles = [po];
-    let mut r = [0u8; 24];
-    // SAFETY: a valid one-entry handle array and result buffer on this frame.
-    let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
-    // SAFETY: closing the PO this process owns; any resolved handle is separate.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
-    if waited != 1 {
-        return (KError::KernelError.as_i32(), 0);
-    }
-    let status = i32::from_le_bytes([r[8], r[9], r[10], r[11]]);
-    let result = u64::from_le_bytes([r[16], r[17], r[18], r[19], r[20], r[21], r[22], r[23]]);
-    (status, result)
+    entropy::fill(&mut salt).ok().map(|()| salt)
 }
 
 /// **Replace `/system/users` with `bytes`, atomically.** A leftover `users.new`, from a write that
 /// died, is cut to nothing; the new copy is created at its size, written through a mapping,
 /// unmapped, synced, and then renamed over the file. A crash before the rename leaves the old file
 /// as it was, and the rename is the filesystem's one operation. `Err` names the step that failed.
-fn install(ns: u64, bytes: &[u8]) -> Result<(), &'static [u8]> {
-    let path = |p: &[u8]| (p.as_ptr() as u64, p.len() as u64);
-    let (np, nl) = path(USERS_NEW);
+fn install(ns: &Handle<Namespace, NsReadOnly>, bytes: &[u8]) -> Result<(), &'static [u8]> {
+    let rights = Rights::MAP_READ | Rights::MAP_WRITE;
     // A leftover, cut to nothing. Absent is the usual case, and not an error.
-    // SAFETY: a valid path and namespace handle.
-    let po = unsafe { syscall5(SYS_FILE_TRUNCATE, ns, np, nl, RIGHT_MAP_READ | RIGHT_MAP_WRITE, 0) };
-    if po > 0 {
-        let (_, h) = po_wait(po as u64);
-        if h != 0 {
-            // SAFETY: closing the handle the truncate's resolve installed.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-        }
-    }
-    // SAFETY: a valid path and namespace handle.
-    let po = unsafe { syscall5(SYS_FILE_CREATE, ns, np, nl, RIGHT_MAP_READ | RIGHT_MAP_WRITE, bytes.len() as u64) };
-    if po < 0 {
+    let _: libos::Result<Handle<File, MapReadWrite>> = block_on(fs::truncate(ns, USERS_NEW, 0, rights));
+    let made: libos::Result<Handle<File, MapReadWrite>> =
+        block_on(fs::create(ns, USERS_NEW, bytes.len() as u64, rights));
+    let Ok(file) = made else {
         return Err(b"users.new could not be created");
-    }
-    let (status, file) = po_wait(po as u64);
-    if status != 0 || file == 0 {
-        return Err(b"users.new could not be created");
-    }
+    };
     if !bytes.is_empty() {
-        // SAFETY: a file handle this call created with MAP_READ | MAP_WRITE; the file is at most a
-        // page (DB_MAX <= PAGE).
-        let addr = unsafe { syscall4(SYS_MEMORY_MAP, file, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-        if addr < 0 {
-            // SAFETY: closing this call's own handle.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, file) };
+        let Ok(mut mapping) = file.map(PAGE) else {
+            return Err(b"users.new could not be mapped");
+        };
+        // The file is at most a page (DB_MAX <= PAGE). Unmapped before the sync, as `libfs` does: a
+        // write-back that begins with a writable mapping cannot call the file clean.
+        if mapping.write_from(0, bytes).is_err() {
             return Err(b"users.new could not be mapped");
         }
-        // SAFETY: `bytes.len()` bytes are mapped writable at `addr`, and `bytes` is the server's
-        // own buffer, which this mapping cannot alias. Unmapped before the sync, as `libfs` does: a
-        // write-back that begins with a writable mapping cannot call the file clean.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
-            syscall2(SYS_MEMORY_UNMAP, addr as u64, PAGE);
-        }
     }
-    // SAFETY: a file handle this call holds.
-    let synced = unsafe { syscall1(SYS_FILE_SYNC, file) };
-    // SAFETY: closing this call's own handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, file) };
-    if synced != 0 {
+    let synced = block_on(fs::flush(&file));
+    drop(file);
+    if synced.is_err() {
         return Err(b"users.new could not be written back");
     }
-    let (up, ul) = path(USERS);
-    // SAFETY: two valid paths and a namespace handle.
-    let po = unsafe { syscall6(SYS_FILE_RENAME, ns, np, nl, up, ul, RENAME_REPLACE as u64) };
-    if po < 0 {
-        return Err(b"users.new could not be renamed over users");
-    }
-    let (status, _) = po_wait(po as u64);
-    if status != 0 {
-        return Err(b"users.new could not be renamed over users");
-    }
-    Ok(())
-}
-
-fn free_session(srv: &mut Server, ch: u64) {
-    for s in srv.sessions.iter_mut().filter(|s| matches!(s, Some((c, _)) if *c == ch)) {
-        *s = None;
-    }
-    // SAFETY: closing a handle this process owns.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
-}
-
-/// Reply to a resolve with the minted session channel in `handles[0]`: an auth handle *is* a live
-/// channel to this server, as a directory handle is to `profile-server`.
-fn reply_session_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
-    let mut body = [0u8; RESOLVE_REPLY_LEN];
-    let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
-    send(serve_end, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, client_end)
-}
-
-/// Reply to a resolve with an error: **the whole twelve-byte `ErrorBody`**, as every server sends
-/// one. The kernel reads a shorter body on a forwarded resolve as malformed, so a caller refused
-/// `NotFound` or `WouldBlock` would be handed `KernelError` instead.
-fn reply_resolve_error(serve_end: u64, request_id: u64, op: u16, code: i32) {
-    let mut body = [0u8; librsproto::error::ERROR_BODY_LEN];
-    let _ = librsproto::error::error_body(&mut body, code, 0, b"");
-    send(serve_end, op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body, 0);
+    block_on(fs::rename(ns, USERS_NEW, USERS, RENAME_REPLACE))
+        .map_err(|_| &b"users.new could not be renamed over users"[..])
 }
 
 /// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited
 /// root namespace (resolves `/system/users`), `rdx` = the control-channel endpoint the
 /// supervisor installed, `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
-    kprint(b"auth-service: up\n");
-    // SAFETY: a register-only syscall: a handle or a negative error.
-    let ent = unsafe { syscall0(SYS_ENTROPY_CREATE) };
-    let mut srv = Server {
-        db: [0; DB_MAX],
-        db_len: 0,
-        new_db: [0; DB_MAX],
-        admin_reply: [0; RS_MAX_BODY],
-        sessions: [None; MAX_SESSIONS],
-        root_ns,
-        entropy: if ent > 0 { ent as u64 } else { 0 },
+pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, control, arg0) };
+    log::write(b"auth-service: up\n");
+    let control: Option<Endpoint> = start.take_handle0();
+    // A missing root loads nothing, as a root that resolves nothing does.
+    let Some(root) = start.root.take() else {
+        log::write(b"auth-service: /system/users load FAIL\n");
+        libos::exit(1);
     };
-    if !load_db(&mut srv, root_ns) {
+    let mut srv = Server {
+        store: Store { db: [0; DB_MAX], db_len: 0, new_db: [0; DB_MAX], admin_reply: [0; RS_MAX_BODY], root },
+        serve_end: None,
+        control,
+        sessions: [const { None }; MAX_SESSIONS],
+    };
+    if !load_db(&mut srv.store) {
         // No DB → the server would deny everything; that is a misconfiguration, so
         // fail loudly rather than run a useless authenticator.
-        kprint(b"auth-service: /system/users load FAIL\n");
-        exit(1);
+        log::write(b"auth-service: /system/users load FAIL\n");
+        libos::exit(1);
     }
-    kprint(b"auth-service: user database loaded\n");
+    log::write(b"auth-service: user database loaded\n");
 
-    let (client_end, serve_end) = match make_channel() {
-        Some(pair) => pair,
-        None => {
-            kprint(b"auth-service: channel create FAIL\n");
-            exit(1);
-        }
+    let Ok((client_end, serve_end)) = Handle::pair(4) else {
+        log::write(b"auth-service: channel create FAIL\n");
+        libos::exit(1);
     };
-    if !send_ready(control, client_end) {
-        kprint(b"auth-service: Ready send FAIL\n");
-        exit(1);
+    // NoBlock: the control inbox starts empty.
+    if !srv.control.as_ref().is_some_and(|c| server::ready(c, b"auth-service", client_end)) {
+        log::write(b"auth-service: Ready send FAIL\n");
+        libos::exit(1);
     }
-    serve_loop(&mut srv, serve_end, control);
+    srv.serve_end = Some(serve_end);
+    srv.serve_loop();
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"auth-service: PANIC\n");
-    exit(1);
+    log::write(b"auth-service: PANIC\n");
+    libos::exit(1);
 }

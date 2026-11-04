@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Every call to the kernel goes through libos; libkern is the ABI's types and constants.
 libkern = { path = "../libkern" }
 libcrypto = { path = "../libcrypto" }
-librsproto = { path = "../librsproto" }
+libos = { path = "../libos" }
+librsproto = { path = "../librsproto", features = ["io"] }
 # The user database's format, and the edits an administrator's request makes to it (administration
 # Part D.1). `core` only, so this server stays free of `alloc`.
 libusers = { path = "../libusers" }
