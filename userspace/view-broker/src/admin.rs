@@ -116,6 +116,7 @@ impl Broker {
         &self.endpoints[i].0
     }
 
+    /// Answer a request on endpoint `i`'s policy session, `who`'s: the policy shown, or one installed.
     pub(crate) fn serve_policy(&mut self, i: usize, op: u16, request_id: u64, body: &[u8], who: &str) {
         match op {
             OP_VIEWS_SHOW => match libfs::read(&self.root_ns, POLICY_PATH) {

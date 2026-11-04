@@ -37638,7 +37638,13 @@ Decided in the part, for the maintainer's eye:
   but found no room in the set is read every wake. **The control is the count**: the one
   event a session brings it, a route's resolve, costs 6 calls where it cost 28, one wait and two
   receives, the message and the empty ring that ends the drain, where it read every service's
-  channel, 23 receives.
+  channel, 23 receives. **A code no death found makes a pass look at every channel**
+  (`wake::deaths`): the grace wait for one death's code can drain another's, whose channel the
+  pass never read, and nothing else would wake a later one to look. A channel that can bring a
+  message but has no place in the set brings a wake each tick while it has none.
+- **A server whose forwarding endpoint has lost its peer ends**, as the storage service already
+  did: the clipboard and tty servers, the logging service and the profile server spun on it, a
+  closed peer being signalled for good, where service-mgr had dropped a late `Ready`'s endpoint.
 - **libos grew what the servers needed, and nothing they did not**: a control channel's read
   (`libos::control`); the machine's stop and a test verdict (`libos::system`, the stop
   `TODO(surface-shape)` until E.10 makes it a `Write`); an operation waiting beside handles
@@ -37650,7 +37656,9 @@ Decided in the part, for the maintainer's eye:
   waited for neither. The input server's lights write now stays outstanding in its wait set, a
   newer state written once the keyboard answers, rather than the server waiting on the keyboard;
   the tty server's token comes from `try_fill`, so an unseeded pool still costs a password prompt
-  and not every console. Both drivers read the lights byte at submit and complete a waiting write
+  and not every console. Each `try_fill` refused holds one of the kernel's four places for a reader
+  waiting on the seeding until it seeds, so `fill`, finding them taken, pauses and reads again
+  where it gave up. Both drivers read the lights byte at submit and complete a waiting write
   when the device goes, so neither keeps anything waiting.
 - **Every reply that fails is answered**, as `librsproto::server` answers it. The device manager,
   the logging service, the input server, `auth-service` and the view broker closed both ends of a

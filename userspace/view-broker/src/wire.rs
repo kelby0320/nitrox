@@ -17,6 +17,7 @@ pub type Root = Handle<Namespace, NsReadOnly>;
 pub struct Scrubbed(Msg);
 
 impl Scrubbed {
+    /// An empty message.
     pub fn new() -> Self {
         Scrubbed(Msg::new())
     }
@@ -72,6 +73,7 @@ pub fn reply_error(ch: &Ch, op: u16, request_id: u64, err: KError) {
     let _ = server::reply_error(ch, op, request_id, err, b"");
 }
 
+/// Answer request `op` with `outcome` and `reason`, the reason cut to a note when it will not fit.
 pub fn reply_outcome(ch: &Ch, op: u16, request_id: u64, outcome: Outcome, reason: &str) {
     let mut body = [0u8; 512];
     let n = build_outcome(&mut body, outcome, reason.as_bytes())

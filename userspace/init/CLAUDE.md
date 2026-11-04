@@ -45,7 +45,7 @@ Code that runs before init has handed off to the service manager is critical-pat
 - **No `unwrap()` outside of provably-impossible cases.** And those cases need a `// unwrap: <reason>` comment.
 - **Bounded memory.** Init shouldn't allocate unboundedly. The initramfs is read once; mount processing is bounded by the number of `[[mount]]` entries.
 - **Bounded time.** Each mount has a timeout (default 30 seconds). Init must not wait forever for an fs-server to send Ready.
-- **Logging via the kernel log handle.** Init has a kernel log channel. Use it. Errors that happen before logging is set up go to the serial console directly via `sys_kprint` (a debug syscall available to processes with appropriate caps).
+- **Logging through `libos::log`.** Init writes its lines to the serial console with `libos::log::write` and `Line`, which make the `sys_kprint` debug call for it; it starts before the logging service, so it has no log channel to use.
 
 ## Failure → eshell
 
@@ -53,7 +53,8 @@ Any critical-path failure (mount fails, bootstrap manifest is malformed, can't f
 
 1. Log the failure clearly
 2. Look up `/initramfs/sbin/eshell`
-3. Spawn eshell with: serial console handle, initramfs handle (LOOKUP+READ+WRITE), `/dev/disk/*` (RO), kernel log handle (RO)
+3. Spawn eshell with no grant: it shares init's root, `LOOKUP` only, and finds `/dev/console` and
+   `/dev/blk/*` there
 4. Wait for eshell to exit (typically a reboot)
 
 Don't try to "soldier on" past a critical-path failure. If `init.toml` says mount this and it can't be mounted, the system is misconfigured; eshell exists exactly for this case.
