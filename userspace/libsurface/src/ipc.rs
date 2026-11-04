@@ -140,6 +140,14 @@ impl crate::Session<ChannelTransport> {
     }
 }
 
+impl crate::Session<alloc::boxed::Box<ChannelTransport>> {
+    /// The same, for a transport on the heap, as its message buffers are too big to move about a
+    /// small stack.
+    pub fn waitable(&self) -> Ref<'_, Channel, Only> {
+        self.transport.endpoint()
+    }
+}
+
 impl ChannelTransport {
     /// Read the next event, waiting up to `timeout_ns` from now; `Ok(None)` is a timeout.
     ///
@@ -602,6 +610,9 @@ mod tests {
         let session = crate::Session::new(t);
         assert_eq!(session.waitable().raw().0, session.wait_handle());
         assert_ne!(session.wait_handle(), 0);
+        let (t, _peer) = connected();
+        let boxed = crate::Session::new(alloc::boxed::Box::new(t));
+        assert_eq!(boxed.waitable().raw().0, boxed.wait_handle(), "boxed, the same channel");
     }
 
     #[test]
