@@ -8,7 +8,6 @@
 "userspace/coreutils" = 153
 "userspace/desktop-shell" = 73
 "userspace/eshell" = 44
-"userspace/hello" = 58
 "userspace/libheap" = 5
 "userspace/nxsh" = 35
 "userspace/nxterm" = 82
