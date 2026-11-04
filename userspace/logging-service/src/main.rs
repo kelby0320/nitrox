@@ -501,7 +501,17 @@ fn serve_loop(serve_end: Endpoint, mut control: Option<Endpoint>, log: &mut Log)
             }
         }
         if signalled.iter().any(|(i, _)| matches!(names[i], Waited::Serve)) {
-            while let Ok(_sent) = serve_end.recv(&mut msg) {
+            loop {
+                let _sent = match serve_end.recv(&mut msg) {
+                    Ok(sent) => sent,
+                    // A forwarding endpoint with no peer is the end of this server, not a message to skip: the
+                    // kernel keeps a peer-closed channel signalled, so going round again would spin a CPU.
+                    Err(e) if e.code() == KError::PeerClosed => {
+                        log::write(b"logging-service: forwarding endpoint closed\n");
+                        libos::exit(1);
+                    }
+                    Err(_) => break,
+                };
                 process_resolve(&msg, &serve_end, &mut tables);
             }
         }

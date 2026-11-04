@@ -297,8 +297,15 @@ impl Server {
     /// Answer one forwarded `Namespace::Resolve` on the serve endpoint.
     fn serve_resolve(&mut self) {
         let mut msg = Msg::new();
-        let Ok(_sent) = self.serve_end.recv(&mut msg) else {
-            return;
+        let _sent = match self.serve_end.recv(&mut msg) {
+            Ok(sent) => sent,
+            // A forwarding endpoint with no peer is the end of this server, not a message to skip: the
+            // kernel keeps a peer-closed channel signalled, so going round again would spin a CPU.
+            Err(e) if e.code() == KError::PeerClosed => {
+                log::write(b"profile-server: forwarding endpoint closed\n");
+                libos::exit(1);
+            }
+            Err(_) => return,
         };
         let (op, request_id, resolved) = match decode(msg.payload()) {
             Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {

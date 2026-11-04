@@ -80,8 +80,15 @@ fn refuse(ch: &Endpoint, op: u16, request_id: u64, kerror: KError, server_code: 
 impl Server {
     fn serve_resolve(&mut self) {
         let mut msg = Msg::new();
-        let Ok(_sent) = self.serve_end.recv(&mut msg) else {
-            return;
+        let _sent = match self.serve_end.recv(&mut msg) {
+            Ok(sent) => sent,
+            // A forwarding endpoint with no peer is the end of this server, not a message to skip: the
+            // kernel keeps a peer-closed channel signalled, so going round again would spin a CPU.
+            Err(e) if e.code() == KError::PeerClosed => {
+                log::write(b"clipboard-server: forwarding endpoint closed\n");
+                libos::exit(1);
+            }
+            Err(_) => return,
         };
         let (op, request_id, bare) = match decode(msg.payload()) {
             // An empty suffix only: `/dev/clipboard` has no second level to resolve into.
