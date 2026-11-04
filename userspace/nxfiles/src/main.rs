@@ -21,8 +21,13 @@
 extern crate alloc;
 
 use libdraw::geom::{Rect, Size};
-use libdraw::text::{Font, load_ui};
-use libkern::{exit, kprint};
+use libdraw::text::{Font, load_ui_font};
+use libkern::{KError, Rights};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{
+    Channel, Deadline, Handle, Msg as IpcMsg, Namespace, NsReadOnly, Only, Ref, WaitSet, block_on, system, time,
+};
 use librsproto::surface::Role;
 
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
@@ -44,18 +49,21 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// Buffers shared with the compositor. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
 
-const STORAGE_TABLE: &[u8] = b"/dev/storage/all.tsm";
-const STORAGE_WATCH: &[u8] = b"/dev/storage/watch";
-const STORAGE_MEDIA: &[u8] = b"/dev/storage/media";
+const STORAGE_TABLE: &str = "/dev/storage/all.tsm";
+const STORAGE_WATCH: &str = "/dev/storage/watch";
+const STORAGE_MEDIA: &str = "/dev/storage/media";
 
-fn read_drives(ns: u64) -> Option<Vec<Drive>> {
-    let bytes = libfs::read_file(ns, STORAGE_TABLE).ok()?;
+/// The root namespace, borrowed: its handle is the bootstrap's, for the whole run.
+type Ns<'a> = Ref<'a, Namespace, NsReadOnly>;
+
+fn read_drives(ns: Ns<'_>) -> Option<Vec<Drive>> {
+    let bytes = libfs::read(ns, STORAGE_TABLE).ok()?;
     let table = libstream::wire::Table::decode(&bytes).ok()?;
     Some(nxfiles::drives(&table))
 }
 
 fn say_drives(drives: &[Drive]) {
-    let mut l = libkern::debug::Line::new();
+    let mut l = Line::new();
     l.s(b"nxfiles: drives:");
     for d in drives {
         l.s(b" ").untrusted(d.name.as_bytes());
@@ -69,33 +77,35 @@ fn say_drives(drives: &[Drive]) {
     l.end();
 }
 
-fn open_watch(ns: u64) -> Option<u64> {
-    let (st, watch) = libfs::lookup_wait(ns, STORAGE_WATCH, librsproto::session::DIR_SESSION_RIGHTS);
-    if st != 0 || watch == 0 {
-        libkern::debug::Line::new()
-            .s(b"nxfiles: no watch on the drives (status ")
-            .i(st as i64)
-            .s(b"), so they are read at a window's opening and focus")
-            .end();
-        return None;
+fn open_watch(ns: Ns<'_>) -> Option<Handle<Channel, Only>> {
+    let rights = Rights::from_bits(librsproto::session::DIR_SESSION_RIGHTS);
+    match block_on(ns.lookup::<Channel, Only>(STORAGE_WATCH, rights)) {
+        Ok(watch) => {
+            log::write(b"nxfiles: watching the drives\n");
+            Some(watch)
+        }
+        Err(e) => {
+            Line::new()
+                .s(b"nxfiles: no watch on the drives (status ")
+                .i(e.code().as_i32() as i64)
+                .s(b"), so they are read at a window's opening and focus")
+                .end();
+            None
+        }
     }
-    kprint(b"nxfiles: watching the drives\n");
-    Some(watch)
 }
 
 /// Take every ping queued on the watch, into `buf`: `Ok(true)` if there was one, `Err` once the
 /// service's end has gone. Called only when a wait said the watch was ready.
-fn drain_pings(watch: u64, buf: &mut [u8; libkern::abi::IPC_MSG_SIZE]) -> Result<bool, ()> {
+fn drain_pings(watch: &Handle<Channel, Only>, msg: &mut IpcMsg) -> Result<bool, ()> {
     let mut pinged = false;
     loop {
-        let _sent = match libkern::channel_recv(watch, buf) {
-            Ok(sent) => sent,
-            Err(got) if got == libkern::KError::WouldBlock.as_i32() as i64 => return Ok(pinged),
+        match watch.recv(msg) {
+            Ok(_carried) => {}
+            Err(e) if e.code() == KError::WouldBlock => return Ok(pinged),
             Err(_) => return Err(()),
-        };
-        let off = libkern::abi::IPC_HEADER_SIZE;
-        let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        if let Ok(m) = librsproto::decode(&buf[off..off + len.min(buf.len() - off)]) {
+        }
+        if let Ok(m) = librsproto::decode(msg.payload()) {
             pinged |= librsproto::storage::is_changed(m.op, m.body);
         }
     }
@@ -105,23 +115,22 @@ fn drain_pings(watch: u64, buf: &mut [u8; libkern::abi::IPC_MSG_SIZE]) -> Result
 /// It waits for the service on the browser's one thread — `TODO(files-storage-wait)`. `Ok`
 /// carries every mount unmounted on that stick, the drive going whole; `Err` the reason, put for
 /// the person reading the strip.
-fn eject(ns: u64, name: &str) -> Result<Vec<String>, String> {
+fn eject(ns: Ns<'_>, name: &str) -> Result<Vec<String>, String> {
     use librsproto::storage::OP_STORAGE_EJECT;
-    let (st, session) = libfs::lookup_wait(ns, STORAGE_MEDIA, librsproto::session::DIR_SESSION_RIGHTS);
-    if st == libkern::KError::WouldBlock.as_i32() {
-        return Err(String::from("the storage service is busy; try again"));
-    }
-    if st != 0 || session == 0 {
-        return Err(String::from("the storage service cannot be reached"));
-    }
-    let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-    let reply = librsproto::session::round_trip(session, &mut buf, 1, OP_STORAGE_EJECT, name.as_bytes());
-    // SAFETY: closing the media session this call opened.
-    unsafe { libkern::syscall1(libkern::SYS_HANDLE_CLOSE, session) };
+    let rights = Rights::from_bits(librsproto::session::DIR_SESSION_RIGHTS);
+    let session = match block_on(ns.lookup::<Channel, Only>(STORAGE_MEDIA, rights)) {
+        Ok(session) => session,
+        Err(e) if e.code() == KError::WouldBlock => {
+            return Err(String::from("the storage service is busy; try again"));
+        }
+        Err(_) => return Err(String::from("the storage service cannot be reached")),
+    };
+    let mut buf = Box::new(IpcMsg::new());
+    let reply = librsproto::session::exchange(&session, &mut buf, 1, OP_STORAGE_EJECT, name.as_bytes());
+    drop(session);
     let lost = || String::from("the storage service did not answer");
     let len = reply.map_err(|_| lost())?;
-    let off = libkern::abi::IPC_HEADER_SIZE;
-    let msg = librsproto::decode(&buf[off..off + len]).map_err(|_| lost())?;
+    let msg = librsproto::decode(&buf.payload()[..len]).map_err(|_| lost())?;
     if msg.op != OP_STORAGE_EJECT {
         return Err(lost());
     }
@@ -138,22 +147,18 @@ fn eject(ns: u64, name: &str) -> Result<Vec<String>, String> {
 ///
 /// The browser performs these itself: its `/home` binding is the authority they need. The
 /// returned string is what the strip shows, so it is written for the person looking at it.
-fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
+fn perform(ns: Ns<'_>, op: &FileOp) -> (bool, &'static str) {
     // The destination is tested first, which is what makes "nothing overwrites" true:
     // `libfs::create_file` is idempotent, so *new file* onto an existing name would succeed and
     // report a new empty file, and `libfs::rename` does not distinguish an occupied destination,
     // so a refused rename would read like a fault. Testing here puts the promise in this program.
-    let taken = |path: &String| libfs::file_size(ns, path.as_bytes()).is_some() || libfs::is_dir(ns, path.as_bytes());
+    let taken = |path: &String| libfs::file_len(ns, path).is_some() || libfs::is_directory(ns, path);
     match op {
         FileOp::Create { path, dir } => {
             if taken(path) {
                 return (false, "that name is taken");
             }
-            let made = if *dir {
-                libfs::mkdir(ns, path.as_bytes()).is_ok()
-            } else {
-                libfs::create_file(ns, path.as_bytes()).is_ok()
-            };
+            let made = if *dir { libfs::make_dir(ns, path).is_ok() } else { libfs::ensure_file(ns, path).is_ok() };
             if made { (true, "created") } else { (false, "could not create it") }
         }
         // Never `replace`, for rename, copy and move alike: overwriting is a second question.
@@ -161,7 +166,7 @@ fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
             if taken(to) {
                 return (false, "that name is taken");
             }
-            match libfs::rename(ns, from.as_bytes(), to.as_bytes(), false) {
+            match libfs::rename_path(ns, from, to, false) {
                 Ok(()) => (true, "renamed"),
                 Err(_) => (false, "could not rename it"),
             }
@@ -170,7 +175,7 @@ fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
             if taken(to) {
                 return (false, "there is one there already");
             }
-            match libfs::rename(ns, from.as_bytes(), to.as_bytes(), false) {
+            match libfs::rename_path(ns, from, to, false) {
                 Ok(()) => (true, "moved"),
                 Err(_) => (false, "could not move it"),
             }
@@ -182,12 +187,12 @@ fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
                 return (false, "that name is taken");
             }
             if *dir {
-                return match libfs::copy_tree(ns, from.as_bytes(), to.as_bytes(), false, &mut |_, _, _| {}) {
+                return match libfs::copy_recursive(ns, from, to, false, &mut |_, _, _| {}) {
                     Ok(()) => (true, "copied"),
                     Err(_) => (false, "could not copy it"),
                 };
             }
-            match libfs::copy_file(ns, from.as_bytes(), to.as_bytes(), false) {
+            match libfs::copy(ns, from, to, false) {
                 Ok(_) => (true, "copied"),
                 Err(libfs::FileError::TooLarge) => (false, "too large to copy"),
                 Err(_) => (false, "could not copy it"),
@@ -195,9 +200,9 @@ fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
         }
         FileOp::Delete { path, dir } => {
             let r = if *dir {
-                libfs::remove_tree(ns, path.as_bytes(), &mut |_, _| {}).is_ok()
+                libfs::remove_recursive(ns, path, &mut |_, _| {}).is_ok()
             } else {
-                libfs::unlink_at(ns, path.as_bytes()).is_ok()
+                libfs::remove_entry(ns, path).is_ok()
             };
             if r { (true, "deleted") } else { (false, "could not delete it") }
         }
@@ -212,29 +217,24 @@ fn subject(op: &FileOp) -> &str {
 }
 
 fn fail(msg: &[u8]) -> ! {
-    kprint(msg);
-    // SAFETY: under the test-harness kernel this terminates QEMU; elsewhere it is
-    // `Unsupported` and falls through.
-    unsafe { libkern::syscall1(libkern::SYS_TEST_EXIT, libkern::TEST_EXIT_FAILURE as u64) };
-    exit(1);
+    log::write(msg);
+    // Under the test-harness kernel this terminates QEMU; elsewhere it returns.
+    system::test_verdict(false);
+    libos::exit(1);
 }
 
 /// The wall clock in nanoseconds since the epoch, or `0` when the machine has none: a listing
 /// dated 1970 would state something false. `column_modified` then shows dates, not times.
 fn clock_now() -> u64 {
-    let mut nanos = 0u64;
-    // SAFETY: `&mut nanos` is a valid writable u64 out-param for the clock read.
-    let r =
-        unsafe { libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64) };
-    if r < 0 { 0 } else { nanos }
+    time::wall().unwrap_or(0)
 }
 
 /// Read `path` and hand the listing to `app`.
 ///
 /// A failed listing leaves the browser where it was: a directory that cannot be read (a path
 /// that went away since the press) must not cost the listing the user came from.
-fn navigate(app: &mut App, ns: u64, path: &str) {
-    match libfs::list_dir(ns, path.as_bytes()) {
+fn navigate(app: &mut App, ns: Ns<'_>, path: &str) {
+    match libfs::list_directory(ns, path) {
         Ok(entries) => {
             let rows: Vec<Entry> = entries.iter().filter_map(App::entry_of).collect();
             let read = rows.len();
@@ -244,7 +244,7 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
             // differ, so a filtered listing is not mistaken for a small directory. Gates match
             // this line.
             let shown = app.entries().len();
-            let mut l = libkern::debug::Line::new();
+            let mut l = Line::new();
             l.s(b"nxfiles: listed ").untrusted(path.as_bytes()).s(b" - ").u(shown as u64);
             l.s(b" entries");
             if read != shown {
@@ -254,7 +254,7 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
         }
         Err(_) => {
             app.list_failed(path);
-            libkern::debug::Line::new().s(b"nxfiles: cannot list ").untrusted(path.as_bytes()).end();
+            Line::new().s(b"nxfiles: cannot list ").untrusted(path.as_bytes()).end();
         }
     }
 }
@@ -264,19 +264,19 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
 /// A session per request: the shell bounds `/dev/desktop` sessions, and this is used once per
 /// file at human speed. The answer is about the request; what the file turned out to be is the
 /// opener's to report.
-fn ask_shell_to_open(root_ns: u64, path: &str) -> bool {
+fn ask_shell_to_open(root_ns: Ns<'_>, path: &str) -> bool {
     use librsproto::desktop::Desktop;
-    let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-    let Ok(mut desktop) = Desktop::connect(root_ns, &mut buf) else {
-        kprint(b"nxfiles: no /dev/desktop; cannot open anything\n");
+    let mut buf = Box::new(IpcMsg::new());
+    let Ok(mut desktop) = Desktop::resolve(root_ns, &mut buf) else {
+        log::write(b"nxfiles: no /dev/desktop; cannot open anything\n");
         return false;
     };
     let ok = desktop.open(path.as_bytes()).is_ok();
     desktop.close();
     if ok {
-        libkern::debug::Line::new().s(b"nxfiles: asked to open ").s(path.as_bytes()).end();
+        Line::new().s(b"nxfiles: asked to open ").s(path.as_bytes()).end();
     } else {
-        libkern::debug::Line::new().s(b"nxfiles: could not open ").s(path.as_bytes()).end();
+        Line::new().s(b"nxfiles: could not open ").s(path.as_bytes()).end();
     }
     ok
 }
@@ -294,9 +294,9 @@ fn home_of(env: &libstream::wire::Record) -> String {
 
 /// Put `bytes` on the clipboard as a list of paths, connecting per operation as `nxedit` and
 /// `nxterm` do: a held session costs a wait-set slot.
-fn clip_put(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
-    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
-    let mut clip = librsproto::clipboard::Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+fn clip_put(ns: Ns<'_>, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut buf = IpcMsg::new();
+    let mut clip = librsproto::clipboard::Clipboard::resolve(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
     let r = clip.copy(librsproto::clipboard::CLIP_KIND_PATH, bytes).map(|_| ());
     clip.close();
     r.map_err(|_| "the clipboard refused it")
@@ -304,9 +304,9 @@ fn clip_put(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
 
 /// Read the newest clipboard entry: its kind, and how many bytes landed in `out`; `Ok(None)` is
 /// an empty ring, which is what a paste before any copy finds.
-fn clip_get(ns: u64, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static str> {
-    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
-    let mut clip = librsproto::clipboard::Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+fn clip_get(ns: Ns<'_>, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static str> {
+    let mut buf = IpcMsg::new();
+    let mut clip = librsproto::clipboard::Clipboard::resolve(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
     let r = clip.paste(0, librsproto::clipboard::CLIP_ANY_SERIAL, out);
     clip.close();
     match r {
@@ -318,29 +318,22 @@ fn clip_get(ns: u64, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static st
 }
 
 /// Block until the compositor has something to say, or the watch does; with no watch it waits
-/// on the session channel alone. Returns whether the watch was among what woke it: a record
-/// names each handle ready, first word.
-fn wait_for(h: u64, watch: Option<u64>) -> bool {
-    let handles = [h, watch.unwrap_or(0)];
-    let n = if watch.is_some() { 2 } else { 1 };
-    let mut results = [0u8; 48];
-    // SAFETY: a valid handle array of `n` and a result buffer sized for two records.
-    let woke = unsafe {
-        libkern::syscall4(libkern::SYS_WAIT, handles.as_ptr() as u64, n, results.as_mut_ptr() as u64, u64::MAX)
-    };
-    let Some(w) = watch else { return false };
-    (0..woke.clamp(0, 2) as usize).any(|i| {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(&results[i * 24..i * 24 + 8]);
-        u64::from_le_bytes(word) == w
-    })
+/// on the session channel alone. Returns whether the watch was among what woke it.
+fn wait_for(session: Ref<'_, Channel, Only>, watch: Option<&Handle<Channel, Only>>) -> bool {
+    let mut set = WaitSet::<2>::new();
+    let _ = set.add(session);
+    if let Some(w) = watch {
+        let _ = set.add(w);
+    }
+    let woke = set.wait(Deadline::NEVER);
+    watch.is_some() && woke.is_ok_and(|fired| fired.contains(1))
 }
 
 fn dress<T: libsurface::Transport>(win: &mut Session<T>, id: u32) {
     if let Some(mut w) = win.window(id)
         && w.set_title(TITLE).is_err()
     {
-        kprint(b"nxfiles: SetTitle refused\n");
+        log::write(b"nxfiles: SetTitle refused\n");
     }
 }
 
@@ -353,29 +346,39 @@ fn theme_of(env: &libstream::wire::Record) -> Theme {
 /// Entry point.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
-    kprint(b"nxfiles: up\n");
+    log::write(b"nxfiles: up\n");
 
-    let (argv, env) = match libstream::setup::bootstrap(notif, root_ns, endpoint, arg0).setup() {
-        Some(Ok(s)) => (s.argv, s.env),
-        _ => (Vec::new(), libstream::wire::Record::default()),
-    };
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, endpoint, arg0) };
+    let endpoint: Option<Handle<Channel, Only>> = start.take_handle0();
+    let Some(root_ns) = start.root.as_ref().map(Ns::from) else { fail(b"nxfiles: no root namespace\n") };
+    // The setup's stream and terminal endpoints stay open for the run, as they always have.
+    let mut _streams = None;
+    let pending = libstream::setup::setup_is_pending(start.arg0);
+    let (argv, env) =
+        match endpoint.as_ref().filter(|_| pending).map(|e| libstream::setup::receive_setup(e, Deadline::NEVER)) {
+            Some(Ok(Some(s))) => {
+                _streams = Some((s.streams, s.terminal));
+                (s.argv, s.env)
+            }
+            _ => (Vec::new(), libstream::wire::Record::default()),
+        };
     let home = home_of(&env);
     // `argv[1]` is where the first window starts; home, which the sidebar's places and every later
     // window keep, is not the argument (it would offer `Documents/Documents`).
     let start = argv.get(1).cloned().unwrap_or_else(|| home.clone());
-    libkern::debug::Line::new().s(b"nxfiles: starting at ").untrusted(start.as_bytes()).end();
+    Line::new().s(b"nxfiles: starting at ").untrusted(start.as_bytes()).end();
     // Read here, beside the other thing the session tells this program, so the log shows it in
     // the order a reader expects.
     let theme = theme_of(&env);
     // Said out loud: a gate on a release image has no rendered grid to read, and this makes the
     // whole path — disk, shell, setup record, client — assertable from a console.
-    libkern::debug::Line::new().s(b"nxfiles: theme font_px ").u(theme.font_px as u64).end();
+    Line::new().s(b"nxfiles: theme font_px ").u(theme.font_px as u64).end();
 
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let (font, _) = match unsafe { load_ui(root_ns, &theme, b"nxfiles") } {
+    let (font, _) = match load_ui_font(root_ns, &theme, b"nxfiles") {
         Ok(loaded) => loaded,
         Err(e) => {
-            libkern::debug::Line::new().s(b"nxfiles: the UI font ").s(e.why()).end();
+            Line::new().s(b"nxfiles: the UI font ").s(e.why()).end();
             fail(b"nxfiles: font load FAILED\n");
         }
     };
@@ -384,23 +387,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     navigate(&mut app, root_ns, &start);
 
     let size = app.window_size();
-    // SAFETY: `root_ns` is this process's live root namespace.
-    let transport = match unsafe { ChannelTransport::connect(root_ns) } {
-        // Boxed: ~9 KiB of message buffers has no business in a stack frame.
-        Ok(t) => Box::new(t),
+    let transport = match ChannelTransport::open(root_ns) {
+        Ok(t) => t,
         Err(_) => fail(b"nxfiles: connect to /dev/draw FAILED\n"),
     };
-    let mut win = Session::new(transport);
+    // Boxed: ~9 KiB of message buffers has no business in a stack frame.
+    let mut win = Box::new(Session::new(transport));
     // The window is a `libui::window::Child`, so a second window is a second value rather than a
     // second copy of this loop.
     let top = {
         let ui = app.view(&theme, None);
-        match Child::open_sized(&mut win, Role::Normal, (0, 0), size, &ui, &font, &theme, BUFFERS) {
+        match Child::open_sized(&mut *win, Role::Normal, (0, 0), size, &ui, &font, &theme, BUFFERS) {
             Some(t) => t,
             None => fail(b"nxfiles: CreateWindow FAILED\n"),
         }
     };
-    dress(&mut win, top.id());
+    dress(&mut *win, top.id());
 
     let bounds = Rect::new(0, 0, size.w, size.h);
     // The open menu's window and which menu it shows: choosing `Edit` while `File` is open
@@ -411,7 +413,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // The delete question's window, alive only while one is being asked.
     let dialog: Option<(Dialog, Child)> = None;
     let dialog_hovered: Option<u64> = None;
-    let ev = win.wait_handle();
     let reported_prompt = app.prompt_len();
     let reported_pick: Option<String> = app.picked_name();
     let reported_loc: Option<usize> = app.location_text().map(|t| t.chars().count());
@@ -504,7 +505,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     if let Some(now) = read_drives(root_ns) {
         renew_drives(&mut wins, &mut drives, now);
     }
-    let mut ping_buf = alloc::boxed::Box::new([0u8; libkern::abi::IPC_MSG_SIZE]);
+    let mut ping_buf = Box::new(IpcMsg::new());
 
     loop {
         let mut redraw_now = false;
@@ -535,7 +536,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // the layout.
             app.place_menus(&ui, &l);
             // Laid out here, not inside `present`, because the menu bar's anchors read it.
-            if !top.present_laid_out(&mut win, &ui, &l, &font, &theme) {
+            if !top.present_laid_out(&mut *win, &ui, &l, &font, &theme) {
                 fail(b"nxfiles: the window could not be drawn\n");
             }
 
@@ -543,33 +544,33 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 && let Some(mut w) = win.window(window_id)
                 && w.start_move().is_err()
             {
-                kprint(b"nxfiles: the compositor refused the move\n");
+                log::write(b"nxfiles: the compositor refused the move\n");
             }
             if let Some(edges) = app.take_resize_request()
                 && let Some(mut w) = win.window(window_id)
                 && w.start_resize(edges).is_err()
             {
-                kprint(b"nxfiles: the compositor refused the resize\n");
+                log::write(b"nxfiles: the compositor refused the resize\n");
             }
             if let Some(state) = app.take_state_request()
                 && let Some(mut w) = win.window(window_id)
                 && w.request_state(state).is_err()
             {
-                kprint(b"nxfiles: the state request was refused\n");
+                log::write(b"nxfiles: the state request was refused\n");
             }
             if app.take_confirm_move()
                 && let Some((_, c)) = dialog.as_ref()
                 && let Some(mut w) = win.window(c.id())
                 && w.start_move().is_err()
             {
-                kprint(b"nxfiles: the compositor refused the dialog's move\n");
+                log::write(b"nxfiles: the compositor refused the dialog's move\n");
             }
 
             // Opened and destroyed with the menu: a `popup` is a transient role that holds the
             // keyboard while up, and a hidden one would still be a window in the stack.
             if *menu_shown != app.menus.open() {
                 if let Some(m) = menu.take() {
-                    m.close(&mut win);
+                    m.close(&mut *win);
                 }
                 *menu_hovered = None;
                 *menu_shown = app.menus.open();
@@ -578,7 +579,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         Some(a) => {
                             let view = app.menu_view(*which, &theme, None);
                             *menu = Child::open(
-                                &mut win,
+                                &mut *win,
                                 Role::Popup { parent: window_id },
                                 a,
                                 &view,
@@ -595,7 +596,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         // the height by the row count rather than read the theme's text size.
                         Some(m) => {
                             let o = win.window(m.id()).and_then(|w| w.configured()).map_or((0, 0), |c| (c.x, c.y));
-                            libkern::debug::Line::new()
+                            Line::new()
                                 .s(b"nxfiles: menu popup ")
                                 .u(m.id() as u64)
                                 .s(b" at ")
@@ -610,7 +611,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         }
                         // Not fatal: the browser is usable without its menu.
                         None => {
-                            kprint(b"nxfiles: could not open the menu\n");
+                            log::write(b"nxfiles: could not open the menu\n");
                             app.menus.close();
                             *menu_shown = None;
                         }
@@ -624,7 +625,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // Which row the pointer is over, unconditionally: `check-login` matches this
                     // line, walks down and stops at the row it means to click. A key is a number
                     // this program chose, not a label or a position.
-                    let mut l = libkern::debug::Line::new();
+                    let mut l = Line::new();
                     l.s(b"nxfiles: menu hover ");
                     match now {
                         Some(k) => {
@@ -638,9 +639,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 let view = menu_shown.map(|w| app.menu_view(w, &theme, now));
                 if let Some(view) = view
-                    && !m.present(&mut win, &view, &font, &theme)
+                    && !m.present(&mut *win, &view, &font, &theme)
                 {
-                    kprint(b"nxfiles: the menu could not be drawn\n");
+                    log::write(b"nxfiles: the menu could not be drawn\n");
                 }
             }
 
@@ -658,24 +659,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             if loc != *reported_loc {
                 *reported_loc = loc;
                 match loc {
-                    Some(n) => {
-                        libkern::debug::Line::new().s(b"nxfiles: location so far ").u(n as u64).s(b" chars").end()
-                    }
-                    None => kprint(b"nxfiles: location bar closed\n"),
+                    Some(n) => Line::new().s(b"nxfiles: location so far ").u(n as u64).s(b" chars").end(),
+                    None => log::write(b"nxfiles: location bar closed\n"),
                 }
             }
             let picked = app.picked_name();
             if picked != *reported_pick {
                 *reported_pick = picked.clone();
                 match picked.as_deref() {
-                    Some(name) => libkern::debug::Line::new().s(b"nxfiles: selected ").untrusted(name.as_bytes()).end(),
-                    None => kprint(b"nxfiles: nothing selected\n"),
+                    Some(name) => Line::new().s(b"nxfiles: selected ").untrusted(name.as_bytes()).end(),
+                    None => log::write(b"nxfiles: nothing selected\n"),
                 }
             }
             if typed != *reported_prompt {
                 *reported_prompt = typed;
                 if let Some(n) = typed {
-                    libkern::debug::Line::new().s(b"nxfiles: name so far ").u(n as u64).s(b" chars").end();
+                    Line::new().s(b"nxfiles: name so far ").u(n as u64).s(b" chars").end();
                 }
             }
 
@@ -684,17 +683,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let want = app.dialog();
             if want != dialog.as_ref().map(|(k, _)| *k) {
                 if let Some((kind, c)) = dialog.take() {
-                    c.close(&mut win);
-                    kprint(kind.closed());
+                    c.close(&mut *win);
+                    log::write(kind.closed());
                 }
                 *dialog_hovered = None;
                 if let Some(kind) = want {
                     // Said before the window is asked for, so it cannot race the shell to the
                     // console: the dialog's first `Configure` is held for the manager.
-                    kprint(kind.opening());
+                    log::write(kind.opening());
                     let view = app.dialog_view(&theme, None);
                     let opened = Child::open(
-                        &mut win,
+                        &mut *win,
                         Role::Dialog { parent: window_id },
                         // (0, 0): the manager overrides a dialog's offset anyway.
                         (0, 0),
@@ -706,7 +705,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     match opened {
                         Some(c) => *dialog = Some((kind, c)),
                         None => {
-                            kprint(kind.open_failed());
+                            log::write(kind.open_failed());
                             app.dialog_failed();
                         }
                     }
@@ -716,8 +715,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let now = c.hovered_key();
                 *dialog_hovered = now;
                 let view = app.dialog_view(&theme, now);
-                if !c.present(&mut win, &view, &font, &theme) {
-                    kprint(kind.draw_failed());
+                if !c.present(&mut *win, &view, &font, &theme) {
+                    log::write(kind.draw_failed());
                 }
             }
 
@@ -726,7 +725,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let mut payload = [0u8; librsproto::clipboard::MAX_CLIP_BYTES];
                 match librsproto::clipboard::encode_paths(verb, &refs, &mut payload) {
                     Some(n) => match clip_put(root_ns, &payload[..n]) {
-                        Ok(()) => libkern::debug::Line::new()
+                        Ok(()) => Line::new()
                             .s(b"nxfiles: clipboard now holds ")
                             .u(refs.len() as u64)
                             .s(if verb == librsproto::clipboard::PathVerb::Cut {
@@ -750,7 +749,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                                 // The filesystem is asked what each path is: the wire carries
                                 // paths, and a folder copy differs from a file copy.
                                 let list: Vec<(&str, bool)> =
-                                    p.iter().map(|path| (path, libfs::is_dir(root_ns, path.as_bytes()))).collect();
+                                    p.iter().map(|path| (path, libfs::is_directory(root_ns, path))).collect();
                                 app.pasted(p.verb, &list);
                             }
                             // The kind said paths and the bytes are not: not this browser's to fix.
@@ -780,12 +779,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         refusals += 1;
                         refused = Some(why);
                     }
-                    libkern::debug::Line::new()
-                        .s(b"nxfiles: ")
-                        .s(said.as_bytes())
-                        .s(b" ")
-                        .untrusted(subject(&op).as_bytes())
-                        .end();
+                    Line::new().s(b"nxfiles: ").s(said.as_bytes()).s(b" ").untrusted(subject(&op).as_bytes()).end();
                 }
                 match (done, refusals, refused) {
                     (_, 0, _) if done <= 1 => app.operated(said),
@@ -813,7 +807,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // which a browser with no watch would otherwise never get.
             if let Some(name) = app.take_eject() {
                 let answer = eject(root_ns, &name);
-                let mut l = libkern::debug::Line::new();
+                let mut l = Line::new();
                 l.s(b"nxfiles: ");
                 match &answer {
                     Ok(names) if !names.is_empty() => l.untrusted(names.join(", ").as_bytes()).s(b" ejected"),
@@ -841,7 +835,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 opened += 1;
             }
             if w.app.take_quit() {
-                kprint(b"nxfiles: quitting\n");
+                log::write(b"nxfiles: quitting\n");
                 quit_pending = true;
             }
         }
@@ -855,12 +849,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             let mut fresh = App::new(&home);
             fresh.set_drives(drives.clone());
-            match open_window(&mut win, fresh, &font, &theme) {
+            match open_window(&mut *win, fresh, &font, &theme) {
                 Some(w) => {
-                    kprint(b"nxfiles: opened another window\n");
+                    log::write(b"nxfiles: opened another window\n");
                     wins.push(w);
                 }
-                None => kprint(b"nxfiles: could not open another window\n"),
+                None => log::write(b"nxfiles: could not open another window\n"),
             }
         }
         // Quit closes every window: nothing here has unsaved work, so none can refuse.
@@ -874,37 +868,35 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             if wins[i].app.closing() {
                 let w = wins.remove(i);
                 if let Some(m) = w.menu {
-                    m.close(&mut win);
+                    m.close(&mut *win);
                 }
                 if let Some((_, c)) = w.dialog {
-                    c.close(&mut win);
+                    c.close(&mut *win);
                 }
-                w.top.close(&mut win);
-                kprint(b"nxfiles: closed a window\n");
+                w.top.close(&mut *win);
+                log::write(b"nxfiles: closed a window\n");
             } else {
                 i += 1;
             }
         }
         if wins.is_empty() {
-            kprint(b"nxfiles: closing\n");
-            exit(0);
+            log::write(b"nxfiles: closing\n");
+            libos::exit(0);
         }
 
         if redraw_now {
             continue;
         }
 
-        let watch_ready = win.events_pending() == 0 && wait_for(ev, watch);
+        let watch_ready = win.events_pending() == 0 && wait_for(win.waitable(), watch.as_ref());
         // A ping, or several: the drives are read once, before the next frame. A watch whose
         // service end has gone is let go and the table is read at focus. A ping left queued while
         // events were pending keeps the watch ready, so the next wait returns at once.
-        if watch_ready && let Some(w) = watch {
+        if watch_ready && let Some(w) = watch.as_ref() {
             match drain_pings(w, &mut ping_buf) {
                 Ok(pinged) => refresh_drives |= pinged,
                 Err(()) => {
-                    kprint(b"nxfiles: the drives' watch closed, so they are read at focus\n");
-                    // SAFETY: closing the watch this process opened.
-                    unsafe { libkern::syscall1(libkern::SYS_HANDLE_CLOSE, w) };
+                    log::write(b"nxfiles: the drives' watch closed, so they are read at focus\n");
                     watch = None;
                 }
             }
@@ -915,8 +907,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 Ok(Some(e)) => events.push(e),
                 Ok(None) => break,
                 Err(_) => {
-                    kprint(b"nxfiles: the compositor went away\n");
-                    exit(0);
+                    log::write(b"nxfiles: the compositor went away\n");
+                    libos::exit(0);
                 }
             }
         }
@@ -981,7 +973,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         // The receipt a key may be pressed after (`opening` precedes the window,
                         // and an earlier key can reach the browser): see `Child::took_keyboard`.
                         if c.took_keyboard(&event) {
-                            kprint(kind.has_keyboard());
+                            log::write(kind.has_keyboard());
                         }
                         c.route(&view, &font, &theme, &event)
                     })
@@ -997,8 +989,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // Unconditional: `check-login` matches these two lines, the only outside sign
                     // of which answer was given.
                     match msg {
-                        Msg::ConfirmDelete => kprint(b"nxfiles: confirmed the delete\n"),
-                        Msg::KeepIt => kprint(b"nxfiles: delete cancelled\n"),
+                        Msg::ConfirmDelete => log::write(b"nxfiles: confirmed the delete\n"),
+                        Msg::KeepIt => log::write(b"nxfiles: delete cancelled\n"),
                         _ => {}
                     }
                     app.update(msg);
@@ -1044,13 +1036,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                                 };
                                 if let Some(mut w) = win.window(window_id) {
                                     match w.start_drag(kind, &path, &entry.name) {
-                                        Ok(()) => libkern::debug::Line::new()
-                                            .s(b"nxfiles: dragging ")
-                                            .untrusted(entry.name.as_bytes())
-                                            .end(),
+                                        Ok(()) => {
+                                            Line::new().s(b"nxfiles: dragging ").untrusted(entry.name.as_bytes()).end()
+                                        }
                                         // Refused means the press ended between the motion and
                                         // this request: ordinary, not an error.
-                                        Err(_) => kprint(b"nxfiles: the compositor refused the drag\n"),
+                                        Err(_) => log::write(b"nxfiles: the compositor refused the drag\n"),
                                     }
                                 }
                             }
@@ -1066,12 +1057,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 WindowEvent::Configure { width, height, .. } => {
                     if app.resize(Size::new(width, height)) {
                         resized = true;
-                        libkern::debug::Line::new()
-                            .s(b"nxfiles: resized to ")
-                            .u(u64::from(width))
-                            .s(b"x")
-                            .u(u64::from(height))
-                            .end();
+                        Line::new().s(b"nxfiles: resized to ").u(u64::from(width)).s(b"x").u(u64::from(height)).end();
                     }
                 }
                 WindowEvent::Dismissed => {}
@@ -1079,15 +1065,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // The shell asking, answered as the close button is: the kernel closes this
                 // process's handles and the compositor tears its windows down.
                 WindowEvent::CloseRequested => {
-                    kprint(b"nxfiles: asked to close, exiting\n");
+                    log::write(b"nxfiles: asked to close, exiting\n");
                     app.update(Msg::Close);
                 }
                 // This browser offers drags and takes none: a drop is ignored, not swallowed
                 // under a highlight.
                 WindowEvent::Drop { ref name, .. } => {
-                    libkern::debug::Line::new().s(b"nxfiles: ignoring a drop of ").untrusted(name.as_bytes()).end();
+                    Line::new().s(b"nxfiles: ignoring a drop of ").untrusted(name.as_bytes()).end();
                 }
-                WindowEvent::InputLost => kprint(b"nxfiles: input dropped\n"),
+                WindowEvent::InputLost => log::write(b"nxfiles: input dropped\n"),
             }
             if resized {
                 *size = app.window_size();
@@ -1104,6 +1090,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"nxfiles: panic\n");
-    exit(2);
+    log::write(b"nxfiles: panic\n");
+    libos::exit(2);
 }

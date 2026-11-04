@@ -24,7 +24,7 @@
 "userspace/libui/src/widget/tests.rs" = 2231
 "userspace/nxedit/src/lib.rs" = 3811
 "userspace/nxfiles/src/app.rs" = 1719
-"userspace/nxfiles/src/main.rs" = 1109
+"userspace/nxfiles/src/main.rs" = 1095
 "userspace/nxfiles/src/tests.rs" = 2275
 "userspace/nxsh/src/eval.rs" = 4137
 "userspace/nxsh/src/lex.rs" = 1089
