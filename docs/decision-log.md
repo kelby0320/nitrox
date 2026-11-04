@@ -37618,3 +37618,55 @@ object; and a map past a file's backing fails its test by name, where a mutation
 crashed the run. Each crate's new tests were shown to fail with the code they cover broken, and the
 two gaps its implementer reported in `libsession`, a binding's base and a leader's setup, are
 covered now.
+
+## 2026-11-04 — Before Phase 7, E.3: the servers and supervisors on libos
+
+E.3 moves the thirteen servers and supervisors onto libos (`init`, `service-mgr`, `device-mgr`,
+`storage-service`, `auth-service`, `tty-server`, `input-server`, `view-broker`, `profile-server`,
+`clipboard-server`, `logging-service`, `session-mgr` and `desktop-session-mgr`). None makes a raw
+syscall and none keeps a `static mut`. The only `unsafe` a call to the kernel still asks of each is
+`Start::from_registers`, and `init`'s claim that the root it is handed has every right. The ratchet
+falls by their 531, from 2,087 in 26 entries to 1,556 in 13: the programs', the test harness's,
+`eshell`'s and `libheap`'s. Five library shims lost their last caller and went.
+
+Decided in the part, for the maintainer's eye:
+
+- **`service-mgr` reads what its wait says** (`service_mgr::wake`, host-tested): the routes, what
+  serves `/svc/services` and each control channel that can still bring a message are read when
+  they signal and not otherwise. The two looks the plan kept stay: a `ChildExited` has every
+  channel looked at, as it names a pid and not a channel, and a channel that can bring a message
+  but found no room in the set is read every wake. **The control is the count**: the one
+  event a session brings it, a route's resolve, costs 6 calls where it cost 28, one wait and two
+  receives, the message and the empty ring that ends the drain, where it read every service's
+  channel, 23 receives.
+- **libos grew what the servers needed, and nothing they did not**: a control channel's read
+  (`libos::control`); the machine's stop and a test verdict (`libos::system`, the stop
+  `TODO(surface-shape)` until E.10 makes it a `Write`); an operation waiting beside handles
+  (`WaitSet::add_op`, `Op::completion_in`) and a lookup that does the same
+  (`Namespace::start_lookup`); and `entropy::try_fill`. `librsproto::server` sends a `Meta::Ready`,
+  which ten servers wrote by hand, and `libsurface` lends a session's channel typed.
+- **Two waits the move would have brought in were kept out.** libos's defaults are an `Op` whose
+  drop waits for its device and an entropy fill that waits for the seeding; each server's old code
+  waited for neither. The input server's lights write now stays outstanding in its wait set, a
+  newer state written once the keyboard answers, rather than the server waiting on the keyboard;
+  the tty server's token comes from `try_fill`, so an unseeded pool still costs a password prompt
+  and not every console. Both drivers read the lights byte at submit and complete a waiting write
+  when the device goes, so neither keeps anything waiting.
+- **Every reply that fails is answered**, as `librsproto::server` answers it. The device manager,
+  the logging service, the input server, `auth-service` and the view broker closed both ends of a
+  failed channel reply and answered nothing, which leaves a forwarded resolve waiting for good; a
+  table the device manager or the storage service serves is handed read-only, where it went with
+  every right.
+- **Two changes of when, both the same outcome.** `auth-service` makes an entropy source per
+  install, where it made one at start: a machine with none is refused each salt as before. A
+  handle a client attaches to a request the profile server does not take now closes, where it
+  stayed in the server's table.
+- **Nine of the survey's items are ticked**, those in the supervision, security and shell sections
+  whose every site is now on libos; the rest name the programs, `libviews` or the test harness,
+  which are E.4's and E.5's. **sup-o5 and sec-o5 stay open**: a full `WaitSet` refuses a handle
+  with `TooLarge`, and each server's helper still drops that refusal, so only the budgets each
+  asserts keep a handle from going unwatched.
+
+`init`'s emergency path was run once on purpose: an `init.toml` naming a device that is not
+there drops to the emergency shell and fails the run with exit 35, its verdict through
+`libos::system`. The initramfs is 425,772 bytes, under its 440 KiB ceiling, which stands.
