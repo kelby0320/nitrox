@@ -37640,7 +37640,10 @@ Decided in the part, for the maintainer's eye:
   receives, the message and the empty ring that ends the drain, where it read every service's
   channel, 23 receives. **A code no death found makes a pass look at every channel**
   (`wake::deaths`): the grace wait for one death's code can drain another's, whose channel the
-  pass never read, and nothing else would wake a later one to look. A channel that can bring a
+  pass never read or read before it closed, and nothing else would wake a later one to look, so
+  every open channel not found dead is looked at again whenever the codes grow. CI's
+  `check-shutdown` caught the second case: `input-server`, read as it exited, was reaped only at
+  the next death, and the shutdown had run out its bound. A channel that can bring a
   message but has no place in the set brings a wake each tick while it has none.
 - **A server whose forwarding endpoint has lost its peer ends**, as the storage service already
   did: the clipboard and tty servers, the logging service and the profile server spun on it, a

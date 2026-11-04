@@ -58,9 +58,9 @@ and the slice plan all live there.
   handles serving `/svc/services` (`services::SLOTS`) and `registry::STARTING_ROOM` control
   channels that can still bring a message make the kernel's 32. **A wake reads only what
   signalled** (`service_mgr::wake`), bar two looks: a running service's channel is not in the
-  set, and a death queues `ChildExited`, whose pass looks at every channel, as does one whose wait
-  for an exit code drained a code no death it found explains; one that can bring a message and found
-  no room is read on every wake, and a wake comes each tick while one has none.
+  set, and a death queues `ChildExited`, whose pass looks at every channel, and again whenever its
+  wait for an exit code drains a code no death it found explains; one that can bring a message and
+  found no room is read on every wake, and a wake comes each tick while one has none.
 - **An admin request is answered once it has happened, never by a wait** (administration Part
   E.2): a stop is `Held` until the exit, a start until the `Ready`. A reply sent before the thing is
   done is a lie a gate cannot always catch; `boot-probe`'s services test reads the table straight

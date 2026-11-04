@@ -345,8 +345,9 @@ pub mod wake {
     //! **Which control channels a wake reads.** The wait says which handles signalled, and only
     //! those are read, but for two looks it cannot make:
     //! - **a death needs every channel looked at**, as `ChildExited` names a pid and not a
-    //!   channel, so that pass runs when the notification queue signals. A channel a server closes
-    //!   while it lives on is seen at the next death;
+    //!   channel, so that pass runs when the notification queue signals, and looks again when its
+    //!   wait for one death's code brings another's ([`deaths`]). A channel a server closes while
+    //!   it lives on is seen at the next death;
     //! - **a channel that can still bring a message and found no room** in the wait set is looked
     //!   at on every wake, or a server's `Ready` would sit unread to its deadline.
 
@@ -392,28 +393,28 @@ pub mod wake {
 
     /// **One pass's deaths**, in the order found: each channel in `read` looked at, and while more
     /// have died than there are `codes`, a wait for the rest. **A code no death found is a death
-    /// this pass did not look for**: one the wait drained can be a service's whose channel was not
-    /// in `read`, and nothing would wake a later pass to look, so every open channel not yet looked
-    /// at is looked at then.
+    /// this pass did not see**: the wait can drain the code of a service whose channel was not in
+    /// `read`, or was looked at before it closed, and nothing would wake a later pass to look. A
+    /// code follows its channel's close, so every open channel not found dead is looked at again
+    /// whenever the codes have grown since the last such look.
     pub fn deaths(pass: &mut impl Pass, ctrls: &[Ctrl], read: &[usize], codes: &mut Vec<i32>) -> Vec<usize> {
-        let mut looked = alloc::vec![false; ctrls.len()];
+        let open = |i: &usize| ctrls[*i].open;
         let mut dead = Vec::new();
         let mut todo = read.to_vec();
+        // How many codes were in hand when every open channel was last looked at.
+        let mut all_looked_with = (0..ctrls.len()).filter(open).all(|i| read.contains(&i)).then_some(codes.len());
         loop {
             for &i in &todo {
-                looked[i] = true;
                 if pass.look(i) {
                     dead.push(i);
                 }
             }
             while dead.len() > codes.len() && pass.more_codes(codes) {}
-            if codes.len() <= dead.len() {
+            if codes.len() <= dead.len() || all_looked_with == Some(codes.len()) {
                 return dead;
             }
-            todo = (0..ctrls.len()).filter(|&i| ctrls[i].open && !looked[i]).collect();
-            if todo.is_empty() {
-                return dead;
-            }
+            all_looked_with = Some(codes.len());
+            todo = (0..ctrls.len()).filter(|i| open(i) && !dead.contains(i)).collect();
         }
     }
 
@@ -459,6 +460,31 @@ pub mod wake {
             assert_eq!(dead, [0, 1], "the second death, whose code came in the wait");
             assert_eq!(codes, [7, 9]);
             assert_eq!(pass.looked, [0, 1, 2], "every open channel looked at once the codes outran the deaths");
+        }
+
+        #[test]
+        fn a_channel_looked_at_before_it_closed_is_looked_at_again() {
+            // A `ChildExited` pass: 0 has been asked to stop and is still exiting when its channel
+            // is looked at; 1 and 2 have died, and the wait for 2's code brings 0's too.
+            let ctrls = [UP, UP, UP];
+            let mut pass = Fake { closed: vec![false, true, true], looked: vec![], waits: vec![(vec![0], vec![0, 0])] };
+            let mut codes = vec![1];
+            let dead = deaths(&mut pass, &ctrls, &[0, 1, 2], &mut codes);
+            assert_eq!(dead, [1, 2, 0], "the death whose channel closed after its look");
+            assert_eq!(pass.looked, [0, 1, 2, 0], "looked at again once its code came, the dead not");
+        }
+
+        #[test]
+        fn a_code_no_death_explains_brings_one_more_look_at_most() {
+            let ctrls = [UP, STARTING, UP];
+            let mut pass = Fake { closed: vec![false, false, false], looked: vec![], waits: vec![] };
+            let mut codes = vec![5];
+            assert!(deaths(&mut pass, &ctrls, &[0, 1, 2], &mut codes).is_empty());
+            assert_eq!(pass.looked, [0, 1, 2], "every channel looked at after the code came: no more");
+            let mut pass = Fake { closed: vec![false, true, false], looked: vec![], waits: vec![(vec![], vec![7, 5])] };
+            let mut codes = vec![];
+            assert_eq!(deaths(&mut pass, &ctrls, &[1], &mut codes), [1]);
+            assert_eq!(pass.looked, [1, 0, 2], "one look at the rest after the codes grew, then done");
         }
 
         #[test]

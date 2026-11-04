@@ -984,8 +984,8 @@ impl Mgr {
     /// order, and **the close can come first**: `sys_process_exit` closes a child's handles
     /// before it queues the notification, so a wake with more deaths than codes waits for the
     /// rest, up to [`reaping::CODE_GRACE_NS`], answering resolves meanwhile. A death still without
-    /// a code is a failure. The channels in `read` are looked at, and every open one once a code
-    /// came that no death found ([`wake::deaths`]).
+    /// a code is a failure. The channels in `read` are looked at, and every open one not found dead
+    /// again whenever codes come that no death found explains ([`wake::deaths`]).
     fn poll(&mut self, ctrls: &[wake::Ctrl], read: &[usize], codes: &mut Vec<i32>) {
         let dead = wake::deaths(&mut Reaping::new(self), ctrls, read, codes);
         for i in dead {

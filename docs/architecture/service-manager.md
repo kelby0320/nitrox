@@ -217,8 +217,8 @@ at once.
 control channel of each server that can still bring a message** — a starting server's `Ready`, or a
 late one from a server marked down whose process runs. **A wake reads only what signalled**
 (`service_mgr::wake`, pre-Phase-7 Part E.3), bar two looks: a death needs no slot, as it closes the
-channel and queues `ChildExited`, and the pass that drains it looks at every channel, as does a pass
-whose wait for one death's code drained another's; and a channel that can bring a message but found
+channel and queues `ChildExited`, and the pass that drains it looks at every channel, and again once
+its wait for one death's code has drained another's; and a channel that can bring a message but found
 no room in the set is read on every wake, a wake coming each tick while it has none. That keeps the wait
 inside the kernel's 32 handles with fourteen routes (`registry::MAX_ROUTES`); until Part E.1b it
 held every running service's channel, which capped the services at 31 and left no room. A channel
