@@ -20,7 +20,6 @@
 "userspace/nxinstall" = 17
 "userspace/nxsh" = 35
 "userspace/nxterm" = 82
-"userspace/profile-server" = 20
 "userspace/service-mgr" = 71
 "userspace/session-mgr" = 11
 "userspace/storage-service" = 69
