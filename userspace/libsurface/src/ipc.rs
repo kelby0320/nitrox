@@ -132,6 +132,14 @@ impl ChannelTransport {
     }
 }
 
+impl crate::Session<ChannelTransport> {
+    /// The compositor's channel, to wait on beside a client's own handles: the typed form of
+    /// [`wait_handle`](crate::Session::wait_handle).
+    pub fn waitable(&self) -> Ref<'_, Channel, Only> {
+        self.transport.endpoint()
+    }
+}
+
 impl ChannelTransport {
     /// Read the next event, waiting up to `timeout_ns` from now; `Ok(None)` is a timeout.
     ///
@@ -585,6 +593,15 @@ mod tests {
         let open = mock::open_handles();
         drop(t);
         assert_eq!(mock::open_handles(), open - 1);
+    }
+
+    #[test]
+    fn a_session_lends_the_channel_its_raw_form_names() {
+        mock::reset();
+        let (t, _peer) = connected();
+        let session = crate::Session::new(t);
+        assert_eq!(session.waitable().raw().0, session.wait_handle());
+        assert_ne!(session.wait_handle(), 0);
     }
 
     #[test]
