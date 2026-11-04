@@ -103,8 +103,8 @@ pub mod registry {
     /// [`STARTING_ROOM`].
     pub const MAX_ROUTES: usize = 14;
 
-    /// The control channels of starting servers the wait set has room for, within the kernel's
-    /// 32. One more starting at once is still seen on the next pass: the wait is level-triggered.
+    /// The control channels that can still bring a message the wait set has room for, within the
+    /// kernel's 32. One past the room is read on every wake instead ([`crate::wake`]).
     pub const STARTING_ROOM: usize = libkern::abi::MAX_WAIT_HANDLES - 1 - MAX_ROUTES - crate::services::SLOTS;
 
     /// **Endpoints a server mints for sessions**, `(server, suffix)`: resolving `suffix` on the
@@ -337,6 +337,88 @@ pub mod services {
             OP_SERVICES_RESTART if running => Ok(Action::StopThenStart),
             OP_SERVICES_RESTART => Ok(Action::Start),
             _ => Err((KError::Unsupported, "not a Services request")),
+        }
+    }
+}
+
+pub mod wake {
+    //! **Which control channels a wake reads.** The wait says which handles signalled, and only
+    //! those are read, but for two looks it cannot make:
+    //! - **a death needs every channel looked at**, as `ChildExited` names a pid and not a
+    //!   channel, so that pass runs when the notification queue signals. A channel a server closes
+    //!   while it lives on is seen at the next death;
+    //! - **a channel that can still bring a message and found no room** in the wait set is looked
+    //!   at on every wake, or a server's `Ready` would sit unread to its deadline.
+
+    use alloc::vec::Vec;
+
+    /// A service's control channel, as a wake sees it.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Ctrl {
+        /// Its service runs, and the channel was made.
+        pub open: bool,
+        /// It can still bring a message: a starting server's `Ready`, or a late one on the channel
+        /// of a server marked down whose process runs, which is drained so that server ends.
+        pub speaks: bool,
+    }
+
+    /// The channels given a place in the wait set, at most `room`, in service order: those that
+    /// can still bring a message.
+    pub fn slotted(ctrls: &[Ctrl], room: usize) -> Vec<usize> {
+        (0..ctrls.len()).filter(|&i| ctrls[i].open && ctrls[i].speaks).take(room).collect()
+    }
+
+    /// The channels a wake reads: each slotted one that `signalled`, each that can bring a message
+    /// with no place, and every open one when the notification queue was `notified`.
+    pub fn read(ctrls: &[Ctrl], slotted: &[usize], signalled: &[usize], notified: bool) -> Vec<usize> {
+        let unslotted = |i: usize| ctrls[i].speaks && !slotted.contains(&i);
+        (0..ctrls.len()).filter(|&i| ctrls[i].open && (notified || signalled.contains(&i) || unslotted(i))).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::vec;
+
+        const UP: Ctrl = Ctrl { open: true, speaks: false };
+        const STARTING: Ctrl = Ctrl { open: true, speaks: true };
+        const STOPPED: Ctrl = Ctrl { open: false, speaks: false };
+
+        #[test]
+        fn at_rest_a_wake_reads_only_what_signalled() {
+            let ctrls = [UP, STARTING, UP, STOPPED];
+            let slots = slotted(&ctrls, 5);
+            assert_eq!(slots, [1]);
+            assert_eq!(read(&ctrls, &slots, &[], false), Vec::<usize>::new(), "a route's wake reads none");
+            assert_eq!(read(&ctrls, &slots, &[1], false), [1], "a Ready, and only its channel");
+        }
+
+        #[test]
+        fn a_server_past_the_room_is_read_on_every_wake() {
+            let ctrls = [STARTING; 7];
+            let slots = slotted(&ctrls, 5);
+            assert_eq!(slots, [0, 1, 2, 3, 4]);
+            assert_eq!(read(&ctrls, &slots, &[], false), [5, 6], "the two with no place");
+            assert_eq!(read(&ctrls, &slots, &[2], false), [2, 5, 6]);
+        }
+
+        #[test]
+        fn a_late_ready_is_read_from_a_server_down_whose_process_runs() {
+            let late = Ctrl { open: true, speaks: true };
+            let ctrls = [UP, late];
+            let slots = slotted(&ctrls, 5);
+            assert_eq!(slots, [1], "a place, as it can still bring a message");
+            assert_eq!(read(&ctrls, &slots, &[1], false), [1]);
+            assert_eq!(read(&ctrls, &slots, &[], false), Vec::<usize>::new());
+        }
+
+        #[test]
+        fn a_notification_reads_every_open_channel_and_never_a_closed_one() {
+            let ctrls = [UP, STARTING, STOPPED, UP];
+            let slots = slotted(&ctrls, 5);
+            assert_eq!(read(&ctrls, &slots, &[], true), [0, 1, 3], "a death names no channel");
+            assert_eq!(read(&[STOPPED], &[], &[0], true), Vec::<usize>::new());
+            assert_eq!(slotted(&[STOPPED, Ctrl { open: false, speaks: true }], 5), vec![]);
         }
     }
 }
