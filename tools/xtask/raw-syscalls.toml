@@ -7,7 +7,6 @@
 "userspace/auth-service" = 36
 "userspace/compositor" = 95
 "userspace/coreutils" = 153
-"userspace/desktop-session-mgr" = 16
 "userspace/desktop-shell" = 73
 "userspace/device-mgr" = 48
 "userspace/eshell" = 44
