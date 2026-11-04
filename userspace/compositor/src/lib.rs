@@ -29,7 +29,7 @@ use librsproto::surface::{
 /// Where a window's pixels are, for a given (window, buffer) pair.
 pub trait BufferSource {
     /// The bytes of `buffer` on `window`, or `None` if it is not mapped here.
-    fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]>;
+    fn pixels(&self, window: u32, buffer: u32) -> Option<libdraw::pixels::Pixels<'_>>;
 }
 
 /// A buffer a client has attached to a window.
@@ -939,12 +939,12 @@ impl WindowStack {
             }
             let Some(buffer_id) = w.committed else { continue };
             let Some(b) = w.buffers.iter().find(|b| b.id == buffer_id) else { continue };
-            let Some(px) = source.pixels(w.id, buffer_id) else { continue };
-            if px.len() < b.geometry.byte_len() {
+            let Some(px) = source.pixels(w.id, buffer_id).filter(|p| p.len() >= b.geometry.byte_len()) else {
                 continue;
-            }
+            };
             let bounds = Rect::new(w.origin.x, w.origin.y, b.geometry.width, b.geometry.height);
-            let surface = SurfaceRef::new(b.geometry, w.origin, px).with_corner(corner_of(w.role, bounds, screen));
+            let surface = SurfaceRef { geometry: b.geometry, origin: w.origin, pixels: px, shadow: None, corner: 0 }
+                .with_corner(corner_of(w.role, bounds, screen));
             surfaces.push(match w.shadow {
                 Some(sh) => surface.with_shadow(sh),
                 None => surface,
@@ -1314,8 +1314,8 @@ mod tests {
     }
 
     impl BufferSource for MapSource {
-        fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]> {
-            self.0.get(&(window, buffer)).map(|v| v.as_slice())
+        fn pixels(&self, window: u32, buffer: u32) -> Option<libdraw::pixels::Pixels<'_>> {
+            self.0.get(&(window, buffer)).map(|v| libdraw::pixels::Pixels::Own(v.as_slice()))
         }
     }
 
@@ -2065,8 +2065,8 @@ mod tests {
     fn a_short_buffer_is_skipped_rather_than_read_past_its_end() {
         struct Short;
         impl BufferSource for Short {
-            fn pixels(&self, _w: u32, _b: u32) -> Option<&[u8]> {
-                Some(&[0u8; 4]) // far shorter than an 8x8 buffer
+            fn pixels(&self, _w: u32, _b: u32) -> Option<libdraw::pixels::Pixels<'_>> {
+                Some(libdraw::pixels::Pixels::Own(&[0u8; 4])) // far shorter than an 8x8 buffer
             }
         }
         let mut s = WindowStack::new();

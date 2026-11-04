@@ -8,14 +8,14 @@ edition = "2024"
 # syscalls in it, so it host-tests in milliseconds instead of through a boot. The server
 # half (`/dev/draw`, IPC, mapped buffers) is the bin, and lands with plan M2 Part B.
 #
-# Pixels arrive as borrowed slices via `BufferSource`, not owned buffers: in the server
-# they are mapped `MemoryObject`s the client drew into, and copying every frame to satisfy
-# the type would defeat the whole shared-memory design.
+# Pixels arrive via `BufferSource` as `libdraw::pixels::Pixels`, not owned buffers: in the
+# server they are mapped `MemoryObject`s the client drew into, read by copying a piece at a
+# time, and copying every frame to satisfy the type would defeat the shared-memory design.
 [dependencies]
 # The bin needs the syscall-touching half of libdraw (`acquire`); the library half of
 # this crate does not, and its host tests build without it.
 libdraw = { path = "../libdraw", features = ["io"] }
-librsproto = { path = "../librsproto" }
+librsproto = { path = "../librsproto", features = ["io"] }
 # The router turns `libinput`'s logical events into per-window records; the interpretation
 # itself (SYN batching, modifiers) stays in the library both ends of the protocol share.
 libinput = { path = "../libinput" }
@@ -30,3 +30,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "compositor"
 path = "src/main.rs"
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }
