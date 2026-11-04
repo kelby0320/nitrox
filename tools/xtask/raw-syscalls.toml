@@ -13,7 +13,6 @@
 "userspace/eshell" = 44
 "userspace/heartbeat" = 9
 "userspace/hello" = 58
-"userspace/init" = 99
 "userspace/input-server" = 56
 "userspace/libheap" = 5
 "userspace/logging-service" = 10

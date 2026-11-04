@@ -33,8 +33,8 @@ Init is deliberately minimal. It is the most critical-path code in the system. A
 The line init draws is about **runtime state and started services**, not about staying at the raw syscall surface. Init runs before the service ecosystem is up, so it can't depend on anything that registers handlers or relies on services that haven't started. But the alloc-free, bootstrap-free layers (`libkern`, `libheap`, `libos`-core) are fine.
 
 This means:
-- `libos` `Handle<T,M>` + `block_on` for typed, async-shaped I/O is fine (init uses it — e.g. `read_current_generation`). Raw `sys_io_submit`/`sys_wait` + `RawHandle` are still available where mixing is simpler.
-- Use `IpcMsg` directly for the fs-server handshake, not `librsproto` — a *pragmatic current choice* (init hand-parses the tiny Ready envelope, and a refusal's reason, in `src/ready.rs`), not because init couldn't; librsproto is a stateful protocol layer init has no need to pull in yet. It is a **dev-dependency** only, so the parser's host tests can build messages with the encoder every server uses.
+- **Every call init makes is libos's** (pre-Phase-7 Part E.3): owned handles, `Msg`, `WaitSet`, `Spawn`, `block_on`, and `libos::system` for the test verdict and the shutdown's last step. `cargo xtask check-syscalls` holds it at no raw syscall.
+- Use a `libos::Msg` directly for the fs-server handshake, not `librsproto` — a *pragmatic current choice* (init hand-parses the tiny Ready envelope, and a refusal's reason, in `src/ready.rs`), not because init couldn't; librsproto is a stateful protocol layer init has no need to pull in yet. It is a **dev-dependency** only, so the parser's host tests can build messages with the encoder every server uses.
 - Parse TOML manually (a minimal TOML parser, `libinittoml`, since a full parser pulls in more than init needs).
 
 ## Critical-path discipline
@@ -115,7 +115,7 @@ Init reads files from the in-kernel initramfs resource server bound at `/initram
   the profile manifest are on the root (`/system/services.toml`, `/system/profiles/system.toml`)
   since administration Part E.1c
 
-Use the namespace handle and `sys_ns_lookup` + `sys_io_submit` (Read opcode) to access these. There's no special initramfs API — it's a regular resource server.
+Resolve them through the root namespace and map what comes back, as `read_manifest` does. There's no special initramfs API — it's a regular resource server.
 
 **The initramfs is never released.** `sys_release_initramfs()` does not exist — it is specified in [`syscall-abi.md`](../../docs/spec/syscall-abi.md) and was never built, and the initramfs must stay resident regardless: the root fs-server's restart image can only come from it, since `/store/…/bin/fs-server-ext4` is unreadable without the very server being restarted. `/initramfs/...` paths stay valid for the life of the machine. See [`deferred-decisions.md`](../../docs/rationale/deferred-decisions.md). (This file said init calls the syscall after bootstrap until 2026-08-18; audit D.5f.)
 
