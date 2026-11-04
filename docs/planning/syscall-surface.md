@@ -347,6 +347,16 @@ their last caller and went.
 `nxfiles` and `nxedit`: 202. The last of `static mut` as an out-param goes with them, and
 `BufferSource::pixels` stops being a slice (desk-d17). The implementer; `/pr-review`.
 
+**Built 2026-11-04.** The ten make no raw syscall and keep no `static mut`: the ratchet fell by
+their 644, to 912 in 3 entries, the test harness's and the two agreed. **A buffer another process
+shares is read only by copying**: libdraw's `Pixels`, borrowed where this process alone writes the
+bytes and copied a piece at a time where they are shared, under every blit, the downscale and the
+compositor's capture. libos grew a `Timer`, `system::set_clock` and `Mapping::unmap`; `libviews` is
+typed; `libstream` lends a port over an endpoint its owner keeps. The session makes 4,409 calls
+where `main` made 4,403: `nxsh`'s `exit` closes three handles the process's exit closed. Thirty-two
+shims lost their last caller and went; the test harness keeps the rest, with the two filesystem
+servers, whose entry no sub-part moves.
+
 ### E.5 The test harness
 
 **Plumbing moves, and a refusal stays raw** (the maintainer's call, and the exception the Definition

@@ -37681,3 +37681,56 @@ Decided in the part, for the maintainer's eye:
 `init`'s emergency path was run once on purpose: an `init.toml` naming a device that is not
 there drops to the emergency shell and fails the run with exit 35, its verdict through
 `libos::system`. The initramfs is 425,772 bytes, under its 440 KiB ceiling, which stands.
+
+## 2026-11-04 — Before Phase 7, E.4: the desktop and the programs on libos
+
+E.4 moves the ten remaining programs onto libos (`desktop-shell`, `compositor`, `coreutils`,
+`hello`, `nxterm`, `nxsh`, `nxinstall`, `heartbeat`, `nxfiles` and `nxedit`). None makes a raw
+syscall and none keeps a `static mut`. The `unsafe` a call to the kernel still asks of each is
+`Start::from_registers`, bar three that say why: `hello`'s deliberate fault, the compositor's
+`map_framebuffer`, whose contract is the aperture's one writer, and `nxinstall`'s panic handler,
+which sends on a `stderr` the program still owns. The ratchet falls by their 644, from 1,556 in 13
+entries to 912 in 3: the test harness's, `eshell`'s and `libheap`'s. **The session's calls are
+as they were**, 4,409 where `main`'s were 4,403 (`cargo xtask syscall-counts`): `nxsh`'s `exit`
+closes its namespace, notification queue and terminal itself, which the process's exit did, and
+the tty server sees the terminal go; the programs make two fewer.
+
+Decided in the part, for the maintainer's eye:
+
+- **A buffer another process shares is read only by copying** (desk-d17). A client may write its
+  buffer while the compositor composes it, and a Rust reference promises that nothing does, so
+  `libdraw::pixels::Pixels` is either bytes this process alone writes, borrowed as before, or a
+  `SharedBytes` such as a libos `Mapping`, copied out a piece of a row at a time onto the stack.
+  The blits, the downscale (`box_downscale_shared`) and the compositor's capture read through it,
+  and a capture writes the manager's object by copying a thumbnail it scaled into a `Vec`. Host
+  tests compose and scale the same bytes owned and shared on every blit path and find them equal.
+  `nxsh` reads a stage's image the same way (sh-d11's sites outside `eshell`).
+- **libos grew three things, and the libraries what the programs needed**: a `Timer`, which `hello`
+  and `sleep` wait on; `system::set_clock`, which says whether the hardware clock kept the time; and
+  `Mapping::unmap`, an unmap that reports the kernel's answer. `set_clock` is the one call written
+  to today's shape and not the one it will keep, as there is no clock node to pass until E.10 makes
+  it one; `TODO(surface-shape)` says so. `libviews` is typed, its `Handed` owning what a request
+  moves (sec-o1); `libstream`'s `IpcPortRef` is a port over an endpoint its owner keeps, which
+  `coreutils` and `nxinstall` each wrote; a `liblog` `Logger` lends its endpoint, so `heartbeat`'s
+  typed beats need no raw borrow, and `libsurface` lends a boxed session's channel.
+- **The implementer moved nine of the ten**, a crate at a time in a worktree of its own, from one
+  brief; the author moved `heartbeat` as the worked example and read every diff. **What changed,
+  every printed line and exit code otherwise as it was**: an error on `/dev/desktop` is the
+  `ErrorBody` every server sends, whose first four bytes are the `KError` the client reads; a
+  failed session or object reply from the compositor or the desktop is answered with an error,
+  where it went unanswered; the compositor's window and screen info objects go out read-only; a
+  program handed no root namespace says so and exits, where it went on with handle 0, which no
+  spawn does. Handles the old code leaked now close: a ping's in `nxfiles`, a capture's in the
+  desktop, and the mapping of a disk's info page in `nxinstall`.
+- **Thirty-two of E.2's raw shims lost their last caller and went**, with the helpers only they
+  used. **Two kinds of caller keep the rest**: the test harness, which E.5 moves, and **the two
+  filesystem servers, which no sub-part names**. `fs-server-ext4` and `fs-server-fat` make no raw
+  syscall, so the ratchet never listed them, but their `_start`s enter through libfsserver's raw
+  `bootstrap`, `run` and `Disk::new`, a control channel and a device passed as `u64`s. Moving them
+  is a `Start` and libfsserver's typed forms, the size of `heartbeat`'s; `TODO(raw-handle-shims)`
+  now names them beside E.5, as its trigger was "by E.5, when none is left".
+- **Sixteen of the survey's items are ticked**, those whose every site is now on libos. Those still
+  open name the test harness (rt-o1, rt-o2, rt-o5, rt-o7), the shims it keeps (desk-o4's
+  `unsafe fn`s), `eshell`'s sites (sh-d11, sh-o3, sh-o12), or work no move does: a `Transport`
+  that takes a handle by value (desk-o1), a checked received handle (sh-o7), `RawFramebuffer` from
+  a `Mapping` (desk-o5) and a `WindowStack` that holds its buffers' mappings (desk-o9).
