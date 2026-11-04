@@ -406,6 +406,7 @@ dependencies = [
  "libheap",
  "libinput",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
  "libsurface",

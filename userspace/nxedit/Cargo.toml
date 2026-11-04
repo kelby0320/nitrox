@@ -15,6 +15,7 @@ libdraw = { path = "../libdraw", features = ["io"] }
 libsurface = { path = "../libsurface" }
 librsproto = { path = "../librsproto", features = ["io"] }
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 libstream = { path = "../libstream", features = ["io"] }
 libheap = { path = "../libheap" }
 
