@@ -14,8 +14,6 @@ enum Sink {
     None,
     /// An endpoint the logger owns, closed with it.
     Owned(Handle<Channel, Only>),
-    /// An endpoint its caller owns and keeps open while the logger lives.
-    Borrowed(u64),
 }
 
 /// A log endpoint, or none; a record that does not fit a message, or finds the sink full, is
@@ -44,11 +42,12 @@ impl Logger {
         }
     }
 
-    /// Log through `handle`, which the caller keeps owning: the logger closes nothing. For callers
-    /// not yet on libos; the typed form is [`new`](Self::new).
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub const fn borrowing(handle: u64) -> Self {
-        Self { sink: if handle == 0 { Sink::None } else { Sink::Borrowed(handle) } }
+    /// The endpoint, for a caller that sends records of its own on it, as a typed stream.
+    pub fn endpoint(&self) -> Option<Ref<'_, Channel, Only>> {
+        match &self.sink {
+            Sink::None => None,
+            Sink::Owned(endpoint) => Some(endpoint.as_ref()),
+        }
     }
 
     /// Whether the endpoint is present.
@@ -105,15 +104,9 @@ impl Logger {
             return;
         }
         // A full or closed sink drops the record: logging never waits.
-        let _ = match &self.sink {
-            Sink::None => return,
-            Sink::Owned(endpoint) => endpoint.send(&msg, &mut Carried::new()),
-            Sink::Borrowed(raw) => {
-                // SAFETY: `borrowing`'s caller keeps the endpoint open while the logger lives.
-                let endpoint = unsafe { Ref::<Channel, Only>::from_raw(RawHandle(*raw), Rights::empty()) };
-                endpoint.send(&msg, &mut Carried::new())
-            }
-        };
+        if let Sink::Owned(endpoint) = &self.sink {
+            let _ = endpoint.send(&msg, &mut Carried::new());
+        }
     }
 }
 
@@ -170,7 +163,7 @@ mod tests {
         let log = open_source(ns, b"/log/y");
         assert!(!log.is_valid());
         log.info("lost");
-        assert!(!Logger::none().is_valid() && !Logger::borrowing(0).is_valid());
+        assert!(!Logger::none().is_valid() && Logger::none().endpoint().is_none());
     }
 
     #[test]
@@ -185,16 +178,17 @@ mod tests {
     }
 
     #[test]
-    fn a_borrowing_logger_sends_and_closes_nothing() {
+    fn a_logger_lends_its_endpoint_for_records_of_the_callers_own() {
         mock::reset();
         let (ns, peer) = service();
-        // SAFETY: the mock's handle, open for the test.
-        let root = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(ns), Rights::empty()) };
-        let endpoint: Handle<Channel, Only> = block_on(root.lookup("/log/x", Rights::SEND)).unwrap();
-        let log = Logger::borrowing(endpoint.raw().0);
-        log.warn("borrowed");
-        drop(log);
-        assert!(mock::is_open(endpoint.raw().0), "the caller's endpoint stays open");
-        assert_eq!(received(peer), Some((LEVEL_WARN, b"borrowed".to_vec())));
+        let log = open_source(ns, b"/log/x");
+        let mut own = Msg::new();
+        own.set(b"TSM1").unwrap();
+        log.endpoint().unwrap().send(&own, &mut Carried::new()).unwrap();
+        log.warn("after");
+        let mut msg = Msg::new();
+        peer.recv(&mut msg).unwrap();
+        assert_eq!(msg.payload(), b"TSM1", "the caller's own, as sent");
+        assert_eq!(received(peer), Some((LEVEL_WARN, b"after".to_vec())), "on the same endpoint");
     }
 }

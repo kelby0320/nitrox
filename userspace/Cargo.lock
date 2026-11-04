@@ -165,6 +165,7 @@ dependencies = [
  "libheap",
  "libkern",
  "liblog",
+ "libos",
  "libstream",
 ]
 

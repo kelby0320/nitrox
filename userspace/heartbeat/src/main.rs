@@ -14,16 +14,19 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use libkern::control::Control;
-use libkern::*;
+use libkern::CTRL_OP_SHUTDOWN;
 use liblog::Logger;
+use libos::boot::Start;
+use libos::control::{self, Control};
+use libos::log::{self, Line};
+use libos::{Carried, Channel, Deadline, Handle, Msg, Namespace, NsReadOnly, Only, Ref, WaitSet, time};
 use libstream::wire::Result as StreamResult;
 use libstream::{Schema, SliceSink, TableWriter, TypeModifiers, TypeTag, TypedRecord, Value, WireError};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const PAYLOAD_OFF: usize = 24;
+type Endpoint = Handle<Channel, Only>;
 
 struct Beat {
     seq: i64,
@@ -60,49 +63,6 @@ const BEAT_INTERVAL_NS: u64 = 300_000_000; // 300 ms
 /// Beats when spawned without a control channel.
 const FALLBACK_BEATS: u32 = 3;
 
-static mut WAIT_HANDLES: [u64; 1] = [0];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
-static mut CLOCK_BUF: u64 = 0;
-static mut RECV_MSG: [u8; IPC_MSG_SIZE] = [0; IPC_MSG_SIZE];
-
-fn kprint(msg: &[u8]) {
-    // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`; the slice is valid.
-    unsafe {
-        syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0);
-    }
-}
-
-fn kprint_u32(mut v: u32) {
-    let mut buf = [0u8; 10];
-    let mut i = buf.len();
-    if v == 0 {
-        kprint(b"0");
-        return;
-    }
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    kprint(&buf[i..]);
-}
-
-fn exit(code: i64) -> ! {
-    // SAFETY: SYS_PROCESS_EXIT terminates this process; it does not return.
-    unsafe { syscall1(SYS_PROCESS_EXIT, code as u64) };
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-fn clock_now() -> u64 {
-    // SAFETY: CLOCK_BUF is a writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
-    // leaves its last value.
-    unsafe { (&raw const CLOCK_BUF).read() }
-}
-
 /// Encode `beat` as a one-row TSM1 stream into `payload`; `None` if it does not fit.
 fn encode_beat(payload: &mut [u8], beat: &Beat) -> Option<usize> {
     let mut sink = SliceSink::new(payload);
@@ -116,123 +76,108 @@ fn encode_beat(payload: &mut [u8], beat: &Beat) -> Option<usize> {
 }
 
 /// Emit a beat to the log endpoint, or to the serial console when there is none.
-fn emit_beat_typed(log_ep: u64, beat: &Beat) {
-    if log_ep == 0 {
-        kprint(b"heartbeat: beat ");
-        kprint_u32(beat.seq as u32);
-        kprint(b"\n");
+fn emit_beat_typed(log_ep: Option<Ref<'_, Channel, Only>>, beat: &Beat) {
+    let Some(ep) = log_ep else {
+        Line::new().s(b"heartbeat: beat ").u(beat.seq as u64).end();
         return;
-    }
-    let mut buf = [0u8; IPC_MSG_SIZE];
-    let body_len = match encode_beat(&mut buf[PAYLOAD_OFF..], beat) {
-        Some(n) => n,
-        None => return, // does not fit — drop this beat
     };
-    // IpcMsg header: payload_len at 4, handle_count at 8.
-    buf[4..8].copy_from_slice(&(body_len as u32).to_le_bytes());
-    buf[8] = 0;
-    let no_handles = [0u64; 1];
-    // SAFETY: `buf` is a valid IpcMsg (header + `body_len` payload bytes at offset 24);
-    // no transferred handles; NoBlock so a slow/full sink never blocks the beat loop.
-    unsafe {
-        syscall5(SYS_CHANNEL_SEND, log_ep, buf.as_ptr() as u64, no_handles.as_ptr() as u64, 0, SENDMODE_NOBLOCK);
+    let mut msg = Msg::new();
+    // One that does not fit is dropped.
+    let Some(n) = encode_beat(msg.payload_mut(), beat) else { return };
+    if msg.set_len(n).is_ok() {
+        // Refused at once when full, so a slow sink never holds up the beat loop.
+        let _ = ep.send(&msg, &mut Carried::new());
     }
 }
 
 /// Wait up to 2 s for the log endpoint service-mgr moves over the control channel as its
-/// first message (`0` if none); the spawn ABI passes only the control handle.
-fn recv_log_handoff(control: u64) -> u64 {
-    // SAFETY: CLOCK_BUF is a writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
-    // leaves its last value.
-    let now = unsafe { (&raw const CLOCK_BUF).read() };
-    let deadline = now.saturating_add(2_000_000_000); // 2 s
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = control;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
-    };
-    if waited < 1 {
-        return 0; // no handoff (e.g. no logging service) — run without structured logging
+/// first message (`None` if none); the spawn ABI passes only the control handle.
+fn recv_log_handoff(control: &Endpoint) -> Option<Endpoint> {
+    let mut set = WaitSet::<1>::new();
+    set.add(control).ok()?;
+    if set.wait(Deadline::after(2_000_000_000).ok()?).ok()?.is_empty() {
+        return None; // no handoff (e.g. no logging service) — run without structured logging
     }
-    // The log endpoint is the one handle the handoff brings; any more close as `sent` drops.
-    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-    match unsafe { channel_recv_raw(control, &raw mut RECV_MSG) } {
-        Ok(mut sent) => sent.take(0).unwrap_or(0),
-        Err(_) => 0,
-    }
+    // The log endpoint is the one handle the handoff brings; any more close as `carried` drops.
+    let mut msg = Msg::new();
+    let mut carried = control.recv(&mut msg).ok()?;
+    carried.take(0)
 }
 
 /// The daemon loop: beat on a deadline, exit on a control shutdown.
-fn run_daemon(mut control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
-    kprint(b"heartbeat: up (daemon)\n");
+fn run_daemon(mut control: Option<Endpoint>, logger: &Logger, root: Option<&Handle<Namespace, NsReadOnly>>) -> ! {
+    log::write(b"heartbeat: up (daemon)\n");
     // The app-facing path: records on this source carry source="worker" from the path label.
-    if root_ns != 0 {
-        let worker = liblog::open_source(root_ns, b"/log/system/heartbeat/worker");
-        worker.info("worker source online");
+    if let Some(root) = root {
+        Logger::open(root, "/log/system/heartbeat/worker").info("worker source online");
     }
     if logger.is_valid() {
         logger.info("up (daemon)"); // text status via liblog (LogRecord path)
     }
-    let start_ns = clock_now();
+    let start_ns = time::now().unwrap_or(0);
     let mut beat = 1i64;
     // Beat once before the timed loop so a fast boot's verdict still sees a typed beat.
-    emit_beat_typed(log_ep, &Beat { seq: beat, uptime_ns: 0, healthy: true });
+    emit_beat_typed(logger.endpoint(), &Beat { seq: beat, uptime_ns: 0, healthy: true });
     beat += 1;
     loop {
-        let now = clock_now();
-        let deadline = now.saturating_add(BEAT_INTERVAL_NS);
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = control;
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
+        let now = time::now().unwrap_or(start_ns);
+        let deadline = Deadline::at(now.saturating_add(BEAT_INTERVAL_NS));
+        let waited = {
+            let mut set = WaitSet::<1>::new();
+            if let Some(c) = &control {
+                let _ = set.add(c);
+            }
+            set.wait(deadline)
         };
-        if waited >= 1 {
-            match libkern::control::recv(&mut control) {
+        match waited {
+            Ok(fired) if !fired.is_empty() => match control::recv(&mut control) {
                 Control::Op(CTRL_OP_SHUTDOWN) => {
-                    kprint(b"heartbeat: shutdown requested, exiting\n");
-                    exit(0);
+                    log::write(b"heartbeat: shutdown requested, exiting\n");
+                    libos::exit(0);
                 }
                 // The channel stays signalled once closed; waiting again would spin.
                 Control::Closed => {
-                    kprint(b"heartbeat: its supervisor has gone, exiting\n");
-                    exit(0);
+                    log::write(b"heartbeat: its supervisor has gone, exiting\n");
+                    libos::exit(0);
                 }
                 _ => { /* unknown/empty op — ignore and keep beating */ }
+            },
+            // A wait that failed says nothing of the time, so the beat waits it out.
+            failed => {
+                if failed.is_err() {
+                    time::sleep_until(deadline);
+                }
+                let uptime_ns = now.saturating_sub(start_ns) as i64;
+                emit_beat_typed(logger.endpoint(), &Beat { seq: beat, uptime_ns, healthy: true });
+                beat = beat.wrapping_add(1);
             }
-        } else {
-            emit_beat_typed(log_ep, &Beat { seq: beat, uptime_ns: now.saturating_sub(start_ns) as i64, healthy: true });
-            beat = beat.wrapping_add(1);
         }
     }
 }
 
 /// Entry point: `rsi` = namespace, `rdx` = control endpoint from service-mgr (0 if none).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
-    // Receive the log endpoint service-mgr transfers over the control channel, then log
-    // through it. `0` (no handoff) → the logger is a no-op and beats fall back to kprint.
-    let log_ep = if control != 0 { recv_log_handoff(control) } else { 0 };
-    let logger = Logger::borrowing(log_ep);
-    if control != 0 {
-        run_daemon(control, log_ep, &logger, root_ns);
+pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, control, arg0) };
+    let control: Option<Endpoint> = start.take_handle0();
+    if control.is_some() {
+        // Receive the log endpoint service-mgr transfers over the control channel, then log
+        // through it. None (no handoff) → the logger is a no-op and beats fall back to the console.
+        let logger = control.as_ref().and_then(recv_log_handoff).map_or(Logger::none(), Logger::new);
+        run_daemon(control, &logger, start.root.as_ref());
     }
     // No control channel: a bounded run so we never hang unsupervised.
-    kprint(b"heartbeat: up (no control channel; bounded run)\n");
-    let mut beat = 1u32;
-    while beat <= FALLBACK_BEATS {
-        kprint(b"heartbeat: beat ");
-        kprint_u32(beat);
-        kprint(b"\n");
-        beat += 1;
+    log::write(b"heartbeat: up (no control channel; bounded run)\n");
+    for beat in 1..=FALLBACK_BEATS {
+        Line::new().s(b"heartbeat: beat ").u(beat as u64).end();
     }
-    kprint(b"heartbeat: done, exiting 0\n");
-    exit(0);
+    log::write(b"heartbeat: done, exiting 0\n");
+    libos::exit(0);
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"heartbeat: PANIC\n");
-    exit(1);
+    log::write(b"heartbeat: PANIC\n");
+    libos::exit(1);
 }
