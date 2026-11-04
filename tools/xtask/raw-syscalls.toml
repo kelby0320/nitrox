@@ -21,7 +21,6 @@
 "userspace/service-mgr" = 71
 "userspace/storage-service" = 69
 "userspace/test-harness" = 863
-"userspace/tty-server" = 43
 "userspace/view-broker" = 38
 
 [agreed]

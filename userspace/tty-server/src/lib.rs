@@ -430,14 +430,6 @@ pub mod tokens {
         live: Vec<Entry>,
     }
 
-    /// A token from what `sys_entropy_read` answered (`r`, and the buffer), or none. Only `0`
-    /// filled the buffer: a positive answer is a `PendingOperation` for an unseeded pool, which
-    /// completes without writing. The serve loop does not wait for it, and a missing token only
-    /// costs a password prompt.
-    pub fn from_read(r: i64, buf: [u8; LEN]) -> Option<[u8; LEN]> {
-        (r == 0).then_some(buf)
-    }
-
     /// Equal bytes, compared without stopping at the first difference (constant time).
     fn same(a: &[u8; LEN], b: &[u8]) -> bool {
         b.len() == LEN && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -486,14 +478,6 @@ pub mod tokens {
 
         fn token(n: u8) -> [u8; LEN] {
             [n; LEN]
-        }
-
-        /// After a `PendingOperation` the buffer is all zeros, a token anyone can name.
-        #[test]
-        fn only_a_completed_read_is_a_token() {
-            assert_eq!(from_read(0, token(9)), Some(token(9)));
-            assert_eq!(from_read(5, [0; LEN]), None, "a PO: unseeded, nothing written");
-            assert_eq!(from_read(-1, [0; LEN]), None, "an error");
         }
 
         #[test]
