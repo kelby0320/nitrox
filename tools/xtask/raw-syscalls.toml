@@ -5,7 +5,6 @@
 # on libkern, each with its reason; their counts are still held here.
 [counts]
 "userspace/auth-service" = 36
-"userspace/clipboard-server" = 14
 "userspace/compositor" = 95
 "userspace/coreutils" = 153
 "userspace/desktop-session-mgr" = 16

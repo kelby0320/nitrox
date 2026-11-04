@@ -1,7 +1,7 @@
 //! The kill ring itself — the half of `clipboard-server` that is a function of values.
 //!
-//! Fixed storage, no allocator: [`CLIP_RING`] slots of [`MAX_CLIP_BYTES`] each, in `.bss`, about
-//! 63 KiB. A clipboard that could grow is one a program can push into until something dies.
+//! Fixed storage, no allocator: [`CLIP_RING`] slots of [`MAX_CLIP_BYTES`] each, about 63 KiB. A
+//! clipboard that could grow is one a program can push into until something dies.
 //!
 //! **Never log bytes** — counts, serials, lengths and kinds only. A clipboard eventually holds a
 //! password, and the serial console is a log file.
@@ -21,7 +21,7 @@ pub enum RingError {
     TooLarge,
 }
 
-/// One slot; its bytes are inline so the whole ring is one `.bss` object.
+/// One slot; its bytes are inline so the whole ring is one object.
 struct Slot {
     kind: u16,
     len: usize,
@@ -54,7 +54,7 @@ impl Default for Ring {
 }
 
 impl Ring {
-    /// An empty ring; `const` so the server holds it in `.bss` with no runtime initialiser.
+    /// An empty ring.
     pub const fn new() -> Ring {
         // `[Slot::new(); CLIP_RING]` needs `Copy`, which a 4 KiB slot should not have.
         Ring { slots: [const { Slot::new() }; CLIP_RING], head: 0, len: 0, serial: 0 }
