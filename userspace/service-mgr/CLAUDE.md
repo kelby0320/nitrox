@@ -47,8 +47,8 @@ and the slice plan all live there.
 
 - **Never block on anything that can wait on `service-mgr`.** Every server's path resolves through
   its routes, so a `service-mgr` that sits in a wait of its own while a server resolves a path
-  deadlocks the boot. Its main wait is `Mgr::run`'s: its notifications, every route, and the
-  control channel of each server still starting, with the nearest deadline as the timeout. A
+  deadlocks the boot. Its main wait is `Mgr::run`'s: its notifications, every route, and each
+  control channel that can still bring a message, with the nearest deadline as the timeout. A
   `Ready` awaited, a backoff, an `after` — each is a deadline there, and resolves are answered on
   every pass that their route signals. The grace wait for an exit code and the lookup of a derived
   endpoint (`wait_codes`, `lookup_serving`) answer them too. The lookups it waits on outright
@@ -58,8 +58,9 @@ and the slice plan all live there.
   handles serving `/svc/services` (`services::SLOTS`) and `registry::STARTING_ROOM` control
   channels that can still bring a message make the kernel's 32. **A wake reads only what
   signalled** (`service_mgr::wake`), bar two looks: a running service's channel is not in the
-  set, and a death queues `ChildExited`, whose pass looks at every channel; one that can bring a
-  message and found no room is read on every wake.
+  set, and a death queues `ChildExited`, whose pass looks at every channel, as does one whose wait
+  for an exit code drained a code no death it found explains; one that can bring a message and found
+  no room is read on every wake, and a wake comes each tick while one has none.
 - **An admin request is answered once it has happened, never by a wait** (administration Part
   E.2): a stop is `Held` until the exit, a start until the `Ready`. A reply sent before the thing is
   done is a lie a gate cannot always catch; `boot-probe`'s services test reads the table straight

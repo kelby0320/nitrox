@@ -21,9 +21,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libkern::{
-    CTRL_OP_SHUTDOWN, KError, KIND_CHILD_EXITED, Rights, SysCaps, TERMINAL_OP_EMERGENCY, TERMINAL_OP_FINISH,
-};
+use libkern::{CTRL_OP_SHUTDOWN, KError, Rights, SysCaps, TERMINAL_OP_EMERGENCY, TERMINAL_OP_FINISH};
 use libos::boot::Start;
 use libos::log::{self, Line};
 use libos::{
@@ -36,11 +34,14 @@ use service_mgr::registry;
 use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
 use service_mgr::{services, wake};
 
+mod reaping;
+use reaping::{Ready, Reaping, channel_peer_closed, drain_codes, take_ready};
+
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// How many declared services this supervisor holds at once. Not bounded by the wait set: only a
-/// server still starting has its control channel waited on, since a death is also a
+/// control channel that can still bring a message is waited on, since a death is also a
 /// `ChildExited` on the notification channel.
 const MAX_SERVICES: usize = 24;
 const WAIT_MAX: usize = libkern::abi::MAX_WAIT_HANDLES;
@@ -49,6 +50,10 @@ const WAIT_MAX: usize = libkern::abi::MAX_WAIT_HANDLES;
 const SERVE_DEPTH: u32 = 64;
 
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
+
+/// How often a wake comes while a control channel that can bring a message has no place in the
+/// wait set, and so is read on every wake instead: a tick.
+const UNSLOTTED_POLL_NS: u64 = 10_000_000;
 
 type Endpoint = Handle<Channel, Only>;
 /// A namespace this manager binds in: the root with `init`'s rights, or its registry.
@@ -251,7 +256,8 @@ fn spawn_service(
         let _ = spawn.grant(end, rights);
     }
     spawn.syscaps(SysCaps::from_bits_truncate(decl.syscaps));
-    // A refused spawn hands its grant back: it closes as `Refused` drops, with this end and the log.
+    // A refused spawn hands its grant back, which closes as `Refused` drops, with this end and the
+    // log endpoint.
     let Ok(process) = spawn.spawn() else {
         log::write(b"service-mgr: spawn FAIL\n");
         return (None, None);
@@ -548,39 +554,6 @@ fn open_session(end: &Endpoint, op: u16, request_id: u64, held: usize, max: usiz
     server::reply_channel(end, request_id, client).then_some(ours)
 }
 
-enum Ready {
-    /// A `Meta::Ready`, and the endpoint it moved.
-    Endpoint(Endpoint),
-    /// A refusal, with its reason; or a message that was no `Ready`.
-    Refused(String),
-    Nothing,
-    Closed,
-}
-
-fn take_ready(ctrl: &Endpoint) -> Ready {
-    let mut msg = Msg::new();
-    let mut sent = match ctrl.recv(&mut msg) {
-        Ok(sent) => sent,
-        Err(e) if e.code() == KError::PeerClosed => return Ready::Closed,
-        Err(_) => return Ready::Nothing,
-    };
-    let decoded = librsproto::decode(msg.payload()).ok().map(|m| (m.op, m.flags, m.body.to_vec()));
-    let endpoint = decoded.as_ref().and_then(|d| service_mgr::ready::kept(d.0, d.1)).and_then(|i| sent.take(i));
-    let refused = |why: &[u8]| Ready::Refused(String::from_utf8_lossy(why).into_owned());
-    match decoded {
-        Some((op, flags, body)) if op == librsproto::OP_READY && flags & librsproto::RS_FLAG_ERROR != 0 => {
-            let why = librsproto::error::parse_error(&body).map(|e| e.msg).unwrap_or(b"");
-            let why: &[u8] = if why.is_empty() { b"it refused, and gave no reason" } else { why };
-            refused(why)
-        }
-        Some((op, _, _)) if op == librsproto::OP_READY => match endpoint {
-            Some(endpoint) => Ready::Endpoint(endpoint),
-            None => refused(b"a Ready with no endpoint in it"),
-        },
-        _ => refused(b"its first message was not a Ready"),
-    }
-}
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Phase {
     /// Not running, or running and not usable — a server that never became ready.
@@ -711,8 +684,9 @@ struct Supervised {
 /// root's `/log`, `/svc/auth`, `/dev/tty` — comes to this process first, so a wait on a server
 /// that is itself resolving one of those would be two processes waiting on each other. So a
 /// server's `Meta::Ready`, a restart's backoff and an `after` are deadlines in the one wait, and
-/// the resolves are answered on every pass. The lookups it does make wait on the root filesystem,
-/// the profile server and servers already serving, none of which waits on this.
+/// the resolves are answered on each pass their route signals. The lookups it does make wait on
+/// the root filesystem, the profile server and servers already serving, none of which waits on
+/// this.
 ///
 /// **The registry.** Each server's endpoint is bound in a namespace of this manager's own, under
 /// the server's name, and every other binding of the server's path is one of this manager's
@@ -788,7 +762,11 @@ impl Mgr {
                 .map(|s| wake::Ctrl { open: s.running && s.ctrl.is_some(), speaks: s.phase != Phase::Up })
                 .collect();
             let slotted = wake::slotted(&ctrls, registry::STARTING_ROOM);
-            let deadline = Deadline::at(self.next_deadline());
+            let mut deadline = self.next_deadline();
+            if wake::unslotted(&ctrls, &slotted) {
+                deadline = deadline.min(now_ns().saturating_add(UNSLOTTED_POLL_NS));
+            }
+            let deadline = Deadline::at(deadline);
             let mut names = [Waited::Notif; WAIT_MAX];
             let waited = {
                 let mut set = WaitSet::new();
@@ -820,7 +798,7 @@ impl Mgr {
             }
             let signalled: Vec<usize> =
                 fired.iter().filter_map(|w| if let Waited::Ctrl(i) = w { Some(*i) } else { None }).collect();
-            self.poll(&wake::read(&ctrls, &slotted, &signalled, notified), &mut codes);
+            self.poll(&ctrls, &wake::read(&ctrls, &slotted, &signalled, notified), &mut codes);
             self.due();
             self.shutdown_step();
             for code in codes {
@@ -1005,45 +983,43 @@ impl Mgr {
     /// (`TODO(child-exit-attribution)`). The code is taken from the notification queue in arrival
     /// order, and **the close can come first**: `sys_process_exit` closes a child's handles
     /// before it queues the notification, so a wake with more deaths than codes waits for the
-    /// rest, up to [`CODE_GRACE_NS`], answering resolves meanwhile. A death still without a code
-    /// is a failure. Only the channels in `read` are looked at ([`wake::read`]).
-    fn poll(&mut self, read: &[usize], codes: &mut Vec<i32>) {
-        let mut dead = Vec::new();
-        for &i in read {
-            let s = &self.svcs[i];
-            let Some(ctrl) = s.ctrl.as_ref().filter(|_| s.running) else {
-                continue;
-            };
-            if let Phase::Starting { .. } = s.phase {
-                let ready = take_ready(ctrl);
-                match ready {
-                    Ready::Endpoint(ep) => self.register(i, ep),
-                    Ready::Refused(why) => {
-                        Line::new()
-                            .s(b"service-mgr: '")
-                            .s(self.svcs[i].decl.name.as_bytes())
-                            .s(b"' did not come up: ")
-                            .untrusted(why.as_bytes())
-                            .end();
-                        self.failed_to_start(i);
-                    }
-                    Ready::Nothing => {}
-                    Ready::Closed => dead.push(i),
-                }
-            } else if channel_peer_closed(ctrl) {
-                dead.push(i);
-            }
-        }
-        if dead.len() > codes.len() {
-            let until = now_ns().saturating_add(CODE_GRACE_NS);
-            while dead.len() > codes.len() && self.wait_codes(until) {
-                drain_codes(self.notif.as_ref(), codes);
-            }
-        }
+    /// rest, up to [`reaping::CODE_GRACE_NS`], answering resolves meanwhile. A death still without
+    /// a code is a failure. The channels in `read` are looked at, and every open one once a code
+    /// came that no death found ([`wake::deaths`]).
+    fn poll(&mut self, ctrls: &[wake::Ctrl], read: &[usize], codes: &mut Vec<i32>) {
+        let dead = wake::deaths(&mut Reaping::new(self), ctrls, read, codes);
         for i in dead {
             let code = if codes.is_empty() { None } else { Some(codes.remove(0)) };
             self.reap(i, code);
         }
+    }
+
+    /// Look at service `i`'s control channel: a starting server's `Ready`, registered or refused,
+    /// or any other's close. Whether it has closed, its service dead.
+    fn look(&mut self, i: usize) -> bool {
+        let s = &self.svcs[i];
+        let Some(ctrl) = s.ctrl.as_ref().filter(|_| s.running) else {
+            return false;
+        };
+        if !matches!(s.phase, Phase::Starting { .. }) {
+            return channel_peer_closed(ctrl);
+        }
+        let ready = take_ready(ctrl);
+        match ready {
+            Ready::Endpoint(ep) => self.register(i, ep),
+            Ready::Refused(why) => {
+                Line::new()
+                    .s(b"service-mgr: '")
+                    .s(self.svcs[i].decl.name.as_bytes())
+                    .s(b"' did not come up: ")
+                    .untrusted(why.as_bytes())
+                    .end();
+                self.failed_to_start(i);
+            }
+            Ready::Nothing => {}
+            Ready::Closed => return true,
+        }
+        false
     }
 
     /// Wait for the notification queue or any route until `deadline`, answering the routes that
@@ -1891,64 +1867,6 @@ const DERIVE_TIMEOUT_NS: u64 = 5_000_000_000;
 /// exited", and nothing stops a declaration from naming a service that keeps running. A hang
 /// would be a boot that stops with no message.
 const AFTER_TIMEOUT_NS: u64 = 20_000_000_000; // 20 s
-
-/// How long a service found dead waits for its exit code. **The close can come first**:
-/// `sys_process_exit` closes the child's handles before it queues `ChildExited`, so a wake on
-/// another CPU can find it dead with the code still to come, and log `code=unknown`.
-const CODE_GRACE_NS: u64 = 1_000_000_000;
-
-/// Take every `ChildExited` queued on `notif`, logging each, and append its code to `codes`.
-fn drain_codes(notif: Option<&Handle<Notify, Only>>, codes: &mut Vec<i32>) {
-    let Some(notif) = notif else { return };
-    // Drained, until it answers nothing.
-    while let Ok(Some(n)) = notif.recv() {
-        let (kind, body) = (n.kind, n.body);
-        if kind != KIND_CHILD_EXITED {
-            continue;
-        }
-        let cpid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-        let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-        Line::new()
-            .s(b"service-mgr: reaped pid=")
-            .u(cpid as u64)
-            // `.i`, not `.u`: an exit code is signed.
-            .s(b" code=")
-            .i(code as i64)
-            .end();
-        codes.push(code);
-    }
-}
-
-/// Whether `ch`'s peer has gone: drain the endpoint until it answers.
-///
-/// `sys_channel_recv` answers `WouldBlock` when the ring is merely empty and the peer is alive,
-/// `PeerClosed` when it is empty and the peer is gone; that is what makes a control channel an exit
-/// discriminator (see [`Mgr::poll`]). **A drain, not a single receive**, because a receive that
-/// returns `0` has *consumed* a message: a queued message would otherwise mask the close behind it.
-/// A service that is not a server cannot send here — its control end is granted `RECV | WAIT` and
-/// no `SEND` — but **a server can**, and this is where a `Ready` lands that came after its
-/// deadline.
-///
-/// A message found here is reported, and **every handle it carried is closed**: a late `Ready`
-/// carries the server's endpoint, which nothing binds now, and a server whose endpoint has
-/// closed ends itself — its exit is then attributed here, as any other's.
-fn channel_peer_closed(ch: &Endpoint) -> bool {
-    let mut msg = Msg::new();
-    loop {
-        // What came closes as `sent` drops, at the end of this pass.
-        let sent = match ch.recv(&mut msg) {
-            Ok(sent) => sent,
-            Err(e) if e.code() == KError::PeerClosed => return true,
-            Err(_) => return false, // WouldBlock (alive and quiet), or an error we cannot act on
-        };
-        let count = sent.len();
-        Line::new()
-            .s(b"service-mgr: unexpected message on a control channel (dropped, and ")
-            .u(count as u64)
-            .s(b" handle(s) it carried closed)")
-            .end();
-    }
-}
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
