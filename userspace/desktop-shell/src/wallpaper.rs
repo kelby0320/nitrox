@@ -20,13 +20,13 @@ pub(super) struct Wallpaper {
 /// fewer, as a single-buffered client can never draw a second frame. Every failure returns `None`
 /// after saying which; the desktop falls back to its ground colour.
 pub(super) fn open_wallpaper(
-    ns: u64,
+    ns: Root<'_>,
     session: &mut Session<ChannelTransport>,
     theme: &Theme,
     screen: Screen,
 ) -> Option<Wallpaper> {
     let path = theme.wallpaper.as_ref()?;
-    let bytes = match libfs::read_file(ns, path.as_str().as_bytes()) {
+    let bytes = match libfs::read(ns, path.as_str()) {
         Ok(b) => b,
         Err(e) => {
             let why: &[u8] = match e {
@@ -50,12 +50,12 @@ pub(super) fn open_wallpaper(
     let pitch = screen.pitch();
     let len = pitch * screen.height as usize;
     let Some(geometry) = Geometry::with_pitch(screen.width, screen.height, pitch, PixelFormat::XRGB8888) else {
-        kprint(b"desktop-shell: the wallpaper geometry is unusable\n");
+        log::write(b"desktop-shell: the wallpaper geometry is unusable\n");
         return None;
     };
     let mut picture = alloc::vec![0u8; len];
     if !libdraw::scale::place(&image.pixels, image.geometry, plan, theme.desktop, &mut picture, geometry) {
-        kprint(b"desktop-shell: the wallpaper could not be placed\n");
+        log::write(b"desktop-shell: the wallpaper could not be placed\n");
         return None;
     }
 
@@ -63,7 +63,7 @@ pub(super) fn open_wallpaper(
     let id = match session.create(&CreateWindowRequest::new(screen.width, screen.height, role), BUFFERS) {
         Ok(id) => id,
         Err(_) => {
-            kprint(b"desktop-shell: wallpaper CreateWindow FAILED\n");
+            log::write(b"desktop-shell: wallpaper CreateWindow FAILED\n");
             return None;
         }
     };
@@ -75,17 +75,17 @@ pub(super) fn open_wallpaper(
     let mut pool = session.window(id).and_then(|mut w| BufferPool::new(&mut w, size, BUFFERS));
     let mut ok = pool.as_mut().is_some_and(|p| (0..BUFFERS as u32).all(|i| p.write(i, &picture)));
     if !ok {
-        kprint(b"desktop-shell: wallpaper buffers FAILED\n");
+        log::write(b"desktop-shell: wallpaper buffers FAILED\n");
     } else {
         match session.window(id) {
             Some(mut w) => {
                 if w.commit(0, (0, 0, screen.width, screen.height)).is_err() {
-                    kprint(b"desktop-shell: wallpaper Commit FAILED\n");
+                    log::write(b"desktop-shell: wallpaper Commit FAILED\n");
                     ok = false;
                 }
             }
             None => {
-                kprint(b"desktop-shell: wallpaper window vanished\n");
+                log::write(b"desktop-shell: wallpaper window vanished\n");
                 ok = false;
             }
         }
@@ -123,10 +123,10 @@ pub(super) fn open_wallpaper(
 /// In the user's home, not `/etc`: a session namespace has none, and adding a member is a design
 /// decision (`session-mgr/CLAUDE.md`). Every failure lands on the default: a desktop that will
 /// not start because its colours did not parse is worse than any colour.
-pub(super) fn read_theme(ns: u64) -> Theme {
+pub(super) fn read_theme(ns: Root<'_>) -> Theme {
     // One line whatever happens, beginning the same way, so a gate can assert the shell decided
     // about a theme without asserting which way.
-    let bytes = match libfs::read_file(ns, THEME_PATH.as_bytes()) {
+    let bytes = match libfs::read(ns, THEME_PATH) {
         Ok(b) => b,
         Err(e) => {
             // Absent and unreadable are different: "no such file" about one that is there costs

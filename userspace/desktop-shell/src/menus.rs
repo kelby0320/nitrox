@@ -45,7 +45,7 @@ pub(super) fn present_bottom(
     let lit = shown.as_ref().is_some_and(|s| s.desktop == current);
     let view = bottom_view(entries, desktops, current, lit, bar.hovered_key(), theme, font, screen);
     if !bar.present(session, &view, font, panel_theme) {
-        kprint(b"desktop-shell: bottom bar Commit failed\n");
+        log::write(b"desktop-shell: bottom bar Commit failed\n");
     }
 }
 
@@ -138,7 +138,7 @@ impl BarMenus<'_> {
         };
         // Drawn before it is announced: an uncommitted popup is invisible yet takes the keyboard.
         if !c.present(session, &view, font, theme) {
-            kprint(b"desktop-shell: a menu could not draw its first frame\n");
+            log::write(b"desktop-shell: a menu could not draw its first frame\n");
             c.close(session);
             self.state.close();
             return None;
@@ -168,7 +168,7 @@ impl BarMenus<'_> {
             &FontMetrics::new(font, theme.font_px),
         );
         if size.w > 0 && size.h > 0 && c.resize(size) == Some(false) {
-            kprint(b"desktop-shell: a menu could not be resized\n");
+            log::write(b"desktop-shell: a menu could not be resized\n");
         }
         c.present(session, &view, font, theme);
     }

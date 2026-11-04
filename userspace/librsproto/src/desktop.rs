@@ -236,7 +236,8 @@ impl<'a> Desktop<'a> {
         let payload = self.session.call(op, body).map_err(DesktopError::from)?;
         let msg = crate::decode(payload).map_err(|_| DesktopError::Transport(0))?;
         if msg.flags & crate::RS_FLAG_ERROR != 0 {
-            // The shell's error reply is its `KError` as four little-endian bytes.
+            // The shell's error reply is an `ErrorBody`, whose first four little-endian bytes are its
+            // `KError`.
             let code =
                 (msg.body.len() >= 4).then(|| i32::from_le_bytes([msg.body[0], msg.body[1], msg.body[2], msg.body[3]]));
             return Err(DesktopError::Refused(code));

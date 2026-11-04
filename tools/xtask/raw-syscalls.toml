@@ -6,7 +6,6 @@
 [counts]
 "userspace/compositor" = 95
 "userspace/coreutils" = 153
-"userspace/desktop-shell" = 73
 "userspace/eshell" = 44
 "userspace/libheap" = 5
 "userspace/test-harness" = 863

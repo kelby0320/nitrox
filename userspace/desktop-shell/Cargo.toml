@@ -24,8 +24,10 @@ edition = "2024"
 # lives once it does.
 libtime = { path = "../libtime" }
 libkern = { path = "../libkern" }
+# The safe syscall layer: every handle, wait, lookup, spawn and log line goes through it.
+libos = { path = "../libos" }
 # **The namespace builder** (administration Part F.1): an application's namespace is built from
-# the same `NamespaceSpec` the login supervisors build a session's from, so the two cannot drift
+# the same `Members` the login supervisors build a session's from, so the two cannot drift
 # apart again — `/session/user` had. With it `LEADER_STOP_NS`, which the ending's test holds the
 # shell's own stop wait inside. The shell takes nothing else from this crate: it is not a supervisor
 # of sessions. (Until F.1, `rebind_block_devices` was all it took; until G.3, `block_device_count`

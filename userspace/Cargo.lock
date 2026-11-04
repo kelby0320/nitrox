@@ -112,6 +112,7 @@ dependencies = [
  "libfs",
  "libheap",
  "libkern",
+ "libos",
  "libprompt",
  "librsproto",
  "libsession",

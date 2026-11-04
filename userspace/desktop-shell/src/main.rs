@@ -15,8 +15,20 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
-use libkern::debug::Line;
-use libkern::*;
+use libkern::{KError, Rights};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{
+    Carried, Channel, Deadline, File, Handle, MapRead, MapReadWrite, Mapping, Memory, Msg, Namespace, Notify,
+    NsMutable, NsReadOnly, Only, ReadOnly, Ref, Resource, Spawn, WaitSet, block_on, time,
+};
+
+/// An owned channel endpoint.
+type Endpoint = Handle<Channel, Only>;
+/// A server's endpoint this shell borrows for a call, or none where the session lacks one.
+type Peer<'a> = Option<Ref<'a, Channel, Only>>;
+/// The session's namespace, which this shell resolves in and never binds into.
+type Root<'a> = Ref<'a, Namespace, NsReadOnly>;
 
 const KEY_ESC: u16 = 1;
 const KEY_ENTER: u16 = 28;
@@ -79,13 +91,9 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// The wall clock as the top bar shows it, `YYYY-MM-DD HH:MM` with no month names (no timezone
 /// database or locale), or empty when unset: the kernel reports `Unsupported`, not 1970.
 fn clock_text() -> alloc::string::String {
-    let mut nanos = 0u64;
-    // SAFETY: `&mut nanos` is a valid writable u64 out-param for the clock read.
-    let r =
-        unsafe { libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64) };
-    if r < 0 {
+    let Ok(nanos) = time::wall() else {
         return alloc::string::String::new();
-    }
+    };
     let c = libtime::civil_from_unix(nanos);
     let full = libtime::format_civil(&c);
     alloc::string::String::from(full.get(..16).unwrap_or(full.as_str()))
@@ -93,55 +101,34 @@ fn clock_text() -> alloc::string::String {
 
 /// When the displayed minute next changes, as a monotonic deadline aligned to the minute.
 fn next_minute(now: u64) -> u64 {
-    let mut nanos = 0u64;
-    // SAFETY: as above.
-    let r =
-        unsafe { libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64) };
     const MINUTE: u64 = 60 * 1_000_000_000;
-    if r < 0 {
+    let Ok(nanos) = time::wall() else {
         return now.saturating_add(MINUTE);
-    }
+    };
     now.saturating_add(MINUTE - nanos % MINUTE)
 }
 
 const BUFFERS: usize = 2;
 
-fn kprint(msg: &[u8]) {
-    // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
-    unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
-}
-
 /// A shutdown asked this shell to stop: windows are asked to close first (`Asked::Stop`), then
 /// this exit.
 fn stop() -> ! {
-    kprint(b"desktop-shell: asked to stop, exiting\n");
-    // SAFETY: terminating this process.
-    unsafe { syscall4(SYS_PROCESS_EXIT, 0, 0, 0, 0) };
-    loop {
-        core::hint::spin_loop();
-    }
+    log::write(b"desktop-shell: asked to stop, exiting\n");
+    libos::exit(0)
 }
 
 /// Read every notification queued on `notif`, and say whether a terminate request was among them.
-fn stop_asked(notif: u64) -> bool {
+fn stop_asked(notif: &Handle<Notify, Only>) -> bool {
     let mut asked = false;
-    loop {
-        let mut n = Notification::zeroed();
-        // SAFETY: `n` is a valid 64-byte writable out-param on this frame.
-        if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut n) as u64, 0, 0) } != 0 {
-            return asked;
-        }
+    while let Ok(Some(n)) = notif.recv() {
         asked |= n.kind == libkern::abi::KIND_TERMINATE_REQUESTED;
     }
+    asked
 }
 
 fn fail(msg: &[u8]) -> ! {
-    kprint(msg);
-    // SAFETY: terminating this process.
-    unsafe { syscall4(SYS_PROCESS_EXIT, 1, 0, 0, 0) };
-    loop {
-        core::hint::spin_loop();
-    }
+    log::write(msg);
+    libos::exit(1)
 }
 
 /// `theme`, with a bar's ground in place of a window's.
@@ -153,68 +140,48 @@ fn env_str<'a>(env: &'a libstream::wire::Record, name: &str) -> Option<&'a str> 
     env.schema.fields.iter().position(|f| f.name == name).and_then(|i| env.values.get(i)).and_then(|v| v.as_str())
 }
 
-fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
-    // SAFETY: a plain anonymous object of `len` bytes.
-    let h = unsafe { syscall4(SYS_MEMORY_CREATE, len as u64, 0, 0, 0) };
-    if h <= 0 {
+/// `h` borrowed, or none where there is none.
+fn borrowed(h: &Option<Endpoint>) -> Peer<'_> {
+    h.as_ref().map(|h| h.as_ref())
+}
+
+/// Wait for a message on `ch` and return its first transferred handle; any more close as the
+/// rest of the [`Carried`] drops.
+fn recv_endpoint(ch: Option<&Endpoint>) -> Option<Endpoint> {
+    let ch = ch?;
+    let mut set = WaitSet::<1>::new();
+    set.add(ch).ok()?;
+    if set.wait(Deadline::NEVER).ok()?.is_empty() {
         return None;
     }
-    // SAFETY: maps the object read/write at a kernel-chosen address.
-    let base = unsafe { syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if base < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-        return None;
-    }
-    Some((h as u64, base as usize as *mut u8))
+    let mut msg = Msg::new();
+    let mut sent: Carried = ch.recv(&mut msg).ok()?;
+    sent.take(0)
 }
-
-/// Receive one message and return its first transferred handle, or `0`; any more close as the
-/// rest of the [`Received`] drops.
-fn recv_handle(ch: u64) -> u64 {
-    if !wait_one(ch) {
-        return 0;
-    }
-    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-    match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
-        Ok(mut sent) => sent.take(0).unwrap_or(0),
-        Err(_) => 0,
-    }
-}
-
-fn wait_one(h: u64) -> bool {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers, and `WAIT_RESULTS` holds one
-    // `IoResult` per handle in the set — see its declaration for why that is the requirement.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = h;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-    };
-    waited == 1
-}
-
-static mut RECV_MSG: [u8; 4096] = [0; 4096];
-
-/// Wait set: the compositor's event channel, the manager channel, `/dev/desktop` and its
-/// sessions, the notification channel (a shutdown's terminate request), and the view broker's
-/// while a power action runs.
-static mut WAIT_HANDLES: [u64; 5 + MAX_DESKTOP_SESSIONS] = [0; 5 + MAX_DESKTOP_SESSIONS];
-static mut SHELL_NOTIF: u64 = 0;
-/// One 24-byte `IoResult` per handle in the set: `sys_wait` takes no length and writes one record
-/// per signalled handle (`kernel/src/syscall/table.rs`), so a smaller buffer overruns a static.
-static mut WAIT_RESULTS: [u8; 24 * (5 + MAX_DESKTOP_SESSIONS)] = [0; 24 * (5 + MAX_DESKTOP_SESSIONS)];
 
 /// Bootstrap registers, as `libsession::spawn_leader` fills them: `rdi` = notification
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
 /// `argv` and the environment, `rcx` = `arg0`.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> ! {
-    kprint(b"desktop-shell: up (graphical session leader)\n");
-    // SAFETY: single-threaded; written once, here, before the loop waits on it.
-    unsafe { SHELL_NOTIF = notif };
+    log::write(b"desktop-shell: up (graphical session leader)\n");
+    // SAFETY: `_start`'s four registers as the kernel set them, wrapped here and nowhere else.
+    let mut start = unsafe { Start::from_registers(notif, session_ns, setup, arg0) };
+    let notify = start.notify.take();
+    let Some(session_root) = start.root.take() else {
+        fail(b"desktop-shell: no session namespace\n");
+    };
+    let session_ns: Root<'_> = session_root.as_ref();
+    let setup: Option<Endpoint> = start.take_handle0();
 
-    let (argv, env) = match libstream::setup::bootstrap(notif, session_ns, setup, arg0).setup() {
-        Some(Ok(s)) => (s.argv, s.env),
-        _ => (alloc::vec::Vec::new(), libstream::wire::Record::default()),
+    let setup_msg = if libstream::setup::setup_is_pending(start.arg0) {
+        setup.as_ref().and_then(|ch| libstream::setup::receive_setup(ch, Deadline::NEVER).ok().flatten())
+    } else {
+        None
+    };
+    let (argv, env) = match setup_msg {
+        Some(s) => (s.argv, s.env),
+        None => (alloc::vec::Vec::new(), libstream::wire::Record::default()),
     };
     let theme = read_theme(session_ns);
     let env = env.with_str_field("THEME", &theme.to_config());
@@ -222,48 +189,46 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // than wider than the session's own.
     let home: &str = argv.get(1).map(|s| s.as_str()).unwrap_or("");
     if home.is_empty() {
-        kprint(b"desktop-shell: no home in argv; applications get no /home\n");
+        log::write(b"desktop-shell: no home in argv; applications get no /home\n");
     }
     // Every server's is `service-mgr`'s route to it, reaching that server alone whichever
     // instance runs (`fs` and `profile` are `init`'s servers' own): what is bound into an
     // application reaches a restarted server, and `BIND_NAMESPACE` reaches nothing a route does
     // not lead to.
-    let draw_endpoint = recv_handle(setup);
-    let fs_endpoint = recv_handle(setup);
-    let tty_endpoint = recv_handle(setup);
-    let profile_endpoint = recv_handle(setup);
-    let clipboard_endpoint = recv_handle(setup);
+    let draw_endpoint = recv_endpoint(setup.as_ref());
+    let fs_endpoint = recv_endpoint(setup.as_ref());
+    let tty_endpoint = recv_endpoint(setup.as_ref());
+    let profile_endpoint = recv_endpoint(setup.as_ref());
+    let clipboard_endpoint = recv_endpoint(setup.as_ref());
     // The view broker's, and `argv[2]`, the session's base: both bound into every application
     // namespace so `with` works in a terminal launched here. Either absent means no `/dev/views`.
-    let views_endpoint = recv_handle(setup);
+    let views_endpoint = recv_endpoint(setup.as_ref());
     let views_base: &str = argv.get(2).map(|s| s.as_str()).unwrap_or("");
     // An info-only endpoint of the device manager's, bound at `/dev/devices` with base `/info`:
     // nothing reached through it can subscribe to a device.
-    let devices_endpoint = recv_handle(setup);
+    let devices_endpoint = recv_endpoint(setup.as_ref());
     // The storage service's session endpoint, bound at `/storage` and `/dev/storage`: it answers
     // the filesystems and table only, so this shell cannot mount with it.
-    let storage_endpoint = recv_handle(setup);
-    let services_endpoint = recv_handle(setup);
-    if draw_endpoint == 0 {
-        kprint(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
+    let storage_endpoint = recv_endpoint(setup.as_ref());
+    let services_endpoint = recv_endpoint(setup.as_ref());
+    if draw_endpoint.is_none() {
+        log::write(b"desktop-shell: no compositor endpoint; cannot launch applications\n");
     }
-    if fs_endpoint == 0 || tty_endpoint == 0 {
-        kprint(b"desktop-shell: applications will have no fonts or no terminal\n");
+    if fs_endpoint.is_none() || tty_endpoint.is_none() {
+        log::write(b"desktop-shell: applications will have no fonts or no terminal\n");
     }
 
     // Resolved from the session namespace, where `/dev/draw` was bound unscoped; an application's
     // gets a narrower bind, which is what gates the manager channel.
-    // SAFETY: `session_ns` is this process's namespace, live for its whole run.
-    let (font, _) = match unsafe { libdraw::text::load_ui(session_ns, &theme, b"desktop-shell") } {
+    let (font, _) = match libdraw::text::load_ui_font(session_ns, &theme, b"desktop-shell") {
         Ok(loaded) => loaded,
         Err(e) => {
-            libkern::debug::Line::new().s(b"desktop-shell: the UI font ").s(e.why()).end();
+            Line::new().s(b"desktop-shell: the UI font ").s(e.why()).end();
             fail(b"desktop-shell: font load FAILED (is /system readable in the session?)\n");
         }
     };
 
-    // SAFETY: `session_ns` is live for this process's whole run.
-    let transport = match unsafe { ChannelTransport::connect(session_ns) } {
+    let transport = match ChannelTransport::open(session_ns) {
         Ok(t) => t,
         Err(_) => fail(b"desktop-shell: connect to /dev/draw FAILED\n"),
     };
@@ -271,8 +236,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
 
     // The screen's size, asked: every bar, the wallpaper, the overview and the cascade lay out on
     // it. Fatal if unreadable: a guessed size would be drawn where nobody can see it.
-    // SAFETY: `session_ns` is live for this process's whole run.
-    let screen = match unsafe { libsurface::screen::read(session_ns) } {
+    let screen = match libsurface::screen::info(session_ns) {
         Ok(s) => Screen { width: s.width, height: s.height },
         Err(_) => fail(b"desktop-shell: /dev/draw/screen unreadable; cannot lay out the desktop\n"),
     };
@@ -314,55 +278,54 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // before the manager channel is taken, the only moment a `manage` resolve gets an honest
     // answer from a namespace that does not bind it; the desktop endpoint is created first, as it
     // is bound.
-    let desktop_endpoint = match make_channel() {
-        Some((client_end, serve_end)) => {
-            // SAFETY: storing our own serve end.
-            unsafe { DESKTOP_SERVE = serve_end };
-            kprint(b"desktop-shell: serving /dev/desktop\n");
-            client_end
+    let mut desktop_server = DesktopServer::new();
+    let desktop_endpoint = match Endpoint::pair(4) {
+        Ok((client_end, serve_end)) => {
+            desktop_server.serve = Some(serve_end);
+            log::write(b"desktop-shell: serving /dev/desktop\n");
+            Some(client_end)
         }
-        None => {
-            kprint(b"desktop-shell: could not create the /dev/desktop endpoint\n");
-            0
+        Err(_) => {
+            log::write(b"desktop-shell: could not create the /dev/desktop endpoint\n");
+            None
         }
     };
 
     let user = session_user(session_ns);
     let mut launcher = Launcher {
         session_ns,
-        draw: draw_endpoint,
-        fs: fs_endpoint,
-        tty: tty_endpoint,
-        profile: profile_endpoint,
-        desktop: desktop_endpoint,
-        clipboard: clipboard_endpoint,
-        views: views_endpoint,
+        draw: borrowed(&draw_endpoint),
+        fs: borrowed(&fs_endpoint),
+        tty: borrowed(&tty_endpoint),
+        profile: borrowed(&profile_endpoint),
+        desktop: borrowed(&desktop_endpoint),
+        clipboard: borrowed(&clipboard_endpoint),
+        views: borrowed(&views_endpoint),
         views_base,
-        devices: devices_endpoint,
-        storage: storage_endpoint,
-        services: services_endpoint,
+        devices: borrowed(&devices_endpoint),
+        storage: borrowed(&storage_endpoint),
+        services: borrowed(&services_endpoint),
         home,
         user: &user,
         env: &env,
         enabled: false,
     };
     let mut may_launch = false;
-    if draw_endpoint != 0
+    if draw_endpoint.is_some()
         && let Some(built) = build_app_namespace(&launcher)
     {
         may_launch = verify_app_namespace(
-            built.ns,
+            &built.ns,
             !home.is_empty(),
-            desktop_endpoint != 0,
-            devices_endpoint != 0,
-            storage_endpoint != 0,
+            desktop_endpoint.is_some(),
+            devices_endpoint.is_some(),
+            storage_endpoint.is_some(),
             !user.is_empty(),
         );
-        // SAFETY: closing the namespace; nothing has been launched into it yet.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, built.ns) };
+        // The namespace closes here; nothing has been launched into it yet.
     }
     if !may_launch {
-        kprint(b"desktop-shell: application namespaces are not gated; launching is disabled\n");
+        log::write(b"desktop-shell: application namespaces are not gated; launching is disabled\n");
     }
     launcher.enabled = may_launch;
 
@@ -396,7 +359,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let bottom = bottom_bar.as_ref().map(|c| c.id());
     match bottom {
         Some(id) => Line::new().s(b"desktop-shell: bottom bar presented, window ").u(id as u64).end(),
-        None => kprint(b"desktop-shell: bottom bar CreateWindow FAILED; no window list\n"),
+        None => log::write(b"desktop-shell: bottom bar CreateWindow FAILED; no window list\n"),
     }
     let mut shown: Option<ShownDesktop> = None;
 
@@ -404,16 +367,15 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // namespace that binds the `/dev/draw` subtree unscoped (an application's binds
     // `/dev/draw/new` alone). A `normal` window's first `Configure` is held until the manager
     // acts, so from here nothing reaches the screen unless this process places it.
-    // SAFETY: `session_ns` is live for this process's whole run.
-    let mut manager = match unsafe { ChannelTransport::manage(session_ns) } {
+    let mut manager = match ChannelTransport::open_manager(session_ns) {
         Ok(m) => {
-            kprint(b"desktop-shell: manager channel held\n");
+            log::write(b"desktop-shell: manager channel held\n");
             Some(m)
         }
         Err(_) => {
             // Not fatal: a shell that cannot manage still draws a bar and launches things; say
             // so.
-            kprint(b"desktop-shell: /dev/draw/manage unavailable; windows will not be placed\n");
+            log::write(b"desktop-shell: /dev/draw/manage unavailable; windows will not be placed\n");
             None
         }
     };
@@ -513,7 +475,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let mut closing: Option<Closing> = None;
     let mut ending_win: Option<Child> = None;
     let mut last_focus: u32 = 0;
-    let mut powering: Option<(u64, Ending)> = None;
+    let mut powering: Option<(Endpoint, Ending)> = None;
     let mut refused: Option<(Child, Ending, Refusal)> = None;
     let ending_anchor = ending_anchor(&shown_clock, &theme, &font, screen);
     let mut name = TextFieldState::new();
@@ -525,7 +487,6 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
 
     // Blocks on the compositor's event channel, never spins: a spinning leader keeps a run queue
     // non-empty, so the idle thread never runs and reclamation stops machine-wide.
-    let ev = session.wait_handle();
     let mut sent_request = false;
     let mut next_tick = now_ns().map(next_minute).unwrap_or(u64::MAX);
     loop {
@@ -598,44 +559,32 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 _ => end_session(asked),
             }
         }
-        let deadline = if sent_request || session.events_pending() > 0 { 0 } else { next_tick.min(ending_deadline) };
-        sent_request = false;
-        let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for the whole set.
-        unsafe {
-            WAIT_HANDLES[0] = ev;
-            let mut n = 1u64;
-            if mgr_h != 0 {
-                WAIT_HANDLES[n as usize] = mgr_h;
-                n += 1;
-            }
-            if DESKTOP_SERVE != 0 {
-                WAIT_HANDLES[n as usize] = DESKTOP_SERVE;
-                n += 1;
-            }
-            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-            for i in 0..MAX_DESKTOP_SESSIONS {
-                if DESKTOP_SESSIONS[i] != 0 {
-                    WAIT_HANDLES[n as usize] = DESKTOP_SESSIONS[i];
-                    n += 1;
-                }
-            }
-            if SHELL_NOTIF != 0 {
-                WAIT_HANDLES[n as usize] = SHELL_NOTIF;
-                n += 1;
-            }
-            if let Some((ch, _)) = powering {
-                WAIT_HANDLES[n as usize] = ch;
-                n += 1;
-            }
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n, (&raw mut WAIT_RESULTS) as u64, deadline)
+        let deadline = if sent_request || session.events_pending() > 0 {
+            Deadline::POLL
+        } else {
+            Deadline::at(next_tick.min(ending_deadline))
         };
-        // SAFETY: single-threaded; set once at startup.
-        let notif = unsafe { SHELL_NOTIF };
+        sent_request = false;
+        {
+            let mut set = WaitSet::<{ 5 + MAX_DESKTOP_SESSIONS }>::new();
+            // The set has room for everything the loop can be woken by, so no add is refused.
+            let _ = set.add(session.waitable());
+            if let Some(m) = manager.as_ref() {
+                let _ = set.add(m.endpoint());
+            }
+            desktop_server.watch(&mut set);
+            if let Some(n) = notify.as_ref() {
+                let _ = set.add(n);
+            }
+            if let Some((ch, _)) = powering.as_ref() {
+                let _ = set.add(ch);
+            }
+            let _ = set.wait(deadline);
+        }
         // A stop asks the windows too, with no dialog, and goes once they have or after
         // `STOP_WAIT_NS`, inside the leader's bound. It overrides a person's end under way. With
         // nothing to ask, or no clock, it goes at once.
-        if notif != 0 && stop_asked(notif) {
+        if notify.as_ref().is_some_and(stop_asked) {
             let Some(now) = now_ns().filter(|_| manager.is_some()) else { stop() };
             if !matches!(closing.as_ref().map(Closing::asked), Some(Asked::Stop)) {
                 if let Some(d) = ending_win.take() {
@@ -644,27 +593,27 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 if let Some((d, _, _)) = refused.take() {
                     d.close(&mut session);
                 }
-                kprint(b"desktop-shell: asked to stop; asking every window to close first\n");
+                log::write(b"desktop-shell: asked to stop; asking every window to close first\n");
                 closing = Some(Closing::begin(Asked::Stop, now));
             }
         }
         // What became of a Restart or a Shut down asked for, unless the stop it was for has come:
         // `shutdown` exits once `service-mgr` has begun, so any other exit did not happen.
-        if let Some((ch, e)) = powering
+        if let Some((ch, e)) = powering.as_ref()
             && !matches!(closing.as_ref().map(Closing::asked), Some(Asked::Stop))
         {
-            let heard = match libprompt::ipc::recv(ch) {
+            let e = *e;
+            let heard = match libprompt::ipc::receive(ch) {
                 Ok(Some((librsproto::views::OP_VIEWS_EXITED, _, _, body))) => {
                     let (code, crashed) = librsproto::views::parse_exited(&body).unwrap_or((1, true));
                     Some((code == 0 && !crashed).then_some(()).ok_or_else(|| Refusal::exited(code, crashed)))
                 }
                 Ok(_) => None,
-                Err(()) => Some(Err(Refusal::Failed(alloc::string::String::from(failed::BROKER_GONE)))),
+                Err(_) => Some(Err(Refusal::Failed(alloc::string::String::from(failed::BROKER_GONE)))),
             };
             match heard {
                 None => {}
                 Some(Ok(())) => {
-                    libprompt::ipc::close(ch);
                     powering = None;
                     Line::new()
                         .s(b"desktop-shell: ")
@@ -673,33 +622,23 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         .end();
                 }
                 Some(Err(r)) => {
-                    libprompt::ipc::close(ch);
                     powering = None;
                     show_refusal(&mut session, &mut refused, e, r, window, ending_anchor, &theme, &font);
                 }
             }
         }
-        // SAFETY: reading our own endpoint and session table.
-        unsafe {
-            if DESKTOP_SERVE != 0 {
-                serve_desktop_endpoint();
-            }
-            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-            for i in 0..MAX_DESKTOP_SESSIONS {
-                let ch = DESKTOP_SESSIONS[i];
-                if ch != 0 {
-                    list_dirty |= serve_desktop_session(
-                        ch,
-                        manager.as_mut(),
-                        &mut desktops,
-                        &entries,
-                        &mut current_desktop,
-                        &mut told_desktop,
-                        &mut next_desktop_id,
-                        &launcher,
-                    );
-                }
-            }
+        desktop_server.serve_endpoint();
+        for i in 0..MAX_DESKTOP_SESSIONS {
+            list_dirty |= desktop_server.serve_session(
+                i,
+                manager.as_mut(),
+                &mut desktops,
+                &entries,
+                &mut current_desktop,
+                &mut told_desktop,
+                &mut next_desktop_id,
+                &launcher,
+            );
         }
         if let Some(m) = manager.as_mut() {
             // The compositor told of any move the endpoint just made, before a window is drained
@@ -773,7 +712,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
                             list_dirty = true;
                         } else {
-                            kprint(b"desktop-shell: SetWindowDesktop was refused\n");
+                            log::write(b"desktop-shell: SetWindowDesktop was refused\n");
                         }
                     }
                     continue;
@@ -787,7 +726,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         prompt = open_prompt(&mut session, window, bottom, &name, &theme, &font, screen);
                         if let Some(c) = prompt.as_ref() {
                             stick(m, c.id(), b"the name prompt");
-                            kprint(b"desktop-shell: naming this desktop\n");
+                            log::write(b"desktop-shell: naming this desktop\n");
                         }
                     }
                     continue;
@@ -844,7 +783,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     let chord = MgrHotkey { id: base + n, mods, code };
                     let mut b = [0u8; core::mem::size_of::<MgrHotkey>()];
                     if chord.write(&mut b).is_none() {
-                        kprint(b"desktop-shell: a desktop chord would not serialise\n");
+                        log::write(b"desktop-shell: a desktop chord would not serialise\n");
                         continue;
                     }
                     let mut reply = [0u8; 64];
@@ -862,10 +801,10 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             if rename_hk.write(&mut rb).is_some() {
                 let mut reply = [0u8; 64];
                 if m.request(OP_MGR_REGISTER_HOTKEY, &rb, None, &mut reply).is_err() {
-                    kprint(b"desktop-shell: registering Super+R was refused\n");
+                    log::write(b"desktop-shell: registering Super+R was refused\n");
                 }
             } else {
-                kprint(b"desktop-shell: the Super+R registration would not serialise\n");
+                log::write(b"desktop-shell: the Super+R registration would not serialise\n");
             }
             // `Super+A`, not a tap of `Super`: every chord here begins with `Super` going down.
             let apps_hk = MgrHotkey { id: HOTKEY_APPS, mods: MOD_META, code: KEY_A };
@@ -873,12 +812,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             if apps_hk.write(&mut ab).is_some() {
                 let mut reply = [0u8; 64];
                 if m.request(OP_MGR_REGISTER_HOTKEY, &ab, None, &mut reply).is_err() {
-                    kprint(b"desktop-shell: registering Super+A was refused\n");
+                    log::write(b"desktop-shell: registering Super+A was refused\n");
                 }
             } else {
                 // A body that would not serialise would leave a gate waiting on a line nobody
                 // printed.
-                kprint(b"desktop-shell: the Super+A registration would not serialise\n");
+                log::write(b"desktop-shell: the Super+A registration would not serialise\n");
             }
             Line::new()
                 .s(b"desktop-shell: Super+1..")
@@ -888,13 +827,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
 
             let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
             if hk.write(&mut body).is_none() {
-                kprint(b"desktop-shell: a RegisterHotkey body would not serialise\n");
+                log::write(b"desktop-shell: a RegisterHotkey body would not serialise\n");
             } else {
                 let mut reply = [0u8; 64];
                 if m.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_ok() {
-                    kprint(b"desktop-shell: Super+H minimizes the focused window\n");
+                    log::write(b"desktop-shell: Super+H minimizes the focused window\n");
                 } else {
-                    kprint(b"desktop-shell: registering Super+H was refused\n");
+                    log::write(b"desktop-shell: registering Super+H was refused\n");
                 }
             }
         }
@@ -1030,7 +969,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             d.close(&mut session);
                         }
                         closing = None;
-                        kprint(b"desktop-shell: ending the session cancelled; it goes on\n");
+                        log::write(b"desktop-shell: ending the session cancelled; it goes on\n");
                     }
                     Some(EndingMsg::EndAnyway) => {
                         if let (Some(c), Some(m)) = (closing.as_mut(), manager.as_mut()) {
@@ -1073,7 +1012,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 }
                 if close_it && let Some((d, _, _)) = refused.take() {
                     d.close(&mut session);
-                    kprint(b"desktop-shell: refusal dialog closed\n");
+                    log::write(b"desktop-shell: refusal dialog closed\n");
                 }
                 continue;
             }
@@ -1374,7 +1313,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         }
         let view = panel::top_bar(&shown_clock, bar.state.open(), top.hovered_key(), &theme);
         if !top.present(&mut session, &view, &font, &panel_theme) {
-            kprint(b"desktop-shell: top bar Commit failed\n");
+            log::write(b"desktop-shell: top bar Commit failed\n");
         }
 
         // Show-desktop lets go the moment anything on that desktop is back, but not a window the
@@ -1443,15 +1382,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
 /// Every caller treats `None` as nothing to do this round, not zero: a deadline nothing can
 /// evaluate is a wait that returns immediately for ever, a spin harmful machine-wide.
 fn now_ns() -> Option<u64> {
-    libkern::clock_read(libkern::abi::CLOCK_MONOTONIC).ok()
+    time::now().ok()
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"desktop-shell: PANIC\n");
-    // SAFETY: terminating this process.
-    unsafe { syscall4(SYS_PROCESS_EXIT, 1, 0, 0, 0) };
-    loop {
-        core::hint::spin_loop();
-    }
+    log::write(b"desktop-shell: PANIC\n");
+    libos::exit(1)
 }
