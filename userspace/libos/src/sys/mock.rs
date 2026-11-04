@@ -52,6 +52,7 @@ enum Object {
     Process,
     Thread,
     Entropy,
+    SystemControl,
 }
 
 impl Object {
@@ -68,6 +69,7 @@ impl Object {
             Object::Process => KObjectType::Process,
             Object::Thread => KObjectType::Thread,
             Object::Entropy => KObjectType::EntropyObject,
+            Object::SystemControl => KObjectType::SystemControl,
         }
     }
 }
@@ -153,6 +155,8 @@ struct Mock {
     /// Whether the next child exits before anything reaches it, holding nothing.
     exit_next_child: bool,
     threads: Vec<ThreadArgs>,
+    /// Each test verdict reported, as its code.
+    verdicts: Vec<u64>,
 }
 
 thread_local! {
@@ -954,6 +958,21 @@ pub fn entropy_read(h: u64, buf: &mut [u8]) -> i64 {
 
 pub fn kprint(bytes: &[u8]) {
     with(|m| m.log.extend_from_slice(bytes));
+}
+
+/// As a machine with no harness listening: `Unsupported`, the verdict recorded.
+pub fn test_exit(code: u64) -> i64 {
+    with(|m| m.verdicts.push(code));
+    e(KError::Unsupported)
+}
+
+pub fn power(h: u64, op: u64) -> i64 {
+    let checked = with(|m| m.typed(h, Rights::WRITE, KObjectType::SystemControl).map(|_| ()));
+    match checked {
+        Err(r) => r,
+        Ok(()) if op != libkern::POWER_HALT && op != libkern::POWER_REBOOT => e(KError::InvalidArgument),
+        Ok(()) => panic!("power({op})"),
+    }
 }
 
 mod controls;

@@ -98,6 +98,17 @@ pub fn device() -> u64 {
     with(|m| m.mint(Object::Device, Rights::READ | Rights::WRITE) as u64)
 }
 
+/// The system-control object, with `WRITE | INSPECT` and neither `DUPLICATE` nor `TRANSFER`, as
+/// the kernel hands it to `init`.
+pub fn system_control() -> u64 {
+    with(|m| m.mint(Object::SystemControl, Rights::WRITE | Rights::INSPECT) as u64)
+}
+
+/// Each test verdict reported, in order.
+pub fn verdicts() -> Vec<u64> {
+    with(|m| m.verdicts.clone())
+}
+
 /// A namespace whose server at `path` answers each lookup at once with one end of a channel, and
 /// the other end, for the test to read what is sent.
 pub fn answering(path: &str) -> (u64, u64) {

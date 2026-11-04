@@ -2279,11 +2279,12 @@ registration going reaches it, which takes `service-mgr` with it.
 **libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
 `Namespace::flush` and `fs::flush` are `async` though `sys_ns_sync` and `sys_file_sync` answer
 within the call; `Spawn::path` hands the kernel a file, which it reads within the spawn;
-`entropy::fill` makes an `EntropyObject` for each call. Each caller is written once, against the
-shape it will keep, and the call under it changes as its sub-part of
+`entropy::fill` makes an `EntropyObject` for each call; `system::stop` takes the system-control
+object as a char node, which it is not yet. Each caller is written once, against the shape it will
+keep, and the call under it changes as its sub-part of
 [`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 makes both flushes resolves or an
-`io_submit`, E.8 makes `Spawn` read the image into memory first, and E.9 makes entropy a node.
-Trigger: each of those sub-parts.
+`io_submit`, E.8 makes `Spawn` read the image into memory first, E.9 makes entropy a node, and
+E.10 makes a stop a `Write` to the power node. Trigger: each of those sub-parts.
 
 **A library's raw-handle functions stay beside its typed ones — `TODO(raw-handle-shims)`.** Part
 E.2 gives each library moved onto libos a typed API (`Ref`, `Handle`), and keeps each function
