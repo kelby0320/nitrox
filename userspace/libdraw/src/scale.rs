@@ -10,23 +10,22 @@
 use crate::format::{PixelFormat, Rgb};
 use crate::framebuffer::Geometry;
 use crate::geom::{Point, Size};
+use crate::pixels::{Pixels, SharedBytes};
 
 /// Average the `src` rectangle covering one destination pixel, in integers (the sum fits a `u32`).
-fn average(src: &[u8], src_geom: Geometry, x0: u32, y0: u32, x1: u32, y1: u32) -> Rgb {
+fn average(src: Pixels<'_>, src_geom: Geometry, x0: u32, y0: u32, x1: u32, y1: u32) -> Rgb {
     let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
     for y in y0..y1 {
-        for x in x0..x1 {
-            let off = y as usize * src_geom.pitch + x as usize * 4;
-            if off + 4 > src.len() {
-                continue;
+        let off = y as usize * src_geom.pitch + x0 as usize * 4;
+        src.each_piece(off, (x1 - x0) as usize * 4, 4, |_, bytes| {
+            for px in bytes.as_chunks::<4>().0 {
+                let c = src_geom.format.decode(u32::from_le_bytes(*px));
+                r += c.r as u32;
+                g += c.g as u32;
+                b += c.b as u32;
+                n += 1;
             }
-            let word = u32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
-            let c = src_geom.format.decode(word);
-            r += c.r as u32;
-            g += c.g as u32;
-            b += c.b as u32;
-            n += 1;
-        }
+        });
     }
     if n == 0 {
         return Rgb::new(0, 0, 0);
@@ -39,6 +38,15 @@ fn average(src: &[u8], src_geom: Geometry, x0: u32, y0: u32, x1: u32, y1: u32) -
 /// Returns `false` if either geometry is unusable (zero dimension, short source, destination
 /// larger than the source): refused rather than clamped, as a caller scaling up is confused.
 pub fn box_downscale(src: &[u8], src_geom: Geometry, dst: &mut [u8], dst_geom: Geometry) -> bool {
+    downscale(Pixels::Own(src), src_geom, dst, dst_geom)
+}
+
+/// [`box_downscale`] from a buffer another process shares, read only by copying.
+pub fn box_downscale_shared(src: &dyn SharedBytes, src_geom: Geometry, dst: &mut [u8], dst_geom: Geometry) -> bool {
+    downscale(Pixels::Shared(src), src_geom, dst, dst_geom)
+}
+
+fn downscale(src: Pixels<'_>, src_geom: Geometry, dst: &mut [u8], dst_geom: Geometry) -> bool {
     if src_geom.width == 0
         || src_geom.height == 0
         || dst_geom.width == 0
@@ -497,5 +505,20 @@ mod tests {
         let dg = geom(4, 4);
         let mut dst = alloc::vec![0u8; dg.byte_len() - 1];
         assert!(!box_downscale(&src, g, &mut dst, dg));
+    }
+
+    #[test]
+    fn a_shared_source_scales_as_the_same_bytes_owned() {
+        use libos::{Handle, MapReadWrite, Memory};
+        libos::mock::reset();
+        let sg = geom(700, 9);
+        let src = packed(sg, |x, y| Rgb::new((x * 3) as u8, (y * 29) as u8, (x ^ y) as u8));
+        let mem = Handle::<Memory, MapReadWrite>::create(src.len()).unwrap();
+        let mut map = mem.map(src.len()).unwrap();
+        map.write_from(0, &src).unwrap();
+        let dg = geom(1, 2);
+        let (mut own, mut shared) = (alloc::vec![0u8; dg.byte_len()], alloc::vec![0u8; dg.byte_len()]);
+        assert!(box_downscale(&src, sg, &mut own, dg) && box_downscale_shared(&map, sg, &mut shared, dg));
+        assert_eq!(shared, own, "a band wider than a piece, averaged whole");
     }
 }
