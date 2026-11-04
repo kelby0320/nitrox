@@ -180,6 +180,7 @@ mod tests {
         let s = wait(&a, &lookup, crate::Deadline::at(1));
         let got = lookup.completion_in(&s).unwrap().unwrap();
         assert!(got.map(4096).is_ok(), "the server's answer, the caller's");
+        assert_eq!(got.extra_rights(), Rights::MAP_READ, "the rights asked, as `lookup`'s handle carries them");
         let open = sys::open_handles();
         drop(lookup);
         assert_eq!(sys::open_handles(), open - 1, "the PO closes, and the handle taken stays");

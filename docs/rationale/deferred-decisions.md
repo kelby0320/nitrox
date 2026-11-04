@@ -2286,6 +2286,14 @@ keep, and the call under it changes as its sub-part of
 `io_submit`, E.8 makes `Spawn` read the image into memory first, E.9 makes entropy a node, and
 E.10 makes a stop a `Write` to the power node. Trigger: each of those sub-parts.
 
+**Any process can end a test run — `TODO(test-verdict-authority)`.** `sys_test_exit` checks no
+handle and no syscap: a kernel built with the test harness writes the verdict to `isa-debug-exit`
+for whichever process asks, and every other kernel refuses it `Unsupported`. So on a test image any
+program ends the run with the verdict it likes, a stop of the machine with no authority behind it,
+and `libos::system::test_verdict` makes that a safe call for every crate on libos. Only `init` and
+`boot-probe` should hold it: a handle, as pre-Phase-7 Part E.10 makes each privileged operation a
+`Write` to a node. Trigger: E.10.
+
 **A library's raw-handle functions stay beside its typed ones — `TODO(raw-handle-shims)`.** Part
 E.2 gives each library moved onto libos a typed API (`Ref`, `Handle`), and keeps each function
 that took or gave a raw `u64` handle as a thin shim over it, so the crates that call it move once,

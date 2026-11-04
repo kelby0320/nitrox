@@ -126,7 +126,7 @@ impl<const N: usize> Signalled<N> {
 mod tests {
     use super::*;
     use crate::{Channel, Handle, Handles, Msg, Only};
-    use libkern::IoOp;
+    use libkern::{IoOp, Rights};
 
     #[test]
     fn a_wait_answers_which_signalled() {
@@ -190,6 +190,16 @@ mod tests {
         };
         let done = op.completion_in(&s).map(|r| r.err().map(|e| e.code()));
         assert_eq!(done, Some(Some(KError::IoError)), "a device's failure, once it signals");
+    }
+
+    #[test]
+    fn an_operation_done_in_its_call_is_refused_a_place() {
+        sys::reset();
+        let ep: Handle<Channel, Only> = Handle::fresh(sys::forwarding(), Rights::empty());
+        let op = ep.send_held(&Msg::new(), &mut Handles::new()).unwrap();
+        let mut set = WaitSet::<1>::new();
+        assert_eq!(set.add_op(&op).map_err(|e| e.code()), Err(KError::InvalidArgument), "no handle 0 to wait on");
+        assert!(set.is_empty());
     }
 
     #[test]

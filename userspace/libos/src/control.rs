@@ -75,6 +75,7 @@ mod tests {
         assert_eq!(recv(&mut control), Control::Op(CTRL_OP_SHUTDOWN));
         assert_eq!(recv(&mut control), Control::Nothing, "a message with no op");
         assert_eq!(recv(&mut control), Control::Nothing, "nothing queued");
+        assert_eq!(mock::sleeps(), 0, "an empty ring is no pause");
         assert!(control.is_some());
     }
 

@@ -29,6 +29,7 @@ pub fn stop<'a, M: CanWrite + 'a>(control: impl Into<Ref<'a, Resource, M>>, how:
 
 /// Report a test run's verdict to the harness that booted the machine, which ends the run: this
 /// returns where none listens.
+// TODO(test-verdict-authority): any process can end a test run; a handle should be the authority.
 pub fn test_verdict(pass: bool) {
     let code = if pass { TEST_EXIT_SUCCESS } else { TEST_EXIT_FAILURE };
     sys::test_exit(code as u64);

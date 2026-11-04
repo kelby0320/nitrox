@@ -88,6 +88,12 @@ pub fn unseeded(reads: u32) {
     with(|m| m.unseeded = reads);
 }
 
+/// Let the next `reads` unseeded reads find every place the kernel keeps for a reader waiting on
+/// the seeding taken, as it answers past `SEED_WAITERS_MAX`: a PO done `WouldBlock`, to read again.
+pub fn seed_waiters_full(reads: u32) {
+    with(|m| m.seed_full = reads);
+}
+
 /// Set the wall clock, which reads `Unsupported` until then.
 pub fn set_realtime(ns: u64) {
     with(|m| m.realtime = Some(ns));
