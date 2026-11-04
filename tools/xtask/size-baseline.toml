@@ -16,7 +16,7 @@
 "userspace/fs-server-ext4/src/lib.rs" = 1764
 "userspace/libdraw/src/compose.rs" = 1510
 "userspace/libdraw/src/theme.rs" = 1086
-"userspace/librsproto/src/surface.rs" = 2567
+"userspace/librsproto/src/surface.rs" = 2561
 "userspace/libsurface/src/lib.rs" = 1423
 "userspace/libterm/src/grid.rs" = 1600
 "userspace/libui/src/route.rs" = 1235

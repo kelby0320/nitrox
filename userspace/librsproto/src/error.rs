@@ -1,7 +1,7 @@
 //! `ErrorBody` — the body of any error reply (`RS_FLAG_REPLY | RS_FLAG_ERROR`).
 //! See `docs/spec/rsproto-wire-format.md` § "Error replies".
 
-use crate::{get_u16, get_u32, put_u16, put_u32};
+use crate::{Reader, put_u16, put_u32};
 
 /// Fixed prefix of an [`ErrorBody`] (before the optional UTF-8 message).
 pub const ERROR_BODY_LEN: usize = 12;
@@ -43,15 +43,12 @@ pub fn error_body(out: &mut [u8], kerror: i32, server_code: u32, msg: &[u8]) -> 
 
 /// Parse an error body. `None` if truncated.
 pub fn parse_error(body: &[u8]) -> Option<ErrorView<'_>> {
-    if body.len() < ERROR_BODY_LEN {
-        return None;
-    }
-    let msg_len = get_u16(body, 8) as usize;
-    let end = ERROR_BODY_LEN.checked_add(msg_len)?;
-    if body.len() < end {
-        return None;
-    }
-    Some(ErrorView { kerror: get_u32(body, 0) as i32, server_code: get_u32(body, 4), msg: &body[ERROR_BODY_LEN..end] })
+    let mut r = Reader::new(body);
+    let kerror = r.i32()?;
+    let server_code = r.u32()?;
+    let msg_len = r.u16()?;
+    r.skip(2)?;
+    Some(ErrorView { kerror, server_code, msg: r.bytes(msg_len as usize)? })
 }
 
 #[cfg(test)]
@@ -94,5 +91,13 @@ mod tests {
         let e = parse_error(&buf[..n]).unwrap();
         assert_eq!(e.kerror, -30);
         assert!(e.msg.is_empty());
+    }
+
+    #[test]
+    fn parse_error_survives_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut out = [0u8; 64];
+        let n = error_body(&mut out, -5, 9, b"no such file").unwrap();
+        refuses_every_prefix(&out[..n], |b| parse_error(b).map(|e| (e.kerror, e.server_code, e.msg.len())).is_some());
     }
 }

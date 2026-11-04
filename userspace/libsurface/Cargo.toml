@@ -21,3 +21,6 @@ libos = { path = "../libos" }
 [lib]
 name = "libsurface"
 path = "src/lib.rs"
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }

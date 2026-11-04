@@ -13,31 +13,38 @@ extern crate alloc;
 
 pub mod ipc;
 
+#[cfg(test)]
+mod ipc_tests;
+
 use alloc::vec::Vec;
 use libkern::scrub;
+use libos::{Channel, Deadline, Only, Ref, WaitSet};
 use librsproto::{OP_TTY_INTERRUPT, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE, TTY_MODE_ECHO};
 
-use ipc::{recv, send, wait};
+use ipc::{borrowed, ready, receive, transmit};
 
 /// One exchange with the terminal, stepping over an `Interrupt` and recording it in `interrupted`:
 /// `Ctrl-C` at a password prompt means "never mind".
-fn tty(term: u64, op: u16, body: &[u8], interrupted: &mut bool) -> Option<(bool, Vec<u8>)> {
-    if !send(term, op, 1, body, &[]) {
+fn tty(term: Ref<'_, Channel, Only>, op: u16, body: &[u8], interrupted: &mut bool) -> Option<(bool, Vec<u8>)> {
+    if !transmit(term, op, 1, body, &mut libos::Carried::new()) {
         return None;
     }
+    let mut set = WaitSet::<1>::new();
+    set.add(term).ok()?;
     loop {
-        wait(&[term])?;
-        match recv(term) {
+        ready(&set, Deadline::NEVER)?;
+        match receive(term) {
             Ok(Some((OP_TTY_INTERRUPT, 0, _, _))) => *interrupted = true,
             Ok(Some((_, 1, err, body))) => return Some((err, body)),
             Ok(_) => continue,
-            Err(()) => return None,
+            Err(_) => return None,
         }
     }
 }
 
 /// Ask for a line on `term`, echo on. `None` on `Ctrl-C`, `Ctrl-D` or a terminal failure.
-pub fn ask_line(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
+pub fn ask_line_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, prompt: &[u8]) -> Option<Vec<u8>> {
+    let term = term.into();
     let mut interrupted = false;
     let _ = tty(term, OP_TTY_SET_MODE, &[TTY_MODE_ECHO], &mut interrupted);
     let _ = tty(term, OP_TTY_WRITE, prompt, &mut interrupted);
@@ -47,14 +54,33 @@ pub fn ask_line(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Ask for a password on `term`, echo off. `None` on `Ctrl-C`, `Ctrl-D` or a terminal failure.
-pub fn ask_password(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
-    ask_password_then(term, prompt, &mut || {})
+/// Ask for a line on `term`, echo on. For callers not yet on libos; the typed form is
+/// [`ask_line_on`].
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+pub fn ask_line(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
+    ask_line_on(borrowed(term), prompt)
 }
 
-/// [`ask_password`], calling `asked` once echo is off and before the read: a gate waiting on a
+/// Ask for a password on `term`, echo off. `None` on `Ctrl-C`, `Ctrl-D` or a terminal failure.
+pub fn ask_password_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, prompt: &[u8]) -> Option<Vec<u8>> {
+    ask_password_then_on(term, prompt, &mut || {})
+}
+
+/// Ask for a password on `term`, echo off. For callers not yet on libos; the typed form is
+/// [`ask_password_on`].
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+pub fn ask_password(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
+    ask_password_on(borrowed(term), prompt)
+}
+
+/// [`ask_password_on`], calling `asked` once echo is off and before the read: a gate waiting on a
 /// line the program logs there cannot type the password while echo is still on.
-pub fn ask_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut()) -> Option<Vec<u8>> {
+pub fn ask_password_then_on<'a>(
+    term: impl Into<Ref<'a, Channel, Only>>,
+    prompt: &[u8],
+    asked: &mut dyn FnMut(),
+) -> Option<Vec<u8>> {
+    let term = term.into();
     let mut interrupted = false;
     let _ = tty(term, OP_TTY_SET_MODE, &[0], &mut interrupted);
     let _ = tty(term, OP_TTY_WRITE, prompt, &mut interrupted);
@@ -71,6 +97,13 @@ pub fn ask_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut()) -> O
         }
         None => None,
     }
+}
+
+/// [`ask_password_on`] with `asked`. For callers not yet on libos; the typed form is
+/// [`ask_password_then_on`].
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+pub fn ask_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut()) -> Option<Vec<u8>> {
+    ask_password_then_on(borrowed(term), prompt, asked)
 }
 
 /// Why [`ask_new_password`] has no password to give.
@@ -96,20 +129,39 @@ impl NewPassword {
 }
 
 /// A new password typed twice on `term`, then [`confirm`]ed.
-pub fn ask_new_password(term: u64, prompt: &[u8]) -> Result<Vec<u8>, NewPassword> {
-    ask_new_password_then(term, prompt, &mut |_| {})
+pub fn ask_new_password_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, prompt: &[u8]) -> Result<Vec<u8>, NewPassword> {
+    ask_new_password_then_on(term, prompt, &mut |_| {})
 }
 
-/// [`ask_new_password`], calling `asked` with `1` and then `2` as each read is ready, echo off.
+/// A new password typed twice on `term`, then [`confirm`]ed. For callers not yet on libos; the
+/// typed form is [`ask_new_password_on`].
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+pub fn ask_new_password(term: u64, prompt: &[u8]) -> Result<Vec<u8>, NewPassword> {
+    ask_new_password_on(borrowed(term), prompt)
+}
+
+/// [`ask_new_password_on`], calling `asked` with `1` and then `2` as each read is ready, echo off.
 /// Echo goes back on between the two reads, so one receipt for both would let the second copy be
 /// typed while it was on.
-pub fn ask_new_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut(u8)) -> Result<Vec<u8>, NewPassword> {
-    let mut first = ask_password_then(term, prompt, &mut || asked(1)).ok_or(NewPassword::Cancelled)?;
-    let Some(second) = ask_password_then(term, b"again: ", &mut || asked(2)) else {
+pub fn ask_new_password_then_on<'a>(
+    term: impl Into<Ref<'a, Channel, Only>>,
+    prompt: &[u8],
+    asked: &mut dyn FnMut(u8),
+) -> Result<Vec<u8>, NewPassword> {
+    let term = term.into();
+    let mut first = ask_password_then_on(term, prompt, &mut || asked(1)).ok_or(NewPassword::Cancelled)?;
+    let Some(second) = ask_password_then_on(term, b"again: ", &mut || asked(2)) else {
         scrub(&mut first);
         return Err(NewPassword::Cancelled);
     };
     confirm(first, second)
+}
+
+/// [`ask_new_password_on`] with `asked`. For callers not yet on libos; the typed form is
+/// [`ask_new_password_then_on`].
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+pub fn ask_new_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut(u8)) -> Result<Vec<u8>, NewPassword> {
+    ask_new_password_then_on(borrowed(term), prompt, asked)
 }
 
 /// The password typed twice, if the two agree and it keeps the rules. The second copy is always

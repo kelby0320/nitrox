@@ -16,16 +16,7 @@
 "userspace/hello" = 58
 "userspace/init" = 99
 "userspace/input-server" = 56
-"userspace/libdraw" = 2
-"userspace/libfs" = 32
-"userspace/libfsserver" = 36
 "userspace/libheap" = 5
-"userspace/liblog" = 5
-"userspace/libprompt" = 4
-"userspace/librsproto" = 11
-"userspace/libsession" = 59
-"userspace/libstream" = 12
-"userspace/libsurface" = 14
 "userspace/logging-service" = 10
 "userspace/nxedit" = 61
 "userspace/nxfiles" = 61

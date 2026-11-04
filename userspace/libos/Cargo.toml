@@ -7,6 +7,13 @@ edition = "2024"
 # The raw syscall surface + ABI types. libos is the typed/async layer over it.
 libkern = { path = "../libkern" }
 
+[features]
+# The kernel's model under `sys`, for a crate's host tests: `libos = { ..., features = ["mock"] }`
+# among its dev-dependencies. Only an unwinding build takes it: the model needs `std`, which a
+# binary, aborting and with its own panic handler, cannot link, so every binary keeps the real calls.
+mock = []
+
 [lib]
 name = "libos"
 path = "src/lib.rs"
+

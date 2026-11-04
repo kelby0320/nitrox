@@ -11,7 +11,7 @@
 //! `tier`, `timestamp`, `sequence`) are supplied by the logging service from the channel the
 //! record arrived on and never appear on the wire.
 
-use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+use crate::{Reader, put_u16, put_u32, put_u64};
 
 /// Severity levels, matching `LogLevel` in the architecture doc.
 pub const LEVEL_TRACE: u8 = 0;
@@ -136,36 +136,15 @@ pub fn encode_append(
 
 /// Parse a log-append body; rejects a truncated header, message or source. `fields` is not decoded.
 pub fn parse_append(body: &[u8]) -> Option<LogAppend<'_>> {
-    if body.len() < LOG_HEADER_LEN {
-        return None;
-    }
-    let level = body[0];
-    let flags = body[1];
-    let field_count = get_u16(body, 2);
-    let message_len = get_u32(body, 4) as usize;
-    let span = get_u64(body, 8);
-    let trace = get_u64(body, 16);
-
-    let msg_end = LOG_HEADER_LEN.checked_add(message_len)?;
-    if body.len() < msg_end {
-        return None;
-    }
-    let message = &body[LOG_HEADER_LEN..msg_end];
-
-    let source = if flags & LOG_FLAG_HAS_SOURCE != 0 {
-        if body.len() < msg_end + 2 {
-            return None;
-        }
-        let source_len = get_u16(body, msg_end) as usize;
-        let src_start = msg_end + 2;
-        let src_end = src_start.checked_add(source_len)?;
-        if body.len() < src_end {
-            return None;
-        }
-        Some(&body[src_start..src_end])
-    } else {
-        None
-    };
+    let mut r = Reader::new(body);
+    let level = r.u8()?;
+    let flags = r.u8()?;
+    let field_count = r.u16()?;
+    let message_len = r.u32()?;
+    let span = r.u64()?;
+    let trace = r.u64()?;
+    let message = r.bytes(message_len as usize)?;
+    let source = if flags & LOG_FLAG_HAS_SOURCE != 0 { Some(r.lenpfx_u16()?) } else { None };
 
     Some(LogAppend {
         level,
@@ -195,7 +174,10 @@ pub fn read_request(after: u64, max: u32) -> [u8; READ_REQUEST_LEN] {
 
 /// Parse a `Read` request: `(after, max)`, or `None` unless the body is [`READ_REQUEST_LEN`] bytes.
 pub fn parse_read_request(body: &[u8]) -> Option<(u64, u32)> {
-    (body.len() == READ_REQUEST_LEN).then(|| (get_u64(body, 0), get_u32(body, 8)))
+    let mut r = Reader::new(body);
+    let (after, max) = (r.u64()?, r.u32()?);
+    r.finish()?;
+    Some((after, max))
 }
 
 /// A `Read` reply's header: `count: u32`, `flags: u32` (reserved, `0`), and `oldest: u64` — the
@@ -319,23 +301,24 @@ pub struct ReadReply<'a> {
 /// **A reader is fed bytes no writer makes** — a count past the records, a length past the
 /// body, bytes after the last record, a sequence that does not rise — and must refuse each.
 pub fn parse_read_reply(body: &[u8]) -> Option<ReadReply<'_>> {
-    if body.len() < READ_REPLY_HEADER_LEN || get_u32(body, 4) != 0 {
+    let mut r = Reader::new(body);
+    let count = r.u32()?;
+    if r.u32()? != 0 {
         return None;
     }
-    let count = get_u32(body, 0);
-    let oldest = get_u64(body, 8);
-    let records = &body[READ_REPLY_HEADER_LEN..];
-    let mut off = 0usize;
+    let oldest = r.u64()?;
+    let records = r.rest();
+    let mut r = Reader::new(records);
     let mut last: Option<u64> = None;
     for _ in 0..count {
-        let rec = record_at(records, off)?;
+        let rec = read_record(&mut r)?;
         if last.is_some_and(|l| rec.sequence <= l) || rec.sequence == 0 {
             return None;
         }
         last = Some(rec.sequence);
-        off += rec.encoded_len();
     }
-    (off == records.len()).then_some(ReadReply { oldest, count, records })
+    r.finish()?;
+    Some(ReadReply { oldest, count, records })
 }
 
 /// **How many records a reader lost** between the last sequence it read, `after`, and a reply
@@ -348,14 +331,13 @@ pub fn dropped(after: u64, oldest: u64) -> u64 {
 impl<'a> ReadReply<'a> {
     /// The records, oldest first.
     pub fn records(&self) -> ReadRecords<'a> {
-        ReadRecords { records: self.records, off: 0, left: self.count }
+        ReadRecords { records: Reader::new(self.records), left: self.count }
     }
 }
 
 /// The records of a checked [`ReadReply`].
 pub struct ReadRecords<'a> {
-    records: &'a [u8],
-    off: usize,
+    records: Reader<'a>,
     left: u32,
 }
 
@@ -366,33 +348,34 @@ impl<'a> Iterator for ReadRecords<'a> {
         if self.left == 0 {
             return None;
         }
-        // Checked whole by `parse_read_reply`, so this cannot miss; `?` all the same.
-        let rec = record_at(self.records, self.off)?;
-        self.off += rec.encoded_len();
-        self.left -= 1;
-        Some(rec)
+        let rec = read_record(&mut self.records);
+        self.left = if rec.is_some() { self.left - 1 } else { 0 };
+        rec
     }
 }
 
-/// The record at `off`, or `None` if it or its strings run past the end or its principal is empty.
-fn record_at(records: &[u8], off: usize) -> Option<ReadRecord<'_>> {
-    let fixed = records.get(off..off.checked_add(RECORD_HEADER_LEN)?)?;
-    let (plen, slen, mlen) = (get_u16(fixed, 26) as usize, get_u16(fixed, 28) as usize, get_u16(fixed, 30) as usize);
-    let start = off + RECORD_HEADER_LEN;
-    let strings = records.get(start..start + plen + slen + mlen)?;
-    if plen == 0 {
+/// The record at the reader, or `None` if it or its strings run past the end or its principal is empty.
+fn read_record<'a>(r: &mut Reader<'a>) -> Option<ReadRecord<'a>> {
+    let sequence = r.u64()?;
+    let time = r.u64()?;
+    let timestamp = r.u64()?;
+    let (tier, level) = (r.u8()?, r.u8()?);
+    let (plen, slen, mlen) = (r.u16()?, r.u16()?, r.u16()?);
+    let principal = r.bytes(plen as usize)?;
+    let source = r.bytes(slen as usize)?;
+    let message = r.bytes(mlen as usize)?;
+    if principal.is_empty() {
         return None;
     }
-    let time = get_u64(fixed, 8);
     Some(ReadRecord {
-        sequence: get_u64(fixed, 0),
+        sequence,
         time: (time != 0).then_some(time),
-        timestamp: get_u64(fixed, 16),
-        tier: fixed[24],
-        level: fixed[25],
-        principal: &strings[..plen],
-        source: (slen != 0).then(|| &strings[plen..plen + slen]),
-        message: &strings[plen + slen..],
+        timestamp,
+        tier,
+        level,
+        principal,
+        source: (!source.is_empty()).then_some(source),
+        message,
     })
 }
 
@@ -511,8 +494,8 @@ mod tests {
         // can refuse it.
         refused(
             &|b| {
-                let plen = super::get_u16(b, first + 26);
-                let mlen = super::get_u16(b, first + 30);
+                let plen = u16::from_le_bytes([b[first + 26], b[first + 27]]);
+                let mlen = u16::from_le_bytes([b[first + 30], b[first + 31]]);
                 super::put_u16(b, first + 26, 0);
                 super::put_u16(b, first + 30, mlen + plen);
             },
@@ -577,5 +560,22 @@ mod tests {
         let n = encode_append(&mut buf2, LEVEL_INFO, b"hi", None, None, None).unwrap();
         buf2[1] |= LOG_FLAG_HAS_SOURCE; // lie: claim a source that isn't there
         assert!(parse_append(&buf2[..n]).is_none());
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut buf = [0u8; 128];
+        let n = encode_append(&mut buf, LEVEL_ERROR, b"disk full", Some(1), Some(2), Some(b"worker")).unwrap();
+        refuses_every_prefix(&buf[..n], |b| parse_append(b).filter(|a| a.source.is_some()).is_some());
+        let (n, ..) = (encode_append(&mut buf, LEVEL_INFO, b"hi", None, None, None).unwrap(),);
+        survives_corruption(&buf[..n], |x| parse_append(x).is_some());
+        let req = read_request(5, 6);
+        refuses_every_prefix(&req, |x| parse_read_request(x).is_some());
+        let good = reply(3, &two());
+        survives_corruption(&good, |b| parse_read_reply(b).map(|r| r.records().count()).is_some());
+        for k in 0..good.len() {
+            assert!(parse_read_reply(&good[..k]).is_none(), "prefix of {k}");
+        }
     }
 }

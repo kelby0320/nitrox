@@ -18,6 +18,7 @@ edition = "2024"
 # `libsurface` rather than leaving the buffer-ordering rule inside `nxterm`.
 [dependencies]
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 # `io` for `session::Dir` — the directory client this crate's file half sits beside.
 # Declared here rather than inherited from `coreutils`: feature unification made the
 # workspace build pass while `cargo test -p libfs` alone did not, which is the shape of
@@ -27,3 +28,6 @@ librsproto = { path = "../librsproto", features = ["io"] }
 [lib]
 name = "libfs"
 path = "src/lib.rs"
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }

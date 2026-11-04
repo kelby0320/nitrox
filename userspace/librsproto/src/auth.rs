@@ -8,7 +8,7 @@
 //! The password crosses the channel in cleartext (a kernel-mediated local IPC, no network);
 //! the server hashes it and stores only a one-way verifier.
 
-use crate::{get_u16, put_u16};
+use crate::{Reader, put_u16};
 
 /// Fixed prefix of an `AuthenticateRequest` (before the username/password bytes).
 pub const AUTH_REQUEST_PREFIX_LEN: usize = 4;
@@ -48,17 +48,10 @@ pub fn build_authenticate_request(out: &mut [u8], username: &[u8], password: &[u
 
 /// Parse an `AuthenticateRequest` body.
 pub fn parse_authenticate_request(body: &[u8]) -> Option<AuthenticateRequest<'_>> {
-    if body.len() < AUTH_REQUEST_PREFIX_LEN {
-        return None;
-    }
-    let ulen = get_u16(body, 0) as usize;
-    let plen = get_u16(body, 2) as usize;
-    let u_end = AUTH_REQUEST_PREFIX_LEN.checked_add(ulen)?;
-    let p_end = u_end.checked_add(plen)?;
-    if body.len() < p_end {
-        return None;
-    }
-    Some(AuthenticateRequest { username: &body[AUTH_REQUEST_PREFIX_LEN..u_end], password: &body[u_end..p_end] })
+    let mut r = Reader::new(body);
+    let ulen = r.u16()?;
+    let plen = r.u16()?;
+    Some(AuthenticateRequest { username: r.bytes(ulen as usize)?, password: r.bytes(plen as usize)? })
 }
 
 /// A parsed `AuthenticateReply`.
@@ -105,18 +98,12 @@ pub fn build_denied_reply(out: &mut [u8]) -> Option<usize> {
 
 /// Parse an `AuthenticateReply` body.
 pub fn parse_authenticate_reply(body: &[u8]) -> Option<AuthenticateReply<'_>> {
-    if body.len() < AUTH_REPLY_PREFIX_LEN {
-        return None;
-    }
-    let result = get_u16(body, 0);
-    let plen = get_u16(body, 2) as usize;
-    let hlen = get_u16(body, 4) as usize;
-    let p_end = AUTH_REPLY_PREFIX_LEN.checked_add(plen)?;
-    let h_end = p_end.checked_add(hlen)?;
-    if body.len() < h_end {
-        return None;
-    }
-    Some(AuthenticateReply { result, principal: &body[AUTH_REPLY_PREFIX_LEN..p_end], home: &body[p_end..h_end] })
+    let mut r = Reader::new(body);
+    let result = r.u16()?;
+    let plen = r.u16()?;
+    let hlen = r.u16()?;
+    r.skip(2)?;
+    Some(AuthenticateReply { result, principal: r.bytes(plen as usize)?, home: r.bytes(hlen as usize)? })
 }
 
 /// `Auth::List` — every account's name and home. Asked on an admin session.
@@ -191,16 +178,18 @@ pub struct AccountList<'a> {
 
 /// Parse a `List` reply; `None` if an entry runs past the body or the entries do not fill it.
 pub fn parse_account_list(body: &[u8]) -> Option<AccountList<'_>> {
-    if body.len() < 2 {
-        return None;
-    }
-    let count = get_u16(body, 0);
-    let list = AccountList { body, count };
-    let mut end = 2;
+    let mut r = Reader::new(body);
+    let count = r.u16()?;
     for _ in 0..count {
-        end = list.entry_end(end)?;
+        entry(&mut r)?;
     }
-    (end == body.len()).then_some(list)
+    r.finish()?;
+    Some(AccountList { body, count })
+}
+
+/// One `List` entry: a `u8`-prefixed name, then a `u8`-prefixed home.
+fn entry<'a>(r: &mut Reader<'a>) -> Option<(&'a [u8], &'a [u8])> {
+    Some((r.lenpfx_u8()?, r.lenpfx_u8()?))
 }
 
 impl<'a> AccountList<'a> {
@@ -216,26 +205,9 @@ impl<'a> AccountList<'a> {
 
     /// Each account's `(name, home)`, in the order the service gave them.
     pub fn iter(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + '_ {
-        let body = self.body;
-        let mut at = 2;
-        (0..self.count).map(move |_| {
-            let nl = body[at] as usize;
-            let name = &body[at + 1..at + 1 + nl];
-            let h = at + 1 + nl;
-            let hl = body[h] as usize;
-            let home = &body[h + 1..h + 1 + hl];
-            at = h + 1 + hl;
-            (name, home)
-        })
-    }
-
-    /// Where the entry starting at `at` ends, if it fits.
-    fn entry_end(&self, at: usize) -> Option<usize> {
-        let nl = *self.body.get(at)? as usize;
-        let h = at.checked_add(1 + nl)?;
-        let hl = *self.body.get(h)? as usize;
-        let end = h.checked_add(1 + hl)?;
-        (end <= self.body.len()).then_some(end)
+        let mut r = Reader::new(self.body);
+        let _ = r.skip(2);
+        (0..self.count).map_while(move |_| entry(&mut r))
     }
 }
 
@@ -343,5 +315,22 @@ mod tests {
         let mut tiny = [0u8; 3];
         assert!(build_authenticate_request(&mut tiny, b"x", b"y").is_none());
         assert!(build_authenticate_reply(&mut tiny, AUTH_RESULT_DENIED, b"", b"").is_none());
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 64];
+        let n = build_authenticate_request(&mut b, b"alice", b"pw").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_authenticate_request(x).is_some());
+        refuses_every_prefix(&b[..n], |x| parse_account_request(x).is_some());
+        let n = build_authenticate_reply(&mut b, AUTH_RESULT_AUTHENTICATED, b"alice", b"/home/alice").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_authenticate_reply(x).is_some());
+        let mut w = AccountListWriter::new(&mut b).unwrap();
+        w.push(b"alice", b"/home/alice").unwrap();
+        w.push(b"bob", b"/").unwrap();
+        let n = w.finish();
+        refuses_every_prefix(&b[..n], |x| parse_account_list(x).is_some());
+        survives_corruption(&b[..n], |x| parse_account_list(x).map(|l| l.iter().count()).is_some());
     }
 }

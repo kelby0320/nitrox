@@ -28,7 +28,7 @@
 //! Counts, serials, lengths and kinds — never bytes: a clipboard eventually holds a password,
 //! and the serial console is a log file.
 
-use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+use crate::{Reader, put_u16, put_u32, put_u64};
 
 /// `Clipboard::Copy` — push an entry onto the ring. Body: [`ClipEntry`] without its serial.
 ///
@@ -202,18 +202,15 @@ impl<'a> ClipEntry<'a> {
     ///
     /// **The declared length is checked against what arrived**, not trusted.
     pub fn read(b: &'a [u8]) -> Option<ClipEntry<'a>> {
-        if b.len() < CLIP_ENTRY_HEAD {
+        let mut r = Reader::new(b);
+        let serial = r.u64()?;
+        let kind = r.u16()?;
+        let len = r.u32()? as usize;
+        r.skip(2)?;
+        if len > MAX_CLIP_BYTES {
             return None;
         }
-        let len = get_u32(b, 10) as usize;
-        if len > MAX_CLIP_BYTES || b.len() < CLIP_ENTRY_HEAD + len {
-            return None;
-        }
-        Some(ClipEntry {
-            serial: get_u64(b, 0),
-            kind: get_u16(b, 8),
-            bytes: &b[CLIP_ENTRY_HEAD..CLIP_ENTRY_HEAD + len],
-        })
+        Some(ClipEntry { serial, kind, bytes: r.bytes(len)? })
     }
 }
 
@@ -244,10 +241,10 @@ impl ClipPaste {
 
     /// Parse from `b`.
     pub fn read(b: &[u8]) -> Option<ClipPaste> {
-        if b.len() < CLIP_PASTE_LEN {
-            return None;
-        }
-        Some(ClipPaste { index: get_u32(b, 0), expect: get_u64(b, 8) })
+        let mut r = Reader::new(b);
+        let index = r.u32()?;
+        r.skip(4)?;
+        Some(ClipPaste { index, expect: r.u64()? })
     }
 }
 
@@ -299,14 +296,14 @@ impl<'a> ClipList<'a> {
     /// **The declared count is checked against the bytes that arrived** (a peer-controlled
     /// length).
     pub fn read(b: &'a [u8]) -> Option<ClipList<'a>> {
-        if b.len() < CLIP_LIST_HEAD {
+        let mut r = Reader::new(b);
+        let serial = r.u64()?;
+        let count = r.u32()? as usize;
+        r.skip(4)?;
+        if count > CLIP_RING {
             return None;
         }
-        let count = get_u32(b, 8) as usize;
-        if count > CLIP_RING || b.len() < CLIP_LIST_HEAD + count * CLIP_INFO_LEN {
-            return None;
-        }
-        Some(ClipList { serial: get_u64(b, 0), rows: &b[CLIP_LIST_HEAD..], count })
+        Some(ClipList { serial, rows: r.bytes(count * CLIP_INFO_LEN)?, count })
     }
 
     /// How many entries the ring holds.
@@ -316,22 +313,22 @@ impl<'a> ClipList<'a> {
 
     /// The rows, newest first.
     pub fn entries(&self) -> impl Iterator<Item = ClipInfo> + '_ {
-        (0..self.count).map(move |i| {
-            let o = i * CLIP_INFO_LEN;
-            ClipInfo { kind: get_u16(self.rows, o), len: get_u32(self.rows, o + 4) }
+        let mut r = Reader::new(self.rows);
+        (0..self.count).map_while(move |_| {
+            let kind = r.u16()?;
+            r.skip(2)?;
+            Some(ClipInfo { kind, len: r.u32()? })
         })
     }
 }
 
 /// A connection to the clipboard server — the `/dev/clipboard` session.
 ///
-/// Shaped like [`Desktop`](crate::desktop::Desktop): `connect`, `from_endpoint`, explicit
-/// `close`, borrowed buffer.
+/// Shaped like [`Desktop`](crate::desktop::Desktop): `resolve` or `new` for a client that closes
+/// its endpoint on drop, the raw `connect` and `from_endpoint` for one closed only by `close`.
 #[cfg(feature = "io")]
 pub struct Clipboard<'a> {
-    endpoint: u64,
-    buf: &'a mut [u8],
-    next_request_id: u64,
+    session: crate::session::Session<'a>,
 }
 
 /// What a `/dev/clipboard` request can fail with.
@@ -370,58 +367,69 @@ impl ClipError {
 }
 
 #[cfg(feature = "io")]
+impl From<crate::session::WireError> for ClipError {
+    fn from(e: crate::session::WireError) -> Self {
+        match e {
+            crate::session::WireError::Transport(c) => ClipError::Transport(c),
+            crate::session::WireError::Protocol => ClipError::Protocol,
+        }
+    }
+}
+
+#[cfg(feature = "io")]
 impl<'a> Clipboard<'a> {
-    /// Resolve `/dev/clipboard` in `ns` and wrap the session it answers with.
-    ///
-    /// `buf` must be at least [`IPC_MSG_SIZE`](libkern::abi::IPC_MSG_SIZE) bytes.
-    pub fn connect(ns: u64, buf: &'a mut [u8]) -> Result<Clipboard<'a>, ClipError> {
-        use libkern::abi::IPC_MSG_SIZE;
-        use libkern::syscall::{SYS_NS_LOOKUP, syscall4};
-        if buf.len() < IPC_MSG_SIZE {
-            return Err(ClipError::Protocol);
-        }
-        let path = b"/dev/clipboard";
-        // SAFETY: a valid path slice and a namespace handle this process holds.
-        let po = unsafe {
-            syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, crate::session::DIR_SESSION_RIGHTS)
-        };
-        if po < 0 {
-            return Err(ClipError::Transport(po as i32));
-        }
-        let (status, endpoint) = crate::session::po_wait(po as u64);
-        if status < 0 {
-            return Err(ClipError::Transport(status));
-        }
-        if endpoint == 0 {
-            return Err(ClipError::Protocol);
-        }
-        Ok(Clipboard { endpoint, buf, next_request_id: 1 })
+    /// Resolve `/dev/clipboard` in `ns` and wrap the session it answers with, which the client
+    /// owns and closes.
+    pub fn resolve<'n, M: libos::CanLookup + 'n>(
+        ns: impl Into<libos::Ref<'n, libos::Namespace, M>>,
+        msg: &'a mut libos::Msg,
+    ) -> Result<Clipboard<'a>, ClipError> {
+        Ok(Self::new(crate::session::connect(ns, "/dev/clipboard").map_err(ClipError::from)?, msg))
     }
 
-    /// Wrap an endpoint resolved elsewhere. Takes ownership: [`close`](Self::close) closes it.
+    /// Wrap an endpoint resolved elsewhere, which the client owns and closes.
+    pub fn new(endpoint: libos::Handle<libos::Channel, libos::Only>, msg: &'a mut libos::Msg) -> Clipboard<'a> {
+        Clipboard { session: crate::session::Session::new(endpoint, msg) }
+    }
+
+    /// Resolve `/dev/clipboard` in `ns` and wrap the session it answers with.
+    ///
+    /// `buf` must be at least [`IPC_MSG_SIZE`](libkern::abi::IPC_MSG_SIZE) bytes. For callers not
+    /// yet on libos; the typed form is [`resolve`](Self::resolve).
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub fn connect(ns: u64, buf: &'a mut [u8]) -> Result<Clipboard<'a>, ClipError> {
+        if buf.len() < libkern::abi::IPC_MSG_SIZE {
+            return Err(ClipError::Protocol);
+        }
+        // SAFETY: the caller's own namespace handle, open for the call, as this has always asked.
+        let ns = unsafe {
+            libos::Ref::<libos::Namespace, libos::NsReadOnly>::from_raw(
+                libkern::RawHandle(ns),
+                libkern::Rights::empty(),
+            )
+        };
+        let endpoint = crate::session::connect(ns, "/dev/clipboard").map_err(ClipError::from)?;
+        Ok(Clipboard { session: crate::session::Session::raw(endpoint.into_raw().0, buf) })
+    }
+
+    /// Wrap an endpoint resolved elsewhere. Takes ownership: [`close`](Self::close) closes it. For
+    /// callers not yet on libos; the typed form is [`new`](Self::new).
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
     pub fn from_endpoint(endpoint: u64, buf: &'a mut [u8]) -> Result<Clipboard<'a>, ClipError> {
         if buf.len() < libkern::abi::IPC_MSG_SIZE {
             return Err(ClipError::Protocol);
         }
-        Ok(Clipboard { endpoint, buf, next_request_id: 1 })
+        Ok(Clipboard { session: crate::session::Session::raw(endpoint, buf) })
     }
 
-    /// Close the session's endpoint. Explicit rather than a `Drop`, for `Dir`'s reason.
+    /// Close the session's endpoint, whichever way the client holds it.
     pub fn close(self) {
-        // SAFETY: closing an endpoint this session owns.
-        unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, self.endpoint) };
+        self.session.close();
     }
 
     /// Send one request and copy its reply body into `out`, returning the length written.
     fn request(&mut self, op: u16, body: &[u8], out: &mut [u8]) -> Result<usize, ClipError> {
-        let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let len = crate::session::round_trip(self.endpoint, self.buf, request_id, op, body).map_err(|e| match e {
-            crate::session::WireError::Transport(c) => ClipError::Transport(c),
-            crate::session::WireError::Protocol => ClipError::Protocol,
-        })?;
-        let off = crate::session::PAYLOAD_OFF;
-        let payload = &self.buf[off..off + len];
+        let payload = self.session.call(op, body).map_err(ClipError::from)?;
         let msg = crate::decode(payload).map_err(|_| ClipError::Transport(0))?;
         if msg.flags & crate::RS_FLAG_ERROR != 0 {
             // Parsed as an `ErrorBody`: here the finer code is the answer.
@@ -489,6 +497,19 @@ impl<'a> Clipboard<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 64];
+        let n = ClipEntry { serial: 4, kind: CLIP_KIND_TEXT, bytes: b"hello" }.write(&mut b).unwrap();
+        refuses_every_prefix(&b[..n], |x| ClipEntry::read(x).is_some());
+        let n = ClipPaste { index: 2, expect: 7 }.write(&mut b).unwrap();
+        refuses_every_prefix(&b[..n], |x| ClipPaste::read(x).is_some());
+        let rows = [ClipInfo { kind: CLIP_KIND_TEXT, len: 5 }, ClipInfo { kind: CLIP_KIND_TEXT, len: 9 }];
+        let n = write_list(&mut b, 3, &rows).unwrap();
+        refuses_every_prefix(&b[..n], |x| ClipList::read(x).map(|l| l.entries().count()).is_some());
+    }
 
     #[test]
     fn paths_round_trip() {
@@ -605,5 +626,49 @@ mod tests {
     #[test]
     fn the_any_serial_sentinel_is_not_a_serial_the_ring_can_reach() {
         assert_eq!(CLIP_ANY_SERIAL, 0);
+    }
+
+    #[cfg(feature = "io")]
+    mod io {
+        use super::*;
+        use crate::session::fixture::{queue, request, service};
+        use libos::{Msg, mock};
+
+        #[test]
+        fn a_copy_is_sent_to_the_clipboard_and_its_serial_comes_back() {
+            mock::reset();
+            let (ns, peer) = service("/dev/clipboard");
+            let mut msg = Msg::new();
+            let mut clip = Clipboard::resolve(ns, &mut msg).unwrap();
+            let open = mock::open_handles();
+            queue(peer, 1, OP_CLIP_COPY, crate::RS_FLAG_REPLY, &7u64.to_le_bytes());
+            assert_eq!(clip.copy(1, b"text"), Ok(7));
+            let (id, op, body) = request(peer);
+            assert_eq!((id, op), (1, OP_CLIP_COPY));
+            assert_eq!(ClipEntry::read(&body).unwrap().bytes, b"text");
+            drop(clip);
+            assert_eq!(mock::open_handles(), open - 1, "the endpoint goes with the client");
+        }
+
+        #[test]
+        fn a_missing_clipboard_is_a_transport_fault_and_a_raw_client_closes_only_by_close() {
+            mock::reset();
+            let (ns, _peer) = service("/dev/clipboard");
+            let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+            assert!(matches!(Clipboard::connect(0, &mut buf[..16]), Err(ClipError::Protocol)));
+            let (other, _p) = service("/dev/other");
+            assert_eq!(
+                Clipboard::resolve(other, &mut Msg::new()).err(),
+                Some(ClipError::Transport(libkern::KError::NotFound.as_i32()))
+            );
+            let clip = Clipboard::connect(ns.raw().0, &mut buf).unwrap();
+            let open = mock::open_handles();
+            drop(clip);
+            assert_eq!(mock::open_handles(), open, "a raw client is closed by `close` alone");
+            let clip = Clipboard::connect(ns.raw().0, &mut buf).unwrap();
+            clip.close();
+            assert_eq!(mock::open_handles(), open);
+            assert_eq!(mock::stray_closes(), 0);
+        }
     }
 }

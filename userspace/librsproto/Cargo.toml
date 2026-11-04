@@ -9,12 +9,16 @@ edition = "2024"
 # in IpcMsg.handles, managed by the caller. Under `cargo test` it builds as a host
 # `std` crate so the round-trip logic is unit-tested.
 [dependencies]
-# The `session` client (`Dir`) drives real IPC, so it needs the raw syscall layer —
+# The session clients (`Dir`, `Desktop`, `Clipboard`) drive real IPC, so they need libos and the ABI —
 # but only under the `io` feature, so the codec core keeps its no-dependency,
 # host-testable shape. Off by default; a bin that talks to a directory server
 # enables it. Same seam as `libstream`'s `io` feature.
 libkern = { path = "../libkern", optional = true }
+libos = { path = "../libos", optional = true }
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }
 
 [features]
 # The syscall-backed directory-session client (`session::Dir`).
-io = ["dep:libkern"]
+io = ["dep:libkern", "dep:libos"]

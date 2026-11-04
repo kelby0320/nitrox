@@ -153,6 +153,8 @@ mod tests {
         let ep = ep.without_transfer().unwrap();
         ns.bind_server("/srv", ep.as_ref(), "/home/alice").unwrap();
         ns.bind("/srv2", &ep).unwrap();
+        assert_eq!(sys::bound_base(ns.raw().0, "/srv").as_deref(), Some(&b"/home/alice"[..]));
+        assert_eq!(sys::bound_base(ns.raw().0, "/srv2").as_deref(), Some(&b""[..]));
         let got: Handle<Memory, MapRead> = block_on(ns.lookup("/srv/notes", Rights::MAP_READ)).unwrap();
         assert!(got.map(4096).is_ok(), "the server's answer");
         let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
@@ -162,6 +164,26 @@ mod tests {
             "a base on a direct bind"
         );
         assert_eq!(ns.bind_server("/srv3", ep.as_ref(), "/").err().unwrap().code(), KError::InvalidArgument);
+    }
+
+    #[test]
+    fn a_server_can_answer_with_an_endpoint_whose_peer_reads_what_is_sent() {
+        sys::reset();
+        let (root, peer) = sys::answering("/log/x");
+        // SAFETY: the mock's handles, open for the test.
+        let (root, peer) = unsafe {
+            (
+                Ref::<Namespace, NsReadOnly>::from_raw(libkern::RawHandle(root), Rights::empty()),
+                Ref::<Channel, Only>::from_raw(libkern::RawHandle(peer), Rights::empty()),
+            )
+        };
+        let ep: Handle<Channel, Only> = block_on(root.lookup("/log/x", Rights::SEND)).unwrap();
+        let mut m = crate::Msg::new();
+        m.set(b"hi").unwrap();
+        ep.send(&m, &mut crate::Carried::new()).unwrap();
+        let mut got = crate::Msg::new();
+        peer.recv(&mut got).unwrap();
+        assert_eq!(got.payload(), b"hi");
     }
 
     #[test]

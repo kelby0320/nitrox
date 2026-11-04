@@ -13,8 +13,11 @@ libkern = { path = "../libkern" }
 librsproto = { path = "../librsproto" }
 # The password rules `confirm` holds a new password to.
 libusers = { path = "../libusers" }
-# `lookup_wait`, for `ipc::lookup`.
-libfs = { path = "../libfs" }
+# The syscall layer: channels, waits and lookups.
+libos = { path = "../libos" }
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }
 
 [lib]
 name = "libprompt"

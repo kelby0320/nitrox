@@ -5,7 +5,7 @@
 //! then sends [`Commit`](build_commit_request) per frame, the compositor answering
 //! [`Release`](build_release_event) (`rsproto-surface-ops.md` § The buffer lifecycle).
 
-use crate::{get_u16, get_u32, put_u16, put_u32};
+use crate::{Reader, put_u16, put_u32};
 
 /// `CreateWindow` — mint a window; the reply carries its id.
 pub const OP_CREATE_WINDOW: u16 = 0x0900;
@@ -217,21 +217,19 @@ impl WindowInfo {
     /// Returns `None` if the slice is short: a truncated read would otherwise produce a
     /// plausible window with zeroed geometry.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < WINDOW_INFO_LEN {
-            return None;
-        }
+        let mut r = Reader::new(b);
         Some(Self {
-            id: get_u32(b, 0),
-            width: get_u32(b, 4),
-            height: get_u32(b, 8),
-            x: get_u32(b, 12) as i32,
-            y: get_u32(b, 16) as i32,
-            role: get_u16(b, 20),
-            dock: get_u16(b, 22),
-            reserve: get_u32(b, 24),
-            parent: get_u32(b, 28),
-            desktop: get_u32(b, 32),
-            flags: get_u32(b, 36),
+            id: r.u32()?,
+            width: r.u32()?,
+            height: r.u32()?,
+            x: r.u32()? as i32,
+            y: r.u32()? as i32,
+            role: r.u16()?,
+            dock: r.u16()?,
+            reserve: r.u32()?,
+            parent: r.u32()?,
+            desktop: r.u32()?,
+            flags: r.u32()?,
         })
     }
 }
@@ -265,10 +263,10 @@ impl ScreenInfo {
 
     /// Parse from a mapped `screen` object; `None` for a slice shorter than [`SCREEN_INFO_LEN`].
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < SCREEN_INFO_LEN {
-            return None;
-        }
-        Some(Self { width: get_u32(b, 0), height: get_u32(b, 4) })
+        let mut r = Reader::new(b);
+        let (width, height) = (r.u32()?, r.u32()?);
+        r.skip(SCREEN_INFO_LEN - 8)?;
+        Some(Self { width, height })
     }
 }
 
@@ -343,14 +341,14 @@ pub fn build_create_window_request(out: &mut [u8], req: &CreateWindowRequest) ->
 
 /// Parse a `CreateWindowRequest` body.
 pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
-    if body.len() < CREATE_WINDOW_REQUEST_LEN {
-        return None;
-    }
-    let width = get_u32(body, 0);
-    let height = get_u32(body, 4);
-    let aux16 = get_u16(body, 10);
-    let aux32 = get_u32(body, 12);
-    let role = match get_u16(body, 8) {
+    let mut r = Reader::new(body);
+    let width = r.u32()?;
+    let height = r.u32()?;
+    let role_tag = r.u16()?;
+    let aux16 = r.u16()?;
+    let aux32 = r.u32()?;
+    let (offset_x, offset_y) = (r.u32()? as i32, r.u32()? as i32);
+    let role = match role_tag {
         ROLE_NORMAL => Role::Normal,
         ROLE_PANEL => {
             let dock = Edge::from_wire(aux16)?;
@@ -365,7 +363,7 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
     };
     // Read for every role but `panel`, matching the writer: an ignored word is a discarded request.
     let (offset_x, offset_y) = match role {
-        Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => (get_u32(body, 16) as i32, get_u32(body, 20) as i32),
+        Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => (offset_x, offset_y),
         Role::Panel { .. } => (0, 0),
     };
     Some(CreateWindowRequest { width, height, role, offset_x, offset_y })
@@ -382,10 +380,7 @@ pub fn build_create_window_reply(out: &mut [u8], window: u32) -> Option<usize> {
 
 /// Parse a `CreateWindowReply` body.
 pub fn parse_create_window_reply(body: &[u8]) -> Option<u32> {
-    if body.len() < CREATE_WINDOW_REPLY_LEN {
-        return None;
-    }
-    Some(get_u32(body, 0))
+    Reader::new(body).u32()
 }
 
 /// Body length of an `AttachBufferRequest`.
@@ -436,16 +431,14 @@ pub fn build_attach_buffer_request(out: &mut [u8], req: &AttachBufferRequest) ->
 ///
 /// Rejects a pitch too small to hold a row (`rsproto-surface-ops.md` § `AttachBuffer`).
 pub fn parse_attach_buffer_request(body: &[u8]) -> Option<AttachBufferRequest> {
-    if body.len() < ATTACH_BUFFER_REQUEST_LEN {
-        return None;
-    }
+    let mut r = Reader::new(body);
     let req = AttachBufferRequest {
-        window: get_u32(body, 0),
-        buffer: get_u32(body, 4),
-        width: get_u32(body, 8),
-        height: get_u32(body, 12),
-        pitch: get_u32(body, 16),
-        format: get_u32(body, 20),
+        window: r.u32()?,
+        buffer: r.u32()?,
+        width: r.u32()?,
+        height: r.u32()?,
+        pitch: r.u32()?,
+        format: r.u32()?,
     };
     if req.format != SURFACE_FORMAT_XRGB8888 && req.format != SURFACE_FORMAT_ARGB8888 {
         return None;
@@ -494,16 +487,14 @@ pub fn build_commit_request(out: &mut [u8], req: &CommitRequest) -> Option<usize
 
 /// Parse a `CommitRequest` body.
 pub fn parse_commit_request(body: &[u8]) -> Option<CommitRequest> {
-    if body.len() < COMMIT_REQUEST_LEN {
-        return None;
-    }
+    let mut r = Reader::new(body);
     Some(CommitRequest {
-        window: get_u32(body, 0),
-        buffer: get_u32(body, 4),
-        damage_x: get_u32(body, 8),
-        damage_y: get_u32(body, 12),
-        damage_w: get_u32(body, 16),
-        damage_h: get_u32(body, 20),
+        window: r.u32()?,
+        buffer: r.u32()?,
+        damage_x: r.u32()?,
+        damage_y: r.u32()?,
+        damage_w: r.u32()?,
+        damage_h: r.u32()?,
     })
 }
 
@@ -519,10 +510,8 @@ pub fn build_release_event(out: &mut [u8], window: u32, buffer: u32) -> Option<u
 
 /// Parse a `ReleaseEvent` body.
 pub fn parse_release_event(body: &[u8]) -> Option<(u32, u32)> {
-    if body.len() < RELEASE_EVENT_LEN {
-        return None;
-    }
-    Some((get_u32(body, 0), get_u32(body, 4)))
+    let mut r = Reader::new(body);
+    Some((r.u32()?, r.u32()?))
 }
 
 /// Body length of a `DestroyWindowRequest`.
@@ -539,10 +528,7 @@ pub fn build_destroy_window_request(out: &mut [u8], window: u32) -> Option<usize
 
 /// Parse a `DestroyWindowRequest` body.
 pub fn parse_destroy_window_request(body: &[u8]) -> Option<u32> {
-    if body.len() < DESTROY_WINDOW_REQUEST_LEN {
-        return None;
-    }
-    Some(get_u32(body, 0))
+    Reader::new(body).u32()
 }
 
 // Input delivered to a window. **Surface-layer events, not device records**: `libinput` runs
@@ -936,10 +922,8 @@ impl MgrWindowValue {
 
     /// Parse from the first 8 bytes of a request body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 8 {
-            return None;
-        }
-        Some(Self { window: get_u32(b, 0), value: get_u32(b, 4) })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()?, value: r.u32()? })
     }
 }
 
@@ -972,10 +956,8 @@ impl MgrCapture {
 
     /// Parse from the first 16 bytes of a request body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 16 {
-            return None;
-        }
-        Some(Self { window: get_u32(b, 0), width: get_u32(b, 4), height: get_u32(b, 8), pitch: get_u32(b, 12) })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()?, width: r.u32()?, height: r.u32()?, pitch: r.u32()? })
     }
 }
 
@@ -1037,19 +1019,17 @@ impl MgrSnapZone {
 
     /// Parse from the first 36 bytes of a request body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 36 {
-            return None;
-        }
+        let mut r = Reader::new(b);
         Some(Self {
-            id: get_u32(b, 0),
-            trigger_x: get_u32(b, 4) as i32,
-            trigger_y: get_u32(b, 8) as i32,
-            trigger_w: get_u32(b, 12),
-            trigger_h: get_u32(b, 16),
-            target_x: get_u32(b, 20) as i32,
-            target_y: get_u32(b, 24) as i32,
-            target_w: get_u32(b, 28),
-            target_h: get_u32(b, 32),
+            id: r.u32()?,
+            trigger_x: r.u32()? as i32,
+            trigger_y: r.u32()? as i32,
+            trigger_w: r.u32()?,
+            trigger_h: r.u32()?,
+            target_x: r.u32()? as i32,
+            target_y: r.u32()? as i32,
+            target_w: r.u32()?,
+            target_h: r.u32()?,
         })
     }
 }
@@ -1068,10 +1048,8 @@ impl MgrHotkey {
 
     /// Parse from the first 8 bytes of a body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 8 {
-            return None;
-        }
-        Some(Self { id: get_u32(b, 0), mods: get_u16(b, 4), code: get_u16(b, 6) })
+        let mut r = Reader::new(b);
+        Some(Self { id: r.u32()?, mods: r.u16()?, code: r.u16()? })
     }
 }
 
@@ -1099,10 +1077,8 @@ impl MgrDesktop {
 
     /// Parse from the first 4 bytes of a request body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 4 {
-            return None;
-        }
-        Some(Self { desktop: get_u32(b, 0) })
+        let mut r = Reader::new(b);
+        Some(Self { desktop: r.u32()? })
     }
 }
 
@@ -1134,10 +1110,8 @@ impl MgrScheme {
 
     /// Parse from the first 4 bytes of a request body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 4 {
-            return None;
-        }
-        Some(Self { scheme: get_u32(b, 0) })
+        let mut r = Reader::new(b);
+        Some(Self { scheme: r.u32()? })
     }
 }
 
@@ -1161,10 +1135,8 @@ impl WindowRef {
 
     /// Parse from the first 4 bytes of a body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 4 {
-            return None;
-        }
-        Some(Self { window: get_u32(b, 0) })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()? })
     }
 }
 
@@ -1192,10 +1164,8 @@ impl WindowState {
 
     /// Parse from the first 8 bytes of a body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 8 {
-            return None;
-        }
-        Some(Self { window: get_u32(b, 0), state: get_u32(b, 4) })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()?, state: r.u32()? })
     }
 }
 
@@ -1234,16 +1204,14 @@ impl MgrLayout {
 
     /// Parse from the first 24 bytes of a body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 24 {
-            return None;
-        }
+        let mut r = Reader::new(b);
         Some(Self {
-            screen_w: get_u32(b, 0),
-            screen_h: get_u32(b, 4),
-            work_x: get_u32(b, 8) as i32,
-            work_y: get_u32(b, 12) as i32,
-            work_w: get_u32(b, 16),
-            work_h: get_u32(b, 20),
+            screen_w: r.u32()?,
+            screen_h: r.u32()?,
+            work_x: r.u32()? as i32,
+            work_y: r.u32()? as i32,
+            work_w: r.u32()?,
+            work_h: r.u32()?,
         })
     }
 }
@@ -1268,10 +1236,8 @@ impl StartMove {
 
     /// Parse from the first 4 bytes of a request body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 4 {
-            return None;
-        }
-        Some(Self { window: get_u32(b, 0) })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()? })
     }
 }
 
@@ -1298,10 +1264,8 @@ impl StartResize {
 
     /// Parse from the first 8 bytes of a request body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 8 {
-            return None;
-        }
-        Some(Self { window: get_u32(b, 0), edges: get_u32(b, 4) })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()?, edges: r.u32()? })
     }
 
     /// Whether `edges` names a gesture that exists: at least one edge, and not both of a pair.
@@ -1342,14 +1306,12 @@ impl DeclareAcceptor {
     ///
     /// The name is validated here, once: non-empty, within the cap, and UTF-8.
     pub fn read(b: &[u8]) -> Option<(Self, &str)> {
-        if b.len() < Self::HEAD {
-            return None;
-        }
-        let name = core::str::from_utf8(&b[Self::HEAD..]).ok()?;
+        let mut r = Reader::new(b);
+        let head = Self { window: r.u32()?, kinds: r.u32()? };
+        let name = core::str::from_utf8(r.rest()).ok()?;
         if name.is_empty() || name.len() > MAX_ACCEPTOR_NAME {
             return None;
         }
-        let head = Self { window: get_u32(b, 0), kinds: get_u32(b, 4) };
         // A declaration naming no known kind accepts nothing.
         if head.kinds == 0 || head.kinds & !DROP_KINDS_KNOWN != 0 {
             return None;
@@ -1395,20 +1357,18 @@ impl StartDrag {
     ///
     /// **`kind` must be exactly one bit**: a drag carries one payload.
     pub fn read(b: &[u8]) -> Option<(Self, &str, &str)> {
-        if b.len() < Self::HEAD {
-            return None;
-        }
-        let head = Self { window: get_u32(b, 0), kind: get_u32(b, 4), path_len: get_u32(b, 8) };
+        let mut r = Reader::new(b);
+        let head = Self { window: r.u32()?, kind: r.u32()?, path_len: r.u32()? };
         if head.kind == 0 || head.kind & !DROP_KINDS_KNOWN != 0 || !head.kind.is_power_of_two() {
             return None;
         }
         let len = head.path_len as usize;
         // The declared length must fit what arrived: the reader's half of the writer's bound.
-        if len == 0 || len > MAX_DROP_PATH || Self::HEAD + len > b.len() {
+        if len == 0 || len > MAX_DROP_PATH {
             return None;
         }
-        let path = core::str::from_utf8(&b[Self::HEAD..Self::HEAD + len]).ok()?;
-        let name = core::str::from_utf8(&b[Self::HEAD + len..]).ok()?;
+        let path = core::str::from_utf8(r.bytes(len)?).ok()?;
+        let name = core::str::from_utf8(r.rest()).ok()?;
         if name.len() > MAX_DROP_NAME {
             return None;
         }
@@ -1469,27 +1429,23 @@ impl DroppedEvent {
 
     /// Parse an event body into the head, the acceptor, the path and the display name.
     pub fn read(b: &[u8]) -> Option<(Self, &str, &str, &str)> {
-        if b.len() < Self::HEAD {
-            return None;
-        }
+        let mut r = Reader::new(b);
         let head = Self {
-            window: get_u32(b, 0),
-            kind: get_u32(b, 4),
-            x: i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
-            y: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
-            acceptor_len: get_u32(b, 16),
-            path_len: get_u32(b, 20),
+            window: r.u32()?,
+            kind: r.u32()?,
+            x: r.i32()?,
+            y: r.i32()?,
+            acceptor_len: r.u32()?,
+            path_len: r.u32()?,
         };
         let a = head.acceptor_len as usize;
         let p = head.path_len as usize;
-        // Both lengths checked against what arrived, and their sum for overflow.
-        let end = Self::HEAD.checked_add(a)?.checked_add(p)?;
-        if a == 0 || a > MAX_ACCEPTOR_NAME || p == 0 || p > MAX_DROP_PATH || end > b.len() {
+        if a == 0 || a > MAX_ACCEPTOR_NAME || p == 0 || p > MAX_DROP_PATH {
             return None;
         }
-        let acceptor = core::str::from_utf8(&b[Self::HEAD..Self::HEAD + a]).ok()?;
-        let path = core::str::from_utf8(&b[Self::HEAD + a..end]).ok()?;
-        let name = core::str::from_utf8(&b[end..]).ok()?;
+        let acceptor = core::str::from_utf8(r.bytes(a)?).ok()?;
+        let path = core::str::from_utf8(r.bytes(p)?).ok()?;
+        let name = core::str::from_utf8(r.rest()).ok()?;
         if name.len() > MAX_DROP_NAME {
             return None;
         }
@@ -1523,14 +1479,8 @@ impl MgrPlace {
 
     /// Parse from exactly 12 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 12 {
-            return None;
-        }
-        Some(Self {
-            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            x: i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            y: i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
-        })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()?, x: r.i32()?, y: r.i32()? })
     }
 }
 
@@ -1551,18 +1501,16 @@ const _: () = assert!(core::mem::size_of::<MgrWindowRef>() == 8);
 /// [`OP_MGR_WINDOW_TITLE`]: a 4-byte window id then UTF-8, with no length field (the body's
 /// own length gives it). The cap is [`MAX_TITLE`].
 pub mod title {
-    use super::MAX_TITLE;
+    use super::{MAX_TITLE, Reader};
 
     /// Parse a title record into `(window, title)`.
     ///
     /// `None` on a body too short to hold a window id, or one whose title is not UTF-8. The
     /// title is **not** truncated; that is [`truncate_title`]'s job at storage.
     pub fn read(b: &[u8]) -> Option<(u32, &str)> {
-        if b.len() < 4 {
-            return None;
-        }
-        let window = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-        let title = core::str::from_utf8(&b[4..]).ok()?;
+        let mut r = Reader::new(b);
+        let window = r.u32()?;
+        let title = core::str::from_utf8(r.rest()).ok()?;
         Some((window, title))
     }
 
@@ -1607,13 +1555,8 @@ impl MgrWindowRef {
 
     /// Parse from exactly 8 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 8 {
-            return None;
-        }
-        Some(Self {
-            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            other: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-        })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()?, other: r.u32()? })
     }
 }
 
@@ -1666,16 +1609,14 @@ impl MgrWindowCreated {
 
     /// Parse from exactly 20 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 20 {
-            return None;
-        }
+        let mut r = Reader::new(b);
         Some(Self {
-            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            role: u16::from_le_bytes([b[4], b[5]]),
-            aux16: u16::from_le_bytes([b[6], b[7]]),
-            aux32: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
-            width: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
-            height: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+            window: r.u32()?,
+            role: r.u16()?,
+            aux16: r.u16()?,
+            aux32: r.u32()?,
+            width: r.u32()?,
+            height: r.u32()?,
         })
     }
 }
@@ -1714,16 +1655,8 @@ impl ConfigureEvent {
 
     /// Parse from exactly 20 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 20 {
-            return None;
-        }
-        Some(Self {
-            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            width: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            height: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
-            x: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
-            y: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
-        })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()?, width: r.u32()?, height: r.u32()?, x: r.i32()?, y: r.i32()? })
     }
 }
 
@@ -1754,11 +1687,11 @@ impl MgrDragEnded {
 
     /// Parse from 44 bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        let flags = b.get(40..44)?;
+        let mut r = Reader::new(b);
         Some(Self {
-            asked: ConfigureEvent::read(&b[..20])?,
-            from: ConfigureEvent::read(&b[20..40])?,
-            flags: u32::from_le_bytes([flags[0], flags[1], flags[2], flags[3]]),
+            asked: ConfigureEvent::read(r.bytes(20)?)?,
+            from: ConfigureEvent::read(r.bytes(20)?)?,
+            flags: r.u32()?,
         })
     }
 }
@@ -1779,14 +1712,10 @@ impl FocusEvent {
 
     /// Parse from exactly 8 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 8 {
-            return None;
-        }
-        Some(Self {
-            focused: u16::from_le_bytes([b[0], b[1]]),
-            _pad: 0,
-            window: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-        })
+        let mut r = Reader::new(b);
+        let focused = r.u16()?;
+        r.skip(2)?;
+        Some(Self { focused, _pad: 0, window: r.u32()? })
     }
 }
 
@@ -1816,16 +1745,8 @@ impl KeyEvent {
 
     /// Parse from exactly 12 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 12 {
-            return None;
-        }
-        Some(Self {
-            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            keycode: u16::from_le_bytes([b[4], b[5]]),
-            pressed: u16::from_le_bytes([b[6], b[7]]),
-            modifiers: u16::from_le_bytes([b[8], b[9]]),
-            locks: u16::from_le_bytes([b[10], b[11]]),
-        })
+        let mut r = Reader::new(b);
+        Some(Self { window: r.u32()?, keycode: r.u16()?, pressed: r.u16()?, modifiers: r.u16()?, locks: r.u16()? })
     }
 }
 
@@ -1871,20 +1792,18 @@ impl PointerEvent {
 
     /// Parse from exactly 32 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 32 {
-            return None;
-        }
+        let mut r = Reader::new(b);
         Some(Self {
-            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            kind: u16::from_le_bytes([b[4], b[5]]),
-            button: u16::from_le_bytes([b[6], b[7]]),
-            buttons: u16::from_le_bytes([b[8], b[9]]),
-            flags: u16::from_le_bytes([b[10], b[11]]),
-            modifiers: u16::from_le_bytes([b[12], b[13]]),
-            wheel: i16::from_le_bytes([b[14], b[15]]),
-            x: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
-            y: i32::from_le_bytes([b[20], b[21], b[22], b[23]]),
-            time_ms: u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]]),
+            window: r.u32()?,
+            kind: r.u16()?,
+            button: r.u16()?,
+            buttons: r.u16()?,
+            flags: r.u16()?,
+            modifiers: r.u16()?,
+            wheel: r.u16()? as i16,
+            x: r.i32()?,
+            y: r.i32()?,
+            time_ms: r.u64()?,
         })
     }
 }
@@ -1892,6 +1811,81 @@ impl PointerEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every reader answers `None` for every strict prefix of a body its writer made, and none
+    /// panics on a body with a byte flipped.
+    #[test]
+    fn readers_refuse_every_truncation_and_survive_corruption() {
+        use crate::fuzz::*;
+        macro_rules! fixed {
+            ($($t:ty),*) => {$({
+                let mut b = [0u8; 64];
+                let n = <$t>::default().write(&mut b).unwrap();
+                refuses_every_prefix(&b[..n], |x| <$t>::read(x).is_some());
+            })*};
+        }
+        fixed!(
+            WindowInfo,
+            ScreenInfo,
+            MgrWindowValue,
+            MgrCapture,
+            MgrSnapZone,
+            MgrHotkey,
+            MgrDesktop,
+            MgrScheme,
+            WindowRef,
+            WindowState,
+            MgrLayout,
+            StartMove,
+            StartResize,
+            MgrPlace,
+            MgrWindowRef,
+            MgrWindowCreated,
+            ConfigureEvent,
+            MgrDragEnded,
+            FocusEvent,
+            KeyEvent,
+            PointerEvent
+        );
+        let mut b = [0u8; 64];
+        let req = CreateWindowRequest::new(640, 480, Role::Popup { parent: 3 });
+        let n = build_create_window_request(&mut b, &req).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_create_window_request(x).is_some());
+        let n = build_create_window_reply(&mut b, 9).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_create_window_reply(x).is_some());
+        let attach = AttachBufferRequest { window: 1, buffer: 2, width: 4, height: 4, pitch: 16, format: 0 };
+        let n = build_attach_buffer_request(&mut b, &attach).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_attach_buffer_request(x).is_some());
+        let commit = CommitRequest { window: 1, buffer: 2, damage_x: 0, damage_y: 0, damage_w: 1, damage_h: 1 };
+        let n = build_commit_request(&mut b, &commit).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_commit_request(x).is_some());
+        let n = build_release_event(&mut b, 1, 2).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_release_event(x).is_some());
+        let n = build_destroy_window_request(&mut b, 1).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_destroy_window_request(x).is_some());
+
+        let decl = DeclareAcceptor { window: 1, kinds: DROP_KIND_FILE };
+        let n = decl.write(&mut b, b"files").unwrap();
+        survives_corruption(&b[..n], |x| DeclareAcceptor::read(x).is_some());
+        for k in 0..DeclareAcceptor::HEAD + 1 {
+            assert!(DeclareAcceptor::read(&b[..k]).is_none(), "prefix of {k}");
+        }
+        let drag = StartDrag { window: 1, kind: DROP_KIND_FILE, path_len: 4 };
+        let n = drag.write(&mut b, b"/a/b", b"b").unwrap();
+        survives_corruption(&b[..n], |x| StartDrag::read(x).is_some());
+        for k in 0..StartDrag::HEAD + 4 {
+            assert!(StartDrag::read(&b[..k]).is_none(), "prefix of {k}");
+        }
+        let ev = DroppedEvent { window: 1, kind: DROP_KIND_FILE, x: -1, y: 2, acceptor_len: 5, path_len: 4 };
+        let n = ev.write(&mut b, b"files", b"/a/b", b"b").unwrap();
+        survives_corruption(&b[..n], |x| DroppedEvent::read(x).is_some());
+        for k in 0..DroppedEvent::HEAD + 9 {
+            assert!(DroppedEvent::read(&b[..k]).is_none(), "prefix of {k}");
+        }
+        let n = title::write(5, "hi", &mut b).unwrap();
+        refuses_every_prefix(&b[..4], |x| title::read(x).is_some_and(|(_, t)| t.is_empty()));
+        survives_corruption(&b[..n], |x| title::read(x).is_some());
+    }
 
     #[test]
     fn a_drag_ended_reads_the_asked_rectangle_then_the_one_it_came_from() {
@@ -1955,9 +1949,9 @@ mod tests {
             build_create_window_request(&mut req, &CreateWindowRequest::new(640, 480, role)).expect("request encodes");
 
             let ev = MgrWindowCreated::for_role(3, role, 640, 480);
-            assert_eq!(ev.role, get_u16(&req, 8), "role tag for {role:?}");
-            assert_eq!(ev.aux16, get_u16(&req, 10), "aux16 for {role:?}");
-            assert_eq!(ev.aux32, get_u32(&req, 12), "aux32 for {role:?}");
+            assert_eq!(ev.role, u16::from_le_bytes([req[8], req[9]]), "role tag for {role:?}");
+            assert_eq!(ev.aux16, u16::from_le_bytes([req[10], req[11]]), "aux16 for {role:?}");
+            assert_eq!(ev.aux32, u32::from_le_bytes([req[12], req[13], req[14], req[15]]), "aux32 for {role:?}");
 
             let mut body = [0u8; 20];
             let n = ev.write(&mut body).expect("event encodes");

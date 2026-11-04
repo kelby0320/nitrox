@@ -32,7 +32,7 @@ enum Object {
         bytes: Pages,
         size: u64,
     },
-    Namespace(Vec<(Vec<u8>, usize, u64)>),
+    Namespace(Vec<Binding>),
     Channel {
         peer: usize,
         ring: VecDeque<Queued>,
@@ -46,6 +46,9 @@ enum Object {
     Device,
     /// A userspace server: a lookup through it waits for its answer, a fresh memory object.
     Server,
+    /// A userspace server that answers every lookup at once with the object it names, as the
+    /// logging service answers with an endpoint.
+    Answers(usize),
     Process,
     Thread,
     Entropy,
@@ -61,7 +64,7 @@ impl Object {
             Object::Po(_) => KObjectType::PendingOperation,
             Object::Notify(_) => KObjectType::NotificationChannel,
             Object::Device => KObjectType::DeviceNode,
-            Object::Server => KObjectType::UserspaceServerReg,
+            Object::Server | Object::Answers(_) => KObjectType::UserspaceServerReg,
             Object::Process => KObjectType::Process,
             Object::Thread => KObjectType::Thread,
             Object::Entropy => KObjectType::EntropyObject,
@@ -120,6 +123,12 @@ struct Mock {
     fail_sync: Option<i32>,
     fail_thread: Option<i32>,
     fail_recv: Option<i32>,
+    fail_send: Option<i32>,
+    fail_create: Option<i32>,
+    /// The status the next send's operation completes with at once.
+    answer_send: Option<i32>,
+    /// Whether the next truncate leaves the size as it was, as a server ignoring it would.
+    ignore_truncate: bool,
     /// Whether the next rename's answer carries a handle, as a server's could.
     rename_handle: bool,
     submitted: Vec<IoOp>,
@@ -136,13 +145,33 @@ struct Mock {
     closed_in_flight: u32,
     /// Closes of a handle not in the table: one already closed, or moved away.
     stray_closes: u32,
+    terminated: u32,
     log: Vec<u8>,
     spawned: Vec<SpawnArgs>,
+    /// What each spawn's child holds, in spawn order: its grants, which never run to close.
+    children: Vec<Vec<(usize, u64)>>,
+    /// Whether the next child exits before anything reaches it, holding nothing.
+    exit_next_child: bool,
     threads: Vec<ThreadArgs>,
 }
 
 thread_local! {
     static MOCK: RefCell<Mock> = RefCell::new(fresh());
+}
+
+/// A path bound in a namespace, and the base a server's lookups under it are prefixed with.
+#[derive(Clone)]
+struct Binding {
+    path: Vec<u8>,
+    obj: usize,
+    rights: u64,
+    base: Vec<u8>,
+}
+
+impl Binding {
+    fn new(path: &[u8], obj: usize, rights: u64) -> Self {
+        Binding { path: path.to_vec(), obj, rights, base: Vec::new() }
+    }
 }
 
 /// An empty model, but for handles `1` and `2`, devices `io_submit` takes.
@@ -198,8 +227,10 @@ impl Mock {
     /// Whether anything still holds `obj`: a handle, a binding or a message in a ring.
     fn held(&self, obj: usize) -> bool {
         self.table.values().any(|&(o, _)| o == obj)
+            || self.children.iter().flatten().any(|&(o, _)| o == obj)
             || self.objects.iter().any(|o| match o {
-                Object::Namespace(b) => b.iter().any(|&(_, o, _)| o == obj),
+                Object::Namespace(b) => b.iter().any(|b| b.obj == obj),
+                Object::Answers(target) => *target == obj,
                 Object::Channel { ring, held, .. } => {
                     ring.iter().chain(held.iter().map(|(q, ..)| q)).any(|q| q.handles.iter().any(|&(o, _)| o == obj))
                 }
@@ -234,7 +265,7 @@ impl Mock {
         self.typed(ns, need, KObjectType::Namespace).map(|(o, _)| o)
     }
 
-    fn bindings(&mut self, ns: usize) -> &mut Vec<(Vec<u8>, usize, u64)> {
+    fn bindings(&mut self, ns: usize) -> &mut Vec<Binding> {
         match &mut self.objects[ns] {
             Object::Namespace(b) => b,
             _ => unreachable!("checked a namespace"),
@@ -243,19 +274,18 @@ impl Mock {
 
     /// A file's object and rights at `path` in `ns`, bound as a direct binding.
     fn file_at(&mut self, ns: usize, path: &[u8]) -> Option<(usize, u64)> {
-        self.bindings(ns).iter().find(|(p, ..)| p == path).map(|&(_, o, r)| (o, r))
+        self.bindings(ns).iter().find(|b| b.path == path).map(|b| (b.obj, b.rights))
     }
 
     /// Whether `obj` is a server: a lookup through it is forwarded, and waits for an answer.
     fn serves(&self, obj: usize) -> bool {
-        matches!(self.objects[obj], Object::Server | Object::Channel { .. })
+        matches!(self.objects[obj], Object::Server | Object::Answers(_) | Object::Channel { .. })
     }
 
     /// The server whose binding is the longest prefix of `path`, as the kernel resolves one.
     fn server_for(&mut self, ns: usize, path: &[u8]) -> Option<usize> {
         let under = |bound: &[u8]| bound == b"/" || path == bound || path.starts_with(&[bound, b"/"].concat());
-        let found =
-            self.bindings(ns).iter().filter(|(p, ..)| under(p)).max_by_key(|(p, ..)| p.len()).map(|(_, o, _)| *o);
+        let found = self.bindings(ns).iter().filter(|b| under(&b.path)).max_by_key(|b| b.path.len()).map(|b| b.obj);
         found.filter(|&o| self.serves(o))
     }
 }
@@ -427,10 +457,11 @@ pub fn handle_stat(h: u64, out: &mut HandleInfo) -> i64 {
 }
 
 pub fn memory_create(size: u64) -> i64 {
-    with(|m| match size {
-        0 => e(KError::InvalidArgument),
-        s if s > MEMORY_MAX => e(KError::TooLarge),
-        s => {
+    with(|m| match (m.fail_create.take(), size) {
+        (Some(status), _) => status as i64,
+        (None, 0) => e(KError::InvalidArgument),
+        (None, s) if s > MEMORY_MAX => e(KError::TooLarge),
+        (None, s) => {
             let bytes = Pages::new(s as usize);
             let all = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
             m.mint(Object::Memory(bytes), all | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER)
@@ -450,7 +481,14 @@ pub fn memory_map(h: u64, _hint: u64, size: u64, rights: u64) -> i64 {
         }
         let room = match &mut m.objects[obj] {
             Object::Memory(b) => b.len(),
-            Object::File { size, .. } => (*size as usize).next_multiple_of(PAGE),
+            Object::File { size, bytes } => {
+                let room = (*size as usize).next_multiple_of(PAGE);
+                assert!(
+                    room <= bytes.len(),
+                    "the mock backs a file with {FILE_ROOM} bytes; a map past them is the test's"
+                );
+                room
+            }
             _ => return e(KError::InvalidArgument),
         };
         if size == 0 || size as usize > room {
@@ -542,12 +580,16 @@ pub fn channel_send(ch: u64, msg: &IpcMsg, handles: &[u64], mode: u64, _deadline
         if msg.header.payload_len as usize > IPC_PAYLOAD_SIZE {
             return e(KError::InvalidArgument);
         }
+        if let Some(status) = m.fail_send.take() {
+            return status as i64;
+        }
+        let answer = m.answer_send.take();
         if forward {
             // A reply the kernel consumes within the call, whatever the mode.
             for h in handles {
                 m.table.remove(h);
             }
-            return 0;
+            return answer.map_or(0, |status| m.po(Po { ready: true, never: false, status, result: 0, lookup: None }));
         }
         if !m.held(peer) {
             return e(KError::PeerClosed);
@@ -564,8 +606,9 @@ pub fn channel_send(ch: u64, msg: &IpcMsg, handles: &[u64], mode: u64, _deadline
         for h in handles {
             m.table.remove(h);
         }
+        let (ready, status) = answer.map_or((!full, 0), |status| (true, status));
         let po = (mode != libkern::SENDMODE_NOBLOCK)
-            .then(|| m.po(Po { ready: !full, never: false, status: 0, result: 0, lookup: None }));
+            .then(|| m.po(Po { ready, never: false, status, result: 0, lookup: None }));
         let po_obj = po.map(|po| m.table[&(po as u64)].0);
         let Object::Channel { ring, held, .. } = &mut m.objects[peer] else { unreachable!("a channel's peer") };
         match po_obj {
@@ -635,7 +678,10 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
         if !valid_path(path) {
             return e(KError::InvalidArgument);
         }
-        if m.server_for(ns, path).is_some() {
+        if let Some(server) = m.server_for(ns, path) {
+            if let Object::Answers(target) = m.objects[server] {
+                return m.lookup_po(Ok((target, rights)));
+            }
             let answer = m.object(Object::Memory(Pages::new(PAGE)));
             let lookup = Some((answer, rights));
             return m.po(Po { ready: false, never: false, status: 0, result: 0, lookup });
@@ -674,7 +720,7 @@ pub fn ns_bind(ns: u64, path: &[u8], resource: u64, base: &[u8]) -> i64 {
         if m.file_at(ns, path).is_some() {
             return e(KError::AlreadyExists);
         }
-        m.bindings(ns).push((path.to_vec(), obj, rights));
+        m.bindings(ns).push(Binding { path: path.to_vec(), obj, rights, base: base.to_vec() });
         0
     })
 }
@@ -686,7 +732,7 @@ pub fn ns_unbind(ns: u64, path: &[u8]) -> i64 {
             Err(r) => return r,
         };
         let b = m.bindings(ns);
-        match b.iter().position(|(p, ..)| p == path) {
+        match b.iter().position(|x| x.path == path) {
             Some(i) => {
                 b.remove(i);
                 0
@@ -702,7 +748,7 @@ pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
             Ok(o) => o,
             Err(r) => return r,
         };
-        let Some((path, _, rights)) = m.bindings(ns).get(index as usize) else { return e(KError::NotFound) };
+        let Some(Binding { path, rights, .. }) = m.bindings(ns).get(index as usize) else { return e(KError::NotFound) };
         *out = NsEntry::zeroed();
         let n = path.len().min(out.path.len());
         out.path[..n].copy_from_slice(&path[..n]);
@@ -755,16 +801,18 @@ pub fn file_resize(verb: Resize, ns: u64, path: &[u8], rights: u64, size: u64) -
             (None, Resize::Create) => {
                 let obj = m.object(Object::File { bytes: Pages::new(FILE_ROOM), size: 0 });
                 let all = Rights::MAP_READ | Rights::MAP_WRITE | Rights::INSPECT | Rights::TRANSFER | Rights::DUPLICATE;
-                m.bindings(ns).push((path.to_vec(), obj, all.bits()));
+                m.bindings(ns).push(Binding::new(path, obj, all.bits()));
                 Some((obj, all.bits()))
             }
             (None, _) => None,
             (Some(got), _) => Some(got),
         };
         let Some((obj, bound)) = found else { return m.lookup_po(Err(KError::NotFound)) };
+        let ignored = verb == Resize::Truncate && core::mem::take(&mut m.ignore_truncate);
         if let Object::File { size: now, .. } = &mut m.objects[obj] {
             *now = match verb {
                 Resize::Create | Resize::Grow => (*now).max(size),
+                Resize::Truncate if ignored => *now,
                 Resize::Truncate => (*now).min(size),
             };
         }
@@ -782,11 +830,11 @@ pub fn file_rename(ns: u64, from: &[u8], to: &[u8], _flags: u64) -> i64 {
             return e(KError::InvalidArgument);
         }
         let b = m.bindings(ns);
-        let status = match b.iter().position(|(p, ..)| p == from) {
+        let status = match b.iter().position(|x| x.path == from) {
             Some(i) => {
-                b.retain(|(p, ..)| p != to);
-                let i = b.iter().position(|(p, ..)| p == from).unwrap_or(i);
-                b[i].0 = to.to_vec();
+                b.retain(|x| x.path != to);
+                let i = b.iter().position(|x| x.path == from).unwrap_or(i);
+                b[i].path = to.to_vec();
                 0
             }
             None => KError::NotFound as i32,
@@ -831,13 +879,31 @@ pub fn process_spawn(args: &SpawnArgs) -> i64 {
         {
             return r;
         }
+        let mut child = Vec::new();
         for (i, h) in hs.iter().enumerate() {
+            let (obj, rights) = m.table[h];
+            child.push((obj, rights & args.rights[i]));
             if args.move_mask & (1 << i) != 0 {
                 m.table.remove(h);
             }
         }
+        if core::mem::take(&mut m.exit_next_child) {
+            child.clear();
+        }
+        m.children.push(child);
         m.spawned.push(*args);
         m.mint(Object::Process, Rights::SIGNAL | Rights::TERMINATE)
+    })
+}
+
+/// A request the model records and the child, which never runs, ignores.
+pub fn process_terminate(process: u64) -> i64 {
+    with(|m| match m.typed(process, Rights::SIGNAL, KObjectType::Process) {
+        Ok(_) => {
+            m.terminated += 1;
+            0
+        }
+        Err(r) => r,
     })
 }
 

@@ -1,7 +1,7 @@
 //! `Meta` category (`op = 0x00xx`) bodies: Hello, Goodbye, QueryCaps, Ping,
 //! Ready. See `docs/spec/rsproto-wire-format.md` § "Version negotiation".
 
-use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+use crate::{Reader, put_u16, put_u32, put_u64};
 
 /// `HelloRequest` wire length.
 pub const HELLO_REQUEST_LEN: usize = 8;
@@ -32,14 +32,8 @@ pub fn hello_request(out: &mut [u8], min: u16, max: u16, flags: u32) -> Option<u
 
 /// Parse a `HelloRequest` body.
 pub fn parse_hello_request(body: &[u8]) -> Option<HelloRequest> {
-    if body.len() < HELLO_REQUEST_LEN {
-        return None;
-    }
-    Some(HelloRequest {
-        client_min_version: get_u16(body, 0),
-        client_max_version: get_u16(body, 2),
-        flags: get_u32(body, 4),
-    })
+    let mut r = Reader::new(body);
+    Some(HelloRequest { client_min_version: r.u16()?, client_max_version: r.u16()?, flags: r.u32()? })
 }
 
 /// A parsed `HelloReply` (the agreed version + the server's capabilities).
@@ -66,10 +60,8 @@ pub fn hello_reply(out: &mut [u8], agreed: u16, caps: u32, flags: u32) -> Option
 
 /// Parse a `HelloReply` body.
 pub fn parse_hello_reply(body: &[u8]) -> Option<HelloReply> {
-    if body.len() < HELLO_REPLY_LEN {
-        return None;
-    }
-    Some(HelloReply { agreed_version: get_u16(body, 0), server_caps: get_u32(body, 2), server_flags: get_u32(body, 6) })
+    let mut r = Reader::new(body);
+    Some(HelloReply { agreed_version: r.u16()?, server_caps: r.u32()?, server_flags: r.u32()? })
 }
 
 /// Ping request/reply body length (an opaque nonce).
@@ -86,10 +78,7 @@ pub fn ping(out: &mut [u8], nonce: u64) -> Option<usize> {
 
 /// Parse a Ping nonce body.
 pub fn parse_ping(body: &[u8]) -> Option<u64> {
-    if body.len() < PING_LEN {
-        return None;
-    }
-    Some(get_u64(body, 0))
+    Reader::new(body).u64()
 }
 
 /// [`fs_setup`] flag: serve the filesystem **read-only** — refuse every mutation with
@@ -129,15 +118,10 @@ pub fn ready(out: &mut [u8], server_name: &[u8]) -> Option<usize> {
 
 /// Parse a `ReadyMessage` body, returning the server-name bytes.
 pub fn parse_ready(body: &[u8]) -> Option<&[u8]> {
-    if body.len() < READY_PREFIX_LEN {
-        return None;
-    }
-    let name_len = get_u16(body, 0) as usize;
-    let end = READY_PREFIX_LEN.checked_add(name_len)?;
-    if body.len() < end {
-        return None;
-    }
-    Some(&body[READY_PREFIX_LEN..end])
+    let mut r = Reader::new(body);
+    let name_len = r.u16()?;
+    r.skip(2)?;
+    r.bytes(name_len as usize)
 }
 
 #[cfg(test)]
@@ -183,5 +167,19 @@ mod tests {
         assert_eq!(parse_ready(&buf[..n]), Some(&b"fs-server-ext4"[..]));
         let n = ready(&mut buf, b"").unwrap();
         assert_eq!(parse_ready(&buf[..n]), Some(&b""[..]));
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 64];
+        let n = hello_request(&mut b, 1, 3, 9).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_hello_request(x).is_some());
+        let n = hello_reply(&mut b, 2, 5, 9).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_hello_reply(x).is_some());
+        let n = ping(&mut b, 77).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_ping(x).is_some());
+        let n = ready(&mut b, b"fs-server").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_ready(x).is_some());
     }
 }

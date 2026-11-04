@@ -7,18 +7,23 @@ use librsproto::error::parse_error;
 use librsproto::file::{name_request, parse_read_dir_reply, read_dir_request, rename_request};
 use librsproto::{RS_MAX_BODY, decode};
 use std::cell::RefCell;
-use std::string::String;
+use std::string::{String, ToString};
 use std::vec::Vec;
 
 /// What a session asked of the volume, each call as a line.
 #[derive(Default)]
-struct Spy {
-    calls: RefCell<Vec<String>>,
-    orphan: Option<u64>,
+pub(crate) struct Spy {
+    pub(crate) calls: RefCell<Vec<String>>,
+    /// The id an unlink, or a rename over a file, leaves without a name.
+    pub(crate) orphan: Option<u64>,
     entries: usize,
+    /// Whether every path is a file of five bytes, rather than a directory.
+    pub(crate) file: bool,
+    /// Whether a rename by path succeeds, rather than finding nothing.
+    pub(crate) renames: bool,
 }
 
-struct Never;
+pub(crate) struct Never;
 
 impl core::fmt::Display for Never {
     fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -61,9 +66,16 @@ impl Volume for Spy {
         Ok(())
     }
     fn map_file(&self, _: &[u8], _: &mut [BlockRun]) -> Result<Mapped, FsError> {
+        if self.file {
+            return Ok(Mapped { size: 5, block_size: 4096, runs: 0, id: 9 });
+        }
         Err(FsError::NotFound)
     }
-    fn read_file(&self, _: &[u8], _: &mut [u8]) -> Result<usize, FsError> {
+    fn read_file(&self, _: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
+        if self.file {
+            out[..5].copy_from_slice(b"hello");
+            return Ok(5);
+        }
         Err(FsError::NotFound)
     }
     fn read_file_range(&self, _: &[u8], _: u64, _: usize, _: &mut [u8]) -> Result<usize, FsError> {
@@ -79,7 +91,7 @@ impl Volume for Spy {
         Err(FsError::NotFound)
     }
     fn resolve_dir(&self, _: &[u8]) -> Result<u64, FsError> {
-        Ok(7)
+        if self.file { Err(FsError::NotFound) } else { Ok(7) }
     }
     fn read_dir(&self, _: u64, _: u64, mut emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError> {
         let name = [b'n'; 200];
@@ -111,10 +123,12 @@ impl Volume for Spy {
         self.log("rename", &[old, b" ", new].concat());
         Ok(())
     }
-    fn rename_path(&self, _: &[u8], _: &[u8], _: bool, _: i64) -> Result<Option<u64>, FsError> {
-        Err(FsError::NotFound)
+    fn rename_path(&self, from: &[u8], to: &[u8], replace: bool, _: i64) -> Result<Option<u64>, FsError> {
+        self.log(if replace { "rename_path!" } else { "rename_path" }, &[from, b" ", to].concat());
+        if self.renames { Ok(self.orphan) } else { Err(FsError::NotFound) }
     }
-    fn touch_file(&self, _: u64, _: i64) -> Result<(), FsError> {
+    fn touch_file(&self, id: u64, _: i64) -> Result<(), FsError> {
+        self.log("touch", id.to_string().as_bytes());
         Ok(())
     }
     fn release(&self, _: u64, _: i64) -> Result<(), FsError> {

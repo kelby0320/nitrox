@@ -17,8 +17,12 @@ edition = "2024"
 # No `libheap`: an allocator is the *binary's* to register, and this crate only uses `alloc`.
 [dependencies]
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 librsproto = { path = "../librsproto", features = ["io"] }
 libstream = { path = "../libstream", features = ["io"] }
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }
 
 [lib]
 name = "libsession"

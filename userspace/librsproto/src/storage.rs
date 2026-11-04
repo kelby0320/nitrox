@@ -15,7 +15,7 @@
 //! operations under `/svc/storage/fs` and `/svc/storage/info`. A refusal is the standard
 //! `ErrorBody`, and its reason says which step refused.
 
-use crate::{get_u16, get_u32, put_u16, put_u32};
+use crate::{Reader, put_u16, put_u32};
 
 /// Client → service: **mount a device**. Body [`build_mount`]: the device's name as the tables
 /// name it (`blk-<n>`), and a label, empty to let the service choose. **Always writable**: the
@@ -79,16 +79,13 @@ pub fn build_mount(out: &mut [u8], device: &[u8], label: &[u8]) -> Option<usize>
 
 /// A `Mount` body's device name and label; `None` unless the lengths account for the body exactly.
 pub fn parse_mount(body: &[u8]) -> Option<(&[u8], &[u8])> {
-    if body.len() < MOUNT_PREFIX_LEN {
-        return None;
-    }
-    let device_len = get_u16(body, 0) as usize;
-    let label_len = get_u16(body, 2) as usize;
-    if body.len() != MOUNT_PREFIX_LEN + device_len + label_len {
-        return None;
-    }
-    let device = &body[MOUNT_PREFIX_LEN..MOUNT_PREFIX_LEN + device_len];
-    Some((device, &body[MOUNT_PREFIX_LEN + device_len..]))
+    let mut r = Reader::new(body);
+    let device_len = r.u16()?;
+    let label_len = r.u16()?;
+    let device = r.bytes(device_len as usize)?;
+    let label = r.bytes(label_len as usize)?;
+    r.finish()?;
+    Some((device, label))
 }
 
 /// Bytes before a `Mount` reply's label: its mode, a reserved `0`, and the label's length.
@@ -113,12 +110,15 @@ pub fn build_mounted(out: &mut [u8], label: &[u8], read_only: Option<&[u8]>) -> 
 /// A `Mount` reply's label, and why it is read-only if it is; `None` for one its mode and lengths do
 /// not account for, a writable one carrying a reason among them.
 pub fn parse_mounted(body: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
-    if body.len() < MOUNTED_PREFIX_LEN || body[1] != 0 {
+    let mut r = Reader::new(body);
+    let mode = r.u8()?;
+    if r.u8()? != 0 {
         return None;
     }
-    let end = MOUNTED_PREFIX_LEN + get_u16(body, 2) as usize;
-    let (label, why) = (body.get(MOUNTED_PREFIX_LEN..end)?, &body[end..]);
-    match body[0] {
+    let label_len = r.u16()?;
+    let label = r.bytes(label_len as usize)?;
+    let why = r.rest();
+    match mode {
         0 if why.is_empty() => Some((label, None)),
         1 => Some((label, Some(why))),
         _ => None,
@@ -140,14 +140,15 @@ pub fn build_in_use(out: &mut [u8], ids: &[u32]) -> Option<usize> {
 
 /// Call `each` with every id of an `InUse` reply; `false` unless the body is exactly count + ids.
 pub fn parse_in_use(body: &[u8], mut each: impl FnMut(u32)) -> bool {
-    if body.len() < 4 {
+    let mut r = Reader::new(body);
+    let ids = r.u32().and_then(|count| r.bytes((count as usize).checked_mul(4)?));
+    let Some(ids) = ids.filter(|_| r.finish().is_some()) else {
         return false;
+    };
+    let mut ids = Reader::new(ids);
+    while let Some(id) = ids.u32() {
+        each(id);
     }
-    let count = get_u32(body, 0) as usize;
-    if count.checked_mul(4).and_then(|n| n.checked_add(4)) != Some(body.len()) {
-        return false;
-    }
-    (0..count).for_each(|i| each(get_u32(body, 4 + 4 * i)));
     true
 }
 
@@ -228,5 +229,19 @@ mod tests {
         assert!(!parse_in_use(&[1, 0, 0, 0], |_| {}), "a count with no id after it");
         assert!(!parse_in_use(&[0, 0, 0, 0, 9], |_| {}), "a byte after the list");
         assert!(!parse_in_use(&[0xFF, 0xFF, 0xFF, 0xFF], |_| {}), "a count that overflows");
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 64];
+        let n = build_mount(&mut b, b"sda1", b"data").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_mount(x).is_some());
+        let n = build_mounted(&mut b, b"data", Some(b"dirty")).unwrap();
+        survives_corruption(&b[..n], |x| parse_mounted(x).is_some());
+        let n = build_mounted(&mut b, b"data", None).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_mounted(x).is_some());
+        let n = build_in_use(&mut b, &[1, 2, 3]).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_in_use(x, |_| {}));
     }
 }

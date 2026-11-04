@@ -10,7 +10,7 @@
 //! kernel. The information side (`/svc/devices/info`, TSM1 tables) speaks the ordinary `File`
 //! and `Namespace` operations.
 
-use crate::{get_u32, put_u32};
+use crate::{Reader, put_u32};
 
 /// Manager → owner, unsolicited, `request_id` 0: a device of the owner's class is present. Body:
 /// the device's registry record, [`RECORD_LEN`] bytes, as `/dev/registry` serves it
@@ -22,8 +22,11 @@ pub const OP_DEVICES_SETTLED: u16 = 0x0F01;
 /// Manager → owner, unsolicited: a device has gone. Body [`build_departed`]: its registry id.
 pub const OP_DEVICES_DEPARTED: u16 = 0x0F02;
 
-/// Bytes of a registry record — `libkern::device::DeviceRecord`'s size, which both sides assert.
+/// Bytes of a registry record — `libkern::device::DeviceRecord`'s size, which `librsproto` asserts
+/// under its `io` feature.
 pub const RECORD_LEN: usize = 144;
+#[cfg(feature = "io")]
+const _: () = assert!(RECORD_LEN == core::mem::size_of::<libkern::device::DeviceRecord>());
 /// Bytes of a `Settled` or `Departed` body.
 pub const WORD_LEN: usize = 4;
 
@@ -70,7 +73,10 @@ fn build_word(out: &mut [u8], v: u32) -> Option<usize> {
 }
 
 fn parse_word(body: &[u8]) -> Option<u32> {
-    (body.len() == WORD_LEN).then(|| get_u32(body, 0))
+    let mut r = Reader::new(body);
+    let v = r.u32()?;
+    r.finish()?;
+    Some(v)
 }
 
 #[cfg(test)]
@@ -98,5 +104,16 @@ mod tests {
         assert_eq!(parse_departed(&out[..n]), Some(9));
         assert_eq!(parse_settled(&[0, 0, 0]), None);
         assert_eq!(parse_departed(&[0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut out = [0u8; RECORD_LEN];
+        let n = build_arrived(&mut out, &[7u8; RECORD_LEN]).unwrap();
+        refuses_every_prefix(&out[..n], |x| parse_arrived(x).is_some());
+        let n = build_settled(&mut out, 3).unwrap();
+        refuses_every_prefix(&out[..n], |x| parse_settled(x).is_some());
+        refuses_every_prefix(&out[..n], |x| parse_departed(x).is_some());
     }
 }

@@ -213,53 +213,74 @@ impl SetupPayload {
 }
 
 #[cfg(feature = "io")]
-pub use self::io_stage::{Bootstrap, Setup, bootstrap, pipe, send_setup, send_setup_env, send_setup_full};
+pub use self::io_stage::{
+    Bootstrap, Setup, StageSetup, StageStreams, bootstrap, open_pipe, pipe, receive_setup, send_setup, send_setup_env,
+    send_setup_full, send_stage_setup,
+};
 
 /// The sender (a shell spawning a stage) and receiver (`bootstrap().setup()`) sides of
 /// the setup message, over real IPC, behind `io`. Like [`channel::IpcPort`](crate::channel)
 /// but carries transferred handles.
 #[cfg(feature = "io")]
 mod io_stage {
-    use super::{STREAM_MASK, SetupPayload, Streams, setup_is_pending};
+    use super::{STREAM_MASK, SetupPayload, Streams, setup_is_pending, split_handles};
+    use crate::channel::{recv_msg, send_msg};
     use crate::wire::{Record, Result, WireError};
     use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
-    use libkern::abi::{IPC_HANDLE_MAX, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, SENDMODE_BLOCK};
-    use libkern::syscall::{
-        SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall6,
-    };
+    use libkern::{IPC_HANDLE_MAX, RawHandle, Rights};
+    use libos::{Carried, Channel, Deadline, Handle, Msg, Only, Ref};
 
-    const E_WOULDBLOCK: i64 = -11; // KError::WouldBlock
-    const E_PEERCLOSED: i64 = -13; // KError::PeerClosed
-    const OFF_PAYLOAD_LEN: usize = 4;
-    const OFF_HANDLE_COUNT: usize = 8;
-    const OFF_PAYLOAD: usize = 24;
-
-    fn map_err(r: i64) -> WireError {
-        if r == E_PEERCLOSED { WireError::PeerClosed } else { WireError::SinkFull }
+    /// The endpoints of a stage's standard streams, owned: each is closed if it is not sent.
+    #[derive(Default)]
+    pub struct StageStreams {
+        /// The read end of the upstream pipe, if any.
+        pub stdin: Option<Handle<Channel, Only>>,
+        /// The write end of the downstream pipe, if any.
+        pub stdout: Option<Handle<Channel, Only>>,
+        /// The shared diagnostic sink, if any.
+        pub stderr: Option<Handle<Channel, Only>>,
     }
 
-    /// Create a pipe (an IPC channel pair) of queue depth `depth`: endpoints `(a, b)`.
-    pub fn pipe(depth: u32) -> Result<(u64, u64)> {
-        let mut a = 0u64;
-        let mut b = 0u64;
-        // SAFETY: `a`/`b` are valid writable out-params.
-        let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, depth as u64, 0) };
-        if r != 0 {
-            return Err(WireError::SinkFull);
+    impl StageStreams {
+        fn bitmap(&self) -> u32 {
+            let present = |h: &Option<Handle<Channel, Only>>, bit| if h.is_some() { bit } else { 0 };
+            present(&self.stdin, super::STREAM_STDIN)
+                | present(&self.stdout, super::STREAM_STDOUT)
+                | present(&self.stderr, super::STREAM_STDERR)
         }
-        Ok((a, b))
+
+        /// Own the handles of `streams`, which the caller gives up.
+        fn from_raw(streams: Streams) -> Self {
+            // SAFETY: the caller of a raw send gave these handles up, as it always has.
+            let own = |h: Option<u64>| h.map(|h| unsafe { Handle::from_raw(RawHandle(h), Rights::empty()) });
+            StageStreams { stdin: own(streams.stdin), stdout: own(streams.stdout), stderr: own(streams.stderr) }
+        }
+    }
+
+    /// Create a pipe (an IPC channel pair) of queue depth `depth`: endpoints `(a, b)`, both owned.
+    pub fn open_pipe(depth: u32) -> Result<(Handle<Channel, Only>, Handle<Channel, Only>)> {
+        Handle::<Channel, Only>::pair(depth).map_err(|_| WireError::SinkFull)
+    }
+
+    /// Create a pipe of queue depth `depth`: endpoints `(a, b)`, which the caller owns and closes.
+    /// For callers not yet on libos; the typed form is [`open_pipe`].
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub fn pipe(depth: u32) -> Result<(u64, u64)> {
+        open_pipe(depth).map(|(a, b)| (a.into_raw().0, b.into_raw().0))
     }
 
     /// Send the **setup message** on `channel` (the shell's end of the stage's bootstrap
     /// endpoint): the present stream handles (canonical order) are **moved** to the stage, and
-    /// gone on every return, as [`send_setup_full`] says.
+    /// gone on every return, as [`send_stage_setup`] says. For callers not yet on libos.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
     pub fn send_setup(channel: u64, streams: Streams, argv: &[&str]) -> Result<()> {
         send_setup_env(channel, streams, argv, &Record::default())
     }
 
-    /// As [`send_setup`], with an environment.
+    /// As [`send_setup`], with an environment. For callers not yet on libos.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
     pub fn send_setup_env(channel: u64, streams: Streams, argv: &[&str], env: &Record) -> Result<()> {
         send_setup_full(channel, streams, None, argv, env)
     }
@@ -272,6 +293,9 @@ mod io_stage {
     /// **Every handle given is gone on every return**: moved by a send the kernel took, or closed
     /// here when the message could not be made or the kernel refused it. A caller never closes one,
     /// and no `Err` can be retried, `SinkFull` included.
+    ///
+    /// For callers not yet on libos; the typed form is [`send_stage_setup`].
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
     pub fn send_setup_full(
         channel: u64,
         streams: Streams,
@@ -279,60 +303,43 @@ mod io_stage {
         argv: &[&str],
         env: &Record,
     ) -> Result<()> {
-        let mut handles = streams.ordered();
-        handles.extend(terminal);
-        let refused = |e: WireError, handles: &[u64]| {
-            // SAFETY: closing handles the caller gave this call, which no send moved.
-            handles.iter().for_each(|&h| unsafe {
-                syscall1(SYS_HANDLE_CLOSE, h);
-            });
-            Err(e)
-        };
-        let owned: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
-        let payload =
-            SetupPayload { streams: streams.bitmap(), argv: owned, env: env.clone(), terminal: terminal.is_some() }
-                // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge`, not `SinkFull`.
-                .encode();
-        let payload = match payload {
-            Ok(p) => p,
-            Err(e) => return refused(e, &handles),
-        };
-        let mut buf: Box<[u8; IPC_MSG_SIZE]> = Box::new([0u8; IPC_MSG_SIZE]);
-        buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        buf[OFF_HANDLE_COUNT] = handles.len() as u8;
-        buf[OFF_PAYLOAD..OFF_PAYLOAD + payload.len()].copy_from_slice(&payload);
-        // SAFETY: valid IPC_MSG_SIZE buffer + handle array; Block mode returns a
-        // delivery PO to wait on (or a negative error).
-        let r = unsafe {
-            syscall6(
-                SYS_CHANNEL_SEND,
-                channel,
-                buf.as_ptr() as u64,
-                handles.as_ptr() as u64,
-                handles.len() as u64,
-                SENDMODE_BLOCK,
-                u64::MAX,
-            )
-        };
-        if r < 0 {
-            return refused(map_err(r), &handles);
+        // SAFETY: the caller's own endpoint, open for the call, as this has always asked.
+        let channel = unsafe { Ref::<Channel, Only>::from_raw(RawHandle(channel), Rights::empty()) };
+        // SAFETY: the terminal is given up like the streams.
+        let terminal = terminal.map(|h| unsafe { Handle::from_raw(RawHandle(h), Rights::empty()) });
+        send_stage_setup(channel, StageStreams::from_raw(streams), terminal, argv, env, Deadline::NEVER)
+    }
+
+    /// Send the setup message on `channel`, the shell's end of the stage's bootstrap endpoint.
+    ///
+    /// The streams and the terminal are taken: moved to the stage when the kernel holds the
+    /// message, closed on any return before that. `deadline` bounds how long the message waits for
+    /// room in the stage's ring; past it the message and its handles are dropped and the send fails
+    /// `SinkFull`.
+    pub fn send_stage_setup<'a>(
+        channel: impl Into<Ref<'a, Channel, Only>>,
+        streams: StageStreams,
+        terminal: Option<Handle<Channel, Only>>,
+        argv: &[&str],
+        env: &Record,
+        deadline: Deadline,
+    ) -> Result<()> {
+        let payload = SetupPayload {
+            streams: streams.bitmap(),
+            argv: argv.iter().map(|s| String::from(*s)).collect(),
+            env: env.clone(),
+            terminal: terminal.is_some(),
         }
-        // Past here the kernel has taken the handles, whatever the wait says.
-        let po = r as u64;
-        let wh = [po];
-        let mut result = [0u8; 24];
-        // SAFETY: valid handle + result out-buffers.
-        let waited = unsafe { syscall4(SYS_WAIT, wh.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX) };
-        // SAFETY: closing the PO we own.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
-        if waited < 1 {
-            return Err(WireError::PeerClosed);
+        // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge`, not `SinkFull`.
+        .encode()?;
+        let mut msg = Box::new(Msg::new());
+        msg.set(&payload).map_err(|_| WireError::SetupTooLarge)?;
+        let mut handles = Carried::new();
+        // At most three streams and a terminal, against room for `IPC_HANDLE_MAX`.
+        for h in [streams.stdin, streams.stdout, streams.stderr, terminal].into_iter().flatten() {
+            handles.push(h).map_err(|_| WireError::SchemaMismatch)?;
         }
-        let status = i32::from_le_bytes([result[8], result[9], result[10], result[11]]);
-        if status < 0 {
-            return Err(map_err(status as i64));
-        }
-        Ok(())
+        send_msg(channel.into(), &msg, &mut handles, deadline)
     }
 
     /// The four bootstrap registers a process receives at `_start`, plus the opt-in
@@ -358,9 +365,54 @@ mod io_stage {
         pub terminal: Option<u64>,
     }
 
+    /// A Tier-1 stage's setup, its handles owned: [`Setup`]'s typed form.
+    pub struct StageSetup {
+        /// The stream endpoints (`stdin`/`stdout`/`stderr`), mapped from the message.
+        pub streams: StageStreams,
+        /// The command-line arguments (`argv[0]` is the program name).
+        pub argv: Vec<String>,
+        /// The environment this stage was given (empty if none).
+        pub env: Record,
+        /// The terminal this stage was handed, if its parent gave it one.
+        pub terminal: Option<Handle<Channel, Only>>,
+    }
+
     /// Wrap a process's four bootstrap registers (as received by `_start`).
     pub fn bootstrap(notif: u64, namespace: u64, endpoint: u64, arg0: u64) -> Bootstrap {
         Bootstrap { notif, namespace, endpoint, arg0 }
+    }
+
+    /// Receive a setup message on `endpoint`, the stage's bootstrap endpoint: `None` if none came
+    /// by `deadline`. The handles it names are the result's; any it brought beyond them close.
+    pub fn receive_setup<'a>(
+        endpoint: impl Into<Ref<'a, Channel, Only>>,
+        deadline: Deadline,
+    ) -> Result<Option<StageSetup>> {
+        let mut msg = Box::new(Msg::new());
+        let Some(mut sent) = recv_msg(endpoint.into(), &mut msg, deadline)? else {
+            return Ok(None);
+        };
+        let payload = SetupPayload::decode(msg.payload())?;
+        // Checked before any handle is taken, so a refused message closes all it brought.
+        split_handles(&payload, &[0; IPC_HANDLE_MAX][..sent.len()])?;
+        // Streams first, the terminal after: what the payload names, and no more; the rest
+        // close as `sent` drops.
+        let mut next = 0;
+        let mut take = |present: bool| -> Result<Option<Handle<Channel, Only>>> {
+            if !present {
+                return Ok(None);
+            }
+            next += 1;
+            sent.take(next - 1).map(Some).ok_or(WireError::SchemaMismatch)
+        };
+        let streams = StageStreams {
+            stdin: take(payload.streams & super::STREAM_STDIN != 0)?,
+            stdout: take(payload.streams & super::STREAM_STDOUT != 0)?,
+            stderr: take(payload.streams & super::STREAM_STDERR != 0)?,
+        };
+        debug_assert_eq!(streams.bitmap(), payload.streams & STREAM_MASK);
+        let terminal = take(payload.terminal)?;
+        Ok(Some(StageSetup { streams, argv: payload.argv, env: payload.env, terminal }))
     }
 
     impl Bootstrap {
@@ -382,55 +434,26 @@ mod io_stage {
         }
 
         /// If `arg0` marks a pending setup message (Tier 1), receive it on the endpoint
-        /// and parse the streams + `argv`. `None` for a Tier-0 process (no descriptor).
+        /// and parse the streams + `argv`. `None` for a Tier-0 process (no descriptor). The
+        /// handles it brings are raw and the caller's; for callers not yet on libos, the typed
+        /// form is [`receive_setup`].
+        // TODO(raw-handle-shims): goes when its last caller is on libos.
         pub fn setup(&self) -> Option<Result<Setup>> {
             if !setup_is_pending(self.arg0) {
                 return None;
             }
-            Some(self.recv_setup())
-        }
-
-        fn recv_setup(&self) -> Result<Setup> {
-            let mut buf: Box<[u8; IPC_MSG_SIZE]> = Box::new([0u8; IPC_MSG_SIZE]);
-            let mut sent = loop {
-                let r = match libkern::channel_recv(self.endpoint, &mut buf) {
-                    Ok(sent) => break sent,
-                    Err(r) => r,
-                };
-                if r == E_WOULDBLOCK {
-                    let wh = [self.endpoint];
-                    let mut result = [0u8; 24];
-                    // SAFETY: valid handle + result out-buffers.
-                    let waited =
-                        unsafe { syscall4(SYS_WAIT, wh.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX) };
-                    if waited < 1 {
-                        return Err(WireError::PeerClosed);
-                    }
-                    continue;
-                }
-                return Err(map_err(r));
+            // SAFETY: the process's own bootstrap endpoint, open for the call.
+            let endpoint = unsafe { Ref::<Channel, Only>::from_raw(RawHandle(self.endpoint), Rights::empty()) };
+            let raw = |h: Option<Handle<Channel, Only>>| h.map(|h| h.into_raw().0);
+            let s = match receive_setup(endpoint, Deadline::NEVER) {
+                Ok(Some(s)) => s,
+                // Waited for ever, so a setup came; a deadline passing is not a thing to meet.
+                Ok(None) => return Some(Err(WireError::PeerClosed)),
+                Err(e) => return Some(Err(e)),
             };
-            let n = u32::from_le_bytes([
-                buf[OFF_PAYLOAD_LEN],
-                buf[OFF_PAYLOAD_LEN + 1],
-                buf[OFF_PAYLOAD_LEN + 2],
-                buf[OFF_PAYLOAD_LEN + 3],
-            ]) as usize;
-            if n > IPC_PAYLOAD_SIZE {
-                return Err(WireError::UnexpectedEof);
-            }
-            let payload = SetupPayload::decode(&buf[OFF_PAYLOAD..OFF_PAYLOAD + n])?;
-            // Checked before any handle is taken, so a refused message closes all it brought.
-            super::split_handles(&payload, &[0; IPC_HANDLE_MAX][..sent.count()])?;
-            // Streams first, the terminal after: what the payload names, and no more; the rest
-            // close as `sent` drops.
-            let named = (payload.streams & STREAM_MASK).count_ones() as usize + usize::from(payload.terminal);
-            let mut handles = [0u64; IPC_HANDLE_MAX];
-            for (i, h) in handles[..named].iter_mut().enumerate() {
-                *h = sent.take(i).unwrap_or(0);
-            }
-            let (streams, terminal) = super::split_handles(&payload, &handles[..named])?;
-            Ok(Setup { streams, argv: payload.argv, env: payload.env, terminal })
+            let streams =
+                Streams { stdin: raw(s.streams.stdin), stdout: raw(s.streams.stdout), stderr: raw(s.streams.stderr) };
+            Some(Ok(Setup { streams, argv: s.argv, env: s.env, terminal: raw(s.terminal) }))
         }
     }
 }

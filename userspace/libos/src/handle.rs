@@ -400,6 +400,7 @@ mod tests {
         let h = memory();
         let d = h.duplicate(Rights::MAP_READ | Rights::INSPECT).unwrap();
         assert_ne!(d.raw(), h.raw());
+        assert!(sys::same_object(d.raw().0, h.raw().0) && !sys::same_object(d.raw().0, memory().raw().0));
         assert_eq!(d.stat().unwrap().rights, (Rights::MAP_READ | Rights::INSPECT).bits());
         let e = d.duplicate(Rights::MAP_READ).err().unwrap();
         assert_eq!(e.code(), libkern::KError::NoAccess, "no DUPLICATE on the copy");

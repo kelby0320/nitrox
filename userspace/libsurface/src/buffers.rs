@@ -18,25 +18,23 @@ use alloc::vec::Vec;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::Geometry;
 use libdraw::geom::Size;
-use libkern::{SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, syscall2, syscall4};
+use libos::{Handle, MapReadWrite, Mapping, Memory};
 
 use crate::{Transport, UiError, WindowRef};
 
 /// One buffer's memory, on this side.
-struct Mapping {
+struct Buffer {
     /// The id the compositor knows it by.
     id: u32,
-    /// Where it is mapped in this process.
-    addr: *mut u8,
-    /// How many bytes, for the unmap.
-    len: usize,
+    /// Where it is mapped in this process, unmapped with it.
+    map: Mapping<MapReadWrite>,
 }
 
 /// The shared memory behind one window's buffers.
 ///
 /// Owns the mappings and unmaps them on drop; does not own the window.
 pub struct BufferPool {
-    maps: Vec<Mapping>,
+    maps: Vec<Buffer>,
     /// The size every buffer is being brought to, one at a time.
     size: Size,
     /// The format every buffer is attached in, so a resize does not revert to opaque.
@@ -94,58 +92,51 @@ impl BufferPool {
 
     /// Copy a whole frame into buffer `id`; `false` if there is no such buffer or `frame` is not
     /// exactly its length, since a partial copy would leave a band of the previous frame.
+    ///
+    /// The compositor reads the buffer while this writes it, so the bytes are copied in and never
+    /// borrowed.
     pub fn write(&mut self, id: u32, frame: &[u8]) -> bool {
-        let Some(m) = self.maps.iter().find(|m| m.id == id) else { return false };
-        if frame.len() != m.len {
-            return false;
-        }
-        // SAFETY: `m.addr` maps `m.len` writable bytes for this process, `frame` holds exactly
-        // that many, and the two are distinct allocations — the mapping came from
-        // `sys_memory_map` and the frame from the caller's own framebuffer.
-        unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), m.addr, m.len) };
-        true
+        let Some(m) = self.maps.iter_mut().find(|m| m.id == id) else { return false };
+        frame.len() == m.map.len() && m.map.write_from(0, frame).is_ok()
     }
 
     /// Allocate memory for `id` at `size`, attach it, and drop whatever was there.
     fn install<T: Transport>(&mut self, window: &mut WindowRef<'_, T>, id: u32, size: Size) -> Option<()> {
         let pitch = pitch_of(size)?;
         let len = pitch.checked_mul(size.h as usize)?;
-        let (handle, addr) = shared_buffer(len)?;
-        if window.attach_with_format(id, size.w, size.h, pitch as u32, handle, self.format).is_err() {
-            // The handle is transferred by a successful send only, so a failed one leaves it
-            // this process's to close.
-            // SAFETY: the attach failed, so the compositor took neither the handle's object nor
-            // this mapping: a range this process just mapped, a handle it still owns.
-            unsafe {
-                syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64);
-                syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
-            }
-            return None;
-        }
-        // Unmapping first would leave a buffer id the compositor knows and this side cannot
-        // write, and nothing to put back if the attach failed.
+        let memory = Handle::<Memory, MapReadWrite>::create(len).ok()?;
+        let map = memory.map(len).ok()?;
+        // A failed attach hands the handle back to be closed here: only a successful send
+        // transfers it. The mapping unmaps with `map`.
+        window.attach_memory(id, size.w, size.h, pitch as u32, memory, self.format).ok()?;
+        // Dropping the old mapping first would leave a buffer id the compositor knows and this
+        // side cannot write, and nothing to put back if the attach failed.
         if let Some(old) = self.maps.iter().position(|m| m.id == id) {
-            let old = self.maps.swap_remove(old);
-            // SAFETY: unmapping a range this pool mapped and is no longer using; the
-            // compositor's own mapping of that object is its to drop, and the attach above
-            // told it to.
-            unsafe { syscall2(SYS_MEMORY_UNMAP, old.addr as u64, old.len as u64) };
+            self.maps.swap_remove(old);
         }
-        self.maps.push(Mapping { id, addr, len });
+        self.maps.push(Buffer { id, map });
         Some(())
     }
 }
 
-impl Drop for BufferPool {
-    /// Unmap every buffer.
-    ///
-    /// The compositor drops its own mapping when the window goes; this side's must be unmapped
-    /// or the address space grows by a window per resize.
-    fn drop(&mut self) {
-        for m in &self.maps {
-            // SAFETY: `addr`/`len` came from a successful `sys_memory_map` in `install`, and a
-            // mapping is recorded once, so this unmaps once.
-            unsafe { syscall2(SYS_MEMORY_UNMAP, m.addr as u64, m.len as u64) };
+impl<T: Transport> WindowRef<'_, T> {
+    /// [`attach_with_format`](Self::attach_with_format), transferring `memory`. Handed back with the
+    /// error if the attach failed, since only a successful send moves it.
+    pub fn attach_memory(
+        &mut self,
+        buffer_id: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        memory: Handle<Memory, MapReadWrite>,
+        format: PixelFormat,
+    ) -> Result<(), (UiError, Handle<Memory, MapReadWrite>)> {
+        match self.attach_with_format(buffer_id, width, height, pitch, memory.raw().0, format) {
+            Ok(()) => {
+                memory.into_raw();
+                Ok(())
+            }
+            Err(e) => Err((e, memory)),
         }
     }
 }
@@ -160,21 +151,101 @@ fn geometry_of(size: Size, pitch: usize) -> Option<Geometry> {
     Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888)
 }
 
-/// Create a `MemoryObject` of `len` bytes and map it read-write.
-fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
-    // SAFETY: a plain anonymous object of `len` bytes.
-    let h = unsafe { syscall4(SYS_MEMORY_CREATE, len as u64, 0, 0, 0) };
-    if h <= 0 {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::harness::*;
+    use crate::{CreateWindowRequest, Role, Session};
+    use libkern::handle::{RawHandle, Rights};
+    use libos::{Channel, Only, mock};
+    use librsproto::surface::{ConfigureEvent, OP_ATTACH_BUFFER, OP_CONFIGURE, OP_CREATE_WINDOW};
+
+    const SIZE: Size = Size { w: 8, h: 4 };
+    const BYTES: usize = 8 * 4 * 4;
+
+    /// A session with one configured window, and the compositor's end of its channel.
+    fn session() -> (Session<crate::ipc::ChannelTransport>, u32, Handle<Channel, Only>) {
+        mock::reset();
+        let (t, peer) = connected();
+        reply(&peer, OP_CREATE_WINDOW, 1, &7u32.to_le_bytes());
+        let mut cfg = [0u8; 20];
+        ConfigureEvent { window: 7, width: 8, height: 4, x: 0, y: 0 }.write(&mut cfg).unwrap();
+        push(&peer, OP_CONFIGURE, 0, 0, &cfg);
+        let mut s = Session::new(t);
+        let id = s.create(&CreateWindowRequest::new(8, 4, Role::Normal), 2).expect("a window");
+        assert!(taken(&peer).is_some(), "the create request");
+        (s, id, peer)
     }
-    // SAFETY: mapping an object this process just created, read-write.
-    let addr = unsafe {
-        syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE)
-    };
-    if addr <= 0 {
-        // SAFETY: the map failed, so nothing references the object; closing our only handle.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, h as u64, 0, 0, 0) };
-        return None;
+
+    #[test]
+    fn each_buffer_is_mapped_and_its_memory_goes_to_the_compositor() {
+        let (mut s, id, peer) = session();
+        let open = mock::open_handles();
+        let mut w = s.window(id).unwrap();
+        let pool = BufferPool::new(&mut w, SIZE, 2).expect("two buffers");
+        assert_eq!(mock::mappings(), 2);
+        for want in [0u32, 1] {
+            let (op, _, body, carried) = taken(&peer).expect("an attach");
+            assert_eq!(op, OP_ATTACH_BUFFER);
+            assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), want);
+            assert_eq!(carried.len(), 1, "the memory travels with it");
+        }
+        assert_eq!(mock::open_handles(), open, "the memory moved to the compositor: none left open here");
+        assert_eq!(mock::stray_closes(), 0, "a handle that moved is not closed again");
+        drop(pool);
+        assert_eq!(mock::mappings(), 0, "unmapped with the pool");
     }
-    Some((h as u64, addr as *mut u8))
+
+    #[test]
+    fn a_frame_is_copied_in_whole_or_not_at_all() {
+        let (mut s, id, _peer) = session();
+        let mut w = s.window(id).unwrap();
+        let mut pool = BufferPool::new(&mut w, SIZE, 2).unwrap();
+        let frame: std::vec::Vec<u8> = (0..BYTES as u8).collect();
+        assert!(pool.write(1, &frame));
+        let mut back = [0u8; BYTES];
+        pool.maps.iter().find(|m| m.id == 1).unwrap().map.read_into(0, &mut back).unwrap();
+        assert_eq!(back.as_slice(), frame.as_slice());
+        assert!(!pool.write(1, &frame[1..]), "a short frame leaves a band of the last one");
+        assert!(!pool.write(9, &frame), "no such buffer");
+    }
+
+    #[test]
+    fn a_resize_replaces_one_mapping_and_keeps_the_count() {
+        let (mut s, id, _peer) = session();
+        let mut w = s.window(id).unwrap();
+        let mut pool = BufferPool::new(&mut w, SIZE, 2).unwrap();
+        let bigger = Size { w: 16, h: 8 };
+        let got = pool.acquire(&mut w, bigger).expect("a free buffer");
+        assert_eq!(w.buffer_geometry(got).map(|g| (g.width, g.height)), Some((16, 8)));
+        assert_eq!((mock::mappings(), pool.maps.len()), (2, 2), "the old mapping went when the new one came");
+        assert_eq!(pool.maps.iter().find(|m| m.id == got).unwrap().map.len(), 16 * 8 * 4);
+    }
+
+    #[test]
+    fn a_refused_attach_unmaps_and_closes_what_it_made() {
+        let (mut s, id, peer) = session();
+        drop(peer);
+        let open = mock::open_handles();
+        let mut w = s.window(id).unwrap();
+        assert!(BufferPool::new(&mut w, SIZE, 2).is_none());
+        assert_eq!(mock::mappings(), 0);
+        assert_eq!(mock::open_handles(), open, "the memory handle was closed, not leaked");
+    }
+
+    #[test]
+    fn the_raw_attach_leaves_a_refused_handle_with_its_caller() {
+        let (mut s, id, peer) = session();
+        let mem = Handle::<Memory, MapReadWrite>::create(BYTES).unwrap().into_raw().0;
+        drop(peer);
+        let mut w = s.window(id).unwrap();
+        assert_eq!(w.attach(0, 8, 4, 32, mem), Err(UiError::Transport));
+        assert!(mock::is_open(mem));
+        // SAFETY: `mem` is the test's own handle, wrapped once; the raw attach left it open.
+        let typed = unsafe { Handle::<Memory, MapReadWrite>::from_raw(RawHandle(mem), Rights::empty()) };
+        let (e, back) = w.attach_memory(0, 8, 4, 32, typed, PixelFormat::XRGB8888).unwrap_err();
+        assert_eq!(e, UiError::Transport);
+        drop(back);
+        assert!(!mock::is_open(mem), "the typed form hands it back to be closed");
+    }
 }

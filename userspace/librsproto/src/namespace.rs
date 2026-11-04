@@ -1,7 +1,7 @@
 //! `Namespace` category (`op = 0x01xx`) bodies: `Resolve`, the kernel-forwarded path
 //! resolution. See `docs/spec/rsproto-namespace-ops.md`.
 
-use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
+use crate::{Reader, put_u16, put_u32, put_u64};
 
 /// `RESOLVE_FILE_AS_MEMOBJ` — resolve a regular file to a read-only `MemoryObject`, eagerly.
 pub const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
@@ -90,32 +90,23 @@ pub fn resolve_request(out: &mut [u8], requested_rights: u64, flags: u32, suffix
 
 /// Parse a `ResolveRequest` body.
 pub fn parse_resolve_request(body: &[u8]) -> Option<ResolveRequest<'_>> {
-    if body.len() < RESOLVE_REQUEST_PREFIX_LEN {
-        return None;
-    }
-    let suffix_len = get_u16(body, 12) as usize;
-    let end = RESOLVE_REQUEST_PREFIX_LEN.checked_add(suffix_len)?;
-    if body.len() < end {
-        return None;
-    }
-    Some(ResolveRequest {
-        requested_rights: get_u64(body, 0),
-        flags: get_u32(body, 8),
-        suffix: &body[RESOLVE_REQUEST_PREFIX_LEN..end],
-    })
+    read_resolve_request(&mut Reader::new(body))
+}
+
+/// A `ResolveRequest` at the reader, leaving it after the suffix.
+fn read_resolve_request<'a>(r: &mut Reader<'a>) -> Option<ResolveRequest<'a>> {
+    let requested_rights = r.u64()?;
+    let flags = r.u32()?;
+    let suffix_len = r.u16()?;
+    r.skip(2)?;
+    Some(ResolveRequest { requested_rights, flags, suffix: r.bytes(suffix_len as usize)? })
 }
 
 /// For a `RESOLVE_GROW` request, the `new_size` appended after the suffix; `None` if too short.
 pub fn parse_resolve_grow_size(body: &[u8]) -> Option<u32> {
-    if body.len() < RESOLVE_REQUEST_PREFIX_LEN {
-        return None;
-    }
-    let suffix_len = get_u16(body, 12) as usize;
-    let off = RESOLVE_REQUEST_PREFIX_LEN.checked_add(suffix_len)?;
-    if body.len() < off + 4 {
-        return None;
-    }
-    Some(get_u32(body, off))
+    let mut r = Reader::new(body);
+    read_resolve_request(&mut r)?;
+    r.u32()
 }
 
 /// `ResolveReply` wire length (the resource handle rides in `IpcMsg.handles[0]`).
@@ -147,6 +138,19 @@ pub const FILE_BLOCKS_PREFIX_LEN: usize = 32;
 /// Bytes of one `BlockRun` in a `FILE_BLOCKS` reply: `file_block: u64`, `device_lba: u64`,
 /// `length: u32`, `flags: u32`.
 pub const BLOCK_RUN_WIRE_LEN: usize = 24;
+/// Write one `BlockRun` of a `FILE_BLOCKS` reply into `out`, returning [`BLOCK_RUN_WIRE_LEN`]; `None`
+/// if `out` is too small.
+pub fn put_block_run(out: &mut [u8], file_block: u64, device_lba: u64, length: u32, flags: u32) -> Option<usize> {
+    if out.len() < BLOCK_RUN_WIRE_LEN {
+        return None;
+    }
+    put_u64(out, 0, file_block);
+    put_u64(out, 8, device_lba);
+    put_u32(out, 16, length);
+    put_u32(out, 20, flags);
+    Some(BLOCK_RUN_WIRE_LEN)
+}
+
 /// `FILE_BLOCKS` flag: a file that may not be written, a read-only mount's or one resolved on a
 /// mount refusing changes; the kernel installs it without `MAP_WRITE`.
 pub const FILE_BLOCKS_READ_ONLY: u32 = 1 << 0;
@@ -199,32 +203,41 @@ pub fn subnamespace_reply(out: &mut [u8], consumed: u16, base: &[u8]) -> Option<
 
 /// Parse a success `ResolveReply` body.
 pub fn parse_resolve_reply(body: &[u8]) -> Option<ResolveReply> {
-    if body.len() < RESOLVE_REPLY_LEN {
-        return None;
-    }
-    Some(ResolveReply { object_kind: get_u16(body, 0), content_len: get_u32(body, 4) })
+    let mut r = Reader::new(body);
+    let object_kind = r.u16()?;
+    r.skip(2)?;
+    Some(ResolveReply { object_kind, content_len: r.u32()? })
 }
 
 /// The destination suffix + flags a [`RESOLVE_RENAME`] request carries after its primary
 /// suffix: `dest_len: u16`, `flags: u16`, then `dest_len` bytes.
 /// Laid out after the suffix, like `new_size`, so the fixed prefix keeps one shape.
 pub fn parse_resolve_rename(body: &[u8]) -> Option<(&[u8], u16)> {
-    let r = parse_resolve_request(body)?;
-    let tail = RESOLVE_REQUEST_PREFIX_LEN + r.suffix.len();
-    if body.len() < tail + 4 {
-        return None;
-    }
-    let dest_len = u16::from_le_bytes([body[tail], body[tail + 1]]) as usize;
-    let flags = u16::from_le_bytes([body[tail + 2], body[tail + 3]]);
-    if body.len() < tail + 4 + dest_len {
-        return None;
-    }
-    Some((&body[tail + 4..tail + 4 + dest_len], flags))
+    let mut r = Reader::new(body);
+    read_resolve_request(&mut r)?;
+    let dest_len = r.u16()?;
+    let flags = r.u16()?;
+    Some((r.bytes(dest_len as usize)?, flags))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_run_is_written_at_the_offsets_the_kernel_reads() {
+        let mut out = [0xEEu8; 28];
+        assert_eq!(
+            put_block_run(&mut out, 0x0102_0304_0506_0708, 0x1112_1314_1516_1718, 0x2122_2324, 0x3132_3334),
+            Some(24)
+        );
+        assert_eq!(&out[0..8], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(&out[8..16], &[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]);
+        assert_eq!(&out[16..20], &[0x24, 0x23, 0x22, 0x21]);
+        assert_eq!(&out[20..24], &[0x34, 0x33, 0x32, 0x31]);
+        assert_eq!(&out[24..], &[0xEE; 4], "nothing past the run is touched");
+        assert_eq!(put_block_run(&mut out[..23], 1, 2, 3, 4), None);
+    }
 
     #[test]
     fn resolve_request_round_trips() {
@@ -286,5 +299,22 @@ mod tests {
         super::put_u16(&mut buf, 12, 100);
         assert!(parse_resolve_request(&buf).is_none());
         assert!(parse_resolve_reply(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 64];
+        let n = resolve_request(&mut b, 4, RESOLVE_GROW, b"a/b").unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_resolve_request(x).map(|r| r.suffix.len()).is_some());
+        // A grow's `new_size` and a rename's destination follow the suffix.
+        b[n..n + 4].copy_from_slice(&7u32.to_le_bytes());
+        refuses_every_prefix(&b[..n + 4], |x| parse_resolve_grow_size(x).is_some());
+        put_u16(&mut b, n, 2);
+        put_u16(&mut b, n + 2, RENAME_REPLACE);
+        b[n + 4..n + 6].copy_from_slice(b"xy");
+        refuses_every_prefix(&b[..n + 6], |x| parse_resolve_rename(x).is_some());
+        let n = resolve_reply(&mut b, OBJECT_KIND_FILE, 9).unwrap();
+        refuses_every_prefix(&b[..n], |x| parse_resolve_reply(x).is_some());
     }
 }

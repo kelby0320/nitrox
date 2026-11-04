@@ -2,9 +2,11 @@
 //! serves its filesystem through.
 
 use crate::{BlockReader, BlockWriter, FsError};
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ops::Range;
-use libkern::*;
+use libkern::{IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, RawHandle, Rights};
+use libos::{Handle, Notify, Only, Op, ReadWrite, Ref, Resource, WaitSet};
+use sys::{Device, Object, View, Waited};
 
 mod sys;
 
@@ -14,112 +16,105 @@ const PAGE: u64 = 4096;
 /// never runs past the device.
 const IO_BLOCK: usize = 4096;
 
-/// Wait on one `PendingOperation`, read its `(status, result)` (`IoResult`: status @8, result
-/// @16) and close it. **On buffers of its own**: it must not overwrite the batch of results the
-/// server loop is walking.
-///
-/// `None` when the wait returned anything but one signalled record: the operation is **still
-/// running**, and a buffer it was given is the device's still.
-pub fn po_wait(po: u64) -> Option<(i32, u64)> {
-    let mut results = [0u8; WAIT_RESULT_SIZE];
-    let waited = sys::wait_one(po, &mut results);
-    sys::handle_close(po);
-    if waited != 1 {
-        return None;
+/// Wait for a submitted transfer: `(status, bytes moved)`, or `None` when the wait failed and the
+/// device may still be using its buffer.
+pub fn wait_transfer(op: Op) -> Option<(i32, u64)> {
+    match sys::finished(op) {
+        Waited::Finished { status, moved } => Some((status, moved)),
+        Waited::Unfinished => None,
     }
-    let status = i32::from_le_bytes([results[8], results[9], results[10], results[11]]);
-    let result = u64::from_le_bytes([
-        results[16],
-        results[17],
-        results[18],
-        results[19],
-        results[20],
-        results[21],
-        results[22],
-        results[23],
-    ]);
-    Some((status, result))
+}
+
+/// [`wait_transfer`] on a raw `PendingOperation`, which it closes. For callers not yet on libos.
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+pub fn po_wait(po: u64) -> Option<(i32, u64)> {
+    // SAFETY: the caller's own `PendingOperation`, which this has always closed.
+    let po: Handle<Notify, Only> = unsafe { Handle::from_raw(RawHandle(po), Rights::empty()) };
+    let mut set = WaitSet::<1>::new();
+    set.add(&po).ok()?;
+    let signalled = set.wait(libos::Deadline::NEVER).ok()?;
+    let (_, done) = signalled.iter().next()?;
+    Some((done.status, done.result))
 }
 
 /// **The one buffer a device layer moves every transfer through**, a `MemoryObject` mapped for its
 /// life. **Once a wait fails without its transfer complete it is lost**: the device may still read or
 /// write it, so nothing is copied into it and nothing is submitted through it again.
 pub struct Scratch {
-    mem: u64,
-    addr: u64,
-    len: usize,
+    view: RefCell<View>,
+    mem: Object,
     lost: Cell<bool>,
 }
 
 impl Scratch {
     /// A scratch of `len` bytes; `None` if it could not be created or mapped.
     pub fn new(len: usize) -> Option<Scratch> {
-        let mem = sys::memory_create(len as u64);
-        if mem < 0 {
-            return None;
-        }
-        let mem = mem as u64;
-        let addr = sys::memory_map(mem, len as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
-        if addr < 0 {
-            sys::handle_close(mem);
-            return None;
-        }
-        Some(Scratch { mem, addr: addr as u64, len, lost: Cell::new(false) })
+        let mem = sys::create(len).ok()?;
+        let view = sys::map(&mem, len).ok()?;
+        Some(Scratch { view: RefCell::new(view), mem, lost: Cell::new(false) })
     }
 
     /// One transfer of `len` bytes between the scratch and `device` at `offset`, waited for.
     /// `Io` for a refusal, a failed or short transfer, or a scratch already lost.
-    pub fn transfer(&self, device: u64, opcode: u32, offset: u64, len: u64) -> Result<(), FsError> {
-        self.submit(device, self.mem, opcode, offset, len)
+    pub fn exchange<'a>(
+        &self,
+        device: impl Into<Ref<'a, Resource, ReadWrite>>,
+        opcode: u32,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), FsError> {
+        self.submit(device.into(), &self.mem, opcode, offset, len)
     }
 
-    /// A transfer through `buffer`, a memory object of this process's: `transfer` names the
-    /// scratch's own. A wait that fails loses the scratch whichever buffer the transfer named,
-    /// since a write of zeroes that lands late is as wrong as any other.
-    pub(crate) fn submit(&self, device: u64, buffer: u64, opcode: u32, offset: u64, len: u64) -> Result<(), FsError> {
+    /// [`exchange`](Self::exchange) on a raw device handle. For callers not yet on libos.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub fn transfer(&self, device: u64, opcode: u32, offset: u64, len: u64) -> Result<(), FsError> {
+        // SAFETY: the caller's own device handle, open for the call, as this has always asked.
+        let device = unsafe { Device::from_raw(RawHandle(device), Rights::empty()) };
+        self.exchange(device, opcode, offset, len)
+    }
+
+    /// A transfer through `buffer`: the scratch's own, or the zero span. A wait that fails loses
+    /// the scratch either way, since zeroes landing late are as wrong as any other write.
+    pub(crate) fn submit(
+        &self,
+        device: Device<'_>,
+        buffer: &Object,
+        opcode: u32,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), FsError> {
         if self.lost.get() {
             return Err(FsError::Io);
         }
-        let op = IoOp { opcode, flags: 0, buffer, buf_offset: 0, offset, length: len };
-        let po = sys::io_submit(device, &op);
-        if po < 0 {
-            return Err(FsError::Io);
-        }
-        match po_wait(po as u64) {
-            None => {
+        let op = IoOp { opcode, flags: 0, buffer: buffer.raw().0, buf_offset: 0, offset, length: len };
+        let own = core::ptr::eq(buffer, &self.mem).then_some(&self.view);
+        match sys::transfer(device, &op, own) {
+            Err(_) => Err(FsError::Io),
+            Ok(Waited::Unfinished) => {
                 self.lost.set(true);
                 Err(FsError::Io)
             }
-            Some((0, moved)) if moved == len => Ok(()),
-            Some(_) => Err(FsError::Io),
+            Ok(Waited::Finished { status: 0, moved }) if moved == len => Ok(()),
+            Ok(Waited::Finished { .. }) => Err(FsError::Io),
         }
     }
 
     /// Copy `src` into the scratch at `from`; `Io` once it is lost, as a write still in flight
     /// would carry the new bytes.
     pub fn copy_in(&self, from: usize, src: &[u8]) -> Result<(), FsError> {
-        assert!(from + src.len() <= self.len);
+        assert!(from + src.len() <= self.view.borrow().len());
         if self.lost.get() {
             return Err(FsError::Io);
         }
-        // SAFETY: `new` mapped `len` read-write bytes at `addr`, which stay mapped until `drop`,
-        // and the range is within them; `src` is a distinct buffer of the caller's.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (self.addr as *mut u8).add(from), src.len()) };
-        Ok(())
+        self.view.borrow_mut().write_from(from, src).map_err(|_| FsError::Io)
     }
 
     /// Copy `dst.len()` bytes of the scratch from `from` into `dst`.
     pub fn copy_out(&self, from: usize, dst: &mut [u8]) {
-        assert!(from + dst.len() <= self.len);
-        // SAFETY: as for `copy_in`, the other way.
-        unsafe { core::ptr::copy_nonoverlapping((self.addr as *const u8).add(from), dst.as_mut_ptr(), dst.len()) };
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        sys::memory_unmap(self.addr, self.len as u64);
-        sys::handle_close(self.mem);
+        assert!(from + dst.len() <= self.view.borrow().len());
+        let copied = self.view.borrow().read_into(from, dst);
+        assert!(copied.is_ok(), "a copy within the scratch");
     }
 }
 
@@ -127,11 +122,11 @@ impl Drop for Scratch {
 /// one-page scratch `MemoryObject`; `write_at` is a per-block read-modify-write. The metadata a
 /// mutation writes still goes a block at a time (`TODO(ext4-metadata-writes)`).
 pub struct Disk {
-    device: u64,
+    device: Handle<Resource, ReadWrite>,
     scratch: Scratch,
     /// **[`SPAN`] bytes of zeroes**, a `MemoryObject` never written, so a grow's zeroes go to the
     /// device in large commands.
-    zeroes: u64,
+    zeroes: Object,
 }
 
 /// **How [`Disk`] writes `len` zeroes from `offset`**, as byte ranges `(head, whole, tail)`, any
@@ -145,28 +140,34 @@ pub fn split_zeroes(offset: u64, len: u64) -> (Range<u64>, Range<u64>, Range<u64
 }
 
 impl Disk {
-    /// A disk over `device`, with its scratch made and mapped; or why not, as the line a server
-    /// prints.
-    pub fn new(device: u64) -> Result<Disk, &'static [u8]> {
+    /// A disk over `device`, which it owns, with its scratch made and mapped; or why not, as the
+    /// line a server prints.
+    pub fn over(device: Handle<Resource, ReadWrite>) -> Result<Disk, &'static [u8]> {
         let Some(scratch) = Scratch::new(PAGE as usize) else {
             return Err(b"fs-server: scratch create failed\n");
         };
-        let zeroes = sys::memory_create(SPAN as u64);
-        if zeroes < 0 {
+        let Ok(zeroes) = sys::create(SPAN) else {
             return Err(b"fs-server: zero span create failed\n");
-        }
-        Ok(Disk { device, scratch, zeroes: zeroes as u64 })
+        };
+        Ok(Disk { device, scratch, zeroes })
+    }
+
+    /// [`over`](Self::over) the raw `device`, which the disk takes. For callers not yet on libos.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub fn new(device: u64) -> Result<Disk, &'static [u8]> {
+        // SAFETY: the device `bootstrap` took from the setup message, which nothing else holds.
+        Disk::over(unsafe { Handle::from_raw(RawHandle(device), Rights::empty()) })
     }
 
     /// The block-device handle: what a Model A reply hands the kernel a duplicate of.
-    pub fn device(&self) -> u64 {
-        self.device
+    pub fn handle(&self) -> Device<'_> {
+        self.device.as_ref()
     }
-}
 
-impl Drop for Disk {
-    fn drop(&mut self) {
-        sys::handle_close(self.zeroes);
+    /// The raw [`handle`](Self::handle). For callers not yet on libos.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub fn device(&self) -> u64 {
+        self.device.raw().0
     }
 }
 
@@ -178,7 +179,7 @@ impl BlockReader for Disk {
             let block = cur / IO_BLOCK as u64;
             let in_block = (cur % IO_BLOCK as u64) as usize;
             let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
-            self.scratch.transfer(self.device, IO_OPCODE_READ, block * IO_BLOCK as u64, IO_BLOCK as u64)?;
+            self.scratch.exchange(self.device.as_ref(), IO_OPCODE_READ, block * IO_BLOCK as u64, IO_BLOCK as u64)?;
             self.scratch.copy_out(in_block, &mut buf[done..done + n]);
             done += n;
         }
@@ -194,7 +195,7 @@ impl BlockWriter for Disk {
         let mut at = whole.start;
         while at < whole.end {
             let n = (whole.end - at).min(SPAN as u64);
-            self.scratch.submit(self.device, self.zeroes, IO_OPCODE_WRITE, at, n)?;
+            self.scratch.submit(self.device.as_ref(), &self.zeroes, IO_OPCODE_WRITE, at, n)?;
             at += n;
         }
         self.write_at(tail.start, &ZERO[..(tail.end - tail.start) as usize])
@@ -209,10 +210,15 @@ impl BlockWriter for Disk {
             let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
             // A partial block is read first so the untouched bytes are preserved.
             if n != IO_BLOCK {
-                self.scratch.transfer(self.device, IO_OPCODE_READ, block * IO_BLOCK as u64, IO_BLOCK as u64)?;
+                self.scratch.exchange(
+                    self.device.as_ref(),
+                    IO_OPCODE_READ,
+                    block * IO_BLOCK as u64,
+                    IO_BLOCK as u64,
+                )?;
             }
             self.scratch.copy_in(in_block, &buf[done..done + n])?;
-            self.scratch.transfer(self.device, IO_OPCODE_WRITE, block * IO_BLOCK as u64, IO_BLOCK as u64)?;
+            self.scratch.exchange(self.device.as_ref(), IO_OPCODE_WRITE, block * IO_BLOCK as u64, IO_BLOCK as u64)?;
             done += n;
         }
         Ok(())
@@ -229,22 +235,35 @@ const SECTOR: u64 = 512;
 /// sector-aligned and whose partition's last sectors need not fill a 4 KiB block. A write that is
 /// not sector-aligned reads its edge sectors first.
 pub struct SectorDisk {
-    device: u64,
+    device: Handle<Resource, ReadWrite>,
     scratch: Scratch,
 }
 
 impl SectorDisk {
-    /// A disk over `device`, with its 64 KiB scratch made and mapped; or why not.
-    pub fn new(device: u64) -> Result<SectorDisk, &'static [u8]> {
+    /// A disk over `device`, which it owns, with its 64 KiB scratch made and mapped; or why not.
+    pub fn over(device: Handle<Resource, ReadWrite>) -> Result<SectorDisk, &'static [u8]> {
         let Some(scratch) = Scratch::new(SPAN) else {
             return Err(b"fs-server: scratch create failed\n");
         };
         Ok(SectorDisk { device, scratch })
     }
 
+    /// [`over`](Self::over) the raw `device`, which the disk takes. For callers not yet on libos.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub fn new(device: u64) -> Result<SectorDisk, &'static [u8]> {
+        // SAFETY: the device `bootstrap` took from the setup message, which nothing else holds.
+        SectorDisk::over(unsafe { Handle::from_raw(RawHandle(device), Rights::empty()) })
+    }
+
     /// The block-device handle: what a Model A reply hands the kernel a duplicate of.
+    pub fn handle(&self) -> Device<'_> {
+        self.device.as_ref()
+    }
+
+    /// The raw [`handle`](Self::handle). For callers not yet on libos.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
     pub fn device(&self) -> u64 {
-        self.device
+        self.device.raw().0
     }
 
     /// **The sector-aligned chunks covering `[offset, offset + len)`**, each at most [`SPAN`]:
@@ -272,7 +291,7 @@ impl BlockReader for SectorDisk {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
         let mut done = 0usize;
         SectorDisk::chunks(offset, buf.len(), |at, n, from, take| {
-            self.scratch.transfer(self.device, IO_OPCODE_READ, at, n as u64)?;
+            self.scratch.exchange(self.device.as_ref(), IO_OPCODE_READ, at, n as u64)?;
             self.scratch.copy_out(from, &mut buf[done..done + take]);
             done += take;
             Ok(())
@@ -286,10 +305,10 @@ impl BlockWriter for SectorDisk {
         SectorDisk::chunks(offset, buf.len(), |at, n, from, take| {
             // A chunk the request does not cover whole keeps the bytes it does not write.
             if from != 0 || take != n {
-                self.scratch.transfer(self.device, IO_OPCODE_READ, at, n as u64)?;
+                self.scratch.exchange(self.device.as_ref(), IO_OPCODE_READ, at, n as u64)?;
             }
             self.scratch.copy_in(from, &buf[done..done + take])?;
-            self.scratch.transfer(self.device, IO_OPCODE_WRITE, at, n as u64)?;
+            self.scratch.exchange(self.device.as_ref(), IO_OPCODE_WRITE, at, n as u64)?;
             done += take;
             Ok(())
         })
@@ -306,8 +325,8 @@ pub const WINDOW_SPAN: usize = 128 * 1024;
 /// read first where a write covers a sector only in part (a filesystem writes 32-byte
 /// descriptors, a device moves 512-byte sectors). **One scratch object for both directions**.
 /// **Not `Sync`**: every transfer passes through the one scratch.
-pub struct PartitionIo {
-    device: u64,
+pub struct PartitionIo<'a> {
+    device: Device<'a>,
     /// Byte offset of the window's first sector on that device.
     base: u64,
     len: u64,
@@ -315,11 +334,20 @@ pub struct PartitionIo {
     scratch: Scratch,
 }
 
-impl PartitionIo {
+impl<'a> PartitionIo<'a> {
     /// A window onto `device`'s `[base, base + len)` bytes, `base` sector-aligned; `None` if the
     /// scratch could not be made.
-    pub fn new(device: u64, base: u64, len: u64) -> Option<PartitionIo> {
-        Some(PartitionIo { device, base, len, scratch: Scratch::new(WINDOW_SPAN)? })
+    pub fn window(device: impl Into<Device<'a>>, base: u64, len: u64) -> Option<PartitionIo<'a>> {
+        Some(PartitionIo { device: device.into(), base, len, scratch: Scratch::new(WINDOW_SPAN)? })
+    }
+
+    /// [`window`](Self::window) onto a raw `device`. For callers not yet on libos.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub fn new(device: u64, base: u64, len: u64) -> Option<PartitionIo<'a>> {
+        // SAFETY: the caller's own device handle, which stays open while the window lives, as this
+        // has always asked.
+        let device = unsafe { Device::from_raw(RawHandle(device), Rights::empty()) };
+        PartitionIo::window(device, base, len)
     }
 }
 
@@ -340,13 +368,13 @@ fn window(base: u64, len: u64, cap: usize, at: u64, want: usize) -> Result<(u64,
     Ok((start, span, intra))
 }
 
-impl BlockReader for PartitionIo {
+impl BlockReader for PartitionIo<'_> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
         let mut done = 0usize;
         while done < buf.len() {
             let (start, span, intra) =
                 window(self.base, self.len, WINDOW_SPAN, offset + done as u64, buf.len() - done)?;
-            self.scratch.transfer(self.device, IO_OPCODE_READ, start, span)?;
+            self.scratch.exchange(self.device, IO_OPCODE_READ, start, span)?;
             let take = (buf.len() - done).min(span as usize - intra);
             self.scratch.copy_out(intra, &mut buf[done..done + take]);
             done += take;
@@ -355,7 +383,7 @@ impl BlockReader for PartitionIo {
     }
 }
 
-impl BlockWriter for PartitionIo {
+impl BlockWriter for PartitionIo<'_> {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
         let mut done = 0usize;
         while done < buf.len() {
@@ -365,10 +393,10 @@ impl BlockWriter for PartitionIo {
             // **Read first unless the write covers whole sectors**: a partial sector written
             // without its surroundings replaces bytes the filesystem is still using.
             if intra != 0 || take != span as usize {
-                self.scratch.transfer(self.device, IO_OPCODE_READ, start, span)?;
+                self.scratch.exchange(self.device, IO_OPCODE_READ, start, span)?;
             }
             self.scratch.copy_in(intra, &buf[done..done + take])?;
-            self.scratch.transfer(self.device, IO_OPCODE_WRITE, start, span)?;
+            self.scratch.exchange(self.device, IO_OPCODE_WRITE, start, span)?;
             done += take;
         }
         Ok(())

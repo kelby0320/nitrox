@@ -37,6 +37,9 @@ pub mod setup;
 pub mod table;
 pub mod wire;
 
+#[cfg(all(test, feature = "io"))]
+mod io_tests;
+
 pub use record::TypedRecord;
 pub use table::{Item, TableReader, TableWriter, write_text_fallback};
 pub use wire::{

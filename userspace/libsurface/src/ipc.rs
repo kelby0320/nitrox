@@ -4,18 +4,16 @@
 //! endpoint (`rsproto-surface-ops.md`, "How a client obtains a connection").
 
 use libkern::error::KError;
-use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_WAIT, abi::CLOCK_MONOTONIC, syscall2, syscall4, syscall5,
+use libkern::handle::{RawHandle, Rights};
+use libos::{
+    CanLookup, Carried, Channel, Deadline, Handle, MapReadWrite, Memory, Msg, Namespace, NsReadOnly, Only, Ref,
+    WaitSet, block_on,
 };
 use librsproto::surface::OP_RELEASE;
 use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 use crate::{Transport, UiError};
 
-/// IPC message buffer length.
-const MSG_LEN: usize = 4096;
-/// Offset of the rsproto payload inside an `IpcMsg`.
-const PAYLOAD_OFF: usize = 24;
 /// Largest event body parked while waiting for a reply.
 ///
 /// Sized from the protocol: a buffer smaller than a permitted record hands the client a
@@ -40,12 +38,15 @@ fn losable(entry: &(u16, [u8; MAX_BODY], usize)) -> bool {
 }
 
 /// A connection to the compositor over an IPC channel.
+///
+/// Dropping it closes the endpoint. The compositor frees a session slot only on `PeerClosed`, and
+/// there are `MAX_WAIT_HANDLES - 2` = 30 for the whole machine: a leaked endpoint eventually
+/// makes `/dev/draw/new` fail for every process.
 pub struct ChannelTransport {
-    channel: u64,
+    channel: Handle<Channel, Only>,
     request_id: u64,
-    msg: [u8; MSG_LEN],
-    handles: [u64; 4],
-    recv_msg: [u8; MSG_LEN],
+    msg: Msg,
+    recv_msg: Msg,
     /// Messages that arrived while waiting for a reply — drained by `poll_event`.
     parked: [(u16, [u8; MAX_BODY], usize); MAX_PARKED],
     /// Whether a parked event was discarded since the last time anyone asked.
@@ -54,33 +55,36 @@ pub struct ChannelTransport {
 }
 
 impl ChannelTransport {
-    /// Wrap an endpoint obtained by resolving `/dev/draw/new`.
-    ///
-    /// # Safety
-    ///
-    /// `channel` must be a live IPC endpoint connected to a compositor, given away: the
-    /// transport's `Drop` closes it, so a borrowed handle is a double close.
-    pub const unsafe fn new(channel: u64) -> Self {
+    /// Talk to the compositor through `channel`, an endpoint obtained by resolving
+    /// `/dev/draw/new`, which the transport owns and closes.
+    pub fn from_endpoint(channel: Handle<Channel, Only>) -> Self {
         Self {
             channel,
             request_id: 1,
-            msg: [0; MSG_LEN],
-            handles: [0; 4],
-            recv_msg: [0; MSG_LEN],
+            msg: Msg::new(),
+            recv_msg: Msg::new(),
             parked: [(0, [0; MAX_BODY], 0); MAX_PARKED],
             lost: false,
             parked_len: 0,
         }
     }
 
-    /// Resolve `/dev/draw/new` and wrap the endpoint it answers with.
+    /// Wrap an endpoint obtained by resolving `/dev/draw/new`. For callers not yet on libos; the
+    /// typed form is [`from_endpoint`](Self::from_endpoint).
     ///
     /// # Safety
     ///
-    /// `root_ns` must be a live namespace handle owned by the caller.
-    pub unsafe fn connect(root_ns: u64) -> Result<Self, UiError> {
-        // SAFETY: the caller guarantees `root_ns` is live and owned.
-        unsafe { Self::resolve(root_ns, "/dev/draw/new") }
+    /// `channel` must be a live IPC endpoint connected to a compositor, given away: the
+    /// transport's `Drop` closes it, so a borrowed handle is a double close.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub unsafe fn new(channel: u64) -> Self {
+        // SAFETY: the caller gives the endpoint away, as this has always asked.
+        Self::from_endpoint(unsafe { Handle::from_raw(RawHandle(channel), Rights::empty()) })
+    }
+
+    /// Resolve `/dev/draw/new` in `ns` and wrap the endpoint it answers with.
+    pub fn open<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>) -> Result<Self, UiError> {
+        Self::resolve(ns.into(), "/dev/draw/new")
     }
 
     /// Resolve `/dev/draw/manage`, the manager channel for the `Manage` ops on any window.
@@ -89,42 +93,42 @@ impl ChannelTransport {
     /// with no arbiter. The capability is the binding: an application's namespace binds
     /// `/dev/draw/new` alone. A process spawned with `namespace: 0` inherits the root, where
     /// `/dev/draw` is unscoped, and is not gated.
+    pub fn open_manager<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>) -> Result<Self, UiError> {
+        Self::resolve(ns.into(), "/dev/draw/manage")
+    }
+
+    /// [`open`](Self::open) for a raw namespace handle. For callers not yet on libos.
     ///
     /// # Safety
     ///
     /// `root_ns` must be a live namespace handle owned by the caller.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub unsafe fn connect(root_ns: u64) -> Result<Self, UiError> {
+        // SAFETY: the caller guarantees `root_ns` is live and owned.
+        Self::open(unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) })
+    }
+
+    /// [`open_manager`](Self::open_manager) for a raw namespace handle. For callers not yet on
+    /// libos.
+    ///
+    /// # Safety
+    ///
+    /// `root_ns` must be a live namespace handle owned by the caller.
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
     pub unsafe fn manage(root_ns: u64) -> Result<Self, UiError> {
         // SAFETY: the caller guarantees `root_ns` is live and owned.
-        unsafe { Self::resolve(root_ns, "/dev/draw/manage") }
+        Self::open_manager(unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) })
     }
 
-    /// Resolve `path` and wrap the endpoint it answers with.
-    ///
-    /// # Safety
-    ///
-    /// `root_ns` must be a live namespace handle owned by the caller.
-    unsafe fn resolve(root_ns: u64, path: &str) -> Result<Self, UiError> {
-        use libkern::handle::{RawHandle, Rights};
-        use libos::{Channel, Namespace, NsReadOnly, Only, Ref, block_on};
-
-        // SAFETY: the caller guarantees `root_ns` is live and owned.
-        let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+    fn resolve<M: CanLookup>(ns: Ref<'_, Namespace, M>, path: &str) -> Result<Self, UiError> {
         let ch = block_on(ns.lookup::<Channel, Only>(path, Rights::SEND | Rights::RECV | Rights::WAIT))
             .map_err(|_| UiError::Transport)?;
-        // SAFETY: a live endpoint this process now owns.
-        Ok(unsafe { Self::new(ch.into_raw().0) })
+        Ok(Self::from_endpoint(ch))
     }
-}
 
-impl Drop for ChannelTransport {
-    /// Close the endpoint. The compositor frees a session slot only on `PeerClosed`, and there
-    /// are `MAX_WAIT_HANDLES - 2` = 30 for the whole machine: a leaked endpoint eventually
-    /// makes `/dev/draw/new` fail for every process.
-    fn drop(&mut self) {
-        if self.channel != 0 {
-            // SAFETY: closing an endpoint this transport owns and no longer uses.
-            unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, self.channel, 0, 0, 0) };
-        }
+    /// The endpoint, to wait on beside a client's own handles.
+    pub fn endpoint(&self) -> Ref<'_, Channel, Only> {
+        self.channel.as_ref()
     }
 }
 
@@ -132,31 +136,37 @@ impl ChannelTransport {
     /// Read the next event, waiting up to `timeout_ns` from now; `Ok(None)` is a timeout.
     ///
     /// Blocks rather than spinning on [`poll_event`](Transport::poll_event), which on a
-    /// single-CPU guest starves the process waited for. `sys_wait` takes an absolute deadline,
-    /// so this adds the monotonic clock: passed straight through, every wait would time out.
+    /// single-CPU guest starves the process waited for. A wait takes an absolute deadline, so
+    /// this adds the monotonic clock: passed straight through, every wait would time out.
     pub fn wait_event_timeout(&mut self, buf: &mut [u8], timeout_ns: u64) -> Result<Option<(u16, usize)>, UiError> {
-        let mut now: u64 = 0;
-        // SAFETY: a valid out-pointer for one u64; `sys_clock_read` writes exactly that.
-        unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
-        let deadline = now.saturating_add(timeout_ns);
+        let deadline = Deadline::after(timeout_ns).map_err(|_| UiError::Transport)?;
         loop {
             // A parked message is older than anything on the wire.
             if let Some(ev) = self.poll_event(buf)? {
                 return Ok(Some(ev));
             }
-            let handles = [self.channel];
-            let mut results = [0u8; 24];
-            // SAFETY: a valid handle array and result buffer for one waiter. `sys_wait` is
-            // where the thread blocks — never inside the recv.
-            let waited =
-                unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, deadline) };
-            if waited == KError::TimedOut.as_i32() as i64 {
+            // The thread blocks here, never inside the recv.
+            let signalled = self.wait(deadline)?;
+            if signalled.is_empty() {
                 // Poll once more: an event landing between the poll and the wait is not a timeout.
                 return self.poll_event(buf);
             }
-            if waited != 1 {
-                return Err(UiError::Transport);
-            }
+        }
+    }
+
+    /// Wait on the endpoint until `deadline`: which signalled, none at the deadline.
+    fn wait(&self, deadline: Deadline) -> Result<libos::Signalled<1>, UiError> {
+        let mut set = WaitSet::<1>::new();
+        set.add(&self.channel).map_err(|_| UiError::Transport)?;
+        set.wait(deadline).map_err(|_| UiError::Transport)
+    }
+
+    /// Take one message into `recv_msg`: `None` if the ring is empty.
+    fn recv(&mut self) -> Result<Option<()>, UiError> {
+        match self.channel.recv(&mut self.recv_msg) {
+            Ok(_) => Ok(Some(())),
+            Err(e) if e.code() == KError::WouldBlock => Ok(None),
+            Err(_) => Err(UiError::Transport),
         }
     }
 
@@ -199,55 +209,41 @@ impl Transport for ChannelTransport {
         self.request_id = self.request_id.wrapping_add(1);
 
         let hcount = if handle.is_some() { 1u16 } else { 0 };
-        let rs_len = encode(&mut self.msg[PAYLOAD_OFF..], op, id, 0, body, hcount).ok_or(UiError::Malformed)?;
-        self.msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        self.msg[8] = hcount as u8;
+        let rs_len = encode(self.msg.payload_mut(), op, id, 0, body, hcount).ok_or(UiError::Malformed)?;
+        self.msg.set_len(rs_len).map_err(|_| UiError::Malformed)?;
+        let mut carried = Carried::new();
         if let Some(h) = handle {
-            self.handles[0] = h;
+            // SAFETY: the caller's own handle, given with the message as this always asked; a send
+            // that fails hands it back below rather than closing it.
+            let h = unsafe { Handle::<Memory, MapReadWrite>::from_raw(RawHandle(h), Rights::empty()) };
+            if let Err(h) = carried.push(h) {
+                h.into_raw();
+                return Err(UiError::Malformed);
+            }
         }
-
-        // SAFETY: a live endpoint, a valid message buffer, and `hcount` handles in
-        // `self.handles`.
-        let sr = unsafe {
-            syscall5(
-                SYS_CHANNEL_SEND,
-                self.channel,
-                (&raw const self.msg) as u64,
-                (&raw const self.handles) as u64,
-                hcount as u64,
-                SENDMODE_NOBLOCK,
-            )
-        };
-        if sr != 0 {
+        if self.channel.send(&self.msg, &mut carried).is_err() {
+            if let Some(h) = carried.take::<Memory, MapReadWrite>(0) {
+                h.into_raw();
+            }
             return Err(UiError::Transport);
         }
         if reply.is_empty() {
             return Ok(None);
         }
 
-        // `sys_channel_recv` is non-blocking, so a bare send-then-recv fails unless the server
-        // was scheduled in the gap; `sys_wait` is where the thread blocks.
+        // A recv never blocks, so a bare send-then-recv fails unless the server was scheduled in
+        // the gap; the wait is where the thread blocks.
         //
         // Messages that are not this reply are parked: a `Release` can arrive first, and
         // discarding it would leave the buffer busy forever. `poll_event` drains them.
         loop {
-            let handles = [self.channel];
-            let mut results = [0u8; 24];
-            // SAFETY: a valid handle array and result buffer for one waiter.
-            let waited =
-                unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
-            if waited != 1 {
+            if self.wait(Deadline::NEVER)?.is_empty() {
                 return Err(UiError::Transport);
             }
-            let _sent = match libkern::channel_recv(self.channel, &mut self.recv_msg) {
-                Ok(sent) => sent,
-                Err(rr) if rr == KError::WouldBlock.as_i32() as i64 => continue, // nothing to take
-                Err(_) => return Err(UiError::Transport),
-            };
-            let payload_len =
-                u32::from_le_bytes([self.recv_msg[4], self.recv_msg[5], self.recv_msg[6], self.recv_msg[7]]) as usize;
-            let req = &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];
-            let m = decode(req).map_err(|_| UiError::BadReply)?;
+            if self.recv()?.is_none() {
+                continue;
+            }
+            let m = decode(self.recv_msg.payload()).map_err(|_| UiError::BadReply)?;
 
             // Matched by request id, so a stale reply cannot be mistaken for this one.
             if m.flags & RS_FLAG_REPLY != 0 && m.request_id == id {
@@ -277,7 +273,7 @@ impl Transport for ChannelTransport {
     }
 
     fn wait_handle(&self) -> u64 {
-        self.channel
+        self.channel.raw().0
     }
 
     fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError> {
@@ -308,15 +304,10 @@ impl Transport for ChannelTransport {
             buf[..n].copy_from_slice(&body[..n]);
             return Ok(Some((op, n)));
         }
-        let _sent = match libkern::channel_recv(self.channel, &mut self.recv_msg) {
-            Ok(sent) => sent,
-            Err(rr) if rr == KError::WouldBlock.as_i32() as i64 => return Ok(None),
-            Err(_) => return Err(UiError::Transport),
-        };
-        let payload_len =
-            u32::from_le_bytes([self.recv_msg[4], self.recv_msg[5], self.recv_msg[6], self.recv_msg[7]]) as usize;
-        let req = &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];
-        let m = decode(req).map_err(|_| UiError::BadReply)?;
+        if self.recv()?.is_none() {
+            return Ok(None);
+        }
+        let m = decode(self.recv_msg.payload()).map_err(|_| UiError::BadReply)?;
         // A body that does not fit is a loss, not a shorter one: every variable-length field is
         // length-prefixed, so a cut record can parse as a different event.
         if m.body.len() > buf.len() {
@@ -329,15 +320,47 @@ impl Transport for ChannelTransport {
     }
 }
 
+/// A transport over the model of the kernel, and the compositor's end of it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod harness {
     use super::*;
 
+    /// A transport and the peer endpoint where its requests arrive.
+    pub fn connected() -> (ChannelTransport, Handle<Channel, Only>) {
+        let (ours, peer) = Handle::<Channel, Only>::pair(8).expect("a channel");
+        (ChannelTransport::from_endpoint(ours), peer)
+    }
+
+    /// Queue one message from the compositor.
+    pub fn push<'a>(peer: impl Into<Ref<'a, Channel, Only>>, op: u16, id: u64, flags: u32, body: &[u8]) {
+        let mut msg = Msg::new();
+        let n = encode(msg.payload_mut(), op, id, flags, body, 0).expect("fits");
+        msg.set_len(n).expect("fits");
+        peer.into().send(&msg, &mut Carried::new()).expect("room in the ring");
+    }
+
+    /// Queue the reply to request `id`.
+    pub fn reply<'a>(peer: impl Into<Ref<'a, Channel, Only>>, op: u16, id: u64, body: &[u8]) {
+        push(peer, op, id, RS_FLAG_REPLY, body);
+    }
+
+    /// Take what a client sent: the op, the request id, the body, and the handles it carried.
+    pub fn taken<'a>(peer: impl Into<Ref<'a, Channel, Only>>) -> Option<(u16, u64, std::vec::Vec<u8>, Carried)> {
+        let mut msg = Msg::new();
+        let carried = peer.into().recv(&mut msg).ok()?;
+        let m = decode(msg.payload()).ok()?;
+        Some((m.op, m.request_id, m.body.to_vec(), carried))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harness::*;
+    use super::*;
+    use libos::mock;
+
     fn transport() -> ChannelTransport {
-        // SAFETY: `0` is not a live endpoint, and nothing here sends or receives on it:
-        // `poll_event` drains parked entries before touching the channel, and `Drop` checks
-        // for `0`.
-        unsafe { ChannelTransport::new(0) }
+        connected().0
     }
 
     fn park(t: &mut ChannelTransport, n: u16) {
@@ -462,5 +485,122 @@ mod tests {
         assert_eq!(op, 0x8001, "the oldest was the one dropped");
         assert_eq!(len, 1);
         assert_eq!(buf[0], 1, "and its body came with it");
+    }
+
+    const OP: u16 = 0x0901;
+
+    /// A memory object to send, as the raw handle a caller gives.
+    fn memory() -> u64 {
+        Handle::<Memory, MapReadWrite>::create(4096).unwrap().into_raw().0
+    }
+
+    #[test]
+    fn a_request_arrives_with_its_handle_and_returns_its_reply() {
+        mock::reset();
+        let (mut t, peer) = connected();
+        reply(&peer, OP, 1, b"ok");
+        let mem = memory();
+        let mut out = [0u8; 8];
+        assert_eq!(t.request(OP, b"abc", Some(mem), &mut out), Ok(Some(2)));
+        assert_eq!(&out[..2], b"ok");
+        let (op, id, body, carried) = taken(&peer).expect("the request");
+        assert_eq!((op, id, body.as_slice(), carried.len()), (OP, 1, &b"abc"[..], 1));
+        assert_eq!(t.request(OP, b"", None, &mut []), Ok(None), "no reply asked for, none waited for");
+        assert_eq!(taken(&peer).map(|r| (r.1, r.3.len())), Some((2, 0)), "the next id, no handle");
+    }
+
+    #[test]
+    fn a_refused_send_leaves_the_handle_with_the_caller() {
+        mock::reset();
+        let (mut t, peer) = connected();
+        let mem = memory();
+        drop(peer);
+        assert_eq!(t.request(OP, b"abc", Some(mem), &mut []), Err(UiError::Transport));
+        assert!(mock::is_open(mem), "only a send that lands moves it");
+        assert_eq!(mock::stray_closes(), 0);
+    }
+
+    #[test]
+    fn an_event_before_the_reply_is_kept_for_poll_event() {
+        mock::reset();
+        let (mut t, peer) = connected();
+        push(&peer, OP_RELEASE, 0, 0, b"r");
+        reply(&peer, OP, 1, b"ok");
+        let mut out = [0u8; 8];
+        assert_eq!(t.request(OP, b"", None, &mut out), Ok(Some(2)));
+        let mut buf = [0u8; 8];
+        assert_eq!(t.poll_event(&mut buf), Ok(Some((OP_RELEASE, 1))));
+        assert_eq!(buf[0], b'r');
+    }
+
+    #[test]
+    fn an_error_reply_is_a_server_refusal_and_a_wrong_op_a_bad_reply() {
+        mock::reset();
+        let (mut t, peer) = connected();
+        push(&peer, OP, 1, RS_FLAG_REPLY | RS_FLAG_ERROR, b"");
+        assert_eq!(t.request(OP, b"", None, &mut [0u8; 4]), Err(UiError::Server));
+        reply(&peer, OP + 1, 2, b"");
+        assert_eq!(t.request(OP, b"", None, &mut [0u8; 4]), Err(UiError::BadReply));
+    }
+
+    #[test]
+    fn polling_an_empty_endpoint_is_none_and_a_closed_peer_an_error() {
+        mock::reset();
+        let (mut t, peer) = connected();
+        let mut buf = [0u8; 8];
+        assert_eq!(t.poll_event(&mut buf), Ok(None));
+        push(&peer, 0x8001, 0, 0, b"xy");
+        assert_eq!(t.poll_event(&mut buf), Ok(Some((0x8001, 2))));
+        drop(peer);
+        assert_eq!(t.poll_event(&mut buf), Err(UiError::Transport));
+    }
+
+    #[test]
+    fn an_event_too_big_for_the_buffer_is_a_loss_not_a_short_one() {
+        mock::reset();
+        let (mut t, peer) = connected();
+        push(&peer, 0x8001, 0, 0, b"too long");
+        assert_eq!(t.poll_event(&mut [0u8; 2]), Ok(None));
+        assert!(t.took_loss());
+    }
+
+    #[test]
+    fn a_timed_wait_gives_up_with_none_and_returns_an_event_that_is_there() {
+        mock::reset();
+        let (mut t, peer) = connected();
+        let mut buf = [0u8; 8];
+        assert_eq!(t.wait_event_timeout(&mut buf, 1_000), Ok(None));
+        assert_eq!(mock::sleeps(), 1, "it waited out its deadline");
+        push(&peer, 0x8002, 0, 0, b"z");
+        assert_eq!(t.wait_event_timeout(&mut buf, 1_000), Ok(Some((0x8002, 1))));
+        assert_eq!(mock::sleeps(), 1, "an event already there is not waited for");
+    }
+
+    #[test]
+    fn the_endpoint_is_waited_on_and_closed_with_the_transport() {
+        mock::reset();
+        let (t, _peer) = connected();
+        assert_eq!(t.wait_handle(), t.endpoint().raw().0);
+        assert!(mock::is_open(t.wait_handle()));
+        let open = mock::open_handles();
+        drop(t);
+        assert_eq!(mock::open_handles(), open - 1);
+    }
+
+    #[test]
+    fn open_resolves_the_compositor_and_the_manager_path_separately() {
+        mock::reset();
+        let (ns, peer) = mock::answering("/dev/draw/new");
+        // SAFETY: the mock's handles, open for the test.
+        let (ns, peer) = unsafe {
+            (
+                Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(ns), Rights::LOOKUP),
+                Ref::<Channel, Only>::from_raw(RawHandle(peer), Rights::empty()),
+            )
+        };
+        let mut t = ChannelTransport::open(ns).expect("resolves");
+        assert!(ChannelTransport::open_manager(ns).is_err(), "nothing answers /dev/draw/manage");
+        t.request(OP, b"hi", None, &mut []).unwrap();
+        assert_eq!(taken(peer).map(|r| r.2), Some(b"hi".to_vec()));
     }
 }

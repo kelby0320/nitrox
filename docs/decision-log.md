@@ -37556,3 +37556,65 @@ behind a mapping, channels with rings and peers, direct bindings, and each call'
 kernel's order. Each guarantee was shown to fail its test with the guarantee removed, 23 controls;
 two passed at first, a moved grant closed twice and a bootstrap handle never closed, until the mock
 counted closes of handles not there and the test reached the drop.
+
+## 2026-11-03 — Before Phase 7, E.2: the libraries on libos, a bounded reader, a server's replies
+
+E.2 moves the nine libraries onto libos (`librsproto`, `libstream`, `libfs`, `libfsserver`,
+`libsession`, `libsurface`, `liblog`, `libprompt` and `libdraw`) and does P8 with them, as
+`librsproto` is the file both change. None makes a raw syscall: the ratchet falls by their 175, from
+2,262 in 35 entries to 2,087 in 26, every other crate's count as it was.
+
+Decided in the part, for the maintainer's eye:
+
+- **Each library has its typed form now, and keeps its raw one as a shim** (the maintainer's
+  call): a function that took or gave a raw handle has a form over `Ref` and `Handle`, named for
+  the end state, and the raw one keeps its name, signature and behaviour, borrowing its `u64` for
+  the call, `TODO(raw-handle-shims)`. No caller in another crate changed; E.5 removes the shims as
+  their last callers move. **Two shims refuse what their raw form passed on**: a path that is not
+  UTF-8 is refused before the kernel, as libos's paths are `&str`, and a session's views base that
+  is not binds no `/dev/views`.
+- **An operation under `block_on` is one wait.** `Op::poll` read its PO, registered it, `block_on`
+  waited and threw away what it read, and the next poll read the PO again: three waits where code
+  making its own syscalls made one. E.1's counts could not show it with nothing yet on libos; E.2's
+  did, the session's programs making 74 waits where `main` made 40. `block_on` now keeps what its
+  wait read for the poll after it, and a first poll under it registers without a call. The
+  programs make 293 calls where `main` made 299.
+- **A copy resolves its destination at most twice** (`libfs`), from up to four, and `write_file`
+  takes the same fix. The plan's control, copy's row in the counts, could not show it: both of the
+  probe's copies made a new file, which resolved twice already. The probe now copies over a larger
+  file too, 43 calls of the program's and 43 of the server's, from 49 and 52.
+- **A device's failed I/O is told from a wait that failed** (`Op::wait_out`). `block_on` answers
+  both as an `Err`, which left libfsserver guessing from the code whether the device still held its
+  scratch; a device completing `TimedOut` would have read as a lost one.
+- **A disk owns its device** (`libfsserver`) and closes it on drop, where it held a raw value it
+  never closed; a partition's window borrows, as the installer keeps its device.
+- **librsproto's parsers read through `Reader`**, whose reads answer `None` past the end and
+  consume nothing when they do. The guards that only said how long a body must be went; those that
+  say more, an exact length, a cap, a power of two, stayed.
+- **A server's replies are `librsproto::server`'s**, landed with no caller: E.3's servers move
+  onto it, each keeping its own loop. Where their copies disagreed it follows those that answer an
+  error when a reply fails and size an error to its reason, and hands a table on as `service-mgr`'s
+  did, to be mapped for reading, stated and moved: a reader sizes a file by its stat. A directory
+  name no page can hold is left out, where both copies stopped at it and a client would ask again
+  for ever.
+- **`abi-sync-check` holds the kernel's rsproto constants to librsproto's**, from the kernel's
+  names: each must exist in one of librsproto's four files with its value, or be listed one-sided
+  with its reason, and a kernel value it cannot read is a finding. librsproto's own names are not
+  the kernel's to mirror. The fields around a block run are still at literal offsets on both sides,
+  which a text check cannot compare: `TODO(rsproto-offsets)`, for E.7, which rewrites the resolve.
+- **`/session/user` is bound read-only**, with a reader's rights and the `TRANSFER` a direct bind
+  needs, where every process in the session could resolve it writable and rewrite who the session
+  is for.
+- **The initramfs ceiling is 440 KiB.** The four programs grew with the libraries under them, the
+  root's server by 7.9 KB and the profile server by 11.3 KB; 5.9 KB more had been `Debug`
+  formatting that three `expect`s linked into both filesystem servers, now gone. The ceiling still
+  leaves less room than `eshell`'s 28 KB, so a fifth program trips it. E.3 moves `init` and the
+  profile server, and the ceiling is measured again there.
+
+**The mock became a closer model of the kernel**, as the moves needed: a child holds what its spawn
+granted, where a moved end read as closed the moment the child was made, which had left a session
+leader's setup untestable; a binding keeps its base; two handles can be asked whether they name one
+object; and a map past a file's backing fails its test by name, where a mutation mapping 8 MiB had
+crashed the run. Each crate's new tests were shown to fail with the code they cover broken, and the
+two gaps its implementer reported in `libsession`, a binding's base and a leader's setup, are
+covered now.

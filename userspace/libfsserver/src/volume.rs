@@ -1,5 +1,5 @@
 //! **The filesystem, as the protocol sees it**: what a server's library must do for the server
-//! loop, whatever the filesystem; a server hands its [`Volume`] to [`crate::server::run`].
+//! loop, whatever the filesystem; a server hands its [`Volume`] to [`crate::server::serve_volume`].
 //!
 
 use crate::{BlockRun, FsError};

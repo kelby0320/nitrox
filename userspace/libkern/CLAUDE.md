@@ -102,9 +102,9 @@ supervisors share it.
 
 ## Testing
 
-There is no syscall mock (`docs/rationale/deferred-decisions.md`). On the host a syscall is Linux's
-of that number, so a test stops short of the first one, and `libos::sys` is the seam for code
-above this crate. Under Miri `cfg(miri)` twins stand in for the assembly: `syscall6` refuses every
+There is no syscall mock here. On the host a syscall is Linux's of that number, so a test stops
+short of the first one; libos's model of the kernel, its `mock` feature, is the seam for code above
+this crate. Under Miri `cfg(miri)` twins stand in for the assembly: `syscall6` refuses every
 syscall `Unsupported`, and `exit` panics, failing the test that reaches it.
 
 For tests that need real syscalls, use the QEMU integration test harness.

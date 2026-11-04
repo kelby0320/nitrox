@@ -22,6 +22,8 @@ const COMMANDS: &[&str] = &[
     "rename ./c.txt ./d.txt",
     "remove ./d.txt",
     "mkdir ./e",
+    "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] | save ./big.txt",
+    "copy --force ./a.txt ./big.txt",
 ];
 
 /// The process whose calls a program's file operations cost, by the name it logs under.

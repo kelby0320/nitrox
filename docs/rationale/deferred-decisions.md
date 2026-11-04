@@ -2285,6 +2285,24 @@ shape it will keep, and the call under it changes as its sub-part of
 `io_submit`, E.8 makes `Spawn` read the image into memory first, and E.9 makes entropy a node.
 Trigger: each of those sub-parts.
 
+**A library's raw-handle functions stay beside its typed ones — `TODO(raw-handle-shims)`.** Part
+E.2 gives each library moved onto libos a typed API (`Ref`, `Handle`), and keeps each function
+that took or gave a raw `u64` handle as a thin shim over it, so the crates that call it move once,
+onto the typed form, in E.3 to E.5, rather than once now and once again then (the maintainer's
+call, 2026-11-03). A shim's `u64` is its caller's claim, as it always was: borrowing it is the one
+`unsafe` it adds. Trigger: a shim's last caller moving onto libos, and E.5 at the latest, by when
+none is left.
+
+**A resource-server reply's field offsets are literals on both sides — `TODO(rsproto-offsets)`.**
+`abi-sync-check` holds the kernel's rsproto constants to `librsproto`'s (the safety survey's
+proto-o6), and `put_block_run` writes a block run at the offsets the kernel reads, pinned by bytes.
+The fields around it are written at literal offsets by `librsproto` and read at literal offsets by
+the kernel: a `FILE_BLOCKS` reply's block size, run count, file id and flags at 8, 12, 16 and 24, a
+`SUBNAMESPACE` reply's `consumed` and base length at 8 and 10, and a `ResolveReply`'s `content_len`
+at 4. The check compares named values, so naming each on both sides would let it hold them. Part
+E.7 of [`syscall-surface.md`](../planning/syscall-surface.md) rewrites the resolve and its replies,
+and names them there rather than now and again then. Trigger: E.7.
+
 **A thread's stack has no guard below it — `TODO(thread-stack-guard)`.** `libos::thread::Stack`
 is a mapping of its own, but a mapping placed without a hint lies flush against the one below, so
 a thread that overruns its stack writes into that mapping rather than faulting. The main thread's
@@ -2469,7 +2487,12 @@ is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware
 CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
 survive rather than merely diagnose.
 
-**`libkern` mock-syscall test mode.** A feature-flagged mock that records and replays syscalls for host-side tests of layers above. The crate is a `cargo new` placeholder in Phase 0. Trigger: real syscalls are defined.
+~~**`libkern` mock-syscall test mode.**~~ **Built 2026-11-03, in libos rather than libkern**
+(pre-Phase-7 Part E.2): libos's `sys` seam selects a model of the kernel under its own tests, and
+under its `mock` feature in a test build, so a crate above it takes the model as a dev-dependency
+and its paths through libos run in host tests. It answers as the kernel does rather than replaying
+a record (`docs/architecture/libos.md` § *The host-test syscall seam*). A crate that calls
+`libkern` directly still has none, which the move onto libos ends.
 
 ### Auditing and observability
 

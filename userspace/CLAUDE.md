@@ -64,9 +64,7 @@ Application                              ← user code
   ↓
 libviews                                 ← the view broker's client (asking to run in a view)
   ↓
-libprompt                                ← asking a person on a terminal; the scrubbing plumbing
-  ↓
-libfs                                    ← whole-file + path helpers (no protocol of its own)
+libprompt  libfs                         ← asking at a terminal; whole-file + path helpers
   ↓
 libstream  librsproto                    ← typed I/O, RS protocol
   ↓
@@ -93,7 +91,8 @@ it too. `with`, `account` and `desktop-shell` use it. It owns no wire format —
 their program was handed — a line, a password, a new password twice — was `coreutils::prompt`
 until `nxinstall`, which is not a coreutil and never talks to the broker, needed it for the first
 account. The channel plumbing a password crosses, scrubbed after every send, moved with it from
-`libviews`, which speaks through it; it sits above `libfs`, whose `lookup_wait` its `lookup` uses.
+`libviews`, which speaks through it. It sits beside `libfs` rather than above it since pre-Phase-7
+Part E.2, when its lookup moved onto libos.
 **Which question to ask, and when, stays with each caller**; how a question is put to a terminal is
 `libprompt`'s.
 
@@ -116,7 +115,7 @@ There is **no `librt` crate** — the Go-style fiber scheduler and a standalone 
 
 `libline` (the line discipline: what a byte does to a line being typed, and what to write so the screen keeps up) is a fourth: `alloc` only, depending on nothing. `tty-server` drives it in canonical mode and `nxsh` reads raw and drives it to edit its own prompt. It was `tty-server`'s library half until the shell called more of it than the server did (pre-Phase-7 Part C.2), which is the rule above applied again. `eshell` keeps its own copy: it has no `alloc`.
 
-**`libos` is to be every userspace crate's syscall layer** (the decision log, 2026-10-27), and this is the rule the transition works toward: code reaches the kernel through libos, or through a library built on it, and a raw `libkern` syscall outside `libkern` and `libos` is an exception the maintainer agrees to. Three are agreed: `eshell`, the recovery shell, and `libheap`, the allocator under everything, both on `libkern` by choice; and the test harness's refusals, a call that passes what a safe wrapper cannot express, as there the call is the test. Today most crates still make raw syscalls (eight of the other 48 link libos), and pre-Phase-7 Part E moves them: **`cargo xtask check-syscalls` holds each crate to its count** in `tools/xtask/raw-syscalls.toml`, failing a rise, so new code reaches the kernel through libos, and a crate that moves lowers its entry. libos keeps what makes it safe for supervisors and PID 1: `no_std` with an alloc-free core, `libkern` its only dependency, and nothing to start up. **The holes in libos that the decision log listed, the condition for any crate moving onto it, are fixed** (pre-Phase-7 Part I, group R): `block_on` no longer spins on a wait that keeps failing, an `Op` reads no waker but `block_on`'s, and a dropped I/O waits out its device before the buffer it borrowed is the caller's again.
+**`libos` is to be every userspace crate's syscall layer** (the decision log, 2026-10-27), and this is the rule the transition works toward: code reaches the kernel through libos, or through a library built on it, and a raw `libkern` syscall outside `libkern` and `libos` is an exception the maintainer agrees to. Three are agreed: `eshell`, the recovery shell, and `libheap`, the allocator under everything, both on `libkern` by choice; and the test harness's refusals, a call that passes what a safe wrapper cannot express, as there the call is the test. Today most crates still make raw syscalls of their own, though the libraries under them make none since pre-Phase-7 Part E.2 (13 of the other 48 link libos directly), and the rest of Part E moves them: **`cargo xtask check-syscalls` holds each crate to its count** in `tools/xtask/raw-syscalls.toml`, failing a rise, so new code reaches the kernel through libos, and a crate that moves lowers its entry. libos keeps what makes it safe for supervisors and PID 1: `no_std` with an alloc-free core, `libkern` its only dependency, and nothing to start up. **The holes in libos that the decision log listed, the condition for any crate moving onto it, are fixed** (pre-Phase-7 Part I, group R): `block_on` no longer spins on a wait that keeps failing, an `Op` reads no waker but `block_on`'s, and a dropped I/O waits out its device before the buffer it borrowed is the caller's again.
 
 ## Async-first
 
@@ -191,6 +190,12 @@ The startup protocol for any resource server:
 
 Don't have an RS try to register itself. Don't grant `BIND_NAMESPACE` to an RS. See `docs/rationale/why-supervisor-registration.md`.
 
+**A server's replies are `librsproto::server`'s** (its `io` feature): an error sized to its reason,
+a handle or a memory object whose failed send is answered with an error, a continuation, a
+directory page. A forwarded resolve waits with no deadline, so a reply that fails and goes
+unanswered hangs its caller for good; the servers still writing their own move onto it in
+pre-Phase-7 Part E.3.
+
 ## Configuration files
 
 User-facing configuration is TOML. Service declarations follow `docs/spec/service-toml-schema.md`. Parsing should be tolerant of unknown fields (forward compatibility) but strict about types and required fields.
@@ -201,8 +206,10 @@ Don't introduce YAML, JSON5, or custom parsers. The TOML crate (project-internal
 
 - Unit tests in `#[cfg(test)]` modules where possible.
 - Integration tests for services run in QEMU.
-- There is no syscall mock yet (`docs/rationale/deferred-decisions.md`): keep logic free of syscalls
-  to test it on the host, and test the paths that make them in a QEMU gate.
+- **A path through libos runs on the host against its model of the kernel**: take `libos` among a
+  crate's dev-dependencies with `features = ["mock"]`, and drive it with `libos::mock`'s controls.
+  A raw `libkern` syscall has no mock: keep that logic free of syscalls, and test the path in a
+  QEMU gate.
 - `cargo xtask miri` runs the services' unit tests under Miri, nightly in CI, where every syscall is
   refused `Unsupported` and an `exit` fails its test. A test it cannot run or finish says why beside itself, with
   `#[cfg_attr(miri, ignore = "...")]`, and a new crate's target goes on its list or says why not.

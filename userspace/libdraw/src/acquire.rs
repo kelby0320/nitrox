@@ -8,7 +8,7 @@
 
 use libkern::abi::FramebufferInfo;
 use libkern::handle::{RawHandle, Rights};
-use libos::{Handle, MapRead, MapReadWrite, Memory, Namespace, NsReadOnly, Ref, block_on};
+use libos::{CanLookup, Handle, MapRead, MapReadWrite, Memory, Namespace, NsReadOnly, Ref, block_on};
 
 use crate::format::{Channel, PixelFormat};
 use crate::framebuffer::{Geometry, RawFramebuffer};
@@ -37,22 +37,36 @@ pub const FRAMEBUFFER_PATH: &str = "/dev/framebuffer";
 pub const FRAMEBUFFER_INFO_PATH: &str = "/dev/framebuffer/info";
 
 /// Read the framebuffer's geometry without mapping the aperture.
-///
-/// # Safety
-///
-/// `root_ns` must be a live namespace handle owned by the caller for the call; it is borrowed,
-/// never closed.
-pub unsafe fn read_info(root_ns: u64) -> Result<FramebufferInfo, AcquireError> {
-    // SAFETY: the caller guarantees `root_ns` is live and owned.
-    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+pub fn framebuffer_info<'a, M: CanLookup + 'a>(
+    ns: impl Into<Ref<'a, Namespace, M>>,
+) -> Result<FramebufferInfo, AcquireError> {
     let obj: Handle<Memory, MapRead> =
-        block_on(ns.lookup(FRAMEBUFFER_INFO_PATH, Rights::MAP_READ)).map_err(|_| AcquireError::NoBinding)?;
+        block_on(ns.into().lookup(FRAMEBUFFER_INFO_PATH, Rights::MAP_READ)).map_err(|_| AcquireError::NoBinding)?;
 
     // The kernel serves this leaf as exactly one `FramebufferInfo` followed by zero padding.
     let mut bytes = [0u8; core::mem::size_of::<FramebufferInfo>()];
     let mapping = obj.map(bytes.len()).map_err(|_| AcquireError::InfoUnmappable)?;
     mapping.read_into(0, &mut bytes).map_err(|_| AcquireError::InfoUnmappable)?;
     FramebufferInfo::from_bytes(&bytes).ok_or(AcquireError::InfoTruncated)
+}
+
+/// Read the framebuffer's geometry without mapping the aperture. For callers not yet on libos;
+/// the typed form is [`framebuffer_info`].
+///
+/// # Safety
+///
+/// `root_ns` must be a live namespace handle owned by the caller for the call; it is borrowed,
+/// never closed.
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+pub unsafe fn read_info(root_ns: u64) -> Result<FramebufferInfo, AcquireError> {
+    framebuffer_info(borrowed(root_ns))
+}
+
+/// Borrow the caller's own namespace handle for one call.
+fn borrowed<'a>(root_ns: u64) -> Ref<'a, Namespace, NsReadOnly> {
+    // SAFETY: the caller's own namespace handle, open for the call, as the raw functions have
+    // always asked.
+    unsafe { Ref::from_raw(RawHandle(root_ns), Rights::LOOKUP) }
 }
 
 /// Turn a firmware geometry report into a [`Geometry`].
@@ -83,15 +97,15 @@ pub fn geometry_from(info: &FramebufferInfo) -> Result<Geometry, AcquireError> {
 ///
 /// # Safety
 ///
-/// `root_ns` must be a live namespace handle owned by the caller for the call. The returned
-/// [`RawFramebuffer`] must not outlive the address space, and nothing else may write the mapping.
-pub unsafe fn acquire(root_ns: u64) -> Result<(RawFramebuffer, FramebufferInfo), AcquireError> {
-    // SAFETY: forwarded from this function's own contract.
-    let info = unsafe { read_info(root_ns) }?;
+/// The returned [`RawFramebuffer`] must not outlive the address space, and nothing else may
+/// write the mapping.
+pub unsafe fn map_framebuffer<'a, M: CanLookup + 'a>(
+    ns: impl Into<Ref<'a, Namespace, M>>,
+) -> Result<(RawFramebuffer, FramebufferInfo), AcquireError> {
+    let ns = ns.into();
+    let info = framebuffer_info(ns)?;
     let geometry = geometry_from(&info)?;
 
-    // SAFETY: as above.
-    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
     let obj: Handle<Memory, MapReadWrite> = block_on(ns.lookup(FRAMEBUFFER_PATH, Rights::MAP_READ | Rights::MAP_WRITE))
         .map_err(|_| AcquireError::NoBinding)?;
 
@@ -100,6 +114,19 @@ pub unsafe fn acquire(root_ns: u64) -> Result<(RawFramebuffer, FramebufferInfo),
     // `geometry_from` checked, which stays mapped for the life of the address space; the caller's
     // contract forbids a second writer.
     Ok((unsafe { RawFramebuffer::new(geometry, addr) }, info))
+}
+
+/// Map the framebuffer and wrap it as a writable [`RawFramebuffer`]. For callers not yet on
+/// libos; the typed form is [`map_framebuffer`].
+///
+/// # Safety
+///
+/// `root_ns` must be a live namespace handle owned by the caller for the call. The returned
+/// [`RawFramebuffer`] must not outlive the address space, and nothing else may write the mapping.
+// TODO(raw-handle-shims): goes when its last caller is on libos.
+pub unsafe fn acquire(root_ns: u64) -> Result<(RawFramebuffer, FramebufferInfo), AcquireError> {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { map_framebuffer(borrowed(root_ns)) }
 }
 
 #[cfg(test)]
@@ -166,5 +193,18 @@ mod tests {
     fn a_pitch_too_narrow_for_a_row_is_refused() {
         // Would alias row n+1 onto row n.
         assert_eq!(geometry_from(&info(32, 4096)), Err(AcquireError::ImpossibleGeometry));
+    }
+
+    #[test]
+    fn a_namespace_without_the_display_has_no_binding() {
+        libos::mock::reset();
+        let (ns, _peer) = libos::mock::answering("/nothing/here");
+        // SAFETY: the mock's handle, open for the test.
+        let root = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(ns), Rights::LOOKUP) };
+        assert_eq!(framebuffer_info(root).err(), Some(AcquireError::NoBinding));
+        // SAFETY: as above.
+        assert_eq!(unsafe { read_info(ns) }.err(), Some(AcquireError::NoBinding));
+        // SAFETY: as above; nothing is mapped.
+        assert_eq!(unsafe { acquire(ns) }.err(), Some(AcquireError::NoBinding));
     }
 }

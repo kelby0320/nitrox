@@ -106,6 +106,18 @@ impl<M: CanMapWrite> Mapping<M> {
         Ok(())
     }
 
+    /// Copy `len` bytes from `src` at `src_at` to `at` here; `InvalidArgument` past either end.
+    /// **Ranges that overlap in one object copy in no defined order**: its two mappings have
+    /// addresses of their own, so the copy cannot see that it reads what it has written.
+    pub fn copy_from<S>(&mut self, at: usize, src: &Mapping<S>, src_at: usize, len: usize) -> Result<()> {
+        self.within(at, len)?;
+        src.within(src_at, len)?;
+        // SAFETY: both ranges lie in mappings that live for the call, and a copy forms no reference
+        // into either; `copy`, as libos's model maps every mapping of an object at one address.
+        unsafe { core::ptr::copy(src.base.as_ptr().add(src_at), self.base.as_ptr().add(at), len) };
+        Ok(())
+    }
+
     /// Where it starts, writable, for code that reaches the bytes itself.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.base.as_ptr()
@@ -171,6 +183,26 @@ mod tests {
         let rw: Handle<Memory, MapReadWrite> = mem.duplicate(Rights::MAP_READ).unwrap();
         assert_eq!(rw.map(4096).err().unwrap().code(), KError::NoAccess, "MAP_WRITE asked, not held");
         assert_eq!(mem.map(8192).err().unwrap().code(), KError::InvalidArgument, "past the object");
+    }
+
+    #[test]
+    fn one_mapping_copies_from_another_within_both() {
+        sys::reset();
+        let a = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        let b = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        let mut from = a.map(4096).unwrap();
+        from.write_from(0, b"abcdef").unwrap();
+        let mut to = b.map(4096).unwrap();
+        to.copy_from(10, &from, 1, 4).unwrap();
+        let mut out = [0u8; 4];
+        to.read_into(10, &mut out).unwrap();
+        assert_eq!(&out, b"bcde");
+        let refused = |r: Result<()>| r.err().map(|e| e.code()) == Some(KError::InvalidArgument);
+        assert!(refused(to.copy_from(4093, &from, 0, 4)) && refused(to.copy_from(0, &from, 4093, 4)));
+        let mut again = a.map(4096).unwrap();
+        again.copy_from(100, &from, 0, 4).unwrap();
+        from.read_into(100, &mut out).unwrap();
+        assert_eq!(&out, b"abcd", "two mappings of one object, at ranges apart in it");
     }
 
     #[test]

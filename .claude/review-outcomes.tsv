@@ -500,3 +500,17 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-03	418	fea437aa	18	error-paths	optional	demonstrated	fixed	21030e0f	test renamed; a refused restrict tested, its mutation fails it
 2026-11-03	418	fea437aa	19	tests	optional	demonstrated	fixed	21030e0f	each clamp tested at its bound; wait keeps only results in its set
 2026-11-03	418	fea437aa	20	tests	optional	demonstrated	fixed	c95ab125	a listed crate with no Rust tested, the mutation fails it; tests of the cmd_ wrappers declined
+2026-11-03	419	4d52f8e2	1	architecture	worth-fixing	demonstrated	fixed	67dff6a7	reply_object hands MAP_READ|INSPECT|TRANSFER; a libfs test reads a served table, fails without INSPECT
+2026-11-03	419	4d52f8e2	2	logic+tests	worth-fixing	demonstrated	fixed	67dff6a7	call() takes Scrubbed, so the review's plain-Msg edit no longer compiles; no other password message unscrubbed
+2026-11-03	419	4d52f8e2	3	error-paths	worth-fixing	demonstrated	fixed	67dff6a7	rename resolve, touch, and dir-session rollback tested; the review's mutations and dropping the rollback's answer each fail
+2026-11-03	419	4d52f8e2	4	tests	worth-fixing	demonstrated	fixed	67dff6a7	extra refused at duplicate and at send: an empty message each, duplicate closed, logged; all three mutations fail it
+2026-11-03	419	4d52f8e2	5	tests	worth-fixing	demonstrated	fixed	67dff6a7	memobj refused (new mock control) and device undupable each answered with why; both mutations fail
+2026-11-03	419	4d52f8e2	6	logic	worth-fixing	demonstrated	fixed	60f25097	doc says overlap in one object copies in no defined order; reproduced with libkern's memmove order over a memfd mapped twice
+2026-11-03	419	4d52f8e2	7	logic	optional	demonstrated	fixed	67dff6a7	mock ignores a truncate on request; copy and write over a larger file answer TruncateFailed, the mutation fails it
+2026-11-03	419	4d52f8e2	8	tests	optional	demonstrated	refuted		Op::poll makes any negative status Err, so an error answer already fails forget; the guard differs only on a positive status no kernel gives; test kept
+2026-11-03	419	4d52f8e2	9	tests	optional	demonstrated	fixed	67dff6a7	raw send of IPC_HANDLE_MAX+1 handles refused, all still the caller's, none sent; both mutations fail it
+2026-11-03	419	4d52f8e2	10	tests	optional	demonstrated	fixed	67dff6a7	a LOOKUP-only namespace answers KernelError; the mutation fails it
+2026-11-03	419	4d52f8e2	11	architecture	optional	demonstrated	fixed	417bc183	unread kernel values a finding, comments read past (the RESOLVE_RENAME edit fails the check); reply offsets TODO(rsproto-offsets), for E.7
+2026-11-03	419	4d52f8e2	12	architecture	optional	demonstrated	fixed	67dff6a7	/session/user bound MAP_READ|INSPECT|TRANSFER; a writable resolve cannot map it, test fails with the full-rights bind; test-interactive whoami still alice
+2026-11-03	419	4d52f8e2	13	rules-and-docs	optional	demonstrated	fixed	8e2608f2	init/CLAUDE.md names libos's model; no other 'syscall mock yet' left
+2026-11-03	419	4d52f8e2	14	rules-and-docs	optional	demonstrated	fixed	8e2608f2	rewrapped and the sentence rewritten; the PR's other added lines past the wrap rewrapped too

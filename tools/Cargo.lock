@@ -105,6 +105,7 @@ name = "libfs"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
  "librsproto",
 ]
 
@@ -113,6 +114,7 @@ name = "libfsserver"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
  "librsproto",
 ]
 
@@ -144,6 +146,7 @@ name = "liblog"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
  "librsproto",
 ]
 
@@ -165,6 +168,7 @@ name = "librsproto"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
 ]
 
 [[package]]
@@ -172,6 +176,7 @@ name = "libsession"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
 ]
@@ -181,6 +186,7 @@ name = "libstream"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
 ]
 
 [[package]]

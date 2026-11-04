@@ -1,10 +1,11 @@
 //! The async core: the [`Op`] future over `sys_wait`, and [`block_on`].
 //!
-//! An [`Op`] wraps an in-flight `PendingOperation`; polling it does a non-blocking
-//! `sys_wait` on the PO. If not ready, it registers the PO with the running
-//! [`block_on`] reactor (via the `Waker`) and yields `Pending`; [`block_on`] then does
-//! one blocking `sys_wait` on the registered handles and re-polls. There is no ready
-//! queue (deferred; see `docs/architecture/libos.md`).
+//! An [`Op`] wraps an in-flight `PendingOperation`. Under [`block_on`] its first poll registers the
+//! PO with the reactor (via the `Waker`) and yields `Pending`; [`block_on`] does one blocking
+//! `sys_wait` on the registered handles, keeps what it read, and re-polls, and the `Op` takes its
+//! result from there: **one wait an operation**. A poll that finds nothing kept, and every poll
+//! under another executor, does a non-blocking `sys_wait` on the PO. There is no ready queue
+//! (deferred; see `docs/architecture/libos.md`).
 
 use core::future::Future;
 use core::pin::Pin;
@@ -46,11 +47,42 @@ struct Reactor {
     handles: [AtomicU64; MAX_WAIT],
     /// Slots claimed this round, past `MAX_WAIT` if a handle was left out.
     claimed: AtomicUsize,
+    /// What the round's wait read, `[handle, status and reserved, result]` each, for the poll
+    /// after it alone; a handle of `0` is a slot empty or taken.
+    read: [[AtomicU64; 3]; MAX_WAIT],
 }
 
 impl Reactor {
     fn new() -> Self {
-        Reactor { handles: core::array::from_fn(|_| AtomicU64::new(0)), claimed: AtomicUsize::new(0) }
+        let zero = || AtomicU64::new(0);
+        Reactor {
+            handles: core::array::from_fn(|_| zero()),
+            claimed: AtomicUsize::new(0),
+            read: core::array::from_fn(|_| [zero(), zero(), zero()]),
+        }
+    }
+
+    /// Keep what a wait read, in place of what the last one did.
+    fn keep(&self, read: &[IoResult]) {
+        for (i, slot) in self.read.iter().enumerate() {
+            let r = read.get(i).copied().unwrap_or(IoResult { handle: 0, status: 0, reserved: 0, result: 0 });
+            slot[1].store(((r.reserved as u64) << 32) | r.status as u32 as u64, Relaxed);
+            slot[2].store(r.result, Relaxed);
+            slot[0].store(r.handle, Relaxed);
+        }
+    }
+
+    /// Take what the round's wait read for `po`, if it read it.
+    fn take_read(&self, po: u64) -> Option<IoResult> {
+        let slot = self.read.iter().find(|slot| slot[0].load(Relaxed) == po)?;
+        slot[0].store(0, Relaxed);
+        let packed = slot[1].load(Relaxed);
+        Some(IoResult {
+            handle: po,
+            status: packed as u32 as i32,
+            reserved: (packed >> 32) as u32,
+            result: slot[2].load(Relaxed),
+        })
     }
 
     /// Register a waitable handle for this poll round (deduplicated; capped at `MAX_WAIT`).
@@ -112,6 +144,8 @@ pub struct Op {
     finished: bool,
     /// Whether `poll` has returned `Ready`, so its result is handed out once.
     done: bool,
+    /// Whether it has been registered with a `block_on`, whose wait would then have read it.
+    registered: bool,
 }
 
 impl Op {
@@ -142,7 +176,30 @@ impl Op {
     }
 
     fn of(po: u64, kind: Kind) -> Op {
-        Op { po, kind, finished: false, done: false }
+        Op { po, kind, finished: false, done: false, registered: false }
+    }
+
+    /// Wait for the operation to finish, here: its completion, whatever status it carries, or the
+    /// error that refused the wait for good, when the operation may still be running.
+    ///
+    /// Where [`block_on`] answers both as an `Err`, this tells a device's failed I/O, after which
+    /// the buffer it borrowed is the caller's again, from a wait that failed, after which it may
+    /// still be the device's.
+    pub fn wait_out(mut self) -> Result<IoResult> {
+        let mut r = zeroed_results::<1>();
+        loop {
+            match sys::wait(&[self.po], &mut r, u64::MAX) {
+                1 => break,
+                n if n == KError::OutOfMemory as i64 => sleep(),
+                n => {
+                    // The drop must not wait for it again: that wait is what was just refused.
+                    (self.finished, self.done) = (true, true);
+                    return Err(Error::from_status(n as i32));
+                }
+            }
+        }
+        (self.finished, self.done) = (true, true);
+        Ok(r[0])
     }
 }
 
@@ -168,31 +225,39 @@ impl Future for Op {
             this.done = true;
             return Poll::Ready(Ok(IoResult { handle: 0, status: 0, reserved: 0, result: 0 }));
         }
-        let mut r = zeroed_results::<1>();
-        let n = sys::wait(&[this.po], &mut r, 0);
-        if n >= 1 {
+        let waker = cx.waker();
+        // SAFETY: only `block_on` makes a waker with `VTABLE`, its data a `Sync` `Reactor` that
+        // lives for the poll.
+        let reactor = core::ptr::eq(waker.vtable(), &VTABLE).then(|| unsafe { &*(waker.data() as *const Reactor) });
+        // What `block_on`'s wait read for the PO, or else a poll's; a first poll under `block_on`
+        // only registers, as the wait after it reads a PO done already.
+        let read = match reactor.and_then(|r| r.take_read(this.po)) {
+            Some(res) => Some(res),
+            None if reactor.is_some() && !this.registered => None,
+            None => {
+                let mut r = zeroed_results::<1>();
+                match sys::wait(&[this.po], &mut r, 0) {
+                    n if n == KError::WouldBlock as i64 => None,
+                    n if n < 1 => {
+                        this.done = true;
+                        return Poll::Ready(Err(Error::from_status(n as i32)));
+                    }
+                    _ => Some(r[0]),
+                }
+            }
+        };
+        if let Some(res) = read {
             this.finished = true;
             this.done = true;
-            let res = r[0];
-            if res.status < 0 {
-                return Poll::Ready(Err(Error::from_status(res.status)));
-            }
-            return Poll::Ready(Ok(res));
+            return Poll::Ready(if res.status < 0 { Err(Error::from_status(res.status)) } else { Ok(res) });
         }
-        if n != KError::WouldBlock as i64 {
-            this.done = true;
-            return Poll::Ready(Err(Error::from_status(n as i32)));
-        }
-        let waker = cx.waker();
-        if !core::ptr::eq(waker.vtable(), &VTABLE) {
+        let Some(reactor) = reactor else {
             // Another executor's waker, or a clone of `block_on`'s: be polled again, unregistered.
             UNWATCHED.fetch_add(1, Relaxed);
             waker.wake_by_ref();
             return Poll::Pending;
-        }
-        // SAFETY: only `block_on` makes a waker with `VTABLE`, its data a `Sync` `Reactor` that
-        // lives for the poll.
-        let reactor = unsafe { &*(waker.data() as *const Reactor) };
+        };
+        this.registered = true;
         reactor.register(this.po);
         Poll::Pending
     }
@@ -238,6 +303,7 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return v,
             Poll::Pending => {
+                reactor.keep(&[]);
                 let reg = reactor.take();
                 let handles = &reg.handles[..reg.count];
                 let mut results = zeroed_results::<MAX_WAIT>();
@@ -245,6 +311,7 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
                 let deadline = if short { soon() } else { u64::MAX };
                 let waited = reg.count > 0 && {
                     let n = sys::wait(handles, &mut results, deadline);
+                    reactor.keep(&results[..(n.max(0) as usize).min(MAX_WAIT)]);
                     n >= 0 || n == KError::TimedOut as i64
                 };
                 if !waited {
@@ -277,15 +344,68 @@ mod tests {
         assert_eq!(closes, 1, "block_on must close the PO on drop");
     }
 
+    /// **An operation under `block_on` is one wait**: its first poll only registers, and the poll
+    /// after the wait takes what the wait read, a failure's status too.
     #[test]
-    fn deferred_op_polls_then_waits_then_completes() {
+    fn a_deferred_op_is_one_wait_whatever_it_completes_with() {
+        for (status, result) in [(0, 7), (KError::IoError as i32, 0)] {
+            sys::reset();
+            sys::script_next(status, result, false); // completes on the blocking wait
+            let got = block_on(Op::submit(RawHandle(1), &read_op()).unwrap());
+            assert_eq!(
+                got.map(|r| r.result).map_err(|e| e.code() as i32),
+                if status == 0 { Ok(7) } else { Err(status) }
+            );
+            assert_eq!(sys::counts().1, 1, "one blocking wait, whose result the poll after it takes");
+        }
+    }
+
+    /// Two operations polled in one future are read by one wait, each taking its own result.
+    #[test]
+    fn two_ops_polled_together_are_read_by_one_wait() {
         sys::reset();
-        sys::script_next(0, 7, false); // completes on the blocking wait
-        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
-        let r = block_on(op).unwrap();
-        assert_eq!(r.result, 7);
-        let (_subs, waits, _closes) = sys::counts();
-        assert!(waits >= 2, "expected a poll + a blocking wait, got {waits}");
+        sys::script_next(0, 7, false);
+        sys::script_next(KError::IoError as i32, 0, false);
+        let (mut a, mut b) =
+            (Op::submit(RawHandle(1), &read_op()).unwrap(), Op::submit(RawHandle(1), &read_op()).unwrap());
+        let (mut ra, mut rb) = (None, None);
+        let mut first = true;
+        block_on(core::future::poll_fn(|cx| {
+            // The wait reads them in the order they registered; the poll after takes them in the
+            // other, so each must take its own.
+            for i in if first { [0, 1] } else { [1, 0] } {
+                let (op, got) = if i == 0 { (&mut a, &mut ra) } else { (&mut b, &mut rb) };
+                if got.is_none()
+                    && let Poll::Ready(r) = Pin::new(op).poll(cx)
+                {
+                    *got = Some(r.map(|r| r.result));
+                }
+            }
+            first = false;
+            if ra.is_some() && rb.is_some() { Poll::Ready(()) } else { Poll::Pending }
+        }));
+        assert_eq!(ra.unwrap().ok(), Some(7));
+        assert_eq!(rb.unwrap().err().map(|e| e.code()), Some(KError::IoError));
+        assert_eq!(sys::counts().1, 1);
+    }
+
+    /// A lookup under `block_on` is one wait, and its handle is installed once.
+    #[test]
+    fn a_lookup_is_one_wait_and_one_handle() {
+        sys::reset();
+        // SAFETY: the mock's namespace, open for the test.
+        let ns = unsafe {
+            crate::Ref::<crate::Namespace, crate::NsReadOnly>::from_raw(
+                RawHandle(sys::served("/s")),
+                libkern::Rights::empty(),
+            )
+        };
+        let (waits, open) = (sys::counts().1, sys::open_handles());
+        let got: crate::Handle<crate::Memory, crate::MapRead> =
+            block_on(ns.lookup("/s/x", libkern::Rights::MAP_READ)).unwrap();
+        assert_eq!(sys::counts().1, waits + 1);
+        assert_eq!(sys::open_handles(), open + 1, "the handle it resolved to, and its PO closed");
+        drop(got);
     }
 
     /// **A wait takes no more handles than its results hold**: two ready operations, room for one.
@@ -407,6 +527,26 @@ mod tests {
         let ns = sys::served("/x");
         drop(Op::from_po(sys::ns_lookup(ns, b"/x", 0) as u64));
         assert_eq!(sys::closed_in_flight(), 1);
+    }
+
+    /// **A completion is told from a failed wait**: an I/O the device failed is finished, its
+    /// status carried, where a wait refused for good says it may still run.
+    #[test]
+    fn waiting_out_an_op_tells_a_failed_io_from_a_failed_wait() {
+        sys::reset();
+        sys::script_next(KError::IoError as i32, 3, false);
+        let done = Op::submit(RawHandle(1), &read_op()).unwrap().wait_out().unwrap();
+        assert_eq!((done.status, done.result), (KError::IoError as i32, 3));
+        sys::script_next(0, 1, false);
+        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::fail_next_wait(KError::OutOfMemory as i64);
+        assert_eq!(op.wait_out().unwrap().result, 1, "a full waiter queue is waited out");
+        sys::script_never();
+        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        sys::fail_next_wait(KError::InvalidHandle as i64);
+        let closes = sys::counts().2;
+        assert_eq!(op.wait_out().err().unwrap().code(), KError::InvalidHandle);
+        assert_eq!(sys::counts().2, closes + 1, "closed, and not waited on again");
     }
 
     /// **A dropped I/O whose wait is refused for now waits again**, rather than closing in flight.

@@ -20,7 +20,7 @@
 //!
 //! [`block_on`] is the single-task driver: poll, `sys_wait`, re-poll.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, all(feature = "mock", panic = "unwind"))), no_std)]
 
 pub mod boot;
 mod channel;
@@ -53,3 +53,9 @@ pub use process::{Refused, Spawn, exit, spawn};
 pub use thread::thread_create;
 pub use time::Deadline;
 pub use wait::{Signalled, WaitSet};
+
+/// The model of the kernel libos's calls reach in an unwinding build under the `mock` feature,
+/// and its test controls: a crate's host tests take it as a dev-dependency, so a path through
+/// libos runs there.
+#[cfg(all(feature = "mock", panic = "unwind"))]
+pub use sys::mock;

@@ -8,7 +8,7 @@
 //! **The desktop shell serves this**, so it is the one process that both serves a resource and
 //! constructs namespaces (`graphical-session.md` §3).
 
-use crate::{get_u32, put_u32};
+use crate::{Reader, put_u32};
 
 /// Longest desktop name on the wire, in bytes.
 ///
@@ -63,10 +63,7 @@ impl DesktopIndex {
 
     /// Parse from the first 4 bytes of a body.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 4 {
-            return None;
-        }
-        Some(Self { index: get_u32(b, 0) })
+        Some(Self { index: Reader::new(b).u32()? })
     }
 }
 
@@ -121,41 +118,42 @@ pub struct DesktopList<'a> {
 impl<'a> DesktopList<'a> {
     /// Parse a `List` reply.
     pub fn read(b: &'a [u8]) -> Option<Self> {
-        if b.len() < 12 {
-            return None;
-        }
-        Some(Self { body: &b[12..], count: get_u32(b, 0), current: get_u32(b, 4), truncated: get_u32(b, 8) != 0 })
+        let mut r = Reader::new(b);
+        let (count, current, truncated) = (r.u32()?, r.u32()?, r.u32()? != 0);
+        Some(Self { body: r.rest(), count, current, truncated })
     }
 
     /// Walk the entries. Stops early on a malformed one rather than guessing at its length.
     pub fn entries(&self) -> impl Iterator<Item = DesktopEntry<'a>> {
-        let mut rest = self.body;
+        let mut r = Reader::new(self.body);
         let mut left = self.count;
         core::iter::from_fn(move || {
-            if left == 0 || rest.len() < 8 {
+            if left == 0 {
                 return None;
             }
-            let id = get_u32(rest, 0);
-            let len = get_u32(rest, 4) as usize;
-            if rest.len() < 8 + len || len > MAX_DESKTOP_NAME {
-                return None;
-            }
-            let name = core::str::from_utf8(&rest[8..8 + len]).ok()?;
-            rest = &rest[8 + len..];
-            left -= 1;
-            Some(DesktopEntry { id, name })
+            let entry = (|| {
+                let id = r.u32()?;
+                let len = r.u32()? as usize;
+                if len > MAX_DESKTOP_NAME {
+                    return None;
+                }
+                Some(DesktopEntry { id, name: core::str::from_utf8(r.bytes(len)?).ok()? })
+            })();
+            left = if entry.is_some() { left - 1 } else { 0 };
+            entry
         })
     }
 }
 
-/// A client of `/dev/desktop`: an endpoint handle and the one message buffer its traffic uses.
+/// A client of `/dev/desktop`: an endpoint and the one message its traffic uses.
 ///
-/// The buffer is the caller's, so this crate stays `alloc`-free.
+/// The message is the caller's, so this crate stays `alloc`-free. A client built by
+/// [`resolve`](Self::resolve) or [`new`](Self::new) owns its endpoint and closes it when dropped;
+/// one built by the raw [`connect`](Self::connect) or [`from_endpoint`](Self::from_endpoint) is
+/// closed only by [`close`](Self::close).
 #[cfg(feature = "io")]
 pub struct Desktop<'a> {
-    endpoint: u64,
-    buf: &'a mut [u8],
-    next_request_id: u64,
+    session: crate::session::Session<'a>,
 }
 
 /// What a `/dev/desktop` request can fail with.
@@ -173,59 +171,69 @@ pub enum DesktopError {
 }
 
 #[cfg(feature = "io")]
+impl From<crate::session::WireError> for DesktopError {
+    fn from(e: crate::session::WireError) -> Self {
+        match e {
+            crate::session::WireError::Transport(c) => DesktopError::Transport(c),
+            crate::session::WireError::Protocol => DesktopError::Protocol,
+        }
+    }
+}
+
+#[cfg(feature = "io")]
 impl<'a> Desktop<'a> {
-    /// Resolve `/dev/desktop` in `ns` and wrap the session it answers with.
-    ///
-    /// `buf` must be at least [`IPC_MSG_SIZE`](libkern::abi::IPC_MSG_SIZE) bytes.
-    pub fn connect(ns: u64, buf: &'a mut [u8]) -> Result<Desktop<'a>, DesktopError> {
-        use libkern::abi::IPC_MSG_SIZE;
-        use libkern::syscall::{SYS_NS_LOOKUP, syscall4};
-        if buf.len() < IPC_MSG_SIZE {
-            return Err(DesktopError::Protocol);
-        }
-        let path = b"/dev/desktop";
-        // SAFETY: a valid path slice and a namespace handle this process holds.
-        let po = unsafe {
-            syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, crate::session::DIR_SESSION_RIGHTS)
-        };
-        if po < 0 {
-            return Err(DesktopError::Transport(po as i32));
-        }
-        let (status, endpoint) = crate::session::po_wait(po as u64);
-        if status < 0 {
-            return Err(DesktopError::Transport(status));
-        }
-        if endpoint == 0 {
-            return Err(DesktopError::Protocol);
-        }
-        Ok(Desktop { endpoint, buf, next_request_id: 1 })
+    /// Resolve `/dev/desktop` in `ns` and wrap the session it answers with, which the client
+    /// owns and closes.
+    pub fn resolve<'n, M: libos::CanLookup + 'n>(
+        ns: impl Into<libos::Ref<'n, libos::Namespace, M>>,
+        msg: &'a mut libos::Msg,
+    ) -> Result<Desktop<'a>, DesktopError> {
+        Ok(Self::new(crate::session::connect(ns, "/dev/desktop").map_err(DesktopError::from)?, msg))
     }
 
-    /// Wrap an endpoint resolved elsewhere. Takes ownership: [`close`](Self::close) closes it.
+    /// Wrap an endpoint resolved elsewhere, which the client owns and closes.
+    pub fn new(endpoint: libos::Handle<libos::Channel, libos::Only>, msg: &'a mut libos::Msg) -> Desktop<'a> {
+        Desktop { session: crate::session::Session::new(endpoint, msg) }
+    }
+
+    /// Resolve `/dev/desktop` in `ns` and wrap the session it answers with.
+    ///
+    /// `buf` must be at least [`IPC_MSG_SIZE`](libkern::abi::IPC_MSG_SIZE) bytes. For callers not
+    /// yet on libos; the typed form is [`resolve`](Self::resolve).
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
+    pub fn connect(ns: u64, buf: &'a mut [u8]) -> Result<Desktop<'a>, DesktopError> {
+        if buf.len() < libkern::abi::IPC_MSG_SIZE {
+            return Err(DesktopError::Protocol);
+        }
+        // SAFETY: the caller's own namespace handle, open for the call, as this has always asked.
+        let ns = unsafe {
+            libos::Ref::<libos::Namespace, libos::NsReadOnly>::from_raw(
+                libkern::RawHandle(ns),
+                libkern::Rights::empty(),
+            )
+        };
+        let endpoint = crate::session::connect(ns, "/dev/desktop").map_err(DesktopError::from)?;
+        Ok(Desktop { session: crate::session::Session::raw(endpoint.into_raw().0, buf) })
+    }
+
+    /// Wrap an endpoint resolved elsewhere. Takes ownership: [`close`](Self::close) closes it. For
+    /// callers not yet on libos; the typed form is [`new`](Self::new).
+    // TODO(raw-handle-shims): goes when its last caller is on libos.
     pub fn from_endpoint(endpoint: u64, buf: &'a mut [u8]) -> Result<Desktop<'a>, DesktopError> {
         if buf.len() < libkern::abi::IPC_MSG_SIZE {
             return Err(DesktopError::Protocol);
         }
-        Ok(Desktop { endpoint, buf, next_request_id: 1 })
+        Ok(Desktop { session: crate::session::Session::raw(endpoint, buf) })
     }
 
-    /// Close the session's endpoint. Explicit rather than a `Drop`, for [`Dir`]'s reason.
+    /// Close the session's endpoint, whichever way the client holds it.
     pub fn close(self) {
-        // SAFETY: closing an endpoint this session owns.
-        unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, self.endpoint) };
+        self.session.close();
     }
 
     /// Send one request and copy its reply body into `out`, returning the length written.
     pub fn request(&mut self, op: u16, body: &[u8], out: &mut [u8]) -> Result<usize, DesktopError> {
-        let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let len = crate::session::round_trip(self.endpoint, self.buf, request_id, op, body).map_err(|e| match e {
-            crate::session::WireError::Transport(c) => DesktopError::Transport(c),
-            crate::session::WireError::Protocol => DesktopError::Protocol,
-        })?;
-        // `PAYLOAD_OFF`, not a literal: `round_trip`'s bounds check is what makes this slice safe.
-        let off = crate::session::PAYLOAD_OFF;
-        let payload = &self.buf[off..off + len];
+        let payload = self.session.call(op, body).map_err(DesktopError::from)?;
         let msg = crate::decode(payload).map_err(|_| DesktopError::Transport(0))?;
         if msg.flags & crate::RS_FLAG_ERROR != 0 {
             // The shell's error reply is its `KError` as four little-endian bytes.
@@ -314,5 +322,67 @@ mod tests {
         DesktopIndex { index: 3 }.write(&mut b).unwrap();
         assert_eq!(DesktopIndex::read(&b).unwrap().index, 3);
         assert_eq!(DesktopIndex::read(&b[..3]), None);
+    }
+
+    #[test]
+    fn parsers_survive_truncation_and_corruption() {
+        use crate::fuzz::*;
+        let mut b = [0u8; 64];
+        let n = DesktopIndex { index: 3 }.write(&mut b).unwrap();
+        refuses_every_prefix(&b[..n], |x| DesktopIndex::read(x).is_some());
+        let n = write_list(&mut b, 1, &[DesktopEntry { id: 1, name: "one" }, DesktopEntry { id: 2, name: "" }], false)
+            .unwrap();
+        for k in 0..12 {
+            assert!(DesktopList::read(&b[..k]).is_none());
+        }
+        let walk = |x: &[u8]| DesktopList::read(x).map(|l| l.entries().count());
+        survives_corruption(&b[..n], |x| walk(x).is_some());
+        assert_eq!(walk(&b[..n]), Some(2));
+        assert_eq!(walk(&b[..n - 1]), Some(1), "a cut-off second header is dropped");
+    }
+
+    #[cfg(feature = "io")]
+    mod io {
+        use super::*;
+        use crate::session::fixture::{queue, request, service};
+        use libos::{Msg, mock};
+
+        #[test]
+        fn an_open_is_sent_to_the_shell_and_its_endpoint_goes_with_the_client() {
+            mock::reset();
+            let (ns, peer) = service("/dev/desktop");
+            let mut msg = Msg::new();
+            let mut desktop = Desktop::resolve(ns, &mut msg).unwrap();
+            let open = mock::open_handles();
+            queue(peer, 1, OP_DESKTOP_OPEN, crate::RS_FLAG_REPLY, b"");
+            assert_eq!(desktop.open(b"/home/a.txt"), Ok(()));
+            let (id, op, body) = request(peer);
+            assert_eq!((id, op, body.as_slice()), (1, OP_DESKTOP_OPEN, &b"/home/a.txt"[..]));
+            let refusal = libkern::KError::Unsupported.as_i32().to_le_bytes();
+            queue(peer, 2, OP_DESKTOP_OPEN, crate::RS_FLAG_REPLY | crate::RS_FLAG_ERROR, &refusal);
+            assert_eq!(desktop.open(b"/x"), Err(DesktopError::Refused(Some(libkern::KError::Unsupported.as_i32()))));
+            drop(desktop);
+            assert_eq!(mock::open_handles(), open - 1);
+        }
+
+        #[test]
+        fn a_missing_desktop_is_a_transport_fault_and_a_raw_client_closes_only_by_close() {
+            mock::reset();
+            let (ns, _peer) = service("/dev/desktop");
+            let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+            assert!(matches!(Desktop::connect(0, &mut buf[..16]), Err(DesktopError::Protocol)));
+            let (other, _p) = service("/dev/other");
+            assert_eq!(
+                Desktop::resolve(other, &mut Msg::new()).err(),
+                Some(DesktopError::Transport(libkern::KError::NotFound.as_i32()))
+            );
+            let desktop = Desktop::connect(ns.raw().0, &mut buf).unwrap();
+            let open = mock::open_handles();
+            drop(desktop);
+            assert_eq!(mock::open_handles(), open, "a raw client is closed by `close` alone");
+            Desktop::connect(ns.raw().0, &mut buf).unwrap().close();
+            assert_eq!(mock::open_handles(), open);
+            assert_eq!(mock::stray_closes(), 0);
+        }
     }
 }
