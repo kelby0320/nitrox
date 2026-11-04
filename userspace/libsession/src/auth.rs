@@ -101,13 +101,6 @@ pub fn close_views_session<'a>(sup: impl Into<Ref<'a, Channel, Only>>, id: u64) 
     }
 }
 
-/// [`close_views_session`] over a raw `sup` the caller keeps open. For callers not yet on libos; the
-/// typed form is [`close_views_session`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn views_close_session(sup: u64, id: u64) {
-    close_views_session(channel(sup), id);
-}
-
 /// A raw endpoint the caller keeps open, borrowed for the call.
 fn channel<'a>(raw: u64) -> Ref<'a, Channel, Only> {
     // SAFETY: the caller's own endpoint, open for the call, as the function always asked.

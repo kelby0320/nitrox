@@ -8,7 +8,8 @@ and began handing the sessions its own routes to them (Part E.1b), and reading i
 from the root (Part E.1c), and serving `/svc/services` — the list, and starting and stopping on
 an admin session (Part E.2a); last checked 2026-09-29, when every server came to exit on
 `CTRL_OP_SHUTDOWN` and `init` to answer a shutdown's `Finish` (Part E.4a), and it came to run the
-shutdown itself (Part E.4b);
+shutdown itself (Part E.4b); last checked 2026-11-04, when it came onto libos and its wake to read
+only what signalled (pre-Phase-7 Part E.3);
 before that 2026-09-25, when a death found before its exit code learned to wait for it (below);
 before that, 2026-08-21, when it learned to hold **more than one** service and a stale
 "pre-implementation" line below was removed.
@@ -204,18 +205,24 @@ supervisors' process handles and control channels: a shutdown asks them on the f
 sessions, and learns of their exits from the second closing (§ *Shutdown*).
 
 **`service-mgr` never blocks on anything that can wait on it.** Every resolve on a server's path
-waits on it, so a blocking wait for a server that is itself resolving one — the broker opens its
-log at startup — would be two processes waiting on each other. So a server's `Ready`, a restart's
-backoff and an `after` are deadlines in its one wait, and resolves are answered on every pass, as
-they are while it waits for an exit code or a derived endpoint. The lookups it does make outright
-wait on the root filesystem, the profile server and servers already serving, none of which waits
-on it. Each route's ring is 64 deep, since a full one answers a resolve `WouldBlock` at once.
+waits on it, so a blocking wait for a server that is itself resolving one — the broker opens its log
+at startup — would be two processes waiting on each other. So a server's `Ready`, a restart's
+backoff and an `after` are deadlines in its one wait, and resolves are answered on each pass their
+route signals, as they are while it waits for an exit code or a derived endpoint. The lookups it
+does make outright wait on the root filesystem, the profile server and servers already serving, none
+of which waits on it. Each route's ring is 64 deep, since a full one answers a resolve `WouldBlock`
+at once.
 
-**Its wait holds the notification channel, every route, and the control channel of each server
-still starting** — whose `Ready` is the one thing a control channel brings. A death needs no slot:
-it closes the channel and queues `ChildExited`, and each pass looks at every channel. That keeps
-the wait inside the kernel's 32 handles with sixteen routes (`registry::MAX_ROUTES`); until Part
-E.1b it held every running service's channel, which capped the services at 31 and left no room.
+**Its wait holds the notification channel, every route, what serves `/svc/services`, and the
+control channel of each server that can still bring a message** — a starting server's `Ready`, or a
+late one from a server marked down whose process runs. **A wake reads only what signalled**
+(`service_mgr::wake`, pre-Phase-7 Part E.3), bar two looks: a death needs no slot, as it closes the
+channel and queues `ChildExited`, and the pass that drains it looks at every channel, and again once
+its wait for one death's code has drained another's; and a channel that can bring a message but found
+no room in the set is read on every wake, a wake coming each tick while it has none. That keeps the wait
+inside the kernel's 32 handles with fourteen routes (`registry::MAX_ROUTES`); until Part E.1b it
+held every running service's channel, which capped the services at 31 and left no room. A channel
+a server closes while it lives on is seen at the next death.
 
 **`critical = true`, at bring-up only**, marks `auth-service` and `logging-service`, the two `init`
 treated as critical-path. If one does not come up at boot, `service-mgr` starts nothing more and

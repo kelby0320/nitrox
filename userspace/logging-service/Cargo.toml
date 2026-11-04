@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
-librsproto = { path = "../librsproto" }
+libos = { path = "../libos" }
+librsproto = { path = "../librsproto", features = ["io"] }
 # Typed-stream (TSM1) log messages are decoded + rendered via libstream; text
 # LogRecord messages still go through librsproto::log::parse_append.
 libstream = { path = "../libstream" }

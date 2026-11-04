@@ -35,26 +35,32 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use fs_server_ext4::{BlockReader, FsError};
 use libinittoml::manifest::{self, Mode};
-use libkern::abi::{IO_OPCODE_EJECT, IO_OPCODE_FLUSH, IO_OPCODE_READ, IoOp};
-use libkern::debug::Line;
+use libkern::abi::{IO_OPCODE_EJECT, IO_OPCODE_FLUSH, IO_OPCODE_RESCAN, IoOp, IoResult};
 use libkern::device::{DeviceKind, DeviceRecord};
-use libkern::*;
+use libkern::{CTRL_OP_SHUTDOWN, KError, MAX_WAIT_HANDLES, Rights};
+use libos::boot::Start;
+use libos::control::{self, Control};
+use libos::log::{self, Line};
+use libos::{
+    Carried, Channel, Deadline, File, Handle, MapRead, MapReadWrite, Mapping, Memory, Msg, Namespace, NsMutable,
+    NsReadOnly, Only, Op, Process, ReadWrite, Resource, Spawn, WaitSet, block_on, time,
+};
 use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed};
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, parse_read_dir_request};
 use librsproto::meta::{FS_SETUP_READ_ONLY, fs_setup};
-use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, SUBNAMESPACE_PREFIX_LEN, parse_resolve_request,
-    resolve_reply, subnamespace_reply,
-};
+use librsproto::namespace::parse_resolve_request;
+use librsproto::server;
 use librsproto::storage::{
     OP_STORAGE_CHANGED, OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_REREAD, OP_STORAGE_UNMOUNT,
     build_in_use, build_mounted, parse_mount,
 };
-use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
+use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_READY, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode};
 use storage_service::fit::{SCRATCH, ScratchRead, scratch_read};
 use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
@@ -63,18 +69,17 @@ use storage_service::suffix::{self, Asked, session_only};
 use storage_service::table::{self, By, Device, Mounted};
 use storage_service::watch::{Sent, Watches};
 
+mod disks;
 mod mounting;
+use disks::*;
 use mounting::*;
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
-const PAYLOAD_OFF: usize = 24;
-const MSG_LEN: usize = 4096;
-const SUBSCRIPTION: &[u8] = b"/svc/devices/block";
+const SUBSCRIPTION: &str = "/svc/devices/block";
 /// Where `init`'s manifest is, in the initramfs this service inherits.
-const INIT_TOML: &[u8] = b"/initramfs/etc/init.toml";
+const INIT_TOML: &str = "/initramfs/etc/init.toml";
 /// How long one message of the replay may take. The manager queues the whole replay before the
 /// resolve completes, so this bounds a manager that broke that rule.
 const REPLAY_WAIT_NS: u64 = 2_000_000_000;
@@ -104,144 +109,20 @@ const READY_TIMEOUT_NS: u64 = 30_000_000_000;
 const HELD_ASKS: u32 = 3;
 const HELD_PARK_NS: u64 = 5_000_000;
 
-fn close(h: u64) {
-    if h != 0 {
-        // SAFETY: closing a handle this process holds.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    }
+type Chan = Handle<Channel, Only>;
+type Node = Handle<Resource, ReadWrite>;
+type Root = Handle<Namespace, NsReadOnly>;
+type Ns = Handle<Namespace, NsMutable>;
+
+/// `ns` from now.
+fn within(ns: u64) -> Deadline {
+    Deadline::after(ns).unwrap_or(Deadline::at(ns))
 }
 
-fn now_ns() -> u64 {
-    let mut now = 0u64;
-    // SAFETY: `now` is a valid writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
-    now
-}
-
-fn wait_until(h: u64, deadline: u64) -> bool {
-    let mut result = [0u8; 24];
-    // SAFETY: one handle, and room for its one result.
-    unsafe { syscall4(SYS_WAIT, (&raw const h) as u64, 1, result.as_mut_ptr() as u64, deadline) == 1 }
-}
-
-/// Park this thread for `ns`, in a wait on no handles, which the kernel never refuses.
-fn park(ns: u64) {
-    // SAFETY: no handles and no results, so the kernel reads and writes neither.
-    unsafe { syscall4(SYS_WAIT, 0, 0, 0, now_ns().saturating_add(ns)) };
-}
-
-/// Wait for a pending operation and return its `(status, value)`.
-/// Only once done: a full waiter queue refuses a wait for now, while the I/O may run on.
-fn po_wait(po: u64) -> (i64, u64) {
-    let mut r = [0u8; 24];
-    let done = loop {
-        // SAFETY: one handle, and room for its one result.
-        let waited = unsafe { syscall4(SYS_WAIT, (&raw const po) as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
-        if waited != KError::OutOfMemory.as_i32() as i64 {
-            break waited == 1;
-        }
-        park(HELD_PARK_NS);
-    };
-    let word = |off: usize| u64::from_le_bytes(r[off..off + 8].try_into().unwrap_or([0; 8]));
-    // The status is an `i32` beside a zero word: read whole, `AlreadyExists` would never match.
-    let (status, value) = (word(8) as u32 as i32 as i64, word(16));
-    close(po);
-    if done { (status, value) } else { (-1, 0) }
-}
-
-fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
-    send_raw(ch, op, request_id, flags, body, handles) == 0
-}
-
-/// [`send`], answering the syscall's own result. **Through a whole message's buffer**: the kernel
-/// copies a full message from the pointer it is given, so a smaller buffer would be read past.
-fn send_raw(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> i64 {
-    let (mut msg, mut carried) = ([0u8; MSG_LEN], [0u64; 8]);
-    let Some(rs_len) = encode(&mut msg[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16) else {
-        return KError::InvalidArgument.as_i32() as i64;
-    };
-    msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-    msg[8] = handles.len() as u8;
-    carried[..handles.len()].copy_from_slice(handles);
-    let (msg, carried) = (msg.as_ptr() as u64, carried.as_ptr() as u64);
-    // SAFETY: a whole message, and the handles it carries, which this process holds.
-    unsafe { syscall5(SYS_CHANNEL_SEND, ch, msg, carried, handles.len() as u64, SENDMODE_NOBLOCK) }
-}
-
-/// **Ping a watch**: a bare `Changed`, never blocking. A full queue is a ping already waiting, and
-/// a refused send is a client gone.
-fn ping(ch: u64) -> Sent {
-    match send_raw(ch, OP_STORAGE_CHANGED, 0, 0, &[], &[]) {
-        0 => Sent::Queued,
-        r if r == KError::WouldBlock.as_i32() as i64 => Sent::Full,
-        _ => Sent::Gone,
-    }
-}
-
-/// An error reply: a whole twelve-byte `ErrorBody`, which is what the kernel reads a forwarded
-/// resolve's refusal from.
-fn reply_error(ch: u64, op: u16, request_id: u64, err: KError) {
-    let mut body = [0u8; librsproto::error::ERROR_BODY_LEN];
-    let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, b"").unwrap_or(0);
-    let _ = send(ch, op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..n], &[]);
-}
-
-/// **Reply to a resolve carrying `handle`, or refuse it if the reply will not go.** The handle is
-/// moved on success and closed otherwise. A forwarded resolve waits for its answer with no
-/// deadline, so a silently failed reply would block the caller for good (a namespace lacking
-/// `TRANSFER` fails every move). `false` if the reply did not go.
-fn reply_with_handle(serve_end: u64, request_id: u64, body: &[u8], handle: u64) -> bool {
-    if send(serve_end, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, body, &[handle]) {
-        return true;
-    }
-    close(handle);
-    kprint(b"storage-service: a reply could not be sent, so it was refused instead\n");
-    reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::KernelError);
-    false
-}
-
-/// Write back every dirty file of the mount in `ns` (`sys_ns_sync`), held or not. `false` if one
-/// failed.
-fn sync_mount(ns: u64) -> bool {
-    let root = b"/";
-    // SAFETY: a namespace handle this process holds, and a valid path.
-    unsafe { syscall3(SYS_NS_SYNC, ns, root.as_ptr() as u64, root.len() as u64) >= 0 }
-}
-
-/// **How many of the mount's files something still holds** (`sys_ns_held`), asked after a sync.
-/// An IRP whose completion is still running on another CPU holds its file for that moment
-/// (`syscall-abi.md`), so a nonzero count is asked again after a park before it is believed; a
-/// real holder still holds. A nonzero count is said, naming `label`.
-fn held_files(label: &str, ns: u64) -> i64 {
-    let root = b"/";
-    let mut held = 0;
-    for attempt in 0..HELD_ASKS {
-        if attempt > 0 {
-            park(HELD_PARK_NS);
-        }
-        // SAFETY: a namespace handle this process holds, and a valid path.
-        held = unsafe { syscall3(SYS_NS_HELD, ns, root.as_ptr() as u64, root.len() as u64) };
-        if held == 0 {
-            break;
-        }
-    }
-    if held != 0 {
-        Line::new()
-            .s(b"storage-service: ")
-            .untrusted(label.as_bytes())
-            .s(b" is in use: ")
-            .i(held)
-            .s(b" file(s) still open or mapped")
-            .end();
-    }
-    held
-}
-
-fn make_channel(depth: u64) -> Option<(u64, u64)> {
-    let (mut a, mut b) = (0u64, 0u64);
-    // SAFETY: valid writable out-params.
-    let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, depth, 0) };
-    (r == 0).then_some((a, b))
+/// Whether `h` signalled before `deadline`.
+fn wait_until(h: &Chan, deadline: Deadline) -> bool {
+    let mut set = WaitSet::<1>::new();
+    set.add(h).is_ok() && set.wait(deadline).is_ok_and(|s| !s.is_empty())
 }
 
 struct Message {
@@ -251,229 +132,41 @@ struct Message {
     body: Vec<u8>,
 }
 
-/// Receive one message on `ch`, and the handles it carried, closed with the [`libkern::Received`]
-/// unless taken. `Ok(None)` if nothing was queued, `Err(())` if the peer has gone.
-fn recv(ch: u64) -> Result<Option<(Message, libkern::Received)>, ()> {
-    let mut buf = [0u8; MSG_LEN];
-    let sent = match channel_recv(ch, &mut buf) {
+/// Receive one message on `ch`, and the handles it carried, closed with the [`Carried`] unless
+/// taken. `Ok(None)` if nothing was queued, `Err(())` if the peer has gone.
+fn recv(ch: &Chan) -> Result<Option<(Message, Carried)>, ()> {
+    let mut msg = Msg::new();
+    let sent = match ch.recv(&mut msg) {
         Ok(sent) => sent,
-        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => return Err(()),
+        Err(e) if e.code() == KError::PeerClosed => return Err(()),
         Err(_) => return Ok(None),
     };
-    let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-    let msg = &buf[PAYLOAD_OFF..PAYLOAD_OFF + len.min(MSG_LEN - PAYLOAD_OFF)];
     // A message that does not decode closes what it carried, as `sent` drops.
-    Ok(decode(msg)
+    Ok(decode(msg.payload())
         .ok()
         .map(|m| (Message { op: m.op, flags: m.flags, request_id: m.request_id, body: m.body.to_vec() }, sent)))
 }
 
 /// Receive one message on `ch` and close whatever handles came with it: nothing a client sends
 /// this service carries a handle it wants, and one kept would be kept for good.
-fn recv_request(ch: u64) -> Result<Option<Message>, ()> {
+fn recv_request(ch: &Chan) -> Result<Option<Message>, ()> {
     Ok(recv(ch)?.map(|(m, _)| m))
 }
 
-fn lookup(ns: u64, path: &[u8], rights: u64) -> (i64, u64) {
-    let (status, handle) = libfs::lookup_wait(ns, path, rights);
-    (status.into(), handle)
+/// Refuse request `op` with `err` and no reason.
+fn fail(ch: &Chan, op: u16, request_id: u64, err: KError) {
+    let _ = server::reply_error(ch, op, request_id, err, b"");
 }
 
-fn with_mapped<T>(obj: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
-    let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
-    // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
-    if unsafe { syscall2(SYS_HANDLE_STAT, obj, (&raw mut info) as u64) } != 0 || info.size == 0 {
-        return None;
+/// **Ping a watch**: a bare `Changed`, never blocking. A full queue is a ping already waiting, and
+/// a refused send is a client gone.
+fn ping(ch: Option<&Chan>) -> Sent {
+    let Some(ch) = ch else { return Sent::Gone };
+    match server::send(ch, OP_STORAGE_CHANGED, 0, 0, &[], &mut Carried::new()) {
+        Ok(()) => Sent::Queued,
+        Err(e) if e.code() == KError::WouldBlock => Sent::Full,
+        Err(_) => Sent::Gone,
     }
-    // SAFETY: register-only syscall; `obj` is a MemoryObject handle with MAP_READ.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, obj, 0, info.size, RIGHT_MAP_READ) };
-    if addr < 0 {
-        return None;
-    }
-    // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
-    let out = f(unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) });
-    // SAFETY: unmapping what was mapped above; nothing refers to it after `f` returned.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size) };
-    Some(out)
-}
-
-/// The one memory object every device read passes through, mapped for the life of the service.
-struct Scratch {
-    mem: u64,
-    addr: u64,
-}
-
-impl Scratch {
-    fn new() -> Option<Scratch> {
-        // SAFETY: a plain anonymous object of SCRATCH bytes.
-        let mem = unsafe { syscall4(SYS_MEMORY_CREATE, SCRATCH as u64, 0, 0, 0) };
-        if mem <= 0 {
-            return None;
-        }
-        // SAFETY: mapping an object this process just created.
-        let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem as u64, 0, SCRATCH as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-        if addr <= 0 {
-            close(mem as u64);
-            return None;
-        }
-        Some(Scratch { mem: mem as u64, addr: addr as u64 })
-    }
-}
-
-struct DeviceIo<'a> {
-    node: u64,
-    len: u64,
-    sector: u64,
-    scratch: &'a Scratch,
-}
-
-impl DeviceIo<'_> {
-    fn new<'a>(node: u64, r: &DeviceRecord, scratch: &'a Scratch) -> DeviceIo<'a> {
-        let sector = if r.logical_block_size == 0 { 512 } else { r.logical_block_size as u64 };
-        DeviceIo { node, len: sector.saturating_mul(r.block_count), sector, scratch }
-    }
-}
-
-impl BlockReader for DeviceIo<'_> {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-        let end = offset.checked_add(buf.len() as u64).ok_or(FsError::Io)?;
-        if end > self.len {
-            return Err(FsError::Io);
-        }
-        let mut done = 0usize;
-        while done < buf.len() {
-            let ScratchRead { start, intra, want, span } =
-                scratch_read(offset + done as u64, buf.len() - done, self.sector).ok_or(FsError::Io)?;
-            let op = IoOp {
-                opcode: IO_OPCODE_READ,
-                flags: 0,
-                buffer: self.scratch.mem,
-                buf_offset: 0,
-                offset: start,
-                length: span,
-            };
-            // SAFETY: `node` is a block device handle this process holds with READ; `&op` names a
-            // memory object this process owns.
-            let po = unsafe { syscall2(SYS_IO_SUBMIT, self.node, (&op as *const IoOp) as u64) };
-            if po < 0 {
-                return Err(FsError::Io);
-            }
-            let (status, moved) = po_wait(po as u64);
-            if status != 0 || moved != span {
-                return Err(FsError::Io);
-            }
-            // SAFETY: `scratch.addr` maps SCRATCH read-write bytes for the life of the service,
-            // `scratch_read` keeps `intra + want <= span <= SCRATCH`, and the device has moved all
-            // `span`; single-threaded, so nothing else holds a reference.
-            let src = unsafe { core::slice::from_raw_parts(self.scratch.addr as *const u8, span as usize) };
-            buf[done..done + want].copy_from_slice(&src[intra..intra + want]);
-            done += want;
-        }
-        Ok(())
-    }
-}
-
-/// Take `block`: every device queued before `Settled`. `Err` with why if the class was not taken.
-#[allow(clippy::type_complexity, reason = "the pair is returned once and a name for it would only be read here")]
-fn take_block(root_ns: u64) -> Result<(u64, Vec<(DeviceRecord, u64)>), &'static [u8]> {
-    let (st, sub) = lookup(root_ns, SUBSCRIPTION, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
-    if st == KError::AlreadyExists.as_i32() as i64 {
-        return Err(b"block is already owned, so the disks are someone else's");
-    }
-    if st != 0 || sub == 0 {
-        return Err(b"/svc/devices/block did not resolve, so there are no disks to serve");
-    }
-    let mut devices = Vec::new();
-    loop {
-        let (m, mut sent) = match recv(sub) {
-            Ok(Some(m)) => m,
-            Ok(None) if wait_until(sub, now_ns().saturating_add(REPLAY_WAIT_NS)) => continue,
-            _ => {
-                devices.iter().for_each(|&(_, node)| close(node));
-                close(sub);
-                return Err(b"the device manager's replay stopped before Settled");
-            }
-        };
-        match (m.op, parse_arrived(&m.body).and_then(DeviceRecord::read), sent.count()) {
-            (OP_DEVICES_SETTLED, _, _) => return Ok((sub, devices)),
-            (OP_DEVICES_ARRIVED, Some(r), 1) if let Some(node) = sent.take(0) => devices.push((r, node)),
-            _ => {}
-        }
-    }
-}
-
-fn read_table(io: &DeviceIo, disk: u32) -> Option<DiskTable> {
-    let mut front = alloc::vec![0u8; libgpt::table::FRONT_BYTES];
-    io.read_at(0, &mut front).ok()?;
-    let t = libgpt::table::read(&front).ok()?;
-    let entries = t
-        .partitions()
-        .iter()
-        .map(|p| TableEntry { guid: p.unique_guid, name: p.name().to_vec(), blocks: p.blocks() })
-        .collect();
-    Some(DiskTable { disk, entries })
-}
-
-/// `init`'s manifest, or why it could not be read: each way it can fail says so.
-fn read_manifest(root_ns: u64) -> Result<manifest::Manifest, &'static [u8]> {
-    // `INSPECT` as well as `MAP_READ`: the object's size comes from `sys_handle_stat`.
-    let (st, obj) = lookup(root_ns, INIT_TOML, RIGHT_MAP_READ | RIGHT_INSPECT);
-    if st != 0 || obj == 0 {
-        return Err(b"it did not resolve");
-    }
-    let parsed = with_mapped(obj, |bytes| match manifest::text(bytes) {
-        Ok(text) => manifest::parse(text).map_err(|_| b"it did not parse".as_slice()),
-        Err(_) => Err(b"it is not UTF-8".as_slice()),
-    });
-    close(obj);
-    parsed.unwrap_or(Err(b"it would not map"))
-}
-
-fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) {
-    // SAFETY: a plain anonymous object of `bytes.len()`.
-    let obj = unsafe { syscall4(SYS_MEMORY_CREATE, bytes.len() as u64, 0, 0, 0) };
-    if obj <= 0 {
-        return reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::OutOfMemory);
-    }
-    // SAFETY: mapping an object this process just created, to fill it.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, obj as u64, 0, bytes.len() as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if addr <= 0 {
-        close(obj as u64);
-        return reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::OutOfMemory);
-    }
-    // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
-    // Unmapped before the reply, as `device-mgr` does: the mapping holds its own reference, so
-    // left behind it would pin every table ever served.
-    // SAFETY: unmapping a range this process mapped moments ago and never reads again.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
-    let mut body = [0u8; RESOLVE_REPLY_LEN];
-    let _ = resolve_reply(&mut body, OBJECT_KIND_MEMOBJ, bytes.len() as u32);
-    reply_with_handle(serve_end, request_id, &body, obj as u64);
-}
-
-/// Reply to a resolve with a channel: a directory session, or a session endpoint. `client_end` is
-/// consumed either way.
-fn reply_channel(serve_end: u64, request_id: u64, client_end: u64) -> bool {
-    let mut body = [0u8; RESOLVE_REPLY_LEN];
-    let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
-    reply_with_handle(serve_end, request_id, &body, client_end)
-}
-
-/// Reply to a resolve with `ns` and the bytes of the suffix it stands for: the kernel continues
-/// the resolve there (`rsproto-namespace-ops.md` § *The `SUBNAMESPACE` body*). The handle sent is
-/// a duplicate with `LOOKUP`, all a continuation needs, and `TRANSFER`, which moving it needs.
-fn reply_subnamespace(serve_end: u64, request_id: u64, ns: u64, consumed: usize) {
-    let mut body = [0u8; SUBNAMESPACE_PREFIX_LEN + 1];
-    let Some(n) = u16::try_from(consumed).ok().and_then(|c| subnamespace_reply(&mut body, c, b"/")) else {
-        return reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::InvalidArgument);
-    };
-    // SAFETY: duplicating a namespace handle this process holds, narrowed.
-    let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, ns, RIGHT_LOOKUP | RIGHT_TRANSFER) };
-    if dup <= 0 {
-        return reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::KernelError);
-    }
-    reply_with_handle(serve_end, request_id, &body[..n], dup as u64);
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -483,15 +176,14 @@ enum Listing {
 }
 
 struct Service {
-    root_ns: u64,
-    serve_end: u64,
+    root: Root,
     /// The `block` subscription. **Held for the life of the service**: closing it frees the
-    /// class, and the disks would be anyone's.
-    subscription: u64,
+    /// class, and the disks would be anyone's. `None` once the device manager has gone.
+    subscription: Option<Chan>,
     devices: Vec<Device>,
     /// Every device's node, by registry id: this service's own duplicate, kept for mounts and for
     /// the flush an unmount ends with.
-    nodes: Vec<(u32, u64)>,
+    nodes: Vec<(u32, Node)>,
     /// `init`'s mounts, as the table reports them.
     init: Vec<Mounted>,
     /// Whether every one of `init`'s mounts was placed on a device ([`init_known`]). Without it
@@ -503,16 +195,19 @@ struct Service {
     mounted: Vec<Mount>,
     /// The buffer every device read passes through, kept for [`refresh`](Self::refresh).
     scratch: Scratch,
-    /// Ends of the session endpoints minted: resolves on them are [`session_only`].
-    session_ends: Vec<u64>,
+    /// Ends of the session endpoints minted: resolves on them are [`session_only`]. The endpoints
+    /// and sessions below are shared so a handler holds one while it changes the list.
+    session_ends: Vec<Rc<Chan>>,
     /// Ends of the admin endpoints minted: any resolve on one opens an admin session.
-    admin_ends: Vec<u64>,
-    admin_sessions: Vec<u64>,
+    admin_ends: Vec<Rc<Chan>>,
+    admin_sessions: Vec<Rc<Chan>>,
     /// Channels carrying `Eject`, in the wait set.
-    media_sessions: Vec<u64>,
-    /// Channels this service only sends a ping on, outside the wait set.
+    media_sessions: Vec<Rc<Chan>>,
+    /// Channels this service only sends a ping on, outside the wait set: `watches` names each by
+    /// the value of its handle.
     watches: Watches,
-    dirs: Vec<(u64, Listing)>,
+    watch_ends: BTreeMap<u64, Chan>,
+    dirs: Vec<(Chan, Listing)>,
 }
 
 /// A request refused: the error, and the reason its reply carries.
@@ -536,9 +231,14 @@ impl Service {
         }
     }
 
+    /// This service's node for device `id`.
+    fn node_of(&self, id: u32) -> Option<&Node> {
+        self.nodes.iter().find(|(d, _)| *d == id).map(|(_, n)| n)
+    }
+
     /// What device `id` holds now; `None` if this service holds no node for it.
     fn read_found(&self, id: u32) -> Option<Found> {
-        let &(_, node) = self.nodes.iter().find(|(d, _)| *d == id)?;
+        let node = self.node_of(id)?;
         let d = self.devices.iter().find(|d| d.record.id == id)?;
         Some(probe_record(&DeviceIo::new(node, &d.record, &self.scratch), &d.record))
     }
@@ -566,7 +266,7 @@ impl Service {
 
     /// Answer one forwarded resolve on `from`, the endpoint at `/svc/storage` or, when `session`, a
     /// session endpoint. `false` if that endpoint has gone.
-    fn serve_resolve(&mut self, from: u64, session: bool) -> bool {
+    fn serve_resolve(&mut self, from: &Chan, session: bool) -> bool {
         let m = match recv_request(from) {
             Ok(Some(m)) => m,
             Ok(None) => return true,
@@ -589,96 +289,99 @@ impl Service {
                     table::one(&self.devices, &mounts, name)
                 };
                 match bytes {
-                    Some(b) => reply_with_object(from, m.request_id, &b),
-                    None => reply_error(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
+                    Some(b) => {
+                        server::reply_object(from, m.request_id, &b);
+                    }
+                    None => fail(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
                 }
             }
             Asked::Mount { label, consumed } => match self.mounted.iter().find(|x| x.label == label) {
-                Some(x) => reply_subnamespace(from, m.request_id, x.ns, consumed),
-                None => reply_error(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
+                Some(x) => {
+                    server::reply_subnamespace(from, m.request_id, x.ns.as_ref(), consumed, b"/");
+                }
+                None => fail(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
             },
             Asked::SessionEndpoint => self.mint_session_endpoint(from, m.request_id),
             Asked::AdminEndpoint => self.mint_admin_endpoint(from, m.request_id),
             Asked::Media => self.open_media_session(from, m.request_id),
             Asked::Watch => self.open_watch(from, m.request_id),
-            Asked::Unknown => reply_error(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
+            Asked::Unknown => fail(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
         }
         true
     }
 
     /// Answer with a session endpoint. **Minted only on the root endpoint**: [`session_only`]
     /// refuses the suffix on a session endpoint, so its holder cannot make more.
-    fn mint_session_endpoint(&mut self, reply_to: u64, request_id: u64) {
+    fn mint_session_endpoint(&mut self, reply_to: &Chan, request_id: u64) {
         if self.session_ends.len() >= MAX_SESSION_ENDPOINTS {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
         }
-        let Some((client_end, ours)) = make_channel(4) else {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+        let Ok((client_end, ours)) = Chan::pair(4) else {
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
-        if reply_channel(reply_to, request_id, client_end) {
-            self.session_ends.push(ours);
-            kprint(b"storage-service: a session endpoint minted\n");
-        } else {
-            close(ours);
+        if server::reply_channel(reply_to, request_id, client_end) {
+            self.session_ends.push(Rc::new(ours));
+            log::write(b"storage-service: a session endpoint minted\n");
         }
     }
 
     /// Answer with an admin endpoint. **Minted only on the root endpoint**: [`session_only`]
     /// refuses the suffix on a session endpoint, so a session cannot reach mounting at all. Who
     /// holds one is the view broker's `storage` grant to decide.
-    fn mint_admin_endpoint(&mut self, reply_to: u64, request_id: u64) {
+    fn mint_admin_endpoint(&mut self, reply_to: &Chan, request_id: u64) {
         if self.admin_ends.len() >= MAX_ADMIN_ENDPOINTS {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
         }
-        let Some((client_end, ours)) = make_channel(4) else {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+        let Ok((client_end, ours)) = Chan::pair(4) else {
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
-        if reply_channel(reply_to, request_id, client_end) {
-            self.admin_ends.push(ours);
-            kprint(b"storage-service: an admin endpoint minted\n");
-        } else {
-            close(ours);
+        if server::reply_channel(reply_to, request_id, client_end) {
+            self.admin_ends.push(Rc::new(ours));
+            log::write(b"storage-service: an admin endpoint minted\n");
         }
     }
 
     /// Answer with a media session, which only ejects, so a session endpoint answers it.
     /// `WouldBlock` with every one taken: each is held for a request, so a retry finds one.
-    fn open_media_session(&mut self, reply_to: u64, request_id: u64) {
+    fn open_media_session(&mut self, reply_to: &Chan, request_id: u64) {
         if self.media_sessions.len() >= MAX_MEDIA_SESSIONS {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
         }
-        let Some((client_end, ours)) = make_channel(4) else {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+        let Ok((client_end, ours)) = Chan::pair(4) else {
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
-        if reply_channel(reply_to, request_id, client_end) {
-            self.media_sessions.push(ours);
-        } else {
-            close(ours);
+        if server::reply_channel(reply_to, request_id, client_end) {
+            self.media_sessions.push(Rc::new(ours));
         }
     }
 
     /// Answer with a watch. `WouldBlock` once every watch is held by a client still there.
-    fn open_watch(&mut self, reply_to: u64, request_id: u64) {
-        let Some((client_end, ours)) = make_channel(2) else {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+    fn open_watch(&mut self, reply_to: &Chan, request_id: u64) {
+        let Ok((client_end, ours)) = Chan::pair(2) else {
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
-        match self.watches.add(ours, ping) {
+        let key = ours.raw().0;
+        match self.watches.add(key, |e| ping(self.watch_ends.get(&e))) {
             Ok(gone) => {
-                gone.into_iter().for_each(close);
+                for e in gone {
+                    self.watch_ends.remove(&e);
+                }
+                self.watch_ends.insert(key, ours);
                 // A reply that does not go closes the client's end, and the next ping finds the
                 // watch gone.
-                let _ = reply_channel(reply_to, request_id, client_end);
+                let _ = server::reply_channel(reply_to, request_id, client_end);
             }
             Err(()) => {
-                close(ours);
-                close(client_end);
-                reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+                drop((ours, client_end));
+                fail(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
             }
         }
     }
 
     fn mounts_changed(&mut self) {
-        self.watches.changed(ping).into_iter().for_each(close);
+        for e in self.watches.changed(|e| ping(self.watch_ends.get(&e))) {
+            self.watch_ends.remove(&e);
+        }
     }
 
     /// What a watch is told has changed: the names mounted and the devices there are — a partition
@@ -690,18 +393,18 @@ impl Service {
 
     /// One `Eject` on media session `i`: the unmount chain, held check included.
     fn serve_media(&mut self, i: usize) {
-        let ch = self.media_sessions[i];
+        let shared = Rc::clone(&self.media_sessions[i]);
+        let ch = &*shared;
         let m = match recv_request(ch) {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(()) => {
-                close(ch);
                 self.media_sessions.remove(i);
                 return;
             }
         };
         let refuse = |err: KError, why: &[u8]| {
-            let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &error_reply(err, why), &[]);
+            let _ = server::reply_error(ch, m.op, m.request_id, err, why);
         };
         if m.op != OP_STORAGE_EJECT {
             return refuse(KError::Unsupported, b"a media session carries Eject alone");
@@ -716,11 +419,11 @@ impl Service {
         // **The whole stick or none of it**: every mount is synced and asked whether a file is
         // held before any is unmounted, so a held file leaves no half-ejected stick.
         for n in &names {
-            let Some(ns) = self.mounted.iter().find(|x| &x.label == n).map(|x| x.ns) else { continue };
-            if !sync_mount(ns) {
+            let Some(x) = self.mounted.iter().find(|x| &x.label == n) else { continue };
+            if !sync_mount(&x.ns) {
                 return refuse(KError::IoError, b"its files could not all be written back");
             }
-            if held_files(n, ns) != 0 {
+            if held_files(n, &x.ns) != 0 {
                 return refuse(KError::WouldBlock, b"a file on it is still open or mapped");
             }
         }
@@ -737,52 +440,53 @@ impl Service {
         // The reply names every mount of the drive, a name per line (`rsproto-storage-ops.md`).
         // **Before the stop**, which a stick that never answers holds for a command's deadline:
         // the eject is done either way, as everything on it is unmounted.
-        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, names.join("\n").as_bytes(), &[]);
-        let node = self.nodes.iter().find(|(id, _)| *id == disk).map(|&(_, n)| n);
-        let said_stop = mounts::stop_said(node.map_or(Err(KError::NotFound), eject_medium));
+        let reply = names.join("\n");
+        let _ = server::send(ch, m.op, m.request_id, RS_FLAG_REPLY, reply.as_bytes(), &mut Carried::new());
+        let said_stop = mounts::stop_said(self.node_of(disk).map_or(Err(KError::NotFound), eject_medium));
         Line::new().s(b"storage-service: ").untrusted(said.as_bytes()).s(b" ").s(said_stop.as_bytes()).end();
     }
 
     /// A resolve on an admin endpoint, whatever its suffix, gets an admin session. `false` if gone.
-    fn serve_admin_endpoint(&mut self, from: u64) -> bool {
+    fn serve_admin_endpoint(&mut self, from: &Chan) -> bool {
         let m = match recv_request(from) {
             Ok(Some(m)) => m,
             Ok(None) => return true,
             Err(()) => return false,
         };
         if m.op != OP_NS_RESOLVE {
-            reply_error(from, m.op, m.request_id, KError::Unsupported);
+            fail(from, m.op, m.request_id, KError::Unsupported);
             return true;
         }
         if self.admin_sessions.len() >= MAX_ADMIN_SESSIONS {
-            reply_error(from, OP_NS_RESOLVE, m.request_id, KError::WouldBlock);
+            fail(from, OP_NS_RESOLVE, m.request_id, KError::WouldBlock);
             return true;
         }
-        let Some((client_end, ours)) = make_channel(4) else {
-            reply_error(from, OP_NS_RESOLVE, m.request_id, KError::KernelError);
+        let Ok((client_end, ours)) = Chan::pair(4) else {
+            fail(from, OP_NS_RESOLVE, m.request_id, KError::KernelError);
             return true;
         };
-        if reply_channel(from, m.request_id, client_end) {
-            self.admin_sessions.push(ours);
-        } else {
-            close(ours);
+        if server::reply_channel(from, m.request_id, client_end) {
+            self.admin_sessions.push(Rc::new(ours));
         }
         true
     }
 
     fn serve_admin(&mut self, i: usize) {
-        let ch = self.admin_sessions[i];
+        let shared = Rc::clone(&self.admin_sessions[i]);
+        let ch = &*shared;
         let m = match recv_request(ch) {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(()) => {
-                close(ch);
                 self.admin_sessions.remove(i);
                 return;
             }
         };
         let refuse = |err: KError, why: &[u8]| {
-            let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &error_reply(err, why), &[]);
+            let _ = server::reply_error(ch, m.op, m.request_id, err, why);
+        };
+        let reply = |body: &[u8]| {
+            let _ = server::send(ch, m.op, m.request_id, RS_FLAG_REPLY, body, &mut Carried::new());
         };
         match m.op {
             OP_STORAGE_MOUNT => {
@@ -797,9 +501,7 @@ impl Service {
                         let mut body = [0u8; 512];
                         let why = read_only.as_deref().map(str::as_bytes);
                         match build_mounted(&mut body, label.as_bytes(), why) {
-                            Some(n) => {
-                                let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &body[..n], &[]);
-                            }
+                            Some(n) => reply(&body[..n]),
                             None => refuse(KError::KernelError, b"mounted, but the reply would not encode"),
                         }
                     }
@@ -811,9 +513,7 @@ impl Service {
                     return refuse(KError::InvalidArgument, b"a label that is not UTF-8");
                 };
                 match self.unmount(label, true) {
-                    Ok(()) => {
-                        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &[], &[]);
-                    }
+                    Ok(()) => reply(&[]),
                     Err((err, why)) => refuse(err, why),
                 }
             }
@@ -822,9 +522,7 @@ impl Service {
                     return refuse(KError::InvalidArgument, b"a name that is not UTF-8");
                 };
                 match self.reread(name) {
-                    Ok(names) => {
-                        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, names.join("\n").as_bytes(), &[]);
-                    }
+                    Ok(names) => reply(names.join("\n").as_bytes()),
                     Err((err, why)) => refuse(err, why),
                 }
             }
@@ -841,9 +539,7 @@ impl Service {
                 let ids = in_use(&self.devices, &self.all_mounts());
                 let mut body = alloc::vec![0u8; 4 + 4 * ids.len()];
                 match build_in_use(&mut body, &ids) {
-                    Some(n) => {
-                        let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, &body[..n], &[]);
-                    }
+                    Some(n) => reply(&body[..n]),
                     None => refuse(KError::KernelError, b"the list would not encode"),
                 }
             }
@@ -858,10 +554,10 @@ impl Service {
         let room = self.mounted.len() < MAX_MOUNTS;
         let plan = explicit(&self.devices, &self.all_mounts(), &taken, room, self.init_known, device, label)
             .map_err(|r| (r.kerror(), r.why()))?;
-        let Some(&(_, node)) = self.nodes.iter().find(|(id, _)| *id == plan.device) else {
+        let Some(node) = self.node_of(plan.device) else {
             return Err((KError::NotFound, b"this service holds no node for it"));
         };
-        let m = mount(self.root_ns, &plan, node).map_err(|why| (KError::IoError, why))?;
+        let m = mount(&self.root, &plan, node).map_err(|why| (KError::IoError, why))?;
         let found = self.devices.iter().find(|d| d.record.id == plan.device);
         let read_only = found.and_then(|d| d.found.read_only()).filter(|_| m.mode == Mode::Ro).map(String::from);
         let (mode, why): (&[u8], &[u8]) = match &read_only {
@@ -880,7 +576,7 @@ impl Service {
         let what = mounts::reread(&self.devices, &self.all_mounts(), self.init_known, name)
             .map_err(|r| (r.kerror(), r.why()))?;
         let (Reread::Partition(id) | Reread::Disk(id)) = what;
-        let Some(&(_, node)) = self.nodes.iter().find(|(d, _)| *d == id) else {
+        let Some(node) = self.node_of(id) else {
             return Err((KError::NotFound, b"this service holds no node for it"));
         };
         if let Reread::Disk(_) = what {
@@ -903,13 +599,13 @@ impl Service {
         let Some(d) = self.devices.iter().find(|d| d.record.id == id).cloned() else {
             return Err((KError::NotFound, b"it departed as it was read"));
         };
-        let names = self.mount_as_arrival(&d, node);
+        let names = self.mount_as_arrival(&d);
         report(&d, &self.all_mounts(), &self.devices);
         Ok(names)
     }
 
     /// Mount `d`, arrived or read again, by an arrival's rules: the names mounted; failures said.
-    fn mount_as_arrival(&mut self, d: &Device, node: u64) -> Vec<String> {
+    fn mount_as_arrival(&mut self, d: &Device) -> Vec<String> {
         let taken: Vec<String> = self.mounted.iter().map(|m| m.label.clone()).collect();
         let plan = mounts::arrival(
             core::slice::from_ref(d),
@@ -920,6 +616,9 @@ impl Service {
             self.init_known,
         );
         let mut names = Vec::new();
+        let Some((_, node)) = self.nodes.iter().find(|(id, _)| *id == d.record.id) else {
+            return names;
+        };
         for p in plan {
             if self.mounted.len() >= MAX_MOUNTS {
                 Line::new()
@@ -929,7 +628,7 @@ impl Service {
                     .end();
                 break;
             }
-            match mount(self.root_ns, &p, node) {
+            match mount(&self.root, &p, node) {
                 Ok(m) => {
                     names.push(m.label.clone());
                     self.mounted.push(m);
@@ -956,29 +655,27 @@ impl Service {
         //    from here, and put back if a link before the server's refuses.
         let x = self.mounted.remove(i);
         // 2. **Every dirty file written back**, held or not.
-        if !sync_mount(x.ns) {
+        if !sync_mount(&x.ns) {
             self.mounted.insert(i, x);
             return Err((KError::IoError, b"its files could not all be written back"));
         }
         // 3. **Refused while a file is held**: a mapping or a handle could write after the
         //    filesystem is marked clean ([`held_files`]).
-        let held = if held_check { held_files(&x.label, x.ns) } else { 0 };
+        let held = if held_check { held_files(&x.label, &x.ns) } else { 0 };
         if held != 0 {
             self.mounted.insert(i, x);
             return Err((KError::WouldBlock, b"a file on it is still open or mapped"));
         }
         // 4. **The server records the filesystem clean and exits.** From here the mount is gone
         //    whatever the answer: a server that could not record it exits too.
-        let told = send(x.control, OP_UNMOUNT, 1, 0, &[], &[]);
-        let answer = if told && wait_until(x.control, now_ns().saturating_add(READY_TIMEOUT_NS)) {
-            recv(x.control).ok().flatten()
+        let told = server::send(&x.control, OP_UNMOUNT, 1, 0, &[], &mut Carried::new()).is_ok();
+        let answer = if told && wait_until(&x.control, within(READY_TIMEOUT_NS)) {
+            recv(&x.control).ok().flatten()
         } else {
             None
         };
         let recorded = answer.is_some_and(|(a, _)| a.op == OP_UNMOUNT && a.flags & RS_FLAG_ERROR == 0);
-        close(x.ns);
-        close(x.control);
-        close(x.process);
+        drop((x.ns, x.control, x.process));
         if !recorded {
             return Err((
                 KError::IoError,
@@ -987,7 +684,7 @@ impl Service {
         }
         // 5. **The drive's cache flushed**: a writable mount's writes are durable only then.
         if x.mode == Mode::Rw
-            && let Some(&(_, node)) = self.nodes.iter().find(|(id, _)| *id == x.device)
+            && let Some(node) = self.node_of(x.device)
             && !flush(node)
         {
             return Err((KError::IoError, b"the drive's cache could not be flushed"));
@@ -1026,38 +723,35 @@ impl Service {
                     .end();
             }
         }
-        kprint(b"storage-service: asked to stop: everything it mounted is unmounted, exiting\n");
-        exit(0);
+        log::write(b"storage-service: asked to stop: everything it mounted is unmounted, exiting\n");
+        libos::exit(0);
     }
 
-    fn open_dir(&mut self, reply_to: u64, request_id: u64, listing: Listing) {
+    fn open_dir(&mut self, reply_to: &Chan, request_id: u64, listing: Listing) {
         if self.dirs.len() >= MAX_DIRS {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
         }
-        let Some((client_end, ours)) = make_channel(4) else {
-            return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
+        let Ok((client_end, ours)) = Chan::pair(4) else {
+            return fail(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
-        if reply_channel(reply_to, request_id, client_end) {
+        if server::reply_channel(reply_to, request_id, client_end) {
             self.dirs.push((ours, listing));
-        } else {
-            close(ours);
         }
     }
 
     fn serve_dir(&mut self, i: usize) {
-        let (ch, listing) = self.dirs[i];
+        let (ch, listing) = &self.dirs[i];
         let m = match recv_request(ch) {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(()) => {
-                close(ch);
                 self.dirs.remove(i);
                 return;
             }
         };
         let cursor = match parse_read_dir_request(&m.body) {
             Some(r) if m.op == OP_FILE_READ_DIR => r.cursor as usize,
-            _ => return reply_error(ch, m.op, m.request_id, KError::Unsupported),
+            _ => return fail(ch, m.op, m.request_id, KError::Unsupported),
         };
         let mounts = self.all_mounts();
         let entries: Vec<(String, u8, u64)> = match listing {
@@ -1075,10 +769,11 @@ impl Service {
                 .collect(),
             Listing::Mounts => self.mounted.iter().map(|x| (x.label.clone(), DIRENT_KIND_DIR, 0)).collect(),
         };
-        let sent = storage_service::fit::dir_page(&entries, cursor)
-            .is_some_and(|(body, _)| send(ch, OP_FILE_READ_DIR, m.request_id, RS_FLAG_REPLY, &body, &[]));
+        let sent = storage_service::fit::dir_page(&entries, cursor).is_some_and(|(body, _)| {
+            server::send(ch, OP_FILE_READ_DIR, m.request_id, RS_FLAG_REPLY, &body, &mut Carried::new()).is_ok()
+        });
         if !sent {
-            reply_error(ch, m.op, m.request_id, KError::KernelError);
+            fail(ch, m.op, m.request_id, KError::KernelError);
         }
     }
 
@@ -1087,7 +782,7 @@ impl Service {
     /// to a server that no longer answers would fail every resolve under it.
     fn serve_control(&mut self, i: usize) {
         loop {
-            match recv(self.mounted[i].control) {
+            match recv(&self.mounted[i].control) {
                 Ok(Some(_)) => {}
                 Ok(None) => return,
                 Err(()) => {
@@ -1097,9 +792,7 @@ impl Service {
                         .untrusted(x.label.as_bytes())
                         .s(b" exited; it is no longer mounted")
                         .end();
-                    close(x.ns);
-                    close(x.control);
-                    close(x.process);
+                    drop((x.ns, x.control, x.process));
                     return;
                 }
             }
@@ -1111,12 +804,13 @@ impl Service {
     /// down. Anything else is said and its handles closed; the manager going away is said once.
     fn serve_subscription(&mut self) {
         loop {
-            match recv(self.subscription) {
-                Ok(Some((m, mut sent))) => match (m.op, sent.count()) {
+            let Some(sub) = &self.subscription else { return };
+            match recv(sub) {
+                Ok(Some((m, mut sent))) => match (m.op, sent.len()) {
                     (OP_DEVICES_ARRIVED, 1) if let Some(node) = sent.take(0) => {
                         match parse_arrived(&m.body).and_then(DeviceRecord::read) {
                             Some(r) => self.arrived(r, node),
-                            None => close(node),
+                            None => drop(node),
                         }
                     }
                     (OP_DEVICES_DEPARTED, 0) if let Some(id) = parse_departed(&m.body) => self.departed(id),
@@ -1130,9 +824,8 @@ impl Service {
                 },
                 Ok(None) => return,
                 Err(()) => {
-                    kprint(b"storage-service: the device manager has gone; the disks held are kept\n");
-                    close(self.subscription);
-                    self.subscription = 0;
+                    log::write(b"storage-service: the device manager has gone; the disks held are kept\n");
+                    self.subscription = None;
                     return;
                 }
             }
@@ -1143,12 +836,12 @@ impl Service {
 impl Service {
     /// A device that arrived after the boot: read as at boot, kept with its node, mounted by the
     /// boot's rules, and said.
-    fn arrived(&mut self, record: DeviceRecord, node: u64) {
-        let found = probe_record(&DeviceIo::new(node, &record, &self.scratch), &record);
+    fn arrived(&mut self, record: DeviceRecord, node: Node) {
+        let found = probe_record(&DeviceIo::new(&node, &record, &self.scratch), &record);
         let d = Device { found, record };
         self.devices.push(d.clone());
         self.nodes.push((record.id, node));
-        self.mount_as_arrival(&d, node);
+        self.mount_as_arrival(&d);
         report(&d, &self.all_mounts(), &self.devices);
     }
 
@@ -1163,28 +856,24 @@ impl Service {
         }
         let d = self.devices.remove(at);
         if let Some(n) = self.nodes.iter().position(|&(nid, _)| nid == id) {
-            close(self.nodes.remove(n).1);
+            drop(self.nodes.remove(n));
         }
         Line::new().s(b"storage-service: ").s(table::name(&d.record).as_bytes()).s(b" departed").end();
     }
 
     /// **Tear down mount `i`, whose device has gone**: as an unmount, but nothing can be kept.
-    /// `sys_ns_sync` has every write-back refused and the kernel lets each file go; `Meta::Unmount`
+    /// The flush has every write-back refused and the kernel lets each file go; `Meta::Unmount`
     /// has the server fail to record the filesystem clean, answer and exit (**not a terminate**,
     /// which it does not read). The line it says is matched by the QEMU gates.
     fn tear_down(&mut self, i: usize) {
         let x = self.mounted.remove(i);
-        let root = b"/";
-        // SAFETY: a namespace handle this process holds, and a valid path.
-        let _ = unsafe { syscall3(SYS_NS_SYNC, x.ns, root.as_ptr() as u64, root.len() as u64) };
-        if send(x.control, OP_UNMOUNT, 1, 0, &[], &[])
-            && wait_until(x.control, now_ns().saturating_add(READY_TIMEOUT_NS))
+        let _ = sync_mount(&x.ns);
+        if server::send(&x.control, OP_UNMOUNT, 1, 0, &[], &mut Carried::new()).is_ok()
+            && wait_until(&x.control, within(READY_TIMEOUT_NS))
         {
-            let _ = recv(x.control);
+            let _ = recv(&x.control);
         }
-        close(x.ns);
-        close(x.control);
-        close(x.process);
+        drop((x.ns, x.control, x.process));
         Line::new()
             .s(b"storage-service: ")
             .untrusted(x.label.as_bytes())
@@ -1246,50 +935,49 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     line.end();
 }
 
-/// Send `service-mgr` `Meta::Ready` naming this server, with the forwarding endpoint's client end.
-fn send_ready(control: u64, client_end: u64) -> bool {
-    let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
-    let Some(n) = librsproto::meta::ready(&mut body, b"storage-service") else {
-        return false;
-    };
-    send(control, librsproto::OP_READY, 0, 0, &body[..n], &[client_end])
-}
-
 /// Say, in place of `Meta::Ready`, that there is nothing to serve — no handle, and `service-mgr`
 /// says `why` (`rsproto-wire-format.md` § Meta::Ready) — then exit.
-fn refuse(control: u64, err: KError, why: &[u8]) -> ! {
-    let _ = send(control, librsproto::OP_READY, 0, RS_FLAG_ERROR, &error_reply(err, why), &[]);
-    exit(1);
+fn refuse(control: Option<&Chan>, err: KError, why: &[u8]) -> ! {
+    if let Some(control) = control {
+        let _ = server::reply_error(control, OP_READY, 0, err, why);
+    }
+    libos::exit(1);
 }
 
-/// **A refusal's body, sized to its reason**: in a fixed buffer, a reason longer than it makes
-/// `error_body` decline, and the reply goes out flagged an error with no body, its code and its
-/// reason both lost (`Reread`'s 108-byte `CannotRescan` did).
-fn error_reply(err: KError, why: &[u8]) -> Vec<u8> {
-    let mut body = alloc::vec![0u8; librsproto::error::ERROR_BODY_LEN + why.len()];
-    let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
-    body.truncate(n);
-    body
+/// Add `h` to `set`.
+fn watch<'a>(set: &mut WaitSet<'a, MAX_WAIT_HANDLES>, h: &'a Chan) {
+    let _ = set.add(h);
 }
 
 /// Bootstrap registers: `rdi` = notification channel, `rsi` = the inherited root namespace,
 /// `rdx` = the control channel `init` installed, `rcx` = `arg0`.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
-    kprint(b"storage-service: up\n");
-    let (subscription, held) = match take_block(root_ns) {
+pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, control, arg0) };
+    log::write(b"storage-service: up\n");
+    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN`. `None` once `service-mgr` is gone.
+    let mut control: Option<Chan> = start.take_handle0();
+    let Some(root) = start.root.take() else {
+        refuse(
+            control.as_ref(),
+            KError::NotFound,
+            b"/svc/devices/block did not resolve, so there are no disks to serve",
+        );
+    };
+    let (subscription, held) = match take_block(&root) {
         Ok(taken) => taken,
-        Err(why) => refuse(control, KError::NotFound, why),
+        Err(why) => refuse(control.as_ref(), KError::NotFound, why),
     };
     let Some(scratch) = Scratch::new() else {
-        refuse(control, KError::OutOfMemory, b"no scratch buffer to read the disks through");
+        refuse(control.as_ref(), KError::OutOfMemory, b"no scratch buffer to read the disks through");
     };
 
     let mut devices = Vec::new();
     let mut tables = Vec::new();
     let mut nodes = Vec::new();
     for (record, node) in held {
-        let io = DeviceIo::new(node, &record, &scratch);
+        let io = DeviceIo::new(&node, &record, &scratch);
         if matches!(record.kind(), DeviceKind::Disk | DeviceKind::RamDisk)
             && let Some(t) = read_table(&io, record.id)
         {
@@ -1300,7 +988,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     }
     let records: Vec<DeviceRecord> = devices.iter().map(|d| d.record).collect();
 
-    let init_list: Option<Vec<InitMount>> = match read_manifest(root_ns) {
+    let init_list: Option<Vec<InitMount>> = match read_manifest(&root) {
         Ok(m) => Some(init_mounts(&m, &records, &tables)),
         Err(why) => {
             Line::new()
@@ -1326,7 +1014,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     }
     let known = init_known(init_list.as_deref());
     if !known {
-        kprint(b"storage-service: init's mounts are not all known, so this service mounts nothing and does not say what is in use\n");
+        log::write(b"storage-service: init's mounts are not all known, so this service mounts nothing and does not say what is in use\n");
     }
     let live = live_boot(init_list.as_deref().unwrap_or(&[]), &records);
 
@@ -1335,11 +1023,11 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     let mut plan = automount(&devices, &init, live, known);
     plan.truncate(MAX_MOUNTS);
     let mut mounted = Vec::new();
-    for &(id, node) in &nodes {
-        let Some(p) = plan.iter().find(|p| p.device == id) else {
+    for (id, node) in &nodes {
+        let Some(p) = plan.iter().find(|p| p.device == *id) else {
             continue;
         };
-        match mount(root_ns, p, node) {
+        match mount(&root, p, node) {
             Ok(m) => mounted.push(m),
             Err(why) => {
                 Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: ").s(why).end()
@@ -1348,9 +1036,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     }
 
     let mut s = Service {
-        root_ns,
-        serve_end: 0,
-        subscription,
+        root,
+        subscription: Some(subscription),
         devices,
         nodes,
         init,
@@ -1361,6 +1048,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         session_ends: Vec::new(),
         media_sessions: Vec::new(),
         watches: Watches::new(),
+        watch_ends: BTreeMap::new(),
         admin_ends: Vec::new(),
         admin_sessions: Vec::new(),
         dirs: Vec::new(),
@@ -1371,98 +1059,92 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         report(d, &mounts, &s.devices);
     }
     if live {
-        kprint(b"storage-service: a live boot: the root is on a RAM disk, so internal disks mount read-only\n");
+        log::write(b"storage-service: a live boot: the root is on a RAM disk, so internal disks mount read-only\n");
     } else {
-        kprint(b"storage-service: not a live boot\n");
+        log::write(b"storage-service: not a live boot\n");
     }
 
-    let Some((client_end, serve_end)) = make_channel(4) else {
-        kprint(b"storage-service: channel create FAIL\n");
-        exit(1);
+    let Ok((client_end, serve_end)) = Chan::pair(4) else {
+        log::write(b"storage-service: channel create FAIL\n");
+        libos::exit(1);
     };
-    if !send_ready(control, client_end) {
-        kprint(b"storage-service: Ready send FAIL\n");
-        exit(1);
+    if !control.as_ref().is_some_and(|c| server::ready(c, b"storage-service", client_end)) {
+        log::write(b"storage-service: Ready send FAIL\n");
+        libos::exit(1);
     }
-    s.serve_end = serve_end;
-    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN`. `0` once `service-mgr` is gone.
-    let mut control = control;
     loop {
-        let (mut handles, mut results) = ([0u64; MAX_WAIT_HANDLES], [0u8; 24 * MAX_WAIT_HANDLES]);
-        let waited = {
-            let mut n = 0usize;
-            let mut push = |h: u64| {
-                if h != 0 && n < MAX_WAIT_HANDLES {
-                    handles[n] = h;
-                    n += 1;
-                }
-            };
-            push(s.serve_end);
-            push(s.subscription);
-            if control != 0 {
-                push(control);
+        let signalled = {
+            let mut set = WaitSet::<MAX_WAIT_HANDLES>::new();
+            watch(&mut set, &serve_end);
+            if let Some(sub) = &s.subscription {
+                watch(&mut set, sub);
             }
-            for &e in &s.session_ends {
-                push(e);
+            if let Some(c) = &control {
+                watch(&mut set, c);
+            }
+            for e in &s.session_ends {
+                watch(&mut set, e);
             }
             for x in &s.mounted {
-                push(x.control);
+                watch(&mut set, &x.control);
             }
-            for &e in &s.admin_ends {
-                push(e);
+            for e in &s.admin_ends {
+                watch(&mut set, e);
             }
-            for &a in &s.admin_sessions {
-                push(a);
+            for a in &s.admin_sessions {
+                watch(&mut set, a);
             }
-            for &m in &s.media_sessions {
-                push(m);
+            for m in &s.media_sessions {
+                watch(&mut set, m);
             }
-            for &(d, _) in &s.dirs {
-                push(d);
+            for (d, _) in &s.dirs {
+                watch(&mut set, d);
             }
-            // SAFETY: `n` handles, and room for as many results; each kind refuses past its bound.
-            unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, u64::MAX) }
+            set.wait(Deadline::NEVER)
         };
+        let Ok(signalled) = signalled else { continue };
         // **What a watch is told**: the names mounted and the devices there are before this turn,
         // against after it. Compared here, once, rather than at each place that mounts, unmounts
         // or follows a device, so no path can miss a ping.
         let before = s.watched();
-        for j in 0..waited.max(0) as usize {
-            // The handle is the first word of each record.
-            let h = u64::from_le_bytes(results[j * 24..j * 24 + 8].try_into().unwrap_or([0; 8]));
-            if h == s.serve_end {
+        for (_, ready) in signalled.iter() {
+            // Matched by the handle's value, as an earlier handler this turn may have removed
+            // the entry an index would name.
+            let h = ready.handle;
+            let is = |c: &Chan| c.raw().0 == h;
+            if is(&serve_end) {
                 // A root endpoint with no peer is the end of this service, not a message to skip:
                 // the kernel keeps a peer-closed channel signalled, so going round again would spin
                 // a CPU.
-                if !s.serve_resolve(h, false) {
-                    kprint(b"storage-service: forwarding endpoint closed\n");
-                    exit(1);
+                if !s.serve_resolve(&serve_end, false) {
+                    log::write(b"storage-service: forwarding endpoint closed\n");
+                    libos::exit(1);
                 }
-            } else if h == s.subscription {
+            } else if s.subscription.as_ref().is_some_and(is) {
                 s.serve_subscription();
-            } else if h == control {
-                if let libkern::control::Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
+            } else if control.as_ref().is_some_and(is) {
+                if control::recv(&mut control) == Control::Op(CTRL_OP_SHUTDOWN) {
                     s.shut_down();
                 }
-            } else if let Some(i) = s.session_ends.iter().position(|&e| e == h) {
+            } else if let Some(i) = s.session_ends.iter().position(|e| is(e)) {
                 // Every holder of this endpoint has let it go, its bindings included.
-                if !s.serve_resolve(h, true) {
-                    close(h);
+                let ch = Rc::clone(&s.session_ends[i]);
+                if !s.serve_resolve(&ch, true) {
                     s.session_ends.remove(i);
                 }
-            } else if let Some(i) = s.mounted.iter().position(|x| x.control == h) {
+            } else if let Some(i) = s.mounted.iter().position(|x| is(&x.control)) {
                 s.serve_control(i);
-            } else if let Some(i) = s.admin_ends.iter().position(|&e| e == h) {
+            } else if let Some(i) = s.admin_ends.iter().position(|e| is(e)) {
                 // Every holder of this endpoint has let it go, its bindings included.
-                if !s.serve_admin_endpoint(h) {
-                    close(h);
+                let ch = Rc::clone(&s.admin_ends[i]);
+                if !s.serve_admin_endpoint(&ch) {
                     s.admin_ends.remove(i);
                 }
-            } else if let Some(i) = s.admin_sessions.iter().position(|&a| a == h) {
+            } else if let Some(i) = s.admin_sessions.iter().position(|a| is(a)) {
                 s.serve_admin(i);
-            } else if let Some(i) = s.media_sessions.iter().position(|&m| m == h) {
+            } else if let Some(i) = s.media_sessions.iter().position(|m| is(m)) {
                 s.serve_media(i);
-            } else if let Some(i) = s.dirs.iter().position(|&(d, _)| d == h) {
+            } else if let Some(i) = s.dirs.iter().position(|(d, _)| is(d)) {
                 s.serve_dir(i);
             }
         }
@@ -1474,6 +1156,6 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"storage-service: PANIC\n");
-    exit(1);
+    log::write(b"storage-service: PANIC\n");
+    libos::exit(1);
 }

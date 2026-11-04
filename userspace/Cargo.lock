@@ -34,6 +34,7 @@ version = "0.1.0"
 dependencies = [
  "libcrypto",
  "libkern",
+ "libos",
  "librsproto",
  "libusers",
 ]
@@ -43,6 +44,7 @@ name = "clipboard-server"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "libos",
  "librsproto",
 ]
 
@@ -94,6 +96,7 @@ dependencies = [
  "libheap",
  "libinput",
  "libkern",
+ "libos",
  "librsproto",
  "libsession",
  "libstream",
@@ -123,9 +126,9 @@ dependencies = [
 name = "device-mgr"
 version = "0.1.0"
 dependencies = [
- "libfs",
  "libheap",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
 ]
@@ -189,6 +192,7 @@ version = "0.1.0"
 dependencies = [
  "libheap",
  "libkern",
+ "libos",
  "librsproto",
 ]
 
@@ -378,6 +382,7 @@ version = "0.1.0"
 dependencies = [
  "libheap",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
 ]
@@ -480,6 +485,7 @@ version = "0.1.0"
 dependencies = [
  "libheap",
  "libkern",
+ "libos",
  "librsproto",
 ]
 
@@ -501,6 +507,7 @@ version = "0.1.0"
 dependencies = [
  "libheap",
  "libkern",
+ "libos",
  "librsproto",
  "libsession",
  "libstream",
@@ -512,11 +519,11 @@ version = "0.1.0"
 dependencies = [
  "fs-server-ext4",
  "fs-server-fat",
- "libfs",
  "libgpt",
  "libheap",
  "libinittoml",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
 ]
@@ -557,6 +564,7 @@ dependencies = [
  "libheap",
  "libkern",
  "libline",
+ "libos",
  "librsproto",
 ]
 
@@ -568,6 +576,7 @@ dependencies = [
  "libheap",
  "libkern",
  "liblog",
+ "libos",
  "librsproto",
  "libsession",
  "libstream",

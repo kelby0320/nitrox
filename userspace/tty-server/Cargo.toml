@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 libheap = { path = "../libheap" }
-librsproto = { path = "../librsproto" }
+librsproto = { path = "../librsproto", features = ["io"] }
 libline = { path = "../libline" }
 
 # A library + binary split (mirroring profile-server): the library holds the

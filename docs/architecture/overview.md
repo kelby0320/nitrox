@@ -245,7 +245,7 @@ each crate's own `CLAUDE.md` its constraints.
 Each has (or will have) a design doc under `docs/architecture/`, sliced in just-in-time as the
 crate is built:
 
-- **libkern**: raw syscall wrappers, `#![no_std]`, no `alloc`. ABI types and unsafe `extern` declarations. Used directly by early services (init, fs-servers, eshell).
+- **libkern**: raw syscall wrappers, `#![no_std]`, no `alloc`. ABI types and unsafe `extern` declarations. Its calls are made by `libos`, which the libraries, the servers and the supervisors, `init` among them, reach the kernel through, and directly only by `eshell` and `libheap`, by choice, and the crates pre-Phase-7 Part E has still to move (`tools/xtask/raw-syscalls.toml`).
 - **libheap**: the freeing userspace heap — the `#[global_allocator]` backing `alloc`. `#![no_std]`, no `alloc` (it provides it). See [libheap.md](libheap.md).
 - **libos**: typed `Handle<T, M>`, async executor built on `sys_wait`, and the type-system enforcement of access modes. In-process concurrency is `async` tasks on the single-threaded executor; a small `block_on` covers sequential callers. (Real OS threads — `std::thread` semantics — wait on the deferred kernel TLS/FPU work and land only when a workload needs multicore *within* a process.)
 - **libstream**: typed structured I/O, `#[derive(TypedRecord)]` procedural macro for automatic schema derivation, table reading and writing.

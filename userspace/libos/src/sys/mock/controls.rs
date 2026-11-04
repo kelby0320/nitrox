@@ -88,6 +88,12 @@ pub fn unseeded(reads: u32) {
     with(|m| m.unseeded = reads);
 }
 
+/// Let the next `reads` unseeded reads find every place the kernel keeps for a reader waiting on
+/// the seeding taken, as it answers past `SEED_WAITERS_MAX`: a PO done `WouldBlock`, to read again.
+pub fn seed_waiters_full(reads: u32) {
+    with(|m| m.seed_full = reads);
+}
+
 /// Set the wall clock, which reads `Unsupported` until then.
 pub fn set_realtime(ns: u64) {
     with(|m| m.realtime = Some(ns));
@@ -96,6 +102,17 @@ pub fn set_realtime(ns: u64) {
 /// A handle to a device that `io_submit` takes, with `READ | WRITE`.
 pub fn device() -> u64 {
     with(|m| m.mint(Object::Device, Rights::READ | Rights::WRITE) as u64)
+}
+
+/// The system-control object, with `WRITE | INSPECT` and neither `DUPLICATE` nor `TRANSFER`, as
+/// the kernel hands it to `init`.
+pub fn system_control() -> u64 {
+    with(|m| m.mint(Object::SystemControl, Rights::WRITE | Rights::INSPECT) as u64)
+}
+
+/// Each test verdict reported, in order.
+pub fn verdicts() -> Vec<u64> {
+    with(|m| m.verdicts.clone())
 }
 
 /// A namespace whose server at `path` answers each lookup at once with one end of a channel, and

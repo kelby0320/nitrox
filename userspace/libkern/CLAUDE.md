@@ -88,9 +88,10 @@ If something doesn't strictly belong here but you find yourself wanting to put i
 
 **One guard here is `channel::Received`** (pre-Phase-7 Part D, group F): the handles a message
 brought, closed when it drops unless taken. `sys_channel_recv` installs whatever a sender attaches,
-so every receiver must close what it did not ask for, those that do not depend on libos
-(`auth-service`, `librsproto`, `libstream`) included, and the lowest layer is the only one they
-all share. Receive through `channel_recv`, or
+so every receiver must close what it did not ask for, and the lowest layer is the only one they
+all share. libos's `recv` hands what came back as a `Carried`, which does it; a crate still on
+libkern's receive, the programs and the test harness until pre-Phase-7 Part E moves them, has
+`Received`. Receive through `channel_recv`, or
 `channel_recv_raw` into a `static mut` buffer, never a raw `SYS_CHANNEL_RECV`:
 `cargo xtask check-recv` fails any other userspace file that names it.
 

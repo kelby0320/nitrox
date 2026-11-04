@@ -3,9 +3,11 @@
 **Status:** Implemented. `userspace/libos` is the safe layer every userspace crate is to reach the
 kernel through: typed handles and borrows, messages, waits, mappings, namespaces and files,
 spawning and threads, the clocks, the log and the bootstrap registers, over the `Op` future and
-`block_on`. Eight crates use it today; the rest move onto it in pre-Phase-7 Part E.2–E.5, and
-`cargo xtask check-syscalls` holds each crate's raw syscalls to its count as they do. Sections
-marked *deferred* (chiefly the multi-task executor) are genuinely unbuilt. Verified 2026-11-03.
+`block_on`. Twenty-four crates use it directly, the libraries and the system's servers and
+supervisors among them; the programs and the test harness move onto it in pre-Phase-7 Part E.4 and
+E.5, and `cargo xtask check-syscalls` holds each crate's raw syscalls to its count as they do.
+Sections marked *deferred* (chiefly the multi-task executor) are genuinely unbuilt. Verified
+2026-11-04.
 
 `libos` is the **typed, async face of the syscall surface**. Before it, every userspace binary
 called the raw `libkern` surface directly: bare `u64` handles closed by hand on every path,
@@ -79,15 +81,17 @@ gives one out once.
 |---|---|
 | `memory` | `Handle<Memory, MapReadWrite>::create`, and `map(len) -> Mapping<M>` on memory or a file |
 | `channel` | `Msg`, and a `Channel` endpoint's `pair`, `send`, `send_held`, `send_by` and `recv` |
-| `wait` | `WaitSet<N>`, borrowing up to `N` handles, and `Signalled`, which of them a wait found |
-| `ns` | a namespace's `create`, `lookup`, `copy`, `bind`, `bind_server`, `unbind`, `bindings`, `flush` and `held` |
+| `wait` | `WaitSet<N>`, borrowing up to `N` handles or operations, and `Signalled`, which of them a wait found |
+| `ns` | a namespace's `create`, `lookup`, `start_lookup`, `copy`, `bind`, `bind_server`, `unbind`, `bindings`, `flush` and `held` |
 | `fs` | `create`, `grow`, `truncate`, `rename` and `flush`: a file by path |
 | `process` | `Spawn`, by image or by path, and `exit` |
 | `thread` | `Stack`, and `start` |
 | `time` | `now`, `wall`, `sleep`, `sleep_until`, and `Deadline` |
 | `log` | `write`, and `Line`, one write a line |
-| `entropy` | `fill` |
+| `entropy` | `fill`, and `try_fill` for a caller that cannot wait for the seeding |
 | `boot` | `Start`: `_start`'s four registers, owned and typed |
+| `control` | a service's control channel, read: an op, nothing, or closed and taken |
+| `system` | `stop`, the machine halted or reset with the system-control object, and `test_verdict` |
 | `io` | a `Resource`'s `read` and `write`, and a notification queue's `recv` |
 
 **A `Mapping` lends no reference to its bytes.** Another process mapping the same object, or a
@@ -112,7 +116,11 @@ at once for a reply on a server's forwarding endpoint, which the kernel takes wi
 **A `WaitSet` borrows what it waits on**, so nothing in it closes while it is waited on, holds at
 most `MAX_WAIT_HANDLES`, by a compile-time check, and refuses a handle twice. Its `wait` answers
 the indices that signalled, with each one's `IoResult`; a poll that found nothing and a deadline
-that passed are empty answers, not errors.
+that passed are empty answers, not errors. **An operation in flight waits beside handles**:
+`add_op` puts an `Op` in the set, and `Op::completion_in` takes what the wait read for it, so a
+server that keeps a device read outstanding while it serves its channels costs no second wait, and
+an `Op` whose completion was taken waits for nothing as it drops. `Namespace::start_lookup` gives
+a lookup the same shape, its handle taken from the wait that found it.
 
 **A spawn moves its grants or hands them back.** `Spawn::grant` takes a `Handle`, which leaves
 this process when the child starts and comes back in `Refused` if the kernel refuses: it starts a

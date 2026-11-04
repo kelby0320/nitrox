@@ -5,12 +5,13 @@ edition = "2024"
 
 [dependencies]
 libkern = { path = "../libkern" }
-librsproto = { path = "../librsproto" }
+libos = { path = "../libos" }
+librsproto = { path = "../librsproto", features = ["io"] }
 
 # The library/binary split every resource server here uses: the library is the ring — the
 # half that can be wrong about which entry index 0 names — and is host-tested; the binary is
 # the bare-target syscall plumbing, which cannot build on host (`#![no_main]`).
-# Alloc-free: the ring is a bounded `.bss` object, so there is nothing to allocate.
+# Alloc-free: the ring is a bounded object, so there is nothing to allocate.
 [lib]
 name = "clipboard_server"
 path = "src/lib.rs"

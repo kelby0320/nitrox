@@ -6,60 +6,36 @@ pub(super) struct Mount {
     pub(super) label: String,
     pub(super) mode: Mode,
     /// A namespace of its own, with the server bound at `/`: what a `SUBNAMESPACE` reply hands on.
-    pub(super) ns: u64,
+    pub(super) ns: Ns,
     /// The server's control channel: kept, for the unmount it will carry, and waited on, since
     /// its closing means the server has gone.
-    pub(super) control: u64,
+    pub(super) control: Chan,
     /// The server's process handle.
-    pub(super) process: u64,
+    pub(super) process: Handle<Process, Only>,
 }
 
-/// Spawn `path` with `control_end` moved into it; on `None` it is closed, a failed spawn moving
-/// nothing.
-fn spawn(root_ns: u64, path: &[u8], control_end: u64) -> Option<u64> {
-    let (st, image) = lookup(root_ns, path, RIGHT_MAP_READ);
-    if st != 0 || image == 0 {
-        close(control_end);
-        return None;
-    }
-    let args = SpawnArgs {
-        image,
-        handle_count: 1,
-        move_mask: 1, // move the control endpoint to the child
-        arg0: 0,
-        handles: [control_end, 0, 0, 0],
-        rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-        namespace: 0,
-        syscaps: 0, // a resource server holds no ambient capabilities
-    };
-    // SAFETY: `args` is a valid `SpawnArgs` naming handles this process holds.
-    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&args as *const SpawnArgs) as u64) };
-    close(image);
-    if h <= 0 {
-        close(control_end);
-        return None;
-    }
-    Some(h as u64)
+/// Spawn `path` with `control_end` moved into it; a failed spawn moves nothing, and drops it.
+fn spawn(root: &Root, path: &[u8], control_end: Chan) -> Option<Handle<Process, Only>> {
+    let mut spawn = block_on(Spawn::path(root, core::str::from_utf8(path).ok()?)).ok()?;
+    // A resource server holds no ambient capabilities, so no syscaps are given.
+    spawn.grant(control_end, Rights::SEND | Rights::RECV | Rights::TRANSFER | Rights::WAIT).ok()?;
+    spawn.spawn().ok()
 }
 
 /// Send a filesystem server its **setup message**: the device in `handles[0]`, and one flags byte.
 /// Not rsproto-framed — it precedes everything else on the channel (`rsproto-wire-format.md`).
-fn send_setup(control: u64, device: u64, flags: u8) -> bool {
-    let mut msg = [0u8; MSG_LEN];
-    let Some(n) = fs_setup(&mut msg[PAYLOAD_OFF..], flags) else {
+fn send_setup(control: &Chan, device: Node, flags: u8) -> bool {
+    let mut msg = Msg::new();
+    let Some(n) = fs_setup(msg.payload_mut(), flags) else {
         return false;
     };
-    msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-    msg[8] = 1;
-    // SAFETY: a whole message, carrying one handle this process holds.
-    unsafe {
-        syscall5(SYS_CHANNEL_SEND, control, msg.as_ptr() as u64, (&raw const device) as u64, 1, SENDMODE_NOBLOCK) == 0
-    }
+    let mut carried = Carried::new();
+    msg.set_len(n).is_ok() && carried.push(device).is_ok() && control.send(&msg, &mut carried).is_ok()
 }
 
 /// Wait, bounded, for a server's `Meta::Ready` and take its endpoint; `Err` says what came instead.
-fn wait_ready(control: u64) -> Result<u64, &'static [u8]> {
-    if !wait_until(control, now_ns().saturating_add(READY_TIMEOUT_NS)) {
+fn wait_ready(control: &Chan) -> Result<Chan, &'static [u8]> {
+    if !wait_until(control, within(READY_TIMEOUT_NS)) {
         return Err(b"it sent no Ready in time");
     }
     let (m, mut sent) = match recv(control) {
@@ -68,111 +44,123 @@ fn wait_ready(control: u64) -> Result<u64, &'static [u8]> {
         Err(()) => return Err(b"it exited before Ready"),
     };
     // A Ready's one endpoint is kept; anything else closes as `sent` drops.
-    match (m.op, m.flags & RS_FLAG_ERROR != 0, sent.count()) {
+    match (m.op, m.flags & RS_FLAG_ERROR != 0, sent.len()) {
         (librsproto::OP_READY, false, 1) if let Some(endpoint) = sent.take(0) => Ok(endpoint),
         (librsproto::OP_READY, true, _) => Err(b"it refused the device"),
         _ => Err(b"it sent something other than Ready"),
     }
 }
 
+/// Write back every dirty file of the mount in `ns`, held or not. `false` if one failed.
+pub(super) fn sync_mount(ns: &Ns) -> bool {
+    block_on(ns.flush("/")).is_ok()
+}
+
+/// **How many of the mount's files something still holds**, asked after a sync. An IRP whose
+/// completion is still running on another CPU holds its file for that moment (`syscall-abi.md`),
+/// so a nonzero count is asked again after a park before it is believed; a real holder still
+/// holds. A nonzero count is said, naming `label`.
+pub(super) fn held_files(label: &str, ns: &Ns) -> i64 {
+    let mut held = 0;
+    for attempt in 0..HELD_ASKS {
+        if attempt > 0 {
+            let _ = time::sleep(HELD_PARK_NS);
+        }
+        held = ns.held("/").map_or_else(|e| e.code().as_i32() as i64, |n| n as i64);
+        if held == 0 {
+            break;
+        }
+    }
+    if held != 0 {
+        Line::new()
+            .s(b"storage-service: ")
+            .untrusted(label.as_bytes())
+            .s(b" is in use: ")
+            .i(held)
+            .s(b" file(s) still open or mapped")
+            .end();
+    }
+    held
+}
+
+/// Run `opcode` on `node` and wait for it: its completion, or why the submit or the wait failed.
+fn run(node: &Node, opcode: u32) -> Result<IoResult, KError> {
+    let op = IoOp { opcode, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
+    Op::submit(node.raw(), &op).and_then(Op::wait_out).map_err(|e| e.code())
+}
+
 /// **Flush the drive's volatile write cache** (`IoOpcode::Flush`; `drivers-and-irps.md` § Flush):
 /// `true` once it completes. Needs `WRITE` on the node, which the manager's duplicate carries.
-pub(super) fn flush(node: u64) -> bool {
-    let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
-    // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
-    po >= 0 && po_wait(po as u64).0 == 0
+pub(super) fn flush(node: &Node) -> bool {
+    run(node, IO_OPCODE_FLUSH).is_ok_and(|done| done.status == 0)
 }
 
 /// **Have the kernel read a disk's partition table again** (`IoOpcode::Rescan`): its partitions
 /// depart and the table's are published, as arrivals read from the subscription after. How many
 /// were published, or the kernel's refusal (`Unsupported` for every disk but a USB disk's).
-pub(super) fn rescan(node: u64) -> Result<u64, KError> {
-    let op = IoOp { opcode: IO_OPCODE_RESCAN, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
-    // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
-    if po < 0 {
-        return Err(KError::from_i32(po as i32));
-    }
-    match po_wait(po as u64) {
-        (0, published) => Ok(published),
-        (status, _) => Err(KError::from_i32(status as i32)),
+pub(super) fn rescan(node: &Node) -> Result<u64, KError> {
+    match run(node, IO_OPCODE_RESCAN)? {
+        IoResult { status: 0, result, .. } => Ok(result),
+        IoResult { status, .. } => Err(KError::from_i32(status)),
     }
 }
 
 /// **Stop a stick's medium** (`IoOpcode::Eject`); the kernel's error otherwise.
-pub(super) fn eject_medium(node: u64) -> Result<(), KError> {
-    let op = IoOp { opcode: IO_OPCODE_EJECT, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
-    // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
-    if po < 0 {
-        return Err(KError::from_i32(po as i32));
-    }
-    match po_wait(po as u64).0 {
+pub(super) fn eject_medium(node: &Node) -> Result<(), KError> {
+    match run(node, IO_OPCODE_EJECT)?.status {
         0 => Ok(()),
-        status => Err(KError::from_i32(status as i32)),
+        status => Err(KError::from_i32(status)),
     }
+}
+
+/// Let a server that did not come up go: its control channel closed, **which, not the terminate,
+/// ends it**, a request neither filesystem server reads. A server that had not answered `Ready`
+/// finds its control channel closed and exits; one that had exits when its forwarding endpoint
+/// loses its peer. The terminate stays, for a server that does listen.
+fn abandon(control: Chan, process: Handle<Process, Only>) {
+    drop(control);
+    let _ = process.terminate();
 }
 
 /// Mount `plan`'s device: spawn a server over it, and build its namespace. The server gets a
 /// duplicate of `node`; this service keeps its own, for the flush and for a later mount.
-pub(super) fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
+pub(super) fn mount(root: &Root, plan: &Plan, node: &Node) -> Result<Mount, &'static [u8]> {
     // **The server's handle, narrowed to the mode**: a read-only mount's server cannot write the
     // device even if it tried, whatever `ReadOnly` does above it.
-    let write = if plan.mode == Mode::Rw { RIGHT_WRITE } else { 0 };
-    // SAFETY: duplicating a node this process holds with DUPLICATE, narrowed.
-    let device = unsafe { syscall2(SYS_HANDLE_DUPLICATE, node, RIGHT_READ | write | RIGHT_TRANSFER | RIGHT_DUPLICATE) };
-    if device <= 0 {
+    let write = if plan.mode == Mode::Rw { Rights::WRITE } else { Rights::empty() };
+    let Ok(device) = node.duplicate(Rights::READ | write | Rights::TRANSFER | Rights::DUPLICATE) else {
         return Err(b"its node would not duplicate");
-    }
-    let device = device as u64;
-    let Some((control, server_end)) = make_channel(4) else {
-        close(device);
+    };
+    let Ok((control, server_end)) = Chan::pair(4) else {
         return Err(b"no control channel");
     };
-    let Some(process) = spawn(root_ns, plan.server.path(), server_end) else {
-        close(device);
-        close(control);
+    let Some(process) = spawn(root, plan.server.path(), server_end) else {
         return Err(b"its server would not spawn");
     };
-    // **From here a failure lets the server go**: its control channel and handle closed. **That,
-    // not the terminate, ends it**, a request neither filesystem server reads: a server that had
-    // not answered `Ready` finds its control channel closed and exits; one that had exits when its
-    // forwarding endpoint loses its peer. The terminate stays, for a server that does listen.
-    let abandon = |control: u64| {
-        close(control);
-        // SAFETY: the Process handle the spawn returned, with SIGNAL.
-        unsafe { syscall1(SYS_PROCESS_TERMINATE, process) };
-        close(process);
-    };
+    // **From here a failure lets the server go** ([`abandon`]).
     let flags = if plan.mode == Mode::Ro { FS_SETUP_READ_ONLY } else { 0 };
-    if !send_setup(control, device, flags) {
-        close(device);
-        abandon(control);
+    if !send_setup(&control, device, flags) {
+        abandon(control, process);
         return Err(b"the device could not be handed to its server");
     }
-    let endpoint = match wait_ready(control) {
+    let endpoint = match wait_ready(&control) {
         Ok(e) => e,
         Err(why) => {
-            abandon(control);
+            abandon(control, process);
             return Err(why);
         }
     };
-    // SAFETY: register-only syscall; returns a fresh namespace handle with every right.
-    let ns = unsafe { syscall0(SYS_NS_CREATE) };
-    if ns <= 0 {
-        close(endpoint);
-        abandon(control);
+    let Ok(ns) = Ns::create() else {
+        drop(endpoint);
+        abandon(control, process);
         return Err(b"no namespace for it");
-    }
-    let ns = ns as u64;
-    // SAFETY: a namespace this process created, a valid path, and an endpoint it holds.
-    let bound = unsafe { syscall4(SYS_NS_BIND, ns, b"/".as_ptr() as u64, 1, endpoint) };
+    };
+    let bound = ns.bind_server("/", endpoint.as_ref(), "");
     // The binding holds its own reference to the endpoint.
-    close(endpoint);
-    if bound != 0 {
-        close(ns);
-        abandon(control);
+    drop(endpoint);
+    if bound.is_err() {
+        drop(ns);
+        abandon(control, process);
         return Err(b"its server would not bind into its namespace");
     }
     Ok(Mount { device: plan.device, label: plan.label.clone(), mode: plan.mode, ns, control, process })

@@ -140,9 +140,6 @@ fn a_views_session_opens_at_its_base_and_closes() {
     close_views_session(&client, 4242);
     let (op, body) = request(&server);
     assert_eq!((op, parse_session_id(&body)), (OP_VIEWS_CLOSE_SESSION, Some(4242)));
-    views_close_session(client.raw().0, 7);
-    let (_, body) = request(&server);
-    assert_eq!(parse_session_id(&body), Some(7));
 }
 
 /// A refusal, a reply that is not an id and a broker that has gone are all no session.

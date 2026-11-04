@@ -24,6 +24,7 @@
 
 pub mod boot;
 mod channel;
+pub mod control;
 pub mod entropy;
 mod error;
 mod exec;
@@ -35,6 +36,7 @@ mod memory;
 mod ns;
 mod process;
 mod sys;
+pub mod system;
 pub mod thread;
 pub mod time;
 mod wait;
@@ -48,7 +50,7 @@ pub use handle::{
     Resource, Thread, WriteOnly,
 };
 pub use memory::Mapping;
-pub use ns::Bindings;
+pub use ns::{Bindings, Lookup};
 pub use process::{Refused, Spawn, exit, spawn};
 pub use thread::thread_create;
 pub use time::Deadline;

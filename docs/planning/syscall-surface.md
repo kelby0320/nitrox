@@ -331,6 +331,16 @@ reads, in `service-mgr`'s `lib.rs`, with a server past the room and a late `Read
 The author keeps `init` and `service-mgr`, the critical path; the implementer has the rest.
 `/pr-review`, and a boot's worth of gates on each.
 
+**Built 2026-11-04.** The thirteen make no raw syscall and keep no `static mut`: the ratchet fell by
+their 531, to 1,556 in 13 entries, every other crate's count as it was. `service-mgr` reads what its
+wait says, the two looks in `service_mgr::wake` with its host tests: the one event a session brings
+it, a route's resolve, costs 6 calls where it cost 28, two receives where it made 23, and the tty
+server's are as they were, 1,608 where they were 1,612, so a key typed costs no more. libos grew
+what the servers needed (a control channel's read, the machine's stop and a test verdict, an
+operation and a lookup waiting beside handles, `entropy::try_fill`), and two waits its defaults
+would have brought in, on a keyboard's lights and an unseeded pool, were kept out. Five shims lost
+their last caller and went.
+
 ### E.4 The desktop and the programs
 
 `desktop-shell`, `compositor`, `coreutils`, `hello`, `nxterm`, `nxsh`, `nxinstall`, `heartbeat`,

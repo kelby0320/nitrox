@@ -1,6 +1,7 @@
 use super::*;
 use crate::testing::{entries, lookup_only};
 use libkern::KError;
+use libkern::RawHandle;
 use libkern::device::{DEPARTED, DeviceKind, DeviceRecord, REGISTRY_MAGIC, REGISTRY_VERSION};
 use libos::{Handle, MapReadWrite, NsMutable, mock};
 use std::string::String;
@@ -151,19 +152,6 @@ fn what_was_handed_on_is_taken_back_and_nothing_else() {
     // namespace: a fixed range would miss it.
     bind_device(&to, "/dev/blk/4000");
     assert_eq!(withdraw_block_devices(&to), 1);
-}
-
-/// The raw forms do the same between the caller's own namespaces, and close neither.
-#[test]
-fn the_raw_forms_share_and_withdraw_and_close_nothing() {
-    mock::reset();
-    let (from, to) = (source(), Ns::create().unwrap());
-    assert_eq!(rebind_block_devices_except(from.raw().0, to.raw().0, &[11]), 1);
-    assert_eq!(paths(&entries(to.as_ref())), ["/dev/blk/0", "/dev/blk/0/info"]);
-    assert_eq!(unbind_block_devices(to.raw().0), 1);
-    assert!(entries(to.as_ref()).is_empty());
-    assert!(mock::is_open(from.raw().0) && mock::is_open(to.raw().0));
-    assert_eq!(mock::stray_closes(), 0);
 }
 
 /// A binding is a device only at exactly `/dev/blk/<n>`; lookalikes must not be (un)bound.

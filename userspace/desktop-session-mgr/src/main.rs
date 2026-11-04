@@ -13,10 +13,12 @@ use core::sync::atomic::Ordering::Relaxed;
 use desktop_session_mgr::{GREETER_H, GREETER_W, Greeter, KEY_ENTER, greeter_theme};
 use libdraw::geom::Size;
 use libdraw::text::Font;
-use libkern::debug::Line;
-use libkern::*;
+use libkern::{Rights, Secret, SysCaps};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Channel, Deadline, Handle, Msg, Namespace, Notify, NsReadOnly, Only, Ref, WaitSet};
 use librsproto::surface::{CreateWindowRequest, Role};
-use libsession::{NamespaceSpec, authenticate, ns_lookup, spawn_leader};
+use libsession::{Members, authenticate_on, build_namespace, resolve, run_leader};
 use libsurface::Session;
 use libsurface::buffers::BufferPool;
 use libsurface::ipc::ChannelTransport;
@@ -30,229 +32,236 @@ const MAX_REDRAWS_LOGGED: u32 = 512;
 
 static REDRAWS: AtomicU32 = AtomicU32::new(0);
 
-fn kprint(msg: &[u8]) {
-    // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
-    unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
+type Endpoint = Handle<Channel, Only>;
+
+/// The endpoints `service-mgr` hands over, each `None` where it had none.
+struct Endpoints {
+    fs: Option<Endpoint>,
+    profile: Option<Endpoint>,
+    tty: Option<Endpoint>,
+    draw: Option<Endpoint>,
+    clipboard: Option<Endpoint>,
+    views: Option<Endpoint>,
+    devices: Option<Endpoint>,
+    storage: Option<Endpoint>,
+    services: Option<Endpoint>,
+}
+
+/// An endpoint borrowed for a call, `None` for one that is absent.
+fn borrowed(h: &Option<Endpoint>) -> Option<Ref<'_, Channel, Only>> {
+    h.as_ref().map(Handle::as_ref)
 }
 
 /// A shutdown asked this supervisor to stop with no session running: exit, which `service-mgr`
-/// sees as its control channel closing. A running session is ended first by `spawn_leader`.
+/// sees as its control channel closing. A running session is ended first by `run_leader`.
 fn stop() -> ! {
-    kprint(b"desktop-session-mgr: asked to stop, exiting\n");
-    // SAFETY: terminating this process.
-    unsafe { syscall4(SYS_PROCESS_EXIT, 0, 0, 0, 0) };
-    loop {
-        core::hint::spin_loop();
-    }
+    log::write(b"desktop-session-mgr: asked to stop, exiting\n");
+    libos::exit(0);
 }
 
 fn fail(msg: &[u8]) -> ! {
-    kprint(msg);
-    // SAFETY: terminating this process.
-    unsafe { syscall4(SYS_PROCESS_EXIT, 1, 0, 0, 0) };
-    loop {
-        core::hint::spin_loop();
-    }
+    log::write(msg);
+    libos::exit(1);
 }
 
-/// Receive the next control message's one moved handle; `0` on failure. Positional: `service-mgr`
+/// Receive the next control message's one moved handle; `None` on failure. Positional: `service-mgr`
 /// sends an empty message for an endpoint it does not have.
-fn recv_handoff(ctrl: u64) -> u64 {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = ctrl;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-    };
-    if waited != 1 {
-        return 0;
+fn recv_handoff(ctrl: &Endpoint) -> Option<Endpoint> {
+    let mut set = WaitSet::<1>::new();
+    set.add(ctrl).ok()?;
+    if set.wait(Deadline::NEVER).ok()?.len() != 1 {
+        return None;
     }
     // The one handle a handoff brings; any more close as `sent` drops. A whole message's buffer:
     // the kernel copies all of one, however short its payload.
-    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-    match unsafe { channel_recv_raw(ctrl, &raw mut RECV_MSG) } {
-        Ok(mut sent) => sent.take(0).unwrap_or(0),
-        Err(_) => 0,
-    }
+    let mut msg = Msg::new();
+    ctrl.recv(&mut msg).ok()?.take(0)
 }
 
-static mut RECV_MSG: [u8; IPC_MSG_SIZE] = [0; IPC_MSG_SIZE];
-
 /// One session of `user`'s, authenticated with `home`, run to its end.
-#[allow(clippy::too_many_arguments, reason = "the session's handles, one for each service it is given")]
 fn run_session(
-    root_ns: u64,
-    notif: u64,
-    fs: u64,
-    profile: u64,
-    tty: u64,
-    draw: u64,
-    clipboard: u64,
-    views: u64,
-    views_sup: u64,
-    devices: u64,
-    storage: u64,
-    services: u64,
+    root: &Handle<Namespace, NsReadOnly>,
+    notif: &Handle<Notify, Only>,
+    eps: &Endpoints,
+    views_sup: Option<&Endpoint>,
     user: &[u8],
     home: &[u8],
 ) {
     Line::new().s(b"desktop-session-mgr: login ok -> home=").s(home).end();
     // Before the namespace: the broker's base is part of what it binds.
     let mut views_base = [0u8; 24];
-    let opened = if views_sup != 0 { libsession::views_open_session(views_sup, user, &mut views_base) } else { None };
+    let opened = views_sup.and_then(|sup| libsession::open_views_session(sup, user, &mut views_base));
     let base_len = opened.map_or(0, |v| v.1);
+    let views_base = core::str::from_utf8(&views_base[..base_len]).unwrap_or("");
+    let views = if opened.is_some() { borrowed(&eps.views) } else { None };
 
     // No `/dev/console`: a binding is authority, and the console is the serial column's recovery path.
-    let built = libsession::build(&NamespaceSpec {
-        root_ns,
-        fs_endpoint: fs,
-        profile_endpoint: profile,
-        tty_endpoint: tty,
-        clipboard_endpoint: clipboard,
-        home,
-        user,
-        bind_fonts: true,
-        bind_console: false,
-        views_endpoint: if opened.is_some() { views } else { 0 },
-        views_base: &views_base[..base_len],
-        devices_endpoint: devices,
-        storage_endpoint: storage,
-        services_endpoint: services,
-        // `/dev/draw` is bound whole below, for `desktop-shell`; `new` alone is an application's.
-        bind_applications: true,
-        draw_endpoint: 0,
-        desktop_endpoint: 0,
+    let built = core::str::from_utf8(home).ok().and_then(|home| {
+        build_namespace(&Members {
+            root_ns: Some(root.as_ref()),
+            fs_endpoint: borrowed(&eps.fs),
+            profile_endpoint: borrowed(&eps.profile),
+            tty_endpoint: borrowed(&eps.tty),
+            clipboard_endpoint: borrowed(&eps.clipboard),
+            home,
+            user,
+            bind_fonts: true,
+            bind_console: false,
+            views_endpoint: views,
+            views_base,
+            devices_endpoint: borrowed(&eps.devices),
+            storage_endpoint: borrowed(&eps.storage),
+            services_endpoint: borrowed(&eps.services),
+            // `/dev/draw` is bound whole below, for `desktop-shell`; `new` alone is an application's.
+            bind_applications: true,
+            draw_endpoint: None,
+            desktop_endpoint: None,
+        })
     });
     let Some(built) = built else {
-        kprint(b"desktop-session-mgr: session namespace FAIL\n");
-        if let Some((id, _)) = opened {
-            libsession::views_close_session(views_sup, id);
+        log::write(b"desktop-session-mgr: session namespace FAIL\n");
+        if let (Some((id, _)), Some(sup)) = (opened, views_sup) {
+            libsession::close_views_session(sup, id);
         }
         return;
     };
     let session_ns = built.ns;
+    let bound = built.bound;
     // Unscoped, so the shell resolves `manage` as well as `new`; applications get `new` alone.
-    if draw != 0 {
-        let path = b"/dev/draw";
-        // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let dr = unsafe { syscall4(SYS_NS_BIND, session_ns, path.as_ptr() as u64, path.len() as u64, draw) };
-        if dr != 0 {
-            kprint(b"desktop-session-mgr: /dev/draw bind FAIL (the shell cannot draw)\n");
+    if let Some(draw) = &eps.draw {
+        if session_ns.bind("/dev/draw", draw).is_err() {
+            log::write(b"desktop-session-mgr: /dev/draw bind FAIL (the shell cannot draw)\n");
         } else {
-            kprint(b"desktop-session-mgr: /dev/draw bound into the session\n");
+            log::write(b"desktop-session-mgr: /dev/draw bound into the session\n");
         }
     }
     // Reported from what was bound, not from what was asked for, so the gate's assertion can fail.
-    if built.console {
-        kprint(b"desktop-session-mgr: session namespace built (WITH /dev/console)\n");
+    if bound.console {
+        log::write(b"desktop-session-mgr: session namespace built (WITH /dev/console)\n");
     } else {
-        kprint(b"desktop-session-mgr: session namespace built (no /dev/console)\n");
+        log::write(b"desktop-session-mgr: session namespace built (no /dev/console)\n");
     }
-    if built.clipboard {
-        kprint(b"desktop-session-mgr: session has /dev/clipboard\n");
+    if bound.clipboard {
+        log::write(b"desktop-session-mgr: session has /dev/clipboard\n");
     } else {
-        kprint(b"desktop-session-mgr: session has NO /dev/clipboard\n");
+        log::write(b"desktop-session-mgr: session has NO /dev/clipboard\n");
     }
-    if built.views {
-        kprint(b"desktop-session-mgr: session has /dev/views\n");
+    if bound.views {
+        log::write(b"desktop-session-mgr: session has /dev/views\n");
     } else {
-        kprint(b"desktop-session-mgr: session has NO /dev/views\n");
+        log::write(b"desktop-session-mgr: session has NO /dev/views\n");
     }
-    if built.devices {
-        kprint(b"desktop-session-mgr: session has /dev/devices\n");
+    if bound.devices {
+        log::write(b"desktop-session-mgr: session has /dev/devices\n");
     } else {
-        kprint(b"desktop-session-mgr: session has NO /dev/devices\n");
+        log::write(b"desktop-session-mgr: session has NO /dev/devices\n");
     }
-    if built.storage {
-        kprint(b"desktop-session-mgr: session has /storage\n");
+    if bound.storage {
+        log::write(b"desktop-session-mgr: session has /storage\n");
     } else {
-        kprint(b"desktop-session-mgr: session has NO /storage\n");
+        log::write(b"desktop-session-mgr: session has NO /storage\n");
     }
 
     // Endpoints are passed as endpoints, since a binding never resolves back to one. The home is
     // an argument because the shell's own `/home` cannot tell it the base an application's bind
     // needs; not authority, the fs endpoint is.
     let home_str = core::str::from_utf8(home).unwrap_or("");
-    // The view base, for the home's reason; empty when the broker gave no session.
-    let base_str = core::str::from_utf8(&views_base[..base_len]).unwrap_or("");
-    let views_for_shell = if opened.is_some() { views } else { 0 };
-    let code = spawn_leader(
-        root_ns,
-        session_ns,
+    let code = run_leader(
+        root,
+        &session_ns,
         notif,
         "desktop-shell",
-        &[home_str, base_str],
+        // The view base, for the home's reason; empty when the broker gave no session.
+        &[home_str, views_base],
         // The graphical leader alone: it builds each application's namespace, and `nxsh` none.
-        SYSCAP_BIND_NAMESPACE,
+        SysCaps::BIND_NAMESPACE,
         // In the order the shell reads them: compositor, fs, tty, profile, clipboard, view broker,
         // device manager, storage, services.
-        &[draw, fs, tty, profile, clipboard, views_for_shell, devices, storage, services],
+        &[
+            borrowed(&eps.draw),
+            borrowed(&eps.fs),
+            borrowed(&eps.tty),
+            borrowed(&eps.profile),
+            borrowed(&eps.clipboard),
+            views,
+            borrowed(&eps.devices),
+            borrowed(&eps.storage),
+            borrowed(&eps.services),
+        ],
     );
-    if let Some((id, _)) = opened {
-        libsession::views_close_session(views_sup, id);
+    if let (Some((id, _)), Some(sup)) = (opened, views_sup) {
+        libsession::close_views_session(sup, id);
     }
     // The leader is reaped, so this drops the last reference to the namespace.
-    // SAFETY: closing the namespace we created for this session.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
+    drop(session_ns);
     Line::new().s(b"desktop-session-mgr: session ended (leader exit ").i(code as i64).s(b")").end();
 }
 
 /// Bootstrap registers: `rdi` the notification channel the leader is reaped on, `rsi` the
 /// LOOKUP-only root namespace, `rdx` the control channel the endpoints arrive over, `rcx` unused.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
-    kprint(b"desktop-session-mgr: up\n");
+pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, control, arg0) };
+    log::write(b"desktop-session-mgr: up\n");
+    let (Some(notif), Some(root)) = (start.notify.take(), start.root.take()) else {
+        fail(b"desktop-session-mgr: no notification queue or root namespace\n");
+    };
+    let control: Option<Endpoint> = start.take_handle0();
 
     // Endpoints in `service-mgr`'s send order; all but the first two are its routes.
-    let fs_endpoint = recv_handoff(control);
-    let profile_endpoint = recv_handoff(control);
-    let tty_endpoint = recv_handoff(control);
+    let next = || control.as_ref().and_then(recv_handoff);
+    let fs = next();
+    let profile = next();
+    let tty = next();
     // The compositor's endpoint, which the serial column does not get: the shell needs `/dev/draw`
     // bound in its namespace, since it resolves `manage` as well as `new`.
-    let draw_endpoint = recv_handoff(control);
-    let clipboard_endpoint = recv_handoff(control);
-    let views_endpoint = recv_handoff(control);
+    let draw = next();
+    let clipboard = next();
+    let views = next();
     // Info-only, because the shell holds it with `BIND_NAMESPACE`.
-    let devices_endpoint = recv_handoff(control);
-    // `0` on a boot without the storage service. Couriered rather than resolved here, because a
+    let devices = next();
+    // `None` on a boot without the storage service. Couriered rather than resolved here, because a
     // resolved endpoint dies with the service.
-    let storage_endpoint = recv_handoff(control);
-    let services_endpoint = recv_handoff(control);
-    let views_sup = if views_endpoint != 0 {
-        ns_lookup(root_ns, b"/svc/views/session", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT).1
+    let storage = next();
+    let services = next();
+    let eps = Endpoints { fs, profile, tty, draw, clipboard, views, devices, storage, services };
+    let views_sup = if eps.views.is_some() {
+        resolve::<Channel, Only, _>(&root, "/svc/views/session", Rights::SEND | Rights::RECV | Rights::WAIT).ok()
     } else {
-        0
+        None
     };
     // Resolved once at startup: re-resolving per attempt would mint a session per keystroke.
-    let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
-    if fs_endpoint == 0 || auth_status != 0 || auth_ch == 0 {
-        if fs_endpoint == 0 {
-            kprint(b"desktop-session-mgr: no fs endpoint; cannot build a session\n");
-        } else {
-            kprint(b"desktop-session-mgr: /svc/auth resolve FAIL\n");
+    let auth = resolve::<Channel, Only, _>(&root, "/svc/auth", Rights::SEND | Rights::RECV | Rights::WAIT);
+    let auth_ch = match auth {
+        Ok(ch) if eps.fs.is_some() => ch,
+        _ => {
+            if eps.fs.is_none() {
+                log::write(b"desktop-session-mgr: no fs endpoint; cannot build a session\n");
+            } else {
+                log::write(b"desktop-session-mgr: /svc/auth resolve FAIL\n");
+            }
+            fail(b"desktop-session-mgr: no graphical login\n");
         }
-        fail(b"desktop-session-mgr: no graphical login\n");
-    }
+    };
 
     // The font before the window, so a missing one is reported as itself, not an empty window.
     let theme = greeter_theme();
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run
-    let (font, _) = match unsafe { libdraw::text::load_ui(root_ns, &theme, b"desktop-session-mgr") } {
+    let (font, _) = match libdraw::text::load_ui_font(&root, &theme, b"desktop-session-mgr") {
         Ok(loaded) => loaded,
         Err(e) => {
-            libkern::debug::Line::new().s(b"desktop-session-mgr: the UI font ").s(e.why()).end();
+            Line::new().s(b"desktop-session-mgr: the UI font ").s(e.why()).end();
             fail(b"desktop-session-mgr: font load FAILED\n");
         }
     };
 
-    // SAFETY: `root_ns` is live for this process's whole run.
-    let transport = match unsafe { ChannelTransport::connect(root_ns) } {
+    let transport = match ChannelTransport::open(&root) {
         Ok(t) => t,
         Err(_) => fail(b"desktop-session-mgr: connect to /dev/draw FAILED\n"),
     };
     let mut session = Session::new(transport);
     // An unreadable screen leaves the greeter at the origin and says so, rather than guess a size.
-    // SAFETY: `root_ns` is live for this process's whole run.
-    let origin = match unsafe { libsurface::screen::read(root_ns) } {
+    let origin = match libsurface::screen::info(&root) {
         Ok(screen) => {
             let origin = (
                 (screen.width.saturating_sub(GREETER_W) / 2) as i32,
@@ -272,7 +281,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             origin
         }
         Err(_) => {
-            kprint(b"desktop-session-mgr: /dev/draw/screen unreadable; the greeter asks for the origin\n");
+            log::write(b"desktop-session-mgr: /dev/draw/screen unreadable; the greeter asks for the origin\n");
             (0, 0)
         }
     };
@@ -293,16 +302,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
 
     // Blocks on the event channel, never spins: a spinning supervisor keeps the idle thread from
     // running, and deferred handle reclamation lives there.
-    let ev = session.wait_handle();
     loop {
-        // The notification channel is waited on too, so a shutdown ends the supervisor.
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers for two waiters.
-        unsafe {
-            WAIT_HANDLES[0] = ev;
-            WAIT_HANDLES[1] = notif;
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 2, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-        };
-        if libsession::drain_for_stop(notif) {
+        {
+            // The notification channel is waited on too, so a shutdown ends the supervisor.
+            let mut set = WaitSet::<2>::new();
+            let _ = set.add(session.waitable());
+            let _ = set.add(&notif);
+            let _ = set.wait(Deadline::NEVER);
+        }
+        if libsession::drain_stop_requests(&notif) {
             stop();
         }
         if session.pump().is_err() {
@@ -340,27 +348,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             let (ul, authed) = {
                 let mut pass = Secret::<128>::zeroed();
                 let (ul, pl) = greeter.take_credentials(&mut user, &mut pass);
-                (ul, authenticate(auth_ch, &user[..ul], &pass[..pl], &mut home))
+                (ul, authenticate_on(&auth_ch, &user[..ul], &pass[..pl], &mut home))
             };
             if let Some(hl) = authed {
-                run_session(
-                    root_ns,
-                    notif,
-                    fs_endpoint,
-                    profile_endpoint,
-                    tty_endpoint,
-                    draw_endpoint,
-                    clipboard_endpoint,
-                    views_endpoint,
-                    views_sup,
-                    devices_endpoint,
-                    storage_endpoint,
-                    services_endpoint,
-                    &user[..ul],
-                    &home[..hl],
-                );
+                run_session(&root, &notif, &eps, views_sup.as_ref(), &user[..ul], &home[..hl]);
             } else {
-                kprint(b"desktop-session-mgr: login denied\n");
+                log::write(b"desktop-session-mgr: login denied\n");
             }
             if libsession::stop_asked() {
                 stop();
@@ -431,16 +424,8 @@ fn present(
     ok
 }
 
-static mut WAIT_HANDLES: [u64; 2] = [0; 2];
-/// A 24-byte `IoResult` per waiter.
-static mut WAIT_RESULTS: [u8; 48] = [0; 48];
-
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"desktop-session-mgr: PANIC\n");
-    // SAFETY: terminating this process.
-    unsafe { syscall4(SYS_PROCESS_EXIT, 1, 0, 0, 0) };
-    loop {
-        core::hint::spin_loop();
-    }
+    log::write(b"desktop-session-mgr: PANIC\n");
+    libos::exit(1);
 }

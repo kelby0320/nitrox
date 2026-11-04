@@ -16,6 +16,7 @@ use libkern::{IoOp, IoResult, KError, RawHandle};
 
 use crate::error::{Error, Result};
 use crate::sys;
+use crate::wait::Signalled;
 
 /// Max handles one poll round registers, under the kernel's 32 to keep `block_on`'s stack small.
 const MAX_WAIT: usize = 8;
@@ -177,6 +178,23 @@ impl Op {
 
     fn of(po: u64, kind: Kind) -> Op {
         Op { po, kind, finished: false, done: false, registered: false }
+    }
+
+    /// The `PendingOperation` a [`WaitSet`](crate::WaitSet) waits on for this operation.
+    pub(crate) fn po(&self) -> u64 {
+        self.po
+    }
+
+    /// Take this operation's completion from what a wait on a [`WaitSet`](crate::WaitSet) it was
+    /// added to read, if that wait found it signalled; `None` leaves it in flight. Once taken it
+    /// is handed out, as a `Ready` poll's is, and its drop waits for nothing.
+    pub fn completion_in<const N: usize>(&mut self, signalled: &Signalled<N>) -> Option<Result<IoResult>> {
+        if self.done {
+            return None;
+        }
+        let res = *signalled.iter().find(|(_, r)| r.handle == self.po)?.1;
+        (self.finished, self.done) = (true, true);
+        Some(if res.status < 0 { Err(Error::from_status(res.status)) } else { Ok(res) })
     }
 
     /// Wait for the operation to finish, here: its completion, whatever status it carries, or the

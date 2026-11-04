@@ -38,26 +38,29 @@ and the slice plan all live there.
   runtime — it runs after the ecosystem is coming up, not in the pre-allocator
   critical path. Trajectory: `libkern` + `libheap` + `libos` + `librsproto` + `libstream`,
   eventual `std`. **Today it links `libkern`, `libheap`, `librsproto`, `libfs`, `libstream` and
-  `libos`**: `libos` for its safe `spawn`, whose handle owns the process it started;
-  `librsproto` and `libfs` since administration Part E.1a, for the `SUBNAMESPACE`
-  replies its endpoint answers and for reading its declarations, and `libstream` since Part E.2a,
-  for the table `/svc/services/all.tsm`.
+  `libos`**: `libos` for every call to the kernel, and no raw syscall since pre-Phase-7 Part
+  E.3; `librsproto` and `libfs` since administration Part E.1a, for the `SUBNAMESPACE` replies
+  its endpoint answers and for reading its declarations, and `libstream` since Part E.2a, for
+  the table `/svc/services/all.tsm`.
 
 ## Discipline
 
 - **Never block on anything that can wait on `service-mgr`.** Every server's path resolves through
   its routes, so a `service-mgr` that sits in a wait of its own while a server resolves a path
-  deadlocks the boot. Its main wait is `Mgr::run`'s: its notifications, every route, and the
-  control channel of each server still starting, with the nearest deadline as the timeout. A
+  deadlocks the boot. Its main wait is `Mgr::run`'s: its notifications, every route, and each
+  control channel that can still bring a message, with the nearest deadline as the timeout. A
   `Ready` awaited, a backoff, an `after` — each is a deadline there, and resolves are answered on
-  every pass. The grace wait for an exit code and the lookup of a derived endpoint
-  (`wait_serving`, `lookup_serving`) answer them too. The lookups it waits on outright
-  (`ns_lookup`: `/bin`, a server's log endpoint) reach the root filesystem, the profile server and
+  every pass that their route signals. The grace wait for an exit code and the lookup of a derived
+  endpoint (`wait_codes`, `lookup_serving`) answer them too. The lookups it waits on outright
+  (`lookup`: `/bin`, a server's log endpoint) reach the root filesystem, the profile server and
   servers already serving, none of which waits on it.
 - **The wait set is budgeted**: the notification channel, `registry::MAX_ROUTES` routes, the
-  handles serving `/svc/services` (`services::SLOTS`) and `registry::STARTING_ROOM` starting
-  servers make the kernel's 32. A running service's channel is not in it — a death queues
-  `ChildExited`, which wakes the pass that finds it.
+  handles serving `/svc/services` (`services::SLOTS`) and `registry::STARTING_ROOM` control
+  channels that can still bring a message make the kernel's 32. **A wake reads only what
+  signalled** (`service_mgr::wake`), bar two looks: a running service's channel is not in the
+  set, and a death queues `ChildExited`, whose pass looks at every channel, and again whenever its
+  wait for an exit code drains a code no death it found explains; one that can bring a message and
+  found no room is read on every wake, and a wake comes each tick while one has none.
 - **An admin request is answered once it has happened, never by a wait** (administration Part
   E.2): a stop is `Held` until the exit, a start until the `Ready`. A reply sent before the thing is
   done is a lie a gate cannot always catch; `boot-probe`'s services test reads the table straight

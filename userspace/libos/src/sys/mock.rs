@@ -52,6 +52,7 @@ enum Object {
     Process,
     Thread,
     Entropy,
+    SystemControl,
 }
 
 impl Object {
@@ -68,6 +69,7 @@ impl Object {
             Object::Process => KObjectType::Process,
             Object::Thread => KObjectType::Thread,
             Object::Entropy => KObjectType::EntropyObject,
+            Object::SystemControl => KObjectType::SystemControl,
         }
     }
 }
@@ -135,6 +137,8 @@ struct Mock {
     /// What `ns_sync` and `ns_held` answer for a mount path: `(written, held)`.
     mounts: BTreeMap<Vec<u8>, (i64, i64)>,
     unseeded: u32,
+    /// Unseeded reads to find the kernel's seed-waiter places all taken, their PO done `WouldBlock`.
+    seed_full: u32,
     realtime: Option<u64>,
     clock: u64,
     sleeps: u32,
@@ -153,6 +157,8 @@ struct Mock {
     /// Whether the next child exits before anything reaches it, holding nothing.
     exit_next_child: bool,
     threads: Vec<ThreadArgs>,
+    /// Each test verdict reported, as its code.
+    verdicts: Vec<u64>,
 }
 
 thread_local! {
@@ -943,6 +949,16 @@ pub fn entropy_read(h: u64, buf: &mut [u8]) -> i64 {
         }
         if m.unseeded > 0 {
             m.unseeded -= 1;
+            if m.seed_full > 0 {
+                m.seed_full -= 1;
+                return m.po(Po {
+                    ready: true,
+                    never: false,
+                    status: e(KError::WouldBlock) as i32,
+                    result: 0,
+                    lookup: None,
+                });
+            }
             return m.po(Po { ready: false, never: false, status: 0, result: 0, lookup: None });
         }
         for (i, b) in buf.iter_mut().enumerate() {
@@ -954,6 +970,22 @@ pub fn entropy_read(h: u64, buf: &mut [u8]) -> i64 {
 
 pub fn kprint(bytes: &[u8]) {
     with(|m| m.log.extend_from_slice(bytes));
+}
+
+/// As a machine with no harness listening: `Unsupported`, the verdict recorded.
+pub fn test_exit(code: u64) -> i64 {
+    with(|m| m.verdicts.push(code));
+    e(KError::Unsupported)
+}
+
+/// As the kernel answers: a refusal, or for a stop it accepts, a panic, as it does not return.
+pub fn power(h: u64, op: u64) -> i64 {
+    let checked = with(|m| m.typed(h, Rights::WRITE, KObjectType::SystemControl).map(|_| ()));
+    match checked {
+        Err(r) => r,
+        Ok(()) if op != libkern::POWER_HALT && op != libkern::POWER_REBOOT => e(KError::InvalidArgument),
+        Ok(()) => panic!("power({op})"),
+    }
 }
 
 mod controls;

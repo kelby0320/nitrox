@@ -38,7 +38,7 @@ the behaviour people install clipboard managers to escape. Here you copy from th
 and paste.
 
 The cost is that the server holds what you copied for as long as the machine runs. That cost is
-bounded and stated: [`CLIP_RING`] entries of [`MAX_CLIP_BYTES`] each, about 63 KiB, in `.bss`.
+bounded and stated: [`CLIP_RING`] entries of [`MAX_CLIP_BYTES`] each, about 63 KiB.
 
 ## The ring, and the two halves of it
 

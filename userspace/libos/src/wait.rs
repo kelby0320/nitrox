@@ -5,6 +5,7 @@ use core::marker::PhantomData;
 use libkern::{IoResult, KError, MAX_WAIT_HANDLES};
 
 use crate::error::{Error, Result};
+use crate::exec::Op;
 use crate::handle::Ref;
 use crate::sys;
 use crate::time::Deadline;
@@ -33,7 +34,19 @@ impl<'a, const N: usize> WaitSet<'a, N> {
 
     /// Add `h`, answering its index: `TooLarge` once `N` are in, `InvalidArgument` if it is in.
     pub fn add<T: 'a, M: 'a>(&mut self, h: impl Into<Ref<'a, T, M>>) -> Result<usize> {
-        let raw = h.into().raw().0;
+        self.add_raw(h.into().raw().0)
+    }
+
+    /// Add `op`'s operation, answering its index as [`add`](Self::add) does: take its completion
+    /// with [`Op::completion_in`] once a wait finds it signalled.
+    pub fn add_op(&mut self, op: &'a Op) -> Result<usize> {
+        match op.po() {
+            0 => Err(Error::from(KError::InvalidArgument)),
+            po => self.add_raw(po),
+        }
+    }
+
+    fn add_raw(&mut self, raw: u64) -> Result<usize> {
         if self.handles[..self.len].contains(&raw) {
             return Err(Error::from(KError::InvalidArgument));
         }
@@ -113,6 +126,7 @@ impl<const N: usize> Signalled<N> {
 mod tests {
     use super::*;
     use crate::{Channel, Handle, Handles, Msg, Only};
+    use libkern::{IoOp, Rights};
 
     #[test]
     fn a_wait_answers_which_signalled() {
@@ -128,6 +142,64 @@ mod tests {
         drop(a2);
         let s = set.wait(Deadline::NEVER).unwrap();
         assert_eq!(s.len(), 2, "a closed peer signals too");
+    }
+
+    fn read_op() -> Op {
+        let op = IoOp { opcode: libkern::IO_OPCODE_READ, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 8 };
+        Op::submit(libkern::RawHandle(sys::device()), &op).unwrap()
+    }
+
+    #[test]
+    fn an_operation_waits_beside_a_channel_and_its_completion_is_taken_once() {
+        sys::reset();
+        let (a, _a2) = Handle::<Channel, Only>::pair(4).unwrap();
+        sys::script_next(0, 5, true);
+        let mut op = read_op();
+        let s = {
+            let mut set = WaitSet::<4>::new();
+            assert_eq!((set.add(&a).unwrap(), set.add_op(&op).unwrap()), (0, 1));
+            set.wait(Deadline::NEVER).unwrap()
+        };
+        assert!(s.contains(1) && !s.contains(0));
+        assert_eq!(op.completion_in(&s).map(|r| r.map(|done| done.result).ok()), Some(Some(5)));
+        assert!(op.completion_in(&s).is_none(), "handed out once");
+        let (_, waits, _) = sys::counts();
+        drop(op);
+        assert_eq!(sys::counts().1, waits, "a taken completion leaves the drop nothing to wait for");
+    }
+
+    #[test]
+    fn an_operation_a_wait_did_not_find_stays_in_flight() {
+        sys::reset();
+        let (a, a2) = Handle::<Channel, Only>::pair(4).unwrap();
+        sys::script_next(KError::IoError.as_i32(), 0, false);
+        let mut op = read_op();
+        a2.send(&Msg::new(), &mut Handles::new()).unwrap();
+        let s = {
+            let mut set = WaitSet::<2>::new();
+            set.add(&a).unwrap();
+            set.add_op(&op).unwrap();
+            set.wait(Deadline::POLL).unwrap()
+        };
+        assert!(s.contains(0) && !s.contains(1));
+        assert!(op.completion_in(&s).is_none(), "not signalled, so not taken");
+        let s = {
+            let mut set = WaitSet::<1>::new();
+            set.add_op(&op).unwrap();
+            set.wait(Deadline::at(1)).unwrap()
+        };
+        let done = op.completion_in(&s).map(|r| r.err().map(|e| e.code()));
+        assert_eq!(done, Some(Some(KError::IoError)), "a device's failure, once it signals");
+    }
+
+    #[test]
+    fn an_operation_done_in_its_call_is_refused_a_place() {
+        sys::reset();
+        let ep: Handle<Channel, Only> = Handle::fresh(sys::forwarding(), Rights::empty());
+        let op = ep.send_held(&Msg::new(), &mut Handles::new()).unwrap();
+        let mut set = WaitSet::<1>::new();
+        assert_eq!(set.add_op(&op).map_err(|e| e.code()), Err(KError::InvalidArgument), "no handle 0 to wait on");
+        assert!(set.is_empty());
     }
 
     #[test]

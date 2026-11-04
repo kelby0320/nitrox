@@ -103,8 +103,8 @@ pub mod registry {
     /// [`STARTING_ROOM`].
     pub const MAX_ROUTES: usize = 14;
 
-    /// The control channels of starting servers the wait set has room for, within the kernel's
-    /// 32. One more starting at once is still seen on the next pass: the wait is level-triggered.
+    /// The control channels that can still bring a message the wait set has room for, within the
+    /// kernel's 32. One past the room is read on every wake instead ([`crate::wake`]).
     pub const STARTING_ROOM: usize = libkern::abi::MAX_WAIT_HANDLES - 1 - MAX_ROUTES - crate::services::SLOTS;
 
     /// **Endpoints a server mints for sessions**, `(server, suffix)`: resolving `suffix` on the
@@ -337,6 +337,211 @@ pub mod services {
             OP_SERVICES_RESTART if running => Ok(Action::StopThenStart),
             OP_SERVICES_RESTART => Ok(Action::Start),
             _ => Err((KError::Unsupported, "not a Services request")),
+        }
+    }
+}
+
+pub mod wake {
+    //! **Which control channels a wake reads.** The wait says which handles signalled, and only
+    //! those are read, but for two looks it cannot make:
+    //! - **a death needs every channel looked at**, as `ChildExited` names a pid and not a
+    //!   channel, so that pass runs when the notification queue signals, and looks again when its
+    //!   wait for one death's code brings another's ([`deaths`]). A channel a server closes while
+    //!   it lives on is seen at the next death;
+    //! - **a channel that can still bring a message and found no room** in the wait set is looked
+    //!   at on every wake, or a server's `Ready` would sit unread to its deadline.
+
+    use alloc::vec::Vec;
+
+    /// A service's control channel, as a wake sees it.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Ctrl {
+        /// Its service runs, and the channel was made.
+        pub open: bool,
+        /// It can still bring a message: a starting server's `Ready`, or a late one on the channel
+        /// of a server marked down whose process runs, which is drained so that server ends.
+        pub speaks: bool,
+    }
+
+    /// The channels given a place in the wait set, at most `room`, in service order: those that
+    /// can still bring a message.
+    pub fn slotted(ctrls: &[Ctrl], room: usize) -> Vec<usize> {
+        (0..ctrls.len()).filter(|&i| ctrls[i].open && ctrls[i].speaks).take(room).collect()
+    }
+
+    /// Whether a channel that can bring a message found no place in the wait set, and so is read
+    /// on every wake: then a wake has to come, as its own message cannot bring one.
+    pub fn unslotted(ctrls: &[Ctrl], slotted: &[usize]) -> bool {
+        (0..ctrls.len()).any(|i| ctrls[i].open && ctrls[i].speaks && !slotted.contains(&i))
+    }
+
+    /// The channels a wake reads: each slotted one that `signalled`, each that can bring a message
+    /// with no place, and every open one when the notification queue was `notified`.
+    pub fn read(ctrls: &[Ctrl], slotted: &[usize], signalled: &[usize], notified: bool) -> Vec<usize> {
+        let unslotted = |i: usize| ctrls[i].speaks && !slotted.contains(&i);
+        (0..ctrls.len()).filter(|&i| ctrls[i].open && (notified || signalled.contains(&i) || unslotted(i))).collect()
+    }
+
+    /// How a pass reads a control channel, and waits for exit codes: `service-mgr`'s, or a test's.
+    pub trait Pass {
+        /// Look at service `i`'s control channel, taking what it brought: whether it has closed,
+        /// its service dead.
+        fn look(&mut self, i: usize) -> bool;
+        /// Wait, bounded, for more exit codes, appended to `codes`: `false` once the wait is over.
+        fn more_codes(&mut self, codes: &mut Vec<i32>) -> bool;
+    }
+
+    /// **One pass's deaths**, in the order found: each channel in `read` looked at, and while more
+    /// have died than there are `codes`, a wait for the rest. **A code no death found is a death
+    /// this pass did not see**: the wait can drain the code of a service whose channel was not in
+    /// `read`, or was looked at before it closed, and nothing would wake a later pass to look. A
+    /// code follows its channel's close, so every open channel not found dead is looked at again
+    /// whenever the codes have grown since the last such look.
+    pub fn deaths(pass: &mut impl Pass, ctrls: &[Ctrl], read: &[usize], codes: &mut Vec<i32>) -> Vec<usize> {
+        let open = |i: &usize| ctrls[*i].open;
+        let mut dead = Vec::new();
+        let mut todo = read.to_vec();
+        // How many codes were in hand when every open channel was last looked at.
+        let mut all_looked_with = (0..ctrls.len()).filter(open).all(|i| read.contains(&i)).then_some(codes.len());
+        loop {
+            for &i in &todo {
+                if pass.look(i) {
+                    dead.push(i);
+                }
+            }
+            while dead.len() > codes.len() && pass.more_codes(codes) {}
+            if codes.len() <= dead.len() || all_looked_with == Some(codes.len()) {
+                return dead;
+            }
+            all_looked_with = Some(codes.len());
+            todo = (0..ctrls.len()).filter(|i| open(i) && !dead.contains(i)).collect();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::vec;
+
+        /// Channels that close when a test says, and exit codes queued as a test scripts them.
+        struct Fake {
+            closed: Vec<bool>,
+            looked: Vec<usize>,
+            /// Each wait for codes: who dies during it, and the codes it then finds queued.
+            waits: Vec<(Vec<usize>, Vec<i32>)>,
+        }
+
+        impl Pass for Fake {
+            fn look(&mut self, i: usize) -> bool {
+                self.looked.push(i);
+                self.closed[i]
+            }
+            fn more_codes(&mut self, codes: &mut Vec<i32>) -> bool {
+                if self.waits.is_empty() {
+                    return false;
+                }
+                let (die, queued) = self.waits.remove(0);
+                die.into_iter().for_each(|i| self.closed[i] = true);
+                codes.extend(queued);
+                true
+            }
+        }
+
+        /// **A death during the wait for another's code is found in the same pass**: the code the
+        /// wait drained is its, and nothing would wake a later pass to look at its channel.
+        #[test]
+        fn a_death_whose_code_the_grace_wait_drained_is_found() {
+            // 0 is starting, and its channel signalled closed; 1 is up, and not in the set.
+            let ctrls = [STARTING, UP, UP];
+            let mut pass =
+                Fake { closed: vec![true, false, false], looked: vec![], waits: vec![(vec![1], vec![7, 9])] };
+            let mut codes = vec![];
+            let dead = deaths(&mut pass, &ctrls, &[0], &mut codes);
+            assert_eq!(dead, [0, 1], "the second death, whose code came in the wait");
+            assert_eq!(codes, [7, 9]);
+            assert_eq!(pass.looked, [0, 1, 2], "every open channel looked at once the codes outran the deaths");
+        }
+
+        #[test]
+        fn a_channel_looked_at_before_it_closed_is_looked_at_again() {
+            // A `ChildExited` pass: 0 has been asked to stop and is still exiting when its channel
+            // is looked at; 1 and 2 have died, and the wait for 2's code brings 0's too.
+            let ctrls = [UP, UP, UP];
+            let mut pass = Fake { closed: vec![false, true, true], looked: vec![], waits: vec![(vec![0], vec![0, 0])] };
+            let mut codes = vec![1];
+            let dead = deaths(&mut pass, &ctrls, &[0, 1, 2], &mut codes);
+            assert_eq!(dead, [1, 2, 0], "the death whose channel closed after its look");
+            assert_eq!(pass.looked, [0, 1, 2, 0], "looked at again once its code came, the dead not");
+        }
+
+        #[test]
+        fn a_code_no_death_explains_brings_one_more_look_at_most() {
+            let ctrls = [UP, STARTING, UP];
+            let mut pass = Fake { closed: vec![false, false, false], looked: vec![], waits: vec![] };
+            let mut codes = vec![5];
+            assert!(deaths(&mut pass, &ctrls, &[0, 1, 2], &mut codes).is_empty());
+            assert_eq!(pass.looked, [0, 1, 2], "every channel looked at after the code came: no more");
+            let mut pass = Fake { closed: vec![false, true, false], looked: vec![], waits: vec![(vec![], vec![7, 5])] };
+            let mut codes = vec![];
+            assert_eq!(deaths(&mut pass, &ctrls, &[1], &mut codes), [1]);
+            assert_eq!(pass.looked, [1, 0, 2], "one look at the rest after the codes grew, then done");
+        }
+
+        #[test]
+        fn a_pass_whose_codes_match_its_deaths_looks_no_further() {
+            let ctrls = [STARTING, UP];
+            let mut pass = Fake { closed: vec![true, false], looked: vec![], waits: vec![(vec![], vec![7])] };
+            let mut codes = vec![];
+            assert_eq!(deaths(&mut pass, &ctrls, &[0], &mut codes), [0]);
+            assert_eq!(pass.looked, [0], "one death, one code: the up channel is not read");
+            let mut pass = Fake { closed: vec![true, false], looked: vec![], waits: vec![] };
+            let mut codes = vec![];
+            assert_eq!(deaths(&mut pass, &ctrls, &[0], &mut codes), [0], "a code that never came: still a death");
+            assert_eq!(pass.looked, [0]);
+        }
+
+        const UP: Ctrl = Ctrl { open: true, speaks: false };
+        const STARTING: Ctrl = Ctrl { open: true, speaks: true };
+        const STOPPED: Ctrl = Ctrl { open: false, speaks: false };
+
+        #[test]
+        fn at_rest_a_wake_reads_only_what_signalled() {
+            let ctrls = [UP, STARTING, UP, STOPPED];
+            let slots = slotted(&ctrls, 5);
+            assert_eq!(slots, [1]);
+            assert_eq!(read(&ctrls, &slots, &[], false), Vec::<usize>::new(), "a route's wake reads none");
+            assert_eq!(read(&ctrls, &slots, &[1], false), [1], "a Ready, and only its channel");
+        }
+
+        #[test]
+        fn a_server_past_the_room_is_read_on_every_wake() {
+            let ctrls = [STARTING; 7];
+            let slots = slotted(&ctrls, 5);
+            assert_eq!(slots, [0, 1, 2, 3, 4]);
+            assert_eq!(read(&ctrls, &slots, &[], false), [5, 6], "the two with no place");
+            assert_eq!(read(&ctrls, &slots, &[2], false), [2, 5, 6]);
+            assert!(unslotted(&ctrls, &slots), "so the wait must end on a deadline of its own");
+            assert!(!unslotted(&ctrls[..5], &slots), "five have their places");
+            assert!(!unslotted(&[UP, STOPPED], &[]));
+        }
+
+        #[test]
+        fn a_late_ready_is_read_from_a_server_down_whose_process_runs() {
+            let late = Ctrl { open: true, speaks: true };
+            let ctrls = [UP, late];
+            let slots = slotted(&ctrls, 5);
+            assert_eq!(slots, [1], "a place, as it can still bring a message");
+            assert_eq!(read(&ctrls, &slots, &[1], false), [1]);
+            assert_eq!(read(&ctrls, &slots, &[], false), Vec::<usize>::new());
+        }
+
+        #[test]
+        fn a_notification_reads_every_open_channel_and_never_a_closed_one() {
+            let ctrls = [UP, STARTING, STOPPED, UP];
+            let slots = slotted(&ctrls, 5);
+            assert_eq!(read(&ctrls, &slots, &[], true), [0, 1, 3], "a death names no channel");
+            assert_eq!(read(&[STOPPED], &[], &[0], true), Vec::<usize>::new());
+            assert_eq!(slotted(&[STOPPED, Ctrl { open: false, speaks: true }], 5), vec![]);
         }
     }
 }

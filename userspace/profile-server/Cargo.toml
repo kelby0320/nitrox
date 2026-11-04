@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
+libos = { path = "../libos" }
 # `io` for `session::Dir`: building the `/bin` index makes this server a *client*
 # of the fs-server's readdir, over the store.
 librsproto = { path = "../librsproto", features = ["io"] }

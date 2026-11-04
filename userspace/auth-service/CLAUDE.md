@@ -43,10 +43,10 @@ account write a person asks it for; the root namespace can reach it too, the bou
 - **The file's format is `libusers`'**, not this crate's: parse, write a record, the name
   rules, the edits and the 4 KiB bound. The build's seeder and `account` write through it
   too, so none of the three can write a line the others read differently.
-- **`src/main.rs` — the server `[[bin]]`.** Bare-target `_start` + syscall plumbing
+- **`src/main.rs` — the server `[[bin]]`.** Bare-target `_start` + `libos` plumbing
   only: read `/system/users` into a fixed buffer, create a client channel, send
   `Meta::Ready` handing the supervisor the client endpoint, then serve; and for an
-  admin request, draw a salt from the entropy source and **install** a new file
+  admin request, draw a salt from the kernel's generator and **install** a new file
   atomically — `users.new`, synced, renamed over — before its copy in memory changes.
   **Alloc-free** — fixed buffers in `_start`'s frame, no `static mut` and no `#[global_allocator]`.
 

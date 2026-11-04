@@ -99,13 +99,6 @@ pub fn ask_password_then_on<'a>(
     }
 }
 
-/// [`ask_password_on`] with `asked`. For callers not yet on libos; the typed form is
-/// [`ask_password_then_on`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn ask_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut()) -> Option<Vec<u8>> {
-    ask_password_then_on(borrowed(term), prompt, asked)
-}
-
 /// Why [`ask_new_password`] has no password to give.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NewPassword {

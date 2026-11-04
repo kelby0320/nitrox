@@ -17,16 +17,23 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::vec;
 
-use libkern::control::Control;
-use libkern::*;
-use librsproto::error::error_body;
-use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
+use libkern::{CTRL_OP_SHUTDOWN, IO_OPCODE_READ, IoOp, KError, MAX_WAIT_HANDLES, Rights};
+use libos::boot::Start;
+use libos::control::{self, Control};
+use libos::log::{self, Line};
+use libos::{
+    Carried, Channel, Deadline, Handle, MapReadWrite, Mapping, Memory, Msg, Only, Op, ReadOnly, Resource, WaitSet,
+    block_on, entropy, time,
+};
+use librsproto::namespace::parse_resolve_request;
+use librsproto::server;
 use librsproto::{
     OP_NS_RESOLVE, OP_TTY_ATTACH_BACKEND, OP_TTY_CLOSE, OP_TTY_INPUT, OP_TTY_OPEN_SIBLING, OP_TTY_OUTPUT, OP_TTY_READ,
-    OP_TTY_READ_LINE, OP_TTY_REDEEM, OP_TTY_SET_MODE, OP_TTY_TOKEN, OP_TTY_WRITE, RS_FLAG_ERROR, RS_FLAG_REPLY,
-    TTY_MODE_ECHO, decode, encode,
+    OP_TTY_READ_LINE, OP_TTY_REDEEM, OP_TTY_SET_MODE, OP_TTY_TOKEN, OP_TTY_WRITE, RS_FLAG_REPLY, TTY_MODE_ECHO, decode,
+    encode,
 };
 use tty_server::routing::{Act, CONSOLE, ReadKind, Registry, Sink, backend_refusal};
 use tty_server::tokens::Tokens;
@@ -34,49 +41,55 @@ use tty_server::tokens::Tokens;
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
-const PAYLOAD_OFF: usize = 24;
-const MSG_LEN: usize = 4096;
 /// One `sys_wait` slot goes to the serving endpoint, one to the outstanding console read and one
 /// to the control channel. **The rest is halved**, because a terminal can also own a backend
 /// channel that has to be waited on: worst case one per terminal, when every one is a window's.
-const MAX_TTYS: usize = (libkern::abi::MAX_WAIT_HANDLES - 3) / 2;
-const _: () = assert!(3 + 2 * MAX_TTYS <= libkern::abi::MAX_WAIT_HANDLES);
+const MAX_TTYS: usize = (MAX_WAIT_HANDLES - 3) / 2;
+const _: () = assert!(3 + 2 * MAX_TTYS <= MAX_WAIT_HANDLES);
 /// Bytes per console read submission.
 const READ_CHUNK: u64 = 64;
 
-static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
-/// A separate pair for [`po_wait`], which waits *inside* the dispatch of a record the serve loop
-/// is still iterating; sharing the buffers above would corrupt records 1..n.
-static mut PO_HANDLES: [u64; 1] = [0];
-static mut PO_RESULTS: [u8; 24] = [0; 24];
-static mut CTRL_OUT0: u64 = 0;
-static mut CTRL_OUT1: u64 = 0;
+type Endpoint = Handle<Channel, Only>;
 
-/// Write to a sink: serial via the kernel's debug write, or an `OP_TTY_OUTPUT` message to whoever
-/// holds the terminal's backend channel.
-fn sink_write(sink: Sink, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    match sink {
-        Sink::Console => kprint(bytes),
-        // Chunked: a write may exceed one message and the emulator cannot ask for the rest.
-        Sink::Channel(h) => {
-            for part in bytes.chunks(MAX_BODY) {
-                send_output(h, part);
-            }
-        }
+/// The channels the server owns, keyed by the value the [`Registry`] names them with. A channel
+/// leaves a map exactly when the registry drops it, and is closed there.
+struct Links {
+    /// Each terminal's server-side endpoint.
+    ttys: BTreeMap<u64, Endpoint>,
+    /// Each channel backend: the endpoint an emulator handed over.
+    backends: BTreeMap<u64, Endpoint>,
+}
+
+/// What a wait's index names.
+#[derive(Copy, Clone)]
+enum Waited {
+    Resolve,
+    Control,
+    Tty(u64),
+    Backend(u64, u32),
+    Read,
+}
+
+/// Add `h` to `set` as `what`.
+fn watch<'a>(set: &mut WaitSet<'a, MAX_WAIT_HANDLES>, names: &mut [Waited], h: &'a Endpoint, what: Waited) {
+    if let Ok(i) = set.add(h) {
+        names[i] = what;
     }
 }
 
 /// The most body one message can carry ([`librsproto::RS_MAX_BODY`]), envelope included: a
 /// larger chunk makes a message the kernel refuses, and `send_output` drops a failed send.
 const MAX_BODY: usize = librsproto::RS_MAX_BODY;
+
+/// Send a reply on `ch`: `op`/`request_id` echoed, `body` as the payload.
+fn reply(ch: &Endpoint, op: u16, request_id: u64, body: &[u8]) {
+    let _ = server::send(ch, op, request_id, RS_FLAG_REPLY, body, &mut Carried::new());
+}
+
+/// Send an error reply, echoing `op`/`request_id` so the caller can match it.
+fn reply_error(ch: &Endpoint, op: u16, request_id: u64, kerror: KError) {
+    server::reply_error(ch, op, request_id, kerror, b"");
+}
 
 /// Send one `Tty::Output` message, **blocking if the emulator's ring is full**.
 ///
@@ -89,618 +102,315 @@ const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 /// the tty path, and the emulator's send back is `NOBLOCK`. A *visible* stall beats an *invisible*
 /// loss; a per-backend output queue the serve loop drains would cost neither, which is
 /// `TODO(tty-output-queue)`.
-fn send_output(ch: u64, body: &[u8]) {
-    // SAFETY: REPLY_MSG is a valid buffer owned by this module.
-    let po = unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_TTY_OUTPUT, 0, 0, body, 0) else {
-            return;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 0;
-        syscall6(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            0,
-            SENDMODE_BLOCK,
-            u64::MAX,
-        )
+fn send_output(ch: &Endpoint, body: &[u8]) {
+    let mut msg = Msg::new();
+    let Some(rs_len) = encode(msg.payload_mut(), OP_TTY_OUTPUT, 0, 0, body, 0) else {
+        return;
     };
-    if po >= 0 {
+    if msg.set_len(rs_len).is_err() {
+        return;
+    }
+    if let Ok(held) = ch.send_held(&msg, &mut Carried::new()) {
         // Waiting the delivery's `PendingOperation` is what blocks. Its status is ignored: a
         // failure means the emulator is gone, which the serve loop learns from `PeerClosed`.
-        po_wait(po as u64);
+        let _ = block_on(held);
     }
 }
 
-/// Perform what the registry decided.
-fn perform(acts: &[Act]) {
-    for a in acts {
-        match a {
-            Act::Write(sink, bytes) => sink_write(*sink, bytes),
-            Act::Reply { ch, op, request_id, body } => reply(*ch, *op, *request_id, body),
-            Act::Fail { ch, op, request_id, err } => reply_error(*ch, *op, *request_id, *err),
+impl Links {
+    /// Write to a sink: serial via the kernel's debug write, or an `OP_TTY_OUTPUT` message to
+    /// whoever holds the terminal's backend channel.
+    fn sink_write(&self, sink: Sink, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        match sink {
+            Sink::Console => log::write(bytes),
+            // Chunked: a write may exceed one message and the emulator cannot ask for the rest.
+            Sink::Channel(h) => {
+                if let Some(ch) = self.backends.get(&h) {
+                    for part in bytes.chunks(MAX_BODY) {
+                        send_output(ch, part);
+                    }
+                }
+            }
         }
     }
-}
 
-fn exit(code: i64) -> ! {
-    // SAFETY: SYS_PROCESS_EXIT terminates this process.
-    unsafe { syscall1(SYS_PROCESS_EXIT, code as u64) };
-    loop {
-        core::hint::spin_loop();
+    /// Perform what the registry decided.
+    fn perform(&self, acts: &[Act]) {
+        for a in acts {
+            match a {
+                Act::Write(sink, bytes) => self.sink_write(*sink, bytes),
+                Act::Reply { ch, op, request_id, body } => {
+                    if let Some(ch) = self.ttys.get(ch) {
+                        reply(ch, *op, *request_id, body);
+                    }
+                }
+                Act::Fail { ch, op, request_id, err } => {
+                    if let Some(ch) = self.ttys.get(ch) {
+                        reply_error(ch, *op, *request_id, KError::from_i32(*err));
+                    }
+                }
+            }
+        }
     }
-}
 
-/// Resolve `path` in `ns` requesting `rights`; `0` on failure.
-fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
-    // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
-    if po < 0 {
-        return 0;
+    /// Answer terminal `ch` with an error, if it still exists.
+    fn fail(&self, ch: u64, op: u16, request_id: u64, kerror: KError) {
+        if let Some(ch) = self.ttys.get(&ch) {
+            reply_error(ch, op, request_id, kerror);
+        }
     }
-    let (status, handle) = po_wait(po as u64);
-    if status != 0 { 0 } else { handle }
-}
 
-/// Wait one handle and read `(status, value)` out of its `IoResult` (status @8, value @16).
-fn po_wait(po: u64) -> (i32, u64) {
-    // SAFETY: PO_HANDLES/PO_RESULTS are valid writable buffers owned by this function; one
-    // waiter. Deliberately **not** the serve loop's buffers — see their declaration.
-    let waited = unsafe {
-        PO_HANDLES[0] = po;
-        syscall4(SYS_WAIT, (&raw const PO_HANDLES) as u64, 1, (&raw mut PO_RESULTS) as u64, u64::MAX)
-    };
-    // SAFETY: bytes 8..24 are inside `PO_RESULTS`, a static of plain bytes only this thread
-    // touches; they hold the wait's result only when it returned 1.
-    let (status, value) = unsafe {
-        (
-            i32::from_le_bytes([PO_RESULTS[8], PO_RESULTS[9], PO_RESULTS[10], PO_RESULTS[11]]),
-            u64::from_le_bytes([
-                PO_RESULTS[16],
-                PO_RESULTS[17],
-                PO_RESULTS[18],
-                PO_RESULTS[19],
-                PO_RESULTS[20],
-                PO_RESULTS[21],
-                PO_RESULTS[22],
-                PO_RESULTS[23],
-            ]),
-        )
-    };
-    // SAFETY: closing our own PO handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
-    if waited != 1 { (-1, 0) } else { (status, value) }
+    /// Answer terminal `ch`, if it still exists.
+    fn answer(&self, ch: u64, op: u16, request_id: u64, body: &[u8]) {
+        if let Some(ch) = self.ttys.get(&ch) {
+            reply(ch, op, request_id, body);
+        }
+    }
 }
 
 /// The monotonic clock, in nanoseconds: what a token's thirty seconds are measured on.
 fn now_ns() -> u64 {
-    let mut ns: u64 = 0;
-    // SAFETY: a valid writable `u64` out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut ns) as u64) };
-    ns
+    time::now().unwrap_or(0)
 }
 
 /// A token's 128 bits, from the kernel CSPRNG — **or none**: a token made up when the pool will
 /// not answer is one someone else could make up too, and without one the caller is asked for its
-/// password, which is safe. An unseeded pool is none too (`tty_server::tokens::from_read`).
+/// password, which is safe. An unseeded pool is none too: the serve loop does not wait for it, and
+/// a missing token only costs a password prompt.
 fn random_token() -> Option<[u8; tty_server::tokens::LEN]> {
-    // SAFETY: register-only syscall.
-    let h = unsafe { syscall1(SYS_ENTROPY_CREATE, 0) };
-    if h < 0 {
-        return None;
-    }
-    let h = h as u64;
     let mut buf = [0u8; tty_server::tokens::LEN];
-    // SAFETY: a valid writable buffer of `LEN` bytes.
-    let r = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut buf) as u64, buf.len() as u64, 0) };
-    if r > 0 {
-        // SAFETY: closing the pending operation the read answered with, which this process owns.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, r as u64) };
-    }
-    // SAFETY: closing our own handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    tty_server::tokens::from_read(r, buf)
+    entropy::try_fill(&mut buf).ok()?;
+    Some(buf)
 }
 
-/// A connected channel pair, or `None`.
-fn make_channel() -> Option<(u64, u64)> {
-    // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0) };
-    if cr != 0 {
-        return None;
-    }
-    // SAFETY: on success the kernel wrote both endpoint handles.
-    Some(unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) })
+/// What the serve loop works on: the registry and the channels it names, the console and the
+/// outstanding read.
+struct Server {
+    /// The outstanding console read, if one is submitted; ahead of `map` and `buf` so it drops
+    /// first, as an `Op` dropped before it completes waits for its device.
+    read: Option<Op>,
+    reg: Registry,
+    tokens: Tokens,
+    links: Links,
+    serve_end: Endpoint,
+    /// The control channel (`service --stop`), until its supervisor has gone and it would stay
+    /// signalled for good.
+    control: Option<Endpoint>,
+    console: Handle<Resource, ReadOnly>,
+    /// The page every console read lands in, and its mapping.
+    map: Mapping<MapReadWrite>,
+    buf: Handle<Memory, MapReadWrite>,
 }
 
-/// Send `Meta::Ready` on `control`, transferring the endpoint `service-mgr` binds at `/dev/tty`.
-fn send_ready(control: u64, kernel_end: u64) -> bool {
-    let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
-    let Some(body_len) = librsproto::meta::ready(&mut body, b"tty-server") else {
-        return false;
-    };
-    // SAFETY: REPLY_MSG is a valid buffer; the rsproto message goes at offset 24.
-    unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1)
-        else {
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = kernel_end;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            control,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
-}
-
-/// Send a reply on `ch`: `op`/`request_id` echoed, `body` as the payload.
-fn reply(ch: u64, op: u16, request_id: u64, body: &[u8]) {
-    // SAFETY: REPLY_MSG is a valid buffer; no transferred handles.
-    unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY, body, 0) else {
+impl Server {
+    /// `Tty::OpenSibling` on terminal `of`: mint another terminal on its backend and hand the
+    /// caller the new channel, moved in the reply.
+    ///
+    /// A shell's stages get their terminals here: a stage's prompt must appear where the shell's does,
+    /// and resolving `/dev/tty` would land it on the console. The cap is a resolve's, and a refusal
+    /// is `WouldBlock`, which the shell answers by running the stage with no terminal.
+    fn open_sibling(&mut self, of: u64, request_id: u64) {
+        if self.reg.len() >= MAX_TTYS {
+            self.links.fail(of, OP_TTY_OPEN_SIBLING, request_id, KError::WouldBlock);
+            return;
+        }
+        let Ok((client_end, server_end)) = Handle::pair(4) else {
+            self.links.fail(of, OP_TTY_OPEN_SIBLING, request_id, KError::KernelError);
             return;
         };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        );
+        let key = server_end.raw().0;
+        // Registered before the reply so the terminal exists when first used; undone if it cannot go.
+        if !self.reg.open_sibling(key, of) {
+            self.links.fail(of, OP_TTY_OPEN_SIBLING, request_id, KError::NotFound);
+            return;
+        }
+        let mut carried = Carried::new();
+        let sent = match (carried.push(client_end), self.links.ttys.get(&of)) {
+            (Ok(()), Some(of_end)) => {
+                server::send(of_end, OP_TTY_OPEN_SIBLING, request_id, RS_FLAG_REPLY, &[], &mut carried)
+            }
+            _ => Err(KError::KernelError.into()),
+        };
+        match sent {
+            Ok(()) => {
+                self.links.ttys.insert(key, server_end);
+                // With the count, so a leak is visible: a stage's terminal not freed would hold one of
+                // `MAX_TTYS` slots for good. `test-interactive` compares it across identical commands.
+                Line::new()
+                    .s(b"tty-server: terminal opened beside another, ")
+                    .u(self.reg.len() as u64)
+                    .s(b" open")
+                    .end();
+            }
+            Err(e) => {
+                // The client end never moved, so nobody can use the terminal: take it back out, and
+                // say so. A ring too full for the reply drops this too, and the shell keeps waiting.
+                self.reg.close(key);
+                drop(carried);
+                self.links.fail(of, OP_TTY_OPEN_SIBLING, request_id, e.code());
+            }
+        }
     }
-}
 
-/// Send an error reply, echoing `op`/`request_id` so the caller can match it.
-fn reply_error(ch: u64, op: u16, request_id: u64, kerror: i32) {
-    let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
-    let elen = error_body(&mut ebody, kerror, 0, b"").unwrap_or(0);
-    // SAFETY: REPLY_MSG is a valid buffer.
-    unsafe {
-        let Some(rs_len) =
-            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody[..elen], 0)
-        else {
+    /// Reply to a forwarded `/dev/tty` resolve with a fresh terminal channel.
+    fn open_tty(&mut self, request_id: u64) {
+        if self.reg.len() >= MAX_TTYS {
+            reply_error(&self.serve_end, OP_NS_RESOLVE, request_id, KError::WouldBlock);
+            return;
+        }
+        let Ok((client_end, server_end)) = Handle::pair(4) else {
+            reply_error(&self.serve_end, OP_NS_RESOLVE, request_id, KError::KernelError);
             return;
         };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        );
+        let key = server_end.raw().0;
+        // A reply that did not go is answered with an error, a forwarded resolve having no
+        // deadline, and the client end is closed with it.
+        if server::reply_channel(&self.serve_end, request_id, client_end) {
+            self.reg.open(key);
+            self.links.ttys.insert(key, server_end);
+            log::write(b"tty-server: terminal opened\n");
+        }
     }
-}
 
-/// Reply to a forwarded `/dev/tty` resolve with a fresh terminal channel.
-fn open_tty(serve_end: u64, request_id: u64, reg: &mut Registry) {
-    if reg.len() >= MAX_TTYS {
-        reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::WouldBlock.as_i32());
-        return;
+    /// Free terminal `ch`: close its endpoint and drop it.
+    ///
+    /// **This is the revocation point.** This kernel has no revocation, so a process that outlived
+    /// its session while holding a `/dev/tty` handle cannot have it taken away; the server ceasing to
+    /// serve the channel makes teardown a guarantee — see `docs/architecture/console-and-tty.md`.
+    fn free_tty(&mut self, ch: u64) {
+        // The backend goes with the last terminal on it; closing a channel backend tells the
+        // emulator the terminal is gone.
+        for h in self.reg.close_and_retire(ch) {
+            self.links.backends.remove(&h);
+        }
+        self.links.ttys.remove(&ch);
+        log::write(b"tty-server: terminal closed\n");
     }
-    let Some((client_end, server_end)) = make_channel() else {
-        reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::KernelError.as_i32());
-        return;
-    };
-    let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
-    let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
-    // SAFETY: REPLY_MSG is a valid buffer; the channel rides in handles[0].
-    let sent = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
-            Some(rs_len) => {
-                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-                REPLY_MSG[8] = 1;
-                REPLY_HANDLES[0] = client_end;
-                syscall5(
-                    SYS_CHANNEL_SEND,
-                    serve_end,
-                    (&raw const REPLY_MSG) as u64,
-                    (&raw const REPLY_HANDLES) as u64,
-                    1,
-                    SENDMODE_NOBLOCK,
-                )
+
+    /// Handle one request on terminal `ch`'s channel. Returns `false` if the terminal is gone.
+    fn serve_tty(&mut self, ch: u64) -> bool {
+        let Some(end) = self.links.ttys.get(&ch) else { return true };
+        // Only `AttachBackend` takes a handle; whatever came with anything else closes as `sent` drops.
+        let mut msg = Msg::new();
+        let mut sent = match end.recv(&mut msg) {
+            Ok(sent) => sent,
+            // `PeerClosed` means the terminal is finished; anything else is an empty ring.
+            Err(e) => return e.code() != KError::PeerClosed,
+        };
+        let Ok(m) = decode(msg.payload()) else { return true };
+        let (op, request_id, body) = (m.op, m.request_id, m.body);
+        match op {
+            OP_TTY_WRITE => {
+                let acts = self.reg.write(ch, request_id, body);
+                self.links.perform(&acts);
             }
-            None => KError::KernelError.as_i32() as i64,
-        }
-    };
-    if sent == 0 {
-        reg.open(server_end);
-        kprint(b"tty-server: terminal opened\n");
-    } else {
-        // The reply did not go, so the client end never moved — reclaim both, and answer: a
-        // forwarded resolve has no deadline, and its client would wait for good.
-        close(client_end);
-        close(server_end);
-        reply_error(serve_end, OP_NS_RESOLVE, request_id, sent as i32);
-    }
-}
-
-/// `Tty::OpenSibling` on terminal `of`: mint another terminal on its backend and hand the
-/// caller the new channel, moved in the reply.
-///
-/// A shell's stages get their terminals here: a stage's prompt must appear where the shell's does,
-/// and resolving `/dev/tty` would land it on the console. The cap is a resolve's, and a refusal
-/// is `WouldBlock`, which the shell answers by running the stage with no terminal.
-fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
-    if reg.len() >= MAX_TTYS {
-        reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::WouldBlock.as_i32());
-        return;
-    }
-    let Some((client_end, server_end)) = make_channel() else {
-        reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::KernelError.as_i32());
-        return;
-    };
-    // Registered before the reply so the terminal exists when first used; undone if it cannot go.
-    if !reg.open_sibling(server_end, of) {
-        close(client_end);
-        close(server_end);
-        reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::NotFound.as_i32());
-        return;
-    }
-    // SAFETY: REPLY_MSG is a valid buffer; the new terminal's channel rides in handles[0].
-    let sent = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_TTY_OPEN_SIBLING, request_id, RS_FLAG_REPLY, &[], 1) {
-            Some(rs_len) => {
-                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-                REPLY_MSG[8] = 1;
-                REPLY_HANDLES[0] = client_end;
-                syscall5(
-                    SYS_CHANNEL_SEND,
-                    of,
-                    (&raw const REPLY_MSG) as u64,
-                    (&raw const REPLY_HANDLES) as u64,
-                    1,
-                    SENDMODE_NOBLOCK,
-                )
+            OP_TTY_SET_MODE => {
+                let flags = body.first().copied().unwrap_or(TTY_MODE_ECHO);
+                let acts = self.reg.set_mode(ch, request_id, flags & TTY_MODE_ECHO != 0);
+                self.links.perform(&acts);
             }
-            None => KError::KernelError.as_i32() as i64,
-        }
-    };
-    if sent == 0 {
-        // With the count, so a leak is visible: a stage's terminal not freed would hold one of
-        // `MAX_TTYS` slots for good. `test-interactive` compares it across identical commands.
-        libkern::debug::Line::new()
-            .s(b"tty-server: terminal opened beside another, ")
-            .u(reg.len() as u64)
-            .s(b" open")
-            .end();
-    } else {
-        // The client end never moved, so nobody can use the terminal: take it back out, and
-        // say so. A ring too full for the reply drops this too, and the shell keeps waiting.
-        reg.close(server_end);
-        close(client_end);
-        close(server_end);
-        reply_error(of, OP_TTY_OPEN_SIBLING, request_id, sent as i32);
-    }
-}
-
-/// Close `h`, a handle this process holds; `0` is none.
-fn close(h: u64) {
-    if h != 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    }
-}
-
-/// What the kernel says of handle `h`, or the stat's error.
-fn stat(h: u64) -> Result<HandleInfo, i64> {
-    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
-    // SAFETY: `info` is a writable `HandleInfo`, the layout the kernel writes.
-    let r = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
-    if r == 0 { Ok(info) } else { Err(r) }
-}
-
-/// Free terminal `i`: close its endpoint and drop it.
-///
-/// **This is the revocation point.** This kernel has no revocation, so a process that outlived
-/// its session while holding a `/dev/tty` handle cannot have it taken away; the server ceasing to
-/// serve the channel makes teardown a guarantee — see `docs/architecture/console-and-tty.md`.
-fn free_tty(reg: &mut Registry, ch: u64) {
-    // The backend goes with the last terminal on it; closing a channel backend tells the
-    // emulator the terminal is gone.
-    for h in reg.close_and_retire(ch) {
-        // SAFETY: closing our own backend endpoint.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    }
-    // SAFETY: closing our own endpoint.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
-    kprint(b"tty-server: terminal closed\n");
-}
-
-/// Handle one request on terminal `i`'s channel. Returns `false` if the terminal is gone.
-fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
-    // Only `AttachBackend` takes a handle; whatever came with anything else closes as `sent` drops.
-    // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
-    let mut sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
-        Ok(sent) => sent,
-        // `PeerClosed` means the terminal is finished; anything else is an empty ring.
-        Err(rr) => return rr != KError::PeerClosed.as_i32() as i64,
-    };
-    // SAFETY: bounded read-only slice over the just-received message.
-    let (op, request_id, body) = unsafe {
-        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
-        match decode(req) {
-            Ok(m) => (m.op, m.request_id, m.body),
-            Err(_) => return true,
-        }
-    };
-    match op {
-        OP_TTY_WRITE => perform(&reg.write(ch, request_id, body)),
-        OP_TTY_SET_MODE => {
-            let flags = body.first().copied().unwrap_or(TTY_MODE_ECHO);
-            perform(&reg.set_mode(ch, request_id, flags & TTY_MODE_ECHO != 0));
-        }
-        OP_TTY_READ_LINE | OP_TTY_READ => {
-            let kind = if op == OP_TTY_READ { ReadKind::Raw } else { ReadKind::Line };
-            perform(&reg.read(ch, request_id, kind));
-        }
-        OP_TTY_ATTACH_BACKEND => {
-            let handle = sent.take(0).unwrap_or(0);
-            // Succeeding silently with no handle would leave the emulator waiting for output that
-            // goes to the console.
-            let refused = match stat(handle) {
-                Ok(info) => backend_refusal(info.object_type, info.rights),
-                // Without `INSPECT` the server cannot see what it was given, so cannot take it.
-                Err(e) if e == KError::NoAccess.as_i32() as i64 => Some(KError::NoAccess),
-                Err(_) => Some(KError::InvalidArgument),
-            };
-            if let Some(e) = refused {
-                close(handle);
-                reply_error(ch, op, request_id, e.as_i32());
-            } else {
-                match reg.attach_backend(ch, handle) {
-                    Some((_, left)) => {
-                        // Closed, so the emulator of the backend the terminal left sees it end.
-                        left.into_iter().for_each(close);
-                        reply(ch, OP_TTY_ATTACH_BACKEND, request_id, &[]);
-                        kprint(b"tty-server: terminal attached to a backend channel\n");
+            OP_TTY_READ_LINE | OP_TTY_READ => {
+                let kind = if op == OP_TTY_READ { ReadKind::Raw } else { ReadKind::Line };
+                let acts = self.reg.read(ch, request_id, kind);
+                self.links.perform(&acts);
+            }
+            OP_TTY_ATTACH_BACKEND => {
+                let handle: Option<Endpoint> = sent.take(0);
+                // Succeeding silently with no handle would leave the emulator waiting for output that
+                // goes to the console.
+                let refused = match &handle {
+                    None => Some(KError::InvalidArgument),
+                    Some(h) => match h.stat() {
+                        Ok(info) => backend_refusal(info.object_type, info.rights),
+                        // Without `INSPECT` the server cannot see what it was given, so cannot take it.
+                        Err(e) if e.code() == KError::NoAccess => Some(KError::NoAccess),
+                        Err(_) => Some(KError::InvalidArgument),
+                    },
+                };
+                match (refused, handle) {
+                    (None, Some(h)) => {
+                        let key = h.raw().0;
+                        if let Some((_, left)) = self.reg.attach_backend(ch, key) {
+                            self.links.backends.insert(key, h);
+                            // Closed, so the emulator of the backend the terminal left sees it end.
+                            if let Some(l) = left {
+                                self.links.backends.remove(&l);
+                            }
+                            self.links.answer(ch, OP_TTY_ATTACH_BACKEND, request_id, &[]);
+                            log::write(b"tty-server: terminal attached to a backend channel\n");
+                        } else {
+                            drop(h);
+                            self.links.fail(ch, op, request_id, KError::NotFound);
+                        }
                     }
-                    None => {
-                        close(handle);
-                        reply_error(ch, op, request_id, KError::NotFound.as_i32());
+                    (refused, handle) => {
+                        drop(handle);
+                        self.links.fail(ch, op, request_id, refused.unwrap_or(KError::InvalidArgument));
                     }
                 }
             }
-        }
-        OP_TTY_OPEN_SIBLING => open_sibling(reg, ch, request_id),
-        // A token for this terminal's backend: how the view broker learns which terminal a
-        // request came from without asking the requester.
-        OP_TTY_TOKEN => match (reg.backend_of_terminal(ch), random_token()) {
-            (Some(backend), Some(token)) => {
-                tokens.mint(token, backend, now_ns());
-                reply(ch, op, request_id, &token);
+            OP_TTY_OPEN_SIBLING => self.open_sibling(ch, request_id),
+            // A token for this terminal's backend: how the view broker learns which terminal a
+            // request came from without asking the requester.
+            OP_TTY_TOKEN => match (self.reg.backend_of_terminal(ch), random_token()) {
+                (Some(backend), Some(token)) => {
+                    self.tokens.mint(token, backend, now_ns());
+                    self.links.answer(ch, op, request_id, &token);
+                }
+                (None, _) => self.links.fail(ch, op, request_id, KError::NotFound),
+                (_, None) => self.links.fail(ch, op, request_id, KError::KernelError),
+            },
+            // Which backend a token names, once. On any terminal: knowing the token is the proof.
+            OP_TTY_REDEEM => match self.tokens.redeem(body, now_ns()) {
+                Some(backend) => self.links.answer(ch, op, request_id, &backend.to_le_bytes()),
+                None => self.links.fail(ch, op, request_id, KError::NotFound),
+            },
+            OP_TTY_CLOSE => {
+                self.links.answer(ch, OP_TTY_CLOSE, request_id, &[]);
+                return false;
             }
-            (None, _) => reply_error(ch, op, request_id, KError::NotFound.as_i32()),
-            (_, None) => reply_error(ch, op, request_id, KError::KernelError.as_i32()),
-        },
-        // Which backend a token names, once. On any terminal: knowing the token is the proof.
-        OP_TTY_REDEEM => match tokens.redeem(body, now_ns()) {
-            Some(backend) => reply(ch, op, request_id, &backend.to_le_bytes()),
-            None => reply_error(ch, op, request_id, KError::NotFound.as_i32()),
-        },
-        OP_TTY_CLOSE => {
-            reply(ch, OP_TTY_CLOSE, request_id, &[]);
-            return false;
+            _ => self.links.fail(ch, op, request_id, KError::Unsupported),
         }
-        _ => reply_error(ch, op, request_id, KError::Unsupported.as_i32()),
+        true
     }
-    true
-}
 
-/// Feed in what a terminal emulator sent on backend `id`'s channel. Returns `false` if the
-/// emulator is gone, which ends every terminal on that backend.
-fn serve_backend(reg: &mut Registry, id: u32, ch: u64) -> bool {
-    // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
-    let _sent = match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
-        Ok(sent) => sent,
-        Err(rr) => return rr != KError::PeerClosed.as_i32() as i64,
-    };
-    // SAFETY: bounded read-only slice over the just-received message.
-    let (op, body) = unsafe {
-        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
-        match decode(req) {
-            Ok(m) => (m.op, m.body),
-            Err(_) => return true,
+    /// Feed in what a terminal emulator sent on backend `id`'s channel `key`. Returns `false` if
+    /// the emulator is gone, which ends every terminal on that backend.
+    fn serve_backend(&mut self, id: u32, key: u64) -> bool {
+        let Some(end) = self.links.backends.get(&key) else { return true };
+        let mut msg = Msg::new();
+        let _sent = match end.recv(&mut msg) {
+            Ok(sent) => sent,
+            Err(e) => return e.code() != KError::PeerClosed,
+        };
+        let Ok(m) = decode(msg.payload()) else { return true };
+        // Anything but input is ignored: this channel carries unsolicited messages, so there is no
+        // request to fail.
+        if m.op == OP_TTY_INPUT {
+            let acts = self.reg.feed(id, m.body);
+            self.links.perform(&acts);
         }
-    };
-    // Anything but input is ignored: this channel carries unsolicited messages, so there is no
-    // request to fail.
-    if op == OP_TTY_INPUT {
-        perform(&reg.feed(id, body));
+        true
     }
-    true
-}
 
-/// The serve loop: the forwarding endpoint, every open terminal, and one outstanding
-/// console read, all in one `sys_wait`.
-fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut control: u64) -> ! {
-    kprint(b"tty-server: serving /dev/tty over the console\n");
-    let mut reg = Registry::new();
-    let mut tokens = Tokens::new();
-    let mut read_po: u64 = 0;
-    // Rebuilt each turn beside the wait set, so a handle's slot and its meaning cannot drift.
-    let mut backend_at: Vec<(u64, u32)> = Vec::new();
-
-    loop {
-        // A console read is always outstanding: `Ctrl-C` has to be seen **while the shell is
-        // busy**, when nobody is waiting for input. This server is the only reader of
-        // `/dev/console` in a live session, so the single-reader driver is not contended.
-        // Bytes that arrive with no reader still queue.
-        if read_po == 0 {
-            let op = libkern::abi::IoOp {
-                opcode: libkern::abi::IO_OPCODE_READ,
-                flags: 0,
-                buffer: buf_h,
-                buf_offset: 0,
-                offset: 0,
-                length: READ_CHUNK,
+    /// Drain every queued forwarded resolve on the serving endpoint.
+    fn drain_resolves(&mut self) {
+        loop {
+            let mut msg = Msg::new();
+            let _sent = match self.serve_end.recv(&mut msg) {
+                Ok(sent) => sent,
+                // A forwarding endpoint with no peer is the end of this server, not a message to skip: the
+                // kernel keeps a peer-closed channel signalled, so going round again would spin a CPU.
+                Err(e) if e.code() == KError::PeerClosed => {
+                    log::write(b"tty-server: forwarding endpoint closed\n");
+                    libos::exit(1);
+                }
+                Err(_) => return,
             };
-            // SAFETY: `console` is a char DeviceNode with READ; `&op` is a valid IoOp.
-            let po = unsafe { syscall2(SYS_IO_SUBMIT, console, (&op as *const libkern::abi::IoOp) as u64) };
-            if po >= 0 {
-                read_po = po as u64;
-            }
-        }
-
-        backend_at.clear();
-        for h in reg.backend_channels() {
-            if let Some(id) = reg.backend_of_channel(h) {
-                backend_at.push((h, id));
-            }
-        }
-        let count = {
-            // SAFETY: WAIT_HANDLES has MAX_WAIT_HANDLES slots; `n` is bounded by
-            // 1 + MAX_TTYS + MAX_TTYS + 1 + 1, which is inside that limit by construction — see
-            // `MAX_TTYS`, which is halved for exactly this.
-            unsafe {
-                WAIT_HANDLES[0] = serve_end;
-                let mut n = 1usize;
-                // The control channel (`service --stop`), until its supervisor has gone and it
-                // would stay signalled for good.
-                if control != 0 {
-                    WAIT_HANDLES[n] = control;
-                    n += 1;
-                }
-                for ch in reg.channels() {
-                    WAIT_HANDLES[n] = ch;
-                    n += 1;
-                }
-                for (h, _) in backend_at.iter() {
-                    WAIT_HANDLES[n] = *h;
-                    n += 1;
-                }
-                if read_po != 0 {
-                    WAIT_HANDLES[n] = read_po;
-                    n += 1;
-                }
-                n
-            }
-        };
-        // SAFETY: valid wait buffers sized for `count`.
-        let waited = unsafe {
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, count as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-        };
-        if waited < 1 {
-            continue;
-        }
-
-        for j in 0..(waited as usize) {
-            let off = j * 24;
-            // SAFETY: `waited` records were written; `off + 8` is inside WAIT_RESULTS.
-            let h = unsafe {
-                u64::from_le_bytes([
-                    WAIT_RESULTS[off],
-                    WAIT_RESULTS[off + 1],
-                    WAIT_RESULTS[off + 2],
-                    WAIT_RESULTS[off + 3],
-                    WAIT_RESULTS[off + 4],
-                    WAIT_RESULTS[off + 5],
-                    WAIT_RESULTS[off + 6],
-                    WAIT_RESULTS[off + 7],
-                ])
-            };
-            if h == serve_end {
-                drain_resolves(serve_end, &mut reg);
-            } else if control != 0 && h == control {
-                // Every terminal ends with this process; its programs' next read or write
-                // finds the channel closed.
-                if let Control::Op(CTRL_OP_SHUTDOWN) = libkern::control::recv(&mut control) {
-                    kprint(b"tty-server: asked to stop, exiting\n");
-                    exit(0);
-                }
-            } else if read_po != 0 && h == read_po {
-                let n = console_bytes(off);
-                let mut bytes: Vec<u8> = Vec::with_capacity(n as usize);
-                for k in 0..n {
-                    // SAFETY: the kernel wrote `n` bytes into the mapped read buffer at `buf_addr`,
-                    // which stays mapped for the process's life
-                    bytes.push(unsafe { ((buf_addr + k) as *const u8).read_volatile() });
-                }
-                close(read_po);
-                read_po = 0; // consumed; the next iteration submits another
-                perform(&reg.feed(CONSOLE, &bytes));
-            } else if reg.channels().any(|c| c == h) {
-                if !serve_tty(&mut reg, &mut tokens, h) {
-                    free_tty(&mut reg, h);
-                }
-            } else if let Some((_, id)) = backend_at.iter().find(|(bh, _)| *bh == h).copied()
-                && !serve_backend(&mut reg, id, h)
-            {
-                // The emulator is gone, so every terminal on its backend ends: leaving one alive
-                // would give its programs a `/dev/tty` that silently discards everything
-                // written to it, which looks like a hang.
-                kprint(b"tty-server: a backend went away\n");
-                for ch in reg.ttys_on(id) {
-                    free_tty(&mut reg, ch);
-                }
-            }
-        }
-    }
-}
-
-/// The byte count from a completed console read's `IoResult` (status @8, value @16).
-fn console_bytes(off: usize) -> u64 {
-    // SAFETY: the record at `off` was written by the wait.
-    unsafe {
-        let status = i32::from_le_bytes([
-            WAIT_RESULTS[off + 8],
-            WAIT_RESULTS[off + 9],
-            WAIT_RESULTS[off + 10],
-            WAIT_RESULTS[off + 11],
-        ]);
-        if status != 0 {
-            return 0;
-        }
-        u64::from_le_bytes([
-            WAIT_RESULTS[off + 16],
-            WAIT_RESULTS[off + 17],
-            WAIT_RESULTS[off + 18],
-            WAIT_RESULTS[off + 19],
-            WAIT_RESULTS[off + 20],
-            WAIT_RESULTS[off + 21],
-            WAIT_RESULTS[off + 22],
-            WAIT_RESULTS[off + 23],
-        ])
-        .min(READ_CHUNK)
-    }
-}
-
-/// Drain every queued forwarded resolve on the serving endpoint.
-fn drain_resolves(serve_end: u64, reg: &mut Registry) {
-    loop {
-        // SAFETY: single-threaded server; `RECV_MSG` is lent for the call.
-        let Ok(_sent) = (unsafe { channel_recv_raw(serve_end, &raw mut RECV_MSG) }) else {
-            return;
-        };
-        // SAFETY: bounded read-only slice over the received message.
-        let (op, request_id, ok) = unsafe {
-            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            let req = core::slice::from_raw_parts(
-                ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-                payload_len.min(MSG_LEN - PAYLOAD_OFF),
-            );
-            match decode(req) {
+            let (op, request_id, ok) = match decode(msg.payload()) {
                 // Only the terminal itself is addressable, not `/dev/tty/anything`.
                 Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
                     Some(r) => (m.op, m.request_id, r.suffix.is_empty()),
@@ -708,14 +418,112 @@ fn drain_resolves(serve_end: u64, reg: &mut Registry) {
                 },
                 Ok(m) => (m.op, m.request_id, false),
                 Err(_) => (0, 0, false),
+            };
+            if ok {
+                self.open_tty(request_id);
+            } else if op == OP_NS_RESOLVE {
+                reply_error(&self.serve_end, op, request_id, KError::NotFound);
+            } else {
+                reply_error(&self.serve_end, op, request_id, KError::Unsupported);
             }
-        };
-        if ok {
-            open_tty(serve_end, request_id, reg);
-        } else if op == OP_NS_RESOLVE {
-            reply_error(serve_end, op, request_id, KError::NotFound.as_i32());
-        } else {
-            reply_error(serve_end, op, request_id, KError::Unsupported.as_i32());
+        }
+    }
+
+    /// Submit the console read if none is outstanding.
+    ///
+    /// A console read is always outstanding: `Ctrl-C` has to be seen **while the shell is
+    /// busy**, when nobody is waiting for input. This server is the only reader of
+    /// `/dev/console` in a live session, so the single-reader driver is not contended.
+    /// Bytes that arrive with no reader still queue.
+    fn submit_read(&mut self) {
+        if self.read.is_none() {
+            let op = IoOp {
+                opcode: IO_OPCODE_READ,
+                flags: 0,
+                buffer: self.buf.raw().0,
+                buf_offset: 0,
+                offset: 0,
+                length: READ_CHUNK,
+            };
+            self.read = Op::submit(self.console.raw(), &op).ok();
+        }
+    }
+
+    /// The serve loop: the forwarding endpoint, every open terminal, and one outstanding
+    /// console read, all in one `sys_wait`.
+    fn serve_loop(&mut self) -> ! {
+        log::write(b"tty-server: serving /dev/tty over the console\n");
+        loop {
+            self.submit_read();
+
+            // Rebuilt each turn beside the wait set, so a handle's slot and its meaning cannot drift.
+            let mut names = [Waited::Resolve; MAX_WAIT_HANDLES];
+            let signalled = {
+                let mut set = WaitSet::new();
+                watch(&mut set, &mut names, &self.serve_end, Waited::Resolve);
+                if let Some(c) = &self.control {
+                    watch(&mut set, &mut names, c, Waited::Control);
+                }
+                for k in self.reg.channels() {
+                    if let Some(h) = self.links.ttys.get(&k) {
+                        watch(&mut set, &mut names, h, Waited::Tty(k));
+                    }
+                }
+                for k in self.reg.backend_channels() {
+                    if let (Some(h), Some(id)) = (self.links.backends.get(&k), self.reg.backend_of_channel(k)) {
+                        watch(&mut set, &mut names, h, Waited::Backend(k, id));
+                    }
+                }
+                if let Some(read) = &self.read
+                    && let Ok(i) = set.add_op(read)
+                {
+                    names[i] = Waited::Read;
+                }
+                set.wait(Deadline::NEVER)
+            };
+            let Ok(signalled) = signalled else { continue };
+
+            for (i, _) in signalled.iter() {
+                match names[i] {
+                    Waited::Resolve => self.drain_resolves(),
+                    Waited::Control => {
+                        // Every terminal ends with this process; its programs' next read or write
+                        // finds the channel closed.
+                        if control::recv(&mut self.control) == Control::Op(CTRL_OP_SHUTDOWN) {
+                            log::write(b"tty-server: asked to stop, exiting\n");
+                            libos::exit(0);
+                        }
+                    }
+                    Waited::Read => {
+                        let Some(done) = self.read.as_mut().and_then(|op| op.completion_in(&signalled)) else {
+                            continue;
+                        };
+                        // Consumed; the next iteration submits another.
+                        self.read = None;
+                        let n = done.map_or(0, |r| r.result.min(READ_CHUNK)) as usize;
+                        let mut bytes = vec![0u8; n];
+                        let _ = self.map.read_into(0, &mut bytes);
+                        let acts = self.reg.feed(CONSOLE, &bytes);
+                        self.links.perform(&acts);
+                    }
+                    Waited::Tty(k) => {
+                        if self.links.ttys.contains_key(&k) && !self.serve_tty(k) {
+                            self.free_tty(k);
+                        }
+                    }
+                    Waited::Backend(k, id) => {
+                        if self.links.backends.contains_key(&k) && !self.serve_backend(id, k) {
+                            // The emulator is gone, so every terminal on its backend ends: leaving one alive
+                            // would give its programs a `/dev/tty` that silently discards everything
+                            // written to it, which looks like a hang.
+                            log::write(b"tty-server: a backend went away\n");
+                            for ch in self.reg.ttys_on(id) {
+                                self.free_tty(ch);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -723,45 +531,57 @@ fn drain_resolves(serve_end: u64, reg: &mut Registry) {
 /// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited root
 /// namespace (resolves `/dev/console`), `rdx` = its supervisor's control endpoint, `rcx` unused.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
-    kprint(b"tty-server: up\n");
+pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, control, arg0) };
+    log::write(b"tty-server: up\n");
+    let control: Option<Endpoint> = start.take_handle0();
 
     // The raw device is held **exclusively** from here on: a session gets `/dev/tty` and not
     // `/dev/console`, so it cannot reach the device at all.
-    let console = ns_lookup(root_ns, b"/dev/console", RIGHT_READ);
-    if console == 0 {
-        kprint(b"tty-server: /dev/console not found\n");
-        exit(1);
-    }
+    let console = start
+        .root
+        .as_ref()
+        .and_then(|root| block_on(root.lookup::<Resource, ReadOnly>("/dev/console", Rights::READ)).ok());
+    let Some(console) = console else {
+        log::write(b"tty-server: /dev/console not found\n");
+        libos::exit(1);
+    };
 
     // One page, mapped once, for every console read.
-    // SAFETY: a register-only syscall creating an anonymous page object
-    let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
-    if buf_h < 0 {
-        kprint(b"tty-server: read buffer FAIL\n");
-        exit(1);
-    }
-    let buf_h = buf_h as u64;
-    // SAFETY: mapping the page object just created; the mapping is only read through volatile loads below
-    let buf_addr = unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if buf_addr < 0 {
-        kprint(b"tty-server: read buffer map FAIL\n");
-        exit(1);
-    }
-
-    let Some((kernel_end, serve_end)) = make_channel() else {
-        kprint(b"tty-server: channel create FAIL\n");
-        exit(1);
+    let Ok(buf) = Handle::<Memory, MapReadWrite>::create(4096) else {
+        log::write(b"tty-server: read buffer FAIL\n");
+        libos::exit(1);
     };
-    if !send_ready(control, kernel_end) {
-        kprint(b"tty-server: Ready send FAIL\n");
-        exit(1);
+    let Ok(map) = buf.map(4096) else {
+        log::write(b"tty-server: read buffer map FAIL\n");
+        libos::exit(1);
+    };
+
+    let Ok((kernel_end, serve_end)) = Handle::pair(4) else {
+        log::write(b"tty-server: channel create FAIL\n");
+        libos::exit(1);
+    };
+    if !control.as_ref().is_some_and(|c| server::ready(c, b"tty-server", kernel_end)) {
+        log::write(b"tty-server: Ready send FAIL\n");
+        libos::exit(1);
     }
-    serve_loop(serve_end, console, buf_h, buf_addr as u64, control);
+    let mut srv = Server {
+        read: None,
+        reg: Registry::new(),
+        tokens: Tokens::new(),
+        links: Links { ttys: BTreeMap::new(), backends: BTreeMap::new() },
+        serve_end,
+        control,
+        console,
+        map,
+        buf,
+    };
+    srv.serve_loop();
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"tty-server: PANIC\n");
-    exit(1);
+    log::write(b"tty-server: PANIC\n");
+    libos::exit(1);
 }
