@@ -1,6 +1,6 @@
 //! The transport and the setup message, through libos's model of the kernel.
 
-use crate::channel::{ChannelReceiver, ChannelSink, IpcPort, MsgPort};
+use crate::channel::{ChannelReceiver, ChannelSink, IpcPort, IpcPortRef, MsgPort};
 use crate::setup::{
     STREAM_STDIN, StageStreams, Streams, bootstrap, bootstrap_arg0, open_pipe, pipe, receive_setup, send_setup_full,
     send_stage_setup,
@@ -57,6 +57,21 @@ fn a_port_closes_the_endpoint_it_owns_and_not_one_it_borrows() {
     drop(port);
     assert!(mock::is_open(raw), "the caller's endpoint stays open");
     assert_eq!(mock::stray_closes(), 0);
+}
+
+#[test]
+fn a_lent_port_frames_as_an_owning_one_and_closes_nothing() {
+    mock::reset();
+    let (a, b) = pair();
+    let mut sink = ChannelSink::new(IpcPortRef::new(&a), 5);
+    crate::wire::ByteSink::put(&mut sink, b"twelve bytes").unwrap();
+    sink.finish().unwrap();
+    drop(sink);
+    assert_eq!(ChannelReceiver::new(IpcPortRef::new(&b)).receive(usize::MAX).unwrap(), b"twelve bytes");
+    assert!(mock::is_open(a.raw().0) && mock::is_open(b.raw().0), "both ends still their owners'");
+    IpcPortRef::new(&a).send(b"more", false).unwrap();
+    drop(b);
+    assert_eq!(IpcPortRef::new(&a).send(b"gone", false), Err(WireError::PeerClosed));
 }
 
 #[test]

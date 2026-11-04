@@ -11,17 +11,14 @@
 //! spawns it *without* a shell. A Tier-0 stage has no `argv` and no streams, so it can only
 //! run its argument-free default.
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use libkern::KError;
 use libkern::abi::KIND_TERMINATE_REQUESTED;
 use libos::boot::Start;
 use libos::log;
-use libos::{Carried, Channel, Deadline, Handle, Msg, Namespace, Notify, NsReadOnly, Only, Ref, WaitSet, block_on};
+use libos::{Channel, Deadline, Handle, Namespace, Notify, NsReadOnly, Only};
 use libstream::channel::MsgPort;
 use libstream::setup::{StageStreams, receive_setup, setup_is_pending};
-use libstream::wire::WireError;
 
 /// The program did its job. (`i32` — the width `libos::exit` takes.)
 pub const EXIT_OK: i32 = 0;
@@ -30,55 +27,8 @@ pub const EXIT_FAILURE: i32 = 1;
 /// The program was invoked wrongly (bad flag, missing operand).
 pub const EXIT_USAGE: i32 = 2;
 
-/// The transport flag in the IPC header that marks the final message of a stream.
-const MSG_FLAG_LAST: u16 = 1 << 0;
-
-/// A [`MsgPort`] over a stream endpoint the [`Stage`] keeps: it closes nothing, and the stage's
-/// streams stay open to its exit, as a port that owned the endpoint would not leave them.
-pub struct Port<'a> {
-    end: Ref<'a, Channel, Only>,
-    msg: Box<Msg>,
-}
-
-impl<'a> Port<'a> {
-    /// A port on `end`, borrowed.
-    pub fn new(end: Ref<'a, Channel, Only>) -> Self {
-        Port { end, msg: Box::new(Msg::new()) }
-    }
-}
-
-fn transport(e: libos::Error) -> WireError {
-    match e.code() {
-        KError::PeerClosed => WireError::PeerClosed,
-        _ => WireError::SinkFull,
-    }
-}
-
-impl MsgPort for Port<'_> {
-    fn send(&mut self, payload: &[u8], last: bool) -> libstream::wire::Result<()> {
-        self.msg.set(payload).map_err(|_| WireError::SinkFull)?;
-        self.msg.set_flags(if last { MSG_FLAG_LAST } else { 0 });
-        let op = self.end.send_held(&self.msg, &mut Carried::new()).map_err(transport)?;
-        block_on(op).map(|_| ()).map_err(transport)
-    }
-
-    fn recv(&mut self, out: &mut Vec<u8>) -> libstream::wire::Result<bool> {
-        loop {
-            match self.end.recv(&mut self.msg) {
-                // Whatever handles the message brought close as they drop: a frame carries none.
-                Ok(_) => break,
-                Err(e) if e.code() == KError::WouldBlock => {
-                    let mut set = WaitSet::<1>::new();
-                    set.add(self.end).map_err(|_| WireError::PeerClosed)?;
-                    set.wait(Deadline::NEVER).map_err(|_| WireError::PeerClosed)?;
-                }
-                Err(e) => return Err(transport(e)),
-            }
-        }
-        out.extend_from_slice(self.msg.payload());
-        Ok(self.msg.flags() & MSG_FLAG_LAST != 0)
-    }
-}
+/// A stage's stream, lent: a port that closes nothing, so the stage's streams stay open to its exit.
+pub use libstream::channel::IpcPortRef as Port;
 
 /// Everything a coreutil receives at startup.
 pub struct Stage {

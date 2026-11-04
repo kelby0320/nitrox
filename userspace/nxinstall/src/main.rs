@@ -47,7 +47,7 @@ use libos::{
     Carried, Channel, Deadline, Handle, MapRead, Memory, Msg, Namespace, NsReadOnly, Only, Op, ReadWrite, Ref,
     Resource, block_on, entropy, log, time,
 };
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::{ChannelSink, IpcPort, IpcPortRef, MsgPort};
 use libstream::diag::Level;
 use libstream::setup::{receive_setup, setup_is_pending};
 use libstream::table::TableWriter;
@@ -563,19 +563,6 @@ fn log(line: &str) {
     log::write(&bytes);
 }
 
-/// Send `payload` as one message, waiting for room; `false` if it does not fit one or the peer
-/// has gone.
-fn send_message(endpoint: &Endpoint, payload: &[u8]) -> bool {
-    let mut msg = Msg::new();
-    if msg.set(payload).is_err() {
-        return false;
-    }
-    match endpoint.send_held(&msg, &mut Carried::new()) {
-        Ok(op) => block_on(op).is_ok(),
-        Err(_) => false,
-    }
-}
-
 /// Write one line to `stderr` at `level`, or to the kernel log when there is none. Each line is
 /// its own message, since `stderr` is shared between pipeline stages; only an error-level line is
 /// drawn as a refusal.
@@ -584,7 +571,7 @@ fn say_to(stderr: Option<&Endpoint>, level: Level, line: &str) {
     bytes.push(b'\n');
     match stderr {
         Some(endpoint) => {
-            if !send_message(endpoint, &libstream::diag::frame(level, &bytes)) {
+            if IpcPortRef::new(endpoint).send(&libstream::diag::frame(level, &bytes), false).is_err() {
                 log::write(&bytes);
             }
         }
