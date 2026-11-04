@@ -13,7 +13,6 @@
 "userspace/hello" = 58
 "userspace/input-server" = 56
 "userspace/libheap" = 5
-"userspace/logging-service" = 10
 "userspace/nxedit" = 61
 "userspace/nxfiles" = 61
 "userspace/nxinstall" = 17
