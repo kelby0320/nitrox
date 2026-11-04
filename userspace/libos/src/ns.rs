@@ -7,6 +7,7 @@ use crate::error::{Error, Result, check};
 use crate::exec::Op;
 use crate::handle::{CanBind, CanLookup, Channel, Handle, Namespace, NsMutable, Only, Ref, both};
 use crate::sys;
+use crate::wait::Signalled;
 
 impl Handle<Namespace, NsMutable> {
     /// A new, empty namespace, with every right a namespace has.
@@ -23,6 +24,13 @@ both!([M: CanLookup] Namespace, M {
         let po = check(sys::ns_lookup(self.raw().0, path.as_bytes(), rights.bits()))?;
         let done = Op::from_po(po).await?;
         Ok(Handle::fresh(done.result, rights))
+    }
+
+    /// Resolve `path` as [`lookup`](Self::lookup) does, without waiting here: for a caller that
+    /// answers other handles while it resolves, and adds the [`Lookup`]'s operation to its wait.
+    pub fn start_lookup<T, M2>(&self, path: &str, rights: Rights) -> Result<Lookup<T, M2>> {
+        let po = check(sys::ns_lookup(self.raw().0, path.as_bytes(), rights.bits()))?;
+        Ok(Lookup { op: Op::from_po(po), rights, _t: core::marker::PhantomData })
     }
 
     /// A new namespace holding a copy of every binding here, with every right a namespace has.
@@ -68,6 +76,27 @@ both!([M: CanBind] Namespace, M {
         check(sys::ns_unbind(self.raw().0, path.as_bytes())).map(|_| ())
     }
 });
+
+/// A lookup in flight: its operation to add to a [`WaitSet`](crate::WaitSet), and the handle it
+/// resolves to once a wait on that set finds it. Dropped unfinished, it closes what it resolved.
+pub struct Lookup<T, M> {
+    op: Op,
+    rights: Rights,
+    _t: core::marker::PhantomData<(T, M)>,
+}
+
+impl<T, M> Lookup<T, M> {
+    /// The operation, for [`WaitSet::add_op`](crate::WaitSet::add_op).
+    pub fn op(&self) -> &Op {
+        &self.op
+    }
+
+    /// The handle, or why the lookup failed, if `signalled` found it; `None` while in flight.
+    pub fn completion_in<const N: usize>(&mut self, signalled: &Signalled<N>) -> Option<Result<Handle<T, M>>> {
+        let done = self.op.completion_in(signalled)?;
+        Some(done.map(|r| Handle::fresh(r.result, self.rights)))
+    }
+}
 
 /// A namespace's bindings, one call each, borrowed from its handle.
 pub struct Bindings<'a> {
@@ -130,6 +159,50 @@ mod tests {
             block_on(ns.lookup::<Memory, MapRead>("m", Rights::MAP_READ)).err().unwrap().code(),
             KError::InvalidArgument
         );
+    }
+
+    #[test]
+    fn a_lookup_started_is_taken_from_a_wait_beside_other_handles() {
+        sys::reset();
+        // SAFETY: the mock's namespace, open for the test.
+        let ns =
+            unsafe { Ref::<Namespace, NsReadOnly>::from_raw(libkern::RawHandle(sys::served("/srv")), Rights::empty()) };
+        let (a, _a2) = Handle::<Channel, Only>::pair(4).unwrap();
+        let mut lookup = ns.start_lookup::<Memory, MapRead>("/srv/x", Rights::MAP_READ).unwrap();
+        fn wait<T, M>(a: &Handle<Channel, Only>, l: &Lookup<T, M>, deadline: crate::Deadline) -> Signalled<2> {
+            let mut set = crate::WaitSet::<2>::new();
+            set.add(a).unwrap();
+            set.add_op(l.op()).unwrap();
+            set.wait(deadline).unwrap()
+        }
+        let s = wait(&a, &lookup, crate::Deadline::POLL);
+        assert!(lookup.completion_in(&s).is_none(), "in flight: the server has not answered");
+        let s = wait(&a, &lookup, crate::Deadline::at(1));
+        let got = lookup.completion_in(&s).unwrap().unwrap();
+        assert!(got.map(4096).is_ok(), "the server's answer, the caller's");
+        let open = sys::open_handles();
+        drop(lookup);
+        assert_eq!(sys::open_handles(), open - 1, "the PO closes, and the handle taken stays");
+        assert!(sys::is_open(got.raw().0));
+    }
+
+    #[test]
+    fn a_lookup_a_wait_read_and_nobody_took_closes_its_handle() {
+        sys::reset();
+        // SAFETY: the mock's namespace, open for the test.
+        let ns =
+            unsafe { Ref::<Namespace, NsReadOnly>::from_raw(libkern::RawHandle(sys::served("/srv")), Rights::empty()) };
+        let none = sys::open_handles();
+        let lookup = ns.start_lookup::<Memory, MapRead>("/srv/x", Rights::MAP_READ).unwrap();
+        let read = {
+            let mut set = crate::WaitSet::<1>::new();
+            set.add_op(lookup.op()).unwrap();
+            set.wait(crate::Deadline::at(1)).unwrap().len()
+        };
+        assert_eq!(read, 1, "read, so installed");
+        drop(lookup);
+        assert_eq!(sys::open_handles(), none, "neither the PO nor what it resolved left open");
+        assert_eq!(sys::stray_closes(), 0);
     }
 
     #[test]
