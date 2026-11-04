@@ -46,6 +46,14 @@ fn send_with(
     ch.send(&msg, handles)
 }
 
+/// Send `Meta::Ready` on `control` as `name`, moving `endpoint`, the end its supervisor binds. A
+/// send that fails closes `endpoint`. NoBlock: a control channel's ring starts empty.
+pub fn ready<'c>(control: impl Into<Ref<'c, Channel, Only>>, name: &[u8], endpoint: Handle<Channel, Only>) -> bool {
+    let mut carried = Carried::new();
+    carried.push(endpoint).is_ok()
+        && send_with(control.into(), crate::OP_READY, 0, 0, &mut carried, |room| crate::meta::ready(room, name)).is_ok()
+}
+
 /// Answer request `op` with an error: `err`, and `why` if it fits, cut to fit if it does not.
 pub fn reply_error<'e>(
     ch: impl Into<Ref<'e, Channel, Only>>,
@@ -246,6 +254,35 @@ mod tests {
         msg.set(b"hi").unwrap();
         moved.send(&msg, &mut Carried::new()).unwrap();
         assert_eq!(far.recv(&mut Msg::new()).map(drop).ok(), Some(()), "the handle that arrived is the one sent");
+    }
+
+    #[test]
+    fn a_ready_names_its_server_and_moves_its_endpoint() {
+        let (control, supervisor) = pair();
+        let (endpoint, far) = Handle::<Channel, Only>::pair(2).unwrap();
+        assert!(ready(&control, b"clipboard-server", endpoint));
+        let mut got = read(&supervisor);
+        assert_eq!((got.op, got.request_id, got.flags, got.handle_count), (crate::OP_READY, 0, 0, 1));
+        assert_eq!(crate::meta::parse_ready(&got.body), Some(&b"clipboard-server"[..]));
+        let moved: Handle<Channel, Only> = got.handles.take(0).unwrap();
+        moved.send(&Msg::new(), &mut Carried::new()).unwrap();
+        assert!(far.recv(&mut Msg::new()).is_ok(), "the endpoint that arrived is the one sent");
+    }
+
+    #[test]
+    fn a_ready_that_cannot_go_closes_its_endpoint() {
+        let (control, supervisor) = pair();
+        let (endpoint, _far) = Handle::<Channel, Only>::pair(2).unwrap();
+        let held = endpoint.raw().0;
+        mock::fail_next_send(KError::WouldBlock.as_i32());
+        assert!(!ready(&control, b"clipboard-server", endpoint));
+        assert!(!mock::is_open(held) && nothing_queued(&supervisor));
+        let (endpoint, _far) = Handle::<Channel, Only>::pair(2).unwrap();
+        let held = endpoint.raw().0;
+        let long = [b'n'; RS_MAX_PAYLOAD];
+        assert!(!ready(&control, &long, endpoint), "a name no message holds");
+        assert!(!mock::is_open(held) && nothing_queued(&supervisor));
+        assert_eq!(mock::stray_closes(), 0);
     }
 
     #[test]
