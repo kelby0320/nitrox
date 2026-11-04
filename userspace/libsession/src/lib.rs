@@ -22,10 +22,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use libkern::{KError, KIND_TERMINATE_REQUESTED, RawHandle, Rights};
 use libos::{CanLookup, Handle, Namespace, Notify, NsReadOnly, Only, ReadOnly, Ref, Resource, block_on};
 
-pub use auth::{
-    authenticate, authenticate_on, close_views_session, open_views_session, views_close_session, views_open_session,
-};
-pub use blocks::{rebind_block_devices_except, share_block_devices, unbind_block_devices, withdraw_block_devices};
+pub use auth::{authenticate, authenticate_on, close_views_session, open_views_session, views_open_session};
+pub use blocks::{share_block_devices, withdraw_block_devices};
 pub use leader::{run_leader, spawn_leader};
 pub use namespace::{Bound, Built, Constructed, Members, NamespaceSpec, build, build_namespace};
 
@@ -51,14 +49,6 @@ pub fn drain_stop_requests<'a>(notif: impl Into<Ref<'a, Notify, Only>>) -> bool 
         }
     }
     stop_asked()
-}
-
-/// [`drain_stop_requests`] on a raw `notif` the caller keeps open. For callers not yet on libos;
-/// the typed form is [`drain_stop_requests`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn drain_for_stop(notif: u64) -> bool {
-    // SAFETY: the caller's own queue, open for the call, as the function always asked.
-    drain_stop_requests(unsafe { Ref::<Notify, Only>::from_raw(RawHandle(notif), Rights::empty()) })
 }
 
 /// Resolve `path` in `ns` with `rights`, waiting the PO.

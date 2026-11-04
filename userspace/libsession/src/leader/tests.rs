@@ -1,6 +1,6 @@
 use super::*;
 use crate::testing::{endpoint, lookup_only, stop_flag};
-use crate::{drain_for_stop, drain_stop_requests, stop_asked};
+use crate::{drain_stop_requests, stop_asked};
 use libkern::KIND_CHILD_EXITED;
 use libos::{MapReadWrite, Memory, NsMutable, NsReadOnly, mock};
 use std::string::String;
@@ -208,14 +208,4 @@ fn a_drain_between_sessions_finds_a_stop() {
     assert!(drain_stop_requests(&stop));
     assert!(stop_asked());
     assert!(stop.recv().unwrap().is_none(), "drained to the end");
-}
-
-/// The raw drain reads the caller's queue and leaves it open.
-#[test]
-fn the_raw_drain_leaves_the_queue_open() {
-    let _flag = stop_flag();
-    mock::reset();
-    let raw = mock::notify(&[note(KIND_TERMINATE_REQUESTED, 0)]);
-    assert!(drain_for_stop(raw));
-    assert!(mock::is_open(raw));
 }

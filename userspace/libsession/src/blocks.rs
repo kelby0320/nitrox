@@ -2,9 +2,9 @@
 
 use crate::resolve;
 use alloc::vec::Vec;
+use libkern::Rights;
 use libkern::abi::NS_ENTRY_PATH_MAX;
-use libkern::{RawHandle, Rights};
-use libos::{CanLookup, MapRead, Memory, Namespace, NsMutable, NsReadOnly, ReadWrite, Ref, Resource, log};
+use libos::{CanLookup, MapRead, Memory, Namespace, NsMutable, ReadWrite, Ref, Resource, log};
 
 /// **Hand every block device `from`'s registry lists to `to`, except those whose registry ids are
 /// in `withheld`**, each with its `info` snapshot; returns how many were bound. The view broker's
@@ -48,13 +48,6 @@ pub fn share_block_devices<'a, 'b, M: CanLookup + 'a>(
     bound
 }
 
-/// [`share_block_devices`] between raw namespaces the caller keeps open. For callers not yet on
-/// libos; the typed form is [`share_block_devices`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -> usize {
-    share_block_devices(namespace::<NsReadOnly>(from_ns), namespace::<NsMutable>(to_ns), withheld)
-}
-
 /// Take back what [`share_block_devices`] bound into `ns`; returns how many devices were unbound.
 /// A handle a program already holds is not taken back — the kernel has no revocation. **What is
 /// bound is read from `ns` itself**, not a fixed range, which could miss a disk.
@@ -70,18 +63,6 @@ pub fn withdraw_block_devices<'a>(ns: impl Into<Ref<'a, Namespace, NsMutable>>) 
         }
     }
     unbound
-}
-
-/// [`withdraw_block_devices`] in a raw `ns` the caller keeps open. For callers not yet on libos; the
-/// typed form is [`withdraw_block_devices`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn unbind_block_devices(ns: u64) -> usize {
-    withdraw_block_devices(namespace::<NsMutable>(ns))
-}
-
-fn namespace<'a, M>(raw: u64) -> Ref<'a, Namespace, M> {
-    // SAFETY: the caller's own namespace, open for the call, as the function always asked.
-    unsafe { Ref::from_raw(RawHandle(raw), Rights::empty()) }
 }
 
 /// The `/dev/blk/<n>` indices `ns` can reach, less `withheld` registry ids. **From the registry**:
