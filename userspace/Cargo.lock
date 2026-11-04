@@ -519,11 +519,11 @@ version = "0.1.0"
 dependencies = [
  "fs-server-ext4",
  "fs-server-fat",
- "libfs",
  "libgpt",
  "libheap",
  "libinittoml",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
 ]
