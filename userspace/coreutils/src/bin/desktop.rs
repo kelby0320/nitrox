@@ -22,9 +22,10 @@ extern crate alloc;
 use alloc::string::String;
 
 use coreutils::args::parse;
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use libkern::debug::Line;
-use libkern::{exit, kprint};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Msg, exit};
 use librsproto::desktop::{Desktop, DesktopError};
 
 #[global_allocator]
@@ -44,8 +45,10 @@ const HELP: &[u8] = b"usage: desktop [switch N | name N LABEL]\n\
 const VERSION: &[u8] = b"desktop (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
     let args = match parse(&stage.argv, &[]) {
         Ok(a) => a,
         Err(_) => stage.die(b"desktop: unrecognized option (try --help)\n", EXIT_USAGE),
@@ -60,10 +63,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     // **Every diagnostic here goes to the debug console as well as to the stage**: a windowed
     // terminal's grid renders under `test-harness` only, so on the release image `check-login`
     // boots, the stage's output is invisible. `check-login` matches `desktop: running`.
-    kprint(b"desktop: running\n");
-    let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-    let Ok(mut desktop) = Desktop::connect(ns, &mut buf) else {
-        kprint(b"desktop: /dev/desktop did not resolve\n");
+    log::write(b"desktop: running\n");
+    let mut msg = Msg::new();
+    let Ok(mut desktop) = Desktop::resolve(&stage.namespace, &mut msg) else {
+        log::write(b"desktop: /dev/desktop did not resolve\n");
         stage.die(b"desktop: no /dev/desktop in this namespace -- not a graphical session\n", EXIT_FAILURE);
     };
 
@@ -90,7 +93,7 @@ fn parse_index(s: &str) -> Option<u32> {
     (n >= 1).then_some(n)
 }
 
-fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
+fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i32 {
     use librsproto::desktop::{DesktopList, OP_DESKTOP_LIST};
     let mut out = alloc::vec![0u8; 1024];
     let n = match desktop.request(OP_DESKTOP_LIST, &[], &mut out) {
@@ -103,9 +106,9 @@ fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
     };
     // **A `Table` on stdout, with text only when there is no stdout**: stderr is a shared
     // diagnostic sink, not a pipe, so `desktop | sort name` needs the table on stdout.
-    let sink: &[u8] = match stage.streams.stdout {
-        Some(h) => {
-            emit(stage, h, &list);
+    let sink: &[u8] = match stage.stdout() {
+        Some(port) => {
+            emit(stage, port, &list);
             b"table"
         }
         None => {
@@ -138,9 +141,9 @@ fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
 
 /// Emit the listing as `Table<{position: Int, id: Int, name: String, current: Bool}>`; `current`
 /// is a column rather than a marker so a pipeline can filter on it.
-fn emit(stage: &Stage, stdout: u64, list: &librsproto::desktop::DesktopList<'_>) {
+fn emit(stage: &Stage, stdout: Port<'_>, list: &librsproto::desktop::DesktopList<'_>) {
     use libkern::abi::IPC_PAYLOAD_SIZE;
-    use libstream::channel::{ChannelSink, IpcPort};
+    use libstream::channel::ChannelSink;
     use libstream::table::TableWriter;
     use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -149,7 +152,7 @@ fn emit(stage: &Stage, stdout: u64, list: &librsproto::desktop::DesktopList<'_>)
         .field("id", TypeTag::Int, TypeModifiers::NONE)
         .field("name", TypeTag::String, TypeModifiers::NONE)
         .field("current", TypeTag::Bool, TypeModifiers::NONE);
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for (i, e) in list.entries().enumerate() {
             let pos = (i + 1) as i64;
@@ -170,7 +173,7 @@ fn emit(stage: &Stage, stdout: u64, list: &librsproto::desktop::DesktopList<'_>)
     }
 }
 
-fn switch(stage: &Stage, desktop: &mut Desktop<'_>, index: u32) -> i64 {
+fn switch(stage: &Stage, desktop: &mut Desktop<'_>, index: u32) -> i32 {
     use librsproto::desktop::{DesktopIndex, OP_DESKTOP_SWITCH};
     let mut body = [0u8; 4];
     if (DesktopIndex { index }).write(&mut body).is_none() {
@@ -184,7 +187,7 @@ fn switch(stage: &Stage, desktop: &mut Desktop<'_>, index: u32) -> i64 {
     EXIT_OK
 }
 
-fn name(stage: &Stage, desktop: &mut Desktop<'_>, index: u32, words: &[&str]) -> i64 {
+fn name(stage: &Stage, desktop: &mut Desktop<'_>, index: u32, words: &[&str]) -> i32 {
     use librsproto::desktop::{DesktopIndex, MAX_DESKTOP_NAME, OP_DESKTOP_NAME};
     let mut label = String::new();
     for (i, w) in words.iter().enumerate() {
@@ -213,7 +216,7 @@ fn name(stage: &Stage, desktop: &mut Desktop<'_>, index: u32, words: &[&str]) ->
 /// Report a failed request and return its exit status. `verb` completes
 /// "desktop: could not <verb>". Only `InvalidArgument`, which the shell sends for a position
 /// that does not exist, names the operand; any other refusal gets its code printed.
-fn fail(stage: &Stage, verb: &[u8], e: DesktopError) -> i64 {
+fn fail(stage: &Stage, verb: &[u8], e: DesktopError) -> i32 {
     let mut text = String::from("desktop: ");
     match e {
         DesktopError::Refused(Some(c)) if c == libkern::error::KError::InvalidArgument.as_i32() => {
@@ -238,7 +241,7 @@ fn fail(stage: &Stage, verb: &[u8], e: DesktopError) -> i64 {
         }
     }
     stage.diag(text.as_bytes());
-    kprint(text.as_bytes());
+    log::write(text.as_bytes());
     EXIT_FAILURE
 }
 
@@ -262,6 +265,6 @@ fn push_num(s: &mut String, mut n: u32) {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"desktop: panic\n");
+    log::write(b"desktop: panic\n");
     exit(EXIT_FAILURE)
 }

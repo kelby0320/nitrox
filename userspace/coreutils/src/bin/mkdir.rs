@@ -23,13 +23,15 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libfs::TreeError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::log;
+use libos::{Msg, exit};
 use librsproto::session::{Dir, DirError};
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -56,8 +58,10 @@ struct Made {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[PARENTS]) {
         Ok(a) => a,
@@ -82,11 +86,11 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             stage.die(b"mkdir: empty path\n", EXIT_USAGE);
         }
         let created = if parents { make_parents(&stage, path) } else { make_one(&stage, path) };
-        made.push(Made { path: String::from_utf8_lossy(path).into_owned(), created });
+        made.push(Made { path: String::from(path), created });
     }
 
-    match stage.streams.stdout {
-        Some(h) => emit(&stage, h, &made),
+    match stage.stdout() {
+        Some(port) => emit(&stage, port, &made),
         None => {
             for m in &made {
                 report_text(m);
@@ -96,13 +100,13 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(EXIT_OK)
 }
 
-fn make_one(stage: &Stage, path: &[u8]) -> bool {
-    // Checked here as well as in `libfs::mkdir`: this exits with a *usage* status and a
+fn make_one(stage: &Stage, path: &str) -> bool {
+    // Checked here as well as in `libfs::make_dir`: this exits with a *usage* status and a
     // sentence about the root, where the library has only an error to return.
-    if libfs::basename(path).is_empty() {
+    if libfs::basename_str(path).is_empty() {
         stage.die(b"mkdir: cannot create the root directory\n", EXIT_USAGE);
     }
-    match libfs::mkdir(stage.namespace, path) {
+    match libfs::make_dir(&stage.namespace, path) {
         Ok(()) => true,
         // The server says the name is taken, so no confirming round trip is needed.
         Err(TreeError::MakeDir(k)) if k == KError::AlreadyExists.as_i32() => {
@@ -119,29 +123,29 @@ fn is_already_exists(e: &DirError) -> bool {
 
 /// Create `path` and any missing components above it; whether the **leaf** was created by this
 /// run. Diverges on failure.
-fn make_parents(stage: &Stage, path: &[u8]) -> bool {
+fn make_parents(stage: &Stage, path: &str) -> bool {
     // Walk the prefixes shortest-first and try to create each one; `AlreadyExists` is the
     // ordinary answer for the upper prefixes, and only then is the occupant's kind probed.
     let mut created_leaf = false;
-    for end in component_ends(path) {
+    for end in component_ends(path.as_bytes()) {
         let prefix = &path[..end];
-        let parent = libfs::parent(prefix);
-        let name = libfs::basename(prefix);
+        let parent = core::str::from_utf8(libfs::parent(prefix.as_bytes())).unwrap_or(prefix);
+        let name = libfs::basename_str(prefix);
         if name.is_empty() {
             continue;
         }
-        let mut buf = [0u8; 4096];
-        let mut dir = match Dir::open(stage.namespace, parent, &mut buf) {
+        let mut msg = Msg::new();
+        let mut dir = match Dir::resolve(&stage.namespace, parent, &mut msg) {
             Ok(d) => d,
             Err(_) => stage.die(b"mkdir: cannot open a parent directory\n", EXIT_FAILURE),
         };
-        let r = dir.mkdir(name);
+        let r = dir.mkdir(name.as_bytes());
         dir.close();
         created_leaf = match r {
             Ok(()) => true,
             Err(e) if is_already_exists(&e) => {
                 // A file wearing the name does not satisfy "exists as a directory".
-                if !libfs::is_dir(stage.namespace, prefix) {
+                if !libfs::is_directory(&stage.namespace, prefix) {
                     stage.die(b"mkdir: path exists and is not a directory\n", EXIT_FAILURE);
                 }
                 false
@@ -177,22 +181,22 @@ fn component_ends(path: &[u8]) -> Vec<usize> {
 
 /// Drop trailing slashes so `mkdir /a/b/` names the same directory as `mkdir /a/b`.
 /// A path that is only slashes trims to `/`, which the caller rejects as the root.
-fn trim_trailing_slashes(path: &[u8]) -> &[u8] {
+fn trim_trailing_slashes(path: &str) -> &str {
     let mut end = path.len();
-    while end > 1 && path[end - 1] == b'/' {
+    while end > 1 && path.as_bytes()[end - 1] == b'/' {
         end -= 1;
     }
     &path[..end]
 }
 
-fn emit(stage: &Stage, stdout: u64, made: &[Made]) {
+fn emit(stage: &Stage, stdout: Port<'_>, made: &[Made]) {
     let schema = Schema::new().field("path", TypeTag::String, TypeModifiers::NONE).field(
         "created",
         TypeTag::Bool,
         TypeModifiers::NONE,
     );
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for m in made {
             tw.write_row(&[Value::Str(m.path.clone()), Value::Bool(m.created)])?;
@@ -213,11 +217,11 @@ fn report_text(m: &Made) {
     let mut line = String::from(if m.created { "created " } else { "exists " });
     line.push_str(&m.path);
     line.push('\n');
-    kprint(line.as_bytes());
+    log::write(line.as_bytes());
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"mkdir: panic\n");
+    log::write(b"mkdir: panic\n");
     exit(EXIT_FAILURE)
 }

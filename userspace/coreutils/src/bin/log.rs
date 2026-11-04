@@ -30,12 +30,15 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use libkern::Rights;
+use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::log;
+use libos::{Channel, Handle, Msg, Only, block_on, exit};
 use librsproto::log::{OP_LOG_READ, ReadRecord, dropped, level_name, parse_read_reply, read_request, tier_name};
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -43,9 +46,9 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Where the `logs` grant binds the logging service's read endpoint.
-const LOGS: &[u8] = b"/dev/logs";
+const LOGS: &str = "/dev/logs";
 /// Where the `kernel-log` grant binds a snapshot of the kernel's log.
-const KERNEL_LOG: &[u8] = b"/dev/log";
+const KERNEL_LOG: &str = "/dev/log";
 
 const FLAGS: &[Flag] = &[Flag::long_only("kernel", "read the kernel's log instead of the service log")];
 
@@ -69,8 +72,10 @@ const HELP: &[u8] = b"usage: log [PRINCIPAL]\n\
 const VERSION: &[u8] = b"log (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
     let args = match parse(&stage.argv, FLAGS) {
         Ok(a) => a,
         Err(_) => stage.die(b"log: unrecognized option (try --help)\n", EXIT_USAGE),
@@ -92,21 +97,26 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         [p] => Some(p.as_str()),
         _ => stage.die(b"log: takes at most one PRINCIPAL (try --help)\n", EXIT_USAGE),
     };
-    let (st, session) = libfs::lookup_wait(stage.namespace, LOGS, librsproto::session::DIR_SESSION_RIGHTS);
-    if st == KError::NotFound.as_i32() {
-        stage.die(b"log: cannot read the log here -- that needs the logs grant: `with admin log ...`\n", EXIT_FAILURE);
-    }
-    if st == KError::WouldBlock.as_i32() {
-        stage.die(b"log: the log is being read twice already; try again\n", EXIT_FAILURE);
-    }
-    if st != 0 || session == 0 {
-        let why = format!("log: the logging service opened no read session ({:?})\n", KError::from_i32(st));
-        stage.die(why.as_bytes(), EXIT_FAILURE);
-    }
+    let rights = Rights::from_bits(librsproto::session::DIR_SESSION_RIGHTS);
+    let session = match block_on(stage.namespace.lookup::<Channel, Only>(LOGS, rights)) {
+        Ok(session) => session,
+        Err(e) if e.code() == KError::NotFound => {
+            stage.die(
+                b"log: cannot read the log here -- that needs the logs grant: `with admin log ...`\n",
+                EXIT_FAILURE,
+            );
+        }
+        Err(e) if e.code() == KError::WouldBlock => {
+            stage.die(b"log: the log is being read twice already; try again\n", EXIT_FAILURE);
+        }
+        Err(e) => {
+            let why = format!("log: the logging service opened no read session ({:?})\n", e.code());
+            stage.die(why.as_bytes(), EXIT_FAILURE);
+        }
+    };
     let mut out = Out::new(&stage);
-    let code = read(&stage, session, principal, &mut out);
-    // SAFETY: closing the read session this program opened.
-    unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, session) };
+    let code = read(&stage, &session, principal, &mut out);
+    drop(session);
     out.finish(&stage);
     exit(code)
 }
@@ -114,7 +124,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 /// **The kernel's log, a row a line**, from the snapshot the `kernel-log` grant
 /// bound, and exit.
 fn kernel(stage: &Stage) -> ! {
-    let bytes = match libfs::read_file(stage.namespace, KERNEL_LOG) {
+    let bytes = match libfs::read(&stage.namespace, KERNEL_LOG) {
         Ok(b) => b,
         Err(libfs::FileError::NotFound) => stage.die(
             b"log: cannot read the kernel's log here -- that needs the kernel-log grant: `with admin log --kernel`\n",
@@ -140,18 +150,18 @@ fn kernel(stage: &Stage) -> ! {
 /// **Read the ring from the start**, a reply at a time, until a reply holds nothing, writing
 /// `principal`'s records (or every one) to `out`. Each reply must begin after the last one ended,
 /// or a service answering the same records forever would never let this stop.
-fn read(stage: &Stage, session: u64, principal: Option<&str>, out: &mut Out) -> i64 {
-    let mut buf = alloc::vec![0u8; IPC_MSG_SIZE];
+fn read(stage: &Stage, session: &Handle<Channel, Only>, principal: Option<&str>, out: &mut Out) -> i32 {
+    let mut msg = Msg::new();
     let mut after = 0u64;
     let mut request_id = 0u64;
     loop {
         request_id += 1;
         let request = read_request(after, 0);
-        let Ok(len) = librsproto::session::round_trip(session, &mut buf, request_id, OP_LOG_READ, &request) else {
+        let Ok(_) = librsproto::session::exchange(session, &mut msg, request_id, OP_LOG_READ, &request) else {
             stage.diag(b"log: lost the logging service while reading\n");
             return EXIT_FAILURE;
         };
-        let reply = match librsproto::decode(&buf[IPC_HEADER_SIZE..IPC_HEADER_SIZE + len]) {
+        let reply = match librsproto::decode(msg.payload()) {
             Ok(m) if m.op == OP_LOG_READ && m.flags & librsproto::RS_FLAG_ERROR == 0 => parse_read_reply(m.body),
             _ => None,
         };
@@ -185,14 +195,14 @@ fn read(stage: &Stage, session: u64, principal: Option<&str>, out: &mut Out) -> 
     }
 }
 
-enum Out {
-    Table(TableWriter<ChannelSink<IpcPort>>),
+enum Out<'a> {
+    Table(TableWriter<ChannelSink<Port<'a>>>),
     Console,
 }
 
-impl Out {
-    fn new(stage: &Stage) -> Out {
-        let Some(stdout) = stage.streams.stdout else {
+impl<'a> Out<'a> {
+    fn new(stage: &'a Stage) -> Out<'a> {
+        let Some(stdout) = stage.stdout() else {
             return Out::Console;
         };
         let nullable = TypeModifiers::NULLABLE;
@@ -204,7 +214,7 @@ impl Out {
             .field("tier", TypeTag::String, nullable)
             .field("level", TypeTag::String, nullable)
             .field("message", TypeTag::String, TypeModifiers::NONE);
-        let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+        let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
         if tw.write_schema(StreamFlags::NONE, &schema).is_err() {
             stage.die(b"log: write failed\n", EXIT_FAILURE);
         }
@@ -241,7 +251,7 @@ impl Out {
                     level_name(rec.level),
                     lossy(rec.message)
                 );
-                kprint(line.as_bytes());
+                log::write(line.as_bytes());
                 true
             }
         }
@@ -262,7 +272,7 @@ impl Out {
                 tw.write_row(&row).is_ok()
             }
             Out::Console => {
-                kprint(format!("[{sequence}] - kernel: {}\n", lossy(line)).as_bytes());
+                log::write(format!("[{sequence}] - kernel: {}\n", lossy(line)).as_bytes());
                 true
             }
         }
@@ -284,6 +294,6 @@ fn lossy(b: &[u8]) -> String {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"log: panic\n");
+    log::write(b"log: panic\n");
     exit(EXIT_FAILURE)
 }

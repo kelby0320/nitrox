@@ -17,6 +17,7 @@ edition = "2024"
 # `desktop-shell` became a second consumer (M11 Part E batch 9).
 libtime = { path = "../libtime" }
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 libheap = { path = "../libheap" }
 librsproto = { path = "../librsproto", features = ["io"] }
 libfs = { path = "../libfs" }
@@ -37,6 +38,9 @@ libgpt = { path = "../libgpt" }
 fs-server-fat = { path = "../fs-server-fat" }
 fs-server-ext4 = { path = "../fs-server-ext4" }
 libfsserver = { path = "../libfsserver" }
+
+[dev-dependencies]
+libos = { path = "../libos", features = ["mock"] }
 
 [lib]
 name = "coreutils"

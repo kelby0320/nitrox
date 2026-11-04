@@ -4,7 +4,6 @@
 # commit of its own that says why. `[agreed]` names the crates the maintainer agreed may stay
 # on libkern, each with its reason; their counts are still held here.
 [counts]
-"userspace/coreutils" = 153
 "userspace/eshell" = 44
 "userspace/libheap" = 5
 "userspace/test-harness" = 863

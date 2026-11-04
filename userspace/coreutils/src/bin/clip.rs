@@ -29,12 +29,14 @@ use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
-use libkern::{exit, kprint};
+use libkern::abi::IPC_PAYLOAD_SIZE;
+use libos::boot::Start;
+use libos::log;
+use libos::{Msg, exit};
 use librsproto::clipboard::{
     CLIP_ANY_SERIAL, CLIP_KIND_TEXT, CLIP_RING, ClipError, ClipInfo, Clipboard, MAX_CLIP_BYTES,
 };
-use libstream::channel::{ChannelReceiver, ChannelSink, IpcPort};
+use libstream::channel::{ChannelReceiver, ChannelSink};
 use libstream::table::{TableReader, TableWriter, write_text_fallback};
 use libstream::wire::Value;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
@@ -65,8 +67,10 @@ const HELP: &[u8] = b"usage: clip [INDEX]\n\
 const VERSION: &[u8] = b"clip (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[COPY, LIST]) {
         Ok(a) => a,
@@ -93,8 +97,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         },
     };
 
-    let mut buf = [0u8; IPC_MSG_SIZE];
-    let mut clip = match Clipboard::connect(stage.namespace, &mut buf) {
+    let mut msg = Msg::new();
+    let mut clip = match Clipboard::resolve(&stage.namespace, &mut msg) {
         Ok(c) => c,
         // Three causes, and the message says which: a session built without a clipboard, a
         // server that did not start, and a malformed reply are different repairs.
@@ -151,9 +155,9 @@ fn do_paste(stage: &Stage, clip: &mut Clipboard<'_>, index: u32) -> ! {
 
 fn emit_text(stage: &Stage, text: &str) {
     let lines: Vec<&str> = if text.is_empty() { Vec::new() } else { text.split('\n').collect() };
-    match stage.streams.stdout {
-        Some(h) => {
-            let mut sink = ChannelSink::new(IpcPort::new(h), IPC_PAYLOAD_SIZE);
+    match stage.stdout() {
+        Some(port) => {
+            let mut sink = ChannelSink::new(port, IPC_PAYLOAD_SIZE);
             let wrote = write_text_fallback(&mut sink, &lines, 0).and_then(|()| sink.finish());
             match wrote {
                 Ok(()) | Err(libstream::wire::WireError::PeerClosed) => {}
@@ -163,8 +167,8 @@ fn emit_text(stage: &Stage, text: &str) {
         None => {
             // The Tier-0 path — see `TODO(tier0-output-sink)`. The kernel log is scaffolding.
             for line in &lines {
-                kprint(line.as_bytes());
-                kprint(b"\n");
+                log::write(line.as_bytes());
+                log::write(b"\n");
             }
         }
     }
@@ -176,13 +180,13 @@ fn do_list(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
         Ok(t) => t,
         Err(_) => stage.die(b"clip: the clipboard refused the listing\n", EXIT_FAILURE),
     };
-    match stage.streams.stdout {
-        Some(h) => {
+    match stage.stdout() {
+        Some(port) => {
             let schema = Schema::new()
                 .field("index", TypeTag::Int, TypeModifiers::NONE)
                 .field("kind", TypeTag::Int, TypeModifiers::NONE)
                 .field("bytes", TypeTag::Int, TypeModifiers::NONE);
-            let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(h), IPC_PAYLOAD_SIZE));
+            let mut tw = TableWriter::new(ChannelSink::new(port, IPC_PAYLOAD_SIZE));
             let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
                 for (i, r) in rows[..n].iter().enumerate() {
                     tw.write_row(&[Value::Int(i as i64), Value::Int(r.kind as i64), Value::Int(r.len as i64)])?;
@@ -202,7 +206,7 @@ fn do_list(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
                 line.push(' ');
                 push_int(&mut line, r.len as i64);
                 line.push('\n');
-                kprint(line.as_bytes());
+                log::write(line.as_bytes());
             }
         }
     }
@@ -210,12 +214,12 @@ fn do_list(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
 }
 
 fn do_copy(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
-    let Some(stdin) = stage.streams.stdin else {
+    let Some(stdin) = stage.stdin() else {
         // `clip --copy` with nothing upstream would otherwise block forever on a stream that
         // will never arrive.
         stage.die(b"clip: --copy needs something upstream (try `... | clip --copy`)\n", EXIT_USAGE);
     };
-    let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive(MAX_CAPTURE) {
+    let bytes = match ChannelReceiver::new(stdin).receive(MAX_CAPTURE) {
         Ok(b) => b,
         Err(_) => stage.die(b"clip: could not read the upstream stream\n", EXIT_FAILURE),
     };
@@ -304,6 +308,6 @@ fn push_int(out: &mut String, mut v: i64) {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"clip: panic\n");
+    log::write(b"clip: panic\n");
     exit(EXIT_FAILURE)
 }

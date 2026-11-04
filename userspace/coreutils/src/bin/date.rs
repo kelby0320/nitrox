@@ -1,7 +1,7 @@
 //! `date` — report the wall-clock time, or set it.
 //!
 //! Almost all of this utility is calendar arithmetic, which lives in [`coreutils::time`] and is
-//! tested on the host; what remains here is a syscall or two and the choice of what to publish.
+//! tested on the host; what remains here is a call or two and the choice of what to publish.
 //!
 //! ## Deliberate behaviours
 //!
@@ -22,20 +22,19 @@
 extern crate alloc;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use coreutils::time::{civil_from_unix, format_civil, parse_utc};
-use libkern::abi::{CLOCK_REALTIME, CLOCK_SET_THIS_BOOT, IPC_PAYLOAD_SIZE};
+use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
-use libkern::syscall::{SYS_CLOCK_READ, SYS_CLOCK_SET, syscall2};
-use libkern::{exit, kprint};
-use libstream::channel::{ChannelSink, IpcPort};
+use libos::boot::Start;
+use libos::system::{ClockSet, set_clock};
+use libos::{exit, log, time};
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
-
-static mut CLOCK_BUF: u64 = 0;
 
 const UNIX: Flag = Flag::new("unix", 'u', "report the bare epoch value only");
 const SET: Flag = Flag::long_only("set", "set the clock to TIME, in UTC (needs the clock grant)");
@@ -59,8 +58,10 @@ const HELP: &[u8] = b"usage: date [--unix]\n\
 const VERSION: &[u8] = b"date (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[UNIX, SET]) {
         Ok(a) => a,
@@ -82,20 +83,15 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.die(b"date: takes no operands (try --help)\n", EXIT_USAGE);
     }
 
-    // SAFETY: `CLOCK_BUF` is a valid writable `u64` out-param; this process is
-    // single-threaded.
-    let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut CLOCK_BUF) as u64) };
-    if r != 0 {
+    let Ok(nanos) = time::wall() else {
         // The clock is unset (no readable RTC), which is not "the time is zero".
         stage.die(b"date: the wall clock is not set on this machine\n", EXIT_FAILURE);
-    }
-    // SAFETY: written by the syscall above.
-    let nanos = unsafe { (&raw const CLOCK_BUF).read() };
+    };
     let civil = civil_from_unix(nanos);
     let unix_secs = (nanos / 1_000_000_000) as i64;
 
-    match stage.streams.stdout {
-        Some(h) => emit(&stage, h, unix_secs, &civil, args.has("unix")),
+    match stage.stdout() {
+        Some(port) => emit(&stage, port, unix_secs, &civil, args.has("unix")),
         None => {
             let mut line = if args.has("unix") {
                 let mut s = alloc::string::String::new();
@@ -105,7 +101,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
                 format_civil(&civil)
             };
             line.push('\n');
-            kprint(line.as_bytes());
+            log::write(line.as_bytes());
         }
     }
     exit(EXIT_OK)
@@ -120,31 +116,27 @@ fn set(stage: &Stage, time: &str) {
     // `parse_utc` reads four digits of year, so a time before 1970 is the only negative, and the
     // kernel refuses it with everything else outside 2000-2099.
     let ns = u64::try_from(secs).unwrap_or(0).saturating_mul(1_000_000_000);
-    // SAFETY: no pointers; the kernel checks the clock, the time and `SYSTEM_CLOCK`.
-    let r = unsafe { syscall2(SYS_CLOCK_SET, CLOCK_REALTIME, ns) };
-    if r == KError::NoAccess.as_i32() as i64 {
-        stage.die(
+    // The kernel checks the clock, the time and `SYSTEM_CLOCK`.
+    match set_clock(ns) {
+        Err(e) if e.code() == KError::NoAccess => stage.die(
             b"date: cannot set the clock here -- that needs the clock grant: `with admin date --set ...`\n",
             EXIT_FAILURE,
-        );
-    }
-    if r == KError::InvalidArgument.as_i32() as i64 {
-        stage.die(b"date: the clock can be set to a time from 2000 to 2099\n", EXIT_FAILURE);
-    }
-    if r < 0 {
-        stage.die(b"date: the clock was not set\n", EXIT_FAILURE);
-    }
-    if r as u64 == CLOCK_SET_THIS_BOOT {
-        stage.warn(
+        ),
+        Err(e) if e.code() == KError::InvalidArgument => {
+            stage.die(b"date: the clock can be set to a time from 2000 to 2099\n", EXIT_FAILURE)
+        }
+        Err(_) => stage.die(b"date: the clock was not set\n", EXIT_FAILURE),
+        Ok(ClockSet::Kept) => {}
+        Ok(ClockSet::ThisBoot) => stage.warn(
             b"date: the clock is set, but the hardware clock would not take it: it lasts until the \
               next boot\n",
-        );
+        ),
     }
 }
 
 /// Write the single row as a TSM1 table on the `stdout` stream; `--unix` narrows the schema to the
 /// one field.
-fn emit(stage: &Stage, stdout: u64, unix_secs: i64, c: &coreutils::time::Civil, unix_only: bool) {
+fn emit(stage: &Stage, stdout: Port<'_>, unix_secs: i64, c: &coreutils::time::Civil, unix_only: bool) {
     let schema = if unix_only {
         Schema::new().field("unix", TypeTag::Int, TypeModifiers::NONE)
     } else {
@@ -158,7 +150,7 @@ fn emit(stage: &Stage, stdout: u64, unix_secs: i64, c: &coreutils::time::Civil, 
             .field("second", TypeTag::Int, TypeModifiers::NONE)
     };
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         if unix_only {
             tw.write_row(&[Value::Int(unix_secs)])?;
@@ -205,6 +197,6 @@ fn push_i64(out: &mut alloc::string::String, v: i64) {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"date: panic\n");
+    log::write(b"date: panic\n");
     exit(EXIT_FAILURE)
 }

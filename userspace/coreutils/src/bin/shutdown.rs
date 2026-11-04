@@ -20,10 +20,11 @@ use alloc::string::String;
 
 use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE};
-use libkern::debug::Line;
+use libkern::Rights;
 use libkern::error::KError;
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Channel, Msg, Only, block_on, exit};
 use librsproto::services::{OP_SERVICES_SHUTDOWN, shutdown_body};
 use libstream::diag::Level;
 
@@ -31,7 +32,7 @@ use libstream::diag::Level;
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Where the `power` grant binds `service-mgr`'s power endpoint.
-const POWER: &[u8] = b"/dev/power";
+const POWER: &str = "/dev/power";
 
 const FLAGS: [Flag; 1] = [Flag::long_only("reboot", "restart the machine rather than halting it")];
 
@@ -49,8 +50,10 @@ const HELP: &[u8] = b"usage: shutdown [--reboot]\n\
 const VERSION: &[u8] = b"shutdown (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
     let args = match parse(&stage.argv, &FLAGS) {
         Ok(a) => a,
         Err(_) => stage.die(b"shutdown: unrecognized option (try --help)\n", EXIT_USAGE),
@@ -82,23 +85,25 @@ fn say_at(stage: &Stage, level: Level, text: &str) {
 
 /// Ask `service-mgr` to shut down, or reboot: a power session on `/dev/power`, one `Shutdown`, and
 /// its answer, which comes as soon as the shutdown has begun.
-fn shut_down(stage: &Stage, reboot: bool) -> i64 {
-    let (st, session) = libfs::lookup_wait(stage.namespace, POWER, librsproto::session::DIR_SESSION_RIGHTS);
-    if st == KError::NotFound.as_i32() {
-        say(stage, "shutdown: this needs the power grant: `with power shutdown`\n");
-        return EXIT_FAILURE;
-    }
-    if st != 0 || session == 0 {
-        say(stage, &format!("shutdown: service-mgr opened no power session ({:?})\n", KError::from_i32(st)));
-        return EXIT_FAILURE;
-    }
-    let mut buf = alloc::vec![0u8; IPC_MSG_SIZE];
-    let reply = librsproto::session::round_trip(session, &mut buf, 1, OP_SERVICES_SHUTDOWN, &shutdown_body(reboot));
-    // SAFETY: closing the power session this call opened.
-    unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, session) };
+fn shut_down(stage: &Stage, reboot: bool) -> i32 {
+    let rights = Rights::from_bits(librsproto::session::DIR_SESSION_RIGHTS);
+    let session = match block_on(stage.namespace.lookup::<Channel, Only>(POWER, rights)) {
+        Ok(session) => session,
+        Err(e) if e.code() == KError::NotFound => {
+            say(stage, "shutdown: this needs the power grant: `with power shutdown`\n");
+            return EXIT_FAILURE;
+        }
+        Err(e) => {
+            say(stage, &format!("shutdown: service-mgr opened no power session ({:?})\n", e.code()));
+            return EXIT_FAILURE;
+        }
+    };
+    let mut msg = Msg::new();
+    let reply = librsproto::session::exchange(&session, &mut msg, 1, OP_SERVICES_SHUTDOWN, &shutdown_body(reboot));
+    drop(session);
     let refused = match reply {
         Err(_) => Some(String::from("lost service-mgr while asking")),
-        Ok(len) => match librsproto::decode(&buf[IPC_HEADER_SIZE..IPC_HEADER_SIZE + len]) {
+        Ok(_) => match librsproto::decode(msg.payload()) {
             Ok(m) if m.op == OP_SERVICES_SHUTDOWN && m.flags & librsproto::RS_FLAG_ERROR == 0 => None,
             Ok(m) if m.op == OP_SERVICES_SHUTDOWN => Some(
                 librsproto::error::parse_error(m.body)
@@ -119,6 +124,6 @@ fn shut_down(stage: &Stage, reboot: bool) -> i64 {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"shutdown: panic\n");
+    log::write(b"shutdown: panic\n");
     exit(EXIT_FAILURE)
 }

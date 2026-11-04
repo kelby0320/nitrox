@@ -21,11 +21,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::log;
+use libos::{Msg, exit};
 use librsproto::session::Dir;
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -52,8 +54,10 @@ struct Touched {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[NO_CREATE]) {
         Ok(a) => a,
@@ -74,33 +78,33 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     for operand in &args.operands {
         let resolved = stage.path(operand.as_bytes());
-        let path = resolved.as_slice();
+        let path = resolved.as_str();
         if path.is_empty() {
             stage.die(b"touch: empty path\n", EXIT_USAGE);
         }
-        if libfs::is_dir(stage.namespace, path) {
+        if libfs::is_directory(&stage.namespace, path) {
             stage.die(b"touch: path is a directory\n", EXIT_USAGE);
         }
-        let exists = libfs::file_size(stage.namespace, path).is_some();
+        let exists = libfs::file_len(&stage.namespace, path).is_some();
 
         if !exists {
             if no_create {
                 continue; // the flag's whole purpose: skip, do not fail
             }
-            if libfs::create_file(stage.namespace, path).is_err() {
+            if libfs::ensure_file(&stage.namespace, path).is_err() {
                 stage.die(b"touch: cannot create file\n", EXIT_FAILURE);
             }
             // A just-created inode is stamped by the server as it creates it.
-            done.push(Touched { path: as_string(path), created: true });
+            done.push(Touched { path: String::from(path), created: true });
             continue;
         }
 
         stamp(&stage, path);
-        done.push(Touched { path: as_string(path), created: false });
+        done.push(Touched { path: String::from(path), created: false });
     }
 
-    match stage.streams.stdout {
-        Some(h) => emit(&stage, h, &done),
+    match stage.stdout() {
+        Some(port) => emit(&stage, port, &done),
         None => {
             for t in &done {
                 report_text(t);
@@ -112,31 +116,28 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Stamp `path`'s modification time via a session on its parent directory. Diverges on
 /// failure.
-fn stamp(stage: &Stage, path: &[u8]) {
-    let mut buf = [0u8; 4096];
-    let mut dir = match Dir::open(stage.namespace, libfs::parent(path), &mut buf) {
+fn stamp(stage: &Stage, path: &str) {
+    let mut msg = Msg::new();
+    let parent = core::str::from_utf8(libfs::parent(path.as_bytes())).unwrap_or(path);
+    let mut dir = match Dir::resolve(&stage.namespace, parent, &mut msg) {
         Ok(d) => d,
         Err(_) => stage.die(b"touch: cannot open the parent directory\n", EXIT_FAILURE),
     };
-    let r = dir.touch(libfs::basename(path));
+    let r = dir.touch(libfs::basename(path.as_bytes()));
     dir.close();
     if r.is_err() {
         stage.die(b"touch: cannot stamp the modification time\n", EXIT_FAILURE);
     }
 }
 
-fn as_string(path: &[u8]) -> String {
-    String::from_utf8_lossy(path).into_owned()
-}
-
-fn emit(stage: &Stage, stdout: u64, done: &[Touched]) {
+fn emit(stage: &Stage, stdout: Port<'_>, done: &[Touched]) {
     let schema = Schema::new().field("path", TypeTag::String, TypeModifiers::NONE).field(
         "created",
         TypeTag::Bool,
         TypeModifiers::NONE,
     );
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for t in done {
             tw.write_row(&[Value::Str(t.path.clone()), Value::Bool(t.created)])?;
@@ -157,11 +158,11 @@ fn report_text(t: &Touched) {
     let mut line = String::from(if t.created { "created " } else { "touched " });
     line.push_str(&t.path);
     line.push('\n');
-    kprint(line.as_bytes());
+    log::write(line.as_bytes());
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"touch: panic\n");
+    log::write(b"touch: panic\n");
     exit(EXIT_FAILURE)
 }

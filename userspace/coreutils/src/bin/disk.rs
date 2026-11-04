@@ -50,17 +50,22 @@ use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
 use coreutils::format::{self, Fs, Label, Plan, Scheme};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libfsserver::BlockWriter;
 use libfsserver::disk::PartitionIo;
 use libgpt::{mbr, table};
+use libkern::Rights;
+use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::abi::{BlockDeviceInfo, IO_OPCODE_FLUSH, IoOp};
-use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
-use libkern::debug::Line;
 use libkern::error::KError;
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{
+    Channel, Deadline, File, Handle, MapRead, Msg, Namespace, NsReadOnly, Only, Op, ReadWrite, Ref, Resource, WaitSet,
+    block_on, entropy, exit, time,
+};
 use librsproto::storage::{OP_STORAGE_EJECT, OP_STORAGE_MOUNT, OP_STORAGE_REREAD, OP_STORAGE_UNMOUNT, build_mount};
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::wire::Table;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -68,14 +73,14 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const TABLE: &[u8] = b"/dev/storage/all.tsm";
-const ADMIN: &[u8] = b"/dev/storage/admin";
-const MEDIA: &[u8] = b"/dev/storage/media";
+const TABLE: &str = "/dev/storage/all.tsm";
+const ADMIN: &str = "/dev/storage/admin";
+const MEDIA: &str = "/dev/storage/media";
 /// A watch, through the session endpoint: pinged when the mounts or the devices
 /// change.
-const WATCH: &[u8] = b"/dev/storage/watch";
+const WATCH: &str = "/dev/storage/watch";
 /// `/dev/devices`' table: what each block device is, its disk, its driver, and the boot flag.
-const DEVICES: &[u8] = b"/dev/devices/all.tsm";
+const DEVICES: &str = "/dev/devices/all.tsm";
 /// **How long a disk's new partition is waited for**, arrived and, after `--format`, mounted: the
 /// storage service waits as long for a filesystem server's `Ready`.
 const ARRIVAL_NS: u64 = 30_000_000_000;
@@ -119,8 +124,10 @@ const HELP: &[u8] = b"usage: disk --list | --mount DEVICE [LABEL] | --unmount LA
 const VERSION: &[u8] = b"disk (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
     let args = match parse(&stage.argv, &FLAGS) {
         Ok(a) => a,
         Err(_) => stage.die(b"disk: unrecognized option (try --help)\n", EXIT_USAGE),
@@ -174,8 +181,8 @@ fn say(stage: &Stage, text: &str) {
     Line::new().untrusted(text.trim_end_matches('\n').as_bytes()).end();
 }
 
-fn list(stage: &Stage) -> i64 {
-    let table = match libfs::read_file(stage.namespace, TABLE).ok().and_then(|b| Table::decode(&b).ok()) {
+fn list(stage: &Stage) -> i32 {
+    let table = match libfs::read(&stage.namespace, TABLE).ok().and_then(|b| Table::decode(&b).ok()) {
         Some(t) => t,
         None => {
             say(stage, "disk: no /dev/storage/all.tsm in this namespace -- is the storage service running?\n");
@@ -183,9 +190,9 @@ fn list(stage: &Stage) -> i64 {
         }
     };
     let rows = table.rows.len();
-    let sink: &[u8] = match stage.streams.stdout {
-        Some(h) => {
-            write_table(stage, h, &table.schema, &table.rows);
+    let sink: &[u8] = match stage.stdout() {
+        Some(port) => {
+            write_table(stage, port, &table.schema, &table.rows);
             b"table"
         }
         None => {
@@ -213,8 +220,8 @@ fn cell(v: &Value) -> String {
     }
 }
 
-fn write_table(stage: &Stage, stdout: u64, schema: &Schema, rows: &[Vec<Value>]) {
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+fn write_table(stage: &Stage, stdout: Port<'_>, schema: &Schema, rows: &[Vec<Value>]) {
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, schema).and_then(|()| {
         for row in rows {
             tw.write_row(row)?;
@@ -248,20 +255,18 @@ enum Failure {
 /// **No grant, told apart from a busy one.** Without the grant the admin path resolves to no
 /// table, or to nothing: `NotFound` either way, the one answer that means "not in a view with
 /// `storage`". Any other is the service's, and is printed as such.
-fn ask(stage: &Stage, at: &[u8], op: u16, body: &[u8]) -> Result<Vec<u8>, Failure> {
-    let (st, session) = libfs::lookup_wait(stage.namespace, at, librsproto::session::DIR_SESSION_RIGHTS);
-    if st == KError::NotFound.as_i32() {
-        return Err(Failure::NotHere);
-    }
-    if st != 0 || session == 0 {
-        return Err(Failure::Unopened(KError::from_i32(st)));
-    }
-    let mut buf = alloc::vec![0u8; IPC_MSG_SIZE];
-    let reply = librsproto::session::round_trip(session, &mut buf, 1, op, body);
-    // SAFETY: closing the session this call opened.
-    unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, session) };
-    let len = reply.map_err(|_| Failure::Transport)?;
-    let msg = librsproto::decode(&buf[IPC_HEADER_SIZE..IPC_HEADER_SIZE + len]).map_err(|_| Failure::Transport)?;
+fn ask(stage: &Stage, at: &str, op: u16, body: &[u8]) -> Result<Vec<u8>, Failure> {
+    let rights = Rights::from_bits(librsproto::session::DIR_SESSION_RIGHTS);
+    let session = match block_on(stage.namespace.lookup::<Channel, Only>(at, rights)) {
+        Ok(session) => session,
+        Err(e) if e.code() == KError::NotFound => return Err(Failure::NotHere),
+        Err(e) => return Err(Failure::Unopened(e.code())),
+    };
+    let mut buf = Msg::new();
+    let reply = librsproto::session::exchange(&session, &mut buf, 1, op, body);
+    drop(session);
+    reply.map_err(|_| Failure::Transport)?;
+    let msg = librsproto::decode(buf.payload()).map_err(|_| Failure::Transport)?;
     if msg.op != op {
         return Err(Failure::Transport);
     }
@@ -275,7 +280,7 @@ fn ask(stage: &Stage, at: &[u8], op: u16, body: &[u8]) -> Result<Vec<u8>, Failur
     Ok(msg.body.to_vec())
 }
 
-fn failed(stage: &Stage, verb: &str, what: &str, f: Failure) -> i64 {
+fn failed(stage: &Stage, verb: &str, what: &str, f: Failure) -> i32 {
     let text = match f {
         Failure::NotHere if verb == "eject" => {
             String::from("disk: cannot eject here -- no /dev/storage/media in this namespace\n")
@@ -297,7 +302,7 @@ fn failed(stage: &Stage, verb: &str, what: &str, f: Failure) -> i64 {
     EXIT_FAILURE
 }
 
-fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
+fn mount(stage: &Stage, operand: &str, label: &str) -> i32 {
     let Some(device) = device_name(operand) else {
         say(stage, "disk: a device is /dev/blk/N or blk-N\n");
         return EXIT_USAGE;
@@ -318,8 +323,8 @@ fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
     let label = String::from_utf8_lossy(label).into_owned();
     let why = read_only.map(|w| String::from_utf8_lossy(w).into_owned());
     let at = format!("/storage/{label}");
-    match stage.streams.stdout {
-        Some(h) => {
+    match stage.stdout() {
+        Some(port) => {
             let schema = Schema::new()
                 .field("device", TypeTag::String, TypeModifiers::NONE)
                 .field("label", TypeTag::String, TypeModifiers::NONE)
@@ -330,7 +335,7 @@ fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
             let note = why.clone().map_or(Value::Null, Value::Str);
             let row =
                 alloc::vec![Value::Str(device.clone()), Value::Str(label.clone()), Value::Str(at.clone()), mode, note];
-            write_table(stage, h, &schema, &[row]);
+            write_table(stage, port, &schema, &[row]);
         }
         None => match &why {
             Some(why) => stage.note(format!("{device} mounted read-only at {at}: {why}\n").as_bytes()),
@@ -342,18 +347,18 @@ fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
     EXIT_OK
 }
 
-fn unmount(stage: &Stage, label: &str) -> i64 {
+fn unmount(stage: &Stage, label: &str) -> i32 {
     if let Err(f) = ask(stage, ADMIN, OP_STORAGE_UNMOUNT, label.as_bytes()) {
         return failed(stage, "unmount", label, f);
     }
-    match stage.streams.stdout {
-        Some(h) => {
+    match stage.stdout() {
+        Some(port) => {
             let schema = Schema::new().field("label", TypeTag::String, TypeModifiers::NONE).field(
                 "unmounted",
                 TypeTag::Bool,
                 TypeModifiers::NONE,
             );
-            write_table(stage, h, &schema, &[alloc::vec![Value::Str(String::from(label)), Value::Bool(true)]]);
+            write_table(stage, port, &schema, &[alloc::vec![Value::Str(String::from(label)), Value::Bool(true)]]);
         }
         // Not "and left clean": a read-only mount leaves a filesystem as it found it. `--list`
         // says how each was left.
@@ -368,7 +373,7 @@ fn unmount(stage: &Stage, label: &str) -> i64 {
 ///
 /// **The drive goes whole**: the service unmounts every filesystem it mounted on the same stick,
 /// and answers with their names, a row each — two partitions are two rows, whichever was named.
-fn eject(stage: &Stage, name: &str) -> i64 {
+fn eject(stage: &Stage, name: &str) -> i32 {
     let name = name.strip_prefix("/storage/").unwrap_or(name);
     let reply = match ask(stage, MEDIA, OP_STORAGE_EJECT, name.as_bytes()) {
         Ok(r) => r,
@@ -380,8 +385,8 @@ fn eject(stage: &Stage, name: &str) -> i64 {
         names.push(String::from(name));
     }
     let said = names.join(", ");
-    match stage.streams.stdout {
-        Some(h) => {
+    match stage.stdout() {
+        Some(port) => {
             let schema = Schema::new().field("name", TypeTag::String, TypeModifiers::NONE).field(
                 "ejected",
                 TypeTag::Bool,
@@ -389,7 +394,7 @@ fn eject(stage: &Stage, name: &str) -> i64 {
             );
             let rows: Vec<Vec<Value>> =
                 names.iter().map(|n| alloc::vec![Value::Str(n.clone()), Value::Bool(true)]).collect();
-            write_table(stage, h, &schema, &rows);
+            write_table(stage, port, &schema, &rows);
         }
         None => stage.note(format!("{said} ejected: the drive can be removed\n").as_bytes()),
     }
@@ -397,7 +402,7 @@ fn eject(stage: &Stage, name: &str) -> i64 {
     EXIT_OK
 }
 
-fn format_device(stage: &Stage, device: &str, fs: &str, label: Option<&str>, mbr: bool, gpt: bool) -> i64 {
+fn format_device(stage: &Stage, device: &str, fs: &str, label: Option<&str>, mbr: bool, gpt: bool) -> i32 {
     let Some(fs) = Fs::parse(fs) else {
         say(stage, "disk: a filesystem is fat or ext4\n");
         return EXIT_USAGE;
@@ -405,8 +410,11 @@ fn format_device(stage: &Stage, device: &str, fs: &str, label: Option<&str>, mbr
     write(stage, device, Some(fs), label, mbr, gpt)
 }
 
-fn device_rows(ns: u64) -> Option<Vec<format::Row>> {
-    let t = libfs::read_file(ns, DEVICES).ok().and_then(|b| Table::decode(&b).ok())?;
+/// A session's namespace, borrowed for a lookup.
+type Ns<'a> = Ref<'a, Namespace, NsReadOnly>;
+
+fn device_rows(ns: Ns<'_>) -> Option<Vec<format::Row>> {
+    let t = libfs::read(ns, DEVICES).ok().and_then(|b| Table::decode(&b).ok())?;
     let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
     let (name, kind, size, parent, driver, boot) =
         (col("name")?, col("kind")?, col("size")?, col("parent")?, col("driver")?, col("boot")?);
@@ -433,8 +441,8 @@ struct Held {
     note: Option<String>,
 }
 
-fn storage_rows(ns: u64) -> Option<Vec<Held>> {
-    let t = libfs::read_file(ns, TABLE).ok().and_then(|b| Table::decode(&b).ok())?;
+fn storage_rows(ns: Ns<'_>) -> Option<Vec<Held>> {
+    let t = libfs::read(ns, TABLE).ok().and_then(|b| Table::decode(&b).ok())?;
     let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
     let (name, filesystem, mounted) = (col("name")?, col("filesystem")?, col("mounted")?);
     let note = col("note");
@@ -452,89 +460,40 @@ fn storage_rows(ns: u64) -> Option<Vec<Held>> {
     )
 }
 
-fn device_info(ns: u64, path: &str) -> Option<BlockDeviceInfo> {
+fn device_info(ns: Ns<'_>, path: &str) -> Option<BlockDeviceInfo> {
     let leaf = format!("{path}/info");
-    let (st, h) = libfs::lookup_wait(ns, leaf.as_bytes(), libkern::RIGHT_MAP_READ);
-    if st != 0 || h == 0 {
-        return None;
-    }
-    // SAFETY: register-only syscall; `h` is ours.
-    let addr =
-        unsafe { libkern::syscall::syscall4(libkern::syscall::SYS_MEMORY_MAP, h, 0, 4096, libkern::RIGHT_MAP_READ) };
-    close(h);
-    if addr < 0 {
-        return None;
-    }
-    let size = core::mem::size_of::<BlockDeviceInfo>();
-    // SAFETY: `addr` maps a page read-only, and `size` is under it.
-    let info = BlockDeviceInfo::read(unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size) });
-    // SAFETY: unmapping what was mapped above; nothing refers to it now.
-    unsafe { libkern::syscall::syscall2(libkern::syscall::SYS_MEMORY_UNMAP, addr as u64, 4096) };
-    info
-}
-
-fn close(h: u64) {
-    // SAFETY: closing a handle this process holds.
-    unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, h) };
+    let file = block_on(ns.lookup::<File, MapRead>(&leaf, Rights::MAP_READ)).ok()?;
+    let mapping = file.map(4096).ok()?;
+    let mut bytes = [0u8; core::mem::size_of::<BlockDeviceInfo>()];
+    mapping.read_into(0, &mut bytes).ok()?;
+    BlockDeviceInfo::read(&bytes)
 }
 
 fn now_secs() -> i64 {
-    let mut nanos: u64 = 0;
-    // SAFETY: a valid writable `u64` out-param.
-    let r = unsafe {
-        libkern::syscall::syscall2(
-            libkern::syscall::SYS_CLOCK_READ,
-            libkern::abi::CLOCK_REALTIME,
-            (&raw mut nanos) as u64,
-        )
-    };
-    if r < 0 { 0 } else { (nanos / 1_000_000_000) as i64 }
+    time::wall().map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
 }
 
 fn monotonic_ns() -> u64 {
-    let mut now = 0u64;
-    // SAFETY: a valid writable `u64` out-param.
-    unsafe {
-        libkern::syscall::syscall2(
-            libkern::syscall::SYS_CLOCK_READ,
-            libkern::abi::CLOCK_MONOTONIC,
-            (&raw mut now) as u64,
-        )
-    };
-    now
+    time::now().unwrap_or(0)
 }
 
-fn flush(device: u64) -> bool {
+fn flush(device: Ref<'_, Resource, ReadWrite>) -> bool {
     let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
-    // SAFETY: `device` is a block device handle with WRITE; `&op` is a valid `IoOp`.
-    let po =
-        unsafe { libkern::syscall::syscall2(libkern::syscall::SYS_IO_SUBMIT, device, (&op as *const IoOp) as u64) };
-    po >= 0 && matches!(libfsserver::disk::po_wait(po as u64), Some((0, _)))
+    Op::submit(device.raw(), &op).and_then(block_on).is_ok()
 }
 
 /// **Wait for a ping on `watch` until `deadline`**, and take every one queued: `false` at the
 /// deadline, or if the watch has gone.
-fn wait_ping(watch: u64, deadline: u64) -> bool {
-    let handles = [watch];
-    let mut results = [0u8; 24];
-    // SAFETY: a valid one-entry handle array and result buffer on this frame.
-    let waited = unsafe {
-        libkern::syscall::syscall4(
-            libkern::syscall::SYS_WAIT,
-            handles.as_ptr() as u64,
-            1,
-            results.as_mut_ptr() as u64,
-            deadline,
-        )
-    };
-    if waited != 1 {
+fn wait_ping(watch: &Handle<Channel, Only>, deadline: u64) -> bool {
+    let mut set = WaitSet::<1>::new();
+    if set.add(watch).is_err() || !set.wait(Deadline::at(deadline)).is_ok_and(|signalled| signalled.len() == 1) {
         return false;
     }
-    let mut buf = alloc::boxed::Box::new([0u8; IPC_MSG_SIZE]);
+    let mut msg = Msg::new();
     loop {
-        match libkern::channel_recv(watch, &mut buf) {
+        match watch.recv(&mut msg) {
             Ok(_) => {}
-            Err(got) if got == KError::WouldBlock.as_i32() as i64 => return true,
+            Err(e) if e.code() == KError::WouldBlock => return true,
             Err(_) => return false,
         }
     }
@@ -575,7 +534,7 @@ struct Ids {
 impl Ids {
     fn fresh() -> Option<Ids> {
         let mut b = [0u8; 56];
-        coreutils::entropy::fill(&mut b).then(|| Ids {
+        entropy::fill(&mut b).is_ok().then(|| Ids {
             disk_id: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
             disk_guid: b[4..20].try_into().unwrap_or_default(),
             partition_guid: b[20..36].try_into().unwrap_or_default(),
@@ -589,7 +548,7 @@ impl Ids {
 /// its partition, then the drive's cache flushed. `name` is the GPT partition's name.
 fn write_plan(
     stage: &Stage,
-    handle: u64,
+    handle: &Handle<Resource, ReadWrite>,
     t: &format::Target,
     plan: &Plan,
     ids: &Ids,
@@ -598,7 +557,7 @@ fn write_plan(
     let fs = plan.fs.map(|(fs, ..)| fs);
     if let Some((scheme, first, n)) = plan.table {
         let disk =
-            PartitionIo::new(handle, 0, t.sectors * format::SECTOR).ok_or("no transfer buffer for the device")?;
+            PartitionIo::window(handle, 0, t.sectors * format::SECTOR).ok_or("no transfer buffer for the device")?;
         for (at, len) in format::wipes(t.sectors) {
             zero(&disk, at, len)?;
         }
@@ -635,7 +594,7 @@ fn write_plan(
         }
     }
     if let Some((fs, label, at, len)) = plan.fs {
-        let io = PartitionIo::new(handle, at, len).ok_or("no transfer buffer for the device")?;
+        let io = PartitionIo::window(handle, at, len).ok_or("no transfer buffer for the device")?;
         let now = now_secs();
         match (fs, label) {
             (Fs::Fat, Label::Fat(label)) => {
@@ -663,7 +622,7 @@ fn write_plan(
             _ => return Err(String::from("a label for another filesystem")),
         }
     }
-    if !flush(handle) {
+    if !flush(handle.as_ref()) {
         return Err(String::from("the drive's cache could not be flushed"));
     }
     Ok(())
@@ -671,9 +630,9 @@ fn write_plan(
 
 /// **`disk --partition DISK` and `disk --format DEVICE FS [LABEL]`**: decided, refused before a
 /// byte is written, written, read again by the storage service, and — for a disk — waited for.
-fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr: bool, gpt: bool) -> i64 {
+fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr: bool, gpt: bool) -> i32 {
     let verb = if fs.is_some() { "formatted" } else { "partitioned" };
-    let ns = stage.namespace;
+    let ns = stage.namespace.as_ref();
     let Some(name) = device_name(operand) else {
         say(stage, "disk: a device is /dev/blk/N or blk-N\n");
         return EXIT_USAGE;
@@ -709,17 +668,17 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
         }
     }
     let path = format!("/dev/blk/{}", &name["blk-".len()..]);
-    let (st, handle) = libfs::lookup_wait(ns, path.as_bytes(), libkern::RIGHT_READ | libkern::RIGHT_WRITE);
-    if st != 0 || handle == 0 {
+    let rights = Rights::READ | Rights::WRITE;
+    let Ok(handle) = block_on(ns.lookup::<Resource, ReadWrite>(&path, rights)) else {
         let flag = if fs.is_some() { "format" } else { "partition" };
-        return refuse(&if libfs::ns_children(ns, b"/dev/blk").is_empty() {
+        return refuse(&if libfs::bindings_under(ns, "/dev/blk").is_empty() {
             format!("this session holds no disks: run it as `with admin disk --{flag} ...`")
         } else {
             String::from("this view does not hold it: the disks grant withholds a device in use")
         });
-    }
+    };
     let Some(info) = device_info(ns, &path) else {
-        close(handle);
+        drop(handle);
         return refuse("its info would not read");
     };
     t.sectors = info.block_count;
@@ -727,12 +686,12 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
     let plan = match decide(&t) {
         Ok(p) => p,
         Err(r) => {
-            close(handle);
+            drop(handle);
             return refuse(&format!("{r}"));
         }
     };
     let Some(ids) = Ids::fresh() else {
-        close(handle);
+        drop(handle);
         return refuse("the kernel's entropy source did not answer, and the IDs written must be random");
     };
     // The disk's partitions before, so the one its new table brings is told from them; and a watch
@@ -741,22 +700,20 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
     let watch = if t.kind == format::Kind::Partition {
         None
     } else {
-        let (st, w) = libfs::lookup_wait(ns, WATCH, librsproto::session::DIR_SESSION_RIGHTS);
-        (st == 0 && w != 0).then_some(w)
+        let rights = Rights::from_bits(librsproto::session::DIR_SESSION_RIGHTS);
+        block_on(ns.lookup::<Channel, Only>(WATCH, rights)).ok()
     };
     let gpt_name = match fs {
         Some(Fs::Fat) => label.unwrap_or(format::FAT_LABEL),
         Some(Fs::Ext4) => label.unwrap_or(format::EXT4_LABEL),
         None => "",
     };
-    let wrote = write_plan(stage, handle, &t, &plan, &ids, gpt_name.as_bytes());
-    close(handle);
+    let wrote = write_plan(stage, &handle, &t, &plan, &ids, gpt_name.as_bytes());
+    drop(handle);
     let scheme = plan.table.map(|(s, ..)| if s == Scheme::Mbr { "mbr" } else { "gpt" });
     let fs_word = fs.map(|f| if f == Fs::Fat { "fat" } else { "ext4" });
     if let Err(why) = wrote {
-        if let Some(w) = watch {
-            close(w);
-        }
+        drop(watch);
         say(stage, &format!("disk: {name} not {verb}: {why}; what is on it now is unknown\n"));
         return EXIT_FAILURE;
     }
@@ -773,9 +730,7 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
             .map(|n| String::from_utf8_lossy(n).into_owned())
             .collect::<Vec<_>>(),
         Err(f) => {
-            if let Some(w) = watch {
-                close(w);
-            }
+            drop(watch);
             let why = match f {
                 Failure::NotHere => String::from("this session holds no storage grant: run it as `with admin`"),
                 Failure::Unopened(e) => format!("the storage service opened no admin session ({e:?})"),
@@ -801,11 +756,11 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
             let new = device_rows(ns)
                 .and_then(|rows| format::partitions_of(&rows, &name).into_iter().find(|p| !before.contains(p)));
             let row = new.and_then(|p| storage_rows(ns)?.into_iter().find(|h| h.name == p));
-            if row.is_some() || !wait_ping(watch, deadline) {
+            if row.is_some() || !wait_ping(&watch, deadline) {
                 break row;
             }
         };
-        close(watch);
+        drop(watch);
         let Some(row) = found else {
             say(
                 stage,
@@ -828,8 +783,8 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
         Some(p) => format!("{name} {verb} {what}: {p}, {outcome}"),
         None => format!("{name} {verb} {what}: {outcome}"),
     };
-    match stage.streams.stdout {
-        Some(h) => {
+    match stage.stdout() {
+        Some(port) => {
             let nullable = TypeModifiers::NULLABLE;
             let schema = Schema::new()
                 .field("device", TypeTag::String, TypeModifiers::NONE)
@@ -847,7 +802,7 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
                 cell(at.as_deref()),
                 cell(note.as_deref()),
             ];
-            write_table(stage, h, &schema, &[row]);
+            write_table(stage, port, &schema, &[row]);
         }
         None => stage.note(format!("{said}\n").as_bytes()),
     }
@@ -857,6 +812,6 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"disk: panic\n");
+    log::write(b"disk: panic\n");
     exit(EXIT_FAILURE)
 }

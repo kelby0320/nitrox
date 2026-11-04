@@ -29,16 +29,15 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use libkern::abi::{IPC_PAYLOAD_SIZE, KIND_TERMINATE_REQUESTED, Notification};
-use libkern::scrub;
-use libkern::syscall::{
-    SYS_CLOCK_READ, SYS_HANDLE_DUPLICATE, SYS_NOTIF_RECV, SYS_NS_DERIVE, syscall1, syscall2, syscall4,
-};
-use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, exit};
-use libprompt::ask_password;
-use libprompt::ipc::{call, close, lookup, recv, send, wait};
+use libkern::abi::{IPC_PAYLOAD_SIZE, KIND_TERMINATE_REQUESTED};
+use libkern::{Rights, scrub};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Carried, Channel, Deadline, Handle, Only, WaitSet, exit, time};
+use libprompt::ask_password_on;
+use libprompt::ipc::{call_on, lookup_in, ready, receive, transmit};
 use librsproto::views::*;
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::ChannelSink;
 use libstream::diag::Level;
 use libstream::table::TableWriter;
 use libstream::wire::{Value, write_value};
@@ -74,27 +73,23 @@ const VERSION: &[u8] = b"with (nitrox coreutils) 0.1.0\n";
 /// Wrong passwords before the broker ends the request — the prompt counts them for the person.
 const TRIES: u8 = 3;
 
-static mut NOTIF: Notification = Notification::zeroed();
+/// What a session channel to the broker is asked for.
+const SESSION: Rights = Rights::from_bits(Rights::SEND.bits() | Rights::RECV.bits() | Rights::WAIT.bits());
 
 /// When a token from this terminal stops being worth waiting for: two seconds from now.
 fn token_deadline() -> u64 {
-    let mut ns: u64 = 0;
-    // SAFETY: a valid writable `u64` out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut ns) as u64) };
-    ns.saturating_add(2_000_000_000)
+    time::now().unwrap_or(0).saturating_add(2_000_000_000)
 }
 
-fn dup(h: u64) -> u64 {
-    // SAFETY: duplicating a handle this process owns, with the rights a hand-over needs.
-    let d = unsafe { syscall2(SYS_HANDLE_DUPLICATE, h, u64::MAX) };
-    if d > 0 { d as u64 } else { 0 }
+/// A second handle to `h` with every right it has, to hand over while `with` keeps its own.
+fn dup(h: &Handle<Channel, Only>) -> Option<Handle<Channel, Only>> {
+    h.duplicate(Rights::from_bits(u64::MAX)).ok()
 }
 
-fn broker(stage: &Stage) -> u64 {
-    let ch = libviews::broker(stage.namespace);
-    if ch == 0 {
+fn broker(stage: &Stage) -> Handle<Channel, Only> {
+    let Some(ch) = lookup_in(&stage.namespace, "/dev/views", SESSION) else {
         stage.die(b"with: this session has no view broker (/dev/views)\n", EXIT_FAILURE);
-    }
+    };
     ch
 }
 
@@ -115,9 +110,13 @@ fn level_of(o: Outcome) -> Level {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
-    let argv: Vec<&str> = stage.argv.iter().skip(1).map(|s| s.as_str()).collect();
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let mut stage = Stage::enter(start);
+    // Owned, so `run` can take the stage's streams while it holds the arguments.
+    let words: Vec<String> = stage.argv.iter().skip(1).cloned().collect();
+    let argv: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
     match argv.first().copied() {
         Some("--help") => stage.answer(HELP),
         Some("--version") => stage.answer(VERSION),
@@ -127,7 +126,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Some("--show") if argv.len() <= 2 => show(&stage, argv.get(1).copied()),
         Some("--install") if argv.len() == 2 => install(&stage, argv[1]),
         Some(flag) if flag.starts_with("--") => stage.die(HELP, EXIT_USAGE),
-        Some(_) if argv.len() >= 2 => run(&stage, argv[0], argv[1], &argv[2..]),
+        Some(_) if argv.len() >= 2 => run(&mut stage, argv[0], argv[1], &argv[2..]),
         _ => stage.die(HELP, EXIT_USAGE),
     }
 }
@@ -136,7 +135,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 /// `sudo -k`, and silent as it is.
 fn forget(stage: &Stage) -> ! {
     let ch = broker(stage);
-    match libviews::forget(ch, u64::MAX) {
+    match libviews::forget(ch.raw().0, u64::MAX) {
         Ok(()) => exit(EXIT_OK),
         Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     }
@@ -144,7 +143,7 @@ fn forget(stage: &Stage) -> ! {
 
 fn list(stage: &Stage) -> ! {
     let ch = broker(stage);
-    let rows = match libviews::list(ch, u64::MAX) {
+    let rows = match libviews::list(ch.raw().0, u64::MAX) {
         Ok(rows) => rows,
         Err(libviews::Failed::Refused) => {
             stage.die(b"with: the broker could not list your views (does the policy read?)\n", EXIT_FAILURE)
@@ -152,13 +151,13 @@ fn list(stage: &Stage) -> ! {
         Err(libviews::Failed::Garbled) => stage.die(b"with: the broker's listing did not read\n", EXIT_FAILURE),
         Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     };
-    match stage.streams.stdout {
-        Some(h) => {
+    match stage.stdout() {
+        Some(port) => {
             let schema = Schema::new()
                 .field("view", TypeTag::String, TypeModifiers::NONE)
                 .field("run", TypeTag::String, TypeModifiers::NONE)
                 .field("password", TypeTag::Bool, TypeModifiers::NONE);
-            let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(h), IPC_PAYLOAD_SIZE));
+            let mut tw = TableWriter::new(ChannelSink::new(port, IPC_PAYLOAD_SIZE));
             let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
                 for r in &rows {
                     let row = [Value::Str(r.view.clone()), Value::Str(r.run.clone()), Value::Bool(r.password)];
@@ -187,12 +186,12 @@ fn list(stage: &Stage) -> ! {
 
 fn check(stage: &Stage, file: &str) -> ! {
     let path = stage.path(file.as_bytes());
-    let Ok(text) = libfs::read_file(stage.namespace, &path) else {
+    let Ok(text) = libfs::read(&stage.namespace, &path) else {
         say(stage, &alloc::format!("cannot read `{file}`"));
         exit(EXIT_FAILURE);
     };
     let ch = broker(stage);
-    let (o, why) = match call(ch, OP_VIEWS_CHECK, 1, &text, &[]) {
+    let (o, why) = match call_on(&ch, OP_VIEWS_CHECK, 1, &text, &mut Carried::new()) {
         Some((false, body)) => outcome(&body),
         _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     };
@@ -202,18 +201,17 @@ fn check(stage: &Stage, file: &str) -> ! {
 
 /// The broker's policy endpoint, through the `views` grant's `/dev/policy`. Outside a view with the
 /// grant there is none, and `with` says which view to use rather than failing without a word.
-fn policy_endpoint(stage: &Stage, verb: &str) -> u64 {
-    let ch = lookup(stage.namespace, b"/dev/policy", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
-    if ch == 0 {
+fn policy_endpoint(stage: &Stage, verb: &str) -> Handle<Channel, Only> {
+    let Some(ch) = lookup_in(&stage.namespace, "/dev/policy", SESSION) else {
         say(
             stage,
             &alloc::format!(
                 "cannot {verb} the policy here -- that needs the views grant: `with admin with --{verb} ...`"
             ),
         );
-        libkern::kprint(alloc::format!("with: cannot {verb} the policy without the views grant\n").as_bytes());
+        log::write(alloc::format!("with: cannot {verb} the policy without the views grant\n").as_bytes());
         exit(EXIT_FAILURE);
-    }
+    };
     ch
 }
 
@@ -222,19 +220,19 @@ fn policy_endpoint(stage: &Stage, verb: &str) -> u64 {
 /// would not read back as a policy.
 fn show(stage: &Stage, file: Option<&str>) -> ! {
     let ch = policy_endpoint(stage, "show");
-    let text = match call(ch, OP_VIEWS_SHOW, 1, &[], &[]) {
+    let text = match call_on(&ch, OP_VIEWS_SHOW, 1, &[], &mut Carried::new()) {
         Some((false, body)) => body,
         _ => stage.die(b"with: the broker would not show the policy\n", EXIT_FAILURE),
     };
     match file {
         Some(f) => {
             let path = stage.path(f.as_bytes());
-            if libfs::write_file(stage.namespace, &path, &text).is_err() {
+            if libfs::write(&stage.namespace, &path, &text).is_err() {
                 say(stage, &alloc::format!("cannot write `{f}`"));
                 exit(EXIT_FAILURE);
             }
             say_at(stage, Level::Notice, &alloc::format!("wrote the policy to {f} ({} bytes)", text.len()));
-            libkern::kprint(alloc::format!("with: wrote the policy to a copy ({} bytes)\n", text.len()).as_bytes());
+            log::write(alloc::format!("with: wrote the policy to a copy ({} bytes)\n", text.len()).as_bytes());
         }
         // On `stdout`, as what was asked for: text, however long — one diagnostic could hold only
         // a message's worth, and a longer policy went to the kernel log.
@@ -249,7 +247,7 @@ fn show(stage: &Stage, file: Option<&str>) -> ! {
 
 fn install(stage: &Stage, file: &str) -> ! {
     let path = stage.path(file.as_bytes());
-    let Ok(text) = libfs::read_file(stage.namespace, &path) else {
+    let Ok(text) = libfs::read(&stage.namespace, &path) else {
         say(stage, &alloc::format!("cannot read `{file}`"));
         exit(EXIT_FAILURE);
     };
@@ -258,33 +256,30 @@ fn install(stage: &Stage, file: &str) -> ! {
         exit(EXIT_FAILURE);
     }
     let ch = policy_endpoint(stage, "install");
-    let (o, why) = match call(ch, OP_VIEWS_INSTALL, 1, &text, &[]) {
+    let (o, why) = match call_on(&ch, OP_VIEWS_INSTALL, 1, &text, &mut Carried::new()) {
         Some((false, body)) => outcome(&body),
         _ => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     };
     say_at(stage, level_of(o), &alloc::format!("{file}: {why}"));
     // On the console too, since a terminal on a release image renders nothing a gate can read.
     // Escaped: a reason can quote the policy's own text back.
-    libkern::debug::Line::new().s(b"with: install: ").untrusted(why.as_bytes()).end();
+    Line::new().s(b"with: install: ").untrusted(why.as_bytes()).end();
     exit(if o == Outcome::Started { EXIT_OK } else { EXIT_FAILURE })
 }
 
-fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
+fn run(stage: &mut Stage, view: &str, program: &str, args: &[&str]) -> ! {
     let ch = broker(stage);
     // **A copy of this namespace, not this namespace** — the one a process is spawned with cannot
     // be sent, and the broker copies what it is sent again anyway.
-    // SAFETY: a namespace handle this process holds.
-    let copy = unsafe { syscall1(SYS_NS_DERIVE, stage.namespace) };
-    if copy <= 0 {
+    let Ok(copy) = stage.namespace.copy() else {
         stage.die(b"with: could not copy this session's namespace\n", EXIT_FAILURE);
-    }
+    };
     let mut env = Vec::new();
     let _ = write_value(&mut env, &Value::Record(Arc::new(stage.env.clone())));
     // The program's streams are `with`'s own: stdin and stdout move to it. `stderr` and the
     // terminal go as **duplicates** — `with` still needs one to report on and the other to ask
     // for a password on.
-    let term = stage.terminal.unwrap_or(0);
-    let stderr = stage.streams.stderr.map(dup).filter(|&d| d != 0);
+    let stderr = stage.streams.stderr.as_ref().and_then(dup);
     if stage.streams.stderr.is_some() && stderr.is_none() {
         // **Said, not degraded quietly**, as `nxsh` says it of a stage: a program with no `stderr`
         // writes to the kernel log, which on a machine with no serial port reaches nobody.
@@ -294,16 +289,16 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     // **A token from this terminal**, so a password typed here can be remembered for it. The broker
     // redeems it with the terminal server itself; the terminal handle below is not asked which
     // terminal it is. None, and the request is asked for a password as before.
-    let token = (term != 0).then(|| libviews::token(term, token_deadline())).flatten();
+    let token = stage.terminal.as_ref().and_then(|t| libviews::token(t.raw().0, token_deadline()));
     let handed = Handed {
-        ns: copy as u64,
-        stdin: stage.streams.stdin,
-        stdout: stage.streams.stdout,
-        stderr,
-        terminal: Some(term).filter(|&t| t != 0).map(dup).filter(|&d| d != 0),
+        ns: copy.into_raw().0,
+        stdin: stage.streams.stdin.take().map(|h| h.into_raw().0),
+        stdout: stage.streams.stdout.take().map(|h| h.into_raw().0),
+        stderr: stderr.map(|h| h.into_raw().0),
+        terminal: stage.terminal.as_ref().and_then(dup).map(|h| h.into_raw().0),
         token,
     };
-    let (mut o, mut why) = match libviews::request(ch, view, program, args, &env, handed, u64::MAX) {
+    let (mut o, mut why) = match libviews::request(ch.raw().0, view, program, args, &env, handed, u64::MAX) {
         Ok(answer) => answer,
         Err(libviews::Failed::TooLarge) => stage.die(b"with: the request is too large\n", EXIT_USAGE),
         Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
@@ -311,10 +306,10 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     let mut rid = REQUEST_ID;
     let mut tries = 0u8;
     while o == Outcome::NeedPassword || o == (Outcome::Denied { retry: true }) {
-        if term == 0 {
+        let Some(term) = stage.terminal.as_ref() else {
             let why = b"with: a password is needed and there is no terminal to ask on\n";
             stage.die(why, EXIT_FAILURE);
-        }
+        };
         tries += 1;
         // **Why the last one was refused goes on the terminal, in the same write as the next
         // prompt.** On `stderr` it could reach the screen after the prompt, and `test-interactive`
@@ -326,12 +321,12 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
             prompt.push_str("\r\n");
         }
         prompt.push_str(&alloc::format!("[with {view}] password ({tries} of {TRIES}): "));
-        let Some(mut pw) = ask_password(term, prompt.as_bytes()) else {
+        let Some(mut pw) = ask_password_on(term, prompt.as_bytes()) else {
             // Nobody answered. Closing the channel is the broker's cue to drop the request.
             stage.die(b"with: cancelled\n", EXIT_FAILURE);
         };
         rid += 1;
-        let answer = libviews::password(ch, rid, &pw);
+        let answer = libviews::password(ch.raw().0, rid, &pw);
         scrub(&mut pw);
         (o, why) = match answer {
             Ok(answer) => answer,
@@ -342,47 +337,42 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
         say(stage, &why);
         exit(EXIT_FAILURE);
     }
-    close(term);
+    drop(stage.terminal.take());
     wait_for_exit(stage, ch)
 }
 
-fn wait_for_exit(stage: &Stage, ch: u64) -> ! {
+fn wait_for_exit(stage: &Stage, ch: Handle<Channel, Only>) -> ! {
     let mut asked = false;
     loop {
-        let Some(i) = wait(&[ch, stage.notif]) else {
+        let mut set = WaitSet::<2>::new();
+        let added = set.add(&ch).and_then(|_| stage.notif.as_ref().map_or(Ok(0), |n| set.add(n)));
+        let Some(i) = added.ok().and_then(|_| ready(&set, Deadline::NEVER)) else {
             exit(EXIT_FAILURE);
         };
         if i == 1 {
             // A request to stop, from the shell: pass it on, once. The program decides.
-            loop {
-                // SAFETY: NOTIF is a valid 64-byte out-param.
-                let r = unsafe { syscall4(SYS_NOTIF_RECV, stage.notif, (&raw mut NOTIF) as u64, 0, 0) };
-                if r != 0 {
-                    break;
-                }
-                // SAFETY: the kernel wrote a notification into NOTIF.
-                let kind = unsafe { (&raw const NOTIF.kind).read() };
-                if kind == KIND_TERMINATE_REQUESTED && !asked {
+            while let Some(n) = stage.notif.as_ref().and_then(|q| q.recv().ok().flatten()) {
+                if n.kind == KIND_TERMINATE_REQUESTED && !asked {
                     asked = true;
-                    let _ = send(ch, OP_VIEWS_STOP, 99, &[], &[]);
+                    let _ = transmit(&ch, OP_VIEWS_STOP, 99, &[], &mut Carried::new());
                 }
             }
             continue;
         }
-        match recv(ch) {
+        match receive(&ch) {
             Ok(Some((OP_VIEWS_EXITED, 0, _, body))) => {
                 let (code, crashed) = parse_exited(&body).unwrap_or((1, true));
-                exit(if crashed { EXIT_FAILURE } else { code as i64 })
+                exit(if crashed { EXIT_FAILURE } else { code })
             }
             Ok(_) => continue,
             // The broker went away before saying: the program's fate is unknown.
-            Err(()) => exit(EXIT_FAILURE),
+            Err(_) => exit(EXIT_FAILURE),
         }
     }
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    libkern::kprint(b"with: panic\n");
+    log::write(b"with: panic\n");
     exit(EXIT_FAILURE)
 }
