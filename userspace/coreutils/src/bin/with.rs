@@ -135,7 +135,7 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
 /// `sudo -k`, and silent as it is.
 fn forget(stage: &Stage) -> ! {
     let ch = broker(stage);
-    match libviews::forget(ch.raw().0, u64::MAX) {
+    match libviews::forget(&ch, Deadline::NEVER) {
         Ok(()) => exit(EXIT_OK),
         Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
     }
@@ -143,7 +143,7 @@ fn forget(stage: &Stage) -> ! {
 
 fn list(stage: &Stage) -> ! {
     let ch = broker(stage);
-    let rows = match libviews::list(ch.raw().0, u64::MAX) {
+    let rows = match libviews::list(&ch, Deadline::NEVER) {
         Ok(rows) => rows,
         Err(libviews::Failed::Refused) => {
             stage.die(b"with: the broker could not list your views (does the policy read?)\n", EXIT_FAILURE)
@@ -289,16 +289,16 @@ fn run(stage: &mut Stage, view: &str, program: &str, args: &[&str]) -> ! {
     // **A token from this terminal**, so a password typed here can be remembered for it. The broker
     // redeems it with the terminal server itself; the terminal handle below is not asked which
     // terminal it is. None, and the request is asked for a password as before.
-    let token = stage.terminal.as_ref().and_then(|t| libviews::token(t.raw().0, token_deadline()));
+    let token = stage.terminal.as_ref().and_then(|t| libviews::token(t, Deadline::at(token_deadline())));
     let handed = Handed {
-        ns: copy.into_raw().0,
-        stdin: stage.streams.stdin.take().map(|h| h.into_raw().0),
-        stdout: stage.streams.stdout.take().map(|h| h.into_raw().0),
-        stderr: stderr.map(|h| h.into_raw().0),
-        terminal: stage.terminal.as_ref().and_then(dup).map(|h| h.into_raw().0),
+        ns: copy,
+        stdin: stage.streams.stdin.take(),
+        stdout: stage.streams.stdout.take(),
+        stderr,
+        terminal: stage.terminal.as_ref().and_then(dup),
         token,
     };
-    let (mut o, mut why) = match libviews::request(ch.raw().0, view, program, args, &env, handed, u64::MAX) {
+    let (mut o, mut why) = match libviews::request(&ch, view, program, args, &env, handed, Deadline::NEVER) {
         Ok(answer) => answer,
         Err(libviews::Failed::TooLarge) => stage.die(b"with: the request is too large\n", EXIT_USAGE),
         Err(_) => stage.die(b"with: the broker did not answer\n", EXIT_FAILURE),
@@ -326,7 +326,7 @@ fn run(stage: &mut Stage, view: &str, program: &str, args: &[&str]) -> ! {
             stage.die(b"with: cancelled\n", EXIT_FAILURE);
         };
         rid += 1;
-        let answer = libviews::password(ch.raw().0, rid, &pw);
+        let answer = libviews::password(&ch, rid, &pw);
         scrub(&mut pw);
         (o, why) = match answer {
             Ok(answer) => answer,

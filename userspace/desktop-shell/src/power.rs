@@ -90,18 +90,18 @@ pub(super) fn end_session(asked: Asked) -> ! {
 /// How long the shell waits for the view broker before calling it gone; it answers at once.
 const BROKER_WAIT_NS: u64 = 5_000_000_000;
 
-fn broker_deadline() -> u64 {
-    now_ns().map_or(u64::MAX, |n| n.saturating_add(BROKER_WAIT_NS))
+fn broker_deadline() -> Deadline {
+    now_ns().map_or(Deadline::NEVER, |n| Deadline::at(n.saturating_add(BROKER_WAIT_NS)))
 }
 
 /// Whether this session's policy would refuse a Restart or a Shut down, asked of the broker with
 /// `Decide` before any window is asked to close. `None` to go on; the request after the windows
 /// close still decides.
 pub(super) fn power_refusal(session_ns: Root<'_>) -> Option<Refusal> {
-    let Some(ch) = broker(session_ns) else {
+    let Some(ch) = libviews::broker(session_ns) else {
         return Some(Refusal::Failed(alloc::string::String::from(failed::NO_BROKER)));
     };
-    let answer = libviews::decide(ch.raw().0, POWER_VIEW, POWER_PROGRAM, broker_deadline());
+    let answer = libviews::decide(&ch, POWER_VIEW, POWER_PROGRAM, broker_deadline());
     drop(ch);
     match answer {
         Ok((outcome, why)) => Refusal::from_answer(outcome, why),
@@ -120,7 +120,7 @@ pub(super) fn power_refusal(session_ns: Root<'_>) -> Option<Refusal> {
 pub(super) fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<Endpoint, Refusal> {
     use libviews::Outcome;
     let failure = |why: &str| Refusal::Failed(alloc::string::String::from(why));
-    let Some(ch) = broker(l.session_ns) else {
+    let Some(ch) = libviews::broker(l.session_ns) else {
         return Err(failure(failed::NO_BROKER));
     };
     let Some(built) = build_app_namespace(l) else {
@@ -137,8 +137,8 @@ pub(super) fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<Endpoint,
     }
     let args = ending.power_args().unwrap_or(&[]);
     // `request` takes the namespace, sent or closed.
-    let handed = libviews::Handed { ns: built.ns.into_raw().0, ..libviews::Handed::default() };
-    let refusal = match libviews::request(ch.raw().0, POWER_VIEW, POWER_PROGRAM, args, &[], handed, broker_deadline()) {
+    let handed = libviews::Handed::new(built.ns);
+    let refusal = match libviews::request(&ch, POWER_VIEW, POWER_PROGRAM, args, &[], handed, broker_deadline()) {
         Ok((Outcome::Started, _)) => {
             Line::new()
                 .s(b"desktop-shell: ")
@@ -156,12 +156,6 @@ pub(super) fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<Endpoint,
         Err(f) => failure(f.why()),
     };
     Err(refusal)
-}
-
-/// A channel to the view broker at the session's [`libviews::BROKER_PATH`], tied to the session.
-fn broker(ns: Root<'_>) -> Option<Endpoint> {
-    let path = core::str::from_utf8(libviews::BROKER_PATH).ok()?;
-    libprompt::ipc::lookup_in(ns, path, Rights::SEND | Rights::RECV | Rights::WAIT)
 }
 
 /// Say why a Restart or a Shut down did not happen, on the console and in a dialog under the power

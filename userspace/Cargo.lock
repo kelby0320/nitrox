@@ -374,8 +374,8 @@ dependencies = [
 name = "libviews"
 version = "0.1.0"
 dependencies = [
- "libfs",
  "libkern",
+ "libos",
  "libprompt",
  "librsproto",
 ]
