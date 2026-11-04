@@ -440,6 +440,7 @@ dependencies = [
  "libgpt",
  "libheap",
  "libkern",
+ "libos",
  "libprompt",
  "libstream",
  "libusers",

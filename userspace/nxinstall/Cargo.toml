@@ -30,6 +30,7 @@ fs-server-ext4 = { path = "../fs-server-ext4" }
 # crate's own until `disk --format` needed it too (Phase 6 Part G.2).
 libfsserver = { path = "../libfsserver" }
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 libheap = { path = "../libheap" }
 # `ns_children`, to list the devices this namespace was given rather than probe for them
 # (administration Part B.5).
