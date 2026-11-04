@@ -7,7 +7,6 @@
 "userspace/compositor" = 95
 "userspace/coreutils" = 153
 "userspace/desktop-shell" = 73
-"userspace/device-mgr" = 48
 "userspace/eshell" = 44
 "userspace/heartbeat" = 9
 "userspace/hello" = 58

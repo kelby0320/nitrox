@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
-librsproto = { path = "../librsproto" }
-libfs = { path = "../libfs" }
+libos = { path = "../libos" }
+librsproto = { path = "../librsproto", features = ["io"] }
 libstream = { path = "../libstream" }
 
 # The library/binary split every resource server here uses: the library is what can be wrong
