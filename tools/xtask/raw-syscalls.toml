@@ -17,7 +17,6 @@
 "userspace/nxsh" = 35
 "userspace/nxterm" = 82
 "userspace/test-harness" = 863
-"userspace/view-broker" = 38
 
 [agreed]
 "userspace/eshell" = "the recovery shell, on libkern by choice"

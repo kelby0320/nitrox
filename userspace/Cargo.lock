@@ -576,6 +576,7 @@ dependencies = [
  "libheap",
  "libkern",
  "liblog",
+ "libos",
  "librsproto",
  "libsession",
  "libstream",
