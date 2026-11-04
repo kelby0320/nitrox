@@ -224,6 +224,24 @@ pub unsafe fn thread_create(args: &ThreadArgs) -> i64 {
     unsafe { syscall1(libkern::SYS_THREAD_CREATE, args as *const ThreadArgs as u64) }
 }
 
+/// `sys_timer_create`, with no flags, as none is defined.
+pub fn timer_create() -> i64 {
+    // SAFETY: a register-only call.
+    unsafe { syscall1(libkern::SYS_TIMER_CREATE, 0) }
+}
+
+/// `sys_timer_set(timer, at, interval)`: `at` an absolute monotonic time, `0` disarming.
+pub fn timer_set(timer: u64, at: u64, interval: u64) -> i64 {
+    // SAFETY: a register-only call.
+    unsafe { syscall3(libkern::SYS_TIMER_SET, timer, at, interval) }
+}
+
+/// `sys_clock_set(CLOCK_REALTIME, ns)`: `CLOCK_SET_KEPT` or `CLOCK_SET_THIS_BOOT`, or an error.
+pub fn clock_set(ns: u64) -> i64 {
+    // SAFETY: a register-only call.
+    unsafe { syscall2(libkern::SYS_CLOCK_SET, libkern::CLOCK_REALTIME, ns) }
+}
+
 /// `sys_entropy_create` — a handle onto the kernel's generator.
 pub fn entropy_create() -> i64 {
     // SAFETY: a call with no arguments.

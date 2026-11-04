@@ -86,12 +86,12 @@ gives one out once.
 | `fs` | `create`, `grow`, `truncate`, `rename` and `flush`: a file by path |
 | `process` | `Spawn`, by image or by path, and `exit` |
 | `thread` | `Stack`, and `start` |
-| `time` | `now`, `wall`, `sleep`, `sleep_until`, and `Deadline` |
+| `time` | `now`, `wall`, `sleep`, `sleep_until`, `Deadline`, and a `Timer`'s `create`, `set` and `disarm` |
 | `log` | `write`, and `Line`, one write a line |
 | `entropy` | `fill`, and `try_fill` for a caller that cannot wait for the seeding |
 | `boot` | `Start`: `_start`'s four registers, owned and typed |
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
-| `system` | `stop`, the machine halted or reset with the system-control object, and `test_verdict` |
+| `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |
 | `io` | a `Resource`'s `read` and `write`, and a notification queue's `recv` |
 
 **A `Mapping` lends no reference to its bytes.** Another process mapping the same object, or a

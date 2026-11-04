@@ -99,6 +99,11 @@ pub fn set_realtime(ns: u64) {
     with(|m| m.realtime = Some(ns));
 }
 
+/// Answer the next clock set in range with `r`, a refusal or `CLOCK_SET_THIS_BOOT`.
+pub fn answer_next_clock_set(r: i64) {
+    with(|m| m.clock_answer = Some(r));
+}
+
 /// A handle to a device that `io_submit` takes, with `READ | WRITE`.
 pub fn device() -> u64 {
     with(|m| m.mint(Object::Device, Rights::READ | Rights::WRITE) as u64)

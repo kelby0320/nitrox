@@ -2280,11 +2280,13 @@ registration going reaches it, which takes `service-mgr` with it.
 `Namespace::flush` and `fs::flush` are `async` though `sys_ns_sync` and `sys_file_sync` answer
 within the call; `Spawn::path` hands the kernel a file, which it reads within the spawn;
 `entropy::fill` makes an `EntropyObject` for each call; `system::stop` takes the system-control
-object as a char node, which it is not yet. Each caller is written once, against the shape it will
+object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
+its authority is the `SYSTEM_CLOCK` grant until there is a clock node to hold, so its one caller,
+`date`, passes one when E.10 makes it. Every other caller is written once, against the shape it will
 keep, and the call under it changes as its sub-part of
 [`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 makes both flushes resolves or an
 `io_submit`, E.8 makes `Spawn` read the image into memory first, E.9 makes entropy a node, and
-E.10 makes a stop a `Write` to the power node. Trigger: each of those sub-parts.
+E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: each of those sub-parts.
 
 **Any process can end a test run — `TODO(test-verdict-authority)`.** `sys_test_exit` checks no
 handle and no syscap: a kernel built with the test harness writes the verdict to `isa-debug-exit`
