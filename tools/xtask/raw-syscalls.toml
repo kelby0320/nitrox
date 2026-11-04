@@ -9,7 +9,6 @@
 "userspace/desktop-shell" = 73
 "userspace/eshell" = 44
 "userspace/libheap" = 5
-"userspace/nxsh" = 35
 "userspace/test-harness" = 863
 
 [agreed]

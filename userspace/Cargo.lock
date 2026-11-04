@@ -456,6 +456,7 @@ dependencies = [
  "libheap",
  "libkern",
  "libline",
+ "libos",
  "librsproto",
  "libstream",
 ]

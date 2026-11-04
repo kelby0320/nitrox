@@ -20,24 +20,22 @@
 
 extern crate alloc;
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use libkern::{Received, channel_recv_raw};
-
-use libkern::abi::{CLOCK_MONOTONIC, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
-use libkern::handle::{RIGHT_DUPLICATE, RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_SEND, RIGHT_TRANSFER};
-use libkern::syscall::{
-    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
-    SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE, SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE, SYS_WAIT, syscall1,
-    syscall2, syscall3, syscall4, syscall5,
-};
-use libkern::{exit, kprint};
+use libkern::Rights;
+use libkern::abi::{IPC_PAYLOAD_SIZE, NS_ENTRY_PATH_MAX};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Channel, Deadline, File, Handle, MapRead, Msg, Namespace, NsReadOnly, Only, Ref, WaitSet, block_on};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
-use libstream::setup::{bootstrap, bootstrap_arg0, pipe, send_setup_full};
+use libstream::setup::{StageStreams, receive_setup, setup_is_pending};
 use libstream::wire::ByteSink;
 use nxsh::host::{Host, PipelineRun, StageSpec, StageStatus};
-use nxsh::pipeline::Pipeline;
+use nxsh::pipeline::{Pipeline, Sys};
 use nxsh::{Interp, RunMode};
+use signals::Signals;
+use tty::Tty;
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -56,134 +54,74 @@ const EXIT_USAGE: i64 = 64;
 /// Where an unqualified program name is looked up: a short fixed list, not an ambient search path.
 /// A session sees the programs its namespace was built with; `/initramfs/sbin` is absent because no
 /// session namespace binds `/initramfs`.
-const PROGRAM_DIRS: &[&[u8]] = &[b"/bin/"];
+const PROGRAM_DIRS: &[&str] = &["/bin/"];
 
 /// Cap on a captured stage output, so a spawned program cannot run the shell out of memory.
 const MAX_CAPTURE: usize = 1 << 20;
-
-const KIND_CHILD_EXITED: u32 = 0x0200;
-/// `TerminateRequested`: someone holding this shell's process handle (its session's supervisor, at
-/// a shutdown) asks it to exit.
-const KIND_TERMINATE_REQUESTED: u32 = libkern::abi::KIND_TERMINATE_REQUESTED;
-/// `ExitStatus.kind` for a normal exit; anything else means the process died.
-const EXIT_KIND_NORMAL: u32 = 0;
-
-// `libkern`'s own type, not a local copy: the body sits at offset 4, and a local pad put it at 8,
-// reporting every non-zero exit as a crash.
-static mut NOTIF: libkern::abi::Notification = libkern::abi::Notification { kind: 0, body: [0; 60] };
-/// Waiters: the pipeline's output, the terminal (so `Ctrl-C` reaches a slow stage, §11h), its
-/// shared `stderr` (diagnostics appear while a stage works) and the notification channel (a
-/// shutdown's terminate request).
-static mut WAIT_HANDLES: [u64; 4] = [0; 4];
-const WAIT_RESULTS_LEN: usize = 96;
-static mut WAIT_RESULTS: [u8; WAIT_RESULTS_LEN] = [0; WAIT_RESULTS_LEN];
-
-/// Was `handle` among the `n` results `sys_wait` just wrote?
-///
-/// `IoResult.handle` is at offset 0 of each 24-byte record. Without reading it a caller cannot tell
-/// a diagnostic arriving from the pipeline's output, and would block reading output that is not
-/// there.
-fn signalled(n: i64, handle: u64) -> bool {
-    if n < 1 {
-        return false;
-    }
-    let n = (n as usize).min(WAIT_RESULTS_LEN / 24);
-    // SAFETY: the syscall wrote `n` records, and `n` is clamped to the records the array holds.
-    unsafe {
-        let r = &raw const WAIT_RESULTS as *const u8;
-        (0..n).any(|i| {
-            let mut bits = [0u8; 8];
-            core::ptr::copy_nonoverlapping(r.add(i * 24), bits.as_mut_ptr(), 8);
-            u64::from_le_bytes(bits) == handle
-        })
-    }
-}
-
-static mut ERR_MSG: [u8; 4096] = [0; 4096];
 
 /// Write every diagnostic waiting on `err` to the terminal, and do not block.
 ///
 /// Each is one whole message: `stderr` is shared between stages, and a partial line would
 /// interleave.
-fn drain_diagnostics(err: u64, tty: u64) {
-    if err == 0 {
-        return;
-    }
-    // SAFETY: single-threaded shell; valid recv out-params.
-    unsafe {
-        loop {
-            // Every spawned program holds a `SEND` duplicate of this endpoint, so a stage can send
-            // handles: they close as `_sent` drops, or the shell's spawns would fail in the end.
-            let Ok(_sent) = channel_recv_raw(err, &raw mut ERR_MSG) else {
-                break; // WouldBlock (nothing waiting) or the last stage has closed its end
+fn drain_diagnostics(err: Option<Ref<'_, Channel, Only>>, tty: Option<&Tty>) {
+    let Some(err) = err else { return };
+    let mut msg = Msg::new();
+    loop {
+        // Every spawned program holds a `SEND` duplicate of this endpoint, so a stage can send
+        // handles: they close as `_sent` drops, or the shell's spawns would fail in the end.
+        let Ok(_sent) = err.recv(&mut msg) else {
+            break; // WouldBlock (nothing waiting) or the last stage has closed its end
+        };
+        let (level, text) = libstream::diag::parse(msg.payload());
+        let Ok(text) = core::str::from_utf8(text) else {
+            continue; // a diagnostic is text; anything else is not ours to render
+        };
+        // Strip the newline: `write_crlf` ends every line.
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        if let Some(tty) = tty {
+            // Drawn like the shell's own errors, a warning in its own colour, a notice plain
+            // (see `repl::diagnostic`).
+            let painted = match nxsh::style::for_level(level) {
+                Some(sgr) => nxsh::style::paint(true, sgr, text),
+                None => alloc::string::String::from(text),
             };
-            let len = u32::from_le_bytes([ERR_MSG[4], ERR_MSG[5], ERR_MSG[6], ERR_MSG[7]]) as usize;
-            let text = core::slice::from_raw_parts(((&raw const ERR_MSG) as *const u8).add(24), len.min(4096 - 24));
-            let (level, text) = libstream::diag::parse(text);
-            let Ok(text) = core::str::from_utf8(text) else {
-                continue; // a diagnostic is text; anything else is not ours to render
-            };
-            // Strip the newline: `tty_write_crlf` ends every line.
-            let text = text.strip_suffix('\n').unwrap_or(text);
-            if tty != 0 {
-                // Drawn like the shell's own errors, a warning in its own colour, a notice plain
-                // (see `repl::diagnostic`).
-                let painted = match nxsh::style::for_level(level) {
-                    Some(sgr) => nxsh::style::paint(true, sgr, text),
-                    None => alloc::string::String::from(text),
-                };
-                tty_write_crlf(tty, &painted);
-            } else {
-                kprint(text.as_bytes());
-                kprint(b"\n");
-            }
+            tty.write_crlf(&painted);
+        } else {
+            log::write(text.as_bytes());
+            log::write(b"\n");
         }
     }
 }
-static mut SPAWN: SpawnArgs = SpawnArgs {
-    image: 0,
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 0,
-    handles: [0; SPAWN_MAX_HANDLES],
-    rights: [u64::MAX; SPAWN_MAX_HANDLES],
-    namespace: 0,
-    // Whatever this shell holds, passed on; the kernel intersects it with its own (child = parent &
-    // asked): nothing in a session, `SYSTEM_CLOCK` in a view with the `clock` grant, so `with admin
-    // nxsh` has a working `date --set`.
-    syscaps: u64::MAX,
-};
 
+mod signals;
 mod stage;
 mod stages;
+mod tty;
 
 struct NitroxHost {
-    namespace: u64,
-    notif: u64,
-    /// The terminal, for §11h's interrupt checkpoint. `0` when there is none (a script or a Tier-0
-    /// stage).
-    tty: u64,
+    namespace: Handle<Namespace, NsReadOnly>,
+    signals: Rc<Signals>,
+    /// The terminal, for §11h's interrupt checkpoint. `None` when there is none (a script or a
+    /// Tier-0 stage).
+    tty: Option<Rc<Tty>>,
 }
 
 impl NitroxHost {
     /// Say `text` where the person will see it: the terminal if there is one, else the kernel log,
     /// which reaches COM1 only.
     fn say(&mut self, text: &str) {
-        if self.tty != 0 {
-            tty_write_crlf(self.tty, text.strip_suffix('\n').unwrap_or(text));
-        } else {
-            kprint(text.as_bytes());
+        match &self.tty {
+            Some(tty) => tty.write_crlf(text.strip_suffix('\n').unwrap_or(text)),
+            None => log::write(text.as_bytes()),
         }
     }
 
-    fn resolve_program(&mut self, name: &str) -> Result<u64, String> {
+    fn resolve_program(&mut self, name: &str) -> Result<Handle<File, MapRead>, String> {
         if nxsh::exec::is_path_head(name) {
-            return lookup(self.namespace, name.as_bytes()).ok_or_else(|| alloc::format!("`{name}` does not resolve"));
+            return lookup(&self.namespace, name).ok_or_else(|| alloc::format!("`{name}` does not resolve"));
         }
         for dir in PROGRAM_DIRS {
-            let mut path = Vec::from(*dir);
-            path.extend_from_slice(name.as_bytes());
-            if let Some(h) = lookup(self.namespace, &path) {
+            if let Some(h) = lookup(&self.namespace, &alloc::format!("{dir}{name}")) {
                 return Ok(h);
             }
         }
@@ -209,30 +147,30 @@ impl Host for NitroxHost {
         for s in stages {
             match self.resolve_stage(s, env) {
                 Ok((img, argv)) => {
-                    images.0.push(img);
+                    images.0.push(Some(img));
                     argvs.push(argv);
                 }
                 Err(e) => {
                     // Said on the debug console too: under `nxterm` errors go to a grid that
                     // renders only under `test-harness`, so an unfound command would fail silently.
-                    libkern::debug::Line::new().s(b"nxsh: could not resolve `").s(s.program.as_bytes()).s(b"`").end();
+                    Line::new().s(b"nxsh: could not resolve `").s(s.program.as_bytes()).s(b"`").end();
                     return Err(e);
                 }
             }
         }
 
-        let (notif, tty) = (self.notif, self.tty);
+        let (signals, tty) = (self.signals.clone(), self.tty.clone());
+        let tty = tty.as_deref();
         let names: Vec<&str> = stages.iter().map(|s| s.program.as_str()).collect();
-        let mut p = Pipeline::new(stages::Stages { host: self, images, argvs: &argvs, env });
+        let mut p = Pipeline::new(stages::Stages::new(self, images, &argvs, env));
         let ends = p.start(&names, input.is_some())?;
 
         // An interrupt that arrived during setup: handing a stage its terminal is a tty exchange,
-        // and `tty_await_reply` records a `Ctrl-C` there rather than leaving it queued, so the
+        // and `Tty::await_reply` records a `Ctrl-C` there rather than leaving it queued, so the
         // waits below would never see it and `sleep 60` would run its minute (`test-interactive`
         // step 19). The flag stays set for the evaluator's checkpoint.
-        // SAFETY: INTERRUPTED is a process-wide flag read and written only from this thread
-        if unsafe { (&raw const INTERRUPTED).read() } {
-            terminate_all(p.parts().0);
+        if signals.interrupted() {
+            terminate_all(&mut p);
         }
 
         // Feed the head stage only once everything downstream is running.
@@ -241,13 +179,16 @@ impl Host for NitroxHost {
         // stage that stops reading `stdin` stops the shell, and a stage blocked on its 37th unread
         // diagnostic is such a stage. Closing it needs an interleaved send in `ChannelSink`.
         if let (Some(tx), Some(bytes)) = (ends.feed, input) {
-            drain_diagnostics(ends.diagnostics, tty);
-            let mut sender = ChannelSink::new(IpcPort::new(tx), libkern::abi::IPC_PAYLOAD_SIZE);
-            let _ = sender.put(bytes);
-            let _ = sender.finish();
-            // Closed, so the stage sees the stream end.
+            drain_diagnostics(p.sys.channel(ends.diagnostics), tty);
+            if let Some(feed) = p.sys.take_channel(tx) {
+                let mut sender = ChannelSink::new(IpcPort::owning(feed), IPC_PAYLOAD_SIZE);
+                let _ = sender.put(bytes);
+                let _ = sender.finish();
+                // Closed, so the stage sees the stream end.
+                drop(sender);
+            }
             p.close(tx);
-            drain_diagnostics(ends.diagnostics, tty);
+            drain_diagnostics(p.sys.channel(ends.diagnostics), tty);
         }
 
         // Read the tail *before* reaping: a stage that has filled its channel is waiting
@@ -256,7 +197,7 @@ impl Host for NitroxHost {
         let mut output: Option<Vec<u8>> = None;
         // Whether a terminate was passed on; the exits read here are kept for `reap`.
         let mut stop_sent = false;
-        if let Some(rx) = ends.capture {
+        if let Some((rx, tail)) = ends.capture.and_then(|rx| Some((rx, p.sys.take_channel(rx)?))) {
             // The terminal is watched here, not only in `reap` (§11h): the tail's output does not
             // close until the last stage exits, so `sleep 60 | …` blocks here. Diagnostics are
             // drained here too, with or without a terminal, or a long job's progress would arrive
@@ -265,41 +206,44 @@ impl Host for NitroxHost {
             // One loop that waits, drains and reads, taking the tail's messages one at a time
             // rather than through `ChannelReceiver::receive`, which loops on `rx` alone: a stage
             // blocked on its 37th unread diagnostic would never send its `last` message.
-            let mut port = IpcPort::new(rx);
+            let mut port = IpcPort::owning(tail);
             let mut bytes: Vec<u8> = Vec::new();
             let mut complete = false;
             let mut overflowed = false;
             loop {
                 // The notification channel too: a terminate request must reach the stages during
                 // this wait, and a stage's exit read here is kept for `reap`.
-                let (children, exits) = p.parts();
-                drain_notifications(notif, children, &mut stop_sent, exits);
+                drain_notifications(&mut p, &signals, &mut stop_sent);
                 // Poll before blocking: a waiter arriving after a message was enqueued never sees
                 // that edge, and the tty queues the interrupt in the same console read as the line
                 // that started the pipeline.
-                drain_diagnostics(ends.diagnostics, tty);
-                if tty != 0 && drain_tty_interrupt(tty) {
-                    terminate_all(p.parts().0);
+                drain_diagnostics(p.sys.channel(ends.diagnostics), tty);
+                if let Some(tty) = tty
+                    && tty.poll_interrupt()
+                {
+                    terminate_all(&mut p);
                     continue;
                 }
-                // SAFETY: valid waiter buffers; three or four handles.
-                let waited = unsafe {
-                    WAIT_HANDLES[0] = rx;
-                    WAIT_HANDLES[1] = ends.diagnostics;
-                    WAIT_HANDLES[2] = notif;
-                    let n = if tty != 0 {
-                        WAIT_HANDLES[3] = tty;
-                        4
-                    } else {
-                        3
-                    };
-                    syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+                let waited = {
+                    let mut set = WaitSet::<4>::new();
+                    let _ = set.add(port.channel());
+                    if let Some(diagnostics) = p.sys.channel(ends.diagnostics) {
+                        let _ = set.add(diagnostics);
+                    }
+                    if let Some(notify) = signals.notify() {
+                        let _ = set.add(notify);
+                    }
+                    if let Some(tty) = tty {
+                        let _ = set.add(tty.channel());
+                    }
+                    set.wait(Deadline::NEVER)
                 };
-                if waited < 1 {
-                    break; // the wait failed; there is nothing more to read
-                }
+                let output_ready = match waited {
+                    Ok(found) if !found.is_empty() => found.contains(0),
+                    _ => break, // the wait failed; there is nothing more to read
+                };
                 // Only `rx` means output; reading on any other wake would block.
-                if signalled(waited, rx) {
+                if output_ready {
                     match port.recv(&mut bytes) {
                         Ok(true) => {
                             complete = true;
@@ -316,29 +260,29 @@ impl Host for NitroxHost {
                     }
                 }
             }
-            drain_diagnostics(ends.diagnostics, tty);
+            drain_diagnostics(p.sys.channel(ends.diagnostics), tty);
             if overflowed {
                 return Err(String::from("a stage produced more output than nxsh will hold"));
             }
             if complete && !bytes.is_empty() {
                 output = Some(bytes);
             }
+            drop(port);
             p.close(rx);
         }
 
-        let (children, exits) = p.parts();
-        let reaped = reap(notif, tty, ends.diagnostics, children, stages, strict, exits, stop_sent);
+        let reaped = reap(&mut p, &signals, tty, ends.diagnostics, stages, strict, stop_sent);
         p.reaped();
         // One last drain, after every stage is gone: a program's final word can be sent just before
         // `exit`, after the wait that noticed the exit returned.
-        drain_diagnostics(ends.diagnostics, tty);
+        drain_diagnostics(p.sys.channel(ends.diagnostics), tty);
         p.close(ends.diagnostics);
 
         Ok(PipelineRun { stages: reaped, output })
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
-        libfs::read_file(self.namespace, path.as_bytes()).map_err(|e| match e {
+        libfs::read(&self.namespace, path).map_err(|e| match e {
             libfs::FileError::NotFound => alloc::format!("cannot open `{path}`"),
             libfs::FileError::TooLarge => alloc::format!("`{path}` is too large to open"),
             _ => alloc::format!("cannot read `{path}`"),
@@ -347,7 +291,7 @@ impl Host for NitroxHost {
 
     /// Replace `path` with `bytes` (`save`).
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        libfs::save_file(self.namespace, path.as_bytes(), bytes).map_err(|e| match e {
+        libfs::save(&self.namespace, path, bytes).map_err(|e| match e {
             libfs::SaveError::Write(libfs::FileError::TooLarge) => alloc::format!("`{path}` is too large to save"),
             _ => alloc::format!("cannot save `{path}`"),
         })
@@ -357,28 +301,22 @@ impl Host for NitroxHost {
         // A path can be real in three ways, and `cd` must accept all three.
         // 1. It names a binding, or sits above one (`/`, `/bin`): nothing resolves at it, but
         // `list` shows it, so ask the namespace the same question `list` does.
-        if binding_at_or_under(self.namespace, path) {
+        if binding_at_or_under(&self.namespace, path) {
             return true;
         }
         // 2. It resolves to an object — an ordinary file.
-        match lookup(self.namespace, path.as_bytes()) {
-            Some(h) => {
-                // SAFETY: closing a handle just installed into our table.
-                unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        if lookup::<File, MapRead>(&self.namespace, path).is_some() {
+            return true;
+        }
+        // 3. A *directory* does not resolve to a mappable object, so a failed lookup
+        //    is not proof of absence — a directory session is what answers for one.
+        let mut msg = Msg::new();
+        match librsproto::session::Dir::resolve(&self.namespace, path, &mut msg) {
+            Ok(d) => {
+                d.close();
                 true
             }
-            // 3. A *directory* does not resolve to a mappable object, so a failed lookup
-            //    is not proof of absence — a directory session is what answers for one.
-            None => {
-                let mut buf = [0u8; 4096];
-                match librsproto::session::Dir::open(self.namespace, path.as_bytes(), &mut buf) {
-                    Ok(d) => {
-                        d.close();
-                        true
-                    }
-                    Err(_) => false,
-                }
-            }
+            Err(_) => false,
         }
     }
 
@@ -387,8 +325,8 @@ impl Host for NitroxHost {
         // run.
         let mut out = Vec::new();
         for dir in PROGRAM_DIRS {
-            let path = dir.strip_suffix(b"/").unwrap_or(dir);
-            if let Ok(entries) = libfs::list_dir(self.namespace, path) {
+            let path = dir.strip_suffix('/').unwrap_or(dir);
+            if let Ok(entries) = libfs::list_directory(&self.namespace, path) {
                 for e in entries {
                     out.push(String::from_utf8_lossy(e.name()).into_owned());
                 }
@@ -400,7 +338,7 @@ impl Host for NitroxHost {
     fn list_dir(&mut self, dir: &str) -> Vec<(String, bool)> {
         // The filesystem-and-namespace union `list` shows; `cd` and Tab must ask the same question
         // (`nxsh/CLAUDE.md`).
-        match libfs::list_dir(self.namespace, dir.as_bytes()) {
+        match libfs::list_directory(&self.namespace, dir) {
             Ok(entries) => entries
                 .iter()
                 .map(|e| (String::from_utf8_lossy(e.name()).into_owned(), e.kind == librsproto::file::DIRENT_KIND_DIR))
@@ -410,10 +348,10 @@ impl Host for NitroxHost {
     }
 
     fn diag(&mut self, text: &str) {
-        // Not painted: every caller but one is script mode, whose host has `tty: 0` and plain-text
-        // output. The exception is `time`'s line, plain on purpose since it is read off a laptop
-        // screen and a serial console. It also arrives in fragments, so there is no whole run to
-        // bracket; the REPL paints in `run_and_render`.
+        // Not painted: every caller but one is script mode, whose host has no terminal and
+        // plain-text output. The exception is `time`'s line, plain on purpose since it is read off a
+        // laptop screen and a serial console. It also arrives in fragments, so there is no whole run
+        // to bracket; the REPL paints in `run_and_render`.
         self.say(text);
     }
 
@@ -423,58 +361,29 @@ impl Host for NitroxHost {
         // A terminate request, between statements: read off the notification channel here too, so a
         // loop that runs no stage still sees it. `reap` has counted every exit before a pipeline
         // returns.
-        // SAFETY: single-threaded shell; set once at startup.
-        let notif = unsafe { NOTIF_CH };
-        if notif != 0 {
-            drain_notifications(notif, &[], &mut false, &mut Vec::new());
-        }
-        // SAFETY: single-threaded shell.
-        if unsafe { (&raw const STOP_ASKED).read() } {
+        self.signals.drain(&mut Vec::new());
+        if self.signals.stop_asked() {
             return true;
         }
-        if self.tty == 0 {
-            return false;
-        }
-        // SAFETY: single-threaded shell; valid recv out-params.
-        unsafe {
-            loop {
-                let Ok(_sent) = channel_recv_raw(self.tty, &raw mut TTY_MSG) else {
-                    break; // WouldBlock: nothing queued, which is the common case
-                };
-                let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
-                let rep = core::slice::from_raw_parts(
-                    ((&raw const TTY_MSG) as *const u8).add(24),
-                    payload_len.min(4096 - 24),
-                );
-                if let Ok(m) = librsproto::decode(rep)
-                    && m.op == librsproto::OP_TTY_INTERRUPT
-                {
-                    INTERRUPTED = true;
-                }
-            }
-            let hit = (&raw const INTERRUPTED).read();
-            (&raw mut INTERRUPTED).write(false);
-            hit || (&raw const STOP_ASKED).read()
-        }
+        let Some(tty) = &self.tty else { return false };
+        tty.poll_interrupt();
+        self.signals.take_interrupt() || self.signals.stop_asked()
     }
 
     /// The kernel's monotonic clock, for `time`.
     fn now_ns(&mut self) -> Option<u64> {
-        let mut ns = 0u64;
-        // SAFETY: `ns` is a writable `u64`, which is what the kernel writes the clock's value into.
-        let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut ns) as u64) };
-        (r == 0).then_some(ns)
+        libos::time::now().ok()
     }
 
-    /// `display`'s output goes to the terminal when there is one, else to `kprint`. A shell with no
-    /// terminal still writes without a handle, so nothing can redirect it.
+    /// `display`'s output goes to the terminal when there is one, else to the kernel log. A shell
+    /// with no terminal still writes without a handle, so nothing can redirect it.
     /// TODO(tty-server): `docs/rationale/deferred-decisions.md`.
     fn out(&mut self, text: &str) {
         self.say(text);
     }
 
     fn styled(&mut self) -> bool {
-        self.tty != 0
+        self.tty.is_some()
     }
 }
 
@@ -485,49 +394,53 @@ impl Host for NitroxHost {
 /// chain reports the aggregate truthfully and marks each entry with the status of some stage, not
 /// claiming which. Filed as `TODO(pipeline-stage-attribution)`; the fix is a pid on `HandleInfo`
 /// for a process handle, or a handle in the notification, and it is an ABI change.
-#[allow(clippy::too_many_arguments, reason = "a pipeline's channels, stages and what the capture wait already read")]
 fn reap(
-    notif: u64,
-    tty: u64,
+    p: &mut Pipeline<stages::Stages<'_>>,
+    signals: &Signals,
+    tty: Option<&Tty>,
     err: u64,
-    children: &[u64],
     stages: &[StageSpec],
     strict: bool,
-    // Exits the capture wait read before this ran, and whether it passed a terminate request on.
-    seen: &mut Vec<(i32, bool)>,
+    // Whether the capture wait passed a terminate request on.
     stop_sent: bool,
 ) -> Vec<StageStatus> {
+    let children = p.parts().0.len();
     let mut asked = stop_sent;
-    while seen.len() < children.len() {
+    while p.parts().1.len() < children {
         // Wait on the terminal as well as the children: this is the only place `Ctrl-C` is noticed
         // while a stage is slow (§11h). Diagnostics are drained here too: a pipeline with nothing
         // on its tail spends the whole job in this loop.
-        drain_diagnostics(err, tty);
-        // SAFETY: valid waiter buffers; two or three handles.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = notif;
-            WAIT_HANDLES[1] = err;
-            let n = if tty != 0 {
-                WAIT_HANDLES[2] = tty;
-                3
-            } else {
-                2
-            };
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+        drain_diagnostics(p.sys.channel(err), tty);
+        let waited = {
+            let mut set = WaitSet::<3>::new();
+            if let Some(notify) = signals.notify() {
+                let _ = set.add(notify);
+            }
+            if let Some(diagnostics) = p.sys.channel(err) {
+                let _ = set.add(diagnostics);
+            }
+            if let Some(tty) = tty {
+                let _ = set.add(tty.channel());
+            }
+            set.wait(Deadline::NEVER)
         };
-        drain_diagnostics(err, tty);
-        if waited < 1 {
+        drain_diagnostics(p.sys.channel(err), tty);
+        if !matches!(waited, Ok(found) if !found.is_empty()) {
             continue;
         }
         // Poll before blocking, for the same reason as the capture wait above. Every stage is asked
         // to stop, once; a stage that ignores the request is still waited for.
-        if tty != 0 && !asked && drain_tty_interrupt(tty) {
+        if let Some(tty) = tty
+            && !asked
+            && tty.poll_interrupt()
+        {
             asked = true;
-            terminate_all(children);
+            terminate_all(p);
         }
-        drain_notifications(notif, children, &mut asked, seen);
+        drain_notifications(p, signals, &mut asked);
     }
 
+    let seen = p.parts().1.clone();
     let mut out = Vec::with_capacity(stages.len());
     let mut aborted = false;
     for (i, s) in stages.iter().enumerate() {
@@ -539,7 +452,7 @@ fn reap(
         if strict && (code != 0 || crashed) {
             aborted = true;
             // §1's eager abort: the later stages are asked to stop.
-            terminate_all(children);
+            terminate_all(p);
         }
         out.push(StageStatus { command: s.program.clone(), exit_status: code, crashed, cancelled: false });
     }
@@ -547,53 +460,44 @@ fn reap(
 }
 
 /// Ask every stage to stop: a request, which a stage may take its time over.
-fn terminate_all(children: &[u64]) {
-    for &c in children {
-        // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
-        unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+fn terminate_all(p: &mut Pipeline<stages::Stages<'_>>) {
+    let children = p.parts().0.to_vec();
+    for c in children {
+        p.sys.terminate(c);
     }
 }
 
-/// Take a pending `Ctrl-C` from the terminal without blocking, setting the flag the evaluator's
-/// checkpoint reads, so it also unwinds the evaluation.
-fn drain_tty_interrupt(tty: u64) -> bool {
-    let mut hit = false;
-    // SAFETY: single-threaded shell; valid recv out-params.
-    unsafe {
-        loop {
-            let Ok(_sent) = channel_recv_raw(tty, &raw mut TTY_MSG) else {
-                break;
-            };
-            let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
-            let rep =
-                core::slice::from_raw_parts(((&raw const TTY_MSG) as *const u8).add(24), payload_len.min(4096 - 24));
-            if let Ok(m) = librsproto::decode(rep)
-                && m.op == librsproto::OP_TTY_INTERRUPT
-            {
-                INTERRUPTED = true;
-                hit = true;
-            }
-        }
+/// Read what the notification queue holds while a pipeline runs: exits are kept for `reap`, and a
+/// terminate request asks every stage to stop once (`asked`).
+fn drain_notifications(p: &mut Pipeline<stages::Stages<'_>>, signals: &Signals, asked: &mut bool) {
+    if signals.drain(p.parts().1) && !*asked {
+        *asked = true;
+        terminate_all(p);
     }
-    hit
 }
 
-/// Resolve `path` to a handle with **file** rights — mapping and stat.
-fn lookup(ns: u64, path: &[u8]) -> Option<u64> {
-    lookup_rights(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT)
+/// Resolve `path` to a handle of the kind the caller expects, with **file** rights — mapping and
+/// stat.
+fn lookup<T, M>(ns: &Handle<Namespace, NsReadOnly>, path: &str) -> Option<Handle<T, M>> {
+    lookup_rights(ns, path, Rights::MAP_READ | Rights::INSPECT)
 }
 
 /// Resolve `path` asking for `rights`.
 ///
 /// A char device is not a file: `/dev/console` is read with `READ`, not `MAP_READ | INSPECT`. The
 /// wrong rights give a handle that resolves and then fails every read.
-fn lookup_rights(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
-    let (status, handle) = libfs::lookup_wait(ns, path, rights);
-    if status != 0 || handle == 0 { None } else { Some(handle) }
+fn lookup_rights<T, M>(ns: &Handle<Namespace, NsReadOnly>, path: &str, rights: Rights) -> Option<Handle<T, M>> {
+    block_on(ns.lookup(path, rights)).ok()
 }
 
-fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record, terminal: Option<u64>) -> i64 {
-    let mut host = NitroxHost { namespace, notif, tty: 0 };
+fn run(
+    root: Handle<Namespace, NsReadOnly>,
+    signals: Rc<Signals>,
+    argv: &[String],
+    env: libstream::wire::Record,
+    terminal: Option<Handle<Channel, Only>>,
+) -> i64 {
+    let mut host = NitroxHost { namespace: root, signals, tty: None };
 
     let mut script_path: Option<String> = None;
     let source = match argv.get(1).map(|s| s.as_str()) {
@@ -605,10 +509,12 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
             }
         },
         Some("--help") | Some("-h") => {
-            // On the terminal it was handed: script mode keeps none for the host, and `kprint`
-            // reaches nobody on a machine with no serial port.
+            // On the terminal it was handed: script mode keeps none for the host, and the kernel
+            // log reaches nobody on a machine with no serial port.
             match terminal {
-                Some(t) => tty_write_crlf(t, "usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]"),
+                Some(t) => {
+                    Tty::new(t, host.signals.clone()).write_crlf("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]")
+                }
                 None => host.out("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]\n"),
             }
             return EXIT_OK;
@@ -632,9 +538,8 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
                 return EXIT_PARSE_ERROR;
             }
         },
-        None => return repl(notif, namespace, env, terminal),
+        None => return repl(host, env, terminal),
     };
-
     let base = script_path.as_deref().map(nxsh::paths::dir_of);
     let script = match nxsh::parse_script_in(&source, base) {
         Ok(s) => s,
@@ -671,81 +576,76 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
 
 /// The interactive loop (§11): read, edit, parse, evaluate, print. Continuation only where the
 /// parser can prove a statement incomplete (§11b, `nxsh::repl`).
-fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Option<u64>) -> i64 {
+fn repl(mut host: NitroxHost, env: libstream::wire::Record, terminal: Option<Handle<Channel, Only>>) -> i64 {
     // The session's terminal, a channel rather than the raw device. Handed down if the parent gave
     // one (a terminal emulator hands over the terminal whose backend it holds; `/dev/tty` cannot
     // name a particular window), resolved otherwise as a serial login does. See
     // `docs/architecture/graphical-session.md` §6.1.
-    let tty = match terminal {
+    let chan = match terminal {
         Some(t) => t,
         None => {
-            let Some(t) = lookup_rights(
-                namespace,
-                b"/dev/tty",
-                libkern::handle::RIGHT_SEND | libkern::handle::RIGHT_RECV | libkern::handle::RIGHT_WAIT,
-            ) else {
-                kprint(b"nxsh: /dev/tty not found\r\n");
+            let Some(t) = lookup_rights(&host.namespace, "/dev/tty", Rights::SEND | Rights::RECV | Rights::WAIT) else {
+                log::write(b"nxsh: /dev/tty not found\r\n");
                 return EXIT_USAGE;
             };
             t
         }
     };
+    let signals = host.signals.clone();
+    let tty = Rc::new(Tty::new(chan, signals.clone()));
+    host.tty = Some(tty.clone());
 
-    let mut interp = Interp::with_host(alloc::boxed::Box::new(NitroxHost { namespace, notif, tty }), RunMode::Repl);
+    let mut interp = Interp::with_host(alloc::boxed::Box::new(host), RunMode::Repl);
     interp.set_env(env);
 
     // The shell edits its own input, as `bash` does with `ICANON` cleared: history and completion
     // are its knowledge and share one editing loop with backspace and kill. The discipline is
     // linked, not reimplemented. Server-side echo goes off because only the shell knows what the
     // screen should show after a recall.
-    tty_set_echo(tty, false);
+    tty.set_echo(false);
     let mut editor = nxsh::editor::Editor::new();
 
-    tty_write(tty, b"\r\n");
+    tty.write(b"\r\n");
     let banner = alloc::format!("nxsh: interactive shell, Nitrox {BUILD_COMMIT} (Ctrl-D or `exit` to leave)");
-    tty_write(tty, nxsh::style::paint(tty != 0, nxsh::style::BANNER, &banner).as_bytes());
-    tty_write(tty, b"\r\n");
+    tty.write(nxsh::style::paint(true, nxsh::style::BANNER, &banner).as_bytes());
+    tty.write(b"\r\n");
 
     let mut history = nxsh::history::History::new();
-    let prompt = |interp: &Interp| nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0);
-    tty_write(tty, prompt(&interp).as_bytes());
+    let prompt = |interp: &Interp| nxsh::repl::prompt(interp.cwd().unwrap_or("/"), true);
+    tty.write(prompt(&interp).as_bytes());
 
     let mut chunk = [0u8; 64];
     loop {
-        // SAFETY: single-threaded shell.
-        if unsafe { (&raw const STOP_ASKED).read() } {
-            stop();
+        if signals.stop_asked() {
+            signals::stop();
         }
-        let n = match tty_read(tty, &mut chunk) {
+        let n = match tty.read(&mut chunk) {
             Some(n) => n,
             // The terminal is gone: leave, rather than spin on a dead channel.
             None => {
-                kprint(b"nxsh: terminal closed\r\n");
+                log::write(b"nxsh: terminal closed\r\n");
                 return EXIT_OK;
             }
         };
         // `Ctrl-C` at a prompt discards the line (§11h): the byte became an event, so the read came
         // back empty. The tty only reports it; what it means is the caller's decision.
-        // SAFETY: single-threaded shell.
-        if unsafe { (&raw const INTERRUPTED).read() } {
-            // SAFETY: same.
-            unsafe { (&raw mut INTERRUPTED).write(false) };
-            tty_write(tty, &editor.interrupt());
-            tty_write(tty, prompt(&interp).as_bytes());
+        if signals.take_interrupt() {
+            tty.write(&editor.interrupt());
+            tty.write(prompt(&interp).as_bytes());
             continue;
         }
         let read = &chunk[..n];
         for (i, &b) in read.iter().enumerate() {
             for out in editor.feed(b, read.get(i + 1).copied(), &mut history, &mut |whole| interp.complete(whole)) {
                 match out {
-                    nxsh::editor::Out::Write(bytes) => tty_write(tty, &bytes),
-                    nxsh::editor::Out::Prompt => tty_write(tty, prompt(&interp).as_bytes()),
-                    nxsh::editor::Out::Continuation => tty_write(tty, nxsh::repl::continuation_prompt().as_bytes()),
+                    nxsh::editor::Out::Write(bytes) => tty.write(&bytes),
+                    nxsh::editor::Out::Prompt => tty.write(prompt(&interp).as_bytes()),
+                    nxsh::editor::Out::Continuation => tty.write(nxsh::repl::continuation_prompt().as_bytes()),
                     nxsh::editor::Out::Run(src) => {
-                        if let Some(status) = run_and_render(&mut interp, tty, &src) {
+                        if let Some(status) = run_and_render(&mut interp, &tty, &src) {
                             return status;
                         }
-                        tty_write(tty, prompt(&interp).as_bytes());
+                        tty.write(prompt(&interp).as_bytes());
                     }
                     nxsh::editor::Out::Eof => return EXIT_OK,
                 }
@@ -759,10 +659,10 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
 /// The loop intercepts nothing: `exit` is a shell-state builtin (§3) whose status travels the error
 /// channel, and a special case in the driver is a second implementation of the language (it once
 /// made `exit 1` fail). Do not add a case there.
-fn run_and_render(interp: &mut Interp, tty: u64, src: &str) -> Option<i64> {
+fn run_and_render(interp: &mut Interp, tty: &Tty, src: &str) -> Option<i64> {
     match interp.run_line(src) {
         Ok(Some(text)) => {
-            tty_write_crlf(tty, &text);
+            tty.write_crlf(&text);
             None
         }
         Ok(None) => None,
@@ -771,197 +671,17 @@ fn run_and_render(interp: &mut Interp, tty: u64, src: &str) -> Option<i64> {
             // The REPL's error path: `Host::diag` is the script path, whose host has no terminal.
             // The newline goes after the painted message, never inside it; see
             // [`repl::diagnostic`](nxsh::repl::diagnostic).
-            let mut msg = nxsh::repl::diagnostic(&e.message, tty != 0);
+            let mut msg = nxsh::repl::diagnostic(&e.message, true);
             msg.push('\n');
-            tty_write_crlf(tty, &msg);
+            tty.write_crlf(&msg);
             None
         }
     }
 }
 
-/// Send one tty request and wait for its reply, copying the body into `out`, with the handles the
-/// reply carried; `None` if the exchange failed.
-fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, usize, Received)> {
-    tty_exchange(ch, op, body, out, false)
-}
-
-/// [`tty_request`], and when `watch`, the notification channel watched for a terminate request.
-fn tty_exchange(ch: u64, op: u16, body: &[u8], out: &mut [u8], watch: bool) -> Option<(bool, usize, Received)> {
-    // SAFETY: TTY_MSG is a valid buffer; the rsproto message goes at the payload offset.
-    let sent = unsafe {
-        let rs_len = librsproto::encode(&mut TTY_MSG[24..], op, 1, 0, body, 0)?;
-        TTY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        TTY_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const TTY_MSG) as u64,
-            (&raw const TTY_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    };
-    if !sent {
-        return None;
-    }
-    tty_await_reply(ch, out, watch)
-}
-
-/// Wait for the reply to the request just sent, stepping over any interrupt event.
-///
-/// Re-entered because the interrupt is the one unsolicited message on this channel (§11h) and the
-/// reply is still coming behind it. When `watch`, the notification channel is watched too, so a
-/// terminate request finds the shell at the prompt's read; only the prompt watches, since elsewhere
-/// a stage's `ChildExited` could be taken from [`reap`].
-fn tty_await_reply(ch: u64, out: &mut [u8], watch: bool) -> Option<(bool, usize, Received)> {
-    // SAFETY: single-threaded shell; set once at startup.
-    let notif = unsafe { NOTIF_CH };
-    let watch = watch && notif != 0;
-    loop {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one or two waiters.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = ch;
-            WAIT_HANDLES[1] = notif;
-            let n = if watch { 2 } else { 1 };
-            let (handles, results) = ((&raw const WAIT_HANDLES) as u64, (&raw mut WAIT_RESULTS) as u64);
-            syscall4(SYS_WAIT, handles, n, results, u64::MAX)
-        };
-        if waited < 1 {
-            return None;
-        }
-        if !watch {
-            break;
-        }
-        if signalled(waited, notif) {
-            loop {
-                // SAFETY: `NOTIF` is a valid 64-byte out-param.
-                if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) } != 0 {
-                    break;
-                }
-                // SAFETY: the kernel wrote a Notification into `NOTIF`.
-                if unsafe { (&raw const NOTIF.kind).read() } == KIND_TERMINATE_REQUESTED {
-                    stop();
-                }
-            }
-        }
-        if signalled(waited, ch) {
-            break;
-        }
-    }
-    // SAFETY: single-threaded shell; `TTY_MSG` is lent for the call.
-    let sent = unsafe { channel_recv_raw(ch, &raw mut TTY_MSG) }.ok()?;
-    // SAFETY: bounded read-only slice over the reply.
-    unsafe {
-        let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
-        let rep = core::slice::from_raw_parts(((&raw const TTY_MSG) as *const u8).add(24), payload_len.min(4096 - 24));
-        let m = librsproto::decode(rep).ok()?;
-        // The interrupt is unsolicited, so it can land where a reply was expected: record it and
-        // keep waiting, or the real reply stays queued for whoever asked next.
-        if m.op == librsproto::OP_TTY_INTERRUPT {
-            INTERRUPTED = true;
-            return tty_await_reply(ch, out, watch);
-        }
-        let n = m.body.len().min(out.len());
-        out[..n].copy_from_slice(&m.body[..n]);
-        Some((m.is_error(), n, sent))
-    }
-}
-
-/// Take whatever keystrokes are available. `None` if the terminal is unusable.
-fn tty_read(ch: u64, out: &mut [u8]) -> Option<usize> {
-    match tty_exchange(ch, librsproto::OP_TTY_READ, &[], out, true) {
-        Some((false, n, _)) => Some(n),
-        _ => None,
-    }
-}
-
-/// Turn the terminal's own echo on or off; the shell holds the line buffer, so server-side echo
-/// would fight it.
-fn tty_set_echo(ch: u64, on: bool) {
-    let flags = [if on { librsproto::TTY_MODE_ECHO } else { 0 }];
-    let mut scratch = [0u8; 1];
-    let _ = tty_request(ch, librsproto::OP_TTY_SET_MODE, &flags, &mut scratch);
-}
-
-fn tty_write(ch: u64, text: &[u8]) {
-    let mut scratch = [0u8; 1];
-    // In parts: a body over `RS_MAX_BODY` is refused whole, and the screen and the line part.
-    for part in text.chunks(librsproto::RS_MAX_BODY) {
-        let _ = tty_request(ch, librsproto::OP_TTY_WRITE, part, &mut scratch);
-    }
-}
-
-/// Ask the tty server for another terminal on this one's backend (`Tty::OpenSibling`), for a stage
-/// to prompt on. `None` if it refused or the exchange failed; the stage then runs without one.
-fn tty_open_sibling(ch: u64) -> Option<u64> {
-    let mut scratch = [0u8; 1];
-    match tty_request(ch, librsproto::OP_TTY_OPEN_SIBLING, &[], &mut scratch) {
-        Some((false, _, mut sent)) => sent.take(0),
-        _ => None,
-    }
-}
-
-fn tty_write_crlf(ch: u64, text: &str) {
-    for chunk in text.split('\n') {
-        if !chunk.is_empty() {
-            tty_write(ch, chunk.as_bytes());
-        }
-        tty_write(ch, b"\r\n");
-    }
-}
-
-/// Set when the terminal has reported `Ctrl-C` (§11h). The interrupt can arrive in any exchange, so
-/// every path receiving from the tty channel records it here; the caller decides what it means.
-static mut INTERRUPTED: bool = false;
-
-/// This shell has been asked to exit: a `TerminateRequested` from its session's supervisor, at a
-/// shutdown. Unlike [`INTERRUPTED`] it is sticky, so no `catch` recovers from it; the REPL exits
-/// once what was running has unwound.
-static mut STOP_ASKED: bool = false;
-
-/// The shell's notification channel, where that request arrives: set once at startup.
-static mut NOTIF_CH: u64 = 0;
-
-/// Read every notification queued on `notif` while a pipeline runs: a `ChildExited` is kept in
-/// `exits` as `(code, crashed)`, and a `TerminateRequested` asks every stage to stop once (`asked`)
-/// and marks the shell to exit. Shared by the capture wait and [`reap`], so an exit read by the
-/// first is counted by the second.
-fn drain_notifications(notif: u64, children: &[u64], asked: &mut bool, exits: &mut Vec<(i32, bool)>) {
-    loop {
-        // SAFETY: `NOTIF` is a valid 64-byte out-param.
-        if unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) } != 0 {
-            return; // WouldBlock: drained
-        }
-        // SAFETY: the kernel wrote a Notification into `NOTIF`.
-        let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
-        if kind == KIND_TERMINATE_REQUESTED {
-            // SAFETY: single-threaded shell.
-            unsafe { (&raw mut STOP_ASKED).write(true) };
-            if !*asked {
-                *asked = true;
-                terminate_all(children);
-            }
-        } else if kind == KIND_CHILD_EXITED {
-            let exit_kind = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-            exits.push((code, exit_kind != EXIT_KIND_NORMAL));
-        }
-    }
-}
-
-/// Say this shell was asked to stop, and exit.
-fn stop() -> ! {
-    kprint(b"nxsh: asked to stop, exiting\n");
-    exit(EXIT_OK)
-}
-
-static mut TTY_MSG: [u8; 4096] = [0; 4096];
-static mut TTY_HANDLES: [u64; 8] = [0; 8];
-
-/// Is `path` a binding in `ns`, or an ancestor of one?
-/// Is `path` a binding in `ns`, or an ancestor of one? The namespace walk `list` uses
-/// (`SYS_NS_ENUMERATE`), as a yes/no question. `/` is true by construction.
-fn binding_at_or_under(ns: u64, path: &str) -> bool {
+/// Is `path` a binding in `ns`, or an ancestor of one? The namespace walk `list` uses, as a yes/no
+/// question. `/` is true by construction.
+fn binding_at_or_under(ns: &Handle<Namespace, NsReadOnly>, path: &str) -> bool {
     if path == "/" {
         return true;
     }
@@ -970,17 +690,12 @@ fn binding_at_or_under(ns: u64, path: &str) -> bool {
     let mut prefix = String::from(exact);
     prefix.push('/');
 
-    let mut entry = libkern::abi::NsEntry::zeroed();
-    for index in 0u64.. {
-        // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
-        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut _ as u64) };
-        if r != 0 {
-            return false; // NotFound ends the walk
-        }
-        let len = (entry.path_len as usize).min(libkern::abi::NS_ENTRY_PATH_MAX);
-        // SAFETY: the kernel wrote the binding path; `len` is clamped to the buffer.
-        let bound = unsafe { core::slice::from_raw_parts((&raw const entry.path) as *const u8, len) };
-        let Ok(bound) = core::str::from_utf8(bound) else {
+    for entry in ns.bindings() {
+        let Ok(entry) = entry else {
+            return false; // the walk ends at the first refusal
+        };
+        let len = (entry.path_len as usize).min(NS_ENTRY_PATH_MAX);
+        let Ok(bound) = core::str::from_utf8(&entry.path[..len]) else {
             continue;
         };
         if bound == exact || bound.starts_with(&prefix) {
@@ -992,23 +707,34 @@ fn binding_at_or_under(ns: u64, path: &str) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let boot = bootstrap(notif, ns, endpoint, arg0);
-    let (argv, env, terminal) = match boot.setup() {
-        Some(Ok(s)) => (s.argv, s.env, s.terminal),
-        _ => (Vec::new(), libstream::wire::Record::default(), None),
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, ns, endpoint, arg0) };
+    let endpoint: Option<Handle<Channel, Only>> = start.take_handle0();
+    let setup = if setup_is_pending(start.arg0) {
+        endpoint.as_ref().and_then(|e| receive_setup(e, Deadline::NEVER).ok().flatten())
+    } else {
+        None
+    };
+    // The streams are the shell's for its life, though it reads none of them.
+    let (argv, env, terminal, _streams) = match setup {
+        Some(s) => (s.argv, s.env, s.terminal, s.streams),
+        _ => (Vec::new(), libstream::wire::Record::default(), None, StageStreams::default()),
     };
     // Reported from the receiving end, the only end that proves anything: a parent that sent no
     // setup message and one that sent an empty environment look identical from outside. A login
     // gate waits on this line (`nxsh: up`). It goes to the debug console, not the tty: under
     // `nxterm` the grid renders only under `test-harness`.
-    libkern::debug::Line::new().s(b"nxsh: up (env: ").u(env.values.len() as u64).s(b" fields)").end();
-    // SAFETY: single-threaded shell; written once, here, before any wait reads it.
-    unsafe { NOTIF_CH = notif };
-    exit(run(notif, ns, &argv, env, terminal))
+    Line::new().s(b"nxsh: up (env: ").u(env.values.len() as u64).s(b" fields)").end();
+    let signals = Rc::new(Signals::new(start.notify.take()));
+    let Some(root) = start.root.take() else {
+        log::write(b"nxsh: no root namespace\n");
+        libos::exit(EXIT_USAGE as i32)
+    };
+    libos::exit(run(root, signals, &argv, env, terminal) as i32)
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"nxsh: panic\n");
-    exit(EXIT_SCRIPT_FAILED)
+    log::write(b"nxsh: panic\n");
+    libos::exit(EXIT_SCRIPT_FAILED as i32)
 }

@@ -12,6 +12,7 @@ edition = "2024"
 # `[[bin]]` is the *host*: `_start`, spawning stages, wiring pipes, the console reader.
 [dependencies]
 libkern = { path = "../libkern" }
+libos = { path = "../libos" }
 libheap = { path = "../libheap" }
 # The line discipline, *linked* rather than reimplemented — the shell edits its own
 # input (history needs it) but must not become a fourth copy of backspace and kill.

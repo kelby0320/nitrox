@@ -23,10 +23,12 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
   return, its syscalls behind `pipeline::Sys`). **No syscalls.** Host-tested (`cargo test -p nxsh
   --lib --target x86_64-unknown-linux-gnu`) in a second rather than through a 90-second boot.
 - **`src/main.rs` — the host.** `_start`, spawning stages, wiring pipes, the console
-  reader, the filesystem; `src/stage.rs`, a stage's image read and decided by `exec`; and
-  `src/stages.rs`, the `pipeline::Sys` that starts and stops stages.
-  **`eval.rs`, `parse.rs` and `main.rs` are at their size entries**: new code goes in a module
-  of its own.
+  reader, the filesystem — all through `libos`, so the binary makes no raw syscall and holds
+  no `static mut`; `src/stage.rs`, a stage's image read and decided by `exec`; `src/stages.rs`,
+  the `pipeline::Sys` that starts and stops stages, which owns the handles the pipeline names
+  by value; `src/tty.rs`, the terminal's requests; and `src/signals.rs`, the notification queue
+  and the interrupt and stop flags.
+  **`eval.rs` and `parse.rs` are at their size entries**: new code goes in a module of its own.
 
 The seam is the **`Host` trait**: everything that touches the OS sits behind it, the same
 way the ext4 parser sits behind `BlockReader`. It is worth more here than there — an
