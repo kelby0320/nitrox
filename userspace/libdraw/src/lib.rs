@@ -26,6 +26,7 @@ pub mod format;
 pub mod framebuffer;
 pub mod geom;
 pub mod hash;
+pub mod pixels;
 pub mod png;
 pub mod ppm;
 pub mod scale;
