@@ -12,39 +12,55 @@ use libos::{
 /// nothing.
 #[derive(Clone, Copy)]
 pub struct Members<'a> {
-    /// The namespace direct handles are resolved from; `None` binds no console.
+    /// The namespace direct handles are resolved from: the supervisor's own — the root namespace —
+    /// for a session, and **the session's** for an application. `None` binds no console.
     pub root_ns: Option<Ref<'a, Namespace, NsReadOnly>>,
-    /// The fs-server endpoint.
+    /// The fs-server endpoint, bound at `/home` scoped to the user's subtree.
     pub fs_endpoint: Option<Ref<'a, Channel, Only>>,
-    /// The profile-server endpoint.
+    /// The profile-server endpoint, bound at `/bin` and `/applications`.
     pub profile_endpoint: Option<Ref<'a, Channel, Only>>,
-    /// The tty server's.
+    /// The tty server's, bound at `/dev/tty`. **This and every server endpoint below is
+    /// `service-mgr`'s route to the server**, not its own, so a session survives a restart. Each
+    /// route reaches one server and nothing else, which is what lets `desktop-shell` hold them.
     pub tty_endpoint: Option<Ref<'a, Channel, Only>>,
-    /// The clipboard server's.
+    /// The clipboard server's, bound at `/dev/clipboard` in **both columns**, as a pipeline uses it
+    /// as a path.
     pub clipboard_endpoint: Option<Ref<'a, Channel, Only>>,
     /// The user's home directory, as the subtree base for `/home`.
     pub home: &'a str,
     /// The user's name, snapshotted at `/session/user`.
     pub user: &'a [u8],
-    /// Bind `/system/fonts` read-only.
+    /// Bind `/system/fonts` read-only; **a flag** because a member bound for nothing is still
+    /// authority held (`session-mgr/CLAUDE.md`).
     pub bind_fonts: bool,
-    /// Bind `/dev/console`.
+    /// Bind `/dev/console`. **False for a graphical session** (`graphical-session.md`, governing
+    /// decision 3); the serial column binds it as its terminal.
     pub bind_console: bool,
-    /// The view broker's.
+    /// The view broker's, bound at `/dev/views` with [`views_base`](Self::views_base) as its base.
+    /// **The base is the session's identity**: the broker learns whose request it is from the
+    /// suffix, and no program here can choose another — except `desktop-shell`, handed this
+    /// endpoint to bind into applications.
     pub views_endpoint: Option<Ref<'a, Channel, Only>>,
-    /// `/s/<session>`. Empty binds nothing.
+    /// `/s/<session>`, from [`open_views_session`](crate::open_views_session). Empty binds nothing.
     pub views_base: &'a str,
-    /// The device manager's info-only endpoint.
+    /// An **info-only** endpoint of the device manager's, bound at `/dev/devices` with the base
+    /// `/info`. **The endpoint keeps a session from taking a device**: the manager answers only its
+    /// tables on it, whatever suffix arrives.
     pub devices_endpoint: Option<Ref<'a, Channel, Only>>,
-    /// The storage service's session endpoint.
+    /// A **session endpoint** of the storage service's, bound at `/storage` (base `/fs`) and
+    /// `/dev/storage` (base `/info`). **The endpoint keeps a session from mounting**:
+    /// `admin-endpoint` is `NotFound` there, so even `desktop-shell` cannot mint one.
     pub storage_endpoint: Option<Ref<'a, Channel, Only>>,
-    /// `service-mgr`'s session endpoint.
+    /// `service-mgr`'s **session endpoint**, bound at `/dev/services`; it answers only the table.
     pub services_endpoint: Option<Ref<'a, Channel, Only>>,
-    /// Bind `/applications`.
+    /// Bind `/applications`: **true for a session**, **false for an application**.
     pub bind_applications: bool,
-    /// The compositor's forwarding endpoint, required when given.
+    /// The compositor's forwarding endpoint, bound at **`/dev/draw/new` alone**, with the base
+    /// `/new`: an application may open windows, and `manage` is unreachable. The graphical
+    /// supervisor binds `/dev/draw` whole for `desktop-shell` itself. **Required when given**: the
+    /// build fails if it does not bind.
     pub draw_endpoint: Option<Ref<'a, Channel, Only>>,
-    /// `desktop-shell`'s own endpoint.
+    /// `desktop-shell`'s own endpoint, bound at `/dev/desktop`.
     pub desktop_endpoint: Option<Ref<'a, Channel, Only>>,
 }
 
