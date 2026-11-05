@@ -1,14 +1,11 @@
 //! The transport and the setup message, through libos's model of the kernel.
 
 use crate::channel::{ChannelReceiver, ChannelSink, IpcPort, IpcPortRef, MsgPort};
-use crate::setup::{
-    STREAM_STDIN, StageStreams, Streams, bootstrap, bootstrap_arg0, open_pipe, pipe, receive_setup, send_setup_full,
-    send_stage_setup,
-};
+use crate::setup::{STREAM_STDIN, StageStreams, open_pipe, receive_setup, send_stage_setup};
 use crate::wire::{Record, WireError};
 use alloc::vec::Vec;
-use libkern::{KError, RawHandle, Rights};
-use libos::{Carried, Channel, Deadline, Handle, Msg, Only, Ref, mock};
+use libkern::KError;
+use libos::{Carried, Channel, Deadline, Handle, Msg, Only, mock};
 
 fn pair() -> (Handle<Channel, Only>, Handle<Channel, Only>) {
     Handle::pair(4).unwrap()
@@ -45,17 +42,12 @@ fn a_stream_round_trips_over_two_ports() {
 }
 
 #[test]
-fn a_port_closes_the_endpoint_it_owns_and_not_one_it_borrows() {
+fn a_port_closes_the_endpoint_it_owns() {
     mock::reset();
-    let (a, b) = pair();
+    let (a, _b) = pair();
     let raw = a.raw().0;
     drop(IpcPort::owning(a));
     assert!(!mock::is_open(raw));
-    let raw = b.raw().0;
-    let port = IpcPort::new(raw);
-    assert_eq!(port.channel().raw().0, raw);
-    drop(port);
-    assert!(mock::is_open(raw), "the caller's endpoint stays open");
     assert_eq!(mock::stray_closes(), 0);
 }
 
@@ -183,26 +175,6 @@ fn a_setup_too_large_to_send_closes_its_handles_and_says_so() {
     assert!(!mock::is_open(t));
 }
 
-#[test]
-fn the_raw_setup_shims_move_their_handles_and_hand_raw_ones_back() {
-    mock::reset();
-    let (shell, stage) = pair();
-    let ((stdin, _p), terminal) = (pair(), end());
-    let streams = Streams { stdin: Some(stdin.into_raw().0), ..Default::default() };
-    let t = terminal.into_raw().0;
-    send_setup_full(shell.raw().0, streams, Some(t), &["ls"], &Record::default()).unwrap();
-    assert!(!mock::is_open(t) && !mock::is_open(streams.stdin.unwrap()));
-
-    let boot = bootstrap(0, 0, stage.raw().0, bootstrap_arg0(true));
-    let setup = boot.setup().unwrap().unwrap();
-    assert_eq!(setup.argv, ["ls"]);
-    let (i, term) = (setup.streams.stdin.unwrap(), setup.terminal.unwrap());
-    assert!(mock::is_open(i) && mock::is_open(term), "raw, and the caller's to close");
-    assert!(setup.streams.stdout.is_none());
-    assert!(bootstrap(0, 0, stage.raw().0, 0).setup().is_none(), "Tier 0 receives nothing");
-    assert!(mock::is_open(stage.raw().0), "the bootstrap endpoint is borrowed");
-}
-
 /// A setup message made by hand, `extra` handles beyond the ones its payload names.
 fn handmade(streams: u32, terminal: bool, handles: usize) -> (Handle<Channel, Only>, Vec<u64>) {
     let (shell, stage) = pair();
@@ -257,23 +229,14 @@ fn a_setup_waited_for_to_a_deadline_is_none_and_a_closed_peer_is_peer_closed() {
 }
 
 #[test]
-fn a_pipe_is_a_connected_pair_owned_or_raw() {
+fn an_open_pipe_is_a_connected_pair_closed_with_its_ends() {
     mock::reset();
     let (a, b) = open_pipe(2).unwrap();
+    let mut m = Msg::new();
+    m.set(b"hi").unwrap();
+    a.send(&m, &mut Carried::new()).unwrap();
+    assert_eq!(b.recv(&mut Msg::new()).map(|_| ()), Ok(()));
     let (ra, rb) = (a.raw().0, b.raw().0);
     drop((a, b));
     assert!(!mock::is_open(ra) && !mock::is_open(rb));
-    let (a, b) = pipe(2).unwrap();
-    assert!(mock::is_open(a) && mock::is_open(b), "raw ends are the caller's");
-    // SAFETY: the pipe's ends, open until the end of the test.
-    let (ea, eb) = unsafe {
-        (
-            Ref::<Channel, Only>::from_raw(RawHandle(a), Rights::empty()),
-            Ref::<Channel, Only>::from_raw(RawHandle(b), Rights::empty()),
-        )
-    };
-    let mut m = Msg::new();
-    m.set(b"hi").unwrap();
-    ea.send(&m, &mut Carried::new()).unwrap();
-    assert_eq!(eb.recv(&mut Msg::new()).map(|_| ()), Ok(()));
 }

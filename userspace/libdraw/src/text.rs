@@ -50,7 +50,7 @@ impl Font {
         self
     }
 
-    /// This face with `mono` as its fixed-advance companion; the theme names it, see [`load_mono`].
+    /// This face with `mono` as its fixed-advance companion; the theme names it, see [`load_mono_font`].
     pub fn with_mono(mut self, mono: Font) -> Self {
         self.mono = Some(alloc::boxed::Box::new(mono));
         self
@@ -237,14 +237,6 @@ pub fn load_font<'a, M: libos::CanLookup + 'a>(
     Font::from_bytes(data).ok_or(LoadError::NotAFont)
 }
 
-/// Borrow the caller's own namespace handle for one call.
-#[cfg(feature = "io")]
-fn borrowed<'a>(root_ns: u64) -> libos::Ref<'a, libos::Namespace, libos::NsReadOnly> {
-    // SAFETY: the caller's own namespace handle, open for the call, as the raw functions have
-    // always asked.
-    unsafe { libos::Ref::from_raw(libkern::handle::RawHandle(root_ns), libkern::handle::Rights::LOOKUP) }
-}
-
 /// Load the proportional face a theme names, falling back to the built-in one.
 ///
 /// Returns the face and the path it actually came from, which may not be the theme's; a caller
@@ -279,18 +271,6 @@ pub fn load_ui_font<'a, M: libos::CanLookup + 'a>(
     }
 }
 
-/// Load the proportional face a theme names. For callers not yet on libos; the typed form is
-/// [`load_ui_font`].
-///
-/// # Safety
-///
-/// `root_ns` must be a live namespace handle owned by the caller.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-#[cfg(feature = "io")]
-pub unsafe fn load_ui(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {
-    load_ui_font(borrowed(root_ns), theme, who)
-}
-
 /// Load the fixed-advance face a theme names, falling back to the built-in one; returns the path
 /// it came from, as [`load_ui_font`] does.
 #[cfg(feature = "io")]
@@ -300,18 +280,6 @@ pub fn load_mono_font<'a, M: libos::CanLookup + 'a>(
     who: &[u8],
 ) -> Result<(Font, ThemePath), LoadError> {
     load_themed(ns.into(), theme.font_mono, crate::theme::Theme::light().font_mono, who)
-}
-
-/// Load the fixed-advance face a theme names. For callers not yet on libos; the typed form is
-/// [`load_mono_font`].
-///
-/// # Safety
-///
-/// `root_ns` must be a live namespace handle owned by the caller.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-#[cfg(feature = "io")]
-pub unsafe fn load_mono(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {
-    load_mono_font(borrowed(root_ns), theme, who)
 }
 
 /// `wanted`, or `builtin` if `wanted` will not load, with the path actually opened.
@@ -587,11 +555,6 @@ mod io_tests {
         let said = std::string::String::from_utf8(mock::logged()).unwrap();
         assert!(said.starts_with("t: theme font /home/Fancy.ttf did not resolve"), "{said}");
         assert!(said.ends_with(&std::format!("; using {}\n", UI_FONT_PATH)), "{said}");
-
-        mock::reset();
-        // SAFETY: the mock's handle, open for the test's life.
-        assert_eq!(unsafe { load_ui(ns.raw().0, &theme, b"t") }.err(), Some(LoadError::NoBinding));
-        assert!(!mock::logged().is_empty(), "the raw form says it too");
     }
 
     #[test]

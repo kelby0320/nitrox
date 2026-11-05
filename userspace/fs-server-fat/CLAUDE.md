@@ -31,8 +31,8 @@ loop.
   or FAT32 by size, **never with clusters under a page**, so the server serves everything it makes.
   The boot sector is written last. Its tests hold each type and cluster size at its boundary's
   neighbours to `fsck.fat -n`, mtools and `Fat`.
-- **`src/main.rs`** — the `[[bin]]`: `server::bootstrap` with `SectorDisk::new`, then `server::run`
-  over a `Fat`, through `ReadOnly` for a read-only mount — **and through `libfsserver`'s
+- **`src/main.rs`** — the `[[bin]]`: `server::open_disk` with `SectorDisk::over`, then
+  `server::serve_volume` over a `Fat`, through `ReadOnly` for a read-only mount — **and through `libfsserver`'s
   `MetaCache`** since Phase 6 Part H.4, whose 1 MiB is a `static`. Alloc-free.
 
 ## Rules

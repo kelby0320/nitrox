@@ -34,7 +34,7 @@ pub mod mem;
 pub use abi::*;
 pub use channel::{Received, RecvFailure, channel_create, channel_recv, channel_recv_raw, pause_held};
 pub use clock::clock_read;
-pub use debug::{exit, kprint, kprint_hex, kprint_u64};
+pub use debug::{exit, kprint, kprint_hex, kprint_u64, thread_exit};
 pub use error::{KError, from_raw};
 pub use handle::*;
 pub use syscall::*;

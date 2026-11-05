@@ -21,8 +21,9 @@ extern crate alloc;
 use libdraw::acquire::{self, AcquireError};
 use libdraw::hash::hash_visible;
 use libdraw::scene::{self, REFERENCE_HASH};
-use libkern::debug::Line;
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Handle, Namespace, NsReadOnly};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -51,7 +52,7 @@ fn check_reference_hash() -> bool {
         .end();
     // Emitted over serial so the picture leaves the guest. Extract with:
     //   sed -n '/PPM-BEGIN/,/PPM-END/p' log | grep -v PPM- | tr -d '\n' | xxd -r -p > s.ppm
-    kprint(b"---PPM-BEGIN---\n");
+    log::write(b"---PPM-BEGIN---\n");
     let mut line = [0u8; 65];
     let mut n = 0usize;
     for &b in ppm.iter() {
@@ -61,15 +62,15 @@ fn check_reference_hash() -> bool {
         n += 2;
         if n == 64 {
             line[64] = b'\n';
-            kprint(&line[..65]);
+            log::write(&line[..65]);
             n = 0;
         }
     }
     if n > 0 {
         line[n] = b'\n';
-        kprint(&line[..n + 1]);
+        log::write(&line[..n + 1]);
     }
-    kprint(b"---PPM-END---\n");
+    log::write(b"---PPM-END---\n");
     false
 }
 
@@ -77,9 +78,10 @@ fn check_reference_hash() -> bool {
 ///
 /// `Err` only for a *broken binding*; a machine with no display reports `NoBinding`, which the
 /// caller judges.
-fn check_framebuffer_binding(root_ns: u64) -> Result<(), AcquireError> {
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let (_fb, info) = unsafe { acquire::acquire(root_ns) }?;
+fn check_framebuffer_binding(root: Option<&Handle<Namespace, NsReadOnly>>) -> Result<(), AcquireError> {
+    let root = root.ok_or(AcquireError::NoBinding)?;
+    // SAFETY: nothing else in this process writes the aperture, and this check never draws.
+    let (_fb, info) = unsafe { acquire::map_framebuffer(root) }?;
 
     Line::new()
         .s(b"display-selftest: framebuffer ")
@@ -90,29 +92,31 @@ fn check_framebuffer_binding(root_ns: u64) -> Result<(), AcquireError> {
         .u(info.pitch)
         .end();
 
-    kprint(b"display-selftest: framebuffer reachable\n");
+    log::write(b"display-selftest: framebuffer reachable\n");
     Ok(())
 }
 
 /// Entry point: run the hash check, then the framebuffer check, and exit with the verdict.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
-    kprint(b"display-selftest: up\n");
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    log::write(b"display-selftest: up\n");
 
     let hash_ok = check_reference_hash();
 
     let mut headless = false;
-    let present_ok = match check_framebuffer_binding(root_ns) {
+    let present_ok = match check_framebuffer_binding(start.root.as_ref()) {
         Ok(()) => true,
         Err(AcquireError::NoBinding) => {
             // Exit 2 rather than success: only the caller knows whether a display was expected.
-            kprint(b"display-selftest: no /dev/framebuffer binding (headless)\n");
+            log::write(b"display-selftest: no /dev/framebuffer binding (headless)\n");
             headless = true;
             true
         }
         Err(e) => {
-            kprint(b"display-selftest: acquire FAILED: ");
-            kprint(match e {
+            log::write(b"display-selftest: acquire FAILED: ");
+            log::write(match e {
                 AcquireError::InfoUnmappable => b"info unmappable" as &[u8],
                 AcquireError::InfoTruncated => b"info truncated",
                 AcquireError::UnsupportedDepth(_) => b"unsupported depth",
@@ -120,25 +124,25 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 AcquireError::ApertureUnmappable => b"aperture unmappable",
                 AcquireError::NoBinding => b"no binding",
             });
-            kprint(b"\n");
+            log::write(b"\n");
             false
         }
     };
 
     if hash_ok && present_ok {
         if headless {
-            kprint(b"display-selftest: HEADLESS (no display to present to)\n");
-            exit(2);
+            log::write(b"display-selftest: HEADLESS (no display to present to)\n");
+            libos::exit(2);
         }
-        kprint(b"display-selftest: PASSED\n");
-        exit(0);
+        log::write(b"display-selftest: PASSED\n");
+        libos::exit(0);
     }
-    kprint(b"display-selftest: FAILED\n");
-    exit(1);
+    log::write(b"display-selftest: FAILED\n");
+    libos::exit(1);
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"display-selftest: panic\n");
-    exit(2);
+    log::write(b"display-selftest: panic\n");
+    libos::exit(2);
 }

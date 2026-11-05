@@ -20,7 +20,7 @@ pub trait Sys {
     /// A terminal for a stage, if the shell has one to give.
     fn terminal(&mut self) -> Option<u64>;
     /// Send stage `stage` its setup message on `setup`. **Every handle in it is gone on every
-    /// return**, moved or closed (`libstream::setup::send_setup_full`).
+    /// return**, moved or closed (`libstream::setup::send_stage_setup`).
     fn send_setup(&mut self, stage: usize, setup: u64, streams: Streams, terminal: Option<u64>) -> bool;
     /// Tell the person something.
     fn say(&mut self, what: &str);

@@ -20,5 +20,9 @@ path = "src/main.rs"
 libfsserver = { path = "../libfsserver" }
 # The listing's entry kinds, and the wire format.
 librsproto = { path = "../librsproto" }
-# The raw syscall surface (used only by the `[[bin]]`; the library needs none).
+# The `[[bin]]`'s entry: its bootstrap registers, its log and its exit.
+libos = { path = "../libos" }
+
+[dev-dependencies]
+# `KError`, which the tests name.
 libkern = { path = "../libkern" }

@@ -1,14 +1,11 @@
-//! Whole files by path: sizes, reads, writes, copies, replacing saves and renames.
-//!
-//! Each has a typed form over [`libos`] and, beneath it, a raw shim keeping the `ns: u64` and
-//! `&[u8]` signature its callers outside this crate still use.
+//! Whole files by path, over [`libos`]: sizes, reads, writes, copies, replacing saves and renames.
 
 use alloc::vec::Vec;
+use libkern::Rights;
 use libkern::abi::HandleInfo;
 use libkern::error::KError;
 use libkern::handle::{KOBJ_FILE_OBJECT, KOBJ_MEMORY_OBJECT};
-use libkern::{RawHandle, Rights};
-use libos::{CanLookup, File, Handle, MapRead, MapReadWrite, Namespace, NsReadOnly, Ref, block_on, fs};
+use libos::{CanLookup, File, Handle, MapRead, MapReadWrite, Namespace, Ref, block_on, fs};
 use librsproto::namespace::RENAME_REPLACE;
 
 use crate::tree::remove_entry;
@@ -244,60 +241,5 @@ pub(crate) fn rename_error(e: libos::Error) -> FileError {
         KError::Unsupported => FileError::CrossDevice,
         KError::NotFound => FileError::NotFound,
         code => FileError::Io(code.as_i32()),
-    }
-}
-
-/// `ns`, a caller's raw namespace handle, borrowed for one shim's call.
-pub(crate) fn borrowed<'a>(ns: u64) -> Ref<'a, Namespace, NsReadOnly> {
-    // SAFETY: the shims call this with the caller's own namespace handle, open for the call, as
-    // each has always asked, and let the borrow go with it.
-    unsafe { Ref::from_raw(RawHandle(ns), Rights::empty()) }
-}
-
-/// `path` as text, which libos's calls take; `None` if it is not UTF-8.
-pub(crate) fn text(path: &[u8]) -> Option<&str> {
-    core::str::from_utf8(path).ok()
-}
-
-fn not_text() -> FileError {
-    FileError::Io(KError::InvalidArgument.as_i32())
-}
-
-/// [`file_len`] for a raw namespace handle; a path that is not UTF-8 resolves to nothing. For
-/// callers not yet on libos; the typed form is [`file_len`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
-    file_len(borrowed(ns), text(path)?)
-}
-
-/// [`read`] for a raw namespace handle. For callers not yet on libos; the typed form is [`read`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn read_file(ns: u64, path: &[u8]) -> Result<Vec<u8>, FileError> {
-    read(borrowed(ns), text(path).ok_or(FileError::NotFound)?)
-}
-
-/// [`write`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`write`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
-    write(borrowed(ns), text(path).ok_or_else(not_text)?, bytes)
-}
-
-/// [`save`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`save`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn save_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), SaveError> {
-    save(borrowed(ns), text(path).ok_or_else(|| SaveError::Write(not_text()))?, bytes)
-}
-
-/// Resolve `path` to a handle with `rights`, returning `(status, handle)`; not only for files.
-///
-/// For callers not yet on libos; the typed form is libos's own `Namespace::lookup`.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
-    let Some(path) = text(path) else { return (KError::InvalidArgument.as_i32(), 0) };
-    match block_on(borrowed(ns).lookup::<File, MapRead>(path, Rights::from_bits(rights))) {
-        Ok(h) => (0, h.into_raw().0),
-        Err(e) => (e.code().as_i32(), 0),
     }
 }

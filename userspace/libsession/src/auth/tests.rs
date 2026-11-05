@@ -92,18 +92,6 @@ fn a_login_that_is_not_authenticated_is_none() {
     assert_eq!(authenticate_on(&client, &[b'u'; 600], b"pw", &mut home), None, "a request too large to build");
 }
 
-/// The raw form asks the same and leaves the caller's endpoint open.
-#[test]
-fn the_raw_login_leaves_the_endpoint_open() {
-    let (client, server) = pair();
-    answer_every_id(&server, OP_AUTHENTICATE, RS_FLAG_REPLY, &authenticated(b"/home/alice"));
-    let mut home = [0u8; 64];
-    assert_eq!(authenticate(client.raw().0, b"alice", b"pw", &mut home), Some(11));
-    assert!(mock::is_open(client.raw().0));
-    assert_eq!(request(&server).0, OP_AUTHENTICATE);
-    assert_eq!(mock::stray_closes(), 0);
-}
-
 /// A password's message is zeroed where it lies, whichever way the scope ends.
 #[test]
 fn a_scrubbed_message_is_zero_once_its_scope_ends() {
@@ -130,10 +118,6 @@ fn a_views_session_opens_at_its_base_and_closes() {
     assert_eq!(open_views_session(&client, b"alice", &mut base), Some((4242, 7)));
     assert_eq!(&base[..7], b"/s/4242");
     assert_eq!(request(&server), (OP_VIEWS_OPEN_SESSION, b"alice".to_vec()));
-    // The raw form asks the same of the caller's endpoint.
-    let mut raw_base = [0u8; 24];
-    assert_eq!(views_open_session(client.raw().0, b"bob", &mut raw_base), Some((4242, 7)));
-    assert!(mock::is_open(client.raw().0));
 
     let (client, server) = pair();
     answer_every_id(&server, OP_VIEWS_CLOSE_SESSION, RS_FLAG_REPLY, b"");

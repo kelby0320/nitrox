@@ -6,8 +6,7 @@
 use libkern::error::KError;
 use libkern::handle::{RawHandle, Rights};
 use libos::{
-    CanLookup, Carried, Channel, Deadline, Handle, MapReadWrite, Memory, Msg, Namespace, NsReadOnly, Only, Ref,
-    WaitSet, block_on,
+    CanLookup, Carried, Channel, Deadline, Handle, MapReadWrite, Memory, Msg, Namespace, Only, Ref, WaitSet, block_on,
 };
 use librsproto::surface::OP_RELEASE;
 use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -82,29 +81,6 @@ impl ChannelTransport {
     /// `/dev/draw` is unscoped, and is not gated.
     pub fn open_manager<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>) -> Result<Self, UiError> {
         Self::resolve(ns.into(), "/dev/draw/manage")
-    }
-
-    /// [`open`](Self::open) for a raw namespace handle. For callers not yet on libos.
-    ///
-    /// # Safety
-    ///
-    /// `root_ns` must be a live namespace handle owned by the caller.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub unsafe fn connect(root_ns: u64) -> Result<Self, UiError> {
-        // SAFETY: the caller guarantees `root_ns` is live and owned.
-        Self::open(unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) })
-    }
-
-    /// [`open_manager`](Self::open_manager) for a raw namespace handle. For callers not yet on
-    /// libos.
-    ///
-    /// # Safety
-    ///
-    /// `root_ns` must be a live namespace handle owned by the caller.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub unsafe fn manage(root_ns: u64) -> Result<Self, UiError> {
-        // SAFETY: the caller guarantees `root_ns` is live and owned.
-        Self::open_manager(unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) })
     }
 
     fn resolve<M: CanLookup>(ns: Ref<'_, Namespace, M>, path: &str) -> Result<Self, UiError> {
@@ -292,7 +268,7 @@ impl Transport for ChannelTransport {
 
     /// Take the next event if one is already here, without blocking.
     ///
-    /// Callable from outside because a [`manage`](ChannelTransport::manage) transport exists to
+    /// Callable from outside because an [`open_manager`](ChannelTransport::open_manager) transport exists to
     /// receive.
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
         // Parked messages first: they are older than anything on the wire.
@@ -360,7 +336,7 @@ pub(crate) mod harness {
 mod tests {
     use super::harness::*;
     use super::*;
-    use libos::mock;
+    use libos::{NsReadOnly, mock};
 
     fn transport() -> ChannelTransport {
         connected().0

@@ -16,7 +16,7 @@ use crate::serve::{
     serve_grown, session,
 };
 use crate::{FsError, Refusal, Volume};
-use libkern::{KError, MAX_WAIT_HANDLES, RawHandle, Rights};
+use libkern::{KError, MAX_WAIT_HANDLES, Rights};
 use libos::{
     Carried, Channel, Deadline, Handle, MapRead, MapReadWrite, Memory, Msg, Only, ReadWrite, Ref, Resource, WaitSet,
     block_on, exit, log, time,
@@ -609,18 +609,6 @@ pub fn open_disk<'a, D>(control: impl Into<EndpointRef<'a>>, disk: MakeDisk<D>) 
     }
 }
 
-/// [`open_disk`] with a disk that takes the raw device. For callers not yet on libos.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn bootstrap<D>(control: u64, disk: fn(u64) -> Result<D, &'static [u8]>) -> (D, bool) {
-    // SAFETY: the server's own control endpoint, open for the call, as this has always asked.
-    let control = unsafe { EndpointRef::from_raw(RawHandle(control), Rights::empty()) };
-    let Some((device, read_only)) = receive_setup(control) else { fail(b"fs-server: setup recv failed\n") };
-    match disk(device.into_raw().0) {
-        Ok(disk) => (disk, read_only),
-        Err(why) => fail(why),
-    }
-}
-
 /// Check `vol`, record a writable mount mounted, say `Ready` on `control`, and serve `vol` until
 /// an unmount. `device` is the block-device handle a Model A reply hands the kernel a duplicate of.
 pub fn serve_volume<V: Volume>(vol: &V, control: Endpoint, device: Device<'_>) -> ! {
@@ -665,14 +653,4 @@ pub fn serve_volume<V: Volume>(vol: &V, control: Endpoint, device: Device<'_>) -
         },
     };
     server.serve_loop(vol)
-}
-
-/// [`serve_volume`] with raw handles. For callers not yet on libos.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn run<V: Volume>(vol: &V, control: u64, device: u64) -> ! {
-    // SAFETY: the server's own control endpoint, which the loop has always owned and closed.
-    let control = unsafe { Endpoint::from_raw(RawHandle(control), Rights::empty()) };
-    // SAFETY: the block device, open for as long as the server lives, as this has always asked.
-    let device = unsafe { Device::from_raw(RawHandle(device), Rights::empty()) };
-    serve_volume(vol, control, device)
 }

@@ -3,7 +3,8 @@
 //! ones.
 
 use super::*;
-use libkern::{KError, RIGHT_INSPECT, SYS_HANDLE_RESTRICT};
+use libkern::KError;
+use libos::{MapReadWrite, Memory};
 use librsproto::error::parse_error;
 use librsproto::surface::{
     AttachBufferRequest, CreateWindowRequest, DROP_KIND_FILE, MAX_DROP_NAME, MAX_DROP_PATH, OP_ATTACH_BUFFER,
@@ -12,7 +13,8 @@ use librsproto::surface::{
 };
 
 /// The answer to request `id`, past whatever events came first; two seconds at most.
-fn answer_to(ch: u64, id: u64) -> Option<Received> {
+fn answer_to<'a>(ch: impl Into<Ref<'a, Channel, Only>>, id: u64) -> Option<Received> {
+    let ch = ch.into();
     let deadline = clock_ns() + 2_000 * MS;
     loop {
         let m = receive(ch, deadline)?;
@@ -25,13 +27,13 @@ fn answer_to(ch: u64, id: u64) -> Option<Received> {
 /// The `KError` the compositor refused an attach with, sent as request `id` with `handles`, or
 /// `0` if it took it. An attach that holds is not answered, so a `StartMove` of no window follows
 /// it: every session request is answered in order, and that answer arriving first says it held.
-fn attach_refused(ch: u64, id: u64, req: &AttachBufferRequest, handles: &[u64]) -> Option<i32> {
+fn attach_refused(ch: &Handle<Channel, Only>, id: u64, req: &AttachBufferRequest, handles: Carried) -> Option<i32> {
     let mut attach = [0u8; 32];
     let n = build_attach_buffer_request(&mut attach, req)?;
     let mut probe = [0u8; 8];
     let p = StartMove { window: u32::MAX }.write(&mut probe)?;
     if !rs_send(ch, OP_ATTACH_BUFFER, id, &attach[..n], handles)
-        || !rs_send(ch, OP_START_MOVE, id + 1, &probe[..p], &[])
+        || !rs_send(ch, OP_START_MOVE, id + 1, &probe[..p], Carried::new())
     {
         return None;
     }
@@ -47,24 +49,22 @@ fn attach_refused(ch: u64, id: u64, req: &AttachBufferRequest, handles: &[u64]) 
     }
 }
 
-pub(super) fn a_session_takes_memory_and_whole_bodies_test(root_ns: u64) -> bool {
+pub(super) fn a_session_takes_memory_and_whole_bodies_test(root: Root<'_>) -> bool {
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: surface FAIL: ").s(why).end();
         false
     };
-    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
-    let (st, session) = ns_lookup(root_ns, b"/dev/draw/new", chan);
-    if st != 0 || session == 0 {
-        kprint(b"boot-probe: no compositor on this machine, so no session to ask ok\n");
+    let chan = Rights::SEND | Rights::RECV | Rights::WAIT;
+    let Ok(session) = lookup::<Channel, Only, _>(root, "/dev/draw/new", chan) else {
+        log::write(b"boot-probe: no compositor on this machine, so no session to ask ok\n");
         return true;
-    }
+    };
     let mut body = [0u8; 64];
     let created = build_create_window_request(&mut body, &CreateWindowRequest::new(8, 8, Role::Normal))
-        .filter(|&n| rs_send(session, OP_CREATE_WINDOW, 1, &body[..n], &[]))
-        .and_then(|_| answer_to(session, 1))
+        .filter(|&n| rs_send(&session, OP_CREATE_WINDOW, 1, &body[..n], Carried::new()))
+        .and_then(|_| answer_to(&session, 1))
         .and_then(|m| parse_create_window_reply(&m.body));
     let Some(window) = created else {
-        close(session);
         return fail(b"no window");
     };
     let at = |width, height, buffer| AttachBufferRequest {
@@ -76,42 +76,37 @@ pub(super) fn a_session_takes_memory_and_whole_bodies_test(root_ns: u64) -> bool
         format: SURFACE_FORMAT_XRGB8888,
     };
 
-    // SAFETY: a plain anonymous object of one page.
-    let memory = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    if memory <= 0 {
-        close(session);
+    let page = || Handle::<Memory, MapReadWrite>::create(PAGE as usize);
+    let Ok(memory) = page() else {
         return fail(b"no memory object");
-    }
-    let memory = memory as u64;
+    };
     let invalid = Some(KError::InvalidArgument.as_i32());
-    let held = attach_refused(session, 10, &at(8, 8, 0), &[memory]) == Some(0);
+    let held = attach_refused(&session, 10, &at(8, 8, 0), carry(memory)) == Some(0);
 
-    let none = attach_refused(session, 20, &at(1024, 1024, 0), &[]) == invalid;
+    let none = attach_refused(&session, 20, &at(1024, 1024, 0), Carried::new()) == invalid;
     let foreign = AttachBufferRequest { window: u32::MAX, ..at(8, 8, 0) };
     let not_found = KError::NotFound.as_i32();
-    let not_owned = attach_refused(session, 22, &foreign, &[]) == Some(not_found);
-    // SAFETY: a plain anonymous object of one page.
-    let short = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    let too_short = short > 0 && attach_refused(session, 24, &at(1024, 1024, 3), &[short as u64]) == invalid;
+    let not_owned = attach_refused(&session, 22, &foreign, Carried::new()) == Some(not_found);
+    let too_short = page().is_ok_and(|short| attach_refused(&session, 24, &at(1024, 1024, 3), carry(short)) == invalid);
 
-    let (st, file) = ns_lookup(root_ns, b"/system/current-generation", RIGHT_MAP_READ | RIGHT_TRANSFER | RIGHT_INSPECT);
-    let file_refused = st == 0 && file != 0 && attach_refused(session, 30, &at(1, 1, 1), &[file]) == invalid;
+    let file = lookup::<File, MapRead, _>(
+        root,
+        "/system/current-generation",
+        Rights::MAP_READ | Rights::TRANSFER | Rights::INSPECT,
+    );
+    let file_refused = file.is_ok_and(|file| attach_refused(&session, 30, &at(1, 1, 1), carry(file)) == invalid);
 
-    // SAFETY: a plain anonymous object of one page.
-    let blind = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    // SAFETY: attenuating a handle this process holds; it cannot amplify.
-    let narrowed =
-        blind > 0 && unsafe { syscall2(SYS_HANDLE_RESTRICT, blind as u64, RIGHT_MAP_READ | RIGHT_TRANSFER) } == 0;
-    let blind_refused = narrowed && attach_refused(session, 40, &at(8, 8, 2), &[blind as u64]) == invalid;
+    let blind = page().ok().filter(|blind| refused::restrict::narrow(blind, Rights::MAP_READ | Rights::TRANSFER));
+    let blind_refused = blind.is_some_and(|blind| attach_refused(&session, 40, &at(8, 8, 2), carry(blind)) == invalid);
 
     // A body past `SetTitle`'s length, read whole: no grab is `NotFound`, and cut it is malformed.
     let mut drag = [0u8; StartDrag::HEAD + MAX_DROP_PATH + MAX_DROP_NAME];
     let whole = StartDrag { window, kind: DROP_KIND_FILE, path_len: 0 }
         .write(&mut drag, &[b'p'; 300], b"name")
-        .filter(|&n| rs_send(session, OP_START_DRAG, 50, &drag[..n], &[]))
-        .and_then(|_| answer_to(session, 50))
+        .filter(|&n| rs_send(&session, OP_START_DRAG, 50, &drag[..n], Carried::new()))
+        .and_then(|_| answer_to(&session, 50))
         .is_some_and(|m| parse_error(&m.body).is_some_and(|e| e.kerror == not_found));
-    close(session);
+    drop(session);
 
     let mut ok = true;
     for (held, why) in [
@@ -130,6 +125,6 @@ pub(super) fn a_session_takes_memory_and_whole_bodies_test(root_ns: u64) -> bool
     if !ok {
         return false;
     }
-    kprint(b"boot-probe: a session takes memory and whole bodies ok\n");
+    log::write(b"boot-probe: a session takes memory and whole bodies ok\n");
     true
 }

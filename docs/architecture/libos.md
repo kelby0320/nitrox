@@ -3,11 +3,11 @@
 **Status:** Implemented. `userspace/libos` is the safe layer every userspace crate is to reach the
 kernel through: typed handles and borrows, messages, waits, mappings, namespaces and files,
 spawning and threads, the clocks, the log and the bootstrap registers, over the `Op` future and
-`block_on`. Thirty-three crates use it directly: the libraries, the system's servers and
-supervisors, and the desktop and the programs; the test harness moves onto it in pre-Phase-7 Part
-E.5, and `cargo xtask check-syscalls` holds each crate's raw syscalls to its count as it does.
-Sections marked *deferred* (chiefly the multi-task executor) are genuinely unbuilt. Verified
-2026-11-04.
+`block_on`. Thirty-five crates use it directly: the libraries, the system's servers and
+supervisors, the desktop and the programs, and the test harness, whose refusals alone stay raw.
+`cargo xtask check-syscalls` holds what raw syscalls are left, `eshell`'s, `libheap`'s and those
+refusals, to their counts. Sections marked *deferred* (chiefly the multi-task executor) are
+genuinely unbuilt. Verified 2026-11-05.
 
 `libos` is the **typed, async face of the syscall surface**. Before it, every userspace binary
 called the raw `libkern` surface directly: bare `u64` handles closed by hand on every path,
@@ -85,10 +85,10 @@ gives one out once.
 | `ns` | a namespace's `create`, `lookup`, `start_lookup`, `copy`, `bind`, `bind_server`, `unbind`, `bindings`, `flush` and `held` |
 | `fs` | `create`, `grow`, `truncate`, `rename` and `flush`: a file by path |
 | `process` | `Spawn`, by image or by path, and `exit` |
-| `thread` | `Stack`, and `start` |
+| `thread` | `Stack`, `start` and `start_on`, a mask of CPUs, the calling thread's `exit`, and a thread suspended on a fault: its `fault_registers`, and `settle`, to resume it or end it |
 | `time` | `now`, `wall`, `sleep`, `sleep_until`, `Deadline`, and a `Timer`'s `create`, `set` and `disarm` |
 | `log` | `write`, and `Line`, one write a line |
-| `entropy` | `fill`, and `try_fill` for a caller that cannot wait for the seeding |
+| `entropy` | `fill`, and `try_fill` for a caller that cannot wait for the seeding, from a source made for the call or from a `Source`, made here or handed over by `/dev/entropy`, read as often as wanted |
 | `boot` | `Start`: `_start`'s four registers, owned and typed |
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
 | `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |

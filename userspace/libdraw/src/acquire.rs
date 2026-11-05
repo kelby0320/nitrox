@@ -3,12 +3,12 @@
 //! The one part of `libdraw` that touches syscalls, hence behind the optional `io` feature.
 //!
 //! Authority is the binding: a process can drive the display if and only if `/dev/framebuffer`
-//! is in its namespace (`docs/design/display-substrate.md` §3). [`acquire`] takes a namespace
+//! is in its namespace (`docs/design/display-substrate.md` §3). [`map_framebuffer`] takes a namespace
 //! handle and either finds the binding or does not.
 
 use libkern::abi::FramebufferInfo;
-use libkern::handle::{RawHandle, Rights};
-use libos::{CanLookup, Handle, MapRead, MapReadWrite, Memory, Namespace, NsReadOnly, Ref, block_on};
+use libkern::handle::Rights;
+use libos::{CanLookup, Handle, MapRead, MapReadWrite, Memory, Namespace, Ref, block_on};
 
 use crate::format::{Channel, PixelFormat};
 use crate::framebuffer::{Geometry, RawFramebuffer};
@@ -48,13 +48,6 @@ pub fn framebuffer_info<'a, M: CanLookup + 'a>(
     let mapping = obj.map(bytes.len()).map_err(|_| AcquireError::InfoUnmappable)?;
     mapping.read_into(0, &mut bytes).map_err(|_| AcquireError::InfoUnmappable)?;
     FramebufferInfo::from_bytes(&bytes).ok_or(AcquireError::InfoTruncated)
-}
-
-/// Borrow the caller's own namespace handle for one call.
-fn borrowed<'a>(root_ns: u64) -> Ref<'a, Namespace, NsReadOnly> {
-    // SAFETY: the caller's own namespace handle, open for the call, as the raw functions have
-    // always asked.
-    unsafe { Ref::from_raw(RawHandle(root_ns), Rights::LOOKUP) }
 }
 
 /// Turn a firmware geometry report into a [`Geometry`].
@@ -104,22 +97,11 @@ pub unsafe fn map_framebuffer<'a, M: CanLookup + 'a>(
     Ok((unsafe { RawFramebuffer::new(geometry, addr) }, info))
 }
 
-/// Map the framebuffer and wrap it as a writable [`RawFramebuffer`]. For callers not yet on
-/// libos; the typed form is [`map_framebuffer`].
-///
-/// # Safety
-///
-/// `root_ns` must be a live namespace handle owned by the caller for the call. The returned
-/// [`RawFramebuffer`] must not outlive the address space, and nothing else may write the mapping.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub unsafe fn acquire(root_ns: u64) -> Result<(RawFramebuffer, FramebufferInfo), AcquireError> {
-    // SAFETY: forwarded from this function's own contract.
-    unsafe { map_framebuffer(borrowed(root_ns)) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libkern::handle::RawHandle;
+    use libos::NsReadOnly;
 
     fn info(bpp: u16, pitch: u64) -> FramebufferInfo {
         FramebufferInfo {
@@ -190,7 +172,7 @@ mod tests {
         // SAFETY: the mock's handle, open for the test.
         let root = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(ns), Rights::LOOKUP) };
         assert_eq!(framebuffer_info(root).err(), Some(AcquireError::NoBinding));
-        // SAFETY: as above; nothing is mapped.
-        assert_eq!(unsafe { acquire(ns) }.err(), Some(AcquireError::NoBinding));
+        // SAFETY: nothing is mapped, so nothing is written.
+        assert_eq!(unsafe { map_framebuffer(root) }.err(), Some(AcquireError::NoBinding));
     }
 }

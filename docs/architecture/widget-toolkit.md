@@ -298,7 +298,7 @@ the tinted title bar as well, which is the refresh's one deliberate divergence f
 derived from it: `TextSize::Body` is that size, `Small` is ⅞ of it and `Large` 13⁄12, and no step goes under `MIN_FONT_PX`. Those are
 the design's proportions around its 11.5-pixel body: its status bar and secondary columns are
 10 to 10.5 pixels, and its top bar 12.5. `bold` sets text in the
-face's bold companion, `libdraw::text::Font::bold`, which `load_ui` attaches only to the built-in
+face's bold companion, `libdraw::text::Font::bold`, which `load_ui_font` attaches only to the built-in
 face; a face with no companion draws "bold" at its regular weight. **`mono` is the same
 arrangement for the fixed-advance face** (Part J): a window is painted with one face, so a
 surface that wants a second — the editor's buffer — carries it as a companion rather than

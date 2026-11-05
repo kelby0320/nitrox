@@ -4,7 +4,7 @@
 use crate::{BlockReader, BlockWriter, FsError};
 use core::cell::{Cell, RefCell};
 use core::ops::Range;
-use libkern::{IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, RawHandle, Rights};
+use libkern::{IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp};
 use libos::{Handle, Op, ReadWrite, Ref, Resource};
 use sys::{Device, Object, View, Waited};
 
@@ -132,22 +132,9 @@ impl Disk {
         Ok(Disk { device, scratch, zeroes })
     }
 
-    /// [`over`](Self::over) the raw `device`, which the disk takes. For callers not yet on libos.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn new(device: u64) -> Result<Disk, &'static [u8]> {
-        // SAFETY: the device `bootstrap` took from the setup message, which nothing else holds.
-        Disk::over(unsafe { Handle::from_raw(RawHandle(device), Rights::empty()) })
-    }
-
     /// The block-device handle: what a Model A reply hands the kernel a duplicate of.
     pub fn handle(&self) -> Device<'_> {
         self.device.as_ref()
-    }
-
-    /// The raw [`handle`](Self::handle). For callers not yet on libos.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn device(&self) -> u64 {
-        self.device.raw().0
     }
 }
 
@@ -228,22 +215,9 @@ impl SectorDisk {
         Ok(SectorDisk { device, scratch })
     }
 
-    /// [`over`](Self::over) the raw `device`, which the disk takes. For callers not yet on libos.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn new(device: u64) -> Result<SectorDisk, &'static [u8]> {
-        // SAFETY: the device `bootstrap` took from the setup message, which nothing else holds.
-        SectorDisk::over(unsafe { Handle::from_raw(RawHandle(device), Rights::empty()) })
-    }
-
     /// The block-device handle: what a Model A reply hands the kernel a duplicate of.
     pub fn handle(&self) -> Device<'_> {
         self.device.as_ref()
-    }
-
-    /// The raw [`handle`](Self::handle). For callers not yet on libos.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn device(&self) -> u64 {
-        self.device.raw().0
     }
 
     /// **The sector-aligned chunks covering `[offset, offset + len)`**, each at most [`SPAN`]:

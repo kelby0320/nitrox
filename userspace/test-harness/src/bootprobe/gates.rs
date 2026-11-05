@@ -71,29 +71,29 @@ pub(super) fn fp_gate() -> bool {
     };
 
     if sum_scalar(&v) != expect_sq as f64 {
-        kprint(b"boot-probe: fp gate FAIL (f64 disagrees with integer math)\n");
+        log::write(b"boot-probe: fp gate FAIL (f64 disagrees with integer math)\n");
         return false;
     }
 
     for x in v.iter_mut() {
         *x = *x * 2.0 + 1.0;
     }
-    kprint(b"");
+    log::write(b"");
     for x in v.iter_mut() {
         *x = (*x - 1.0) / 2.0;
     }
     if v != original || sum_scalar(&v) != expect_sq as f64 {
-        kprint(b"boot-probe: fp gate FAIL (state lost across a syscall)\n");
+        log::write(b"boot-probe: fp gate FAIL (state lost across a syscall)\n");
         return false;
     }
 
     match fp_avx2_usable() {
         Err(()) => {
-            kprint(b"boot-probe: fp gate FAIL (CPU has AVX2 but XCR0 lacks YMM state)\n");
+            log::write(b"boot-probe: fp gate FAIL (CPU has AVX2 but XCR0 lacks YMM state)\n");
             false
         }
         Ok(false) => {
-            kprint(b"boot-probe: fp gate ok (f64 verified in ring 3; no AVX2)\n");
+            log::write(b"boot-probe: fp gate ok (f64 verified in ring 3; no AVX2)\n");
             true
         }
         Ok(true) => {
@@ -101,10 +101,10 @@ pub(super) fn fp_gate() -> bool {
             // the SSE+AVX state components in `XCR0`.
             let simd = unsafe { fp_sum_squares_avx2(&v) };
             if simd != expect_sq as f64 {
-                kprint(b"boot-probe: fp gate FAIL (avx2 disagrees with scalar)\n");
+                log::write(b"boot-probe: fp gate FAIL (avx2 disagrees with scalar)\n");
                 return false;
             }
-            kprint(b"boot-probe: fp gate ok (f64 + avx2 verified in ring 3)\n");
+            log::write(b"boot-probe: fp gate ok (f64 + avx2 verified in ring 3)\n");
             true
         }
     }
@@ -184,35 +184,28 @@ unsafe fn fp_sum_squares_avx2(v: &[f64; 8]) -> f64 {
 /// nonzero `switches`**. Login proving alone must not PASS a boot whose SMP substrate has died,
 /// and running before the only `SYS_TEST_EXIT(PASS)` call means a failure cannot lose a race to
 /// the verdict.
-pub(super) fn sched_gate(root_ns: u64) -> bool {
-    let (st, mem) = ns_lookup(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
-    if st != 0 || mem == 0 {
-        kprint(b"boot-probe: sched gate: lookup FAIL\n");
+pub(super) fn sched_gate(root: Root<'_>) -> bool {
+    let Ok(stats) = lookup::<File, MapRead, _>(root, "/proc/sched/stats", Rights::MAP_READ) else {
+        log::write(b"boot-probe: sched gate: lookup FAIL\n");
         return false;
-    }
-    // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, 4096, RIGHT_MAP_READ) };
-    if addr < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
-        kprint(b"boot-probe: sched gate: map FAIL\n");
+    };
+    let Ok(mapped) = stats.map(4096) else {
+        log::write(b"boot-probe: sched gate: map FAIL\n");
         return false;
-    }
-    // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the snapshot
-    // text (zero-padded to the page).
-    let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, 4096) };
-    let active = cpus_with_switches(text);
-    // SAFETY: unmapping the page mapped above (`text` is not used past here); closing our own
-    // handle.
-    unsafe {
-        syscall2(SYS_MEMORY_UNMAP, addr as u64, 4096);
-        syscall1(SYS_HANDLE_CLOSE, mem);
-    }
+    };
+    // A page the kernel mapped MAP_READ holding the snapshot text (zero-padded to the page).
+    let mut text = [0u8; 4096];
+    let active = match mapped.read_into(0, &mut text) {
+        Ok(()) => cpus_with_switches(&text),
+        Err(_) => 0,
+    };
+    drop(mapped);
+    drop(stats);
     if active >= 2 {
-        kprint(b"boot-probe: sched gate ok (>=2 CPUs with switches>0)\n");
+        log::write(b"boot-probe: sched gate ok (>=2 CPUs with switches>0)\n");
         true
     } else {
-        kprint(b"boot-probe: sched gate FAIL (<2 CPUs with switches>0)\n");
+        log::write(b"boot-probe: sched gate FAIL (<2 CPUs with switches>0)\n");
         false
     }
 }

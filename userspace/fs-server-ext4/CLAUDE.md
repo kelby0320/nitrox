@@ -42,9 +42,9 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
 - **`src/volume.rs` — ext4 as a `libfsserver::Volume`** (Phase 6 Part E.1): the wrapper the
   server loop calls, delegating each method to `ext4.rs`, and the host tests of the resolve core
   (`libfsserver::serve`) driven through it against the `mke2fs` fixture.
-- **`src/main.rs` — the server `[[bin]]`**: a `_start` that takes the device from
-  `libfsserver::server::bootstrap` and hands `server::run` an `Ext4` over it — or over the
-  `ReadOnly` a read-only mount is served through. **The protocol is `libfsserver`'s** since Part
+- **`src/main.rs` — the server `[[bin]]`**: a `_start` that takes its `libos::boot::Start`, opens
+  the device with `libfsserver::server::open_disk` and hands `server::serve_volume` an `Ext4` over
+  it — or over the `ReadOnly` a read-only mount is served through. **The protocol is `libfsserver`'s** since Part
   E.1, which serves `fs-server-fat` the same way: the setup message, `check_device` and a refusal
   in place of Ready, the forwarding channel and `Meta::Ready`, the serve loop (a Model A resolve
   replying the file's `BlockRun` map and a device handle; `RESOLVE_GROW` and `RESOLVE_CREATE`

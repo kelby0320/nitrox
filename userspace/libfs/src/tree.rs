@@ -1,17 +1,14 @@
-//! Directories and trees: listing, and the walks that copy, remove and make them.
-//!
-//! The typed forms take a namespace and `&str` paths; each raw shim keeps the `ns: u64` and
-//! `&[u8]` signature its callers outside this crate still use.
+//! Directories and trees: listing, and the walks that copy, remove and make them. Each takes a
+//! namespace and `&str` paths.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use libkern::abi::{NS_ENTRY_PATH_MAX, NS_KIND_MOUNT};
-use libkern::error::KError;
 use libos::{CanLookup, Msg, Namespace, Ref};
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, DirEntry, OwnedEntry};
 use librsproto::session::{Dir, DirError};
 
-use crate::files::{FileError, borrowed, copy, text};
+use crate::files::{FileError, copy};
 use crate::{basename, join, parent_str};
 
 /// Does `path` name a directory?
@@ -279,51 +276,6 @@ fn remove_empty_dir<M: CanLookup>(ns: Ref<'_, Namespace, M>, path: &str) -> Resu
         Err(DirError::Server(k)) => Err(TreeError::Rmdir(k)),
         Err(_) => Err(TreeError::Rmdir(0)),
     }
-}
-
-/// [`is_directory`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`is_directory`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn is_dir(ns: u64, path: &[u8]) -> bool {
-    text(path).is_some_and(|path| is_directory(borrowed(ns), path))
-}
-
-/// [`copy_recursive`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`copy_recursive`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn copy_tree(
-    ns: u64,
-    src: &[u8],
-    dst: &[u8],
-    force: bool,
-    on_file: &mut impl FnMut(&[u8], &[u8], u64),
-) -> Result<(), TreeError> {
-    let (Some(src), Some(dst)) = (text(src), text(dst)) else {
-        return Err(TreeError::Copy(FileError::Io(KError::InvalidArgument.as_i32())));
-    };
-    copy_recursive(borrowed(ns), src, dst, force, &mut |s, d, n| on_file(s.as_bytes(), d.as_bytes(), n))
-}
-
-/// [`remove_recursive`] for a raw namespace handle. For callers not yet on libos; the typed form
-/// is [`remove_recursive`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn remove_tree(ns: u64, path: &[u8], on_entry: &mut impl FnMut(&[u8], bool)) -> Result<(), TreeError> {
-    let path = text(path).ok_or(TreeError::OpenDir)?;
-    remove_recursive(borrowed(ns), path, &mut |p, dir| on_entry(p.as_bytes(), dir))
-}
-
-/// [`make_dir`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`make_dir`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn mkdir(ns: u64, path: &[u8]) -> Result<(), TreeError> {
-    make_dir(borrowed(ns), text(path).ok_or(TreeError::OpenDir)?)
-}
-
-/// [`remove_entry`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`remove_entry`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn unlink_at(ns: u64, path: &[u8]) -> Result<(), TreeError> {
-    remove_entry(borrowed(ns), text(path).ok_or(TreeError::OpenDir)?)
 }
 
 #[cfg(test)]

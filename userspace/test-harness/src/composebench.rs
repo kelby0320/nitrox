@@ -24,9 +24,9 @@ use libdraw::compose::{SurfaceRef, compose, compose_exposed};
 use libdraw::format::{PixelFormat, Rgb};
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Point, Rect};
-use libkern::debug::Line;
-use libkern::syscall::{SYS_CLOCK_READ, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_TEST_EXIT, syscall1, syscall4};
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Handle, MapReadWrite, Memory, system, time};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -41,29 +41,12 @@ const STEP: i32 = 1;
 ///
 /// Monotonic, not realtime: realtime is `Unsupported` when the RTC could not be read.
 fn now_ns() -> u64 {
-    let mut out: u64 = 0;
-    // SAFETY: `&mut out` is a valid writable `u64` out-param, which is what the ABI asks for.
-    let r = unsafe { syscall4(SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&mut out as *mut u64) as u64, 0, 0) };
-    if r < 0 { 0 } else { out }
+    time::now().unwrap_or(0)
 }
 
 fn anonymous(len: usize) -> Option<*mut u8> {
-    // SAFETY: a plain anonymous object of `len` bytes.
-    let h = unsafe { syscall4(SYS_MEMORY_CREATE, len as u64, 0, 0, 0) };
-    if h <= 0 {
-        return None;
-    }
-    // SAFETY: maps the object read/write at a kernel-chosen address.
-    let base = unsafe {
-        syscall4(
-            SYS_MEMORY_MAP,
-            h as u64,
-            0,
-            len as u64,
-            libkern::handle::RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE,
-        )
-    };
-    if base < 0 { None } else { Some(base as u64 as *mut u8) }
+    let mapping = Handle::<Memory, MapReadWrite>::create(len).ok()?.map(len).ok()?;
+    Some(mapping.into_raw().0)
 }
 
 /// **E1** — write `len` bytes to `dst` `rounds` times, in ns per round; a plain store loop, since
@@ -159,14 +142,19 @@ fn frame_shadow<F: Framebuffer + ?Sized>(
 
 /// Entry point: run E1, then the E2 to E4 arms frame by frame, then fire the boot verdict.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
-    kprint(b"compose-bench: up\n");
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    log::write(b"compose-bench: up\n");
 
-    // SAFETY: `root_ns` is this process's live root namespace for its whole run.
-    let (mut fb, info) = match unsafe { acquire::acquire(root_ns) } {
+    let framebuffer = start.root.as_ref().ok_or(AcquireError::NoBinding).and_then(|root| {
+        // SAFETY: this program owns the screen for the length of a run, so it is the only writer.
+        unsafe { acquire::map_framebuffer(root) }
+    });
+    let (mut fb, info) = match framebuffer {
         Ok(pair) => pair,
         Err(e) => {
-            kprint(match e {
+            log::write(match e {
                 AcquireError::InfoUnmappable => b"compose-bench: info unmappable\n" as &[u8],
                 AcquireError::NoBinding => b"compose-bench: no /dev/framebuffer\n",
                 _ => b"compose-bench: acquire failed\n",
@@ -188,7 +176,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
     // ---- E1: is the aperture behaving like RAM? One row per round, not the screen. ----
     let row = geometry.pitch;
     let rounds = 64;
-    kprint(b"compose-bench: e1 begins (aperture vs anonymous, one row per round)\n");
+    log::write(b"compose-bench: e1 begins (aperture vs anonymous, one row per round)\n");
     match anonymous(row) {
         Some(ram) => {
             for _ in 0..rounds {
@@ -200,7 +188,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
                 }
             }
         }
-        None => kprint(b"compose-bench: e1 SKIPPED (no anonymous mapping)\n"),
+        None => log::write(b"compose-bench: e1 SKIPPED (no anonymous mapping)\n"),
     }
 
     // ---- E2: in place versus shadow, on a drag ----
@@ -217,7 +205,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
     }
     let mut shadow = MemFramebuffer::new(geometry);
 
-    kprint(b"compose-bench: e2 begins (in-place vs shadow, one-pixel drag)\n");
+    log::write(b"compose-bench: e2 begins (in-place vs shadow, one-pixel drag)\n");
     let mut prev = window_at(0, screen);
     for i in 1..=FRAMES {
         let next = window_at(i, screen);
@@ -250,7 +238,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
         prev = next;
     }
 
-    kprint(b"compose-bench: done\n");
+    log::write(b"compose-bench: done\n");
     verdict(true)
 }
 
@@ -260,15 +248,14 @@ fn dmg_area(dmg: &[Rect], screen: Rect) -> usize {
 }
 
 fn verdict(pass: bool) -> ! {
-    let code = if pass { libkern::syscall::TEST_EXIT_SUCCESS } else { libkern::syscall::TEST_EXIT_FAILURE };
-    // SAFETY: `SYS_TEST_EXIT` takes the verdict in a0; under the kernel's test-harness build it
-    // writes the `isa-debug-exit` device and does not return.
-    unsafe { syscall1(SYS_TEST_EXIT, code as u64) };
-    exit(if pass { 0 } else { 1 })
+    // Under the kernel's test-harness build this writes the `isa-debug-exit` device and does not
+    // return.
+    system::test_verdict(pass);
+    libos::exit(if pass { 0 } else { 1 })
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"compose-bench: PANIC\n");
+    log::write(b"compose-bench: PANIC\n");
     verdict(false)
 }

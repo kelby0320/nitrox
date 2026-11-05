@@ -15,6 +15,8 @@ use fs_server_ext4::{Ext4, ReadOnly};
 use libfsserver::cache::{MetaCache, OnceStore};
 use libfsserver::disk::Disk;
 use libfsserver::server;
+use libos::boot::Start;
+use libos::{Channel, Only, exit, log};
 
 /// The metadata cache's memory.
 static STORE: OnceStore = OnceStore::new();
@@ -24,10 +26,16 @@ static STORE: OnceStore = OnceStore::new();
 /// the server resolves nothing), `rdx` = the **control channel** endpoint its
 /// supervisor installed, `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: `_start`'s four registers as the kernel set them, wrapped here and nowhere else.
+    let mut start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    // `start` keeps the two unused handles for the server's life, as serving never returns.
+    let Some(control) = start.take_handle0::<Channel, Only>() else {
+        log::write(b"fs-server: setup recv failed\n");
+        exit(1)
+    };
     // 1–2. The block device, and whether to serve it read-only, from the setup message.
-    let (disk, read_only) = server::bootstrap(control, Disk::new);
-    let device = disk.device();
+    let (disk, read_only) = server::open_disk(&control, Disk::over);
     // The device through a metadata cache.
     let store = STORE.take().expect("`_start` runs once");
     let cached = MetaCache::new(&disk, store);
@@ -35,9 +43,9 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     //      which also marks each file it resolves read-only.
     if read_only {
         let ro = ReadOnly(&cached);
-        server::run(&Ext4(&ro), control, device)
+        server::serve_volume(&Ext4(&ro), control, disk.handle())
     } else {
-        server::run(&Ext4(&cached), control, device)
+        server::serve_volume(&Ext4(&cached), control, disk.handle())
     }
 }
 

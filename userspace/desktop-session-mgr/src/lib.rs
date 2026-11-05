@@ -195,7 +195,7 @@ mod tests {
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
     const BOLD: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans-Bold.ttf");
 
-    /// The faces the greeter draws with, as `load_ui` attaches them in the guest.
+    /// The faces the greeter draws with, as `load_ui_font` attaches them in the guest.
     fn faces() -> Font {
         Font::from_bytes(DEJAVU.to_vec())
             .expect("the vendored face parses")

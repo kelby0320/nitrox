@@ -309,7 +309,7 @@ impl Server {
         };
         let (op, request_id, resolved) = match decode(msg.payload()) {
             Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
-                // A suffix naming a projection's root is what `Dir::open` asks for: answered with
+                // A suffix naming a projection's root is what `Dir::resolve` asks for: answered with
                 // a session, a reply of a different shape from a file's.
                 Some(r) => match core::str::from_utf8(r.suffix).ok().and_then(split_suffix) {
                     Some((dir, "")) => (m.op, m.request_id, Resolved::Dir(dir)),

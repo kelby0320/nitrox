@@ -24,7 +24,7 @@ servers speak one protocol and a fix to it is a fix to both:
 - **`disk.rs`** — the device over `sys_io_submit`: `Disk`, a 4 KiB block per submit, which ext4's
   server uses — but zeroes up to 64 KiB a submit, from a zeroed memory object of its own
   (`BlockWriter::write_zeroes`, Phase 6 Part H.4); and `SectorDisk` (Part E.3), sector-granular and up to 64 KiB per submit, which
-  FAT's uses. A server hands `server::bootstrap` the one it wants. And **`PartitionIo`** (Phase 6
+  FAT's uses. A server hands `server::open_disk` the one it wants. And **`PartitionIo`** (Phase 6
   Part G.2), a window onto part of a device, for a program that makes a filesystem on a disk it
   holds rather than a server handed a partition: `nxinstall`'s until `disk --format` needed it too.
   **None of the three is `Sync`**: each moves every transfer through one **`Scratch`**, a memory
@@ -50,8 +50,8 @@ servers speak one protocol and a fix to it is a fix to both:
 - **Every forwarded request is answered**, for the same reason: a reply the kernel did not take
   is answered with an error and its handles closed (`Outbox::forwarded`, and a directory session's
   open). Once the kernel takes one, it completes the lookup itself, an install that fails too.
-- **`no_std`, no `alloc`, and no `static mut`.** The loop's state is one `Server`, which `run`
-  makes on its own stack, so nothing else reaches it. **A request is borrowed from its inbox**, the
+- **`no_std`, no `alloc`, and no `static mut`.** The loop's state is one `Server`, which
+  `serve_volume` makes on its own stack, so nothing else reaches it. **A request is borrowed from its inbox**, the
   rest of the server beside it, so no receive can overwrite a request still being read; a handler
   takes the request as `&[u8]`, never copies it to a buffer of its own size. Each binary's metadata
   store is a `cache::OnceStore`, a `static` handed out once.

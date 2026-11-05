@@ -213,23 +213,20 @@ impl SetupPayload {
 }
 
 #[cfg(feature = "io")]
-pub use self::io_stage::{
-    Bootstrap, Setup, StageSetup, StageStreams, bootstrap, open_pipe, pipe, receive_setup, send_setup, send_setup_full,
-    send_stage_setup,
-};
+pub use self::io_stage::{StageSetup, StageStreams, open_pipe, receive_setup, send_stage_setup};
 
-/// The sender (a shell spawning a stage) and receiver (`bootstrap().setup()`) sides of
+/// The sender (a shell spawning a stage) and receiver ([`receive_setup`]) sides of
 /// the setup message, over real IPC, behind `io`. Like [`channel::IpcPort`](crate::channel)
 /// but carries transferred handles.
 #[cfg(feature = "io")]
 mod io_stage {
-    use super::{STREAM_MASK, SetupPayload, Streams, setup_is_pending, split_handles};
+    use super::{STREAM_MASK, SetupPayload, split_handles};
     use crate::channel::{recv_msg, send_msg};
     use crate::wire::{Record, Result, WireError};
     use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
-    use libkern::{IPC_HANDLE_MAX, RawHandle, Rights};
+    use libkern::IPC_HANDLE_MAX;
     use libos::{Carried, Channel, Deadline, Handle, Msg, Only, Ref};
 
     /// The endpoints of a stage's standard streams, owned: each is closed if it is not sent.
@@ -250,58 +247,11 @@ mod io_stage {
                 | present(&self.stdout, super::STREAM_STDOUT)
                 | present(&self.stderr, super::STREAM_STDERR)
         }
-
-        /// Own the handles of `streams`, which the caller gives up.
-        fn from_raw(streams: Streams) -> Self {
-            // SAFETY: the caller of a raw send gave these handles up, as it always has.
-            let own = |h: Option<u64>| h.map(|h| unsafe { Handle::from_raw(RawHandle(h), Rights::empty()) });
-            StageStreams { stdin: own(streams.stdin), stdout: own(streams.stdout), stderr: own(streams.stderr) }
-        }
     }
 
     /// Create a pipe (an IPC channel pair) of queue depth `depth`: endpoints `(a, b)`, both owned.
     pub fn open_pipe(depth: u32) -> Result<(Handle<Channel, Only>, Handle<Channel, Only>)> {
         Handle::<Channel, Only>::pair(depth).map_err(|_| WireError::SinkFull)
-    }
-
-    /// Create a pipe of queue depth `depth`: endpoints `(a, b)`, which the caller owns and closes.
-    /// For callers not yet on libos; the typed form is [`open_pipe`].
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn pipe(depth: u32) -> Result<(u64, u64)> {
-        open_pipe(depth).map(|(a, b)| (a.into_raw().0, b.into_raw().0))
-    }
-
-    /// Send the **setup message** on `channel` (the shell's end of the stage's bootstrap
-    /// endpoint): the present stream handles (canonical order) are **moved** to the stage, and
-    /// gone on every return, as [`send_stage_setup`] says. For callers not yet on libos.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn send_setup(channel: u64, streams: Streams, argv: &[&str]) -> Result<()> {
-        send_setup_full(channel, streams, None, argv, &Record::default())
-    }
-
-    /// The full form: streams, an optional **terminal**, `argv` and the environment.
-    ///
-    /// The terminal handle is **moved** like the streams, and rides *after* them in the
-    /// handle array; see [`SetupPayload::terminal`]. Other callers pass `None`.
-    ///
-    /// **Every handle given is gone on every return**: moved by a send the kernel took, or closed
-    /// here when the message could not be made or the kernel refused it. A caller never closes one,
-    /// and no `Err` can be retried, `SinkFull` included.
-    ///
-    /// For callers not yet on libos; the typed form is [`send_stage_setup`].
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn send_setup_full(
-        channel: u64,
-        streams: Streams,
-        terminal: Option<u64>,
-        argv: &[&str],
-        env: &Record,
-    ) -> Result<()> {
-        // SAFETY: the caller's own endpoint, open for the call, as this has always asked.
-        let channel = unsafe { Ref::<Channel, Only>::from_raw(RawHandle(channel), Rights::empty()) };
-        // SAFETY: the terminal is given up like the streams.
-        let terminal = terminal.map(|h| unsafe { Handle::from_raw(RawHandle(h), Rights::empty()) });
-        send_stage_setup(channel, StageStreams::from_raw(streams), terminal, argv, env, Deadline::NEVER)
     }
 
     /// Send the setup message on `channel`, the shell's end of the stage's bootstrap endpoint.
@@ -336,44 +286,18 @@ mod io_stage {
         send_msg(channel.into(), &msg, &mut handles, deadline)
     }
 
-    /// The four bootstrap registers a process receives at `_start`, plus the opt-in
-    /// setup message. Construct with [`bootstrap`].
-    pub struct Bootstrap {
-        notif: u64,
-        namespace: u64,
-        endpoint: u64,
-        arg0: u64,
-    }
-
-    /// A Tier-1 stage's setup: its standard streams and `argv`.
-    pub struct Setup {
-        /// The stream handles (`stdin`/`stdout`/`stderr`), mapped from the message.
-        pub streams: Streams,
-        /// The command-line arguments (`argv[0]` is the program name).
-        pub argv: Vec<String>,
-        /// The environment this stage was given (empty if none); Tier 0 has none, as it
-        /// has no setup message.
-        pub env: Record,
-        /// The terminal this stage was handed, if its parent gave it one; otherwise it
-        /// resolves `/dev/tty`. See [`SetupPayload::terminal`].
-        pub terminal: Option<u64>,
-    }
-
-    /// A Tier-1 stage's setup, its handles owned: [`Setup`]'s typed form.
+    /// A Tier-1 stage's setup: its standard streams and `argv`, its handles owned.
     pub struct StageSetup {
         /// The stream endpoints (`stdin`/`stdout`/`stderr`), mapped from the message.
         pub streams: StageStreams,
         /// The command-line arguments (`argv[0]` is the program name).
         pub argv: Vec<String>,
-        /// The environment this stage was given (empty if none).
+        /// The environment this stage was given (empty if none); Tier 0 has none, as it has no
+        /// setup message.
         pub env: Record,
-        /// The terminal this stage was handed, if its parent gave it one.
+        /// The terminal this stage was handed, if its parent gave it one; otherwise it resolves
+        /// `/dev/tty`. See [`SetupPayload::terminal`].
         pub terminal: Option<Handle<Channel, Only>>,
-    }
-
-    /// Wrap a process's four bootstrap registers (as received by `_start`).
-    pub fn bootstrap(notif: u64, namespace: u64, endpoint: u64, arg0: u64) -> Bootstrap {
-        Bootstrap { notif, namespace, endpoint, arg0 }
     }
 
     /// Receive a setup message on `endpoint`, the stage's bootstrap endpoint: `None` if none came
@@ -407,48 +331,6 @@ mod io_stage {
         debug_assert_eq!(streams.bitmap(), payload.streams & STREAM_MASK);
         let terminal = take(payload.terminal)?;
         Ok(Some(StageSetup { streams, argv: payload.argv, env: payload.env, terminal }))
-    }
-
-    impl Bootstrap {
-        /// The notification-channel handle.
-        pub fn notif(&self) -> u64 {
-            self.notif
-        }
-        /// The root-namespace handle.
-        pub fn namespace(&self) -> u64 {
-            self.namespace
-        }
-        /// The bootstrap endpoint handle (the setup channel for a Tier-1 stage).
-        pub fn endpoint(&self) -> u64 {
-            self.endpoint
-        }
-        /// The raw `arg0` descriptor word.
-        pub fn arg0(&self) -> u64 {
-            self.arg0
-        }
-
-        /// If `arg0` marks a pending setup message (Tier 1), receive it on the endpoint
-        /// and parse the streams + `argv`. `None` for a Tier-0 process (no descriptor). The
-        /// handles it brings are raw and the caller's; for callers not yet on libos, the typed
-        /// form is [`receive_setup`].
-        // TODO(raw-handle-shims): goes when its last caller is on libos.
-        pub fn setup(&self) -> Option<Result<Setup>> {
-            if !setup_is_pending(self.arg0) {
-                return None;
-            }
-            // SAFETY: the process's own bootstrap endpoint, open for the call.
-            let endpoint = unsafe { Ref::<Channel, Only>::from_raw(RawHandle(self.endpoint), Rights::empty()) };
-            let raw = |h: Option<Handle<Channel, Only>>| h.map(|h| h.into_raw().0);
-            let s = match receive_setup(endpoint, Deadline::NEVER) {
-                Ok(Some(s)) => s,
-                // Waited for ever, so a setup came; a deadline passing is not a thing to meet.
-                Ok(None) => return Some(Err(WireError::PeerClosed)),
-                Err(e) => return Some(Err(e)),
-            };
-            let streams =
-                Streams { stdin: raw(s.streams.stdin), stdout: raw(s.streams.stdout), stderr: raw(s.streams.stderr) };
-            Some(Ok(Setup { streams, argv: s.argv, env: s.env, terminal: raw(s.terminal) }))
-        }
     }
 }
 

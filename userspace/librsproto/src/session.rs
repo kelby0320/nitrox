@@ -15,15 +15,9 @@ use crate::file::{
 use crate::{
     OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK, RS_HEADER_LEN,
 };
-use libkern::abi::IPC_MSG_SIZE;
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
-use libkern::{KError, RawHandle, Rights};
-use libos::{CanLookup, Carried, Channel, Deadline, Handle, Msg, Namespace, NsReadOnly, Only, Ref, WaitSet, block_on};
-
-/// Byte offset of the rsproto payload within an `IpcMsg` (the IPC header precedes it).
-pub(crate) const PAYLOAD_OFF: usize = 24;
-/// `IpcMsgHeader.payload_len` field offset.
-const OFF_PAYLOAD_LEN: usize = 4;
+use libkern::{KError, Rights};
+use libos::{CanLookup, Carried, Channel, Deadline, Handle, Msg, Namespace, Only, Ref, WaitSet, block_on};
 
 /// The rights a directory session needs: send, receive, and `sys_wait` for the reply.
 pub const DIR_SESSION_RIGHTS: u64 = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT;
@@ -46,10 +40,7 @@ pub type Result<T> = core::result::Result<T, DirError>;
 /// An open directory session: an endpoint plus the one message its traffic uses.
 ///
 /// The message is caller-provided so this crate stays `alloc`-free; the same one carries the
-/// request out and the reply back. A session built by [`resolve`](Self::resolve) or
-/// [`new`](Self::new) owns its endpoint and closes it when dropped; one built by the raw
-/// [`open`](Self::open) or [`from_endpoint`](Self::from_endpoint) is closed only by
-/// [`close`](Self::close).
+/// request out and the reply back. The session owns its endpoint and closes it when dropped.
 pub struct Dir<'a> {
     session: Session<'a>,
 }
@@ -74,43 +65,9 @@ impl<'a> Dir<'a> {
         Dir { session: Session::new(endpoint, msg) }
     }
 
-    /// Resolve `path` in the namespace `ns` to a directory session.
-    ///
-    /// `buf` must be at least [`IPC_MSG_SIZE`] bytes. Fails with [`DirError::Transport`] if the
-    /// path does not resolve or resolves to something that is not a directory. For callers not
-    /// yet on libos; the typed form is [`resolve`](Self::resolve).
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn open(ns: u64, path: &[u8], buf: &'a mut [u8]) -> Result<Dir<'a>> {
-        if buf.len() < IPC_MSG_SIZE {
-            return Err(DirError::Protocol);
-        }
-        let path = core::str::from_utf8(path).map_err(|_| DirError::Transport(KError::InvalidArgument.as_i32()))?;
-        // SAFETY: the caller's own namespace handle, open for the call, as this has always asked.
-        let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(ns), Rights::empty()) };
-        let endpoint = connect(ns, path).map_err(DirError::from)?;
-        Ok(Dir { session: Session::raw(endpoint.into_raw().0, buf) })
-    }
-
-    /// Wrap an already-resolved session endpoint; [`close`](Self::close) closes it. For callers
-    /// not yet on libos; the typed form is [`new`](Self::new).
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn from_endpoint(endpoint: u64, buf: &'a mut [u8]) -> Result<Dir<'a>> {
-        if buf.len() < IPC_MSG_SIZE {
-            return Err(DirError::Protocol);
-        }
-        Ok(Dir { session: Session::raw(endpoint, buf) })
-    }
-
     /// The underlying endpoint, borrowed (for waiting on alongside other handles).
     pub fn channel(&self) -> Ref<'_, Channel, Only> {
         self.session.channel()
-    }
-
-    /// The underlying endpoint handle (for `sys_wait` alongside other handles). For callers not
-    /// yet on libos; the typed form is [`channel`](Self::channel).
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn endpoint(&self) -> u64 {
-        self.session.channel().raw().0
     }
 
     /// Close the session's endpoint handle, releasing the server-side session.
@@ -232,61 +189,33 @@ pub(crate) fn connect<'n, M: CanLookup + 'n>(
     Ok(endpoint)
 }
 
-/// Where a session's endpoint and message live.
-enum Link<'a> {
-    /// An endpoint the session owns, with the caller's message: closed on drop.
-    Owned(Handle<Channel, Only>, &'a mut Msg),
-    /// A raw endpoint and byte buffer of a caller not yet on libos: closed only by `close`.
-    Raw(u64, &'a mut [u8]),
-}
-
 /// The endpoint and request ids shared by every session client.
 pub(crate) struct Session<'a> {
-    link: Link<'a>,
+    /// Closed on drop.
+    endpoint: Handle<Channel, Only>,
+    msg: &'a mut Msg,
     /// Monotonic per-session request id — echoed by the server, useful in a trace.
     next_request_id: u64,
 }
 
 impl<'a> Session<'a> {
     pub(crate) fn new(endpoint: Handle<Channel, Only>, msg: &'a mut Msg) -> Self {
-        Session { link: Link::Owned(endpoint, msg), next_request_id: 1 }
-    }
-
-    /// `buf` must be at least [`IPC_MSG_SIZE`] bytes: the caller checks.
-    pub(crate) fn raw(endpoint: u64, buf: &'a mut [u8]) -> Self {
-        Session { link: Link::Raw(endpoint, buf), next_request_id: 1 }
+        Session { endpoint, msg, next_request_id: 1 }
     }
 
     pub(crate) fn channel(&self) -> Ref<'_, Channel, Only> {
-        match &self.link {
-            Link::Owned(endpoint, _) => endpoint.as_ref(),
-            // SAFETY: the shim's caller keeps the endpoint open until `close`, as it always has.
-            Link::Raw(endpoint, _) => unsafe { Ref::from_raw(RawHandle(*endpoint), Rights::empty()) },
-        }
+        self.endpoint.as_ref()
     }
 
-    /// Close the endpoint, whichever way the session holds it.
-    pub(crate) fn close(self) {
-        if let Link::Raw(endpoint, _) = self.link {
-            // SAFETY: `close` is where the raw shims' caller gave the endpoint up.
-            drop(unsafe { Handle::<Channel, Only>::from_raw(RawHandle(endpoint), Rights::empty()) });
-        }
-    }
+    /// Close the endpoint, as the drop does.
+    pub(crate) fn close(self) {}
 
     /// Send one request and wait for its reply; returns the reply's rsproto payload.
     pub(crate) fn call(&mut self, op: u16, body: &[u8]) -> core::result::Result<&[u8], WireError> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        match &mut self.link {
-            Link::Owned(endpoint, msg) => {
-                let n = exchange(endpoint.as_ref(), msg, request_id, op, body)?;
-                Ok(&msg.payload()[..n])
-            }
-            Link::Raw(endpoint, buf) => {
-                let n = round_trip(*endpoint, buf, request_id, op, body)?;
-                Ok(&buf[PAYLOAD_OFF..PAYLOAD_OFF + n])
-            }
-        }
+        let n = exchange(self.endpoint.as_ref(), self.msg, request_id, op, body)?;
+        Ok(&self.msg.payload()[..n])
     }
 }
 
@@ -320,29 +249,6 @@ pub fn exchange<'e>(
             return Ok(payload_len);
         }
     }
-}
-
-/// As [`exchange`], on a raw `endpoint` the caller keeps open, with the reply left in `buf` at
-/// [`PAYLOAD_OFF`]. A `buf` shorter than [`IPC_MSG_SIZE`] is refused `Protocol`. For callers not
-/// yet on libos; the typed form is [`exchange`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn round_trip(
-    endpoint: u64,
-    buf: &mut [u8],
-    request_id: u64,
-    op: u16,
-    body: &[u8],
-) -> core::result::Result<usize, WireError> {
-    if buf.len() < IPC_MSG_SIZE {
-        return Err(WireError::Protocol);
-    }
-    // SAFETY: the caller's own endpoint, open for the call, as this has always asked.
-    let endpoint = unsafe { Ref::<Channel, Only>::from_raw(RawHandle(endpoint), Rights::empty()) };
-    let mut msg = Msg::new();
-    let n = exchange(endpoint, &mut msg, request_id, op, body)?;
-    buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(n as u32).to_le_bytes());
-    buf[PAYLOAD_OFF..PAYLOAD_OFF + n].copy_from_slice(msg.payload());
-    Ok(n)
 }
 
 /// The payload length of the message in `msg` if it answers `request_id`'s `op`, `None` if it has
@@ -391,7 +297,8 @@ fn rename_body(old: &[u8], new: &[u8]) -> Option<([u8; RENAME_REQUEST_MAX], usiz
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::*;
-    use libos::mock;
+    use libkern::RawHandle;
+    use libos::{NsReadOnly, mock};
 
     /// A namespace whose `path` answers a lookup with an endpoint, and that endpoint's peer.
     pub(crate) fn service(path: &str) -> (Ref<'static, Namespace, NsReadOnly>, Ref<'static, Channel, Only>) {
@@ -450,13 +357,6 @@ mod tests {
         assert_eq!(reply_to(&msg, 7, OP_FILE_MKDIR), Err(WireError::Protocol));
     }
 
-    /// Refused before anything is sent: a message one byte short reaches no syscall.
-    #[test]
-    fn a_round_trip_refuses_a_buffer_shorter_than_a_message() {
-        let mut short = [0u8; IPC_MSG_SIZE - 1];
-        assert!(matches!(round_trip(0, &mut short, 1, crate::OP_FILE_READ_DIR, &[]), Err(WireError::Protocol)));
-    }
-
     /// A reply to an older request is passed over; the request goes out under this call's id.
     #[test]
     fn a_session_waits_for_its_own_reply_and_owns_its_endpoint() {
@@ -503,46 +403,6 @@ mod tests {
         let mut msg = Msg::new();
         let err = Dir::resolve(ns, "/dev/gone", &mut msg).err().unwrap();
         assert_eq!(err, DirError::Transport(KError::NotFound.as_i32()));
-        let mut buf = [0u8; IPC_MSG_SIZE];
-        assert_eq!(
-            Dir::open(0, b"/dev/\xff", &mut buf).err(),
-            Some(DirError::Transport(KError::InvalidArgument.as_i32()))
-        );
         assert_eq!(mock::open_handles(), open);
-    }
-
-    /// A session of the raw shims is closed by `close` and by nothing else: its caller may own
-    /// the endpoint, or close it itself.
-    #[test]
-    fn a_session_of_the_raw_shims_is_closed_only_by_close() {
-        mock::reset();
-        let (ns, _peer) = service("/dev/dir");
-        let mut buf = [0u8; IPC_MSG_SIZE];
-        let opened = Dir::open(ns.raw().0, b"/dev/dir", &mut buf).unwrap();
-        let ep = opened.endpoint();
-        drop(opened);
-        assert!(mock::is_open(ep), "dropped, not closed");
-        let wrapped = Dir::from_endpoint(ep, &mut buf).unwrap();
-        drop(wrapped);
-        assert!(mock::is_open(ep), "a wrapped endpoint is its caller's until `close`");
-        Dir::from_endpoint(ep, &mut buf).unwrap().close();
-        assert!(!mock::is_open(ep));
-        assert_eq!(mock::stray_closes(), 0);
-        assert!(matches!(Dir::from_endpoint(ep, &mut buf[..IPC_MSG_SIZE - 1]), Err(DirError::Protocol)));
-    }
-
-    /// The raw round trip leaves the reply in the caller's buffer, where its callers read it.
-    #[test]
-    fn a_raw_round_trip_leaves_the_reply_in_the_buffer() {
-        mock::reset();
-        let (ns, peer) = service("/dev/dir");
-        let endpoint = block_on(ns.lookup::<Channel, Only>("/dev/dir", Rights::from_bits(DIR_SESSION_RIGHTS))).unwrap();
-        queue(peer, 5, OP_FILE_MKDIR, RS_FLAG_REPLY, b"mine");
-        let mut buf = [0u8; IPC_MSG_SIZE];
-        let n = round_trip(endpoint.raw().0, &mut buf, 5, OP_FILE_MKDIR, b"ask").unwrap();
-        assert_eq!(crate::decode(&buf[PAYLOAD_OFF..PAYLOAD_OFF + n]).unwrap().body, b"mine");
-        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize, n);
-        assert_eq!(request(peer).2, b"ask");
-        assert!(mock::is_open(endpoint.raw().0), "the caller's endpoint stays open");
     }
 }

@@ -2,8 +2,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use libkern::{RawHandle, Rights};
-use libos::{CanLookup, Carried, Channel, Handle, Msg, Namespace, NsReadOnly, Only, Ref, block_on};
+use libkern::Rights;
+use libos::{CanLookup, Carried, Channel, Handle, Msg, Namespace, Only, Ref, block_on};
 use librsproto::log::encode_append;
 
 pub use librsproto::log::{LEVEL_CRITICAL, LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN};
@@ -110,29 +110,18 @@ impl Logger {
     }
 }
 
-/// Resolve a log path in `ns` to a [`Logger`] that owns its endpoint, or to an invalid one. For
-/// callers not yet on libos; the typed form is [`Logger::open`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn open_source(ns: u64, path: &[u8]) -> Logger {
-    // SAFETY: the caller's own namespace handle, open for the call, as this has always asked.
-    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(ns), Rights::empty()) };
-    match core::str::from_utf8(path) {
-        Ok(path) => Logger::open(ns, path),
-        Err(_) => Logger::none(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libos::mock;
+    use libkern::RawHandle;
+    use libos::{NsReadOnly, mock};
     use librsproto::log::parse_append;
 
     /// A namespace whose `/log/x` answers with an endpoint, and its peer, where records arrive.
-    fn service() -> (u64, Ref<'static, Channel, Only>) {
+    fn service() -> (Ref<'static, Namespace, NsReadOnly>, Ref<'static, Channel, Only>) {
         let (ns, peer) = mock::answering("/log/x");
-        // SAFETY: the mock's handle, open for the test's life.
-        (ns, unsafe { Ref::from_raw(RawHandle(peer), Rights::empty()) })
+        // SAFETY: the mock's handles, open for the test's life.
+        unsafe { (Ref::from_raw(RawHandle(ns), Rights::LOOKUP), Ref::from_raw(RawHandle(peer), Rights::empty())) }
     }
 
     fn received(peer: Ref<'_, Channel, Only>) -> Option<(u8, std::vec::Vec<u8>)> {
@@ -145,7 +134,7 @@ mod tests {
     fn an_opened_logger_sends_each_record_and_owns_its_endpoint() {
         mock::reset();
         let (ns, peer) = service();
-        let log = open_source(ns, b"/log/x");
+        let log = Logger::open(ns, "/log/x");
         assert!(log.is_valid());
         log.info("hello");
         log.error("bad");
@@ -160,7 +149,7 @@ mod tests {
     fn a_path_that_does_not_resolve_logs_nowhere() {
         mock::reset();
         let (ns, _peer) = service();
-        let log = open_source(ns, b"/log/y");
+        let log = Logger::open(ns, "/log/y");
         assert!(!log.is_valid());
         log.info("lost");
         assert!(!Logger::none().is_valid() && Logger::none().endpoint().is_none());
@@ -170,7 +159,7 @@ mod tests {
     fn a_record_past_a_message_is_dropped_whole() {
         mock::reset();
         let (ns, peer) = service();
-        let log = open_source(ns, b"/log/x");
+        let log = Logger::open(ns, "/log/x");
         let long = "x".repeat(libkern::IPC_PAYLOAD_SIZE);
         log.info(&long);
         log.info("after");
@@ -181,7 +170,7 @@ mod tests {
     fn a_logger_lends_its_endpoint_for_records_of_the_callers_own() {
         mock::reset();
         let (ns, peer) = service();
-        let log = open_source(ns, b"/log/x");
+        let log = Logger::open(ns, "/log/x");
         let mut own = Msg::new();
         own.set(b"TSM1").unwrap();
         log.endpoint().unwrap().send(&own, &mut Carried::new()).unwrap();

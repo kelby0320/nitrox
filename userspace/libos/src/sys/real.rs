@@ -1,8 +1,8 @@
 //! The calls themselves: each a `syscallN` with the arguments its types say.
 
 use libkern::{
-    HandleInfo, IPC_HANDLE_MAX, IoOp, IoResult, IpcMsg, Notification, NsEntry, SpawnArgs, ThreadArgs, syscall1,
-    syscall2, syscall3, syscall4, syscall5, syscall6,
+    HandleInfo, IPC_HANDLE_MAX, IoOp, IoResult, IpcMsg, Notification, NsEntry, RegisterValues, SpawnArgs, ThreadArgs,
+    syscall1, syscall2, syscall3, syscall4, syscall5, syscall6,
 };
 
 use super::Resize;
@@ -222,6 +222,23 @@ pub fn process_exit(status: i32) -> ! {
 pub unsafe fn thread_create(args: &ThreadArgs) -> i64 {
     // SAFETY: forwarded from this fn's contract; the kernel copies `args` in.
     unsafe { syscall1(libkern::SYS_THREAD_CREATE, args as *const ThreadArgs as u64) }
+}
+
+/// `sys_thread_exit(status)` — end the calling thread.
+pub fn thread_exit(status: i32) -> ! {
+    libkern::thread_exit(status as i64)
+}
+
+/// `sys_thread_get_registers(thread, out)` — the registers a thread suspended on a fault stopped with.
+pub fn thread_get_registers(thread: u64, out: &mut RegisterValues) -> i64 {
+    // SAFETY: `out` is a live `RegisterValues`, which the kernel writes.
+    unsafe { syscall2(libkern::SYS_THREAD_GET_REGISTERS, thread, out as *mut RegisterValues as u64) }
+}
+
+/// `sys_exception_resume(thread, disposition, code)` — go on with a thread suspended on a fault.
+pub fn exception_resume(thread: u64, disposition: u64, code: u64) -> i64 {
+    // SAFETY: a register-only call.
+    unsafe { syscall3(libkern::SYS_EXCEPTION_RESUME, thread, disposition, code) }
 }
 
 /// `sys_timer_create`, with no flags, as none is defined.

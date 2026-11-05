@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use libkern::{KIND_TERMINATE_REQUESTED, Rights};
 use libos::{CanLookup, Handle, Namespace, Notify, Only, Ref, block_on};
 
-pub use auth::{authenticate, authenticate_on, close_views_session, open_views_session, views_open_session};
+pub use auth::{authenticate_on, close_views_session, open_views_session};
 pub use blocks::{share_block_devices, withdraw_block_devices};
 pub use leader::run_leader;
 pub use namespace::{Bound, Constructed, Members, build_namespace};

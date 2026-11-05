@@ -1,7 +1,7 @@
 //! The setup message a stage starts with: what becomes of the handles it is given.
 
 use super::*;
-use libstream::setup::{Streams, pipe, send_setup_full};
+use libstream::setup::{StageStreams, open_pipe, send_stage_setup};
 use libstream::wire::{Record, WireError};
 
 /// **A setup message that cannot be made closes the handles it was given**, and one sent moves
@@ -12,26 +12,33 @@ pub(super) fn a_refused_setup_message_closes_its_handles_test() -> bool {
         Line::new().s(b"boot-probe: setup handles FAIL: ").s(why).end();
         false
     };
-    let (Ok((ours, theirs)), Ok((rx, tx)), Ok((t, peer))) = (pipe(4), pipe(4), pipe(4)) else {
+    let (Ok((ours, theirs)), Ok((rx, tx)), Ok((t, peer))) = (open_pipe(4), open_pipe(4), open_pipe(4)) else {
         return fail(b"no channel");
     };
     let long = "x".repeat(5000);
-    let streams = Streams { stdin: None, stdout: Some(tx), stderr: None };
-    let refused = send_setup_full(ours, streams, Some(t), &[&long], &Record::default());
-    let gone = stat(tx).is_none() && stat(t).is_none();
-    let streams = Streams { stdin: None, stdout: Some(rx), stderr: None };
-    let sent = send_setup_full(ours, streams, None, &["stage"], &Record::default());
-    let moved = stat(rx).is_none();
-    [ours, theirs, peer].into_iter().for_each(close);
-    // The kernel refusing the send, the stage's end gone, before it takes anything.
-    let (Ok((dead, theirs)), Ok((x, x_peer))) = (pipe(4), pipe(4)) else {
+    let streams = StageStreams { stdin: None, stdout: Some(tx), stderr: None };
+    let refused = send_stage_setup(&ours, streams, Some(t), &[&long], &Record::default(), Deadline::NEVER);
+    // The handles gone are the ones whose peers see them close.
+    let gone = peer_gone_by(&rx, clock_ns() + 2_000 * MS) && peer_gone_by(&peer, clock_ns() + 2_000 * MS);
+    drop(rx);
+    // Moved, not copied: the peer of the end sent sees it close once the stage's goes.
+    let Ok((y, y_peer)) = open_pipe(4) else {
         return fail(b"no channel");
     };
-    close(theirs);
-    let streams = Streams { stdin: None, stdout: Some(x), stderr: None };
-    let peerless = send_setup_full(dead, streams, None, &["stage"], &Record::default());
-    let closed = stat(x).is_none();
-    [dead, x_peer].into_iter().for_each(close);
+    let streams = StageStreams { stdin: None, stdout: Some(y), stderr: None };
+    let sent = send_stage_setup(&ours, streams, None, &["stage"], &Record::default(), Deadline::NEVER);
+    let received = theirs.recv(&mut Msg::new()).ok();
+    let one = received.as_ref().is_some_and(|carried| carried.len() == 1);
+    drop(received);
+    let moved = one && peer_gone_by(&y_peer, clock_ns() + 2_000 * MS);
+    // The kernel refusing the send, the stage's end gone, before it takes anything.
+    let (Ok((dead, theirs)), Ok((x, x_peer))) = (open_pipe(4), open_pipe(4)) else {
+        return fail(b"no channel");
+    };
+    drop(theirs);
+    let streams = StageStreams { stdin: None, stdout: Some(x), stderr: None };
+    let peerless = send_stage_setup(&dead, streams, None, &["stage"], &Record::default(), Deadline::NEVER);
+    let closed = peer_gone_by(&x_peer, clock_ns() + 2_000 * MS);
     if peerless.is_ok() || !closed {
         return fail(b"a send the kernel refused left its handle open");
     }

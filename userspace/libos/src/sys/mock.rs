@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use libkern::{
     HandleInfo, IPC_HANDLE_MAX, IPC_PAYLOAD_SIZE, IoOp, IoResult, IpcMsg, KError, KObjectType, Notification, NsEntry,
-    Rights, SPAWN_MAX_HANDLES, SpawnArgs, ThreadArgs,
+    RegisterValues, Rights, SPAWN_MAX_HANDLES, SpawnArgs, ThreadArgs,
 };
 
 use super::Resize;
@@ -50,7 +50,8 @@ enum Object {
     /// logging service answers with an endpoint.
     Answers(usize),
     Process,
-    Thread,
+    /// The registers it faulted with while it is suspended on a fault.
+    Thread(Option<RegisterValues>),
     Entropy,
     SystemControl,
     Timer(u64),
@@ -68,7 +69,7 @@ impl Object {
             Object::Device => KObjectType::DeviceNode,
             Object::Server | Object::Answers(_) => KObjectType::UserspaceServerReg,
             Object::Process => KObjectType::Process,
-            Object::Thread => KObjectType::Thread,
+            Object::Thread(_) => KObjectType::Thread,
             Object::Timer(_) => KObjectType::Timer,
             Object::Entropy => KObjectType::EntropyObject,
             Object::SystemControl => KObjectType::SystemControl,
@@ -160,6 +161,8 @@ struct Mock {
     /// Whether the next child exits before anything reaches it, holding nothing.
     exit_next_child: bool,
     threads: Vec<ThreadArgs>,
+    /// Each `exception_resume` the model took, as `(disposition, code)`.
+    settled: Vec<(u64, u64)>,
     /// Each test verdict reported, as its code.
     verdicts: Vec<u64>,
 }
@@ -815,7 +818,9 @@ pub fn file_resize(verb: Resize, ns: u64, path: &[u8], rights: u64, size: u64) -
     })
 }
 
-pub fn file_rename(ns: u64, from: &[u8], to: &[u8], _flags: u64) -> i64 {
+/// An existing destination is refused `AlreadyExists` unless `flags` asks to replace it, as a
+/// filesystem server answers (`librsproto`'s `RENAME_REPLACE`, bit 0).
+pub fn file_rename(ns: u64, from: &[u8], to: &[u8], flags: u64) -> i64 {
     with(|m| {
         let ns = match m.namespace(ns, Rights::LOOKUP) {
             Ok(o) => o,
@@ -826,6 +831,7 @@ pub fn file_rename(ns: u64, from: &[u8], to: &[u8], _flags: u64) -> i64 {
         }
         let b = m.bindings(ns);
         let status = match b.iter().position(|x| x.path == from) {
+            Some(_) if flags & 1 == 0 && from != to && b.iter().any(|x| x.path == to) => KError::AlreadyExists as i32,
             Some(i) => {
                 b.retain(|x| x.path != to);
                 let i = b.iter().position(|x| x.path == from).unwrap_or(i);
@@ -917,7 +923,7 @@ pub unsafe fn thread_create(args: &ThreadArgs) -> i64 {
             return status as i64;
         }
         m.threads.push(*args);
-        m.mint(Object::Thread, Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)
+        m.mint(Object::Thread(None), Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)
     })
 }
 
@@ -978,6 +984,8 @@ pub fn power(h: u64, op: u64) -> i64 {
 }
 
 mod controls;
+mod thread;
 mod time;
 pub use controls::*;
+pub use thread::*;
 pub use time::*;

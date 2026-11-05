@@ -14,76 +14,46 @@
 #![no_std]
 #![no_main]
 
-use libkern::debug::Line;
-use libkern::{
-    CLOCK_MONOTONIC, KError, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE,
-    SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
-};
+use libkern::KError;
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Carried, Channel, Deadline, Handle, Msg, Only, Ref, WaitSet, time};
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
 use librsproto::{OP_NS_RESOLVE, OP_READY, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
-static mut MSG: [u8; 4096] = [0; 4096];
-static mut OUT: [u8; 4096] = [0; 4096];
-
 fn now_ns() -> u64 {
-    let mut t = 0u64;
-    // SAFETY: `t` is a valid writable out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut t) as u64) };
-    t
-}
-
-fn close(h: u64) {
-    if h != 0 {
-        // SAFETY: closing a handle this process owns.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    }
-}
-
-fn channel(depth: u64) -> Option<(u64, u64)> {
-    let (mut a, mut b) = (0u64, 0u64);
-    // SAFETY: valid writable out-params.
-    let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, depth, 0) };
-    (r == 0).then_some((a, b))
+    time::now().unwrap_or(0)
 }
 
 /// Send an rsproto message on `ch`, moving `handles`.
-fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
-    // SAFETY: OUT is this process's; single-threaded.
-    unsafe {
-        let Some(n) = encode(&mut OUT[24..], op, request_id, flags, body, handles.len() as u16) else {
-            return false;
-        };
-        OUT[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-        OUT[8] = handles.len() as u8;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            ch,
-            (&raw const OUT) as u64,
-            handles.as_ptr() as u64,
-            handles.len() as u64,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
+fn send(ch: Ref<'_, Channel, Only>, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &mut Carried) -> bool {
+    let mut msg = Msg::new();
+    let Some(n) = encode(msg.payload_mut(), op, request_id, flags, body, handles.len() as u16) else {
+        return false;
+    };
+    msg.set_len(n).is_ok() && ch.send(&msg, handles).is_ok()
 }
 
 /// An error reply with the whole twelve-byte `ErrorBody`.
-fn refuse(ch: u64, request_id: u64, err: KError) {
+fn refuse(ch: Ref<'_, Channel, Only>, request_id: u64, err: KError) {
     let mut body = [0u8; librsproto::error::ERROR_BODY_LEN];
     let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, b"").unwrap_or(0);
-    let _ = send(ch, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..n], &[]);
+    let _ = send(ch, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..n], &mut Carried::new());
 }
 
 /// Answer a resolve of `id`: a channel, with this instance's token queued on it.
-fn answer_id(serve: u64, request_id: u64, token: u64) {
-    let Some((theirs, ours)) = channel(2) else {
+fn answer_id(serve: Ref<'_, Channel, Only>, request_id: u64, token: u64) {
+    let Ok((theirs, ours)) = Handle::<Channel, Only>::pair(2) else {
         return refuse(serve, request_id, KError::OutOfMemory);
     };
-    let _ = send(ours, 0, 0, 0, &token.to_le_bytes(), &[]);
-    close(ours);
+    let _ = send(ours.as_ref(), 0, 0, 0, &token.to_le_bytes(), &mut Carried::new());
+    drop(ours);
     let mut body = [0u8; RESOLVE_REPLY_LEN];
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
-    if !send(serve, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, &[theirs]) {
-        close(theirs);
+    let mut carried = Carried::new();
+    let _ = carried.push(theirs);
+    if !send(serve, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, &mut carried) {
+        drop(carried);
         refuse(serve, request_id, KError::KernelError);
     }
 }
@@ -91,46 +61,52 @@ fn answer_id(serve: u64, request_id: u64, token: u64) {
 /// Bootstrap registers: `rdi` = notification channel, `rsi` = namespace, `rdx` = the control
 /// channel `service-mgr` moved in, `rcx` = `arg0`.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, _ns: u64, control: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let control = start.take_handle0::<Channel, Only>();
     let token = now_ns();
-    let Some((client_end, serve)) = channel(4) else {
-        kprint(b"restart-probe: endpoint create FAIL\n");
-        exit(1);
+    let Ok((client_end, serve)) = Handle::<Channel, Only>::pair(4) else {
+        log::write(b"restart-probe: endpoint create FAIL\n");
+        libos::exit(1);
     };
     let mut body = [0u8; 64];
     let n = librsproto::meta::ready(&mut body, b"restart-probe").unwrap_or(0);
-    if !send(control, OP_READY, 0, 0, &body[..n], &[client_end]) {
-        kprint(b"restart-probe: Ready send FAIL\n");
-        exit(1);
+    let mut carried = Carried::new();
+    let _ = carried.push(client_end);
+    if !control.as_ref().is_some_and(|c| send(c.as_ref(), OP_READY, 0, 0, &body[..n], &mut carried)) {
+        log::write(b"restart-probe: Ready send FAIL\n");
+        libos::exit(1);
     }
     Line::new().s(b"restart-probe: up, instance ").u(token).end();
+    let mut msg = Msg::new();
     loop {
-        let handles = [serve];
-        let mut results = [0u8; 24];
-        // SAFETY: valid one-entry wait arrays on this frame.
-        unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+        let mut set = WaitSet::<1>::new();
+        let _ = set.add(&serve);
+        let _ = set.wait(Deadline::NEVER);
         loop {
-            // SAFETY: single-threaded; `MSG` is lent for the call.
-            let Ok(_sent) = (unsafe { libkern::channel_recv_raw(serve, &raw mut MSG) }) else {
-                break;
+            let _sent = match serve.recv(&mut msg) {
+                Ok(sent) => sent,
+                // **Nothing can reach the probe any more**: the peer stays signalled, so waiting
+                // again would spin a CPU for the rest of the boot.
+                Err(e) if e.code() == KError::PeerClosed => {
+                    log::write(b"restart-probe: nothing can reach it any more; exiting\n");
+                    libos::exit(0);
+                }
+                Err(_) => break,
             };
-            // SAFETY: bounded read of the payload the kernel just wrote.
-            let msg = unsafe {
-                let len = u32::from_le_bytes([MSG[4], MSG[5], MSG[6], MSG[7]]) as usize;
-                core::slice::from_raw_parts(((&raw const MSG) as *const u8).add(24), len.min(4096 - 24))
-            };
-            let Ok(m) = decode(msg) else { continue };
+            let Ok(m) = decode(msg.payload()) else { continue };
             if m.op != OP_NS_RESOLVE {
                 continue;
             }
             match parse_resolve_request(m.body).map(|r| r.suffix) {
-                Some(b"id") => answer_id(serve, m.request_id, token),
+                Some(b"id") => answer_id(serve.as_ref(), m.request_id, token),
                 Some(b"exit") => {
-                    refuse(serve, m.request_id, KError::NotFound);
+                    refuse(serve.as_ref(), m.request_id, KError::NotFound);
                     Line::new().s(b"restart-probe: instance ").u(token).s(b" exiting, as asked").end();
-                    exit(1);
+                    libos::exit(1);
                 }
-                _ => refuse(serve, m.request_id, KError::NotFound),
+                _ => refuse(serve.as_ref(), m.request_id, KError::NotFound),
             }
         }
     }
@@ -138,6 +114,6 @@ pub extern "C" fn _start(_notif: u64, _ns: u64, control: u64, _arg0: u64) -> ! {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"restart-probe: PANIC\n");
-    exit(1);
+    log::write(b"restart-probe: PANIC\n");
+    libos::exit(1);
 }

@@ -206,7 +206,7 @@ without spinning up a userspace process — see "In-kernel resource servers" bel
 
 There is **no "open directory" syscall**. A directory handle is an IPC **session channel**
 the owning server mints and transfers, returned from an ordinary `sys_ns_lookup`.
-`librsproto::session::Dir::open` is nothing but a lookup; the endpoint it gets back speaks
+`librsproto::session::Dir::resolve` is nothing but a lookup; the endpoint it gets back speaks
 `OP_FILE_READ_DIR`, `OP_FILE_MKDIR`, `OP_FILE_UNLINK` and friends.
 
 **The server chooses object-or-session, from what the path denotes** — not the kernel, and
@@ -222,7 +222,7 @@ server that returns an object regardless is not violating anything the kernel en
 Two consequences worth stating, because both have already bitten:
 
 - **Answering resolves is not enough to make your subtree listable.** A server that only
-  handles the object case leaves `Dir::open` failing at the transport level, and every
+  handles the object case leaves `Dir::resolve` failing at the transport level, and every
   listing of its subtree reports the filesystem as unreachable. That is exactly what the
   profile server does at `/bin` today.
 - **Ordering between the two paths matters.** The fs-server checks `rename` *before* the
@@ -237,7 +237,7 @@ there. A listing is therefore the union of:
 
 1. **The bindings beneath the path** — `sys_ns_enumerate` walks the caller's own
    namespace. Local and cheap: no IPC, the kernel is reading a list it already holds.
-2. **The filesystem under the path** — `Dir::open` + `OP_FILE_READ_DIR` to whichever
+2. **The filesystem under the path** — `Dir::resolve` + `OP_FILE_READ_DIR` to whichever
    server owns it.
 
 Bindings **shadow** same-named filesystem entries, exactly as a mount point shadows the

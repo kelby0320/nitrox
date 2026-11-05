@@ -3182,7 +3182,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Opportunities**
 
-- [ ] **rt-o1** encapsulate: out-parameter syscalls called raw with a caller-chosen buffer or
+- [x] **rt-o1** encapsulate: out-parameter syscalls called raw with a caller-chosen buffer or
   `static mut` (`sys_handle_stat` into `HandleInfo`, `sys_notif_recv`, `sys_ns_enumerate`,
   `sys_clock_read`, `sys_channel_create`) — 125 sites (`grep -rnE
   "syscall[0-6]\(\s*(libkern::)?(syscall::)?SYS_(HANDLE_STAT|NOTIF_RECV|NS_ENUMERATE|CLOCK_READ|CHANNEL_CREATE)\b"
@@ -3204,8 +3204,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   failed clock read, and shared `static mut` out-params. Depends on: nothing; write alongside
   Part E's syscall-surface changes so each is written once. abi, ownership, opportunities.
   Value high, effort medium. **Plan**, in P7.
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe), with the filesystem servers' entry in
+  `e177f1ff`: no out-parameter call is made outside libkern and libos but by `eshell`, agreed raw,
+  and the harness's two `refused` modules, where the out-parameter is the test.
 
-- [ ] **rt-o2** encapsulate: a PendingOperation waited on by hand with a raw `sys_wait` into a
+- [x] **rt-o2** encapsulate: a PendingOperation waited on by hand with a raw `sys_wait` into a
   hand-sized `[u8; 24*N]`, the `IoResult` decoded at byte offsets 0/8/16, and the PO closed by
   hand — 99 sites in 46 files (`grep -rnE "syscall[0-6]\(\s*(libkern::)?(syscall::)?SYS_WAIT\b"
   --include=*.rs userspace | grep -v '^userspace/libkern/' | wc -l`; 8 in runtime; the other
@@ -3229,6 +3233,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   libkern taking libos as a dependency (it is `no_std`, no alloc) or the maintainer extending
   libkern's one-guard exception as for `Received`. abi, ownership, soundness, opportunities.
   Value high, effort medium. **Plan**, in P7.
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe): no PendingOperation is waited on by hand
+  outside libkern and libos but by `eshell` and the waits in `bootprobe/refused/` whose `TimedOut`
+  or `WouldBlock` is the test.
 
 - [ ] **rt-o3** encapsulate: a mapping kept as a bare address, with a slice built by
   `from_raw_parts`/`copy_nonoverlapping` and an unmap the caller must remember, with some sites
@@ -3269,7 +3277,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the subsystem's unsafe after hello. Depends on: rt-o1, rt-o2, rt-o3. abi, ownership,
   soundness, opportunities. Value high, effort medium. **Plan**, in P7.
 
-- [ ] **rt-o5** encapsulate: an IPC message built and read as raw `[u8; 4096]`, `payload_len`
+- [x] **rt-o5** encapsulate: an IPC message built and read as raw `[u8; 4096]`, `payload_len`
   stamped and parsed at bytes 4..8 by hand with a local `const PAYLOAD_OFF: usize = 24` — 67
   sites (`grep -rnE "\[4\.\.8\]\.copy_from_slice\(&\(" --include=*.rs userspace | wc -l`; 4 in
   fs-server-ext4 may not be IPC; 19 local `PAYLOAD_OFF` copies; about 93 `SYS_CHANNEL_SEND` lines
@@ -3289,6 +3297,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   4064-byte record). Today the outcome matches liblog's documented 'dropped' behaviour only by
   luck. Also closes header fields at hand-typed offsets. Depends on: nothing. abi,
   soundness, opportunities. Value medium, effort small to medium. **Plan**, in P7.
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe): every message is a libos `Msg`, but
+  `eshell`'s and the one boot-probe sends raw to list a handle twice.
 
 - [ ] **rt-o6** narrow/encapsulate: `spawn(&SpawnArgs)` and `thread_create(&ThreadArgs)` are safe
   wrappers over raw ABI blocks; a thread's stack and entry, and the handles `move_mask` moves,
@@ -3311,7 +3322,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Depends on: nothing for the `unsafe fn` and `Spawn` builder; rt-o3 for `Stack`. abi,
   ownership, opportunities. Value medium, effort medium. **Plan**, in P7.
 
-- [ ] **rt-o7** encapsulate: bootstrap handles arrive at `_start` as bare `u64`s and travel as
+- [x] **rt-o7** encapsulate: bootstrap handles arrive at `_start` as bare `u64`s and travel as
   `root_ns: u64`; each consumer re-wraps with `unsafe Handle::borrow` or declares its own `unsafe
   fn f(root_ns: u64)` — 24 sites (9 `Handle::<..>::borrow(` in 8 files and 15 `unsafe fn` with a
   raw namespace parameter, regex `unsafe fn \w+(<[^>]*>)?\([^)]*\b(root_ns|ns|namespace)\s*:\s*u64`;
@@ -3325,6 +3336,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   impl CanLookup>`, no longer unsafe), libsurface `screen::read`. Closes: a borrow that outlives
   its owner and the per-crate unsafe raw-namespace contracts. Depends on: the entry/std-port
   seam decision (`libos.md`). opportunities. Value medium, effort large. **Plan**, in P7.
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe) and `e177f1ff`: every `_start` but
+  `eshell`'s takes `libos::boot::Start`, and no `unsafe fn` takes a raw namespace.
 
 - [x] **rt-o8** narrow: `Handle::borrow(raw, rights)` yields a full `Handle` with no lifetime, on
   which safe `without_transfer`, `without_duplicate`, `into_read_only` and `into_raw` act on a
@@ -5499,7 +5513,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Done in `b643fbc4`, `b40b7979`, `e1c8549f` (nxfiles) and `5f4d535b`, input-server's and clipboard-
   server's in E.3: every wait is a `WaitSet`.
 
-- [ ] **desk-o4** narrow: `unsafe fn`s whose only contract is "root_ns must be a live namespace
+- [x] **desk-o4** narrow: `unsafe fn`s whose only contract is "root_ns must be a live namespace
   handle". A stale handle fails the generation check and returns InvalidHandle, so the contract
   guards no UB, yet it makes every caller write `unsafe` — 14 of the subsystem's 16 `unsafe fn`s
   with 26 to 31 unsafe call blocks, counted by `grep -rnE 'unsafe fn [a-z_]+(<[^>]*>)?\('
@@ -5519,6 +5533,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   memory hazards. Depends on: a one-time borrow of the bootstrap namespace in each `_start` (or
   libos's thin-entry seam). abi, soundness, opportunities. Value high, effort medium.
   **Plan**, in P7.
+  Done in `981fe01e`: libdraw's `acquire`, `load_ui` and `load_mono` and libsurface's `connect` and
+  `manage` went with the shims, the last of the fourteen; `map_framebuffer` stays `unsafe` only for
+  its one writer.
 
 - [ ] **desk-o5** encapsulate: shared mappings as raw `(*mut u8, len)` pairs, unmapped by hand or
   not at all — 12 map sites against 10 to 13 unmaps and 9 `from_raw_parts` slices over mappings,
@@ -6171,7 +6188,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   (698, 781, 897). ownership, soundness, opportunities. Low. **Fix.**
   Fixed in `009c098c`: each test unmaps and closes its file. Held files across the files tests rose
   from 3 to 6 before, 1 to 1 after.
-- [ ] **th-d7** `userspace/test-harness/src/harness.rs:3727` — `forward_demo` releases nothing it
+- [x] **th-d7** `userspace/test-harness/src/harness.rs:3727` — `forward_demo` releases nothing it
   made on success: the namespace with the userspace-server binding (3727/3736), `send_end`
   (3724), the resolved MemoryObject (3846) and both mappings (3782, 3853). The same success-path
   leak is in `ns_demo` (mapping at :607), `initramfs_demo` (:864), `read_block_sector0` (:3562,
@@ -6182,6 +6199,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   closing. Demonstrated by path: `awk 'NR>=3713 && NR<=3865 && /close\(|SYS_HANDLE_CLOSE|SYS_MEMORY_UNMAP/'
   harness.rs` prints nothing. Bounded: the harness exits at the end of the chain. ownership,
   soundness, opportunities. Low. **Plan**, in P7.
+  Done in `75aeff05`: every handle and mapping the harness makes is a libos `Handle` or `Mapping`,
+  closed or unmapped as it drops, on success paths and failure paths alike.
 - [x] **th-d8** `userspace/test-harness/src/harness.rs:3156` — `rename_wait` discards
   `sys_wait`'s return and reads the status from the shared `WAIT_RESULTS[8..12]` anyway. Its own
   SAFETY comment says those bytes hold the result "only when it returned 1". A failed wait (for
@@ -6204,6 +6223,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   `find_free_range` + `map_vma_lazy` asserted `b.start == a.end` and passed (vmm.rs:413-435); the
   probe was restored. Unverified: the overrun itself, which a boot with a thread recursing past
   its stack would show. soundness. Low. **Plan**, in P7.
+  Userspace half done in `e02204d2` and `321a1b83`: every thread runs on a libos `Stack` of its own,
+  `EXIT_SPAWNING`'s 48 among them; the guard below each waits on the kernel half (E.6).
 - [x] **th-d10** `userspace/test-harness/src/inputclient.rs:104` — `lookup` never closes the
   PendingOperation that `sys_ns_lookup` returned, because this copy of `po_wait` (:72-96), unlike
   the other 11 hand-rolled copies, does not close the PO. One PO handle leaks per
@@ -6251,7 +6272,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
 
 **Opportunities**
 
-- [ ] **th-o1** encapsulate: handles are bare `u64`s closed by hand on every path, success and
+- [x] **th-o1** encapsulate: handles are bare `u64`s closed by hand on every path, success and
   failure — 374 sites (113 `syscall1(SYS_HANDLE_CLOSE` by `grep -rnoE
   'syscall[14]\((libkern::)?SYS_HANDLE_CLOSE'` plus 261 `close(x)` calls by `grep -rnoE
   '\bclose\([a-z_]' | grep -v 'fn close'`; 146 lookup calls return `(status, u64)`), such as
@@ -6265,7 +6286,10 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   double closes; removes 113 unsafe close blocks. Depends on: libos markers for
   Channel/Timer/Pending/File; easier after th-o3. ownership, opportunities. Value high, effort
   large. **Plan**, as sup-o2, in P7.
-- [ ] **th-o2** encapsulate: a mapping is a bare address that is turned into `from_raw_parts`
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe): no handle in the crate is closed by hand;
+  lookups are libos's typed ones.
+- [x] **th-o2** encapsulate: a mapping is a bare address that is turned into `from_raw_parts`
   slices or raw volatile accesses, with a hand-written unmap that some paths never reach — 38 to
   48 sites (38 `SYS_MEMORY_MAP` by script, plus 9 `map_file(` calls; 32 unmaps, 17 of them size 0;
   17 `from_raw_parts`; 22 `_volatile`), such as `bootprobe/storage.rs:273`, `harness.rs:3197`,
@@ -6280,7 +6304,11 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   across a device write (th-d2), mappings never unmapped (th-d6, th-d7), size-0 unmaps (th-d13),
   offsets past the mapped length. Depends on: th-o1 for the File marker. abi, ownership,
   soundness, opportunities. Value high, effort medium. **Plan**, as rt-o3, in P7.
-- [ ] **th-o3** encapsulate: out-params of kernel calls held by convention as raw pointers cast
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe): every mapping is a libos `Mapping`, read
+  and written by copying, but compose-bench's timed store loop, which writes through a pointer on
+  purpose.
+- [x] **th-o3** encapsulate: out-params of kernel calls held by convention as raw pointers cast
   to `u64` — 46 sites (20 `CHANNEL_CREATE`, 12 `CLOCK_READ`, 5 `NOTIF_RECV`, 5 `HANDLE_STAT`, 3
   `ENTROPY_READ`, 1 `THREAD_GET_REGISTERS` by `grep -rnE "syscall[0-9]\((libkern::)?SYS_(...)"`;
   3 hand decodes of `Notification.body[8]`), such as `harness.rs:128`, `harness.rs:800`,
@@ -6295,7 +6323,10 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   out-param shared through a static, with the 'failed read leaves its last value' reads at
   harness.rs:2004 and inputclient.rs:478. Depends on: nothing. opportunities, soundness. Value
   high, effort medium. **Plan**, as rt-o1, in P7.
-- [ ] **th-o4** encapsulate: raw `SYS_WAIT` on a hand-sized result buffer with the `IoResult`
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe): libos's typed calls own every
+  out-parameter, but the clock written into a read-only page in `src/refused/`.
+- [x] **th-o4** encapsulate: raw `SYS_WAIT` on a hand-sized result buffer with the `IoResult`
   decoded from byte offsets (status at 8..12, result at 16..24), each caller checking `== 1` for
   itself — 39 sites (35 `grep -rnE "syscall[456]\((libkern::)?SYS_WAIT,"` plus 4 multi-line;
   17 status decodes, 12 to 13 result decodes, 10 to 14 local helper clones: `po_wait` x4,
@@ -6311,7 +6342,10 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   convention (the 16-vs-24 smash), a status read from a wait that did not return 1 (th-d8), and
   `IoResult` byte offsets restated 17 times. Depends on: nothing. abi, ownership, soundness,
   opportunities. Value high, effort medium. **Plan**, as rt-o2, in P7.
-- [ ] **th-o5** remove: `static mut` as per-call scratch for syscall out-params, argument blocks
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe): waits are `WaitSet`s and `Op`s, but the
+  two in `bootprobe/refused/deadlines.rs` whose answer is the test.
+- [x] **th-o5** remove: `static mut` as per-call scratch for syscall out-params, argument blocks
   and message buffers — 31 statics (`grep -rn "static mut" userspace/test-harness/src`), 103 of
   the 494 unsafe blocks naming one (81 in harness.rs, 10 inputclient.rs, 6 bootprobe, 3
   restartprobe.rs, 3 stage.rs), 8 `&*(&raw const X)` derefs under 7 `clippy::deref_addrof`
@@ -6326,7 +6360,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   and unenforced 'only this thread touches it' SAFETY claims. Depends on: th-o4 and th-o9 for the
   `WAIT_*` and message statics (smaller once the typed wrappers land). abi, ownership,
   soundness, opportunities. Value high, effort medium. **Plan**, in P7.
-- [ ] **th-o6** encapsulate: starting a thread by hand — `SYS_MEMORY_CREATE`, `SYS_MEMORY_MAP`, a
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe): no `static mut` is left in the crate.
+- [x] **th-o6** encapsulate: starting a thread by hand — `SYS_MEMORY_CREATE`, `SYS_MEMORY_MAP`, a
   `ThreadArgs` literal with `_reserved: [0; 36]` and the safe `libos::thread_create`; handle and
   pointer values travel through statics and `AtomicU64`s, while `arg0` is always 0 — 5 sites
   (`grep -rn "thread_create(&"`), all in this crate: `harness.rs:159`, `stage.rs:487`,
@@ -6340,7 +6376,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   half (th-d9), a kernel way to keep an unmapped range below a caller-supplied stack (a reserved
   no-access VMA, or a gap `find_free_range` leaves; Part E). abi, ownership, soundness,
   opportunities. Value high, effort medium. **Plan**, as rt-o6, in P7.
-- [ ] **th-o7** remove: private copies of a namespace lookup plus PO wait — 3 helpers, 141 callers
+  Done in `e02204d2`, `75aeff05` and `321a1b83`: every thread runs on a libos `Stack` of its own
+  through `thread::start` or `thread::start_on`; `EXIT_SPAWNING` makes its 48 up front.
+- [x] **th-o7** remove: private copies of a namespace lookup plus PO wait — 3 helpers, 141 callers
   (`harness.rs:760` `ns_lookup_wait`, 29 callers; `bootprobe/main.rs:89` `ns_lookup`, 111;
   `inputclient.rs:96` `lookup`, 1). `libfs::lookup_wait(ns, path, rights) -> (i32, u64)`, already
   used 5 times in this crate (stage.rs:366/444, pattern.rs:209/220/245), returns the kernel
@@ -6350,6 +6388,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   In libfs (exists). Closes: three more hand-parsed `IoResult` copies with their own static wait
   buffers (th-d10). Depends on: nothing. abi, opportunities. Value medium, effort small.
   **Plan**, in P7.
+  Done in `75aeff05`, `d3d38a8a` and `321a1b83`: the three copies are gone, their callers on
+  libos's typed lookup.
 - [x] **th-o8** encapsulate: boot-probe's `Received` strips `libkern::Received`'s guard — 20
   `receive()` callers (`grep -rnE "(^|[^_a-z])receive\(" userspace/test-harness/src/bootprobe |
   grep -v "fn receive\|views_receive\|ChannelReceiver"`), 12 closing `m.handles` by hand and 9
@@ -6363,7 +6403,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   Value medium, effort small. **Fix.**
   Done in `009c098c`: `Received` keeps `libkern::Received`, with `take` and `count`; the twelve
   close loops go.
-- [ ] **th-o9** encapsulate: IPC messages framed and parsed by hand in raw `[u8; 4096]` buffers
+- [x] **th-o9** encapsulate: IPC messages framed and parsed by hand in raw `[u8; 4096]` buffers
   (payload length at [4..8], handle count at [8], rsproto at [24..]) and sent with a raw
   `SYS_CHANNEL_SEND` — 14 to 15 sites (14 sends by grep; 8 `[4..8].copy_from_slice` header writes,
   one deliberately raw at authority.rs:146; 7 header reads), such as `restartprobe.rs:53`,
@@ -6378,7 +6418,10 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   desktop-session-mgr 256-byte receive was this class), header offsets disagreeing with
   `IpcMsgHeader`, and payload slices running past `IPC_PAYLOAD_SIZE` into the handle area.
   Depends on: nothing. abi, opportunities. Value medium, effort medium. **Plan**, as rt-o5, in P7.
-- [ ] **th-o10** encapsulate: spawning a program by path by hand (look up the image, fill
+  Done in `75aeff05` (test-harness), `e02204d2` (stage and the small programs), `d3d38a8a` (the
+  display and input clients) and `321a1b83` (boot-probe): every message is a `Msg`, but the one
+  send in `bootprobe/refused/` that lists a handle twice.
+- [x] **th-o10** encapsulate: spawning a program by path by hand (look up the image, fill
   `SpawnArgs`, spawn, then remember to close the image; 4 of 9 sites forget) — 9 sites
   (`grep -rnE 'syscall1\(SYS_PROCESS_SPAWN|[^_]spawn\(&'`), such as `harness.rs:2370`,
   `harness.rs:1355`, `bootprobe/exits.rs:15`, `stage.rs:444`. `spawn_path(ns, path, args:
@@ -6388,7 +6431,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   and `run_grants`. In libos beside `spawn` (which already returns an owning `Handle<Process>`).
   Closes: the never-closed spawn images (th-d4, about 56 per run). Depends on: nothing. ownership.
   Value medium, effort small. **Plan**, in P7.
-- [ ] **th-o11** encapsulate: DMA buffers built by hand (an `IoOp` submitted raw on a memory
+  Done in `75aeff05`, `e02204d2` and `321a1b83`: every spawn is a libos `Spawn`, which holds the
+  image for the call.
+- [x] **th-o11** encapsulate: DMA buffers built by hand (an `IoOp` submitted raw on a memory
   object that is mapped and read around the I/O, then closed whether or not the wait completed)
   — 8 sites (`SYS_IO_SUBMIT`; three map and read the buffer: `harness.rs:3567`,
   `bootprobe/files.rs:97`, `bootprobe/storage.rs:277`), such as `storage.rs:273`, `files.rs:84`,
@@ -6400,7 +6445,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   (th-d2), and a DMA buffer closed or unmapped while its I/O may still be in flight after a
   failed wait (harness.rs:3568-3578, `RootDevice::drop` after a failed read). Depends on: th-o2.
   soundness. Value medium, effort small. **Plan**, in P7.
-- [ ] **th-o12** encapsulate: `librsproto::session::Dir` is closed only by an explicit `.close()`
+  Done in `75aeff05` and `321a1b83`: I/O goes through libos's `read` or `Op::submit`, whose drop
+  waits out a device before its buffer goes.
+- [x] **th-o12** encapsulate: `librsproto::session::Dir` is closed only by an explicit `.close()`
   on every path (its doc says drop cannot report a failure, but `close()` returns `()`) — 46
   sites (`grep -rnE "Dir::(open|from_endpoint)\("` 46; `grep -rnoE "\.close\(\)"` 46), such as
   `harness.rs:1007`, `bootprobe/files.rs:326`, `harness.rs:3249`. A `Drop` for `Dir` that closes
@@ -6408,7 +6455,9 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   librsproto session.rs. Closes: a session left open on an early return, holding one of a
   server's `MAX_WAIT_HANDLES - 2` slots (`session_fanout_demo` shows the table is finite).
   Depends on: nothing. opportunities. Value low, effort small. **Plan**, as sup-o2, in P7.
-- [ ] **th-o13** narrow: `unsafe` library calls whose only contract is "this `u64` is a live
+  Done in `981fe01e`: with the raw constructors gone, every `Dir` owns its endpoint and closes it
+  as it drops.
+- [x] **th-o13** narrow: `unsafe` library calls whose only contract is "this `u64` is a live
   namespace handle I own" — 16 to 17 sites (`grep -rnE "ChannelTransport::(connect|manage)|
   acquire::acquire\(|text::load_(ui|mono)\(|Handle::<[A-Za-z]+, *[A-Za-z]+>::(borrow|from_raw)"`
   16, plus `load_ui`/`load_mono` at uiclient.rs:279/283), such as `uiclient.rs:185`,
@@ -6420,6 +6469,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   sentence that hides the one clause that is broken (th-d11). A wrong value is a kernel
   InvalidHandle, never UB. Depends on: the libos thin-entry shim for the full form. soundness,
   opportunities. Value low, effort medium. **Plan**, as desk-o4, in P7.
+  Done in `981fe01e`: the raw `connect`, `manage`, `acquire`, `load_ui` and `load_mono` are gone;
+  their typed forms take a namespace, and `map_framebuffer` is `unsafe` only for its one writer.
 - [ ] **th-o14** remove: inline asm with safe or intrinsic equivalents — 9 sites (`grep -rnE
   "asm!\(\"pause\"|\"cpuid\"|\"xgetbv\""`: 5 `pause` loops, 2 `cpuid`, 2 `xgetbv`), such as
   `stage.rs:42`, `bootprobe/gates.rs:119`, `harness.rs:114`, `stage.rs:65`. `core::hint::spin_loop()`
@@ -6450,7 +6501,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   (`idle_cpus` would undercount and fail `dead_log_source_demo` falsely at about 40 online CPUs;
   `MAX_CPUS` is 8 today) and the leaked initramfs mapping. Depends on: nothing. abi. Value low,
   effort small. **Plan**, in P7.
-- [ ] **th-o17** remove: kernel error discriminants copied as literals where
+- [x] **th-o17** remove: kernel error discriminants copied as literals where
   `KError::X.as_i32()` exists (harness.rs:22 already does it for TimedOut) — 3 sites (`grep -rn
   "const KERR_\|== -[0-9]\+\b"`): `harness.rs:636` (`status2 == -10`), `harness.rs:2999`
   (`KERR_WOULD_BLOCK = -11`), `harness.rs:3134` (`KERR_UNSUPPORTED = -52`). Use
@@ -6458,6 +6509,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   silent drift of an ABI discriminant in a test that would then assert the wrong refusal;
   abi-sync-check holds libkern to the kernel but not these copies. The three literals match
   today. Depends on: nothing. abi. Value low, effort small. **Later.**
+  Done in `75aeff05`: the harness names `KError` where it copied literals.
 
 What held up: Every `SYS_WAIT` (39 sites) passes count 1 with a result buffer of at least 24
 bytes, and the 16-vs-24 `HandleInfo` smash at harness.rs:798 has not come back; every kernel
