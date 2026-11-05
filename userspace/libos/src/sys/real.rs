@@ -226,15 +226,7 @@ pub unsafe fn thread_create(args: &ThreadArgs) -> i64 {
 
 /// `sys_thread_exit(status)` — end the calling thread.
 pub fn thread_exit(status: i32) -> ! {
-    // SAFETY: `sys_thread_exit` never returns to the thread that makes it, so `noreturn` holds.
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") libkern::SYS_THREAD_EXIT,
-            in("rdi") status as i64,
-            options(noreturn, nostack),
-        );
-    }
+    libkern::thread_exit(status as i64)
 }
 
 /// `sys_thread_get_registers(thread, out)` — the registers a thread suspended on a fault stopped with.

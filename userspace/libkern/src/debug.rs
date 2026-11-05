@@ -35,6 +35,28 @@ pub fn exit(status: i64) -> ! {
     panic!("exit({status})")
 }
 
+/// End the calling thread with `status`; the process goes on while another of its threads does.
+/// Diverges (never returns).
+#[cfg(not(miri))]
+pub fn thread_exit(status: i64) -> ! {
+    // SAFETY: `sys_thread_exit` never returns to the thread that makes it, so `options(noreturn)`
+    // is sound.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") crate::syscall::SYS_THREAD_EXIT,
+            in("rdi") status,
+            options(noreturn, nostack),
+        );
+    }
+}
+
+/// [`thread_exit`] under Miri, as [`exit`] is.
+#[cfg(miri)]
+pub fn thread_exit(status: i64) -> ! {
+    panic!("thread_exit({status})")
+}
+
 /// Format `v` as decimal into `buf`, returning the written suffix. No alloc.
 pub fn fmt_u64(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
     if v == 0 {
@@ -205,6 +227,13 @@ mod tests {
     #[should_panic(expected = "exit(3)")]
     fn under_miri_an_exit_fails_its_own_test() {
         exit(3)
+    }
+
+    #[cfg(miri)]
+    #[test]
+    #[should_panic(expected = "thread_exit(3)")]
+    fn under_miri_a_thread_exit_fails_its_own_test() {
+        thread_exit(3)
     }
 
     #[test]

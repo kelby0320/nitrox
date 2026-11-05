@@ -48,6 +48,7 @@ fn the_wrapper_list_is_derived_from_libkern() {
         "debug::kprint",
         "debug::kprint_hex",
         "debug::kprint_u64",
+        "debug::thread_exit",
     ];
     assert_eq!(names, want);
     let recv = got.wrappers.iter().find(|w| w.name == "recv").unwrap();
