@@ -1,30 +1,11 @@
 //! The faulting worker, whose registers `test-harness` checks one by one after its `SegFault`.
 
+use crate::{Notif, PAGE, refused, wait_readable};
 use core::arch::asm;
-use libkern::debug::Line;
-use libkern::*;
-use libos::thread_create;
-
-/// One page; the worker thread's stack size.
-const PAGE: u64 = 4096;
-
-static mut NOTIF: Notification = Notification::zeroed();
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
-static mut WAIT_HANDLES: [u64; 1] = [0];
-/// `sys_exception_resume` disposition: terminate the thread with a code.
-const DISPOSITION_TERMINATE: u64 = 2;
-
-static mut WORKER_ARGS: ThreadArgs = ThreadArgs {
-    entry: 0,
-    user_sp: 0,
-    arg0: 0,
-    class: 0, // TimeShared
-    rt_priority: 0,
-    nice: 0,
-    cpu_affinity: 0, // no restriction
-    _reserved: [0; 36],
-};
-static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
+use libkern::{KError, KIND_SEG_FAULT, REG_RIP};
+use libos::log::{self, Line};
+use libos::thread::{self, Disposition, Stack};
+use libos::{Handle, MapReadWrite, Memory, exit, time};
 
 const FAULT_ADDR: u64 = 0xdead_0000;
 
@@ -36,20 +17,10 @@ const fn mark(index: usize) -> u64 {
 /// The registers the worker sets, by index: all an `asm!` may name but `rax`, the address.
 const MARKED: [usize; 12] = [2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
 
-/// Wait `ns`, in a wait on no handles, which the kernel never refuses.
-fn nap(ns: u64) {
-    let mut now = 0u64;
-    // SAFETY: `now` is a valid writable out-parameter; then no handles and no results.
-    unsafe {
-        syscall2(SYS_CLOCK_READ, abi::CLOCK_MONOTONIC, (&raw mut now) as u64);
-        syscall4(SYS_WAIT, 0, 0, 0, now.saturating_add(ns));
-    }
-}
-
 /// The worker's entry: fault on a store with each register in [`MARKED`] at its [`mark`], once
 /// the main thread has had time to reach its wait, so the fault finds it waiting.
-extern "C" fn worker_fault() -> ! {
-    nap(10_000_000);
+extern "C" fn worker_fault(_: u64, _: u64, _: u64, _: u64) -> ! {
+    let _ = time::sleep(10_000_000);
     // SAFETY: this is the whole point — `FAULT_ADDR` is an unmapped user address, so the store
     // traps; the kernel never lets it complete, and the registers it sets are only inputs.
     unsafe {
@@ -70,100 +41,64 @@ extern "C" fn worker_fault() -> ! {
 /// **The kernel cannot write through a read-only user mapping**: a syscall's copy-out to one
 /// faults on the user side, and recovery answers `FaultFromUser`, the page untouched.
 fn a_copy_out_to_a_read_only_page_is_refused() {
-    // SAFETY: register-only syscalls with valid arguments.
-    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    // SAFETY: maps the memory object read-only at a kernel-chosen address.
-    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem.max(0) as u64, 0, PAGE, RIGHT_MAP_READ) };
-    if mem < 0 || base < 0 {
-        kprint(b"test-harness: read-only page FAIL\n");
+    let page = Handle::<Memory, MapReadWrite>::create(PAGE)
+        .and_then(Handle::into_read_only)
+        .and_then(|mem| mem.map(PAGE).map(|mapping| (mem, mapping)));
+    let Ok((_mem, mapping)) = page else {
+        log::write(b"test-harness: read-only page FAIL\n");
         exit(1);
-    }
-    // SAFETY: the clock's out-parameter is `base`, a mapped user page this process may only read.
-    let read = unsafe { syscall2(SYS_CLOCK_READ, abi::CLOCK_MONOTONIC, base as u64) };
-    // SAFETY: `base` is mapped readable for a page.
-    let after = unsafe { core::ptr::read_volatile(base as *const u64) };
-    if read != KError::FaultFromUser as i64 || after != 0 {
+    };
+    let read = refused::clock_read_into(mapping.as_ptr());
+    let mut after = [0u8; 8];
+    if read != KError::FaultFromUser as i64 || mapping.read_into(0, &mut after).is_err() || after != [0; 8] {
         Line::new().s(b"test-harness: a copy to a read-only page landed: ").i(read).s(b" FAIL").end();
         exit(1);
     }
-    kprint(b"test-harness: a copy to a read-only page is refused ok\n");
+    log::write(b"test-harness: a copy to a read-only page is refused ok\n");
 }
 
 /// The exception demo: see the worker's `SegFault` on `notif`, check its registers, terminate it.
-pub(crate) fn run(notif: u64) {
+pub(crate) fn run(notif: &Notif) {
     a_copy_out_to_a_read_only_page_is_refused();
-    kprint(b"test-harness: mapping a worker stack\n");
-    // SAFETY: register-only syscalls with valid arguments.
-    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    if mem < 0 {
-        kprint(b"test-harness: worker stack create FAIL\n");
+    log::write(b"test-harness: mapping a worker stack\n");
+    let Ok(stack) = Stack::new(PAGE) else {
+        log::write(b"test-harness: worker stack create FAIL\n");
         exit(1);
-    }
-    // SAFETY: maps the memory object read/write at a kernel-chosen address.
-    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if base < 0 {
-        kprint(b"test-harness: worker stack map FAIL\n");
-        exit(1);
-    }
-    let stack_top = base as u64 + PAGE; // stacks grow down from the top
-
-    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: WORKER_ARGS is our static, exclusively initialised here, then lent to the wrapper.
-    // `worker_fault` faults rather than returning, on a stack mapped for it alone.
-    let worker = match unsafe {
-        WORKER_ARGS.entry = worker_fault as *const () as usize as u64;
-        WORKER_ARGS.user_sp = stack_top;
-        WORKER_ARGS.arg0 = 0;
-        thread_create(&*(&raw const WORKER_ARGS))
-    } {
-        Ok(w) => w,
-        Err(_) => {
-            kprint(b"test-harness: thread_create FAIL\n");
-            exit(1);
-        }
     };
-    kprint(b"test-harness: created worker thread; awaiting its fault\n");
+    let Ok(worker) = thread::start(worker_fault, stack, 0) else {
+        log::write(b"test-harness: thread_create FAIL\n");
+        exit(1);
+    };
+    log::write(b"test-harness: created worker thread; awaiting its fault\n");
 
     loop {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = notif;
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-        };
-        if waited < 1 {
-            kprint(b"test-harness: wait FAIL\n");
+        if !wait_readable(notif) {
+            log::write(b"test-harness: wait FAIL\n");
             exit(1);
         }
-        // SAFETY: NOTIF is a valid 64-byte writable out-param.
-        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-        if r != 0 {
-            continue; // WouldBlock: re-block on the channel
-        }
-        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-        let kind = unsafe { (&raw const NOTIF.kind).read() };
-        if kind == KIND_SEG_FAULT {
+        // `WouldBlock`: re-block on the channel.
+        let Ok(Some(n)) = notif.recv() else { continue };
+        if n.kind == KIND_SEG_FAULT {
             break;
         }
     }
 
-    // SAFETY: WORKER_REGS is a valid writable RegisterValues out-param.
-    let gr = unsafe { syscall4(SYS_THREAD_GET_REGISTERS, worker.raw().0, (&raw mut WORKER_REGS) as u64, 0, 0) };
-    // SAFETY: the kernel wrote the 18-register snapshot into WORKER_REGS, or nothing.
-    let regs = unsafe { (&raw const WORKER_REGS.regs).read() };
-    let marked = MARKED.iter().all(|&i| regs[i] == mark(i));
-    if gr != 0 || regs[0] != FAULT_ADDR || !marked || regs[REG_RIP] == 0 {
-        kprint(b"test-harness: get_registers FAIL (not the registers the worker faulted with)\n");
-        exit(1);
-    }
+    let regs = match worker.fault_registers() {
+        Ok(r) if r.regs[0] == FAULT_ADDR && MARKED.iter().all(|&i| r.regs[i] == mark(i)) && r.regs[REG_RIP] != 0 => {
+            r.regs
+        }
+        _ => {
+            log::write(b"test-harness: get_registers FAIL (not the registers the worker faulted with)\n");
+            exit(1);
+        }
+    };
     let rip = regs[REG_RIP];
     Line::new().s(b"test-harness: worker faulted @ rip=").x(rip).s(b" ; terminating").end();
 
-    // SAFETY: register-only syscall.
-    let er = unsafe { syscall4(SYS_EXCEPTION_RESUME, worker.raw().0, DISPOSITION_TERMINATE, 7, 0) };
-    if er != 0 {
-        kprint(b"test-harness: exception_resume FAIL\n");
+    if worker.settle(Disposition::Terminate(7)).is_err() {
+        log::write(b"test-harness: exception_resume FAIL\n");
         exit(1);
     }
     // The worker is not this process's last thread, so its termination produces no `ChildExited`.
-    kprint(b"test-harness: worker terminated\n");
+    log::write(b"test-harness: worker terminated\n");
 }
