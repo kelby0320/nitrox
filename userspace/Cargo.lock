@@ -148,6 +148,7 @@ version = "0.1.0"
 dependencies = [
  "libfsserver",
  "libkern",
+ "libos",
  "librsproto",
 ]
 
@@ -157,6 +158,7 @@ version = "0.1.0"
 dependencies = [
  "libfsserver",
  "libkern",
+ "libos",
  "librsproto",
 ]
 

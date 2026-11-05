@@ -23,7 +23,11 @@ path = "src/main.rs"
 [dependencies]
 # The request→reply codec (`Namespace::Resolve` + `Meta::Ready`). no_std/no-alloc.
 librsproto = { path = "../librsproto" }
-# The raw syscall surface (used only by the `[[bin]]`; the reader lib needs none).
-libkern = { path = "../libkern" }
+# The `[[bin]]`'s entry: its bootstrap registers, its log and its exit.
+libos = { path = "../libos" }
 # The protocol half of the server, and the block-device traits (Phase 6 Part E.1).
 libfsserver = { path = "../libfsserver" }
+
+[dev-dependencies]
+# `KError`, which the tests name.
+libkern = { path = "../libkern" }

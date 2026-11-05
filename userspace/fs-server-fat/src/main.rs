@@ -17,6 +17,8 @@ use fs_server_fat::{Fat, ReadOnly};
 use libfsserver::cache::{MetaCache, OnceStore};
 use libfsserver::disk::SectorDisk;
 use libfsserver::server;
+use libos::boot::Start;
+use libos::{Channel, Only, exit, log};
 
 /// The metadata cache's memory.
 static STORE: OnceStore = OnceStore::new();
@@ -25,18 +27,24 @@ static STORE: OnceStore = OnceStore::new();
 /// channel (unused), `rsi` = the inherited root namespace (unused — the server resolves nothing),
 /// `rdx` = the **control channel** endpoint its supervisor installed, `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {
-    let (disk, read_only) = server::bootstrap(control, SectorDisk::new);
-    let device = disk.device();
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: `_start`'s four registers as the kernel set them, wrapped here and nowhere else.
+    let mut start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    // `start` keeps the two unused handles for the server's life, as serving never returns.
+    let Some(control) = start.take_handle0::<Channel, Only>() else {
+        log::write(b"fs-server: setup recv failed\n");
+        exit(1)
+    };
+    let (disk, read_only) = server::open_disk(&control, SectorDisk::over);
     let store = STORE.take().expect("`_start` runs once");
     let cached = MetaCache::new(&disk, store);
     // 3–6. Check, Ready, serve — a read-only mount through the type that refuses every write,
     //      which also marks each file it resolves read-only.
     if read_only {
         let ro = ReadOnly(&cached);
-        server::run(&Fat::new(&ro), control, device)
+        server::serve_volume(&Fat::new(&ro), control, disk.handle())
     } else {
-        server::run(&Fat::new(&cached), control, device)
+        server::serve_volume(&Fat::new(&cached), control, disk.handle())
     }
 }
 
