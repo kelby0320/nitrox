@@ -69,19 +69,6 @@ impl ChannelTransport {
         }
     }
 
-    /// Wrap an endpoint obtained by resolving `/dev/draw/new`. For callers not yet on libos; the
-    /// typed form is [`from_endpoint`](Self::from_endpoint).
-    ///
-    /// # Safety
-    ///
-    /// `channel` must be a live IPC endpoint connected to a compositor, given away: the
-    /// transport's `Drop` closes it, so a borrowed handle is a double close.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub unsafe fn new(channel: u64) -> Self {
-        // SAFETY: the caller gives the endpoint away, as this has always asked.
-        Self::from_endpoint(unsafe { Handle::from_raw(RawHandle(channel), Rights::empty()) })
-    }
-
     /// Resolve `/dev/draw/new` in `ns` and wrap the endpoint it answers with.
     pub fn open<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>) -> Result<Self, UiError> {
         Self::resolve(ns.into(), "/dev/draw/new")

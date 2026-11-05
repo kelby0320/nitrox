@@ -37722,7 +37722,7 @@ Decided in the part, for the maintainer's eye:
   program handed no root namespace says so and exits, where it went on with handle 0, which no
   spawn does. Handles the old code leaked now close: a ping's in `nxfiles`, a capture's in the
   desktop, and the mapping of a disk's info page in `nxinstall`.
-- **Thirty-two of E.2's raw shims lost their last caller and went**, with the helpers only they
+- **Thirty-four of E.2's raw shims lost their last caller and went**, with the helpers only they
   used. **Two kinds of caller keep the rest**: the test harness, which E.5 moves, and **the two
   filesystem servers, which no sub-part names**. `fs-server-ext4` and `fs-server-fat` make no raw
   syscall, so the ratchet never listed them, but their `_start`s enter through libfsserver's raw

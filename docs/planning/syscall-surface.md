@@ -353,7 +353,7 @@ shares is read only by copying**: libdraw's `Pixels`, borrowed where this proces
 bytes and copied a piece at a time where they are shared, under every blit, the downscale and the
 compositor's capture. libos grew a `Timer`, `system::set_clock` and `Mapping::unmap`; `libviews` is
 typed; `libstream` lends a port over an endpoint its owner keeps. The session makes 4,409 calls
-where `main` made 4,403: `nxsh`'s `exit` closes three handles the process's exit closed. Thirty-two
+where `main` made 4,403: `nxsh`'s `exit` closes three handles the process's exit closed. Thirty-four
 shims lost their last caller and went; the test harness keeps the rest, with the two filesystem
 servers, whose entry no sub-part moves.
 

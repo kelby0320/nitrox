@@ -2301,7 +2301,7 @@ E.2 gives each library moved onto libos a typed API (`Ref`, `Handle`), and keeps
 that took or gave a raw `u64` handle as a thin shim over it, so the crates that call it move once,
 onto the typed form, in E.3 to E.5, rather than once now and once again then (the maintainer's
 call, 2026-11-03). A shim's `u64` is its caller's claim, as it always was: borrowing it is the one
-`unsafe` it adds. Thirty-two went in E.4 with their last callers. **Two kinds of caller keep the
+`unsafe` it adds. Thirty-four went in E.4 with their last callers. **Two kinds of caller keep the
 rest**: the test harness, and the two filesystem servers, whose `_start`s enter through
 libfsserver's raw `bootstrap`, `run` and `Disk::new` and which no sub-part names. Trigger: a shim's
 last caller moving onto libos: E.5 for the test harness's, and the filesystem servers' entry when a
