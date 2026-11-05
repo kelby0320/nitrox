@@ -1,6 +1,6 @@
 //! The session's terminal: a channel to the tty server, spoken in `librsproto` requests.
 
-use crate::signals::{Signals, stop};
+use crate::notices::{Notices, stop};
 use alloc::rc::Rc;
 use libkern::abi::KIND_TERMINATE_REQUESTED;
 use libos::{Carried, Channel, Deadline, Handle, Msg, Only, Ref, WaitSet};
@@ -10,12 +10,12 @@ type Reply = (bool, usize, Carried);
 
 pub(crate) struct Tty {
     chan: Handle<Channel, Only>,
-    signals: Rc<Signals>,
+    notices: Rc<Notices>,
 }
 
 impl Tty {
-    pub(crate) fn new(chan: Handle<Channel, Only>, signals: Rc<Signals>) -> Self {
-        Tty { chan, signals }
+    pub(crate) fn new(chan: Handle<Channel, Only>, notices: Rc<Notices>) -> Self {
+        Tty { chan, notices }
     }
 
     pub(crate) fn channel(&self) -> Ref<'_, Channel, Only> {
@@ -53,7 +53,7 @@ impl Tty {
             // The interrupt is unsolicited, so it can land where a reply was expected: record it and
             // keep waiting, or the real reply stays queued for whoever asked next.
             if m.op == librsproto::OP_TTY_INTERRUPT {
-                self.signals.interrupt();
+                self.notices.interrupt();
                 continue;
             }
             let n = m.body.len().min(out.len());
@@ -63,7 +63,7 @@ impl Tty {
     }
 
     fn wait_for_reply(&self, watch: bool) -> Option<()> {
-        let notify = self.signals.notify().filter(|_| watch);
+        let notify = self.notices.notify().filter(|_| watch);
         loop {
             let mut set = WaitSet::<2>::new();
             let _ = set.add(&self.chan);
@@ -140,7 +140,7 @@ impl Tty {
             if let Ok(m) = librsproto::decode(msg.payload())
                 && m.op == librsproto::OP_TTY_INTERRUPT
             {
-                self.signals.interrupt();
+                self.notices.interrupt();
                 hit = true;
             }
         }

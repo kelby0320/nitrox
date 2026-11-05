@@ -162,11 +162,11 @@ impl Sys for Stages<'_> {
     fn await_exits(&mut self, children: &[u64], exits: &mut Vec<(i32, bool)>) {
         loop {
             // The pipeline is being stopped, so a terminate request read here has nothing to add.
-            self.host.signals.drain(exits);
+            self.host.notices.drain(exits);
             if exits.len() >= children.len() {
                 return;
             }
-            let Some(notify) = self.host.signals.notify() else { return };
+            let Some(notify) = self.host.notices.notify() else { return };
             let mut set = WaitSet::<1>::new();
             let _ = set.add(notify);
             // No exit can be read if the wait fails.

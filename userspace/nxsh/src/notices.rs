@@ -11,7 +11,7 @@ const KIND_CHILD_EXITED: u32 = 0x0200;
 const EXIT_KIND_NORMAL: u32 = 0;
 
 /// The shell's notification queue and the two flags the rest of it reads.
-pub(crate) struct Signals {
+pub(crate) struct Notices {
     notify: Option<Handle<Notify, Only>>,
     /// Set when the terminal has reported `Ctrl-C` (§11h). The interrupt can arrive in any exchange,
     /// so every path receiving from the tty channel records it here; the caller decides what it
@@ -23,9 +23,9 @@ pub(crate) struct Signals {
     stop_asked: Cell<bool>,
 }
 
-impl Signals {
+impl Notices {
     pub(crate) fn new(notify: Option<Handle<Notify, Only>>) -> Self {
-        Signals { notify, interrupted: Cell::new(false), stop_asked: Cell::new(false) }
+        Notices { notify, interrupted: Cell::new(false), stop_asked: Cell::new(false) }
     }
 
     pub(crate) fn notify(&self) -> Option<Ref<'_, Notify, Only>> {

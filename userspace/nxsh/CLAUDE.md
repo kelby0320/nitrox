@@ -26,7 +26,7 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
   reader, the filesystem — all through `libos`, so the binary makes no raw syscall and holds
   no `static mut`; `src/stage.rs`, a stage's image read and decided by `exec`; `src/stages.rs`,
   the `pipeline::Sys` that starts and stops stages, which owns the handles the pipeline names
-  by value; `src/tty.rs`, the terminal's requests; and `src/signals.rs`, the notification queue
+  by value; `src/tty.rs`, the terminal's requests; and `src/notices.rs`, the notification queue
   and the interrupt and stop flags.
   **`eval.rs` and `parse.rs` are at their size entries**: new code goes in a module of its own.
 

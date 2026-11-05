@@ -31,10 +31,10 @@ use libos::{Channel, Deadline, File, Handle, MapRead, Msg, Namespace, NsReadOnly
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
 use libstream::setup::{StageStreams, receive_setup, setup_is_pending};
 use libstream::wire::ByteSink;
+use notices::Notices;
 use nxsh::host::{Host, PipelineRun, StageSpec, StageStatus};
 use nxsh::pipeline::{Pipeline, Sys};
 use nxsh::{Interp, RunMode};
-use signals::Signals;
 use tty::Tty;
 
 #[global_allocator]
@@ -93,14 +93,14 @@ fn drain_diagnostics(err: Option<Ref<'_, Channel, Only>>, tty: Option<&Tty>) {
     }
 }
 
-mod signals;
+mod notices;
 mod stage;
 mod stages;
 mod tty;
 
 struct NitroxHost {
     namespace: Handle<Namespace, NsReadOnly>,
-    signals: Rc<Signals>,
+    notices: Rc<Notices>,
     /// The terminal, for §11h's interrupt checkpoint. `None` when there is none (a script or a
     /// Tier-0 stage).
     tty: Option<Rc<Tty>>,
@@ -159,7 +159,7 @@ impl Host for NitroxHost {
             }
         }
 
-        let (signals, tty) = (self.signals.clone(), self.tty.clone());
+        let (notices, tty) = (self.notices.clone(), self.tty.clone());
         let tty = tty.as_deref();
         let names: Vec<&str> = stages.iter().map(|s| s.program.as_str()).collect();
         let mut p = Pipeline::new(stages::Stages::new(self, images, &argvs, env));
@@ -169,7 +169,7 @@ impl Host for NitroxHost {
         // and `Tty::await_reply` records a `Ctrl-C` there rather than leaving it queued, so the
         // waits below would never see it and `sleep 60` would run its minute (`test-interactive`
         // step 19). The flag stays set for the evaluator's checkpoint.
-        if signals.interrupted() {
+        if notices.interrupted() {
             terminate_all(&mut p);
         }
 
@@ -213,7 +213,7 @@ impl Host for NitroxHost {
             loop {
                 // The notification channel too: a terminate request must reach the stages during
                 // this wait, and a stage's exit read here is kept for `reap`.
-                drain_notifications(&mut p, &signals, &mut stop_sent);
+                drain_notifications(&mut p, &notices, &mut stop_sent);
                 // Poll before blocking: a waiter arriving after a message was enqueued never sees
                 // that edge, and the tty queues the interrupt in the same console read as the line
                 // that started the pipeline.
@@ -230,7 +230,7 @@ impl Host for NitroxHost {
                     if let Some(diagnostics) = p.sys.channel(ends.diagnostics) {
                         let _ = set.add(diagnostics);
                     }
-                    if let Some(notify) = signals.notify() {
+                    if let Some(notify) = notices.notify() {
                         let _ = set.add(notify);
                     }
                     if let Some(tty) = tty {
@@ -271,7 +271,7 @@ impl Host for NitroxHost {
             p.close(rx);
         }
 
-        let reaped = reap(&mut p, &signals, tty, ends.diagnostics, stages, strict, stop_sent);
+        let reaped = reap(&mut p, &notices, tty, ends.diagnostics, stages, strict, stop_sent);
         p.reaped();
         // One last drain, after every stage is gone: a program's final word can be sent just before
         // `exit`, after the wait that noticed the exit returned.
@@ -361,13 +361,13 @@ impl Host for NitroxHost {
         // A terminate request, between statements: read off the notification channel here too, so a
         // loop that runs no stage still sees it. `reap` has counted every exit before a pipeline
         // returns.
-        self.signals.drain(&mut Vec::new());
-        if self.signals.stop_asked() {
+        self.notices.drain(&mut Vec::new());
+        if self.notices.stop_asked() {
             return true;
         }
         let Some(tty) = &self.tty else { return false };
         tty.poll_interrupt();
-        self.signals.take_interrupt() || self.signals.stop_asked()
+        self.notices.take_interrupt() || self.notices.stop_asked()
     }
 
     /// The kernel's monotonic clock, for `time`.
@@ -396,7 +396,7 @@ impl Host for NitroxHost {
 /// for a process handle, or a handle in the notification, and it is an ABI change.
 fn reap(
     p: &mut Pipeline<stages::Stages<'_>>,
-    signals: &Signals,
+    notices: &Notices,
     tty: Option<&Tty>,
     err: u64,
     stages: &[StageSpec],
@@ -413,7 +413,7 @@ fn reap(
         drain_diagnostics(p.sys.channel(err), tty);
         let waited = {
             let mut set = WaitSet::<3>::new();
-            if let Some(notify) = signals.notify() {
+            if let Some(notify) = notices.notify() {
                 let _ = set.add(notify);
             }
             if let Some(diagnostics) = p.sys.channel(err) {
@@ -437,7 +437,7 @@ fn reap(
             asked = true;
             terminate_all(p);
         }
-        drain_notifications(p, signals, &mut asked);
+        drain_notifications(p, notices, &mut asked);
     }
 
     let seen = p.parts().1.clone();
@@ -469,8 +469,8 @@ fn terminate_all(p: &mut Pipeline<stages::Stages<'_>>) {
 
 /// Read what the notification queue holds while a pipeline runs: exits are kept for `reap`, and a
 /// terminate request asks every stage to stop once (`asked`).
-fn drain_notifications(p: &mut Pipeline<stages::Stages<'_>>, signals: &Signals, asked: &mut bool) {
-    if signals.drain(p.parts().1) && !*asked {
+fn drain_notifications(p: &mut Pipeline<stages::Stages<'_>>, notices: &Notices, asked: &mut bool) {
+    if notices.drain(p.parts().1) && !*asked {
         *asked = true;
         terminate_all(p);
     }
@@ -492,12 +492,12 @@ fn lookup_rights<T, M>(ns: &Handle<Namespace, NsReadOnly>, path: &str, rights: R
 
 fn run(
     root: Handle<Namespace, NsReadOnly>,
-    signals: Rc<Signals>,
+    notices: Rc<Notices>,
     argv: &[String],
     env: libstream::wire::Record,
     terminal: Option<Handle<Channel, Only>>,
 ) -> i64 {
-    let mut host = NitroxHost { namespace: root, signals, tty: None };
+    let mut host = NitroxHost { namespace: root, notices, tty: None };
 
     let mut script_path: Option<String> = None;
     let source = match argv.get(1).map(|s| s.as_str()) {
@@ -513,7 +513,7 @@ fn run(
             // log reaches nobody on a machine with no serial port.
             match terminal {
                 Some(t) => {
-                    Tty::new(t, host.signals.clone()).write_crlf("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]")
+                    Tty::new(t, host.notices.clone()).write_crlf("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]")
                 }
                 None => host.out("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]\n"),
             }
@@ -591,8 +591,8 @@ fn repl(mut host: NitroxHost, env: libstream::wire::Record, terminal: Option<Han
             t
         }
     };
-    let signals = host.signals.clone();
-    let tty = Rc::new(Tty::new(chan, signals.clone()));
+    let notices = host.notices.clone();
+    let tty = Rc::new(Tty::new(chan, notices.clone()));
     host.tty = Some(tty.clone());
 
     let mut interp = Interp::with_host(alloc::boxed::Box::new(host), RunMode::Repl);
@@ -616,8 +616,8 @@ fn repl(mut host: NitroxHost, env: libstream::wire::Record, terminal: Option<Han
 
     let mut chunk = [0u8; 64];
     loop {
-        if signals.stop_asked() {
-            signals::stop();
+        if notices.stop_asked() {
+            notices::stop();
         }
         let n = match tty.read(&mut chunk) {
             Some(n) => n,
@@ -629,7 +629,7 @@ fn repl(mut host: NitroxHost, env: libstream::wire::Record, terminal: Option<Han
         };
         // `Ctrl-C` at a prompt discards the line (§11h): the byte became an event, so the read came
         // back empty. The tty only reports it; what it means is the caller's decision.
-        if signals.take_interrupt() {
+        if notices.take_interrupt() {
             tty.write(&editor.interrupt());
             tty.write(prompt(&interp).as_bytes());
             continue;
@@ -725,12 +725,12 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     // gate waits on this line (`nxsh: up`). It goes to the debug console, not the tty: under
     // `nxterm` the grid renders only under `test-harness`.
     Line::new().s(b"nxsh: up (env: ").u(env.values.len() as u64).s(b" fields)").end();
-    let signals = Rc::new(Signals::new(start.notify.take()));
+    let notices = Rc::new(Notices::new(start.notify.take()));
     let Some(root) = start.root.take() else {
         log::write(b"nxsh: no root namespace\n");
         libos::exit(EXIT_USAGE as i32)
     };
-    libos::exit(run(root, signals, &argv, env, terminal) as i32)
+    libos::exit(run(root, notices, &argv, env, terminal) as i32)
 }
 
 #[panic_handler]
