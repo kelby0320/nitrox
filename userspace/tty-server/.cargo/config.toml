@@ -1,8 +1,8 @@
 # Build config for the `tty-server` userspace program.
 #
 # Read by cargo when the build is invoked from this directory (xtask runs
-# `cargo build` with cwd = userspace/hello), so it does not affect the other
-# userspace crates (`init`, `libkern`) which still build for the host.
+# `cargo build` with cwd = this crate's directory), so it does not reach the
+# libraries, which build for the host in their tests.
 #
 # The goal is a static, non-PIE ELF (ET_EXEC) in the low half: the kernel ELF
 # loader rejects PIE/ET_DYN and dynamic interpreters. `user.ld` (passed via
