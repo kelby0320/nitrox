@@ -85,8 +85,15 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
         let _ = set.add(&serve);
         let _ = set.wait(Deadline::NEVER);
         loop {
-            let Ok(_sent) = serve.recv(&mut msg) else {
-                break;
+            let _sent = match serve.recv(&mut msg) {
+                Ok(sent) => sent,
+                // **Nothing can reach the probe any more**: the peer stays signalled, so waiting
+                // again would spin a CPU for the rest of the boot.
+                Err(e) if e.code() == KError::PeerClosed => {
+                    log::write(b"restart-probe: nothing can reach it any more; exiting\n");
+                    libos::exit(0);
+                }
+                Err(_) => break,
             };
             let Ok(m) = decode(msg.payload()) else { continue };
             if m.op != OP_NS_RESOLVE {

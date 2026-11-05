@@ -20,9 +20,17 @@ pub(super) fn a_refused_setup_message_closes_its_handles_test() -> bool {
     let refused = send_stage_setup(&ours, streams, Some(t), &[&long], &Record::default(), Deadline::NEVER);
     // The handles gone are the ones whose peers see them close.
     let gone = peer_gone_by(&rx, clock_ns() + 2_000 * MS) && peer_gone_by(&peer, clock_ns() + 2_000 * MS);
-    let streams = StageStreams { stdin: None, stdout: Some(rx), stderr: None };
+    drop(rx);
+    // Moved, not copied: the peer of the end sent sees it close once the stage's goes.
+    let Ok((y, y_peer)) = open_pipe(4) else {
+        return fail(b"no channel");
+    };
+    let streams = StageStreams { stdin: None, stdout: Some(y), stderr: None };
     let sent = send_stage_setup(&ours, streams, None, &["stage"], &Record::default(), Deadline::NEVER);
-    let moved = receive_count(&theirs) == Some(1);
+    let received = theirs.recv(&mut Msg::new()).ok();
+    let one = received.as_ref().is_some_and(|carried| carried.len() == 1);
+    drop(received);
+    let moved = one && peer_gone_by(&y_peer, clock_ns() + 2_000 * MS);
     // The kernel refusing the send, the stage's end gone, before it takes anything.
     let (Ok((dead, theirs)), Ok((x, x_peer))) = (open_pipe(4), open_pipe(4)) else {
         return fail(b"no channel");
@@ -45,9 +53,4 @@ pub(super) fn a_refused_setup_message_closes_its_handles_test() -> bool {
     }
     Line::new().s(b"boot-probe: a refused setup message closes its handles ok").end();
     true
-}
-
-/// How many handles the next message on `ch` carries, if one is there.
-fn receive_count(ch: &Handle<Channel, Only>) -> Option<usize> {
-    ch.recv(&mut Msg::new()).ok().map(|carried| carried.len())
 }
