@@ -227,7 +227,7 @@ session namespace. The prohibited act is a resource server making itself reachab
 a supervisor owns; deciding what a child it created may reach is the constructor role, which this
 process already has and already exercises. It also removes a cost
 [`deferred-decisions.md`](../rationale/deferred-decisions.md) had named against this box: no
-`Meta::Ready` handshake, and no change to `spawn_leader` to wait for a ready before it reaps.
+`Meta::Ready` handshake, and no change to `run_leader` to wait for a ready before it reaps.
 
 **Built 2026-08-26** (Milestone 8 Part F). The shell serves `/dev/desktop` and binds it into
 every application namespace it constructs; nothing binds it into the session namespace, because
@@ -315,7 +315,7 @@ diverge anyway.
 **A shutdown ends both** (administration Part E.4c). `service-mgr` sends each supervisor a terminate
 request, and where it finds one decides what happens:
 - **at its prompt or greeter**, the supervisor exits;
-- **during a session**, `libsession::spawn_leader` passes the request to the leader and gives it
+- **during a session**, `libsession::run_leader` passes the request to the leader and gives it
   5 s. The supervisor then closes the session at the view broker, as at any session's end, and
   exits rather than presenting a login again.
 

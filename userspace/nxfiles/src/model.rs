@@ -128,7 +128,7 @@ pub enum FileOp {
         from: String,
         /// The path to write.
         to: String,
-        /// Whether it is a directory, which decides whether the copy descends (`copy_file` fails).
+        /// Whether it is a directory, which decides whether the copy descends (`libfs::copy` fails).
         dir: bool,
     },
     /// Remove `path`, and everything under it if it is a directory.

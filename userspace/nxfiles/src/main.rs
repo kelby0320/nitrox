@@ -149,8 +149,8 @@ fn eject(ns: Ns<'_>, name: &str) -> Result<Vec<String>, String> {
 /// returned string is what the strip shows, so it is written for the person looking at it.
 fn perform(ns: Ns<'_>, op: &FileOp) -> (bool, &'static str) {
     // The destination is tested first, which is what makes "nothing overwrites" true:
-    // `libfs::create_file` is idempotent, so *new file* onto an existing name would succeed and
-    // report a new empty file, and `libfs::rename` does not distinguish an occupied destination,
+    // `libfs::ensure_file` is idempotent, so *new file* onto an existing name would succeed and
+    // report a new empty file, and `libfs::rename_path` does not distinguish an occupied destination,
     // so a refused rename would read like a fault. Testing here puts the promise in this program.
     let taken = |path: &String| libfs::file_len(ns, path).is_some() || libfs::is_directory(ns, path);
     match op {
@@ -180,7 +180,7 @@ fn perform(ns: Ns<'_>, op: &FileOp) -> (bool, &'static str) {
                 Err(_) => (false, "could not move it"),
             }
         }
-        // `copy_file` maps both sides and copies with no heap, bounded by `libfs::MAX_COPY`; a
+        // `libfs::copy` maps both sides and copies with no heap, bounded by `libfs::MAX_COPY`; a
         // *folder* takes `copy_tree`.
         FileOp::Copy { from, to, dir } => {
             if taken(to) {

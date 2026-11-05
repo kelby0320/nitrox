@@ -738,9 +738,9 @@ the codes can swap, which matters only to `on-failure` (`never` and `always` do 
 code). A service found dead with no code queued is treated as a failure, since a crash that
 outruns its notification is the case worth restarting.
 
-**`libsession::spawn_leader` gives up on a leader after `LEADER_STOP_NS`**, on a shutdown and when
+**`libsession::run_leader` gives up on a leader after `LEADER_STOP_NS`**, on a shutdown and when
 its setup message fails, and returns with that leader's `ChildExited` still to come. The next
-`spawn_leader` takes the first it sees as its own, so a leader that outlasts its five seconds ends
+`run_leader` takes the first it sees as its own, so a leader that outlasts its five seconds ends
 the next session under a running shell. Reachable only by a leader that ignores both a terminate
 and its closed setup channel, which neither `nxsh` nor `desktop-shell` does. A life channel, as
 the broker and `service-mgr` hold, would attribute it.
@@ -1001,7 +1001,7 @@ window instead reaches the session's console.
 
 **What changed:** M7 Part D built `desktop-session-mgr`, so the graphical session namespace this
 entry was waiting on now exists — and it binds `/dev/tty`, because
-`libsession::build` binds it for both columns whenever a tty endpoint was handed
+`libsession::build_namespace` binds it for both columns whenever a tty endpoint was handed
 down.
 
 **The sharp edge, which Part D's own reasoning did not cover.** That session deliberately has

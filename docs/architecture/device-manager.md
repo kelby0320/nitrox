@@ -219,7 +219,7 @@ the same fix to come. The manager holds no syscaps and binds nothing; `service-m
 
 - **`eshell`'s `lsblk`** reads `/dev/registry`, since the recovery shell runs in the root
   namespace. It prints each block device's path, kind, size and name.
-- **`libsession::rebind_block_devices_except`** hands disks to a view: the broker's `disks` grant,
+- **`libsession::share_block_devices`** hands disks to a view: the broker's `disks` grant,
   and since administration Part G.3 the only way a disk reaches a program. It reads the registry of
   its source, the root namespace, where `/dev/blk` is one kernel-server binding whose children no
   enumeration can see. Until G.3 it also read a session's own `/dev/blk/<n>` bindings, for
@@ -230,7 +230,7 @@ the same fix to come. The manager holds no syscaps and binds nothing; `service-m
   where one is mounted, by whom.
 
 None of them stops at a gap, and each takes its indices from what exists rather than from a
-counter. `libfs::ns_children` still reports a kernel server's subtree as one binding, and says that
+counter. `libfs::bindings_under` still reports a kernel server's subtree as one binding, and says that
 `/dev/devices` is what lists the devices.
 
 ## 8. What the gates prove

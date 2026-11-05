@@ -904,7 +904,7 @@ impl App {
             self.ops.push(match verb {
                 librsproto::clipboard::PathVerb::Cut => FileOp::MoveInto { from: String::from(*from), to },
                 // Whether it is a directory comes from the binary, which asked the filesystem:
-                // `copy_file` on a folder fails.
+                // `libfs::copy` on a folder fails.
                 librsproto::clipboard::PathVerb::Copy => FileOp::Copy { from: String::from(*from), to, dir: *is_dir },
             });
         }

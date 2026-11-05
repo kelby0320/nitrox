@@ -159,7 +159,7 @@ fn recv_endpoint(ch: Option<&Endpoint>) -> Option<Endpoint> {
     sent.take(0)
 }
 
-/// Bootstrap registers, as `libsession::spawn_leader` fills them: `rdi` = notification
+/// Bootstrap registers, as `libsession::run_leader` fills them: `rdi` = notification
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
 /// `argv` and the environment, `rcx` = `arg0`.
 #[unsafe(no_mangle)]

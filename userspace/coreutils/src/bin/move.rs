@@ -7,8 +7,7 @@
 //!
 //! - **Rename first, copy only if forced to.** A rename is O(1) and preserves the file's
 //!   identity; `move` falls back only on the kernel's `CrossDevice` verdict, which `libfs`
-//!   documents as *"a caller's cue to fall back to `copy_file` + unlink rather than an error
-//!   to report"*.
+//!   documents as the cue to fall back to `libfs::copy` + unlink rather than an error to report.
 //! - **It reports which method it used.** `Table<{from, to, method: String}>` with `method`
 //!   one of `rename` or `copy`: the two differ in cost and in whether the file keeps its
 //!   identity, and a gate uses it to prove the same-mount path is not silently copying.

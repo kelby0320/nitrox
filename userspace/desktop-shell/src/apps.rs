@@ -40,8 +40,8 @@ pub(super) fn read_applications(ns: Root<'_>) -> alloc::vec::Vec<Application> {
     apps
 }
 
-/// Construct the namespace one application runs in: [`libsession::build`] from the same spec the
-/// login supervisors use.
+/// Construct the namespace one application runs in: [`libsession::build_namespace`] from the same
+/// members the login supervisors use.
 ///
 /// The load-bearing part of the shell and the reason it holds `BIND_NAMESPACE`:
 /// `ui-composition-model.md` §5a rests "an application cannot compose other applications" on this

@@ -93,7 +93,7 @@ fn window_title(path: &str) -> &str {
     if path.is_empty() { "untitled" } else { libfs::basename_str(path) }
 }
 
-/// Write `bytes` to `path` with [`libfs::save_file`]. The error is the sentence the status strip
+/// Write `bytes` to `path` with [`libfs::save`]. The error is the sentence the status strip
 /// shows.
 fn save(ns: &Handle<Namespace, NsReadOnly>, path: &str, bytes: &[u8]) -> Result<usize, &'static str> {
     match libfs::save(ns, path, bytes) {

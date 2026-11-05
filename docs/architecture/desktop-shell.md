@@ -403,7 +403,7 @@ is host-tested; the loop asks and draws:
 **A shutdown started elsewhere** — `with power shutdown` in a terminal, or on the serial console —
 reaches the shell as a terminate request (administration Part E.4c). It asks every window the same
 way and exits once they have or after **3 s of its own, with no dialog**: inside the 5 s
-`libsession::spawn_leader` gives a leader, whose clock starts before the shell hears of the stop,
+`libsession::run_leader` gives a leader, whose clock starts before the shell hears of the stop,
 so the supervisor never gives up on the shell first. A question an application raised then goes
 unanswered, and the machine stops.
 

@@ -8,7 +8,7 @@
 //! - **`--parents` makes an existing leaf a success, not an error**: "ensure this path exists".
 //! - **Existence is learned from the attempt, and only its *kind* is asked about.** The
 //!   server answers a colliding create with `KError::AlreadyExists`, so the common path is
-//!   one round trip. `--parents` accepts only a directory, so [`libfs::is_dir`] is asked
+//!   one round trip. `--parents` accepts only a directory, so [`libfs::is_directory`] is asked
 //!   on the collision, not ahead of every component.
 //! - **A failure stops the run**, as in `copy`; the rows already emitted say what was created.
 //! - **It emits a table.** `Table<{path: String, created: Bool}>`, one row per operand.
