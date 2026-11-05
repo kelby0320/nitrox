@@ -6,10 +6,12 @@
 [counts]
 "userspace/eshell" = 44
 "userspace/libheap" = 5
-"userspace/test-harness" = 197
+"userspace/test-harness" = 196
 "userspace/test-harness/src/bootprobe/refused" = 2
+"userspace/test-harness/src/refused" = 1
 
 [agreed]
 "userspace/eshell" = "the recovery shell, on libkern by choice"
 "userspace/libheap" = "the allocator under everything, on libkern by choice"
 "userspace/test-harness/src/bootprobe/refused" = "the boot probe's refusals: each call passes what a safe wrapper cannot express, so the call is the test"
+"userspace/test-harness/src/refused" = "the other test programs' refusals, likewise"
