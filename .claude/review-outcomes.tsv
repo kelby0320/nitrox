@@ -537,3 +537,9 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-05	421	f322b83c	8	architecture	optional	demonstrated	fixed	9a5345e5	NamespaceSpec's per-member docs back on Members
 2026-11-05	421	f322b83c	9	architecture	optional	demonstrated	fixed	4fdad227	both removed; every other shim checked by call shape has a test-harness or fs-server caller; pipeline-stdio.md named send_setup_env
 2026-11-05	421	f322b83c	10	architecture	optional	demonstrated	fixed	20099345	notices and Notices, with nxsh/CLAUDE.md
+2026-11-05	422	dec312a0	1	tests+architecture+logic+error-paths	worth-fixing	demonstrated	fixed	9d32dfa7	the model records each settle's (disposition, code); swapping, dropping the status or resuming as 2 now fails; sweep found file_rename ignoring RENAME_REPLACE, fixed with a test
+2026-11-05	422	dec312a0	2	error-paths+architecture	worth-fixing	demonstrated	fixed	95a24ca5	every listed line fixed, logging.md's Logger::borrowing too; the sweep over every removed name found three source comments more
+2026-11-05	422	dec312a0	3	architecture	worth-fixing	demonstrated	fixed	424a8b8c	libkern::thread_exit with its Miri twin; without the twin a Miri run of libkern aborts whole; no syscall asm left outside libkern
+2026-11-05	422	dec312a0	4	logic	optional	unverified	fixed	f5aeee6b	a fresh pipe's peer must see the sent end close; a boot keeping a duplicate fails the test, the real one passes
+2026-11-05	422	dec312a0	5	logic+error-paths	optional	unverified	fixed	f5aeee6b	reproduced: the old loop went round 100,000 times on a closed peer; the fixed one exits; same boot pointing the loop at a dead channel
+2026-11-05	422	dec312a0	6	tests	optional	unverified	declined		binaries are tested by boots by design; the sweep of every code the diff dropped found only finding 4's; a converted check expecting the wrong code fails test-qemu
