@@ -3,8 +3,7 @@
 //! A file's contents bypass the directory protocol: a file resolves to a page-cache object the
 //! process maps, so a copy is a `memcpy` between two mappings. The directory protocol itself is
 //! [`librsproto::session::Dir`]; this crate owns no wire format, only namespace and memory
-//! syscalls and the composition of directory answers ([`list_directory`]). Each function has a typed
-//! form over [`libos`]; the raw `u64` forms beside it are for callers not yet on libos.
+//! syscalls and the composition of directory answers ([`list_directory`]), each over [`libos`].
 
 #![cfg_attr(not(test), no_std)]
 

@@ -3,7 +3,7 @@
 use super::*;
 use crate::files::rename_error;
 use libkern::Rights;
-use libos::{File, Handle, MapReadWrite, Namespace, NsMutable, block_on, fs, mock};
+use libos::{File, Handle, MapReadWrite, Namespace, NsMutable, NsReadOnly, Ref, block_on, fs, mock};
 
 fn fresh() -> Handle<Namespace, NsMutable> {
     mock::reset();
@@ -89,7 +89,9 @@ fn a_size_is_a_files_and_none_for_a_path_that_is_not() {
     ns.bind("/mem", &mem).unwrap();
     assert_eq!(file_len(&ns, "/mem"), Some(4096), "a memory object stats as a file does");
     let (root, _peer) = mock::answering("/dir");
-    assert_eq!(file_size(root, b"/dir"), None, "a session endpoint is not a file");
+    // SAFETY: the mock's namespace, open for the test's life.
+    let root = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(libkern::RawHandle(root), Rights::LOOKUP) };
+    assert_eq!(file_len(root, "/dir"), None, "a session endpoint is not a file");
 }
 
 #[test]
@@ -264,48 +266,6 @@ fn creating_a_file_is_idempotent_and_keeps_what_it_holds() {
     put(&ns, "/f", b"kept");
     ensure_file(&ns, "/f").unwrap();
     assert_eq!(get(&ns, "/f"), b"kept");
-}
-
-#[test]
-fn the_raw_forms_do_what_the_typed_ones_do() {
-    let ns = fresh();
-    let raw = ns.raw().0;
-    write_file(raw, b"/f", b"raw bytes").unwrap();
-    assert_eq!(read_file(raw, b"/f").unwrap(), b"raw bytes");
-    assert_eq!(file_size(raw, b"/f"), Some(9));
-    assert_eq!(read_file(raw, b"/none"), Err(FileError::NotFound));
-    save_file(raw, b"/g", b"saved").unwrap();
-    assert_eq!(get(&ns, "/g"), b"saved");
-    assert_eq!(unpadded(&get(&ns, "/g")), b"saved");
-}
-
-#[test]
-fn a_path_that_is_not_text_resolves_to_nothing() {
-    let ns = fresh();
-    let raw = ns.raw().0;
-    let bad: &[u8] = b"/\xff";
-    assert_eq!(file_size(raw, bad), None);
-    assert_eq!(read_file(raw, bad), Err(FileError::NotFound));
-    put(&ns, "/s", b"x");
-    assert!(matches!(write_file(raw, bad, b"x"), Err(FileError::Io(_))));
-    assert_eq!(lookup_wait(raw, bad, Rights::MAP_READ.bits()).1, 0);
-}
-
-#[test]
-fn a_raw_lookup_gives_a_handle_the_caller_closes() {
-    let ns = fresh();
-    put(&ns, "/f", b"x");
-    let raw = ns.raw().0;
-    let (status, h) = lookup_wait(raw, b"/f", (Rights::MAP_READ | Rights::INSPECT).bits());
-    assert_eq!(status, 0);
-    assert!(mock::is_open(h), "the handle is the caller's now");
-    // SAFETY: the mock's handle, which nothing else owns.
-    drop(unsafe { Handle::<File, libos::MapRead>::from_raw(libkern::RawHandle(h), Rights::empty()) });
-    assert!(!mock::is_open(h));
-    let open = mock::open_handles();
-    let (status, h) = lookup_wait(raw, b"/none", Rights::MAP_READ.bits());
-    assert_eq!((status, h), (libkern::error::KError::NotFound.as_i32(), 0));
-    assert_eq!(mock::open_handles(), open, "a refusal leaves nothing open");
 }
 
 /// A server's table, as `librsproto::server` hands it on, is a file this crate can read.

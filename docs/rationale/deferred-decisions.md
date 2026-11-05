@@ -2296,17 +2296,6 @@ and `libos::system::test_verdict` makes that a safe call for every crate on libo
 `boot-probe` should hold it: a handle, as pre-Phase-7 Part E.10 makes each privileged operation a
 `Write` to a node. Trigger: E.10.
 
-**A library's raw-handle functions stay beside its typed ones — `TODO(raw-handle-shims)`.** Part
-E.2 gives each library moved onto libos a typed API (`Ref`, `Handle`), and keeps each function
-that took or gave a raw `u64` handle as a thin shim over it, so the crates that call it move once,
-onto the typed form, in E.3 to E.5, rather than once now and once again then (the maintainer's
-call, 2026-11-03). A shim's `u64` is its caller's claim, as it always was: borrowing it is the one
-`unsafe` it adds. Thirty-four went in E.4 with their last callers. **Two kinds of caller keep the
-rest**: the test harness, and the two filesystem servers, whose `_start`s enter through
-libfsserver's raw `bootstrap`, `run` and `Disk::new` and which no sub-part names. Trigger: a shim's
-last caller moving onto libos: E.5 for the test harness's, and the filesystem servers' entry when a
-part takes it.
-
 **A resource-server reply's field offsets are literals on both sides — `TODO(rsproto-offsets)`.**
 `abi-sync-check` holds the kernel's rsproto constants to `librsproto`'s (the safety survey's
 proto-o6), and `put_block_run` writes a block run at the offsets the kernel reads, pinned by bytes.
@@ -2524,6 +2513,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A library's raw-handle functions beside its typed ones (`raw-handle-shims`) | 2026-11-05 | **Their last callers moved**: the test harness and the two filesystem servers' entry, in pre-Phase-7 Part E.5, and the thirty-three shims went with them, and with them what only they used: `librsproto`'s raw `Dir` session and libstream's raw `Bootstrap`. Each library's only form is its typed one. |
 | Five provenance tests that only Miri can fail (`miri-provenance-tests`) | 2026-11-01 | **The Miri job**, `cargo xtask miri`, nightly and by hand: each pins a pointer's provenance, which the hardware cannot see, so natively it passes on the old code as on the new, and half of a sixth, a fill answered with the wrong kind of object, reads uninitialised bytes that happen to refuse. All of them now run in that job. |
 | `REAP_RESERVE`, a userspace-reachable cap that aborts when crossed | 2026-10-25 | The sweep it capped is gone: a process's exit only marks its threads, and each parks itself on the reap list of the CPU it ends on, as a lone thread's exit always did. The reap lists hold `MAX_THREADS` since 2026-10-22, and nothing pushes more than one thread at a time. |
 | `copy` and `remove` slow on a real disk (`fs-throughput`) | 2026-10-13 | **Phase 6 Part H**, measured on the laptop beside Linux on the same machine and fixed until it was not the bottleneck: ext4 allocating and freeing in runs, a grow's blocks not read back, each server caching its metadata, and more than a page a command — 6.7 times Linux's time to 0.73 over fifteen runs. The number went into Phase 6's Definition of Done (Part H.5, the maintainer's call); the two costs left are `TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`, above. |

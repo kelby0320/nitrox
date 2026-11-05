@@ -1,4 +1,5 @@
 use super::*;
+use libkern::{RawHandle, Rights};
 use libos::mock;
 
 #[test]
@@ -64,6 +65,12 @@ fn device() -> u64 {
     mock::device()
 }
 
+/// A device of the model's, owned, as a setup message hands a server one.
+fn owned_device() -> Handle<Resource, ReadWrite> {
+    // SAFETY: fresh from the model and named nowhere else.
+    unsafe { Handle::from_raw(RawHandle(device()), Rights::empty()) }
+}
+
 /// A disk whose first wait times out answers `Io` to that write, and to every later transfer
 /// without submitting one, and leaves the scratch as the failed transfer left it.
 fn assert_lost_after_a_timeout<D: BlockReader + BlockWriter>(disk: &D, scratch: &Scratch) {
@@ -111,11 +118,11 @@ fn a_failed_or_short_transfer_is_an_error_but_not_a_loss() {
 }
 
 fn disk() -> Disk {
-    Disk::new(device()).ok().unwrap()
+    Disk::over(owned_device()).ok().unwrap()
 }
 
 fn sector_disk() -> SectorDisk {
-    SectorDisk::new(device()).ok().unwrap()
+    SectorDisk::over(owned_device()).ok().unwrap()
 }
 
 /// The test's own device handle, lent to a window that must leave it open.
@@ -194,7 +201,7 @@ fn a_scratch_that_cannot_be_mapped_closes_its_handle() {
 fn a_disk_whose_zero_span_fails_gives_back_its_scratch_and_its_device() {
     let before = mock::open_handles();
     sys::with(|f| f.creates.extend([None, Some(-1)]));
-    assert!(Disk::new(device()).is_err());
+    assert!(Disk::over(owned_device()).is_err());
     assert_eq!(mock::open_handles(), before, "the device the disk was handed is closed with it");
     assert_eq!(mock::mappings(), 0);
 }

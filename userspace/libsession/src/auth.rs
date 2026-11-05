@@ -1,7 +1,7 @@
 //! Authenticating against auth-service, and a session's registration with the view broker.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use libkern::{RawHandle, Rights, Secret, scrub};
+use libkern::{Secret, scrub};
 use libos::{Channel, Msg, Only, Ref};
 use librsproto::auth::{build_authenticate_request, parse_authenticate_reply};
 use librsproto::{OP_AUTHENTICATE, decode};
@@ -30,13 +30,6 @@ pub fn authenticate_on<'a>(
     let mut msg = Scrubbed(Msg::new());
     let reply = call(auth_ch.into(), OP_AUTHENTICATE, &body[..n], &mut msg)?;
     home_of(reply, home_out)
-}
-
-/// [`authenticate_on`] over a raw `auth_ch` the caller keeps open. For callers not yet on libos; the
-/// typed form is [`authenticate_on`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> Option<usize> {
-    authenticate_on(channel(auth_ch), user, pass, home_out)
 }
 
 /// The home an `Authenticate` reply names, copied into `home_out`; `None` unless AUTHENTICATED with
@@ -85,13 +78,6 @@ pub fn open_views_session<'a>(
     Some((id, 3 + d.len()))
 }
 
-/// [`open_views_session`] over a raw `sup` the caller keeps open. For callers not yet on libos; the
-/// typed form is [`open_views_session`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn views_open_session(sup: u64, principal: &[u8], base_out: &mut [u8; 24]) -> Option<(u64, usize)> {
-    open_views_session(channel(sup), principal, base_out)
-}
-
 /// Tell the view broker that session `id` has ended. **The supervisor's job**: a program in a view
 /// still binds `/dev/views`, so the registration outlives the login.
 pub fn close_views_session<'a>(sup: impl Into<Ref<'a, Channel, Only>>, id: u64) {
@@ -99,12 +85,6 @@ pub fn close_views_session<'a>(sup: impl Into<Ref<'a, Channel, Only>>, id: u64) 
     if let Some(n) = librsproto::views::build_session_id(&mut body, id) {
         let _ = views_call(sup.into(), librsproto::views::OP_VIEWS_CLOSE_SESSION, &body[..n], &mut [0u8; 1]);
     }
-}
-
-/// A raw endpoint the caller keeps open, borrowed for the call.
-fn channel<'a>(raw: u64) -> Ref<'a, Channel, Only> {
-    // SAFETY: the caller's own endpoint, open for the call, as the function always asked.
-    unsafe { Ref::from_raw(RawHandle(raw), Rights::empty()) }
 }
 
 #[cfg(test)]

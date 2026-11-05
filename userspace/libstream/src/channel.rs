@@ -144,49 +144,24 @@ mod io_port {
     use crate::wire::{Result, WireError};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
-    use libkern::{KError, RawHandle, Rights};
+    use libkern::KError;
     use libos::{Carried, Channel, Deadline, Handle, Msg, Only, Ref, WaitSet, block_on};
 
     /// Transport flag in the IPC header's `flags`: the final message of a stream. The
     /// kernel passes `flags` through untouched.
     const MSG_FLAG_LAST: u16 = 1 << 0;
 
-    /// The endpoint a port sends and receives on.
-    enum End {
-        /// One the port owns, closed with it.
-        Owned(Handle<Channel, Only>),
-        /// One its caller owns and keeps open while the port lives.
-        Borrowed(u64),
-    }
-
-    impl End {
-        fn as_ref(&self) -> Ref<'_, Channel, Only> {
-            match self {
-                End::Owned(h) => h.as_ref(),
-                // SAFETY: `IpcPort::new`'s caller keeps the endpoint open while the port lives.
-                End::Borrowed(raw) => unsafe { Ref::from_raw(RawHandle(*raw), Rights::empty()) },
-            }
-        }
-    }
-
     /// A [`MsgPort`] over one IPC channel endpoint, owning a reusable one-page message
     /// buffer. A full ring blocks the send; a closed peer fails it.
     pub struct IpcPort {
-        end: End,
+        end: Handle<Channel, Only>,
         buf: Box<Msg>,
     }
 
     impl IpcPort {
         /// A port that owns `endpoint` and closes it when dropped.
         pub fn owning(endpoint: Handle<Channel, Only>) -> Self {
-            IpcPort { end: End::Owned(endpoint), buf: Box::new(Msg::new()) }
-        }
-
-        /// Wrap a channel-endpoint handle the caller keeps owning: the port closes nothing. For
-        /// callers not yet on libos; the typed form is [`owning`](Self::owning).
-        // TODO(raw-handle-shims): goes when its last caller is on libos.
-        pub fn new(endpoint: u64) -> Self {
-            IpcPort { end: End::Borrowed(endpoint), buf: Box::new(Msg::new()) }
+            IpcPort { end: endpoint, buf: Box::new(Msg::new()) }
         }
 
         /// The endpoint this port sends and receives on.

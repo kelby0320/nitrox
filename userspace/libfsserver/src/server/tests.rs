@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::serve::session_tests::{Never, Spy};
+use libkern::RawHandle;
 use libos::mock;
 use librsproto::error::parse_error;
 use librsproto::meta::{FS_SETUP_READ_ONLY, fs_setup, parse_ready};
@@ -95,28 +96,19 @@ fn a_setup_message_gives_the_device_and_the_flag() {
     }
 }
 
-/// The disk is made over the device the message brought, the typed way owning it and the raw way
-/// handing it over still open.
+/// The disk is made over the device the message brought, and owns it.
 #[test]
 fn a_disk_is_made_over_the_device_the_setup_brought() {
-    let setup = || {
-        let (control, supervisor) = pair();
-        let device = mock::with_rights(mock::device(), Rights::READ | Rights::WRITE | Rights::TRANSFER);
-        let mut sent = Carried::new();
-        sent.push(own::<Resource, ReadWrite>(device)).ok().unwrap();
-        send(&supervisor, &[FS_SETUP_READ_ONLY], &mut sent);
-        (control, supervisor)
-    };
-    let (control, _supervisor) = setup();
+    let (control, supervisor) = pair();
+    let device = mock::with_rights(mock::device(), Rights::READ | Rights::WRITE | Rights::TRANSFER);
+    let mut sent = Carried::new();
+    sent.push(own::<Resource, ReadWrite>(device)).ok().unwrap();
+    send(&supervisor, &[FS_SETUP_READ_ONLY], &mut sent);
     let (got, read_only) = open_disk(&control, Ok);
     let raw = got.raw().0;
     assert!(read_only && mock::is_open(raw));
     drop(got);
-    assert!(!mock::is_open(raw), "the typed disk owns its device");
-
-    let (control, _supervisor) = setup();
-    let (raw, read_only) = bootstrap(control.raw().0, Ok);
-    assert!(read_only && mock::is_open(raw), "the raw one is handed it open");
+    assert!(!mock::is_open(raw), "the disk owns its device");
 }
 
 #[test]

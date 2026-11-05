@@ -34,7 +34,7 @@ floor; the setup message is opt-in.
   and every existing service/leaf-shell stay here **unchanged**. Selected by
   `arg0 == 0` — the value every current spawner already passes.
 - **Tier 1 — register + one setup recv (opt-in).** A stage calls
-  `libos::bootstrap().setup()`, which receives + parses the setup message on its
+  `libstream::setup::receive_setup`, which receives + parses the setup message on its
   bootstrap endpoint. The parent sends it before/as the stage starts, so the recv is
   normally **pre-queued and non-blocking**.
 
@@ -104,7 +104,7 @@ message is one structured value, not a data stream:
 | `terminal` | `Int` | Non-zero: a **terminal channel** follows the stream handles. Absent or zero: none. |
 
 The exact record schema is pinned in `libstream::setup` (the sender, `send_stage_setup`) and
-consumed by `bootstrap().setup()` (the receiver). **The handles a sender gives are gone on every
+consumed by `receive_setup` (the receiver). **The handles a sender gives are gone on every
 return**: moved by a send the kernel took, or closed by `send_stage_setup` when the message could
 not be made or the kernel refused it. A sender never closes one, so none is closed twice and none is left open.
 
