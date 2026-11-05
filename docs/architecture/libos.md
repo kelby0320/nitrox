@@ -88,7 +88,7 @@ gives one out once.
 | `thread` | `Stack`, `start` and `start_on`, a mask of CPUs, the calling thread's `exit`, and a thread suspended on a fault: its `fault_registers`, and `settle`, to resume it or end it |
 | `time` | `now`, `wall`, `sleep`, `sleep_until`, `Deadline`, and a `Timer`'s `create`, `set` and `disarm` |
 | `log` | `write`, and `Line`, one write a line |
-| `entropy` | `fill`, and `try_fill` for a caller that cannot wait for the seeding |
+| `entropy` | `fill`, and `try_fill` for a caller that cannot wait for the seeding, from a source made for the call or from a `Source`, made here or handed over by `/dev/entropy`, read as often as wanted |
 | `boot` | `Start`: `_start`'s four registers, owned and typed |
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
 | `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |
