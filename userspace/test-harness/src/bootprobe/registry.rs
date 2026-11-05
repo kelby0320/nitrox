@@ -4,8 +4,7 @@ use super::*;
 
 /// **Wait `ns`**, in a wait on no handles, which the kernel never refuses.
 pub(super) fn nap(ns: u64) {
-    // SAFETY: no handles and no results, so the kernel reads and writes neither.
-    unsafe { syscall4(SYS_WAIT, 0, 0, 0, clock_ns().saturating_add(ns)) };
+    time::sleep_until(Deadline::at(clock_ns().saturating_add(ns)));
 }
 
 /// **The device registry, through its binding.** The kernel's host tests see its table as a
@@ -25,15 +24,14 @@ pub(super) fn nap(ns: u64) {
 ///   PCI function of class `0c/03/30` claimed by `xhci`, with a port, a speed and a name, which no
 ///   other kind carries. Each is printed, for `test-qemu` to hold to what QEMU attached: the
 ///   kernel's own line says a device was enumerated, and only this says the table got it.
-pub(super) fn registry_test(root_ns: u64) -> bool {
+pub(super) fn registry_test(root: Root<'_>) -> bool {
     use libkern::device::DeviceKind;
-    use libkern::{RIGHT_INSPECT, RIGHT_READ};
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: registry: ").s(what).s(b" FAIL").end();
         false
     };
 
-    let Some(all) = registry_records(root_ns) else {
+    let Some(all) = registry_records(root) else {
         return fail(b"no /dev/registry in the root namespace that reads");
     };
     let total = all.len();
@@ -63,8 +61,7 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
                 _ => None,
             };
             for p in core::iter::once(path.clone()).chain(served) {
-                let (st, h) = ns_lookup(root_ns, p.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
-                close(h);
+                let st = status(&lookup::<Resource, ReadOnly, _>(root, &p, Rights::READ | Rights::INSPECT));
                 if st != libkern::KError::NotFound.as_i32() {
                     Line::new()
                         .s(b"boot-probe: registry: departed ")
@@ -78,9 +75,9 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
             Line::new().s(b"boot-probe: registry: record ").u(r.id as u64).s(b" departed, its paths refused").end();
             continue;
         }
-        let (st, node) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
-        let kind_ok = st == 0 && stat(node).is_some_and(|i| i.object_type == libkern::KObjectType::DeviceNode as u32);
-        close(node);
+        let node = lookup::<Resource, ReadOnly, _>(root, &path, Rights::READ | Rights::INSPECT);
+        let kind_ok =
+            node.is_ok_and(|n| n.stat().is_ok_and(|i| i.object_type == libkern::KObjectType::DeviceNode as u32));
         if !kind_ok {
             Line::new().s(b"boot-probe: registry: ").s(path.as_bytes()).s(b" is not a device node").end();
             return fail(b"a record's id does not resolve to its node");
@@ -89,18 +86,19 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
             DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk => {
                 blocks += 1;
                 let dev = alloc::format!("/dev/blk/{}", r.served);
-                let (st, h) = ns_lookup(root_ns, dev.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
-                let size = if st == 0 { stat(h).map(|i| i.size) } else { None };
-                close(h);
+                let size = lookup::<Resource, ReadOnly, _>(root, &dev, Rights::READ | Rights::INSPECT)
+                    .ok()
+                    .and_then(|h| h.stat().ok())
+                    .map(|i| i.size);
                 let want = r.logical_block_size as u64 * r.block_count;
                 if size != Some(want) {
                     Line::new().s(b"boot-probe: registry: ").s(dev.as_bytes()).s(b" is not the record's size").end();
                     return fail(b"a block record's served index names another device");
                 }
                 let info_path = alloc::format!("/dev/blk/{}/info", r.served);
-                let (st, ih) = ns_lookup(root_ns, info_path.as_bytes(), RIGHT_MAP_READ | RIGHT_INSPECT);
-                let info = if st == 0 { read_all(ih) } else { None };
-                close(ih);
+                let info = lookup::<File, MapRead, _>(root, &info_path, Rights::MAP_READ | Rights::INSPECT)
+                    .ok()
+                    .and_then(|ih| read_all(&ih));
                 // `BlockDeviceInfo`: `name_len` at 16, `name` from 24.
                 let named = info.is_some_and(|b| {
                     let n = u32::from_le_bytes([b[16], b[17], b[18], b[19]]) as usize;
@@ -138,9 +136,7 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
             }
             DeviceKind::Keyboard | DeviceKind::Mouse => {
                 let raw = alloc::format!("/dev/input/raw/{}", r.served);
-                let (st, h) = ns_lookup(root_ns, raw.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
-                close(h);
-                if st != 0 {
+                if lookup::<Resource, ReadOnly, _>(root, &raw, Rights::READ | Rights::INSPECT).is_err() {
                     return fail(b"an input record is not at its raw index");
                 }
                 if r.driver() == b"usb-hid" {
@@ -209,9 +205,7 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
     let mut probed = 0u32;
     loop {
         let dev = alloc::format!("/dev/blk/{probed}");
-        let (st, h) = ns_lookup(root_ns, dev.as_bytes(), RIGHT_READ | RIGHT_INSPECT);
-        close(h);
-        if st != 0 {
+        if lookup::<Resource, ReadOnly, _>(root, &dev, Rights::READ | Rights::INSPECT).is_err() {
             break;
         }
         probed += 1;
@@ -247,24 +241,19 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
     // (`io-operation.md`'s rule, which the manager's eight-byte reads never test). Asked past
     // generation 0, so a node that took it would answer at once rather than keep one of the
     // four places a waiting read has.
-    let (st, changes) = ns_lookup(root_ns, b"/dev/registry/changes", RIGHT_READ);
-    if st != 0 || changes == 0 {
+    let Ok(changes) = lookup::<Resource, ReadOnly, _>(root, "/dev/registry/changes", Rights::READ) else {
         return fail(b"/dev/registry/changes does not open");
-    }
-    // SAFETY: register-only syscall.
-    let page = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }.max(0) as u64;
-    let short = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: page, buf_offset: 0, offset: 0, length: 7 };
-    // SAFETY: a valid `IoOp`; `changes` and `page` are handles this process holds.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, changes, (&short as *const IoOp) as u64) };
-    close(changes);
-    if page != 0 {
-        close(page);
-    }
-    if po != libkern::KError::InvalidArgument.as_i32() as i64 {
-        if po > 0 {
-            close(po as u64);
-        }
-        Line::new().s(b"boot-probe: registry: a seven-byte read of /dev/registry/changes gave ").i(po).end();
+    };
+    let page = Handle::<Memory, MapReadWrite>::create(PAGE as usize);
+    let short = match &page {
+        Ok(page) => block_on(changes.read(page, 0, 0, 7)),
+        Err(e) => Err(*e),
+    };
+    drop(changes);
+    drop(page);
+    if !matches!(&short, Err(e) if e.code() == libkern::KError::InvalidArgument) {
+        let gave = short.map_or_else(|e| i64::from(e.code().as_i32()), |n| n as i64);
+        Line::new().s(b"boot-probe: registry: a seven-byte read of /dev/registry/changes gave ").i(gave).end();
         return fail(b"/dev/registry/changes did not refuse a read shorter than its answer");
     }
     Line::new()
@@ -290,19 +279,18 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
 /// - **the info-only endpoint answers the tables and nothing else**: `block` and
 ///   another `info-endpoint` are `NotFound` on it, where the root endpoint subscribes and mints,
 ///   and `info` opens the directory.
-pub(super) fn devices_test(root_ns: u64) -> bool {
+pub(super) fn devices_test(root: Root<'_>) -> bool {
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: devices: ").s(what).s(b" FAIL").end();
         false
     };
-    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
+    let chan = Rights::SEND | Rights::RECV | Rights::WAIT;
 
     // **`block` has its owner from boot on**: `service-mgr` spawns the storage service straight
     // after the manager and waits for its `Ready`, which comes only after it has subscribed and
     // settled. Taking the class here would take the disks from their owner; that the replay
     // reaches it is `storage_test`'s: a row per block record.
-    let (st, block) = ns_lookup(root_ns, b"/svc/devices/block", chan);
-    close(block);
+    let st = status(&lookup::<Channel, Only, _>(root, "/svc/devices/block", chan));
     if st != libkern::KError::AlreadyExists.as_i32() {
         Line::new().s(b"boot-probe: devices: a subscription to block answered ").i(st as i64).end();
         return fail(b"block is not held, so the storage service did not take the disks");
@@ -310,8 +298,7 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
 
     // `input` has its owner from boot on: `init` waits for `input-server`'s `Ready`, which comes
     // only after it has subscribed and settled.
-    let (st, input) = ns_lookup(root_ns, b"/svc/devices/input", chan);
-    close(input);
+    let st = status(&lookup::<Channel, Only, _>(root, "/svc/devices/input", chan));
     if st != libkern::KError::AlreadyExists.as_i32() {
         Line::new().s(b"boot-probe: devices: a subscription to input answered ").i(st as i64).end();
         return fail(b"input is not held, so input-server did not take its devices from the manager");
@@ -322,19 +309,18 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
     // would take `block` as a subscription to every disk. The probe cannot bind (no syscaps), but
     // the manager answers whatever resolve arrives on the channel, so the probe sends the
     // resolves a namespace would forward.
-    let (st, endpoint) = ns_lookup(root_ns, b"/svc/devices/info-endpoint", chan);
-    if st != 0 || endpoint == 0 {
+    let Ok(endpoint) = lookup::<Channel, Only, _>(root, "/svc/devices/info-endpoint", chan) else {
         return fail(b"no info-only endpoint at /svc/devices/info-endpoint");
-    }
+    };
     let forward = |request_id: u64, suffix: &[u8]| -> Option<Received> {
         let mut body = [0u8; 64];
-        let n = librsproto::namespace::resolve_request(&mut body, chan, 0, suffix)?;
-        if !rs_send(endpoint, librsproto::OP_NS_RESOLVE, request_id, &body[..n], &[]) {
+        let n = librsproto::namespace::resolve_request(&mut body, chan.bits(), 0, suffix)?;
+        if !rs_send(&endpoint, librsproto::OP_NS_RESOLVE, request_id, &body[..n], Carried::new()) {
             return None;
         }
         let deadline = clock_ns() + 5_000_000_000;
         loop {
-            let m = receive(endpoint, deadline)?;
+            let m = receive(&endpoint, deadline)?;
             if m.request_id == request_id {
                 return Some(m);
             }
@@ -351,7 +337,7 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
     let block = forward(1, b"block");
     let minted = forward(2, b"info-endpoint");
     let listing = forward(3, b"info");
-    close(endpoint);
+    drop(endpoint);
     if !refused(&block) {
         return fail(b"the info-only endpoint answered `block` as something other than NotFound");
     }
@@ -371,13 +357,12 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
     let usb = |r: &libkern::device::DeviceRecord| r.kind() == libkern::device::DeviceKind::UsbDevice;
     let mut attempts = 0u32;
     let (rows, usb_named, departed) = loop {
-        let Some(registry) = registry_records(root_ns) else {
+        let Some(registry) = registry_records(root) else {
             return fail(b"the registry does not read");
         };
-        let present: alloc::vec::Vec<&libkern::device::DeviceRecord> =
-            registry.iter().filter(|r| !r.is_departed()).collect();
-        let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-        let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/devices/info", &mut dirbuf) else {
+        let present: Vec<&libkern::device::DeviceRecord> = registry.iter().filter(|r| !r.is_departed()).collect();
+        let mut dirmsg = Msg::new();
+        let Ok(mut dir) = librsproto::session::Dir::resolve(root, "/svc/devices/info", &mut dirmsg) else {
             return fail(b"/svc/devices/info is not a directory");
         };
         let (mut names, mut has_all, mut usb_named, mut departed_named) = (0usize, false, 0usize, false);
@@ -403,9 +388,9 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
         if listed.is_err() {
             return fail(b"the directory would not list");
         }
-        let (st, table) = ns_lookup(root_ns, b"/svc/devices/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
-        let tbytes = if st == 0 { read_all(table) } else { None };
-        close(table);
+        let tbytes = lookup::<File, MapRead, _>(root, "/svc/devices/info/all.tsm", Rights::MAP_READ | Rights::INSPECT)
+            .ok()
+            .and_then(|table| read_all(&table));
         // The object is page-sized; the decoder stops at the table's terminator.
         let rows = tbytes.and_then(|b| libstream::wire::Table::decode(&b).ok()).map(|t| t.rows.len());
         let present_usb = present.iter().filter(|r| usb(r)).count();
@@ -441,13 +426,12 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
     };
     // **And a listed USB device's file is its table**: one row, named `usb-<id>`,
     // of kind `usb`, driven by `xhci`. The listing alone says only that a name was made.
-    let now = registry_records(root_ns).unwrap_or_default();
+    let now = registry_records(root).unwrap_or_default();
     if let Some(r) = now.iter().find(|r| usb(r) && !r.is_departed()) {
         let name = alloc::format!("usb-{}", r.id);
         let path = alloc::format!("/svc/devices/info/{name}.tsm");
-        let (st, h) = ns_lookup(root_ns, path.as_bytes(), RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
-        let bytes = if st == 0 { read_all(h) } else { None };
-        close(h);
+        let bytes =
+            lookup::<File, MapRead, _>(root, &path, Rights::MAP_READ | Rights::INSPECT).ok().and_then(|h| read_all(&h));
         let row = bytes
             .and_then(|b| libstream::wire::Table::decode(&b).ok())
             .and_then(|mut t| (t.rows.len() == 1).then(|| t.rows.remove(0)));
@@ -494,17 +478,15 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
 ///
 /// Each holds on every machine this runs on, which is every `--selftest` gate's, so none names a
 /// device by position: the scratch disk by its label, the root's by what is mounted at `/`.
-pub(super) fn io_counters_test(root_ns: u64) -> bool {
-    use libkern::SYS_FILE_CREATE;
+pub(super) fn io_counters_test(root: Root<'_>) -> bool {
     use libstream::wire::{Table, Value};
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: io counters: ").s(what).s(b" FAIL").end();
         false
     };
-    let table = |path: &[u8]| {
-        let (st, h) = ns_lookup(root_ns, path, RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
-        let bytes = if st == 0 { read_all(h) } else { None };
-        close(h);
+    let table = |path: &str| {
+        let bytes =
+            lookup::<File, MapRead, _>(root, path, Rights::MAP_READ | Rights::INSPECT).ok().and_then(|h| read_all(&h));
         bytes.and_then(|b| Table::decode(&b).ok())
     };
     let col = |t: &Table, name: &str| t.schema.fields.iter().position(|f| f.name == name);
@@ -521,7 +503,7 @@ pub(super) fn io_counters_test(root_ns: u64) -> bool {
     };
 
     // The scratch disk by its label, and the disk the root is on by what is mounted at `/`.
-    let (Some(storage), Some(devices)) = (table(b"/svc/storage/info/all.tsm"), table(b"/svc/devices/info/all.tsm"))
+    let (Some(storage), Some(devices)) = (table("/svc/storage/info/all.tsm"), table("/svc/devices/info/all.tsm"))
     else {
         return fail(b"the storage or device table would not read");
     };
@@ -530,12 +512,12 @@ pub(super) fn io_counters_test(root_ns: u64) -> bool {
             .find(|&r| text(cell(&storage, r, column)).as_deref() == Some(value))
             .and_then(|r| text(cell(&storage, r, "name")))
     };
-    let (Some(scratch), Some(root)) = (named_where("label", "nitrox-scratch"), named_where("mounted", "/")) else {
+    let (Some(scratch), Some(root_name)) = (named_where("label", "nitrox-scratch"), named_where("mounted", "/")) else {
         return fail(b"the storage table has no scratch disk or root");
     };
-    let root_disk = match row_named(&devices, &root) {
+    let root_disk = match row_named(&devices, &root_name) {
         Some(r) if text(cell(&devices, r, "kind")).as_deref() == Some("partition") => text(cell(&devices, r, "parent")),
-        Some(_) => Some(root.clone()),
+        Some(_) => Some(root_name.clone()),
         None => None,
     };
     let Some(root_disk) = root_disk else {
@@ -545,31 +527,33 @@ pub(super) fn io_counters_test(root_ns: u64) -> bool {
         .filter(|&r| matches!(text(cell(&devices, r, "kind")).as_deref(), Some("disk") | Some("ramdisk")))
         .count();
 
-    let Some(before) = table(b"/svc/devices/info/io.tsm") else {
+    let Some(before) = table("/svc/devices/info/io.tsm") else {
         return fail(b"io.tsm would not read");
     };
     const PAGES: u64 = 64;
     let len = PAGES * PAGE;
-    let Some(fh) = file_resize(SYS_FILE_CREATE, root_ns, b"/svc/storage/fs/nitrox-scratch/probe-io", len) else {
+    let Ok(fh) = block_on(fs::create::<_, MapReadWrite>(root, "/svc/storage/fs/nitrox-scratch/probe-io", len, RW))
+    else {
         return fail(b"a file would not create on the scratch disk");
     };
-    let Some(addr) = map_file(fh, len, RIGHT_MAP_READ | RIGHT_MAP_WRITE) else {
-        close(fh);
+    let Ok(mut mapped) = fh.map(len as usize) else {
         return fail(b"the file would not map writable");
     };
-    for i in 0..len {
-        // SAFETY: `len` bytes are mapped writable at `addr`.
-        unsafe { ((addr + i) as *mut u8).write_volatile((i % 251) as u8) };
+    let mut chunk = [0u8; PAGE as usize];
+    for p in 0..PAGES {
+        for (i, b) in chunk.iter_mut().enumerate() {
+            *b = ((p * PAGE + i as u64) % 251) as u8;
+        }
+        let _ = mapped.write_from((p * PAGE) as usize, &chunk);
     }
-    // SAFETY: unmapping this call's own mapping, before the sync, as `libfs` does.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, len) };
-    // SAFETY: register-only syscall on a file handle this process holds.
-    let synced = unsafe { syscall1(SYS_FILE_SYNC, fh) };
-    close(fh);
-    if synced != 0 {
+    // Unmapped before the sync, as `libfs` does.
+    drop(mapped);
+    let synced = block_on(fs::flush(&fh));
+    drop(fh);
+    if synced.is_err() {
         return fail(b"the file would not sync");
     }
-    let Some(after) = table(b"/svc/devices/info/io.tsm") else {
+    let Some(after) = table("/svc/devices/info/io.tsm") else {
         return fail(b"io.tsm would not read after the sync");
     };
     let moved = |name: &str, column: &str| Some(num(&after, name, column)?.saturating_sub(num(&before, name, column)?));
@@ -611,26 +595,20 @@ pub(super) fn io_counters_test(root_ns: u64) -> bool {
 
     // The file the build wrote, read through a mapping: nothing has opened it, so each page comes
     // from the device, a fill and the pages it reads ahead an IRP.
-    let (st, ah) = ns_lookup(root_ns, b"/svc/storage/fs/nitrox-scratch/ahead", RIGHT_MAP_READ);
-    if st != 0 {
-        close(ah);
+    let Ok(ah) = lookup::<File, MapRead, _>(root, "/svc/storage/fs/nitrox-scratch/ahead", Rights::MAP_READ) else {
         return fail(b"the build's file would not open");
-    }
-    let Some(at) = map_file(ah, len, RIGHT_MAP_READ) else {
-        close(ah);
+    };
+    let Ok(at) = ah.map(len as usize) else {
         return fail(b"the build's file would not map");
     };
     let mut wrong = 0u64;
-    for i in 0..len {
-        // SAFETY: `len` bytes are mapped readable at `at`.
-        if unsafe { ((at + i) as *const u8).read_volatile() } != (i % 251) as u8 {
-            wrong += 1;
-        }
+    for p in 0..PAGES {
+        let _ = at.read_into((p * PAGE) as usize, &mut chunk);
+        wrong += chunk.iter().enumerate().filter(|&(i, &b)| b != ((p * PAGE + i as u64) % 251) as u8).count() as u64;
     }
-    // SAFETY: unmapping this call's own mapping.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, at, len) };
-    close(ah);
-    let Some(read) = table(b"/svc/devices/info/io.tsm") else {
+    drop(at);
+    drop(ah);
+    let Some(read) = table("/svc/devices/info/io.tsm") else {
         return fail(b"io.tsm would not read after the read-back");
     };
     let since = |name: &str, column: &str| Some(num(&read, name, column)?.saturating_sub(num(&after, name, column)?));

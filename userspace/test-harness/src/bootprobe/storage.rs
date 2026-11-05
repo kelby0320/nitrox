@@ -16,21 +16,14 @@ use super::*;
 ///    The same file and the same table come back. Bound with no base, it will not mint another
 ///    endpoint.
 /// 4. A label nothing is mounted under is `NotFound`.
-pub(super) fn storage_mount_test(root_ns: u64) -> bool {
-    use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
+pub(super) fn storage_mount_test(root: Root<'_>) -> bool {
+    use libkern::KError;
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: storage mount: ").s(what).s(b" FAIL").end();
         false
     };
-    let read = |ns: u64, path: &[u8]| {
-        let (st, h) = ns_lookup(ns, path, RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
-        let bytes = if st == 0 { read_all(h) } else { None };
-        close(h);
-        bytes
-    };
-
-    let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs", &mut dirbuf) else {
+    let mut dirmsg = Msg::new();
+    let Ok(mut dir) = librsproto::session::Dir::resolve(root, "/svc/storage/fs", &mut dirmsg) else {
         return fail(b"/svc/storage/fs is not a directory");
     };
     let mut listed_dir = false;
@@ -48,34 +41,29 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
         return fail(b"/svc/storage/fs is not the one directory nitrox-scratch");
     }
 
-    if read(root_ns, b"/svc/storage/fs/nitrox-scratch/README").as_deref() != Some(SCRATCH_README) {
+    if read_path(root, "/svc/storage/fs/nitrox-scratch/README").as_deref() != Some(SCRATCH_README) {
         return fail(b"the scratch disk's README did not read through /svc/storage");
     }
 
     const LEN: u64 = 3 * PAGE + 100;
-    let path = b"/svc/storage/fs/nitrox-scratch/probe-write";
-    let Some(fh) = file_resize(SYS_FILE_CREATE, root_ns, path, LEN) else {
+    let path = "/svc/storage/fs/nitrox-scratch/probe-write";
+    let Ok(fh) = block_on(fs::create::<_, MapReadWrite>(root, path, LEN, RW)) else {
         return fail(b"a file would not create through /svc/storage");
     };
-    let Some(addr) = map_file(fh, LEN, RIGHT_MAP_READ | RIGHT_MAP_WRITE) else {
-        close(fh);
+    let Ok(mut mapped) = fh.map(LEN as usize) else {
         return fail(b"the created file would not map writable");
     };
     let pattern = |i: u64| (i * 7 + 3) as u8;
-    for i in 0..LEN {
-        // SAFETY: `LEN` bytes are mapped writable at `addr`.
-        unsafe { ((addr + i) as *mut u8).write_volatile(pattern(i)) };
-    }
+    let bytes: Vec<u8> = (0..LEN).map(pattern).collect();
+    let _ = mapped.write_from(0, &bytes);
     // Unmapped before the sync, as `libfs` does, so the write-back can leave the file clean.
-    // SAFETY: unmapping this call's own mapping.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, LEN) };
-    // SAFETY: register-only syscall on a file handle this process holds.
-    let synced = unsafe { syscall1(SYS_FILE_SYNC, fh) };
-    close(fh);
-    if synced != 0 {
+    drop(mapped);
+    let synced = block_on(fs::flush(&fh));
+    drop(fh);
+    if synced.is_err() {
         return fail(b"the file made through /svc/storage would not sync");
     }
-    let Some(t) = read(root_ns, b"/svc/storage/info/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok())
+    let Some(t) = read_path(root, "/svc/storage/info/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok())
     else {
         return fail(b"all.tsm would not read");
     };
@@ -89,55 +77,34 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
             _ => None,
         })
     });
-    let Some(raw) = device.and_then(|p| RootDevice::on(root_ns, p.as_bytes())) else {
+    let Some(raw) = device.and_then(|p| RootDevice::on(root, &p)) else {
         return fail(b"the scratch disk's device would not open raw");
     };
-    let want: alloc::vec::Vec<u8> = (0..LEN).map(pattern).collect();
-    if raw.read_file(b"/probe-write", 0, LEN as usize).as_deref() != Some(&want[..]) {
+    if raw.read_file(b"/probe-write", 0, LEN as usize).as_deref() != Some(&bytes[..]) {
         return fail(b"what was written through /svc/storage is not on the device");
     }
     drop(raw);
 
     // 4. A session endpoint, bound as a supervisor will bind it.
-    let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT | libkern::RIGHT_DUPLICATE;
-    let (st, endpoint) = ns_lookup(root_ns, b"/svc/storage/session-endpoint", chan);
-    if st != 0 || endpoint == 0 {
+    let chan = Rights::SEND | Rights::RECV | Rights::WAIT | Rights::DUPLICATE;
+    let Ok(endpoint) = lookup::<Channel, Only, _>(root, "/svc/storage/session-endpoint", chan) else {
         return fail(b"no session endpoint at /svc/storage/session-endpoint");
-    }
-    // SAFETY: register-only syscall (its argument is unused); returns a fresh namespace handle.
-    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
-    if ns <= 0 {
-        close(endpoint);
-        return fail(b"no namespace to bind the session endpoint into");
-    }
-    let ns = ns as u64;
-    let bind = |at: &[u8], base: &[u8]| {
-        // SAFETY: a namespace this process created, valid path and base, an endpoint it holds.
-        let r = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                at.as_ptr() as u64,
-                at.len() as u64,
-                endpoint,
-                base.as_ptr() as u64,
-                base.len() as u64,
-            )
-        };
-        r == 0
     };
-    let bound = bind(b"/storage", b"/fs") && bind(b"/dev/storage", b"/info") && bind(b"/raw", b"");
-    close(endpoint);
+    let Ok(ns) = Handle::<Namespace, NsMutable>::create() else {
+        return fail(b"no namespace to bind the session endpoint into");
+    };
+    let bind = |at: &str, base: &str| ns.bind_server(at, endpoint.as_ref(), base).is_ok();
+    let bound = bind("/storage", "/fs") && bind("/dev/storage", "/info") && bind("/raw", "");
+    drop(endpoint);
     if !bound {
-        close(ns);
         return fail(b"the session endpoint would not bind as a supervisor binds it");
     }
-    let readme = read(ns, b"/storage/nitrox-scratch/README");
-    let rows =
-        read(ns, b"/dev/storage/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok()).map(|t| t.rows.len());
-    let (minted, other) = ns_lookup(ns, b"/raw/session-endpoint", chan);
-    close(other);
-    close(ns);
+    let readme = read_path(&ns, "/storage/nitrox-scratch/README");
+    let rows = read_path(&ns, "/dev/storage/all.tsm")
+        .and_then(|b| libstream::wire::Table::decode(&b).ok())
+        .map(|t| t.rows.len());
+    let minted = status(&lookup::<Channel, Only, _>(&ns, "/raw/session-endpoint", chan));
+    drop(ns);
     if readme.as_deref() != Some(SCRATCH_README) {
         return fail(b"/storage/nitrox-scratch/README did not read through a session endpoint");
     }
@@ -148,12 +115,11 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
         return fail(b"a session endpoint minted another");
     }
 
-    let (st, h) = ns_lookup(root_ns, b"/svc/storage/fs/no-such-label/README", RIGHT_MAP_READ);
-    close(h);
+    let st = status(&lookup::<File, MapRead, _>(root, "/svc/storage/fs/no-such-label/README", Rights::MAP_READ));
     if st != KError::NotFound.as_i32() {
         return fail(b"a label nothing is mounted under was not NotFound");
     }
-    kprint(b"boot-probe: storage mount: nitrox-scratch listed, its README read and a new file written to the device through /svc/storage, the same through a session endpoint bound at /storage and /dev/storage, which minted nothing, and an unknown label NotFound ok\n");
+    log::write(b"boot-probe: storage mount: nitrox-scratch listed, its README read and a new file written to the device through /svc/storage, the same through a session endpoint bound at /storage and /dev/storage, which minted nothing, and an unknown label NotFound ok\n");
     true
 }
 
@@ -162,16 +128,15 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
 /// scratch disk and listed through a session, as `list` and `copy` list one. A reply sized by the
 /// page rather than by what a message carries is one the kernel refuses, the server never knows,
 /// and the client waits for good — here, `test-qemu` timing out at this step.
-pub(super) fn long_listing_test(root_ns: u64) -> bool {
-    use libkern::SYS_FILE_CREATE;
+pub(super) fn long_listing_test(root: Root<'_>) -> bool {
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: long listing: ").s(what).s(b" FAIL").end();
         false
     };
     const FILES: usize = 200;
     const PREFIX: &str = "a-name-long-enough-to-fill-a-listing-page-";
-    let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-    let Ok(mut scratch) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs/nitrox-scratch", &mut buf) else {
+    let mut msg = Msg::new();
+    let Ok(mut scratch) = librsproto::session::Dir::resolve(root, "/svc/storage/fs/nitrox-scratch", &mut msg) else {
         return fail(b"the scratch disk would not open as a directory");
     };
     let made = scratch.mkdir(b"probe-many");
@@ -181,12 +146,11 @@ pub(super) fn long_listing_test(root_ns: u64) -> bool {
     }
     for i in 0..FILES {
         let path = alloc::format!("/svc/storage/fs/nitrox-scratch/probe-many/{PREFIX}{i:03}");
-        let Some(h) = file_resize(SYS_FILE_CREATE, root_ns, path.as_bytes(), 0) else {
+        if block_on(fs::create::<_, MapReadWrite>(root, &path, 0, RW)).is_err() {
             return fail(b"a file would not create in probe-many");
-        };
-        close(h);
+        }
     }
-    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs/nitrox-scratch/probe-many", &mut buf)
+    let Ok(mut dir) = librsproto::session::Dir::resolve(root, "/svc/storage/fs/nitrox-scratch/probe-many", &mut msg)
     else {
         return fail(b"probe-many would not open as a directory");
     };
@@ -227,13 +191,13 @@ const PAST_TWO_TIB_BLOCK: u64 = (1 << 32) + 7;
 /// written through its node past 2 TiB — where a ten-byte command's block number would wrap — and
 /// read back, the page cleared between. **On a machine with no such disk it says so and passes**:
 /// every `--selftest` gate runs this, and only `test-qemu` attaches one, which holds this line.
-pub(super) fn past_two_tib_test(root_ns: u64) -> bool {
+pub(super) fn past_two_tib_test(root: Root<'_>) -> bool {
     use libkern::device::DeviceKind;
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: past 2 TiB: ").s(what).s(b" FAIL").end();
         false
     };
-    let Some(all) = registry_records(root_ns) else {
+    let Some(all) = registry_records(root) else {
         return fail(b"the registry does not read");
     };
     let Some(r) = all.iter().find(|r| {
@@ -242,63 +206,34 @@ pub(super) fn past_two_tib_test(root_ns: u64) -> bool {
             && r.driver() == b"usb-storage"
             && r.block_count > u32::MAX as u64
     }) else {
-        kprint(b"boot-probe: past 2 TiB: no USB disk of more than 2^32 blocks here; test-qemu attaches one\n");
+        log::write(b"boot-probe: past 2 TiB: no USB disk of more than 2^32 blocks here; test-qemu attaches one\n");
         return true;
     };
     let path = alloc::format!("/dev/blk/{}", r.served);
-    let (st, dev) = ns_lookup(root_ns, path.as_bytes(), libkern::RIGHT_READ | libkern::RIGHT_WRITE);
-    if st != 0 || dev == 0 {
+    let Ok(dev) = lookup::<Resource, ReadWrite, _>(root, &path, Rights::READ | Rights::WRITE) else {
         return fail(b"its node would not open writable");
-    }
-    // SAFETY: register-only syscall.
-    let page = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    let addr = if page > 0 {
-        // SAFETY: `page` is a memory object we just created; the result is checked below
-        unsafe { syscall4(SYS_MEMORY_MAP, page as u64, 0, PAGE, RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) }
-    } else {
-        -1
     };
-    if addr <= 0 {
-        close(dev);
-        if page > 0 {
-            close(page as u64);
-        }
+    let Ok(page) = Handle::<Memory, MapReadWrite>::create(PAGE as usize) else {
         return fail(b"no page to move it through");
-    }
-    let (page, addr) = (page as u64, addr as u64);
-    let want: alloc::vec::Vec<u8> = (0..512u32)
+    };
+    let Ok(mut mapped) = page.map(PAGE as usize) else {
+        return fail(b"no page to move it through");
+    };
+    let want: Vec<u8> = (0..512u32)
         .map(|i| if (i as usize) < PAST_TWO_TIB.len() { PAST_TWO_TIB[i as usize] } else { (i * 31 + 7) as u8 })
         .collect();
-    let io = |opcode: u32| {
-        let op = IoOp { opcode, flags: 0, buffer: page, buf_offset: 0, offset: PAST_TWO_TIB_BLOCK * 512, length: 512 };
-        // SAFETY: a valid `IoOp`; `dev` and `page` are handles this process holds.
-        let po = unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) };
-        po > 0 && po_wait(po as u64) == (0, 512)
-    };
-    {
-        // SAFETY: `addr` maps PAGE writable bytes, 512 are written, and no device is using the
-        // page: this slice is dead before the write is submitted.
-        let buf = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 512) };
-        buf.copy_from_slice(&want);
-    }
-    let wrote = io(libkern::abi::IO_OPCODE_WRITE);
-    {
-        // SAFETY: as above; the write has completed, and this slice is dead before the read is
-        // submitted.
-        let buf = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 512) };
-        buf.fill(0);
-    }
-    let read = wrote && io(IO_OPCODE_READ);
+    let at = PAST_TWO_TIB_BLOCK * 512;
+    let _ = mapped.write_from(0, &want);
+    let wrote = block_on(dev.write(&page, 0, at, 512)) == Ok(512);
+    let _ = mapped.fill(0, 512, 0);
+    let read = wrote && block_on(dev.read(&page, 0, at, 512)) == Ok(512);
     let same = read && {
-        // SAFETY: `addr` maps PAGE bytes; the read has completed, so the device writes the page
-        // no more and this slice is made only now.
-        let got = unsafe { core::slice::from_raw_parts(addr as *const u8, 512) };
-        got == &want[..]
+        let mut got = [0u8; 512];
+        mapped.read_into(0, &mut got).is_ok() && got == want[..]
     };
-    // SAFETY: unmapping this call's own mapping.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, addr, PAGE) };
-    close(page);
-    close(dev);
+    drop(mapped);
+    drop(page);
+    drop(dev);
     if !wrote {
         return fail(b"the write past 2 TiB failed");
     }
@@ -325,7 +260,7 @@ pub(super) fn past_two_tib_test(root_ns: u64) -> bool {
 ///   twice. The service mounts nothing on a boot with nothing to mount: the ESP is FAT, which it
 ///   recognises and does not serve, and the disk holds only its table.
 /// - What each device holds is what the image builder put there, read off the disks on a boot.
-pub(super) fn storage_test(root_ns: u64) -> bool {
+pub(super) fn storage_test(root: Root<'_>) -> bool {
     use alloc::string::String;
     use libkern::device::{DeviceKind, DeviceRecord};
     use libstream::wire::Value;
@@ -333,14 +268,11 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
         Line::new().s(b"boot-probe: storage: ").s(what).s(b" FAIL").end();
         false
     };
-    let Some(registry) = registry_records(root_ns) else {
+    let Some(registry) = registry_records(root) else {
         return fail(b"the registry does not read");
     };
-    let block: alloc::vec::Vec<&DeviceRecord> = registry.iter().filter(|r| r.kind().is_block()).collect();
-    let (st, table) = ns_lookup(root_ns, b"/svc/storage/info/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
-    let bytes = if st == 0 { read_all(table) } else { None };
-    close(table);
-    let Some(bytes) = bytes else {
+    let block: Vec<&DeviceRecord> = registry.iter().filter(|r| r.kind().is_block()).collect();
+    let Some(bytes) = read_path(root, "/svc/storage/info/all.tsm") else {
         return fail(b"/svc/storage/info/all.tsm would not map");
     };
     let Ok(t) = libstream::wire::Table::decode(&bytes) else {
@@ -357,8 +289,8 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
         _ => None,
     };
     let name = |r: &DeviceRecord| alloc::format!("blk-{}", r.served);
-    let want: alloc::vec::Vec<String> = block.iter().map(|r| name(r)).collect();
-    let got: alloc::vec::Vec<&str> = (0..t.rows.len()).map(|i| text(i, name_c).unwrap_or("")).collect();
+    let want: Vec<String> = block.iter().map(|r| name(r)).collect();
+    let got: Vec<&str> = (0..t.rows.len()).map(|i| text(i, name_c).unwrap_or("")).collect();
     if got != want {
         Line::new()
             .s(b"boot-probe: storage: ")
@@ -374,22 +306,25 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
         block.iter().find(|r| r.kind() == kind && (label.is_empty() || r.name() == label)).and_then(|r| row(r))
     };
 
-    let Some(root) = find(DeviceKind::Partition, b"nitrox-root") else {
+    let Some(root_row) = find(DeviceKind::Partition, b"nitrox-root") else {
         return fail(b"no nitrox-root partition to check the root against");
     };
-    let at_root: alloc::vec::Vec<usize> = (0..t.rows.len()).filter(|&i| text(i, at_c) == Some("/")).collect();
-    if at_root != [root] {
+    let at_root: Vec<usize> = (0..t.rows.len()).filter(|&i| text(i, at_c) == Some("/")).collect();
+    if at_root != [root_row] {
         return fail(b"the root is not one row, nitrox-root's");
     }
-    if text(root, by_c) != Some("init") || text(root, mode_c) != Some("rw") || text(root, fs_c) != Some("ext4") {
+    if text(root_row, by_c) != Some("init")
+        || text(root_row, mode_c) != Some("rw")
+        || text(root_row, fs_c) != Some("ext4")
+    {
         return fail(b"the root is not init's writable ext4");
     }
-    if t.rows[root][clean_c] != Value::Null {
+    if t.rows[root_row][clean_c] != Value::Null {
         return fail(b"a root mounted writable reported how it was left");
     }
     // **What the service mounted is the test image's scratch disk, and only it**: the
     // one filesystem on this boot that is neither `init`'s nor FAT.
-    let by_storage: alloc::vec::Vec<usize> = (0..t.rows.len()).filter(|&i| text(i, by_c) == Some("storage")).collect();
+    let by_storage: Vec<usize> = (0..t.rows.len()).filter(|&i| text(i, by_c) == Some("storage")).collect();
     let Some(scratch) = find(DeviceKind::RamDisk, b"") else {
         return fail(b"no RAM disk: the test image's scratch module did not arrive");
     };
@@ -417,8 +352,8 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
         return fail(b"the disk, which holds only its table, reported a filesystem");
     }
 
-    let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/info", &mut dirbuf) else {
+    let mut dirmsg = Msg::new();
+    let Ok(mut dir) = librsproto::session::Dir::resolve(root, "/svc/storage/info", &mut dirmsg) else {
         return fail(b"/svc/storage/info is not a directory");
     };
     let mut names = 0usize;
@@ -430,8 +365,7 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
     if listed.is_err() || names != block.len() + 1 {
         return fail(b"the directory is not all.tsm and a file per device");
     }
-    let (st, other) = ns_lookup(root_ns, b"/svc/storage/block", RIGHT_MAP_READ);
-    close(other);
+    let st = status(&lookup::<File, MapRead, _>(root, "/svc/storage/block", Rights::MAP_READ));
     if st != libkern::KError::NotFound.as_i32() {
         return fail(b"a suffix the service does not serve was not NotFound");
     }
@@ -446,53 +380,49 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
 /// **A block request off its device's blocks is refused**, on the root partition's disk: part of a
 /// block with no operation made, a range past its end through the operation. The last block still
 /// reads. The disk, as a partition refused a range past its end already.
-pub(super) fn block_bounds_test(root_ns: u64) -> bool {
-    use libkern::{IO_OPCODE_READ, KError};
+pub(super) fn block_bounds_test(root: Root<'_>) -> bool {
+    use libkern::{IO_OPCODE_READ, IoOp, KError};
+    use libos::Op;
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: block bounds FAIL: ").s(why).end();
         false
     };
-    let Some(records) = registry_records(root_ns) else {
+    let Some(records) = registry_records(root) else {
         return fail(b"the registry does not read");
     };
     let labels: [&[u8]; 2] = [b"nitrox-root", b"nitrox-live"];
-    let Some(root) = records.iter().find(|r| labels.contains(&r.name())) else {
+    let Some(root_record) = records.iter().find(|r| labels.contains(&r.name())) else {
         return fail(b"no root partition in the registry");
     };
-    let Some(disk) = records.iter().find(|r| r.id == root.parent) else {
+    let Some(disk) = records.iter().find(|r| r.id == root_record.parent) else {
         return fail(b"the root partition has no disk in the registry");
     };
     let Some(index) = disk.block_index() else {
         return fail(b"the root's disk has no /dev/blk index");
     };
     let path = alloc::format!("/dev/blk/{index}");
-    let (st, dev) = ns_lookup(root_ns, path.as_bytes(), RIGHT_READ);
-    if st != 0 || dev == 0 {
+    let Ok(dev) = lookup::<Resource, ReadOnly, _>(root, &path, Rights::READ) else {
         return fail(b"the root's disk does not open");
-    }
-    // Two pages: room for a block and part of another, at 4,096 bytes a block.
-    // SAFETY: register-only syscall.
-    let page = unsafe { syscall4(SYS_MEMORY_CREATE, 2 * PAGE, 0, 0, 0) };
-    if page <= 0 {
-        close(dev);
-        return fail(b"no pages to read into");
-    }
-    let page = page as u64;
-    let submit = |offset: u64, length: u64| {
-        let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: page, buf_offset: 0, offset, length };
-        // SAFETY: `op` is a valid `IoOp`; `dev` and `page` are handles this process holds.
-        unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) }
     };
-    let invalid = KError::InvalidArgument.as_i32();
+    // Two pages: room for a block and part of another, at 4,096 bytes a block.
+    let Ok(pages) = Handle::<Memory, MapReadWrite>::create(2 * PAGE as usize) else {
+        return fail(b"no pages to read into");
+    };
+    let read = |offset: u64, length: u64| block_on(dev.read(&pages, 0, offset, length));
+    let submit = |offset: u64, length: u64| {
+        let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: pages.raw().0, buf_offset: 0, offset, length };
+        Op::submit(dev.raw(), &op)
+    };
+    let invalid = KError::InvalidArgument;
     let block = u64::from(disk.logical_block_size);
-    let partial = [(0, 100), (100, block), (0, block + 100)].iter().all(|&(o, l)| submit(o, l) == invalid as i64);
+    let partial = [(0, 100), (100, block), (0, block + 100)]
+        .iter()
+        .all(|&(o, l)| matches!(submit(o, l), Err(e) if e.code() == invalid));
     let end = disk.block_count * block;
-    let past = submit(end, block);
-    let past = past >= 0 && po_wait(past as u64).0 == invalid;
-    let last = submit(end - block, block);
-    let last = last >= 0 && po_wait(last as u64).0 == 0;
-    close(page);
-    close(dev);
+    let past = matches!(read(end, block), Err(e) if e.code() == invalid);
+    let last = read(end - block, block).is_ok();
+    drop(pages);
+    drop(dev);
     if !partial {
         return fail(b"part of a block was taken");
     }
@@ -502,6 +432,6 @@ pub(super) fn block_bounds_test(root_ns: u64) -> bool {
     if !last {
         return fail(b"the last block did not read");
     }
-    kprint(b"boot-probe: block bounds: part of a block refused, past the end failed, the last block read ok\n");
+    log::write(b"boot-probe: block bounds: part of a block refused, past the end failed, the last block read ok\n");
     true
 }

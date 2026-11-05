@@ -6,8 +6,7 @@
 [counts]
 "userspace/eshell" = 44
 "userspace/libheap" = 5
-"userspace/test-harness" = 196
-"userspace/test-harness/src/bootprobe/refused" = 2
+"userspace/test-harness/src/bootprobe/refused" = 14
 "userspace/test-harness/src/refused" = 1
 
 [agreed]
