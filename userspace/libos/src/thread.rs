@@ -29,6 +29,11 @@ impl Stack {
 /// **The stack is the thread's for the rest of the process's life**: nothing tells a process that
 /// a thread of its has ended, so nothing could give the stack back safely.
 pub fn start(entry: Entry, stack: Stack, arg0: u64) -> Result<Handle<Thread, Only>> {
+    start_on(entry, stack, arg0, 0)
+}
+
+/// [`start`] on the CPUs whose bits are set in `cpus`; `0` is any.
+pub fn start_on(entry: Entry, stack: Stack, arg0: u64, cpus: u8) -> Result<Handle<Thread, Only>> {
     let top = stack.0.as_ptr() as u64 + stack.0.len() as u64;
     let args = ThreadArgs {
         entry: entry as usize as u64,
@@ -38,7 +43,7 @@ pub fn start(entry: Entry, stack: Stack, arg0: u64) -> Result<Handle<Thread, Onl
         class: 0,
         rt_priority: 0,
         nice: 0,
-        cpu_affinity: 0,
+        cpu_affinity: cpus,
         _reserved: [0; 36],
     };
     // SAFETY: `entry` never returns and takes the registers the kernel sets, and the stack is this
@@ -113,9 +118,16 @@ mod tests {
         assert_eq!(len, 8192);
         let t = start(worker, stack, 42).unwrap();
         let args = sys::threads().pop().unwrap();
-        assert_eq!((args.user_sp, args.arg0), (base + len, 42));
+        assert_eq!((args.user_sp, args.arg0, args.cpu_affinity), (base + len, 42, 0));
         drop(t);
         assert_eq!(sys::mappings(), 1, "the stack outlives the handle");
+    }
+
+    #[test]
+    fn a_pinned_thread_asks_for_its_cpus() {
+        sys::reset();
+        start_on(worker, Stack::new(4096).unwrap(), 0, 1 << 3).unwrap();
+        assert_eq!(sys::threads().pop().unwrap().cpu_affinity, 1 << 3);
     }
 
     #[test]
