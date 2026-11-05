@@ -1,7 +1,6 @@
 # Building and embedding a userspace program
 
-How a userspace binary is built and loaded by the kernel, as established by
-the first userspace process (`userspace/hello`).
+How a userspace binary is built and loaded by the kernel.
 
 ## The program
 

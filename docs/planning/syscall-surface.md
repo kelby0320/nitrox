@@ -355,7 +355,7 @@ compositor's capture. libos grew a `Timer`, `system::set_clock` and `Mapping::un
 typed; `libstream` lends a port over an endpoint its owner keeps. The session makes 4,409 calls
 where `main` made 4,403: `nxsh`'s `exit` closes three handles the process's exit closed. Thirty-four
 shims lost their last caller and went; the test harness keeps the rest, with the two filesystem
-servers, whose entry no sub-part moves.
+servers, whose entry no sub-part moves. `hello`, which nothing had run since 2026-06-23, is deleted.
 
 ### E.5 The test harness
 

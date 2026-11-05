@@ -1203,7 +1203,7 @@ own queue overflowing, so the client-side vocabulary exists; what is missing is 
 Trigger: the first observed outbox overflow that is not a deliberately wedged test client, or
 the toolkit (M4) needing to resynchronise held-key state after one. Raised 2026-08-10.
 
-**The `4` in the other resource servers** (`auth-service`, `fs-server-ext4`, `hello`) is left
+**The `4` in the other resource servers** (`auth-service` and `fs-server-ext4`) is left
 alone deliberately: those channels carry request/reply traffic, where the sender is waiting for
 an answer and cannot outrun the receiver. They are undersized rather than wrong. Trigger: any of
 them growing a server-initiated push stream.

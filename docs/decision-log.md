@@ -37687,8 +37687,8 @@ there drops to the emergency shell and fails the run with exit 35, its verdict t
 E.4 moves the ten remaining programs onto libos (`desktop-shell`, `compositor`, `coreutils`,
 `hello`, `nxterm`, `nxsh`, `nxinstall`, `heartbeat`, `nxfiles` and `nxedit`). None makes a raw
 syscall and none keeps a `static mut`. The `unsafe` a call to the kernel still asks of each is
-`Start::from_registers`, bar three that say why: `hello`'s deliberate fault, the compositor's
-`map_framebuffer`, whose contract is the aperture's one writer, and `nxinstall`'s panic handler,
+`Start::from_registers`, bar two that say why: the compositor's `map_framebuffer`, whose contract
+is the aperture's one writer, and `nxinstall`'s panic handler,
 which sends on a `stderr` the program still owns. The ratchet falls by their 644, from 1,556 in 13
 entries to 912 in 3: the test harness's, `eshell`'s and `libheap`'s. **The session's calls are
 as they were**, 4,409 where `main`'s were 4,403 (`cargo xtask syscall-counts`): `nxsh`'s `exit`
@@ -37705,8 +37705,8 @@ Decided in the part, for the maintainer's eye:
   and a capture writes the manager's object by copying a thumbnail it scaled into a `Vec`. Host
   tests compose and scale the same bytes owned and shared on every blit path and find them equal.
   `nxsh` reads a stage's image the same way (sh-d11's sites outside `eshell`).
-- **libos grew three things, and the libraries what the programs needed**: a `Timer`, which `hello`
-  and `sleep` wait on; `system::set_clock`, which says whether the hardware clock kept the time; and
+- **libos grew three things, and the libraries what the programs needed**: a `Timer`, which `sleep`
+  waits on; `system::set_clock`, which says whether the hardware clock kept the time; and
   `Mapping::unmap`, an unmap that reports the kernel's answer. `set_clock` is the one call written
   to today's shape and not the one it will keep, as there is no clock node to pass until E.10 makes
   it one; `TODO(surface-shape)` says so. `libviews` is typed, its `Handed` owning what a request
@@ -37734,3 +37734,9 @@ Decided in the part, for the maintainer's eye:
   `unsafe fn`s), `eshell`'s sites (sh-d11, sh-o3, sh-o12), or work no move does: a `Transport`
   that takes a handle by value (desk-o1), a checked received handle (sh-o7), `RawFramebuffer` from
   a `Mapping` (desk-o5) and a `WindowStack` that holds its buffers' mappings (desk-o9).
+- **`hello` is deleted** (the maintainer's call at review, 2026-11-05). Nothing had run it since
+  `init` became PID 1 on 2026-06-23: no image held it and nothing spawned it, though xtask built it
+  first on every build and its doc said the boot gate counted its lines. A boot on a kernel whose
+  poll answered `TimedOut`, whose restrict kept `DUPLICATE` and whose close answered an error passed
+  `test-qemu` with no line from it. The test harness checks what it checked, but for a poll's
+  `WouldBlock`, which `boot-probe` now asserts; restrict and close are the kernel's host tests'.

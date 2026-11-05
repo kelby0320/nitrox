@@ -73,7 +73,8 @@ pub(super) fn wait_on_nothing_test() -> bool {
 }
 
 /// **Holding many armed timers starves no one's deadline.** With [`TIMERS`] armed for an hour, every
-/// one arms, a wait with a deadline times out, and a bounded send's deadline still fires.
+/// one arms, a wait with a deadline times out, a poll answers `WouldBlock`, and a bounded send's
+/// deadline still fires.
 pub(super) fn many_timers_test() -> bool {
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: many timers FAIL: ").s(why).end();
@@ -98,6 +99,7 @@ pub(super) fn many_timers_test() -> bool {
     // SAFETY: as above.
     let unarmed = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
     let waited = if unarmed > 0 { wait_status(unarmed as u64, clock_ns() + 10 * MS) } else { Err(unarmed) };
+    let polled = if unarmed > 0 { wait_status(unarmed as u64, 0) } else { Err(unarmed) };
     let sent = bounded_send_to_a_full_channel();
     close(unarmed.max(0) as u64);
     timers.iter().for_each(|&t| close(t));
@@ -108,6 +110,10 @@ pub(super) fn many_timers_test() -> bool {
     }
     if waited != Err(i64::from(timed_out)) {
         return fail(b"a wait with a deadline did not time out");
+    }
+    // The status libos folds into an empty wait, so only a raw call sees it.
+    if polled != Err(i64::from(KError::WouldBlock.as_i32())) {
+        return fail(b"a poll that found nothing did not answer WouldBlock");
     }
     if sent != Ok(timed_out) {
         return fail(b"a bounded send to a full channel did not time out");

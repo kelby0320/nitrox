@@ -3,7 +3,7 @@
 **Status:** Implemented. `userspace/libos` is the safe layer every userspace crate is to reach the
 kernel through: typed handles and borrows, messages, waits, mappings, namespaces and files,
 spawning and threads, the clocks, the log and the bootstrap registers, over the `Op` future and
-`block_on`. Thirty-four crates use it directly: the libraries, the system's servers and
+`block_on`. Thirty-three crates use it directly: the libraries, the system's servers and
 supervisors, and the desktop and the programs; the test harness moves onto it in pre-Phase-7 Part
 E.5, and `cargo xtask check-syscalls` holds each crate's raw syscalls to its count as it does.
 Sections marked *deferred* (chiefly the multi-task executor) are genuinely unbuilt. Verified

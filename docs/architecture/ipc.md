@@ -91,8 +91,3 @@ blocked waiter's reference) at the moment the first one nulls it.
   delivered by the deadline, the scheduler's timer tick cancels it — the PO
   completes `TimedOut` and the message is reclaimed (swept out of the pending-send
   queue on the next recv, or at close). See the decision log (2026-06-12).
-- **Demo:** `hello` creates a channel, holds both endpoints, sends a message to
-  itself end0→end1, blocks on end1 via `sys_wait`, receives and verifies it,
-  observes `WouldBlock` on an empty endpoint, then closes one end and observes
-  `PeerClosed` on the other — a full ring-3 round-trip. (Cross-process IPC
-  arrives with spawn.)

@@ -97,7 +97,6 @@ paths = [
   "userspace/libfs/",
   "userspace/liblog/",
   "userspace/libtime/",
-  "userspace/hello/",
   "userspace/heartbeat/",
 ]
 
