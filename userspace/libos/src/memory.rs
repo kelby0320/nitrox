@@ -178,6 +178,18 @@ mod tests {
         drop(b);
     }
 
+    /// The kernel's refusal reaches the caller: where nothing is mapped it answers
+    /// `InvalidArgument`.
+    #[test]
+    fn a_refused_unmap_answers_the_refusal() {
+        sys::reset();
+        let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        let mut m = mem.map(4096).unwrap();
+        // SAFETY: the model frees nothing at an unmap, and nothing reads `m` again.
+        assert_eq!(unsafe { sys::memory_unmap(m.as_mut_ptr() as u64, 4096) }, 0);
+        assert_eq!(m.unmap().map_err(|e| e.code()), Err(KError::InvalidArgument));
+    }
+
     #[test]
     fn a_copy_past_the_end_is_refused_and_touches_nothing() {
         sys::reset();

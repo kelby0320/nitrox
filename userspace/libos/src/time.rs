@@ -85,6 +85,7 @@ pub fn sleep_until(deadline: Deadline) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libkern::KError;
 
     #[test]
     fn a_deadline_at_zero_is_no_poll() {
@@ -128,6 +129,18 @@ mod tests {
         assert!(set.wait(Deadline::POLL).unwrap().is_empty());
         timer.set(0).unwrap();
         assert!(set.wait(Deadline::POLL).unwrap().contains(0), "a time at zero is past, not a disarm");
+    }
+
+    /// The kernel's refusal of a set or a disarm reaches the caller: `InvalidHandle` once the
+    /// handle is closed.
+    #[test]
+    fn a_refused_set_or_disarm_answers_the_refusal() {
+        sys::reset();
+        let timer = Handle::<Timer, Only>::create().unwrap();
+        sys::handle_close(timer.raw().0);
+        assert_eq!(timer.set(5).map_err(|e| e.code()), Err(KError::InvalidHandle));
+        assert_eq!(timer.disarm().map_err(|e| e.code()), Err(KError::InvalidHandle));
+        let _ = timer.into_raw();
     }
 
     #[test]

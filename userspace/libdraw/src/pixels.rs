@@ -142,6 +142,20 @@ mod tests {
         assert!(pieces(shared, 2999, 4, 4).is_empty() && pieces(own, 2999, 4, 4).is_empty(), "no part of a unit");
     }
 
+    /// A unit that does not divide a piece, three bytes a pixel, is never split between two.
+    #[test]
+    fn a_unit_that_does_not_divide_a_piece_stays_whole() {
+        mock::reset();
+        let bytes: Vec<u8> = (0..3000u32).map(|i| (i * 7) as u8).collect();
+        let map = shared(&bytes);
+        let got = pieces(Pixels::Shared(&map), 0, 2500, 3);
+        assert_eq!(
+            got.iter().map(|(at, b)| (*at, b.len())).collect::<Vec<_>>(),
+            [(0, 1023), (1023, 1023), (2046, 453)]
+        );
+        assert_eq!(got.into_iter().flat_map(|(_, b)| b).collect::<Vec<u8>>(), &bytes[..2499]);
+    }
+
     /// A shared surface draws what the same bytes owned do, on every blit path: rows, blended,
     /// another format's, and a rounded corner's edge.
     #[test]
