@@ -527,3 +527,13 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-04	420	78884994	11	rules-and-docs	optional	demonstrated	fixed	27a48f14	Scrubbed::new and reply_outcome documented; sweep of the PR's added pub items found serve_policy and the model's power too
 2026-11-04	420	78884994	12	architecture	optional	unverified	deferred	d78ae334	pre-dates the PR; TODO(test-verdict-authority), trigger E.10, which makes privileged operations handles
 2026-11-04	420	78884994	13	architecture	optional	demonstrated	fixed	4b284f13	libkern/CLAUDE.md (27a48f14), Mgr doc and MAX_SERVICES doc corrected; sweep found service-mgr/CLAUDE.md's main-wait line
+2026-11-05	421	f322b83c	1	rules-and-docs+architecture	worth-fixing	demonstrated	fixed	535daf45	every site named; the sweep of every public item the PR removed found nxfiles, coreutils and nxedit naming libfs shims, widget-toolkit's list_dir, move.rs's dead quote, device-manager's E.3 name
+2026-11-05	421	f322b83c	2	rules-and-docs	worth-fixing	demonstrated	fixed	535daf45	libfs::bindings_under, whose doc makes the same claim
+2026-11-05	421	f322b83c	3	logic	optional	demonstrated	fixed	be5d9a53	band-at-a-time sums; copies 3,000 -> 30, the test failing on the old code; 85 ms -> 11 ms shared, owned 9.4; compose's per-row calls measure the same shared as owned
+2026-11-05	421	f322b83c	4	logic	optional	unverified	fixed	ff8bd941	nothing ran hello since 2026-06-23: a poll-TimedOut kernel passed test-qemu with no hello line; hello deleted (maintainer); boot-probe pins a poll's WouldBlock, failing on that kernel
+2026-11-05	421	f322b83c	5	error-paths	optional	demonstrated	fixed	ff8bd941	hello deleted (maintainer); restrict_on and close_on stay pinned by the kernel's host tests, which fail on a no-op restrict and a close answering an error
+2026-11-05	421	f322b83c	6	tests	optional	demonstrated	fixed	b8e41c86	a 3-byte unit; fails with step = PIECE
+2026-11-05	421	f322b83c	7	tests	optional	unverified	fixed	b8e41c86	an unmap after one underneath answers InvalidArgument, failing when the status is ignored; sweep: Timer::set and disarm the same
+2026-11-05	421	f322b83c	8	architecture	optional	demonstrated	fixed	9a5345e5	NamespaceSpec's per-member docs back on Members
+2026-11-05	421	f322b83c	9	architecture	optional	demonstrated	fixed	4fdad227	both removed; every other shim checked by call shape has a test-harness or fs-server caller; pipeline-stdio.md named send_setup_env
+2026-11-05	421	f322b83c	10	architecture	optional	demonstrated	fixed	20099345	notices and Notices, with nxsh/CLAUDE.md
