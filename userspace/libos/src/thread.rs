@@ -1,9 +1,9 @@
 //! Threads in this process, each on a [`Stack`] of its own.
 
-use libkern::{RawHandle, Rights, ThreadArgs};
+use libkern::{RawHandle, RegisterValues, Rights, ThreadArgs};
 
 use crate::error::{Error, Result, check};
-use crate::handle::{Handle, MapReadWrite, Memory, Only, Thread};
+use crate::handle::{Handle, MapReadWrite, Memory, Only, Thread, both};
 use crate::memory::Mapping;
 use crate::sys;
 use libkern::KError;
@@ -48,6 +48,40 @@ pub fn start(entry: Entry, stack: Stack, arg0: u64) -> Result<Handle<Thread, Onl
     Ok(Handle::fresh(h, Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE))
 }
 
+/// End the calling thread with `status`. The process goes on while another of its threads does.
+pub fn exit(status: i32) -> ! {
+    sys::thread_exit(status)
+}
+
+/// How a thread suspended on a fault goes on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// Run the instruction that faulted again, which faults again unless its cause has gone.
+    Resume,
+    /// End the thread with this status.
+    Terminate(i32),
+}
+
+both!([] Thread, Only {
+    /// The registers it faulted with: `InvalidArgument` unless it is suspended on a fault. Needs
+    /// `SIGNAL`.
+    pub fn fault_registers(&self) -> Result<RegisterValues> {
+        let mut regs = RegisterValues { regs: [0; 18] };
+        check(sys::thread_get_registers(self.raw().0, &mut regs))?;
+        Ok(regs)
+    }
+
+    /// Go on with it, suspended on a fault, as `how` says: `InvalidArgument` unless it is
+    /// suspended. Needs `SIGNAL`.
+    pub fn settle(&self, how: Disposition) -> Result<()> {
+        let (disposition, code) = match how {
+            Disposition::Resume => (0, 0),
+            Disposition::Terminate(status) => (2, status as u32 as u64),
+        };
+        check(sys::exception_resume(self.raw().0, disposition, code)).map(|_| ())
+    }
+});
+
 /// Start a thread in this process from `args` (a libkern [`ThreadArgs`]), returning an
 /// owning handle. The `RealTime` class in `args` requires the `REAL_TIME` syscap
 /// (else `Err`). The kernel grants `SIGNAL | TERMINATE | INSPECT | DUPLICATE`.
@@ -88,6 +122,34 @@ mod tests {
     fn a_stack_too_large_to_round_is_refused() {
         sys::reset();
         assert_eq!(Stack::new(usize::MAX).err().unwrap().code(), KError::TooLarge);
+    }
+
+    /// Its registers are there only while it is suspended on a fault, and settling it once ends
+    /// that.
+    #[test]
+    fn a_faulted_thread_is_read_and_settled_once() {
+        sys::reset();
+        let t = start(worker, Stack::new(4096).unwrap(), 0).unwrap();
+        let invalid = Err(KError::InvalidArgument);
+        assert_eq!(t.fault_registers().map(|r| r.regs).map_err(|e| e.code()), invalid, "running");
+        let mut regs = RegisterValues { regs: [0; 18] };
+        regs.regs[16] = 0x40_1000;
+        sys::fault_thread(t.raw().0, regs);
+        assert_eq!(t.fault_registers().unwrap().regs, regs.regs);
+        assert!(t.settle(Disposition::Terminate(7)).is_ok());
+        assert_eq!(t.fault_registers().map(|r| r.regs).map_err(|e| e.code()), invalid, "settled");
+        assert_eq!(t.settle(Disposition::Resume).map_err(|e| e.code()), Err(KError::InvalidArgument), "settled once");
+    }
+
+    #[test]
+    fn a_thread_handle_without_signal_can_neither_read_nor_settle() {
+        sys::reset();
+        let t = start(worker, Stack::new(4096).unwrap(), 0).unwrap();
+        sys::fault_thread(t.raw().0, RegisterValues { regs: [0; 18] });
+        let blind = t.duplicate(Rights::INSPECT).unwrap();
+        assert_eq!(blind.fault_registers().map(|r| r.regs).map_err(|e| e.code()), Err(KError::NoAccess));
+        assert_eq!(blind.settle(Disposition::Resume).map_err(|e| e.code()), Err(KError::NoAccess));
+        assert!(t.fault_registers().is_ok(), "still suspended: the refusals settled nothing");
     }
 
     #[test]

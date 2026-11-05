@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use libkern::{
     HandleInfo, IPC_HANDLE_MAX, IPC_PAYLOAD_SIZE, IoOp, IoResult, IpcMsg, KError, KObjectType, Notification, NsEntry,
-    Rights, SPAWN_MAX_HANDLES, SpawnArgs, ThreadArgs,
+    RegisterValues, Rights, SPAWN_MAX_HANDLES, SpawnArgs, ThreadArgs,
 };
 
 use super::Resize;
@@ -50,7 +50,8 @@ enum Object {
     /// logging service answers with an endpoint.
     Answers(usize),
     Process,
-    Thread,
+    /// The registers it faulted with while it is suspended on a fault.
+    Thread(Option<RegisterValues>),
     Entropy,
     SystemControl,
     Timer(u64),
@@ -68,7 +69,7 @@ impl Object {
             Object::Device => KObjectType::DeviceNode,
             Object::Server | Object::Answers(_) => KObjectType::UserspaceServerReg,
             Object::Process => KObjectType::Process,
-            Object::Thread => KObjectType::Thread,
+            Object::Thread(_) => KObjectType::Thread,
             Object::Timer(_) => KObjectType::Timer,
             Object::Entropy => KObjectType::EntropyObject,
             Object::SystemControl => KObjectType::SystemControl,
@@ -917,7 +918,7 @@ pub unsafe fn thread_create(args: &ThreadArgs) -> i64 {
             return status as i64;
         }
         m.threads.push(*args);
-        m.mint(Object::Thread, Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)
+        m.mint(Object::Thread(None), Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)
     })
 }
 
@@ -978,6 +979,8 @@ pub fn power(h: u64, op: u64) -> i64 {
 }
 
 mod controls;
+mod thread;
 mod time;
 pub use controls::*;
+pub use thread::*;
 pub use time::*;
