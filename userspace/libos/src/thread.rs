@@ -149,8 +149,23 @@ mod tests {
         sys::fault_thread(t.raw().0, regs);
         assert_eq!(t.fault_registers().unwrap().regs, regs.regs);
         assert!(t.settle(Disposition::Terminate(7)).is_ok());
+        assert_eq!(sys::settled(), [(2, 7)], "terminated with its status");
         assert_eq!(t.fault_registers().map(|r| r.regs).map_err(|e| e.code()), invalid, "settled");
         assert_eq!(t.settle(Disposition::Resume).map_err(|e| e.code()), Err(KError::InvalidArgument), "settled once");
+    }
+
+    /// Each disposition reaches the kernel as its own number, a negative status whole.
+    #[test]
+    fn a_resume_and_a_terminate_say_which_they_are() {
+        sys::reset();
+        let t = start(worker, Stack::new(4096).unwrap(), 0).unwrap();
+        sys::fault_thread(t.raw().0, RegisterValues { regs: [0; 18] });
+        t.settle(Disposition::Resume).unwrap();
+        sys::fault_thread(t.raw().0, RegisterValues { regs: [0; 18] });
+        t.settle(Disposition::Terminate(-3)).unwrap();
+        let settled = sys::settled();
+        assert_eq!(settled[0], (0, 0));
+        assert_eq!((settled[1].0, settled[1].1 as i32), (2, -3), "as the kernel reads it, an `i32`");
     }
 
     #[test]

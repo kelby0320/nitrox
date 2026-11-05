@@ -113,6 +113,20 @@ mod tests {
         assert!(block_on(rename(&ns, "/a", "/c", 0)).err().unwrap().is_not_found());
     }
 
+    /// The flags reach the server: without the replace bit an existing name is refused, with it
+    /// the name is taken.
+    #[test]
+    fn a_rename_onto_a_name_replaces_it_only_when_asked() {
+        sys::reset();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        let _a: Handle<File, MapReadWrite> = block_on(create(&ns, "/a", 1, rw())).unwrap();
+        let _b: Handle<File, MapReadWrite> = block_on(create(&ns, "/b", 1, rw())).unwrap();
+        assert_eq!(block_on(rename(&ns, "/a", "/b", 0)).map_err(|e| e.code()), Err(KError::AlreadyExists));
+        assert!(block_on(ns.lookup::<File, MapRead>("/a", Rights::MAP_READ)).is_ok(), "refused, the source stays");
+        block_on(rename(&ns, "/a", "/b", 1)).unwrap();
+        assert!(block_on(ns.lookup::<File, MapRead>("/a", Rights::MAP_READ)).err().unwrap().is_not_found());
+    }
+
     #[test]
     fn a_rename_answered_with_a_handle_leaves_none_open() {
         sys::reset();

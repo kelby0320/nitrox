@@ -21,13 +21,14 @@ pub fn thread_get_registers(thread: u64, out: &mut RegisterValues) -> i64 {
 }
 
 /// The disposition is checked before the handle, as the kernel checks it.
-pub fn exception_resume(thread: u64, disposition: u64, _code: u64) -> i64 {
+pub fn exception_resume(thread: u64, disposition: u64, code: u64) -> i64 {
     if !matches!(disposition, 0 | 2) {
         return e(KError::Unsupported);
     }
     with(|m| match m.typed(thread, Rights::SIGNAL, KObjectType::Thread) {
         Ok((o, _)) if matches!(m.objects[o], Object::Thread(Some(_))) => {
             m.objects[o] = Object::Thread(None);
+            m.settled.push((disposition, code));
             0
         }
         Ok(_) => e(KError::InvalidArgument),
@@ -41,4 +42,9 @@ pub fn fault_thread(h: u64, regs: RegisterValues) {
         let (o, _) = m.typed(h, Rights::empty(), KObjectType::Thread).expect("a thread handle");
         m.objects[o] = Object::Thread(Some(regs));
     })
+}
+
+/// Each `exception_resume` the model took, as `(disposition, code)`: 0 resumes, 2 terminates.
+pub fn settled() -> Vec<(u64, u64)> {
+    with(|m| m.settled.clone())
 }

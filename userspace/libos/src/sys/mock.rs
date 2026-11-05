@@ -161,6 +161,8 @@ struct Mock {
     /// Whether the next child exits before anything reaches it, holding nothing.
     exit_next_child: bool,
     threads: Vec<ThreadArgs>,
+    /// Each `exception_resume` the model took, as `(disposition, code)`.
+    settled: Vec<(u64, u64)>,
     /// Each test verdict reported, as its code.
     verdicts: Vec<u64>,
 }
@@ -816,7 +818,9 @@ pub fn file_resize(verb: Resize, ns: u64, path: &[u8], rights: u64, size: u64) -
     })
 }
 
-pub fn file_rename(ns: u64, from: &[u8], to: &[u8], _flags: u64) -> i64 {
+/// An existing destination is refused `AlreadyExists` unless `flags` asks to replace it, as a
+/// filesystem server answers (`librsproto`'s `RENAME_REPLACE`, bit 0).
+pub fn file_rename(ns: u64, from: &[u8], to: &[u8], flags: u64) -> i64 {
     with(|m| {
         let ns = match m.namespace(ns, Rights::LOOKUP) {
             Ok(o) => o,
@@ -827,6 +831,7 @@ pub fn file_rename(ns: u64, from: &[u8], to: &[u8], _flags: u64) -> i64 {
         }
         let b = m.bindings(ns);
         let status = match b.iter().position(|x| x.path == from) {
+            Some(_) if flags & 1 == 0 && from != to && b.iter().any(|x| x.path == to) => KError::AlreadyExists as i32,
             Some(i) => {
                 b.retain(|x| x.path != to);
                 let i = b.iter().position(|x| x.path == from).unwrap_or(i);
