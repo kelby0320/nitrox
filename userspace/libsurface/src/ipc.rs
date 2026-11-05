@@ -268,7 +268,7 @@ impl Transport for ChannelTransport {
 
     /// Take the next event if one is already here, without blocking.
     ///
-    /// Callable from outside because a [`manage`](ChannelTransport::manage) transport exists to
+    /// Callable from outside because an [`open_manager`](ChannelTransport::open_manager) transport exists to
     /// receive.
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
         // Parked messages first: they are older than anything on the wire.

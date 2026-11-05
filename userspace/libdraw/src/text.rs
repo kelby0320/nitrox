@@ -50,7 +50,7 @@ impl Font {
         self
     }
 
-    /// This face with `mono` as its fixed-advance companion; the theme names it, see [`load_mono`].
+    /// This face with `mono` as its fixed-advance companion; the theme names it, see [`load_mono_font`].
     pub fn with_mono(mut self, mono: Font) -> Self {
         self.mono = Some(alloc::boxed::Box::new(mono));
         self

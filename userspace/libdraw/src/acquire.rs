@@ -3,7 +3,7 @@
 //! The one part of `libdraw` that touches syscalls, hence behind the optional `io` feature.
 //!
 //! Authority is the binding: a process can drive the display if and only if `/dev/framebuffer`
-//! is in its namespace (`docs/design/display-substrate.md` §3). [`acquire`] takes a namespace
+//! is in its namespace (`docs/design/display-substrate.md` §3). [`map_framebuffer`] takes a namespace
 //! handle and either finds the binding or does not.
 
 use libkern::abi::FramebufferInfo;
