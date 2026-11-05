@@ -32,13 +32,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use libkern::abi::{IO_OPCODE_READ, IoOp};
-use libkern::debug::Line;
-use libkern::{
-    KError, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, SYS_FILE_CREATE, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4,
-    syscall5,
-};
+use libkern::{KError, Rights};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Channel, File, Handle, MapRead, MapReadWrite, Memory, Namespace, NsReadOnly, Only, ReadOnly, Resource};
+use libos::{Msg, block_on, fs};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -57,23 +55,32 @@ fn byte(i: usize) -> u8 {
 /// Entry point: dispatch `--write`, `--check`, `--eject-held` or `--read-device` from the setup
 /// message's `argv`.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let argv: Vec<String> = match libstream::setup::bootstrap(notif, ns, endpoint, arg0).setup() {
-        Some(Ok(s)) => s.argv,
-        _ => Vec::new(),
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let endpoint = start.take_handle0::<Channel, Only>();
+    let setup = endpoint
+        .as_ref()
+        .filter(|_| libstream::setup::setup_is_pending(start.arg0))
+        .and_then(|e| libstream::setup::receive_setup(e, libos::Deadline::NEVER).ok().flatten());
+    let args: Vec<&str> = setup.as_ref().map_or(&[][..], |s| &s.argv[..]).iter().map(String::as_str).collect();
+    let Some(ns) = start.root.as_ref() else {
+        log::write(b"test-pattern: no namespace\n");
+        libos::exit(1);
     };
-    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
     let code = match args.as_slice() {
-        [_, "--write", path] => write(ns, path.as_bytes()),
-        [_, "--check", path] => check(ns, path.as_bytes()),
-        [_, "--eject-held", path, name] => eject_held(ns, path.as_bytes(), name.as_bytes()),
-        [_, "--read-device", path] => read_device(ns, path.as_bytes()),
+        [_, "--write", path] => write(ns, path),
+        [_, "--check", path] => check(ns, path),
+        [_, "--eject-held", path, name] => eject_held(ns, path, name.as_bytes()),
+        [_, "--read-device", path] => read_device(ns, path),
         _ => {
-            kprint(b"usage: test-pattern --write PATH | --check PATH | --eject-held PATH NAME | --read-device PATH\n");
+            log::write(
+                b"usage: test-pattern --write PATH | --check PATH | --eject-held PATH NAME | --read-device PATH\n",
+            );
             2
         }
     };
-    exit(code)
+    libos::exit(code as i32)
 }
 
 fn status_name(status: i32) -> String {
@@ -81,72 +88,59 @@ fn status_name(status: i32) -> String {
 }
 
 /// `--write`: create `path`, write the pattern through a writable mapping, **do not sync**.
-fn write(ns: u64, path: &[u8]) -> i64 {
-    // SAFETY: a valid path slice and the namespace this process was given.
-    let po = unsafe {
-        syscall5(
-            SYS_FILE_CREATE,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
-            LEN as u64,
-        )
+fn write(ns: &Handle<Namespace, NsReadOnly>, path: &str) -> i64 {
+    let rights = Rights::MAP_READ | Rights::MAP_WRITE;
+    let file: Handle<File, MapReadWrite> = match block_on(fs::create(ns, path, LEN as u64, rights)) {
+        Ok(file) => file,
+        Err(e) => {
+            let status = e.code().as_i32();
+            Line::new()
+                .s(b"test-pattern: ")
+                .untrusted(path.as_bytes())
+                .s(b" refused: ")
+                .s(status_name(status).as_bytes())
+                .s(b" (")
+                .i(status as i64)
+                .s(b")")
+                .end();
+            return 1;
+        }
     };
-    let (status, file) = if po < 0 { (po as i32, 0) } else { po_wait(po as u64) };
-    if status != 0 || file == 0 {
-        let status = if status == 0 { KError::KernelError.as_i32() } else { status };
-        Line::new()
-            .s(b"test-pattern: ")
-            .untrusted(path)
-            .s(b" refused: ")
-            .s(status_name(status).as_bytes())
-            .s(b" (")
-            .i(status as i64)
-            .s(b")")
-            .end();
-        return 1;
-    }
-    // SAFETY: mapping the file this call created, with the rights it was created with.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, file, 0, LEN as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if addr < 0 {
-        // SAFETY: closing the handle this call created.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, file) };
-        Line::new()
-            .s(b"test-pattern: ")
-            .untrusted(path)
-            .s(b" would not map: ")
-            .s(status_name(addr as i32).as_bytes())
-            .end();
-        return 1;
-    }
-    for i in 0..LEN {
-        // SAFETY: `LEN` bytes are mapped writable at `addr`.
-        unsafe { ((addr as usize + i) as *mut u8).write(byte(i)) };
-    }
+    let mut mapping = match file.map(LEN) {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            drop(file);
+            Line::new()
+                .s(b"test-pattern: ")
+                .untrusted(path.as_bytes())
+                .s(b" would not map: ")
+                .s(status_name(e.code().as_i32()).as_bytes())
+                .end();
+            return 1;
+        }
+    };
+    let pattern: Vec<u8> = (0..LEN).map(byte).collect();
+    let _ = mapping.write_from(0, &pattern);
     // **Let go without a sync**: the kernel keeps the pages dirty until something writes them back.
-    // SAFETY: unmapping this call's own mapping, then closing its own handle.
-    unsafe {
-        syscall2(SYS_MEMORY_UNMAP, addr as u64, LEN as u64);
-        syscall1(SYS_HANDLE_CLOSE, file);
-    }
+    drop(mapping);
+    drop(file);
     Line::new()
         .s(b"test-pattern: wrote ")
         .u(LEN as u64)
         .s(b" bytes to ")
-        .untrusted(path)
+        .untrusted(path.as_bytes())
         .s(b" through a mapping, and did not sync")
         .end();
     0
 }
 
-fn check(ns: u64, path: &[u8]) -> i64 {
-    let bytes = match libfs::read_file(ns, path) {
+fn check(ns: &Handle<Namespace, NsReadOnly>, path: &str) -> i64 {
+    let bytes = match libfs::read(ns, path) {
         Ok(b) => b,
         Err(e) => {
             Line::new()
                 .s(b"test-pattern: ")
-                .untrusted(path)
+                .untrusted(path.as_bytes())
                 .s(b" would not read: ")
                 .s(alloc::format!("{e:?}").as_bytes())
                 .s(b" FAIL")
@@ -159,7 +153,7 @@ fn check(ns: u64, path: &[u8]) -> i64 {
         (None, true) => {
             Line::new()
                 .s(b"test-pattern: ")
-                .untrusted(path)
+                .untrusted(path.as_bytes())
                 .s(b" holds the pattern, ")
                 .u(LEN as u64)
                 .s(b" bytes ok")
@@ -168,7 +162,7 @@ fn check(ns: u64, path: &[u8]) -> i64 {
         }
         (at, _) => {
             let mut l = Line::new();
-            l.s(b"test-pattern: ").untrusted(path).s(b" is ").u(bytes.len() as u64).s(b" bytes");
+            l.s(b"test-pattern: ").untrusted(path.as_bytes()).s(b" is ").u(bytes.len() as u64).s(b" bytes");
             if let Some(i) = at {
                 l.s(b", and differs from the pattern at byte ").u(i as u64);
             }
@@ -180,27 +174,30 @@ fn check(ns: u64, path: &[u8]) -> i64 {
 
 /// `--eject-held`: hold `path`, ask the storage service to eject `name` through a media session,
 /// let go — and succeed only if the eject was refused for the file held.
-fn eject_held(ns: u64, path: &[u8], name: &[u8]) -> i64 {
+fn eject_held(ns: &Handle<Namespace, NsReadOnly>, path: &str, name: &[u8]) -> i64 {
     use librsproto::storage::OP_STORAGE_EJECT;
-    let (st, held) = libfs::lookup_wait(ns, path, RIGHT_MAP_READ);
-    if st != 0 || held == 0 {
-        Line::new()
-            .s(b"test-pattern: ")
-            .untrusted(path)
-            .s(b" would not open to hold: ")
-            .s(status_name(st).as_bytes())
-            .s(b" FAIL")
-            .end();
-        return 1;
-    }
-    let (st, media) = libfs::lookup_wait(ns, b"/dev/storage/media", librsproto::session::DIR_SESSION_RIGHTS);
-    let answer = if st == 0 && media != 0 {
-        let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
-        let reply = librsproto::session::round_trip(media, &mut buf, 1, OP_STORAGE_EJECT, name);
-        // SAFETY: closing the media session this call opened.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, media) };
-        let off = libkern::abi::IPC_HEADER_SIZE;
-        reply.ok().and_then(|len| librsproto::decode(&buf[off..off + len]).ok()).map(|m| {
+    let held = match block_on(ns.lookup::<File, MapRead>(path, Rights::MAP_READ)) {
+        Ok(held) => held,
+        Err(e) => {
+            Line::new()
+                .s(b"test-pattern: ")
+                .untrusted(path.as_bytes())
+                .s(b" would not open to hold: ")
+                .s(status_name(e.code().as_i32()).as_bytes())
+                .s(b" FAIL")
+                .end();
+            return 1;
+        }
+    };
+    let media = block_on(
+        ns.lookup::<Channel, Only>("/dev/storage/media", Rights::from_bits(librsproto::session::DIR_SESSION_RIGHTS)),
+    );
+    let st = media.as_ref().err().map_or(0, |e| e.code().as_i32());
+    let answer = if let Ok(media) = media {
+        let mut buf = Msg::new();
+        let reply = librsproto::session::exchange(&media, &mut buf, 1, OP_STORAGE_EJECT, name);
+        drop(media);
+        reply.ok().and_then(|len| librsproto::decode(&buf.payload()[..len]).ok()).map(|m| {
             let refusal = (m.flags & librsproto::RS_FLAG_ERROR != 0)
                 .then(|| librsproto::error::parse_error(m.body).map(|e| (e.kerror, alloc::vec::Vec::from(e.msg))))
                 .flatten();
@@ -209,10 +206,9 @@ fn eject_held(ns: u64, path: &[u8], name: &[u8]) -> i64 {
     } else {
         None
     };
-    // SAFETY: closing the file this call held.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, held) };
+    drop(held);
     let mut l = Line::new();
-    l.s(b"test-pattern: eject of ").untrusted(name).s(b" with ").untrusted(path).s(b" held: ");
+    l.s(b"test-pattern: eject of ").untrusted(name).s(b" with ").untrusted(path.as_bytes()).s(b" held: ");
     match answer {
         Some((OP_STORAGE_EJECT, Some((kerror, why)))) if kerror == KError::WouldBlock.as_i32() => {
             l.s(b"refused, ").untrusted(&why).s(b" ok").end();
@@ -234,51 +230,34 @@ fn eject_held(ns: u64, path: &[u8], name: &[u8]) -> i64 {
 }
 
 /// `--read-device`: the first 4 KiB of the block device at `path`, and how the read went.
-fn read_device(ns: u64, path: &[u8]) -> i64 {
+fn read_device(ns: &Handle<Namespace, NsReadOnly>, path: &str) -> i64 {
     const LEN: u64 = 4096;
-    let (st, node) = libfs::lookup_wait(ns, path, RIGHT_READ);
-    // SAFETY: a plain anonymous object of LEN bytes.
-    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, LEN, 0, 0, 0) };
+    let node = block_on(ns.lookup::<Resource, ReadOnly>(path, Rights::READ));
+    let mem = Handle::<Memory, MapReadWrite>::create(LEN as usize);
     let mut l = Line::new();
-    l.s(b"test-pattern: a read of ").untrusted(path).s(b": ");
-    if st != 0 || node == 0 || mem <= 0 {
-        l.s(b"would not open: ").s(status_name(if st != 0 { st } else { mem as i32 }).as_bytes()).end();
-        return 1;
-    }
-    let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: mem as u64, buf_offset: 0, offset: 0, length: LEN };
-    // SAFETY: `node` is a block device handle this call holds with READ; `&op` names a memory object
-    // this call created.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
-    let (status, moved) = if po < 0 { (po as i32, 0) } else { po_wait(po as u64) };
-    // SAFETY: closing the handles this call opened.
-    unsafe {
-        syscall1(SYS_HANDLE_CLOSE, mem as u64);
-        syscall1(SYS_HANDLE_CLOSE, node);
-    }
-    match status {
-        0 => l.s(b"read ").u(moved).s(b" bytes").end(),
-        _ => l.s(b"refused: ").s(status_name(status).as_bytes()).s(b" (").i(status as i64).s(b")").end(),
+    l.s(b"test-pattern: a read of ").untrusted(path.as_bytes()).s(b": ");
+    let (node, mem) = match (node, mem) {
+        (Ok(node), Ok(mem)) => (node, mem),
+        (Err(e), _) | (_, Err(e)) => {
+            l.s(b"would not open: ").s(status_name(e.code().as_i32()).as_bytes()).end();
+            return 1;
+        }
+    };
+    let read = block_on(node.read(&mem, 0, 0, LEN));
+    drop(mem);
+    drop(node);
+    match read {
+        Ok(moved) => l.s(b"read ").u(moved as u64).s(b" bytes").end(),
+        Err(e) => {
+            let status = e.code().as_i32();
+            l.s(b"refused: ").s(status_name(status).as_bytes()).s(b" (").i(status as i64).s(b")").end()
+        }
     }
     0
 }
 
-fn po_wait(po: u64) -> (i32, u64) {
-    let handles = [po];
-    let mut r = [0u8; 24];
-    // SAFETY: a valid one-entry handle array and result buffer.
-    let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
-    // SAFETY: closing the PO this process owns; a created file is a separate handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
-    if waited != 1 {
-        return (KError::KernelError.as_i32(), 0);
-    }
-    let status = i32::from_le_bytes([r[8], r[9], r[10], r[11]]);
-    let result = u64::from_le_bytes([r[16], r[17], r[18], r[19], r[20], r[21], r[22], r[23]]);
-    (status, result)
-}
-
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"test-pattern: PANIC\n");
-    exit(1)
+    log::write(b"test-pattern: PANIC\n");
+    libos::exit(1)
 }

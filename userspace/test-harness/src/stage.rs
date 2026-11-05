@@ -10,12 +10,19 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use libkern::{
-    CLOCK_MONOTONIC, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, exit, kprint,
-    syscall1, syscall2, syscall4,
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use libkern::{RawHandle, Rights};
+use libos::boot::Start;
+use libos::log;
+use libos::thread::{self, Stack};
+use libos::{
+    Carried, Channel, Deadline, File, Handle, MapRead, MapReadWrite, Memory, Msg, Namespace, NsReadOnly, Only, Ref,
+    Spawn, Timer, WaitSet, block_on, exit, time,
 };
+use libstream::setup::{StageSetup, receive_setup};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -23,11 +30,11 @@ static ALLOC: libheap::Heap = libheap::Heap;
 // The hard-float worker: real `mulsd`/`addsd`, not soft-float libcalls.
 
 /// Exit codes, so `parent` can tell *which* invariant broke rather than just "nonzero".
-const FP_EXIT_SCALAR_MISMATCH: i64 = 20;
-const FP_EXIT_ROUNDTRIP: i64 = 21;
-const FP_EXIT_SIMD_MISMATCH: i64 = 22;
+const FP_EXIT_SCALAR_MISMATCH: i32 = 20;
+const FP_EXIT_ROUNDTRIP: i32 = 21;
+const FP_EXIT_SIMD_MISMATCH: i32 = 22;
 /// The kernel enabled AVX in `XCR0` but the `YMM` state bit was not visible from ring 3.
-const FP_EXIT_XCR0: i64 = 23;
+const FP_EXIT_XCR0: i32 = 23;
 
 /// Values per worker: eight `f64`, two `ymm` registers' worth.
 const FP_LANES: usize = 8;
@@ -72,7 +79,7 @@ unsafe fn xgetbv0() -> u64 {
 ///
 /// Needs the CPU feature, `XSAVE` on, **and** the SSE + AVX state enabled in `XCR0` — userspace
 /// confirming from ring 3 the write the kernel made in `fpu_init_cpu`.
-fn avx2_usable() -> Result<bool, i64> {
+fn avx2_usable() -> Result<bool, i32> {
     let (_, _, ecx1, _) = cpuid(1, 0);
     let osxsave = ecx1 & (1 << 27) != 0;
     let (_, ebx7, _, _) = cpuid(7, 0);
@@ -125,39 +132,16 @@ fn sum_squares_scalar(v: &[f64; FP_LANES]) -> f64 {
 
 /// Sleep about `ms` milliseconds on a one-shot timer: a real deschedule and wake.
 fn timer_nap_ms(ms: u64) {
-    // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
-    let th = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
-    if th < 0 {
-        return; // no timer: fall through without napping rather than failing the check
+    // No timer: fall through without napping rather than failing the check.
+    let Ok(timer) = Handle::<Timer, Only>::create() else { return };
+    let fire_at = time::now().unwrap_or(0) + ms * 1_000_000;
+    let _ = timer.set(fire_at);
+    // The deadline is generous so the timer, not the deadline, normally wakes us.
+    let mut set = WaitSet::<1>::new();
+    if set.add(&timer).is_ok() {
+        let _ = set.wait(Deadline::at(fire_at + 1_000_000_000));
     }
-    let th = th as u64;
-    // SAFETY: FP_CLOCK is a writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut FP_CLOCK) as u64) };
-    // SAFETY: `FP_CLOCK` is a plain `u64` static only this thread touches; a failed clock read
-    // leaves its last value.
-    let now = unsafe { (&raw const FP_CLOCK).read() };
-    let fire_at = now + ms * 1_000_000;
-    // SAFETY: arming our own timer handle (absolute monotonic, one-shot).
-    unsafe { syscall4(SYS_TIMER_SET, th, fire_at, 0, 0) };
-    // SAFETY: FP_WAIT_* are valid writable buffers; the outer deadline is generous so
-    // the timer, not the deadline, normally wakes us.
-    unsafe {
-        FP_WAIT_HANDLES[0] = th;
-        syscall4(
-            SYS_WAIT,
-            (&raw const FP_WAIT_HANDLES) as u64,
-            1,
-            (&raw mut FP_WAIT_RESULTS) as u64,
-            fire_at + 1_000_000_000,
-        );
-    }
-    // SAFETY: closing our own handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
 }
-
-static mut FP_CLOCK: u64 = 0;
-static mut FP_WAIT_HANDLES: [u64; 1] = [0];
-static mut FP_WAIT_RESULTS: [u8; 24] = [0; 24];
 
 /// Role 3 — prove hardware floating point works in ring 3 and that a process's FP state survives
 /// syscalls, preemption and other processes doing the same.
@@ -222,9 +206,9 @@ fn run_fp_worker(seed: u64) -> ! {
     }
 
     if use_avx2 {
-        kprint(b"child: fp worker ok (f64 + avx2)\n");
+        log::write(b"child: fp worker ok (f64 + avx2)\n");
     } else {
-        kprint(b"child: fp worker ok (f64, no avx2)\n");
+        log::write(b"child: fp worker ok (f64, no avx2)\n");
     }
     exit(0);
 }
@@ -248,14 +232,11 @@ fn parse_u64(s: &str) -> Option<u64> {
 ///
 /// `"stage <rows>"` verifies a TSM1 stream on stdin, `"fp <seed>"` runs a hard-float worker. Role
 /// and params come from `argv`, streams from the setup message, never from `arg0`. Exits `0`/`1`.
-fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let boot = libstream::setup::bootstrap(notif, ns, endpoint, arg0);
-    let setup = match boot.setup() {
-        Some(Ok(s)) => s,
-        _ => {
-            kprint(b"test-stage: setup recv/parse FAIL\n");
-            exit(1);
-        }
+fn run_stage(endpoint: Option<Handle<Channel, Only>>, root: Option<&Handle<Namespace, NsReadOnly>>) -> ! {
+    let setup = endpoint.as_ref().and_then(|e| receive_setup(e, Deadline::NEVER).ok().flatten());
+    let Some(setup) = setup else {
+        log::write(b"test-stage: setup recv/parse FAIL\n");
+        exit(1);
     };
     match setup.argv.first().map(|s| s.as_str()) {
         Some("stage") => run_stage_consumer(&setup),
@@ -265,9 +246,9 @@ fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         }
         Some("hold") => run_hold(&setup),
         // A view broker names the program first, as a shell does.
-        Some("test-stage") if setup.argv.get(1).is_some_and(|a| a == "grants") => run_grants(&setup, ns),
+        Some("test-stage") if setup.argv.get(1).is_some_and(|a| a == "grants") => run_grants(&setup, root),
         _ => {
-            kprint(b"test-stage: unknown argv[0]\n");
+            log::write(b"test-stage: unknown argv[0]\n");
             exit(1);
         }
     }
@@ -275,47 +256,46 @@ fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// The `"hold"` role: its setup taken, wait until `stdin`'s other end closes, then exit, so a test
 /// can look at what taking the setup left while the stage still runs.
-fn run_hold(setup: &libstream::setup::Setup) -> ! {
-    if let Some(stdin) = setup.streams.stdin {
-        let waited = [stdin];
-        let mut results = [0u8; 24];
-        // SAFETY: one handle to wait on and room for its result; no deadline.
-        unsafe { syscall4(SYS_WAIT, waited.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+fn run_hold(setup: &StageSetup) -> ! {
+    if let Some(stdin) = &setup.streams.stdin {
+        let mut set = WaitSet::<1>::new();
+        let _ = set.add(stdin);
+        let _ = set.wait(Deadline::NEVER);
     }
     exit(0);
 }
 
 /// The `"stage <rows>"` role: read + verify a TSM1 stream on `stdin` (`<rows>` rows, row
 /// `i` carries `Int(i)`), the stream handle delivered via the setup message.
-fn run_stage_consumer(setup: &libstream::setup::Setup) -> ! {
-    use libstream::channel::{ChannelReceiver, IpcPort};
+fn run_stage_consumer(setup: &StageSetup) -> ! {
+    use libstream::channel::{ChannelReceiver, IpcPortRef};
     use libstream::table::{Item, TableReader};
 
     let expect = match setup.argv.get(1).and_then(|s| parse_u64(s)) {
         Some(n) => n as i64,
         None => {
-            kprint(b"test-stage: bad argv (rows)\n");
+            log::write(b"test-stage: bad argv (rows)\n");
             exit(1);
         }
     };
-    let stdin = match setup.streams.stdin {
+    let stdin = match &setup.streams.stdin {
         Some(h) => h,
         None => {
-            kprint(b"test-stage: no stdin stream\n");
+            log::write(b"test-stage: no stdin stream\n");
             exit(1);
         }
     };
-    let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive(1 << 20) {
+    let bytes = match ChannelReceiver::new(IpcPortRef::new(stdin)).receive(1 << 20) {
         Ok(b) => b,
         Err(_) => {
-            kprint(b"test-stage: stdin receive FAIL\n");
+            log::write(b"test-stage: stdin receive FAIL\n");
             exit(1);
         }
     };
     let mut tr = match TableReader::new(&bytes) {
         Ok(t) => t,
         Err(_) => {
-            kprint(b"test-stage: bad TSM1 header\n");
+            log::write(b"test-stage: bad TSM1 header\n");
             exit(1);
         }
     };
@@ -324,23 +304,23 @@ fn run_stage_consumer(setup: &libstream::setup::Setup) -> ! {
         match tr.next() {
             Some(Ok(Item::Row(vals))) => {
                 if vals.first().and_then(|v| v.as_int()) != Some(n) {
-                    kprint(b"test-stage: row MISMATCH\n");
+                    log::write(b"test-stage: row MISMATCH\n");
                     exit(1);
                 }
                 n += 1;
             }
             Some(Ok(Item::End(_))) | None => break,
             _ => {
-                kprint(b"test-stage: decode FAIL\n");
+                log::write(b"test-stage: decode FAIL\n");
                 exit(1);
             }
         }
     }
     if n != expect {
-        kprint(b"test-stage: wrong row count\n");
+        log::write(b"test-stage: wrong row count\n");
         exit(1);
     }
-    kprint(b"test-stage: setup message + stdin stream verified ok\n");
+    log::write(b"test-stage: setup message + stdin stream verified ok\n");
     exit(0);
 }
 
@@ -349,78 +329,53 @@ const GRANTS_CHILD: u64 = 0x4752_0000;
 
 /// Where a view's grants bind, bit `i` each in what [`grants_resolved`] reports; bit 7 stands for
 /// any `/dev/blk/<n>`, which the `disks` grant binds.
-const GRANT_PATHS: [&[u8]; 7] = [
-    b"/dev/storage/admin",
-    b"/dev/services/admin",
-    b"/dev/power",
-    b"/dev/logs",
-    b"/dev/policy",
-    b"/dev/accounts",
-    b"/dev/log",
+const GRANT_PATHS: [&str; 7] = [
+    "/dev/storage/admin",
+    "/dev/services/admin",
+    "/dev/power",
+    "/dev/logs",
+    "/dev/policy",
+    "/dev/accounts",
+    "/dev/log",
 ];
 
 /// Which of a view's grants resolve in `ns`, as bits of [`GRANT_PATHS`].
-fn grants_resolved(ns: u64) -> u8 {
-    use libkern::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_READ, RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
-    let rights = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_MAP_READ | RIGHT_READ | RIGHT_INSPECT;
-    let found = |path: &[u8]| match libfs::lookup_wait(ns, path, rights) {
-        (0, h) => {
-            // SAFETY: closing a handle the lookup gave this process.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-            true
-        }
-        _ => false,
-    };
+fn grants_resolved(ns: Option<&Handle<Namespace, NsReadOnly>>) -> u8 {
+    let rights = Rights::SEND | Rights::RECV | Rights::WAIT | Rights::MAP_READ | Rights::READ | Rights::INSPECT;
+    let found = |path: &str| ns.is_some_and(|ns| block_on(ns.lookup::<File, MapRead>(path, rights)).is_ok());
     let mut mask = 0;
     for (i, path) in GRANT_PATHS.iter().enumerate() {
         if found(path) {
             mask |= 1 << i;
         }
     }
-    if (0..16).any(|n| found(alloc::format!("/dev/blk/{n}").as_bytes())) {
+    if (0..16).any(|n| found(&alloc::format!("/dev/blk/{n}"))) {
         mask |= 1 << 7;
     }
     mask
 }
 
 /// Send one rsproto message with `op` and `body` on `ch`, moving `handles`.
-fn rs_send(ch: u64, op: u16, body: &[u8], handles: &[u64]) -> bool {
-    let mut msg = [0u8; libkern::abi::IPC_MSG_SIZE]; // the kernel copies a whole message
-    let Some(n) = librsproto::encode(&mut msg[24..], op, 1, 0, body, handles.len() as u16) else {
+fn rs_send(ch: Ref<'_, Channel, Only>, op: u16, body: &[u8], handles: &mut Carried) -> bool {
+    let mut msg = Msg::new();
+    let Some(n) = librsproto::encode(msg.payload_mut(), op, 1, 0, body, handles.len() as u16) else {
         return false;
     };
-    msg[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-    msg[8] = handles.len() as u8;
-    // SAFETY: a valid message buffer and handle array.
-    let sr = unsafe {
-        libkern::syscall5(
-            libkern::SYS_CHANNEL_SEND,
-            ch,
-            msg.as_ptr() as u64,
-            handles.as_ptr() as u64,
-            handles.len() as u64,
-            libkern::SENDMODE_NOBLOCK,
-        )
-    };
-    sr == 0
+    msg.set_len(n).is_ok() && ch.send(&msg, handles).is_ok()
 }
 
 /// The next rsproto message's op on `ch`, waiting for it; `None` once the peer has gone.
-fn rs_recv(ch: u64) -> Option<u16> {
-    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
+fn rs_recv(ch: Ref<'_, Channel, Only>) -> Option<u16> {
+    let mut msg = Msg::new();
     loop {
-        match libkern::channel_recv(ch, &mut buf) {
-            Ok(_) => {
-                let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-                return librsproto::decode(&buf[24..24 + len.min(4096 - 24)]).ok().map(|m| m.op);
-            }
-            Err(rr) if rr == libkern::KError::PeerClosed.as_i32() as i64 => return None,
+        match ch.recv(&mut msg) {
+            Ok(_) => return librsproto::decode(msg.payload()).ok().map(|m| m.op),
+            Err(e) if e.code() == libkern::KError::PeerClosed => return None,
             Err(_) => {}
         }
-        let waited = [ch];
-        let mut results = [0u64; 8];
-        // SAFETY: one handle to wait on and room for its result; no deadline.
-        unsafe { syscall4(SYS_WAIT, waited.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+        let mut set = WaitSet::<1>::new();
+        let _ = set.add(ch);
+        let _ = set.wait(Deadline::NEVER);
     }
 }
 
@@ -428,48 +383,38 @@ fn rs_recv(ch: u64) -> Option<u16> {
 /// request to stop goes unheeded. Each message on stdin is answered on stdout: op 1 with the
 /// grants that resolve here ([`grants_resolved`]); op 2 by leaving a child on this namespace,
 /// handing over a channel to it, and exiting.
-fn run_grants(setup: &libstream::setup::Setup, ns: u64) -> ! {
-    let (Some(stdin), Some(stdout)) = (setup.streams.stdin, setup.streams.stdout) else {
+fn run_grants(setup: &StageSetup, ns: Option<&Handle<Namespace, NsReadOnly>>) -> ! {
+    let (Some(stdin), Some(stdout)) = (&setup.streams.stdin, &setup.streams.stdout) else {
         exit(1);
     };
-    while let Some(op) = rs_recv(stdin) {
+    while let Some(op) = rs_recv(stdin.as_ref()) {
         if op == 1 {
-            rs_send(stdout, 1, &[grants_resolved(ns)], &[]);
+            rs_send(stdout.as_ref(), 1, &[grants_resolved(ns)], &mut Carried::new());
             continue;
         }
-        let (mut mine, mut its) = (0u64, 0u64);
-        // SAFETY: valid writable out-params.
-        let made =
-            unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut mine) as u64, (&raw mut its) as u64, 4, 0) } == 0;
-        let (st, image) = libfs::lookup_wait(ns, b"/bin/test-stage", libkern::RIGHT_MAP_READ);
-        if !made || st != 0 {
+        let made = Handle::<Channel, Only>::pair(4);
+        let image = ns.map(|ns| block_on(ns.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ)));
+        let (Ok((mine, its)), Some(Ok(image))) = (made, image) else {
             exit(1);
-        }
-        let mut args = libkern::SpawnArgs {
-            image,
-            handle_count: 1,
-            move_mask: 1,
-            arg0: GRANTS_CHILD,
-            handles: [0; libkern::SPAWN_MAX_HANDLES],
-            rights: [0; libkern::SPAWN_MAX_HANDLES],
-            namespace: 0,
-            syscaps: 0,
         };
-        args.handles[0] = its;
-        args.rights[0] = u64::MAX;
-        let spawned = libos::spawn(&args).is_ok();
-        // SAFETY: closing our own image handle, which the spawn only read.
-        unsafe { libkern::syscall::syscall1(libkern::SYS_HANDLE_CLOSE, image) };
-        exit(if spawned && rs_send(stdout, 2, &[], &[mine]) { 0 } else { 1 });
+        let spawned = {
+            let mut spawn = Spawn::new(&image);
+            spawn.arg0(GRANTS_CHILD);
+            spawn.grant(its, Rights::from_bits(u64::MAX)).is_ok() && spawn.spawn().is_ok()
+        };
+        drop(image);
+        let mut handed = Carried::new();
+        let _ = handed.push(mine);
+        exit(if spawned && rs_send(stdout.as_ref(), 2, &[], &mut handed) { 0 } else { 1 });
     }
     exit(0);
 }
 
 /// The child [`run_grants`] leaves: one message on its channel is answered with the grants that
 /// resolve in the namespace it shares with the program that started it.
-fn run_grants_child(ns: u64, ch: u64) -> ! {
-    if rs_recv(ch).is_some() {
-        rs_send(ch, 1, &[grants_resolved(ns)], &[]);
+fn run_grants_child(ns: Option<&Handle<Namespace, NsReadOnly>>, ch: &Handle<Channel, Only>) -> ! {
+    if rs_recv(ch.as_ref()).is_some() {
+        rs_send(ch.as_ref(), 1, &[grants_resolved(ns)], &mut Carried::new());
     }
     exit(0);
 }
@@ -486,43 +431,29 @@ static EXIT_HANDLE: AtomicU64 = AtomicU64::new(0);
 static EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Start a thread at `entry` on the CPUs in `affinity` (`0` for any), on a stack never unmapped.
-fn start_thread(entry: extern "C" fn() -> !, affinity: u8) -> bool {
-    const STACK: u64 = 4 * 4096;
-    // SAFETY: register-only syscalls; the second maps the object the first made.
-    let base = unsafe {
-        let mem = syscall4(libkern::SYS_MEMORY_CREATE, STACK, 0, 0, 0);
-        if mem < 0 {
-            return false;
-        }
-        syscall4(libkern::SYS_MEMORY_MAP, mem as u64, 0, STACK, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE)
-    };
-    let args = libkern::ThreadArgs {
-        entry: entry as *const () as u64,
-        user_sp: base as u64 + STACK,
-        arg0: 0,
-        class: 0,
-        rt_priority: 0,
-        nice: 0,
-        cpu_affinity: affinity,
-        _reserved: [0; 36],
-    };
-    // SAFETY: `entry` never returns, and the stack just mapped is never unmapped or used again.
-    base >= 0 && unsafe { libos::thread_create(&args) }.is_ok()
+fn start_thread(entry: thread::Entry, affinity: u8) -> bool {
+    Stack::new(4 * 4096).and_then(|stack| thread::start_on(entry, stack, 0, affinity)).is_ok()
 }
 
-fn thread_exit() -> ! {
-    // SAFETY: `sys_thread_exit` ends this thread.
-    unsafe { syscall1(libkern::SYS_THREAD_EXIT, 0) };
-    loop {
-        // SAFETY: `pause` is always valid in ring 3 and has no effects.
-        unsafe { asm!("pause", options(nomem, nostack)) };
-    }
+/// The channel [`EXIT_HANDLE`] holds, as the thread that waits on it borrows it.
+fn exit_channel() -> Ref<'static, Channel, Only> {
+    // SAFETY: the main thread stored a channel it owns before starting any thread, and its frame,
+    // which never returns, holds it open until the process exits.
+    unsafe { Ref::from_raw(RawHandle(EXIT_HANDLE.load(Ordering::Acquire)), Rights::empty()) }
+}
+
+/// The counter at `addr`, in a page a parent shares and only reads.
+fn shared_count(addr: &AtomicU64) -> &'static AtomicU64 {
+    // SAFETY: `addr` holds the address of a page the main thread mapped and keeps for the life of
+    // the process, and an atomic is what a page written by one side and read by another holds.
+    unsafe { &*(addr.load(Ordering::Acquire) as *const AtomicU64) }
 }
 
 /// `EXIT_WAITING`: a second thread blocks in `sys_wait` on `ch`, which nothing sends to; once it
 /// has had time to block, a message says so on `ch` and the process exits.
-fn exit_waiting(ch: u64) -> ! {
-    EXIT_HANDLE.store(ch, Ordering::Release);
+fn exit_waiting(ch: Option<Handle<Channel, Only>>) -> ! {
+    let Some(ch) = ch else { exit(1) };
+    EXIT_HANDLE.store(ch.raw().0, Ordering::Release);
     if !start_thread(exit_waiter, 0) {
         exit(1);
     }
@@ -530,47 +461,39 @@ fn exit_waiting(ch: u64) -> ! {
         core::hint::spin_loop();
     }
     timer_nap_ms(20);
-    exit(if rs_send(ch, 1, &[], &[]) { 0 } else { 1 });
+    exit(if rs_send(ch.as_ref(), 1, &[], &mut Carried::new()) { 0 } else { 1 });
 }
 
 /// Waits on [`EXIT_HANDLE`] for good: a wait that returns waits again, so only an exit ends it.
-extern "C" fn exit_waiter() -> ! {
-    let ch = [EXIT_HANDLE.load(Ordering::Acquire)];
-    let mut results = [0u8; 24];
+extern "C" fn exit_waiter(_: u64, _: u64, _: u64, _: u64) -> ! {
+    let mut set = WaitSet::<1>::new();
+    let _ = set.add(exit_channel());
     EXIT_STARTED.store(true, Ordering::Release);
     loop {
-        // SAFETY: a one-handle list and a result buffer for it.
-        unsafe { syscall4(SYS_WAIT, ch.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+        let _ = set.wait(Deadline::NEVER);
     }
 }
 
 /// `EXIT_RUNNING`: one thread counts in the page of `mem` on CPU 2, another exits the process
 /// from CPU 3 once the count has begun, and the first thread leaves.
-fn exit_running(mem: u64) -> ! {
-    // SAFETY: register-only syscall mapping the page the parent handed over.
-    let page =
-        unsafe { syscall4(libkern::SYS_MEMORY_MAP, mem, 0, 4096, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) };
-    if page < 0 {
-        exit(1);
-    }
-    EXIT_HANDLE.store(page as u64, Ordering::Release);
+fn exit_running(mem: Option<Handle<Memory, MapReadWrite>>) -> ! {
+    let Some(Ok(page)) = mem.as_ref().map(|mem| mem.map(4096)) else { exit(1) };
+    EXIT_HANDLE.store(page.into_raw().0 as u64, Ordering::Release);
     if !start_thread(exit_counter, 1 << 2) || !start_thread(exit_exiter, 1 << 3) {
         exit(1);
     }
-    thread_exit();
+    thread::exit(0);
 }
 
-extern "C" fn exit_counter() -> ! {
-    // SAFETY: the page `exit_running` mapped, never unmapped; the parent only reads it.
-    let count = unsafe { &*(EXIT_HANDLE.load(Ordering::Acquire) as *const AtomicU64) };
+extern "C" fn exit_counter(_: u64, _: u64, _: u64, _: u64) -> ! {
+    let count = shared_count(&EXIT_HANDLE);
     loop {
         count.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-extern "C" fn exit_exiter() -> ! {
-    // SAFETY: as in `exit_counter`.
-    let count = unsafe { &*(EXIT_HANDLE.load(Ordering::Acquire) as *const AtomicU64) };
+extern "C" fn exit_exiter(_: u64, _: u64, _: u64, _: u64) -> ! {
+    let count = shared_count(&EXIT_HANDLE);
     while count.load(Ordering::Relaxed) == 0 {
         core::hint::spin_loop();
     }
@@ -579,35 +502,29 @@ extern "C" fn exit_exiter() -> ! {
 
 /// `EXIT_ALONE`: the process's only thread leaves by `sys_thread_exit`, holding the channel.
 fn exit_alone() -> ! {
-    thread_exit();
+    thread::exit(0);
 }
 
 const SPAWNS: u64 = 48;
 static SPAWNED: AtomicU64 = AtomicU64::new(0);
 /// The address of the page [`spawn_waiter`]s count in.
 static SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Every spawn's stack, mapped up front so the spawner spends its time in `sys_thread_create`.
-static SPAWN_STACKS: AtomicU64 = AtomicU64::new(0);
-const SPAWN_STACK: u64 = 4 * 4096;
+/// Every spawn's stack, made up front so the spawner spends its time in `sys_thread_create`: a
+/// `Box<Vec<Stack>>` leaked by `exit_spawning` for the spawner to take.
+static SPAWN_STACKS: AtomicPtr<Vec<Stack>> = AtomicPtr::new(core::ptr::null_mut());
+const SPAWN_STACK: usize = 4 * 4096;
 
 /// `EXIT_SPAWNING`: a second thread starts [`spawn_waiter`]s as fast as it can, and the process
 /// exits once a few have, so the exit meets one mid-creation.
-fn exit_spawning(mem: u64) -> ! {
-    let rw = libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE;
-    let stacks = SPAWNS * SPAWN_STACK;
-    let (mut ours, mut theirs) = (0u64, 0u64);
-    // SAFETY: register-only syscalls and valid out-params; each map maps the object it names.
-    let (page, base, made) = unsafe {
-        let page = syscall4(libkern::SYS_MEMORY_MAP, mem, 0, 4096, rw);
-        let obj = syscall4(libkern::SYS_MEMORY_CREATE, stacks, 0, 0, 0);
-        let base = syscall4(libkern::SYS_MEMORY_MAP, obj.max(0) as u64, 0, stacks, rw);
-        let made = syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 4, 0);
-        (page, base, made == 0)
-    };
-    SPAWN_COUNT.store(page.max(0) as u64, Ordering::Release);
-    SPAWN_STACKS.store(base.max(0) as u64, Ordering::Release);
-    EXIT_HANDLE.store(ours, Ordering::Release);
-    if page < 0 || base < 0 || !made || !start_thread(exit_spawner, 0) {
+fn exit_spawning(mem: Option<Handle<Memory, MapReadWrite>>) -> ! {
+    let page = mem.as_ref().map(|mem| mem.map(4096));
+    let stacks = (0..SPAWNS).map(|_| Stack::new(SPAWN_STACK)).collect::<Result<Vec<_>, _>>();
+    let channel = Handle::<Channel, Only>::pair(4);
+    let (Some(Ok(page)), Ok(stacks), Ok((ours, _theirs))) = (page, stacks, channel) else { exit(1) };
+    SPAWN_COUNT.store(page.into_raw().0 as u64, Ordering::Release);
+    SPAWN_STACKS.store(Box::into_raw(Box::new(stacks)), Ordering::Release);
+    EXIT_HANDLE.store(ours.raw().0, Ordering::Release);
+    if !start_thread(exit_spawner, 0) {
         exit(1);
     }
     while SPAWNED.load(Ordering::Acquire) < 4 {
@@ -616,38 +533,26 @@ fn exit_spawning(mem: u64) -> ! {
     exit(0);
 }
 
-extern "C" fn exit_spawner() -> ! {
-    let base = SPAWN_STACKS.load(Ordering::Acquire);
-    for i in 0..SPAWNS {
-        let args = libkern::ThreadArgs {
-            entry: spawn_waiter as *const () as u64,
-            user_sp: base + (i + 1) * SPAWN_STACK,
-            arg0: 0,
-            class: 0,
-            rt_priority: 0,
-            nice: 0,
-            cpu_affinity: 0,
-            _reserved: [0; 36],
-        };
-        // SAFETY: `spawn_waiter` never returns, and each waiter has its own slice of the stacks,
-        // which are never unmapped.
-        if unsafe { libos::thread_create(&args) }.is_err() {
+extern "C" fn exit_spawner(_: u64, _: u64, _: u64, _: u64) -> ! {
+    let stacks = SPAWN_STACKS.swap(core::ptr::null_mut(), Ordering::Acquire);
+    // SAFETY: `exit_spawning` leaked this box for the spawner alone, and the swap hands it out once.
+    let stacks = unsafe { Box::from_raw(stacks) };
+    for stack in *stacks {
+        if thread::start(spawn_waiter, stack, 0).is_err() {
             break;
         }
         SPAWNED.fetch_add(1, Ordering::Release);
     }
-    thread_exit();
+    thread::exit(0);
 }
 
 /// Waits on [`EXIT_HANDLE`] for good, counting each wait that fails, as all do once it is closed.
-extern "C" fn spawn_waiter() -> ! {
-    let ch = [EXIT_HANDLE.load(Ordering::Acquire)];
-    // SAFETY: the page `exit_spawning` mapped, never unmapped; the parent only reads it.
-    let count = unsafe { &*(SPAWN_COUNT.load(Ordering::Acquire) as *const AtomicU64) };
-    let mut results = [0u8; 24];
+extern "C" fn spawn_waiter(_: u64, _: u64, _: u64, _: u64) -> ! {
+    let count = shared_count(&SPAWN_COUNT);
+    let mut set = WaitSet::<1>::new();
+    let _ = set.add(exit_channel());
     loop {
-        // SAFETY: a one-handle list and a result buffer for it.
-        if unsafe { syscall4(SYS_WAIT, ch.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) } < 0 {
+        if set.wait(Deadline::NEVER).is_err() {
             count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -656,16 +561,21 @@ extern "C" fn spawn_waiter() -> ! {
 /// Bootstrap registers: `rdi` notif, `rsi` namespace, `rdx` endpoint (the setup channel for a
 /// Tier-1 stage), `rcx` `arg0`.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    if libstream::setup::setup_is_pending(arg0) {
-        run_stage(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    if libstream::setup::setup_is_pending(start.arg0) {
+        run_stage(start.take_handle0(), start.root.as_ref());
     }
-    match arg0 {
-        GRANTS_CHILD => run_grants_child(ns, endpoint),
-        EXIT_WAITING => exit_waiting(endpoint),
-        EXIT_RUNNING => exit_running(endpoint),
+    match start.arg0 {
+        GRANTS_CHILD => match start.take_handle0() {
+            Some(ch) => run_grants_child(start.root.as_ref(), &ch),
+            None => exit(1),
+        },
+        EXIT_WAITING => exit_waiting(start.take_handle0()),
+        EXIT_RUNNING => exit_running(start.take_handle0()),
         EXIT_ALONE => exit_alone(),
-        EXIT_SPAWNING => exit_spawning(endpoint),
+        EXIT_SPAWNING => exit_spawning(start.take_handle0()),
         _ => exit(0),
     }
 }
