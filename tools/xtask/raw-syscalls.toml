@@ -6,7 +6,7 @@
 [counts]
 "userspace/eshell" = 44
 "userspace/libheap" = 5
-"userspace/test-harness" = 863
+"userspace/test-harness" = 858
 
 [agreed]
 "userspace/eshell" = "the recovery shell, on libkern by choice"
