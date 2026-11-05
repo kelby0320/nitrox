@@ -22,10 +22,16 @@
 
 extern crate alloc;
 
+use libdraw::format::PixelFormat;
 use libdraw::framebuffer::Framebuffer;
 use libdraw::scene;
-use libkern::debug::Line;
-use libkern::{SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2, syscall4};
+use libkern::Rights;
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{
+    Deadline, Handle, MapRead, MapReadWrite, Mapping, Memory, Namespace, Notify, NsReadOnly, Only, Ref, WaitSet,
+    block_on, system, time,
+};
 use librsproto::surface::{
     AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, FocusEvent, MgrWindowCreated,
     MgrWindowRef, OP_ATTACH_BUFFER, OP_COMMIT, OP_CONFIGURE, OP_FOCUS_EVENT, OP_MGR_WINDOW_CREATED,
@@ -75,8 +81,15 @@ impl Win {
         self.session.window(self.id).expect("this session's only window")
     }
 
-    fn attach(&mut self, b: u32, width: u32, height: u32, pitch: u32, handle: u64) -> Result<(), libsurface::UiError> {
-        self.w().attach(b, width, height, pitch, handle)
+    fn attach(
+        &mut self,
+        b: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        memory: Handle<Memory, MapReadWrite>,
+    ) -> Result<(), libsurface::UiError> {
+        self.w().attach_memory(b, width, height, pitch, memory, PixelFormat::XRGB8888).map_err(|(e, _)| e)
     }
 
     fn commit(&mut self, b: u32, damage: (u32, u32, u32, u32)) -> Result<(), libsurface::UiError> {
@@ -96,32 +109,15 @@ impl Win {
     }
 }
 
-/// Create a `MemoryObject` of `len` bytes and map it read-write; returns `(handle, address)`.
-fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
-    // SAFETY: a plain anonymous object of `len` bytes.
-    let h = unsafe { syscall4(SYS_MEMORY_CREATE, len as u64, 0, 0, 0) };
-    if h <= 0 {
-        return None;
-    }
-    // SAFETY: mapping an object this process just created, read-write.
-    let addr = unsafe {
-        syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE)
-    };
-    if addr <= 0 {
-        // SAFETY: the map failed, so nothing references the object; closing our only
-        // handle to it. Only reachable when allocation is already failing — but this file
-        // exists to prove leaks absent, so it should not contain one.
-        unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, h as u64, 0, 0, 0) };
-        return None;
-    }
-    Some((h as u64, addr as *mut u8))
+/// Create a `MemoryObject` of `len` bytes and map it read-write; returns the object and its mapping.
+fn shared_buffer(len: usize) -> Option<(Handle<Memory, MapReadWrite>, Mapping<MapReadWrite>)> {
+    let memory = Handle::<Memory, MapReadWrite>::create(len).ok()?;
+    let map = memory.map(len).ok()?;
+    Some((memory, map))
 }
 
 /// Resolve `/dev/draw/<id>/info`, map it, and return the snapshot.
-fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::WindowInfo> {
-    use libkern::handle::{RawHandle, Rights};
-    use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, Ref, block_on};
-
+fn read_window_info(ns: Ref<'_, Namespace, NsReadOnly>, id: u32) -> Option<librsproto::surface::WindowInfo> {
     let mut path = [0u8; 32];
     let prefix = b"/dev/draw/";
     path[..prefix.len()].copy_from_slice(prefix);
@@ -145,8 +141,6 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
     n += 5;
     let path = core::str::from_utf8(&path[..n]).ok()?;
 
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
     let obj: Handle<Memory, MapRead> = block_on(ns.lookup(path, Rights::MAP_READ)).ok()?;
     // **The constant, not a literal**: a stale length would silently make this return `None`.
     const N: usize = librsproto::surface::WINDOW_INFO_LEN;
@@ -155,8 +149,8 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
     librsproto::surface::WindowInfo::read(&bytes)
 }
 
-fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
-    let Some(info) = read_window_info(root_ns, id) else { return false };
+fn check_info(ns: Ref<'_, Namespace, NsReadOnly>, id: u32, want_w: u32, want_h: u32) -> bool {
+    let Some(info) = read_window_info(ns, id) else { return false };
 
     Line::new()
         .s(b"ui-testclient: info id=")
@@ -174,10 +168,9 @@ fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
 
 /// Open and close windows in a loop, proving the compositor gives the memory back.
 #[inline(never)]
-fn churn(root_ns: u64) -> bool {
+fn churn(ns: Ref<'_, Namespace, NsReadOnly>) -> bool {
     // **Boxed**: a `ChannelTransport` is ~9 KiB against a 32 KiB stack.
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let mut t = match unsafe { ChannelTransport::connect(root_ns) } {
+    let mut t = match ChannelTransport::open(ns) {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => return false,
     };
@@ -191,23 +184,22 @@ fn churn(root_ns: u64) -> bool {
                 return false;
             }
         };
-        let Some((handle, addr)) = shared_buffer(len) else {
+        let Some((memory, map)) = shared_buffer(len) else {
             Line::new().s(b"churn: real buffer alloc failed at cycle ").u(cycle as u64).end();
             return false;
         };
-        if w.attach(0, CHURN_W, CHURN_H, pitch as u32, handle).is_err() {
+        if w.attach(0, CHURN_W, CHURN_H, pitch as u32, memory).is_err() {
             return false;
         }
         if w.destroy().is_err() {
             return false;
         }
         t = w.into_transport();
-        // SAFETY: unmapping a range this process mapped in `shared_buffer`.
-        unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64) };
+        drop(map);
 
         // **A rejected attach must also give the memory back**: sent raw, as `libsurface` cannot
         // express it.
-        let Some((bogus_handle, bogus_addr)) = shared_buffer(len) else {
+        let Some((bogus_memory, bogus_map)) = shared_buffer(len) else {
             Line::new().s(b"churn: bogus buffer alloc failed at cycle ").u(cycle as u64).end();
             return false;
         };
@@ -249,34 +241,30 @@ fn churn(root_ns: u64) -> bool {
         // **Waits for the refusal**: it paces the loop; anything but `Err(Server)` means a bogus
         // attach was accepted.
         let mut reply = [0u8; 32];
-        match t.request(bogus_op, &req[..rn], Some(bogus_handle), &mut reply) {
+        let sent = t.request(bogus_op, &req[..rn], Some(bogus_memory.raw().0), &mut reply);
+        // The send moved the object to the compositor, which closes it whatever it answers.
+        bogus_memory.into_raw();
+        match sent {
             Err(libsurface::UiError::Server) => {}
             _ => {
                 Line::new().s(b"churn: bogus request was not refused at cycle ").u(cycle as u64).end();
                 return false;
             }
         }
-        // SAFETY: unmapping a range this process mapped in `shared_buffer`.
-        unsafe { syscall2(SYS_MEMORY_UNMAP, bogus_addr as u64, len as u64) };
+        drop(bogus_map);
     }
     true
 }
 
 /// Load one of the two faces the image ships, or die saying which and why: a font that fails to
 /// load must not leave a green boot with no text.
-fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
+fn load_face(ns: Ref<'_, Namespace, NsReadOnly>, face: Face) -> libdraw::text::Font {
     use libdraw::theme::Theme;
 
     let theme = Theme::default();
     let (wanted, loaded) = match face {
-        Face::Ui => (theme.font_ui, unsafe {
-            // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-            libdraw::text::load_ui(root_ns, &theme, b"ui-testclient")
-        }),
-        Face::Mono => (theme.font_mono, unsafe {
-            // SAFETY: as above.
-            libdraw::text::load_mono(root_ns, &theme, b"ui-testclient")
-        }),
+        Face::Ui => (theme.font_ui, libdraw::text::load_ui_font(ns, &theme, b"ui-testclient")),
+        Face::Mono => (theme.font_mono, libdraw::text::load_mono_font(ns, &theme, b"ui-testclient")),
     };
     match loaded {
         // **The path opened, not the one asked for**: `check-display` asserts against this line.
@@ -298,7 +286,7 @@ enum Face {
 
 /// Present [`libui::reference`] in a window of its own, drawn with `font`; the caller keeps the
 /// window.
-fn present_reference_ui(root_ns: u64, font: &libdraw::text::Font) -> Win {
+fn present_reference_ui(ns: Ref<'_, Namespace, NsReadOnly>, font: &libdraw::text::Font) -> Win {
     let (w, h) = (libui::reference::WIDTH, libui::reference::HEIGHT);
     let pitch = libui::reference::PITCH;
     let len = pitch * h as usize;
@@ -307,8 +295,7 @@ fn present_reference_ui(root_ns: u64, font: &libdraw::text::Font) -> Win {
         fail(b"ui-testclient: reference UI is not the size it declares\n");
     }
 
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let t = match unsafe { ChannelTransport::connect(root_ns) } {
+    let t = match ChannelTransport::open(ns) {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"ui-testclient: second connect to /dev/draw FAILED\n"),
     };
@@ -317,13 +304,13 @@ fn present_reference_ui(root_ns: u64, font: &libdraw::text::Font) -> Win {
         Err(_) => fail(b"ui-testclient: reference UI CreateWindow FAILED\n"),
     };
     for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
+        let Some((memory, mut map)) = shared_buffer(len) else {
             fail(b"ui-testclient: reference UI buffer alloc FAILED\n");
         };
-        // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
-        // regions are distinct allocations, so they cannot overlap.
-        unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
-        if win.attach(i as u32, w, h, pitch as u32, handle).is_err() {
+        if map.write_from(0, &picture).is_err() {
+            fail(b"ui-testclient: reference UI buffer alloc FAILED\n");
+        }
+        if win.attach(i as u32, w, h, pitch as u32, memory).is_err() {
             fail(b"ui-testclient: reference UI AttachBuffer FAILED\n");
         }
     }
@@ -351,7 +338,7 @@ fn present_reference_ui(root_ns: u64, font: &libdraw::text::Font) -> Win {
 ///
 /// **The reference, not `nxterm`'s window**: a live first frame is a banner; this stream makes each
 /// line fail differently.
-fn present_reference_term(root_ns: u64, font: &libdraw::text::Font) -> Win {
+fn present_reference_term(ns: Ref<'_, Namespace, NsReadOnly>, font: &libdraw::text::Font) -> Win {
     use libterm::render::reference;
 
     let size = reference::size(font);
@@ -363,8 +350,7 @@ fn present_reference_term(root_ns: u64, font: &libdraw::text::Font) -> Win {
         fail(b"ui-testclient: reference terminal is not the size it declares\n");
     }
 
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let t = match unsafe { ChannelTransport::connect(root_ns) } {
+    let t = match ChannelTransport::open(ns) {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"ui-testclient: third connect to /dev/draw FAILED\n"),
     };
@@ -373,13 +359,13 @@ fn present_reference_term(root_ns: u64, font: &libdraw::text::Font) -> Win {
         Err(_) => fail(b"ui-testclient: reference terminal CreateWindow FAILED\n"),
     };
     for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
+        let Some((memory, mut map)) = shared_buffer(len) else {
             fail(b"ui-testclient: reference terminal buffer alloc FAILED\n");
         };
-        // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
-        // regions are distinct allocations, so they cannot overlap.
-        unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
-        if win.attach(i as u32, w, h, pitch as u32, handle).is_err() {
+        if map.write_from(0, &picture).is_err() {
+            fail(b"ui-testclient: reference terminal buffer alloc FAILED\n");
+        }
+        if win.attach(i as u32, w, h, pitch as u32, memory).is_err() {
             fail(b"ui-testclient: reference terminal AttachBuffer FAILED\n");
         }
     }
@@ -430,7 +416,7 @@ fn raise_window(mgr: &mut ChannelTransport, window: u32) -> bool {
 
 /// Drive the three desktop requests over the real manager channel and read each back (the **wire**
 /// is what no host test reaches); the window ends where it started.
-fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32) {
+fn verify_desktop_requests(mgr: &mut ChannelTransport, ns: Ref<'_, Namespace, NsReadOnly>, window: u32) {
     use librsproto::surface::{
         MgrDesktop, MgrWindowValue, OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_MINIMIZED, OP_MGR_SET_WINDOW_DESKTOP,
         STICKY_DESKTOP, WINDOW_FLAG_MINIMIZED,
@@ -449,7 +435,7 @@ fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32
     if !send_value(mgr, OP_MGR_SET_WINDOW_DESKTOP, window, 2) {
         fail(b"ui-testclient: SetWindowDesktop was refused\n");
     }
-    let Some(info) = read_window_info(root_ns, window) else {
+    let Some(info) = read_window_info(ns, window) else {
         fail(b"ui-testclient: could not read back a window's desktop\n");
     };
     if info.desktop != 2 {
@@ -467,7 +453,7 @@ fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32
     if !send_value(mgr, OP_MGR_SET_MINIMIZED, window, 1) {
         fail(b"ui-testclient: SetMinimized was refused\n");
     }
-    let Some(info) = read_window_info(root_ns, window) else {
+    let Some(info) = read_window_info(ns, window) else {
         fail(b"ui-testclient: could not read back a minimized window\n");
     };
     if info.flags & WINDOW_FLAG_MINIMIZED == 0 {
@@ -501,15 +487,15 @@ fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32
             fail(b"ui-testclient: a legal SetCurrentDesktop was refused\n");
         }
     }
-    kprint(b"ui-testclient: desktop and minimized requests round-tripped through info\n");
+    log::write(b"ui-testclient: desktop and minimized requests round-tripped through info\n");
 }
 
 /// Place `window` at `(x, y)` and read the origin back through `/dev/draw/<id>/info`.
-fn verify_placement(mgr: &mut ChannelTransport, root_ns: u64, window: u32, x: i32, y: i32) {
+fn verify_placement(mgr: &mut ChannelTransport, ns: Ref<'_, Namespace, NsReadOnly>, window: u32, x: i32, y: i32) {
     if !place_window(mgr, window, x, y) {
         fail(b"ui-testclient: a manager Place was refused\n");
     }
-    let Some(info) = read_window_info(root_ns, window) else {
+    let Some(info) = read_window_info(ns, window) else {
         fail(b"ui-testclient: could not read back a placed window's info\n");
     };
     if info.x != x || info.y != y {
@@ -561,7 +547,7 @@ fn await_mgr(
             Err(_) => fail(b"ui-testclient: manager channel error while awaiting an event\n"),
         }
     }
-    kprint(what);
+    log::write(what);
     fail(b"ui-testclient: a manager event never arrived\n");
 }
 
@@ -589,11 +575,10 @@ fn drain_mgr(mgr: &mut ChannelTransport) {
 /// It cannot use `Window::new`, which blocks for a configure only this client, as the manager, can
 /// release. Asserted: the reply arrives at once, no configure before the manager answers, and the
 /// one that comes carries the origin **the manager placed**.
-fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
+fn verify_initial_configure(mgr: &mut ChannelTransport, ns: Ref<'_, Namespace, NsReadOnly>) {
     drain_mgr(mgr);
 
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let mut t = match unsafe { ChannelTransport::connect(root_ns) } {
+    let mut t = match ChannelTransport::open(ns) {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"ui-testclient: B4 connect to /dev/draw FAILED\n"),
     };
@@ -679,7 +664,7 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
         fail(b"ui-testclient: the first configure did not carry the manager's placement\n");
     }
 
-    kprint(b"ui-testclient: the first configure carried the manager's placement\n");
+    log::write(b"ui-testclient: the first configure carried the manager's placement\n");
 
     // **Closed, not leaked**: an unread session's outbox never empties, so the compositor would
     // retry for the rest of the boot.
@@ -689,10 +674,9 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
 /// **A popup is placed by its creator, relative to its parent**: the offset resolves against the
 /// parent's **current** origin, and a popup is **not** held for the manager; raw transport, as in
 /// the module doc.
-fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
+fn verify_popup_placement(mgr: &mut ChannelTransport, ns: Ref<'_, Namespace, NsReadOnly>) {
     drain_mgr(mgr);
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let mut t = match unsafe { ChannelTransport::connect(root_ns) } {
+    let mut t = match ChannelTransport::open(ns) {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"ui-testclient: C1 connect to /dev/draw FAILED\n"),
     };
@@ -731,7 +715,7 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     }
 
     // 4. And it is where its creator asked, relative to where its parent *now* is.
-    let Some(info) = read_window_info(root_ns, popup) else {
+    let Some(info) = read_window_info(ns, popup) else {
         fail(b"ui-testclient: C1 could not read the popup's info\n");
     };
     if (info.x, info.y) != (px + ox, py + oy) {
@@ -748,7 +732,7 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
         fail(b"ui-testclient: the popup was not placed at its offset from the parent\n");
     }
 
-    kprint(b"ui-testclient: a popup was placed by its creator, without the manager\n");
+    log::write(b"ui-testclient: a popup was placed by its creator, without the manager\n");
 
     // 5. **A `dialog` is the other way round on both counts**: its parent carries desktop
     // membership and lifetime, not position, so a manager places it and it is held like a `normal`;
@@ -807,7 +791,7 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
         fail(b"ui-testclient: a dialog took its creator's offset instead of the placement\n");
     }
 
-    kprint(b"ui-testclient: a dialog was held for the manager and placed by it\n");
+    log::write(b"ui-testclient: a dialog was held for the manager and placed by it\n");
 
     let mut body = [0u8; 8];
     body[..4].copy_from_slice(&parent.to_le_bytes());
@@ -820,21 +804,21 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
 fn raw_create(t: &mut ChannelTransport, req: &CreateWindowRequest, what: &[u8]) -> u32 {
     let mut body = [0u8; librsproto::surface::CREATE_WINDOW_REQUEST_LEN];
     if librsproto::surface::build_create_window_request(&mut body, req).is_none() {
-        kprint(what);
+        log::write(what);
         fail(b": could not build CreateWindow\n");
     }
     let mut reply = [0u8; 32];
     let n = match t.request(librsproto::surface::OP_CREATE_WINDOW, &body, None, &mut reply) {
         Ok(Some(n)) => n,
         _ => {
-            kprint(what);
+            log::write(what);
             fail(b": CreateWindow got no reply\n");
         }
     };
     match librsproto::surface::parse_create_window_reply(&reply[..n]) {
         Some(id) => id,
         None => {
-            kprint(what);
+            log::write(what);
             fail(b": CreateWindow reply did not decode\n");
         }
     }
@@ -842,13 +826,15 @@ fn raw_create(t: &mut ChannelTransport, req: &CreateWindowRequest, what: &[u8]) 
 
 /// **One window's whole life, watched from the manager channel**; each event is checked and named
 /// separately.
-fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::boxed::Box<ChannelTransport> {
+fn verify_manager_events(
+    mgr: &mut ChannelTransport,
+    ns: Ref<'_, Namespace, NsReadOnly>,
+) -> alloc::boxed::Box<ChannelTransport> {
     drain_mgr(mgr);
 
     // Created *after* the manager attached, so it is announced; never committed, so it paints
     // nothing.
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let t = match unsafe { ChannelTransport::connect(root_ns) } {
+    let t = match ChannelTransport::open(ns) {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"ui-testclient: probe connect to /dev/draw FAILED\n"),
     };
@@ -900,10 +886,10 @@ fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::box
     // requested**: otherwise an event echoing the request looks like one reporting the screen.
     let (cw, ch) = (32u32, 16u32);
     let cpitch = cw as usize * 4;
-    let Some((chandle, caddr)) = shared_buffer(cpitch * ch as usize) else {
+    let Some((cmemory, cmap)) = shared_buffer(cpitch * ch as usize) else {
         fail(b"ui-testclient: probe buffer alloc FAILED\n");
     };
-    if w.attach(0, cw, ch, cpitch as u32, chandle).is_err() {
+    if w.attach(0, cw, ch, cpitch as u32, cmemory).is_err() {
         fail(b"ui-testclient: probe attach FAILED\n");
     }
     if w.commit(0, (0, 0, cw, ch)).is_err() {
@@ -974,10 +960,9 @@ fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::box
         &mut buf,
         b"ui-testclient: no WindowDestroyed for the probe window\n",
     );
-    // SAFETY: unmapping a range this process mapped in `shared_buffer`.
-    unsafe { syscall2(SYS_MEMORY_UNMAP, caddr as u64, (cpitch * ch as usize) as u64) };
+    drop(cmap);
 
-    kprint(b"ui-testclient: manager saw created, focus, geometry and destroyed\n");
+    log::write(b"ui-testclient: manager saw created, focus, geometry and destroyed\n");
 
     // **Handed back rather than dropped**: closing the session repaints the screen, which tore the
     // gate's capture.
@@ -986,32 +971,34 @@ fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::box
 
 /// Report failure and end the run; init cannot wait on this program, which on success never exits.
 fn fail(msg: &[u8]) -> ! {
-    kprint(msg);
+    log::write(msg);
     // The verdict path init uses; unconditional because this binary is embedded only in test
     // images, and without the exit device the syscall is `Unsupported` and falls through to `exit`.
-    // SAFETY: SYS_TEST_EXIT takes the verdict in a0; under the test-harness kernel it
-    // terminates QEMU, so this does not return in practice.
-    unsafe { libkern::syscall1(libkern::SYS_TEST_EXIT, libkern::TEST_EXIT_FAILURE as u64) };
-    exit(1);
+    system::test_verdict(false);
+    libos::exit(1);
 }
 
 /// Entry point: connect, create a window, share buffers, present, then serve chords or park.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
-    kprint(b"ui-testclient: up\n");
+pub extern "C" fn _start(notif: u64, root: u64, boot2: u64, arg0: u64) -> ! {
+    log::write(b"ui-testclient: up\n");
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(notif, root, boot2, arg0) };
+    let Some(ns) = start.root.as_ref().map(Handle::as_ref) else {
+        fail(b"ui-testclient: connect to /dev/draw FAILED\n");
+    };
 
     // 0. The reference pictures first, in decreasing size (320x160, 180x96, then the scene's
     // 64x32), as windows stack in creation order and a larger later one would hide a region the
     // gate compares. **Which font each gets is the point**: the host renders each with the file the
     // guest read, so the wrong one fails against real pixels.
-    let ui_font = load_face(root_ns, Face::Ui);
-    let mono_font = load_face(root_ns, Face::Mono);
-    let _ui_window = present_reference_ui(root_ns, &ui_font);
-    let _term_window = present_reference_term(root_ns, &mono_font);
+    let ui_font = load_face(ns, Face::Ui);
+    let mono_font = load_face(ns, Face::Mono);
+    let _ui_window = present_reference_ui(ns, &ui_font);
+    let _term_window = present_reference_term(ns, &mono_font);
 
     // 1. A session. The compositor mints a channel per resolve of `/dev/draw/new`.
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let transport = match unsafe { ChannelTransport::connect(root_ns) } {
+    let transport = match ChannelTransport::open(ns) {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => {
             fail(b"ui-testclient: connect to /dev/draw FAILED\n");
@@ -1029,12 +1016,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     // 2b. Read the window back through the *numbered* path: resolve suffix, id parsing, object
     // hand-off.
-    if !check_info(root_ns, win.id(), w, h) {
+    if !check_info(ns, win.id(), w, h) {
         fail(b"ui-testclient: /dev/draw/<N>/info FAILED\n");
     }
 
     // 2c. Churn before the presented window exists in final form, so no churn window is captured.
-    if !churn(root_ns) {
+    if !churn(ns) {
         // Names **no** suspect: the compositor is not the only one; the `churn:` line says which
         // step failed.
         fail(b"ui-testclient: window churn FAILED (see the churn: line above)\n");
@@ -1047,26 +1034,25 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let pitch = scene::SCREEN_PITCH;
     let len = pitch * h as usize;
     let rendered = scene::render_reference();
-    let mut maps: [*mut u8; BUFFERS] = [core::ptr::null_mut(); BUFFERS];
-    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
+    let mut frame = alloc::vec![0u8; len];
+    for y in 0..h {
+        for x in 0..w {
+            let c = Framebuffer::get_pixel(&rendered, x, y).unwrap_or_default();
+            let at = y as usize * pitch + x as usize * 4;
+            frame[at..at + 4].copy_from_slice(&PixelFormat::XRGB8888.encode(c).to_ne_bytes());
+        }
+    }
     for i in 0..BUFFERS {
-        let Some((handle, addr)) = shared_buffer(len) else {
+        let Some((memory, mut map)) = shared_buffer(len) else {
             fail(b"ui-testclient: buffer alloc FAILED\n");
         };
-        for y in 0..h {
-            for x in 0..w {
-                let c = Framebuffer::get_pixel(&rendered, x, y).unwrap_or_default();
-                let word = libdraw::format::PixelFormat::XRGB8888.encode(c);
-                // SAFETY: `addr` maps `len` writable bytes; `y*pitch + x*4 + 4 <= len`.
-                unsafe { (addr.add(y as usize * pitch + x as usize * 4) as *mut u32).write(word) };
-            }
+        if map.write_from(0, &frame).is_err() {
+            fail(b"ui-testclient: buffer alloc FAILED\n");
         }
-        maps[i] = addr;
-        if win.attach(i as u32, w, h, pitch as u32, handle).is_err() {
+        if win.attach(i as u32, w, h, pitch as u32, memory).is_err() {
             fail(b"ui-testclient: AttachBuffer FAILED\n");
         }
     }
-    let _ = maps;
 
     // 4. More frames than buffers: from frame 3 this proceeds only if the compositor released one.
     for frame in 0..FRAMES {
@@ -1102,23 +1088,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let mut probe_session: Option<alloc::boxed::Box<ChannelTransport>> = None;
     // **Outlives the block below too**: the client serves chords for the rest of its life.
     let mut manager: Option<ChannelTransport> = None;
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    if let Ok(mut mgr) = unsafe { ChannelTransport::manage(root_ns) } {
+    if let Ok(mut mgr) = ChannelTransport::open_manager(ns) {
         // **Before the placements**: this probe creates and destroys a window, so it goes first and
         // leaves the placements last. **Bound outside this block**: dropping it closes the probe's
         // session and repaints the screen.
-        probe_session = Some(verify_manager_events(&mut mgr, root_ns));
-        verify_initial_configure(&mut mgr, root_ns);
-        verify_popup_placement(&mut mgr, root_ns);
+        probe_session = Some(verify_manager_events(&mut mgr, ns));
+        verify_initial_configure(&mut mgr, ns);
+        verify_popup_placement(&mut mgr, ns);
 
         // **Move one window off the default and read it back** before placing at the origin: a
         // `Place` that did nothing looks the same at `(0, 0)`. Restored below.
-        verify_placement(&mut mgr, root_ns, win.id(), 11, 7);
+        verify_placement(&mut mgr, ns, win.id(), 11, 7);
 
         for id in [_ui_window.id(), _term_window.id(), win.id()] {
-            verify_placement(&mut mgr, root_ns, id, 0, 0);
+            verify_placement(&mut mgr, ns, id, 0, 0);
         }
-        verify_desktop_requests(&mut mgr, root_ns, win.id());
+        verify_desktop_requests(&mut mgr, ns, win.id());
 
         // **Then stack them, bottom to top, in the order the gate composes them**, last so nothing
         // reorders it. Creation order was a race with `nxterm` (it landed above the toolkit
@@ -1129,24 +1114,23 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 fail(b"ui-testclient: a manager Raise was refused\n");
             }
         }
-        kprint(b"ui-testclient: reference windows placed and stacked via /dev/draw/manage\n");
+        log::write(b"ui-testclient: reference windows placed and stacked via /dev/draw/manage\n");
 
         // **Exercise the one-manager rule**: a second resolve is refused, not allowed to depose the
         // first (two managers placing windows is a race). A *success* here is the failure.
-        // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-        match unsafe { ChannelTransport::manage(root_ns) } {
+        match ChannelTransport::open_manager(ns) {
             Ok(_) => fail(b"ui-testclient: a second /dev/draw/manage was SERVED\n"),
-            Err(_) => kprint(b"ui-testclient: a second /dev/draw/manage was refused\n"),
+            Err(_) => log::write(b"ui-testclient: a second /dev/draw/manage was refused\n"),
         }
         manager = Some(mgr);
     } else {
         // A distinguishable line, not a `fail`: the gate asserts the success line above, and this
         // says which way it failed.
-        kprint(b"ui-testclient: no manager channel; windows keep the default placement\n");
+        log::write(b"ui-testclient: no manager channel; windows keep the default placement\n");
     }
 
-    kprint(b"ui-testclient: scene presented via /dev/draw\n");
-    kprint(b"ui-testclient: PASSED\n");
+    log::write(b"ui-testclient: scene presented via /dev/draw\n");
+    log::write(b"ui-testclient: PASSED\n");
 
     // Named so it is plainly deliberate: the probe's session stays open for the process's life.
     let _held_open = probe_session;
@@ -1154,29 +1138,30 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // **The client serves chords rather than parking**: a chord is how the host asks the guest to
     // change the screen.
     match manager.as_mut() {
-        Some(mgr) => serve_hotkeys(mgr, notif),
+        Some(mgr) => serve_hotkeys(mgr),
         // No manager channel, nothing to register a chord on: park so the scene stays up.
-        None => park(notif),
+        None => park(start.notify.as_ref().map(Handle::as_ref)),
     }
 }
 
 /// Wait forever on a notification nothing signals, for the path with no manager channel.
-fn park(notif: u64) -> ! {
+fn park(notify: Option<Ref<'_, Notify, Only>>) -> ! {
     loop {
-        let handles = [notif];
-        let mut results = [0u8; 24];
-        // SAFETY: waiting on this process's own notification handle, which nothing
-        // signals; the deadline is infinite, so this parks rather than spins
-        unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+        let mut set = WaitSet::<1>::new();
+        match notify {
+            Some(n) if set.add(n).is_ok() => {
+                let _ = set.wait(Deadline::NEVER);
+            }
+            _ => time::sleep_until(Deadline::NEVER),
+        }
     }
 }
 
 /// Register a chord and act on it until killed; **toggling, not one-way**, so a gate sees the scene
 /// come back.
-fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
+fn serve_hotkeys(mgr: &mut ChannelTransport) -> ! {
     use libkern::abi::{KEY_F1, KEY_SPACE};
     use librsproto::surface::{MOD_META, MgrHotkey, OP_MGR_HOTKEY, OP_MGR_REGISTER_HOTKEY};
-    let _ = notif;
 
     // `Super+F1`: a second key keeps it out of the way of a shell's `Super` launcher.
     const HOTKEY_ID: u32 = 0x8001;
@@ -1207,7 +1192,7 @@ fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
     if mgr.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_err() {
         fail(b"ui-testclient: registering the quiet chord was refused\n");
     }
-    kprint(b"ui-testclient: hotkey registered, waiting\n");
+    log::write(b"ui-testclient: hotkey registered, waiting\n");
 
     let mut current: u32 = 1;
     let mut buf = [0u8; 64];
@@ -1219,7 +1204,7 @@ fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
                 };
                 if got.id == QUIET_ID {
                     // Nothing is changed on purpose — see where it is registered.
-                    kprint(b"ui-testclient: quiet chord fired\n");
+                    log::write(b"ui-testclient: quiet chord fired\n");
                     continue;
                 }
                 if got.id != HOTKEY_ID {
@@ -1255,6 +1240,6 @@ fn set_current_desktop(mgr: &mut ChannelTransport, desktop: u32) -> bool {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"ui-testclient: panic\n");
-    exit(2);
+    log::write(b"ui-testclient: panic\n");
+    libos::exit(2);
 }
