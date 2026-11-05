@@ -5,7 +5,6 @@
 //!
 //! - [`stage`] — the Tier-0/Tier-1 startup prologue: streams, `argv`, `stderr`, exits.
 //! - [`args`] — GNU-style flag parsing (`--long`, `-f`, `--`, `--help`/`--version`).
-//! - [`entropy`] — random bytes from the kernel: `account`'s salts, `disk`'s IDs.
 //! - [`format`] — what `disk --partition` and `disk --format` write, decided before writing.
 //!
 //! **Asking a person on a terminal** is [`libprompt`], and the view broker's client [`libviews`].
@@ -19,7 +18,6 @@
 extern crate alloc;
 
 pub mod args;
-pub mod entropy;
 pub mod format;
 pub mod stage;
 pub mod text;

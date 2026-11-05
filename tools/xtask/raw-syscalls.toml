@@ -4,18 +4,8 @@
 # commit of its own that says why. `[agreed]` names the crates the maintainer agreed may stay
 # on libkern, each with its reason; their counts are still held here.
 [counts]
-"userspace/compositor" = 95
-"userspace/coreutils" = 153
-"userspace/desktop-shell" = 73
 "userspace/eshell" = 44
-"userspace/heartbeat" = 9
-"userspace/hello" = 58
 "userspace/libheap" = 5
-"userspace/nxedit" = 61
-"userspace/nxfiles" = 61
-"userspace/nxinstall" = 17
-"userspace/nxsh" = 35
-"userspace/nxterm" = 82
 "userspace/test-harness" = 863
 
 [agreed]

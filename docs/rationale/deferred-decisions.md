@@ -738,9 +738,9 @@ the codes can swap, which matters only to `on-failure` (`never` and `always` do 
 code). A service found dead with no code queued is treated as a failure, since a crash that
 outruns its notification is the case worth restarting.
 
-**`libsession::spawn_leader` gives up on a leader after `LEADER_STOP_NS`**, on a shutdown and when
+**`libsession::run_leader` gives up on a leader after `LEADER_STOP_NS`**, on a shutdown and when
 its setup message fails, and returns with that leader's `ChildExited` still to come. The next
-`spawn_leader` takes the first it sees as its own, so a leader that outlasts its five seconds ends
+`run_leader` takes the first it sees as its own, so a leader that outlasts its five seconds ends
 the next session under a running shell. Reachable only by a leader that ignores both a terminate
 and its closed setup channel, which neither `nxsh` nor `desktop-shell` does. A life channel, as
 the broker and `service-mgr` hold, would attribute it.
@@ -1001,7 +1001,7 @@ window instead reaches the session's console.
 
 **What changed:** M7 Part D built `desktop-session-mgr`, so the graphical session namespace this
 entry was waiting on now exists — and it binds `/dev/tty`, because
-`libsession::build` binds it for both columns whenever a tty endpoint was handed
+`libsession::build_namespace` binds it for both columns whenever a tty endpoint was handed
 down.
 
 **The sharp edge, which Part D's own reasoning did not cover.** That session deliberately has
@@ -1203,7 +1203,7 @@ own queue overflowing, so the client-side vocabulary exists; what is missing is 
 Trigger: the first observed outbox overflow that is not a deliberately wedged test client, or
 the toolkit (M4) needing to resynchronise held-key state after one. Raised 2026-08-10.
 
-**The `4` in the other resource servers** (`auth-service`, `fs-server-ext4`, `hello`) is left
+**The `4` in the other resource servers** (`auth-service` and `fs-server-ext4`) is left
 alone deliberately: those channels carry request/reply traffic, where the sender is waiting for
 an answer and cannot outrun the receiver. They are undersized rather than wrong. Trigger: any of
 them growing a server-initiated push stream.
@@ -2280,11 +2280,13 @@ registration going reaches it, which takes `service-mgr` with it.
 `Namespace::flush` and `fs::flush` are `async` though `sys_ns_sync` and `sys_file_sync` answer
 within the call; `Spawn::path` hands the kernel a file, which it reads within the spawn;
 `entropy::fill` makes an `EntropyObject` for each call; `system::stop` takes the system-control
-object as a char node, which it is not yet. Each caller is written once, against the shape it will
+object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
+its authority is the `SYSTEM_CLOCK` grant until there is a clock node to hold, so its one caller,
+`date`, passes one when E.10 makes it. Every other caller is written once, against the shape it will
 keep, and the call under it changes as its sub-part of
 [`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 makes both flushes resolves or an
 `io_submit`, E.8 makes `Spawn` read the image into memory first, E.9 makes entropy a node, and
-E.10 makes a stop a `Write` to the power node. Trigger: each of those sub-parts.
+E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: each of those sub-parts.
 
 **Any process can end a test run — `TODO(test-verdict-authority)`.** `sys_test_exit` checks no
 handle and no syscap: a kernel built with the test harness writes the verdict to `isa-debug-exit`
@@ -2299,8 +2301,11 @@ E.2 gives each library moved onto libos a typed API (`Ref`, `Handle`), and keeps
 that took or gave a raw `u64` handle as a thin shim over it, so the crates that call it move once,
 onto the typed form, in E.3 to E.5, rather than once now and once again then (the maintainer's
 call, 2026-11-03). A shim's `u64` is its caller's claim, as it always was: borrowing it is the one
-`unsafe` it adds. Trigger: a shim's last caller moving onto libos, and E.5 at the latest, by when
-none is left.
+`unsafe` it adds. Thirty-four went in E.4 with their last callers. **Two kinds of caller keep the
+rest**: the test harness, and the two filesystem servers, whose `_start`s enter through
+libfsserver's raw `bootstrap`, `run` and `Disk::new` and which no sub-part names. Trigger: a shim's
+last caller moving onto libos: E.5 for the test harness's, and the filesystem servers' entry when a
+part takes it.
 
 **A resource-server reply's field offsets are literals on both sides — `TODO(rsproto-offsets)`.**
 `abi-sync-check` holds the kernel's rsproto constants to `librsproto`'s (the safety survey's

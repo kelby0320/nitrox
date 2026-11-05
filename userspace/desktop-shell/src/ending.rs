@@ -135,7 +135,7 @@ pub enum Asked {
 pub const DIALOG_AFTER_NS: u64 = 500_000_000;
 
 /// How long a shutdown started elsewhere waits for the windows: 3 s, inside the 5 s
-/// `libsession::spawn_leader` gives a leader. The supervisor's clock starts before the shell hears
+/// `libsession::run_leader` gives a leader. The supervisor's clock starts before the shell hears
 /// of the stop, so an equal wait would end after the supervisor had given up.
 pub const STOP_WAIT_NS: u64 = 3_000_000_000;
 

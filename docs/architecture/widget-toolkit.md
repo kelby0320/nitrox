@@ -780,7 +780,7 @@ surely as a stale id does.
 it is the toolkit's answer to a question every application eventually asks. **It is a widget over
 a listing, not a browser** (M14 decision 3): `libui` may not make a syscall, and that rule is not
 bent for this one. The module renders and routes over entries it is *given*; the application lists
-the directory with `libfs::list_dir` and orders it with `libfs::sort`.
+the directory with `libfs::list_directory` and orders it with `libfs::sort`.
 
 | Piece | What it is |
 |---|---|

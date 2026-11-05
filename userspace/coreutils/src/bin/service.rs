@@ -26,13 +26,15 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
-use libkern::debug::Line;
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use libkern::Rights;
+use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Channel, Msg, Only, block_on, exit};
 use librsproto::services::{OP_SERVICES_RESTART, OP_SERVICES_START, OP_SERVICES_STOP};
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::wire::Table;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -40,8 +42,8 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const TABLE: &[u8] = b"/dev/services/all.tsm";
-const ADMIN: &[u8] = b"/dev/services/admin";
+const TABLE: &str = "/dev/services/all.tsm";
+const ADMIN: &str = "/dev/services/admin";
 
 const FLAGS: [Flag; 4] = [
     Flag::long_only("list", "every declared service, its state, and its restarts"),
@@ -67,8 +69,10 @@ const HELP: &[u8] = b"usage: service --list | --start NAME | --stop NAME | --res
 const VERSION: &[u8] = b"service (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
     let args = match parse(&stage.argv, &FLAGS) {
         Ok(a) => a,
         Err(_) => stage.die(b"service: unrecognized option (try --help)\n", EXIT_USAGE),
@@ -102,8 +106,8 @@ fn say(stage: &Stage, text: &str) {
     Line::new().untrusted(text.trim_end_matches('\n').as_bytes()).end();
 }
 
-fn list(stage: &Stage) -> i64 {
-    let table = match libfs::read_file(stage.namespace, TABLE).ok().and_then(|b| Table::decode(&b).ok()) {
+fn list(stage: &Stage) -> i32 {
+    let table = match libfs::read(&stage.namespace, TABLE).ok().and_then(|b| Table::decode(&b).ok()) {
         Some(t) => t,
         None => {
             say(stage, "service: no /dev/services/all.tsm in this namespace\n");
@@ -111,9 +115,9 @@ fn list(stage: &Stage) -> i64 {
         }
     };
     let rows = table.rows.len();
-    let sink: &[u8] = match stage.streams.stdout {
-        Some(h) => {
-            write_table(stage, h, &table.schema, &table.rows);
+    let sink: &[u8] = match stage.stdout() {
+        Some(port) => {
+            write_table(stage, port, &table.schema, &table.rows);
             b"table"
         }
         None => {
@@ -141,8 +145,8 @@ fn cell(v: &Value) -> String {
     }
 }
 
-fn write_table(stage: &Stage, stdout: u64, schema: &Schema, rows: &[Vec<Value>]) {
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+fn write_table(stage: &Stage, stdout: Port<'_>, schema: &Schema, rows: &[Vec<Value>]) {
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, schema).and_then(|()| {
         for row in rows {
             tw.write_row(row)?;
@@ -213,19 +217,17 @@ enum Failure {
 /// **No grant, told apart from a refusal**: without it the path resolves to no table, or to
 /// nothing — `NotFound`, the one answer that means "not in a view with `services`".
 fn ask(stage: &Stage, op: u16, body: &[u8]) -> Result<(), Failure> {
-    let (st, session) = libfs::lookup_wait(stage.namespace, ADMIN, librsproto::session::DIR_SESSION_RIGHTS);
-    if st == KError::NotFound.as_i32() {
-        return Err(Failure::NoGrant);
-    }
-    if st != 0 || session == 0 {
-        return Err(Failure::Unopened(KError::from_i32(st)));
-    }
-    let mut buf = alloc::vec![0u8; IPC_MSG_SIZE];
-    let reply = librsproto::session::round_trip(session, &mut buf, 1, op, body);
-    // SAFETY: closing the admin session this call opened.
-    unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, session) };
-    let len = reply.map_err(|_| Failure::Transport)?;
-    let msg = librsproto::decode(&buf[IPC_HEADER_SIZE..IPC_HEADER_SIZE + len]).map_err(|_| Failure::Transport)?;
+    let rights = Rights::from_bits(librsproto::session::DIR_SESSION_RIGHTS);
+    let session = match block_on(stage.namespace.lookup::<Channel, Only>(ADMIN, rights)) {
+        Ok(session) => session,
+        Err(e) if e.code() == KError::NotFound => return Err(Failure::NoGrant),
+        Err(e) => return Err(Failure::Unopened(e.code())),
+    };
+    let mut buf = Msg::new();
+    let reply = librsproto::session::exchange(&session, &mut buf, 1, op, body);
+    drop(session);
+    reply.map_err(|_| Failure::Transport)?;
+    let msg = librsproto::decode(buf.payload()).map_err(|_| Failure::Transport)?;
     if msg.op != op {
         return Err(Failure::Transport);
     }
@@ -239,7 +241,7 @@ fn ask(stage: &Stage, op: u16, body: &[u8]) -> Result<(), Failure> {
     Ok(())
 }
 
-fn act(stage: &Stage, verb: Verb, name: &str) -> i64 {
+fn act(stage: &Stage, verb: Verb, name: &str) -> i32 {
     if let Err(f) = ask(stage, verb.op(), name.as_bytes()) {
         let word = verb.word();
         let text = match f {
@@ -255,15 +257,15 @@ fn act(stage: &Stage, verb: Verb, name: &str) -> i64 {
         say(stage, &text);
         return EXIT_FAILURE;
     }
-    match stage.streams.stdout {
-        Some(h) => {
+    match stage.stdout() {
+        Some(port) => {
             let schema = Schema::new().field("name", TypeTag::String, TypeModifiers::NONE).field(
                 "state",
                 TypeTag::String,
                 TypeModifiers::NONE,
             );
             let row = alloc::vec![Value::Str(String::from(name)), Value::Str(String::from(verb.state()))];
-            write_table(stage, h, &schema, &[row]);
+            write_table(stage, port, &schema, &[row]);
         }
         None => stage.note(format!("{name} {}\n", verb.done()).as_bytes()),
     }
@@ -273,6 +275,6 @@ fn act(stage: &Stage, verb: Verb, name: &str) -> i64 {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"service: panic\n");
+    log::write(b"service: panic\n");
     exit(EXIT_FAILURE)
 }

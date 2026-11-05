@@ -47,7 +47,7 @@ pub use exec::{Op, block_on};
 pub use handle::{
     CanBind, CanLookup, CanMapRead, CanMapWrite, CanRead, CanWrite, Channel, File, Handle, Handles, MapExec, MapRead,
     MapReadWrite, Mappable, Memory, Namespace, Notify, NsMutable, NsReadOnly, Only, Process, ReadOnly, ReadWrite, Ref,
-    Resource, Thread, WriteOnly,
+    Resource, Thread, Timer, WriteOnly,
 };
 pub use memory::Mapping;
 pub use ns::{Bindings, Lookup};

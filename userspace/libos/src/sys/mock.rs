@@ -53,6 +53,7 @@ enum Object {
     Thread,
     Entropy,
     SystemControl,
+    Timer(u64),
 }
 
 impl Object {
@@ -68,6 +69,7 @@ impl Object {
             Object::Server | Object::Answers(_) => KObjectType::UserspaceServerReg,
             Object::Process => KObjectType::Process,
             Object::Thread => KObjectType::Thread,
+            Object::Timer(_) => KObjectType::Timer,
             Object::Entropy => KObjectType::EntropyObject,
             Object::SystemControl => KObjectType::SystemControl,
         }
@@ -140,6 +142,7 @@ struct Mock {
     /// Unseeded reads to find the kernel's seed-waiter places all taken, their PO done `WouldBlock`.
     seed_full: u32,
     realtime: Option<u64>,
+    clock_answer: Option<i64>,
     clock: u64,
     sleeps: u32,
     submits: u32,
@@ -250,6 +253,7 @@ impl Mock {
             Object::Po(po) if po.ready => Some(IoResult { status: po.status, result: po.result, ..ready }),
             Object::Channel { peer, ring, .. } if !ring.is_empty() || !self.held(*peer) => Some(ready),
             Object::Notify(q) if !q.is_empty() => Some(ready),
+            Object::Timer(at) if *at != 0 && self.clock >= *at => Some(ready),
             _ => None,
         }
     }
@@ -348,6 +352,9 @@ pub(super) fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u6
             pass_time(m);
         }
         let mut n = 0usize;
+        if deadline != 0 && !objs.iter().any(|&o| m.signalled(o).is_some()) {
+            m.clock = time::next_fire(m, &objs, deadline).unwrap_or(m.clock).max(m.clock);
+        }
         for (&h, &obj) in handles.iter().zip(&objs) {
             let Some(mut res) = m.signalled(obj) else { continue };
             res.handle = h;
@@ -398,24 +405,6 @@ fn pass_time(m: &mut Mock) {
             p.status = KError::TimedOut as i32;
         }
     }
-}
-
-pub fn clock_read(clock: u64, out: &mut u64) -> i64 {
-    with(|m| match clock {
-        libkern::CLOCK_MONOTONIC => {
-            m.clock += 1_000;
-            *out = m.clock;
-            0
-        }
-        libkern::CLOCK_REALTIME => match m.realtime {
-            Some(t) => {
-                *out = t + m.clock;
-                0
-            }
-            None => e(KError::Unsupported),
-        },
-        _ => e(KError::InvalidArgument),
-    })
 }
 
 pub fn handle_close(h: u64) {
@@ -989,4 +978,6 @@ pub fn power(h: u64, op: u64) -> i64 {
 }
 
 mod controls;
+mod time;
 pub use controls::*;
+pub use time::*;

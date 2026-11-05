@@ -27,12 +27,13 @@ extern crate alloc;
 use alloc::string::String;
 
 use coreutils::args::parse;
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use libkern::Rights;
 use libkern::abi::IPC_PAYLOAD_SIZE;
-use libkern::handle::RIGHT_MAP_READ;
-use libkern::syscall::{SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, syscall1, syscall4};
-use libkern::{exit, kprint};
-use libstream::channel::{ChannelSink, IpcPort};
+use libos::boot::Start;
+use libos::log;
+use libos::{File, MapRead, block_on, exit};
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -40,7 +41,7 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Where a session publishes its user.
-const SESSION_USER: &[u8] = b"/session/user";
+const SESSION_USER: &str = "/session/user";
 
 /// Longest name accepted: a bound object is at least a page, so the read needs a bound of its own.
 const NAME_MAX: usize = 256;
@@ -57,8 +58,10 @@ const HELP: &[u8] = b"usage: whoami\n\
 const VERSION: &[u8] = b"whoami (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[]) {
         Ok(a) => a,
@@ -81,48 +84,31 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         _ => stage.die(b"whoami: no session identity (/session/user is not bound)\n", EXIT_FAILURE),
     };
 
-    match stage.streams.stdout {
-        Some(h) => emit(&stage, h, &user),
+    match stage.stdout() {
+        Some(port) => emit(&stage, port, &user),
         None => {
             let mut line = user.clone();
             line.push('\n');
-            kprint(line.as_bytes());
+            log::write(line.as_bytes());
         }
     }
     exit(EXIT_OK)
 }
 
 fn read_session_user(stage: &Stage) -> Option<String> {
-    let (st, handle) = libfs::lookup_wait(stage.namespace, SESSION_USER, RIGHT_MAP_READ);
-    if st != 0 || handle == 0 {
-        return None;
-    }
-    // SAFETY: mapping a readable object this process just resolved, at a
-    // kernel-chosen address, for one page — enough for any name we accept.
-    let base = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, 4096, RIGHT_MAP_READ) };
-    if base < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
-        return None;
-    }
-    // SAFETY: `base` is a live read-only mapping of at least one page; the read is
-    // bounded by `NAME_MAX` and stops at the first NUL or newline.
-    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, NAME_MAX) };
+    let file = block_on(stage.namespace.lookup::<File, MapRead>(SESSION_USER, Rights::MAP_READ)).ok()?;
+    // One page at a kernel-chosen address: enough for any name we accept.
+    let mapping = file.map(4096).ok()?;
+    let mut bytes = [0u8; NAME_MAX];
+    mapping.read_into(0, &mut bytes).ok()?;
     let end = bytes.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(NAME_MAX);
-    let name = String::from_utf8_lossy(&bytes[..end]).into_owned();
-
-    // SAFETY: unmapping the mapping made above, then closing our own handle.
-    unsafe {
-        syscall4(SYS_MEMORY_UNMAP, base as u64, 4096, 0, 0);
-        syscall1(SYS_HANDLE_CLOSE, handle);
-    }
-    Some(name)
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
-fn emit(stage: &Stage, stdout: u64, user: &str) {
+fn emit(stage: &Stage, stdout: Port<'_>, user: &str) {
     let schema = Schema::new().field("user", TypeTag::String, TypeModifiers::NONE);
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         tw.write_row(&[Value::Str(String::from(user))])?;
         tw.finish_with_status(0)
@@ -137,6 +123,6 @@ fn emit(stage: &Stage, stdout: u64, user: &str) {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"whoami: panic\n");
+    log::write(b"whoami: panic\n");
     exit(EXIT_FAILURE)
 }

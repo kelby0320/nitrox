@@ -227,7 +227,7 @@ session namespace. The prohibited act is a resource server making itself reachab
 a supervisor owns; deciding what a child it created may reach is the constructor role, which this
 process already has and already exercises. It also removes a cost
 [`deferred-decisions.md`](../rationale/deferred-decisions.md) had named against this box: no
-`Meta::Ready` handshake, and no change to `spawn_leader` to wait for a ready before it reaps.
+`Meta::Ready` handshake, and no change to `run_leader` to wait for a ready before it reaps.
 
 **Built 2026-08-26** (Milestone 8 Part F). The shell serves `/dev/desktop` and binds it into
 every application namespace it constructs; nothing binds it into the session namespace, because
@@ -315,7 +315,7 @@ diverge anyway.
 **A shutdown ends both** (administration Part E.4c). `service-mgr` sends each supervisor a terminate
 request, and where it finds one decides what happens:
 - **at its prompt or greeter**, the supervisor exits;
-- **during a session**, `libsession::spawn_leader` passes the request to the leader and gives it
+- **during a session**, `libsession::run_leader` passes the request to the leader and gives it
   5 s. The supervisor then closes the session at the view broker, as at any session's end, and
   exits rather than presenting a login again.
 
@@ -374,7 +374,7 @@ resolves to the tty server's endpoint, which **mints** terminals. The per-applic
 from minting and from `Tty::AttachBackend`, not from the binding.
 
 So an application namespace binds `/dev/tty` the same way for every application
-(`desktop-shell` builds it with `libsession::build`, as a session is built, since administration
+(`desktop-shell` builds it with `libsession::build_namespace`, as a session is built, since administration
 Part F.1), and `nxterm` opens a terminal, attaches its own
 window as that terminal's backend, and hands the terminal to `nxsh` **as a handle** — which is
 why two terminals do not contend: each mints its own, on its own backend. `nxsh` takes a
@@ -393,7 +393,7 @@ hole in a sandbox with nothing on the other side of it.
 **What it has that it lacked until administration Part F.1: `/session/user`.** `desktop-shell`
 built an application's namespace with a builder of its own, which had drifted from the sessions'
 and never bound who the session is for, so `whoami` in a desktop terminal said "no session
-identity". It builds with `libsession::build` now, from the same `NamespaceSpec` the supervisors
+identity". It builds with `libsession::build_namespace` now, from the same `Members` the supervisors
 use — **one vocabulary, three builders**, the view broker's deriving — and reads the name from its
 own session's `/session/user`. What an application gets beyond a session is `/dev/draw/new`,
 narrowly, and `/dev/desktop`; what it lacks is `/applications` and the console.

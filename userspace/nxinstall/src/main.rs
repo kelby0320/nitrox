@@ -30,31 +30,39 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use fs_server_ext4::mkfs;
-use libfsserver::disk::{PartitionIo, Scratch, po_wait};
+
+use libfsserver::disk::{PartitionIo, Scratch, wait_transfer};
 use libgpt::table::{self, BACK_BYTES, BLOCK, FRONT_BYTES};
 use libkern::abi::{
     BlockDeviceInfo, BlockKind, IO_OPCODE_FLUSH, IO_OPCODE_READ, IO_OPCODE_WRITE, IPC_PAYLOAD_SIZE, IoOp,
 };
-use libkern::handle::{RIGHT_MAP_READ, RIGHT_READ, RIGHT_WRITE};
-use libkern::syscall::{
-    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
-    SYS_MEMORY_MAP, SYS_NS_LOOKUP, syscall1, syscall2, syscall4, syscall6,
+use libkern::{RawHandle, Rights};
+use libos::boot::Start;
+use libos::{
+    Carried, Channel, Deadline, Handle, MapRead, Memory, Msg, Namespace, NsReadOnly, Only, Op, ReadWrite, Ref,
+    Resource, block_on, entropy, log, time,
 };
-use libkern::{exit, kprint};
-use libstream::channel::{ChannelSink, IpcPort, MsgPort};
+use libstream::channel::{ChannelSink, IpcPort, IpcPortRef, MsgPort};
 use libstream::diag::Level;
+use libstream::setup::{receive_setup, setup_is_pending};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
+
+type Endpoint = Handle<Channel, Only>;
+type Root = Handle<Namespace, NsReadOnly>;
+type DeviceHandle = Handle<Resource, ReadWrite>;
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// What a failure before the program is running exits with: a malformed setup message, or a
 /// panic. Every other status comes from [`nxinstall::Outcome`].
-const EXIT_FAILURE: i64 = 1;
+const EXIT_FAILURE: i32 = 1;
 
 /// The transfer buffer, in bytes: 256 KiB, which is 64 pages and so 64 scatter-gather fragments,
 /// inside what one AHCI command can describe (`MAX_PRDT_ENTRIES` is 248).
@@ -92,48 +100,13 @@ const FS_BLOCK: u64 = 4096;
 /// small filesystems and the cap large ones.
 const BYTES_PER_INODE: u32 = 16384;
 
-static mut FRONT: [u8; FRONT_BYTES] = [0; FRONT_BYTES];
-static mut BACK: [u8; BACK_BYTES] = [0; BACK_BYTES];
-
-fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
-    // SAFETY: valid namespace handle and path slice.
-    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
-    if po < 0 {
-        return None;
-    }
-    match po_wait(po as u64) {
-        Some((0, handle)) if handle != 0 => Some(handle),
-        _ => None,
-    }
-}
-
 /// 16 bytes from the kernel CSPRNG, for a partition GUID.
 ///
 /// Refuses rather than inventing one: constant GUIDs would collide with every other machine this
 /// program installed.
 fn random_guid() -> Option<[u8; 16]> {
-    // SAFETY: register-only syscall.
-    let h = unsafe { syscall1(SYS_ENTROPY_CREATE, 0) };
-    if h < 0 {
-        return None;
-    }
-    let h = h as u64;
     let mut buf = [0u8; 16];
-    // Read again after an unseeded pool's PO: it completing says only that the pool is now
-    // seeded and writes nothing, so the buffer would be sixteen zeros.
-    let ok = loop {
-        // SAFETY: a valid writable 16-byte buffer.
-        let r = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut buf) as u64, 16, 0) };
-        if r == 0 {
-            break true;
-        }
-        if r < 0 || !matches!(po_wait(r as u64), Some((0, _))) {
-            break false;
-        }
-    };
-    // SAFETY: closing our own handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-    ok.then_some(buf)
+    entropy::fill(&mut buf).ok().map(|()| buf)
 }
 
 /// One block device this view can reach.
@@ -141,7 +114,7 @@ struct Device {
     index: usize,
     /// The device handle, with read and write: [`devices`] asks for both, so a device bound
     /// read-only is left out of the list.
-    handle: u64,
+    handle: DeviceHandle,
     info: BlockDeviceInfo,
 }
 
@@ -158,7 +131,7 @@ impl Device {
         let mut done = 0usize;
         while done < buf.len() {
             let n = core::cmp::min(CHUNK as usize, buf.len() - done);
-            transfer(io, IO_OPCODE_READ, self.handle, at + done as u64, n as u64)?;
+            transfer(io, IO_OPCODE_READ, &self.handle, at + done as u64, n as u64)?;
             io.copy_out(0, &mut buf[done..done + n]);
             done += n;
         }
@@ -170,7 +143,7 @@ impl Device {
         while done < buf.len() {
             let n = core::cmp::min(CHUNK as usize, buf.len() - done);
             io.copy_in(0, &buf[done..done + n]).map_err(|_| "the transfer buffer is lost to an abandoned transfer")?;
-            transfer(io, IO_OPCODE_WRITE, self.handle, at + done as u64, n as u64)?;
+            transfer(io, IO_OPCODE_WRITE, &self.handle, at + done as u64, n as u64)?;
             done += n;
         }
         Ok(())
@@ -178,37 +151,32 @@ impl Device {
 }
 
 /// One transfer through `io` and its failure as a line. `length` must be at most [`CHUNK`].
-fn transfer(io: &Scratch, opcode: u32, device: u64, offset: u64, length: u64) -> Result<(), &'static str> {
-    io.transfer(device, opcode, offset, length).map_err(|_| "the transfer failed")
+fn transfer(io: &Scratch, opcode: u32, device: &DeviceHandle, offset: u64, length: u64) -> Result<(), &'static str> {
+    io.exchange(device, opcode, offset, length).map_err(|_| "the transfer failed")
 }
 
 /// Every block device in `ns`, in index order. Listed, not probed: probing `0`, `1`, … would stop
 /// at the first gap. An empty result is the ordinary answer in an ordinary session.
-fn devices(ns: u64) -> Vec<Device> {
+fn devices(ns: Option<&Root>) -> Vec<Device> {
+    let Some(ns) = ns else { return Vec::new() };
     let mut indices: Vec<usize> =
-        libfs::ns_children(ns, b"/dev/blk").iter().filter_map(|(name, _)| nxinstall::block_index(name)).collect();
+        libfs::bindings_under(ns, "/dev/blk").iter().filter_map(|(name, _)| nxinstall::block_index(name)).collect();
     indices.sort_unstable();
     indices.dedup();
     let mut out = Vec::new();
     for index in indices {
         let path = format!("/dev/blk/{index}");
-        let Some(handle) = lookup(ns, path.as_bytes(), RIGHT_READ | RIGHT_WRITE) else {
+        let Ok(handle) = block_on(ns.lookup::<Resource, ReadWrite>(&path, Rights::READ | Rights::WRITE)) else {
             continue;
         };
         let ipath = format!("/dev/blk/{index}/info");
-        let info = lookup(ns, ipath.as_bytes(), RIGHT_MAP_READ)
+        let info = block_on(ns.lookup::<Memory, MapRead>(&ipath, Rights::MAP_READ))
+            .ok()
             .and_then(|h| {
-                let size = core::mem::size_of::<BlockDeviceInfo>() as u64;
-                // SAFETY: register-only syscall.
-                let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, 4096, RIGHT_MAP_READ) };
-                // SAFETY: closing our own handle; the mapping outlives it.
-                unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-                if addr < 0 {
-                    return None;
-                }
-                // SAFETY: `addr` maps a page read-only and `size` is under it.
-                let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) };
-                BlockDeviceInfo::read(bytes)
+                let mapping = h.map(4096).ok()?;
+                let mut bytes = [0u8; core::mem::size_of::<BlockDeviceInfo>()];
+                mapping.read_into(0, &mut bytes).ok()?;
+                BlockDeviceInfo::read(&bytes)
             })
             // A device whose info would not map reads as `Unknown`, which every destructive
             // path here refuses.
@@ -297,8 +265,8 @@ fn copy(
     let mut reported = 0u64;
     while done < bytes {
         let n = core::cmp::min(CHUNK, bytes - done);
-        transfer(io, IO_OPCODE_READ, src.handle, src_at + done, n).map_err(|e| format!("reading {what}: {e}"))?;
-        transfer(io, IO_OPCODE_WRITE, dst.handle, dst_at + done, n).map_err(|e| format!("writing {what}: {e}"))?;
+        transfer(io, IO_OPCODE_READ, &src.handle, src_at + done, n).map_err(|e| format!("reading {what}: {e}"))?;
+        transfer(io, IO_OPCODE_WRITE, &dst.handle, dst_at + done, n).map_err(|e| format!("writing {what}: {e}"))?;
         done += n;
         if done - reported >= 8 * 1024 * 1024 || done == bytes {
             reported = done;
@@ -366,21 +334,19 @@ fn install(
         human(esp_bytes),
         human(layout.root_blocks() * block)
     ));
-    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // SAFETY: single-threaded program; these statics have no other reader.
-    let (front, back) = unsafe { (&mut *(&raw mut FRONT), &mut *(&raw mut BACK)) };
-    table::build(target.info.block_count, disk_guid, &layout.partitions(esp_guid, root_guid), front, back)
+    let (mut front, mut back) = (vec![0u8; FRONT_BYTES], vec![0u8; BACK_BYTES]);
+    table::build(target.info.block_count, disk_guid, &layout.partitions(esp_guid, root_guid), &mut front, &mut back)
         .map_err(|e| format!("the partition table would not build: {e:?}. Nothing was written."))?;
-    target.write_at(io, 0, front).map_err(|e| format!("writing the partition table: {e}"))?;
+    target.write_at(io, 0, &front).map_err(|e| format!("writing the partition table: {e}"))?;
     let back_at = (target.info.block_count - table::ARRAY_BLOCKS - 1) * BLOCK as u64;
-    target.write_at(io, back_at, back).map_err(|e| format!("writing the backup partition table: {e}"))?;
+    target.write_at(io, back_at, &back).map_err(|e| format!("writing the backup partition table: {e}"))?;
 
     say(&format!("copying the boot partition ({})", human(esp_bytes)));
     copy(io, srcs.esp, 0, target, layout.esp_first * BLOCK as u64, esp_bytes, "boot", say)?;
 
     let root_bytes_dst = layout.root_blocks() * block;
     say(&format!("making a filesystem of {}", human(root_bytes_dst)));
-    let dst = match PartitionIo::new(target.handle, layout.root_first * BLOCK as u64, root_bytes_dst) {
+    let dst = match PartitionIo::window(target.handle.as_ref(), layout.root_first * BLOCK as u64, root_bytes_dst) {
         Some(p) => p,
         None => return Err(String::from("could not allocate a transfer buffer for the target")),
     };
@@ -416,8 +382,8 @@ fn install(
     })?;
     say(&format!("  {} inodes across {} group(s)", geom.inodes_count, geom.groups));
 
-    let src = match PartitionIo::new(
-        srcs.root.handle,
+    let src = match PartitionIo::window(
+        srcs.root.handle.as_ref(),
         srcs.root_extent.0 * BLOCK as u64,
         srcs.root_extent.1 * BLOCK as u64,
     ) {
@@ -444,30 +410,25 @@ fn install(
     ));
     // Durable before "done": a drive may hold the last sectors in its volatile cache, and the
     // next thing a person does is take the power away.
-    flush(target.handle).map_err(String::from)?;
+    flush(&target.handle).map_err(String::from)?;
     log("flushed the disk's write cache");
     Ok(())
 }
 
 /// Have `device` write its volatile cache to its medium and wait: an `IO_OPCODE_FLUSH`.
-fn flush(device: u64) -> Result<(), &'static str> {
+fn flush(device: &DeviceHandle) -> Result<(), &'static str> {
     let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
-    // SAFETY: `device` is a block device handle with `WRITE`; `&op` is a valid `IoOp`.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, device, (&op as *const IoOp) as u64) };
-    if po < 0 {
+    let Ok(op) = Op::submit(device.raw(), &op) else {
         return Err("the disk refused to flush its cache");
-    }
-    if !matches!(po_wait(po as u64), Some((0, _))) {
+    };
+    if !matches!(wait_transfer(op), Some((0, _))) {
         return Err("the disk could not flush its cache");
     }
     Ok(())
 }
 
 fn wall_clock_seconds() -> i64 {
-    let mut nanos: u64 = 0;
-    // SAFETY: a valid writable `u64` out-param.
-    let r = unsafe { syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64) };
-    if r < 0 { 0 } else { (nanos / 1_000_000_000) as i64 }
+    time::wall().map_or(0, |nanos| (nanos / 1_000_000_000) as i64)
 }
 
 struct Account {
@@ -482,11 +443,11 @@ struct Account {
 ///
 /// Each question logs its receipt, since nothing reads a desktop terminal's grid: the name's
 /// before it is asked, and each password's once echo is off, so a gate's typing is not echoed.
-fn ask_account(term: u64, stderr: Option<u64>) -> Result<Account, nxinstall::Outcome> {
+fn ask_account(term: &Endpoint, stderr: Option<&Endpoint>) -> Result<Account, nxinstall::Outcome> {
     use nxinstall::Outcome;
     let say = |level: Level, line: &str| say_to(stderr, level, line);
     log("asking for the first account");
-    let Some(name) = libprompt::ask_line(term, b"the new machine's first account: name: ") else {
+    let Some(name) = libprompt::ask_line_on(term, b"the new machine's first account: name: ") else {
         say(Level::Notice, "cancelled; nothing was written.");
         return Err(Outcome::Declined);
     };
@@ -500,7 +461,7 @@ fn ask_account(term: u64, stderr: Option<u64>) -> Result<Account, nxinstall::Out
     }
     // Two receipts, neither a prefix of the other, since a gate matches on a line's start.
     let asked = &mut |n: u8| log(if n == 1 { "asking for its password" } else { "asking for the password again" });
-    match libprompt::ask_new_password_then(term, b"password: ", asked) {
+    match libprompt::ask_new_password_then_on(term, b"password: ", asked) {
         Ok(password) => Ok(Account { name, password }),
         Err(why) => {
             // A cancelled question is the person's no; mismatched or refused passwords are an
@@ -514,10 +475,11 @@ fn ask_account(term: u64, stderr: Option<u64>) -> Result<Account, nxinstall::Out
 
 /// The disks this view does not hold, and why, from `/dev/devices`' and `/dev/storage`' tables.
 /// Empty when either will not read: there is then nothing true to say.
-fn withheld_disks(ns: u64, reachable: &[String]) -> Vec<nxinstall::withheld::Withheld> {
+fn withheld_disks(ns: Option<&Root>, reachable: &[String]) -> Vec<nxinstall::withheld::Withheld> {
     use nxinstall::withheld::{Device as Row, Mount, withheld};
-    let read = |path: &[u8]| libfs::read_file(ns, path).ok().and_then(|b| libstream::wire::Table::decode(&b).ok());
-    let (Some(devices), Some(storage)) = (read(b"/dev/devices/all.tsm"), read(b"/dev/storage/all.tsm")) else {
+    let Some(ns) = ns else { return Vec::new() };
+    let read = |path: &str| libfs::read(ns, path).ok().and_then(|b| libstream::wire::Table::decode(&b).ok());
+    let (Some(devices), Some(storage)) = (read("/dev/devices/all.tsm"), read("/dev/storage/all.tsm")) else {
         return Vec::new();
     };
     let cell = |t: &libstream::wire::Table, row: usize, name: &str| -> String {
@@ -554,14 +516,16 @@ fn withheld_disks(ns: u64, reachable: &[String]) -> Vec<nxinstall::withheld::Wit
     withheld(&rows, &mounts, &reachable)
 }
 
-/// The device list, as a TSM1 table on `stdout`; everything else goes to `stderr`.
-fn emit_devices(stdout: u64, devs: &[Device]) {
+/// The device list, as a TSM1 table on `stdout`, which stays open; everything else goes to
+/// `stderr`. `false` with no `stdout`.
+fn emit_devices(stdout: &mut Option<IpcPort>, devs: &[Device]) -> bool {
+    let Some(port) = stdout.take() else { return false };
     let schema = Schema::new()
         .field("path", TypeTag::String, TypeModifiers::NONE)
         .field("kind", TypeTag::String, TypeModifiers::NONE)
         .field("size", TypeTag::String, TypeModifiers::NONE)
         .field("name", TypeTag::String, TypeModifiers::NONE);
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(port, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for d in devs {
             tw.write_row(&[
@@ -573,7 +537,10 @@ fn emit_devices(stdout: u64, devs: &[Device]) {
         }
         tw.finish_with_status(0)
     });
-    let _ = wrote.and_then(|()| tw.into_sink().finish());
+    let mut sink = tw.into_sink();
+    let _ = wrote.and_then(|()| sink.finish());
+    *stdout = Some(sink.into_port());
+    true
 }
 
 fn kind_name(k: BlockKind) -> &'static str {
@@ -593,40 +560,40 @@ fn log(line: &str) {
     let mut bytes = Vec::from(&b"nxinstall: "[..]);
     bytes.extend_from_slice(line.as_bytes());
     bytes.push(b'\n');
-    kprint(&bytes);
+    log::write(&bytes);
 }
 
 /// Write one line to `stderr` at `level`, or to the kernel log when there is none. Each line is
 /// its own message, since `stderr` is shared between pipeline stages; only an error-level line is
 /// drawn as a refusal.
-fn say_to(stderr: Option<u64>, level: Level, line: &str) {
+fn say_to(stderr: Option<&Endpoint>, level: Level, line: &str) {
     let mut bytes = Vec::from(line.as_bytes());
     bytes.push(b'\n');
     match stderr {
-        Some(h) => {
-            let mut port = IpcPort::new(h);
-            if port.send(&libstream::diag::frame(level, &bytes), false).is_err() {
-                kprint(&bytes);
+        Some(endpoint) => {
+            if IpcPortRef::new(endpoint).send(&libstream::diag::frame(level, &bytes), false).is_err() {
+                log::write(&bytes);
             }
         }
-        None => kprint(&bytes),
+        None => log::write(&bytes),
     }
 }
 
 /// `--help`'s lines on `stdout`; `false` with no `stdout`, or when the write failed.
-fn help_out(stdout: Option<u64>) -> bool {
-    stdout.is_some_and(|h| {
-        let mut sink = ChannelSink::new(IpcPort::new(h), IPC_PAYLOAD_SIZE);
-        libstream::table::write_text_fallback(&mut sink, HELP, 0).and_then(|()| sink.finish()).is_ok()
-    })
+fn help_out(stdout: &mut Option<IpcPort>) -> bool {
+    let Some(port) = stdout.take() else { return false };
+    let mut sink = ChannelSink::new(port, IPC_PAYLOAD_SIZE);
+    let wrote = libstream::table::write_text_fallback(&mut sink, HELP, 0).and_then(|()| sink.finish()).is_ok();
+    *stdout = Some(sink.into_port());
+    wrote
 }
 
 fn run(
-    namespace: u64,
+    namespace: Option<&Root>,
     argv: &[String],
-    stdout: Option<u64>,
-    stderr: Option<u64>,
-    terminal: Option<u64>,
+    stdout: Option<Endpoint>,
+    stderr: Option<&Endpoint>,
+    terminal: Option<&Endpoint>,
 ) -> nxinstall::Outcome {
     use nxinstall::Outcome;
     // An error, a warning or a notice: what stopped it, what it left out, and progress.
@@ -634,10 +601,12 @@ fn run(
     let warn = |line: &str| say_to(stderr, Level::Warning, line);
     let mut note = |line: &str| say_to(stderr, Level::Notice, line);
 
+    // Open until the program ends, as the streams always were.
+    let mut stdout: Option<IpcPort> = stdout.map(IpcPort::owning);
     let operands: Vec<&String> = argv.iter().skip(1).collect();
     // Before anything is looked up, so `nxinstall --help` answers without a view.
     if operands.iter().any(|o| o.as_str() == "--help") {
-        if !help_out(stdout) {
+        if !help_out(&mut stdout) {
             for line in HELP {
                 note(line);
             }
@@ -668,18 +637,15 @@ fn run(
             }
             return Outcome::NotInstalled;
         }
-        match stdout {
-            Some(h) => emit_devices(h, &devs),
-            None => {
-                for d in &devs {
-                    note(&format!(
-                        "{} {} {} {}",
-                        d.path(),
-                        kind_name(d.info.kind()),
-                        human(d.info.byte_capacity()),
-                        d.name()
-                    ));
-                }
+        if !emit_devices(&mut stdout, &devs) {
+            for d in &devs {
+                note(&format!(
+                    "{} {} {} {}",
+                    d.path(),
+                    kind_name(d.info.kind()),
+                    human(d.info.byte_capacity()),
+                    d.name()
+                ));
             }
         }
         for w in &withheld {
@@ -784,7 +750,7 @@ fn run(
     );
     // The receipt a gate waits for before it types the answer: nothing reads a desktop terminal.
     log("asking to go ahead");
-    let answer = libprompt::ask_line(term, question.as_bytes());
+    let answer = libprompt::ask_line_on(term, question.as_bytes());
     if !answer.as_deref().is_some_and(nxinstall::confirmed) {
         note("nothing was written.");
         log(&format!("not going ahead; nothing was written to {}", target.path()));
@@ -824,90 +790,76 @@ fn run(
 /// Called by the kernel ELF loader with the four bootstrap registers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start(notif: u64, namespace: u64, endpoint: u64, arg0: u64) -> ! {
-    let boot = libstream::setup::bootstrap(notif, namespace, endpoint, arg0);
-    let (argv, stdout, stderr, terminal) = match boot.setup() {
-        Some(Ok(s)) => (s.argv, s.streams.stdout, s.streams.stderr, s.terminal),
-        Some(Err(_)) => {
-            kprint(b"nxinstall: malformed setup message\n");
-            exit(EXIT_FAILURE);
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, namespace, endpoint, arg0) };
+    let bootstrap: Option<Endpoint> = start.take_handle0();
+    let setup = if setup_is_pending(start.arg0) {
+        // No bootstrap endpoint to receive on is as malformed as a message that fails to decode.
+        let received = bootstrap.as_ref().map(|e| receive_setup(e, Deadline::NEVER));
+        match received {
+            Some(Ok(Some(setup))) => Some(setup),
+            _ => {
+                log::write(b"nxinstall: malformed setup message\n");
+                libos::exit(EXIT_FAILURE);
+            }
         }
-        None => (Vec::new(), None, None, None),
+    } else {
+        None
     };
-    // SAFETY: single-threaded, before anything can panic.
-    unsafe { PANIC_SINK = stderr.unwrap_or(0) };
-    exit(run(namespace, &argv, stdout, stderr, terminal).status());
+    // `stdin`, the terminal and the bootstrap endpoint stay open until the process exits, which
+    // `exit` below ends without dropping them.
+    let (argv, _stdin, stdout, stderr, terminal) = match setup {
+        Some(s) => (s.argv, s.streams.stdin, s.streams.stdout, s.streams.stderr, s.terminal),
+        None => (Vec::new(), None, None, None, None),
+    };
+    PANIC_SINK.store(stderr.as_ref().map_or(0, |e| e.raw().0), Ordering::Relaxed);
+    let outcome = run(start.root.as_ref(), &argv, stdout, stderr.as_ref(), terminal.as_ref());
+    libos::exit(outcome.status() as i32);
 }
 
-/// The `stderr` sink for the panic handler: `kprint` reaches COM1 only, which the target lacks.
-static mut PANIC_SINK: u64 = 0;
-
-static mut PANIC_MSG: [u8; 4096] = [0; 4096];
+/// The raw `stderr` handle for the panic handler to send on, or `0`: `kprint` reaches COM1 only,
+/// which the target lacks.
+static PANIC_SINK: AtomicU64 = AtomicU64::new(0);
 
 /// Nothing here is recoverable; say where it happened, on the terminal, and stop.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // SAFETY: single-threaded, and nothing runs after this.
-    unsafe {
-        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-        let buf = &mut *(&raw mut PANIC_MSG);
-        let mut n = 0usize;
-        let mut put = |bytes: &[u8], n: &mut usize| {
-            let take = bytes.len().min(buf.len().saturating_sub(*n + 1));
-            buf[*n..*n + take].copy_from_slice(&bytes[..take]);
-            *n += take;
-        };
-        put(b"nxinstall: stopped by an internal error", &mut n);
-        if let Some(loc) = info.location() {
-            put(b" at ", &mut n);
-            put(loc.file().as_bytes(), &mut n);
-            put(b":", &mut n);
-            let mut line = loc.line();
-            let mut digits = [0u8; 10];
-            let mut d = digits.len();
-            loop {
-                d -= 1;
-                digits[d] = b'0' + (line % 10) as u8;
-                line /= 10;
-                if line == 0 || d == 0 {
-                    break;
-                }
+    // Built in the message itself: a panic can come with little stack left.
+    let mut msg = Msg::new();
+    let buf = msg.payload_mut();
+    let mut n = 0usize;
+    let mut put = |bytes: &[u8], n: &mut usize| {
+        let take = bytes.len().min(buf.len().saturating_sub(*n + 1));
+        buf[*n..*n + take].copy_from_slice(&bytes[..take]);
+        *n += take;
+    };
+    put(b"nxinstall: stopped by an internal error", &mut n);
+    if let Some(loc) = info.location() {
+        put(b" at ", &mut n);
+        put(loc.file().as_bytes(), &mut n);
+        put(b":", &mut n);
+        let mut line = loc.line();
+        let mut digits = [0u8; 10];
+        let mut d = digits.len();
+        loop {
+            d -= 1;
+            digits[d] = b'0' + (line % 10) as u8;
+            line /= 10;
+            if line == 0 || d == 0 {
+                break;
             }
-            put(&digits[d..], &mut n);
         }
-        put(b". Nothing further was written.\n", &mut n);
-        kprint(&buf[..n]);
-        let sink = (&raw const PANIC_SINK).read();
-        if sink != 0 {
-            raw_send(sink, &buf[..n]);
-        }
+        put(&digits[d..], &mut n);
     }
-    exit(EXIT_FAILURE);
-}
-
-/// Send one message on a channel without allocating, for the panic handler.
-fn raw_send(channel: u64, payload: &[u8]) {
-    const OFF_PAYLOAD_LEN: usize = 4;
-    const OFF_PAYLOAD: usize = 24;
-    // SAFETY: single-threaded; this static is used by nothing else.
-    unsafe {
-        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-        let msg = &mut *(&raw mut RAW_MSG);
-        let n = payload.len().min(msg.len() - OFF_PAYLOAD);
-        msg[..OFF_PAYLOAD].fill(0);
-        msg[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(n as u32).to_le_bytes());
-        msg[OFF_PAYLOAD..OFF_PAYLOAD + n].copy_from_slice(&payload[..n]);
-        let no_handles = [0u64; 1];
+    put(b". Nothing further was written.\n", &mut n);
+    log::write(&buf[..n]);
+    let sink = PANIC_SINK.load(Ordering::Relaxed);
+    if sink != 0 && msg.set_len(n).is_ok() {
+        // SAFETY: `_start` stores the handle of the `stderr` it still owns, and holds it open
+        // until the process exits.
+        let stderr = unsafe { Ref::<Channel, Only>::from_raw(RawHandle(sink), Rights::empty()) };
         // Non-blocking: a full channel is not worth hanging a dying process over.
-        syscall6(
-            SYS_CHANNEL_SEND,
-            channel,
-            msg.as_ptr() as u64,
-            no_handles.as_ptr() as u64,
-            0,
-            libkern::abi::SENDMODE_NOBLOCK,
-            0,
-        );
+        let _ = stderr.send(&msg, &mut Carried::new());
     }
+    libos::exit(EXIT_FAILURE);
 }
-
-static mut RAW_MSG: [u8; 4096] = [0; 4096];

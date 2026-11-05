@@ -15,9 +15,10 @@
 extern crate alloc;
 
 use libdraw::geom::{Rect, Size};
-use libdraw::text::{Font, load_mono, load_ui};
-use libkern::debug::Line;
-use libkern::{exit, kprint};
+use libdraw::text::{Font, load_mono_font, load_ui_font};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Channel, Deadline, Handle, Msg as IpcMsg, Namespace, NsReadOnly, Only, Ref, WaitSet};
 use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
 use librsproto::surface::Role;
 
@@ -40,28 +41,27 @@ static ALLOC: libheap::Heap = libheap::Heap;
 const BUFFERS: usize = 2;
 
 fn fail(msg: &[u8]) -> ! {
-    kprint(msg);
-    // SAFETY: under the test-harness kernel this terminates QEMU; elsewhere it is
-    // `Unsupported` and falls through.
-    unsafe { libkern::syscall1(libkern::SYS_TEST_EXIT, libkern::TEST_EXIT_FAILURE as u64) };
-    exit(1);
+    log::write(msg);
+    // Under the test-harness kernel this terminates QEMU; elsewhere it returns.
+    libos::system::test_verdict(false);
+    libos::exit(1);
 }
 
 /// Read the file into `app`, or say why it could not be. A missing path is not a failure; a
 /// directory or a failed read blocks the buffer, since saving the empty window would destroy it.
-fn open_into(app: &mut App, ns: u64, path: &str) {
-    if libfs::is_dir(ns, path.as_bytes()) {
+fn open_into(app: &mut App, ns: &Handle<Namespace, NsReadOnly>, path: &str) {
+    if libfs::is_directory(ns, path) {
         app.blocked("that is a directory");
-        kprint(b"nxedit: refusing to edit a directory\n");
+        log::write(b"nxedit: refusing to edit a directory\n");
         return;
     }
-    match libfs::read_file(ns, path.as_bytes()) {
+    match libfs::read(ns, path) {
         Ok(bytes) => match core::str::from_utf8(&bytes) {
             Ok(text) => {
                 app.loaded(text, &bytes);
                 // The language rides on this line so a gate that waits for the open learns it;
                 // appended, so expectations matching the prefix still match.
-                libkern::debug::Line::new()
+                Line::new()
                     .s(b"nxedit: opened ")
                     .untrusted(path.as_bytes())
                     .s(b" - ")
@@ -73,16 +73,16 @@ fn open_into(app: &mut App, ns: u64, path: &str) {
             // Refused rather than mangled: saving a lossy conversion would write it back.
             Err(_) => {
                 app.blocked("not text");
-                kprint(b"nxedit: refusing to edit a file that is not UTF-8\n");
+                log::write(b"nxedit: refusing to edit a file that is not UTF-8\n");
             }
         },
         Err(libfs::FileError::NotFound) => {
             app.absent();
-            libkern::debug::Line::new().s(b"nxedit: new file ").s(path.as_bytes()).end();
+            Line::new().s(b"nxedit: new file ").s(path.as_bytes()).end();
         }
         Err(_) => {
             app.blocked("could not be read");
-            libkern::debug::Line::new().s(b"nxedit: cannot read ").s(path.as_bytes()).end();
+            Line::new().s(b"nxedit: cannot read ").s(path.as_bytes()).end();
         }
     }
 }
@@ -93,35 +93,35 @@ fn window_title(path: &str) -> &str {
     if path.is_empty() { "untitled" } else { libfs::basename_str(path) }
 }
 
-/// Write `bytes` to `path` with [`libfs::save_file`]. The error is the sentence the status strip
+/// Write `bytes` to `path` with [`libfs::save`]. The error is the sentence the status strip
 /// shows.
-fn save(ns: u64, path: &str, bytes: &[u8]) -> Result<usize, &'static str> {
-    match libfs::save_file(ns, path.as_bytes(), bytes) {
+fn save(ns: &Handle<Namespace, NsReadOnly>, path: &str, bytes: &[u8]) -> Result<usize, &'static str> {
+    match libfs::save(ns, path, bytes) {
         Ok(()) => Ok(bytes.len()),
         Err(libfs::SaveError::Write(_)) => Err("the file could not be written"),
         Err(libfs::SaveError::Replace(_)) => Err("the file could not be replaced"),
     }
 }
 
-fn wait_one(h: u64) {
-    let handles = [h];
-    let mut results = [0u8; 24];
-    // SAFETY: a valid one-handle array and a result buffer sized for one record.
-    unsafe { libkern::syscall4(libkern::SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
+fn wait_one(ev: Ref<'_, Channel, Only>) {
+    let mut set = WaitSet::<1>::new();
+    if set.add(ev).is_ok() {
+        let _ = set.wait(Deadline::NEVER);
+    }
 }
 
 fn dress<T: libsurface::Transport>(win: &mut Session<T>, id: u32, path: &str) {
     if let Some(mut w) = win.window(id)
         && w.set_title(window_title(path)).is_err()
     {
-        kprint(b"nxedit: SetTitle refused\n");
+        log::write(b"nxedit: SetTitle refused\n");
     }
     // Files only: a directory has no contents to put in a buffer. The compositor matches this
     // while the pointer moves, so a drag carrying a folder is never highlighted here.
     if let Some(mut w) = win.window(id)
         && w.declare_acceptor(nxedit::ACCEPTOR, librsproto::surface::DROP_KIND_FILE).is_err()
     {
-        kprint(b"nxedit: DeclareAcceptor refused\n");
+        log::write(b"nxedit: DeclareAcceptor refused\n");
     }
 }
 
@@ -131,9 +131,9 @@ fn theme_of(env: &libstream::wire::Record) -> Theme {
 }
 
 /// Push `bytes` onto the kill ring. Connects per operation, not holding a wait-set slot.
-fn clip_copy(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
-    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
-    let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+fn clip_copy(ns: &Handle<Namespace, NsReadOnly>, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut buf = IpcMsg::new();
+    let mut clip = Clipboard::resolve(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
     let r = clip.copy(CLIP_KIND_TEXT, bytes).map(|_| ());
     clip.close();
     r.map_err(|_| "the clipboard refused it")
@@ -142,9 +142,14 @@ fn clip_copy(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
 /// Read ring entry `index`, continuing from `expect` — see `librsproto::clipboard::ClipPaste`.
 /// `Ok(None)` is no entry there; the stale case has its own message, since the answer is to
 /// start again.
-fn clip_read(ns: u64, index: u32, expect: u64, out: &mut [u8]) -> Result<Option<(u64, usize)>, &'static str> {
-    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
-    let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+fn clip_read(
+    ns: &Handle<Namespace, NsReadOnly>,
+    index: u32,
+    expect: u64,
+    out: &mut [u8],
+) -> Result<Option<(u64, usize)>, &'static str> {
+    let mut buf = IpcMsg::new();
+    let mut clip = Clipboard::resolve(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
     let r = clip.paste(index, expect, out);
     clip.close();
     match r {
@@ -158,10 +163,24 @@ fn clip_read(ns: u64, index: u32, expect: u64, out: &mut [u8]) -> Result<Option<
 /// Entry point, called by the kernel's ELF entry with the standard bootstrap arguments.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
-    kprint(b"nxedit: up\n");
+    log::write(b"nxedit: up\n");
 
-    let (argv, env) = match libstream::setup::bootstrap(notif, root_ns, endpoint, arg0).setup() {
-        Some(Ok(s)) => (s.argv, s.env),
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, endpoint, arg0) };
+    let Some(root) = start.root.take() else { fail(b"nxedit: no root namespace\n") };
+    let root = &root;
+    // Held to the end: the streams and terminal a setup brings, and the endpoint it came on.
+    let endpoint: Option<Handle<Channel, Only>> = start.take_handle0();
+    let mut _held = None;
+    let (argv, env) = match endpoint
+        .as_ref()
+        .filter(|_| libstream::setup::setup_is_pending(start.arg0))
+        .map(|e| libstream::setup::receive_setup(e, Deadline::NEVER))
+    {
+        Some(Ok(Some(s))) => {
+            _held = Some((s.streams, s.terminal));
+            (s.argv, s.env)
+        }
         _ => (Vec::new(), libstream::wire::Record::default()),
     };
     // `argv[1]`, or an untitled buffer whose name is asked for in the status strip.
@@ -171,36 +190,33 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     // Read before the font: the theme names the file to load.
     let theme = theme_of(&env);
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let (font, _) = match unsafe { load_ui(root_ns, &theme, b"nxedit") } {
+    let (font, _) = match load_ui_font(root, &theme, b"nxedit") {
         Ok(loaded) => loaded,
         Err(e) => {
-            libkern::debug::Line::new().s(b"nxedit: the UI font ").s(e.why()).end();
+            Line::new().s(b"nxedit: the UI font ").s(e.why()).end();
             fail(b"nxedit: font load FAILED\n");
         }
     };
     // The fixed-advance face for the buffer, a companion of the UI face. Fatal like it: a
     // silent fallback to the proportional face would be a window that looks subtly wrong.
-    // SAFETY: as above.
-    let font = match unsafe { load_mono(root_ns, &theme, b"nxedit") } {
+    let font = match load_mono_font(root, &theme, b"nxedit") {
         Ok((mono, _)) => font.with_mono(mono),
         Err(e) => {
-            libkern::debug::Line::new().s(b"nxedit: the mono font ").s(e.why()).end();
+            Line::new().s(b"nxedit: the mono font ").s(e.why()).end();
             fail(b"nxedit: font load FAILED\n");
         }
     };
 
     let mut app = App::new(&path, &home);
     if !path.is_empty() {
-        open_into(&mut app, root_ns, &path);
+        open_into(&mut app, root, &path);
     }
     let size = app.window_size();
-    // SAFETY: `root_ns` is this process's live root namespace.
-    let transport = match unsafe { ChannelTransport::connect(root_ns) } {
-        Ok(t) => Box::new(t),
+    let transport = match ChannelTransport::open(root) {
+        Ok(t) => t,
         Err(_) => fail(b"nxedit: connect to /dev/draw FAILED\n"),
     };
-    let mut win = Session::new(transport);
+    let mut win = Box::new(Session::new(transport));
     let top = {
         let ui = app.view(&theme, None);
         match Child::open_sized(&mut win, Role::Normal, (0, 0), size, &ui, &font, &theme, BUFFERS) {
@@ -219,7 +235,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let menu_shown: Option<usize> = None;
     let menu_hovered: Option<u64> = None;
     let confirm_hovered: Option<u64> = None;
-    let ev = win.wait_handle();
     let reported = app.revision();
     let reported_name = app.naming_len();
     let reported_title = String::from(window_title(&path));
@@ -325,7 +340,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let rev = app.revision();
             if rev != *reported {
                 *reported = rev;
-                libkern::debug::Line::new().s(b"nxedit: buffer rev ").u(rev).end();
+                Line::new().s(b"nxedit: buffer rev ").u(rev).end();
             }
             // The name field gets the same receipt (`revision` cannot see naming).
             let want_title = String::from(window_title(app.path()));
@@ -333,7 +348,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 && let Some(mut w) = win.window(window_id)
             {
                 if w.set_title(&want_title).is_err() {
-                    kprint(b"nxedit: SetTitle refused\n");
+                    log::write(b"nxedit: SetTitle refused\n");
                 }
                 *reported_title = want_title;
             }
@@ -341,12 +356,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let showing = app.current_tab();
             if showing != *reported_tab {
                 *reported_tab = showing;
-                libkern::debug::Line::new()
-                    .s(b"nxedit: tab ")
-                    .u(showing)
-                    .s(b" showing ")
-                    .untrusted(app.path().as_bytes())
-                    .end();
+                Line::new().s(b"nxedit: tab ").u(showing).s(b" showing ").untrusted(app.path().as_bytes()).end();
             }
             let named = app.naming_len();
             if named != *reported_name {
@@ -354,13 +364,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 if let Some(n) = named {
                     // Named by field: a gate waiting on "name so far" must not match a search.
                     let what = app.field_kind().map_or("field", nxedit::Field::label);
-                    libkern::debug::Line::new()
-                        .s(b"nxedit: ")
-                        .s(what.as_bytes())
-                        .s(b" so far ")
-                        .u(n as u64)
-                        .s(b" chars")
-                        .end();
+                    Line::new().s(b"nxedit: ").s(what.as_bytes()).s(b" so far ").u(n as u64).s(b" chars").end();
                 }
             }
             let ui = app.view(&theme, top.hovered_key());
@@ -374,7 +378,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // A search's receipt is where it landed, not the needle: `check-login` boots the
             // release image and has no rendered window to read.
             if let Some(hit) = app.take_find_report() {
-                let mut l = libkern::debug::Line::new();
+                let mut l = Line::new();
                 match hit {
                     Some(line) => {
                         l.s(b"nxedit: find hit at line ").u(line as u64);
@@ -410,7 +414,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         None => *menu = None,
                     }
                     if menu.is_none() {
-                        kprint(b"nxedit: could not open the menu\n");
+                        log::write(b"nxedit: could not open the menu\n");
                         app.menus.close();
                         *menu_shown = None;
                     }
@@ -422,7 +426,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 if let Some(which) = menu_shown {
                     let view = app.menu_view(*which, &theme, now);
                     if !m.present(&mut win, &view, &font, &theme) {
-                        kprint(b"nxedit: the menu could not be drawn\n");
+                        log::write(b"nxedit: the menu could not be drawn\n");
                     }
                 }
             }
@@ -432,10 +436,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             if let Some(path) = app.take_open()
                 && app.accept_drop(&path)
             {
-                open_into(app, root_ns, &path);
+                open_into(app, root, &path);
             }
             if let Some(dir) = app.take_chooser_list() {
-                let rows = match libfs::list_dir(root_ns, dir.as_bytes()) {
+                let rows = match libfs::list_directory(root, &dir) {
                     Ok(mut entries) => {
                         libfs::sort(&mut entries, libfs::Order::NameAsc);
                         entries
@@ -455,7 +459,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                     // An unreadable directory is shown empty, not refused: keep the person's place.
                     Err(_) => {
-                        kprint(b"nxedit: could not list that directory\n");
+                        log::write(b"nxedit: could not list that directory\n");
                         alloc::vec::Vec::new()
                     }
                 };
@@ -463,7 +467,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 if chooser.is_some()
                     && let Some(c) = app.chooser()
                 {
-                    libkern::debug::Line::new()
+                    Line::new()
                         .s(b"nxedit: the chooser moved to ")
                         .untrusted(c.dir.as_bytes())
                         .s(b" - ")
@@ -476,7 +480,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 (true, false) => {
                     // Counts the entries: an empty list is deliberate for an unreadable directory.
                     if let Some(c) = app.chooser() {
-                        libkern::debug::Line::new()
+                        Line::new()
                             .s(b"nxedit: choosing a file in ")
                             .untrusted(c.dir.as_bytes())
                             .s(b" - ")
@@ -495,7 +499,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         BUFFERS,
                     );
                     if chooser.is_none() {
-                        kprint(b"nxedit: could not open the chooser\n");
+                        log::write(b"nxedit: could not open the chooser\n");
                         app.update(Msg::ChooserCancel);
                     }
                 }
@@ -512,7 +516,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 *chooser_hovered = now;
                 let view = app.chooser_view(&theme, now);
                 if !c.present(&mut win, &view, &font, &theme) {
-                    kprint(b"nxedit: the chooser could not be drawn\n");
+                    log::write(b"nxedit: the chooser could not be drawn\n");
                 }
             }
 
@@ -521,7 +525,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 (true, false) => {
                     // Said before the window is asked for: `Child::open` returns downstream of
                     // the shell, so a line after it raced the shell's (KVM failed, TCG passed).
-                    kprint(b"nxedit: unsaved buffer - asking before closing\n");
+                    log::write(b"nxedit: unsaved buffer - asking before closing\n");
                     let ask = app.confirm_view(&theme, None);
                     *confirm = Child::open(
                         &mut win,
@@ -535,7 +539,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     );
                     // Unconditional: `check-login` boots the release image, with no test line.
                     if confirm.is_none() {
-                        kprint(b"nxedit: could not open the confirmation dialog\n");
+                        log::write(b"nxedit: could not open the confirmation dialog\n");
                         app.confirm_failed();
                     }
                 }
@@ -552,7 +556,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 *confirm_hovered = now;
                 let ask = app.confirm_view(&theme, now);
                 if !c.present(&mut win, &ask, &font, &theme) {
-                    kprint(b"nxedit: the confirmation dialog could not be drawn\n");
+                    log::write(b"nxedit: the confirmation dialog could not be drawn\n");
                 }
             }
 
@@ -560,37 +564,37 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 && let Some(mut w) = win.window(window_id)
                 && w.start_move().is_err()
             {
-                kprint(b"nxedit: the compositor refused the move\n");
+                log::write(b"nxedit: the compositor refused the move\n");
             }
             if let Some(edges) = app.take_resize_request()
                 && let Some(mut w) = win.window(window_id)
                 && w.start_resize(edges).is_err()
             {
-                kprint(b"nxedit: the compositor refused the resize\n");
+                log::write(b"nxedit: the compositor refused the resize\n");
             }
             if app.take_confirm_move()
                 && let Some(c) = confirm.as_ref()
                 && let Some(mut w) = win.window(c.id())
                 && w.start_move().is_err()
             {
-                kprint(b"nxedit: the compositor refused the dialog's move\n");
+                log::write(b"nxedit: the compositor refused the dialog's move\n");
             }
             if let Some(state) = app.take_state_request()
                 && let Some(mut w) = win.window(window_id)
                 && w.request_state(state).is_err()
             {
-                kprint(b"nxedit: the state request was refused\n");
+                log::write(b"nxedit: the state request was refused\n");
             }
             if let Some(req) = app.take_clip_request() {
                 match req {
-                    nxedit::ClipRequest::Copy(text) => match clip_copy(root_ns, text.as_bytes()) {
+                    nxedit::ClipRequest::Copy(text) => match clip_copy(root, text.as_bytes()) {
                         // A count, never the text: the serial console is a log file.
                         Ok(()) => Line::new().s(b"nxedit: copied ").u(text.len() as u64).s(b" bytes").end(),
                         Err(why) => Line::new().s(b"nxedit: the copy failed: ").s(why.as_bytes()).end(),
                     },
                     nxedit::ClipRequest::Paste => {
                         let mut got = [0u8; MAX_CLIP_BYTES];
-                        match clip_read(root_ns, 0, CLIP_ANY_SERIAL, &mut got) {
+                        match clip_read(root, 0, CLIP_ANY_SERIAL, &mut got) {
                             Ok(Some((serial, n))) => match core::str::from_utf8(&got[..n]) {
                                 Ok(text) => {
                                     app.pasted(text, 0, serial);
@@ -611,7 +615,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         Some(c) => {
                             let mut got = [0u8; MAX_CLIP_BYTES];
                             let next = c.index + 1;
-                            match clip_read(root_ns, next, c.serial, &mut got) {
+                            match clip_read(root, next, c.serial, &mut got) {
                                 Ok(Some((serial, n))) => match core::str::from_utf8(&got[..n]) {
                                     Ok(text) => {
                                         app.cycled(text, next, serial);
@@ -622,7 +626,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                                 Ok(None) => app.cycle_ended("no older entry"),
                                 Err(why) => {
                                     app.cycle_ended(why);
-                                    kprint(b"nxedit: the cycle ended\n");
+                                    log::write(b"nxedit: the cycle ended\n");
                                 }
                             }
                         }
@@ -638,17 +642,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // The path comes back with the bytes: `app.path()` is the current tab, and a
                 // `Ctrl+S` plus a tab click in one drain wrote the wrong tab's bytes.
                 let bytes = to_bytes(&text);
-                let result = save(root_ns, &editing, &bytes);
+                let result = save(root, &editing, &bytes);
                 // Gates match the `saved` line; the failure line names the path and the reason.
                 match result {
-                    Ok(n) => libkern::debug::Line::new()
+                    Ok(n) => Line::new()
                         .s(b"nxedit: saved ")
                         .untrusted(editing.as_bytes())
                         .s(b" - ")
                         .u(n as u64)
                         .s(b" bytes")
                         .end(),
-                    Err(why) => libkern::debug::Line::new()
+                    Err(why) => Line::new()
                         .s(b"nxedit: save FAILED for ")
                         .untrusted(editing.as_bytes())
                         .s(b" - ")
@@ -677,15 +681,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             match open_window(&mut win, App::new("", &home), &font, &theme) {
                 Some(w) => {
                     // Matched by a gate.
-                    kprint(b"nxedit: opened another window\n");
+                    log::write(b"nxedit: opened another window\n");
                     wins.push(w);
                 }
-                None => kprint(b"nxedit: could not open another window\n"),
+                None => log::write(b"nxedit: could not open another window\n"),
             }
         }
         if quit_asked {
             // Gates match "quitting", "closed a window" and "closing".
-            kprint(b"nxedit: quitting\n");
+            log::write(b"nxedit: quitting\n");
             quit_pending = true;
         }
 
@@ -709,14 +713,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     c.close(&mut win);
                 }
                 w.top.close(&mut win);
-                kprint(b"nxedit: closed a window\n");
+                log::write(b"nxedit: closed a window\n");
             } else {
                 i += 1;
             }
         }
         if wins.is_empty() {
-            kprint(b"nxedit: closing\n");
-            exit(0);
+            log::write(b"nxedit: closing\n");
+            libos::exit(0);
         }
 
         // A frame is owed: blocking now would delay the repaint to the next event.
@@ -725,7 +729,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
 
         if win.events_pending() == 0 {
-            wait_one(ev);
+            wait_one(win.waitable());
         }
         let mut events = Vec::new();
         loop {
@@ -733,8 +737,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 Ok(Some(e)) => events.push(e),
                 Ok(None) => break,
                 Err(_) => {
-                    kprint(b"nxedit: the compositor went away\n");
-                    exit(0);
+                    log::write(b"nxedit: the compositor went away\n");
+                    libos::exit(0);
                 }
             }
         }
@@ -807,7 +811,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         // Gates wait for this line before typing a name: a key that beats the
                         // manager's placement goes to the document instead.
                         if c.took_keyboard(&event) {
-                            kprint(b"nxedit: the chooser has the keyboard\n");
+                            log::write(b"nxedit: the chooser has the keyboard\n");
                         }
                         let view = app.chooser_view(&theme, *chooser_hovered);
                         c.route(&view, &font, &theme, &event)
@@ -823,7 +827,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             && let Some(c) = app.chooser()
                             && c.mode == libui::chooser::Mode::Save
                         {
-                            libkern::debug::Line::new()
+                            Line::new()
                                 .s(b"nxedit: chooser name so far ")
                                 .u(c.state.name.text().chars().count() as u64)
                                 .s(b" chars")
@@ -845,7 +849,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     .as_mut()
                     .map(|c| {
                         if c.took_keyboard(&event) {
-                            kprint(b"nxedit: the question has the keyboard\n");
+                            log::write(b"nxedit: the question has the keyboard\n");
                         }
                         c.route(&ask, &font, &theme, &event)
                     })
@@ -861,12 +865,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 for m in msgs {
                     // Unconditional (release image): the only outside sign of the answer given.
                     match m {
-                        Msg::Discard => kprint(b"nxedit: discarding the unsaved buffer\n"),
+                        Msg::Discard => log::write(b"nxedit: discarding the unsaved buffer\n"),
                         // Cancelling aborts the quit; `quit_pending` must clear or it reopens.
                         Msg::KeepEditing => {
-                            kprint(b"nxedit: close cancelled, still editing\n");
+                            log::write(b"nxedit: close cancelled, still editing\n");
                             if quit_pending {
-                                kprint(b"nxedit: quit cancelled\n");
+                                log::write(b"nxedit: quit cancelled\n");
                             }
                             quit_pending = false;
                         }
@@ -907,35 +911,30 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     if app.resize(Size::new(width, height)) {
                         resized = true;
                         // Matched by a gate.
-                        libkern::debug::Line::new()
-                            .s(b"nxedit: resized to ")
-                            .u(u64::from(width))
-                            .s(b"x")
-                            .u(u64::from(height))
-                            .end();
+                        Line::new().s(b"nxedit: resized to ").u(u64::from(width)).s(b"x").u(u64::from(height)).end();
                     }
                 }
                 WindowEvent::Dismissed => {}
                 WindowEvent::State(s) => app.update(Msg::WindowState(s)),
                 // `Msg::Close` asks about unsaved work; a logout from the power menu waits on it.
                 WindowEvent::CloseRequested => {
-                    kprint(b"nxedit: asked to close\n");
+                    log::write(b"nxedit: asked to close\n");
                     app.update(Msg::Close);
                 }
                 WindowEvent::Drop { ref path, ref name, x, y, .. } => {
                     let taken = top.drop_at(&ui, &l, x, y);
                     // Matched by a gate; says whether the text area took the drop.
-                    libkern::debug::Line::new()
+                    Line::new()
                         .s(b"nxedit: drop of ")
                         .untrusted(name.as_bytes())
                         .s(if taken { b" on the document" as &[u8] } else { b" outside it" })
                         .end();
                     // A drop opens a tab, so nothing here decides whether the buffer can go.
                     if taken && app.accept_drop(path) {
-                        open_into(app, root_ns, path);
+                        open_into(app, root, path);
                     }
                 }
-                WindowEvent::InputLost => kprint(b"nxedit: input dropped\n"),
+                WindowEvent::InputLost => log::write(b"nxedit: input dropped\n"),
             }
             if resized {
                 *size = app.window_size();
@@ -953,6 +952,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"nxedit: panic\n");
-    exit(2);
+    log::write(b"nxedit: panic\n");
+    libos::exit(2);
 }

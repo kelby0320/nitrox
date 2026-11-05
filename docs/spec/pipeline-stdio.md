@@ -103,11 +103,10 @@ message is one structured value, not a data stream:
 | `env` | `Record` | The environment. Typed, not `key=value` strings. Empty when the spawner has none. |
 | `terminal` | `Int` | Non-zero: a **terminal channel** follows the stream handles. Absent or zero: none. |
 
-The exact record schema is pinned in `libstream::setup` (the sender,
-[`send_setup_env`], or `send_setup_full` with a terminal) and consumed by
-`bootstrap().setup()` (the receiver). **The handles a sender gives are gone on every return**:
-moved by a send the kernel took, or closed by `send_setup_full` when the message could not be made
-or the kernel refused it. A sender never closes one, so none is closed twice and none is left open.
+The exact record schema is pinned in `libstream::setup` (the sender, `send_stage_setup`) and
+consumed by `bootstrap().setup()` (the receiver). **The handles a sender gives are gone on every
+return**: moved by a send the kernel took, or closed by `send_stage_setup` when the message could
+not be made or the kernel refused it. A sender never closes one, so none is closed twice and none is left open.
 
 **A terminal is not a stream, which is why it is not a `streams` bit.** It answers `SetMode` and
 delivers `Interrupt`, and a program holds it *as well as* its stdin and stdout. A fourth bit would

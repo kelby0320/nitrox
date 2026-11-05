@@ -21,12 +21,14 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
-use libkern::{exit, kprint};
+use libos::boot::Start;
+use libos::exit;
+use libos::log;
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, DIRENT_KIND_SYMLINK, OwnedEntry};
 use librsproto::session::DirError;
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -52,8 +54,10 @@ const DEFAULT_PATH: &[u8] = b"/";
 const MAX_DEPTH: u32 = 32;
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[RECURSIVE]) {
         Ok(a) => a,
@@ -75,19 +79,18 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             None => owned(DEFAULT_PATH),
         });
     }
-    let paths: Vec<String> =
-        paths.iter().map(|p| String::from_utf8_lossy(&stage.path(p.as_bytes())).into_owned()).collect();
+    let paths: Vec<String> = paths.iter().map(|p| stage.path(p.as_bytes())).collect();
 
     let mut rows: Vec<(String, OwnedEntry)> = Vec::new();
     for path in &paths {
-        if let Err(e) = collect(&stage, path.as_bytes(), "", args.has("recursive"), 0, &mut rows) {
-            stage.diag(describe(path.as_bytes(), e).as_bytes());
+        if let Err(e) = collect(&stage, path, "", args.has("recursive"), 0, &mut rows) {
+            stage.diag(describe(path, e).as_bytes());
             exit(EXIT_FAILURE);
         }
     }
 
-    match stage.streams.stdout {
-        Some(h) => emit_stream(&stage, h, &rows),
+    match stage.stdout() {
+        Some(port) => emit_stream(&stage, port, &rows),
         None => emit_text(&rows),
     }
     exit(EXIT_OK)
@@ -103,7 +106,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 /// a time: the server's concurrent-session cap (`MAX_SESSIONS`) is small.
 fn collect(
     stage: &Stage,
-    path: &[u8],
+    path: &str,
     prefix: &str,
     recursive: bool,
     depth: u32,
@@ -115,7 +118,7 @@ fn collect(
     }
     // The union of the filesystem under this path and the namespace bindings beneath it, with
     // bindings shadowing; `libfs` owns that rule.
-    let entries = libfs::list_dir(stage.namespace, path)?;
+    let entries = libfs::list_directory(&stage.namespace, path)?;
 
     for e in &entries {
         out.push((reported(prefix, e.name()), *e));
@@ -123,9 +126,9 @@ fn collect(
     if recursive {
         for e in &entries {
             if e.kind == DIRENT_KIND_DIR {
-                let child_path = libfs::join(path, e.name());
+                let child_path = libfs::join(path.as_bytes(), e.name());
                 let child_prefix = reported(prefix, e.name());
-                collect(stage, child_path.as_bytes(), &child_prefix, true, depth + 1, out)?;
+                collect(stage, &child_path, &child_prefix, true, depth + 1, out)?;
             }
         }
     }
@@ -150,14 +153,14 @@ fn reported(prefix: &str, name: &[u8]) -> String {
 
 /// Write the rows as a TSM1 table. A `PeerClosed` — the consumer closed its read end, the
 /// `yes | head -1` case — is a **clean** end: the stage exits `0`. Any other write error fails.
-fn emit_stream(stage: &Stage, stdout: u64, rows: &[(String, OwnedEntry)]) -> ! {
+fn emit_stream(stage: &Stage, stdout: Port<'_>, rows: &[(String, OwnedEntry)]) -> ! {
     let schema = Schema::new()
         .field("name", TypeTag::String, TypeModifiers::NONE)
         .field("size", TypeTag::Int, TypeModifiers::NONE)
         .field("kind", TypeTag::String, TypeModifiers::NONE)
         .field("modified", TypeTag::Int, TypeModifiers::NONE);
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     if let Err(e) = tw.write_schema(StreamFlags::NONE, &schema) {
         finish_write(stage, e);
     }
@@ -193,7 +196,7 @@ fn finish_write(stage: &Stage, e: libstream::wire::WireError) -> ! {
 /// Render the rows as plain text to the kernel log: the Tier-0 path, with no `stdout` stream.
 ///
 /// `TODO(tier0-output-sink)`: the kernel log is the wrong destination for program output.
-/// `kprint` is a kernel *diagnostic* path and the klog is a bounded ring, so this evicts
+/// `log::write` is a kernel *diagnostic* path and the klog is a bounded ring, so this evicts
 /// kernel diagnostics to print a directory listing. Acceptable while init and the test
 /// harness are the only spawners; it should not survive the shell. See
 /// `docs/rationale/deferred-decisions.md`.
@@ -206,7 +209,7 @@ fn emit_text(rows: &[(String, OwnedEntry)]) {
         line.push(' ');
         line.push_str(name);
         line.push('\n');
-        kprint(line.as_bytes());
+        log::write(line.as_bytes());
     }
 }
 
@@ -237,9 +240,9 @@ fn push_u64(s: &mut String, mut v: u64) {
     }
 }
 
-fn describe(path: &[u8], e: DirError) -> String {
+fn describe(path: &str, e: DirError) -> String {
     let mut s = String::from("list: ");
-    s.push_str(&owned(path));
+    s.push_str(path);
     s.push_str(match e {
         DirError::Server(_) => ": cannot list (not a directory, or not found)\n",
         DirError::Transport(_) => ": filesystem unreachable\n",
@@ -250,7 +253,7 @@ fn describe(path: &[u8], e: DirError) -> String {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"list: panic\n");
+    log::write(b"list: panic\n");
     // Not critical-path (unlike init/eshell): exit, and the supervisor sees the status.
     exit(EXIT_FAILURE);
 }

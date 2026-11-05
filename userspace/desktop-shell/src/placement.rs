@@ -110,7 +110,7 @@ pub(super) fn configure_window(mgr: &mut ChannelTransport, window: u32, x: i32, 
     let mut body = [0u8; core::mem::size_of::<ConfigureEvent>()];
     let ev = ConfigureEvent { window, width: w, height: h, x, y };
     if ev.write(&mut body).is_none() {
-        kprint(b"desktop-shell: a Configure body would not serialise\n");
+        log::write(b"desktop-shell: a Configure body would not serialise\n");
         return;
     }
     // Logged from the request's own arguments, inside the function that sends it: one value, read
@@ -158,7 +158,7 @@ pub(super) fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i
     use librsproto::surface::{MgrPlace, OP_MGR_PLACE};
     let mut body = [0u8; core::mem::size_of::<MgrPlace>()];
     if (MgrPlace { window, x, y }).write(&mut body).is_none() {
-        kprint(b"desktop-shell: a Place body would not serialise\n");
+        log::write(b"desktop-shell: a Place body would not serialise\n");
         return;
     }
     let mut reply = [0u8; 64];
@@ -171,7 +171,7 @@ pub(super) fn window_value(mgr: &mut ChannelTransport, op: u16, window: u32, val
     use librsproto::surface::MgrWindowValue;
     let mut body = [0u8; core::mem::size_of::<MgrWindowValue>()];
     if (MgrWindowValue { window, value }).write(&mut body).is_none() {
-        kprint(b"desktop-shell: a window-value body would not serialise\n");
+        log::write(b"desktop-shell: a window-value body would not serialise\n");
         return false;
     }
     let mut reply = [0u8; 64];
@@ -483,7 +483,7 @@ pub(super) fn show_desktop(
         return;
     }
     let Some(mut plan) = ShownDesktop::plan(&windows_of(entries), current, capacity) else {
-        kprint(b"desktop-shell: showing the desktop, minimised 0 window(s)\n");
+        log::write(b"desktop-shell: showing the desktop, minimised 0 window(s)\n");
         return;
     };
     // **A refusal is a window left up**, like one past the bar's end: it was never put away, so

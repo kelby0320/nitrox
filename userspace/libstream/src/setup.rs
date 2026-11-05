@@ -214,8 +214,8 @@ impl SetupPayload {
 
 #[cfg(feature = "io")]
 pub use self::io_stage::{
-    Bootstrap, Setup, StageSetup, StageStreams, bootstrap, open_pipe, pipe, receive_setup, send_setup, send_setup_env,
-    send_setup_full, send_stage_setup,
+    Bootstrap, Setup, StageSetup, StageStreams, bootstrap, open_pipe, pipe, receive_setup, send_setup, send_setup_full,
+    send_stage_setup,
 };
 
 /// The sender (a shell spawning a stage) and receiver (`bootstrap().setup()`) sides of
@@ -276,13 +276,7 @@ mod io_stage {
     /// gone on every return, as [`send_stage_setup`] says. For callers not yet on libos.
     // TODO(raw-handle-shims): goes when its last caller is on libos.
     pub fn send_setup(channel: u64, streams: Streams, argv: &[&str]) -> Result<()> {
-        send_setup_env(channel, streams, argv, &Record::default())
-    }
-
-    /// As [`send_setup`], with an environment. For callers not yet on libos.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn send_setup_env(channel: u64, streams: Streams, argv: &[&str], env: &Record) -> Result<()> {
-        send_setup_full(channel, streams, None, argv, env)
+        send_setup_full(channel, streams, None, argv, &Record::default())
     }
 
     /// The full form: streams, an optional **terminal**, `argv` and the environment.

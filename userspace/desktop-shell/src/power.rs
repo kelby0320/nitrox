@@ -56,7 +56,7 @@ pub(super) fn show_ending_dialog(
     }
     let view = ending_view(c, None, theme);
     let Some(mut d) = Child::open(session, Role::Popup { parent }, at, &view, font, theme, BUFFERS) else {
-        kprint(b"desktop-shell: waiting dialog CreateWindow FAILED\n");
+        log::write(b"desktop-shell: waiting dialog CreateWindow FAILED\n");
         return;
     };
     if !d.present(session, &view, font, theme) {
@@ -83,31 +83,26 @@ pub(super) fn end_session(asked: Asked) -> ! {
     if asked == Asked::Stop {
         stop();
     }
-    kprint(b"desktop-shell: logging out, exiting\n");
-    // SAFETY: terminating this process.
-    unsafe { syscall4(SYS_PROCESS_EXIT, 0, 0, 0, 0) };
-    loop {
-        core::hint::spin_loop();
-    }
+    log::write(b"desktop-shell: logging out, exiting\n");
+    libos::exit(0)
 }
 
 /// How long the shell waits for the view broker before calling it gone; it answers at once.
 const BROKER_WAIT_NS: u64 = 5_000_000_000;
 
-fn broker_deadline() -> u64 {
-    now_ns().map_or(u64::MAX, |n| n.saturating_add(BROKER_WAIT_NS))
+fn broker_deadline() -> Deadline {
+    now_ns().map_or(Deadline::NEVER, |n| Deadline::at(n.saturating_add(BROKER_WAIT_NS)))
 }
 
 /// Whether this session's policy would refuse a Restart or a Shut down, asked of the broker with
 /// `Decide` before any window is asked to close. `None` to go on; the request after the windows
 /// close still decides.
-pub(super) fn power_refusal(session_ns: u64) -> Option<Refusal> {
-    let ch = libviews::broker(session_ns);
-    if ch == 0 {
+pub(super) fn power_refusal(session_ns: Root<'_>) -> Option<Refusal> {
+    let Some(ch) = libviews::broker(session_ns) else {
         return Some(Refusal::Failed(alloc::string::String::from(failed::NO_BROKER)));
-    }
-    let answer = libviews::decide(ch, POWER_VIEW, POWER_PROGRAM, broker_deadline());
-    libprompt::ipc::close(ch);
+    };
+    let answer = libviews::decide(&ch, POWER_VIEW, POWER_PROGRAM, broker_deadline());
+    drop(ch);
     match answer {
         Ok((outcome, why)) => Refusal::from_answer(outcome, why),
         Err(f) => Some(Refusal::Failed(alloc::string::String::from(f.why()))),
@@ -122,29 +117,28 @@ pub(super) fn power_refusal(session_ns: u64) -> Option<Refusal> {
 ///
 /// No password is asked for: the desktop has no prompt, so the channel is closed, the broker's cue
 /// to drop the request, and the refusal says so.
-pub(super) fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
+pub(super) fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<Endpoint, Refusal> {
     use libviews::Outcome;
     let failure = |why: &str| Refusal::Failed(alloc::string::String::from(why));
-    let ch = libviews::broker(l.session_ns);
-    if ch == 0 {
+    let Some(ch) = libviews::broker(l.session_ns) else {
         return Err(failure(failed::NO_BROKER));
-    }
+    };
     let Some(built) = build_app_namespace(l) else {
-        libprompt::ipc::close(ch);
         return Err(failure(failed::NO_NAMESPACE));
     };
     // Verified as a launch's is: `shutdown`'s view not reaching `manage` rests on the same bind.
     let (home, desktop, devices, storage, user) =
-        (!l.home.is_empty(), l.desktop != 0, l.devices != 0, l.storage != 0, !l.user.is_empty());
-    if !verify_app_namespace(built.ns, home, desktop, devices, storage, user) {
-        libprompt::ipc::close(built.ns);
-        libprompt::ipc::close(ch);
-        kprint(b"desktop-shell: application namespace is not gated; not asking the broker\n");
+        (!l.home.is_empty(), l.desktop.is_some(), l.devices.is_some(), l.storage.is_some(), !l.user.is_empty());
+    if !verify_app_namespace(&built.ns, home, desktop, devices, storage, user) {
+        drop(built);
+        drop(ch);
+        log::write(b"desktop-shell: application namespace is not gated; not asking the broker\n");
         return Err(failure(failed::NO_NAMESPACE));
     }
     let args = ending.power_args().unwrap_or(&[]);
-    let handed = libviews::Handed { ns: built.ns, ..libviews::Handed::default() };
-    let refusal = match libviews::request(ch, POWER_VIEW, POWER_PROGRAM, args, &[], handed, broker_deadline()) {
+    // `request` takes the namespace, sent or closed.
+    let handed = libviews::Handed::new(built.ns);
+    let refusal = match libviews::request(&ch, POWER_VIEW, POWER_PROGRAM, args, &[], handed, broker_deadline()) {
         Ok((Outcome::Started, _)) => {
             Line::new()
                 .s(b"desktop-shell: ")
@@ -161,7 +155,6 @@ pub(super) fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refu
         Ok((Outcome::Denied { .. }, why)) => Refusal::Refused(why),
         Err(f) => failure(f.why()),
     };
-    libprompt::ipc::close(ch);
     Err(refusal)
 }
 
@@ -185,7 +178,7 @@ pub(super) fn show_refusal(
     }
     let view = panel::refusal_dialog(ending, &refusal, None, theme);
     let Some(mut d) = Child::open(session, Role::Popup { parent }, at, &view, font, theme, BUFFERS) else {
-        kprint(b"desktop-shell: refusal dialog CreateWindow FAILED\n");
+        log::write(b"desktop-shell: refusal dialog CreateWindow FAILED\n");
         return;
     };
     if !d.present(session, &view, font, theme) {
@@ -228,7 +221,7 @@ pub(super) fn open_prompt(
         None => (top, (x, BAR_H as i32 + panel::MENU_DROP)),
     };
     let Some(mut c) = Child::open(session, Role::Popup { parent }, at, &view, font, theme, BUFFERS) else {
-        kprint(b"desktop-shell: name prompt CreateWindow FAILED\n");
+        log::write(b"desktop-shell: name prompt CreateWindow FAILED\n");
         return None;
     };
     if !c.present(session, &view, font, theme) {

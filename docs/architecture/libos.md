@@ -3,9 +3,9 @@
 **Status:** Implemented. `userspace/libos` is the safe layer every userspace crate is to reach the
 kernel through: typed handles and borrows, messages, waits, mappings, namespaces and files,
 spawning and threads, the clocks, the log and the bootstrap registers, over the `Op` future and
-`block_on`. Twenty-four crates use it directly, the libraries and the system's servers and
-supervisors among them; the programs and the test harness move onto it in pre-Phase-7 Part E.4 and
-E.5, and `cargo xtask check-syscalls` holds each crate's raw syscalls to its count as they do.
+`block_on`. Thirty-three crates use it directly: the libraries, the system's servers and
+supervisors, and the desktop and the programs; the test harness moves onto it in pre-Phase-7 Part
+E.5, and `cargo xtask check-syscalls` holds each crate's raw syscalls to its count as it does.
 Sections marked *deferred* (chiefly the multi-task executor) are genuinely unbuilt. Verified
 2026-11-04.
 
@@ -86,20 +86,23 @@ gives one out once.
 | `fs` | `create`, `grow`, `truncate`, `rename` and `flush`: a file by path |
 | `process` | `Spawn`, by image or by path, and `exit` |
 | `thread` | `Stack`, and `start` |
-| `time` | `now`, `wall`, `sleep`, `sleep_until`, and `Deadline` |
+| `time` | `now`, `wall`, `sleep`, `sleep_until`, `Deadline`, and a `Timer`'s `create`, `set` and `disarm` |
 | `log` | `write`, and `Line`, one write a line |
 | `entropy` | `fill`, and `try_fill` for a caller that cannot wait for the seeding |
 | `boot` | `Start`: `_start`'s four registers, owned and typed |
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
-| `system` | `stop`, the machine halted or reset with the system-control object, and `test_verdict` |
+| `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |
 | `io` | a `Resource`'s `read` and `write`, and a notification queue's `recv` |
 
 **A `Mapping` lends no reference to its bytes.** Another process mapping the same object, or a
 device the kernel lent it to, may write them at any time, and a Rust reference promises nothing
 does while it lives. So it copies: `read_into`, `write_from` and `fill`, each refused
 `InvalidArgument` past the end. A caller who knows nothing else writes them takes a slice with
-`unsafe fn assume_unshared`. It unmaps itself on drop; `into_raw` keeps it for the process's
-life, as the framebuffer's aperture is kept.
+`unsafe fn assume_unshared`. It unmaps itself on drop; `unmap` does it now and says what the
+kernel answered, which a drop cannot; `into_raw` keeps it for the process's life, as the
+framebuffer's aperture is kept. **libdraw reads a buffer another process shares through
+`Pixels::Shared`**, a piece of a row copied out at a time, so a compositor never borrows a
+client's pixels.
 
 **A send never loses a handle, and a receive never leaks one.** `send` takes the handles from a
 `Handles`, which the kernel moves only when the message is queued or held; a refused send leaves

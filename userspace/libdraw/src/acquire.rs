@@ -50,18 +50,6 @@ pub fn framebuffer_info<'a, M: CanLookup + 'a>(
     FramebufferInfo::from_bytes(&bytes).ok_or(AcquireError::InfoTruncated)
 }
 
-/// Read the framebuffer's geometry without mapping the aperture. For callers not yet on libos;
-/// the typed form is [`framebuffer_info`].
-///
-/// # Safety
-///
-/// `root_ns` must be a live namespace handle owned by the caller for the call; it is borrowed,
-/// never closed.
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub unsafe fn read_info(root_ns: u64) -> Result<FramebufferInfo, AcquireError> {
-    framebuffer_info(borrowed(root_ns))
-}
-
 /// Borrow the caller's own namespace handle for one call.
 fn borrowed<'a>(root_ns: u64) -> Ref<'a, Namespace, NsReadOnly> {
     // SAFETY: the caller's own namespace handle, open for the call, as the raw functions have
@@ -202,8 +190,6 @@ mod tests {
         // SAFETY: the mock's handle, open for the test.
         let root = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(ns), Rights::LOOKUP) };
         assert_eq!(framebuffer_info(root).err(), Some(AcquireError::NoBinding));
-        // SAFETY: as above.
-        assert_eq!(unsafe { read_info(ns) }.err(), Some(AcquireError::NoBinding));
         // SAFETY: as above; nothing is mapped.
         assert_eq!(unsafe { acquire(ns) }.err(), Some(AcquireError::NoBinding));
     }

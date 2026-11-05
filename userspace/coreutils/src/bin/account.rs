@@ -36,13 +36,15 @@ use alloc::vec::Vec;
 use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
-use libkern::debug::Line;
-use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, exit, scrub};
-use libprompt::ipc::{call, lookup};
-use libprompt::{ask_new_password, ask_password};
+use libkern::{Rights, scrub};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Carried, Channel, Handle, Only, entropy, exit};
+use libprompt::ipc::{call_on, lookup_in};
+use libprompt::{ask_new_password_on, ask_password_on};
 use librsproto::auth::build_account_request;
 use librsproto::views::*;
-use libstream::channel::{ChannelSink, IpcPort};
+use libstream::channel::ChannelSink;
 use libstream::diag::Level;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -52,8 +54,11 @@ use libviews::outcome;
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Where the `accounts` grant binds the broker's accounts endpoint.
-const ACCOUNTS: &[u8] = b"/dev/accounts";
-const VIEWS: &[u8] = b"/dev/views";
+const ACCOUNTS: &str = "/dev/accounts";
+const VIEWS: &str = "/dev/views";
+
+/// What a session channel to the broker is asked for.
+const SESSION: Rights = Rights::from_bits(Rights::SEND.bits() | Rights::RECV.bits() | Rights::WAIT.bits());
 
 const FLAGS: [Flag; 5] = [
     Flag::long_only("list", "every account, its home, its sessions, and whether it administers"),
@@ -90,8 +95,10 @@ const HELP: &[u8] = b"usage: account --list\n\
 const VERSION: &[u8] = b"account (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
     let flags = [FLAGS[0], FLAGS[1], FLAGS[2], FLAGS[3], FLAGS[4], USERS];
     let args = match parse(&stage.argv, &flags) {
         Ok(a) => a,
@@ -138,35 +145,31 @@ fn say_at(stage: &Stage, level: Level, text: &str) {
     Line::new().s(b"account: ").untrusted(text.as_bytes()).end();
 }
 
-fn terminal(stage: &Stage) -> Result<u64, i64> {
-    stage.terminal.ok_or_else(|| {
+fn terminal(stage: &Stage) -> Result<&Handle<Channel, Only>, i32> {
+    stage.terminal.as_ref().ok_or_else(|| {
         say(stage, "a password is needed and there is no terminal to ask on");
         EXIT_FAILURE
     })
 }
 
-fn views(stage: &Stage) -> Result<u64, i64> {
-    let ch = lookup(stage.namespace, VIEWS, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
-    if ch == 0 {
+fn views(stage: &Stage) -> Result<Handle<Channel, Only>, i32> {
+    lookup_in(&stage.namespace, VIEWS, SESSION).ok_or_else(|| {
         say(stage, "this session has no view broker (/dev/views)");
-        return Err(EXIT_FAILURE);
-    }
-    Ok(ch)
+        EXIT_FAILURE
+    })
 }
 
 /// A channel on the broker's accounts endpoint, which only the `accounts` grant binds. Without it,
 /// a failure that names the view to use rather than one that says nothing.
-fn accounts(stage: &Stage, verb: &str) -> Result<u64, i64> {
-    let ch = lookup(stage.namespace, ACCOUNTS, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
-    if ch == 0 {
+fn accounts(stage: &Stage, verb: &str) -> Result<Handle<Channel, Only>, i32> {
+    lookup_in(&stage.namespace, ACCOUNTS, SESSION).ok_or_else(|| {
         say(stage, &format!("cannot {verb} here -- that needs the accounts grant: `with admin account ...`"));
-        return Err(EXIT_FAILURE);
-    }
-    Ok(ch)
+        EXIT_FAILURE
+    })
 }
 
-fn ask(stage: &Stage, ch: u64, op: u16, body: &[u8]) -> i64 {
-    let answer = call(ch, op, 1, body, &[]);
+fn ask(stage: &Stage, ch: &Handle<Channel, Only>, op: u16, body: &[u8]) -> i32 {
+    let answer = call_on(ch, op, 1, body, &mut Carried::new());
     let (o, why) = match answer {
         Some((false, body)) => outcome(&body),
         Some((true, _)) => (Outcome::Denied { retry: false }, String::from("the broker refused the request")),
@@ -177,7 +180,7 @@ fn ask(stage: &Stage, ch: u64, op: u16, body: &[u8]) -> i64 {
 }
 
 /// A name checked here against the rules, so a mistyped one is said before any password is asked.
-fn checked_name(stage: &Stage, name: &str) -> Result<(), i64> {
+fn checked_name(stage: &Stage, name: &str) -> Result<(), i32> {
     if libusers::valid_name(name.as_bytes()) {
         return Ok(());
     }
@@ -186,12 +189,12 @@ fn checked_name(stage: &Stage, name: &str) -> Result<(), i64> {
 }
 
 /// `account --list`: `Table<{name, home, sessions, administers}>`, or a line per account.
-fn list(stage: &Stage) -> i64 {
+fn list(stage: &Stage) -> i32 {
     let ch = match views(stage) {
         Ok(ch) => ch,
         Err(code) => return code,
     };
-    let Some((false, body)) = call(ch, OP_VIEWS_ACCOUNTS, 1, &[], &[]) else {
+    let Some((false, body)) = call_on(&ch, OP_VIEWS_ACCOUNTS, 1, &[], &mut Carried::new()) else {
         say(stage, "the broker could not list the accounts");
         return EXIT_FAILURE;
     };
@@ -201,7 +204,7 @@ fn list(stage: &Stage) -> i64 {
         say(stage, "the broker's list did not read");
         return EXIT_FAILURE;
     }
-    let Some(stdout) = stage.streams.stdout else {
+    let Some(stdout) = stage.stdout() else {
         for (name, home, sessions, administers) in &rows {
             let role = if *administers { ", administers" } else { "" };
             say_at(stage, Level::Notice, &format!("{name}  {home}  {sessions} session(s){role}"));
@@ -213,7 +216,7 @@ fn list(stage: &Stage) -> i64 {
         .field("home", TypeTag::String, TypeModifiers::NONE)
         .field("sessions", TypeTag::Int, TypeModifiers::NONE)
         .field("administers", TypeTag::Bool, TypeModifiers::NONE);
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for (name, home, sessions, administers) in &rows {
             let row = [
@@ -233,7 +236,7 @@ fn list(stage: &Stage) -> i64 {
     EXIT_OK
 }
 
-fn add(stage: &Stage, name: &str) -> i64 {
+fn add(stage: &Stage, name: &str) -> i32 {
     if let Err(code) = checked_name(stage, name) {
         return code;
     }
@@ -241,7 +244,7 @@ fn add(stage: &Stage, name: &str) -> i64 {
         (Ok(ch), Ok(term)) => (ch, term),
         (Err(code), _) | (_, Err(code)) => return code,
     };
-    let mut pw = match ask_new_password(term, format!("new password for {name}: ").as_bytes()) {
+    let mut pw = match ask_new_password_on(term, format!("new password for {name}: ").as_bytes()) {
         Ok(pw) => pw,
         Err(e) => {
             say(stage, e.why());
@@ -252,7 +255,7 @@ fn add(stage: &Stage, name: &str) -> i64 {
     let n = build_account_request(&mut body, name.as_bytes(), &pw);
     scrub(&mut pw);
     let code = match n {
-        Some(n) => ask(stage, ch, OP_VIEWS_ADD_ACCOUNT, &body[..n]),
+        Some(n) => ask(stage, &ch, OP_VIEWS_ADD_ACCOUNT, &body[..n]),
         None => {
             say(stage, "the request does not fit");
             EXIT_FAILURE
@@ -262,7 +265,7 @@ fn add(stage: &Stage, name: &str) -> i64 {
     code
 }
 
-fn remove(stage: &Stage, name: &str, home: bool) -> i64 {
+fn remove(stage: &Stage, name: &str, home: bool) -> i32 {
     if let Err(code) = checked_name(stage, name) {
         return code;
     }
@@ -272,12 +275,12 @@ fn remove(stage: &Stage, name: &str, home: bool) -> i64 {
     };
     let mut body = [0u8; 64];
     match build_remove_account(&mut body, name.as_bytes(), home) {
-        Some(n) => ask(stage, ch, OP_VIEWS_REMOVE_ACCOUNT, &body[..n]),
+        Some(n) => ask(stage, &ch, OP_VIEWS_REMOVE_ACCOUNT, &body[..n]),
         None => EXIT_USAGE,
     }
 }
 
-fn set(stage: &Stage, name: &str) -> i64 {
+fn set(stage: &Stage, name: &str) -> i32 {
     if let Err(code) = checked_name(stage, name) {
         return code;
     }
@@ -285,7 +288,7 @@ fn set(stage: &Stage, name: &str) -> i64 {
         (Ok(ch), Ok(term)) => (ch, term),
         (Err(code), _) | (_, Err(code)) => return code,
     };
-    let mut pw = match ask_new_password(term, format!("new password for {name}: ").as_bytes()) {
+    let mut pw = match ask_new_password_on(term, format!("new password for {name}: ").as_bytes()) {
         Ok(pw) => pw,
         Err(e) => {
             say(stage, e.why());
@@ -296,7 +299,7 @@ fn set(stage: &Stage, name: &str) -> i64 {
     let n = build_account_request(&mut body, name.as_bytes(), &pw);
     scrub(&mut pw);
     let code = match n {
-        Some(n) => ask(stage, ch, OP_VIEWS_SET_PASSWORD, &body[..n]),
+        Some(n) => ask(stage, &ch, OP_VIEWS_SET_PASSWORD, &body[..n]),
         None => {
             say(stage, "the request does not fit");
             EXIT_FAILURE
@@ -308,16 +311,16 @@ fn set(stage: &Stage, name: &str) -> i64 {
 
 /// `account --password`: your own — the current one, then a new one twice, then `ChangePassword`,
 /// which the broker checks under the session's delay after a wrong one.
-fn change_own(stage: &Stage) -> i64 {
+fn change_own(stage: &Stage) -> i32 {
     let (ch, term) = match (views(stage), terminal(stage)) {
         (Ok(ch), Ok(term)) => (ch, term),
         (Err(code), _) | (_, Err(code)) => return code,
     };
-    let Some(mut current) = ask_password(term, b"current password: ") else {
+    let Some(mut current) = ask_password_on(term, b"current password: ") else {
         say(stage, "cancelled");
         return EXIT_FAILURE;
     };
-    let mut new = match ask_new_password(term, b"new password: ") {
+    let mut new = match ask_new_password_on(term, b"new password: ") {
         Ok(pw) => pw,
         Err(e) => {
             scrub(&mut current);
@@ -330,7 +333,7 @@ fn change_own(stage: &Stage) -> i64 {
     scrub(&mut current);
     scrub(&mut new);
     let code = match n {
-        Some(n) => ask(stage, ch, OP_VIEWS_CHANGE_PASSWORD, &body[..n]),
+        Some(n) => ask(stage, &ch, OP_VIEWS_CHANGE_PASSWORD, &body[..n]),
         None => {
             say(stage, "the request does not fit");
             EXIT_FAILURE
@@ -343,12 +346,12 @@ fn change_own(stage: &Stage) -> i64 {
 /// `account --password NAME --users FILE`: **recovery, with no service.** `FILE` is read, `NAME`'s
 /// record given a new password under a fresh salt, and the result written to `FILE.new` and renamed
 /// over `FILE` — so a failure part way leaves `FILE` as it was.
-fn offline(stage: &Stage, name: &str, file: &str) -> i64 {
+fn offline(stage: &Stage, name: &str, file: &str) -> i32 {
     if let Err(code) = checked_name(stage, name) {
         return code;
     }
     let path = stage.path(file.as_bytes());
-    let before = match libfs::read_file(stage.namespace, &path) {
+    let before = match libfs::read(&stage.namespace, &path) {
         Ok(b) => b,
         Err(_) => {
             say(stage, &format!("cannot read {file}"));
@@ -367,7 +370,7 @@ fn offline(stage: &Stage, name: &str, file: &str) -> i64 {
         Ok(t) => t,
         Err(code) => return code,
     };
-    let mut pw = match ask_new_password(term, format!("new password for {name}: ").as_bytes()) {
+    let mut pw = match ask_new_password_on(term, format!("new password for {name}: ").as_bytes()) {
         Ok(pw) => pw,
         Err(e) => {
             say(stage, e.why());
@@ -375,7 +378,7 @@ fn offline(stage: &Stage, name: &str, file: &str) -> i64 {
         }
     };
     let mut salt = [0u8; libusers::SALT_LEN];
-    if !coreutils::entropy::fill(&mut salt) {
+    if entropy::fill(&mut salt).is_err() {
         scrub(&mut pw);
         say(stage, "the kernel's entropy source did not answer, so there is no salt");
         return EXIT_FAILURE;
@@ -390,10 +393,9 @@ fn offline(stage: &Stage, name: &str, file: &str) -> i64 {
             return EXIT_FAILURE;
         }
     };
-    let mut new_path = path.clone();
-    new_path.extend_from_slice(b".new");
-    let written = libfs::write_file(stage.namespace, &new_path, &after[..n])
-        .and_then(|()| libfs::rename(stage.namespace, &new_path, &path, true));
+    let new_path = format!("{path}.new");
+    let written = libfs::write(&stage.namespace, &new_path, &after[..n])
+        .and_then(|()| libfs::rename_path(&stage.namespace, &new_path, &path, true));
     if written.is_err() {
         say(stage, &format!("{file} could not be written; it is as it was"));
         return EXIT_FAILURE;
@@ -404,6 +406,6 @@ fn offline(stage: &Stage, name: &str, file: &str) -> i64 {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    libkern::kprint(b"account: panic\n");
+    log::write(b"account: panic\n");
     exit(EXIT_FAILURE)
 }

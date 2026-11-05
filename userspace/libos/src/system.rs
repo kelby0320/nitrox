@@ -1,8 +1,8 @@
-//! The machine itself: stopping it, and a test run's verdict.
+//! The machine itself: stopping it, setting its clock, and a test run's verdict.
 
-use libkern::{KError, POWER_HALT, POWER_REBOOT, TEST_EXIT_FAILURE, TEST_EXIT_SUCCESS};
+use libkern::{CLOCK_SET_THIS_BOOT, KError, POWER_HALT, POWER_REBOOT, TEST_EXIT_FAILURE, TEST_EXIT_SUCCESS};
 
-use crate::error::Error;
+use crate::error::{Error, Result, check};
 use crate::handle::{CanWrite, Ref, Resource};
 use crate::sys;
 
@@ -27,6 +27,23 @@ pub fn stop<'a, M: CanWrite + 'a>(control: impl Into<Ref<'a, Resource, M>>, how:
     Error::from_status(if r < 0 { r as i32 } else { KError::KernelError as i32 })
 }
 
+/// How far a set of the clock reached.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClockSet {
+    /// The hardware clock holds it, so the next boot starts from it.
+    Kept,
+    /// This boot's clock alone: the hardware clock would not take it.
+    ThisBoot,
+}
+
+/// Set the wall clock to `ns` since the Unix epoch, stepping it either way: refused `NoAccess`
+/// without the `SYSTEM_CLOCK` grant, and `InvalidArgument` for a time outside 2000 to 2099.
+pub fn set_clock(ns: u64) -> Result<ClockSet> {
+    // TODO(surface-shape): a write to the clock node, once the clock is a char node.
+    let r = check(sys::clock_set(ns))?;
+    Ok(if r == CLOCK_SET_THIS_BOOT { ClockSet::ThisBoot } else { ClockSet::Kept })
+}
+
 /// Report a test run's verdict to the harness that booted the machine, which ends the run: this
 /// returns where none listens.
 // TODO(test-verdict-authority): any process can end a test run; a handle should be the authority.
@@ -45,6 +62,19 @@ mod tests {
     fn control(raw: u64) -> Handle<Resource, WriteOnly> {
         // SAFETY: a handle the model just made, owned here alone.
         unsafe { Handle::from_raw(RawHandle(raw), Rights::empty()) }
+    }
+
+    #[test]
+    fn a_clock_set_says_how_far_it_reached() {
+        mock::reset();
+        let ns = 1_900_000_000_000_000_000;
+        assert_eq!(set_clock(ns).map_err(|e| e.code()), Ok(ClockSet::Kept));
+        assert!(crate::time::wall().unwrap() >= ns, "the wall clock reads it");
+        mock::answer_next_clock_set(CLOCK_SET_THIS_BOOT as i64);
+        assert_eq!(set_clock(ns).map_err(|e| e.code()), Ok(ClockSet::ThisBoot));
+        mock::answer_next_clock_set(KError::NoAccess as i64);
+        assert_eq!(set_clock(ns).map_err(|e| e.code()), Err(KError::NoAccess), "without the grant");
+        assert_eq!(set_clock(0).map_err(|e| e.code()), Err(KError::InvalidArgument), "before 2000");
     }
 
     #[test]

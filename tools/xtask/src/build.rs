@@ -80,8 +80,6 @@ pub(crate) fn test_package() -> Vec<&'static str> {
 }
 
 pub(crate) fn cmd_build(mode: BuildMode) -> R<()> {
-    // Userspace first: the kernel embeds the ELFs via `include_bytes!`.
-    cmd_build_hello()?;
     if mode.stages_test_data() {
         build_userspace_crate("test-harness", TEST_PROGRAMS, None)?;
         for prog in TEST_CRATE_PROGRAMS {
@@ -169,26 +167,6 @@ fn arg_userspace_target(c: &mut Command) {
 /// Directory holding built userspace release artifacts.
 pub(crate) fn userspace_release_dir() -> PathBuf {
     repo_root().join("userspace/target").join(USERSPACE_TARGET).join("release")
-}
-
-/// Path to the built `hello` userspace ELF (the kernel embeds this).
-fn hello_elf() -> PathBuf {
-    userspace_release_dir().join("hello")
-}
-
-/// Build the `hello` userspace program as a static `ET_EXEC` for the bare target.
-fn cmd_build_hello() -> R<()> {
-    let hello_dir = repo_root().join("userspace").join("hello");
-    let mut c = userspace_cargo();
-    c.arg("build").arg("--release");
-    arg_userspace_target(&mut c);
-    run(c.current_dir(&hello_dir))?;
-    let elf = hello_elf();
-    if !elf.exists() {
-        return Err(format!("hello ELF missing after build: {}", elf.display()).into());
-    }
-    println!("xtask: built hello ELF at {}", elf.display());
-    Ok(())
 }
 
 /// Build the userspace program `name` as a static `ET_EXEC` for the bare target.

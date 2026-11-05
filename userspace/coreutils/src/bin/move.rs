@@ -7,8 +7,7 @@
 //!
 //! - **Rename first, copy only if forced to.** A rename is O(1) and preserves the file's
 //!   identity; `move` falls back only on the kernel's `CrossDevice` verdict, which `libfs`
-//!   documents as *"a caller's cue to fall back to `copy_file` + unlink rather than an error
-//!   to report"*.
+//!   documents as the cue to fall back to `libfs::copy` + unlink rather than an error to report.
 //! - **It reports which method it used.** `Table<{from, to, method: String}>` with `method`
 //!   one of `rename` or `copy`: the two differ in cost and in whether the file keeps its
 //!   identity, and a gate uses it to prove the same-mount path is not silently copying.
@@ -16,7 +15,7 @@
 //!   the source does not, the result is a duplicate, not a move: the exit status is non-zero
 //!   and the row is not emitted.
 //! - **A cross-mount *directory* move copies the tree, then removes it**, with the walks
-//!   [`libfs::copy_tree`] and [`libfs::remove_tree`] that `copy` and `remove` use.
+//!   [`libfs::copy_recursive`] and [`libfs::remove_recursive`] that `copy` and `remove` use.
 //! - **A partial copy is left where it fell**: cleaning it up would delete whatever of the
 //!   destination already existed. The source is untouched, and the exit status says the move
 //!   did not happen.
@@ -32,11 +31,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libfs::FileError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
-use libkern::{exit, kprint};
-use libstream::channel::{ChannelSink, IpcPort};
+use libos::boot::Start;
+use libos::exit;
+use libos::log;
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -65,8 +66,10 @@ struct Moved {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[FORCE]) {
         Ok(a) => a,
@@ -84,9 +87,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     let force = args.has("force");
     let (sources, dest) = args.operands.split_at(args.operands.len() - 1);
-    let dest_owned = stage.path(dest[0].as_bytes());
-    let dest = dest_owned.as_slice();
-    let dest_is_dir = libfs::is_dir(stage.namespace, dest);
+    let dest = stage.path(dest[0].as_bytes());
+    let dest_is_dir = libfs::is_directory(&stage.namespace, &dest);
 
     // As in `copy`: with a file destination, several sources would each overwrite the last.
     if sources.len() > 1 && !dest_is_dir {
@@ -95,22 +97,18 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     let mut done: Vec<Moved> = Vec::new();
     for source in sources {
-        let src_owned = stage.path(source.as_bytes());
-        let src = src_owned.as_slice();
-        let target = if dest_is_dir {
-            libfs::join(dest, libfs::basename(src))
-        } else {
-            String::from_utf8_lossy(dest).into_owned()
-        };
-        if target.as_bytes() == src {
+        let src = stage.path(source.as_bytes());
+        let target =
+            if dest_is_dir { libfs::join(dest.as_bytes(), libfs::basename(src.as_bytes())) } else { dest.clone() };
+        if target == src {
             stage.die(b"move: source and destination are the same file\n", EXIT_USAGE);
         }
-        let method = move_one(&stage, src, target.as_bytes(), force);
-        done.push(Moved { from: String::from_utf8_lossy(src).into_owned(), to: target, method });
+        let method = move_one(&stage, &src, &target, force);
+        done.push(Moved { from: src, to: target, method });
     }
 
-    match stage.streams.stdout {
-        Some(h) => emit(&stage, h, &done),
+    match stage.stdout() {
+        Some(port) => emit(&stage, port, &done),
         None => {
             for m in &done {
                 report_text(m);
@@ -120,8 +118,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(EXIT_OK)
 }
 
-fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str {
-    match libfs::rename(stage.namespace, src, dst, force) {
+fn move_one(stage: &Stage, src: &str, dst: &str, force: bool) -> &'static str {
+    match libfs::rename_path(&stage.namespace, src, dst, force) {
         Ok(()) => return "rename",
         // Not a failure: the paths are on different mounts, so only a copy can express this.
         Err(FileError::CrossDevice) => {}
@@ -135,8 +133,8 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
         stage.die(b"move: source is a namespace binding, not a file\n", EXIT_FAILURE);
     }
 
-    let is_dir = libfs::is_dir(stage.namespace, src);
-    if libfs::copy_tree(stage.namespace, src, dst, force, &mut |_, _, _| {}).is_err() {
+    let is_dir = libfs::is_directory(&stage.namespace, src);
+    if libfs::copy_recursive(&stage.namespace, src, dst, force, &mut |_, _, _| {}).is_err() {
         // The source is untouched; a partial destination is left where it fell.
         stage.die(b"move: cross-mount copy failed\n", EXIT_FAILURE);
     }
@@ -144,9 +142,9 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
     // From here a failure leaves *two* copies, which is not a move: reported as a failure, no
     // row emitted. "Both now exist" tells an operator that nothing was lost.
     let removed = if is_dir {
-        libfs::remove_tree(stage.namespace, src, &mut |_, _| {}).is_ok()
+        libfs::remove_recursive(&stage.namespace, src, &mut |_, _| {}).is_ok()
     } else {
-        libfs::unlink_at(stage.namespace, src).is_ok()
+        libfs::remove_entry(&stage.namespace, src).is_ok()
     };
     if !removed {
         stage.die(b"move: copied, but could not remove the original (both now exist)\n", EXIT_FAILURE);
@@ -156,18 +154,19 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
 
 /// Is `path` a namespace binding rather than a filesystem entry? Asked of the parent's
 /// bindings, which is where a mount point appears. Mirrors `remove`'s check.
-fn is_binding(stage: &Stage, path: &[u8]) -> bool {
-    let name = libfs::basename(path);
-    libfs::ns_children(stage.namespace, libfs::parent(path)).iter().any(|(n, _)| n.as_bytes() == name)
+fn is_binding(stage: &Stage, path: &str) -> bool {
+    let name = libfs::basename_str(path);
+    let parent = core::str::from_utf8(libfs::parent(path.as_bytes())).unwrap_or(path);
+    libfs::bindings_under(&stage.namespace, parent).iter().any(|(n, _)| n == name)
 }
 
-fn emit(stage: &Stage, stdout: u64, done: &[Moved]) {
+fn emit(stage: &Stage, stdout: Port<'_>, done: &[Moved]) {
     let schema = Schema::new()
         .field("from", TypeTag::String, TypeModifiers::NONE)
         .field("to", TypeTag::String, TypeModifiers::NONE)
         .field("method", TypeTag::String, TypeModifiers::NONE);
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for m in done {
             tw.write_row(&[Value::Str(m.from.clone()), Value::Str(m.to.clone()), Value::Str(String::from(m.method))])?;
@@ -192,11 +191,11 @@ fn report_text(m: &Moved) {
     line.push_str(" -> ");
     line.push_str(&m.to);
     line.push('\n');
-    kprint(line.as_bytes());
+    log::write(line.as_bytes());
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"move: panic\n");
+    log::write(b"move: panic\n");
     exit(EXIT_FAILURE)
 }

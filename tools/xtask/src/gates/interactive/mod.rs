@@ -151,11 +151,8 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 
     // 4. A correct password reaches a shell prompt.
     s.send(DEMO_PASSWORD)?;
-    // **Through the shared session core**: `session-mgr` calls `libsession::spawn_leader`, and this
-    // line is that function's. The line names the program, so a supervisor that went back to
-    // spawning `nxsh` directly would be silent here rather than passing.
-    // **And a session with the view broker, bound in**: the namespace binds `/dev/views` at its
-    // base. Reported from what was bound, so a session built without it says so.
+    // **A session with the view broker, bound in**: the namespace binds `/dev/views` at its base.
+    // Reported from what was bound, so a session built without it says so.
     s.expect("view-broker: session ")?;
     let opened = s.rest_of_line()?;
     if !opened.ends_with("opened") {

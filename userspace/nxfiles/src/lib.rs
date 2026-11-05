@@ -1,7 +1,7 @@
 //! `nxfiles` — the file browser, minus the syscalls.
 //!
 //! What a listing *is* — sorted, marked, navigable — is a function of values and host-tests
-//! without a disk: [`App::show`] is handed entries the binary fetched with [`libfs::list_dir`].
+//! without a disk: [`App::show`] is handed entries the binary fetched with [`libfs::list_directory`].
 //! Which entries a path holds (the filesystem's plus the namespace bindings mounted there,
 //! bindings shadowing) is `libfs`'s rule, shared with `list`; re-deriving it would show a mount
 //! point twice.

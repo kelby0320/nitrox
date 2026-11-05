@@ -69,19 +69,6 @@ impl ChannelTransport {
         }
     }
 
-    /// Wrap an endpoint obtained by resolving `/dev/draw/new`. For callers not yet on libos; the
-    /// typed form is [`from_endpoint`](Self::from_endpoint).
-    ///
-    /// # Safety
-    ///
-    /// `channel` must be a live IPC endpoint connected to a compositor, given away: the
-    /// transport's `Drop` closes it, so a borrowed handle is a double close.
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub unsafe fn new(channel: u64) -> Self {
-        // SAFETY: the caller gives the endpoint away, as this has always asked.
-        Self::from_endpoint(unsafe { Handle::from_raw(RawHandle(channel), Rights::empty()) })
-    }
-
     /// Resolve `/dev/draw/new` in `ns` and wrap the endpoint it answers with.
     pub fn open<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>) -> Result<Self, UiError> {
         Self::resolve(ns.into(), "/dev/draw/new")
@@ -135,6 +122,14 @@ impl ChannelTransport {
 impl crate::Session<ChannelTransport> {
     /// The compositor's channel, to wait on beside a client's own handles: the typed form of
     /// [`wait_handle`](crate::Session::wait_handle).
+    pub fn waitable(&self) -> Ref<'_, Channel, Only> {
+        self.transport.endpoint()
+    }
+}
+
+impl crate::Session<alloc::boxed::Box<ChannelTransport>> {
+    /// The same, for a transport on the heap, as its message buffers are too big to move about a
+    /// small stack.
     pub fn waitable(&self) -> Ref<'_, Channel, Only> {
         self.transport.endpoint()
     }
@@ -602,6 +597,9 @@ mod tests {
         let session = crate::Session::new(t);
         assert_eq!(session.waitable().raw().0, session.wait_handle());
         assert_ne!(session.wait_handle(), 0);
+        let (t, _peer) = connected();
+        let boxed = crate::Session::new(alloc::boxed::Box::new(t));
+        assert_eq!(boxed.waitable().raw().0, boxed.wait_handle(), "boxed, the same channel");
     }
 
     #[test]

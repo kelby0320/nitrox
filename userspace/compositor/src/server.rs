@@ -124,10 +124,13 @@ fn first_truncation() -> bool {
 /// Report the **first** over-long title only: a serial write per request is too costly on this
 /// path, and one line explains a title that came back shorter than it went out.
 fn note_title_truncated(len: usize) {
-    if !first_truncation() {
-        return;
+    if first_truncation() {
+        log_title_truncated(len);
     }
-    let mut l = libkern::debug::Line::new();
+}
+
+fn log_title_truncated(len: usize) {
+    let mut l = libos::log::Line::new();
     l.s(b"compositor: title of ")
         .u(len as u64)
         .s(b" bytes truncated to ")
@@ -385,6 +388,9 @@ fn parent_of(role: &librsproto::surface::Role) -> Option<u32> {
 }
 
 #[cfg(test)]
+mod shared_pixels;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -414,6 +420,16 @@ mod tests {
             })
         });
         assert!(most <= 1, "two threads each saw themselves first");
+    }
+
+    #[test]
+    fn a_truncated_title_is_reported_with_both_lengths() {
+        libos::mock::reset();
+        log_title_truncated(300);
+        let line = alloc::string::String::from_utf8(libos::mock::logged()).unwrap();
+        let max = librsproto::surface::MAX_TITLE;
+        let want = alloc::format!("compositor: title of 300 bytes truncated to {max} (further truncations not logged)");
+        assert_eq!(line.trim_end(), want);
     }
 
     fn info(object: KObjectType, size: u64) -> HandleInfo {

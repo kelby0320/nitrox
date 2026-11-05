@@ -10,8 +10,9 @@ use libprompt::ipc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use libkern::Rights;
 use libkern::abi::IPC_PAYLOAD_SIZE;
-use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
+use libos::{CanLookup, Carried, Channel, Deadline, Handle, Namespace, NsMutable, Only, Ref};
 pub use librsproto::views::Outcome;
 use librsproto::views::{
     OP_VIEWS_DECIDE, OP_VIEWS_FORGET, OP_VIEWS_LIST, OP_VIEWS_PASSWORD, OP_VIEWS_REQUEST, REQ_STDERR, REQ_STDIN,
@@ -28,14 +29,14 @@ pub fn outcome(body: &[u8]) -> (Outcome, String) {
 }
 
 /// Where a session's namespace binds the broker.
-pub const BROKER_PATH: &[u8] = b"/dev/views";
+pub const BROKER_PATH: &str = "/dev/views";
 
 /// The request id [`request`] sends with. A password for the same request is sent with a later one.
 pub const REQUEST_ID: u64 = 1;
 
-/// A channel to the broker at `ns`'s [`BROKER_PATH`], tied to `ns`'s session; `0` if none.
-pub fn broker(ns: u64) -> u64 {
-    ipc::lookup(ns, BROKER_PATH, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)
+/// A channel to the broker at `ns`'s [`BROKER_PATH`], tied to `ns`'s session; `None` if none.
+pub fn broker<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>) -> Option<Handle<Channel, Only>> {
+    ipc::lookup_in(ns, BROKER_PATH, Rights::SEND | Rights::RECV | Rights::WAIT)
 }
 
 /// Why the broker gave no answer to act on.
@@ -63,28 +64,35 @@ impl Failed {
     }
 }
 
-/// The namespace and streams a request hands the program; each handle present moves to the broker.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+/// The namespace and streams a request hands the program, each moved to the broker.
 pub struct Handed {
     /// The namespace to build the view from. The broker copies it, and never uses it as it is.
-    pub ns: u64,
+    pub ns: Handle<Namespace, NsMutable>,
     /// The program's `stdin`.
-    pub stdin: Option<u64>,
+    pub stdin: Option<Handle<Channel, Only>>,
     /// The program's `stdout`.
-    pub stdout: Option<u64>,
+    pub stdout: Option<Handle<Channel, Only>>,
     /// The program's `stderr`.
-    pub stderr: Option<u64>,
+    pub stderr: Option<Handle<Channel, Only>>,
     /// The terminal the program may prompt on.
-    pub terminal: Option<u64>,
+    pub terminal: Option<Handle<Channel, Only>>,
     /// A `Tty::Token` ([`token`]); not a handle: the broker redeems it with the terminal server.
     pub token: Option<[u8; TTY_TOKEN_LEN]>,
 }
 
 impl Handed {
-    /// The handle bits and handles in the order the broker takes them: namespace, then streams.
-    pub fn wire(&self) -> (u8, Vec<u64>) {
+    /// `ns` alone: no streams, terminal or token.
+    pub fn new(ns: Handle<Namespace, NsMutable>) -> Self {
+        Handed { ns, stdin: None, stdout: None, stderr: None, terminal: None, token: None }
+    }
+
+    /// The handle bits, and the handles in the order the broker takes them: namespace, then
+    /// streams.
+    pub fn wire(self) -> (u8, Carried) {
         let mut bits = 0u8;
-        let mut handles = alloc::vec![self.ns];
+        let mut handles = Carried::new();
+        // Five at most, inside a message's room, so no push is refused.
+        let _ = handles.push(self.ns);
         for (bit, h) in [
             (REQ_STDIN, self.stdin),
             (REQ_STDOUT, self.stdout),
@@ -93,7 +101,7 @@ impl Handed {
         ] {
             if let Some(h) = h {
                 bits |= bit;
-                handles.push(h);
+                let _ = handles.push(h);
             }
         }
         (bits, handles)
@@ -103,32 +111,29 @@ impl Handed {
 /// Ask the broker on `ch` to run `program` in `view`; every handle in `handed` is gone on return
 /// (sent, or closed here). [`Outcome::NeedPassword`] is answered by [`password`]. `env` is a
 /// serialised record or empty; the broker sets `view` in it.
-pub fn request(
-    ch: u64,
+pub fn request<'a>(
+    ch: impl Into<Ref<'a, Channel, Only>>,
     view: &str,
     program: &str,
     args: &[&str],
     env: &[u8],
     handed: Handed,
-    deadline: u64,
+    deadline: Deadline,
 ) -> Result<(Outcome, String), Failed> {
-    let (bits, handles) = handed.wire();
+    let ch = ch.into();
+    let token = handed.token;
+    let (bits, mut handles) = handed.wire();
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let mut body = alloc::vec![0u8; IPC_PAYLOAD_SIZE - 64];
-    let token = handed.token.as_ref();
-    let Some(n) = build_request(&mut body, bits, view.as_bytes(), program.as_bytes(), &arg_bytes, env, token) else {
-        for h in handles {
-            ipc::close(h);
-        }
+    let Some(n) = build_request(&mut body, bits, view.as_bytes(), program.as_bytes(), &arg_bytes, env, token.as_ref())
+    else {
         return Err(Failed::TooLarge);
     };
-    if !ipc::send(ch, OP_VIEWS_REQUEST, REQUEST_ID, &body[..n], &handles) {
-        for h in handles {
-            ipc::close(h);
-        }
+    // What a refused send leaves in `handles` closes as it drops.
+    if !ipc::transmit(ch, OP_VIEWS_REQUEST, REQUEST_ID, &body[..n], &mut handles) {
         return Err(Failed::NoAnswer);
     }
-    match ipc::answer(ch, REQUEST_ID, deadline) {
+    match ipc::answer_on(ch, REQUEST_ID, deadline) {
         Some((false, body)) => Ok(outcome(&body)),
         Some((true, _)) => Err(Failed::Refused),
         None => Err(Failed::NoAnswer),
@@ -140,22 +145,24 @@ const TOKEN_REQUEST_ID: u64 = 0x544f_4b45;
 
 /// A one-time `Tty::Token` for `term`, so the broker learns the terminal from its server; `None`
 /// if `term` does not answer by `deadline`, and the request then asks for a password.
-pub fn token(term: u64, deadline: u64) -> Option<[u8; TTY_TOKEN_LEN]> {
-    if !ipc::send(term, OP_TTY_TOKEN, TOKEN_REQUEST_ID, &[], &[]) {
+pub fn token<'a>(term: impl Into<Ref<'a, Channel, Only>>, deadline: Deadline) -> Option<[u8; TTY_TOKEN_LEN]> {
+    let term = term.into();
+    if !ipc::transmit(term, OP_TTY_TOKEN, TOKEN_REQUEST_ID, &[], &mut Carried::new()) {
         return None;
     }
-    match ipc::answer(term, TOKEN_REQUEST_ID, deadline)? {
+    match ipc::answer_on(term, TOKEN_REQUEST_ID, deadline)? {
         (false, body) => body.as_slice().try_into().ok(),
         (true, _) => None,
     }
 }
 
 /// Forget every password, on every terminal, that the session on `ch` has remembered.
-pub fn forget(ch: u64, deadline: u64) -> Result<(), Failed> {
-    if !ipc::send(ch, OP_VIEWS_FORGET, REQUEST_ID, &[], &[]) {
+pub fn forget<'a>(ch: impl Into<Ref<'a, Channel, Only>>, deadline: Deadline) -> Result<(), Failed> {
+    let ch = ch.into();
+    if !ipc::transmit(ch, OP_VIEWS_FORGET, REQUEST_ID, &[], &mut Carried::new()) {
         return Err(Failed::NoAnswer);
     }
-    match ipc::answer(ch, REQUEST_ID, deadline) {
+    match ipc::answer_on(ch, REQUEST_ID, deadline) {
         Some((false, _)) => Ok(()),
         Some((true, _)) => Err(Failed::Refused),
         None => Err(Failed::NoAnswer),
@@ -163,8 +170,12 @@ pub fn forget(ch: u64, deadline: u64) -> Result<(), Failed> {
 }
 
 /// A password for the request waiting on `ch`: the broker's answer, after the session's delay.
-pub fn password(ch: u64, request_id: u64, pw: &[u8]) -> Result<(Outcome, String), Failed> {
-    match ipc::call(ch, OP_VIEWS_PASSWORD, request_id, pw, &[]) {
+pub fn password<'a>(
+    ch: impl Into<Ref<'a, Channel, Only>>,
+    request_id: u64,
+    pw: &[u8],
+) -> Result<(Outcome, String), Failed> {
+    match ipc::call_on(ch, OP_VIEWS_PASSWORD, request_id, pw, &mut Carried::new()) {
         Some((false, body)) => Ok(outcome(&body)),
         Some((true, _)) => Err(Failed::Refused),
         None => Err(Failed::NoAnswer),
@@ -183,11 +194,12 @@ pub struct Row {
 }
 
 /// The views the person `ch`'s session belongs to may use.
-pub fn list(ch: u64, deadline: u64) -> Result<Vec<Row>, Failed> {
-    if !ipc::send(ch, OP_VIEWS_LIST, REQUEST_ID, &[], &[]) {
+pub fn list<'a>(ch: impl Into<Ref<'a, Channel, Only>>, deadline: Deadline) -> Result<Vec<Row>, Failed> {
+    let ch = ch.into();
+    if !ipc::transmit(ch, OP_VIEWS_LIST, REQUEST_ID, &[], &mut Carried::new()) {
         return Err(Failed::NoAnswer);
     }
-    let body = match ipc::answer(ch, REQUEST_ID, deadline) {
+    let body = match ipc::answer_on(ch, REQUEST_ID, deadline) {
         Some((false, body)) => body,
         Some((true, _)) => return Err(Failed::Refused),
         None => return Err(Failed::NoAnswer),
@@ -209,15 +221,21 @@ pub fn list(ch: u64, deadline: u64) -> Result<Vec<Row>, Failed> {
 /// What the broker would answer a request, via `Decide` (runs nothing); not `List`, cut at 2 KiB.
 /// A policy changed between this and the request is the request's to answer: this is a way to
 /// know before asking, not a way to ask.
-pub fn decide(ch: u64, view: &str, program: &str, deadline: u64) -> Result<(Outcome, String), Failed> {
+pub fn decide<'a>(
+    ch: impl Into<Ref<'a, Channel, Only>>,
+    view: &str,
+    program: &str,
+    deadline: Deadline,
+) -> Result<(Outcome, String), Failed> {
+    let ch = ch.into();
     let mut body = [0u8; 512];
     let Some(n) = build_decide(&mut body, view.as_bytes(), program.as_bytes()) else {
         return Err(Failed::TooLarge);
     };
-    if !ipc::send(ch, OP_VIEWS_DECIDE, REQUEST_ID, &body[..n], &[]) {
+    if !ipc::transmit(ch, OP_VIEWS_DECIDE, REQUEST_ID, &body[..n], &mut Carried::new()) {
         return Err(Failed::NoAnswer);
     }
-    match ipc::answer(ch, REQUEST_ID, deadline) {
+    match ipc::answer_on(ch, REQUEST_ID, deadline) {
         Some((false, body)) => Ok(outcome(&body)),
         Some((true, _)) => Err(Failed::Refused),
         None => Err(Failed::NoAnswer),
@@ -227,26 +245,57 @@ pub fn decide(ch: u64, view: &str, program: &str, deadline: u64) -> Result<(Outc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libos::mock;
     use librsproto::views::parse_request;
+
+    fn channel() -> Handle<Channel, Only> {
+        Handle::<Channel, Only>::pair(1).unwrap().0
+    }
+
+    /// The handles in order, as the values the kernel knows them by.
+    fn raws(mut handles: Carried) -> Vec<u64> {
+        (0..handles.len()).filter_map(|i| handles.take::<Channel, Only>(i)).map(|h| h.raw().0).collect()
+    }
 
     #[test]
     fn a_requests_handles_are_in_the_order_the_broker_takes_them() {
-        let all = Handed { ns: 1, stdin: Some(2), stdout: Some(3), stderr: Some(4), terminal: Some(5), token: None };
-        assert_eq!(all.wire(), (REQ_STDIN | REQ_STDOUT | REQ_STDERR | REQ_TERMINAL, alloc::vec![1, 2, 3, 4, 5]));
+        mock::reset();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        let (n, i, o, e, t) = (ns.raw().0, channel(), channel(), channel(), channel());
+        let want = [n, i.raw().0, o.raw().0, e.raw().0, t.raw().0];
+        let all = Handed { ns, stdin: Some(i), stdout: Some(o), stderr: Some(e), terminal: Some(t), token: None };
+        let (bits, handles) = all.wire();
+        assert_eq!(bits, REQ_STDIN | REQ_STDOUT | REQ_STDERR | REQ_TERMINAL);
+        assert_eq!(raws(handles), want);
         // A gap is closed up: the broker counts the bits, not the slots.
-        let some = Handed { ns: 1, stdout: Some(3), terminal: Some(5), ..Handed::default() };
-        assert_eq!(some.wire(), (REQ_STDOUT | REQ_TERMINAL, alloc::vec![1, 3, 5]));
-        assert_eq!(Handed { ns: 7, ..Handed::default() }.wire(), (0, alloc::vec![7]));
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        let (o, t) = (channel(), channel());
+        let want = [ns.raw().0, o.raw().0, t.raw().0];
+        let (bits, handles) = Handed { stdout: Some(o), terminal: Some(t), ..Handed::new(ns) }.wire();
+        assert_eq!((bits, raws(handles)), (REQ_STDOUT | REQ_TERMINAL, want.to_vec()));
     }
 
     #[test]
     fn a_request_the_wire_builds_is_one_the_broker_reads_with_as_many_handles() {
-        let h = Handed { ns: 1, stderr: Some(4), ..Handed::default() };
+        mock::reset();
+        let h = Handed { stderr: Some(channel()), ..Handed::new(Handle::<Namespace, NsMutable>::create().unwrap()) };
         let (bits, handles) = h.wire();
         let mut body = alloc::vec![0u8; IPC_PAYLOAD_SIZE - 64];
         let n = build_request(&mut body, bits, b"power", b"shutdown", &[b"--reboot"], &[], None).unwrap();
         let r = parse_request(&body[..n]).unwrap();
         assert_eq!(r.handle_count(), handles.len());
         assert_eq!((r.view, r.program), (&b"power"[..], &b"shutdown"[..]));
+    }
+
+    #[test]
+    fn a_request_too_large_closes_every_handle_it_was_given() {
+        mock::reset();
+        let (ch, _broker) = Handle::<Channel, Only>::pair(1).unwrap();
+        let open = mock::open_handles();
+        let h = Handed { stdout: Some(channel()), ..Handed::new(Handle::<Namespace, NsMutable>::create().unwrap()) };
+        let huge = "a".repeat(IPC_PAYLOAD_SIZE);
+        let r = request(&ch, "admin", &huge, &[], &[], h, Deadline::POLL);
+        assert_eq!(r, Err(Failed::TooLarge));
+        assert_eq!(mock::open_handles(), open, "the namespace and the stream closed, neither sent");
     }
 }

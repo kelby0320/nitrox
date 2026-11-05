@@ -32,6 +32,8 @@ pub struct Resource;
 pub struct Process;
 /// A `Thread` in this process (from [`thread::start`](crate::thread::start)).
 pub struct Thread;
+/// A `Timer`, signalled from the time it is set to fire.
+pub struct Timer;
 
 // --- mode markers (M) — principal rights as types -------------------------
 

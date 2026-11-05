@@ -6,10 +6,9 @@
 use crate::format::Rgb;
 use crate::framebuffer::{Framebuffer, Geometry};
 use crate::geom::{Point, Rect};
+use crate::pixels::{Pixels, SharedBytes};
 
-/// A client's pixel buffer, positioned on screen.
-///
-/// Borrowed: in the compositor the bytes are a mapped `MemoryObject` the client drew into (§4).
+/// A client's pixel buffer, positioned on screen: in the compositor, [`Pixels::Shared`] (§4).
 #[derive(Clone, Copy, Debug)]
 pub struct SurfaceRef<'a> {
     /// The surface's own size, stride and format, which need not match the framebuffer's.
@@ -17,7 +16,7 @@ pub struct SurfaceRef<'a> {
     /// Where the surface's top-left corner sits in screen space. May be negative.
     pub origin: Point,
     /// The surface's pixels, at least `geometry.byte_len()` bytes.
-    pub pixels: &'a [u8],
+    pub pixels: Pixels<'a>,
     /// The shadow cast around this surface, if any.
     ///
     /// A property of the surface so it can be drawn between surfaces without a parameter on
@@ -33,7 +32,12 @@ pub struct SurfaceRef<'a> {
 impl<'a> SurfaceRef<'a> {
     /// A surface at `origin` over `pixels`, square-cornered and casting no shadow.
     pub const fn new(geometry: Geometry, origin: Point, pixels: &'a [u8]) -> Self {
-        Self { geometry, origin, pixels, shadow: None, corner: 0 }
+        Self { geometry, origin, pixels: Pixels::Own(pixels), shadow: None, corner: 0 }
+    }
+
+    /// A surface at `origin` over a buffer another process shares, read only by copying.
+    pub const fn shared(geometry: Geometry, origin: Point, pixels: &'a dyn SharedBytes) -> Self {
+        Self { geometry, origin, pixels: Pixels::Shared(pixels), shadow: None, corner: 0 }
     }
 
     /// The same surface, casting `shadow`.
@@ -410,8 +414,11 @@ fn blend_one<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, x: i
     let src = surface.geometry;
     let (sx, sy) = ((x - surface.origin.x) as u32, (y - surface.origin.y) as u32);
     let Some(off) = src.offset_of(sx, sy) else { return };
-    let Some(bytes) = surface.pixels.get(off..off + 4) else { return };
-    let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let mut bytes = [0u8; 4];
+    if !surface.pixels.copy_out(off, &mut bytes) {
+        return;
+    }
+    let word = u32::from_le_bytes(bytes);
     let alpha = src.format.alpha_of(word) as u32;
     let a = ((alpha * coverage as u32 + 127) / 255) as u8;
     fb.blend_pixel(x as u32, y as u32, src.format.decode(word), a);
@@ -436,52 +443,33 @@ fn blit_span<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visi
 /// a row copy (hence alpha is opt-in). [`Framebuffer::blend_pixel`] skips transparent pixels and
 /// stores opaque ones.
 fn blit_blended<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visible: Rect) {
-    let src = surface.geometry;
-    let bpp = src.format.bytes_per_pixel();
-    for row in 0..visible.size.h {
-        let dst_y = visible.origin.y + row as i32;
-        let src_y = (dst_y - surface.origin.y) as u32;
-        for col in 0..visible.size.w {
-            let dst_x = visible.origin.x + col as i32;
-            let src_x = (dst_x - surface.origin.x) as u32;
-            let Some(off) = src.offset_of(src_x, src_y) else { continue };
-            if off + bpp > surface.pixels.len() {
-                continue;
-            }
-            let word = u32::from_le_bytes([
-                surface.pixels[off],
-                surface.pixels[off + 1],
-                surface.pixels[off + 2],
-                surface.pixels[off + 3],
-            ]);
-            fb.blend_pixel(dst_x as u32, dst_y as u32, src.format.decode(word), src.format.alpha_of(word));
-        }
-    }
+    let format = surface.geometry.format;
+    each_pixel(surface, visible, |x, y, word| fb.blend_pixel(x, y, format.decode(word), format.alpha_of(word)));
 }
 
 /// The general case, and the definition [`blit_rows`] must agree with: every caller takes the fast
 /// path, so a test compares them.
 fn blit_pixels<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visible: Rect) {
+    let format = surface.geometry.format;
+    each_pixel(surface, visible, |x, y, word| fb.put_pixel(x, y, format.decode(word)));
+}
+
+/// Each pixel of `visible` that `surface` holds, a row at a time: its screen position and word.
+fn each_pixel(surface: &SurfaceRef<'_>, visible: Rect, mut f: impl FnMut(u32, u32, u32)) {
     let src = surface.geometry;
-    let src_bpp = src.format.bytes_per_pixel();
+    let bpp = src.format.bytes_per_pixel();
+    let src_x = (visible.origin.x - surface.origin.x) as u32;
     for row in 0..visible.size.h {
-        let dst_y = visible.origin.y + row as i32;
-        let src_y = (dst_y - surface.origin.y) as u32;
-        for col in 0..visible.size.w {
-            let dst_x = visible.origin.x + col as i32;
-            let src_x = (dst_x - surface.origin.x) as u32;
-            let Some(off) = src.offset_of(src_x, src_y) else { continue };
-            if off + src_bpp > surface.pixels.len() {
-                continue;
+        let y = visible.origin.y + row as i32;
+        let Some(start) = src.offset_of(src_x, (y - surface.origin.y) as u32) else { continue };
+        surface.pixels.each_piece(start, visible.size.w as usize * bpp, bpp, |at, bytes| {
+            for (i, px) in bytes.chunks_exact(bpp).enumerate() {
+                let mut word = [0u8; 4];
+                word[..bpp.min(4)].copy_from_slice(&px[..bpp.min(4)]);
+                let x = visible.origin.x as u32 + ((at - start) / bpp + i) as u32;
+                f(x, y as u32, u32::from_le_bytes(word));
             }
-            let word = u32::from_le_bytes([
-                surface.pixels[off],
-                surface.pixels[off + 1],
-                surface.pixels[off + 2],
-                surface.pixels[off + 3],
-            ]);
-            fb.put_pixel(dst_x as u32, dst_y as u32, src.format.decode(word));
-        }
+        });
     }
 }
 
@@ -513,7 +501,7 @@ fn blit_rows<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visi
         if doff + have > bytes.len() {
             continue;
         }
-        bytes[doff..doff + have].copy_from_slice(&surface.pixels[soff..soff + have]);
+        surface.pixels.copy_out(soff, &mut bytes[doff..doff + have]);
     }
 }
 
@@ -1134,7 +1122,9 @@ mod tests {
             for x in b.origin.x.max(0)..(b.right() as i32).min(under.geometry().width as i32) {
                 let (sx, sy) = ((x - b.origin.x) as u32, (y - b.origin.y) as u32);
                 let off = surface.geometry.offset_of(sx, sy).unwrap();
-                let word = u32::from_le_bytes(surface.pixels[off..off + 4].try_into().unwrap());
+                let mut px = [0u8; 4];
+                assert!(surface.pixels.copy_out(off, &mut px));
+                let word = u32::from_le_bytes(px);
                 let colour = surface.geometry.format.decode(word);
                 let alpha = surface.geometry.format.alpha_of(word) as u32;
                 let a = (alpha * covered(b, r, x, y) as u32 + 127) / 255;

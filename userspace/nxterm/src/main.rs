@@ -13,11 +13,13 @@ mod backend;
 
 use libdraw::framebuffer::{Framebuffer, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
-use libdraw::text::{Font, load_mono, load_ui};
-use libkern::debug::Line;
-use libkern::{exit, kprint};
+use libdraw::text::{Font, load_mono_font, load_ui_font};
+use libos::boot::Start;
+use libos::log::{self, Line};
+use libos::{Channel, Deadline, Handle, Msg as IpcMsg, Namespace, NsReadOnly, Only, Ref, WaitSet};
 use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
 use librsproto::surface::Role;
+use libstream::setup::receive_setup;
 
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
@@ -44,11 +46,10 @@ const ROWS: usize = 20;
 
 /// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
-    kprint(msg);
-    // SAFETY: under the test-harness kernel this terminates QEMU; elsewhere it is
-    // `Unsupported` and falls through.
-    unsafe { libkern::syscall1(libkern::SYS_TEST_EXIT, libkern::TEST_EXIT_FAILURE as u64) };
-    exit(1);
+    log::write(msg);
+    // Under the test-harness kernel this terminates QEMU; elsewhere it returns.
+    libos::system::test_verdict(false);
+    libos::exit(1);
 }
 
 /// The message on row `i` of menu `open`, if that row is an enabled action.
@@ -74,7 +75,7 @@ fn chose(msg: Msg) {
             Msg::Close => b"Close Window",
             _ => return,
         };
-        libkern::debug::Line::new().s(b"nxterm: menu chose ").s(name).end();
+        Line::new().s(b"nxterm: menu chose ").s(name).end();
     }
 }
 
@@ -98,28 +99,18 @@ fn report_row(app: &App, row: usize) {
         n -= 1;
     }
     if n > 0 {
-        libkern::debug::Line::new().s(b"nxterm: grid> ").s(&buf[..n]).end();
+        Line::new().s(b"nxterm: grid> ").s(&buf[..n]).end();
     }
 }
 
 /// Block until any of `handles` has something.
 ///
 /// One `sys_wait` over all of them, so neither a quiet shell nor a quiet keyboard blocks the other.
-fn wait_any(handles: &[u64]) -> bool {
-    let mut results = alloc::vec![0u8; handles.len() * libkern::abi::WAIT_RESULT_SIZE];
-    // SAFETY: a valid handle array and a result buffer sized for one record per handle.
-    let n = unsafe {
-        libkern::syscall4(
-            libkern::SYS_WAIT,
-            handles.as_ptr() as u64,
-            handles.len() as u64,
-            results.as_mut_ptr() as u64,
-            u64::MAX,
-        )
-    };
+fn wait_any(handles: &[Ref<'_, Channel, Only>]) -> bool {
+    let mut set = WaitSet::<{ libkern::abi::MAX_WAIT_HANDLES }>::new();
     // Checked: the kernel rejects a `count` above `MAX_WAIT_HANDLES` and returns at once, so
     // ignoring the answer would spin the render loop. `MAX_TABS` keeps the count under the limit.
-    n as i64 > 0
+    handles.iter().all(|h| set.add(*h).is_ok()) && set.wait(Deadline::NEVER).is_ok_and(|s| !s.is_empty())
 }
 
 /// Tell the compositor what a newly created window of this terminal is called.
@@ -127,7 +118,7 @@ fn dress<T: libsurface::Transport>(win: &mut Session<T>, id: u32) {
     if let Some(mut w) = win.window(id)
         && w.set_title(nxterm::TITLE).is_err()
     {
-        kprint(b"nxterm: SetTitle refused\n");
+        log::write(b"nxterm: SetTitle refused\n");
     }
 }
 
@@ -138,18 +129,18 @@ fn theme_of(env: &libstream::wire::Record) -> Theme {
 
 /// Push `bytes` onto the kill ring, connecting per operation: a session would cost the server a
 /// wait-set slot.
-fn clipboard_copy(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
-    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
-    let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+fn clipboard_copy(ns: Ref<'_, Namespace, NsReadOnly>, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut buf = IpcMsg::new();
+    let mut clip = Clipboard::resolve(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
     let r = clip.copy(CLIP_KIND_TEXT, bytes).map(|_| ());
     clip.close();
     r.map_err(|_| "the clipboard refused it")
 }
 
 /// Read the newest entry into `out`; returns how many bytes it wrote.
-fn clipboard_paste(ns: u64, out: &mut [u8]) -> Result<usize, &'static str> {
-    let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
-    let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
+fn clipboard_paste(ns: Ref<'_, Namespace, NsReadOnly>, out: &mut [u8]) -> Result<usize, &'static str> {
+    let mut buf = IpcMsg::new();
+    let mut clip = Clipboard::resolve(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
     let r = clip.paste(0, CLIP_ANY_SERIAL, out);
     clip.close();
     match r {
@@ -163,14 +154,22 @@ fn clipboard_paste(ns: u64, out: &mut [u8]) -> Result<usize, &'static str> {
 /// Entry point: the kernel's ELF entry, with the standard bootstrap arguments.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
-    kprint(b"nxterm: up\n");
+    log::write(b"nxterm: up\n");
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, endpoint, arg0) };
+    let setup_channel: Option<Handle<Channel, Only>> = start.take_handle0();
+    let Some(root_handle) = &start.root else { fail(b"nxterm: no root namespace\n") };
+    let root = root_handle.as_ref();
 
     // Its own setup message, so the shell it hosts gets a real environment. Absent is normal (a
-    // Tier-0 spawn has none): an empty `Record`.
-    let env = match libstream::setup::bootstrap(notif, root_ns, endpoint, arg0).setup() {
-        Some(Ok(s)) => s.env,
-        Some(Err(_)) => libstream::wire::Record::default(),
-        None => libstream::wire::Record::default(),
+    // Tier-0 spawn has none): an empty `Record`. Its streams and terminal stay open for the run:
+    // closing one would tell its far end.
+    let (env, _held) = match setup_channel.as_ref().filter(|_| libstream::setup::setup_is_pending(start.arg0)) {
+        Some(ch) => match receive_setup(ch, Deadline::NEVER) {
+            Ok(Some(s)) => (s.env, Some((s.streams, s.terminal))),
+            _ => (libstream::wire::Record::default(), None),
+        },
+        None => (libstream::wire::Record::default(), None),
     };
 
     // Read here, before anything is sized with it: the grid's cells are built from `font_px`.
@@ -178,19 +177,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     // Two fonts: the menu bar and popup are widgets and take the proportional face; the grid needs
     // the fixed-advance one, as `libterm` measures a cell from one glyph's advance.
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let (ui_font, _) = match unsafe { load_ui(root_ns, &theme, b"nxterm") } {
+    let (ui_font, _) = match load_ui_font(root, &theme, b"nxterm") {
         Ok(loaded) => loaded,
         Err(e) => {
-            libkern::debug::Line::new().s(b"nxterm: the UI font ").s(e.why()).end();
+            Line::new().s(b"nxterm: the UI font ").s(e.why()).end();
             fail(b"nxterm: font load FAILED\n");
         }
     };
-    // SAFETY: as above.
-    let (mono_font, mono_path) = match unsafe { load_mono(root_ns, &theme, b"nxterm") } {
+    let (mono_font, mono_path) = match load_mono_font(root, &theme, b"nxterm") {
         Ok(loaded) => loaded,
         Err(e) => {
-            libkern::debug::Line::new().s(b"nxterm: the grid font ").s(e.why()).end();
+            Line::new().s(b"nxterm: the grid font ").s(e.why()).end();
             fail(b"nxterm: font load FAILED\n");
         }
     };
@@ -200,7 +197,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // `mono_path` is the path the load returned (the built-in one if the theme's would not open),
     // and the size is two integers because `.u()` truncates; `from_config` rounds to hundredths.
     let (px_whole, px_cents) = libdraw::theme::px_parts(theme.font_px);
-    libkern::debug::Line::new()
+    Line::new()
         .s(b"nxterm: grid font ")
         .s(mono_path.as_str().as_bytes())
         .s(b", cell ")
@@ -217,16 +214,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         .end();
     let mut app = App::new(COLS, ROWS, metrics);
     // `check-login` reads this to tell that a maximise grew the grid.
-    libkern::debug::Line::new()
-        .s(b"nxterm: started, grid ")
-        .u(app.grid().cols() as u64)
-        .s(b"x")
-        .u(app.grid().rows() as u64)
-        .end();
+    Line::new().s(b"nxterm: started, grid ").u(app.grid().cols() as u64).s(b"x").u(app.grid().rows() as u64).end();
 
     let size = app.window_size();
-    // SAFETY: `root_ns` is this process's live root namespace.
-    let transport = match unsafe { ChannelTransport::connect(root_ns) } {
+    let transport = match ChannelTransport::open(root) {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"nxterm: connect to /dev/draw FAILED\n"),
     };
@@ -268,16 +259,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     }
 
     /// Open a window of this terminal, dressed and with a shell in its first tab.
-    ///
-    /// # Safety
-    ///
-    /// `root_ns` must be this process's live root namespace.
-    unsafe fn open_window<T: libsurface::Transport>(
+    fn open_window<T: libsurface::Transport>(
         win: &mut Session<T>,
         mut app: App,
         ui_font: &Font,
         theme: &Theme,
-        root_ns: u64,
+        root: Ref<'_, Namespace, NsReadOnly>,
         env: &libstream::wire::Record,
     ) -> Option<Win> {
         let size = app.window_size();
@@ -285,8 +272,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         let top = Child::open_sized(win, Role::Normal, (0, 0), size, &ui, ui_font, theme, BUFFERS)?;
         dress(win, top.id());
         let mut backends = alloc::vec::Vec::new();
-        // SAFETY: the caller's contract — `root_ns` is this process's live root namespace.
-        unsafe { reconcile_backends(&mut app, &mut backends, root_ns, env) };
+        reconcile_backends(&mut app, &mut backends, root, env);
         Some(Win {
             top,
             app,
@@ -309,14 +295,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     }
 
     /// Give every tab that has no backend a terminal and a shell.
-    ///
-    /// # Safety
-    ///
-    /// `root_ns` must be this process's live root namespace.
-    unsafe fn reconcile_backends(
+    fn reconcile_backends(
         app: &mut App,
         backends: &mut alloc::vec::Vec<TabBackend>,
-        root_ns: u64,
+        root: Ref<'_, Namespace, NsReadOnly>,
         env: &libstream::wire::Record,
     ) {
         // Tabs that went away drop their backend; `Backend`'s `Drop` closes the channel, which ends
@@ -325,14 +307,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         let want: alloc::vec::Vec<u64> =
             app.tabs().iter().map(|t| t.key()).filter(|k| !backends.iter().any(|b| b.key == *k)).collect();
         for key in want {
-            // SAFETY: the caller's contract — `root_ns` is this process's live root namespace.
-            match unsafe { backend::attach(root_ns) } {
+            match backend::attach(root) {
                 Some((terminal, b)) => {
-                    // SAFETY: `terminal` is a channel this process owns until the spawn moves it.
                     // Said on success too: a release image could not otherwise tell a hosting
                     // terminal from an empty window.
-                    if !unsafe { backend::spawn_shell(root_ns, terminal, env) } {
-                        kprint(b"nxterm: no shell\n");
+                    if !backend::spawn_shell(root, terminal, env) {
+                        log::write(b"nxterm: no shell\n");
                     }
                     backends.push(TabBackend { key, backend: b });
                 }
@@ -343,8 +323,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     }
 
     let mut backends: alloc::vec::Vec<TabBackend> = alloc::vec::Vec::new();
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    unsafe { reconcile_backends(&mut app, &mut backends, root_ns, &env) };
+    reconcile_backends(&mut app, &mut backends, root, &env);
     let mut wins = alloc::vec![Win { top, app, backends, bounds, popup, menu_shown, menu_hovered }];
 
     loop {
@@ -390,7 +369,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     #[cfg(feature = "test-harness")]
                     if let Some(p) = popup.as_ref() {
                         let o = win.window(p.id()).and_then(|w| w.configured()).map_or((0, 0), |c| (c.x, c.y));
-                        libkern::debug::Line::new()
+                        Line::new()
                             .s(b"nxterm: menu popup ")
                             .u(p.id() as u64)
                             .s(b" at ")
@@ -405,7 +384,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                     if popup.is_none() {
                         // Not fatal: the terminal is usable without its menu.
-                        kprint(b"nxterm: could not open the menu popup\n");
+                        log::write(b"nxterm: could not open the menu popup\n");
                         app.menus.close();
                         *menu_shown = None;
                     }
@@ -426,7 +405,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // `check-terminal` matches `menu hover`.
                     #[cfg(feature = "test-harness")]
                     {
-                        let mut l = libkern::debug::Line::new();
+                        let mut l = Line::new();
                         l.s(b"nxterm: menu hover ");
                         match now {
                             Some(k) => {
@@ -441,7 +420,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 let menu = app.menu_view(&theme, now);
                 if !p.present(&mut win, &menu, &ui_font, &theme) {
-                    kprint(b"nxterm: the menu popup could not be drawn\n");
+                    log::write(b"nxterm: the menu popup could not be drawn\n");
                 }
             }
 
@@ -494,8 +473,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // Asked to close, by its button or the shell: exiting closes the handles, and the
             // compositor destroys the session's windows. `check-login` matches `closing`.
             if app.closing() {
-                kprint(b"nxterm: closing\n");
-                exit(0);
+                log::write(b"nxterm: closing\n");
+                libos::exit(0);
             }
 
             // The title bar was dragged. Done here as `update` has no syscalls, and before the
@@ -505,8 +484,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 && let Some(mut w) = win.window(window_id)
             {
                 match w.start_move() {
-                    Ok(()) => kprint(b"nxterm: dragging its own title bar\n"),
-                    Err(_) => kprint(b"nxterm: the compositor refused the move\n"),
+                    Ok(()) => log::write(b"nxterm: dragging its own title bar\n"),
+                    Err(_) => log::write(b"nxterm: the compositor refused the move\n"),
                 }
             }
 
@@ -516,8 +495,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 && let Some(mut w) = win.window(window_id)
             {
                 match w.start_resize(edges) {
-                    Ok(()) => kprint(b"nxterm: dragging its own corner\n"),
-                    Err(_) => kprint(b"nxterm: the compositor refused the resize\n"),
+                    Ok(()) => log::write(b"nxterm: dragging its own corner\n"),
+                    Err(_) => log::write(b"nxterm: the compositor refused the resize\n"),
                 }
             }
 
@@ -529,12 +508,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             {
                 match w.request_state(state) {
                     Ok(()) => {
-                        libkern::debug::Line::new()
-                            .s(b"nxterm: asked the shell for window state ")
-                            .u(state as u64)
-                            .end();
+                        Line::new().s(b"nxterm: asked the shell for window state ").u(state as u64).end();
                     }
-                    Err(_) => kprint(b"nxterm: the state request was refused\n"),
+                    Err(_) => log::write(b"nxterm: the state request was refused\n"),
                 }
             }
 
@@ -542,7 +518,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // pasted entry goes down the pty as if typed.
             if let Some(req) = app.take_clip_request() {
                 match req {
-                    nxterm::ClipRequest::Copy(text) => match clipboard_copy(root_ns, text.as_bytes()) {
+                    nxterm::ClipRequest::Copy(text) => match clipboard_copy(root, text.as_bytes()) {
                         // A length, never the text: a selection is as private as typing.
                         // `check-login` matches `pasted N bytes`.
                         Ok(()) => Line::new().s(b"nxterm: copied ").u(text.len() as u64).s(b" bytes").end(),
@@ -550,13 +526,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     },
                     nxterm::ClipRequest::Paste => {
                         let mut got = [0u8; MAX_CLIP_BYTES];
-                        match clipboard_paste(root_ns, &mut got) {
+                        match clipboard_paste(root, &mut got) {
                             Ok(n) => {
                                 if let Ok(text) = core::str::from_utf8(&got[..n]) {
                                     app.pasted(text);
                                     Line::new().s(b"nxterm: pasted ").u(n as u64).s(b" bytes").end();
                                 } else {
-                                    kprint(b"nxterm: the clipboard entry is not text\n");
+                                    log::write(b"nxterm: the clipboard entry is not text\n");
                                 }
                             }
                             Err(why) => Line::new().s(b"nxterm: the paste failed: ").s(why.as_bytes()).end(),
@@ -575,7 +551,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let out =
                     app.tabs_mut().iter_mut().find(|t| t.key() == tb.key).map(|t| t.take_outbox()).unwrap_or_default();
                 if !out.is_empty() && !tb.backend.typed(&out) {
-                    kprint(b"nxterm: input did not reach the tty\n");
+                    log::write(b"nxterm: input did not reach the tty\n");
                 }
                 while let Some(bytes) = tb.backend.output() {
                     #[cfg(feature = "test-harness")]
@@ -605,7 +581,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     && t.take_directory_change()
                     && let Some(dir) = t.directory()
                 {
-                    libkern::debug::Line::new().s(b"nxterm: shell is at ").s(dir.as_bytes()).end();
+                    Line::new().s(b"nxterm: shell is at ").s(dir.as_bytes()).end();
                 }
                 if tb.backend.is_gone() {
                     ended.push(tb.key);
@@ -614,11 +590,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // A shell that exited closes its tab, and the last one closes the window, as
             // `Msg::CloseTab` does. `check-login` matches `the terminal ended`.
             for key in ended {
-                kprint(b"nxterm: the terminal ended\n");
+                log::write(b"nxterm: the terminal ended\n");
                 app.update(Msg::CloseTab(key));
             }
-            // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-            unsafe { reconcile_backends(app, backends, root_ns, &env) };
+            reconcile_backends(app, backends, root, &env);
         }
 
         // After every window is serviced: a window cannot be created or destroyed mid-iteration.
@@ -634,19 +609,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
             if w.app.take_quit() {
-                kprint(b"nxterm: quitting\n");
+                log::write(b"nxterm: quitting\n");
                 quit_pending = true;
             }
         }
         for _ in 0..opened {
             // A new window starts with one fresh tab, not a copy of this one's shells.
-            // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-            match unsafe { open_window(&mut win, App::new(COLS, ROWS, metrics), &ui_font, &theme, root_ns, &env) } {
+            match open_window(&mut win, App::new(COLS, ROWS, metrics), &ui_font, &theme, root, &env) {
                 Some(w) => {
-                    kprint(b"nxterm: opened another window\n");
+                    log::write(b"nxterm: opened another window\n");
                     wins.push(w);
                 }
-                None => kprint(b"nxterm: could not open another window\n"),
+                None => log::write(b"nxterm: could not open another window\n"),
             }
         }
         // Quit closes every window as its own close button does.
@@ -665,38 +639,37 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // The backends go with the window; their `Drop` closes each channel, which ends
                 // every shell on them.
                 w.top.close(&mut win);
-                kprint(b"nxterm: closed a window\n");
+                log::write(b"nxterm: closed a window\n");
             } else {
                 i += 1;
             }
         }
         if wins.is_empty() {
-            kprint(b"nxterm: closing\n");
-            exit(0);
+            log::write(b"nxterm: closing\n");
+            libos::exit(0);
         }
 
         // One `sys_wait` over the compositor and every tab, then non-blocking drains: waiting on
         // the compositor alone would show a shell's output only after the next keystroke.
         let mut events: alloc::vec::Vec<(u32, WindowEvent)> = alloc::vec::Vec::new();
-        let win_handle = win.wait_handle();
         // Every tab of every window, so a shell printing in a background tab never waits.
         let any_backend = wins.iter().any(|w| !w.backends.is_empty());
-        if any_backend && win_handle != 0 {
+        if any_backend {
             loop {
                 match win.poll_event() {
                     Ok(Some(ev)) => events.push(ev),
                     Ok(None) => break,
                     Err(_) => {
-                        kprint(b"nxterm: the compositor went away\n");
-                        exit(0);
+                        log::write(b"nxterm: the compositor went away\n");
+                        libos::exit(0);
                     }
                 }
             }
             if events.is_empty() {
                 let mut handles = alloc::vec::Vec::with_capacity(8);
-                handles.push(win_handle);
+                handles.push(win.waitable());
                 for w in wins.iter() {
-                    handles.extend(w.backends.iter().map(|b| b.backend.channel));
+                    handles.extend(w.backends.iter().map(|b| b.backend.channel.as_ref()));
                 }
                 if !wait_any(&handles) {
                     fail(b"nxterm: the wait was refused\n");
@@ -707,8 +680,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             match win.wait_event() {
                 Ok(ev) => events.push(ev),
                 Err(_) => {
-                    kprint(b"nxterm: the compositor went away\n");
-                    exit(0);
+                    log::write(b"nxterm: the compositor went away\n");
+                    libos::exit(0);
                 }
             }
         }
@@ -797,7 +770,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     if p.kind == librsproto::surface::POINTER_BUTTON
                         && p.flags & librsproto::surface::POINTER_PRESSED != 0
                     {
-                        kprint(b"nxterm: clicked\n");
+                        log::write(b"nxterm: clicked\n");
                     }
                     // Counted before routing so the press can ask which click it was; the record's
                     // own time is used, so a stalled client does not read two clicks as a double.
@@ -817,7 +790,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // the topmost focusable window and nxterm starts at the bottom until a click
                     // raises it, so early keys race the raise.
                     #[cfg(feature = "test-harness")]
-                    libkern::debug::Line::new().s(b"nxterm: focus=").u(u64::from(f)).end();
+                    Line::new().s(b"nxterm: focus=").u(u64::from(f)).end();
                     top.route(&ui, &ui_font, &theme, &WindowEvent::Focus(f));
                     app.focused = f;
                 }
@@ -827,13 +800,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 // The shell asking, answered like the close button; `check-login` matches the log
                 // line.
                 WindowEvent::CloseRequested => {
-                    kprint(b"nxterm: asked to close, exiting\n");
+                    log::write(b"nxterm: asked to close, exiting\n");
                     app.update(Msg::Close);
                 }
                 // A terminal declares no acceptor, so a drop never arrives; the match is
                 // exhaustive. `InputLost` discards nothing: modifiers arrive on each event.
-                WindowEvent::Drop { .. } => kprint(b"nxterm: a drop arrived; this window takes none\n"),
-                WindowEvent::InputLost => kprint(b"nxterm: input dropped\n"),
+                WindowEvent::Drop { .. } => log::write(b"nxterm: a drop arrived; this window takes none\n"),
+                WindowEvent::InputLost => log::write(b"nxterm: input dropped\n"),
                 // Accepted: the window becomes the size asked for, the grid the cells that fit, and
                 // the history rewraps. Same size costs nothing.
                 WindowEvent::Configure { width, height, .. } => {
@@ -843,7 +816,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     let lines_before = app.grid().logical_lines();
                     if let Some(r) = app.resize(Size::new(width, height)) {
                         resized = true;
-                        libkern::debug::Line::new()
+                        Line::new()
                             .s(b"nxterm: resized to ")
                             .u(u64::from(width))
                             .s(b"x")
@@ -884,6 +857,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"nxterm: panic\n");
-    exit(2);
+    log::write(b"nxterm: panic\n");
+    libos::exit(2);
 }

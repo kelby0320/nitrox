@@ -74,6 +74,14 @@ impl<M> Mapping<M> {
         unsafe { core::slice::from_raw_parts(self.base.as_ptr(), self.len) }
     }
 
+    /// Unmap it now, with the kernel's answer, which a drop does not report.
+    pub fn unmap(self) -> Result<()> {
+        let (base, len) = self.into_raw();
+        // SAFETY: the mapping was this value's alone, which `into_raw` gave up, so nothing else
+        // unmaps it or reads it.
+        check(unsafe { sys::memory_unmap(base as u64, len as u64) }).map(|_| ())
+    }
+
     /// Keep it mapped for the rest of the process's life: where it starts, and how long it is.
     pub fn into_raw(self) -> (*mut u8, usize) {
         let kept = (self.base.as_ptr(), self.len);
@@ -157,6 +165,29 @@ mod tests {
         assert_eq!(&out, b"\0nitrox\0");
         drop(m);
         assert_eq!(sys::mappings(), 0);
+    }
+
+    #[test]
+    fn an_unmap_answers_and_unmaps_once() {
+        sys::reset();
+        let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        let (a, b) = (mem.map(4096).unwrap(), mem.map(4096).unwrap());
+        assert_eq!(sys::mappings(), 2);
+        assert!(a.unmap().is_ok());
+        assert_eq!(sys::mappings(), 1, "unmapped once, and not again as it went");
+        drop(b);
+    }
+
+    /// The kernel's refusal reaches the caller: where nothing is mapped it answers
+    /// `InvalidArgument`.
+    #[test]
+    fn a_refused_unmap_answers_the_refusal() {
+        sys::reset();
+        let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        let mut m = mem.map(4096).unwrap();
+        // SAFETY: the model frees nothing at an unmap, and nothing reads `m` again.
+        assert_eq!(unsafe { sys::memory_unmap(m.as_mut_ptr() as u64, 4096) }, 0);
+        assert_eq!(m.unmap().map_err(|e| e.code()), Err(KError::InvalidArgument));
     }
 
     #[test]

@@ -22,12 +22,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libfs::TreeError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
-use libkern::{exit, kprint};
-use libstream::channel::{ChannelSink, IpcPort};
+use libos::boot::Start;
+use libos::exit;
+use libos::log;
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -61,8 +63,10 @@ enum What {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[RECURSIVE, FORCE]) {
         Ok(a) => a,
@@ -85,7 +89,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     for operand in &args.operands {
         let resolved = stage.path(operand.as_bytes());
         let path = trim_trailing_slashes(&resolved);
-        if path.is_empty() || path == b"/" {
+        if path.is_empty() || path == "/" {
             stage.die(b"remove: refusing to remove the root directory\n", EXIT_USAGE);
         }
         // Refuse a binding by name rather than let it fall through to "no such path".
@@ -100,7 +104,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             }
             What::File => {
                 unlink_one(&stage, path);
-                removed.push(Removed { path: as_string(path), kind: "file" });
+                removed.push(Removed { path: String::from(path), kind: "file" });
             }
             What::Dir => {
                 if !recursive {
@@ -111,8 +115,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         }
     }
 
-    match stage.streams.stdout {
-        Some(h) => emit(&stage, h, &removed),
+    match stage.stdout() {
+        Some(port) => emit(&stage, port, &removed),
         None => {
             for r in &removed {
                 report_text(r);
@@ -124,12 +128,12 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Remove `path` and everything under it, appending a row per entry. Diverges on failure.
 ///
-/// The walk is [`libfs::remove_tree`], shared with `move`'s cross-mount fallback; it enumerates
+/// The walk is [`libfs::remove_recursive`], shared with `move`'s cross-mount fallback; it enumerates
 /// **filesystem entries only**, so it cannot delete through a mount point. The check that
 /// `path` *itself* is not a binding stays at the operand.
-fn remove_tree(stage: &Stage, path: &[u8], out: &mut Vec<Removed>) {
-    let r = libfs::remove_tree(stage.namespace, path, &mut |p, is_dir| {
-        out.push(Removed { path: as_string(p), kind: if is_dir { "directory" } else { "file" } });
+fn remove_tree(stage: &Stage, path: &str, out: &mut Vec<Removed>) {
+    let r = libfs::remove_recursive(&stage.namespace, path, &mut |p, is_dir| {
+        out.push(Removed { path: String::from(p), kind: if is_dir { "directory" } else { "file" } });
     });
     match r {
         Ok(()) => {}
@@ -147,16 +151,16 @@ fn remove_tree(stage: &Stage, path: &[u8], out: &mut Vec<Removed>) {
     }
 }
 
-fn unlink_one(stage: &Stage, path: &[u8]) {
-    if libfs::unlink_at(stage.namespace, path).is_err() {
+fn unlink_one(stage: &Stage, path: &str) {
+    if libfs::remove_entry(&stage.namespace, path).is_err() {
         stage.die(b"remove: cannot remove file\n", EXIT_FAILURE);
     }
 }
 
-fn classify(stage: &Stage, path: &[u8]) -> What {
-    if libfs::is_dir(stage.namespace, path) {
+fn classify(stage: &Stage, path: &str) -> What {
+    if libfs::is_directory(&stage.namespace, path) {
         What::Dir
-    } else if libfs::file_size(stage.namespace, path).is_some() {
+    } else if libfs::file_len(&stage.namespace, path).is_some() {
         What::File
     } else {
         What::Missing
@@ -165,31 +169,28 @@ fn classify(stage: &Stage, path: &[u8]) -> What {
 
 /// Is `path` a namespace binding rather than a filesystem entry? Asked of the parent's
 /// bindings, which is where a mount point appears.
-fn is_binding(stage: &Stage, path: &[u8]) -> bool {
-    let name = libfs::basename(path);
-    libfs::ns_children(stage.namespace, libfs::parent(path)).iter().any(|(n, _)| n.as_bytes() == name)
+fn is_binding(stage: &Stage, path: &str) -> bool {
+    let name = libfs::basename_str(path);
+    let parent = core::str::from_utf8(libfs::parent(path.as_bytes())).unwrap_or(path);
+    libfs::bindings_under(&stage.namespace, parent).iter().any(|(n, _)| n == name)
 }
 
-fn trim_trailing_slashes(path: &[u8]) -> &[u8] {
+fn trim_trailing_slashes(path: &str) -> &str {
     let mut end = path.len();
-    while end > 1 && path[end - 1] == b'/' {
+    while end > 1 && path.as_bytes()[end - 1] == b'/' {
         end -= 1;
     }
     &path[..end]
 }
 
-fn as_string(path: &[u8]) -> String {
-    String::from_utf8_lossy(path).into_owned()
-}
-
-fn emit(stage: &Stage, stdout: u64, removed: &[Removed]) {
+fn emit(stage: &Stage, stdout: Port<'_>, removed: &[Removed]) {
     let schema = Schema::new().field("path", TypeTag::String, TypeModifiers::NONE).field(
         "kind",
         TypeTag::String,
         TypeModifiers::NONE,
     );
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for r in removed {
             tw.write_row(&[Value::Str(r.path.clone()), Value::Str(String::from(r.kind))])?;
@@ -212,11 +213,11 @@ fn report_text(r: &Removed) {
     line.push(' ');
     line.push_str(&r.path);
     line.push('\n');
-    kprint(line.as_bytes());
+    log::write(line.as_bytes());
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"remove: panic\n");
+    log::write(b"remove: panic\n");
     exit(EXIT_FAILURE)
 }

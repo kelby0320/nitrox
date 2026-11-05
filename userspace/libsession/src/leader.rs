@@ -1,8 +1,8 @@
 //! Spawning a session's leader and supervising it until it exits.
 
-use crate::{LEADER_STOP_NS, STOP_ASKED, borrow, session_env};
+use crate::{LEADER_STOP_NS, STOP_ASKED, session_env};
 use core::sync::atomic::Ordering;
-use libkern::{KIND_CHILD_EXITED, KIND_TERMINATE_REQUESTED, Notification, RawHandle, Rights, SysCaps};
+use libkern::{KIND_CHILD_EXITED, KIND_TERMINATE_REQUESTED, Notification, Rights, SysCaps};
 use libos::{
     CanLookup, Carried, Channel, Deadline, Handle, Msg, Namespace, Notify, Only, Ref, Spawn, WaitSet, block_on, log,
 };
@@ -163,30 +163,6 @@ fn send_extra(setup: Ref<'_, Channel, Only>, extra: Option<Ref<'_, Channel, Only
         // The leader cannot tell this from an endpoint that was never wanted.
         log::write(b"libsession: an endpoint the leader expects is absent (placeholder sent)\n");
     }
-}
-
-/// [`run_leader`] over raw handles the caller keeps open, `0` in `extras` for a missing endpoint.
-/// For callers not yet on libos; the typed form is [`run_leader`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn spawn_leader(
-    root_ns: u64,
-    session_ns: u64,
-    notif: u64,
-    program: &str,
-    argv_rest: &[&str],
-    syscaps: u64,
-    extras: &[u64],
-) -> i32 {
-    let extras: alloc::vec::Vec<_> = extras.iter().map(|&e| borrow(e)).collect();
-    // SAFETY: the caller's own namespaces and queue, open for the call, as the function always asked.
-    let (root_ns, session_ns, notif) = unsafe {
-        (
-            Ref::<Namespace, libos::NsReadOnly>::from_raw(RawHandle(root_ns), Rights::empty()),
-            Ref::<Namespace, libos::NsReadOnly>::from_raw(RawHandle(session_ns), Rights::empty()),
-            Ref::<Notify, Only>::from_raw(RawHandle(notif), Rights::empty()),
-        )
-    };
-    run_leader(root_ns, session_ns, notif, program, argv_rest, SysCaps::from_bits_truncate(syscaps), &extras)
 }
 
 #[cfg(test)]

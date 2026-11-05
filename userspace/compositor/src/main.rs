@@ -29,29 +29,27 @@ use core::sync::atomic::Ordering::Relaxed;
 use libdraw::format::Rgb;
 use libdraw::framebuffer::RawFramebuffer;
 use libdraw::geom::{Point, Rect};
+use libdraw::pixels::Pixels;
 use libinput::Interpreter;
-use libkern::abi::CLOCK_MONOTONIC;
-use libkern::abi::HandleInfo;
-use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
-use libkern::debug::Line;
+use libkern::abi::{INPUT_EVENT_LEN, InputEvent, MAX_WAIT_HANDLES};
 use libkern::error::KError;
-use libkern::{Received, SYS_HANDLE_STAT, channel_recv_raw};
-use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
-    SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
+use libkern::{CTRL_OP_SHUTDOWN, Rights};
+use libos::boot::Start;
+use libos::control::{self, Control};
+use libos::log::{self, Line};
+use libos::{
+    Carried, Channel, Deadline, Handle, MapRead, MapReadWrite, Mapping, Memory, Msg, Namespace, NsReadOnly, Only, Ref,
+    WaitSet, block_on, time,
 };
-use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
     ConfigureEvent, FocusEvent, KeyEvent, MgrCapture, OP_ATTACH_BUFFER, OP_CONFIGURE, OP_FOCUS_EVENT, OP_KEY_EVENT,
     OP_MGR_CAPTURE, OP_POINTER_EVENT, OP_RELEASE, PointerEvent,
 };
-use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
+use librsproto::{OP_NS_RESOLVE, RS_FLAG_REPLY, decode, server};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const MSG_LEN: usize = 4096;
-const PAYLOAD_OFF: usize = 24;
 /// The background the screen is cleared to; the display gate's reference render fills with the same
 /// `scene::BACKGROUND`, so the two must be one constant.
 const BACKGROUND: Rgb = libdraw::scene::BACKGROUND;
@@ -60,9 +58,9 @@ const BACKGROUND: Rgb = libdraw::scene::BACKGROUND;
 const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
 /// Four less than the wait limit: the forwarding, input, manager and control channels.
-const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 4;
+const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 4;
 
-const _: () = assert!(4 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
+const _: () = assert!(4 + MAX_SESSIONS <= MAX_WAIT_HANDLES);
 
 /// How many client-driven rejections get logged **per session** before the tap closes.
 const MAX_LOGGED_REJECTIONS: u32 = 8;
@@ -75,13 +73,6 @@ const MAX_LOGGED_ROUTES: u32 = 8;
 /// logged. Generous, since any gate needs a handful, but not absent: serial is slow.
 const MAX_LOGGED_INPUT_DIAGS: u32 = 256;
 
-static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
-static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
-/// The manager's channel, or `0`. One, not a table: two managers placing windows race with no
-/// arbiter, so a second resolve is refused.
-static mut MANAGER_CH: u64 = 0;
 static ROUTES_LOGGED: AtomicU32 = AtomicU32::new(0);
 static INPUT_DIAGS_LOGGED: AtomicU32 = AtomicU32::new(0);
 
@@ -96,33 +87,26 @@ const RETRY_INTERVAL_NS: u64 = 10_000_000;
 const CONFIGURE_DEADLINE_NS: u64 = 200_000_000;
 
 const MAX_LOGGED_OVERFLOWS: u32 = 8;
-static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 
-struct Mapping {
-    addr: *mut u8,
-    len: usize,
-}
+type Endpoint = Handle<Channel, Only>;
 
-impl Drop for Mapping {
-    /// Unmap when the record goes away: the `Vec::retain` calls that shrink `Server::buffers` rely
-    /// on it.
-    fn drop(&mut self) {
-        // SAFETY: `addr`/`len` came from a successful `sys_memory_map` in
-        // `map_attached_buffer`; a record is dropped once, so this unmaps once.
-        unsafe { syscall2(libkern::SYS_MEMORY_UNMAP, self.addr as u64, self.len as u64) };
-    }
-}
+/// A channel that may be absent, so a send to it is a refusal rather than a panic.
+type Peer<'a> = Option<Ref<'a, Channel, Only>>;
 
 struct Server {
     stack: WindowStack,
     conns: [Connection; MAX_SESSIONS],
-    buffers: alloc::vec::Vec<Attached<Mapping>>,
+    /// One per session slot, `None` while the slot is free.
+    sessions: [Option<Endpoint>; MAX_SESSIONS],
+    /// The manager's channel. One, not a table: two managers placing windows race with no
+    /// arbiter, so a second resolve is refused.
+    manager: Option<Endpoint>,
+    buffers: alloc::vec::Vec<Attached<Mapping<MapRead>>>,
     /// Device triples → logical events. Reset by a `SYN_DROPPED` the server forwards.
     interp: Interpreter,
     router: InputRouter,
-    /// The consumer channel from `/dev/input/new`, or 0 if input is unavailable.
-    input_ch: u64,
+    /// The consumer channel from `/dev/input/new`, or `None` if input is unavailable.
+    input: Option<Endpoint>,
     repeat: Option<compositor::Repeat>,
     /// `(window, deadline_ns)` of windows holding their first `Configure`; none may be dropped
     /// without one sent: see [`release_configure`].
@@ -144,135 +128,51 @@ impl Server {
     fn session_of(&self, window: u32) -> Option<usize> {
         (0..MAX_SESSIONS).find(|&i| self.conns[i].owns(window))
     }
+
+    fn session(&self, slot: usize) -> Peer<'_> {
+        self.sessions[slot].as_ref().map(Handle::as_ref)
+    }
+
+    fn manager(&self) -> Peer<'_> {
+        self.manager.as_ref().map(Handle::as_ref)
+    }
+
+    /// The mapping of `buffer` on `window`, or `None` if it is not mapped here.
+    fn buffer(&self, window: u32, buffer: u32) -> Option<&Mapping<MapRead>> {
+        Some(&self.buffers.iter().find(|b| b.window == window && b.buffer == buffer)?.memory)
+    }
 }
 
 impl BufferSource for Server {
-    fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]> {
-        let b = &self.buffers.iter().find(|b| b.window == window && b.buffer == buffer)?.memory;
-        // SAFETY: `addr`/`len` come from a successful `sys_memory_map` of the client's
-        // `MemoryObject`. The mapping lives exactly as long as its `Mapping` record —
-        // `Drop` unmaps — and this slice borrows `&self`, so no `&mut` path that could drop
-        // the record can run while it is alive.
-        Some(unsafe { core::slice::from_raw_parts(b.addr, b.len) })
+    fn pixels(&self, window: u32, buffer: u32) -> Option<Pixels<'_>> {
+        Some(Pixels::Shared(self.buffer(window, buffer)?))
     }
 }
 
 /// Receive-ring depth for a client **session** channel: the kernel's `IPC_DEFAULT_QUEUE_DEPTH`. A
 /// stalled client's motion coalesces only after this many queue; 128 KiB of kernel memory per
 /// session.
-const SESSION_QUEUE_DEPTH: u64 = 16;
+const SESSION_QUEUE_DEPTH: u32 = 16;
 
 fn now_ns() -> u64 {
-    libkern::clock_read(CLOCK_MONOTONIC).unwrap_or(0)
+    time::now().unwrap_or(0)
 }
 
-fn make_channel(depth: u64) -> Option<(u64, u64)> {
-    libkern::channel_create(depth).ok()
+fn reply_resolve_error(serve_end: Ref<'_, Channel, Only>, request_id: u64, err: KError) -> bool {
+    server::reply_error(serve_end, OP_NS_RESOLVE, request_id, err, b"")
 }
 
-fn send_ready(control: u64, kernel_end: u64) -> bool {
-    let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
-    let Some(body_len) = librsproto::meta::ready(&mut body, b"compositor") else { return false };
-    // SAFETY: REPLY_MSG is a valid buffer; the rsproto message goes at PAYLOAD_OFF.
-    let rs_len = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1) {
-            Some(n) => n,
-            None => return false,
-        }
-    };
-    // SAFETY: stamp the IpcMsg header (payload_len @4, handle_count @8) + handle slot.
-    unsafe {
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = kernel_end;
-    }
-    // SAFETY: valid endpoint + message + 1-handle transfer.
-    let sr = unsafe {
-        syscall5(
-            SYS_CHANNEL_SEND,
-            control,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    sr == 0
+fn reply_on_session(session: Peer<'_>, op: u16, request_id: u64, body: &[u8]) -> bool {
+    session.is_some_and(|ch| server::send(ch, op, request_id, RS_FLAG_REPLY, body, &mut Carried::new()).is_ok())
 }
 
-fn reply_session(serve_end: u64, request_id: u64, client_end: u64) -> bool {
-    let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
-    let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
-    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid; one handle rides the reply.
-    unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
-        else {
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = client_end;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            serve_end,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
-}
-
-fn reply_resolve_error(serve_end: u64, request_id: u64, err: KError) -> bool {
-    let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
-    let elen = librsproto::error::error_body(&mut ebody, err.as_i32(), 0, b"").unwrap_or(0);
-    // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
-    unsafe {
-        let Some(rs_len) = encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            OP_NS_RESOLVE,
-            request_id,
-            RS_FLAG_REPLY | RS_FLAG_ERROR,
-            &ebody[..elen],
-            0,
-        ) else {
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            serve_end,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
-}
-
-fn reply_on_session(session: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
-    // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
-    unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY, body, 0) else {
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            session,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
+fn reply_error_on_session(session: Peer<'_>, op: u16, request_id: u64, err: KError) -> bool {
+    session.is_some_and(|ch| server::reply_error(ch, op, request_id, err, b""))
 }
 
 /// Send one server-initiated record, with no request id. `false` if the channel would not take it:
 /// the caller leaves the message at the head of its outbox and retries.
-fn send_input(session: u64, op: u16, body: &[u8]) -> bool {
+fn send_input(session: Peer<'_>, op: u16, body: &[u8]) -> bool {
     reply_on_session(session, op, 0, body)
 }
 
@@ -281,28 +181,11 @@ fn send_input(session: u64, op: u16, body: &[u8]) -> bool {
 /// `lights_sent` moves only on a send, so a full channel delays the lights rather than losing them.
 fn send_lights(srv: &mut Server) {
     let lights = libinput::lights(srv.interp.locks());
-    if srv.input_ch == 0 || srv.lights_sent == Some(lights) {
+    let Some(input) = &srv.input else { return };
+    if srv.lights_sent == Some(lights) {
         return;
     }
-    // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
-    let sent = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_INPUT_LIGHTS, 0, 0, &[lights], 0) {
-            Some(rs_len) => {
-                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-                REPLY_MSG[8] = 0;
-                syscall5(
-                    SYS_CHANNEL_SEND,
-                    srv.input_ch,
-                    (&raw const REPLY_MSG) as u64,
-                    (&raw const REPLY_HANDLES) as u64,
-                    0,
-                    SENDMODE_NOBLOCK,
-                ) == 0
-            }
-            None => false,
-        }
-    };
-    if sent {
+    if server::send(input, librsproto::OP_INPUT_LIGHTS, 0, 0, &[lights], &mut Carried::new()).is_ok() {
         srv.lights_sent = Some(lights);
     }
 }
@@ -318,7 +201,7 @@ fn log_route(rec: &Outbound) {
         }
         ROUTES_LOGGED.store(n + 1, Relaxed);
         if n == MAX_LOGGED_ROUTES {
-            kprint(b"compositor: (further routed input not logged)\n");
+            log::write(b"compositor: (further routed input not logged)\n");
             return;
         }
     }
@@ -464,32 +347,28 @@ fn enqueue(srv: &mut Server, slot: usize, rec: Outbound) {
 /// deadline (there is no writability signal). Stops at the first refusal: skipping would reorder a
 /// client's stream.
 fn flush_outboxes(srv: &mut Server) -> bool {
-    #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-    for slot in 0..MAX_SESSIONS {
-        // SAFETY: reading our own slot table.
-        let ch = unsafe { SESSION_CH[slot] };
-        if ch == 0 {
-            srv.outbox[slot].clear();
+    for (ch, outbox) in srv.sessions.iter().zip(&mut srv.outbox) {
+        let Some(ch) = ch else {
+            outbox.clear();
             continue;
-        }
-        while let Some(rec) = srv.outbox[slot].front() {
-            if !send_outbound(ch, rec) {
+        };
+        while let Some(rec) = outbox.front() {
+            if !send_outbound(ch.as_ref(), rec) {
                 break;
             }
-            srv.outbox[slot].pop();
+            outbox.pop();
         }
     }
     // Drained as the clients' are: a manager that lost a `created` would never place that window.
-    // SAFETY: reading our own manager slot.
-    let mgr = unsafe { MANAGER_CH };
-    if mgr == 0 {
-        srv.mgr_outbox.clear();
-    } else {
-        while let Some(ev) = srv.mgr_outbox.front() {
-            if !send_mgr_event(mgr, ev) {
-                break;
+    match &srv.manager {
+        None => srv.mgr_outbox.clear(),
+        Some(mgr) => {
+            while let Some(ev) = srv.mgr_outbox.front() {
+                if !send_mgr_event(mgr.as_ref(), ev) {
+                    break;
+                }
+                srv.mgr_outbox.pop();
             }
-            srv.mgr_outbox.pop();
         }
     }
     (0..MAX_SESSIONS).any(|i| !srv.outbox[i].is_empty()) || !srv.mgr_outbox.is_empty()
@@ -555,8 +434,7 @@ fn fire_configure_deadlines(srv: &mut Server, screen: &mut Screen<RawFramebuffer
 }
 
 fn mgr_emit(srv: &mut Server, ev: MgrEvent) {
-    // SAFETY: reading our own manager slot.
-    if unsafe { MANAGER_CH } == 0 {
+    if srv.manager.is_none() {
         return;
     }
     if srv.mgr_outbox.push(ev) {
@@ -582,7 +460,8 @@ fn unserialisable(what: &[u8]) -> bool {
     true
 }
 
-fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
+fn send_mgr_event(ch: Ref<'_, Channel, Only>, ev: &MgrEvent) -> bool {
+    let ch = Some(ch);
     use librsproto::surface::{
         MgrHotkey, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
         OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_TITLE,
@@ -656,7 +535,8 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     }
 }
 
-fn send_outbound(ch: u64, rec: &Outbound) -> bool {
+fn send_outbound(ch: Ref<'_, Channel, Only>, rec: &Outbound) -> bool {
+    let ch = Some(ch);
     // Sized from the types, not the spec's byte counts: `write` refuses a short buffer, which would
     // drop every event of that kind.
     match rec {
@@ -721,7 +601,7 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
                 // Unreachable with the caps enforced at both edges; reported, as a vanished drop is
                 // a gesture the system forgot.
                 None => {
-                    kprint(b"compositor: a drop would not serialise\n");
+                    log::write(b"compositor: a drop would not serialise\n");
                     true
                 }
             }
@@ -739,15 +619,9 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
 
 /// Resolve `/dev/input/new` and return the consumer channel, or `None`. Not fatal: a machine with
 /// no i8042 has no input server, and the display is still worth having.
-fn connect_input(root_ns: u64) -> Option<u64> {
-    use libkern::handle::{RawHandle, Rights};
-    use libos::{Channel, Namespace, NsReadOnly, Only, Ref, block_on};
-
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(root_ns), Rights::LOOKUP) };
+fn connect_input(root: &Handle<Namespace, NsReadOnly>) -> Option<Endpoint> {
     // The input server mints one consumer per resolve, exactly as `/dev/draw/new` mints one session.
-    let ch = block_on(ns.lookup::<Channel, Only>("/dev/input/new", Rights::RECV | Rights::SEND | Rights::WAIT)).ok()?;
-    Some(ch.into_raw().0)
+    block_on(root.lookup::<Channel, Only>("/dev/input/new", Rights::RECV | Rights::SEND | Rights::WAIT)).ok()
 }
 
 /// Serve every request already queued on the manager's channel and every client's, between
@@ -763,8 +637,7 @@ fn connect_input(root_ns: u64) -> Option<u64> {
 /// off. The manager goes first: it arranges the stack.
 fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
     for _ in 0..SESSION_QUEUE_DEPTH {
-        // SAFETY: reading our own manager slot.
-        if unsafe { MANAGER_CH } == 0 {
+        if srv.manager.is_none() {
             break;
         }
         match serve_manager(srv, screen) {
@@ -776,11 +649,9 @@ fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) 
             }
         }
     }
-    #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
     for slot in 0..MAX_SESSIONS {
         for _ in 0..SESSION_QUEUE_DEPTH {
-            // SAFETY: reading our own slot table.
-            if unsafe { SESSION_CH[slot] } == 0 {
+            if srv.sessions[slot].is_none() {
                 break;
             }
             match serve_session(slot, srv, screen) {
@@ -815,25 +686,18 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     let cursor_was = srv.router.pointer();
     let mut alive = true;
     // Receive the whole pass, then serve the requests, then route (see [`serve_queued_requests`]).
-    // Each batch is copied out because `RECV_MSG` is shared by every receive.
+    // Each batch is copied out because one message buffer is shared by every receive.
     let mut batches: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    let mut msg = Msg::new();
     while batches.len() < INPUT_DRAIN_MAX {
-        // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-        let _sent = match unsafe { channel_recv_raw(srv.input_ch, &raw mut RECV_MSG) } {
-            Ok(sent) => sent,
-            Err(rr) => {
-                // The ordinary end of the drain. `PeerClosed` means the input server is gone and
-                // the handle must leave the wait set or the loop spins; anything else is spurious.
-                alive = rr != KError::PeerClosed.as_i32() as i64;
-                break;
-            }
-        };
-        // SAFETY: bounded read of the payload the kernel just wrote.
-        let payload = unsafe {
-            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF))
-        };
-        batches.push(payload.to_vec());
+        let Some(input) = &srv.input else { break };
+        if let Err(e) = input.recv(&mut msg) {
+            // The ordinary end of the drain. `PeerClosed` means the input server is gone and
+            // the handle must leave the wait set or the loop spins; anything else is spurious.
+            alive = e.code() != KError::PeerClosed;
+            break;
+        }
+        batches.push(msg.payload().to_vec());
     }
     serve_queued_requests(srv, screen);
     for batch in &batches {
@@ -1061,7 +925,7 @@ fn parse_u32(b: &[u8]) -> Option<u32> {
     Some(n)
 }
 
-fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> bool {
+fn reply_window_info(serve_end: Ref<'_, Channel, Only>, request_id: u64, srv: &Server, id: u32) -> bool {
     let Some(info) = srv.stack.info(id) else {
         return reply_resolve_error(serve_end, request_id, KError::NotFound);
     };
@@ -1069,96 +933,31 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
     if info.write(&mut bytes).is_none() {
         return reply_resolve_error(serve_end, request_id, KError::KernelError);
     }
-    reply_with_object(serve_end, request_id, &bytes)
+    server::reply_object(serve_end, request_id, &bytes)
 }
 
-fn reply_screen_info(serve_end: u64, request_id: u64, srv: &Server) -> bool {
+fn reply_screen_info(serve_end: Ref<'_, Channel, Only>, request_id: u64, srv: &Server) -> bool {
     let info = librsproto::surface::ScreenInfo { width: srv.screen.size.w, height: srv.screen.size.h };
     let mut bytes = [0u8; librsproto::surface::SCREEN_INFO_LEN];
     if info.write(&mut bytes).is_none() {
         return reply_resolve_error(serve_end, request_id, KError::KernelError);
     }
-    reply_with_object(serve_end, request_id, &bytes)
+    server::reply_object(serve_end, request_id, &bytes)
 }
 
-fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) -> bool {
-    // SAFETY: a plain anonymous object of `bytes.len()`.
-    let obj = unsafe { syscall4(SYS_MEMORY_CREATE, bytes.len() as u64, 0, 0, 0) };
-    if obj <= 0 {
-        return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
-    }
-    // SAFETY: mapping an object this process just created, to fill it.
-    let addr = unsafe {
-        syscall4(SYS_MEMORY_MAP, obj as u64, 0, bytes.len() as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE)
-    };
-    if addr <= 0 {
-        // SAFETY: closing the object we just made and cannot use.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
-        return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
-    }
-    // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
-    // Unmap before replying: the mapping holds a reference that would pin the frames, and any
-    // client can resolve `info` in a loop.
-    // SAFETY: unmapping a range this process mapped moments ago and never reads again.
-    unsafe { syscall2(libkern::SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
-
-    let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
-    if resolve_reply(&mut body, librsproto::namespace::OBJECT_KIND_MEMOBJ, bytes.len() as u32).is_none() {
-        // SAFETY: nothing was sent, so the object is still ours to drop.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
-        return reply_resolve_error(serve_end, request_id, KError::KernelError);
-    }
-    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid; the object rides the reply.
-    let sent = unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
-        else {
-            // SAFETY: nothing was sent, so the object is still ours to drop.
-            syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0);
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = obj as u64;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            serve_end,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    };
-    if !sent {
-        // A failed send leaves the transfers untaken, so the object is still ours.
-        // SAFETY: closing a handle this process still owns.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
-    }
-    sent
-}
-
-fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
-    // SAFETY: single-threaded server scanning its own slot table.
-    let Some(slot) = (unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == 0) }) else {
+fn open_session(serve_end: Ref<'_, Channel, Only>, request_id: u64, srv: &mut Server) -> bool {
+    let Some(slot) = srv.sessions.iter().position(Option::is_none) else {
         return reply_resolve_error(serve_end, request_id, KError::OutOfHandles);
     };
-    let Some((client_end, server_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
+    let Ok((client_end, server_end)) = Handle::pair(SESSION_QUEUE_DEPTH) else {
         return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
     };
-    // SAFETY: `slot` is free; recording our end and a fresh connection for it.
-    unsafe {
-        SESSION_CH[slot] = server_end;
-    }
     srv.conns[slot] = Connection::new();
-    if !reply_session(serve_end, request_id, client_end) {
-        // SAFETY: the reply failed, so the client never received its end; drop both.
-        unsafe {
-            syscall4(SYS_HANDLE_CLOSE, client_end, 0, 0, 0);
-            syscall4(SYS_HANDLE_CLOSE, server_end, 0, 0, 0);
-            SESSION_CH[slot] = 0;
-        }
+    // A reply that fails closes the client's end, and `server_end` with it as it drops.
+    if !server::reply_channel(serve_end, request_id, client_end) {
         return false;
     }
+    srv.sessions[slot] = Some(server_end);
     true
 }
 
@@ -1167,31 +966,31 @@ fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
 /// Queued, not sent: a briefly full ring would otherwise drop it, unlogged.
 fn configure_window(srv: &mut Server, window: u32, width: u32, height: u32, origin: Point) -> bool {
     let Some(slot) = srv.session_of(window) else { return false };
-    // SAFETY: reading our own slot table.
-    if unsafe { SESSION_CH[slot] } == 0 {
+    if srv.sessions[slot].is_none() {
         return false;
     }
     enqueue(srv, slot, Outbound::Configure { window, width, height, x: origin.x, y: origin.y });
     true
 }
 
-fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64) -> bool {
+fn do_capture(srv: &Server, request_id: u64, body: &[u8], obj: Option<Handle<Memory, MapReadWrite>>) -> bool {
+    let fail = |err| reply_error_on_session(srv.manager(), OP_MGR_CAPTURE, request_id, err);
     let Some(req) = MgrCapture::read(body) else {
-        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+        return fail(KError::InvalidArgument);
     };
-    if obj == 0 || req.width == 0 || req.height == 0 || req.pitch == 0 {
-        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
-    }
+    let Some(obj) = obj.filter(|_| req.width != 0 && req.height != 0 && req.pitch != 0) else {
+        return fail(KError::InvalidArgument);
+    };
     let Some(w) = srv.stack.window(req.window) else {
-        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::NotFound);
+        return fail(KError::NotFound);
     };
     // The committed buffer, as compositing reads, so a thumbnail never shows a frame the screen did
     // not.
     let (Some(buffer_id), id) = (w.committed, w.id) else {
-        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::WouldBlock);
+        return fail(KError::WouldBlock);
     };
     let Some(b) = w.buffers.iter().find(|b| b.id == buffer_id).map(|b| b.geometry) else {
-        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::WouldBlock);
+        return fail(KError::WouldBlock);
     };
     let dst_geom = match libdraw::framebuffer::Geometry::with_pitch(
         req.width,
@@ -1201,29 +1000,28 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
     ) {
         Some(g) => g,
         None => {
-            return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+            return fail(KError::InvalidArgument);
         }
     };
     let len = dst_geom.byte_len();
-    if !stat(obj).is_some_and(|info| holds(&info, len)) {
-        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+    if !obj.stat().is_ok_and(|info| holds(&info, len)) {
+        return fail(KError::InvalidArgument);
     }
-    // SAFETY: mapping an object the manager sent, writable, for exactly its own length.
-    let addr =
-        unsafe { syscall4(SYS_MEMORY_MAP, obj, 0, len as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) };
-    if addr <= 0 {
-        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
-    }
-    // SAFETY: `addr` maps `len` writable bytes, which is what `box_downscale` writes.
-    let dst = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, len) };
-    let ok = match srv.pixels(id, buffer_id) {
-        Some(src) => libdraw::scale::box_downscale(src, b, dst, dst_geom),
-        None => false,
+    let Ok(mut target) = obj.map(len) else {
+        return fail(KError::InvalidArgument);
     };
-    // SAFETY: unmapping what was just mapped, at the same length.
-    unsafe { syscall4(SYS_MEMORY_UNMAP, addr as u64, len as u64, 0, 0) };
+    let mut scaled = alloc::vec::Vec::new();
+    if scaled.try_reserve_exact(len).is_err() {
+        return fail(KError::OutOfMemory);
+    }
+    scaled.resize(len, 0);
+    let ok = match srv.buffer(id, buffer_id) {
+        Some(src) => libdraw::scale::box_downscale_shared(src, b, &mut scaled, dst_geom),
+        None => false,
+    } && target.write_from(0, &scaled).is_ok();
+    drop(target);
     if !ok {
-        return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
+        return fail(KError::InvalidArgument);
     }
     Line::new()
         .s(b"compositor: captured window ")
@@ -1233,7 +1031,7 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
         .s(b"x")
         .u(req.height as u64)
         .end();
-    reply_on_session(ch, OP_MGR_CAPTURE, request_id, &[])
+    reply_on_session(srv.manager(), OP_MGR_CAPTURE, request_id, &[])
 }
 
 /// What one call to [`serve_manager`] or [`serve_session`] found; `Empty` lets
@@ -1246,77 +1044,62 @@ enum Served {
 }
 
 fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
-    // SAFETY: reading our own manager slot and valid recv out-params.
-    let ch = unsafe { MANAGER_CH };
-    // SAFETY: the receive buffer is this process's static, only touched from this loop.
-    match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
-        Ok(sent) => {
-            if handle_manager_request(ch, srv, screen, sent) {
+    let mut msg = Msg::new();
+    let Some(ch) = &srv.manager else { return Served::Empty };
+    match ch.recv(&mut msg) {
+        Ok(carried) => {
+            if handle_manager_request(srv, screen, &msg, carried) {
                 Served::One
             } else {
                 Served::Closed
             }
         }
-        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => Served::Closed,
+        Err(e) if e.code() == KError::PeerClosed => Served::Closed,
         Err(_) => Served::Empty,
     }
 }
 
-fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>, mut sent: Received) -> bool {
-    // SAFETY: bounded read-only slice over the just-received message.
-    let (op, request_id, body, carried) = unsafe {
-        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
-        let decoded = decode(req);
-        // Only `Capture` takes a handle; every other one closes as `sent` drops.
-        let carried = match &decoded {
-            Ok(m) if m.op == OP_MGR_CAPTURE => sent.take(0).unwrap_or(0),
-            _ => 0,
-        };
-        drop(sent);
-        match decoded {
-            Ok(m) => (m.op, m.request_id, m.body.to_vec(), carried),
-            Err(_) => {
-                return true;
-            }
-        }
+fn handle_manager_request(
+    srv: &mut Server,
+    screen: &mut Screen<RawFramebuffer>,
+    msg: &Msg,
+    mut carried: Carried,
+) -> bool {
+    // A message that does not decode closes what it carried as `carried` drops.
+    let Ok(m) = decode(msg.payload()) else {
+        return true;
     };
+    let (op, request_id, body) = (m.op, m.request_id, m.body);
+    // Only `Capture` takes a handle; every other one closes as `carried` drops.
+    let object = if op == OP_MGR_CAPTURE { carried.take::<Memory, MapReadWrite>(0) } else { None };
+    drop(carried);
     if op == OP_MGR_CAPTURE {
         // Handled here, not in `manager::dispatch`, which sees only the stack: this needs the
-        // handle, the pixel source and syscalls to map with.
-        let ok = do_capture(srv, ch, request_id, &body, carried);
-        if carried != 0 {
-            // SAFETY: the object was installed in this process's table by the recv above; the
-            // capture has finished with it either way
-            unsafe { syscall4(SYS_HANDLE_CLOSE, carried, 0, 0, 0) };
-        }
-        return ok;
+        // handle, the pixel source and mappings.
+        return do_capture(srv, request_id, body, object);
     }
     if op == librsproto::surface::OP_MGR_REQUEST_CLOSE {
         // Handled here: asking a client to close puts a record in that client's outbox, which the
         // server owns. The window itself is untouched. `check-login` waits on this line.
-        let Some(req) = librsproto::surface::MgrWindowRef::read(&body) else {
-            return reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
+        let Some(req) = librsproto::surface::MgrWindowRef::read(body) else {
+            return reply_error_on_session(srv.manager(), op, request_id, KError::InvalidArgument);
         };
         let Some(slot) = srv.session_of(req.window) else {
-            return reply_error_on_session(ch, op, request_id, KError::NotFound);
+            return reply_error_on_session(srv.manager(), op, request_id, KError::NotFound);
         };
         enqueue(srv, slot, Outbound::CloseRequested { window: req.window });
         Line::new().s(b"compositor: asked window ").u(req.window as u64).s(b" to close").end();
-        return reply_on_session(ch, op, request_id, &[]);
+        return reply_on_session(srv.manager(), op, request_id, &[]);
     }
     if op == librsproto::surface::OP_MGR_QUERY_LAYOUT {
         let layout = current_layout(srv);
         let mut body = [0u8; core::mem::size_of::<librsproto::surface::MgrLayout>()];
         return match layout.write(&mut body) {
-            Some(n) => reply_on_session(ch, op, request_id, &body[..n]),
-            None => reply_error_on_session(ch, op, request_id, KError::InvalidArgument),
+            Some(n) => reply_on_session(srv.manager(), op, request_id, &body[..n]),
+            None => reply_error_on_session(srv.manager(), op, request_id, KError::InvalidArgument),
         };
     }
-    let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
+    let mgr_outcome = manager::dispatch(&mut srv.stack, op, body);
     // Said on the console, changed or not: the one proof a boot can give that the shell's theme
     // reached this process (`check-login`).
     if op == librsproto::surface::OP_MGR_SET_SCHEME && matches!(mgr_outcome, MgrOutcome::Applied { .. }) {
@@ -1339,17 +1122,17 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                 None => repaint(srv, screen),
             }
             announce_focus(srv);
-            reply_on_session(ch, op, request_id, &[]);
+            reply_on_session(srv.manager(), op, request_id, &[]);
         }
         MgrOutcome::State { window, state } => {
             // To the client only: the compositor keeps no notion of a window's state.
             let Some(slot) = srv.session_of(window) else {
-                return reply_error_on_session(ch, op, request_id, KError::NotFound);
+                return reply_error_on_session(srv.manager(), op, request_id, KError::NotFound);
             };
             let rec = Outbound::WindowState { window, state };
             log_route(&rec);
             enqueue(srv, slot, rec);
-            reply_on_session(ch, op, request_id, &[]);
+            reply_on_session(srv.manager(), op, request_id, &[]);
         }
         MgrOutcome::RegisterZone(z) => {
             // Applied here because the table is the router's, and replacing rather than refusing an
@@ -1378,11 +1161,11 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                         .s(b"x")
                         .u(z.target_h as u64)
                         .end();
-                    reply_on_session(ch, op, request_id, &[]);
+                    reply_on_session(srv.manager(), op, request_id, &[]);
                 }
                 Err(_) => {
-                    kprint(b"compositor: a snap zone registration was refused\n");
-                    reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
+                    log::write(b"compositor: a snap zone registration was refused\n");
+                    reply_error_on_session(srv.manager(), op, request_id, KError::InvalidArgument);
                 }
             }
         }
@@ -1400,13 +1183,13 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                         .u(hk.code as u64)
                         .s(b")")
                         .end();
-                    reply_on_session(ch, op, request_id, &[]);
+                    reply_on_session(srv.manager(), op, request_id, &[]);
                 }
                 Err(_) => {
                     // `InvalidArgument` for all three, as the spec publishes: a full table never
                     // empties, so `WouldBlock` would make a manager retry forever.
-                    kprint(b"compositor: a hotkey registration was refused\n");
-                    reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
+                    log::write(b"compositor: a hotkey registration was refused\n");
+                    reply_error_on_session(srv.manager(), op, request_id, KError::InvalidArgument);
                 }
             }
         }
@@ -1422,7 +1205,7 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
             let moved = match srv.stack.place(window, origin) {
                 Ok(d) => Some(d.rect()),
                 Err(compositor::StackError::Dragging) => {
-                    return reply_error_on_session(ch, op, request_id, KError::WouldBlock);
+                    return reply_error_on_session(srv.manager(), op, request_id, KError::WouldBlock);
                 }
                 Err(_) => None,
             };
@@ -1440,42 +1223,36 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                     }
                     announce_focus(srv);
                 }
-                reply_on_session(ch, op, request_id, &[]);
+                reply_on_session(srv.manager(), op, request_id, &[]);
             } else {
                 // No session owns that window, so nobody can be told: a refusal, not a hollow
                 // success.
-                reply_error_on_session(ch, op, request_id, surface_errno(SurfaceError::NotFound));
+                reply_error_on_session(srv.manager(), op, request_id, surface_errno(SurfaceError::NotFound));
             }
         }
         MgrOutcome::Failed(e) => {
-            reply_error_on_session(ch, op, request_id, surface_errno(e));
+            reply_error_on_session(srv.manager(), op, request_id, surface_errno(e));
         }
     }
     true
 }
 
 /// Mint the manager channel, or refuse because one is already attached.
-fn open_manager(serve_end: u64, request_id: u64) -> bool {
-    // SAFETY: single-threaded server reading its own state.
-    if unsafe { MANAGER_CH } != 0 {
+fn open_manager(serve_end: Ref<'_, Channel, Only>, request_id: u64, srv: &mut Server) -> bool {
+    if srv.manager.is_some() {
         // Refused, not replaced: a second manager would silently depose the first.
-        kprint(b"compositor: a second manager was refused\n");
+        log::write(b"compositor: a second manager was refused\n");
         return reply_resolve_error(serve_end, request_id, KError::WouldBlock);
     }
-    let Some((client_end, server_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
+    let Ok((client_end, server_end)) = Handle::pair(SESSION_QUEUE_DEPTH) else {
         return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
     };
-    if !reply_session(serve_end, request_id, client_end) {
-        // SAFETY: the reply failed, so the manager never received its end; drop both.
-        unsafe {
-            syscall4(SYS_HANDLE_CLOSE, client_end, 0, 0, 0);
-            syscall4(SYS_HANDLE_CLOSE, server_end, 0, 0, 0);
-        }
+    // A reply that fails closes the manager's end, and `server_end` with it as it drops.
+    if !server::reply_channel(serve_end, request_id, client_end) {
         return false;
     }
-    // SAFETY: recording our end of the channel we just handed out.
-    unsafe { MANAGER_CH = server_end };
-    kprint(b"compositor: a manager attached\n");
+    srv.manager = Some(server_end);
+    log::write(b"compositor: a manager attached\n");
     true
 }
 
@@ -1500,7 +1277,7 @@ fn close_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
     // one, and a dark session's shadows would fall too strongly under it.
     if srv.stack.set_scheme(libdraw::theme::Scheme::Light) {
         repaint(srv, screen);
-        kprint(b"compositor: scheme light (the manager that named another went away)\n");
+        log::write(b"compositor: scheme light (the manager that named another went away)\n");
     }
     // Every window it was going to place is shown now: those clients are blocked, and waiting out a
     // timer for a manager that has gone is latency for nothing.
@@ -1508,52 +1285,27 @@ fn close_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
     for window in waiting {
         release_configure(srv, screen, window);
     }
-    // SAFETY: closing our own endpoint and clearing the slot.
-    unsafe {
-        if MANAGER_CH != 0 {
-            syscall4(SYS_HANDLE_CLOSE, MANAGER_CH, 0, 0, 0);
-            MANAGER_CH = 0;
-        }
-    }
-    kprint(b"compositor: the manager went away\n");
+    srv.manager = None;
+    log::write(b"compositor: the manager went away\n");
 }
 
 fn close_session(slot: usize, srv: &mut Server) {
-    // SAFETY: closing our own endpoint and clearing the slot.
-    unsafe {
-        if SESSION_CH[slot] != 0 {
-            syscall4(SYS_HANDLE_CLOSE, SESSION_CH[slot], 0, 0, 0);
-            SESSION_CH[slot] = 0;
-        }
-    }
+    srv.sessions[slot] = None;
     srv.outbox[slot].clear();
     disconnect(&mut srv.conns[slot], &mut srv.stack);
     drain_stack_events(srv);
     announce_focus(srv);
 }
 
-/// What the kernel says `handle` is; `None` if it will not, as of a handle without `INSPECT`.
-fn stat(handle: u64) -> Option<HandleInfo> {
-    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
-    // SAFETY: `info` is a writable `HandleInfo` on this frame.
-    (unsafe { syscall2(SYS_HANDLE_STAT, handle, (&raw mut info) as u64) } == 0).then_some(info)
-}
-
 /// Map a client's transferred `MemoryObject` at attach, as [`attach_memory`] rules, no handle
 /// refused with the rest. Always consumes `handle`, on every path.
-fn map_attached_buffer(body: &[u8], handle: u64) -> Option<Attached<Option<Mapping>>> {
-    if handle == 0 {
-        return None;
-    }
-    let attached = attach_memory(body, stat(handle).as_ref(), |len| {
-        // SAFETY: `handle` is a `MemoryObject` the client transferred, of at least `len` bytes;
-        // mapping it read-only with the size its own geometry declares.
-        let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };
-        (addr > 0).then(|| Mapping { addr: addr as *mut u8, len })
-    });
-    // SAFETY: closing our reference; a mapping outlives it.
-    unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-    attached
+fn map_attached_buffer(
+    body: &[u8],
+    handle: Option<Handle<Memory, MapRead>>,
+) -> Option<Attached<Option<Mapping<MapRead>>>> {
+    let handle = handle?;
+    // The mapping holds its own reference to the object, so it outlives `handle`.
+    attach_memory(body, handle.stat().ok().as_ref(), |len| handle.map(len).ok())
 }
 
 /// Recomposite the whole screen: the fallback for `Applied { dirty: None }` and the first frame.
@@ -1609,81 +1361,41 @@ fn announce_layout(srv: &mut Server) {
     mgr_emit(srv, MgrEvent::LayoutChanged(now));
 }
 
-fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -> bool {
-    let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
-    let elen = librsproto::error::error_body(&mut ebody, err.as_i32(), 0, b"").unwrap_or(0);
-    // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
-    unsafe {
-        let Some(rs_len) =
-            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody[..elen], 0)
-        else {
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
-        REPLY_MSG[8] = 0;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            session,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
-}
-
 fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
-    // SAFETY: SESSION_CH is only written by this single-threaded loop, and `slot` indexes it in bounds
-    let ch = unsafe { SESSION_CH[slot] };
-    // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-    match unsafe { channel_recv_raw(ch, &raw mut RECV_MSG) } {
-        Ok(sent) => {
-            if handle_session_request(slot, ch, srv, screen, sent) {
+    let mut msg = Msg::new();
+    let Some(ch) = &srv.sessions[slot] else { return Served::Empty };
+    match ch.recv(&mut msg) {
+        Ok(carried) => {
+            if handle_session_request(slot, srv, screen, &msg, carried) {
                 Served::One
             } else {
                 Served::Closed
             }
         }
-        Err(rr) if rr == KError::PeerClosed.as_i32() as i64 => Served::Closed,
+        Err(e) if e.code() == KError::PeerClosed => Served::Closed,
         Err(_) => Served::Empty,
     }
 }
 
 fn handle_session_request(
     slot: usize,
-    ch: u64,
     srv: &mut Server,
     screen: &mut Screen<RawFramebuffer>,
-    mut sent: Received,
+    msg: &Msg,
+    mut carried: Carried,
 ) -> bool {
-    // Copied out to avoid two live `static mut` borrows. `MAX_BODY` fits any message's body, so
-    // this `min` is a bounds check, not a policy.
-    let mut body_buf = [0u8; MAX_BODY];
-    // SAFETY: RECV_MSG was filled by the recv in the caller; the slice is clamped to the payload
-    // region and is copied out before anything else touches the statics
-    let (op, request_id, body_len, handle) = unsafe {
-        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF));
-        // A message that does not decode closes what it carried as `sent` drops; past the first
-        // handle, so does one that does.
-        let Ok(m) = decode(req) else {
-            return true;
-        };
-        let h = sent.take(0).unwrap_or(0);
-        drop(sent);
-        let n = m.body.len().min(MAX_BODY);
-        body_buf[..n].copy_from_slice(&m.body[..n]);
-        (m.op, m.request_id, n, h)
+    // A message that does not decode closes what it carried as `carried` drops.
+    let Ok(m) = decode(msg.payload()) else {
+        return true;
     };
-    let body = &body_buf[..body_len];
+    let (op, request_id, body) = (m.op, m.request_id, m.body);
+    // Only an attach takes a handle, and only its first; the rest close as `carried` drops.
+    let handle = if op == OP_ATTACH_BUFFER { carried.take::<Memory, MapRead>(0) } else { None };
+    drop(carried);
 
     // `StartMove` is answered here as `dispatch` sees no router, which owns the grab this is
     // checked against. A foreign window answers `NotFound`.
     if op == librsproto::surface::OP_START_MOVE {
-        if handle != 0 {
-            // SAFETY: closing a handle this process owns and will never interpret.
-            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        }
         let err = match librsproto::surface::StartMove::read(body) {
             None => Some(KError::InvalidArgument),
             Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
@@ -1711,18 +1423,14 @@ fn handle_session_request(
             },
         };
         return match err {
-            Some(e) => reply_error_on_session(ch, op, request_id, e),
-            None => reply_on_session(ch, op, request_id, &[]),
+            Some(e) => reply_error_on_session(srv.session(slot), op, request_id, e),
+            None => reply_on_session(srv.session(slot), op, request_id, &[]),
         };
     }
 
     // `StartResize` is answered here for the reason `StartMove` is. It resizes nothing: an outline
     // follows the pointer and the manager hears one event at the release.
     if op == librsproto::surface::OP_START_RESIZE {
-        if handle != 0 {
-            // SAFETY: closing a handle this process owns and will never interpret.
-            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        }
         let err = match librsproto::surface::StartResize::read(body) {
             None => Some(KError::InvalidArgument),
             Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
@@ -1762,18 +1470,14 @@ fn handle_session_request(
             },
         };
         return match err {
-            Some(e) => reply_error_on_session(ch, op, request_id, e),
-            None => reply_on_session(ch, op, request_id, &[]),
+            Some(e) => reply_error_on_session(srv.session(slot), op, request_id, e),
+            None => reply_on_session(srv.session(slot), op, request_id, &[]),
         };
     }
 
     // A window says what it takes, once. The compositor holds the table so "would this window take
     // this drag?" is answered per motion without a round trip.
     if op == librsproto::surface::OP_DECLARE_ACCEPTOR {
-        if handle != 0 {
-            // SAFETY: closing a handle this process owns and will never interpret.
-            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        }
         let err = match librsproto::surface::DeclareAcceptor::read(body) {
             None => Some(KError::InvalidArgument),
             Some((req, _)) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
@@ -1801,18 +1505,14 @@ fn handle_session_request(
             },
         };
         return match err {
-            Some(e) => reply_error_on_session(ch, op, request_id, e),
-            None => reply_on_session(ch, op, request_id, &[]),
+            Some(e) => reply_error_on_session(srv.session(slot), op, request_id, e),
+            None => reply_on_session(srv.session(slot), op, request_id, &[]),
         };
     }
 
     // A drag is a gesture the compositor runs, refused like a move and a resize without the grab;
     // it ends in a payload for the window it was let go over.
     if op == librsproto::surface::OP_START_DRAG {
-        if handle != 0 {
-            // SAFETY: closing a handle this process owns and will never interpret.
-            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        }
         let err = match librsproto::surface::StartDrag::read(body) {
             None => Some(KError::InvalidArgument),
             Some((req, ..)) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
@@ -1844,18 +1544,14 @@ fn handle_session_request(
             }
         };
         return match err {
-            Some(e) => reply_error_on_session(ch, op, request_id, e),
-            None => reply_on_session(ch, op, request_id, &[]),
+            Some(e) => reply_error_on_session(srv.session(slot), op, request_id, e),
+            None => reply_on_session(srv.session(slot), op, request_id, &[]),
         };
     }
 
     // `RequestState` is forwarded, not applied: minimising and maximising are manager operations,
     // so the compositor only checks ownership and hands the manager the question.
     if op == librsproto::surface::OP_REQUEST_STATE {
-        if handle != 0 {
-            // SAFETY: closing a handle this process owns and will never interpret.
-            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-        }
         let err = match librsproto::surface::WindowState::read(body) {
             None => Some(KError::InvalidArgument),
             Some(req) if req.state > librsproto::surface::WINDOW_STATE_MAXIMIZED => Some(KError::InvalidArgument),
@@ -1870,8 +1566,8 @@ fn handle_session_request(
             }
         };
         return match err {
-            Some(e) => reply_error_on_session(ch, op, request_id, e),
-            None => reply_on_session(ch, op, request_id, &[]),
+            Some(e) => reply_error_on_session(srv.session(slot), op, request_id, e),
+            None => reply_on_session(srv.session(slot), op, request_id, &[]),
         };
     }
 
@@ -1879,16 +1575,11 @@ fn handle_session_request(
     // geometry without it, and recorded after, as a rejected one would put the client's memory
     // under ids it does not own. The handle is disposed of exactly once.
     let attached = if op == OP_ATTACH_BUFFER { map_attached_buffer(body, handle) } else { None };
-    if op != OP_ATTACH_BUFFER && handle != 0 {
-        // SAFETY: closing a handle this process owns and will not use.
-        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
-    }
+    let mut reply = [0u8; MAX_BODY];
     let outcome = if op == OP_ATTACH_BUFFER && attached.is_none() {
         refuse_attach(&srv.conns[slot], body)
     } else {
-        // SAFETY: single-threaded, and nothing else borrows `REPLY_MSG` across this call, so the
-        // `&mut` is unique; `body` is a local copy, so it does not alias it.
-        unsafe { dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut REPLY_MSG[PAYLOAD_OFF + 16..]) }
+        dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut reply)
     };
     drain_stack_events(srv);
     if let Some(attached) = attached {
@@ -1897,27 +1588,14 @@ fn handle_session_request(
 
     match outcome {
         Outcome::Reply(len) => {
-            let mut body = [0u8; MAX_BODY];
-            let n = len.min(MAX_BODY);
-            // SAFETY: `dispatch` wrote `len` bytes at this offset in REPLY_MSG, and `n` is clamped to MAX_BODY; copy
-            // them out before `reply_on_session` re-encodes into the same buffer
-            unsafe {
-                body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
-            }
-            if !reply_on_session(ch, op, request_id, &body[..n]) {
-                kprint(b"compositor: DROPPED a reply (client receive ring full)\n");
+            if !reply_on_session(srv.session(slot), op, request_id, &reply[..len.min(MAX_BODY)]) {
+                log::write(b"compositor: DROPPED a reply (client receive ring full)\n");
             }
         }
         Outcome::Created { reply_len, configure } => {
             // The reply first, then the configure, on the same channel: the client reads its id and
             // then waits for the configure before it may commit.
-            let mut body = [0u8; MAX_BODY];
             let n = reply_len.min(MAX_BODY);
-            // SAFETY: `dispatch` wrote `reply_len` bytes at this offset in REPLY_MSG, and `n` is clamped to MAX_BODY;
-            // copy them out before `reply_on_session` re-encodes into the same buffer
-            unsafe {
-                body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
-            }
             // The manager hears of it with the role and size asked for: a follow-up question would
             // be a seam with a round trip in it.
             if let Some(w) = srv.stack.window(configure.window) {
@@ -1929,9 +1607,9 @@ fn handle_session_request(
                 );
                 mgr_emit(srv, MgrEvent::Created(ev));
             }
-            let sent = reply_on_session(ch, op, request_id, &body[..n]);
+            let sent = reply_on_session(srv.session(slot), op, request_id, &reply[..n]);
             if !sent {
-                kprint(b"compositor: a create reply did not send\n");
+                log::write(b"compositor: a create reply did not send\n");
             }
             // Held when a manager is attached, so it can place the window before anyone sees it. A
             // popup is never held: its creator places it, and every menu open would cost the
@@ -1940,16 +1618,15 @@ fn handle_session_request(
                 .stack
                 .window(configure.window)
                 .is_some_and(|w| matches!(w.role, librsproto::surface::Role::Popup { .. }));
-            // SAFETY: reading our own manager slot.
-            if sent && !placed_by_creator && unsafe { MANAGER_CH } != 0 {
+            if sent && !placed_by_creator && srv.manager.is_some() {
                 srv.pending_configure.push((configure.window, now_ns().saturating_add(CONFIGURE_DEADLINE_NS)));
             } else {
                 let mut cfg = [0u8; core::mem::size_of::<ConfigureEvent>()];
                 srv.stack.mark_configured(configure.window);
-                if sent && configure.write(&mut cfg).is_some() && !send_input(ch, OP_CONFIGURE, &cfg) {
+                if sent && configure.write(&mut cfg).is_some() && !send_input(srv.session(slot), OP_CONFIGURE, &cfg) {
                     // The client waits for this and nothing else produces it; a silent failure
                     // parks it forever.
-                    kprint(b"compositor: a window's first configure did not send\n");
+                    log::write(b"compositor: a window's first configure did not send\n");
                 }
             }
         }
@@ -1977,17 +1654,17 @@ fn handle_session_request(
             srv.conns[slot].rejections_logged += 1;
             let n = srv.conns[slot].rejections_logged;
             if n <= MAX_LOGGED_REJECTIONS {
-                kprint(match e {
+                log::write(match e {
                     SurfaceError::Malformed => b"compositor: malformed request\n" as &[u8],
                     SurfaceError::Unsupported => b"compositor: unsupported op\n",
                     SurfaceError::NotFound => b"compositor: no such window for this connection\n",
                     SurfaceError::Rejected(_) => b"compositor: request rejected\n",
                 });
                 if n == MAX_LOGGED_REJECTIONS {
-                    kprint(b"compositor: (further rejections not logged)\n");
+                    log::write(b"compositor: (further rejections not logged)\n");
                 }
             }
-            reply_error_on_session(ch, op, request_id, surface_errno(e));
+            reply_error_on_session(srv.session(slot), op, request_id, surface_errno(e));
         }
     }
 
@@ -1998,8 +1675,30 @@ fn handle_session_request(
     true
 }
 
-fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Server, mut control: u64) -> ! {
-    kprint(b"compositor: serving /dev/draw\n");
+/// What a wait's index names.
+#[derive(Copy, Clone)]
+enum Waited {
+    Resolve,
+    Control,
+    Input,
+    Manager,
+    Session(usize),
+}
+
+/// Add `h` to `set` as `what`.
+fn watch<'a>(set: &mut WaitSet<'a, MAX_WAIT_HANDLES>, names: &mut [Waited], h: &'a Endpoint, what: Waited) {
+    if let Ok(i) = set.add(h) {
+        names[i] = what;
+    }
+}
+
+fn serve_loop(
+    serve_end: Endpoint,
+    mut screen: Screen<RawFramebuffer>,
+    srv: &mut Server,
+    mut control: Option<Endpoint>,
+) -> ! {
+    log::write(b"compositor: serving /dev/draw\n");
     let mut parked = false;
     loop {
         // Every iteration, not only on a timeout, or the configure deadline holds only when idle.
@@ -2007,30 +1706,25 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
         if fire_configure_deadlines(srv, &mut screen) {
             parked = flush_outboxes(srv);
         }
-        // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
-        // `4 + MAX_SESSIONS` — `serve_end`, the control channel until its supervisor has gone, the
-        // input channel when connected, the manager channel when one is attached, then the
-        // sessions — which the `const _` beside `MAX_SESSIONS` holds to that limit.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = serve_end;
-            let mut n = 1usize;
-            if control != 0 {
-                WAIT_HANDLES[n] = control;
-                n += 1;
+        // At most `4 + MAX_SESSIONS` — `serve_end`, the control channel until its supervisor has
+        // gone, the input channel when connected, the manager channel when one is attached, then the
+        // sessions — which the `const _` beside `MAX_SESSIONS` holds to the wait limit.
+        let mut names = [Waited::Resolve; MAX_WAIT_HANDLES];
+        let waited = {
+            let mut set = WaitSet::new();
+            watch(&mut set, &mut names, &serve_end, Waited::Resolve);
+            if let Some(c) = &control {
+                watch(&mut set, &mut names, c, Waited::Control);
             }
-            if srv.input_ch != 0 {
-                WAIT_HANDLES[n] = srv.input_ch;
-                n += 1;
+            if let Some(i) = &srv.input {
+                watch(&mut set, &mut names, i, Waited::Input);
             }
-            if MANAGER_CH != 0 {
-                WAIT_HANDLES[n] = MANAGER_CH;
-                n += 1;
+            if let Some(m) = &srv.manager {
+                watch(&mut set, &mut names, m, Waited::Manager);
             }
-            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
-            for i in 0..MAX_SESSIONS {
-                if SESSION_CH[i] != 0 {
-                    WAIT_HANDLES[n] = SESSION_CH[i];
-                    n += 1;
+            for (slot, s) in srv.sessions.iter().enumerate() {
+                if let Some(s) = s {
+                    watch(&mut set, &mut names, s, Waited::Session(slot));
                 }
             }
             // Bounded while something is parked or a key is repeating, whichever is sooner; an idle
@@ -2046,67 +1740,48 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             for &(_, at) in &srv.pending_configure {
                 deadline = deadline.min(at);
             }
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, deadline)
+            set.wait(Deadline::at(deadline))
         };
-        if waited < 1 {
-            fire_repeat(srv);
-            parked = flush_outboxes(srv);
-            continue;
-        }
+        let signalled = match waited {
+            Ok(signalled) if !signalled.is_empty() => signalled,
+            _ => {
+                fire_repeat(srv);
+                parked = flush_outboxes(srv);
+                continue;
+            }
+        };
 
         let mut serve_signalled = false;
-        for j in 0..(waited as usize) {
-            let off = j * 24;
-            // SAFETY: `waited` records were written; `off + 8` stays inside WAIT_RESULTS.
-            let h = unsafe {
-                u64::from_le_bytes([
-                    WAIT_RESULTS[off],
-                    WAIT_RESULTS[off + 1],
-                    WAIT_RESULTS[off + 2],
-                    WAIT_RESULTS[off + 3],
-                    WAIT_RESULTS[off + 4],
-                    WAIT_RESULTS[off + 5],
-                    WAIT_RESULTS[off + 6],
-                    WAIT_RESULTS[off + 7],
-                ])
-            };
-            if h == serve_end {
-                serve_signalled = true;
-                continue;
-            }
-            // `service --stop`: every window goes with this process and its clients find their
-            // channels closed; a restarted compositor takes the screen again.
-            if control != 0 && h == control {
-                if let libkern::control::Control::Op(libkern::abi::CTRL_OP_SHUTDOWN) =
-                    libkern::control::recv(&mut control)
-                {
-                    kprint(b"compositor: asked to stop, exiting\n");
-                    exit(0);
+        for (i, _) in signalled.iter() {
+            match names[i] {
+                Waited::Resolve => serve_signalled = true,
+                // `service --stop`: every window goes with this process and its clients find their
+                // channels closed; a restarted compositor takes the screen again.
+                Waited::Control => {
+                    if control::recv(&mut control) == Control::Op(CTRL_OP_SHUTDOWN) {
+                        log::write(b"compositor: asked to stop, exiting\n");
+                        libos::exit(0);
+                    }
                 }
-                continue;
-            }
-            if srv.input_ch != 0 && h == srv.input_ch && !serve_input(srv, &mut screen) {
-                // The input server died: carry on serving the display rather than exit because a
-                // mouse went away.
-                kprint(b"compositor: input server gone\n");
-                // SAFETY: closing an endpoint this process owns and stops using.
-                unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, srv.input_ch, 0, 0, 0) };
-                srv.input_ch = 0;
-                continue;
-            }
-            // SAFETY: reading our own manager slot.
-            if unsafe { MANAGER_CH } != 0 && h == unsafe { MANAGER_CH } {
-                if serve_manager(srv, &mut screen) == Served::Closed {
-                    close_manager(srv, &mut screen);
+                Waited::Input => {
+                    if srv.input.is_some() && !serve_input(srv, &mut screen) {
+                        // The input server died: carry on serving the display rather than exit because a
+                        // mouse went away.
+                        log::write(b"compositor: input server gone\n");
+                        srv.input = None;
+                    }
                 }
-                continue;
-            }
-            // SAFETY: scanning our own slot table for the signalled endpoint.
-            if let Some(slot) = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == h) }
-                && serve_session(slot, srv, &mut screen) == Served::Closed
-            {
-                close_session(slot, srv);
-                repaint(srv, &mut screen);
+                Waited::Manager => {
+                    if serve_manager(srv, &mut screen) == Served::Closed {
+                        close_manager(srv, &mut screen);
+                    }
+                }
+                Waited::Session(slot) => {
+                    if serve_session(slot, srv, &mut screen) == Served::Closed {
+                        close_session(slot, srv);
+                        repaint(srv, &mut screen);
+                    }
+                }
             }
         }
         // Before the early `continue`: everything above may have queued messages, and the common
@@ -2121,94 +1796,90 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
         // A forwarded resolve: `new` mints a session, `manage` the manager channel, `<N>/info`
         // window metadata, `screen` the screen's size. `<N>/ports/...` is unscheduled:
         // `TODO(port-shape-rework)`.
-        // SAFETY: single-threaded; `RECV_MSG` is lent for the call.
-        let Ok(_sent) = (unsafe { channel_recv_raw(serve_end, &raw mut RECV_MSG) }) else {
+        let mut msg = Msg::new();
+        let Ok(_carried) = serve_end.recv(&mut msg) else {
             continue;
         };
-        // SAFETY: bounded read of the payload, then of the resolve's suffix.
-        let (request_id, resolved, ok) = unsafe {
-            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            let req =
-                core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF));
-            match decode(req) {
-                Ok(m) if m.op == OP_NS_RESOLVE => {
-                    let suffix = librsproto::namespace::parse_resolve_request(m.body).map(|r| r.suffix).unwrap_or(b"");
-                    (m.request_id, classify(suffix), true)
-                }
-                Ok(m) => (m.request_id, Resolved::Unknown, true),
-                Err(_) => (0, Resolved::Unknown, false),
+        let (request_id, resolved) = match decode(msg.payload()) {
+            Ok(m) if m.op == OP_NS_RESOLVE => {
+                let suffix = librsproto::namespace::parse_resolve_request(m.body).map(|r| r.suffix).unwrap_or(b"");
+                (m.request_id, classify(suffix))
             }
+            Ok(m) => (m.request_id, Resolved::Unknown),
+            Err(_) => continue,
         };
-        if !ok {
-            continue;
-        }
         match resolved {
             Resolved::New => {
-                open_session(serve_end, request_id, srv);
+                open_session(serve_end.as_ref(), request_id, srv);
             }
             Resolved::Manage => {
-                open_manager(serve_end, request_id);
+                open_manager(serve_end.as_ref(), request_id, srv);
             }
             Resolved::Info(id) => {
-                reply_window_info(serve_end, request_id, srv, id);
+                reply_window_info(serve_end.as_ref(), request_id, srv, id);
             }
             Resolved::Screen => {
-                reply_screen_info(serve_end, request_id, srv);
+                reply_screen_info(serve_end.as_ref(), request_id, srv);
             }
             Resolved::Unknown => {
-                reply_resolve_error(serve_end, request_id, KError::NotFound);
+                reply_resolve_error(serve_end.as_ref(), request_id, KError::NotFound);
             }
         }
     }
 }
 
-/// Called by the kernel's ELF entry; `ctrl` is the control channel the supervisor spawned us with.
+/// Called by the kernel's ELF entry; `control` is the channel the supervisor spawned us with.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
-    kprint(b"compositor: up\n");
+pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let mut start = unsafe { Start::from_registers(notif, root_ns, control, arg0) };
+    log::write(b"compositor: up\n");
+    let control: Option<Endpoint> = start.take_handle0();
 
     // The shadow buffer is allocated before the screen changes hands: acquiring `/dev/framebuffer`
     // stops the kernel console drawing, so a later refusal would be unreadable on a machine with no
     // serial port (`check-fbcon`). Reading the geometry does not take the screen; `acquire` does.
-    //
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let shadow =
-        match unsafe { libdraw::acquire::read_info(root_ns) }.and_then(|info| libdraw::acquire::geometry_from(&info)) {
-            Ok(geometry) => match libdraw::framebuffer::MemFramebuffer::try_new(geometry) {
-                Some(shadow) => shadow,
-                None => {
-                    kprint(b"compositor: no memory for a shadow buffer -- cannot serve\n");
-                    exit(1);
-                }
-            },
-            Err(_) => {
-                kprint(b"compositor: cannot read the framebuffer's shape -- cannot serve\n");
-                exit(1);
+    let geometry = start
+        .root
+        .as_ref()
+        .and_then(|root| libdraw::acquire::framebuffer_info(root).ok())
+        .and_then(|info| libdraw::acquire::geometry_from(&info).ok());
+    let shadow = match geometry {
+        Some(geometry) => match libdraw::framebuffer::MemFramebuffer::try_new(geometry) {
+            Some(shadow) => shadow,
+            None => {
+                log::write(b"compositor: no memory for a shadow buffer -- cannot serve\n");
+                libos::exit(1);
             }
-        };
-
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let (aperture, info) = match unsafe { libdraw::acquire::acquire(root_ns) } {
-        Ok(pair) => pair,
-        Err(_) => {
-            kprint(b"compositor: no /dev/framebuffer -- cannot serve\n");
-            exit(1);
+        },
+        None => {
+            log::write(b"compositor: cannot read the framebuffer's shape -- cannot serve\n");
+            libos::exit(1);
         }
     };
-    let _ = info;
+
+    // SAFETY: the mapping is kept for the process's life, and from here the aperture is reachable
+    // only through `screen`, the one writer once acquiring has stopped the kernel console drawing.
+    let acquired = start.root.as_ref().and_then(|root| unsafe { libdraw::acquire::map_framebuffer(root) }.ok());
+    let Some((aperture, _info)) = acquired else {
+        log::write(b"compositor: no /dev/framebuffer -- cannot serve\n");
+        libos::exit(1);
+    };
     // From here the aperture is reachable only through `screen`: frames are composed in the shadow
     // buffer and copied out, so nothing is scanned out half-painted. There is no serving without
     // it: composing into the write-combining framebuffer reads it back uncached, a second a frame.
     let mut screen = Screen::with_shadow(aperture, shadow);
 
-    let Some((kernel_end, serve_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
-        kprint(b"compositor: channel create FAIL\n");
-        exit(1);
+    let Ok((kernel_end, serve_end)) = Handle::pair(SESSION_QUEUE_DEPTH) else {
+        log::write(b"compositor: channel create FAIL\n");
+        libos::exit(1);
     };
     let screen_bounds = screen.geometry().bounds();
     let mut srv = Server {
         stack: WindowStack::new(),
         conns: core::array::from_fn(|_| Connection::new()),
+        sessions: [const { None }; MAX_SESSIONS],
+        manager: None,
         buffers: alloc::vec::Vec::new(),
         repeat: None,
         pending_configure: alloc::vec::Vec::new(),
@@ -2221,17 +1892,17 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         interp: Interpreter::new(),
         // The cursor clamps to the screen actually acquired, not a constant that happens to match.
         router: InputRouter::new(screen_bounds),
-        input_ch: 0,
+        input: None,
         lights_sent: None,
     };
-    match connect_input(root_ns) {
-        Some(ch) => {
-            srv.input_ch = ch;
+    match start.root.as_ref().and_then(connect_input) {
+        Some(input) => {
+            srv.input = Some(input);
             // `check-input` waits on this line.
-            kprint(b"compositor: input connected\n");
+            log::write(b"compositor: input connected\n");
             send_lights(&mut srv);
         }
-        None => kprint(b"compositor: no /dev/input/new -- display only\n"),
+        None => log::write(b"compositor: no /dev/input/new -- display only\n"),
     }
 
     // Clear before announcing readiness, so `Meta::Ready` means the screen is taken: announcing
@@ -2240,16 +1911,16 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     // mouse first moves.
     repaint(&srv, &mut screen);
 
-    if !send_ready(ctrl, kernel_end) {
-        kprint(b"compositor: Ready send FAIL\n");
-        exit(1);
+    if !control.as_ref().is_some_and(|c| server::ready(c, b"compositor", kernel_end)) {
+        log::write(b"compositor: Ready send FAIL\n");
+        libos::exit(1);
     }
 
-    serve_loop(serve_end, screen, &mut srv, ctrl);
+    serve_loop(serve_end, screen, &mut srv, control);
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kprint(b"compositor: panic\n");
-    exit(2);
+    log::write(b"compositor: panic\n");
+    libos::exit(2);
 }

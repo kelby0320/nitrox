@@ -29,18 +29,6 @@ fn blit_clipped(fb: &mut MemFramebuffer, src: &[u8], g: Geometry, x: i32, y: i32
     }
 }
 
-/// Unmap a buffer this process mapped with [`shared_buffer`], and forget the pointer. Nothing
-/// reclaims it on drop: an overview open once leaked about 9 MB.
-fn release_buffer(addr: &mut *mut u8, len: usize) {
-    if addr.is_null() {
-        return;
-    }
-    // SAFETY: unmapping exactly what `shared_buffer` mapped, at the same length; the handle moved
-    // away at `attach`, so the object goes with its last reference.
-    unsafe { syscall4(SYS_MEMORY_UNMAP, *addr as u64, len as u64, 0, 0) };
-    *addr = core::ptr::null_mut();
-}
-
 /// Paint the overview: frozen thumbnails of the current desktop, and a sidebar of desktops.
 ///
 /// Frozen by design: `desktop-shell.md` §6 chose a compositor snapshot over compositing live
@@ -127,7 +115,7 @@ fn mini_wallpaper(picture: &[u8], screen: Screen) -> Option<(alloc::vec::Vec<u8>
     let mut out = alloc::vec![0u8; dst.pitch * h as usize];
     if !libdraw::scale::box_downscale(picture, src, &mut out, dst) {
         // Said, not silently fallen back from: `None` puts every miniature back to flat blue.
-        kprint(b"desktop-shell: the overview could not scale the wallpaper for a miniature\n");
+        log::write(b"desktop-shell: the overview could not scale the wallpaper for a miniature\n");
         return None;
     }
     Some((out, dst))
@@ -186,15 +174,15 @@ pub(super) fn open_overview(
         if let Some(w) = session.window(id) {
             let _ = w.destroy();
         }
-        kprint(b"desktop-shell: overview buffers FAILED\n");
+        log::write(b"desktop-shell: overview buffers FAILED\n");
         return None;
     }
     // One line whichever way it went (`check-login` matches it), so a gate can assert the
     // overview decided about a ground without asserting which way.
     if wallpaper.is_some() {
-        kprint(b"desktop-shell: overview ground is the wallpaper\n");
+        log::write(b"desktop-shell: overview ground is the wallpaper\n");
     } else {
-        kprint(b"desktop-shell: overview ground is the desktop colour\n");
+        log::write(b"desktop-shell: overview ground is the desktop colour\n");
     }
     present_overview(session, id, theme, font, shots, desktops, current, entries, pool, wallpaper, screen);
     Some(id)
@@ -360,25 +348,29 @@ fn capture_window(
     let h = want.1.min(size.1.max(1));
     let pitch = (w as usize) * 4;
     let len = pitch * h as usize;
-    let (handle, mut addr) = shared_buffer(len)?;
+    let buffer = Handle::<Memory, MapReadWrite>::create(len).ok()?;
+    let mapping: Mapping<MapReadWrite> = buffer.map(len).ok()?;
     let req = MgrCapture { window, width: w, height: h, pitch: pitch as u32 };
     let mut body = [0u8; core::mem::size_of::<MgrCapture>()];
     req.write(&mut body)?;
     let mut reply = [0u8; 64];
-    let ok = mgr.request(OP_MGR_CAPTURE, &body, Some(handle), &mut reply).is_ok();
+    // The transport moves the buffer with the request, so what it leaves is not ours to close: a
+    // refusal may come after the compositor has the handle.
+    let ok = mgr.request(OP_MGR_CAPTURE, &body, Some(buffer.into_raw().0), &mut reply).is_ok();
     if !ok {
         Line::new().s(b"desktop-shell: Capture refused for window ").u(window as u64).end();
-        release_buffer(&mut addr, len);
         // TODO(capture-refused-leak): a failed send leaves the handle.
         return None;
     }
-    // SAFETY: `addr` maps `len` readable bytes the compositor has just written.
-    let px = unsafe { core::slice::from_raw_parts(addr, len) }.to_vec();
+    // A copy, not a slice: the compositor wrote these bytes and may write them again. `px` is
+    // zeroed, so a mapping that cannot be read leaves it blank.
+    let mut px = alloc::vec![0u8; len];
+    let _ = mapping.read_into(0, &mut px);
     // A reply is not an effect: the compositor logs a capture whether or not the scale wrote
-    // anything, so a black rectangle looks like a dark window to every gate. `shared_buffer` is
+    // anything, so a black rectangle looks like a dark window to every gate. The buffer starts
     // zeroed, so "some pixel is non-zero" is the question. The copy is taken, so the mapping is
     // released.
-    release_buffer(&mut addr, len);
+    drop(mapping);
     let lit = px.as_chunks::<4>().0.iter().filter(|c| **c != [0, 0, 0, 0]).count();
     if lit == 0 {
         Line::new().s(b"desktop-shell: capture of window ").u(window as u64).s(b" came back blank").end();

@@ -270,13 +270,6 @@ pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
     file_len(borrowed(ns), text(path)?)
 }
 
-/// [`copy`] for a raw namespace handle. For callers not yet on libos; the typed form is [`copy`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64, FileError> {
-    let src = text(src).ok_or(FileError::NotFound)?;
-    copy(borrowed(ns), src, text(dst).ok_or_else(not_text)?, overwrite)
-}
-
 /// [`read`] for a raw namespace handle. For callers not yet on libos; the typed form is [`read`].
 // TODO(raw-handle-shims): goes when its last caller is on libos.
 pub fn read_file(ns: u64, path: &[u8]) -> Result<Vec<u8>, FileError> {
@@ -295,23 +288,6 @@ pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
 // TODO(raw-handle-shims): goes when its last caller is on libos.
 pub fn save_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), SaveError> {
     save(borrowed(ns), text(path).ok_or_else(|| SaveError::Write(not_text()))?, bytes)
-}
-
-/// [`ensure_file`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`ensure_file`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn create_file(ns: u64, path: &[u8]) -> Result<(), FileError> {
-    ensure_file(borrowed(ns), text(path).ok_or_else(not_text)?)
-}
-
-/// [`rename_path`] for a raw namespace handle. For callers not yet on libos; the typed form is
-/// [`rename_path`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn rename(ns: u64, src: &[u8], dst: &[u8], replace: bool) -> Result<(), FileError> {
-    match (text(src), text(dst)) {
-        (Some(src), Some(dst)) => rename_path(borrowed(ns), src, dst, replace),
-        _ => Err(not_text()),
-    }
 }
 
 /// Resolve `path` to a handle with `rights`, returning `(status, handle)`; not only for files.

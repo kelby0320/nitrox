@@ -20,11 +20,13 @@ extern crate alloc;
 use alloc::string::String;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libfs::FileError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
-use libkern::{exit, kprint};
-use libstream::channel::{ChannelSink, IpcPort};
+use libos::boot::Start;
+use libos::exit;
+use libos::log;
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -46,8 +48,10 @@ const HELP: &[u8] = b"usage: rename [--force] OLD NEW\n\
 const VERSION: &[u8] = b"rename (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[FORCE]) {
         Ok(a) => a,
@@ -63,17 +67,15 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.die(b"rename: need exactly OLD and NEW (try --help)\n", EXIT_USAGE);
     }
 
-    let from_owned = stage.path(args.operands[0].as_bytes());
-    let from = from_owned.as_slice();
+    let from = stage.path(args.operands[0].as_bytes());
     // Both resolve against `PWD`: the kernel refuses a relative path, so a NEW taken as typed made
     // `rename ./a ./b` fail wherever it ran.
-    let to_owned = stage.path(args.operands[1].as_bytes());
-    let to = to_owned.as_slice();
+    let to = stage.path(args.operands[1].as_bytes());
     if from == to {
         stage.die(b"rename: source and destination are the same name\n", EXIT_USAGE);
     }
 
-    match libfs::rename(stage.namespace, from, to, args.has("force")) {
+    match libfs::rename_path(&stage.namespace, &from, &to, args.has("force")) {
         Ok(()) => {}
         // Not a filesystem failure: this operation cannot express it, and `move` can.
         Err(FileError::CrossDevice) => {
@@ -83,30 +85,28 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         Err(_) => stage.die(b"rename: cannot rename\n", EXIT_FAILURE),
     }
 
-    let from_s = String::from_utf8_lossy(from).into_owned();
-    let to_s = String::from_utf8_lossy(to).into_owned();
-    match stage.streams.stdout {
-        Some(h) => emit(&stage, h, &from_s, &to_s),
+    match stage.stdout() {
+        Some(port) => emit(&stage, port, &from, &to),
         None => {
             let mut line = String::from("renamed ");
-            line.push_str(&from_s);
+            line.push_str(&from);
             line.push_str(" -> ");
-            line.push_str(&to_s);
+            line.push_str(&to);
             line.push('\n');
-            kprint(line.as_bytes());
+            log::write(line.as_bytes());
         }
     }
     exit(EXIT_OK)
 }
 
-fn emit(stage: &Stage, stdout: u64, from: &str, to: &str) {
+fn emit(stage: &Stage, stdout: Port<'_>, from: &str, to: &str) {
     let schema = Schema::new().field("from", TypeTag::String, TypeModifiers::NONE).field(
         "to",
         TypeTag::String,
         TypeModifiers::NONE,
     );
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         tw.write_row(&[Value::Str(String::from(from)), Value::Str(String::from(to))])?;
         tw.finish_with_status(0)
@@ -121,6 +121,6 @@ fn emit(stage: &Stage, stdout: u64, from: &str, to: &str) {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"rename: panic\n");
+    log::write(b"rename: panic\n");
     exit(EXIT_FAILURE)
 }

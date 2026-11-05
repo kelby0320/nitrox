@@ -21,7 +21,7 @@ use libkern::scrub;
 use libos::{Channel, Deadline, Only, Ref, WaitSet};
 use librsproto::{OP_TTY_INTERRUPT, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE, TTY_MODE_ECHO};
 
-use ipc::{borrowed, ready, receive, transmit};
+use ipc::{ready, receive, transmit};
 
 /// One exchange with the terminal, stepping over an `Interrupt` and recording it in `interrupted`:
 /// `Ctrl-C` at a password prompt means "never mind".
@@ -54,23 +54,9 @@ pub fn ask_line_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, prompt: &[u8]) -
     }
 }
 
-/// Ask for a line on `term`, echo on. For callers not yet on libos; the typed form is
-/// [`ask_line_on`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn ask_line(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
-    ask_line_on(borrowed(term), prompt)
-}
-
 /// Ask for a password on `term`, echo off. `None` on `Ctrl-C`, `Ctrl-D` or a terminal failure.
 pub fn ask_password_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, prompt: &[u8]) -> Option<Vec<u8>> {
     ask_password_then_on(term, prompt, &mut || {})
-}
-
-/// Ask for a password on `term`, echo off. For callers not yet on libos; the typed form is
-/// [`ask_password_on`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn ask_password(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
-    ask_password_on(borrowed(term), prompt)
 }
 
 /// [`ask_password_on`], calling `asked` once echo is off and before the read: a gate waiting on a
@@ -99,7 +85,7 @@ pub fn ask_password_then_on<'a>(
     }
 }
 
-/// Why [`ask_new_password`] has no password to give.
+/// Why [`ask_new_password_on`] has no password to give.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NewPassword {
     /// `Ctrl-C` or `Ctrl-D`, or the terminal failed.
@@ -126,13 +112,6 @@ pub fn ask_new_password_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, prompt: 
     ask_new_password_then_on(term, prompt, &mut |_| {})
 }
 
-/// A new password typed twice on `term`, then [`confirm`]ed. For callers not yet on libos; the
-/// typed form is [`ask_new_password_on`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn ask_new_password(term: u64, prompt: &[u8]) -> Result<Vec<u8>, NewPassword> {
-    ask_new_password_on(borrowed(term), prompt)
-}
-
 /// [`ask_new_password_on`], calling `asked` with `1` and then `2` as each read is ready, echo off.
 /// Echo goes back on between the two reads, so one receipt for both would let the second copy be
 /// typed while it was on.
@@ -148,13 +127,6 @@ pub fn ask_new_password_then_on<'a>(
         return Err(NewPassword::Cancelled);
     };
     confirm(first, second)
-}
-
-/// [`ask_new_password_on`] with `asked`. For callers not yet on libos; the typed form is
-/// [`ask_new_password_then_on`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn ask_new_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut(u8)) -> Result<Vec<u8>, NewPassword> {
-    ask_new_password_then_on(borrowed(term), prompt, asked)
 }
 
 /// The password typed twice, if the two agree and it keeps the rules. The second copy is always

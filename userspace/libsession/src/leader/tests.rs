@@ -1,7 +1,7 @@
 use super::*;
-use crate::testing::{endpoint, lookup_only, stop_flag};
+use crate::testing::{lookup_only, stop_flag};
 use crate::{drain_stop_requests, stop_asked};
-use libkern::KIND_CHILD_EXITED;
+use libkern::{KIND_CHILD_EXITED, RawHandle};
 use libos::{MapReadWrite, Memory, NsMutable, NsReadOnly, mock};
 use std::string::String;
 
@@ -153,29 +153,6 @@ fn a_refused_spawn_closes_both_ends_of_the_setup_channel() {
     assert!(mock::spawned().is_empty());
     assert!(mock::logged().ends_with(b"libsession: nxsh spawn FAIL\n"));
     assert_eq!(mock::open_handles(), before);
-    assert_eq!(mock::stray_closes(), 0);
-}
-
-/// The raw form is the same leader on the caller's own handles, which it leaves open.
-#[test]
-fn the_raw_form_spawns_the_same_leader_and_closes_nothing() {
-    let w = world(&[note(KIND_CHILD_EXITED, 4)]);
-    let (extra, _peer) = endpoint(50);
-    let code = spawn_leader(
-        w.root.raw().0,
-        w.session.raw().0,
-        w.notif.raw().0,
-        "nxsh",
-        &[],
-        SysCaps::BIND_NAMESPACE.bits(),
-        &[extra.raw().0, 0],
-    );
-    assert_eq!(code, 4);
-    let args = mock::spawned().pop().unwrap();
-    assert_eq!((args.namespace, args.syscaps), (w.session.raw().0, SysCaps::BIND_NAMESPACE.bits()));
-    for h in [w.root.raw().0, w.session.raw().0, w.notif.raw().0, extra.raw().0] {
-        assert!(mock::is_open(h));
-    }
     assert_eq!(mock::stray_closes(), 0);
 }
 

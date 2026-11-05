@@ -325,7 +325,7 @@ impl<'a> ClipList<'a> {
 /// A connection to the clipboard server — the `/dev/clipboard` session.
 ///
 /// Shaped like [`Desktop`](crate::desktop::Desktop): `resolve` or `new` for a client that closes
-/// its endpoint on drop, the raw `connect` and `from_endpoint` for one closed only by `close`.
+/// its endpoint on drop.
 #[cfg(feature = "io")]
 pub struct Clipboard<'a> {
     session: crate::session::Session<'a>,
@@ -392,37 +392,7 @@ impl<'a> Clipboard<'a> {
         Clipboard { session: crate::session::Session::new(endpoint, msg) }
     }
 
-    /// Resolve `/dev/clipboard` in `ns` and wrap the session it answers with.
-    ///
-    /// `buf` must be at least [`IPC_MSG_SIZE`](libkern::abi::IPC_MSG_SIZE) bytes. For callers not
-    /// yet on libos; the typed form is [`resolve`](Self::resolve).
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn connect(ns: u64, buf: &'a mut [u8]) -> Result<Clipboard<'a>, ClipError> {
-        if buf.len() < libkern::abi::IPC_MSG_SIZE {
-            return Err(ClipError::Protocol);
-        }
-        // SAFETY: the caller's own namespace handle, open for the call, as this has always asked.
-        let ns = unsafe {
-            libos::Ref::<libos::Namespace, libos::NsReadOnly>::from_raw(
-                libkern::RawHandle(ns),
-                libkern::Rights::empty(),
-            )
-        };
-        let endpoint = crate::session::connect(ns, "/dev/clipboard").map_err(ClipError::from)?;
-        Ok(Clipboard { session: crate::session::Session::raw(endpoint.into_raw().0, buf) })
-    }
-
-    /// Wrap an endpoint resolved elsewhere. Takes ownership: [`close`](Self::close) closes it. For
-    /// callers not yet on libos; the typed form is [`new`](Self::new).
-    // TODO(raw-handle-shims): goes when its last caller is on libos.
-    pub fn from_endpoint(endpoint: u64, buf: &'a mut [u8]) -> Result<Clipboard<'a>, ClipError> {
-        if buf.len() < libkern::abi::IPC_MSG_SIZE {
-            return Err(ClipError::Protocol);
-        }
-        Ok(Clipboard { session: crate::session::Session::raw(endpoint, buf) })
-    }
-
-    /// Close the session's endpoint, whichever way the client holds it.
+    /// Close the session's endpoint.
     pub fn close(self) {
         self.session.close();
     }
@@ -651,23 +621,13 @@ mod tests {
         }
 
         #[test]
-        fn a_missing_clipboard_is_a_transport_fault_and_a_raw_client_closes_only_by_close() {
+        fn a_missing_clipboard_is_a_transport_fault() {
             mock::reset();
-            let (ns, _peer) = service("/dev/clipboard");
-            let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
-            assert!(matches!(Clipboard::connect(0, &mut buf[..16]), Err(ClipError::Protocol)));
             let (other, _p) = service("/dev/other");
             assert_eq!(
                 Clipboard::resolve(other, &mut Msg::new()).err(),
                 Some(ClipError::Transport(libkern::KError::NotFound.as_i32()))
             );
-            let clip = Clipboard::connect(ns.raw().0, &mut buf).unwrap();
-            let open = mock::open_handles();
-            drop(clip);
-            assert_eq!(mock::open_handles(), open, "a raw client is closed by `close` alone");
-            let clip = Clipboard::connect(ns.raw().0, &mut buf).unwrap();
-            clip.close();
-            assert_eq!(mock::open_handles(), open);
             assert_eq!(mock::stray_closes(), 0);
         }
     }

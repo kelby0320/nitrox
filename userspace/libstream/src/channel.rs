@@ -132,7 +132,7 @@ impl<P: MsgPort> ChannelReceiver<P> {
 }
 
 #[cfg(feature = "io")]
-pub use self::io_port::IpcPort;
+pub use self::io_port::{IpcPort, IpcPortRef};
 #[cfg(feature = "io")]
 pub(crate) use self::io_port::{recv_msg, send_msg};
 
@@ -192,13 +192,6 @@ mod io_port {
         /// The endpoint this port sends and receives on.
         pub fn channel(&self) -> Ref<'_, Channel, Only> {
             self.end.as_ref()
-        }
-
-        /// The endpoint handle this port sends/receives on, still owned by whoever owned it. For
-        /// callers not yet on libos; the typed form is [`channel`](Self::channel).
-        // TODO(raw-handle-shims): goes when its last caller is on libos.
-        pub fn endpoint(&self) -> u64 {
-            self.channel().raw().0
         }
 
         /// As [`MsgPort::send`], giving up once the ring has stayed full to `deadline`: a message
@@ -271,6 +264,35 @@ mod io_port {
 
         fn recv(&mut self, out: &mut Vec<u8>) -> Result<bool> {
             self.recv_by(out, Deadline::NEVER).map(|last| last.unwrap_or(false))
+        }
+    }
+
+    /// An [`IpcPort`] over an endpoint its owner keeps: the port closes nothing, so a stream lent
+    /// for a write stays open after it.
+    pub struct IpcPortRef<'a> {
+        end: Ref<'a, Channel, Only>,
+        buf: Box<Msg>,
+    }
+
+    impl<'a> IpcPortRef<'a> {
+        /// A port on `end`, borrowed.
+        pub fn new(end: impl Into<Ref<'a, Channel, Only>>) -> Self {
+            IpcPortRef { end: end.into(), buf: Box::new(Msg::new()) }
+        }
+    }
+
+    impl MsgPort for IpcPortRef<'_> {
+        fn send(&mut self, payload: &[u8], last: bool) -> Result<()> {
+            self.buf.set(payload).map_err(|_| WireError::SinkFull)?;
+            self.buf.set_flags(if last { MSG_FLAG_LAST } else { 0 });
+            send_msg(self.end, &self.buf, &mut Carried::new(), Deadline::NEVER)
+        }
+
+        fn recv(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+            // Whatever handles the message brought close as they drop: a frame carries none.
+            recv_msg(self.end, &mut self.buf, Deadline::NEVER)?;
+            out.extend_from_slice(self.buf.payload());
+            Ok(self.buf.flags() & MSG_FLAG_LAST != 0)
         }
     }
 }

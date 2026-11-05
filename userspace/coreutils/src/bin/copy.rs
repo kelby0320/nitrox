@@ -28,11 +28,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libfs::{FileError, TreeError};
 use libkern::abi::IPC_PAYLOAD_SIZE;
-use libkern::{exit, kprint};
-use libstream::channel::{ChannelSink, IpcPort};
+use libos::boot::Start;
+use libos::exit;
+use libos::log;
+use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
@@ -59,8 +61,10 @@ struct Copied {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    let stage = Stage::enter(notif, ns, endpoint, arg0);
+pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
+    // SAFETY: the kernel's bootstrap registers, read once, here.
+    let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
+    let stage = Stage::enter(start);
 
     let args = match parse(&stage.argv, &[FORCE]) {
         Ok(a) => a,
@@ -78,9 +82,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     let force = args.has("force");
     let (sources, dest) = args.operands.split_at(args.operands.len() - 1);
-    let dest_owned = stage.path(dest[0].as_bytes());
-    let dest = dest_owned.as_slice();
-    let dest_is_dir = libfs::is_dir(stage.namespace, dest);
+    let dest = stage.path(dest[0].as_bytes());
+    let dest_is_dir = libfs::is_directory(&stage.namespace, &dest);
 
     // With a file destination, several sources would each overwrite the last.
     if sources.len() > 1 && !dest_is_dir {
@@ -89,22 +92,18 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     let mut done: Vec<Copied> = Vec::new();
     for source in sources {
-        let src_owned = stage.path(source.as_bytes());
-        let src = src_owned.as_slice();
+        let src = stage.path(source.as_bytes());
         // Into an existing directory a source keeps its name; otherwise `dest` names the copy.
-        let target = if dest_is_dir {
-            libfs::join(dest, libfs::basename(src))
-        } else {
-            String::from_utf8_lossy(dest).into_owned()
-        };
-        if target.as_bytes() == src {
+        let target =
+            if dest_is_dir { libfs::join(dest.as_bytes(), libfs::basename(src.as_bytes())) } else { dest.clone() };
+        if target == src {
             stage.die(b"copy: source and destination are the same file\n", EXIT_USAGE);
         }
-        copy_any(&stage, src, target.as_bytes(), force, &mut done);
+        copy_any(&stage, &src, &target, force, &mut done);
     }
 
-    match stage.streams.stdout {
-        Some(h) => emit(&stage, h, &done),
+    match stage.stdout() {
+        Some(port) => emit(&stage, port, &done),
         None => {
             for c in &done {
                 report_text(c);
@@ -115,15 +114,11 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 }
 
 /// Copy `src` to `dst` — a file, or a directory and everything under it — with
-/// [`libfs::copy_tree`], shared with `move`; what stays here is one row per file and the message
+/// [`libfs::copy_recursive`], shared with `move`; what stays here is one row per file and the message
 /// each failure earns.
-fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<Copied>) {
-    let r = libfs::copy_tree(stage.namespace, src, dst, force, &mut |s, d, bytes| {
-        done.push(Copied {
-            source: String::from_utf8_lossy(s).into_owned(),
-            destination: String::from_utf8_lossy(d).into_owned(),
-            bytes,
-        });
+fn copy_any(stage: &Stage, src: &str, dst: &str, force: bool, done: &mut Vec<Copied>) {
+    let r = libfs::copy_recursive(&stage.namespace, src, dst, force, &mut |s, d, bytes| {
+        done.push(Copied { source: String::from(s), destination: String::from(d), bytes });
     });
     // A partial copy is reported by the rows already emitted, and the run fails.
     match r {
@@ -141,13 +136,13 @@ fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<C
 
 /// Write the report as a TSM1 table on `stdout`. As in `list`, a closed consumer is a
 /// clean end, not a failure.
-fn emit(stage: &Stage, stdout: u64, done: &[Copied]) {
+fn emit(stage: &Stage, stdout: Port<'_>, done: &[Copied]) {
     let schema = Schema::new()
         .field("source", TypeTag::String, TypeModifiers::NONE)
         .field("destination", TypeTag::String, TypeModifiers::NONE)
         .field("bytes", TypeTag::Int, TypeModifiers::NONE);
 
-    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
+    let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for c in done {
             tw.write_row(&[
@@ -172,14 +167,14 @@ fn report_text(c: &Copied) {
     line.push_str(" -> ");
     line.push_str(&c.destination);
     line.push('\n');
-    kprint(line.as_bytes());
+    log::write(line.as_bytes());
 }
 
-fn describe(src: &[u8], dst: &[u8], e: FileError) -> String {
+fn describe(src: &str, dst: &str, e: FileError) -> String {
     let mut s = String::from("copy: ");
-    s.push_str(&String::from_utf8_lossy(src));
+    s.push_str(src);
     s.push_str(" -> ");
-    s.push_str(&String::from_utf8_lossy(dst));
+    s.push_str(dst);
     s.push_str(match e {
         FileError::NotFound => ": source not found\n",
         FileError::Exists => ": destination exists (use --force)\n",
@@ -197,6 +192,6 @@ fn describe(src: &[u8], dst: &[u8], e: FileError) -> String {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    kprint(b"copy: panic\n");
+    log::write(b"copy: panic\n");
     exit(EXIT_FAILURE);
 }

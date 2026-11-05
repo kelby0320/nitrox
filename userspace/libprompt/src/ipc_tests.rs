@@ -70,21 +70,9 @@ fn a_message_that_does_not_fit_is_refused_and_keeps_its_handles() {
     let (c, _d) = End::pair(2).unwrap();
     let c = c.into_raw().0;
     let body = vec![b'x'; RS_MAX_BODY + 1];
-    assert!(!send(a.raw().0, 1, 1, &body, &[c]));
+    let mut held = carrying(c);
+    assert!(!transmit(a.as_ref(), 1, 1, &body, &mut held));
     assert!(is_open(c) && receive(&b).unwrap().is_none(), "nothing sent, nothing lost");
-}
-
-/// More handles than a message carries is refused before the kernel, every one still the caller's.
-#[test]
-fn a_send_of_more_handles_than_a_message_carries_keeps_them_all() {
-    let (a, b) = pair();
-    let ends: Vec<_> = (0..=libkern::IPC_HANDLE_MAX).map(|_| End::pair(2).unwrap()).collect();
-    let raw: Vec<u64> = ends.iter().map(|(c, _)| c.raw().0).collect();
-    assert!(!send(a.raw().0, 1, 1, b"", &raw));
-    assert!(raw.iter().all(|&h| is_open(h)), "none closed by the shim");
-    assert_eq!(b.recv(&mut WireMsg::new()).err().unwrap().code(), libkern::KError::WouldBlock, "and none sent");
-    drop(ends);
-    assert_eq!(mock::stray_closes(), 0);
 }
 
 #[test]
@@ -92,13 +80,16 @@ fn a_send_moves_its_handles_and_a_refused_one_hands_them_back() {
     let (a, b) = pair();
     let (c, _d) = End::pair(2).unwrap();
     let c = c.into_raw().0;
-    assert!(send(a.raw().0, 1, 1, b"", &[c]));
+    assert!(transmit(a.as_ref(), 1, 1, b"", &mut carrying(c)));
     assert!(!is_open(c), "the kernel took it");
     let (e, _f) = End::pair(2).unwrap();
     let e = e.into_raw().0;
     drop(b);
-    assert!(!send(a.raw().0, 1, 1, b"", &[e]), "the peer has gone");
-    assert!(is_open(e), "still the caller's, not closed by the shim");
+    let mut held = carrying(e);
+    assert!(!transmit(a.as_ref(), 1, 1, b"", &mut held), "the peer has gone");
+    assert!(is_open(e), "still the caller's, not closed by the send");
+    drop(held);
+    assert!(!is_open(e));
     assert_eq!(mock::stray_closes(), 0);
 }
 
@@ -109,10 +100,9 @@ fn a_receive_says_nothing_queued_peer_gone_or_not_ours() {
     b.send(&WireMsg::new(), &mut Carried::new()).unwrap();
     assert_eq!(receive(&a).unwrap(), None, "bytes that are no envelope");
     put(&b, 9, 4, RS_FLAG_ERROR, b"no");
-    assert_eq!(recv(a.raw().0), Ok(Some((9, 4, true, b"no".to_vec()))));
+    assert_eq!(receive(&a).unwrap(), Some((9, 4, true, b"no".to_vec())));
     drop(b);
     assert_eq!(receive(&a).err().unwrap().code(), libkern::KError::PeerClosed);
-    assert_eq!(recv(a.raw().0), Err(()));
 }
 
 #[test]
@@ -120,44 +110,44 @@ fn a_reply_is_found_among_others_and_a_gone_peer_ends_the_wait() {
     let (a, b) = pair();
     put(&b, 1, 2, 0, b"other");
     put(&b, 1, 7, RS_FLAG_ERROR, b"mine");
-    assert_eq!(call(a.raw().0, 3, 7, b"q", &[]), Some((true, b"mine".to_vec())));
+    assert_eq!(call_on(&a, 3, 7, b"q", &mut Carried::new()), Some((true, b"mine".to_vec())));
     assert_eq!(got(&b), (3, 7, b"q".to_vec()));
     drop(b);
-    assert_eq!(answer(a.raw().0, 7, u64::MAX), None);
+    assert_eq!(answer_on(&a, 7, Deadline::NEVER), None);
 }
 
 #[test]
 fn a_wait_past_its_deadline_gives_up() {
     let (a, _b) = pair();
-    assert_eq!(answer(a.raw().0, 7, 1), None);
-    assert_eq!(wait_until(&[a.raw().0], 1), None);
+    assert_eq!(answer_on(&a, 7, Deadline::at(1)), None);
+    let mut set = WaitSet::<1>::new();
+    set.add(&a).unwrap();
+    assert_eq!(ready(&set, Deadline::at(1)), None);
 }
 
 #[test]
-fn a_wait_names_the_handle_that_is_ready_and_holds_to_four() {
-    let (a, b) = pair();
+fn a_wait_names_the_handle_that_is_ready() {
+    let (a, _b) = pair();
     let (c, d) = End::pair(4).unwrap();
     d.send(&WireMsg::new(), &mut Carried::new()).unwrap();
-    assert_eq!(wait(&[a.raw().0, c.raw().0]), Some(1));
-    let five = [a.raw().0, c.raw().0, b.raw().0, d.raw().0, 99];
-    assert_eq!(wait(&five), None);
+    let mut set = WaitSet::<2>::new();
+    set.add(&a).unwrap();
+    set.add(&c).unwrap();
+    assert_eq!(ready(&set, Deadline::NEVER), Some(1));
 }
 
 #[test]
-fn a_lookup_gives_the_endpoint_or_zero() {
+fn a_lookup_gives_the_endpoint_or_nothing() {
     mock::reset();
     let (ns, _peer) = mock::answering("/sys/broker");
-    let h = lookup(ns, b"/sys/broker", Rights::SEND.bits());
-    assert!(h != 0 && is_open(h));
-    assert_eq!(lookup(ns, b"/sys/other", Rights::SEND.bits()), 0);
-    assert_eq!(lookup(ns, b"/sys/\xff", Rights::SEND.bits()), 0);
     // SAFETY: the mock's handle, open for the test.
     let ns = unsafe { Ref::<libos::Namespace, libos::NsReadOnly>::from_raw(RawHandle(ns), Rights::LOOKUP) };
-    assert!(lookup_in(ns, "/sys/broker", Rights::SEND).is_some());
+    let h = lookup_in(ns, "/sys/broker", Rights::SEND).unwrap();
+    let raw = h.raw().0;
+    assert!(is_open(raw));
     assert!(lookup_in(ns, "/sys/other", Rights::SEND).is_none());
-    close(h);
-    assert!(!is_open(h));
-    close(0);
+    drop(h);
+    assert!(!is_open(raw));
 }
 
 #[test]
@@ -182,7 +172,7 @@ fn a_line_is_read_with_echo_on_and_a_refusal_or_interrupt_is_none() {
     for body in [&b""[..], b"", b"alice"] {
         put(&b, 0, 1, 0, body);
     }
-    assert_eq!(ask_line(a.raw().0, b"user: "), Some(b"alice".to_vec()));
+    assert_eq!(ask_line_on(&a, b"user: "), Some(b"alice".to_vec()));
 
     let (a, b) = pair();
     put(&b, 0, 1, 0, b"");
@@ -197,7 +187,7 @@ fn a_line_is_read_with_echo_on_and_a_refusal_or_interrupt_is_none() {
     put(&b, 0, 1, 0, b"never");
     ack(&b);
     ack(&b);
-    assert_eq!(ask_password(a.raw().0, b"pw: "), None, "Ctrl-C is never mind, whatever was typed");
+    assert_eq!(ask_password_on(&a, b"pw: "), None, "Ctrl-C is never mind, whatever was typed");
 
     let (a, b) = pair();
     drop(b);
@@ -213,7 +203,7 @@ fn a_new_password_is_asked_twice_and_must_match() {
         }
     }
     let mut seen = vec![];
-    let got = ask_new_password_then(a.raw().0, b"new: ", &mut |n| seen.push(n));
+    let got = ask_new_password_then_on(&a, b"new: ", &mut |n| seen.push(n));
     assert_eq!(got, Ok(b"hunter2".to_vec()));
     assert_eq!(seen, [1, 2]);
 
@@ -224,6 +214,15 @@ fn a_new_password_is_asked_twice_and_must_match() {
         }
     }
     assert_eq!(ask_new_password_on(&a, b"new: "), Err(NewPassword::Mismatch));
+}
+
+/// The raw handle `h`, owned and open, as a handle in flight.
+fn carrying(h: u64) -> Carried {
+    let mut held = Carried::new();
+    // SAFETY: `h` is an open channel endpoint this test owns, handed over here.
+    let h = unsafe { Handle::<Channel, Only>::from_raw(RawHandle(h), Rights::empty()) };
+    assert!(held.push(h).is_ok());
+    held
 }
 
 fn is_open(h: u64) -> bool {

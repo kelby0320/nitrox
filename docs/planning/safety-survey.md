@@ -3350,7 +3350,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   safe. `from_raw` stays `unsafe` for its ownership claim, as `std`'s `OwnedFd` is. The 17 sites
   moved with it.
 
-- [ ] **rt-o9** remove: local re-implementations of `kprint` and `exit` over raw
+- [x] **rt-o9** remove: local re-implementations of `kprint` and `exit` over raw
   `SYS_DEBUG_KPRINT` / `SYS_PROCESS_EXIT` although `libkern::debug::{kprint, exit}` exist (`exit` is
   `-> !` via noreturn asm) — 24 sites (`grep -rnE
   "syscall[0-6]\(\s*(libkern::)?(syscall::)?SYS_DEBUG_KPRINT\b" --include=*.rs userspace | grep -v
@@ -3361,8 +3361,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `libkern::kprint_u64` or `debug::Line`. Home: libkern::debug (already there). Closes: nothing
   new; removes 24 unsafe blocks and the spin-after-exit loops that paper over a non-diverging
   `syscall1`. Depends on: nothing. abi. Value low, effort small. **Plan**, in P7.
+  Done in `fbc06f2c` (heartbeat) and `5f4d535b` (desktop-shell), session-mgr's in E.3: no local
+  `kprint` or `exit` over a raw call is left outside libkern and libos.
 
-- [ ] **rt-o10** remove: `static mut` buffers in hello and heartbeat used as syscall out-params and
+- [x] **rt-o10** remove: `static mut` buffers in hello and heartbeat used as syscall out-params and
   receive buffers, with the `unsafe` `channel_recv_raw` used where the safe `channel_recv` with
   a stack buffer would do — 19 sites (`grep -rnw "static mut" userspace/hello/src
   userspace/heartbeat/src` = 12, hello 8 and heartbeat 4; `grep -rn "channel_recv_raw("` = 5, hello
@@ -3378,6 +3380,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   either program grows a second thread (`thread_create` is one call away). Depends on: rt-o1
   for the CLOCK/STAT statics to lose their remaining `unsafe` and not just the `static`.
   soundness, opportunities. Value low, effort small. **Plan**, in P7.
+  Done in `85ee3900` (hello) and `fbc06f2c` (heartbeat): neither keeps a `static mut`, and hello's
+  steps go through libos, its unmap's answer through `Mapping::unmap`.
 
 - [x] **rt-o11** narrow: 6 of libos's 13 `cfg(not(test))` seam functions in `sys.rs` are safe but
   take an address as `u64` or rely on an unchecked length: `wait` (`results.len() >=
@@ -4146,7 +4150,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Opportunities**
 
-- [ ] **sec-o1** encapsulate: raw u64 handles closed by hand on every exit path, and structs of
+- [x] **sec-o1** encapsulate: raw u64 handles closed by hand on every exit path, and structs of
   handles that hold ownership only by comment — 69 sites (`grep -nE
   "SYS_HANDLE_CLOSE|(^|[^a-z_.])close\([a-z_*]|\.close\(\)"` over auth-service/src/main.rs,
   view-broker/src/main.rs, session-mgr/src/main.rs, libsession/src/lib.rs,
@@ -4166,6 +4170,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   after the move. Depends on: libos gaining Channel and File types, and lifting the 'no libos'
   rule in userspace/session-mgr/CLAUDE.md (which libsession follows), or the libkern variant.
   ownership, soundness, opportunities. Value high, effort large. **Plan**, as sup-o2, in P7.
+  Done in `2b7276db`: `libviews`' `Handed` owns its handles and is not `Copy`. With the servers in
+  E.3 and the libraries in E.2, no handle in the six files is closed by hand, bar the bodies of
+  libprompt's raw shims, which go with the test harness's move (E.5).
 - [x] **sec-o2** encapsulate: message I/O through `static mut` 4 KiB buffers, with the IpcMsg
   header (`payload_len` at 4..8, `handle_count` at 8) stamped by hand, a `from_raw_parts`
   payload view clamped to `MSG_LEN - PAYLOAD_OFF` (4072, not `IPC_PAYLOAD_SIZE` 4008), a raw
@@ -5406,7 +5413,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `at_most_one_thread_reports_a_title_truncated` passes under Miri, which reports a data race on
   the old `static mut`.
 
-- [ ] **desk-d17** `userspace/compositor/src/main.rs:159` — `BufferSource::pixels` builds a `&[u8]`
+- [x] **desk-d17** `userspace/compositor/src/main.rs:159` — `BufferSource::pixels` builds a `&[u8]`
   over a mapping the client holds read-write (libsurface maps `MAP_READ|MAP_WRITE`,
   buffers.rs:170), and `do_capture` (:1244) makes a `&mut [u8]` over the manager's object. A
   reference promises that nothing writes the bytes while it lives, and the other process can break
@@ -5416,6 +5423,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: cross-process, so no host test or Miri reaches it. A copy-only reader (`ptr::copy`
   or volatile loads) behind a Mapping type (see desk-o5) would settle it. soundness,
   opportunities. Low. **Plan**, in P7.
+  Done in `b40773d7`, `04dd7581` and `b643fbc4`: a client's buffer is read through
+  `libdraw::pixels::Pixels::Shared`, a piece copied out at a time, and a capture scales from it into
+  a `Vec` copied into the manager's object, so no reference is formed over either.
 
 **Opportunities**
 
@@ -5441,7 +5451,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   linked through libsurface and libdraw, so that rule needs a decision. abi, ownership,
   soundness, opportunities. Value high, effort large. **Plan**, as sup-o2, in P7.
 
-- [ ] **desk-o2** encapsulate: IPC messages as raw `static mut [u8; 4096]` buffers, framed by hand
+- [x] **desk-o2** encapsulate: IPC messages as raw `static mut [u8; 4096]` buffers, framed by hand
   (payload_len read at [4..8], slices via `from_raw_parts(base+24, len.min(4096-24))`, headers
   stamped at [4..8] and [8], raw `SYS_CHANNEL_SEND`) — 30 to 45 sites, counted by `grep -rnE
   'from_le_bytes\(\[[A-Za-z_.]+\[4\]'` (16 receive parses), `grep -rnE
@@ -5465,8 +5475,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   nothing (the 8 MiB stack is decided; the "32 KiB stack" comments are stale); moving handles in
   a send waits for desk-o1. abi, ownership, soundness, opportunities. Value high, effort medium.
   **Plan**, as rt-o5, in P7.
+  Done in `b643fbc4` (compositor) and `b40b7979` (nxterm), clipboard-server's and input-server's in
+  E.3: every message is a libos `Msg`.
 
-- [ ] **desk-o3** encapsulate: `sys_wait` called by hand over `static mut WAIT_HANDLES` and
+- [x] **desk-o3** encapsulate: `sys_wait` called by hand over `static mut WAIT_HANDLES` and
   `WAIT_RESULTS`, with 24-byte `IoResult` records decoded by byte offset and the result buffer
   sized by a comment — 17 to 21 sites, counted by `grep -rn 'SYS_WAIT,' --include=*.rs <the 13
   crates> | wc -l` (21 hits, 17 to 18 calls once import lines are removed), over 12 wait-array
@@ -5484,6 +5496,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   static); a wait set over the kernel limit (desk-d11, nxterm's `Full` becomes "no more tabs"
   instead of exit). Depends on: nothing. abi, ownership, soundness, opportunities. Value high,
   effort medium. **Plan**, as rt-o2, in P7.
+  Done in `b643fbc4`, `b40b7979`, `e1c8549f` (nxfiles) and `5f4d535b`, input-server's and clipboard-
+  server's in E.3: every wait is a `WaitSet`.
 
 - [ ] **desk-o4** narrow: `unsafe fn`s whose only contract is "root_ns must be a live namespace
   handle". A stale handle fails the generation check and returns InvalidHandle, so the contract
@@ -5565,7 +5579,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Finished in `d188a633`, by the implementer. `libkern` gains `channel_create` and
   `clock_read`, used by the desktop's crates; the others' helpers move with P7.
 
-- [ ] **desk-o8** encapsulate: server state kept in `static mut` tables whose "nothing else holds
+- [x] **desk-o8** encapsulate: server state kept in `static mut` tables whose "nothing else holds
   it" claim rests on call order — 10 statics (SESSION_CH and MANAGER_CH in the compositor;
   DESKTOP_SERVE, DESKTOP_SESSIONS, SHELL_NOTIF, NOTIF and SPAWN_APP in desktop-shell; RING,
   SESSION_CH and REPLY_BODY in clipboard-server), 62 uses, counted by `grep -nE
@@ -5578,6 +5592,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   In each server binary. Closes: a table or buffer aliased across a call that changes it,
   prevented today only by single-threading and call order. Depends on: desk-o2 (the receive and
   reply buffers move with this state). soundness. Value medium, effort medium. **Plan**, in P7.
+  Done in `b643fbc4` and `5f4d535b`, clipboard-server's in E.3: the tables are fields of each
+  server's own struct.
 
 - [ ] **desk-o9** encapsulate: the compositor keeps a buffer's geometry in `WindowStack` and its
   mapping in a second table (`Server.buffers`), kept in step by hand-placed retains — 4 sites
@@ -5591,7 +5607,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   held today only by two length checks. Depends on: desk-o5. ownership. Value medium, effort
   medium. **Plan**, in P7.
 
-- [ ] **desk-o10** remove: the namespace lookup's wait-and-decode copied into three crates, the
+- [x] **desk-o10** remove: the namespace lookup's wait-and-decode copied into three crates, the
   copy-paste libos was built to replace — 3 sites (`grep -rnE
   'syscall[0-9]\((libkern::)?SYS_NS_LOOKUP'`), `userspace/input-server/src/main.rs:236` (lookup +
   `wait_one` + `po_completion`), `userspace/nxterm/src/backend.rs:84` (`ns_lookup` + `po_wait`),
@@ -5602,8 +5618,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the last wait did not write, and PO handles each copy must remember to close. Depends on:
   nothing; a safe lookup (desk-o4) removes the remaining unsafe. opportunities. Value medium,
   effort small. **Plan**, in P7.
+  Done in `b40b7979` and `5f4d535b`, input-server's in E.3: each is `block_on(ns.lookup(..))`, a
+  refusal read from the error's code.
 
-- [ ] **desk-o11** narrow: a transferred handle taken out of `Received` before the code knows it
+- [x] **desk-o11** narrow: a transferred handle taken out of `Received` before the code knows it
   will keep it, then closed by hand on each branch — 2 sites: compositor `handle_session_request`
   takes handle 0 unconditionally (main.rs:1702) and closes it at 6 sites (`grep -n 'if handle !=
   0' userspace/compositor/src/main.rs`: 1713, 1752, 1803, 1842, 1885, 1922), and input-server
@@ -5615,8 +5633,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   before `dispatch` that forgets the close, leaking one client-supplied handle per request (the
   class b4cc3a39 fixed by hand). Depends on: nothing (desk-o1 would make it structural).
   opportunities. Value medium, effort small. **Plan**, in P7.
+  Done in `b643fbc4`: the compositor takes a handle only for the op that keeps it, an attach's
+  buffer or a capture's object, and the rest close as the message's `Carried` drops; input-server's
+  in E.3.
 
-- [ ] **desk-o12** remove: raw syscalls that have, or need only, a one-line safe wrapper — 24
+- [x] **desk-o12** remove: raw syscalls that have, or need only, a one-line safe wrapper — 24
   sites, counted by `grep -rnE
   'syscall[0-9]\((libkern::)?SYS_(DEBUG_KPRINT|PROCESS_EXIT|TEST_EXIT|CLOCK_READ|NS_ENUMERATE|HANDLE_STAT)'`:
   DEBUG_KPRINT 3 and PROCESS_EXIT 8 (clipboard, desktop-shell and dsm redefine `libkern::kprint`
@@ -5628,6 +5649,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `test_exit(ok)` in libkern (`debug.rs`, a clock fn) and `stat` in libos. Closes: duplicated
   wrappers drifting apart, such as the three exit loops that spin if the syscall returns.
   Depends on: nothing. opportunities. Value low, effort small. **Plan**, as rt-o9, in P7.
+  Done in `5f4d535b`, clipboard-server's and desktop-session-mgr's in E.3: none defines a raw
+  `kprint`, `exit`, clock read or test exit.
 
 What held up:
 - **Receive sizing.** The desktop-session-mgr 256-byte class cannot recur. All 18 receives (15
@@ -5873,7 +5896,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Opportunities**
 
-- [ ] **sh-o1** encapsulate: raw u64 handles closed by hand on every path, and a received handle
+- [x] **sh-o1** encapsulate: raw u64 handles closed by hand on every path, and a received handle
   taken as whatever the server assumes — 54 sites (`grep -rn 'SYS_HANDLE_CLOSE,'` over
   userspace/{nxsh,coreutils,tty-server,eshell,nxinstall,profile-server}/src, minus imports:
   nxsh 15, tty-server 12, coreutils 12, eshell 6, profile-server 5, nxinstall 4), such as
@@ -5890,7 +5913,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   handle that already moved (sh-d10). Depends on: libos gaining the wrappers above; eshell is
   excluded by its CLAUDE.md (6 sites). abi, ownership, soundness, opportunities. Value high,
   effort large. **Plan**, as sup-o2, in P7.
-- [ ] **sh-o2** encapsulate: rsproto messages sent and received by hand through `static mut
+  Done in `15ef092b` (nxsh), `09af4a13` (coreutils) and `3ba7b37b` (nxinstall), tty-server's and
+  profile-server's in E.3: every handle is a libos `Handle`. eshell's six stay, as the item has it.
+- [x] **sh-o2** encapsulate: rsproto messages sent and received by hand through `static mut
   [u8; 4096]` (encode at [24..], payload_len stamped at [4..8], handle_count at [8], handles in
   a second static, raw SYS_CHANNEL_SEND; receive then `from_raw_parts(MSG + 24,
   len.min(4096 - 24))` with an unbounded lifetime) — 22 sites (13 sends: `grep -rn
@@ -5911,6 +5936,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   where the kernel refuses past 4008), and moved handles stranded by a refused reply (sh-d13).
   Removes 22 unsafe blocks and 9 statics. Depends on: nothing. abi, ownership, soundness,
   opportunities. Value high, effort medium. **Plan**, as rt-o5, in P7.
+  Done in `15ef092b` and `3ba7b37b`, tty-server's and profile-server's in E.3: every message is a
+  `Msg`.
 - [ ] **sh-o3** encapsulate: raw SYS_WAIT into hand-sized buffers, IoResult decoded by byte offset
   (handle @0, status @8, result @16), and PendingOperation lifecycles with private po_wait copies
   — 13 call sites (`grep -rn "syscall4(SYS_WAIT\|SYS_WAIT," userspace/{nxsh,coreutils,tty-server,
@@ -5947,7 +5974,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   ownership, abi, opportunities. Value high, effort medium. **Fix.**
   Fixed in `2991d0dc`: `nxsh::pipeline::Pipeline`, in the library half behind `pipeline::Sys` so it
   is host-tested; the binary's `Sys` is src/stages.rs.
-- [ ] **sh-o5** encapsulate: map, `from_raw_parts` slice, then unmap (or forget to), with the
+- [x] **sh-o5** encapsulate: map, `from_raw_parts` slice, then unmap (or forget to), with the
   mapped, read and object lengths chosen separately — 11 sites (`grep -rn 'SYS_MEMORY_MAP,'` gives
   12, 9 of them file reads and 1 a mapped write; `grep -rn from_raw_parts` gives 21, 11 over
   mappings), such as `userspace/nxsh/src/main.rs:459`, `userspace/nxsh/src/stage.rs:102`,
@@ -5961,6 +5988,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   devices), size-0 unmaps (sh-d9) and a manifest cut at a page (sh-d7). Depends on: sh-o1, for
   `&Handle`; eshell keeps its 2 sites. ownership, soundness, opportunities. Value medium, effort
   medium. **Plan**, as rt-o3, in P7.
+  Done in `15ef092b` and `09af4a13`, profile-server's in E.3: each map is a `Mapping`, read by
+  copying. eshell keeps its two.
 - [x] **sh-o6** remove: nxsh's own file I/O and lookup helpers duplicate libfs, already a
   dependency — 3 helpers, 15 unsafe blocks (`awk 'NR>=437 && NR<=508 && /unsafe/'` gives 11,
   `NR>=747 && NR<=783` gives 4; `grep -n "SYS_MEMORY_MAP,\|SYS_FILE_CREATE,\|syscall4(SYS_NS_LOOKUP"`
@@ -5984,7 +6013,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   unchecked `unsafe fn from_raw`. Closes: a client-supplied handle of the wrong type or rights
   poisoning a server's wait set (sh-d1). Depends on: sh-o1's Channel type. ownership,
   opportunities. Value medium, effort small. **Plan**, in P7.
-- [ ] **sh-o8** remove: `static mut` used only as a syscall out-parameter, argument block or
+- [x] **sh-o8** remove: `static mut` used only as a syscall out-parameter, argument block or
   per-call scratch, where a local does the job — 12 sites (`grep -rn 'static mut'` gives 45;
   CLOCK_BUF in sleep.rs and date.rs, CTRL_OUT0/1 in tty-server and profile-server, NOTIF/NOTIF_BUF
   in nxsh, with.rs and coreutils stage.rs, SPAWN in nxsh, FRONT/BACK in nxinstall; ownership
@@ -5995,6 +6024,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   FRONT_BYTES array on the stack). Home: each binary. Closes: two live `&mut` to one static in
   nxinstall and about 20 unsafe blocks that only reach the statics. Depends on: nothing. abi,
   ownership, soundness, opportunities. Value low, effort small. **Plan**, in P7.
+  Done in `15ef092b`, `09af4a13` and `3ba7b37b`, tty-server's and profile-server's in E.3: no such
+  `static mut` is left, and nxinstall's partition tables are `Vec`s.
 - [x] **sh-o9** remove: profile-server keeps its state in `static mut` (INDEX, SESSION_CH,
   SESSION_DIR, PENDING_DIR) and reborrows the index as `&'static [Entry]` — 4 sites
   (`grep -n '^static mut \(INDEX\|SESSION_\|PENDING_DIR\)'`), at
@@ -6008,14 +6039,17 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Done in `08a73e02` (profile-server): `Server` holds the index and a `[Option<Session>;
   MAX_SESSIONS]` and is passed as `&mut`; there is no `static mut`, and a forwarded resolve returns
   `Resolved::Dir` instead of leaving a pending directory in a static.
-- [ ] **sh-o10** encapsulate: `librsproto::session::Dir` is closed by an explicit `close(self)`
+- [x] **sh-o10** encapsulate: `librsproto::session::Dir` is closed by an explicit `close(self)`
   with no Drop — 4 sites in the subsystem (`grep -rn 'Dir::open'`; 4 more in libfs), at
   `userspace/nxsh/src/main.rs:528`, `userspace/coreutils/src/bin/mkdir.rs:134`,
   `userspace/profile-server/src/main.rs:204`. `impl Drop for Dir` closing the endpoint, with
   `close(self)` kept as an early release. Home: librsproto session.rs. Closes: a session endpoint
   leaked by an early return between open and close; none found today. Depends on: nothing.
   ownership. Value low, effort small. **Plan**, as sup-o2, in P7.
-- [ ] **sh-o11** encapsulate: a coreutil opens a one-shot service session with
+  Done by E.2's `Dir::resolve`, which owns its endpoint and closes it on drop; the subsystem's sites
+  use it since `15ef092b` and `09af4a13`, and the raw `Dir::open`, closed only by `close`, is the
+  test harness's (E.5).
+- [x] **sh-o11** encapsulate: a coreutil opens a one-shot service session with
   `libfs::lookup_wait(DIR_SESSION_RIGHTS)`, calls round_trip and closes the endpoint with a raw
   syscall — 4 sites (`grep -rn 'round_trip(session' userspace/coreutils/src/bin`), at
   `userspace/coreutils/src/bin/service.rs:216`, `userspace/coreutils/src/bin/shutdown.rs:85`,
@@ -6024,6 +6058,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   distinct) and `ask(&mut self, buf, op, body) -> Result<usize, WireError>`. Home: librsproto
   session. Closes: a session endpoint leaked on an early return; removes 4 unsafe blocks.
   Depends on: nothing. opportunities. Value low, effort small. **Plan**, in P7.
+  Done in `09af4a13`: each one-shot session is a typed lookup and `librsproto::session::exchange`,
+  its endpoint closed as it drops.
 - [ ] **sh-o12** remove: raw operations where core or the type already offers a safe one — 3
   sites (the inventory's only asm, its only `unsafe fn`, and a raw slice over a local struct
   field), at `userspace/eshell/src/main.rs:367`, `userspace/nxsh/src/main.rs:1175`,

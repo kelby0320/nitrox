@@ -19,13 +19,13 @@ mod namespace;
 mod testing;
 
 use core::sync::atomic::{AtomicBool, Ordering};
-use libkern::{KError, KIND_TERMINATE_REQUESTED, RawHandle, Rights};
-use libos::{CanLookup, Handle, Namespace, Notify, NsReadOnly, Only, ReadOnly, Ref, Resource, block_on};
+use libkern::{KIND_TERMINATE_REQUESTED, Rights};
+use libos::{CanLookup, Handle, Namespace, Notify, Only, Ref, block_on};
 
 pub use auth::{authenticate, authenticate_on, close_views_session, open_views_session, views_open_session};
 pub use blocks::{share_block_devices, withdraw_block_devices};
-pub use leader::{run_leader, spawn_leader};
-pub use namespace::{Bound, Built, Constructed, Members, NamespaceSpec, build, build_namespace};
+pub use leader::run_leader;
+pub use namespace::{Bound, Constructed, Members, build_namespace};
 
 /// Whether a terminate request has reached this process; set by the leader's wait and the drain.
 static STOP_ASKED: AtomicBool = AtomicBool::new(false);
@@ -60,19 +60,6 @@ pub fn resolve<'a, T, M2, M: CanLookup + 'a>(
     block_on(ns.into().lookup(path, rights))
 }
 
-/// [`resolve`] in a raw `ns` the caller keeps open: `(status, handle)`, the handle the caller's to
-/// close. For callers not yet on libos; the typed form is [`resolve`].
-// TODO(raw-handle-shims): goes when its last caller is on libos.
-pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
-    let Ok(path) = core::str::from_utf8(path) else { return (KError::InvalidArgument as i32, 0) };
-    // SAFETY: the caller's own namespace, open for the call, as the function always asked.
-    let ns = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(RawHandle(ns), Rights::empty()) };
-    match resolve::<Resource, ReadOnly, _>(ns, path, Rights::from_bits(rights)) {
-        Ok(h) => (0, h.into_raw().0),
-        Err(e) => (e.code() as i32, 0),
-    }
-}
-
 /// The user's home *as seen from inside the session*; the outside path is not nameable.
 const SESSION_HOME: &str = "/home";
 
@@ -93,12 +80,6 @@ pub fn session_env() -> libstream::wire::Record {
             Value::List(alloc::sync::Arc::from(path)),
         ],
     }
-}
-
-/// Borrow a raw handle as a `Ref`, `None` for the `0` a caller gives for a member it does not bind.
-fn borrow<'a, T, M>(raw: u64) -> Option<Ref<'a, T, M>> {
-    // SAFETY: the caller's own handle, open for the call, as the raw functions have always asked.
-    (raw != 0).then(|| unsafe { Ref::from_raw(RawHandle(raw), Rights::empty()) })
 }
 
 #[cfg(test)]

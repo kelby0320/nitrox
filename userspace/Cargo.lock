@@ -80,6 +80,7 @@ dependencies = [
  "libgpt",
  "libheap",
  "libkern",
+ "libos",
  "libprompt",
  "librsproto",
  "libstream",
@@ -112,6 +113,7 @@ dependencies = [
  "libfs",
  "libheap",
  "libkern",
+ "libos",
  "libprompt",
  "librsproto",
  "libsession",
@@ -165,14 +167,8 @@ dependencies = [
  "libheap",
  "libkern",
  "liblog",
+ "libos",
  "libstream",
-]
-
-[[package]]
-name = "hello"
-version = "0.1.0"
-dependencies = [
- "libkern",
 ]
 
 [[package]]
@@ -370,8 +366,8 @@ dependencies = [
 name = "libviews"
 version = "0.1.0"
 dependencies = [
- "libfs",
  "libkern",
+ "libos",
  "libprompt",
  "librsproto",
 ]
@@ -405,6 +401,7 @@ dependencies = [
  "libheap",
  "libinput",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
  "libsurface",
@@ -420,6 +417,7 @@ dependencies = [
  "libheap",
  "libinput",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
  "libsurface",
@@ -437,6 +435,7 @@ dependencies = [
  "libgpt",
  "libheap",
  "libkern",
+ "libos",
  "libprompt",
  "libstream",
  "libusers",
@@ -451,6 +450,7 @@ dependencies = [
  "libheap",
  "libkern",
  "libline",
+ "libos",
  "librsproto",
  "libstream",
 ]
@@ -463,6 +463,7 @@ dependencies = [
  "libheap",
  "libinput",
  "libkern",
+ "libos",
  "librsproto",
  "libstream",
  "libsurface",

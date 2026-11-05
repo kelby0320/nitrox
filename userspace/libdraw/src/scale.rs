@@ -10,35 +10,22 @@
 use crate::format::{PixelFormat, Rgb};
 use crate::framebuffer::Geometry;
 use crate::geom::{Point, Size};
-
-/// Average the `src` rectangle covering one destination pixel, in integers (the sum fits a `u32`).
-fn average(src: &[u8], src_geom: Geometry, x0: u32, y0: u32, x1: u32, y1: u32) -> Rgb {
-    let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let off = y as usize * src_geom.pitch + x as usize * 4;
-            if off + 4 > src.len() {
-                continue;
-            }
-            let word = u32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
-            let c = src_geom.format.decode(word);
-            r += c.r as u32;
-            g += c.g as u32;
-            b += c.b as u32;
-            n += 1;
-        }
-    }
-    if n == 0 {
-        return Rgb::new(0, 0, 0);
-    }
-    Rgb::new((r / n) as u8, (g / n) as u8, (b / n) as u8)
-}
+use crate::pixels::{Pixels, SharedBytes};
 
 /// Box-downscale `src` into `dst`, both XRGB8888.
 ///
 /// Returns `false` if either geometry is unusable (zero dimension, short source, destination
 /// larger than the source): refused rather than clamped, as a caller scaling up is confused.
 pub fn box_downscale(src: &[u8], src_geom: Geometry, dst: &mut [u8], dst_geom: Geometry) -> bool {
+    downscale(Pixels::Own(src), src_geom, dst, dst_geom)
+}
+
+/// [`box_downscale`] from a buffer another process shares, read only by copying.
+pub fn box_downscale_shared(src: &dyn SharedBytes, src_geom: Geometry, dst: &mut [u8], dst_geom: Geometry) -> bool {
+    downscale(Pixels::Shared(src), src_geom, dst, dst_geom)
+}
+
+fn downscale(src: Pixels<'_>, src_geom: Geometry, dst: &mut [u8], dst_geom: Geometry) -> bool {
     if src_geom.width == 0
         || src_geom.height == 0
         || dst_geom.width == 0
@@ -52,20 +39,51 @@ pub fn box_downscale(src: &[u8], src_geom: Geometry, dst: &mut [u8], dst_geom: G
     {
         return false;
     }
+    let (sw, dw) = (src_geom.width, dst_geom.width);
+    // One sum per destination pixel of the row being built, so each source row is read once and
+    // whole, a shared one in pieces of a row rather than a box's few pixels at a time. In integers:
+    // a box's sum fits a `u32`.
+    let mut sums = alloc::vec![[0u32; 4]; dw as usize];
     for dy in 0..dst_geom.height {
         // Bands come from the edges, not a step, so every source row is in exactly one band.
         let y0 = dy * src_geom.height / dst_geom.height;
         let y1 = ((dy + 1) * src_geom.height / dst_geom.height).max(y0 + 1);
-        for dx in 0..dst_geom.width {
-            let x0 = dx * src_geom.width / dst_geom.width;
-            let x1 = ((dx + 1) * src_geom.width / dst_geom.width).max(x0 + 1);
-            let c = average(src, src_geom, x0, y0, x1, y1);
-            let off = dy as usize * dst_geom.pitch + dx as usize * 4;
-            let word = dst_geom.format.encode(c).to_le_bytes();
-            dst[off..off + 4].copy_from_slice(&word);
+        sums.fill([0; 4]);
+        for y in y0..y1 {
+            let row = y as usize * src_geom.pitch;
+            // The columns split a row as the bands split the rows, so a pixel's box is the first
+            // whose end lies past it.
+            let (mut dx, mut x1) = (0, column_end(0, sw, dw));
+            src.each_piece(row, sw as usize * 4, 4, |at, bytes| {
+                for (i, px) in bytes.as_chunks::<4>().0.iter().enumerate() {
+                    let x = ((at - row) / 4 + i) as u32;
+                    while x >= x1 {
+                        dx += 1;
+                        x1 = column_end(dx, sw, dw);
+                    }
+                    let c = src_geom.format.decode(u32::from_le_bytes(*px));
+                    let sum = &mut sums[dx as usize];
+                    sum[0] += c.r as u32;
+                    sum[1] += c.g as u32;
+                    sum[2] += c.b as u32;
+                    sum[3] += 1;
+                }
+            });
+        }
+        for (dx, &[r, g, b, n]) in sums.iter().enumerate() {
+            // A box a failed copy left empty draws black.
+            let n = n.max(1);
+            let c = Rgb::new((r / n) as u8, (g / n) as u8, (b / n) as u8);
+            let off = dy as usize * dst_geom.pitch + dx * 4;
+            dst[off..off + 4].copy_from_slice(&dst_geom.format.encode(c).to_le_bytes());
         }
     }
     true
+}
+
+/// Where destination column `dx`'s box ends, scaling a row `sw` wide to `dw`: past where it starts.
+fn column_end(dx: u32, sw: u32, dw: u32) -> u32 {
+    ((dx + 1) * sw / dw).max(dx * sw / dw + 1)
 }
 
 /// [`fit`] scales a picture bigger than the screen down to fit, aspect kept, and draws one that
@@ -497,5 +515,73 @@ mod tests {
         let dg = geom(4, 4);
         let mut dst = alloc::vec![0u8; dg.byte_len() - 1];
         assert!(!box_downscale(&src, g, &mut dst, dg));
+    }
+
+    #[test]
+    fn a_shared_source_scales_as_the_same_bytes_owned() {
+        use libos::{Handle, MapReadWrite, Memory};
+        libos::mock::reset();
+        let sg = geom(700, 9);
+        let src = packed(sg, |x, y| Rgb::new((x * 3) as u8, (y * 29) as u8, (x ^ y) as u8));
+        let mem = Handle::<Memory, MapReadWrite>::create(src.len()).unwrap();
+        let mut map = mem.map(src.len()).unwrap();
+        map.write_from(0, &src).unwrap();
+        let dg = geom(1, 2);
+        let (mut own, mut shared) = (alloc::vec![0u8; dg.byte_len()], alloc::vec![0u8; dg.byte_len()]);
+        assert!(box_downscale(&src, sg, &mut own, dg) && box_downscale_shared(&map, sg, &mut shared, dg));
+        assert_eq!(shared, own, "a band wider than a piece, averaged whole");
+    }
+
+    /// Each destination pixel is the mean of its own box, worked out alone, at sizes that do not
+    /// divide.
+    #[test]
+    fn each_destination_pixel_is_the_mean_of_its_box() {
+        let sg = geom(37, 23);
+        let src = packed(sg, |x, y| Rgb::new((x * 41 + y * 7) as u8, (x * y) as u8, (x ^ (y * 3)) as u8));
+        let edges = |d: u32, s: u32, n: u32| (d * s / n, ((d + 1) * s / n).max(d * s / n + 1));
+        for (w, h) in [(5, 4), (36, 1), (37, 23), (1, 22), (18, 11)] {
+            let dg = geom(w, h);
+            let mut dst = alloc::vec![0u8; dg.byte_len()];
+            assert!(box_downscale(&src, sg, &mut dst, dg));
+            for dy in 0..h {
+                for dx in 0..w {
+                    let ((x0, x1), (y0, y1)) = (edges(dx, 37, w), edges(dy, 23, h));
+                    let (mut sum, mut n) = ([0u32; 3], 0);
+                    for (x, y) in (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))) {
+                        let c = at(&src, sg, x, y);
+                        sum = [sum[0] + c.r as u32, sum[1] + c.g as u32, sum[2] + c.b as u32];
+                        n += 1;
+                    }
+                    let mean = Rgb::new((sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8);
+                    assert_eq!(at(&dst, dg, dx, dy), mean, "{w}x{h} at ({dx}, {dy})");
+                }
+            }
+        }
+    }
+
+    /// A shared source is copied a row at a time, in pieces, once for the band it is in: not once
+    /// for every destination pixel its row crosses.
+    #[test]
+    fn a_shared_source_is_copied_once_a_row() {
+        struct Counted(alloc::vec::Vec<u8>, core::cell::Cell<usize>);
+        impl SharedBytes for Counted {
+            fn len(&self) -> usize {
+                self.0.len()
+            }
+            fn copy_out(&self, offset: usize, out: &mut [u8]) -> bool {
+                self.1.set(self.1.get() + 1);
+                out.copy_from_slice(&self.0[offset..offset + out.len()]);
+                true
+            }
+        }
+        // 2,400 bytes a row: three pieces.
+        let sg = geom(600, 10);
+        let src = packed(sg, |x, y| Rgb::new(x as u8, (y * 19) as u8, (x / 3) as u8));
+        let counted = Counted(src.clone(), core::cell::Cell::new(0));
+        let dg = geom(300, 5);
+        let (mut own, mut shared) = (alloc::vec![0u8; dg.byte_len()], alloc::vec![0u8; dg.byte_len()]);
+        assert!(box_downscale(&src, sg, &mut own, dg) && box_downscale_shared(&counted, sg, &mut shared, dg));
+        assert_eq!(shared, own);
+        assert_eq!(counted.1.get(), 10 * 3, "ten rows, each in three pieces");
     }
 }
