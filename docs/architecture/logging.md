@@ -262,12 +262,12 @@ each where it is.
 ## Client ergonomics
 
 Emitting should be a one-liner, not hand-rolled record encoding or raw `sys_channel_send`.
-A small client surface — `log!`/`info!`/`warn!`/`error!` over a held endpoint, plus an
-`open_source(label)` helper that resolves `<principal>/<label>` and returns a named-stream
-handle — lives alongside the syscall layer so any process can use it. It is `liblog`: its
-`open_source` returns a `Logger` that owns its endpoint and closes it when dropped, which
-frees the source's slot in the service, and `Logger::borrowing` wraps an endpoint its caller
-keeps, as a supervisor-given one is.
+A small client surface — `log!`/`info!`/`warn!`/`error!` over a held endpoint, plus a
+`Logger::open(ns, path)` that resolves `<principal>/<label>` and returns a named-stream handle
+— lives alongside the syscall layer so any process can use it. It is `liblog`: `Logger::open`
+returns a `Logger` that owns its endpoint and closes it when dropped, which frees the source's
+slot in the service, `Logger::new` takes one a supervisor gave, and `Logger::endpoint` lends it
+for records of the caller's own.
 
 ## Slice 1 scope
 

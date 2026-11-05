@@ -48,8 +48,8 @@ is the 2026-07-31 `logging-service` bug, found from a hung shell three subsystem
 
 - **`#![no_std]` + `#![no_main]`, with `alloc`.** The no-`alloc` rule was lifted on
   2026-07-31: session-mgr hands each session its **environment**, and every step of that
-  needs a heap — a TSM1 `Record` holds `Vec`s, `send_setup` builds a `Vec<String>` of
-  `argv`, and encoding returns a `Vec<u8>`. The old rule's own escape clause was "unless a
+  needs a heap — a TSM1 `Record` holds `Vec`s, `send_stage_setup` builds a `Vec<String>`
+  of `argv`, and encoding returns a `Vec<u8>`. The old rule's own escape clause was "unless a
   real need appears", and this is one: without it the *parent* cannot give the child its
   environment, which is the whole basis of Milestone 3.5. The alternative — a second,
   allocation-free encoding path in `libstream` — would have cost more than it saved.
