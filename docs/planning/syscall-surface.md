@@ -370,6 +370,13 @@ mapping among them, which is th-d9's half here. The implementer; the author read
 
 **With E.5 the raw count is `eshell`'s, `libheap`'s and the refusals'**, and Part J comes next.
 
+**Built 2026-11-05**, with the two filesystem servers' entry folded in (the maintainer's call, as no
+sub-part named it). The harness's 863 raw calls fall to 15, each a refusal, in modules named
+`refused`: boot-probe's under `bootprobe/`, the other programs' in `src/refused/`, each with an agreed
+entry. The ratchet is at 64 in 4 entries. libos grew `thread::exit`, a faulted thread's
+`fault_registers` and `settle`, `thread::start_on` and `entropy::Source`; every harness thread runs
+on a `Stack` of its own. The thirty-three raw shims went with their last callers.
+
 ### E.6 The mapping path
 
 Three bash findings and the gap, which are one path and Phase 7's first:

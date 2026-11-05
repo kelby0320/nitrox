@@ -37740,3 +37740,52 @@ Decided in the part, for the maintainer's eye:
   poll answered `TimedOut`, whose restrict kept `DUPLICATE` and whose close answered an error passed
   `test-qemu` with no line from it. The test harness checks what it checked, but for a poll's
   `WouldBlock`, which `boot-probe` now asserts; restrict and close are the kernel's host tests'.
+
+## 2026-11-05 — Before Phase 7, E.5: the test harness on libos
+
+E.5 moves the test harness onto libos, and with it **the two filesystem servers' entry** (the
+maintainer's call, 2026-11-05, as no sub-part named it). The harness's 863 raw calls fall to 15,
+each a refusal kept on purpose; the ratchet falls from 912 in 3 entries to 64 in 4: `eshell`'s 44,
+`libheap`'s 5, boot-probe's refusals' 14 and the other test programs' 1. The thirty-three raw shims
+E.2 kept went with their last callers, and `TODO(raw-handle-shims)` is resolved. **The session's
+calls are as they were**: 4,380 and 4,395 on two runs (`cargo xtask syscall-counts`), where E.4
+measured 4,409, every difference in `nxsh`'s and the tty server's exchanges of a typed line, which
+vary run to run; the filesystem servers' are the same to the call.
+
+Decided in the part, for the maintainer's eye:
+
+- **What stays raw is what a safe wrapper cannot express**, the plan's rule, read as: a handle libos
+  cannot name (none, the wrong kind, narrowed in place to rights no type names), a pointer or a
+  length libos computes itself, a call libos never makes, and an answer libos folds (a wait's
+  `TimedOut` and `WouldBlock`). A server's or the kernel's refusal of a well-formed request moves:
+  `Error::code()` is the `KError`. **The kept calls live in modules named `refused`**, boot-probe's
+  under `bootprobe/` as the plan put them and the other programs' in `src/refused/`, one file per
+  binary, as a module of `bootprobe/` cannot be another binary's. Each has an agreed entry of its
+  own in `raw-syscalls.toml`, raised by hand in the commit that says why.
+- **libos grew four things the harness needed**: `thread::exit`; on a thread handle,
+  `fault_registers` and `settle(Disposition)`, a supervisor's read and resume of a faulted thread;
+  `thread::start_on`, a thread on chosen CPUs, which the exit races pin to; and `entropy::Source`,
+  a source of random bytes made here or handed over by `/dev/entropy`, read as often as wanted.
+  Three of the implementers' kept calls were these gaps rather than refusals, two pinned threads
+  and an entropy read, and moved once each existed.
+- **Every harness thread runs on a libos `Stack` of its own**, `EXIT_SPAWNING`'s 48 made up front
+  where it carved them from one mapping: th-d9's userspace half. The guard below a stack is still
+  the kernel's to give (E.6, `TODO(thread-stack-guard)`).
+- **A moved check that holds a refusal still provokes it.** Those comparing a specific code pass
+  only if the kernel answered it, so `test-qemu` passing is their proof; boot-probe prints the same
+  72 ok lines as before. Those that accept any failure were probed in one boot that printed each
+  code: `NotFound` for the missing names, `AlreadyExists` for a rename over a file, `NoAccess` for
+  a writable map of a program and a copy of a namespace without `LOOKUP`, each the refusal meant.
+  The worked example's bounded send failed on a kernel that ignores a `BlockBounded` deadline.
+- **The implementer moved the harness in four groups**, each in a worktree of its own from one
+  brief; the author moved boot-probe's deadline tests as the worked example, the filesystem
+  servers' entry, the libos pieces and the shims, and read every diff. **What changed, every
+  success line and exit code otherwise as it was**: failure-only lines merge where one libos call
+  does what two raw ones did; the handles, mappings, PendingOperations and setup endpoints the old
+  code leaked now close, a reference window's mapping among them once its picture is written; a
+  program handed no root namespace or control channel says so, which no spawn does.
+- **Nineteen of the survey's items are ticked**: rt-o1, rt-o2, rt-o5, rt-o7 and desk-o4, which E.4
+  left open for the harness and its shims, and th-d7 and thirteen of the harness's own
+  opportunities. Open still: th-d9's kernel half, th-d11 (the bench and the display check drawing
+  on an aperture the compositor writes), and th-o14 to th-o16 (inline asm with intrinsics, the
+  sleeps that exercise a timer on purpose, snapshots read at one page).
