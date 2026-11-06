@@ -37789,3 +37789,51 @@ Decided in the part, for the maintainer's eye:
   opportunities. Open still: th-d9's kernel half, th-d11 (the bench and the display check drawing
   on an aperture the compositor writes), and th-o14 to th-o16 (inline asm with intrinsics, the
   sleeps that exercise a timer on purpose, snapshots read at one page).
+
+## 2026-11-05 — Before Phase 7, Part J detailed: fifteen sub-parts, and a ratchet on the kernel's `unsafe`
+
+Part J's detail pass, in `typed-layers.md`, checked the survey's six kernel layers, 45 items, against
+`main` at PR #422's merge. **Part I had already taken part of ten**: the page tables' atomic slots
+and one walk, a kernel stack with no root, the inline waiter set, device memory freed only once its
+device stops, one completion call for an IRP, a partition's window on its node, the log copied
+through `copy_in`, and every bug behind P4, which leaves P4 debug assertions to make types. **Six
+things the survey drew do not hold**: masked interrupts do not pin a thread across a switch; a
+host-test twin cannot live in a generic per-CPU type; no `&'static AhciDisk` exists when its node is
+made; a safe `Copy` handle to DMA memory is what Part I removed; a raw copy does not end kobj-d13's
+race; and a vector a device was programmed with cannot simply be cleared. **Two latent defects** the
+survey missed go into its record and into J.11: `init_syscall_entry` runs unpinned after the APs are
+up (kplat-d23), and `arm_kernel_stack_for` runs after the SCHED it says it holds (sched-d16).
+
+**The order is P6, P1, P2, P3, P4, P5**, all before E.6. P6 is the smallest and clears the trait and
+the mask that P3 and P4 edit; P1 is what the others are written on, the scheduler's repetition going
+before the types that would touch five copies of it; an owned frame is what P3's maps and P5's DMA
+buffers hold. Part J converts every site but the two calls E.9 removes.
+
+Decided in the pass, for the maintainer's eye:
+
+- **`check-unsafe`, a ratchet on the kernel's `unsafe`** as `check-syscalls` is on userspace's raw
+  calls: each subsystem's `unsafe` blocks and `unsafe fn`s held to a table from J.1, a rise failing CI.
+  Each sub-part lowers its entries, and E's new kernel code raises one in the commit that says why,
+  the justification `kernel/CLAUDE.md` asks for and nothing held.
+- **`Thread` has no `&Thread` until it is split** (J.7): its fields are written raw under SCHED, and a
+  shared reference to one is kobj-d11's race. The other thirteen kinds keep what changes in cells or
+  atomics, so a typed reference derefs for them from J.2.
+- **A frame another party may write is copied in relaxed atomic words**, as `TableRef` reads a table:
+  plain moves on x86_64, never a reference, and a Miri control for kobj-d13 that a raw copy could not
+  have. **Under Miri the buddy hands out a host allocation per block**, so Miri sees a frame used
+  after its free.
+- **The VMA says whether an unmapped frame is owned**, through an `unsafe from_pte` at three sites,
+  and no PTE bit says it twice. **A walk of the active root stays `unsafe`**: making it safe would
+  promise that intermediate tables are never freed.
+- **A view of a cache page borrows its file**, sound because a Ready page is freed only with its
+  object; E.8's `IO_NOCACHE`, the first to free one early, keeps that with its count of operations.
+- **Per-CPU state has two containers over one `CpuIndex`**: `arch`'s `PerCpu`, raw slots with a safe
+  read only for `Sync` values, and `cpu_local!` for what the host tests run, its twin a thread-local.
+  **A site with no guard to borrow a pin from checks IF itself, in every build**, a `pushfq` against
+  a syscall's hundreds of cycles; **a debug count of live pins is zero at every switch**; and
+  `CpuIndex::current` trusts the bound held where `TSC_AUX` is written.
+- **A block backend's context is typed by its constructor**, its fields private, rather than an enum
+  that would make `io` name its drivers; **the storage and HID table entries own their buffers**;
+  **an IRP token dropped unfinished fails a debug build**, a lost IRP being drv-d3's class.
+- **A device vector comes back only if no device was programmed with it**: a declined xHCI whose MSI
+  is enabled may still signal, so it keeps its vector, and a full pool answers `Err` where it asserts.
