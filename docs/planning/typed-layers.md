@@ -138,6 +138,11 @@ call-site `SAFETY` on these goes in the same change; `memory-management.md` says
 `unsafe`. Control: the compiler both ways, and `kernel_asm.rs`'s floor of five asm blocks, which
 the seven left once `halt` goes still meet. With `check-unsafe` and its table. Author.
 
+**Built 2026-11-06.** `check-unsafe` is in CI, its table starting at 1,113 `unsafe` blocks and 348
+`unsafe fn`s in 28 modules. Eighteen `unsafe fn`s went, the ten named, `tlb::invalidate_local`
+under the flushes, and `halt`, leaving 1,094 blocks and 330 `unsafe fn`s. The kernel's `.text`,
+debug and release, is byte-identical before and after.
+
 ### J.2 The typed kernel object (kobj-o1, with kmem-o1, drv-o2 and kplat-o5)
 
 A tag and a pointer are tied only by hand. Measured: **75 downcasts** written `&*(x.as_ptr() as

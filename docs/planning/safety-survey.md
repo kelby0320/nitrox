@@ -2811,7 +2811,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   reclaimed twice or never on an allocate error path, a type tag that disagrees with the
   pointer (the class behind kplat-d16). Depends on: nothing. ownership. Value medium, effort
   medium. **Plan**, as kobj-o2, in P1.
-- [ ] **kplat-o8** remove: `unsafe fn`s whose whole contract is "ring 0" and whose bodies cannot
+- [x] **kplat-o8** remove: `unsafe fn`s whose whole contract is "ring 0" and whose bodies cannot
   break memory safety (TLB flushes, `wbinvd`, masking interrupts, MTRR/PAT reads after a CPUID
   check, walking the always-valid active root); `ArchCpu::halt` has no callers — 24 sites
   (call sites by `grep -rnF`, less definitions and comments: `flush_tlb_page(` 7,
@@ -2828,6 +2828,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   0", diluting review of the ones that matter. Depends on: `of_mapping` is cleaner after the
   typed-root part of kplat-o1; the rest on nothing. opportunities. Value medium, effort small.
   **Plan**, in P6.
+  Done in `77de0376`: the ten named and `tlb::invalidate_local` are plain fns, `ArchCpu::halt`
+  is gone, and `idle_halt` says why it stays `unsafe`; 18 `unsafe fn`s and 19 `unsafe` blocks
+  fewer. `flush_tlb_all`'s CR3 reload and `of_mapping`'s walk of the active root keep one inner
+  block each. The kernel's `.text` is byte-identical before and after.
 - [x] **kplat-o9** encapsulate: the interrupt/exception entry prologue (error-code slot, vector,
   15 GPR pushes, `mov rdi, rsp`, call, unwind, iretq) written out six times — 6 sites (`grep -c
   'push rax\\npush rbx' kernel/src/arch/x86_64/idt.rs` = 6: `exception_stub!`, vec14,
