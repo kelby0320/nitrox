@@ -291,16 +291,14 @@ fn declined(why: &'static str) -> Outcome {
 }
 
 /// Bring up the controller `controller` is, unless `usb_off` or one is already claimed.
-pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
+pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     if usb_off {
         return declined("usb=off on the command line");
     }
     if XHCI.get().is_some() {
         return declined("another xHCI controller is already claimed");
     }
-    // SAFETY: `controller` pins a live `DeviceNode`.
-    let dn: &DeviceNode = unsafe { &*(controller.as_ptr() as *const DeviceNode) };
-    let desc = *dn.descriptor();
+    let desc = *controller.descriptor();
     let at = Address(&desc);
 
     // **Power first**: in D3hot the registers read as all ones (the laptop's was in D3 when Linux

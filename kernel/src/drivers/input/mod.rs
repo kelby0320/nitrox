@@ -27,6 +27,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::libkern::input::{INPUT_EVENT_LEN, InputEvent};
 use crate::mm::{PAGE_SIZE, heap};
+use crate::object::header::Ref;
 use crate::object::{MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 use ring::EventRing;
@@ -37,14 +38,14 @@ pub const DRAIN_MAX: usize = ring::RING_EVENTS * INPUT_EVENT_LEN;
 /// A parked `sys_io_submit(Read)` waiting for events on one node.
 pub struct ParkedRead {
     po: ObjectRef,
-    buffer: ObjectRef,
+    buffer: Ref<MemoryObject>,
     buf_offset: u64,
     max_len: usize,
 }
 
 impl ParkedRead {
     /// A read of up to `max_len` bytes into `buffer` at `buf_offset`, completing `po`.
-    pub fn new(po: &ObjectRef, buffer: &ObjectRef, buf_offset: u64, max_len: usize) -> ParkedRead {
+    pub fn new(po: &ObjectRef, buffer: &Ref<MemoryObject>, buf_offset: u64, max_len: usize) -> ParkedRead {
         ParkedRead { po: po.clone(), buffer: buffer.clone(), buf_offset, max_len }
     }
 }
@@ -210,9 +211,7 @@ pub fn read_or_park(mut reclaim: impl FnMut(), mut attempt: impl FnMut() -> Read
 /// **Copy `bytes` into a read's buffer and complete it**; no lock held, as completing takes the
 /// scheduler's.
 pub fn deliver(read: &ParkedRead, bytes: &[u8]) {
-    // SAFETY: `read` owns the `ObjectRef` pinning this `MemoryObject`, and the caller keeps `read`
-    // for the duration.
-    unsafe { copy_into_memobj(read.buffer.as_ptr(), read.buf_offset, bytes) };
+    read.buffer.copy_in(read.buf_offset as usize, bytes);
     // SAFETY: `read` owns the reference pinning its `PendingOperation`.
     unsafe { crate::sched::complete_pending_op(read.po.as_ptr(), 0, bytes.len() as u64) };
 }
@@ -224,37 +223,21 @@ pub fn refuse(read: &ParkedRead, err: KError) {
 }
 
 /// Copy `bytes` into `buffer` at `buf_offset` and complete `po`: a read satisfied at once.
-pub fn deliver_now(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, bytes: &[u8]) {
-    // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
-    unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, bytes) };
+pub fn deliver_now(buffer: &MemoryObject, po: &ObjectRef, buf_offset: u64, bytes: &[u8]) {
+    buffer.copy_in(buf_offset as usize, bytes);
     // SAFETY: `po` is the caller's `PendingOperation` reference.
     unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, bytes.len() as u64) };
 }
 
-/// Copy `src` into `buffer`'s frames at `buf_offset`, via the HHDM; the caller bounds-checks it.
-///
-/// # Safety
-///
-/// `buffer` must point at a live `MemoryObject` — held alive by an `ObjectRef` the caller
-/// keeps for the duration. The DPC passes a *borrowed* pointer precisely so it never owns a
-/// reference it would then have to drop.
-unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
-    // SAFETY: the caller guarantees `buffer` pins a live `MemoryObject`.
-    let mo: &MemoryObject = unsafe { &*(buffer as *const MemoryObject) };
-    mo.copy_in(buf_offset as usize, src);
-}
-
 /// **The lights a write to a keyboard's node carries**: exactly one byte at `buf_offset`, of
 /// `LIGHT_NUM`, `LIGHT_CAPS` and `LIGHT_SCROLL` alone, else `InvalidArgument`. Thread context.
-pub fn lights_from(buffer: &ObjectRef, buf_offset: u64, len: u64) -> Result<u8, KError> {
+pub fn lights_from(buffer: &MemoryObject, buf_offset: u64, len: u64) -> Result<u8, KError> {
     use crate::libkern::input::{LIGHT_CAPS, LIGHT_NUM, LIGHT_SCROLL};
     if len != 1 {
         return Err(KError::InvalidArgument);
     }
-    // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
-    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
     let (page, intra) = (buf_offset as usize / PAGE_SIZE, buf_offset as usize % PAGE_SIZE);
-    let frame = *mo.frames().get(page).ok_or(KError::InvalidArgument)?;
+    let frame = *buffer.frames().get(page).ok_or(KError::InvalidArgument)?;
     // SAFETY: within an owned, HHDM-mapped frame of the buffer (bounds checked by `sys_io_submit`
     // and by `get` above).
     let byte = unsafe { *((frame.as_u64() + heap::hhdm_offset()) as *const u8).add(intra) };
@@ -287,7 +270,7 @@ mod tests {
 
     fn read(max_len: usize) -> ParkedRead {
         let po = ObjectRef::new(PendingOperation::try_new().unwrap());
-        let buf = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+        let buf = Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
         ParkedRead::new(&po, &buf, 0, max_len)
     }
 
@@ -431,7 +414,7 @@ mod tests {
     fn a_lights_write_is_one_byte_of_three_bits() {
         init_global_heap();
         let mo = MemoryObject::try_new_filled(&[0x02, 0x08, 0x07]).unwrap();
-        let buf = ObjectRef::new(mo);
+        let buf = Ref::new(mo);
         assert_eq!(lights_from(&buf, 0, 1), Ok(0x02), "Caps Lock");
         assert_eq!(lights_from(&buf, 2, 1), Ok(0x07), "all three");
         assert_eq!(lights_from(&buf, 1, 1), Err(KError::InvalidArgument), "bit 3 is no light");
@@ -452,6 +435,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::mm::PAGE_SIZE;
+    use crate::object::header::Ref;
     use crate::object::{MemoryObject, ObjectRef, PendingOperation};
     use crate::syscall::error::KError;
     use std::sync::{Arc, mpsc};
@@ -459,14 +443,14 @@ pub(crate) mod test_support {
 
     pub(crate) fn a_read_waits_out_the_delivery_before_it<S: Send + Sync + 'static, T>(
         state: S,
-        read: fn(&S, &ObjectRef, &ObjectRef) -> Result<(), KError>,
+        read: fn(&S, &Ref<MemoryObject>, &ObjectRef) -> Result<(), KError>,
         take: fn(&S) -> T,
         owe: fn(&S, T),
         parked: fn(&S) -> bool,
     ) {
         crate::mm::test_support::init_global_heap();
         let state = Arc::new(state);
-        let buf = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+        let buf = Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
         let po = || ObjectRef::new(PendingOperation::try_new().unwrap());
         assert_eq!(read(&state, &buf, &po()), Ok(()));
         let first = take(&state);

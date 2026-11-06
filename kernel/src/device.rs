@@ -34,12 +34,13 @@ use crate::libkern::device::{
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KVec, SpinLock};
 use crate::object::device_node::{CharBackend, DeviceClass, DeviceNode, ResourceDescriptor};
+use crate::object::header::Ref;
 use crate::object::{MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 
 /// One node, and what the table knows about it.
 struct Entry {
-    node: ObjectRef,
+    node: Ref<DeviceNode>,
     kind: DeviceKind,
     /// The `<n>` its path serves it at, or [`NOT_SERVED`].
     served: u32,
@@ -89,12 +90,6 @@ impl Default for Registry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// The node an entry holds.
-fn node_of(e: &Entry) -> &DeviceNode {
-    // SAFETY: every entry pins a live `DeviceNode` through its owning reference.
-    unsafe { &*(e.node.as_ptr() as *const DeviceNode) }
 }
 
 impl Registry {
@@ -150,7 +145,7 @@ impl Registry {
     /// **Flag `disk` as the disk the machine started from**. One change, so one
     /// generation. Whether it changed anything: a node the table does not hold, or one flagged
     /// already, does not.
-    pub fn mark_boot(&mut self, disk: &ObjectRef) -> bool {
+    pub fn mark_boot(&mut self, disk: &Ref<DeviceNode>) -> bool {
         let Some(e) = self.entries.iter_mut().find(|e| e.node.as_ptr() == disk.as_ptr()) else {
             return false;
         };
@@ -183,7 +178,7 @@ impl Registry {
     }
 
     /// Append a PCI function `pci` enumerated.
-    pub fn add_pci(&mut self, node: ObjectRef) -> bool {
+    pub fn add_pci(&mut self, node: Ref<DeviceNode>) -> bool {
         self.push(Entry {
             node,
             kind: DeviceKind::PciFunction,
@@ -200,14 +195,14 @@ impl Registry {
     /// served index is the number of block nodes before it** — `/dev/blk/<n>` in publication
     /// order, as it has always been — and its parent is the PCI function at its address, if it
     /// has one: a disk's controller.
-    pub fn add_block(&mut self, node: ObjectRef, driver: &'static str) -> bool {
-        let parent = self.pci_parent(node_of_ref(&node).descriptor());
+    pub fn add_block(&mut self, node: Ref<DeviceNode>, driver: &'static str) -> bool {
+        let parent = self.pci_parent(node.descriptor());
         self.add_block_under(node, parent, driver)
     }
 
     /// Append a block node that belongs to `parent`, a node already in the table: a partition and
     /// its disk. A `parent` the table does not hold records no parent.
-    pub fn add_block_child(&mut self, node: ObjectRef, parent: &ObjectRef, driver: &'static str) -> bool {
+    pub fn add_block_child(&mut self, node: Ref<DeviceNode>, parent: &Ref<DeviceNode>, driver: &'static str) -> bool {
         let parent =
             self.entries.iter().position(|e| e.node.as_ptr() == parent.as_ptr()).map_or(NO_PARENT, |i| i as u32);
         self.add_block_under(node, parent, driver)
@@ -215,9 +210,9 @@ impl Registry {
 
     /// **Append a block node under the entry `parent`**, by id: a USB disk under its `UsbDevice`
     /// record, whose address names no PCI function.
-    pub fn add_block_under(&mut self, node: ObjectRef, parent: u32, driver: &'static str) -> bool {
-        let served = self.entries.iter().filter(|e| node_of(e).class() == DeviceClass::Block).count() as u32;
-        let kind = match BlockKind::from_u32(node_of_ref(&node).block_info().kind) {
+    pub fn add_block_under(&mut self, node: Ref<DeviceNode>, parent: u32, driver: &'static str) -> bool {
+        let served = self.entries.iter().filter(|e| e.node.class() == DeviceClass::Block).count() as u32;
+        let kind = match BlockKind::from_u32(node.block_info().kind) {
             BlockKind::Disk => DeviceKind::Disk,
             BlockKind::Partition => DeviceKind::Partition,
             BlockKind::RamDisk => DeviceKind::RamDisk,
@@ -227,7 +222,7 @@ impl Registry {
     }
 
     /// Append a character node: the console, or an i8042 device at `/dev/input/raw/<served>`.
-    pub fn add_char(&mut self, node: ObjectRef, kind: DeviceKind, served: u32, driver: &'static str) -> bool {
+    pub fn add_char(&mut self, node: Ref<DeviceNode>, kind: DeviceKind, served: u32, driver: &'static str) -> bool {
         self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None, departed: false, boot: false })
     }
 
@@ -237,7 +232,7 @@ impl Registry {
     /// the i8042 has a mouse and no keyboard. The index, or `None` when the table could not take it.
     pub fn add_input(
         &mut self,
-        node: ObjectRef,
+        node: Ref<DeviceNode>,
         kind: DeviceKind,
         parent: Option<u32>,
         driver: &'static str,
@@ -262,7 +257,7 @@ impl Registry {
     /// id, which is its place, or `None` when the table could not take it.
     pub fn add_usb(
         &mut self,
-        node: ObjectRef,
+        node: Ref<DeviceNode>,
         controller: &ResourceDescriptor,
         driver: &'static str,
         facts: UsbFacts,
@@ -284,30 +279,30 @@ impl Registry {
         }
         self.entries
             .iter()
-            .position(|e| e.kind == DeviceKind::PciFunction && address(node_of(e).descriptor()) == address(desc))
+            .position(|e| e.kind == DeviceKind::PciFunction && address(e.node.descriptor()) == address(desc))
             .map_or(NO_PARENT, |i| i as u32)
     }
 
     /// The block node `/dev/blk/<index>` serves. **None for a departed one**.
-    pub fn block(&self, index: u32) -> Option<ObjectRef> {
+    pub fn block(&self, index: u32) -> Option<Ref<DeviceNode>> {
         self.entries
             .iter()
-            .find(|e| !e.departed && node_of(e).class() == DeviceClass::Block && e.served == index)
+            .find(|e| !e.departed && e.node.class() == DeviceClass::Block && e.served == index)
             .map(|e| e.node.clone())
     }
 
     /// **The live block node with the lowest served index from `index` on**, and that index: a
     /// walk of every block device, which a departed one's index, never served again, cannot end.
-    pub fn block_from(&self, index: u32) -> Option<(u32, ObjectRef)> {
+    pub fn block_from(&self, index: u32) -> Option<(u32, Ref<DeviceNode>)> {
         self.entries
             .iter()
-            .filter(|e| !e.departed && node_of(e).class() == DeviceClass::Block && e.served >= index)
+            .filter(|e| !e.departed && e.node.class() == DeviceClass::Block && e.served >= index)
             .min_by_key(|e| e.served)
             .map(|e| (e.served, e.node.clone()))
     }
 
     /// The input node `/dev/input/raw/<index>` serves. **None for a departed one**.
-    pub fn input(&self, index: u32) -> Option<ObjectRef> {
+    pub fn input(&self, index: u32) -> Option<Ref<DeviceNode>> {
         self.entries
             .iter()
             .find(|e| !e.departed && matches!(e.kind, DeviceKind::Keyboard | DeviceKind::Mouse) && e.served == index)
@@ -315,7 +310,7 @@ impl Registry {
     }
 
     /// Node `id` — its place in the table. **None for a departed one**.
-    pub fn node(&self, id: u32) -> Option<ObjectRef> {
+    pub fn node(&self, id: u32) -> Option<Ref<DeviceNode>> {
         self.entries.get(id as usize).filter(|e| !e.departed).map(|e| e.node.clone())
     }
 
@@ -333,7 +328,7 @@ impl Registry {
         let mut out: KVec<DeviceRecord> = KVec::new();
         out.try_reserve(self.entries.len())?;
         for (id, e) in self.entries.iter().enumerate() {
-            let n = node_of(e);
+            let n = &e.node;
             let d = n.descriptor();
             let mut r = DeviceRecord {
                 id: id as u32,
@@ -439,7 +434,7 @@ impl Registry {
                 continue;
             }
             let flags = if e.departed { DEPARTED as u32 } else { 0 };
-            out.try_push(node_of_ref(&e.node).io().record_for(id as u32, flags))?;
+            out.try_push(e.node.io().record_for(id as u32, flags))?;
         }
         Ok(out)
     }
@@ -464,12 +459,6 @@ pub fn io_bytes(records: &[IoRecord], cache: CacheCounts) -> Result<KVec<u8>, Al
     Ok(out)
 }
 
-/// The node `node` pins, for a reference not yet in a table.
-fn node_of_ref(node: &ObjectRef) -> &DeviceNode {
-    // SAFETY: callers pass references to `DeviceNode`s — every registration site builds one.
-    unsafe { &*(node.as_ptr() as *const DeviceNode) }
-}
-
 /// The kernel's table. Seeded by [`init`], appended to by drivers during boot, read thereafter.
 /// Lock rank: `Registry` — it allocates while held — and never held with another lock.
 static DEVICES: SpinLock<Registry> = SpinLock::new(LockRank::Registry, Registry::new());
@@ -490,7 +479,7 @@ pub fn init() {
     crate::kprintln!("device: {} node(s) registered", count);
     let backend = CharBackend { submit_read: changes_read, submit_write: None, ctx: core::ptr::null_mut() };
     match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
-        Ok(node) => *CHANGES.lock() = Some(ObjectRef::new(node)),
+        Ok(node) => *CHANGES.lock() = Some(Ref::new(node)),
         Err(_) => crate::kprintln!("device: no memory for /dev/registry/changes; nothing will learn of a change"),
     }
 }
@@ -503,9 +492,9 @@ pub fn count() -> usize {
 /// A snapshot of the device table: a cloned owning reference per device, taken under the lock and
 /// returned, so a caller (driver matching) can iterate and allocate **without** holding the device
 /// lock across a lock-ordering boundary.
-pub fn snapshot() -> KVec<ObjectRef> {
+pub fn snapshot() -> KVec<Ref<DeviceNode>> {
     let table = DEVICES.lock();
-    let mut out: KVec<ObjectRef> = KVec::new();
+    let mut out: KVec<Ref<DeviceNode>> = KVec::new();
     if out.try_reserve(table.len()).is_err() {
         return KVec::new();
     }
@@ -517,7 +506,7 @@ pub fn snapshot() -> KVec<ObjectRef> {
 
 /// Append a block node a driver published — a disk or the RAM disk. The table takes ownership
 /// of `node`.
-pub fn register(node: ObjectRef, driver: &'static str) {
+pub fn register(node: Ref<DeviceNode>, driver: &'static str) {
     if !DEVICES.lock().add_block(node, driver) {
         crate::kprintln!("device: table full; dropping a registered node");
     }
@@ -525,7 +514,7 @@ pub fn register(node: ObjectRef, driver: &'static str) {
 }
 
 /// Append a partition of `disk`. The table takes ownership of `node`.
-pub fn register_partition(node: ObjectRef, disk: &ObjectRef, driver: &'static str) {
+pub fn register_partition(node: Ref<DeviceNode>, disk: &Ref<DeviceNode>, driver: &'static str) {
     if !DEVICES.lock().add_block_child(node, disk, driver) {
         crate::kprintln!("device: table full; dropping a registered partition");
     }
@@ -534,7 +523,7 @@ pub fn register_partition(node: ObjectRef, disk: &ObjectRef, driver: &'static st
 
 /// Append a character node — the console, or an i8042 device served at
 /// `/dev/input/raw/<served>`. The table takes ownership of `node`.
-pub fn register_char(node: ObjectRef, kind: DeviceKind, served: u32, driver: &'static str) {
+pub fn register_char(node: Ref<DeviceNode>, kind: DeviceKind, served: u32, driver: &'static str) {
     if !DEVICES.lock().add_char(node, kind, served, driver) {
         crate::kprintln!("device: table full; dropping a registered {:?}", kind);
     }
@@ -546,7 +535,7 @@ pub fn register_char(node: ObjectRef, kind: DeviceKind, served: u32, driver: &'s
 /// `device-mgr`'s `usb-<id>`), or `None` when the table could not take it. From the hub thread,
 /// never a DPC: the table allocates while locked.
 pub fn register_usb(
-    node: ObjectRef,
+    node: Ref<DeviceNode>,
     controller: &ResourceDescriptor,
     driver: &'static str,
     facts: UsbFacts,
@@ -561,7 +550,7 @@ pub fn register_usb(
 
 /// **Append a disk a USB device provides**, under its device's record `parent`. Its
 /// id, the place its partitions are registered under, or `None` if the table could not take it.
-pub fn register_block_under(node: ObjectRef, parent: u32, driver: &'static str) -> Option<u32> {
+pub fn register_block_under(node: Ref<DeviceNode>, parent: u32, driver: &'static str) -> Option<u32> {
     let id = {
         let mut d = DEVICES.lock();
         let id = d.len() as u32;
@@ -577,7 +566,12 @@ pub fn register_block_under(node: ObjectRef, parent: u32, driver: &'static str) 
 /// Append a keyboard or mouse a USB device provides, under its device's record `parent`, at the next
 /// `/dev/input/raw/<n>`. The table takes ownership of `node`. The `<n>`, or `None` when the table
 /// could not take it. From the hub thread.
-pub fn register_input(node: ObjectRef, kind: DeviceKind, parent: Option<u32>, driver: &'static str) -> Option<u32> {
+pub fn register_input(
+    node: Ref<DeviceNode>,
+    kind: DeviceKind,
+    parent: Option<u32>,
+    driver: &'static str,
+) -> Option<u32> {
     let served = DEVICES.lock().add_input(node, kind, parent, driver);
     if served.is_none() {
         crate::kprintln!("device: table full; dropping a {:?}", kind);
@@ -603,7 +597,7 @@ pub fn children(id: u32) -> KVec<u32> {
 
 /// **Flag `disk` as the disk the machine started from**, as one change. Whether
 /// it was not flagged before.
-pub fn mark_boot(disk: &ObjectRef) -> bool {
+pub fn mark_boot(disk: &Ref<DeviceNode>) -> bool {
     let marked = DEVICES.lock().mark_boot(disk);
     if marked {
         announce();
@@ -613,22 +607,22 @@ pub fn mark_boot(disk: &ObjectRef) -> bool {
 
 /// The node `/dev/blk/<index>` serves, as a cloned owning reference (the table keeps its own).
 /// Resolved through each entry's served index, which is also what `/dev/registry` reports.
-pub fn find_block_device(index: usize) -> Option<ObjectRef> {
+pub fn find_block_device(index: usize) -> Option<Ref<DeviceNode>> {
     DEVICES.lock().block(index as u32)
 }
 
 /// [`Registry::block_from`]: the next live block device from `index` on, and its index.
-pub fn find_block_device_from(index: usize) -> Option<(usize, ObjectRef)> {
+pub fn find_block_device_from(index: usize) -> Option<(usize, Ref<DeviceNode>)> {
     DEVICES.lock().block_from(index as u32).map(|(i, node)| (i as usize, node))
 }
 
 /// The node `/dev/input/raw/<index>` serves.
-pub fn find_input_device(index: usize) -> Option<ObjectRef> {
+pub fn find_input_device(index: usize) -> Option<Ref<DeviceNode>> {
     DEVICES.lock().input(index as u32)
 }
 
 /// Node `id`, for `/dev/registry/<id>`.
-pub fn node(id: u32) -> Option<ObjectRef> {
+pub fn node(id: u32) -> Option<Ref<DeviceNode>> {
     DEVICES.lock().node(id)
 }
 
@@ -638,7 +632,7 @@ pub fn has(kind: DeviceKind) -> bool {
 }
 
 /// The node `/dev/registry/changes` serves, or `None` if it could not be made.
-pub fn changes_node() -> Option<ObjectRef> {
+pub fn changes_node() -> Option<Ref<DeviceNode>> {
     CHANGES.lock().clone()
 }
 
@@ -730,7 +724,7 @@ impl<T> Waiters<T> {
 /// A read waiting on the change node: what answers it.
 struct WaitingRead {
     po: ObjectRef,
-    buffer: ObjectRef,
+    buffer: Ref<MemoryObject>,
     buf_offset: u64,
 }
 
@@ -743,7 +737,7 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 static WAITING: SpinLock<Waiters<WaitingRead>> = SpinLock::new(LockRank::Leaf, Waiters::new());
 
 /// The node `/dev/registry/changes` serves, made by [`init`].
-static CHANGES: SpinLock<Option<ObjectRef>> = SpinLock::new(LockRank::Leaf, None);
+static CHANGES: SpinLock<Option<Ref<DeviceNode>>> = SpinLock::new(LockRank::Leaf, None);
 
 /// **The table changed**: store its generation and answer every waiting read it is past. Thread
 /// context, with no lock held — answering completes an operation, which takes the scheduler's.
@@ -758,11 +752,8 @@ fn announce() {
 }
 
 /// Write `generation` into `buffer` at `buf_offset` and complete `po` with its eight bytes.
-fn answer(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, generation: u64) {
-    // SAFETY: `buffer` is a live `MemoryObject` reference, held across this — `sys_io_submit`
-    // checked its type and the range.
-    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
-    mo.copy_in(buf_offset as usize, &generation.to_le_bytes());
+fn answer(buffer: &MemoryObject, po: &ObjectRef, buf_offset: u64, generation: u64) {
+    buffer.copy_in(buf_offset as usize, &generation.to_le_bytes());
     // SAFETY: `po` pins the request's `PendingOperation`.
     unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, 8) };
 }
@@ -771,7 +762,7 @@ fn answer(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, generation: u64) 
 /// `offset`, the generation the reader holds, or wait until it is.** At least eight bytes, or
 /// `InvalidArgument`; a fifth reader waiting is refused, `WouldBlock`.
 fn changes_read(
-    buffer: &ObjectRef,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     buf_offset: u64,
     offset: u64,
@@ -786,7 +777,7 @@ fn changes_read(
 fn read_changes(
     waiting: &SpinLock<Waiters<WaitingRead>>,
     generation: &AtomicU64,
-    buffer: &ObjectRef,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     buf_offset: u64,
     offset: u64,
@@ -881,8 +872,7 @@ pub fn log_outcomes() {
     let enumerated = ENUMERATED.load(Ordering::Acquire);
     let devices = snapshot();
     for node in devices.iter().take(enumerated) {
-        // SAFETY: every table entry pins a live `DeviceNode`.
-        let desc = *unsafe { &*(node.as_ptr() as *const DeviceNode) }.descriptor();
+        let desc = *node.descriptor();
         let outcome = OUTCOMES.lock().iter().find(|(a, _)| *a == address(&desc)).map(|&(_, o)| o);
         crate::kprintln!("{}", OutcomeLine { desc: &desc, outcome });
     }

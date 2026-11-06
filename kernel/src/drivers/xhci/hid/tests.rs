@@ -212,7 +212,7 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     assert_eq!(unsafe { crate::sched::pending_op_completion(lights.as_ptr()) }, (KError::PeerClosed as i32, 0));
     nodes.readers[5].lock().ring.push(InputEvent::rel(REL_X, 3, 2));
 
-    let buf = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+    let buf = Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
     let po = ObjectRef::new(PendingOperation::try_new().unwrap());
     let len = 4 * INPUT_EVENT_LEN as u64;
     assert_eq!(nodes.read(&buf, &po, 0, len, made[5], 3), Err(KError::PeerClosed), "the keyboard's node");

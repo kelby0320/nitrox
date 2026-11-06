@@ -34,8 +34,8 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
-use crate::object::header::{Header, Shared, kobject};
-use crate::object::{ObjectRef, PendingOperation, StoredMsg};
+use crate::object::header::{Header, Ref, Shared, kobject};
+use crate::object::{DeviceNode, ObjectRef, PendingOperation, StoredMsg};
 
 /// How a [`FileObject`] **fills** a cache page on a fault.
 pub enum Producer {
@@ -57,7 +57,7 @@ pub enum Producer {
     /// the one thing it cannot learn otherwise — that it was **written**. An in-place overwrite
     /// never reaches the server, so the kernel sends `File::Touch` by id after a write-back
     /// ([`FileObject::writeback`]).
-    FsServerBlocks { device: ObjectRef, block_size: u32, reg: ObjectRef, file_id: u64 },
+    FsServerBlocks { device: Ref<DeviceNode>, block_size: u32, reg: ObjectRef, file_id: u64 },
 }
 
 /// One contiguous mapping from a file's blocks to the device (the kernel-side mirror of the
@@ -1081,7 +1081,7 @@ impl FileObject {
         index: usize,
         frame: PhysAddr,
         po: &ObjectRef,
-        device: &ObjectRef,
+        device: &Ref<DeviceNode>,
         block_size: u32,
         read_ahead: bool,
     ) -> FillStart {
@@ -1461,14 +1461,14 @@ mod tests {
 
     std::thread_local! {
         /// The test's server's device: one, as a server has, since a cached file refuses another.
-        static DEVICE: ObjectRef = {
+        static DEVICE: Ref<DeviceNode> = {
             let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
-            ObjectRef::new(dev)
+            Ref::new(dev)
         };
     }
 
     fn candidate_in(reg: &ObjectRef, id: u64, size: usize, block_size: u32) -> ObjectRef {
-        let device = DEVICE.with(ObjectRef::clone);
+        let device = DEVICE.with(Ref::clone);
         let f =
             FileObject::try_new(size, Producer::FsServerBlocks { device, block_size, reg: reg.clone(), file_id: id })
                 .unwrap();
@@ -1981,7 +1981,7 @@ mod tests {
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
         let node =
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-        let device = ObjectRef::new(node);
+        let device = Ref::new(node);
         let reg = registration();
         let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 7 };
         let cand = FileObject::try_new(20 * PAGE_SIZE, producer).unwrap();
@@ -2056,7 +2056,7 @@ mod tests {
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
         let node =
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-        let device = ObjectRef::new(node);
+        let device = Ref::new(node);
         let reg = registration();
         let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 7 };
         let cand = FileObject::try_new(20 * PAGE_SIZE, producer).unwrap();

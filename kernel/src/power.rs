@@ -30,6 +30,7 @@ use crate::arch::timer::ArchTimer;
 use crate::libkern::KVec;
 use crate::libkern::block::BlockKind;
 use crate::libkern::power::PowerOp;
+use crate::object::header::Ref;
 use crate::object::{DeviceNode, MAX_WAIT_HANDLES, ObjectRef, PendingOperation};
 
 /// How long the flush may take, every disk together. A drive's own limit is longer (30 seconds for
@@ -87,9 +88,7 @@ fn flush_every_disk() {
     let mut next = 0usize;
     while let Some((index, device)) = crate::device::find_block_device_from(next) {
         next = index + 1;
-        // SAFETY: the device table holds `DeviceNode`s, and `device` pins this one.
-        let node = unsafe { &*(device.as_ptr() as *const DeviceNode) };
-        if flushes(node.block_info().kind) {
+        if flushes(device.block_info().kind) {
             match start_flush(&device) {
                 Ok(po) => {
                     if flushing.try_push((index, po)).is_err() {
@@ -144,7 +143,7 @@ fn flush_every_disk() {
 }
 
 /// Send one disk a flush, returning its operation, or the status it was refused with.
-fn start_flush(device: &ObjectRef) -> Result<ObjectRef, i32> {
+fn start_flush(device: &Ref<DeviceNode>) -> Result<ObjectRef, i32> {
     let po = PendingOperation::try_new().map_err(|_| crate::syscall::KError::OutOfMemory as i32)?;
     let po = ObjectRef::new(po);
     crate::io::block::dispatch_block_flush(device, &po).map_err(|e| e as i32)?;

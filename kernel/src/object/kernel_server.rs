@@ -9,7 +9,6 @@
 
 use crate::libkern::KBox;
 use crate::libkern::handle::Rights;
-use crate::object::DeviceNode;
 use crate::object::EntropyObject;
 use crate::object::MemoryObject;
 use crate::object::ObjectRef;
@@ -212,10 +211,9 @@ fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     };
     if !want_info {
-        return OpStatus::Completed(node);
+        return OpStatus::Completed(node.erase());
     }
-    // SAFETY: `find_block_device` returns a live `DeviceNode` reference.
-    let info = unsafe { &*(node.as_ptr() as *const DeviceNode) }.block_info();
+    let info = node.block_info();
     match MemoryObject::try_new_filled(info.as_bytes()) {
         Ok(obj) => complete_with_memobj(obj),
         Err(_) => OpStatus::Rejected(KError::OutOfMemory),
@@ -233,7 +231,7 @@ fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     };
     match crate::device::find_input_device(index) {
-        Some(obj) => OpStatus::Completed(obj),
+        Some(obj) => OpStatus::Completed(obj.erase()),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }
@@ -273,7 +271,7 @@ fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
     if suffix == b"changes" {
         return match crate::device::changes_node() {
-            Some(node) => OpStatus::Completed(node),
+            Some(node) => OpStatus::Completed(node.erase()),
             None => OpStatus::Rejected(KError::NotFound),
         };
     }
@@ -281,7 +279,7 @@ fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     };
     match crate::device::node(id as u32) {
-        Some(obj) => OpStatus::Completed(obj),
+        Some(obj) => OpStatus::Completed(obj.erase()),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }
@@ -385,7 +383,7 @@ fn console_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     }
     match crate::drivers::console::device_ref() {
-        Some(obj) => OpStatus::Completed(obj),
+        Some(obj) => OpStatus::Completed(obj.erase()),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }

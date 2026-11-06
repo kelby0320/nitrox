@@ -24,9 +24,9 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
         IoOpcode::Rescan => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Rescan),
         IoOpcode::Eject => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Eject),
     };
-    let dev_ok = lookup_typed(resource_h, pid, dev_right, KObjectType::DeviceNode)?;
-    let buf_ok = lookup_typed(op.buffer, pid, buf_right, KObjectType::MemoryObject)?;
-    let buffer_size = io_buffer_size(&buf_ok.object)?;
+    let device = lookup_as::<DeviceNode>(resource_h, pid, dev_right)?;
+    let buffer = lookup_as::<MemoryObject>(op.buffer, pid, buf_right)?;
+    let buffer_size = io_buffer_size(buffer.as_object())?;
     let buf_end = op.buf_offset.checked_add(op.length).ok_or(KError::InvalidArgument)?;
     if buf_end > buffer_size {
         return Err(KError::InvalidArgument);
@@ -53,28 +53,18 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 
     // A block device goes through the IRP path; a char device through its backend. On failure
     // the PO handle is rolled back.
-    // SAFETY: `dev_ok.object` pins a live `DeviceNode` (type-checked above).
-    let dn: &DeviceNode = unsafe { &*(dev_ok.object.as_ptr() as *const DeviceNode) };
-    let dispatched: Result<(), KError> = match dn.class() {
-        DeviceClass::Block => crate::io::block::dispatch_block_irp(
-            &dev_ok.object,
-            &buf_ok.object,
-            &po_ref,
-            opcode,
-            op.offset,
-            op.buf_offset,
-            op.length,
-        ),
+    let dispatched: Result<(), KError> = match device.class() {
+        DeviceClass::Block => {
+            crate::io::block::dispatch_block_irp(&device, &buffer, &po_ref, opcode, op.offset, op.buf_offset, op.length)
+        }
         DeviceClass::Char if opcode == IoOpcode::Write => {
-            match dn.char_backend().and_then(|b| Some((b.submit_write?, b.ctx))) {
-                Some((write, ctx)) => write(&buf_ok.object, &po_ref, op.buf_offset, op.length, ctx),
+            match device.char_backend().and_then(|b| Some((b.submit_write?, b.ctx))) {
+                Some((write, ctx)) => write(&buffer, &po_ref, op.buf_offset, op.length, ctx),
                 None => Err(KError::Unsupported),
             }
         }
-        DeviceClass::Char if opcode == IoOpcode::Read => match dn.char_backend() {
-            Some(backend) => {
-                (backend.submit_read)(&buf_ok.object, &po_ref, op.buf_offset, op.offset, op.length, backend.ctx)
-            }
+        DeviceClass::Char if opcode == IoOpcode::Read => match device.char_backend() {
+            Some(backend) => (backend.submit_read)(&buffer, &po_ref, op.buf_offset, op.offset, op.length, backend.ctx),
             None => Err(KError::Unsupported),
         },
         DeviceClass::Char | DeviceClass::Other => Err(KError::Unsupported),
@@ -99,9 +89,8 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
     if op.buffer != 0 || op.buf_offset != 0 || op.offset != 0 || op.length != 0 {
         return Err(KError::InvalidArgument);
     }
-    let dev_ok = lookup_typed(resource_h, pid, Rights::WRITE, KObjectType::DeviceNode)?;
-    // SAFETY: `dev_ok.object` pins a live `DeviceNode` (type-checked above).
-    if unsafe { &*(dev_ok.object.as_ptr() as *const DeviceNode) }.class() != DeviceClass::Block {
+    let device = lookup_as::<DeviceNode>(resource_h, pid, Rights::WRITE)?;
+    if device.class() != DeviceClass::Block {
         return Err(KError::Unsupported);
     }
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
@@ -115,7 +104,7 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
             return Err(map_handle_err(e));
         }
     };
-    match crate::io::block::dispatch_block_control(&dev_ok.object, &po_ref, irp_op) {
+    match crate::io::block::dispatch_block_control(&device, &po_ref, irp_op) {
         Ok(()) => Ok(po_h.bits() as isize),
         Err(e) => {
             close_and_release(po_h, pid);

@@ -19,7 +19,8 @@ use crate::dpc::Dpc;
 use crate::libkern::KBox;
 use crate::libkern::io_op::IoOpcode;
 use crate::mm::heap::hhdm_offset;
-use crate::object::{InterruptObject, MemoryObject, ObjectRef, PendingOperation};
+use crate::object::header::Ref;
+use crate::object::{DeviceNode, InterruptObject, MemoryObject, ObjectRef, PendingOperation};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 /// The [`InterruptObject`] self-test's DPC, a static as every queued DPC must outlive its drain.
@@ -63,7 +64,7 @@ fn block_irp_self_test() {
         }
     };
     let device = match ramdisk::try_new_device(rd, b"io self-test ramdisk") {
-        Ok(dn) => ObjectRef::new(dn),
+        Ok(dn) => Ref::new(dn),
         Err(_) => {
             crate::kprintln!("io: self-test SKIP (ramdisk device alloc failed)");
             return;
@@ -72,7 +73,7 @@ fn block_irp_self_test() {
 
     const LEN: usize = 2 * crate::mm::PAGE_SIZE;
     let buffer = match MemoryObject::try_new(LEN) {
-        Ok(mo) => ObjectRef::new(mo),
+        Ok(mo) => Ref::new(mo),
         Err(_) => {
             crate::kprintln!("io: self-test SKIP (buffer alloc failed)");
             return;
@@ -112,12 +113,10 @@ fn block_irp_self_test() {
 
 /// `true` iff the first `len` bytes of `buffer`'s frames equal the ramdisk
 /// pattern (`RamDisk::pattern_byte`).
-fn buffer_matches_pattern(buffer: &ObjectRef, len: usize) -> bool {
-    // SAFETY: `buffer` pins a live `MemoryObject`.
-    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
+fn buffer_matches_pattern(buffer: &MemoryObject, len: usize) -> bool {
     let hhdm = hhdm_offset();
     let mut checked = 0usize;
-    for &frame in mo.frames() {
+    for &frame in buffer.frames() {
         let va = (frame.as_u64() + hhdm) as *const u8;
         let n = crate::mm::PAGE_SIZE.min(len - checked);
         for i in 0..n {
@@ -232,12 +231,12 @@ pub fn reclaim_under_load_self_test() {
 }
 
 /// A fresh ramdisk's device, and a buffer for one block.
-fn ramdisk_and_buffer() -> Option<(ObjectRef, ObjectRef)> {
+fn ramdisk_and_buffer() -> Option<(Ref<DeviceNode>, Ref<MemoryObject>)> {
     // SAFETY: leak the box to obtain a 'static reference for the device.
     let rd = unsafe { &*(KBox::into_raw(ramdisk::RamDisk::try_new().ok()?).as_ptr()) };
     let (device, buffer) = (
         ramdisk::try_new_device(rd, b"io reclaim self-test ramdisk").ok()?,
         MemoryObject::try_new(crate::mm::PAGE_SIZE).ok()?,
     );
-    Some((ObjectRef::new(device), ObjectRef::new(buffer)))
+    Some((Ref::new(device), Ref::new(buffer)))
 }

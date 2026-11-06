@@ -10,8 +10,8 @@ use crate::io::block::{BlockBackend, Partition, partition_backend};
 use crate::io::stats::IoStats;
 use crate::libkern::block::{BlockDeviceInfo, BlockKind};
 use crate::libkern::{AllocError, KBox};
-use crate::object::ObjectRef;
-use crate::object::header::{Header, Shared, kobject};
+use crate::object::header::{Header, Ref, Shared, kobject};
+use crate::object::{MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 
 /// What a device is, from its PCI configuration header (`docs/spec/device-node.md`).
@@ -175,7 +175,7 @@ pub struct CharBackend {
 /// `po`. **`offset` is the read's own**: a stream ignores it; the registry's change node reads
 /// it as the generation the reader holds.
 pub type CharRead = fn(
-    buffer: &ObjectRef,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     buf_offset: u64,
     offset: u64,
@@ -185,7 +185,7 @@ pub type CharRead = fn(
 
 /// A char device's write: `len` bytes from `buffer` at `buf_offset`, completing `po`.
 pub type CharWrite =
-    fn(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError>;
+    fn(buffer: &Ref<MemoryObject>, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError>;
 
 // SAFETY: identical reasoning to `BlockBackend` — `ctx` points at a device
 // structure that lives for the kernel's lifetime, touched only on the CPU

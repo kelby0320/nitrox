@@ -62,18 +62,16 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     let geometry = |blocks| BlockGeometry { logical_block_size: 512, block_count: blocks };
     let backend =
         BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
-    let disk = ObjectRef::new(
+    let disk = Ref::new(
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(8192), BlockKind::Disk, b"disk", backend).unwrap(),
     );
     let window = Partition::new(&disk, 2048, 100, 512).unwrap();
-    let part =
-        ObjectRef::new(DeviceNode::try_new_partition(ResourceDescriptor::ZERO, geometry(100), b"p", window).unwrap());
+    let part = Ref::new(DeviceNode::try_new_partition(ResourceDescriptor::ZERO, geometry(100), b"p", window).unwrap());
     // An IRP through the partition node's backend; returns its status after
     // any refusal's completion has run.
     let submit = |op: IrpOp, offset: u64| {
         let mut irp = Irp::new_block(op, core::ptr::null(), offset, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
-        // SAFETY: `part` pins the node; its backend's context is the leaked window.
-        let b = unsafe { &*(part.as_ptr() as *const DeviceNode) }.block_backend().unwrap();
+        let b = part.block_backend().unwrap();
         (b.submit)(&mut irp, b.ctx);
         crate::dpc::run_pending();
         irp.status
@@ -107,7 +105,7 @@ fn a_node_is_a_window_by_what_made_it_not_by_its_backends_function() {
     let backend = BlockBackend { submit: partition_submit, poll: partition_poll, ctx, max_frags: 8 };
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 100 };
     let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Partition, b"p", backend);
-    let node = ObjectRef::new(node.unwrap());
+    let node = Ref::new(node.unwrap());
     assert!(!retire_window(&node), "no window made it");
     assert_eq!(not_a_window, [0; 8], "nothing written through its context");
 }
@@ -139,11 +137,11 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 8192 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-    let (disk, po) = (ObjectRef::new(node), ObjectRef::new(PendingOperation::try_new().unwrap()));
+    let (disk, po) = (Ref::new(node), ObjectRef::new(PendingOperation::try_new().unwrap()));
     let frames: std::vec::Vec<PhysAddr> = (0..9).map(|i| PhysAddr(0x10_0000 + i * 0x3000)).collect();
     let page = PAGE_SIZE as u64;
     let write = |frames: &[PhysAddr], length| {
-        dispatch_block_irp_into_frames(&disk, frames, disk.clone(), &po, IoOpcode::Write, 4096, length)
+        dispatch_block_irp_into_frames(&disk, frames, disk.as_object().clone(), &po, IoOpcode::Write, 4096, length)
     };
     assert_eq!(write(&frames, 9 * page), Err(KError::InvalidArgument), "nine frames, eight fragments");
     assert_eq!(write(&frames[..8], 9 * page), Err(KError::InvalidArgument), "a length past the frames");
@@ -183,15 +181,23 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-    let disk = ObjectRef::new(node);
-    let buffer = ObjectRef::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap());
+    let disk = Ref::new(node);
+    let buffer = Ref::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap());
     let po = || ObjectRef::new(PendingOperation::try_new().unwrap());
     let frames = [PhysAddr(0x10_0000), PhysAddr(0x20_0000)];
     // Each request through both entry points, its operation's status once settled.
     let both = |offset: u64, length: u64| {
         let (a, b) = (po(), po());
         let r = dispatch_block_irp(&disk, &buffer, &a, IoOpcode::Read, offset, 0, length);
-        let s = dispatch_block_irp_into_frames(&disk, &frames, disk.clone(), &b, IoOpcode::Write, offset, length);
+        let s = dispatch_block_irp_into_frames(
+            &disk,
+            &frames,
+            disk.as_object().clone(),
+            &b,
+            IoOpcode::Write,
+            offset,
+            length,
+        );
         crate::dpc::run_pending();
         reclaim_completed();
         // SAFETY: each pins its live `PendingOperation`; a single-threaded test stands in for `SCHED`.
@@ -246,7 +252,7 @@ fn a_blocking_read_its_device_did_not_complete_fails() {
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
         let node =
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-        let disk = ObjectRef::new(node);
+        let disk = Ref::new(node);
         read_blocking(&disk, lba, 1, &mut [0u8; 512])
     };
     assert!(read(completes, runs, 0), "a read its device completed");
@@ -333,8 +339,8 @@ fn more_refusals_than_the_dpc_queue_holds_each_complete() {
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-    let disk = ObjectRef::new(node);
-    let buffer = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+    let disk = Ref::new(node);
+    let buffer = Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
     let pos: std::vec::Vec<ObjectRef> =
         (0..100).map(|_| ObjectRef::new(PendingOperation::try_new().unwrap())).collect();
     for po in &pos {

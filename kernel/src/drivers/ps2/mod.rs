@@ -20,7 +20,8 @@ use crate::libkern::IrqSpinLock;
 use crate::libkern::input::InputEvent;
 use crate::libkern::lockrank::LockRank;
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
-use crate::object::{DeviceNode, ObjectRef};
+use crate::object::header::Ref;
+use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 
 /// The two devices this controller publishes, and their `/dev/input/raw/<n>` indices.
@@ -188,7 +189,7 @@ const MAX_DRAIN_PER_IRQ: u32 = 64;
 
 /// [`CharBackend::submit_read`] for a raw input node; `max_len` is floored to whole records.
 fn submit_read(
-    buffer: &ObjectRef,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     buf_offset: u64,
     _offset: u64,
@@ -205,7 +206,7 @@ fn submit_read(
 fn read(
     ps2: &IrqSpinLock<Inner>,
     index: usize,
-    buffer: &ObjectRef,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     buf_offset: u64,
     max_len: usize,
@@ -319,7 +320,13 @@ fn reclaim(ps2: &IrqSpinLock<Inner>) {
 /// [`CharBackend::submit_write`] for the keyboard's node: **its lights**, one byte in HID's order.
 /// A write arriving while one is in flight waits, replacing any already waiting, which completes as
 /// done.
-fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError> {
+fn submit_write(
+    buffer: &Ref<MemoryObject>,
+    po: &ObjectRef,
+    buf_offset: u64,
+    len: u64,
+    ctx: *mut (),
+) -> Result<(), KError> {
     if ctx as usize != DEV_KEYBOARD {
         return Err(KError::Unsupported);
     }
@@ -510,7 +517,7 @@ pub fn init() {
         match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
             Ok(node) => {
                 // **Owned by the device table**, which `/dev/input/raw/<n>` resolves through.
-                let r = ObjectRef::new(node);
+                let r = Ref::new(node);
                 let kind = if index == DEV_KEYBOARD {
                     crate::libkern::device::DeviceKind::Keyboard
                 } else {

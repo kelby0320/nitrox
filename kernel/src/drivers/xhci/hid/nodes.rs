@@ -145,7 +145,7 @@ impl Nodes {
 
     pub(super) fn read(
         &self,
-        buffer: &ObjectRef,
+        buffer: &Ref<MemoryObject>,
         po: &ObjectRef,
         buf_offset: u64,
         max_len: u64,
@@ -186,7 +186,7 @@ impl Nodes {
     pub(super) fn write(
         &self,
         x: Option<&Xhci>,
-        buffer: &ObjectRef,
+        buffer: &Ref<MemoryObject>,
         po: &ObjectRef,
         buf_offset: u64,
         len: u64,

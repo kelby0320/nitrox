@@ -48,10 +48,10 @@ use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, KBox, KVec};
-use crate::object::ObjectRef;
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
+use crate::object::header::Ref;
 use crate::syscall::error::KError;
 
 /// Backing size of the bring-up ramdisk (64 KiB).
@@ -359,7 +359,7 @@ pub fn publish_modules() {
                 continue;
             }
         };
-        let node_ref = ObjectRef::new(node);
+        let node_ref = Ref::new(node);
         crate::device::register(node_ref.clone(), "ramdisk");
         rd.counted().attach(&node_ref);
         crate::kprintln!("ramdisk: module {} ({}), {} bytes, as a block device", disk.index, path, disk.len);

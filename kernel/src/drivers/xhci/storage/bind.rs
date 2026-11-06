@@ -287,7 +287,7 @@ impl Binding<'_> {
             crate::kprintln!("usb: port {port}: no memory for its disk's node");
             return false;
         };
-        let node = crate::object::ObjectRef::new(node);
+        let node = crate::object::header::Ref::new(node);
         let Some(id) = crate::device::register_block_under(node.clone(), parent, "usb-storage") else {
             return false;
         };

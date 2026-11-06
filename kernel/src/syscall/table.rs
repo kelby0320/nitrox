@@ -14,6 +14,7 @@ use crate::handle::global;
 use crate::handle::table::{Claim, HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
 use crate::rsproto::SizeChange;
+use lookup::{lookup_as, lookup_typed};
 
 /// What a resolve is being asked to do beyond resolving, one intent per call site.
 #[derive(Copy, Clone)]
@@ -41,6 +42,7 @@ use crate::mm::user_access::{
 use crate::mm::vmm::{Protection, VAddrRange};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 use crate::object::device_node::DeviceClass;
+use crate::object::header::Ref;
 use crate::object::kernel_server::{self, OpStatus};
 use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, SubtreeBase, validate_path};
 use crate::object::userspace_server::{Forward, ForwardOp};
@@ -511,16 +513,6 @@ fn map_handle_err(e: HandleError) -> KError {
     }
 }
 
-/// Look up `h` for `pid`, require `required` rights, confirm the object is of type `expected`
-/// (else `InvalidArgument`); the [`LookupOk`] pins the object.
-fn lookup_typed(h: u64, pid: u32, required: Rights, expected: KObjectType) -> Result<LookupOk, KError> {
-    let ok = global::get().lookup(RawHandle(h), pid, required).map_err(map_handle_err)?;
-    if ok.object.object_type() != expected {
-        return Err(KError::InvalidArgument);
-    }
-    Ok(ok)
-}
-
 fn close_on(t: &HandleTable, h: RawHandle, pid: u32) -> SysResult {
     let co = t.close(h, pid).map_err(map_handle_err)?;
     // Dropped outside the table call so teardown (rank-6 allocator) doesn't nest under rank 3.
@@ -716,8 +708,8 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
 
 /// What `sys_memory_map` maps.
 enum Mappable {
-    Memory(crate::object::header::Ref<MemoryObject>),
-    File(crate::object::header::Ref<FileObject>),
+    Memory(Ref<MemoryObject>),
+    File(Ref<FileObject>),
 }
 
 /// `sys_memory_unmap(addr, size)` — unmap the region at `addr` from the caller's address
@@ -1905,11 +1897,10 @@ fn build_and_install_file_blocks(
     use crate::rsproto::{file_blocks_rights, reply_body};
 
     let (device, device_rights) = match transfers[0].take() {
-        Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => (tr.obj, tr.rights),
-        Some(tr) => {
-            drop(tr.obj);
-            return (KError::Unsupported as i32, None);
-        }
+        Some(tr) => match tr.obj.downcast::<DeviceNode>() {
+            Ok(device) => (device, tr.rights),
+            Err(_) => return (KError::Unsupported as i32, None),
+        },
         None => return (KError::InvalidArgument as i32, None), // success but no device
     };
     let Some(body) = reply_body(reply_msg) else {
@@ -2072,7 +2063,7 @@ fn continued_dest<'o>(
 /// map, and identity (registration and file id; non-zero means cached under it).
 fn new_block_file(
     size: u32,
-    device: ObjectRef,
+    device: Ref<DeviceNode>,
     block_size: u32,
     reg: ObjectRef,
     file_id: u64,
@@ -2176,6 +2167,7 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
 }
 
 mod fill;
+mod lookup;
 mod send;
 mod spawn;
 mod submit;

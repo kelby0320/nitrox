@@ -13,6 +13,7 @@ use crate::libkern::io_op::IoOpcode;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec};
 use crate::mm::{PAGE_SIZE, PhysAddr};
+use crate::object::header::Ref;
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -130,16 +131,15 @@ fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: *mut Irp) {
 /// the device can describe in one command. A range past the device's end completes `po`
 /// `InvalidArgument`.
 pub fn dispatch_block_irp(
-    device: &ObjectRef,
-    buffer: &ObjectRef,
+    device: &Ref<DeviceNode>,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     opcode: IoOpcode,
     dev_offset: u64,
     buf_offset: u64,
     length: u64,
 ) -> Result<(), KError> {
-    // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
-    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
+    let dn: &DeviceNode = device;
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
     whole_blocks(dn, dev_offset, length)?;
     // **A disk moves 16-bit words**: an odd offset makes an odd address and count, which no PRDT holds.
@@ -147,9 +147,7 @@ pub fn dispatch_block_irp(
         return Err(KError::InvalidArgument);
     }
 
-    // SAFETY: `buffer` pins a live `MemoryObject` (type checked by the caller).
-    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
-    let frags = build_frags(mo.frames(), buf_offset, length)?;
+    let frags = build_frags(buffer.frames(), buf_offset, length)?;
     // **The device's own limit, checked against the exact fragment count.**
     // Refused rather than truncated or split: `sys_io_submit` bounds the range
     // only against the buffer's size, so a caller holding a block device handle
@@ -182,8 +180,8 @@ pub fn dispatch_block_irp(
         irp,
         frags,
         _po: po.clone(),
-        _buffer: buffer.clone(),
-        _device: device.clone(),
+        _buffer: buffer.as_object().clone(),
+        _device: device.as_object().clone(),
         reclaim_next: core::ptr::null_mut(),
     })
     .map_err(|_| KError::OutOfMemory)?;
@@ -208,10 +206,8 @@ pub fn dispatch_block_irp(
 /// **The most fragments `device` describes in one command**
 /// ([`max_frags`](BlockBackend::max_frags)), or `None` without a block backend;
 /// it sizes the page cache's runs ([`dispatch_block_irp_into_frames`]).
-pub fn max_frags(device: &ObjectRef) -> Option<u32> {
-    // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
-    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
-    dn.block_backend().map(|b| b.max_frags)
+pub fn max_frags(device: &DeviceNode) -> Option<u32> {
+    device.block_backend().map(|b| b.max_frags)
 }
 
 /// Dispatch a block IRP moving `length` bytes between device offset `dev_offset`
@@ -222,7 +218,7 @@ pub fn max_frags(device: &ObjectRef) -> Option<u32> {
 /// `≤ frames.len() * PAGE_SIZE`. Errors as [`dispatch_block_irp`]; a caller sizes
 /// its runs by [`max_frags`].
 pub fn dispatch_block_irp_into_frames(
-    device: &ObjectRef,
+    device: &Ref<DeviceNode>,
     frames: &[PhysAddr],
     pin: ObjectRef,
     po: &ObjectRef,
@@ -230,8 +226,7 @@ pub fn dispatch_block_irp_into_frames(
     dev_offset: u64,
     length: u64,
 ) -> Result<(), KError> {
-    // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
-    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
+    let dn: &DeviceNode = device;
     let backend = dn.block_backend().ok_or(KError::Unsupported)?;
     whole_blocks(dn, dev_offset, length)?;
     if length > (frames.len() * PAGE_SIZE) as u64 {
@@ -263,7 +258,7 @@ pub fn dispatch_block_irp_into_frames(
         frags,
         _po: po.clone(),
         _buffer: pin, // pins the frame owner (the FileObject), not a MemoryObject
-        _device: device.clone(),
+        _device: device.as_object().clone(),
         reclaim_next: core::ptr::null_mut(),
     })
     .map_err(|_| KError::OutOfMemory)?;
@@ -287,24 +282,22 @@ pub fn dispatch_block_irp_into_frames(
 /// medium (a partition passes it to its disk, a RAM disk completes it at once).
 /// `Err` before anything starts: `Unsupported` without a block backend,
 /// `OutOfMemory` if the IRP cannot be allocated.
-pub fn dispatch_block_flush(device: &ObjectRef, po: &ObjectRef) -> Result<(), KError> {
+pub fn dispatch_block_flush(device: &Ref<DeviceNode>, po: &ObjectRef) -> Result<(), KError> {
     dispatch_block_control(device, po, IrpOp::Flush)
 }
 
 /// Dispatch an IRP that moves no data — a [`Flush`](IrpOp::Flush), a [`Rescan`](IrpOp::Rescan) of
 /// a disk's table or an [`Eject`](IrpOp::Eject) of its medium — completing `po`. Errors as
 /// [`dispatch_block_flush`]'s.
-pub fn dispatch_block_control(device: &ObjectRef, po: &ObjectRef, op: IrpOp) -> Result<(), KError> {
-    // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
-    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
-    let backend = dn.block_backend().ok_or(KError::Unsupported)?;
+pub fn dispatch_block_control(device: &Ref<DeviceNode>, po: &ObjectRef, op: IrpOp) -> Result<(), KError> {
+    let backend = device.block_backend().ok_or(KError::Unsupported)?;
     let irp = Irp::new_block(op, device.as_ptr() as *const (), 0, 0, IrpBuffer::NONE, po.as_ptr(), 0);
     let bx = KBox::try_new(IrpBox {
         irp,
         frags: KVec::new(),
         _po: po.clone(),
-        _buffer: device.clone(), // no buffer to pin; the slot holds the device again
-        _device: device.clone(),
+        _buffer: device.as_object().clone(), // no buffer to pin; the slot holds the device again
+        _device: device.as_object().clone(),
         reclaim_next: core::ptr::null_mut(),
     })
     .map_err(|_| KError::OutOfMemory)?;
@@ -422,11 +415,9 @@ unsafe extern "C" fn finish(irp: *mut Irp) {
 /// before interrupts are enabled (the GPT driver). Returns `false` on any
 /// failure (allocation, bad device, short `dst`, device error). **Before the other CPUs come up**:
 /// another CPU's drain could take its IRP first.
-pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -> bool {
+pub fn read_blocking(device: &Ref<DeviceNode>, lba: u64, count: u64, dst: &mut [u8]) -> bool {
     debug_assert!(crate::sched::online_mask().count_ones() <= 1, "read_blocking with other CPUs online");
-    // SAFETY: `device` pins a live `DeviceNode`.
-    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
-    let Some(backend) = dn.block_backend() else {
+    let Some(backend) = device.block_backend() else {
         return false;
     };
     // **Checked**: a table's header names where its entries are, and is the disk's bytes, not ours.
@@ -440,7 +431,7 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     let Ok(buf) = MemoryObject::try_new(len) else {
         return false;
     };
-    let buf_ref = ObjectRef::new(buf);
+    let buf_ref = Ref::new(buf);
     let Ok(po) = crate::object::PendingOperation::try_new() else {
         return false;
     };
@@ -461,11 +452,9 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
         return false;
     }
 
-    // SAFETY: `buf_ref` pins the live `MemoryObject`.
-    let mo: &MemoryObject = unsafe { &*(buf_ref.as_ptr() as *const MemoryObject) };
     let hhdm = crate::mm::heap::hhdm_offset();
     let mut copied = 0usize;
-    for &frame in mo.frames() {
+    for &frame in buf_ref.frames() {
         let n = PAGE_SIZE.min(len - copied);
         let src = (frame.as_u64() + hhdm) as *const u8;
         // SAFETY: `src..src+n` is an owned, HHDM-mapped buffer frame; `dst` fits.
@@ -599,10 +588,8 @@ impl Partition {
     /// Create a partition window `[start_lba, start_lba + block_count)` over block
     /// device `disk`, returning the leaked `'static` partition, or `None` if
     /// `disk` is not a block device.
-    pub fn new(disk: &ObjectRef, start_lba: u64, block_count: u64, sector_size: u64) -> Option<&'static Partition> {
-        // SAFETY: `disk` pins a live `DeviceNode`.
-        let dn: &DeviceNode = unsafe { &*(disk.as_ptr() as *const DeviceNode) };
-        let disk_backend = dn.block_backend()?;
+    pub fn new(disk: &DeviceNode, start_lba: u64, block_count: u64, sector_size: u64) -> Option<&'static Partition> {
+        let disk_backend = disk.block_backend()?;
         let boxed = KBox::try_new(Partition {
             disk: disk_backend,
             start_lba,
@@ -623,16 +610,15 @@ impl Partition {
 }
 
 /// The partition window behind `node`, if `node` is one: a disk's node is not.
-fn window_of(node: &ObjectRef) -> Option<&'static Partition> {
-    // SAFETY: `node` pins a live `DeviceNode`.
-    unsafe { &*(node.as_ptr() as *const DeviceNode) }.window()
+fn window_of(node: &DeviceNode) -> Option<&'static Partition> {
+    node.window()
 }
 
 /// **Retire the partition window behind `node`**: every IRP is refused from
 /// here, for a rescan that departs its record; a disk's node is left alone
 /// (`false`). A submit already past the check may still be forwarding:
 /// [`window_busy`] says when none is.
-pub fn retire_window(node: &ObjectRef) -> bool {
+pub fn retire_window(node: &DeviceNode) -> bool {
     let Some(p) = window_of(node) else { return false };
     p.retired.store(true, core::sync::atomic::Ordering::SeqCst);
     true
@@ -641,7 +627,7 @@ pub fn retire_window(node: &ObjectRef) -> bool {
 /// **Whether a submit is between `node`'s window's retired check and its
 /// forward**: what a rescan waits out after [`retire_window`], so every IRP the
 /// window let through is at its disk, and none arrives after.
-pub fn window_busy(node: &ObjectRef) -> bool {
+pub fn window_busy(node: &DeviceNode) -> bool {
     window_of(node).is_some_and(|p| p.entering.load(core::sync::atomic::Ordering::SeqCst) != 0)
 }
 

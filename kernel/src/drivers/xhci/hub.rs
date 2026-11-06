@@ -35,6 +35,7 @@ use crate::libkern::block::MAX_DEVICE_NAME;
 use crate::libkern::printable::Printable;
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::object::device_node::{BlockGeometry, DeviceClass, DeviceNode, ResourceDescriptor};
+use crate::object::header::Ref;
 use crate::object::{ObjectRef, PendingOperation};
 use crate::syscall::error::KError;
 
@@ -416,7 +417,7 @@ fn record(x: &Xhci, port: u8, facts: UsbFacts) -> Option<u32> {
         crate::kprintln!("usb: port {port}: no memory for its node; it is not in the registry");
         return None;
     };
-    crate::device::register_usb(ObjectRef::new(node), &x.pci, "xhci", facts)
+    crate::device::register_usb(Ref::new(node), &x.pci, "xhci", facts)
 }
 
 /// The longest configuration descriptor kept for the class drivers: QEMU's devices' are 34 to 93
