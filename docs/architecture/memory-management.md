@@ -86,8 +86,8 @@ the same physical memory — the property that makes it shareable. See
 
 **Trace — `sys_memory_create(size, 0)`:** validate flags/size →
 `MemoryObject::try_new` (`buddy_alloc(0)` × N pages, zero each via HHDM, store
-in a slab-backed `KVec<PhysAddr>`; refcount 1) → `handle table allocate(pid,
-obj, MemoryObject, full_rights)` → return the handle to userspace.
+in a slab-backed `KVec<PhysAddr>`; refcount 1) → `handle table install(pid,
+ObjectRef::new(obj), full_rights)` → return the handle to userspace.
 
 **Trace — `sys_memory_map(h, 0, size, rights)`:** resolve the caller's
 `AddressSpace` (`sched::current_process`) → handle-table `lookup` (checks owner

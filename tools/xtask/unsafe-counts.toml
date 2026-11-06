@@ -16,14 +16,14 @@
 "kernel/src/io" = 43
 "kernel/src/libkern" = 38
 "kernel/src/limine" = 14
-"kernel/src/main" = 20
+"kernel/src/main" = 17
 "kernel/src/mm" = 87
 "kernel/src/object" = 148
 "kernel/src/pci" = 4
 "kernel/src/power" = 5
 "kernel/src/report" = 1
 "kernel/src/sched" = 194
-"kernel/src/syscall" = 48
+"kernel/src/syscall" = 28
 "kernel/src/tlb" = 2
 
 [unsafe-fns]
@@ -32,7 +32,7 @@
 "kernel/src/drivers" = 4
 "kernel/src/fbcon" = 5
 "kernel/src/framebuffer" = 1
-"kernel/src/handle" = 3
+"kernel/src/handle" = 4
 "kernel/src/initramfs" = 1
 "kernel/src/io" = 5
 "kernel/src/libkern" = 2
@@ -47,7 +47,7 @@
 "kernel/src/dpc" = 3
 "kernel/src/drivers" = 5
 "kernel/src/fbcon" = 1
-"kernel/src/handle" = 3
+"kernel/src/handle" = 1
 "kernel/src/io" = 8
 "kernel/src/libkern" = 13
 "kernel/src/mm" = 4

@@ -214,6 +214,17 @@ rollback `Installed<N>` replaces is past the first, so it becomes a countdown fa
 *n*th on, as `TABLES_LEFT` is. kplat-d16 is boot-only, so its early returns are held by the
 guard's own test. Author.
 
+**Built 2026-11-06.** No caller of the handle table holds a raw pointer: `install` answers the
+reference back with a refusal, `allocate` is the table's own and `unsafe`, and `close` and the exit
+sweep answer a `Closed`. Every syscall that installs more than one handle, or installs one before a
+step that can fail, holds them in an `Installed<N>`. That covers spawn's two tables, channel
+creation, receive, the PO paths, a thread's start, and pid 1's three at boot. None of the 28
+hand-written rollbacks is left. The control drives each such syscall on the host with its installs
+refused in turn, and counts this thread's handles in and out, since the global table is shared by
+every test. Spawn is driven up to the parent's handle and not past it: a started child needs a kernel
+stack the host has not. `unsafe` blocks fall from 954 to 931; `allocate` is one more `unsafe fn`, and
+`ClosedObject`'s two `unsafe impl`s are gone.
+
 ### J.4 The scheduler's own plumbing (sched-o6's rest, sched-o9, sched-o10, sched-o11)
 
 Four repetitions, each one function after; before J.5 to J.7, which would otherwise touch five

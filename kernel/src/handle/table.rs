@@ -28,12 +28,24 @@ pub const DEFER_RING_CAPACITY: usize = 256;
 
 #[cfg(test)]
 std::thread_local! {
-    /// One-shot per-thread flag forcing the next [`HandleTable::allocate`] on
-    /// this thread to fail with [`HandleError::OutOfMemory`], to exercise the
-    /// duplicate-error reclaim path. Per-thread as for
-    /// [`crate::handle::FAIL_NEXT_ACQUIRE`].
-    pub(crate) static FAIL_NEXT_ALLOCATE: core::cell::Cell<bool> =
-        const { core::cell::Cell::new(false) };
+    /// How many more installs on this thread succeed before every later one fails
+    /// `OutOfMemory`, or `None` for all; per-thread as for [`crate::handle::FAIL_NEXT_ACQUIRE`].
+    static INSTALLS_LEFT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+    /// Handles this thread installed less those it closed, in every table.
+    static NET_INSTALLED: core::cell::Cell<isize> = const { core::cell::Cell::new(0) };
+}
+
+/// Let this thread install `n` more handles, failing every one after, or any with `None`.
+#[cfg(test)]
+pub(crate) fn fail_installs_after(n: Option<usize>) {
+    INSTALLS_LEFT.with(|left| left.set(n));
+}
+
+/// The handles this thread has installed less those it has closed: a syscall that fails leaves
+/// it as it was.
+#[cfg(test)]
+pub(crate) fn net_installed() -> isize {
+    NET_INSTALLED.with(core::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -97,22 +109,21 @@ pub struct HandleStat {
     pub generation: u32,
 }
 
-/// The object pointer and type returned by [`HandleTable::close`].
+/// A closed handle's reference, from [`HandleTable::close`] and the exit sweep.
 ///
-/// `close` nulls the slot but does **not** decrement the refcount: it transfers
-/// the entry's one reference to this token, which the caller must account for
-/// (normally `ObjectRef::from_raw(co.0)`, then drop). Leaving the
-/// decrement to the caller, once `close` has waited out lookups, keeps destruction,
-/// which reaches the rank-6 allocator, out from under the rank-3 lock. The
-/// wrapper makes the `Result` `Send`; a bare `*mut ()` is not.
-#[derive(Copy, Clone, Debug)]
-pub struct ClosedObject(pub *mut (), pub KObjectType);
+/// The table hands the entry's reference out rather than release it: the release can destroy the
+/// object, which reaches the rank-6 allocator, so it happens when the caller drops this, after
+/// `close` has waited out lookups and outside the rank-3 lock.
+#[must_use = "dropping it releases the handle's reference, which may destroy the object"]
+#[derive(Debug)]
+pub struct Closed(ObjectRef);
 
-// SAFETY: as `LookupOk` — the pointer is opaque at the handle-table
-// layer; thread-safety of the pointee is the caller's concern.
-unsafe impl Send for ClosedObject {}
-// SAFETY: as `Send`.
-unsafe impl Sync for ClosedObject {}
+impl Closed {
+    /// The object the handle named.
+    pub fn object(&self) -> &ObjectRef {
+        &self.0
+    }
+}
 
 /// Where a [`HandleTable::close_owned_batch`] sweep resumes: it stops mid-scan
 /// so references are dropped outside the rank-3 lock. Start at
@@ -274,13 +285,32 @@ impl HandleTable {
         Ok(())
     }
 
-    /// Allocate a fresh handle for `object`, owned by `owner_pid`.
-    /// `object_type` and `rights` must satisfy the type-rights matrix or this
-    /// returns [`HandleError::BadRights`]. `object` is type-erased and **adopts
-    /// one reference** the caller already holds (a `KBox::into_raw()` pointer, or
-    /// one from [`ObjectRef::into_raw`], as `duplicate` does). `allocate` never
-    /// bumps the refcount; on failure the caller still owns the reference.
-    pub fn allocate(
+    /// Install `object` as a fresh handle owned by `owner_pid`, its rights `rights`, which must
+    /// suit its kind ([`HandleError::BadRights`] otherwise). The entry keeps the reference; a
+    /// failure hands it back.
+    pub fn install(
+        &self,
+        owner_pid: u32,
+        object: ObjectRef,
+        rights: Rights,
+    ) -> Result<RawHandle, (HandleError, ObjectRef)> {
+        // SAFETY: `object` holds one reference to a live kernel object whose tag is its header's;
+        // the reference is the entry's on success, so it is forgotten, and `object`'s on failure.
+        match unsafe { self.allocate(owner_pid, object.as_ptr(), object.object_type(), rights) } {
+            Ok(h) => {
+                core::mem::forget(object);
+                Ok(h)
+            }
+            Err(e) => Err((e, object)),
+        }
+    }
+
+    /// Allocate a fresh handle for `object`, owned by `owner_pid`, **adopting** on success the
+    /// reference the caller holds and never bumping the count.
+    ///
+    /// # Safety
+    /// `object` holds one reference to a live kernel object whose tag is `object_type`.
+    unsafe fn allocate(
         &self,
         owner_pid: u32,
         object: *mut (),
@@ -289,13 +319,9 @@ impl HandleTable {
     ) -> Result<RawHandle, HandleError> {
         debug_assert!(!object.is_null(), "callers must not store null objects");
         #[cfg(test)]
-        {
-            if FAIL_NEXT_ALLOCATE.with(|f| f.replace(false)) {
-                return Err(HandleError::OutOfMemory);
-            }
+        if INSTALLS_LEFT.with(|left| left.replace(left.get().map(|n| n.saturating_sub(1))) == Some(0)) {
+            return Err(HandleError::OutOfMemory);
         }
-        // TODO(handle-install-tag): the tag is the caller's word, not the object's header's; see
-        // `docs/rationale/deferred-decisions.md`.
         if !is_rights_compatible(object_type, rights) {
             return Err(HandleError::BadRights);
         }
@@ -353,6 +379,8 @@ impl HandleTable {
                 }
                 if let Some((seg_id, slot_id, new_gen)) = chosen {
                     self.next_segment_hint.store(seg_id, Ordering::Relaxed);
+                    #[cfg(test)]
+                    NET_INSTALLED.with(|n| n.set(n.get() + 1));
                     return Ok(RawHandle::encode(seg_id, slot_id, new_gen));
                 }
             }
@@ -508,10 +536,8 @@ impl HandleTable {
         (entry.generation.load(Ordering::Relaxed) == generation).then_some(entry)
     }
 
-    /// Close a handle, returning a [`ClosedObject`] with the object pointer and
-    /// type; the caller releases the handle's reference (see [`ClosedObject`]).
-    /// Does not decrement the refcount itself.
-    pub fn close(&self, h: RawHandle, caller_pid: u32) -> Result<ClosedObject, HandleError> {
+    /// Close a handle, handing its reference out as a [`Closed`] for the caller to release.
+    pub fn close(&self, h: RawHandle, caller_pid: u32) -> Result<Closed, HandleError> {
         if h.is_null() {
             return Err(HandleError::NullHandle);
         }
@@ -547,12 +573,6 @@ impl HandleTable {
         if prev_obj.is_null() {
             return Err(HandleError::InvalidHandle);
         }
-        // The recorded type, read before nulling, for the `ClosedObject`; the destroy reads the
-        // object's own header.
-        let object_type = match KObjectType::from_u32(entry.object_type.load(Ordering::Relaxed)) {
-            Some(t) => t,
-            None => return Err(HandleError::InvalidHandle),
-        };
 
         // Null the object under the seqlock; the generation is NOT bumped (spec
         // § "Generation counter behavior").
@@ -580,7 +600,11 @@ impl HandleTable {
         drop(guard);
         self.grace.synchronize();
 
-        Ok(ClosedObject(prev_obj, object_type))
+        #[cfg(test)]
+        NET_INSTALLED.with(|n| n.set(n.get() - 1));
+        // SAFETY: the entry held one reference to the live object at `prev_obj`, which nulling it
+        // hands here, once.
+        Ok(Closed(unsafe { ObjectRef::from_raw(prev_obj) }))
     }
 
     /// Attenuate a handle's rights in place to `existing & new_rights`; the spec
@@ -625,26 +649,15 @@ impl HandleTable {
 
     /// Duplicate a handle: a new handle to the same object with rights
     /// `existing & new_rights`; requires [`Rights::DUPLICATE`]. The
-    /// `lookup`→`allocate` gap is race-free: `lookup`'s [`ObjectRef`] holds one
+    /// `lookup`→`install` gap is race-free: `lookup`'s [`ObjectRef`] holds one
     /// reference, so a concurrent `close` of the source can drop only the source
     /// handle's reference, never the object's last. That reference moves into the
-    /// new handle ([`ObjectRef::into_raw`] + `allocate`, which adopts it without
-    /// bumping) and is reclaimed if `allocate` fails. See
+    /// new handle, or is released if the install fails. See
     /// `docs/architecture/handle-system.md`.
     pub fn duplicate(&self, h: RawHandle, caller_pid: u32, new_rights: Rights) -> Result<RawHandle, HandleError> {
         let info = self.lookup(h, caller_pid, Rights::DUPLICATE)?;
-        let dup_rights = info.rights & new_rights;
-        let (object, object_type) = info.object.into_raw();
         // DUPLICATE may be dropped by omitting it from `new_rights`; it is not forced.
-        match self.allocate(caller_pid, object, object_type, dup_rights) {
-            Ok(new_handle) => Ok(new_handle),
-            Err(e) => {
-                // SAFETY: `into_raw` above transferred exactly one
-                // outstanding reference to us; we account for it once.
-                drop(unsafe { ObjectRef::from_raw(object) });
-                Err(e)
-            }
-        }
+        self.install(caller_pid, info.object, info.rights & new_rights).map_err(|(e, _)| e)
     }
 
     /// Snapshot a handle's metadata for `sys_handle_stat`; requires
@@ -685,38 +698,28 @@ impl HandleTable {
         sum
     }
 
-    /// Close up to `out.len()` live handles owned by `pid`, resuming at
-    /// `cursor`, writing each closed slot's object into `out`; returns
-    /// `(count, more_remain)`. As with [`close`](HandleTable::close) the caller
-    /// **must** release each returned reference, and only **after this
-    /// returns**, never under the rank-3 lock: a destructor can take rank-4
-    /// object locks and, for an IPC endpoint, rank-1 `SCHED`, inverting the
-    /// ranking.
+    /// Close up to `N` live handles owned by `pid`, resuming at `cursor`; returns a fresh batch of
+    /// their references, the closed first, and `more_remain`. As with [`close`](HandleTable::close)
+    /// the caller releases each reference **after this returns**, never under the rank-3 lock: a
+    /// destructor can take rank-4 object locks and, for an IPC endpoint, rank-1 `SCHED`, inverting
+    /// the ranking. The batch is made here, so no slot the caller still holds is overwritten, and
+    /// its reference released, under that lock.
     ///
     /// `more_remain` is `true` when the batch filled, the deferred-close ring is
     /// full (the caller draining its batch is what lets it drain), or the scan
     /// has not reached the end; call again with the same `cursor` until `false`.
     /// This is the process-exit sweep: otherwise a dead process's entries pin
     /// their objects, notably its end of every pipe, forever.
-    pub fn close_owned_batch(
-        &self,
-        pid: u32,
-        cursor: &mut SweepCursor,
-        out: &mut [Option<ClosedObject>],
-    ) -> (usize, bool) {
-        let (n, more) = self.unpublish_owned_batch(pid, cursor, out);
+    pub fn close_owned_batch<const N: usize>(&self, pid: u32, cursor: &mut SweepCursor) -> ([Option<Closed>; N], bool) {
+        let mut out = [const { None }; N];
+        let (n, more) = self.unpublish_owned_batch(pid, cursor, &mut out);
         if n > 0 {
             self.grace.synchronize();
         }
-        (n, more)
+        (out, more)
     }
 
-    fn unpublish_owned_batch(
-        &self,
-        pid: u32,
-        cursor: &mut SweepCursor,
-        out: &mut [Option<ClosedObject>],
-    ) -> (usize, bool) {
+    fn unpublish_owned_batch(&self, pid: u32, cursor: &mut SweepCursor, out: &mut [Option<Closed>]) -> (usize, bool) {
         let mut n = 0usize;
         if out.is_empty() {
             return (0, true);
@@ -746,14 +749,6 @@ impl HandleTable {
                     return (n, true); // batch full — resume at this same slot
                 }
                 let obj = entry.object.load(Ordering::Acquire);
-                let object_type = match KObjectType::from_u32(entry.object_type.load(Ordering::Relaxed)) {
-                    Some(t) => t,
-                    None => {
-                        // A malformed entry must not stall the sweep.
-                        cursor.slot += 1;
-                        continue;
-                    }
-                };
                 let handle =
                     RawHandle::encode(cursor.seg as u32, cursor.slot as u32, entry.generation.load(Ordering::Relaxed));
                 let epoch = self.grace.current_epoch();
@@ -766,7 +761,12 @@ impl HandleTable {
                     let _wg = WriteGuard::new(entry);
                     entry.object.store(ptr::null_mut(), Ordering::Release);
                 }
-                out[n] = Some(ClosedObject(obj, object_type));
+                #[cfg(test)]
+                NET_INSTALLED.with(|n| n.set(n.get() - 1));
+                // SAFETY: the entry held one reference to the live object at `obj`, which nulling
+                // it hands here, once; `close_owned_batch` waits out lookups before the caller
+                // can release it.
+                out[n] = Some(Closed(unsafe { ObjectRef::from_raw(obj) }));
                 n += 1;
                 cursor.slot += 1;
             }
@@ -818,10 +818,7 @@ impl Claim<'_> {
     /// meanwhile has nothing left to close.
     pub fn commit(self) {
         let this = core::mem::ManuallyDrop::new(self);
-        if let Ok(co) = this.table.close(this.handle, this.pid) {
-            // SAFETY: `close` transferred the handle's one reference into `co`.
-            drop(unsafe { ObjectRef::from_raw(co.0) });
-        }
+        drop(this.table.close(this.handle, this.pid));
     }
 }
 

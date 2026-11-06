@@ -315,12 +315,18 @@ fn map_load_segment(asp: &mut AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &
     Ok(())
 }
 
+/// A one-page image that loads, for a host test that needs a process made from one.
+#[cfg(test)]
+pub(crate) fn a_test_image() -> std::vec::Vec<u8> {
+    tests::ElfBuilder::new().load_segment(0x40_0000, PF_X, std::vec![0xF4], 1).build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
 
-    struct ElfBuilder {
+    pub(super) struct ElfBuilder {
         segments: Vec<TestSegment>,
         e_type: u16,
         e_machine: u16,
@@ -339,7 +345,7 @@ mod tests {
     }
 
     impl ElfBuilder {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 segments: Vec::new(),
                 e_type: E_TYPE_EXEC,
@@ -376,7 +382,7 @@ mod tests {
             self
         }
 
-        fn load_segment(mut self, p_vaddr: u64, p_flags: u32, data: Vec<u8>, p_memsz: u64) -> Self {
+        pub(super) fn load_segment(mut self, p_vaddr: u64, p_flags: u32, data: Vec<u8>, p_memsz: u64) -> Self {
             self.segments.push(TestSegment { p_type: PT_LOAD, p_flags, p_vaddr, p_memsz, data });
             self
         }
@@ -385,7 +391,7 @@ mod tests {
             self
         }
 
-        fn build(self) -> Vec<u8> {
+        pub(super) fn build(self) -> Vec<u8> {
             // Layout: Ehdr | Phdrs | padding | seg0 | seg1 | ...; each segment's offset matches
             // its `p_vaddr` mod PAGE (the ELF alignment rule).
             let phdr_count = self.segments.len();

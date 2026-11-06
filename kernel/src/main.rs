@@ -702,9 +702,8 @@ unsafe fn unmap_plain(base: nitrox_kernel::mm::VirtAddr, pages: u64) {
 fn run_first_userspace() {
     use mm::addr_space::AddressSpace;
     use mm::elf::load_elf;
-    use nitrox_kernel::handle::global;
-    use nitrox_kernel::libkern::KBox;
-    use nitrox_kernel::libkern::handle::{KObjectType, Rights};
+    use nitrox_kernel::handle::{Installed, global};
+    use nitrox_kernel::libkern::handle::Rights;
     use nitrox_kernel::object::header::Ref;
     use nitrox_kernel::object::kernel_server::KernelServerId;
     use nitrox_kernel::object::{Namespace, NotificationChannel, ObjectRef, Process};
@@ -757,16 +756,12 @@ fn run_first_userspace() {
     // One reference for the Process, the other installed as a handle (refcount → 2).
     let chan_ref = ObjectRef::new(chan);
     proc_box.set_notification_channel(chan_ref.clone());
-    let (cp, ct) = chan_ref.into_raw();
+    // pid 1's handles, closed again by any return before init is spawned.
+    let mut installed = Installed::<3>::new(global::get(), 1);
     let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
-    let notif_h = match global::get().allocate(1, cp, ct, notif_rights) {
-        Ok(h) => h,
-        Err(_) => {
-            // SAFETY: reclaim the channel-handle reference; `proc_box` drops too.
-            drop(unsafe { ObjectRef::from_raw(cp) });
-            kprintln!("init: notification handle alloc failed");
-            return;
-        }
+    let Ok(notif_h) = installed.install(chan_ref, notif_rights) else {
+        kprintln!("init: notification handle alloc failed");
+        return;
     };
 
     // The root namespace, referenced like the channel above (its handle goes in `rsi`).
@@ -884,38 +879,25 @@ fn run_first_userspace() {
     // One reference for the Process, the other installed as a handle (refcount → 2).
     let ns_ref = ObjectRef::new(ns);
     proc_box.set_namespace(ns_ref.clone());
-    let (np, nt) = ns_ref.into_raw();
     // Full namespace rights, in sync with `syscall::table::namespace_rights`.
     let ns_rights =
         Rights::LOOKUP | Rights::BIND | Rights::UNBIND | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT;
-    let ns_h = match global::get().allocate(1, np, nt, ns_rights) {
-        Ok(h) => h,
-        Err(_) => {
-            // SAFETY: reclaim the namespace-handle reference; `proc_box` (which
-            // still owns its clone) drops on return.
-            drop(unsafe { ObjectRef::from_raw(np) });
-            kprintln!("init: namespace handle alloc failed");
-            return;
-        }
+    let Ok(ns_h) = installed.install(ns_ref, ns_rights) else {
+        kprintln!("init: namespace handle alloc failed");
+        return;
     };
 
     // The system-control object, the capability to stop the machine, handed to init in `rdx`. Its
     // handle has `WRITE` and `INSPECT` but not `DUPLICATE` or `TRANSFER`, so init cannot give it
     // away.
     let system_control_h = match nitrox_kernel::object::SystemControl::try_new() {
-        Ok(sc) => {
-            let sp = KBox::into_raw(sc).as_ptr() as *mut ();
-            let rights = nitrox_kernel::object::system_control::INIT_RIGHTS;
-            match global::get().allocate(1, sp, KObjectType::SystemControl, rights) {
-                Ok(h) => h.bits(),
-                Err(_) => {
-                    // SAFETY: `allocate` did not adopt the creation reference; reclaim and drop it.
-                    drop(unsafe { ObjectRef::from_raw(sp) });
-                    kprintln!("init: system-control handle alloc failed");
-                    0
-                }
+        Ok(sc) => match installed.install(ObjectRef::new(sc), nitrox_kernel::object::system_control::INIT_RIGHTS) {
+            Ok(h) => h.bits(),
+            Err(_) => {
+                kprintln!("init: system-control handle alloc failed");
+                0
             }
-        }
+        },
         Err(_) => {
             kprintln!("init: system-control object alloc failed");
             0
@@ -935,6 +917,7 @@ fn run_first_userspace() {
         kprintln!("init: spawn_user failed");
         return;
     }
+    installed.commit();
     kprintln!("init: spawned init (pid 1); handing off to userspace");
 }
 

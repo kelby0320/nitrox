@@ -224,3 +224,50 @@ pub(super) fn thread_exit_under_load_test(root: Root<'_>) -> bool {
     log::write(b"boot-probe: a last thread's sys_thread_exit closes its handles with every CPU busy ok\n");
     true
 }
+
+extern "C" fn quit(_: u64, _: u64, _: u64, _: u64) -> ! {
+    thread::exit(0)
+}
+
+/// **What a spawn and a thread's start hand back is still the caller's** once the call returns,
+/// as a handle the kernel closed again would not be: a child that exits by itself still takes a
+/// terminate request, which only queues, and a thread not suspended has no fault registers to
+/// give, which a closed handle answers `InvalidHandle` instead.
+pub(super) fn started_handles_are_kept_test(root: Root<'_>) -> bool {
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: started handles FAIL: ").s(why).end();
+        false
+    };
+    let Some((mine, its)) = channel() else {
+        return fail(b"no channel");
+    };
+    let Some(mut spawn) = stage(root, EXIT_ALONE) else {
+        return fail(b"no stage");
+    };
+    if spawn.grant(its, ALL).is_err() {
+        return fail(b"no grant");
+    }
+    let Ok(child) = spawn.spawn() else {
+        return fail(b"no child");
+    };
+    let asked = child.terminate();
+    let gone = peer_gone_by(&mine, clock_ns() + 5_000 * MS);
+    drop((child, mine));
+    if asked.is_err() {
+        return fail(b"a spawn's handle to its child was closed");
+    }
+    if !gone {
+        return fail(b"the child never exited");
+    }
+    let Ok(stack) = thread::Stack::new(4 * PAGE as usize) else {
+        return fail(b"no stack");
+    };
+    let Ok(started) = thread::start(quit, stack, 0) else {
+        return fail(b"no thread");
+    };
+    if !started.fault_registers().is_err_and(|e| e.code() == KError::InvalidArgument) {
+        return fail(b"a thread's handle was closed, or it answered as a suspended thread's");
+    }
+    log::write(b"boot-probe: a spawn's and a thread's handles are the caller's once they return ok\n");
+    true
+}

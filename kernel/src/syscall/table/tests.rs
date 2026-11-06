@@ -4,6 +4,7 @@ use crate::libkern::handle::KObjectType;
 use crate::mm::test_support::init_global_heap;
 use crate::object::Process;
 
+mod installs;
 mod object_casts;
 
 /// **A block map the page cache cannot use is refused**, each bound at the values either
@@ -145,11 +146,8 @@ fn timer_rights_are_allocatable_on_a_timer() {
     init_global_heap();
     let t = HandleTable::try_new(0x1234_5678_9ABC_DEF0).unwrap();
     let timer = crate::object::Timer::try_new().unwrap();
-    let ptr = KBox::into_raw(timer).as_ptr() as *mut ();
-    let h = t.allocate(1, ptr, KObjectType::Timer, timer_rights()).expect("timer_rights must be valid for a Timer");
-    let co = t.close(h, 1).unwrap();
-    // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    let h = t.install(1, ObjectRef::new(timer), timer_rights()).expect("timer_rights must be valid for a Timer");
+    drop(t.close(h, 1).unwrap());
 }
 
 #[test]
@@ -162,14 +160,11 @@ fn notif_channel_rights_are_allocatable_on_a_channel() {
     init_global_heap();
     let t = HandleTable::try_new(0x0FED_CBA9_8765_4321).unwrap();
     let chan = crate::object::NotificationChannel::try_new().unwrap();
-    let ptr = KBox::into_raw(chan).as_ptr() as *mut ();
     let rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     let h = t
-        .allocate(1, ptr, KObjectType::NotificationChannel, rights)
+        .install(1, ObjectRef::new(chan), rights)
         .expect("WAIT + generic rights must be valid for a NotificationChannel");
-    let co = t.close(h, 1).unwrap();
-    // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    drop(t.close(h, 1).unwrap());
 }
 
 #[test]
@@ -177,13 +172,9 @@ fn namespace_rights_are_allocatable_on_a_namespace() {
     init_global_heap();
     let t = HandleTable::try_new(0x1357_9BDF_0246_8ACE).unwrap();
     let ns = Namespace::try_new().unwrap();
-    let ptr = KBox::into_raw(ns).as_ptr() as *mut ();
-    let h = t
-        .allocate(1, ptr, KObjectType::Namespace, namespace_rights())
-        .expect("namespace_rights must be valid for a Namespace");
-    let co = t.close(h, 1).unwrap();
-    // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    let h =
+        t.install(1, ObjectRef::new(ns), namespace_rights()).expect("namespace_rights must be valid for a Namespace");
+    drop(t.close(h, 1).unwrap());
 }
 
 #[test]
@@ -191,13 +182,9 @@ fn entropy_rights_are_allocatable_on_an_entropy_object() {
     init_global_heap();
     let t = HandleTable::try_new(0x2468_ACE0_1357_9BDF).unwrap();
     let e = EntropyObject::try_new().unwrap();
-    let ptr = KBox::into_raw(e).as_ptr() as *mut ();
-    let h = t
-        .allocate(1, ptr, KObjectType::EntropyObject, entropy_rights())
-        .expect("entropy_rights must be valid for an EntropyObject");
-    let co = t.close(h, 1).unwrap();
-    // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    let h =
+        t.install(1, ObjectRef::new(e), entropy_rights()).expect("entropy_rights must be valid for an EntropyObject");
+    drop(t.close(h, 1).unwrap());
 }
 
 #[test]
@@ -206,18 +193,15 @@ fn the_system_control_handle_cannot_be_given_away() {
     use crate::object::system_control::INIT_RIGHTS;
     init_global_heap();
     let t = HandleTable::try_new(0x1357_9BDF_2468_ACE0).unwrap();
-    let ptr = KBox::into_raw(SystemControl::try_new().unwrap()).as_ptr() as *mut ();
     let h = t
-        .allocate(1, ptr, KObjectType::SystemControl, INIT_RIGHTS)
+        .install(1, ObjectRef::new(SystemControl::try_new().unwrap()), INIT_RIGHTS)
         .expect("INIT_RIGHTS must be valid for a SystemControl");
     assert!(t.lookup(h, 1, Rights::WRITE).is_ok());
     assert!(t.duplicate(h, 1, Rights::WRITE).is_err(), "a duplicate is refused");
     let held = t.lookup(h, 1, Rights::empty()).unwrap().rights;
     assert_eq!(direct_bindable(held), Err(KError::NoAccess), "and so is a bind");
     assert_eq!(direct_bindable(held | Rights::TRANSFER), Ok(()), "which TRANSFER would allow");
-    let co = t.close(h, 1).unwrap();
-    // SAFETY: `co` carries the handle's one reference, released here once.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    drop(t.close(h, 1).unwrap());
 }
 
 #[test]
@@ -298,13 +282,10 @@ fn channel_endpoint_rights_are_allocatable_on_a_channel() {
     init_global_heap();
     let t = HandleTable::try_new(0x1357_9BDF_0246_8ACE).unwrap();
     let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-    let a_ptr = KBox::into_raw(a).as_ptr() as *mut ();
     let h = t
-        .allocate(1, a_ptr, KObjectType::IpcChannel, channel_endpoint_rights())
+        .install(1, ObjectRef::new(a), channel_endpoint_rights())
         .expect("channel_endpoint_rights must be valid for an IpcChannel");
-    let co = t.close(h, 1).unwrap();
-    // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    drop(t.close(h, 1).unwrap());
     drop(b);
 }
 
@@ -351,8 +332,8 @@ fn fresh_table() -> HandleTable {
     HandleTable::try_new(0x0123_4567_89AB_CDEF).unwrap()
 }
 
-fn mk_process(pid: u32) -> *mut () {
-    KBox::into_raw(Process::try_new(pid).unwrap()).as_ptr() as *mut ()
+fn mk_process(pid: u32) -> KBox<Process> {
+    Process::try_new(pid).unwrap()
 }
 
 fn full() -> Rights {
@@ -438,7 +419,7 @@ fn only_a_memory_object_or_a_file_maps() {
 #[test]
 fn a_handle_of_another_kind_is_an_invalid_argument() {
     use crate::object::{Namespace, Timer};
-    const PID: u32 = 4453;
+    const PID: u32 = 4480;
     init_global_heap();
     global::init_for_tests();
     let h = install(PID, ObjectRef::new(Timer::try_new().unwrap()), Rights::empty()).unwrap().bits();
@@ -450,7 +431,7 @@ fn a_handle_of_another_kind_is_an_invalid_argument() {
 #[test]
 fn close_on_success_invalidates_handle() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, full()).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), full()).unwrap();
     assert_eq!(close_on(&t, h, 1), Ok(0));
     assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
 }
@@ -458,7 +439,7 @@ fn close_on_success_invalidates_handle() {
 #[test]
 fn close_on_wrong_owner_is_invalid_handle() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, full()).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), full()).unwrap();
     assert_eq!(close_on(&t, h, 2), Err(KError::InvalidHandle));
     assert_eq!(close_on(&t, h, 1), Ok(0));
 }
@@ -472,7 +453,7 @@ fn close_on_null_handle_is_invalid() {
 #[test]
 fn duplicate_on_returns_new_handle_with_intersected_rights() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, full()).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), full()).unwrap();
     let ret = duplicate_on(&t, h, 1, Rights::DUPLICATE | Rights::INSPECT).unwrap();
     assert!(ret >= 0, "a valid handle value is non-negative");
     let dup = RawHandle(ret as u64);
@@ -486,7 +467,7 @@ fn duplicate_on_returns_new_handle_with_intersected_rights() {
 #[test]
 fn duplicate_on_without_duplicate_right_is_no_access() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::INSPECT | Rights::SIGNAL).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), Rights::INSPECT | Rights::SIGNAL).unwrap();
     assert_eq!(duplicate_on(&t, h, 1, Rights::INSPECT), Err(KError::NoAccess));
     close_on(&t, h, 1).unwrap();
 }
@@ -494,7 +475,7 @@ fn duplicate_on_without_duplicate_right_is_no_access() {
 #[test]
 fn restrict_on_attenuates_in_place() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, full()).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), full()).unwrap();
     assert_eq!(restrict_on(&t, h, 1, Rights::INSPECT), Ok(0));
     let info = stat_on(&t, h, 1).unwrap();
     assert_eq!(info.rights, Rights::INSPECT.bits());
@@ -504,7 +485,7 @@ fn restrict_on_attenuates_in_place() {
 #[test]
 fn restrict_on_cannot_amplify() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::INSPECT).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), Rights::INSPECT).unwrap();
     assert_eq!(restrict_on(&t, h, 1, Rights::SIGNAL | Rights::INSPECT), Ok(0));
     let info = stat_on(&t, h, 1).unwrap();
     assert_eq!(info.rights, Rights::INSPECT.bits());
@@ -515,7 +496,7 @@ fn restrict_on_cannot_amplify() {
 fn stat_on_reports_type_rights_generation() {
     let t = fresh_table();
     let rights = Rights::INSPECT | Rights::SIGNAL;
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, rights).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), rights).unwrap();
     let info = stat_on(&t, h, 1).unwrap();
     assert_eq!(info.object_type, KObjectType::Process as u32);
     assert_eq!(info.rights, rights.bits());
@@ -527,7 +508,7 @@ fn stat_on_reports_type_rights_generation() {
 #[test]
 fn stat_on_without_inspect_is_no_access() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), Rights::SIGNAL).unwrap();
     assert_eq!(stat_on(&t, h, 1), Err(KError::NoAccess));
     close_on(&t, h, 1).unwrap();
 }
@@ -535,7 +516,7 @@ fn stat_on_without_inspect_is_no_access() {
 #[test]
 fn stat_on_wrong_owner_is_invalid_handle() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::INSPECT).unwrap();
+    let h = t.install(1, ObjectRef::new(mk_process(1)), Rights::INSPECT).unwrap();
     assert_eq!(stat_on(&t, h, 2), Err(KError::InvalidHandle));
     close_on(&t, h, 1).unwrap();
 }
@@ -563,13 +544,9 @@ fn full_mem_rights_are_allocatable_on_a_memory_object() {
     init_global_heap();
     let t = HandleTable::try_new(0xFEED_FACE_CAFE_BEEF).unwrap();
     let m = crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap();
-    let ptr = KBox::into_raw(m).as_ptr() as *mut ();
-    let h = t
-        .allocate(1, ptr, KObjectType::MemoryObject, full_mem_rights())
-        .expect("full_mem_rights must be valid for a MemoryObject");
-    let co = t.close(h, 1).unwrap();
-    // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    let h =
+        t.install(1, ObjectRef::new(m), full_mem_rights()).expect("full_mem_rights must be valid for a MemoryObject");
+    drop(t.close(h, 1).unwrap());
 }
 
 /// A file server's registration, its peer endpoint dropped.
@@ -639,7 +616,7 @@ fn a_file_blocks_reply_installs_a_file_no_more_writable_than_its_server_holds_it
                 assert_eq!(status, 0);
                 let write = global::get().lookup(RawHandle(h), FILE_CLIENT, Rights::MAP_WRITE).is_ok();
                 assert_eq!(write, w, "device rights {:?}", device);
-                close_and_release(RawHandle(h), FILE_CLIENT);
+                drop(global::get().close(RawHandle(h), FILE_CLIENT).unwrap());
             }
         }
     }
@@ -664,8 +641,8 @@ fn a_reply_for_a_cached_file_naming_another_device_is_refused() {
     let (status, b) = file_blocks_reply(&reg, 7, first, Rights::READ | Rights::WRITE | Rights::TRANSFER);
     assert_eq!(status, 0, "its own device again");
     assert!(writable(b));
-    close_and_release(RawHandle(a), FILE_CLIENT);
-    close_and_release(RawHandle(b), FILE_CLIENT);
+    drop(global::get().close(RawHandle(a), FILE_CLIENT).unwrap());
+    drop(global::get().close(RawHandle(b), FILE_CLIENT).unwrap());
 }
 
 /// A forwarded lookup, and a reply carrying a memory object built for it.
@@ -777,7 +754,7 @@ fn a_lookup_read_into_a_full_table_fails_for_good() {
     let mem = ObjectRef::new(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap());
     // SAFETY: `po` pins the `PendingOperation`.
     assert!(unsafe { crate::sched::complete_lookup(po.as_ptr(), 0, Some((mem, Rights::MAP_READ))) }.is_none());
-    crate::handle::table::FAIL_NEXT_ALLOCATE.with(|f| f.set(true));
+    crate::handle::table::fail_installs_after(Some(0));
     let failed = (map_handle_err(HandleError::OutOfMemory) as i32, 0);
     assert_eq!(read_completion(&po, PID), failed);
     assert_eq!(test_probe::memory_object_destroys(), 1, "released");

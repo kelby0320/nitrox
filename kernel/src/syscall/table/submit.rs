@@ -34,25 +34,18 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     let po_ref = ObjectRef::new(po_box);
-    let (tptr, tty) = po_ref.clone().into_raw();
-    let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt this reference; reclaim it. Then
-            // `po_ref` drops at return, destroying the PO.
-            drop(unsafe { ObjectRef::from_raw(tptr) });
-            return Err(map_handle_err(e));
-        }
-    };
+    let mut installed = installing::<1>(pid);
+    let po_h = installed.install(po_ref.clone(), pending_op_rights()).map_err(refused)?;
 
     if op.length == 0 {
         // SAFETY: `po_ref` pins the `PendingOperation`.
         unsafe { crate::sched::complete_pending_op(po_ref.as_ptr(), 0, 0) };
+        installed.commit();
         return Ok(po_h.bits() as isize);
     }
 
     // A block device goes through the IRP path; a char device through its backend. On failure
-    // the PO handle is rolled back.
+    // the PO handle is closed again.
     let dispatched: Result<(), KError> = match device.class() {
         DeviceClass::Block => {
             crate::io::block::dispatch_block_irp(&device, &buffer, &po_ref, opcode, op.offset, op.buf_offset, op.length)
@@ -69,13 +62,9 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
         },
         DeviceClass::Char | DeviceClass::Other => Err(KError::Unsupported),
     };
-    match dispatched {
-        Ok(()) => Ok(po_h.bits() as isize),
-        Err(e) => {
-            close_and_release(po_h, pid);
-            Err(e)
-        }
-    }
+    dispatched?;
+    installed.commit();
+    Ok(po_h.bits() as isize)
 }
 
 /// `sys_io_submit`'s **flush**: make what has been written to the block device `resource_h`
@@ -95,22 +84,11 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
     }
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     let po_ref = ObjectRef::new(po_box);
-    let (tptr, tty) = po_ref.clone().into_raw();
-    let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt this reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(tptr) });
-            return Err(map_handle_err(e));
-        }
-    };
-    match crate::io::block::dispatch_block_control(&device, &po_ref, irp_op) {
-        Ok(()) => Ok(po_h.bits() as isize),
-        Err(e) => {
-            close_and_release(po_h, pid);
-            Err(e)
-        }
-    }
+    let mut installed = installing::<1>(pid);
+    let po_h = installed.install(po_ref.clone(), pending_op_rights()).map_err(refused)?;
+    crate::io::block::dispatch_block_control(&device, &po_ref, irp_op)?;
+    installed.commit();
+    Ok(po_h.bits() as isize)
 }
 
 /// An I/O buffer's size; a borrowed one is refused, as the kernel and the device reach its frames.

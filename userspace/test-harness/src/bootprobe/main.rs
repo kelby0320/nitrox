@@ -143,6 +143,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         & exit_with_a_running_sibling_test(root)
         & exit_while_spawning_test(root)
         & thread_exit_under_load_test(root)
+        & started_handles_are_kept_test(root)
         & many_timers_test()
         & refused::deadlines::wait_on_nothing_test()
         & received_closes_what_was_not_taken_test()

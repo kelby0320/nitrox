@@ -57,7 +57,7 @@ Kernel objects are dispatched via `match` on `KObjectType`, not via `dyn Trait`.
 
 Don't introduce trait objects for kernel object operations. Per-type traits are fine for clarity within a type's implementation; cross-type dispatch is via the `KObjectType` discriminant.
 
-Reach a concrete type through `kernel/src/object/header.rs`, never a cast: a new object is a `Ref::new` or `ObjectRef::new` of its box, a handle is looked up with `lookup_as::<T>`, and an `ObjectRef` of any kind becomes a `T` by `downcast`/`downcast_ref`, which read the tag the type fixed in the header. A field or parameter that only ever holds one kind is a `Ref<T>`. A new object type is a `kobject!`, and a `Shared` impl argues why a `&T` is sound.
+Reach a concrete type through `kernel/src/object/header.rs`, never a cast: a new object is a `Ref::new` or `ObjectRef::new` of its box, a handle is looked up with `lookup_as::<T>`, and an `ObjectRef` of any kind becomes a `T` by `downcast`/`downcast_ref`, which read the tag the type fixed in the header. A field or parameter that only ever holds one kind is a `Ref<T>`. A new object type is a `kobject!`, and a `Shared` impl argues why a `&T` is sound. A handle is made with `HandleTable::install`, which hands the reference back on a refusal; a syscall that installs more than one, or installs one before a step that can fail, holds them in an `Installed<N>`, never a rollback by hand.
 
 ## ABI hash awareness
 

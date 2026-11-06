@@ -30,14 +30,14 @@ use crate::object::header::KObjectHeader;
 pub(crate) mod entry;
 pub mod global;
 pub(crate) mod grace;
+pub mod installed;
 pub(crate) mod prng;
 pub(crate) mod segment;
 pub mod table;
 pub(crate) mod type_rights;
 
-pub use table::{
-    Claim, ClosedObject, DEFER_RING_CAPACITY, HandleError, HandleStat, HandleTable, LookupOk, SweepCursor,
-};
+pub use installed::Installed;
+pub use table::{Claim, Closed, DEFER_RING_CAPACITY, HandleError, HandleStat, HandleTable, LookupOk, SweepCursor};
 
 /// Number of top-level directory slots, each a
 /// [`segment::SegmentEntries`] or null until grown (spec § "Default capacity").
