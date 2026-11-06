@@ -215,16 +215,17 @@ pub struct DeviceNode {
     header: Header<Self>,
     /// Self-check sentinel.
     magic: u64,
-    /// Device class (mutated to `Block` by a claiming driver).
+    /// Device class, fixed when the node is made: a driver claiming a device publishes a new
+    /// `Block` node for its disk rather than reclassing the device's.
     class: DeviceClass,
     /// The hardware resource descriptor (immutable after enumeration).
     descriptor: ResourceDescriptor,
-    /// Block geometry (zeroed until a block driver claims the node).
+    /// Block geometry; zero for a node that is not a block device.
     geometry: BlockGeometry,
     /// What kind of block device this is and what to call it — the facts a program choosing a
     /// device needs. Default for a non-block node.
     block_info: BlockDeviceInfo,
-    /// The block I/O entry point, present iff a driver has claimed this `Block` node.
+    /// The block I/O entry point, present iff this is a `Block` node.
     block_backend: Option<BlockBackend>,
     /// **The window a partition's node is over**, which a rescan of its disk retires.
     window: Option<&'static Partition>,

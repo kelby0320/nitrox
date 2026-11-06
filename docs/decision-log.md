@@ -37885,12 +37885,12 @@ Part J's second sub-part, `typed-layers.md` § J.2, built on `pre-phase-7/part-j
 
 - **A kernel object's tag is its type's**: each type is a `KObject`, made one by `kobject!`, and its
   first field is a `Header<Self>` whose tag is `Self::TYPE`, so no constructor writes a tag. The
-  macro checks at compile time that the field is a `Header<Self>` at offset 0, and
-  `dispatch_destroy`'s arms are written `T::TYPE`, so a second type with a tag leaves one
-  unreachable, which CI denies.
+  macro checks at compile time that the field is a `Header<Self>` at offset 0 and that the type
+  is `crate::object`'s of the tag's name, so no other type takes the tag; `dispatch_destroy`
+  matches every variant, freeing that type for each, so a kind with no arm does not compile.
 - **An `ObjectRef` reads its tag from the header and keeps nothing else**: `from_raw` and
-  `try_acquire` take no tag, and a handle entry's recorded tag decides no cast and no destroy. It
-  is still recorded, for the type-rights check and a handle's stat. `downcast_ref`, `downcast`,
+  `try_acquire` take no tag, and a handle entry's recorded tag decides no cast, no destroy and no
+  stat: it is still recorded, for `allocate`'s type-rights check alone. `downcast_ref`, `downcast`,
   `Ref<T>` and `lookup_as` are the only ways to a `T`. Of what the pass counted outside tests at
   J.2's base, nothing is left: 76 hand-written downcasts, 22 hand-tagged adoptions, 23 calls of
   the `adopt` helpers and 22 of `lookup_typed`.
@@ -37904,5 +37904,5 @@ Part J's second sub-part, `typed-layers.md` § J.2, built on `pre-phase-7/part-j
   `File(Ref<FileObject>)`, in place of a kind and an `Option<ObjectRef>` tied by hand.
 - **The test that drove each release tag assertion the wrong kind is retired**: every function it
   called takes a typed reference, which the compiler holds.
-- `unsafe` blocks fall from 1,094 to 959 and `unsafe fn`s from 330 to 327; `unsafe impl`s rise
+- `unsafe` blocks fall from 1,094 to 954 and `unsafe fn`s from 330 to 327; `unsafe impl`s rise
   from 52 to 67, each raise by hand in the commit that made it.

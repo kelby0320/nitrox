@@ -294,6 +294,8 @@ impl HandleTable {
                 return Err(HandleError::OutOfMemory);
             }
         }
+        // TODO(handle-install-tag): the tag is the caller's word, not the object's header's; see
+        // `docs/rationale/deferred-decisions.md`.
         if !is_rights_compatible(object_type, rights) {
             return Err(HandleError::BadRights);
         }
@@ -545,7 +547,8 @@ impl HandleTable {
         if prev_obj.is_null() {
             return Err(HandleError::InvalidHandle);
         }
-        // Capture the type before nulling so the caller can rebuild an `ObjectRef`.
+        // The recorded type, read before nulling, for the `ClosedObject`; the destroy reads the
+        // object's own header.
         let object_type = match KObjectType::from_u32(entry.object_type.load(Ordering::Relaxed)) {
             Some(t) => t,
             None => return Err(HandleError::InvalidHandle),
@@ -645,11 +648,11 @@ impl HandleTable {
     }
 
     /// Snapshot a handle's metadata for `sys_handle_stat`; requires
-    /// [`Rights::INSPECT`]. All four fields come from `lookup`'s single
+    /// [`Rights::INSPECT`]. The rights, owner and generation come from `lookup`'s single
     /// seqlock-bracketed snapshot (`owner_pid` and `generation` were verified at
-    /// steps 10 and 9). A second `read_snapshot` would race: a concurrent
-    /// close-plus-realloc of the slot (legal between two threads of one owner)
-    /// could install a new generation and owner, mixing two slot lifetimes.
+    /// steps 10 and 9), and the type from the object's own header, fixed for its life. A second
+    /// `read_snapshot` would race: a concurrent close-plus-realloc of the slot (legal between two
+    /// threads of one owner) could install a new generation and owner, mixing two slot lifetimes.
     pub fn stat(&self, h: RawHandle, caller_pid: u32) -> Result<HandleStat, HandleError> {
         let info = self.lookup(h, caller_pid, Rights::INSPECT)?;
         let (_, _, generation) = h.decode();

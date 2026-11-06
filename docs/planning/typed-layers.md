@@ -178,7 +178,7 @@ time, each diff read.
 **Built 2026-11-06.** None of what the pass measured is left: no hand-written downcast of an
 `ObjectRef` (76 at J.2's base), no hand-tagged adoption or `adopt` helper call, no `lookup_typed`,
 and no tag assertion before a cast. Tests are included; `Thread`'s raw accessors are left for J.6
-and J.7. The kernel's `unsafe` blocks fall from 1,094 to 959 and its `unsafe fn`s from 330 to 327.
+and J.7. The kernel's `unsafe` blocks fall from 1,094 to 954 and its `unsafe fn`s from 330 to 327.
 Its `unsafe impl`s rise from 52 to 67, each raised by hand:
 - the thirteen `Shared` claims, each argued beside its type;
 - `kobject!`'s impl;

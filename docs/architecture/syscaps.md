@@ -95,7 +95,7 @@ this slice fills it:
 
 ```rust
 pub struct Process {
-    header: KObjectHeader,
+    header: Header<Self>,
     pid: u32,
     // …
     syscaps: SysCaps,   // NEW: this process's ambient authority

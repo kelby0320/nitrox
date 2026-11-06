@@ -2317,6 +2317,16 @@ unmapped page below what a hint-less map places. Trigger: E.6.
 
 ### Concurrency primitives
 
+**`allocate` checks a handle's rights against the tag its caller passes, not the object's own —
+`TODO(handle-install-tag)`.** Since J.2 an object's tag is its header's, fixed by its type, and a
+lookup, a stat, a downcast and a destroy read only that. `HandleTable::allocate` still takes the
+type beside the pointer, records it, and checks the rights against that type's matrix. Eight
+sites write it by hand; each names its object's kind today, checked in the review of J.2, and one
+that did not would let a handle carry rights its kind refuses. **The fix is J.3's**:
+`install(pid, ObjectRef, rights)` takes the tag from the reference and makes `allocate` private
+(`docs/planning/typed-layers.md` § J.3). Reading the header inside `allocate` now would add an
+`unsafe` read that J.3 removes again.
+
 **The three handle-validation paths check the same things in different orders —
 `TODO(handle-validation-order)`.**
 `docs/spec/handle-encoding.md` § "Validation algorithm" gives twelve steps and says "in order".
