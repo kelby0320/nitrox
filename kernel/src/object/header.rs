@@ -45,8 +45,8 @@ const MAX_REFCOUNT: usize = usize::MAX / 2;
 /// Implemented by [`kobject!`] beside each type, which asserts what the compiler can check of it.
 ///
 /// # Safety
-/// `Self`'s field at offset 0 is a [`Header<Self>`], and no other type has the tag `TYPE`:
-/// [`dispatch_destroy`] frees an object so tagged as a `KBox<Self>`.
+/// `Self`'s field at offset 0 is a [`Header<Self>`], and `Self` is the type [`dispatch_destroy`]
+/// frees an object tagged `TYPE` as: no other type has the tag.
 pub unsafe trait KObject: Send + Sync + Sized {
     /// The tag of every object of this type.
     const TYPE: KObjectType;
@@ -59,16 +59,18 @@ pub unsafe trait KObject: Send + Sync + Sized {
 /// atomic or a lock, so no `&Self` overlaps a write made through a raw pointer.
 pub unsafe trait Shared: KObject {}
 
-/// Make `$t` a [`KObject`] tagged `KObjectType::$t`, asserting at compile time that its field at
+/// Make `$t` a [`KObject`] tagged `KObjectType::$t`, asserting at compile time that it is
+/// `crate::object::$t`, the type [`dispatch_destroy`] frees for that tag, and that its field at
 /// offset 0 is its `header`, a [`Header<$t>`].
 macro_rules! kobject {
     ($t:ident) => {
-        // SAFETY: the assertions below put a `Header<$t>` at offset 0. `dispatch_destroy`'s arm
-        // for this tag is written `$t::TYPE` and frees a `KBox<$t>`, and a second type with the
-        // tag would make one of its arms unreachable, which CI denies.
+        // SAFETY: the assertions below make `$t` the `crate::object::$t` that `dispatch_destroy`
+        // frees for `KObjectType::$t`, so no other type takes the tag, and put a `Header<$t>` at
+        // offset 0.
         unsafe impl $crate::object::header::KObject for $t {
             const TYPE: $crate::libkern::handle::KObjectType = $crate::libkern::handle::KObjectType::$t;
         }
+        const _: fn(&$t) -> &$crate::object::$t = |object| object;
         const _: () = assert!(::core::mem::offset_of!($t, header) == 0);
         const _: fn(&$t) -> &$crate::object::header::Header<$t> = |object| &object.header;
     };
@@ -191,7 +193,7 @@ impl ObjectRef {
         // the header a reference to it would cover.
         let header = unsafe { NonNull::new_unchecked(obj.cast::<KObjectHeader>()) };
         // SAFETY: as above.
-        unsafe { header.as_ref() }.try_acquire().then_some(ObjectRef { header })
+        if unsafe { header.as_ref() }.try_acquire() { Some(ObjectRef { header }) } else { None }
     }
 
     fn header(&self) -> &KObjectHeader {
@@ -333,7 +335,8 @@ impl<T: KObject> core::fmt::Debug for Ref<T> {
 
 /// Run the destructor for the kernel object at `header`: rebuild the owning `KBox` for the type
 /// its tag names and drop it, returning the storage to the slab. Dispatch is a `match` on the
-/// tag (`kernel/CLAUDE.md` § "Kernel object dispatch"), each arm the `TYPE` of the type it frees.
+/// tag (`kernel/CLAUDE.md` § "Kernel object dispatch") over every variant, each kind's arm
+/// freeing `crate::object`'s type of the same name, so a kind with no arm does not compile.
 ///
 /// # Safety
 /// `header` must be the last live reference to a kernel object.
@@ -342,26 +345,36 @@ unsafe fn dispatch_destroy(header: NonNull<KObjectHeader>) {
     let ty = unsafe { header.as_ref() }.object_type();
     #[cfg(test)]
     assert!(!crate::libkern::lockrank::sched_held_by_this_thread(), "a {ty:?} destroyed under SCHED");
-    // SAFETY: each arm frees the type whose tag it matches, which `KObject` places at `header`,
-    // made by `ObjectRef::new` from that type's `KBox`; the reference is the last, by the contract.
+    macro_rules! by_tag {
+        ($($t:ident),*) => {
+            match ty {
+                $(KObjectType::$t => destroy::<$t>(header),)*
+                KObjectType::Invalid | KObjectType::IoRing => {
+                    debug_assert!(false, "dispatch_destroy on a tag no kernel object has: {ty:?}")
+                }
+            }
+        };
+    }
+    // SAFETY: each arm frees the type whose tag it matches, the one `kobject!` lets take it, which
+    // `KObject` places at `header`, made by `ObjectRef::new` from that type's `KBox`; the reference
+    // is the last, by the contract.
     unsafe {
-        match ty {
-            Process::TYPE => destroy::<Process>(header),
-            Thread::TYPE => destroy::<Thread>(header),
-            MemoryObject::TYPE => destroy::<MemoryObject>(header),
-            Timer::TYPE => destroy::<Timer>(header),
-            NotificationChannel::TYPE => destroy::<NotificationChannel>(header),
-            IpcChannel::TYPE => destroy::<IpcChannel>(header),
-            PendingOperation::TYPE => destroy::<PendingOperation>(header),
-            Namespace::TYPE => destroy::<Namespace>(header),
-            EntropyObject::TYPE => destroy::<EntropyObject>(header),
-            DeviceNode::TYPE => destroy::<DeviceNode>(header),
-            InterruptObject::TYPE => destroy::<InterruptObject>(header),
-            UserspaceServerReg::TYPE => destroy::<UserspaceServerReg>(header),
-            FileObject::TYPE => destroy::<FileObject>(header),
-            SystemControl::TYPE => destroy::<SystemControl>(header),
-            _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
-        }
+        by_tag!(
+            Process,
+            Thread,
+            MemoryObject,
+            Timer,
+            NotificationChannel,
+            IpcChannel,
+            PendingOperation,
+            Namespace,
+            EntropyObject,
+            DeviceNode,
+            InterruptObject,
+            UserspaceServerReg,
+            FileObject,
+            SystemControl
+        )
     }
 }
 

@@ -133,6 +133,27 @@ fn try_acquire_fails_at_zero() {
     drop(unsafe { KBox::from_raw(raw) });
 }
 
+/// **A refused acquire leaves a dying object's count at zero**, through `ObjectRef` and `Ref` alike:
+/// the refusal makes no reference, so none is dropped to take the count past zero.
+#[test]
+fn a_refused_acquire_leaves_the_count_at_zero() {
+    init_global_heap();
+    test_probe::reset();
+    let raw = KBox::into_raw(Process::try_new(1).unwrap());
+    // SAFETY: the box was just given up; it is freed only after the last read below.
+    let header = unsafe { &*(raw.as_ptr() as *const KObjectHeader) };
+    assert!(header.release());
+    // SAFETY: the object is whole until the box is rebuilt below; its count is zero.
+    assert!(unsafe { ObjectRef::try_acquire(raw.as_ptr().cast()) }.is_none());
+    assert_eq!(header.refcount(), 0, "after a refused untyped acquire");
+    // SAFETY: as above.
+    assert!(unsafe { Ref::try_acquire(raw.as_ptr()) }.is_none());
+    assert_eq!(header.refcount(), 0, "after a refused typed acquire");
+    assert_eq!(test_probe::process_destroys(), 0, "a refusal destroys nothing");
+    // SAFETY: the count is zero and nothing else holds the storage, which came from a `KBox`.
+    drop(unsafe { KBox::from_raw(raw) });
+}
+
 #[test]
 fn release_reports_last_ref_exactly_once() {
     init_global_heap();
