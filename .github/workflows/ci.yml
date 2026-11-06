@@ -71,6 +71,11 @@ jobs:
       - name: cargo xtask check-syscalls
         run: cargo xtask check-syscalls
 
+      # No kernel module holds more `unsafe` blocks or `unsafe fn`s than tools/xtask/unsafe-counts.toml
+      # lists for it; a raise is by hand, in the commit that adds the `unsafe`.
+      - name: cargo xtask check-unsafe
+        run: cargo xtask check-unsafe
+
       # Each workspace formatted by `cargo fmt` with its pinned toolchain and the root rustfmt.toml.
       - name: cargo fmt --check
         run: |

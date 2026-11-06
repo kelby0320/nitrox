@@ -28,7 +28,7 @@ The kernel uses `unsafe` in well-defined places: the architecture abstraction la
 Rules:
 
 - Every `unsafe` block has a `// SAFETY:` comment explaining the invariants that make it sound.
-- Don't extend `unsafe` to new files without a reason. The total `unsafe` surface is roughly 10-15% of the kernel; adding `unsafe` should require justification.
+- Don't extend `unsafe` to new files without a reason. The total `unsafe` surface is roughly 10-15% of the kernel; adding `unsafe` should require justification. `cargo xtask check-unsafe` holds each module's count of `unsafe` blocks and `unsafe fn`s to `tools/xtask/unsafe-counts.toml`, and a raise is made by hand in the commit that adds the `unsafe`, saying why.
 - Wrap `unsafe` operations in safe abstractions where possible. The arch layer is unsafe internally but exposes safe traits.
 - Pointer dereferences in safe code through `UserPtr<T>` / `UserMutPtr<T>` are forbidden. The only way to access user memory is via the copy primitives in `kernel/src/mm/user_access.rs`.
 

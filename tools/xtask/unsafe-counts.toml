@@ -1,0 +1,45 @@
+# The `unsafe` blocks and `unsafe fn`s of each kernel module, counted by `cargo xtask check-unsafe`
+# as `cargo xtask unsafe-inventory` counts them: a module is `x.rs` and `x/` together, test code
+# left out. A count only falls. `--update` lowers or removes entries; a raise is by hand, in the
+# commit that adds the `unsafe`, whose message says why (kernel/CLAUDE.md's `unsafe` policy).
+
+[unsafe-blocks]
+"kernel/src/arch" = 207
+"kernel/src/boot_selftest" = 8
+"kernel/src/clock" = 1
+"kernel/src/device" = 5
+"kernel/src/dpc" = 4
+"kernel/src/drivers" = 134
+"kernel/src/fbcon" = 4
+"kernel/src/handle" = 30
+"kernel/src/initramfs" = 1
+"kernel/src/io" = 64
+"kernel/src/libkern" = 40
+"kernel/src/limine" = 14
+"kernel/src/main" = 26
+"kernel/src/mm" = 92
+"kernel/src/object" = 178
+"kernel/src/pci" = 5
+"kernel/src/power" = 7
+"kernel/src/report" = 1
+"kernel/src/sched" = 197
+"kernel/src/syscall" = 90
+"kernel/src/tlb" = 5
+
+[unsafe-fns]
+"kernel/src/arch" = 142
+"kernel/src/dpc" = 2
+"kernel/src/drivers" = 7
+"kernel/src/fbcon" = 5
+"kernel/src/framebuffer" = 1
+"kernel/src/handle" = 3
+"kernel/src/initramfs" = 1
+"kernel/src/io" = 6
+"kernel/src/libkern" = 2
+"kernel/src/limine" = 2
+"kernel/src/main" = 1
+"kernel/src/mm" = 23
+"kernel/src/object" = 106
+"kernel/src/pci" = 1
+"kernel/src/sched" = 45
+"kernel/src/tlb" = 1

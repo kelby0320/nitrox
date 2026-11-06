@@ -22,6 +22,8 @@ const KINDS: &[(&str, &[&str])] = &[
     ("asm", &["asm!", "global_asm!", "naked_asm!"]),
     ("volatile", &["read_volatile", "write_volatile"]),
 ];
+const UNSAFE_BLOCK: usize = 0;
+const UNSAFE_FN: usize = 1;
 const RAW_DEREF: usize = 6;
 
 /// The counts for one path: lines of code, then one per [`KINDS`] entry.
@@ -267,6 +269,19 @@ fn tally(group: &str, files: &[(String, String)]) -> R<Counts> {
         return Err(format!("unsafe-inventory: no tracked Rust code under {group}").into());
     }
     Ok(total)
+}
+
+/// The `unsafe` blocks and `unsafe fn`s of each kernel module, from `files`, each a tracked path
+/// and its text: the default groups' scan, so `x.rs` and `x/` are one module `kernel/src/x`.
+pub(super) fn kernel_unsafe(files: &[(String, String)]) -> R<std::collections::BTreeMap<String, (usize, usize)>> {
+    let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).filter(|p| p.starts_with("kernel/src/")).collect();
+    let mut out = std::collections::BTreeMap::new();
+    for group in default_groups(&paths).into_iter().filter(|g| g.starts_with("kernel/src/")) {
+        let own: Vec<(String, String)> = files.iter().filter(|(p, _)| in_group(p, &group)).cloned().collect();
+        let c = tally(&group, &own)?;
+        out.insert(group, (c.kinds[UNSAFE_BLOCK], c.kinds[UNSAFE_FN]));
+    }
+    Ok(out)
 }
 
 /// `unsafe-inventory [PATH...]`: a Markdown table, a row per path (every userspace crate and kernel
