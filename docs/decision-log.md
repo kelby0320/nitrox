@@ -37906,3 +37906,21 @@ Part J's second sub-part, `typed-layers.md` § J.2, built on `pre-phase-7/part-j
   called takes a typed reference, which the compiler holds.
 - `unsafe` blocks fall from 1,094 to 954 and `unsafe fn`s from 330 to 327; `unsafe impl`s rise
   from 52 to 67, each raise by hand in the commit that made it.
+
+## 2026-11-06 — Before Phase 7, J.3: a handle holds its reference
+
+Part J's third sub-part, `typed-layers.md` § J.3, built on `pre-phase-7/part-j3-handles`.
+
+- **The handle table takes and gives references, never raw pointers**:
+  `install(pid, ObjectRef, rights)` keeps the reference or hands it back with the refusal, the tag
+  read from the object's own header, so `TODO(handle-install-tag)`, deferred in J.2's review, is
+  resolved. `allocate` is the table's own, and `unsafe`: it was a public safe function that
+  planted whatever pointer it was given. `close` and the exit sweep answer a `#[must_use]`
+  `Closed`, released by its caller outside the rank-3 lock as before.
+- **A syscall's installs are one set, closed unless the syscall succeeds**: `Installed<'t, N>`,
+  per table, closing newest first on drop. It replaces every hand rollback, 28 of them, and closes
+  the early returns in `run_first_userspace` that left pid 1's handles installed (kplat-d16).
+- **A failure the host can drive is driven**: each such syscall runs on the host with its installs
+  refused in turn, from a countdown that replaced the one-shot `FAIL_NEXT_ALLOCATE`, and a
+  per-thread count of handles installed less closed says its tables are as they were. Counting per
+  thread is what lets it run beside other tests on the one global table.

@@ -399,7 +399,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `Thread` not among them. No hand-written downcast, hand-tagged adoption or `adopt` helper is
   left. Fails without it: a Process entered in a handle under the Thread tag looked up as a Thread.
 
-- [ ] **kobj-o2** encapsulate: the handle table passes ownership as a raw `(*mut (), KObjectType)`
+- [x] **kobj-o2** encapsulate: the handle table passes ownership as a raw `(*mut (), KObjectType)`
   pair. Every `allocate` caller does `into_raw` and, on `Err`, rebuilds the reference with `drop(unsafe
   { ObjectRef::from_raw(..) })`. `close` and `close_owned_batch` return a `Copy`
   `ClosedObject(pub *mut (), pub KObjectType)` that each caller adopts exactly once — 31 sites
@@ -418,6 +418,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `Closed` is what the grace drain hands out once the release is deferred. Depends on: nothing; it
   fits best with the kobj-d1 fix and gains from kobj-o1. ownership/soundness/opportunities/
   concurrency. Value high, effort medium. **Plan**, in P1.
+  Done in `7f21ee2e`: `install(pid, ObjectRef, rights)` keeps the reference or hands it back, its
+  tag the object's own; `allocate` is private and `unsafe`; `close` and the exit sweep answer a
+  `#[must_use]` `Closed`. No caller of the table holds a raw pointer or adopts one.
 
 - [ ] **kobj-o3** encapsulate: scheduler-owned interior state is reached through `unsafe fn
   accessor(obj: *mut (), ..)` whose contract is "live, pinned by the caller, and SCHED held" by
@@ -531,7 +534,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   capacity is its type, and a wake takes the list itself; the five waiter tests pin the order taken,
   and a `take` that keeps the list fails all five.
 
-- [ ] **kobj-o9** encapsulate: handles installed partway through a syscall are rolled back by hand
+- [x] **kobj-o9** encapsulate: handles installed partway through a syscall are rolled back by hand
   on each later early return — 17 sites (`grep -E
   '(close_and_release|spawn_rollback_child_handles|recv_rollback_installed)\('
   kernel/src/syscall/table.rs`: 5 spawn rollbacks at `:424,443,458,469,486`, 5 in
@@ -543,6 +546,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   Home: `kernel/src/syscall/table.rs` (or `kernel/src/handle/`). Closes: a handle left in a table,
   pinning its object, when a new early return forgets the rollback. Depends on: nothing. ownership.
   Value medium, effort small. **Plan**, in P1.
+  Done in `7f21ee2e`: `Installed<'t, N>`, closed on drop unless committed, holds the handles of
+  channel creation, receive, spawn (the child's and the parent's), the PO paths and a thread's
+  start. Fails without it: each syscall's installs refused in turn leaves its tables as they were,
+  and eight of the nine tests fail with the drop closing nothing.
 
 - [ ] **kobj-o10** encapsulate: uncounted back-pointers to kernel objects (`IpcChannel.peer`,
   `IpcChannel.us_reg`, `CachedFile.obj`, the handle entry's object pointer) are each upgraded with
@@ -2617,7 +2624,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `5ac6215f`: `klog::copy_into_object(&MemoryObject)` writes through `copy_in`, and
   klog.rs has no unsafe left; fails without it: `the_log_is_copied_into_its_object_cut_at_its_size`
   (a cap past the object, or every run at offset 0).
-- [ ] **kplat-d16** `kernel/src/main.rs:874` — `run_first_userspace` allocates pid-1
+- [x] **kplat-d16** `kernel/src/main.rs:874` — `run_first_userspace` allocates pid-1
   handle-table entries (`notif_h`, then `ns_h` and `system_control_h`) as raw u64s, then returns
   on twelve later failure paths (main.rs:877, 888, 894, 900, 934, 943, 949, 962, 972, 980,
   1001, 1043) without closing them. Each entry keeps its object (notification channel, root
@@ -2625,6 +2632,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   any `bind_kernel_server`, or `spawn_user` leaks them to a process that will never exist.
   Unverified: by path (`notif_h` at main.rs:863-871, and the early returns read). Reachable
   only by a boot-time OOM or bind failure, not injected. ownership. Low. **Plan**, in P1.
+  Fixed in `7f21ee2e`: pid 1's three handles are an `Installed<3>`, committed once init is
+  spawned, so each early return closes them. Boot-only, so held by `Installed`'s own test.
 - [x] **kplat-d17** `kernel/src/arch/x86_64/ioapic.rs:55` — IOAPIC registers use an indirect
   IOREGSEL-then-IOWIN protocol and `set_rte_mask` is a read-modify-write, but nothing
   serialises them, and the `ArchIrqRouter` route/mask/unmask contracts do not ask callers to
@@ -2814,7 +2823,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   so klog's fill is `memobj.copy_in(off, run)` and `copy_into_frames` takes `&mut MemoryObject`.
   Home: kernel/src/mm. Closes: safe code writing a frame it does not own (kplat-d15). Depends
   on: nothing. ownership, opportunities. Value medium, effort medium. **Plan**, in P2.
-- [ ] **kplat-o7** encapsulate: handle installation by `global::get().allocate(owner, raw_ptr,
+- [x] **kplat-o7** encapsulate: handle installation by `global::get().allocate(owner, raw_ptr,
   ty, rights)` after `ObjectRef::into_raw`, with a manual `drop(ObjectRef::from_raw(p, t))` on
   the error arm — 27 sites (`grep -rn "global::get().allocate(" kernel/src --include=*.rs |
   grep -v "tests\|test_support" | wc -l` = 26: main.rs 3, syscall/table.rs 23; plus
@@ -2825,6 +2834,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   reclaimed twice or never on an allocate error path, a type tag that disagrees with the
   pointer (the class behind kplat-d16). Depends on: nothing. ownership. Value medium, effort
   medium. **Plan**, as kobj-o2, in P1.
+  Done in `7f21ee2e`, as kobj-o2: `run_first_userspace`'s three installs go through `install`.
 - [x] **kplat-o8** remove: `unsafe fn`s whose whole contract is "ring 0" and whose bodies cannot
   break memory safety (TLB flushes, `wbinvd`, masking interrupts, MTRR/PAT reads after a CPUID
   check, walking the always-valid active root); `ArchCpu::halt` has no callers — 24 sites
