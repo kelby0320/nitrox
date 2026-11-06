@@ -4,42 +4,42 @@
 # commit that adds the `unsafe`, whose message says why (kernel/CLAUDE.md's `unsafe` policy).
 
 [unsafe-blocks]
-"kernel/src/arch" = 201
+"kernel/src/arch" = 200
 "kernel/src/boot_selftest" = 8
 "kernel/src/clock" = 1
-"kernel/src/device" = 5
+"kernel/src/device" = 1
 "kernel/src/dpc" = 4
-"kernel/src/drivers" = 133
+"kernel/src/drivers" = 101
 "kernel/src/fbcon" = 4
 "kernel/src/handle" = 30
 "kernel/src/initramfs" = 1
-"kernel/src/io" = 64
+"kernel/src/io" = 43
 "kernel/src/libkern" = 38
 "kernel/src/limine" = 14
-"kernel/src/main" = 23
-"kernel/src/mm" = 90
-"kernel/src/object" = 178
-"kernel/src/pci" = 5
-"kernel/src/power" = 7
+"kernel/src/main" = 20
+"kernel/src/mm" = 87
+"kernel/src/object" = 148
+"kernel/src/pci" = 4
+"kernel/src/power" = 5
 "kernel/src/report" = 1
-"kernel/src/sched" = 196
-"kernel/src/syscall" = 89
+"kernel/src/sched" = 194
+"kernel/src/syscall" = 48
 "kernel/src/tlb" = 2
 
 [unsafe-fns]
 "kernel/src/arch" = 125
 "kernel/src/dpc" = 2
-"kernel/src/drivers" = 7
+"kernel/src/drivers" = 4
 "kernel/src/fbcon" = 5
 "kernel/src/framebuffer" = 1
 "kernel/src/handle" = 3
 "kernel/src/initramfs" = 1
-"kernel/src/io" = 6
+"kernel/src/io" = 5
 "kernel/src/libkern" = 2
 "kernel/src/limine" = 2
 "kernel/src/main" = 1
 "kernel/src/mm" = 23
-"kernel/src/object" = 106
+"kernel/src/object" = 107
 "kernel/src/pci" = 1
 "kernel/src/sched" = 45
 
@@ -50,8 +50,8 @@
 "kernel/src/handle" = 3
 "kernel/src/io" = 8
 "kernel/src/libkern" = 13
-"kernel/src/mm" = 3
-"kernel/src/object" = 16
+"kernel/src/mm" = 4
+"kernel/src/object" = 30
 
 [unsafe-attrs]
 "kernel/src/arch" = 12

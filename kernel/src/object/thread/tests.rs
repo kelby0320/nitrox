@@ -72,11 +72,7 @@ fn dropping_a_user_thread_releases_its_process_no_cycle() {
     test_probe::reset();
     let (proc_ref, _root) = user_process_ref(1);
     let t = user_thread_no_stack(1, proc_ref, 0x40_0000, 0x7fff_f000);
-    let tref = {
-        let ptr = KBox::into_raw(t).as_ptr() as *mut ();
-        // SAFETY: into_raw yielded the single creation ref; adopt it.
-        unsafe { ObjectRef::from_raw(ptr, KObjectType::Thread) }
-    };
+    let tref = crate::object::ObjectRef::new(t);
     assert_eq!(test_probe::process_destroys(), 0);
     assert_eq!(test_probe::thread_destroys(), 0);
     drop(tref);

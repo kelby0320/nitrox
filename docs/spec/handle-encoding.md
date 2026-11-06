@@ -99,9 +99,9 @@ struct HandleEntry {
     generation:   u32,            // bumped on each slot reuse
     owner_pid:    u32,
     rights:       Rights,         // 8 bytes
-    object_type:  KObjectType,    // 4 bytes
+    object_type:  KObjectType,    // 4 bytes; the type allocate checked the rights against
     in_transit:   u32,            // nonzero while a move claims it; read only under the table lock
-    object:       AtomicPtr<()>,  // 8 bytes; type-erased; dispatch via object_type
+    object:       AtomicPtr<()>,  // 8 bytes; type-erased; dispatch via the object's own header
     next_owned:   RawHandle,      // 8 bytes; intrusive list for per-process cleanup
     free_next:    u32,            // index of next free slot (valid only when free)
     _pad2:        u32,

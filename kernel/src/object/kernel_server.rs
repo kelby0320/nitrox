@@ -8,12 +8,10 @@
 //! lookup's `PendingOperation`, so an in-kernel lookup is synchronous.
 
 use crate::libkern::KBox;
-use crate::libkern::handle::{KObjectType, Rights};
-use crate::object::DeviceNode;
+use crate::libkern::handle::Rights;
 use crate::object::EntropyObject;
 use crate::object::MemoryObject;
 use crate::object::ObjectRef;
-use crate::object::Process;
 use crate::syscall::error::KError;
 
 /// Identifies one in-kernel resource server; `Copy`, so a `KernelServer` binding needs no
@@ -89,10 +87,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
 
 /// Adopt a fresh [`MemoryObject`] into a [`Completed`](OpStatus::Completed) answer.
 fn complete_with_memobj(obj: KBox<MemoryObject>) -> OpStatus {
-    // SAFETY: `into_raw` yields the one outstanding creation reference.
-    OpStatus::Completed(unsafe {
-        ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), KObjectType::MemoryObject)
-    })
+    OpStatus::Completed(ObjectRef::new(obj))
 }
 
 /// `/dev/entropy` — a **leaf**; an exact match mints an [`EntropyObject`] on the global CSPRNG.
@@ -101,10 +96,7 @@ fn entropy_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     }
     match EntropyObject::try_new() {
-        // SAFETY: `into_raw` yields the one outstanding creation reference.
-        Ok(obj) => OpStatus::Completed(unsafe {
-            ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), KObjectType::EntropyObject)
-        }),
+        Ok(obj) => OpStatus::Completed(ObjectRef::new(obj)),
         Err(_) => OpStatus::Rejected(KError::OutOfMemory),
     }
 }
@@ -122,7 +114,7 @@ fn proc_self_process(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     }
     match crate::sched::current_process() {
-        Some(obj) => OpStatus::Completed(obj),
+        Some(obj) => OpStatus::Completed(obj.erase()),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }
@@ -143,11 +135,7 @@ fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
     }
-    let ns = crate::sched::current_process().and_then(|p| {
-        // SAFETY: `current_process` returns a live `Process` ObjectRef; `p` pins it
-        // for this borrow. `namespace_ref` clones the stored namespace ObjectRef.
-        unsafe { &*(p.as_ptr() as *const Process) }.namespace_ref()
-    });
+    let ns = crate::sched::current_process().and_then(|p| p.namespace_ref());
     match ns {
         Some(obj) => OpStatus::Completed(obj),
         None => OpStatus::Rejected(KError::NotFound),
@@ -218,10 +206,9 @@ fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     };
     if !want_info {
-        return OpStatus::Completed(node);
+        return OpStatus::Completed(node.erase());
     }
-    // SAFETY: `find_block_device` returns a live `DeviceNode` reference.
-    let info = unsafe { &*(node.as_ptr() as *const DeviceNode) }.block_info();
+    let info = node.block_info();
     match MemoryObject::try_new_filled(info.as_bytes()) {
         Ok(obj) => complete_with_memobj(obj),
         Err(_) => OpStatus::Rejected(KError::OutOfMemory),
@@ -239,7 +226,7 @@ fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     };
     match crate::device::find_input_device(index) {
-        Some(obj) => OpStatus::Completed(obj),
+        Some(obj) => OpStatus::Completed(obj.erase()),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }
@@ -279,7 +266,7 @@ fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
     if suffix == b"changes" {
         return match crate::device::changes_node() {
-            Some(node) => OpStatus::Completed(node),
+            Some(node) => OpStatus::Completed(node.erase()),
             None => OpStatus::Rejected(KError::NotFound),
         };
     }
@@ -287,7 +274,7 @@ fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     };
     match crate::device::node(id as u32) {
-        Some(obj) => OpStatus::Completed(obj),
+        Some(obj) => OpStatus::Completed(obj.erase()),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }
@@ -391,7 +378,7 @@ fn console_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     }
     match crate::drivers::console::device_ref() {
-        Some(obj) => OpStatus::Completed(obj),
+        Some(obj) => OpStatus::Completed(obj.erase()),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }
@@ -414,6 +401,7 @@ fn parse_index(s: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libkern::handle::KObjectType;
     use crate::mm::test_support::init_global_heap;
 
     #[test]
@@ -462,8 +450,7 @@ mod tests {
         match dispatch(KernelServerId::SchedStats, b"", Rights::MAP_READ) {
             OpStatus::Completed(obj) => {
                 assert_eq!(obj.object_type(), KObjectType::MemoryObject);
-                // SAFETY: `obj` pins a live MemoryObject just created above.
-                let m = unsafe { &*(obj.as_ptr() as *const MemoryObject) };
+                let m = obj.downcast_ref::<MemoryObject>().unwrap();
                 assert_eq!(m.size(), PAGE_SIZE); // one page holds the header
                 let expected = b"cpus_online=0\nreaper_closed=0\nexit_closed=0\n";
                 let base = (m.frames()[0].as_u64() + heap::hhdm_offset()) as *const u8;

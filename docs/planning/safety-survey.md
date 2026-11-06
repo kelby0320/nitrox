@@ -370,7 +370,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
 
 **Opportunities**
 
-- [ ] **kobj-o1** encapsulate: the kernel object's type tag and its pointer are tied together
+- [x] **kobj-o1** encapsulate: the kernel object's type tag and its pointer are tied together
   only by hand. Adoptions write `ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (),
   KObjectType::X)`, and downcasts write `unsafe { &*(r.as_ptr() as *const X) }` after a `match` or
   `lookup_typed` several lines up. `ObjectRef::object_type()` returns the tag the creator passed,
@@ -392,6 +392,12 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `handle/table.rs`. Closes: a type-confused destroy (kobj-d8, demonstrated) and a cast made
   without its tag check. Depends on: nothing for the 13 non-`Thread` types. abi/ownership/
   soundness/concurrency/opportunities. Value high, effort medium. **Plan**, in P1.
+  Done in `30e79517` with its sites in `499e3cc4`, `2ddb0898` and `60874ea9`: every type is a
+  `KObject`, made one by `kobject!`, whose `Header<Self>` at offset 0 fixes its tag, so no
+  constructor writes one. `ObjectRef` reads its tag from the header; `downcast_ref`, `downcast`,
+  `Ref<T>` and `lookup_as` check it. `Shared` marks the thirteen kinds a `&T` is sound for,
+  `Thread` not among them. No hand-written downcast, hand-tagged adoption or `adopt` helper is
+  left. Fails without it: a Process entered in a handle under the Thread tag looked up as a Thread.
 
 - [ ] **kobj-o2** encapsulate: the handle table passes ownership as a raw `(*mut (), KObjectType)`
   pair. Every `allocate` caller does `into_raw` and, on `Err`, rebuilds the reference with `drop(unsafe
@@ -1445,7 +1451,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Opportunities**
 
-- [ ] **kmem-o1** encapsulate: a type-erased `ObjectRef` is downcast by hand with `unsafe {
+- [x] **kmem-o1** encapsulate: a type-erased `ObjectRef` is downcast by hand with `unsafe {
   &*(r.as_ptr() as *const T) }` behind a `debug_assert` or an earlier match, fresh boxes are
   adopted with `from_raw` or the safe `adopt<T>` helpers under any tag, and
   `FileObject::writable_unmapped` takes `*mut ()` — 128 sites (103 production downcasts, 32 of
@@ -1466,6 +1472,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `unsafe impl Send/Sync` claims every object is Send + Sync while `Process` is not (VmaTree's
   `NonNull` links), so the supertrait would force an explicit, argued impl. Depends on: nothing.
   Lenses: abi, ownership, soundness, concurrency, opportunities. Value high, effort medium.
+  Done in `224f1a2f`: `Vma::backing` is `Anonymous`, `Object(Ref<MemoryObject>)` or
+  `File(Ref<FileObject>)`, and the three assertions went with it. `Process` is `Send + Sync` by
+  `VmaTree: Send`, argued there: the tree owns every node its links reach.
   **Plan**, as kobj-o1, in P1.
 - [ ] **kmem-o2** encapsulate: physical frames are bare `Copy` `PhysAddr` values from
   `heap::buddy_alloc` and returned by hand with the safe `buddy_free(addr, order)`; the buddy
@@ -2023,7 +2032,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   pointers that dereference raw arguments. Depends on: nothing. Lenses: abi, ownership,
   opportunities. Value high, effort medium. **Plan**, in P5.
 
-- [ ] **drv-o2** encapsulate: kernel objects are adopted from a `KBox` and downcast from an
+- [x] **drv-o2** encapsulate: kernel objects are adopted from a `KBox` and downcast from an
   `ObjectRef` by hand. `ObjectRef::from_raw(KBox::into_raw(x).as_ptr() as *mut (),
   KObjectType::Y)` is written inline or through the untyped safe `adopt` helpers, and `&*(r.as_ptr()
   as *const DeviceNode|MemoryObject)` relies on "type checked by the caller" behind safe pub fns
@@ -2043,6 +2052,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   reached from safe signatures; it removes 27 of the subsystem's 96 raw derefs. Depends on:
   nothing. Lenses: abi, ownership, soundness, opportunities. Value high, effort medium.
   **Plan**, as kobj-o1, in P1.
+  Done in `499e3cc4`, on `30e79517`'s types: the registry holds `Ref<DeviceNode>`, and block I/O
+  and the char backends take typed devices and buffers.
 
 - [ ] **drv-o3** encapsulate: DMA memory is read and written through raw pointers from
   `DmaBuffer::virt()`, or u64 addresses kept beside the buffer, at hand-computed offsets: AHCI
@@ -2773,7 +2784,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `3d1174b5`: as sched-d1: no frame address leaves the arch layer, `ArchRegisters` and its
   any-`usize` decoder are gone, and `irq_dispatcher!` hands its bodies a `&mut ExceptionFrame`
   converted once.
-- [ ] **kplat-o5** encapsulate: kernel objects travel type-erased — adopted with `ObjectRef::
+- [x] **kplat-o5** encapsulate: kernel objects travel type-erased — adopted with `ObjectRef::
   from_raw(KBox::into_raw(x).as_ptr() as *mut (), KObjectType::T)`, downcast with `&*(r.as_ptr()
   as *const T)`, and passed to `unsafe fn f(obj: *mut ())` — 235 sites (downcasts `grep -rnE
   '&\*\(\w+(\.\w+)*\.as_ptr\(\) as \*(const|mut) [A-Za-z_:]+\)' kernel/src` = 105; type-erased
@@ -2789,6 +2800,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   it drops. Depends on: nothing; spans object and sched, seen here from power.rs, idt.rs and
   main.rs. ownership, soundness, opportunities. Value medium, effort large.
   **Plan**, as kobj-o1, in P1.
+  Done in `30e79517`, `2ddb0898` and `60874ea9`, for its adoptions and downcasts: the current
+  process and a user thread's are `Ref<Process>`. The `unsafe fn f(obj: *mut ())` it also counts
+  are kobj-o3's and kobj-o7's, in J.5 and J.6.
 - [ ] **kplat-o6** encapsulate: physical frames written through `(phys + hhdm_offset()) as *mut
   u8` from a bare `PhysAddr`, ownership asserted only in a SAFETY comment — 44 sites (`grep -rn
   'hhdm_offset()' kernel/src` less comments, the definition and tests.rs; 19 of them write, by

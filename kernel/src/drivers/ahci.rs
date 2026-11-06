@@ -17,7 +17,6 @@ use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
@@ -25,6 +24,7 @@ use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
+use crate::object::header::Ref;
 use crate::object::{InterruptObject, ObjectRef};
 
 const HBA_CAP: u64 = 0x00;
@@ -461,9 +461,8 @@ fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
 }
 
 /// **The disk's block node**, its backend pointing at `disk`, published before the node is.
-fn disk_node(controller: &ObjectRef, sectors: u64, name: &[u8], disk: &AhciDisk) -> Option<KBox<DeviceNode>> {
-    // SAFETY: `controller` pins a live `DeviceNode`.
-    let cdesc = unsafe { &*(controller.as_ptr() as *const DeviceNode) }.descriptor();
+fn disk_node(controller: &DeviceNode, sectors: u64, name: &[u8], disk: &AhciDisk) -> Option<KBox<DeviceNode>> {
+    let cdesc = controller.descriptor();
     let backend = BlockBackend {
         submit,
         poll: ahci_poll,

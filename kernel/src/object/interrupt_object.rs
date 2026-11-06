@@ -9,19 +9,23 @@
 
 use core::cell::UnsafeCell;
 
-use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, ArrayVec, KBox};
 use crate::object::WaitQueue;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 
 /// A hardware-interrupt waitable (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct InterruptObject {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     /// All mutable state, reached only under `SCHED`.
     inner: UnsafeCell<InterruptInner>,
 }
+
+kobject!(InterruptObject);
+// SAFETY: an `InterruptObject` changes once shared only in `inner`, an `UnsafeCell` touched only
+// under `SCHED`.
+unsafe impl Shared for InterruptObject {}
 
 struct InterruptInner {
     /// Pending unconsumed interrupts (saturating); `> 0` ⇒ the waitable is signaled.
@@ -47,7 +51,7 @@ impl InterruptObject {
     /// Allocate an unsignalled `InterruptObject` with a refcount of one.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::InterruptObject),
+            header: Header::new(),
             magic: Self::MAGIC,
             inner: UnsafeCell::new(InterruptInner { pending: 0, waiters: WaitQueue::new() }),
         })
@@ -167,7 +171,7 @@ mod tests {
         // SAFETY: live object, single-threaded test stands in for SCHED.
         assert!(!unsafe { InterruptObject::already_signaled(p) });
         // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
-        drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
+        drop(unsafe { ObjectRef::from_raw(p) });
     }
 
     #[test]
@@ -186,7 +190,7 @@ mod tests {
             assert!(!InterruptObject::already_signaled(p));
         }
         // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
-        drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
+        drop(unsafe { ObjectRef::from_raw(p) });
     }
 
     #[test]
@@ -202,20 +206,14 @@ mod tests {
             assert_eq!(&InterruptObject::take_waiters(p)[..], &[t2]);
         }
         // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
-        drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
+        drop(unsafe { ObjectRef::from_raw(p) });
     }
 
     #[test]
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        // SAFETY: adopt the creation reference and drop it.
-        let r = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(InterruptObject::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::InterruptObject,
-            )
-        };
+        let r = ObjectRef::new(InterruptObject::try_new().unwrap());
         assert_eq!(test_probe::interrupt_object_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::interrupt_object_destroys(), 1);

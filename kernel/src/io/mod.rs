@@ -17,10 +17,10 @@ pub mod stats;
 
 use crate::dpc::Dpc;
 use crate::libkern::KBox;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::io_op::IoOpcode;
 use crate::mm::heap::hhdm_offset;
-use crate::object::{InterruptObject, MemoryObject, ObjectRef, PendingOperation};
+use crate::object::header::Ref;
+use crate::object::{DeviceNode, InterruptObject, MemoryObject, ObjectRef, PendingOperation};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 /// The [`InterruptObject`] self-test's DPC, a static as every queued DPC must outlive its drain.
@@ -64,8 +64,7 @@ fn block_irp_self_test() {
         }
     };
     let device = match ramdisk::try_new_device(rd, b"io self-test ramdisk") {
-        // SAFETY: a fresh `DeviceNode`, adopted under its own tag.
-        Ok(dn) => unsafe { adopt(dn, KObjectType::DeviceNode) },
+        Ok(dn) => Ref::new(dn),
         Err(_) => {
             crate::kprintln!("io: self-test SKIP (ramdisk device alloc failed)");
             return;
@@ -74,16 +73,14 @@ fn block_irp_self_test() {
 
     const LEN: usize = 2 * crate::mm::PAGE_SIZE;
     let buffer = match MemoryObject::try_new(LEN) {
-        // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
-        Ok(mo) => unsafe { adopt(mo, KObjectType::MemoryObject) },
+        Ok(mo) => Ref::new(mo),
         Err(_) => {
             crate::kprintln!("io: self-test SKIP (buffer alloc failed)");
             return;
         }
     };
     let po = match PendingOperation::try_new() {
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        Ok(po) => unsafe { adopt(po, KObjectType::PendingOperation) },
+        Ok(po) => ObjectRef::new(po),
         Err(_) => {
             crate::kprintln!("io: self-test SKIP (PO alloc failed)");
             return;
@@ -116,12 +113,10 @@ fn block_irp_self_test() {
 
 /// `true` iff the first `len` bytes of `buffer`'s frames equal the ramdisk
 /// pattern (`RamDisk::pattern_byte`).
-fn buffer_matches_pattern(buffer: &ObjectRef, len: usize) -> bool {
-    // SAFETY: `buffer` pins a live `MemoryObject`.
-    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
+fn buffer_matches_pattern(buffer: &MemoryObject, len: usize) -> bool {
     let hhdm = hhdm_offset();
     let mut checked = 0usize;
-    for &frame in mo.frames() {
+    for &frame in buffer.frames() {
         let va = (frame.as_u64() + hhdm) as *const u8;
         let n = crate::mm::PAGE_SIZE.min(len - checked);
         for i in 0..n {
@@ -141,8 +136,7 @@ fn buffer_matches_pattern(buffer: &ObjectRef, len: usize) -> bool {
 
 fn interrupt_object_self_test() {
     let irq = match InterruptObject::try_new() {
-        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
-        Ok(io) => unsafe { adopt(io, KObjectType::InterruptObject) },
+        Ok(io) => ObjectRef::new(io),
         Err(_) => {
             crate::kprintln!("io: interrupt self-test SKIP (alloc failed)");
             return;
@@ -210,8 +204,7 @@ pub fn reclaim_under_load_self_test() {
     let before = block::reclaim_backlog();
     let mut peak = before;
     for _ in 0..READS {
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        let Ok(po) = PendingOperation::try_new().map(|po| unsafe { adopt(po, KObjectType::PendingOperation) }) else {
+        let Ok(po) = PendingOperation::try_new().map(ObjectRef::new) else {
             panic!("io: reclaim-under-load self-test: no memory for an operation");
         };
         let sent = block::dispatch_block_irp(&device, &buffer, &po, IoOpcode::Read, 0, 0, 512).is_ok();
@@ -238,22 +231,12 @@ pub fn reclaim_under_load_self_test() {
 }
 
 /// A fresh ramdisk's device, and a buffer for one block.
-fn ramdisk_and_buffer() -> Option<(ObjectRef, ObjectRef)> {
+fn ramdisk_and_buffer() -> Option<(Ref<DeviceNode>, Ref<MemoryObject>)> {
     // SAFETY: leak the box to obtain a 'static reference for the device.
     let rd = unsafe { &*(KBox::into_raw(ramdisk::RamDisk::try_new().ok()?).as_ptr()) };
     let (device, buffer) = (
         ramdisk::try_new_device(rd, b"io reclaim self-test ramdisk").ok()?,
         MemoryObject::try_new(crate::mm::PAGE_SIZE).ok()?,
     );
-    // SAFETY: a fresh `DeviceNode` and `MemoryObject`, each adopted under its own tag.
-    unsafe { Some((adopt(device, KObjectType::DeviceNode), adopt(buffer, KObjectType::MemoryObject))) }
-}
-
-/// Adopt a freshly-created kernel object box into an owning [`ObjectRef`].
-///
-/// # Safety
-/// `obj` is a kernel object whose type `ty` names: its drop runs `ty`'s destructor on it.
-unsafe fn adopt<T>(obj: KBox<T>, ty: KObjectType) -> ObjectRef {
-    // SAFETY: `into_raw` yields the single creation reference of a `ty` object, by the contract.
-    unsafe { ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), ty) }
+    Some((Ref::new(device), Ref::new(buffer)))
 }

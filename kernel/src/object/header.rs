@@ -1,21 +1,22 @@
-//! [`KObjectHeader`] and [`ObjectRef`] — the reference-counting substrate
-//! every kernel object is built on.
+//! [`KObjectHeader`], [`ObjectRef`] and [`Ref`] — the reference-counting substrate every kernel
+//! object is built on, and the types that tie an object's tag to its pointer.
 //!
-//! Each kernel object is `#[repr(C)]` with a [`KObjectHeader`] as its **first field**, so a
+//! Each kernel object type is a [`KObject`], whose **first field** is a [`Header<Self>`], so a
 //! type-erased `*mut ()` from the handle table can be read as `*const KObjectHeader` without
 //! knowing the concrete type (see `docs/architecture/overview.md` § "Kernel objects" and
-//! `docs/archive/os-design-v5.1.md` § "Object Header and Dispatch"). The concrete type is
-//! needed only to run the right destructor on the last release, dispatched via `match` on
-//! [`KObjectType`](crate::libkern::handle::KObjectType), never `dyn` (`kernel/CLAUDE.md`
-//! § "Kernel object dispatch").
+//! `docs/archive/os-design-v5.1.md` § "Object Header and Dispatch"). The header's tag is the
+//! type's [`KObject::TYPE`], fixed by the header's own type, and an [`ObjectRef`] reads it there.
+//! The concrete type is needed only to downcast and to run the right destructor on the last
+//! release, dispatched via `match` on [`KObjectType`](crate::libkern::handle::KObjectType), never
+//! `dyn` (`kernel/CLAUDE.md` § "Kernel object dispatch").
 //!
 //! ## Ownership model
 //!
-//! Each live handle-table entry owns exactly one refcount; each [`ObjectRef`] owns exactly one:
-//! `refcount == (live handles to O) + (live ObjectRefs to O)`. The count reaches zero exactly
-//! once, firing exactly one destroy. An `ObjectRef` returned by `lookup` pins the object
-//! across the `lookup`→`allocate` gap, closing the `HandleTable::duplicate` TOCTOU described
-//! in `docs/architecture/handle-system.md`.
+//! Each live handle-table entry owns exactly one refcount; each [`ObjectRef`] or [`Ref`] owns
+//! exactly one: `refcount == (live handles to O) + (live references to O)`. The count reaches
+//! zero exactly once, firing exactly one destroy. An `ObjectRef` returned by `lookup` pins the
+//! object across the `lookup`→`allocate` gap, closing the `HandleTable::duplicate` TOCTOU
+//! described in `docs/architecture/handle-system.md`.
 //!
 //! ## Memory ordering
 //!
@@ -23,6 +24,8 @@
 //! established happens-before), the decrement is `Release`, and the thread that sees the
 //! count reach zero issues an `Acquire` fence before destroying.
 
+use core::marker::PhantomData;
+use core::ops::Deref;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
@@ -36,6 +39,43 @@ use crate::object::{
 /// Upper bound on the refcount; exceeding it means ~2^62 leaked references, so abort rather
 /// than wrap into a use-after-free (as `Arc` does with `isize::MAX`).
 const MAX_REFCOUNT: usize = usize::MAX / 2;
+
+/// A kernel object type, every one of whose headers is tagged [`TYPE`](Self::TYPE).
+///
+/// Implemented by [`kobject!`] beside each type, which asserts what the compiler can check of it.
+///
+/// # Safety
+/// `Self`'s field at offset 0 is a [`Header<Self>`], and `Self` is the type [`dispatch_destroy`]
+/// frees an object tagged `TYPE` as: no other type has the tag.
+pub unsafe trait KObject: Send + Sync + Sized {
+    /// The tag of every object of this type.
+    const TYPE: KObjectType;
+}
+
+/// A kernel object that a shared `&Self` may be formed to while a reference pins it.
+///
+/// # Safety
+/// Once an object of this type is shared, nothing writes its fields except through a cell, an
+/// atomic or a lock, so no `&Self` overlaps a write made through a raw pointer.
+pub unsafe trait Shared: KObject {}
+
+/// Make `$t` a [`KObject`] tagged `KObjectType::$t`, asserting at compile time that it is
+/// `crate::object::$t`, the type [`dispatch_destroy`] frees for that tag, and that its field at
+/// offset 0 is its `header`, a [`Header<$t>`].
+macro_rules! kobject {
+    ($t:ident) => {
+        // SAFETY: the assertions below make `$t` the `crate::object::$t` that `dispatch_destroy`
+        // frees for `KObjectType::$t`, so no other type takes the tag, and put a `Header<$t>` at
+        // offset 0.
+        unsafe impl $crate::object::header::KObject for $t {
+            const TYPE: $crate::libkern::handle::KObjectType = $crate::libkern::handle::KObjectType::$t;
+        }
+        const _: fn(&$t) -> &$crate::object::$t = |object| object;
+        const _: () = assert!(::core::mem::offset_of!($t, header) == 0);
+        const _: fn(&$t) -> &$crate::object::header::Header<$t> = |object| &object.header;
+    };
+}
+pub(crate) use kobject;
 
 /// The common header every kernel object begins with.
 ///
@@ -51,7 +91,7 @@ pub struct KObjectHeader {
 
 impl KObjectHeader {
     /// A header for a fresh object, refcount one: the reference the creator holds.
-    pub const fn new(object_type: KObjectType) -> Self {
+    const fn new(object_type: KObjectType) -> Self {
         Self { refcount: AtomicUsize::new(1), object_type }
     }
 
@@ -101,213 +141,252 @@ impl KObjectHeader {
     }
 }
 
-/// An owning reference to a kernel object: one refcount, released on drop.
-///
-/// The pointer is type-erased; the recorded type selects the destructor on the last release.
-#[derive(Debug)]
-pub struct ObjectRef {
-    obj: NonNull<()>,
-    object_type: KObjectType,
+/// The [`KObjectHeader`] of a `T`, whose tag its type sets to `T::TYPE`, so no constructor
+/// writes one.
+#[repr(transparent)]
+pub struct Header<T> {
+    raw: KObjectHeader,
+    _type: PhantomData<fn() -> T>,
 }
 
-// SAFETY: the refcount is atomic, and the concrete objects behind the erased pointer keep
-// their mutable state behind atomics or locks, so they are `Send + Sync`. Destruction runs
-// only on the last release, after an `Acquire` fence ordering every other holder's final
-// access before the drop.
+impl<T: KObject> Header<T> {
+    /// A header for a fresh `T`, refcount one: the reference its creator holds.
+    #[allow(clippy::new_without_default, reason = "a header is made once per object, as its first field")]
+    pub const fn new() -> Self {
+        Self { raw: KObjectHeader::new(T::TYPE), _type: PhantomData }
+    }
+}
+
+/// An owning reference to a kernel object of any type: one refcount, released on drop.
+///
+/// Its tag is the object's header's, so the destructor its last release runs is the one the
+/// object's type fixed. [`downcast_ref`](Self::downcast_ref) and [`downcast`](Self::downcast)
+/// check it against a type.
+#[derive(Debug)]
+pub struct ObjectRef {
+    header: NonNull<KObjectHeader>,
+}
+
+// SAFETY: the refcount is atomic, and the object behind the pointer is `Send + Sync`, as every
+// `KObject` is: `new` takes only a `KObject`'s box, and `from_raw` and `try_acquire` a pointer to
+// a kernel object. Destruction runs only on the last release, after an `Acquire` fence ordering
+// every other holder's final access before the drop.
 unsafe impl Send for ObjectRef {}
 // SAFETY: as `Send`.
 unsafe impl Sync for ObjectRef {}
 
 impl ObjectRef {
+    /// Adopt a fresh object's box as the reference its creator holds.
+    pub fn new<T: KObject>(object: KBox<T>) -> Self {
+        Self { header: KBox::into_raw(object).cast() }
+    }
+
     /// Acquire a reference to the object at `obj`, or `None` if its count was already zero.
     ///
     /// # Safety
-    /// `obj` must point at a live kernel object of type `ty` (header at
-    /// offset 0). In the handle table this is guaranteed by `lookup`
-    /// having observed `entry.object` non-null under a grace read-guard
-    /// before this call (step 6 precedes step 7).
-    pub unsafe fn try_acquire(obj: *mut (), ty: KObjectType) -> Option<ObjectRef> {
-        // SAFETY: caller guarantees `obj` addresses a live object whose
-        // first field is a `KObjectHeader`.
-        let header = unsafe { &*(obj as *const KObjectHeader) };
-        if header.try_acquire() {
-            // SAFETY: `obj` is non-null per the caller's contract.
-            Some(ObjectRef { obj: unsafe { NonNull::new_unchecked(obj) }, object_type: ty })
-        } else {
-            None
-        }
+    /// `obj` must point at a live kernel object. In the handle table this is guaranteed by
+    /// `lookup` having observed `entry.object` non-null under a grace read-guard before this call
+    /// (step 6 precedes step 7).
+    pub unsafe fn try_acquire(obj: *mut ()) -> Option<ObjectRef> {
+        // SAFETY: `obj` addresses a live kernel object, so it is non-null, and its header is at
+        // offset 0. The pointer is `obj` itself, whose provenance spans the whole object, not
+        // the header a reference to it would cover.
+        let header = unsafe { NonNull::new_unchecked(obj.cast::<KObjectHeader>()) };
+        // SAFETY: as above.
+        if unsafe { header.as_ref() }.try_acquire() { Some(ObjectRef { header }) } else { None }
+    }
+
+    fn header(&self) -> &KObjectHeader {
+        // SAFETY: the reference this holds keeps the object, and so its header, live.
+        unsafe { self.header.as_ref() }
     }
 
     /// The type-erased object pointer.
     pub fn as_ptr(&self) -> *mut () {
-        self.obj.as_ptr()
+        self.header.as_ptr().cast()
     }
 
-    /// The concrete type of the referenced object.
+    /// The concrete type of the referenced object, read from its header.
     pub fn object_type(&self) -> KObjectType {
-        self.object_type
+        self.header().object_type()
+    }
+
+    /// `true` iff the object is a `T`.
+    pub fn is<T: KObject>(&self) -> bool {
+        self.object_type() == T::TYPE
+    }
+
+    /// The object as a `T`, if its header says it is one; borrowed for as long as this reference.
+    pub fn downcast_ref<T: Shared>(&self) -> Option<&T> {
+        if !self.is::<T>() {
+            return None;
+        }
+        // SAFETY: the header says the object is a `T`, which `KObject` places at the header's
+        // address; this reference keeps it live for the borrow, and `T: Shared` lets it be shared.
+        Some(unsafe { self.header.cast::<T>().as_ref() })
+    }
+
+    /// This reference as a [`Ref<T>`], if the object's header says it is a `T`; else itself back.
+    pub fn downcast<T: KObject>(self) -> Result<Ref<T>, ObjectRef> {
+        if self.is::<T>() { Ok(Ref { object: self, _type: PhantomData }) } else { Err(self) }
     }
 
     /// Consume the `ObjectRef`, yielding its raw `(pointer, type)` and handing the held reference
     /// **out** without decrementing; the recipient must account for it via
     /// [`ObjectRef::from_raw`] or a handle entry.
     pub fn into_raw(self) -> (*mut (), KObjectType) {
-        let raw = (self.obj.as_ptr(), self.object_type);
+        let raw = (self.as_ptr(), self.object_type());
         core::mem::forget(self);
         raw
     }
 
-    /// Reconstruct an `ObjectRef` from a pair from [`into_raw`](ObjectRef::into_raw) or a handle
-    /// entry; adopts that reference and does **not** increment.
+    /// Reconstruct an `ObjectRef` from a pointer from [`into_raw`](ObjectRef::into_raw) or a
+    /// handle entry; adopts that reference and does **not** increment.
     ///
     /// # Safety
-    /// `ptr` must own exactly one outstanding reference to a live object
-    /// of type `ty`, and that reference must not be reclaimed twice.
-    pub unsafe fn from_raw(ptr: *mut (), ty: KObjectType) -> ObjectRef {
+    /// `ptr` must own exactly one outstanding reference to a live kernel object, and that
+    /// reference must not be reclaimed twice.
+    pub unsafe fn from_raw(ptr: *mut ()) -> ObjectRef {
         debug_assert!(!ptr.is_null(), "ObjectRef::from_raw on null pointer");
-        ObjectRef {
-            // SAFETY: caller guarantees `ptr` is non-null and owns a ref.
-            obj: unsafe { NonNull::new_unchecked(ptr) },
-            object_type: ty,
-        }
+        // SAFETY: caller guarantees `ptr` is non-null and owns a ref.
+        ObjectRef { header: unsafe { NonNull::new_unchecked(ptr.cast()) } }
     }
 }
 
 impl Clone for ObjectRef {
     fn clone(&self) -> Self {
-        // SAFETY: we already hold a reference, so the header is live and
-        // its count is at least one; `bump` cannot resurrect a zero.
-        let header = unsafe { &*(self.obj.as_ptr() as *const KObjectHeader) };
-        header.bump();
-        ObjectRef { obj: self.obj, object_type: self.object_type }
+        // We already hold a reference, so the count is at least one; `bump` cannot resurrect a
+        // zero.
+        self.header().bump();
+        ObjectRef { header: self.header }
     }
 }
 
 impl Drop for ObjectRef {
     fn drop(&mut self) {
-        // SAFETY: we hold a reference, so the header is live.
-        let header = unsafe { &*(self.obj.as_ptr() as *const KObjectHeader) };
-        if header.release() {
+        if self.header().release() {
             // Acquire so every other holder's final writes are visible to the destructor.
             fence(Ordering::Acquire);
-            // SAFETY: this was the last reference, so we have exclusive
-            // access; `object_type` records the concrete type, and the
-            // pointer originated from a `KBox::<T>::into_raw` for that T.
-            unsafe { dispatch_destroy(self.obj.as_ptr(), self.object_type) };
+            // SAFETY: this was the last reference, so we have exclusive access.
+            unsafe { dispatch_destroy(self.header) };
         }
     }
 }
 
-/// Run the destructor for the kernel object at `ptr`: rebuild the owning `KBox` for its
-/// concrete type and drop it, returning the storage to the slab. Dispatch is a `match` on the
-/// tag (`kernel/CLAUDE.md` § "Kernel object dispatch").
+/// An owning reference to a kernel object of type `T`: an [`ObjectRef`] whose tag is `T::TYPE`.
+/// It derefs to `T` where `T` is [`Shared`].
+pub struct Ref<T: KObject> {
+    object: ObjectRef,
+    _type: PhantomData<T>,
+}
+
+impl<T: KObject> Ref<T> {
+    /// Adopt a fresh `T`'s box as the reference its creator holds.
+    pub fn new(object: KBox<T>) -> Self {
+        Self { object: ObjectRef::new(object), _type: PhantomData }
+    }
+
+    /// Acquire a reference to the `T` at `obj`, or `None` if its count was already zero.
+    ///
+    /// # Safety
+    /// `obj` must point at a live `T`.
+    pub unsafe fn try_acquire(obj: *mut T) -> Option<Self> {
+        // SAFETY: a live `T` is a live kernel object, by the contract.
+        unsafe { ObjectRef::try_acquire(obj.cast()) }.map(|object| Self { object, _type: PhantomData })
+    }
+
+    /// The reference, its type forgotten.
+    pub fn erase(self) -> ObjectRef {
+        self.object
+    }
+
+    /// The reference as an [`ObjectRef`], for what takes any object.
+    pub fn as_object(&self) -> &ObjectRef {
+        &self.object
+    }
+
+    /// The object's pointer.
+    pub fn as_ptr(&self) -> *mut T {
+        self.object.header.as_ptr().cast()
+    }
+}
+
+impl<T: KObject> Clone for Ref<T> {
+    fn clone(&self) -> Self {
+        Self { object: self.object.clone(), _type: PhantomData }
+    }
+}
+
+impl<T: Shared> Deref for Ref<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the object is a `T`, its tag checked or set when this was made; this reference
+        // keeps it live for the borrow, and `T: Shared` lets it be shared.
+        unsafe { &*self.as_ptr() }
+    }
+}
+
+impl<T: KObject> core::fmt::Debug for Ref<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Ref").field(&T::TYPE).field(&self.as_ptr()).finish()
+    }
+}
+
+/// Run the destructor for the kernel object at `header`: rebuild the owning `KBox` for the type
+/// its tag names and drop it, returning the storage to the slab. Dispatch is a `match` on the
+/// tag (`kernel/CLAUDE.md` § "Kernel object dispatch") over every variant, each kind's arm
+/// freeing `crate::object`'s type of the same name, so a kind with no arm does not compile.
 ///
 /// # Safety
-/// `ptr` must be the last live reference to an object of type `ty`,
-/// originally produced by `KBox::<Concrete>::into_raw`.
-unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
+/// `header` must be the last live reference to a kernel object.
+unsafe fn dispatch_destroy(header: NonNull<KObjectHeader>) {
+    // SAFETY: the object is live until it is freed below, by the contract.
+    let ty = unsafe { header.as_ref() }.object_type();
     #[cfg(test)]
     assert!(!crate::libkern::lockrank::sched_held_by_this_thread(), "a {ty:?} destroyed under SCHED");
-    match ty {
-        KObjectType::Process => {
-            // SAFETY: last ref to a `Process` produced by KBox::into_raw.
-            drop(unsafe { KBox::<Process>::from_raw(NonNull::new_unchecked(ptr as *mut Process)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::Process);
-        }
-        KObjectType::Thread => {
-            // SAFETY: last ref to a `Thread` produced by KBox::into_raw.
-            drop(unsafe { KBox::<Thread>::from_raw(NonNull::new_unchecked(ptr as *mut Thread)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::Thread);
-        }
-        KObjectType::MemoryObject => {
-            // SAFETY: last ref to a `MemoryObject` produced by KBox::into_raw.
-            // Dropping the box runs `MemoryObject::Drop`, freeing its frames.
-            drop(unsafe { KBox::<MemoryObject>::from_raw(NonNull::new_unchecked(ptr as *mut MemoryObject)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::MemoryObject);
-        }
-        KObjectType::Timer => {
-            // SAFETY: last ref to a `Timer` produced by KBox::into_raw.
-            drop(unsafe { KBox::<Timer>::from_raw(NonNull::new_unchecked(ptr as *mut Timer)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::Timer);
-        }
-        KObjectType::NotificationChannel => {
-            // SAFETY: last ref to a `NotificationChannel` produced by KBox::into_raw.
-            drop(unsafe {
-                KBox::<NotificationChannel>::from_raw(NonNull::new_unchecked(ptr as *mut NotificationChannel))
-            });
-            #[cfg(test)]
-            test_probe::note(KObjectType::NotificationChannel);
-        }
-        KObjectType::IpcChannel => {
-            // SAFETY: last ref to an `IpcChannel` produced by KBox::into_raw.
-            // Dropping the box runs `IpcChannel::Drop`, which unlinks the peer.
-            drop(unsafe { KBox::<IpcChannel>::from_raw(NonNull::new_unchecked(ptr as *mut IpcChannel)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::IpcChannel);
-        }
-        KObjectType::PendingOperation => {
-            // SAFETY: last ref to a `PendingOperation` produced by KBox::into_raw.
-            drop(unsafe { KBox::<PendingOperation>::from_raw(NonNull::new_unchecked(ptr as *mut PendingOperation)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::PendingOperation);
-        }
-        KObjectType::Namespace => {
-            // SAFETY: last ref to a `Namespace` produced by KBox::into_raw.
-            // Dropping the box releases every binding's target `ObjectRef`.
-            drop(unsafe { KBox::<Namespace>::from_raw(NonNull::new_unchecked(ptr as *mut Namespace)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::Namespace);
-        }
-        KObjectType::EntropyObject => {
-            // SAFETY: last ref to an `EntropyObject` produced by KBox::into_raw.
-            // The object owns nothing; the box drop frees its allocation.
-            drop(unsafe { KBox::<EntropyObject>::from_raw(NonNull::new_unchecked(ptr as *mut EntropyObject)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::EntropyObject);
-        }
-        KObjectType::DeviceNode => {
-            // SAFETY: last ref to a `DeviceNode` produced by KBox::into_raw.
-            // The object owns nothing out-of-line; the box drop frees it.
-            drop(unsafe { KBox::<DeviceNode>::from_raw(NonNull::new_unchecked(ptr as *mut DeviceNode)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::DeviceNode);
-        }
-        KObjectType::InterruptObject => {
-            // SAFETY: last ref to an `InterruptObject` produced by KBox::into_raw.
-            drop(unsafe { KBox::<InterruptObject>::from_raw(NonNull::new_unchecked(ptr as *mut InterruptObject)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::InterruptObject);
-        }
-        KObjectType::UserspaceServerReg => {
-            // SAFETY: last ref to a `UserspaceServerReg` produced by KBox::into_raw.
-            // Dropping the box releases its owned endpoint `ObjectRef` (whose
-            // `IpcChannel::drop` unlinks the peer) and any pending lookup's PO.
-            drop(unsafe {
-                KBox::<UserspaceServerReg>::from_raw(NonNull::new_unchecked(ptr as *mut UserspaceServerReg))
-            });
-            #[cfg(test)]
-            test_probe::note(KObjectType::UserspaceServerReg);
-        }
-        KObjectType::FileObject => {
-            // SAFETY: last ref to a `FileObject` produced by KBox::into_raw.
-            // Dropping the box runs `FileObject::Drop`, freeing its cached frames.
-            drop(unsafe { KBox::<FileObject>::from_raw(NonNull::new_unchecked(ptr as *mut FileObject)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::FileObject);
-        }
-        KObjectType::SystemControl => {
-            // SAFETY: last ref to a `SystemControl` produced by KBox::into_raw.
-            // The object owns nothing; the box drop frees its allocation.
-            drop(unsafe { KBox::<SystemControl>::from_raw(NonNull::new_unchecked(ptr as *mut SystemControl)) });
-            #[cfg(test)]
-            test_probe::note(KObjectType::SystemControl);
-        }
-        _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
+    macro_rules! by_tag {
+        ($($t:ident),*) => {
+            match ty {
+                $(KObjectType::$t => destroy::<$t>(header),)*
+                KObjectType::Invalid | KObjectType::IoRing => {
+                    debug_assert!(false, "dispatch_destroy on a tag no kernel object has: {ty:?}")
+                }
+            }
+        };
     }
+    // SAFETY: each arm frees the type whose tag it matches, the one `kobject!` lets take it, which
+    // `KObject` places at `header`, made by `ObjectRef::new` from that type's `KBox`; the reference
+    // is the last, by the contract.
+    unsafe {
+        by_tag!(
+            Process,
+            Thread,
+            MemoryObject,
+            Timer,
+            NotificationChannel,
+            IpcChannel,
+            PendingOperation,
+            Namespace,
+            EntropyObject,
+            DeviceNode,
+            InterruptObject,
+            UserspaceServerReg,
+            FileObject,
+            SystemControl
+        )
+    }
+}
+
+/// Free a `T` by dropping its rebuilt box, which runs its `Drop`.
+///
+/// # Safety
+/// `header` is the last live reference to a `T` whose box `KBox::into_raw` gave up.
+unsafe fn destroy<T: KObject>(header: NonNull<KObjectHeader>) {
+    // SAFETY: the last reference to a `T` from `KBox::<T>::into_raw`, by the contract.
+    drop(unsafe { KBox::<T>::from_raw(header.cast()) });
+    #[cfg(test)]
+    test_probe::note(T::TYPE);
 }
 
 /// Per-thread destructor-dispatch counters, so tests can verify which `match` arm fired.
@@ -318,232 +397,82 @@ pub(crate) mod test_probe {
     use crate::libkern::handle::KObjectType;
     use core::cell::Cell;
 
+    /// One more than the largest tag.
+    const TAGS: usize = KObjectType::SystemControl as usize + 1;
+
     std::thread_local! {
-        static PROCESS_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static THREAD_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static MEMORY_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static TIMER_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static NOTIFICATION_CHANNEL_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static IPC_CHANNEL_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static PENDING_OP_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static NAMESPACE_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static ENTROPY_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static DEVICE_NODE_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static INTERRUPT_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static USERSPACE_SERVER_REG_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static FILE_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
-        static SYSTEM_CONTROL_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static DESTROYS: [Cell<usize>; TAGS] = const { [const { Cell::new(0) }; TAGS] };
     }
 
     pub(crate) fn note(ty: KObjectType) {
-        match ty {
-            KObjectType::Process => PROCESS_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::Thread => THREAD_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::MemoryObject => MEMORY_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::Timer => TIMER_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::NotificationChannel => NOTIFICATION_CHANNEL_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::IpcChannel => IPC_CHANNEL_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::PendingOperation => PENDING_OP_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::Namespace => NAMESPACE_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::EntropyObject => ENTROPY_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::DeviceNode => DEVICE_NODE_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::InterruptObject => INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::UserspaceServerReg => USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::FileObject => FILE_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::SystemControl => SYSTEM_CONTROL_DESTROYS.with(|c| c.set(c.get() + 1)),
-            _ => {}
-        }
+        DESTROYS.with(|d| d[ty as usize].set(d[ty as usize].get() + 1));
+    }
+
+    /// The destroys of objects tagged `ty` on this thread since its last [`reset`].
+    pub(crate) fn destroys(ty: KObjectType) -> usize {
+        DESTROYS.with(|d| d[ty as usize].get())
     }
 
     pub(crate) fn process_destroys() -> usize {
-        PROCESS_DESTROYS.with(Cell::get)
+        destroys(KObjectType::Process)
     }
 
     pub(crate) fn thread_destroys() -> usize {
-        THREAD_DESTROYS.with(Cell::get)
+        destroys(KObjectType::Thread)
     }
 
     pub(crate) fn memory_object_destroys() -> usize {
-        MEMORY_OBJECT_DESTROYS.with(Cell::get)
+        destroys(KObjectType::MemoryObject)
     }
 
     pub(crate) fn timer_destroys() -> usize {
-        TIMER_DESTROYS.with(Cell::get)
+        destroys(KObjectType::Timer)
     }
 
     pub(crate) fn notification_channel_destroys() -> usize {
-        NOTIFICATION_CHANNEL_DESTROYS.with(Cell::get)
+        destroys(KObjectType::NotificationChannel)
     }
 
     pub(crate) fn ipc_channel_destroys() -> usize {
-        IPC_CHANNEL_DESTROYS.with(Cell::get)
+        destroys(KObjectType::IpcChannel)
     }
 
     pub(crate) fn pending_op_destroys() -> usize {
-        PENDING_OP_DESTROYS.with(Cell::get)
+        destroys(KObjectType::PendingOperation)
     }
 
     pub(crate) fn namespace_destroys() -> usize {
-        NAMESPACE_DESTROYS.with(Cell::get)
+        destroys(KObjectType::Namespace)
     }
 
     pub(crate) fn entropy_object_destroys() -> usize {
-        ENTROPY_OBJECT_DESTROYS.with(Cell::get)
+        destroys(KObjectType::EntropyObject)
     }
 
     pub(crate) fn system_control_destroys() -> usize {
-        SYSTEM_CONTROL_DESTROYS.with(Cell::get)
+        destroys(KObjectType::SystemControl)
     }
 
     pub(crate) fn device_node_destroys() -> usize {
-        DEVICE_NODE_DESTROYS.with(Cell::get)
+        destroys(KObjectType::DeviceNode)
     }
 
     pub(crate) fn interrupt_object_destroys() -> usize {
-        INTERRUPT_OBJECT_DESTROYS.with(Cell::get)
+        destroys(KObjectType::InterruptObject)
     }
 
     pub(crate) fn userspace_server_reg_destroys() -> usize {
-        USERSPACE_SERVER_REG_DESTROYS.with(Cell::get)
+        destroys(KObjectType::UserspaceServerReg)
     }
 
     pub(crate) fn file_object_destroys() -> usize {
-        FILE_OBJECT_DESTROYS.with(Cell::get)
+        destroys(KObjectType::FileObject)
     }
 
     pub(crate) fn reset() {
-        PROCESS_DESTROYS.with(|c| c.set(0));
-        THREAD_DESTROYS.with(|c| c.set(0));
-        MEMORY_OBJECT_DESTROYS.with(|c| c.set(0));
-        TIMER_DESTROYS.with(|c| c.set(0));
-        NOTIFICATION_CHANNEL_DESTROYS.with(|c| c.set(0));
-        IPC_CHANNEL_DESTROYS.with(|c| c.set(0));
-        PENDING_OP_DESTROYS.with(|c| c.set(0));
-        NAMESPACE_DESTROYS.with(|c| c.set(0));
-        ENTROPY_OBJECT_DESTROYS.with(|c| c.set(0));
-        DEVICE_NODE_DESTROYS.with(|c| c.set(0));
-        INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(0));
-        USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(0));
-        FILE_OBJECT_DESTROYS.with(|c| c.set(0));
+        DESTROYS.with(|d| d.iter().for_each(|c| c.set(0)));
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mm::test_support::init_global_heap;
-    use crate::object::{Process, Thread};
-
-    fn fresh_process(pid: u32) -> *mut () {
-        init_global_heap();
-        KBox::into_raw(Process::try_new(pid).unwrap()).as_ptr() as *mut ()
-    }
-
-    fn fresh_thread(tid: u32, owner_pid: u32) -> *mut () {
-        init_global_heap();
-        KBox::into_raw(Thread::try_new(tid, owner_pid).unwrap()).as_ptr() as *mut ()
-    }
-
-    fn header_of(obj: *mut ()) -> &'static KObjectHeader {
-        // SAFETY: each test object is a kernel object, its header at offset 0, freed only after its last read.
-        unsafe { &*(obj as *const KObjectHeader) }
-    }
-
-    #[test]
-    fn header_new_starts_refcount_one() {
-        init_global_heap();
-        let obj = fresh_process(7);
-        assert_eq!(header_of(obj).refcount(), 1);
-        assert_eq!(header_of(obj).object_type(), KObjectType::Process);
-        // SAFETY: adopts the object's creation reference.
-        drop(unsafe { ObjectRef::from_raw(obj, KObjectType::Process) });
-    }
-
-    #[test]
-    fn try_acquire_increments_above_zero() {
-        let obj = fresh_process(1);
-        assert!(header_of(obj).try_acquire());
-        assert_eq!(header_of(obj).refcount(), 2);
-        assert!(!header_of(obj).release()); // 2 -> 1
-        // SAFETY: adopts the object's creation reference.
-        drop(unsafe { ObjectRef::from_raw(obj, KObjectType::Process) }); // 1 -> 0, destroy
-    }
-
-    #[test]
-    fn try_acquire_fails_at_zero() {
-        let obj = fresh_process(1);
-        // Release the creation ref via the header: the count reaches zero without a destroy.
-        assert!(header_of(obj).release()); // 1 -> 0
-        assert!(!header_of(obj).try_acquire());
-        assert_eq!(header_of(obj).refcount(), 0);
-        // Free the storage by hand: the count is zero and nothing else references it.
-        // SAFETY: the count is zero and nothing else holds the storage, which came from a `KBox`.
-        drop(unsafe { KBox::<Process>::from_raw(NonNull::new_unchecked(obj as *mut Process)) });
-    }
-
-    #[test]
-    fn release_reports_last_ref_exactly_once() {
-        let obj = fresh_process(1);
-        for _ in 0..3 {
-            assert!(header_of(obj).try_acquire());
-        }
-        assert!(!header_of(obj).release());
-        assert!(!header_of(obj).release());
-        assert!(!header_of(obj).release());
-        assert!(header_of(obj).release());
-        // SAFETY: the count is zero and nothing else holds the storage, which came from a `KBox`.
-        drop(unsafe { KBox::<Process>::from_raw(NonNull::new_unchecked(obj as *mut Process)) });
-    }
-
-    #[test]
-    fn objectref_clone_then_drop_balances_and_destroys_once() {
-        test_probe::reset();
-        let obj = fresh_process(1);
-        // SAFETY: adopts the object's creation reference.
-        let r = unsafe { ObjectRef::from_raw(obj, KObjectType::Process) };
-        let r2 = r.clone(); // count 2
-        assert_eq!(header_of(obj).refcount(), 2);
-        drop(r); // count 1, no destroy
-        assert_eq!(test_probe::process_destroys(), 0);
-        drop(r2); // count 0, destroy
-        assert_eq!(test_probe::process_destroys(), 1);
-    }
-
-    #[test]
-    fn drop_runs_correct_destructor_per_type() {
-        test_probe::reset();
-        // SAFETY: adopts the object's creation reference.
-        let p = unsafe { ObjectRef::from_raw(fresh_process(1), KObjectType::Process) };
-        // SAFETY: adopts the object's creation reference.
-        let t = unsafe { ObjectRef::from_raw(fresh_thread(1, 1), KObjectType::Thread) };
-        drop(p);
-        assert_eq!(test_probe::process_destroys(), 1);
-        assert_eq!(test_probe::thread_destroys(), 0, "wrong arm ran for Process");
-        drop(t);
-        assert_eq!(test_probe::process_destroys(), 1);
-        assert_eq!(test_probe::thread_destroys(), 1, "Thread arm did not run");
-    }
-
-    #[test]
-    fn into_raw_then_from_raw_no_double_decrement() {
-        test_probe::reset();
-        // SAFETY: adopts the object's creation reference.
-        let r = unsafe { ObjectRef::from_raw(fresh_process(1), KObjectType::Process) };
-        let (ptr, ty) = r.into_raw(); // forget, no decrement
-        assert_eq!(header_of(ptr).refcount(), 1);
-        assert_eq!(test_probe::process_destroys(), 0);
-        // SAFETY: re-adopts the reference `into_raw` gave up.
-        let r2 = unsafe { ObjectRef::from_raw(ptr, ty) }; // adopt, no increment
-        assert_eq!(header_of(ptr).refcount(), 1);
-        drop(r2); // count 0, destroy once
-        assert_eq!(test_probe::process_destroys(), 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "refcount overflow")]
-    fn refcount_overflow_guard_panics() {
-        let obj = fresh_process(1);
-        header_of(obj).refcount.store(MAX_REFCOUNT + 1, Ordering::Relaxed);
-        header_of(obj).bump();
-    }
-}
+mod tests;

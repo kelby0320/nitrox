@@ -37878,3 +37878,31 @@ is a report only Miri can make. This narrows what Part J's detail pass wrote, th
 runs `cargo xtask miri kernel`: about fifty minutes each, and against 2026-10-26's call that Miri
 runs on its own and not per PR. The CI job, `miri.yml`, runs as it did, on its schedule and by
 hand.
+
+## 2026-11-06 — Before Phase 7, J.2: the typed kernel object
+
+Part J's second sub-part, `typed-layers.md` § J.2, built on `pre-phase-7/part-j2-typed-object`.
+
+- **A kernel object's tag is its type's**: each type is a `KObject`, made one by `kobject!`, and its
+  first field is a `Header<Self>` whose tag is `Self::TYPE`, so no constructor writes a tag. The
+  macro checks at compile time that the field is a `Header<Self>` at offset 0 and that the type
+  is `crate::object`'s of the tag's name, so no other type takes the tag; `dispatch_destroy`
+  matches every variant, freeing that type for each, so a kind with no arm does not compile.
+- **An `ObjectRef` reads its tag from the header and keeps nothing else**: `from_raw` and
+  `try_acquire` take no tag, and a handle entry's recorded tag decides no cast, no destroy and no
+  stat: it is still recorded, for `allocate`'s type-rights check alone. `downcast_ref`, `downcast`,
+  `Ref<T>` and `lookup_as` are the only ways to a `T`. Of what the pass counted outside tests at
+  J.2's base, nothing is left: 76 hand-written downcasts, 22 hand-tagged adoptions, 23 calls of
+  the `adopt` helpers and 22 of `lookup_typed`.
+- **`Ref<T>` derefs only where `T: Shared`**, an `unsafe` claim that a `&T` is sound once the object
+  is shared: thirteen kinds make it, each argued beside its type. `Thread` makes none until J.7,
+  its fields being written raw under SCHED.
+- **`Process` is `Send` because `VmaTree` is**: the supertrait `KObject: Send + Sync` found the raw
+  links there, and the tree owns every node they reach, so the argued impl is the tree's, not the
+  process's.
+- **A VMA's backing is one typed field**, `Anonymous`, `Object(Ref<MemoryObject>)` or
+  `File(Ref<FileObject>)`, in place of a kind and an `Option<ObjectRef>` tied by hand.
+- **The test that drove each release tag assertion the wrong kind is retired**: every function it
+  called takes a typed reference, which the compiler holds.
+- `unsafe` blocks fall from 1,094 to 954 and `unsafe fn`s from 330 to 327; `unsafe impl`s rise
+  from 52 to 67, each raise by hand in the commit that made it.

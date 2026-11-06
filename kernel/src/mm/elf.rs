@@ -30,7 +30,7 @@ use crate::arch::paging::ArchPaging;
 use crate::libkern::KBox;
 use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::heap;
-use crate::mm::vmm::{MappingKind, Protection, VAddrRange, Vma};
+use crate::mm::vmm::{Protection, VAddrRange, Vma};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 use crate::object::MemoryObject;
 
@@ -130,7 +130,7 @@ pub fn load_elf(asp: &mut AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLo
     // file bytes into their frames.
     let stack_range = VAddrRange::new(VirtAddr::new(STACK_TOP - STACK_SIZE), VirtAddr::new(STACK_TOP))
         .expect("stack range constants are valid by construction");
-    let stack_vma = KBox::try_new(Vma::new(stack_range, Protection::WRITE | Protection::USER, MappingKind::Anonymous))
+    let stack_vma = KBox::try_new(Vma::new(stack_range, Protection::WRITE | Protection::USER))
         .map_err(|_| ElfLoadError::OutOfMemory)?;
     match asp.map_vma_lazy(stack_vma) {
         Ok(()) => {}
@@ -264,7 +264,7 @@ fn map_load_segment(asp: &mut AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &
         prot = prot | Protection::EXEC;
     }
 
-    let vma = KBox::try_new(Vma::new(range, prot, MappingKind::Anonymous)).map_err(|_| ElfLoadError::OutOfMemory)?;
+    let vma = KBox::try_new(Vma::new(range, prot)).map_err(|_| ElfLoadError::OutOfMemory)?;
     match asp.map_vma(vma) {
         Ok(()) => {}
         Err((_, MapError::OutOfMemory)) => return Err(ElfLoadError::OutOfMemory),

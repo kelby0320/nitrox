@@ -23,7 +23,7 @@ use crate::libkern::ipc::{IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC
 use crate::libkern::{AllocError, ArrayVec, KBox, KVec, Reserved};
 use crate::object::ObjectRef;
 use crate::object::WaitQueue;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 
 /// A queued message in kernel storage: the natural-alignment twin of
 /// [`IpcMsg`](crate::libkern::IpcMsg), so a byte view round-trips through `copy_*_user`.
@@ -227,12 +227,17 @@ pub enum RecvState {
 /// One endpoint of an IPC channel.
 #[repr(C)]
 pub struct IpcChannel {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     inner: UnsafeCell<Inner>,
     /// Its sends' deadline-heap slots, given back after `Drop` takes their entries out.
     _slots: SlotHold,
 }
+
+kobject!(IpcChannel);
+// SAFETY: an endpoint changes once shared only in `inner`, an `UnsafeCell` touched only under
+// `SCHED`.
+unsafe impl Shared for IpcChannel {}
 
 struct Inner {
     recv: MsgRing,
@@ -291,7 +296,7 @@ impl IpcChannel {
         let recv = MsgRing::with_capacity(cap)?;
         let pending_sends = Reserved::with_capacity(Self::MAX_PENDING_SENDS)?;
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::IpcChannel),
+            header: Header::new(),
             magic: Self::MAGIC,
             inner: UnsafeCell::new(Inner {
                 recv,

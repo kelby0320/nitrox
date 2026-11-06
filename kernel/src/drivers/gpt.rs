@@ -17,18 +17,21 @@
 use super::partitions::{self, PartKind, Scheme, Table, Unread};
 use crate::io::block::{Partition, read_blocking};
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{KBox, KVec, Rights, SpinLock};
+use crate::libkern::{KVec, Rights, SpinLock};
+use crate::object::Namespace;
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
-use crate::object::{Namespace, ObjectRef};
+use crate::object::header::Ref;
 
 const SECTOR: u64 = partitions::BLOCK as u64;
 
+/// A partition's node, a `/dev/disk` name it goes by, and whether that name is still free for it.
+type Named = (Ref<DeviceNode>, KVec<u8>, bool);
+
 struct PartEntry {
-    node: ObjectRef,
+    node: Ref<DeviceNode>,
     by_partuuid: KVec<u8>,
     /// `/dev/disk/by-partlabel/<label>` path (absent if the label is not a usable path component).
     by_partlabel: Option<KVec<u8>>,
@@ -51,16 +54,15 @@ pub enum Names {
 
 /// **Read `disk`'s table at boot and publish its partitions**, with their `/dev/disk` names.
 /// Interrupts masked, so the reads are polled.
-pub fn init(disk: &ObjectRef) {
-    // SAFETY: `disk` pins a live `DeviceNode`.
-    let blocks = unsafe { &*(disk.as_ptr() as *const DeviceNode) }.geometry().block_count;
+pub fn init(disk: &Ref<DeviceNode>) {
+    let blocks = disk.geometry().block_count;
     let table = partitions::read(blocks, &mut |lba, count, out: &mut [u8]| read_blocking(disk, lba, count, out));
     publish(disk, table, Names::Bind);
 }
 
 /// **Publish what `table` says of `disk`**, logging each partition, and flag the disk if it is the
 /// one the machine started from. How many partitions were published.
-pub fn publish(disk: &ObjectRef, table: Result<Table, Unread>, names: Names) -> u32 {
+pub fn publish(disk: &Ref<DeviceNode>, table: Result<Table, Unread>, names: Names) -> u32 {
     let table = match table {
         Ok(t) => t,
         Err(Unread::Io) => {
@@ -76,9 +78,7 @@ pub fn publish(disk: &ObjectRef, table: Result<Table, Unread>, names: Names) -> 
             return 0;
         }
     };
-    // SAFETY: `disk` pins a live `DeviceNode`.
-    let mut boot_medium =
-        unsafe { &*(disk.as_ptr() as *const DeviceNode) }.block_info().kind == BlockKind::RamDisk.as_u32();
+    let mut boot_medium = disk.block_info().kind == BlockKind::RamDisk.as_u32();
     let what = match table.scheme {
         Scheme::Gpt { disk_guid } => {
             let boot = partitions::is_boot(&disk_guid, partitions::boot_disk());
@@ -112,12 +112,11 @@ pub fn publish(disk: &ObjectRef, table: Result<Table, Unread>, names: Names) -> 
 
 /// Create a partition window and block `DeviceNode`, register it, and record a boot disk's GPT
 /// names.
-fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names, boot_medium: bool) -> bool {
+fn publish_partition(disk: &Ref<DeviceNode>, p: &partitions::Part, names: Names, boot_medium: bool) -> bool {
     let Some(part) = Partition::new(disk, p.first_lba, p.count, SECTOR) else {
         return false;
     };
-    // SAFETY: `disk` pins a live `DeviceNode`; copy its bus identity.
-    let dd = unsafe { &*(disk.as_ptr() as *const DeviceNode) }.descriptor();
+    let dd = disk.descriptor();
     let descriptor = ResourceDescriptor {
         identity: DeviceIdentity {
             vendor: dd.identity.vendor,
@@ -166,8 +165,7 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names, boot_
         Ok(n) => n,
         Err(_) => return false,
     };
-    // SAFETY: adopt the creation reference.
-    let node_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+    let node_ref = Ref::new(node);
 
     let (first, last) = (p.first_lba, p.first_lba + p.count - 1);
     let Some((guid, _)) = gpt else {
@@ -227,7 +225,7 @@ pub fn bind_partition_names(ns: &Namespace) {
 }
 
 /// Bind each name [`bind_order`] left free to its partition.
-fn bind_names(ns: &Namespace, names: &[(ObjectRef, KVec<u8>, bool)]) {
+fn bind_names(ns: &Namespace, names: &[Named]) {
     // READ + WRITE (the RW fs-server writes filesystem metadata to its partition) + the
     // generic band (DUPLICATE lets it hand a device copy to the kernel for the data path).
     let rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
@@ -239,8 +237,8 @@ fn bind_names(ns: &Namespace, names: &[(ObjectRef, KVec<u8>, bool)]) {
 /// **Which partition each `/dev/disk` name goes to**, and whether it is still free for it: the
 /// boot medium's first, so another disk copying a label or GUID it carries never takes it, then
 /// the rest, each in the order found. `None` on running out of memory.
-fn bind_order(parts: &[PartEntry]) -> Option<KVec<(ObjectRef, KVec<u8>, bool)>> {
-    let mut out: KVec<(ObjectRef, KVec<u8>, bool)> = KVec::new();
+fn bind_order(parts: &[PartEntry]) -> Option<KVec<Named>> {
+    let mut out: KVec<Named> = KVec::new();
     out.try_reserve(2 * parts.len()).ok()?;
     for boot_medium in [true, false] {
         for pe in parts.iter().filter(|pe| pe.boot_medium == boot_medium) {
@@ -255,8 +253,8 @@ fn bind_order(parts: &[PartEntry]) -> Option<KVec<(ObjectRef, KVec<u8>, bool)>> 
 
 /// Bind `node` at `path` in `ns`; drop the handed-back ref on failure (outside any
 /// lock — `bind` returns it on error).
-fn bind_one(ns: &Namespace, path: &KVec<u8>, node: &ObjectRef, rights: Rights) {
-    if let Err((reclaimed, _)) = ns.bind(path, node.clone(), rights) {
+fn bind_one(ns: &Namespace, path: &KVec<u8>, node: &Ref<DeviceNode>, rights: Rights) {
+    if let Err((reclaimed, _)) = ns.bind(path, node.as_object().clone(), rights) {
         drop(reclaimed);
         crate::kprintln!("gpt: binding a /dev/disk name failed");
     }
@@ -359,12 +357,11 @@ mod tests {
     /// both; a name only one partition carries is bound wherever it is.
     #[test]
     fn a_name_two_partitions_carry_goes_to_the_boot_mediums() {
-        use crate::object::{MemoryObject, namespace::ResolvedTarget};
+        use crate::object::device_node::DeviceClass;
+        use crate::object::namespace::ResolvedTarget;
         init_global_heap();
         let node = || {
-            let mem = KBox::into_raw(MemoryObject::try_new(4096).unwrap()).as_ptr() as *mut ();
-            // SAFETY: a fresh `into_raw`, carrying its single creation reference.
-            unsafe { ObjectRef::from_raw(mem, KObjectType::MemoryObject) }
+            Ref::new(DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap())
         };
         let path = |s: &[u8]| {
             copy_bytes(&{
@@ -373,7 +370,7 @@ mod tests {
                 v
             })
         };
-        let entry = |node: &ObjectRef, uuid: &[u8], label: &[u8], boot_medium| PartEntry {
+        let entry = |node: &Ref<DeviceNode>, uuid: &[u8], label: &[u8], boot_medium| PartEntry {
             node: node.clone(),
             by_partuuid: path(uuid).unwrap(),
             by_partlabel: path(label),
@@ -393,9 +390,13 @@ mod tests {
             Some((ResolvedTarget::DirectHandle(o), _, _)) => o.as_ptr(),
             _ => core::ptr::null_mut(),
         };
-        assert_eq!(at(live), ram_root.as_ptr(), "the label to the RAM disk's root");
-        assert_eq!(at(uuid), ram_root.as_ptr(), "and the GUID");
-        assert_eq!(at(b"/dev/disk/by-partlabel/nitrox-root"), sata_other.as_ptr(), "a name only one carries");
+        assert_eq!(at(live), ram_root.as_object().as_ptr(), "the label to the RAM disk's root");
+        assert_eq!(at(uuid), ram_root.as_object().as_ptr(), "and the GUID");
+        assert_eq!(
+            at(b"/dev/disk/by-partlabel/nitrox-root"),
+            sata_other.as_object().as_ptr(),
+            "a name only one carries"
+        );
         let passed: KVec<bool> = {
             let mut v = KVec::new();
             for (_, _, free) in bind_order(&parts).unwrap().iter() {

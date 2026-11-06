@@ -24,7 +24,6 @@
 //! error paths [`release_refcount`] drops it. The test-only
 //! [`FAIL_NEXT_ACQUIRE`] forces the step-7 failure branch.
 
-use crate::libkern::handle::KObjectType;
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 
@@ -68,7 +67,7 @@ std::thread_local! {
 ///
 /// `obj` addresses a kernel object whose memory is whole for the call: read from a live entry
 /// under the grace guard.
-pub(crate) unsafe fn try_acquire_refcount(obj: *mut (), _ty: KObjectType) -> bool {
+pub(crate) unsafe fn try_acquire_refcount(obj: *mut ()) -> bool {
     #[cfg(test)]
     {
         if FAIL_NEXT_ACQUIRE.with(|f| f.replace(false)) {
@@ -89,14 +88,14 @@ pub(crate) unsafe fn try_acquire_refcount(obj: *mut (), _ty: KObjectType) -> boo
 ///
 /// # Safety
 ///
-/// `obj` is a kernel object of type `ty`, and the caller gives up a reference
-/// [`try_acquire_refcount`] took on it.
-pub(crate) unsafe fn release_refcount(obj: *mut (), ty: KObjectType) {
+/// `obj` is a kernel object, and the caller gives up a reference [`try_acquire_refcount`] took on
+/// it.
+pub(crate) unsafe fn release_refcount(obj: *mut ()) {
     // SAFETY: `obj` owns exactly the reference acquired by the matching
     // `try_acquire_refcount` on the lookup retry/error path; adopting it
     // into an `ObjectRef` and dropping it accounts for that one
     // reference exactly once.
-    drop(unsafe { ObjectRef::from_raw(obj, ty) });
+    drop(unsafe { ObjectRef::from_raw(obj) });
 }
 
 /// The calling context's id for the [`grace::GraceTracker`]: the running CPU's

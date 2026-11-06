@@ -44,7 +44,7 @@ pub(in crate::drivers::xhci) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut D
         }
         Recovered::Done
     };
-    while windows.iter().any(window_busy) {
+    while windows.iter().any(|w| window_busy(w)) {
         if late() {
             return give_up("kept a window busy");
         }

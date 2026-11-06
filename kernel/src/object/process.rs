@@ -5,18 +5,17 @@
 //! (`docs/architecture/notifications.md`), a root namespace and ambient syscaps. See
 //! `docs/architecture/overview.md`.
 
-use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, ExitStatus, KBox, SysCaps};
 use crate::mm::PhysAddr;
 use crate::mm::addr_space::AddressSpace;
 use crate::object::ObjectRef;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// A process kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct Process {
-    header: KObjectHeader,
+    header: Header<Self>,
     pid: u32,
     /// Self-check sentinel; a live `Process` always reads [`Process::MAGIC`].
     magic: u64,
@@ -40,6 +39,11 @@ pub struct Process {
     ending: AtomicU64,
 }
 
+kobject!(Process);
+// SAFETY: a `Process` changes once shared only in `ending`, an atomic, and in its address space,
+// behind that space's lock: its setters take `&mut self`, on the box before it is shared.
+unsafe impl Shared for Process {}
+
 const ENDING: u64 = 1 << 63;
 
 fn pack(status: ExitStatus) -> u64 {
@@ -53,7 +57,7 @@ impl Process {
     /// Allocate a process object with **no** address space, refcount one.
     pub fn try_new(pid: u32) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Process),
+            header: Header::new(),
             pid,
             magic: Self::MAGIC,
             address_space: None,
@@ -69,7 +73,7 @@ impl Process {
     /// `syscaps`: init gets [`SysCaps::all`], a spawned child `parent.syscaps & args.syscaps`.
     pub fn try_new_user(pid: u32, address_space: AddressSpace, syscaps: SysCaps) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Process),
+            header: Header::new(),
             pid,
             magic: Self::MAGIC,
             address_space: Some(address_space),
@@ -211,9 +215,8 @@ mod tests {
         test_probe::reset();
         let mut p = Process::try_new(1).unwrap();
         assert!(p.notification_channel_ptr().is_none());
-        let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
-        // SAFETY: into_raw yielded the single creation ref; adopt it.
-        let chan_ref = unsafe { ObjectRef::from_raw(chan, KObjectType::NotificationChannel) };
+        let chan_ref = ObjectRef::new(NotificationChannel::try_new().unwrap());
+        let chan = chan_ref.as_ptr();
         p.set_notification_channel(chan_ref);
         assert_eq!(p.notification_channel_ptr(), Some(chan));
         assert_eq!(test_probe::notification_channel_destroys(), 0);
@@ -229,9 +232,8 @@ mod tests {
         test_probe::reset();
         let mut p = Process::try_new(1).unwrap();
         assert!(p.namespace_ref().is_none());
-        let ns = KBox::into_raw(Namespace::try_new().unwrap()).as_ptr() as *mut ();
-        // SAFETY: into_raw yielded the single creation ref; adopt it.
-        let ns_ref = unsafe { ObjectRef::from_raw(ns, KObjectType::Namespace) };
+        let ns_ref = ObjectRef::new(Namespace::try_new().unwrap());
+        let ns = ns_ref.as_ptr();
         p.set_namespace(ns_ref);
         let cloned = p.namespace_ref().expect("namespace attached");
         assert_eq!(cloned.as_ptr(), ns);

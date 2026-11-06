@@ -14,10 +14,9 @@ pub mod xhci;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::timer::ArchTimer;
 use crate::io::block::dispatch_block_irp;
-use crate::libkern::KBox;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::io_op::IoOpcode;
 use crate::object::device_node::DeviceClass;
+use crate::object::header::Ref;
 use crate::object::{DeviceNode, MemoryObject, ObjectRef, PendingOperation};
 
 const PCI_CLASS_AHCI: (u8, u8, u8) = (0x01, 0x06, 0x01);
@@ -29,14 +28,12 @@ const PCI_CLASS_AHCI: (u8, u8, u8) = (0x01, 0x06, 0x01);
 pub fn probe(flags: &crate::cmdline::Flags) {
     let devices = crate::device::snapshot();
     for node in devices.iter() {
-        // SAFETY: each snapshot entry pins a live `DeviceNode`.
-        let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
-        let id = &dn.descriptor().identity;
+        let id = &node.descriptor().identity;
         let class = (id.class, id.subclass, id.prog_if);
         if class == PCI_CLASS_AHCI {
-            crate::device::record_outcome(dn.descriptor(), ahci::init(node));
+            crate::device::record_outcome(node.descriptor(), ahci::init(node));
         } else if class == xhci::PCI_CLASS {
-            crate::device::record_outcome(dn.descriptor(), xhci::init(node, flags.usb_off));
+            crate::device::record_outcome(node.descriptor(), xhci::init(node, flags.usb_off));
         }
     }
 
@@ -49,9 +46,7 @@ pub fn probe(flags: &crate::cmdline::Flags) {
     // re-scanned.
     let disks = crate::device::snapshot();
     for node in disks.iter() {
-        // SAFETY: each entry pins a live `DeviceNode`.
-        let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
-        if dn.class() == DeviceClass::Block {
+        if node.class() == DeviceClass::Block {
             gpt::init(node);
         }
     }
@@ -78,11 +73,7 @@ pub fn settle() {
 /// pass/fail; not a `panic!` path.
 pub fn self_test() {
     let devices = crate::device::snapshot();
-    let disk = devices.iter().find(|node| {
-        // SAFETY: each entry pins a live `DeviceNode`.
-        let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
-        dn.class() == DeviceClass::Block
-    });
+    let disk = devices.iter().find(|node| node.class() == DeviceClass::Block);
     let Some(disk) = disk else {
         return; // no block device (no AHCI disk) — nothing to test
     };
@@ -92,13 +83,11 @@ pub fn self_test() {
     oversize_refused(disk);
 
     let buffer = match MemoryObject::try_new(512) {
-        // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
-        Ok(mo) => unsafe { adopt(mo, KObjectType::MemoryObject) },
+        Ok(mo) => Ref::new(mo),
         Err(_) => return,
     };
     let po = match PendingOperation::try_new() {
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        Ok(po) => unsafe { adopt(po, KObjectType::PendingOperation) },
+        Ok(po) => ObjectRef::new(po),
         Err(_) => return,
     };
     let po_check = po.clone();
@@ -150,10 +139,8 @@ pub fn self_test() {
 /// with the check in `dispatch_block_irp` deleted, which would let the driver write PRDT entries
 /// past its one-page command table. Runs before the sector-0 read, as the two share only the disk
 /// handle.
-fn oversize_refused(disk: &ObjectRef) {
-    // SAFETY: `disk` pins a live `DeviceNode` (found by class above).
-    let dn: &DeviceNode = unsafe { &*(disk.as_ptr() as *const DeviceNode) };
-    let Some(backend) = dn.block_backend() else {
+fn oversize_refused(disk: &Ref<DeviceNode>) {
+    let Some(backend) = disk.block_backend() else {
         return;
     };
     // **Ask the device what it can do, then ask for one fragment more**: a driver that published
@@ -165,13 +152,11 @@ fn oversize_refused(disk: &ObjectRef) {
     let pages = backend.max_frags as usize + 1;
     let bytes = pages * crate::mm::PAGE_SIZE;
     let big = match MemoryObject::try_new(bytes) {
-        // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
-        Ok(mo) => unsafe { adopt(mo, KObjectType::MemoryObject) },
+        Ok(mo) => Ref::new(mo),
         Err(_) => return,
     };
     let po = match PendingOperation::try_new() {
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        Ok(po) => unsafe { adopt(po, KObjectType::PendingOperation) },
+        Ok(po) => ObjectRef::new(po),
         Err(_) => return,
     };
     match dispatch_block_irp(disk, &big, &po, IoOpcode::Read, 0, 0, bytes as u64) {
@@ -188,26 +173,9 @@ fn oversize_refused(disk: &ObjectRef) {
 }
 
 /// Read the little-endian 16-bit boot signature (`0xAA55`) at offset 510 of `buffer`'s first frame.
-fn read_boot_signature(buffer: &ObjectRef) -> u16 {
-    // SAFETY: `buffer` pins a live `MemoryObject` of ≥ 512 bytes.
-    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
-    let frame = mo.frames()[0];
+fn read_boot_signature(buffer: &MemoryObject) -> u16 {
+    let frame = buffer.frames()[0];
     let va = (frame.as_u64() + crate::mm::heap::hhdm_offset()) as *const u8;
     // SAFETY: offset 510..512 is within the first (HHDM-mapped) buffer frame.
     unsafe { (va.add(510) as *const u16).read_unaligned() }
-}
-
-/// Adopt a freshly made kernel object's box as the [`ObjectRef`] of its creation reference.
-///
-/// # Safety
-/// `obj` is a kernel object whose type `ty` names: its drop runs `ty`'s destructor on it.
-pub(crate) unsafe fn adopt<T>(obj: KBox<T>, ty: KObjectType) -> ObjectRef {
-    // SAFETY: `into_raw` yields the single creation reference of a `ty` object, by the contract.
-    unsafe { ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), ty) }
-}
-
-/// [`adopt`] a fresh device node, whose type fixes its tag.
-pub(crate) fn adopt_node(node: KBox<DeviceNode>) -> ObjectRef {
-    // SAFETY: a `DeviceNode`, under its own tag.
-    unsafe { adopt(node, KObjectType::DeviceNode) }
 }

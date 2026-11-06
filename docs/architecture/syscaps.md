@@ -95,7 +95,7 @@ this slice fills it:
 
 ```rust
 pub struct Process {
-    header: KObjectHeader,
+    header: Header<Self>,
     pid: u32,
     // …
     syscaps: SysCaps,   // NEW: this process's ambient authority
@@ -158,7 +158,7 @@ right returns, so userspace sees one "insufficient authority" story.
 
 ### The two gates wired this slice
 
-**`BIND_NAMESPACE` — on `sys_ns_bind`** (`table.rs:1025`). It was also specified to gate
+**`BIND_NAMESPACE` — on `sys_ns_bind`** (`syscall/table.rs`). It was also specified to gate
 `sys_ns_release_initramfs`, which **has never existed** under that spelling or as
 `sys_release_initramfs` (audit D.5f, corrected 2026-08-18). The existing
 `Rights::BIND`-on-the-handle check stays; the
@@ -167,7 +167,7 @@ syscap is an *additional* gate checked first:
 ```rust
 pub fn sys_ns_bind(ns_h, path, len, resource_h) -> SysResult {
     require_syscap(SysCaps::BIND_NAMESPACE)?;                    // NEW
-    let ns_ok = lookup_typed(ns_h, pid, Rights::BIND, Namespace)?;  // unchanged
+    let ns = lookup_as::<Namespace>(ns_h, pid, Rights::BIND)?;       // unchanged
     // …
 }
 ```

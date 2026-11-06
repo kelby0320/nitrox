@@ -12,7 +12,7 @@ fn range(start: u64, end: u64) -> VAddrRange {
 }
 
 fn anon_box(r: VAddrRange) -> KBox<Vma> {
-    KBox::try_new(Vma::new(r, Protection::empty(), MappingKind::Anonymous)).expect("test heap exhausted")
+    KBox::try_new(Vma::new(r, Protection::empty())).expect("test heap exhausted")
 }
 
 fn insert_or_panic(tree: &mut VmaTree, r: VAddrRange) {
@@ -189,7 +189,7 @@ fn protection_empty_is_zero() {
 #[test]
 fn vma_new_initializes_link_unlinked_red_with_self_max() {
     let r = range(PAGE, PAGE * 4);
-    let v = Vma::new(r, Protection::empty(), MappingKind::Anonymous);
+    let v = Vma::new(r, Protection::empty());
     assert!(v.link.parent.is_none());
     assert!(v.link.left.is_none());
     assert!(v.link.right.is_none());
@@ -570,18 +570,4 @@ fn drop_releases_every_owned_box() {
         }
         verify(&tree);
     }
-}
-
-/// **A file-backed VMA over another kind of object stops at its drop.**
-#[test]
-#[should_panic(expected = "left == right")]
-fn a_file_backed_vma_over_another_kind_of_object_stops_at_its_drop() {
-    use crate::libkern::handle::KObjectType;
-    use crate::object::MemoryObject;
-    init_global_heap();
-    // SAFETY: a fresh `MemoryObject` under its own tag.
-    let mo = unsafe { crate::drivers::adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject) };
-    let mut v = Vma::new_object(range(0x40_0000, 0x40_1000), Protection::WRITE, mo, crate::mm::Caching::Normal);
-    v.mapping = MappingKind::FileBacked;
-    drop(v);
 }

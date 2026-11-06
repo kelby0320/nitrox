@@ -14,14 +14,12 @@
 //! bind/unbind hand refs back to the caller to drop outside the lock; resolve clones (an atomic
 //! bump, never a drop).
 
-use crate::libkern::handle::{
-    KObjectType, NS_ENTRY_PATH_MAX, NS_KIND_DIRECT, NS_KIND_KERNEL, NS_KIND_MOUNT, NsEntry, Rights,
-};
+use crate::libkern::handle::{NS_ENTRY_PATH_MAX, NS_KIND_DIRECT, NS_KIND_KERNEL, NS_KIND_MOUNT, NsEntry, Rights};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
-use crate::object::ObjectRef;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Ref, Shared, kobject};
 use crate::object::kernel_server::KernelServerId;
+use crate::object::{ObjectRef, UserspaceServerReg};
 
 /// Maximum namespace path length in bytes (see the design doc § Path grammar).
 pub const NS_PATH_MAX: usize = 1024;
@@ -98,7 +96,7 @@ pub enum BindingTarget {
     /// An in-kernel resource server, identified by its dispatch id.
     KernelServer(KernelServerId),
     /// A userspace resource server via its kernel registration record, with a subtree base.
-    UserspaceServer(ObjectRef, SubtreeBase),
+    UserspaceServer(Ref<UserspaceServerReg>, SubtreeBase),
 }
 
 /// The result of [`Namespace::resolve`]: the kinds of [`BindingTarget`], the handle-owning cases
@@ -110,7 +108,7 @@ pub enum ResolvedTarget {
     KernelServer(KernelServerId),
     /// A cloned reference to a userspace server's registration, plus the binding's [`SubtreeBase`]
     /// the caller prepends to the forwarded suffix.
-    UserspaceServer(ObjectRef, SubtreeBase),
+    UserspaceServer(Ref<UserspaceServerReg>, SubtreeBase),
 }
 
 struct Binding {
@@ -130,10 +128,14 @@ struct CacheEntry {
 /// A per-process namespace kernel object.
 #[repr(C)]
 pub struct Namespace {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     inner: SpinLock<Inner>,
 }
+
+kobject!(Namespace);
+// SAFETY: a `Namespace` changes once shared only behind its lock.
+unsafe impl Shared for Namespace {}
 
 struct Inner {
     bindings: KVec<Binding>,
@@ -149,7 +151,7 @@ impl Namespace {
         let mut cache: KVec<CacheEntry> = KVec::new();
         cache.try_reserve(NS_CACHE_MAX)?;
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Namespace),
+            header: Header::new(),
             magic: Self::MAGIC,
             inner: SpinLock::new(LockRank::KernelObject, Inner { bindings: KVec::new(), cache }),
         })
@@ -220,10 +222,10 @@ impl Namespace {
     pub fn bind_userspace_server(
         &self,
         path: &[u8],
-        reg: ObjectRef,
+        reg: Ref<UserspaceServerReg>,
         rights: Rights,
         base: SubtreeBase,
-    ) -> Result<(), (ObjectRef, NsError)> {
+    ) -> Result<(), (Ref<UserspaceServerReg>, NsError)> {
         if let Err(e) = validate_path(path) {
             return Err((reg, e));
         }
@@ -439,13 +441,10 @@ mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
     use crate::object::Timer;
-    use crate::object::header::test_probe;
+    use crate::object::header::{Ref, test_probe};
 
     fn target() -> ObjectRef {
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut (), KObjectType::Timer)
-        }
+        ObjectRef::new(Timer::try_new().unwrap())
     }
 
     fn ns() -> KBox<Namespace> {
@@ -622,19 +621,9 @@ mod tests {
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let r = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(Namespace::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::Namespace,
-            )
-        };
-        {
-            // SAFETY: `r` holds a live reference to a `Namespace`.
-            let ns: &Namespace = unsafe { &*(r.as_ptr() as *const Namespace) };
-            ns.bind(b"/a", target(), Rights::LOOKUP).unwrap();
-            ns.bind(b"/b", target(), Rights::LOOKUP).unwrap();
-        }
+        let r = Ref::new(Namespace::try_new().unwrap());
+        r.bind(b"/a", target(), Rights::LOOKUP).unwrap();
+        r.bind(b"/b", target(), Rights::LOOKUP).unwrap();
         assert_eq!(test_probe::namespace_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::namespace_destroys(), 1, "namespace destructor ran");
@@ -679,29 +668,26 @@ mod tests {
         assert!(matches!(n.resolve(b"/dev/entropy").unwrap().0, ResolvedTarget::KernelServer(_)));
     }
 
-    fn us_reg_target() -> ObjectRef {
-        use crate::object::{IpcChannel, UserspaceServerReg};
+    fn us_reg_target() -> Ref<UserspaceServerReg> {
+        use crate::object::IpcChannel;
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        // SAFETY: adopt the kernel endpoint's creation reference; drop the peer's.
-        let endpoint = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
-        // SAFETY: adopts the peer's creation reference, to drop it.
-        drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
-        let reg = UserspaceServerReg::try_new(endpoint).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(KBox::into_raw(reg).as_ptr() as *mut (), KObjectType::UserspaceServerReg) }
+        let endpoint = Ref::new(a);
+        drop(ObjectRef::new(b));
+        Ref::new(UserspaceServerReg::try_new(endpoint).unwrap())
     }
 
     #[test]
     fn bind_userspace_server_resolves_to_the_registration() {
         let n = ns();
-        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP | Rights::MAP_READ, SubtreeBase::empty())
-            .unwrap();
+        let bound = us_reg_target();
+        let at = bound.as_ptr();
+        n.bind_userspace_server(b"/fs", bound, Rights::LOOKUP | Rights::MAP_READ, SubtreeBase::empty()).unwrap();
         let (target, rights, suf) = n.resolve(b"/fs").unwrap();
         assert_eq!(suf, b"");
         assert_eq!(rights, Rights::LOOKUP | Rights::MAP_READ);
         match target {
             ResolvedTarget::UserspaceServer(reg, base) => {
-                assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
+                assert_eq!(reg.as_ptr(), at, "the registration bound");
                 assert!(base.is_empty(), "an unscoped mount carries no base");
             }
             _ => panic!("expected a userspace-server target"),
@@ -774,10 +760,11 @@ mod tests {
     #[test]
     fn bind_userspace_server_hands_back_target_on_error() {
         let n = ns();
-        let (t, e) =
-            n.bind_userspace_server(b"bad", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap_err();
+        let refused = us_reg_target();
+        let at = refused.as_ptr();
+        let (t, e) = n.bind_userspace_server(b"bad", refused, Rights::LOOKUP, SubtreeBase::empty()).unwrap_err();
         assert_eq!(e, NsError::InvalidPath);
-        assert_eq!(t.object_type(), KObjectType::UserspaceServerReg);
+        assert_eq!(t.as_ptr(), at, "the registration it was given");
         drop(t);
         n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap();
         let (t, e) =
@@ -789,10 +776,12 @@ mod tests {
     #[test]
     fn unbind_userspace_server_returns_the_registration_ref() {
         let n = ns();
-        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap();
+        let bound = us_reg_target();
+        let at = bound.as_ptr();
+        n.bind_userspace_server(b"/fs", bound, Rights::LOOKUP, SubtreeBase::empty()).unwrap();
         match n.unbind(b"/fs").expect("was bound") {
             BindingTarget::UserspaceServer(reg, _) => {
-                assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
+                assert_eq!(reg.as_ptr(), at, "the registration bound");
                 drop(reg); // released outside the lock
             }
             _ => panic!("expected a userspace-server target"),

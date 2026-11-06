@@ -48,11 +48,12 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, Reserved};
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::mm::PhysAddr;
+use crate::object::header::Ref;
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 use crate::object::{
-    BlockSendOutcome, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, PendingOperation,
-    ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg, Thread, ThreadEntry, ThreadState, Timer, TransferRef,
-    UserspaceServerReg,
+    BlockSendOutcome, FileObject, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,
+    PendingOperation, Process, ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg, Thread, ThreadEntry,
+    ThreadState, Timer, TransferRef, UserspaceServerReg,
 };
 
 mod current;
@@ -367,10 +368,7 @@ pub fn alloc_pid() -> Option<u32> {
 
 /// Adopt a freshly created `Thread` into an [`ObjectRef`] without a refcount change.
 fn into_objref(t: KBox<Thread>) -> ObjectRef {
-    let ptr = KBox::into_raw(t).as_ptr() as *mut ();
-    // SAFETY: `KBox::into_raw` yielded the single creation reference (the
-    // header starts at refcount 1); `from_raw` adopts it without bumping.
-    unsafe { ObjectRef::from_raw(ptr, KObjectType::Thread) }
+    ObjectRef::new(t)
 }
 
 /// Cooperatively yield to the next ready thread, round-robin. Returns immediately (still

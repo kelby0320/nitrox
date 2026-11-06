@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use crate::libkern::handle::{KObjectType, RawHandle, Rights};
 use crate::libkern::{AllocError, KVec, SpinLock};
 use crate::object::ObjectRef;
+use crate::object::header::{KObject, Ref};
 
 use super::entry::{WriteGuard, read_snapshot};
 use super::grace::{GraceTracker, yield_for_grace};
@@ -62,6 +63,8 @@ pub enum HandleError {
     OutOfMemory,
     /// `allocate` got rights invalid for the `KObjectType` (type-rights matrix).
     BadRights,
+    /// [`lookup_as`](HandleTable::lookup_as) found an object of another kind.
+    WrongType,
 }
 
 impl From<AllocError> for HandleError {
@@ -98,7 +101,7 @@ pub struct HandleStat {
 ///
 /// `close` nulls the slot but does **not** decrement the refcount: it transfers
 /// the entry's one reference to this token, which the caller must account for
-/// (normally `ObjectRef::from_raw(co.0, co.1)`, then drop). Leaving the
+/// (normally `ObjectRef::from_raw(co.0)`, then drop). Leaving the
 /// decrement to the caller, once `close` has waited out lookups, keeps destruction,
 /// which reaches the rank-6 allocator, out from under the rank-3 lock. The
 /// wrapper makes the `Result` `Send`; a bare `*mut ()` is not.
@@ -291,6 +294,8 @@ impl HandleTable {
                 return Err(HandleError::OutOfMemory);
             }
         }
+        // TODO(handle-install-tag): the tag is the caller's word, not the object's header's; see
+        // `docs/rationale/deferred-decisions.md`.
         if !is_rights_compatible(object_type, rights) {
             return Err(HandleError::BadRights);
         }
@@ -389,7 +394,7 @@ impl HandleTable {
         loop {
             // Steps 5 to 7 are a read section, which a close waits out before releasing. Releases
             // come after it: a last one runs a destructor, which may close.
-            let (snap, obj, object_type) = {
+            let (snap, obj) = {
                 let _read_guard = self.grace.enter_read(current_ctx_id());
 
                 // Step 5: seqlock-protected metadata snapshot.
@@ -401,10 +406,9 @@ impl HandleTable {
                     return Err(HandleError::InvalidHandle);
                 }
 
-                let object_type = match KObjectType::from_u32(snap.object_type) {
-                    Some(t) => t,
-                    None => return Err(HandleError::InvalidHandle),
-                };
+                if KObjectType::from_u32(snap.object_type).is_none() {
+                    return Err(HandleError::InvalidHandle);
+                }
 
                 #[cfg(test)]
                 if let Some(other_cpu) = BEFORE_ACQUIRE.take() {
@@ -416,17 +420,17 @@ impl HandleTable {
                 // step 12 or released on the retry/error paths below.
                 // SAFETY: `obj` was read from a live entry in a read section, which a close waits
                 // out, so it addresses a live object.
-                if !unsafe { try_acquire_refcount(obj, object_type) } {
+                if !unsafe { try_acquire_refcount(obj) } {
                     return Err(HandleError::InvalidHandle);
                 }
-                (snap, obj, object_type)
+                (snap, obj)
             };
 
             // Step 8: re-read seq; if changed or odd, release and retry.
             let s2 = entry.seq.load(Ordering::Acquire);
             if s2 != snap.seq || (s2 & 1) != 0 {
                 // SAFETY: releases the reference `try_acquire_refcount` took above.
-                unsafe { release_refcount(obj, object_type) };
+                unsafe { release_refcount(obj) };
                 retries += 1;
                 debug_assert!(retries < 1024, "handle table lookup spinning past 1024 retries — logic bug",);
                 continue;
@@ -435,34 +439,43 @@ impl HandleTable {
             // Step 9: generation match.
             if snap.generation != gen_expected {
                 // SAFETY: releases the reference `try_acquire_refcount` took above.
-                unsafe { release_refcount(obj, object_type) };
+                unsafe { release_refcount(obj) };
                 return Err(HandleError::InvalidHandle);
             }
 
             // Step 10: owner_pid match — security-critical.
             if snap.owner_pid != caller_pid {
                 // SAFETY: releases the reference `try_acquire_refcount` took above.
-                unsafe { release_refcount(obj, object_type) };
+                unsafe { release_refcount(obj) };
                 return Err(HandleError::NotOwner);
             }
 
             // Step 11: rights subset.
             if !required.is_subset_of(snap.rights) {
                 // SAFETY: releases the reference `try_acquire_refcount` took above.
-                unsafe { release_refcount(obj, object_type) };
+                unsafe { release_refcount(obj) };
                 return Err(HandleError::NoAccess);
             }
 
             // Step 12: adopt the reference step 7 took into an `ObjectRef` (no
             // second increment); dropping the `LookupOk` releases it.
             return Ok(LookupOk {
-                // SAFETY: step 7 acquired exactly one reference on `obj`
-                // (type `object_type`); `from_raw` adopts that reference
-                // without double-counting, and `obj` is non-null (step 6).
-                object: unsafe { ObjectRef::from_raw(obj, object_type) },
+                // SAFETY: step 7 acquired exactly one reference on `obj`; `from_raw` adopts
+                // that reference without double-counting, and `obj` is non-null (step 6).
+                object: unsafe { ObjectRef::from_raw(obj) },
                 rights: snap.rights,
             });
         }
+    }
+
+    /// Look up `h` as [`lookup`](Self::lookup) does, its object a `T` by the object's own tag.
+    pub fn lookup_as<T: KObject>(
+        &self,
+        h: RawHandle,
+        caller_pid: u32,
+        required: Rights,
+    ) -> Result<Ref<T>, HandleError> {
+        self.lookup(h, caller_pid, required)?.object.downcast().map_err(|_| HandleError::WrongType)
     }
 
     /// Look up `h` as [`lookup`](Self::lookup) does, and claim it to be moved: until the [`Claim`]
@@ -534,7 +547,8 @@ impl HandleTable {
         if prev_obj.is_null() {
             return Err(HandleError::InvalidHandle);
         }
-        // Capture the type before nulling so the caller can rebuild an `ObjectRef`.
+        // The recorded type, read before nulling, for the `ClosedObject`; the destroy reads the
+        // object's own header.
         let object_type = match KObjectType::from_u32(entry.object_type.load(Ordering::Relaxed)) {
             Some(t) => t,
             None => return Err(HandleError::InvalidHandle),
@@ -627,18 +641,18 @@ impl HandleTable {
             Err(e) => {
                 // SAFETY: `into_raw` above transferred exactly one
                 // outstanding reference to us; we account for it once.
-                drop(unsafe { ObjectRef::from_raw(object, object_type) });
+                drop(unsafe { ObjectRef::from_raw(object) });
                 Err(e)
             }
         }
     }
 
     /// Snapshot a handle's metadata for `sys_handle_stat`; requires
-    /// [`Rights::INSPECT`]. All four fields come from `lookup`'s single
+    /// [`Rights::INSPECT`]. The rights, owner and generation come from `lookup`'s single
     /// seqlock-bracketed snapshot (`owner_pid` and `generation` were verified at
-    /// steps 10 and 9). A second `read_snapshot` would race: a concurrent
-    /// close-plus-realloc of the slot (legal between two threads of one owner)
-    /// could install a new generation and owner, mixing two slot lifetimes.
+    /// steps 10 and 9), and the type from the object's own header, fixed for its life. A second
+    /// `read_snapshot` would race: a concurrent close-plus-realloc of the slot (legal between two
+    /// threads of one owner) could install a new generation and owner, mixing two slot lifetimes.
     pub fn stat(&self, h: RawHandle, caller_pid: u32) -> Result<HandleStat, HandleError> {
         let info = self.lookup(h, caller_pid, Rights::INSPECT)?;
         let (_, _, generation) = h.decode();
@@ -806,7 +820,7 @@ impl Claim<'_> {
         let this = core::mem::ManuallyDrop::new(self);
         if let Ok(co) = this.table.close(this.handle, this.pid) {
             // SAFETY: `close` transferred the handle's one reference into `co`.
-            drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+            drop(unsafe { ObjectRef::from_raw(co.0) });
         }
     }
 }

@@ -2,15 +2,13 @@ use super::*;
 
 /// Probe and initialise an AHCI controller `DeviceNode`, publishing its first SATA disk; returns
 /// its fate (claimed, or declined with why).
-pub fn init(controller: &ObjectRef) -> Outcome {
+pub fn init(controller: &DeviceNode) -> Outcome {
     // **One controller's disk is served**, through `AHCI`: a second is declined before it is touched.
     if AHCI.get().is_some() {
         crate::kprintln!("ahci: another controller's disk is served already; this one is declined");
         return declined("another AHCI controller is already claimed");
     }
-    // SAFETY: `controller` pins a live `DeviceNode`.
-    let dn: &DeviceNode = unsafe { &*(controller.as_ptr() as *const DeviceNode) };
-    let desc = dn.descriptor();
+    let desc = controller.descriptor();
 
     // BAR5 is the ABAR (AHCI 1.3). Map it uncached.
     let bar = desc.bars[5];
@@ -121,8 +119,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
     write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
 
-    // SAFETY: adopt the creation reference into the device table.
-    let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+    let r = Ref::new(node);
     crate::device::register(r.clone(), "ahci");
     disk.counted.attach(&r);
     Outcome::Claimed { driver: DRIVER, signal }
@@ -206,11 +203,9 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         sectors: 0,
         flush_command: ATA_FLUSH_CACHE,
         state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
-        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
-        intr: unsafe { crate::drivers::adopt(intr, KObjectType::InterruptObject) },
+        intr: ObjectRef::new(intr),
         counted: Counted::new(),
-        // SAFETY: as above.
-        wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
+        wake: ObjectRef::new(wake),
     };
     let Ok(mut disk) = KBox::try_new(disk) else {
         return Err(OUT_OF_MEMORY);

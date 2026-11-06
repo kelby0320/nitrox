@@ -2,14 +2,9 @@ use super::*;
 use crate::mm::test_support::init_global_heap;
 use crate::object::{IpcChannel, MemoryObject, UserspaceServerReg};
 
-fn adopt<T>(b: KBox<T>, t: KObjectType) -> ObjectRef {
-    // SAFETY: `into_raw` yields the box's single creation reference, of an object of type `t`.
-    unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), t) }
-}
-
 fn pair(depth: u32) -> (ObjectRef, ObjectRef) {
     let (a, b) = IpcChannel::try_new_pair(depth).unwrap();
-    (adopt(a, KObjectType::IpcChannel), adopt(b, KObjectType::IpcChannel))
+    (ObjectRef::new(a), ObjectRef::new(b))
 }
 
 type Moving = (RawHandle, [Option<TransferRef>; IPC_HANDLE_MAX], [Option<Claim<'static>>; IPC_HANDLE_MAX]);
@@ -71,10 +66,13 @@ fn a_forwarded_reply_closes_the_handles_it_carries() {
     const PID: u32 = 4463;
     init_global_heap();
     global::init_for_tests();
-    let (k, server_end) = pair(4);
-    let reg = adopt(UserspaceServerReg::try_new(k.clone()).unwrap(), KObjectType::UserspaceServerReg);
+    let (k, server_end) = {
+        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+        (Ref::new(a), ObjectRef::new(b))
+    };
+    let reg = Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
     // SAFETY: `k` is pinned by the test's reference.
-    assert!(unsafe { crate::sched::us_server_attach(k.as_ptr(), &reg) }.is_none());
+    assert!(unsafe { crate::sched::us_server_attach(k.as_object().as_ptr(), &reg) }.is_none());
     let (h, mut t, mut c) = moving(PID);
     assert_eq!(deliver(&server_end, &message(), &mut t, &mut c, SendMode::NoBlock, 0, PID), Ok(0));
     assert!(!held(h, PID), "closed with the reply");

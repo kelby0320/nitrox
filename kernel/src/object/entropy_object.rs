@@ -4,19 +4,22 @@
 //! token that authorizes reading it, so it carries no state. `sys_entropy_read` looks one up
 //! (requiring `READ`) and draws via [`crate::entropy::fill`]. See `docs/architecture/entropy.md`.
 
-use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 
 /// An entropy-source capability token.
 ///
 /// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
 #[repr(C)]
 pub struct EntropyObject {
-    header: KObjectHeader,
+    header: Header<Self>,
     /// Self-check sentinel; a live object always reads [`EntropyObject::MAGIC`].
     magic: u64,
 }
+
+kobject!(EntropyObject);
+// SAFETY: nothing writes an `EntropyObject` once it is made.
+unsafe impl Shared for EntropyObject {}
 
 impl EntropyObject {
     /// Sentinel written into [`EntropyObject::magic`] at construction.
@@ -24,7 +27,7 @@ impl EntropyObject {
 
     /// Allocate an entropy-source token with a refcount of one.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
-        KBox::try_new(Self { header: KObjectHeader::new(KObjectType::EntropyObject), magic: Self::MAGIC })
+        KBox::try_new(Self { header: Header::new(), magic: Self::MAGIC })
     }
 
     /// `true` iff the self-check sentinel is intact.
@@ -54,13 +57,7 @@ mod tests {
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let r = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(EntropyObject::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::EntropyObject,
-            )
-        };
+        let r = ObjectRef::new(EntropyObject::try_new().unwrap());
         assert_eq!(test_probe::entropy_object_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::entropy_object_destroys(), 1);

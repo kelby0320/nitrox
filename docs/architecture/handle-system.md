@@ -174,7 +174,7 @@ algorithm" step-for-step, and numbered as its comments are.
 5. `read_snapshot(entry)` — seqlock loop returning a consistent
    metadata tuple plus the observed seq value.
 6. `entry.object` is non-null (Acquire load).
-7. `try_acquire_refcount(object, type)` — the **ObjectRef seam**
+7. `try_acquire_refcount(object)` — the **ObjectRef seam**
    (see below).
 8. Re-read seq; if it changed or is odd, release refcount and retry
    the inner loop.
@@ -190,13 +190,13 @@ may close.
 
 ### ObjectRef seam
 
-Step 7 calls `try_acquire_refcount(*mut (), KObjectType) -> bool`, which
+Step 7 calls `try_acquire_refcount(*mut ()) -> bool`, which
 reads the `KObjectHeader` at offset 0 of the object pointer and bumps
 its refcount with `Arc`-upgrade semantics (failing if the count was
 already zero — the object is being torn down). Error/retry paths call
-`release_refcount(*mut (), KObjectType)`, which drops the reference and
-runs the object's destructor (dispatched on `KObjectType`) if it was the
-last. On success, step 12 wraps the acquired reference in an `ObjectRef`
+`release_refcount(*mut ())`, which drops the reference and runs the
+object's destructor, dispatched on the header's own tag, if it was the
+last. The entry's recorded `object_type` takes no part. On success, step 12 wraps the acquired reference in an `ObjectRef`
 (the RAII holder in `kernel/src/object/`); `lookup` returns
 `LookupOk { object: ObjectRef, rights }` and dropping the `LookupOk`
 releases the reference. A `#[cfg(test)] FAIL_NEXT_ACQUIRE` flag still
@@ -225,8 +225,9 @@ close(handle, caller_pid) -> ClosedObject
 The returned `ClosedObject(*mut (), KObjectType)` carries the previous
 object pointer **and its type**, transferring the handle's one
 reference to the caller; `close` itself does **not** decrement. The
-caller releases it via `ObjectRef::from_raw(ptr, ty)` + drop after
-`close` returns. Keeping the decrement out of `close` keeps object
+caller releases it via `ObjectRef::from_raw(ptr)` + drop after
+`close` returns; the destructor is the one the object's header names,
+not the entry's recorded type. Keeping the decrement out of `close` keeps object
 destruction (which calls `kfree`, a rank-6 allocator lock) off the
 rank-3 handle-table lock. **The wait in step 5 is what makes a racing
 `lookup` safe**: a lookup between reading the pointer and taking its

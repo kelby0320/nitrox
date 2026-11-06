@@ -1,8 +1,6 @@
 use super::*;
 use crate::io::block::BlockBackend;
 use crate::io::irp::Irp;
-use crate::libkern::KBox;
-use crate::libkern::handle::KObjectType;
 use crate::mm::test_support::init_global_heap;
 use crate::object::device_node::{BlockGeometry, CharBackend, DeviceIdentity};
 
@@ -25,40 +23,37 @@ fn pci_at(bus: u8, dev: u8, func: u8) -> ResourceDescriptor {
     }
 }
 
-fn adopt(node: KBox<DeviceNode>) -> ObjectRef {
-    // SAFETY: `into_raw` yields the single creation reference; the test adopts it.
-    unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) }
-}
-
 fn no_submit(_: *mut Irp, _: *mut ()) {}
 fn no_poll(_: *mut ()) {}
-fn no_read(_: &ObjectRef, _: &ObjectRef, _: u64, _: u64, _: u64, _: *mut ()) -> Result<(), KError> {
+fn no_read(_: &Ref<MemoryObject>, _: &ObjectRef, _: u64, _: u64, _: u64, _: *mut ()) -> Result<(), KError> {
     Err(KError::Unsupported)
 }
 
-fn block(desc: ResourceDescriptor, kind: BlockKind, name: &[u8], blocks: u64) -> ObjectRef {
+fn block(desc: ResourceDescriptor, kind: BlockKind, name: &[u8], blocks: u64) -> Ref<DeviceNode> {
     let backend = BlockBackend { submit: no_submit, poll: no_poll, ctx: core::ptr::null_mut(), max_frags: 1 };
     let geometry = BlockGeometry { logical_block_size: 512, block_count: blocks };
-    adopt(DeviceNode::try_new_block(desc, geometry, kind, name, backend).unwrap())
+    Ref::new(DeviceNode::try_new_block(desc, geometry, kind, name, backend).unwrap())
 }
 
-fn char_node() -> ObjectRef {
+fn char_node() -> Ref<DeviceNode> {
     let backend = CharBackend { submit_read: no_read, submit_write: None, ctx: core::ptr::null_mut() };
-    adopt(DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).unwrap())
+    Ref::new(DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).unwrap())
 }
 
 /// The boot's order, which `drivers::probe` sets: PCI functions (the host bridge at 00:00.0
 /// first, as on every PC), a disk on the AHCI controller, a RAM disk (published before the GPT
 /// pass, so it can be scanned like a disk), the disk's partition from that pass, then the
 /// console and the i8042's keyboard and mouse.
-fn booted() -> (Registry, ObjectRef, ObjectRef) {
+fn booted() -> (Registry, Ref<DeviceNode>, Ref<DeviceNode>) {
     let mut r = Registry::new();
-    assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0, 0), BlockGeometry::ZERO).unwrap())));
     assert!(
-        r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x1f, 2), BlockGeometry::ZERO).unwrap()))
+        r.add_pci(Ref::new(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0, 0), BlockGeometry::ZERO).unwrap()))
     );
     assert!(
-        r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x02, 0), BlockGeometry::ZERO).unwrap()))
+        r.add_pci(Ref::new(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x1f, 2), BlockGeometry::ZERO).unwrap()))
+    );
+    assert!(
+        r.add_pci(Ref::new(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x02, 0), BlockGeometry::ZERO).unwrap()))
     );
     let disk = block(pci_at(0, 0x1f, 2), BlockKind::Disk, b"QEMU HARDDISK (QM00001)", 1 << 20);
     assert!(r.add_block(disk.clone(), "ahci"));
@@ -183,8 +178,9 @@ fn a_usb_record_carries_its_ids_port_speed_and_name_under_its_controller() {
         identity: DeviceIdentity { class: 0x0c, subclass: 0x03, prog_if: 0x30, ..at3.identity },
         ..at3
     };
-    assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, xhci, BlockGeometry::ZERO).unwrap())));
-    let usb = || adopt(DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap());
+    assert!(r.add_pci(Ref::new(DeviceNode::try_new(DeviceClass::Other, xhci, BlockGeometry::ZERO).unwrap())));
+    let usb =
+        || Ref::new(DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap());
     let mut name = [0u8; MAX_DEVICE_NAME];
     name[..18].copy_from_slice(b"QEMU USB Keyboard ");
     let kbd = UsbFacts { vendor: 0x0627, product: 0x0001, class: (3, 1, 1), port: 9, speed: 3, name, name_len: 17 };
@@ -229,8 +225,9 @@ fn with_usb(r: &mut Registry) -> (u32, u32, u32, u32) {
         identity: DeviceIdentity { class: 0x0c, subclass: 0x03, prog_if: 0x30, ..at3.identity },
         ..at3
     };
-    assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, xhci, BlockGeometry::ZERO).unwrap())));
-    let usb = || adopt(DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap());
+    assert!(r.add_pci(Ref::new(DeviceNode::try_new(DeviceClass::Other, xhci, BlockGeometry::ZERO).unwrap())));
+    let usb =
+        || Ref::new(DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap());
     let name = [0; MAX_DEVICE_NAME];
     let facts = UsbFacts { vendor: 0x0627, product: 1, class: (3, 1, 1), port: 9, speed: 3, name, name_len: 0 };
     let kbd = r.add_usb(usb(), &xhci, "xhci", facts).unwrap();
@@ -438,15 +435,8 @@ fn a_change_read_is_refused_short_answered_behind_and_refused_a_fifth_place() {
     init_global_heap();
     let waiting = SpinLock::new(LockRank::Leaf, Waiters::new());
     let generation = AtomicU64::new(5);
-    let page =
-        // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
-        unsafe { crate::drivers::adopt(MemoryObject::try_new(crate::mm::PAGE_SIZE).unwrap(), KObjectType::MemoryObject) };
-    let po = || {
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        unsafe {
-            crate::drivers::adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
-        }
-    };
+    let page = Ref::new(MemoryObject::try_new(crate::mm::PAGE_SIZE).unwrap());
+    let po = || ObjectRef::new(crate::object::PendingOperation::try_new().unwrap());
     let read = |po: &ObjectRef, offset, len| read_changes(&waiting, &generation, &page, po, 0, offset, len);
 
     let behind = po();

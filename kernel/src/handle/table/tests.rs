@@ -27,14 +27,12 @@ fn close_release(t: &HandleTable, h: RawHandle, pid: u32) -> Result<(), HandleEr
     let co = t.close(h, pid)?;
     // SAFETY: `co` carries exactly the handle's one reference; we
     // account for it once.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
     Ok(())
 }
 
 fn process_magic_ok(r: &ObjectRef) -> bool {
-    debug_assert_eq!(r.object_type(), KObjectType::Process);
-    // SAFETY: `r` pins a live `Process`.
-    unsafe { &*(r.as_ptr() as *const Process) }.magic_ok()
+    r.downcast_ref::<Process>().expect("a Process").magic_ok()
 }
 
 fn sig() -> Rights {
@@ -81,7 +79,7 @@ fn sweep_owned(t: &HandleTable, pid: u32) -> usize {
         let (n, more) = t.close_owned_batch(pid, &mut cursor, &mut batch);
         for co in batch[..n].iter().flatten() {
             // SAFETY: each carries exactly the closed handle's one reference.
-            drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+            drop(unsafe { ObjectRef::from_raw(co.0) });
         }
         total += n;
         if !more {
@@ -249,7 +247,7 @@ fn close_makes_handle_invalid() {
     assert_eq!(prev.0, p);
     assert_eq!(prev.1, KObjectType::Process);
     // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(prev.0, prev.1) });
+    drop(unsafe { ObjectRef::from_raw(prev.0) });
     assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
 }
 
@@ -518,7 +516,7 @@ fn close_does_not_destroy_until_caller_drops_token() {
     // SAFETY: `co` still holds the table's reference, so `close` freed nothing.
     assert!(unsafe { &*(co.0 as *const Process) }.magic_ok());
     // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
     assert_eq!(test_probe::process_destroys(), 1);
 }
 
@@ -689,7 +687,7 @@ fn concurrent_torn_read_torture() {
                     let _ = close_release(&t, h, pid);
                 } else {
                     // SAFETY: adopts the object's creation reference.
-                    drop(unsafe { ObjectRef::from_raw(obj, KObjectType::Process) });
+                    drop(unsafe { ObjectRef::from_raw(obj) });
                 }
                 pid = pid.wrapping_add(1);
                 if pid == 0 {
@@ -716,8 +714,7 @@ fn concurrent_torn_read_torture() {
                         for generation in 1..8u32 {
                             let h = RawHandle::encode(0, slot, generation);
                             if let Ok(ok) = t.lookup(h, pid, sig()) {
-                                // SAFETY: `ok.object` pins the object, and this test stores only `Process`es.
-                                let p = unsafe { &*(ok.object.as_ptr() as *const Process) };
+                                let p = ok.object.downcast_ref::<Process>().expect("this test stores only Processes");
                                 assert!(p.magic_ok(), "torn/UAF read: bad magic");
                                 assert_eq!(p.pid(), pid, "object pid != owner pid");
                             }
@@ -934,4 +931,30 @@ fn a_claim_needs_the_rights_it_asks_for() {
     let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
     assert_eq!(t.claim(h, 1, Rights::TRANSFER).err(), Some(HandleError::NoAccess));
     assert_eq!(t.claim(h, 2, Rights::empty()).err(), Some(HandleError::NotOwner));
+}
+
+/// **A reference's kind is the object's header's, never the entry's record**: an entry recorded
+/// under the wrong tag looks up as the kind its object is, and is freed as that kind. The record is
+/// rewritten after a true `allocate`, as no caller could: what is pinned is the lookup, not that
+/// `allocate` takes a tag the object disagrees with.
+#[test]
+fn a_lookup_reads_the_objects_tag_not_the_entrys() {
+    let t = fresh_table();
+    test_probe::reset();
+    let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::empty()).unwrap();
+    let (seg, slot, _) = h.decode();
+    let entries = t.directory[seg as usize].load(Ordering::Acquire);
+    // SAFETY: a published segment, which outlives the table; the test is single-threaded.
+    unsafe { (*entries)[slot as usize].object_type.store(KObjectType::Thread as u32, Ordering::Relaxed) };
+    let ok = t.lookup(h, 1, Rights::empty()).unwrap();
+    let (ptr, ty) = ok.object.into_raw();
+    assert_eq!(ty, KObjectType::Process, "the tag a lookup's reference carries");
+    // SAFETY: re-adopts the reference `into_raw` gave up.
+    let object = unsafe { ObjectRef::from_raw(ptr) };
+    assert!(object.downcast_ref::<Process>().is_some_and(Process::magic_ok));
+    assert!(object.downcast::<Thread>().is_err());
+    assert_eq!(t.lookup_as::<Thread>(h, 1, Rights::empty()).unwrap_err(), HandleError::WrongType);
+    assert!(t.lookup_as::<Process>(h, 1, Rights::empty()).is_ok_and(|p| p.magic_ok()));
+    close_release(&t, h, 1).unwrap();
+    assert_eq!((test_probe::process_destroys(), test_probe::thread_destroys()), (1, 0));
 }

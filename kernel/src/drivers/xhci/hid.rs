@@ -29,8 +29,9 @@ use crate::libkern::device::DeviceKind;
 use crate::libkern::input::{EV_KEY, InputEvent, KEY_PRESS};
 use crate::libkern::lockrank::LockRank;
 use crate::mm::dma::{DmaBuffer, Programmed};
-use crate::object::ObjectRef;
 use crate::object::device_node::{CharBackend, DeviceNode, ResourceDescriptor};
+use crate::object::header::Ref;
+use crate::object::{MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 
 /// USB input nodes a boot can publish.
@@ -502,7 +503,7 @@ fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32, u32)> {
     LIGHTS_TAKEN.fetch_and(!(1u32 << index), Ordering::Relaxed);
     let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: context(index, epoch) };
     let served = DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).ok().and_then(|node| {
-        let node = crate::drivers::adopt_node(node);
+        let node = Ref::new(node);
         crate::device::register_input(node, kind, parent, "usb-hid")
     });
     if served.is_none() {
@@ -758,7 +759,7 @@ fn let_go_meanwhile(nodes: &Nodes, node: usize, decoder: Decoder, now: u64, mut 
 }
 
 fn submit_read(
-    buffer: &ObjectRef,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     buf_offset: u64,
     _offset: u64,
@@ -775,7 +776,13 @@ static LIGHTS_TAKEN: AtomicU32 = AtomicU32::new(0);
 /// keyboard that has left is refused at once, `PeerClosed`, and to one that takes no more lights,
 /// `IoError`; one that comes while another waits replaces it, which is completed as done, its
 /// lights being older than the ones that will be set. [`Nodes::write`], on the boot's.
-fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError> {
+fn submit_write(
+    buffer: &Ref<MemoryObject>,
+    po: &ObjectRef,
+    buf_offset: u64,
+    len: u64,
+    ctx: *mut (),
+) -> Result<(), KError> {
     NODES.write(super::controller(), buffer, po, buf_offset, len, ctx)
 }
 

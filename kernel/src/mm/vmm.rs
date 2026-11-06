@@ -5,14 +5,15 @@
 //! red-black tree storing them per process. It reaches hardware page tables only through
 //! [`arch::Paging`](crate::arch::Paging).
 //!
-//! This file holds the leaf data types ([`VAddrRange`], [`Protection`], [`MappingKind`], [`Vma`])
+//! This file holds the leaf data types ([`VAddrRange`], [`Protection`], [`Backing`], [`Vma`])
 //! and the [`VmaTree`], an intrusive interval-augmented red-black tree of `Vma`s.
 
 use core::ptr::NonNull;
 
 use crate::libkern::KBox;
 use crate::mm::{PAGE_SIZE, VirtAddr};
-use crate::object::ObjectRef;
+use crate::object::header::Ref;
+use crate::object::{FileObject, MemoryObject};
 
 /// A half-open range of virtual addresses, `[start, end)`.
 ///
@@ -127,26 +128,22 @@ impl core::ops::BitOr for Protection {
     }
 }
 
-/// What backs a [`Vma`]'s pages.
+/// What backs a [`Vma`]'s pages: the backing object's reference, held so its frames outlive the
+/// mapping and dropped when the VMA is freed.
 ///
-/// A `Copy` marker: the owning reference for [`Object`] lives in [`Vma::object`], so the enum
-/// stays `Copy`/`Eq`. A new variant touches only the `match`es in `AddressSpace::free_vma_pages`
-/// and `AddressSpace::fault_in`.
-///
-/// [`Object`]: MappingKind::Object
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum MappingKind {
+/// A new variant touches only the `match`es in `AddressSpace::free_vma_pages` and
+/// `AddressSpace::fault_in`.
+#[derive(Debug)]
+pub enum Backing {
     /// Zero-initialised, backed by anonymous frames owned by the VMA. Faulted in on first touch
     /// when reserved via `map_vma_lazy`, or allocated up front by `map_vma`; freed on unmap.
     Anonymous,
-    /// Backed by a [`MemoryObject`](crate::object::MemoryObject)'s own pre-allocated frames. The
-    /// owning [`ObjectRef`] is in [`Vma::object`]; the object frees the frames on its last-ref
-    /// drop, **not** unmap.
-    Object,
-    /// Backed by a file's pages served through the page cache; the owning [`ObjectRef`] is in
-    /// [`Vma::object`]. A not-present fault is serviced outside the AS lock
-    /// (`AddressSpace::file_backing`, `map_file_page`).
-    FileBacked,
+    /// Backed by a [`MemoryObject`]'s own pre-allocated frames, which the object frees on its
+    /// last-ref drop, **not** unmap.
+    Object(Ref<MemoryObject>),
+    /// Backed by a file's pages served through the page cache. A not-present fault is serviced
+    /// outside the AS lock (`AddressSpace::file_backing`, `map_file_page`).
+    File(Ref<FileObject>),
 }
 
 /// The kind of access that triggered a page fault, decoded from the arch's fault information.
@@ -216,7 +213,7 @@ impl RbLink {
 pub struct Vma {
     pub range: VAddrRange,
     pub prot: Protection,
-    pub mapping: MappingKind,
+    pub backing: Backing,
     /// How this mapping's pages are cached: the backing object's answer, taken when the VMA is
     /// made.
     ///
@@ -225,9 +222,6 @@ pub struct Vma {
     /// and the kinds that fault in are ordinary memory. The field lets the answer travel with the
     /// mapping rather than being recomputed per site.
     pub caching: crate::mm::Caching,
-    /// `Some(_)` iff `mapping` is `Object` or `FileBacked`: the owning reference to the backing
-    /// object, held so its frames outlive this mapping and dropped when the VMA is freed.
-    pub object: Option<ObjectRef>,
     link: RbLink,
 }
 
@@ -237,33 +231,29 @@ impl Drop for Vma {
     /// those do. The object's dirty pin is untouched: what was written through this mapping is
     /// still unwritten, and a later write-back decides.
     fn drop(&mut self) {
-        if self.mapping == MappingKind::FileBacked
+        if let Backing::File(file) = &self.backing
             && self.prot.contains(Protection::WRITE)
-            && let Some(obj) = self.object.as_ref()
         {
-            // Nothing ties `mapping` to the object's kind, so it is checked before the cast.
-            assert_eq!(obj.object_type(), crate::libkern::handle::KObjectType::FileObject, "Vma::drop");
-            // SAFETY: `obj` is the VMA's reference to its `FileObject`, its type just checked.
-            unsafe { crate::object::FileObject::writable_unmapped(obj.as_ptr()) };
+            file.writable_unmapped();
         }
     }
 }
 
 impl Vma {
-    pub const fn new(range: VAddrRange, prot: Protection, mapping: MappingKind) -> Self {
-        Self { range, prot, mapping, caching: crate::mm::Caching::Normal, object: None, link: RbLink::new(range.end()) }
-    }
-
-    /// Construct an object-backed VMA holding `object`; not `const` (stores an [`ObjectRef`]).
-    pub fn new_object(range: VAddrRange, prot: Protection, object: ObjectRef, caching: crate::mm::Caching) -> Self {
+    /// An anonymous VMA; a mapping of an object takes its [`backing`](Self::backing) once made.
+    pub const fn new(range: VAddrRange, prot: Protection) -> Self {
         Self {
             range,
             prot,
-            mapping: MappingKind::Object,
-            caching,
-            object: Some(object),
+            backing: Backing::Anonymous,
+            caching: crate::mm::Caching::Normal,
             link: RbLink::new(range.end()),
         }
+    }
+
+    /// The backing object's reference, the VMA left anonymous: a refused mapping hands it back.
+    pub fn take_backing(&mut self) -> Backing {
+        core::mem::replace(&mut self.backing, Backing::Anonymous)
     }
 }
 
@@ -288,6 +278,11 @@ pub struct VmaTree {
     root: Option<NonNull<Vma>>,
     len: usize,
 }
+
+// SAFETY: the tree owns every `Vma` its links reach, each a box it took, and no link leaves it, so
+// moving the tree moves those boxes as moving each `KBox<Vma>` would; a `Vma`'s other fields are
+// `Send`.
+unsafe impl Send for VmaTree {}
 
 impl VmaTree {
     pub const fn new() -> Self {

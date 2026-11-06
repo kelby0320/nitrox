@@ -14,8 +14,8 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::io::irp::IrpOp;
 use crate::libkern::device::IoRecord;
-use crate::libkern::handle::KObjectType;
-use crate::object::{DeviceNode, ObjectRef};
+use crate::object::DeviceNode;
+use crate::object::header::Ref;
 
 /// **One device's counters, since it was registered.** Relaxed throughout: they are statistics,
 /// and a reader between two updates for one command can see one of them and not the other.
@@ -95,13 +95,9 @@ impl Counted {
 
     /// Hold `node`'s counters, **pinning the node for good**: they outlive every command recorded
     /// into them, whatever became of its registration.
-    pub fn attach(&self, node: &ObjectRef) {
-        if node.object_type() != KObjectType::DeviceNode {
-            return;
-        }
+    pub fn attach(&self, node: &Ref<DeviceNode>) {
         let pinned = node.clone();
-        // SAFETY: a `DeviceNode`, by its type, which `pinned` keeps from here on.
-        let io = unsafe { &*(pinned.as_ptr() as *const DeviceNode) }.io();
+        let io = pinned.io();
         self.0.store(io as *const IoStats as *mut IoStats, Ordering::Release);
         core::mem::forget(pinned);
     }
@@ -173,7 +169,7 @@ mod tests {
         use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
         crate::mm::test_support::init_global_heap();
         let node = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
-        let node = crate::drivers::adopt_node(node);
+        let node = Ref::new(node);
         let c = Counted::new();
         c.attach(&node);
         // SAFETY: `node` holds the object here.

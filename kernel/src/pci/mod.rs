@@ -10,15 +10,14 @@
 
 use crate::arch::Platform;
 use crate::arch::platform::{ArchPlatform, EcamRegion};
-use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, KVec};
+use crate::libkern::{AllocError, KVec};
 use crate::mm::PhysAddr;
 use crate::mm::kvmap::{self, MmioWindow};
-use crate::object::ObjectRef;
 use crate::object::device_node::{
     BAR_FLAG_64, BAR_FLAG_PREFETCH, BAR_IO, BAR_MMIO, BAR_NONE, BarWindow, BlockGeometry, DeviceClass, DeviceIdentity,
     DeviceNode, InterruptSpec, ResourceDescriptor,
 };
+use crate::object::header::Ref;
 
 const REG_ID: u16 = 0x00; // vendor_id | device_id << 16
 const REG_COMMAND: u16 = 0x04; // command | status << 16
@@ -213,6 +212,8 @@ enum Probe {
     Present { multifunction: bool },
 }
 
+type Found = KVec<Ref<DeviceNode>>;
+
 /// Probe `(bus, dev, func)`: repoint the window and, if a device is present, build, log and push
 /// its `DeviceNode`.
 fn probe_function(
@@ -221,7 +222,7 @@ fn probe_function(
     bus: u8,
     dev: u8,
     func: u8,
-    out: &mut KVec<ObjectRef>,
+    out: &mut Found,
     found: &mut usize,
 ) -> Probe {
     // SAFETY: `func_phys` is a 4 KiB-aligned config-space frame within `region`, and nothing reads
@@ -239,19 +240,14 @@ fn probe_function(
     match DeviceNode::try_new(DeviceClass::Other, desc, BlockGeometry::ZERO) {
         Ok(node) => {
             log_function(&desc, &caps);
-            // SAFETY: `into_raw` yields the single creation reference; adopt it
-            // as an `ObjectRef` of the matching type.
-            let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
-            if out.try_push(r).is_ok() {
-                *found += 1;
-            }
+            *found += out.try_push(Ref::new(node)).is_ok() as usize;
         }
         Err(_) => crate::kprintln!("pci: {:02x}:{:02x}.{} node alloc failed", bus, dev, func),
     }
     Probe::Present { multifunction }
 }
 
-fn scan_device(region: &EcamRegion, win: &mut MmioWindow, bus: u8, dev: u8, out: &mut KVec<ObjectRef>, n: &mut usize) {
+fn scan_device(region: &EcamRegion, win: &mut MmioWindow, bus: u8, dev: u8, out: &mut Found, n: &mut usize) {
     if let Probe::Present { multifunction } = probe_function(region, win, bus, dev, 0, out, n)
         && multifunction
     {
@@ -266,8 +262,8 @@ fn scan_device(region: &EcamRegion, win: &mut MmioWindow, bus: u8, dev: u8, out:
 ///
 /// Must run after the allocators, HHDM, kvmap and [`ArchPlatform::init`]. Performs no I/O
 /// beyond config reads and BAR sizing.
-pub fn enumerate() -> KVec<ObjectRef> {
-    let mut out: KVec<ObjectRef> = KVec::new();
+pub fn enumerate() -> KVec<Ref<DeviceNode>> {
+    let mut out = KVec::new();
     let regions = Platform::pcie_ecam_regions();
     if regions.is_empty() {
         crate::kprintln!("pci: no ECAM regions discovered");

@@ -375,15 +375,8 @@ mod tests {
 
     /// A live `PendingOperation`, adopted into an `ObjectRef`, as a seed-waiter.
     fn po() -> ObjectRef {
-        use crate::libkern::KBox;
         use crate::object::PendingOperation;
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
-                crate::libkern::handle::KObjectType::PendingOperation,
-            )
-        }
+        ObjectRef::new(PendingOperation::try_new().unwrap())
     }
 
     fn reserved_state() -> EntropyState {

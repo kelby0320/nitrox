@@ -37,7 +37,6 @@ use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
 use crate::dpc::{Dpc, OneAtATime};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
@@ -292,16 +291,14 @@ fn declined(why: &'static str) -> Outcome {
 }
 
 /// Bring up the controller `controller` is, unless `usb_off` or one is already claimed.
-pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
+pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     if usb_off {
         return declined("usb=off on the command line");
     }
     if XHCI.get().is_some() {
         return declined("another xHCI controller is already claimed");
     }
-    // SAFETY: `controller` pins a live `DeviceNode`.
-    let dn: &DeviceNode = unsafe { &*(controller.as_ptr() as *const DeviceNode) };
-    let desc = *dn.descriptor();
+    let desc = *controller.descriptor();
     let at = Address(&desc);
 
     // **Power first**: in D3hot the registers read as all ones (the laptop's was in D3 when Linux
@@ -476,10 +473,8 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(ev_mem), ring: Consumer::new() }),
         _erst: Programmed::new(erst),
         port_changes: AtomicU32::new(0),
-        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
-        hub_wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        first_round: unsafe { crate::drivers::adopt(first, KObjectType::PendingOperation) },
+        hub_wake: ObjectRef::new(wake),
+        first_round: ObjectRef::new(first),
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
         pci: desc,
@@ -849,12 +844,8 @@ fn fake(regs: u64) -> Xhci {
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(page()), ring: Consumer::new() }),
         _erst: Programmed::new(page()),
         port_changes: AtomicU32::new(0),
-        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
-        hub_wake: unsafe { crate::drivers::adopt(InterruptObject::try_new().unwrap(), KObjectType::InterruptObject) },
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        first_round: unsafe {
-            crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
-        },
+        hub_wake: ObjectRef::new(InterruptObject::try_new().unwrap()),
+        first_round: ObjectRef::new(PendingOperation::try_new().unwrap()),
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
         pci: ResourceDescriptor::ZERO,

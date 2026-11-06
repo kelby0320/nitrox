@@ -19,9 +19,9 @@ use crate::dpc::Dpc;
 use crate::drivers::input::{self, ReadNow, Submitted};
 use crate::libkern::IrqSpinLock;
 use crate::libkern::KBox;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
+use crate::object::header::Ref;
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 
@@ -30,7 +30,7 @@ const RING_CAP: usize = 256;
 
 struct ParkedRead {
     po: ObjectRef,
-    buffer: ObjectRef,
+    buffer: Ref<MemoryObject>,
     buf_offset: u64,
     max_len: usize,
 }
@@ -101,27 +101,12 @@ static CONSOLE: IrqSpinLock<Inner> = IrqSpinLock::new(LockRank::Leaf, Inner::new
 
 static CONSOLE_DPC: Dpc = Dpc::new(console_intr_dpc, core::ptr::null_mut());
 
-static CONSOLE_NODE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Copy `src` into `buffer`'s frames at byte `buf_offset`, via the HHDM; the caller has
-/// bounds-checked it. Runs outside the console lock; the frames are kernel memory, so it is sound
-/// from a DPC.
-///
-/// # Safety
-///
-/// `buffer` must point at a live `MemoryObject`, kept alive by an `ObjectRef` the caller
-/// holds for the duration. The DPC passes a *borrowed* pointer so it never owns a reference
-/// it would then have to drop.
-unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
-    // SAFETY: the caller guarantees `buffer` pins a live `MemoryObject`.
-    let mo: &MemoryObject = unsafe { &*(buffer as *const MemoryObject) };
-    mo.copy_in(buf_offset as usize, src);
-}
+static CONSOLE_NODE: AtomicPtr<DeviceNode> = AtomicPtr::new(core::ptr::null_mut());
 
 /// [`CharBackend::submit_read`] for the console: satisfy the read now from the ring or park it for
 /// the next RX interrupt; `WouldBlock` if one is already pending. Syscall context.
 fn submit_read(
-    buffer: &ObjectRef,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     buf_offset: u64,
     _offset: u64,
@@ -133,7 +118,7 @@ fn submit_read(
 
 fn read(
     console: &IrqSpinLock<Inner>,
-    buffer: &ObjectRef,
+    buffer: &Ref<MemoryObject>,
     po: &ObjectRef,
     buf_offset: u64,
     max_len: usize,
@@ -152,8 +137,7 @@ fn read(
     );
     match found {
         Submitted::Drained(n) => {
-            // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
-            unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, &tmp[..n]) };
+            buffer.copy_in(buf_offset as usize, &tmp[..n]);
             // SAFETY: `po` pins the read's `PendingOperation`.
             unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64) };
             Ok(())
@@ -171,9 +155,7 @@ fn console_intr_dpc(_ctx: *mut ()) {
     // would let another CPU's `reap_pending` drop it mid-copy.
     let completed = CONSOLE.lock().take_ready(&mut tmp);
     if let Some((pr, n)) = completed {
-        // SAFETY: `pr` owns the `ObjectRef` pinning this `MemoryObject`, and `pr` is a local
-        // — unreachable from any other CPU until it is published below.
-        unsafe { copy_into_memobj(pr.buffer.as_ptr(), pr.buf_offset, &tmp[..n]) };
+        pr.buffer.copy_in(pr.buf_offset as usize, &tmp[..n]);
         // SAFETY: `pr` owns the reference pinning its `PendingOperation`.
         unsafe { crate::sched::complete_pending_op(pr.po.as_ptr(), 0, n as u64) };
         // **Nothing is dropped here, deliberately.** Nothing cancels a parked read, so a process
@@ -214,14 +196,14 @@ extern "C" fn console_isr() {
 }
 
 /// A counted reference to the console [`DeviceNode`], or `None` before [`init`] runs.
-pub fn device_ref() -> Option<ObjectRef> {
+pub fn device_ref() -> Option<Ref<DeviceNode>> {
     let p = CONSOLE_NODE.load(Ordering::Acquire);
     if p.is_null() {
         return None;
     }
     // SAFETY: `CONSOLE_NODE` points at the leaked-`'static` console `DeviceNode`
     // (its creation reference is never released), so the object is live.
-    unsafe { ObjectRef::try_acquire(p, KObjectType::DeviceNode) }
+    unsafe { Ref::try_acquire(p) }
 }
 
 /// Bring up console input: self-test RX by internal loopback, publish the console `DeviceNode`, arm
@@ -240,8 +222,7 @@ pub fn init() {
     let backend = CharBackend { submit_read, submit_write: None, ctx: core::ptr::null_mut() };
     match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
         Ok(node) => {
-            let ptr = KBox::into_raw(node).as_ptr() as *mut ();
-            CONSOLE_NODE.store(ptr, Ordering::Release);
+            CONSOLE_NODE.store(KBox::into_raw(node).as_ptr(), Ordering::Release);
             // **And in the device table**, so `/dev/registry` lists it; it is served at
             // `/dev/console`, which no index names.
             if let Some(r) = device_ref() {
@@ -276,15 +257,9 @@ mod tests {
     use crate::object::PendingOperation;
 
     fn read() -> ParkedRead {
-        let adopt = |p: *mut (), ty| {
-            // SAFETY: `p` is the single creation reference of a `ty` object.
-            unsafe { ObjectRef::from_raw(p, ty) }
-        };
-        let po = KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut ();
-        let buf = KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut ();
         ParkedRead {
-            po: adopt(po, KObjectType::PendingOperation),
-            buffer: adopt(buf, KObjectType::MemoryObject),
+            po: ObjectRef::new(PendingOperation::try_new().unwrap()),
+            buffer: Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap()),
             buf_offset: 0,
             max_len: 1,
         }

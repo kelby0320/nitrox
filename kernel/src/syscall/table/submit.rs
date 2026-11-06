@@ -24,25 +24,23 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
         IoOpcode::Rescan => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Rescan),
         IoOpcode::Eject => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Eject),
     };
-    let dev_ok = lookup_typed(resource_h, pid, dev_right, KObjectType::DeviceNode)?;
-    let buf_ok = lookup_typed(op.buffer, pid, buf_right, KObjectType::MemoryObject)?;
-    let buffer_size = io_buffer_size(&buf_ok.object)?;
+    let device = lookup_as::<DeviceNode>(resource_h, pid, dev_right)?;
+    let buffer = lookup_as::<MemoryObject>(op.buffer, pid, buf_right)?;
+    let buffer_size = io_buffer_size(&buffer)?;
     let buf_end = op.buf_offset.checked_add(op.length).ok_or(KError::InvalidArgument)?;
     if buf_end > buffer_size {
         return Err(KError::InvalidArgument);
     }
 
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: adopt the single creation reference.
-    let po_ref =
-        unsafe { ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation) };
+    let po_ref = ObjectRef::new(po_box);
     let (tptr, tty) = po_ref.clone().into_raw();
     let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
         Ok(h) => h,
         Err(e) => {
             // SAFETY: `allocate` did not adopt this reference; reclaim it. Then
             // `po_ref` drops at return, destroying the PO.
-            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+            drop(unsafe { ObjectRef::from_raw(tptr) });
             return Err(map_handle_err(e));
         }
     };
@@ -55,28 +53,18 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 
     // A block device goes through the IRP path; a char device through its backend. On failure
     // the PO handle is rolled back.
-    // SAFETY: `dev_ok.object` pins a live `DeviceNode` (type-checked above).
-    let dn: &DeviceNode = unsafe { &*(dev_ok.object.as_ptr() as *const DeviceNode) };
-    let dispatched: Result<(), KError> = match dn.class() {
-        DeviceClass::Block => crate::io::block::dispatch_block_irp(
-            &dev_ok.object,
-            &buf_ok.object,
-            &po_ref,
-            opcode,
-            op.offset,
-            op.buf_offset,
-            op.length,
-        ),
+    let dispatched: Result<(), KError> = match device.class() {
+        DeviceClass::Block => {
+            crate::io::block::dispatch_block_irp(&device, &buffer, &po_ref, opcode, op.offset, op.buf_offset, op.length)
+        }
         DeviceClass::Char if opcode == IoOpcode::Write => {
-            match dn.char_backend().and_then(|b| Some((b.submit_write?, b.ctx))) {
-                Some((write, ctx)) => write(&buf_ok.object, &po_ref, op.buf_offset, op.length, ctx),
+            match device.char_backend().and_then(|b| Some((b.submit_write?, b.ctx))) {
+                Some((write, ctx)) => write(&buffer, &po_ref, op.buf_offset, op.length, ctx),
                 None => Err(KError::Unsupported),
             }
         }
-        DeviceClass::Char if opcode == IoOpcode::Read => match dn.char_backend() {
-            Some(backend) => {
-                (backend.submit_read)(&buf_ok.object, &po_ref, op.buf_offset, op.offset, op.length, backend.ctx)
-            }
+        DeviceClass::Char if opcode == IoOpcode::Read => match device.char_backend() {
+            Some(backend) => (backend.submit_read)(&buffer, &po_ref, op.buf_offset, op.offset, op.length, backend.ctx),
             None => Err(KError::Unsupported),
         },
         DeviceClass::Char | DeviceClass::Other => Err(KError::Unsupported),
@@ -101,25 +89,22 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
     if op.buffer != 0 || op.buf_offset != 0 || op.offset != 0 || op.length != 0 {
         return Err(KError::InvalidArgument);
     }
-    let dev_ok = lookup_typed(resource_h, pid, Rights::WRITE, KObjectType::DeviceNode)?;
-    // SAFETY: `dev_ok.object` pins a live `DeviceNode` (type-checked above).
-    if unsafe { &*(dev_ok.object.as_ptr() as *const DeviceNode) }.class() != DeviceClass::Block {
+    let device = lookup_as::<DeviceNode>(resource_h, pid, Rights::WRITE)?;
+    if device.class() != DeviceClass::Block {
         return Err(KError::Unsupported);
     }
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: adopt the single creation reference.
-    let po_ref =
-        unsafe { ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation) };
+    let po_ref = ObjectRef::new(po_box);
     let (tptr, tty) = po_ref.clone().into_raw();
     let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
         Ok(h) => h,
         Err(e) => {
             // SAFETY: `allocate` did not adopt this reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+            drop(unsafe { ObjectRef::from_raw(tptr) });
             return Err(map_handle_err(e));
         }
     };
-    match crate::io::block::dispatch_block_control(&dev_ok.object, &po_ref, irp_op) {
+    match crate::io::block::dispatch_block_control(&device, &po_ref, irp_op) {
         Ok(()) => Ok(po_h.bits() as isize),
         Err(e) => {
             close_and_release(po_h, pid);
@@ -129,12 +114,9 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
 }
 
 /// An I/O buffer's size; a borrowed one is refused, as the kernel and the device reach its frames.
-pub(super) fn io_buffer_size(buf: &ObjectRef) -> Result<u64, KError> {
-    assert_eq!(buf.object_type(), KObjectType::MemoryObject, "io_buffer_size");
-    // SAFETY: `buf` pins a live `MemoryObject`, its type just checked.
-    let mo = unsafe { &*(buf.as_ptr() as *const MemoryObject) };
-    if !mo.kernel_reachable() {
+pub(super) fn io_buffer_size(buf: &MemoryObject) -> Result<u64, KError> {
+    if !buf.kernel_reachable() {
         return Err(KError::InvalidArgument);
     }
-    Ok(mo.size() as u64)
+    Ok(buf.size() as u64)
 }

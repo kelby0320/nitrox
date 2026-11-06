@@ -93,13 +93,13 @@ obj, MemoryObject, full_rights)` → return the handle to userspace.
 `AddressSpace` (`sched::current_process`) → handle-table `lookup` (checks owner
 + that the handle carries the requested `MAP_*` rights; pins the object) →
 `find_free_range` picks a virtual range → `AddressSpace::map_object` installs a
-PTE per page pointing at `obj.frames()[i]` and records an `Object` VMA holding
-an `ObjectRef` → `flush_tlb_all` (the AS is active) → return the base address.
+PTE per page pointing at `obj.frames()[i]` and records a VMA backed by
+`Backing::Object`, holding a `Ref<MemoryObject>` → `flush_tlb_all` (the AS is active) → return the base address.
 A subsequent user dereference is pure MMU: the process PML4 walk hits the
 installed PTE, no kernel involvement.
 
 **Trace — teardown:** `sys_memory_unmap(addr)` removes the VMA + PTEs (frames
-untouched) and drops the VMA's `ObjectRef`; `sys_handle_close` (or process
+untouched) and drops the VMA's reference; `sys_handle_close` (or process
 exit) drops the handle's. When the last reference goes, `dispatch_destroy` runs
 `MemoryObject::Drop`, returning every frame to the buddy.
 
@@ -251,7 +251,7 @@ shootdown — all filed in `docs/rationale/deferred-decisions.md`.
 ## VMA tree
 
 [`mm/vmm.rs`](../../kernel/src/mm/vmm.rs) holds the leaf data types
-(`VAddrRange`, `Protection`, `MappingKind`, `Vma`) and `VmaTree` — an
+(`VAddrRange`, `Protection`, `Backing`, `Vma`) and `VmaTree` — an
 interval-augmented intrusive red-black tree of `Vma`s, keyed on
 `range.start`.
 
@@ -326,35 +326,34 @@ ELF loader's, is filled eagerly, so its rollback frees without one.
   the caller with a `MapError`. The whole sequence runs under the AS
   lock so the tree and the page tables can never disagree about
   what's mapped.
-- **`map_object(range, prot, ObjectRef)`.** The sibling path for a
+- **`map_object(range, prot, Ref<MemoryObject>)`.** The sibling path for a
   `MemoryObject` (see below). It allocates and zeroes **nothing** — it
   installs PTEs pointing at the object's own, pre-allocated frames and
-  records a `MappingKind::Object` VMA that holds the `ObjectRef`. The
-  `ObjectRef` (the only fallible thing before it is consumed is the VMA
+  records a VMA whose `Backing::Object` holds the reference. The
+  reference (the only fallible thing before it is consumed is the VMA
   box, allocated before the lock) is handed back in the error tuple on
-  any failure. Mapping the same object at two ranges installs PTEs to the
+  any failure. `map_file` takes a `Ref<FileObject>` the same way: a VMA's
+  backing is typed, so neither can be handed the other's kind. Mapping the same object at two ranges installs PTEs to the
   same frames, so the two mappings alias.
 - **Eager *or* lazy anonymous allocation.** `map_vma` allocates one
   frame per page at map time; **`map_vma_lazy` reserves the range with
   no frames** and lets the page-fault handler back each page on first
   touch. `fault_in(addr, access)` looks up the covering VMA, checks the
-  attempted access against its protection, and for a `MappingKind::Anonymous`
+  attempted access against its protection, and for a `Backing::Anonymous`
   page allocates + zeroes one frame, installs the leaf PTE, and flushes the
   stale not-present TLB entry (the faulting AS is live in the MMU). The ELF
   loader reserves user stacks lazily; PT_LOAD segments stay eager because the
-  loader copies file bytes into their frames. `MappingKind::FileBacked` is the
-  page-cache backing kind — its enum variant and fault-in/teardown dispatch
-  arms exist, but no producer constructs one yet, so a fault on it is fatal
-  until the page cache lands.
+  loader copies file bytes into their frames. `Backing::File` is the
+  page-cache backing: `fault_in` only signals it, and the fault path pages
+  the file in outside the AS lock (`file_backing`, `map_file_page`).
 - **Frame ownership depends on the backing kind.**
   `ArchPaging::unmap_page` returns the `PhysAddr` it cleared;
-  `unmap_covering` and `Drop` branch on `Vma.mapping`: for
-  `MappingKind::Anonymous` the frame was owned by the mapping and is
-  handed to `buddy_free`; for `MappingKind::Object` the frame is owned by
-  the `MemoryObject` (kept alive by `Vma.object`) and is **not** freed —
-  the object frees its frames when its last reference drops. `FileBacked`
-  / `Device` (Phase 2) add further arms (page-cache pages, never-kernel-
-  allocated device pages).
+  `unmap_covering` and `Drop` branch on `Vma.backing`: for
+  `Backing::Anonymous` the frame was owned by the mapping and is
+  handed to `buddy_free`; for `Backing::Object` the frame is owned by
+  the `MemoryObject` (kept alive by the reference the backing holds) and is
+  **not** freed — the object frees its frames when its last reference drops.
+  `Backing::File`'s are the page cache's, and not freed either.
 - **`Drop` drains the tree leftmost-first**, uninstalls every PTE,
   frees every leaf frame, then frees the PML4. Intermediate
   page-table frames (PDPT / PD / PT) leak per the deferred decision
@@ -377,7 +376,7 @@ Unlike an anonymous `Vma` (whose frames are owned by the mapping), a
 `MemoryObject` **owns its physical frames** — a `KVec<PhysAddr>`, one per
 page, allocated and zeroed at creation and freed in its `Drop`. `map_object`
 points a process's PTEs at those frames and keeps the object alive for the
-mapping's lifetime via an `ObjectRef` in the `Vma`. This is what makes the
+mapping's lifetime via the reference in the `Vma`'s backing. This is what makes the
 object shareable: two mappings (eventually, in two processes) of the same
 object address the same physical memory, and the frames outlive any individual
 mapping. Phase 1 is eager and anonymous-only; copy-on-write and file-backing

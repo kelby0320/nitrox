@@ -149,7 +149,7 @@ fn timer_rights_are_allocatable_on_a_timer() {
     let h = t.allocate(1, ptr, KObjectType::Timer, timer_rights()).expect("timer_rights must be valid for a Timer");
     let co = t.close(h, 1).unwrap();
     // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn notif_channel_rights_are_allocatable_on_a_channel() {
         .expect("WAIT + generic rights must be valid for a NotificationChannel");
     let co = t.close(h, 1).unwrap();
     // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn namespace_rights_are_allocatable_on_a_namespace() {
         .expect("namespace_rights must be valid for a Namespace");
     let co = t.close(h, 1).unwrap();
     // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn entropy_rights_are_allocatable_on_an_entropy_object() {
         .expect("entropy_rights must be valid for an EntropyObject");
     let co = t.close(h, 1).unwrap();
     // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn the_system_control_handle_cannot_be_given_away() {
     assert_eq!(direct_bindable(held | Rights::TRANSFER), Ok(()), "which TRANSFER would allow");
     let co = t.close(h, 1).unwrap();
     // SAFETY: `co` carries the handle's one reference, released here once.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn channel_endpoint_rights_are_allocatable_on_a_channel() {
         .expect("channel_endpoint_rights must be valid for an IpcChannel");
     let co = t.close(h, 1).unwrap();
     // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
     drop(b);
 }
 
@@ -417,6 +417,34 @@ fn map_handle_err_collapses_notowner_to_invalid() {
     assert_eq!(map_handle_err(HandleError::OutOfHandles), KError::OutOfHandles);
     assert_eq!(map_handle_err(HandleError::OutOfMemory), KError::OutOfMemory);
     assert_eq!(map_handle_err(HandleError::BadRights), KError::InvalidArgument);
+    assert_eq!(map_handle_err(HandleError::WrongType), KError::InvalidArgument);
+}
+
+/// **Only a memory object or a file maps**: `sys_memory_map` answers another kind `InvalidHandle`.
+#[test]
+fn only_a_memory_object_or_a_file_maps() {
+    use crate::object::{FileObject, MemoryObject, PendingOperation, Producer};
+    init_global_heap();
+    let memory = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+    let file = ObjectRef::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap());
+    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
+    assert!(matches!(Mappable::of(memory), Ok(Mappable::Memory(_))));
+    assert!(matches!(Mappable::of(file), Ok(Mappable::File(_))));
+    assert!(matches!(Mappable::of(po), Err(KError::InvalidHandle)));
+}
+
+/// **A handle of another kind is `InvalidArgument`** to every syscall that names the kind it wants,
+/// as `lookup_typed`'s callers answered.
+#[test]
+fn a_handle_of_another_kind_is_an_invalid_argument() {
+    use crate::object::{Namespace, Timer};
+    const PID: u32 = 4453;
+    init_global_heap();
+    global::init_for_tests();
+    let h = install(PID, ObjectRef::new(Timer::try_new().unwrap()), Rights::empty()).unwrap().bits();
+    assert_eq!(lookup_as::<Namespace>(h, PID, Rights::empty()).unwrap_err(), KError::InvalidArgument);
+    assert!(lookup_as::<Timer>(h, PID, Rights::empty()).is_ok());
+    assert_eq!(global::close_all_owned_by(PID), 1);
 }
 
 #[test]
@@ -541,36 +569,30 @@ fn full_mem_rights_are_allocatable_on_a_memory_object() {
         .expect("full_mem_rights must be valid for a MemoryObject");
     let co = t.close(h, 1).unwrap();
     // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
-}
-
-/// A fresh kernel object's reference; each caller names the type it boxed.
-fn adopt<T>(b: KBox<T>, t: KObjectType) -> ObjectRef {
-    // SAFETY: `into_raw` yields the box's single creation reference, of an object of type `t`.
-    unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), t) }
+    drop(unsafe { ObjectRef::from_raw(co.0) });
 }
 
 /// A file server's registration, its peer endpoint dropped.
-fn file_server_reg() -> ObjectRef {
-    use crate::object::{IpcChannel, UserspaceServerReg};
+fn file_server_reg() -> Ref<UserspaceServerReg> {
+    use crate::object::IpcChannel;
     let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-    drop(adopt(b, KObjectType::IpcChannel));
-    let ep = adopt(a, KObjectType::IpcChannel);
-    adopt(UserspaceServerReg::try_new(ep).unwrap(), KObjectType::UserspaceServerReg)
+    drop(ObjectRef::new(b));
+    let ep = Ref::new(a);
+    Ref::new(UserspaceServerReg::try_new(ep).unwrap())
 }
 
 fn block_device() -> ObjectRef {
     use crate::object::DeviceNode;
     use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
     let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
-    adopt(dev, KObjectType::DeviceNode)
+    ObjectRef::new(dev)
 }
 
 const FILE_CLIENT: u32 = 4242;
 
 /// `reg`'s server answers a lookup asking `MAP_READ | MAP_WRITE` with a file-blocks reply for
 /// `file_id` (`0` uncached): 512-byte blocks, one run of a page, `device` sent with `rights`.
-fn file_blocks_reply(reg: &ObjectRef, file_id: u64, device: ObjectRef, rights: Rights) -> (i32, u64) {
+fn file_blocks_reply(reg: &Ref<UserspaceServerReg>, file_id: u64, device: ObjectRef, rights: Rights) -> (i32, u64) {
     use crate::object::PendingOperation;
     use crate::object::userspace_server::{ForwardOp, LOOKUP_SUFFIX_MAX, PendingLookup};
     let mut msg = std::vec![0u8; 28 + 32 + 24];
@@ -580,7 +602,7 @@ fn file_blocks_reply(reg: &ObjectRef, file_id: u64, device: ObjectRef, rights: R
     msg[28 + 16..28 + 24].copy_from_slice(&file_id.to_le_bytes());
     msg[28 + 32 + 8..28 + 32 + 16].copy_from_slice(&100u64.to_le_bytes());
     msg[28 + 32 + 16..28 + 32 + 20].copy_from_slice(&8u32.to_le_bytes());
-    let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
     let pl = PendingLookup {
         request_id: 1,
         po,
@@ -648,7 +670,7 @@ fn a_reply_for_a_cached_file_naming_another_device_is_refused() {
 
 /// A forwarded lookup, and a reply carrying a memory object built for it.
 struct Forwarded {
-    reg: ObjectRef,
+    reg: Ref<UserspaceServerReg>,
     po: ObjectRef,
     reply: crate::object::ipc_channel::StoredMsg,
     transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
@@ -661,14 +683,21 @@ fn forwarded_memobj_lookup() -> Forwarded {
     use crate::object::{IpcChannel, MemoryObject, PendingOperation, UserspaceServerReg};
     use crate::rsproto::{OBJECT_KIND_MEMOBJ, build_resolve_request};
     let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-    let (k, _server_end) = (adopt(k, KObjectType::IpcChannel), adopt(s, KObjectType::IpcChannel));
-    let reg = adopt(UserspaceServerReg::try_new(k).unwrap(), KObjectType::UserspaceServerReg);
-    let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+    let (k, _server_end) = (Ref::new(k), ObjectRef::new(s));
+    let reg = Ref::new(UserspaceServerReg::try_new(k).unwrap());
+    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
     let mut msg = StoredMsg::zeroed();
     msg.header.payload_len = build_resolve_request(&mut msg.payload, Rights::MAP_READ.bits(), b"f").unwrap() as u32;
     // SAFETY: `reg` and `po` are pinned by the test.
     let forwarded = unsafe {
-        crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, &po, Rights::MAP_READ, b"f", Forward::PLAIN)
+        crate::sched::us_forward_originate(
+            reg.as_object().as_ptr(),
+            &mut msg,
+            &po,
+            Rights::MAP_READ,
+            b"f",
+            Forward::PLAIN,
+        )
     };
     assert_eq!(forwarded, crate::sched::ForwardOutcome::Pending);
     // The request's envelope turned round, as a server's reply: flags REPLY, a MEMOBJ body.
@@ -678,7 +707,7 @@ fn forwarded_memobj_lookup() -> Forwarded {
     reply.payload[20..24].copy_from_slice(&8u32.to_le_bytes());
     reply.payload[28..30].copy_from_slice(&OBJECT_KIND_MEMOBJ.to_le_bytes());
     reply.payload[32..36].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-    let mem = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+    let mem = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     transfers[0] = Some(TransferRef { obj: mem, rights: Rights::MAP_READ | Rights::TRANSFER });
     Forwarded { reg, po, reply, transfers, _server_end }
@@ -723,8 +752,8 @@ fn a_lookup_reply_is_installed_when_its_completion_is_read() {
 fn a_lookup_read_while_another_installs_it_waits_for_that_handle() {
     use crate::sched::{Completion, complete_lookup, pending_op_installed, pending_op_take};
     init_global_heap();
-    let po = adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
-    let mem = adopt(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+    let po = ObjectRef::new(crate::object::PendingOperation::try_new().unwrap());
+    let mem = ObjectRef::new(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap());
     // SAFETY: `po` pins the `PendingOperation`, and the test is single-threaded.
     unsafe {
         assert!(complete_lookup(po.as_ptr(), 0, Some((mem, Rights::MAP_READ))).is_none());
@@ -744,8 +773,8 @@ fn a_lookup_read_into_a_full_table_fails_for_good() {
     init_global_heap();
     global::init_for_tests();
     test_probe::reset();
-    let po = adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
-    let mem = adopt(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+    let po = ObjectRef::new(crate::object::PendingOperation::try_new().unwrap());
+    let mem = ObjectRef::new(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap());
     // SAFETY: `po` pins the `PendingOperation`.
     assert!(unsafe { crate::sched::complete_lookup(po.as_ptr(), 0, Some((mem, Rights::MAP_READ))) }.is_none());
     crate::handle::table::FAIL_NEXT_ALLOCATE.with(|f| f.set(true));
@@ -762,8 +791,8 @@ fn a_lookup_completed_twice_keeps_its_first_object() {
     const PID: u32 = 4454;
     init_global_heap();
     global::init_for_tests();
-    let po = adopt(crate::object::PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
-    let mem = || adopt(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+    let po = ObjectRef::new(crate::object::PendingOperation::try_new().unwrap());
+    let mem = || ObjectRef::new(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap());
     let (first, second) = (mem(), mem());
     let first_at = first.as_ptr();
     // SAFETY: `po` pins the `PendingOperation`.
@@ -805,22 +834,16 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     use crate::object::{FileObject, IpcChannel, MemoryObject, PageState, Producer, UserspaceServerReg};
     use crate::rsproto::{REQUEST_ID_OFFSET, build_read_range_request};
     init_global_heap();
-    // SAFETY: each pointer is a fresh `into_raw`, carrying its single creation reference.
-    let adopt = |p: *mut (), t| unsafe { ObjectRef::from_raw(p, t) };
     let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-    let k = adopt(KBox::into_raw(k).as_ptr() as *mut (), KObjectType::IpcChannel);
-    let _server_end = adopt(KBox::into_raw(s).as_ptr() as *mut (), KObjectType::IpcChannel);
-    let reg = adopt(
-        KBox::into_raw(UserspaceServerReg::try_new(k).unwrap()).as_ptr() as *mut (),
-        KObjectType::UserspaceServerReg,
-    );
+    let k = Ref::new(k);
+    let _server_end = ObjectRef::new(s);
+    let reg = Ref::new(UserspaceServerReg::try_new(k).unwrap());
     let file = FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap();
-    let file = adopt(KBox::into_raw(file).as_ptr() as *mut (), KObjectType::FileObject);
-    // SAFETY: `file` pins the `FileObject`.
-    let fo = unsafe { &*(file.as_ptr() as *const FileObject) };
+    let file = Ref::new(file);
+    let fo: &FileObject = &file;
     let Fault::Fill(frame, stale) = fo.reserve_fault(0) else { panic!("a fill") };
     // SAFETY: `reg` pins the registration, and the test is single-threaded.
-    let id = unsafe { UserspaceServerReg::begin_fill(reg.as_ptr(), &stale, &file, frame, 0) }.unwrap();
+    let id = unsafe { UserspaceServerReg::begin_fill(reg.as_object().as_ptr(), &stale, &file, frame, 0) }.unwrap();
     fo.resize(0, KVec::new()).unwrap();
     fo.resize(PAGE_SIZE, KVec::new()).unwrap();
     let Fault::Fill(next, _its_fill) = fo.reserve_fault(0) else { panic!("a fill afresh") };
@@ -831,8 +854,7 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     reply.payload[16..20].copy_from_slice(&1u32.to_le_bytes());
     reply.payload[20..24].copy_from_slice(&8u32.to_le_bytes());
     reply.payload[28..32].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-    let bytes =
-        adopt(KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut (), KObjectType::MemoryObject);
+    let bytes = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     transfers[0] = Some(TransferRef { obj: bytes, rights: Rights::MAP_READ | Rights::TRANSFER });
     assert_eq!(complete_read_range_reply(&reg, &reply, &mut transfers, 36), Ok(0));
@@ -852,24 +874,19 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
     use crate::rsproto::{REQUEST_ID_OFFSET, build_read_range_request};
     init_global_heap();
     let refused = |answer: ObjectRef| {
-        // SAFETY: each a fresh object, adopted under its own tag.
-        let (reg, _server_end, file) = unsafe {
+        let (reg, _server_end, file) = {
             let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-            let k = crate::drivers::adopt(k, KObjectType::IpcChannel);
+            let k = Ref::new(k);
             (
-                crate::drivers::adopt(UserspaceServerReg::try_new(k).unwrap(), KObjectType::UserspaceServerReg),
-                crate::drivers::adopt(s, KObjectType::IpcChannel),
-                crate::drivers::adopt(
-                    FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap(),
-                    KObjectType::FileObject,
-                ),
+                Ref::new(UserspaceServerReg::try_new(k).unwrap()),
+                ObjectRef::new(s),
+                Ref::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap()),
             )
         };
-        // SAFETY: `file` pins the `FileObject`.
-        let fo = unsafe { &*(file.as_ptr() as *const FileObject) };
+        let fo: &FileObject = &file;
         let Fault::Fill(frame, po) = fo.reserve_fault(0) else { panic!("a fill") };
         // SAFETY: `reg` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin_fill(reg.as_ptr(), &po, &file, frame, 0) }.unwrap();
+        let id = unsafe { UserspaceServerReg::begin_fill(reg.as_object().as_ptr(), &po, &file, frame, 0) }.unwrap();
         let mut reply = StoredMsg::zeroed();
         build_read_range_request(&mut reply.payload, 0, PAGE_SIZE as u32, b"f").unwrap();
         reply.payload[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8].copy_from_slice(&id.to_le_bytes());
@@ -886,13 +903,7 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
     let unsupported = (KError::Unsupported as i32, Some(PageState::Loading));
     // SAFETY: a range the test heap never holds; nothing maps it, and a read of it would fault.
     let aperture = unsafe { MemoryObject::try_new_borrowed(PhysAddr::new(0xF000_0000), PAGE_SIZE, Caching::Normal) };
-    // SAFETY: fresh objects, adopted under their own tags.
-    let (aperture, po) = unsafe {
-        (
-            crate::drivers::adopt(aperture.unwrap(), KObjectType::MemoryObject),
-            crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation),
-        )
-    };
+    let (aperture, po) = (ObjectRef::new(aperture.unwrap()), ObjectRef::new(PendingOperation::try_new().unwrap()));
     assert_eq!(refused(aperture), unsupported, "a borrowed memory object");
     assert_eq!(refused(po), unsupported, "another kind of object");
 }
@@ -903,24 +914,19 @@ fn a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames() {
     use crate::mm::{Caching, PAGE_SIZE, PhysAddr, heap};
     use crate::object::{MemoryObject, PendingOperation};
     init_global_heap();
-    let adopt = |mo| {
-        // SAFETY: a fresh `MemoryObject`, under its own tag.
-        unsafe { crate::drivers::adopt(mo, KObjectType::MemoryObject) }
-    };
+    let adopt = |mo| ObjectRef::new(mo);
     // SAFETY: a range the test heap never holds; nothing maps it, and a read of it would fault.
     let aperture = unsafe { MemoryObject::try_new_borrowed(PhysAddr::new(0xF000_0000), PAGE_SIZE, Caching::Normal) };
     let aperture = adopt(aperture.unwrap());
     let owned = adopt(MemoryObject::try_new_filled(b"\x7fELF").unwrap());
     let cache = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap());
-    // SAFETY: `cache` pins the live `MemoryObject`.
-    let frame = unsafe { &*(cache.as_ptr() as *const MemoryObject) }.frames()[0];
-    // SAFETY: a fresh `PendingOperation`, under its own tag.
-    let po = unsafe { crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation) };
+    let frame = cache.downcast_ref::<MemoryObject>().unwrap().frames()[0];
+    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
 
     assert_eq!(spawn::image_bytes(&aperture).err(), Some(KError::InvalidArgument));
     assert_eq!(&spawn::image_bytes(&owned).unwrap()[..4], b"\x7fELF");
-    assert_eq!(submit::io_buffer_size(&aperture), Err(KError::InvalidArgument));
-    assert_eq!(submit::io_buffer_size(&owned), Ok(PAGE_SIZE as u64));
+    assert_eq!(submit::io_buffer_size(aperture.downcast_ref().unwrap()), Err(KError::InvalidArgument));
+    assert_eq!(submit::io_buffer_size(owned.downcast_ref().unwrap()), Ok(PAGE_SIZE as u64));
     assert_eq!(fill::copy_fill_into_frame(&aperture, frame, 4), Err(KError::Unsupported));
     assert_eq!(fill::copy_fill_into_frame(&po, frame, 4), Err(KError::Unsupported));
     assert_eq!(fill::copy_fill_into_frame(&owned, frame, 4), Ok(()));

@@ -14,19 +14,23 @@
 
 use core::cell::UnsafeCell;
 
-use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, ArrayVec, KBox, Notification, Reserved};
 use crate::object::WaitQueue;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 
 /// A per-process notification queue (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct NotificationChannel {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     /// All mutable state, reached only under `SCHED`.
     inner: UnsafeCell<Inner>,
 }
+
+kobject!(NotificationChannel);
+// SAFETY: a channel changes once shared only in `inner`, an `UnsafeCell` touched only under
+// `SCHED`.
+unsafe impl Shared for NotificationChannel {}
 
 struct Inner {
     /// FIFO of pending notifications; pre-reserved to [`NotificationChannel::QUEUE_CAP`].
@@ -60,7 +64,7 @@ impl NotificationChannel {
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         let queue = Reserved::with_capacity(Self::QUEUE_CAP)?;
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::NotificationChannel),
+            header: Header::new(),
             magic: Self::MAGIC,
             inner: UnsafeCell::new(Inner { queue, dropped: 0, waiters: WaitQueue::new() }),
         })
@@ -316,7 +320,7 @@ mod tests {
         test_probe::reset();
         let obj = new_chan();
         // SAFETY: `obj` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(obj, KObjectType::NotificationChannel) };
+        let r = unsafe { ObjectRef::from_raw(obj) };
         assert_eq!(test_probe::notification_channel_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::notification_channel_destroys(), 1);

@@ -482,7 +482,7 @@ fn paging_smoke_test() {
 fn demand_paging_smoke_test() {
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::mm::addr_space::{AddressSpace, FaultIn};
-    use nitrox_kernel::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma};
+    use nitrox_kernel::mm::vmm::{FaultAccess, Protection, VAddrRange, Vma};
 
     let page = mm::PAGE_SIZE as u64;
     let Ok(asp) = AddressSpace::new() else {
@@ -492,7 +492,7 @@ fn demand_paging_smoke_test() {
     let base = 0x4000_0000u64;
     let range = VAddrRange::new(mm::VirtAddr::new(base), mm::VirtAddr::new(base + 2 * page))
         .expect("smoke-test range is valid by construction");
-    let Ok(vma) = KBox::try_new(Vma::new(range, Protection::WRITE | Protection::USER, MappingKind::Anonymous)) else {
+    let Ok(vma) = KBox::try_new(Vma::new(range, Protection::WRITE | Protection::USER)) else {
         kprintln!("demand-paging: smoke test skipped (VMA alloc failed)");
         return;
     };
