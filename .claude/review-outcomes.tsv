@@ -543,3 +543,17 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-05	422	dec312a0	4	logic	optional	unverified	fixed	f5aeee6b	a fresh pipe's peer must see the sent end close; a boot keeping a duplicate fails the test, the real one passes
 2026-11-05	422	dec312a0	5	logic+error-paths	optional	unverified	fixed	f5aeee6b	reproduced: the old loop went round 100,000 times on a closed peer; the fixed one exits; same boot pointing the loop at a dead channel
 2026-11-05	422	dec312a0	6	tests	optional	unverified	declined		binaries are tested by boots by design; the sweep of every code the diff dropped found only finding 4's; a converted check expecting the wrong code fails test-qemu
+2026-11-06	423	9f2f4510	1	logic	worth-fixing	demonstrated	fixed	daa7435d	the scan's sched group holds sched.rs (171 + 26 = 197); table row 197/45, the rest 81/14; J.1 writes its entries from the scan, not the table
+2026-11-06	423	9f2f4510	2	logic+error-paths	worth-fixing	demonstrated	fixed	daa7435d	wait.rs:120 is sleep_until's own body; the hub's sleep alone calls it, park_briefly keeps wait_on_io so an ending thread's fault still waits for its fill
+2026-11-06	423	9f2f4510	3	logic+error-paths	worth-fixing	demonstrated	fixed	daa7435d	process_ref clones 7 before f34e8a4f, 0 now; left: 7 raw child reads (J.5) and 6 process_of reads (J.7, needs &Thread, which J.5 had borrowed early); control the Miri tests reaching each
+2026-11-06	423	9f2f4510	4	error-paths	worth-fixing	demonstrated	fixed	daa7435d	FAIL_NEXT_ALLOCATE is replace(false), a one-shot; J.3's control is a countdown from the nth install
+2026-11-06	423	9f2f4510	5	error-paths	worth-fixing	demonstrated	fixed	daa7435d	every returning failure arm frees the frame; J.10 says by hand today, by construction after
+2026-11-06	423	9f2f4510	6	logic+error-paths+tests+rules-and-docs	optional	demonstrated	fixed	daa7435d	sched.rs:498 and :596; the boot thread's cpu_mask is object/thread.rs:255 in try_new_boot; paths written in full
+2026-11-06	423	9f2f4510	7	rules-and-docs	optional	demonstrated	fixed	daa7435d	two setters in syscall.rs, gdt::set_kernel_stack the third, named
+2026-11-06	423	9f2f4510	8	logic	optional	demonstrated	fixed	daa7435d	acpi.rs at 1,036 named, J.8 moves its tests out; the sweep found 8 more kernel files past 900 the near list missed
+2026-11-06	423	9f2f4510	9	logic	optional	demonstrated	fixed	daa7435d	99 was accessors by a line regex, not unsafe fns; it missed 6 split signatures: J.6 is 60; paging tests 20; sweep: J.5's 31 take *mut () or, two, a list
+2026-11-06	423	9f2f4510	10	error-paths	optional	unverified	fixed	daa7435d	J.4's bag is a Deferred<N> its site sizes as Orphans<N> is (48 at endpoint close); a full bag ends the machine; switch_away takes a plain guard
+2026-11-06	423	9f2f4510	11	error-paths	optional	unverified	fixed	daa7435d	map_vma's buddy_alloc has no seam; J.9's countdown sits in Frame's allocation, reaching a 3-page VMA's second and third pages
+2026-11-06	423	9f2f4510	12	error-paths	optional	unverified	fixed	daa7435d	install_intx routes and unmasks before AHCI's publish can decline; J.13 keeps a routed vector, masks the entry, control on the IOAPIC register fake
+2026-11-06	423	9f2f4510	13	rules-and-docs	optional	unverified	refuted		the test finds 8 blocks (context.rs and syscall.rs too); with halt's removed it passes; cut to 3 it fails 'found 3'
+2026-11-06	423	9f2f4510	14	rules-and-docs	optional	demonstrated	fixed	daa7435d	the tenth was kplat-o3, unnamed; sched-o8 makes eleven; both named, decision log and pre-phase-7 agree

@@ -71,6 +71,8 @@ runs found is one.
   step is there, its second later.
 - **Two more, found reviewing PR #400** (rt-d12, rt-d13, at the end): both fix, with libos's other
   holes.
+- **Two more, found in Part J's detail pass** (kplat-d23, sched-d16, at the end): both plan, in P4,
+  as `typed-layers.md`'s J.11.
 
 The calls:
 
@@ -6577,3 +6579,29 @@ exist fails the whole wait. Both probes were removed.
   Fixed in `fae8cbf5`: a round that left a handle out waits until a deadline 1 ms off. Fails
   without it: `a_ninth_operation_is_polled_again`, through a mock that panics on a wait for
   ever nothing will end.
+
+### Found in Part J's detail pass — main at d6cf7ca7, 2026-11-05
+
+Two the kplat and sched runs missed, both read from the code while P4 was checked against it, and
+neither run. Both latent.
+
+- [ ] **kplat-d23** `kernel/src/main.rs:716` — `run_first_userspace` calls `arch::init_syscall_entry`
+  after preemption is armed (main.rs:318, inside `sched_bringup`) and the APs are up
+  (main.rs:272), on a boot thread whose `cpu_mask` is every CPU (`object/thread.rs:255`, in
+  `try_new_boot`). `init_syscall_entry` (`arch/x86_64/syscall.rs:75`) reads its CPU's block through
+  `this_cpu_block()`, then writes `KERNEL_GS_BASE`, STAR, LSTAR, SFMASK and EFER, with no pin and no
+  `debug_assert_pinned`, where `arm_user_entry_cpu_base` and `set_syscall_kernel_stack` beside it,
+  and `gdt::set_kernel_stack`, assert one. A migration between the read and the writes puts one CPU's
+  block into another's `KERNEL_GS_BASE`, and a boot thread that moved off the BSP leaves the BSP's
+  MSRs to be armed later. Latent: `arm_user_entry_cpu_base` re-arms `KERNEL_GS_BASE`, and the rest
+  when EFER.SCE is clear, before a thread's first descent, and every switch-in re-arms
+  `KERNEL_GS_BASE`, so no syscall reaches the stale value. Fix: the BSP's call beside `init_tables`,
+  before the CPU can be scheduled, with its index passed. Unverified: by reading; the control is the
+  assertion, which would fire on every debug boot with the old placement, IF being 1 there.
+  concurrency. Low. **Plan**, in P4.
+- [ ] **sched-d16** `kernel/src/sched.rs:608` — `arm_kernel_stack_for` (sched.rs:498) says its caller
+  holds SCHED and reads the incoming thread's `kstack_top` under it, but `switch_into` calls it after
+  `release_keeping_irqs_masked` (sched.rs:596). Benign today: the incoming thread's stack does not
+  change once it is chosen, and interrupts stay masked to the switch. Fix: call it above the release,
+  where the guard is its pin; RSP0 and the syscall stack are read only at a ring-3 entry, so the
+  order is equivalent. Unverified: by reading. concurrency. Low. **Plan**, in P4.
