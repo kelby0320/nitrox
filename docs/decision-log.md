@@ -37918,7 +37918,7 @@ Part J's third sub-part, `typed-layers.md` § J.3, built on `pre-phase-7/part-j3
   planted whatever pointer it was given. `close` and the exit sweep answer a `#[must_use]`
   `Closed`, released by its caller outside the rank-3 lock as before.
 - **A syscall's installs are one set, closed unless the syscall succeeds**: `Installed<'t, N>`,
-  per table, closing newest first on drop. It replaces every hand rollback, 28 of them, and closes
+  per table, closing what it holds on drop. It replaces every hand rollback, 28 of them, and closes
   the early returns in `run_first_userspace` that left pid 1's handles installed (kplat-d16).
 - **A failure the host can drive is driven**: each such syscall runs on the host with its installs
   refused in turn, from a countdown that replaced the one-shot `FAIL_NEXT_ALLOCATE`, and a

@@ -92,7 +92,7 @@ Two layers of synchronisation, by design.
 
 ### Rank-3 spinlock — for table-structural changes
 
-A single `SpinLock<Inner>` serialises allocate / close / restrict /
+A single `SpinLock<Inner>` serialises install / close / restrict /
 duplicate / segment-grow bookkeeping. It is rank 3 in
 [`kernel/docs/lock-ordering.md`](../../kernel/docs/lock-ordering.md):
 above the rank-4 `AddressSpace` lock so a future syscall can hold an
@@ -100,7 +100,7 @@ above the rank-4 `AddressSpace` lock so a future syscall can hold an
 the rank-6 allocators because segment growth must drop the lock
 before calling `kmalloc`.
 
-`allocate` and `close` both `drain_expired()` first thing under the
+An install and a close both `drain_expired()` first thing under the
 lock, returning any deferred-close slot whose grace period has
 elapsed to its segment's freelist.
 
@@ -246,7 +246,7 @@ in flight.
 
 A syscall that installs several handles, or installs one before a step that can still fail,
 holds them in an `Installed<N>` (`kernel/src/handle/installed.rs`): each is closed again when it
-drops, newest first, unless the syscall commits it on success. A channel's two ends, a received
+drops, unless the syscall commits it on success. A channel's two ends, a received
 message's handles, a spawn's child handles and its parent's handle to the child, a blocking send's
 or an I/O request's `PendingOperation`, a thread's handle before it starts, and pid 1's three at
 boot are held so; no syscall rolls a handle back by hand.
@@ -268,7 +268,7 @@ segment's freelist.
 ### Defer ring sizing
 
 `DEFER_RING_CAPACITY = 256`. Sized to absorb a burst of closes
-between `allocate` / `close` drain opportunities. On overflow, close
+between install / close drain opportunities. On overflow, close
 releases the rank-3 lock, calls `yield_for_grace` (`spin_loop` in
 production, `std::thread::yield_now` in hosted tests), reacquires the
 lock and retries. In Phase 1's single-CPU world the loop body never
@@ -353,7 +353,7 @@ Subset semantics live on `Rights`: `r1.is_subset_of(r2)` iff
 `restrict` and `duplicate` both intersect.
 
 `is_rights_compatible(KObjectType, Rights)` enforces the spec's
-type-rights compatibility matrix at allocate time, rejecting
+type-rights compatibility matrix at install time, against the object's own tag, rejecting
 nonsensical combinations (e.g. `MAP_WRITE` on a `Process` handle).
 Generic rights are valid on every type; modifier rights are not
 constrained per type today.
@@ -396,7 +396,7 @@ handle a process owns, so exit could walk exactly those entries. It is still
 on `owner_pid`.
 
 The trade is deliberate. The list makes exit `O(handles owned)` but adds
-list maintenance to every `allocate`, `close`, and `duplicate` — all under the
+list maintenance to every install, close and duplicate — all under the
 rank-3 lock, all needing to stay consistent with the deferred-reclamation ring
 that already recycles slots. The scan is `O(allocated slots)` with no
 bookkeeping anywhere else, and today that is one or two 4096-entry segments per
