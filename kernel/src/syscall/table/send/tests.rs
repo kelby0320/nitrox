@@ -66,10 +66,13 @@ fn a_forwarded_reply_closes_the_handles_it_carries() {
     const PID: u32 = 4463;
     init_global_heap();
     global::init_for_tests();
-    let (k, server_end) = pair(4);
+    let (k, server_end) = {
+        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+        (Ref::new(a), ObjectRef::new(b))
+    };
     let reg = ObjectRef::new(UserspaceServerReg::try_new(k.clone()).unwrap());
     // SAFETY: `k` is pinned by the test's reference.
-    assert!(unsafe { crate::sched::us_server_attach(k.as_ptr(), &reg) }.is_none());
+    assert!(unsafe { crate::sched::us_server_attach(k.as_object().as_ptr(), &reg) }.is_none());
     let (h, mut t, mut c) = moving(PID);
     assert_eq!(deliver(&server_end, &message(), &mut t, &mut c, SendMode::NoBlock, 0, PID), Ok(0));
     assert!(!held(h, PID), "closed with the reply");

@@ -3,24 +3,18 @@
 use super::*;
 
 /// A user process of `pid` around a fresh address space, its single reference adopted.
-pub(crate) fn user_process_ref(pid: u32) -> (ObjectRef, crate::mm::PhysAddr) {
+pub(crate) fn user_process_ref(pid: u32) -> (Ref<Process>, crate::mm::PhysAddr) {
     use crate::mm::addr_space::AddressSpace;
     let asp = AddressSpace::new().unwrap();
     let root = asp.root();
     let p = Process::try_new_user(pid, asp, crate::libkern::SysCaps::empty()).unwrap();
-    let ptr = KBox::into_raw(p).as_ptr() as *mut ();
-    // SAFETY: into_raw yielded the single creation ref; adopt it.
-    (unsafe { ObjectRef::from_raw(ptr) }, root)
+    (Ref::new(p), root)
 }
 
 /// A user thread built **without** a kernel stack, avoiding the QEMU-only `fabricate_frame`,
 /// which writes a kernel-vmap address that is not host memory.
-pub(crate) fn user_thread_no_stack(tid: u32, process: ObjectRef, entry: u64, user_sp: u64) -> KBox<Thread> {
-    let (owner_pid, root) = {
-        let p = process.as_ptr() as *const Process;
-        // SAFETY: `process` is a live Process ref this test holds.
-        unsafe { ((*p).pid(), (*p).address_space_root().unwrap()) }
-    };
+pub(crate) fn user_thread_no_stack(tid: u32, process: Ref<Process>, entry: u64, user_sp: u64) -> KBox<Thread> {
+    let (owner_pid, root) = (process.pid(), process.address_space_root().unwrap());
     KBox::try_new(Thread {
         header: crate::object::header::Header::new(),
         tid,

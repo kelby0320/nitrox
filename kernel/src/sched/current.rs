@@ -65,9 +65,9 @@ pub unsafe fn notif_try_recv(channel: *mut ()) -> Option<Notification> {
 
 /// The [`Process`](crate::object::Process) owning the currently running thread (`None` for
 /// kernel/boot threads). Takes only the rank-1 lock; the returned
-/// [`ObjectRef`](crate::object::ObjectRef) is cloned under it and outlives it. Callers then
+/// [`Ref`](crate::object::header::Ref) is cloned under it and outlives it. Callers then
 /// take lower-rank locks (handle-table rank-3, AS rank-4), never nesting upward.
-pub fn current_process() -> Option<ObjectRef> {
+pub fn current_process() -> Option<Ref<Process>> {
     let g = SCHED.lock();
     let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
     // SAFETY: as `current_owner_pid`; the clone bumps the process's refcount under the lock.

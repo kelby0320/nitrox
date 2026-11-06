@@ -68,18 +68,14 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     let child_syscaps = {
         let requested = crate::libkern::SysCaps::from_bits_truncate(args.syscaps);
         match crate::sched::current_process() {
-            // SAFETY: pins a live Process; read its immutable syscap set.
-            Some(pp) => unsafe { &*(pp.as_ptr() as *const Process) }.syscaps() & requested,
+            Some(pp) => pp.syscaps() & requested,
             None => crate::libkern::SysCaps::empty(),
         }
     };
 
     let mut proc_box = Process::try_new_user(child_pid, asp, child_syscaps).map_err(|_| KError::OutOfMemory)?;
-    if let Some(parent_proc) = crate::sched::current_process() {
-        // SAFETY: `parent_proc` pins a live Process; clone its channel ref.
-        if let Some(c) = unsafe { &*(parent_proc.as_ptr() as *const Process) }.notification_channel_ref() {
-            proc_box.set_parent_notif(c);
-        }
+    if let Some(c) = crate::sched::current_process().and_then(|p| p.notification_channel_ref()) {
+        proc_box.set_parent_notif(c);
     }
 
     let chan = NotificationChannel::try_new().map_err(|_| KError::OutOfMemory)?;
@@ -110,10 +106,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
             }
         }
     } else {
-        crate::sched::current_process().and_then(|p| {
-            // SAFETY: `p` pins a live Process; clone its namespace ref if any.
-            unsafe { &*(p.as_ptr() as *const Process) }.namespace_ref()
-        })
+        crate::sched::current_process().and_then(|p| p.namespace_ref())
     };
     let child_ns_h = if let Some(ns_ref) = ns_source {
         proc_box.set_namespace(ns_ref.clone()); // the child owns a reference
@@ -165,14 +158,10 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
         }
     }
 
-    let proc_obj = {
-        let p = KBox::into_raw(proc_box).as_ptr() as *mut ();
-        // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(p) }
-    };
+    let proc_obj = Ref::new(proc_box);
 
     // The parent's handle to the child before the child runs: nothing may fail once it does.
-    let parent_handle = match install(parent_pid, proc_obj.clone(), Rights::SIGNAL | Rights::TERMINATE) {
+    let parent_handle = match install(parent_pid, proc_obj.clone().erase(), Rights::SIGNAL | Rights::TERMINATE) {
         Ok(h) => h,
         Err(e) => {
             drop(proc_obj);
@@ -207,9 +196,9 @@ pub(super) fn image_bytes(img: &ObjectRef) -> Result<KVec<u8>, KError> {
         }
         // Blocks on each fill — sound on the syscall thread, which holds no AS/cache lock.
         KObjectType::FileObject => {
-            // SAFETY: type checked above; `img` pins it live.
-            image_fits(unsafe { &*(img.as_ptr() as *const FileObject) }.size())?;
-            FileObject::read_to_kvec(img).map_err(|_| KError::OutOfMemory)
+            let file = img.clone().downcast::<FileObject>().map_err(|_| KError::InvalidArgument)?;
+            image_fits(file.size())?;
+            FileObject::read_to_kvec(&file).map_err(|_| KError::OutOfMemory)
         }
         _ => Err(KError::InvalidArgument),
     }

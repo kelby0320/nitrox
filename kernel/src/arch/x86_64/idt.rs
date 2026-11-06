@@ -315,11 +315,7 @@ fn try_fault_in(cr2: u64, error_code: u64) -> bool {
     let Some(proc_ref) = crate::sched::current_process() else {
         return false;
     };
-    // SAFETY: `proc_ref` references a live `Process` (its `KObjectHeader` is at
-    // offset 0), pinned by the current user thread for the duration of this
-    // fault. The borrow does not outlive `proc_ref`.
-    let proc = unsafe { &*(proc_ref.as_ptr() as *const crate::object::Process) };
-    let Some(asp) = proc.address_space() else {
+    let Some(asp) = proc_ref.address_space() else {
         return false;
     };
     let addr = crate::mm::VirtAddr::new(cr2);
@@ -333,7 +329,7 @@ fn try_fault_in(cr2: u64, error_code: u64) -> bool {
             let Some((file_obj, index)) = asp.file_backing(addr) else {
                 return false;
             };
-            match crate::object::FileObject::fault_in_page(file_obj.as_object(), index) {
+            match crate::object::FileObject::fault_in_page(&file_obj, index) {
                 Some(frame) => asp.map_file_page(addr, &file_obj, frame),
                 None => false,
             }

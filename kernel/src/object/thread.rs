@@ -21,9 +21,8 @@ use crate::arch::{ArchFpuState, ArchThreadContext, RegisterValues, thread_trampo
 use crate::libkern::{AllocError, KBox};
 use crate::mm::PhysAddr;
 use crate::mm::kstack::{KernelStack, KernelStackTop};
-use crate::object::ObjectRef;
 use crate::object::Process;
-use crate::object::header::{Header, kobject};
+use crate::object::header::{Header, Ref, kobject};
 
 /// Maximum number of handles one `sys_wait` call may block on. Bounds the per-thread wait
 /// arrays (so registration never allocates under the scheduler lock) and a caller's `count`.
@@ -134,10 +133,10 @@ pub struct Thread {
     /// Set when the thread's process is exiting: it ends itself at its next return to ring 3,
     /// letting go on the way of whatever its kernel stack holds, and its waits return at once.
     ending: bool,
-    /// Owning process, for a user thread. This [`ObjectRef`] keeps the `Process` and its
+    /// Owning process, for a user thread. This [`Ref`] keeps the `Process` and its
     /// `AddressSpace` alive until the thread is reaped. No cycle: the `Process` does not hold the
     /// thread. `None` for kernel/boot threads.
-    process: Option<ObjectRef>,
+    process: Option<Ref<Process>>,
     /// Wait bookkeeping (meaningful only while `Blocked`), touched only under `SCHED` except
     /// `wait_phase`: the type-erased addresses this thread waits on, and per-slot fired flags set
     /// by the waker.
@@ -305,21 +304,17 @@ impl Thread {
 
     /// Allocate a **user** thread: a fresh kernel stack and fabricated frame that lands in
     /// [`thread_enter`](crate::sched), which descends to ring 3 at `(entry, user_sp)`. `process`
-    /// must be a live `Process` with an address space root; the held [`ObjectRef`] keeps it alive.
+    /// must be a live `Process` with an address space root; the held [`Ref`] keeps it alive.
     pub fn try_new_user(
         tid: u32,
-        process: ObjectRef,
+        process: Ref<Process>,
         entry: u64,
         user_sp: u64,
         boot_args: [u64; 4],
     ) -> Result<KBox<Self>, AllocError> {
         let (owner_pid, root) = {
-            let p = process.as_ptr() as *const Process;
-            // SAFETY: `process` pins a live `Process`, whose pid and root nothing mutates.
-            let pid = unsafe { (*p).pid() };
-            // SAFETY: as above.
-            let root = unsafe { (*p).address_space_root() }.expect("user process must have an address space");
-            (pid, root)
+            let root = process.address_space_root().expect("user process must have an address space");
+            (process.pid(), root)
         };
         let mut stack = KernelStack::new()?;
         let arch = stack.fabricate(thread_trampoline as *const () as u64);
@@ -369,7 +364,7 @@ impl Thread {
 
     /// Clone the owning [`Process`](crate::object::Process) reference of a user thread; `None`
     /// for kernel/boot threads.
-    pub fn process_ref(&self) -> Option<ObjectRef> {
+    pub fn process_ref(&self) -> Option<Ref<Process>> {
         self.process.clone()
     }
 
@@ -779,14 +774,14 @@ impl Thread {
     pub(crate) unsafe fn process_of(obj: *mut ()) -> Option<*mut ()> {
         // SAFETY: `obj` is a pinned live `Thread` under the accessor contract, and `process` is
         // set before the thread is shared and never written after.
-        unsafe { (*(obj as *const Thread)).process.as_ref().map(ObjectRef::as_ptr) }
+        unsafe { (*(obj as *const Thread)).process.as_ref().map(|p| p.as_object().as_ptr()) }
     }
 
     /// [`Thread::process_ref`] through a raw place.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn process_ref_of(obj: *mut ()) -> Option<ObjectRef> {
+    pub(crate) unsafe fn process_ref_of(obj: *mut ()) -> Option<Ref<Process>> {
         // SAFETY: as `process_of`.
         unsafe { (*(obj as *const Thread)).process.clone() }
     }

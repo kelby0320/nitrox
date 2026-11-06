@@ -171,7 +171,7 @@ pub unsafe fn us_forward_originate_fill(
     reg: *mut (),
     msg: &mut StoredMsg,
     po: &ObjectRef,
-    file_obj: &ObjectRef,
+    file_obj: &Ref<FileObject>,
     frame: crate::mm::PhysAddr,
     index: usize,
 ) -> ForwardOutcome {
@@ -236,7 +236,7 @@ pub unsafe fn us_forward_take_pending_fill(reg: *mut (), request_id: u64) -> Opt
 ///
 /// `send_endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller
 /// holds.
-pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<ObjectRef> {
+pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<Ref<UserspaceServerReg>> {
     let _g = SCHED.lock();
     // SAFETY: `send_endpoint` is pinned by the caller; `SCHED` held.
     let peer = unsafe { IpcChannel::peer_of(send_endpoint) };
@@ -248,9 +248,10 @@ pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<ObjectRe
     if reg.is_null() {
         return None;
     }
-    // SAFETY: a registration clears this back-pointer under `SCHED` before it is freed, so
-    // `reg` is whole while `SCHED` is held; `try_acquire` refuses one already at zero.
-    unsafe { ObjectRef::try_acquire(reg) }
+    // SAFETY: the back-pointer names only the `UserspaceServerReg` attached to the endpoint,
+    // which clears it under `SCHED` before it is freed, so `reg` is a whole registration while
+    // `SCHED` is held; `try_acquire` refuses one already at zero.
+    unsafe { Ref::try_acquire(reg.cast::<UserspaceServerReg>()) }
 }
 
 /// Detach a dying [`UserspaceServerReg`] from its endpoint, completing anything still
@@ -330,7 +331,7 @@ unsafe fn fail_outstanding<const N: usize>(g: &mut SchedState, reg: *mut (), orp
     while let Some(pf) = unsafe { UserspaceServerReg::take_pending_fill_next(reg) } {
         signal_pending_op(g, pf.po.as_ptr(), closed);
         orphans.keep(pf.po);
-        orphans.keep(pf.file_obj);
+        orphans.keep(pf.file_obj.erase());
     }
 }
 
@@ -570,6 +571,12 @@ mod tests {
         (ObjectRef::new(a), ObjectRef::new(b))
     }
 
+    /// A pair whose first end is typed, for a registration to own.
+    fn kernel_end() -> (Ref<IpcChannel>, ObjectRef) {
+        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+        (Ref::new(a), ObjectRef::new(b))
+    }
+
     fn carrying(r: &ObjectRef) -> [Option<TransferRef>; IPC_HANDLE_MAX] {
         core::array::from_fn(|i| (i == 0).then(|| TransferRef { obj: r.clone(), rights: Rights::empty() }))
     }
@@ -600,22 +607,26 @@ mod tests {
     }
 
     /// A registration over the kernel's end of a fresh pair, attached; and the server's end.
-    fn served() -> (ObjectRef, ObjectRef) {
-        let (k, s) = pair();
-        let reg = ObjectRef::new(UserspaceServerReg::try_new(k.clone()).unwrap());
+    fn served() -> (Ref<UserspaceServerReg>, ObjectRef) {
+        let (k, s) = kernel_end();
+        let reg = Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
         // SAFETY: `k` is pinned by the test's reference.
-        assert!(unsafe { us_server_attach(k.as_ptr(), &reg) }.is_none());
+        assert!(unsafe { us_server_attach(k.as_object().as_ptr(), reg.as_object()) }.is_none());
         (reg, s)
     }
 
     /// A lookup and a fill outstanding on `reg`, their POs, and the fill's file.
-    fn outstanding(reg: &ObjectRef, producer: crate::object::Producer) -> (ObjectRef, ObjectRef, ObjectRef) {
+    fn outstanding(
+        reg: &Ref<UserspaceServerReg>,
+        producer: crate::object::Producer,
+    ) -> (ObjectRef, ObjectRef, Ref<FileObject>) {
         let (lookup, fill) = (po(), po());
-        let file = ObjectRef::new(crate::object::FileObject::try_new(4096, producer).unwrap());
+        let file = Ref::new(FileObject::try_new(4096, producer).unwrap());
+        let reg = reg.as_object().as_ptr();
         // SAFETY: `reg` pins the registration, and the test is single-threaded.
         unsafe {
-            UserspaceServerReg::begin(reg.as_ptr(), &lookup, Rights::MAP_READ, b"f").unwrap();
-            UserspaceServerReg::begin_fill(reg.as_ptr(), &fill, &file, crate::mm::PhysAddr::new(0x5000), 0).unwrap();
+            UserspaceServerReg::begin(reg, &lookup, Rights::MAP_READ, b"f").unwrap();
+            UserspaceServerReg::begin_fill(reg, &fill, &file, crate::mm::PhysAddr::new(0x5000), 0).unwrap();
         }
         (lookup, fill, file)
     }
@@ -650,15 +661,16 @@ mod tests {
     #[test]
     fn a_second_attach_of_an_endpoint_gets_the_first_registration() {
         init_global_heap();
-        let (k, _server_end) = pair();
+        let (k, _server_end) = kernel_end();
         let new_reg = || ObjectRef::new(UserspaceServerReg::try_new(k.clone()).unwrap());
         let (first, second) = (new_reg(), new_reg());
+        let k = k.as_object().as_ptr();
         // SAFETY: `k` is pinned by the test's reference, and the test is single-threaded.
         unsafe {
-            assert!(us_server_attach(k.as_ptr(), &first).is_none());
-            let shared = us_server_attach(k.as_ptr(), &second).expect("the first registration");
+            assert!(us_server_attach(k, &first).is_none());
+            let shared = us_server_attach(k, &second).expect("the first registration");
             assert_eq!(shared.as_ptr(), first.as_ptr());
-            assert_eq!(IpcChannel::us_reg_of(k.as_ptr()), first.as_ptr(), "replies route to it");
+            assert_eq!(IpcChannel::us_reg_of(k), first.as_ptr(), "replies route to it");
         }
     }
 

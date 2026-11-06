@@ -395,7 +395,7 @@ impl AddressSpace {
         // undoes it here, since its VMA drops without its object.
         let writable = prot.contains(Protection::WRITE);
         if writable {
-            FileObject::writable_mapped(object.as_object());
+            FileObject::writable_mapped(&object);
         }
         let refused = |object: Ref<FileObject>, e: MapError| {
             if writable {

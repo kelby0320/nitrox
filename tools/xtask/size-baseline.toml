@@ -3,10 +3,10 @@
 # by hand, in a reviewed commit of its own that says why.
 [files]
 "kernel/src/arch/x86_64/acpi.rs" = 1036
-"kernel/src/main.rs" = 1074
-"kernel/src/object/file_object.rs" = 2425
+"kernel/src/main.rs" = 1071
+"kernel/src/object/file_object.rs" = 2384
 "kernel/src/pci/mod.rs" = 1041
-"kernel/src/syscall/table.rs" = 2179
+"kernel/src/syscall/table.rs" = 2168
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
 "userspace/compositor/src/main.rs" = 1926

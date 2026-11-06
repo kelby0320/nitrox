@@ -705,6 +705,7 @@ fn run_first_userspace() {
     use nitrox_kernel::handle::global;
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::libkern::handle::{KObjectType, Rights};
+    use nitrox_kernel::object::header::Ref;
     use nitrox_kernel::object::kernel_server::KernelServerId;
     use nitrox_kernel::object::{Namespace, NotificationChannel, ObjectRef, Process};
 
@@ -925,11 +926,7 @@ fn run_first_userspace() {
         }
     };
 
-    let proc_ref = {
-        let ptr = KBox::into_raw(proc_box).as_ptr() as *mut ();
-        // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(ptr) }
-    };
+    let proc_ref = Ref::new(proc_box);
 
     if sched::spawn_user(
         proc_ref,

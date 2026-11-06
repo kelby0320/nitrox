@@ -856,11 +856,10 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
     let parent = unsafe { ObjectRef::from_raw(chan) };
     let recorded = ExitStatus { kind: ExitKind::Normal as u32, code: 3 };
     {
-        let p = process.as_ptr() as *mut crate::object::Process;
+        let p = process.as_ptr();
         // SAFETY: the test's own Process, not yet shared with anything that reads it.
         unsafe { (*p).set_parent_notif(parent.clone()) };
-        // SAFETY: as above.
-        unsafe { &*p }.begin_ending(recorded);
+        process.begin_ending(recorded);
     }
     let me = into_objref(user_thread_no_stack(1, process.clone(), 0x40_0000, 0x7fff_f000));
     let own = ExitStatus { kind: ExitKind::Crashed as u32, code: 14 };
@@ -908,9 +907,7 @@ fn a_thread_made_for_a_process_that_has_begun_to_exit_is_placed_marked() {
     super::online_set::force(0b1);
     let mut st = reserved_state();
     let (exiting, _) = user_process_ref(5);
-    // SAFETY: `exiting` pins the test's own `Process`.
-    unsafe { &*(exiting.as_ptr() as *const crate::object::Process) }
-        .begin_ending(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
+    exiting.begin_ending(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
     let (running, _) = user_process_ref(6);
     for (process, marked) in [(exiting, true), (running, false)] {
         let thread = into_objref(user_thread_no_stack(1, process, 0x40_0000, 0x7fff_f000));

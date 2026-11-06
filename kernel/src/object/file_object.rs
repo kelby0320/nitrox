@@ -30,12 +30,11 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::arch::timer::ArchTimer;
 use crate::dpc::Dpc;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::{Header, Ref, Shared, kobject};
-use crate::object::{DeviceNode, ObjectRef, PendingOperation, StoredMsg};
+use crate::object::{DeviceNode, ObjectRef, PendingOperation, StoredMsg, UserspaceServerReg};
 
 /// How a [`FileObject`] **fills** a cache page on a fault.
 pub enum Producer {
@@ -45,8 +44,7 @@ pub enum Producer {
     /// resource server through the [`UserspaceServerReg`] `reg`'s forwarding endpoint. `reg` pins
     /// the registration; `suffix` names the file under the mount.
     ///
-    /// [`UserspaceServerReg`]: crate::object::UserspaceServerReg
-    FsServer { reg: ObjectRef, suffix: KString },
+    FsServer { reg: Ref<UserspaceServerReg>, suffix: KString },
     /// Model A — a **block** filesystem: the kernel owns the file-data path. The run map (under
     /// the object's lock, since a size change replaces it) maps the file's blocks to device LBAs;
     /// a fault reads the page's block **zero-copy** from `device` into the cache frame via a block
@@ -57,7 +55,7 @@ pub enum Producer {
     /// the one thing it cannot learn otherwise — that it was **written**. An in-place overwrite
     /// never reaches the server, so the kernel sends `File::Touch` by id after a write-back
     /// ([`FileObject::writeback`]).
-    FsServerBlocks { device: Ref<DeviceNode>, block_size: u32, reg: ObjectRef, file_id: u64 },
+    FsServerBlocks { device: Ref<DeviceNode>, block_size: u32, reg: Ref<UserspaceServerReg>, file_id: u64 },
 }
 
 /// One contiguous mapping from a file's blocks to the device (the kernel-side mirror of the
@@ -162,7 +160,7 @@ struct Inner {
     /// until a write-back that finds none left. It keeps a file whose writer exited without
     /// syncing alive in its registration's cache (which indexes objects only weakly) until a sync
     /// or unmount writes it. Taken only for a cached object, the kind a sync can find.
-    self_pin: Option<ObjectRef>,
+    self_pin: Option<Ref<FileObject>>,
     /// Raised by every writable mapping; see [`clean_mark`](FileObject::clean_mark).
     map_gen: u64,
     /// **The file's server is freeing it** ([`forget`](FileObject::forget)). No device I/O of the
@@ -384,10 +382,8 @@ impl FileObject {
     /// lock (this takes the object's own lock; they never nest); a mapping that then fails calls
     /// [`writable_unmapped`](Self::writable_unmapped). The pin is kept even then: a spurious dirty
     /// mark costs one write-back of clean pages, where a missing one costs data.
-    pub fn writable_mapped(file_obj: &ObjectRef) {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "writable_mapped");
-        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
-        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+    pub fn writable_mapped(file_obj: &Ref<FileObject>) {
+        let fo: &FileObject = file_obj;
         let mut g = fo.inner.lock();
         fo.writable_maps.fetch_add(1, Ordering::AcqRel);
         g.map_gen = g.map_gen.wrapping_add(1);
@@ -416,12 +412,9 @@ impl FileObject {
 
     /// After a successful write-back that began at `mark`: **clean**, unless a writable mapping
     /// was made since. Clean drops the self-pin outside the lock, as it may be the last reference.
-    pub fn unpin_if_clean(file_obj: &ObjectRef, mark: u64) {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "unpin_if_clean");
-        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
-        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+    pub fn unpin_if_clean(file_obj: &Ref<FileObject>, mark: u64) {
         let pin = {
-            let mut g = fo.inner.lock();
+            let mut g = file_obj.inner.lock();
             if g.map_gen == mark { g.self_pin.take() } else { None }
         };
         drop(pin);
@@ -473,19 +466,16 @@ impl FileObject {
     /// allocation failure, with nothing entered or resized; and for a reply whose block size or
     /// device is not the cached object's, with nothing resized: the reply's runs were checked
     /// against its own block size, and its rights were decided by its own device.
-    pub fn cache_in(reg: &ObjectRef, candidate: ObjectRef) -> Result<ObjectRef, CacheInError> {
-        assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg, "cache_in's registration");
-        assert_eq!(candidate.object_type(), KObjectType::FileObject, "cache_in's candidate");
-        // SAFETY: both references pin live objects of the asserted types (header at offset 0).
-        let (r, cand) = unsafe {
-            (&*(reg.as_ptr() as *const crate::object::UserspaceServerReg), &*(candidate.as_ptr() as *const FileObject))
-        };
+    pub fn cache_in(
+        reg: &Ref<UserspaceServerReg>,
+        candidate: Ref<FileObject>,
+    ) -> Result<Ref<FileObject>, CacheInError> {
+        let cand: &FileObject = &candidate;
         let id = cand.file_id().expect("a cached object has an id");
-        match r.cache_get_or_insert(id, &candidate).map_err(|_| CacheInError::OutOfMemory)? {
+        match reg.cache_get_or_insert(id, &candidate).map_err(|_| CacheInError::OutOfMemory)? {
             None => Ok(candidate),
             Some(existing) => {
-                // SAFETY: `existing` pins a live `FileObject`.
-                let ex = unsafe { &*(existing.as_ptr() as *const FileObject) };
+                let ex: &FileObject = &existing;
                 if ex.block_size() != cand.block_size() {
                     drop(candidate);
                     return Err(CacheInError::BlockSizeChanged);
@@ -804,20 +794,18 @@ impl FileObject {
     /// retried for the faulted page alone**, as the error may have been on a page it never asked
     /// for. A faulter that cannot register on a PO (`MAX_WAITERS`) parks a millisecond and looks
     /// again.
-    pub fn fault_in_page(file_obj: &ObjectRef, index: usize) -> Option<PhysAddr> {
+    pub fn fault_in_page(file_obj: &Ref<FileObject>, index: usize) -> Option<PhysAddr> {
         Self::fault_in_page_with(file_obj, index, &mut wait_for_fill, &mut park_briefly)
     }
 
     /// [`fault_in_page`](Self::fault_in_page) with its waits given, so host tests play the device.
     fn fault_in_page_with(
-        file_obj: &ObjectRef,
+        file_obj: &Ref<FileObject>,
         index: usize,
         wait: &mut dyn FnMut(&ObjectRef) -> bool,
         park: &mut dyn FnMut(),
     ) -> Option<PhysAddr> {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "fault_in_page_with");
-        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
-        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+        let fo: &FileObject = file_obj;
         // Whether this fault's fill may read ahead, and whether a failed fill may be tried again:
         // neither after a failure, so a fault fails at the second.
         let mut read_ahead = true;
@@ -891,10 +879,8 @@ impl FileObject {
     /// `file_obj` pins the frames across the IRPs. [`WriteBack::Written`] when every write
     /// succeeded, [`WriteBack::Gone`] when the device refused one `PeerClosed` (it has left, and no
     /// later write-back can do better), else [`WriteBack::Failed`].
-    pub fn writeback(file_obj: &ObjectRef) -> WriteBack {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "writeback");
-        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
-        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+    pub fn writeback(file_obj: &Ref<FileObject>) -> WriteBack {
+        let fo: &FileObject = file_obj;
         // The producer is immutable; the run map is read under the lock with the pages.
         let (device, block_size) = match &fo.producer {
             Producer::FsServerBlocks { device, block_size, .. } => (device.clone(), *block_size),
@@ -910,7 +896,7 @@ impl FileObject {
             if let Err(e) = crate::io::block::dispatch_block_irp_into_frames(
                 &device,
                 frames,
-                file_obj.clone(),
+                file_obj.clone().erase(),
                 &po,
                 crate::libkern::io_op::IoOpcode::Write,
                 dev_offset,
@@ -981,12 +967,9 @@ impl FileObject {
     ///
     /// **Not marked dead**, as a `Forget` marks it: a dead file's fill reads a hole, but a fill of
     /// a departed device's file must fail (refused `PeerClosed`), not read as zeros.
-    pub fn let_go(file_obj: &ObjectRef) -> usize {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "let_go");
-        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
-        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+    pub fn let_go(file_obj: &Ref<FileObject>) -> usize {
         let (pin, pages) = {
-            let mut g = fo.inner.lock();
+            let mut g = file_obj.inner.lock();
             let pages = g.pages.iter().filter(|p| p.state == PageState::Ready).count();
             (g.self_pin.take(), pages)
         };
@@ -998,15 +981,12 @@ impl FileObject {
     /// Model A file; `None` for any other. For the post-writeback `File::Touch`, which must reach
     /// a server *without* a resolve — by id, since a cached object outlives the resolve that named
     /// it. The clone pins the registration across the send.
-    pub fn touch_target(file_obj: &ObjectRef) -> Option<(ObjectRef, u64)> {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "touch_target");
-        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
-        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+    pub fn touch_target(file_obj: &Ref<FileObject>) -> Option<(Ref<UserspaceServerReg>, u64)> {
         // A forgotten file's id may already name another file.
-        if fo.inner.lock().dead {
+        if file_obj.inner.lock().dead {
             return None;
         }
-        match &fo.producer {
+        match &file_obj.producer {
             Producer::FsServerBlocks { reg, file_id, .. } if *file_id != 0 => Some((reg.clone(), *file_id)),
             _ => None,
         }
@@ -1016,10 +996,8 @@ impl FileObject {
     /// [`fault_in_page`](Self::fault_in_page), **blocking on each fill**, so only where blocking
     /// is allowed (a syscall thread, not a DPC/IRQ). `sys_process_spawn` loads an ELF with it.
     /// `AllocError` on a buffer-allocation or fill failure.
-    pub fn read_to_kvec(file_obj: &ObjectRef) -> Result<KVec<u8>, AllocError> {
-        assert_eq!(file_obj.object_type(), KObjectType::FileObject, "read_to_kvec");
-        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
-        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+    pub fn read_to_kvec(file_obj: &Ref<FileObject>) -> Result<KVec<u8>, AllocError> {
+        let fo: &FileObject = file_obj;
         let size = fo.size();
         let mut buf = KVec::new();
         buf.try_reserve(size)?;
@@ -1043,7 +1021,7 @@ impl FileObject {
     /// the [`Producer`]. `file_obj` is this object's reference (the deferred fill clones it).
     fn start_fill(
         &self,
-        file_obj: &ObjectRef,
+        file_obj: &Ref<FileObject>,
         index: usize,
         frame: PhysAddr,
         po: &ObjectRef,
@@ -1077,7 +1055,7 @@ impl FileObject {
     #[allow(clippy::too_many_arguments, reason = "the fill's object, page, frame, operation, device and run")]
     fn model_a_start_fill(
         &self,
-        file_obj: &ObjectRef,
+        file_obj: &Ref<FileObject>,
         index: usize,
         frame: PhysAddr,
         po: &ObjectRef,
@@ -1104,7 +1082,7 @@ impl FileObject {
                 match crate::io::block::dispatch_block_irp_into_frames(
                     device,
                     &frames,
-                    file_obj.clone(),
+                    file_obj.clone().erase(),
                     po,
                     crate::libkern::io_op::IoOpcode::Read,
                     dev_block * block_size as u64,
@@ -1130,11 +1108,11 @@ impl FileObject {
     /// could not be built or sent (the caller rolls the page back).
     fn fs_server_start_fill(
         &self,
-        file_obj: &ObjectRef,
+        file_obj: &Ref<FileObject>,
         index: usize,
         frame: PhysAddr,
         po: &ObjectRef,
-        reg: &ObjectRef,
+        reg: &Ref<UserspaceServerReg>,
         suffix: &KString,
     ) -> bool {
         let offset = (index * PAGE_SIZE) as u64;
@@ -1157,7 +1135,9 @@ impl FileObject {
         // reply completes `po`; `Busy`/`Full`/`PeerClosed` fail this fault.
         matches!(
             // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
-            unsafe { crate::sched::us_forward_originate_fill(reg.as_ptr(), &mut msg, po, file_obj, frame, index) },
+            unsafe {
+                crate::sched::us_forward_originate_fill(reg.as_object().as_ptr(), &mut msg, po, file_obj, frame, index)
+            },
             crate::sched::ForwardOutcome::Pending
         )
     }
@@ -1217,7 +1197,7 @@ fn park_briefly() {
 /// address. The DPC fills `frame`, marks the page `Ready`, completes `po`, and frees the box.
 struct StubFillBox {
     dpc: Dpc,
-    file_obj: ObjectRef,
+    file_obj: Ref<FileObject>,
     po: ObjectRef,
     frame: PhysAddr,
     index: usize,
@@ -1226,7 +1206,7 @@ struct StubFillBox {
 
 /// Start a stub fill (page `index` ← the byte `base + index`) by enqueuing a DPC. `false` on
 /// box-allocation failure. The box clones `file_obj` and `po` so they outlive the deferred fill.
-fn stub_start_fill(file_obj: &ObjectRef, index: usize, frame: PhysAddr, po: &ObjectRef, base: u8) -> bool {
+fn stub_start_fill(file_obj: &Ref<FileObject>, index: usize, frame: PhysAddr, po: &ObjectRef, base: u8) -> bool {
     let bx = match KBox::try_new(StubFillBox {
         dpc: Dpc::new(stub_fill_dpc, core::ptr::null_mut()),
         file_obj: file_obj.clone(),
@@ -1250,7 +1230,7 @@ fn stub_start_fill(file_obj: &ObjectRef, index: usize, frame: PhysAddr, po: &Obj
 
 /// DPC: write the stub byte into the cache frame, mark the page `Ready`, complete the PO.
 fn stub_fill_dpc(ctx: *mut ()) {
-    // Dropping `bx` here releases two `ObjectRef`s in DPC context, which the block path stopped
+    // Dropping `bx` here releases two references in DPC context, which the block path stopped
     // doing (decision log, 2026-08-06): a last-reference drop reaches `SlabCache::free` and can
     // deadlock against an allocator holder on the same CPU. Safe *here* only because
     // `Producer::Stub` is built solely from `#[cfg(test)]` code, so this never runs on a boot.
@@ -1262,9 +1242,7 @@ fn stub_fill_dpc(ctx: *mut ()) {
     unsafe {
         core::ptr::write_bytes((bx.frame.as_u64() + heap::hhdm_offset()) as *mut u8, bx.fill_byte, PAGE_SIZE);
     }
-    // SAFETY: `bx.file_obj` pins a live `FileObject`.
-    let fo: &FileObject = unsafe { &*(bx.file_obj.as_ptr() as *const FileObject) };
-    fo.settle(bx.index, &bx.po, true);
+    bx.file_obj.settle(bx.index, &bx.po, true);
     // SAFETY: `bx` owns the reference pinning its `PendingOperation`.
     unsafe { crate::sched::complete_pending_op(bx.po.as_ptr(), 0, 0) };
 }
@@ -1285,13 +1263,11 @@ impl Drop for FileObject {
         }
         // **Out of the registration's cache** after the page lock is released (the cache lock ranks
         // above it), by address: a new object for the file may have replaced this one.
+        let this: *mut Self = self;
         if let Producer::FsServerBlocks { reg, file_id, .. } = &self.producer
             && *file_id != 0
         {
-            // SAFETY: `reg` pins a live `UserspaceServerReg`.
-            let r: &crate::object::UserspaceServerReg =
-                unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
-            r.cache_forget_object(self as *mut Self as *mut ());
+            reg.cache_forget_object(this);
         }
     }
 }
@@ -1437,25 +1413,15 @@ mod tests {
     use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
     use crate::object::{DeviceNode, IpcChannel, UserspaceServerReg};
 
-    fn registration() -> ObjectRef {
+    fn registration() -> Ref<UserspaceServerReg> {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        let ep = ObjectRef::new(a);
+        let ep = Ref::new(a);
         drop(ObjectRef::new(b));
         let r = UserspaceServerReg::try_new(ep).unwrap();
-        ObjectRef::new(r)
+        Ref::new(r)
     }
 
-    fn reg_of(reg: &ObjectRef) -> &UserspaceServerReg {
-        // SAFETY: `reg` pins a live registration.
-        unsafe { &*(reg.as_ptr() as *const UserspaceServerReg) }
-    }
-
-    fn file_of(f: &ObjectRef) -> &FileObject {
-        // SAFETY: `f` pins a live `FileObject`.
-        unsafe { &*(f.as_ptr() as *const FileObject) }
-    }
-
-    fn candidate(reg: &ObjectRef, id: u64, size: usize) -> ObjectRef {
+    fn candidate(reg: &Ref<UserspaceServerReg>, id: u64, size: usize) -> Ref<FileObject> {
         candidate_in(reg, id, size, 4096)
     }
 
@@ -1467,15 +1433,15 @@ mod tests {
         };
     }
 
-    fn candidate_in(reg: &ObjectRef, id: u64, size: usize, block_size: u32) -> ObjectRef {
+    fn candidate_in(reg: &Ref<UserspaceServerReg>, id: u64, size: usize, block_size: u32) -> Ref<FileObject> {
         let device = DEVICE.with(Ref::clone);
         let f =
             FileObject::try_new(size, Producer::FsServerBlocks { device, block_size, reg: reg.clone(), file_id: id })
                 .unwrap();
-        ObjectRef::new(f)
+        Ref::new(f)
     }
 
-    fn resolve(reg: &ObjectRef, id: u64, size: usize) -> ObjectRef {
+    fn resolve(reg: &Ref<UserspaceServerReg>, id: u64, size: usize) -> Ref<FileObject> {
         FileObject::cache_in(reg, candidate(reg, id, size)).unwrap()
     }
 
@@ -1500,10 +1466,10 @@ mod tests {
         let first = FileObject::cache_in(&reg, candidate_in(&reg, 7, 2 * PAGE_SIZE, 4096)).unwrap();
         let changed = FileObject::cache_in(&reg, candidate_in(&reg, 7, PAGE_SIZE, 512));
         assert_eq!(changed.err(), Some(CacheInError::BlockSizeChanged));
-        assert_eq!(file_of(&first).size(), 2 * PAGE_SIZE, "nothing resized");
+        assert_eq!(first.size(), 2 * PAGE_SIZE, "nothing resized");
         let same = FileObject::cache_in(&reg, candidate_in(&reg, 7, PAGE_SIZE, 4096)).unwrap();
         assert_eq!(same.as_ptr(), first.as_ptr());
-        assert_eq!(file_of(&first).size(), PAGE_SIZE, "a reply in its own block size resizes it");
+        assert_eq!(first.size(), PAGE_SIZE, "a reply in its own block size resizes it");
     }
 
     #[test]
@@ -1515,9 +1481,9 @@ mod tests {
         assert_eq!(a.as_ptr(), b.as_ptr(), "one file, one object");
         let other = resolve(&reg, 8, PAGE_SIZE);
         assert_ne!(other.as_ptr(), a.as_ptr(), "another file, another object");
-        assert_eq!(reg_of(&reg).cached_files(), 2);
-        let frame = fill(file_of(&a), 0, 0x5A);
-        assert_eq!(file_of(&b).lookup(0), Some((frame, PageState::Ready)));
+        assert_eq!(reg.cached_files(), 2);
+        let frame = fill(&a, 0, 0x5A);
+        assert_eq!(b.lookup(0), Some((frame, PageState::Ready)));
     }
 
     #[test]
@@ -1527,7 +1493,7 @@ mod tests {
         let a = resolve(&reg, 7, PAGE_SIZE);
         let b = resolve(&reg, 7, 3 * PAGE_SIZE);
         assert_eq!(a.as_ptr(), b.as_ptr());
-        assert_eq!(file_of(&a).size(), 3 * PAGE_SIZE, "the grow reached the first holder too");
+        assert_eq!(a.size(), 3 * PAGE_SIZE, "the grow reached the first holder too");
     }
 
     #[test]
@@ -1537,16 +1503,16 @@ mod tests {
         let a = resolve(&reg, 7, PAGE_SIZE);
         let first = a.as_ptr();
         FileObject::writable_mapped(&a);
-        file_of(&a).writable_unmapped();
-        let mark = file_of(&a).clean_mark().expect("no writable mapping left");
+        a.writable_unmapped();
+        let mark = a.clean_mark().expect("no writable mapping left");
         FileObject::unpin_if_clean(&a, mark);
-        assert!(!file_of(&a).is_dirty());
+        assert!(!a.is_dirty());
         test_probe::reset();
         drop(a);
         assert_eq!(test_probe::file_object_destroys(), 1, "clean, and nothing holds it");
-        assert_eq!(reg_of(&reg).cached_files(), 0, "and its entry went with it");
+        assert_eq!(reg.cached_files(), 0, "and its entry went with it");
         let again = resolve(&reg, 7, PAGE_SIZE);
-        assert_eq!(reg_of(&reg).cached_files(), 1);
+        assert_eq!(reg.cached_files(), 1);
         drop((first, again));
     }
 
@@ -1556,24 +1522,24 @@ mod tests {
         let reg = registration();
         let a = resolve(&reg, 7, PAGE_SIZE);
         let first = a.as_ptr();
-        let frame = fill(file_of(&a), 0, 0xC3);
+        let frame = fill(&a, 0, 0xC3);
         FileObject::writable_mapped(&a);
-        file_of(&a).writable_unmapped();
-        assert!(file_of(&a).is_dirty());
+        a.writable_unmapped();
+        assert!(a.is_dirty());
         test_probe::reset();
         drop(a);
         assert_eq!(test_probe::file_object_destroys(), 0, "dirty: it holds itself");
-        assert_eq!(reg_of(&reg).cached_files(), 1);
+        assert_eq!(reg.cached_files(), 1);
         let found = resolve(&reg, 7, PAGE_SIZE);
         assert_eq!(found.as_ptr(), first, "the next resolve finds it");
         test_probe::reset(); // the resolve's own candidate was dropped for it
-        assert_eq!(file_of(&found).lookup(0), Some((frame, PageState::Ready)), "with its written page");
-        assert_eq!(reg_of(&reg).cache_objects().unwrap().len(), 1, "and a sync can enumerate it");
-        let mark = file_of(&found).clean_mark().unwrap();
+        assert_eq!(found.lookup(0), Some((frame, PageState::Ready)), "with its written page");
+        assert_eq!(reg.cache_objects().unwrap().len(), 1, "and a sync can enumerate it");
+        let mark = found.clean_mark().unwrap();
         FileObject::unpin_if_clean(&found, mark);
         drop(found);
         assert_eq!(test_probe::file_object_destroys(), 1);
-        assert_eq!(reg_of(&reg).cached_files(), 0);
+        assert_eq!(reg.cached_files(), 0);
     }
 
     #[test]
@@ -1581,16 +1547,16 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let a = resolve(&reg, 7, PAGE_SIZE);
-        let fo = file_of(&a);
+        let fo = &a;
 
         FileObject::writable_mapped(&a);
         assert_eq!(fo.clean_mark(), None);
-        file_of(&a).writable_unmapped();
+        a.writable_unmapped();
         assert!(fo.is_dirty(), "the sync that began mapped does not clean");
 
         let mark = fo.clean_mark().unwrap();
         FileObject::writable_mapped(&a);
-        file_of(&a).writable_unmapped();
+        a.writable_unmapped();
         FileObject::unpin_if_clean(&a, mark);
         assert!(fo.is_dirty(), "a mapping during the write-back keeps it dirty");
 
@@ -1607,12 +1573,12 @@ mod tests {
         let reg = registration();
         let a = candidate(&reg, 0, PAGE_SIZE);
         FileObject::writable_mapped(&a);
-        assert_eq!(file_of(&a).writable_maps(), 1);
-        assert!(!file_of(&a).is_dirty());
-        file_of(&a).writable_unmapped();
-        assert_eq!(reg_of(&reg).cached_files(), 0);
-        file_of(&a).writable_unmapped();
-        assert_eq!(file_of(&a).writable_maps(), 0);
+        assert_eq!(a.writable_maps(), 1);
+        assert!(!a.is_dirty());
+        a.writable_unmapped();
+        assert_eq!(reg.cached_files(), 0);
+        a.writable_unmapped();
+        assert_eq!(a.writable_maps(), 0);
     }
 
     /// **A truncate and then a grow read zero over the regrown range.** The test holds the retired
@@ -1662,13 +1628,13 @@ mod tests {
         }
     }
 
-    fn two_block_file(reg: &ObjectRef, id: u64) -> ObjectRef {
+    fn two_block_file(reg: &Ref<UserspaceServerReg>, id: u64) -> Ref<FileObject> {
         let f = resolve(reg, id, 2 * PAGE_SIZE);
         let mut runs = KVec::new();
         runs.try_push(BlockRun { file_block: 0, device_lba: 100, length: 2, flags: 0 }).unwrap();
-        file_of(&f).resize(2 * PAGE_SIZE, runs).unwrap();
-        fill(file_of(&f), 0, 0xA0);
-        fill(file_of(&f), 1, 0xA1);
+        f.resize(2 * PAGE_SIZE, runs).unwrap();
+        fill(&f, 0, 0xA0);
+        fill(&f, 1, 0xA1);
         f
     }
 
@@ -1685,17 +1651,14 @@ mod tests {
         let mut runs = KVec::new();
         runs.try_push(run(0, 100, 1, 0)).unwrap();
         runs.try_push(run(1, 101, 2, RUN_UNWRITTEN)).unwrap();
-        file_of(&f).resize(3 * PAGE_SIZE, runs).unwrap();
-        assert_eq!(read_one(file_of(&f), 0, 4096), 100, "the old block is read");
-        file_of(&f).end_io();
-        assert_eq!(read_one(file_of(&f), 1, 4096), 0, "a grown block is not");
-        assert_eq!(read_one(file_of(&f), 2, 4096), 0);
-        fill(file_of(&f), 1, 0xB1);
-        assert!(
-            matches!(file_of(&f).begin_write(1, 4096, 1, &mut KVec::new()), WriteStep::Go(101, 1)),
-            "but is written back"
-        );
-        file_of(&f).end_io();
+        f.resize(3 * PAGE_SIZE, runs).unwrap();
+        assert_eq!(read_one(&f, 0, 4096), 100, "the old block is read");
+        f.end_io();
+        assert_eq!(read_one(&f, 1, 4096), 0, "a grown block is not");
+        assert_eq!(read_one(&f, 2, 4096), 0);
+        fill(&f, 1, 0xB1);
+        assert!(matches!(f.begin_write(1, 4096, 1, &mut KVec::new()), WriteStep::Go(101, 1)), "but is written back");
+        f.end_io();
 
         // One-KiB blocks, four to a page: page 0 holds the old block and three of the grow's, page 1
         // four of the grow's.
@@ -1703,10 +1666,10 @@ mod tests {
         let mut runs = KVec::new();
         runs.try_push(run(0, 200, 1, 0)).unwrap();
         runs.try_push(run(1, 201, 7, RUN_UNWRITTEN)).unwrap();
-        file_of(&g).resize(2 * PAGE_SIZE, runs).unwrap();
-        assert_eq!(read_one(file_of(&g), 0, 1024), 200, "a page with one old block is read whole");
-        file_of(&g).end_io();
-        assert_eq!(read_one(file_of(&g), 1, 1024), 0, "a page of grown blocks is not");
+        g.resize(2 * PAGE_SIZE, runs).unwrap();
+        assert_eq!(read_one(&g, 0, 1024), 200, "a page with one old block is read whole");
+        g.end_io();
+        assert_eq!(read_one(&g, 1, 1024), 0, "a page of grown blocks is not");
 
         // Grown blocks beside a hole in one page read nothing; the flag alone does not make a hole.
         let mut runs = KVec::new();
@@ -1717,20 +1680,20 @@ mod tests {
     }
 
     fn mapped_file(
-        reg: &ObjectRef,
+        reg: &Ref<UserspaceServerReg>,
         id: u64,
         pages: usize,
         block_size: u32,
         map: &[(u64, u64, u32)],
         resident: impl Iterator<Item = usize>,
-    ) -> (ObjectRef, std::collections::BTreeMap<usize, PhysAddr>) {
+    ) -> (Ref<FileObject>, std::collections::BTreeMap<usize, PhysAddr>) {
         let f = FileObject::cache_in(reg, candidate_in(reg, id, pages * PAGE_SIZE, block_size)).unwrap();
         let mut runs = KVec::new();
         for &(file_block, device_lba, length) in map {
             runs.try_push(BlockRun { file_block, device_lba, length, flags: 0 }).unwrap();
         }
-        file_of(&f).resize(pages * PAGE_SIZE, runs).unwrap();
-        let frames = resident.map(|i| (i, fill(file_of(&f), i, i as u8))).collect();
+        f.resize(pages * PAGE_SIZE, runs).unwrap();
+        let frames = resident.map(|i| (i, fill(&f, i, i as u8))).collect();
         (f, frames)
     }
 
@@ -1760,12 +1723,12 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let (f, frames) = mapped_file(&reg, 7, 100, 4096, &[(0, 1000, 100)], (0..100).rev());
-        let (w, irps) = write_runs(file_of(&f), 4096, 64);
+        let (w, irps) = write_runs(&f, 4096, 64);
         assert_eq!(w, WriteBack::Written);
         assert_eq!(irps, [irp(&frames, 0..64, 1000, 4096), irp(&frames, 64..100, 1064, 4096)]);
-        let (_, irps) = write_runs(file_of(&f), 4096, RUN_MAX_PAGES);
+        let (_, irps) = write_runs(&f, 4096, RUN_MAX_PAGES);
         assert_eq!(irps, [irp(&frames, 0..100, 1000, 4096)]);
-        assert!(matches!(file_of(&f).forget(&po()), Forgotten::Now), "nothing in flight");
+        assert!(matches!(f.forget(&po()), Forgotten::Now), "nothing in flight");
     }
 
     #[test]
@@ -1775,7 +1738,7 @@ mod tests {
         // Pages 0-9 at device block 1000, 10-19 at 2000, 20-23 a hole, 24-39 at 3000.
         let map = [(0, 1000, 10), (10, 2000, 10), (20, 0, 4), (24, 3000, 16)];
         let (f, mut frames) = mapped_file(&reg, 7, 40, 4096, &map, (0..40).filter(|&i| i != 30 && i != 33));
-        let fo = file_of(&f);
+        let fo = &f;
         assert!(matches!(fo.reserve(33), Reserve::New(_)), "page 33 filling");
         // The file cut to 38 pages, and pages 38 and 39 faulted in again past its end.
         let mut runs = KVec::new();
@@ -1804,7 +1767,7 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let (f, _) = mapped_file(&reg, 7, 100, 4096, &[(0, 1000, 100)], 0..100);
-        let fo = file_of(&f);
+        let fo = &f;
         let (mut issued, mut forgotten) = (0, None);
         let w = fo.write_runs(4096, 10, |_, _, _| {
             issued += 1;
@@ -1823,12 +1786,12 @@ mod tests {
         ] {
             let (g, _) = mapped_file(&reg, id, 100, 4096, &[(0, 2000, 100)], 0..100);
             let mut issued = 0;
-            let w = file_of(&g).write_runs(4096, 10, |_, _, _| {
+            let w = g.write_runs(4096, 10, |_, _, _| {
                 issued += 1;
                 if issued == 2 { status } else { 0 }
             });
             assert_eq!((w, issued), (outcome, 2));
-            assert!(matches!(file_of(&g).forget(&po()), Forgotten::Now), "the refused run ended");
+            assert!(matches!(g.forget(&po()), Forgotten::Now), "the refused run ended");
         }
     }
 
@@ -1837,9 +1800,9 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let (f, frames) = mapped_file(&reg, 7, 8, 1024, &[(0, 400, 32)], 0..8);
-        assert_eq!(write_runs(file_of(&f), 1024, 64).1, [irp(&frames, 0..8, 400, 1024)]);
+        assert_eq!(write_runs(&f, 1024, 64).1, [irp(&frames, 0..8, 400, 1024)]);
         let (g, frames) = mapped_file(&reg, 8, 8, 1024, &[(0, 400, 16), (16, 900, 16)], 0..8);
-        assert_eq!(write_runs(file_of(&g), 1024, 64).1, [irp(&frames, 0..4, 400, 1024), irp(&frames, 4..8, 900, 1024)]);
+        assert_eq!(write_runs(&g, 1024, 64).1, [irp(&frames, 0..4, 400, 1024), irp(&frames, 4..8, 900, 1024)]);
     }
 
     #[test]
@@ -1885,9 +1848,9 @@ mod tests {
         let d = u64::MAX / 512 - 10;
         let map = [(0, d, 8), (8, d + 8, 1), (16, 7000, 8)];
         let (f, _) = mapped_file(&reg, 7, 3, 512, &map, 0..0);
-        assert_eq!(fill_ahead(file_of(&f), 0, 512, 31).0, ReadStep::Go(d, 2));
+        assert_eq!(fill_ahead(&f, 0, 512, 31).0, ReadStep::Go(d, 2));
         let (g, _) = mapped_file(&reg, 8, 3, 512, &map, 0..3);
-        assert!(matches!(file_of(&g).begin_write(0, 512, 3, &mut KVec::new()), WriteStep::Go(at, 2) if at == d));
+        assert!(matches!(g.begin_write(0, 512, 3, &mut KVec::new()), WriteStep::Go(at, 2) if at == d));
     }
 
     #[test]
@@ -1895,7 +1858,7 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let (f, _) = mapped_file(&reg, 7, 100, 4096, &[(0, 1000, 40), (40, 5000, 60)], 0..0);
-        let fo = file_of(&f);
+        let fo = &f;
         let (frame, fill_po) = miss(fo, 0);
         let mut frames = KVec::new();
         assert_eq!(fo.begin_fill(0, frame, 4096, 31, &fill_po, &mut frames), ReadStep::Go(1000, 32));
@@ -1909,7 +1872,7 @@ mod tests {
         );
         assert!(matches!(fo.forget(&po()), Forgotten::Later(_)), "one IRP in flight");
         let (f, _) = mapped_file(&reg, 8, 100, 4096, &[(0, 1000, 40), (40, 5000, 64)], 0..0);
-        let fo = file_of(&f);
+        let fo = &f;
         assert_eq!(fill_ahead(fo, 0, 4096, 31).0, ReadStep::Go(1000, 32));
         assert_eq!(fo.lookup(31).map(|(_, s)| s), Some(PageState::Ready), "settled with the faulted page");
         assert_eq!(fill_ahead(fo, 32, 4096, 31).0, ReadStep::Go(1032, 8), "to the jump on the device");
@@ -1928,7 +1891,7 @@ mod tests {
         for r in [run(0, 1000, 20, 0), run(20, 1020, 4, RUN_UNWRITTEN), run(24, 0, 4, 0), run(28, 1028, 10, 0)] {
             runs.try_push(r).unwrap();
         }
-        let fo = file_of(&f);
+        let fo = &f;
         fo.resize(40 * PAGE_SIZE, runs).unwrap();
         fill(fo, 5, 5);
         assert!(matches!(fo.reserve(9), Reserve::New(_)), "page 9 filling, by another path");
@@ -1940,7 +1903,7 @@ mod tests {
         assert_eq!(fill_ahead(fo, 28, 4096, 31).0, ReadStep::Go(1028, 10), "to the map's end");
         assert_eq!(fill_ahead(fo, 38, 4096, 31).0, ReadStep::Hole, "past it");
         let (g, _) = mapped_file(&reg, 8, 10, 4096, &[(0, 2000, 10)], 0..0);
-        assert_eq!(fill_ahead(file_of(&g), 0, 4096, 0).0, ReadStep::Go(2000, 1), "nothing ahead");
+        assert_eq!(fill_ahead(&g, 0, 4096, 0).0, ReadStep::Go(2000, 1), "nothing ahead");
     }
 
     #[test]
@@ -1948,12 +1911,12 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let (f, _) = mapped_file(&reg, 7, 16, 1024, &[(0, 400, 64)], 0..0);
-        assert_eq!(fill_ahead(file_of(&f), 0, 1024, 31).0, ReadStep::Go(400, 16));
+        assert_eq!(fill_ahead(&f, 0, 1024, 31).0, ReadStep::Go(400, 16));
         let (g, _) = mapped_file(&reg, 8, 16, 1024, &[(0, 400, 64)], 0..0);
-        let _ = file_of(&g).forget(&po());
-        let (step, frames) = fill_ahead(file_of(&g), 0, 1024, 31);
+        let _ = g.forget(&po());
+        let (step, frames) = fill_ahead(&g, 0, 1024, 31);
         assert_eq!((step, frames.len()), (ReadStep::Hole, 0));
-        assert_eq!(file_of(&g).resident_pages(), 1, "nothing reserved ahead");
+        assert_eq!(g.resident_pages(), 1, "nothing reserved ahead");
     }
 
     #[test]
@@ -1985,20 +1948,20 @@ mod tests {
         let reg = registration();
         let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 7 };
         let cand = FileObject::try_new(20 * PAGE_SIZE, producer).unwrap();
-        let cand = ObjectRef::new(cand);
+        let cand = Ref::new(cand);
         let f = FileObject::cache_in(&reg, cand).unwrap();
         let mut runs = KVec::new();
         runs.try_push(BlockRun { file_block: 0, device_lba: 1000, length: 20, flags: 0 }).unwrap();
-        file_of(&f).resize(20 * PAGE_SIZE, runs).unwrap();
+        f.resize(20 * PAGE_SIZE, runs).unwrap();
 
-        let (frame, fill_po) = miss(file_of(&f), 0);
-        assert_eq!(file_of(&f).start_fill(&f, 0, frame, &fill_po, true), FillStart::DeviceIo(8));
+        let (frame, fill_po) = miss(&f, 0);
+        assert_eq!(f.start_fill(&f, 0, frame, &fill_po, true), FillStart::DeviceIo(8));
         let (irp, frags) = seen.0.borrow_mut().pop().expect("one IRP");
         assert!(seen.0.borrow().is_empty());
         // SAFETY: the IRP is live until it is completed below.
         let (op, offset, length) = unsafe { ((*irp).op, (*irp).offset, (*irp).length) };
         assert_eq!((op, offset, length), (crate::io::irp::IrpOp::Read as u32, 1000 * 4096, 8 * PAGE_SIZE as u64));
-        let expected: std::vec::Vec<u64> = (0..8).map(|i| file_of(&f).lookup(i).unwrap().0.as_u64()).collect();
+        let expected: std::vec::Vec<u64> = (0..8).map(|i| f.lookup(i).unwrap().0.as_u64()).collect();
         assert_eq!(
             frags.iter().map(|fr| fr.base).collect::<std::vec::Vec<_>>(),
             expected,
@@ -2013,13 +1976,13 @@ mod tests {
         let completed = unsafe { crate::sched::pending_op_completion(fill_po.as_ptr()) };
         assert_eq!(completed, (0, length), "the fault's PO completed");
 
-        let (frame, fill_po) = miss(file_of(&f), 8);
-        assert_eq!(file_of(&f).start_fill(&f, 8, frame, &fill_po, false), FillStart::DeviceIo(1));
+        let (frame, fill_po) = miss(&f, 8);
+        assert_eq!(f.start_fill(&f, 8, frame, &fill_po, false), FillStart::DeviceIo(1));
         let (irp, frags) = seen.0.borrow_mut().pop().expect("one IRP");
         // SAFETY: the IRP is live until it is completed below.
         let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
         assert_eq!((offset, length, frags.len()), (1008 * 4096, PAGE_SIZE as u64, 1), "page 8 alone");
-        assert_eq!(file_of(&f).lookup(9), None, "nothing reserved after it");
+        assert_eq!(f.lookup(9), None, "nothing reserved after it");
         // SAFETY: as above.
         unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
         // SAFETY: `irp` is the recording device's in-flight IRP.
@@ -2042,7 +2005,7 @@ mod tests {
 
     struct Held(core::cell::RefCell<std::vec::Vec<*mut crate::io::irp::Irp>>);
 
-    fn held_disk_file(held: &Held) -> ObjectRef {
+    fn held_disk_file(held: &Held) -> Ref<FileObject> {
         use crate::io::block::BlockBackend;
         use crate::io::irp::Irp;
         use crate::libkern::block::BlockKind;
@@ -2060,11 +2023,11 @@ mod tests {
         let reg = registration();
         let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 7 };
         let cand = FileObject::try_new(20 * PAGE_SIZE, producer).unwrap();
-        let cand = ObjectRef::new(cand);
+        let cand = Ref::new(cand);
         let f = FileObject::cache_in(&reg, cand).unwrap();
         let mut runs = KVec::new();
         runs.try_push(BlockRun { file_block: 0, device_lba: 1000, length: 20, flags: 0 }).unwrap();
-        file_of(&f).resize(20 * PAGE_SIZE, runs).unwrap();
+        f.resize(20 * PAGE_SIZE, runs).unwrap();
         f
     }
 
@@ -2109,7 +2072,7 @@ mod tests {
             let ok = disk(po);
             if core::mem::take(&mut first) {
                 for k in [3, 5] {
-                    match file_of(&f).reserve_fault(k) {
+                    match f.reserve_fault(k) {
                         Fault::Wait(on) => assert_eq!(on.as_ptr(), po.as_ptr(), "page {k} waits on page 0's read"),
                         _ => panic!("page {k} is not being read"),
                     }
@@ -2124,10 +2087,10 @@ mod tests {
         assert_eq!(*reads.borrow(), [(0, 8), (3, 1), (5, 1), (0, 1)], "the read ahead, then each page alone");
         for (k, got) in [(0, page_0), (3, page_3)] {
             assert!(got.is_some(), "page {k}'s fault failed for page 5's error");
-            assert_eq!(file_of(&f).lookup(k), got.map(|frame| (frame, PageState::Ready)));
+            assert_eq!(f.lookup(k), got.map(|frame| (frame, PageState::Ready)));
         }
         assert_eq!(page_5, None, "page 5 does not read");
-        assert_eq!(file_of(&f).lookup(5), None, "and is left for the next fault to try");
+        assert_eq!(f.lookup(5), None, "and is left for the next fault to try");
         crate::io::block::reclaim_completed();
     }
 
@@ -2138,7 +2101,7 @@ mod tests {
         let held = Held(RefCell::new(std::vec::Vec::new()));
         let f = held_disk_file(&held);
         let reads = RefCell::new(std::vec::Vec::new());
-        let fo = file_of(&f);
+        let fo = &f;
 
         let (frame, read_0) = miss(fo, 0);
         assert_eq!(fo.start_fill(&f, 0, frame, &read_0, true), FillStart::DeviceIo(8));
@@ -2176,17 +2139,17 @@ mod tests {
         let a = two_block_file(&reg, 7);
         let first = a.as_ptr();
         FileObject::writable_mapped(&a);
-        file_of(&a).writable_unmapped();
-        assert!(file_of(&a).is_dirty());
-        assert!(matches!(file_of(&a).begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)));
-        assert!(file_of(&a).end_io().is_none(), "nothing forgotten yet");
+        a.writable_unmapped();
+        assert!(a.is_dirty());
+        assert!(matches!(a.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)));
+        assert!(a.end_io().is_none(), "nothing forgotten yet");
 
-        assert!(matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now), "nothing in flight");
-        assert_eq!(reg_of(&reg).cached_files(), 0, "so its entry went at once");
-        assert!(file_of(&a).is_dead());
-        assert!(!file_of(&a).is_dirty(), "the pin is gone");
-        assert!(matches!(file_of(&a).begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Dead));
-        assert_eq!(read_one(file_of(&a), 0, 4096), 0, "a fill reads a hole, not a freed block");
+        assert!(matches!(reg.forget_file(7, &po()), Forgotten::Now), "nothing in flight");
+        assert_eq!(reg.cached_files(), 0, "so its entry went at once");
+        assert!(a.is_dead());
+        assert!(!a.is_dirty(), "the pin is gone");
+        assert!(matches!(a.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Dead));
+        assert_eq!(read_one(&a, 0, 4096), 0, "a fill reads a hole, not a freed block");
         assert_eq!(FileObject::touch_target(&a).map(|(_, id)| id), None, "and no touch names it");
         let again = resolve(&reg, 7, PAGE_SIZE);
         assert_ne!(again.as_ptr(), first, "a new object for the id");
@@ -2200,7 +2163,7 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let a = two_block_file(&reg, 7);
-        let fo = file_of(&a);
+        let fo = &a;
         assert!(
             matches!(fo.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)),
             "page 0's IRP is issued"
@@ -2223,21 +2186,21 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let a = two_block_file(&reg, 7);
-        let fo = file_of(&a);
+        let fo = &a;
         assert!(
             matches!(fo.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)),
             "page 0's IRP is issued"
         );
         let answer = po();
-        let Forgotten::Later(first) = reg_of(&reg).forget_file(7, &answer) else { panic!("an IRP is in flight") };
+        let Forgotten::Later(first) = reg.forget_file(7, &answer) else { panic!("an IRP is in flight") };
         assert_eq!(first.as_ptr(), answer.as_ptr());
-        let Forgotten::Later(second) = reg_of(&reg).forget_file(7, &po()) else {
+        let Forgotten::Later(second) = reg.forget_file(7, &po()) else {
             panic!("a second Forget found nothing to wait on")
         };
         assert_eq!(second.as_ptr(), answer.as_ptr(), "the first one's answer");
         assert_eq!(fo.end_io().map(|p| p.as_ptr()), Some(answer.as_ptr()));
-        assert!(matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now), "nothing in flight now");
-        assert_eq!(reg_of(&reg).cached_files(), 0, "and the entry has gone");
+        assert!(matches!(reg.forget_file(7, &po()), Forgotten::Now), "nothing in flight now");
+        assert_eq!(reg.cached_files(), 0, "and the entry has gone");
     }
 
     #[test]
@@ -2245,19 +2208,15 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let a = two_block_file(&reg, 7);
-        assert_eq!(read_one(file_of(&a), 1, 4096), 101);
+        assert_eq!(read_one(&a, 1, 4096), 101);
         let answer = po();
-        assert!(matches!(reg_of(&reg).forget_file(7, &answer), Forgotten::Later(_)));
-        assert_eq!(reg_of(&reg).cache_objects().unwrap().len(), 0, "no sync sees it");
+        assert!(matches!(reg.forget_file(7, &answer), Forgotten::Later(_)));
+        assert_eq!(reg.cache_objects().unwrap().len(), 0, "no sync sees it");
         let again = resolve(&reg, 7, PAGE_SIZE);
         assert_ne!(again.as_ptr(), a.as_ptr(), "a resolve gets a new object");
-        assert!(matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now), "the new file has nothing in flight");
-        assert!(file_of(&again).is_dead(), "and it is the one forgotten");
-        assert_eq!(
-            file_of(&a).end_io().map(|p| p.as_ptr()),
-            Some(answer.as_ptr()),
-            "the old answer still waited for its IRP"
-        );
+        assert!(matches!(reg.forget_file(7, &po()), Forgotten::Now), "the new file has nothing in flight");
+        assert!(again.is_dead(), "and it is the one forgotten");
+        assert_eq!(a.end_io().map(|p| p.as_ptr()), Some(answer.as_ptr()), "the old answer still waited for its IRP");
     }
 
     #[test]
@@ -2265,7 +2224,7 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let a = two_block_file(&reg, 7);
-        let fo = file_of(&a);
+        let fo = &a;
         assert_eq!(read_one(fo, 1, 4096), 101);
         let answer = po();
         assert!(matches!(fo.forget(&answer), Forgotten::Later(_)));
@@ -2277,7 +2236,7 @@ mod tests {
     fn the_held_count_is_what_a_sync_leaves_alive() {
         init_global_heap();
         let reg = registration();
-        let count = || reg_of(&reg).cache_objects().unwrap().len();
+        let count = || reg.cache_objects().unwrap().len();
         let held = two_block_file(&reg, 7);
         let dirty = two_block_file(&reg, 8);
         let gone = two_block_file(&reg, 9);
@@ -2286,24 +2245,24 @@ mod tests {
         assert_eq!(count(), 2, "a file nothing holds leaves the cache");
 
         FileObject::writable_mapped(&dirty);
-        file_of(&dirty).writable_unmapped();
-        let mark = file_of(&dirty).clean_mark().expect("no writable mapping remains");
+        dirty.writable_unmapped();
+        let mark = dirty.clean_mark().expect("no writable mapping remains");
         let dirty_at = dirty.as_ptr();
         drop(dirty);
         assert_eq!(count(), 2, "a dirty file holds itself");
-        let live = reg_of(&reg).cache_objects().unwrap();
+        let live = reg.cache_objects().unwrap();
         let pinned = live.iter().find(|f| f.as_ptr() == dirty_at).unwrap().clone();
         drop(live);
         FileObject::unpin_if_clean(&pinned, mark);
         drop(pinned);
         assert_eq!(count(), 1, "cleaned, it goes");
 
-        assert_eq!(read_one(file_of(&held), 1, 4096), 101);
+        assert_eq!(read_one(&held, 1, 4096), 101);
         let answer = po();
-        assert!(matches!(reg_of(&reg).forget_file(7, &answer), Forgotten::Later(_)));
-        assert_eq!(reg_of(&reg).cached_files(), 1, "the entry stays while the read is in flight");
+        assert!(matches!(reg.forget_file(7, &answer), Forgotten::Later(_)));
+        assert_eq!(reg.cached_files(), 1, "the entry stays while the read is in flight");
         assert_eq!(count(), 0, "a forgotten file is not counted, though something holds it");
-        assert!(file_of(&held).end_io().is_some());
+        assert!(held.end_io().is_some());
         drop(held);
     }
 
@@ -2323,12 +2282,12 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         FileObject::writable_mapped(&a);
-        file_of(&a).writable_unmapped();
-        assert!(file_of(&a).is_dirty());
+        a.writable_unmapped();
+        assert!(a.is_dirty());
         assert_eq!(FileObject::let_go(&a), 2, "both pages resident, unwritten");
-        assert!(!file_of(&a).is_dirty(), "the pin is gone");
-        assert!(!file_of(&a).is_dead(), "but not forgotten");
-        assert_ne!(read_one(file_of(&a), 1, 4096), 0, "a fill still reads its block, not a hole");
+        assert!(!a.is_dirty(), "the pin is gone");
+        assert!(!a.is_dead(), "but not forgotten");
+        assert_ne!(read_one(&a, 1, 4096), 0, "a fill still reads its block, not a hole");
     }
 
     #[test]
@@ -2336,10 +2295,10 @@ mod tests {
         init_global_heap();
         let reg = registration();
         let a = two_block_file(&reg, 7);
-        let _ = reg_of(&reg).forget_file(7, &po());
+        let _ = reg.forget_file(7, &po());
         FileObject::writable_mapped(&a);
-        assert!(!file_of(&a).is_dirty());
-        file_of(&a).writable_unmapped();
+        assert!(!a.is_dirty());
+        a.writable_unmapped();
     }
 
     fn fault(f: &FileObject, index: usize) -> (&'static str, Option<PhysAddr>, Option<ObjectRef>) {

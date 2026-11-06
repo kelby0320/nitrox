@@ -199,7 +199,12 @@ fn spawn_inner(
 /// reference is moved into the thread, keeping its address space alive. `boot_args` are the
 /// `[rdi, rsi, rdx, rcx]` seeded at first ring-3 entry (the spawn hand-off). Stack and frame
 /// fabrication happen before the enqueue lock.
-pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64, boot_args: [u64; 4]) -> Result<ObjectRef, AllocError> {
+pub fn spawn_user(
+    process: Ref<Process>,
+    entry: u64,
+    user_sp: u64,
+    boot_args: [u64; 4],
+) -> Result<ObjectRef, AllocError> {
     // Default scheduling: TimeShared, nice 0, no affinity restriction.
     let r = make_user_sched(process, entry, user_sp, boot_args, SchedClass::TimeShared, 0, 0, u8::MAX)?;
     // Clone the caller's handle before the enqueue moves `r` into `ready`.
@@ -211,7 +216,7 @@ pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64, boot_args: [u64;
 /// `REAL_TIME`-gated by the caller), and not enqueued: [`start_user`] runs it, after what may fail.
 #[allow(clippy::too_many_arguments, reason = "a thread's process, entry, stack and scheduling")]
 pub fn make_user_sched(
-    process: ObjectRef,
+    process: Ref<Process>,
     entry: u64,
     user_sp: u64,
     boot_args: [u64; 4],

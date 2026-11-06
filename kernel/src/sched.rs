@@ -48,11 +48,12 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, Reserved};
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::mm::PhysAddr;
+use crate::object::header::Ref;
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 use crate::object::{
-    BlockSendOutcome, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, PendingOperation,
-    ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg, Thread, ThreadEntry, ThreadState, Timer, TransferRef,
-    UserspaceServerReg,
+    BlockSendOutcome, FileObject, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,
+    PendingOperation, Process, ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg, Thread, ThreadEntry,
+    ThreadState, Timer, TransferRef, UserspaceServerReg,
 };
 
 mod current;

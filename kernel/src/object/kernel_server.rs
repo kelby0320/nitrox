@@ -12,7 +12,6 @@ use crate::libkern::handle::Rights;
 use crate::object::EntropyObject;
 use crate::object::MemoryObject;
 use crate::object::ObjectRef;
-use crate::object::Process;
 use crate::syscall::error::KError;
 
 /// Identifies one in-kernel resource server; `Copy`, so a `KernelServer` binding needs no
@@ -115,7 +114,7 @@ fn proc_self_process(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     }
     match crate::sched::current_process() {
-        Some(obj) => OpStatus::Completed(obj),
+        Some(obj) => OpStatus::Completed(obj.erase()),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }
@@ -136,11 +135,7 @@ fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
     }
-    let ns = crate::sched::current_process().and_then(|p| {
-        // SAFETY: `current_process` returns a live `Process` ObjectRef; `p` pins it
-        // for this borrow. `namespace_ref` clones the stored namespace ObjectRef.
-        unsafe { &*(p.as_ptr() as *const Process) }.namespace_ref()
-    });
+    let ns = crate::sched::current_process().and_then(|p| p.namespace_ref());
     match ns {
         Some(obj) => OpStatus::Completed(obj),
         None => OpStatus::Rejected(KError::NotFound),
@@ -455,8 +450,7 @@ mod tests {
         match dispatch(KernelServerId::SchedStats, b"", Rights::MAP_READ) {
             OpStatus::Completed(obj) => {
                 assert_eq!(obj.object_type(), KObjectType::MemoryObject);
-                // SAFETY: `obj` pins a live MemoryObject just created above.
-                let m = unsafe { &*(obj.as_ptr() as *const MemoryObject) };
+                let m = obj.downcast_ref::<MemoryObject>().unwrap();
                 assert_eq!(m.size(), PAGE_SIZE); // one page holds the header
                 let expected = b"cpus_online=0\nreaper_closed=0\nexit_closed=0\n";
                 let base = (m.frames()[0].as_u64() + heap::hhdm_offset()) as *const u8;

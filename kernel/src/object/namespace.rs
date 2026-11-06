@@ -442,7 +442,7 @@ mod tests {
     use crate::libkern::handle::KObjectType;
     use crate::mm::test_support::init_global_heap;
     use crate::object::Timer;
-    use crate::object::header::test_probe;
+    use crate::object::header::{Ref, test_probe};
 
     fn target() -> ObjectRef {
         ObjectRef::new(Timer::try_new().unwrap())
@@ -622,13 +622,9 @@ mod tests {
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        let r = ObjectRef::new(Namespace::try_new().unwrap());
-        {
-            // SAFETY: `r` holds a live reference to a `Namespace`.
-            let ns: &Namespace = unsafe { &*(r.as_ptr() as *const Namespace) };
-            ns.bind(b"/a", target(), Rights::LOOKUP).unwrap();
-            ns.bind(b"/b", target(), Rights::LOOKUP).unwrap();
-        }
+        let r = Ref::new(Namespace::try_new().unwrap());
+        r.bind(b"/a", target(), Rights::LOOKUP).unwrap();
+        r.bind(b"/b", target(), Rights::LOOKUP).unwrap();
         assert_eq!(test_probe::namespace_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::namespace_destroys(), 1, "namespace destructor ran");
@@ -676,7 +672,7 @@ mod tests {
     fn us_reg_target() -> ObjectRef {
         use crate::object::{IpcChannel, UserspaceServerReg};
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        let endpoint = ObjectRef::new(a);
+        let endpoint = Ref::new(a);
         drop(ObjectRef::new(b));
         let reg = UserspaceServerReg::try_new(endpoint).unwrap();
         ObjectRef::new(reg)

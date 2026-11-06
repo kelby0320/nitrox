@@ -7,7 +7,7 @@ use super::*;
 /// mark the page ready, and complete the fill PO (waking the parked faulter). An error or
 /// uncorrelated reply fails the PO / is dropped (transfers released, handles closed).
 pub(super) fn complete_read_range_reply(
-    reg: &ObjectRef,
+    reg: &Ref<UserspaceServerReg>,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     payload_len: usize,
@@ -17,7 +17,7 @@ pub(super) fn complete_read_range_reply(
     let reply = parse_read_range_reply(&bounce.payload[..payload_len]);
     let pf = match reply {
         // SAFETY: `reg` pins the registration the send arrived through.
-        Some(r) => unsafe { crate::sched::us_forward_take_pending_fill(reg.as_ptr(), r.request_id) },
+        Some(r) => unsafe { crate::sched::us_forward_take_pending_fill(reg.as_object().as_ptr(), r.request_id) },
         None => None,
     };
     let Some(pf) = pf else {
@@ -32,10 +32,7 @@ pub(super) fn complete_read_range_reply(
             None => KError::InvalidArgument as i32, // success but no bytes
             Some(tr) => match copy_fill_into_frame(&tr.obj, pf.frame, content_len as usize) {
                 Ok(()) => {
-                    // SAFETY: `pf.file_obj` pins the live `FileObject` (header at 0).
-                    let fo: &crate::object::FileObject =
-                        unsafe { &*(pf.file_obj.as_ptr() as *const crate::object::FileObject) };
-                    fo.settle(pf.index, &pf.po, true);
+                    pf.file_obj.settle(pf.index, &pf.po, true);
                     drop(tr.obj);
                     0
                 }

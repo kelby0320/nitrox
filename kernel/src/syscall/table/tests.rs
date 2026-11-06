@@ -545,12 +545,12 @@ fn full_mem_rights_are_allocatable_on_a_memory_object() {
 }
 
 /// A file server's registration, its peer endpoint dropped.
-fn file_server_reg() -> ObjectRef {
-    use crate::object::{IpcChannel, UserspaceServerReg};
+fn file_server_reg() -> Ref<UserspaceServerReg> {
+    use crate::object::IpcChannel;
     let (a, b) = IpcChannel::try_new_pair(4).unwrap();
     drop(ObjectRef::new(b));
-    let ep = ObjectRef::new(a);
-    ObjectRef::new(UserspaceServerReg::try_new(ep).unwrap())
+    let ep = Ref::new(a);
+    Ref::new(UserspaceServerReg::try_new(ep).unwrap())
 }
 
 fn block_device() -> ObjectRef {
@@ -564,7 +564,7 @@ const FILE_CLIENT: u32 = 4242;
 
 /// `reg`'s server answers a lookup asking `MAP_READ | MAP_WRITE` with a file-blocks reply for
 /// `file_id` (`0` uncached): 512-byte blocks, one run of a page, `device` sent with `rights`.
-fn file_blocks_reply(reg: &ObjectRef, file_id: u64, device: ObjectRef, rights: Rights) -> (i32, u64) {
+fn file_blocks_reply(reg: &Ref<UserspaceServerReg>, file_id: u64, device: ObjectRef, rights: Rights) -> (i32, u64) {
     use crate::object::PendingOperation;
     use crate::object::userspace_server::{ForwardOp, LOOKUP_SUFFIX_MAX, PendingLookup};
     let mut msg = std::vec![0u8; 28 + 32 + 24];
@@ -642,7 +642,7 @@ fn a_reply_for_a_cached_file_naming_another_device_is_refused() {
 
 /// A forwarded lookup, and a reply carrying a memory object built for it.
 struct Forwarded {
-    reg: ObjectRef,
+    reg: Ref<UserspaceServerReg>,
     po: ObjectRef,
     reply: crate::object::ipc_channel::StoredMsg,
     transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
@@ -655,14 +655,21 @@ fn forwarded_memobj_lookup() -> Forwarded {
     use crate::object::{IpcChannel, MemoryObject, PendingOperation, UserspaceServerReg};
     use crate::rsproto::{OBJECT_KIND_MEMOBJ, build_resolve_request};
     let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-    let (k, _server_end) = (ObjectRef::new(k), ObjectRef::new(s));
-    let reg = ObjectRef::new(UserspaceServerReg::try_new(k).unwrap());
+    let (k, _server_end) = (Ref::new(k), ObjectRef::new(s));
+    let reg = Ref::new(UserspaceServerReg::try_new(k).unwrap());
     let po = ObjectRef::new(PendingOperation::try_new().unwrap());
     let mut msg = StoredMsg::zeroed();
     msg.header.payload_len = build_resolve_request(&mut msg.payload, Rights::MAP_READ.bits(), b"f").unwrap() as u32;
     // SAFETY: `reg` and `po` are pinned by the test.
     let forwarded = unsafe {
-        crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, &po, Rights::MAP_READ, b"f", Forward::PLAIN)
+        crate::sched::us_forward_originate(
+            reg.as_object().as_ptr(),
+            &mut msg,
+            &po,
+            Rights::MAP_READ,
+            b"f",
+            Forward::PLAIN,
+        )
     };
     assert_eq!(forwarded, crate::sched::ForwardOutcome::Pending);
     // The request's envelope turned round, as a server's reply: flags REPLY, a MEMOBJ body.
@@ -800,16 +807,15 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     use crate::rsproto::{REQUEST_ID_OFFSET, build_read_range_request};
     init_global_heap();
     let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-    let k = ObjectRef::new(k);
+    let k = Ref::new(k);
     let _server_end = ObjectRef::new(s);
-    let reg = ObjectRef::new(UserspaceServerReg::try_new(k).unwrap());
+    let reg = Ref::new(UserspaceServerReg::try_new(k).unwrap());
     let file = FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap();
-    let file = ObjectRef::new(file);
-    // SAFETY: `file` pins the `FileObject`.
-    let fo = unsafe { &*(file.as_ptr() as *const FileObject) };
+    let file = Ref::new(file);
+    let fo: &FileObject = &file;
     let Fault::Fill(frame, stale) = fo.reserve_fault(0) else { panic!("a fill") };
     // SAFETY: `reg` pins the registration, and the test is single-threaded.
-    let id = unsafe { UserspaceServerReg::begin_fill(reg.as_ptr(), &stale, &file, frame, 0) }.unwrap();
+    let id = unsafe { UserspaceServerReg::begin_fill(reg.as_object().as_ptr(), &stale, &file, frame, 0) }.unwrap();
     fo.resize(0, KVec::new()).unwrap();
     fo.resize(PAGE_SIZE, KVec::new()).unwrap();
     let Fault::Fill(next, _its_fill) = fo.reserve_fault(0) else { panic!("a fill afresh") };
@@ -842,18 +848,17 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
     let refused = |answer: ObjectRef| {
         let (reg, _server_end, file) = {
             let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-            let k = ObjectRef::new(k);
+            let k = Ref::new(k);
             (
-                ObjectRef::new(UserspaceServerReg::try_new(k).unwrap()),
+                Ref::new(UserspaceServerReg::try_new(k).unwrap()),
                 ObjectRef::new(s),
-                ObjectRef::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap()),
+                Ref::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap()),
             )
         };
-        // SAFETY: `file` pins the `FileObject`.
-        let fo = unsafe { &*(file.as_ptr() as *const FileObject) };
+        let fo: &FileObject = &file;
         let Fault::Fill(frame, po) = fo.reserve_fault(0) else { panic!("a fill") };
         // SAFETY: `reg` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin_fill(reg.as_ptr(), &po, &file, frame, 0) }.unwrap();
+        let id = unsafe { UserspaceServerReg::begin_fill(reg.as_object().as_ptr(), &po, &file, frame, 0) }.unwrap();
         let mut reply = StoredMsg::zeroed();
         build_read_range_request(&mut reply.payload, 0, PAGE_SIZE as u32, b"f").unwrap();
         reply.payload[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8].copy_from_slice(&id.to_le_bytes());

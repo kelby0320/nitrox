@@ -28,12 +28,12 @@
 
 use core::cell::UnsafeCell;
 
-use crate::libkern::handle::{KObjectType, Rights};
+use crate::libkern::handle::Rights;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::PhysAddr;
-use crate::object::header::{Header, Shared, kobject};
-use crate::object::{FileObject, Forgotten, ObjectRef};
+use crate::object::header::{Header, Ref, Shared, kobject};
+use crate::object::{FileObject, Forgotten, IpcChannel, ObjectRef};
 
 /// Largest lookup suffix a [`PendingLookup`] stores inline (no allocation under `SCHED`). A
 /// longer one keeps its true `suffix_len` but a truncated buffer: harmless for an eager
@@ -118,7 +118,7 @@ pub struct PendingFill {
     /// The fill's `PendingOperation` (the faulting thread blocks on it).
     pub(crate) po: ObjectRef,
     /// The `FileObject` being filled (pins it; the reply marks its page ready).
-    pub(crate) file_obj: ObjectRef,
+    pub(crate) file_obj: Ref<FileObject>,
     /// The cache frame to copy the replied bytes into.
     pub(crate) frame: PhysAddr,
     /// The page index within the file.
@@ -132,7 +132,7 @@ pub const US_PENDING_MAX: usize = 8;
 
 struct Inner {
     /// The kernel's IPC endpoint; its peer is the endpoint the server services.
-    endpoint: ObjectRef,
+    endpoint: Ref<IpcChannel>,
     /// Outstanding forwarded lookups, by `request_id`; a free slot is `None`.
     pending: [Option<PendingLookup>; US_PENDING_MAX],
     /// Outstanding forwarded fills; separate from `pending`, routed by reply op.
@@ -146,7 +146,7 @@ struct CachedFile {
     id: u64,
     /// The object, **weakly**: a lookup must `try_acquire` it. The object's `Drop` takes its
     /// entry out, by address, so an entry never outlives the memory it names.
-    obj: *mut (),
+    obj: *mut FileObject,
     /// **Its server forgot it with I/O in flight** (`File::Forget`): the entry stays so a second
     /// `Forget` finds the object and waits on the first one's answer. No resolve or sync sees
     /// it, and it goes with the object.
@@ -189,8 +189,7 @@ impl UserspaceServerReg {
     /// Allocate a registration owning `endpoint` (the kernel's IPC endpoint), refcount one, with
     /// empty pending tables. The caller installs the back-pointer from `endpoint` to this
     /// object (under `SCHED`) and binds it as a `UserspaceServer` target.
-    pub fn try_new(endpoint: ObjectRef) -> Result<KBox<Self>, AllocError> {
-        assert_eq!(endpoint.object_type(), KObjectType::IpcChannel, "UserspaceServerReg::try_new");
+    pub fn try_new(endpoint: Ref<IpcChannel>) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
@@ -210,13 +209,12 @@ impl UserspaceServerReg {
     /// a new reference, `obj` left for the caller to drop outside this lock; otherwise `obj` is
     /// entered under `id` (replacing a mid-teardown entry) and `Ok(None)` returned. `Err` only if
     /// the index cannot grow. A forgotten entry is passed by: its file is freed or about to be.
-    pub fn cache_get_or_insert(&self, id: u64, obj: &ObjectRef) -> Result<Option<ObjectRef>, AllocError> {
-        assert_eq!(obj.object_type(), KObjectType::FileObject, "cache_get_or_insert");
+    pub fn cache_get_or_insert(&self, id: u64, obj: &Ref<FileObject>) -> Result<Option<Ref<FileObject>>, AllocError> {
         let mut g = self.files.lock();
         if let Some(e) = g.iter_mut().find(|e| e.id == id && !e.forgotten) {
             // SAFETY: the entry's object is live — its `Drop` removes the entry under this
             // lock before its memory goes, so while the lock is held the pointer is readable.
-            if let Some(existing) = unsafe { ObjectRef::try_acquire(e.obj) } {
+            if let Some(existing) = unsafe { Ref::try_acquire(e.obj) } {
                 return Ok(Some(existing));
             }
             // Mid-teardown (refcount zero): its `Drop` will look for its own address, which
@@ -246,7 +244,7 @@ impl UserspaceServerReg {
                 return Forgotten::Now;
             };
             // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
-            match unsafe { ObjectRef::try_acquire(g[i].obj) } {
+            match unsafe { Ref::try_acquire(g[i].obj) } {
                 Some(obj) => {
                     g[i].forgotten = true;
                     obj
@@ -259,9 +257,7 @@ impl UserspaceServerReg {
             }
         };
         // Outside the files lock: the object's own lock ranks below it.
-        // SAFETY: `obj` pins a live `FileObject`.
-        let fo: &FileObject = unsafe { &*(obj.as_ptr() as *const FileObject) };
-        let outcome = fo.forget(answer);
+        let outcome = obj.forget(answer);
         if matches!(outcome, Forgotten::Now) {
             self.cache_forget_object(obj.as_ptr());
         }
@@ -271,7 +267,7 @@ impl UserspaceServerReg {
     }
 
     /// Take the entry naming `obj` out of the cache, if one does — a `FileObject`'s `Drop`.
-    pub fn cache_forget_object(&self, obj: *mut ()) {
+    pub fn cache_forget_object(&self, obj: *mut FileObject) {
         let mut g = self.files.lock();
         if let Some(i) = g.iter().position(|e| e.obj == obj) {
             g.remove(i);
@@ -281,13 +277,13 @@ impl UserspaceServerReg {
     /// Every live cached object, each a new reference the caller drops — outside this lock,
     /// which it is by the time this returns. Forgotten ones are left out: nothing of theirs is
     /// written again. `Err` if the list cannot be built.
-    pub fn cache_objects(&self) -> Result<KVec<ObjectRef>, AllocError> {
+    pub fn cache_objects(&self) -> Result<KVec<Ref<FileObject>>, AllocError> {
         let mut out = KVec::new();
         let g = self.files.lock();
         out.try_reserve(g.len())?;
         for e in g.iter().filter(|e| !e.forgotten) {
             // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
-            if let Some(r) = unsafe { ObjectRef::try_acquire(e.obj) } {
+            if let Some(r) = unsafe { Ref::try_acquire(e.obj) } {
                 // `try_reserve` above guarantees this push does not allocate.
                 let _ = out.try_push(r);
             }
@@ -349,7 +345,7 @@ impl UserspaceServerReg {
     /// See the accessor contract above.
     pub(crate) unsafe fn endpoint_ptr(reg: *mut ()) -> *mut () {
         // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(reg) }.endpoint.as_ptr()
+        unsafe { Self::inner(reg) }.endpoint.as_object().as_ptr()
     }
 
     /// A plain lookup's [`begin_forward`](Self::begin_forward), the tests' shorthand.
@@ -413,7 +409,7 @@ impl UserspaceServerReg {
     pub(crate) unsafe fn begin_fill(
         reg: *mut (),
         po: &ObjectRef,
-        file_obj: &ObjectRef,
+        file_obj: &Ref<FileObject>,
         frame: PhysAddr,
         index: usize,
     ) -> Option<u64> {
@@ -506,10 +502,10 @@ mod tests {
     use crate::object::header::test_probe;
     use crate::object::{IpcChannel, PendingOperation};
 
-    /// A live `IpcChannel` endpoint adopted into an `ObjectRef`; its peer is dropped at once.
-    fn endpoint() -> ObjectRef {
+    /// A live `IpcChannel` endpoint adopted into a `Ref`; its peer is dropped at once.
+    fn endpoint() -> Ref<IpcChannel> {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        let a_ref = ObjectRef::new(a);
+        let a_ref = Ref::new(a);
         drop(ObjectRef::new(b));
         a_ref
     }
@@ -531,7 +527,7 @@ mod tests {
     fn dropping_a_registration_clears_its_endpoints_back_pointer() {
         init_global_heap();
         let ep_ref = endpoint();
-        let ep = ep_ref.as_ptr();
+        let ep = ep_ref.as_object().as_ptr();
 
         // Hold the endpoint independently of the registration — this is what a server
         // handle or a parked waiter does, and it is the case that used to dangle.
@@ -566,9 +562,9 @@ mod tests {
     fn a_reply_holds_the_registration_it_found() {
         init_global_heap();
         let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-        let k_ref = ObjectRef::new(k);
+        let k_ref = Ref::new(k);
         let s_ref = ObjectRef::new(s);
-        let k_ptr = k_ref.as_ptr();
+        let k_ptr = k_ref.as_object().as_ptr();
         let r = UserspaceServerReg::try_new(k_ref).unwrap();
         let binding = ObjectRef::new(r);
         // SAFETY: `k_ptr` is the endpoint the registration holds.
@@ -581,7 +577,7 @@ mod tests {
         drop(binding);
         assert_eq!(test_probe::userspace_server_reg_destroys(), destroyed, "freed under the reply");
         // SAFETY: `reply` pins the registration.
-        assert!(unsafe { crate::sched::us_forward_take_pending(reply.as_ptr(), 1) }.is_none());
+        assert!(unsafe { crate::sched::us_forward_take_pending(reply.as_object().as_ptr(), 1) }.is_none());
 
         drop(reply);
         assert_eq!(test_probe::userspace_server_reg_destroys(), destroyed + 1);
@@ -597,7 +593,7 @@ mod tests {
     fn a_dying_registration_leaves_a_successors_back_pointer_alone() {
         init_global_heap();
         let ep_ref = endpoint();
-        let ep = ep_ref.as_ptr();
+        let ep = ep_ref.as_object().as_ptr();
         // SAFETY: `ep` is live; the bump balances the adopted ref.
         let keepalive = unsafe {
             (*(ep as *const crate::object::header::KObjectHeader)).bump();
@@ -721,11 +717,11 @@ mod tests {
         drop(r);
     }
 
-    /// A `FileObject` adopted into an `ObjectRef` (the form a `PendingFill` holds).
-    fn file_obj() -> ObjectRef {
-        use crate::object::{FileObject, Producer};
+    /// A `FileObject` adopted into a `Ref` (the form a `PendingFill` holds).
+    fn file_obj() -> Ref<FileObject> {
+        use crate::object::Producer;
         let f = FileObject::try_new(4096, Producer::Stub { base: 0 }).unwrap();
-        ObjectRef::new(f)
+        Ref::new(f)
     }
 
     #[test]

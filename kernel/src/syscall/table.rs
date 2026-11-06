@@ -609,12 +609,8 @@ fn round_up_page(n: u64) -> u64 {
     n.saturating_add(PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1)
 }
 
-fn current_address_space(proc_ref: &ObjectRef) -> Option<&AddressSpace> {
-    assert_eq!(proc_ref.object_type(), KObjectType::Process, "current_address_space");
-    // SAFETY: `proc_ref` references a live `Process`, its type just checked, pinned by the current
-    // user thread for the syscall; the returned borrow is tied to `proc_ref`'s lifetime.
-    let proc: &Process = unsafe { &*(proc_ref.as_ptr() as *const Process) };
-    proc.address_space()
+fn current_address_space(proc_ref: &Ref<Process>) -> Option<&AddressSpace> {
+    proc_ref.address_space()
 }
 
 /// `sys_memory_create(size, flags)` — a zero-filled `MemoryObject` of `size` bytes (page-rounded)
@@ -910,9 +906,7 @@ pub fn sys_ns_derive(ns_h: u64) -> SysResult {
 /// else [`KError::NoAccess`]. Checked alongside, not instead of, per-handle `Rights`.
 fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
     let proc = crate::sched::current_process().ok_or(KError::KernelError)?;
-    // SAFETY: `proc` pins a live `Process`; read its immutable syscap set.
-    let held = unsafe { &*(proc.as_ptr() as *const Process) }.syscaps();
-    if held.contains(cap) { Ok(()) } else { Err(KError::NoAccess) }
+    if proc.syscaps().contains(cap) { Ok(()) } else { Err(KError::NoAccess) }
 }
 
 /// Whether a handle carrying `rights` may be bound as a **direct handle**: only one that may
@@ -962,12 +956,12 @@ pub fn sys_ns_bind(
 
     // An `IpcChannel` binds as a **Userspace Server** (the kernel adopts the endpoint); any
     // other type binds as a direct handle (`docs/architecture/namespace-and-resource-servers.md`).
-    if res_ok.object.object_type() == KObjectType::IpcChannel {
+    if let Ok(endpoint) = res_ok.object.clone().downcast::<IpcChannel>() {
         // Bind-mount semantics: an endpoint that already backs a registration is *shared*; a
         // rival would clobber the endpoint→reg reply-routing back-pointer and hijack replies.
-        let reg_box = UserspaceServerReg::try_new(res_ok.object.clone()).map_err(|_| KError::OutOfMemory)?;
+        let reg_box = UserspaceServerReg::try_new(endpoint).map_err(|_| KError::OutOfMemory)?;
         let reg_ref = ObjectRef::new(reg_box);
-        // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+        // SAFETY: `res_ok.object` is the live `IpcChannel` downcast above, held across the call.
         let reg = match unsafe { crate::sched::us_server_attach(res_ok.object.as_ptr(), &reg_ref) } {
             Some(existing) => existing,
             None => reg_ref,
@@ -1629,7 +1623,7 @@ fn commit_all(claims: &mut [Option<Claim<'_>>]) {
 /// `OBJECT_KIND_FILE` reply builds a lazy [`FileObject`] pointed back at this server; an error
 /// completes the PO with a `KError`. An uncorrelated (duplicate / stale) reply is dropped.
 fn complete_resolve_reply(
-    reg: &ObjectRef,
+    reg: &Ref<UserspaceServerReg>,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     payload_len: usize,
@@ -1642,7 +1636,7 @@ fn complete_resolve_reply(
     let reply = parse_reply(&bounce.payload[..payload_len]);
     let pl = match reply {
         // SAFETY: `reg` pins the registration the send arrived through.
-        Some(r) => unsafe { crate::sched::us_forward_take_pending(reg.as_ptr(), r.request_id) },
+        Some(r) => unsafe { crate::sched::us_forward_take_pending(reg.as_object().as_ptr(), r.request_id) },
         None => None,
     };
     let Some(pl) = pl else {
@@ -1702,17 +1696,14 @@ fn complete_resolve_reply(
 /// on a syscall thread). `0` on success, else a `KError`.
 fn sys_file_sync(handle: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
-    let ok = lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)?;
-    write_back(&ok.object)?;
+    let file = lookup_as::<FileObject>(handle, pid, Rights::MAP_WRITE)?;
+    write_back(&file)?;
     Ok(0)
 }
 
 /// Write one file's pages back, tell its server, and unpin it if no writable mapping appeared.
-fn write_back(file_obj: &ObjectRef) -> Result<(), KError> {
-    use crate::object::FileObject;
-    assert_eq!(file_obj.object_type(), KObjectType::FileObject, "write_back");
-    // SAFETY: `file_obj` pins a live `FileObject`, its type just checked.
-    let mark = unsafe { &*(file_obj.as_ptr() as *const FileObject) }.clean_mark();
+fn write_back(file_obj: &Ref<FileObject>) -> Result<(), KError> {
+    let mark = file_obj.clean_mark();
     match FileObject::writeback(file_obj) {
         crate::object::file_object::WriteBack::Written => {}
         crate::object::file_object::WriteBack::Failed => return Err(KError::IoError),
@@ -1756,9 +1747,7 @@ fn sys_ns_sync(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
     let mut written = 0isize;
     let mut result = Ok(());
     for f in files.iter() {
-        // SAFETY: `f` pins a live `FileObject`.
-        let fo: &crate::object::FileObject = unsafe { &*(f.as_ptr() as *const crate::object::FileObject) };
-        if !fo.is_dirty() {
+        if !f.is_dirty() {
             continue;
         }
         match write_back(f) {
@@ -1828,7 +1817,7 @@ fn sys_power(sc_h: u64, op: u64) -> SysResult {
 /// Send `File::Touch` for a just-flushed Model A file so its server can stamp `mtime`. Stamps
 /// on **sync**, not on the write (no per-page dirty bit, `TODO(page-dirty-tracking)`). Silent
 /// on failure: the data is durable, and a dropped touch costs only a stale `mtime`.
-fn notify_file_touched(file_obj: &ObjectRef) {
+fn notify_file_touched(file_obj: &Ref<FileObject>) {
     use crate::libkern::KBox;
     use crate::object::FileObject;
 
@@ -1847,7 +1836,7 @@ fn notify_file_touched(file_obj: &ObjectRef) {
     msg.header.payload_len = body_len as u32;
     msg.header.handle_count = 0;
     // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
-    unsafe { crate::sched::us_forward_notify(reg.as_ptr(), &mut msg) };
+    unsafe { crate::sched::us_forward_notify(reg.as_object().as_ptr(), &mut msg) };
 }
 
 /// Build a lazy [`FileObject`] for an `OBJECT_KIND_FILE` resolve reply; returns what the lookup's
@@ -1855,7 +1844,7 @@ fn notify_file_touched(file_obj: &ObjectRef) {
 /// names the file by the lookup's stored suffix, so a page fault fills it via `File::ReadRange`.
 /// `TooLarge` if the suffix overran the inline buffer, `OutOfMemory` on allocation failure.
 fn build_and_install_file(
-    reg: &ObjectRef,
+    reg: &Ref<UserspaceServerReg>,
     pl: &crate::object::userspace_server::PendingLookup,
     content_len: u32,
 ) -> Resolved {
@@ -1876,7 +1865,7 @@ fn build_and_install_file(
         Ok(f) => f,
         Err(_) => return (KError::OutOfMemory as i32, None),
     };
-    let fref = ObjectRef::new(fobj);
+    let fref = Ref::new(fobj).erase();
     // `INSPECT` too, so a client can `sys_handle_stat` the lazy file for its size before mapping.
     (0, Some((fref, pl.requested | Rights::INSPECT)))
 }
@@ -1886,7 +1875,7 @@ fn build_and_install_file(
 /// the reply body, and construct a `FileObject` whose producer fills each page zero-copy from
 /// the device. Returns `(0, Some((file, rights)))` or `(kerror, None)`.
 fn build_and_install_file_blocks(
-    reg: &ObjectRef,
+    reg: &Ref<UserspaceServerReg>,
     pl: &crate::object::userspace_server::PendingLookup,
     content_len: u32,
     reply_msg: &[u8],
@@ -1934,7 +1923,7 @@ fn build_and_install_file_blocks(
         }
     };
     drop(reg_ref);
-    (0, Some((fref, rights)))
+    (0, Some((fref.erase(), rights)))
 }
 
 /// The deepest a lookup follows `SUBNAMESPACE` replies; the next one is `TooLarge`.
@@ -2059,16 +2048,16 @@ fn continued_dest<'o>(
     continued_path(dest, consumed, base, out)
 }
 
-/// A new Model A `FileObject` over `device`, adopted into an `ObjectRef`: size, block size, run
+/// A new Model A `FileObject` over `device`, adopted into a `Ref`: size, block size, run
 /// map, and identity (registration and file id; non-zero means cached under it).
 fn new_block_file(
     size: u32,
     device: Ref<DeviceNode>,
     block_size: u32,
-    reg: ObjectRef,
+    reg: Ref<UserspaceServerReg>,
     file_id: u64,
     runs: crate::libkern::KVec<crate::object::BlockRun>,
-) -> Result<ObjectRef, KError> {
+) -> Result<Ref<FileObject>, KError> {
     use crate::object::{FileObject, Producer};
     let fobj = FileObject::try_new_with_runs(
         size as usize,
@@ -2076,7 +2065,7 @@ fn new_block_file(
         runs,
     )
     .map_err(|_| KError::OutOfMemory)?;
-    Ok(ObjectRef::new(fobj))
+    Ok(Ref::new(fobj))
 }
 
 /// Close every handle a partial `sys_channel_recv` installed, so a copy-out fault or

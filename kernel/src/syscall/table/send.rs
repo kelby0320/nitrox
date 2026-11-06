@@ -80,13 +80,11 @@ pub(super) fn deliver(
 /// `PendingOperation` installed in the server's table, complete already if nothing was in
 /// flight, else when the last IRP ends; a second `Forget` meanwhile gets the same one. The
 /// server `sys_wait`s on it, so a `Forget` must be sent `Block`.
-fn answer_forget(reg: &ObjectRef, file_id: u64, pid: u32) -> SysResult {
-    use crate::object::{Forgotten, UserspaceServerReg};
+fn answer_forget(reg: &UserspaceServerReg, file_id: u64, pid: u32) -> SysResult {
+    use crate::object::Forgotten;
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     let answer = ObjectRef::new(po);
-    // SAFETY: `reg` pins the registration the send arrived through.
-    let r: &UserspaceServerReg = unsafe { &*(reg.as_ptr() as *const UserspaceServerReg) };
-    let wait_on = match r.forget_file(file_id, &answer) {
+    let wait_on = match reg.forget_file(file_id, &answer) {
         Forgotten::Later(po) => po,
         Forgotten::Now => {
             // SAFETY: `answer` is the `PendingOperation` this created.
@@ -112,7 +110,7 @@ fn answer_forget(reg: &ObjectRef, file_id: u64, pid: u32) -> SysResult {
 /// Runs in syscall context (no `SCHED` held), so the
 /// cross-context `allocate` and the drops are outside the lock.
 fn complete_forwarded_reply(
-    reg: &ObjectRef,
+    reg: &Ref<UserspaceServerReg>,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> SysResult {
