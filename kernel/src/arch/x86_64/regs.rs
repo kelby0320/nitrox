@@ -343,7 +343,8 @@ pub fn cli() {
 ///
 /// # Safety
 /// Ring-0 only. The IDT must be installed and a sane interrupt environment
-/// established before enabling delivery.
+/// established before enabling delivery, and the caller is in no section that masking protects
+/// (see `ArchCpu::interrupts_enable`).
 #[inline]
 pub unsafe fn sti() {
     // SAFETY: `sti` sets IF; ring-0 instruction. See `cli` re: `nomem` and `preserves_flags`.

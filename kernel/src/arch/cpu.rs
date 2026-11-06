@@ -98,7 +98,9 @@ pub trait ArchCpu {
     /// Unmask maskable interrupts. Used once at boot to arm preemption.
     ///
     /// # Safety
-    /// Ring-0 only; the IDT and a timer source must be live before enabling.
+    /// Ring-0 only; the IDT and a timer source must be live before enabling, and the caller is
+    /// in no section that masking protects: an `IrqSpinLock`'s hold, a context switch, or the
+    /// syscall return's window on the user stack.
     unsafe fn interrupts_enable();
 
     /// Restore a prior interrupt-enabled state captured by
@@ -106,7 +108,9 @@ pub trait ArchCpu {
     /// else leave masked.
     ///
     /// # Safety
-    /// Ring-0 only.
+    /// Ring-0 only; `prev` is what the `interrupts_disable` opening this section returned, and
+    /// the caller is in no inner section that masking protects, as for
+    /// [`interrupts_enable`](Self::interrupts_enable).
     unsafe fn interrupts_restore(prev: bool);
 
     /// Log what this processor is and which of the features the kernel depends on it has:

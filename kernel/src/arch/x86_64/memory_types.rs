@@ -161,7 +161,7 @@ impl ArchMemoryTypes for X86MemoryTypes {
         }
         use crate::arch::paging::ArchPaging;
         let root = super::paging::X86Paging::active_root();
-        // SAFETY: the active root is live and reachable through the HHDM.
+        // SAFETY: the active root is loaded on this CPU, which `attribute_index`'s contract covers.
         let index = unsafe { super::paging::X86Paging::attribute_index(root, crate::mm::VirtAddr::new(virt)) }?;
         // SAFETY: CPUID advertises the attribute table, so `IA32_PAT` is implemented.
         let pat = unsafe { regs::rdmsr(MSR_PAT) };

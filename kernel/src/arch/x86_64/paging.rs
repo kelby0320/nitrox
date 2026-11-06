@@ -440,7 +440,8 @@ impl ArchPaging for X86Paging {
         }
         pt.set(pt_index(virt), Pte::empty());
         // TODO: reclaim intermediate tables that are now empty —
-        // deferred (see docs/rationale/deferred-decisions.md).
+        // deferred (see docs/rationale/deferred-decisions.md). Reclaiming one breaks `translate`'s
+        // promise for a loaded root, which safe code walks: `of_mapping`, the fault diagnostics.
         Ok(entry.phys())
     }
 

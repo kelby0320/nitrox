@@ -98,9 +98,9 @@ pub enum UnmapError {
 ///
 /// Most methods are `unsafe`: they install, remove, or switch hardware
 /// address translations and mutate live MMU state the running kernel
-/// depends on. The read-only [`active_root`](ArchPaging::active_root) is the
-/// exception (a side-effect-free `CR3` read). The implementation for the
-/// active architecture is re-exported as `crate::arch::Paging`.
+/// depends on. The read-only [`active_root`](ArchPaging::active_root) and the two TLB
+/// flushes, which only make the CPU walk the tables again, are the exceptions. The
+/// implementation for the active architecture is re-exported as `crate::arch::Paging`.
 ///
 /// Neither [`map_page`](ArchPaging::map_page) nor
 /// [`unmap_page`](ArchPaging::unmap_page) flushes the TLB; the caller
@@ -209,7 +209,9 @@ pub trait ArchPaging {
     ///
     /// # Safety
     /// `root` must be the physical base of a valid top-level page table
-    /// reachable through the higher-half direct map.
+    /// reachable through the higher-half direct map, each table in its tree live for the walk.
+    /// A root loaded on a CPU is: its tables are freed only when its address space drops, after
+    /// no CPU has it loaded, as an unmap reclaims none.
     unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>;
 
     /// Which cache-attribute entry the mapping of `virt` in `root` selects, or `None` if it is
@@ -221,8 +223,7 @@ pub trait ArchPaging {
     /// machine, and a gate on a boot line proved to pass with the translation deleted.
     ///
     /// # Safety
-    /// `root` must be the physical base of a valid top-level page table reachable through the
-    /// higher-half direct map.
+    /// As [`translate`](Self::translate).
     unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8>;
 
     /// The physical base of the page table the current CPU is using (the
