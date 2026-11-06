@@ -69,10 +69,7 @@ pub enum Policy {
 pub trait ArchMemoryTypes {
     /// The type the firmware's configuration gives `phys`, or `None` where the CPU offers no
     /// such configuration (then every range is whatever the page tables say).
-    ///
-    /// # Safety
-    /// Ring 0. Reads architecture configuration registers; touches no memory.
-    unsafe fn at(phys: u64) -> Option<MemoryType>;
+    fn at(phys: u64) -> Option<MemoryType>;
 
     /// What the *mapping* of `virt` asks for, or `None` if it is not mapped.
     ///
@@ -80,10 +77,7 @@ pub trait ArchMemoryTypes {
     /// disagreeing is the problem this module exists to expose. What the hardware then does is
     /// the stronger of the two, except that a mapping asking for write-combining raises an
     /// uncacheable range — the one case where a page table wins, and the one the fix uses.
-    ///
-    /// # Safety
-    /// Ring 0. Walks the active page tables.
-    unsafe fn of_mapping(virt: u64) -> Option<MemoryType>;
+    fn of_mapping(virt: u64) -> Option<MemoryType>;
 
     /// Install the kernel's own cache-policy table on **this** CPU, and say what happened.
     ///
@@ -103,8 +97,5 @@ pub trait ArchMemoryTypes {
     /// Log the platform's cache-policy configuration, in that architecture's own terms — the
     /// one place the spelling is allowed to show, because a reader comparing this against the
     /// vendor's manual needs the vendor's names.
-    ///
-    /// # Safety
-    /// Ring 0, during boot, once the console exists.
-    unsafe fn log_configuration();
+    fn log_configuration();
 }

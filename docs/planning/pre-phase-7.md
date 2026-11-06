@@ -12,7 +12,7 @@ for what it left (the maintainer's call); Part I added 2026-10-26, a safety surv
 maintainer's call), its thirteen runs done 2026-10-26 and 2026-10-27 and triaged 2026-10-27, and
 Part J added for the kernel layers it plans (the maintainer's call); Part I's items marked fix all
 fixed 2026-11-01, and its Miri job built the same day; Part E detailed 2026-11-02; E.1 to E.5
-built by 2026-11-05; Part J detailed 2026-11-05.** Each later
+built by 2026-11-05; Part J detailed 2026-11-05, J.1 built 2026-11-06.** Each later
 part gets its detail pass when it is next. Ten parts, A–J, in the order below: Part I between D
 and E, and **Part J between Part E's two halves** (the maintainer's call, 2026-11-02). Part E is
 the syscall-surface consolidation, planned separately in
@@ -1015,7 +1015,9 @@ the surface's new kernel code, which wants P1 and P2 under it
 [`typed-layers.md`](typed-layers.md): fifteen sub-parts, a PR each, measured on `main` at PR
 #422's merge. P6 first, then P1, P2, P3, P4 and P5, all before E.6; a ratchet on the kernel's
 `unsafe`, `check-unsafe`, from the first. The pass found eleven items Part I had already taken part
-of, six premises that no longer hold, and two latent defects, kplat-d23 and sched-d16.
+of, six premises that no longer hold, and two latent defects, kplat-d23 and sched-d16. **Part J
+is done when the whole suite has run under Miri after J.15 and what it reports is triaged** (the
+maintainer's call, 2026-11-06).
 
 ## Part E — the syscall surface
 

@@ -37841,3 +37841,40 @@ Decided in the pass, for the maintainer's eye:
   keeps its vector, a routed entry masked; and a full pool answers `Err` where it asserts.
 - **A guard that defers drops takes a bag its site sizes**, as `Orphans<N>` is today, rather than one
   carried by every acquisition of SCHED; no bag crosses a switch.
+
+## 2026-11-06 — Before Phase 7, J.1: the `unsafe` that needs none, and `check-unsafe`
+
+Part J's first sub-part, `typed-layers.md` § J.1, built on `pre-phase-7/part-j1-ring0`.
+
+- **`cargo xtask check-unsafe` holds each kernel module's `unsafe`**, every kind that makes an
+  `unsafe` claim: blocks, `unsafe fn`s and `unsafe impl`s, `#[unsafe(..)]` attributes, `unsafe
+  extern` blocks and `static mut`s. They are counted by `unsafe-inventory`'s own scan with test
+  code left out, a module being `x.rs` and `x/` together, against `tools/xtask/unsafe-counts.toml`,
+  in CI after `check-syscalls`. A rise fails, as do a stale entry and a module with new `unsafe`
+  and no entry; `--update` lowers and removes and never raises, so **a raise is by hand, in the
+  commit that adds the `unsafe`, whose message says why**, the justification `kernel/CLAUDE.md`
+  asked for and nothing held. It started at 1,113 blocks and 348 `unsafe fn`s in 28 modules, with
+  52 `unsafe impl`s, 25 attributes, one `extern` block and 11 `static mut`s. The plan named blocks
+  and `unsafe fn`s; the review of J.1 showed a new `unsafe impl Send` passed unheld, so it holds
+  the rest too.
+- **Eighteen `unsafe fn`s whose whole contract was "ring 0" went** (kplat-o8): the two TLB
+  flushes, `invlpg` and `tlb::invalidate_local` under them, `cli` and `interrupts_disable`,
+  `wbinvd`, and `MemoryTypes::{at, of_mapping, log_configuration}` are safe, and `ArchCpu::halt`,
+  which nothing called, is gone. **A flush is safe because an invalidation only makes the CPU walk
+  the tables again**, and the CR3 reload writes back the root it read, a thread's root never
+  changing and no PCID being used. **Masking is safe**: it can stall preemption, never break
+  memory. `sti`, `interrupts_enable`, `interrupts_restore`, `idle_halt` and `install_policy` stay
+  `unsafe`, as each can open the IF=0 window around a switch or a lock's mask, and `idle_halt`'s
+  contract now says so. The kernel stands at 1,094 blocks and 330 `unsafe fn`s.
+- **The control is the compiler both ways**: the debug and release kernels' `.text` are
+  byte-identical before and after, so no machine code changed.
+
+## 2026-11-06 — Miri after each phase of work, not each part
+
+**The whole suite runs under Miri at the end of a phase of work, and the phase is not done until
+what it reports is triaged** (the maintainer's call). Part J is the first: one run after J.15. A
+part in between runs under Miri only the tests its own controls need, by name, where the control
+is a report only Miri can make. This narrows what Part J's detail pass wrote, that every sub-part
+runs `cargo xtask miri kernel`: about fifty minutes each, and against 2026-10-26's call that Miri
+runs on its own and not per PR. The CI job, `miri.yml`, runs as it did, on its schedule and by
+hand.

@@ -286,16 +286,11 @@ pub unsafe fn write_cr3(value: u64) {
 
 /// Invalidate the TLB entry for the page containing linear address
 /// `virt` on the current CPU.
-///
-/// # Safety
-/// `invlpg` is valid only in ring 0, which is the only ring the kernel
-/// runs in. The caller should already have updated the page tables so
-/// the invalidation reflects a real change.
 #[inline]
 // Under `cfg(test)` the body is a no-op stub and every caller is `#[cfg(not(test))]`,
 // leaving it callerless.
 #[cfg_attr(test, allow(dead_code, reason = "a host build elides its only caller, which runs in ring 0"))]
-pub unsafe fn invlpg(virt: u64) {
+pub fn invlpg(virt: u64) {
     // Host unit tests run in ring 3, where `invlpg` would `#GP`; a test build elides it so the
     // demand-paging fault-in path, which must flush after installing a PTE, runs host-side.
     #[cfg(test)]
@@ -333,12 +328,10 @@ pub fn debug_assert_pinned(what: &str) {
 }
 
 /// Clear the interrupt flag (`cli`), masking maskable interrupts on this CPU.
-///
-/// # Safety
-/// Ring-0 only. Leaving interrupts masked indefinitely stalls preemption;
+/// Leaving interrupts masked indefinitely stalls preemption;
 /// callers must bound the masked window (see [`crate::libkern::IrqSpinLock`]).
 #[inline]
-pub unsafe fn cli() {
+pub fn cli() {
     // SAFETY: `cli` clears IF; ring-0 instruction. Not `nomem`: a memory access must not move
     // out of the section it opens. IF is not one of the arithmetic flags `preserves_flags` tracks.
     unsafe {
@@ -350,7 +343,8 @@ pub unsafe fn cli() {
 ///
 /// # Safety
 /// Ring-0 only. The IDT must be installed and a sane interrupt environment
-/// established before enabling delivery.
+/// established before enabling delivery, and the caller is in no section that masking protects
+/// (see `ArchCpu::interrupts_enable`).
 #[inline]
 pub unsafe fn sti() {
     // SAFETY: `sti` sets IF; ring-0 instruction. See `cli` re: `nomem` and `preserves_flags`.
@@ -449,11 +443,9 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
 
 /// Write back and invalidate every cache on this CPU (`wbinvd`). Expensive: changing a
 /// cache-policy register requires the caches to hold nothing the old policy described.
-///
-/// # Safety
-/// Ring 0. Discards nothing (everything dirty is written back first), but it stalls this CPU for
+/// Discards nothing (everything dirty is written back first), but it stalls this CPU for
 /// as long as the caches take, so it belongs in boot paths and not beside ordinary work.
-pub unsafe fn wbinvd() {
+pub fn wbinvd() {
     // SAFETY: `wbinvd` is a ring-0 instruction with no operands. It touches no normal memory the
     // compiler must know about — the write-back is architectural, not a store it can reorder —
     // but `nomem` would let the compiler keep a value in a register across it, so it is omitted.

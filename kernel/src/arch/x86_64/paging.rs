@@ -440,30 +440,26 @@ impl ArchPaging for X86Paging {
         }
         pt.set(pt_index(virt), Pte::empty());
         // TODO: reclaim intermediate tables that are now empty —
-        // deferred (see docs/rationale/deferred-decisions.md).
+        // deferred (see docs/rationale/deferred-decisions.md). Reclaiming one breaks `translate`'s
+        // promise for a loaded root, which safe code walks: `of_mapping`, the fault diagnostics.
         Ok(entry.phys())
     }
 
     #[cfg(not(test))]
-    unsafe fn flush_tlb_page(virt: VirtAddr) {
-        // SAFETY: `invlpg` is a ring-0 instruction — the only ring the
-        // kernel runs in. The caller owns the page-table change this
-        // invalidation reflects.
-        unsafe {
-            regs::invlpg(virt.as_u64());
-        }
+    fn flush_tlb_page(virt: VirtAddr) {
+        regs::invlpg(virt.as_u64());
     }
 
     // Host tests run in ring 3, where `invlpg` `#GP`s; they exercise the page-table memory
     // edits, and there is no TLB to flush under `cargo test`.
     #[cfg(test)]
-    unsafe fn flush_tlb_page(_virt: VirtAddr) {}
+    fn flush_tlb_page(_virt: VirtAddr) {}
 
     #[cfg(not(test))]
-    unsafe fn flush_tlb_all() {
-        // SAFETY: reloading CR3 with the value it already holds is sound
-        // in ring 0; it leaves the active address space unchanged while
-        // dropping every non-global TLB entry.
+    fn flush_tlb_all() {
+        // SAFETY: CR3 is written with the value just read, which is this thread's root however
+        // the thread moves between the two: a thread's root never changes, and no PCID bits are
+        // used. The active address space is unchanged; every non-global TLB entry is dropped.
         unsafe {
             regs::write_cr3(regs::read_cr3());
         }
@@ -471,7 +467,7 @@ impl ArchPaging for X86Paging {
 
     // Host-test stub: `mov cr3` is privileged (see `flush_tlb_page`).
     #[cfg(test)]
-    unsafe fn flush_tlb_all() {}
+    fn flush_tlb_all() {}
 
     unsafe fn set_page_table(root: PhysAddr) {
         // SAFETY: forwarded to the caller — per `ArchPaging::set_page_table`

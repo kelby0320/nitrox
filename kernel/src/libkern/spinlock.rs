@@ -139,9 +139,7 @@ mod irq_backend {
 
     #[inline]
     pub(super) fn disable() -> bool {
-        // SAFETY: ring-0; the IrqSpinLock contract bounds the masked window
-        // (the lock is held only briefly and never across a blocking wait).
-        unsafe { Cpu::interrupts_disable() }
+        Cpu::interrupts_disable()
     }
 
     #[inline]

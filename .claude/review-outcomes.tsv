@@ -557,3 +557,11 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-06	423	9f2f4510	12	error-paths	optional	unverified	fixed	daa7435d	install_intx routes and unmasks before AHCI's publish can decline; J.13 keeps a routed vector, masks the entry, control on the IOAPIC register fake
 2026-11-06	423	9f2f4510	13	rules-and-docs	optional	unverified	refuted		the test finds 8 blocks (context.rs and syscall.rs too); with halt's removed it passes; cut to 3 it fails 'found 3'
 2026-11-06	423	9f2f4510	14	rules-and-docs	optional	demonstrated	fixed	daa7435d	the tenth was kplat-o3, unnamed; sched-o8 makes eleven; both named, decision log and pre-phase-7 agree
+2026-11-06	424	431e4cc6	1	logic+error-paths	worth-fixing	demonstrated	fixed	25a3ec80	a test-only module counts zero; the review's two shapes as a test, failing with tally's refusal put back
+2026-11-06	424	431e4cc6	2	architecture	worth-fixing	demonstrated	fixed	93bac303	sweep: the fault diagnostics in idt.rs walk the loaded root from safe code too; translate's contract states the rule once, the reclaim TODO and deferral name the walkers; doc only
+2026-11-06	424	431e4cc6	3	logic+error-paths	optional	demonstrated	fixed	25a3ec80	braceless items end outside brackets, block comments blanked; test fails with either undone; no count in the tree changes, check-syscalls' neither
+2026-11-06	424	431e4cc6	4	logic+architecture	optional	demonstrated	fixed	25a3ec80	holds impls, #[unsafe(..)] attrs, extern blocks, static muts too; the review's tlb.rs probe now fails; a fn-pointer type not counted
+2026-11-06	424	431e4cc6	5	architecture	optional	demonstrated	fixed	93bac303	enable/restore/sti say the caller is in no masked section; ArchPaging doc names the flushes; sweep: every other ring-0 contract carries a further condition
+2026-11-06	424	431e4cc6	6	tests	optional	demonstrated	fixed	25a3ec80	a_listing_leaves_out_what_counts_zero fails without measured's filter
+2026-11-06	424	431e4cc6	7	tests	optional	unverified	fixed	25a3ec80	flow is a pure run(): --update writes the lowered table and still fails a rise, --list needs no table; git ls-files declined: as check-syscalls and check-size, CI sees a committed file
+2026-11-06	424	431e4cc6	8	rules-and-docs	optional	unverified	refuted		regs::cli's doc says callers must bound the masked window (regs.rs:331-332), interrupts_disable's that the caller bounds it

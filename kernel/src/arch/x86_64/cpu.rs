@@ -60,13 +60,9 @@ impl ArchCpu for X86Cpu {
         // with IF=1). A tick inside the send loop can deschedule this thread
         // (`on_timer_tick` calls `switch_to_next` from the handler), leaving `STOPPING` latched
         // with no NMI sent; resuming on another CPU, `me` below would name the old one and
-        // the loop would NMI its own core. Masking makes the sequence uninterruptible.
-        //
-        // SAFETY: ring 0. The caller goes on to halt or reset, so nothing later depends on IF
-        // being restored.
-        unsafe {
-            <Self as ArchCpu>::interrupts_disable();
-        }
+        // the loop would NMI its own core. Masking makes the sequence uninterruptible, and
+        // nothing restores IF: the caller halts or resets.
+        <Self as ArchCpu>::interrupts_disable();
 
         // Only if this CPU can send: an AP that has not run `ap_cpu_init` has not entered
         // x2APIC mode, and the ICR write there `#GP`s inside the panic path. Early boot is
@@ -115,18 +111,11 @@ impl ArchCpu for X86Cpu {
         edx & CPUID_1_EDX_APIC != 0
     }
 
-    unsafe fn halt() {
-        // SAFETY: `hlt` is a ring-0 instruction; it parks the CPU until the next interrupt,
-        // whose handler may change memory, hence not `nomem`. The caller owns the
-        // interrupt-flag state that governs wake-up (see the trait contract).
-        unsafe { asm!("hlt", options(nostack, preserves_flags)) };
-    }
-
     unsafe fn idle_halt() {
         // SAFETY: ring-0. `sti; hlt`: `sti`'s one-instruction interrupt shadow defers delivery
         // until after the `hlt` retires, so the CPU parks with IF=1 yet cannot miss a wake
-        // racing the enable. Unlike bare `halt` it does not trust the caller's IF: a CPU that
-        // parked with IF=0 would sleep forever.
+        // racing the enable. It does not trust the caller's IF: a CPU that parked with IF=0
+        // would sleep forever. Not `nomem`: the waking interrupt's handler may change memory.
         unsafe { asm!("sti; hlt", options(nostack, preserves_flags)) };
     }
 
@@ -134,10 +123,9 @@ impl ArchCpu for X86Cpu {
         regs::read_rflags() & RFLAGS_IF != 0
     }
 
-    unsafe fn interrupts_disable() -> bool {
+    fn interrupts_disable() -> bool {
         let was = Self::interrupts_enabled();
-        // SAFETY: ring-0; the caller bounds the masked window (IrqSpinLock).
-        unsafe { regs::cli() };
+        regs::cli();
         was
     }
 
@@ -157,8 +145,7 @@ impl ArchCpu for X86Cpu {
             // SAFETY: ring-0; restoring a previously-enabled interrupt state.
             unsafe { regs::sti() };
         } else {
-            // SAFETY: ring-0; restoring a previously-masked interrupt state.
-            unsafe { regs::cli() };
+            regs::cli();
         }
     }
 

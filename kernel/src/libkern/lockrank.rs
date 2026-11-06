@@ -249,8 +249,7 @@ mod tracker {
     /// write then clobbers the depth with a stale value, corrupting the stack.
     #[inline]
     fn mask() -> bool {
-        // SAFETY: ring-0; the window is a handful of instructions, restored below.
-        unsafe { Cpu::interrupts_disable() }
+        Cpu::interrupts_disable()
     }
 
     #[inline]

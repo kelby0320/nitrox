@@ -440,6 +440,7 @@ fn main() -> ExitCode {
         Some("check-comments") => comments::cmd_check_comments(&qargs),
         Some("check-moves") => moves::cmd_check_moves(&qargs),
         Some("check-syscalls") => syscalls::cmd_check_syscalls(&qargs),
+        Some("check-unsafe") => unsafe_counts::cmd_check_unsafe(&qargs),
         Some("check-size") => size::cmd_check_size(&qargs),
         Some("unsafe-inventory") => unsafe_inventory::cmd_unsafe_inventory(&qargs),
         Some("check-images") => cmd_check_images(),

@@ -108,17 +108,20 @@ bodies it leaves as they are. Code E.7 moves into a resolve's operations moves t
 
 **A ratchet on the kernel's `unsafe`, as `check-syscalls` is on userspace's raw calls** (decided in
 the pass, for the maintainer's eye): `cargo xtask check-unsafe`, in CI from J.1, counts each kernel
-subsystem's `unsafe` blocks and `unsafe fn`s with `unsafe-inventory`'s scan against
-`tools/xtask/unsafe-counts.toml`, whose entries J.1 writes from the scan's groups at its base, not
-from the table above, and fails a rise, and a stale entry as `check-size` does. Each sub-part
-lowers its entries; new kernel code in E.6 to E.11 that needs `unsafe` raises its entry in the
-commit that says why. kernel/CLAUDE.md asks for that justification and nothing holds it.
+subsystem's `unsafe` of every kind, blocks and `unsafe fn`s first, with `unsafe-inventory`'s scan
+against `tools/xtask/unsafe-counts.toml`, whose entries J.1 writes from the scan's groups at its
+base, not from the table above, and fails a rise, and a stale entry as `check-size` does. Each
+sub-part lowers its entries; new kernel code in E.6 to E.11 that needs `unsafe` raises its entry in
+the commit that says why. kernel/CLAUDE.md asks for that justification and nothing holds it.
 
 ### How each is held
 
-Every sub-part: `/pr-review`; the host tests, and `cargo xtask miri kernel`, as most of what these
-layers type is reached by host tests that Miri runs; and the KVM gates its files reach, `test-qemu`
-at least, on the debug kernel every gate boots, so a new debug assertion runs on all of them. A
+Every sub-part: `/pr-review`; the host tests; and the KVM gates its files reach, `test-qemu` at
+least, on the debug kernel every gate boots, so a new debug assertion runs on all of them. **The
+whole suite runs under Miri once, after J.15, and Part J is not done until what it reports is
+triaged** (the maintainer's call, 2026-11-06: Miri after each phase of work, not each part). A
+sub-part runs under Miri only the tests its own controls need, by name, where the control is a
+report only Miri can make, as J.6's, J.7's and J.8's are. A
 defect's control fails without its fix, and an opportunity's is the tests that already hold the
 code, run before and after. Each ticks its items in `safety-survey.md` with the commit that
 finished them, and updates the `architecture/` docs it outdates.
@@ -137,6 +140,12 @@ CI denies `unnecessary_safety_comment` and `unnecessary_safety_doc`, so every `#
 call-site `SAFETY` on these goes in the same change; `memory-management.md` says the flushes are all
 `unsafe`. Control: the compiler both ways, and `kernel_asm.rs`'s floor of five asm blocks, which
 the seven left once `halt` goes still meet. With `check-unsafe` and its table. Author.
+
+**Built 2026-11-06.** `check-unsafe` is in CI, its table starting at 1,113 `unsafe` blocks and 348
+`unsafe fn`s in 28 modules, and holding `unsafe impl`s, `#[unsafe(..)]` attributes, `extern` blocks
+and `static mut`s as well. Eighteen `unsafe fn`s went, the ten named, `tlb::invalidate_local`
+under the flushes, and `halt`, leaving 1,094 blocks and 330 `unsafe fn`s. The kernel's `.text`,
+debug and release, is byte-identical before and after.
 
 ### J.2 The typed kernel object (kobj-o1, with kmem-o1, drv-o2 and kplat-o5)
 

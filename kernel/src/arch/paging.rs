@@ -98,9 +98,9 @@ pub enum UnmapError {
 ///
 /// Most methods are `unsafe`: they install, remove, or switch hardware
 /// address translations and mutate live MMU state the running kernel
-/// depends on. The read-only [`active_root`](ArchPaging::active_root) is the
-/// exception (a side-effect-free `CR3` read). The implementation for the
-/// active architecture is re-exported as `crate::arch::Paging`.
+/// depends on. The read-only [`active_root`](ArchPaging::active_root) and the two TLB
+/// flushes, which only make the CPU walk the tables again, are the exceptions. The
+/// implementation for the active architecture is re-exported as `crate::arch::Paging`.
 ///
 /// Neither [`map_page`](ArchPaging::map_page) nor
 /// [`unmap_page`](ArchPaging::unmap_page) flushes the TLB; the caller
@@ -142,21 +142,13 @@ pub trait ArchPaging {
     unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, UnmapError>;
 
     /// Invalidate the TLB entry for the page containing `virt` on the
-    /// current CPU.
-    ///
-    /// # Safety
-    /// Issues a ring-0-only instruction. The caller should already have
-    /// updated the page tables so the invalidation reflects a real change.
-    unsafe fn flush_tlb_page(virt: VirtAddr);
+    /// current CPU. Safe, as an invalidation only makes the CPU walk the tables again.
+    fn flush_tlb_page(virt: VirtAddr);
 
     /// Invalidate every non-global TLB entry on the current CPU by
     /// reloading the page-table root with its current value. Entries for
     /// pages marked [`PageFlags::GLOBAL`] survive.
-    ///
-    /// # Safety
-    /// Ring-0 only. Reloads the active root with the value it already
-    /// holds, so the active address space is unchanged.
-    unsafe fn flush_tlb_all();
+    fn flush_tlb_all();
 
     /// Switch the active address space by loading `root` as the
     /// page-table root of the current CPU.
@@ -217,7 +209,9 @@ pub trait ArchPaging {
     ///
     /// # Safety
     /// `root` must be the physical base of a valid top-level page table
-    /// reachable through the higher-half direct map.
+    /// reachable through the higher-half direct map, each table in its tree live for the walk.
+    /// A root loaded on a CPU is: its tables are freed only when its address space drops, after
+    /// no CPU has it loaded, as an unmap reclaims none.
     unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>;
 
     /// Which cache-attribute entry the mapping of `virt` in `root` selects, or `None` if it is
@@ -229,8 +223,7 @@ pub trait ArchPaging {
     /// machine, and a gate on a boot line proved to pass with the translation deleted.
     ///
     /// # Safety
-    /// `root` must be the physical base of a valid top-level page table reachable through the
-    /// higher-half direct map.
+    /// As [`translate`](Self::translate).
     unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u8>;
 
     /// The physical base of the page table the current CPU is using (the

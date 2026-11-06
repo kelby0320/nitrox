@@ -84,16 +84,10 @@ fn pinned_cpu() -> usize {
 }
 
 /// Perform the local invalidation for a request. `None` = whole TLB.
-///
-/// # Safety
-/// Ring-0. The caller owns the page-table change this reflects.
-unsafe fn invalidate_local(va: Option<VirtAddr>) {
-    // SAFETY: forwarded — a ring-0 TLB invalidation for a caller-owned change.
-    unsafe {
-        match va {
-            Some(v) => Paging::flush_tlb_page(v),
-            None => Paging::flush_tlb_all(),
-        }
+fn invalidate_local(va: Option<VirtAddr>) {
+    match va {
+        Some(v) => Paging::flush_tlb_page(v),
+        None => Paging::flush_tlb_all(),
     }
 }
 
@@ -114,8 +108,7 @@ fn shootdown(va: Option<VirtAddr>) {
 
     // Sole online CPU (or pre-SMP boot): invalidate locally; no other CPU holds a stale entry.
     if online & !(1u64 << me) == 0 {
-        // SAFETY: ring-0; local invalidation of a caller-owned page-table change.
-        unsafe { invalidate_local(va) };
+        invalidate_local(va);
         crate::sched::preempt_enable();
         return;
     }
@@ -212,8 +205,7 @@ pub fn on_ipi() {
     } else {
         Some(VirtAddr::new(REQUEST_VA.load(Ordering::Acquire)))
     };
-    // SAFETY: ring-0 IPI context; performs only a TLB invalidation.
-    unsafe { invalidate_local(va) };
+    invalidate_local(va);
     // Acknowledge after the invalidation is issued: the initiator sees completion only once this
     // CPU can no longer use the stale translation.
     ACKED.fetch_or(1u64 << (Smp::current_cpu() as usize), Ordering::Release);

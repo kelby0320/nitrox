@@ -72,27 +72,15 @@ pub trait ArchCpu {
     /// CPUID feature bit.
     fn has_apic() -> bool;
 
-    /// Halt the current CPU until the next interrupt wakes it. Unlike
-    /// [`halt_loop`](ArchCpu::halt_loop) (which disables interrupts and parks
-    /// forever), this returns when an interrupt arrives — the primitive the
-    /// idle thread will run with interrupts enabled.
-    ///
-    /// # Safety
-    /// Ring-0 only. The caller owns the interrupt-flag state that decides
-    /// what (if anything) can wake the CPU: with interrupts masked (IF=0)
-    /// only an NMI/SMI resumes it; the idle thread runs this with IF=1 so the
-    /// periodic timer wakes it.
-    unsafe fn halt();
-
     /// Park this CPU idle until the next interrupt, **atomically enabling
-    /// interrupts as it parks** (the `sti; hlt` idiom). Unlike [`halt`](Self::halt),
-    /// it does not trust the inbound IF state — it guarantees the CPU sleeps with
-    /// IF=1, so the periodic timer or a reschedule IPI can always wake it, and the
-    /// enable's interrupt shadow closes the wake-race window. This is the only
-    /// correct primitive for the idle loop.
+    /// interrupts as it parks** (the `sti; hlt` idiom). It does not trust the inbound
+    /// IF state — it guarantees the CPU sleeps with IF=1, so the periodic timer or a
+    /// reschedule IPI can always wake it, and the enable's interrupt shadow closes the
+    /// wake-race window. This is the only correct primitive for the idle loop.
     ///
     /// # Safety
-    /// Ring-0 only.
+    /// Ring-0 only. It returns with interrupts enabled, so the caller holds no state that
+    /// interrupts being masked protects.
     unsafe fn idle_halt();
 
     /// `true` if maskable interrupts are currently enabled on this CPU (the
@@ -101,19 +89,18 @@ pub trait ArchCpu {
 
     /// Mask maskable interrupts, returning the prior enabled-state so the
     /// caller can restore it. The save/`cli` half of the [`IrqSpinLock`]
-    /// discipline.
-    ///
-    /// # Safety
-    /// Ring-0 only; the caller must bound the masked window (see
-    /// [`IrqSpinLock`]).
+    /// discipline. Masking cannot break memory safety, only stall this CPU's
+    /// preemption, so the caller bounds the masked window.
     ///
     /// [`IrqSpinLock`]: crate::libkern::IrqSpinLock
-    unsafe fn interrupts_disable() -> bool;
+    fn interrupts_disable() -> bool;
 
     /// Unmask maskable interrupts. Used once at boot to arm preemption.
     ///
     /// # Safety
-    /// Ring-0 only; the IDT and a timer source must be live before enabling.
+    /// Ring-0 only; the IDT and a timer source must be live before enabling, and the caller is
+    /// in no section that masking protects: an `IrqSpinLock`'s hold, a context switch, or the
+    /// syscall return's window on the user stack.
     unsafe fn interrupts_enable();
 
     /// Restore a prior interrupt-enabled state captured by
@@ -121,7 +108,9 @@ pub trait ArchCpu {
     /// else leave masked.
     ///
     /// # Safety
-    /// Ring-0 only.
+    /// Ring-0 only; `prev` is what the `interrupts_disable` opening this section returned, and
+    /// the caller is in no inner section that masking protects, as for
+    /// [`interrupts_enable`](Self::interrupts_enable).
     unsafe fn interrupts_restore(prev: bool);
 
     /// Log what this processor is and which of the features the kernel depends on it has:

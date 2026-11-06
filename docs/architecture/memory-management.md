@@ -227,8 +227,10 @@ through `ArchPaging`, the kernel's first cross-architecture trait
 implementation genuinely differs between x86_64 and aarch64; the active
 architecture's implementation is re-exported as `arch::Paging`.
 
-- **Surface:** `map_page`, `unmap_page`, `flush_tlb_page`,
-  `flush_tlb_all`, `set_page_table` — all `unsafe`. `map_page` /
+- **Surface:** `map_page`, `unmap_page` and `set_page_table`, all
+  `unsafe`, and `flush_tlb_page` and `flush_tlb_all`, safe: an invalidation
+  only makes the CPU walk the tables again, and the reload writes back the
+  root it read, a thread's root never changing. `map_page` /
   `unmap_page` install and remove a 4 KiB leaf and allocate intermediate
   tables from the buddy on demand; neither flushes the TLB, so the
   caller batches one flush over many changes. `unmap_page` returns the

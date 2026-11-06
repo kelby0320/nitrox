@@ -711,8 +711,7 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
     };
     match result {
         Ok(()) => {
-            // SAFETY: ring-0 TLB flush; reloads the active root with itself.
-            unsafe { Paging::flush_tlb_all() };
+            Paging::flush_tlb_all();
             Ok(range.start().as_u64() as isize)
         }
         Err((returned, e)) => {
