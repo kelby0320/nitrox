@@ -118,9 +118,10 @@ commit that says why. kernel/CLAUDE.md asks for that justification and nothing h
 
 Every sub-part: `/pr-review`; the host tests; and the KVM gates its files reach, `test-qemu` at
 least, on the debug kernel every gate boots, so a new debug assertion runs on all of them. **The
-whole suite under Miri is the nightly job's**, not a sub-part's (the maintainer's call,
-2026-10-26): a sub-part runs under Miri only the tests its own controls need, by name, where the
-control is a report only Miri can make, as J.6's, J.7's and J.8's are. A
+whole suite runs under Miri once, after J.15, and Part J is not done until what it reports is
+triaged** (the maintainer's call, 2026-11-06: Miri after each phase of work, not each part). A
+sub-part runs under Miri only the tests its own controls need, by name, where the control is a
+report only Miri can make, as J.6's, J.7's and J.8's are. A
 defect's control fails without its fix, and an opportunity's is the tests that already hold the
 code, run before and after. Each ticks its items in `safety-survey.md` with the commit that
 finished them, and updates the `architecture/` docs it outdates.

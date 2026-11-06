@@ -1015,7 +1015,9 @@ the surface's new kernel code, which wants P1 and P2 under it
 [`typed-layers.md`](typed-layers.md): fifteen sub-parts, a PR each, measured on `main` at PR
 #422's merge. P6 first, then P1, P2, P3, P4 and P5, all before E.6; a ratchet on the kernel's
 `unsafe`, `check-unsafe`, from the first. The pass found eleven items Part I had already taken part
-of, six premises that no longer hold, and two latent defects, kplat-d23 and sched-d16.
+of, six premises that no longer hold, and two latent defects, kplat-d23 and sched-d16. **Part J
+is done when the whole suite has run under Miri after J.15 and what it reports is triaged** (the
+maintainer's call, 2026-11-06).
 
 ## Part E — the syscall surface
 

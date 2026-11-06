@@ -37864,3 +37864,13 @@ Part J's first sub-part, `typed-layers.md` § J.1, built on `pre-phase-7/part-j1
   contract now says so. The kernel stands at 1,094 blocks and 330 `unsafe fn`s.
 - **The control is the compiler both ways**: the debug and release kernels' `.text` are
   byte-identical before and after, so no machine code changed.
+
+## 2026-11-06 — Miri after each phase of work, not each part
+
+**The whole suite runs under Miri at the end of a phase of work, and the phase is not done until
+what it reports is triaged** (the maintainer's call). Part J is the first: one run after J.15. A
+part in between runs under Miri only the tests its own controls need, by name, where the control
+is a report only Miri can make. This narrows what Part J's detail pass wrote, that every sub-part
+runs `cargo xtask miri kernel`: about fifty minutes each, and against 2026-10-26's call that Miri
+runs on its own and not per PR. The CI job, `miri.yml`, runs as it did, on its schedule and by
+hand.
