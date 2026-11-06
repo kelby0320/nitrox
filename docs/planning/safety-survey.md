@@ -6587,10 +6587,11 @@ neither run. Both latent.
 
 - [ ] **kplat-d23** `kernel/src/main.rs:716` — `run_first_userspace` calls `arch::init_syscall_entry`
   after preemption is armed (main.rs:318, inside `sched_bringup`) and the APs are up
-  (main.rs:272), on a boot thread whose `cpu_mask` is every CPU (thread.rs:218).
-  `init_syscall_entry` (syscall.rs:75) reads its CPU's block through `this_cpu_block()`, then writes
-  `KERNEL_GS_BASE`, STAR, LSTAR, SFMASK and EFER, with no pin and no `debug_assert_pinned`, where
-  the three setters beside it assert one. A migration between the read and the writes puts one CPU's
+  (main.rs:272), on a boot thread whose `cpu_mask` is every CPU (`object/thread.rs:255`, in
+  `try_new_boot`). `init_syscall_entry` (`arch/x86_64/syscall.rs:75`) reads its CPU's block through
+  `this_cpu_block()`, then writes `KERNEL_GS_BASE`, STAR, LSTAR, SFMASK and EFER, with no pin and no
+  `debug_assert_pinned`, where `arm_user_entry_cpu_base` and `set_syscall_kernel_stack` beside it,
+  and `gdt::set_kernel_stack`, assert one. A migration between the read and the writes puts one CPU's
   block into another's `KERNEL_GS_BASE`, and a boot thread that moved off the BSP leaves the BSP's
   MSRs to be armed later. Latent: `arm_user_entry_cpu_base` re-arms `KERNEL_GS_BASE`, and the rest
   when EFER.SCE is clear, before a thread's first descent, and every switch-in re-arms
@@ -6598,9 +6599,9 @@ neither run. Both latent.
   before the CPU can be scheduled, with its index passed. Unverified: by reading; the control is the
   assertion, which would fire on every debug boot with the old placement, IF being 1 there.
   concurrency. Low. **Plan**, in P4.
-- [ ] **sched-d16** `kernel/src/sched.rs:608` — `arm_kernel_stack_for` (sched.rs:499) says its caller
+- [ ] **sched-d16** `kernel/src/sched.rs:608` — `arm_kernel_stack_for` (sched.rs:498) says its caller
   holds SCHED and reads the incoming thread's `kstack_top` under it, but `switch_into` calls it after
-  `release_keeping_irqs_masked` (sched.rs:597). Benign today: the incoming thread's stack does not
+  `release_keeping_irqs_masked` (sched.rs:596). Benign today: the incoming thread's stack does not
   change once it is chosen, and interrupts stay masked to the switch. Fix: call it above the release,
   where the guard is its pin; RSP0 and the syscall stack are read only at a ring-3 entry, so the
   order is equivalent. Unverified: by reading. concurrency. Low. **Plan**, in P4.

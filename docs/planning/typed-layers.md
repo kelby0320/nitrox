@@ -30,15 +30,17 @@ and this differ, this is the plan. **Fifteen sub-parts, a PR each.**
 
 ### What the pass found
 
-- **Part I already took part of ten items.** kplat-o1's atomic slots and single walk are its
+- **Part I already took part of eleven items.** kplat-o1's atomic slots and single walk are its
   `TableRef` (kplat-d7). kmem-o6's two defects closed with a kernel stack that keeps no root (kmem-d4)
   and a loader that takes the address space `&mut`. sched-o6's inline waiter set is `WaitQueue`.
   drv-o13's free-before-disable is `Programmed` and `Quiesced` (drv-o4), and its unfenced ring writes
   are one `RingMem`. drv-o3's overrun of the hub's data page closed (drv-d8). drv-o1's single
   completion is `io::irp::complete`, its provenance the box's. drv-o12's function-pointer compare
   became a window the node carries (drv-d16). kplat-o12's refused installs take no vector.
-  kplat-o6's log copy is `copy_in` (kplat-d15). And **every bug that motivated P4 is fixed**
-  (kplat-d2, d8, d11, d18, d19): what is left there is debug assertions to make types.
+  kplat-o6's log copy is `copy_in` (kplat-d15). sched-o8's clones, dropped under SCHED, went when
+  the scheduler stopped borrowing a whole `Thread` (kobj-d11), leaving raw reads. And **every bug
+  kplat-o3 was to close is fixed** (kplat-d2, d8, d11, d18, d19): what is left of P4 is debug
+  assertions to make types.
 - **Six things the survey drew do not hold:**
   1. **Masked interrupts do not pin a thread across a switch.** The scheduler switches with IF=0,
      so a token taken from IF=0 is good only until the next call that can switch (J.11).
@@ -51,16 +53,19 @@ and this differ, this is the plan. **Fifteen sub-parts, a PR each.**
   5. **A raw copy does not end kobj-d13's race**: `copy_nonoverlapping` forms no reference but is
      still a non-atomic read racing a writer, which no test could tell from the slice (J.8).
   6. **A vector cannot simply be cleared once a device was programmed with it**: an enabled MSI
-     may still signal (J.13).
+     may still signal, and so may a line routed to it (J.13).
 - **Two latent defects, kplat-d23 and sched-d16**, appended to the survey's record and fixed in
   J.11. `init_syscall_entry` runs after preemption is armed and the APs are up, unpinned, and reads
   its CPU's block before writing that CPU's MSRs; two later re-arms are all that cover a migration
   between. `arm_kernel_stack_for` says its caller holds SCHED, and `switch_into` calls it after
   releasing it.
-- **Four files sit at their size entries**, so a sub-part that touches one moves code out first
-  or shrinks it: `syscall/table.rs` (2,195), `object/file_object.rs` (2,459), `main.rs` (1,079) and
-  `pci/mod.rs` (1,045). `drivers/xhci/hub.rs` (985), `arch/x86_64/idt.rs` (949) and
-  `arch/x86_64/paging.rs` (913) are near 1,000.
+- **Five files sit at their size entries**, so a sub-part that touches one moves code out first
+  or shrinks it: `syscall/table.rs` (2,195), `object/file_object.rs` (2,459), `main.rs` (1,079),
+  `pci/mod.rs` (1,045) and `arch/x86_64/acpi.rs` (1,036). Eleven more are past 900 lines:
+  `mm/vmm.rs` (988), `drivers/xhci/hub.rs` (985), `sched/tests.rs` (980), `arch/x86_64/idt.rs`
+  (949), `handle/table/tests.rs` (937), `object/namespace.rs` (933), `syscall/table/tests.rs` (930),
+  `drivers/xhci/mod.rs` (921), `device.rs` (916), `arch/x86_64/paging.rs` (913) and
+  `object/thread.rs` (909).
 
 ### Where it stands
 
@@ -70,7 +75,7 @@ fn`s, 52 `unsafe impl`s and 344 raw dereferences.** By subsystem:
 | | `unsafe` blocks | `unsafe fn` | `unsafe impl` | raw derefs |
 |---|---:|---:|---:|---:|
 | `arch` | 207 | 142 | 0 | 13 |
-| `sched` and `sched.rs` | 223 | 48 | 0 | 7 |
+| `sched` | 197 | 45 | 0 | 7 |
 | `object` | 178 | 106 | 16 | 87 |
 | `drivers` | 134 | 7 | 5 | 30 |
 | `mm` | 92 | 23 | 3 | 122 |
@@ -78,9 +83,10 @@ fn`s, 52 `unsafe impl`s and 344 raw dereferences.** By subsystem:
 | `io` | 64 | 6 | 8 | 42 |
 | `libkern` | 40 | 2 | 13 | 7 |
 | `handle` | 30 | 3 | 3 | 1 |
-| the rest: `main.rs`, `dpc.rs`, `tlb.rs` and others | 55 | 11 | 4 | 5 |
+| the rest: `main`, `limine`, `boot_selftest`, `power` and eight more | 81 | 14 | 4 | 5 |
 
-Each sub-part says what it removes from that count, and from the patterns it names.
+Each row is one of the scan's groups, a module's file and its directory together, so the rows sum to
+the totals. Each sub-part says what it removes from that count, and from the patterns it names.
 
 ### The order
 
@@ -103,9 +109,10 @@ bodies it leaves as they are. Code E.7 moves into a resolve's operations moves t
 **A ratchet on the kernel's `unsafe`, as `check-syscalls` is on userspace's raw calls** (decided in
 the pass, for the maintainer's eye): `cargo xtask check-unsafe`, in CI from J.1, counts each kernel
 subsystem's `unsafe` blocks and `unsafe fn`s with `unsafe-inventory`'s scan against
-`tools/xtask/unsafe-counts.toml`, and fails a rise, and a stale entry as `check-size` does. Each
-sub-part lowers its entries; new kernel code in E.6 to E.11 that needs `unsafe` raises its entry
-in the commit that says why. kernel/CLAUDE.md asks for that justification and nothing holds it.
+`tools/xtask/unsafe-counts.toml`, whose entries J.1 writes from the scan's groups at its base, not
+from the table above, and fails a rise, and a stale entry as `check-size` does. Each sub-part
+lowers its entries; new kernel code in E.6 to E.11 that needs `unsafe` raises its entry in the
+commit that says why. kernel/CLAUDE.md asks for that justification and nothing holds it.
 
 ### How each is held
 
@@ -174,10 +181,12 @@ handles installed partway through a syscall (`table.rs` 14, `spawn.rs` 11, `subm
   Spawn, channel creation, receive, the PO paths and `run_first_userspace`, whose twelve early
   returns leak three handles today (kplat-d16).
 
-Controls: the existing `FAIL_NEXT_ALLOCATE` makes a failed install hand back its reference, the
-object's destroy count 0 until it drops; and each syscall's steps fail in turn, by the same
-injection, with the table's handle count after each as it was before. kplat-d16 is boot-only, so
-its early returns are held by the guard's own test. Author.
+Controls: a failed install hands back its reference, the object's destroy count 0 until it drops;
+and each syscall's installs fail in turn, with the table's handle count after each as it was
+before. `FAIL_NEXT_ALLOCATE` is a one-shot, which fails only a syscall's first install, and every
+rollback `Installed<N>` replaces is past the first, so it becomes a countdown failing from the
+*n*th on, as `TABLES_LEFT` is. kplat-d16 is boot-only, so its early returns are held by the
+guard's own test. Author.
 
 ### J.4 The scheduler's own plumbing (sched-o6's rest, sched-o9, sched-o10, sched-o11)
 
@@ -185,31 +194,45 @@ Four repetitions, each one function after; before J.5 to J.7, which would otherw
 copies.
 
 - **One `wake_all`** for the five wake loops.
-- **A `SchedGuard` that defers drops**: `defer(ObjectRef)` into an inline bag, dropped once SCHED is
-  released, or moved to `deferred_drops` in interrupt context; the eleven hand-carried releases go.
+- **A guard that defers drops**: a site declares a `Deferred<N>`, sized to its burst as `Orphans<N>`
+  is today (48 at an endpoint's close), and locks SCHED through it. `defer(ObjectRef)` puts a
+  reference in the bag, which drops after the guard, by declaration order, once SCHED is released;
+  in interrupt context, where nothing may be freed, its contents move to `deferred_drops` instead,
+  whose reserve covers the largest bag a site there declares. A full bag is a sizing bug and ends
+  the machine, as `push_reserved` does. **`switch_away` takes only a plain guard**, so no bag
+  crosses a switch, and the terminal exit path keeps `deferred_drops`. The eleven hand-carried
+  releases go, and no acquisition, the tick's among them, carries a bag it does not use.
   **`ObjectRef::drop` asserts no SCHED in every debug build**, where it asserts only in host tests
   now, and the kernel images are debug builds.
 - **One `switch_away(guard, prev, Park)`** for the five switch tails, `Park` naming where the
   outgoing thread goes; `switch_into` takes the slot from `prev` itself, where a caller passes it.
 - **A deadline entry names its target by kind**, an enum, where it carries bare `usize`s.
 
-Controls: the drop assertion fails a host test that drops under SCHED; the parking is split out for
-host tests, one per `Park`, as `clear_online_bit` was. Author.
+Controls: the drop assertion fails a host test that drops under SCHED; a bag deferring one past
+its size ends its test; the parking is split out for host tests, one per `Park`, as
+`clear_online_bit` was. Author.
 
 ### J.5 Typed scheduler calls (kobj-o7, with sched-o2 and drv-o8; sched-o8)
 
-Measured: **31 `unsafe fn` entry points** in `sched/` take a `*mut ()`, called 93 times from outside
-it, **76 of them passing the `.as_ptr()` of a reference the caller holds**.
+Measured: **31 `unsafe fn` entry points** in `sched/` take a raw object, a `*mut ()` or, for the two
+waits, a list of addresses, called 93 times from outside it, **76 of them passing the `.as_ptr()`
+of a reference the caller holds**.
 
 - **The entry points take `&Ref<T>`**, or a `&T` borrowed from one, and the borrow is the pin;
-  `wait_on` takes the references, and the two sleeps written `wait_on(&[])` call `sleep_until`. The
-  three drop hooks stay raw, and so do the twelve callers holding only a pointer an IRP or a driver
-  pins, until J.14 and J.15 give those a type.
-- **A borrow for a read under SCHED** (sched-o8): `Thread::process`, `Process::notification_channel`
-  and `UserspaceServerReg::endpoint` borrow what the owner holds, where clones are dropped under
-  SCHED today, each argued not the last.
+  `wait_on` takes the references, and the hub's sleep, written `wait_on(&[])`, calls `sleep_until`.
+  **`park_briefly`'s `wait_on_io(&[])` stays an I/O wait**: `sleep_until` heeds an exit, and a
+  thread ending while it faults on a page in flight must still wait for the fill, where it would
+  return at once on every pass and spin. The three drop hooks stay raw, and so do the twelve
+  callers holding only a pointer an IRP or a driver pins, until J.14 and J.15 give those a type.
+- **A borrow for a read under SCHED** (sched-o8's rest). Part I took its clones; what is left is a
+  raw child pointer, read and argued alive by its owner, at three channel-pointer reads and four
+  `endpoint_ptr` reads. `Process::notification_channel`, `Process::parent_notif` and
+  `UserspaceServerReg::endpoint` borrow what the owner holds. **`Thread::process`, for the six
+  `process_of` reads, waits for J.7**, as it borrows a `&Thread`.
 
-Depends on J.2. Control: J.4's assertion holds the clones' sites. Author; the call sites to the
+Depends on J.2. Control: an opportunity, so the tests that reach these reads, under Miri before and
+after. Host tests reach `deliver_child_exited` and `us_forward_originate`; J.5 names the test that
+reaches each of the seven reads, and writes one where none does. Author; the call sites to the
 implementer.
 
 ### J.6 What SCHED guards, as a type (kobj-o3 with sched-o1; kobj-o10 with sched-o7; sched-d11)
@@ -217,8 +240,9 @@ implementer.
 - **A `SchedToken`**, zero-sized, a field of `SchedState`, so only the guard reaches one, and
   **`SchedCell<T>`**, whose `get` takes `&mut SchedToken`: one interior borrowed at a time, and never
   without SCHED. The six objects SCHED mutates (`Timer`, `PendingOperation`, `NotificationChannel`,
-  `InterruptObject`, `IpcChannel`, `UserspaceServerReg`) keep that state in one cell each, and their
-  accessor `unsafe fn`s, 54 of the 99 in `object/`, become safe methods.
+  `InterruptObject`, `IpcChannel`, `UserspaceServerReg`) keep that state in one cell each: their 60
+  `unsafe fn`s taking the object as a `*mut ()`, an `inner` each among them, become the cell and
+  safe methods.
 - **A back-pointer set and read with a witness** (kobj-o10): `IpcChannel.peer` and `.us_reg` with the
   token, the file cache's with its guard, so a stale one cannot be followed. `is_live`, which reads
   memory that may be freed, goes.
@@ -228,12 +252,13 @@ implementer.
 Control: sched-d11's, the survey's host test, two threads under Miri, which reports the retag today.
 Depends on J.2 and J.4. Author.
 
-### J.7 The thread, split (kobj-o3's `Thread` half)
+### J.7 The thread, split (kobj-o3's `Thread` half; sched-o8's last)
 
 `Thread`'s **41 accessors**, called 112 times in `sched/`. Its identity stays plain; what SCHED
 guards moves into a `SchedCell<ThreadSched>`; `on_cpu` and the wait phase stay atomics; and `arch`
 and the FPU area, which `context_switch` writes without SCHED, get a cell and a narrow raw API of
-their own. Then `&Thread` is sound and `Ref<Thread>` derefs. Control: kobj-d11's Miri test, and
+their own. Then `&Thread` is sound and `Ref<Thread>` derefs, and `Thread::process` borrows the
+process for the six `process_of` reads, sched-o8's last. Control: kobj-d11's Miri test, and
 `sched`'s tests under Miri. Author.
 
 ### J.8 A frame's bytes, through a view (kobj-o11 with kmem-o5; kobj-d13 with kmem-d18; drv-o14; kplat-o6's view)
@@ -267,7 +292,7 @@ borrow sound; that is E.8's.
 Controls: a writer thread storing into an object's frame while `copy_to_kvec` reads it, under Miri,
 a race reported against the slice and none against the copy, the writer storing at the copy's
 width; neighbour tests at `PAGE_SIZE - 1`, `PAGE_SIZE` and one past, and across a frame.
-`file_object.rs` is at its size entry, so its tests move out first. Author.
+`file_object.rs` and `acpi.rs` are at their size entries, so their tests move out first. Author.
 
 ### J.9 An owned frame (kmem-o2, kmem-d11; kplat-o6's owned half)
 
@@ -291,8 +316,10 @@ zeroing blocks, the owned-or-borrowed flag kept by hand, and three hand-written 
 - **Not closed here: a frame freed while a device still writes it.** That is P5's.
 
 Controls: each owner's frees counted (an order-2 block frees four); each rollback failing at every
-index, through `TABLES_LEFT`, `FRAMES_LEFT` and a new seam in `MemoryObject::try_new`; and the
-survey's probe, a live frame freed and read, reported by J.8's Miri route. Author.
+index, through a countdown in `Frame`'s allocation, which every owner's frames pass, beside
+`TABLES_LEFT`: `FRAMES_LEFT` reaches only `kvmap`'s frames and `TABLES_LEFT` only an index that
+needs a new table, so a three-page VMA inside one table fails at its second and third pages as
+well; and the survey's probe, a live frame freed and read, reported by J.8's Miri route. Author.
 
 ### J.10 Typed page tables (kmem-o6, kplat-o1's rest, kmem-o10, kmem-o7's first step)
 
@@ -309,8 +336,9 @@ twice. `AddressSpace` repeats one `unsafe` map or unmap, with one argument, at e
 - **`translate` and `attribute_index` are safe on either**, and `AddressSpace::translate` takes
   about 45 test sites out of `unsafe`.
 - **`UserTables::map_owned(va, Frame)`**, safe, giving the frame back with the error, for `map_vma`
-  and `fault_in`, where a failed map loses the frame today. Mapping an object's frame, kept alive by
-  the VMA's reference, keeps a narrow `unsafe` for that half.
+  and `fault_in`, whose failure arms each free the frame by hand today; the type frees it by
+  construction. Mapping an object's frame, kept alive by the VMA's reference, keeps a narrow
+  `unsafe` for that half.
 - **An unmap gives back an anonymous mapping's frames as `Frame`s, by the VMA's kind**, through an
   `unsafe from_pte` at its three sites: the VMA is the one record of what owns a page, and a second
   in the PTE could disagree with it.
@@ -321,7 +349,7 @@ twice. `AddressSpace` repeats one `unsafe` map or unmap, with one argument, at e
   still says it is kept for future queries.
 
 `x86_64/paging.rs`'s tests move out first. Depends on J.9. Control: an opportunity, so none of its
-own; the 16 paging tests, the Miri walk among them, and the 39 address-space tests, the unmap's
+own; the 20 paging tests, the Miri walk among them, and the 39 address-space tests, the unmap's
 shootdown ordering among them. Author.
 
 ### J.11 Per-CPU state (kplat-o3 with sched-o3; kplat-d23, sched-d16)
@@ -388,13 +416,16 @@ port bases, its mapping's length not kept.
   at bring-up, in a pure `windows(..)` a host test reaches. PCI's `MmioCfg` is a 4 KiB `Mmio`; its
   `Cfg` callers are unchanged.
 - **The vector pool answers `Err(PoolFull)`**, where it asserts, and a `DeviceVector` guard gives a
-  vector back unless committed. **Only a vector no device was programmed with comes back**: a
-  declined xHCI whose MSI is enabled may still signal, so it keeps its vector.
+  vector back unless committed. **Only a vector nothing was programmed with or routed to comes
+  back**: a declined xHCI whose MSI is enabled may still signal, and an AHCI that declines at its
+  publish has had its GSI routed, unmasked, to its vector by `install_intx`. Each keeps its vector,
+  and the guard masks a routed entry first.
 
 Controls: `sub` at the BAR's end allowed and a byte past refused; a fake whose RTSOFF points past
 BAR0 declined, where Miri reports the write past the fake today; a full pool answering `Err`, the
-pool a value for it, as the global counter is shared by parallel tests. `pci/mod.rs` is at its size
-entry, so `MmioCfg` may not grow it. Author.
+pool a value for it, as the global counter is shared by parallel tests; a guard dropped after a
+routed install leaves the entry masked and the vector taken, on the IOAPIC's register fake.
+`pci/mod.rs` is at its size entry, so `MmioCfg` may not grow it. Author.
 
 ### J.14 An I/O request in flight (drv-o12, drv-o1)
 

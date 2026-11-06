@@ -37793,14 +37793,15 @@ Decided in the part, for the maintainer's eye:
 ## 2026-11-05 — Before Phase 7, Part J detailed: fifteen sub-parts, and a ratchet on the kernel's `unsafe`
 
 Part J's detail pass, in `typed-layers.md`, checked the survey's six kernel layers, 45 items, against
-`main` at PR #422's merge. **Part I had already taken part of ten**: the page tables' atomic slots
-and one walk, a kernel stack with no root, the inline waiter set, device memory freed only once its
-device stops, one completion call for an IRP, a partition's window on its node, the log copied
-through `copy_in`, and every bug behind P4, which leaves P4 debug assertions to make types. **Six
-things the survey drew do not hold**: masked interrupts do not pin a thread across a switch; a
-host-test twin cannot live in a generic per-CPU type; no `&'static AhciDisk` exists when its node is
-made; a safe `Copy` handle to DMA memory is what Part I removed; a raw copy does not end kobj-d13's
-race; and a vector a device was programmed with cannot simply be cleared. **Two latent defects** the
+`main` at PR #422's merge. **Part I had already taken part of eleven**: the page tables' atomic
+slots and one walk, a kernel stack with no root, the inline waiter set, device memory freed only once
+its device stops, one completion call for an IRP, a partition's window on its node, the log copied
+through `copy_in`, the clones the scheduler dropped under its lock, and every bug behind P4, which
+leaves P4 debug assertions to make types. **Six things the survey drew do not hold**: masked
+interrupts do not pin a thread across a switch; a host-test twin cannot live in a generic per-CPU
+type; no `&'static AhciDisk` exists when its node is made; a safe `Copy` handle to DMA memory is
+what Part I removed; a raw copy does not end kobj-d13's race; and a vector a device was programmed
+with, or a line routed to, cannot simply be cleared. **Two latent defects** the
 survey missed go into its record and into J.11: `init_syscall_entry` runs unpinned after the APs are
 up (kplat-d23), and `arm_kernel_stack_for` runs after the SCHED it says it holds (sched-d16).
 
@@ -37835,5 +37836,8 @@ Decided in the pass, for the maintainer's eye:
 - **A block backend's context is typed by its constructor**, its fields private, rather than an enum
   that would make `io` name its drivers; **the storage and HID table entries own their buffers**;
   **an IRP token dropped unfinished fails a debug build**, a lost IRP being drv-d3's class.
-- **A device vector comes back only if no device was programmed with it**: a declined xHCI whose MSI
-  is enabled may still signal, so it keeps its vector, and a full pool answers `Err` where it asserts.
+- **A device vector comes back only if nothing was programmed with it or routed to it**: a declined
+  xHCI whose MSI is enabled may still signal, and so may a declined AHCI's routed INTx line, so each
+  keeps its vector, a routed entry masked; and a full pool answers `Err` where it asserts.
+- **A guard that defers drops takes a bag its site sizes**, as `Orphans<N>` is today, rather than one
+  carried by every acquisition of SCHED; no bag crosses a switch.
