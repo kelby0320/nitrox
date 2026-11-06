@@ -68,10 +68,9 @@ fn sweep_owned(t: &HandleTable, pid: u32) -> usize {
     let mut cursor = SweepCursor::START;
     let mut total = 0;
     loop {
-        let mut batch: [Option<Closed>; 4] = [const { None }; 4];
-        let (n, more) = t.close_owned_batch(pid, &mut cursor, &mut batch);
+        let (batch, more): ([Option<Closed>; 4], bool) = t.close_owned_batch(pid, &mut cursor);
+        total += batch.iter().flatten().count();
         drop(batch);
-        total += n;
         if !more {
             return total;
         }
@@ -942,4 +941,18 @@ fn a_lookup_reads_the_objects_tag_not_the_entrys() {
     assert!(t.lookup_as::<Process>(h, 1, Rights::empty()).is_ok_and(|p| p.magic_ok()));
     close_release(&t, h, 1).unwrap();
     assert_eq!((test_probe::process_destroys(), test_probe::thread_destroys()), (1, 0));
+}
+
+/// **The exit sweep closes as `close` does**: what it closes leaves this thread's count of handles
+/// installed less closed as it was before they were installed.
+#[test]
+fn a_sweep_counts_what_it_closes() {
+    let t = fresh_table();
+    let before = net_installed();
+    for i in 0..5 {
+        t.install(9, mk_process(i), sig()).unwrap();
+    }
+    assert_eq!(net_installed(), before + 5);
+    assert_eq!(sweep_owned(&t, 9), 5);
+    assert_eq!(net_installed(), before, "each handle the sweep closed counted out");
 }

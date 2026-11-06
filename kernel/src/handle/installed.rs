@@ -40,10 +40,10 @@ impl<'t, const N: usize> Installed<'t, N> {
 }
 
 impl<const N: usize> Drop for Installed<'_, N> {
-    /// Close each handle, newest first, releasing its reference here: outside the table's lock,
-    /// as every drop of one is.
+    /// Close each handle, releasing its reference here: outside the table's lock, as every drop of
+    /// one is.
     fn drop(&mut self) {
-        for &h in self.handles[..self.len].iter().rev() {
+        for &h in &self.handles[..self.len] {
             drop(self.table.close(h, self.pid));
         }
     }

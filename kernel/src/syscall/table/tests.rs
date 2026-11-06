@@ -419,7 +419,7 @@ fn only_a_memory_object_or_a_file_maps() {
 #[test]
 fn a_handle_of_another_kind_is_an_invalid_argument() {
     use crate::object::{Namespace, Timer};
-    const PID: u32 = 4453;
+    const PID: u32 = 4480;
     init_global_heap();
     global::init_for_tests();
     let h = install(PID, ObjectRef::new(Timer::try_new().unwrap()), Rights::empty()).unwrap().bits();

@@ -85,8 +85,9 @@ impl GlobalTable {
     }
 }
 
-/// Handles closed per batch by [`close_all_owned_by`]; each entry is a pointer
-/// plus a type tag, so a batch is small on the sweeping thread's kernel stack.
+/// Handles closed per batch by [`close_all_owned_by`]; each entry is one pointer, an
+/// `Option<Closed>` its niche keeps that size, so a batch is small on the sweeping thread's kernel
+/// stack.
 const SWEEP_BATCH: usize = 16;
 
 /// Close **every** handle owned by `pid` and release the objects they pinned;
@@ -113,8 +114,8 @@ pub fn close_all_owned_by(pid: u32) -> usize {
     let mut closed = 0usize;
     let mut cursor = SweepCursor::START;
     loop {
-        let mut batch: [Option<Closed>; SWEEP_BATCH] = [const { None }; SWEEP_BATCH];
-        let (n, more) = get().close_owned_batch(pid, &mut cursor, &mut batch);
+        let (batch, more): ([Option<Closed>; SWEEP_BATCH], bool) = get().close_owned_batch(pid, &mut cursor);
+        let n = batch.iter().flatten().count();
         crate::sched::preempt_disable();
         drop(batch);
         crate::sched::preempt_enable();

@@ -698,25 +698,25 @@ impl HandleTable {
         sum
     }
 
-    /// Close up to `out.len()` live handles owned by `pid`, resuming at
-    /// `cursor`, writing each closed slot's object into `out`; returns
-    /// `(count, more_remain)`. As with [`close`](HandleTable::close) the caller
-    /// **must** release each returned reference, and only **after this
-    /// returns**, never under the rank-3 lock: a destructor can take rank-4
-    /// object locks and, for an IPC endpoint, rank-1 `SCHED`, inverting the
-    /// ranking.
+    /// Close up to `N` live handles owned by `pid`, resuming at `cursor`; returns a fresh batch of
+    /// their references, the closed first, and `more_remain`. As with [`close`](HandleTable::close)
+    /// the caller releases each reference **after this returns**, never under the rank-3 lock: a
+    /// destructor can take rank-4 object locks and, for an IPC endpoint, rank-1 `SCHED`, inverting
+    /// the ranking. The batch is made here, so no slot the caller still holds is overwritten, and
+    /// its reference released, under that lock.
     ///
     /// `more_remain` is `true` when the batch filled, the deferred-close ring is
     /// full (the caller draining its batch is what lets it drain), or the scan
     /// has not reached the end; call again with the same `cursor` until `false`.
     /// This is the process-exit sweep: otherwise a dead process's entries pin
     /// their objects, notably its end of every pipe, forever.
-    pub fn close_owned_batch(&self, pid: u32, cursor: &mut SweepCursor, out: &mut [Option<Closed>]) -> (usize, bool) {
-        let (n, more) = self.unpublish_owned_batch(pid, cursor, out);
+    pub fn close_owned_batch<const N: usize>(&self, pid: u32, cursor: &mut SweepCursor) -> ([Option<Closed>; N], bool) {
+        let mut out = [const { None }; N];
+        let (n, more) = self.unpublish_owned_batch(pid, cursor, &mut out);
         if n > 0 {
             self.grace.synchronize();
         }
-        (n, more)
+        (out, more)
     }
 
     fn unpublish_owned_batch(&self, pid: u32, cursor: &mut SweepCursor, out: &mut [Option<Closed>]) -> (usize, bool) {
