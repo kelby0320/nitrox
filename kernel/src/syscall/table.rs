@@ -14,6 +14,7 @@ use crate::handle::global;
 use crate::handle::table::{Claim, HandleError, HandleTable};
 use crate::libkern::clock::ClockId;
 use crate::rsproto::SizeChange;
+use mappable::Mappable;
 
 /// What a resolve is being asked to do beyond resolving, one intent per call site.
 #[derive(Copy, Clone)]
@@ -657,10 +658,7 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
 
     // A `MemoryObject` (eager) or demand-paged `FileObject`; others lack the `MAP_*` right.
     let ok = global::get().lookup(RawHandle(obj_h), pid, required).map_err(map_handle_err)?;
-    let object = match ok.object.downcast::<MemoryObject>() {
-        Ok(memory) => Mappable::Memory(memory),
-        Err(other) => Mappable::File(other.downcast::<FileObject>().map_err(|_| KError::InvalidHandle)?),
-    };
+    let object = Mappable::of(ok.object)?;
     let max_bytes = match &object {
         Mappable::Memory(memory) => memory.size(),
         Mappable::File(file) => file.npages() * PAGE_SIZE,
@@ -704,12 +702,6 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
     result.map_err(map_mem_map_err)?;
     Paging::flush_tlb_all();
     Ok(range.start().as_u64() as isize)
-}
-
-/// What `sys_memory_map` maps.
-enum Mappable {
-    Memory(Ref<MemoryObject>),
-    File(Ref<FileObject>),
 }
 
 /// `sys_memory_unmap(addr, size)` — unmap the region at `addr` from the caller's address
@@ -1072,11 +1064,7 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
     }
 
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    let po_ref = {
-        let ptr = KBox::into_raw(po).as_ptr() as *mut ();
-        // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(ptr) }
-    };
+    let po_ref = ObjectRef::new(po);
     let waiter_ref = po_ref.clone();
     let (pp, pt) = po_ref.into_raw();
     let po_h = match global::get().allocate(pid, pp, pt, pending_op_rights()) {
@@ -2140,6 +2128,7 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
 }
 
 mod fill;
+mod mappable;
 mod send;
 mod spawn;
 mod submit;

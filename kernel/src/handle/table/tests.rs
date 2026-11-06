@@ -934,12 +934,18 @@ fn a_claim_needs_the_rights_it_asks_for() {
 }
 
 /// **A reference's kind is the object's header's, never the entry's record**: an entry recorded
-/// under the wrong tag looks up as the kind its object is, and is freed as that kind.
+/// under the wrong tag looks up as the kind its object is, and is freed as that kind. The record is
+/// rewritten after a true `allocate`, as no caller could: what is pinned is the lookup, not that
+/// `allocate` takes a tag the object disagrees with.
 #[test]
 fn a_lookup_reads_the_objects_tag_not_the_entrys() {
     let t = fresh_table();
     test_probe::reset();
-    let h = t.allocate(1, mk_process(1), KObjectType::Thread, Rights::empty()).unwrap();
+    let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::empty()).unwrap();
+    let (seg, slot, _) = h.decode();
+    let entries = t.directory[seg as usize].load(Ordering::Acquire);
+    // SAFETY: a published segment, which outlives the table; the test is single-threaded.
+    unsafe { (*entries)[slot as usize].object_type.store(KObjectType::Thread as u32, Ordering::Relaxed) };
     let ok = t.lookup(h, 1, Rights::empty()).unwrap();
     let (ptr, ty) = ok.object.into_raw();
     assert_eq!(ty, KObjectType::Process, "the tag a lookup's reference carries");

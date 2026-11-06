@@ -398,9 +398,7 @@ mod tests {
         init_global_heap();
         test_probe::reset();
         let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
-        let ptr = KBox::into_raw(m).as_ptr() as *mut ();
-        // SAFETY: `ptr` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(ptr) };
+        let r = ObjectRef::new(m);
         assert_eq!(test_probe::memory_object_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::memory_object_destroys(), 1);

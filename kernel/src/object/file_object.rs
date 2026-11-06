@@ -2374,9 +2374,7 @@ mod tests {
         test_probe::reset();
         let f = fobj(PAGE_SIZE);
         let _ = f.reserve(0);
-        let ptr = KBox::into_raw(f).as_ptr() as *mut ();
-        // SAFETY: `ptr` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(ptr) };
+        let r = ObjectRef::new(f);
         assert_eq!(test_probe::file_object_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::file_object_destroys(), 1);

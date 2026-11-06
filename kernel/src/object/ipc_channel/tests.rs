@@ -188,9 +188,8 @@ fn transfer_moves_with_message_and_releases_on_drop() {
     init_global_heap();
     test_probe::reset();
     let (a, b) = new_pair();
-    let p = KBox::into_raw(Process::try_new(99).unwrap()).as_ptr() as *mut ();
-    // SAFETY: adopts the process's creation reference.
-    let pref = unsafe { ObjectRef::from_raw(p) };
+    let pref = ObjectRef::new(Process::try_new(99).unwrap());
+    let p = pref.as_ptr();
     // SAFETY: live endpoints, single-threaded test.
     unsafe {
         let mut send_t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
@@ -219,9 +218,7 @@ fn undelivered_transfer_released_when_endpoint_destroyed() {
     init_global_heap();
     test_probe::reset();
     let (a, b) = new_pair();
-    let p = KBox::into_raw(Process::try_new(7).unwrap()).as_ptr() as *mut ();
-    // SAFETY: adopts the process's creation reference.
-    let pref = unsafe { ObjectRef::from_raw(p) };
+    let pref = ObjectRef::new(Process::try_new(7).unwrap());
     // SAFETY: live endpoints, single-threaded test.
     unsafe {
         let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);

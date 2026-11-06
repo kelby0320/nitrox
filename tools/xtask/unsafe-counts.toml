@@ -16,14 +16,14 @@
 "kernel/src/io" = 43
 "kernel/src/libkern" = 38
 "kernel/src/limine" = 14
-"kernel/src/main" = 22
+"kernel/src/main" = 20
 "kernel/src/mm" = 87
 "kernel/src/object" = 148
 "kernel/src/pci" = 4
 "kernel/src/power" = 5
 "kernel/src/report" = 1
-"kernel/src/sched" = 195
-"kernel/src/syscall" = 50
+"kernel/src/sched" = 194
+"kernel/src/syscall" = 48
 "kernel/src/tlb" = 2
 
 [unsafe-fns]

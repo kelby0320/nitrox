@@ -368,10 +368,7 @@ pub fn alloc_pid() -> Option<u32> {
 
 /// Adopt a freshly created `Thread` into an [`ObjectRef`] without a refcount change.
 fn into_objref(t: KBox<Thread>) -> ObjectRef {
-    let ptr = KBox::into_raw(t).as_ptr() as *mut ();
-    // SAFETY: `KBox::into_raw` yielded the single creation reference (the
-    // header starts at refcount 1); `from_raw` adopts it without bumping.
-    unsafe { ObjectRef::from_raw(ptr) }
+    ObjectRef::new(t)
 }
 
 /// Cooperatively yield to the next ready thread, round-robin. Returns immediately (still

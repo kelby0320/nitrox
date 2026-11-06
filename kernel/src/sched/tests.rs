@@ -560,9 +560,7 @@ fn entry(deadline_ns: u64, target: usize) -> deadline::Entry {
 mod timers;
 
 fn new_timer() -> ObjectRef {
-    let obj = KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut ();
-    // SAFETY: `obj` carries the single creation reference.
-    unsafe { ObjectRef::from_raw(obj) }
+    ObjectRef::new(Timer::try_new().unwrap())
 }
 
 #[test]
@@ -851,9 +849,7 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
     st.ended_pids = Reserved::with_capacity(4).unwrap();
     st.reaper = Some(inert_ref(99));
     let (process, _root) = user_process_ref(5);
-    let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
-    // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-    let parent = unsafe { ObjectRef::from_raw(chan) };
+    let parent = ObjectRef::new(NotificationChannel::try_new().unwrap());
     let recorded = ExitStatus { kind: ExitKind::Normal as u32, code: 3 };
     {
         let p = process.as_ptr();
@@ -938,9 +934,8 @@ fn a_fault_wakes_the_thread_waiting_on_its_channel_or_none() {
     init_global_heap();
     super::online_set::force(0b1);
     let mut st = reserved_state();
-    let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
-    // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-    let _pinned = unsafe { ObjectRef::from_raw(chan) };
+    let _pinned = ObjectRef::new(NotificationChannel::try_new().unwrap());
+    let chan = _pinned.as_ptr();
     let notif = Notification::seg_fault(7, 0xdead_0000, FaultKind::NotWritable);
     // SAFETY: the test's own live channel, its queue room reserved by `try_new`; single-threaded.
     unsafe {

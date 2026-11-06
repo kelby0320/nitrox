@@ -79,9 +79,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     }
 
     let chan = NotificationChannel::try_new().map_err(|_| KError::OutOfMemory)?;
-    let chan_ptr = KBox::into_raw(chan).as_ptr() as *mut ();
-    // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-    let chan_ref = unsafe { ObjectRef::from_raw(chan_ptr) };
+    let chan_ref = ObjectRef::new(chan);
     proc_box.set_notification_channel(chan_ref.clone()); // refcount 2
     let (cp, ct) = chan_ref.into_raw();
     let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;

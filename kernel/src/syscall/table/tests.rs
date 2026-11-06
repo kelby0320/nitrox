@@ -417,6 +417,34 @@ fn map_handle_err_collapses_notowner_to_invalid() {
     assert_eq!(map_handle_err(HandleError::OutOfHandles), KError::OutOfHandles);
     assert_eq!(map_handle_err(HandleError::OutOfMemory), KError::OutOfMemory);
     assert_eq!(map_handle_err(HandleError::BadRights), KError::InvalidArgument);
+    assert_eq!(map_handle_err(HandleError::WrongType), KError::InvalidArgument);
+}
+
+/// **Only a memory object or a file maps**: `sys_memory_map` answers another kind `InvalidHandle`.
+#[test]
+fn only_a_memory_object_or_a_file_maps() {
+    use crate::object::{FileObject, MemoryObject, PendingOperation, Producer};
+    init_global_heap();
+    let memory = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+    let file = ObjectRef::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap());
+    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
+    assert!(matches!(Mappable::of(memory), Ok(Mappable::Memory(_))));
+    assert!(matches!(Mappable::of(file), Ok(Mappable::File(_))));
+    assert!(matches!(Mappable::of(po), Err(KError::InvalidHandle)));
+}
+
+/// **A handle of another kind is `InvalidArgument`** to every syscall that names the kind it wants,
+/// as `lookup_typed`'s callers answered.
+#[test]
+fn a_handle_of_another_kind_is_an_invalid_argument() {
+    use crate::object::{Namespace, Timer};
+    const PID: u32 = 4453;
+    init_global_heap();
+    global::init_for_tests();
+    let h = install(PID, ObjectRef::new(Timer::try_new().unwrap()), Rights::empty()).unwrap().bits();
+    assert_eq!(lookup_as::<Namespace>(h, PID, Rights::empty()).unwrap_err(), KError::InvalidArgument);
+    assert!(lookup_as::<Timer>(h, PID, Rights::empty()).is_ok());
+    assert_eq!(global::close_all_owned_by(PID), 1);
 }
 
 #[test]

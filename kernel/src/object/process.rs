@@ -215,9 +215,8 @@ mod tests {
         test_probe::reset();
         let mut p = Process::try_new(1).unwrap();
         assert!(p.notification_channel_ptr().is_none());
-        let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
-        // SAFETY: into_raw yielded the single creation ref; adopt it.
-        let chan_ref = unsafe { ObjectRef::from_raw(chan) };
+        let chan_ref = ObjectRef::new(NotificationChannel::try_new().unwrap());
+        let chan = chan_ref.as_ptr();
         p.set_notification_channel(chan_ref);
         assert_eq!(p.notification_channel_ptr(), Some(chan));
         assert_eq!(test_probe::notification_channel_destroys(), 0);
@@ -233,9 +232,8 @@ mod tests {
         test_probe::reset();
         let mut p = Process::try_new(1).unwrap();
         assert!(p.namespace_ref().is_none());
-        let ns = KBox::into_raw(Namespace::try_new().unwrap()).as_ptr() as *mut ();
-        // SAFETY: into_raw yielded the single creation ref; adopt it.
-        let ns_ref = unsafe { ObjectRef::from_raw(ns) };
+        let ns_ref = ObjectRef::new(Namespace::try_new().unwrap());
+        let ns = ns_ref.as_ptr();
         p.set_namespace(ns_ref);
         let cloned = p.namespace_ref().expect("namespace attached");
         assert_eq!(cloned.as_ptr(), ns);

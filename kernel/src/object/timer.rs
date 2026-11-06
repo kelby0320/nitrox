@@ -276,9 +276,7 @@ mod tests {
     fn dispatch_destroy_runs_timer_arm() {
         init_global_heap();
         test_probe::reset();
-        let obj = KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut ();
-        // SAFETY: `obj` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(obj) };
+        let r = ObjectRef::new(Timer::try_new().unwrap());
         assert_eq!(test_probe::timer_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::timer_destroys(), 1);

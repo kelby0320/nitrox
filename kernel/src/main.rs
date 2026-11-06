@@ -754,10 +754,8 @@ fn run_first_userspace() {
             return;
         }
     };
-    let chan_ptr = KBox::into_raw(chan).as_ptr() as *mut ();
-    // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
-    // one for the Process, install the other as a handle (refcount → 2).
-    let chan_ref = unsafe { ObjectRef::from_raw(chan_ptr) };
+    // One reference for the Process, the other installed as a handle (refcount → 2).
+    let chan_ref = ObjectRef::new(chan);
     proc_box.set_notification_channel(chan_ref.clone());
     let (cp, ct) = chan_ref.into_raw();
     let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
@@ -883,10 +881,8 @@ fn run_first_userspace() {
 
     nitrox_kernel::drivers::gpt::bind_partition_names(&ns);
 
-    let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
-    // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
-    // one for the Process, install the other as a handle (refcount → 2).
-    let ns_ref = unsafe { ObjectRef::from_raw(ns_ptr) };
+    // One reference for the Process, the other installed as a handle (refcount → 2).
+    let ns_ref = ObjectRef::new(ns);
     proc_box.set_namespace(ns_ref.clone());
     let (np, nt) = ns_ref.into_raw();
     // Full namespace rights, in sync with `syscall::table::namespace_rights`.
