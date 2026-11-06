@@ -170,8 +170,7 @@ pub fn preempt_enable() {
 fn preempt_irqs_mask() -> bool {
     #[cfg(not(test))]
     {
-        // SAFETY: ring-0; a microseconds-bounded masked window, restored below.
-        unsafe { Cpu::interrupts_disable() }
+        Cpu::interrupts_disable()
     }
     #[cfg(test)]
     {

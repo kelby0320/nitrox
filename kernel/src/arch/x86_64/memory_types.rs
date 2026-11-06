@@ -137,7 +137,7 @@ fn log_table(what: &str, pat: u64) {
 }
 
 impl ArchMemoryTypes for X86MemoryTypes {
-    unsafe fn at(phys: u64) -> Option<MemoryType> {
+    fn at(phys: u64) -> Option<MemoryType> {
         if regs::cpuid(1, 0).3 & CPUID_EDX_MTRR == 0 {
             return None;
         }
@@ -155,7 +155,7 @@ impl ArchMemoryTypes for X86MemoryTypes {
         Some(type_for(phys, &ranges[..used], decode((def & 0xFF) as u8), enabled))
     }
 
-    unsafe fn of_mapping(virt: u64) -> Option<MemoryType> {
+    fn of_mapping(virt: u64) -> Option<MemoryType> {
         if regs::cpuid(1, 0).3 & CPUID_EDX_PAT == 0 {
             return None;
         }
@@ -207,7 +207,7 @@ impl ArchMemoryTypes for X86MemoryTypes {
         Policy::Replaced
     }
 
-    unsafe fn log_configuration() {
+    fn log_configuration() {
         let edx = regs::cpuid(1, 0).3;
         if edx & CPUID_EDX_MTRR == 0 {
             crate::kprintln!("cache policy: no range registers on this CPU");

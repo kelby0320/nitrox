@@ -142,21 +142,13 @@ pub trait ArchPaging {
     unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, UnmapError>;
 
     /// Invalidate the TLB entry for the page containing `virt` on the
-    /// current CPU.
-    ///
-    /// # Safety
-    /// Issues a ring-0-only instruction. The caller should already have
-    /// updated the page tables so the invalidation reflects a real change.
-    unsafe fn flush_tlb_page(virt: VirtAddr);
+    /// current CPU. Safe, as an invalidation only makes the CPU walk the tables again.
+    fn flush_tlb_page(virt: VirtAddr);
 
     /// Invalidate every non-global TLB entry on the current CPU by
     /// reloading the page-table root with its current value. Entries for
     /// pages marked [`PageFlags::GLOBAL`] survive.
-    ///
-    /// # Safety
-    /// Ring-0 only. Reloads the active root with the value it already
-    /// holds, so the active address space is unchanged.
-    unsafe fn flush_tlb_all();
+    fn flush_tlb_all();
 
     /// Switch the active address space by loading `root` as the
     /// page-table root of the current CPU.

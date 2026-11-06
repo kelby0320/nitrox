@@ -121,8 +121,7 @@ pub fn self_test() {
         }
         core::hint::spin_loop();
     }
-    // SAFETY: ring-0; restore interrupts-masked.
-    let _ = unsafe { crate::arch::Cpu::interrupts_disable() };
+    let _ = crate::arch::Cpu::interrupts_disable();
 
     if !via_irq {
         ahci::poll_complete_inflight();

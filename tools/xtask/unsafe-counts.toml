@@ -4,30 +4,30 @@
 # commit that adds the `unsafe`, whose message says why (kernel/CLAUDE.md's `unsafe` policy).
 
 [unsafe-blocks]
-"kernel/src/arch" = 207
+"kernel/src/arch" = 201
 "kernel/src/boot_selftest" = 8
 "kernel/src/clock" = 1
 "kernel/src/device" = 5
 "kernel/src/dpc" = 4
-"kernel/src/drivers" = 134
+"kernel/src/drivers" = 133
 "kernel/src/fbcon" = 4
 "kernel/src/handle" = 30
 "kernel/src/initramfs" = 1
 "kernel/src/io" = 64
-"kernel/src/libkern" = 40
+"kernel/src/libkern" = 38
 "kernel/src/limine" = 14
-"kernel/src/main" = 26
-"kernel/src/mm" = 92
+"kernel/src/main" = 23
+"kernel/src/mm" = 90
 "kernel/src/object" = 178
 "kernel/src/pci" = 5
 "kernel/src/power" = 7
 "kernel/src/report" = 1
-"kernel/src/sched" = 197
-"kernel/src/syscall" = 90
-"kernel/src/tlb" = 5
+"kernel/src/sched" = 196
+"kernel/src/syscall" = 89
+"kernel/src/tlb" = 2
 
 [unsafe-fns]
-"kernel/src/arch" = 142
+"kernel/src/arch" = 125
 "kernel/src/dpc" = 2
 "kernel/src/drivers" = 7
 "kernel/src/fbcon" = 5
@@ -42,4 +42,3 @@
 "kernel/src/object" = 106
 "kernel/src/pci" = 1
 "kernel/src/sched" = 45
-"kernel/src/tlb" = 1

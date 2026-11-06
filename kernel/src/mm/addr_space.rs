@@ -276,11 +276,9 @@ impl AddressSpace {
                         unreachable!("fault_in: map_page called Misaligned a page-aligned address");
                     }
                 }
-                // SAFETY: ring-0 `invlpg` evicting the not-present entry the
-                // CPU cached for this page on the fault we are servicing.
-                unsafe {
-                    Paging::flush_tlb_page(page_base);
-                }
+                // Evict the not-present entry the CPU cached for this page on the fault we are
+                // servicing.
+                Paging::flush_tlb_page(page_base);
                 FaultIn::Mapped
             }
             // Installed eagerly by `map_object`; a fault here is a bug or teardown race.
@@ -467,9 +465,7 @@ impl AddressSpace {
         // `page_base` is page-aligned and in the validated user-half VMA range.
         match unsafe { Paging::map_page(root, page_base, frame, flags) } {
             Ok(()) | Err(ArchMapError::AlreadyMapped) => {
-                // SAFETY: ring-0 `invlpg` evicting the not-present entry cached on
-                // the fault we are servicing.
-                unsafe { Paging::flush_tlb_page(page_base) };
+                Paging::flush_tlb_page(page_base);
                 true
             }
             Err(ArchMapError::OutOfMemory) => false,

@@ -615,11 +615,9 @@ fn record_framebuffer() {
 /// device memory with a different type is the aliasing the manuals warn about, so this maps the
 /// same attribute the console's has, for one fill, then unmaps it.
 fn report_framebuffer_cost(console_virt: u64) {
-    // SAFETY: ring 0, during boot, with the console up.
-    unsafe { arch::MemoryTypes::log_configuration() };
+    arch::MemoryTypes::log_configuration();
     let Some((phys, info, caching)) = framebuffer::aperture() else { return };
-    // SAFETY: ring 0; reads configuration registers only.
-    match unsafe { arch::MemoryTypes::at(phys.as_u64()) } {
+    match arch::MemoryTypes::at(phys.as_u64()) {
         Some(kind) => kprintln!(
             "framebuffer: {:#x} is {} memory, and a plain mapping of it is write-back{}",
             phys.as_u64(),
@@ -640,12 +638,9 @@ fn report_framebuffer_cost(console_virt: u64) {
     // SAFETY: `plain`, when mapped, addresses the same framebuffer for the length of the call;
     // the console is the kernel's and no userspace exists yet.
     let measured = unsafe { fbcon::time_full_fills(plain.map(|v| v.as_u64() as *mut u8)) };
-    let asks = |what: &str, virt: u64| {
-        // SAFETY: ring 0; walks the active page tables and reads a configuration register.
-        match unsafe { arch::MemoryTypes::of_mapping(virt) } {
-            Some(kind) => kprintln!("framebuffer: {what} asks for {}", kind.name()),
-            None => kprintln!("framebuffer: {what} could not be read"),
-        }
+    let asks = |what: &str, virt: u64| match arch::MemoryTypes::of_mapping(virt) {
+        Some(kind) => kprintln!("framebuffer: {what} asks for {}", kind.name()),
+        None => kprintln!("framebuffer: {what} could not be read"),
     };
     asks("the console's mapping", console_virt);
     if let Some(v) = plain {

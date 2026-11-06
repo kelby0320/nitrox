@@ -240,8 +240,7 @@ impl ArchIrqRouter for X86IoApic {
             }
             core::hint::spin_loop();
         }
-        // SAFETY: ring-0; restore interrupts-masked.
-        let _ = unsafe { Cpu::interrupts_disable() };
+        let _ = Cpu::interrupts_disable();
 
         // SAFETY: ring-0; mask the line again (the PIT free-runs, ignored).
         unsafe { Self::mask(gsi) };
