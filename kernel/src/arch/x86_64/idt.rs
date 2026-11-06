@@ -333,7 +333,7 @@ fn try_fault_in(cr2: u64, error_code: u64) -> bool {
             let Some((file_obj, index)) = asp.file_backing(addr) else {
                 return false;
             };
-            match crate::object::FileObject::fault_in_page(&file_obj, index) {
+            match crate::object::FileObject::fault_in_page(file_obj.as_object(), index) {
                 Some(frame) => asp.map_file_page(addr, &file_obj, frame),
                 None => false,
             }

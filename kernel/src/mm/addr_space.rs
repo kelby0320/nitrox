@@ -17,12 +17,12 @@ use core::ptr;
 use crate::arch::Paging;
 use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_MAP_END, USER_STACK_GUARD_SIZE};
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock, SpinLockGuard};
-use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaTree};
+use crate::mm::vmm::{Backing, FaultAccess, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr, heap};
-use crate::object::{FileObject, MemoryObject, ObjectRef};
+use crate::object::header::Ref;
+use crate::object::{FileObject, MemoryObject};
 
 /// Base of the `hint == 0` ("anywhere") window: above the ELF image, well below the user stack.
 const MMAP_BASE: u64 = 0x1_0000_0000;
@@ -64,7 +64,7 @@ pub enum FaultIn {
     Protection,
     /// A VMA permits the access but no backing frame could be allocated.
     Oom,
-    /// A [`FileBacked`](MappingKind::FileBacked) not-present fault. `fault_in` only *signals*:
+    /// A [`File`](Backing::File) not-present fault. `fault_in` only *signals*:
     /// the caller fetches the backing ([`file_backing`](AddressSpace::file_backing)), makes the
     /// page resident and installs the PTE ([`map_file_page`](AddressSpace::map_file_page)) outside
     /// the AS lock, since the file's page-cache lock is rank 4 like this one and they never nest.
@@ -191,11 +191,11 @@ impl AddressSpace {
     }
 
     /// Reserve an **anonymous** VMA with no frames and no PTEs; [`fault_in`](Self::fault_in)
-    /// zeroes and maps each page on first touch. `boxed.mapping` must be
-    /// [`MappingKind::Anonymous`]. Same rejections as `map_vma` (box returned), but it allocates
+    /// zeroes and maps each page on first touch. `boxed.backing` must be
+    /// [`Backing::Anonymous`]. Same rejections as `map_vma` (box returned), but it allocates
     /// nothing, so never [`OutOfMemory`](MapError::OutOfMemory).
     pub fn map_vma_lazy(&self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
-        debug_assert_eq!(boxed.mapping, MappingKind::Anonymous, "map_vma_lazy is for anonymous mappings only");
+        debug_assert!(matches!(boxed.backing, Backing::Anonymous), "map_vma_lazy is for anonymous mappings only");
         let range = boxed.range;
 
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
@@ -221,7 +221,7 @@ impl AddressSpace {
     /// Resolve a page fault at `addr` for `access` against this (currently loaded) address space.
     /// Called from the arch `#PF` handler for a **not-present** ring-3 fault.
     ///
-    /// For an [`Anonymous`](MappingKind::Anonymous) VMA permitting the access, allocates and zeroes
+    /// For an [`Anonymous`](Backing::Anonymous) VMA permitting the access, allocates and zeroes
     /// a frame, installs the leaf PTE and flushes that page's stale not-present TLB entry. The
     /// address space **is live in the MMU** (unlike eager `map_vma`), so the flush is mandatory.
     /// Only [`FaultIn::Mapped`] means retry.
@@ -243,12 +243,11 @@ impl AddressSpace {
         }
 
         let flags = page_flags_for(vma.prot, vma.caching);
-        let kind = vma.mapping;
         let root = guard.root;
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
 
-        match kind {
-            MappingKind::Anonymous => {
+        match vma.backing {
+            Backing::Anonymous => {
                 let Some(phys) = heap::buddy_alloc(0) else {
                     return FaultIn::Oom;
                 };
@@ -282,10 +281,10 @@ impl AddressSpace {
                 FaultIn::Mapped
             }
             // Installed eagerly by `map_object`; a fault here is a bug or teardown race.
-            MappingKind::Object => FaultIn::NoVma,
+            Backing::Object(_) => FaultIn::NoVma,
             // Signal only: the file cache's lock is rank 4 like this one and they never nest
             // (see `FaultIn::FileBacked`).
-            MappingKind::FileBacked => FaultIn::FileBacked,
+            Backing::File(_) => FaultIn::FileBacked,
         }
     }
 
@@ -299,8 +298,8 @@ impl AddressSpace {
         &self,
         range: VAddrRange,
         prot: Protection,
-        object: ObjectRef,
-    ) -> Result<(), (ObjectRef, MapError)> {
+        object: Ref<MemoryObject>,
+    ) -> Result<(), (Ref<MemoryObject>, MapError)> {
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((object, MapError::NotCanonical));
@@ -309,20 +308,14 @@ impl AddressSpace {
             return Err((object, MapError::NotUserHalf));
         }
 
-        assert_eq!(object.object_type(), KObjectType::MemoryObject, "map_object");
-        // SAFETY: `object` holds a reference to a live `MemoryObject` (its
-        // header is at offset 0); we only read its frame list.
-        let mobj = unsafe { &*(object.as_ptr() as *const MemoryObject) };
-        // `frames` borrows through the raw pointer, not `object`, so `object` can move into the VMA
-        // below while the install loop still reads it; the object stays alive throughout.
-        let frames = mobj.frames_to_map();
-        let caching = mobj.caching();
+        let frames = object.frames_to_map();
+        let caching = object.caching();
         let npages = range.pages();
         debug_assert!(frames.len() as u64 >= npages, "object too small for range");
 
         // Build the VMA box before the lock (no allocation under a spinlock); the only fallible
         // step before `object` is consumed, so failure can return it.
-        let mut boxed = match KBox::try_new(Vma::new(range, prot, MappingKind::Object)) {
+        let mut boxed = match KBox::try_new(Vma::new(range, prot)) {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
@@ -362,12 +355,12 @@ impl AddressSpace {
             }
         }
 
-        boxed.object = Some(object);
+        boxed.backing = Backing::Object(object);
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             Err(mut b) => {
                 rollback_object_map(guard, range.start(), installed);
-                let object = b.object.take().expect("object-backed VMA carries its ObjectRef");
+                let Backing::Object(object) = b.take_backing() else { unreachable!("an object-backed VMA") };
                 Err((object, MapError::Overlap))
             }
         }
@@ -384,9 +377,8 @@ impl AddressSpace {
         &self,
         range: VAddrRange,
         prot: Protection,
-        object: ObjectRef,
-    ) -> Result<(), (ObjectRef, MapError)> {
-        assert_eq!(object.object_type(), KObjectType::FileObject, "map_file");
+        object: Ref<FileObject>,
+    ) -> Result<(), (Ref<FileObject>, MapError)> {
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((object, MapError::NotCanonical));
@@ -394,7 +386,7 @@ impl AddressSpace {
         if range.end().as_u64() > USER_MAP_END {
             return Err((object, MapError::NotUserHalf));
         }
-        let mut boxed = match KBox::try_new(Vma::new(range, prot, MappingKind::FileBacked)) {
+        let mut boxed = match KBox::try_new(Vma::new(range, prot)) {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
@@ -403,12 +395,11 @@ impl AddressSpace {
         // undoes it here, since its VMA drops without its object.
         let writable = prot.contains(Protection::WRITE);
         if writable {
-            FileObject::writable_mapped(&object);
+            FileObject::writable_mapped(object.as_object());
         }
-        let refused = |object: ObjectRef, e: MapError| {
+        let refused = |object: Ref<FileObject>, e: MapError| {
             if writable {
-                // SAFETY: `object` pins the `FileObject` the mapping counted.
-                unsafe { FileObject::writable_unmapped(object.as_ptr()) };
+                object.writable_unmapped();
             }
             Err((object, e))
         };
@@ -417,11 +408,11 @@ impl AddressSpace {
             drop(guard);
             return refused(object, MapError::Overlap);
         }
-        boxed.object = Some(object);
+        boxed.backing = Backing::File(object);
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             Err(mut b) => {
-                let object = b.object.take().expect("file-backed VMA carries its ObjectRef");
+                let Backing::File(object) = b.take_backing() else { unreachable!("a file-backed VMA") };
                 drop(guard);
                 refused(object, MapError::Overlap)
             }
@@ -429,16 +420,16 @@ impl AddressSpace {
     }
 
     /// For a `FileBacked` fault at `addr`: the backing [`FileObject`](crate::object::FileObject)
-    /// (a cloned `ObjectRef`) and the page index within the file; `None` if no file-backed VMA
+    /// (a cloned reference) and the page index within the file; `None` if no file-backed VMA
     /// covers `addr` (a teardown race). A fresh lock acquisition, so the page cache is reached
     /// only **outside** this AS lock.
-    pub fn file_backing(&self, addr: VirtAddr) -> Option<(ObjectRef, usize)> {
+    pub fn file_backing(&self, addr: VirtAddr) -> Option<(Ref<FileObject>, usize)> {
         let guard = self.inner.lock();
         let vma = guard.vma_tree.find_covering(addr)?;
-        if vma.mapping != MappingKind::FileBacked {
+        let Backing::File(file) = &vma.backing else {
             return None;
-        }
-        let object = vma.object.as_ref()?.clone();
+        };
+        let object = file.clone();
         let page_base = addr.as_u64() & !(PAGE_SIZE as u64 - 1);
         let index = ((page_base - vma.range.start().as_u64()) / PAGE_SIZE as u64) as usize;
         Some((object, index))
@@ -449,19 +440,19 @@ impl AddressSpace {
     /// (the fault may have raced an unmap or exit). `true` if the page is now present (installed
     /// here or by a racing fault); `false` if the VMA is gone or changed, or a page-table
     /// allocation failed. The object owns the frame, so `unmap` removes the PTE without freeing it.
-    pub fn map_file_page(&self, addr: VirtAddr, object: &ObjectRef, frame: PhysAddr) -> bool {
+    pub fn map_file_page(&self, addr: VirtAddr, object: &Ref<FileObject>, frame: PhysAddr) -> bool {
         let guard = self.inner.lock();
         let Some(vma) = guard.vma_tree.find_covering(addr) else {
             return false;
         };
-        if vma.mapping != MappingKind::FileBacked || vma.object.as_ref().map(|o| o.as_ptr()) != Some(object.as_ptr()) {
+        if !matches!(&vma.backing, Backing::File(file) if file.as_ptr() == object.as_ptr()) {
             return false;
         }
         let flags = page_flags_for(vma.prot, vma.caching);
         let root = guard.root;
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
         // SAFETY: `root` is this AS's PML4; `frame` is a live, resident cache frame
-        // the file object owns and keeps alive (the VMA holds its `ObjectRef`);
+        // the file object owns and keeps alive (the VMA holds its reference);
         // `page_base` is page-aligned and in the validated user-half VMA range.
         match unsafe { Paging::map_page(root, page_base, frame, flags) } {
             Ok(()) | Err(ArchMapError::AlreadyMapped) => {
@@ -519,7 +510,7 @@ impl AddressSpace {
         // Only an anonymous mapping's frames come back; reserving for a mapped 2 GiB file would
         // ask for more than the largest allocation and refuse the unmap.
         let pages = match guard.vma_tree.find_covering(addr) {
-            Some(v) if matches!(v.mapping, MappingKind::Anonymous) => v.range.pages(),
+            Some(v) if matches!(v.backing, Backing::Anonymous) => v.range.pages(),
             Some(_) => 0,
             None => return Ok(None),
         };
@@ -534,7 +525,7 @@ impl AddressSpace {
             // were installed into.
             let r = unsafe { Paging::unmap_page(guard.root, virt) };
             if let Ok(phys) = r
-                && matches!(boxed.mapping, MappingKind::Anonymous)
+                && matches!(boxed.backing, Backing::Anonymous)
             {
                 frames.try_push(phys).expect("within the spare capacity checked above");
             }
@@ -604,15 +595,12 @@ fn free_vma_pages(root: PhysAddr, vma: &Vma) {
         // valid top-level table they were installed into.
         let r = unsafe { Paging::unmap_page(root, virt) };
         if let Ok(phys) = r {
-            match vma.mapping {
-                MappingKind::Anonymous => heap::buddy_free(phys, 0),
+            match vma.backing {
+                Backing::Anonymous => heap::buddy_free(phys, 0),
                 // The `MemoryObject` owns the frames and frees them on its last-ref drop.
-                MappingKind::Object => {}
-                // TODO(phase-2 page cache): file pages are owned by the page
-                // cache, not this mapping, so (like Object) the PTE is removed
-                // but the frame is not freed here. No FileBacked VMA is ever
-                // constructed yet, so this arm is currently unreachable.
-                MappingKind::FileBacked => {}
+                Backing::Object(_) => {}
+                // The file's page cache owns the frames, as an object owns its own.
+                Backing::File(_) => {}
             }
         }
     }

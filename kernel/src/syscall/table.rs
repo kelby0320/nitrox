@@ -665,13 +665,13 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
 
     // A `MemoryObject` (eager) or demand-paged `FileObject`; others lack the `MAP_*` right.
     let ok = global::get().lookup(RawHandle(obj_h), pid, required).map_err(map_handle_err)?;
-    let obj_ty = ok.object.object_type();
-    let max_bytes = match obj_ty {
-        // SAFETY: type-confirmed live object pinned by `lookup`; read its size.
-        KObjectType::MemoryObject => unsafe { &*(ok.object.as_ptr() as *const MemoryObject) }.size(),
-        // SAFETY: as above.
-        KObjectType::FileObject => unsafe { &*(ok.object.as_ptr() as *const FileObject) }.npages() * PAGE_SIZE,
-        _ => return Err(KError::InvalidHandle),
+    let object = match ok.object.downcast::<MemoryObject>() {
+        Ok(memory) => Mappable::Memory(memory),
+        Err(other) => Mappable::File(other.downcast::<FileObject>().map_err(|_| KError::InvalidHandle)?),
+    };
+    let max_bytes = match &object {
+        Mappable::Memory(memory) => memory.size(),
+        Mappable::File(file) => file.npages() * PAGE_SIZE,
     };
 
     let size = round_up_page(size);
@@ -705,20 +705,19 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
     }
 
     // `MemoryObject` maps eagerly; `FileObject` **lazily** (`fault_in` pages in on first touch).
-    let result = match obj_ty {
-        KObjectType::FileObject => asp.map_file(range, prot, ok.object),
-        _ => asp.map_object(range, prot, ok.object),
+    let result = match object {
+        Mappable::Memory(memory) => asp.map_object(range, prot, memory).map_err(|(_, e)| e),
+        Mappable::File(file) => asp.map_file(range, prot, file).map_err(|(_, e)| e),
     };
-    match result {
-        Ok(()) => {
-            Paging::flush_tlb_all();
-            Ok(range.start().as_u64() as isize)
-        }
-        Err((returned, e)) => {
-            drop(returned);
-            Err(map_mem_map_err(e))
-        }
-    }
+    result.map_err(map_mem_map_err)?;
+    Paging::flush_tlb_all();
+    Ok(range.start().as_u64() as isize)
+}
+
+/// What `sys_memory_map` maps.
+enum Mappable {
+    Memory(crate::object::header::Ref<MemoryObject>),
+    File(crate::object::header::Ref<FileObject>),
 }
 
 /// `sys_memory_unmap(addr, size)` — unmap the region at `addr` from the caller's address

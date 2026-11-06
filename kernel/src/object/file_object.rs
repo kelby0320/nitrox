@@ -4,7 +4,7 @@
 //! Where a [`MemoryObject`](crate::object::MemoryObject) is RAM committed **eagerly**, a
 //! `FileObject` owns a sparse **page cache**: frames allocated and filled when a page is first
 //! faulted, freed with the object. `sys_memory_map` builds a lazy
-//! [`MappingKind::FileBacked`](crate::mm::vmm::MappingKind) VMA; the `#PF` handler faults pages
+//! [`Backing::File`](crate::mm::vmm::Backing) VMA; the `#PF` handler faults pages
 //! in through the cache. See `docs/architecture/memory-management.md`.
 //!
 //! [`fault_in_page`](FileObject::fault_in_page) reserves a frame on a miss, starts the
@@ -397,16 +397,10 @@ impl FileObject {
         }
     }
 
-    /// A writable mapping of the object at `obj` has gone. Lock-free, since a VMA drops wherever
-    /// its address space is torn down; saturating, so a never-counted VMA takes no one's count.
-    ///
-    /// # Safety
-    ///
-    /// `obj` points at a live `FileObject`, pinned for the call by a reference the caller holds.
-    pub unsafe fn writable_unmapped(obj: *mut ()) {
-        // SAFETY: the caller's `ObjectRef` (the VMA's) pins a live `FileObject` at `obj`.
-        let fo: &FileObject = unsafe { &*(obj as *const FileObject) };
-        let _ = fo.writable_maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    /// A writable mapping of this object has gone. Lock-free, since a VMA drops wherever its
+    /// address space is torn down; saturating, so a never-counted VMA takes no one's count.
+    pub fn writable_unmapped(&self) {
+        let _ = self.writable_maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
     }
 
     /// **Taken before a write-back: whether it can leave the object clean.** `Some` only if no
@@ -1543,8 +1537,7 @@ mod tests {
         let a = resolve(&reg, 7, PAGE_SIZE);
         let first = a.as_ptr();
         FileObject::writable_mapped(&a);
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
         let mark = file_of(&a).clean_mark().expect("no writable mapping left");
         FileObject::unpin_if_clean(&a, mark);
         assert!(!file_of(&a).is_dirty());
@@ -1565,8 +1558,7 @@ mod tests {
         let first = a.as_ptr();
         let frame = fill(file_of(&a), 0, 0xC3);
         FileObject::writable_mapped(&a);
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
         assert!(file_of(&a).is_dirty());
         test_probe::reset();
         drop(a);
@@ -1593,14 +1585,12 @@ mod tests {
 
         FileObject::writable_mapped(&a);
         assert_eq!(fo.clean_mark(), None);
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
         assert!(fo.is_dirty(), "the sync that began mapped does not clean");
 
         let mark = fo.clean_mark().unwrap();
         FileObject::writable_mapped(&a);
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
         FileObject::unpin_if_clean(&a, mark);
         assert!(fo.is_dirty(), "a mapping during the write-back keeps it dirty");
 
@@ -1619,11 +1609,9 @@ mod tests {
         FileObject::writable_mapped(&a);
         assert_eq!(file_of(&a).writable_maps(), 1);
         assert!(!file_of(&a).is_dirty());
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
         assert_eq!(reg_of(&reg).cached_files(), 0);
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
         assert_eq!(file_of(&a).writable_maps(), 0);
     }
 
@@ -2188,8 +2176,7 @@ mod tests {
         let a = two_block_file(&reg, 7);
         let first = a.as_ptr();
         FileObject::writable_mapped(&a);
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
         assert!(file_of(&a).is_dirty());
         assert!(matches!(file_of(&a).begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)));
         assert!(file_of(&a).end_io().is_none(), "nothing forgotten yet");
@@ -2299,8 +2286,7 @@ mod tests {
         assert_eq!(count(), 2, "a file nothing holds leaves the cache");
 
         FileObject::writable_mapped(&dirty);
-        // SAFETY: `dirty` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(dirty.as_ptr()) };
+        file_of(&dirty).writable_unmapped();
         let mark = file_of(&dirty).clean_mark().expect("no writable mapping remains");
         let dirty_at = dirty.as_ptr();
         drop(dirty);
@@ -2337,8 +2323,7 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         FileObject::writable_mapped(&a);
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
         assert!(file_of(&a).is_dirty());
         assert_eq!(FileObject::let_go(&a), 2, "both pages resident, unwritten");
         assert!(!file_of(&a).is_dirty(), "the pin is gone");
@@ -2354,8 +2339,7 @@ mod tests {
         let _ = reg_of(&reg).forget_file(7, &po());
         FileObject::writable_mapped(&a);
         assert!(!file_of(&a).is_dirty());
-        // SAFETY: `a` pins the `FileObject`.
-        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
+        file_of(&a).writable_unmapped();
     }
 
     fn fault(f: &FileObject, index: usize) -> (&'static str, Option<PhysAddr>, Option<ObjectRef>) {

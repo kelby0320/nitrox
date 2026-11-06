@@ -6,8 +6,7 @@ use super::*;
 /// and [`no_object_type_check_is_debug_only`] keeps each check in a release build.
 #[test]
 fn every_cast_of_an_object_ref_stops_another_kind_at_its_type_check() {
-    use crate::mm::vmm::{MappingKind, Protection, VAddrRange, Vma};
-    use crate::mm::{Caching, PAGE_SIZE, VirtAddr};
+    use crate::mm::PAGE_SIZE;
     use crate::object::file_object::Producer;
     use crate::object::{FileObject, IpcChannel, MemoryObject, UserspaceServerReg};
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -24,8 +23,6 @@ fn every_cast_of_an_object_ref_stops_another_kind_at_its_type_check() {
     let reg = ObjectRef::new(UserspaceServerReg::try_new(endpoint).unwrap());
     // SAFETY: `reg` pins the live `UserspaceServerReg`.
     let reg_obj = unsafe { &*(reg.as_ptr() as *const UserspaceServerReg) };
-    let range = VAddrRange::new(VirtAddr::new(0x40_0000), VirtAddr::new(0x40_1000)).unwrap();
-    let asp = AddressSpace::new().unwrap();
     type Site<'a> = (&'static str, Box<dyn FnOnce() + 'a>);
     let sites: Vec<Site<'_>> = vec![
         (
@@ -85,18 +82,6 @@ fn every_cast_of_an_object_ref_stops_another_kind_at_its_type_check() {
             }),
         ),
         (
-            "map_object",
-            Box::new(|| {
-                let _ = asp.map_object(range, Protection::WRITE, file.clone());
-            }),
-        ),
-        (
-            "map_file",
-            Box::new(|| {
-                let _ = asp.map_file(range, Protection::WRITE, mo.clone());
-            }),
-        ),
-        (
             "current_address_space",
             Box::new(|| {
                 let _ = current_address_space(&mo);
@@ -112,14 +97,6 @@ fn every_cast_of_an_object_ref_stops_another_kind_at_its_type_check() {
             "io_buffer_size",
             Box::new(|| {
                 let _ = submit::io_buffer_size(&file);
-            }),
-        ),
-        (
-            "Vma::drop",
-            Box::new(|| {
-                let mut v = Vma::new_object(range, Protection::WRITE, mo.clone(), Caching::Normal);
-                v.mapping = MappingKind::FileBacked;
-                drop(v);
             }),
         ),
     ];

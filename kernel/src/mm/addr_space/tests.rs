@@ -49,7 +49,7 @@ fn range(start: u64, end: u64) -> VAddrRange {
 }
 
 fn anon_box(r: VAddrRange, prot: Protection) -> KBox<Vma> {
-    KBox::try_new(Vma::new(r, prot, MappingKind::Anonymous)).expect("test heap exhausted")
+    KBox::try_new(Vma::new(r, prot)).expect("test heap exhausted")
 }
 
 #[test]
@@ -189,10 +189,10 @@ fn drop_tears_down_populated_address_space() {
     }
 }
 
-use crate::object::header::test_probe;
+use crate::object::header::{Ref, test_probe};
 
-fn into_obj(m: KBox<MemoryObject>) -> ObjectRef {
-    ObjectRef::new(m)
+fn into_obj(m: KBox<MemoryObject>) -> Ref<MemoryObject> {
+    Ref::new(m)
 }
 
 fn uprot() -> Protection {
@@ -279,8 +279,8 @@ fn find_free_range_picks_a_gap_in_the_mmap_window() {
 
 use crate::object::{FileObject, Producer, Reserve};
 
-fn into_file(f: KBox<FileObject>) -> ObjectRef {
-    ObjectRef::new(f)
+fn into_file(f: KBox<FileObject>) -> Ref<FileObject> {
+    Ref::new(f)
 }
 
 /// **Dropping an address space must release its file-backed VMAs without a lock-order
@@ -643,14 +643,4 @@ fn an_unmap_is_shot_down_before_its_frames_or_its_object_are_freed() {
         assert_eq!(crate::tlb::shootdowns_by_this_thread().1, freed, "{at:#x}: none freed before it");
         assert_eq!(heap::frames_freed_by_this_thread() - freed, frames, "{at:#x}");
     }
-}
-
-/// **Mapping a file as a memory object stops at its type**, in a release build too.
-#[test]
-#[should_panic(expected = "left == right")]
-fn a_file_mapped_as_a_memory_object_stops_at_its_type() {
-    init_global_heap();
-    let asp = AddressSpace::new().unwrap();
-    let file = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-    let _ = asp.map_object(range(0x40_0000, 0x40_1000), uprot(), file);
 }

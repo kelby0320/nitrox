@@ -17,13 +17,13 @@
 "kernel/src/libkern" = 38
 "kernel/src/limine" = 14
 "kernel/src/main" = 23
-"kernel/src/mm" = 90
-"kernel/src/object" = 163
+"kernel/src/mm" = 87
+"kernel/src/object" = 162
 "kernel/src/pci" = 4
 "kernel/src/power" = 6
 "kernel/src/report" = 1
 "kernel/src/sched" = 196
-"kernel/src/syscall" = 81
+"kernel/src/syscall" = 79
 "kernel/src/tlb" = 2
 
 [unsafe-fns]
@@ -39,7 +39,7 @@
 "kernel/src/limine" = 2
 "kernel/src/main" = 1
 "kernel/src/mm" = 23
-"kernel/src/object" = 107
+"kernel/src/object" = 106
 "kernel/src/pci" = 1
 "kernel/src/sched" = 45
 
