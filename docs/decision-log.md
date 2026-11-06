@@ -37924,3 +37924,36 @@ Part J's third sub-part, `typed-layers.md` § J.3, built on `pre-phase-7/part-j3
   refused in turn, from a countdown that replaced the one-shot `FAIL_NEXT_ALLOCATE`, and a
   per-thread count of handles installed less closed says its tables are as they were. Counting per
   thread is what lets it run beside other tests on the one global table.
+
+## 2026-11-06 — Before Phase 7, J.4: the scheduler's plumbing once
+
+Part J's fourth sub-part, `typed-layers.md` § J.4, built on `pre-phase-7/part-j4-sched`.
+
+- **A wake goes through one loop**: `wake_all` takes a `Waiters<N>`, which only `WaitQueue::take`
+  makes, so its one `unsafe` block argues for every waiter once, where five loops argued each.
+- **What a `SCHED` hold lets go of waits in a bag the hold borrows**: `Deferred<N>`, sized to its
+  site's burst, and locked through. The borrow is what keeps the order: the bag must be declared
+  before the guard, so it drops after the lock is released. None of the eleven hand-carried
+  releases is left.
+- **A bag in interrupt context is declared so by its site**, `Deferred::in_interrupt`, and moves
+  what it holds to `deferred_drops`. Nothing tells interrupt context at run time, so the site
+  says so. A compile-time assertion keeps such a bag within that list's reserve. The tick's
+  entropy wake, the only such site, now takes a hold of its own: the hold the tick switches with
+  may not carry a bag.
+- **A full list or bag ends the machine through one function**, `reserve_exhausted`, the one place
+  a refused value is forgotten rather than dropped. A wake's placement and the held-send queue end
+  through it too, where each had a `mem::forget` before a `panic!` of its own.
+- **Every debug build asserts no `SCHED` on every `ObjectRef` drop**, where host tests asserted it
+  at a destroy alone. Every drop, because one dropped under the lock is the last whenever another
+  CPU lets go first. Every kernel image is a debug build, so every gate runs it. A boot with one
+  clone dropped under `SCHED` in `yield_now` fails `test-qemu`, and all 19 CI gates pass without
+  it.
+- **Every switch is one `switch_away(guard, Outgoing, Park)`**. Only taking this CPU's `current`
+  makes an `Outgoing`, so the context saved is always the running thread's own. `Park` names both
+  the list and the state. The reaper keeps `Blocked`, now named once.
+- **A deadline's target is an enum of addresses**, `usize`s, as `idle_addr` is, so the
+  scheduler's state stays `Send` without an `unsafe impl`. Removal matches the whole target, so a
+  held send's deadline is removed only by naming its endpoint too. No test held that removal
+  before; one now drives a delivery and a close.
+- `unsafe` blocks fall from 931 to 915, all in `sched`.
+
