@@ -57,6 +57,8 @@ Kernel objects are dispatched via `match` on `KObjectType`, not via `dyn Trait`.
 
 Don't introduce trait objects for kernel object operations. Per-type traits are fine for clarity within a type's implementation; cross-type dispatch is via the `KObjectType` discriminant.
 
+Reach a concrete type through `kernel/src/object/header.rs`, never a cast: a new object is a `Ref::new` or `ObjectRef::new` of its box, a handle is looked up with `lookup_as::<T>`, and an `ObjectRef` of any kind becomes a `T` by `downcast`/`downcast_ref`, which read the tag the type fixed in the header. A field or parameter that only ever holds one kind is a `Ref<T>`. A new object type is a `kobject!`, and a `Shared` impl argues why a `&T` is sound.
+
 ## ABI hash awareness
 
 Changes to the kernel's exported symbol surface (anything declared with `export!`), to ABI-critical type layouts (`KObjectHeader`, `Notification`, `Irp`, etc.), or to enum discriminant values invalidate the kernel ABI version hash. This forces all loadable kernel modules to be rebuilt. See `docs/spec/abi-version-hash.md` for what's in the hash.

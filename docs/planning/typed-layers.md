@@ -175,6 +175,23 @@ the header's, shown by an `ObjectRef` made with the wrong one through the `unsaf
 handle entries keep. The author writes the types; the implementer moves the sites a directory at a
 time, each diff read.
 
+**Built 2026-11-06.** None of what the pass measured is left: no hand-written downcast of an
+`ObjectRef` (76 at J.2's base), no hand-tagged adoption or `adopt` helper call, no `lookup_typed`,
+and no tag assertion before a cast. Tests are included; `Thread`'s raw accessors are left for J.6
+and J.7. The kernel's `unsafe` blocks fall from 1,094 to 959 and its `unsafe fn`s from 330 to 327.
+Its `unsafe impl`s rise from 52 to 67, each raised by hand:
+- the thirteen `Shared` claims, each argued beside its type;
+- `kobject!`'s impl;
+- `VmaTree: Send`, which is where `Process`'s missing `Send` came from; the tree owns every node
+  its links reach.
+
+Two things differ from the plan:
+- **`from_raw` takes no tag.** An `ObjectRef` keeps only the header's pointer, so the control
+  enters a Process into a handle under the Thread tag. It looks up as a Process, and on `main` as
+  a Thread.
+- **`Ref::try_acquire` is added**, for the caches that keep a `T`'s address weakly: a
+  registration's files, the console's node, an endpoint's registration.
+
 ### J.3 A handle holds its reference (kobj-o2 with kplat-o7; kobj-o9; kplat-d16)
 
 Measured: **21 `allocate` calls**, each an `into_raw` with a `from_raw` on its error arm; `close`
