@@ -53,13 +53,15 @@ pub(super) fn deliver(
             let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
             let po_ref = ObjectRef::new(po);
             // Its handle before the push: once the message is committed, nothing may fail.
-            let po_h = install(pid, po_ref.clone(), pending_op_rights())?;
+            let mut installed = installing::<1>(pid);
+            let po_h = installed.install(po_ref.clone(), pending_op_rights()).map_err(refused)?;
             // SAFETY: `ch` is the live `IpcChannel` its lookup type-checked, held across the call.
-            let refused = match unsafe {
+            let refusal = match unsafe {
                 crate::sched::ipc_send_push_blocking(ch.as_ptr(), bounce, transfers, &po_ref, deadline_ns)
             } {
                 BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
                     commit_all(claims);
+                    installed.commit();
                     return Ok(po_h.bits() as isize);
                 }
                 // Back-pressure / dead peer: nothing committed; the sender keeps its handles.
@@ -67,8 +69,7 @@ pub(super) fn deliver(
                 BlockSendOutcome::PeerClosed => KError::PeerClosed,
                 BlockSendOutcome::Cycle => KError::InvalidArgument,
             };
-            close_and_release(po_h, pid);
-            Err(refused)
+            Err(refusal)
         }
     }
 }
@@ -93,15 +94,7 @@ fn answer_forget(reg: &UserspaceServerReg, file_id: u64, pid: u32) -> SysResult 
         }
     };
     drop(answer);
-    let (op, ot) = wait_on.into_raw();
-    match global::get().allocate(pid, op, ot, pending_op_rights()) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(op) });
-            Err(map_handle_err(e))
-        }
-    }
+    Ok(install(pid, wait_on, pending_op_rights())?.bits() as isize)
 }
 
 /// Complete a forwarded **reply** inline in the server's `sys_channel_send`: a

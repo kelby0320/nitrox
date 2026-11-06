@@ -2317,16 +2317,6 @@ unmapped page below what a hint-less map places. Trigger: E.6.
 
 ### Concurrency primitives
 
-**`allocate` checks a handle's rights against the tag its caller passes, not the object's own —
-`TODO(handle-install-tag)`.** Since J.2 an object's tag is its header's, fixed by its type, and a
-lookup, a stat, a downcast and a destroy read only that. `HandleTable::allocate` still takes the
-type beside the pointer, records it, and checks the rights against that type's matrix. Eight
-sites write it by hand; each names its object's kind today, checked in the review of J.2, and one
-that did not would let a handle carry rights its kind refuses. **The fix is J.3's**:
-`install(pid, ObjectRef, rights)` takes the tag from the reference and makes `allocate` private
-(`docs/planning/typed-layers.md` § J.3). Reading the header inside `allocate` now would add an
-`unsafe` read that J.3 removes again.
-
 **The three handle-validation paths check the same things in different orders —
 `TODO(handle-validation-order)`.**
 `docs/spec/handle-encoding.md` § "Validation algorithm" gives twelve steps and says "in order".
@@ -2523,6 +2513,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A handle's rights checked against the tag its caller passes (`handle-install-tag`) | 2026-11-06 | **`HandleTable::install(pid, ObjectRef, rights)`, pre-Phase-7 J.3**: the tag is the reference's own, its object's header's, and the reference comes back with a refusal. `allocate`, which took a tag beside a raw pointer, is private to the table and `unsafe`, so no caller writes a tag. |
 | A library's raw-handle functions beside its typed ones (`raw-handle-shims`) | 2026-11-05 | **Their last callers moved**: the test harness and the two filesystem servers' entry, in pre-Phase-7 Part E.5, and the thirty-three shims went with them, and with them what only they used: `librsproto`'s raw `Dir` session and libstream's raw `Bootstrap`. Each library's only form is its typed one. |
 | Five provenance tests that only Miri can fail (`miri-provenance-tests`) | 2026-11-01 | **The Miri job**, `cargo xtask miri`, nightly and by hand: each pins a pointer's provenance, which the hardware cannot see, so natively it passes on the old code as on the new, and half of a sixth, a fill answered with the wrong kind of object, reads uninitialised bytes that happen to refuse. All of them now run in that job. |
 | `REAP_RESERVE`, a userspace-reachable cap that aborts when crossed | 2026-10-25 | The sweep it capped is gone: a process's exit only marks its threads, and each parks itself on the reap list of the CPU it ends on, as a lone thread's exit always did. The reap lists hold `MAX_THREADS` since 2026-10-22, and nothing pushes more than one thread at a time. |

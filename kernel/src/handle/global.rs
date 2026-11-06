@@ -108,21 +108,15 @@ const SWEEP_BATCH: usize = 16;
 /// ([`alloc_pid`](crate::sched::alloc_pid)). Returns how many handles it closed,
 /// which tells "nothing left" from "never ran".
 pub fn close_all_owned_by(pid: u32) -> usize {
-    use super::table::{ClosedObject, SweepCursor};
-    use crate::object::ObjectRef;
+    use super::table::{Closed, SweepCursor};
 
     let mut closed = 0usize;
     let mut cursor = SweepCursor::START;
     loop {
-        let mut batch: [Option<ClosedObject>; SWEEP_BATCH] = [None; SWEEP_BATCH];
+        let mut batch: [Option<Closed>; SWEEP_BATCH] = [const { None }; SWEEP_BATCH];
         let (n, more) = get().close_owned_batch(pid, &mut cursor, &mut batch);
         crate::sched::preempt_disable();
-        for co in batch[..n].iter().flatten() {
-            // SAFETY: each `ClosedObject` carries exactly the one reference its
-            // handle-table entry held; the entry is already unlinked, so this
-            // accounts for it once and only once.
-            drop(unsafe { ObjectRef::from_raw(co.0) });
-        }
+        drop(batch);
         crate::sched::preempt_enable();
         closed += n;
         if !more {

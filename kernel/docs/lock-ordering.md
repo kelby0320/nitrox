@@ -308,7 +308,7 @@ Step 3 is the load-bearing part: dropping under rank 3 would take rank 1
 inverting the ranking. `HandleTable::close_owned_batch` therefore returns a
 `(count, more_remain)` pair and a resume cursor rather than sweeping the whole
 process in one critical section — the same "unlink under the lock, free
-outside it" shape as `close`'s `ClosedObject` contract and
+outside it" shape as `close`'s `Closed` and
 `unmap_covering`'s `Unmapped`, released after the lock. The drops run inside a
 `preempt_disable`/`enable` region for the reason F12 established: a descheduled
 holder of an allocator spinlock starves every CPU spinning on it.
@@ -555,7 +555,7 @@ then copies the message **out** after releasing the lock. **Handle transfer** ri
 the same boundary: a transferred handle's `ObjectRef` is **moved** in/out of the
 queued message slot under `SCHED` (a `mem::take`, which never touches a refcount —
 only `ObjectRef` *Drop* is forbidden under the lock), while the receiver-side
-install (`allocate`) and any error/undelivered-transfer *drop* run **outside**
+install (`install`) and any error/undelivered-transfer *drop* run **outside**
 `SCHED` (the send commits the move by closing the sender's handles after the push;
 undelivered transfers release their refs when the ring drops, in destructor
 context). `IpcChannel::Drop`

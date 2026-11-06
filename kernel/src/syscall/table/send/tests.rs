@@ -11,8 +11,9 @@ type Moving = (RawHandle, [Option<TransferRef>; IPC_HANDLE_MAX], [Option<Claim<'
 
 /// A memory object's handle in `pid`'s table, claimed to move as a send would claim it.
 fn moving(pid: u32) -> Moving {
-    let mem = KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut ();
-    let h = global::get().allocate(pid, mem, KObjectType::MemoryObject, Rights::MAP_READ | Rights::TRANSFER).unwrap();
+    let h = global::get()
+        .install(pid, ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap()), Rights::MAP_READ | Rights::TRANSFER)
+        .unwrap();
     let (ok, claim) = global::get().claim(h, pid, Rights::TRANSFER).unwrap();
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     transfers[0] = Some(TransferRef { obj: ok.object, rights: ok.rights });
@@ -87,7 +88,7 @@ fn a_blocking_send_whose_handle_cannot_be_made_sends_nothing() {
     global::init_for_tests();
     let ((a, b), msg) = (pair(1), message());
     let (h, mut t, mut c) = moving(PID);
-    crate::handle::table::FAIL_NEXT_ALLOCATE.with(|f| f.set(true));
+    crate::handle::table::fail_installs_after(Some(0));
     assert_eq!(deliver(&a, &msg, &mut t, &mut c, SendMode::Block, 0, PID), Err(KError::OutOfMemory));
     // SAFETY: `b` is pinned by the test's reference, and the test is single-threaded.
     assert!(!unsafe { IpcChannel::already_signaled(b.as_ptr()) }, "no message for the peer");

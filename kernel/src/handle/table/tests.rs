@@ -1,7 +1,6 @@
 use super::*;
 use crate::handle::FAIL_NEXT_ACQUIRE;
 use crate::handle::entry::FREE_NEXT_TAIL;
-use crate::libkern::KBox;
 use crate::mm::test_support::init_global_heap;
 use crate::object::header::test_probe;
 use crate::object::{Process, Thread};
@@ -11,23 +10,16 @@ fn fresh_table() -> HandleTable {
     HandleTable::try_new(0xCAFE_BABE_DEAD_BEEF).unwrap()
 }
 
-fn mk_process(pid: u32) -> *mut () {
-    KBox::into_raw(Process::try_new(pid).unwrap()).as_ptr() as *mut ()
+fn mk_process(pid: u32) -> ObjectRef {
+    ObjectRef::new(Process::try_new(pid).unwrap())
 }
 
-fn mk_thread(tid: u32, owner_pid: u32) -> *mut () {
-    KBox::into_raw(Thread::try_new(tid, owner_pid).unwrap()).as_ptr() as *mut ()
-}
-
-fn fake_obj(addr: usize) -> *mut () {
-    addr as *mut ()
+fn mk_thread(tid: u32, owner_pid: u32) -> ObjectRef {
+    ObjectRef::new(Thread::try_new(tid, owner_pid).unwrap())
 }
 
 fn close_release(t: &HandleTable, h: RawHandle, pid: u32) -> Result<(), HandleError> {
-    let co = t.close(h, pid)?;
-    // SAFETY: `co` carries exactly the handle's one reference; we
-    // account for it once.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    drop(t.close(h, pid)?);
     Ok(())
 }
 
@@ -52,7 +44,7 @@ fn try_new_eagerly_allocates_segment_zero() {
 #[test]
 fn allocate_returns_non_null_handle() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert!(!h.is_null());
     close_release(&t, h, 1).unwrap();
 }
@@ -61,9 +53,10 @@ fn allocate_returns_non_null_handle() {
 fn allocate_lookup_round_trip() {
     let t = fresh_table();
     let p = mk_process(7);
-    let h = t.allocate(7, p, KObjectType::Process, sigterm()).unwrap();
+    let at = p.as_ptr();
+    let h = t.install(7, p, sigterm()).unwrap();
     let ok = t.lookup(h, 7, sig()).unwrap();
-    assert_eq!(ok.object.as_ptr(), p);
+    assert_eq!(ok.object.as_ptr(), at);
     assert_eq!(ok.object.object_type(), KObjectType::Process);
     assert!(ok.rights.contains(Rights::SIGNAL));
     assert!(ok.rights.contains(Rights::TERMINATE));
@@ -75,12 +68,9 @@ fn sweep_owned(t: &HandleTable, pid: u32) -> usize {
     let mut cursor = SweepCursor::START;
     let mut total = 0;
     loop {
-        let mut batch: [Option<ClosedObject>; 4] = [None; 4];
+        let mut batch: [Option<Closed>; 4] = [const { None }; 4];
         let (n, more) = t.close_owned_batch(pid, &mut cursor, &mut batch);
-        for co in batch[..n].iter().flatten() {
-            // SAFETY: each carries exactly the closed handle's one reference.
-            drop(unsafe { ObjectRef::from_raw(co.0) });
-        }
+        drop(batch);
         total += n;
         if !more {
             return total;
@@ -94,8 +84,8 @@ fn sweep_closes_every_handle_of_one_process_and_no_others() {
     let mut doomed = Vec::new();
     let mut survivor = Vec::new();
     for i in 0..5 {
-        doomed.push(t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap());
-        survivor.push(t.allocate(2, mk_process(2), KObjectType::Process, sig()).unwrap());
+        doomed.push(t.install(1, mk_process(1), sig()).unwrap());
+        survivor.push(t.install(2, mk_process(2), sig()).unwrap());
         let _ = i;
     }
 
@@ -117,7 +107,7 @@ fn sweep_releases_the_objects() {
     let t = fresh_table();
     let before = test_probe::process_destroys();
     for _ in 0..3 {
-        t.allocate(9, mk_process(9), KObjectType::Process, sig()).unwrap();
+        t.install(9, mk_process(9), sig()).unwrap();
     }
     assert_eq!(test_probe::process_destroys(), before, "nothing destroyed yet");
     assert_eq!(sweep_owned(&t, 9), 3);
@@ -128,7 +118,7 @@ fn sweep_releases_the_objects() {
 fn sweep_resumes_across_batches() {
     let t = fresh_table();
     for _ in 0..17 {
-        t.allocate(3, mk_process(3), KObjectType::Process, sig()).unwrap();
+        t.install(3, mk_process(3), sig()).unwrap();
     }
     assert_eq!(sweep_owned(&t, 3), 17);
     assert_eq!(sweep_owned(&t, 3), 0, "a second sweep finds nothing left");
@@ -137,7 +127,7 @@ fn sweep_resumes_across_batches() {
 #[test]
 fn sweep_of_a_process_with_no_handles_is_a_no_op() {
     let t = fresh_table();
-    let h = t.allocate(4, mk_process(4), KObjectType::Process, sig()).unwrap();
+    let h = t.install(4, mk_process(4), sig()).unwrap();
     assert_eq!(sweep_owned(&t, 99), 0);
     assert!(t.lookup(h, 4, sig()).is_ok());
     close_release(&t, h, 4).unwrap();
@@ -148,11 +138,11 @@ fn swept_slots_are_reusable() {
     let t = fresh_table();
     let before = t.allocated_count();
     for _ in 0..8 {
-        t.allocate(5, mk_process(5), KObjectType::Process, sig()).unwrap();
+        t.install(5, mk_process(5), sig()).unwrap();
     }
     assert_eq!(t.allocated_count(), before + 8);
     assert_eq!(sweep_owned(&t, 5), 8);
-    let h = t.allocate(6, mk_process(6), KObjectType::Process, sig()).unwrap();
+    let h = t.install(6, mk_process(6), sig()).unwrap();
     close_release(&t, h, 6).unwrap();
     assert_eq!(t.allocated_count(), before, "swept slots were not returned to the freelist");
 }
@@ -160,8 +150,9 @@ fn swept_slots_are_reusable() {
 #[test]
 fn allocate_rejects_incompatible_rights_for_type() {
     let t = fresh_table();
-    let err = t.allocate(1, fake_obj(0x1000), KObjectType::Process, Rights::MAP_WRITE).unwrap_err();
+    let (err, back) = t.install(1, mk_process(1), Rights::MAP_WRITE).unwrap_err();
     assert_eq!(err, HandleError::BadRights);
+    assert!(back.is::<Process>(), "the refused reference, handed back");
 }
 
 #[test]
@@ -169,7 +160,7 @@ fn allocate_many_handles_in_a_row() {
     let t = fresh_table();
     let mut handles = [RawHandle::NULL; 32];
     for (i, h) in handles.iter_mut().enumerate() {
-        *h = t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap();
+        *h = t.install(1, mk_process(i as u32), sig()).unwrap();
     }
     for i in 0..handles.len() {
         for j in (i + 1)..handles.len() {
@@ -185,7 +176,7 @@ fn allocate_many_handles_in_a_row() {
 #[test]
 fn lookup_wrong_owner_pid_returns_not_owner() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert_eq!(t.lookup(h, 2, Rights::empty()).unwrap_err(), HandleError::NotOwner);
     close_release(&t, h, 1).unwrap();
 }
@@ -193,7 +184,7 @@ fn lookup_wrong_owner_pid_returns_not_owner() {
 #[test]
 fn lookup_correct_owner_succeeds_for_zero_pid_too() {
     let t = fresh_table();
-    let h = t.allocate(0, mk_process(0), KObjectType::Process, sig()).unwrap();
+    let h = t.install(0, mk_process(0), sig()).unwrap();
     assert!(t.lookup(h, 0, sig()).is_ok());
     close_release(&t, h, 0).unwrap();
 }
@@ -201,7 +192,7 @@ fn lookup_correct_owner_succeeds_for_zero_pid_too() {
 #[test]
 fn lookup_insufficient_rights_returns_no_access() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert_eq!(t.lookup(h, 1, Rights::TERMINATE).unwrap_err(), HandleError::NoAccess);
     close_release(&t, h, 1).unwrap();
 }
@@ -209,7 +200,7 @@ fn lookup_insufficient_rights_returns_no_access() {
 #[test]
 fn lookup_superset_rights_request_returns_no_access() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert_eq!(t.lookup(h, 1, sigterm()).unwrap_err(), HandleError::NoAccess,);
     close_release(&t, h, 1).unwrap();
 }
@@ -217,7 +208,7 @@ fn lookup_superset_rights_request_returns_no_access() {
 #[test]
 fn lookup_subset_rights_request_succeeds() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sigterm()).unwrap();
+    let h = t.install(1, mk_process(1), sigterm()).unwrap();
     assert!(t.lookup(h, 1, Rights::SIGNAL).is_ok());
     assert!(t.lookup(h, 1, Rights::TERMINATE).is_ok());
     assert!(t.lookup(h, 1, sigterm()).is_ok());
@@ -242,19 +233,19 @@ fn out_of_range_segment_returns_invalid_handle() {
 fn close_makes_handle_invalid() {
     let t = fresh_table();
     let p = mk_process(1);
-    let h = t.allocate(1, p, KObjectType::Process, sig()).unwrap();
+    let at = p.as_ptr();
+    let h = t.install(1, p, sig()).unwrap();
     let prev = t.close(h, 1).unwrap();
-    assert_eq!(prev.0, p);
-    assert_eq!(prev.1, KObjectType::Process);
-    // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(prev.0) });
+    assert_eq!(prev.object().as_ptr(), at);
+    assert_eq!(prev.object().object_type(), KObjectType::Process);
+    drop(prev);
     assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
 }
 
 #[test]
 fn close_rejects_wrong_owner() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert_eq!(t.close(h, 2).unwrap_err(), HandleError::NotOwner);
     assert!(t.lookup(h, 1, sig()).is_ok());
     close_release(&t, h, 1).unwrap();
@@ -263,7 +254,7 @@ fn close_rejects_wrong_owner() {
 #[test]
 fn double_close_returns_invalid_on_second() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     close_release(&t, h, 1).unwrap();
     assert_eq!(t.close(h, 1).unwrap_err(), HandleError::InvalidHandle);
 }
@@ -271,10 +262,10 @@ fn double_close_returns_invalid_on_second() {
 #[test]
 fn close_then_allocate_reuses_slot_with_new_generation() {
     let t = fresh_table();
-    let h1 = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h1 = t.install(1, mk_process(1), sig()).unwrap();
     let (seg1, slot1, gen1) = h1.decode();
     close_release(&t, h1, 1).unwrap();
-    let h2 = t.allocate(1, mk_process(2), KObjectType::Process, sig()).unwrap();
+    let h2 = t.install(1, mk_process(2), sig()).unwrap();
     let (seg2, slot2, gen2) = h2.decode();
     assert_eq!((seg1, slot1), (seg2, slot2), "the freed slot must be the one reused");
     assert_ne!(gen1, gen2, "generation must bump on slot reuse");
@@ -286,7 +277,7 @@ fn close_then_allocate_reuses_slot_with_new_generation() {
 #[test]
 fn generation_wraps_at_max_without_retiring_the_slot() {
     let t = fresh_table();
-    let h1 = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h1 = t.install(1, mk_process(1), sig()).unwrap();
     let (seg, slot, _) = h1.decode();
 
     {
@@ -307,7 +298,7 @@ fn generation_wraps_at_max_without_retiring_the_slot() {
     // Reallocate: the slot is recycled, not retired, and wraps
     // `GENERATION_MAX` to 0.
     close_release(&t, h_max, 1).unwrap();
-    let h_next = t.allocate(1, mk_process(2), KObjectType::Process, sig()).unwrap();
+    let h_next = t.install(1, mk_process(2), sig()).unwrap();
     let (nseg, nslot, ngen) = h_next.decode();
     assert_eq!((nseg, nslot), (seg, slot), "slot must be recycled, not retired");
     assert_eq!(ngen, 0, "generation wraps from GENERATION_MAX to 0");
@@ -319,7 +310,7 @@ fn generation_wraps_at_max_without_retiring_the_slot() {
 #[test]
 fn restrict_cannot_amplify_rights() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     t.restrict(h, 1, Rights::TERMINATE).unwrap();
     assert_eq!(t.lookup(h, 1, Rights::SIGNAL).unwrap_err(), HandleError::NoAccess,);
     assert!(t.lookup(h, 1, Rights::empty()).is_ok());
@@ -329,7 +320,7 @@ fn restrict_cannot_amplify_rights() {
 #[test]
 fn restrict_drops_rights() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sigterm()).unwrap();
+    let h = t.install(1, mk_process(1), sigterm()).unwrap();
     t.restrict(h, 1, Rights::SIGNAL).unwrap();
     assert!(t.lookup(h, 1, Rights::SIGNAL).is_ok());
     assert_eq!(t.lookup(h, 1, Rights::TERMINATE).unwrap_err(), HandleError::NoAccess,);
@@ -339,7 +330,7 @@ fn restrict_drops_rights() {
 #[test]
 fn restrict_rejects_wrong_owner() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert_eq!(t.restrict(h, 2, Rights::SIGNAL).unwrap_err(), HandleError::NotOwner);
     close_release(&t, h, 1).unwrap();
 }
@@ -364,10 +355,10 @@ fn restrict_rejects_wrong_owner() {
 /// A slot freed and handed to a new object of the same owner, returning
 /// `(stale, live)`: the only shape where the generation check stands alone.
 fn reused_slot(t: &HandleTable) -> (RawHandle, RawHandle) {
-    let stale = t.allocate(1, mk_process(1), KObjectType::Process, sigterm()).unwrap();
+    let stale = t.install(1, mk_process(1), sigterm()).unwrap();
     let (seg1, slot1, gen1) = stale.decode();
     close_release(t, stale, 1).unwrap();
-    let live = t.allocate(1, mk_process(2), KObjectType::Process, sigterm()).unwrap();
+    let live = t.install(1, mk_process(2), sigterm()).unwrap();
     let (seg2, slot2, gen2) = live.decode();
     assert_eq!((seg1, slot1), (seg2, slot2), "the freed slot must be the one reused");
     assert_ne!(gen1, gen2, "reuse must bump the generation");
@@ -404,7 +395,7 @@ fn restrict_rejects_a_stale_handle_whose_slot_was_reused() {
 #[test]
 fn restrict_rejects_a_handle_whose_object_was_closed() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sigterm()).unwrap();
+    let h = t.install(1, mk_process(1), sigterm()).unwrap();
     close_release(&t, h, 1).unwrap();
     assert_eq!(t.restrict(h, 1, sig()).unwrap_err(), HandleError::InvalidHandle);
 }
@@ -447,7 +438,7 @@ fn an_unpopulated_segment_is_rejected_by_lookup_close_and_restrict() {
 #[test]
 fn duplicate_requires_duplicate_right() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert_eq!(t.duplicate(h, 1, sig()).unwrap_err(), HandleError::NoAccess,);
     close_release(&t, h, 1).unwrap();
 }
@@ -455,9 +446,7 @@ fn duplicate_requires_duplicate_right() {
 #[test]
 fn duplicate_yields_independent_handle_with_intersected_rights() {
     let t = fresh_table();
-    let original = t
-        .allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::TERMINATE | Rights::DUPLICATE)
-        .unwrap();
+    let original = t.install(1, mk_process(1), Rights::SIGNAL | Rights::TERMINATE | Rights::DUPLICATE).unwrap();
     let copy = t.duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE).unwrap();
     assert_ne!(copy, original);
     assert!(t.lookup(copy, 1, Rights::SIGNAL).is_ok());
@@ -472,7 +461,7 @@ fn duplicate_yields_independent_handle_with_intersected_rights() {
 fn duplicate_refcount_accounting_destroys_once_at_last_close() {
     let t = fresh_table();
     test_probe::reset();
-    let original = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::DUPLICATE).unwrap(); // object refcount = 1 (one handle)
+    let original = t.install(1, mk_process(1), Rights::SIGNAL | Rights::DUPLICATE).unwrap(); // object refcount = 1 (one handle)
     let copy = t.duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE).unwrap(); // refcount = 2 (two handles)
     close_release(&t, copy, 1).unwrap();
     assert_eq!(test_probe::process_destroys(), 0, "destroyed while a handle remains");
@@ -484,9 +473,11 @@ fn duplicate_refcount_accounting_destroys_once_at_last_close() {
 fn duplicate_allocate_error_reclaims_ref() {
     let t = fresh_table();
     test_probe::reset();
-    let original = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::DUPLICATE).unwrap(); // refcount = 1
-    FAIL_NEXT_ALLOCATE.with(|f| f.set(true));
-    assert_eq!(t.duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE).unwrap_err(), HandleError::OutOfMemory,);
+    let original = t.install(1, mk_process(1), Rights::SIGNAL | Rights::DUPLICATE).unwrap(); // refcount = 1
+    fail_installs_after(Some(0));
+    let refused = t.duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE).unwrap_err();
+    fail_installs_after(None);
+    assert_eq!(refused, HandleError::OutOfMemory);
     assert_eq!(test_probe::process_destroys(), 0);
     assert!(t.lookup(original, 1, Rights::SIGNAL).is_ok());
     close_release(&t, original, 1).unwrap();
@@ -497,7 +488,7 @@ fn duplicate_allocate_error_reclaims_ref() {
 fn lookup_holds_ref_until_lookupok_dropped() {
     let t = fresh_table();
     test_probe::reset();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     let ok = t.lookup(h, 1, sig()).unwrap(); // refcount = 2
     close_release(&t, h, 1).unwrap(); // refcount = 1 (the ObjectRef)
     assert_eq!(test_probe::process_destroys(), 0, "destroyed while ObjectRef held");
@@ -510,20 +501,18 @@ fn lookup_holds_ref_until_lookupok_dropped() {
 fn close_does_not_destroy_until_caller_drops_token() {
     let t = fresh_table();
     test_probe::reset();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     let co = t.close(h, 1).unwrap();
     assert_eq!(test_probe::process_destroys(), 0);
-    // SAFETY: `co` still holds the table's reference, so `close` freed nothing.
-    assert!(unsafe { &*(co.0 as *const Process) }.magic_ok());
-    // SAFETY: the table's reference, which `close` handed back.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    assert!(process_magic_ok(co.object()), "`close` freed nothing");
+    drop(co);
     assert_eq!(test_probe::process_destroys(), 1);
 }
 
 #[test]
 fn stat_returns_snapshot_when_inspect_granted() {
     let t = fresh_table();
-    let h = t.allocate(42, mk_process(42), KObjectType::Process, Rights::SIGNAL | Rights::INSPECT).unwrap();
+    let h = t.install(42, mk_process(42), Rights::SIGNAL | Rights::INSPECT).unwrap();
     let s = t.stat(h, 42).unwrap();
     assert_eq!(s.object_type, KObjectType::Process);
     assert!(s.rights.contains(Rights::SIGNAL));
@@ -536,7 +525,7 @@ fn stat_returns_snapshot_when_inspect_granted() {
 #[test]
 fn stat_requires_inspect_right() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert_eq!(t.stat(h, 1).unwrap_err(), HandleError::NoAccess);
     close_release(&t, h, 1).unwrap();
 }
@@ -547,10 +536,10 @@ fn segment_grows_when_first_segment_full() {
     let mut handles = KVec::<RawHandle>::new();
     handles.try_reserve(SEGMENT_LEN + 1).unwrap();
     for i in 0..SEGMENT_LEN {
-        handles.try_push(t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap()).unwrap();
+        handles.try_push(t.install(1, mk_process(i as u32), sig()).unwrap()).unwrap();
     }
     assert_eq!(t.segments_allocated(), 1);
-    let h = t.allocate(1, mk_process(0xFFFF), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(0xFFFF), sig()).unwrap();
     handles.try_push(h).unwrap();
     assert_eq!(t.segments_allocated(), 2);
     let (seg, _, _) = h.decode();
@@ -565,12 +554,12 @@ fn freelist_invariant_count_matches_chain() {
     let t = fresh_table();
     let mut handles = [RawHandle::NULL; 64];
     for (i, h) in handles.iter_mut().enumerate() {
-        *h = t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap();
+        *h = t.install(1, mk_process(i as u32), sig()).unwrap();
     }
     for i in (0..64).step_by(2) {
         close_release(&t, handles[i], 1).unwrap();
     }
-    let h_temp = t.allocate(1, mk_process(0xAAAA), KObjectType::Process, sig()).unwrap();
+    let h_temp = t.install(1, mk_process(0xAAAA), sig()).unwrap();
     close_release(&t, h_temp, 1).unwrap();
     let guard = t.inner.lock();
     let free_head = guard.segment_meta[0].free_head;
@@ -597,7 +586,7 @@ fn freelist_invariant_count_matches_chain() {
 #[test]
 fn failed_acquire_refcount_returns_invalid_handle() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     FAIL_NEXT_ACQUIRE.with(|f| f.set(true));
     assert_eq!(t.lookup(h, 1, sig()).unwrap_err(), HandleError::InvalidHandle,);
     assert!(t.lookup(h, 1, sig()).is_ok());
@@ -608,8 +597,8 @@ fn failed_acquire_refcount_returns_invalid_handle() {
 fn destructor_dispatches_on_object_type() {
     let t = fresh_table();
     test_probe::reset();
-    let hp = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
-    let ht = t.allocate(1, mk_thread(1, 1), KObjectType::Thread, sig()).unwrap();
+    let hp = t.install(1, mk_process(1), sig()).unwrap();
+    let ht = t.install(1, mk_thread(1, 1), sig()).unwrap();
     close_release(&t, hp, 1).unwrap();
     assert_eq!(test_probe::process_destroys(), 1);
     assert_eq!(test_probe::thread_destroys(), 0, "wrong destructor for Process");
@@ -638,7 +627,7 @@ fn concurrent_allocate_lookup_close_pid_isolation() {
                 test_probe::reset();
                 for i in 0..ITERS {
                     let obj = mk_process(my_pid * 1_000_000 + i as u32);
-                    let h = t.allocate(my_pid, obj, KObjectType::Process, sig()).expect("allocate");
+                    let h = t.install(my_pid, obj, sig()).expect("allocate");
                     let ok = t.lookup(h, my_pid, sig()).expect("lookup");
                     assert!(process_magic_ok(&ok.object));
                     drop(ok);
@@ -655,7 +644,7 @@ fn concurrent_allocate_lookup_close_pid_isolation() {
         total_destroys += w.join().expect("join");
     }
     assert_eq!(total_destroys, N_THREADS * ITERS, "every object destroyed once");
-    let h = t.allocate(99, mk_process(99), KObjectType::Process, sig()).unwrap();
+    let h = t.install(99, mk_process(99), sig()).unwrap();
     close_release(&t, h, 99).unwrap();
     assert!(t.allocated_count() <= 1, "stray handles after stress: {}", t.allocated_count());
 }
@@ -682,12 +671,8 @@ fn concurrent_torn_read_torture() {
             let mut pid = 1u32;
             let mut cycles_since_yield = 0u32;
             while !stop.load(Ordering::Relaxed) {
-                let obj = mk_process(pid);
-                if let Ok(h) = t.allocate(pid, obj, KObjectType::Process, sig()) {
+                if let Ok(h) = t.install(pid, mk_process(pid), sig()) {
                     let _ = close_release(&t, h, pid);
-                } else {
-                    // SAFETY: adopts the object's creation reference.
-                    drop(unsafe { ObjectRef::from_raw(obj) });
                 }
                 pid = pid.wrapping_add(1);
                 if pid == 0 {
@@ -753,7 +738,7 @@ fn concurrent_duplicate_vs_close_toctou_torture() {
     const DUPLICATES: u32 = if cfg!(miri) { 30 } else { u32::MAX };
     let t = Arc::new(fresh_table());
     test_probe::reset();
-    let h0 = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::DUPLICATE).unwrap();
+    let h0 = t.install(1, mk_process(1), Rights::SIGNAL | Rights::DUPLICATE).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut duplicators = Vec::new();
@@ -817,11 +802,11 @@ fn concurrent_duplicate_vs_close_toctou_torture() {
 fn close_then_allocate_drains_immediately_on_single_context() {
     let t = fresh_table();
     for i in 0..1024 {
-        let h = t.allocate(1, mk_process(i), KObjectType::Process, sig()).unwrap();
+        let h = t.install(1, mk_process(i), sig()).unwrap();
         close_release(&t, h, 1).unwrap();
     }
     assert_eq!(t.allocated_count(), 0);
-    let h = t.allocate(1, mk_process(0xFEED), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(0xFEED), sig()).unwrap();
     close_release(&t, h, 1).unwrap();
 }
 
@@ -838,7 +823,7 @@ fn a_closer_waits_for_a_lookup_about_to_take_its_reference(close: fn(&HandleTabl
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::{Arc, Mutex};
     let t: &'static HandleTable = std::boxed::Box::leak(std::boxed::Box::new(fresh_table()));
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     let (freed, closer) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
     let (f, c) = (freed.clone(), closer.clone());
     BEFORE_ACQUIRE.with(|b| {
@@ -880,7 +865,7 @@ fn moveable() -> Rights {
 #[test]
 fn a_claimed_handle_cannot_be_claimed_again_and_commits_to_closed() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, moveable()).unwrap();
+    let h = t.install(1, mk_process(1), moveable()).unwrap();
     let before = test_probe::process_destroys();
     let (ok, claim) = t.claim(h, 1, Rights::TRANSFER).unwrap();
     assert_eq!(t.claim(h, 1, Rights::TRANSFER).err(), Some(HandleError::InvalidHandle));
@@ -895,7 +880,7 @@ fn a_claimed_handle_cannot_be_claimed_again_and_commits_to_closed() {
 #[test]
 fn a_dropped_claim_gives_the_handle_back() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, moveable()).unwrap();
+    let h = t.install(1, mk_process(1), moveable()).unwrap();
     drop(t.claim(h, 1, Rights::TRANSFER).unwrap());
     let (_ok, claim) = t.claim(h, 1, Rights::TRANSFER).unwrap();
     drop(claim);
@@ -908,10 +893,10 @@ fn a_dropped_claim_gives_the_handle_back() {
 fn a_stale_claim_leaves_its_slots_next_handle_alone() {
     let t = fresh_table();
     for commit in [true, false] {
-        let h = t.allocate(1, mk_process(1), KObjectType::Process, moveable()).unwrap();
+        let h = t.install(1, mk_process(1), moveable()).unwrap();
         let (_ok, stale) = t.claim(h, 1, Rights::TRANSFER).unwrap();
         close_release(&t, h, 1).unwrap();
-        let again = t.allocate(1, mk_process(2), KObjectType::Process, moveable()).unwrap();
+        let again = t.install(1, mk_process(2), moveable()).unwrap();
         assert_eq!(again.decode().1, h.decode().1, "the slot reused");
         let (_ok, live) = t.claim(again, 1, Rights::TRANSFER).unwrap();
         if commit {
@@ -928,7 +913,7 @@ fn a_stale_claim_leaves_its_slots_next_handle_alone() {
 #[test]
 fn a_claim_needs_the_rights_it_asks_for() {
     let t = fresh_table();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+    let h = t.install(1, mk_process(1), sig()).unwrap();
     assert_eq!(t.claim(h, 1, Rights::TRANSFER).err(), Some(HandleError::NoAccess));
     assert_eq!(t.claim(h, 2, Rights::empty()).err(), Some(HandleError::NotOwner));
 }
@@ -941,7 +926,7 @@ fn a_claim_needs_the_rights_it_asks_for() {
 fn a_lookup_reads_the_objects_tag_not_the_entrys() {
     let t = fresh_table();
     test_probe::reset();
-    let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::empty()).unwrap();
+    let h = t.install(1, mk_process(1), Rights::empty()).unwrap();
     let (seg, slot, _) = h.decode();
     let entries = t.directory[seg as usize].load(Ordering::Acquire);
     // SAFETY: a published segment, which outlives the table; the test is single-threaded.

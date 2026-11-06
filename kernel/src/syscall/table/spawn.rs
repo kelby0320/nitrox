@@ -3,19 +3,6 @@
 use super::*;
 use crate::libkern::KVec;
 
-/// Close every child-side handle a partly-built spawn allocated; `ns_h` is `NULL` if none.
-fn spawn_rollback_child_handles(child_pid: u32, notif_h: RawHandle, ns_h: RawHandle, installed: &[RawHandle]) {
-    close_and_release(notif_h, child_pid);
-    if !ns_h.is_null() {
-        close_and_release(ns_h, child_pid);
-    }
-    for &h in installed {
-        if !h.is_null() {
-            close_and_release(h, child_pid);
-        }
-    }
-}
-
 /// `sys_process_spawn(args)` — create a child process from an image object and start it.
 /// Returns a handle to the child `Process` (`SIGNAL | TERMINATE`). The child's handle table is
 /// populated from `args.handles` (each installed with `source_rights & args.rights[i]`; bit `i`
@@ -81,102 +68,59 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     let chan = NotificationChannel::try_new().map_err(|_| KError::OutOfMemory)?;
     let chan_ref = ObjectRef::new(chan);
     proc_box.set_notification_channel(chan_ref.clone()); // refcount 2
-    let (cp, ct) = chan_ref.into_raw();
-    let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
-    let notif_h = match global::get().allocate(child_pid, cp, ct, notif_rights) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: reclaim the channel-handle reference; `proc_box` drops here
-            // too, releasing its own channel reference and freeing the AS.
-            drop(unsafe { ObjectRef::from_raw(cp) });
-            return Err(map_handle_err(e));
-        }
-    };
+    // Every handle the child is given is closed again, as `proc_box` drops, unless it starts.
+    let mut child = installing::<{ SPAWN_MAX_HANDLES + 2 }>(child_pid);
+    let notif_h = child.install(chan_ref, Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT).map_err(refused)?;
 
     // The child's root: `args.namespace` if the parent holds it with `LOOKUP`, else the parent's
     // own; always a **LOOKUP-only** handle, so the child cannot rebind its root.
     let ns_source: Option<ObjectRef> = if !args.namespace.is_null() {
-        match lookup_as::<Namespace>(args.namespace.bits(), parent_pid, Rights::LOOKUP) {
-            Ok(ns) => Some(ns.erase()),
-            Err(e) => {
-                spawn_rollback_child_handles(child_pid, notif_h, RawHandle::NULL, &[]);
-                return Err(e);
-            }
-        }
+        Some(lookup_as::<Namespace>(args.namespace.bits(), parent_pid, Rights::LOOKUP)?.erase())
     } else {
         crate::sched::current_process().and_then(|p| p.namespace_ref())
     };
-    let child_ns_h = if let Some(ns_ref) = ns_source {
-        proc_box.set_namespace(ns_ref.clone()); // the child owns a reference
-        let (np, nt) = ns_ref.into_raw();
-        match global::get().allocate(child_pid, np, nt, Rights::LOOKUP) {
-            Ok(h) => h,
-            Err(e) => {
-                // SAFETY: reclaim the namespace-handle reference; `proc_box` drops
-                // its own clone + the AS. Roll back the notif handle too.
-                drop(unsafe { ObjectRef::from_raw(np) });
-                spawn_rollback_child_handles(child_pid, notif_h, RawHandle::NULL, &[]);
-                return Err(map_handle_err(e));
-            }
+    let child_ns_h = match ns_source {
+        Some(ns_ref) => {
+            proc_box.set_namespace(ns_ref.clone()); // the child owns a reference
+            child.install(ns_ref, Rights::LOOKUP).map_err(refused)?
         }
-    } else {
-        RawHandle::NULL
+        None => RawHandle::NULL,
     };
 
-    let mut installed = [RawHandle::NULL; SPAWN_MAX_HANDLES];
+    let mut endpoint_h = RawHandle::NULL;
     let mut claims: [Option<Claim<'_>>; SPAWN_MAX_HANDLES] = core::array::from_fn(|_| None);
-    for i in 0..count {
+    for (i, claim) in claims.iter_mut().enumerate().take(count) {
         // A grant not moved is a copy, and a copy needs DUPLICATE, as `sys_handle_duplicate` does.
         // A move is claimed until the spawn commits, so a second move of it at once fails.
         let found = if args.move_mask & (1 << i) == 0 {
             global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER | Rights::DUPLICATE)
         } else {
             global::get().claim(args.handles[i], parent_pid, Rights::TRANSFER).map(|(ok, c)| {
-                claims[i] = Some(c);
+                *claim = Some(c);
                 ok
             })
         };
-        let ok = match found {
-            Ok(ok) => ok,
-            Err(e) => {
-                spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..i]);
-                return Err(map_handle_err(e));
-            }
-        };
+        let ok = found.map_err(map_handle_err)?;
         let child_rights = ok.rights & Rights::from_bits_truncate(args.rights[i]);
-        let (op, ot) = ok.object.clone().into_raw();
-        match global::get().allocate(child_pid, op, ot, child_rights) {
-            Ok(h) => installed[i] = h,
-            Err(e) => {
-                // SAFETY: reclaim the clone; `ok.object` drops at scope end.
-                drop(unsafe { ObjectRef::from_raw(op) });
-                spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..i]);
-                return Err(map_handle_err(e));
-            }
+        let h = child.install(ok.object, child_rights).map_err(refused)?;
+        if i == 0 {
+            endpoint_h = h;
         }
     }
 
     let proc_obj = Ref::new(proc_box);
 
     // The parent's handle to the child before the child runs: nothing may fail once it does.
-    let parent_handle = match install(parent_pid, proc_obj.clone().erase(), Rights::SIGNAL | Rights::TERMINATE) {
-        Ok(h) => h,
-        Err(e) => {
-            drop(proc_obj);
-            spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
-            return Err(e);
-        }
-    };
+    let mut parent = installing::<1>(parent_pid);
+    let parent_handle =
+        parent.install(proc_obj.clone().erase(), Rights::SIGNAL | Rights::TERMINATE).map_err(refused)?;
 
-    let endpoint_h = if count > 0 { installed[0].bits() } else { 0 };
-    let boot = [notif_h.bits(), child_ns_h.bits(), endpoint_h, args.arg0];
-    if crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot).is_err() {
-        close_and_release(parent_handle, parent_pid);
-        spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
-        return Err(KError::OutOfMemory);
-    }
+    let boot = [notif_h.bits(), child_ns_h.bits(), endpoint_h.bits(), args.arg0];
+    crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot)
+        .map_err(|_| KError::OutOfMemory)?;
     commit_all(&mut claims);
-
+    child.commit();
+    parent.commit();
     Ok(parent_handle.bits() as isize)
 }
 

@@ -10,6 +10,7 @@ use crate::arch::Timer;
 use crate::arch::abi::USER_VIRT_END;
 use crate::arch::paging::ArchPaging;
 use crate::arch::timer::ArchTimer;
+use crate::handle::Installed;
 use crate::handle::global;
 use crate::handle::table::{Claim, HandleError, HandleTable};
 use crate::libkern::clock::ClockId;
@@ -386,11 +387,11 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     .map_err(|_| KError::OutOfMemory)?;
 
     // Its handle before it runs: nothing may fail once it does, or a retry would start another.
-    let h = install(pid, th.clone(), Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)?;
-    if crate::sched::start_user(th).is_err() {
-        close_and_release(h, pid);
-        return Err(KError::OutOfMemory);
-    }
+    let mut installed = installing::<1>(pid);
+    let rights = Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE;
+    let h = installed.install(th.clone(), rights).map_err(refused)?;
+    crate::sched::start_user(th).map_err(|_| KError::OutOfMemory)?;
+    installed.commit();
     Ok(h.bits() as isize)
 }
 
@@ -519,11 +520,8 @@ fn lookup_as<T: KObject>(h: u64, pid: u32, required: Rights) -> Result<Ref<T>, K
 }
 
 fn close_on(t: &HandleTable, h: RawHandle, pid: u32) -> SysResult {
-    let co = t.close(h, pid).map_err(map_handle_err)?;
-    // Dropped outside the table call so teardown (rank-6 allocator) doesn't nest under rank 3.
-    // SAFETY: `co` carries exactly the handle's one outstanding reference;
-    // we account for it once.
-    drop(unsafe { ObjectRef::from_raw(co.0) });
+    // Released here, outside the table call, so teardown (rank-6 allocator) doesn't nest under 3.
+    drop(t.close(h, pid).map_err(map_handle_err)?);
     Ok(0)
 }
 
@@ -631,17 +629,8 @@ pub fn sys_memory_create(size: u64, flags: u64) -> SysResult {
         return Err(KError::TooLarge);
     }
     let obj = MemoryObject::try_new(size as usize).map_err(|_| KError::OutOfMemory)?;
-    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
     let pid = crate::sched::current_owner_pid();
-    match global::get().allocate(pid, ptr, KObjectType::MemoryObject, full_mem_rights()) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // `allocate` did not adopt the creation reference; drop it outside the table call.
-            // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr) });
-            Err(map_handle_err(e))
-        }
-    }
+    Ok(install(pid, ObjectRef::new(obj), full_mem_rights())?.bits() as isize)
 }
 
 /// `sys_memory_map(obj, hint, size, rights)` — map `obj`'s frames into the caller's address
@@ -832,16 +821,8 @@ pub fn sys_timer_create(flags: u64) -> SysResult {
         return Err(KError::InvalidArgument);
     }
     let obj = TimerObject::try_new().map_err(|_| KError::OutOfMemory)?;
-    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
     let pid = crate::sched::current_owner_pid();
-    match global::get().allocate(pid, ptr, KObjectType::Timer, timer_rights()) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr) });
-            Err(map_handle_err(e))
-        }
-    }
+    Ok(install(pid, ObjectRef::new(obj), timer_rights())?.bits() as isize)
 }
 
 /// `sys_timer_set(timer, deadline_ns, interval_ns)` — arm `timer` to fire at the absolute
@@ -859,16 +840,8 @@ pub fn sys_timer_set(timer_h: u64, deadline_ns: u64, interval_ns: u64) -> SysRes
 /// `sys_ns_create()` — create an empty [`Namespace`]; the handle carries [`namespace_rights`].
 pub fn sys_ns_create() -> SysResult {
     let obj = Namespace::try_new().map_err(|_| KError::OutOfMemory)?;
-    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
     let pid = crate::sched::current_owner_pid();
-    match global::get().allocate(pid, ptr, KObjectType::Namespace, namespace_rights()) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr) });
-            Err(map_handle_err(e))
-        }
-    }
+    Ok(install(pid, ObjectRef::new(obj), namespace_rights())?.bits() as isize)
 }
 
 /// `sys_ns_derive(ns)` — create a new [`Namespace`] holding a **copy of `ns`'s bindings** and
@@ -885,15 +858,7 @@ pub fn sys_ns_derive(ns_h: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;
     let obj = ns.try_derive().map_err(|_| KError::OutOfMemory)?;
-    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
-    match global::get().allocate(pid, ptr, KObjectType::Namespace, namespace_rights()) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr) });
-            Err(map_handle_err(e))
-        }
-    }
+    Ok(install(pid, ObjectRef::new(obj), namespace_rights())?.bits() as isize)
 }
 
 /// Require the calling process to hold system capability `cap` (`docs/architecture/syscaps.md`),
@@ -1023,16 +988,8 @@ fn entropy_rights() -> Rights {
 /// `sys_entropy_create()` — create an [`EntropyObject`] token onto the kernel CSPRNG.
 pub fn sys_entropy_create() -> SysResult {
     let obj = EntropyObject::try_new().map_err(|_| KError::OutOfMemory)?;
-    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
     let pid = crate::sched::current_owner_pid();
-    match global::get().allocate(pid, ptr, KObjectType::EntropyObject, entropy_rights()) {
-        Ok(h) => Ok(h.bits() as isize),
-        Err(e) => {
-            // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr) });
-            Err(map_handle_err(e))
-        }
-    }
+    Ok(install(pid, ObjectRef::new(obj), entropy_rights())?.bits() as isize)
 }
 
 /// `sys_entropy_read(ent, buf, len)` — fill `buf[0..len]` with CSPRNG output. Requires `READ`
@@ -1066,17 +1023,7 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     let po_ref = ObjectRef::new(po);
     let waiter_ref = po_ref.clone();
-    let (pp, pt) = po_ref.into_raw();
-    let po_h = match global::get().allocate(pid, pp, pt, pending_op_rights()) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it. Drop the
-            // clone too — both outside any lock.
-            drop(unsafe { ObjectRef::from_raw(pp) });
-            drop(waiter_ref);
-            return Err(map_handle_err(e));
-        }
-    };
+    let po_h = install(pid, po_ref, pending_op_rights())?;
     match crate::entropy::register_seed_waiter(waiter_ref) {
         crate::entropy::SeedWaitReg::Queued => {}
         crate::entropy::SeedWaitReg::AlreadySeeded(r) => {
@@ -1448,15 +1395,13 @@ fn read_completion(po: &ObjectRef, pid: u32) -> (i32, u64) {
             Completion::Installing => continue,
             Completion::Install(obj, rights) => (obj, rights),
         };
-        let (op, ot) = obj.into_raw();
-        let outcome =
-            global::get().allocate(pid, op, ot, rights).map(|h| h.bits()).map_err(|e| map_handle_err(e) as i32);
+        // A refusal's reference is released at the end of the arm, outside `SCHED`.
+        let (outcome, _refused) = match global::get().install(pid, obj, rights) {
+            Ok(h) => (Ok(h.bits()), None),
+            Err((e, obj)) => (Err(map_handle_err(e) as i32), Some(obj)),
+        };
         // SAFETY: as above.
         unsafe { crate::sched::pending_op_installed(po.as_ptr(), outcome) };
-        if outcome.is_err() {
-            // SAFETY: `allocate` did not adopt the reference; reclaim it, outside `SCHED`.
-            drop(unsafe { ObjectRef::from_raw(op) });
-        }
         return outcome.map_or_else(|status| (status, 0), |h| (0, h));
     }
 }
@@ -1468,20 +1413,18 @@ fn channel_endpoint_rights() -> Rights {
 
 /// Install `obj` in `pid`'s table with `rights`, or release it, off the table's lock.
 fn install(pid: u32, obj: ObjectRef, rights: Rights) -> Result<RawHandle, KError> {
-    let (p, t) = obj.into_raw();
-    global::get().allocate(pid, p, t, rights).map_err(|e| {
-        // SAFETY: `allocate` did not adopt the reference; reclaim it.
-        drop(unsafe { ObjectRef::from_raw(p) });
-        map_handle_err(e)
-    })
+    global::get().install(pid, obj, rights).map_err(refused)
 }
 
-fn close_and_release(h: RawHandle, pid: u32) {
-    if let Ok(co) = global::get().close(h, pid) {
-        // SAFETY: `close` transferred one reference into the token without
-        // decrementing; adopt it into an `ObjectRef` and drop to release.
-        drop(unsafe { ObjectRef::from_raw(co.0) });
-    }
+/// An install's refusal as the syscall's error, the reference it handed back released here,
+/// outside the table's lock.
+fn refused((e, _object): (HandleError, ObjectRef)) -> KError {
+    map_handle_err(e)
+}
+
+/// The handles a syscall installs in `pid`'s table, closed again unless it commits them.
+fn installing<const N: usize>(pid: u32) -> Installed<'static, N> {
+    Installed::new(global::get(), pid)
 }
 
 /// `sys_channel_create(end0, end1, queue_depth)` — create a bidirectional IPC channel and write
@@ -1500,42 +1443,17 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
 
     let pid = crate::sched::current_owner_pid();
     let (a, b) = IpcChannel::try_new_pair(depth).map_err(|_| KError::OutOfMemory)?;
-    let a_ptr = KBox::into_raw(a).as_ptr() as *mut ();
-    let b_ptr = KBox::into_raw(b).as_ptr() as *mut ();
+    let (a, b) = (ObjectRef::new(a), ObjectRef::new(b));
     let rights = channel_endpoint_rights();
 
-    let h0 = match global::get().allocate(pid, a_ptr, KObjectType::IpcChannel, rights) {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: each pointer still owns its single creation reference.
-            drop(unsafe { ObjectRef::from_raw(a_ptr) });
-            // SAFETY: as above.
-            drop(unsafe { ObjectRef::from_raw(b_ptr) });
-            return Err(map_handle_err(e));
-        }
-    };
-    // Endpoint 1; on failure, close `h0` (nulls b's peer) and reclaim b's creation reference.
-    let h1 = match global::get().allocate(pid, b_ptr, KObjectType::IpcChannel, rights) {
-        Ok(h) => h,
-        Err(e) => {
-            close_and_release(h0, pid);
-            // SAFETY: b_ptr still owns its creation reference.
-            drop(unsafe { ObjectRef::from_raw(b_ptr) });
-            return Err(map_handle_err(e));
-        }
-    };
-
-    // A faulting copy rolls both back so no endpoint leaks into a process that cannot see it.
-    if let Err(e) = copy_to_user(e0, &h0) {
-        close_and_release(h0, pid);
-        close_and_release(h1, pid);
-        return Err(from_user_access(e));
-    }
-    if let Err(e) = copy_to_user(e1, &h1) {
-        close_and_release(h0, pid);
-        close_and_release(h1, pid);
-        return Err(from_user_access(e));
-    }
+    // A failure at any step closes what was installed, so no endpoint leaks into a process that
+    // cannot see it; a refused endpoint's reference drops with its error.
+    let mut installed = installing::<2>(pid);
+    let h0 = installed.install(a, rights).map_err(refused)?;
+    let h1 = installed.install(b, rights).map_err(refused)?;
+    copy_to_user(e0, &h0).map_err(from_user_access)?;
+    copy_to_user(e1, &h1).map_err(from_user_access)?;
+    installed.commit();
     Ok(0)
 }
 
@@ -2040,16 +1958,6 @@ fn new_block_file(
     Ok(Ref::new(fobj))
 }
 
-/// Close every handle a partial `sys_channel_recv` installed, so a copy-out fault or
-/// mid-install error after the dequeue doesn't leak them.
-fn recv_rollback_installed(installed: &[RawHandle], pid: u32) {
-    for &h in installed {
-        if !h.is_null() {
-            close_and_release(h, pid);
-        }
-    }
-}
-
 /// `sys_channel_recv(ch, msg, handles, count)` — dequeue the oldest message on endpoint `ch`
 /// into `*msg` (4096 bytes), **install** any transferred handles into the caller's table
 /// (writing their values to `handles[0..*count]` and the in-message `handles[]`), and write
@@ -2087,43 +1995,23 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     if n > IPC_HANDLE_MAX {
         return Err(KError::KernelError);
     }
-    let mut installed = [RawHandle::NULL; IPC_HANDLE_MAX];
+    // A copy-out fault or a refused install after the dequeue closes every handle installed.
+    let mut installed = installing::<IPC_HANDLE_MAX>(pid);
+    let mut out = [RawHandle::NULL; IPC_HANDLE_MAX];
     for i in 0..n {
         if let Some(tr) = transfers[i].take() {
-            let (op, ot) = tr.obj.into_raw();
-            match global::get().allocate(pid, op, ot, tr.rights) {
-                Ok(h) => {
-                    installed[i] = h;
-                    bounce.handles[i] = h.bits();
-                }
-                Err(e) => {
-                    // SAFETY: reclaim the reference `into_raw` yielded.
-                    drop(unsafe { ObjectRef::from_raw(op) });
-                    recv_rollback_installed(&installed[..i], pid);
-                    return Err(map_handle_err(e));
-                }
-            }
+            out[i] = installed.install(tr.obj, tr.rights).map_err(refused)?;
+            bounce.handles[i] = out[i].bits();
         }
     }
 
-    if let Err(e) = copy_slice_to_user(mptr, bounce.as_bytes()) {
-        recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
-        return Err(from_user_access(e));
-    }
+    copy_slice_to_user(mptr, bounce.as_bytes()).map_err(from_user_access)?;
     if n > 0 {
-        let hptr = UserMutPtr::<u8>::new(handles).map_err(|e| {
-            recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
-            from_user_access(e)
-        })?;
-        if let Err(e) = copy_array_to_user(hptr, &installed[..n]) {
-            recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
-            return Err(from_user_access(e));
-        }
+        let hptr = UserMutPtr::<u8>::new(handles).map_err(from_user_access)?;
+        copy_array_to_user(hptr, &out[..n]).map_err(from_user_access)?;
     }
-    if let Err(e) = copy_to_user(cptr, &n) {
-        recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
-        return Err(from_user_access(e));
-    }
+    copy_to_user(cptr, &n).map_err(from_user_access)?;
+    installed.commit();
     Ok(0)
 }
 
