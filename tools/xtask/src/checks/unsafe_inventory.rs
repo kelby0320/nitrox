@@ -21,10 +21,17 @@ const KINDS: &[(&str, &[&str])] = &[
     ("transmute", &["transmute"]),
     ("asm", &["asm!", "global_asm!", "naked_asm!"]),
     ("volatile", &["read_volatile", "write_volatile"]),
+    ("unsafe attr", &["#[unsafe("]),
+    ("unsafe extern", &["unsafe extern {"]),
 ];
-const UNSAFE_BLOCK: usize = 0;
-const UNSAFE_FN: usize = 1;
+pub(super) const UNSAFE_BLOCK: usize = 0;
+pub(super) const UNSAFE_FN: usize = 1;
+pub(super) const UNSAFE_IMPL: usize = 2;
+pub(super) const STATIC_MUT: usize = 3;
 const RAW_DEREF: usize = 6;
+pub(super) const UNSAFE_ATTR: usize = 10;
+pub(super) const UNSAFE_EXTERN: usize = 11;
+pub(super) const KIND_COUNT: usize = KINDS.len();
 
 /// The counts for one path: lines of code, then one per [`KINDS`] entry.
 #[derive(Default, Debug, PartialEq)]
@@ -49,7 +56,7 @@ pub(super) fn is_test_file(path: &str) -> bool {
     name == "tests.rs" || name.ends_with("_tests.rs") || name == "test_support.rs" || path.contains("/tests/")
 }
 
-/// `text` with its `//` comments removed and each string and character literal's contents
+/// `text` with its comments removed and each string and character literal's contents
 /// replaced by `x`, line for line, so a brace or a marker inside a literal is not code.
 pub(super) fn blanked(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
@@ -95,6 +102,24 @@ pub(super) fn blanked(text: &str) -> Vec<String> {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
+        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            // Block comments nest; only their line breaks stay.
+            let mut depth = 0;
+            while i < chars.len() {
+                let pair = (chars[i], chars.get(i + 1).copied());
+                if pair == ('/', Some('*')) || pair == ('*', Some('/')) {
+                    depth += if pair.0 == '/' { 1 } else { -1 };
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    if chars[i] == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+            }
         } else {
             out.push(c);
             i += 1;
@@ -104,7 +129,8 @@ pub(super) fn blanked(text: &str) -> Vec<String> {
 }
 
 /// `lines` with every `#[cfg(test)]` item taken out: the attribute's next item, to the `}` that
-/// closes it or, with no brace, to its `;` or `,`. An item still open at the end is an error.
+/// closes it or, with no brace, to its `;` or `,` outside any bracket. An item still open at the
+/// end is an error.
 pub(super) fn non_test_lines(lines: Vec<String>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -119,7 +145,7 @@ pub(super) fn non_test_lines(lines: Vec<String>) -> Result<Vec<String>, String> 
         while i < lines.len() && lines[i].trim_start().starts_with("#[") {
             i += 1;
         }
-        let (mut depth, mut opened, mut ended) = (0i64, false, false);
+        let (mut depth, mut nest, mut opened, mut ended) = (0i64, 0i64, false, false);
         while i < lines.len() && !ended {
             for c in lines[i].chars() {
                 match c {
@@ -128,11 +154,13 @@ pub(super) fn non_test_lines(lines: Vec<String>) -> Result<Vec<String>, String> 
                         opened = true;
                     }
                     '}' => depth -= 1,
+                    '(' | '[' => nest += 1,
+                    ')' | ']' => nest -= 1,
                     _ => {}
                 }
             }
             let line = lines[i].trim_end();
-            ended = if opened { depth <= 0 } else { line.ends_with(';') || line.ends_with(',') };
+            ended = if opened { depth <= 0 } else { nest <= 0 && (line.ends_with(';') || line.ends_with(',')) };
             i += 1;
         }
         if !ended {
@@ -162,16 +190,18 @@ pub(super) fn occurrences(line: &str, marker: &str) -> usize {
     n
 }
 
-/// `line` with each `unsafe extern "<abi>" fn` read as `unsafe fn`.
+/// `line` with each `unsafe extern "<abi>" fn` read as `unsafe fn`, and each `unsafe extern
+/// "<abi>" {` block as `unsafe extern {`. A function-pointer type, `unsafe extern "C" fn(`, is
+/// neither.
 fn unextern(line: &str) -> String {
     let mut out = String::new();
     let mut rest = line;
     while let Some(at) = rest.find("unsafe extern \"") {
         let after = &rest[at + "unsafe extern \"".len()..];
-        match after.split_once('"').filter(|(_, tail)| tail.starts_with(" fn ")) {
+        match after.split_once('"').filter(|(_, tail)| tail.starts_with(" fn ") || tail.starts_with(" {")) {
             Some((_, tail)) => {
                 out.push_str(&rest[..at]);
-                out.push_str("unsafe");
+                out.push_str(if tail.starts_with(" {") { "unsafe extern" } else { "unsafe" });
                 rest = tail;
             }
             None => {
@@ -258,28 +288,33 @@ fn named_groups(args: &[String]) -> Vec<String> {
     args.iter().map(|p| p.trim_end_matches('/').to_string()).collect()
 }
 
-/// The counts over `files`, each a tracked path and its text, test files left out; refused if
-/// that leaves no code, so a path that names nothing is not a row of zeros.
-fn tally(group: &str, files: &[(String, String)]) -> R<Counts> {
+/// The counts over `files`, each a tracked path and its text, test files left out.
+fn sum(files: &[(String, String)]) -> R<Counts> {
     let mut total = Counts::default();
     for (path, text) in files.iter().filter(|(p, _)| p.ends_with(".rs") && !is_test_file(p)) {
         total.add(&count(text).map_err(|e| format!("unsafe-inventory: {path}: {e}"))?);
     }
+    Ok(total)
+}
+
+/// [`sum`], refused if that leaves no code, so a path that names nothing is not a row of zeros.
+fn tally(group: &str, files: &[(String, String)]) -> R<Counts> {
+    let total = sum(files)?;
     if total.code == 0 {
         return Err(format!("unsafe-inventory: no tracked Rust code under {group}").into());
     }
     Ok(total)
 }
 
-/// The `unsafe` blocks and `unsafe fn`s of each kernel module, from `files`, each a tracked path
-/// and its text: the default groups' scan, so `x.rs` and `x/` are one module `kernel/src/x`.
-pub(super) fn kernel_unsafe(files: &[(String, String)]) -> R<std::collections::BTreeMap<String, (usize, usize)>> {
+/// Every kind's count in each kernel module, from `files`, each a tracked path and its text: the
+/// default groups' scan, so `x.rs` and `x/` are one module `kernel/src/x`. A module holding only
+/// test code counts zero of each.
+pub(super) fn kernel_counts(files: &[(String, String)]) -> R<std::collections::BTreeMap<String, [usize; KIND_COUNT]>> {
     let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).filter(|p| p.starts_with("kernel/src/")).collect();
     let mut out = std::collections::BTreeMap::new();
     for group in default_groups(&paths).into_iter().filter(|g| g.starts_with("kernel/src/")) {
         let own: Vec<(String, String)> = files.iter().filter(|(p, _)| in_group(p, &group)).cloned().collect();
-        let c = tally(&group, &own)?;
-        out.insert(group, (c.kinds[UNSAFE_BLOCK], c.kinds[UNSAFE_FN]));
+        out.insert(group, sum(&own)?.kinds);
     }
     Ok(out)
 }

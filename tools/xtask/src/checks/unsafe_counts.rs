@@ -1,11 +1,13 @@
-//! `check-unsafe`: the `unsafe` blocks and `unsafe fn`s of each kernel module only fall, against
+//! `check-unsafe`: each kind of `unsafe` in each kernel module only falls, against
 //! `tools/xtask/unsafe-counts.toml`.
 //!
 //! The modules and the counts are `unsafe-inventory`'s: each module of `kernel/src` is `x.rs` and
 //! `x/` together, test code left out. A rise fails, and so does an entry above its count.
 
 use super::comment_budget::git;
-use super::unsafe_inventory::kernel_unsafe;
+use super::unsafe_inventory::{
+    KIND_COUNT, STATIC_MUT, UNSAFE_ATTR, UNSAFE_BLOCK, UNSAFE_EXTERN, UNSAFE_FN, UNSAFE_IMPL, kernel_counts,
+};
 use crate::*;
 use std::collections::BTreeMap;
 
@@ -13,62 +15,76 @@ use std::collections::BTreeMap;
 mod tests;
 
 const BASELINE: &str = "tools/xtask/unsafe-counts.toml";
-const HEADER: &str = "# The `unsafe` blocks and `unsafe fn`s of each kernel module, counted by `cargo xtask check-unsafe`\n\
-                      # as `cargo xtask unsafe-inventory` counts them: a module is `x.rs` and `x/` together, test code\n\
+const HEADER: &str = "# The `unsafe` of each kernel module, by kind, counted by `cargo xtask check-unsafe` as\n\
+                      # `cargo xtask unsafe-inventory` counts it: a module is `x.rs` and `x/` together, test code\n\
                       # left out. A count only falls. `--update` lowers or removes entries; a raise is by hand, in the\n\
                       # commit that adds the `unsafe`, whose message says why (kernel/CLAUDE.md's `unsafe` policy).\n";
-const SECTIONS: [&str; 2] = ["unsafe-blocks", "unsafe-fns"];
 
-/// The checked-in baseline: a count per module, for each of the two kinds.
+/// Each section of the table: its name, the inventory kind it holds, and what a count of it is.
+const SECTIONS: [(&str, usize, &str); 6] = [
+    ("unsafe-blocks", UNSAFE_BLOCK, "unsafe block(s)"),
+    ("unsafe-fns", UNSAFE_FN, "unsafe fn(s)"),
+    ("unsafe-impls", UNSAFE_IMPL, "unsafe impl(s)"),
+    ("unsafe-attrs", UNSAFE_ATTR, "#[unsafe(..)] attribute(s)"),
+    ("unsafe-externs", UNSAFE_EXTERN, "unsafe extern block(s)"),
+    ("static-muts", STATIC_MUT, "static mut(s)"),
+];
+
+/// Each kernel module's count of every inventory kind.
+type Counts = BTreeMap<String, [usize; KIND_COUNT]>;
+
+/// The checked-in baseline: for each of [`SECTIONS`], a count per module.
 #[derive(Default, Debug, PartialEq, Clone)]
 struct Baseline {
-    blocks: BTreeMap<String, usize>,
-    fns: BTreeMap<String, usize>,
+    sections: [BTreeMap<String, usize>; SECTIONS.len()],
 }
 
 fn parse_baseline(text: &str) -> R<Baseline> {
     let mut out = Baseline::default();
-    let mut section = "";
+    let mut section = None;
     for line in text.lines() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
-        if let Some(name) = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')).filter(|n| SECTIONS.contains(n)) {
-            section = name;
+        if let Some(name) = t.strip_prefix('[').and_then(|r| r.strip_suffix(']'))
+            && let Some(i) = SECTIONS.iter().position(|(s, _, _)| *s == name)
+        {
+            section = Some(i);
             continue;
         }
         let bad = || format!("{BASELINE}: not `\"path\" = count`: {line}");
         let (path, value) = t.strip_prefix('"').and_then(|r| r.split_once("\" = ")).ok_or_else(bad)?;
         let count = value.parse().map_err(|_| bad())?;
-        match section {
-            "unsafe-blocks" => out.blocks.insert(path.to_string(), count),
-            "unsafe-fns" => out.fns.insert(path.to_string(), count),
-            _ => {
-                return Err(format!("{BASELINE}: an entry outside `[unsafe-blocks]` and `[unsafe-fns]`: {line}").into());
-            }
-        };
+        let i = section.ok_or_else(|| format!("{BASELINE}: an entry before any section: {line}"))?;
+        out.sections[i].insert(path.to_string(), count);
     }
     Ok(out)
 }
 
 fn format_baseline(b: &Baseline) -> String {
     let mut out = HEADER.to_string();
-    for (name, counts) in SECTIONS.iter().zip([&b.blocks, &b.fns]) {
+    for ((name, _, _), entries) in SECTIONS.iter().zip(&b.sections) {
         out.push_str(&format!("\n[{name}]\n"));
-        for (path, n) in counts {
+        for (path, n) in entries {
             out.push_str(&format!("\"{path}\" = {n}\n"));
         }
     }
     out
 }
 
+/// One kind's count in each module.
+fn of_kind(actual: &Counts, kind: usize) -> BTreeMap<String, usize> {
+    actual.iter().map(|(g, c)| (g.clone(), c[kind])).collect()
+}
+
 /// The measured counts as a baseline: a module counting zero in a kind has no entry in it.
-fn measured(actual: &BTreeMap<String, (usize, usize)>) -> Baseline {
-    let pick = |f: fn(&(usize, usize)) -> usize| {
-        actual.iter().map(|(g, c)| (g.clone(), f(c))).filter(|(_, n)| *n > 0).collect::<BTreeMap<_, _>>()
-    };
-    Baseline { blocks: pick(|c| c.0), fns: pick(|c| c.1) }
+fn measured(actual: &Counts) -> Baseline {
+    let mut out = Baseline::default();
+    for (i, (_, kind, _)) in SECTIONS.iter().enumerate() {
+        out.sections[i] = of_kind(actual, *kind).into_iter().filter(|(_, n)| *n > 0).collect();
+    }
+    out
 }
 
 /// What is wrong with one section: `counts` against its `entries`, `what` naming the kind.
@@ -104,47 +120,81 @@ fn section_failures(what: &str, counts: &BTreeMap<String, usize>, entries: &BTre
     out
 }
 
-fn failures(actual: &BTreeMap<String, (usize, usize)>, baseline: &Baseline) -> Vec<String> {
-    let kind = |f: fn(&(usize, usize)) -> usize| -> BTreeMap<String, usize> {
-        actual.iter().map(|(g, c)| (g.clone(), f(c))).collect()
-    };
-    let mut out = section_failures("unsafe block(s)", &kind(|c| c.0), &baseline.blocks);
-    out.extend(section_failures("unsafe fn(s)", &kind(|c| c.1), &baseline.fns));
+fn failures(actual: &Counts, baseline: &Baseline) -> Vec<String> {
+    let mut out = Vec::new();
+    for ((_, kind, what), entries) in SECTIONS.iter().zip(&baseline.sections) {
+        out.extend(section_failures(what, &of_kind(actual, *kind), entries));
+    }
     out
 }
 
 /// `baseline` with each count lowered to the one measured and each entry that counts zero or is
 /// gone removed; never raised.
-fn updated(actual: &BTreeMap<String, (usize, usize)>, baseline: &Baseline) -> Baseline {
-    let lower = |entries: &BTreeMap<String, usize>, f: fn(&(usize, usize)) -> usize| {
-        entries
+fn updated(actual: &Counts, baseline: &Baseline) -> Baseline {
+    let mut out = Baseline::default();
+    for (i, (_, kind, _)) in SECTIONS.iter().enumerate() {
+        out.sections[i] = baseline.sections[i]
             .iter()
-            .filter_map(|(g, &e)| actual.get(g).map(f).filter(|&n| n > 0).map(|n| (g.clone(), e.min(n))))
-            .collect()
-    };
-    Baseline { blocks: lower(&baseline.blocks, |c| c.0), fns: lower(&baseline.fns, |c| c.1) }
+            .filter_map(|(g, &e)| actual.get(g).map(|c| c[*kind]).filter(|&n| n > 0).map(|n| (g.clone(), e.min(n))))
+            .collect();
+    }
+    out
 }
 
-/// Print each entry `new` changes from `old`.
-fn print_changes(what: &str, old: &BTreeMap<String, usize>, new: &BTreeMap<String, usize>) {
-    for (group, o) in old {
-        match new.get(group) {
-            Some(n) if n == o => {}
-            Some(n) => println!("check-unsafe: {group}: {what} {o} -> {n}"),
-            None => println!("check-unsafe: {group}: {what} removed"),
-        }
+/// What a run does: the table it writes, if any; the lines it prints; and its failures.
+#[derive(Debug, Default)]
+struct Run {
+    write: Option<String>,
+    printed: Vec<String>,
+    failures: Vec<String>,
+}
+
+/// `check-unsafe [--update | --list]` over `actual`, given the table's text; `--list` needs none.
+fn run(args: &[String], actual: &Counts, table: Option<&str>) -> R<Run> {
+    let mut out = Run::default();
+    if args.iter().any(|a| a == "--list") {
+        out.printed.push(format_baseline(&measured(actual)));
+        return Ok(out);
     }
+    let mut baseline = parse_baseline(table.ok_or_else(|| format!("check-unsafe: no {BASELINE}"))?)?;
+    if args.iter().any(|a| a == "--update") {
+        let new = updated(actual, &baseline);
+        for ((name, _, _), (old, now)) in SECTIONS.iter().zip(baseline.sections.iter().zip(&new.sections)) {
+            for (group, o) in old {
+                match now.get(group) {
+                    Some(n) if n == o => {}
+                    Some(n) => out.printed.push(format!("check-unsafe: {group}: {name} {o} -> {n}")),
+                    None => out.printed.push(format!("check-unsafe: {group}: {name} removed")),
+                }
+            }
+        }
+        out.write = Some(format_baseline(&new));
+        baseline = new;
+    }
+    out.failures = failures(actual, &baseline);
+    if out.failures.is_empty() {
+        let totals: Vec<String> = SECTIONS
+            .iter()
+            .map(|(name, kind, _)| format!("{} {name}", actual.values().map(|c| c[*kind]).sum::<usize>()))
+            .collect();
+        out.printed.push(format!(
+            "check-unsafe: {} in {} modules, none over its entry ✓",
+            totals.join(", "),
+            actual.len()
+        ));
+    }
+    Ok(out)
 }
 
 /// The counts of every kernel module, read from the tracked files.
-fn measure() -> R<BTreeMap<String, (usize, usize)>> {
+fn measure() -> R<Counts> {
     let root = repo_root();
     let mut files = Vec::new();
     for path in git(&["ls-files", "--", "kernel/src"])?.lines().filter(|p| p.ends_with(".rs")) {
         let text = fs::read_to_string(root.join(path)).map_err(|e| format!("check-unsafe: {path}: {e}"))?;
         files.push((path.to_string(), text));
     }
-    kernel_unsafe(&files)
+    kernel_counts(&files)
 }
 
 /// `check-unsafe [--update | --list]`: `--list` prints every current count in the baseline's format
@@ -152,29 +202,19 @@ fn measure() -> R<BTreeMap<String, (usize, usize)>> {
 pub(crate) fn cmd_check_unsafe(args: &[String]) -> R<()> {
     let file = repo_root().join(BASELINE);
     let actual = measure()?;
-    if args.iter().any(|a| a == "--list") {
-        print!("{}", format_baseline(&measured(&actual)));
-        return Ok(());
+    let table = if file.exists() { Some(crate::read_text(&file)?) } else { None };
+    let done = run(args, &actual, table.as_deref())?;
+    if let Some(text) = &done.write {
+        fs::write(&file, text)?;
     }
-    let mut baseline = parse_baseline(&crate::read_text(&file)?)?;
-    if args.iter().any(|a| a == "--update") {
-        let new = updated(&actual, &baseline);
-        print_changes("unsafe blocks", &baseline.blocks, &new.blocks);
-        print_changes("unsafe fns", &baseline.fns, &new.fns);
-        fs::write(&file, format_baseline(&new))?;
-        baseline = new;
+    for line in &done.printed {
+        println!("{}", line.trim_end());
     }
-    let failed = failures(&actual, &baseline);
-    if !failed.is_empty() {
-        for f in &failed {
+    if !done.failures.is_empty() {
+        for f in &done.failures {
             eprintln!("check-unsafe: {f}");
         }
-        return Err(format!("check-unsafe: {} failure(s)", failed.len()).into());
+        return Err(format!("check-unsafe: {} failure(s)", done.failures.len()).into());
     }
-    let (blocks, fns): (usize, usize) = actual.values().fold((0, 0), |(b, f), c| (b + c.0, f + c.1));
-    println!(
-        "check-unsafe: {blocks} unsafe blocks and {fns} unsafe fns in {} modules, none over its entry ✓",
-        actual.len()
-    );
     Ok(())
 }

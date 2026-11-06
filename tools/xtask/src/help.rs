@@ -45,7 +45,7 @@ pub(crate) fn print_help() {
            check-recv    fail if userspace receives raw, past libkern's `channel_recv`\n  \
            check-syscalls  fail if a crate's raw syscalls rise past raw-syscalls.toml; `--update`\n  \
            \x20               lowers stale entries, `--list` prints the counts and libkern's wrappers\n  \
-           check-unsafe    fail if a kernel module's `unsafe` blocks or fns rise past unsafe-counts.toml;\n  \
+           check-unsafe    fail if a kernel module's `unsafe` of any kind rises past unsafe-counts.toml;\n  \
            \x20               `--update` lowers stale entries, `--list` prints the counts\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
            check-docs      fail if a doc links to, or cites, a path that does not exist\n  \

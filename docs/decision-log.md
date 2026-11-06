@@ -37846,13 +37846,17 @@ Decided in the pass, for the maintainer's eye:
 
 Part J's first sub-part, `typed-layers.md` § J.1, built on `pre-phase-7/part-j1-ring0`.
 
-- **`cargo xtask check-unsafe` holds each kernel module's `unsafe`**: its `unsafe` blocks and
-  `unsafe fn`s, counted by `unsafe-inventory`'s own scan with test code left out, a module being
-  `x.rs` and `x/` together, against `tools/xtask/unsafe-counts.toml`, in CI after
-  `check-syscalls`. A rise fails, as do a stale entry and a module with new `unsafe` and no entry;
-  `--update` lowers and removes and never raises, so **a raise is by hand, in the commit that adds
-  the `unsafe`, whose message says why**, the justification `kernel/CLAUDE.md` asked for and
-  nothing held. It started at 1,113 blocks and 348 `unsafe fn`s in 28 modules.
+- **`cargo xtask check-unsafe` holds each kernel module's `unsafe`**, every kind that makes an
+  `unsafe` claim: blocks, `unsafe fn`s and `unsafe impl`s, `#[unsafe(..)]` attributes, `unsafe
+  extern` blocks and `static mut`s. They are counted by `unsafe-inventory`'s own scan with test
+  code left out, a module being `x.rs` and `x/` together, against `tools/xtask/unsafe-counts.toml`,
+  in CI after `check-syscalls`. A rise fails, as do a stale entry and a module with new `unsafe`
+  and no entry; `--update` lowers and removes and never raises, so **a raise is by hand, in the
+  commit that adds the `unsafe`, whose message says why**, the justification `kernel/CLAUDE.md`
+  asked for and nothing held. It started at 1,113 blocks and 348 `unsafe fn`s in 28 modules, with
+  52 `unsafe impl`s, 25 attributes, one `extern` block and 11 `static mut`s. The plan named blocks
+  and `unsafe fn`s; the review of J.1 showed a new `unsafe impl Send` passed unheld, so it holds
+  the rest too.
 - **Eighteen `unsafe fn`s whose whole contract was "ring 0" went** (kplat-o8): the two TLB
   flushes, `invlpg` and `tlb::invalidate_local` under them, `cli` and `interrupts_disable`,
   `wbinvd`, and `MemoryTypes::{at, of_mapping, log_configuration}` are safe, and `ArchCpu::halt`,
