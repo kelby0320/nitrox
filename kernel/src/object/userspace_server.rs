@@ -566,7 +566,7 @@ mod tests {
         let s_ref = ObjectRef::new(s);
         let k_ptr = k_ref.as_object().as_ptr();
         let r = UserspaceServerReg::try_new(k_ref).unwrap();
-        let binding = ObjectRef::new(r);
+        let binding = Ref::new(r);
         // SAFETY: `k_ptr` is the endpoint the registration holds.
         assert!(unsafe { crate::sched::us_server_attach(k_ptr, &binding) }.is_none());
 

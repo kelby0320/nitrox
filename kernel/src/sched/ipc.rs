@@ -342,24 +342,22 @@ unsafe fn fail_outstanding<const N: usize>(g: &mut SchedState, reg: *mut (), orp
 ///
 /// # Safety
 ///
-/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds,
-/// and `reg` is a `UserspaceServerReg`.
-pub unsafe fn us_server_attach(endpoint: *mut (), reg: &ObjectRef) -> Option<ObjectRef> {
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
+pub unsafe fn us_server_attach(endpoint: *mut (), reg: &Ref<UserspaceServerReg>) -> Option<Ref<UserspaceServerReg>> {
     let _g = SCHED.lock();
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
     let existing = unsafe { IpcChannel::us_reg_of(endpoint) };
     if !existing.is_null() {
         // `try_acquire`, not `bump`: one mid-drop has a zero count, and is replaced.
-        // SAFETY: `existing` addresses a `UserspaceServerReg` whose header is at offset 0;
-        // `SCHED` held.
-        let header = unsafe { &*(existing as *const crate::object::header::KObjectHeader) };
-        if header.try_acquire() {
-            // SAFETY: the successful `try_acquire` above balances this adoption.
-            return Some(unsafe { ObjectRef::from_raw(existing) });
+        // SAFETY: the back-pointer names only the `UserspaceServerReg` attached to the endpoint,
+        // which clears it under `SCHED` before it is freed, so `existing` is a whole registration
+        // while `SCHED` is held; `try_acquire` refuses one already at zero.
+        if let Some(shared) = unsafe { Ref::try_acquire(existing.cast::<UserspaceServerReg>()) } {
+            return Some(shared);
         }
     }
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
-    unsafe { IpcChannel::set_us_reg(endpoint, reg.as_ptr()) };
+    unsafe { IpcChannel::set_us_reg(endpoint, reg.as_object().as_ptr()) };
     None
 }
 
@@ -611,7 +609,7 @@ mod tests {
         let (k, s) = kernel_end();
         let reg = Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
         // SAFETY: `k` is pinned by the test's reference.
-        assert!(unsafe { us_server_attach(k.as_object().as_ptr(), reg.as_object()) }.is_none());
+        assert!(unsafe { us_server_attach(k.as_object().as_ptr(), &reg) }.is_none());
         (reg, s)
     }
 
@@ -662,7 +660,7 @@ mod tests {
     fn a_second_attach_of_an_endpoint_gets_the_first_registration() {
         init_global_heap();
         let (k, _server_end) = kernel_end();
-        let new_reg = || ObjectRef::new(UserspaceServerReg::try_new(k.clone()).unwrap());
+        let new_reg = || Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
         let (first, second) = (new_reg(), new_reg());
         let k = k.as_object().as_ptr();
         // SAFETY: `k` is pinned by the test's reference, and the test is single-threaded.
@@ -670,7 +668,7 @@ mod tests {
             assert!(us_server_attach(k, &first).is_none());
             let shared = us_server_attach(k, &second).expect("the first registration");
             assert_eq!(shared.as_ptr(), first.as_ptr());
-            assert_eq!(IpcChannel::us_reg_of(k), first.as_ptr(), "replies route to it");
+            assert_eq!(IpcChannel::us_reg_of(k), first.as_object().as_ptr(), "replies route to it");
         }
     }
 

@@ -26,7 +26,7 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     };
     let device = lookup_as::<DeviceNode>(resource_h, pid, dev_right)?;
     let buffer = lookup_as::<MemoryObject>(op.buffer, pid, buf_right)?;
-    let buffer_size = io_buffer_size(buffer.as_object())?;
+    let buffer_size = io_buffer_size(&buffer)?;
     let buf_end = op.buf_offset.checked_add(op.length).ok_or(KError::InvalidArgument)?;
     if buf_end > buffer_size {
         return Err(KError::InvalidArgument);
@@ -114,12 +114,9 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
 }
 
 /// An I/O buffer's size; a borrowed one is refused, as the kernel and the device reach its frames.
-pub(super) fn io_buffer_size(buf: &ObjectRef) -> Result<u64, KError> {
-    assert_eq!(buf.object_type(), KObjectType::MemoryObject, "io_buffer_size");
-    // SAFETY: `buf` pins a live `MemoryObject`, its type just checked.
-    let mo = unsafe { &*(buf.as_ptr() as *const MemoryObject) };
-    if !mo.kernel_reachable() {
+pub(super) fn io_buffer_size(buf: &MemoryObject) -> Result<u64, KError> {
+    if !buf.kernel_reachable() {
         return Err(KError::InvalidArgument);
     }
-    Ok(mo.size() as u64)
+    Ok(buf.size() as u64)
 }

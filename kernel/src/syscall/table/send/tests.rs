@@ -70,7 +70,7 @@ fn a_forwarded_reply_closes_the_handles_it_carries() {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
         (Ref::new(a), ObjectRef::new(b))
     };
-    let reg = ObjectRef::new(UserspaceServerReg::try_new(k.clone()).unwrap());
+    let reg = Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
     // SAFETY: `k` is pinned by the test's reference.
     assert!(unsafe { crate::sched::us_server_attach(k.as_object().as_ptr(), &reg) }.is_none());
     let (h, mut t, mut c) = moving(PID);

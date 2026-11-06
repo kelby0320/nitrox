@@ -1,34 +1,4 @@
-//! The type checks before each cast of an `ObjectRef`: each one present, and none debug-only.
-
-use super::*;
-
-/// **Every cast of an `ObjectRef` stops at its type check** when handed another kind of object,
-/// and [`no_object_type_check_is_debug_only`] keeps each check in a release build.
-#[test]
-fn every_cast_of_an_object_ref_stops_another_kind_at_its_type_check() {
-    use crate::mm::PAGE_SIZE;
-    use crate::object::FileObject;
-    use crate::object::file_object::Producer;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    init_global_heap();
-    let file = ObjectRef::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap());
-    type Site<'a> = (&'static str, Box<dyn FnOnce() + 'a>);
-    let sites: Vec<Site<'_>> = vec![(
-        "io_buffer_size",
-        Box::new(|| {
-            let _ = submit::io_buffer_size(&file);
-        }),
-    )];
-    let missed: Vec<&str> = sites
-        .into_iter()
-        .filter_map(|(name, site)| {
-            let stopped = catch_unwind(AssertUnwindSafe(site));
-            let at_check = stopped.is_err_and(|e| e.downcast_ref::<String>().is_some_and(|m| m.contains(name)));
-            (!at_check).then_some(name)
-        })
-        .collect();
-    assert!(missed.is_empty(), "no type check stopped: {missed:?}");
-}
+//! No type check of an `ObjectRef` is debug-only.
 
 /// **No type check before a cast is debug-only**: a release build skips a `debug_assert`, and the
 /// cast after it reads another kind of object as this one.

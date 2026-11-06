@@ -56,11 +56,7 @@ pub(super) fn complete_read_range_reply(
 /// frames or `n == 0`. `Unsupported` for any other kind of object, or a borrowed one.
 pub(super) fn copy_fill_into_frame(src: &ObjectRef, dst: crate::mm::PhysAddr, n: usize) -> Result<(), KError> {
     use crate::mm::{PAGE_SIZE, heap};
-    if src.object_type() != KObjectType::MemoryObject {
-        return Err(KError::Unsupported);
-    }
-    // SAFETY: `src` pins the live `MemoryObject` (header at offset 0), its type just checked.
-    let mo: &crate::object::MemoryObject = unsafe { &*(src.as_ptr() as *const crate::object::MemoryObject) };
+    let mo = src.downcast_ref::<crate::object::MemoryObject>().ok_or(KError::Unsupported)?;
     if !mo.kernel_reachable() {
         return Err(KError::Unsupported);
     }

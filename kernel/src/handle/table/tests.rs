@@ -32,9 +32,7 @@ fn close_release(t: &HandleTable, h: RawHandle, pid: u32) -> Result<(), HandleEr
 }
 
 fn process_magic_ok(r: &ObjectRef) -> bool {
-    debug_assert_eq!(r.object_type(), KObjectType::Process);
-    // SAFETY: `r` pins a live `Process`.
-    unsafe { &*(r.as_ptr() as *const Process) }.magic_ok()
+    r.downcast_ref::<Process>().expect("a Process").magic_ok()
 }
 
 fn sig() -> Rights {
@@ -716,8 +714,7 @@ fn concurrent_torn_read_torture() {
                         for generation in 1..8u32 {
                             let h = RawHandle::encode(0, slot, generation);
                             if let Ok(ok) = t.lookup(h, pid, sig()) {
-                                // SAFETY: `ok.object` pins the object, and this test stores only `Process`es.
-                                let p = unsafe { &*(ok.object.as_ptr() as *const Process) };
+                                let p = ok.object.downcast_ref::<Process>().expect("this test stores only Processes");
                                 assert!(p.magic_ok(), "torn/UAF read: bad magic");
                                 assert_eq!(p.pid(), pid, "object pid != owner pid");
                             }

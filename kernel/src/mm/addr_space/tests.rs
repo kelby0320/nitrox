@@ -401,10 +401,7 @@ fn a_writable_file_mapping_is_counted_while_its_vma_exists() {
     init_global_heap();
     let asp = AddressSpace::new().unwrap();
     let obj = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-    let fo = || {
-        // SAFETY: `obj` pins a live `FileObject` for the whole test.
-        unsafe { &*(obj.as_ptr() as *const FileObject) }
-    };
+    let fo = || -> &FileObject { &obj };
     asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
     assert_eq!(fo().writable_maps(), 1);
     let (back, _) = asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap_err();

@@ -892,14 +892,13 @@ fn a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames() {
     let aperture = adopt(aperture.unwrap());
     let owned = adopt(MemoryObject::try_new_filled(b"\x7fELF").unwrap());
     let cache = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap());
-    // SAFETY: `cache` pins the live `MemoryObject`.
-    let frame = unsafe { &*(cache.as_ptr() as *const MemoryObject) }.frames()[0];
+    let frame = cache.downcast_ref::<MemoryObject>().unwrap().frames()[0];
     let po = ObjectRef::new(PendingOperation::try_new().unwrap());
 
     assert_eq!(spawn::image_bytes(&aperture).err(), Some(KError::InvalidArgument));
     assert_eq!(&spawn::image_bytes(&owned).unwrap()[..4], b"\x7fELF");
-    assert_eq!(submit::io_buffer_size(&aperture), Err(KError::InvalidArgument));
-    assert_eq!(submit::io_buffer_size(&owned), Ok(PAGE_SIZE as u64));
+    assert_eq!(submit::io_buffer_size(aperture.downcast_ref().unwrap()), Err(KError::InvalidArgument));
+    assert_eq!(submit::io_buffer_size(owned.downcast_ref().unwrap()), Ok(PAGE_SIZE as u64));
     assert_eq!(fill::copy_fill_into_frame(&aperture, frame, 4), Err(KError::Unsupported));
     assert_eq!(fill::copy_fill_into_frame(&po, frame, 4), Err(KError::Unsupported));
     assert_eq!(fill::copy_fill_into_frame(&owned, frame, 4), Ok(()));

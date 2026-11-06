@@ -98,8 +98,8 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     // The child's root: `args.namespace` if the parent holds it with `LOOKUP`, else the parent's
     // own; always a **LOOKUP-only** handle, so the child cannot rebind its root.
     let ns_source: Option<ObjectRef> = if !args.namespace.is_null() {
-        match lookup_typed(args.namespace.bits(), parent_pid, Rights::LOOKUP, KObjectType::Namespace) {
-            Ok(ok) => Some(ok.object.clone()),
+        match lookup_as::<Namespace>(args.namespace.bits(), parent_pid, Rights::LOOKUP) {
+            Ok(ns) => Some(ns.erase()),
             Err(e) => {
                 spawn_rollback_child_handles(child_pid, notif_h, RawHandle::NULL, &[]);
                 return Err(e);
@@ -184,22 +184,15 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
 
 /// A spawn's image as one buffer for the loader, read through the HHDM: a borrowed one is refused.
 pub(super) fn image_bytes(img: &ObjectRef) -> Result<KVec<u8>, KError> {
-    match img.object_type() {
-        KObjectType::MemoryObject => {
-            // SAFETY: type checked above; `img` pins it live.
-            let mo = unsafe { &*(img.as_ptr() as *const MemoryObject) };
-            if !mo.kernel_reachable() {
-                return Err(KError::InvalidArgument);
-            }
-            image_fits(mo.size())?;
-            mo.copy_to_kvec().map_err(|_| KError::OutOfMemory)
+    if let Some(mo) = img.downcast_ref::<MemoryObject>() {
+        if !mo.kernel_reachable() {
+            return Err(KError::InvalidArgument);
         }
-        // Blocks on each fill — sound on the syscall thread, which holds no AS/cache lock.
-        KObjectType::FileObject => {
-            let file = img.clone().downcast::<FileObject>().map_err(|_| KError::InvalidArgument)?;
-            image_fits(file.size())?;
-            FileObject::read_to_kvec(&file).map_err(|_| KError::OutOfMemory)
-        }
-        _ => Err(KError::InvalidArgument),
+        image_fits(mo.size())?;
+        return mo.copy_to_kvec().map_err(|_| KError::OutOfMemory);
     }
+    // Blocks on each fill — sound on the syscall thread, which holds no AS/cache lock.
+    let file = img.clone().downcast::<FileObject>().map_err(|_| KError::InvalidArgument)?;
+    image_fits(file.size())?;
+    FileObject::read_to_kvec(&file).map_err(|_| KError::OutOfMemory)
 }
