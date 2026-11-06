@@ -4,30 +4,47 @@ use crate::mm::PAGE_SIZE;
 use crate::mm::buddy::MAX_ORDER;
 use crate::object::IpcChannel;
 
-/// What a deadline-heap entry fires when its `deadline_ns` elapses.
-///
-/// [`Timer`]: crate::object::Timer
+/// The kinds of deadline, each with its own heap slots.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum DeadlineKind {
-    /// A `sys_wait` thread-deadline: `target` is the waiting Thread object,
-    /// woken directly (its wait slots stay un-signaled → it sees a timeout).
     Thread,
-    /// A [`Timer`] fire: `target` is the Timer object address.
     Timer,
-    /// A `BlockBounded` IPC send's delivery deadline: `target` is the
-    /// [`PendingOperation`](crate::object::PendingOperation), `channel` the
-    /// receiving endpoint holding the (undelivered) send.
     PendingSend,
 }
 
-/// One pending deadline, keyed by `(target, kind)` for removal.
+/// What a deadline-heap entry fires when its `deadline_ns` elapses, by the objects' addresses: a
+/// `usize` keeps the heap `Send`. Nothing pins them; each is removed before its object is freed.
+///
+/// [`Timer`]: crate::object::Timer
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Target {
+    /// A `sys_wait` deadline: the waiting `Thread`, woken directly, its wait slots unsignalled, so
+    /// it sees a timeout.
+    Thread(usize),
+    /// A [`Timer`], fired.
+    Timer(usize),
+    /// A `BlockBounded` IPC send's delivery deadline: its
+    /// [`PendingOperation`](crate::object::PendingOperation), and the receiving endpoint holding
+    /// the undelivered send.
+    PendingSend { po: usize, channel: usize },
+}
+
+impl Target {
+    /// The kind whose slots this target's entry takes.
+    pub(super) fn kind(self) -> DeadlineKind {
+        match self {
+            Target::Thread(_) => DeadlineKind::Thread,
+            Target::Timer(_) => DeadlineKind::Timer,
+            Target::PendingSend { .. } => DeadlineKind::PendingSend,
+        }
+    }
+}
+
+/// One pending deadline, removed by its whole `target`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Entry {
     pub deadline_ns: u64,
-    pub target: usize,
-    pub kind: DeadlineKind,
-    /// The receiving endpoint, for [`DeadlineKind::PendingSend`]; `0` else.
-    pub channel: usize,
+    pub target: Target,
 }
 
 /// The slots [`init`](super::init) promises the threads: one each, for `MAX_THREADS` placed threads
@@ -138,10 +155,10 @@ pub(super) fn regrow(h: &mut Reserved<Entry>, mut grown: Reserved<Entry>) -> Res
 
 /// [`push`] an entry its owner holds a slot for; a debug build stops a kind past its slots.
 pub(super) fn push_promised(g: &mut SchedState, e: Entry) -> Result<(), AllocError> {
+    let kind = e.target.kind();
     debug_assert!(
-        g.deadlines.iter().filter(|x| x.kind == e.kind).count() < g.deadline_slots[e.kind as usize],
-        "a {:?} deadline with no slot promised",
-        e.kind
+        g.deadlines.iter().filter(|x| x.target.kind() == kind).count() < g.deadline_slots[kind as usize],
+        "a {kind:?} deadline with no slot promised"
     );
     push(&mut g.deadlines, e)
 }
@@ -184,13 +201,12 @@ pub(super) fn pop_min(h: &mut Reserved<Entry>) -> Option<Entry> {
     min
 }
 
-/// Remove the first entry matching `(target, kind)`. Returns `true` if one
-/// was removed. Used when a `sys_wait` resumes (drop its deadline), a timer
-/// is re-armed (drop its stale entry), or a `BlockBounded` send is delivered
-/// early / its endpoint closes (drop its pending-send deadline).
-pub(super) fn remove(h: &mut Reserved<Entry>, target: usize, kind: DeadlineKind) -> bool {
+/// Remove the first entry for `target`. Returns `true` if one was removed. Used when a
+/// `sys_wait` resumes (drop its deadline), a timer is re-armed (drop its stale entry), or a
+/// `BlockBounded` send is delivered early / its endpoint closes (drop its pending-send deadline).
+pub(super) fn remove(h: &mut Reserved<Entry>, target: Target) -> bool {
     // TODO(deadline-heap-scan): a scan, under `SCHED`, of a heap one process can fill.
-    let Some(i) = h.iter().position(|e| e.target == target && e.kind == kind) else {
+    let Some(i) = h.iter().position(|e| e.target == target) else {
         return false;
     };
     let n = h.len();

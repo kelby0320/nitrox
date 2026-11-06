@@ -9,9 +9,9 @@
 
 use core::cell::UnsafeCell;
 
-use crate::libkern::{AllocError, ArrayVec, KBox};
-use crate::object::WaitQueue;
+use crate::libkern::{AllocError, KBox};
 use crate::object::header::{Header, Shared, kobject};
+use crate::object::{WaitQueue, Waiters};
 
 /// A hardware-interrupt waitable (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
@@ -135,7 +135,7 @@ impl InterruptObject {
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { InterruptObject::MAX_WAITERS }> {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ InterruptObject::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         inner.waiters.take()

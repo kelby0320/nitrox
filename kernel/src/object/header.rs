@@ -264,6 +264,14 @@ impl Clone for ObjectRef {
 
 impl Drop for ObjectRef {
     fn drop(&mut self) {
+        // Any reference, not only the last: one dropped under `SCHED` is the last whenever another
+        // CPU lets go first, and a destructor reaches the allocator (`kernel/docs/lock-ordering.md`).
+        #[cfg(debug_assertions)]
+        assert!(
+            !crate::libkern::lockrank::sched_held_by_this_thread(),
+            "a {:?} reference dropped under SCHED",
+            self.object_type()
+        );
         if self.header().release() {
             // Acquire so every other holder's final writes are visible to the destructor.
             fence(Ordering::Acquire);
@@ -343,8 +351,6 @@ impl<T: KObject> core::fmt::Debug for Ref<T> {
 unsafe fn dispatch_destroy(header: NonNull<KObjectHeader>) {
     // SAFETY: the object is live until it is freed below, by the contract.
     let ty = unsafe { header.as_ref() }.object_type();
-    #[cfg(test)]
-    assert!(!crate::libkern::lockrank::sched_held_by_this_thread(), "a {ty:?} destroyed under SCHED");
     macro_rules! by_tag {
         ($($t:ident),*) => {
             match ty {

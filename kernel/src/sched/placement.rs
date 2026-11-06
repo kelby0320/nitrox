@@ -179,6 +179,15 @@ pub(super) fn pick_wake_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize 
     pick_target_cpu(g, obj, online)
 }
 
+/// Place `r`, a thread woken or resumed, which cannot be refused: every queue is reserved for every
+/// thread the cap admits ([`MAX_THREADS`]), so none a woken thread may go to can be full unless
+/// that sizing is wrong, which ends the machine.
+pub(super) fn place_woken(g: &mut SchedState, r: ObjectRef) {
+    if let Err(r) = place_thread(g, r, true) {
+        reserve_exhausted(r, "wake placement (every queue the woken thread may go to)");
+    }
+}
+
 /// Enqueue a runnable thread `r` on a chosen CPU's run queue, seeding its vruntime against
 /// that CPU's floor. `wake` selects the policy (home CPU vs least-loaded) and the seeding
 /// (latency boost vs plain floor). Returns `Err(r)` — the ref handed back so the caller

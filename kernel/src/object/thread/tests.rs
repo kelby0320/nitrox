@@ -96,11 +96,7 @@ fn wait_bookkeeping_round_trips() {
         assert!(Thread::wait_mark_signaled(obj, 0xBB));
         assert!(!Thread::wait_mark_signaled(obj, 0xCC));
 
-        let mut out = [(0usize, false); MAX_WAIT_HANDLES];
-        let n = Thread::wait_snapshot(obj, &mut out);
-        assert_eq!(n, 2);
-        assert_eq!(out[0], (0xAA, false));
-        assert_eq!(out[1], (0xBB, true));
+        assert_eq!(Thread::wait_signaled(obj)[..3], [false, true, false]);
 
         assert!(Thread::wait_try_wake(obj));
         assert!(!Thread::wait_try_wake(obj));
@@ -109,7 +105,7 @@ fn wait_bookkeeping_round_trips() {
         Thread::wait_clear(obj);
         assert_eq!(Thread::wait_phase(obj), WaitPhase::Running as u8);
         assert!(!Thread::wait_has_deadline(obj));
-        assert_eq!(Thread::wait_snapshot(obj, &mut out), 0);
+        assert_eq!(Thread::wait_signaled(obj), [false; MAX_WAIT_HANDLES], "none past a count of 0");
 
         drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
     }

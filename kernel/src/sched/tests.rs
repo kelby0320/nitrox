@@ -554,9 +554,10 @@ fn stats_format_omits_offline_cpus_preserving_indices() {
 // --- Deadline min-heap (pure) -------------------------------------
 
 fn entry(deadline_ns: u64, target: usize) -> deadline::Entry {
-    deadline::Entry { deadline_ns, target, kind: deadline::DeadlineKind::Timer, channel: 0 }
+    deadline::Entry { deadline_ns, target: deadline::Target::Timer(target) }
 }
 
+mod plumbing;
 mod timers;
 
 fn new_timer() -> ObjectRef {
@@ -805,7 +806,7 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
         }
     }
     let (b, o) = (blocked.as_ptr(), other.as_ptr());
-    let thread_deadline = deadline::Entry { kind: deadline::DeadlineKind::Thread, ..entry(5_000, b as usize) };
+    let thread_deadline = deadline::Entry { deadline_ns: 5_000, target: deadline::Target::Thread(b as usize) };
     deadline::push(&mut st.deadlines, thread_deadline).unwrap();
     assert!(st.blocked.push(blocked).is_ok());
     assert!(st.blocked.push(other).is_ok());
@@ -832,7 +833,8 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
     let ready: std::vec::Vec<_> = st.ready.iter().flat_map(|q| q.iter().map(|r| r.as_ptr())).collect();
     assert!(ready.contains(&b) && ready.contains(&s3), "woken and resumed to run");
     assert!(with_ending(1, |e| e.load(Ordering::Acquire)), "CPU 1 ends its running thread on the way out");
-    assert!(st.deadlines.iter().any(|e| e.target == b as usize), "left for its own wait_on to remove");
+    let left = st.deadlines.iter().any(|e| e.target == deadline::Target::Thread(b as usize));
+    assert!(left, "left for its own wait_on to remove");
     assert!(st.reap.iter().all(|q| q.is_empty()));
     // SAFETY: pinned by `t1`; single-threaded. What each thread's own `wait_on` would undo.
     assert_eq!(unsafe { Timer::take_waiters(t1.as_ptr()) }.len(), 2, "both still registered");

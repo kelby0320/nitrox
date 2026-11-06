@@ -157,38 +157,12 @@ pub(super) fn end_process_if_last(g: &mut SchedState, me_obj: *mut (), status: E
     true
 }
 
-/// Mark `me` (the current thread, already out of `current`) `Exited`, park it in `reap`, and
-/// switch away forever. Its stack cannot be freed here — this code is running on it — so the
-/// next scheduler entry reaps it. Shared tail of [`exit_thread`] and [`exit_process`].
-fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
-    let me_obj = me.as_ptr();
-    // SAFETY: `me` is the running thread, pinned, lock held. (The idle thread
-    // never exits, so `me` is never the idle thread.)
-    unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
-    // SAFETY: as above.
-    let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
-    // Park self for deferred reclamation.
-    push_reserved(g.reap_slot(), me, "reap list (self)");
-
-    // Switch to the next ready thread, else the idle thread (parked here, since `me` was
-    // current, not idle).
-    let next = match pick_next(&mut g) {
-        Some(n) => n,
-        None => g.idle_slot().take().expect("idle thread exists after init"),
-    };
-    let next_obj = next.as_ptr();
-    // SAFETY: next is pinned, becoming current; lock held.
-    unsafe { Thread::set_state(next_obj, ThreadState::Running) };
-    *g.cur_slot() = Some(next);
-
-    // Switch away forever. `switch_into` loads the incoming root before the stack swap, so
-    // when the last user thread exits CR3 is off its root before this thread is reaped (its
-    // `AddressSpace::Drop` frees the PML4).
-    // SAFETY: `me_slot` is our own (now-`Exited`, pinned-in-`reap`) saved-SP
-    // slot — written by the switch and never read again; `me_obj`/`next_obj` is the
-    // pinned incoming thread. We never resume, so the restore inside
-    // `switch_into` is never reached.
-    unsafe { switch_into(g, me_slot, me_obj, next_obj) };
+/// Park `me`, out of `current`, in this CPU's reap list and switch away forever. Its stack
+/// cannot be freed here — this code is running on it — so the next scheduler entry on this CPU
+/// reaps it; the switch loads the incoming root first, so CR3 is off a last thread's root before
+/// its `AddressSpace::Drop` frees it. Shared tail of [`exit_thread`] and [`exit_process`].
+fn finish_exit(g: IrqSpinLockGuard<'_, SchedState>, me: Outgoing) -> ! {
+    switch_away(g, me, Park::Exited);
     unreachable!("switched away from an exited thread");
 }
 
@@ -199,7 +173,7 @@ pub fn exit_thread(status: ExitStatus) -> ! {
     reap_pending();
 
     let mut g = SCHED.lock();
-    let me = g.cur_slot().take().expect("current set");
+    let me = take_current(&mut g);
     end_process_if_last(&mut g, me.as_ptr(), status);
     finish_exit(g, me);
 }
@@ -211,7 +185,7 @@ pub fn exit_process(status: ExitStatus) -> ! {
     reap_pending();
 
     let mut g = SCHED.lock();
-    let me = g.cur_slot().take().expect("current set");
+    let me = take_current(&mut g);
     // SAFETY: `me` is the running thread, pinned, lock held.
     if let Some(process) = unsafe { Thread::process_of(me.as_ptr()) } {
         // SAFETY: the thread pins its live `Process`.
@@ -277,7 +251,7 @@ pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification
             // Its process is exiting, and resumes nothing: it terminates instead of parking.
             return ResumeDisposition::Terminate(0);
         }
-        let me = g.cur_slot().take().expect("current set");
+        let me = take_current(&mut g);
         me_obj = me.as_ptr();
 
         // Deliver the fault notification (borrowed pointer — no destructor under `SCHED`).
@@ -294,34 +268,15 @@ pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification
             report_unwaited_fault(me_obj, &notif);
         }
 
-        // Record the registers, mark Suspended, park off the run queue; the `ExceptionFrame`
-        // stays on this frozen kernel stack until resume.
+        // Record the registers and park off the run queue; the `ExceptionFrame` stays on this
+        // frozen kernel stack until resume.
         // TODO(unsupervised-fault): nothing supervises an ordinary program, so with
         // the thirty-second auto-terminate deferred its thread stays here for the
         // boot — first reached by a pulled stick's failed fill.
         // SAFETY: `me` is the running thread, pinned, lock held.
-        unsafe {
-            Thread::set_fault_registers(me_obj, regs);
-            Thread::set_state(me_obj, ThreadState::Suspended);
-        }
-        // SAFETY: as above.
-        let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
-        push_reserved(&mut g.suspended, me, "suspended list");
-
-        let next = match pick_next(&mut g) {
-            Some(n) => n,
-            None => g.idle_slot().take().expect("idle thread exists after init"),
-        };
-        let next_obj = next.as_ptr();
-        // SAFETY: next is pinned, becoming current; lock held.
-        unsafe { Thread::set_state(next_obj, ThreadState::Running) };
-        *g.cur_slot() = Some(next);
-
-        // We resume here when `sys_exception_resume` moves us `suspended`→`ready`.
-        // SAFETY: `me_slot` is our own (now-`Suspended`, pinned-in-`suspended`)
-        // saved-SP slot; `me_obj`/`next_obj` are the pinned outgoing / incoming
-        // threads.
-        unsafe { switch_into(g, me_slot, me_obj, next_obj) };
+        unsafe { Thread::set_fault_registers(me_obj, regs) };
+        // Resumes here when `sys_exception_resume` moves us `suspended`→`ready`.
+        switch_away(g, me, Park::Suspended);
     }
 
     // Read (and clear) the disposition the resume stored on us.
@@ -366,18 +321,7 @@ fn resume_parked(g: &mut SchedState, r: ObjectRef, disp_tag: u8, disp_code: i32)
         Thread::set_state(thread, ThreadState::Ready);
     }
     // Re-home on its CPU (a wake; a full home falls back to a permitted queue with room).
-    // Fails only when every permitted queue is at reserve.
-    if let Err(returned) = place_thread(g, r, true) {
-        // **Do not let `returned` drop here**: `SCHED` is held and an `ObjectRef` drop can
-        // reach the allocator's plain spinlock. Leaked deliberately (`panic = "abort"`); see
-        // `make_runnable` for the full argument.
-        core::mem::forget(returned);
-        panic!(
-            "resume placement: no ready queue would take the thread — every affinity-permitted \
-             queue is at reserve; or affinity permits no CPU that accepts work and every CPU \
-             that does is at reserve; or no CPU accepts work and this one is at reserve"
-        );
-    }
+    place_woken(g, r);
 }
 
 /// The user registers `thread` faulted with, or `None` if it is not `Suspended`: a copy, taken
@@ -512,29 +456,10 @@ fn park_reaper() {
     if !g.ended_pids.is_empty() || crate::io::block::reclaim_backlog() > 0 {
         return; // work arrived while we were draining — go round again
     }
-    let me = g.cur_slot().take().expect("current set");
-    let me_obj = me.as_ptr();
-    let next = match pick_next(&mut g) {
-        Some(n) => n,
-        None => g.idle_slot().take().expect("idle thread exists after init"),
-    };
-    let next_obj = next.as_ptr();
-    // SAFETY: both pinned (self parked in the reaper slot, next becoming current);
-    // `SCHED` held — the Thread accessor contract.
-    unsafe {
-        Thread::set_state(me_obj, ThreadState::Blocked);
-        Thread::set_state(next_obj, ThreadState::Running);
-    }
-    // SAFETY: as above.
-    let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
-    // Park in the reaper slot — not `blocked`, so no generic waker can find it, and not
-    // `ready`, so it does not spin. `wake_reaper` is the only way back.
-    debug_assert!(g.reaper.is_none());
-    g.reaper = Some(me);
-    *g.cur_slot() = Some(next);
-    // Resumes here, lock-free, when `wake_reaper` re-queues us.
-    // SAFETY: `me_slot` is our own (now-parked) saved-SP slot; both threads pinned.
-    unsafe { switch_into(g, me_slot, me_obj, next_obj) };
+    // Its own slot — not `blocked`, so no generic waker can find it, and not `ready`, so it does
+    // not spin. Resumes here, lock-free, when `wake_reaper` re-queues it.
+    let me = take_current(&mut g);
+    switch_away(g, me, Park::Reaper);
 }
 
 /// Wake the reaper to drain the completed-IRP list: from a DPC, holding nothing.

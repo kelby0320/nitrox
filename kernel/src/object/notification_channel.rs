@@ -14,9 +14,9 @@
 
 use core::cell::UnsafeCell;
 
-use crate::libkern::{AllocError, ArrayVec, KBox, Notification, Reserved};
-use crate::object::WaitQueue;
+use crate::libkern::{AllocError, KBox, Notification, Reserved};
 use crate::object::header::{Header, Shared, kobject};
+use crate::object::{WaitQueue, Waiters};
 
 /// A per-process notification queue (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
@@ -172,7 +172,7 @@ impl NotificationChannel {
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { NotificationChannel::MAX_WAITERS }> {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ NotificationChannel::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         inner.waiters.take()

@@ -105,7 +105,7 @@ pub unsafe fn us_forward_notify(reg: *mut (), msg: &mut StoredMsg) -> bool {
 /// request `msg`, and push it into the server's inbox, waking its receivers. The lookup PO
 /// stays **uncompleted**; the server's reply completes it inline (see
 /// [`us_forward_take_pending`]). On `Busy` nothing was reserved; on `Full` / `PeerClosed`
-/// the slot is rolled back and its `po` clone dropped outside `SCHED`. The caller pins
+/// the slot is rolled back and its `po` clone dropped after `SCHED`. The caller pins
 /// `reg` and `po`.
 ///
 /// # Safety
@@ -120,7 +120,8 @@ pub unsafe fn us_forward_originate(
     suffix: &[u8],
     fwd: crate::object::userspace_server::Forward<'_>,
 ) -> ForwardOutcome {
-    let mut g = SCHED.lock();
+    let mut bag = Deferred::<1>::new();
+    let mut g = bag.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
     // held. Reserve the pending slot + assign a request id (None ⇒ already busy).
     let request_id = match unsafe { UserspaceServerReg::begin_forward(reg, po, requested, suffix, fwd) } {
@@ -146,11 +147,10 @@ pub unsafe fn us_forward_originate(
             ForwardOutcome::Pending
         }
         SendOutcome::Full | SendOutcome::PeerClosed | SendOutcome::Cycle => {
-            // Roll back the reserved slot; drop its `po` clone **outside** `SCHED`.
-            // SAFETY: `reg` live, `SCHED` held.
-            let pl = unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) };
-            drop(g);
-            drop(pl);
+            // SAFETY: `reg` live, `SCHED` held. Roll back the reserved slot.
+            if let Some(pl) = unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) } {
+                g.defer(pl.po);
+            }
             if outcome == SendOutcome::Full { ForwardOutcome::Full } else { ForwardOutcome::PeerClosed }
         }
     }
@@ -161,7 +161,7 @@ pub unsafe fn us_forward_originate(
 /// pushing a `File::ReadRange` request. The fill PO stays **uncompleted**; the server's
 /// reply completes it inline (see [`us_forward_take_pending_fill`]). On `Busy` nothing is
 /// reserved; on `Full` / `PeerClosed` the slot is rolled back and its references dropped
-/// outside `SCHED`. The caller pins `reg`, `po` and `file_obj`.
+/// after `SCHED`. The caller pins `reg`, `po` and `file_obj`.
 ///
 /// # Safety
 ///
@@ -175,7 +175,8 @@ pub unsafe fn us_forward_originate_fill(
     frame: crate::mm::PhysAddr,
     index: usize,
 ) -> ForwardOutcome {
-    let mut g = SCHED.lock();
+    let mut bag = Deferred::<2>::new();
+    let mut g = bag.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
     // held. Reserve the pending-fill slot + assign a request id (None ⇒ busy).
     let request_id = match unsafe { UserspaceServerReg::begin_fill(reg, po, file_obj, frame, index) } {
@@ -200,11 +201,11 @@ pub unsafe fn us_forward_originate_fill(
             ForwardOutcome::Pending
         }
         SendOutcome::Full | SendOutcome::PeerClosed | SendOutcome::Cycle => {
-            // Roll back the reserved slot; drop the fill's clones **outside** `SCHED`.
-            // SAFETY: `reg` live, `SCHED` held.
-            let pf = unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) };
-            drop(g);
-            drop(pf);
+            // SAFETY: `reg` live, `SCHED` held. Roll back the reserved slot.
+            if let Some(pf) = unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) } {
+                g.defer(pf.po);
+                g.defer(pf.file_obj.erase());
+            }
             if outcome == SendOutcome::Full { ForwardOutcome::Full } else { ForwardOutcome::PeerClosed }
         }
     }
@@ -271,13 +272,13 @@ pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<Ref<User
 ///
 /// `reg` is the `UserspaceServerReg` being dropped: its memory whole, its last reference gone.
 pub unsafe fn us_reg_detach(reg: *mut ()) {
-    let mut g = SCHED.lock();
+    let mut bag = Deferred::<ORPHANS_PER_REG>::new();
+    let mut g = bag.lock();
     // SAFETY: called from `Drop` with the last reference gone but the object whole;
     // `SCHED` held, satisfying the accessor contract.
     let endpoint = unsafe { UserspaceServerReg::endpoint_ptr(reg) };
-    let mut orphans = Orphans::<ORPHANS_PER_REG>::new();
     // SAFETY: as above; `SCHED` held.
-    unsafe { fail_outstanding(&mut g, reg, &mut orphans) };
+    unsafe { fail_outstanding(&mut g, reg) };
     if !endpoint.is_null() {
         // Clear only a pointer that still names *this* registration: `us_server_attach` can
         // retarget an endpoint, and stomping a live successor's pointer breaks its routing.
@@ -287,27 +288,6 @@ pub unsafe fn us_reg_detach(reg: *mut ()) {
             // SAFETY: as above.
             unsafe { IpcChannel::set_us_reg(endpoint, core::ptr::null_mut()) };
         }
-    }
-    // Release `SCHED` before dropping the orphans: an `ObjectRef` drop can reach the
-    // allocator, which must not happen under the rank-1 lock.
-    drop(g);
-    drop(orphans);
-}
-
-/// The references a teardown takes from registrations' tables, dropped once `SCHED` is released.
-struct Orphans<const N: usize> {
-    refs: [Option<ObjectRef>; N],
-    n: usize,
-}
-
-impl<const N: usize> Orphans<N> {
-    fn new() -> Self {
-        Self { refs: core::array::from_fn(|_| None), n: 0 }
-    }
-
-    fn keep(&mut self, r: ObjectRef) {
-        self.refs[self.n] = Some(r);
-        self.n += 1;
     }
 }
 
@@ -319,19 +299,19 @@ const ORPHANS_PER_REG: usize = 3 * US_PENDING_MAX;
 ///
 /// # Safety
 ///
-/// `reg` is a whole `UserspaceServerReg`, live or mid-drop, and `g` is `SCHED` held.
-unsafe fn fail_outstanding<const N: usize>(g: &mut SchedState, reg: *mut (), orphans: &mut Orphans<N>) {
+/// `reg` is a whole `UserspaceServerReg`, live or mid-drop.
+unsafe fn fail_outstanding<const N: usize>(g: &mut Held<'_, N>, reg: *mut ()) {
     let closed = crate::syscall::error::KError::PeerClosed as i32;
     // SAFETY: forwarded from this function's contract.
     while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg) } {
         signal_pending_op(g, pl.po.as_ptr(), closed);
-        orphans.keep(pl.po);
+        g.defer(pl.po);
     }
     // SAFETY: as above.
     while let Some(pf) = unsafe { UserspaceServerReg::take_pending_fill_next(reg) } {
         signal_pending_op(g, pf.po.as_ptr(), closed);
-        orphans.keep(pf.po);
-        orphans.keep(pf.file_obj.erase());
+        g.defer(pf.po);
+        g.defer(pf.file_obj.erase());
     }
 }
 
@@ -424,9 +404,7 @@ pub unsafe fn ipc_send_push_blocking(
                 &mut g,
                 deadline::Entry {
                     deadline_ns,
-                    target: po.as_ptr() as usize,
-                    kind: deadline::DeadlineKind::PendingSend,
-                    channel: peer as usize,
+                    target: deadline::Target::PendingSend { po: po.as_ptr() as usize, channel: peer as usize },
                 },
             );
         }
@@ -479,7 +457,8 @@ pub unsafe fn ipc_recv_pop_into(
     if let Some(ref po) = promoted {
         // Delivered before its deadline: drop its pending-send deadline (idempotent), then
         // complete it.
-        deadline::remove(&mut g.deadlines, po.as_ptr() as usize, deadline::DeadlineKind::PendingSend);
+        let target = deadline::Target::PendingSend { po: po.as_ptr() as usize, channel: endpoint as usize };
+        deadline::remove(&mut g.deadlines, target);
         signal_pending_op(&mut g, po.as_ptr(), 0);
     }
     (true, promoted)
@@ -495,7 +474,8 @@ pub unsafe fn ipc_recv_pop_into(
 ///
 /// `endpoint` is the `IpcChannel` being dropped: its memory whole, its last reference gone.
 pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
-    let mut g = SCHED.lock();
+    let mut bag = Deferred::<{ 2 * ORPHANS_PER_REG }>::new();
+    let mut g = bag.lock();
     // SAFETY: `endpoint` is the object being dropped (still valid memory);
     // `SCHED` held.
     let peer = unsafe { IpcChannel::peer_of(endpoint) };
@@ -503,9 +483,7 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
     // the kernel-forwarding endpoint with `PeerClosed`, whether **this** endpoint is the
     // kernel end (registration being torn down) or its **peer** is (server process died).
     // An endpoint is shared by many bindings, so up to `US_PENDING_MAX` lookups may be in
-    // flight: drain *all*. Each PO is signalled here and collected into `orphans`; the
-    // references are dropped **outside** `SCHED` below.
-    let mut orphans = Orphans::<{ 2 * ORPHANS_PER_REG }>::new();
+    // flight: drain *all*. Each PO is signalled here and deferred to the bag.
     // SAFETY: `endpoint` is valid memory; `SCHED` held.
     let reg_self = unsafe { IpcChannel::us_reg_of(endpoint) };
     // Non-null does not prove live: `us_reg_detach` clears the back-pointer when a
@@ -520,7 +498,7 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
         // SAFETY: `reg_self` is this endpoint's owning registration (the endpoint
         // is being dropped *because* the registration is — `reg_self` is still
         // valid memory mid-drop); `SCHED` held.
-        unsafe { fail_outstanding(&mut g, reg_self, &mut orphans) };
+        unsafe { fail_outstanding(&mut g, reg_self) };
     }
     if !peer.is_null() {
         // SAFETY: `peer` is the surviving endpoint, kept alive by its own handle
@@ -535,7 +513,7 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
         if !reg_peer.is_null() && unsafe { UserspaceServerReg::is_live(reg_peer) } {
             // SAFETY: `reg_peer` is pinned by the live `peer` (its owned endpoint);
             // `SCHED` held.
-            unsafe { fail_outstanding(&mut g, reg_peer, &mut orphans) };
+            unsafe { fail_outstanding(&mut g, reg_peer) };
         }
     }
     // Complete every blocking sender held on THIS endpoint with `PeerClosed`: our receive
@@ -549,13 +527,10 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
         // Drop each held send's pending-send deadline **before** the endpoint is freed, or a
         // live `BlockBounded` deadline could fire later and dereference this dead `channel`.
         // Idempotent (a plain `Block` send, or a timed-out one, has no entry).
-        deadline::remove(&mut g.deadlines, po as usize, deadline::DeadlineKind::PendingSend);
+        let target = deadline::Target::PendingSend { po: po as usize, channel: endpoint as usize };
+        deadline::remove(&mut g.deadlines, target);
         signal_pending_op(&mut g, po, crate::syscall::error::KError::PeerClosed as i32);
     }
-    // Release `SCHED` before dropping the orphans (an `ObjectRef` drop must not run under
-    // the rank-1 lock).
-    drop(g);
-    drop(orphans);
 }
 
 #[cfg(test)]
@@ -694,6 +669,48 @@ mod tests {
             let held = ipc_send_push_blocking(c.as_ptr(), &msg, &mut carrying(&b), &po, u64::MAX);
             assert_eq!(held, BlockSendOutcome::Queued, "D's ring is full: B waits in its held sends");
             assert_eq!(ipc_send_push(a.as_ptr(), &msg, &mut carrying(&d)), SendOutcome::Cycle);
+        }
+    }
+
+    /// **A bounded send's deadline goes with its send**: one a receive delivers, and one its
+    /// endpoint's close fails, each leaves no entry to fire on the endpoint it names.
+    #[test]
+    fn a_held_sends_deadline_goes_when_it_is_delivered_or_its_endpoint_closes() {
+        init_global_heap();
+        let msg = KBox::<StoredMsg>::try_new_zeroed().unwrap();
+        let none = || -> [Option<TransferRef>; IPC_HANDLE_MAX] { core::array::from_fn(|_| None) };
+        let named = |po: &ObjectRef| {
+            let po = po.as_ptr() as usize;
+            SCHED
+                .lock()
+                .deadlines
+                .iter()
+                .any(|e| matches!(e.target, deadline::Target::PendingSend { po: p, .. } if p == po))
+        };
+        for closes in [false, true] {
+            let ((a, b), held) = (pair(), po());
+            // SAFETY: both endpoints and the PO are pinned by the test's references.
+            unsafe {
+                while matches!(ipc_send_push(a.as_ptr(), &msg, &mut none()), SendOutcome::Sent { .. }) {}
+                let queued = ipc_send_push_blocking(a.as_ptr(), &msg, &mut none(), &held, u64::MAX - 1);
+                assert_eq!(queued, BlockSendOutcome::Queued);
+            }
+            assert!(named(&held), "a bounded send waits with its deadline");
+            if closes {
+                drop(b);
+                assert!(!named(&held), "failed by its endpoint's close");
+            } else {
+                let mut dst = KBox::<StoredMsg>::try_new_zeroed().unwrap();
+                let mut reclaimed = core::array::from_fn(|_| None);
+                // SAFETY: as above.
+                let (popped, promoted) =
+                    unsafe { ipc_recv_pop_into(b.as_ptr(), &mut dst, &mut none(), &mut reclaimed) };
+                assert!(popped);
+                assert_eq!(promoted.as_ref().map(ObjectRef::as_ptr), Some(held.as_ptr()), "delivered");
+                assert!(!named(&held), "delivered by a receive");
+                drop((promoted, b));
+            }
+            drop(a);
         }
     }
 }

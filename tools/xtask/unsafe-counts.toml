@@ -22,7 +22,7 @@
 "kernel/src/pci" = 4
 "kernel/src/power" = 5
 "kernel/src/report" = 1
-"kernel/src/sched" = 194
+"kernel/src/sched" = 178
 "kernel/src/syscall" = 28
 "kernel/src/tlb" = 2
 

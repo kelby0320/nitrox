@@ -20,10 +20,10 @@ use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::ipc::{IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader};
-use crate::libkern::{AllocError, ArrayVec, KBox, KVec, Reserved};
+use crate::libkern::{AllocError, KBox, KVec, Reserved};
 use crate::object::ObjectRef;
-use crate::object::WaitQueue;
 use crate::object::header::{Header, Shared, kobject};
+use crate::object::{WaitQueue, Waiters};
 
 /// A queued message in kernel storage: the natural-alignment twin of
 /// [`IpcMsg`](crate::libkern::IpcMsg), so a byte view round-trips through `copy_*_user`.
@@ -477,7 +477,7 @@ impl IpcChannel {
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { IpcChannel::MAX_WAITERS }> {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ IpcChannel::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         inner.recv_waiters.take()
@@ -516,15 +516,8 @@ impl IpcChannel {
         }
         // `po.clone()` bumps an atomic refcount: sound under `SCHED`. Reserved to
         // `MAX_PENDING_SENDS` and length-checked above, so it cannot refuse.
-        peer_inner
-            .pending_sends
-            .push(PendingSend { msg: *msg, transfers: held, po: po.clone(), cancelled: false })
-            .unwrap_or_else(|held| {
-                // Unreachable: reserved at construction and length-checked above. Do not let
-                // `held` drop here — it owns an `ObjectRef` and `SCHED` is held.
-                core::mem::forget(held);
-                panic!("pending-send queue: reserve exhausted despite the length check above");
-            });
+        let send = PendingSend { msg: *msg, transfers: held, po: po.clone(), cancelled: false };
+        crate::sched::push_reserved(&mut peer_inner.pending_sends, send, "pending-send queue");
         BlockSendOutcome::Queued
     }
 

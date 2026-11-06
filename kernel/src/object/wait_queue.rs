@@ -1,5 +1,7 @@
 //! [`WaitQueue`]: the threads blocked on one waitable object.
 
+use core::ops::Deref;
+
 use crate::libkern::ArrayVec;
 
 /// At most `N` threads waiting on one object, inline, so adding one under `SCHED` never allocates.
@@ -24,8 +26,8 @@ impl<const N: usize> WaitQueue<N> {
     }
 
     /// Every waiter, in the order they were added, leaving none.
-    pub(crate) fn take(&mut self) -> ArrayVec<*mut (), N> {
-        core::mem::take(&mut self.0)
+    pub(crate) fn take(&mut self) -> Waiters<N> {
+        Waiters(core::mem::take(&mut self.0))
     }
 
     /// Whether no thread waits.
@@ -37,5 +39,16 @@ impl<const N: usize> WaitQueue<N> {
 impl<const N: usize> Default for WaitQueue<N> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The threads taken from a [`WaitQueue`], all at once: only `take` makes one, so each is a thread
+/// a wait registered there, which the scheduler's one wake loop relies on.
+pub(crate) struct Waiters<const N: usize>(ArrayVec<*mut (), N>);
+
+impl<const N: usize> Deref for Waiters<N> {
+    type Target = [*mut ()];
+    fn deref(&self) -> &[*mut ()] {
+        &self.0
     }
 }
