@@ -32,7 +32,7 @@ use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::PhysAddr;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 use crate::object::{FileObject, Forgotten, ObjectRef};
 
 /// Largest lookup suffix a [`PendingLookup`] stores inline (no allocation under `SCHED`). A
@@ -156,7 +156,7 @@ struct CachedFile {
 /// The kernel's registration record for one Userspace Server (`#[repr(C)]`, header first).
 #[repr(C)]
 pub struct UserspaceServerReg {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     inner: UnsafeCell<Inner>,
     /// **The file cache: one `FileObject` per file this server's replies named**, keyed by the
@@ -170,6 +170,11 @@ pub struct UserspaceServerReg {
     /// under it**, since the last one would re-enter it from `FileObject::drop`.
     files: SpinLock<KVec<CachedFile>>,
 }
+
+kobject!(UserspaceServerReg);
+// SAFETY: a registration changes once shared only in `inner`, an `UnsafeCell` touched only under
+// `SCHED`, and behind `files`' lock.
+unsafe impl Shared for UserspaceServerReg {}
 
 // SAFETY: identical reasoning to `IpcChannel` — the header refcount is atomic and
 // every access to `inner` is serialised under the single-CPU `SCHED` lock.
@@ -187,7 +192,7 @@ impl UserspaceServerReg {
     pub fn try_new(endpoint: ObjectRef) -> Result<KBox<Self>, AllocError> {
         assert_eq!(endpoint.object_type(), KObjectType::IpcChannel, "UserspaceServerReg::try_new");
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::UserspaceServerReg),
+            header: Header::new(),
             magic: Self::MAGIC,
             inner: UnsafeCell::new(Inner {
                 endpoint,
@@ -211,7 +216,7 @@ impl UserspaceServerReg {
         if let Some(e) = g.iter_mut().find(|e| e.id == id && !e.forgotten) {
             // SAFETY: the entry's object is live — its `Drop` removes the entry under this
             // lock before its memory goes, so while the lock is held the pointer is readable.
-            if let Some(existing) = unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) } {
+            if let Some(existing) = unsafe { ObjectRef::try_acquire(e.obj) } {
                 return Ok(Some(existing));
             }
             // Mid-teardown (refcount zero): its `Drop` will look for its own address, which
@@ -241,7 +246,7 @@ impl UserspaceServerReg {
                 return Forgotten::Now;
             };
             // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
-            match unsafe { ObjectRef::try_acquire(g[i].obj, KObjectType::FileObject) } {
+            match unsafe { ObjectRef::try_acquire(g[i].obj) } {
                 Some(obj) => {
                     g[i].forgotten = true;
                     obj
@@ -282,7 +287,7 @@ impl UserspaceServerReg {
         out.try_reserve(g.len())?;
         for e in g.iter().filter(|e| !e.forgotten) {
             // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
-            if let Some(r) = unsafe { ObjectRef::try_acquire(e.obj, KObjectType::FileObject) } {
+            if let Some(r) = unsafe { ObjectRef::try_acquire(e.obj) } {
                 // `try_reserve` above guarantees this push does not allocate.
                 let _ = out.try_push(r);
             }
@@ -504,28 +509,19 @@ mod tests {
     /// A live `IpcChannel` endpoint adopted into an `ObjectRef`; its peer is dropped at once.
     fn endpoint() -> ObjectRef {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let a_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
-        // SAFETY: adopts the peer's creation reference, to drop it.
-        drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
+        let a_ref = ObjectRef::new(a);
+        drop(ObjectRef::new(b));
         a_ref
     }
 
     fn make_po() -> ObjectRef {
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::PendingOperation,
-            )
-        }
+        ObjectRef::new(PendingOperation::try_new().unwrap())
     }
 
     fn reg() -> ObjectRef {
         let r = UserspaceServerReg::try_new(endpoint()).unwrap();
         assert!(r.magic_ok());
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) }
+        ObjectRef::new(r)
     }
 
     /// An endpoint can outlive its registration, and its `us_reg` back-pointer is raw and
@@ -542,13 +538,11 @@ mod tests {
         // SAFETY: `ep` is a live `IpcChannel`; the bump balances the adopted ref.
         let keepalive = unsafe {
             (*(ep as *const crate::object::header::KObjectHeader)).bump();
-            ObjectRef::from_raw(ep, KObjectType::IpcChannel)
+            ObjectRef::from_raw(ep)
         };
 
         let r = UserspaceServerReg::try_new(ep_ref).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let reg_ref =
-            unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
+        let reg_ref = ObjectRef::new(r);
         // SAFETY: both objects are live and this test is single-threaded.
         unsafe { IpcChannel::set_us_reg(ep, reg_ref.as_ptr()) };
         // SAFETY: the test's references keep `ep` live, and it is single-threaded.
@@ -572,15 +566,11 @@ mod tests {
     fn a_reply_holds_the_registration_it_found() {
         init_global_heap();
         let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-        // SAFETY: `into_raw` yields each endpoint's single creation reference; adopt it.
-        let k_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(k).as_ptr() as *mut (), KObjectType::IpcChannel) };
-        // SAFETY: as above.
-        let s_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(s).as_ptr() as *mut (), KObjectType::IpcChannel) };
+        let k_ref = ObjectRef::new(k);
+        let s_ref = ObjectRef::new(s);
         let k_ptr = k_ref.as_ptr();
         let r = UserspaceServerReg::try_new(k_ref).unwrap();
-        // SAFETY: adopt the creation reference; it stands for the binding's.
-        let binding =
-            unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
+        let binding = ObjectRef::new(r);
         // SAFETY: `k_ptr` is the endpoint the registration holds.
         assert!(unsafe { crate::sched::us_server_attach(k_ptr, &binding) }.is_none());
 
@@ -611,13 +601,11 @@ mod tests {
         // SAFETY: `ep` is live; the bump balances the adopted ref.
         let keepalive = unsafe {
             (*(ep as *const crate::object::header::KObjectHeader)).bump();
-            ObjectRef::from_raw(ep, KObjectType::IpcChannel)
+            ObjectRef::from_raw(ep)
         };
 
         let old = UserspaceServerReg::try_new(ep_ref).unwrap();
-        // SAFETY: adopt the creation reference.
-        let old_ref =
-            unsafe { ObjectRef::from_raw(KBox::into_raw(old).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
+        let old_ref = ObjectRef::new(old);
         let successor = 0xdead_beef_usize as *mut ();
         // SAFETY: single-threaded test; the value is only compared, never dereferenced.
         unsafe { IpcChannel::set_us_reg(ep, successor) };
@@ -737,8 +725,7 @@ mod tests {
     fn file_obj() -> ObjectRef {
         use crate::object::{FileObject, Producer};
         let f = FileObject::try_new(4096, Producer::Stub { base: 0 }).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject) }
+        ObjectRef::new(f)
     }
 
     #[test]

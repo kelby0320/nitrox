@@ -440,20 +440,11 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     let Ok(buf) = MemoryObject::try_new(len) else {
         return false;
     };
-    // SAFETY: adopt the creation references into owning `ObjectRef`s.
-    let buf_ref = unsafe {
-        ObjectRef::from_raw(KBox::into_raw(buf).as_ptr() as *mut (), crate::libkern::handle::KObjectType::MemoryObject)
-    };
+    let buf_ref = ObjectRef::new(buf);
     let Ok(po) = crate::object::PendingOperation::try_new() else {
         return false;
     };
-    // SAFETY: `into_raw` yields the box's single creation reference, which this adopts.
-    let po_ref = unsafe {
-        ObjectRef::from_raw(
-            KBox::into_raw(po).as_ptr() as *mut (),
-            crate::libkern::handle::KObjectType::PendingOperation,
-        )
-    };
+    let po_ref = ObjectRef::new(po);
 
     if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, offset, 0, len as u64).is_err() {
         return false;

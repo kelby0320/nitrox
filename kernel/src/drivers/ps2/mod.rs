@@ -17,8 +17,6 @@ use crate::arch::timer::ArchTimer;
 use crate::dpc::Dpc;
 use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader, Submitted};
 use crate::libkern::IrqSpinLock;
-use crate::libkern::KBox;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::input::InputEvent;
 use crate::libkern::lockrank::LockRank;
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
@@ -512,9 +510,7 @@ pub fn init() {
         match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
             Ok(node) => {
                 // **Owned by the device table**, which `/dev/input/raw/<n>` resolves through.
-                // SAFETY: `into_raw` yields the single creation reference; the table adopts it.
-                let r =
-                    unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+                let r = ObjectRef::new(node);
                 let kind = if index == DEV_KEYBOARD {
                     crate::libkern::device::DeviceKind::Keyboard
                 } else {

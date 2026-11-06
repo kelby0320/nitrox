@@ -121,8 +121,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
     write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
 
-    // SAFETY: adopt the creation reference into the device table.
-    let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+    let r = ObjectRef::new(node);
     crate::device::register(r.clone(), "ahci");
     disk.counted.attach(&r);
     Outcome::Claimed { driver: DRIVER, signal }
@@ -206,11 +205,9 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         sectors: 0,
         flush_command: ATA_FLUSH_CACHE,
         state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
-        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
-        intr: unsafe { crate::drivers::adopt(intr, KObjectType::InterruptObject) },
+        intr: ObjectRef::new(intr),
         counted: Counted::new(),
-        // SAFETY: as above.
-        wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
+        wake: ObjectRef::new(wake),
     };
     let Ok(mut disk) = KBox::try_new(disk) else {
         return Err(OUT_OF_MEMORY);

@@ -1,5 +1,4 @@
 use super::*;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::input::{INPUT_EVENT_LEN, KEY_RELEASE, REL_X};
 use crate::mm::PAGE_SIZE;
 use crate::mm::test_support::init_global_heap;
@@ -201,8 +200,7 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
 
     // The keyboard in slot 5 departs holding a key, and a lights write is left waiting.
     nodes.retire(5, |r| r.ring.push_group(&[InputEvent::key(30, KEY_RELEASE, 1)]), 1);
-    // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-    let lights = unsafe { crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation) };
+    let lights = ObjectRef::new(PendingOperation::try_new().unwrap());
     nodes.lights.lock()[5] = Some((lights.clone(), 1));
     // A mouse takes its slot, and moves.
     let (index, epoch) = nodes.take(false).expect("the retired slot");
@@ -214,10 +212,8 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     assert_eq!(unsafe { crate::sched::pending_op_completion(lights.as_ptr()) }, (KError::PeerClosed as i32, 0));
     nodes.readers[5].lock().ring.push(InputEvent::rel(REL_X, 3, 2));
 
-    // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
-    let buf = unsafe { crate::drivers::adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject) };
-    // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-    let po = unsafe { crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation) };
+    let buf = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
     let len = 4 * INPUT_EVENT_LEN as u64;
     assert_eq!(nodes.read(&buf, &po, 0, len, made[5], 3), Err(KError::PeerClosed), "the keyboard's node");
     assert!(!nodes.readers[5].lock().ring.is_empty(), "took none of the mouse's motion");

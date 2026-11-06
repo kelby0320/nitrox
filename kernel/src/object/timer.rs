@@ -16,20 +16,23 @@
 use crate::sched::{SlotHold, Slots};
 use core::cell::UnsafeCell;
 
-use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, ArrayVec, KBox};
 use crate::object::WaitQueue;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 
 /// A timer kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct Timer {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     inner: UnsafeCell<TimerInner>,
     /// Its slot in the deadline heap, given back after `Drop` has taken its entry out.
     _slot: SlotHold,
 }
+
+kobject!(Timer);
+// SAFETY: a `Timer` changes once shared only in `inner`, an `UnsafeCell` touched only under `SCHED`.
+unsafe impl Shared for Timer {}
 
 struct TimerInner {
     /// Absolute monotonic-ns deadline; `0` = not armed.
@@ -62,7 +65,7 @@ impl Timer {
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         let slot = SlotHold::reserve(Slots::Timer)?;
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Timer),
+            header: Header::new(),
             magic: Self::MAGIC,
             inner: UnsafeCell::new(TimerInner {
                 deadline_ns: 0,
@@ -275,7 +278,7 @@ mod tests {
         test_probe::reset();
         let obj = KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut ();
         // SAFETY: `obj` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(obj, KObjectType::Timer) };
+        let r = unsafe { ObjectRef::from_raw(obj) };
         assert_eq!(test_probe::timer_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::timer_destroys(), 1);

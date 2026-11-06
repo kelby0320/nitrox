@@ -119,7 +119,7 @@ See: [handle system architecture](handle-system.md), [handle encoding spec](../s
 
 ### Kernel objects
 
-A kernel object is anything that can be referenced by a handle. The complete list is fixed: Process, Thread, Namespace, MemoryObject, IpcChannel, NotificationChannel, Timer, InterruptObject, PendingOperation, IoRing, EntropyObject, DeviceNode, UserspaceServerReg, FileObject, SystemControl. Each kernel object begins with a common header (refcount, type tag) so generic code can manipulate them through type-erased pointers; type-specific operations dispatch through a `match` on the type tag.
+A kernel object is anything that can be referenced by a handle. The complete list is fixed: Process, Thread, Namespace, MemoryObject, IpcChannel, NotificationChannel, Timer, InterruptObject, PendingOperation, IoRing, EntropyObject, DeviceNode, UserspaceServerReg, FileObject, SystemControl. Each kernel object begins with a common header (refcount, type tag) so generic code can manipulate them through type-erased pointers; type-specific operations dispatch through a `match` on the type tag. The tag is the type's own: each object type is a `KObject` whose first field is a `Header<Self>`, so no constructor writes a tag, and an `ObjectRef` becomes a typed `Ref<T>` only by a downcast that checks the header's (`kernel/src/object/header.rs`).
 
 Internal kernel data structures (page table entries, VMA trees, IRPs, scheduler runqueues) are not kernel objects — they're not handle-accessible.
 

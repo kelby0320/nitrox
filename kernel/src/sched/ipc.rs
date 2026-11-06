@@ -250,7 +250,7 @@ pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<ObjectRe
     }
     // SAFETY: a registration clears this back-pointer under `SCHED` before it is freed, so
     // `reg` is whole while `SCHED` is held; `try_acquire` refuses one already at zero.
-    unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) }
+    unsafe { ObjectRef::try_acquire(reg) }
 }
 
 /// Detach a dying [`UserspaceServerReg`] from its endpoint, completing anything still
@@ -354,7 +354,7 @@ pub unsafe fn us_server_attach(endpoint: *mut (), reg: &ObjectRef) -> Option<Obj
         let header = unsafe { &*(existing as *const crate::object::header::KObjectHeader) };
         if header.try_acquire() {
             // SAFETY: the successful `try_acquire` above balances this adoption.
-            return Some(unsafe { ObjectRef::from_raw(existing, KObjectType::UserspaceServerReg) });
+            return Some(unsafe { ObjectRef::from_raw(existing) });
         }
     }
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
@@ -565,14 +565,9 @@ mod tests {
     use crate::mm::test_support::init_global_heap;
     use crate::object::header::test_probe;
 
-    fn adopt<T>(b: KBox<T>, ty: KObjectType) -> ObjectRef {
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), ty) }
-    }
-
     fn pair() -> (ObjectRef, ObjectRef) {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        (adopt(a, KObjectType::IpcChannel), adopt(b, KObjectType::IpcChannel))
+        (ObjectRef::new(a), ObjectRef::new(b))
     }
 
     fn carrying(r: &ObjectRef) -> [Option<TransferRef>; IPC_HANDLE_MAX] {
@@ -587,7 +582,7 @@ mod tests {
         test_probe::reset();
         let msg = KBox::<StoredMsg>::try_new_zeroed().unwrap();
         let ((a, b), (c, d)) = (pair(), pair());
-        let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+        let po = ObjectRef::new(PendingOperation::try_new().unwrap());
         // SAFETY: every endpoint and the PO are pinned by the test's references.
         unsafe {
             assert_eq!(ipc_send_push(a.as_ptr(), &msg, &mut carrying(&b)), SendOutcome::Cycle, "B into its own ring");
@@ -601,13 +596,13 @@ mod tests {
     }
 
     fn po() -> ObjectRef {
-        adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
+        ObjectRef::new(PendingOperation::try_new().unwrap())
     }
 
     /// A registration over the kernel's end of a fresh pair, attached; and the server's end.
     fn served() -> (ObjectRef, ObjectRef) {
         let (k, s) = pair();
-        let reg = adopt(UserspaceServerReg::try_new(k.clone()).unwrap(), KObjectType::UserspaceServerReg);
+        let reg = ObjectRef::new(UserspaceServerReg::try_new(k.clone()).unwrap());
         // SAFETY: `k` is pinned by the test's reference.
         assert!(unsafe { us_server_attach(k.as_ptr(), &reg) }.is_none());
         (reg, s)
@@ -616,7 +611,7 @@ mod tests {
     /// A lookup and a fill outstanding on `reg`, their POs, and the fill's file.
     fn outstanding(reg: &ObjectRef, producer: crate::object::Producer) -> (ObjectRef, ObjectRef, ObjectRef) {
         let (lookup, fill) = (po(), po());
-        let file = adopt(crate::object::FileObject::try_new(4096, producer).unwrap(), KObjectType::FileObject);
+        let file = ObjectRef::new(crate::object::FileObject::try_new(4096, producer).unwrap());
         // SAFETY: `reg` pins the registration, and the test is single-threaded.
         unsafe {
             UserspaceServerReg::begin(reg.as_ptr(), &lookup, Rights::MAP_READ, b"f").unwrap();
@@ -656,7 +651,7 @@ mod tests {
     fn a_second_attach_of_an_endpoint_gets_the_first_registration() {
         init_global_heap();
         let (k, _server_end) = pair();
-        let new_reg = || adopt(UserspaceServerReg::try_new(k.clone()).unwrap(), KObjectType::UserspaceServerReg);
+        let new_reg = || ObjectRef::new(UserspaceServerReg::try_new(k.clone()).unwrap());
         let (first, second) = (new_reg(), new_reg());
         // SAFETY: `k` is pinned by the test's reference, and the test is single-threaded.
         unsafe {
@@ -681,7 +676,7 @@ mod tests {
         init_global_heap();
         let msg = KBox::<StoredMsg>::try_new_zeroed().unwrap();
         let ((a, b), (c, d)) = (pair(), pair());
-        let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
+        let po = ObjectRef::new(PendingOperation::try_new().unwrap());
         let mut none: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
         // SAFETY: every endpoint and the PO are pinned by the test's references.
         unsafe {

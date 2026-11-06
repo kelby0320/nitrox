@@ -17,7 +17,6 @@ use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};

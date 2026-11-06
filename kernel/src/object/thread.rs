@@ -18,13 +18,12 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::arch::{ArchFpuState, ArchThreadContext, RegisterValues, thread_trampoline};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
 use crate::mm::PhysAddr;
 use crate::mm::kstack::{KernelStack, KernelStackTop};
 use crate::object::ObjectRef;
 use crate::object::Process;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, kobject};
 
 /// Maximum number of handles one `sys_wait` call may block on. Bounds the per-thread wait
 /// arrays (so registration never allocates under the scheduler lock) and a caller's `count`.
@@ -112,7 +111,7 @@ const _: () = assert!(
 /// identity pair are scheduler-owned (see "Mutation discipline").
 #[repr(C)]
 pub struct Thread {
-    header: KObjectHeader,
+    header: Header<Self>,
     tid: u32,
     owner_pid: u32,
     arch: ArchThreadContext,
@@ -176,6 +175,8 @@ pub struct Thread {
     fpu: Option<KBox<ArchFpuState>>,
 }
 
+kobject!(Thread);
+
 /// A thread's FP/SIMD save area, at the architectural power-on state: it is restored on the first
 /// switch-in.
 fn new_fpu_area() -> Result<KBox<ArchFpuState>, AllocError> {
@@ -188,7 +189,7 @@ impl Thread {
     /// Allocate an **inert** thread (no kernel stack, never scheduled), refcount one.
     pub fn try_new(tid: u32, owner_pid: u32) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Thread),
+            header: Header::new(),
             tid,
             owner_pid,
             arch: ArchThreadContext::new(),
@@ -225,7 +226,7 @@ impl Thread {
     /// [`context_switch`](crate::arch::context_switch) has a slot to save into. It owns no stack.
     pub fn try_new_boot(tid: u32, owner_pid: u32) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Thread),
+            header: Header::new(),
             tid,
             owner_pid,
             arch: ArchThreadContext::new(),
@@ -269,7 +270,7 @@ impl Thread {
         let mut stack = KernelStack::new()?;
         let arch = stack.fabricate(thread_trampoline as *const () as u64);
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Thread),
+            header: Header::new(),
             tid,
             owner_pid,
             arch,
@@ -323,7 +324,7 @@ impl Thread {
         let mut stack = KernelStack::new()?;
         let arch = stack.fabricate(thread_trampoline as *const () as u64);
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Thread),
+            header: Header::new(),
             tid,
             owner_pid,
             arch,

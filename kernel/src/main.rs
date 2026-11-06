@@ -756,7 +756,7 @@ fn run_first_userspace() {
     let chan_ptr = KBox::into_raw(chan).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
     // one for the Process, install the other as a handle (refcount → 2).
-    let chan_ref = unsafe { ObjectRef::from_raw(chan_ptr, KObjectType::NotificationChannel) };
+    let chan_ref = unsafe { ObjectRef::from_raw(chan_ptr) };
     proc_box.set_notification_channel(chan_ref.clone());
     let (cp, ct) = chan_ref.into_raw();
     let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
@@ -764,7 +764,7 @@ fn run_first_userspace() {
         Ok(h) => h,
         Err(_) => {
             // SAFETY: reclaim the channel-handle reference; `proc_box` drops too.
-            drop(unsafe { ObjectRef::from_raw(cp, ct) });
+            drop(unsafe { ObjectRef::from_raw(cp) });
             kprintln!("init: notification handle alloc failed");
             return;
         }
@@ -885,7 +885,7 @@ fn run_first_userspace() {
     let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
     // one for the Process, install the other as a handle (refcount → 2).
-    let ns_ref = unsafe { ObjectRef::from_raw(ns_ptr, KObjectType::Namespace) };
+    let ns_ref = unsafe { ObjectRef::from_raw(ns_ptr) };
     proc_box.set_namespace(ns_ref.clone());
     let (np, nt) = ns_ref.into_raw();
     // Full namespace rights, in sync with `syscall::table::namespace_rights`.
@@ -896,7 +896,7 @@ fn run_first_userspace() {
         Err(_) => {
             // SAFETY: reclaim the namespace-handle reference; `proc_box` (which
             // still owns its clone) drops on return.
-            drop(unsafe { ObjectRef::from_raw(np, nt) });
+            drop(unsafe { ObjectRef::from_raw(np) });
             kprintln!("init: namespace handle alloc failed");
             return;
         }
@@ -913,7 +913,7 @@ fn run_first_userspace() {
                 Ok(h) => h.bits(),
                 Err(_) => {
                     // SAFETY: `allocate` did not adopt the creation reference; reclaim and drop it.
-                    drop(unsafe { ObjectRef::from_raw(sp, KObjectType::SystemControl) });
+                    drop(unsafe { ObjectRef::from_raw(sp) });
                     kprintln!("init: system-control handle alloc failed");
                     0
                 }
@@ -928,7 +928,7 @@ fn run_first_userspace() {
     let proc_ref = {
         let ptr = KBox::into_raw(proc_box).as_ptr() as *mut ();
         // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }
+        unsafe { ObjectRef::from_raw(ptr) }
     };
 
     if sched::spawn_user(

@@ -27,10 +27,9 @@ use core::fmt::Write;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::platform::ArchPlatform;
 use crate::arch::timer::ArchTimer;
+use crate::libkern::KVec;
 use crate::libkern::block::BlockKind;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::power::PowerOp;
-use crate::libkern::{KBox, KVec};
 use crate::object::{DeviceNode, MAX_WAIT_HANDLES, ObjectRef, PendingOperation};
 
 /// How long the flush may take, every disk together. A drive's own limit is longer (30 seconds for
@@ -147,8 +146,7 @@ fn flush_every_disk() {
 /// Send one disk a flush, returning its operation, or the status it was refused with.
 fn start_flush(device: &ObjectRef) -> Result<ObjectRef, i32> {
     let po = PendingOperation::try_new().map_err(|_| crate::syscall::KError::OutOfMemory as i32)?;
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let po = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
+    let po = ObjectRef::new(po);
     crate::io::block::dispatch_block_flush(device, &po).map_err(|e| e as i32)?;
     Ok(po)
 }

@@ -33,16 +33,14 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     }
 
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: adopt the single creation reference.
-    let po_ref =
-        unsafe { ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation) };
+    let po_ref = ObjectRef::new(po_box);
     let (tptr, tty) = po_ref.clone().into_raw();
     let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
         Ok(h) => h,
         Err(e) => {
             // SAFETY: `allocate` did not adopt this reference; reclaim it. Then
             // `po_ref` drops at return, destroying the PO.
-            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+            drop(unsafe { ObjectRef::from_raw(tptr) });
             return Err(map_handle_err(e));
         }
     };
@@ -107,15 +105,13 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
         return Err(KError::Unsupported);
     }
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: adopt the single creation reference.
-    let po_ref =
-        unsafe { ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation) };
+    let po_ref = ObjectRef::new(po_box);
     let (tptr, tty) = po_ref.clone().into_raw();
     let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
         Ok(h) => h,
         Err(e) => {
             // SAFETY: `allocate` did not adopt this reference; reclaim it.
-            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+            drop(unsafe { ObjectRef::from_raw(tptr) });
             return Err(map_handle_err(e));
         }
     };

@@ -9,10 +9,9 @@
 use crate::io::block::{BlockBackend, Partition, partition_backend};
 use crate::io::stats::IoStats;
 use crate::libkern::block::{BlockDeviceInfo, BlockKind};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
 use crate::object::ObjectRef;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 use crate::syscall::error::KError;
 
 /// What a device is, from its PCI configuration header (`docs/spec/device-node.md`).
@@ -213,7 +212,7 @@ impl BlockGeometry {
 /// A discovered device: `#[repr(C)]` with [`KObjectHeader`] first (see [`crate::object::header`]).
 #[repr(C)]
 pub struct DeviceNode {
-    header: KObjectHeader,
+    header: Header<Self>,
     /// Self-check sentinel.
     magic: u64,
     /// Device class (mutated to `Block` by a claiming driver).
@@ -236,6 +235,10 @@ pub struct DeviceNode {
     io: IoStats,
 }
 
+kobject!(DeviceNode);
+// SAFETY: a `DeviceNode` changes once shared only in its counters, which are atomics.
+unsafe impl Shared for DeviceNode {}
+
 impl DeviceNode {
     /// Sentinel written into [`DeviceNode::magic`] at construction.
     pub const MAGIC: u64 = 0x4465_7669_6365_4e21; // "DeviceN!"
@@ -247,7 +250,7 @@ impl DeviceNode {
         geometry: BlockGeometry,
     ) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::DeviceNode),
+            header: Header::new(),
             magic: Self::MAGIC,
             class,
             descriptor,
@@ -263,7 +266,7 @@ impl DeviceNode {
     /// Allocate a [`DeviceClass::Char`] node backed by `backend`, with zeroed geometry.
     pub fn try_new_char(descriptor: ResourceDescriptor, backend: CharBackend) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::DeviceNode),
+            header: Header::new(),
             magic: Self::MAGIC,
             class: DeviceClass::Char,
             descriptor,
@@ -285,7 +288,7 @@ impl DeviceNode {
         backend: BlockBackend,
     ) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::DeviceNode),
+            header: Header::new(),
             magic: Self::MAGIC,
             class: DeviceClass::Block,
             descriptor,
@@ -411,17 +414,8 @@ mod tests {
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it as
-        // the path a real handle release takes, then drop it.
-        let r = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(
-                    DeviceNode::try_new(DeviceClass::Other, sample_descriptor(), BlockGeometry::ZERO).unwrap(),
-                )
-                .as_ptr() as *mut (),
-                KObjectType::DeviceNode,
-            )
-        };
+        let r =
+            ObjectRef::new(DeviceNode::try_new(DeviceClass::Other, sample_descriptor(), BlockGeometry::ZERO).unwrap());
         assert_eq!(test_probe::device_node_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::device_node_destroys(), 1);

@@ -10,8 +10,7 @@
 
 use crate::arch::Platform;
 use crate::arch::platform::{ArchPlatform, EcamRegion};
-use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, KVec};
+use crate::libkern::{AllocError, KVec};
 use crate::mm::PhysAddr;
 use crate::mm::kvmap::{self, MmioWindow};
 use crate::object::ObjectRef;
@@ -239,9 +238,7 @@ fn probe_function(
     match DeviceNode::try_new(DeviceClass::Other, desc, BlockGeometry::ZERO) {
         Ok(node) => {
             log_function(&desc, &caps);
-            // SAFETY: `into_raw` yields the single creation reference; adopt it
-            // as an `ObjectRef` of the matching type.
-            let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+            let r = ObjectRef::new(node);
             if out.try_push(r).is_ok() {
                 *found += 1;
             }

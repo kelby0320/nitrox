@@ -14,13 +14,11 @@
 //! bind/unbind hand refs back to the caller to drop outside the lock; resolve clones (an atomic
 //! bump, never a drop).
 
-use crate::libkern::handle::{
-    KObjectType, NS_ENTRY_PATH_MAX, NS_KIND_DIRECT, NS_KIND_KERNEL, NS_KIND_MOUNT, NsEntry, Rights,
-};
+use crate::libkern::handle::{NS_ENTRY_PATH_MAX, NS_KIND_DIRECT, NS_KIND_KERNEL, NS_KIND_MOUNT, NsEntry, Rights};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::object::ObjectRef;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 use crate::object::kernel_server::KernelServerId;
 
 /// Maximum namespace path length in bytes (see the design doc § Path grammar).
@@ -130,10 +128,14 @@ struct CacheEntry {
 /// A per-process namespace kernel object.
 #[repr(C)]
 pub struct Namespace {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     inner: SpinLock<Inner>,
 }
+
+kobject!(Namespace);
+// SAFETY: a `Namespace` changes once shared only behind its lock.
+unsafe impl Shared for Namespace {}
 
 struct Inner {
     bindings: KVec<Binding>,
@@ -149,7 +151,7 @@ impl Namespace {
         let mut cache: KVec<CacheEntry> = KVec::new();
         cache.try_reserve(NS_CACHE_MAX)?;
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::Namespace),
+            header: Header::new(),
             magic: Self::MAGIC,
             inner: SpinLock::new(LockRank::KernelObject, Inner { bindings: KVec::new(), cache }),
         })
@@ -437,15 +439,13 @@ fn match_suffix_offset(binding: &[u8], query: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libkern::handle::KObjectType;
     use crate::mm::test_support::init_global_heap;
     use crate::object::Timer;
     use crate::object::header::test_probe;
 
     fn target() -> ObjectRef {
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut (), KObjectType::Timer)
-        }
+        ObjectRef::new(Timer::try_new().unwrap())
     }
 
     fn ns() -> KBox<Namespace> {
@@ -622,13 +622,7 @@ mod tests {
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let r = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(Namespace::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::Namespace,
-            )
-        };
+        let r = ObjectRef::new(Namespace::try_new().unwrap());
         {
             // SAFETY: `r` holds a live reference to a `Namespace`.
             let ns: &Namespace = unsafe { &*(r.as_ptr() as *const Namespace) };
@@ -682,13 +676,10 @@ mod tests {
     fn us_reg_target() -> ObjectRef {
         use crate::object::{IpcChannel, UserspaceServerReg};
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        // SAFETY: adopt the kernel endpoint's creation reference; drop the peer's.
-        let endpoint = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
-        // SAFETY: adopts the peer's creation reference, to drop it.
-        drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
+        let endpoint = ObjectRef::new(a);
+        drop(ObjectRef::new(b));
         let reg = UserspaceServerReg::try_new(endpoint).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(KBox::into_raw(reg).as_ptr() as *mut (), KObjectType::UserspaceServerReg) }
+        ObjectRef::new(reg)
     }
 
     #[test]

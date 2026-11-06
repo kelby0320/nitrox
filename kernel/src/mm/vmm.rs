@@ -289,6 +289,11 @@ pub struct VmaTree {
     len: usize,
 }
 
+// SAFETY: the tree owns every `Vma` its links reach, each a box it took, and no link leaves it, so
+// moving the tree moves those boxes as moving each `KBox<Vma>` would; a `Vma`'s other fields are
+// `Send`.
+unsafe impl Send for VmaTree {}
+
 impl VmaTree {
     pub const fn new() -> Self {
         Self { root: None, len: 0 }

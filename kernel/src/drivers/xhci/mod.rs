@@ -37,7 +37,6 @@ use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
 use crate::dpc::{Dpc, OneAtATime};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
@@ -476,10 +475,8 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(ev_mem), ring: Consumer::new() }),
         _erst: Programmed::new(erst),
         port_changes: AtomicU32::new(0),
-        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
-        hub_wake: unsafe { crate::drivers::adopt(wake, KObjectType::InterruptObject) },
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        first_round: unsafe { crate::drivers::adopt(first, KObjectType::PendingOperation) },
+        hub_wake: ObjectRef::new(wake),
+        first_round: ObjectRef::new(first),
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
         pci: desc,
@@ -849,12 +846,8 @@ fn fake(regs: u64) -> Xhci {
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(page()), ring: Consumer::new() }),
         _erst: Programmed::new(page()),
         port_changes: AtomicU32::new(0),
-        // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
-        hub_wake: unsafe { crate::drivers::adopt(InterruptObject::try_new().unwrap(), KObjectType::InterruptObject) },
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        first_round: unsafe {
-            crate::drivers::adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation)
-        },
+        hub_wake: ObjectRef::new(InterruptObject::try_new().unwrap()),
+        first_round: ObjectRef::new(PendingOperation::try_new().unwrap()),
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
         pci: ResourceDescriptor::ZERO,

@@ -502,7 +502,7 @@ fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32, u32)> {
     LIGHTS_TAKEN.fetch_and(!(1u32 << index), Ordering::Relaxed);
     let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: context(index, epoch) };
     let served = DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).ok().and_then(|node| {
-        let node = crate::drivers::adopt_node(node);
+        let node = ObjectRef::new(node);
         crate::device::register_input(node, kind, parent, "usb-hid")
     });
     if served.is_none() {

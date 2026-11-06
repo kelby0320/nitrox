@@ -225,8 +225,9 @@ close(handle, caller_pid) -> ClosedObject
 The returned `ClosedObject(*mut (), KObjectType)` carries the previous
 object pointer **and its type**, transferring the handle's one
 reference to the caller; `close` itself does **not** decrement. The
-caller releases it via `ObjectRef::from_raw(ptr, ty)` + drop after
-`close` returns. Keeping the decrement out of `close` keeps object
+caller releases it via `ObjectRef::from_raw(ptr)` + drop after
+`close` returns; the destructor is the one the object's header names,
+not the entry's recorded type. Keeping the decrement out of `close` keeps object
 destruction (which calls `kfree`, a rank-6 allocator lock) off the
 rank-3 handle-table lock. **The wait in step 5 is what makes a racing
 `lookup` safe**: a lookup between reading the pointer and taking its

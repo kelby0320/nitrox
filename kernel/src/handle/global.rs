@@ -121,7 +121,7 @@ pub fn close_all_owned_by(pid: u32) -> usize {
             // SAFETY: each `ClosedObject` carries exactly the one reference its
             // handle-table entry held; the entry is already unlinked, so this
             // accounts for it once and only once.
-            drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+            drop(unsafe { ObjectRef::from_raw(co.0) });
         }
         crate::sched::preempt_enable();
         closed += n;

@@ -46,7 +46,6 @@ use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpOp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, KBox, KVec};
 use crate::object::ObjectRef;
@@ -360,9 +359,7 @@ pub fn publish_modules() {
                 continue;
             }
         };
-        // SAFETY: adopt the creation reference; the device table takes ownership below.
-        let node_ref =
-            unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+        let node_ref = ObjectRef::new(node);
         crate::device::register(node_ref.clone(), "ramdisk");
         rd.counted().attach(&node_ref);
         crate::kprintln!("ramdisk: module {} ({}), {} bytes, as a block device", disk.index, path, disk.len);

@@ -576,11 +576,9 @@ fn drop_releases_every_owned_box() {
 #[test]
 #[should_panic(expected = "left == right")]
 fn a_file_backed_vma_over_another_kind_of_object_stops_at_its_drop() {
-    use crate::libkern::handle::KObjectType;
     use crate::object::MemoryObject;
     init_global_heap();
-    // SAFETY: a fresh `MemoryObject` under its own tag.
-    let mo = unsafe { crate::drivers::adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject) };
+    let mo = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
     let mut v = Vma::new_object(range(0x40_0000, 0x40_1000), Protection::WRITE, mo, crate::mm::Caching::Normal);
     v.mapping = MappingKind::FileBacked;
     drop(v);

@@ -507,7 +507,7 @@ fn map_handle_err(e: HandleError) -> KError {
         HandleError::NoAccess => KError::NoAccess,
         HandleError::OutOfHandles => KError::OutOfHandles,
         HandleError::OutOfMemory => KError::OutOfMemory,
-        HandleError::BadRights => KError::InvalidArgument,
+        HandleError::BadRights | HandleError::WrongType => KError::InvalidArgument,
     }
 }
 
@@ -526,7 +526,7 @@ fn close_on(t: &HandleTable, h: RawHandle, pid: u32) -> SysResult {
     // Dropped outside the table call so teardown (rank-6 allocator) doesn't nest under rank 3.
     // SAFETY: `co` carries exactly the handle's one outstanding reference;
     // we account for it once.
-    drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    drop(unsafe { ObjectRef::from_raw(co.0) });
     Ok(0)
 }
 
@@ -645,7 +645,7 @@ pub fn sys_memory_create(size: u64, flags: u64) -> SysResult {
         Err(e) => {
             // `allocate` did not adopt the creation reference; drop it outside the table call.
             // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::MemoryObject) });
+            drop(unsafe { ObjectRef::from_raw(ptr) });
             Err(map_handle_err(e))
         }
     }
@@ -855,7 +855,7 @@ pub fn sys_timer_create(flags: u64) -> SysResult {
         Ok(h) => Ok(h.bits() as isize),
         Err(e) => {
             // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::Timer) });
+            drop(unsafe { ObjectRef::from_raw(ptr) });
             Err(map_handle_err(e))
         }
     }
@@ -882,7 +882,7 @@ pub fn sys_ns_create() -> SysResult {
         Ok(h) => Ok(h.bits() as isize),
         Err(e) => {
             // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::Namespace) });
+            drop(unsafe { ObjectRef::from_raw(ptr) });
             Err(map_handle_err(e))
         }
     }
@@ -909,7 +909,7 @@ pub fn sys_ns_derive(ns_h: u64) -> SysResult {
         Ok(h) => Ok(h.bits() as isize),
         Err(e) => {
             // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::Namespace) });
+            drop(unsafe { ObjectRef::from_raw(ptr) });
             Err(map_handle_err(e))
         }
     }
@@ -975,10 +975,7 @@ pub fn sys_ns_bind(
         // Bind-mount semantics: an endpoint that already backs a registration is *shared*; a
         // rival would clobber the endpoint→reg reply-routing back-pointer and hijack replies.
         let reg_box = UserspaceServerReg::try_new(res_ok.object.clone()).map_err(|_| KError::OutOfMemory)?;
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let reg_ref = unsafe {
-            ObjectRef::from_raw(KBox::into_raw(reg_box).as_ptr() as *mut (), KObjectType::UserspaceServerReg)
-        };
+        let reg_ref = ObjectRef::new(reg_box);
         // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
         let reg = match unsafe { crate::sched::us_server_attach(res_ok.object.as_ptr(), &reg_ref) } {
             Some(existing) => existing,
@@ -1060,7 +1057,7 @@ pub fn sys_entropy_create() -> SysResult {
         Ok(h) => Ok(h.bits() as isize),
         Err(e) => {
             // SAFETY: `ptr` carries the single outstanding creation reference.
-            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::EntropyObject) });
+            drop(unsafe { ObjectRef::from_raw(ptr) });
             Err(map_handle_err(e))
         }
     }
@@ -1098,7 +1095,7 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
     let po_ref = {
         let ptr = KBox::into_raw(po).as_ptr() as *mut ();
         // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(ptr, KObjectType::PendingOperation) }
+        unsafe { ObjectRef::from_raw(ptr) }
     };
     let waiter_ref = po_ref.clone();
     let (pp, pt) = po_ref.into_raw();
@@ -1107,7 +1104,7 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
         Err(e) => {
             // SAFETY: `allocate` did not adopt the reference; reclaim it. Drop the
             // clone too — both outside any lock.
-            drop(unsafe { ObjectRef::from_raw(pp, pt) });
+            drop(unsafe { ObjectRef::from_raw(pp) });
             drop(waiter_ref);
             return Err(map_handle_err(e));
         }
@@ -1157,8 +1154,7 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
     };
 
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let po_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
+    let po_ref = ObjectRef::new(po);
     let po_ptr = po_ref.as_ptr();
     // No `DUPLICATE` or `TRANSFER`: it will hold its object, which could be the ring it is moved to.
     // A refusal drops `po_ref` at return, destroying the PO (no waiters yet — its assert holds).
@@ -1491,7 +1487,7 @@ fn read_completion(po: &ObjectRef, pid: u32) -> (i32, u64) {
         unsafe { crate::sched::pending_op_installed(po.as_ptr(), outcome) };
         if outcome.is_err() {
             // SAFETY: `allocate` did not adopt the reference; reclaim it, outside `SCHED`.
-            drop(unsafe { ObjectRef::from_raw(op, ot) });
+            drop(unsafe { ObjectRef::from_raw(op) });
         }
         return outcome.map_or_else(|status| (status, 0), |h| (0, h));
     }
@@ -1507,7 +1503,7 @@ fn install(pid: u32, obj: ObjectRef, rights: Rights) -> Result<RawHandle, KError
     let (p, t) = obj.into_raw();
     global::get().allocate(pid, p, t, rights).map_err(|e| {
         // SAFETY: `allocate` did not adopt the reference; reclaim it.
-        drop(unsafe { ObjectRef::from_raw(p, t) });
+        drop(unsafe { ObjectRef::from_raw(p) });
         map_handle_err(e)
     })
 }
@@ -1516,7 +1512,7 @@ fn close_and_release(h: RawHandle, pid: u32) {
     if let Ok(co) = global::get().close(h, pid) {
         // SAFETY: `close` transferred one reference into the token without
         // decrementing; adopt it into an `ObjectRef` and drop to release.
-        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+        drop(unsafe { ObjectRef::from_raw(co.0) });
     }
 }
 
@@ -1544,9 +1540,9 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
         Ok(h) => h,
         Err(e) => {
             // SAFETY: each pointer still owns its single creation reference.
-            drop(unsafe { ObjectRef::from_raw(a_ptr, KObjectType::IpcChannel) });
+            drop(unsafe { ObjectRef::from_raw(a_ptr) });
             // SAFETY: as above.
-            drop(unsafe { ObjectRef::from_raw(b_ptr, KObjectType::IpcChannel) });
+            drop(unsafe { ObjectRef::from_raw(b_ptr) });
             return Err(map_handle_err(e));
         }
     };
@@ -1556,7 +1552,7 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
         Err(e) => {
             close_and_release(h0, pid);
             // SAFETY: b_ptr still owns its creation reference.
-            drop(unsafe { ObjectRef::from_raw(b_ptr, KObjectType::IpcChannel) });
+            drop(unsafe { ObjectRef::from_raw(b_ptr) });
             return Err(map_handle_err(e));
         }
     };
@@ -1889,8 +1885,7 @@ fn build_and_install_file(
         Ok(f) => f,
         Err(_) => return (KError::OutOfMemory as i32, None),
     };
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let fref = unsafe { ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject) };
+    let fref = ObjectRef::new(fobj);
     // `INSPECT` too, so a client can `sys_handle_stat` the lazy file for its size before mapping.
     (0, Some((fref, pl.requested | Rights::INSPECT)))
 }
@@ -2091,8 +2086,7 @@ fn new_block_file(
         runs,
     )
     .map_err(|_| KError::OutOfMemory)?;
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    Ok(unsafe { ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject) })
+    Ok(ObjectRef::new(fobj))
 }
 
 /// Close every handle a partial `sys_channel_recv` installed, so a copy-out fault or
@@ -2153,7 +2147,7 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
                 }
                 Err(e) => {
                     // SAFETY: reclaim the reference `into_raw` yielded.
-                    drop(unsafe { ObjectRef::from_raw(op, ot) });
+                    drop(unsafe { ObjectRef::from_raw(op) });
                     recv_rollback_installed(&installed[..i], pid);
                     return Err(map_handle_err(e));
                 }

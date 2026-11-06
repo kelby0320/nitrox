@@ -192,8 +192,7 @@ fn drop_tears_down_populated_address_space() {
 use crate::object::header::test_probe;
 
 fn into_obj(m: KBox<MemoryObject>) -> ObjectRef {
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    unsafe { ObjectRef::from_raw(KBox::into_raw(m).as_ptr() as *mut (), KObjectType::MemoryObject) }
+    ObjectRef::new(m)
 }
 
 fn uprot() -> Protection {
@@ -281,8 +280,7 @@ fn find_free_range_picks_a_gap_in_the_mmap_window() {
 use crate::object::{FileObject, Producer, Reserve};
 
 fn into_file(f: KBox<FileObject>) -> ObjectRef {
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    unsafe { ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject) }
+    ObjectRef::new(f)
 }
 
 /// **Dropping an address space must release its file-backed VMAs without a lock-order

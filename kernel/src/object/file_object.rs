@@ -34,7 +34,7 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 use crate::object::{ObjectRef, PendingOperation, StoredMsg};
 
 /// How a [`FileObject`] **fills** a cache page on a fault.
@@ -132,7 +132,7 @@ pub enum Reserve {
 /// A mapped file's content, backed by a demand-filled page cache.
 #[repr(C)]
 pub struct FileObject {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     /// Exact file size in bytes; the mapped range is bounded by it. **Changes in place** for a
     /// cached Model A file ([`resize`](Self::resize)), so it is atomic.
@@ -144,6 +144,10 @@ pub struct FileObject {
     producer: Producer,
     inner: SpinLock<Inner>,
 }
+
+kobject!(FileObject);
+// SAFETY: a `FileObject` changes once shared only in its atomics and behind its lock.
+unsafe impl Shared for FileObject {}
 
 struct Inner {
     /// Cached pages. Sparse and unsorted; lookups are a linear scan. Each entry **owns** its
@@ -308,7 +312,7 @@ impl FileObject {
     /// As [`try_new`](Self::try_new), for a Model A file whose blocks `runs` maps.
     pub fn try_new_with_runs(size: usize, producer: Producer, runs: KVec<BlockRun>) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::FileObject),
+            header: Header::new(),
             magic: Self::MAGIC,
             size: AtomicUsize::new(size),
             writable_maps: AtomicU32::new(0),
@@ -734,10 +738,7 @@ impl FileObject {
             return Fault::Oom;
         }
         let po = match PendingOperation::try_new() {
-            // SAFETY: adopt the single creation reference.
-            Ok(p) => unsafe {
-                ObjectRef::from_raw(KBox::into_raw(p).as_ptr() as *mut (), KObjectType::PendingOperation)
-            },
+            Ok(p) => ObjectRef::new(p),
             Err(_) => return Fault::Oom,
         };
         let Some(frame) = heap::buddy_alloc(0) else {
@@ -908,10 +909,7 @@ impl FileObject {
         let max = run_pages(crate::io::block::max_frags(&device));
         fo.write_runs(block_size, max, |frames, dev_offset, length| {
             let po = match PendingOperation::try_new() {
-                // SAFETY: adopt the single creation reference.
-                Ok(p) => unsafe {
-                    ObjectRef::from_raw(KBox::into_raw(p).as_ptr() as *mut (), KObjectType::PendingOperation)
-                },
+                Ok(p) => ObjectRef::new(p),
                 Err(_) => return crate::syscall::error::KError::OutOfMemory as i32,
             };
             let started = crate::arch::Timer::read_ns();
@@ -1447,13 +1445,10 @@ mod tests {
 
     fn registration() -> ObjectRef {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        // SAFETY: `into_raw` yields each single creation reference; adopt them.
-        let ep = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
-        // SAFETY: adopts the peer's creation reference, to drop it.
-        drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
+        let ep = ObjectRef::new(a);
+        drop(ObjectRef::new(b));
         let r = UserspaceServerReg::try_new(ep).unwrap();
-        // SAFETY: as above.
-        unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) }
+        ObjectRef::new(r)
     }
 
     fn reg_of(reg: &ObjectRef) -> &UserspaceServerReg {
@@ -1474,8 +1469,7 @@ mod tests {
         /// The test's server's device: one, as a server has, since a cached file refuses another.
         static DEVICE: ObjectRef = {
             let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
-            // SAFETY: `into_raw` yields the single creation reference; adopt it.
-            unsafe { ObjectRef::from_raw(KBox::into_raw(dev).as_ptr() as *mut (), KObjectType::DeviceNode) }
+            ObjectRef::new(dev)
         };
     }
 
@@ -1484,8 +1478,7 @@ mod tests {
         let f =
             FileObject::try_new(size, Producer::FsServerBlocks { device, block_size, reg: reg.clone(), file_id: id })
                 .unwrap();
-        // SAFETY: as above.
-        unsafe { ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject) }
+        ObjectRef::new(f)
     }
 
     fn resolve(reg: &ObjectRef, id: u64, size: usize) -> ObjectRef {
@@ -1670,13 +1663,7 @@ mod tests {
     }
 
     fn po() -> ObjectRef {
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::PendingOperation,
-            )
-        }
+        ObjectRef::new(PendingOperation::try_new().unwrap())
     }
 
     fn read_one(f: &FileObject, index: usize, block_size: u32) -> u64 {
@@ -2006,13 +1993,11 @@ mod tests {
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
         let node =
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let device = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+        let device = ObjectRef::new(node);
         let reg = registration();
         let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 7 };
         let cand = FileObject::try_new(20 * PAGE_SIZE, producer).unwrap();
-        // SAFETY: as above.
-        let cand = unsafe { ObjectRef::from_raw(KBox::into_raw(cand).as_ptr() as *mut (), KObjectType::FileObject) };
+        let cand = ObjectRef::new(cand);
         let f = FileObject::cache_in(&reg, cand).unwrap();
         let mut runs = KVec::new();
         runs.try_push(BlockRun { file_block: 0, device_lba: 1000, length: 20, flags: 0 }).unwrap();
@@ -2059,8 +2044,7 @@ mod tests {
     fn a_fill_wait_answers_the_fill_not_the_exit() {
         init_global_heap();
         let po = PendingOperation::try_new().unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let po = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
+        let po = ObjectRef::new(po);
         // SAFETY: `po` pins the `PendingOperation`; the device's side of a success.
         unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, 0) };
         let answers =
@@ -2084,13 +2068,11 @@ mod tests {
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
         let node =
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let device = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+        let device = ObjectRef::new(node);
         let reg = registration();
         let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 7 };
         let cand = FileObject::try_new(20 * PAGE_SIZE, producer).unwrap();
-        // SAFETY: as above.
-        let cand = unsafe { ObjectRef::from_raw(KBox::into_raw(cand).as_ptr() as *mut (), KObjectType::FileObject) };
+        let cand = ObjectRef::new(cand);
         let f = FileObject::cache_in(&reg, cand).unwrap();
         let mut runs = KVec::new();
         runs.try_push(BlockRun { file_block: 0, device_lba: 1000, length: 20, flags: 0 }).unwrap();
@@ -2451,7 +2433,7 @@ mod tests {
         let _ = f.reserve(0);
         let ptr = KBox::into_raw(f).as_ptr() as *mut ();
         // SAFETY: `ptr` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(ptr, KObjectType::FileObject) };
+        let r = unsafe { ObjectRef::from_raw(ptr) };
         assert_eq!(test_probe::file_object_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::file_object_destroys(), 1);

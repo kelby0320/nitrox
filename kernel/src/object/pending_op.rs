@@ -16,19 +16,24 @@
 
 use core::cell::UnsafeCell;
 
-use crate::libkern::handle::{KObjectType, Rights};
+use crate::libkern::handle::Rights;
 use crate::libkern::{AllocError, ArrayVec, KBox};
 use crate::object::ObjectRef;
 use crate::object::WaitQueue;
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 
 /// A pending-operation kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct PendingOperation {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     inner: UnsafeCell<PendingOpInner>,
 }
+
+kobject!(PendingOperation);
+// SAFETY: a `PendingOperation` changes once shared only in `inner`, an `UnsafeCell` touched only
+// under `SCHED`.
+unsafe impl Shared for PendingOperation {}
 
 struct PendingOpInner {
     /// `true` once the operation has completed; one-shot (never cleared).
@@ -68,7 +73,7 @@ impl PendingOperation {
     /// Allocate an unsignalled `PendingOperation` (refcount one).
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::PendingOperation),
+            header: Header::new(),
             magic: Self::MAGIC,
             inner: UnsafeCell::new(PendingOpInner {
                 signaled: false,
@@ -326,7 +331,7 @@ mod tests {
         test_probe::reset();
         let obj = fresh();
         // SAFETY: `obj` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(obj, KObjectType::PendingOperation) };
+        let r = unsafe { ObjectRef::from_raw(obj) };
         assert_eq!(test_probe::pending_op_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::pending_op_destroys(), 1);

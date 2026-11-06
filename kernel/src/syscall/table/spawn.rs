@@ -85,7 +85,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     let chan = NotificationChannel::try_new().map_err(|_| KError::OutOfMemory)?;
     let chan_ptr = KBox::into_raw(chan).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-    let chan_ref = unsafe { ObjectRef::from_raw(chan_ptr, KObjectType::NotificationChannel) };
+    let chan_ref = unsafe { ObjectRef::from_raw(chan_ptr) };
     proc_box.set_notification_channel(chan_ref.clone()); // refcount 2
     let (cp, ct) = chan_ref.into_raw();
     let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
@@ -94,7 +94,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
         Err(e) => {
             // SAFETY: reclaim the channel-handle reference; `proc_box` drops here
             // too, releasing its own channel reference and freeing the AS.
-            drop(unsafe { ObjectRef::from_raw(cp, ct) });
+            drop(unsafe { ObjectRef::from_raw(cp) });
             return Err(map_handle_err(e));
         }
     };
@@ -123,7 +123,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
             Err(e) => {
                 // SAFETY: reclaim the namespace-handle reference; `proc_box` drops
                 // its own clone + the AS. Roll back the notif handle too.
-                drop(unsafe { ObjectRef::from_raw(np, nt) });
+                drop(unsafe { ObjectRef::from_raw(np) });
                 spawn_rollback_child_handles(child_pid, notif_h, RawHandle::NULL, &[]);
                 return Err(map_handle_err(e));
             }
@@ -158,7 +158,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
             Ok(h) => installed[i] = h,
             Err(e) => {
                 // SAFETY: reclaim the clone; `ok.object` drops at scope end.
-                drop(unsafe { ObjectRef::from_raw(op, ot) });
+                drop(unsafe { ObjectRef::from_raw(op) });
                 spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..i]);
                 return Err(map_handle_err(e));
             }
@@ -168,7 +168,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     let proc_obj = {
         let p = KBox::into_raw(proc_box).as_ptr() as *mut ();
         // SAFETY: `into_raw` yielded the single creation reference; adopt it.
-        unsafe { ObjectRef::from_raw(p, KObjectType::Process) }
+        unsafe { ObjectRef::from_raw(p) }
     };
 
     // The parent's handle to the child before the child runs: nothing may fail once it does.

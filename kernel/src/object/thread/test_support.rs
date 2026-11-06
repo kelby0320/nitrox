@@ -10,7 +10,7 @@ pub(crate) fn user_process_ref(pid: u32) -> (ObjectRef, crate::mm::PhysAddr) {
     let p = Process::try_new_user(pid, asp, crate::libkern::SysCaps::empty()).unwrap();
     let ptr = KBox::into_raw(p).as_ptr() as *mut ();
     // SAFETY: into_raw yielded the single creation ref; adopt it.
-    (unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }, root)
+    (unsafe { ObjectRef::from_raw(ptr) }, root)
 }
 
 /// A user thread built **without** a kernel stack, avoiding the QEMU-only `fabricate_frame`,
@@ -22,7 +22,7 @@ pub(crate) fn user_thread_no_stack(tid: u32, process: ObjectRef, entry: u64, use
         unsafe { ((*p).pid(), (*p).address_space_root().unwrap()) }
     };
     KBox::try_new(Thread {
-        header: KObjectHeader::new(KObjectType::Thread),
+        header: crate::object::header::Header::new(),
         tid,
         owner_pid,
         arch: ArchThreadContext::new(),

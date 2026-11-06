@@ -11,7 +11,7 @@ fn new_pair() -> (*mut (), *mut ()) {
 
 fn drop_endpoint(obj: *mut ()) {
     // SAFETY: adopts the endpoint's creation reference, to drop it.
-    drop(unsafe { ObjectRef::from_raw(obj, KObjectType::IpcChannel) });
+    drop(unsafe { ObjectRef::from_raw(obj) });
 }
 
 fn a_msg(byte: u8, len: u32) -> StoredMsg {
@@ -190,7 +190,7 @@ fn transfer_moves_with_message_and_releases_on_drop() {
     let (a, b) = new_pair();
     let p = KBox::into_raw(Process::try_new(99).unwrap()).as_ptr() as *mut ();
     // SAFETY: adopts the process's creation reference.
-    let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
+    let pref = unsafe { ObjectRef::from_raw(p) };
     // SAFETY: live endpoints, single-threaded test.
     unsafe {
         let mut send_t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
@@ -221,7 +221,7 @@ fn undelivered_transfer_released_when_endpoint_destroyed() {
     let (a, b) = new_pair();
     let p = KBox::into_raw(Process::try_new(7).unwrap()).as_ptr() as *mut ();
     // SAFETY: adopts the process's creation reference.
-    let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
+    let pref = unsafe { ObjectRef::from_raw(p) };
     // SAFETY: live endpoints, single-threaded test.
     unsafe {
         let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
@@ -243,13 +243,7 @@ fn payload_size_is_one_page_worth() {
 }
 
 fn make_po() -> ObjectRef {
-    // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    unsafe {
-        ObjectRef::from_raw(
-            KBox::into_raw(crate::object::PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
-            KObjectType::PendingOperation,
-        )
-    }
+    ObjectRef::new(crate::object::PendingOperation::try_new().unwrap())
 }
 
 fn empty_xfer() -> [Option<TransferRef>; IPC_HANDLE_MAX] {

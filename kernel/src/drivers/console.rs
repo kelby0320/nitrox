@@ -19,7 +19,6 @@ use crate::dpc::Dpc;
 use crate::drivers::input::{self, ReadNow, Submitted};
 use crate::libkern::IrqSpinLock;
 use crate::libkern::KBox;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
@@ -221,7 +220,7 @@ pub fn device_ref() -> Option<ObjectRef> {
     }
     // SAFETY: `CONSOLE_NODE` points at the leaked-`'static` console `DeviceNode`
     // (its creation reference is never released), so the object is live.
-    unsafe { ObjectRef::try_acquire(p, KObjectType::DeviceNode) }
+    unsafe { ObjectRef::try_acquire(p) }
 }
 
 /// Bring up console input: self-test RX by internal loopback, publish the console `DeviceNode`, arm
@@ -276,15 +275,9 @@ mod tests {
     use crate::object::PendingOperation;
 
     fn read() -> ParkedRead {
-        let adopt = |p: *mut (), ty| {
-            // SAFETY: `p` is the single creation reference of a `ty` object.
-            unsafe { ObjectRef::from_raw(p, ty) }
-        };
-        let po = KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut ();
-        let buf = KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut ();
         ParkedRead {
-            po: adopt(po, KObjectType::PendingOperation),
-            buffer: adopt(buf, KObjectType::MemoryObject),
+            po: ObjectRef::new(PendingOperation::try_new().unwrap()),
+            buffer: ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap()),
             buf_offset: 0,
             max_len: 1,
         }

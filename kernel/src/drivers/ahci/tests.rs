@@ -176,8 +176,7 @@ fn fake_disk() -> (FakeRegs, AhciDisk) {
 }
 
 fn interrupt_object() -> ObjectRef {
-    // SAFETY: a fresh `InterruptObject`, adopted under its own tag.
-    unsafe { crate::drivers::adopt(InterruptObject::try_new().unwrap(), KObjectType::InterruptObject) }
+    ObjectRef::new(InterruptObject::try_new().unwrap())
 }
 
 /// A read of one sector into `frag`.

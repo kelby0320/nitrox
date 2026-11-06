@@ -17,9 +17,8 @@
 use super::partitions::{self, PartKind, Scheme, Table, Unread};
 use crate::io::block::{Partition, read_blocking};
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
-use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{KBox, KVec, Rights, SpinLock};
+use crate::libkern::{KVec, Rights, SpinLock};
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
@@ -166,8 +165,7 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names, boot_
         Ok(n) => n,
         Err(_) => return false,
     };
-    // SAFETY: adopt the creation reference.
-    let node_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+    let node_ref = ObjectRef::new(node);
 
     let (first, last) = (p.first_lba, p.first_lba + p.count - 1);
     let Some((guid, _)) = gpt else {
@@ -361,11 +359,7 @@ mod tests {
     fn a_name_two_partitions_carry_goes_to_the_boot_mediums() {
         use crate::object::{MemoryObject, namespace::ResolvedTarget};
         init_global_heap();
-        let node = || {
-            let mem = KBox::into_raw(MemoryObject::try_new(4096).unwrap()).as_ptr() as *mut ();
-            // SAFETY: a fresh `into_raw`, carrying its single creation reference.
-            unsafe { ObjectRef::from_raw(mem, KObjectType::MemoryObject) }
-        };
+        let node = || ObjectRef::new(MemoryObject::try_new(4096).unwrap());
         let path = |s: &[u8]| {
             copy_bytes(&{
                 let mut v = KVec::new();

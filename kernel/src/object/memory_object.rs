@@ -11,10 +11,9 @@
 
 use core::ptr;
 
-use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec};
 use crate::mm::{Caching, PAGE_SHIFT, PAGE_SIZE, PhysAddr, heap};
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 
 /// Whether a [`MemoryObject`]'s frames belong to it.
 ///
@@ -35,7 +34,7 @@ const BORROWED_ONLY_MAPPED: &str = "a borrowed object's frames are only mapped";
 /// An anonymous memory kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct MemoryObject {
-    header: KObjectHeader,
+    header: Header<Self>,
     magic: u64,
     size: usize,
     /// One frame per page; freed in [`Drop`] only when `ownership` is `Owned`.
@@ -44,6 +43,11 @@ pub struct MemoryObject {
     /// How every mapping of these frames is cached; ordinary unless an aperture says otherwise.
     caching: Caching,
 }
+
+kobject!(MemoryObject);
+// SAFETY: nothing writes a `MemoryObject`'s fields once it is made; its frames' bytes are not
+// its fields.
+unsafe impl Shared for MemoryObject {}
 
 impl MemoryObject {
     /// Sentinel written into [`MemoryObject::magic`] at construction.
@@ -86,7 +90,7 @@ impl MemoryObject {
 
         // A `KBox::try_new` failure drops the value, and `Drop` below frees every frame.
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::MemoryObject),
+            header: Header::new(),
             magic: Self::MAGIC,
             size,
             frames,
@@ -117,7 +121,7 @@ impl MemoryObject {
         }
 
         KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::MemoryObject),
+            header: Header::new(),
             magic: Self::MAGIC,
             size,
             frames,
@@ -396,7 +400,7 @@ mod tests {
         let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
         let ptr = KBox::into_raw(m).as_ptr() as *mut ();
         // SAFETY: `ptr` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(ptr, KObjectType::MemoryObject) };
+        let r = unsafe { ObjectRef::from_raw(ptr) };
         assert_eq!(test_probe::memory_object_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::memory_object_destroys(), 1);

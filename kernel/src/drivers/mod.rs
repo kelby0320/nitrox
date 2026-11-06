@@ -14,8 +14,6 @@ pub mod xhci;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::timer::ArchTimer;
 use crate::io::block::dispatch_block_irp;
-use crate::libkern::KBox;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::io_op::IoOpcode;
 use crate::object::device_node::DeviceClass;
 use crate::object::{DeviceNode, MemoryObject, ObjectRef, PendingOperation};
@@ -92,13 +90,11 @@ pub fn self_test() {
     oversize_refused(disk);
 
     let buffer = match MemoryObject::try_new(512) {
-        // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
-        Ok(mo) => unsafe { adopt(mo, KObjectType::MemoryObject) },
+        Ok(mo) => ObjectRef::new(mo),
         Err(_) => return,
     };
     let po = match PendingOperation::try_new() {
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        Ok(po) => unsafe { adopt(po, KObjectType::PendingOperation) },
+        Ok(po) => ObjectRef::new(po),
         Err(_) => return,
     };
     let po_check = po.clone();
@@ -165,13 +161,11 @@ fn oversize_refused(disk: &ObjectRef) {
     let pages = backend.max_frags as usize + 1;
     let bytes = pages * crate::mm::PAGE_SIZE;
     let big = match MemoryObject::try_new(bytes) {
-        // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
-        Ok(mo) => unsafe { adopt(mo, KObjectType::MemoryObject) },
+        Ok(mo) => ObjectRef::new(mo),
         Err(_) => return,
     };
     let po = match PendingOperation::try_new() {
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        Ok(po) => unsafe { adopt(po, KObjectType::PendingOperation) },
+        Ok(po) => ObjectRef::new(po),
         Err(_) => return,
     };
     match dispatch_block_irp(disk, &big, &po, IoOpcode::Read, 0, 0, bytes as u64) {
@@ -195,19 +189,4 @@ fn read_boot_signature(buffer: &ObjectRef) -> u16 {
     let va = (frame.as_u64() + crate::mm::heap::hhdm_offset()) as *const u8;
     // SAFETY: offset 510..512 is within the first (HHDM-mapped) buffer frame.
     unsafe { (va.add(510) as *const u16).read_unaligned() }
-}
-
-/// Adopt a freshly made kernel object's box as the [`ObjectRef`] of its creation reference.
-///
-/// # Safety
-/// `obj` is a kernel object whose type `ty` names: its drop runs `ty`'s destructor on it.
-pub(crate) unsafe fn adopt<T>(obj: KBox<T>, ty: KObjectType) -> ObjectRef {
-    // SAFETY: `into_raw` yields the single creation reference of a `ty` object, by the contract.
-    unsafe { ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), ty) }
-}
-
-/// [`adopt`] a fresh device node, whose type fixes its tag.
-pub(crate) fn adopt_node(node: KBox<DeviceNode>) -> ObjectRef {
-    // SAFETY: a `DeviceNode`, under its own tag.
-    unsafe { adopt(node, KObjectType::DeviceNode) }
 }

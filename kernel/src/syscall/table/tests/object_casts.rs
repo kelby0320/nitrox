@@ -12,23 +12,16 @@ fn every_cast_of_an_object_ref_stops_another_kind_at_its_type_check() {
     use crate::object::{FileObject, IpcChannel, MemoryObject, UserspaceServerReg};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     init_global_heap();
-    // SAFETY: each a fresh object, adopted under its own tag.
-    let (mo, file, endpoint, peer) = unsafe {
+    let (mo, file, endpoint, peer) = {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
         (
-            crate::drivers::adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject),
-            crate::drivers::adopt(
-                FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap(),
-                KObjectType::FileObject,
-            ),
-            crate::drivers::adopt(a, KObjectType::IpcChannel),
-            crate::drivers::adopt(b, KObjectType::IpcChannel),
+            ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap()),
+            ObjectRef::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap()),
+            ObjectRef::new(a),
+            ObjectRef::new(b),
         )
     };
-    // SAFETY: as above.
-    let reg = unsafe {
-        crate::drivers::adopt(UserspaceServerReg::try_new(endpoint).unwrap(), KObjectType::UserspaceServerReg)
-    };
+    let reg = ObjectRef::new(UserspaceServerReg::try_new(endpoint).unwrap());
     // SAFETY: `reg` pins the live `UserspaceServerReg`.
     let reg_obj = unsafe { &*(reg.as_ptr() as *const UserspaceServerReg) };
     let range = VAddrRange::new(VirtAddr::new(0x40_0000), VirtAddr::new(0x40_1000)).unwrap();

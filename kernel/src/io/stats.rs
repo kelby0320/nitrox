@@ -173,7 +173,7 @@ mod tests {
         use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
         crate::mm::test_support::init_global_heap();
         let node = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
-        let node = crate::drivers::adopt_node(node);
+        let node = ObjectRef::new(node);
         let c = Counted::new();
         c.attach(&node);
         // SAFETY: `node` holds the object here.

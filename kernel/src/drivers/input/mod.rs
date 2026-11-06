@@ -280,21 +280,14 @@ pub fn key_presses() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::libkern::KBox;
-    use crate::libkern::handle::KObjectType;
     use crate::libkern::input::KEY_PRESS;
     use crate::mm::test_support::init_global_heap;
     use crate::object::PendingOperation;
     use crate::object::header::test_probe;
 
-    fn adopt<T>(b: KBox<T>, ty: KObjectType) -> ObjectRef {
-        // SAFETY: `into_raw` yields the single creation reference of a `ty` object.
-        unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), ty) }
-    }
-
     fn read(max_len: usize) -> ParkedRead {
-        let po = adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation);
-        let buf = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
+        let po = ObjectRef::new(PendingOperation::try_new().unwrap());
+        let buf = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
         ParkedRead::new(&po, &buf, 0, max_len)
     }
 
@@ -438,7 +431,7 @@ mod tests {
     fn a_lights_write_is_one_byte_of_three_bits() {
         init_global_heap();
         let mo = MemoryObject::try_new_filled(&[0x02, 0x08, 0x07]).unwrap();
-        let buf = adopt(mo, KObjectType::MemoryObject);
+        let buf = ObjectRef::new(mo);
         assert_eq!(lights_from(&buf, 0, 1), Ok(0x02), "Caps Lock");
         assert_eq!(lights_from(&buf, 2, 1), Ok(0x07), "all three");
         assert_eq!(lights_from(&buf, 1, 1), Err(KError::InvalidArgument), "bit 3 is no light");
@@ -458,8 +451,6 @@ mod tests {
 /// **Drives a driver's own read through the race**: a second read must not park beside the first.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::drivers::adopt;
-    use crate::libkern::handle::KObjectType;
     use crate::mm::PAGE_SIZE;
     use crate::object::{MemoryObject, ObjectRef, PendingOperation};
     use crate::syscall::error::KError;
@@ -475,10 +466,8 @@ pub(crate) mod test_support {
     ) {
         crate::mm::test_support::init_global_heap();
         let state = Arc::new(state);
-        // SAFETY: a fresh `MemoryObject`, adopted under its own tag.
-        let buf = unsafe { adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject) };
-        // SAFETY: a fresh `PendingOperation`, adopted under its own tag.
-        let po = || unsafe { adopt(PendingOperation::try_new().unwrap(), KObjectType::PendingOperation) };
+        let buf = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+        let po = || ObjectRef::new(PendingOperation::try_new().unwrap());
         assert_eq!(read(&state, &buf, &po()), Ok(()));
         let first = take(&state);
         let (done, answer) = mpsc::channel();

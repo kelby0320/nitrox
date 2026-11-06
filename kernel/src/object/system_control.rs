@@ -7,9 +7,9 @@
 //! `sys_power` looks it up, requiring `WRITE`, and flushes, stops and halts or resets through
 //! [`crate::power`]. See `docs/architecture/power.md`.
 
-use crate::libkern::handle::{KObjectType, Rights};
+use crate::libkern::handle::Rights;
 use crate::libkern::{AllocError, KBox};
-use crate::object::header::KObjectHeader;
+use crate::object::header::{Header, Shared, kobject};
 
 /// The rights `init`'s handle carries: `WRITE`, which `sys_power` requires, and `INSPECT`;
 /// neither `DUPLICATE` nor `TRANSFER`, so it can give the handle to no one.
@@ -20,10 +20,14 @@ pub const INIT_RIGHTS: Rights = Rights::WRITE.union(Rights::INSPECT);
 /// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
 #[repr(C)]
 pub struct SystemControl {
-    header: KObjectHeader,
+    header: Header<Self>,
     /// Self-check sentinel; a live object always reads [`SystemControl::MAGIC`].
     magic: u64,
 }
+
+kobject!(SystemControl);
+// SAFETY: nothing writes a `SystemControl` once it is made.
+unsafe impl Shared for SystemControl {}
 
 impl SystemControl {
     /// Sentinel written into [`SystemControl::magic`] at construction.
@@ -31,7 +35,7 @@ impl SystemControl {
 
     /// Allocate the token with a refcount of one.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
-        let header = KObjectHeader::new(KObjectType::SystemControl);
+        let header = Header::new();
         KBox::try_new(Self { header, magic: Self::MAGIC })
     }
 
@@ -61,13 +65,7 @@ mod tests {
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let r = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(SystemControl::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::SystemControl,
-            )
-        };
+        let r = ObjectRef::new(SystemControl::try_new().unwrap());
         assert_eq!(test_probe::system_control_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::system_control_destroys(), 1);

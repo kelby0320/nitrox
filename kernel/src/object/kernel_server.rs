@@ -8,7 +8,7 @@
 //! lookup's `PendingOperation`, so an in-kernel lookup is synchronous.
 
 use crate::libkern::KBox;
-use crate::libkern::handle::{KObjectType, Rights};
+use crate::libkern::handle::Rights;
 use crate::object::DeviceNode;
 use crate::object::EntropyObject;
 use crate::object::MemoryObject;
@@ -89,10 +89,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
 
 /// Adopt a fresh [`MemoryObject`] into a [`Completed`](OpStatus::Completed) answer.
 fn complete_with_memobj(obj: KBox<MemoryObject>) -> OpStatus {
-    // SAFETY: `into_raw` yields the one outstanding creation reference.
-    OpStatus::Completed(unsafe {
-        ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), KObjectType::MemoryObject)
-    })
+    OpStatus::Completed(ObjectRef::new(obj))
 }
 
 /// `/dev/entropy` — a **leaf**; an exact match mints an [`EntropyObject`] on the global CSPRNG.
@@ -101,10 +98,7 @@ fn entropy_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         return OpStatus::Rejected(KError::NotFound);
     }
     match EntropyObject::try_new() {
-        // SAFETY: `into_raw` yields the one outstanding creation reference.
-        Ok(obj) => OpStatus::Completed(unsafe {
-            ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), KObjectType::EntropyObject)
-        }),
+        Ok(obj) => OpStatus::Completed(ObjectRef::new(obj)),
         Err(_) => OpStatus::Rejected(KError::OutOfMemory),
     }
 }
@@ -414,6 +408,7 @@ fn parse_index(s: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libkern::handle::KObjectType;
     use crate::mm::test_support::init_global_heap;
 
     #[test]

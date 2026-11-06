@@ -59,23 +59,15 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     }
     fn disk_poll(_: *mut ()) {}
     let seen = Seen(RefCell::new(std::vec::Vec::new()));
-    let adopt = |node: KBox<DeviceNode>| {
-        // SAFETY: `into_raw` yields the single creation reference, which the test adopts.
-        unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(node).as_ptr() as *mut (),
-                crate::libkern::handle::KObjectType::DeviceNode,
-            )
-        }
-    };
     let geometry = |blocks| BlockGeometry { logical_block_size: 512, block_count: blocks };
     let backend =
         BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
-    let disk = adopt(
+    let disk = ObjectRef::new(
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(8192), BlockKind::Disk, b"disk", backend).unwrap(),
     );
     let window = Partition::new(&disk, 2048, 100, 512).unwrap();
-    let part = adopt(DeviceNode::try_new_partition(ResourceDescriptor::ZERO, geometry(100), b"p", window).unwrap());
+    let part =
+        ObjectRef::new(DeviceNode::try_new_partition(ResourceDescriptor::ZERO, geometry(100), b"p", window).unwrap());
     // An IRP through the partition node's backend; returns its status after
     // any refusal's completion has run.
     let submit = |op: IrpOp, offset: u64| {
@@ -115,7 +107,7 @@ fn a_node_is_a_window_by_what_made_it_not_by_its_backends_function() {
     let backend = BlockBackend { submit: partition_submit, poll: partition_poll, ctx, max_frags: 8 };
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 100 };
     let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Partition, b"p", backend);
-    let node = crate::drivers::adopt_node(node.unwrap());
+    let node = ObjectRef::new(node.unwrap());
     assert!(!retire_window(&node), "no window made it");
     assert_eq!(not_a_window, [0; 8], "nothing written through its context");
 }
@@ -125,7 +117,6 @@ fn a_node_is_a_window_by_what_made_it_not_by_its_backends_function() {
 #[test]
 fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
     use crate::libkern::block::BlockKind;
-    use crate::libkern::handle::KObjectType;
     use crate::object::PendingOperation;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
     use core::cell::RefCell;
@@ -148,16 +139,7 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 8192 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-    // SAFETY: `into_raw` yields each single creation reference, which the test adopts.
-    let (disk, po) = unsafe {
-        (
-            ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode),
-            ObjectRef::from_raw(
-                KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::PendingOperation,
-            ),
-        )
-    };
+    let (disk, po) = (ObjectRef::new(node), ObjectRef::new(PendingOperation::try_new().unwrap()));
     let frames: std::vec::Vec<PhysAddr> = (0..9).map(|i| PhysAddr(0x10_0000 + i * 0x3000)).collect();
     let page = PAGE_SIZE as u64;
     let write = |frames: &[PhysAddr], length| {
@@ -184,7 +166,6 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
 fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     let _exclusive = crate::dpc::exclusive();
     use crate::libkern::block::BlockKind;
-    use crate::libkern::handle::KObjectType;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
     use crate::object::{MemoryObject, PendingOperation};
     use core::cell::RefCell;
@@ -202,16 +183,9 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-    // SAFETY: `into_raw` yields each single creation reference, which the test adopts.
-    let adopt = |p: *mut (), kind| unsafe { ObjectRef::from_raw(p, kind) };
-    let disk = adopt(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode);
-    let buffer = adopt(
-        KBox::into_raw(MemoryObject::try_new(2 * PAGE_SIZE).unwrap()).as_ptr() as *mut (),
-        KObjectType::MemoryObject,
-    );
-    let po = || {
-        adopt(KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (), KObjectType::PendingOperation)
-    };
+    let disk = ObjectRef::new(node);
+    let buffer = ObjectRef::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap());
+    let po = || ObjectRef::new(PendingOperation::try_new().unwrap());
     let frames = [PhysAddr(0x10_0000), PhysAddr(0x20_0000)];
     // Each request through both entry points, its operation's status once settled.
     let both = |offset: u64, length: u64| {
@@ -254,7 +228,6 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
 fn a_blocking_read_its_device_did_not_complete_fails() {
     let _exclusive = crate::dpc::exclusive();
     use crate::libkern::block::BlockKind;
-    use crate::libkern::handle::KObjectType;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
     init_global_heap();
     fn kept(_: *mut Irp, _: *mut ()) {}
@@ -273,8 +246,7 @@ fn a_blocking_read_its_device_did_not_complete_fails() {
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
         let node =
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-        // SAFETY: `into_raw` yields the single creation reference, which the test adopts.
-        let disk = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
+        let disk = ObjectRef::new(node);
         read_blocking(&disk, lba, 1, &mut [0u8; 512])
     };
     assert!(read(completes, runs, 0), "a read its device completed");
@@ -352,7 +324,6 @@ fn an_unaligned_start_costs_an_extra_fragment() {
 fn more_refusals_than_the_dpc_queue_holds_each_complete() {
     let _exclusive = crate::dpc::exclusive();
     use crate::libkern::block::BlockKind;
-    use crate::libkern::handle::KObjectType;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
     use crate::object::{MemoryObject, PendingOperation};
     init_global_heap();
@@ -362,19 +333,10 @@ fn more_refusals_than_the_dpc_queue_holds_each_complete() {
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-    // SAFETY: `into_raw` yields each single creation reference, which the test adopts.
-    let adopt = |p: *mut (), kind| unsafe { ObjectRef::from_raw(p, kind) };
-    let disk = adopt(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode);
-    let buffer =
-        adopt(KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut (), KObjectType::MemoryObject);
-    let pos: std::vec::Vec<ObjectRef> = (0..100)
-        .map(|_| {
-            adopt(
-                KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::PendingOperation,
-            )
-        })
-        .collect();
+    let disk = ObjectRef::new(node);
+    let buffer = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+    let pos: std::vec::Vec<ObjectRef> =
+        (0..100).map(|_| ObjectRef::new(PendingOperation::try_new().unwrap())).collect();
     for po in &pos {
         assert_eq!(dispatch_block_irp(&disk, &buffer, po, IoOpcode::Read, 64 * 512, 0, 512), Ok(()));
     }
