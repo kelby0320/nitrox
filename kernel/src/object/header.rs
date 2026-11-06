@@ -186,9 +186,12 @@ impl ObjectRef {
     /// `lookup` having observed `entry.object` non-null under a grace read-guard before this call
     /// (step 6 precedes step 7).
     pub unsafe fn try_acquire(obj: *mut ()) -> Option<ObjectRef> {
-        // SAFETY: `obj` addresses a live kernel object, its header at offset 0, by the contract.
-        let header = unsafe { &*(obj as *const KObjectHeader) };
-        header.try_acquire().then(|| ObjectRef { header: NonNull::from(header) })
+        // SAFETY: `obj` addresses a live kernel object, so it is non-null, and its header is at
+        // offset 0. The pointer is `obj` itself, whose provenance spans the whole object, not
+        // the header a reference to it would cover.
+        let header = unsafe { NonNull::new_unchecked(obj.cast::<KObjectHeader>()) };
+        // SAFETY: as above.
+        unsafe { header.as_ref() }.try_acquire().then_some(ObjectRef { header })
     }
 
     fn header(&self) -> &KObjectHeader {
@@ -279,6 +282,15 @@ impl<T: KObject> Ref<T> {
     /// Adopt a fresh `T`'s box as the reference its creator holds.
     pub fn new(object: KBox<T>) -> Self {
         Self { object: ObjectRef::new(object), _type: PhantomData }
+    }
+
+    /// Acquire a reference to the `T` at `obj`, or `None` if its count was already zero.
+    ///
+    /// # Safety
+    /// `obj` must point at a live `T`.
+    pub unsafe fn try_acquire(obj: *mut T) -> Option<Self> {
+        // SAFETY: a live `T` is a live kernel object, by the contract.
+        unsafe { ObjectRef::try_acquire(obj.cast()) }.map(|object| Self { object, _type: PhantomData })
     }
 
     /// The reference, its type forgotten.

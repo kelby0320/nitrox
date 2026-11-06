@@ -111,6 +111,15 @@ fn try_acquire_increments_above_zero() {
 }
 
 #[test]
+fn a_typed_acquire_counts_as_the_untyped_one() {
+    init_global_heap();
+    let p = Ref::new(Process::try_new(5).unwrap());
+    // SAFETY: `p` keeps the `Process` live across the call.
+    let q = unsafe { Ref::try_acquire(p.as_ptr()) }.expect("count above zero");
+    assert_eq!((q.pid(), header_of(p.as_object()).refcount()), (5, 2));
+}
+
+#[test]
 fn try_acquire_fails_at_zero() {
     init_global_heap();
     let raw = KBox::into_raw(Process::try_new(1).unwrap());
