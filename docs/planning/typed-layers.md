@@ -266,8 +266,9 @@ its size ends its test; the parking is split out for host tests, one per `Park`,
 - **A deadline's target is an enum** carrying each kind's addresses.
 
 `unsafe` blocks fall from 931 to 915. Three things differ from the plan:
-- **A bag for interrupt context is declared so by its site**, `Deferred::in_interrupt`, bounded at
-  compile time by `deferred_drops`' reserve: nothing tells interrupt context at run time. The
+- **A bag for interrupt context is declared so by its site**, `Deferred::in_interrupt`, no larger,
+  at compile time, than `deferred_drops`' reserve, whose room for every such bag at once rests on
+  the one site's lifetime total: nothing tells interrupt context at run time. The
   tick's entropy wake, the one such site, takes its own hold, so the hold it switches with carries
   no bag.
 - **A target's addresses are `usize`s**, as `idle_addr` is, which keeps the scheduler's state
