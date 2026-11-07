@@ -50,4 +50,4 @@ pub use system_control::SystemControl;
 pub use thread::{MAX_WAIT_HANDLES, SchedClass, Thread, ThreadEntry, ThreadState, WaitPhase};
 pub use timer::Timer;
 pub use userspace_server::UserspaceServerReg;
-pub(crate) use wait_queue::WaitQueue;
+pub(crate) use wait_queue::{WaitQueue, Waiters};

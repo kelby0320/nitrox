@@ -174,7 +174,10 @@ pub fn classify(rank: LockRank, held: &[u8], taken: Taken) -> Acquisition {
 /// Debug-build enforcement. Compiled out in release builds, and in host unit tests (the
 /// per-CPU model does not hold there).
 #[cfg(all(debug_assertions, not(test)))]
-pub use tracker::{IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing};
+pub use tracker::{
+    IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing,
+    sched_held_by_this_thread,
+};
 
 /// Release builds: every hook vanishes. Host tests: each thread counts the locks it holds.
 #[cfg(not(all(debug_assertions, not(test))))]
@@ -391,6 +394,17 @@ mod tracker {
             }
             FLOOR[cpu].store(self.saved_floor, Ordering::Relaxed);
         }
+    }
+
+    /// Whether this CPU, and so the thread on it, holds `SCHED`, under which no reference may drop.
+    /// Masked, so the thread cannot move to a CPU that does between the index and the scan.
+    pub fn sched_held_by_this_thread() -> bool {
+        let irq = mask();
+        let cpu = this_cpu();
+        let depth = DEPTH[cpu].load(Ordering::Relaxed).min(MAX_HELD);
+        let held = HELD[cpu][..depth].iter().any(|r| r.load(Ordering::Relaxed) == LockRank::Sched as u8);
+        unmask(irq);
+        held
     }
 
     /// Assert that this CPU is safe to context-switch on: nothing held, no interrupt scope

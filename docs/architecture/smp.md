@@ -134,13 +134,14 @@ thread that *adopts* the `_start` context (`Thread::try_new_boot`, tid 0, no
 
 ### 4. The context switch — `switch_into`
 
-Every voluntary or involuntary switch funnels through **`switch_into`**
-(`sched.rs`), the shared tail of `switch_to_next` (preempt/yield),
-`block_current_and_switch` (blocking wait), `finish_exit` (thread exit), and
-`suspend_with_fault`. The caller, **under the held `SCHED` guard**, has already
-re-homed the outgoing thread (into `ready`/`blocked`/`reap`/`suspended`), set the
-incoming thread `Running`, and installed it as `current`. `switch_into` then, in
-order:
+Every voluntary or involuntary switch funnels through **`switch_away(guard, prev,
+park)`** (`sched.rs`): a yield or a tick (`Park::Ready`), a blocking wait
+(`Blocked`), a fault (`Suspended`), an exit (`Exited`) and the reaper's park
+(`Reaper`). `prev` is an `Outgoing`, which only taking this CPU's `current` makes.
+**Under the held `SCHED` guard** it picks the next thread (else the idle thread),
+gives `prev` the state its `Park` names and puts it on that list (`park`), sets
+the incoming thread `Running` and installs it as `current`, and calls
+`switch_into`, which, in order:
 
 1. Reads the incoming thread's saved RSP and **page-table root** (`resolve_root` →
    the process's CR3, or the boot root for kernel threads).
@@ -156,7 +157,8 @@ order:
 6. **Loads CR3** (`Paging::set_page_table(next_root)`) — before the stack swap, so
    a dying thread leaves CR3 on the incoming root before its own address space is
    torn down.
-7. **`context_switch(out_slot, next_sp, out_on_cpu)`** — the arch asm
+7. **`context_switch(out_slot, next_sp, out_on_cpu)`**, `out_slot` the outgoing
+   thread's own saved-SP slot — the arch asm
    (`arch/x86_64/context.rs`): pushes the six callee-saved registers onto the
    outgoing stack, `mov [rdi], rsp` **commits** the outgoing thread's resume RSP,
    then `mov byte [rdx], 0` **clears its `on_cpu` guard** (only now is its parked

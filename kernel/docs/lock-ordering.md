@@ -118,10 +118,11 @@ will surface as a panic naming both ranks rather than as a claim nobody can chec
 `SCHED` (`kernel/src/sched.rs`) is the rank-1 runqueue lock, an
 [`IrqSpinLock`]. The cardinal rule: **the lock is released before every
 `context_switch` and re-acquired fresh on resume — it is never held across
-a stack switch.** The cooperative `yield_now`/`exit` and the preemptive
-`on_timer_tick` all funnel through `switch_to_next`, which mutates the queue
-and the current-thread pointer, captures the `(prev_sp_slot, next_sp)` pair,
-drops the guard, and only then calls the switch. Every point a thread
+a stack switch.** Every switch, the cooperative `yield_now`, a wait, a fault and
+an exit as well as the preemptive `on_timer_tick`, funnels through `switch_away`,
+which parks the outgoing thread, installs the next as current, drops the guard,
+and only then calls the switch. It takes the plain guard, never a `Deferred`
+bag's, so no deferred drop is carried across a switch. Every point a thread
 *resumes* at (the instruction after `context_switch`, and `thread_enter` for a
 freshly scheduled thread) therefore runs with the lock not held.
 
@@ -163,8 +164,8 @@ Two corollaries:
 - **Suspend obeys the block-and-switch discipline.** `suspend_with_fault`
   (the ring-3 exception path) delivers the fault notification + parks the
   thread in `suspended` and context-switches away — all under one `SCHED`
-  hold, no allocation (the queue pre-reserved, the waiters inline), mirroring
-  `block_current_and_switch`. It records the registers the thread faulted
+  hold, no allocation (the queue pre-reserved, the waiters inline), through
+  the same `switch_away` a wait takes. It records the registers the thread faulted
   with in the `Thread`, under that hold; the supervisor's
   `sys_thread_get_registers` copies them out under `SCHED`, then to user
   memory **outside** it, so a resume racing the copy-out cannot change them.
@@ -206,8 +207,9 @@ The seeded-latch's wake of any `PendingOperation` waiters (the userspace read
 contract) runs on the `PendingOperation` completion path under `SCHED`, **outside**
 this lock — so `ENTROPY` never nests with `SCHED`. Concretely, `on_timer_tick`'s
 `wake_entropy_seed_waiters` (`sched/timers.rs`) *moves* the queued waiter `ObjectRef`s out
-of `ENTROPY` (the entropy subsystem owns them, the IPC-`Block` pattern), signals
-each, and **parks the refs in `SchedState::deferred_drops`** for `reap_pending` to
+of `ENTROPY` (the entropy subsystem owns them, the IPC-`Block` pattern) before it takes
+`SCHED`, signals each, and defers each to a bag made for interrupt context (`Deferred::in_interrupt`),
+whose guard **parks the refs in `SchedState::deferred_drops`** for `reap_pending` to
 drop later, in thread context with no lock held.
 
 > **History (corrected 2026-07-21, review finding F2).** An earlier revision
@@ -221,8 +223,9 @@ drop later, in thread context with no lock held.
 > IRQ context* can self-deadlock against an allocator holder the tick interrupted
 > on the same CPU. The rule is therefore strict: **nothing that can reach a plain
 > spinlock may run under `SCHED` or in IRQ context — neither allocation nor an
-> `ObjectRef` drop.** Refs that must be released from such contexts are moved
-> (never dropped) into `deferred_drops` within its reserve. The tail of an
+> `ObjectRef` drop.** Refs released under `SCHED` wait in a `Deferred` bag until
+> it is released, and refs released in IRQ context are moved (never dropped)
+> into `deferred_drops` within its reserve. The tail of an
 > interrupt taken from ring 3, which interrupted no kernel code, is the exception:
 > § *A thread ends itself at an interrupt's return to ring 3*.
 
@@ -483,6 +486,19 @@ from IRQ context, any plain `SpinLock` transitively acquirable **while holding
 IF=1 and can be interrupted into a spin on `SCHED`. Freeing is acquiring: an
 `ObjectRef` drop can reach the slab/buddy locks, so the no-allocation rule under
 `SCHED` (and in IRQ context) extends to **no `ObjectRef` drops** there.
+
+**Debug builds hold it**: `ObjectRef::drop` asserts that its thread holds no `SCHED`, on
+every drop, not only the last, which is the last whenever another CPU lets go first.
+Every kernel image is a debug build, so every gate runs it. **A site that lets go of
+references under `SCHED` declares a `Deferred<N>`** (`kernel/src/sched/deferred.rs`) and
+locks `SCHED` through it: `defer` keeps each in the bag, which the guard borrows, so
+the bag drops after the guard releases the lock. `N` is the site's burst, and a full
+bag ends the machine, as a full `Reserved` list does (`sched::reserve_exhausted`, the
+one place a refused value is forgotten rather than dropped). A bag made for interrupt
+context, where nothing may be freed at all, moves what it holds into
+`SchedState::deferred_drops` instead, and is no larger than that list's reserve. That bounds
+one bag only: the list is shared and drained by `reap_pending` alone, so its room rests on
+each such site's lifetime total, the entropy wake's at most half the reserve a boot.
 
 **A list pushed where nothing may allocate — under `SCHED` or an `IrqSpinLock`, or
 in interrupt or DPC context — is a `Reserved` or an `ArrayVec`, never a `KVec`**

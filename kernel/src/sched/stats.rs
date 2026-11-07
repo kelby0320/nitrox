@@ -7,8 +7,8 @@ use crate::libkern::{AllocError, KString};
 /// under the rank-1 `SCHED` lock; copied out by [`stats_snapshot`](super::stats_snapshot).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Counters {
-    /// Context switches performed by this CPU — every [`switch_into`] (super), across all
-    /// four parking dispositions (ready / blocked / suspended / reap).
+    /// Context switches performed by this CPU — every [`switch_into`] (super), whatever the
+    /// outgoing thread was parked as (ready, blocked, suspended, exited, or the reaper's).
     pub switches: u64,
     /// Threads this CPU stole from a peer's ready queue (`steal_one`).
     pub steals: u64,

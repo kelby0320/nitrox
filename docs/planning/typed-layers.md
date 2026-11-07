@@ -249,6 +249,34 @@ Controls: the drop assertion fails a host test that drops under SCHED; a bag def
 its size ends its test; the parking is split out for host tests, one per `Park`, as
 `clear_online_bit` was. Author.
 
+**Built 2026-11-06.** Each repetition is one function:
+- **`wake_all`** takes a `Waiters<N>`, which only a `WaitQueue` makes, and holds the five wake
+  loops' one `unsafe` block. A wait's signalled slots come back by value, where a caller-sized
+  buffer was checked by a `debug_assert!` alone.
+- **A site that lets go of references under SCHED declares a `Deferred<N>`** and locks through
+  it. The guard borrows the bag, so the compiler keeps the bag declared first and dropped last.
+  - None of the eleven hand-carried releases is left.
+  - The one place a refused value is forgotten is `reserve_exhausted`. `push_reserved`, a wake's
+    `place_woken`, the bag and the held-send queue all end through it.
+  - `ObjectRef::drop` asserts no SCHED on every drop in every debug build. A boot with one clone
+    dropped under SCHED fails `test-qemu`.
+- **`switch_away(guard, Outgoing, Park)`** replaces the five tails. Only taking this CPU's
+  `current` makes an `Outgoing`, `park` is host-tested once per `Park`, and one `unsafe` switch
+  call is left.
+- **A deadline's target is an enum** carrying each kind's addresses.
+
+`unsafe` blocks fall from 931 to 915. Three things differ from the plan:
+- **A bag for interrupt context is declared so by its site**, `Deferred::in_interrupt`, no larger,
+  at compile time, than `deferred_drops`' reserve, whose room for every such bag at once rests on
+  the one site's lifetime total: nothing tells interrupt context at run time. The
+  tick's entropy wake, the one such site, takes its own hold, so the hold it switches with carries
+  no bag.
+- **A target's addresses are `usize`s**, as `idle_addr` is, which keeps the scheduler's state
+  `Send` without an `unsafe impl`.
+- **A held send's deadline is removed by its whole target, the endpoint too.** Nothing tested
+  that removal before; a test now drives a delivery and a close, and naming the other endpoint
+  fails it.
+
 ### J.5 Typed scheduler calls (kobj-o7, with sched-o2 and drv-o8; sched-o8)
 
 Measured: **31 `unsafe fn` entry points** in `sched/` take a raw object, a `*mut ()` or, for the two

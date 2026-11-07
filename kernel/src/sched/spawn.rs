@@ -179,18 +179,20 @@ fn spawn_inner(
         Thread::set_cpu_mask(obj, cpu_mask);
     }
 
-    let leftover = {
-        let mut g = SCHED.lock();
-        // `place_thread` refuses rather than grow under the rank-1 lock, handing `r` back so
-        // it drops below, lock-free.
-        match place_thread(&mut g, r, false) {
-            Ok(()) => return Ok(tid),
-            Err(returned) => returned, // carry out of the locked block
-        }
-    };
-    // Lock released: `leftover` drops here, freeing the kernel stack off the rank-1 lock.
-    drop(leftover);
-    Err(AllocError)
+    enqueue(r, |g, r| place_thread(g, r, false)).map(|()| tid)
+}
+
+/// Place `r`, a thread just made, with `place`, which refuses rather than grow under the rank-1
+/// lock: a refused thread drops with the bag, its last reference, freeing its kernel stack off the
+/// lock.
+fn enqueue(r: ObjectRef, place: fn(&mut SchedState, ObjectRef) -> Result<(), ObjectRef>) -> Result<(), AllocError> {
+    let mut bag = Deferred::<1>::new();
+    let mut g = bag.lock();
+    if let Err(refused) = place(&mut g, r) {
+        g.defer(refused);
+        return Err(AllocError);
+    }
+    Ok(())
 }
 
 /// Create a **user** thread for `process` that descends to ring 3 at `entry` with stack
@@ -247,17 +249,7 @@ pub fn make_user_sched(
 
 /// Enqueue a thread [`make_user_sched`] made.
 pub fn start_user(r: ObjectRef) -> Result<(), AllocError> {
-    let leftover = {
-        let mut g = SCHED.lock();
-        match place_spawned(&mut g, r) {
-            Ok(()) => return Ok(()),
-            Err(returned) => returned, // carry out of the locked block
-        }
-    };
-    // Over capacity: lock released; `leftover` drops here, freeing the stack and releasing the
-    // Process off the rank-1 lock.
-    drop(leftover);
-    Err(AllocError)
+    enqueue(r, place_spawned)
 }
 
 /// Place `r`, a thread just made for a process, marking it first if the process has begun to exit:

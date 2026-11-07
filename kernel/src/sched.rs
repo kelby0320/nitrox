@@ -1,15 +1,15 @@
 //! Preemptive round-robin scheduler for kernel and user threads, with per-CPU run queues.
 //!
 //! A thread runs until it calls [`yield_now`]/[`exit`] (the **cooperative** path) or the timer
-//! IRQ's [`on_timer_tick`] expires its quantum (the **preemptive** path). Both funnel through
-//! [`switch_to_next`] over [`context_switch`](crate::arch::context_switch) and the [`Thread`]
-//! kernel object. An [idle thread](idle_body) runs (`hlt`) whenever nothing else is ready.
+//! IRQ's [`on_timer_tick`] expires its quantum (the **preemptive** path). Both, as every switch
+//! does, funnel through [`switch_away`] over [`context_switch`](crate::arch::context_switch) and
+//! the [`Thread`] kernel object. An [idle thread](idle_body) runs (`hlt`) whenever nothing else is ready.
 //!
 //! ## Blocking and deadlines (wait queues)
 //!
 //! In `sys_wait`, [`wait_on`] registers the thread as a waiter on each target object and
-//! (optionally) on the deadline min-heap ([`deadline`]), then [`block_current_and_switch`]
-//! parks it in [`SchedState::blocked`]. A waker calls [`make_runnable`]. Deadlines are
+//! (optionally) on the deadline min-heap ([`deadline`]), then [`switch_away`] parks it in
+//! [`SchedState::blocked`]. A waker calls [`make_runnable`]. Deadlines are
 //! checked on the tick ([`on_timer_tick`] → [`fire_expired_deadlines`]) and waiters woken
 //! **directly** under `SCHED`, no DPC. Wait, timer and blocked state all live under the one
 //! rank-1 lock, so there is no lost-wakeup window (`kernel/docs/lock-ordering.md`).
@@ -53,14 +53,16 @@ use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX
 use crate::object::{
     BlockSendOutcome, FileObject, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,
     PendingOperation, Process, ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg, Thread, ThreadEntry,
-    ThreadState, Timer, TransferRef, UserspaceServerReg,
+    ThreadState, Timer, TransferRef, UserspaceServerReg, Waiters,
 };
 
 mod current;
+mod deferred;
 mod exit;
 mod ipc;
 mod objects;
 mod online;
+mod outgoing;
 mod placement;
 mod preempt;
 mod spawn;
@@ -68,10 +70,12 @@ mod timers;
 mod wait;
 
 pub use current::*;
+use deferred::{Deferred, Held};
 pub use exit::*;
 pub use ipc::*;
 pub use objects::*;
 pub use online::*;
+use outgoing::{Outgoing, take_current};
 use placement::*;
 pub use preempt::*;
 pub use spawn::*;
@@ -99,9 +103,10 @@ const QUANTUM_TICKS: u32 = 1;
 /// by object address (`SchedState::idle_addr`).
 const IDLE_TID: u32 = u32::MAX;
 
-/// Pre-reserved capacity for [`SchedState::deferred_drops`]. Sized to twice the only
-/// producer's burst (the entropy seed wake parks ≤ [`crate::entropy::SEED_WAITERS_MAX`]
-/// refs, once per boot); [`reap_pending`] drains it in thread context.
+/// Pre-reserved capacity for [`SchedState::deferred_drops`], which no bag an interrupt declares
+/// ([`Deferred::in_interrupt`]) may exceed. The bags share it, so what they hold at once is bounded
+/// by their sites' lifetime totals: the only one's, the entropy seed wake's, is
+/// ≤ [`crate::entropy::SEED_WAITERS_MAX`] refs a boot, half of it. [`reap_pending`] drains it.
 const DEFERRED_DROP_RESERVE: usize = 2 * crate::entropy::SEED_WAITERS_MAX;
 /// Handle tables the [reaper](reaper_body) has closed, reported as `reaper_closed=` in
 /// `/proc/sched/stats`. Exposed because the failure mode is **silence**: a reaper that
@@ -172,15 +177,22 @@ const _: () = assert!(
      no unwinder — if this fires, a target spec has dropped panic-strategy: abort"
 );
 
-/// Push onto a list held under `SCHED` that is sized so it cannot be full: a full one is a sizing
-/// bug, which ends the machine with a message naming the list. **The value is `forget`ten rather
-/// than dropped**: an `ObjectRef` drop reaches `dispatch_destroy` → `SlabCache::free`, a plain
-/// spinlock, under the rank-1 IRQ-acquired lock.
+/// End the machine over `what`, a list or bag sized so it cannot be full, which was: a sizing bug.
+/// **`held`, the value it refused, is `forget`ten rather than dropped**: an `ObjectRef` drop
+/// reaches `dispatch_destroy` → `SlabCache::free`, a plain spinlock, under the rank-1
+/// IRQ-acquired lock, and would spin there instead of reporting.
 #[track_caller]
-fn push_reserved<T>(list: &mut Reserved<T>, val: T, what: &str) {
+pub(crate) fn reserve_exhausted<T>(held: T, what: &str) -> ! {
+    core::mem::forget(held);
+    panic!("{what}: reserve exhausted — it is sized so that cannot happen");
+}
+
+/// Push onto a list held under `SCHED` that is sized so it cannot be full; a full one ends the
+/// machine ([`reserve_exhausted`]).
+#[track_caller]
+pub(crate) fn push_reserved<T>(list: &mut Reserved<T>, val: T, what: &str) {
     if let Err(returned) = list.push(val) {
-        core::mem::forget(returned);
-        panic!("{what}: reserve exhausted — this list is sized so that cannot happen");
+        reserve_exhausted(returned, what);
     }
 }
 
@@ -254,12 +266,11 @@ struct SchedState {
     deadline_slots: [usize; 3],
     /// **Per-CPU** event counters, incremented at sites that all hold this lock.
     stats: [stats::Counters; MAX_CPUS],
-    /// `ObjectRef`s parked for a **thread-context** drop by [`reap_pending`]: refs a
-    /// lock-held or IRQ-context path must release but may not drop in place, because a drop
-    /// can reach the plain-spinlock allocator — never legal under this IRQ-acquired lock
-    /// (cross-CPU deadlock) or in IRQ context (self-deadlock against an interrupted
-    /// allocator holder). Producers *move* refs in within the reserve (see
-    /// [`DEFERRED_DROP_RESERVE`]); the only one is [`wake_entropy_seed_waiters`].
+    /// `ObjectRef`s parked for a **thread-context** drop by [`reap_pending`]: refs an
+    /// IRQ-context path must release but may not drop at all, because a drop can reach the
+    /// plain-spinlock allocator — never legal in IRQ context (self-deadlock against an
+    /// interrupted allocator holder), as under this lock (cross-CPU deadlock). An interrupt's
+    /// [`Deferred`] *moves* its refs in, within the reserve (see [`DEFERRED_DROP_RESERVE`]).
     deferred_drops: Reserved<ObjectRef>,
     /// Processes whose last thread has exited and whose **handle table** still needs
     /// closing. Pushed by [`end_process_if_last`] under `SCHED`; drained by the
@@ -389,12 +400,13 @@ pub fn yield_now() {
 /// On quantum expiry it reschedules round-robin via [`switch_to_next`] if another thread is
 /// ready.
 pub fn on_timer_tick() {
+    // Its own hold, with the bag the switch below may not carry.
+    wake_entropy_seed_waiters();
     let mut g = SCHED.lock();
     // Fire elapsed deadlines FIRST, so a just-woken thread is in `ready` and the
     // reschedule below can pick it: direct wakeup, no DPC (see the module docs).
     let now = crate::arch::Timer::read_ns();
     fire_expired_deadlines(&mut g, now);
-    wake_entropy_seed_waiters(&mut g);
     // Charge this CPU's running TimeShared thread a nice-weighted tick of vruntime.
     accrue_vruntime(&mut g);
     let me = SchedState::this_cpu();
@@ -507,39 +519,82 @@ unsafe fn arm_kernel_stack_for(obj: *mut ()) {
     }
 }
 
-/// The common context-switch tail shared by every voluntary/involuntary switch:
-/// [`block_current_and_switch`], [`switch_to_next`], [`finish_exit`], and
-/// [`suspend_with_fault`]. The caller must have already re-homed the outgoing thread (onto
-/// `ready` / `blocked` / `suspended` / `reap`), set the incoming thread's state to
-/// `Running`, and installed it as `current`, all under the held `SCHED` guard `g`. This
-/// consumes `g`.
-///
-/// `out_slot` is the outgoing thread's saved-SP slot (where the switch stashes its kernel
-/// RSP); `next_obj` is the pinned incoming thread just made current.
-///
-/// It drops the lock keeping interrupts masked (see the module docs and
-/// [`release_keeping_irqs_masked`](IrqSpinLockGuard::release_keeping_irqs_masked)),
-/// re-arms the incoming thread's trap/syscall kernel stack, loads its page-table root
-/// **before** switching away (so a dying thread's CR3 is off its soon-to-be-freed root),
-/// and performs the stack switch. On a resuming caller, control returns here and its own
-/// captured interrupt state is restored; a terminal caller ([`finish_exit`]) never
-/// switches back.
-///
-/// Factoring this once means the four parking dispositions cannot drift apart — a
-/// divergence (e.g. forgetting `arm_kernel_stack_for` or the CR3 load on one path) would be
-/// a latent `#DF`/corruption bug.
+/// Where [`switch_away`] puts the thread it switches from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Park {
+    /// This CPU's run queue, or the idle slot for the idle thread: a yield or a tick.
+    Ready,
+    /// `blocked`, for a waker's [`make_runnable`].
+    Blocked,
+    /// `suspended`, after a ring-3 fault, for `sys_exception_resume`.
+    Suspended,
+    /// This CPU's reap list, never to run again.
+    Exited,
+    /// The reaper's slot, for [`wake_reaper`] alone.
+    Reaper,
+}
+
+/// Give `prev` the state `to` means and put it on that list. Caller holds `SCHED`.
+fn park(g: &mut SchedState, prev: Outgoing, to: Park) {
+    let obj = prev.as_ptr();
+    let idle = g.idle_addr() == obj as usize;
+    debug_assert!(!idle || to == Park::Ready, "the idle thread only ever yields");
+    let state = match to {
+        Park::Ready => ThreadState::Ready,
+        Park::Blocked | Park::Reaper => ThreadState::Blocked,
+        Park::Suspended => ThreadState::Suspended,
+        Park::Exited => ThreadState::Exited,
+    };
+    // SAFETY: `prev` pins the thread; `SCHED` held.
+    unsafe { Thread::set_state(obj, state) };
+    let r = prev.into_ref();
+    match to {
+        Park::Ready if idle => {
+            debug_assert!(g.idle_slot().is_none());
+            *g.idle_slot() = Some(r);
+        }
+        Park::Ready => push_reserved(g.ready_slot(), r, "run queue (switch-out)"),
+        Park::Blocked => push_reserved(&mut g.blocked, r, "blocked list"),
+        Park::Suspended => push_reserved(&mut g.suspended, r, "suspended list"),
+        Park::Exited => push_reserved(g.reap_slot(), r, "reap list (self)"),
+        Park::Reaper => {
+            debug_assert!(g.reaper.is_none());
+            g.reaper = Some(r);
+        }
+    }
+}
+
+/// Switch this CPU from `prev`, parked as `to`, to the next ready thread, else its idle thread.
+/// Consumes the plain guard, so no bag of drops crosses a switch. Returns when `prev` next runs;
+/// one parked [`Park::Exited`] never does.
+fn switch_away(mut g: IrqSpinLockGuard<'_, SchedState>, prev: Outgoing, to: Park) {
+    // Picked before `prev` is parked, so a yield goes behind the others on its queue.
+    let next = match pick_next(&mut g) {
+        Some(n) => n,
+        None => g.idle_slot().take().expect("a runnable thread (ready or idle)"),
+    };
+    let (prev_obj, next_obj) = (prev.as_ptr(), next.as_ptr());
+    park(&mut g, prev, to);
+    // SAFETY: `next` is pinned, becoming current; `SCHED` held.
+    unsafe { Thread::set_state(next_obj, ThreadState::Running) };
+    *g.cur_slot() = Some(next);
+    // SAFETY: `prev_obj` is the thread this CPU runs, an `Outgoing` being only ever that, now
+    // pinned by the list `park` put it on; `next_obj` is pinned by `current`; `SCHED` held.
+    unsafe { switch_into(g, prev_obj, next_obj) };
+}
+
+/// The switch itself, for [`switch_away`]. It drops the lock keeping interrupts masked (see the
+/// module docs and [`release_keeping_irqs_masked`](IrqSpinLockGuard::release_keeping_irqs_masked)),
+/// re-arms the incoming thread's trap/syscall kernel stack, loads its page-table root **before**
+/// switching away (so a dying thread's CR3 is off its soon-to-be-freed root), and performs the
+/// stack switch, saving the outgoing thread's kernel RSP in its own slot. On a resuming caller,
+/// control returns here and its own captured interrupt state is restored.
 ///
 /// # Safety
-/// `out_slot` must be the saved-SP slot of the (pinned) outgoing thread and
-/// `next_obj` the pinned incoming thread the caller just made `current`, both
-/// under the `SCHED` hold being released here. Single-CPU: nothing else
-/// touches either thread's saved SP across the switch.
-unsafe fn switch_into(
-    mut g: IrqSpinLockGuard<'_, SchedState>,
-    out_slot: *mut u64,
-    out_obj: *mut (),
-    next_obj: *mut (),
-) {
+/// `out_obj` is the pinned thread this CPU is running, and `next_obj` the pinned incoming thread
+/// just made `current`, both under the `SCHED` hold being released here. Single-CPU: nothing
+/// else touches either thread's saved SP across the switch.
+unsafe fn switch_into(mut g: IrqSpinLockGuard<'_, SchedState>, out_obj: *mut (), next_obj: *mut ()) {
     g.stats[SchedState::this_cpu()].switches += 1;
     // Sample the **outgoing** thread's kernel-stack high-water mark. Every thread that runs
     // passes through here, including servers that spend their lives blocked and so never
@@ -636,6 +691,8 @@ unsafe fn switch_into(
             crate::arch::fpu_restore(next_fpu);
         }
     }
+    // SAFETY: the outgoing thread is pinned (the contract); its saved-SP slot.
+    let out_slot = unsafe { Thread::saved_sp_mut_ptr(out_obj) };
     // SAFETY: lock released; interrupts masked; `out_slot` points into the
     // outgoing thread (pinned) and `next_sp` is the saved RSP of the now-current
     // thread (pinned). `out_on_cpu` is the outgoing thread's guard byte, cleared
@@ -643,8 +700,8 @@ unsafe fn switch_into(
     unsafe { context_switch(out_slot, next_sp, out_on_cpu) };
     // Resumed (cooperative path): restore the interrupt state this thread had on entry. On
     // the preemptive path the resume returns into the timer-stub epilogue (which `iretq`s IF
-    // back) and `saved_if` is false, so this is a redundant `cli`. A terminal caller
-    // (`finish_exit`) never reaches this.
+    // back) and `saved_if` is false, so this is a redundant `cli`. An exited thread never
+    // reaches this.
     // SAFETY: ring-0; restoring this thread's own captured interrupt state.
     unsafe { Cpu::interrupts_restore(saved_if) };
 }
@@ -660,49 +717,17 @@ fn tick_quantum(quantum: u32, ready_nonempty: bool) -> (u32, bool) {
     if q == 0 { (QUANTUM_TICKS, ready_nonempty) } else { (q, false) }
 }
 
-/// The shared switch core used by [`yield_now`] and [`on_timer_tick`]: the outgoing
-/// `current` is re-homed (re-enqueued, or re-parked if it is the idle thread) and the next
-/// thread (front of `ready`, else the idle thread) becomes current. Consumes the guard.
+/// Yield this CPU's running thread to the next, as [`yield_now`] and [`on_timer_tick`] do: it
+/// goes back on this CPU's queue (movement happens only via placement and stealing). Callers
+/// ensure there is something else to run. Consumes the guard.
 ///
-/// Callers ensure there is something else to run. Reusing
-/// [`context_switch`](crate::arch::context_switch) is sound from the preemptive path too:
-/// the interrupted thread's full register frame is already on its kernel stack (pushed by
-/// the timer stub) *below* the callee-saved frame this switch parks, so on resume it
-/// returns up into the timer-stub epilogue, which `iretq`s the original context back.
+/// Reusing [`context_switch`](crate::arch::context_switch) is sound from the preemptive path
+/// too: the interrupted thread's full register frame is already on its kernel stack (pushed by
+/// the timer stub) *below* the callee-saved frame this switch parks, so on resume it returns up
+/// into the timer-stub epilogue, which `iretq`s the original context back.
 fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
-    let next = match pick_next(&mut g) {
-        Some(n) => n,
-        // Only reachable if a caller violates the precondition; idle is the safe fallback
-        // when it is parked.
-        None => g.idle_slot().take().expect("a runnable thread (ready or idle)"),
-    };
-    let prev = g.cur_slot().take().expect("current set after init");
-    let prev_obj = prev.as_ptr();
-    let next_obj = next.as_ptr();
-    // SAFETY: both pinned alive (prev re-homed, next becoming current) and we
-    // hold the run-queue lock — the Thread accessor contract.
-    unsafe {
-        Thread::set_state(prev_obj, ThreadState::Ready);
-        Thread::set_state(next_obj, ThreadState::Running);
-    }
-    // SAFETY: as above.
-    let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
-
-    // Re-home prev: the idle thread parks in its slot (never in `ready`); every other
-    // thread re-enqueues on **this CPU's** queue (movement happens only via
-    // placement/stealing).
-    if g.idle_addr() == prev_obj as usize {
-        debug_assert!(g.idle_slot().is_none());
-        *g.idle_slot() = Some(prev);
-    } else {
-        push_reserved(g.ready_slot(), prev, "run queue (switch-out)");
-    }
-    *g.cur_slot() = Some(next);
-
-    // SAFETY: `prev_slot` is the re-homed outgoing (now-`Ready`, pinned)
-    // thread's saved-SP slot; `prev_obj`/`next_obj` are the pinned outgoing /
-    // incoming threads.
-    unsafe { switch_into(g, prev_slot, prev_obj, next_obj) };
+    let prev = take_current(&mut g);
+    switch_away(g, prev, Park::Ready);
 }
 
 /// `true` when no thread other than the current one is ready to run.

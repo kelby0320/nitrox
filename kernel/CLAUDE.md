@@ -87,7 +87,9 @@ This is intentional — strict equality matching prevents subtle ABI mismatches.
 - `unwrap()` outside of tests or known-impossible cases (with `// unwrap: <reason>` comment).
 - Allocating in the IRQ handler or DPC — and **freeing counts as allocating**:
   an `ObjectRef` drop can reach the allocator locks, so no drops there (or under
-  `SCHED`) either; park refs in `sched`'s `deferred_drops` instead. Two documented
+  `SCHED`, which debug builds assert on every drop) either. A `SCHED` hold lets go of
+  references through a `Deferred<N>` bag (`kernel/src/sched/deferred.rs`), dropped after the
+  lock; an interrupt's bag parks them in `deferred_drops`. Two documented
   exceptions, both reached only from ring 3, where nothing is held: the `#PF`
   fault-in path (`map_page` may allocate intermediate page-table frames —
   `kernel/docs/lock-ordering.md` § The AddressSpace lock), and a thread ending

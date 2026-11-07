@@ -4,30 +4,29 @@ use super::*;
 
 /// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the unseeded
 /// `sys_entropy_read` path), gated by a lock-free check so the common case costs one atomic
-/// load. Caller holds `SCHED`.
-///
-/// The entropy subsystem owns the waiter refs; we move them out, signal each, and **park
-/// them in [`SchedState::deferred_drops`]** for [`reap_pending`] to drop in thread context.
-/// They must not drop here: an `ObjectRef` drop can reach the plain-spinlock allocator,
-/// which may neither run under the IRQ-acquired `SCHED` lock (a cross-CPU deadlock against
-/// an allocator holder whose own tick spins on `SCHED`) nor in this tick's IRQ context (a
-/// same-CPU self-deadlock against an allocator holder it interrupted). See
-/// `kernel/docs/lock-ordering.md`.
-pub(super) fn wake_entropy_seed_waiters(g: &mut SchedState) {
-    if !crate::entropy::seed_wake_pending() {
+/// load. From the tick.
+pub(super) fn wake_entropy_seed_waiters() {
+    if crate::entropy::seed_wake_pending() {
+        wake_seed_waiters(crate::entropy::drain_seed_waiters);
+    }
+}
+
+/// Complete the seed waiters `drain` hands over. The entropy subsystem owns their refs, which
+/// move into an interrupt's bag, so they reach `deferred_drops` rather than drop here. Drained
+/// before `SCHED` is taken, so `ENTROPY` never nests in it. Bounded: waiters queue only pre-seed
+/// and the drain fires post-seed, so the lifetime total is ≤ `SEED_WAITERS_MAX`.
+pub(super) fn wake_seed_waiters(drain: impl FnOnce(&mut [Option<ObjectRef>]) -> usize) {
+    use crate::entropy::SEED_WAITERS_MAX;
+    let mut buf: [Option<ObjectRef>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
+    let n = drain(&mut buf);
+    if n == 0 {
         return;
     }
-    let mut buf: [Option<ObjectRef>; crate::entropy::SEED_WAITERS_MAX] =
-        [const { None }; crate::entropy::SEED_WAITERS_MAX];
-    let n = crate::entropy::drain_seed_waiters(&mut buf);
-    for slot in buf[..n].iter_mut() {
-        if let Some(po) = slot.take() {
-            signal_pending_op_with_result(g, po.as_ptr(), 0, 0);
-            // A move within the reserve — no drop, no allocation under the lock. Bounded:
-            // waiters queue only pre-seed and the drain fires post-seed, so the lifetime
-            // total is ≤ SEED_WAITERS_MAX (< the reserve).
-            push_reserved(&mut g.deferred_drops, po, "deferred-drop list");
-        }
+    let mut bag = Deferred::<SEED_WAITERS_MAX>::in_interrupt();
+    let mut g = bag.lock();
+    for po in buf[..n].iter_mut().filter_map(Option::take) {
+        signal_pending_op_with_result(&mut g, po.as_ptr(), 0, 0);
+        g.defer(po);
     }
 }
 
@@ -41,30 +40,29 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
             break;
         }
         deadline::pop_min(&mut g.deadlines);
-        match top.kind {
-            deadline::DeadlineKind::Thread => {
+        match top.target {
+            deadline::Target::Thread(th) => {
                 // A `sys_wait` deadline: wake the waiting thread directly.
-                let th = top.target as *mut ();
+                let th = th as *mut ();
                 // SAFETY: a heaped thread-deadline names a thread blocked in
                 // `wait_on`, pinned in `blocked`; `SCHED` held.
                 if unsafe { Thread::wait_try_wake(th) } {
                     make_runnable(g, th);
                 }
             }
-            deadline::DeadlineKind::Timer => {
-                let timer = top.target as *mut ();
+            deadline::Target::Timer(timer) => {
+                let timer = timer as *mut ();
                 // SAFETY: a heaped timer is whole: `timer_closing` removes its entry
                 // under `SCHED` before the memory goes; `SCHED` held.
                 unsafe { Timer::set_in_heap(timer, false) };
                 fire_timer(g, timer, now);
             }
-            deadline::DeadlineKind::PendingSend => {
+            deadline::Target::PendingSend { po, channel } => {
                 // A `BlockBounded` send's delivery deadline elapsed: cancel the held send
                 // and complete its `PendingOperation` with `TimedOut`. No `ObjectRef` drop
                 // here (`SCHED` held — a transferred object's `Drop` could take the buddy
                 // lock); the message + refs are reclaimed on the next recv / at close.
-                let channel = top.channel as *mut ();
-                let po = top.target as *mut ();
+                let (po, channel) = (po as *mut (), channel as *mut ());
                 // SAFETY: `channel` is still open — `ipc_endpoint_closing`
                 // removes its held sends' deadline entries, so a fired
                 // pending-send deadline always names a live endpoint; `SCHED`
@@ -81,17 +79,7 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
 fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
     // SAFETY: live Timer, `SCHED` held — drains its waiter list.
     let waiters = unsafe { Timer::take_waiters(timer) };
-    for &th in waiters.iter() {
-        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
-        // `blocked`; `SCHED` held. Mark this timer's slot signaled, then claim
-        // the thread for wakeup (CAS); the first claimer makes it runnable.
-        unsafe {
-            Thread::wait_mark_signaled(th, timer as usize);
-            if Thread::wait_try_wake(th) {
-                make_runnable(g, th);
-            }
-        }
-    }
+    wake_all(g, waiters, timer);
     // SAFETY: live Timer, `SCHED` held.
     let interval = unsafe { Timer::interval(timer) };
     // A one-shot keeps its passed deadline, out of the heap, so a wait that arrives after this
@@ -106,12 +94,7 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
         // Re-push into the slot the timer holds (its entry was just popped).
         let _ = deadline::push_promised(
             g,
-            deadline::Entry {
-                deadline_ns: next,
-                target: timer as usize,
-                kind: deadline::DeadlineKind::Timer,
-                channel: 0,
-            },
+            deadline::Entry { deadline_ns: next, target: deadline::Target::Timer(timer as usize) },
         );
     }
 }
@@ -133,7 +116,7 @@ pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> R
     if deadline_ns != 0 {
         if deadline::push_promised(
             &mut g,
-            deadline::Entry { deadline_ns, target: timer as usize, kind: deadline::DeadlineKind::Timer, channel: 0 },
+            deadline::Entry { deadline_ns, target: deadline::Target::Timer(timer as usize) },
         )
         .is_err()
         {
@@ -167,7 +150,7 @@ pub unsafe fn timer_closing(timer: *mut ()) {
 unsafe fn unheap(g: &mut SchedState, timer: *mut ()) {
     // SAFETY: the caller's contract.
     if unsafe { Timer::in_heap(timer) } {
-        deadline::remove(&mut g.deadlines, timer as usize, deadline::DeadlineKind::Timer);
+        deadline::remove(&mut g.deadlines, deadline::Target::Timer(timer as usize));
         // SAFETY: as above.
         unsafe { Timer::set_in_heap(timer, false) };
     }

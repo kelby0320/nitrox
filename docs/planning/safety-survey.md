@@ -1053,7 +1053,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   waiters and the DPC queue `ArrayVec`s; `Reserved`'s and `ArrayVec`'s tests, the latter under Miri
   with strict provenance.
 
-- [ ] **sched-o6** encapsulate: five waitable objects each keep `waiters: KVec<*mut ()>` reserved to
+- [x] **sched-o6** encapsulate: five waitable objects each keep `waiters: KVec<*mut ()>` reserved to
   `MAX_WAITERS` = 4 and repeat `add_waiter`/`remove_waiter`/`take_waiters(obj, out: &mut [*mut ()])`
   (the out buffer is caller-sized, checked by `debug_assert!(out.len() >= n)` only), and sched
   repeats the take, `mark_signaled`, `try_wake`, `make_runnable` loop five times — 20-25 sites
@@ -1073,6 +1073,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `take_waiters` (a panic in IRQ/DPC context under SCHED), growth under SCHED through a waiter push,
   and drift among the five wake loops. Depends on: nothing (composes with sched-o1). abi, soundness,
   opportunities. Value medium, effort small. **Plan**, in P1.
+  Done in `aa4aa395`: `WaitQueue::take` answers a `Waiters<N>` only it makes, the five wake loops are
+  one `wake_all`, and `Thread::wait_signaled` returns a wait's slots by value. The tests holding
+  the wake paths pass before and after.
 
 - [ ] **sched-o7** encapsulate: uncounted back-pointers (`IpcChannel.peer`, `IpcChannel.us_reg`) that
   the target's Drop clears under SCHED are followed raw, and `ipc_endpoint_closing` reads a magic
@@ -1107,7 +1110,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   gone. Depends on: nothing (made safe internally by sched-o2's `downcast_ref`). opportunities.
   Value medium, effort small. **Plan**, in P1.
 
-- [ ] **sched-o9** encapsulate: ObjectRefs that a SCHED-held path must release are carried out of
+- [x] **sched-o9** encapsulate: ObjectRefs that a SCHED-held path must release are carried out of
   the locked block by hand (`drop(g); drop(x)`, `Err(returned) => returned`, orphans arrays dropped
   after release, `mem::forget` before a panic, a move into `deferred_drops`), each relying on the
   author remembering that a drop under the rank-1 lock reaches the allocator spinlock — 11 sites
@@ -1124,8 +1127,14 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   the allocator, the cross-CPU deadlock `make_runnable`'s comment describes, and the reason
   `deferred_drops` exists. Depends on: nothing. ownership. Value medium, effort medium.
   **Plan**, in P1.
+  Done in `aa4aa395`: a `Deferred<N>` bag, borrowed by the `SCHED` guard it locks, drops what a hold
+  defers once the lock is released, or in interrupt context moves it to `deferred_drops`. None of
+  the eleven hand-carried releases is left, and `reserve_exhausted` is the one place a refused value
+  is forgotten. `ObjectRef::drop` asserts no `SCHED` in every debug build. Fails without it: a drop
+  under `SCHED`, a bag dropping under its hold, an interrupt's bag not moved, a bag past its size,
+  each a host test.
 
-- [ ] **sched-o10** encapsulate: the switch-away tail is written out five times — pick next or fall
+- [x] **sched-o10** encapsulate: the switch-away tail is written out five times — pick next or fall
   back to idle, take current, set both states, take the saved-SP slot, park prev on a list, install
   next, then `unsafe { switch_into(g, slot, prev, next) }`; `switch_into`'s doc says "four parking
   dispositions" and names four callers, and `park_reaper` is a fifth — 5 sites
@@ -1144,8 +1153,12 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (`park_reaper` sets Blocked but parks in the reaper slot) or passes an outgoing slot belonging to a
   different thread; it leaves a single unsafe switch call. Depends on: nothing. opportunities. Value
   medium, effort small. **Plan**, in P1.
+  Done in `aa4aa395`: one `switch_away(guard, Outgoing, Park)` for the five tails, the outgoing thread
+  only ever `current`'s, `park` host-tested once per `Park`, and `switch_into` taking the slot from
+  the thread. The reaper's state is still `Blocked`, named once now, as `Park::Reaper`'s: no other
+  state fits a thread one waker wakes.
 
-- [ ] **sched-o11** narrow: deadline-heap entries carry their targets as bare `usize` (`target`,
+- [x] **sched-o11** narrow: deadline-heap entries carry their targets as bare `usize` (`target`,
   `channel`, 0 when unused) beside a separate `DeadlineKind`, cast back to `*mut ()` by kind at fire
   time and matched by `(usize, kind)` on removal — 11-12 sites (`grep -rn 'deadline::Entry
   {\|deadline::remove(\|DeadlineKind::\(Thread\|Timer\|PendingSend\) =>' kernel/src/sched.rs kernel/src/sched/*.rs | grep -v tests`
@@ -1158,6 +1171,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   free). In `kernel/src/sched/deadline.rs`. Closes: a target read as the wrong kind (a Timer address
   read as a thread) and a PendingSend entry with no channel. Depends on: nothing. abi,
   opportunities. Value low, effort small. **Plan**, in P1.
+  Done in `aa4aa395`: `deadline::Target`, `Thread`, `Timer` or `PendingSend { po, channel }`, the
+  addresses `usize`s so the state stays `Send`, removed by the whole target. A held send's deadline
+  is pinned, at its delivery and at its endpoint's close.
 
 What held up: the `on_cpu` handoff in `switch_into` and `context_switch` (guard raised under SCHED,
 cleared only after the `saved_sp` store, spun on before `saved_sp` and the FPU image are read), the

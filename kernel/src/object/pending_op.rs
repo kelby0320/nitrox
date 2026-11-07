@@ -17,10 +17,10 @@
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::Rights;
-use crate::libkern::{AllocError, ArrayVec, KBox};
+use crate::libkern::{AllocError, KBox};
 use crate::object::ObjectRef;
-use crate::object::WaitQueue;
 use crate::object::header::{Header, Shared, kobject};
+use crate::object::{WaitQueue, Waiters};
 
 /// A pending-operation kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
@@ -215,7 +215,7 @@ impl PendingOperation {
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> ArrayVec<*mut (), { PendingOperation::MAX_WAITERS }> {
+    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ PendingOperation::MAX_WAITERS }> {
         // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         inner.waiters.take()

@@ -23,12 +23,13 @@ fn heap_peek_is_min_and_remove_targets() {
     deadline::push(&mut h, entry(30, 0xC)).unwrap();
     deadline::push(&mut h, entry(10, 0xA)).unwrap();
     deadline::push(&mut h, entry(20, 0xB)).unwrap();
-    assert_eq!(deadline::peek(&h).unwrap().target, 0xA);
-    assert!(deadline::remove(&mut h, 0xB, deadline::DeadlineKind::Timer));
-    assert!(!deadline::remove(&mut h, 0xB, deadline::DeadlineKind::Timer)); // gone
-    assert!(!deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Thread)); // wrong kind
-    assert_eq!(deadline::pop_min(&mut h).unwrap().target, 0xA);
-    assert_eq!(deadline::pop_min(&mut h).unwrap().target, 0xC);
+    let timer = deadline::Target::Timer;
+    assert_eq!(deadline::peek(&h).unwrap().target, timer(0xA));
+    assert!(deadline::remove(&mut h, timer(0xB)));
+    assert!(!deadline::remove(&mut h, timer(0xB))); // gone
+    assert!(!deadline::remove(&mut h, deadline::Target::Thread(0xA))); // wrong kind
+    assert_eq!(deadline::pop_min(&mut h).unwrap().target, timer(0xA));
+    assert_eq!(deadline::pop_min(&mut h).unwrap().target, timer(0xC));
     assert!(deadline::pop_min(&mut h).is_none());
 }
 
@@ -36,23 +37,18 @@ fn heap_peek_is_min_and_remove_targets() {
 fn heap_remove_distinguishes_kind_for_same_target() {
     init_global_heap();
     let mut h = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
-    // The same `target` can hold entries of different kinds, each removable by `(target, kind)`.
-    deadline::push(
-        &mut h,
-        deadline::Entry { deadline_ns: 10, target: 0xA, kind: deadline::DeadlineKind::Thread, channel: 0 },
-    )
-    .unwrap();
-    deadline::push(
-        &mut h,
-        deadline::Entry { deadline_ns: 20, target: 0xA, kind: deadline::DeadlineKind::PendingSend, channel: 0xBEEF },
-    )
-    .unwrap();
-    assert!(!deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Timer));
-    assert!(deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Thread));
-    let e = deadline::peek(&h).unwrap();
-    assert_eq!(e.kind, deadline::DeadlineKind::PendingSend);
-    assert_eq!(e.channel, 0xBEEF);
-    assert!(deadline::remove(&mut h, 0xA, deadline::DeadlineKind::PendingSend));
+    // The same address can be the target of entries of different kinds, each removed by its own.
+    let held = deadline::Target::PendingSend { po: 0xA, channel: 0xBEEF };
+    deadline::push(&mut h, deadline::Entry { deadline_ns: 10, target: deadline::Target::Thread(0xA) }).unwrap();
+    deadline::push(&mut h, deadline::Entry { deadline_ns: 20, target: held }).unwrap();
+    assert!(!deadline::remove(&mut h, deadline::Target::Timer(0xA)));
+    assert!(deadline::remove(&mut h, deadline::Target::Thread(0xA)));
+    assert_eq!(deadline::peek(&h).unwrap().target, held);
+    assert!(
+        !deadline::remove(&mut h, deadline::Target::PendingSend { po: 0xA, channel: 0xC0DE }),
+        "another endpoint's"
+    );
+    assert!(deadline::remove(&mut h, held));
     assert!(deadline::peek(&h).is_none());
 }
 
@@ -78,7 +74,7 @@ fn removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap
         deadline::push(&mut h, entry(d, i)).unwrap();
     }
     // Removing 11 moves 7 under 10, which it must rise above.
-    assert!(deadline::remove(&mut h, 3, deadline::DeadlineKind::Timer));
+    assert!(deadline::remove(&mut h, deadline::Target::Timer(3)));
     for i in 1..h.len() {
         assert!(h[(i - 1) / 2].deadline_ns <= h[i].deadline_ns, "{:?}", h.iter().map(|e| e.deadline_ns));
     }
@@ -159,7 +155,7 @@ fn reserve_global_deadlines() {
 }
 
 fn global_heap_names(timer: *mut ()) -> bool {
-    SCHED.lock().deadlines.iter().any(|e| e.target == timer as usize && e.kind == deadline::DeadlineKind::Timer)
+    SCHED.lock().deadlines.iter().any(|e| e.target == deadline::Target::Timer(timer as usize))
 }
 
 /// The one test that arms timers on the global heap, so no other can reuse a freed timer's

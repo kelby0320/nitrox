@@ -103,17 +103,17 @@ pub unsafe fn request_terminate(process: *mut ()) -> bool {
     true
 }
 
-/// Wake every thread blocked on `channel` (its queue just went non-empty). Caller holds
-/// `SCHED`. No allocation, no blocking — safe from the fault path.
-pub(super) fn signal_channel(g: &mut SchedState, channel: *mut ()) -> bool {
-    // SAFETY: live channel, `SCHED` held — drains its waiter list.
-    let waiters = unsafe { NotificationChannel::take_waiters(channel) };
+/// Wake every thread in `waiters`, just taken from `target`'s queue: mark `target` signalled in
+/// each one's wait, and make runnable each that this wake is the first to claim. Whether any was.
+/// Caller holds `SCHED`. No allocation, no blocking — safe from the fault path and the tick.
+pub(super) fn wake_all<const N: usize>(g: &mut SchedState, waiters: Waiters<N>, target: *mut ()) -> bool {
     let mut woke = false;
     for &th in waiters.iter() {
-        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
-        // `blocked`; `SCHED` held.
+        // SAFETY: only a `WaitQueue` makes `Waiters`, and only `wait_on` adds to one: the
+        // current thread, parked in `blocked` until it removes itself under `SCHED`, which the
+        // caller holds; so each is a live, pinned thread.
         unsafe {
-            Thread::wait_mark_signaled(th, channel as usize);
+            Thread::wait_mark_signaled(th, target as usize);
             if Thread::wait_try_wake(th) {
                 make_runnable(g, th);
                 woke = true;
@@ -123,21 +123,20 @@ pub(super) fn signal_channel(g: &mut SchedState, channel: *mut ()) -> bool {
     woke
 }
 
+/// Wake every thread blocked on `channel` (its queue just went non-empty). Caller holds
+/// `SCHED`. No allocation, no blocking — safe from the fault path.
+pub(super) fn signal_channel(g: &mut SchedState, channel: *mut ()) -> bool {
+    // SAFETY: live channel, `SCHED` held — drains its waiter list.
+    let waiters = unsafe { NotificationChannel::take_waiters(channel) };
+    wake_all(g, waiters, channel)
+}
+
 /// Wake every thread blocked recv-ing on `endpoint` (a message just arrived in its inbox,
 /// or its peer just closed). Caller holds `SCHED`. No allocation, no blocking.
 pub(super) fn signal_ipc_endpoint(g: &mut SchedState, endpoint: *mut ()) {
     // SAFETY: live endpoint, `SCHED` held — drains its recv-waiter list.
     let waiters = unsafe { IpcChannel::take_waiters(endpoint) };
-    for &th in waiters.iter() {
-        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
-        // `blocked`; `SCHED` held.
-        unsafe {
-            Thread::wait_mark_signaled(th, endpoint as usize);
-            if Thread::wait_try_wake(th) {
-                make_runnable(g, th);
-            }
-        }
-    }
+    wake_all(g, waiters, endpoint);
 }
 
 /// Complete a [`PendingOperation`] with `status` and wake every thread blocked on it.
@@ -156,16 +155,7 @@ pub(super) fn signal_pending_op_with_result(g: &mut SchedState, po: *mut (), sta
     }
     // SAFETY: live PO, `SCHED` held — drains its waiter list.
     let waiters = unsafe { PendingOperation::take_waiters(po) };
-    for &th in waiters.iter() {
-        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
-        // `blocked`; `SCHED` held.
-        unsafe {
-            Thread::wait_mark_signaled(th, po as usize);
-            if Thread::wait_try_wake(th) {
-                make_runnable(g, th);
-            }
-        }
-    }
+    wake_all(g, waiters, po);
 }
 
 /// Read a completed [`PendingOperation`]'s `(status, result)` under one `SCHED` hold, for
@@ -264,21 +254,16 @@ pub unsafe fn complete_pending_op(po: *mut (), status: i32, result: u64) {
 ///
 /// `irq` points at a live `InterruptObject`, pinned for the call by a reference the caller holds.
 pub unsafe fn signal_interrupt(irq: *mut ()) {
-    let mut g = SCHED.lock();
+    signal_interrupt_in(&mut SCHED.lock(), irq);
+}
+
+/// [`signal_interrupt`] for a caller holding `SCHED`, `irq` a live `InterruptObject`.
+pub(super) fn signal_interrupt_in(g: &mut SchedState, irq: *mut ()) {
     // SAFETY: live `InterruptObject`, `SCHED` held — latches a pending interrupt.
     unsafe { InterruptObject::signal(irq) };
     // SAFETY: live object, `SCHED` held — drains its waiter list.
     let waiters = unsafe { InterruptObject::take_waiters(irq) };
-    for &th in waiters.iter() {
-        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
-        // `blocked`; `SCHED` held.
-        unsafe {
-            Thread::wait_mark_signaled(th, irq as usize);
-            if Thread::wait_try_wake(th) {
-                make_runnable(&mut g, th);
-            }
-        }
-    }
+    wake_all(g, waiters, irq);
 }
 
 /// Consume one pending interrupt on `irq` — called by `sys_wait` on returning for an

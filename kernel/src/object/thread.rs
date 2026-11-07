@@ -826,22 +826,17 @@ impl Thread {
         false
     }
 
-    /// Copy the per-slot `(object_addr, signaled)` pairs into `out` and return
-    /// the wait count. `out` must be at least `MAX_WAIT_HANDLES` long.
+    /// Which of this wait's slots were signalled, by slot; none past the wait's count.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn wait_snapshot(obj: *mut (), out: &mut [(usize, bool)]) -> usize {
+    pub(crate) unsafe fn wait_signaled(obj: *mut ()) -> [bool; MAX_WAIT_HANDLES] {
         let p = obj as *mut Thread;
+        let mut signaled = [false; MAX_WAIT_HANDLES];
         // SAFETY: live Thread, SCHED held.
-        unsafe {
-            let n = (*p).wait_count as usize;
-            debug_assert!(out.len() >= n);
-            for (i, o) in out.iter_mut().enumerate().take(n) {
-                *o = ((*p).wait_objs[i], (*p).wait_signaled[i]);
-            }
-            n
-        }
+        let (n, slots) = unsafe { ((*p).wait_count as usize, &(*p).wait_signaled) };
+        signaled[..n].copy_from_slice(&slots[..n]);
+        signaled
     }
 
     /// `true` iff this wait registered a finite deadline (heap entry to remove

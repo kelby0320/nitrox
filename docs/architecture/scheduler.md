@@ -305,7 +305,7 @@ because every event site already holds the rank-1 `SCHED` lock:
 
 | Counter | Incremented | Meaning |
 |---------|-------------|---------|
-| `switches` | `switch_into` (the common tail of all four parking dispositions) | context switches performed by this CPU |
+| `switches` | `switch_into`, under `switch_away`, whichever `Park` | context switches performed by this CPU |
 | `steals` | `steal_one` | threads this CPU stole from a peer's queue |
 | `placed` | `place_thread` | placements **received** by this CPU (spawn + wake re-homing), counted against the target CPU |
 | `ipis` | `on_reschedule_ipi` | reschedule IPIs handled by this CPU |
