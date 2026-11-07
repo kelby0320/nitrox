@@ -4,18 +4,26 @@ use super::*;
 
 /// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the unseeded
 /// `sys_entropy_read` path), gated by a lock-free check so the common case costs one atomic
-/// load. From the tick: the entropy subsystem owns the waiter refs, which move into an
-/// interrupt's bag, so they reach `deferred_drops` rather than drop here. Bounded: waiters queue
-/// only pre-seed and the drain fires post-seed, so the lifetime total is ≤ `SEED_WAITERS_MAX`.
+/// load. From the tick.
 pub(super) fn wake_entropy_seed_waiters() {
+    if crate::entropy::seed_wake_pending() {
+        wake_seed_waiters(crate::entropy::drain_seed_waiters);
+    }
+}
+
+/// Complete the seed waiters `drain` hands over. The entropy subsystem owns their refs, which
+/// move into an interrupt's bag, so they reach `deferred_drops` rather than drop here. Drained
+/// before `SCHED` is taken, so `ENTROPY` never nests in it. Bounded: waiters queue only pre-seed
+/// and the drain fires post-seed, so the lifetime total is ≤ `SEED_WAITERS_MAX`.
+pub(super) fn wake_seed_waiters(drain: impl FnOnce(&mut [Option<ObjectRef>]) -> usize) {
     use crate::entropy::SEED_WAITERS_MAX;
-    if !crate::entropy::seed_wake_pending() {
+    let mut buf: [Option<ObjectRef>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
+    let n = drain(&mut buf);
+    if n == 0 {
         return;
     }
-    let mut buf: [Option<ObjectRef>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
     let mut bag = Deferred::<SEED_WAITERS_MAX>::in_interrupt();
     let mut g = bag.lock();
-    let n = crate::entropy::drain_seed_waiters(&mut buf);
     for po in buf[..n].iter_mut().filter_map(Option::take) {
         signal_pending_op_with_result(&mut g, po.as_ptr(), 0, 0);
         g.defer(po);

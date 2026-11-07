@@ -254,12 +254,16 @@ pub unsafe fn complete_pending_op(po: *mut (), status: i32, result: u64) {
 ///
 /// `irq` points at a live `InterruptObject`, pinned for the call by a reference the caller holds.
 pub unsafe fn signal_interrupt(irq: *mut ()) {
-    let mut g = SCHED.lock();
+    signal_interrupt_in(&mut SCHED.lock(), irq);
+}
+
+/// [`signal_interrupt`] for a caller holding `SCHED`, `irq` a live `InterruptObject`.
+pub(super) fn signal_interrupt_in(g: &mut SchedState, irq: *mut ()) {
     // SAFETY: live `InterruptObject`, `SCHED` held — latches a pending interrupt.
     unsafe { InterruptObject::signal(irq) };
     // SAFETY: live object, `SCHED` held — drains its waiter list.
     let waiters = unsafe { InterruptObject::take_waiters(irq) };
-    wake_all(&mut g, waiters, irq);
+    wake_all(g, waiters, irq);
 }
 
 /// Consume one pending interrupt on `irq` — called by `sys_wait` on returning for an

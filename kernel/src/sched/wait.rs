@@ -16,7 +16,7 @@ pub(super) fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     unsafe { Thread::set_state(thread, ThreadState::Ready) };
     // Re-home onto its CPU (a full home falls back to the least-loaded permitted queue with
     // room).
-    place_woken(g, r);
+    place_woken(g, r, "wake placement (every queue the woken thread may go to)");
     true
 }
 

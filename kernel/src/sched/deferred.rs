@@ -24,7 +24,9 @@ impl<const N: usize> Deferred<N> {
         Self { refs: [const { None }; N], len: 0, interrupt: false }
     }
 
-    /// A bag for a site in interrupt context, no larger than `deferred_drops` keeps room for.
+    /// A bag for a site in interrupt context, no larger than `deferred_drops`' reserve. That list is
+    /// shared and drained only by `reap_pending`, so its room at the drop rests on each such site's
+    /// own lifetime bound ([`DEFERRED_DROP_RESERVE`]).
     pub(super) fn in_interrupt() -> Self {
         const { assert!(N <= DEFERRED_DROP_RESERVE, "an interrupt's bag past deferred_drops' reserve") };
         Self { interrupt: true, ..Self::new() }

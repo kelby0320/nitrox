@@ -181,10 +181,11 @@ pub(super) fn pick_wake_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize 
 
 /// Place `r`, a thread woken or resumed, which cannot be refused: every queue is reserved for every
 /// thread the cap admits ([`MAX_THREADS`]), so none a woken thread may go to can be full unless
-/// that sizing is wrong, which ends the machine.
-pub(super) fn place_woken(g: &mut SchedState, r: ObjectRef) {
+/// that sizing is wrong, which ends the machine, naming `what` placed it.
+#[track_caller]
+pub(super) fn place_woken(g: &mut SchedState, r: ObjectRef, what: &str) {
     if let Err(r) = place_thread(g, r, true) {
-        reserve_exhausted(r, "wake placement (every queue the woken thread may go to)");
+        reserve_exhausted(r, what);
     }
 }
 

@@ -207,8 +207,8 @@ The seeded-latch's wake of any `PendingOperation` waiters (the userspace read
 contract) runs on the `PendingOperation` completion path under `SCHED`, **outside**
 this lock — so `ENTROPY` never nests with `SCHED`. Concretely, `on_timer_tick`'s
 `wake_entropy_seed_waiters` (`sched/timers.rs`) *moves* the queued waiter `ObjectRef`s out
-of `ENTROPY` (the entropy subsystem owns them, the IPC-`Block` pattern), signals
-each, and defers each to a bag made for interrupt context (`Deferred::in_interrupt`),
+of `ENTROPY` (the entropy subsystem owns them, the IPC-`Block` pattern) before it takes
+`SCHED`, signals each, and defers each to a bag made for interrupt context (`Deferred::in_interrupt`),
 whose guard **parks the refs in `SchedState::deferred_drops`** for `reap_pending` to
 drop later, in thread context with no lock held.
 
@@ -496,7 +496,9 @@ the bag drops after the guard releases the lock. `N` is the site's burst, and a 
 bag ends the machine, as a full `Reserved` list does (`sched::reserve_exhausted`, the
 one place a refused value is forgotten rather than dropped). A bag made for interrupt
 context, where nothing may be freed at all, moves what it holds into
-`SchedState::deferred_drops` instead, and is no larger than that list's reserve.
+`SchedState::deferred_drops` instead, and is no larger than that list's reserve. That bounds
+one bag only: the list is shared and drained by `reap_pending` alone, so its room rests on
+each such site's lifetime total, the entropy wake's at most half the reserve a boot.
 
 **A list pushed where nothing may allocate — under `SCHED` or an `IrqSpinLock`, or
 in interrupt or DPC context — is a `Reserved` or an `ArrayVec`, never a `KVec`**

@@ -1,9 +1,9 @@
 //! Preemptive round-robin scheduler for kernel and user threads, with per-CPU run queues.
 //!
 //! A thread runs until it calls [`yield_now`]/[`exit`] (the **cooperative** path) or the timer
-//! IRQ's [`on_timer_tick`] expires its quantum (the **preemptive** path). Both funnel through
-//! [`switch_to_next`] over [`context_switch`](crate::arch::context_switch) and the [`Thread`]
-//! kernel object. An [idle thread](idle_body) runs (`hlt`) whenever nothing else is ready.
+//! IRQ's [`on_timer_tick`] expires its quantum (the **preemptive** path). Both, as every switch
+//! does, funnel through [`switch_away`] over [`context_switch`](crate::arch::context_switch) and
+//! the [`Thread`] kernel object. An [idle thread](idle_body) runs (`hlt`) whenever nothing else is ready.
 //!
 //! ## Blocking and deadlines (wait queues)
 //!
@@ -62,6 +62,7 @@ mod exit;
 mod ipc;
 mod objects;
 mod online;
+mod outgoing;
 mod placement;
 mod preempt;
 mod spawn;
@@ -74,6 +75,7 @@ pub use exit::*;
 pub use ipc::*;
 pub use objects::*;
 pub use online::*;
+use outgoing::{Outgoing, take_current};
 use placement::*;
 pub use preempt::*;
 pub use spawn::*;
@@ -101,9 +103,10 @@ const QUANTUM_TICKS: u32 = 1;
 /// by object address (`SchedState::idle_addr`).
 const IDLE_TID: u32 = u32::MAX;
 
-/// Pre-reserved capacity for [`SchedState::deferred_drops`], the bound on any bag an interrupt
-/// declares ([`Deferred::in_interrupt`]). Twice the only one's burst: the entropy seed wake's
-/// ≤ [`crate::entropy::SEED_WAITERS_MAX`] refs, once per boot; [`reap_pending`] drains it.
+/// Pre-reserved capacity for [`SchedState::deferred_drops`], which no bag an interrupt declares
+/// ([`Deferred::in_interrupt`]) may exceed. The bags share it, so what they hold at once is bounded
+/// by their sites' lifetime totals: the only one's, the entropy seed wake's, is
+/// ≤ [`crate::entropy::SEED_WAITERS_MAX`] refs a boot, half of it. [`reap_pending`] drains it.
 const DEFERRED_DROP_RESERVE: usize = 2 * crate::entropy::SEED_WAITERS_MAX;
 /// Handle tables the [reaper](reaper_body) has closed, reported as `reaper_closed=` in
 /// `/proc/sched/stats`. Exposed because the failure mode is **silence**: a reaper that
@@ -531,22 +534,6 @@ enum Park {
     Reaper,
 }
 
-/// The thread taken out of this CPU's `current` slot, so the one this CPU is running: only
-/// [`take_current`] makes one, so a switch saves this CPU's context into its own thread.
-struct Outgoing(ObjectRef);
-
-impl Outgoing {
-    /// The thread's object.
-    fn as_ptr(&self) -> *mut () {
-        self.0.as_ptr()
-    }
-}
-
-/// Take the running thread out of this CPU's `current` slot.
-fn take_current(g: &mut SchedState) -> Outgoing {
-    Outgoing(g.cur_slot().take().expect("current set after init"))
-}
-
 /// Give `prev` the state `to` means and put it on that list. Caller holds `SCHED`.
 fn park(g: &mut SchedState, prev: Outgoing, to: Park) {
     let obj = prev.as_ptr();
@@ -560,7 +547,7 @@ fn park(g: &mut SchedState, prev: Outgoing, to: Park) {
     };
     // SAFETY: `prev` pins the thread; `SCHED` held.
     unsafe { Thread::set_state(obj, state) };
-    let Outgoing(r) = prev;
+    let r = prev.into_ref();
     match to {
         Park::Ready if idle => {
             debug_assert!(g.idle_slot().is_none());

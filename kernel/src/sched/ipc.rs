@@ -713,4 +713,39 @@ mod tests {
             drop(a);
         }
     }
+
+    /// **A forward its server cannot take, its ring full or the server gone, gives its slot back**,
+    /// letting go of what the slot held once `SCHED` is released.
+    #[test]
+    fn a_forward_its_server_cannot_take_lets_go_of_its_slot() {
+        use crate::object::userspace_server::Forward;
+        init_global_heap();
+        for gone in [false, true] {
+            let (reg, server_end) = served();
+            let r = reg.as_object().as_ptr();
+            let mut msg = KBox::<StoredMsg>::try_new_zeroed().unwrap();
+            let server_end = if gone {
+                drop(server_end);
+                None
+            } else {
+                // SAFETY: `reg` pins the registration.
+                while unsafe { us_forward_notify(r, &mut msg) } {}
+                Some(server_end)
+            };
+            let (lookup, fill) = (po(), po());
+            let file = Ref::new(FileObject::try_new(4096, crate::object::Producer::Stub { base: 0 }).unwrap());
+            let refused = if gone { ForwardOutcome::PeerClosed } else { ForwardOutcome::Full };
+            // SAFETY: `reg`, both POs and the file are pinned by the test's references.
+            unsafe {
+                assert_eq!(us_forward_originate(r, &mut msg, &lookup, Rights::MAP_READ, b"f", Forward::PLAIN), refused);
+                let frame = crate::mm::PhysAddr::new(0x5000);
+                assert_eq!(us_forward_originate_fill(r, &mut msg, &fill, &file, frame, 0), refused);
+            }
+            test_probe::reset();
+            drop((lookup, fill, file));
+            assert_eq!(test_probe::pending_op_destroys(), 2, "gone={gone}: no slot keeps a PO");
+            assert_eq!(test_probe::file_object_destroys(), 1, "gone={gone}: nor the fill's file");
+            drop((reg, server_end));
+        }
+    }
 }

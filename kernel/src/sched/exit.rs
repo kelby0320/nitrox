@@ -321,7 +321,7 @@ fn resume_parked(g: &mut SchedState, r: ObjectRef, disp_tag: u8, disp_code: i32)
         Thread::set_state(thread, ThreadState::Ready);
     }
     // Re-home on its CPU (a wake; a full home falls back to a permitted queue with room).
-    place_woken(g, r);
+    place_woken(g, r, "resume placement (every queue the resumed thread may go to)");
 }
 
 /// The user registers `thread` faulted with, or `None` if it is not `Suspended`: a copy, taken
