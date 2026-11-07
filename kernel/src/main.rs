@@ -754,12 +754,12 @@ fn run_first_userspace() {
         }
     };
     // One reference for the Process, the other installed as a handle (refcount → 2).
-    let chan_ref = ObjectRef::new(chan);
+    let chan_ref = Ref::new(chan);
     proc_box.set_notification_channel(chan_ref.clone());
     // pid 1's handles, closed again by any return before init is spawned.
     let mut installed = Installed::<3>::new(global::get(), 1);
     let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
-    let Ok(notif_h) = installed.install(chan_ref, notif_rights) else {
+    let Ok(notif_h) = installed.install(chan_ref.erase(), notif_rights) else {
         kprintln!("init: notification handle alloc failed");
         return;
     };

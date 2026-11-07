@@ -33,7 +33,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::PhysAddr;
 use crate::object::header::{Header, Ref, Shared, kobject};
-use crate::object::{FileObject, Forgotten, IpcChannel, ObjectRef};
+use crate::object::{FileObject, Forgotten, IpcChannel, PendingOperation};
 
 /// Largest lookup suffix a [`PendingLookup`] stores inline (no allocation under `SCHED`). A
 /// longer one keeps its true `suffix_len` but a truncated buffer: harmless for an eager
@@ -78,7 +78,7 @@ pub struct PendingLookup {
     pub(crate) request_id: u64,
     /// The lookup's `PendingOperation` (a clone of the client's), pinned so the reply can
     /// complete it even if the client closed its handle.
-    pub(crate) po: ObjectRef,
+    pub(crate) po: Ref<PendingOperation>,
     /// The `Rights` the lookup requested; the installed handle gets `requested ∩ granted`.
     pub(crate) requested: Rights,
     /// The path suffix, inline (`suffix[..suffix_len.min(MAX)]`); `suffix_len` is the *true*
@@ -116,7 +116,7 @@ pub struct PendingFill {
     /// The `request_id` stamped on the `ReadRange` request; the reply echoes it.
     pub(crate) request_id: u64,
     /// The fill's `PendingOperation` (the faulting thread blocks on it).
-    pub(crate) po: ObjectRef,
+    pub(crate) po: Ref<PendingOperation>,
     /// The `FileObject` being filled (pins it; the reply marks its page ready).
     pub(crate) file_obj: Ref<FileObject>,
     /// The cache frame to copy the replied bytes into.
@@ -131,8 +131,6 @@ pub struct PendingFill {
 pub const US_PENDING_MAX: usize = 8;
 
 struct Inner {
-    /// The kernel's IPC endpoint; its peer is the endpoint the server services.
-    endpoint: Ref<IpcChannel>,
     /// Outstanding forwarded lookups, by `request_id`; a free slot is `None`.
     pending: [Option<PendingLookup>; US_PENDING_MAX],
     /// Outstanding forwarded fills; separate from `pending`, routed by reply op.
@@ -158,6 +156,9 @@ struct CachedFile {
 pub struct UserspaceServerReg {
     header: Header<Self>,
     magic: u64,
+    /// The kernel's IPC endpoint; its peer is the endpoint the server services. Set once, and
+    /// declared before `inner` so it drops first, with the pending tables still whole.
+    endpoint: Ref<IpcChannel>,
     inner: UnsafeCell<Inner>,
     /// **The file cache: one `FileObject` per file this server's replies named**, keyed by the
     /// id a `FILE_BLOCKS` reply carries, so every resolve shares one object and a sync or unmount
@@ -193,8 +194,8 @@ impl UserspaceServerReg {
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
+            endpoint,
             inner: UnsafeCell::new(Inner {
-                endpoint,
                 pending: core::array::from_fn(|_| None),
                 pending_fill: core::array::from_fn(|_| None),
                 next_id: 1,
@@ -235,7 +236,7 @@ impl UserspaceServerReg {
     /// no sync finds the object; it goes now if nothing is in flight, else with the object.
     /// Taking the entry out on every `Forget` would answer a second one at once, with the
     /// first one's IRP still in flight. [`Forgotten::Now`] if the id is not cached.
-    pub fn forget_file(&self, id: u64, answer: &ObjectRef) -> Forgotten {
+    pub fn forget_file(&self, id: u64, answer: &Ref<PendingOperation>) -> Forgotten {
         let obj = {
             let mut g = self.files.lock();
             let Some(i) =
@@ -338,14 +339,10 @@ impl UserspaceServerReg {
         unsafe { &mut *r.inner.get() }
     }
 
-    /// The kernel-held endpoint pointer (type-erased): a forwarded Resolve request is sent on
-    /// it and lands in the *peer*'s inbox.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn endpoint_ptr(reg: *mut ()) -> *mut () {
-        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(reg) }.endpoint.as_object().as_ptr()
+    /// The kernel's endpoint, borrowed: a forwarded request is sent on it and lands in the
+    /// *peer*'s inbox.
+    pub fn endpoint(&self) -> &IpcChannel {
+        &self.endpoint
     }
 
     /// A plain lookup's [`begin_forward`](Self::begin_forward), the tests' shorthand.
@@ -353,7 +350,12 @@ impl UserspaceServerReg {
     /// # Safety
     /// As [`begin_forward`](Self::begin_forward).
     #[cfg(test)]
-    pub(crate) unsafe fn begin(reg: *mut (), po: &ObjectRef, requested: Rights, suffix: &[u8]) -> Option<u64> {
+    pub(crate) unsafe fn begin(
+        reg: *mut (),
+        po: &Ref<PendingOperation>,
+        requested: Rights,
+        suffix: &[u8],
+    ) -> Option<u64> {
         // SAFETY: the caller's contract, passed through.
         unsafe { Self::begin_forward(reg, po, requested, suffix, Forward::PLAIN) }
     }
@@ -368,7 +370,7 @@ impl UserspaceServerReg {
     /// See the accessor contract above; `po` references a live `PendingOperation`.
     pub(crate) unsafe fn begin_forward(
         reg: *mut (),
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
         requested: Rights,
         suffix: &[u8],
         fwd: Forward<'_>,
@@ -408,7 +410,7 @@ impl UserspaceServerReg {
     /// See the accessor contract above; `po` / `file_obj` reference live objects.
     pub(crate) unsafe fn begin_fill(
         reg: *mut (),
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
         file_obj: &Ref<FileObject>,
         frame: PhysAddr,
         index: usize,
@@ -499,6 +501,7 @@ impl Drop for UserspaceServerReg {
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
+    use crate::object::ObjectRef;
     use crate::object::header::test_probe;
     use crate::object::{IpcChannel, PendingOperation};
 
@@ -510,8 +513,8 @@ mod tests {
         a_ref
     }
 
-    fn make_po() -> ObjectRef {
-        ObjectRef::new(PendingOperation::try_new().unwrap())
+    fn make_po() -> Ref<PendingOperation> {
+        Ref::new(PendingOperation::try_new().unwrap())
     }
 
     fn reg() -> ObjectRef {
@@ -563,26 +566,20 @@ mod tests {
         init_global_heap();
         let (k, s) = IpcChannel::try_new_pair(4).unwrap();
         let k_ref = Ref::new(k);
-        let s_ref = ObjectRef::new(s);
-        let k_ptr = k_ref.as_object().as_ptr();
+        let s_ref = Ref::new(s);
         let r = UserspaceServerReg::try_new(k_ref).unwrap();
         let binding = Ref::new(r);
-        // SAFETY: `k_ptr` is the endpoint the registration holds.
-        assert!(unsafe { crate::sched::us_server_attach(k_ptr, &binding) }.is_none());
+        assert!(crate::sched::us_server_attach(binding.endpoint(), &binding).is_none());
 
-        // SAFETY: `s_ref` pins the server's end.
-        let reply =
-            unsafe { crate::sched::us_forward_reg_for_send(s_ref.as_ptr()) }.expect("routed to the registration");
+        let reply = crate::sched::us_forward_reg_for_send(&s_ref).expect("routed to the registration");
         let destroyed = test_probe::userspace_server_reg_destroys();
         drop(binding);
         assert_eq!(test_probe::userspace_server_reg_destroys(), destroyed, "freed under the reply");
-        // SAFETY: `reply` pins the registration.
-        assert!(unsafe { crate::sched::us_forward_take_pending(reply.as_object().as_ptr(), 1) }.is_none());
+        assert!(crate::sched::us_forward_take_pending(&reply, 1).is_none());
 
         drop(reply);
         assert_eq!(test_probe::userspace_server_reg_destroys(), destroyed + 1);
-        // SAFETY: `s_ref` pins the server's end, whose peer closed with the registration.
-        assert!(unsafe { crate::sched::us_forward_reg_for_send(s_ref.as_ptr()) }.is_none());
+        assert!(crate::sched::us_forward_reg_for_send(&s_ref).is_none());
         drop(s_ref);
     }
 

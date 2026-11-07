@@ -66,11 +66,12 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     }
 
     let chan = NotificationChannel::try_new().map_err(|_| KError::OutOfMemory)?;
-    let chan_ref = ObjectRef::new(chan);
+    let chan_ref = Ref::new(chan);
     proc_box.set_notification_channel(chan_ref.clone()); // refcount 2
     // Every handle the child is given is closed again, as `proc_box` drops, unless it starts.
     let mut child = installing::<{ SPAWN_MAX_HANDLES + 2 }>(child_pid);
-    let notif_h = child.install(chan_ref, Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT).map_err(refused)?;
+    let notif_h =
+        child.install(chan_ref.erase(), Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT).map_err(refused)?;
 
     // The child's root: `args.namespace` if the parent holds it with `LOOKUP`, else the parent's
     // own; always a **LOOKUP-only** handle, so the child cannot rebind its root.

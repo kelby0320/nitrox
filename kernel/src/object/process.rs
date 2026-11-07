@@ -8,8 +8,8 @@
 use crate::libkern::{AllocError, ExitStatus, KBox, SysCaps};
 use crate::mm::PhysAddr;
 use crate::mm::addr_space::AddressSpace;
-use crate::object::ObjectRef;
-use crate::object::header::{Header, Shared, kobject};
+use crate::object::header::{Header, Ref, Shared, kobject};
+use crate::object::{NotificationChannel, ObjectRef};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// A process kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
@@ -24,10 +24,10 @@ pub struct Process {
     address_space: Option<AddressSpace>,
     /// The notification channel the exception path delivers fault notifications to. The channel
     /// does **not** back-reference the `Process`, so there is no refcount cycle.
-    notification_channel: Option<ObjectRef>,
+    notification_channel: Option<Ref<NotificationChannel>>,
     /// The **parent's** notification channel, where `ChildExited` is delivered when this process
-    /// exits; `None` for the boot parent. A held `ObjectRef`, so it outlives this child; no cycle.
-    parent_notif: Option<ObjectRef>,
+    /// exits; `None` for the boot parent. A held reference, so it outlives this child; no cycle.
+    parent_notif: Option<Ref<NotificationChannel>>,
     /// This process's **root namespace** (`docs/architecture/namespace-and-resource-servers.md`);
     /// owned, so it outlives the process's handle to it. `None` until attached. No cycle.
     namespace: Option<ObjectRef>,
@@ -124,19 +124,18 @@ impl Process {
     }
 
     /// Attach the notification channel; the box is not yet shared, so `&mut self` is exclusive.
-    pub fn set_notification_channel(&mut self, chan: ObjectRef) {
+    pub fn set_notification_channel(&mut self, chan: Ref<NotificationChannel>) {
         self.notification_channel = Some(chan);
     }
 
-    /// The type-erased pointer to the attached channel. The fault path must **not** clone/drop an
-    /// `ObjectRef` under the scheduler lock, so it borrows this; the channel stays alive because
-    /// this `Process` owns a reference to it.
-    pub fn notification_channel_ptr(&self) -> Option<*mut ()> {
-        self.notification_channel.as_ref().map(|r| r.as_ptr())
+    /// The attached channel, borrowed: the fault path must **not** clone or drop a reference under
+    /// the scheduler lock, and this `Process`'s own keeps the channel alive as long as the borrow.
+    pub fn notification_channel(&self) -> Option<&NotificationChannel> {
+        self.notification_channel.as_deref()
     }
 
     /// Clone the channel reference; spawn gives it to a child as its `parent_notif`.
-    pub fn notification_channel_ref(&self) -> Option<ObjectRef> {
+    pub fn notification_channel_ref(&self) -> Option<Ref<NotificationChannel>> {
         self.notification_channel.clone()
     }
 
@@ -152,15 +151,14 @@ impl Process {
     }
 
     /// Attach the **parent's** notification channel at spawn; the boot parent never sets it.
-    pub fn set_parent_notif(&mut self, chan: ObjectRef) {
+    pub fn set_parent_notif(&mut self, chan: Ref<NotificationChannel>) {
         self.parent_notif = Some(chan);
     }
 
-    /// The type-erased pointer to the parent's channel, borrowed by the reap path to enqueue
-    /// `ChildExited`; like [`notification_channel_ptr`](Self::notification_channel_ptr), it must
-    /// not clone/drop an `ObjectRef` under the scheduler lock.
-    pub fn parent_notif_ptr(&self) -> Option<*mut ()> {
-        self.parent_notif.as_ref().map(|r| r.as_ptr())
+    /// The parent's channel, borrowed by the exit path to enqueue `ChildExited`, as
+    /// [`notification_channel`](Self::notification_channel) is.
+    pub fn parent_notif(&self) -> Option<&NotificationChannel> {
+        self.parent_notif.as_deref()
     }
 
     /// This process's pid, the `child` of the `ChildExited` the reap path builds.
@@ -208,17 +206,16 @@ mod tests {
     }
 
     #[test]
-    fn notification_channel_attach_and_read_ptr() {
-        use crate::object::NotificationChannel;
+    fn notification_channel_attach_and_borrow() {
         use crate::object::header::test_probe;
         init_global_heap();
         test_probe::reset();
         let mut p = Process::try_new(1).unwrap();
-        assert!(p.notification_channel_ptr().is_none());
-        let chan_ref = ObjectRef::new(NotificationChannel::try_new().unwrap());
+        assert!(p.notification_channel().is_none());
+        let chan_ref = Ref::new(NotificationChannel::try_new().unwrap());
         let chan = chan_ref.as_ptr();
         p.set_notification_channel(chan_ref);
-        assert_eq!(p.notification_channel_ptr(), Some(chan));
+        assert_eq!(p.notification_channel().map(core::ptr::from_ref), Some(chan.cast_const()));
         assert_eq!(test_probe::notification_channel_destroys(), 0);
         drop(p);
         assert_eq!(test_probe::notification_channel_destroys(), 1);

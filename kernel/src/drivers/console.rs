@@ -22,14 +22,14 @@ use crate::libkern::KBox;
 use crate::libkern::lockrank::LockRank;
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
 use crate::object::header::Ref;
-use crate::object::{DeviceNode, MemoryObject, ObjectRef};
+use crate::object::{DeviceNode, MemoryObject, PendingOperation};
 use crate::syscall::error::KError;
 
 /// Capacity of the RX ring; input beyond it is dropped rather than blocking the ISR.
 const RING_CAP: usize = 256;
 
 struct ParkedRead {
-    po: ObjectRef,
+    po: Ref<PendingOperation>,
     buffer: Ref<MemoryObject>,
     buf_offset: u64,
     max_len: usize,
@@ -107,7 +107,7 @@ static CONSOLE_NODE: AtomicPtr<DeviceNode> = AtomicPtr::new(core::ptr::null_mut(
 /// the next RX interrupt; `WouldBlock` if one is already pending. Syscall context.
 fn submit_read(
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     _offset: u64,
     max_len: u64,
@@ -119,7 +119,7 @@ fn submit_read(
 fn read(
     console: &IrqSpinLock<Inner>,
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     max_len: usize,
 ) -> Result<(), KError> {
@@ -138,8 +138,7 @@ fn read(
     match found {
         Submitted::Drained(n) => {
             buffer.copy_in(buf_offset as usize, &tmp[..n]);
-            // SAFETY: `po` pins the read's `PendingOperation`.
-            unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64) };
+            crate::sched::complete_pending_op(po, 0, n as u64);
             Ok(())
         }
         Submitted::Parked => Ok(()),
@@ -156,8 +155,7 @@ fn console_intr_dpc(_ctx: *mut ()) {
     let completed = CONSOLE.lock().take_ready(&mut tmp);
     if let Some((pr, n)) = completed {
         pr.buffer.copy_in(pr.buf_offset as usize, &tmp[..n]);
-        // SAFETY: `pr` owns the reference pinning its `PendingOperation`.
-        unsafe { crate::sched::complete_pending_op(pr.po.as_ptr(), 0, n as u64) };
+        crate::sched::complete_pending_op(&pr.po, 0, n as u64);
         // **Nothing is dropped here, deliberately.** Nothing cancels a parked read, so a process
         // that submits one and exits leaves the *last* references here, and dropping them in DPC
         // context runs `SlabCache::free` — the same-CPU allocator deadlock fixed for `io::block`
@@ -258,7 +256,7 @@ mod tests {
 
     fn read() -> ParkedRead {
         ParkedRead {
-            po: ObjectRef::new(PendingOperation::try_new().unwrap()),
+            po: Ref::new(PendingOperation::try_new().unwrap()),
             buffer: Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap()),
             buf_offset: 0,
             max_len: 1,

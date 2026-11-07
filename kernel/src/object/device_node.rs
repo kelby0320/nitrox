@@ -11,7 +11,7 @@ use crate::io::stats::IoStats;
 use crate::libkern::block::{BlockDeviceInfo, BlockKind};
 use crate::libkern::{AllocError, KBox};
 use crate::object::header::{Header, Ref, Shared, kobject};
-use crate::object::{MemoryObject, ObjectRef};
+use crate::object::{MemoryObject, PendingOperation};
 use crate::syscall::error::KError;
 
 /// What a device is, from its PCI configuration header (`docs/spec/device-node.md`).
@@ -176,7 +176,7 @@ pub struct CharBackend {
 /// it as the generation the reader holds.
 pub type CharRead = fn(
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     offset: u64,
     max_len: u64,
@@ -184,8 +184,13 @@ pub type CharRead = fn(
 ) -> Result<(), KError>;
 
 /// A char device's write: `len` bytes from `buffer` at `buf_offset`, completing `po`.
-pub type CharWrite =
-    fn(buffer: &Ref<MemoryObject>, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError>;
+pub type CharWrite = fn(
+    buffer: &Ref<MemoryObject>,
+    po: &Ref<PendingOperation>,
+    buf_offset: u64,
+    len: u64,
+    ctx: *mut (),
+) -> Result<(), KError>;
 
 // SAFETY: identical reasoning to `BlockBackend` — `ctx` points at a device
 // structure that lives for the kernel's lifetime, touched only on the CPU

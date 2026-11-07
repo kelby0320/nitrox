@@ -200,7 +200,7 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
 
     // The keyboard in slot 5 departs holding a key, and a lights write is left waiting.
     nodes.retire(5, |r| r.ring.push_group(&[InputEvent::key(30, KEY_RELEASE, 1)]), 1);
-    let lights = ObjectRef::new(PendingOperation::try_new().unwrap());
+    let lights = Ref::new(PendingOperation::try_new().unwrap());
     nodes.lights.lock()[5] = Some((lights.clone(), 1));
     // A mouse takes its slot, and moves.
     let (index, epoch) = nodes.take(false).expect("the retired slot");
@@ -208,12 +208,11 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     let now = context(index, epoch);
     assert_ne!(now, made[5], "another epoch");
     assert!(nodes.lights.lock()[5].is_none(), "the waiting lights write is let go");
-    // SAFETY: `lights` is a live `PendingOperation` reference held across the call.
-    assert_eq!(unsafe { crate::sched::pending_op_completion(lights.as_ptr()) }, (KError::PeerClosed as i32, 0));
+    assert_eq!(crate::sched::pending_op_completion(&lights), (KError::PeerClosed as i32, 0));
     nodes.readers[5].lock().ring.push(InputEvent::rel(REL_X, 3, 2));
 
     let buf = Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
-    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
+    let po = Ref::new(PendingOperation::try_new().unwrap());
     let len = 4 * INPUT_EVENT_LEN as u64;
     assert_eq!(nodes.read(&buf, &po, 0, len, made[5], 3), Err(KError::PeerClosed), "the keyboard's node");
     assert!(!nodes.readers[5].lock().ring.is_empty(), "took none of the mouse's motion");
@@ -221,8 +220,7 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     assert_eq!(nodes.write(None, &buf, &po, 0, 1, now), Err(KError::Unsupported), "a mouse takes none");
     assert_eq!(nodes.read(&buf, &po, 0, len, now, 3), Ok(()), "the mouse's node reads it");
     assert_eq!(
-        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-        unsafe { crate::sched::pending_op_completion(po.as_ptr()) },
+        crate::sched::pending_op_completion(&po),
         (0, INPUT_EVENT_LEN as u64),
         "the motion alone: none of the keyboard's release",
     );

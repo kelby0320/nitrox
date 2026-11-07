@@ -101,15 +101,12 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
 
 /// Arm (or, with `deadline_ns == 0`, disarm) a timer: set its deadline/interval and
 /// (re)insert its absolute-monotonic-ns heap entry. `Err(())` if the heap is at reserve.
-///
-/// # Safety
-///
-/// `timer` points at a live `Timer`, pinned for the call by a reference the caller holds.
 #[allow(clippy::result_unit_err, reason = "one failure, the heap's reserve, which every caller reports one way")]
-pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
+pub fn timer_arm(timer: &Timer, deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
     let mut g = SCHED.lock();
+    let timer = addr(timer);
     // Drop any stale heap entry (re-arm).
-    // SAFETY: live Timer (caller holds its `ObjectRef`), `SCHED` held.
+    // SAFETY: pinned by the borrow, `SCHED` held.
     unsafe { unheap(&mut g, timer) };
     // SAFETY: live Timer, `SCHED` held.
     unsafe { Timer::set_armed(timer, deadline_ns, interval_ns) };

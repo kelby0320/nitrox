@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::libkern::input::{INPUT_EVENT_LEN, InputEvent};
 use crate::mm::{PAGE_SIZE, heap};
 use crate::object::header::Ref;
-use crate::object::{MemoryObject, ObjectRef};
+use crate::object::{MemoryObject, PendingOperation};
 use crate::syscall::error::KError;
 use ring::EventRing;
 
@@ -37,7 +37,7 @@ pub const DRAIN_MAX: usize = ring::RING_EVENTS * INPUT_EVENT_LEN;
 
 /// A parked `sys_io_submit(Read)` waiting for events on one node.
 pub struct ParkedRead {
-    po: ObjectRef,
+    po: Ref<PendingOperation>,
     buffer: Ref<MemoryObject>,
     buf_offset: u64,
     max_len: usize,
@@ -45,7 +45,7 @@ pub struct ParkedRead {
 
 impl ParkedRead {
     /// A read of up to `max_len` bytes into `buffer` at `buf_offset`, completing `po`.
-    pub fn new(po: &ObjectRef, buffer: &Ref<MemoryObject>, buf_offset: u64, max_len: usize) -> ParkedRead {
+    pub fn new(po: &Ref<PendingOperation>, buffer: &Ref<MemoryObject>, buf_offset: u64, max_len: usize) -> ParkedRead {
         ParkedRead { po: po.clone(), buffer: buffer.clone(), buf_offset, max_len }
     }
 }
@@ -212,21 +212,18 @@ pub fn read_or_park(mut reclaim: impl FnMut(), mut attempt: impl FnMut() -> Read
 /// scheduler's.
 pub fn deliver(read: &ParkedRead, bytes: &[u8]) {
     read.buffer.copy_in(read.buf_offset as usize, bytes);
-    // SAFETY: `read` owns the reference pinning its `PendingOperation`.
-    unsafe { crate::sched::complete_pending_op(read.po.as_ptr(), 0, bytes.len() as u64) };
+    crate::sched::complete_pending_op(&read.po, 0, bytes.len() as u64);
 }
 
 /// **Complete a parked read with `err`** and no bytes, for a device that has gone. No lock held.
 pub fn refuse(read: &ParkedRead, err: KError) {
-    // SAFETY: `read` owns the reference pinning its `PendingOperation`.
-    unsafe { crate::sched::complete_pending_op(read.po.as_ptr(), err as i32, 0) };
+    crate::sched::complete_pending_op(&read.po, err as i32, 0);
 }
 
 /// Copy `bytes` into `buffer` at `buf_offset` and complete `po`: a read satisfied at once.
-pub fn deliver_now(buffer: &MemoryObject, po: &ObjectRef, buf_offset: u64, bytes: &[u8]) {
+pub fn deliver_now(buffer: &MemoryObject, po: &Ref<PendingOperation>, buf_offset: u64, bytes: &[u8]) {
     buffer.copy_in(buf_offset as usize, bytes);
-    // SAFETY: `po` is the caller's `PendingOperation` reference.
-    unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, bytes.len() as u64) };
+    crate::sched::complete_pending_op(po, 0, bytes.len() as u64);
 }
 
 /// **The lights a write to a keyboard's node carries**: exactly one byte at `buf_offset`, of
@@ -269,7 +266,7 @@ mod tests {
     use crate::object::header::test_probe;
 
     fn read(max_len: usize) -> ParkedRead {
-        let po = ObjectRef::new(PendingOperation::try_new().unwrap());
+        let po = Ref::new(PendingOperation::try_new().unwrap());
         let buf = Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
         ParkedRead::new(&po, &buf, 0, max_len)
     }
@@ -436,14 +433,16 @@ mod tests {
 pub(crate) mod test_support {
     use crate::mm::PAGE_SIZE;
     use crate::object::header::Ref;
-    use crate::object::{MemoryObject, ObjectRef, PendingOperation};
+    use crate::object::{MemoryObject, PendingOperation};
     use crate::syscall::error::KError;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
+    type ReadFn<S> = fn(&S, &Ref<MemoryObject>, &Ref<PendingOperation>) -> Result<(), KError>;
+
     pub(crate) fn a_read_waits_out_the_delivery_before_it<S: Send + Sync + 'static, T>(
         state: S,
-        read: fn(&S, &Ref<MemoryObject>, &ObjectRef) -> Result<(), KError>,
+        read: ReadFn<S>,
         take: fn(&S) -> T,
         owe: fn(&S, T),
         parked: fn(&S) -> bool,
@@ -451,7 +450,7 @@ pub(crate) mod test_support {
         crate::mm::test_support::init_global_heap();
         let state = Arc::new(state);
         let buf = Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
-        let po = || ObjectRef::new(PendingOperation::try_new().unwrap());
+        let po = || Ref::new(PendingOperation::try_new().unwrap());
         assert_eq!(read(&state, &buf, &po()), Ok(()));
         let first = take(&state);
         let (done, answer) = mpsc::channel();

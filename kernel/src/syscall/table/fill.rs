@@ -16,8 +16,7 @@ pub(super) fn complete_read_range_reply(
 
     let reply = parse_read_range_reply(&bounce.payload[..payload_len]);
     let pf = match reply {
-        // SAFETY: `reg` pins the registration the send arrived through.
-        Some(r) => unsafe { crate::sched::us_forward_take_pending_fill(reg.as_object().as_ptr(), r.request_id) },
+        Some(r) => crate::sched::us_forward_take_pending_fill(reg, r.request_id),
         None => None,
     };
     let Some(pf) = pf else {
@@ -45,8 +44,7 @@ pub(super) fn complete_read_range_reply(
     };
 
     // Complete the fill PO (one-shot); release the kernel's clones outside `SCHED`.
-    // SAFETY: `pf` owns the fill's `PendingOperation` reference.
-    unsafe { crate::sched::complete_pending_op(pf.po.as_ptr(), status, 0) };
+    crate::sched::complete_pending_op(&pf.po, status, 0);
     drop(pf);
     Ok(0)
 }

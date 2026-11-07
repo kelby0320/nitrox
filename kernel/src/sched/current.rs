@@ -52,15 +52,10 @@ pub fn current_tid() -> u32 {
 /// Pop one notification from `channel` under `SCHED` (or synthesize a dropped notice). The
 /// lock-guarded core of `sys_notif_recv` and the in-kernel supervisor; the caller copies
 /// the result out **after** this returns.
-///
-/// # Safety
-///
-/// `channel` points at a live `NotificationChannel`, pinned for the call by a reference the caller
-/// holds.
-pub unsafe fn notif_try_recv(channel: *mut ()) -> Option<Notification> {
+pub fn notif_try_recv(channel: &NotificationChannel) -> Option<Notification> {
     let _g = SCHED.lock();
-    // SAFETY: the caller holds an `ObjectRef` pinning the channel; SCHED held.
-    unsafe { NotificationChannel::try_recv(channel) }
+    // SAFETY: pinned by the borrow; SCHED held.
+    unsafe { NotificationChannel::try_recv(addr(channel)) }
 }
 
 /// The [`Process`](crate::object::Process) owning the currently running thread (`None` for

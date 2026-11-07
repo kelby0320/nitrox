@@ -122,15 +122,14 @@ fn an_interrupts_bag_moves_what_it_deferred_to_deferred_drops() {
 fn the_seed_wake_completes_its_waiters_and_frees_none() {
     init_global_heap();
     reserve_deferred_drops();
-    let (a, b) = (po(), po());
-    let mine = [a.as_ptr(), b.as_ptr()];
+    let (a, b) = (Ref::new(PendingOperation::try_new().unwrap()), Ref::new(PendingOperation::try_new().unwrap()));
+    let mine = [a.as_object().as_ptr(), b.as_object().as_ptr()];
     wake_seed_waiters(|out| {
-        out[0] = Some(a.clone());
-        out[1] = Some(b.clone());
+        out[0] = Some(a.as_object().clone());
+        out[1] = Some(b.as_object().clone());
         2
     });
-    // SAFETY: each PO is pinned by the test.
-    assert!(mine.iter().all(|&p| unsafe { pending_op_is_signaled(p) }), "completed");
+    assert!(pending_op_is_signaled(&a) && pending_op_is_signaled(&b), "completed");
     assert_eq!(take_parked(&mine).len(), 2, "and waiting in deferred_drops");
 }
 
@@ -263,4 +262,18 @@ fn a_reference_dropped_under_sched_stops_its_test() {
     let po = po();
     let _g = SCHED.lock();
     drop(po.clone());
+}
+
+/// **A terminate request reaches the process's own channel**, the one the borrowed `Process`
+/// holds; a process with none cannot be asked.
+#[test]
+fn a_terminate_request_reaches_the_channel_its_process_holds() {
+    init_global_heap();
+    let channel = Ref::new(NotificationChannel::try_new().unwrap());
+    let mut process = Process::try_new(9).unwrap();
+    assert!(!request_terminate(&process), "no channel to ask on");
+    process.set_notification_channel(channel.clone());
+    assert!(request_terminate(&process));
+    let heard = notif_try_recv(&channel).expect("the request");
+    assert_eq!(heard.as_bytes(), Notification::terminate_requested().as_bytes());
 }

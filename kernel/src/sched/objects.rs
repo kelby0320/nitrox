@@ -86,18 +86,12 @@ pub(super) unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
 /// [`exit_process`]. A process that listens exits itself; one that does not keeps running
 /// ("there is no forcible kill in this system"). `false` when the target has no notification
 /// channel: it can never be asked, which the caller reports.
-///
-/// # Safety
-///
-/// `process` points at a live `Process`, pinned for the call by a reference the caller holds.
-pub unsafe fn request_terminate(process: *mut ()) -> bool {
+pub fn request_terminate(process: &Process) -> bool {
     let mut g = SCHED.lock();
-    // SAFETY: the caller pins `process` through its Process handle for this call.
-    let chan = unsafe { &*(process as *const crate::object::Process) }.notification_channel_ptr();
-    let Some(c) = chan else { return false };
+    let Some(c) = process.notification_channel().map(addr) else { return false };
     let notif = Notification::terminate_requested();
-    // SAFETY: `c` is the channel that Process owns a reference on, so it outlives this
-    // call; `SCHED` held; the queue is pre-reserved, so no allocation happens here.
+    // SAFETY: `c` is the channel the borrowed `Process` holds, so it outlives this call; `SCHED`
+    // held; the queue is pre-reserved, so no allocation happens here.
     let _edge = unsafe { NotificationChannel::enqueue(c, notif) };
     signal_channel(&mut g, c);
     true
@@ -159,32 +153,26 @@ pub(super) fn signal_pending_op_with_result(g: &mut SchedState, po: *mut (), sta
 }
 
 /// Read a completed [`PendingOperation`]'s `(status, result)` under one `SCHED` hold, for
-/// `sys_wait` building the `IoResult`. The caller's handle pins `po`.
-///
-/// # Safety
-///
-/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
-pub unsafe fn pending_op_completion(po: *mut ()) -> (i32, u64) {
+/// `sys_wait` building the `IoResult`.
+pub fn pending_op_completion(po: &PendingOperation) -> (i32, u64) {
     let _g = SCHED.lock();
-    // SAFETY: `po` is a live `PendingOperation` pinned by the caller's handle;
-    // `SCHED` held — both reads see the same one-shot-stable completion.
+    let po = addr(po);
+    // SAFETY: `po` is pinned by the borrow; `SCHED` held — both reads see the same
+    // one-shot-stable completion.
     unsafe { (PendingOperation::status(po), PendingOperation::result(po)) }
 }
 
 /// Complete a lookup's [`PendingOperation`] with `status` and its object, **parked** for
 /// [`pending_op_take`]'s reader; one a PO already completed comes back, to drop outside `SCHED`.
-///
-/// # Safety
-///
-/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
 #[must_use]
-pub unsafe fn complete_lookup(
-    po: *mut (),
+pub fn complete_lookup(
+    po: &PendingOperation,
     status: i32,
     parked: Option<(ObjectRef, Rights)>,
 ) -> Option<(ObjectRef, Rights)> {
     let mut g = SCHED.lock();
-    // SAFETY: `po` is a live `PendingOperation` pinned by the caller; `SCHED` held.
+    let po = addr(po);
+    // SAFETY: `po` is pinned by the borrow; `SCHED` held.
     if unsafe { PendingOperation::already_signaled(po) } {
         return parked;
     }
@@ -205,13 +193,10 @@ pub enum Completion {
 }
 
 /// Read a completed [`PendingOperation`] for `sys_wait`, under one `SCHED` hold.
-///
-/// # Safety
-///
-/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
-pub unsafe fn pending_op_take(po: *mut ()) -> Completion {
+pub fn pending_op_take(po: &PendingOperation) -> Completion {
     let _g = SCHED.lock();
-    // SAFETY: `po` is a live `PendingOperation` pinned by the caller; `SCHED` held.
+    let po = addr(po);
+    // SAFETY: `po` is pinned by the borrow; `SCHED` held.
     unsafe {
         match PendingOperation::take_parked(po) {
             Err(()) => Completion::Installing,
@@ -222,39 +207,27 @@ pub unsafe fn pending_op_take(po: *mut ()) -> Completion {
 }
 
 /// End a [`Completion::Install`]: the handle made, or the error the lookup now fails with.
-///
-/// # Safety
-///
-/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
-pub unsafe fn pending_op_installed(po: *mut (), outcome: Result<u64, i32>) {
+pub fn pending_op_installed(po: &PendingOperation, outcome: Result<u64, i32>) {
     let _g = SCHED.lock();
-    // SAFETY: `po` is a live `PendingOperation` pinned by the caller; `SCHED` held.
-    unsafe { PendingOperation::installed(po, outcome) };
+    // SAFETY: `po` is pinned by the borrow; `SCHED` held.
+    unsafe { PendingOperation::installed(addr(po), outcome) };
 }
 
 /// Complete a [`PendingOperation`] from **syscall context** (not a wakeup path), taking
 /// `SCHED`. A namespace direct-handle lookup **pre-signals** the PO it returns: resolution
 /// finished synchronously, the PO has no waiters yet, and the caller's later `sys_wait`
 /// takes the already-signalled fast path. One-shot.
-///
-/// # Safety
-///
-/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
-pub unsafe fn complete_pending_op(po: *mut (), status: i32, result: u64) {
+pub fn complete_pending_op(po: &PendingOperation, status: i32, result: u64) {
     let mut g = SCHED.lock();
-    signal_pending_op_with_result(&mut g, po, status, result);
+    signal_pending_op_with_result(&mut g, addr(po), status, result);
 }
 
 /// Record an interrupt on `irq` and wake every thread blocked on it. Latching: with no
 /// current waiter the pending count increments and the next waiter gets it. Takes `SCHED`,
 /// so it is callable from a DPC handler (the path a device ISR's completion takes). No
 /// allocation, no blocking, no `ObjectRef` drop.
-///
-/// # Safety
-///
-/// `irq` points at a live `InterruptObject`, pinned for the call by a reference the caller holds.
-pub unsafe fn signal_interrupt(irq: *mut ()) {
-    signal_interrupt_in(&mut SCHED.lock(), irq);
+pub fn signal_interrupt(irq: &InterruptObject) {
+    signal_interrupt_in(&mut SCHED.lock(), addr(irq));
 }
 
 /// [`signal_interrupt`] for a caller holding `SCHED`, `irq` a live `InterruptObject`.
@@ -268,34 +241,22 @@ pub(super) fn signal_interrupt_in(g: &mut SchedState, irq: *mut ()) {
 
 /// Consume one pending interrupt on `irq` — called by `sys_wait` on returning for an
 /// [`InterruptObject`], so a driver's wait→service→wait loop wakes once per interrupt.
-///
-/// # Safety
-///
-/// `irq` points at a live `InterruptObject`, pinned for the call by a reference the caller holds.
-pub unsafe fn interrupt_consume(irq: *mut ()) {
+pub fn interrupt_consume(irq: &InterruptObject) {
     let _g = SCHED.lock();
-    // SAFETY: live `InterruptObject` pinned by the caller's handle; `SCHED` held.
-    unsafe { InterruptObject::consume(irq) };
+    // SAFETY: pinned by the borrow; `SCHED` held.
+    unsafe { InterruptObject::consume(addr(irq)) };
 }
 
 /// `true` iff `irq` has an unconsumed pending interrupt. Used by the boot self-test.
-///
-/// # Safety
-///
-/// `irq` points at a live `InterruptObject`, pinned for the call by a reference the caller holds.
-pub unsafe fn interrupt_pending(irq: *mut ()) -> bool {
+pub fn interrupt_pending(irq: &InterruptObject) -> bool {
     let _g = SCHED.lock();
-    // SAFETY: live `InterruptObject` pinned by the caller's reference; `SCHED` held.
-    unsafe { InterruptObject::already_signaled(irq) }
+    // SAFETY: pinned by the borrow; `SCHED` held.
+    unsafe { InterruptObject::already_signaled(addr(irq)) }
 }
 
 /// `true` iff `po` has completed; lets a boot self-test poll without a thread to `sys_wait`.
-///
-/// # Safety
-///
-/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
-pub unsafe fn pending_op_is_signaled(po: *mut ()) -> bool {
+pub fn pending_op_is_signaled(po: &PendingOperation) -> bool {
     let _g = SCHED.lock();
-    // SAFETY: live `PendingOperation` pinned by the caller's reference; `SCHED` held.
-    unsafe { PendingOperation::already_signaled(po) }
+    // SAFETY: pinned by the borrow; `SCHED` held.
+    unsafe { PendingOperation::already_signaled(addr(po)) }
 }

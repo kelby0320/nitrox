@@ -203,9 +203,9 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         sectors: 0,
         flush_command: ATA_FLUSH_CACHE,
         state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
-        intr: ObjectRef::new(intr),
+        intr: Ref::new(intr),
         counted: Counted::new(),
-        wake: ObjectRef::new(wake),
+        wake: Ref::new(wake),
     };
     let Ok(mut disk) = KBox::try_new(disk) else {
         return Err(OUT_OF_MEMORY);

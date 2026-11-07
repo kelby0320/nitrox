@@ -16,15 +16,15 @@ pub enum ResumeDisposition {
 }
 
 /// Deliver a `ChildExited { pid, status }` to `me_obj`'s process's parent channel, if it has
-/// one, and wake its waiters. Caller holds `SCHED`. Borrows the channel pointer (no owned
-/// `ObjectRef`, so no destructor under `SCHED`); enqueue is allocation-free.
+/// one, and wake its waiters. Caller holds `SCHED`. Borrows the channel (no owned reference,
+/// so no destructor under `SCHED`); enqueue is allocation-free.
 fn deliver_child_exited(g: &mut SchedState, me_obj: *mut (), status: ExitStatus) {
     let info: Option<(*mut (), u32)> = {
         // SAFETY: `me_obj` is the running thread, pinned, lock held.
         unsafe { Thread::process_of(me_obj) }.and_then(|p| {
             // SAFETY: the thread pins its live Process; read its parent channel + pid.
             let proc = unsafe { &*(p as *const crate::object::Process) };
-            proc.parent_notif_ptr().map(|chan| (chan, proc.pid_u32()))
+            proc.parent_notif().map(|chan| (addr(chan), proc.pid_u32()))
         })
     };
     if let Some((chan, child_pid)) = info {
@@ -258,8 +258,8 @@ pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification
         let chan: Option<*mut ()> = {
             // SAFETY: `me` is the running thread, pinned, lock held.
             unsafe { Thread::process_of(me_obj) }.and_then(|p| {
-                // SAFETY: the thread pins its live Process; read its channel pointer.
-                unsafe { &*(p as *const crate::object::Process) }.notification_channel_ptr()
+                // SAFETY: the thread pins its live Process; borrow its channel.
+                unsafe { &*(p as *const crate::object::Process) }.notification_channel().map(addr)
             })
         };
         // SAFETY: `chan` is the channel the current Process owns a ref on (alive at least until
@@ -297,12 +297,9 @@ pub(super) const DISP_TERMINATE: u8 = 2;
 /// Resume a thread suspended on a fault: record the supervisor's disposition on it and move
 /// it `suspended`→`ready`. Returns `false` (no-op) if `thread` is not `Suspended` — the
 /// backstop `sys_exception_resume` maps to `InvalidArgument`. Takes `SCHED` itself.
-///
-/// # Safety
-///
-/// `thread` points at a live `Thread`, pinned for the call by a reference the caller holds.
-pub unsafe fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
+pub fn resume_suspended(thread: &Ref<Thread>, disp_tag: u8, disp_code: i32) -> bool {
     let mut g = SCHED.lock();
+    let thread = thread.as_object().as_ptr();
     let Some(i) = g.suspended.iter().position(|r| r.as_ptr() == thread) else {
         return false;
     };
@@ -326,13 +323,10 @@ fn resume_parked(g: &mut SchedState, r: ObjectRef, disp_tag: u8, disp_code: i32)
 
 /// The user registers `thread` faulted with, or `None` if it is not `Suspended`: a copy, taken
 /// under `SCHED`, so a resume that races the caller's copy-out cannot change it.
-///
-/// # Safety
-///
-/// `thread` points at a live `Thread`, pinned for the call by a reference the caller holds.
-pub unsafe fn suspended_registers(thread: *mut ()) -> Option<crate::arch::RegisterValues> {
+pub fn suspended_registers(thread: &Ref<Thread>) -> Option<crate::arch::RegisterValues> {
     let _g = SCHED.lock();
-    // SAFETY: the caller pins `thread` via its Thread handle; `SCHED` held.
+    let thread = thread.as_object().as_ptr();
+    // SAFETY: pinned by the borrowed reference; `SCHED` held.
     unsafe { (Thread::state_now(thread) == ThreadState::Suspended).then(|| Thread::fault_registers(thread)) }
 }
 
