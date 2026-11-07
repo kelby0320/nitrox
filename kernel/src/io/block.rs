@@ -14,7 +14,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec};
 use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::object::header::Ref;
-use crate::object::{DeviceNode, MemoryObject, ObjectRef};
+use crate::object::{DeviceNode, MemoryObject, ObjectRef, PendingOperation};
 use crate::syscall::error::KError;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -62,7 +62,7 @@ pub(crate) struct IrpBox {
     /// Backing store for `irp.buffer.frags`.
     frags: KVec<PhysFrag>,
     /// Owning references that pin the objects `irp` points at.
-    _po: ObjectRef,
+    _po: Ref<PendingOperation>,
     _buffer: ObjectRef,
     _device: ObjectRef,
     /// Intrusive link for [`RECLAIM`], used between completion and reclamation.
@@ -133,7 +133,7 @@ fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: *mut Irp) {
 pub fn dispatch_block_irp(
     device: &Ref<DeviceNode>,
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     opcode: IoOpcode,
     dev_offset: u64,
     buf_offset: u64,
@@ -172,7 +172,7 @@ pub fn dispatch_block_irp(
         dev_offset,
         length,
         IrpBuffer::NONE, // patched to point at `frags` after placement
-        po.as_ptr(),
+        po.as_object().as_ptr(),
         0,
     );
 
@@ -221,7 +221,7 @@ pub fn dispatch_block_irp_into_frames(
     device: &Ref<DeviceNode>,
     frames: &[PhysAddr],
     pin: ObjectRef,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     opcode: IoOpcode,
     dev_offset: u64,
     length: u64,
@@ -250,7 +250,7 @@ pub fn dispatch_block_irp_into_frames(
         dev_offset,
         length,
         IrpBuffer::NONE, // patched to point at `frags` after placement
-        po.as_ptr(),
+        po.as_object().as_ptr(),
         0,
     );
     let bx = KBox::try_new(IrpBox {
@@ -282,16 +282,16 @@ pub fn dispatch_block_irp_into_frames(
 /// medium (a partition passes it to its disk, a RAM disk completes it at once).
 /// `Err` before anything starts: `Unsupported` without a block backend,
 /// `OutOfMemory` if the IRP cannot be allocated.
-pub fn dispatch_block_flush(device: &Ref<DeviceNode>, po: &ObjectRef) -> Result<(), KError> {
+pub fn dispatch_block_flush(device: &Ref<DeviceNode>, po: &Ref<PendingOperation>) -> Result<(), KError> {
     dispatch_block_control(device, po, IrpOp::Flush)
 }
 
 /// Dispatch an IRP that moves no data — a [`Flush`](IrpOp::Flush), a [`Rescan`](IrpOp::Rescan) of
 /// a disk's table or an [`Eject`](IrpOp::Eject) of its medium — completing `po`. Errors as
 /// [`dispatch_block_flush`]'s.
-pub fn dispatch_block_control(device: &Ref<DeviceNode>, po: &ObjectRef, op: IrpOp) -> Result<(), KError> {
+pub fn dispatch_block_control(device: &Ref<DeviceNode>, po: &Ref<PendingOperation>, op: IrpOp) -> Result<(), KError> {
     let backend = device.block_backend().ok_or(KError::Unsupported)?;
-    let irp = Irp::new_block(op, device.as_ptr() as *const (), 0, 0, IrpBuffer::NONE, po.as_ptr(), 0);
+    let irp = Irp::new_block(op, device.as_ptr() as *const (), 0, 0, IrpBuffer::NONE, po.as_object().as_ptr(), 0);
     let bx = KBox::try_new(IrpBox {
         irp,
         frags: KVec::new(),
@@ -388,8 +388,10 @@ unsafe extern "C" fn finish(irp: *mut Irp) {
         let irp = &(*bx_ptr).irp;
         (irp.status, irp.transferred, irp.completion as *mut ())
     };
-    // SAFETY: the box's `_po` pins the `PendingOperation` until thread context reclaims the box.
-    unsafe { crate::sched::complete_pending_op(po, status, transferred) };
+    // SAFETY: the box's `_po` pins the `PendingOperation` at `po` until thread context reclaims the
+    // box.
+    let po = unsafe { &*po.cast::<crate::object::PendingOperation>() };
+    crate::sched::complete_pending_op(po, status, transferred);
     // **Hand the box to thread context; do not drop it here.** Dropping releases
     // `_po`/`_buffer`/`_device` and `frags`, each of which reaches
     // `SlabCache::free`, whose lock is a plain `SpinLock` (preemption off,
@@ -435,17 +437,15 @@ pub fn read_blocking(device: &Ref<DeviceNode>, lba: u64, count: u64, dst: &mut [
     let Ok(po) = crate::object::PendingOperation::try_new() else {
         return false;
     };
-    let po_ref = ObjectRef::new(po);
+    let po_ref = Ref::new(po);
 
     if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, offset, 0, len as u64).is_err() {
         return false;
     }
     (backend.poll)(backend.ctx);
 
-    // SAFETY: `po_ref` is a live `PendingOperation` reference held across the call.
-    let done = unsafe { crate::sched::pending_op_is_signaled(po_ref.as_ptr()) };
-    // SAFETY: as above.
-    let (status, _result) = unsafe { crate::sched::pending_op_completion(po_ref.as_ptr()) };
+    let done = crate::sched::pending_op_is_signaled(&po_ref);
+    let (status, _result) = crate::sched::pending_op_completion(&po_ref);
     // **Not completed is not read**: a command the device kept, or a refusal whose DPC no poll ran,
     // reads status 0 too.
     if !done || status != 0 {

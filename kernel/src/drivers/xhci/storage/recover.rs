@@ -163,13 +163,10 @@ fn dev_field<T: Default>(i: usize, f: impl FnOnce(&Dev) -> T) -> T {
 fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Result<HubResult, Failed> {
     let po = hub::new_operation()?;
     let now = crate::arch::Timer::read_ns();
-    DISKS.issue_hub(i, po.as_ptr(), lun, cdb, len, status_only, now).map_err(Failed::Device)?;
+    DISKS.issue_hub(i, po.as_object().as_ptr(), lun, cdb, len, status_only, now).map_err(Failed::Device)?;
     let at = crate::arch::Timer::read_ns();
-    let signalled = matches!(
-        // SAFETY: `po` pins the `PendingOperation` waited on.
-        unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], at + BIND_NS, at) },
-        crate::sched::WaitResult::Signaled(_)
-    );
+    let signalled =
+        matches!(crate::sched::wait_on(&[po.as_object()], at + BIND_NS, at), crate::sched::WaitResult::Signaled(_));
     if !signalled {
         match DISKS.take_back(i) {
             TakeBack::Taken => return Err(Failed::Timeout),
@@ -178,9 +175,7 @@ fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Resul
             // go: so `po` is not dropped until then, as `hub::wait` waits.
             TakeBack::OnItsWay => {
                 use crate::sched::{WaitResult, wait_on};
-                // SAFETY: `po` pins the `PendingOperation` waited on, and outlives the closure.
-                let done =
-                    || matches!(unsafe { wait_on(&[po.as_ptr() as usize], u64::MAX, 0) }, WaitResult::Signaled(_));
+                let done = || matches!(wait_on(&[po.as_object()], u64::MAX, 0), WaitResult::Signaled(_));
                 while !done() {
                     hub::sleep(1_000_000);
                 }

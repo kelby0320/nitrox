@@ -35,7 +35,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KVec, SpinLock};
 use crate::object::device_node::{CharBackend, DeviceClass, DeviceNode, ResourceDescriptor};
 use crate::object::header::Ref;
-use crate::object::{MemoryObject, ObjectRef};
+use crate::object::{MemoryObject, PendingOperation};
 use crate::syscall::error::KError;
 
 /// One node, and what the table knows about it.
@@ -723,7 +723,7 @@ impl<T> Waiters<T> {
 
 /// A read waiting on the change node: what answers it.
 struct WaitingRead {
-    po: ObjectRef,
+    po: Ref<PendingOperation>,
     buffer: Ref<MemoryObject>,
     buf_offset: u64,
 }
@@ -752,10 +752,9 @@ fn announce() {
 }
 
 /// Write `generation` into `buffer` at `buf_offset` and complete `po` with its eight bytes.
-fn answer(buffer: &MemoryObject, po: &ObjectRef, buf_offset: u64, generation: u64) {
+fn answer(buffer: &MemoryObject, po: &Ref<PendingOperation>, buf_offset: u64, generation: u64) {
     buffer.copy_in(buf_offset as usize, &generation.to_le_bytes());
-    // SAFETY: `po` pins the request's `PendingOperation`.
-    unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, 8) };
+    crate::sched::complete_pending_op(po, 0, 8);
 }
 
 /// [`CharBackend::submit_read`] for `/dev/registry/changes`: **answer at once if the table is past
@@ -763,7 +762,7 @@ fn answer(buffer: &MemoryObject, po: &ObjectRef, buf_offset: u64, generation: u6
 /// `InvalidArgument`; a fifth reader waiting is refused, `WouldBlock`.
 fn changes_read(
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     offset: u64,
     max_len: u64,
@@ -778,7 +777,7 @@ fn read_changes(
     waiting: &SpinLock<Waiters<WaitingRead>>,
     generation: &AtomicU64,
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     offset: u64,
     max_len: u64,

@@ -33,13 +33,12 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     }
 
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    let po_ref = ObjectRef::new(po_box);
+    let po_ref = Ref::new(po_box);
     let mut installed = installing::<1>(pid);
-    let po_h = installed.install(po_ref.clone(), pending_op_rights()).map_err(refused)?;
+    let po_h = installed.install(po_ref.clone().erase(), pending_op_rights()).map_err(refused)?;
 
     if op.length == 0 {
-        // SAFETY: `po_ref` pins the `PendingOperation`.
-        unsafe { crate::sched::complete_pending_op(po_ref.as_ptr(), 0, 0) };
+        crate::sched::complete_pending_op(&po_ref, 0, 0);
         installed.commit();
         return Ok(po_h.bits() as isize);
     }
@@ -83,9 +82,9 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
         return Err(KError::Unsupported);
     }
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    let po_ref = ObjectRef::new(po_box);
+    let po_ref = Ref::new(po_box);
     let mut installed = installing::<1>(pid);
-    let po_h = installed.install(po_ref.clone(), pending_op_rights()).map_err(refused)?;
+    let po_h = installed.install(po_ref.clone().erase(), pending_op_rights()).map_err(refused)?;
     crate::io::block::dispatch_block_control(&device, &po_ref, irp_op)?;
     installed.commit();
     Ok(po_h.bits() as isize)

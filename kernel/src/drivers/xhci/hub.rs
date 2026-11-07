@@ -34,9 +34,9 @@ use crate::libkern::KVec;
 use crate::libkern::block::MAX_DEVICE_NAME;
 use crate::libkern::printable::Printable;
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
+use crate::object::PendingOperation;
 use crate::object::device_node::{BlockGeometry, DeviceClass, DeviceNode, ResourceDescriptor};
 use crate::object::header::Ref;
-use crate::object::{ObjectRef, PendingOperation};
 use crate::syscall::error::KError;
 
 /// How long the boot waits for the first round.
@@ -145,8 +145,7 @@ pub(super) extern "C" fn main(_arg: usize) {
     let mut attached: KVec<Option<Attached>> = KVec::new();
     if attached.try_reserve(x.max_ports as usize + 1).is_err() {
         crate::kprintln!("usb: no memory for the hub thread's ports; nothing is enumerated");
-        // SAFETY: `x.first_round` pins its `PendingOperation` for the controller's life.
-        unsafe { crate::sched::complete_pending_op(x.first_round.as_ptr(), 0, 0) };
+        crate::sched::complete_pending_op(&x.first_round, 0, 0);
         return;
     }
     while attached.push_within_capacity(None).is_ok() {}
@@ -178,8 +177,7 @@ pub(super) extern "C" fn main(_arg: usize) {
         found,
         crate::arch::Timer::read_ns().wrapping_sub(start) / 1_000_000
     );
-    // SAFETY: `x.first_round` pins its `PendingOperation` for the controller's life.
-    unsafe { crate::sched::complete_pending_op(x.first_round.as_ptr(), 0, found) };
+    crate::sched::complete_pending_op(&x.first_round, 0, found);
 
     // **Then every later change**, woken by the DPC. The wake latches, so changes that land while
     // a device is being enumerated are found by the scan after it.
@@ -189,10 +187,8 @@ pub(super) extern "C" fn main(_arg: usize) {
         // idle machine, where nothing else wakes this.
         let now = crate::arch::Timer::read_ns();
         let until = super::storage::bound(now);
-        // SAFETY: `x.hub_wake` pins the `InterruptObject` for the controller's life.
-        match unsafe { crate::sched::wait_on(&[x.hub_wake.as_ptr() as usize], until.unwrap_or(u64::MAX), now) } {
-            // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
-            crate::sched::WaitResult::Signaled(_) => unsafe { crate::sched::interrupt_consume(x.hub_wake.as_ptr()) },
+        match crate::sched::wait_on(&[x.hub_wake.as_object()], until.unwrap_or(u64::MAX), now) {
+            crate::sched::WaitResult::Signaled(_) => crate::sched::interrupt_consume(&x.hub_wake),
             _ if until.is_some() => {}
             _ => sleep(1_000_000),
         }
@@ -675,7 +671,8 @@ fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u1
         }
         base + probe as u64 * 16
     };
-    *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
+    *x.waiting.lock() =
+        Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_object().as_ptr())));
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, true));
     mem.ring.push(&mut slots, Trb::data_in(mem.data.phys().as_u64(), len as u32));
@@ -718,7 +715,8 @@ pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8;
     let next = mem.ring.next_slot();
     let status_slot = if next + 1 == super::RING_TRBS - 1 { 0 } else { next + 1 };
     let status_at = base + status_slot as u64 * 16;
-    *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
+    *x.waiting.lock() =
+        Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_object().as_ptr())));
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, false));
     let at = mem.ring.push(&mut slots, Trb::status(false));
@@ -757,7 +755,8 @@ pub(super) fn control_out_data(
         }
         base + probe as u64 * 16
     };
-    *x.waiting.lock() = Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_ptr())));
+    *x.waiting.lock() =
+        Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_object().as_ptr())));
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup_out(request));
     mem.ring.push(&mut slots, Trb::data_out(mem.data.phys().as_u64(), len as u32));
@@ -821,8 +820,7 @@ fn lights_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
                 }
             }
         };
-        // SAFETY: `po` pins the lights write's `PendingOperation`, dropped after this.
-        unsafe { crate::sched::complete_pending_op(po.as_ptr(), status, (status == 0) as u64) };
+        crate::sched::complete_pending_op(&po, status, (status == 0) as u64);
         drop(po);
     }
 }
@@ -835,7 +833,7 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
         let c = x.cmd.lock();
         c.mem.phys().as_u64() + c.ring.next_slot() as u64 * 16
     };
-    *x.waiting.lock() = Some(Waiting::new(Awaited::Command { trb: sent }, PoPtr(po.as_ptr())));
+    *x.waiting.lock() = Some(Waiting::new(Awaited::Command { trb: sent }, PoPtr(po.as_object().as_ptr())));
     {
         let mut c = x.cmd.lock();
         let CommandRing { mem, ring } = &mut *c;
@@ -860,34 +858,26 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
 /// complete. On a timeout the waiting record is taken back, so the DPC cannot complete an operation
 /// this thread is about to drop; if the DPC already took it, its completion is on the way, and is
 /// waited for.
-fn wait(x: &Xhci, po: &ObjectRef, bound_ns: u64) -> Option<(u8, u64)> {
+fn wait(x: &Xhci, po: &Ref<PendingOperation>, bound_ns: u64) -> Option<(u8, u64)> {
     let now = crate::arch::Timer::read_ns();
-    let done = matches!(
-        // SAFETY: `po` pins the `PendingOperation` waited on.
-        unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], now + bound_ns, now) },
-        crate::sched::WaitResult::Signaled(_)
-    );
+    let done =
+        matches!(crate::sched::wait_on(&[po.as_object()], now + bound_ns, now), crate::sched::WaitResult::Signaled(_));
     if !done {
         if x.waiting.lock().take().is_some() {
             return None;
         }
-        while !matches!(
-            // SAFETY: `po` pins the `PendingOperation` waited on.
-            unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) },
-            crate::sched::WaitResult::Signaled(_)
-        ) {
+        while !matches!(crate::sched::wait_on(&[po.as_object()], u64::MAX, 0), crate::sched::WaitResult::Signaled(_)) {
             sleep(1_000_000);
         }
     }
-    // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-    let (status, result) = unsafe { crate::sched::pending_op_completion(po.as_ptr()) };
+    let (status, result) = crate::sched::pending_op_completion(po);
     Some((status as u8, result))
 }
 
 /// A fresh operation for one wait.
-pub(super) fn new_operation() -> Result<ObjectRef, Failed> {
+pub(super) fn new_operation() -> Result<Ref<PendingOperation>, Failed> {
     let po = PendingOperation::try_new().map_err(|_| Failed::NoMemory)?;
-    Ok(ObjectRef::new(po))
+    Ok(Ref::new(po))
 }
 
 /// **Enable `port`**: a USB 2 port is reset and given its recovery time; a USB 3 port is enabled
@@ -963,8 +953,7 @@ pub(super) fn input_bytes<'a>(input: &'a mut Programmed, x: &Xhci) -> &'a mut [u
 /// Sleep for `ns`: a wait on nothing with a deadline, so the CPU runs something else meanwhile.
 pub(super) fn sleep(ns: u64) {
     let now = crate::arch::Timer::read_ns();
-    // SAFETY: no objects: a sleep until the deadline.
-    let _ = unsafe { crate::sched::wait_on(&[], now + ns, now) };
+    let _ = crate::sched::sleep_until(now + ns, now);
 }
 
 fn poll(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {

@@ -638,21 +638,19 @@ fn resume_suspended_moves_to_ready_and_sets_disposition() {
 #[test]
 fn a_suspended_threads_registers_are_its_faults_until_it_resumes() {
     init_global_heap();
-    let th = inert_user_ref(1, 1);
-    let obj = th.as_ptr();
+    let th = Ref::new(Thread::try_new(1, 1).unwrap());
+    let obj = th.as_object().as_ptr();
     let regs = crate::arch::RegisterValues { rip: 0x40_1000, ..Default::default() };
     // SAFETY: pinned, single-threaded; as `suspend_with_fault` records them.
     unsafe {
         Thread::set_fault_registers(obj, regs);
         Thread::set_state(obj, ThreadState::Suspended);
     }
-    // SAFETY: pinned by `th`.
-    let read = unsafe { suspended_registers(obj) };
+    let read = suspended_registers(&th);
     assert_eq!(read, Some(regs));
     // SAFETY: pinned. The resume.
     unsafe { Thread::set_state(obj, ThreadState::Ready) };
-    // SAFETY: pinned by `th`.
-    assert_eq!(unsafe { suspended_registers(obj) }, None);
+    assert_eq!(suspended_registers(&th), None);
 }
 
 #[test]
@@ -851,7 +849,7 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
     st.ended_pids = Reserved::with_capacity(4).unwrap();
     st.reaper = Some(inert_ref(99));
     let (process, _root) = user_process_ref(5);
-    let parent = ObjectRef::new(NotificationChannel::try_new().unwrap());
+    let parent = Ref::new(NotificationChannel::try_new().unwrap());
     let recorded = ExitStatus { kind: ExitKind::Normal as u32, code: 3 };
     {
         let p = process.as_ptr();
@@ -872,8 +870,7 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
     assert!(st.reaper.is_none(), "the reaper was woken");
     // SAFETY: pinned by `me`; single-threaded.
     assert!(unsafe { Thread::process_ended(me.as_ptr()) });
-    // SAFETY: the parent channel is pinned by `parent`; single-threaded.
-    let heard = unsafe { NotificationChannel::try_recv(parent.as_ptr()) }.expect("ChildExited");
+    let heard = notif_try_recv(&parent).expect("ChildExited");
     assert_eq!(heard.as_bytes(), Notification::child_exited(5, recorded).as_bytes());
     drop((sibling, me));
 }
@@ -882,8 +879,7 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
 #[test]
 fn a_thread_its_process_marked_waits_for_nothing_but_its_io() {
     init_global_heap();
-    // SAFETY: no objects, so nothing to pin.
-    let (heeded, io) = with_current(an_ending_thread(), || unsafe { (wait_on(&[], 1, 0), wait_on_io(&[], 0, 0)) });
+    let (heeded, io) = with_current(an_ending_thread(), || (wait_on(&[], 1, 0), wait_on_io(&[], 0, 0)));
     assert!(matches!(heeded, WaitResult::Ended));
     assert!(matches!(io, WaitResult::TimedOut), "a poll for I/O answers as a poll");
 }

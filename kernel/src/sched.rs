@@ -196,6 +196,11 @@ pub(crate) fn push_reserved<T>(list: &mut Reserved<T>, val: T, what: &str) {
     }
 }
 
+/// The address the objects' accessors take for `object`, which the borrow pins for the call.
+fn addr<T>(object: &T) -> *mut () {
+    core::ptr::from_ref(object).cast_mut().cast()
+}
+
 /// The page-table root a thread should run under: its own process root if it
 /// has one, else the boot root. Caller holds the run-queue lock.
 ///

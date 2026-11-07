@@ -501,7 +501,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `an_array_is_copied_through_user_bytes_at_any_alignment` and
   `a_typed_copy_moves_exactly_its_values_bytes`.
 
-- [ ] **kobj-o7** narrow: the scheduler's entry points take a type-erased `*mut ()` with the
+- [x] **kobj-o7** narrow: the scheduler's entry points take a type-erased `*mut ()` with the
   contract "a live `T` pinned by the caller's reference", so every syscall site writes `unsafe {
   crate::sched::f(obj.as_ptr(), ..) }` on a reference it already holds as an `ObjectRef` — 60 sites
   (`grep -E 'crate::sched::[a-z_]+\([a-z_.]*\.as_ptr\(\)'` over non-test `kernel/src`: 25 in
@@ -516,6 +516,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   sched call after the `ObjectRef` dropped, or on the wrong type, and removes about 26 unsafe
   blocks from `syscall/table.rs`. Depends on: kobj-o1. ownership/soundness. Value medium, effort
   medium. **Plan**, in P1.
+  Done in `89ce369f`: every entry point but the three drop hooks and `set_thread_affinity`, which E.9
+  removes, takes its object borrowed and is safe; the syscall layer keeps 2 `unsafe` blocks of 28.
 
 - [x] **kobj-o8** encapsulate: bounded lists pushed under SCHED rely on a `try_reserve` at
   construction matching a separate `MAX` constant, and the waiter list (`add_waiter`/`remove_waiter`/
@@ -974,7 +976,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   lock half; sched-o2 for the liveness half. abi, ownership, soundness, concurrency, opportunities.
   Value high, effort large. **Plan**, as kobj-o3, in P1.
 
-- [ ] **sched-o2** encapsulate: scheduler entry points take a type-erased `*mut ()` (and
+- [x] **sched-o2** encapsulate: scheduler entry points take a type-erased `*mut ()` (and
   `wait_on`/`wait_on_io` take `&[usize]`) whose kind and liveness the caller promises, though nearly
   every caller already holds a type-checked ObjectRef and passes `.as_ptr()` — about 98 sites (29
   `pub unsafe fn` by `grep -rhoE "pub unsafe fn [a-z_]+" kernel/src/sched.rs kernel/src/sched/`; 26
@@ -999,6 +1001,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   SCHED-held accessor, the class behind the stale-`us_reg` crash and the `is_live`/magic backstops.
   Depends on: nothing. abi, ownership, soundness, concurrency, opportunities. Value high, effort
   large. **Plan**, as kobj-o7, in P1.
+  Done in `89ce369f`: the entry points take a `&T` for the thirteen `Shared` kinds and a `&Ref<Thread>`
+  for a thread, the borrow the pin; `wait_on` takes `&[&ObjectRef]` and dispatches by header. The
+  six callers holding only a pointer an IRP or a driver pins form the `&T` in one `unsafe` each.
 
 - [ ] **sched-o3** encapsulate: per-CPU statics indexed by `this_cpu()` whose correctness rests on
   a comment that the caller cannot migrate between reading the index and using the slot — 28 sites
@@ -1109,6 +1114,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (the allocator under rank 1) at the clone sites, and a raw child pointer used after its owner is
   gone. Depends on: nothing (made safe internally by sched-o2's `downcast_ref`). opportunities.
   Value medium, effort small. **Plan**, in P1.
+  Partly done in `89ce369f`: `Process::notification_channel` and `parent_notif` and
+  `UserspaceServerReg::endpoint` borrow what their owner holds; `Thread::process`, for the six
+  `process_of` reads, is J.7's.
 
 - [x] **sched-o9** encapsulate: ObjectRefs that a SCHED-held path must release are carried out of
   the locked block by hand (`drop(g); drop(x)`, `Err(returned) => returned`, orphans arrays dropped
@@ -2174,7 +2182,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   kernel memory, and out-of-window or unaligned config reads through a safe trait method. Depends
   on: nothing. Lenses: abi, soundness, opportunities. Value medium, effort medium. **Plan**, in P5.
 
-- [ ] **drv-o8** encapsulate: the scheduler's object calls (`complete_pending_op`,
+- [x] **drv-o8** encapsulate: the scheduler's object calls (`complete_pending_op`,
   `pending_op_is_signaled`, `pending_op_completion`, `signal_interrupt`, `interrupt_consume`,
   `wait_on`) take `*mut ()` with "pinned by a reference the caller holds", and most callers pass
   `.as_ptr()` of an `ObjectRef` they hold, each in its own unsafe block; a sleep is spelled
@@ -2190,6 +2198,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `kernel/src/sched/wait.rs`. Closes: a PO or interrupt operation on a wrong-typed or already-dead
   object address. Depends on: drv-o2 (or a runtime `object_type()` check in each wrapper). Lenses:
   soundness, concurrency, opportunities. Value medium, effort medium. **Plan**, as kobj-o7, in P1.
+  Done in `89ce369f`: the PO and interrupt calls take `&PendingOperation` and `&InterruptObject`, the
+  drivers' POs and wake objects are `Ref<T>`s, and the hub's sleep is `sched::sleep_until`.
 
 - [x] **drv-o9** encapsulate: AHCI slot-0 state (`inflight`, `issued_at`, `dead`, `fault`) is kept
   as atomics with comments saying "accessed under pending's lock", plus `unsafe fn issue_locked`

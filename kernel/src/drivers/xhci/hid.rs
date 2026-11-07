@@ -31,7 +31,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::mm::dma::{DmaBuffer, Programmed};
 use crate::object::device_node::{CharBackend, DeviceNode, ResourceDescriptor};
 use crate::object::header::Ref;
-use crate::object::{MemoryObject, ObjectRef};
+use crate::object::{MemoryObject, PendingOperation};
 use crate::syscall::error::KError;
 
 /// USB input nodes a boot can publish.
@@ -568,8 +568,7 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
     // project builds panics on the other order.
     if halted {
         x.hid_halted.store(true, Ordering::Release);
-        // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
-        unsafe { crate::sched::signal_interrupt(x.hub_wake.as_ptr()) };
+        crate::sched::signal_interrupt(&x.hub_wake);
     }
     let Some((node, epoch)) = target else { return };
     // **Each batch decoded under the table's lock and pushed after it**: one, unless a bitmap
@@ -760,7 +759,7 @@ fn let_go_meanwhile(nodes: &Nodes, node: usize, decoder: Decoder, now: u64, mut 
 
 fn submit_read(
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     _offset: u64,
     max_len: u64,
@@ -778,7 +777,7 @@ static LIGHTS_TAKEN: AtomicU32 = AtomicU32::new(0);
 /// lights being older than the ones that will be set. [`Nodes::write`], on the boot's.
 fn submit_write(
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     len: u64,
     ctx: *mut (),
@@ -798,7 +797,7 @@ pub(super) enum LightsTo {
 }
 
 /// **The lights waiting for node `node`**, and where they go. From the hub thread.
-pub(super) fn take_lights(x: &Xhci, node: usize) -> Option<(ObjectRef, u8, LightsTo)> {
+pub(super) fn take_lights(x: &Xhci, node: usize) -> Option<(Ref<PendingOperation>, u8, LightsTo)> {
     let (po, lights) = NODES.lights.lock()[node].take()?;
     let to = match x.hid.lock().entries.iter().flatten().find(|b| b.node == node) {
         None => LightsTo::Gone,

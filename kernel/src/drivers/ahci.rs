@@ -21,11 +21,11 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
+use crate::object::InterruptObject;
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
 use crate::object::header::Ref;
-use crate::object::{InterruptObject, ObjectRef};
 
 const HBA_CAP: u64 = 0x00;
 const HBA_GHC: u64 = 0x04;
@@ -191,10 +191,10 @@ pub struct AhciDisk {
     flush_command: u8,
     /// The port lock: slot 0 and its queue, taken from thread context and the ISR alike.
     state: IrqSpinLock<PortState>,
-    intr: ObjectRef,
+    intr: Ref<InterruptObject>,
     counted: Counted,
     /// What wakes the watch thread: a fault's DPC signals it. An `InterruptObject`.
-    wake: ObjectRef,
+    wake: Ref<InterruptObject>,
 }
 
 // SAFETY: the disk state is set up once at boot and is immutable thereafter except for `state`,
@@ -685,8 +685,7 @@ fn on_interrupt(d: &AhciDisk) {
 
 fn ahci_fault_dpc(_ctx: *mut ()) {
     if let Some(d) = AHCI.get() {
-        // SAFETY: `d.wake` pins the disk's `InterruptObject`.
-        unsafe { crate::sched::signal_interrupt(d.wake.as_ptr()) };
+        crate::sched::signal_interrupt(&d.wake);
     }
 }
 
@@ -698,11 +697,9 @@ extern "C" fn watch(_arg: usize) {
     };
     while !d.state.lock().dead {
         let now = clock();
-        // SAFETY: `d.wake` pins the disk's `InterruptObject`.
-        let woke = unsafe { crate::sched::wait_on(&[d.wake.as_ptr() as usize], due_at(d, now), now) };
+        let woke = crate::sched::wait_on(&[d.wake.as_object()], due_at(d, now), now);
         if let crate::sched::WaitResult::Signaled(_) = woke {
-            // SAFETY: as above.
-            unsafe { crate::sched::interrupt_consume(d.wake.as_ptr()) };
+            crate::sched::interrupt_consume(&d.wake);
         }
         if let Some(irp) = claim(d, clock(), false) {
             said(d, recover(d, irp));
@@ -821,8 +818,7 @@ fn ahci_poll(_ctx: *mut ()) {
 
 fn ahci_intr_dpc(_ctx: *mut ()) {
     if let Some(d) = AHCI.get() {
-        // SAFETY: `d.intr` pins the disk's `InterruptObject`.
-        unsafe { crate::sched::signal_interrupt(d.intr.as_ptr()) };
+        crate::sched::signal_interrupt(&d.intr);
     }
 }
 

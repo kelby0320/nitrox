@@ -39,16 +39,10 @@ pub enum WaitResult {
 /// addresses) with an optional `deadline_ns` (absolute monotonic; `0` = poll, `u64::MAX` =
 /// no timeout), block until one fires, then unregister and report which signaled. `now` is
 /// the current monotonic time. Registration and block happen under a single `SCHED` hold, so
-/// a waker cannot slip between them — no lost wakeup.
-///
-/// # Safety
-///
-/// Each of `objs` is the address of a live `Timer`, `NotificationChannel`, `IpcChannel`,
-/// `PendingOperation` or `InterruptObject`, pinned by a reference the caller holds until this
-/// returns.
-pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
-    // SAFETY: the caller's contract.
-    unsafe { wait(objs, deadline_ns, now, true) }
+/// a waker cannot slip between them — no lost wakeup. Each object's borrow pins it until this
+/// returns; one that cannot be waited on is refused as over a reserve.
+pub fn wait_on(objs: &[&ObjectRef], deadline_ns: u64, now: u64) -> WaitResult {
+    wait(objs, deadline_ns, now, true)
 }
 
 /// `sys_wait` on no handles: sleep until `deadline_ns`, on the deadline slot every thread holds,
@@ -58,8 +52,7 @@ pub fn sleep_until(deadline_ns: u64, now: u64) -> SysResult {
     if deadline_ns == 0 || deadline_ns == u64::MAX {
         return Err(KError::InvalidArgument);
     }
-    // SAFETY: an empty wait set has no object to pin.
-    match unsafe { wait_on(&[], deadline_ns, now) } {
+    match wait_on(&[], deadline_ns, now) {
         WaitResult::OutOfMemory => Err(KError::OutOfMemory),
         _ => Err(KError::TimedOut),
     }
@@ -67,18 +60,20 @@ pub fn sleep_until(deadline_ns: u64, now: u64) -> SysResult {
 
 /// [`wait_on`] for a wait that I/O in flight depends on: it never answers [`WaitResult::Ended`],
 /// and one the process's exit woke answers as a timeout, for the caller to wait again.
-///
-/// # Safety
-///
-/// As [`wait_on`].
-pub unsafe fn wait_on_io(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
-    // SAFETY: the caller's contract.
-    unsafe { wait(objs, deadline_ns, now, false) }
+pub fn wait_on_io(objs: &[&ObjectRef], deadline_ns: u64, now: u64) -> WaitResult {
+    wait(objs, deadline_ns, now, false)
 }
 
-/// [`wait_on`], with its contract, answering [`WaitResult::Ended`] only if `heed_exit`.
-unsafe fn wait(objs: &[usize], deadline_ns: u64, now: u64, heed_exit: bool) -> WaitResult {
-    debug_assert!(objs.len() <= MAX_WAIT_HANDLES);
+/// [`wait_on`], answering [`WaitResult::Ended`] only if `heed_exit`.
+fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> WaitResult {
+    if refs.len() > MAX_WAIT_HANDLES {
+        return WaitResult::OutOfMemory;
+    }
+    let mut addrs = [0usize; MAX_WAIT_HANDLES];
+    for (a, o) in addrs.iter_mut().zip(refs) {
+        *a = o.as_ptr() as usize;
+    }
+    let objs = &addrs[..refs.len()];
     let me_ptr;
     {
         let mut g = SCHED.lock();
@@ -94,8 +89,8 @@ unsafe fn wait(objs: &[usize], deadline_ns: u64, now: u64, heed_exit: bool) -> W
         let mut signaled = [false; MAX_WAIT_HANDLES];
         let mut any = false;
         for (i, &o) in objs.iter().enumerate() {
-            // SAFETY: `o` is a live waitable pinned by the caller's `ObjectRef`;
-            // `SCHED` held. Dispatches by the object's header type.
+            // SAFETY: `o` is pinned by the caller's borrow; `SCHED` held. Dispatches by the
+            // object's header type, which also answers for a kind that cannot be waited on.
             if unsafe { obj_already_signaled(o as *mut (), now) } {
                 signaled[i] = true;
                 any = true;
@@ -117,7 +112,7 @@ unsafe fn wait(objs: &[usize], deadline_ns: u64, now: u64, heed_exit: bool) -> W
         let mut registered = 0usize;
         let mut failed = false;
         for &o in objs {
-            // SAFETY: live waitable, `SCHED` held.
+            // SAFETY: pinned by the caller's borrow, `SCHED` held.
             if unsafe { obj_add_waiter(o as *mut (), me_ptr) }.is_err() {
                 failed = true;
                 break;
@@ -134,7 +129,7 @@ unsafe fn wait(objs: &[usize], deadline_ns: u64, now: u64, heed_exit: bool) -> W
         if failed {
             // Unwind the partial registration and bail without blocking.
             for &o in &objs[..registered] {
-                // SAFETY: live Timer, `SCHED` held.
+                // SAFETY: pinned by the caller's borrow, `SCHED` held.
                 unsafe { obj_remove_waiter(o as *mut (), me_ptr) };
             }
             // SAFETY: live Thread, `SCHED` held.
@@ -156,7 +151,7 @@ unsafe fn wait(objs: &[usize], deadline_ns: u64, now: u64, heed_exit: bool) -> W
         // SAFETY: live Thread (we run on it), `SCHED` held.
         let bits = unsafe { Thread::wait_signaled(me_ptr) };
         for &o in objs {
-            // SAFETY: live Timer (caller still holds its `ObjectRef`), `SCHED` held.
+            // SAFETY: pinned by the caller's borrow, still held; `SCHED` held.
             unsafe { obj_remove_waiter(o as *mut (), me_ptr) };
         }
         // SAFETY: live Thread, `SCHED` held.

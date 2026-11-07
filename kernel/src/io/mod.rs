@@ -20,7 +20,7 @@ use crate::libkern::KBox;
 use crate::libkern::io_op::IoOpcode;
 use crate::mm::heap::hhdm_offset;
 use crate::object::header::Ref;
-use crate::object::{DeviceNode, InterruptObject, MemoryObject, ObjectRef, PendingOperation};
+use crate::object::{DeviceNode, InterruptObject, MemoryObject, PendingOperation};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 /// The [`InterruptObject`] self-test's DPC, a static as every queued DPC must outlive its drain.
@@ -33,7 +33,8 @@ static INTR_TEST_OBJ: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 fn intr_test_dpc(_: *mut ()) {
     // SAFETY: the self-test set its live `InterruptObject` before queuing this, and drains it
     // before letting the object go, on the one CPU there is before the APs come up.
-    unsafe { crate::sched::signal_interrupt(INTR_TEST_OBJ.load(Ordering::Acquire)) };
+    let irq = unsafe { &*INTR_TEST_OBJ.load(Ordering::Acquire).cast::<crate::object::InterruptObject>() };
+    crate::sched::signal_interrupt(irq);
 }
 
 /// Boot self-test for the I/O spine. Proves, without real hardware:
@@ -80,7 +81,7 @@ fn block_irp_self_test() {
         }
     };
     let po = match PendingOperation::try_new() {
-        Ok(po) => ObjectRef::new(po),
+        Ok(po) => Ref::new(po),
         Err(_) => {
             crate::kprintln!("io: self-test SKIP (PO alloc failed)");
             return;
@@ -97,8 +98,7 @@ fn block_irp_self_test() {
     // interrupt-dispatch tail.
     crate::dpc::run_pending();
 
-    // SAFETY: `po_check` is a live `PendingOperation` reference held across the call.
-    let (status, result) = unsafe { crate::sched::pending_op_completion(po_check.as_ptr()) };
+    let (status, result) = crate::sched::pending_op_completion(&po_check);
     if status != 0 || result != LEN as u64 {
         crate::kprintln!("io: block-read self-test FAIL (status {} result {})", status, result);
         return;
@@ -136,25 +136,22 @@ fn buffer_matches_pattern(buffer: &MemoryObject, len: usize) -> bool {
 
 fn interrupt_object_self_test() {
     let irq = match InterruptObject::try_new() {
-        Ok(io) => ObjectRef::new(io),
+        Ok(io) => Ref::new(io),
         Err(_) => {
             crate::kprintln!("io: interrupt self-test SKIP (alloc failed)");
             return;
         }
     };
-    INTR_TEST_OBJ.store(irq.as_ptr(), Ordering::Release);
+    INTR_TEST_OBJ.store(irq.as_ptr().cast(), Ordering::Release);
     crate::dpc::enqueue(&INTR_TEST_DPC);
     crate::dpc::run_pending();
 
-    // SAFETY: `irq` is a live `InterruptObject` reference held across the call.
-    if !unsafe { crate::sched::interrupt_pending(irq.as_ptr()) } {
+    if !crate::sched::interrupt_pending(&irq) {
         crate::kprintln!("io: interrupt self-test FAIL (not latched after DPC)");
         return;
     }
-    // SAFETY: `irq` is a live `InterruptObject` reference held across the call.
-    unsafe { crate::sched::interrupt_consume(irq.as_ptr()) };
-    // SAFETY: `irq` is a live `InterruptObject` reference held across the call.
-    if unsafe { crate::sched::interrupt_pending(irq.as_ptr()) } {
+    crate::sched::interrupt_consume(&irq);
+    if crate::sched::interrupt_pending(&irq) {
         crate::kprintln!("io: interrupt self-test FAIL (still latched after consume)");
         return;
     }
@@ -204,12 +201,11 @@ pub fn reclaim_under_load_self_test() {
     let before = block::reclaim_backlog();
     let mut peak = before;
     for _ in 0..READS {
-        let Ok(po) = PendingOperation::try_new().map(ObjectRef::new) else {
+        let Ok(po) = PendingOperation::try_new().map(Ref::new) else {
             panic!("io: reclaim-under-load self-test: no memory for an operation");
         };
         let sent = block::dispatch_block_irp(&device, &buffer, &po, IoOpcode::Read, 0, 0, 512).is_ok();
-        // SAFETY: `po` pins its live `PendingOperation`.
-        if !sent || !wait(&|| unsafe { crate::sched::pending_op_is_signaled(po.as_ptr()) }) {
+        if !sent || !wait(&|| crate::sched::pending_op_is_signaled(&po)) {
             panic!("io: reclaim-under-load self-test: a read was refused or never completed");
         }
         peak = peak.max(block::reclaim_backlog());

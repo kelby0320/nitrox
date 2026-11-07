@@ -137,7 +137,7 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 8192 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
-    let (disk, po) = (Ref::new(node), ObjectRef::new(PendingOperation::try_new().unwrap()));
+    let (disk, po) = (Ref::new(node), Ref::new(PendingOperation::try_new().unwrap()));
     let frames: std::vec::Vec<PhysAddr> = (0..9).map(|i| PhysAddr(0x10_0000 + i * 0x3000)).collect();
     let page = PAGE_SIZE as u64;
     let write = |frames: &[PhysAddr], length| {
@@ -183,7 +183,7 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
     let disk = Ref::new(node);
     let buffer = Ref::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap());
-    let po = || ObjectRef::new(PendingOperation::try_new().unwrap());
+    let po = || Ref::new(PendingOperation::try_new().unwrap());
     let frames = [PhysAddr(0x10_0000), PhysAddr(0x20_0000)];
     // Each request through both entry points, its operation's status once settled.
     let both = |offset: u64, length: u64| {
@@ -200,9 +200,8 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
         );
         crate::dpc::run_pending();
         reclaim_completed();
-        // SAFETY: each pins its live `PendingOperation`; a single-threaded test stands in for `SCHED`.
-        let status = |p: &ObjectRef| unsafe {
-            PendingOperation::already_signaled(p.as_ptr()).then(|| PendingOperation::status(p.as_ptr()))
+        let status = |p: &Ref<PendingOperation>| {
+            crate::sched::pending_op_is_signaled(p).then(|| crate::sched::pending_op_completion(p).0)
         };
         ((r, status(&a)), (s, status(&b)))
     };
@@ -341,14 +340,13 @@ fn more_refusals_than_the_dpc_queue_holds_each_complete() {
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
     let disk = Ref::new(node);
     let buffer = Ref::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
-    let pos: std::vec::Vec<ObjectRef> =
-        (0..100).map(|_| ObjectRef::new(PendingOperation::try_new().unwrap())).collect();
+    let pos: std::vec::Vec<Ref<PendingOperation>> =
+        (0..100).map(|_| Ref::new(PendingOperation::try_new().unwrap())).collect();
     for po in &pos {
         assert_eq!(dispatch_block_irp(&disk, &buffer, po, IoOpcode::Read, 64 * 512, 0, 512), Ok(()));
     }
-    // SAFETY: each pins its live `PendingOperation`; a single-threaded test stands in for `SCHED`.
-    let settled = |po: &ObjectRef| unsafe {
-        PendingOperation::already_signaled(po.as_ptr()).then(|| PendingOperation::status(po.as_ptr()))
+    let settled = |po: &Ref<PendingOperation>| {
+        crate::sched::pending_op_is_signaled(po).then(|| crate::sched::pending_op_completion(po).0)
     };
     crate::dpc::run_pending();
     reclaim_completed();
