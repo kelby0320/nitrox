@@ -516,8 +516,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   sched call after the `ObjectRef` dropped, or on the wrong type, and removes about 26 unsafe
   blocks from `syscall/table.rs`. Depends on: kobj-o1. ownership/soundness. Value medium, effort
   medium. **Plan**, in P1.
-  Done in `89ce369f`: every entry point but the three drop hooks and `set_thread_affinity`, which E.9
-  removes, takes its object borrowed and is safe; the syscall layer keeps 2 `unsafe` blocks of 28.
+  Done in `89ce369f` and `60f149de`: every entry point but the three drop hooks and
+  `complete_pending_op_at` takes its object borrowed and is safe; the syscall layer keeps 1 `unsafe`
+  block of 28.
 
 - [x] **kobj-o8** encapsulate: bounded lists pushed under SCHED rely on a `try_reserve` at
   construction matching a separate `MAX` constant, and the waiter list (`add_waiter`/`remove_waiter`/
@@ -1001,9 +1002,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   SCHED-held accessor, the class behind the stale-`us_reg` crash and the `is_live`/magic backstops.
   Depends on: nothing. abi, ownership, soundness, concurrency, opportunities. Value high, effort
   large. **Plan**, as kobj-o7, in P1.
-  Done in `89ce369f`: the entry points take a `&T` for the thirteen `Shared` kinds and a `&Ref<Thread>`
-  for a thread, the borrow the pin; `wait_on` takes `&[&ObjectRef]` and dispatches by header. The
-  six callers holding only a pointer an IRP or a driver pins form the `&T` in one `unsafe` each.
+  Done in `89ce369f` and `60f149de`: the entry points take a `&T` for the thirteen `Shared` kinds and a
+  `&Ref<Thread>` for a thread, the borrow the pin; `wait_on` takes `&[&ObjectRef]` and dispatches by
+  header. Three of the six callers holding only a pointer an IRP or a driver pins form the `&T` in
+  one `unsafe` each; xHCI's three, whose pin the hub thread lets go of once it sees the completion,
+  complete by address.
 
 - [ ] **sched-o3** encapsulate: per-CPU statics indexed by `this_cpu()` whose correctness rests on
   a comment that the caller cannot migrate between reading the index and using the slot — 28 sites
@@ -2198,8 +2201,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   `kernel/src/sched/wait.rs`. Closes: a PO or interrupt operation on a wrong-typed or already-dead
   object address. Depends on: drv-o2 (or a runtime `object_type()` check in each wrapper). Lenses:
   soundness, concurrency, opportunities. Value medium, effort medium. **Plan**, as kobj-o7, in P1.
-  Done in `89ce369f`: the PO and interrupt calls take `&PendingOperation` and `&InterruptObject`, the
-  drivers' POs and wake objects are `Ref<T>`s, and the hub's sleep is `sched::sleep_until`.
+  Done in `89ce369f` and `60f149de`: the PO and interrupt calls take `&PendingOperation` and
+  `&InterruptObject`, xHCI's completions an address, the drivers' POs and wake objects are `Ref<T>`s,
+  and the hub's sleep is `sched::sleep_until`.
 
 - [x] **drv-o9** encapsulate: AHCI slot-0 state (`inflight`, `issued_at`, `dead`, `fault`) is kept
   as atomics with comments saying "accessed under pending's lock", plus `unsafe fn issue_locked`
