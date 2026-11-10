@@ -38008,3 +38008,25 @@ Part J's sixth sub-part, `typed-layers.md` § J.6, built on `pre-phase-7/part-j6
   (two 256-byte buffers an entry), overflowed the debug kernel's 16 KiB stack at every boot.
 - `unsafe` blocks fall from 829 to 685, `unsafe fn`s from 299 to 233, `unsafe impl`s from 65 to 57.
 
+## 2026-11-10 — Before Phase 7, J.7: the thread, split
+
+Part J's seventh sub-part, `typed-layers.md` § J.7, built on `pre-phase-7/part-j7-thread-split`.
+
+- **A thread's fields are split by who writes them**:
+  - identity, fixed when it is made;
+  - what `SCHED` guards, a `SchedCell<ThreadSched>`;
+  - the wait phase, the `on_cpu` guard and the ended mark, atomics;
+  - the parked context, which the switch writes with the lock let go, reached only by address.
+
+  So a `&Thread` is sound, `Thread` is `Shared`, and the scheduler's lists hold `Ref<Thread>`.
+- **The ended mark is an atomic, not `SCHED`'s**: the reaper reads it with no lock held, once the
+  reap list has handed the thread over.
+- **The saved stack pointer is read only with the guard clear** (`Thread::parked_sp`), and only the
+  switch's asm clears the guard, so a read under `SCHED` never meets the switch's write. Raising the
+  guard is safe; clearing it is not.
+- **A switch is prepared under the hold.** What it needs of both threads is read there, the incoming
+  thread's stack top among it, which is sched-d16's read. The arming stays after the release, for
+  J.11.
+- `unsafe` blocks fall from 685 to 571 and `unsafe fn`s from 233 to 188; `unsafe impl`s rise from
+  57 to 59.
+
