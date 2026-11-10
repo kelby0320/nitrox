@@ -5,7 +5,7 @@ use super::*;
 
 /// Deliver `bounce` on endpoint `ch` for `pid`, `transfers` moving with it under `claims`.
 pub(super) fn deliver(
-    ch: &ObjectRef,
+    ch: &Ref<IpcChannel>,
     bounce: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     claims: &mut [Option<Claim<'_>>],
@@ -16,8 +16,7 @@ pub(super) fn deliver(
     // A peer that is the kernel's end of a Userspace Server channel means a forwarded-lookup
     // **reply**: complete the waiting lookup inline (nothing receives that ring), whatever
     // `send_mode`. See `docs/spec/rsproto-namespace-ops.md`.
-    // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-    if let Some(reg) = unsafe { crate::sched::us_forward_reg_for_send(ch.as_ptr()) } {
+    if let Some(reg) = crate::sched::us_forward_reg_for_send(ch) {
         let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
         if let Some(file_id) = crate::rsproto::forget_request(&bounce.payload[..payload_len]) {
             // Only `Block`: its result is a PO, and no deadline could apply.
@@ -34,31 +33,25 @@ pub(super) fn deliver(
 
     match send_mode {
         // `Sent` commits the transfer move; a full ring / dead peer leaves the transfers untaken.
-        SendMode::NoBlock => {
-            // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
-            match unsafe { crate::sched::ipc_send_push(ch.as_ptr(), bounce, transfers) } {
-                SendOutcome::Sent { .. } => {
-                    commit_all(claims);
-                    Ok(0)
-                }
-                SendOutcome::Full => Err(KError::WouldBlock),
-                SendOutcome::PeerClosed => Err(KError::PeerClosed),
-                SendOutcome::Cycle => Err(KError::InvalidArgument),
+        SendMode::NoBlock => match crate::sched::ipc_send_push(ch, bounce, transfers) {
+            SendOutcome::Sent { .. } => {
+                commit_all(claims);
+                Ok(0)
             }
-        }
+            SendOutcome::Full => Err(KError::WouldBlock),
+            SendOutcome::PeerClosed => Err(KError::PeerClosed),
+            SendOutcome::Cycle => Err(KError::InvalidArgument),
+        },
         // Returns a `PendingOperation` that completes on delivery; the message is committed
         // either way, so the transfer move is too. The syscall never parks (async-first).
         SendMode::Block | SendMode::BlockBounded => {
             let deadline_ns = if send_mode == SendMode::BlockBounded { deadline } else { u64::MAX };
             let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-            let po_ref = ObjectRef::new(po);
+            let po_ref = Ref::new(po);
             // Its handle before the push: once the message is committed, nothing may fail.
             let mut installed = installing::<1>(pid);
-            let po_h = installed.install(po_ref.clone(), pending_op_rights()).map_err(refused)?;
-            // SAFETY: `ch` is the live `IpcChannel` its lookup type-checked, held across the call.
-            let refusal = match unsafe {
-                crate::sched::ipc_send_push_blocking(ch.as_ptr(), bounce, transfers, &po_ref, deadline_ns)
-            } {
+            let po_h = installed.install(po_ref.clone().erase(), pending_op_rights()).map_err(refused)?;
+            let refusal = match crate::sched::ipc_send_push_blocking(ch, bounce, transfers, &po_ref, deadline_ns) {
                 BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
                     commit_all(claims);
                     installed.commit();
@@ -84,17 +77,16 @@ pub(super) fn deliver(
 fn answer_forget(reg: &UserspaceServerReg, file_id: u64, pid: u32) -> SysResult {
     use crate::object::Forgotten;
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    let answer = ObjectRef::new(po);
+    let answer = Ref::new(po);
     let wait_on = match reg.forget_file(file_id, &answer) {
         Forgotten::Later(po) => po,
         Forgotten::Now => {
-            // SAFETY: `answer` is the `PendingOperation` this created.
-            unsafe { crate::sched::complete_pending_op(answer.as_ptr(), 0, 0) };
+            crate::sched::complete_pending_op(&answer, 0, 0);
             answer.clone()
         }
     };
     drop(answer);
-    Ok(install(pid, wait_on, pending_op_rights())?.bits() as isize)
+    Ok(install(pid, wait_on.erase(), pending_op_rights())?.bits() as isize)
 }
 
 /// Complete a forwarded **reply** inline in the server's `sys_channel_send`: a

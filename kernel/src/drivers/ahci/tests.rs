@@ -175,8 +175,8 @@ fn fake_disk() -> (FakeRegs, AhciDisk) {
     (regs, disk)
 }
 
-fn interrupt_object() -> ObjectRef {
-    ObjectRef::new(InterruptObject::try_new().unwrap())
+fn interrupt_object() -> Ref<InterruptObject> {
+    Ref::new(InterruptObject::try_new().unwrap())
 }
 
 /// A read of one sector into `frag`.

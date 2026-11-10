@@ -300,6 +300,35 @@ after. Host tests reach `deliver_child_exited` and `us_forward_originate`; J.5 n
 reaches each of the seven reads, and writes one where none does. Author; the call sites to the
 implementer.
 
+**Built 2026-11-06.** No scheduler entry point takes a raw object but the three drop hooks and
+`complete_pending_op_at`. Each takes its object borrowed, the borrow its pin, and is safe:
+- a `&T` for the thirteen `Shared` kinds, a `&Ref<Thread>` for a thread;
+- `&[&ObjectRef]` for the waits, dispatched by header as before;
+- the hub's sleep is `sleep_until`, and `park_briefly` stays an I/O wait.
+
+Three of the six callers holding only a pointer an IRP or a driver pins form the `&T` in one
+`unsafe` each. xHCI's three complete by address, through `complete_pending_op_at`: the hub thread
+that pins each PO lets go once it sees the completion, before a borrow held for the call would end.
+Every untyped holder that only ever held one kind is a `Ref<T>`: every PO a driver, a file, the
+power path and the syscalls keep, a pending lookup's, a fill's, a held send's and an entropy seed
+waiter's among them, a started user thread, the `InterruptObject`s AHCI and xHCI wake on, and a char
+device's read and write backends' `po`. `unsafe` blocks fall from 915 to 829 and `unsafe fn`s from
+328 to 299.
+
+The reads under SCHED borrow: `Process::notification_channel` and `parent_notif`, now
+`Ref<NotificationChannel>`s, and `UserspaceServerReg::endpoint`, a field set once outside the
+SCHED-guarded cell. The tests reaching the seven reads:
+- `deliver_child_exited`'s: `the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_recorded`;
+- `suspend_with_fault`'s: the harness's fault demo, in every `test-qemu`;
+- `request_terminate`'s: `a_terminate_request_reaches_the_channel_its_process_holds`, new;
+- the four endpoint reads: `a_forward_its_server_cannot_take_lets_go_of_its_slot` and
+  `a_registration_dropped_fails_its_fills`.
+
+The host ones pass under Miri on `main` and after, among `sched::` and the three objects' tests, 112
+and 115. One thing differs from the plan: **an entry point takes a `&T`, not a `&Ref<T>`**, as no
+PO was held typed and a caller with only a pinned pointer can form a `&T` but not a `Ref`. The
+objects' accessors reach their state through an `UnsafeCell`, so a pointer from a `&T` is sound.
+
 ### J.6 What SCHED guards, as a type (kobj-o3 with sched-o1; kobj-o10 with sched-o7; sched-d11)
 
 - **A `SchedToken`**, zero-sized, a field of `SchedState`, so only the guard reaches one, and

@@ -7,23 +7,22 @@
 "kernel/src/arch" = 200
 "kernel/src/boot_selftest" = 8
 "kernel/src/clock" = 1
-"kernel/src/device" = 1
 "kernel/src/dpc" = 4
-"kernel/src/drivers" = 101
+"kernel/src/drivers" = 70
 "kernel/src/fbcon" = 4
 "kernel/src/handle" = 30
 "kernel/src/initramfs" = 1
-"kernel/src/io" = 43
+"kernel/src/io" = 36
 "kernel/src/libkern" = 38
 "kernel/src/limine" = 14
 "kernel/src/main" = 17
 "kernel/src/mm" = 87
-"kernel/src/object" = 148
+"kernel/src/object" = 139
 "kernel/src/pci" = 4
-"kernel/src/power" = 5
+"kernel/src/power" = 1
 "kernel/src/report" = 1
-"kernel/src/sched" = 178
-"kernel/src/syscall" = 28
+"kernel/src/sched" = 171
+"kernel/src/syscall" = 1
 "kernel/src/tlb" = 2
 
 [unsafe-fns]
@@ -39,9 +38,9 @@
 "kernel/src/limine" = 2
 "kernel/src/main" = 1
 "kernel/src/mm" = 23
-"kernel/src/object" = 107
+"kernel/src/object" = 106
 "kernel/src/pci" = 1
-"kernel/src/sched" = 45
+"kernel/src/sched" = 17
 
 [unsafe-impls]
 "kernel/src/dpc" = 3

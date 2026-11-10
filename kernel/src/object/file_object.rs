@@ -34,7 +34,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::{Header, Ref, Shared, kobject};
-use crate::object::{DeviceNode, ObjectRef, PendingOperation, StoredMsg, UserspaceServerReg};
+use crate::object::{DeviceNode, PendingOperation, StoredMsg, UserspaceServerReg};
 
 /// How a [`FileObject`] **fills** a cache page on a fault.
 pub enum Producer {
@@ -101,13 +101,13 @@ struct CachePage {
     /// While a fault's fill is in flight, **its `PendingOperation`**, which a second faulter
     /// blocks on; taken out when the page [settles](FileObject::settle). Never the last reference
     /// while here — the filler holds its own — so dropping it under the lock only decrements.
-    fill: Option<ObjectRef>,
+    fill: Option<Ref<PendingOperation>>,
 }
 
 pub(crate) enum Fault {
     Hit(PhysAddr),
-    Fill(PhysAddr, ObjectRef),
-    Wait(ObjectRef),
+    Fill(PhysAddr, Ref<PendingOperation>),
+    Wait(Ref<PendingOperation>),
     /// Loading with no fill to wait on (reserved outside the fault path, as host tests do).
     Busy,
     Oom,
@@ -171,7 +171,7 @@ struct Inner {
     /// under this lock with `dead` checked, lowered by the issuer ([`end_io`](FileObject::end_io)).
     io_in_flight: u32,
     /// The `File::Forget` answer waiting for `io_in_flight` to reach zero.
-    forget_answer: Option<ObjectRef>,
+    forget_answer: Option<Ref<PendingOperation>>,
 }
 
 #[derive(Debug)]
@@ -213,7 +213,7 @@ pub enum Forgotten {
     /// I/O of the file is in flight. The server is answered by completing this PO, which
     /// [`end_io`](FileObject::end_io) hands back when the last of it ends (the caller's own, or the
     /// one an earlier `Forget` of the file already waits on).
-    Later(ObjectRef),
+    Later(Ref<PendingOperation>),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -511,7 +511,7 @@ impl FileObject {
         frame: PhysAddr,
         block_size: u32,
         ahead: usize,
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
         frames: &mut KVec<PhysAddr>,
     ) -> ReadStep {
         let ahead = ahead.min(READ_AHEAD_PAGES - 1);
@@ -608,7 +608,7 @@ impl FileObject {
     /// **An IRP counted by [`begin_fill`](Self::begin_fill) or [`begin_write`](Self::begin_write)
     /// has completed.** If it was the last in flight of a forgotten file, the `Forget` answer comes
     /// back for the caller to complete — outside this lock, since completing takes the scheduler's.
-    pub fn end_io(&self) -> Option<ObjectRef> {
+    pub fn end_io(&self) -> Option<Ref<PendingOperation>> {
         let mut g = self.inner.lock();
         g.io_in_flight = g.io_in_flight.saturating_sub(1);
         if g.dead && g.io_in_flight == 0 { g.forget_answer.take() } else { None }
@@ -616,8 +616,7 @@ impl FileObject {
 
     fn finish_io(&self) {
         if let Some(answer) = self.end_io() {
-            // SAFETY: `answer` is the `Forget` answer's `PendingOperation` reference.
-            unsafe { crate::sched::complete_pending_op(answer.as_ptr(), 0, 0) };
+            crate::sched::complete_pending_op(&answer, 0, 0);
         }
     }
 
@@ -630,7 +629,7 @@ impl FileObject {
     ///
     /// `answer` is the server's: [`Forgotten::Now`] if nothing is in flight, else the PO to
     /// hand the server, completed when the last I/O ends ([`end_io`](Self::end_io)).
-    pub fn forget(&self, answer: &ObjectRef) -> Forgotten {
+    pub fn forget(&self, answer: &Ref<PendingOperation>) -> Forgotten {
         let (outcome, pin) = {
             let mut g = self.inner.lock();
             g.dead = true;
@@ -722,7 +721,7 @@ impl FileObject {
             return Fault::Oom;
         }
         let po = match PendingOperation::try_new() {
-            Ok(p) => ObjectRef::new(p),
+            Ok(p) => Ref::new(p),
             Err(_) => return Fault::Oom,
         };
         let Some(frame) = heap::buddy_alloc(0) else {
@@ -748,7 +747,7 @@ impl FileObject {
     /// afresh, and settling by index alone would call that new page ready while its own fill still
     /// ran. Matched by the PO, not the frame: every caller holds a reference to the PO, so its
     /// address cannot be reused meanwhile, where a freed frame's can.
-    pub(crate) fn settle(&self, index: usize, po: &ObjectRef, ok: bool) {
+    pub(crate) fn settle(&self, index: usize, po: &Ref<PendingOperation>, ok: bool) {
         let taken = {
             let mut g = self.inner.lock();
             let at = g
@@ -802,7 +801,7 @@ impl FileObject {
     fn fault_in_page_with(
         file_obj: &Ref<FileObject>,
         index: usize,
-        wait: &mut dyn FnMut(&ObjectRef) -> bool,
+        wait: &mut dyn FnMut(&Ref<PendingOperation>) -> bool,
         park: &mut dyn FnMut(),
     ) -> Option<PhysAddr> {
         let fo: &FileObject = file_obj;
@@ -820,14 +819,7 @@ impl FileObject {
                     let started_kind = fo.start_fill(file_obj, index, frame, &po, read_ahead);
                     if started_kind == FillStart::Failed {
                         fo.settle(index, &po, false);
-                        // SAFETY: `po` pins the fill's `PendingOperation`.
-                        unsafe {
-                            crate::sched::complete_pending_op(
-                                po.as_ptr(),
-                                crate::syscall::error::KError::OutOfMemory as i32,
-                                0,
-                            )
-                        };
+                        crate::sched::complete_pending_op(&po, crate::syscall::error::KError::OutOfMemory as i32, 0);
                         return None;
                     }
                     let ok = wait(&po);
@@ -889,7 +881,7 @@ impl FileObject {
         let max = run_pages(crate::io::block::max_frags(&device));
         fo.write_runs(block_size, max, |frames, dev_offset, length| {
             let po = match PendingOperation::try_new() {
-                Ok(p) => ObjectRef::new(p),
+                Ok(p) => Ref::new(p),
                 Err(_) => return crate::syscall::error::KError::OutOfMemory as i32,
             };
             let started = crate::arch::Timer::read_ns();
@@ -1024,7 +1016,7 @@ impl FileObject {
         file_obj: &Ref<FileObject>,
         index: usize,
         frame: PhysAddr,
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
         read_ahead: bool,
     ) -> FillStart {
         match &self.producer {
@@ -1058,7 +1050,7 @@ impl FileObject {
         file_obj: &Ref<FileObject>,
         index: usize,
         frame: PhysAddr,
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
         device: &Ref<DeviceNode>,
         block_size: u32,
         read_ahead: bool,
@@ -1072,8 +1064,7 @@ impl FileObject {
         let mut frames = KVec::new();
         match self.begin_fill(index, frame, block_size, ahead, po, &mut frames) {
             ReadStep::Hole => {
-                // SAFETY: `po` pins the fill's `PendingOperation`.
-                unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, 0) };
+                crate::sched::complete_pending_op(po, 0, 0);
                 FillStart::Hole
             }
             ReadStep::NoMemory => FillStart::Failed,
@@ -1111,7 +1102,7 @@ impl FileObject {
         file_obj: &Ref<FileObject>,
         index: usize,
         frame: PhysAddr,
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
         reg: &Ref<UserspaceServerReg>,
         suffix: &KString,
     ) -> bool {
@@ -1134,10 +1125,7 @@ impl FileObject {
         // Originate: records the pending fill on `reg` and pushes the request. The
         // reply completes `po`; `Busy`/`Full`/`PeerClosed` fail this fault.
         matches!(
-            // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
-            unsafe {
-                crate::sched::us_forward_originate_fill(reg.as_object().as_ptr(), &mut msg, po, file_obj, frame, index)
-            },
+            crate::sched::us_forward_originate_fill(reg, &mut msg, po, file_obj, frame, index),
             crate::sched::ForwardOutcome::Pending
         )
     }
@@ -1145,13 +1133,11 @@ impl FileObject {
 
 /// Wait until `po` has completed, and answer its status (`0` = success): a barrier for its I/O,
 /// so a wait woken with nothing signalled, by the process's exit or for want of room, waits again.
-fn wait_status(po: &ObjectRef) -> i32 {
+fn wait_status(po: &Ref<PendingOperation>) -> i32 {
     loop {
-        // SAFETY: `po` pins the `PendingOperation` waited on.
-        let waited = unsafe { crate::sched::wait_on_io(&[po.as_ptr() as usize], u64::MAX, 0) };
+        let waited = crate::sched::wait_on_io(&[po.as_object()], u64::MAX, 0);
         if let crate::sched::WaitResult::Signaled(_) = waited {
-            // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-            return unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0;
+            return crate::sched::pending_op_completion(po).0;
         }
         park_briefly();
     }
@@ -1181,7 +1167,7 @@ impl WriteBack {
 }
 
 /// Wait for a page fill's `po` to complete, as [`wait_status`] does; `true` iff it succeeded.
-fn wait_for_fill(po: &ObjectRef) -> bool {
+fn wait_for_fill(po: &Ref<PendingOperation>) -> bool {
     wait_status(po) == 0
 }
 
@@ -1189,8 +1175,7 @@ fn wait_for_fill(po: &ObjectRef) -> bool {
 /// else or idles with interrupts on; a `yield_now` from the fault handler returns at once.
 fn park_briefly() {
     let now = crate::arch::Timer::read_ns();
-    // SAFETY: no objects: a sleep until the deadline.
-    let _ = unsafe { crate::sched::wait_on_io(&[], now + 1_000_000, now) };
+    let _ = crate::sched::wait_on_io(&[], now + 1_000_000, now);
 }
 
 /// A self-test fill in flight: the DPC and what it needs, heap-boxed so its `Dpc` has a stable
@@ -1198,7 +1183,7 @@ fn park_briefly() {
 struct StubFillBox {
     dpc: Dpc,
     file_obj: Ref<FileObject>,
-    po: ObjectRef,
+    po: Ref<PendingOperation>,
     frame: PhysAddr,
     index: usize,
     fill_byte: u8,
@@ -1206,7 +1191,13 @@ struct StubFillBox {
 
 /// Start a stub fill (page `index` ← the byte `base + index`) by enqueuing a DPC. `false` on
 /// box-allocation failure. The box clones `file_obj` and `po` so they outlive the deferred fill.
-fn stub_start_fill(file_obj: &Ref<FileObject>, index: usize, frame: PhysAddr, po: &ObjectRef, base: u8) -> bool {
+fn stub_start_fill(
+    file_obj: &Ref<FileObject>,
+    index: usize,
+    frame: PhysAddr,
+    po: &Ref<PendingOperation>,
+    base: u8,
+) -> bool {
     let bx = match KBox::try_new(StubFillBox {
         dpc: Dpc::new(stub_fill_dpc, core::ptr::null_mut()),
         file_obj: file_obj.clone(),
@@ -1243,8 +1234,7 @@ fn stub_fill_dpc(ctx: *mut ()) {
         core::ptr::write_bytes((bx.frame.as_u64() + heap::hhdm_offset()) as *mut u8, bx.fill_byte, PAGE_SIZE);
     }
     bx.file_obj.settle(bx.index, &bx.po, true);
-    // SAFETY: `bx` owns the reference pinning its `PendingOperation`.
-    unsafe { crate::sched::complete_pending_op(bx.po.as_ptr(), 0, 0) };
+    crate::sched::complete_pending_op(&bx.po, 0, 0);
 }
 
 impl Drop for FileObject {
@@ -1326,6 +1316,7 @@ fn zero_tail(g: &Inner, end: usize) {
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
+    use crate::object::ObjectRef;
     use crate::object::header::test_probe;
 
     fn fobj(size: usize) -> KBox<FileObject> {
@@ -1616,8 +1607,8 @@ mod tests {
         }
     }
 
-    fn po() -> ObjectRef {
-        ObjectRef::new(PendingOperation::try_new().unwrap())
+    fn po() -> Ref<PendingOperation> {
+        Ref::new(PendingOperation::try_new().unwrap())
     }
 
     fn read_one(f: &FileObject, index: usize, block_size: u32) -> u64 {
@@ -1816,7 +1807,7 @@ mod tests {
         assert_eq!(run_pages(None), 1);
     }
 
-    fn miss(f: &FileObject, index: usize) -> (PhysAddr, ObjectRef) {
+    fn miss(f: &FileObject, index: usize) -> (PhysAddr, Ref<PendingOperation>) {
         match f.reserve_fault(index) {
             Fault::Fill(frame, po) => (frame, po),
             _ => panic!("page {index} was not a miss"),
@@ -1972,8 +1963,7 @@ mod tests {
         unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
         // SAFETY: `irp` is the recording device's in-flight IRP.
         unsafe { crate::io::block::complete_for_test(irp) };
-        // SAFETY: `fill_po` is a live `PendingOperation` reference held across the call.
-        let completed = unsafe { crate::sched::pending_op_completion(fill_po.as_ptr()) };
+        let completed = crate::sched::pending_op_completion(&fill_po);
         assert_eq!(completed, (0, length), "the fault's PO completed");
 
         let (frame, fill_po) = miss(&f, 8);
@@ -1995,9 +1985,8 @@ mod tests {
     fn a_fill_wait_answers_the_fill_not_the_exit() {
         init_global_heap();
         let po = PendingOperation::try_new().unwrap();
-        let po = ObjectRef::new(po);
-        // SAFETY: `po` pins the `PendingOperation`; the device's side of a success.
-        unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, 0) };
+        let po = Ref::new(po);
+        crate::sched::complete_pending_op(&po, 0, 0);
         let answers =
             crate::sched::with_current(crate::sched::an_ending_thread(), || (wait_for_fill(&po), wait_status(&po)));
         assert_eq!(answers, (true, 0));
@@ -2035,7 +2024,7 @@ mod tests {
         held: &Held,
         reads: &core::cell::RefCell<std::vec::Vec<(u64, u64)>>,
         bad: u64,
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
     ) -> bool {
         let irps: std::vec::Vec<_> = held.0.borrow_mut().drain(..).collect();
         for irp in irps {
@@ -2053,8 +2042,7 @@ mod tests {
             unsafe { crate::io::block::complete_for_test(irp) };
         }
         assert!(reads.borrow().len() < 16, "a fault that never gives up");
-        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-        unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 == 0
+        crate::sched::pending_op_completion(po).0 == 0
     }
 
     #[test]
@@ -2064,11 +2052,11 @@ mod tests {
         let held = Held(RefCell::new(std::vec::Vec::new()));
         let f = held_disk_file(&held);
         let reads = RefCell::new(std::vec::Vec::new());
-        let disk = |po: &ObjectRef| complete_held(&held, &reads, 5, po);
+        let disk = |po: &Ref<PendingOperation>| complete_held(&held, &reads, 5, po);
 
         let (mut page_3, mut page_5) = (None, None);
         let mut first = true;
-        let mut wait_0 = |po: &ObjectRef| -> bool {
+        let mut wait_0 = |po: &Ref<PendingOperation>| -> bool {
             let ok = disk(po);
             if core::mem::take(&mut first) {
                 for k in [3, 5] {
@@ -2107,7 +2095,7 @@ mod tests {
         assert_eq!(fo.start_fill(&f, 0, frame, &read_0, true), FillStart::DeviceIo(8));
         let mut read_5 = None;
         let mut waits = 0;
-        let mut wait = |po: &ObjectRef| -> bool {
+        let mut wait = |po: &Ref<PendingOperation>| -> bool {
             waits += 1;
             let ok = complete_held(&held, &reads, 5, po);
             if waits == 1 {
@@ -2301,7 +2289,7 @@ mod tests {
         a.writable_unmapped();
     }
 
-    fn fault(f: &FileObject, index: usize) -> (&'static str, Option<PhysAddr>, Option<ObjectRef>) {
+    fn fault(f: &FileObject, index: usize) -> (&'static str, Option<PhysAddr>, Option<Ref<PendingOperation>>) {
         match f.reserve_fault(index) {
             Fault::Hit(fr) => ("hit", Some(fr), None),
             Fault::Fill(fr, po) => ("fill", Some(fr), Some(po)),

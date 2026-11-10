@@ -18,7 +18,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{ChaCha20Rng, IrqSpinLock, Reserved};
-use crate::object::ObjectRef;
+use crate::object::PendingOperation;
+use crate::object::header::Ref;
 
 /// Pool size in bytes: one ChaCha key.
 const POOL_LEN: usize = 32;
@@ -53,10 +54,10 @@ pub enum SeedWaitReg {
     Queued,
     /// The pool was already seeded (a race after the caller's `is_seeded` check) —
     /// the caller should complete the returned PO now so its wait returns at once.
-    AlreadySeeded(ObjectRef),
+    AlreadySeeded(Ref<PendingOperation>),
     /// The waiter list was full; the caller should complete the returned PO with a
     /// retry status. Pathological (> `SEED_WAITERS_MAX` concurrent unseeded reads).
-    Full(ObjectRef),
+    Full(Ref<PendingOperation>),
 }
 
 /// Set while the seed-waiter list is non-empty, so the timer tick can skip the lock otherwise.
@@ -77,7 +78,7 @@ struct EntropyState {
     bytes_since_reseed: u32,
     /// `PendingOperation`s parked on the pool seeding. Pre-reserved in [`init`]; the subsystem owns
     /// these refs until the timer-tick drain moves them out to be signalled and dropped.
-    seed_waiters: Reserved<ObjectRef>,
+    seed_waiters: Reserved<Ref<PendingOperation>>,
 }
 
 impl EntropyState {
@@ -146,7 +147,7 @@ impl EntropyState {
     /// never dropped, here.
     ///
     /// [`init`]'s reserve is best-effort, and a list it could not reserve reports itself full.
-    fn register_waiter(&mut self, po: ObjectRef) -> SeedWaitReg {
+    fn register_waiter(&mut self, po: Ref<PendingOperation>) -> SeedWaitReg {
         if self.seeded {
             return SeedWaitReg::AlreadySeeded(po);
         }
@@ -163,7 +164,7 @@ impl EntropyState {
 
     /// If seeded, move up to `out.len()` waiter refs into `out`; 0 if not. No `ObjectRef` drop
     /// here.
-    fn drain_waiters(&mut self, out: &mut [Option<ObjectRef>]) -> usize {
+    fn drain_waiters(&mut self, out: &mut [Option<Ref<PendingOperation>>]) -> usize {
         if !self.seeded {
             return 0;
         }
@@ -261,7 +262,7 @@ pub fn is_seeded() -> bool {
 /// [`SeedWaitReg::Queued`] the subsystem owns `po` until [`drain_seed_waiters`] signals it;
 /// otherwise `po` is handed back to complete now. The re-check under the lock closes the race
 /// between the caller's `is_seeded` check and registering.
-pub fn register_seed_waiter(po: ObjectRef) -> SeedWaitReg {
+pub fn register_seed_waiter(po: Ref<PendingOperation>) -> SeedWaitReg {
     let reg = ENTROPY.lock().register_waiter(po);
     if matches!(reg, SeedWaitReg::Queued) {
         SEED_WAKE_PENDING.store(true, Ordering::Release);
@@ -277,7 +278,7 @@ pub fn seed_wake_pending() -> bool {
 /// If the pool is seeded, move up to `out.len()` queued waiter refs into `out` (returning the
 /// count) for the caller to signal and drop, and clear [`seed_wake_pending`] once the list empties;
 /// 0, touching nothing, when unseeded. No `ObjectRef` drop happens under the lock.
-pub fn drain_seed_waiters(out: &mut [Option<ObjectRef>]) -> usize {
+pub fn drain_seed_waiters(out: &mut [Option<Ref<PendingOperation>>]) -> usize {
     let mut g = ENTROPY.lock();
     let n = g.drain_waiters(out);
     if g.seed_waiters.is_empty() {
@@ -373,10 +374,9 @@ mod tests {
         assert!(s.bytes_since_reseed < RESEED_BYTES, "the byte-threshold reseed reset the counter",);
     }
 
-    /// A live `PendingOperation`, adopted into an `ObjectRef`, as a seed-waiter.
-    fn po() -> ObjectRef {
-        use crate::object::PendingOperation;
-        ObjectRef::new(PendingOperation::try_new().unwrap())
+    /// A live `PendingOperation`, as a seed-waiter.
+    fn po() -> Ref<PendingOperation> {
+        Ref::new(PendingOperation::try_new().unwrap())
     }
 
     fn reserved_state() -> EntropyState {
@@ -423,7 +423,7 @@ mod tests {
         let mut s = reserved_state();
         s.register_waiter(po());
         s.register_waiter(po());
-        let mut out: [Option<ObjectRef>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
+        let mut out: [Option<Ref<PendingOperation>>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
         assert_eq!(s.drain_waiters(&mut out), 0, "no drain while unseeded");
         assert_eq!(s.seed_waiters.len(), 2);
         s.seeded = true;

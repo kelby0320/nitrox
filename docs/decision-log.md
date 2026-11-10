@@ -37957,3 +37957,30 @@ Part J's fourth sub-part, `typed-layers.md` § J.4, built on `pre-phase-7/part-j
   held send's deadline is removed only by naming its endpoint too. No test held that removal
   before; one now drives a delivery and a close.
 - `unsafe` blocks fall from 931 to 915, all in `sched`.
+
+## 2026-11-06 — Before Phase 7, J.5: typed scheduler calls
+
+Part J's fifth sub-part, `typed-layers.md` § J.5, built on `pre-phase-7/part-j5-sched-calls`.
+
+- **A scheduler entry point takes its object borrowed, and the borrow is the pin**: a `&T` for the
+  thirteen `Shared` kinds, a `&Ref<Thread>` for a thread, `&[&ObjectRef]` for the waits. 29 `unsafe
+  fn`s become safe, `set_thread_affinity` among them, and `endpoint_ptr` goes. Only the three drop
+  hooks keep an address, and one new entry point, `complete_pending_op_at`, for xHCI's three
+  completions: the hub thread pins each PO and lets go once it sees it complete, which can be before
+  a borrow held for the call would end, a free under a protected reference that Miri refuses.
+- **`&T`, not `&Ref<T>`**: no PO was held typed, and a caller holding only a pointer an IRP or a
+  driver pins can form a `&T` but not a `Ref` without a count. The objects' accessors reach their
+  state through an `UnsafeCell`, so a pointer made from a `&T` may be written through; the tests
+  reaching the reads pass under Miri before and after.
+- **What only ever held one kind is a `Ref<T>`**: every PO the drivers, the file object, the power
+  path and the syscalls keep, a pending lookup's and fill's, which made two `downcast_ref` skips
+  unnecessary, a held send's and an entropy seed waiter's; a started user thread; and the
+  `InterruptObject`s two drivers wake on. A char device's backends take `&Ref<PendingOperation>`,
+  and `us_server_attach` takes the registration alone, attaching the endpoint its drop clears.
+- **A read under SCHED borrows what its owner holds**: `Process`'s two channels and the
+  registration's endpoint, which moves out of its SCHED-guarded cell. Set once, it needs no lock.
+- **A sleep is a sleep**: the hub's `wait_on(&[])` is `sleep_until`. A kernel thread has no process
+  to end, so heeding an exit changes nothing. `park_briefly` stays an I/O wait, as a faulting
+  thread must still wait out its fill.
+- `unsafe` blocks fall from 915 to 829, `unsafe fn`s from 328 to 299.
+

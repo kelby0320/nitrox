@@ -123,15 +123,11 @@ pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
 
 /// Set a thread's CPU **affinity** mask (`sys_thread_set_affinity`). Takes effect at the
 /// next placement / steal / wake; a thread running on a now-excluded CPU finishes its slice
-/// there. The caller pins `thread` via a held handle ref.
-///
-/// # Safety
-///
-/// `thread` points at a live `Thread`, pinned for the call by a reference the caller holds.
-pub unsafe fn set_thread_affinity(thread: *mut (), mask: u8) {
+/// there.
+pub fn set_thread_affinity(thread: &Ref<Thread>, mask: u8) {
     let _g = SCHED.lock();
-    // SAFETY: `thread` pins a live Thread (caller holds a handle ref); `SCHED` held.
-    unsafe { Thread::set_cpu_mask(thread, mask) };
+    // SAFETY: the borrow pins the thread; `SCHED` held.
+    unsafe { Thread::set_cpu_mask(thread.as_ptr().cast(), mask) };
 }
 
 /// As [`spawn`] but pinned to the CPUs in `cpu_mask` (bit `c` ⇒ may run on CPU `c`).
@@ -211,7 +207,7 @@ pub fn spawn_user(
     let r = make_user_sched(process, entry, user_sp, boot_args, SchedClass::TimeShared, 0, 0, u8::MAX)?;
     // Clone the caller's handle before the enqueue moves `r` into `ready`.
     let handle = r.clone();
-    start_user(r).map(|()| handle)
+    start_user(r).map(|()| handle.erase())
 }
 
 /// As [`spawn_user`], but with explicit scheduling parameters (the `RealTime` class is
@@ -226,7 +222,7 @@ pub fn make_user_sched(
     rt_priority: u8,
     nice: i8,
     cpu_mask: u8,
-) -> Result<ObjectRef, AllocError> {
+) -> Result<Ref<Thread>, AllocError> {
     let tid = {
         let mut g = SCHED.lock();
         let t = g.next_tid;
@@ -235,8 +231,8 @@ pub fn make_user_sched(
     };
     // Heavy work outside the lock (consumes `process` on success).
     let thread = Thread::try_new_user(tid, process, entry, user_sp, boot_args)?;
-    let r = into_objref(thread);
-    let obj = r.as_ptr();
+    let r = Ref::new(thread);
+    let obj = r.as_ptr().cast::<()>();
     // SAFETY: `obj` is the new thread, exclusively owned via `r` and not yet enqueued —
     // no other context can observe it, so setting its scheduling parameters here
     // (before the enqueue lock) is sound. Mirrors `spawn_inner`.
@@ -248,8 +244,8 @@ pub fn make_user_sched(
 }
 
 /// Enqueue a thread [`make_user_sched`] made.
-pub fn start_user(r: ObjectRef) -> Result<(), AllocError> {
-    enqueue(r, place_spawned)
+pub fn start_user(r: Ref<Thread>) -> Result<(), AllocError> {
+    enqueue(r.erase(), place_spawned)
 }
 
 /// Place `r`, a thread just made for a process, marking it first if the process has begun to exit:

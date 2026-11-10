@@ -239,8 +239,8 @@ fn payload_size_is_one_page_worth() {
     assert_eq!(core::mem::size_of::<StoredMsg>(), 4096);
 }
 
-fn make_po() -> ObjectRef {
-    ObjectRef::new(crate::object::PendingOperation::try_new().unwrap())
+fn make_po() -> Ref<PendingOperation> {
+    Ref::new(PendingOperation::try_new().unwrap())
 }
 
 fn empty_xfer() -> [Option<TransferRef>; IPC_HANDLE_MAX] {
@@ -317,7 +317,7 @@ fn closing_receiver_releases_a_held_pending_send() {
         assert_eq!(IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
         let mut pos = [core::ptr::null_mut(); IpcChannel::MAX_PENDING_SENDS];
         assert_eq!(IpcChannel::pending_send_pos(b, &mut pos), 1);
-        assert_eq!(pos[0], po.as_ptr());
+        assert_eq!(pos[0], po.as_ptr().cast());
     }
     drop_endpoint(b);
     assert_eq!(test_probe::pending_op_destroys(), 0, "creation ref still held");
@@ -339,7 +339,7 @@ fn cancel_marks_the_matching_held_send() {
         let mut t = empty_xfer();
         assert_eq!(IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
         assert!(!IpcChannel::cancel_pending_send(b, 0xDEAD as *mut ()));
-        assert!(IpcChannel::cancel_pending_send(b, po.as_ptr()));
+        assert!(IpcChannel::cancel_pending_send(b, po.as_ptr().cast()));
     }
     drop(po);
     drop_endpoint(a);
@@ -362,7 +362,7 @@ fn recv_sweeps_cancelled_then_promotes_the_live_send() {
         assert_eq!(IpcChannel::send_or_queue(a, &a_msg(50, 1), &mut t1, &po1), BlockSendOutcome::Queued);
         let mut t2 = empty_xfer();
         assert_eq!(IpcChannel::send_or_queue(a, &a_msg(51, 1), &mut t2, &po2), BlockSendOutcome::Queued);
-        assert!(IpcChannel::cancel_pending_send(b, po1.as_ptr()));
+        assert!(IpcChannel::cancel_pending_send(b, po1.as_ptr().cast()));
         let mut d = a_msg(0, 0);
         assert!(pop_no_xfer(b, &mut d));
         let mut rc = empty_reclaim();

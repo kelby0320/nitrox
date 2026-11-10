@@ -21,7 +21,7 @@ use crate::libkern::input::InputEvent;
 use crate::libkern::lockrank::LockRank;
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
 use crate::object::header::Ref;
-use crate::object::{DeviceNode, MemoryObject, ObjectRef};
+use crate::object::{DeviceNode, MemoryObject, PendingOperation};
 use crate::syscall::error::KError;
 
 /// The two devices this controller publishes, and their `/dev/input/raw/<n>` indices.
@@ -39,8 +39,8 @@ struct Inner {
     keys: scancode::Decoder,
     mouse: mouse::Decoder,
     lights: Option<lights::Exchange>,
-    lights_po: Option<ObjectRef>,
-    lights_next: Option<(ObjectRef, u8)>,
+    lights_po: Option<Ref<PendingOperation>>,
+    lights_next: Option<(Ref<PendingOperation>, u8)>,
     lights_done: [Option<LightsDone>; 4],
     lights_unreported: Option<i32>,
     /// What the DPC logs about the exchange that ended, outside this lock (the serial port's lock
@@ -49,7 +49,7 @@ struct Inner {
 }
 
 struct LightsDone {
-    po: ObjectRef,
+    po: Ref<PendingOperation>,
     status: i32,
     state: Completion,
 }
@@ -140,7 +140,7 @@ impl Inner {
     }
 
     /// Begin an exchange for `po` with `lights`; a failed send ends it at once.
-    fn lights_start(&mut self, po: ObjectRef, lights: u8, now: u64) {
+    fn lights_start(&mut self, po: Ref<PendingOperation>, lights: u8, now: u64) {
         let (exchange, first) = lights::Exchange::start(lights, now);
         self.lights_po = Some(po);
         if crate::arch::ps2::send_keyboard(first) {
@@ -190,7 +190,7 @@ const MAX_DRAIN_PER_IRQ: u32 = 64;
 /// [`CharBackend::submit_read`] for a raw input node; `max_len` is floored to whole records.
 fn submit_read(
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     _offset: u64,
     max_len: u64,
@@ -207,7 +207,7 @@ fn read(
     ps2: &IrqSpinLock<Inner>,
     index: usize,
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     max_len: usize,
 ) -> Result<(), KError> {
@@ -255,14 +255,16 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
         for (i, d) in g.lights_done.iter_mut().enumerate() {
             if let Some(d) = d.as_mut().filter(|d| d.state == Completion::Waiting) {
                 d.state = Completion::Completing;
-                taken[i] = Some((i, d.po.as_ptr(), d.status));
+                taken[i] = Some((i, d.po.as_object().as_ptr(), d.status));
             }
         }
         g.lights_say.take()
     };
     for &(_, po, status) in taken.iter().flatten() {
-        // SAFETY: the slot holds `po`'s reference, `Completing` until thread context reclaims it after this.
-        unsafe { crate::sched::complete_pending_op(po, status, (status == 0) as u64) };
+        // SAFETY: the slot holds the reference to the `PendingOperation` at `po`, `Completing` until
+        // thread context reclaims it after this.
+        let po = unsafe { &*po.cast::<crate::object::PendingOperation>() };
+        crate::sched::complete_pending_op(po, status, (status == 0) as u64);
     }
     if taken.iter().any(Option::is_some) {
         let mut g = PS2.lock();
@@ -322,7 +324,7 @@ fn reclaim(ps2: &IrqSpinLock<Inner>) {
 /// done.
 fn submit_write(
     buffer: &Ref<MemoryObject>,
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     buf_offset: u64,
     len: u64,
     ctx: *mut (),
@@ -343,8 +345,7 @@ fn submit_write(
         }
     };
     if let Some((old, _)) = superseded {
-        // SAFETY: `old` is the superseded write's `PendingOperation` reference.
-        unsafe { crate::sched::complete_pending_op(old.as_ptr(), 0, 1) };
+        crate::sched::complete_pending_op(&old, 0, 1);
         drop(old);
     }
     crate::dpc::enqueue(&PS2_DPC);

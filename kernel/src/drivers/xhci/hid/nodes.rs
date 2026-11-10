@@ -7,6 +7,9 @@ pub(super) const BOUND: u8 = 1;
 /// A slot whose device has departed: its node reads what its ring holds and then refuses.
 pub(super) const RETIRED: u8 = 2;
 
+/// A lights write waiting: its operation and the lights.
+pub(super) type Lights = (Ref<PendingOperation>, u8);
+
 /// **The USB input nodes, by slot**: each slot's state, epoch, reader side, lights write waiting,
 /// and which slots hold keyboards. A node's `CharBackend` context names its slot and the epoch it
 /// was made in ([`context`]).
@@ -21,7 +24,7 @@ pub(super) struct Nodes {
     pub(super) epochs: [AtomicU32; MAX_NODES],
     pub(super) readers: [IrqSpinLock<Reader>; MAX_NODES],
     /// **A lights write waiting for the hub thread**, by slot: its operation and the lights.
-    pub(super) lights: IrqSpinLock<[Option<(ObjectRef, u8)>; MAX_NODES]>,
+    pub(super) lights: IrqSpinLock<[Option<Lights>; MAX_NODES]>,
     /// Which slots hold keyboards, one bit each: what takes lights, and what the hardware report
     /// drains.
     pub(super) keyboards: AtomicU32,
@@ -77,8 +80,7 @@ impl Nodes {
             drop(old);
             let waiting = self.lights.lock()[index].take();
             if let Some((po, _)) = waiting {
-                // SAFETY: `po` is the lights write's `PendingOperation` reference, taken from its slot.
-                unsafe { crate::sched::complete_pending_op(po.as_ptr(), KError::PeerClosed as i32, 0) };
+                crate::sched::complete_pending_op(&po, KError::PeerClosed as i32, 0);
                 drop(po);
             }
         }
@@ -114,8 +116,7 @@ impl Nodes {
         }
         let waiting = self.lights.lock()[index].take();
         if let Some((po, _)) = waiting {
-            // SAFETY: `po` is the lights write's `PendingOperation` reference, taken from its slot.
-            unsafe { crate::sched::complete_pending_op(po.as_ptr(), KError::PeerClosed as i32, 0) };
+            crate::sched::complete_pending_op(&po, KError::PeerClosed as i32, 0);
             drop(po);
         }
         self.states[index].store(RETIRED, Ordering::Release);
@@ -146,7 +147,7 @@ impl Nodes {
     pub(super) fn read(
         &self,
         buffer: &Ref<MemoryObject>,
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
         buf_offset: u64,
         max_len: u64,
         ctx: *mut (),
@@ -187,7 +188,7 @@ impl Nodes {
         &self,
         x: Option<&Xhci>,
         buffer: &Ref<MemoryObject>,
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
         buf_offset: u64,
         len: u64,
         ctx: *mut (),
@@ -214,13 +215,11 @@ impl Nodes {
         }
         let superseded = self.lights.lock()[index].replace((po.clone(), lights));
         if let Some((old, _)) = superseded {
-            // SAFETY: `old` is the superseded write's `PendingOperation` reference.
-            unsafe { crate::sched::complete_pending_op(old.as_ptr(), 0, 1) };
+            crate::sched::complete_pending_op(&old, 0, 1);
             drop(old);
         }
         x.hid_lights.store(true, Ordering::Release);
-        // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
-        unsafe { crate::sched::signal_interrupt(x.hub_wake.as_ptr()) };
+        crate::sched::signal_interrupt(&x.hub_wake);
         Ok(())
     }
 

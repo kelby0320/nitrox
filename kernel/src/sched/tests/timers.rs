@@ -166,32 +166,27 @@ fn a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it() {
     test_probe::reset();
     reserve_global_deadlines();
     for interval in [0, 1_000] {
-        let t = new_timer();
-        let p = t.as_ptr();
-        // SAFETY: pinned by `t`.
-        unsafe { timer_arm(p, 1 << 40, interval) }.unwrap();
+        let t = Ref::new(Timer::try_new().unwrap());
+        let p = t.as_object().as_ptr();
+        timer_arm(&t, 1 << 40, interval).unwrap();
         assert!(global_heap_names(p));
         drop(t);
         assert!(!global_heap_names(p), "interval {interval}: the heap names a freed timer");
     }
     // A periodic timer the tick has fired is in the heap again.
-    let t = new_timer();
-    let p = t.as_ptr();
-    // SAFETY: pinned by `t`.
-    unsafe { timer_arm(p, 1_000, 500) }.unwrap();
+    let t = Ref::new(Timer::try_new().unwrap());
+    let p = t.as_object().as_ptr();
+    timer_arm(&t, 1_000, 500).unwrap();
     fire_expired_deadlines(&mut SCHED.lock(), 1_000);
     assert!(global_heap_names(p));
     drop(t);
     assert!(!global_heap_names(p), "the heap names a freed timer the tick re-armed");
     assert_eq!(test_probe::timer_destroys(), 3);
 
-    let t = new_timer();
-    // SAFETY: pinned by `t`.
-    unsafe {
-        timer_arm(t.as_ptr(), 1 << 40, 0).unwrap();
-        timer_arm(t.as_ptr(), 0, 0).unwrap();
-    }
-    assert!(!global_heap_names(t.as_ptr()), "a disarmed timer stays in the heap");
+    let t = Ref::new(Timer::try_new().unwrap());
+    timer_arm(&t, 1 << 40, 0).unwrap();
+    timer_arm(&t, 0, 0).unwrap();
+    assert!(!global_heap_names(t.as_object().as_ptr()), "a disarmed timer stays in the heap");
 }
 
 // --- slots promised -----------------------------------------------------------

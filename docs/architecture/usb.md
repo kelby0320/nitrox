@@ -93,12 +93,13 @@ scratchpad(s)` on `test-qemu` — the No Op's answer, and the MSI vector.
 
 **A kernel thread** (`drivers/xhci/hub.rs`), spawned by `drivers::start` once the scheduler and
 the APs are up — after them rather than during AP bring-up, the scheduler's most delicate moment.
-It is **the first long-lived kernel thread to block in `sched::wait_on`**, on three kinds of thing:
+It is **the first long-lived kernel thread to block in `sched::wait_on`**, on two kinds of thing,
+and to sleep:
 - **a command's or a control transfer's `PendingOperation`**, which the DPC completes when the
   event for it arrives;
 - **the port-change `InterruptObject`**, which the DPC signals on every Port Status Change Event.
   It latches, so a change that lands while the thread is enumerating is counted, not lost;
-- **nothing, until a deadline**, to sleep through the waits USB requires.
+- and it sleeps until a deadline, in `sched::sleep_until`, through the waits USB requires.
 
 **One wait at a time, handed over safely.** The thread records what it awaits — a command by its
 TRB's address, a transfer by its slot and its Status stage's address — *before* the TRB is written,

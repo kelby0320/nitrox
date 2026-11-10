@@ -742,12 +742,14 @@ fn act(a: Action, x: Option<&Xhci>) {
             complete(irp, 0, 0);
             act(Action::Wake, x);
         }
-        // SAFETY: the hub thread holds `po`'s reference while its command is in flight, waiting on it.
-        Action::Hub { po } => unsafe { crate::sched::complete_pending_op(po, 0, 0) },
+        Action::Hub { po } => {
+            // SAFETY: the hub thread holds the reference to the `PendingOperation` at `po` while
+            // its command is in flight, and lets go of it once it sees this completion.
+            unsafe { crate::sched::complete_pending_op_at(po, 0, 0) };
+        }
         Action::Wake => {
             if let Some(x) = x {
-                // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
-                unsafe { crate::sched::signal_interrupt(x.hub_wake.as_ptr()) };
+                crate::sched::signal_interrupt(&x.hub_wake);
             }
         }
     }

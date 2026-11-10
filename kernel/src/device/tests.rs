@@ -25,7 +25,7 @@ fn pci_at(bus: u8, dev: u8, func: u8) -> ResourceDescriptor {
 
 fn no_submit(_: *mut Irp, _: *mut ()) {}
 fn no_poll(_: *mut ()) {}
-fn no_read(_: &Ref<MemoryObject>, _: &ObjectRef, _: u64, _: u64, _: u64, _: *mut ()) -> Result<(), KError> {
+fn no_read(_: &Ref<MemoryObject>, _: &Ref<PendingOperation>, _: u64, _: u64, _: u64, _: *mut ()) -> Result<(), KError> {
     Err(KError::Unsupported)
 }
 
@@ -436,23 +436,20 @@ fn a_change_read_is_refused_short_answered_behind_and_refused_a_fifth_place() {
     let waiting = SpinLock::new(LockRank::Leaf, Waiters::new());
     let generation = AtomicU64::new(5);
     let page = Ref::new(MemoryObject::try_new(crate::mm::PAGE_SIZE).unwrap());
-    let po = || ObjectRef::new(crate::object::PendingOperation::try_new().unwrap());
-    let read = |po: &ObjectRef, offset, len| read_changes(&waiting, &generation, &page, po, 0, offset, len);
+    let po = || Ref::new(crate::object::PendingOperation::try_new().unwrap());
+    let read = |po: &Ref<PendingOperation>, offset, len| read_changes(&waiting, &generation, &page, po, 0, offset, len);
 
     let behind = po();
     assert_eq!(read(&behind, 4, 7), Err(KError::InvalidArgument), "shorter than its answer");
-    // SAFETY: `behind` is a live `PendingOperation` reference held across the call.
-    assert!(!unsafe { crate::sched::pending_op_is_signaled(behind.as_ptr()) });
+    assert!(!crate::sched::pending_op_is_signaled(&behind));
     assert_eq!(read(&behind, 4, 8), Ok(()));
-    // SAFETY: `behind` is a live `PendingOperation` reference held across the call.
-    let answered = unsafe { crate::sched::pending_op_completion(behind.as_ptr()) };
+    let answered = crate::sched::pending_op_completion(&behind);
     assert_eq!(answered, (0, 8), "behind, so answered at once");
 
-    let ahead: [ObjectRef; WAITERS_MAX] = core::array::from_fn(|_| po());
+    let ahead: [Ref<PendingOperation>; WAITERS_MAX] = core::array::from_fn(|_| po());
     for p in &ahead {
         assert_eq!(read(p, 5, 8), Ok(()));
-        // SAFETY: `p` is a live `PendingOperation` reference held across the call.
-        assert!(!unsafe { crate::sched::pending_op_is_signaled(p.as_ptr()) }, "5 is not past 5: it waits");
+        assert!(!crate::sched::pending_op_is_signaled(p), "5 is not past 5: it waits");
     }
     assert_eq!(read(&po(), 5, 8), Err(KError::WouldBlock), "a fifth place to wait");
 }

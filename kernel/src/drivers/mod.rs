@@ -17,7 +17,7 @@ use crate::io::block::dispatch_block_irp;
 use crate::libkern::io_op::IoOpcode;
 use crate::object::device_node::DeviceClass;
 use crate::object::header::Ref;
-use crate::object::{DeviceNode, MemoryObject, ObjectRef, PendingOperation};
+use crate::object::{DeviceNode, MemoryObject, PendingOperation};
 
 const PCI_CLASS_AHCI: (u8, u8, u8) = (0x01, 0x06, 0x01);
 
@@ -87,7 +87,7 @@ pub fn self_test() {
         Err(_) => return,
     };
     let po = match PendingOperation::try_new() {
-        Ok(po) => ObjectRef::new(po),
+        Ok(po) => Ref::new(po),
         Err(_) => return,
     };
     let po_check = po.clone();
@@ -103,8 +103,7 @@ pub fn self_test() {
     // SAFETY: ring-0; IF was 0 here and is restored to 0 below.
     unsafe { crate::arch::Cpu::interrupts_enable() };
     while crate::arch::Timer::read_ns().wrapping_sub(start) < 200_000_000 {
-        // SAFETY: `po_check` is a live `PendingOperation` reference held across the call.
-        if unsafe { crate::sched::pending_op_is_signaled(po_check.as_ptr()) } {
+        if crate::sched::pending_op_is_signaled(&po_check) {
             via_irq = true;
             break;
         }
@@ -116,8 +115,7 @@ pub fn self_test() {
         ahci::poll_complete_inflight();
     }
 
-    // SAFETY: `po_check` is a live `PendingOperation` reference held across the call.
-    let (status, result) = unsafe { crate::sched::pending_op_completion(po_check.as_ptr()) };
+    let (status, result) = crate::sched::pending_op_completion(&po_check);
     if status != 0 || result != 512 {
         crate::kprintln!("ahci: read self-test FAIL (status {} result {})", status, result);
         return;
@@ -156,7 +154,7 @@ fn oversize_refused(disk: &Ref<DeviceNode>) {
         Err(_) => return,
     };
     let po = match PendingOperation::try_new() {
-        Ok(po) => ObjectRef::new(po),
+        Ok(po) => Ref::new(po),
         Err(_) => return,
     };
     match dispatch_block_irp(disk, &big, &po, IoOpcode::Read, 0, 0, bytes as u64) {

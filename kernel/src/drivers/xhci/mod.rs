@@ -42,7 +42,8 @@ use crate::libkern::{IrqSpinLock, KBox, KVec, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
-use crate::object::{InterruptObject, ObjectRef, PendingOperation};
+use crate::object::header::Ref;
+use crate::object::{InterruptObject, PendingOperation};
 use ring::{Consumer, Producer, RingMem, Trb, code, kind};
 
 /// PCI class, subclass and programming interface of an xHCI controller.
@@ -154,9 +155,9 @@ pub struct Xhci {
     port_changes: AtomicU32,
     /// **What wakes the hub thread**: the DPC signals it on every port change. Latching, so a
     /// change that lands while the thread is busy is counted, not lost.
-    hub_wake: ObjectRef,
+    hub_wake: Ref<InterruptObject>,
     /// Completed by the hub thread when its first round is done, for the boot to wait on.
-    first_round: ObjectRef,
+    first_round: Ref<PendingOperation>,
     /// The one command or transfer the hub thread is waiting for, which the DPC completes.
     waiting: IrqSpinLock<Option<Waiting>>,
     /// A command went unanswered: the command ring may be stuck, and nothing more is asked of it.
@@ -473,8 +474,8 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(ev_mem), ring: Consumer::new() }),
         _erst: Programmed::new(erst),
         port_changes: AtomicU32::new(0),
-        hub_wake: ObjectRef::new(wake),
-        first_round: ObjectRef::new(first),
+        hub_wake: Ref::new(wake),
+        first_round: Ref::new(first),
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
         pci: desc,
@@ -689,8 +690,7 @@ fn on_event(x: &Xhci, trb: &Trb) {
     match trb.kind() {
         kind::PORT_STATUS_CHANGE => {
             x.port_changes.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
-            unsafe { crate::sched::signal_interrupt(x.hub_wake.as_ptr()) };
+            crate::sched::signal_interrupt(&x.hub_wake);
         }
         kind::COMMAND_COMPLETION => complete_if(
             x,
@@ -709,8 +709,9 @@ fn on_event(x: &Xhci, trb: &Trb) {
             let done =
                 ep0_event(&mut x.waiting.lock(), trb.slot_id(), trb.pointer(), trb.completion_code(), trb.residual());
             if let Some((w, code, result)) = done {
-                // SAFETY: the waiting thread's reference pins `w.po` until its operation completes.
-                unsafe { crate::sched::complete_pending_op(w.po.0, code as i32, result) };
+                // SAFETY: the waiting thread's reference pins the `PendingOperation` at `w.po` until
+                // it sees this completion.
+                unsafe { crate::sched::complete_pending_op_at(w.po.0, code as i32, result) };
             }
         }
         _ => {}
@@ -758,8 +759,9 @@ fn complete_if(x: &Xhci, matches: impl Fn(Awaited) -> bool, code: u8, result: u6
         if w.as_ref().is_some_and(|w| matches(w.awaited)) { w.take() } else { None }
     };
     if let Some(w) = taken {
-        // SAFETY: the waiting thread's reference pins `w.po` until its operation completes.
-        unsafe { crate::sched::complete_pending_op(w.po.0, code as i32, result) };
+        // SAFETY: the waiting thread's reference pins the `PendingOperation` at `w.po` until it sees
+        // this completion.
+        unsafe { crate::sched::complete_pending_op_at(w.po.0, code as i32, result) };
     }
 }
 
@@ -781,9 +783,7 @@ pub fn settle(bound_ns: u64) {
         return;
     };
     let now = crate::arch::Timer::read_ns();
-    let po = x.first_round.as_ptr();
-    // SAFETY: `x.first_round` pins the `PendingOperation` at `po` for the controller's life.
-    let waited = unsafe { crate::sched::wait_on(&[po as usize], now + bound_ns, now) };
+    let waited = crate::sched::wait_on(&[x.first_round.as_object()], now + bound_ns, now);
     if !matches!(waited, crate::sched::WaitResult::Signaled(_)) {
         crate::kprintln!(
             "usb: the first round was not done in {} ms; what is still enumerating arrives later",
@@ -844,8 +844,8 @@ fn fake(regs: u64) -> Xhci {
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(page()), ring: Consumer::new() }),
         _erst: Programmed::new(page()),
         port_changes: AtomicU32::new(0),
-        hub_wake: ObjectRef::new(InterruptObject::try_new().unwrap()),
-        first_round: ObjectRef::new(PendingOperation::try_new().unwrap()),
+        hub_wake: Ref::new(InterruptObject::try_new().unwrap()),
+        first_round: Ref::new(PendingOperation::try_new().unwrap()),
         waiting: IrqSpinLock::new(LockRank::Leaf, None),
         wedged: AtomicBool::new(false),
         pci: ResourceDescriptor::ZERO,

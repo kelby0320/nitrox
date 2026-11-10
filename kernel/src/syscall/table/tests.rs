@@ -579,10 +579,10 @@ fn file_blocks_reply(reg: &Ref<UserspaceServerReg>, file_id: u64, device: Object
     msg[28 + 16..28 + 24].copy_from_slice(&file_id.to_le_bytes());
     msg[28 + 32 + 8..28 + 32 + 16].copy_from_slice(&100u64.to_le_bytes());
     msg[28 + 32 + 16..28 + 32 + 20].copy_from_slice(&8u32.to_le_bytes());
-    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
+    let po = Ref::new(PendingOperation::try_new().unwrap());
     let pl = PendingLookup {
         request_id: 1,
-        po,
+        po: po.clone(),
         requested: Rights::MAP_READ | Rights::MAP_WRITE,
         suffix: [0; LOOKUP_SUFFIX_MAX],
         suffix_len: 0,
@@ -594,9 +594,8 @@ fn file_blocks_reply(reg: &Ref<UserspaceServerReg>, file_id: u64, device: Object
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     transfers[0] = Some(TransferRef { obj: device, rights });
     let (status, parked) = build_and_install_file_blocks(reg, &pl, 4096, &msg, &mut transfers);
-    // SAFETY: `pl.po` pins the lookup's `PendingOperation`.
-    drop(unsafe { crate::sched::complete_lookup(pl.po.as_ptr(), status, parked) });
-    read_completion(&pl.po, FILE_CLIENT)
+    drop(crate::sched::complete_lookup(&po, status, parked));
+    read_completion(&po, FILE_CLIENT)
 }
 
 /// A file-blocks reply's file is as writable as its server's hold on the device it sent: the
@@ -648,7 +647,7 @@ fn a_reply_for_a_cached_file_naming_another_device_is_refused() {
 /// A forwarded lookup, and a reply carrying a memory object built for it.
 struct Forwarded {
     reg: Ref<UserspaceServerReg>,
-    po: ObjectRef,
+    po: Ref<crate::object::PendingOperation>,
     reply: crate::object::ipc_channel::StoredMsg,
     transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
     _server_end: ObjectRef,
@@ -662,20 +661,10 @@ fn forwarded_memobj_lookup() -> Forwarded {
     let (k, s) = IpcChannel::try_new_pair(4).unwrap();
     let (k, _server_end) = (Ref::new(k), ObjectRef::new(s));
     let reg = Ref::new(UserspaceServerReg::try_new(k).unwrap());
-    let po = ObjectRef::new(PendingOperation::try_new().unwrap());
+    let po = Ref::new(PendingOperation::try_new().unwrap());
     let mut msg = StoredMsg::zeroed();
     msg.header.payload_len = build_resolve_request(&mut msg.payload, Rights::MAP_READ.bits(), b"f").unwrap() as u32;
-    // SAFETY: `reg` and `po` are pinned by the test.
-    let forwarded = unsafe {
-        crate::sched::us_forward_originate(
-            reg.as_object().as_ptr(),
-            &mut msg,
-            &po,
-            Rights::MAP_READ,
-            b"f",
-            Forward::PLAIN,
-        )
-    };
+    let forwarded = crate::sched::us_forward_originate(&reg, &mut msg, &po, Rights::MAP_READ, b"f", Forward::PLAIN);
     assert_eq!(forwarded, crate::sched::ForwardOutcome::Pending);
     // The request's envelope turned round, as a server's reply: flags REPLY, a MEMOBJ body.
     let mut reply = StoredMsg::zeroed();
@@ -729,17 +718,14 @@ fn a_lookup_reply_is_installed_when_its_completion_is_read() {
 fn a_lookup_read_while_another_installs_it_waits_for_that_handle() {
     use crate::sched::{Completion, complete_lookup, pending_op_installed, pending_op_take};
     init_global_heap();
-    let po = ObjectRef::new(crate::object::PendingOperation::try_new().unwrap());
+    let po = Ref::new(crate::object::PendingOperation::try_new().unwrap());
     let mem = ObjectRef::new(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap());
-    // SAFETY: `po` pins the `PendingOperation`, and the test is single-threaded.
-    unsafe {
-        assert!(complete_lookup(po.as_ptr(), 0, Some((mem, Rights::MAP_READ))).is_none());
-        let Completion::Install(obj, _) = pending_op_take(po.as_ptr()) else { panic!("its object") };
-        assert!(matches!(pending_op_take(po.as_ptr()), Completion::Installing));
-        drop(obj);
-        pending_op_installed(po.as_ptr(), Ok(7));
-        assert!(matches!(pending_op_take(po.as_ptr()), Completion::Read(0, 7)));
-    }
+    assert!(complete_lookup(&po, 0, Some((mem, Rights::MAP_READ))).is_none());
+    let Completion::Install(obj, _) = pending_op_take(&po) else { panic!("its object") };
+    assert!(matches!(pending_op_take(&po), Completion::Installing));
+    drop(obj);
+    pending_op_installed(&po, Ok(7));
+    assert!(matches!(pending_op_take(&po), Completion::Read(0, 7)));
 }
 
 /// A lookup whose reader's table cannot take its handle fails for good, its object released.
@@ -750,10 +736,9 @@ fn a_lookup_read_into_a_full_table_fails_for_good() {
     init_global_heap();
     global::init_for_tests();
     test_probe::reset();
-    let po = ObjectRef::new(crate::object::PendingOperation::try_new().unwrap());
+    let po = Ref::new(crate::object::PendingOperation::try_new().unwrap());
     let mem = ObjectRef::new(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap());
-    // SAFETY: `po` pins the `PendingOperation`.
-    assert!(unsafe { crate::sched::complete_lookup(po.as_ptr(), 0, Some((mem, Rights::MAP_READ))) }.is_none());
+    assert!(crate::sched::complete_lookup(&po, 0, Some((mem, Rights::MAP_READ))).is_none());
     crate::handle::table::fail_installs_after(Some(0));
     let failed = (map_handle_err(HandleError::OutOfMemory) as i32, 0);
     assert_eq!(read_completion(&po, PID), failed);
@@ -768,16 +753,13 @@ fn a_lookup_completed_twice_keeps_its_first_object() {
     const PID: u32 = 4454;
     init_global_heap();
     global::init_for_tests();
-    let po = ObjectRef::new(crate::object::PendingOperation::try_new().unwrap());
+    let po = Ref::new(crate::object::PendingOperation::try_new().unwrap());
     let mem = || ObjectRef::new(crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap());
     let (first, second) = (mem(), mem());
     let first_at = first.as_ptr();
-    // SAFETY: `po` pins the `PendingOperation`.
-    unsafe {
-        assert!(crate::sched::complete_lookup(po.as_ptr(), 0, Some((first, Rights::MAP_READ))).is_none());
-        let back = crate::sched::complete_lookup(po.as_ptr(), 0, Some((second, Rights::MAP_READ)));
-        assert!(back.is_some_and(|(o, _)| o.as_ptr() != first_at), "the second's own object");
-    }
+    assert!(crate::sched::complete_lookup(&po, 0, Some((first, Rights::MAP_READ))).is_none());
+    let back = crate::sched::complete_lookup(&po, 0, Some((second, Rights::MAP_READ)));
+    assert!(back.is_some_and(|(o, _)| o.as_ptr() != first_at), "the second's own object");
     let (status, h) = read_completion(&po, PID);
     assert_eq!(status, 0);
     let read = global::get().lookup(RawHandle(h), PID, Rights::MAP_READ).unwrap();
@@ -873,8 +855,7 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
         let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
         transfers[0] = Some(TransferRef { obj: answer, rights: Rights::MAP_READ | Rights::TRANSFER });
         assert_eq!(complete_read_range_reply(&reg, &reply, &mut transfers, 36), Ok(0));
-        // SAFETY: `po` pins the fill's `PendingOperation`.
-        let (status, _) = unsafe { crate::sched::pending_op_completion(po.as_ptr()) };
+        let (status, _) = crate::sched::pending_op_completion(&po);
         (status, fo.lookup(0).map(|(_, state)| state))
     };
     let unsupported = (KError::Unsupported as i32, Some(PageState::Loading));

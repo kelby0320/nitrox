@@ -27,9 +27,9 @@ use core::fmt::Write;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::platform::ArchPlatform;
 use crate::arch::timer::ArchTimer;
-use crate::libkern::KVec;
 use crate::libkern::block::BlockKind;
 use crate::libkern::power::PowerOp;
+use crate::libkern::{ArrayVec, KVec};
 use crate::object::header::Ref;
 use crate::object::{DeviceNode, MAX_WAIT_HANDLES, ObjectRef, PendingOperation};
 
@@ -84,7 +84,7 @@ fn flushes(kind: u32) -> bool {
 /// Flush every disk, waiting until each is done or [`FLUSH_BOUND_NS`] has passed, logging each.
 fn flush_every_disk() {
     // `/dev/blk/<n>` and its flush's operation.
-    let mut flushing: KVec<(usize, ObjectRef)> = KVec::new();
+    let mut flushing: KVec<(usize, Ref<PendingOperation>)> = KVec::new();
     let mut next = 0usize;
     while let Some((index, device)) = crate::device::find_block_device_from(next) {
         next = index + 1;
@@ -104,22 +104,18 @@ fn flush_every_disk() {
 
     let deadline = crate::arch::Timer::read_ns().saturating_add(FLUSH_BOUND_NS);
     loop {
-        let mut waiting = [0usize; MAX_WAIT_HANDLES];
-        let mut n = 0;
+        let mut waiting = ArrayVec::<&ObjectRef, MAX_WAIT_HANDLES>::new();
         for (_, po) in flushing.iter() {
-            // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-            if n < MAX_WAIT_HANDLES && !unsafe { crate::sched::pending_op_is_signaled(po.as_ptr()) } {
-                waiting[n] = po.as_ptr() as usize;
-                n += 1;
+            if !crate::sched::pending_op_is_signaled(po) {
+                let _ = waiting.try_push(po.as_object());
             }
         }
         let now = crate::arch::Timer::read_ns();
-        if n == 0 || now >= deadline {
+        if waiting.is_empty() || now >= deadline {
             break;
         }
-        // SAFETY: `flushing` pins every operation waited on. Out of memory to wait with is a flush that
-        // does not finish, as far as the log is concerned.
-        let waited = unsafe { crate::sched::wait_on_io(&waiting[..n], deadline, now) };
+        // Out of memory to wait with is a flush that does not finish, as far as the log is concerned.
+        let waited = crate::sched::wait_on_io(&waiting, deadline, now);
         if let crate::sched::WaitResult::OutOfMemory = waited {
             break;
         }
@@ -127,14 +123,12 @@ fn flush_every_disk() {
 
     let mut flushed = 0usize;
     for (index, po) in flushing.iter() {
-        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-        if !unsafe { crate::sched::pending_op_is_signaled(po.as_ptr()) } {
+        if !crate::sched::pending_op_is_signaled(po) {
             let bound = FLUSH_BOUND_NS / 1_000_000_000;
             crate::kprintln!("power: /dev/blk/{index} did not finish flushing in {bound} s");
             continue;
         }
-        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
-        match unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 {
+        match crate::sched::pending_op_completion(po).0 {
             0 => flushed += 1,
             status => crate::kprintln!("power: /dev/blk/{index} failed to flush (status {status})"),
         }
@@ -143,9 +137,9 @@ fn flush_every_disk() {
 }
 
 /// Send one disk a flush, returning its operation, or the status it was refused with.
-fn start_flush(device: &Ref<DeviceNode>) -> Result<ObjectRef, i32> {
+fn start_flush(device: &Ref<DeviceNode>) -> Result<Ref<PendingOperation>, i32> {
     let po = PendingOperation::try_new().map_err(|_| crate::syscall::KError::OutOfMemory as i32)?;
-    let po = ObjectRef::new(po);
+    let po = Ref::new(po);
     crate::io::block::dispatch_block_flush(device, &po).map_err(|e| e as i32)?;
     Ok(po)
 }
