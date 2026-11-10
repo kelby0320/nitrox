@@ -147,17 +147,17 @@ fn a_started_thread_no_queue_takes_drops_after_the_hold() {
 }
 
 /// A thread blocked on each of `objs`, registered as `wait_on` registers it.
-fn waiting_on(st: &mut SchedState, objs: &[*mut ()]) -> *mut () {
+fn waiting_on(st: &mut SchedState, objs: &[&ObjectRef]) -> *mut () {
     let th = inert_ref(1);
     let t = th.as_ptr();
-    let addrs: std::vec::Vec<usize> = objs.iter().map(|&o| o as usize).collect();
-    // SAFETY: each object is pinned by its test; single-threaded test.
+    let addrs: std::vec::Vec<usize> = objs.iter().map(|o| o.as_ptr() as usize).collect();
+    // SAFETY: the thread is pinned by its test; single-threaded test.
     unsafe {
         Thread::wait_register(t, &addrs, false);
-        for &o in objs {
-            obj_add_waiter(o, t).unwrap();
-        }
         Thread::set_state(t, ThreadState::Blocked);
+    }
+    for o in objs {
+        obj_add_waiter(&mut st.tok, o, t).unwrap();
     }
     assert!(st.blocked.push(th).is_ok());
     t
@@ -174,29 +174,29 @@ fn every_kind_of_waitable_marks_its_slot_and_wakes_its_waiter() {
     init_global_heap();
     super::online_set::force(0b1);
     let (ep, peer) = IpcChannel::try_new_pair(1).unwrap();
-    let (ep, _peer) = (ObjectRef::new(ep), ObjectRef::new(peer));
+    let (ep, peer) = (ObjectRef::new(ep), Ref::new(peer));
     let chan = ObjectRef::new(NotificationChannel::try_new().unwrap());
     let irq = ObjectRef::new(InterruptObject::try_new().unwrap());
     let (po, timer) = (po(), new_timer());
-    let fire = |g: &mut SchedState, timer: *mut ()| {
-        let target = deadline::Target::Timer(timer as usize);
+    let fire = |g: &mut SchedState, timer: &ObjectRef| {
+        let target = deadline::Target::Timer(timer.as_ptr() as usize);
         deadline::push(&mut g.deadlines, deadline::Entry { deadline_ns: 1, target }).unwrap();
         fire_expired_deadlines(g, 2);
     };
-    type Signal = fn(&mut SchedState, *mut ());
-    let signals: [(&ObjectRef, Signal); 5] = [
-        (&chan, |g, o| {
-            signal_channel(g, o);
+    type Signal<'a> = &'a dyn Fn(&mut SchedState, &ObjectRef);
+    let signals: [(&ObjectRef, Signal<'_>); 5] = [
+        (&chan, &|g, o| {
+            signal_channel(g, o.downcast_ref().unwrap());
         }),
-        (&ep, signal_ipc_endpoint),
-        (&po, |g, o| signal_pending_op(g, o, 0)),
-        (&irq, signal_interrupt_in),
-        (&timer, fire),
+        (&ep, &|g, _| wake_peer(g, &peer)),
+        (&po, &|g, o| signal_pending_op(g, o.downcast_ref().unwrap(), 0)),
+        (&irq, &|g, o| signal_interrupt_in(g, o.downcast_ref().unwrap())),
+        (timer.as_object(), &fire),
     ];
     for (obj, signal) in signals {
         let mut st = reserved_state();
-        let t = waiting_on(&mut st, &[obj.as_ptr()]);
-        signal(&mut st, obj.as_ptr());
+        let t = waiting_on(&mut st, &[obj]);
+        signal(&mut st, obj);
         let kind = obj.object_type();
         // SAFETY: pinned by its run queue; single-threaded test.
         assert!(unsafe { Thread::wait_signaled(t) }[0], "{kind:?}: its slot marked");
@@ -213,9 +213,9 @@ fn a_thread_waiting_on_two_objects_is_woken_by_the_first_alone() {
     let mut st = reserved_state();
     let channel = || ObjectRef::new(NotificationChannel::try_new().unwrap());
     let (a, b) = (channel(), channel());
-    let t = waiting_on(&mut st, &[a.as_ptr(), b.as_ptr()]);
-    assert!(signal_channel(&mut st, a.as_ptr()), "the first wakes it");
-    assert!(!signal_channel(&mut st, b.as_ptr()), "the second wakes nothing");
+    let t = waiting_on(&mut st, &[&a, &b]);
+    assert!(signal_channel(&mut st, a.downcast_ref().unwrap()), "the first wakes it");
+    assert!(!signal_channel(&mut st, b.downcast_ref().unwrap()), "the second wakes nothing");
     // SAFETY: pinned by its run queue; single-threaded test.
     assert_eq!(unsafe { Thread::wait_signaled(t) }[..2], [true, true]);
     assert_eq!(queued(&st, t), 1);
@@ -276,23 +276,20 @@ fn a_terminate_request_reaches_the_channel_its_process_holds() {
     let waiter = inert_ref(1);
     let (t, on) = (waiter.as_ptr(), channel.as_ptr().cast::<()>());
     {
-        let _g = SCHED.lock();
-        // SAFETY: the test's thread and channel, pinned by its references; `SCHED` held.
-        unsafe {
-            Thread::wait_register(t, &[on as usize], false);
-            NotificationChannel::add_waiter(on, t).unwrap();
-        }
+        let mut g = SCHED.lock();
+        // SAFETY: the test's thread, pinned by its reference; `SCHED` held.
+        unsafe { Thread::wait_register(t, &[on as usize], false) };
+        channel.add_waiter(&mut g.tok, t).unwrap();
     }
     assert!(request_terminate(&process));
     let woken = {
-        let _g = SCHED.lock();
+        let mut g = SCHED.lock();
         // SAFETY: as above.
-        unsafe {
-            let marked = Thread::wait_signaled(t)[0];
-            NotificationChannel::remove_waiter(on, t);
-            Thread::wait_clear(t);
-            marked
-        }
+        let marked = unsafe { Thread::wait_signaled(t) }[0];
+        channel.remove_waiter(&mut g.tok, t);
+        // SAFETY: as above.
+        unsafe { Thread::wait_clear(t) };
+        marked
     };
     assert!(woken, "its waiter woken");
     let heard = notif_try_recv(&channel).expect("the request");
@@ -330,4 +327,44 @@ fn a_wait_on_one_object_more_than_it_holds_is_refused() {
         assert!(matches!(held, WaitResult::Signaled(b) if b[MAX_WAIT_HANDLES - 1]), "its last slot read");
         assert!(matches!(wait_on(&objs, 0, 0), WaitResult::OutOfMemory), "one more");
     });
+}
+
+/// **An endpoint whose last reference goes while its peer sends into it is borrowed by neither**:
+/// the send, under `SCHED`, writes the closing endpoint's ring through the peer's back-pointer, so
+/// nothing may hold a `&mut` to that endpoint until its closing has taken `SCHED` and unlinked it.
+#[test]
+#[cfg_attr(not(miri), ignore = "an aliasing check: only Miri can see it")]
+fn an_endpoint_closing_while_its_peer_sends_into_it_is_borrowed_by_neither() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Moved<T>(T);
+    // SAFETY: the test hands each reference to one thread at a time.
+    unsafe impl<T> Send for Moved<T> {}
+    init_global_heap();
+    let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+    let (a, b) = (Ref::new(a), Moved(Ref::new(b)));
+    let locked = Arc::new(AtomicBool::new(false));
+    let sender = {
+        let locked = locked.clone();
+        std::thread::spawn(move || {
+            let b = b;
+            let msg = crate::libkern::KBox::<StoredMsg>::try_new_zeroed().unwrap();
+            let mut none: [Option<TransferRef>; crate::libkern::ipc::IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+            let mut g = SCHED.lock();
+            locked.store(true, Ordering::Release);
+            for _ in 0..64 {
+                std::thread::yield_now();
+            }
+            let sent = b.0.send_push(&mut g.tok, &msg, &mut none);
+            drop(g);
+            (b, sent)
+        })
+    };
+    while !locked.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    drop(a);
+    let (b, sent) = sender.join().unwrap();
+    assert!(matches!(sent, SendOutcome::Sent { .. } | SendOutcome::PeerClosed));
+    drop(b);
 }

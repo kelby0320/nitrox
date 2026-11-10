@@ -25,7 +25,7 @@ pub(super) fn wake_seed_waiters(drain: impl FnOnce(&mut [Option<Ref<PendingOpera
     let mut bag = Deferred::<SEED_WAITERS_MAX>::in_interrupt();
     let mut g = bag.lock();
     for po in buf[..n].iter_mut().filter_map(Option::take) {
-        signal_pending_op_with_result(&mut g, addr(&*po), 0, 0);
+        signal_pending_op_with_result(&mut g, &po, 0, 0);
         g.defer(po.erase());
     }
 }
@@ -51,10 +51,10 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
                 }
             }
             deadline::Target::Timer(timer) => {
-                let timer = timer as *mut ();
-                // SAFETY: a heaped timer is whole: `timer_closing` removes its entry
-                // under `SCHED` before the memory goes; `SCHED` held.
-                unsafe { Timer::set_in_heap(timer, false) };
+                // SAFETY: a heaped timer is whole: its closing removes the entry under `SCHED`
+                // before the memory goes, and `SCHED` is held.
+                let timer = unsafe { &*(timer as *const Timer) };
+                timer.set_in_heap(&mut g.tok, false);
                 fire_timer(g, timer, now);
             }
             deadline::Target::PendingSend { po, channel } => {
@@ -62,12 +62,14 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
                 // and complete its `PendingOperation` with `TimedOut`. No `ObjectRef` drop
                 // here (`SCHED` held — a transferred object's `Drop` could take the buddy
                 // lock); the message + refs are reclaimed on the next recv / at close.
-                let (po, channel) = (po as *mut (), channel as *mut ());
-                // SAFETY: `channel` is still open — `ipc_endpoint_closing`
-                // removes its held sends' deadline entries, so a fired
-                // pending-send deadline always names a live endpoint; `SCHED`
-                // held. `cancel_pending_send` only sets a flag (no drop).
-                unsafe { IpcChannel::cancel_pending_send(channel, po) };
+                // SAFETY: `channel` is still open: its closing removes its held sends' deadline
+                // entries under `SCHED`, which is held, before the memory goes.
+                let channel = unsafe { &*(channel as *const IpcChannel) };
+                // SAFETY: the PO is pinned by the held send in `channel`'s queue, which only a
+                // receive or the closing takes out, and neither runs while `SCHED` is held.
+                let po = unsafe { &*(po as *const PendingOperation) };
+                // Only a flag is set: nothing is dropped here.
+                channel.cancel_pending_send(&mut g.tok, po);
                 signal_pending_op(g, po, crate::syscall::error::KError::TimedOut as i32);
             }
         }
@@ -76,25 +78,20 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
 
 /// Fire one timer: signal + wake all its waiters, then re-arm if periodic. Caller holds
 /// `SCHED`.
-fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
-    // SAFETY: live Timer, `SCHED` held — drains its waiter list.
-    let waiters = unsafe { Timer::take_waiters(timer) };
-    wake_all(g, waiters, timer);
-    // SAFETY: live Timer, `SCHED` held.
-    let interval = unsafe { Timer::interval(timer) };
+fn fire_timer(g: &mut SchedState, timer: &Timer, now: u64) {
+    let waiters = timer.take_waiters(&mut g.tok);
+    wake_all(g, waiters, addr(timer));
+    let interval = timer.interval(&g.tok);
     // A one-shot keeps its passed deadline, out of the heap, so a wait that arrives after this
     // tick still finds it signaled.
     if interval > 0 {
         let next = now.saturating_add(interval);
-        // SAFETY: live Timer, `SCHED` held — re-arm the periodic timer.
-        unsafe {
-            Timer::set_armed(timer, next, interval);
-            Timer::set_in_heap(timer, true);
-        }
+        timer.set_armed(&mut g.tok, next, interval);
+        timer.set_in_heap(&mut g.tok, true);
         // Re-push into the slot the timer holds (its entry was just popped).
         let _ = deadline::push_promised(
             g,
-            deadline::Entry { deadline_ns: next, target: deadline::Target::Timer(timer as usize) },
+            deadline::Entry { deadline_ns: next, target: deadline::Target::Timer(addr(timer) as usize) },
         );
     }
 }
@@ -104,51 +101,31 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
 #[allow(clippy::result_unit_err, reason = "one failure, the heap's reserve, which every caller reports one way")]
 pub fn timer_arm(timer: &Timer, deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
     let mut g = SCHED.lock();
-    let timer = addr(timer);
     // Drop any stale heap entry (re-arm).
-    // SAFETY: pinned by the borrow, `SCHED` held.
-    unsafe { unheap(&mut g, timer) };
-    // SAFETY: live Timer, `SCHED` held.
-    unsafe { Timer::set_armed(timer, deadline_ns, interval_ns) };
+    unheap(&mut g, timer);
+    timer.set_armed(&mut g.tok, deadline_ns, interval_ns);
     if deadline_ns != 0 {
-        if deadline::push_promised(
-            &mut g,
-            deadline::Entry { deadline_ns, target: deadline::Target::Timer(timer as usize) },
-        )
-        .is_err()
-        {
-            // SAFETY: live Timer, `SCHED` held — undo the arm on heap overflow.
-            unsafe { Timer::set_armed(timer, 0, 0) };
+        let target = deadline::Target::Timer(addr(timer) as usize);
+        if deadline::push_promised(&mut g, deadline::Entry { deadline_ns, target }).is_err() {
+            // Undo the arm on heap overflow.
+            timer.set_armed(&mut g.tok, 0, 0);
             return Err(());
         }
-        // SAFETY: live Timer, `SCHED` held.
-        unsafe { Timer::set_in_heap(timer, true) };
+        timer.set_in_heap(&mut g.tok, true);
     }
     Ok(())
 }
 
-/// A timer is being destroyed: drop its heap entry, which names it by address without a
-/// reference. Called only from [`Timer::drop`](crate::object::Timer), outside `SCHED`.
-///
-/// # Safety
-///
-/// `timer` is the `Timer` being dropped: its memory whole, its last reference gone.
-pub unsafe fn timer_closing(timer: *mut ()) {
-    let mut g = SCHED.lock();
-    // SAFETY: the memory is whole until the drop returns; `SCHED` held.
-    unsafe { unheap(&mut g, timer) };
+/// A timer's last reference has gone: drop its heap entry, which names it by address without a
+/// reference. Its closing, outside `SCHED`, before the memory goes.
+pub(crate) fn timer_closing(timer: &Timer) {
+    unheap(&mut SCHED.lock(), timer);
 }
 
 /// Remove `timer`'s heap entry, if it has one.
-///
-/// # Safety
-///
-/// `timer` is a `Timer` whose memory is whole; the caller holds `SCHED`.
-unsafe fn unheap(g: &mut SchedState, timer: *mut ()) {
-    // SAFETY: the caller's contract.
-    if unsafe { Timer::in_heap(timer) } {
-        deadline::remove(&mut g.deadlines, deadline::Target::Timer(timer as usize));
-        // SAFETY: as above.
-        unsafe { Timer::set_in_heap(timer, false) };
+fn unheap(g: &mut SchedState, timer: &Timer) {
+    if timer.in_heap(&g.tok) {
+        deadline::remove(&mut g.deadlines, deadline::Target::Timer(addr(timer) as usize));
+        timer.set_in_heap(&mut g.tok, false);
     }
 }

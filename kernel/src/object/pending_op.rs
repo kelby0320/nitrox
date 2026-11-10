@@ -10,29 +10,26 @@
 //!
 //! ## Mutation discipline
 //!
-//! As for [`Timer`](crate::object::Timer): all interior state lives in an [`UnsafeCell`]
-//! touched **exclusively under the rank-1 `SCHED` lock** (`kernel/docs/lock-ordering.md`),
-//! reached through a type-erased `*mut ()` so no aliasing `&mut PendingOperation` is formed.
-
-use core::cell::UnsafeCell;
+//! As for [`Timer`](crate::object::Timer): all interior state lives in a [`SchedCell`], borrowed
+//! only with the token the rank-1 `SCHED` lock keeps (`kernel/docs/lock-ordering.md`).
 
 use crate::libkern::handle::Rights;
 use crate::libkern::{AllocError, KBox};
 use crate::object::ObjectRef;
 use crate::object::header::{Header, Shared, kobject};
 use crate::object::{WaitQueue, Waiters};
+use crate::sched::{SchedCell, SchedToken};
 
 /// A pending-operation kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct PendingOperation {
     header: Header<Self>,
     magic: u64,
-    inner: UnsafeCell<PendingOpInner>,
+    inner: SchedCell<PendingOpInner>,
 }
 
 kobject!(PendingOperation);
-// SAFETY: a `PendingOperation` changes once shared only in `inner`, an `UnsafeCell` touched only
-// under `SCHED`.
+// SAFETY: a `PendingOperation` changes once shared only in `inner`, a `SchedCell`.
 unsafe impl Shared for PendingOperation {}
 
 struct PendingOpInner {
@@ -56,13 +53,6 @@ struct PendingOpInner {
     installing: bool,
 }
 
-// SAFETY: identical reasoning to `Timer`/`ObjectRef` — the header refcount is
-// atomic, and every access to `inner` is serialised under the single-CPU `SCHED`
-// lock, so sharing/moving a `PendingOperation` across contexts cannot race.
-unsafe impl Send for PendingOperation {}
-// SAFETY: as `Send`.
-unsafe impl Sync for PendingOperation {}
-
 impl PendingOperation {
     /// Sentinel written into [`PendingOperation::magic`] at construction.
     pub const MAGIC: u64 = 0x50_65_6e_64_4f_70_21_21; // "PendOp!!"
@@ -75,7 +65,7 @@ impl PendingOperation {
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(PendingOpInner {
+            inner: SchedCell::new(PendingOpInner {
                 signaled: false,
                 status: 0,
                 result: 0,
@@ -91,32 +81,11 @@ impl PendingOperation {
         self.magic == Self::MAGIC
     }
 
-    // SAFETY (shared by all): `obj` is a live `PendingOperation` pinned by the caller's
-    // `ObjectRef`, and the caller holds `SCHED`, which serialises all access to `inner`.
-
-    /// Borrow the interior mutably. Must not outlive the `SCHED` hold nor alias.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
-    unsafe fn inner<'a>(obj: *mut ()) -> &'a mut PendingOpInner {
-        // SAFETY: `obj` is a live PO; forming a shared `&PendingOperation` to
-        // reach the `UnsafeCell`, then a `&mut PendingOpInner` through it, is the
-        // interior-mutability contract — sound while `SCHED` serialises access.
-        let p = unsafe { &*(obj as *const PendingOperation) };
-        // SAFETY: as above.
-        unsafe { &mut *p.inner.get() }
-    }
-
     /// Mark the operation complete with `status` **and** a `result` payload. **One-shot**: a PO
     /// already signalled is untouched (the first completion wins). Returns `true` iff this call
     /// made the transition, so the caller knows to wake waiters.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn signal_with_result(obj: *mut (), status: i32, result: u64) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn signal_with_result(&self, tok: &mut SchedToken, status: i32, result: u64) -> bool {
+        let inner = self.inner.get(tok);
         if inner.signaled {
             return false;
         }
@@ -127,49 +96,29 @@ impl PendingOperation {
     }
 
     /// The completion status (`0` before signalled); stable after the one-shot transition.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn status(obj: *mut ()) -> i32 {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.status
+    pub(crate) fn status(&self, tok: &SchedToken) -> i32 {
+        self.inner.read(tok).status
     }
 
     /// The completion result payload (`0` before signalled); stable after the transition.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn result(obj: *mut ()) -> u64 {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.result
+    pub(crate) fn result(&self, tok: &SchedToken) -> u64 {
+        self.inner.read(tok).result
     }
 
     /// `true` iff the operation has completed — the `sys_wait` fast-path check.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn already_signaled(obj: *mut ()) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.signaled
+    pub(crate) fn already_signaled(&self, tok: &SchedToken) -> bool {
+        self.inner.read(tok).signaled
     }
 
     /// Park a lookup's object for its reader (see `parked`).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn park(obj: *mut (), parked: Option<(ObjectRef, Rights)>) {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.parked = parked;
+    pub(crate) fn park(&self, tok: &mut SchedToken, parked: Option<(ObjectRef, Rights)>) {
+        self.inner.get(tok).parked = parked;
     }
 
     /// The parked object, for a reader to install, then end with [`installed`](Self::installed);
     /// `None` with none parked, or with another reader installing it, which `Err` says.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_parked(obj: *mut ()) -> Result<Option<(ObjectRef, Rights)>, ()> {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn take_parked(&self, tok: &mut SchedToken) -> Result<Option<(ObjectRef, Rights)>, ()> {
+        let inner = self.inner.get(tok);
         if inner.installing {
             return Err(());
         }
@@ -178,12 +127,8 @@ impl PendingOperation {
     }
 
     /// End an install: its handle is the result now, or its error is the status, for good.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn installed(obj: *mut (), outcome: Result<u64, i32>) {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn installed(&self, tok: &mut SchedToken, outcome: Result<u64, i32>) {
+        let inner = self.inner.get(tok);
         inner.installing = false;
         match outcome {
             Ok(handle) => inner.result = handle,
@@ -192,32 +137,20 @@ impl PendingOperation {
     }
 
     /// Register `thread` as a waiter; `Err(())` at the cap, which callers map to `OutOfMemory`.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn add_waiter(&self, tok: &mut SchedToken, thread: *mut ()) -> Result<(), ()> {
+        let inner = self.inner.get(tok);
         inner.waiters.add(thread)
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn remove_waiter(&self, tok: &mut SchedToken, thread: *mut ()) {
+        let inner = self.inner.get(tok);
         inner.waiters.remove(thread);
     }
 
     /// Take every waiter, leaving none.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ PendingOperation::MAX_WAITERS }> {
-        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn take_waiters(&self, tok: &mut SchedToken) -> Waiters<{ PendingOperation::MAX_WAITERS }> {
+        let inner = self.inner.get(tok);
         inner.waiters.take()
     }
 }
@@ -237,101 +170,71 @@ mod tests {
     use crate::object::ObjectRef;
     use crate::object::header::test_probe;
 
-    fn fresh() -> *mut () {
+    fn fresh() -> (KBox<PendingOperation>, SchedToken) {
         init_global_heap();
-        KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut ()
-    }
-
-    fn free(obj: *mut ()) {
-        // SAFETY: `obj` carries the single creation reference and has no waiters.
-        unsafe {
-            drop(KBox::<PendingOperation>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut PendingOperation)));
-        }
+        (PendingOperation::try_new().unwrap(), SchedToken::for_test())
     }
 
     #[test]
     fn try_new_is_unsignalled_with_magic() {
-        init_global_heap();
-        let p = PendingOperation::try_new().unwrap();
+        let (p, tok) = fresh();
         assert!(p.magic_ok());
-        let obj = KBox::into_raw(p).as_ptr() as *mut ();
-        // SAFETY: live PO, single-threaded test (stands in for SCHED).
-        unsafe {
-            assert!(!PendingOperation::already_signaled(obj));
-            assert_eq!(PendingOperation::status(obj), 0);
-        }
-        free(obj);
+        assert!(!p.already_signaled(&tok));
+        assert_eq!(p.status(&tok), 0);
     }
 
     #[test]
     fn signal_is_one_shot_and_records_status() {
-        let obj = fresh();
-        // SAFETY: live PO, single-threaded test.
-        unsafe {
-            assert!(PendingOperation::signal_with_result(obj, 0, 0));
-            assert!(PendingOperation::already_signaled(obj));
-            assert_eq!(PendingOperation::status(obj), 0);
-            assert!(!PendingOperation::signal_with_result(obj, -12, 0));
-            assert_eq!(PendingOperation::status(obj), 0, "status must not change");
-        }
-        free(obj);
+        let (p, mut tok) = fresh();
+        assert!(p.signal_with_result(&mut tok, 0, 0));
+        assert!(p.already_signaled(&tok));
+        assert_eq!(p.status(&tok), 0);
+        assert!(!p.signal_with_result(&mut tok, -12, 0));
+        assert_eq!(p.status(&tok), 0, "status must not change");
     }
 
     #[test]
     fn signal_carries_a_negative_status() {
-        let obj = fresh();
-        // SAFETY: live PO, single-threaded test.
-        unsafe {
-            assert!(PendingOperation::signal_with_result(obj, -12, 0)); // e.g. TimedOut
-            assert!(PendingOperation::already_signaled(obj));
-            assert_eq!(PendingOperation::status(obj), -12);
-            assert_eq!(PendingOperation::result(obj), 0);
-        }
-        free(obj);
+        let (p, mut tok) = fresh();
+        assert!(p.signal_with_result(&mut tok, -12, 0)); // e.g. TimedOut
+        assert!(p.already_signaled(&tok));
+        assert_eq!(p.status(&tok), -12);
+        assert_eq!(p.result(&tok), 0);
     }
 
     #[test]
     fn signal_with_result_records_status_and_payload() {
-        let obj = fresh();
-        // SAFETY: live PO, single-threaded test.
-        unsafe {
-            assert_eq!(PendingOperation::result(obj), 0, "zero before signal");
-            assert!(PendingOperation::signal_with_result(obj, 0, 0xCAFE));
-            assert!(PendingOperation::already_signaled(obj));
-            assert_eq!(PendingOperation::status(obj), 0);
-            assert_eq!(PendingOperation::result(obj), 0xCAFE);
-            assert!(!PendingOperation::signal_with_result(obj, -10, 0xDEAD));
-            assert_eq!(PendingOperation::status(obj), 0, "status unchanged");
-            assert_eq!(PendingOperation::result(obj), 0xCAFE, "result unchanged");
-        }
-        free(obj);
+        let (p, mut tok) = fresh();
+        assert_eq!(p.result(&tok), 0, "zero before signal");
+        assert!(p.signal_with_result(&mut tok, 0, 0xCAFE));
+        assert!(p.already_signaled(&tok));
+        assert_eq!(p.status(&tok), 0);
+        assert_eq!(p.result(&tok), 0xCAFE);
+        assert!(!p.signal_with_result(&mut tok, -10, 0xDEAD));
+        assert_eq!(p.status(&tok), 0, "status unchanged");
+        assert_eq!(p.result(&tok), 0xCAFE, "result unchanged");
     }
 
     #[test]
     fn waiters_add_remove_take_caps_at_max() {
-        let obj = fresh();
-        // SAFETY: live PO, single-threaded test.
-        unsafe {
-            let ths: [*mut (); PendingOperation::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
-            for &t in &ths {
-                assert!(PendingOperation::add_waiter(obj, t).is_ok());
-            }
-            assert!(PendingOperation::add_waiter(obj, 0xDEAD as *mut ()).is_err());
-            PendingOperation::remove_waiter(obj, ths[1]);
-            assert!(PendingOperation::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
-            assert_eq!(&PendingOperation::take_waiters(obj)[..], &[ths[0], ths[2], ths[3], 0xBEEF as *mut ()]);
-            assert!(PendingOperation::take_waiters(obj).is_empty());
+        let (p, mut tok) = fresh();
+        let tok = &mut tok;
+        let ths: [*mut (); PendingOperation::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+        for &t in &ths {
+            assert!(p.add_waiter(tok, t).is_ok());
         }
-        free(obj);
+        assert!(p.add_waiter(tok, 0xDEAD as *mut ()).is_err());
+        p.remove_waiter(tok, ths[1]);
+        assert!(p.add_waiter(tok, 0xBEEF as *mut ()).is_ok());
+        assert_eq!(&p.take_waiters(tok)[..], &[ths[0], ths[2], ths[3], 0xBEEF as *mut ()]);
+        assert!(p.take_waiters(tok).is_empty());
     }
 
     #[test]
     fn dispatch_destroy_runs_pending_op_arm() {
         init_global_heap();
         test_probe::reset();
-        let obj = fresh();
-        // SAFETY: `obj` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(obj) };
+        let r = ObjectRef::new(PendingOperation::try_new().unwrap());
         assert_eq!(test_probe::pending_op_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::pending_op_destroys(), 1);

@@ -275,9 +275,9 @@ IRQ context. It is sound there, for the reason the `#PF` fault-in is:
 `Namespace` (`kernel/src/object/namespace.rs`) is a syscall-accessed object — its
 binding store is touched only by the owning thread's namespace syscalls, never by
 the scheduler — so it follows the `AddressSpace` model: a rank-4 `SpinLock<Inner>`,
-not the under-`SCHED` `UnsafeCell` pattern used by scheduler-touched objects
-(`Timer`, `IpcChannel`). `bind` allocates under the lock (the path copy and the
-binding push), which acquires the rank-6 allocator beneath rank 4 — correctly
+not the `SchedCell` of scheduler-touched objects (`Timer`, `IpcChannel`), borrowed
+only with the token the held `SCHED` keeps. `bind` allocates under the lock (the path
+copy and the binding push), which acquires the rank-6 allocator beneath rank 4 — correctly
 ordered (rank N held while acquiring rank M > N). The no-allocation rule applies
 only to the rank-1 `SCHED` lock. `bind`/`unbind` hand the target `ObjectRef` back
 to the caller on every path so it is dropped **outside** the lock (an `ObjectRef`
@@ -294,8 +294,9 @@ that its end of a pipe never closes so a peer never observes `PeerClosed`
 The sweep cannot run where the process actually dies, in its last thread's exit:
 that thread holds rank-1 `SCHED` and never returns from `finish_exit`, and
 releasing an object reference runs a destructor that reaches the rank-6
-allocator — and, for an `IpcChannel` or a `Timer`, takes rank-1 `SCHED` itself,
-to wake blocked receivers or take the timer out of the deadline heap. So:
+allocator — and, for an `IpcChannel`, a `Timer` or a `UserspaceServerReg`, a closing
+that takes rank-1 `SCHED` first, to wake blocked receivers, take the timer out of the
+deadline heap or fail a registration's requests. So:
 
 1. The last thread out only *marks* itself (`Thread::set_process_ended`) under
    `SCHED`, and queues the pid for the reaper thread.

@@ -801,8 +801,7 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     let file = Ref::new(file);
     let fo: &FileObject = &file;
     let Fault::Fill(frame, stale) = fo.reserve_fault(0) else { panic!("a fill") };
-    // SAFETY: `reg` pins the registration, and the test is single-threaded.
-    let id = unsafe { UserspaceServerReg::begin_fill(reg.as_object().as_ptr(), &stale, &file, frame, 0) }.unwrap();
+    let id = reg.begin_fill(&mut crate::sched::SchedToken::for_test(), &stale, &file, frame, 0).unwrap();
     fo.resize(0, KVec::new()).unwrap();
     fo.resize(PAGE_SIZE, KVec::new()).unwrap();
     let Fault::Fill(next, _its_fill) = fo.reserve_fault(0) else { panic!("a fill afresh") };
@@ -844,8 +843,7 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
         };
         let fo: &FileObject = &file;
         let Fault::Fill(frame, po) = fo.reserve_fault(0) else { panic!("a fill") };
-        // SAFETY: `reg` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin_fill(reg.as_object().as_ptr(), &po, &file, frame, 0) }.unwrap();
+        let id = reg.begin_fill(&mut crate::sched::SchedToken::for_test(), &po, &file, frame, 0).unwrap();
         let mut reply = StoredMsg::zeroed();
         build_read_range_request(&mut reply.payload, 0, PAGE_SIZE as u32, b"f").unwrap();
         reply.payload[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8].copy_from_slice(&id.to_le_bytes());

@@ -1,27 +1,30 @@
 //! IPC delivery: sends, receives, and forwarding to a userspace server.
 
 use super::*;
+use crate::object::userspace_server::Outstanding;
 
 /// Whether a send on `endpoint` carrying `transfers` could close a cycle of endpoints holding
 /// each other through their rings, which nothing would free: it carries the endpoint it is for,
 /// or one already holding an endpoint, as the last move of every such cycle must. A cycle
 /// through a namespace binding is not caught: TODO(ipc-handle-cycles).
 /// A lookup's PO, which can hold an endpoint, cannot move at all.
-///
-/// # Safety
-///
-/// `endpoint` is a live `IpcChannel` the caller pins; the caller holds `SCHED`.
-unsafe fn closes_a_cycle(endpoint: *mut (), transfers: &[Option<TransferRef>]) -> bool {
+fn closes_a_cycle(tok: &SchedToken, endpoint: &IpcChannel, transfers: &[Option<TransferRef>]) -> bool {
     if transfers.iter().all(Option::is_none) {
         return false;
     }
-    // SAFETY: the caller's contract. A peer only ever turns null.
-    let peer = unsafe { IpcChannel::peer_of(endpoint) };
+    let peer = endpoint.peer_addr(tok);
     transfers.iter().flatten().any(|t| {
-        let ep = t.obj.as_ptr();
-        // SAFETY: an `IpcChannel` the transfer pins; `SCHED` held.
-        ep == peer || (t.obj.object_type() == KObjectType::IpcChannel && unsafe { IpcChannel::holds_an_endpoint(ep) })
+        core::ptr::eq(t.obj.as_ptr().cast::<IpcChannel>(), peer)
+            || t.obj.downcast_ref::<IpcChannel>().is_some_and(|ep| ep.holds_an_endpoint(tok))
     })
+}
+
+/// Wake the receivers blocked on `endpoint`'s peer, whose ring a send just made non-empty.
+pub(super) fn wake_peer(g: &mut SchedState, endpoint: &IpcChannel) {
+    let peer = endpoint.peer(&mut g.tok).map(|(peer, tok)| (peer.take_waiters(tok), addr(peer)));
+    if let Some((waiters, key)) = peer {
+        wake_all(g, waiters, key);
+    }
 }
 
 /// Send `msg` from `endpoint` into its peer's receive ring under `SCHED`, **moving** any
@@ -35,19 +38,12 @@ pub fn ipc_send_push(
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> SendOutcome {
     let mut g = SCHED.lock();
-    let endpoint = addr(endpoint);
-    // SAFETY: the borrow pins `endpoint`; `SCHED` held.
-    if unsafe { closes_a_cycle(endpoint, transfers) } {
+    if closes_a_cycle(&g.tok, endpoint, transfers) {
         return SendOutcome::Cycle;
     }
-    // SAFETY: as above.
-    let outcome = unsafe { IpcChannel::send_push(endpoint, msg, transfers) };
+    let outcome = endpoint.send_push(&mut g.tok, msg, transfers);
     if let SendOutcome::Sent { woke_edge: true } = outcome {
-        // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
-        let peer = unsafe { IpcChannel::peer_of(endpoint) };
-        if !peer.is_null() {
-            signal_ipc_endpoint(&mut g, peer);
-        }
+        wake_peer(&mut g, endpoint);
     }
     outcome
 }
@@ -72,17 +68,11 @@ pub enum ForwardOutcome {
 /// already on the device.
 pub fn us_forward_notify(reg: &UserspaceServerReg, msg: &mut StoredMsg) -> bool {
     let mut g = SCHED.lock();
-    let endpoint = addr(reg.endpoint());
     let mut no_transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
-    // SAFETY: the borrowed registration holds its endpoint; `SCHED` held.
-    match unsafe { IpcChannel::send_push(endpoint, msg, &mut no_transfers) } {
+    match reg.endpoint().send_push(&mut g.tok, msg, &mut no_transfers) {
         SendOutcome::Sent { woke_edge } => {
             if woke_edge {
-                // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
-                let peer = unsafe { IpcChannel::peer_of(endpoint) };
-                if !peer.is_null() {
-                    signal_ipc_endpoint(&mut g, peer);
-                }
+                wake_peer(&mut g, reg.endpoint());
             }
             true
         }
@@ -107,33 +97,24 @@ pub fn us_forward_originate(
 ) -> ForwardOutcome {
     let mut bag = Deferred::<1>::new();
     let mut g = bag.lock();
-    let endpoint = addr(reg.endpoint());
-    let reg = addr(reg);
-    // SAFETY: the borrow pins `reg`; `SCHED` held. Reserve the pending slot + assign a request
-    // id (None ⇒ already busy).
-    let request_id = match unsafe { UserspaceServerReg::begin_forward(reg, po, requested, suffix, fwd) } {
-        Some(id) => id,
-        None => return ForwardOutcome::Busy,
+    // Reserve the pending slot and assign a request id (`None`: already busy).
+    let Some(request_id) = reg.begin_forward(&mut g.tok, po, requested, suffix, fwd) else {
+        return ForwardOutcome::Busy;
     };
     // Stamp the assigned id into the request envelope (built with a zero placeholder).
     crate::rsproto::stamp_request_id(&mut msg.payload, request_id);
     let mut no_transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
-    // SAFETY: the borrowed registration holds its endpoint; `SCHED` held.
-    let outcome = unsafe { IpcChannel::send_push(endpoint, msg, &mut no_transfers) };
+    let outcome = reg.endpoint().send_push(&mut g.tok, msg, &mut no_transfers);
     match outcome {
         SendOutcome::Sent { woke_edge } => {
             if woke_edge {
-                // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
-                let peer = unsafe { IpcChannel::peer_of(endpoint) };
-                if !peer.is_null() {
-                    signal_ipc_endpoint(&mut g, peer);
-                }
+                wake_peer(&mut g, reg.endpoint());
             }
             ForwardOutcome::Pending
         }
         SendOutcome::Full | SendOutcome::PeerClosed | SendOutcome::Cycle => {
-            // SAFETY: the borrow pins `reg`; `SCHED` held. Roll back the reserved slot.
-            if let Some(pl) = unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) } {
+            // Roll back the reserved slot.
+            if let Some(pl) = reg.take_pending_matching(&mut g.tok, request_id) {
                 g.defer(pl.po.erase());
             }
             if outcome == SendOutcome::Full { ForwardOutcome::Full } else { ForwardOutcome::PeerClosed }
@@ -157,32 +138,23 @@ pub fn us_forward_originate_fill(
 ) -> ForwardOutcome {
     let mut bag = Deferred::<2>::new();
     let mut g = bag.lock();
-    let endpoint = addr(reg.endpoint());
-    let reg = addr(reg);
-    // SAFETY: the borrow pins `reg`; `SCHED` held. Reserve the pending-fill slot + assign a
-    // request id (None ⇒ busy).
-    let request_id = match unsafe { UserspaceServerReg::begin_fill(reg, po, file_obj, frame, index) } {
-        Some(id) => id,
-        None => return ForwardOutcome::Busy,
+    // Reserve the pending-fill slot and assign a request id (`None`: busy).
+    let Some(request_id) = reg.begin_fill(&mut g.tok, po, file_obj, frame, index) else {
+        return ForwardOutcome::Busy;
     };
     crate::rsproto::stamp_request_id(&mut msg.payload, request_id);
     let mut no_transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
-    // SAFETY: the borrowed registration holds its endpoint; `SCHED` held.
-    let outcome = unsafe { IpcChannel::send_push(endpoint, msg, &mut no_transfers) };
+    let outcome = reg.endpoint().send_push(&mut g.tok, msg, &mut no_transfers);
     match outcome {
         SendOutcome::Sent { woke_edge } => {
             if woke_edge {
-                // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
-                let peer = unsafe { IpcChannel::peer_of(endpoint) };
-                if !peer.is_null() {
-                    signal_ipc_endpoint(&mut g, peer);
-                }
+                wake_peer(&mut g, reg.endpoint());
             }
             ForwardOutcome::Pending
         }
         SendOutcome::Full | SendOutcome::PeerClosed | SendOutcome::Cycle => {
-            // SAFETY: the borrow pins `reg`; `SCHED` held. Roll back the reserved slot.
-            if let Some(pf) = unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) } {
+            // Roll back the reserved slot.
+            if let Some(pf) = reg.take_pending_fill_matching(&mut g.tok, request_id) {
                 g.defer(pf.po.erase());
                 g.defer(pf.file_obj.erase());
             }
@@ -196,9 +168,7 @@ pub fn us_forward_originate_fill(
 /// (duplicate / stale). The returned [`PendingFill`]'s references are dropped by the caller
 /// **outside** `SCHED`. The caller pins `reg` (from [`us_forward_reg_for_send`]).
 pub fn us_forward_take_pending_fill(reg: &UserspaceServerReg, request_id: u64) -> Option<PendingFill> {
-    let _g = SCHED.lock();
-    // SAFETY: the borrow pins `reg`; `SCHED` held.
-    unsafe { UserspaceServerReg::take_pending_fill_matching(addr(reg), request_id) }
+    reg.take_pending_fill_matching(&mut SCHED.lock().tok, request_id)
 }
 
 /// If a send on `send_endpoint` targets the kernel's end of a Userspace Server channel (its
@@ -208,78 +178,41 @@ pub fn us_forward_take_pending_fill(reg: &UserspaceServerReg, request_id: u64) -
 /// closed peer, or a registration being destroyed. Acquired under `SCHED`: the back-pointer
 /// is uncounted, and once `SCHED` is released another CPU may drop the last binding.
 pub fn us_forward_reg_for_send(send_endpoint: &IpcChannel) -> Option<Ref<UserspaceServerReg>> {
-    let _g = SCHED.lock();
-    // SAFETY: the borrow pins `send_endpoint`; `SCHED` held.
-    let peer = unsafe { IpcChannel::peer_of(addr(send_endpoint)) };
-    if peer.is_null() {
-        return None;
-    }
-    // SAFETY: `peer` is the surviving endpoint (the kernel end); `SCHED` held.
-    let reg = unsafe { IpcChannel::us_reg_of(peer) };
-    if reg.is_null() {
-        return None;
-    }
-    // SAFETY: the back-pointer names only the `UserspaceServerReg` attached to the endpoint,
-    // which clears it under `SCHED` before it is freed, so `reg` is a whole registration while
-    // `SCHED` is held; `try_acquire` refuses one already at zero.
-    unsafe { Ref::try_acquire(reg.cast::<UserspaceServerReg>()) }
+    let mut g = SCHED.lock();
+    let (peer, tok) = send_endpoint.peer(&mut g.tok)?;
+    peer.us_reg_upgrade(tok)
 }
 
-/// Detach a dying [`UserspaceServerReg`] from its endpoint, completing anything still
-/// outstanding on it. Called from that type's `Drop`, before its fields drop, because two
-/// jobs must happen while the registration is intact:
-///
-/// 1. **Complete outstanding forwarded requests** `PeerClosed`, so their waiters wake. The
-///    endpoint is still alive here, so the wake is well-formed.
-/// 2. **Clear the endpoint's back-pointer to us.** `IpcChannel.us_reg` is raw and uncounted
-///    (a counted edge would cycle with the registration's ownership of the endpoint), so an
-///    endpoint outliving its registration would leave readers following freed memory.
-///
-/// Takes `SCHED`, sound for the same reason `ipc_endpoint_closing` may: registration
-/// references are released only outside `SCHED`.
-///
-/// # Safety
-///
-/// `reg` is the `UserspaceServerReg` being dropped: its memory whole, its last reference gone.
-pub unsafe fn us_reg_detach(reg: *mut ()) {
+/// A [`UserspaceServerReg`]'s last reference has gone: complete what it has outstanding
+/// `PeerClosed`, so its waiters wake, and clear its endpoint's uncounted back-pointer to it, so
+/// nothing follows it once it is freed. Its closing, run before its box is rebuilt, with its
+/// endpoint still held. Takes `SCHED`, sound as references are released only outside it.
+pub(crate) fn us_reg_detach(reg: &UserspaceServerReg) {
     let mut bag = Deferred::<ORPHANS_PER_REG>::new();
     let mut g = bag.lock();
-    // SAFETY: called from `Drop` with the last reference gone but the object whole, so
-    // readable; its endpoint is a field, never changed once set.
-    let endpoint = addr(unsafe { &*reg.cast::<UserspaceServerReg>() }.endpoint());
-    // SAFETY: as above; `SCHED` held.
-    unsafe { fail_outstanding(&mut g, reg) };
+    let outstanding = reg.take_outstanding(&mut g.tok);
+    fail_outstanding(&mut g, outstanding);
     // Clear only a pointer that still names *this* registration: `us_server_attach` can
     // retarget an endpoint, and stomping a live successor's pointer breaks its routing.
-    // SAFETY: `endpoint` is pinned by the reference this registration still holds (released by
-    // the field drops that follow this call); `SCHED` held.
-    if unsafe { IpcChannel::us_reg_of(endpoint) } == reg {
-        // SAFETY: as above.
-        unsafe { IpcChannel::set_us_reg(endpoint, core::ptr::null_mut()) };
-    }
+    reg.endpoint().clear_us_reg_if(&mut g.tok, reg);
 }
 
 /// A registration's tables hold at most a lookup's PO, and a fill's PO and file, a slot.
 const ORPHANS_PER_REG: usize = 3 * US_PENDING_MAX;
 
-/// Fail everything `reg` has outstanding `PeerClosed`, its fills too: a faulter waits on one with
-/// no deadline, and its file may hold `reg`, a cycle its drop outside `SCHED` ends.
-///
-/// # Safety
-///
-/// `reg` is a whole `UserspaceServerReg`, live or mid-drop.
-unsafe fn fail_outstanding<const N: usize>(g: &mut Held<'_, N>, reg: *mut ()) {
+/// Fail everything a registration had outstanding `PeerClosed`, its fills too: a faulter waits on
+/// one with no deadline, and its file may hold the registration, a cycle its drop outside `SCHED`
+/// ends.
+fn fail_outstanding<const N: usize>(g: &mut Held<'_, N>, outstanding: Outstanding) {
     let closed = crate::syscall::error::KError::PeerClosed as i32;
-    // SAFETY: forwarded from this function's contract.
-    while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg) } {
-        signal_pending_op(g, addr(&*pl.po), closed);
-        g.defer(pl.po.erase());
+    for po in outstanding.lookups.into_iter().flatten() {
+        signal_pending_op(g, &po, closed);
+        g.defer(po.erase());
     }
-    // SAFETY: as above.
-    while let Some(pf) = unsafe { UserspaceServerReg::take_pending_fill_next(reg) } {
-        signal_pending_op(g, addr(&*pf.po), closed);
-        g.defer(pf.po.erase());
-        g.defer(pf.file_obj.erase());
+    for (po, file_obj) in outstanding.fills.into_iter().flatten() {
+        signal_pending_op(g, &po, closed);
+        g.defer(po.erase());
+        g.defer(file_obj.erase());
     }
 }
 
@@ -289,21 +222,15 @@ unsafe fn fail_outstanding<const N: usize>(g: &mut Held<'_, N>, reg: *mut ()) {
 /// comes back to share, from the same `SCHED` hold, so two binds cannot each make one. Only that
 /// endpoint is attached, the one `us_reg_detach` clears when `reg` drops.
 pub fn us_server_attach(reg: &Ref<UserspaceServerReg>) -> Option<Ref<UserspaceServerReg>> {
-    let _g = SCHED.lock();
-    let endpoint = addr(reg.endpoint());
-    // SAFETY: the borrow pins `endpoint`; `SCHED` held.
-    let existing = unsafe { IpcChannel::us_reg_of(endpoint) };
-    if !existing.is_null() {
-        // `try_acquire`, not `bump`: one mid-drop has a zero count, and is replaced.
-        // SAFETY: the back-pointer names only the `UserspaceServerReg` attached to the endpoint,
-        // which clears it under `SCHED` before it is freed, so `existing` is a whole registration
-        // while `SCHED` is held; `try_acquire` refuses one already at zero.
-        if let Some(shared) = unsafe { Ref::try_acquire(existing.cast::<UserspaceServerReg>()) } {
-            return Some(shared);
-        }
+    let mut g = SCHED.lock();
+    let endpoint = reg.endpoint();
+    // A registration mid-drop has a zero count, refuses the upgrade, and is replaced.
+    if let Some(shared) = endpoint.us_reg_upgrade(&g.tok) {
+        return Some(shared);
     }
-    // SAFETY: as above.
-    unsafe { IpcChannel::set_us_reg(endpoint, reg.as_object().as_ptr()) };
+    // SAFETY: kept in the endpoint's cell, behind `SCHED`, and `reg`'s closing (`us_reg_detach`)
+    // clears it there before the registration is freed.
+    endpoint.set_us_reg(&mut g.tok, unsafe { Weak::new(reg.as_ptr()) });
     None
 }
 
@@ -312,9 +239,7 @@ pub fn us_server_attach(reg: &Ref<UserspaceServerReg>) -> Option<Ref<UserspaceSe
 /// [`PendingLookup`]'s `po` is dropped by the caller **outside** `SCHED`. The caller pins
 /// `reg` (from [`us_forward_reg_for_send`]).
 pub fn us_forward_take_pending(reg: &UserspaceServerReg, request_id: u64) -> Option<PendingLookup> {
-    let _g = SCHED.lock();
-    // SAFETY: the borrow pins `reg`; `SCHED` held.
-    unsafe { UserspaceServerReg::take_pending_matching(addr(reg), request_id) }
+    reg.take_pending_matching(&mut SCHED.lock().tok, request_id)
 }
 
 /// Blocking send (`Block` / `BlockBounded`): deliver `msg` into the peer's receive ring, or
@@ -333,36 +258,28 @@ pub fn ipc_send_push_blocking(
     deadline_ns: u64,
 ) -> BlockSendOutcome {
     let mut g = SCHED.lock();
-    let endpoint = addr(endpoint);
-    // SAFETY: the borrows pin `endpoint` and `po`; `SCHED` held.
-    if unsafe { closes_a_cycle(endpoint, transfers) } {
+    if closes_a_cycle(&g.tok, endpoint, transfers) {
         return BlockSendOutcome::Cycle;
     }
-    // SAFETY: as above.
-    let outcome = unsafe { IpcChannel::send_or_queue(endpoint, msg, transfers, po) };
+    let outcome = endpoint.send_or_queue(&mut g.tok, msg, transfers, po);
     match outcome {
         BlockSendOutcome::Sent { woke_edge } => {
             if woke_edge {
-                // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
-                let peer = unsafe { IpcChannel::peer_of(endpoint) };
-                if !peer.is_null() {
-                    signal_ipc_endpoint(&mut g, peer);
-                }
+                wake_peer(&mut g, endpoint);
             }
             // Delivered synchronously — complete the PO now (no waiters yet).
-            signal_pending_op(&mut g, addr(&**po), 0);
+            signal_pending_op(&mut g, po, 0);
         }
         BlockSendOutcome::Queued if deadline_ns != u64::MAX => {
             // `BlockBounded`: register the delivery deadline against the PO; the held send
-            // lives on the peer (receiving) endpoint.
-            // SAFETY: the send queued, proving the peer is non-null; `SCHED` held.
-            let peer = unsafe { IpcChannel::peer_of(endpoint) };
+            // lives on the peer (receiving) endpoint, which a queued send proves is there.
+            let channel = endpoint.peer_addr(&g.tok) as usize;
             // Into a slot the receiving endpoint holds, one for each send it can hold.
             let _ = deadline::push_promised(
                 &mut g,
                 deadline::Entry {
                     deadline_ns,
-                    target: deadline::Target::PendingSend { po: addr(&**po) as usize, channel: peer as usize },
+                    target: deadline::Target::PendingSend { po: addr(&**po) as usize, channel },
                 },
             );
         }
@@ -374,9 +291,7 @@ pub fn ipc_send_push_blocking(
 /// Inspect `endpoint`'s receive side under `SCHED` without dequeuing, so the empty-poll
 /// `WouldBlock` path allocates no bounce buffer.
 pub fn ipc_recv_peek(endpoint: &IpcChannel) -> RecvState {
-    let _g = SCHED.lock();
-    // SAFETY: the borrow pins `endpoint`; `SCHED` held.
-    unsafe { IpcChannel::recv_peek(addr(endpoint)) }
+    endpoint.recv_peek(&SCHED.lock().tok)
 }
 
 /// Pop the oldest message from `endpoint`'s inbox into `dst` under `SCHED`, **moving** its
@@ -396,89 +311,62 @@ pub fn ipc_recv_pop_into(
     reclaimed: &mut [Option<ReclaimedSend>; IpcChannel::MAX_PENDING_SENDS],
 ) -> (bool, Option<Ref<PendingOperation>>) {
     let mut g = SCHED.lock();
-    let endpoint = addr(endpoint);
-    // SAFETY: the borrow pins `endpoint`; `SCHED` held.
-    let popped = unsafe { IpcChannel::recv_pop_into(endpoint, dst, out) };
-    if !popped {
+    if !endpoint.recv_pop_into(&mut g.tok, dst, out) {
         return (false, None);
     }
-    // SAFETY: `endpoint` is pinned; `SCHED` held. A slot just freed — sweep
-    // timed-out sends and promote the oldest live one.
-    let promoted = unsafe { IpcChannel::promote_pending_send(endpoint, reclaimed) };
+    // A slot just freed — sweep timed-out sends and promote the oldest live one.
+    let promoted = endpoint.promote_pending_send(&mut g.tok, reclaimed);
     if let Some(ref po) = promoted {
         // Delivered before its deadline: drop its pending-send deadline (idempotent), then
         // complete it.
-        let target = deadline::Target::PendingSend { po: addr(&**po) as usize, channel: endpoint as usize };
+        let target = deadline::Target::PendingSend { po: addr(&**po) as usize, channel: addr(endpoint) as usize };
         deadline::remove(&mut g.deadlines, target);
-        signal_pending_op(&mut g, addr(&**po), 0);
+        signal_pending_op(&mut g, po, 0);
     }
     (true, promoted)
 }
 
-/// An IPC endpoint is being destroyed (its last handle closed). Under `SCHED`, null the
-/// surviving peer's back-pointer to us and wake its blocked receivers (who observe
-/// `PeerClosed`). Called only from [`IpcChannel::drop`](crate::object::IpcChannel), whose
-/// docs give the no-use-after-free argument and the "refs released only outside `SCHED`"
-/// invariant that makes taking the lock here sound.
-///
-/// # Safety
-///
-/// `endpoint` is the `IpcChannel` being dropped: its memory whole, its last reference gone.
-pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
-    let mut bag = Deferred::<{ 2 * ORPHANS_PER_REG }>::new();
+/// An IPC endpoint's last reference has gone: under `SCHED`, clear the surviving peer's
+/// back-pointer to it and wake the peer's blocked receivers (they observe `PeerClosed`), fail
+/// forwarded requests a Userspace Server channel leaves, and fail the sends held on this
+/// endpoint. Its closing, run before its box is rebuilt; the endpoint's docs give the
+/// "references released only outside `SCHED`" invariant that makes taking the lock here sound.
+pub(crate) fn ipc_endpoint_closing(endpoint: &IpcChannel) {
+    let mut bag = Deferred::<{ 2 * ORPHANS_PER_REG + IpcChannel::MAX_PENDING_SENDS }>::new();
     let mut g = bag.lock();
-    // SAFETY: `endpoint` is the object being dropped (still valid memory);
-    // `SCHED` held.
-    let peer = unsafe { IpcChannel::peer_of(endpoint) };
     // A Userspace Server channel is losing its server: fail forwarded requests pending on
     // the kernel-forwarding endpoint with `PeerClosed`, whether **this** endpoint is the
-    // kernel end (registration being torn down) or its **peer** is (server process died).
-    // An endpoint is shared by many bindings, so up to `US_PENDING_MAX` lookups may be in
-    // flight: drain *all*. Each PO is signalled here and deferred to the bag.
-    // SAFETY: `endpoint` is valid memory; `SCHED` held.
-    let reg_self = unsafe { IpcChannel::us_reg_of(endpoint) };
-    // Non-null does not prove live: this is a raw read without a count. A registration's drop
-    // fails its requests and clears this pointer in `us_reg_detach` before its fields, this
-    // endpoint among them, drop, so the ordinary teardown reads null here. A stale registration
-    // would be a recycled allocation yielding a garbage `po` (`#GP`/`#PF`); the `magic` sentinel
-    // catches it, and skipping the drain is right since its lookups were released with it.
-    // SAFETY: non-null and, being a kernel-heap allocation, mapped and readable.
-    if !reg_self.is_null() && unsafe { UserspaceServerReg::is_live(reg_self) } {
-        // SAFETY: `reg_self` is this endpoint's owning registration (the endpoint
-        // is being dropped *because* the registration is — `reg_self` is still
-        // valid memory mid-drop); `SCHED` held.
-        unsafe { fail_outstanding(&mut g, reg_self) };
+    // kernel end or its **peer** is (server process died). An endpoint is shared by many
+    // bindings, so up to `US_PENDING_MAX` lookups may be in flight: drain *all*. A
+    // registration's closing clears this endpoint's pointer before the endpoint can close, so
+    // this one names a registration only if it outlived that.
+    let mine = endpoint.us_reg(&mut g.tok).map(|(reg, tok)| reg.take_outstanding(tok));
+    if let Some(mine) = mine {
+        fail_outstanding(&mut g, mine);
     }
-    if !peer.is_null() {
-        // SAFETY: `peer` is the surviving endpoint, kept alive by its own handle
-        // / a waiter's `ObjectRef`; `SCHED` held.
-        unsafe { IpcChannel::clear_peer(peer) };
-        signal_ipc_endpoint(&mut g, peer);
-        // SAFETY: `peer` is the live surviving endpoint; `SCHED` held.
-        let reg_peer = unsafe { IpcChannel::us_reg_of(peer) };
-        // Same unchecked back-pointer as `reg_self`: a live `peer` says nothing about its
-        // registration still existing.
-        // SAFETY: non-null and, being a kernel-heap allocation, mapped and readable.
-        if !reg_peer.is_null() && unsafe { UserspaceServerReg::is_live(reg_peer) } {
-            // SAFETY: `reg_peer` is pinned by the live `peer` (its owned endpoint);
-            // `SCHED` held.
-            unsafe { fail_outstanding(&mut g, reg_peer) };
+    let peer = endpoint.peer(&mut g.tok).map(|(peer, tok)| {
+        peer.clear_peer(tok);
+        let waiters = peer.take_waiters(tok);
+        let theirs = peer.us_reg(tok).map(|(reg, tok)| reg.take_outstanding(tok));
+        (waiters, addr(peer), theirs)
+    });
+    if let Some((waiters, key, theirs)) = peer {
+        wake_all(&mut g, waiters, key);
+        if let Some(theirs) = theirs {
+            fail_outstanding(&mut g, theirs);
         }
     }
     // Complete every blocking sender held on THIS endpoint with `PeerClosed`: our receive
-    // ring is gone, so their messages can never be delivered. We only *signal* them here;
-    // each held entry's message, transfers and PO reference are released when this
-    // endpoint's `Inner` drops just after this returns, outside `SCHED`.
-    let mut pos = [core::ptr::null_mut(); IpcChannel::MAX_PENDING_SENDS];
-    // SAFETY: `endpoint` is valid; `SCHED` held.
-    let n = unsafe { IpcChannel::pending_send_pos(endpoint, &mut pos) };
-    for &po in &pos[..n] {
+    // ring is gone, so their messages can never be delivered. The sends stay queued, released
+    // with the endpoint outside `SCHED`; the references here go with the bag.
+    for po in endpoint.held_sends(&g.tok).into_iter().flatten() {
         // Drop each held send's pending-send deadline **before** the endpoint is freed, or a
-        // live `BlockBounded` deadline could fire later and dereference this dead `channel`.
+        // live `BlockBounded` deadline could fire later and follow this dead `channel`.
         // Idempotent (a plain `Block` send, or a timed-out one, has no entry).
-        let target = deadline::Target::PendingSend { po: po as usize, channel: endpoint as usize };
+        let target = deadline::Target::PendingSend { po: addr(&*po) as usize, channel: addr(endpoint) as usize };
         deadline::remove(&mut g.deadlines, target);
-        signal_pending_op(&mut g, po, crate::syscall::error::KError::PeerClosed as i32);
+        signal_pending_op(&mut g, &po, crate::syscall::error::KError::PeerClosed as i32);
+        g.defer(po.erase());
     }
 }
 
@@ -539,12 +427,9 @@ mod tests {
     ) -> (Ref<PendingOperation>, Ref<PendingOperation>, Ref<FileObject>) {
         let (lookup, fill) = (po(), po());
         let file = Ref::new(FileObject::try_new(4096, producer).unwrap());
-        let reg = reg.as_object().as_ptr();
-        // SAFETY: `reg` pins the registration, and the test is single-threaded.
-        unsafe {
-            UserspaceServerReg::begin(reg, &lookup, Rights::MAP_READ, b"f").unwrap();
-            UserspaceServerReg::begin_fill(reg, &fill, &file, crate::mm::PhysAddr::new(0x5000), 0).unwrap();
-        }
+        let tok = &mut SchedToken::for_test();
+        reg.begin(tok, &lookup, Rights::MAP_READ, b"f").unwrap();
+        reg.begin_fill(tok, &fill, &file, crate::mm::PhysAddr::new(0x5000), 0).unwrap();
         (lookup, fill, file)
     }
 
@@ -580,9 +465,8 @@ mod tests {
         assert!(us_server_attach(&first).is_none());
         let shared = us_server_attach(&second).expect("the first registration");
         assert_eq!(shared.as_ptr(), first.as_ptr());
-        // SAFETY: `k` is pinned by the test's reference, and the test is single-threaded.
-        let routed = unsafe { IpcChannel::us_reg_of(k.as_object().as_ptr()) };
-        assert_eq!(routed, first.as_object().as_ptr(), "replies route to it");
+        let routed = k.us_reg_addr(&SchedToken::for_test());
+        assert_eq!(routed, first.as_ptr().cast_const(), "replies route to it");
     }
 
     #[test]

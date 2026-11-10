@@ -50,6 +50,15 @@ const MAX_REFCOUNT: usize = usize::MAX / 2;
 pub unsafe trait KObject: Send + Sync + Sized {
     /// The tag of every object of this type.
     const TYPE: KObjectType;
+
+    /// Run once the last reference has gone, before the box is rebuilt, so with no `&mut` to the
+    /// object live: unlink it from wherever other CPUs still reach it, uncounted, under a lock.
+    ///
+    /// # Safety
+    /// `object` is whole and its last reference gone, and its box is not yet rebuilt.
+    unsafe fn closing(object: NonNull<Self>) {
+        let _ = object;
+    }
 }
 
 /// A kernel object that a shared `&Self` may be formed to while a reference pins it.
@@ -70,6 +79,22 @@ macro_rules! kobject {
         unsafe impl $crate::object::header::KObject for $t {
             const TYPE: $crate::libkern::handle::KObjectType = $crate::libkern::handle::KObjectType::$t;
         }
+        $crate::object::header::kobject!(@checks $t);
+    };
+    ($t:ident, closing = $hook:path) => {
+        // SAFETY: as above.
+        unsafe impl $crate::object::header::KObject for $t {
+            const TYPE: $crate::libkern::handle::KObjectType = $crate::libkern::handle::KObjectType::$t;
+
+            unsafe fn closing(object: ::core::ptr::NonNull<Self>) {
+                // SAFETY: `closing`'s contract: the object is whole and no `&mut` to it is live, and
+                // `$t: Shared`, so a `&$t` may stand beside what other CPUs write in its cells.
+                $hook(unsafe { object.as_ref() })
+            }
+        }
+        $crate::object::header::kobject!(@checks $t);
+    };
+    (@checks $t:ident) => {
         const _: fn(&$t) -> &$crate::object::$t = |object| object;
         const _: () = assert!(::core::mem::offset_of!($t, header) == 0);
         const _: fn(&$t) -> &$crate::object::header::Header<$t> = |object| &object.header;
@@ -341,6 +366,54 @@ impl<T: KObject> core::fmt::Debug for Ref<T> {
     }
 }
 
+/// An uncounted pointer to a `T`, kept behind the lock its target's closing takes to clear or
+/// remove it before the target is freed: whoever reaches it holds that lock, so the target is whole.
+pub struct Weak<T: KObject> {
+    target: NonNull<T>,
+}
+
+// SAFETY: it moves between CPUs only with what keeps it, behind its lock, and its target is `Sync`.
+unsafe impl<T: KObject> Send for Weak<T> {}
+
+impl<T: KObject> Weak<T> {
+    /// A pointer to `target`, with the provenance its owner's reference has.
+    ///
+    /// # Safety
+    /// `target` is a live `T`. This is kept only behind a lock that `target`'s closing takes, and
+    /// that closing clears or removes it, under the lock, before `target` is freed.
+    pub unsafe fn new(target: *mut T) -> Self {
+        // SAFETY: a live `T`'s address is not null, by the contract.
+        Self { target: unsafe { NonNull::new_unchecked(target) } }
+    }
+
+    /// The target's address.
+    pub fn as_ptr(&self) -> *mut T {
+        self.target.as_ptr()
+    }
+
+    /// Whether this names `target`.
+    pub fn names(&self, target: *const T) -> bool {
+        core::ptr::eq(self.target.as_ptr(), target)
+    }
+
+    /// The target, whole while what keeps this is borrowed, under its lock.
+    pub fn get(&self) -> &T
+    where
+        T: Shared,
+    {
+        // SAFETY: `new`'s contract: the target is freed only after its closing has taken the lock
+        // this is kept behind, which whoever borrows this holds.
+        unsafe { self.target.as_ref() }
+    }
+
+    /// A new reference to the target, or `None` once its count is zero, its closing yet to clear
+    /// this.
+    pub fn upgrade(&self) -> Option<Ref<T>> {
+        // SAFETY: as `get`: the target is whole while this is borrowed.
+        unsafe { Ref::try_acquire(self.target.as_ptr()) }
+    }
+}
+
 /// Run the destructor for the kernel object at `header`: rebuild the owning `KBox` for the type
 /// its tag names and drop it, returning the storage to the slab. Dispatch is a `match` on the
 /// tag (`kernel/CLAUDE.md` § "Kernel object dispatch") over every variant, each kind's arm
@@ -384,11 +457,13 @@ unsafe fn dispatch_destroy(header: NonNull<KObjectHeader>) {
     }
 }
 
-/// Free a `T` by dropping its rebuilt box, which runs its `Drop`.
+/// Close a `T`, then free it by dropping its rebuilt box, which runs its `Drop`.
 ///
 /// # Safety
 /// `header` is the last live reference to a `T` whose box `KBox::into_raw` gave up.
 unsafe fn destroy<T: KObject>(header: NonNull<KObjectHeader>) {
+    // SAFETY: the last reference is gone, by the contract, and the box not yet rebuilt.
+    unsafe { T::closing(header.cast()) };
     // SAFETY: the last reference to a `T` from `KBox::<T>::into_raw`, by the contract.
     drop(unsafe { KBox::<T>::from_raw(header.cast()) });
     #[cfg(test)]

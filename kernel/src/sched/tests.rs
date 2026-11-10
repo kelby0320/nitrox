@@ -137,6 +137,7 @@ fn test_state() -> SchedState {
         ended_pids: Reserved::unreserved(),
         reaper: None,
         threads: 0,
+        tok: SchedToken::for_test(),
     }
 }
 
@@ -560,8 +561,8 @@ fn entry(deadline_ns: u64, target: usize) -> deadline::Entry {
 mod plumbing;
 mod timers;
 
-fn new_timer() -> ObjectRef {
-    ObjectRef::new(Timer::try_new().unwrap())
+fn new_timer() -> Ref<Timer> {
+    Ref::new(Timer::try_new().unwrap())
 }
 
 #[test]
@@ -799,9 +800,9 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
         // SAFETY: every object here is pinned by the test; single-threaded.
         unsafe {
             Thread::wait_register(r.as_ptr(), &[t1.as_ptr() as usize], true);
-            Timer::add_waiter(t1.as_ptr(), r.as_ptr()).unwrap();
             Thread::set_state(r.as_ptr(), ThreadState::Blocked);
         }
+        t1.add_waiter(&mut st.tok, r.as_ptr()).unwrap();
     }
     let (b, o) = (blocked.as_ptr(), other.as_ptr());
     let thread_deadline = deadline::Entry { deadline_ns: 5_000, target: deadline::Target::Thread(b as usize) };
@@ -834,8 +835,8 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
     let left = st.deadlines.iter().any(|e| e.target == deadline::Target::Thread(b as usize));
     assert!(left, "left for its own wait_on to remove");
     assert!(st.reap.iter().all(|q| q.is_empty()));
-    // SAFETY: pinned by `t1`; single-threaded. What each thread's own `wait_on` would undo.
-    assert_eq!(unsafe { Timer::take_waiters(t1.as_ptr()) }.len(), 2, "both still registered");
+    // What each thread's own `wait_on` would undo.
+    assert_eq!(t1.take_waiters(&mut st.tok).len(), 2, "both still registered");
 }
 
 /// The last thread out of a process, however it left, hands the process's handles to the reaper
@@ -932,29 +933,23 @@ fn a_fault_wakes_the_thread_waiting_on_its_channel_or_none() {
     init_global_heap();
     super::online_set::force(0b1);
     let mut st = reserved_state();
-    let _pinned = ObjectRef::new(NotificationChannel::try_new().unwrap());
-    let chan = _pinned.as_ptr();
+    let chan = Ref::new(NotificationChannel::try_new().unwrap());
     let notif = Notification::seg_fault(7, 0xdead_0000, FaultKind::NotWritable);
-    // SAFETY: the test's own live channel, its queue room reserved by `try_new`; single-threaded.
-    unsafe {
-        assert!(!deliver_fault(&mut st, None, notif), "no channel");
-        assert!(!deliver_fault(&mut st, Some(chan), notif), "no thread waiting");
-    }
+    assert!(!deliver_fault(&mut st, None, notif), "no channel");
+    assert!(!deliver_fault(&mut st, Some(&chan), notif), "no thread waiting");
     let supervisor = inert_user_ref(1, 7);
     let s = supervisor.as_ptr();
     // SAFETY: pinned by the test; single-threaded.
     unsafe {
-        Thread::wait_register(s, &[chan as usize], true);
-        NotificationChannel::add_waiter(chan, s).unwrap();
+        Thread::wait_register(s, &[chan.as_ptr() as usize], true);
         Thread::set_state(s, ThreadState::Blocked);
     }
+    chan.add_waiter(&mut st.tok, s).unwrap();
     assert!(st.blocked.push(supervisor).is_ok());
-    // SAFETY: as above.
-    assert!(unsafe { deliver_fault(&mut st, Some(chan), notif) }, "the supervisor was waiting");
+    assert!(deliver_fault(&mut st, Some(&chan), notif), "the supervisor was waiting");
     assert!(st.ready.iter().any(|q| q.iter().any(|r| r.as_ptr() == s)), "and is woken to run");
     for _ in 0..2 {
-        // SAFETY: as above.
-        assert!(unsafe { NotificationChannel::try_recv(chan) }.is_some(), "each fault was queued");
+        assert!(chan.try_recv(&mut st.tok).is_some(), "each fault was queued");
     }
 }
 

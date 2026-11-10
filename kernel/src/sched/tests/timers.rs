@@ -82,16 +82,13 @@ fn removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap
 
 // --- timers on the deadline heap ----------------------------------------------
 
-fn heap_with(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> SchedState {
+fn heap_with(timer: &Timer, deadline_ns: u64, interval_ns: u64) -> SchedState {
     let mut st = test_state();
     st.deadlines = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 1;
-    deadline::push(&mut st.deadlines, entry(deadline_ns, timer as usize)).unwrap();
-    // SAFETY: the caller pins `timer`; single-threaded test.
-    unsafe {
-        Timer::set_armed(timer, deadline_ns, interval_ns);
-        Timer::set_in_heap(timer, true);
-    }
+    deadline::push(&mut st.deadlines, entry(deadline_ns, addr(timer) as usize)).unwrap();
+    timer.set_armed(&mut st.tok, deadline_ns, interval_ns);
+    timer.set_in_heap(&mut st.tok, true);
     st
 }
 
@@ -99,47 +96,41 @@ fn heap_with(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> SchedState {
 fn a_timer_fires_at_its_deadline_and_not_before() {
     init_global_heap();
     let t = new_timer();
-    let mut st = heap_with(t.as_ptr(), 1_000, 0);
+    let mut st = heap_with(&t, 1_000, 0);
     fire_expired_deadlines(&mut st, 999);
     assert_eq!(st.deadlines.len(), 1);
     fire_expired_deadlines(&mut st, 1_000);
     assert!(st.deadlines.is_empty());
-    // SAFETY: pinned by `t`; single-threaded.
-    assert!(!unsafe { Timer::in_heap(t.as_ptr()) });
+    assert!(!t.in_heap(&st.tok));
 }
 
 #[test]
 fn a_one_shot_timer_fired_with_no_waiter_still_reads_signaled() {
     init_global_heap();
     let t = new_timer();
-    let mut st = heap_with(t.as_ptr(), 1_000, 0);
+    let mut st = heap_with(&t, 1_000, 0);
     fire_expired_deadlines(&mut st, 1_000);
-    // SAFETY: pinned by `t`; single-threaded.
-    assert!(unsafe { Timer::already_signaled(t.as_ptr(), 1_500) });
+    assert!(t.already_signaled(&st.tok, 1_500));
     // A waiter on another CPU read the clock before this tick, and took `SCHED` after it.
-    // SAFETY: as above.
-    assert!(unsafe { Timer::already_signaled(t.as_ptr(), 999) }, "a clock read before the fire");
+    assert!(t.already_signaled(&st.tok, 999), "a clock read before the fire");
 }
 
 #[test]
 fn a_periodic_timer_rearms_an_interval_after_the_tick_that_fired_it() {
     init_global_heap();
     let t = new_timer();
-    let mut st = heap_with(t.as_ptr(), 1_000, 250);
+    let mut st = heap_with(&t, 1_000, 250);
     fire_expired_deadlines(&mut st, 1_100);
     assert_eq!(deadline::peek(&st.deadlines).map(|e| e.deadline_ns), Some(1_350));
-    // SAFETY: pinned by `t`; single-threaded.
-    unsafe {
-        assert_eq!(Timer::deadline(t.as_ptr()), 1_350);
-        assert!(Timer::in_heap(t.as_ptr()));
-    }
+    assert_eq!(t.deadline(&st.tok), 1_350);
+    assert!(t.in_heap(&st.tok));
 }
 
 #[test]
 fn a_periodic_timer_whose_next_fire_would_wrap_waits_for_ever_instead() {
     init_global_heap();
     let t = new_timer();
-    let mut st = heap_with(t.as_ptr(), 1_000, u64::MAX - 10);
+    let mut st = heap_with(&t, 1_000, u64::MAX - 10);
     fire_expired_deadlines(&mut st, 1_000);
     assert_eq!(deadline::peek(&st.deadlines).map(|e| e.deadline_ns), Some(u64::MAX));
 }
@@ -263,7 +254,7 @@ fn a_timer_and_a_channel_give_back_their_slots_when_dropped() {
 fn a_periodic_timers_re_push_is_held_to_its_slot() {
     init_global_heap();
     let t = new_timer();
-    let mut st = heap_with(t.as_ptr(), 1_000, 250);
+    let mut st = heap_with(&t, 1_000, 250);
     st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 0;
     fire_expired_deadlines(&mut st, 1_100);
 }
