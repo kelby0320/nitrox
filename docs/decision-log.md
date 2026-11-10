@@ -37999,10 +37999,12 @@ Part J's sixth sub-part, `typed-layers.md` § J.6, built on `pre-phase-7/part-j6
 - **A closing runs before the box is rebuilt** (sched-d11): `KObject::closing`, which
   `dispatch_destroy` calls on the raw pointer, so no `&mut` to an object is live while another CPU
   still reaches it under SCHED or the file cache's lock. Its two-thread test failed under both Miri
-  models.
+  models. A type a box of which could be linked is made as a `Ref`, as a box's drop would skip
+  the closing, and a hook takes a `Closing` only `dispatch_destroy` makes, so none runs on a live
+  object.
 - **What stays raw**: the deadline heap's targets, formed in the tick under the closing's
   argument, `complete_pending_op_at`, and `Thread`, whose split is J.7's.
 - **What a closing collects is references**: a registration's outstanding requests, taken whole
   (two 256-byte buffers an entry), overflowed the debug kernel's 16 KiB stack at every boot.
-- `unsafe` blocks fall from 829 to 686, `unsafe fn`s from 299 to 233, `unsafe impl`s from 65 to 57.
+- `unsafe` blocks fall from 829 to 685, `unsafe fn`s from 299 to 233, `unsafe impl`s from 65 to 57.
 

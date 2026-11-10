@@ -357,11 +357,13 @@ once instead. `wait_on`'s dispatchers borrow each object by kind.
 - **sched-d11**: `dispatch_destroy` runs a type's `KObject::closing`, which `kobject!` sets, on the
   raw pointer before it rebuilds the box: an endpoint's, a timer's and a registration's, and a
   `FileObject`'s cache removal, which had the same shape. Its two-thread test fails under both Miri
-  models on `main` and passes here.
+  models on `main` and passes here. A type a box of which could be linked is made as a `Ref`, as a
+  box's drop would skip its closing; a hook takes a `Closing` only `dispatch_destroy` makes; and
+  each type's `Drop` asserts its closing ran.
 
 What stays raw: the deadline heap's targets, which the tick forms into a `&Timer`, a `&IpcChannel`
 and a `&PendingOperation` under the closing's argument, and `complete_pending_op_at`. `unsafe`
-blocks fall from 829 to 686, `unsafe fn`s from 299 to 233 (`object`'s 106 to 50, `sched`'s 17 to 7)
+blocks fall from 829 to 685, `unsafe fn`s from 299 to 233 (`object`'s 106 to 50, `sched`'s 17 to 7)
 and `unsafe impl`s from 65 to 57, `SchedCell`'s `Sync` the one new. Under Miri, `sched::` and the
 six objects', `process`'s and `header`'s tests pass on `main` (148) and here (149), measured
 before a registration's outstanding requests came out as their references alone, a change in safe
