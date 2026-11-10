@@ -19,20 +19,19 @@ pub enum ResumeDisposition {
 /// one, and wake its waiters. Caller holds `SCHED`. Borrows the channel (no owned reference,
 /// so no destructor under `SCHED`); enqueue is allocation-free.
 fn deliver_child_exited(g: &mut SchedState, me_obj: *mut (), status: ExitStatus) {
-    let info: Option<(*mut (), u32)> = {
+    // The parent's channel, kept alive by this process's `parent_notif` reference (still held:
+    // `me` is not yet reaped).
+    let info: Option<(&NotificationChannel, u32)> = {
         // SAFETY: `me_obj` is the running thread, pinned, lock held.
         unsafe { Thread::process_of(me_obj) }.and_then(|p| {
             // SAFETY: the thread pins its live Process; read its parent channel + pid.
             let proc = unsafe { &*(p as *const crate::object::Process) };
-            proc.parent_notif().map(|chan| (addr(chan), proc.pid_u32()))
+            proc.parent_notif().map(|chan| (chan, proc.pid_u32()))
         })
     };
     if let Some((chan, child_pid)) = info {
-        let notif = Notification::child_exited(child_pid, status);
-        // SAFETY: `chan` is the parent's channel, kept alive by this process's
-        // `parent_notif` reference (still held — `me` is not yet reaped); SCHED
-        // held; no allocation (queue pre-reserved).
-        let _edge = unsafe { NotificationChannel::enqueue(chan, notif) };
+        // No allocation: the queue is pre-reserved.
+        let _edge = chan.enqueue(&mut g.tok, Notification::child_exited(child_pid, status));
         signal_channel(g, chan);
     }
 }
@@ -199,13 +198,9 @@ pub fn exit_process(status: ExitStatus) -> ! {
 
 /// Queue a fault's notification on its process's channel, if it has one: whether that woke a
 /// thread waiting to hear it, wherever the thread then runs. Caller holds `SCHED`.
-///
-/// # Safety
-/// `chan`, if any, is a live `NotificationChannel` whose queue has room reserved.
-pub(super) unsafe fn deliver_fault(g: &mut SchedState, chan: Option<*mut ()>, notif: Notification) -> bool {
+pub(super) fn deliver_fault(g: &mut SchedState, chan: Option<&NotificationChannel>, notif: Notification) -> bool {
     let Some(c) = chan else { return false };
-    // SAFETY: a live channel with room reserved, by the contract; `SCHED` held.
-    let _edge = unsafe { NotificationChannel::enqueue(c, notif) };
+    let _edge = c.enqueue(&mut g.tok, notif);
     signal_channel(g, c)
 }
 
@@ -255,16 +250,16 @@ pub fn suspend_with_fault(regs: crate::arch::RegisterValues, notif: Notification
         me_obj = me.as_ptr();
 
         // Deliver the fault notification (borrowed pointer — no destructor under `SCHED`).
-        let chan: Option<*mut ()> = {
+        // The channel the current Process owns a ref on, alive at least until this thread is
+        // reaped.
+        let chan: Option<&NotificationChannel> = {
             // SAFETY: `me` is the running thread, pinned, lock held.
             unsafe { Thread::process_of(me_obj) }.and_then(|p| {
                 // SAFETY: the thread pins its live Process; borrow its channel.
-                unsafe { &*(p as *const crate::object::Process) }.notification_channel().map(addr)
+                unsafe { &*(p as *const crate::object::Process) }.notification_channel()
             })
         };
-        // SAFETY: `chan` is the channel the current Process owns a ref on (alive at least until
-        // this thread is reaped), its queue pre-reserved; SCHED held.
-        if !unsafe { deliver_fault(&mut g, chan, notif) } {
+        if !deliver_fault(&mut g, chan, notif) {
             report_unwaited_fault(me_obj, &notif);
         }
 

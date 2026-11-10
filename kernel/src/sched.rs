@@ -48,7 +48,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, Reserved};
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::mm::PhysAddr;
-use crate::object::header::{Ref, Shared};
+use crate::object::header::{Closing, Ref, Shared, Weak};
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 use crate::object::{
     BlockSendOutcome, FileObject, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,
@@ -56,6 +56,7 @@ use crate::object::{
     ThreadState, Timer, TransferRef, UserspaceServerReg, Waiters,
 };
 
+mod cell;
 mod current;
 mod deferred;
 mod exit;
@@ -69,6 +70,7 @@ mod spawn;
 mod timers;
 mod wait;
 
+pub use cell::{SchedCell, SchedToken, follow};
 pub use current::*;
 use deferred::{Deferred, Held};
 pub use exit::*;
@@ -289,6 +291,8 @@ struct SchedState {
     /// Threads held, the idle threads aside: counted from a thread's first placement (or
     /// adoption at boot) until its reap is drained. Bounded by [`MAX_THREADS`].
     threads: usize,
+    /// What borrows the objects' [`SchedCell`]s.
+    tok: SchedToken,
 }
 
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(
@@ -313,6 +317,8 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(
         ended_pids: Reserved::unreserved(),
         reaper: None,
         threads: 0,
+        // SAFETY: this is the one `SchedState`, which every object's cells are borrowed through.
+        tok: unsafe { SchedToken::new() },
     },
 );
 

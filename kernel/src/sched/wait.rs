@@ -88,10 +88,8 @@ fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> Wai
         // Fast path: any object already signaled?
         let mut signaled = [false; MAX_WAIT_HANDLES];
         let mut any = false;
-        for (i, &o) in objs.iter().enumerate() {
-            // SAFETY: `o` is pinned by the caller's borrow; `SCHED` held. Dispatches by the
-            // object's header type, which also answers for a kind that cannot be waited on.
-            if unsafe { obj_already_signaled(o as *mut (), now) } {
+        for (i, o) in refs.iter().enumerate() {
+            if obj_already_signaled(&g.tok, o, now) {
                 signaled[i] = true;
                 any = true;
             }
@@ -111,9 +109,8 @@ fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> Wai
         unsafe { Thread::wait_register(me_ptr, objs, has_deadline) };
         let mut registered = 0usize;
         let mut failed = false;
-        for &o in objs {
-            // SAFETY: pinned by the caller's borrow, `SCHED` held.
-            if unsafe { obj_add_waiter(o as *mut (), me_ptr) }.is_err() {
+        for o in refs {
+            if obj_add_waiter(&mut g.tok, o, me_ptr).is_err() {
                 failed = true;
                 break;
             }
@@ -128,9 +125,8 @@ fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> Wai
         }
         if failed {
             // Unwind the partial registration and bail without blocking.
-            for &o in &objs[..registered] {
-                // SAFETY: pinned by the caller's borrow, `SCHED` held.
-                unsafe { obj_remove_waiter(o as *mut (), me_ptr) };
+            for o in &refs[..registered] {
+                obj_remove_waiter(&mut g.tok, o, me_ptr);
             }
             // SAFETY: live Thread, `SCHED` held.
             unsafe { Thread::wait_clear(me_ptr) };
@@ -150,9 +146,8 @@ fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> Wai
         let mut g = SCHED.lock();
         // SAFETY: live Thread (we run on it), `SCHED` held.
         let bits = unsafe { Thread::wait_signaled(me_ptr) };
-        for &o in objs {
-            // SAFETY: pinned by the caller's borrow, still held; `SCHED` held.
-            unsafe { obj_remove_waiter(o as *mut (), me_ptr) };
+        for o in refs {
+            obj_remove_waiter(&mut g.tok, o, me_ptr);
         }
         // SAFETY: live Thread, `SCHED` held.
         if unsafe { Thread::wait_has_deadline(me_ptr) } {

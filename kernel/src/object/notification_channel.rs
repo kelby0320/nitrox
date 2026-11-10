@@ -8,28 +8,25 @@
 //!
 //! ## Mutation discipline
 //!
-//! As for [`Timer`], all interior state lives in an [`UnsafeCell`] touched **only under the
-//! rank-1 `SCHED` lock** (`kernel/docs/lock-ordering.md`), reached through a type-erased
-//! `*mut ()` so no aliasing `&mut NotificationChannel` is formed.
-
-use core::cell::UnsafeCell;
+//! As for [`Timer`], all interior state lives in a [`SchedCell`], borrowed only with the token the
+//! rank-1 `SCHED` lock keeps (`kernel/docs/lock-ordering.md`).
 
 use crate::libkern::{AllocError, KBox, Notification, Reserved};
 use crate::object::header::{Header, Shared, kobject};
 use crate::object::{WaitQueue, Waiters};
+use crate::sched::{SchedCell, SchedToken};
 
 /// A per-process notification queue (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct NotificationChannel {
     header: Header<Self>,
     magic: u64,
-    /// All mutable state, reached only under `SCHED`.
-    inner: UnsafeCell<Inner>,
+    /// All mutable state.
+    inner: SchedCell<Inner>,
 }
 
 kobject!(NotificationChannel);
-// SAFETY: a channel changes once shared only in `inner`, an `UnsafeCell` touched only under
-// `SCHED`.
+// SAFETY: a channel changes once shared only in `inner`, a `SchedCell`.
 unsafe impl Shared for NotificationChannel {}
 
 struct Inner {
@@ -42,13 +39,6 @@ struct Inner {
     /// [`NotificationChannel::MAX_WAITERS`].
     waiters: WaitQueue<{ NotificationChannel::MAX_WAITERS }>,
 }
-
-// SAFETY: identical reasoning to `Timer`/`ObjectRef` — the header refcount is
-// atomic and every access to `inner` is serialised under the single-CPU `SCHED`
-// lock, so sharing/moving a channel across contexts cannot race.
-unsafe impl Send for NotificationChannel {}
-// SAFETY: as `Send`.
-unsafe impl Sync for NotificationChannel {}
 
 impl NotificationChannel {
     /// Sentinel written into [`NotificationChannel::magic`] at construction.
@@ -66,7 +56,7 @@ impl NotificationChannel {
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(Inner { queue, dropped: 0, waiters: WaitQueue::new() }),
+            inner: SchedCell::new(Inner { queue, dropped: 0, waiters: WaitQueue::new() }),
         })
     }
 
@@ -75,33 +65,12 @@ impl NotificationChannel {
         self.magic == Self::MAGIC
     }
 
-    // SAFETY (shared by all): `obj` is a live `NotificationChannel` pinned by the caller's
-    // `ObjectRef`, and the caller holds `SCHED`, which serialises all access to `inner`.
-
-    /// Borrow the interior mutably (no aliasing; `SCHED` held).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
-    unsafe fn inner<'a>(obj: *mut ()) -> &'a mut Inner {
-        // SAFETY: forming a shared `&NotificationChannel` to reach the
-        // `UnsafeCell`, then a `&mut Inner` through it, is the interior-
-        // mutability contract — sound while `SCHED` serialises access.
-        let c = unsafe { &*(obj as *const NotificationChannel) };
-        // SAFETY: as above.
-        unsafe { &mut *c.inner.get() }
-    }
-
     /// Enqueue `n`; `true` iff the channel went empty→signaled (the caller then wakes its
     /// waiters). Overflow (`docs/spec/notification-format.md`): on a full queue an exception
     /// notification evicts the oldest non-exception entry; otherwise (or if the queue is all
     /// exceptions) the drop counter is incremented.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn enqueue(obj: *mut (), n: Notification) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn enqueue(&self, tok: &mut SchedToken, n: Notification) -> bool {
+        let inner = self.inner.get(tok);
         // "Signaled" is queue non-empty or a drop pending; report the edge to avoid a double wake.
         let was_signaled = !inner.queue.is_empty() || inner.dropped > 0;
         if inner.queue.len() < Self::QUEUE_CAP {
@@ -124,12 +93,8 @@ impl NotificationChannel {
 
     /// Pop the oldest notification, or first a synthetic `NotificationsDropped { count }` if drops
     /// are pending (resetting the counter).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn try_recv(obj: *mut ()) -> Option<Notification> {
-        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn try_recv(&self, tok: &mut SchedToken) -> Option<Notification> {
+        let inner = self.inner.get(tok);
         if inner.dropped > 0 {
             let count = inner.dropped;
             inner.dropped = 0;
@@ -139,42 +104,26 @@ impl NotificationChannel {
     }
 
     /// `true` iff a recv would return something — the waitable "signaled" predicate.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn already_signaled(obj: *mut ()) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn already_signaled(&self, tok: &SchedToken) -> bool {
+        let inner = self.inner.read(tok);
         !inner.queue.is_empty() || inner.dropped > 0
     }
 
     /// Register `thread` as a waiter; `Err(())` at [`MAX_WAITERS`](Self::MAX_WAITERS).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
-        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn add_waiter(&self, tok: &mut SchedToken, thread: *mut ()) -> Result<(), ()> {
+        let inner = self.inner.get(tok);
         inner.waiters.add(thread)
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
-        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn remove_waiter(&self, tok: &mut SchedToken, thread: *mut ()) {
+        let inner = self.inner.get(tok);
         inner.waiters.remove(thread);
     }
 
     /// Take every waiter, leaving none.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ NotificationChannel::MAX_WAITERS }> {
-        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn take_waiters(&self, tok: &mut SchedToken) -> Waiters<{ NotificationChannel::MAX_WAITERS }> {
+        let inner = self.inner.get(tok);
         inner.waiters.take()
     }
 }
@@ -195,132 +144,102 @@ mod tests {
     use crate::object::ObjectRef;
     use crate::object::header::test_probe;
 
-    fn new_chan() -> *mut () {
-        KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ()
-    }
-
-    fn drop_chan(obj: *mut ()) {
-        // SAFETY: single creation reference; reclaim it.
-        drop(unsafe {
-            KBox::<NotificationChannel>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut NotificationChannel))
-        });
+    fn new_chan() -> (KBox<NotificationChannel>, SchedToken) {
+        (NotificationChannel::try_new().unwrap(), SchedToken::for_test())
     }
 
     #[test]
     fn enqueue_recv_fifo_and_empty_edge() {
         init_global_heap();
-        let obj = new_chan();
-        // SAFETY: live channel, single-threaded test (stands in for SCHED).
-        unsafe {
-            assert!(!NotificationChannel::already_signaled(obj));
-            assert!(NotificationChannel::try_recv(obj).is_none());
-            assert!(NotificationChannel::enqueue(obj, Notification::divide_by_zero(1, 0x10)));
-            assert!(!NotificationChannel::enqueue(obj, Notification::illegal_insn(2, 0x20)));
-            assert!(NotificationChannel::already_signaled(obj));
-            assert_eq!(
-                NotificationChannel::try_recv(obj).unwrap().kind(),
-                crate::libkern::notification::KIND_DIVIDE_BY_ZERO
-            );
-            assert_eq!(
-                NotificationChannel::try_recv(obj).unwrap().kind(),
-                crate::libkern::notification::KIND_ILLEGAL_INSN
-            );
-            assert!(NotificationChannel::try_recv(obj).is_none());
-        }
-        drop_chan(obj);
+        let (obj, mut tok) = new_chan();
+        let tok = &mut tok;
+        assert!(!obj.already_signaled(tok));
+        assert!(obj.try_recv(tok).is_none());
+        assert!(obj.enqueue(tok, Notification::divide_by_zero(1, 0x10)));
+        assert!(!obj.enqueue(tok, Notification::illegal_insn(2, 0x20)));
+        assert!(obj.already_signaled(tok));
+        assert_eq!(obj.try_recv(tok).unwrap().kind(), crate::libkern::notification::KIND_DIVIDE_BY_ZERO);
+        assert_eq!(obj.try_recv(tok).unwrap().kind(), crate::libkern::notification::KIND_ILLEGAL_INSN);
+        assert!(obj.try_recv(tok).is_none());
     }
 
     #[test]
     fn overflow_non_exception_drops_and_synthesizes() {
         init_global_heap();
-        let obj = new_chan();
-        // SAFETY: live channel, single-threaded test.
-        unsafe {
-            for _ in 0..NotificationChannel::QUEUE_CAP {
-                NotificationChannel::enqueue(obj, Notification::notifications_dropped(0));
-            }
-            for _ in 0..5 {
-                NotificationChannel::enqueue(obj, Notification::notifications_dropped(0));
-            }
-            let first = NotificationChannel::try_recv(obj).unwrap();
-            assert_eq!(first.kind(), KIND_NOTIFICATIONS_DROPPED);
-            assert_eq!(u32::from_le_bytes(first.as_bytes()[4..8].try_into().unwrap()), 5);
-            let mut n = 0;
-            while NotificationChannel::try_recv(obj).is_some() {
-                n += 1;
-            }
-            assert_eq!(n, NotificationChannel::QUEUE_CAP);
+        let (obj, mut tok) = new_chan();
+        let tok = &mut tok;
+        for _ in 0..NotificationChannel::QUEUE_CAP {
+            obj.enqueue(tok, Notification::notifications_dropped(0));
         }
-        drop_chan(obj);
+        for _ in 0..5 {
+            obj.enqueue(tok, Notification::notifications_dropped(0));
+        }
+        let first = obj.try_recv(tok).unwrap();
+        assert_eq!(first.kind(), KIND_NOTIFICATIONS_DROPPED);
+        assert_eq!(u32::from_le_bytes(first.as_bytes()[4..8].try_into().unwrap()), 5);
+        let mut n = 0;
+        while obj.try_recv(tok).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, NotificationChannel::QUEUE_CAP);
     }
 
     #[test]
     fn overflow_exception_evicts_oldest_non_exception() {
         init_global_heap();
-        let obj = new_chan();
-        // SAFETY: live channel, single-threaded test.
-        unsafe {
-            for _ in 0..NotificationChannel::QUEUE_CAP {
-                NotificationChannel::enqueue(obj, Notification::notifications_dropped(0));
-            }
-            NotificationChannel::enqueue(obj, Notification::seg_fault(7, 0x1000, FaultKind::NotMapped));
-            let mut saw_seg = false;
-            let mut count = 0;
-            while let Some(n) = NotificationChannel::try_recv(obj) {
-                count += 1;
-                if n.is_exception() {
-                    saw_seg = true;
-                }
-            }
-            assert_eq!(count, NotificationChannel::QUEUE_CAP, "stayed at capacity, no drop");
-            assert!(saw_seg, "the seg_fault survived");
+        let (obj, mut tok) = new_chan();
+        let tok = &mut tok;
+        for _ in 0..NotificationChannel::QUEUE_CAP {
+            obj.enqueue(tok, Notification::notifications_dropped(0));
         }
-        drop_chan(obj);
+        obj.enqueue(tok, Notification::seg_fault(7, 0x1000, FaultKind::NotMapped));
+        let mut saw_seg = false;
+        let mut count = 0;
+        while let Some(n) = obj.try_recv(tok) {
+            count += 1;
+            if n.is_exception() {
+                saw_seg = true;
+            }
+        }
+        assert_eq!(count, NotificationChannel::QUEUE_CAP, "stayed at capacity, no drop");
+        assert!(saw_seg, "the seg_fault survived");
     }
 
     #[test]
     fn overflow_all_exceptions_drop_counts() {
         init_global_heap();
-        let obj = new_chan();
-        // SAFETY: live channel, single-threaded test.
-        unsafe {
-            for _ in 0..NotificationChannel::QUEUE_CAP {
-                NotificationChannel::enqueue(obj, Notification::seg_fault(1, 0, FaultKind::NotMapped));
-            }
-            NotificationChannel::enqueue(obj, Notification::seg_fault(2, 0, FaultKind::NotMapped));
-            let first = NotificationChannel::try_recv(obj).unwrap();
-            assert_eq!(first.kind(), KIND_NOTIFICATIONS_DROPPED);
-            assert_eq!(u32::from_le_bytes(first.as_bytes()[4..8].try_into().unwrap()), 1);
+        let (obj, mut tok) = new_chan();
+        let tok = &mut tok;
+        for _ in 0..NotificationChannel::QUEUE_CAP {
+            obj.enqueue(tok, Notification::seg_fault(1, 0, FaultKind::NotMapped));
         }
-        drop_chan(obj);
+        obj.enqueue(tok, Notification::seg_fault(2, 0, FaultKind::NotMapped));
+        let first = obj.try_recv(tok).unwrap();
+        assert_eq!(first.kind(), KIND_NOTIFICATIONS_DROPPED);
+        assert_eq!(u32::from_le_bytes(first.as_bytes()[4..8].try_into().unwrap()), 1);
     }
 
     #[test]
     fn waiters_add_remove_take_caps_at_max() {
         init_global_heap();
-        let obj = new_chan();
-        // SAFETY: live channel, single-threaded test.
-        unsafe {
-            let ths: [*mut (); NotificationChannel::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
-            for &t in &ths {
-                assert!(NotificationChannel::add_waiter(obj, t).is_ok());
-            }
-            assert!(NotificationChannel::add_waiter(obj, 0xDEAD as *mut ()).is_err());
-            NotificationChannel::remove_waiter(obj, ths[0]);
-            assert!(NotificationChannel::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
-            assert_eq!(&NotificationChannel::take_waiters(obj)[..], &[ths[1], ths[2], ths[3], 0xBEEF as *mut ()]);
-            assert!(NotificationChannel::take_waiters(obj).is_empty());
+        let (obj, mut tok) = new_chan();
+        let tok = &mut tok;
+        let ths: [*mut (); NotificationChannel::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+        for &t in &ths {
+            assert!(obj.add_waiter(tok, t).is_ok());
         }
-        drop_chan(obj);
+        assert!(obj.add_waiter(tok, 0xDEAD as *mut ()).is_err());
+        obj.remove_waiter(tok, ths[0]);
+        assert!(obj.add_waiter(tok, 0xBEEF as *mut ()).is_ok());
+        assert_eq!(&obj.take_waiters(tok)[..], &[ths[1], ths[2], ths[3], 0xBEEF as *mut ()]);
+        assert!(obj.take_waiters(tok).is_empty());
     }
 
     #[test]
     fn dispatch_destroy_runs_channel_arm() {
         init_global_heap();
         test_probe::reset();
-        let obj = new_chan();
-        // SAFETY: `obj` carries the single creation reference.
-        let r = unsafe { ObjectRef::from_raw(obj) };
+        let r = ObjectRef::new(NotificationChannel::try_new().unwrap());
         assert_eq!(test_probe::notification_channel_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::notification_channel_destroys(), 1);

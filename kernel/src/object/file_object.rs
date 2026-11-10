@@ -51,7 +51,7 @@ pub enum Producer {
     /// IRP. See `docs/architecture/filesystem-data-path.md`.
     ///
     /// `reg` and `file_id` are the file's identity: **a non-zero `file_id` means the object is in
-    /// `reg`'s file cache** (`Drop` takes it out), and they name the file back to its server for
+    /// `reg`'s file cache** (its closing takes it out), and they name the file back to its server for
     /// the one thing it cannot learn otherwise — that it was **written**. An in-place overwrite
     /// never reaches the server, so the kernel sends `File::Touch` by id after a write-back
     /// ([`FileObject::writeback`]).
@@ -143,7 +143,7 @@ pub struct FileObject {
     inner: SpinLock<Inner>,
 }
 
-kobject!(FileObject);
+kobject!(FileObject, closing = FileObject::leave_cache);
 // SAFETY: a `FileObject` changes once shared only in its atomics and behind its lock.
 unsafe impl Shared for FileObject {}
 
@@ -299,6 +299,16 @@ pub mod fill_stats {
 }
 
 impl FileObject {
+    /// **Out of the registration's cache** before the box is rebuilt, by address (a new object for
+    /// the file may have replaced this one): until then, another CPU may upgrade the entry.
+    fn leave_cache(&self, _: crate::object::header::Closing) {
+        if let Producer::FsServerBlocks { reg, file_id, .. } = &self.producer
+            && *file_id != 0
+        {
+            reg.cache_forget_object(self);
+        }
+    }
+
     /// Sentinel written into [`FileObject::magic`] at construction.
     pub const MAGIC: u64 = 0x46_69_6c_65_4f_62_6a_21; // "FileObj!"
 
@@ -363,10 +373,10 @@ impl FileObject {
         }
     }
 
-    /// The id this object is cached under in its registration, if it is cached.
-    pub fn file_id(&self) -> Option<u64> {
+    /// The registration whose cache holds this object, and its id there, if it is cached.
+    pub fn cache_key(&self) -> Option<(&UserspaceServerReg, u64)> {
         match &self.producer {
-            Producer::FsServerBlocks { file_id, .. } if *file_id != 0 => Some(*file_id),
+            Producer::FsServerBlocks { reg, file_id, .. } if *file_id != 0 => Some((reg, *file_id)),
             _ => None,
         }
     }
@@ -388,7 +398,7 @@ impl FileObject {
         fo.writable_maps.fetch_add(1, Ordering::AcqRel);
         g.map_gen = g.map_gen.wrapping_add(1);
         // No sync writes a forgotten object, so a pin on it is one nothing would ever clean.
-        if g.self_pin.is_none() && fo.file_id().is_some() && !g.dead {
+        if g.self_pin.is_none() && fo.cache_key().is_some() && !g.dead {
             g.self_pin = Some(file_obj.clone());
         }
     }
@@ -462,7 +472,7 @@ impl FileObject {
     /// candidate dropped; otherwise the candidate is entered in the cache and returned. Every
     /// resolve of one file gets one object.
     ///
-    /// The candidate drops outside the cache's lock, since its `Drop` takes it. `Err` on
+    /// The candidate drops outside the cache's lock, since its closing takes it. `Err` on
     /// allocation failure, with nothing entered or resized; and for a reply whose block size or
     /// device is not the cached object's, with nothing resized: the reply's runs were checked
     /// against its own block size, and its rights were decided by its own device.
@@ -471,8 +481,7 @@ impl FileObject {
         candidate: Ref<FileObject>,
     ) -> Result<Ref<FileObject>, CacheInError> {
         let cand: &FileObject = &candidate;
-        let id = cand.file_id().expect("a cached object has an id");
-        match reg.cache_get_or_insert(id, &candidate).map_err(|_| CacheInError::OutOfMemory)? {
+        match reg.cache_get_or_insert(&candidate).map_err(|_| CacheInError::OutOfMemory)? {
             None => Ok(candidate),
             Some(existing) => {
                 let ex: &FileObject = &existing;
@@ -1238,26 +1247,15 @@ fn stub_fill_dpc(ctx: *mut ()) {
 }
 
 impl Drop for FileObject {
-    /// Free every cached frame (raw `PhysAddr`s). Runs when the last reference releases, with no
-    /// lock held on entry, so taking the cache lock is one ordered acquisition.
+    /// Free every cached frame (raw `PhysAddr`s). `self_pin` is `None`: a pinned object has a
+    /// reference, so is not dropping.
     fn drop(&mut self) {
-        {
-            let g = self.inner.lock();
-            for p in g.pages.iter() {
-                heap::buddy_free(p.frame, 0);
-            }
-            for f in g.retired.iter() {
-                heap::buddy_free(*f, 0);
-            }
-            // `self_pin` is `None`: a pinned object has a reference, so is not dropping.
+        let g = self.inner.lock();
+        for p in g.pages.iter() {
+            heap::buddy_free(p.frame, 0);
         }
-        // **Out of the registration's cache** after the page lock is released (the cache lock ranks
-        // above it), by address: a new object for the file may have replaced this one.
-        let this: *mut Self = self;
-        if let Producer::FsServerBlocks { reg, file_id, .. } = &self.producer
-            && *file_id != 0
-        {
-            reg.cache_forget_object(this);
+        for f in g.retired.iter() {
+            heap::buddy_free(*f, 0);
         }
     }
 }
@@ -1405,11 +1403,9 @@ mod tests {
     use crate::object::{DeviceNode, IpcChannel, UserspaceServerReg};
 
     fn registration() -> Ref<UserspaceServerReg> {
-        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        let ep = Ref::new(a);
-        drop(ObjectRef::new(b));
-        let r = UserspaceServerReg::try_new(ep).unwrap();
-        Ref::new(r)
+        let (ep, b) = IpcChannel::try_new_pair(4).unwrap();
+        drop(b);
+        UserspaceServerReg::try_new(ep).unwrap()
     }
 
     fn candidate(reg: &Ref<UserspaceServerReg>, id: u64, size: usize) -> Ref<FileObject> {

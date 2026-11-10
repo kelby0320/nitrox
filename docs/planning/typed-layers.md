@@ -346,6 +346,33 @@ objects' accessors reach their state through an `UnsafeCell`, so a pointer from 
 Control: sched-d11's, the survey's host test, two threads under Miri, which reports the retag today.
 Depends on J.2 and J.4. Author.
 
+**Built 2026-11-10.** The six objects `SCHED` mutates keep that state in a `SchedCell`, borrowed
+only with the `SchedToken` the scheduler's state keeps, and their raw accessors, an `inner` each
+among them, are safe methods; their twelve `Send`/`Sync` claims go, a `WaitQueue`'s `Send` argued
+once instead. `wait_on`'s dispatchers borrow each object by kind.
+- **Back-pointers are `Weak<T>`** (`object/header.rs`): an endpoint's `peer` and `us_reg`, and the
+  file cache's entries, each made under the contract that its target's closing clears it under
+  the lock it is kept behind. `sched::follow` reads one out of a cell and lends the token back with
+  the target, so endpoint, peer and registration chain without `unsafe`. `is_live` goes.
+- **sched-d11**: `dispatch_destroy` runs a type's `KObject::closing`, which `kobject!` sets, on the
+  raw pointer before it rebuilds the box: an endpoint's, a timer's and a registration's, and a
+  `FileObject`'s cache removal, which had the same shape. Its two-thread test fails under both Miri
+  models on `main` and passes here. A type a box of which could be linked is made as a `Ref`, as a
+  box's drop would skip its closing; a hook takes a `Closing` only `dispatch_destroy` makes; and
+  each type's `Drop` asserts its closing ran.
+
+What stays raw: the deadline heap's targets, which the tick forms into a `&Timer`, a `&IpcChannel`
+and a `&PendingOperation` under the closing's argument, and `complete_pending_op_at`. `unsafe`
+blocks fall from 829 to 685, `unsafe fn`s from 299 to 233 (`object`'s 106 to 50, `sched`'s 17 to 7)
+and `unsafe impl`s from 65 to 57, `SchedCell`'s `Sync` the one new. Under Miri, `sched::` and the
+six objects', `process`'s and `header`'s tests pass on `main` (148) and here (149), measured
+before a registration's outstanding requests came out as their references alone, a change in safe
+code: taken whole, the tables overflowed the debug kernel's stack in a closing.
+
+One thing differs from the survey: **`follow` lends the token back with the target**, where it had
+a `SchedWeak::get` borrowing the token: a followed target's own cell is borrowed with the token,
+which a target borrowing it would forbid.
+
 ### J.7 The thread, split (kobj-o3's `Thread` half; sched-o8's last)
 
 `Thread`'s **41 accessors**, called 112 times in `sched/`. Its identity stays plain; what SCHED

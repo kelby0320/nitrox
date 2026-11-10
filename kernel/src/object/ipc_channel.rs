@@ -1,28 +1,26 @@
 //! The [`IpcChannel`] kernel object — one **endpoint** of a bidirectional IPC channel.
 //!
 //! A channel is a **pair** of endpoint objects, each with its own receive ring and recv-waiter
-//! list, linked by a mutual raw `peer` pointer: a send pushes into the *peer's* ring, a recv
+//! list, linked by a mutual uncounted `peer` pointer: a send pushes into the *peer's* ring, a recv
 //! drains the endpoint's *own*. See `docs/spec/ipc-message-format.md`.
 //!
-//! All interior state lives in an [`UnsafeCell`] touched **only while the rank-1 `SCHED` lock
-//! is held** (see `kernel/docs/lock-ordering.md`); the `pub(crate) unsafe fn` accessors take a
-//! type-erased `*mut ()`, so no aliasing `&mut IpcChannel` is formed.
+//! All interior state lives in a [`SchedCell`], borrowed only with the token the rank-1 `SCHED`
+//! lock keeps (see `kernel/docs/lock-ordering.md`).
 //!
-//! When an endpoint's last handle closes, [`IpcChannel::drop`] runs
-//! [`crate::sched::ipc_endpoint_closing`]: under `SCHED` it nulls the *surviving* peer's `peer`
-//! pointer and wakes its blocked receivers (they observe `PeerClosed`). The survivor is alive
-//! (pinned by its handle or a waiter); the second endpoint to drop reads its own `peer` as
-//! already-null and skips. **Invariant:** endpoint references are released only in
-//! syscall/boot context, **never under `SCHED`**, so `drop` may itself take `SCHED`.
+//! When an endpoint's last reference goes, its closing runs [`crate::sched::ipc_endpoint_closing`]
+//! before the box is rebuilt: under `SCHED` it clears the *surviving* peer's `peer` pointer and
+//! wakes its blocked receivers (they observe `PeerClosed`). The survivor is alive (pinned by its
+//! handle or a waiter); the second endpoint to close finds its own `peer` already cleared.
+//! **Invariant:** endpoint references are released only in syscall/boot context, **never under
+//! `SCHED`**, so the closing may itself take `SCHED`.
 
-use crate::sched::{SlotHold, Slots};
-use core::cell::UnsafeCell;
+use crate::sched::{SchedCell, SchedToken, SlotHold, Slots, follow};
 
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::ipc::{IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader};
 use crate::libkern::{AllocError, KBox, KVec, Reserved};
-use crate::object::header::{Header, Ref, Shared, kobject};
-use crate::object::{ObjectRef, PendingOperation};
+use crate::object::header::{Header, Ref, Shared, Weak, kobject};
+use crate::object::{ObjectRef, PendingOperation, UserspaceServerReg};
 use crate::object::{WaitQueue, Waiters};
 
 /// A queued message in kernel storage: the natural-alignment twin of
@@ -229,14 +227,13 @@ pub enum RecvState {
 pub struct IpcChannel {
     header: Header<Self>,
     magic: u64,
-    inner: UnsafeCell<Inner>,
-    /// Its sends' deadline-heap slots, given back after `Drop` takes their entries out.
+    inner: SchedCell<Inner>,
+    /// Its sends' deadline-heap slots, given back after its closing takes their entries out.
     _slots: SlotHold,
 }
 
-kobject!(IpcChannel);
-// SAFETY: an endpoint changes once shared only in `inner`, an `UnsafeCell` touched only under
-// `SCHED`.
+kobject!(IpcChannel, closing = crate::sched::ipc_endpoint_closing);
+// SAFETY: an endpoint changes once shared only in `inner`, a `SchedCell`.
 unsafe impl Shared for IpcChannel {}
 
 struct Inner {
@@ -247,20 +244,13 @@ struct Inner {
     /// Blocking senders awaiting space in **this** ring, FIFO, promoted into `recv` when a recv
     /// frees a slot. Pre-reserved to [`IpcChannel::MAX_PENDING_SENDS`]: no `SCHED` allocation.
     pending_sends: Reserved<PendingSend>,
-    peer: *mut IpcChannel,
-    /// Non-null iff this is the **kernel's** end of a Userspace Server channel: a non-owning
-    /// back-pointer to the owning [`UserspaceServerReg`](crate::object::UserspaceServerReg), which
-    /// *owns* this endpoint. A reply sent here (by the server, on its peer) is a forwarded-lookup
-    /// reply the kernel completes inline rather than enqueues.
-    us_reg: *mut (),
+    /// The other endpoint, until its closing clears this.
+    peer: Option<Weak<IpcChannel>>,
+    /// Set iff this is the **kernel's** end of a Userspace Server channel: the registration that
+    /// owns this endpoint, until its closing clears this. A reply sent here (by the server, on its
+    /// peer) is a forwarded-lookup reply the kernel completes inline rather than enqueues.
+    us_reg: Option<Weak<UserspaceServerReg>>,
 }
-
-// SAFETY: identical reasoning to `Timer`/`NotificationChannel` — the header
-// refcount is atomic and every access to `inner` (including the raw `peer`
-// pointer) is serialised under the single-CPU `SCHED` lock.
-unsafe impl Send for IpcChannel {}
-// SAFETY: as `Send`.
-unsafe impl Sync for IpcChannel {}
 
 impl IpcChannel {
     /// Sentinel written into [`IpcChannel::magic`] at construction.
@@ -274,18 +264,20 @@ impl IpcChannel {
     pub const MAX_PENDING_SENDS: usize = 4;
 
     /// Create a connected endpoint **pair**, each with a `depth`-slot receive ring (clamped to
-    /// `1..=IPC_MAX_QUEUE_DEPTH`). Each returned `KBox` holds one creation reference.
-    pub fn try_new_pair(depth: u32) -> Result<(KBox<Self>, KBox<Self>), AllocError> {
+    /// `1..=IPC_MAX_QUEUE_DEPTH`). Each returned `Ref` is its creation reference.
+    pub fn try_new_pair(depth: u32) -> Result<(Ref<Self>, Ref<Self>), AllocError> {
         let cap = depth.clamp(1, IPC_MAX_QUEUE_DEPTH) as usize;
         let (a, b) = (Self::try_new_endpoint(cap)?, Self::try_new_endpoint(cap)?);
         let (a, b) = (KBox::into_raw(a), KBox::into_raw(b));
         // Each peer is the other box's own pointer, so no later borrow of that box retires it.
         // SAFETY: both endpoints are this function's alone, so `SCHED` is not needed, and each
         // write goes through its box's own pointer; each box is rebuilt from the pointer it gave.
+        // Each `Weak` is kept in its endpoint's cell, behind `SCHED`, and its target's closing
+        // clears it there before the target is freed.
         unsafe {
-            (*UnsafeCell::raw_get(&raw const (*a.as_ptr()).inner)).peer = b.as_ptr();
-            (*UnsafeCell::raw_get(&raw const (*b.as_ptr()).inner)).peer = a.as_ptr();
-            Ok((KBox::from_raw(a), KBox::from_raw(b)))
+            (*SchedCell::raw_get(&raw const (*a.as_ptr()).inner)).peer = Some(Weak::new(b.as_ptr()));
+            (*SchedCell::raw_get(&raw const (*b.as_ptr()).inner)).peer = Some(Weak::new(a.as_ptr()));
+            Ok((Ref::new(KBox::from_raw(a)), Ref::new(KBox::from_raw(b))))
         }
     }
 
@@ -298,12 +290,12 @@ impl IpcChannel {
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(Inner {
+            inner: SchedCell::new(Inner {
                 recv,
                 recv_waiters: WaitQueue::new(),
                 pending_sends,
-                peer: core::ptr::null_mut(),
-                us_reg: core::ptr::null_mut(),
+                peer: None,
+                us_reg: None,
             }),
             _slots: slots,
         })
@@ -314,115 +306,82 @@ impl IpcChannel {
         self.magic == Self::MAGIC
     }
 
-    // --- Scheduler-only accessors --------------------------------------
-    //
-    // SAFETY (shared by all): `obj` addresses a live `IpcChannel` (pinned by an
-    // `ObjectRef` the caller holds), and the caller holds `SCHED`, which —
-    // single-CPU — serialises all access to `inner`.
+    // --- What the scheduler reaches, with its token ---------------------
 
-    /// Borrow the interior mutably (no aliasing; `SCHED` held).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
-    unsafe fn inner<'a>(obj: *mut ()) -> &'a mut Inner {
-        // SAFETY: forming a shared `&IpcChannel` to reach the `UnsafeCell`, then
-        // a `&mut Inner` through it, is the interior-mutability contract — sound
-        // while `SCHED` serialises access.
-        let c = unsafe { &*(obj as *const IpcChannel) };
-        // SAFETY: as above.
-        unsafe { &mut *c.inner.get() }
+    /// The peer endpoint, until it closes, with the token lent back.
+    pub(crate) fn peer<'t>(&self, tok: &'t mut SchedToken) -> Option<(&'t IpcChannel, &'t mut SchedToken)> {
+        follow(&self.inner, tok, |i| i.peer.as_ref())
     }
 
-    /// The peer endpoint pointer (type-erased), or null if the peer has closed.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn peer_of(obj: *mut ()) -> *mut () {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.peer as *mut ()
+    /// The peer's address, null once it has closed: a key, never followed.
+    pub(crate) fn peer_addr(&self, tok: &SchedToken) -> *const IpcChannel {
+        self.inner.read(tok).peer.as_ref().map_or(core::ptr::null(), |p| p.as_ptr())
     }
 
-    /// Null this endpoint's peer pointer (the peer is closing).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn clear_peer(obj: *mut ()) {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.peer = core::ptr::null_mut();
+    /// Forget the peer, which is closing.
+    pub(crate) fn clear_peer(&self, tok: &mut SchedToken) {
+        self.inner.get(tok).peer = None;
     }
 
-    /// Mark this endpoint as the kernel's end of a Userspace Server channel, recording `reg`.
-    /// Set by `us_server_attach` only where no live registration is, and cleared by its drop.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn set_us_reg(obj: *mut (), reg: *mut ()) {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.us_reg = reg;
+    /// Make this endpoint the kernel's end of `reg`'s Userspace Server channel.
+    pub(crate) fn set_us_reg(&self, tok: &mut SchedToken, reg: Weak<UserspaceServerReg>) {
+        self.inner.get(tok).us_reg = Some(reg);
+    }
+
+    /// Forget `reg`, which is closing, if this endpoint still names it: another may have replaced it.
+    pub(crate) fn clear_us_reg_if(&self, tok: &mut SchedToken, reg: &UserspaceServerReg) {
+        let us_reg = &mut self.inner.get(tok).us_reg;
+        if us_reg.as_ref().is_some_and(|r| r.names(reg)) {
+            *us_reg = None;
+        }
+    }
+
+    /// The registration this endpoint is the kernel's end for, with the token lent back.
+    pub(crate) fn us_reg<'t>(&self, tok: &'t mut SchedToken) -> Option<(&'t UserspaceServerReg, &'t mut SchedToken)> {
+        follow(&self.inner, tok, |i| i.us_reg.as_ref())
+    }
+
+    /// The registration's address, null with none: a key, never followed.
+    #[cfg(test)]
+    pub(crate) fn us_reg_addr(&self, tok: &SchedToken) -> *const UserspaceServerReg {
+        self.inner.read(tok).us_reg.as_ref().map_or(core::ptr::null(), |r| r.as_ptr())
+    }
+
+    /// A new reference to that registration; `None` with none, or one whose count is zero.
+    pub(crate) fn us_reg_upgrade(&self, tok: &SchedToken) -> Option<Ref<UserspaceServerReg>> {
+        self.inner.read(tok).us_reg.as_ref()?.upgrade()
     }
 
     /// `true` iff this endpoint's receive side holds an endpoint, in a queued message or a held
     /// send. A popped slot's transfers are taken, so every slot can be read.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn holds_an_endpoint(obj: *mut ()) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn holds_an_endpoint(&self, tok: &SchedToken) -> bool {
+        let inner = self.inner.read(tok);
         let endpoint =
             |t: &Option<TransferRef>| t.as_ref().is_some_and(|t| t.obj.object_type() == KObjectType::IpcChannel);
         inner.recv.slots.iter().any(|s| s.transfers.iter().any(endpoint))
             || inner.pending_sends.iter().any(|p| p.transfers.iter().any(endpoint))
     }
 
-    /// The owning [`UserspaceServerReg`](crate::object::UserspaceServerReg)
-    /// back-pointer for this endpoint (type-erased), or null if this is an ordinary
-    /// channel endpoint.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn us_reg_of(obj: *mut ()) -> *mut () {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.us_reg
-    }
-
     /// Push `msg` (and **move** any `transfers`) into the **peer**'s ring; `Sent`'s `woke_edge`
     /// reports an empty→non-empty edge. On `Full`/`PeerClosed` the `transfers` are left untouched.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn send_push(
-        obj: *mut (),
+    pub(crate) fn send_push(
+        &self,
+        tok: &mut SchedToken,
         msg: &StoredMsg,
         transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     ) -> SendOutcome {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let peer = unsafe { Self::inner(obj) }.peer;
-        if peer.is_null() {
-            return SendOutcome::PeerClosed;
-        }
-        // SAFETY: the accessor contract, for `peer`: the other endpoint, live while its pointer is
-        // set, which closing clears under `SCHED`; a distinct object from `obj`, whose borrow has ended.
-        let peer_inner = unsafe { Self::inner(peer as *mut ()) };
-        let was_empty = peer_inner.recv.is_empty();
-        if peer_inner.recv.push_from(msg, transfers) {
-            SendOutcome::Sent { woke_edge: was_empty }
-        } else {
-            SendOutcome::Full
-        }
+        let Some((peer, tok)) = self.peer(tok) else { return SendOutcome::PeerClosed };
+        let recv = &mut peer.inner.get(tok).recv;
+        let was_empty = recv.is_empty();
+        if recv.push_from(msg, transfers) { SendOutcome::Sent { woke_edge: was_empty } } else { SendOutcome::Full }
     }
 
     /// Inspect this endpoint's receive side without dequeuing.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn recv_peek(obj: *mut ()) -> RecvState {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn recv_peek(&self, tok: &SchedToken) -> RecvState {
+        let inner = self.inner.read(tok);
         if !inner.recv.is_empty() {
             RecvState::HasMsg
-        } else if inner.peer.is_null() {
+        } else if inner.peer.is_none() {
             RecvState::PeerClosed
         } else {
             RecvState::Empty
@@ -431,78 +390,48 @@ impl IpcChannel {
 
     /// Pop the oldest message into `dst` and **move** its transferred-handle
     /// references into `out`. Returns `false` if empty.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn recv_pop_into(
-        obj: *mut (),
+    pub(crate) fn recv_pop_into(
+        &self,
+        tok: &mut SchedToken,
         dst: &mut StoredMsg,
         out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     ) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.recv.pop_into(dst, out)
+        self.inner.get(tok).recv.pop_into(dst, out)
     }
 
     /// `true` iff a recv would return something or report a closed peer — the "signaled" predicate.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn already_signaled(obj: *mut ()) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
-        !inner.recv.is_empty() || inner.peer.is_null()
+    pub(crate) fn already_signaled(&self, tok: &SchedToken) -> bool {
+        let inner = self.inner.read(tok);
+        !inner.recv.is_empty() || inner.peer.is_none()
     }
 
     /// Register `thread` as a receiver. `Err(())` at [`MAX_WAITERS`](Self::MAX_WAITERS).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
-        inner.recv_waiters.add(thread)
+    pub(crate) fn add_waiter(&self, tok: &mut SchedToken, thread: *mut ()) -> Result<(), ()> {
+        self.inner.get(tok).recv_waiters.add(thread)
     }
 
     /// Remove `thread` from the receiver set if present (idempotent).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
-        inner.recv_waiters.remove(thread);
+    pub(crate) fn remove_waiter(&self, tok: &mut SchedToken, thread: *mut ()) {
+        self.inner.get(tok).recv_waiters.remove(thread);
     }
 
     /// Take every receiver, leaving none.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ IpcChannel::MAX_WAITERS }> {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
-        inner.recv_waiters.take()
+    pub(crate) fn take_waiters(&self, tok: &mut SchedToken) -> Waiters<{ IpcChannel::MAX_WAITERS }> {
+        self.inner.get(tok).recv_waiters.take()
     }
 
     /// Blocking-send entry: deliver `msg` straight into the **peer**'s ring, or if full **hold**
     /// it in the peer's pending-send queue with a cloned reference to the caller's
     /// `PendingOperation` `po`. `Sent`/`Queued` take the `transfers`; the rest leave them.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn send_or_queue(
-        obj: *mut (),
+    pub(crate) fn send_or_queue(
+        &self,
+        tok: &mut SchedToken,
         msg: &StoredMsg,
         transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
         po: &Ref<PendingOperation>,
     ) -> BlockSendOutcome {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let peer = unsafe { Self::inner(obj) }.peer;
-        if peer.is_null() {
-            return BlockSendOutcome::PeerClosed;
-        }
-        // SAFETY: the accessor contract, for `peer`: the other endpoint, live while its pointer is
-        // set, which closing clears under `SCHED`; a distinct object from `obj`, whose borrow has ended.
-        let peer_inner = unsafe { Self::inner(peer as *mut ()) };
+        let Some((peer, tok)) = self.peer(tok) else { return BlockSendOutcome::PeerClosed };
+        let peer_inner = peer.inner.get(tok);
         let was_empty = peer_inner.recv.is_empty();
         if peer_inner.recv.push_from(msg, transfers) {
             return BlockSendOutcome::Sent { woke_edge: was_empty };
@@ -524,13 +453,9 @@ impl IpcChannel {
     /// Mark the held sender whose `PendingOperation` is `po` **cancelled** (a `BlockBounded`
     /// deadline elapsed). It stays queued — `po` was already completed `TimedOut`, and a drop must
     /// not run under `SCHED` — until `promote_pending_send` or close reclaims it.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn cancel_pending_send(obj: *mut (), po: *mut ()) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
-        if let Some(p) = inner.pending_sends.iter_mut().find(|p| p.po.as_ptr().cast() == po) {
+    pub(crate) fn cancel_pending_send(&self, tok: &mut SchedToken, po: *const PendingOperation) -> bool {
+        let inner = self.inner.get(tok);
+        if let Some(p) = inner.pending_sends.iter_mut().find(|p| core::ptr::eq(p.po.as_ptr(), po)) {
             p.cancelled = true;
             true
         } else {
@@ -542,15 +467,12 @@ impl IpcChannel {
     /// `reclaimed`, for release **outside** `SCHED`), then promote the oldest **live** sender into
     /// the ring (FIFO) and return its `PendingOperation` ref: the caller completes it status 0
     /// under `SCHED` and drops it outside. `None` if no live sender was promoted.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn promote_pending_send(
-        obj: *mut (),
+    pub(crate) fn promote_pending_send(
+        &self,
+        tok: &mut SchedToken,
         reclaimed: &mut [Option<ReclaimedSend>; Self::MAX_PENDING_SENDS],
     ) -> Option<Ref<PendingOperation>> {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+        let inner = self.inner.get(tok);
         let mut r = 0;
         loop {
             let cancelled = {
@@ -574,32 +496,21 @@ impl IpcChannel {
         }
     }
 
-    /// Copy every held sender's `PendingOperation` pointer into `out` (for the closing path to
-    /// complete them `PeerClosed`), returning the count. They stay queued, released with `Inner`.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn pending_send_pos(obj: *mut (), out: &mut [*mut ()]) -> usize {
-        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
-        let mut n = 0;
-        for p in inner.pending_sends.iter() {
-            if n < out.len() {
-                out[n] = p.po.as_ptr().cast();
-                n += 1;
-            }
-        }
-        n
+    /// A reference to every held sender's `PendingOperation`, for the closing path to complete them
+    /// `PeerClosed` and drop outside `SCHED`. The sends stay queued, released with the endpoint.
+    pub(crate) fn held_sends(&self, tok: &SchedToken) -> [Option<Ref<PendingOperation>>; Self::MAX_PENDING_SENDS] {
+        let held = &self.inner.read(tok).pending_sends;
+        core::array::from_fn(|i| held.get(i).map(|p| p.po.clone()))
     }
 }
 
 impl Drop for IpcChannel {
-    /// Unlink from the peer and wake its blocked receivers (they observe `PeerClosed`), then assert
-    /// this endpoint has no receivers of its own (a live waiter pins it via its `ObjectRef`).
+    /// A live waiter pins this endpoint through its `ObjectRef`, so none is left at the last drop;
+    /// and its closing, run first, unlinked it.
     fn drop(&mut self) {
-        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
-        unsafe { crate::sched::ipc_endpoint_closing(self as *mut Self as *mut ()) };
-        debug_assert!(self.inner.get_mut().recv_waiters.is_empty(), "IpcChannel dropped with live receivers");
+        let inner = self.inner.get_mut();
+        debug_assert!(inner.recv_waiters.is_empty(), "IpcChannel dropped with live receivers");
+        debug_assert!(inner.peer.is_none() && inner.us_reg.is_none(), "IpcChannel dropped still linked");
     }
 }
 

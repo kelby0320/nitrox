@@ -8,16 +8,13 @@
 //! ## Mutation discipline
 //!
 //! A `Timer` is shared through an [`ObjectRef`](crate::object::ObjectRef) yet mutated by the
-//! scheduler, which is sound only because **all** its interior state lives in an
-//! [`UnsafeCell`] touched **exclusively under the rank-1 `SCHED` lock**
-//! (`kernel/docs/lock-ordering.md`). The `pub(crate) unsafe fn` accessors reach the cell
-//! through a type-erased `*mut ()`, so no aliasing `&mut Timer` is ever formed.
+//! scheduler: **all** its interior state lives in a [`SchedCell`], borrowed only with the token
+//! the rank-1 `SCHED` lock keeps (`kernel/docs/lock-ordering.md`).
 
-use crate::sched::{SlotHold, Slots};
-use core::cell::UnsafeCell;
+use crate::sched::{SchedCell, SchedToken, SlotHold, Slots};
 
 use crate::libkern::{AllocError, KBox};
-use crate::object::header::{Header, Shared, kobject};
+use crate::object::header::{Header, Ref, Shared, kobject};
 use crate::object::{WaitQueue, Waiters};
 
 /// A timer kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
@@ -25,13 +22,13 @@ use crate::object::{WaitQueue, Waiters};
 pub struct Timer {
     header: Header<Self>,
     magic: u64,
-    inner: UnsafeCell<TimerInner>,
-    /// Its slot in the deadline heap, given back after `Drop` has taken its entry out.
+    inner: SchedCell<TimerInner>,
+    /// Its slot in the deadline heap, given back after its closing has taken its entry out.
     _slot: SlotHold,
 }
 
-kobject!(Timer);
-// SAFETY: a `Timer` changes once shared only in `inner`, an `UnsafeCell` touched only under `SCHED`.
+kobject!(Timer, closing = crate::sched::timer_closing);
+// SAFETY: a `Timer` changes once shared only in `inner`, a `SchedCell`.
 unsafe impl Shared for Timer {}
 
 struct TimerInner {
@@ -46,13 +43,6 @@ struct TimerInner {
     waiters: WaitQueue<{ Timer::MAX_WAITERS }>,
 }
 
-// SAFETY: identical reasoning to `ObjectRef`/`Thread` — the header refcount is
-// atomic, and every access to `inner` is serialised under the single-CPU
-// `SCHED` lock, so sharing/moving a `Timer` across contexts cannot race.
-unsafe impl Send for Timer {}
-// SAFETY: as `Send`.
-unsafe impl Sync for Timer {}
-
 impl Timer {
     /// Sentinel written into [`Timer::magic`] at construction.
     pub const MAGIC: u64 = 0x54_69_6d_65_72_21_21_21; // "Timer!!!"
@@ -62,12 +52,12 @@ impl Timer {
 
     /// Allocate an unarmed `Timer` (refcount one), reserving its slot in the deadline heap up
     /// front.
-    pub fn try_new() -> Result<KBox<Self>, AllocError> {
+    pub fn try_new() -> Result<Ref<Self>, AllocError> {
         let slot = SlotHold::reserve(Slots::Timer)?;
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(TimerInner {
+            inner: SchedCell::new(TimerInner {
                 deadline_ns: 0,
                 interval_ns: 0,
                 in_heap: false,
@@ -75,6 +65,7 @@ impl Timer {
             }),
             _slot: slot,
         })
+        .map(Ref::new)
     }
 
     /// `true` iff the self-check sentinel is intact.
@@ -82,132 +73,69 @@ impl Timer {
         self.magic == Self::MAGIC
     }
 
-    // SAFETY (shared by all): `obj` is a live `Timer` pinned by the caller's `ObjectRef`, and
-    // the caller holds `SCHED`, which serialises all access to `inner`.
-
-    /// Borrow the interior mutably; must not outlive the `SCHED` hold nor alias.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
-    unsafe fn inner<'a>(obj: *mut ()) -> &'a mut TimerInner {
-        // SAFETY: `obj` is a live Timer; forming a shared `&Timer` to reach the
-        // `UnsafeCell`, then a `&mut TimerInner` through it, is exactly the
-        // interior-mutability contract — sound while `SCHED` serialises access.
-        let t = unsafe { &*(obj as *const Timer) };
-        // SAFETY: as above.
-        unsafe { &mut *t.inner.get() }
-    }
-
     /// Arm (or disarm, with `deadline_ns == 0`) the timer.
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
-    pub(crate) unsafe fn set_armed(obj: *mut (), deadline_ns: u64, interval_ns: u64) {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn set_armed(&self, tok: &mut SchedToken, deadline_ns: u64, interval_ns: u64) {
+        let inner = self.inner.get(tok);
         inner.deadline_ns = deadline_ns;
         inner.interval_ns = interval_ns;
     }
 
     /// The armed deadline (`0` = unarmed). Test-only; production reads it from the heap.
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
     #[cfg(test)]
-    pub(crate) unsafe fn deadline(obj: *mut ()) -> u64 {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.deadline_ns
+    pub(crate) fn deadline(&self, tok: &SchedToken) -> u64 {
+        self.inner.read(tok).deadline_ns
     }
 
     /// The re-arm interval (`0` = one-shot).
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
-    pub(crate) unsafe fn interval(obj: *mut ()) -> u64 {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.interval_ns
+    pub(crate) fn interval(&self, tok: &SchedToken) -> u64 {
+        self.inner.read(tok).interval_ns
     }
 
     /// Set the "present in the deadline heap" flag.
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
-    pub(crate) unsafe fn set_in_heap(obj: *mut (), v: bool) {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.in_heap = v;
+    pub(crate) fn set_in_heap(&self, tok: &mut SchedToken, v: bool) {
+        self.inner.get(tok).in_heap = v;
     }
 
     /// `true` iff this timer has a live deadline-heap entry.
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
-    pub(crate) unsafe fn in_heap(obj: *mut ()) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.in_heap
+    pub(crate) fn in_heap(&self, tok: &SchedToken) -> bool {
+        self.inner.read(tok).in_heap
     }
 
     /// Register `thread` as a waiter; `Err(())` at the cap, which callers map to `OutOfMemory`.
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
-    pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn add_waiter(&self, tok: &mut SchedToken, thread: *mut ()) -> Result<(), ()> {
+        let inner = self.inner.get(tok);
         inner.waiters.add(thread)
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
-    pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn remove_waiter(&self, tok: &mut SchedToken, thread: *mut ()) {
+        let inner = self.inner.get(tok);
         inner.waiters.remove(thread);
     }
 
     /// `true` iff the timer is armed and its deadline is at or before `now`, or it is a one-shot
     /// the tick has already fired: out of the heap with its deadline kept, the one state that
     /// means so. A waiter's `now` is read before it takes `SCHED`, and may predate that fire.
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
-    pub(crate) unsafe fn already_signaled(obj: *mut (), now_ns: u64) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn already_signaled(&self, tok: &SchedToken, now_ns: u64) -> bool {
+        let inner = self.inner.read(tok);
         let fired = inner.interval_ns == 0 && !inner.in_heap;
         inner.deadline_ns != 0 && (inner.deadline_ns <= now_ns || fired)
     }
 
     /// Take every waiter, leaving none.
-    ///
-    /// # Safety
-    ///
-    /// See the accessor contract.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ Timer::MAX_WAITERS }> {
-        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn take_waiters(&self, tok: &mut SchedToken) -> Waiters<{ Timer::MAX_WAITERS }> {
+        let inner = self.inner.get(tok);
         inner.waiters.take()
     }
 }
 
 impl Drop for Timer {
-    /// Take the timer out of the deadline heap, which names it by address. A live waiter pins
-    /// it (it holds an `ObjectRef` across `sys_wait`), so the last reference cannot drop while
-    /// waiters remain; the assert documents that.
+    /// A live waiter pins the timer (it holds an `ObjectRef` across `sys_wait`), so the last
+    /// reference cannot drop while waiters remain; the assert documents that.
     fn drop(&mut self) {
-        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
-        unsafe { crate::sched::timer_closing(self as *mut Self as *mut ()) };
-        debug_assert!(self.inner.get_mut().waiters.is_empty(), "Timer dropped with live waiters");
+        let inner = self.inner.get_mut();
+        debug_assert!(inner.waiters.is_empty(), "Timer dropped with live waiters");
+        debug_assert!(!inner.in_heap, "Timer dropped in the deadline heap");
     }
 }
 
@@ -215,68 +143,54 @@ impl Drop for Timer {
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
-    use crate::object::ObjectRef;
     use crate::object::header::test_probe;
 
     #[test]
     fn try_new_is_unarmed_with_magic() {
         init_global_heap();
-        let t = Timer::try_new().unwrap();
+        let (t, tok) = (Timer::try_new().unwrap(), &mut SchedToken::for_test());
         assert!(t.magic_ok());
-        let obj = KBox::into_raw(t).as_ptr() as *mut ();
-        // SAFETY: live Timer, single-threaded test (stands in for SCHED).
-        unsafe {
-            assert_eq!(Timer::deadline(obj), 0);
-            assert_eq!(Timer::interval(obj), 0);
-            assert!(!Timer::in_heap(obj));
-            assert!(!Timer::already_signaled(obj, u64::MAX));
-            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));
-        }
+        assert_eq!(t.deadline(tok), 0);
+        assert_eq!(t.interval(tok), 0);
+        assert!(!t.in_heap(tok));
+        assert!(!t.already_signaled(tok, u64::MAX));
     }
 
     #[test]
     fn arm_and_signal_predicate() {
         init_global_heap();
-        let obj = KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut ();
-        // SAFETY: live Timer, single-threaded test.
-        unsafe {
-            Timer::set_armed(obj, 1000, 0); // armed as `timer_arm` arms: into the heap
-            Timer::set_in_heap(obj, true);
-            assert_eq!(Timer::deadline(obj), 1000);
-            assert!(!Timer::already_signaled(obj, 999));
-            assert!(Timer::already_signaled(obj, 1000));
-            assert!(Timer::already_signaled(obj, 1001));
-            Timer::set_armed(obj, 0, 0); // disarm
-            Timer::set_in_heap(obj, false);
-            assert!(!Timer::already_signaled(obj, u64::MAX));
-            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));
-        }
+        let (t, tok) = (Timer::try_new().unwrap(), &mut SchedToken::for_test());
+        t.set_armed(tok, 1000, 0); // armed as `timer_arm` arms: into the heap
+        t.set_in_heap(tok, true);
+        assert_eq!(t.deadline(tok), 1000);
+        assert!(!t.already_signaled(tok, 999));
+        assert!(t.already_signaled(tok, 1000));
+        assert!(t.already_signaled(tok, 1001));
+        t.set_armed(tok, 0, 0); // disarm
+        t.set_in_heap(tok, false);
+        assert!(!t.already_signaled(tok, u64::MAX));
     }
 
     #[test]
     fn waiters_add_remove_take_caps_at_max() {
         init_global_heap();
-        let obj = KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut ();
-        // SAFETY: live Timer, single-threaded test.
-        unsafe {
-            let ths: [*mut (); Timer::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
-            for &t in &ths {
-                assert!(Timer::add_waiter(obj, t).is_ok());
-            }
-            assert!(Timer::add_waiter(obj, 0xDEAD as *mut ()).is_err());
-            Timer::remove_waiter(obj, ths[1]);
-            assert!(Timer::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
-            assert_eq!(&Timer::take_waiters(obj)[..], &[ths[0], ths[2], ths[3], 0xBEEF as *mut ()]);
-            assert!(Timer::take_waiters(obj).is_empty());
-            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));
+        let (t, tok) = (Timer::try_new().unwrap(), &mut SchedToken::for_test());
+        let ths: [*mut (); Timer::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+        for &th in &ths {
+            assert!(t.add_waiter(tok, th).is_ok());
         }
+        assert!(t.add_waiter(tok, 0xDEAD as *mut ()).is_err());
+        t.remove_waiter(tok, ths[1]);
+        assert!(t.add_waiter(tok, 0xBEEF as *mut ()).is_ok());
+        assert_eq!(&t.take_waiters(tok)[..], &[ths[0], ths[2], ths[3], 0xBEEF as *mut ()]);
+        assert!(t.take_waiters(tok).is_empty());
     }
 
     #[test]
     fn dispatch_destroy_runs_timer_arm() {
         init_global_heap();
         test_probe::reset();
-        let r = ObjectRef::new(Timer::try_new().unwrap());
+        let r = Timer::try_new().unwrap().erase();
         assert_eq!(test_probe::timer_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::timer_destroys(), 1);

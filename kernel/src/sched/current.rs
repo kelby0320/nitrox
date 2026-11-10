@@ -53,9 +53,7 @@ pub fn current_tid() -> u32 {
 /// lock-guarded core of `sys_notif_recv` and the in-kernel supervisor; the caller copies
 /// the result out **after** this returns.
 pub fn notif_try_recv(channel: &NotificationChannel) -> Option<Notification> {
-    let _g = SCHED.lock();
-    // SAFETY: pinned by the borrow; SCHED held.
-    unsafe { NotificationChannel::try_recv(addr(channel)) }
+    channel.try_recv(&mut SCHED.lock().tok)
 }
 
 /// The [`Process`](crate::object::Process) owning the currently running thread (`None` for

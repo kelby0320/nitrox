@@ -17,11 +17,11 @@
 "kernel/src/limine" = 14
 "kernel/src/main" = 17
 "kernel/src/mm" = 87
-"kernel/src/object" = 139
+"kernel/src/object" = 70
 "kernel/src/pci" = 4
 "kernel/src/power" = 1
 "kernel/src/report" = 1
-"kernel/src/sched" = 171
+"kernel/src/sched" = 96
 "kernel/src/syscall" = 1
 "kernel/src/tlb" = 2
 
@@ -38,9 +38,9 @@
 "kernel/src/limine" = 2
 "kernel/src/main" = 1
 "kernel/src/mm" = 23
-"kernel/src/object" = 106
+"kernel/src/object" = 50
 "kernel/src/pci" = 1
-"kernel/src/sched" = 17
+"kernel/src/sched" = 7
 
 [unsafe-impls]
 "kernel/src/dpc" = 3
@@ -50,7 +50,8 @@
 "kernel/src/io" = 8
 "kernel/src/libkern" = 13
 "kernel/src/mm" = 4
-"kernel/src/object" = 30
+"kernel/src/object" = 21
+"kernel/src/sched" = 1
 
 [unsafe-attrs]
 "kernel/src/arch" = 12

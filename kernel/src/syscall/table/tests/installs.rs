@@ -50,7 +50,7 @@ fn a_channel_with_an_end_refused_leaves_no_handle() {
 /// A channel whose receiving end is in `pid`'s table.
 fn endpoints(pid: u32) -> (Ref<IpcChannel>, RawHandle) {
     let (a, b) = IpcChannel::try_new_pair(2).unwrap();
-    (Ref::new(a), install(pid, ObjectRef::new(b), channel_endpoint_rights()).unwrap())
+    (a, install(pid, b.erase(), channel_endpoint_rights()).unwrap())
 }
 
 /// Send a message on `a` carrying two fresh pages.
@@ -165,8 +165,7 @@ fn a_blocking_send_refused_after_its_handle_closes_it() {
     global::init_for_tests();
     test_probe::reset();
     let (a, b) = IpcChannel::try_new_pair(1).unwrap();
-    let a = Ref::new(a);
-    drop(ObjectRef::new(b));
+    drop(b);
     let msg = KBox::<StoredMsg>::try_new_zeroed().unwrap();
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     let mut claims: [Option<Claim<'static>>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);

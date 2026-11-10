@@ -5,26 +5,24 @@
 //!
 //! A **latching edge counter**: each `signal` increments a pending count (an IRQ with no
 //! waiter is not lost), and a `sys_wait` returning for the object **consumes** one. As in
-//! [`PendingOperation`](super::pending_op), all state is reached only under `SCHED`.
-
-use core::cell::UnsafeCell;
+//! [`PendingOperation`](super::pending_op), all state is in a [`SchedCell`].
 
 use crate::libkern::{AllocError, KBox};
 use crate::object::header::{Header, Shared, kobject};
 use crate::object::{WaitQueue, Waiters};
+use crate::sched::{SchedCell, SchedToken};
 
 /// A hardware-interrupt waitable (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct InterruptObject {
     header: Header<Self>,
     magic: u64,
-    /// All mutable state, reached only under `SCHED`.
-    inner: UnsafeCell<InterruptInner>,
+    /// All mutable state.
+    inner: SchedCell<InterruptInner>,
 }
 
 kobject!(InterruptObject);
-// SAFETY: an `InterruptObject` changes once shared only in `inner`, an `UnsafeCell` touched only
-// under `SCHED`.
+// SAFETY: an `InterruptObject` changes once shared only in `inner`, a `SchedCell`.
 unsafe impl Shared for InterruptObject {}
 
 struct InterruptInner {
@@ -33,13 +31,6 @@ struct InterruptInner {
     /// Blocked threads, non-owning (each is kept alive by its own parked `ObjectRef`).
     waiters: WaitQueue<{ InterruptObject::MAX_WAITERS }>,
 }
-
-// SAFETY: identical reasoning to `PendingOperation` — the header refcount is
-// atomic, and every access to `inner` is serialised under the single-CPU `SCHED`
-// lock, so sharing/moving an `InterruptObject` across contexts cannot race.
-unsafe impl Send for InterruptObject {}
-// SAFETY: as `Send`.
-unsafe impl Sync for InterruptObject {}
 
 impl InterruptObject {
     /// Sentinel written into [`InterruptObject::magic`] at construction.
@@ -53,7 +44,7 @@ impl InterruptObject {
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(InterruptInner { pending: 0, waiters: WaitQueue::new() }),
+            inner: SchedCell::new(InterruptInner { pending: 0, waiters: WaitQueue::new() }),
         })
     }
 
@@ -62,82 +53,41 @@ impl InterruptObject {
         self.magic == Self::MAGIC
     }
 
-    // SAFETY (shared by all): `obj` is a live `InterruptObject` pinned by the caller's
-    // `ObjectRef`, and the caller holds `SCHED`, which serialises all access to `inner`.
-
-    /// Borrow the interior mutably. Must not outlive the `SCHED` hold nor alias.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
-    unsafe fn inner<'a>(obj: *mut ()) -> &'a mut InterruptInner {
-        // SAFETY: `obj` is a live `InterruptObject`; forming a shared reference to
-        // reach the `UnsafeCell`, then a `&mut InterruptInner` through it, is the
-        // interior-mutability contract — sound while `SCHED` serialises access.
-        let p = unsafe { &*(obj as *const InterruptObject) };
-        // SAFETY: as above.
-        unsafe { &mut *p.inner.get() }
-    }
-
     /// Record an interrupt (saturating); returns `true`, as callers always wake waiters.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn signal(obj: *mut ()) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn signal(&self, tok: &mut SchedToken) -> bool {
+        let inner = self.inner.get(tok);
         inner.pending = inner.pending.saturating_add(1);
         true
     }
 
     /// Consume one pending interrupt (a `sys_wait` returned for this object); idempotent at zero.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn consume(obj: *mut ()) {
-        // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn consume(&self, tok: &mut SchedToken) {
+        let inner = self.inner.get(tok);
         if inner.pending > 0 {
             inner.pending -= 1;
         }
     }
 
     /// `true` iff an interrupt is pending — the `sys_wait` fast-path predicate.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn already_signaled(obj: *mut ()) -> bool {
-        // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
-        unsafe { Self::inner(obj) }.pending > 0
+    pub(crate) fn already_signaled(&self, tok: &SchedToken) -> bool {
+        self.inner.read(tok).pending > 0
     }
 
     /// Register `thread` as a waiter; `Err(())` at [`MAX_WAITERS`](Self::MAX_WAITERS).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
-        // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn add_waiter(&self, tok: &mut SchedToken, thread: *mut ()) -> Result<(), ()> {
+        let inner = self.inner.get(tok);
         inner.waiters.add(thread)
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
-        // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn remove_waiter(&self, tok: &mut SchedToken, thread: *mut ()) {
+        let inner = self.inner.get(tok);
         inner.waiters.remove(thread);
     }
 
     /// Take every waiter, leaving none.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_waiters(obj: *mut ()) -> Waiters<{ InterruptObject::MAX_WAITERS }> {
-        // SAFETY: the accessor contract: `obj` is a live `InterruptObject` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(obj) };
+    pub(crate) fn take_waiters(&self, tok: &mut SchedToken) -> Waiters<{ InterruptObject::MAX_WAITERS }> {
+        let inner = self.inner.get(tok);
         inner.waiters.take()
     }
 }
@@ -157,56 +107,43 @@ mod tests {
     use crate::object::ObjectRef;
     use crate::object::header::test_probe;
 
-    fn fresh() -> *mut () {
+    fn fresh() -> (KBox<InterruptObject>, SchedToken) {
         init_global_heap();
-        KBox::into_raw(InterruptObject::try_new().unwrap()).as_ptr() as *mut ()
+        (InterruptObject::try_new().unwrap(), SchedToken::for_test())
     }
 
     #[test]
     fn try_new_has_magic_and_is_unsignalled() {
-        init_global_heap();
-        let io = InterruptObject::try_new().unwrap();
+        let (io, tok) = fresh();
         assert!(io.magic_ok());
-        let p = KBox::into_raw(io).as_ptr() as *mut ();
-        // SAFETY: live object, single-threaded test stands in for SCHED.
-        assert!(!unsafe { InterruptObject::already_signaled(p) });
-        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
-        drop(unsafe { ObjectRef::from_raw(p) });
+        assert!(!io.already_signaled(&tok));
     }
 
     #[test]
     fn signal_latches_and_consume_clears() {
-        let p = fresh();
-        // SAFETY: live object; single-threaded test serialises like SCHED.
-        unsafe {
-            assert!(InterruptObject::signal(p));
-            assert!(InterruptObject::already_signaled(p));
-            InterruptObject::signal(p);
-            InterruptObject::consume(p);
-            assert!(InterruptObject::already_signaled(p), "second IRQ still pending");
-            InterruptObject::consume(p);
-            assert!(!InterruptObject::already_signaled(p));
-            InterruptObject::consume(p);
-            assert!(!InterruptObject::already_signaled(p));
-        }
-        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
-        drop(unsafe { ObjectRef::from_raw(p) });
+        let (io, mut tok) = fresh();
+        let tok = &mut tok;
+        assert!(io.signal(tok));
+        assert!(io.already_signaled(tok));
+        io.signal(tok);
+        io.consume(tok);
+        assert!(io.already_signaled(tok), "second IRQ still pending");
+        io.consume(tok);
+        assert!(!io.already_signaled(tok));
+        io.consume(tok);
+        assert!(!io.already_signaled(tok));
     }
 
     #[test]
     fn waiters_add_take_and_remove() {
-        let p = fresh();
+        let (io, mut tok) = fresh();
+        let tok = &mut tok;
         let t1 = 0x1000usize as *mut ();
         let t2 = 0x2000usize as *mut ();
-        // SAFETY: live object; single-threaded test.
-        unsafe {
-            assert!(InterruptObject::add_waiter(p, t1).is_ok());
-            assert!(InterruptObject::add_waiter(p, t2).is_ok());
-            InterruptObject::remove_waiter(p, t1);
-            assert_eq!(&InterruptObject::take_waiters(p)[..], &[t2]);
-        }
-        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
-        drop(unsafe { ObjectRef::from_raw(p) });
+        assert!(io.add_waiter(tok, t1).is_ok());
+        assert!(io.add_waiter(tok, t2).is_ok());
+        io.remove_waiter(tok, t1);
+        assert_eq!(&io.take_waiters(tok)[..], &[t2]);
     }
 
     #[test]

@@ -40,7 +40,7 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
 | 4    | Kernel-object internal locks (`AddressSpace`, `Namespace`, the `FileObject` page cache)| live as of Phase 1 slice 5 (item 3); `Namespace` binding store added Phase 2 slice 1; the page cache with slice 8. Never nested in either order; also taken from the `#PF` handler — see § The AddressSpace lock and the page-fault handler |
 | 5    | IPC channel                                  | reserved (Phase 1 folds endpoint state into rank 1 — see § Wait queues) |
-| 5 (`Registry`) | Registries that **allocate while held**: the device registry (`DEVICES`) and its driver outcomes (`OUTCOMES`, never held with it), the GPT partition table (`PARTITIONS`), and each userspace server's **file cache** (`UserspaceServerReg::files`) | `DEVICES` and `PARTITIONS` live as of Phase 2 — ranked here rather than as leaves because they push into a `KVec` while held, so they must sit above the allocators. The file cache as of administration Part C.1: a `FileObject`'s `Drop` takes it *after* releasing its own page-cache lock, never inside it, and no object reference is ever dropped under it, since the last one would re-enter it |
+| 5 (`Registry`) | Registries that **allocate while held**: the device registry (`DEVICES`) and its driver outcomes (`OUTCOMES`, never held with it), the GPT partition table (`PARTITIONS`), and each userspace server's **file cache** (`UserspaceServerReg::files`) | `DEVICES` and `PARTITIONS` live as of Phase 2 — ranked here rather than as leaves because they push into a `KVec` while held, so they must sit above the allocators. The file cache as of administration Part C.1: a `FileObject`'s closing takes it, and releases it, before its `Drop` takes the page-cache lock, never inside it, and no object reference is ever dropped under it, since the last one would re-enter it |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
@@ -275,9 +275,9 @@ IRQ context. It is sound there, for the reason the `#PF` fault-in is:
 `Namespace` (`kernel/src/object/namespace.rs`) is a syscall-accessed object — its
 binding store is touched only by the owning thread's namespace syscalls, never by
 the scheduler — so it follows the `AddressSpace` model: a rank-4 `SpinLock<Inner>`,
-not the under-`SCHED` `UnsafeCell` pattern used by scheduler-touched objects
-(`Timer`, `IpcChannel`). `bind` allocates under the lock (the path copy and the
-binding push), which acquires the rank-6 allocator beneath rank 4 — correctly
+not the `SchedCell` of scheduler-touched objects (`Timer`, `IpcChannel`), borrowed
+only with the token the held `SCHED` keeps. `bind` allocates under the lock (the path
+copy and the binding push), which acquires the rank-6 allocator beneath rank 4 — correctly
 ordered (rank N held while acquiring rank M > N). The no-allocation rule applies
 only to the rank-1 `SCHED` lock. `bind`/`unbind` hand the target `ObjectRef` back
 to the caller on every path so it is dropped **outside** the lock (an `ObjectRef`
@@ -294,8 +294,9 @@ that its end of a pipe never closes so a peer never observes `PeerClosed`
 The sweep cannot run where the process actually dies, in its last thread's exit:
 that thread holds rank-1 `SCHED` and never returns from `finish_exit`, and
 releasing an object reference runs a destructor that reaches the rank-6
-allocator — and, for an `IpcChannel` or a `Timer`, takes rank-1 `SCHED` itself,
-to wake blocked receivers or take the timer out of the deadline heap. So:
+allocator — and, for an `IpcChannel`, a `Timer` or a `UserspaceServerReg`, a closing
+that takes rank-1 `SCHED` first, to wake blocked receivers, take the timer out of the
+deadline heap or fail a registration's requests. So:
 
 1. The last thread out only *marks* itself (`Thread::set_process_ended`) under
    `SCHED`, and queues the pid for the reaper thread.
@@ -574,13 +575,13 @@ only `ObjectRef` *Drop* is forbidden under the lock), while the receiver-side
 install (`install`) and any error/undelivered-transfer *drop* run **outside**
 `SCHED` (the send commits the move by closing the sender's handles after the push;
 undelivered transfers release their refs when the ring drops, in destructor
-context). `IpcChannel::Drop`
-(an endpoint's last handle closing) takes `SCHED` to null the surviving peer's
-back-pointer and wake its receivers — sound because endpoint `ObjectRef`s are
-released only outside `SCHED` (handle close, the `sys_wait`/lookup references),
-never under it, so the destructor's acquire can never nest on a held `SCHED`. **`Timer::Drop`
-takes it too**, to leave the deadline heap, and rests on the same rule: no `ObjectRef` of
-either kind is released under `SCHED`.
+context). An endpoint's **closing** (`KObject::closing`, which `dispatch_destroy` runs when its
+last reference goes, before the box is rebuilt) takes `SCHED` to clear the surviving peer's
+back-pointer and wake its receivers — sound because endpoint `ObjectRef`s are released only
+outside `SCHED` (handle close, the `sys_wait`/lookup references), never under it, so the closing's
+acquire can never nest on a held `SCHED`. **A `Timer`'s closing takes it too**, to leave the
+deadline heap, and a registration's, to fail its requests, resting on the same rule: no
+`ObjectRef` of these kinds is released under `SCHED`. Their `Drop`s take no lock.
 
 ## Plain spinlocks are no-preemption regions (2026-07-21, F12)
 

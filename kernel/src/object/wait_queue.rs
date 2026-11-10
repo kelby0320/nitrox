@@ -7,6 +7,10 @@ use crate::libkern::ArrayVec;
 /// At most `N` threads waiting on one object, inline, so adding one under `SCHED` never allocates.
 pub(crate) struct WaitQueue<const N: usize>(ArrayVec<*mut (), N>);
 
+// SAFETY: the threads' addresses are followed only by the scheduler's wake loop, under `SCHED`, where
+// each waiter is pinned in `blocked` until it takes itself out of this queue.
+unsafe impl<const N: usize> Send for WaitQueue<N> {}
+
 impl<const N: usize> WaitQueue<N> {
     /// No waiters.
     pub(crate) const fn new() -> Self {

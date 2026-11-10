@@ -4,7 +4,7 @@ use crate::object::{IpcChannel, MemoryObject, UserspaceServerReg};
 
 fn pair(depth: u32) -> (Ref<IpcChannel>, Ref<IpcChannel>) {
     let (a, b) = IpcChannel::try_new_pair(depth).unwrap();
-    (Ref::new(a), Ref::new(b))
+    (a, b)
 }
 
 type Moving = (RawHandle, [Option<TransferRef>; IPC_HANDLE_MAX], [Option<Claim<'static>>; IPC_HANDLE_MAX]);
@@ -69,9 +69,9 @@ fn a_forwarded_reply_closes_the_handles_it_carries() {
     global::init_for_tests();
     let (k, server_end) = {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        (Ref::new(a), Ref::new(b))
+        (a, b)
     };
-    let reg = Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
+    let reg = UserspaceServerReg::try_new(k.clone()).unwrap();
     assert!(crate::sched::us_server_attach(&reg).is_none());
     let (h, mut t, mut c) = moving(PID);
     assert_eq!(deliver(&server_end, &message(), &mut t, &mut c, SendMode::NoBlock, 0, PID), Ok(0));
@@ -89,8 +89,7 @@ fn a_blocking_send_whose_handle_cannot_be_made_sends_nothing() {
     let (h, mut t, mut c) = moving(PID);
     crate::handle::table::fail_installs_after(Some(0));
     assert_eq!(deliver(&a, &msg, &mut t, &mut c, SendMode::Block, 0, PID), Err(KError::OutOfMemory));
-    // SAFETY: `b` is pinned by the test's reference, and the test is single-threaded.
-    assert!(!unsafe { IpcChannel::already_signaled(b.as_object().as_ptr()) }, "no message for the peer");
+    assert!(!b.already_signaled(&crate::sched::SchedToken::for_test()), "no message for the peer");
     drop((t, c));
     assert!(held(h, PID), "its handle not moved");
     global::close_all_owned_by(PID);

@@ -16,9 +16,9 @@
 //!
 //! ## Mutation discipline
 //!
-//! As for [`IpcChannel`] / [`Timer`](crate::object::Timer): the pending tables live in an
-//! [`UnsafeCell`] touched **only under the rank-1 `SCHED` lock**; the owned `endpoint` is set once
-//! at construction, and the file cache has a lock of its own. The endpoint and the pending `po`s
+//! As for [`IpcChannel`] / [`Timer`](crate::object::Timer): the pending tables live in a
+//! [`SchedCell`], borrowed only with the token the rank-1 `SCHED` lock keeps; the owned `endpoint`
+//! is set once at construction, and the file cache has a lock of its own. The endpoint and the pending `po`s
 //! are dropped only when the registration is destroyed (`dispatch_destroy`, **outside** `SCHED`) or
 //! by the caller of a `take_pending_*`, never under the lock.
 //!
@@ -26,14 +26,13 @@
 //! § Subtree scoping), so up to [`US_PENDING_MAX`] lookups and, independently, fills can be in
 //! flight; a full table fails a new request `WouldBlock`.
 
-use core::cell::UnsafeCell;
-
 use crate::libkern::handle::Rights;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::PhysAddr;
-use crate::object::header::{Header, Ref, Shared, kobject};
+use crate::object::header::{Header, Ref, Shared, Weak, kobject};
 use crate::object::{FileObject, Forgotten, IpcChannel, PendingOperation};
+use crate::sched::{SchedCell, SchedToken};
 
 /// Largest lookup suffix a [`PendingLookup`] stores inline (no allocation under `SCHED`). A
 /// longer one keeps its true `suffix_len` but a truncated buffer: harmless for an eager
@@ -71,7 +70,7 @@ impl Forward<'_> {
 }
 
 /// One outstanding forwarded lookup: what completing its `PendingOperation` needs when the
-/// reply arrives. Moved out by `take_pending_matching` / `take_pending_next`; the caller drops
+/// reply arrives. Moved out by `take_pending_matching` / `take_outstanding`; the caller drops
 /// its `po` **outside** `SCHED`.
 pub struct PendingLookup {
     /// The `request_id` stamped on the Resolve request; the reply must echo it.
@@ -142,9 +141,9 @@ struct Inner {
 /// One file in a registration's cache: the id its server gave it, and its `FileObject`.
 struct CachedFile {
     id: u64,
-    /// The object, **weakly**: a lookup must `try_acquire` it. The object's `Drop` takes its
-    /// entry out, by address, so an entry never outlives the memory it names.
-    obj: *mut FileObject,
+    /// The object, **weakly**: a lookup must upgrade it. The object's closing takes its entry out,
+    /// under the files lock, by address, so an entry never outlives the memory it names.
+    obj: Weak<FileObject>,
     /// **Its server forgot it with I/O in flight** (`File::Forget`): the entry stays so a second
     /// `Forget` finds the object and waits on the first one's answer. No resolve or sync sees
     /// it, and it goes with the object.
@@ -159,7 +158,7 @@ pub struct UserspaceServerReg {
     /// The kernel's IPC endpoint; its peer is the endpoint the server services. Set once, so read
     /// without `SCHED`.
     endpoint: Ref<IpcChannel>,
-    inner: UnsafeCell<Inner>,
+    inner: SchedCell<Inner>,
     /// **The file cache: one `FileObject` per file this server's replies named**, keyed by the
     /// id a `FILE_BLOCKS` reply carries, so every resolve shares one object and a sync or unmount
     /// can enumerate them. An index only: users hold the objects, or they hold themselves while
@@ -172,16 +171,10 @@ pub struct UserspaceServerReg {
     files: SpinLock<KVec<CachedFile>>,
 }
 
-kobject!(UserspaceServerReg);
-// SAFETY: a registration changes once shared only in `inner`, an `UnsafeCell` touched only under
-// `SCHED`, and behind `files`' lock.
+kobject!(UserspaceServerReg, closing = crate::sched::us_reg_detach);
+// SAFETY: a registration changes once shared only in `inner`, a `SchedCell`, and behind `files`'
+// lock.
 unsafe impl Shared for UserspaceServerReg {}
-
-// SAFETY: identical reasoning to `IpcChannel` — the header refcount is atomic and
-// every access to `inner` is serialised under the single-CPU `SCHED` lock.
-unsafe impl Send for UserspaceServerReg {}
-// SAFETY: as `Send`.
-unsafe impl Sync for UserspaceServerReg {}
 
 impl UserspaceServerReg {
     /// Sentinel written into [`UserspaceServerReg::magic`] at construction.
@@ -190,40 +183,47 @@ impl UserspaceServerReg {
     /// Allocate a registration owning `endpoint` (the kernel's IPC endpoint), refcount one, with
     /// empty pending tables. The caller installs the back-pointer from `endpoint` to this
     /// object (under `SCHED`) and binds it as a `UserspaceServer` target.
-    pub fn try_new(endpoint: Ref<IpcChannel>) -> Result<KBox<Self>, AllocError> {
+    pub fn try_new(endpoint: Ref<IpcChannel>) -> Result<Ref<Self>, AllocError> {
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
             endpoint,
-            inner: UnsafeCell::new(Inner {
+            inner: SchedCell::new(Inner {
                 pending: core::array::from_fn(|_| None),
                 pending_fill: core::array::from_fn(|_| None),
                 next_id: 1,
             }),
             files: SpinLock::new(LockRank::Registry, KVec::new()),
         })
+        .map(Ref::new)
     }
 
     // --- The file cache (its own lock; never under `SCHED`) --------------
 
-    /// **The one object for file `id`, or `obj` becomes it.** A live cached object is returned as
-    /// a new reference, `obj` left for the caller to drop outside this lock; otherwise `obj` is
-    /// entered under `id` (replacing a mid-teardown entry) and `Ok(None)` returned. `Err` only if
-    /// the index cannot grow. A forgotten entry is passed by: its file is freed or about to be.
-    pub fn cache_get_or_insert(&self, id: u64, obj: &Ref<FileObject>) -> Result<Option<Ref<FileObject>>, AllocError> {
+    /// **The one object for `obj`'s file, or `obj` becomes it.** A live cached object is returned
+    /// as a new reference, `obj` left for the caller to drop outside this lock; otherwise `obj` is
+    /// entered under its id (replacing a mid-teardown entry) and `Ok(None)` returned. An object
+    /// this registration does not cache, by its producer, is not entered and also answers
+    /// `Ok(None)`. `Err` only if the index cannot grow. A forgotten entry is passed by: its file
+    /// is freed or about to be.
+    pub fn cache_get_or_insert(&self, obj: &Ref<FileObject>) -> Result<Option<Ref<FileObject>>, AllocError> {
+        let Some((_, id)) = obj.cache_key().filter(|&(owner, _)| core::ptr::eq(owner, self)) else {
+            return Ok(None);
+        };
         let mut g = self.files.lock();
+        // SAFETY: kept behind the files lock, which `obj`'s closing takes to remove its entry, by
+        // address, before the object is freed: its producer names this registration.
+        let weak = || unsafe { Weak::new(obj.as_ptr()) };
         if let Some(e) = g.iter_mut().find(|e| e.id == id && !e.forgotten) {
-            // SAFETY: the entry's object is live — its `Drop` removes the entry under this
-            // lock before its memory goes, so while the lock is held the pointer is readable.
-            if let Some(existing) = unsafe { Ref::try_acquire(e.obj) } {
+            if let Some(existing) = e.obj.upgrade() {
                 return Ok(Some(existing));
             }
-            // Mid-teardown (refcount zero): its `Drop` will look for its own address, which
+            // Mid-teardown (refcount zero): its closing will look for its own address, which
             // this overwrites, so it removes nothing.
-            e.obj = obj.as_ptr();
+            e.obj = weak();
             return Ok(None);
         }
-        g.try_push(CachedFile { id, obj: obj.as_ptr(), forgotten: false })?;
+        g.try_push(CachedFile { id, obj: weak(), forgotten: false })?;
         Ok(None)
     }
 
@@ -244,8 +244,7 @@ impl UserspaceServerReg {
             else {
                 return Forgotten::Now;
             };
-            // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
-            match unsafe { Ref::try_acquire(g[i].obj) } {
+            match g[i].obj.upgrade() {
                 Some(obj) => {
                     g[i].forgotten = true;
                     obj
@@ -267,10 +266,10 @@ impl UserspaceServerReg {
         outcome
     }
 
-    /// Take the entry naming `obj` out of the cache, if one does — a `FileObject`'s `Drop`.
-    pub fn cache_forget_object(&self, obj: *mut FileObject) {
+    /// Take the entry naming `obj` out of the cache, if one does — a `FileObject`'s closing.
+    pub fn cache_forget_object(&self, obj: *const FileObject) {
         let mut g = self.files.lock();
-        if let Some(i) = g.iter().position(|e| e.obj == obj) {
+        if let Some(i) = g.iter().position(|e| e.obj.names(obj)) {
             g.remove(i);
         }
     }
@@ -283,8 +282,7 @@ impl UserspaceServerReg {
         let g = self.files.lock();
         out.try_reserve(g.len())?;
         for e in g.iter().filter(|e| !e.forgotten) {
-            // SAFETY: as in `cache_get_or_insert` — live while the lock is held.
-            if let Some(r) = unsafe { Ref::try_acquire(e.obj) } {
+            if let Some(r) = e.obj.upgrade() {
                 // `try_reserve` above guarantees this push does not allocate.
                 let _ = out.try_push(r);
             }
@@ -303,42 +301,6 @@ impl UserspaceServerReg {
         self.magic == Self::MAGIC
     }
 
-    // SAFETY (shared by all): `reg` is a live `UserspaceServerReg` pinned by the caller's
-    // `ObjectRef`, and the caller holds `SCHED`, which serialises all access to `inner`.
-
-    /// Is `reg` a live registration? Reads the [`MAGIC`](Self::MAGIC) sentinel: the raw-pointer
-    /// counterpart of [`magic_ok`](Self::magic_ok) for a pointer that *might* dangle:
-    /// `IpcChannel.us_reg`, should any path outlive `Drop`'s clearing (`ipc_endpoint_closing`
-    /// checks).
-    ///
-    /// # Safety
-    /// `reg` must be non-null and point at readable memory (a freed-but-mapped
-    /// kernel-heap allocation qualifies — telling that case apart is the point).
-    pub(crate) unsafe fn is_live(reg: *mut ()) -> bool {
-        // SAFETY: the caller guarantees readable memory; `magic` sits at a fixed
-        // offset in the `#[repr(C)]` header layout, and any bit pattern is a valid
-        // `u64`, so this cannot form an invalid value.
-        let magic = unsafe { core::ptr::addr_of!((*(reg as *const UserspaceServerReg)).magic).read_volatile() };
-        magic == Self::MAGIC
-    }
-
-    /// Borrow the interior mutably (no aliasing; `SCHED` held).
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
-    unsafe fn inner<'a>(reg: *mut ()) -> &'a mut Inner {
-        // The sentinel catches a stale back-pointer when followed, not as garbage in the table.
-        // SAFETY: the accessor contract makes `reg` a registration's memory, so readable.
-        debug_assert!(unsafe { Self::is_live(reg) }, "UserspaceServerReg accessor on a dead/stale registration");
-        // SAFETY: forming a shared `&UserspaceServerReg` to reach the `UnsafeCell`,
-        // then a `&mut Inner` through it, is the interior-mutability contract —
-        // sound while `SCHED` serialises access.
-        let r = unsafe { &*(reg as *const UserspaceServerReg) };
-        // SAFETY: as above.
-        unsafe { &mut *r.inner.get() }
-    }
-
     /// The kernel's endpoint, borrowed: a forwarded request is sent on it and lands in the
     /// *peer*'s inbox.
     pub fn endpoint(&self) -> &IpcChannel {
@@ -346,18 +308,15 @@ impl UserspaceServerReg {
     }
 
     /// A plain lookup's [`begin_forward`](Self::begin_forward), the tests' shorthand.
-    ///
-    /// # Safety
-    /// As [`begin_forward`](Self::begin_forward).
     #[cfg(test)]
-    pub(crate) unsafe fn begin(
-        reg: *mut (),
+    pub(crate) fn begin(
+        &self,
+        tok: &mut SchedToken,
         po: &Ref<PendingOperation>,
         requested: Rights,
         suffix: &[u8],
     ) -> Option<u64> {
-        // SAFETY: the caller's contract, passed through.
-        unsafe { Self::begin_forward(reg, po, requested, suffix, Forward::PLAIN) }
+        self.begin_forward(tok, po, requested, suffix, Forward::PLAIN)
     }
 
     /// Reserve a free pending-lookup slot, returning its new `request_id`; `None` if all
@@ -365,18 +324,15 @@ impl UserspaceServerReg {
     ///
     /// Stores a clone of `po` (an atomic bump, sound under `SCHED`) so the reply can complete
     /// it, and `fwd`, what the request asked for, so a `SUBNAMESPACE` reply can send it on.
-    ///
-    /// # Safety
-    /// See the accessor contract above; `po` references a live `PendingOperation`.
-    pub(crate) unsafe fn begin_forward(
-        reg: *mut (),
+    pub(crate) fn begin_forward(
+        &self,
+        tok: &mut SchedToken,
         po: &Ref<PendingOperation>,
         requested: Rights,
         suffix: &[u8],
         fwd: Forward<'_>,
     ) -> Option<u64> {
-        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(reg) };
+        let inner = self.inner.get(tok);
         let slot = inner.pending.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
@@ -405,18 +361,15 @@ impl UserspaceServerReg {
     /// Reserve a free pending-**fill** slot for a forwarded `File::ReadRange`, returning its
     /// `request_id`; `None` if all [`US_PENDING_MAX`] are in flight. Stores clones of `po` and
     /// `file_obj` so the reply can land the page even if the faulting thread's references changed.
-    ///
-    /// # Safety
-    /// See the accessor contract above; `po` / `file_obj` reference live objects.
-    pub(crate) unsafe fn begin_fill(
-        reg: *mut (),
+    pub(crate) fn begin_fill(
+        &self,
+        tok: &mut SchedToken,
         po: &Ref<PendingOperation>,
         file_obj: &Ref<FileObject>,
         frame: PhysAddr,
         index: usize,
     ) -> Option<u64> {
-        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(reg) };
+        let inner = self.inner.get(tok);
         let slot = inner.pending_fill.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
@@ -427,136 +380,90 @@ impl UserspaceServerReg {
 
     /// Take the pending fill **iff** a slot's `request_id` matches the `ReadRange` reply's
     /// echoed id; `None` otherwise. The caller drops `po` / `file_obj` **outside** `SCHED`.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_pending_fill_matching(reg: *mut (), request_id: u64) -> Option<PendingFill> {
-        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(reg) };
+    pub(crate) fn take_pending_fill_matching(&self, tok: &mut SchedToken, request_id: u64) -> Option<PendingFill> {
+        let inner = self.inner.get(tok);
         let slot = inner.pending_fill.iter().position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
         inner.pending_fill[slot].take()
     }
 
     /// Take the pending lookup **iff** a slot's `request_id` matches the reply's echoed id;
     /// `None` for a duplicate or stale reply. The caller drops `po` **outside** `SCHED`.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_pending_matching(reg: *mut (), request_id: u64) -> Option<PendingLookup> {
-        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(reg) };
+    pub(crate) fn take_pending_matching(&self, tok: &mut SchedToken, request_id: u64) -> Option<PendingLookup> {
+        let inner = self.inner.get(tok);
         let slot = inner.pending.iter().position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
         inner.pending[slot].take()
     }
 
-    /// Take the next pending fill, as [`take_pending_next`](Self::take_pending_next) does a lookup.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_pending_fill_next(reg: *mut ()) -> Option<PendingFill> {
-        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(reg) };
-        let slot = inner.pending_fill.iter().position(Option::is_some)?;
-        inner.pending_fill[slot].take()
-    }
-
-    /// Take the next occupied pending lookup, for **draining** the table when the server dies:
-    /// the caller loops until `None`, failing each, and drops `po` **outside** `SCHED`.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_pending_next(reg: *mut ()) -> Option<PendingLookup> {
-        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
-        let inner = unsafe { Self::inner(reg) };
-        let slot = inner.pending.iter().position(Option::is_some)?;
-        inner.pending[slot].take()
+    /// Take everything outstanding, for **failing** it when the server or the registration goes:
+    /// the caller completes each and drops its references **outside** `SCHED`. Only the references
+    /// come out; the rest of each entry is plain data, dropped here.
+    pub(crate) fn take_outstanding(&self, tok: &mut SchedToken) -> Outstanding {
+        let inner = self.inner.get(tok);
+        Outstanding {
+            lookups: core::array::from_fn(|i| inner.pending[i].take().map(|pl| pl.po)),
+            fills: core::array::from_fn(|i| inner.pending_fill[i].take().map(|pf| (pf.po, pf.file_obj))),
+        }
     }
 }
 
 impl Drop for UserspaceServerReg {
-    /// Detach from the endpoint that points back at this registration, and complete anything
-    /// still outstanding on it, both while the registration is still whole.
-    ///
-    /// `IpcChannel.us_reg` is a raw, **uncounted** back-pointer (the registration owns the
-    /// endpoint, so a counted edge back would be a cycle), and an endpoint can outlive its
-    /// registration. Clearing it here keeps every consumer (`ipc_endpoint_closing`,
-    /// `us_forward_reg_for_send`, `us_server_attach`) from dereferencing freed memory or
-    /// resurrecting a dead object's refcount.
-    ///
-    /// This runs **before** the fields drop: the pending table is still populated (so its
-    /// waiters are woken `PeerClosed` rather than left hanging) and `endpoint` is still live
-    /// (so the back-pointer is cleared before anything can follow it). The field drops that
-    /// follow release the endpoint, and if that is its last reference `ipc_endpoint_closing`
-    /// runs and finds nothing to drain.
+    /// Its closing, run first, failed and took out everything outstanding.
     fn drop(&mut self) {
-        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
-        unsafe { crate::sched::us_reg_detach(self as *mut Self as *mut ()) };
-        // Poison the sentinel last, so a dangling pointer that survives this fails `is_live`: a
-        // freed-but-untouched allocation would still read `UsSrvRg!`.
-        self.magic = 0;
+        let inner = self.inner.get_mut();
+        let none = inner.pending.iter().all(Option::is_none) && inner.pending_fill.iter().all(Option::is_none);
+        debug_assert!(none, "UserspaceServerReg dropped with requests outstanding");
     }
+}
+
+/// What a registration had outstanding, taken whole: every forwarded lookup's PO, and every
+/// fill's PO and file.
+pub(crate) struct Outstanding {
+    pub(crate) lookups: [Option<Ref<PendingOperation>>; US_PENDING_MAX],
+    pub(crate) fills: [Option<(Ref<PendingOperation>, Ref<FileObject>)>; US_PENDING_MAX],
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
-    use crate::object::ObjectRef;
     use crate::object::header::test_probe;
     use crate::object::{IpcChannel, PendingOperation};
 
     /// A live `IpcChannel` endpoint adopted into a `Ref`; its peer is dropped at once.
     fn endpoint() -> Ref<IpcChannel> {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        let a_ref = Ref::new(a);
-        drop(ObjectRef::new(b));
-        a_ref
+        drop(b);
+        a
     }
 
     fn make_po() -> Ref<PendingOperation> {
         Ref::new(PendingOperation::try_new().unwrap())
     }
 
-    fn reg() -> ObjectRef {
+    fn reg() -> Ref<UserspaceServerReg> {
         let r = UserspaceServerReg::try_new(endpoint()).unwrap();
         assert!(r.magic_ok());
-        ObjectRef::new(r)
+        r
     }
 
-    /// An endpoint can outlive its registration, and its `us_reg` back-pointer is raw and
-    /// uncounted, so `Drop` must clear it: without that, four consumers dereferenced freed
+    /// An endpoint can outlive its registration, and its `us_reg` back-pointer is uncounted, so the
+    /// registration's closing must clear it: without that, four consumers dereferenced freed
     /// memory (`#GP`/`#PF` in `signal_pending_op`, about one boot in four under load).
     #[test]
     fn dropping_a_registration_clears_its_endpoints_back_pointer() {
         init_global_heap();
-        let ep_ref = endpoint();
-        let ep = ep_ref.as_object().as_ptr();
-
-        // Hold the endpoint independently of the registration — this is what a server
-        // handle or a parked waiter does, and it is the case that used to dangle.
-        // SAFETY: `ep` is a live `IpcChannel`; the bump balances the adopted ref.
-        let keepalive = unsafe {
-            (*(ep as *const crate::object::header::KObjectHeader)).bump();
-            ObjectRef::from_raw(ep)
-        };
-
-        let r = UserspaceServerReg::try_new(ep_ref).unwrap();
-        let reg_ref = ObjectRef::new(r);
-        // SAFETY: both objects are live and this test is single-threaded.
-        unsafe { IpcChannel::set_us_reg(ep, reg_ref.as_ptr()) };
-        // SAFETY: the test's references keep `ep` live, and it is single-threaded.
-        assert_eq!(unsafe { IpcChannel::us_reg_of(ep) }, reg_ref.as_ptr());
-
-        drop(reg_ref); // last registration reference; the endpoint survives
-
-        // SAFETY: `ep` is still live, pinned by `keepalive`.
+        let tok = SchedToken::for_test();
+        // Held apart from the registration, as a server handle or a parked waiter holds it.
+        let ep = endpoint();
+        let reg = UserspaceServerReg::try_new(ep.clone()).unwrap();
+        assert!(crate::sched::us_server_attach(&reg).is_none());
+        assert_eq!(ep.us_reg_addr(&tok), reg.as_ptr().cast_const());
+        drop(reg); // the last registration reference; the endpoint survives
         assert!(
-            // SAFETY: the test's references keep `ep` live, and it is single-threaded.
-            unsafe { IpcChannel::us_reg_of(ep) }.is_null(),
+            ep.us_reg_addr(&tok).is_null(),
             "a dying registration must clear its endpoint's back-pointer, or every \
              consumer of it is reading freed memory"
         );
-        drop(keepalive);
     }
 
     /// A reply holds the registration it was routed to: the last binding, dropped on another CPU
@@ -564,11 +471,8 @@ mod tests {
     #[test]
     fn a_reply_holds_the_registration_it_found() {
         init_global_heap();
-        let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-        let k_ref = Ref::new(k);
-        let s_ref = Ref::new(s);
-        let r = UserspaceServerReg::try_new(k_ref).unwrap();
-        let binding = Ref::new(r);
+        let (k, s_ref) = IpcChannel::try_new_pair(4).unwrap();
+        let binding = UserspaceServerReg::try_new(k).unwrap();
         assert!(crate::sched::us_server_attach(&binding).is_none());
 
         let reply = crate::sched::us_forward_reg_for_send(&s_ref).expect("routed to the registration");
@@ -589,56 +493,40 @@ mod tests {
     #[test]
     fn a_dying_registration_leaves_a_successors_back_pointer_alone() {
         init_global_heap();
-        let ep_ref = endpoint();
-        let ep = ep_ref.as_object().as_ptr();
-        // SAFETY: `ep` is live; the bump balances the adopted ref.
-        let keepalive = unsafe {
-            (*(ep as *const crate::object::header::KObjectHeader)).bump();
-            ObjectRef::from_raw(ep)
-        };
-
-        let old = UserspaceServerReg::try_new(ep_ref).unwrap();
-        let old_ref = ObjectRef::new(old);
-        let successor = 0xdead_beef_usize as *mut ();
-        // SAFETY: single-threaded test; the value is only compared, never dereferenced.
-        unsafe { IpcChannel::set_us_reg(ep, successor) };
-
-        drop(old_ref);
-
-        // SAFETY: `ep` is still live, pinned by `keepalive`.
+        let mut tok = SchedToken::for_test();
+        let ep = endpoint();
+        let old = UserspaceServerReg::try_new(ep.clone()).unwrap();
+        assert!(crate::sched::us_server_attach(&old).is_none());
+        let successor = UserspaceServerReg::try_new(ep.clone()).unwrap();
+        // SAFETY: kept in the endpoint's cell, and the successor's closing clears it there.
+        ep.set_us_reg(&mut tok, unsafe { Weak::new(successor.as_ptr()) });
+        drop(old);
         assert_eq!(
-            // SAFETY: the test's references keep `ep` live, and it is single-threaded.
-            unsafe { IpcChannel::us_reg_of(ep) },
-            successor,
+            ep.us_reg_addr(&tok),
+            successor.as_ptr().cast_const(),
             "the predecessor cleared a pointer that no longer named it"
         );
-        // Leave the endpoint without a stale pointer for the drop below.
-        // SAFETY: as above.
-        unsafe { IpcChannel::set_us_reg(ep, core::ptr::null_mut()) };
-        drop(keepalive);
+        drop(successor);
+        assert!(ep.us_reg_addr(&tok).is_null(), "and the successor's own closing clears it");
     }
 
     #[test]
     fn begin_assigns_monotonic_ids_and_caps_at_capacity() {
         init_global_heap();
         let r = reg();
+        let tok = &mut SchedToken::for_test();
         let po = make_po();
         for expect in 1..=US_PENDING_MAX as u64 {
-            // SAFETY: `r` pins the registration, and the test is single-threaded.
-            let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") };
+            let id = r.begin(tok, &po, Rights::MAP_READ, b"sys/gen");
             assert_eq!(id, Some(expect));
         }
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        assert_eq!(unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") }, None);
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let taken = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) };
+        assert_eq!(r.begin(tok, &po, Rights::MAP_READ, b"sys/gen"), None);
+        let taken = r.take_pending_matching(tok, 1);
         assert_eq!(taken.as_ref().map(|p| p.request_id), Some(1));
         drop(taken);
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") };
+        let id = r.begin(tok, &po, Rights::MAP_READ, b"sys/gen");
         assert_eq!(id, Some(US_PENDING_MAX as u64 + 1));
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        while unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.is_some() {}
+        drop(r.take_outstanding(tok));
         drop(po);
         drop(r);
     }
@@ -650,22 +538,18 @@ mod tests {
     fn a_pending_lookup_keeps_its_operation_for_a_continuation() {
         init_global_heap();
         let r = reg();
+        let tok = &mut SchedToken::for_test();
         let po = make_po();
         let fwd = Forward { op: ForwardOp::Rename { flags: 1 }, dest: b"fs/l1/b", depth: 2 };
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let id =
-            unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, Rights::MAP_READ, b"fs/l1/a", fwd) }.unwrap();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let pl = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
+        let id = r.begin_forward(tok, &po, Rights::MAP_READ, b"fs/l1/a", fwd).unwrap();
+        let pl = r.take_pending_matching(tok, id).unwrap();
         assert_eq!((pl.op, pl.dest(), pl.depth), (ForwardOp::Rename { flags: 1 }, Some(&b"fs/l1/b"[..]), 2));
         assert_eq!(pl.suffix(), Some(&b"fs/l1/a"[..]));
         drop(pl);
         let long = [b'a'; LOOKUP_SUFFIX_MAX + 1];
         let fwd = Forward { op: ForwardOp::Rename { flags: 0 }, dest: &long, depth: 0 };
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin_forward(r.as_ptr(), &po, Rights::MAP_READ, b"a", fwd) }.unwrap();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let pl = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
+        let id = r.begin_forward(tok, &po, Rights::MAP_READ, b"a", fwd).unwrap();
+        let pl = r.take_pending_matching(tok, id).unwrap();
         assert_eq!(pl.dest(), None, "an overlong destination is absent, not truncated");
         drop(pl);
         drop(po);
@@ -676,17 +560,14 @@ mod tests {
     fn concurrent_lookups_correlate_independently() {
         init_global_heap();
         let r = reg();
+        let tok = &mut SchedToken::for_test();
         let po = make_po();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let a = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"one") }.unwrap();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let b = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"two") }.unwrap();
+        let a = r.begin(tok, &po, Rights::MAP_READ, b"one").unwrap();
+        let b = r.begin(tok, &po, Rights::MAP_READ, b"two").unwrap();
         assert_ne!(a, b);
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let tb = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), b) }.unwrap();
+        let tb = r.take_pending_matching(tok, b).unwrap();
         assert_eq!(tb.suffix(), Some(&b"two"[..]));
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let ta = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), a) }.unwrap();
+        let ta = r.take_pending_matching(tok, a).unwrap();
         assert_eq!(ta.suffix(), Some(&b"one"[..]));
         drop(tb);
         drop(ta);
@@ -698,17 +579,14 @@ mod tests {
     fn take_matching_correlates_by_request_id() {
         init_global_heap();
         let r = reg();
+        let tok = &mut SchedToken::for_test();
         let po = make_po();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") }.unwrap();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        assert!(unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id ^ 0xFF) }.is_none());
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let taken = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
+        let id = r.begin(tok, &po, Rights::MAP_READ, b"sys/gen").unwrap();
+        assert!(r.take_pending_matching(tok, id ^ 0xFF).is_none());
+        let taken = r.take_pending_matching(tok, id).unwrap();
         assert_eq!(taken.request_id, id);
         assert_eq!(taken.requested, Rights::MAP_READ);
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        assert!(unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.is_none());
+        assert!(r.take_pending_matching(tok, id).is_none());
         drop(taken);
         drop(po);
         drop(r);
@@ -725,11 +603,10 @@ mod tests {
     fn begin_records_the_lookup_suffix() {
         init_global_heap();
         let r = reg();
+        let tok = &mut SchedToken::for_test();
         let po = make_po();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"a/b/c") };
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let taken = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.unwrap();
+        let id = r.begin(tok, &po, Rights::MAP_READ, b"a/b/c").unwrap();
+        let taken = r.take_pending_matching(tok, id).unwrap();
         assert_eq!(taken.suffix(), Some(&b"a/b/c"[..]));
         drop(taken);
         drop(po);
@@ -740,23 +617,19 @@ mod tests {
     fn fill_slot_is_independent_and_correlates_by_id() {
         init_global_heap();
         let r = reg();
+        let tok = &mut SchedToken::for_test();
         let po = make_po();
         let fo = file_obj();
         let frame = PhysAddr::new(0x5000);
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let lid = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"x") }.unwrap();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let fid = unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 2) }.unwrap();
+        let lid = r.begin(tok, &po, Rights::MAP_READ, b"x").unwrap();
+        let fid = r.begin_fill(tok, &po, &fo, frame, 2).unwrap();
         assert_ne!(lid, fid); // distinct request ids
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        assert!(unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid ^ 0xFF) }.is_none());
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let pf = unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid) }.unwrap();
+        assert!(r.take_pending_fill_matching(tok, fid ^ 0xFF).is_none());
+        let pf = r.take_pending_fill_matching(tok, fid).unwrap();
         assert_eq!(pf.request_id, fid);
         assert_eq!(pf.frame, frame);
         assert_eq!(pf.index, 2);
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        let pl = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.unwrap();
+        let pl = r.take_pending_matching(tok, lid).unwrap();
         assert_eq!(pl.request_id, lid);
         drop(pf);
         drop(pl);
@@ -784,13 +657,73 @@ mod tests {
         init_global_heap();
         test_probe::reset();
         let r = reg();
+        let tok = &mut SchedToken::for_test();
         let po = make_po();
-        // SAFETY: `r` pins the registration, and the test is single-threaded.
-        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, Rights::MAP_READ, b"sys/gen") };
+        r.begin(tok, &po, Rights::MAP_READ, b"sys/gen");
         assert_eq!(test_probe::pending_op_destroys(), 0);
         drop(r); // releases the pending entry's PO clone
         assert_eq!(test_probe::pending_op_destroys(), 0, "creation ref still held by `po`");
         drop(po); // last ref → PO destroyed
         assert_eq!(test_probe::pending_op_destroys(), 1);
+    }
+
+    /// A file `reg`'s server names `id`, as a `FILE_BLOCKS` reply makes it.
+    fn cached_file(reg: &Ref<UserspaceServerReg>, id: u64) -> Ref<FileObject> {
+        use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
+        use crate::object::{DeviceNode, Producer};
+        let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
+        let producer =
+            Producer::FsServerBlocks { device: Ref::new(dev), block_size: 4096, reg: reg.clone(), file_id: id };
+        Ref::new(FileObject::try_new(4096, producer).unwrap())
+    }
+
+    /// `f`'s count taken to zero with its closing yet to run, as another CPU dropping the last
+    /// reference leaves it; the test leaks the object, so nothing is freed.
+    fn mid_teardown(f: Ref<FileObject>) {
+        let (obj, _) = f.erase().into_raw();
+        // SAFETY: the object `f` held, whole, and never freed here.
+        let header = unsafe { &*obj.cast::<crate::object::header::KObjectHeader>() };
+        assert!(header.release(), "the test's was the last reference");
+    }
+
+    /// **An entry whose object is mid-teardown is replaced** by the next object for its file, which
+    /// the dying one's closing, looking for its own address, leaves.
+    #[test]
+    fn a_mid_teardown_entry_is_replaced_by_the_next_object_for_its_file() {
+        init_global_heap();
+        let r = reg();
+        let dying = cached_file(&r, 7);
+        assert!(r.cache_get_or_insert(&dying).unwrap().is_none());
+        mid_teardown(dying);
+        let next = cached_file(&r, 7);
+        assert!(r.cache_get_or_insert(&next).unwrap().is_none(), "entered in its place");
+        let found = r.cache_get_or_insert(&cached_file(&r, 7)).unwrap();
+        assert_eq!(found.as_ref().map(Ref::as_ptr), Some(next.as_ptr()), "the entry names it");
+    }
+
+    /// **`File::Forget` of a file whose object is mid-teardown answers at once** and takes its
+    /// entry out: nothing of it is in flight, since an IRP pins its object.
+    #[test]
+    fn forgetting_a_mid_teardown_file_takes_its_entry_out() {
+        init_global_heap();
+        let r = reg();
+        let dying = cached_file(&r, 7);
+        assert!(r.cache_get_or_insert(&dying).unwrap().is_none());
+        mid_teardown(dying);
+        assert!(matches!(r.forget_file(7, &make_po()), Forgotten::Now));
+        assert_eq!(r.cached_files(), 0);
+    }
+
+    /// **Only an object this registration produces is cached here**: an object's closing takes its
+    /// entry out of the cache its producer names, so another's would outlive it.
+    #[test]
+    fn an_object_another_registration_produces_is_not_cached_here() {
+        init_global_heap();
+        let (mine, theirs) = (reg(), reg());
+        let stub = Ref::new(FileObject::try_new(4096, crate::object::Producer::Stub { base: 0 }).unwrap());
+        for f in [stub, cached_file(&theirs, 9)] {
+            assert!(mine.cache_get_or_insert(&f).unwrap().is_none());
+        }
+        assert_eq!(mine.cached_files(), 0);
     }
 }
