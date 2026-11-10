@@ -443,6 +443,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   and the 12 per-type Send/Sync claims. Depends on: kobj-o1 for the `&T` receiver (otherwise the
   liveness half stays `unsafe`). ownership/soundness/concurrency/opportunities. Value high, effort
   large. **Plan**, in P1.
+  Partly done in `01170e32`: the six objects SCHED mutates keep that state in a `SchedCell`,
+  borrowed with the token only the held lock keeps, and their accessors are safe methods; their
+  12 `Send`/`Sync` claims go. `Thread`'s half is J.7's.
 
 - [x] **kobj-o4** encapsulate: host tests and Miri cannot see use-after-free of kernel objects.
   The kernel slab sits over a leaked 16 MiB host `Vec`, so a freed object is still inside a live
@@ -571,6 +574,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   without holding what the free path waits for, the shape of kobj-d1. Depends on: kobj-o1, and the
   kobj-d1 fix for the handle-table instance. opportunities. Value medium, effort medium.
   **Plan**, in P1.
+  Partly done in `01170e32`: `IpcChannel.peer`, `.us_reg` and the file cache's entries are a
+  `Weak<T>`, made under the contract that the target's closing clears it under the lock it is kept
+  behind. The handle table's is kobj-d1's.
 
 - [ ] **kobj-o11** encapsulate: frame contents are reached by raw HHDM arithmetic, `(frame.as_u64() +
   heap::hhdm_offset()) as *mut u8`, each site with its own "owned, mapped, unaliased" SAFETY claim,
@@ -867,7 +873,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   **Fix**, as kobj-d11.
   Fixed in `f34e8a4f`, as kobj-d11.
 
-- [ ] **sched-d11** `kernel/src/object/ipc_channel.rs:629` — `IpcChannel::drop`, `Timer::drop`
+- [x] **sched-d11** `kernel/src/object/ipc_channel.rs:629` — `IpcChannel::drop`, `Timer::drop`
   (`timer.rs:221`) and `UserspaceServerReg::drop` (`userspace_server.rs:489`) run with a live
   `&mut self` (Box retag, protected Drop argument) until their closing hook acquires SCHED. Other
   CPUs still reach the object through uncounted pointers and mutate it under SCHED: a send through
@@ -883,6 +889,11 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   not exist", the peer tag invalidated by the Unique retag at `kbox.rs:116`. Under Tree Borrows it
   reports "Data race detected between (1) non-atomic write ... ipc_channel.rs:149 self.len += 1 and
   (2) retag read of type IpcChannel ... drop_in_place". concurrency. Low. **Plan**, in P1.
+  Done in `01170e32`: `dispatch_destroy` runs the type's `KObject::closing` on the raw pointer
+  before it rebuilds the box: an endpoint's, a timer's and a registration's, and a `FileObject`'s
+  cache removal, which had the same shape. The test above, as
+  `an_endpoint_closing_while_its_peer_sends_into_it_is_borrowed_by_neither`, fails under both
+  models on `main` and passes here.
 
 - [x] **sched-d12** `kernel/src/object/ipc_channel.rs:283` — `IpcChannel::try_new_pair` takes each
   peer pointer from a shared borrow (`&*b as *const Self`), then retags the box Unique through
@@ -976,6 +987,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   sched-d10; it removes most of sched's 162 unsafe blocks of this kind. Depends on: nothing for the
   lock half; sched-o2 for the liveness half. abi, ownership, soundness, concurrency, opportunities.
   Value high, effort large. **Plan**, as kobj-o3, in P1.
+  Partly done in `01170e32`, as kobj-o3; `Thread`'s split is J.7's.
 
 - [x] **sched-o2** encapsulate: scheduler entry points take a type-erased `*mut ()` (and
   `wait_on`/`wait_on_io` take `&[usize]`) whose kind and liveness the caller promises, though nearly
@@ -1085,7 +1097,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   one `wake_all`, and `Thread::wait_signaled` returns a wait's slots by value. The tests holding
   the wake paths pass before and after.
 
-- [ ] **sched-o7** encapsulate: uncounted back-pointers (`IpcChannel.peer`, `IpcChannel.us_reg`) that
+- [x] **sched-o7** encapsulate: uncounted back-pointers (`IpcChannel.peer`, `IpcChannel.us_reg`) that
   the target's Drop clears under SCHED are followed raw, and `ipc_endpoint_closing` reads a magic
   word through a possibly stale `us_reg` (`is_live`) as a defence — 19 sites
   (`grep -rnoE 'IpcChannel::(peer_of|clear_peer|us_reg_of|set_us_reg)\(|UserspaceServerReg::is_live\(' kernel/src/sched.rs kernel/src/sched/*.rs`
@@ -1099,6 +1111,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   crash happened here before); it also makes the `is_live` read of possibly freed memory
   unnecessary, and a single `attach` that refuses when set would hold sched-d7. Depends on: sched-o1
   (the token). opportunities. Value medium, effort medium. **Plan**, as kobj-o10, in P1.
+  Done in `01170e32`: `peer` and `us_reg` are `Weak`s in the endpoint's `SchedCell`, followed with the
+  token by `sched::follow`, which lends it back with the target; `is_live` goes.
 
 - [ ] **sched-o8** narrow: under SCHED, code clones an owned ObjectRef only to read through it
   (`th.process_ref()`) and argues at each site that dropping the clone "is never the last

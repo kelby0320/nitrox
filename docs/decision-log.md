@@ -37984,3 +37984,25 @@ Part J's fifth sub-part, `typed-layers.md` § J.5, built on `pre-phase-7/part-j5
   thread must still wait out its fill.
 - `unsafe` blocks fall from 915 to 829, `unsafe fn`s from 328 to 299.
 
+## 2026-11-10 — Before Phase 7, J.6: what SCHED guards, as a type
+
+Part J's sixth sub-part, `typed-layers.md` § J.6, built on `pre-phase-7/part-j6-sched-cell`.
+
+- **The state SCHED guards is a `SchedCell`**, borrowed only with the `SchedToken` the scheduler's
+  state keeps: one interior at a time, never without the lock. The six objects SCHED mutates keep
+  theirs in one, their raw accessors are safe methods, and their `Send`/`Sync` claims go.
+- **An uncounted pointer between objects is a `Weak<T>`**, made under the contract that its
+  target's closing clears it under the lock it is kept behind: an endpoint's peer and
+  registration, and the file cache's entries. `sched::follow` reads one out of a cell and lends the
+  token back with the target, where the survey had the target borrow the token, which would forbid
+  borrowing the target's own cell. `is_live`, which read memory that may be freed, goes.
+- **A closing runs before the box is rebuilt** (sched-d11): `KObject::closing`, which
+  `dispatch_destroy` calls on the raw pointer, so no `&mut` to an object is live while another CPU
+  still reaches it under SCHED or the file cache's lock. Its two-thread test failed under both Miri
+  models.
+- **What stays raw**: the deadline heap's targets, formed in the tick under the closing's
+  argument, `complete_pending_op_at`, and `Thread`, whose split is J.7's.
+- **What a closing collects is references**: a registration's outstanding requests, taken whole
+  (two 256-byte buffers an entry), overflowed the debug kernel's 16 KiB stack at every boot.
+- `unsafe` blocks fall from 829 to 686, `unsafe fn`s from 299 to 233, `unsafe impl`s from 65 to 57.
+
