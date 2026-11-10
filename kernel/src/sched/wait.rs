@@ -5,15 +5,14 @@ use crate::syscall::error::{KError, SysResult};
 
 /// Move a `Blocked` thread from `blocked` to `ready` (state `Ready`). Caller holds
 /// `SCHED`. Returns `false` (no-op) if `thread` is not in `blocked` — the backstop for a
-/// second waker after the wake-CAS already claimed it. The `ObjectRef` moves
-/// `blocked`→`ready` with no refcount change.
-pub(super) fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
-    let Some(i) = g.blocked.iter().position(|r| r.as_ptr() == thread) else {
+/// second waker after the wake-CAS already claimed it. The reference moves `blocked`→`ready`
+/// with no refcount change. `thread` is only compared, never followed.
+pub(super) fn make_runnable(g: &mut SchedState, thread: *const Thread) -> bool {
+    let Some(i) = g.blocked.iter().position(|r| core::ptr::eq(&**r, thread)) else {
         return false;
     };
     let r = g.blocked.remove(i);
-    // SAFETY: `r` pins `thread`; `SCHED` held.
-    unsafe { Thread::set_state(thread, ThreadState::Ready) };
+    r.set_state(&mut g.tok, ThreadState::Ready);
     // Re-home onto its CPU (a full home falls back to the least-loaded permitted queue with
     // room).
     place_woken(g, r, "wake placement (every queue the woken thread may go to)");
@@ -77,11 +76,11 @@ fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> Wai
     let me_ptr;
     {
         let mut g = SCHED.lock();
-        me_ptr = g.cur_ref().as_ref().expect("current set when a thread runs").as_ptr();
+        let (me, tok) = g.running();
+        me_ptr = addr(me);
         // Under the hold `end_siblings` marks in: a thread marked before this blocks nowhere,
         // and one marked after is in `blocked`, where the marking wakes it.
-        // SAFETY: live Thread (current), `SCHED` held.
-        if heed_exit && unsafe { Thread::is_ending(me_ptr) } {
+        if heed_exit && me.is_ending(tok) {
             return WaitResult::Ended;
         }
 
@@ -105,8 +104,8 @@ fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> Wai
         // Register the wait set on the thread, then on each object, all under this one hold
         // so it is atomic w.r.t. any waker.
         let has_deadline = deadline_ns != u64::MAX;
-        // SAFETY: live Thread (current), `SCHED` held.
-        unsafe { Thread::wait_register(me_ptr, objs, has_deadline) };
+        let (me, tok) = g.running();
+        me.wait_register(tok, objs, has_deadline);
         let mut registered = 0usize;
         let mut failed = false;
         for o in refs {
@@ -125,11 +124,11 @@ fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> Wai
         }
         if failed {
             // Unwind the partial registration and bail without blocking.
+            let (me, tok) = g.running();
             for o in &refs[..registered] {
-                obj_remove_waiter(&mut g.tok, o, me_ptr);
+                obj_remove_waiter(tok, o, me_ptr);
             }
-            // SAFETY: live Thread, `SCHED` held.
-            unsafe { Thread::wait_clear(me_ptr) };
+            me.wait_clear(tok);
             return WaitResult::OutOfMemory;
         }
 
@@ -144,17 +143,18 @@ fn wait(refs: &[&ObjectRef], deadline_ns: u64, now: u64, heed_exit: bool) -> Wai
     let signaled;
     {
         let mut g = SCHED.lock();
-        // SAFETY: live Thread (we run on it), `SCHED` held.
-        let bits = unsafe { Thread::wait_signaled(me_ptr) };
+        // This CPU's `current` is the thread that blocked: it runs on its own stack.
+        let (me, tok) = g.running();
+        debug_assert_eq!(addr(me), me_ptr);
+        let bits = me.wait_signaled(tok);
         for o in refs {
-            obj_remove_waiter(&mut g.tok, o, me_ptr);
+            obj_remove_waiter(tok, o, me_ptr);
         }
-        // SAFETY: live Thread, `SCHED` held.
-        if unsafe { Thread::wait_has_deadline(me_ptr) } {
+        let has_deadline = me.wait_has_deadline(tok);
+        me.wait_clear(tok);
+        if has_deadline {
             deadline::remove(&mut g.deadlines, deadline::Target::Thread(me_ptr as usize));
         }
-        // SAFETY: live Thread, `SCHED` held.
-        unsafe { Thread::wait_clear(me_ptr) };
         signaled = bits.contains(&true).then_some(bits);
     }
     match signaled {

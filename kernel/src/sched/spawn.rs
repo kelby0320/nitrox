@@ -12,7 +12,7 @@ const REAPER_TID: u32 = u32::MAX - 1;
 
 /// A list a thread can be on — a run queue, the blocked or suspended list, a reap list — reserved
 /// to hold [`MAX_THREADS`]: every list is made here, so the boot's reserves are the tests'.
-pub(super) fn thread_list() -> Result<Reserved<ObjectRef>, AllocError> {
+pub(super) fn thread_list() -> Result<Reserved<Ref<Thread>>, AllocError> {
     Reserved::with_capacity(MAX_THREADS)
 }
 
@@ -29,21 +29,18 @@ pub fn init() -> Result<(), AllocError> {
     let (ready, blocked, suspended, reap) = (thread_list()?, thread_list()?, thread_list()?, thread_list()?);
     let deadlines = Reserved::with_capacity(deadline::HEAP_RESERVE)?;
     let deferred_drops = Reserved::with_capacity(DEFERRED_DROP_RESERVE)?;
-    let boot = Thread::try_new_boot(0, 0)?;
-    let boot_ref = into_objref(boot);
+    let boot_ref = Ref::new(Thread::try_new_boot(0, 0)?);
 
     // The idle thread: a kernel thread with its own stack that just halts. Built outside the
     // lock (it allocates a stack). Never enqueued or reaped.
-    let idle = Thread::try_new_runnable(IDLE_TID, 0, idle_body, 0)?;
-    let idle_ref = into_objref(idle);
+    let idle_ref = Ref::new(Thread::try_new_runnable(IDLE_TID, 0, idle_body, 0)?);
     let idle_addr = idle_ref.as_ptr() as usize;
 
     // The reaper: **one** for the machine. It closes handle tables, which are keyed on pid
     // and touch no thread stack, so any CPU may do it (the per-CPU `reap` list is a
     // different job — see `reaper_body`). Allocated outside the lock; it starts runnable and
     // parks itself when it finds nothing to do.
-    let reaper = Thread::try_new_runnable(REAPER_TID, 0, reaper_body, 0)?;
-    let reaper_ref = into_objref(reaper);
+    let reaper_ref = Ref::new(Thread::try_new_runnable(REAPER_TID, 0, reaper_body, 0)?);
     let ended_pids = Reserved::with_capacity(ENDED_PIDS_RESERVE)?;
 
     let mut g = SCHED.lock();
@@ -91,10 +88,8 @@ pub fn ap_init() -> Result<(), AllocError> {
         g.next_tid = g.next_tid.wrapping_add(1);
         t
     };
-    let boot = Thread::try_new_boot(boot_tid, 0)?;
-    let boot_ref = into_objref(boot);
-    let idle = Thread::try_new_runnable(IDLE_TID, 0, idle_body, 0)?;
-    let idle_ref = into_objref(idle);
+    let boot_ref = Ref::new(Thread::try_new_boot(boot_tid, 0)?);
+    let idle_ref = Ref::new(Thread::try_new_runnable(IDLE_TID, 0, idle_body, 0)?);
     let idle_addr = idle_ref.as_ptr() as usize;
     // Reserved outside the lock so neither `finish_exit`'s reap push nor a placement onto
     // this CPU allocates under `SCHED`.
@@ -125,9 +120,7 @@ pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
 /// next placement / steal / wake; a thread running on a now-excluded CPU finishes its slice
 /// there.
 pub fn set_thread_affinity(thread: &Ref<Thread>, mask: u8) {
-    let _g = SCHED.lock();
-    // SAFETY: the borrow pins the thread; `SCHED` held.
-    unsafe { Thread::set_cpu_mask(thread.as_ptr().cast(), mask) };
+    thread.set_cpu_mask(&mut SCHED.lock().tok, mask);
 }
 
 /// As [`spawn`] but pinned to the CPUs in `cpu_mask` (bit `c` ⇒ may run on CPU `c`).
@@ -164,28 +157,22 @@ fn spawn_inner(
         t
     };
     // Heavy work outside the lock.
-    let thread = Thread::try_new_runnable(tid, 0, entry, arg)?;
-    let r = into_objref(thread);
-    let obj = r.as_ptr();
-    // SAFETY: `obj` is the new thread, exclusively owned via `r` and not yet
-    // enqueued — no other context can observe it, so setting its scheduling
-    // parameters here (before the lock) is sound.
-    unsafe {
-        Thread::set_sched(obj, class, rt_priority, nice);
-        Thread::set_cpu_mask(obj, cpu_mask);
-    }
-
-    enqueue(r, |g, r| place_thread(g, r, false)).map(|()| tid)
+    let mut thread = Thread::try_new_runnable(tid, 0, entry, arg)?;
+    thread.set_policy(class, rt_priority, nice, cpu_mask);
+    enqueue(Ref::new(thread), |g, r| place_thread(g, r, false)).map(|()| tid)
 }
 
 /// Place `r`, a thread just made, with `place`, which refuses rather than grow under the rank-1
 /// lock: a refused thread drops with the bag, its last reference, freeing its kernel stack off the
 /// lock.
-fn enqueue(r: ObjectRef, place: fn(&mut SchedState, ObjectRef) -> Result<(), ObjectRef>) -> Result<(), AllocError> {
+fn enqueue(
+    r: Ref<Thread>,
+    place: fn(&mut SchedState, Ref<Thread>) -> Result<(), Ref<Thread>>,
+) -> Result<(), AllocError> {
     let mut bag = Deferred::<1>::new();
     let mut g = bag.lock();
     if let Err(refused) = place(&mut g, r) {
-        g.defer(refused);
+        g.defer(refused.erase());
         return Err(AllocError);
     }
     Ok(())
@@ -230,33 +217,21 @@ pub fn make_user_sched(
         t
     };
     // Heavy work outside the lock (consumes `process` on success).
-    let thread = Thread::try_new_user(tid, process, entry, user_sp, boot_args)?;
-    let r = Ref::new(thread);
-    let obj = r.as_ptr().cast::<()>();
-    // SAFETY: `obj` is the new thread, exclusively owned via `r` and not yet enqueued —
-    // no other context can observe it, so setting its scheduling parameters here
-    // (before the enqueue lock) is sound. Mirrors `spawn_inner`.
-    unsafe {
-        Thread::set_sched(obj, class, rt_priority, nice);
-        Thread::set_cpu_mask(obj, cpu_mask);
-    }
-    Ok(r)
+    let mut thread = Thread::try_new_user(tid, process, entry, user_sp, boot_args)?;
+    thread.set_policy(class, rt_priority, nice, cpu_mask);
+    Ok(Ref::new(thread))
 }
 
 /// Enqueue a thread [`make_user_sched`] made.
 pub fn start_user(r: Ref<Thread>) -> Result<(), AllocError> {
-    enqueue(r.erase(), place_spawned)
+    enqueue(r, place_spawned)
 }
 
 /// Place `r`, a thread just made for a process, marking it first if the process has begun to exit:
 /// a thread placed after `exit_process` marked the others is marked here instead.
-pub(super) fn place_spawned(g: &mut SchedState, r: ObjectRef) -> Result<(), ObjectRef> {
-    // SAFETY: `r` pins the new thread, and it its `Process`; `SCHED` held.
-    let ending = unsafe { Thread::process_of(r.as_ptr()) }
-        .is_some_and(|p| unsafe { &*(p as *const crate::object::Process) }.ending().is_some());
-    if ending {
-        // SAFETY: as above.
-        unsafe { Thread::set_ending(r.as_ptr()) };
+pub(super) fn place_spawned(g: &mut SchedState, r: Ref<Thread>) -> Result<(), Ref<Thread>> {
+    if r.process().is_some_and(|p| p.ending().is_some()) {
+        r.set_ending(&mut g.tok);
     }
     place_thread(g, r, false)
 }

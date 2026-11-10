@@ -16,7 +16,7 @@ use crate::object::{DeviceNode, IpcChannel, MemoryObject, Namespace, Thread};
 
 /// Run `f` as a thread of `pid`, every install from the `n`th on refused.
 fn refusing_from<R>(pid: u32, n: Option<usize>, f: impl FnOnce() -> R) -> R {
-    let me = ObjectRef::new(Thread::try_new(1, pid).unwrap());
+    let me = Ref::new(Thread::try_new(1, pid).unwrap());
     fail_installs_after(n);
     let r = crate::sched::with_current(me, f);
     fail_installs_after(None);

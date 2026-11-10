@@ -368,6 +368,7 @@ pub(crate) fn ipc_endpoint_closing(endpoint: &IpcChannel, _: Closing) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libkern::KBox;
     use crate::mm::test_support::init_global_heap;
     use crate::object::header::test_probe;
 

@@ -43,10 +43,10 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
         match top.target {
             deadline::Target::Thread(th) => {
                 // A `sys_wait` deadline: wake the waiting thread directly.
-                let th = th as *mut ();
-                // SAFETY: a heaped thread-deadline names a thread blocked in
-                // `wait_on`, pinned in `blocked`; `SCHED` held.
-                if unsafe { Thread::wait_try_wake(th) } {
+                // SAFETY: a heaped thread-deadline names a thread in `wait_on`, which a scheduler
+                // list pins until it takes the entry out under `SCHED`, which is held.
+                let th = unsafe { &*(th as *const Thread) };
+                if th.wait_try_wake() {
                     make_runnable(g, th);
                 }
             }
