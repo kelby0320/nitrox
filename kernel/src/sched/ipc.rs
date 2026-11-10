@@ -187,7 +187,7 @@ pub fn us_forward_reg_for_send(send_endpoint: &IpcChannel) -> Option<Ref<Userspa
 /// `PeerClosed`, so its waiters wake, and clear its endpoint's uncounted back-pointer to it, so
 /// nothing follows it once it is freed. Its closing, run before its box is rebuilt, with its
 /// endpoint still held. Takes `SCHED`, sound as references are released only outside it.
-pub(crate) fn us_reg_detach(reg: &UserspaceServerReg) {
+pub(crate) fn us_reg_detach(reg: &UserspaceServerReg, _: Closing) {
     let mut bag = Deferred::<ORPHANS_PER_REG>::new();
     let mut g = bag.lock();
     let outstanding = reg.take_outstanding(&mut g.tok);
@@ -331,25 +331,20 @@ pub fn ipc_recv_pop_into(
 /// forwarded requests a Userspace Server channel leaves, and fail the sends held on this
 /// endpoint. Its closing, run before its box is rebuilt; the endpoint's docs give the
 /// "references released only outside `SCHED`" invariant that makes taking the lock here sound.
-pub(crate) fn ipc_endpoint_closing(endpoint: &IpcChannel) {
-    let mut bag = Deferred::<{ 2 * ORPHANS_PER_REG + IpcChannel::MAX_PENDING_SENDS }>::new();
+pub(crate) fn ipc_endpoint_closing(endpoint: &IpcChannel, _: Closing) {
+    let mut bag = Deferred::<{ ORPHANS_PER_REG + IpcChannel::MAX_PENDING_SENDS }>::new();
     let mut g = bag.lock();
-    // A Userspace Server channel is losing its server: fail forwarded requests pending on
-    // the kernel-forwarding endpoint with `PeerClosed`, whether **this** endpoint is the
-    // kernel end or its **peer** is (server process died). An endpoint is shared by many
-    // bindings, so up to `US_PENDING_MAX` lookups may be in flight: drain *all*. A
-    // registration's closing clears this endpoint's pointer before the endpoint can close, so
-    // this one names a registration only if it outlived that.
-    let mine = endpoint.us_reg(&mut g.tok).map(|(reg, tok)| reg.take_outstanding(tok));
-    if let Some(mine) = mine {
-        fail_outstanding(&mut g, mine);
-    }
+    // A Userspace Server channel is losing its server, if the **peer** is the kernel end: fail the
+    // forwarded requests pending on its registration `PeerClosed`. An endpoint is shared by many
+    // bindings, so up to `US_PENDING_MAX` lookups may be in flight: drain *all*. This endpoint is
+    // never a kernel end itself: a registration holds its own, and its closing detaches it first.
     let peer = endpoint.peer(&mut g.tok).map(|(peer, tok)| {
         peer.clear_peer(tok);
         let waiters = peer.take_waiters(tok);
         let theirs = peer.us_reg(tok).map(|(reg, tok)| reg.take_outstanding(tok));
         (waiters, addr(peer), theirs)
     });
+    endpoint.clear_peer(&mut g.tok);
     if let Some((waiters, key, theirs)) = peer {
         wake_all(&mut g, waiters, key);
         if let Some(theirs) = theirs {
@@ -378,7 +373,7 @@ mod tests {
 
     fn pair() -> (Ref<IpcChannel>, Ref<IpcChannel>) {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        (Ref::new(a), Ref::new(b))
+        (a, b)
     }
 
     /// A pair whose first end is typed, for a registration to own.
@@ -415,7 +410,7 @@ mod tests {
     /// A registration over the kernel's end of a fresh pair, attached; and the server's end.
     fn served() -> (Ref<UserspaceServerReg>, Ref<IpcChannel>) {
         let (k, s) = kernel_end();
-        let reg = Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
+        let reg = UserspaceServerReg::try_new(k.clone()).unwrap();
         assert!(us_server_attach(&reg).is_none());
         (reg, s)
     }
@@ -460,7 +455,7 @@ mod tests {
     fn a_second_attach_of_an_endpoint_gets_the_first_registration() {
         init_global_heap();
         let (k, _server_end) = kernel_end();
-        let new_reg = || Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
+        let new_reg = || UserspaceServerReg::try_new(k.clone()).unwrap();
         let (first, second) = (new_reg(), new_reg());
         assert!(us_server_attach(&first).is_none());
         let shared = us_server_attach(&second).expect("the first registration");
@@ -515,6 +510,7 @@ mod tests {
             if closes {
                 drop(b);
                 assert!(!named(&held), "failed by its endpoint's close");
+                assert!(failed(&held), "its sender told so");
             } else {
                 let mut dst = KBox::<StoredMsg>::try_new_zeroed().unwrap();
                 let mut reclaimed = core::array::from_fn(|_| None);

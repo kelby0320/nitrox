@@ -818,7 +818,7 @@ pub fn sys_timer_create(flags: u64) -> SysResult {
     }
     let obj = TimerObject::try_new().map_err(|_| KError::OutOfMemory)?;
     let pid = crate::sched::current_owner_pid();
-    Ok(install(pid, ObjectRef::new(obj), timer_rights())?.bits() as isize)
+    Ok(install(pid, obj.erase(), timer_rights())?.bits() as isize)
 }
 
 /// `sys_timer_set(timer, deadline_ns, interval_ns)` — arm `timer` to fire at the absolute
@@ -909,8 +909,7 @@ pub fn sys_ns_bind(
     if let Ok(endpoint) = res_ok.object.clone().downcast::<IpcChannel>() {
         // Bind-mount semantics: an endpoint that already backs a registration is *shared*; a
         // rival would clobber the endpoint→reg reply-routing back-pointer and hijack replies.
-        let reg_box = UserspaceServerReg::try_new(endpoint).map_err(|_| KError::OutOfMemory)?;
-        let reg_ref = Ref::new(reg_box);
+        let reg_ref = UserspaceServerReg::try_new(endpoint).map_err(|_| KError::OutOfMemory)?;
         let reg = match crate::sched::us_server_attach(&reg_ref) {
             Some(existing) => existing,
             None => reg_ref,
@@ -1424,7 +1423,7 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
 
     let pid = crate::sched::current_owner_pid();
     let (a, b) = IpcChannel::try_new_pair(depth).map_err(|_| KError::OutOfMemory)?;
-    let (a, b) = (ObjectRef::new(a), ObjectRef::new(b));
+    let (a, b) = (a.erase(), b.erase());
     let rights = channel_endpoint_rights();
 
     // A failure at any step closes what was installed, so no endpoint leaks into a process that

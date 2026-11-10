@@ -183,7 +183,7 @@ impl UserspaceServerReg {
     /// Allocate a registration owning `endpoint` (the kernel's IPC endpoint), refcount one, with
     /// empty pending tables. The caller installs the back-pointer from `endpoint` to this
     /// object (under `SCHED`) and binds it as a `UserspaceServer` target.
-    pub fn try_new(endpoint: Ref<IpcChannel>) -> Result<KBox<Self>, AllocError> {
+    pub fn try_new(endpoint: Ref<IpcChannel>) -> Result<Ref<Self>, AllocError> {
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
@@ -195,18 +195,24 @@ impl UserspaceServerReg {
             }),
             files: SpinLock::new(LockRank::Registry, KVec::new()),
         })
+        .map(Ref::new)
     }
 
     // --- The file cache (its own lock; never under `SCHED`) --------------
 
-    /// **The one object for file `id`, or `obj` becomes it.** A live cached object is returned as
-    /// a new reference, `obj` left for the caller to drop outside this lock; otherwise `obj` is
-    /// entered under `id` (replacing a mid-teardown entry) and `Ok(None)` returned. `Err` only if
-    /// the index cannot grow. A forgotten entry is passed by: its file is freed or about to be.
-    pub fn cache_get_or_insert(&self, id: u64, obj: &Ref<FileObject>) -> Result<Option<Ref<FileObject>>, AllocError> {
+    /// **The one object for `obj`'s file, or `obj` becomes it.** A live cached object is returned
+    /// as a new reference, `obj` left for the caller to drop outside this lock; otherwise `obj` is
+    /// entered under its id (replacing a mid-teardown entry) and `Ok(None)` returned. An object
+    /// this registration does not cache, by its producer, is not entered and also answers
+    /// `Ok(None)`. `Err` only if the index cannot grow. A forgotten entry is passed by: its file
+    /// is freed or about to be.
+    pub fn cache_get_or_insert(&self, obj: &Ref<FileObject>) -> Result<Option<Ref<FileObject>>, AllocError> {
+        let Some((_, id)) = obj.cache_key().filter(|&(owner, _)| core::ptr::eq(owner, self)) else {
+            return Ok(None);
+        };
         let mut g = self.files.lock();
         // SAFETY: kept behind the files lock, which `obj`'s closing takes to remove its entry, by
-        // address, before the object is freed.
+        // address, before the object is freed: its producer names this registration.
         let weak = || unsafe { Weak::new(obj.as_ptr()) };
         if let Some(e) = g.iter_mut().find(|e| e.id == id && !e.forgotten) {
             if let Some(existing) = e.obj.upgrade() {
@@ -400,6 +406,15 @@ impl UserspaceServerReg {
     }
 }
 
+impl Drop for UserspaceServerReg {
+    /// Its closing, run first, failed and took out everything outstanding.
+    fn drop(&mut self) {
+        let inner = self.inner.get_mut();
+        let none = inner.pending.iter().all(Option::is_none) && inner.pending_fill.iter().all(Option::is_none);
+        debug_assert!(none, "UserspaceServerReg dropped with requests outstanding");
+    }
+}
+
 /// What a registration had outstanding, taken whole: every forwarded lookup's PO, and every
 /// fill's PO and file.
 pub(crate) struct Outstanding {
@@ -411,16 +426,14 @@ pub(crate) struct Outstanding {
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
-    use crate::object::ObjectRef;
     use crate::object::header::test_probe;
     use crate::object::{IpcChannel, PendingOperation};
 
     /// A live `IpcChannel` endpoint adopted into a `Ref`; its peer is dropped at once.
     fn endpoint() -> Ref<IpcChannel> {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        let a_ref = Ref::new(a);
-        drop(ObjectRef::new(b));
-        a_ref
+        drop(b);
+        a
     }
 
     fn make_po() -> Ref<PendingOperation> {
@@ -430,7 +443,7 @@ mod tests {
     fn reg() -> Ref<UserspaceServerReg> {
         let r = UserspaceServerReg::try_new(endpoint()).unwrap();
         assert!(r.magic_ok());
-        Ref::new(r)
+        r
     }
 
     /// An endpoint can outlive its registration, and its `us_reg` back-pointer is uncounted, so the
@@ -442,7 +455,7 @@ mod tests {
         let tok = SchedToken::for_test();
         // Held apart from the registration, as a server handle or a parked waiter holds it.
         let ep = endpoint();
-        let reg = Ref::new(UserspaceServerReg::try_new(ep.clone()).unwrap());
+        let reg = UserspaceServerReg::try_new(ep.clone()).unwrap();
         assert!(crate::sched::us_server_attach(&reg).is_none());
         assert_eq!(ep.us_reg_addr(&tok), reg.as_ptr().cast_const());
         drop(reg); // the last registration reference; the endpoint survives
@@ -458,11 +471,8 @@ mod tests {
     #[test]
     fn a_reply_holds_the_registration_it_found() {
         init_global_heap();
-        let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-        let k_ref = Ref::new(k);
-        let s_ref = Ref::new(s);
-        let r = UserspaceServerReg::try_new(k_ref).unwrap();
-        let binding = Ref::new(r);
+        let (k, s_ref) = IpcChannel::try_new_pair(4).unwrap();
+        let binding = UserspaceServerReg::try_new(k).unwrap();
         assert!(crate::sched::us_server_attach(&binding).is_none());
 
         let reply = crate::sched::us_forward_reg_for_send(&s_ref).expect("routed to the registration");
@@ -485,9 +495,9 @@ mod tests {
         init_global_heap();
         let mut tok = SchedToken::for_test();
         let ep = endpoint();
-        let old = Ref::new(UserspaceServerReg::try_new(ep.clone()).unwrap());
+        let old = UserspaceServerReg::try_new(ep.clone()).unwrap();
         assert!(crate::sched::us_server_attach(&old).is_none());
-        let successor = Ref::new(UserspaceServerReg::try_new(ep.clone()).unwrap());
+        let successor = UserspaceServerReg::try_new(ep.clone()).unwrap();
         // SAFETY: kept in the endpoint's cell, and the successor's closing clears it there.
         ep.set_us_reg(&mut tok, unsafe { Weak::new(successor.as_ptr()) });
         drop(old);
@@ -655,5 +665,65 @@ mod tests {
         assert_eq!(test_probe::pending_op_destroys(), 0, "creation ref still held by `po`");
         drop(po); // last ref → PO destroyed
         assert_eq!(test_probe::pending_op_destroys(), 1);
+    }
+
+    /// A file `reg`'s server names `id`, as a `FILE_BLOCKS` reply makes it.
+    fn cached_file(reg: &Ref<UserspaceServerReg>, id: u64) -> Ref<FileObject> {
+        use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
+        use crate::object::{DeviceNode, Producer};
+        let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
+        let producer =
+            Producer::FsServerBlocks { device: Ref::new(dev), block_size: 4096, reg: reg.clone(), file_id: id };
+        Ref::new(FileObject::try_new(4096, producer).unwrap())
+    }
+
+    /// `f`'s count taken to zero with its closing yet to run, as another CPU dropping the last
+    /// reference leaves it; the test leaks the object, so nothing is freed.
+    fn mid_teardown(f: Ref<FileObject>) {
+        let (obj, _) = f.erase().into_raw();
+        // SAFETY: the object `f` held, whole, and never freed here.
+        let header = unsafe { &*obj.cast::<crate::object::header::KObjectHeader>() };
+        assert!(header.release(), "the test's was the last reference");
+    }
+
+    /// **An entry whose object is mid-teardown is replaced** by the next object for its file, which
+    /// the dying one's closing, looking for its own address, leaves.
+    #[test]
+    fn a_mid_teardown_entry_is_replaced_by_the_next_object_for_its_file() {
+        init_global_heap();
+        let r = reg();
+        let dying = cached_file(&r, 7);
+        assert!(r.cache_get_or_insert(&dying).unwrap().is_none());
+        mid_teardown(dying);
+        let next = cached_file(&r, 7);
+        assert!(r.cache_get_or_insert(&next).unwrap().is_none(), "entered in its place");
+        let found = r.cache_get_or_insert(&cached_file(&r, 7)).unwrap();
+        assert_eq!(found.as_ref().map(Ref::as_ptr), Some(next.as_ptr()), "the entry names it");
+    }
+
+    /// **`File::Forget` of a file whose object is mid-teardown answers at once** and takes its
+    /// entry out: nothing of it is in flight, since an IRP pins its object.
+    #[test]
+    fn forgetting_a_mid_teardown_file_takes_its_entry_out() {
+        init_global_heap();
+        let r = reg();
+        let dying = cached_file(&r, 7);
+        assert!(r.cache_get_or_insert(&dying).unwrap().is_none());
+        mid_teardown(dying);
+        assert!(matches!(r.forget_file(7, &make_po()), Forgotten::Now));
+        assert_eq!(r.cached_files(), 0);
+    }
+
+    /// **Only an object this registration produces is cached here**: an object's closing takes its
+    /// entry out of the cache its producer names, so another's would outlive it.
+    #[test]
+    fn an_object_another_registration_produces_is_not_cached_here() {
+        init_global_heap();
+        let (mine, theirs) = (reg(), reg());
+        let stub = Ref::new(FileObject::try_new(4096, crate::object::Producer::Stub { base: 0 }).unwrap());
+        for f in [stub, cached_file(&theirs, 9)] {
+            assert!(mine.cache_get_or_insert(&f).unwrap().is_none());
+        }
+        assert_eq!(mine.cached_files(), 0);
     }
 }

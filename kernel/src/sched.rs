@@ -48,7 +48,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, Reserved};
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::mm::PhysAddr;
-use crate::object::header::{Ref, Shared, Weak};
+use crate::object::header::{Closing, Ref, Shared, Weak};
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 use crate::object::{
     BlockSendOutcome, FileObject, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,

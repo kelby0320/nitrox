@@ -174,7 +174,7 @@ fn every_kind_of_waitable_marks_its_slot_and_wakes_its_waiter() {
     init_global_heap();
     super::online_set::force(0b1);
     let (ep, peer) = IpcChannel::try_new_pair(1).unwrap();
-    let (ep, peer) = (ObjectRef::new(ep), Ref::new(peer));
+    let ep = ep.erase();
     let chan = ObjectRef::new(NotificationChannel::try_new().unwrap());
     let irq = ObjectRef::new(InterruptObject::try_new().unwrap());
     let (po, timer) = (po(), new_timer());
@@ -332,8 +332,8 @@ fn a_wait_on_one_object_more_than_it_holds_is_refused() {
 /// **An endpoint whose last reference goes while its peer sends into it is borrowed by neither**:
 /// the send, under `SCHED`, writes the closing endpoint's ring through the peer's back-pointer, so
 /// nothing may hold a `&mut` to that endpoint until its closing has taken `SCHED` and unlinked it.
+/// Only Miri sees such a `&mut`; natively, the endpoint's `Drop` asserts its closing ran first.
 #[test]
-#[cfg_attr(not(miri), ignore = "an aliasing check: only Miri can see it")]
 fn an_endpoint_closing_while_its_peer_sends_into_it_is_borrowed_by_neither() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -342,7 +342,7 @@ fn an_endpoint_closing_while_its_peer_sends_into_it_is_borrowed_by_neither() {
     unsafe impl<T> Send for Moved<T> {}
     init_global_heap();
     let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-    let (a, b) = (Ref::new(a), Moved(Ref::new(b)));
+    let b = Moved(b);
     let locked = Arc::new(AtomicBool::new(false));
     let sender = {
         let locked = locked.clone();
@@ -367,4 +367,31 @@ fn an_endpoint_closing_while_its_peer_sends_into_it_is_borrowed_by_neither() {
     let (b, sent) = sender.join().unwrap();
     assert!(matches!(sent, SendOutcome::Sent { .. } | SendOutcome::PeerClosed));
     drop(b);
+}
+
+/// **An endpoint's closing wakes the receivers blocked on its peer**, which then read `PeerClosed`.
+#[test]
+fn closing_an_endpoint_wakes_a_receiver_blocked_on_its_peer() {
+    init_global_heap();
+    let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+    let waiter = inert_ref(1);
+    let (t, on) = (waiter.as_ptr(), a.as_ptr().cast::<()>());
+    {
+        let mut g = SCHED.lock();
+        // SAFETY: the test's thread, pinned by its reference; `SCHED` held.
+        unsafe { Thread::wait_register(t, &[on as usize], false) };
+        a.add_waiter(&mut g.tok, t).unwrap();
+    }
+    drop(b);
+    let woken = {
+        let mut g = SCHED.lock();
+        // SAFETY: as above.
+        let marked = unsafe { Thread::wait_signaled(t) }[0];
+        a.remove_waiter(&mut g.tok, t);
+        // SAFETY: as above.
+        unsafe { Thread::wait_clear(t) };
+        marked
+    };
+    assert!(woken, "its receiver woken");
+    assert_eq!(ipc_recv_peek(&a), RecvState::PeerClosed);
 }

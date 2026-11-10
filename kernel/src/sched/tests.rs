@@ -562,7 +562,7 @@ mod plumbing;
 mod timers;
 
 fn new_timer() -> Ref<Timer> {
-    Ref::new(Timer::try_new().unwrap())
+    Timer::try_new().unwrap()
 }
 
 #[test]

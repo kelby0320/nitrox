@@ -52,12 +52,13 @@ pub unsafe trait KObject: Send + Sync + Sized {
     const TYPE: KObjectType;
 
     /// Run once the last reference has gone, before the box is rebuilt, so with no `&mut` to the
-    /// object live: unlink it from wherever other CPUs still reach it, uncounted, under a lock.
+    /// object live: unlink it from wherever other CPUs still reach it, uncounted, under a lock. A
+    /// type a box of which could be linked is made as a [`Ref`]: a box's drop would skip this.
     ///
     /// # Safety
     /// `object` is whole and its last reference gone, and its box is not yet rebuilt.
-    unsafe fn closing(object: NonNull<Self>) {
-        let _ = object;
+    unsafe fn closing(object: NonNull<Self>, closing: Closing) {
+        let _ = (object, closing);
     }
 }
 
@@ -86,10 +87,10 @@ macro_rules! kobject {
         unsafe impl $crate::object::header::KObject for $t {
             const TYPE: $crate::libkern::handle::KObjectType = $crate::libkern::handle::KObjectType::$t;
 
-            unsafe fn closing(object: ::core::ptr::NonNull<Self>) {
+            unsafe fn closing(object: ::core::ptr::NonNull<Self>, closing: $crate::object::header::Closing) {
                 // SAFETY: `closing`'s contract: the object is whole and no `&mut` to it is live, and
                 // `$t: Shared`, so a `&$t` may stand beside what other CPUs write in its cells.
-                $hook(unsafe { object.as_ref() })
+                $hook(unsafe { object.as_ref() }, closing)
             }
         }
         $crate::object::header::kobject!(@checks $t);
@@ -366,6 +367,10 @@ impl<T: KObject> core::fmt::Debug for Ref<T> {
     }
 }
 
+/// What only [`dispatch_destroy`] makes, as it runs an object's [`KObject::closing`]: a closing
+/// hook takes one, so it runs on nothing whose last reference has not gone.
+pub struct Closing(());
+
 /// An uncounted pointer to a `T`, kept behind the lock its target's closing takes to clear or
 /// remove it before the target is freed: whoever reaches it holds that lock, so the target is whole.
 pub struct Weak<T: KObject> {
@@ -379,8 +384,9 @@ impl<T: KObject> Weak<T> {
     /// A pointer to `target`, with the provenance its owner's reference has.
     ///
     /// # Safety
-    /// `target` is a live `T`. This is kept only behind a lock that `target`'s closing takes, and
-    /// that closing clears or removes it, under the lock, before `target` is freed.
+    /// `target` is a live `T`. This is kept in place behind a lock that `target`'s closing takes,
+    /// never moved out from behind it but to be dropped there, and that closing clears or removes
+    /// it, under the lock, before `target` is freed.
     pub unsafe fn new(target: *mut T) -> Self {
         // SAFETY: a live `T`'s address is not null, by the contract.
         Self { target: unsafe { NonNull::new_unchecked(target) } }
@@ -396,20 +402,11 @@ impl<T: KObject> Weak<T> {
         core::ptr::eq(self.target.as_ptr(), target)
     }
 
-    /// The target, whole while what keeps this is borrowed, under its lock.
-    pub fn get(&self) -> &T
-    where
-        T: Shared,
-    {
-        // SAFETY: `new`'s contract: the target is freed only after its closing has taken the lock
-        // this is kept behind, which whoever borrows this holds.
-        unsafe { self.target.as_ref() }
-    }
-
     /// A new reference to the target, or `None` once its count is zero, its closing yet to clear
     /// this.
     pub fn upgrade(&self) -> Option<Ref<T>> {
-        // SAFETY: as `get`: the target is whole while this is borrowed.
+        // SAFETY: `new`'s contract: the target is freed only after its closing has taken the lock
+        // this is kept behind, which whoever borrows this in place holds, so it is whole.
         unsafe { Ref::try_acquire(self.target.as_ptr()) }
     }
 }
@@ -463,7 +460,7 @@ unsafe fn dispatch_destroy(header: NonNull<KObjectHeader>) {
 /// `header` is the last live reference to a `T` whose box `KBox::into_raw` gave up.
 unsafe fn destroy<T: KObject>(header: NonNull<KObjectHeader>) {
     // SAFETY: the last reference is gone, by the contract, and the box not yet rebuilt.
-    unsafe { T::closing(header.cast()) };
+    unsafe { T::closing(header.cast(), Closing(())) };
     // SAFETY: the last reference to a `T` from `KBox::<T>::into_raw`, by the contract.
     drop(unsafe { KBox::<T>::from_raw(header.cast()) });
     #[cfg(test)]

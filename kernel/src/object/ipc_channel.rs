@@ -264,8 +264,8 @@ impl IpcChannel {
     pub const MAX_PENDING_SENDS: usize = 4;
 
     /// Create a connected endpoint **pair**, each with a `depth`-slot receive ring (clamped to
-    /// `1..=IPC_MAX_QUEUE_DEPTH`). Each returned `KBox` holds one creation reference.
-    pub fn try_new_pair(depth: u32) -> Result<(KBox<Self>, KBox<Self>), AllocError> {
+    /// `1..=IPC_MAX_QUEUE_DEPTH`). Each returned `Ref` is its creation reference.
+    pub fn try_new_pair(depth: u32) -> Result<(Ref<Self>, Ref<Self>), AllocError> {
         let cap = depth.clamp(1, IPC_MAX_QUEUE_DEPTH) as usize;
         let (a, b) = (Self::try_new_endpoint(cap)?, Self::try_new_endpoint(cap)?);
         let (a, b) = (KBox::into_raw(a), KBox::into_raw(b));
@@ -277,7 +277,7 @@ impl IpcChannel {
         unsafe {
             (*SchedCell::raw_get(&raw const (*a.as_ptr()).inner)).peer = Some(Weak::new(b.as_ptr()));
             (*SchedCell::raw_get(&raw const (*b.as_ptr()).inner)).peer = Some(Weak::new(a.as_ptr()));
-            Ok((KBox::from_raw(a), KBox::from_raw(b)))
+            Ok((Ref::new(KBox::from_raw(a)), Ref::new(KBox::from_raw(b))))
         }
     }
 
@@ -505,9 +505,12 @@ impl IpcChannel {
 }
 
 impl Drop for IpcChannel {
-    /// A live waiter pins this endpoint through its `ObjectRef`, so none is left at the last drop.
+    /// A live waiter pins this endpoint through its `ObjectRef`, so none is left at the last drop;
+    /// and its closing, run first, unlinked it.
     fn drop(&mut self) {
-        debug_assert!(self.inner.get_mut().recv_waiters.is_empty(), "IpcChannel dropped with live receivers");
+        let inner = self.inner.get_mut();
+        debug_assert!(inner.recv_waiters.is_empty(), "IpcChannel dropped with live receivers");
+        debug_assert!(inner.peer.is_none() && inner.us_reg.is_none(), "IpcChannel dropped still linked");
     }
 }
 

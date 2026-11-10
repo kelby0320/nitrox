@@ -100,13 +100,17 @@ fn fire_timer(g: &mut SchedState, timer: &Timer, now: u64) {
 /// (re)insert its absolute-monotonic-ns heap entry. `Err(())` if the heap is at reserve.
 #[allow(clippy::result_unit_err, reason = "one failure, the heap's reserve, which every caller reports one way")]
 pub fn timer_arm(timer: &Timer, deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
-    let mut g = SCHED.lock();
+    arm(&mut SCHED.lock(), timer, deadline_ns, interval_ns)
+}
+
+/// [`timer_arm`], under a held `SCHED`.
+pub(super) fn arm(g: &mut SchedState, timer: &Timer, deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
     // Drop any stale heap entry (re-arm).
-    unheap(&mut g, timer);
+    unheap(g, timer);
     timer.set_armed(&mut g.tok, deadline_ns, interval_ns);
     if deadline_ns != 0 {
         let target = deadline::Target::Timer(addr(timer) as usize);
-        if deadline::push_promised(&mut g, deadline::Entry { deadline_ns, target }).is_err() {
+        if deadline::push_promised(g, deadline::Entry { deadline_ns, target }).is_err() {
             // Undo the arm on heap overflow.
             timer.set_armed(&mut g.tok, 0, 0);
             return Err(());
@@ -118,7 +122,7 @@ pub fn timer_arm(timer: &Timer, deadline_ns: u64, interval_ns: u64) -> Result<()
 
 /// A timer's last reference has gone: drop its heap entry, which names it by address without a
 /// reference. Its closing, outside `SCHED`, before the memory goes.
-pub(crate) fn timer_closing(timer: &Timer) {
+pub(crate) fn timer_closing(timer: &Timer, _: Closing) {
     unheap(&mut SCHED.lock(), timer);
 }
 

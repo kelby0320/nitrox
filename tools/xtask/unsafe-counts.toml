@@ -17,7 +17,7 @@
 "kernel/src/limine" = 14
 "kernel/src/main" = 17
 "kernel/src/mm" = 87
-"kernel/src/object" = 71
+"kernel/src/object" = 70
 "kernel/src/pci" = 4
 "kernel/src/power" = 1
 "kernel/src/report" = 1

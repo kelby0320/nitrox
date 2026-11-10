@@ -146,7 +146,7 @@ fn timer_rights_are_allocatable_on_a_timer() {
     init_global_heap();
     let t = HandleTable::try_new(0x1234_5678_9ABC_DEF0).unwrap();
     let timer = crate::object::Timer::try_new().unwrap();
-    let h = t.install(1, ObjectRef::new(timer), timer_rights()).expect("timer_rights must be valid for a Timer");
+    let h = t.install(1, timer.erase(), timer_rights()).expect("timer_rights must be valid for a Timer");
     drop(t.close(h, 1).unwrap());
 }
 
@@ -283,7 +283,7 @@ fn channel_endpoint_rights_are_allocatable_on_a_channel() {
     let t = HandleTable::try_new(0x1357_9BDF_0246_8ACE).unwrap();
     let (a, b) = IpcChannel::try_new_pair(4).unwrap();
     let h = t
-        .install(1, ObjectRef::new(a), channel_endpoint_rights())
+        .install(1, a.erase(), channel_endpoint_rights())
         .expect("channel_endpoint_rights must be valid for an IpcChannel");
     drop(t.close(h, 1).unwrap());
     drop(b);
@@ -422,7 +422,7 @@ fn a_handle_of_another_kind_is_an_invalid_argument() {
     const PID: u32 = 4480;
     init_global_heap();
     global::init_for_tests();
-    let h = install(PID, ObjectRef::new(Timer::try_new().unwrap()), Rights::empty()).unwrap().bits();
+    let h = install(PID, Timer::try_new().unwrap().erase(), Rights::empty()).unwrap().bits();
     assert_eq!(lookup_as::<Namespace>(h, PID, Rights::empty()).unwrap_err(), KError::InvalidArgument);
     assert!(lookup_as::<Timer>(h, PID, Rights::empty()).is_ok());
     assert_eq!(global::close_all_owned_by(PID), 1);
@@ -552,10 +552,9 @@ fn full_mem_rights_are_allocatable_on_a_memory_object() {
 /// A file server's registration, its peer endpoint dropped.
 fn file_server_reg() -> Ref<UserspaceServerReg> {
     use crate::object::IpcChannel;
-    let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-    drop(ObjectRef::new(b));
-    let ep = Ref::new(a);
-    Ref::new(UserspaceServerReg::try_new(ep).unwrap())
+    let (ep, b) = IpcChannel::try_new_pair(4).unwrap();
+    drop(b);
+    UserspaceServerReg::try_new(ep).unwrap()
 }
 
 fn block_device() -> ObjectRef {
@@ -659,8 +658,8 @@ fn forwarded_memobj_lookup() -> Forwarded {
     use crate::object::{IpcChannel, MemoryObject, PendingOperation, UserspaceServerReg};
     use crate::rsproto::{OBJECT_KIND_MEMOBJ, build_resolve_request};
     let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-    let (k, _server_end) = (Ref::new(k), ObjectRef::new(s));
-    let reg = Ref::new(UserspaceServerReg::try_new(k).unwrap());
+    let _server_end = s.erase();
+    let reg = UserspaceServerReg::try_new(k).unwrap();
     let po = Ref::new(PendingOperation::try_new().unwrap());
     let mut msg = StoredMsg::zeroed();
     msg.header.payload_len = build_resolve_request(&mut msg.payload, Rights::MAP_READ.bits(), b"f").unwrap() as u32;
@@ -794,9 +793,8 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     use crate::rsproto::{REQUEST_ID_OFFSET, build_read_range_request};
     init_global_heap();
     let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-    let k = Ref::new(k);
-    let _server_end = ObjectRef::new(s);
-    let reg = Ref::new(UserspaceServerReg::try_new(k).unwrap());
+    let _server_end = s.erase();
+    let reg = UserspaceServerReg::try_new(k).unwrap();
     let file = FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap();
     let file = Ref::new(file);
     let fo: &FileObject = &file;
@@ -834,10 +832,9 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
     let refused = |answer: ObjectRef| {
         let (reg, _server_end, file) = {
             let (k, s) = IpcChannel::try_new_pair(4).unwrap();
-            let k = Ref::new(k);
             (
-                Ref::new(UserspaceServerReg::try_new(k).unwrap()),
-                ObjectRef::new(s),
+                UserspaceServerReg::try_new(k).unwrap(),
+                s.erase(),
                 Ref::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap()),
             )
         };

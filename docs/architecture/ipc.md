@@ -56,8 +56,8 @@ kobject type at the object header. The async model holds: a receiver that finds
 
 ## Dead peer
 
-When an endpoint's last handle closes, its destructor (under the scheduler lock)
-nulls the surviving peer's back-pointer and wakes the peer's blocked receivers.
+When an endpoint's last handle closes, its closing (under the scheduler lock, before the
+object is freed) clears the surviving peer's back-pointer and wakes the peer's blocked receivers.
 The survivor's subsequent operations then observe the closed peer: `recv` drains
 any already-queued messages first, then returns `PeerClosed`; `send` returns
 `PeerClosed` immediately. The two endpoints are freed independently; the

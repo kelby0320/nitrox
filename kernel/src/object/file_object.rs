@@ -301,7 +301,7 @@ pub mod fill_stats {
 impl FileObject {
     /// **Out of the registration's cache** before the box is rebuilt, by address (a new object for
     /// the file may have replaced this one): until then, another CPU may upgrade the entry.
-    fn leave_cache(&self) {
+    fn leave_cache(&self, _: crate::object::header::Closing) {
         if let Producer::FsServerBlocks { reg, file_id, .. } = &self.producer
             && *file_id != 0
         {
@@ -373,10 +373,10 @@ impl FileObject {
         }
     }
 
-    /// The id this object is cached under in its registration, if it is cached.
-    pub fn file_id(&self) -> Option<u64> {
+    /// The registration whose cache holds this object, and its id there, if it is cached.
+    pub fn cache_key(&self) -> Option<(&UserspaceServerReg, u64)> {
         match &self.producer {
-            Producer::FsServerBlocks { file_id, .. } if *file_id != 0 => Some(*file_id),
+            Producer::FsServerBlocks { reg, file_id, .. } if *file_id != 0 => Some((reg, *file_id)),
             _ => None,
         }
     }
@@ -398,7 +398,7 @@ impl FileObject {
         fo.writable_maps.fetch_add(1, Ordering::AcqRel);
         g.map_gen = g.map_gen.wrapping_add(1);
         // No sync writes a forgotten object, so a pin on it is one nothing would ever clean.
-        if g.self_pin.is_none() && fo.file_id().is_some() && !g.dead {
+        if g.self_pin.is_none() && fo.cache_key().is_some() && !g.dead {
             g.self_pin = Some(file_obj.clone());
         }
     }
@@ -481,8 +481,7 @@ impl FileObject {
         candidate: Ref<FileObject>,
     ) -> Result<Ref<FileObject>, CacheInError> {
         let cand: &FileObject = &candidate;
-        let id = cand.file_id().expect("a cached object has an id");
-        match reg.cache_get_or_insert(id, &candidate).map_err(|_| CacheInError::OutOfMemory)? {
+        match reg.cache_get_or_insert(&candidate).map_err(|_| CacheInError::OutOfMemory)? {
             None => Ok(candidate),
             Some(existing) => {
                 let ex: &FileObject = &existing;
@@ -1404,11 +1403,9 @@ mod tests {
     use crate::object::{DeviceNode, IpcChannel, UserspaceServerReg};
 
     fn registration() -> Ref<UserspaceServerReg> {
-        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        let ep = Ref::new(a);
-        drop(ObjectRef::new(b));
-        let r = UserspaceServerReg::try_new(ep).unwrap();
-        Ref::new(r)
+        let (ep, b) = IpcChannel::try_new_pair(4).unwrap();
+        drop(b);
+        UserspaceServerReg::try_new(ep).unwrap()
     }
 
     fn candidate(reg: &Ref<UserspaceServerReg>, id: u64, size: usize) -> Ref<FileObject> {

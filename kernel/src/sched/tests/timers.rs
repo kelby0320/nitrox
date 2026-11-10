@@ -135,7 +135,7 @@ fn a_periodic_timer_whose_next_fire_would_wrap_waits_for_ever_instead() {
     assert_eq!(deadline::peek(&st.deadlines).map(|e| e.deadline_ns), Some(u64::MAX));
 }
 
-/// `timer_arm` and `Timer::drop` take the global `SCHED`, whose heap only `init` reserves.
+/// `timer_arm` and a timer's closing take the global `SCHED`, whose heap only `init` reserves.
 fn reserve_global_deadlines() {
     let mut h = Reserved::with_capacity(deadline::HEAP_RESERVE).unwrap();
     let mut g = SCHED.lock();
@@ -157,7 +157,7 @@ fn a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it() {
     test_probe::reset();
     reserve_global_deadlines();
     for interval in [0, 1_000] {
-        let t = Ref::new(Timer::try_new().unwrap());
+        let t = Timer::try_new().unwrap();
         let p = t.as_object().as_ptr();
         timer_arm(&t, 1 << 40, interval).unwrap();
         assert!(global_heap_names(p));
@@ -165,7 +165,7 @@ fn a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it() {
         assert!(!global_heap_names(p), "interval {interval}: the heap names a freed timer");
     }
     // A periodic timer the tick has fired is in the heap again.
-    let t = Ref::new(Timer::try_new().unwrap());
+    let t = Timer::try_new().unwrap();
     let p = t.as_object().as_ptr();
     timer_arm(&t, 1_000, 500).unwrap();
     fire_expired_deadlines(&mut SCHED.lock(), 1_000);
@@ -174,7 +174,7 @@ fn a_timer_destroyed_while_armed_leaves_nothing_in_the_heap_naming_it() {
     assert!(!global_heap_names(p), "the heap names a freed timer the tick re-armed");
     assert_eq!(test_probe::timer_destroys(), 3);
 
-    let t = Ref::new(Timer::try_new().unwrap());
+    let t = Timer::try_new().unwrap();
     timer_arm(&t, 1 << 40, 0).unwrap();
     timer_arm(&t, 0, 0).unwrap();
     assert!(!global_heap_names(t.as_object().as_ptr()), "a disarmed timer stays in the heap");
@@ -264,4 +264,16 @@ fn a_wait_on_nothing_refuses_a_poll_and_a_wait_for_ever() {
     use crate::syscall::error::KError;
     assert_eq!(sleep_until(0, 0), Err(KError::InvalidArgument));
     assert_eq!(sleep_until(u64::MAX, 0), Err(KError::InvalidArgument));
+}
+
+/// **An arm the heap refuses is undone**: the timer reads unarmed, not armed but out of the heap.
+#[test]
+fn an_arm_the_heap_refuses_leaves_the_timer_unarmed() {
+    init_global_heap();
+    let t = new_timer();
+    // A slot promised, and a heap reserved for none.
+    let mut st = test_state();
+    st.deadline_slots[deadline::DeadlineKind::Timer as usize] = 1;
+    assert!(arm(&mut st, &t, 1_000, 250).is_err());
+    assert_eq!((t.deadline(&st.tok), t.interval(&st.tok), t.in_heap(&st.tok)), (0, 0, false));
 }

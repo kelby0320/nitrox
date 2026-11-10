@@ -6,7 +6,7 @@ use crate::object::header::test_probe;
 
 fn new_pair() -> (Ref<IpcChannel>, Ref<IpcChannel>) {
     let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-    (Ref::new(a), Ref::new(b))
+    (a, b)
 }
 
 fn a_msg(byte: u8, len: u32) -> StoredMsg {

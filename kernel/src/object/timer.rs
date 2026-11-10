@@ -14,7 +14,7 @@
 use crate::sched::{SchedCell, SchedToken, SlotHold, Slots};
 
 use crate::libkern::{AllocError, KBox};
-use crate::object::header::{Header, Shared, kobject};
+use crate::object::header::{Header, Ref, Shared, kobject};
 use crate::object::{WaitQueue, Waiters};
 
 /// A timer kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
@@ -52,7 +52,7 @@ impl Timer {
 
     /// Allocate an unarmed `Timer` (refcount one), reserving its slot in the deadline heap up
     /// front.
-    pub fn try_new() -> Result<KBox<Self>, AllocError> {
+    pub fn try_new() -> Result<Ref<Self>, AllocError> {
         let slot = SlotHold::reserve(Slots::Timer)?;
         KBox::try_new(Self {
             header: Header::new(),
@@ -65,6 +65,7 @@ impl Timer {
             }),
             _slot: slot,
         })
+        .map(Ref::new)
     }
 
     /// `true` iff the self-check sentinel is intact.
@@ -132,7 +133,9 @@ impl Drop for Timer {
     /// A live waiter pins the timer (it holds an `ObjectRef` across `sys_wait`), so the last
     /// reference cannot drop while waiters remain; the assert documents that.
     fn drop(&mut self) {
-        debug_assert!(self.inner.get_mut().waiters.is_empty(), "Timer dropped with live waiters");
+        let inner = self.inner.get_mut();
+        debug_assert!(inner.waiters.is_empty(), "Timer dropped with live waiters");
+        debug_assert!(!inner.in_heap, "Timer dropped in the deadline heap");
     }
 }
 
@@ -140,7 +143,6 @@ impl Drop for Timer {
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
-    use crate::object::ObjectRef;
     use crate::object::header::test_probe;
 
     #[test]
@@ -188,7 +190,7 @@ mod tests {
     fn dispatch_destroy_runs_timer_arm() {
         init_global_heap();
         test_probe::reset();
-        let r = ObjectRef::new(Timer::try_new().unwrap());
+        let r = Timer::try_new().unwrap().erase();
         assert_eq!(test_probe::timer_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::timer_destroys(), 1);

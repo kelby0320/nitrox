@@ -444,7 +444,7 @@ mod tests {
     use crate::object::header::{Ref, test_probe};
 
     fn target() -> ObjectRef {
-        ObjectRef::new(Timer::try_new().unwrap())
+        Timer::try_new().unwrap().erase()
     }
 
     fn ns() -> KBox<Namespace> {
@@ -670,10 +670,9 @@ mod tests {
 
     fn us_reg_target() -> Ref<UserspaceServerReg> {
         use crate::object::IpcChannel;
-        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        let endpoint = Ref::new(a);
-        drop(ObjectRef::new(b));
-        Ref::new(UserspaceServerReg::try_new(endpoint).unwrap())
+        let (endpoint, b) = IpcChannel::try_new_pair(4).unwrap();
+        drop(b);
+        UserspaceServerReg::try_new(endpoint).unwrap()
     }
 
     #[test]
