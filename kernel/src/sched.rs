@@ -48,7 +48,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, Reserved};
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::mm::PhysAddr;
-use crate::object::header::Ref;
+use crate::object::header::{Ref, Shared};
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 use crate::object::{
     BlockSendOutcome, FileObject, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,
@@ -197,7 +197,7 @@ pub(crate) fn push_reserved<T>(list: &mut Reserved<T>, val: T, what: &str) {
 }
 
 /// The address the objects' accessors take for `object`, which the borrow pins for the call.
-fn addr<T>(object: &T) -> *mut () {
+fn addr<T: Shared>(object: &T) -> *mut () {
     core::ptr::from_ref(object).cast_mut().cast()
 }
 

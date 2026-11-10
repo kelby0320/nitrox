@@ -6,7 +6,7 @@
 "kernel/src/main.rs" = 1050
 "kernel/src/object/file_object.rs" = 2370
 "kernel/src/pci/mod.rs" = 1041
-"kernel/src/syscall/table.rs" = 2005
+"kernel/src/syscall/table.rs" = 2003
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
 "userspace/compositor/src/main.rs" = 1926

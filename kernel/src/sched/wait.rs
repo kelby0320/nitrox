@@ -27,7 +27,7 @@ pub enum WaitResult {
     Signaled([bool; MAX_WAIT_HANDLES]),
     /// Nothing signaled before the deadline (or a poll found nothing ready).
     TimedOut,
-    /// Registration exceeded a per-object or heap reserve.
+    /// Registration exceeded a per-object or heap reserve, or named a kind no thread waits on.
     OutOfMemory,
     /// The thread's process is exiting, so it does not block: its caller unwinds to the return to
     /// ring 3, where it ends. A wait the exit found blocked is woken, and answers as a timeout.
@@ -35,12 +35,12 @@ pub enum WaitResult {
     Ended,
 }
 
-/// Register the current thread as a waiter on every object in `objs` (type-erased
-/// addresses) with an optional `deadline_ns` (absolute monotonic; `0` = poll, `u64::MAX` =
-/// no timeout), block until one fires, then unregister and report which signaled. `now` is
-/// the current monotonic time. Registration and block happen under a single `SCHED` hold, so
-/// a waker cannot slip between them — no lost wakeup. Each object's borrow pins it until this
-/// returns; one that cannot be waited on is refused as over a reserve.
+/// Register the current thread as a waiter on every object in `objs`, of any kind, with an
+/// optional `deadline_ns` (absolute monotonic; `0` = poll, `u64::MAX` = no timeout), block until
+/// one fires, then unregister and report which signaled. `now` is the current monotonic time.
+/// Registration and block happen under a single `SCHED` hold, so a waker cannot slip between them —
+/// no lost wakeup. Each object's borrow pins it until this returns. A kind no thread waits on is
+/// never ready: a poll finds it so, and a wait that would block on it is refused as over a reserve.
 pub fn wait_on(objs: &[&ObjectRef], deadline_ns: u64, now: u64) -> WaitResult {
     wait(objs, deadline_ns, now, true)
 }

@@ -21,8 +21,8 @@ use core::cell::UnsafeCell;
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::ipc::{IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader};
 use crate::libkern::{AllocError, KBox, KVec, Reserved};
-use crate::object::ObjectRef;
-use crate::object::header::{Header, Shared, kobject};
+use crate::object::header::{Header, Ref, Shared, kobject};
+use crate::object::{ObjectRef, PendingOperation};
 use crate::object::{WaitQueue, Waiters};
 
 /// A queued message in kernel storage: the natural-alignment twin of
@@ -199,7 +199,7 @@ pub enum BlockSendOutcome {
 struct PendingSend {
     msg: StoredMsg,
     transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
-    po: ObjectRef,
+    po: Ref<PendingOperation>,
     /// Set when a `BlockBounded` deadline elapsed: `po` was already completed `TimedOut`, so the
     /// entry is swept out at the next `promote_pending_send` (or at close), not delivered.
     cancelled: bool,
@@ -209,7 +209,7 @@ struct PendingSend {
 /// [`promote_pending_send`](IpcChannel::promote_pending_send) for release **outside** `SCHED`:
 /// their `Drop`s may take lower-rank locks (the buddy allocator) that must not nest under it.
 pub struct ReclaimedSend {
-    pub po: ObjectRef,
+    pub po: Ref<PendingOperation>,
     pub transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
 }
 
@@ -488,12 +488,12 @@ impl IpcChannel {
     /// `PendingOperation` `po`. `Sent`/`Queued` take the `transfers`; the rest leave them.
     ///
     /// # Safety
-    /// See the accessor contract above; `po` references a live `PendingOperation`.
+    /// See the accessor contract above.
     pub(crate) unsafe fn send_or_queue(
         obj: *mut (),
         msg: &StoredMsg,
         transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-        po: &ObjectRef,
+        po: &Ref<PendingOperation>,
     ) -> BlockSendOutcome {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let peer = unsafe { Self::inner(obj) }.peer;
@@ -530,7 +530,7 @@ impl IpcChannel {
     pub(crate) unsafe fn cancel_pending_send(obj: *mut (), po: *mut ()) -> bool {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        if let Some(p) = inner.pending_sends.iter_mut().find(|p| p.po.as_ptr() == po) {
+        if let Some(p) = inner.pending_sends.iter_mut().find(|p| p.po.as_ptr().cast() == po) {
             p.cancelled = true;
             true
         } else {
@@ -548,7 +548,7 @@ impl IpcChannel {
     pub(crate) unsafe fn promote_pending_send(
         obj: *mut (),
         reclaimed: &mut [Option<ReclaimedSend>; Self::MAX_PENDING_SENDS],
-    ) -> Option<ObjectRef> {
+    ) -> Option<Ref<PendingOperation>> {
         // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         let mut r = 0;
@@ -585,7 +585,7 @@ impl IpcChannel {
         let mut n = 0;
         for p in inner.pending_sends.iter() {
             if n < out.len() {
-                out[n] = p.po.as_ptr();
+                out[n] = p.po.as_ptr().cast();
                 n += 1;
             }
         }

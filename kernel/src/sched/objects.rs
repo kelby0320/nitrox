@@ -4,9 +4,9 @@ use super::*;
 
 // --- Waitable dispatch ---
 //
-// `wait_on` works over type-erased object pointers; it dispatches the waitable operations
-// by the kobject type read from the `KObjectHeader` at offset 0 (every kobject is
-// `#[repr(C)]` with the header first). `sys_wait` has already rejected non-waitables.
+// `wait_on` dispatches the waitable operations on each object's address by the kobject type
+// read from the `KObjectHeader` at offset 0 (every kobject is `#[repr(C)]` with the header
+// first). A kind no thread waits on falls to each dispatch's last arm.
 
 /// The kobject type at the head of a type-erased object pointer.
 ///
@@ -22,9 +22,9 @@ unsafe fn obj_type(obj: *mut ()) -> KObjectType {
 ///
 /// # Safety
 ///
-/// Live waitable, `SCHED` held.
+/// A live kobject of any kind, `SCHED` held.
 pub(super) unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
-    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // SAFETY: this function's contract: `obj` is a live kobject, of the type its header names, and
     // `SCHED` is held.
     unsafe {
         match obj_type(obj) {
@@ -42,9 +42,9 @@ pub(super) unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
 ///
 /// # Safety
 ///
-/// Live waitable, `SCHED` held.
+/// A live kobject of any kind, `SCHED` held.
 pub(super) unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
-    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // SAFETY: this function's contract: `obj` is a live kobject, of the type its header names, and
     // `SCHED` is held.
     unsafe {
         match obj_type(obj) {
@@ -62,9 +62,9 @@ pub(super) unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()>
 ///
 /// # Safety
 ///
-/// Live waitable, `SCHED` held.
+/// A live kobject of any kind, `SCHED` held.
 pub(super) unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
-    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // SAFETY: this function's contract: `obj` is a live kobject, of the type its header names, and
     // `SCHED` is held.
     unsafe {
         match obj_type(obj) {
@@ -220,6 +220,19 @@ pub fn pending_op_installed(po: &PendingOperation, outcome: Result<u64, i32>) {
 pub fn complete_pending_op(po: &PendingOperation, status: i32, result: u64) {
     let mut g = SCHED.lock();
     signal_pending_op_with_result(&mut g, addr(po), status, result);
+}
+
+/// [`complete_pending_op`] for a completer holding only the address of a `PendingOperation` its
+/// waiter pins. The waiter may let go once it sees the completion, which can be before this
+/// returns, and a borrow would be held for the whole call, past the release of `SCHED`.
+///
+/// # Safety
+///
+/// `po` is a live `PendingOperation`, pinned by a reference its waiter lets go of only once it sees
+/// a completion.
+pub unsafe fn complete_pending_op_at(po: *mut (), status: i32, result: u64) {
+    let mut g = SCHED.lock();
+    signal_pending_op_with_result(&mut g, po, status, result);
 }
 
 /// Record an interrupt on `irq` and wake every thread blocked on it. Latching: with no

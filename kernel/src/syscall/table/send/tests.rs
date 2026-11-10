@@ -72,7 +72,7 @@ fn a_forwarded_reply_closes_the_handles_it_carries() {
         (Ref::new(a), Ref::new(b))
     };
     let reg = Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
-    assert!(crate::sched::us_server_attach(&k, &reg).is_none());
+    assert!(crate::sched::us_server_attach(&reg).is_none());
     let (h, mut t, mut c) = moving(PID);
     assert_eq!(deliver(&server_end, &message(), &mut t, &mut c, SendMode::NoBlock, 0, PID), Ok(0));
     assert!(!held(h, PID), "closed with the reply");

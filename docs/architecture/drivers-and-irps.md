@@ -235,8 +235,9 @@ as a state machine of DPCs: `sched::spawn` makes the thread, and `sched::wait_on
 under `sys_wait` — blocks it with a deadline on the same waitables. The USB hub thread
 ([`usb.md`](usb.md)) is the first long-lived one, and its waits are the pattern:
 - **A `PendingOperation` per operation**, completed by the DPC with
-  `sched::complete_pending_op`. The thread records what it awaits *before* the hardware can
-  answer, so no completion arrives first.
+  `sched::complete_pending_op_at`, by address: the thread lets go of the operation once it sees the
+  completion, which can be before the DPC's call returns, so the DPC holds no borrow of it. The
+  thread records what it awaits *before* the hardware can answer, so no completion arrives first.
 - **The DPC completes outside its locks.** It takes the matching record out under the driver's
   leaf lock and completes the operation after releasing it, since completing takes the scheduler's
   lock.

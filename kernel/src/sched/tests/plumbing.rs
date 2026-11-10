@@ -125,8 +125,8 @@ fn the_seed_wake_completes_its_waiters_and_frees_none() {
     let (a, b) = (Ref::new(PendingOperation::try_new().unwrap()), Ref::new(PendingOperation::try_new().unwrap()));
     let mine = [a.as_object().as_ptr(), b.as_object().as_ptr()];
     wake_seed_waiters(|out| {
-        out[0] = Some(a.as_object().clone());
-        out[1] = Some(b.as_object().clone());
+        out[0] = Some(a.clone());
+        out[1] = Some(b.clone());
         2
     });
     assert!(pending_op_is_signaled(&a) && pending_op_is_signaled(&b), "completed");
@@ -140,7 +140,7 @@ fn a_started_thread_no_queue_takes_drops_after_the_hold() {
     init_global_heap();
     test_probe::reset();
     let (process, _root) = user_process_ref(9);
-    let thread = into_objref(user_thread_no_stack(1, process, 0x40_0000, 0x7fff_f000));
+    let thread = Ref::new(user_thread_no_stack(1, process, 0x40_0000, 0x7fff_f000));
     // The global run queues are reserved only by `init`, which no host test runs.
     assert!(start_user(thread).is_err());
     assert_eq!(test_probe::thread_destroys(), 1);
@@ -264,8 +264,8 @@ fn a_reference_dropped_under_sched_stops_its_test() {
     drop(po.clone());
 }
 
-/// **A terminate request reaches the process's own channel**, the one the borrowed `Process`
-/// holds; a process with none cannot be asked.
+/// **A terminate request reaches the process's own channel, and wakes what waits on it**: the
+/// channel the borrowed `Process` holds. A process with none cannot be asked.
 #[test]
 fn a_terminate_request_reaches_the_channel_its_process_holds() {
     init_global_heap();
@@ -273,7 +273,61 @@ fn a_terminate_request_reaches_the_channel_its_process_holds() {
     let mut process = Process::try_new(9).unwrap();
     assert!(!request_terminate(&process), "no channel to ask on");
     process.set_notification_channel(channel.clone());
+    let waiter = inert_ref(1);
+    let (t, on) = (waiter.as_ptr(), channel.as_ptr().cast::<()>());
+    {
+        let _g = SCHED.lock();
+        // SAFETY: the test's thread and channel, pinned by its references; `SCHED` held.
+        unsafe {
+            Thread::wait_register(t, &[on as usize], false);
+            NotificationChannel::add_waiter(on, t).unwrap();
+        }
+    }
     assert!(request_terminate(&process));
+    let woken = {
+        let _g = SCHED.lock();
+        // SAFETY: as above.
+        unsafe {
+            let marked = Thread::wait_signaled(t)[0];
+            NotificationChannel::remove_waiter(on, t);
+            Thread::wait_clear(t);
+            marked
+        }
+    };
+    assert!(woken, "its waiter woken");
     let heard = notif_try_recv(&channel).expect("the request");
     assert_eq!(heard.as_bytes(), Notification::terminate_requested().as_bytes());
+}
+
+/// **A kind no thread waits on is never ready, and a wait that would block on it is refused**, its
+/// registration on the rest unwound: the PO beside it asserts, as it drops, that no waiter is left.
+#[test]
+fn a_wait_that_would_block_on_a_kind_no_thread_waits_on_is_refused() {
+    init_global_heap();
+    let process = ObjectRef::new(Process::try_new(9).unwrap());
+    let po = Ref::new(PendingOperation::try_new().unwrap());
+    with_current(into_objref(Thread::try_new(0, 0).unwrap()), || {
+        assert!(matches!(wait_on(&[&process], 0, 0), WaitResult::TimedOut), "a poll finds it not ready");
+        for deadline in [5, u64::MAX] {
+            let refused = wait_on(&[po.as_object(), &process], deadline, 0);
+            assert!(matches!(refused, WaitResult::OutOfMemory), "deadline {deadline}");
+        }
+    });
+    drop(po);
+}
+
+/// **A wait takes as many objects as it holds slots for**, and one more is refused before any is
+/// read.
+#[test]
+fn a_wait_on_one_object_more_than_it_holds_is_refused() {
+    init_global_heap();
+    let pos: std::vec::Vec<Ref<PendingOperation>> =
+        (0..=MAX_WAIT_HANDLES).map(|_| Ref::new(PendingOperation::try_new().unwrap())).collect();
+    complete_pending_op(&pos[MAX_WAIT_HANDLES - 1], 0, 0);
+    let objs: std::vec::Vec<&ObjectRef> = pos.iter().map(Ref::as_object).collect();
+    with_current(into_objref(Thread::try_new(0, 0).unwrap()), || {
+        let held = wait_on(&objs[..MAX_WAIT_HANDLES], 0, 0);
+        assert!(matches!(held, WaitResult::Signaled(b) if b[MAX_WAIT_HANDLES - 1]), "its last slot read");
+        assert!(matches!(wait_on(&objs, 0, 0), WaitResult::OutOfMemory), "one more");
+    });
 }

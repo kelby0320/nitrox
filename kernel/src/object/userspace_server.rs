@@ -16,11 +16,11 @@
 //!
 //! ## Mutation discipline
 //!
-//! As for [`IpcChannel`] / [`Timer`](crate::object::Timer): all interior state lives in an
-//! [`UnsafeCell`] touched **only under the rank-1 `SCHED` lock**. The owned `endpoint` and
-//! pending `po` `ObjectRef`s are dropped only when the registration is destroyed
-//! (`dispatch_destroy`, **outside** `SCHED`) or by the caller of a `take_pending_*`, never
-//! under the lock.
+//! As for [`IpcChannel`] / [`Timer`](crate::object::Timer): the pending tables live in an
+//! [`UnsafeCell`] touched **only under the rank-1 `SCHED` lock**; the owned `endpoint` is set once
+//! at construction, and the file cache has a lock of its own. The endpoint and the pending `po`s
+//! are dropped only when the registration is destroyed (`dispatch_destroy`, **outside** `SCHED`) or
+//! by the caller of a `take_pending_*`, never under the lock.
 //!
 //! One endpoint is shared by *many* bindings (`docs/architecture/namespace-and-resource-servers.md`
 //! § Subtree scoping), so up to [`US_PENDING_MAX`] lookups and, independently, fills can be in
@@ -156,8 +156,8 @@ struct CachedFile {
 pub struct UserspaceServerReg {
     header: Header<Self>,
     magic: u64,
-    /// The kernel's IPC endpoint; its peer is the endpoint the server services. Set once, and
-    /// declared before `inner` so it drops first, with the pending tables still whole.
+    /// The kernel's IPC endpoint; its peer is the endpoint the server services. Set once, so read
+    /// without `SCHED`.
     endpoint: Ref<IpcChannel>,
     inner: UnsafeCell<Inner>,
     /// **The file cache: one `FileObject` per file this server's replies named**, keyed by the
@@ -569,7 +569,7 @@ mod tests {
         let s_ref = Ref::new(s);
         let r = UserspaceServerReg::try_new(k_ref).unwrap();
         let binding = Ref::new(r);
-        assert!(crate::sched::us_server_attach(binding.endpoint(), &binding).is_none());
+        assert!(crate::sched::us_server_attach(&binding).is_none());
 
         let reply = crate::sched::us_forward_reg_for_send(&s_ref).expect("routed to the registration");
         let destroyed = test_probe::userspace_server_reg_destroys();

@@ -318,8 +318,7 @@ pub fn sys_thread_set_affinity(thread_h: u64, cpu_mask: u64) -> SysResult {
     if mask == 0 {
         return Err(KError::InvalidArgument);
     }
-    // SAFETY: `ok` holds the live `Thread` across the call.
-    unsafe { crate::sched::set_thread_affinity(ok.as_object().as_ptr(), mask) };
+    crate::sched::set_thread_affinity(&ok, mask);
     Ok(0)
 }
 
@@ -389,7 +388,7 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     // Its handle before it runs: nothing may fail once it does, or a retry would start another.
     let mut installed = installing::<1>(pid);
     let rights = Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE;
-    let h = installed.install(th.clone(), rights).map_err(refused)?;
+    let h = installed.install(th.clone().erase(), rights).map_err(refused)?;
     crate::sched::start_user(th).map_err(|_| KError::OutOfMemory)?;
     installed.commit();
     Ok(h.bits() as isize)
@@ -912,7 +911,7 @@ pub fn sys_ns_bind(
         // rival would clobber the endpoint→reg reply-routing back-pointer and hijack replies.
         let reg_box = UserspaceServerReg::try_new(endpoint).map_err(|_| KError::OutOfMemory)?;
         let reg_ref = Ref::new(reg_box);
-        let reg = match crate::sched::us_server_attach(reg_ref.endpoint(), &reg_ref) {
+        let reg = match crate::sched::us_server_attach(&reg_ref) {
             Some(existing) => existing,
             None => reg_ref,
         };
@@ -1016,9 +1015,8 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
 
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     let po_ref = Ref::new(po);
-    let waiter_ref = po_ref.clone().erase();
     let po_h = install(pid, po_ref.clone().erase(), pending_op_rights())?;
-    match crate::entropy::register_seed_waiter(waiter_ref) {
+    match crate::entropy::register_seed_waiter(po_ref.clone()) {
         crate::entropy::SeedWaitReg::Queued => {}
         crate::entropy::SeedWaitReg::AlreadySeeded(r) => {
             crate::sched::complete_pending_op(&po_ref, 0, 0);

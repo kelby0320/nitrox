@@ -710,9 +710,8 @@ fn on_event(x: &Xhci, trb: &Trb) {
                 ep0_event(&mut x.waiting.lock(), trb.slot_id(), trb.pointer(), trb.completion_code(), trb.residual());
             if let Some((w, code, result)) = done {
                 // SAFETY: the waiting thread's reference pins the `PendingOperation` at `w.po` until
-                // its operation completes.
-                let po = unsafe { &*w.po.0.cast::<crate::object::PendingOperation>() };
-                crate::sched::complete_pending_op(po, code as i32, result);
+                // it sees this completion.
+                unsafe { crate::sched::complete_pending_op_at(w.po.0, code as i32, result) };
             }
         }
         _ => {}
@@ -760,10 +759,9 @@ fn complete_if(x: &Xhci, matches: impl Fn(Awaited) -> bool, code: u8, result: u6
         if w.as_ref().is_some_and(|w| matches(w.awaited)) { w.take() } else { None }
     };
     if let Some(w) = taken {
-        // SAFETY: the waiting thread's reference pins the `PendingOperation` at `w.po` until its
-        // operation completes.
-        let po = unsafe { &*w.po.0.cast::<crate::object::PendingOperation>() };
-        crate::sched::complete_pending_op(po, code as i32, result);
+        // SAFETY: the waiting thread's reference pins the `PendingOperation` at `w.po` until it sees
+        // this completion.
+        unsafe { crate::sched::complete_pending_op_at(w.po.0, code as i32, result) };
     }
 }
 

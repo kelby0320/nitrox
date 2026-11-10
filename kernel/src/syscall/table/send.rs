@@ -51,18 +51,17 @@ pub(super) fn deliver(
             // Its handle before the push: once the message is committed, nothing may fail.
             let mut installed = installing::<1>(pid);
             let po_h = installed.install(po_ref.clone().erase(), pending_op_rights()).map_err(refused)?;
-            let refusal =
-                match crate::sched::ipc_send_push_blocking(ch, bounce, transfers, po_ref.as_object(), deadline_ns) {
-                    BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
-                        commit_all(claims);
-                        installed.commit();
-                        return Ok(po_h.bits() as isize);
-                    }
-                    // Back-pressure / dead peer: nothing committed; the sender keeps its handles.
-                    BlockSendOutcome::PendingFull => KError::WouldBlock,
-                    BlockSendOutcome::PeerClosed => KError::PeerClosed,
-                    BlockSendOutcome::Cycle => KError::InvalidArgument,
-                };
+            let refusal = match crate::sched::ipc_send_push_blocking(ch, bounce, transfers, &po_ref, deadline_ns) {
+                BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
+                    commit_all(claims);
+                    installed.commit();
+                    return Ok(po_h.bits() as isize);
+                }
+                // Back-pressure / dead peer: nothing committed; the sender keeps its handles.
+                BlockSendOutcome::PendingFull => KError::WouldBlock,
+                BlockSendOutcome::PeerClosed => KError::PeerClosed,
+                BlockSendOutcome::Cycle => KError::InvalidArgument,
+            };
             Err(refusal)
         }
     }

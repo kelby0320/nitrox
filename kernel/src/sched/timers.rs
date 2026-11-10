@@ -15,9 +15,9 @@ pub(super) fn wake_entropy_seed_waiters() {
 /// move into an interrupt's bag, so they reach `deferred_drops` rather than drop here. Drained
 /// before `SCHED` is taken, so `ENTROPY` never nests in it. Bounded: waiters queue only pre-seed
 /// and the drain fires post-seed, so the lifetime total is ≤ `SEED_WAITERS_MAX`.
-pub(super) fn wake_seed_waiters(drain: impl FnOnce(&mut [Option<ObjectRef>]) -> usize) {
+pub(super) fn wake_seed_waiters(drain: impl FnOnce(&mut [Option<Ref<PendingOperation>>]) -> usize) {
     use crate::entropy::SEED_WAITERS_MAX;
-    let mut buf: [Option<ObjectRef>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
+    let mut buf: [Option<Ref<PendingOperation>>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
     let n = drain(&mut buf);
     if n == 0 {
         return;
@@ -25,8 +25,8 @@ pub(super) fn wake_seed_waiters(drain: impl FnOnce(&mut [Option<ObjectRef>]) -> 
     let mut bag = Deferred::<SEED_WAITERS_MAX>::in_interrupt();
     let mut g = bag.lock();
     for po in buf[..n].iter_mut().filter_map(Option::take) {
-        signal_pending_op_with_result(&mut g, po.as_ptr(), 0, 0);
-        g.defer(po);
+        signal_pending_op_with_result(&mut g, addr(&*po), 0, 0);
+        g.defer(po.erase());
     }
 }
 

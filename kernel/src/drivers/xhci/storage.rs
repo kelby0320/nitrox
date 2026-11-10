@@ -744,9 +744,8 @@ fn act(a: Action, x: Option<&Xhci>) {
         }
         Action::Hub { po } => {
             // SAFETY: the hub thread holds the reference to the `PendingOperation` at `po` while
-            // its command is in flight, waiting on it.
-            let po = unsafe { &*po.cast::<crate::object::PendingOperation>() };
-            crate::sched::complete_pending_op(po, 0, 0);
+            // its command is in flight, and lets go of it once it sees this completion.
+            unsafe { crate::sched::complete_pending_op_at(po, 0, 0) };
         }
         Action::Wake => {
             if let Some(x) = x {

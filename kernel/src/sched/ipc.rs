@@ -283,13 +283,14 @@ unsafe fn fail_outstanding<const N: usize>(g: &mut Held<'_, N>, reg: *mut ()) {
     }
 }
 
-/// Record the endpoint → registration back-pointer that makes `endpoint` the kernel's end of
-/// a Userspace Server channel, so a reply sent to it (by the server, on its peer) is
+/// Record the back-pointer from `reg`'s own endpoint to `reg` that makes the endpoint the kernel's
+/// end of a Userspace Server channel, so a reply sent to it (by the server, on its peer) is
 /// completed inline rather than enqueued, unless a live registration is there already: that one
-/// comes back to share, from the same `SCHED` hold, so two binds cannot each make one.
-pub fn us_server_attach(endpoint: &IpcChannel, reg: &Ref<UserspaceServerReg>) -> Option<Ref<UserspaceServerReg>> {
+/// comes back to share, from the same `SCHED` hold, so two binds cannot each make one. Only that
+/// endpoint is attached, the one `us_reg_detach` clears when `reg` drops.
+pub fn us_server_attach(reg: &Ref<UserspaceServerReg>) -> Option<Ref<UserspaceServerReg>> {
     let _g = SCHED.lock();
-    let endpoint = addr(endpoint);
+    let endpoint = addr(reg.endpoint());
     // SAFETY: the borrow pins `endpoint`; `SCHED` held.
     let existing = unsafe { IpcChannel::us_reg_of(endpoint) };
     if !existing.is_null() {
@@ -328,7 +329,7 @@ pub fn ipc_send_push_blocking(
     endpoint: &IpcChannel,
     msg: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    po: &ObjectRef,
+    po: &Ref<PendingOperation>,
     deadline_ns: u64,
 ) -> BlockSendOutcome {
     let mut g = SCHED.lock();
@@ -349,7 +350,7 @@ pub fn ipc_send_push_blocking(
                 }
             }
             // Delivered synchronously — complete the PO now (no waiters yet).
-            signal_pending_op(&mut g, po.as_ptr(), 0);
+            signal_pending_op(&mut g, addr(&**po), 0);
         }
         BlockSendOutcome::Queued if deadline_ns != u64::MAX => {
             // `BlockBounded`: register the delivery deadline against the PO; the held send
@@ -361,7 +362,7 @@ pub fn ipc_send_push_blocking(
                 &mut g,
                 deadline::Entry {
                     deadline_ns,
-                    target: deadline::Target::PendingSend { po: po.as_ptr() as usize, channel: peer as usize },
+                    target: deadline::Target::PendingSend { po: addr(&**po) as usize, channel: peer as usize },
                 },
             );
         }
@@ -393,7 +394,7 @@ pub fn ipc_recv_pop_into(
     dst: &mut StoredMsg,
     out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     reclaimed: &mut [Option<ReclaimedSend>; IpcChannel::MAX_PENDING_SENDS],
-) -> (bool, Option<ObjectRef>) {
+) -> (bool, Option<Ref<PendingOperation>>) {
     let mut g = SCHED.lock();
     let endpoint = addr(endpoint);
     // SAFETY: the borrow pins `endpoint`; `SCHED` held.
@@ -407,9 +408,9 @@ pub fn ipc_recv_pop_into(
     if let Some(ref po) = promoted {
         // Delivered before its deadline: drop its pending-send deadline (idempotent), then
         // complete it.
-        let target = deadline::Target::PendingSend { po: po.as_ptr() as usize, channel: endpoint as usize };
+        let target = deadline::Target::PendingSend { po: addr(&**po) as usize, channel: endpoint as usize };
         deadline::remove(&mut g.deadlines, target);
-        signal_pending_op(&mut g, po.as_ptr(), 0);
+        signal_pending_op(&mut g, addr(&**po), 0);
     }
     (true, promoted)
 }
@@ -436,13 +437,11 @@ pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
     // flight: drain *all*. Each PO is signalled here and deferred to the bag.
     // SAFETY: `endpoint` is valid memory; `SCHED` held.
     let reg_self = unsafe { IpcChannel::us_reg_of(endpoint) };
-    // Non-null does not prove live: `us_reg_detach` clears the back-pointer when a
-    // registration drops, but this is a raw read without a count. In the ordinary teardown
-    // the registration owns this endpoint and is mid-drop — its `Inner` declares `endpoint`
-    // before `pending`, so this `Drop` lands with the pending table intact, which makes the
-    // drain correct. A stale registration would be a recycled allocation yielding a garbage
-    // `po` (`#GP`/`#PF`); the `magic` sentinel catches it, and skipping the drain is right
-    // since its lookups were released with it.
+    // Non-null does not prove live: this is a raw read without a count. A registration's drop
+    // fails its requests and clears this pointer in `us_reg_detach` before its fields, this
+    // endpoint among them, drop, so the ordinary teardown reads null here. A stale registration
+    // would be a recycled allocation yielding a garbage `po` (`#GP`/`#PF`); the `magic` sentinel
+    // catches it, and skipping the drain is right since its lookups were released with it.
     // SAFETY: non-null and, being a kernel-heap allocation, mapped and readable.
     if !reg_self.is_null() && unsafe { UserspaceServerReg::is_live(reg_self) } {
         // SAFETY: `reg_self` is this endpoint's owning registration (the endpoint
@@ -515,7 +514,7 @@ mod tests {
         assert_eq!(ipc_send_push(&a, &msg, &mut carrying(&b)), SendOutcome::Cycle, "B into its own ring");
         assert!(matches!(ipc_send_push(&c, &msg, &mut carrying(&b)), SendOutcome::Sent { .. }));
         assert_eq!(ipc_send_push(&a, &msg, &mut carrying(&d)), SendOutcome::Cycle, "D, holding B");
-        let blocking = ipc_send_push_blocking(&a, &msg, &mut carrying(&d), po.as_object(), u64::MAX);
+        let blocking = ipc_send_push_blocking(&a, &msg, &mut carrying(&d), &po, u64::MAX);
         assert_eq!(blocking, BlockSendOutcome::Cycle);
         drop((a, b, c, d));
         assert_eq!(test_probe::ipc_channel_destroys(), 4, "an endpoint left holding another");
@@ -529,7 +528,7 @@ mod tests {
     fn served() -> (Ref<UserspaceServerReg>, Ref<IpcChannel>) {
         let (k, s) = kernel_end();
         let reg = Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
-        assert!(us_server_attach(&k, &reg).is_none());
+        assert!(us_server_attach(&reg).is_none());
         (reg, s)
     }
 
@@ -578,8 +577,8 @@ mod tests {
         let (k, _server_end) = kernel_end();
         let new_reg = || Ref::new(UserspaceServerReg::try_new(k.clone()).unwrap());
         let (first, second) = (new_reg(), new_reg());
-        assert!(us_server_attach(&k, &first).is_none());
-        let shared = us_server_attach(&k, &second).expect("the first registration");
+        assert!(us_server_attach(&first).is_none());
+        let shared = us_server_attach(&second).expect("the first registration");
         assert_eq!(shared.as_ptr(), first.as_ptr());
         // SAFETY: `k` is pinned by the test's reference, and the test is single-threaded.
         let routed = unsafe { IpcChannel::us_reg_of(k.as_object().as_ptr()) };
@@ -603,7 +602,7 @@ mod tests {
         let po = po();
         let mut none: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
         while matches!(ipc_send_push(&c, &msg, &mut none), SendOutcome::Sent { .. }) {}
-        let held = ipc_send_push_blocking(&c, &msg, &mut carrying(&b), po.as_object(), u64::MAX);
+        let held = ipc_send_push_blocking(&c, &msg, &mut carrying(&b), &po, u64::MAX);
         assert_eq!(held, BlockSendOutcome::Queued, "D's ring is full: B waits in its held sends");
         assert_eq!(ipc_send_push(&a, &msg, &mut carrying(&d)), SendOutcome::Cycle);
     }
@@ -626,7 +625,7 @@ mod tests {
         for closes in [false, true] {
             let ((a, b), held) = (pair(), po());
             while matches!(ipc_send_push(&a, &msg, &mut none()), SendOutcome::Sent { .. }) {}
-            let queued = ipc_send_push_blocking(&a, &msg, &mut none(), held.as_object(), u64::MAX - 1);
+            let queued = ipc_send_push_blocking(&a, &msg, &mut none(), &held, u64::MAX - 1);
             assert_eq!(queued, BlockSendOutcome::Queued);
             assert!(named(&held), "a bounded send waits with its deadline");
             if closes {
@@ -637,7 +636,7 @@ mod tests {
                 let mut reclaimed = core::array::from_fn(|_| None);
                 let (popped, promoted) = ipc_recv_pop_into(&b, &mut dst, &mut none(), &mut reclaimed);
                 assert!(popped);
-                assert_eq!(promoted.as_ref().map(ObjectRef::as_ptr), Some(held.as_object().as_ptr()), "delivered");
+                assert_eq!(promoted.as_ref().map(Ref::as_ptr), Some(held.as_ptr()), "delivered");
                 assert!(!named(&held), "delivered by a receive");
                 drop((promoted, b));
             }
