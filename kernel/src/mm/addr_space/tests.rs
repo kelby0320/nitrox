@@ -641,3 +641,35 @@ fn an_unmap_is_shot_down_before_its_frames_or_its_object_are_freed() {
         assert_eq!(heap::frames_freed_by_this_thread() - freed, frames, "{at:#x}");
     }
 }
+
+/// **`copy_in` writes only anonymous memory present where it writes**: it refuses anything else,
+/// having written what came before.
+#[test]
+fn copy_in_writes_only_anonymous_memory_that_is_present() {
+    init_global_heap();
+    let mut asp = AddressSpace::new().unwrap();
+    asp.map_vma(anon_box(range(PAGE * 4, PAGE * 6), uprot())).unwrap();
+    asp.map_vma_lazy(anon_box(range(PAGE * 6, PAGE * 7), uprot())).unwrap();
+    let m = MemoryObject::try_new(PAGE as usize).unwrap();
+    let object_frame = m.frames()[0];
+    asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(m)).unwrap();
+    let f = FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap();
+    let Reserve::New(file_frame) = f.reserve(0) else { panic!("a fresh page") };
+    f.mark_ready(0);
+    let file = into_file(f);
+    asp.map_file(range(PAGE * 10, PAGE * 11), uprot(), file.clone()).unwrap();
+    assert!(asp.map_file_page(va(PAGE * 10), &file, file_frame));
+
+    assert!(asp.copy_in(va(PAGE * 5 - 2), &[1, 2, 3, 4]), "across two anonymous pages");
+    assert!(!asp.copy_in(va(PAGE * 6 - 1), &[5, 6]), "into a page not yet faulted in");
+    assert!(!asp.copy_in(va(PAGE * 8), &[9]), "an object's page");
+    assert!(!asp.copy_in(va(PAGE * 10), &[9]), "a file's page");
+    assert!(!asp.copy_in(va(PAGE * 12), &[9]), "no mapping");
+    // SAFETY: frames this test's mappings and objects keep live; nothing else writes them now.
+    let byte = |phys: PhysAddr| unsafe { *frame::hhdm::<u8>(phys) };
+    // SAFETY: `asp`'s root is the live page table this test built.
+    let at = |a: u64| byte(unsafe { Paging::translate(asp.root(), va(a)) }.expect("mapped"));
+    assert_eq!([PAGE * 5 - 2, PAGE * 5 - 1, PAGE * 5, PAGE * 5 + 1].map(at), [1, 2, 3, 4]);
+    assert_eq!(at(PAGE * 6 - 1), 5, "what came before the page not faulted in");
+    assert_eq!((byte(object_frame), byte(file_frame)), (0, 0), "neither the object's page nor the file's");
+}

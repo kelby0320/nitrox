@@ -48,6 +48,8 @@ use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, KBox, KVec};
+use crate::mm::frame::FrameView;
+use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
@@ -162,9 +164,9 @@ impl RamDisk {
         &self.counted
     }
 
-    /// Perform the IRP's transfer against the backing, returning `(status, transferred)`. A
-    /// `memcpy` either direction across the buffer's physical fragments (reached through the
-    /// HHDM), under the disk's lock. No blocking, no allocation.
+    /// Perform the IRP's transfer against the backing, returning `(status, transferred)`: a copy
+    /// either way across the buffer's fragments, under the disk's lock, through views of their
+    /// frames, as its copies are the CPU's. No blocking, no allocation.
     fn transfer(&self, irp: &Irp) -> (i32, u64) {
         // **Every op by name**: inferring a write from "not a read" is how a flush, which
         // carries no range, would be taken for one.
@@ -200,17 +202,22 @@ impl RamDisk {
         let (mut dev_pos, mut left) = (dev_off, len);
         for f in frags {
             let n = f.len.min(left);
-            let buf_va = crate::mm::frame::hhdm::<u8>(crate::mm::PhysAddr::new(f.base));
-            // SAFETY: `dev_pos + n <= dev_off + len`, which was bounds-checked against the
-            // capacity; `buf_va` is the HHDM alias of an owned buffer frame of at least `n` bytes;
-            // the regions do not overlap.
-            unsafe {
-                let dev_ptr = base.add(dev_pos as usize);
-                if is_read {
-                    core::ptr::copy_nonoverlapping(dev_ptr, buf_va, n as usize);
-                } else {
-                    core::ptr::copy_nonoverlapping(buf_va as *const u8, dev_ptr, n as usize);
+            let (mut pos, mut done) = (f.base, 0);
+            while done < n {
+                let at = pos % PAGE_SIZE as u64;
+                let k = (PAGE_SIZE as u64 - at).min(n - done);
+                // SAFETY: `dev_pos + n <= dev_off + len`, bounds-checked against the capacity: the
+                // disk's own memory, which only a transfer reaches, under `busy`. And a frame of the
+                // IRP's buffer, which the object it holds keeps, its owner lending it to views alone.
+                let (dev, page) = unsafe {
+                    let dev = core::slice::from_raw_parts_mut(base.add((dev_pos + done) as usize), k as usize);
+                    (dev, FrameView::new(PhysAddr::new(pos - at)))
+                };
+                match is_read {
+                    true => page.write(at as usize, dev),
+                    false => page.read(at as usize, dev),
                 }
+                (pos, done) = (pos + k, done + k);
             }
             dev_pos += n;
             left -= n;
@@ -370,6 +377,7 @@ mod tests {
     use super::*;
     use crate::io::irp::{IRP_BUF_FRAGS, IrpBuffer};
     use crate::mm::test_support::init_global_heap;
+    use crate::object::MemoryObject;
 
     /// An IRP over host memory: on the host the HHDM offset is 0, so a fragment's "physical" base
     /// is simply a host address.
@@ -379,8 +387,20 @@ mod tests {
         Irp::new_block(op, core::ptr::null(), offset, length, buffer, core::ptr::null_mut(), 0)
     }
 
-    fn frag(buf: &mut [u8]) -> PhysFrag {
-        PhysFrag { base: buf.as_mut_ptr() as u64, len: buf.len() as u64 }
+    /// A buffer of whole frames holding `bytes`, as an I/O request's is.
+    fn frames_of(bytes: &[u8]) -> KBox<MemoryObject> {
+        MemoryObject::try_new_filled(bytes).unwrap()
+    }
+
+    /// The fragment of `len` bytes from `at` in `m`, inside one frame.
+    fn frag(m: &MemoryObject, at: usize, len: usize) -> PhysFrag {
+        PhysFrag { base: m.frames()[at / PAGE_SIZE].as_u64() + (at % PAGE_SIZE) as u64, len: len as u64 }
+    }
+
+    fn bytes(m: &MemoryObject, len: usize) -> std::vec::Vec<u8> {
+        let mut v = std::vec![0; len];
+        m.copy_out(0, &mut v);
+        v
     }
 
     #[test]
@@ -391,14 +411,14 @@ mod tests {
         let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
         assert_eq!(rd.capacity(), 2048);
 
-        let mut out = [0xAB_u8; 512];
-        let (status, n) = rd.transfer(&irp(IrpOp::Write, 512, &[frag(&mut out)]));
+        let out = frames_of(&[0xAB; 512]);
+        let (status, n) = rd.transfer(&irp(IrpOp::Write, 512, &[frag(&out, 0, 512)]));
         assert_eq!((status, n), (IrpStatus::Success as i32, 512));
 
-        let (mut a, mut b) = ([0u8; 100], [0u8; 412]);
-        let (status, n) = rd.transfer(&irp(IrpOp::Read, 512, &[frag(&mut a), frag(&mut b)]));
+        let back = frames_of(&[0; 512]);
+        let (status, n) = rd.transfer(&irp(IrpOp::Read, 512, &[frag(&back, 0, 100), frag(&back, 100, 412)]));
         assert_eq!((status, n), (IrpStatus::Success as i32, 512));
-        assert!(a.iter().chain(b.iter()).all(|&x| x == 0xAB));
+        assert!(bytes(&back, 512).iter().all(|&x| x == 0xAB));
         drop(rd);
         assert!(module[512..1024].iter().all(|&x| x == 0xAB), "the write landed in the module");
         assert!(module[..512].iter().all(|&x| x == 0), "and nowhere else");
@@ -412,12 +432,14 @@ mod tests {
         let mut module = vec![0xCD_u8; 2560];
         // SAFETY: `module` outlives `rd`, which is over its first 2048 bytes alone.
         let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), 2048) }.unwrap();
-        let mut long = [0xAB_u8; 1024];
-        let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: &frag(&mut long) as *const PhysFrag as u64 };
+        let long = frames_of(&[0xAB; 1024]);
+        let buffer =
+            IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: &frag(&long, 0, 1024) as *const PhysFrag as u64 };
         let write = Irp::new_block(IrpOp::Write, core::ptr::null(), 1536, 512, buffer, core::ptr::null_mut(), 0);
         assert_eq!(rd.transfer(&write), (IrpStatus::Success as i32, 512));
-        let mut short = [0u8; 256];
-        let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: &frag(&mut short) as *const PhysFrag as u64 };
+        let short = frames_of(&[0; 256]);
+        let buffer =
+            IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: &frag(&short, 0, 256) as *const PhysFrag as u64 };
         let read = Irp::new_block(IrpOp::Read, core::ptr::null(), 0, 512, buffer, core::ptr::null_mut(), 0);
         assert_eq!(rd.transfer(&read), (KError::InvalidArgument as i32, 0), "fragments short of it");
         drop(rd);
@@ -430,14 +452,17 @@ mod tests {
     fn a_disk_over_its_own_bytes_writes_and_reads_them_back() {
         init_global_heap();
         let rd = RamDisk::try_new().unwrap();
-        let mut out = [0x5A_u8; 512];
-        assert_eq!(rd.transfer(&irp(IrpOp::Write, 1024, &[frag(&mut out)])), (IrpStatus::Success as i32, 512));
-        let mut back = [0u8; 512];
-        assert_eq!(rd.transfer(&irp(IrpOp::Read, 1024, &[frag(&mut back)])), (IrpStatus::Success as i32, 512));
-        assert_eq!(back, [0x5A; 512]);
-        let mut before = [0u8; 512];
-        rd.transfer(&irp(IrpOp::Read, 512, &[frag(&mut before)]));
-        assert!(before.iter().enumerate().all(|(i, &b)| b == RamDisk::pattern_byte(512 + i)), "and nowhere else");
+        let out = frames_of(&[0x5A; 512]);
+        assert_eq!(rd.transfer(&irp(IrpOp::Write, 1024, &[frag(&out, 0, 512)])), (IrpStatus::Success as i32, 512));
+        let back = frames_of(&[0; 512]);
+        assert_eq!(rd.transfer(&irp(IrpOp::Read, 1024, &[frag(&back, 0, 512)])), (IrpStatus::Success as i32, 512));
+        assert_eq!(bytes(&back, 512), [0x5A; 512]);
+        let before = frames_of(&[0; 512]);
+        rd.transfer(&irp(IrpOp::Read, 512, &[frag(&before, 0, 512)]));
+        assert!(
+            bytes(&before, 512).iter().enumerate().all(|(i, &b)| b == RamDisk::pattern_byte(512 + i)),
+            "and nowhere else"
+        );
     }
 
     /// A RAM disk counts what it serves: each transfer by its op, the bytes it
@@ -456,10 +481,10 @@ mod tests {
             ticks.set(ticks.get() + 5);
             ticks.get()
         };
-        let mut buf = [0u8; 1024];
-        assert_eq!(rd.serve(&irp(IrpOp::Write, 0, &[frag(&mut buf)]), clock), (IrpStatus::Success as i32, 1024));
-        assert_eq!(rd.serve(&irp(IrpOp::Read, 512, &[frag(&mut buf[..512])]), clock).1, 512);
-        assert_eq!(rd.serve(&irp(IrpOp::Read, 2048, &[frag(&mut buf[..512])]), clock).1, 0, "past the end");
+        let buf = frames_of(&[0; 1024]);
+        assert_eq!(rd.serve(&irp(IrpOp::Write, 0, &[frag(&buf, 0, 1024)]), clock), (IrpStatus::Success as i32, 1024));
+        assert_eq!(rd.serve(&irp(IrpOp::Read, 512, &[frag(&buf, 0, 512)]), clock).1, 512);
+        assert_eq!(rd.serve(&irp(IrpOp::Read, 2048, &[frag(&buf, 0, 512)]), clock).1, 0, "past the end");
         rd.serve(&irp(IrpOp::Rescan, 0, &[]), clock);
         let r = IO.record_for(0, 0);
         assert_eq!((r.writes, r.written_bytes, r.reads, r.read_bytes), (1, 1024, 1, 512));
@@ -476,9 +501,10 @@ mod tests {
         // SAFETY: as above.
         let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
         assert_eq!(rd.transfer(&irp(IrpOp::Flush, 0, &[])), (IrpStatus::Success as i32, 0));
-        let mut out = [0xCD_u8; 512];
-        assert_eq!(rd.transfer(&irp(IrpOp::Flush, 0, &[frag(&mut out)])), (IrpStatus::Success as i32, 0));
-        let mut unknown = irp(IrpOp::Write, 0, &[frag(&mut out)]);
+        let out = frames_of(&[0xCD; 512]);
+        assert_eq!(rd.transfer(&irp(IrpOp::Flush, 0, &[frag(&out, 0, 512)])), (IrpStatus::Success as i32, 0));
+        let out = [frag(&out, 0, 512)];
+        let mut unknown = irp(IrpOp::Write, 0, &out);
         unknown.op = 7;
         assert_eq!(rd.transfer(&unknown).0, KError::InvalidArgument as i32);
         assert_eq!(rd.transfer(&irp(IrpOp::Eject, 0, &[])).0, KError::Unsupported as i32, "nothing ejects it");
@@ -492,10 +518,10 @@ mod tests {
         let mut module = vec![7u8; 1024];
         // SAFETY: as above.
         let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
-        let mut out = [0u8; 512];
-        let (status, n) = rd.transfer(&irp(IrpOp::Write, 768, &[frag(&mut out)]));
+        let out = frames_of(&[0; 512]);
+        let (status, n) = rd.transfer(&irp(IrpOp::Write, 768, &[frag(&out, 0, 512)]));
         assert_eq!((status, n), (KError::InvalidArgument as i32, 0), "ends 256 bytes past the disk");
-        let (status, _) = rd.transfer(&irp(IrpOp::Read, u64::MAX - 10, &[frag(&mut out)]));
+        let (status, _) = rd.transfer(&irp(IrpOp::Read, u64::MAX - 10, &[frag(&out, 0, 512)]));
         assert_eq!(status, KError::InvalidArgument as i32, "an offset that overflows");
         drop(rd);
         assert!(module.iter().all(|&x| x == 7));
@@ -505,9 +531,9 @@ mod tests {
     fn the_bring_up_disk_still_reads_its_pattern() {
         init_global_heap();
         let rd = RamDisk::try_new().unwrap();
-        let mut out = [0u8; 64];
-        rd.transfer(&irp(IrpOp::Read, 1000, &[frag(&mut out)]));
-        assert!(out.iter().enumerate().all(|(i, &x)| x == RamDisk::pattern_byte(1000 + i)));
+        let out = frames_of(&[0; 64]);
+        rd.transfer(&irp(IrpOp::Read, 1000, &[frag(&out, 0, 64)]));
+        assert!(bytes(&out, 64).iter().enumerate().all(|(i, &x)| x == RamDisk::pattern_byte(1000 + i)));
     }
 
     #[test]
@@ -522,5 +548,24 @@ mod tests {
         let slots = *MODULE_DISKS.lock();
         let first = slots[0].unwrap();
         assert_eq!((first.index, first.path_len), (1, PATH_BYTES));
+    }
+
+    /// **A transfer to or from a buffer another thread writes is no race**, which Miri tells: the
+    /// disk's copies are the CPU's, so they reach the buffer's frames as its owner's views do.
+    #[test]
+    fn a_transfer_beside_a_writer_to_its_buffer_is_no_race() {
+        init_global_heap();
+        let mut module = vec![0u8; 2048];
+        // SAFETY: `module` outlives `rd` and nothing else touches it while `rd` is used.
+        let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
+        let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
+        let frags = [PhysFrag { base: m.frames()[0].as_u64(), len: 512 }];
+        for op in [IrpOp::Write, IrpOp::Read] {
+            std::thread::scope(|s| {
+                s.spawn(|| m.copy_in(0, &[1; 512]));
+                assert_eq!(rd.transfer(&irp(op, 0, &frags)), (IrpStatus::Success as i32, 512));
+            });
+        }
+        drop(rd);
     }
 }

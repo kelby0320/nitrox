@@ -497,11 +497,11 @@ impl ArchPlatform for X86Platform {
 
         // Translate to a kernel-virtual pointer via the HHDM; Limine returns a physical address,
         // but an already-virtual one (far above a physical RSDP) is tolerated.
-        let hhdm = heap::hhdm_offset();
-        let va = if address >= hhdm { address } else { address + hhdm };
+        let virtual_already = address >= heap::hhdm_offset();
+        let va = if virtual_already { address as *const u8 } else { crate::mm::frame::hhdm(PhysAddr::new(address)) };
         // SAFETY: the RSDP lives in firmware memory mapped by the HHDM; reading
         // up to 36 bytes (the max RSDP size) is within the mapping.
-        let rsdp = unsafe { core::slice::from_raw_parts(va as *const u8, 36) };
+        let rsdp = unsafe { core::slice::from_raw_parts(va, 36) };
 
         let info = match parse_rsdp(rsdp) {
             Some(i) => i,

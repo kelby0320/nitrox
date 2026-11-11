@@ -1,8 +1,9 @@
 //! A frame's bytes, through the HHDM: a [`FrameView`] its owner lends, and [`hhdm`] for memory no
-//! owner lends (firmware tables, page tables, an I/O request's fragments).
+//! owner lends (firmware tables, page tables, a DMA buffer's memory).
 
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::ops::Range;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 
@@ -22,9 +23,9 @@ pub fn alloc_zeroed(order: usize) -> Option<PhysAddr> {
     Some(block)
 }
 
-/// One frame's bytes, lent by its owner for `'a`, **copied in relaxed atomic words** (plain moves on
-/// x86_64): a user mapping or another CPU may write them meanwhile, and a reference to such bytes,
-/// or a non-atomic copy of them, is a data race.
+/// One frame's bytes, lent by its owner for `'a`. **Every access is an aligned 8-byte atomic**
+/// (a plain move on x86_64): a user mapping or another CPU may write the frame meanwhile, and a
+/// reference to such bytes, a non-atomic copy, or atomics of two sizes over one word race.
 #[derive(Clone, Copy)]
 pub struct FrameView<'a> {
     base: *mut u8,
@@ -45,55 +46,59 @@ impl<'a> FrameView<'a> {
     /// Copy the frame's bytes from `at` into `dst`. Panics past the frame's end.
     pub fn read(self, at: usize, dst: &mut [u8]) {
         in_frame(at, dst.len());
-        walk(
-            dst.len(),
-            |i| (at + i).is_multiple_of(WORD),
-            |i, word| match word {
-                true => dst[i..i + WORD].copy_from_slice(&self.word(at + i).load(Ordering::Relaxed).to_ne_bytes()),
-                false => dst[i] = self.byte(at + i).load(Ordering::Relaxed),
-            },
-        );
+        for (w, bytes, from) in words(at, dst.len()) {
+            let word = self.word(w).load(Ordering::Relaxed).to_ne_bytes();
+            dst[from..from + bytes.len()].copy_from_slice(&word[bytes]);
+        }
     }
 
     /// Copy `src` into the frame from `at`. Panics past the frame's end.
     pub fn write(self, at: usize, src: &[u8]) {
         in_frame(at, src.len());
-        walk(
-            src.len(),
-            |i| (at + i).is_multiple_of(WORD),
-            |i, word| match word {
-                true => self.word(at + i).store(u64::from_ne_bytes(word_of(&src[i..])), Ordering::Relaxed),
-                false => self.byte(at + i).store(src[i], Ordering::Relaxed),
-            },
-        );
+        for (w, bytes, from) in words(at, src.len()) {
+            let n = bytes.len();
+            self.put(w, bytes, &src[from..from + n]);
+        }
     }
 
     /// Set `len` bytes from `at` to `byte`. Panics past the frame's end.
     pub fn fill(self, at: usize, len: usize, byte: u8) {
         in_frame(at, len);
-        let whole = u64::from_ne_bytes([byte; WORD]);
-        walk(
-            len,
-            |i| (at + i).is_multiple_of(WORD),
-            |i, word| match word {
-                true => self.word(at + i).store(whole, Ordering::Relaxed),
-                false => self.byte(at + i).store(byte, Ordering::Relaxed),
-            },
-        );
+        for (w, bytes, _) in words(at, len) {
+            let n = bytes.len();
+            self.put(w, bytes, &[byte; WORD][..n]);
+        }
     }
 
     /// Copy `len` bytes of `src` from `src_at` into this frame from `at`. Panics past either end.
     pub fn copy_from(self, at: usize, src: FrameView<'_>, src_at: usize, len: usize) {
         in_frame(at, len);
         in_frame(src_at, len);
-        walk(
-            len,
-            |i| (at + i).is_multiple_of(WORD) && (src_at + i).is_multiple_of(WORD),
-            |i, word| match word {
-                true => self.word(at + i).store(src.word(src_at + i).load(Ordering::Relaxed), Ordering::Relaxed),
-                false => self.byte(at + i).store(src.byte(src_at + i).load(Ordering::Relaxed), Ordering::Relaxed),
-            },
-        );
+        for (w, bytes, from) in words(at, len) {
+            let mut piece = [0u8; WORD];
+            let piece = &mut piece[..bytes.len()];
+            src.read(src_at + from, piece);
+            self.put(w, bytes, piece);
+        }
+    }
+
+    /// Store `src` as bytes `bytes` of the word at `w`: whole, or merged by compare-and-swap into
+    /// what the word holds, so another writer's bytes in it are not lost.
+    fn put(self, w: usize, bytes: Range<usize>, src: &[u8]) {
+        let word = self.word(w);
+        if bytes.len() == WORD {
+            word.store(u64::from_ne_bytes(src.try_into().expect("a word's bytes")), Ordering::Relaxed);
+            return;
+        }
+        let merge = |old: u64| {
+            let mut new = old.to_ne_bytes();
+            new[bytes.clone()].copy_from_slice(src);
+            u64::from_ne_bytes(new)
+        };
+        let mut old = word.load(Ordering::Relaxed);
+        while let Err(now) = word.compare_exchange_weak(old, merge(old), Ordering::Relaxed, Ordering::Relaxed) {
+            old = now;
+        }
     }
 
     fn word(self, at: usize) -> &'a AtomicU64 {
@@ -102,30 +107,20 @@ impl<'a> FrameView<'a> {
         // nothing else reach but atomically.
         unsafe { AtomicU64::from_ptr(self.base.add(at).cast()) }
     }
-
-    fn byte(self, at: usize) -> &'a AtomicU8 {
-        assert!(at < PAGE_SIZE, "a byte at {at}");
-        // SAFETY: as `word`'s, for a byte.
-        unsafe { AtomicU8::from_ptr(self.base.add(at)) }
-    }
 }
 
 fn in_frame(at: usize, len: usize) {
     assert!(at.checked_add(len).is_some_and(|end| end <= PAGE_SIZE), "{len} bytes at {at} run past a frame");
 }
 
-/// Hand `step` each offset of `len` bytes, and whether a word moves from it: where `aligned`, if one fits.
-fn walk(len: usize, aligned: impl Fn(usize) -> bool, mut step: impl FnMut(usize, bool)) {
-    let mut i = 0;
-    while i < len {
-        let word = len - i >= WORD && aligned(i);
-        step(i, word);
-        i += if word { WORD } else { 1 };
-    }
-}
-
-fn word_of(bytes: &[u8]) -> [u8; WORD] {
-    bytes[..WORD].try_into().expect("a word's bytes")
+/// The words `len` bytes from `at` touch: each one's offset, the bytes of it they cover, and where
+/// those begin among the `len`.
+fn words(at: usize, len: usize) -> impl Iterator<Item = (usize, Range<usize>, usize)> {
+    let end = at + len;
+    (at - at % WORD..end)
+        .step_by(WORD)
+        .map(move |w| (w, at.max(w) - w..end.min(w + WORD) - w))
+        .filter_map(move |(w, bytes)| (!bytes.is_empty()).then(|| (w, bytes.clone(), w + bytes.start - at)))
 }
 
 #[cfg(test)]

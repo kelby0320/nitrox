@@ -211,16 +211,19 @@ the buddy's own tests keep its coalescing on their local allocator.
 the HHDM:
 
 - **`FrameView`**: one frame its owner lends for a borrow, with `read`, `write`, `fill` and
-  `copy_from`, each stopping an access past the frame's end. **It copies in relaxed atomic
-  words, never forming a reference**: a user mapping or another CPU may write the frame
-  meanwhile, and a `&[u8]` over such bytes is a data race, as a non-atomic copy is. Relaxed
-  loads and stores are plain moves on x86_64. Owners lend views: `MemoryObject::page` (with
-  `copy_in` and `copy_out` over it), a `FileObject`'s cache pages, and `AddressSpace::copy_in`,
-  which writes the anonymous memory mapped at an address.
+  `copy_from`, each stopping an access past the frame's end. **Every access is an aligned 8-byte
+  atomic, never a reference**, and a write of part of a word merges by compare-and-swap: a user
+  mapping or another CPU may write the frame meanwhile, and a `&[u8]` over such bytes, a
+  non-atomic copy, or atomics of two sizes over one word race. Relaxed loads and stores are plain
+  moves on x86_64. Owners lend views: `MemoryObject::page` (with `copy_in` and `copy_out` over
+  it), a `FileObject`'s cache pages, and `AddressSpace::copy_in`, which writes the anonymous
+  memory mapped at an address. The RAM disk, whose copies stand in for a device's, reaches an I/O
+  request's frames through views too.
 - **`alloc_zeroed`**: fresh frames from the buddy, zeroed, as a mapping, a page table or a cache
   page starts.
 - **`hhdm`**: the address of memory no owner lends, which its caller reaches in its own `unsafe`:
-  ACPI's tables, the page tables, the fragments an I/O request carries.
+  ACPI's tables, the page tables, a DMA buffer's memory. The slab reaches its own pages through
+  its `BuddyPager`.
 
 ## Initialisation order
 

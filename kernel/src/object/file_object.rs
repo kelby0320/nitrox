@@ -951,17 +951,14 @@ impl FileObject {
         }
     }
 
-    /// Materialize the whole file into a fresh heap buffer of [`size`](Self::size) bytes via
-    /// [`fault_in_page`](Self::fault_in_page), **blocking on each fill**, so only where blocking
-    /// is allowed (a syscall thread, not a DPC/IRQ). `sys_process_spawn` loads an ELF with it.
-    /// `AllocError` on a buffer-allocation or fill failure.
-    pub fn read_to_kvec(file_obj: &Ref<FileObject>) -> Result<KVec<u8>, AllocError> {
-        let fo: &FileObject = file_obj;
-        let mut buf = KVec::try_filled(0, fo.size())?;
+    /// The whole file in a fresh heap buffer, each page faulted in by `fault` first: a spawn gives
+    /// [`fault_in_page`](Self::fault_in_page), which blocks on each fill. `AllocError` on a failure.
+    pub fn read_to_kvec(&self, mut fault: impl FnMut(usize) -> Option<PhysAddr>) -> Result<KVec<u8>, AllocError> {
+        let mut buf = KVec::try_filled(0, self.size())?;
         for (i, piece) in buf.chunks_mut(PAGE_SIZE).enumerate() {
-            FileObject::fault_in_page(file_obj, i).ok_or(AllocError)?;
+            fault(i).ok_or(AllocError)?;
             // Not ready once faulted in only if a truncation took it since.
-            fo.ready_page(i).ok_or(AllocError)?.read(0, piece);
+            self.ready_page(i).ok_or(AllocError)?.read(0, piece);
         }
         Ok(buf)
     }

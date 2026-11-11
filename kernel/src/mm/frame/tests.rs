@@ -14,16 +14,20 @@ fn stops(f: impl FnOnce()) -> bool {
     catch_unwind(AssertUnwindSafe(f)).is_err()
 }
 
-/// **Each access reaches the frame's last byte and stops one past it**, or at an end that overflows.
+/// **Each access reaches the frame's last byte and stops one past it**, or at an end that overflows,
+/// having written none of the frame: each runs words past the end at lengths that would write some.
 #[test]
 fn an_access_reaches_the_last_byte_and_stops_one_past_it() {
     init_global_heap();
     let (f, page) = frame();
+    let mut expected: std::vec::Vec<u8> = (0..PAGE_SIZE).map(|i| i as u8).collect();
+    page.write(0, &expected);
     page.write(PAGE_SIZE - 1, &[7]);
     let mut b = [0u8];
     page.read(PAGE_SIZE - 1, &mut b);
     assert_eq!(b, [7]);
     page.fill(PAGE_SIZE - 1, 1, 9);
+    expected[PAGE_SIZE - 1] = 9;
     page.read(PAGE_SIZE, &mut []);
     page.write(PAGE_SIZE, &[]);
     page.fill(PAGE_SIZE, 0, 1);
@@ -32,13 +36,33 @@ fn an_access_reaches_the_last_byte_and_stops_one_past_it() {
     assert!(stops(|| page.read(PAGE_SIZE, &mut [0])), "a read one past");
     assert!(stops(|| page.read(PAGE_SIZE - 1, &mut [0; 2])), "a read running one past");
     assert!(stops(|| page.write(PAGE_SIZE, &[0])), "a write one past");
-    assert!(stops(|| page.write(PAGE_SIZE - 8, &[0; 9])), "a word's write running one past");
+    assert!(stops(|| page.write(PAGE_SIZE - 12, &[0; 13])), "a write running one past");
     assert!(stops(|| page.fill(PAGE_SIZE + 1, 0, 0)), "an empty fill past the end");
+    assert!(stops(|| page.fill(PAGE_SIZE - 12, 13, 0)), "a fill running one past");
     assert!(stops(|| page.fill(usize::MAX, 2, 0)), "a fill whose end overflows");
-    assert!(stops(|| page.copy_from(0, page, PAGE_SIZE - 3, 4)), "a copy from past the source");
-    assert!(stops(|| page.copy_from(PAGE_SIZE - 3, page, 0, 4)), "a copy past the destination");
-    page.read(PAGE_SIZE - 1, &mut b);
-    assert_eq!(b, [9], "nothing a refused access began was written");
+    assert!(stops(|| page.copy_from(0, page, PAGE_SIZE - 12, 13)), "a copy from past the source");
+    assert!(stops(|| page.copy_from(PAGE_SIZE - 12, page, 0, 13)), "a copy past the destination");
+    let mut back = std::vec![0u8; PAGE_SIZE];
+    page.read(0, &mut back);
+    assert!(back == expected, "a refused access wrote nothing");
+    heap::buddy_free(f, 0);
+}
+
+/// **Writers to two bytes of one word lose neither's**: a write of part of a word merges.
+#[test]
+fn writers_to_two_bytes_of_one_word_lose_neither() {
+    init_global_heap();
+    let (f, page) = frame();
+    for round in 0..if cfg!(miri) { 4 } else { 64 } {
+        std::thread::scope(|s| {
+            // SAFETY: the frame this test allocated and frees after the scope.
+            s.spawn(move || unsafe { FrameView::new(f) }.write(1, &[round]));
+            page.write(2, &[!round]);
+        });
+        let mut w = [0u8; 8];
+        page.read(0, &mut w);
+        assert_eq!((w[1], w[2]), (round, !round), "round {round}");
+    }
     heap::buddy_free(f, 0);
 }
 

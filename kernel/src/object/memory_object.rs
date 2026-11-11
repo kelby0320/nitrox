@@ -411,7 +411,8 @@ mod tests {
         assert_eq!(MemoryObject::try_new(PAGE_SIZE).unwrap().caching(), Caching::Normal);
     }
 
-    /// **An object copied out while a user mapping writes it is no race**: both move atomic words.
+    /// **An object copied out while a user mapping writes it is no race**, which Miri tells: natively,
+    /// any copy passes. Both move aligned atomic words.
     #[test]
     fn copying_an_object_out_while_another_writes_it_is_no_race() {
         use core::sync::atomic::{AtomicU64, Ordering};
@@ -428,6 +429,19 @@ mod tests {
             });
             let copy = m.copy_to_kvec().unwrap();
             assert!(copy.iter().all(|&b| b == 0 || b == 0xFF));
+        });
+    }
+
+    /// **Copies at different alignments are no race**, which Miri tells: one in from an odd offset
+    /// and one out whole reach the frame in the same aligned words.
+    #[test]
+    fn copies_at_different_alignments_are_no_race() {
+        init_global_heap();
+        let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| m.copy_in(1, &[0xFF; 15]));
+            let copy = m.copy_to_kvec().unwrap();
+            assert!(copy[1..16].iter().all(|&b| b == 0 || b == 0xFF) && copy[0] == 0 && copy[16] == 0);
         });
     }
 }

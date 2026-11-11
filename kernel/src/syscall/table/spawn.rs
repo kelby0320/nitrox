@@ -137,5 +137,5 @@ pub(super) fn image_bytes(img: &ObjectRef) -> Result<KVec<u8>, KError> {
     // Blocks on each fill — sound on the syscall thread, which holds no AS/cache lock.
     let file = img.clone().downcast::<FileObject>().map_err(|_| KError::InvalidArgument)?;
     image_fits(file.size())?;
-    FileObject::read_to_kvec(&file).map_err(|_| KError::OutOfMemory)
+    file.read_to_kvec(|i| FileObject::fault_in_page(&file, i)).map_err(|_| KError::OutOfMemory)
 }
