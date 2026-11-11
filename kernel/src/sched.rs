@@ -45,9 +45,10 @@ use crate::arch::{Cpu, MAX_CPUS, Paging, context_switch};
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::ipc::IPC_HANDLE_MAX;
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, Reserved};
+use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, Reserved};
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::mm::PhysAddr;
+use crate::mm::kstack::KernelStackTop;
 use crate::object::header::{Closing, Ref, Shared, Weak};
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 use crate::object::{
@@ -203,17 +204,10 @@ fn addr<T: Shared>(object: &T) -> *mut () {
     core::ptr::from_ref(object).cast_mut().cast()
 }
 
-/// The page-table root a thread should run under: its own process root if it
-/// has one, else the boot root. Caller holds the run-queue lock.
-///
-/// # Safety
-/// `obj` is a live, pinned `Thread`.
-unsafe fn resolve_root(obj: *mut ()) -> PhysAddr {
-    // SAFETY: this function's contract: `obj` is a live, pinned `Thread`.
-    match unsafe { Thread::addr_space_root(obj) } {
-        Some(root) => root,
-        None => PhysAddr::new(BOOT_ROOT.load(Ordering::Relaxed)),
-    }
+/// The page-table root a thread should run under: its own process root if it has one, else the
+/// boot root.
+fn resolve_root(th: &Thread) -> PhysAddr {
+    th.addr_space_root().unwrap_or_else(|| PhysAddr::new(BOOT_ROOT.load(Ordering::Relaxed)))
 }
 
 /// Scheduler state behind the rank-1 run-queue lock.
@@ -223,7 +217,7 @@ struct SchedState {
     /// while queued. A preempted thread re-homes to **its own** CPU's queue; movement
     /// happens only via placement (spawn/wake) and stealing. Pre-reserved per CPU (see
     /// [`MAX_THREADS`]), all under the one `SCHED` lock.
-    ready: [Reserved<ObjectRef>; MAX_CPUS],
+    ready: [Reserved<Ref<Thread>>; MAX_CPUS],
     /// Which CPUs' scheduler state is initialized (and whose queues are reserved). The BSP
     /// sets bit 0 in [`init`]; each AP sets its own in [`ap_init`] in the same critical
     /// section that reserves its queues. Placement and stealing only target a CPU whose flag
@@ -231,7 +225,7 @@ struct SchedState {
     cpu_online: [bool; MAX_CPUS],
     /// The currently running thread, **per CPU** (indexed via
     /// [`cur_slot`](SchedState::cur_slot)). `None` only before that CPU's init.
-    current: [Option<ObjectRef>; MAX_CPUS],
+    current: [Option<Ref<Thread>>; MAX_CPUS],
     /// Exited threads awaiting reclamation, **per CPU** (indexed via
     /// [`reap_slot`](SchedState::reap_slot)). Dropped — freeing their kernel stacks — by the
     /// next scheduler entry **on the same CPU**, never by the thread itself (still running
@@ -239,11 +233,11 @@ struct SchedState {
     /// `switch_into`s off its stack, so freeing it from another CPU mid-switch would be a
     /// use-after-free. A **list** because several threads can end on a CPU before its next
     /// scheduler entry. Pre-reserved per CPU (see [`MAX_THREADS`]).
-    reap: [Reserved<ObjectRef>; MAX_CPUS],
+    reap: [Reserved<Ref<Thread>>; MAX_CPUS],
     /// Threads suspended after a ring-3 fault, off the run queue with their `ExceptionFrame`
     /// on their kernel stacks. `sys_exception_resume` moves one back to `ready` or marks it
     /// for termination. Pre-reserved (see [`MAX_THREADS`]).
-    suspended: Reserved<ObjectRef>,
+    suspended: Reserved<Ref<Thread>>,
     /// Monotonic thread-id source.
     next_tid: u32,
     /// Monotonic process-id source. The boot parent takes pid 1; spawned children take
@@ -259,13 +253,13 @@ struct SchedState {
     min_vruntime: [u64; MAX_CPUS],
     /// The idle thread, **per CPU**, parked here whenever it is **not** that CPU's current
     /// thread; kept out of `ready`/`reap`. `None` before [`init`] or while idle is current.
-    idle: [Option<ObjectRef>; MAX_CPUS],
+    idle: [Option<Ref<Thread>>; MAX_CPUS],
     /// Each CPU's idle-thread object address, its stable identity (the `idle` slot is empty
     /// while idle runs). A `usize` so `SchedState` stays `Send`.
     idle_addr: [usize; MAX_CPUS],
     /// Threads blocked in `sys_wait`, off the run queue, each holding one refcount on its
     /// `Thread`. Pre-reserved (see [`MAX_THREADS`]).
-    blocked: Reserved<ObjectRef>,
+    blocked: Reserved<Ref<Thread>>,
     /// The deadline min-heap, drained on each tick. Never fuller than its promised slots.
     deadlines: Reserved<deadline::Entry>,
     /// The heap slots promised, by [`deadline::DeadlineKind`]: the threads' at [`init`], each
@@ -287,7 +281,7 @@ struct SchedState {
     ended_pids: Reserved<u32>,
     /// The reaper thread while it is parked. `None` while it is running or queued, like
     /// [`idle`](Self::idle), so a wake is a `take()`.
-    reaper: Option<ObjectRef>,
+    reaper: Option<Ref<Thread>>,
     /// Threads held, the idle threads aside: counted from a thread's first placement (or
     /// adoption at boot) until its reap is drained. Bounded by [`MAX_THREADS`].
     threads: usize,
@@ -339,32 +333,38 @@ impl SchedState {
 
     /// This CPU's `current`-thread slot (mutable).
     #[inline]
-    fn cur_slot(&mut self) -> &mut Option<ObjectRef> {
+    fn cur_slot(&mut self) -> &mut Option<Ref<Thread>> {
         &mut self.current[Self::this_cpu()]
     }
 
     /// This CPU's `current`-thread slot (shared).
     #[inline]
-    fn cur_ref(&self) -> &Option<ObjectRef> {
+    fn cur_ref(&self) -> &Option<Ref<Thread>> {
         &self.current[Self::this_cpu()]
+    }
+
+    /// This CPU's running thread, with the token lent beside it.
+    fn running(&mut self) -> (&Thread, &mut SchedToken) {
+        let cur = self.current[Self::this_cpu()].as_deref().expect("current set when a thread runs");
+        (cur, &mut self.tok)
     }
 
     /// This CPU's idle-thread parking slot (mutable).
     #[inline]
-    fn idle_slot(&mut self) -> &mut Option<ObjectRef> {
+    fn idle_slot(&mut self) -> &mut Option<Ref<Thread>> {
         &mut self.idle[Self::this_cpu()]
     }
 
     /// This CPU's reap list (mutable). Per-CPU so a dying thread is reclaimed only by the
     /// CPU it died on, after its `switch_into` completed.
     #[inline]
-    fn reap_slot(&mut self) -> &mut Reserved<ObjectRef> {
+    fn reap_slot(&mut self) -> &mut Reserved<Ref<Thread>> {
         &mut self.reap[Self::this_cpu()]
     }
 
     /// This CPU's ready run queue (mutable). A preempted thread re-homes here.
     #[inline]
-    fn ready_slot(&mut self) -> &mut Reserved<ObjectRef> {
+    fn ready_slot(&mut self) -> &mut Reserved<Ref<Thread>> {
         &mut self.ready[Self::this_cpu()]
     }
 
@@ -386,11 +386,6 @@ impl SchedState {
 /// `sys_process_spawn` calls this before touching the rank-3 handle table.
 pub fn alloc_pid() -> Option<u32> {
     SCHED.lock().take_pid()
-}
-
-/// Adopt a freshly created `Thread` into an [`ObjectRef`] without a refcount change.
-fn into_objref(t: KBox<Thread>) -> ObjectRef {
-    ObjectRef::new(t)
 }
 
 /// Cooperatively yield to the next ready thread, round-robin. Returns immediately (still
@@ -511,15 +506,12 @@ pub fn stats_snapshot() -> stats::Snapshot {
     }
 }
 
-/// Point the ring-0 trap stack (`TSS.RSP0`) and the per-CPU syscall stack at `obj`'s kernel
-/// stack, so a ring-3 → ring-0 transition from this thread lands on **its** kernel stack,
-/// not a sibling's. Called on every switch-in; a no-op for stackless boot/idle threads that
-/// never trap from ring 3. Caller holds `SCHED`; the writes are arch register/per-CPU
-/// stores, no locks.
-unsafe fn arm_kernel_stack_for(obj: *mut ()) {
-    // SAFETY: `obj` is the pinned incoming thread; `kstack_top` reads its field
-    // under `SCHED`. Setting TSS.RSP0 / the syscall stack are arch stores.
-    if let Some(ktop) = unsafe { Thread::kstack_top(obj) } {
+/// Point the ring-0 trap stack (`TSS.RSP0`) and the per-CPU syscall stack at a thread's kernel
+/// stack, `top`, so a ring-3 → ring-0 transition from it lands on **its** kernel stack, not a
+/// sibling's. Called on every switch-in; a no-op for stackless boot/idle threads (`None`), which
+/// never trap from ring 3. The writes are arch register/per-CPU stores, no locks.
+fn arm_kernel_stack(top: Option<KernelStackTop>) {
+    if let Some(ktop) = top {
         Cpu::set_kernel_stack(ktop);
         crate::arch::set_syscall_kernel_stack(ktop);
         // Re-assert this CPU's `KERNEL_GS_BASE`. A user thread that **migrated** here must
@@ -547,8 +539,7 @@ enum Park {
 
 /// Give `prev` the state `to` means and put it on that list. Caller holds `SCHED`.
 fn park(g: &mut SchedState, prev: Outgoing, to: Park) {
-    let obj = prev.as_ptr();
-    let idle = g.idle_addr() == obj as usize;
+    let idle = g.idle_addr() == prev.as_ptr() as usize;
     debug_assert!(!idle || to == Park::Ready, "the idle thread only ever yields");
     let state = match to {
         Park::Ready => ThreadState::Ready,
@@ -556,8 +547,7 @@ fn park(g: &mut SchedState, prev: Outgoing, to: Park) {
         Park::Suspended => ThreadState::Suspended,
         Park::Exited => ThreadState::Exited,
     };
-    // SAFETY: `prev` pins the thread; `SCHED` held.
-    unsafe { Thread::set_state(obj, state) };
+    prev.set_state(&mut g.tok, state);
     let r = prev.into_ref();
     match to {
         Park::Ready if idle => {
@@ -584,77 +574,87 @@ fn switch_away(mut g: IrqSpinLockGuard<'_, SchedState>, prev: Outgoing, to: Park
         Some(n) => n,
         None => g.idle_slot().take().expect("a runnable thread (ready or idle)"),
     };
-    let (prev_obj, next_obj) = (prev.as_ptr(), next.as_ptr());
+    let switch = Switch::prepare(&mut g, &prev, &next);
     park(&mut g, prev, to);
-    // SAFETY: `next` is pinned, becoming current; `SCHED` held.
-    unsafe { Thread::set_state(next_obj, ThreadState::Running) };
+    next.set_state(&mut g.tok, ThreadState::Running);
     *g.cur_slot() = Some(next);
-    // SAFETY: `prev_obj` is the thread this CPU runs, an `Outgoing` being only ever that, now
-    // pinned by the list `park` put it on; `next_obj` is pinned by `current`; `SCHED` held.
-    unsafe { switch_into(g, prev_obj, next_obj) };
+    // SAFETY: `switch` was prepared under this hold from `prev`, the thread this CPU runs, now on
+    // the list `park` put it on, and `next`, now `current`; each pinned there.
+    unsafe { switch_into(g, switch) };
 }
 
-/// The switch itself, for [`switch_away`]. It drops the lock keeping interrupts masked (see the
-/// module docs and [`release_keeping_irqs_masked`](IrqSpinLockGuard::release_keeping_irqs_masked)),
-/// re-arms the incoming thread's trap/syscall kernel stack, loads its page-table root **before**
-/// switching away (so a dying thread's CR3 is off its soon-to-be-freed root), and performs the
-/// stack switch, saving the outgoing thread's kernel RSP in its own slot. On a resuming caller,
+/// What a switch needs of its two threads, read under the `SCHED` hold it is prepared in, so that
+/// once the lock is let go it reaches neither but through the addresses of their parked contexts.
+struct Switch {
+    out_sp_slot: *mut u64,
+    out_on_cpu: *mut u8,
+    out_fpu: *mut crate::arch::ArchFpuState,
+    next_sp: u64,
+    next_root: PhysAddr,
+    next_kstack: Option<KernelStackTop>,
+    next_fpu: *mut crate::arch::ArchFpuState,
+}
+
+impl Switch {
+    /// Prepare the switch from `out`, the thread this CPU runs, to `next`: wait out `next`'s
+    /// mid-switch-out guard to read its saved stack pointer, record where it runs, and raise
+    /// `out`'s guard. Caller holds `SCHED`.
+    fn prepare(g: &mut SchedState, out: &Thread, next: &Thread) -> Self {
+        let me = SchedState::this_cpu();
+        // Sample the **outgoing** thread's kernel-stack high-water mark. Every thread that runs
+        // passes through here, including servers that spend their lives blocked and so never
+        // sit in a run queue, which is why this is the sample point. Instrumentation only.
+        #[cfg(feature = "test-harness")]
+        if let Some(top) = out.kstack_top() {
+            // SAFETY: `top` is the exclusive top of `out`'s live painted stack, as `sample`
+            // requires: `out` runs on it, and the borrow pins it.
+            unsafe { crate::mm::kstack::watermark::sample(top.get(), out.owner_pid()) };
+        }
+        // Wait out the incoming thread's mid-switch-out guard before reading its parked context. A
+        // waker can re-home a thread to a **third** CPU's queue (an affinity-diverted wake/resume)
+        // in the window between its old CPU releasing `SCHED` and `context_switch` committing its
+        // saved stack pointer, and `dequeue_front`, unlike `stealable_to`, does not filter on the
+        // guard, so that CPU could otherwise resume a not-yet-committed context (a double-run).
+        // Bounded and deadlock-free even with `SCHED` held: the owning CPU is in straight-line
+        // post-release code and clears the guard without any lock.
+        let next_sp = loop {
+            if let Some(sp) = next.parked_sp(&g.tok) {
+                break sp;
+            }
+            core::hint::spin_loop();
+        };
+        // Where a later wake re-homes it (cache-warm, minimal migration).
+        next.set_last_cpu(&mut g.tok, me as u8);
+        let ending = next.is_ending(&g.tok);
+        with_ending(me, |e| e.store(ending, Ordering::Release));
+        // Raised **while still holding `SCHED`**, so it is set before the release makes any `ready`
+        // entry for `out` visible to a stealer; `context_switch` clears it once it has committed
+        // `out`'s saved stack pointer, and the parked context is then valid to resume elsewhere.
+        out.raise_on_cpu(&g.tok);
+        Self {
+            out_sp_slot: out.sp_slot(),
+            out_on_cpu: out.on_cpu_ptr(),
+            out_fpu: out.fpu_area(),
+            next_sp,
+            next_root: resolve_root(next),
+            next_kstack: next.kstack_top(),
+            next_fpu: next.fpu_area(),
+        }
+    }
+}
+
+/// The switch itself. It drops the lock keeping interrupts masked (see the module docs and
+/// [`release_keeping_irqs_masked`](IrqSpinLockGuard::release_keeping_irqs_masked)), re-arms the
+/// incoming thread's trap/syscall kernel stack, loads its page-table root **before** switching
+/// away (so a dying thread's CR3 is off its soon-to-be-freed root), and performs the stack
+/// switch, saving the outgoing thread's kernel RSP in its own slot. On a resuming caller,
 /// control returns here and its own captured interrupt state is restored.
 ///
 /// # Safety
-/// `out_obj` is the pinned thread this CPU is running, and `next_obj` the pinned incoming thread
-/// just made `current`, both under the `SCHED` hold being released here. Single-CPU: nothing
-/// else touches either thread's saved SP across the switch.
-unsafe fn switch_into(mut g: IrqSpinLockGuard<'_, SchedState>, out_obj: *mut (), next_obj: *mut ()) {
+/// `switch` was [prepared](Switch::prepare) under the hold `g` is, from the thread this CPU runs
+/// and the one just made `current`, each still pinned by the list it is on.
+unsafe fn switch_into(mut g: IrqSpinLockGuard<'_, SchedState>, switch: Switch) {
     g.stats[SchedState::this_cpu()].switches += 1;
-    // Sample the **outgoing** thread's kernel-stack high-water mark. Every thread that runs
-    // passes through here, including servers that spend their lives blocked and so never
-    // sit in a run queue, which is why this is the sample point. Instrumentation only.
-    #[cfg(feature = "test-harness")]
-    // SAFETY: `out_obj` is the pinned outgoing thread and `SCHED` is held, satisfying the
-    // `Thread` accessor contract; `kstack_top` yields the top of its live painted stack
-    // (`None` for a thread with no kernel stack of its own).
-    if let Some(top) = unsafe { Thread::kstack_top(out_obj) } {
-        // SAFETY: `out_obj` is pinned under `SCHED` (accessor contract), and `top` is that
-        // live stack's exclusive top, as `sample` requires.
-        unsafe {
-            let pid = Thread::owner_pid_of(out_obj);
-            crate::mm::kstack::watermark::sample(top.get(), pid);
-        }
-    }
-    // Wait out the incoming thread's mid-switch-out guard before touching its parked
-    // context. A waker can re-home a thread to a **third** CPU's queue (an
-    // affinity-diverted wake/resume) in the window between its old CPU releasing `SCHED` and
-    // `context_switch` committing `saved_sp` — and `dequeue_front`, unlike `stealable_to`,
-    // does not filter on the guard, so that CPU could otherwise resume a not-yet-committed
-    // context (a double-run). Bounded and deadlock-free even with `SCHED` held: the owning
-    // CPU is in straight-line post-release code and clears the guard without any lock.
-    // SAFETY: `next_obj` is pinned (now `current`).
-    while unsafe { Thread::is_on_cpu(next_obj) } {
-        core::hint::spin_loop();
-    }
-    // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
-    // here, satisfying the Thread accessor contract for these reads.
-    let next_sp = unsafe { Thread::saved_sp(next_obj) };
-    // SAFETY: as above.
-    let next_root = unsafe { resolve_root(next_obj) };
-    // Record the CPU this thread is about to run on, so a later wake re-homes it here
-    // (cache-warm, minimal migration). SAFETY: `next_obj` pinned (now current); `SCHED`
-    // still held.
-    unsafe { Thread::set_last_cpu(next_obj, SchedState::this_cpu() as u8) };
-    // SAFETY: as above.
-    let ending = unsafe { Thread::is_ending(next_obj) };
-    with_ending(SchedState::this_cpu(), |e| e.store(ending, Ordering::Release));
-    // Raise the outgoing thread's mid-switch-out guard **while still holding `SCHED`** (so
-    // it is set before the lock release makes any `ready` entry for `out_obj` visible to a
-    // stealer). `context_switch` clears it after it commits `out_obj`'s `saved_sp`, at which
-    // point the parked context is valid to resume elsewhere. Prevents a cross-CPU steal from
-    // loading a not-yet-written `saved_sp` and double-running the thread (see
-    // `Thread::on_cpu` and `steal_one`).
-    // SAFETY: `out_obj` is the pinned outgoing thread; `SCHED` still held.
-    unsafe { Thread::set_on_cpu(out_obj, true) };
-    // SAFETY: as above.
-    let out_on_cpu = unsafe { Thread::on_cpu_ptr(out_obj) };
     // Drop the lock but keep interrupts masked across the switch; `saved_if` is restored
     // when this thread next resumes.
     let saved_if = g.release_keeping_irqs_masked();
@@ -668,47 +668,43 @@ unsafe fn switch_into(mut g: IrqSpinLockGuard<'_, SchedState>, out_obj: *mut (),
     // `resched_if_idle_locked`) latch into `RESCHED_PENDING` rather than switching; this
     // checks the **voluntary** ones too. The reasoning is on the function.
     assert_switch_preempt_safe();
-    // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
-    unsafe { arm_kernel_stack_for(next_obj) };
+    arm_kernel_stack(switch.next_kstack);
     // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
     // with the kernel half inherited); all kernel stacks are mapped in every
     // root, so switching CR3 before the stack swap is sound. Loading it before
     // the switch also ensures a dying thread leaves CR3 on the incoming root
     // before it is reaped (its `AddressSpace::Drop` may free the old PML4).
-    unsafe { Paging::set_page_table(next_root) };
+    unsafe { Paging::set_page_table(switch.next_root) };
     // Swap the floating-point / SIMD register file. Eager, not lazy: leaving the outgoing
     // thread's registers live behind a `CR0.TS` trap is CVE-2018-3665 (see
     // `arch/../fpu.rs`).
     //
     // Placement is load-bearing on both ends. The **save** must precede `context_switch`,
-    // because that clears `out_obj`'s `on_cpu` guard — the FP image is part of the parked
-    // context, so it must be complete before another CPU may resume the thread. The
-    // **restore** must follow the `is_on_cpu(next_obj)` spin above, for the mirror-image
-    // reason: until that guard clears, the incoming image may still be mid-write on its old
-    // CPU. Restoring before the stack swap is correct because the FP register file is CPU
-    // state, not stack state. Neither call allocates, so both are legal in this lock-free,
-    // IRQ-masked window.
+    // because that clears the outgoing thread's `on_cpu` guard — the FP image is part of the
+    // parked context, so it must be complete before another CPU may resume the thread. The
+    // **restore** must follow `prepare`'s wait on the incoming thread's guard, for the
+    // mirror-image reason: until that guard clears, the incoming image may still be
+    // mid-write on its old CPU. Restoring before the stack swap is correct because the FP
+    // register file is CPU state, not stack state. Neither call allocates, so both are legal
+    // in this lock-free, IRQ-masked window.
     //
-    // SAFETY: both areas are live, 64-byte-aligned images belonging to pinned
-    // threads, and every CPU ran `fpu_init_cpu` during bring-up. A null area
-    // means an inert thread that is never scheduled — skip it.
+    // SAFETY: both areas are live, 64-byte-aligned images belonging to pinned threads, the
+    // outgoing one's guard raised and the incoming one's seen clear, and every CPU ran
+    // `fpu_init_cpu` during bring-up. A null area means an inert thread that is never
+    // scheduled — skip it.
     unsafe {
-        let out_fpu = Thread::fpu_area_ptr(out_obj);
-        if !out_fpu.is_null() {
-            crate::arch::fpu_save(out_fpu);
+        if !switch.out_fpu.is_null() {
+            crate::arch::fpu_save(switch.out_fpu);
         }
-        let next_fpu = Thread::fpu_area_ptr(next_obj);
-        if !next_fpu.is_null() {
-            crate::arch::fpu_restore(next_fpu);
+        if !switch.next_fpu.is_null() {
+            crate::arch::fpu_restore(switch.next_fpu);
         }
     }
-    // SAFETY: the outgoing thread is pinned (the contract); its saved-SP slot.
-    let out_slot = unsafe { Thread::saved_sp_mut_ptr(out_obj) };
-    // SAFETY: lock released; interrupts masked; `out_slot` points into the
-    // outgoing thread (pinned) and `next_sp` is the saved RSP of the now-current
-    // thread (pinned). `out_on_cpu` is the outgoing thread's guard byte, cleared
-    // by the switch once `out_slot` is committed.
-    unsafe { context_switch(out_slot, next_sp, out_on_cpu) };
+    // SAFETY: lock released; interrupts masked; `out_sp_slot` points into the outgoing
+    // thread (pinned) and `next_sp` is the saved RSP of the now-current thread (pinned).
+    // `out_on_cpu` is the outgoing thread's guard byte, cleared by the switch once its slot
+    // is committed.
+    unsafe { context_switch(switch.out_sp_slot, switch.next_sp, switch.out_on_cpu) };
     // Resumed (cooperative path): restore the interrupt state this thread had on entry. On
     // the preemptive path the resume returns into the timer-stub epilogue (which `iretq`s IF
     // back) and `saved_if` is false, so this is a redundant `cli`. An exited thread never
@@ -757,26 +753,20 @@ pub(crate) extern "C" fn thread_enter() -> ! {
     // Capture (under the lock) whether the current thread descends to ring 3 and its params.
     let descent: Option<(u64, u64, [u64; 4])> = {
         let g = SCHED.lock();
-        let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
-        let obj = cur.as_ptr();
-        // SAFETY: `current` is pinned alive and we hold the lock.
-        match unsafe { Thread::user_entry(obj) } {
+        let cur = g.cur_ref().as_deref().expect("current set when a thread runs");
+        match cur.user_entry() {
             // A thread whose process began exiting before it first ran never reaches ring 3.
-            // SAFETY: as above.
-            Some(_) if unsafe { Thread::is_ending(obj) } => {
+            Some(_) if cur.is_ending(&g.tok) => {
                 drop(g);
                 exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
             }
             Some((entry, user_sp)) => {
-                // SAFETY: as above.
-                assert!(unsafe { Thread::kstack_top(obj) }.is_some(), "a user thread has a kernel stack");
+                let top = cur.kstack_top();
+                assert!(top.is_some(), "a user thread has a kernel stack");
                 // Armed under `SCHED`, where reading the CPU and writing its slots cannot straddle a
                 // migration; a switch-in re-arms them wherever the thread resumes.
-                // SAFETY: as above.
-                unsafe { arm_kernel_stack_for(obj) };
-                // SAFETY: as above.
-                let boot = unsafe { Thread::user_boot_args(obj) };
-                Some((entry, user_sp, boot))
+                arm_kernel_stack(top);
+                Some((entry, user_sp, cur.user_boot_args()))
             }
             None => None,
         }

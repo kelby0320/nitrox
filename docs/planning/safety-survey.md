@@ -422,7 +422,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   tag the object's own; `allocate` is private and `unsafe`; `close` and the exit sweep answer a
   `#[must_use]` `Closed`. No caller of the table holds a raw pointer or adopts one.
 
-- [ ] **kobj-o3** encapsulate: scheduler-owned interior state is reached through `unsafe fn
+- [x] **kobj-o3** encapsulate: scheduler-owned interior state is reached through `unsafe fn
   accessor(obj: *mut (), ..)` whose contract is "live, pinned by the caller, and SCHED held" by
   prose only. Six types expose `unsafe fn inner<'a>(obj) -> &'a mut Inner` with an unbounded
   lifetime, so two calls alias unchecked, and `Thread` does it with about 40 raw-field accessors.
@@ -446,6 +446,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   Partly done in `01170e32`: the six objects SCHED mutates keep that state in a `SchedCell`,
   borrowed with the token only the held lock keeps, and their accessors are safe methods; their
   12 `Send`/`Sync` claims go. `Thread`'s half is J.7's.
+  Done in `deb7258b`: a `Thread`'s scheduler state is a `SchedCell<ThreadSched>`; its wait phase,
+  `on_cpu` guard and ended mark are atomics; and its parked context is reached only by address,
+  its saved stack pointer read only with the guard clear. Its 43 raw accessors are safe methods,
+  and the scheduler's lists hold `Ref<Thread>`.
 
 - [x] **kobj-o4** encapsulate: host tests and Miri cannot see use-after-free of kernel objects.
   The kernel slab sits over a leaked 16 MiB host `Vec`, so a freed object is still inside a live
@@ -963,7 +967,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Opportunities**
 
-- [ ] **sched-o1** encapsulate: scheduler-owned state is reached through `pub(crate) unsafe fn
+- [x] **sched-o1** encapsulate: scheduler-owned state is reached through `pub(crate) unsafe fn
   x(obj: *mut ())` accessors whose contract is "live, pinned, and SCHED held", or through `unsafe fn
   inner<'a>(obj) -> &'a mut Inner` with an unbounded lifetime. Nothing proves the lock is held or
   stops two `&mut Inner` from coexisting — about 169 sites (the call sites in sched outside tests:
@@ -988,6 +992,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   lock half; sched-o2 for the liveness half. abi, ownership, soundness, concurrency, opportunities.
   Value high, effort large. **Plan**, as kobj-o3, in P1.
   Partly done in `01170e32`, as kobj-o3; `Thread`'s split is J.7's.
+  Done in `deb7258b`, as kobj-o3.
 
 - [x] **sched-o2** encapsulate: scheduler entry points take a type-erased `*mut ()` (and
   `wait_on`/`wait_on_io` take `&[usize]`) whose kind and liveness the caller promises, though nearly
@@ -1114,7 +1119,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Done in `01170e32`: `peer` and `us_reg` are `Weak`s in the endpoint's `SchedCell`, followed with the
   token by `sched::follow`, which lends it back with the target; `is_live` goes.
 
-- [ ] **sched-o8** narrow: under SCHED, code clones an owned ObjectRef only to read through it
+- [x] **sched-o8** narrow: under SCHED, code clones an owned ObjectRef only to read through it
   (`th.process_ref()`) and argues at each site that dropping the clone "is never the last
   reference"; elsewhere it takes a raw child pointer and argues the owner keeps it alive — 12 sites
   (`grep -n 'process_ref()\|notification_channel_ptr()\|parent_notif_ptr()\|endpoint_ptr(' kernel/src/sched.rs kernel/src/sched/*.rs | grep -v tests`
@@ -1134,6 +1139,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Partly done in `89ce369f`: `Process::notification_channel` and `parent_notif` and
   `UserspaceServerReg::endpoint` borrow what their owner holds; `Thread::process`, for the six
   `process_of` reads, is J.7's.
+  Done in `deb7258b`: `Thread::process` borrows the process the thread pins, for the six reads.
 
 - [x] **sched-o9** encapsulate: ObjectRefs that a SCHED-held path must release are carried out of
   the locked block by hand (`drop(g); drop(x)`, `Err(returned) => returned`, orphans arrays dropped

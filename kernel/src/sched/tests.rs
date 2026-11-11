@@ -106,9 +106,9 @@ use crate::object::header::test_probe;
 
 extern "C" fn noop(_arg: usize) {}
 
-/// Build an inert Thread ObjectRef without a kernel stack (no host paging needed).
-fn inert_ref(tid: u32) -> ObjectRef {
-    into_objref(Thread::try_new(tid, 0).unwrap())
+/// Build an inert thread without a kernel stack (no host paging needed).
+fn inert_ref(tid: u32) -> Ref<Thread> {
+    Ref::new(Thread::try_new(tid, 0).unwrap())
 }
 
 /// A fresh `SchedState` for data-structure tests (no idle thread; the refs are inert).
@@ -150,14 +150,10 @@ fn dequeue_front_is_round_robin() {
         assert!(st.ready[0].push(inert_ref(tid)).is_ok());
     }
     let a = dequeue_front(&mut st).unwrap();
-    // SAFETY: pinned, single-threaded test.
-    let a_tid = unsafe { &*(a.as_ptr() as *const Thread) }.tid();
-    assert_eq!(a_tid, 1);
+    assert_eq!(a.tid(), 1);
     assert!(st.ready[0].push(a).is_ok());
     let b = dequeue_front(&mut st).unwrap();
-    // SAFETY: `b` pins a live `Thread`.
-    let b_tid = unsafe { &*(b.as_ptr() as *const Thread) }.tid();
-    assert_eq!(b_tid, 2, "round-robin must pick the next, not repeat");
+    assert_eq!(b.tid(), 2, "round-robin must pick the next, not repeat");
     assert!(st.ready[0].push(b).is_ok());
 }
 
@@ -166,11 +162,6 @@ fn dequeue_front_empty_is_none() {
     init_global_heap();
     let mut st = test_state();
     assert!(dequeue_front(&mut st).is_none());
-}
-
-fn tid_of(r: &ObjectRef) -> u32 {
-    // SAFETY: pinned, single-threaded test.
-    unsafe { &*(r.as_ptr() as *const Thread) }.tid()
 }
 
 #[test]
@@ -190,20 +181,17 @@ fn dequeue_prefers_realtime_by_priority_then_timeshared() {
     init_global_heap();
     let mut st = test_state();
     st.ready[0] = thread_list().unwrap();
-    let ts = inert_ref(1); // TimeShared (default), vruntime 0
-    let rt_lo = inert_ref(2); // RealTime, priority 20
-    let rt_hi = inert_ref(3); // RealTime, priority 5 (higher)
-    // SAFETY: pinned, single-threaded test.
-    unsafe {
-        Thread::set_sched(rt_lo.as_ptr(), SchedClass::RealTime, 20, 0);
-        Thread::set_sched(rt_hi.as_ptr(), SchedClass::RealTime, 5, 0);
-    }
-    assert!(st.ready[0].push(ts).is_ok());
-    assert!(st.ready[0].push(rt_lo).is_ok());
-    assert!(st.ready[0].push(rt_hi).is_ok());
-    assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "RealTime prio 5 first");
-    assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "RealTime prio 20 next");
-    assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 1, "TimeShared last");
+    let real_time = |tid, prio| {
+        let mut t = Thread::try_new(tid, 0).unwrap();
+        t.set_policy(SchedClass::RealTime, prio, 0, u8::MAX);
+        Ref::new(t)
+    };
+    assert!(st.ready[0].push(inert_ref(1)).is_ok()); // TimeShared (default), vruntime 0
+    assert!(st.ready[0].push(real_time(2, 20)).is_ok());
+    assert!(st.ready[0].push(real_time(3, 5)).is_ok()); // higher
+    assert_eq!(dequeue_front(&mut st).unwrap().tid(), 3, "RealTime prio 5 first");
+    assert_eq!(dequeue_front(&mut st).unwrap().tid(), 2, "RealTime prio 20 next");
+    assert_eq!(dequeue_front(&mut st).unwrap().tid(), 1, "TimeShared last");
 }
 
 #[test]
@@ -214,18 +202,15 @@ fn dequeue_timeshared_picks_min_vruntime_and_advances_floor() {
     let a = inert_ref(1);
     let b = inert_ref(2);
     let c = inert_ref(3);
-    // SAFETY: pinned, single-threaded test.
-    unsafe {
-        Thread::set_vruntime(a.as_ptr(), 500);
-        Thread::set_vruntime(b.as_ptr(), 100); // smallest
-        Thread::set_vruntime(c.as_ptr(), 300);
-    }
+    a.set_vruntime(&mut st.tok, 500);
+    b.set_vruntime(&mut st.tok, 100); // smallest
+    c.set_vruntime(&mut st.tok, 300);
     assert!(st.ready[0].push(a).is_ok());
     assert!(st.ready[0].push(b).is_ok());
     assert!(st.ready[0].push(c).is_ok());
-    assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "smallest vruntime first");
+    assert_eq!(dequeue_front(&mut st).unwrap().tid(), 2, "smallest vruntime first");
     assert_eq!(st.min_vruntime[0], 100, "floor advanced to the picked vruntime");
-    assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "next-smallest vruntime");
+    assert_eq!(dequeue_front(&mut st).unwrap().tid(), 3, "next-smallest vruntime");
     assert_eq!(st.min_vruntime[0], 300);
 }
 
@@ -236,19 +221,15 @@ fn seed_vruntime_floors_new_and_boosts_woken() {
     let base = 2 * TICK_NS;
     st.min_vruntime[0] = base;
     let n = inert_ref(1);
-    seed_vruntime(&st, n.as_ptr(), 0, false);
-    // SAFETY: pinned, single-threaded test.
-    assert_eq!(unsafe { Thread::vruntime(n.as_ptr()) }, base);
+    seed_vruntime(&mut st, &n, 0, false);
+    assert_eq!(n.vruntime(&st.tok), base);
     let w = inert_ref(2);
-    seed_vruntime(&st, w.as_ptr(), 0, true);
-    // SAFETY: `w` pins a live `Thread`, and the test is single-threaded.
-    assert_eq!(unsafe { Thread::vruntime(w.as_ptr()) }, base - TICK_NS);
+    seed_vruntime(&mut st, &w, 0, true);
+    assert_eq!(w.vruntime(&st.tok), base - TICK_NS);
     let ahead = inert_ref(3);
-    // SAFETY: `ahead` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_vruntime(ahead.as_ptr(), 3 * TICK_NS) };
-    seed_vruntime(&st, ahead.as_ptr(), 0, false);
-    // SAFETY: `ahead` pins a live `Thread`, and the test is single-threaded.
-    assert_eq!(unsafe { Thread::vruntime(ahead.as_ptr()) }, 3 * TICK_NS);
+    ahead.set_vruntime(&mut st.tok, 3 * TICK_NS);
+    seed_vruntime(&mut st, &ahead, 0, false);
+    assert_eq!(ahead.vruntime(&st.tok), 3 * TICK_NS);
 }
 
 /// Bring `n` CPUs online (0..n) with reserved ready queues, for placement tests.
@@ -283,17 +264,16 @@ fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
 
     assert!(st.ready[0].push(inert_ref(10)).is_ok());
     assert!(st.ready[1].push(inert_ref(11)).is_ok());
-    assert_eq!(pick_target_cpu(&st, t.as_ptr(), all_up(4)), 2);
+    assert_eq!(pick_target_cpu(&st, &t, all_up(4)), 2);
 
     // CPU 2 parks: gone from the online set, still `true` in `cpu_online[]`.
     let parked = all_up(4) & !(1u64 << 2);
     assert!(st.cpu_online[2], "the park cannot clear this, which is why the bug existed");
-    assert_eq!(pick_target_cpu(&st, t.as_ptr(), parked), 3, "placed on a CPU that will never run");
+    assert_eq!(pick_target_cpu(&st, &t, parked), 3, "placed on a CPU that will never run");
 
     // A waking thread whose home is the parked CPU goes elsewhere too.
-    // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
-    assert_ne!(pick_wake_cpu(&st, t.as_ptr(), parked), 2, "woken onto a parked home CPU");
+    t.set_last_cpu(&mut st.tok, 2);
+    assert_ne!(pick_wake_cpu(&st, &t, parked), 2, "woken onto a parked home CPU");
 
     // Rescue half: empty every other queue so the parked CPU is the *only* steal source.
     drop(st.ready[0].pop().unwrap());
@@ -306,8 +286,7 @@ fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
     // Gating either path on `cpu_accepts_work` would strand the thread on CPU 2 forever.
     assert!(steal_available(&st, 0), "a parked CPU's queue must stay drainable, or this fix strands what it holds");
     let stolen = steal_one(&mut st).expect("steal_one must reach a parked CPU's queue");
-    // SAFETY: `stolen` pins a live `Thread`.
-    assert_eq!(unsafe { &*(stolen.as_ptr() as *const Thread) }.tid(), 12);
+    assert_eq!(stolen.tid(), 12);
     assert!(st.ready[2].is_empty(), "the parked CPU's queue was not drained");
 }
 
@@ -323,11 +302,10 @@ fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
     online_n(&mut st, 4);
     // Pinned to CPU 3; CPUs 0 and 3 have parked, so nothing permitted accepts work.
     let t = inert_ref(1);
-    // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 3) };
+    t.set_cpu_mask(&mut st.tok, 1 << 3);
     let parked = all_up(4) & !(1u64 << 0) & !(1u64 << 3);
 
-    let chosen = pick_target_cpu(&st, t.as_ptr(), parked);
+    let chosen = pick_target_cpu(&st, &t, parked);
     assert!(
         cpu_accepts_work(&st, chosen, parked),
         "fallback picked cpu {chosen}, which does not accept work — the thread would \
@@ -340,7 +318,7 @@ fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
     for i in 0..MAX_THREADS {
         assert!(st.ready[1].push(inert_ref(100 + i as u32)).is_ok());
     }
-    let chosen = pick_target_cpu(&st, t.as_ptr(), parked);
+    let chosen = pick_target_cpu(&st, &t, parked);
     assert!(cpu_accepts_work(&st, chosen, parked), "fallback picked cpu {chosen}, which does not accept work");
     assert!(
         st.ready[chosen].len() < st.ready[chosen].capacity(),
@@ -350,9 +328,8 @@ fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
 
     // The wake path delegates to the same fallback. (The affinity mask rejects home 0 before
     // `cpu_accepts_work` is reached, so this asserts the delegation and nothing more.)
-    // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
-    let woken = pick_wake_cpu(&st, t.as_ptr(), parked);
+    t.set_last_cpu(&mut st.tok, 0);
+    let woken = pick_wake_cpu(&st, &t, parked);
     assert!(cpu_accepts_work(&st, woken, parked), "wake fallback picked cpu {woken}, which does not accept work");
 }
 
@@ -362,18 +339,16 @@ fn placement_least_loaded_and_respects_affinity() {
     let mut st = test_state();
     online_n(&mut st, 4);
     let a = inert_ref(1);
-    assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 0);
+    assert_eq!(pick_target_cpu(&st, &a, all_up(4)), 0);
     assert!(st.ready[0].push(inert_ref(10)).is_ok());
     assert!(st.ready[1].push(inert_ref(11)).is_ok());
-    assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 2);
-    // SAFETY: `a` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 3) };
-    assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 3);
+    assert_eq!(pick_target_cpu(&st, &a, all_up(4)), 2);
+    a.set_cpu_mask(&mut st.tok, 1 << 3);
+    assert_eq!(pick_target_cpu(&st, &a, all_up(4)), 3);
     // Pinned to an offline CPU (5) → falls **outside** the mask, to the least-loaded CPU that
     // accepts work; stated as properties, not an index.
-    // SAFETY: `a` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 5) };
-    let chosen = pick_target_cpu(&st, a.as_ptr(), all_up(4));
+    a.set_cpu_mask(&mut st.tok, 1 << 5);
+    let chosen = pick_target_cpu(&st, &a, all_up(4));
     assert!(cpu_accepts_work(&st, chosen, all_up(4)), "fallback chose cpu {chosen}");
     assert_eq!(st.ready[chosen].len(), 0, "fallback chose loaded cpu {chosen} while an empty one accepted work");
 }
@@ -384,26 +359,44 @@ fn wake_placement_prefers_home_cpu() {
     let mut st = test_state();
     online_n(&mut st, 4);
     let t = inert_ref(1);
-    // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
-    assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 2);
-    // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 0) };
-    assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 0);
+    t.set_last_cpu(&mut st.tok, 2);
+    assert_eq!(pick_wake_cpu(&st, &t, all_up(4)), 2);
+    t.set_cpu_mask(&mut st.tok, 1 << 0);
+    assert_eq!(pick_wake_cpu(&st, &t, all_up(4)), 0);
 }
 
 #[test]
 fn stealable_respects_affinity() {
     init_global_heap();
+    let mut tok = SchedToken::for_test();
     let t = inert_ref(1); // kernel thread (no user_entry), default mask = all
-    // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
-    unsafe {
-        assert!(stealable_to(t.as_ptr(), 0));
-        assert!(stealable_to(t.as_ptr(), 3));
-        Thread::set_cpu_mask(t.as_ptr(), 1 << 0);
-        assert!(stealable_to(t.as_ptr(), 0));
-        assert!(!stealable_to(t.as_ptr(), 1));
-    }
+    assert!(stealable_to(&tok, &t, 0));
+    assert!(stealable_to(&tok, &t, 3));
+    t.set_cpu_mask(&mut tok, 1 << 0);
+    assert!(stealable_to(&tok, &t, 0));
+    assert!(!stealable_to(&tok, &t, 1));
+}
+
+/// **A thread still switching out stays where it is**, though its affinity allows the steal: its
+/// saved stack pointer is not yet committed. Once the switch clears its guard it may be stolen.
+#[test]
+fn a_thread_still_switching_out_is_not_stolen() {
+    use core::sync::atomic::AtomicU8;
+    init_global_heap();
+    let mut st = test_state();
+    online_n(&mut st, 2);
+    let t = inert_ref(1);
+    t.raise_on_cpu(&st.tok);
+    assert!(st.ready[1].push(t.clone()).is_ok());
+    assert!(!stealable_to(&st.tok, &t, 0));
+    assert!(!steal_available(&st, 0));
+    assert!(steal_one(&mut st).is_none());
+    // SAFETY: the guard byte of a live thread this test pins, cleared as `context_switch` clears
+    // it once the slot is committed; nothing else writes it.
+    unsafe { AtomicU8::from_ptr(t.on_cpu_ptr()).store(0, Ordering::Release) };
+    assert!(stealable_to(&st.tok, &t, 0));
+    assert!(steal_available(&st, 0));
+    assert_eq!(steal_one(&mut st).map(|s| s.tid()), Some(1));
 }
 
 #[test]
@@ -412,15 +405,14 @@ fn wake_placement_falls_back_when_home_queue_is_full() {
     let mut st = test_state();
     online_n(&mut st, 2);
     let t = inert_ref(1);
-    // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
-    unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
+    t.set_last_cpu(&mut st.tok, 0);
     // Fill CPU 0's queue to its reserve: the home pick must divert (not a fatal wake).
     for tid in 100..(100 + MAX_THREADS as u32) {
         assert!(st.ready[0].push(inert_ref(tid)).is_ok());
     }
-    assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 1);
+    assert_eq!(pick_wake_cpu(&st, &t, all_up(4)), 1);
     drop(st.ready[0].pop().unwrap());
-    assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 0);
+    assert_eq!(pick_wake_cpu(&st, &t, all_up(4)), 0);
 }
 
 #[test]
@@ -430,8 +422,7 @@ fn steal_one_skips_busiest_victim_with_no_stealable_thread() {
     online_n(&mut st, 3);
     for tid in 10..12 {
         let t = inert_ref(tid);
-        // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
-        unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 1) };
+        t.set_cpu_mask(&mut st.tok, 1 << 1);
         assert!(st.ready[1].push(t).is_ok());
     }
     assert!(st.ready[2].push(inert_ref(20)).is_ok());
@@ -439,9 +430,7 @@ fn steal_one_skips_busiest_victim_with_no_stealable_thread() {
     // (searching only the busiest victim would), which panics the idle-steal paths.
     assert!(steal_available(&st, 0));
     let stolen = steal_one(&mut st).expect("steal_one must succeed when steal_available");
-    // SAFETY: `stolen` pins a live `Thread`.
-    let stolen_tid = unsafe { &*(stolen.as_ptr() as *const Thread) }.tid();
-    assert_eq!(stolen_tid, 20);
+    assert_eq!(stolen.tid(), 20);
     assert!(st.ready[2].is_empty());
 }
 
@@ -455,9 +444,7 @@ fn steal_one_prefers_the_busiest_stealable_victim() {
         assert!(st.ready[2].push(inert_ref(tid)).is_ok());
     }
     let stolen = steal_one(&mut st).unwrap();
-    // SAFETY: `stolen` pins a live `Thread`.
-    let stolen_tid = unsafe { &*(stolen.as_ptr() as *const Thread) }.tid();
-    assert_eq!(stolen_tid, 20);
+    assert_eq!(stolen.tid(), 20);
     assert_eq!(st.ready[2].len(), 1);
     assert_eq!(st.ready[1].len(), 1);
 }
@@ -474,7 +461,7 @@ fn drain_pending_drops_moves_all_and_preserves_capacity() {
         assert!(st.reap[0].push(inert_ref(tid)).is_ok());
     }
     for tid in 4..=5 {
-        assert!(st.deferred_drops.push(inert_ref(tid)).is_ok());
+        assert!(st.deferred_drops.push(inert_ref(tid).erase()).is_ok());
     }
     let mut buf: [Option<ObjectRef>; MAX_THREADS + DEFERRED_DROP_RESERVE] =
         [const { None }; MAX_THREADS + DEFERRED_DROP_RESERVE];
@@ -600,8 +587,8 @@ fn queue_drop_releases_every_thread_exactly_once() {
 
 /// Build an inert Thread tagged with `owner_pid = pid`, enough for the teardown tests'
 /// `pid` scans (no process, no kernel stack).
-fn inert_user_ref(tid: u32, pid: u32) -> ObjectRef {
-    into_objref(Thread::try_new(tid, pid).unwrap())
+fn inert_user_ref(tid: u32, pid: u32) -> Ref<Thread> {
+    Ref::new(Thread::try_new(tid, pid).unwrap())
 }
 
 #[test]
@@ -612,25 +599,20 @@ fn resume_suspended_moves_to_ready_and_sets_disposition() {
     st.suspended = thread_list().unwrap();
     let th = inert_user_ref(1, 1);
     let obj = th.as_ptr();
-    // SAFETY: pinned, single-threaded test; mimic a suspended thread.
-    unsafe { Thread::set_state(obj, ThreadState::Suspended) };
+    // Mimic a suspended thread.
+    th.set_state(&mut st.tok, ThreadState::Suspended);
     assert!(st.suspended.push(th).is_ok());
 
     // `resume_suspended` takes the global SCHED, so mirror its list ops to stay lock-free.
     let i = st.suspended.iter().position(|r| r.as_ptr() == obj).unwrap();
     let r = st.suspended.remove(i);
-    // SAFETY: pinned, single-threaded.
-    unsafe {
-        Thread::set_disposition(obj, 2, 7);
-        Thread::set_state(obj, ThreadState::Ready);
-    }
+    r.set_disposition(&mut st.tok, 2, 7);
+    r.set_state(&mut st.tok, ThreadState::Ready);
     assert!(st.ready[0].push(r).is_ok());
 
     assert!(st.suspended.is_empty());
     assert_eq!(st.ready[0].len(), 1);
-    // SAFETY: pinned.
-    let (tag, code) = unsafe { Thread::take_disposition(obj) };
-    assert_eq!((tag, code), (2, 7));
+    assert_eq!(st.ready[0][0].take_disposition(&st.tok), (2, 7));
 }
 
 /// **A suspended thread's registers are a copy of its fault's**, taken under `SCHED`: the
@@ -640,17 +622,17 @@ fn resume_suspended_moves_to_ready_and_sets_disposition() {
 fn a_suspended_threads_registers_are_its_faults_until_it_resumes() {
     init_global_heap();
     let th = Ref::new(Thread::try_new(1, 1).unwrap());
-    let obj = th.as_object().as_ptr();
     let regs = crate::arch::RegisterValues { rip: 0x40_1000, ..Default::default() };
-    // SAFETY: pinned, single-threaded; as `suspend_with_fault` records them.
-    unsafe {
-        Thread::set_fault_registers(obj, regs);
-        Thread::set_state(obj, ThreadState::Suspended);
+    {
+        // As `suspend_with_fault` records them.
+        let tok = &mut SCHED.lock().tok;
+        th.set_fault_registers(tok, regs);
+        th.set_state(tok, ThreadState::Suspended);
     }
     let read = suspended_registers(&th);
     assert_eq!(read, Some(regs));
-    // SAFETY: pinned. The resume.
-    unsafe { Thread::set_state(obj, ThreadState::Ready) };
+    // The resume.
+    th.set_state(&mut SCHED.lock().tok, ThreadState::Ready);
     assert_eq!(suspended_registers(&th), None);
 }
 
@@ -683,8 +665,7 @@ fn a_process_ending_marks_only_its_own_threads_and_frees_none() {
     }
 
     end_siblings(&mut st, 1);
-    // SAFETY: each is pinned by `ready`; single-threaded.
-    let marked: std::vec::Vec<bool> = st.ready[0].iter().map(|r| unsafe { Thread::is_ending(r.as_ptr()) }).collect();
+    let marked: std::vec::Vec<bool> = st.ready[0].iter().map(|r| r.is_ending(&st.tok)).collect();
     assert_eq!(marked, [true, false, true]);
     assert!(st.reap[0].is_empty(), "each ends itself; none is parked for reaping here");
     assert_eq!(test_probe::thread_destroys(), 0);
@@ -704,9 +685,8 @@ fn reaped_thread_destroyed_when_dropped() {
 fn into_objref_preserves_single_reference() {
     init_global_heap();
     test_probe::reset();
-    let r = into_objref(Thread::try_new(9, 0).unwrap());
-    // SAFETY: pinned, single-threaded.
-    let (_entry, arg) = unsafe { Thread::entry_and_arg(r.as_ptr()) };
+    let r = Ref::new(Thread::try_new(9, 0).unwrap());
+    let (_entry, arg) = r.entry_and_arg();
     assert_eq!(arg, 0);
     drop(r);
     assert_eq!(test_probe::thread_destroys(), 1);
@@ -734,27 +714,25 @@ fn every_thread_the_cap_admits_can_fault_block_wake_and_be_reaped_on_one_cpu() {
     init_global_heap();
     super::online_set::force(0b11);
     let mut st = reserved_state();
-    let pinned = |tid: usize| {
+    let pinned = |st: &mut SchedState, tid: usize| {
         let r = inert_user_ref(tid as u32, 7);
-        // SAFETY: `r` pins the thread; single-threaded test.
-        unsafe { Thread::set_cpu_mask(r.as_ptr(), 1) };
+        r.set_cpu_mask(&mut st.tok, 1);
         r
     };
     for tid in 1..=MAX_THREADS {
-        assert!(place_thread(&mut st, pinned(tid), false).is_ok(), "thread {tid} refused");
+        let r = pinned(&mut st, tid);
+        assert!(place_thread(&mut st, r, false).is_ok(), "thread {tid} refused");
     }
     st.cpu_online[1] = true;
     st.ready[1] = thread_list().unwrap();
     let elsewhere = inert_ref(0);
-    // SAFETY: `elsewhere` pins the thread; single-threaded test.
-    unsafe { Thread::set_cpu_mask(elsewhere.as_ptr(), 2) };
+    elsewhere.set_cpu_mask(&mut st.tok, 2);
     assert!(place_thread(&mut st, elsewhere, false).is_err(), "a spawn past the cap, to a CPU with room");
     while let Some(r) = st.ready[0].pop() {
         push_reserved(&mut st.suspended, r, "suspended list");
     }
     while let Some(r) = st.suspended.pop() {
-        // SAFETY: `r` pins the thread; single-threaded test.
-        unsafe { Thread::set_state(r.as_ptr(), ThreadState::Blocked) };
+        r.set_state(&mut st.tok, ThreadState::Blocked);
         push_reserved(&mut st.blocked, r, "blocked list");
     }
     let blocked: std::vec::Vec<_> = st.blocked.iter().map(|r| r.as_ptr()).collect();
@@ -797,12 +775,9 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
     let blocked = inert_user_ref(1, 7);
     let other = inert_user_ref(2, 8);
     for r in [&blocked, &other] {
-        // SAFETY: every object here is pinned by the test; single-threaded.
-        unsafe {
-            Thread::wait_register(r.as_ptr(), &[t1.as_ptr() as usize], true);
-            Thread::set_state(r.as_ptr(), ThreadState::Blocked);
-        }
-        t1.add_waiter(&mut st.tok, r.as_ptr()).unwrap();
+        r.wait_register(&mut st.tok, &[t1.as_ptr() as usize], true);
+        r.set_state(&mut st.tok, ThreadState::Blocked);
+        t1.add_waiter(&mut st.tok, r.as_ptr().cast()).unwrap();
     }
     let (b, o) = (blocked.as_ptr(), other.as_ptr());
     let thread_deadline = deadline::Entry { deadline_ns: 5_000, target: deadline::Target::Thread(b as usize) };
@@ -811,8 +786,7 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
     assert!(st.blocked.push(other).is_ok());
     let suspended = inert_user_ref(3, 7);
     let s3 = suspended.as_ptr();
-    // SAFETY: pinned by the test; single-threaded.
-    unsafe { Thread::set_state(s3, ThreadState::Suspended) };
+    suspended.set_state(&mut st.tok, ThreadState::Suspended);
     assert!(st.suspended.push(suspended).is_ok());
     let running = inert_user_ref(4, 7);
     let r4 = running.as_ptr();
@@ -820,12 +794,14 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
 
     end_siblings(&mut st, 7);
 
-    // SAFETY: each thread is pinned by a scheduler list; single-threaded.
-    unsafe {
-        assert!(Thread::is_ending(b) && Thread::is_ending(s3) && Thread::is_ending(r4));
-        assert!(!Thread::is_ending(o), "another process's thread");
-        assert_eq!(Thread::take_disposition(s3), (DISP_TERMINATE, 0));
-    }
+    let threads: std::vec::Vec<&Thread> =
+        st.ready.iter().chain([&st.blocked]).flat_map(|q| q.iter().map(|r| &**r)).collect();
+    let thread = |p: *mut Thread| {
+        *threads.iter().chain(st.current[1].as_deref().iter()).find(|t| core::ptr::eq(**t, p)).unwrap()
+    };
+    assert!([b, s3, r4].iter().all(|&t| thread(t).is_ending(&st.tok)));
+    assert!(!thread(o).is_ending(&st.tok), "another process's thread");
+    assert_eq!(thread(s3).take_disposition(&st.tok), (DISP_TERMINATE, 0));
     assert_eq!(st.blocked.len(), 1);
     assert_eq!(st.blocked[0].as_ptr(), o, "the other process's thread stays blocked");
     assert!(st.suspended.is_empty());
@@ -858,19 +834,18 @@ fn the_last_thread_out_of_a_process_wakes_the_reaper_with_the_status_its_exit_re
         unsafe { (*p).set_parent_notif(parent.clone()) };
         process.begin_ending(recorded);
     }
-    let me = into_objref(user_thread_no_stack(1, process.clone(), 0x40_0000, 0x7fff_f000));
+    let me = Ref::new(user_thread_no_stack(1, process.clone(), 0x40_0000, 0x7fff_f000));
     let own = ExitStatus { kind: ExitKind::Crashed as u32, code: 14 };
     assert!(st.blocked.push(inert_user_ref(2, 5)).is_ok());
 
-    assert!(!end_process_if_last(&mut st, me.as_ptr(), own), "a sibling is still live");
+    assert!(!end_process_if_last(&mut st, &me, own), "a sibling is still live");
     assert!(st.ended_pids.is_empty() && st.reaper.is_some());
 
     let sibling = st.blocked.pop().unwrap();
-    assert!(end_process_if_last(&mut st, me.as_ptr(), own));
+    assert!(end_process_if_last(&mut st, &me, own));
     assert_eq!(st.ended_pids.iter().copied().collect::<std::vec::Vec<_>>(), [5]);
     assert!(st.reaper.is_none(), "the reaper was woken");
-    // SAFETY: pinned by `me`; single-threaded.
-    assert!(unsafe { Thread::process_ended(me.as_ptr()) });
+    assert!(me.process_ended());
     let heard = notif_try_recv(&parent).expect("ChildExited");
     assert_eq!(heard.as_bytes(), Notification::child_exited(5, recorded).as_bytes());
     drop((sibling, me));
@@ -905,11 +880,10 @@ fn a_thread_made_for_a_process_that_has_begun_to_exit_is_placed_marked() {
     exiting.begin_ending(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
     let (running, _) = user_process_ref(6);
     for (process, marked) in [(exiting, true), (running, false)] {
-        let thread = into_objref(user_thread_no_stack(1, process, 0x40_0000, 0x7fff_f000));
-        let obj = thread.as_ptr();
+        let thread = Ref::new(user_thread_no_stack(1, process, 0x40_0000, 0x7fff_f000));
         assert!(place_spawned(&mut st, thread).is_ok());
-        // SAFETY: pinned by its run queue; single-threaded.
-        assert_eq!(unsafe { Thread::is_ending(obj) }, marked);
+        let placed = st.ready[0].pop().unwrap();
+        assert_eq!(placed.is_ending(&st.tok), marked);
     }
 }
 
@@ -919,7 +893,7 @@ fn the_current_identity_is_its_pid_then_its_tid() {
     use crate::object::thread::test_support::{user_process_ref, user_thread_no_stack};
     init_global_heap();
     let (process, _root) = user_process_ref(9);
-    let me = into_objref(user_thread_no_stack(7, process, 0x40_0000, 0x7fff_f000));
+    let me = Ref::new(user_thread_no_stack(7, process, 0x40_0000, 0x7fff_f000));
     assert_eq!(with_current(me, current_pid_tid), Some((9, 7)));
     assert_eq!(with_current(inert_ref(3), current_pid_tid), None);
 }
@@ -939,12 +913,9 @@ fn a_fault_wakes_the_thread_waiting_on_its_channel_or_none() {
     assert!(!deliver_fault(&mut st, Some(&chan), notif), "no thread waiting");
     let supervisor = inert_user_ref(1, 7);
     let s = supervisor.as_ptr();
-    // SAFETY: pinned by the test; single-threaded.
-    unsafe {
-        Thread::wait_register(s, &[chan.as_ptr() as usize], true);
-        Thread::set_state(s, ThreadState::Blocked);
-    }
-    chan.add_waiter(&mut st.tok, s).unwrap();
+    supervisor.wait_register(&mut st.tok, &[chan.as_ptr() as usize], true);
+    supervisor.set_state(&mut st.tok, ThreadState::Blocked);
+    chan.add_waiter(&mut st.tok, s.cast()).unwrap();
     assert!(st.blocked.push(supervisor).is_ok());
     assert!(deliver_fault(&mut st, Some(&chan), notif), "the supervisor was waiting");
     assert!(st.ready.iter().any(|q| q.iter().any(|r| r.as_ptr() == s)), "and is woken to run");

@@ -139,25 +139,32 @@ park)`** (`sched.rs`): a yield or a tick (`Park::Ready`), a blocking wait
 (`Blocked`), a fault (`Suspended`), an exit (`Exited`) and the reaper's park
 (`Reaper`). `prev` is an `Outgoing`, which only taking this CPU's `current` makes.
 **Under the held `SCHED` guard** it picks the next thread (else the idle thread),
-gives `prev` the state its `Park` names and puts it on that list (`park`), sets
-the incoming thread `Running` and installs it as `current`, and calls
-`switch_into`, which, in order:
+prepares the switch (`Switch::prepare`), gives `prev` the state its `Park` names
+and puts it on that list (`park`), sets the incoming thread `Running` and installs
+it as `current`, and calls `switch_into`. In order, the preparation:
 
-1. Reads the incoming thread's saved RSP and **page-table root** (`resolve_root` →
-   the process's CR3, or the boot root for kernel threads).
+1. Waits out the incoming thread's `on_cpu` guard and reads its saved RSP
+   (`Thread::parked_sp`, which answers `None` while the guard is raised), its
+   **page-table root** (`resolve_root` → the process's CR3, or the boot root for
+   kernel threads) and its `kstack_top`.
 2. Records `last_cpu = this_cpu()` on the incoming thread (for cache-warm wakeups).
-3. **Raises the outgoing thread's `on_cpu` guard** (`Thread::set_on_cpu(out, true)`)
-   — while still holding `SCHED` (§7, invariant I2).
+3. **Raises the outgoing thread's `on_cpu` guard** (`Thread::raise_on_cpu`) — while
+   still holding `SCHED` (§7, invariant I2) — and takes the addresses of its saved-RSP
+   slot, guard byte and FP area. That parked context is written after the lock is
+   released, so nothing reaches it by reference.
+
+Then `switch_into`:
+
 4. **Releases `SCHED`** but keeps interrupts masked (`release_keeping_irqs_masked`).
 5. **Arms the incoming thread's kernel-entry state on this core**
-   (`arm_kernel_stack_for(next)`): sets **TSS.RSP0** (`Cpu::set_kernel_stack`) and
+   (`arm_kernel_stack`): sets **TSS.RSP0** (`Cpu::set_kernel_stack`) and
    the **syscall entry stack** to the incoming thread's `kstack_top`, and
    re-asserts this core's **`KERNEL_GS_BASE`** (`arm_user_entry_cpu_base`). This is
    what makes migration safe (§5).
 6. **Loads CR3** (`Paging::set_page_table(next_root)`) — before the stack swap, so
    a dying thread leaves CR3 on the incoming root before its own address space is
    torn down.
-7. **`context_switch(out_slot, next_sp, out_on_cpu)`**, `out_slot` the outgoing
+7. **`context_switch(out_sp_slot, next_sp, out_on_cpu)`**, `out_sp_slot` the outgoing
    thread's own saved-SP slot — the arch asm
    (`arch/x86_64/context.rs`): pushes the six callee-saved registers onto the
    outgoing stack, `mov [rdi], rsp` **commits** the outgoing thread's resume RSP,
@@ -174,7 +181,7 @@ fabricated frame `ret`s into `thread_trampoline` (`context.rs`): `sti` (it did n
 arrive via an `iretq` that would restore IF), then `call thread_enter`
 (`sched.rs`). `thread_enter` reads the current thread under `SCHED`; if it is a
 **user** thread it points TSS.RSP0 + the syscall stack at this thread's kernel
-stack and re-arms `KERNEL_GS_BASE` (`arm_kernel_stack_for`), still under `SCHED`,
+stack and re-arms `KERNEL_GS_BASE` (`arm_kernel_stack`), still under `SCHED`,
 where reading the CPU and writing its slots cannot straddle a migration; the setters
 assert interrupts are masked in debug builds. It then `enter_user`s to ring 3 (seeding
 `rdi/rsi/rdx/rcx` with the spawn hand-off — notification channel, root namespace,
@@ -190,9 +197,9 @@ it happens on **every** switch-in, so migration needs no special path:
 | Per-core / per-thread state | Where re-armed | Consequence if stale |
 |---|---|---|
 | **CR3** (address space) | `switch_into` step 6, every switch | user thread faults on its own code/data |
-| **TSS.RSP0** (ring3→ring0 trap stack) | `arm_kernel_stack_for`, every switch (+ `thread_enter` at first descent) | a trap/IRQ from ring 3 pushes onto the wrong core's stack → `#DF` |
-| **Syscall entry stack** | `arm_kernel_stack_for`, every switch | first `syscall` after migration lands on a stale stack |
-| **`KERNEL_GS_BASE`** | `arm_kernel_stack_for` (`arm_user_entry_cpu_base`) | `swapgs` in the syscall stub reads the wrong core's block |
+| **TSS.RSP0** (ring3→ring0 trap stack) | `arm_kernel_stack`, every switch (+ `thread_enter` at first descent) | a trap/IRQ from ring 3 pushes onto the wrong core's stack → `#DF` |
+| **Syscall entry stack** | `arm_kernel_stack`, every switch | first `syscall` after migration lands on a stale stack |
+| **`KERNEL_GS_BASE`** | `arm_kernel_stack` (`arm_user_entry_cpu_base`) | `swapgs` in the syscall stub reads the wrong core's block |
 | **Syscall MSRs (`EFER.SCE`, `STAR`/`LSTAR`)** | re-armed at each ring-3 **descent** (`arm_user_entry_cpu_base`, cheap `rdmsr(EFER)` gate) | first `syscall` `#UD`s (Bug 1) |
 | **Dense index (`TSC_AUX`)** | set once at bring-up, never per-thread: the BSP's first thing in `kernel_main`, before anything reads it | see Bugs 2 & 5 |
 
@@ -241,7 +248,9 @@ These are the load-bearing rules. Every bug in Part 2 was a violation of one.
   threads. Without it, the window between "enqueue `prev` into `ready` + release
   `SCHED`" and "`context_switch` writes `saved_sp`" lets another core steal `prev`
   and resume it from a **stale `saved_sp`** — a double-run (Bug 4). Modeled on
-  Linux's `task_struct::on_cpu` + `smp_cond_load_acquire(&p->on_cpu)`.
+  Linux's `task_struct::on_cpu` + `smp_cond_load_acquire(&p->on_cpu)`. The saved
+  stack pointer is read only through `Thread::parked_sp`, which answers `None` while
+  the guard is raised, so a read under `SCHED` never meets the switch's write.
 - **I3 — the dense index is unique and stable.** Enforced by APIC-id derivation
   (§2). Any code that writes `IA32_TSC_AUX` must run on the core it is labelling,
   before that core can migrate (Bug 5).
@@ -459,7 +468,7 @@ unrelated idle-fallback panic and been inconclusive — worth calling out, becau
 briefly pointed the wrong way).
 
 **Fix.** The **`on_cpu` guard** (I2): a per-`Thread` `AtomicBool` set under `SCHED`
-in `switch_into` before the lock release, and cleared by `context_switch`'s asm
+in `Switch::prepare` before the lock release, and cleared by `context_switch`'s asm
 *after* it commits `saved_sp`; `stealable_to` skips guarded threads. x86-TSO orders
 the sp-commit store before the flag-clear store, so a stealer that observes the
 clear also sees the final `saved_sp` — no explicit fence. This cut the rate 13 % →

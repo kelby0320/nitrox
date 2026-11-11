@@ -1,9 +1,9 @@
 //! Kernel-thread context switch, shared by the cooperative (`yield_now`/`exit`) and
 //! preemptive (timer-IRQ) scheduler paths.
 //!
-//! [`context_switch`] is the xv6/Linux `swtch` as a `#[unsafe(naked)]` function, so the
-//! scheduler couples `Thread.arch.rsp` to it by `offset_of!` (decision log, 2026-05-29): park
-//! the six callee-saved registers on the outgoing stack, store RSP in the outgoing slot, load
+//! [`context_switch`] is the xv6/Linux `swtch` as a `#[unsafe(naked)]` function, which the
+//! scheduler hands the outgoing thread's saved-RSP slot by address (decision log, 2026-05-29):
+//! park the six callee-saved registers on the outgoing stack, store RSP in the outgoing slot, load
 //! the incoming RSP, pop its six registers, `ret`. Caller-saved registers and RFLAGS are not
 //! saved (a normal `call`; the scheduler masks interrupts across the switch, see
 //! `kernel/docs/lock-ordering.md`). CR3 is not switched here.
@@ -69,7 +69,8 @@ const fn fabricated_sp(top: u64) -> u64 {
 
 /// Cooperatively switch from the current thread to another.
 ///
-/// `prev_sp_slot` is `&mut current.arch.rsp`, where the outgoing resume RSP is stored;
+/// `prev_sp_slot` is the outgoing thread's saved-RSP slot ([`sp_slot`](ArchThreadContext::sp_slot)),
+/// where the outgoing resume RSP is stored;
 /// `next_sp` is the incoming thread's saved RSP (parked, or from [`fabricate_frame`]).
 /// Returns only when a later switch selects the outgoing thread again.
 ///
@@ -83,7 +84,7 @@ const fn fabricated_sp(top: u64) -> u64 {
 ///
 /// # Safety
 /// `prev_sp_slot` must be a valid, writable `*mut u64` (the outgoing
-/// thread's `arch.rsp`), `next_sp` must be the saved RSP of a thread
+/// thread's saved-RSP slot), `next_sp` must be the saved RSP of a thread
 /// whose stack holds a matching parked or fabricated frame, and
 /// `prev_on_cpu` must be null or a valid `*mut u8` at the outgoing thread's
 /// `on_cpu` byte. Passing anything else corrupts the stack and is undefined
@@ -92,8 +93,8 @@ const fn fabricated_sp(top: u64) -> u64 {
 #[unsafe(naked)]
 pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64, prev_on_cpu: *mut u8) {
     // SAFETY: naked — no prologue/epilogue; every register effect is written explicitly.
-    // Reached only via a normal `call` from `sched::yield_now`/`exit`: rdi is a live
-    // `*mut u64` into the outgoing `arch.rsp`, rsi the saved RSP of a live, refcount-pinned
+    // Reached only via a normal `call` from `sched::switch_into`: rdi is a live
+    // `*mut u64` at the outgoing thread's saved-RSP slot, rsi the saved RSP of a live, refcount-pinned
     // incoming thread, rdx null or a live `*mut u8` at its `on_cpu`. Exactly the six
     // callee-saved registers are preserved; the push order MUST mirror `fabricate_frame`.
     naked_asm!(

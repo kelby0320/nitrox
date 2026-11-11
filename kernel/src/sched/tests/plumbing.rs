@@ -5,11 +5,10 @@ fn po() -> ObjectRef {
 }
 
 /// A thread made this CPU's current in `st`, as a switch finds it.
-fn running(st: &mut SchedState, tid: u32) -> *mut () {
+fn running(st: &mut SchedState, tid: u32) -> Ref<Thread> {
     let r = inert_ref(tid);
-    let obj = r.as_ptr();
-    *st.cur_slot() = Some(r);
-    obj
+    *st.cur_slot() = Some(r.clone());
+    r
 }
 
 /// **Each `Park` puts the outgoing thread on its own list, in the state that list means**, and
@@ -26,15 +25,15 @@ fn each_park_puts_the_thread_on_its_own_list_in_its_state() {
     ];
     for (i, (to, state)) in cases.into_iter().enumerate() {
         let mut st = reserved_state();
-        let obj = running(&mut st, 1);
+        let th = running(&mut st, 1);
+        let obj = th.as_ptr();
         let prev = take_current(&mut st);
         park(&mut st, prev, to);
-        let holds = |l: &Reserved<ObjectRef>| l.iter().any(|r| r.as_ptr() == obj);
+        let holds = |l: &Reserved<Ref<Thread>>| l.iter().any(|r| r.as_ptr() == obj);
         let reaper = st.reaper.as_ref().is_some_and(|r| r.as_ptr() == obj);
         let on = [holds(&st.ready[0]), holds(&st.blocked), holds(&st.suspended), holds(&st.reap[0]), reaper];
         assert_eq!(on, core::array::from_fn(|list| list == i), "{to:?}: the lists holding it");
-        // SAFETY: pinned by the list it is on; single-threaded test.
-        assert_eq!(unsafe { Thread::state_now(obj) }, state, "{to:?}");
+        assert_eq!(th.state(&st.tok), state, "{to:?}");
         assert!(st.cur_ref().is_none());
     }
 }
@@ -44,12 +43,12 @@ fn each_park_puts_the_thread_on_its_own_list_in_its_state() {
 fn the_idle_thread_yields_to_its_own_slot() {
     init_global_heap();
     let mut st = reserved_state();
-    let obj = running(&mut st, IDLE_TID);
+    let obj = running(&mut st, IDLE_TID).as_ptr();
     st.set_idle_addr(obj as usize);
     let prev = take_current(&mut st);
     park(&mut st, prev, Park::Ready);
     assert!(st.ready[0].is_empty());
-    assert_eq!(st.idle_slot().as_ref().map(ObjectRef::as_ptr), Some(obj));
+    assert_eq!(st.idle_slot().as_ref().map(Ref::as_ptr), Some(obj));
 }
 
 /// **What a hold defers drops once `SCHED` is released**: under it, the drop assertion would stop
@@ -147,24 +146,20 @@ fn a_started_thread_no_queue_takes_drops_after_the_hold() {
 }
 
 /// A thread blocked on each of `objs`, registered as `wait_on` registers it.
-fn waiting_on(st: &mut SchedState, objs: &[&ObjectRef]) -> *mut () {
+fn waiting_on(st: &mut SchedState, objs: &[&ObjectRef]) -> Ref<Thread> {
     let th = inert_ref(1);
-    let t = th.as_ptr();
     let addrs: std::vec::Vec<usize> = objs.iter().map(|o| o.as_ptr() as usize).collect();
-    // SAFETY: the thread is pinned by its test; single-threaded test.
-    unsafe {
-        Thread::wait_register(t, &addrs, false);
-        Thread::set_state(t, ThreadState::Blocked);
-    }
+    th.wait_register(&mut st.tok, &addrs, false);
+    th.set_state(&mut st.tok, ThreadState::Blocked);
     for o in objs {
-        obj_add_waiter(&mut st.tok, o, t).unwrap();
+        obj_add_waiter(&mut st.tok, o, addr(&*th)).unwrap();
     }
-    assert!(st.blocked.push(th).is_ok());
-    t
+    assert!(st.blocked.push(th.clone()).is_ok());
+    th
 }
 
-fn queued(st: &SchedState, t: *mut ()) -> usize {
-    st.ready.iter().map(|q| q.iter().filter(|r| r.as_ptr() == t).count()).sum()
+fn queued(st: &SchedState, t: &Thread) -> usize {
+    st.ready.iter().map(|q| q.iter().filter(|r| core::ptr::eq(&***r, t)).count()).sum()
 }
 
 /// **Every kind of waitable wakes through the one loop**, which marks its slot in the waiter's
@@ -198,9 +193,8 @@ fn every_kind_of_waitable_marks_its_slot_and_wakes_its_waiter() {
         let t = waiting_on(&mut st, &[obj]);
         signal(&mut st, obj);
         let kind = obj.object_type();
-        // SAFETY: pinned by its run queue; single-threaded test.
-        assert!(unsafe { Thread::wait_signaled(t) }[0], "{kind:?}: its slot marked");
-        assert_eq!(queued(&st, t), 1, "{kind:?}: its waiter runnable");
+        assert!(t.wait_signaled(&st.tok)[0], "{kind:?}: its slot marked");
+        assert_eq!(queued(&st, &t), 1, "{kind:?}: its waiter runnable");
     }
 }
 
@@ -216,20 +210,17 @@ fn a_thread_waiting_on_two_objects_is_woken_by_the_first_alone() {
     let t = waiting_on(&mut st, &[&a, &b]);
     assert!(signal_channel(&mut st, a.downcast_ref().unwrap()), "the first wakes it");
     assert!(!signal_channel(&mut st, b.downcast_ref().unwrap()), "the second wakes nothing");
-    // SAFETY: pinned by its run queue; single-threaded test.
-    assert_eq!(unsafe { Thread::wait_signaled(t) }[..2], [true, true]);
-    assert_eq!(queued(&st, t), 1);
+    assert_eq!(t.wait_signaled(&st.tok)[..2], [true, true]);
+    assert_eq!(queued(&st, &t), 1);
 }
 
 fn ending(st: &mut SchedState, blocked: bool) {
     let th = inert_user_ref(1, 7);
-    // SAFETY: pinned by `th`; single-threaded test. A blocked thread is in a wait, to be claimed.
-    unsafe {
-        if blocked {
-            Thread::wait_register(th.as_ptr(), &[], false);
-        }
-        Thread::set_state(th.as_ptr(), if blocked { ThreadState::Blocked } else { ThreadState::Suspended });
+    // A blocked thread is in a wait, to be claimed.
+    if blocked {
+        th.wait_register(&mut st.tok, &[], false);
     }
+    th.set_state(&mut st.tok, if blocked { ThreadState::Blocked } else { ThreadState::Suspended });
     let list = if blocked { &mut st.blocked } else { &mut st.suspended };
     *list = thread_list().unwrap();
     assert!(list.push(th).is_ok());
@@ -274,21 +265,18 @@ fn a_terminate_request_reaches_the_channel_its_process_holds() {
     assert!(!request_terminate(&process), "no channel to ask on");
     process.set_notification_channel(channel.clone());
     let waiter = inert_ref(1);
-    let (t, on) = (waiter.as_ptr(), channel.as_ptr().cast::<()>());
+    let (t, on) = (addr(&*waiter), channel.as_ptr().cast::<()>());
     {
         let mut g = SCHED.lock();
-        // SAFETY: the test's thread, pinned by its reference; `SCHED` held.
-        unsafe { Thread::wait_register(t, &[on as usize], false) };
+        waiter.wait_register(&mut g.tok, &[on as usize], false);
         channel.add_waiter(&mut g.tok, t).unwrap();
     }
     assert!(request_terminate(&process));
     let woken = {
         let mut g = SCHED.lock();
-        // SAFETY: as above.
-        let marked = unsafe { Thread::wait_signaled(t) }[0];
+        let marked = waiter.wait_signaled(&g.tok)[0];
         channel.remove_waiter(&mut g.tok, t);
-        // SAFETY: as above.
-        unsafe { Thread::wait_clear(t) };
+        waiter.wait_clear(&mut g.tok);
         marked
     };
     assert!(woken, "its waiter woken");
@@ -303,7 +291,7 @@ fn a_wait_that_would_block_on_a_kind_no_thread_waits_on_is_refused() {
     init_global_heap();
     let process = ObjectRef::new(Process::try_new(9).unwrap());
     let po = Ref::new(PendingOperation::try_new().unwrap());
-    with_current(into_objref(Thread::try_new(0, 0).unwrap()), || {
+    with_current(Ref::new(Thread::try_new(0, 0).unwrap()), || {
         assert!(matches!(wait_on(&[&process], 0, 0), WaitResult::TimedOut), "a poll finds it not ready");
         for deadline in [5, u64::MAX] {
             let refused = wait_on(&[po.as_object(), &process], deadline, 0);
@@ -322,7 +310,7 @@ fn a_wait_on_one_object_more_than_it_holds_is_refused() {
         (0..=MAX_WAIT_HANDLES).map(|_| Ref::new(PendingOperation::try_new().unwrap())).collect();
     complete_pending_op(&pos[MAX_WAIT_HANDLES - 1], 0, 0);
     let objs: std::vec::Vec<&ObjectRef> = pos.iter().map(Ref::as_object).collect();
-    with_current(into_objref(Thread::try_new(0, 0).unwrap()), || {
+    with_current(Ref::new(Thread::try_new(0, 0).unwrap()), || {
         let held = wait_on(&objs[..MAX_WAIT_HANDLES], 0, 0);
         assert!(matches!(held, WaitResult::Signaled(b) if b[MAX_WAIT_HANDLES - 1]), "its last slot read");
         assert!(matches!(wait_on(&objs, 0, 0), WaitResult::OutOfMemory), "one more");
@@ -375,23 +363,107 @@ fn closing_an_endpoint_wakes_a_receiver_blocked_on_its_peer() {
     init_global_heap();
     let (a, b) = IpcChannel::try_new_pair(4).unwrap();
     let waiter = inert_ref(1);
-    let (t, on) = (waiter.as_ptr(), a.as_ptr().cast::<()>());
+    let (t, on) = (addr(&*waiter), a.as_ptr().cast::<()>());
     {
         let mut g = SCHED.lock();
-        // SAFETY: the test's thread, pinned by its reference; `SCHED` held.
-        unsafe { Thread::wait_register(t, &[on as usize], false) };
+        waiter.wait_register(&mut g.tok, &[on as usize], false);
         a.add_waiter(&mut g.tok, t).unwrap();
     }
     drop(b);
     let woken = {
         let mut g = SCHED.lock();
-        // SAFETY: as above.
-        let marked = unsafe { Thread::wait_signaled(t) }[0];
+        let marked = waiter.wait_signaled(&g.tok)[0];
         a.remove_waiter(&mut g.tok, t);
-        // SAFETY: as above.
-        unsafe { Thread::wait_clear(t) };
+        waiter.wait_clear(&mut g.tok);
         marked
     };
     assert!(woken, "its receiver woken");
     assert_eq!(ipc_recv_peek(&a), RecvState::PeerClosed);
+}
+
+/// **A borrowed thread stands beside what other CPUs write in it**: one CPU reads it through a
+/// `&Thread` while another sets its affinity under `SCHED`, and a third, switching it out, writes
+/// its saved stack pointer with the lock let go and then clears its guard, as the switch's asm
+/// does. Miri reports a race between such a borrow and any write outside a cell; and the stack
+/// pointer is read only once the guard is seen clear.
+#[test]
+fn a_borrowed_thread_stands_beside_its_scheduler_and_its_switch() {
+    use core::sync::atomic::AtomicU8;
+    init_global_heap();
+    let th = Ref::new(Thread::try_new(7, 3).unwrap());
+    let shared: &Thread = &th;
+    th.raise_on_cpu(&SCHED.lock().tok);
+    std::thread::scope(|s| {
+        s.spawn(|| (1..=4).for_each(|mask| set_thread_affinity(&th, mask)));
+        s.spawn(|| {
+            // SAFETY: the slot and the guard byte are the thread's, which `th` pins, and only this
+            // switch writes them while the guard is raised: the slot, then the guard.
+            unsafe {
+                th.sp_slot().write(0x1000);
+                AtomicU8::from_ptr(th.on_cpu_ptr()).store(0, Ordering::Release);
+            }
+        });
+        for _ in 0..8 {
+            assert_eq!((shared.tid(), shared.owner_pid()), (7, 3));
+        }
+        let sp = loop {
+            if let Some(sp) = shared.parked_sp(&SCHED.lock().tok) {
+                break sp;
+            }
+            std::hint::spin_loop();
+        };
+        assert_eq!(sp, 0x1000, "read once the switch had committed it");
+    });
+    assert_eq!(shared.cpu_mask(&SCHED.lock().tok), 4);
+}
+
+/// **A switch is prepared from what the incoming thread's guard lets it read, and leaves the
+/// outgoing thread's guard raised**: the stack pointer it resumes is the one its last switch
+/// committed, and the thread switched from is not resumable until this switch commits its own.
+#[test]
+fn a_prepared_switch_waits_on_the_incoming_guard_and_raises_the_outgoing_one() {
+    use core::sync::atomic::AtomicU8;
+    init_global_heap();
+    let mut st = test_state();
+    let (out, next) = (inert_ref(1), inert_ref(2));
+    next.set_last_cpu(&mut st.tok, 3);
+    next.raise_on_cpu(&st.tok);
+    let switch = std::thread::scope(|s| {
+        s.spawn(|| {
+            // Long enough that a `prepare` not waiting reads the slot before it is written.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: as the switch that parks `next` writes them: its slot, then its guard,
+            // which nothing else writes while it is raised.
+            unsafe {
+                next.sp_slot().write(0x2000);
+                AtomicU8::from_ptr(next.on_cpu_ptr()).store(0, Ordering::Release);
+            }
+        });
+        Switch::prepare(&mut st, &out, &next)
+    });
+    assert_eq!(switch.next_sp, 0x2000, "read once the switch parking it had committed it");
+    assert_eq!(next.last_cpu(&st.tok), 0, "recorded where it runs");
+    assert!(out.is_on_cpu() && out.parked_sp(&st.tok).is_none(), "not resumable until it commits");
+    assert_eq!((switch.out_sp_slot, switch.out_on_cpu), (out.sp_slot(), out.on_cpu_ptr()));
+}
+
+/// **The reap closes the handles of a process whose last thread its batch holds**, and no other
+/// process's.
+#[test]
+fn the_reap_closes_the_handles_of_an_ended_process_only() {
+    use crate::handle::global;
+    use crate::libkern::Rights;
+    use crate::object::Timer;
+    const ENDED: u32 = 4490;
+    const LIVE: u32 = 4491;
+    init_global_heap();
+    global::init_for_tests();
+    let install = |pid| global::get().install(pid, Timer::try_new().unwrap().erase(), Rights::empty()).ok().unwrap();
+    let (ended, live) = (install(ENDED), install(LIVE));
+    let (last, other) = (inert_user_ref(1, ENDED), inert_user_ref(2, LIVE));
+    last.set_process_ended();
+    close_ended_processes(&[Some(last.erase()), Some(other.erase()), None]);
+    assert!(global::get().lookup(ended, ENDED, Rights::empty()).is_err(), "the ended process's handle is closed");
+    assert!(global::get().lookup(live, LIVE, Rights::empty()).is_ok(), "a live process's is not");
+    assert_eq!(global::close_all_owned_by(LIVE), 1);
 }

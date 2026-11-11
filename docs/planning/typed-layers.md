@@ -382,6 +382,36 @@ their own. Then `&Thread` is sound and `Ref<Thread>` derefs, and `Thread::proces
 process for the six `process_of` reads, sched-o8's last. Control: kobj-d11's Miri test, and
 `sched`'s tests under Miri. Author.
 
+**Built 2026-11-10.** A `Thread`'s fields are split by who writes them:
+- its identity is fixed when it is made;
+- what `SCHED` guards is a `SchedCell<ThreadSched>`;
+- its wait phase, `on_cpu` guard and ended mark are atomics;
+- its parked context, the saved stack pointer and the FP/SIMD image, is reached only by address.
+
+`Thread` is `Shared`, so `Ref<Thread>` derefs, and its 43 raw accessors are safe methods, those for
+`SCHED`'s state taking the token. The scheduler's lists hold `Ref<Thread>`, and
+`Thread::process` borrows the process for the six `process_of` reads.
+- **The parked context is read only with its guard clear.** `Thread::parked_sp` is `None` while
+  `on_cpu` is raised, and only the switch's asm clears the guard, so a read under `SCHED` never
+  meets the switch's write.
+- **A switch is prepared under the hold** (`Switch::prepare`): what it needs of both threads is
+  read there, the incoming thread's stack top among it, sched-d16's read. Its arming stays after the
+  release, for J.11.
+- **The ended mark is an atomic**, as the reaper reads it with no lock held.
+
+What stays raw: a waiter's address. `wake_all` and the tick's thread deadline follow it, as a
+scheduler list pins a waiting thread until it unregisters.
+
+Counts:
+- `unsafe` blocks fall from 685 to 571 and `unsafe fn`s from 233 to 188 (`object`'s 50 to 9,
+  `sched`'s 7 to 3);
+- `unsafe impl`s rise from 57 to 59: `Thread`'s `Shared` claim, and its parked context's `Sync`.
+
+**The control fails on `main` under both Miri models and passes here.** One thread reads a thread
+through a `&Thread`, another sets its affinity under `SCHED`, and a third writes its parked context
+as the switch does. With the control, `sched::` and the objects' tests pass under Miri: 162 on
+`main` and 163 here.
+
 ### J.8 A frame's bytes, through a view (kobj-o11 with kmem-o5; kobj-d13 with kmem-d18; drv-o14; kplat-o6's view)
 
 Measured: **30 `hhdm_offset()` sites** outside tests. Nine reach an object's frames, four are driver

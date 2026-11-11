@@ -84,14 +84,13 @@ pub(super) fn wake_all<const N: usize>(g: &mut SchedState, waiters: Waiters<N>, 
     let mut woke = false;
     for &th in waiters.iter() {
         // SAFETY: only a `WaitQueue` makes `Waiters`, and only `wait_on` adds to one: the
-        // current thread, parked in `blocked` until it removes itself under `SCHED`, which the
-        // caller holds; so each is a live, pinned thread.
-        unsafe {
-            Thread::wait_mark_signaled(th, target as usize);
-            if Thread::wait_try_wake(th) {
-                make_runnable(g, th);
-                woke = true;
-            }
+        // current thread, which a scheduler list pins until it removes itself under `SCHED`,
+        // which the caller holds; so each is a live, pinned thread.
+        let th = unsafe { &*th.cast::<Thread>() };
+        th.wait_mark_signaled(&mut g.tok, target as usize);
+        if th.wait_try_wake() {
+            make_runnable(g, th);
+            woke = true;
         }
     }
     woke
