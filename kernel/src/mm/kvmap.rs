@@ -18,7 +18,8 @@ use crate::arch::Paging;
 use crate::arch::paging::{ArchPaging, PageFlags};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, SpinLock};
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
+use crate::mm::frame::Frame;
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
 
 /// Inclusive lower bound of the kernel vmap region (`docs/architecture/overview.md`).
 pub const KERNEL_VMAP_START: u64 = 0xFFFF_C000_0000_0000;
@@ -226,8 +227,9 @@ impl MmioWindow {
 /// clears the mapping, invalidates it on every CPU, then frees the frames and gives the VA back.
 pub struct VmapFrames<const N: usize> {
     base: VirtAddr,
-    frames: [PhysAddr; N],
     slot: Option<KBox<Slot>>,
+    /// Freed as the fields drop, after `drop`'s shootdown.
+    _frames: [Frame; N],
 }
 
 impl<const N: usize> VmapFrames<N> {
@@ -238,24 +240,15 @@ impl<const N: usize> VmapFrames<N> {
         drop(unused);
         let slot = slot?;
         let base = VirtAddr::new(slot.start + guard * PAGE_SIZE as u64);
-        let mut frames = [PhysAddr::new(0); N];
-        for i in 0..N {
-            match frame() {
-                Some(f) => frames[i] = f,
-                None => {
-                    frames[..i].iter().for_each(|&f| heap::buddy_free(f, 0));
-                    VMAP.lock().give_back(slot);
-                    return Err(AllocError);
-                }
-            }
-        }
+        let frames = core::array::from_fn::<_, N, _>(|_| Frame::alloc());
+        let phys = frames.iter().flatten().map(Frame::phys);
         // SAFETY: the slot's VA is this range's alone, fresh or given back after its shootdown.
-        if unsafe { map_all(base.as_u64(), frames.iter().copied(), flags) }.is_err() {
-            frames.iter().for_each(|&f| heap::buddy_free(f, 0));
+        let mapped = frames.iter().all(Option::is_some) && unsafe { map_all(base.as_u64(), phys, flags) }.is_ok();
+        if !mapped {
             VMAP.lock().give_back(slot);
             return Err(AllocError);
         }
-        Ok(Self { base, frames, slot: Some(slot) })
+        Ok(Self { base, slot: Some(slot), _frames: frames.map(|f| f.expect("every frame, checked above")) })
     }
 
     /// The first mapped byte; the guard pages are below it.
@@ -274,25 +267,10 @@ impl<const N: usize> VmapFrames<N> {
     }
 }
 
-/// A frame for a [`VmapFrames`], which a host test can make fail.
-fn frame() -> Option<PhysAddr> {
-    #[cfg(test)]
-    if FRAMES_LEFT.with(|left| left.replace(left.get().map(|n| n.saturating_sub(1))) == Some(0)) {
-        return None;
-    }
-    heap::buddy_alloc(0)
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static FRAMES_LEFT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
-}
-
 impl<const N: usize> Drop for VmapFrames<N> {
     fn drop(&mut self) {
         // SAFETY: this range's own mapping, which its owner uses no longer.
         unsafe { unmap_all(self.base.as_u64(), N as u64) };
-        self.frames.iter().for_each(|&f| heap::buddy_free(f, 0));
         if let Some(slot) = self.slot.take() {
             VMAP.lock().give_back(slot);
         }

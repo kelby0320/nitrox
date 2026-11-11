@@ -1,4 +1,5 @@
 use super::*;
+use crate::mm::heap;
 use crate::mm::test_support::init_global_heap;
 use crate::object::ObjectRef;
 use crate::object::header::test_probe;
@@ -320,6 +321,23 @@ fn a_page_being_filled_is_neither_lent_nor_marked_ready() {
     assert_eq!(f.lookup(0).map(|(_, state)| state), Some(PageState::Loading), "nor marked ready");
     f.settle(0, &po, false);
     assert!(f.lookup(0).is_none(), "the failed fill freed it");
+}
+
+/// **A cache frees a failed fill's frame as it settles, a retired or cached page's with the object.**
+#[test]
+fn a_cache_frees_each_pages_frame_once() {
+    init_global_heap();
+    let f = fobj(3 * PAGE_SIZE);
+    for i in 0..3 {
+        fill(&f, i, 1);
+    }
+    let freed = heap::frames_freed_by_this_thread();
+    f.resize(PAGE_SIZE, KVec::new()).unwrap();
+    let Fault::Fill(_, po) = f.reserve_fault(1) else { panic!("a miss") };
+    f.settle(1, &po, false);
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 1, "only the failed fill's");
+    drop(f);
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 4, "the cached page and the two retired");
 }
 
 /// **A page a truncation takes between its fault and its copy fails the read**, rather than

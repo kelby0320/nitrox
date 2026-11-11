@@ -1,5 +1,7 @@
 use super::*;
 use crate::mm::addr_space::AddressSpace;
+use crate::mm::frame::fail_frames_after;
+use crate::mm::heap;
 use crate::mm::test_support::init_global_heap;
 
 const PAGE: u64 = PAGE_SIZE as u64;
@@ -50,15 +52,14 @@ fn the_last_page_the_vmap_hands_out_is_mapped_under_every_root() {
     init_global_heap();
     let last = VMAP.lock().end - PAGE;
     let (a, b) = (AddressSpace::new().unwrap(), AddressSpace::new().unwrap());
-    let frame = heap::buddy_alloc(0).unwrap();
+    let frame = Frame::alloc().unwrap();
     // SAFETY: the window's last page, far past the cursor, which no test hands out.
-    unsafe { map_all(last, core::iter::once(frame), PageFlags::WRITABLE).unwrap() };
+    unsafe { map_all(last, core::iter::once(frame.phys()), PageFlags::WRITABLE).unwrap() };
     for root in [a.root(), b.root()] {
-        assert_eq!(translate(root, last), Some(frame));
+        assert_eq!(translate(root, last), Some(frame.phys()));
     }
     // SAFETY: mapped just above, and used by nothing.
     unsafe { unmap_all(last, 1) };
-    heap::buddy_free(frame, 0);
 }
 
 #[test]
@@ -84,7 +85,8 @@ fn a_repointed_window_reads_the_new_frame_and_shoots_down_the_old() {
     init_global_heap();
     let other = AddressSpace::new().unwrap();
     let mut win = MmioWindow::new().unwrap();
-    let (first, second) = (heap::buddy_alloc(0).unwrap(), heap::buddy_alloc(0).unwrap());
+    // Left to the window, which keeps the second mapped.
+    let (first, second) = (Frame::alloc().unwrap().into_pte(), Frame::alloc().unwrap().into_pte());
     let shots = crate::tlb::shootdowns_by_this_thread().0;
     // SAFETY: frames this test owns, read through the window by nothing.
     unsafe { win.repoint(first).unwrap() };
@@ -113,13 +115,13 @@ fn a_range_that_runs_out_of_page_tables_is_undone() {
     let other = AddressSpace::new().unwrap();
     // Far past the cursor: two pages in a table made here, two past the 2 MiB boundary in none.
     let boundary = VMAP_WINDOW_END - (64 << 20);
-    let frame = heap::buddy_alloc(0).unwrap();
+    let frame = Frame::alloc().unwrap();
     // SAFETY: a page no test hands out, mapped only to make its table.
     unsafe {
-        map_all(boundary - PAGE, core::iter::once(frame), PageFlags::WRITABLE).unwrap();
+        map_all(boundary - PAGE, core::iter::once(frame.phys()), PageFlags::WRITABLE).unwrap();
         unmap_all(boundary - PAGE, 1);
     }
-    heap::buddy_free(frame, 0);
+    drop(frame);
     VMAP.lock().give_back(KBox::try_new(Slot { start: boundary - 4 * PAGE, pages: 6, next: None }).unwrap());
     let (shots, freed) = (crate::tlb::shootdowns_by_this_thread().0, heap::frames_freed_by_this_thread());
     crate::arch::fail_page_tables_after(Some(0));
@@ -133,17 +135,20 @@ fn a_range_that_runs_out_of_page_tables_is_undone() {
     assert_eq!(VmapFrames::<4>::new(PageFlags::WRITABLE, 2).unwrap().base().as_u64(), base, "its VA, given back");
 }
 
+/// **A range a frame short frees those it took and gives back its VA**, short at each index.
 #[test]
 fn a_range_short_of_frames_frees_those_it_took_and_gives_back_its_va() {
     init_global_heap();
     let first = VmapFrames::<3>::new(PageFlags::WRITABLE, 5).unwrap().base();
-    FRAMES_LEFT.with(|left| left.set(Some(2)));
-    let freed = heap::frames_freed_by_this_thread();
-    let short = VmapFrames::<3>::new(PageFlags::WRITABLE, 5);
-    FRAMES_LEFT.with(|left| left.set(None));
-    assert!(short.is_err());
-    assert_eq!(heap::frames_freed_by_this_thread() - freed, 2);
-    assert_eq!(VmapFrames::<3>::new(PageFlags::WRITABLE, 5).unwrap().base(), first);
+    for short in 0..3 {
+        fail_frames_after(Some(short));
+        let freed = heap::frames_freed_by_this_thread();
+        let made = VmapFrames::<3>::new(PageFlags::WRITABLE, 5);
+        fail_frames_after(None);
+        assert!(made.is_err());
+        assert_eq!(heap::frames_freed_by_this_thread() - freed, short, "a frame short at {short}");
+        assert_eq!(VmapFrames::<3>::new(PageFlags::WRITABLE, 5).unwrap().base(), first, "short at {short}");
+    }
 }
 
 std::thread_local! {

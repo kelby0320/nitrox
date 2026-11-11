@@ -1,7 +1,8 @@
 //! A frame's bytes, through the HHDM: a [`FrameView`] its owner lends, and [`hhdm`] for memory no
-//! owner lends (firmware tables, page tables, a DMA buffer's memory).
+//! owner lends (firmware tables, page tables, a DMA buffer's memory). Its owner is a [`Frame`].
 
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,13 +15,119 @@ pub fn hhdm<T>(phys: PhysAddr) -> *mut T {
     (phys.as_u64() + heap::hhdm_offset()) as *mut T
 }
 
-/// `2^order` fresh frames from the buddy, zeroed; `None` when memory is exhausted.
-pub fn alloc_zeroed(order: usize) -> Option<PhysAddr> {
+/// `2^order` fresh frames from the buddy, zeroed if `zero`; `None` when memory is exhausted.
+fn take(order: usize, zero: bool) -> Option<PhysAddr> {
+    #[cfg(test)]
+    if FRAMES_LEFT.with(|left| left.replace(left.get().map(|n| n.saturating_sub(1))) == Some(0)) {
+        return None;
+    }
     let block = heap::buddy_alloc(order)?;
+    if !zero {
+        return Some(block);
+    }
     // SAFETY: a block the buddy just handed out, `PAGE_SIZE << order` bytes the HHDM maps, which
     // nothing else reaches until its address is returned.
     unsafe { core::ptr::write_bytes(hhdm::<u8>(block), 0, PAGE_SIZE << order) };
     Some(block)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FRAMES_LEFT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+/// Let this thread take `n` more frames or blocks, failing every one after, or any with `None`.
+#[cfg(test)]
+pub fn fail_frames_after(n: Option<usize>) {
+    FRAMES_LEFT.with(|left| left.set(n));
+}
+
+/// **A frame of RAM this value owns, freed as it drops**: not `Copy`, so freed once. A page table
+/// mapping it takes it ([`into_pte`](Self::into_pte)); transparent, so a list lends its addresses.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct Frame(PhysAddr);
+
+impl Frame {
+    /// A fresh frame, zeroed; `None` when memory is exhausted.
+    pub fn alloc_zeroed() -> Option<Self> {
+        take(0, true).map(Self)
+    }
+
+    /// A fresh frame holding whatever it held last, for a caller that writes all of it first.
+    pub fn alloc() -> Option<Self> {
+        take(0, false).map(Self)
+    }
+
+    /// Where the frame is.
+    pub fn phys(&self) -> PhysAddr {
+        self.0
+    }
+
+    /// The frame's bytes, for as long as it is borrowed.
+    pub fn view(&self) -> FrameView<'_> {
+        // SAFETY: a frame this value owns, so freed only once the borrow ends, and whose bytes
+        // its owner lends only to views, to mappings and to devices.
+        unsafe { FrameView::new(self.0) }
+    }
+
+    /// Hand the frame to the page table about to map it, which owns it from here.
+    pub fn into_pte(self) -> PhysAddr {
+        ManuallyDrop::new(self).0
+    }
+
+    /// Take back a frame a page table owned.
+    ///
+    /// # Safety
+    /// [`into_pte`](Self::into_pte) handed `phys` over, it is mapped no longer, and this takes it back
+    /// once; its drop frees it, so must wait until no CPU holds a stale translation to it.
+    pub unsafe fn from_pte(phys: PhysAddr) -> Self {
+        Self(phys)
+    }
+
+    /// The addresses of `frames`, for a device or a page table to borrow.
+    pub fn addrs(frames: &[Frame]) -> &[PhysAddr] {
+        // SAFETY: `Frame` is a transparent `PhysAddr`; the borrow keeps the frames.
+        unsafe { core::slice::from_raw_parts(frames.as_ptr().cast(), frames.len()) }
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        // SAFETY: a frame `take` made at order 0, which this value alone owned.
+        unsafe { heap::buddy_free(self.0, 0) }
+    }
+}
+
+/// **`2^order` contiguous frames this value owns**, freed together, at their order, as it drops.
+#[derive(Debug)]
+pub struct FrameBlock {
+    phys: PhysAddr,
+    order: usize,
+}
+
+impl FrameBlock {
+    /// `2^order` fresh frames, zeroed; `None` when memory is exhausted or `order` past the largest.
+    pub fn alloc_zeroed(order: usize) -> Option<Self> {
+        take(order, true).map(|phys| Self { phys, order })
+    }
+
+    /// Where the block begins.
+    pub fn phys(&self) -> PhysAddr {
+        self.phys
+    }
+
+    /// The block's order: it is `PAGE_SIZE << order` bytes.
+    pub fn order(&self) -> usize {
+        self.order
+    }
+}
+
+impl Drop for FrameBlock {
+    fn drop(&mut self) {
+        // SAFETY: a block `take` made at `order`, which this value alone owned.
+        unsafe { heap::buddy_free(self.phys, self.order) }
+    }
 }
 
 /// One frame's bytes, lent by its owner for `'a`. **Every access is an aligned 8-byte atomic**

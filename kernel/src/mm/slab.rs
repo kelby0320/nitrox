@@ -391,7 +391,8 @@ pub unsafe fn kfree(ptr: *mut u8) {
     // zero-sized types a dangling pointer and never route them here.
     let owner = unsafe { (*desc).owner };
     if owner.is_null() {
-        large_free(ptr, &HeapBuddy);
+        // SAFETY: a null owner marks a large allocation, which the caller frees once.
+        unsafe { large_free(ptr, &HeapBuddy) };
         return;
     }
     // SAFETY: `owner` is a pointer captured by `SlabCache::grow_locked`
@@ -444,7 +445,10 @@ fn large_alloc<P: BuddyPager>(size: usize, align: usize, pager: &P) -> *mut u8 {
 }
 
 /// Free a large allocation from [`large_alloc`].
-fn large_free<P: BuddyPager>(ptr: *mut u8, pager: &P) {
+///
+/// # Safety
+/// `ptr` is a large allocation [`large_alloc`] made from `pager`, freed once.
+unsafe fn large_free<P: BuddyPager>(ptr: *mut u8, pager: &P) {
     let desc = descriptor_of(ptr);
     let page0 = desc as usize;
     // SAFETY: large-alloc invariant — descriptor at byte 0 of the first
@@ -452,7 +456,8 @@ fn large_free<P: BuddyPager>(ptr: *mut u8, pager: &P) {
     let total = unsafe { (*desc).obj_size as usize };
     let order = BuddyAllocator::order_for_size(total);
     let phys = PhysAddr::new((page0 as u64).wrapping_sub(pager.hhdm_offset()));
-    pager.free(phys, order);
+    // SAFETY: the block `large_alloc` took from `pager` at this order, freed once as promised.
+    unsafe { pager.free(phys, order) };
 }
 
 /// **Under Miri, each `kmalloc` is a host allocation of its own**, so a use after `kfree` is one
@@ -580,8 +585,9 @@ mod tests {
         fn alloc(&self, order: usize) -> Option<PhysAddr> {
             self.inner.borrow_mut().alloc(order)
         }
-        fn free(&self, addr: PhysAddr, order: usize) {
-            self.inner.borrow_mut().free(addr, order);
+        unsafe fn free(&self, addr: PhysAddr, order: usize) {
+            // SAFETY: as this method's own contract.
+            unsafe { self.inner.borrow_mut().free(addr, order) };
         }
         fn hhdm_offset(&self) -> u64 {
             self.hhdm
@@ -727,7 +733,8 @@ mod tests {
         let obj_size = unsafe { (*desc).obj_size };
         assert!(owner.is_null(), "large-alloc descriptor must have null owner");
         assert_eq!(obj_size as usize, PAGE_SIZE << 2);
-        large_free(p, &pager);
+        // SAFETY: the large allocation just made from `pager`, freed once.
+        unsafe { large_free(p, &pager) };
     }
 
     #[test]
@@ -744,7 +751,8 @@ mod tests {
         let (_mem, pager) = make_world((PAGE_SIZE * 3) << crate::mm::buddy::MAX_ORDER);
         let fits = large_alloc(crate::mm::elf::MAX_IMAGE_BYTES, 8, &pager);
         assert!(!fits.is_null());
-        large_free(fits, &pager);
+        // SAFETY: the large allocation just made from `pager`, freed once.
+        unsafe { large_free(fits, &pager) };
         assert!(large_alloc(PAGE_SIZE << crate::mm::buddy::MAX_ORDER, 8, &pager).is_null(), "exactly 4 MiB");
     }
 
@@ -777,7 +785,8 @@ mod tests {
             let (owner, size) = unsafe { ((*desc).owner, (*desc).obj_size as usize) };
             assert!(owner.is_null(), "{align}");
             assert!(desc as usize + size >= p as usize + 64, "{align}: the block holds the object");
-            large_free(p, &pager);
+            // SAFETY: the large allocation just made from `pager`, freed once.
+            unsafe { large_free(p, &pager) };
         }
     }
 
@@ -788,7 +797,8 @@ mod tests {
         let desc = ((p as usize) & SLAB_MASK) as *mut SlabDescriptor;
         // SAFETY: test owns the allocation.
         assert!(unsafe { (*desc).owner.is_null() });
-        large_free(p, &pager);
+        // SAFETY: the large allocation just made from `pager`, freed once.
+        unsafe { large_free(p, &pager) };
     }
 
     #[test]

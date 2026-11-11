@@ -1,7 +1,7 @@
 //! The [`MemoryObject`] kernel object — mappable memory.
 //!
 //! **Owns** physical frames, allocated and zeroed at creation and freed with the last
-//! reference (or **borrows** a device range; see [`FrameOwnership`]). A mapping
+//! reference (or **borrows** a device range; see [`MemoryObject::try_new_borrowed`]). A mapping
 //! ([`AddressSpace::map_object`]) holds an [`ObjectRef`], so the frames outlive every mapping
 //! and `unmap` never frees them; mapping one object twice aliases the same memory. Allocation
 //! is eager and anonymous only (`docs/architecture/memory-management.md`).
@@ -12,21 +12,16 @@
 use core::ops::Range;
 
 use crate::libkern::{AllocError, KBox, KVec};
-use crate::mm::frame::{self, FrameView};
-use crate::mm::{Caching, PAGE_SHIFT, PAGE_SIZE, PhysAddr, heap};
+use crate::mm::frame::{Frame, FrameView};
+use crate::mm::{Caching, PAGE_SHIFT, PAGE_SIZE, PhysAddr};
 use crate::object::header::{Header, Shared, kobject};
 
-/// Whether a [`MemoryObject`]'s frames belong to it.
-///
-/// Load-bearing: [`Drop`] hands every frame to the buddy allocator, which is **catastrophic**
-/// for a device aperture, whose MMIO addresses would land on the free list and be handed out
-/// as RAM.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FrameOwnership {
-    /// Frames came from the buddy allocator and are freed on drop.
-    Owned,
-    /// A fixed physical range this object does not own (a device aperture); never freed.
-    Borrowed,
+/// A [`MemoryObject`]'s pages, and whether they are its own.
+enum Frames {
+    /// Frames from the buddy, one a page, freed as the object drops.
+    Owned(KVec<Frame>),
+    /// A device's range from `base`, never freed: an aperture freed to the buddy would be RAM handed out.
+    Borrowed { base: PhysAddr, npages: usize },
 }
 
 /// Why the kernel refuses to reach a borrowed object's frames itself.
@@ -38,9 +33,7 @@ pub struct MemoryObject {
     header: Header<Self>,
     magic: u64,
     size: usize,
-    /// One frame per page; freed in [`Drop`] only when `ownership` is `Owned`.
-    frames: KVec<PhysAddr>,
-    ownership: FrameOwnership,
+    frames: Frames,
     /// How every mapping of these frames is cached; ordinary unless an aperture says otherwise.
     caching: Caching,
 }
@@ -70,27 +63,16 @@ impl MemoryObject {
         let npages = size >> PAGE_SHIFT;
 
         // Reserve the frame vector up front, the only fallible growth: the pushes cannot fail.
-        let mut frames: KVec<PhysAddr> = KVec::new();
+        let mut frames = KVec::new();
         frames.try_reserve(npages)?;
-
         for _ in 0..npages {
-            let Some(f) = frame::alloc_zeroed(0) else {
-                // `frames` is a bare `KVec` here: its `Drop` frees only storage, not these frames.
-                for &done in frames.iter() {
-                    heap::buddy_free(done, 0);
-                }
-                return Err(AllocError);
-            };
-            frames.try_push(f).expect("within reserved capacity");
+            frames.try_push(Frame::alloc_zeroed().ok_or(AllocError)?).expect("within reserved capacity");
         }
-
-        // A `KBox::try_new` failure drops the value, and `Drop` below frees every frame.
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
             size,
-            frames,
-            ownership: FrameOwnership::Owned,
+            frames: Frames::Owned(frames),
             caching: Caching::Normal,
         })
     }
@@ -100,7 +82,7 @@ impl MemoryObject {
     /// framebuffer this way (`docs/design/display-substrate.md` §3). [`MemoryObject::MAX_SIZE`]
     /// does **not** apply: it guards eager allocation, and a 4K aperture is ≈33 MiB.
     ///
-    /// `base` must be page-aligned; `size` rounds up. `AllocError` only if the frame vector fails.
+    /// `base` must be page-aligned; `size` rounds up. `AllocError` only if the box fails.
     ///
     /// # Safety
     /// `base..base + size` must be physical memory safe to map into a user address space for the
@@ -108,33 +90,19 @@ impl MemoryObject {
     /// buddy allocator manages (ordinary RAM would alias allocatable memory and never be freed).
     pub unsafe fn try_new_borrowed(base: PhysAddr, size: usize, caching: Caching) -> Result<KBox<Self>, AllocError> {
         let size = (size.max(1) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let npages = size >> PAGE_SHIFT;
-
-        let mut frames: KVec<PhysAddr> = KVec::new();
-        frames.try_reserve(npages)?;
-        for i in 0..npages {
-            frames.try_push(PhysAddr::new(base.as_u64() + (i << PAGE_SHIFT) as u64)).expect("within reserved capacity");
-        }
-
         KBox::try_new(Self {
             header: Header::new(),
             magic: Self::MAGIC,
             size,
-            frames,
-            ownership: FrameOwnership::Borrowed,
+            frames: Frames::Borrowed { base, npages: size >> PAGE_SHIFT },
             caching,
         })
-    }
-
-    /// Whether this object's frames are freed when it drops.
-    pub fn ownership(&self) -> FrameOwnership {
-        self.ownership
     }
 
     /// Whether the kernel may reach these frames itself, through the HHDM or a device: only those
     /// it owns. A borrowed range need not be in the HHDM, nor be memory, so it is for mapping.
     pub fn kernel_reachable(&self) -> bool {
-        self.ownership == FrameOwnership::Owned
+        matches!(self.frames, Frames::Owned(_))
     }
 
     /// How every mapping of this object is cached.
@@ -158,27 +126,34 @@ impl MemoryObject {
 
     /// Number of frames (pages) backing the object.
     pub fn npages(&self) -> usize {
-        self.frames.len()
+        match &self.frames {
+            Frames::Owned(frames) => frames.len(),
+            Frames::Borrowed { npages, .. } => *npages,
+        }
     }
 
     /// The object's backing frames, for the kernel to reach itself; `frames()[i]` backs page `i`.
-    /// A borrowed object's stop here, being only mapped: see [`Self::frames_to_map`].
-    pub fn frames(&self) -> &[PhysAddr] {
-        assert!(self.kernel_reachable(), "{BORROWED_ONLY_MAPPED}");
-        &self.frames
+    /// A borrowed object's stop here, being only mapped: see [`Self::frame_to_map`].
+    pub fn frames(&self) -> &[Frame] {
+        match &self.frames {
+            Frames::Owned(frames) => frames,
+            Frames::Borrowed { .. } => panic!("{BORROWED_ONLY_MAPPED}"),
+        }
     }
 
-    /// The object's frames for a mapping into a user's address space, a borrowed object's too.
-    pub fn frames_to_map(&self) -> &[PhysAddr] {
-        &self.frames
+    /// Page `i`'s frame for a mapping into a user's address space, a borrowed object's too.
+    pub fn frame_to_map(&self, i: usize) -> Option<PhysAddr> {
+        match &self.frames {
+            Frames::Owned(frames) => frames.get(i).map(Frame::phys),
+            Frames::Borrowed { base, npages } => {
+                (i < *npages).then(|| PhysAddr::new(base.as_u64() + (i << PAGE_SHIFT) as u64))
+            }
+        }
     }
 
     /// Page `i`'s frame, for the kernel to copy in or out of; `None` past the last.
     pub fn page(&self, i: usize) -> Option<FrameView<'_>> {
-        let &f = self.frames().get(i)?;
-        // SAFETY: a frame this object owns and frees only as it drops, so for the borrow of `self`,
-        // and whose bytes it lends to whoever holds it, as a mapping of it does.
-        Some(unsafe { FrameView::new(f) })
+        self.frames().get(i).map(Frame::view)
     }
 
     /// **Copy `src` into the object from byte `offset`**; a range past the last frame is cut
@@ -222,23 +197,11 @@ impl MemoryObject {
     }
 }
 
-impl Drop for MemoryObject {
-    /// Free every backing frame; the raw `PhysAddr`s have no owning wrapper to do it.
-    fn drop(&mut self) {
-        // Borrowed frames are a device aperture: freeing them would put MMIO addresses on the
-        // buddy free list (see [`FrameOwnership`]).
-        if self.ownership == FrameOwnership::Borrowed {
-            return;
-        }
-        for &f in self.frames.iter() {
-            heap::buddy_free(f, 0);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mm::frame::fail_frames_after;
+    use crate::mm::heap;
     use crate::mm::test_support::init_global_heap;
     use crate::object::ObjectRef;
     use crate::object::header::test_probe;
@@ -254,13 +217,27 @@ mod tests {
         let m = MemoryObject::try_new(2 * PAGE_SIZE + 1).unwrap();
         assert_eq!(m.size(), 3 * PAGE_SIZE);
         assert_eq!(m.npages(), 3);
-        for &f in m.frames() {
-            let base = (f.as_u64() + heap::hhdm_offset()) as *const u8;
-            for i in 0..PAGE_SIZE {
-                // SAFETY: a live MemoryObject's frames are allocated and HHDM-reachable.
-                let byte = unsafe { *base.add(i) };
-                assert_eq!(byte, 0, "frame byte {i} not zeroed");
-            }
+        for f in m.frames() {
+            let mut bytes = [1u8; PAGE_SIZE];
+            f.view().read(0, &mut bytes);
+            assert!(bytes.iter().all(|&b| b == 0), "a frame not zeroed");
+        }
+    }
+
+    /// **An object frees each frame it owns once as it drops; one a frame short, those it took.**
+    #[test]
+    fn an_object_frees_its_frames_once_and_a_short_one_those_it_took() {
+        init_global_heap();
+        let freed = heap::frames_freed_by_this_thread();
+        drop(MemoryObject::try_new(3 * PAGE_SIZE).unwrap());
+        assert_eq!(heap::frames_freed_by_this_thread() - freed, 3);
+        for short in 0..3 {
+            fail_frames_after(Some(short));
+            let freed = heap::frames_freed_by_this_thread();
+            let made = MemoryObject::try_new(3 * PAGE_SIZE);
+            fail_frames_after(None);
+            assert!(made.is_err());
+            assert_eq!(heap::frames_freed_by_this_thread() - freed, short, "a frame short at {short}");
         }
     }
 
@@ -272,12 +249,13 @@ mod tests {
         // inspects the object's bookkeeping, never the memory itself.
         let m = unsafe { MemoryObject::try_new_borrowed(base, 3 * PAGE_SIZE + 1, Caching::Normal).unwrap() };
 
-        assert_eq!(m.ownership(), FrameOwnership::Borrowed);
+        assert!(!m.kernel_reachable());
         assert_eq!(m.size(), 4 * PAGE_SIZE, "size rounds up to whole pages");
         assert_eq!(m.npages(), 4);
-        for (i, &f) in m.frames_to_map().iter().enumerate() {
-            assert_eq!(f.as_u64(), base.as_u64() + (i * PAGE_SIZE) as u64, "frame {i}");
+        for i in 0..4 {
+            assert_eq!(m.frame_to_map(i), Some(PhysAddr::new(base.as_u64() + (i * PAGE_SIZE) as u64)), "frame {i}");
         }
+        assert_eq!(m.frame_to_map(4), None);
     }
 
     /// **The kernel does not reach a borrowed object's frames itself**: copying in or out, or
@@ -296,43 +274,21 @@ mod tests {
         assert!(stops(&|| assert!(!m.frames().is_empty())), "frames");
         assert!(stops(&|| m.copy_in(0, b"x")), "copy_in");
         assert!(stops(&|| drop(m.copy_to_kvec())), "copy_to_kvec");
-        assert_eq!(m.frames_to_map(), &[base]);
+        assert_eq!((m.frame_to_map(0), m.frame_to_map(1)), (Some(base), None));
     }
 
     #[test]
     fn dropping_a_borrowed_object_never_frees_its_frames_into_the_buddy() {
-        // The property `FrameOwnership` exists for. The fake aperture is a high range the test heap
-        // never contains, so a leaked frame is identifiable by address.
         init_global_heap();
-        const APERTURE: u64 = 0xF000_0000;
-        const PAGES: usize = 64;
-
         // SAFETY: test-only. Nothing maps or dereferences these frames; the object
         // only records their addresses, and Borrowed drop must not touch them.
         let m = unsafe {
-            MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGES * PAGE_SIZE, Caching::WriteCombining).unwrap()
+            MemoryObject::try_new_borrowed(PhysAddr::new(0xF000_0000), 64 * PAGE_SIZE, Caching::WriteCombining).unwrap()
         };
+        let freed = heap::frames_freed_by_this_thread();
         drop(m);
-
-        let mut taken = KVec::new();
-        taken.try_reserve(PAGES).unwrap();
-        for _ in 0..PAGES {
-            let f = heap::buddy_alloc(0).expect("a frame");
-            assert!(
-                f.as_u64() < APERTURE || f.as_u64() >= APERTURE + (PAGES * PAGE_SIZE) as u64,
-                "buddy returned {:#x}, inside the borrowed aperture — Drop freed frames \
-                 it does not own",
-                f.as_u64()
-            );
-            taken.try_push(f).unwrap();
-        }
-        for &f in taken.iter() {
-            heap::buddy_free(f, 0);
-        }
+        assert_eq!(heap::frames_freed_by_this_thread(), freed);
     }
-
-    // The control for the test above is `drop_frees_frames_no_leak`: if `Drop` stopped freeing
-    // anything, that test exhausts the heap, whereas a no-op `Drop` would still pass this one.
 
     #[test]
     fn try_new_filled_copies_bytes_and_zeroes_tail() {
@@ -343,8 +299,8 @@ mod tests {
         }
         let m = MemoryObject::try_new_filled(&data).unwrap();
         assert_eq!(m.npages(), 2);
-        let base0 = (m.frames()[0].as_u64() + heap::hhdm_offset()) as *const u8;
-        let base1 = (m.frames()[1].as_u64() + heap::hhdm_offset()) as *const u8;
+        let base0 = (m.frames()[0].phys().as_u64() + heap::hhdm_offset()) as *const u8;
+        let base1 = (m.frames()[1].phys().as_u64() + heap::hhdm_offset()) as *const u8;
         // SAFETY: live, HHDM-reachable frames; read-only checks.
         unsafe {
             for (i, &d) in data[..PAGE_SIZE].iter().enumerate() {
@@ -366,7 +322,7 @@ mod tests {
         let fs = m.frames();
         for i in 0..fs.len() {
             for j in (i + 1)..fs.len() {
-                assert_ne!(fs[i], fs[j], "duplicate frame at {i},{j}");
+                assert_ne!(fs[i].phys(), fs[j].phys(), "duplicate frame at {i},{j}");
             }
         }
     }
@@ -418,7 +374,7 @@ mod tests {
         use core::sync::atomic::{AtomicU64, Ordering};
         init_global_heap();
         let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
-        let words = (m.frames()[0].as_u64() + heap::hhdm_offset()) as usize;
+        let words = (m.frames()[0].phys().as_u64() + heap::hhdm_offset()) as usize;
         std::thread::scope(|s| {
             s.spawn(|| {
                 for i in 0..PAGE_SIZE / 8 {

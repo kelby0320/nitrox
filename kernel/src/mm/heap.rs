@@ -36,7 +36,7 @@ pub unsafe fn init_buddy(memory_map: &MemoryMapResponse, hhdm_offset: u64) {
 }
 
 /// Allocate `2^order` contiguous physical frames; `None` on OOM. Panics before [`init_buddy`].
-pub fn buddy_alloc(order: usize) -> Option<PhysAddr> {
+pub(super) fn buddy_alloc(order: usize) -> Option<PhysAddr> {
     #[cfg(test)]
     if cfg!(miri) {
         return miri_frames::alloc(order);
@@ -46,7 +46,10 @@ pub fn buddy_alloc(order: usize) -> Option<PhysAddr> {
 }
 
 /// Return frames from [`buddy_alloc`]; `order` must match. Panics before [`init_buddy`].
-pub fn buddy_free(addr: PhysAddr, order: usize) {
+///
+/// # Safety
+/// Given back once, the block is reached by nothing after: the buddy hands it out again.
+pub(super) unsafe fn buddy_free(addr: PhysAddr, order: usize) {
     #[cfg(test)]
     FREED.with(|f| f.set(f.get() + (1 << order)));
     #[cfg(test)]
@@ -54,7 +57,9 @@ pub fn buddy_free(addr: PhysAddr, order: usize) {
         return miri_frames::free(addr, order);
     }
     let mut slot = BUDDY.lock();
-    slot.as_mut().expect("heap::buddy_free called before init_buddy").free(addr, order);
+    let buddy = slot.as_mut().expect("heap::buddy_free called before init_buddy");
+    // SAFETY: as this function's own contract.
+    unsafe { buddy.free(addr, order) };
 }
 
 /// **Under Miri, each block is a host allocation of its own**, as each `kmalloc` is, so Miri sees a
@@ -107,7 +112,9 @@ pub fn hhdm_offset() -> u64 {
 /// per-test `BuddyAllocator` in tests.
 pub trait BuddyPager {
     fn alloc(&self, order: usize) -> Option<PhysAddr>;
-    fn free(&self, addr: PhysAddr, order: usize);
+    /// # Safety
+    /// As [`buddy_free`]'s, for a block this pager's `alloc` gave.
+    unsafe fn free(&self, addr: PhysAddr, order: usize);
     fn hhdm_offset(&self) -> u64;
 }
 
@@ -118,8 +125,9 @@ impl BuddyPager for HeapBuddy {
     fn alloc(&self, order: usize) -> Option<PhysAddr> {
         buddy_alloc(order)
     }
-    fn free(&self, addr: PhysAddr, order: usize) {
-        buddy_free(addr, order);
+    unsafe fn free(&self, addr: PhysAddr, order: usize) {
+        // SAFETY: as this method's own contract.
+        unsafe { buddy_free(addr, order) };
     }
     fn hhdm_offset(&self) -> u64 {
         hhdm_offset()

@@ -12,8 +12,9 @@ Three layers, each owning a single concern:
 | VMM    | `kernel/src/mm/vmm.rs`                | Per-process address spaces, VMAs       |
 
 The boot facade in `kernel/src/mm/heap.rs` glues layers 1 and 2: it owns
-the single global `BuddyAllocator` and exposes `buddy_alloc` /
-`buddy_free` / `hhdm_offset` for callers above it. The slab calls into
+the single global `BuddyAllocator` and exposes `buddy_alloc`, the `unsafe`
+`buddy_free` and `hhdm_offset` within `mm`. Every other owner of frames holds
+a [`Frame` or `FrameBlock`](#frame-contents), freed as it drops. The slab calls into
 this facade through a small `BuddyPager` trait so tests can inject a
 local buddy without touching the global statics.
 
@@ -75,7 +76,7 @@ Two distinct paths share the same foundation. Keep them separate in your head:
 
 **Where `MemoryObject` fits.** It is the *owner* of user-mappable physical
 memory, sitting as a kernel object between the buddy allocator and the address
-space. It pulls frames straight from the buddy (zeroed by `frame::alloc_zeroed`), is
+space. It pulls frames straight from the buddy (zeroed `Frame`s), is
 reference-counted and reachable by a handle, and — crucially — *owns* those
 frames. Mapping it installs PTEs that point at its frames; unmap removes the
 PTEs but never frees them. That is the difference from an anonymous `map_vma`
@@ -85,8 +86,8 @@ the same physical memory — the property that makes it shareable. See
 [MemoryObject](#memoryobject).
 
 **Trace — `sys_memory_create(size, 0)`:** validate flags/size →
-`MemoryObject::try_new` (`buddy_alloc(0)` × N pages, zero each via HHDM, store
-in a slab-backed `KVec<PhysAddr>`; refcount 1) → `handle table install(pid,
+`MemoryObject::try_new` (`Frame::alloc_zeroed()` × N pages, kept in a
+slab-backed `KVec<Frame>`; refcount 1) → `handle table install(pid,
 ObjectRef::new(obj), full_rights)` → return the handle to userspace.
 
 **Trace — `sys_memory_map(h, 0, size, rights)`:** resolve the caller's
@@ -195,8 +196,8 @@ The single owner of the buddy allocator. Three responsibilities:
 
 1. Hold the static `SpinLock<Option<BuddyAllocator>>` and the
    `AtomicU64` HHDM offset, both populated by `init_buddy` during boot.
-2. Expose `buddy_alloc` / `buddy_free` / `hhdm_offset` for everyone
-   else.
+2. Expose `buddy_alloc` and the `unsafe` `buddy_free` within `mm`, to
+   `Frame`, `FrameBlock` and the slab, and `hhdm_offset` to everyone.
 3. Provide the `BuddyPager` trait so the slab can be tested against a
    local buddy in `#[cfg(test)]` builds without touching the production
    statics.
@@ -207,9 +208,17 @@ the buddy's own tests keep its coalescing on their local allocator.
 
 ## Frame contents
 
-[`mm/frame.rs`](../../kernel/src/mm/frame.rs) is how the kernel reaches a frame's bytes through
-the HHDM:
+[`mm/frame.rs`](../../kernel/src/mm/frame.rs) is how the kernel owns frames and reaches their
+bytes through the HHDM:
 
+- **`Frame`**: one frame of RAM, freed as it drops; not `Copy`, so it is freed once, at the order
+  it was taken, and nothing safe frees it otherwise. `alloc_zeroed` takes one as a mapping, a page
+  table or a cache page starts; `alloc`, unzeroed, one a read fills whole. A page table that maps
+  one takes it by `into_pte`, and an unmap takes an anonymous page's back by the `unsafe`
+  `from_pte`, freeing it after its shootdown. `Frame` is a transparent `PhysAddr`, so an owner's
+  list lends a device its addresses (`Frame::addrs`). **`FrameBlock`** is `2^order` contiguous
+  frames, freed together: a `DmaBuffer`'s. Under host tests a countdown fails a thread's takes from
+  the `n`th on (`fail_frames_after`), so each owner's rollback is driven at every index.
 - **`FrameView`**: one frame its owner lends for a borrow, with `read`, `write`, `fill` and
   `copy_from`, each stopping an access past the frame's end. **Every access is an aligned 8-byte
   atomic, never a reference**, and a write of part of a word merges by compare-and-swap: a user
@@ -219,8 +228,6 @@ the HHDM:
   it), a `FileObject`'s cache pages, and `AddressSpace::copy_in`, which writes the anonymous
   memory mapped at an address. The RAM disk, whose copies stand in for a device's, reaches an I/O
   request's frames through views too.
-- **`alloc_zeroed`**: fresh frames from the buddy, zeroed, as a mapping, a page table or a cache
-  page starts.
 - **`hhdm`**: the address of memory no owner lends, which its caller reaches in its own `unsafe`:
   ACPI's tables, the page tables, a DMA buffer's memory. The slab reaches its own pages through
   its `BuddyPager`.
@@ -373,8 +380,9 @@ ELF loader's, is filled eagerly, so its rollback frees without one.
 - **Frame ownership depends on the backing kind.**
   `ArchPaging::unmap_page` returns the `PhysAddr` it cleared;
   `unmap_covering` and `Drop` branch on `Vma.backing`: for
-  `Backing::Anonymous` the frame was owned by the mapping and is
-  handed to `buddy_free`; for `Backing::Object` the frame is owned by
+  `Backing::Anonymous` the frame was owned by the mapping, and is
+  taken back as a `Frame` (`from_pte`) and freed as it drops, an unmap's after its shootdown;
+  for `Backing::Object` the frame is owned by
   the `MemoryObject` (kept alive by the reference the backing holds) and is
   **not** freed — the object frees its frames when its last reference drops.
   `Backing::File`'s are the page cache's, and not freed either.
@@ -397,8 +405,9 @@ ELF loader's, is filled eagerly, so its rollback frees without one.
 A `MemoryObject` (`kernel/src/object/memory_object.rs`) is the kernel object
 behind `sys_memory_create`: anonymous, zero-filled memory a process can map.
 Unlike an anonymous `Vma` (whose frames are owned by the mapping), a
-`MemoryObject` **owns its physical frames** — a `KVec<PhysAddr>`, one per
-page, allocated and zeroed at creation and freed in its `Drop`. `map_object`
+`MemoryObject` **owns its physical frames** — a `KVec<Frame>`, one per
+page, allocated and zeroed at creation and freed as it drops; a borrowed aperture is a base and
+a page count, which nothing frees. `map_object`
 points a process's PTEs at those frames and keeps the object alive for the
 mapping's lifetime via the reference in the `Vma`'s backing. This is what makes the
 object shareable: two mappings (eventually, in two processes) of the same

@@ -164,7 +164,7 @@ pub struct UserspaceServerReg {
     /// Its own lock, not `SCHED`, since the objects it hands out are cloned and dropped: ranked
     /// [`Registry`](LockRank::Registry), above the page caches it indexes (it allocates while
     /// held), and never taken inside a `FileObject`'s lock. **No reference is ever dropped
-    /// under it**, since the last one would re-enter it from `FileObject::drop`.
+    /// under it**, since the last one would re-enter it from `FileObject::leave_cache`.
     files: SpinLock<KVec<CachedFile>>,
 }
 

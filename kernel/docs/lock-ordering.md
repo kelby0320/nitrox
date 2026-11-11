@@ -401,14 +401,25 @@ calling `inherit_kernel_mappings` while holding any lock at rank
 
 ## Paging allocates page-table frames from the buddy
 
-`ArchPaging::map_page` (`kernel/src/arch/x86_64/paging.rs`) calls
-`buddy_alloc` to obtain frames for intermediate page tables. The paging
+`ArchPaging::map_page` (`kernel/src/arch/x86_64/paging.rs`) takes a
+`Frame` from the buddy for each intermediate page table, and drops one that
+loses the race to link its slot. The paging
 layer holds no lock of its own — the page-table root is passed in by the
 caller — so it introduces no new rank and no new nesting. It does
 acquire rank 6b transitively: `map_page` must not be called while
 holding the rank-7 `SERIAL` lock. The future VMM will call `map_page`
 while holding the rank-4 VMA-tree lock, which is correctly ordered (rank
 4 is above rank 6b).
+
+## A frame's drop takes the buddy
+
+A `Frame` or `FrameBlock` (`kernel/src/mm/frame.rs`) frees itself as it drops,
+taking `BUDDY` (rank 6b), so the rule against allocating under `SCHED` or in an
+interrupt binds a frame's drop as it binds a call. Every frame drops in thread
+context: an object's or a cache's with its owner, an unmap's after its
+shootdown, a page table that lost its race or a fault's frame another CPU's map
+beat, under the caller's locks, all ranked above 6b — the last on the `#PF`
+path's documented exception (§ The AddressSpace lock and the page-fault handler).
 
 ## The serial lock is a leaf
 

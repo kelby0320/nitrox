@@ -394,7 +394,7 @@ mod tests {
 
     /// The fragment of `len` bytes from `at` in `m`, inside one frame.
     fn frag(m: &MemoryObject, at: usize, len: usize) -> PhysFrag {
-        PhysFrag { base: m.frames()[at / PAGE_SIZE].as_u64() + (at % PAGE_SIZE) as u64, len: len as u64 }
+        PhysFrag { base: m.frames()[at / PAGE_SIZE].phys().as_u64() + (at % PAGE_SIZE) as u64, len: len as u64 }
     }
 
     fn bytes(m: &MemoryObject, len: usize) -> std::vec::Vec<u8> {
@@ -559,7 +559,7 @@ mod tests {
         // SAFETY: `module` outlives `rd` and nothing else touches it while `rd` is used.
         let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
         let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
-        let frags = [PhysFrag { base: m.frames()[0].as_u64(), len: 512 }];
+        let frags = [PhysFrag { base: m.frames()[0].phys().as_u64(), len: 512 }];
         for op in [IrpOp::Write, IrpOp::Read] {
             std::thread::scope(|s| {
                 s.spawn(|| m.copy_in(0, &[1; 512]));

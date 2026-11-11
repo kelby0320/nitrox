@@ -298,8 +298,7 @@ fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 ///
 /// - `""` → a **borrowed** [`MemoryObject`] over the firmware aperture. Borrowed is
 ///   load-bearing: the frames are MMIO, and an owned object would hand them to the buddy
-///   allocator when the last handle closed (see
-///   [`FrameOwnership`](crate::object::memory_object::FrameOwnership)).
+///   allocator when the last handle closed (see [`MemoryObject::try_new_borrowed`]).
 /// - `"info"` → a read-only [`MemoryObject`] of one
 ///   [`FramebufferInfo`](crate::libkern::framebuffer::FramebufferInfo): two leaves rather than
 ///   a richer `HandleInfo`, a frozen layout shared by every type
@@ -453,7 +452,7 @@ mod tests {
                 let m = obj.downcast_ref::<MemoryObject>().unwrap();
                 assert_eq!(m.size(), PAGE_SIZE); // one page holds the header
                 let expected = b"cpus_online=0\nreaper_closed=0\nexit_closed=0\n";
-                let base = (m.frames()[0].as_u64() + heap::hhdm_offset()) as *const u8;
+                let base = (m.frames()[0].phys().as_u64() + heap::hhdm_offset()) as *const u8;
                 for (i, &want) in expected.iter().enumerate() {
                     // SAFETY: a live MemoryObject's frame is HHDM-reachable;
                     // read-only check within the page.
