@@ -335,7 +335,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   Its `try_new_pair` half fixed in `656f7e02`, as sched-d12, and its `fpu_area_ptr` sibling in
   `aaceb893`, as sched-d9; the `Drop` half stays planned.
 
-- [ ] **kobj-d13** `kernel/src/object/memory_object.rs:203` — `MemoryObject::copy_to_kvec` (and
+- [x] **kobj-d13** `kernel/src/object/memory_object.rs:203` — `MemoryObject::copy_to_kvec` (and
   `FileObject::read_to_kvec`, `file_object.rs:1043`) forms `&[u8]` over frames while a writable
   user mapping of the same object may store to them on another CPU, so the SAFETY claim "not
   aliased" is false. A parent maps its image `MAP_WRITE` and writes while another thread runs
@@ -344,6 +344,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   (with `-Zmiri-permissive-provenance`) reported "Data race detected between (1) retag read ... and
   (2) non-atomic write". It was removed. Fix: `ptr::copy_nonoverlapping` into the `KVec`'s spare
   capacity (see kobj-o11). soundness/opportunities. Low. **Plan**, in P2.
+  Fixed in `123999c8`: `copy_to_kvec` and `read_to_kvec` copy through frame views, in relaxed atomic
+  words. Fails without it: `copying_an_object_out_while_another_writes_it_is_no_race` and
+  `a_file_read_whole_while_another_writes_a_page_is_no_race` report a data race under both Miri
+  models on `main`, and so does a raw `copy_nonoverlapping` in the view's place.
 
 - [x] **kobj-d14** `kernel/src/handle/global.rs:72` — `global::get()` is a safe `pub fn` that
   returns `&'static HandleTable` via `assume_init_ref` and checks `READY` only with `debug_assert`
@@ -582,7 +586,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `Weak<T>`, made under the contract that the target's closing clears it under the lock it is kept
   behind. The handle table's is kobj-d1's.
 
-- [ ] **kobj-o11** encapsulate: frame contents are reached by raw HHDM arithmetic, `(frame.as_u64() +
+- [x] **kobj-o11** encapsulate: frame contents are reached by raw HHDM arithmetic, `(frame.as_u64() +
   heap::hhdm_offset()) as *mut u8`, each site with its own "owned, mapped, unaliased" SAFETY claim,
   some forming `&[u8]` over frames a user mapping or DMA can write, and false for a borrowed
   aperture — 11 sites in scope (`grep -E 'hhdm_offset\(\)'` over non-test lines of
@@ -597,6 +601,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `frame.rs`). Closes: a reference over concurrently written frames (kobj-d13) and per-site
   `min(PAGE_SIZE)` arithmetic. Depends on: nothing. soundness/opportunities. Value medium (low per
   one reviewer), effort small. **Plan**, in P2.
+  Done in `123999c8`: `mm::frame::FrameView`, with `read`, `write`, `fill` and `copy_from` within one
+  frame, each stopping past its end and copying in relaxed atomic words, lent by
+  `MemoryObject::page` (under `copy_in` and `copy_out`), a `FileObject`'s ready page and
+  `AddressSpace::copy_in`.
 
 - [ ] **kobj-o12** encapsulate: the kernel's rsproto codec writes and parses the 28-byte RS
   envelope by hand-coded offsets — 98 sites (`awk 'NR<624' kernel/src/rsproto.rs | grep -cE
@@ -1487,6 +1495,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Unverified: Miri cannot tell this from a raw copy. Copy with `ptr::copy` from raw pointers (or
   the user-copy asm), never forming the reference, and correct the SAFETY comments.
   Lenses: soundness, concurrency. Low. **Plan**, as kobj-d13, in P2.
+  Partly fixed in `123999c8`, as kobj-d13; `DmaBuffer::as_slice` and `as_mut_slice` are J.12's.
 - [x] **kmem-d19** `kernel/src/object/memory_object.rs:106` — `try_new_borrowed`'s `# Safety` does
   not require the range to be HHDM-mapped, but safe accessors (`copy_in` at line 174,
   `copy_to_kvec` at 192) and the I/O paths dereference every frame through the HHDM, and
@@ -1586,7 +1595,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   concurrency. Value high, effort medium. **Fix.**
   Finished in `88a5edea`: an unmap returns an `Unmapped`, shot down before anything it held is
   freed, and `map_vma` takes `&mut self`.
-- [ ] **kmem-o5** encapsulate: frame contents are reached by hand-computing `phys +
+- [x] **kmem-o5** encapsulate: frame contents are reached by hand-computing `phys +
   hhdm_offset()` at each site, then a raw write, a copy, or a `&[u8]` slice, with each site
   re-arguing its bounds and liveness — 44 HHDM-arithmetic sites (`grep -rn "hhdm_offset()"
   kernel/src --include=*.rs | grep -v "tests.rs\|/tests/\|mm/heap.rs\|mm/test_support"`; other
@@ -1605,6 +1614,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   (kmem-d18, kmem-d19). Depends on: nothing (usable over `PhysAddr`; the `Frame` type, kmem-o2,
   for owned frames). Lenses: abi, ownership, concurrency, opportunities. Value medium, effort
   medium. **Plan**, as kobj-o11, in P2.
+  Done in `123999c8`, as kobj-o11; a fresh frame is zeroed by `frame::alloc_zeroed`.
 - [ ] **kmem-o6** narrow: every `ArchPaging` operation takes `root: PhysAddr` under the unsafe
   contract "a valid top-level table owned by the caller" (10 unsafe trait fns, 15 more in the
   x86_64 impl), and safe wrappers such as `KernelStack::new(root)` forward a caller's value —
@@ -2315,7 +2325,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   drv-o4 for the accessors and for `release` (not required). Lenses: ownership, soundness,
   opportunities. Value medium, effort medium. **Plan**, in P5.
 
-- [ ] **drv-o14** remove: MemoryObject bytes are read through hand-computed HHDM pointers (frame +
+- [x] **drv-o14** remove: MemoryObject bytes are read through hand-computed HHDM pointers (frame +
   `hhdm_offset`) instead of a bounded accessor, and `copy_into_memobj` is duplicated as an `unsafe
   fn(*const ())` (console.rs:115, input/mod.rs:241) although every caller holds an `&ObjectRef`,
   which pins the object just as well — 10 sites (2 `copy_into_memobj` definitions, 4 unsafe calls
@@ -2330,6 +2340,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   MemoryObject's frames held only by `sys_io_submit`'s earlier bound, and a dangling `*const ()`
   reaching the copy. Depends on: nothing (drv-o2 optional). Lenses: opportunities, soundness
   (the console copy). Value medium, effort small. **Plan**, in P2.
+  Done in `123999c8`: the four reads use `MemoryObject::copy_out`; `copy_into_memobj` had gone
+  already, the console and the input layer calling `copy_in`.
 
 - [ ] **drv-o15** encapsulate: a PendingOperation is borrowed by raw pointer (`PoPtr`,
   `Owner::Hub { po }`, `Action::Hub`) while the hub thread's `ObjectRef` pins it, and "take the
@@ -2873,6 +2885,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   so klog's fill is `memobj.copy_in(off, run)` and `copy_into_frames` takes `&mut MemoryObject`.
   Home: kernel/src/mm. Closes: safe code writing a frame it does not own (kplat-d15). Depends
   on: nothing. ownership, opportunities. Value medium, effort medium. **Plan**, in P2.
+  Partly done in `123999c8`: a frame's bytes are reached through views, borrowed memory at
+  `frame::hhdm`; the owned `Frame` is J.9's.
 - [x] **kplat-o7** encapsulate: handle installation by `global::get().allocate(owner, raw_ptr,
   ty, rights)` after `ObjectRef::into_raw`, with a manual `drop(ObjectRef::from_raw(p, t))` on
   the error arm — 27 sites (`grep -rn "global::get().allocate(" kernel/src --include=*.rs |

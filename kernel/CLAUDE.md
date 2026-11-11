@@ -31,6 +31,7 @@ Rules:
 - Don't extend `unsafe` to new files without a reason. The total `unsafe` surface is roughly 10-15% of the kernel; adding `unsafe` should require justification. `cargo xtask check-unsafe` holds each module's count of each kind of `unsafe` (blocks, `unsafe fn`s and `unsafe impl`s, `#[unsafe(..)]` attributes, `unsafe extern` blocks and `static mut`s) to `tools/xtask/unsafe-counts.toml`, and a raise is made by hand in the commit that adds the `unsafe`, saying why.
 - Wrap `unsafe` operations in safe abstractions where possible. The arch layer is unsafe internally but exposes safe traits.
 - Pointer dereferences in safe code through `UserPtr<T>` / `UserMutPtr<T>` are forbidden. The only way to access user memory is via the copy primitives in `kernel/src/mm/user_access.rs`.
+- A frame's bytes are reached through a `FrameView` its owner lends (`kernel/src/mm/frame.rs`): `MemoryObject::copy_in` and `copy_out`, a `FileObject`'s cache pages, `AddressSpace::copy_in`. It copies in atomic words, never forming a reference, as a user mapping may write the frame meanwhile. Memory no owner lends (a firmware table, a page table, an I/O request's fragments) is reached at `mm::frame::hhdm`, in its caller's `unsafe`.
 
 ## Lock ordering
 
