@@ -12,13 +12,12 @@
 //!
 //! [deferred-decisions.md]: ../../docs/rationale/deferred-decisions.md
 
-use core::ptr;
-
 use crate::arch::Paging;
 use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_MAP_END, USER_STACK_GUARD_SIZE};
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock, SpinLockGuard};
+use crate::mm::frame::{self, FrameView};
 use crate::mm::vmm::{Backing, FaultAccess, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::object::header::Ref;
@@ -87,18 +86,34 @@ impl AddressSpace {
     /// Build an empty address space: a zeroed PML4 frame inheriting the kernel-half entries from
     /// the boot template, and an empty VMA tree. Panics before `arch::init_kernel_template`.
     pub fn new() -> Result<Self, AllocError> {
-        let root = heap::buddy_alloc(0).ok_or(AllocError)?;
-        // SAFETY: the frame was just returned by the buddy and is not
-        // aliased; HHDM access is the standard way to reach a fresh
-        // physical frame. Zeroing it makes every PML4 entry absent;
-        // `inherit_kernel_mappings` then refills the kernel half so
-        // the AS is loadable without losing kernel code, stack, or HHDM.
-        unsafe {
-            let virt = (root.as_u64() + heap::hhdm_offset()) as *mut u8;
-            ptr::write_bytes(virt, 0, PAGE_SIZE);
-            Paging::inherit_kernel_mappings(root);
-        }
+        // Zeroed, every entry is absent until `inherit_kernel_mappings` fills the kernel half.
+        let root = frame::alloc_zeroed(0).ok_or(AllocError)?;
+        // SAFETY: a fresh table this space owns, which no CPU has loaded.
+        unsafe { Paging::inherit_kernel_mappings(root) };
         Ok(AddressSpace { inner: SpinLock::new(LockRank::KernelObject, Inner { vma_tree: VmaTree::new(), root }) })
+    }
+
+    /// **Copy `src` into the anonymous memory mapped from `at`**, as the loader writes an image;
+    /// `false`, what came before written, at a page no anonymous mapping has present.
+    pub fn copy_in(&mut self, at: VirtAddr, src: &[u8]) -> bool {
+        let inner = self.inner.get_mut();
+        let mut done = 0;
+        while done < src.len() {
+            let Some(va) = at.as_u64().checked_add(done as u64).map(VirtAddr::new) else { return false };
+            let anonymous = inner.vma_tree.find_covering(va).is_some_and(|v| matches!(v.backing, Backing::Anonymous));
+            // SAFETY: this space's root, whose tables live while it does.
+            let Some(phys) = anonymous.then(|| unsafe { Paging::translate(inner.root, va) }).flatten() else {
+                return false;
+            };
+            // SAFETY: an anonymous frame mapped here, which this space owns and frees only at an
+            // unmap or its drop, both of which `&mut self` rules out for the copy.
+            let page = unsafe { FrameView::new(PhysAddr::new(phys.as_u64() & !(PAGE_SIZE as u64 - 1))) };
+            let at = phys.as_u64() as usize % PAGE_SIZE;
+            let n = (PAGE_SIZE - at).min(src.len() - done);
+            page.write(at, &src[done..done + n]);
+            done += n;
+        }
+        true
     }
 
     /// Physical base of this address space's top-level page table.
@@ -145,17 +160,10 @@ impl AddressSpace {
         for i in 0..total_pages {
             let virt = VirtAddr::new(range.start().as_u64() + i * (PAGE_SIZE as u64));
 
-            let Some(phys) = heap::buddy_alloc(0) else {
+            let Some(phys) = frame::alloc_zeroed(0) else {
                 rollback_partial_map(root, range.start(), installed);
                 return Err((boxed, MapError::OutOfMemory));
             };
-
-            // SAFETY: `phys` was just allocated, is not aliased, and is
-            // HHDM-reachable.
-            unsafe {
-                let v = (phys.as_u64() + heap::hhdm_offset()) as *mut u8;
-                ptr::write_bytes(v, 0, PAGE_SIZE);
-            }
 
             // SAFETY: `root` is the PML4 owned by this AS; `phys` is a
             // fresh frame we just allocated and zeroed; `virt` is in
@@ -248,15 +256,9 @@ impl AddressSpace {
 
         match vma.backing {
             Backing::Anonymous => {
-                let Some(phys) = heap::buddy_alloc(0) else {
+                let Some(phys) = frame::alloc_zeroed(0) else {
                     return FaultIn::Oom;
                 };
-                // SAFETY: `phys` was just allocated, is not aliased, and is
-                // HHDM-reachable; we zero the whole frame before it is mapped.
-                unsafe {
-                    let v = (phys.as_u64() + heap::hhdm_offset()) as *mut u8;
-                    ptr::write_bytes(v, 0, PAGE_SIZE);
-                }
                 // SAFETY: `root` is this AS's PML4; `phys` is the fresh,
                 // zeroed frame; `page_base` is the page-aligned faulting
                 // address, in the validated user-half VMA range. A present PTE

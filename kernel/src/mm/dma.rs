@@ -17,7 +17,7 @@
 
 use core::mem::ManuallyDrop;
 use core::ops::Deref;
-use core::ptr::{self, NonNull};
+use core::ptr::NonNull;
 
 use crate::libkern::AllocError;
 use crate::mm::buddy::MAX_ORDER;
@@ -43,12 +43,8 @@ impl DmaBuffer {
     /// (`2^MAX_ORDER × PAGE_SIZE`) or physical memory is exhausted.
     pub fn alloc(size: usize) -> Result<Self, AllocError> {
         let order = order_for(size).ok_or(AllocError)?;
-        let phys = heap::buddy_alloc(order).ok_or(AllocError)?;
-        let len = PAGE_SIZE << order;
-        let virt = (phys.as_u64() + heap::hhdm_offset()) as *mut u8;
-        // SAFETY: `phys` was just allocated (so not aliased), is HHDM-reachable,
-        // and the block is exactly `len` bytes; zeroing it is sound.
-        unsafe { ptr::write_bytes(virt, 0, len) };
+        let phys = crate::mm::frame::alloc_zeroed(order).ok_or(AllocError)?;
+        let virt = crate::mm::frame::hhdm::<u8>(phys);
         Ok(Self {
             // SAFETY: a live HHDM mapping of a real frame is never null.
             virt: unsafe { NonNull::new_unchecked(virt) },

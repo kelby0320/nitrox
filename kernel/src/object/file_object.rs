@@ -32,6 +32,7 @@ use crate::arch::timer::ArchTimer;
 use crate::dpc::Dpc;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
+use crate::mm::frame::{self, FrameView};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::{Header, Ref, Shared, kobject};
 use crate::object::{DeviceNode, PendingOperation, StoredMsg, UserspaceServerReg};
@@ -104,6 +105,15 @@ struct CachePage {
     fill: Option<Ref<PendingOperation>>,
 }
 
+impl CachePage {
+    /// The page's frame, for as long as the page is borrowed.
+    fn view(&self) -> FrameView<'_> {
+        // SAFETY: the page owns its frame, which is freed only once the page is out of the cache
+        // (a failed fill's) or with the object, neither while the page is borrowed.
+        unsafe { FrameView::new(self.frame) }
+    }
+}
+
 pub(crate) enum Fault {
     Hit(PhysAddr),
     Fill(PhysAddr, Ref<PendingOperation>),
@@ -172,6 +182,13 @@ struct Inner {
     io_in_flight: u32,
     /// The `File::Forget` answer waiting for `io_in_flight` to reach zero.
     forget_answer: Option<Ref<PendingOperation>>,
+}
+
+impl Inner {
+    /// Where page `index` is if `po` is still its fill: a truncation can retire a page mid-fill.
+    fn filling(&self, index: usize, po: &Ref<PendingOperation>) -> Option<usize> {
+        self.pages.iter().position(|p| p.index == index && p.fill.as_ref().is_some_and(|f| f.as_ptr() == po.as_ptr()))
+    }
 }
 
 #[derive(Debug)]
@@ -699,15 +716,10 @@ impl FileObject {
         if g.pages.try_reserve(1).is_err() {
             return Reserve::Oom;
         }
-        let Some(frame) = heap::buddy_alloc(0) else {
+        // Zeroed: a partial tail page's padding reads as zero.
+        let Some(frame) = frame::alloc_zeroed(0) else {
             return Reserve::Oom;
         };
-        // SAFETY: `frame` was just returned by the buddy, is unaliased, and is
-        // HHDM-reachable; zeroing prevents leaking stale memory (and zero-pads a
-        // partial tail page).
-        unsafe {
-            core::ptr::write_bytes((frame.as_u64() + heap::hhdm_offset()) as *mut u8, 0, PAGE_SIZE);
-        }
         g.pages
             .try_push(CachePage { index, frame, state: PageState::Loading, fill: None })
             .expect("slot reserved above");
@@ -733,16 +745,11 @@ impl FileObject {
             Ok(p) => Ref::new(p),
             Err(_) => return Fault::Oom,
         };
-        let Some(frame) = heap::buddy_alloc(0) else {
+        let Some(frame) = frame::alloc_zeroed(0) else {
             drop(g); // the PO's only reference drops outside the lock
             drop(po);
             return Fault::Oom;
         };
-        // SAFETY: `frame` was just returned by the buddy, is unaliased, and is HHDM-reachable;
-        // zeroing prevents leaking stale memory (and zero-pads a partial tail page).
-        unsafe {
-            core::ptr::write_bytes((frame.as_u64() + heap::hhdm_offset()) as *mut u8, 0, PAGE_SIZE);
-        }
         g.pages
             .try_push(CachePage { index, frame, state: PageState::Loading, fill: Some(po.clone()) })
             .expect("slot reserved above");
@@ -759,11 +766,7 @@ impl FileObject {
     pub(crate) fn settle(&self, index: usize, po: &Ref<PendingOperation>, ok: bool) {
         let taken = {
             let mut g = self.inner.lock();
-            let at = g
-                .pages
-                .iter()
-                .position(|p| p.index == index && p.fill.as_ref().is_some_and(|f| f.as_ptr() == po.as_ptr()));
-            match at {
+            match g.filling(index, po) {
                 None => None,
                 Some(i) if ok => {
                     g.pages[i].state = PageState::Ready;
@@ -779,12 +782,35 @@ impl FileObject {
         drop(taken);
     }
 
-    /// Transition page `index` from `Loading` to `Ready`; a no-op if absent or already `Ready`.
+    /// Transition page `index` from `Loading` to `Ready`; a no-op if absent, ready, or a fault's
+    /// fill's to [`settle`](Self::settle), so no ready page has a fill for a settle to free.
     pub fn mark_ready(&self, index: usize) {
         let mut g = self.inner.lock();
-        if let Some(p) = g.pages.iter_mut().find(|p| p.index == index) {
+        if let Some(p) = g.pages.iter_mut().find(|p| p.index == index && p.fill.is_none()) {
             p.state = PageState::Ready;
         }
+    }
+
+    /// **Write page `index` as its fill `po` read it**, if `po` is still its fill; `false` if not.
+    pub(crate) fn fill_page(
+        &self,
+        index: usize,
+        po: &Ref<PendingOperation>,
+        write: impl FnOnce(FrameView<'_>),
+    ) -> bool {
+        let g = self.inner.lock();
+        let Some(i) = g.filling(index, po) else { return false };
+        write(g.pages[i].view());
+        true
+    }
+
+    /// Page `index`'s frame while it is [`Ready`](PageState::Ready), for the borrow of `self`.
+    fn ready_page(&self, index: usize) -> Option<FrameView<'_>> {
+        let g = self.inner.lock();
+        let p = g.pages.iter().find(|p| p.index == index && p.state == PageState::Ready)?;
+        // SAFETY: a ready page has no fill (`mark_ready`), so no `settle` frees it; a truncation
+        // retires it, and only `self`'s drop frees it.
+        Some(unsafe { FrameView::new(p.frame) })
     }
 
     /// **Fault page `index` in**, blocking until it is resident: a hit returns at once; a miss
@@ -999,21 +1025,11 @@ impl FileObject {
     /// `AllocError` on a buffer-allocation or fill failure.
     pub fn read_to_kvec(file_obj: &Ref<FileObject>) -> Result<KVec<u8>, AllocError> {
         let fo: &FileObject = file_obj;
-        let size = fo.size();
-        let mut buf = KVec::new();
-        buf.try_reserve(size)?;
-        let mut remaining = size;
-        for i in 0..fo.npages() {
-            if remaining == 0 {
-                break;
-            }
-            let frame = FileObject::fault_in_page(file_obj, i).ok_or(AllocError)?;
-            let n = core::cmp::min(PAGE_SIZE, remaining);
-            // SAFETY: `fault_in_page` returned a resident, HHDM-reachable frame for page
-            // `i`; reading `n <= PAGE_SIZE` bytes from its HHDM mapping is sound.
-            let page = unsafe { core::slice::from_raw_parts((frame.as_u64() + heap::hhdm_offset()) as *const u8, n) };
-            buf.try_extend_from_slice(page)?;
-            remaining -= n;
+        let mut buf = KVec::try_filled(0, fo.size())?;
+        for (i, piece) in buf.chunks_mut(PAGE_SIZE).enumerate() {
+            FileObject::fault_in_page(file_obj, i).ok_or(AllocError)?;
+            // Not ready once faulted in only if a truncation took it since.
+            fo.ready_page(i).ok_or(AllocError)?.read(0, piece);
         }
         Ok(buf)
     }
@@ -1030,14 +1046,14 @@ impl FileObject {
     ) -> FillStart {
         match &self.producer {
             Producer::Stub { base } => {
-                if stub_start_fill(file_obj, index, frame, po, *base) {
+                if stub_start_fill(file_obj, index, po, *base) {
                     FillStart::Io
                 } else {
                     FillStart::Failed
                 }
             }
             Producer::FsServer { reg, suffix } => {
-                if self.fs_server_start_fill(file_obj, index, frame, po, reg, suffix) {
+                if self.fs_server_start_fill(file_obj, index, po, reg, suffix) {
                     FillStart::Io
                 } else {
                     FillStart::Failed
@@ -1104,13 +1120,12 @@ impl FileObject {
 
     /// Start a real fs-server fill: send a `File::ReadRange` for page `index`'s byte range over
     /// the server's forwarding endpoint (`reg`) and leave the fill **pending** — the reply copies
-    /// the bytes into `frame`, marks the page ready, and completes `po`. `false` if the request
-    /// could not be built or sent (the caller rolls the page back).
+    /// the bytes into the page, marks it ready, and completes `po`. `false` if the request could
+    /// not be built or sent (the caller rolls the page back).
     fn fs_server_start_fill(
         &self,
         file_obj: &Ref<FileObject>,
         index: usize,
-        frame: PhysAddr,
         po: &Ref<PendingOperation>,
         reg: &Ref<UserspaceServerReg>,
         suffix: &KString,
@@ -1134,7 +1149,7 @@ impl FileObject {
         // Originate: records the pending fill on `reg` and pushes the request. The
         // reply completes `po`; `Busy`/`Full`/`PeerClosed` fail this fault.
         matches!(
-            crate::sched::us_forward_originate_fill(reg, &mut msg, po, file_obj, frame, index),
+            crate::sched::us_forward_originate_fill(reg, &mut msg, po, file_obj, index),
             crate::sched::ForwardOutcome::Pending
         )
     }
@@ -1188,30 +1203,22 @@ fn park_briefly() {
 }
 
 /// A self-test fill in flight: the DPC and what it needs, heap-boxed so its `Dpc` has a stable
-/// address. The DPC fills `frame`, marks the page `Ready`, completes `po`, and frees the box.
+/// address. The DPC fills the page, marks it `Ready`, completes `po`, and frees the box.
 struct StubFillBox {
     dpc: Dpc,
     file_obj: Ref<FileObject>,
     po: Ref<PendingOperation>,
-    frame: PhysAddr,
     index: usize,
     fill_byte: u8,
 }
 
 /// Start a stub fill (page `index` ← the byte `base + index`) by enqueuing a DPC. `false` on
 /// box-allocation failure. The box clones `file_obj` and `po` so they outlive the deferred fill.
-fn stub_start_fill(
-    file_obj: &Ref<FileObject>,
-    index: usize,
-    frame: PhysAddr,
-    po: &Ref<PendingOperation>,
-    base: u8,
-) -> bool {
+fn stub_start_fill(file_obj: &Ref<FileObject>, index: usize, po: &Ref<PendingOperation>, base: u8) -> bool {
     let bx = match KBox::try_new(StubFillBox {
         dpc: Dpc::new(stub_fill_dpc, core::ptr::null_mut()),
         file_obj: file_obj.clone(),
         po: po.clone(),
-        frame,
         index,
         fill_byte: base.wrapping_add(index as u8),
     }) {
@@ -1228,7 +1235,7 @@ fn stub_start_fill(
     true
 }
 
-/// DPC: write the stub byte into the cache frame, mark the page `Ready`, complete the PO.
+/// DPC: write the stub byte into the page, mark it `Ready`, complete the PO.
 fn stub_fill_dpc(ctx: *mut ()) {
     // Dropping `bx` here releases two references in DPC context, which the block path stopped
     // doing (decision log, 2026-08-06): a last-reference drop reaches `SlabCache::free` and can
@@ -1237,11 +1244,7 @@ fn stub_fill_dpc(ctx: *mut ()) {
     let bx_ptr = ctx as *mut StubFillBox;
     // SAFETY: `ctx` is the `StubFillBox` we placed in `stub_start_fill`; reclaim it.
     let bx = unsafe { KBox::from_raw(NonNull::new_unchecked(bx_ptr)) };
-    // SAFETY: `frame` is a live, HHDM-reachable cache frame owned by `file_obj`
-    // (which `bx` keeps alive); fill the whole page with the stub byte.
-    unsafe {
-        core::ptr::write_bytes((bx.frame.as_u64() + heap::hhdm_offset()) as *mut u8, bx.fill_byte, PAGE_SIZE);
-    }
+    bx.file_obj.fill_page(bx.index, &bx.po, |page| page.fill(0, PAGE_SIZE, bx.fill_byte));
     bx.file_obj.settle(bx.index, &bx.po, true);
     crate::sched::complete_pending_op(&bx.po, 0, 0);
 }
@@ -1298,15 +1301,7 @@ fn zero_tail(g: &Inner, end: usize) {
     }
     let index = end / PAGE_SIZE;
     if let Some(p) = g.pages.iter().find(|p| p.index == index && p.state == PageState::Ready) {
-        // SAFETY: `p.frame` is a live, HHDM-reachable cache frame this object owns; the
-        // range `[within, PAGE_SIZE)` lies inside it.
-        unsafe {
-            core::ptr::write_bytes(
-                (p.frame.as_u64() + heap::hhdm_offset() + within as u64) as *mut u8,
-                0,
-                PAGE_SIZE - within,
-            );
-        }
+        p.view().fill(within, PAGE_SIZE - within, 0);
     }
 }
 

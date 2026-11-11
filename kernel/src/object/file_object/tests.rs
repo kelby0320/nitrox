@@ -288,4 +288,24 @@ fn a_truncate_then_a_grow_reads_zero_over_the_regrown_range() {
     }
 }
 
+/// **A file read whole while a user mapping writes a page is no race**: as an object copied out.
+#[test]
+fn a_file_read_whole_while_another_writes_a_page_is_no_race() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    init_global_heap();
+    let f = Ref::new(fobj(PAGE_SIZE));
+    let words = (fill(&f, 0, 0).as_u64() + heap::hhdm_offset()) as usize;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for i in 0..PAGE_SIZE / 8 {
+                // SAFETY: a word of the file's ready page, which outlives the scope; stored
+                // atomically, as a user's store is to the kernel's reads.
+                unsafe { AtomicU64::from_ptr((words as *mut u64).add(i)) }.store(u64::MAX, Ordering::Relaxed);
+            }
+        });
+        let copy = FileObject::read_to_kvec(&f).unwrap();
+        assert!(copy.iter().all(|&b| b == 0 || b == 0xFF));
+    });
+}
+
 mod io;

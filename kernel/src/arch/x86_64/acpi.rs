@@ -477,10 +477,9 @@ pub(crate) fn fadt() -> Option<Fadt> {
 /// HHDM (ACPI tables live in ACPI-reclaimable memory, which it does); `len`
 /// bytes from there must be within that mapping. Callers cap `len`.
 unsafe fn phys_slice(phys: PhysAddr, len: usize) -> &'static [u8] {
-    let va = phys.as_u64() + heap::hhdm_offset();
     // SAFETY: forwarded from this function's contract; the HHDM maps the
     // firmware physical range and the bytes are read-only ACPI data.
-    unsafe { core::slice::from_raw_parts(va as *const u8, len) }
+    unsafe { core::slice::from_raw_parts(crate::mm::frame::hhdm(phys), len) }
 }
 
 /// The x86_64 [`ArchPlatform`] implementation (ACPI). Zero-sized; re-exported as

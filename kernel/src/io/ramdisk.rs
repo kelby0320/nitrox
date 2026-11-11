@@ -197,11 +197,10 @@ impl RamDisk {
         if frags.iter().try_fold(0u64, |sum, f| sum.checked_add(f.len)).is_none_or(|sum| sum < len) {
             return (KError::InvalidArgument as i32, 0);
         }
-        let hhdm = crate::mm::heap::hhdm_offset();
         let (mut dev_pos, mut left) = (dev_off, len);
         for f in frags {
             let n = f.len.min(left);
-            let buf_va = (f.base + hhdm) as *mut u8;
+            let buf_va = crate::mm::frame::hhdm::<u8>(crate::mm::PhysAddr::new(f.base));
             // SAFETY: `dev_pos + n <= dev_off + len`, which was bounds-checked against the
             // capacity; `buf_va` is the HHDM alias of an owned buffer frame of at least `n` bytes;
             // the regions do not overlap.

@@ -799,7 +799,7 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     let file = Ref::new(file);
     let fo: &FileObject = &file;
     let Fault::Fill(frame, stale) = fo.reserve_fault(0) else { panic!("a fill") };
-    let id = reg.begin_fill(&mut crate::sched::SchedToken::for_test(), &stale, &file, frame, 0).unwrap();
+    let id = reg.begin_fill(&mut crate::sched::SchedToken::for_test(), &stale, &file, 0).unwrap();
     fo.resize(0, KVec::new()).unwrap();
     fo.resize(PAGE_SIZE, KVec::new()).unwrap();
     let Fault::Fill(next, _its_fill) = fo.reserve_fault(0) else { panic!("a fill afresh") };
@@ -810,11 +810,14 @@ fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
     reply.payload[16..20].copy_from_slice(&1u32.to_le_bytes());
     reply.payload[20..24].copy_from_slice(&8u32.to_le_bytes());
     reply.payload[28..32].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-    let bytes = ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap());
+    let bytes = ObjectRef::new(MemoryObject::try_new_filled(&[0xAB; 64]).unwrap());
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     transfers[0] = Some(TransferRef { obj: bytes, rights: Rights::MAP_READ | Rights::TRANSFER });
     assert_eq!(complete_read_range_reply(&reg, &reply, &mut transfers, 36), Ok(0));
     assert_eq!(fo.lookup(0), Some((next, PageState::Loading)));
+    // SAFETY: both the object's frames, the retired one kept until it drops; read by the test alone.
+    let first = |f| unsafe { *crate::mm::frame::hhdm::<u8>(f) };
+    assert_eq!((first(frame), first(next)), (0, 0), "the reply wrote neither the retired page nor the next");
 }
 
 /// **A fill answered with bytes the kernel may not read fails**: a borrowed memory object, or
@@ -839,8 +842,8 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
             )
         };
         let fo: &FileObject = &file;
-        let Fault::Fill(frame, po) = fo.reserve_fault(0) else { panic!("a fill") };
-        let id = reg.begin_fill(&mut crate::sched::SchedToken::for_test(), &po, &file, frame, 0).unwrap();
+        let Fault::Fill(_, po) = fo.reserve_fault(0) else { panic!("a fill") };
+        let id = reg.begin_fill(&mut crate::sched::SchedToken::for_test(), &po, &file, 0).unwrap();
         let mut reply = StoredMsg::zeroed();
         build_read_range_request(&mut reply.payload, 0, PAGE_SIZE as u32, b"f").unwrap();
         reply.payload[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8].copy_from_slice(&id.to_le_bytes());
@@ -865,24 +868,25 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
 #[test]
 fn a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames() {
     use crate::mm::{Caching, PAGE_SIZE, PhysAddr, heap};
-    use crate::object::{MemoryObject, PendingOperation};
+    use crate::object::file_object::{Fault, Producer};
+    use crate::object::{FileObject, MemoryObject, PendingOperation};
     init_global_heap();
     let adopt = |mo| ObjectRef::new(mo);
     // SAFETY: a range the test heap never holds; nothing maps it, and a read of it would fault.
     let aperture = unsafe { MemoryObject::try_new_borrowed(PhysAddr::new(0xF000_0000), PAGE_SIZE, Caching::Normal) };
     let aperture = adopt(aperture.unwrap());
     let owned = adopt(MemoryObject::try_new_filled(b"\x7fELF").unwrap());
-    let cache = adopt(MemoryObject::try_new(PAGE_SIZE).unwrap());
-    let frame = cache.downcast_ref::<MemoryObject>().unwrap().frames()[0];
+    let cache = FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap();
+    let Fault::Fill(frame, fill) = cache.reserve_fault(0) else { panic!("a miss") };
     let po = ObjectRef::new(PendingOperation::try_new().unwrap());
 
     assert_eq!(spawn::image_bytes(&aperture).err(), Some(KError::InvalidArgument));
     assert_eq!(&spawn::image_bytes(&owned).unwrap()[..4], b"\x7fELF");
     assert_eq!(submit::io_buffer_size(aperture.downcast_ref().unwrap()), Err(KError::InvalidArgument));
     assert_eq!(submit::io_buffer_size(owned.downcast_ref().unwrap()), Ok(PAGE_SIZE as u64));
-    assert_eq!(fill::copy_fill_into_frame(&aperture, frame, 4), Err(KError::Unsupported));
-    assert_eq!(fill::copy_fill_into_frame(&po, frame, 4), Err(KError::Unsupported));
-    assert_eq!(fill::copy_fill_into_frame(&owned, frame, 4), Ok(()));
+    assert_eq!(fill::copy_fill(&cache, 0, &fill, &aperture, 4), Err(KError::Unsupported));
+    assert_eq!(fill::copy_fill(&cache, 0, &fill, &po, 4), Err(KError::Unsupported));
+    assert_eq!(fill::copy_fill(&cache, 0, &fill, &owned, 4), Ok(()));
     // SAFETY: the cache frame is the test heap's, reachable through its HHDM offset.
     let filled = unsafe { core::slice::from_raw_parts((frame.as_u64() + heap::hhdm_offset()) as *const u8, 4) };
     assert_eq!(filled, b"\x7fELF");

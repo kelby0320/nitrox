@@ -26,7 +26,6 @@ pub mod ring;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::libkern::input::{INPUT_EVENT_LEN, InputEvent};
-use crate::mm::{PAGE_SIZE, heap};
 use crate::object::header::Ref;
 use crate::object::{MemoryObject, PendingOperation};
 use crate::syscall::error::KError;
@@ -233,11 +232,11 @@ pub fn lights_from(buffer: &MemoryObject, buf_offset: u64, len: u64) -> Result<u
     if len != 1 {
         return Err(KError::InvalidArgument);
     }
-    let (page, intra) = (buf_offset as usize / PAGE_SIZE, buf_offset as usize % PAGE_SIZE);
-    let frame = *buffer.frames().get(page).ok_or(KError::InvalidArgument)?;
-    // SAFETY: within an owned, HHDM-mapped frame of the buffer (bounds checked by `sys_io_submit`
-    // and by `get` above).
-    let byte = unsafe { *((frame.as_u64() + heap::hhdm_offset()) as *const u8).add(intra) };
+    let mut byte = [0u8];
+    if buffer.copy_out(buf_offset as usize, &mut byte) != 1 {
+        return Err(KError::InvalidArgument);
+    }
+    let [byte] = byte;
     if byte as u16 & !(LIGHT_NUM | LIGHT_CAPS | LIGHT_SCROLL) != 0 {
         return Err(KError::InvalidArgument);
     }
@@ -261,6 +260,7 @@ pub fn key_presses() -> u64 {
 mod tests {
     use super::*;
     use crate::libkern::input::KEY_PRESS;
+    use crate::mm::PAGE_SIZE;
     use crate::mm::test_support::init_global_heap;
     use crate::object::PendingOperation;
     use crate::object::header::test_probe;

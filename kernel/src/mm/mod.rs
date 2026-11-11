@@ -8,6 +8,7 @@ pub mod addr_space;
 pub mod buddy;
 pub mod dma;
 pub mod elf;
+pub mod frame;
 pub mod heap;
 pub mod kstack;
 pub mod kvmap;
