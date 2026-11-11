@@ -279,6 +279,25 @@ architecture's implementation is re-exported as `arch::Paging`.
   and 1 GiB pages so it is correct against the bootloader's live tables.
   The kernel enables `EFER.NXE` at boot so `NO_EXECUTE` is usable.
 
+**The tables are owned** ([`mm/page_tables.rs`](../../kernel/src/mm/page_tables.rs)), and a
+root is a bare address only where a CPU loads it, which stays `unsafe`: `set_page_table`'s caller
+keeps the root live while it is loaded. So do the five diagnostic walks of whatever root a CPU has
+loaded. `translate` and `attribute_index` are safe on either type, as no table under a root is
+freed while its owner lives.
+
+- **`KernelTables`** is the boot root, adopted once at boot: `adopt` links the vmap's window
+  into it, then captures the kernel half for every address space, so the window is always in
+  the capture. The scheduler loads it for a thread with no address space. Its kernel half is edited
+  from many CPUs under no lock, so `map` and `unmap` take `&self`, and stay `unsafe`: the caller
+  answers for the address and the frame.
+- **`UserTables`** is an address space's own root, behind its lock, edited through `&mut self`
+  and freed as it drops, after the space's VMAs. `map_owned` takes a `Frame` and hands it back
+  with an error; it is safe, as it maps write-back, at a user-half page, never global. `map`, for a
+  frame an object or a file keeps, stays `unsafe`: the caller keeps the frame live until its
+  mapping is shot down. `unmap` is safe and gives back the address; the address space takes an
+  anonymous page's frame back by `Frame::from_pte`, by the VMA's kind, after the shootdown. A
+  kernel-half address is refused (`NotUser`), so no address space's tables edit what all share.
+
 Page tables are reached through the higher-half direct map: a table at
 physical `p` is addressed at `frame::hhdm(p)`, `p + hhdm_offset()`. Out of scope today:
 reclaiming intermediate tables on unmap, range TLB flush, and cross-CPU
@@ -338,8 +357,8 @@ released. `map_object`'s rollback is shot down before its object comes
 back. `map_vma` takes `&mut self`: only a space no CPU has loaded, the
 ELF loader's, is filled eagerly, so its rollback frees without one.
 
-- **Construction.** `new()` allocates a fresh 4 KiB PML4 frame from
-  the buddy, zeros every entry, then calls
+- **Construction.** `new()` makes its `UserTables`: a fresh 4 KiB PML4 frame
+  from the buddy, every entry zeroed, then
   `ArchPaging::inherit_kernel_mappings` to populate the kernel half
   from a boot-captured template (see
   [Kernel-half PML4 sharing](#kernel-half-pml4-sharing) below). The
@@ -352,7 +371,7 @@ ELF loader's, is filled eagerly, so its rollback frees without one.
   returns to a non-canonical address that Intel's `sysretq` faults on in
   ring 0), pre-checks tree overlap, then walks the
   range one page at a time: allocate a frame, zero it through the
-  HHDM, install the PTE via `ArchPaging::map_page`. On failure
+  HHDM, install the PTE via `UserTables::map_owned`. On failure
   mid-walk, the partial install is rolled back (every installed PTE
   uninstalled, every allocated frame freed) and the box returned to
   the caller with a `MapError`. The whole sequence runs under the AS
@@ -379,7 +398,7 @@ ELF loader's, is filled eagerly, so its rollback frees without one.
   page-cache backing: `fault_in` only signals it, and the fault path pages
   the file in outside the AS lock (`file_backing`, `map_file_page`).
 - **Frame ownership depends on the backing kind.**
-  `ArchPaging::unmap_page` returns the `PhysAddr` it cleared;
+  `UserTables::unmap` returns the `PhysAddr` it cleared;
   `unmap_covering` and `Drop` branch on `Vma.backing`: for
   `Backing::Anonymous` the frame was owned by the mapping, and is
   taken back as a `Frame` (`from_pte`) and freed as it drops, an unmap's after its shootdown;
@@ -388,7 +407,7 @@ ELF loader's, is filled eagerly, so its rollback frees without one.
   **not** freed — the object frees its frames when its last reference drops.
   `Backing::File`'s are the page cache's, and not freed either.
 - **`Drop` drains the tree leftmost-first**, uninstalls every PTE,
-  frees every leaf frame, then frees the PML4. Intermediate
+  frees every leaf frame, then the `UserTables` drop frees the PML4. Intermediate
   page-table frames (PDPT / PD / PT) leak per the deferred decision
   documented for `ArchPaging::unmap_page` — for a single Phase 1 AS
   the cost is negligible.
@@ -437,15 +456,16 @@ process AS would unmap the executing kernel and triple-fault.
 
 The mechanism is template-and-copy:
 
-1. **Boot capture.** At boot,
-   [`arch::init_kernel_template`](../../kernel/src/arch/x86_64/paging.rs)
-   reads Limine's live PML4 (via `arch::active_root`) and copies
+1. **Boot capture.** At boot, `KernelTables::adopt` takes Limine's live
+   PML4 (via `arch::active_root`) as the kernel's tables, and, once
+   kvmap's window is linked,
+   [`init_kernel_template`](../../kernel/src/arch/x86_64/paging.rs) copies
    entries 256..512 — the canonical kernel-half — into a static
    `SpinLock<Option<[u64; 256]>>`. Must run after `init_memory` (the
    HHDM is required to reach the PML4 frame) and before any
    `AddressSpace::new`.
-2. **AS inheritance.** `AddressSpace::new` allocates a fresh PML4,
-   zeros it, then calls
+2. **AS inheritance.** `UserTables::new`, for `AddressSpace::new`,
+   allocates a fresh PML4, zeros it, then calls
    `ArchPaging::inherit_kernel_mappings(root)`. On x86_64 this
    copies the template's 256 entries into the new PML4's kernel
    half. The user half (entries 0..256) stays zero.
@@ -469,7 +489,7 @@ next sub-item).
 On a future aarch64 port, `inherit_kernel_mappings` is a no-op:
 the TTBR0/TTBR1 split makes the kernel half live in a separate
 translation register that process address spaces don't manage.
-The arch-neutral caller (`AddressSpace::new`) is unchanged.
+The arch-neutral caller (`UserTables::new`) is unchanged.
 
 ## Kernel vmap and per-thread kernel stacks
 
@@ -479,17 +499,16 @@ per-CPU data and driver MMIO — live in the kernel vmap region
 [architecture overview](overview.md)). Two pieces split the work:
 
 [`mm/kvmap.rs`](../../kernel/src/mm/kvmap.rs) owns the vmap's **window**:
-the first 512 GiB of the region, the part whose PDPT `mm::kvmap::init`
-links at boot, **before** `init_kernel_template`, through
-`ArchPaging::ensure_kernel_intermediate`. The
+the first 512 GiB of the region, the part whose PDPT `KernelTables::adopt`
+links at boot, from `mm::kvmap::window`, **before** it captures the
+template. The
 [shared-kernel-half rule](#kernel-half-pml4-sharing) does the rest: the
 captured template includes the PDPT pointer, every future AS inherits it,
 and later leaf edits change the shared sub-tree every AS sees. kvmap hands
 out VA only inside the window, so no mapping ever needs a PDPT of its own,
-which would be linked into one root alone. It edits the tables through the
-boot root `init` recorded, never which root happens to be loaded or a
-caller's: Limine's PML4, which is never freed, as the buddy takes only
-usable memory.
+which would be linked into one root alone. It edits the tables through
+`KernelTables`, never which root happens to be loaded or a caller's:
+Limine's PML4, which is never freed, as the buddy takes only usable memory.
 
 Its VA comes from a cursor over the window, and from ranges given back:
 

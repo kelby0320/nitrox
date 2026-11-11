@@ -977,7 +977,7 @@ fn init_memory() -> bool {
 /// 2. Pre-allocate the kernel-vmap region's intermediate page tables in the live PML4.
 /// 3. Capture the kernel-half PML4 entries into the template every new address space inherits.
 ///
-/// The order matters: `kvmap::init` modifies the live PML4 in ways the template must see, and the
+/// `KernelTables::adopt` keeps the order: the template must see the vmap's tables, and the
 /// snapshot freezes the kernel half. See "Kernel-half PML4 sharing" in
 /// `docs/architecture/memory-management.md`.
 fn paging_init() {
@@ -990,7 +990,7 @@ fn paging_init() {
     // so each AP repeats it in `ap_cpu_init`: CPUs that disagreed would give a page different
     // meanings by core.
     //
-    // SAFETY: ring 0, on the boot CPU, before `kvmap::init` maps anything.
+    // SAFETY: ring 0, on the boot CPU, before the vmap maps anything.
     let policy = unsafe { arch::MemoryTypes::install_policy() };
     ATTRIBUTE_TABLE.store(policy != Policy::NoTable, core::sync::atomic::Ordering::Relaxed);
     match policy {
@@ -1011,13 +1011,11 @@ fn paging_init() {
         arch::fpu_vector_bits(),
         arch::fpu_area_bytes()
     );
-    // SAFETY: HHDM is up (init_memory ran first) and the buddy
+    // SAFETY: the live boot root, which nothing frees, as the buddy takes only usable memory.
+    // HHDM is up (init_memory ran first) and the buddy
     // allocator is live; no AS exists yet whose captured template
     // could disagree with the new PML4 entries.
-    unsafe {
-        mm::kvmap::init(arch::Paging::active_root());
-        arch::Paging::init_kernel_template(arch::Paging::active_root());
-    }
+    unsafe { mm::page_tables::KernelTables::adopt(arch::Paging::active_root(), mm::kvmap::window()) };
 }
 
 #[panic_handler]

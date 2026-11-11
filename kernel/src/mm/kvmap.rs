@@ -6,19 +6,17 @@
 //! A vmap mapping must be visible under every address space (a stack allocated under one AS is
 //! used while another is loaded), via
 //! [Kernel-half PML4 sharing](../../docs/architecture/memory-management.md#kernel-half-pml4-sharing):
-//! [`init`] runs at boot **before** `init_kernel_template` and pre-allocates the vmap's top-level
+//! [`window`] is linked at boot **before** `init_kernel_template`, pre-allocating the vmap's top-level
 //! intermediate page tables, the template snapshots those PML4 entries, and every
 //! `AddressSpace::new` inherits them. Later `map_page` calls modify a PD/PT chain under the shared
 //! PDPTs, visible to every AS with no shootdown. So VA is handed out only in that window, the
 //! tables are edited through the boot root alone, and every unmap is shot down on every CPU.
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
-use crate::arch::Paging;
-use crate::arch::paging::{ArchPaging, PageFlags};
+use crate::arch::paging::PageFlags;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, SpinLock};
 use crate::mm::frame::Frame;
+use crate::mm::page_tables::KernelTables;
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
 
 /// Inclusive lower bound of the kernel vmap region (`docs/architecture/overview.md`).
@@ -32,10 +30,6 @@ const WINDOW_PDPTS: u64 = 1;
 /// Exclusive upper bound of the window, the part of the region every root shares.
 pub const VMAP_WINDOW_END: u64 = KERNEL_VMAP_START + WINDOW_PDPTS * PDPT_SPAN;
 const _: () = assert!(VMAP_WINDOW_END <= KERNEL_VMAP_END);
-
-/// The boot root: never freed, as the buddy takes only usable memory, which the bootloader's
-/// tables are not.
-static ROOT: AtomicU64 = AtomicU64::new(0);
 
 /// Never nested, and nothing allocates or frees under it; lock rank 6d.
 static VMAP: SpinLock<Vmap> = SpinLock::new(LockRank::KernelVmap, Vmap::new(KERNEL_VMAP_START, VMAP_WINDOW_END));
@@ -101,29 +95,9 @@ fn unlink(mut list: &mut Option<KBox<Slot>>, pages: u64) -> Option<KBox<Slot>> {
     Some(node)
 }
 
-/// Link the window's PDPTs into `boot_root`, for the kernel template, and record the root.
-///
-/// # Safety
-/// `boot_root` must be the live root, which is never freed.
-/// Must be called after `init_memory` (HHDM required to reach the
-/// PML4 frame) and **before** [`crate::arch::init_kernel_template`]
-/// (must influence the snapshot). The single CPU running boot code
-/// is the only mutator of the live PML4 at this point.
-pub unsafe fn init(boot_root: PhysAddr) {
-    for i in 0..WINDOW_PDPTS {
-        // SAFETY: forwarded from this function's contract; no AS exists to disagree.
-        unsafe {
-            Paging::ensure_kernel_intermediate(boot_root, VirtAddr::new(KERNEL_VMAP_START + i * PDPT_SPAN))
-                .expect("kvmap PDPT pre-allocation failed at boot");
-        }
-    }
-    ROOT.store(boot_root.as_u64(), Ordering::Release);
-}
-
-fn root() -> PhysAddr {
-    let root = ROOT.load(Ordering::Acquire);
-    debug_assert_ne!(root, 0, "kvmap used before kvmap::init");
-    PhysAddr::new(root)
+/// The window's top-level tables, which [`KernelTables::adopt`] links for every root to share.
+pub fn window() -> impl Iterator<Item = VirtAddr> {
+    (0..WINDOW_PDPTS).map(|i| VirtAddr::new(KERNEL_VMAP_START + i * PDPT_SPAN))
 }
 
 fn page(base: u64, i: u64) -> VirtAddr {
@@ -138,7 +112,7 @@ fn page(base: u64, i: u64) -> VirtAddr {
 unsafe fn map_all(base: u64, frames: impl Iterator<Item = PhysAddr>, flags: PageFlags) -> Result<(), AllocError> {
     for (mapped, phys) in (0..).zip(frames) {
         // SAFETY: forwarded; the window's PDPTs are linked, so only shared PDs and PTs are made.
-        if unsafe { Paging::map_page(root(), page(base, mapped), phys, flags) }.is_err() {
+        if unsafe { KernelTables::get().map(page(base, mapped), phys, flags) }.is_err() {
             // SAFETY: the pages just mapped, which nothing has seen.
             unsafe { unmap_all(base, mapped) };
             return Err(AllocError);
@@ -152,7 +126,7 @@ unsafe fn map_all(base: u64, frames: impl Iterator<Item = PhysAddr>, flags: Page
 unsafe fn unmap_all(base: u64, pages: u64) {
     for i in 0..pages {
         // SAFETY: forwarded from this function's contract.
-        let _ = unsafe { Paging::unmap_page(root(), page(base, i)) };
+        let _ = unsafe { KernelTables::get().unmap(page(base, i)) };
     }
     crate::tlb::shootdown_all();
 }
@@ -213,7 +187,7 @@ impl MmioWindow {
     pub unsafe fn repoint(&mut self, phys: PhysAddr) -> Result<(), AllocError> {
         if core::mem::take(&mut self.mapped) {
             // SAFETY: the window's own page, mapped by the previous repoint.
-            let _ = unsafe { Paging::unmap_page(root(), self.va) };
+            let _ = unsafe { KernelTables::get().unmap(self.va) };
             crate::tlb::shootdown_page(self.va);
         }
         // SAFETY: the window's own page, unmapped; `phys` is a device frame, per the contract.

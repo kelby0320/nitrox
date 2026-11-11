@@ -501,12 +501,10 @@ fn demand_paging_smoke_test() {
         return;
     }
 
-    // SAFETY: `translate` only reads this AS's own page-table memory via the HHDM.
-    let before = unsafe { arch::Paging::translate(asp.root(), mm::VirtAddr::new(base)) };
+    let before = asp.translate(mm::VirtAddr::new(base));
     let r0 = asp.fault_in(mm::VirtAddr::new(base), FaultAccess::Write);
     let r1 = asp.fault_in(mm::VirtAddr::new(base + page), FaultAccess::Read);
-    // SAFETY: as above — page 0 should now resolve.
-    let after = unsafe { arch::Paging::translate(asp.root(), mm::VirtAddr::new(base)) };
+    let after = asp.translate(mm::VirtAddr::new(base));
 
     if before.is_none() && after.is_some() && r0 == FaultIn::Mapped && r1 == FaultIn::Mapped {
         kprintln!(

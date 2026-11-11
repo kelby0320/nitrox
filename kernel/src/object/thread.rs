@@ -122,7 +122,7 @@ pub struct Thread {
     /// Owned kernel stack; `None` for the boot thread (bootloader stack) and inert threads.
     stack: Option<KernelStack>,
     /// Page-table root to load when this thread runs: `None` for kernel/boot threads (the
-    /// scheduler uses its cached boot root), `Some(root)` for a user thread.
+    /// scheduler uses the boot root), `Some(root)` for a user thread.
     addr_space_root: Option<PhysAddr>,
     user_entry: Option<(u64, u64)>,
     /// Bootstrap registers (`rdi`, `rsi`, `rdx`, `rcx`) seeded at a user thread's ring-3 entry.

@@ -36,7 +36,7 @@
 //!
 //! [`release_keeping_irqs_masked`]: crate::libkern::IrqSpinLockGuard::release_keeping_irqs_masked
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
@@ -49,6 +49,7 @@ use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, Reserved};
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::mm::PhysAddr;
 use crate::mm::kstack::KernelStackTop;
+use crate::mm::page_tables::KernelTables;
 use crate::object::header::{Closing, Ref, Shared, Weak};
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 use crate::object::{
@@ -134,11 +135,6 @@ pub use deadline::{SlotHold, Slots};
 /// counters are plain `u64`s because every increment site already holds `SCHED`.
 pub mod stats;
 
-/// The kernel/boot page-table root, captured once at [`init`]. Threads with no per-process
-/// address space run on it; it is loaded on switch-in so a dying user thread's address
-/// space can be freed safely.
-static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
-
 /// Lock-free bitmask of online CPUs (dense index → bit), for subsystems that must not
 /// take the top-rank `SCHED` lock — notably TLB shootdown ([`crate::tlb`]), which fires
 /// from the mm layer under lower locks. Each CPU sets its own bit as it comes online.
@@ -207,7 +203,7 @@ fn addr<T: Shared>(object: &T) -> *mut () {
 /// The page-table root a thread should run under: its own process root if it has one, else the
 /// boot root.
 fn resolve_root(th: &Thread) -> PhysAddr {
-    th.addr_space_root().unwrap_or_else(|| PhysAddr::new(BOOT_ROOT.load(Ordering::Relaxed)))
+    th.addr_space_root().unwrap_or_else(|| KernelTables::get().root())
 }
 
 /// Scheduler state behind the rank-1 run-queue lock.

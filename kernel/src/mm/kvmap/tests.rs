@@ -11,9 +11,8 @@ fn spare(pages: u64) -> KBox<Slot> {
     KBox::try_new(Slot { start: 0, pages, next: None }).unwrap()
 }
 
-fn translate(root: PhysAddr, va: u64) -> Option<PhysAddr> {
-    // SAFETY: a read-only walk of a root this test holds.
-    unsafe { Paging::translate(root, VirtAddr::new(va)) }
+fn translate(asp: &AddressSpace, va: u64) -> Option<PhysAddr> {
+    asp.translate(VirtAddr::new(va))
 }
 
 #[test]
@@ -55,8 +54,8 @@ fn the_last_page_the_vmap_hands_out_is_mapped_under_every_root() {
     let frame = Frame::alloc().unwrap();
     // SAFETY: the window's last page, far past the cursor, which no test hands out.
     unsafe { map_all(last, core::iter::once(frame.phys()), PageFlags::WRITABLE).unwrap() };
-    for root in [a.root(), b.root()] {
-        assert_eq!(translate(root, last), Some(frame.phys()));
+    for asp in [&a, &b] {
+        assert_eq!(translate(asp, last), Some(frame.phys()));
     }
     // SAFETY: mapped just above, and used by nothing.
     unsafe { unmap_all(last, 1) };
@@ -68,8 +67,8 @@ fn a_dropped_range_is_shot_down_before_its_frames_are_freed() {
     let other = AddressSpace::new().unwrap();
     let range = VmapFrames::<3>::new(PageFlags::WRITABLE, 1).unwrap();
     let base = range.base().as_u64();
-    assert!((0..3).all(|i| translate(other.root(), base + i * PAGE).is_some()));
-    assert_eq!(translate(other.root(), base - PAGE), None, "the guard page");
+    assert!((0..3).all(|i| translate(&other, base + i * PAGE).is_some()));
+    assert_eq!(translate(&other, base - PAGE), None, "the guard page");
     assert_eq!(range.end().as_u64(), base + 3 * PAGE);
     let (shots, freed) = (crate::tlb::shootdowns_by_this_thread().0, heap::frames_freed_by_this_thread());
     drop(range);
@@ -77,7 +76,7 @@ fn a_dropped_range_is_shot_down_before_its_frames_are_freed() {
     assert_eq!(shots_after, shots + 1);
     assert_eq!(freed_at_shot, freed, "no frame freed before the shootdown");
     assert_eq!(heap::frames_freed_by_this_thread() - freed, 3);
-    assert!((0..3).all(|i| translate(other.root(), base + i * PAGE).is_none()));
+    assert!((0..3).all(|i| translate(&other, base + i * PAGE).is_none()));
 }
 
 #[test]
@@ -90,11 +89,11 @@ fn a_repointed_window_reads_the_new_frame_and_shoots_down_the_old() {
     let shots = crate::tlb::shootdowns_by_this_thread().0;
     // SAFETY: frames this test owns, read through the window by nothing.
     unsafe { win.repoint(first).unwrap() };
-    assert_eq!(translate(other.root(), win.va().as_u64()), Some(first));
+    assert_eq!(translate(&other, win.va().as_u64()), Some(first));
     assert_eq!(crate::tlb::shootdowns_by_this_thread().0, shots, "nothing to shoot down yet");
     // SAFETY: as above.
     unsafe { win.repoint(second).unwrap() };
-    assert_eq!(translate(other.root(), win.va().as_u64()), Some(second));
+    assert_eq!(translate(&other, win.va().as_u64()), Some(second));
     assert_eq!(crate::tlb::shootdowns_by_this_thread().0, shots + 1, "the first frame's page");
 }
 
@@ -129,7 +128,7 @@ fn a_range_that_runs_out_of_page_tables_is_undone() {
     crate::arch::fail_page_tables_after(None);
     assert!(failed.is_err());
     let base = boundary - 2 * PAGE;
-    assert!((0..2).all(|i| translate(other.root(), base + i * PAGE).is_none()), "mapped, then undone");
+    assert!((0..2).all(|i| translate(&other, base + i * PAGE).is_none()), "mapped, then undone");
     assert_eq!(crate::tlb::shootdowns_by_this_thread(), (shots + 1, freed), "shot down before a frame is freed");
     assert_eq!(heap::frames_freed_by_this_thread() - freed, 4);
     assert_eq!(VmapFrames::<4>::new(PageFlags::WRITABLE, 2).unwrap().base().as_u64(), base, "its VA, given back");

@@ -82,6 +82,8 @@ pub enum MapError {
     /// The virtual or physical address was not 4 KiB aligned, or the
     /// virtual address was not canonical.
     Misaligned,
+    /// Refused by a user half's tables: see `UserTables::map_owned`.
+    NotUser,
 }
 
 /// Why [`ArchPaging::unmap_page`] could not remove a mapping.
@@ -92,6 +94,8 @@ pub enum UnmapError {
     NotMapped,
     /// The virtual address was not 4 KiB aligned, or not canonical.
     Misaligned,
+    /// A kernel-half address, which a user half's tables do not hold.
+    NotUser,
 }
 
 /// Architecture page-table operations.
@@ -158,6 +162,7 @@ pub trait ArchPaging {
     /// table that maps, at minimum, all currently-executing kernel code,
     /// the current stack, and the higher-half direct map. Loading an
     /// incomplete table triple-faults the CPU instantly.
+    /// It stays live while loaded: a CPU loads another before its owner frees it.
     unsafe fn set_page_table(root: PhysAddr);
 
     /// Populate the kernel-half mappings of a freshly-allocated top-level

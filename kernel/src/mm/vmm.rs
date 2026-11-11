@@ -337,7 +337,6 @@ impl VmaTree {
         }
         self.len += 1;
 
-        // RB fixup restores no-red-red.
         self.insert_fixup(new_node);
         Ok(())
     }

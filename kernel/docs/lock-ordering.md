@@ -387,9 +387,9 @@ lock at rank 1–5.
 `SpinLock<Option<[u64; 256]>>` holding the kernel-half PML4 entries
 captured at boot. It is acquired in exactly two places:
 
-- `init_kernel_template(boot_root)` at boot, with no other lock held.
+- `init_kernel_template(boot_root)` at boot, in `KernelTables::adopt`, with no other lock held.
 - `X86Paging::inherit_kernel_mappings(root)` inside
-  `AddressSpace::new` — at the point of acquisition, the freshly
+  `UserTables::new`, for `AddressSpace::new` — at the point of acquisition, the freshly
   allocated PML4 frame is the only AS-related state; `new` has not
   yet wrapped it in its own `SpinLock<Inner>`, so the rank-4
   `AddressSpace` lock is not held.
