@@ -3,10 +3,9 @@
 
 use std::sync::Once;
 
-use crate::arch::Paging;
-use crate::arch::paging::ArchPaging;
 use crate::limine::{MEMMAP_USABLE, MemoryMapEntry, MemoryMapResponse};
 use crate::mm::frame::Frame;
+use crate::mm::page_tables::KernelTables;
 use crate::mm::{PAGE_SIZE, heap, slab};
 
 static HEAP_INIT: Once = Once::new();
@@ -47,11 +46,8 @@ pub fn init_global_heap() {
         // `AddressSpace::new` shares the window as at boot.
         let boot_root = Frame::alloc_zeroed().expect("a frame for the test boot root").into_pte();
         // SAFETY: a fresh, unaliased frame, reachable at its own address under the test HHDM
-        // offset of 0. Zeroed, it is an empty PML4; `kvmap::init` links the window into it before
+        // offset of 0. Zeroed, it is an empty PML4; `adopt` links the window into it before
         // the template is captured, and it is never freed.
-        unsafe {
-            crate::mm::kvmap::init(boot_root);
-            Paging::init_kernel_template(boot_root);
-        }
+        unsafe { KernelTables::adopt(boot_root, crate::mm::kvmap::window()) };
     });
 }

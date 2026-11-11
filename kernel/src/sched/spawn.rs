@@ -20,10 +20,6 @@ pub(super) fn thread_list() -> Result<Reserved<Ref<Thread>>, AllocError> {
 /// thread so the first [`context_switch`] has a valid slot to save into. Must run once,
 /// after the allocators and paging are up and before any [`spawn`]/[`yield_now`].
 pub fn init() -> Result<(), AllocError> {
-    // Cache the kernel/boot page-table root (see `resolve_root`); `active_root` reads CR3,
-    // never reached in host tests.
-    BOOT_ROOT.store(Paging::active_root().as_u64(), Ordering::Relaxed);
-
     // Build the pre-reserved queues and heap OUTSIDE the lock (the only growth); blocking and
     // timer arming stay within these reserves.
     let (ready, blocked, suspended, reap) = (thread_list()?, thread_list()?, thread_list()?, thread_list()?);

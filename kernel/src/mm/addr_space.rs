@@ -18,6 +18,7 @@ use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock, SpinLockGuard};
 use crate::mm::frame::{Frame, FrameView};
+use crate::mm::page_tables::UserTables;
 use crate::mm::vmm::{Backing, FaultAccess, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::object::header::Ref;
@@ -78,20 +79,16 @@ pub struct AddressSpace {
 
 struct Inner {
     vma_tree: VmaTree,
-    /// Physical base of the top-level page-table frame; freed in `Drop` after the tree.
-    root: PhysAddr,
+    /// Freed after the tree, as the fields drop, `Drop` having torn down the VMAs.
+    tables: UserTables,
 }
 
 impl AddressSpace {
     /// Build an empty address space: a zeroed PML4 frame inheriting the kernel-half entries from
-    /// the boot template, and an empty VMA tree. Panics before `arch::init_kernel_template`.
+    /// the boot template, and an empty VMA tree. Panics before `KernelTables::adopt`.
     pub fn new() -> Result<Self, AllocError> {
-        // Zeroed, every entry is absent until `inherit_kernel_mappings` fills the kernel half.
-        // Handed over as every table is, so no view reaches it.
-        let root = Frame::alloc_zeroed().ok_or(AllocError)?.into_pte();
-        // SAFETY: a fresh table this space owns, which no CPU has loaded.
-        unsafe { Paging::inherit_kernel_mappings(root) };
-        Ok(AddressSpace { inner: SpinLock::new(LockRank::KernelObject, Inner { vma_tree: VmaTree::new(), root }) })
+        let tables = UserTables::new()?;
+        Ok(AddressSpace { inner: SpinLock::new(LockRank::KernelObject, Inner { vma_tree: VmaTree::new(), tables }) })
     }
 
     /// **Copy `src` into the anonymous memory mapped from `at`**, as the loader writes an image;
@@ -102,8 +99,7 @@ impl AddressSpace {
         while done < src.len() {
             let Some(va) = at.as_u64().checked_add(done as u64).map(VirtAddr::new) else { return false };
             let anonymous = inner.vma_tree.find_covering(va).is_some_and(|v| matches!(v.backing, Backing::Anonymous));
-            // SAFETY: this space's root, whose tables live while it does.
-            let Some(phys) = anonymous.then(|| unsafe { Paging::translate(inner.root, va) }).flatten() else {
+            let Some(phys) = anonymous.then(|| inner.tables.translate(va)).flatten() else {
                 return false;
             };
             // SAFETY: an anonymous frame mapped here, which this space owns and frees only at an
@@ -119,7 +115,18 @@ impl AddressSpace {
 
     /// Physical base of this address space's top-level page table.
     pub fn root(&self) -> PhysAddr {
-        self.inner.lock().root
+        self.inner.lock().tables.root()
+    }
+
+    /// The address `va` maps to here, or `None`.
+    pub fn translate(&self, va: VirtAddr) -> Option<PhysAddr> {
+        self.inner.lock().tables.translate(va)
+    }
+
+    /// `f` of this space's page tables, under its lock. **Host tests only.**
+    #[cfg(test)]
+    pub(crate) fn with_tables<R>(&self, f: impl FnOnce(&UserTables) -> R) -> R {
+        f(&self.inner.lock().tables)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -153,8 +160,7 @@ impl AddressSpace {
             return Err((boxed, MapError::Overlap));
         }
 
-        let flags = page_flags_for(boxed.prot, boxed.caching);
-        let root = guard.root;
+        let flags = page_flags_for(boxed.prot, Caching::Normal);
         let total_pages = range.pages();
         let mut installed: u64 = 0;
 
@@ -162,32 +168,23 @@ impl AddressSpace {
             let virt = VirtAddr::new(range.start().as_u64() + i * (PAGE_SIZE as u64));
 
             let Some(frame) = Frame::alloc_zeroed() else {
-                rollback_partial_map(root, range.start(), installed);
+                rollback_partial_map(&mut guard.tables, range.start(), installed);
                 return Err((boxed, MapError::OutOfMemory));
             };
-            let phys = frame.phys();
 
-            // SAFETY: `root` is the PML4 owned by this AS; `phys` is a
-            // fresh frame we just allocated and zeroed; `virt` is in
-            // the validated, canonical, user-half range. No TLB flush
-            // is needed today — no CPU has this address space loaded.
-            let r = unsafe { Paging::map_page(root, virt, phys, flags) };
-            match r {
-                Ok(()) => {
-                    frame.into_pte();
-                    installed += 1;
-                }
-                Err(ArchMapError::OutOfMemory) => {
-                    rollback_partial_map(root, range.start(), installed);
+            match guard.tables.map_owned(virt, frame, flags) {
+                Ok(()) => installed += 1,
+                Err((_, ArchMapError::OutOfMemory)) => {
+                    rollback_partial_map(&mut guard.tables, range.start(), installed);
                     return Err((boxed, MapError::OutOfMemory));
                 }
-                Err(ArchMapError::AlreadyMapped) => {
+                Err((_, ArchMapError::AlreadyMapped)) => {
                     // Impossible: AS lock held and overlap pre-checked.
                     unreachable!("ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check");
                 }
-                Err(ArchMapError::Misaligned) => {
+                Err((_, e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared))) => {
                     // Impossible: `VAddrRange` enforces page alignment.
-                    unreachable!("ArchPaging::map_page returned Misaligned for a page-aligned per-page address");
+                    unreachable!("map_vma: {e:?} for a page-aligned user-half address");
                 }
             }
         }
@@ -196,7 +193,7 @@ impl AddressSpace {
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             Err(b) => {
-                rollback_partial_map(root, range.start(), installed);
+                rollback_partial_map(&mut guard.tables, range.start(), installed);
                 Err((b, MapError::Overlap))
             }
         }
@@ -238,9 +235,10 @@ impl AddressSpace {
     /// address space **is live in the MMU** (unlike eager `map_vma`), so the flush is mandatory.
     /// Only [`FaultIn::Mapped`] means retry.
     pub fn fault_in(&self, addr: VirtAddr, access: FaultAccess) -> FaultIn {
-        let guard = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
 
-        let Some(vma) = guard.vma_tree.find_covering(addr) else {
+        let Some(vma) = inner.vma_tree.find_covering(addr) else {
             return FaultIn::NoVma;
         };
 
@@ -254,8 +252,7 @@ impl AddressSpace {
             _ => {}
         }
 
-        let flags = page_flags_for(vma.prot, vma.caching);
-        let root = guard.root;
+        let flags = page_flags_for(vma.prot, Caching::Normal);
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
 
         match vma.backing {
@@ -263,22 +260,14 @@ impl AddressSpace {
                 let Some(frame) = Frame::alloc_zeroed() else {
                     return FaultIn::Oom;
                 };
-                let phys = frame.phys();
-                // SAFETY: `root` is this AS's PML4; `phys` is the fresh,
-                // zeroed frame; `page_base` is the page-aligned faulting
-                // address, in the validated user-half VMA range. A present PTE
-                // is refused, not aliased.
-                match unsafe { Paging::map_page(root, page_base, phys, flags) } {
-                    Ok(()) => {
-                        frame.into_pte();
-                        crate::mm::record_demand_fault();
-                    }
-                    Err(ArchMapError::OutOfMemory) => return FaultIn::Oom,
+                match inner.tables.map_owned(page_base, frame, flags) {
+                    Ok(()) => crate::mm::record_demand_fault(),
+                    Err((_, ArchMapError::OutOfMemory)) => return FaultIn::Oom,
                     // Another CPU faulted on the same page and mapped it first, between this
                     // CPU's fault and the lock: the page is there, so the access can be retried.
-                    Err(ArchMapError::AlreadyMapped) => {}
-                    Err(ArchMapError::Misaligned) => {
-                        unreachable!("fault_in: map_page called Misaligned a page-aligned address");
+                    Err((_, ArchMapError::AlreadyMapped)) => {}
+                    Err((_, e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared))) => {
+                        unreachable!("fault_in: {e:?} for a page-aligned user-half address");
                     }
                 }
                 // Evict the not-present entry the CPU cached for this page on the fault we are
@@ -324,7 +313,6 @@ impl AddressSpace {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
-        boxed.caching = caching;
 
         let mut guard = self.inner.lock();
 
@@ -333,18 +321,16 @@ impl AddressSpace {
         }
 
         let flags = page_flags_for(prot, caching);
-        let root = guard.root;
         let mut installed: u64 = 0;
 
         for i in 0..npages {
             let virt = VirtAddr::new(range.start().as_u64() + i * (PAGE_SIZE as u64));
             let frame = object.frame_to_map(i as usize).expect("an object as large as the range");
-            // SAFETY: `root` is this AS's PML4; `frame` is owned by the
-            // `MemoryObject` the VMA will keep alive; `virt` is in the
-            // validated canonical user-half range. Aliasing a frame already
+            // SAFETY: `frame` is owned by the `MemoryObject` the VMA will keep alive until an
+            // unmap's shootdown (`Unmapped`), or a rollback's; aliasing a frame already
             // mapped elsewhere is intended (shared memory). No frame is
             // allocated or zeroed here — the object owns them.
-            match unsafe { Paging::map_page(root, virt, frame, flags) } {
+            match unsafe { guard.tables.map(virt, frame, flags) } {
                 Ok(()) => installed += 1,
                 Err(ArchMapError::OutOfMemory) => {
                     rollback_object_map(guard, range.start(), installed);
@@ -354,9 +340,9 @@ impl AddressSpace {
                     // Impossible: overlap was pre-checked under the lock.
                     unreachable!("ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check");
                 }
-                Err(ArchMapError::Misaligned) => {
+                Err(e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared)) => {
                     // Impossible: VAddrRange enforces page alignment.
-                    unreachable!("ArchPaging::map_page returned Misaligned for a page-aligned per-page address");
+                    unreachable!("map_object: {e:?} for a page-aligned user-half address");
                 }
             }
         }
@@ -447,27 +433,27 @@ impl AddressSpace {
     /// here or by a racing fault); `false` if the VMA is gone or changed, or a page-table
     /// allocation failed. The object owns the frame, so `unmap` removes the PTE without freeing it.
     pub fn map_file_page(&self, addr: VirtAddr, object: &Ref<FileObject>, frame: PhysAddr) -> bool {
-        let guard = self.inner.lock();
-        let Some(vma) = guard.vma_tree.find_covering(addr) else {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        let Some(vma) = inner.vma_tree.find_covering(addr) else {
             return false;
         };
         if !matches!(&vma.backing, Backing::File(file) if file.as_ptr() == object.as_ptr()) {
             return false;
         }
-        let flags = page_flags_for(vma.prot, vma.caching);
-        let root = guard.root;
+        let flags = page_flags_for(vma.prot, Caching::Normal);
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
-        // SAFETY: `root` is this AS's PML4; `frame` is a live, resident cache frame
-        // the file object owns and keeps alive (the VMA holds its reference);
-        // `page_base` is page-aligned and in the validated user-half VMA range.
-        match unsafe { Paging::map_page(root, page_base, frame, flags) } {
+        // SAFETY: `frame` is a live, resident cache frame
+        // the file object owns and keeps alive (the VMA holds its reference, until an unmap's
+        // shootdown); `page_base` is page-aligned and in the validated user-half VMA range.
+        match unsafe { inner.tables.map(page_base, frame, flags) } {
             Ok(()) | Err(ArchMapError::AlreadyMapped) => {
                 Paging::flush_tlb_page(page_base);
                 true
             }
             Err(ArchMapError::OutOfMemory) => false,
-            Err(ArchMapError::Misaligned) => {
-                unreachable!("map_file_page: Misaligned for a page-aligned address")
+            Err(e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared)) => {
+                unreachable!("map_file_page: {e:?} for a page-aligned user-half address")
             }
         }
     }
@@ -526,10 +512,7 @@ impl AddressSpace {
         let boxed = guard.vma_tree.remove_covering(addr).expect("find_covering matched under the same hold");
         for i in 0..boxed.range.pages() {
             let virt = VirtAddr::new(boxed.range.start().as_u64() + i * (PAGE_SIZE as u64));
-            // SAFETY: every page in the range was mapped by a prior `map_vma`
-            // under this same AS lock; `guard.root` is the top-level table they
-            // were installed into.
-            let r = unsafe { Paging::unmap_page(guard.root, virt) };
+            let r = guard.tables.unmap(virt);
             if let Ok(phys) = r
                 && matches!(boxed.backing, Backing::Anonymous)
             {
@@ -584,24 +567,17 @@ impl Drop for AddressSpace {
             let Some(boxed) = guard.vma_tree.remove_covering(leftmost_start) else {
                 break;
             };
-            free_vma_pages(guard.root, &boxed);
+            free_vma_pages(&mut guard.tables, &boxed);
         }
-
-        // SAFETY: the table `new` handed over, which no CPU has loaded (above), taken back once.
-        drop(unsafe { Frame::from_pte(guard.root) });
     }
 }
 
 /// Uninstall every PTE of a VMA's range and free each anonymous leaf frame.
-fn free_vma_pages(root: PhysAddr, vma: &Vma) {
+fn free_vma_pages(tables: &mut UserTables, vma: &Vma) {
     let range = vma.range;
     for i in 0..range.pages() {
         let virt = VirtAddr::new(range.start().as_u64() + i * (PAGE_SIZE as u64));
-        // SAFETY: every page in `range` was mapped by a prior `map_vma`
-        // under the same AS lock; the PTEs exist now and `root` is the
-        // valid top-level table they were installed into.
-        let r = unsafe { Paging::unmap_page(root, virt) };
-        if let Ok(phys) = r {
+        if let Ok(phys) = tables.unmap(virt) {
             match vma.backing {
                 // SAFETY: an anonymous page's frame, its PTE just cleared in a space no CPU has loaded.
                 Backing::Anonymous => drop(unsafe { Frame::from_pte(phys) }),
@@ -616,13 +592,10 @@ fn free_vma_pages(root: PhysAddr, vma: &Vma) {
 
 /// Roll back a partial `map_vma`: uninstall `installed` PTEs from `start`, freeing each frame, with
 /// no shootdown, as `map_vma` fills only a space no CPU has loaded.
-fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
+fn rollback_partial_map(tables: &mut UserTables, start: VirtAddr, installed: u64) {
     for i in 0..installed {
         let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
-        // SAFETY: we successfully installed exactly these `installed`
-        // pages in `map_vma` immediately before this call.
-        let r = unsafe { Paging::unmap_page(root, virt) };
-        if let Ok(phys) = r {
+        if let Ok(phys) = tables.unmap(virt) {
             // SAFETY: the frame `map_vma` handed this PTE, now cleared in a space no CPU has loaded.
             drop(unsafe { Frame::from_pte(phys) });
         }
@@ -632,14 +605,10 @@ fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
 /// Roll back a partial `map_object`: uninstall `installed` PTEs from `start` but **do not free
 /// the frames** (the `MemoryObject` owns them), then release the lock and shoot them down, if any
 /// page was mapped. The space is live, so the object may be released only once this returns.
-fn rollback_object_map(guard: SpinLockGuard<'_, Inner>, start: VirtAddr, installed: u64) {
-    let root = guard.root;
+fn rollback_object_map(mut guard: SpinLockGuard<'_, Inner>, start: VirtAddr, installed: u64) {
     for i in 0..installed {
         let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
-        // SAFETY: we successfully installed exactly these `installed` pages in
-        // `map_object` immediately before this call. The returned phys is the
-        // object's frame, which the object still owns — discard it.
-        let _ = unsafe { Paging::unmap_page(root, virt) };
+        let _ = guard.tables.unmap(virt);
     }
     let unmapped = (installed > 0).then(|| Unmapped { _frames: KVec::new(), vma: None });
     drop(guard);
@@ -649,7 +618,7 @@ fn rollback_object_map(guard: SpinLockGuard<'_, Inner>, start: VirtAddr, install
 /// Translate the VMA-level [`Protection`] and [`Caching`] into hardware [`PageFlags`].
 /// `NO_EXECUTE` is inverted: hardware is executable by default, [`Protection`] non-executable.
 ///
-/// The caching comes from the object via the VMA, so every mapping of one aperture asks for the
+/// The caching comes from the object, so every mapping of one aperture asks for the
 /// same thing (a write-back request over firmware-uncacheable memory made `/dev/framebuffer`
 /// mappings far slower). Public because the boot's `report_framebuffer_cost` measures through it,
 /// and a measurement with its own copy would pass with this translation deleted.

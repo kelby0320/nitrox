@@ -294,8 +294,6 @@ pub(crate) fn a_test_image() -> std::vec::Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::Paging;
-    use crate::arch::paging::ArchPaging;
     use crate::mm::heap;
     use crate::mm::test_support::init_global_heap;
 
@@ -411,9 +409,7 @@ mod tests {
     }
 
     fn read_user_byte(asp: &AddressSpace, virt: VirtAddr) -> u8 {
-        let phys =
-            // SAFETY: `asp`'s root is the live page table this test built.
-            unsafe { Paging::translate(asp.root(), virt) }.expect("address must be mapped for the test to read it");
+        let phys = asp.translate(virt).expect("address must be mapped for the test to read it");
         // SAFETY: a page `translate` found mapped, read through the HHDM.
         unsafe { *((phys.as_u64() + heap::hhdm_offset()) as *const u8) }
     }
@@ -577,20 +573,12 @@ mod tests {
         // Lazily reserved: nothing translates until first touch.
         let last_stack_byte = VirtAddr::new(STACK_TOP - 1);
         let first_stack_byte = VirtAddr::new(STACK_TOP - STACK_SIZE);
-        assert!(
-            // SAFETY: `asp`'s root is the live page table this test built.
-            unsafe { Paging::translate(asp.root(), last_stack_byte) }.is_none(),
-            "stack must be demand-paged, not eagerly backed"
-        );
+        assert!(asp.translate(last_stack_byte).is_none(), "stack must be demand-paged, not eagerly backed");
 
         // Faulting a page in yields a zero-filled page; an untouched page stays unbacked.
         assert_eq!(asp.fault_in(last_stack_byte, FaultAccess::Write), FaultIn::Mapped);
         assert_eq!(read_user_byte(&asp, last_stack_byte), 0);
-        assert!(
-            // SAFETY: `asp`'s root is the live page table this test built.
-            unsafe { Paging::translate(asp.root(), first_stack_byte) }.is_none(),
-            "an untouched stack page must remain unbacked"
-        );
+        assert!(asp.translate(first_stack_byte).is_none(), "an untouched stack page must remain unbacked");
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod frame;
 pub mod heap;
 pub mod kstack;
 pub mod kvmap;
+pub mod page_tables;
 pub mod slab;
 pub mod user_access;
 pub mod vmm;

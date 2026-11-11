@@ -577,6 +577,53 @@ twice. `AddressSpace` repeats one `unsafe` map or unmap, with one argument, at e
 own; the 20 paging tests, the Miri walk among them, and the 39 address-space tests, the unmap's
 shootdown ordering among them. Author.
 
+**Built 2026-11-11** (`bb331b92`; the paging tests moved first, `94ec28f8`, and `subtree_max_end`
+went, `abdf3772`, with two blocks and an `unsafe fn`).
+- **`mm::page_tables`: `KernelTables` and `UserTables`.** The kernel's is the boot root, adopted
+  once; it replaces kvmap's and the scheduler's copies. Its `map` and `unmap` stay `unsafe`,
+  through `&self`. An address space holds a `UserTables` in its locked state, freed as it drops,
+  after the VMAs.
+- **`adopt` links the vmap window's top-level tables and captures the kernel half in one call**,
+  from `kvmap::window`, so the template always holds the window: `kvmap::init` went, and with it
+  the order `main.rs` kept by hand. The plan had kvmap link them after the tables were made.
+- **`map_owned(va, Frame)` is safe**, handing the frame back with the error; `map`, for an
+  object's or a file's frame, stays `unsafe`; `unmap` is safe and gives back the address, an
+  anonymous page's frame taken back by `from_pte`, by the VMA's kind, at the three sites.
+- **For the maintainer's eye: a user half refuses a kernel-half address, a global mapping, and an
+  owned frame mapped other than write-back** (`MapError` and `UnmapError::NotUser`). Without
+  them the safe calls would let any address space's tables unmap a kernel stack from every root,
+  map a frame that outlives the space's time loaded, or alias RAM the direct map holds
+  write-back with another type, which the processor leaves undefined.
+- **`translate` and `attribute_index` are safe on either**: `AddressSpace::translate` takes 24
+  test walks and 2 self-test walks out of `unsafe` (the plan's 45 counted calls behind helpers).
+  The five walks of the active root stay `unsafe`, as does loading a root, whose contract now
+  says it stays live while loaded.
+
+Counts: `unsafe` blocks fall from 569 to 566 and `unsafe fn`s rise from 195 to 197. `page_tables`'
+11 blocks and four `unsafe fn`s (`adopt`, the kernel tables' `map` and `unmap`, the user tables'
+`map` of a frame its owner keeps) hold the root that `addr_space`'s nine replaced blocks and
+`kvmap::init` took bare; `mm`'s entries are raised by hand in the code commit.
+
+**The controls**: an opportunity's, the tests that held the code, passing before and after: the
+20 paging tests, the Miri walk among them, and the 41 address-space tests, the unmap's shootdown
+ordering among them. The refusals, which are new, have their own: eight mutations, each failing
+the test that names it. They unmap or map a kernel page through a user half, allow a global or an
+uncached owned mapping, refuse a borrowed frame write-combining, never free the root, free an owned
+frame while mapped, or lose it on a refusal. Forging tables from an address, or mapping through
+either without `unsafe`, does not compile (E0451, E0133). Under Miri, both models, the tests of
+paging, the tables, the address space, kvmap, kstack and the VMA tree: 110 pass.
+
+**After review** (`45019557`):
+- **`map_page` links no kernel-half top-level table** (`MapError::Unshared`): `KernelTables::map`
+  past the vmap's window had linked one into the boot root alone, after the template's capture.
+- **A user half refuses from `USER_MAP_END`, not `USER_VIRT_END`**: the top user page, which a
+  `sysretq` faults on in ring 0, had mapped through the safe call.
+- **A VMA keeps no caching**: anonymous and file pages map write-back, an object's mapping its
+  object's, so a write-combining anonymous VMA, which had panicked naming `Misaligned`, cannot be
+  written. The arms that cannot be reached name the error they got.
+- `KernelTables` walks too, as the doc said; `adopt` refuses a second call; the refusals of `map`
+  and `map_owned`'s hand-back on an arch error are tested. Blocks: 568.
+
 ### J.11 Per-CPU state (kplat-o3 with sched-o3; kplat-d23, sched-d16)
 
 No dense CPU index type, no per-CPU container and no pin exist: the index is a `u32`, a `usize` or a

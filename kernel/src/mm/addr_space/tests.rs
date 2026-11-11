@@ -35,8 +35,6 @@ fn the_stack_and_guard_are_the_sizes_the_rationale_claims() {
     assert_eq!(USER_STACK_GUARD_SIZE % PAGE_SIZE as u64, 0);
     assert_eq!(USER_STACK_GUARD_BOTTOM % PAGE_SIZE as u64, 0);
 }
-use crate::arch::Paging;
-use crate::arch::paging::ArchPaging;
 use crate::mm::test_support::init_global_heap;
 use crate::mm::vmm::VAddrRange;
 
@@ -75,12 +73,9 @@ fn map_single_page_installs_pte_translate_finds_it() {
     let r = range(PAGE * 4, PAGE * 5);
     asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
-    // SAFETY: translate is read-only against the live tables we
-    // just populated. The root is owned by `asp`.
-    let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 4)) };
+    let phys = asp.translate(va(PAGE * 4));
     assert!(phys.is_some());
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let beyond = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) };
+    let beyond = asp.translate(va(PAGE * 5));
     assert!(beyond.is_none());
     assert_eq!(asp.len(), 1);
 }
@@ -93,14 +88,11 @@ fn map_multi_page_installs_every_pte() {
     asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
     for i in 8..16 {
-        // SAFETY: `asp`'s root is the live page table this test built.
-        let p = unsafe { Paging::translate(asp.root(), va(PAGE * i)) };
+        let p = asp.translate(va(PAGE * i));
         assert!(p.is_some(), "page {i} not mapped");
     }
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let before = unsafe { Paging::translate(asp.root(), va(PAGE * 7)) };
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let after = unsafe { Paging::translate(asp.root(), va(PAGE * 16)) };
+    let before = asp.translate(va(PAGE * 7));
+    let after = asp.translate(va(PAGE * 16));
     assert!(before.is_none());
     assert!(after.is_none());
 }
@@ -117,8 +109,7 @@ fn map_then_unmap_removes_the_ptes() {
     assert!(asp.is_empty());
 
     for i in 4..8 {
-        // SAFETY: `asp`'s root is the live page table this test built.
-        let p = unsafe { Paging::translate(asp.root(), va(PAGE * i)) };
+        let p = asp.translate(va(PAGE * i));
         assert!(p.is_none(), "page {i} still mapped after unmap");
     }
 }
@@ -136,10 +127,8 @@ fn map_rejects_overlap_with_existing_vma() {
     assert_eq!(err.1, MapError::Overlap);
     assert_eq!(err.0.range, range(PAGE * 6, PAGE * 10));
 
-    // SAFETY: `asp`'s root is the live page table this test built.
-    assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_some());
-    // SAFETY: `asp`'s root is the live page table this test built.
-    assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 9)) }.is_none());
+    assert!(asp.translate(va(PAGE * 4)).is_some());
+    assert!(asp.translate(va(PAGE * 9)).is_none());
     assert_eq!(asp.len(), 1);
 }
 
@@ -226,8 +215,7 @@ fn map_object_points_ptes_at_object_frames() {
     asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_object must succeed");
 
     for i in 0..3u64 {
-        // SAFETY: `asp`'s root is the live page table this test built.
-        let phys = unsafe { Paging::translate(asp.root(), va(PAGE * (4 + i))) }.expect("page must be mapped");
+        let phys = asp.translate(va(PAGE * (4 + i))).expect("page must be mapped");
         assert_eq!(phys, frames[i as usize], "page {i} not pointing at object frame");
     }
     assert_eq!(asp.len(), 1);
@@ -245,10 +233,8 @@ fn map_object_twice_aliases_same_frame() {
     asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
     asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), obj2).unwrap();
 
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let p1 = unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.unwrap();
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let p2 = unsafe { Paging::translate(asp.root(), va(PAGE * 8)) }.unwrap();
+    let p1 = asp.translate(va(PAGE * 4)).unwrap();
+    let p2 = asp.translate(va(PAGE * 8)).unwrap();
     assert_eq!(p1, frame0);
     assert_eq!(p2, frame0);
     assert_eq!(p1, p2, "two mappings of one object must alias the same frame");
@@ -265,8 +251,7 @@ fn unmap_object_mapping_does_not_free_the_objects_frames() {
 
     asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
     let removed = asp.unmap_at(va(PAGE * 4)).expect("unmap must find the covering vma");
-    // SAFETY: `asp`'s root is the live page table this test built.
-    assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_none());
+    assert!(asp.translate(va(PAGE * 4)).is_none());
     drop(removed);
     assert_eq!(test_probe::memory_object_destroys(), 0, "unmap freed shared frames");
     drop(keep);
@@ -349,8 +334,7 @@ fn map_file_page_installs_pte_for_a_ready_frame() {
     asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj.clone()).unwrap();
 
     assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) }.expect("page must now be mapped");
+    let phys = asp.translate(va(PAGE * 5)).expect("page must now be mapped");
     assert_eq!(phys, frame, "PTE points at the cache frame");
     assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
 }
@@ -425,8 +409,7 @@ fn a_writable_file_mapping_is_counted_while_its_vma_exists() {
 }
 
 fn is_mapped(asp: &AddressSpace, v: VirtAddr) -> bool {
-    // SAFETY: read-only walk of `asp`'s own page tables.
-    unsafe { Paging::translate(asp.root(), v) }.is_some()
+    asp.translate(v).is_some()
 }
 
 /// Two CPUs can fault on one fresh page: the second, taking the lock after the first mapped it,
@@ -437,13 +420,11 @@ fn a_fault_on_a_page_another_cpu_just_mapped_is_a_retry_and_keeps_no_frame() {
     let asp = AddressSpace::new().unwrap();
     asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 6), uprot())).unwrap();
     assert_eq!(asp.fault_in(va(PAGE * 5), FaultAccess::Write), FaultIn::Mapped);
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let first = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) };
+    let first = asp.translate(va(PAGE * 5));
     let freed = heap::frames_freed_by_this_thread();
     assert_eq!(asp.fault_in(va(PAGE * 5 + 8), FaultAccess::Write), FaultIn::Mapped);
     assert_eq!(heap::frames_freed_by_this_thread() - freed, 1, "the second fault's frame goes back");
-    // SAFETY: as above.
-    assert_eq!(unsafe { Paging::translate(asp.root(), va(PAGE * 5)) }, first);
+    assert_eq!(asp.translate(va(PAGE * 5)), first);
 }
 
 #[test]
@@ -584,8 +565,7 @@ fn mapping_an_aperture_object_selects_the_write_combining_entry() {
     let ordinary = MemoryObject::try_new(PAGE as usize).unwrap();
     asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(ordinary)).expect("map_object must succeed");
 
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let index = |v: u64| unsafe { Paging::attribute_index(asp.root(), va(v)) };
+    let index = |v: u64| asp.with_tables(|t| t.attribute_index(va(v)));
     // Entry 5 is write-combining and entry 0 write-back in the table the kernel programs.
     assert_eq!(index(PAGE * 4), Some(5), "the aperture's mapping");
     assert_eq!(index(PAGE * 8), Some(0), "ordinary memory's");
@@ -705,8 +685,7 @@ fn copy_in_writes_only_anonymous_memory_that_is_present() {
     assert!(!asp.copy_in(va(PAGE * 12), &[9]), "no mapping");
     // SAFETY: frames this test's mappings and objects keep live; nothing else writes them now.
     let byte = |phys: PhysAddr| unsafe { *frame::hhdm::<u8>(phys) };
-    // SAFETY: `asp`'s root is the live page table this test built.
-    let at = |a: u64| byte(unsafe { Paging::translate(asp.root(), va(a)) }.expect("mapped"));
+    let at = |a: u64| byte(asp.translate(va(a)).expect("mapped"));
     assert_eq!([PAGE * 5 - 2, PAGE * 5 - 1, PAGE * 5, PAGE * 5 + 1].map(at), [1, 2, 3, 4]);
     assert_eq!(at(PAGE * 6 - 1), 5, "what came before the page not faulted in");
     assert_eq!((byte(object_frame), byte(file_frame)), (0, 0), "neither the object's page nor the file's");

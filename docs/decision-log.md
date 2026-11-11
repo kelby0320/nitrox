@@ -38074,3 +38074,29 @@ Part J's ninth sub-part, `typed-layers.md` § J.9, built on `pre-phase-7/part-j9
   interrupt binds it; every frame drops in thread context or on the `#PF` path's exception.
 - `unsafe` blocks rise from 558 to 569, and `unsafe fn`s from 189 to 195: each free that was a
   safe call is `unsafe` now, and so is each hand-over a type cannot hold.
+
+
+## 2026-11-11 — Before Phase 7, J.10: typed page tables
+
+Part J's tenth sub-part, `typed-layers.md` § J.10, built on
+`pre-phase-7/part-j10-typed-page-tables`.
+
+- **The page tables are owned** (`mm::page_tables`): `KernelTables`, the boot root, adopted once,
+  edited through `&self` and never freed; `UserTables`, an address space's, in its locked state,
+  edited through `&mut self` and freed as it drops, after the VMAs. A root is a bare address only
+  where a CPU loads it, and in the five diagnostic walks of the active root, both still `unsafe`.
+- **`adopt` links the vmap window's tables and captures the kernel half in one call**, so the
+  template always holds the window, an order `main.rs` kept by hand; `kvmap::init` went.
+- **An owned frame is mapped safely** (`map_owned`, the frame handed back with an error); a frame
+  an object or a file keeps is mapped `unsafe`ly, the caller keeping it until the shootdown; an
+  unmap is safe and gives back the address, the VMA's kind saying whose it was.
+- **A user half refuses an address at or past `USER_MAP_END`, a global mapping, and an owned
+  frame not write-back** (`NotUser`), so the safe calls cannot unmap a kernel stack from every
+  root, map the top user page `sysretq` faults on, outlive the space's time loaded, or alias RAM
+  with a second memory type. A VMA keeps no caching of its own: anonymous and file pages are
+  mapped write-back, and an object's mapping takes its object's.
+- **`map_page` links no kernel-half top-level table** (`Unshared`): every root shares that level,
+  captured at boot, so a mapping under one linked later would be the boot root's alone.
+- `translate` and `attribute_index` are safe on either; `subtree_max_end`, which nothing read, went.
+- `unsafe` blocks fall from 569 to 568 and `unsafe fn`s rise from 195 to 197: the wrappers hold the
+  root the callers passed bare.

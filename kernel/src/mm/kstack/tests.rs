@@ -1,15 +1,7 @@
 use super::*;
-use crate::arch::Paging;
-use crate::arch::paging::ArchPaging;
-use crate::mm::PhysAddr;
 use crate::mm::addr_space::AddressSpace;
 use crate::mm::heap;
 use crate::mm::test_support::init_global_heap;
-
-fn translate(root: PhysAddr, va: VirtAddr) -> Option<PhysAddr> {
-    // SAFETY: a read-only walk of a root this test holds.
-    unsafe { Paging::translate(root, va) }
-}
 
 /// Writable, not executable and the kernel's alone, under every root.
 #[test]
@@ -18,14 +10,13 @@ fn a_stack_is_mapped_under_every_root_above_an_unmapped_guard() {
     let before = AddressSpace::new().unwrap();
     let stack = KernelStack::new().unwrap();
     let after = AddressSpace::new().unwrap();
-    for root in [before.root(), after.root()] {
+    for asp in [&before, &after] {
         for i in 0..KERNEL_STACK_PAGES as u64 {
             let v = VirtAddr::new(stack.base().as_u64() + i * PAGE_SIZE as u64);
-            // SAFETY: a read-only walk of a root this test holds.
-            let ok = unsafe { crate::arch::mapped_with(root, v, PageFlags::WRITABLE | PageFlags::NO_EXECUTE) };
+            let ok = asp.with_tables(|t| t.mapped_with(v, PageFlags::WRITABLE | PageFlags::NO_EXECUTE));
             assert!(ok, "stack page {i}");
         }
-        assert!(translate(root, stack.guard_page()).is_none(), "the guard page");
+        assert!(asp.translate(stack.guard_page()).is_none(), "the guard page");
     }
 }
 
@@ -53,7 +44,7 @@ fn a_stack_outlives_the_address_space_it_was_made_under() {
     let stack = KernelStack::new().unwrap();
     let other = AddressSpace::new().unwrap();
     drop(made_under);
-    assert!(translate(other.root(), stack.base()).is_some());
+    assert!(other.translate(stack.base()).is_some());
     let (shots, freed) = (crate::tlb::shootdowns_by_this_thread().0, heap::frames_freed_by_this_thread());
     drop(stack);
     // Not by its VA, which another test's stack may already have.

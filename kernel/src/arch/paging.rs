@@ -82,6 +82,10 @@ pub enum MapError {
     /// The virtual or physical address was not 4 KiB aligned, or the
     /// virtual address was not canonical.
     Misaligned,
+    /// Refused by `UserTables`: past `USER_MAP_END`, global, or an owned frame not write-back.
+    NotUser,
+    /// A kernel-half address under no top-level table, which every root shares, so only boot links.
+    Unshared,
 }
 
 /// Why [`ArchPaging::unmap_page`] could not remove a mapping.
@@ -92,6 +96,8 @@ pub enum UnmapError {
     NotMapped,
     /// The virtual address was not 4 KiB aligned, or not canonical.
     Misaligned,
+    /// Refused by `UserTables::unmap`: an address at or past `USER_MAP_END`.
+    NotUser,
 }
 
 /// Architecture page-table operations.
@@ -116,6 +122,7 @@ pub trait ArchPaging {
     ///
     /// Installs the entry but does **not** flush the TLB. Returns
     /// [`MapError::AlreadyMapped`] rather than replacing an existing leaf.
+    /// It links no kernel-half top-level table ([`MapError::Unshared`]).
     ///
     /// # Safety
     /// - `root` must be the physical base of a valid top-level page
@@ -158,6 +165,7 @@ pub trait ArchPaging {
     /// table that maps, at minimum, all currently-executing kernel code,
     /// the current stack, and the higher-half direct map. Loading an
     /// incomplete table triple-faults the CPU instantly.
+    /// It stays live while loaded: a CPU loads another before its owner frees it.
     unsafe fn set_page_table(root: PhysAddr);
 
     /// Populate the kernel-half mappings of a freshly-allocated top-level
