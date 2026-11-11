@@ -12,6 +12,7 @@ use crate::io::irp::{IRP_BUF_FRAGS, Irp, IrpBuffer, IrpOp, PhysFrag};
 use crate::libkern::io_op::IoOpcode;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec};
+use crate::mm::frame::Frame;
 use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::object::header::Ref;
 use crate::object::{DeviceNode, MemoryObject, ObjectRef, PendingOperation};
@@ -147,7 +148,7 @@ pub fn dispatch_block_irp(
         return Err(KError::InvalidArgument);
     }
 
-    let frags = build_frags(buffer.frames(), buf_offset, length)?;
+    let frags = build_frags(Frame::addrs(buffer.frames()), buf_offset, length)?;
     // **The device's own limit, checked against the exact fragment count.**
     // Refused rather than truncated or split: `sys_io_submit` bounds the range
     // only against the buffer's size, so a caller holding a block device handle

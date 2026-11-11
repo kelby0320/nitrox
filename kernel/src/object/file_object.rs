@@ -32,8 +32,8 @@ use crate::arch::timer::ArchTimer;
 use crate::dpc::Dpc;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
-use crate::mm::frame::{self, FrameView};
-use crate::mm::{PAGE_SIZE, PhysAddr, heap};
+use crate::mm::frame::{Frame, FrameView};
+use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::object::header::{Header, Ref, Shared, kobject};
 use crate::object::{DeviceNode, PendingOperation, StoredMsg, UserspaceServerReg};
 
@@ -97,7 +97,7 @@ pub enum PageState {
 
 struct CachePage {
     index: usize,
-    frame: PhysAddr,
+    frame: Frame,
     state: PageState,
     /// While a fault's fill is in flight, **its `PendingOperation`**, which a second faulter
     /// blocks on; taken out when the page [settles](FileObject::settle). Never the last reference
@@ -108,9 +108,7 @@ struct CachePage {
 impl CachePage {
     /// The page's frame, for as long as the page is borrowed.
     fn view(&self) -> FrameView<'_> {
-        // SAFETY: the page owns its frame, which is freed only once the page is out of the cache
-        // (a failed fill's) or with the object, neither while the page is borrowed.
-        unsafe { FrameView::new(self.frame) }
+        self.frame.view()
     }
 }
 
@@ -159,11 +157,11 @@ unsafe impl Shared for FileObject {}
 
 struct Inner {
     /// Cached pages. Sparse and unsorted; lookups are a linear scan. Each entry **owns** its
-    /// frame (freed in [`FileObject::drop`]).
+    /// frame, freed as it drops.
     pages: KVec<CachePage>,
     /// Frames a truncation took out of `pages`; a mapping that faulted one in may still point at
     /// it, so they are freed only with the object.
-    retired: KVec<PhysAddr>,
+    retired: KVec<Frame>,
     /// A Model A file's run map; empty for any other producer.
     runs: KVec<BlockRun>,
     /// **The object's own reference to itself, held while it is dirty** — from a writable mapping
@@ -403,8 +401,8 @@ impl FileObject {
         while i < g.pages.len() {
             if g.pages[i].index >= keep {
                 let p = g.pages.remove(i);
-                // `try_reserve` above guarantees this push does not allocate.
-                let _ = g.retired.try_push(p.frame);
+                // Reserved above; a `try_push` that failed would drop a frame still mapped.
+                let Ok(()) = g.retired.push_within_capacity(p.frame) else { unreachable!("reserved above") };
             } else {
                 i += 1;
             }
@@ -502,11 +500,11 @@ impl FileObject {
             if Some(block * bs) != (first * bs).checked_add((n * PAGE_SIZE) as u64) || g.pages.try_reserve(1).is_err() {
                 break;
             }
-            let Some(f) = heap::buddy_alloc(0) else { break };
+            let Some(f) = Frame::alloc() else { break };
+            let _ = frames.try_push(f.phys());
             g.pages
                 .try_push(CachePage { index: index + n, frame: f, state: PageState::Loading, fill: Some(po.clone()) })
                 .expect("slot reserved above");
-            let _ = frames.try_push(f);
             n += 1;
         }
         g.io_in_flight += 1;
@@ -542,7 +540,7 @@ impl FileObject {
             };
             let p = &g.pages[at];
             let block = device_block_in(&g.runs, (index * PAGE_SIZE) as u64 / bs);
-            (p.state == PageState::Ready && block != 0).then_some((at, p.frame, block))
+            (p.state == PageState::Ready && block != 0).then_some((at, p.frame.phys(), block))
         };
         let Some((mut at, frame, first)) = target(&g, start, 0) else {
             return WriteStep::Skip;
@@ -629,7 +627,7 @@ impl FileObject {
     /// Look up page `index`: its frame + [`PageState`] if cached, else `None`.
     pub fn lookup(&self, index: usize) -> Option<(PhysAddr, PageState)> {
         let g = self.inner.lock();
-        g.pages.iter().find(|p| p.index == index).map(|p| (p.frame, p.state))
+        g.pages.iter().find(|p| p.index == index).map(|p| (p.frame.phys(), p.state))
     }
 
     /// Reserve page `index` for the fault path: [`Reserve::Ready`] on a hit, [`Reserve::Loading`]
@@ -640,8 +638,8 @@ impl FileObject {
         let mut g = self.inner.lock();
         if let Some(p) = g.pages.iter().find(|p| p.index == index) {
             return match p.state {
-                PageState::Ready => Reserve::Ready(p.frame),
-                PageState::Loading => Reserve::Loading(p.frame),
+                PageState::Ready => Reserve::Ready(p.frame.phys()),
+                PageState::Loading => Reserve::Loading(p.frame.phys()),
             };
         }
         // Reserve the slot before allocating the frame, so a `try_push` cannot fail and leak it.
@@ -649,13 +647,14 @@ impl FileObject {
             return Reserve::Oom;
         }
         // Zeroed: a partial tail page's padding reads as zero.
-        let Some(frame) = frame::alloc_zeroed(0) else {
+        let Some(frame) = Frame::alloc_zeroed() else {
             return Reserve::Oom;
         };
+        let new = Reserve::New(frame.phys());
         g.pages
             .try_push(CachePage { index, frame, state: PageState::Loading, fill: None })
             .expect("slot reserved above");
-        Reserve::New(frame)
+        new
     }
 
     /// The fault path's [`reserve`](Self::reserve): a miss also makes the fill's `PendingOperation`
@@ -665,7 +664,7 @@ impl FileObject {
         let mut g = self.inner.lock();
         if let Some(p) = g.pages.iter().find(|p| p.index == index) {
             return match (p.state, &p.fill) {
-                (PageState::Ready, _) => Fault::Hit(p.frame),
+                (PageState::Ready, _) => Fault::Hit(p.frame.phys()),
                 (PageState::Loading, Some(po)) => Fault::Wait(po.clone()),
                 (PageState::Loading, None) => Fault::Busy,
             };
@@ -677,15 +676,16 @@ impl FileObject {
             Ok(p) => Ref::new(p),
             Err(_) => return Fault::Oom,
         };
-        let Some(frame) = frame::alloc_zeroed(0) else {
+        let Some(frame) = Frame::alloc_zeroed() else {
             drop(g); // the PO's only reference drops outside the lock
             drop(po);
             return Fault::Oom;
         };
+        let phys = frame.phys();
         g.pages
             .try_push(CachePage { index, frame, state: PageState::Loading, fill: Some(po.clone()) })
             .expect("slot reserved above");
-        Fault::Fill(frame, po)
+        Fault::Fill(phys, po)
     }
 
     /// **Settle page `index`'s fill `po`** once it has completed: `Ready` if it succeeded,
@@ -704,11 +704,7 @@ impl FileObject {
                     g.pages[i].state = PageState::Ready;
                     g.pages[i].fill.take()
                 }
-                Some(i) => {
-                    let p = g.pages.remove(i);
-                    heap::buddy_free(p.frame, 0);
-                    p.fill
-                }
+                Some(i) => g.pages.remove(i).fill,
             }
         };
         drop(taken);
@@ -742,7 +738,7 @@ impl FileObject {
         let p = g.pages.iter().find(|p| p.index == index && p.state == PageState::Ready)?;
         // SAFETY: a ready page has no fill (`mark_ready`), so no `settle` frees it; a truncation
         // retires it, and only `self`'s drop frees it.
-        Some(unsafe { FrameView::new(p.frame) })
+        Some(unsafe { FrameView::new(p.frame.phys()) })
     }
 
     /// **Fault page `index` in**, blocking until it is resident: a hit returns at once; a miss
@@ -1176,20 +1172,6 @@ fn stub_fill_dpc(ctx: *mut ()) {
     bx.file_obj.fill_page(bx.index, &bx.po, |page| page.fill(0, PAGE_SIZE, bx.fill_byte));
     bx.file_obj.settle(bx.index, &bx.po, true);
     crate::sched::complete_pending_op(&bx.po, 0, 0);
-}
-
-impl Drop for FileObject {
-    /// Free every cached frame (raw `PhysAddr`s). `self_pin` is `None`: a pinned object has a
-    /// reference, so is not dropping.
-    fn drop(&mut self) {
-        let g = self.inner.lock();
-        for p in g.pages.iter() {
-            heap::buddy_free(p.frame, 0);
-        }
-        for f in g.retired.iter() {
-            heap::buddy_free(*f, 0);
-        }
-    }
 }
 
 /// The device block holding file block `file_block` in `runs`; `0` for a hole or past the map.

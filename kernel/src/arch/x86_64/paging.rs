@@ -15,12 +15,13 @@ use crate::arch::paging::{ArchPaging, MapError, PageFlags, UnmapError};
 use crate::arch::x86_64::regs;
 use crate::libkern::SpinLock;
 use crate::libkern::lockrank::LockRank;
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
+use crate::mm::frame::Frame;
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const PAGE_TABLE_ENTRIES: usize = 512;
 
-// One page table is exactly one page frame, which the HHDM walk and `alloc_page_table` rely on.
+// One page table is exactly one page frame, which the HHDM walk and `new_table` rely on.
 const _: () = assert!(size_of::<[Pte; PAGE_TABLE_ENTRIES]>() == PAGE_SIZE);
 const _: () = assert!(size_of::<[AtomicU64; PAGE_TABLE_ENTRIES]>() == PAGE_SIZE);
 
@@ -271,15 +272,14 @@ unsafe fn walk(root: PhysAddr, virt: VirtAddr) -> Option<(Pte, u8)> {
     }
 }
 
-/// Allocate one zeroed, page-aligned 4 KiB frame to use as a page table, or `None` if the
-/// physical frame allocator is exhausted.
-fn alloc_page_table() -> Option<PhysAddr> {
+/// A zeroed frame to use as a page table, or `None` if the frame allocator is exhausted.
+fn new_table() -> Option<Frame> {
     #[cfg(test)]
     if TABLES_LEFT.with(|left| left.replace(left.get().map(|n| n.saturating_sub(1))) == Some(0)) {
         return None;
     }
     // Zeroed, every entry reads as not present before the frame is linked into a tree.
-    crate::mm::frame::alloc_zeroed(0)
+    Frame::alloc_zeroed()
 }
 
 /// The child table slot `index` of `table` names, linking a fresh one if it is empty.
@@ -292,29 +292,22 @@ fn ensure_table(table: TableRef<'_>, index: usize) -> Result<TableRef<'_>, MapEr
     loop {
         let empty = match table.slot(index) {
             Slot::Empty(e) => e,
-            found => {
-                if let Some(unused) = child {
-                    heap::buddy_free(unused, 0);
-                }
-                return match found {
-                    Slot::Table(t) => Ok(t),
-                    _ => Err(MapError::AlreadyMapped),
-                };
-            }
+            Slot::Table(t) => return Ok(t),
+            Slot::Leaf(_) => return Err(MapError::AlreadyMapped),
         };
-        let new = match child {
+        let new = match child.take() {
             Some(c) => c,
-            None => alloc_page_table().ok_or(MapError::OutOfMemory)?,
+            None => new_table().ok_or(MapError::OutOfMemory)?,
         };
-        child = Some(new);
         #[cfg(test)]
         if let Some(other_cpu) = BEFORE_LINK.take() {
             other_cpu(&table.entries[index]);
         }
-        if table.link(index, empty, Pte::new_table(new)) {
+        if table.link(index, empty, Pte::new_table(new.phys())) {
             // SAFETY: a fresh zeroed table, which holds no entries, now linked one level down.
-            return Ok(unsafe { TableRef::at(new, table.level - 1) });
+            return Ok(unsafe { TableRef::at(new.into_pte(), table.level - 1) });
         }
+        child = Some(new);
     }
 }
 
@@ -517,7 +510,13 @@ impl ArchPaging for X86Paging {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mm::heap;
     use crate::mm::test_support::init_global_heap;
+
+    /// A zeroed frame, the test's to leak or take back: a table, or a page to map.
+    fn alloc_page_table() -> Option<PhysAddr> {
+        new_table().map(Frame::into_pte)
+    }
 
     std::thread_local! {
         static OTHER_CPUS_TABLE: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
@@ -543,8 +542,8 @@ mod tests {
         assert_eq!(parent_table.entry(7).phys(), first, "the first table was unlinked");
         assert_eq!(got.entries.as_ptr(), table_ptr(first).cast(), "the first table is the one taken");
         assert_eq!(heap::frames_freed_by_this_thread() - freed, 1, "the second table goes back");
-        heap::buddy_free(first, 0);
-        heap::buddy_free(parent, 0);
+        // SAFETY: the tables this test made, which nothing walks from here.
+        drop(unsafe { (Frame::from_pte(first), Frame::from_pte(parent)) });
     }
 
     #[test]
@@ -865,9 +864,8 @@ mod tests {
             let target = PhysAddr::new(0x10_0000);
             assert_eq!(X86Paging::map_page(root, inside, target, PageFlags::WRITABLE), Err(MapError::AlreadyMapped));
         }
-        for t in [pd, pdpt, root] {
-            heap::buddy_free(t, 0);
-        }
+        // SAFETY: the tables this test made, which nothing walks from here.
+        drop(unsafe { [pd, pdpt, root].map(|t| Frame::from_pte(t)) });
     }
 
     /// **A walk beside a mapper in one tree reads each slot atomically**: a race Miri reports.

@@ -504,6 +504,48 @@ index, through a countdown in `Frame`'s allocation, which every owner's frames p
 needs a new table, so a three-page VMA inside one table fails at its second and third pages as
 well; and the survey's probe, a live frame freed and read, reported by J.8's Miri route. Author.
 
+**Built 2026-11-11** (`9b98803f`).
+- **`Frame` and `FrameBlock`** (`mm::frame`), each freed as it drops, at its order, and neither
+  `Copy`. The buddy's frees, `heap::buddy_free`, `BuddyAllocator::free` and `BuddyPager::free`,
+  are `unsafe`, the first `mm`'s alone; the slab's large free keeps its call, and is `unsafe` too.
+- **Every owner holds its frames typed**: a `MemoryObject` is `Owned(KVec<Frame>)` or
+  `Borrowed { base, npages }`; a cache page and a retired frame are `Frame`s; `VmapFrames` holds
+  `[Frame; N]`, freed as its fields drop after its shootdown; a `DmaBuffer` a `FrameBlock`; an
+  `AddressSpace` its root. The three rollbacks by hand went, with `MemoryObject`'s, `FileObject`'s
+  and `DmaBuffer`'s `Drop`.
+- **A mapped frame is its PTE's**: `into_pte` hands it over, and an unmap takes an anonymous
+  page's back by the `unsafe` `from_pte`, at the three sites drawn here for J.10: with the frees
+  `unsafe`, they could not wait. J.10 moves them into `UserTables`.
+- **Addresses the cache lends stay `PhysAddr`s**, and `Frame::addrs` lends an object's list to
+  `build_frags`. `lock-ordering.md` binds a frame's drop by the rule against freeing under `SCHED`
+  or in an interrupt.
+
+Counts: `unsafe` blocks rise from 558 to 567, and `unsafe fn`s from 189 to 195, the frees' danger
+made visible: the four frees, the slab's large free and `from_pte` are `unsafe fn`s; the calls
+through them, the two drops that free, `from_pte`'s three sites, the cast that lends addresses and
+`Frame::view` are blocks, less the two views an object and a cache page had formed by hand.
+
+**The controls**: each owner's frees counted, an order-2 block's four. A countdown in the frame
+allocation, `fail_frames_after`, which every owner's frames pass, fails each rollback at every
+take: a three-page map in a fresh space at each of its six, an object and a vmap range at each
+frame. Eleven mutations, each freeing nothing, at the wrong order or before a shootdown, fail the
+test that names them. Safe code freeing, copying or taking back a frame, or keeping a view past it,
+does not compile. The survey's probe, a frame freed while its owner still reads it, now needs an
+`unsafe` `from_pte`; it passes natively and Miri reports it. Under Miri, both models, the tests of
+`mm`, the memory object, the cache's frees, the paging race, the block layer and the RAM disk pass.
+
+**After review** (`ac2ed261`):
+- **An address space's root and a `VmapFrames`' frames are handed over by `into_pte`**, as a mapped
+  frame is, and taken back by `from_pte` as their owner drops: held as `Frame`s, a safe `view`
+  reached a live page table and a kernel stack. Viewing either no longer compiles; blocks: 569.
+- **`BuddyPager` and `HeapBuddy` are `mm`'s alone**: a free by hand from `object/` compiled.
+- **`fault_in`'s refusal is driven at each of its four takes, and a read ahead's frames are counted
+  taken and freed** (`frames_taken_by_this_thread`): a leak at either passed every test.
+- A retired frame, and a reference the file cache lists, are pushed only into the room reserved
+  for them, never dropped by a failed push: a reserve drifting from its loop fails tests now.
+- `lock-ordering.md` and `memory-management.md` lose the `Drop`s J.9 removed, and the former lists
+  every frame the `#PF` path drops.
+
 ### J.10 Typed page tables (kmem-o6, kplat-o1's rest, kmem-o10, kmem-o7's first step)
 
 **Most of kplat-o1 is Part I's**: slots read and written atomically through a `TableRef`, one walk,

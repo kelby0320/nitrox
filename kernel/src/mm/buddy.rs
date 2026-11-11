@@ -170,7 +170,10 @@ impl BuddyAllocator {
     }
 
     /// Return a block; `order` must match the one passed to `alloc`.
-    pub fn free(&mut self, addr: PhysAddr, order: usize) {
+    ///
+    /// # Safety
+    /// Given back once, the block is reached by nothing after: it becomes a free-list link.
+    pub unsafe fn free(&mut self, addr: PhysAddr, order: usize) {
         debug_assert!(order <= MAX_ORDER, "buddy: free order {order} > MAX_ORDER");
         debug_assert!(addr.is_page_aligned(), "buddy: free of unaligned address {:#x}", addr.as_u64());
         let frame = addr.frame();
@@ -424,7 +427,8 @@ mod tests {
     fn free_then_realloc_returns_same_block() {
         let (_mem, mut a) = make_alloc(PAGE_SIZE * 64);
         let p = a.alloc(0).expect("alloc 0");
-        a.free(p, 0);
+        // SAFETY: the block just taken, given back once.
+        unsafe { a.free(p, 0) };
         let q = a.alloc(0).expect("alloc 0 after free");
         assert_eq!(p, q, "LIFO free list should return the just-freed block");
     }
@@ -435,8 +439,10 @@ mod tests {
         let block = a.alloc(1).expect("alloc order 1");
         assert_eq!(block.frame() & 1, 0, "order-1 block must be order-1-aligned");
         let hi = PhysAddr(block.as_u64() + PAGE_SIZE as u64);
-        a.free(block, 0);
-        a.free(hi, 0);
+        // SAFETY: the two halves of the block just taken, each given back once.
+        unsafe { a.free(block, 0) };
+        // SAFETY: as above.
+        unsafe { a.free(hi, 0) };
         let merged = a.alloc(1).expect("coalesced order-1 alloc");
         assert_eq!(merged, block, "coalesced block should start at the lower buddy");
     }

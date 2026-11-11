@@ -1,5 +1,7 @@
 use super::*;
 use crate::arch::abi::USER_VIRT_END;
+use crate::mm::frame::fail_frames_after;
+use crate::mm::{frame, heap};
 
 #[test]
 fn the_mapping_window_stops_below_the_guard_gap() {
@@ -61,6 +63,9 @@ fn new_yields_empty_address_space_with_real_root() {
     let root = asp.root();
     assert!(root.is_page_aligned());
     assert_ne!(root.as_u64(), 0);
+    let freed = heap::frames_freed_by_this_thread();
+    drop(asp);
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 1, "its root, once");
 }
 
 #[test]
@@ -215,7 +220,7 @@ fn map_object_points_ptes_at_object_frames() {
     init_global_heap();
     let asp = AddressSpace::new().unwrap();
     let m = MemoryObject::try_new(PAGE as usize * 3).unwrap();
-    let frames = [m.frames()[0], m.frames()[1], m.frames()[2]];
+    let frames = [m.frames()[0].phys(), m.frames()[1].phys(), m.frames()[2].phys()];
     let obj = into_obj(m);
 
     asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_object must succeed");
@@ -233,7 +238,7 @@ fn map_object_twice_aliases_same_frame() {
     init_global_heap();
     let asp = AddressSpace::new().unwrap();
     let m = MemoryObject::try_new(PAGE as usize).unwrap();
-    let frame0 = m.frames()[0];
+    let frame0 = m.frames()[0].phys();
     let obj = into_obj(m);
     let obj2 = obj.clone(); // second mapping needs its own reference
 
@@ -602,6 +607,39 @@ fn a_page_is_writable_executable_and_user_only_as_its_protection_says() {
     assert!(!f(Protection::WRITE).contains(PageFlags::USER), "a kernel mapping");
 }
 
+/// **A map a frame short frees the pages it took**: a first page, its three tables, then two more.
+#[test]
+fn a_map_a_frame_short_at_any_take_frees_the_pages_it_took() {
+    init_global_heap();
+    for (short, pages) in [(0, 0), (1, 1), (2, 1), (3, 1), (4, 1), (5, 2)] {
+        let mut asp = AddressSpace::new().unwrap();
+        fail_frames_after(Some(short));
+        let freed = heap::frames_freed_by_this_thread();
+        let made = asp.map_vma(anon_box(range(PAGE * 16, PAGE * 19), uprot()));
+        fail_frames_after(None);
+        assert_eq!(made.err().map(|(_, e)| e), Some(MapError::OutOfMemory), "short at {short}");
+        assert_eq!(heap::frames_freed_by_this_thread() - freed, pages, "short at {short}");
+        assert!((16..19).all(|p| !is_mapped(&asp, va(PAGE * p))), "short at {short}: rolled back");
+    }
+}
+
+/// **A fault a frame short frees the frame it took**: its page, then its three tables.
+#[test]
+fn a_fault_a_frame_short_at_any_take_frees_the_frame_it_took() {
+    init_global_heap();
+    for (short, pages) in [(0, 0), (1, 1), (2, 1), (3, 1)] {
+        let asp = AddressSpace::new().unwrap();
+        asp.map_vma_lazy(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
+        fail_frames_after(Some(short));
+        let freed = heap::frames_freed_by_this_thread();
+        let fault = asp.fault_in(va(PAGE * 17), FaultAccess::Write);
+        fail_frames_after(None);
+        assert_eq!(fault, FaultIn::Oom, "short at {short}");
+        assert_eq!(heap::frames_freed_by_this_thread() - freed, pages, "short at {short}");
+        assert!(!is_mapped(&asp, va(PAGE * 17)), "short at {short}");
+    }
+}
+
 /// **A failed object map is shot down before its object comes back**: the caller may drop the
 /// object, and with it the frames another CPU may have cached through the pages mapped.
 #[test]
@@ -651,7 +689,7 @@ fn copy_in_writes_only_anonymous_memory_that_is_present() {
     asp.map_vma(anon_box(range(PAGE * 4, PAGE * 6), uprot())).unwrap();
     asp.map_vma_lazy(anon_box(range(PAGE * 6, PAGE * 7), uprot())).unwrap();
     let m = MemoryObject::try_new(PAGE as usize).unwrap();
-    let object_frame = m.frames()[0];
+    let object_frame = m.frames()[0].phys();
     asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(m)).unwrap();
     let f = FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap();
     let Reserve::New(file_frame) = f.reserve(0) else { panic!("a fresh page") };

@@ -1412,7 +1412,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   KObjectType::Timer)` with no `unsafe` and printed "adopted as Timer". The drop was not run.
   Lens: opportunities. Medium. **Fix**, as kobj-d8.
   Fixed in `9a28d4b0`, as kobj-d8.
-- [ ] **kmem-d11** `kernel/src/mm/heap.rs:45` — `heap::buddy_free`, `BuddyAllocator::free`
+- [x] **kmem-d11** `kernel/src/mm/heap.rs:45` — `heap::buddy_free`, `BuddyAllocator::free`
   (buddy.rs:182) and `BuddyPager::free` are safe fns that write the free-list link through the
   HHDM and hand the frame out again. Frame ownership is held by convention at 18 hand-written
   free sites. A double free, or a free while a mapping or DMA still uses the frame (the shape of
@@ -1420,6 +1420,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: a buddy host probe on a local allocator freed a live frame with the safe call.
   The owner's first word read 0x0 and the next `alloc` returned the same frame. Lens:
   opportunities. Medium. **Plan**, in P2.
+  Fixed in `9b98803f`, as kmem-o2: the frees are `unsafe` and `mm`'s, and every owner's frames
+  a `Frame` or `FrameBlock`, freed as it drops. The probe needs an `unsafe` `Frame::from_pte`, and
+  Miri reports it.
 - [ ] **kmem-d12** `kernel/src/mm/addr_space.rs:458` — `map_file_page` re-checks only that some
   FileBacked VMA of the same object covers `addr`, not that `addr` still maps to the page index
   `file_backing` computed in an earlier hold of the AS lock. Thread A faults at 6P in F mapped at
@@ -1539,7 +1542,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `File(Ref<FileObject>)`, and the three assertions went with it. `Process` is `Send + Sync` by
   `VmaTree: Send`, argued there: the tree owns every node its links reach.
   **Plan**, as kobj-o1, in P1.
-- [ ] **kmem-o2** encapsulate: physical frames are bare `Copy` `PhysAddr` values from
+- [x] **kmem-o2** encapsulate: physical frames are bare `Copy` `PhysAddr` values from
   `heap::buddy_alloc` and returned by hand with the safe `buddy_free(addr, order)`; the buddy
   only `debug_assert`s a free, and 8 alloc sites carry their own unsafe zeroing block — 28 to 32
   sites (18 or 19 production `buddy_free(` plus 10 to 13 `buddy_alloc(`; counted with `grep -rn
@@ -1559,6 +1562,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   also lets host tests carry provenance so Miri can check frame accesses. Depends on: nothing;
   pairs with kmem-o6. Lenses: ownership, soundness, opportunities. Value high, effort medium
   (one lens said large). **Plan**, in P2.
+  Done in `9b98803f`: `Frame` and `FrameBlock` in `mm::frame`, `into_pte` and `unsafe from_pte`; a
+  `MemoryObject` `Owned(KVec<Frame>)` or `Borrowed { base, npages }`; cache pages, retired frames
+  and a `DmaBuffer`'s typed. An address space's root and `VmapFrames`' (the kernel stack's) are
+  handed over by `into_pte` (`ac2ed261`).
 - [x] **kmem-o3** encapsulate: kernel-half (vmap) mappings are made through
   `Paging::map_page`/`unmap_page` with a caller-chosen root (`active_root()`, a process root, or
   the root stored in `KernelStack`) and a local-only TLB flush, although the tables are shared by
@@ -2874,7 +2881,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Done in `30e79517`, `2ddb0898` and `60874ea9`, for its adoptions and downcasts: the current
   process and a user thread's are `Ref<Process>`. The `unsafe fn f(obj: *mut ())` it also counts
   are kobj-o3's and kobj-o7's, in J.5 and J.6.
-- [ ] **kplat-o6** encapsulate: physical frames written through `(phys + hhdm_offset()) as *mut
+- [x] **kplat-o6** encapsulate: physical frames written through `(phys + hhdm_offset()) as *mut
   u8` from a bare `PhysAddr`, ownership asserted only in a SAFETY comment — 44 sites (`grep -rn
   'hhdm_offset()' kernel/src` less comments, the definition and tests.rs; 19 of them write, by
   `... | grep "mut u8\|write_bytes"`; 10 in this subsystem), such as `kernel/src/klog.rs:252`,
@@ -2886,7 +2893,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Home: kernel/src/mm. Closes: safe code writing a frame it does not own (kplat-d15). Depends
   on: nothing. ownership, opportunities. Value medium, effort medium. **Plan**, in P2.
   Partly done in `123999c8`: a frame's bytes are reached through views, borrowed memory at
-  `frame::hhdm`; the owned `Frame` is J.9's.
+  `frame::hhdm`; the owned `Frame` is J.9's. Done in `9b98803f`: an owned `Frame`, its bytes lent by
+  `Frame::view`.
 - [x] **kplat-o7** encapsulate: handle installation by `global::get().allocate(owner, raw_ptr,
   ty, rights)` after `ObjectRef::into_raw`, with a manual `drop(ObjectRef::from_raw(p, t))` on
   the error arm — 27 sites (`grep -rn "global::get().allocate(" kernel/src --include=*.rs |

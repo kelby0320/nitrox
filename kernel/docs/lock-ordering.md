@@ -40,7 +40,7 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
 | 4    | Kernel-object internal locks (`AddressSpace`, `Namespace`, the `FileObject` page cache)| live as of Phase 1 slice 5 (item 3); `Namespace` binding store added Phase 2 slice 1; the page cache with slice 8. Never nested in either order; also taken from the `#PF` handler — see § The AddressSpace lock and the page-fault handler |
 | 5    | IPC channel                                  | reserved (Phase 1 folds endpoint state into rank 1 — see § Wait queues) |
-| 5 (`Registry`) | Registries that **allocate while held**: the device registry (`DEVICES`) and its driver outcomes (`OUTCOMES`, never held with it), the GPT partition table (`PARTITIONS`), and each userspace server's **file cache** (`UserspaceServerReg::files`) | `DEVICES` and `PARTITIONS` live as of Phase 2 — ranked here rather than as leaves because they push into a `KVec` while held, so they must sit above the allocators. The file cache as of administration Part C.1: a `FileObject`'s closing takes it, and releases it, before its `Drop` takes the page-cache lock, never inside it, and no object reference is ever dropped under it, since the last one would re-enter it |
+| 5 (`Registry`) | Registries that **allocate while held**: the device registry (`DEVICES`) and its driver outcomes (`OUTCOMES`, never held with it), the GPT partition table (`PARTITIONS`), and each userspace server's **file cache** (`UserspaceServerReg::files`) | `DEVICES` and `PARTITIONS` live as of Phase 2 — ranked here rather than as leaves because they push into a `KVec` while held, so they must sit above the allocators. The file cache as of administration Part C.1: a `FileObject`'s closing takes it, and releases it, before the object drops, never inside it, and no object reference is ever dropped under it, since the last one would re-enter it |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
@@ -401,14 +401,30 @@ calling `inherit_kernel_mappings` while holding any lock at rank
 
 ## Paging allocates page-table frames from the buddy
 
-`ArchPaging::map_page` (`kernel/src/arch/x86_64/paging.rs`) calls
-`buddy_alloc` to obtain frames for intermediate page tables. The paging
+`ArchPaging::map_page` (`kernel/src/arch/x86_64/paging.rs`) takes a
+`Frame` from the buddy for each intermediate page table, and drops one that
+loses the race to link its slot. The paging
 layer holds no lock of its own — the page-table root is passed in by the
 caller — so it introduces no new rank and no new nesting. It does
 acquire rank 6b transitively: `map_page` must not be called while
 holding the rank-7 `SERIAL` lock. The future VMM will call `map_page`
 while holding the rank-4 VMA-tree lock, which is correctly ordered (rank
 4 is above rank 6b).
+
+## A frame's drop takes the buddy
+
+A `Frame` or `FrameBlock` (`kernel/src/mm/frame.rs`) frees itself as it drops,
+taking `BUDDY` (rank 6b), so the rule against allocating under `SCHED` or in an
+interrupt binds a frame's drop as it binds a call. Every frame drops in thread
+context: an object's or a cache's with its owner, an unmap's after its
+shootdown, a failed fill's as `settle` takes its page out of the cache, a page
+table that lost its race, and a fault's frame another CPU's map beat or a map
+short of tables refused, under the caller's locks, all ranked above 6b. The
+`#PF` path drops the last four on its documented exception (§ The AddressSpace
+lock and the page-fault handler): a fault's and a table's under the
+`AddressSpace` lock, and a failed fill's under the `FileObject` lock, as
+`FileObject::fault_in_page` settles it. It drops a whole cache's too, holding
+nothing, when an unmap meanwhile left its fault the file's last reference.
 
 ## The serial lock is a leaf
 

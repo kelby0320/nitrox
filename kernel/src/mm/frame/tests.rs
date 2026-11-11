@@ -4,10 +4,11 @@ use super::*;
 use crate::mm::test_support::init_global_heap;
 
 /// A fresh frame and a view of it, which the test frees.
-fn frame() -> (PhysAddr, FrameView<'static>) {
-    let f = alloc_zeroed(0).expect("a frame");
+fn frame() -> (Frame, FrameView<'static>) {
+    let f = Frame::alloc_zeroed().expect("a frame");
     // SAFETY: a frame just allocated for this test, which frees it only once done with the view.
-    (f, unsafe { FrameView::new(f) })
+    let view = unsafe { FrameView::new(f.phys()) };
+    (f, view)
 }
 
 fn stops(f: impl FnOnce()) -> bool {
@@ -45,7 +46,7 @@ fn an_access_reaches_the_last_byte_and_stops_one_past_it() {
     let mut back = std::vec![0u8; PAGE_SIZE];
     page.read(0, &mut back);
     assert!(back == expected, "a refused access wrote nothing");
-    heap::buddy_free(f, 0);
+    drop(f);
 }
 
 /// **Writers to two bytes of one word lose neither's**: a write of part of a word merges.
@@ -55,15 +56,14 @@ fn writers_to_two_bytes_of_one_word_lose_neither() {
     let (f, page) = frame();
     for round in 0..if cfg!(miri) { 4 } else { 64 } {
         std::thread::scope(|s| {
-            // SAFETY: the frame this test allocated and frees after the scope.
-            s.spawn(move || unsafe { FrameView::new(f) }.write(1, &[round]));
+            s.spawn(|| f.view().write(1, &[round]));
             page.write(2, &[!round]);
         });
         let mut w = [0u8; 8];
         page.read(0, &mut w);
         assert_eq!((w[1], w[2]), (round, !round), "round {round}");
     }
-    heap::buddy_free(f, 0);
+    drop(f);
 }
 
 /// **A run from an odd offset across words reads back whole, and in pieces at other alignments.**
@@ -86,7 +86,7 @@ fn a_run_across_words_reads_back_at_any_alignment() {
     page.fill(5, 17, 0xEE);
     page.read(0, &mut back);
     assert!(back[5..22].iter().all(|&b| b == 0xEE) && back[..5] == [0, 0, 0, 1, 2] && back[22] == 20);
-    heap::buddy_free(f, 0);
+    drop(f);
 }
 
 /// **A copy between frames moves its bytes, aligned alike or not.**
@@ -106,8 +106,7 @@ fn a_copy_between_frames_moves_its_bytes_at_any_alignment() {
         b.read(to + 100, &mut got[100..]);
         assert_eq!(got[100..], [0, 0], "{from} to {to}: nothing past the run");
     }
-    heap::buddy_free(fa, 0);
-    heap::buddy_free(fb, 0);
+    drop((fa, fb));
 }
 
 /// **A block freed dirty comes back zeroed**, at every order the test reaches.
@@ -116,13 +115,37 @@ fn a_block_freed_dirty_comes_back_zeroed() {
     init_global_heap();
     for order in [0, 2] {
         for _ in 0..4 {
-            let f = alloc_zeroed(order).expect("a block");
+            let f = FrameBlock::alloc_zeroed(order).expect("a block");
             let bytes = PAGE_SIZE << order;
             // SAFETY: the block this test just allocated, `bytes` long, which it alone reaches.
-            let block = unsafe { core::slice::from_raw_parts_mut(hhdm::<u8>(f), bytes) };
+            let block = unsafe { core::slice::from_raw_parts_mut(hhdm::<u8>(f.phys()), bytes) };
             assert!(block.iter().all(|&b| b == 0), "order {order}: zeroed");
             block.fill(0xA5);
-            heap::buddy_free(f, order);
         }
     }
+}
+
+/// **Each owner frees its frames once, at their order**: a page table's, once taken back.
+#[test]
+fn each_owner_frees_its_frames_once_at_their_order() {
+    init_global_heap();
+    let freed = heap::frames_freed_by_this_thread();
+    drop(Frame::alloc().expect("a frame"));
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 1);
+    drop(FrameBlock::alloc_zeroed(2).expect("a block"));
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 5, "an order-2 block frees four");
+    let mapped = Frame::alloc_zeroed().expect("a frame").into_pte();
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 5, "a page table's frame stays");
+    // SAFETY: the frame handed over just above, which nothing maps.
+    drop(unsafe { Frame::from_pte(mapped) });
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 6);
+}
+
+/// **A list of frames lends their addresses in order.**
+#[test]
+fn a_list_of_frames_lends_their_addresses() {
+    init_global_heap();
+    let frames: std::vec::Vec<Frame> = (0..3).map(|_| Frame::alloc().expect("a frame")).collect();
+    let addrs: std::vec::Vec<PhysAddr> = frames.iter().map(Frame::phys).collect();
+    assert_eq!(Frame::addrs(&frames), &addrs[..]);
 }

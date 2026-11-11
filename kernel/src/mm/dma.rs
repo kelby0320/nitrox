@@ -21,13 +21,13 @@ use core::ptr::NonNull;
 
 use crate::libkern::AllocError;
 use crate::mm::buddy::MAX_ORDER;
-use crate::mm::{PAGE_SIZE, PhysAddr, heap};
+use crate::mm::frame::FrameBlock;
+use crate::mm::{PAGE_SIZE, PhysAddr};
 
 /// An owned, physically contiguous, zeroed block of DMA-able memory; freed to the buddy on drop.
 pub struct DmaBuffer {
     virt: NonNull<u8>,
-    phys: PhysAddr,
-    order: usize,
+    block: FrameBlock,
 }
 
 // SAFETY: a `DmaBuffer` owns its physical frames outright; the `virt` pointer
@@ -42,20 +42,18 @@ impl DmaBuffer {
     /// power-of-two number of pages. [`AllocError`] if `size` exceeds the largest buddy block
     /// (`2^MAX_ORDER × PAGE_SIZE`) or physical memory is exhausted.
     pub fn alloc(size: usize) -> Result<Self, AllocError> {
-        let order = order_for(size).ok_or(AllocError)?;
-        let phys = crate::mm::frame::alloc_zeroed(order).ok_or(AllocError)?;
-        let virt = crate::mm::frame::hhdm::<u8>(phys);
+        let block = FrameBlock::alloc_zeroed(order_for(size).ok_or(AllocError)?).ok_or(AllocError)?;
+        let virt = crate::mm::frame::hhdm::<u8>(block.phys());
         Ok(Self {
             // SAFETY: a live HHDM mapping of a real frame is never null.
             virt: unsafe { NonNull::new_unchecked(virt) },
-            phys,
-            order,
+            block,
         })
     }
 
     /// The physical base address: what a device DMAs to.
     pub fn phys(&self) -> PhysAddr {
-        self.phys
+        self.block.phys()
     }
 
     /// The CPU-side virtual base (HHDM).
@@ -66,7 +64,7 @@ impl DmaBuffer {
     /// The buffer length in bytes (`2^order × PAGE_SIZE`).
     #[allow(clippy::len_without_is_empty, reason = "never empty: at least a page")]
     pub fn len(&self) -> usize {
-        PAGE_SIZE << self.order
+        PAGE_SIZE << self.block.order()
     }
 
     /// The buffer as a byte slice.
@@ -80,13 +78,6 @@ impl DmaBuffer {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as `as_slice`; `&mut self` proves exclusive access.
         unsafe { core::slice::from_raw_parts_mut(self.virt.as_ptr(), self.len()) }
-    }
-}
-
-impl Drop for DmaBuffer {
-    /// Return the block to the buddy allocator. The bytes are raw, so the free is the only cleanup.
-    fn drop(&mut self) {
-        heap::buddy_free(self.phys, self.order);
     }
 }
 
@@ -154,6 +145,7 @@ fn order_for(size: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mm::heap;
     use crate::mm::test_support::init_global_heap;
 
     /// **A buffer a device was given is freed only with the proof it stopped**: dropped, or cleared

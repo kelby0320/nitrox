@@ -303,6 +303,29 @@ fn read_ahead_in_one_kib_blocks_and_never_for_a_forgotten_file() {
     assert_eq!(g.resident_pages(), 1, "nothing reserved ahead");
 }
 
+/// **Every frame a read ahead takes comes back**: a failed fill's as it settles, the rest with the
+/// file.
+#[test]
+fn every_frame_a_read_ahead_takes_comes_back() {
+    use crate::mm::frame::frames_taken_by_this_thread as taken;
+    init_global_heap();
+    let reg = registration();
+    let (f, _) = mapped_file(&reg, 7, 16, 4096, &[(0, 1000, 16)], 0..0);
+    let (took, freed) = (taken(), heap::frames_freed_by_this_thread());
+    for ok in [false, true] {
+        let (frame, po) = miss(&f, 0);
+        assert_eq!(f.begin_fill(0, frame, 4096, 7, &po, &mut KVec::new()), ReadStep::Go(1000, 8));
+        f.end_io();
+        for k in 0..8 {
+            f.settle(k, &po, ok);
+        }
+    }
+    assert_eq!(taken() - took, 16, "the faulted page and seven ahead, twice");
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 8, "the failed fill's");
+    drop(f);
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 16, "the rest with the file");
+}
+
 #[test]
 fn a_fill_reads_its_page_and_those_ahead_in_one_irp_within_the_devices_limit() {
     use crate::io::block::BlockBackend;
