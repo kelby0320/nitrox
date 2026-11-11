@@ -602,9 +602,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/syscall kernel/src/objec
   `min(PAGE_SIZE)` arithmetic. Depends on: nothing. soundness/opportunities. Value medium (low per
   one reviewer), effort small. **Plan**, in P2.
   Done in `123999c8`: `mm::frame::FrameView`, with `read`, `write`, `fill` and `copy_from` within one
-  frame, each stopping past its end and copying in relaxed atomic words, lent by
-  `MemoryObject::page` (under `copy_in` and `copy_out`), a `FileObject`'s ready page and
-  `AddressSpace::copy_in`.
+  frame, each stopping past its end, lent by `MemoryObject::page` (under `copy_in` and
+  `copy_out`), a `FileObject`'s ready page and `AddressSpace::copy_in`. Every access is an
+  aligned atomic word since `811c7fa4`, and the RAM disk reaches its requests' frames through views.
 
 - [ ] **kobj-o12** encapsulate: the kernel's rsproto codec writes and parses the 28-byte RS
   envelope by hand-coded offsets — 98 sites (`awk 'NR<624' kernel/src/rsproto.rs | grep -cE

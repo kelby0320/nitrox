@@ -38034,10 +38034,12 @@ Part J's seventh sub-part, `typed-layers.md` § J.7, built on `pre-phase-7/part-
 
 Part J's eighth sub-part, `typed-layers.md` § J.8, built on `pre-phase-7/part-j8-frame-views`.
 
-- **A frame's bytes are reached through a `FrameView` its owner lends** (`mm::frame`), copied in
-  relaxed atomic words and never through a reference: a user mapping or another CPU may write the
-  frame meanwhile, and both a `&[u8]` over such bytes and a non-atomic copy of them race in
-  Rust's model. Relaxed loads and stores are plain moves on x86_64.
+- **A frame's bytes are reached through a `FrameView` its owner lends** (`mm::frame`), every
+  access an aligned 8-byte atomic and never a reference, a write of part of a word merged by
+  compare-and-swap: a user mapping or another CPU may write the frame meanwhile, and a `&[u8]`
+  over such bytes, a non-atomic copy of them, or atomics of two sizes over one word race in Rust's
+  model. Relaxed loads and stores are plain moves on x86_64. The RAM disk, whose copies stand in
+  for a device's, reaches an I/O request's frames through views too.
 - **The owner lends the view, for a borrow of itself**: a `MemoryObject` its frames, a
   `FileObject` a ready page, which only its drop frees, and an `AddressSpace` the anonymous memory
   `&mut` keeps mapped.

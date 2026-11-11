@@ -449,7 +449,8 @@ width; neighbour tests at `PAGE_SIZE - 1`, `PAGE_SIZE` and one past, and across 
 - **Miri sees frames** (`392cc4c7`): under Miri each buddy block is a host allocation of its own. A
   frame read after its free, a probe, is reported, and passes with the route switched off.
 - **`mm::frame`**: `FrameView`, with `read`, `write`, `fill` and `copy_from`, each stopping past
-  the frame's end and copying in relaxed atomic words; `alloc_zeroed` for the eight sites that
+  the frame's end, every access an aligned 8-byte atomic, a write of part of a word merged by
+  compare-and-swap; `alloc_zeroed` for the eight sites that
   zeroed a fresh frame by hand; and `hhdm` for borrowed memory. Owners lend views:
   `MemoryObject::page`, under `copy_in` and its twin `copy_out`; a `FileObject`'s ready page; and
   `AddressSpace::copy_in`, which the loader writes through.
@@ -467,6 +468,14 @@ into a frame in atomic words while `copy_to_kvec` or `read_to_kvec` copies it. A
 `copy_nonoverlapping` in the view's place races too. Under Miri, the tests of `mm`, the memory
 and file objects, the registration, `syscall::table`, `sched::ipc`, `drivers::input`, `io`, and
 the paging and ACPI modules pass with frames on the host's allocator: 396, two ignored as before.
+
+**After review** (`811c7fa4`):
+- **The RAM disk reaches an I/O request's frames through views.** Its copies are the CPU's, which
+  the views' owners lend; a raw copy beside `copy_in` raced under both Miri models.
+- **Every access is an aligned word.** Two sizes of atomic over one word race: a byte copied in at
+  an odd offset against `copy_to_kvec`'s word loads, under both models.
+- Tests pin `ready_page`'s and `mark_ready`'s guards, `read_to_kvec`'s refusal of a page truncated
+  after its fault, and `AddressSpace::copy_in`'s refusals. The RSDP is reached at `hhdm`.
 
 ### J.9 An owned frame (kmem-o2, kmem-d11; kplat-o6's owned half)
 
