@@ -416,3 +416,54 @@ fn a_borrowed_thread_stands_beside_its_scheduler_and_its_switch() {
     });
     assert_eq!(shared.cpu_mask(&SCHED.lock().tok), 4);
 }
+
+/// **A switch is prepared from what the incoming thread's guard lets it read, and leaves the
+/// outgoing thread's guard raised**: the stack pointer it resumes is the one its last switch
+/// committed, and the thread switched from is not resumable until this switch commits its own.
+#[test]
+fn a_prepared_switch_waits_on_the_incoming_guard_and_raises_the_outgoing_one() {
+    use core::sync::atomic::AtomicU8;
+    init_global_heap();
+    let mut st = test_state();
+    let (out, next) = (inert_ref(1), inert_ref(2));
+    next.set_last_cpu(&mut st.tok, 3);
+    next.raise_on_cpu(&st.tok);
+    let switch = std::thread::scope(|s| {
+        s.spawn(|| {
+            // Long enough that a `prepare` not waiting reads the slot before it is written.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: as the switch that parks `next` writes them: its slot, then its guard,
+            // which nothing else writes while it is raised.
+            unsafe {
+                next.sp_slot().write(0x2000);
+                AtomicU8::from_ptr(next.on_cpu_ptr()).store(0, Ordering::Release);
+            }
+        });
+        Switch::prepare(&mut st, &out, &next)
+    });
+    assert_eq!(switch.next_sp, 0x2000, "read once the switch parking it had committed it");
+    assert_eq!(next.last_cpu(&st.tok), 0, "recorded where it runs");
+    assert!(out.is_on_cpu() && out.parked_sp(&st.tok).is_none(), "not resumable until it commits");
+    assert_eq!((switch.out_sp_slot, switch.out_on_cpu), (out.sp_slot(), out.on_cpu_ptr()));
+}
+
+/// **The reap closes the handles of a process whose last thread its batch holds**, and no other
+/// process's.
+#[test]
+fn the_reap_closes_the_handles_of_an_ended_process_only() {
+    use crate::handle::global;
+    use crate::libkern::Rights;
+    use crate::object::Timer;
+    const ENDED: u32 = 4490;
+    const LIVE: u32 = 4491;
+    init_global_heap();
+    global::init_for_tests();
+    let install = |pid| global::get().install(pid, Timer::try_new().unwrap().erase(), Rights::empty()).ok().unwrap();
+    let (ended, live) = (install(ENDED), install(LIVE));
+    let (last, other) = (inert_user_ref(1, ENDED), inert_user_ref(2, LIVE));
+    last.set_process_ended();
+    close_ended_processes(&[Some(last.erase()), Some(other.erase()), None]);
+    assert!(global::get().lookup(ended, ENDED, Rights::empty()).is_err(), "the ended process's handle is closed");
+    assert!(global::get().lookup(live, LIVE, Rights::empty()).is_ok(), "a live process's is not");
+    assert_eq!(global::close_all_owned_by(LIVE), 1);
+}

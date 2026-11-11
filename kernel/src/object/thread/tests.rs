@@ -100,6 +100,11 @@ fn wait_bookkeeping_round_trips() {
     assert_eq!(t.wait_phase(), WaitPhase::Running as u8);
     assert!(!t.wait_has_deadline(&tok));
     assert_eq!(t.wait_signaled(&tok), [false; MAX_WAIT_HANDLES], "none past a count of 0");
+
+    // A second wait over as many objects begins with none of them signalled: what the first
+    // wait's wake marked is not this one's result.
+    t.wait_register(&mut tok, &[0xAA, 0xBB], false);
+    assert_eq!(t.wait_signaled(&tok)[..2], [false, false]);
 }
 
 /// **The switch path's save area may be written through a shared thread**: `XSAVE` stores

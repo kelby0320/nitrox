@@ -377,6 +377,28 @@ fn stealable_respects_affinity() {
     assert!(!stealable_to(&tok, &t, 1));
 }
 
+/// **A thread still switching out stays where it is**, though its affinity allows the steal: its
+/// saved stack pointer is not yet committed. Once the switch clears its guard it may be stolen.
+#[test]
+fn a_thread_still_switching_out_is_not_stolen() {
+    use core::sync::atomic::AtomicU8;
+    init_global_heap();
+    let mut st = test_state();
+    online_n(&mut st, 2);
+    let t = inert_ref(1);
+    t.raise_on_cpu(&st.tok);
+    assert!(st.ready[1].push(t.clone()).is_ok());
+    assert!(!stealable_to(&st.tok, &t, 0));
+    assert!(!steal_available(&st, 0));
+    assert!(steal_one(&mut st).is_none());
+    // SAFETY: the guard byte of a live thread this test pins, cleared as `context_switch` clears
+    // it once the slot is committed; nothing else writes it.
+    unsafe { AtomicU8::from_ptr(t.on_cpu_ptr()).store(0, Ordering::Release) };
+    assert!(stealable_to(&st.tok, &t, 0));
+    assert!(steal_available(&st, 0));
+    assert_eq!(steal_one(&mut st).map(|s| s.tid()), Some(1));
+}
+
 #[test]
 fn wake_placement_falls_back_when_home_queue_is_full() {
     init_global_heap();

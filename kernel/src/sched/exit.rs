@@ -325,18 +325,9 @@ pub fn reap_pending() {
             let mut g = SCHED.lock();
             drain_pending_drops(&mut g, &mut buf)
         };
-        // Close the handles of any process whose last thread is in this batch **before** the
-        // drops below, so its pipes close (waking peers) as promptly as the reap runs. Thread
-        // context, no `SCHED`; the exiting thread could not do it — it holds `SCHED` and never
-        // returns from `finish_exit`.
-        for th in buf[..n].iter().flatten().filter_map(ObjectRef::downcast_ref::<Thread>) {
-            let (ended, pid) = (th.process_ended(), th.owner_pid());
-            // `pid == 0` is a kernel/idle thread, which owns no handles and whose pid must
-            // never be swept.
-            if ended && pid != 0 {
-                crate::handle::global::close_all_owned_by(pid);
-            }
-        }
+        // **Before** the drops below, so an ended process's pipes close (waking peers) as
+        // promptly as the reap runs.
+        close_ended_processes(&buf[..n]);
 
         // Drop with preemption disabled: the drops take the allocator locks and (for a kernel
         // stack) run a TLB shootdown — plain locks other CPUs may spin on. Being descheduled
@@ -352,6 +343,19 @@ pub fn reap_pending() {
             return; // drained everything that was parked when we looked
         }
         // Filled the batch: go around for the rest.
+    }
+}
+
+/// Close the handles of each process whose last thread is in `batch`, in thread context with no
+/// `SCHED`: the exiting thread holds it and never returns from `finish_exit`.
+pub(super) fn close_ended_processes(batch: &[Option<ObjectRef>]) {
+    for th in batch.iter().flatten().filter_map(ObjectRef::downcast_ref::<Thread>) {
+        let (ended, pid) = (th.process_ended(), th.owner_pid());
+        // `pid == 0` is a kernel/idle thread, which owns no handles and whose pid must never be
+        // swept.
+        if ended && pid != 0 {
+            crate::handle::global::close_all_owned_by(pid);
+        }
     }
 }
 

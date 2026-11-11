@@ -164,7 +164,7 @@ Then `switch_into`:
 6. **Loads CR3** (`Paging::set_page_table(next_root)`) — before the stack swap, so
    a dying thread leaves CR3 on the incoming root before its own address space is
    torn down.
-7. **`context_switch(out_slot, next_sp, out_on_cpu)`**, `out_slot` the outgoing
+7. **`context_switch(out_sp_slot, next_sp, out_on_cpu)`**, `out_sp_slot` the outgoing
    thread's own saved-SP slot — the arch asm
    (`arch/x86_64/context.rs`): pushes the six callee-saved registers onto the
    outgoing stack, `mov [rdi], rsp` **commits** the outgoing thread's resume RSP,

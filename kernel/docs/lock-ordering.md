@@ -557,12 +557,12 @@ channel pointer via the child `Process`'s `parent_notif`, never dropping an
 parent blocked in `sys_wait` wakes, while stack reclamation stays deferred to reap.
 
 A related multi-user-thread invariant (not a lock, but switch-path state): the
-per-CPU trap/syscall stack (TSS.RSP0 + the syscall-entry stack) is re-armed for
-the incoming thread on **every** switch-in (`arm_kernel_stack_for`, all three
-switch sites), and `KERNEL_GS_BASE` is re-asserted at each thread's first ring-3
-descent (`arm_user_entry_cpu_base`) — a thread that blocks mid-syscall is
-switched away with the entry `swapgs` still in effect, so a fresh descent must
-restore it. With a single user thread neither mattered; multiple do.
+per-CPU trap/syscall stack (TSS.RSP0 + the syscall-entry stack) and this CPU's
+`KERNEL_GS_BASE` (`arm_user_entry_cpu_base`) are re-armed for the incoming thread by
+`arm_kernel_stack`, on **every** switch-in (`switch_into`, through which every switch
+passes) and at each thread's first ring-3 descent (`thread_enter`) — a thread that
+blocks mid-syscall is switched away with the entry `swapgs` still in effect, so a
+fresh descent must restore it. With a single user thread neither mattered; multiple do.
 
 The IPC paths obey the same discipline. `sys_channel_send` copies the 4096-byte
 message **in** from user memory before taking `SCHED`, then pushes into the peer's
