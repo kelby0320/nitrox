@@ -110,7 +110,7 @@ pub fn hhdm_offset() -> u64 {
 
 /// The buddy allocator as the slab sees it: [`HeapBuddy`] in production, a `LocalBuddy` over a
 /// per-test `BuddyAllocator` in tests.
-pub trait BuddyPager {
+pub(super) trait BuddyPager {
     fn alloc(&self, order: usize) -> Option<PhysAddr>;
     /// # Safety
     /// As [`buddy_free`]'s, for a block this pager's `alloc` gave.
@@ -119,7 +119,7 @@ pub trait BuddyPager {
 }
 
 /// Production [`BuddyPager`] that routes through the static buddy.
-pub struct HeapBuddy;
+pub(super) struct HeapBuddy;
 
 impl BuddyPager for HeapBuddy {
     fn alloc(&self, order: usize) -> Option<PhysAddr> {

@@ -144,7 +144,7 @@ impl SlabCache {
 
     /// Allocate one object; null on OOM. `pager` is used if the cache must grow ([`HeapBuddy`] in
     /// production, a local one in tests).
-    pub fn alloc<P: BuddyPager>(&self, pager: &P) -> *mut u8 {
+    pub(super) fn alloc<P: BuddyPager>(&self, pager: &P) -> *mut u8 {
         let mut state = self.state.lock();
         if state.partial.is_null() {
             // SAFETY: cache lock held; we own `state`. `grow_locked`

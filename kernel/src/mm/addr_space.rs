@@ -78,8 +78,8 @@ pub struct AddressSpace {
 
 struct Inner {
     vma_tree: VmaTree,
-    /// The top-level page table, freed after the tree, as the fields drop.
-    root: Frame,
+    /// Physical base of the top-level page-table frame; freed in `Drop` after the tree.
+    root: PhysAddr,
 }
 
 impl AddressSpace {
@@ -87,9 +87,10 @@ impl AddressSpace {
     /// the boot template, and an empty VMA tree. Panics before `arch::init_kernel_template`.
     pub fn new() -> Result<Self, AllocError> {
         // Zeroed, every entry is absent until `inherit_kernel_mappings` fills the kernel half.
-        let root = Frame::alloc_zeroed().ok_or(AllocError)?;
+        // Handed over as every table is, so no view reaches it.
+        let root = Frame::alloc_zeroed().ok_or(AllocError)?.into_pte();
         // SAFETY: a fresh table this space owns, which no CPU has loaded.
-        unsafe { Paging::inherit_kernel_mappings(root.phys()) };
+        unsafe { Paging::inherit_kernel_mappings(root) };
         Ok(AddressSpace { inner: SpinLock::new(LockRank::KernelObject, Inner { vma_tree: VmaTree::new(), root }) })
     }
 
@@ -102,7 +103,7 @@ impl AddressSpace {
             let Some(va) = at.as_u64().checked_add(done as u64).map(VirtAddr::new) else { return false };
             let anonymous = inner.vma_tree.find_covering(va).is_some_and(|v| matches!(v.backing, Backing::Anonymous));
             // SAFETY: this space's root, whose tables live while it does.
-            let Some(phys) = anonymous.then(|| unsafe { Paging::translate(inner.root.phys(), va) }).flatten() else {
+            let Some(phys) = anonymous.then(|| unsafe { Paging::translate(inner.root, va) }).flatten() else {
                 return false;
             };
             // SAFETY: an anonymous frame mapped here, which this space owns and frees only at an
@@ -118,7 +119,7 @@ impl AddressSpace {
 
     /// Physical base of this address space's top-level page table.
     pub fn root(&self) -> PhysAddr {
-        self.inner.lock().root.phys()
+        self.inner.lock().root
     }
 
     pub fn is_empty(&self) -> bool {
@@ -153,7 +154,7 @@ impl AddressSpace {
         }
 
         let flags = page_flags_for(boxed.prot, boxed.caching);
-        let root = guard.root.phys();
+        let root = guard.root;
         let total_pages = range.pages();
         let mut installed: u64 = 0;
 
@@ -254,7 +255,7 @@ impl AddressSpace {
         }
 
         let flags = page_flags_for(vma.prot, vma.caching);
-        let root = guard.root.phys();
+        let root = guard.root;
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
 
         match vma.backing {
@@ -332,7 +333,7 @@ impl AddressSpace {
         }
 
         let flags = page_flags_for(prot, caching);
-        let root = guard.root.phys();
+        let root = guard.root;
         let mut installed: u64 = 0;
 
         for i in 0..npages {
@@ -454,7 +455,7 @@ impl AddressSpace {
             return false;
         }
         let flags = page_flags_for(vma.prot, vma.caching);
-        let root = guard.root.phys();
+        let root = guard.root;
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
         // SAFETY: `root` is this AS's PML4; `frame` is a live, resident cache frame
         // the file object owns and keeps alive (the VMA holds its reference);
@@ -528,7 +529,7 @@ impl AddressSpace {
             // SAFETY: every page in the range was mapped by a prior `map_vma`
             // under this same AS lock; `guard.root` is the top-level table they
             // were installed into.
-            let r = unsafe { Paging::unmap_page(guard.root.phys(), virt) };
+            let r = unsafe { Paging::unmap_page(guard.root, virt) };
             if let Ok(phys) = r
                 && matches!(boxed.backing, Backing::Anonymous)
             {
@@ -583,8 +584,11 @@ impl Drop for AddressSpace {
             let Some(boxed) = guard.vma_tree.remove_covering(leftmost_start) else {
                 break;
             };
-            free_vma_pages(guard.root.phys(), &boxed);
+            free_vma_pages(guard.root, &boxed);
         }
+
+        // SAFETY: the table `new` handed over, which no CPU has loaded (above), taken back once.
+        drop(unsafe { Frame::from_pte(guard.root) });
     }
 }
 
@@ -629,7 +633,7 @@ fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
 /// the frames** (the `MemoryObject` owns them), then release the lock and shoot them down, if any
 /// page was mapped. The space is live, so the object may be released only once this returns.
 fn rollback_object_map(guard: SpinLockGuard<'_, Inner>, start: VirtAddr, installed: u64) {
-    let root = guard.root.phys();
+    let root = guard.root;
     for i in 0..installed {
         let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
         // SAFETY: we successfully installed exactly these `installed` pages in

@@ -15,8 +15,9 @@ The boot facade in `kernel/src/mm/heap.rs` glues layers 1 and 2: it owns
 the single global `BuddyAllocator` and exposes `buddy_alloc`, the `unsafe`
 `buddy_free` and `hhdm_offset` within `mm`. Every other owner of frames holds
 a [`Frame` or `FrameBlock`](#frame-contents), freed as it drops. The slab calls into
-this facade through a small `BuddyPager` trait so tests can inject a
-local buddy without touching the global statics.
+this facade through a small `BuddyPager` trait, `mm`'s alone as the facade's
+functions are, so tests can inject a local buddy without touching the global
+statics.
 
 These three are the core, but the full picture spans more: the
 [arch paging layer](#arch-paging-layer) (the hardware MMU primitive), the
@@ -101,8 +102,8 @@ installed PTE, no kernel involvement.
 
 **Trace — teardown:** `sys_memory_unmap(addr)` removes the VMA + PTEs (frames
 untouched) and drops the VMA's reference; `sys_handle_close` (or process
-exit) drops the handle's. When the last reference goes, `dispatch_destroy` runs
-`MemoryObject::Drop`, returning every frame to the buddy.
+exit) drops the handle's. When the last reference goes, `dispatch_destroy` drops
+the object, and an owned object's every `Frame` goes back to the buddy as it drops.
 
 **Boot order** (`kernel/src/main.rs`): Limine memory map → buddy + slab
 (`init_memory`) → kernel-half paging template (`paging_init`, inherited by
@@ -198,7 +199,8 @@ The single owner of the buddy allocator. Three responsibilities:
    `AtomicU64` HHDM offset, both populated by `init_buddy` during boot.
 2. Expose `buddy_alloc` and the `unsafe` `buddy_free` within `mm`, to
    `Frame`, `FrameBlock` and the slab, and `hhdm_offset` to everyone.
-3. Provide the `BuddyPager` trait so the slab can be tested against a
+3. Provide the `BuddyPager` trait, and `HeapBuddy`, its production
+   implementation, both `mm`'s alone, so the slab can be tested against a
    local buddy in `#[cfg(test)]` builds without touching the production
    statics.
 
@@ -214,11 +216,14 @@ bytes through the HHDM:
 - **`Frame`**: one frame of RAM, freed as it drops; not `Copy`, so it is freed once, at the order
   it was taken, and nothing safe frees it otherwise. `alloc_zeroed` takes one as a mapping, a page
   table or a cache page starts; `alloc`, unzeroed, one a read fills whole. A page table that maps
-  one takes it by `into_pte`, and an unmap takes an anonymous page's back by the `unsafe`
-  `from_pte`, freeing it after its shootdown. `Frame` is a transparent `PhysAddr`, so an owner's
-  list lends a device its addresses (`Frame::addrs`). **`FrameBlock`** is `2^order` contiguous
-  frames, freed together: a `DmaBuffer`'s. Under host tests a countdown fails a thread's takes from
-  the `n`th on (`fail_frames_after`), so each owner's rollback is driven at every index.
+  one takes it by `into_pte`, as an `AddressSpace` does its root and a `VmapFrames` its frames,
+  so no view reaches a frame the kernel reaches another way. An unmap takes an anonymous page's
+  back by the `unsafe` `from_pte`, freeing it after its shootdown; the root and a vmap range's
+  frames come back the same way as their owner drops. `Frame` is a transparent `PhysAddr`, so an
+  owner's list lends a device its addresses (`Frame::addrs`). **`FrameBlock`** is `2^order`
+  contiguous frames, freed together: a `DmaBuffer`'s. Under host tests a countdown fails a thread's
+  takes from the `n`th on (`fail_frames_after`), so each owner's rollback is driven at every index,
+  and a thread's frames taken and freed are counted, so a test weighs one against the other.
 - **`FrameView`**: one frame its owner lends for a borrow, with `read`, `write`, `fill` and
   `copy_from`, each stopping an access past the frame's end. **Every access is an aligned 8-byte
   atomic, never a reference**, and a write of part of a word merges by compare-and-swap: a user

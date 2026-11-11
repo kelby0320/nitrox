@@ -401,8 +401,8 @@ impl FileObject {
         while i < g.pages.len() {
             if g.pages[i].index >= keep {
                 let p = g.pages.remove(i);
-                // `try_reserve` above guarantees this push does not allocate.
-                let _ = g.retired.try_push(p.frame);
+                // Reserved above; a `try_push` that failed would drop a frame still mapped.
+                let Ok(()) = g.retired.push_within_capacity(p.frame) else { unreachable!("reserved above") };
             } else {
                 i += 1;
             }

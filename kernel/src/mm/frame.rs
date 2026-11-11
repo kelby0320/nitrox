@@ -22,6 +22,8 @@ fn take(order: usize, zero: bool) -> Option<PhysAddr> {
         return None;
     }
     let block = heap::buddy_alloc(order)?;
+    #[cfg(test)]
+    TAKEN.with(|t| t.set(t.get() + (1 << order)));
     if !zero {
         return Some(block);
     }
@@ -34,6 +36,13 @@ fn take(order: usize, zero: bool) -> Option<PhysAddr> {
 #[cfg(test)]
 std::thread_local! {
     static FRAMES_LEFT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+    static TAKEN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Frames this thread has taken as a `Frame` or `FrameBlock`, to weigh against those it freed.
+#[cfg(test)]
+pub fn frames_taken_by_this_thread() -> usize {
+    TAKEN.with(core::cell::Cell::get)
 }
 
 /// Let this thread take `n` more frames or blocks, failing every one after, or any with `None`.
@@ -67,7 +76,7 @@ impl Frame {
     /// The frame's bytes, for as long as it is borrowed.
     pub fn view(&self) -> FrameView<'_> {
         // SAFETY: a frame this value owns, so freed only once the borrow ends, and whose bytes
-        // its owner lends only to views, to mappings and to devices.
+        // its owner lends only to views, to user mappings and to devices.
         unsafe { FrameView::new(self.0) }
     }
 

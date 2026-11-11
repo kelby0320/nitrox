@@ -281,7 +281,7 @@ impl UserspaceServerReg {
         for e in g.iter().filter(|e| !e.forgotten) {
             if let Some(r) = e.obj.upgrade() {
                 // `try_reserve` above guarantees this push does not allocate.
-                let _ = out.try_push(r);
+                let Ok(()) = out.push_within_capacity(r) else { unreachable!("reserved above") };
             }
         }
         Ok(out)

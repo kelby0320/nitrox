@@ -63,6 +63,9 @@ fn new_yields_empty_address_space_with_real_root() {
     let root = asp.root();
     assert!(root.is_page_aligned());
     assert_ne!(root.as_u64(), 0);
+    let freed = heap::frames_freed_by_this_thread();
+    drop(asp);
+    assert_eq!(heap::frames_freed_by_this_thread() - freed, 1, "its root, once");
 }
 
 #[test]
@@ -617,6 +620,23 @@ fn a_map_a_frame_short_at_any_take_frees_the_pages_it_took() {
         assert_eq!(made.err().map(|(_, e)| e), Some(MapError::OutOfMemory), "short at {short}");
         assert_eq!(heap::frames_freed_by_this_thread() - freed, pages, "short at {short}");
         assert!((16..19).all(|p| !is_mapped(&asp, va(PAGE * p))), "short at {short}: rolled back");
+    }
+}
+
+/// **A fault a frame short frees the frame it took**: its page, then its three tables.
+#[test]
+fn a_fault_a_frame_short_at_any_take_frees_the_frame_it_took() {
+    init_global_heap();
+    for (short, pages) in [(0, 0), (1, 1), (2, 1), (3, 1)] {
+        let asp = AddressSpace::new().unwrap();
+        asp.map_vma_lazy(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
+        fail_frames_after(Some(short));
+        let freed = heap::frames_freed_by_this_thread();
+        let fault = asp.fault_in(va(PAGE * 17), FaultAccess::Write);
+        fail_frames_after(None);
+        assert_eq!(fault, FaultIn::Oom, "short at {short}");
+        assert_eq!(heap::frames_freed_by_this_thread() - freed, pages, "short at {short}");
+        assert!(!is_mapped(&asp, va(PAGE * 17)), "short at {short}");
     }
 }
 

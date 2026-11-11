@@ -227,9 +227,9 @@ impl MmioWindow {
 /// clears the mapping, invalidates it on every CPU, then frees the frames and gives the VA back.
 pub struct VmapFrames<const N: usize> {
     base: VirtAddr,
+    /// Handed to the mapping by [`Frame::into_pte`], so no view reaches what the kernel uses it for.
+    frames: [PhysAddr; N],
     slot: Option<KBox<Slot>>,
-    /// Freed as the fields drop, after `drop`'s shootdown.
-    _frames: [Frame; N],
 }
 
 impl<const N: usize> VmapFrames<N> {
@@ -248,7 +248,7 @@ impl<const N: usize> VmapFrames<N> {
             VMAP.lock().give_back(slot);
             return Err(AllocError);
         }
-        Ok(Self { base, slot: Some(slot), _frames: frames.map(|f| f.expect("every frame, checked above")) })
+        Ok(Self { base, slot: Some(slot), frames: frames.map(|f| f.expect("every frame, checked above").into_pte()) })
     }
 
     /// The first mapped byte; the guard pages are below it.
@@ -271,6 +271,10 @@ impl<const N: usize> Drop for VmapFrames<N> {
     fn drop(&mut self) {
         // SAFETY: this range's own mapping, which its owner uses no longer.
         unsafe { unmap_all(self.base.as_u64(), N as u64) };
+        for &phys in &self.frames {
+            // SAFETY: a frame `new` handed the mapping, cleared and shot down above.
+            drop(unsafe { Frame::from_pte(phys) });
+        }
         if let Some(slot) = self.slot.take() {
             VMAP.lock().give_back(slot);
         }
