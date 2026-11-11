@@ -172,8 +172,7 @@ fn oversize_refused(disk: &Ref<DeviceNode>) {
 
 /// Read the little-endian 16-bit boot signature (`0xAA55`) at offset 510 of `buffer`'s first frame.
 fn read_boot_signature(buffer: &MemoryObject) -> u16 {
-    let frame = buffer.frames()[0];
-    let va = (frame.as_u64() + crate::mm::heap::hhdm_offset()) as *const u8;
-    // SAFETY: offset 510..512 is within the first (HHDM-mapped) buffer frame.
-    unsafe { (va.add(510) as *const u16).read_unaligned() }
+    let mut sig = [0u8; 2];
+    buffer.copy_out(510, &mut sig);
+    u16::from_le_bytes(sig)
 }

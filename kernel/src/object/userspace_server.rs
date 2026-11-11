@@ -29,7 +29,6 @@
 use crate::libkern::handle::Rights;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
-use crate::mm::PhysAddr;
 use crate::object::header::{Header, Ref, Shared, Weak, kobject};
 use crate::object::{FileObject, Forgotten, IpcChannel, PendingOperation};
 use crate::sched::{SchedCell, SchedToken};
@@ -109,8 +108,8 @@ impl PendingLookup {
 }
 
 /// One outstanding forwarded **page-cache fill** (`File::ReadRange`): the faulting thread is
-/// parked on `po`, and the reply copies the bytes into `frame`, marks the page ready and
-/// completes `po`. The caller drops `po` / `file_obj` **outside** `SCHED`.
+/// parked on `po`, and the reply copies the bytes into the page, marks it ready and completes
+/// `po`. The caller drops `po` / `file_obj` **outside** `SCHED`.
 pub struct PendingFill {
     /// The `request_id` stamped on the `ReadRange` request; the reply echoes it.
     pub(crate) request_id: u64,
@@ -118,8 +117,6 @@ pub struct PendingFill {
     pub(crate) po: Ref<PendingOperation>,
     /// The `FileObject` being filled (pins it; the reply marks its page ready).
     pub(crate) file_obj: Ref<FileObject>,
-    /// The cache frame to copy the replied bytes into.
-    pub(crate) frame: PhysAddr,
     /// The page index within the file.
     pub(crate) index: usize,
 }
@@ -366,15 +363,13 @@ impl UserspaceServerReg {
         tok: &mut SchedToken,
         po: &Ref<PendingOperation>,
         file_obj: &Ref<FileObject>,
-        frame: PhysAddr,
         index: usize,
     ) -> Option<u64> {
         let inner = self.inner.get(tok);
         let slot = inner.pending_fill.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
-        inner.pending_fill[slot] =
-            Some(PendingFill { request_id, po: po.clone(), file_obj: file_obj.clone(), frame, index });
+        inner.pending_fill[slot] = Some(PendingFill { request_id, po: po.clone(), file_obj: file_obj.clone(), index });
         Some(request_id)
     }
 
@@ -620,14 +615,12 @@ mod tests {
         let tok = &mut SchedToken::for_test();
         let po = make_po();
         let fo = file_obj();
-        let frame = PhysAddr::new(0x5000);
         let lid = r.begin(tok, &po, Rights::MAP_READ, b"x").unwrap();
-        let fid = r.begin_fill(tok, &po, &fo, frame, 2).unwrap();
+        let fid = r.begin_fill(tok, &po, &fo, 2).unwrap();
         assert_ne!(lid, fid); // distinct request ids
         assert!(r.take_pending_fill_matching(tok, fid ^ 0xFF).is_none());
         let pf = r.take_pending_fill_matching(tok, fid).unwrap();
         assert_eq!(pf.request_id, fid);
-        assert_eq!(pf.frame, frame);
         assert_eq!(pf.index, 2);
         let pl = r.take_pending_matching(tok, lid).unwrap();
         assert_eq!(pl.request_id, lid);

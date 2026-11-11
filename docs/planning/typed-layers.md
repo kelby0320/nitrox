@@ -445,6 +445,38 @@ a race reported against the slice and none against the copy, the writer storing 
 width; neighbour tests at `PAGE_SIZE - 1`, `PAGE_SIZE` and one past, and across a frame.
 `file_object.rs` and `acpi.rs` are at their size entries, so their tests move out first. Author.
 
+**Built 2026-11-10.**
+- **Miri sees frames** (`392cc4c7`): under Miri each buddy block is a host allocation of its own. A
+  frame read after its free, a probe, is reported, and passes with the route switched off.
+- **`mm::frame`**: `FrameView`, with `read`, `write`, `fill` and `copy_from`, each stopping past
+  the frame's end, every access an aligned 8-byte atomic, a write of part of a word merged by
+  compare-and-swap; `alloc_zeroed` for the eight sites that
+  zeroed a fresh frame by hand; and `hhdm` for borrowed memory. Owners lend views:
+  `MemoryObject::page`, under `copy_in` and its twin `copy_out`; a `FileObject`'s ready page; and
+  `AddressSpace::copy_in`, which the loader writes through.
+- **A fill's reply copies under the file's lock**, into the page its fill still is, found by
+  index and PO; `PendingFill` loses its frame. `mark_ready` passes over a page a fault's fill is
+  filling, so no ready page has a fill and none is freed before its object.
+- **`hhdm` is a safe function**, not the `unsafe fn` drawn here: it only computes an address,
+  and each borrowed reach is its caller's `unsafe`.
+- `acpi.rs` shrank a line, so its tests stay; `file_object.rs`'s moved, in two files.
+
+Counts: `unsafe` blocks fall from 571 to 559; `unsafe fn`s rise from 188 to 189, `FrameView::new`.
+
+**The controls fail on `main` under both Miri models and pass here, over 16 seeds**: a writer storing
+into a frame in atomic words while `copy_to_kvec` or `read_to_kvec` copies it. A raw
+`copy_nonoverlapping` in the view's place races too. Under Miri, the tests of `mm`, the memory
+and file objects, the registration, `syscall::table`, `sched::ipc`, `drivers::input`, `io`, and
+the paging and ACPI modules pass with frames on the host's allocator: 396, two ignored as before.
+
+**After review** (`811c7fa4`):
+- **The RAM disk reaches an I/O request's frames through views.** Its copies are the CPU's, which
+  the views' owners lend; a raw copy beside `copy_in` raced under both Miri models.
+- **Every access is an aligned word.** Two sizes of atomic over one word race: a byte copied in at
+  an odd offset against `copy_to_kvec`'s word loads, under both models.
+- Tests pin `ready_page`'s and `mark_ready`'s guards, `read_to_kvec`'s refusal of a page truncated
+  after its fault, and `AddressSpace::copy_in`'s refusals. The RSDP is reached at `hhdm`.
+
 ### J.9 An owned frame (kmem-o2, kmem-d11; kplat-o6's owned half)
 
 `heap::buddy_free`, `BuddyAllocator::free` and the pager's `free` are safe functions that hand a

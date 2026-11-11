@@ -133,13 +133,12 @@ pub fn us_forward_originate_fill(
     msg: &mut StoredMsg,
     po: &Ref<PendingOperation>,
     file_obj: &Ref<FileObject>,
-    frame: crate::mm::PhysAddr,
     index: usize,
 ) -> ForwardOutcome {
     let mut bag = Deferred::<2>::new();
     let mut g = bag.lock();
     // Reserve the pending-fill slot and assign a request id (`None`: busy).
-    let Some(request_id) = reg.begin_fill(&mut g.tok, po, file_obj, frame, index) else {
+    let Some(request_id) = reg.begin_fill(&mut g.tok, po, file_obj, index) else {
         return ForwardOutcome::Busy;
     };
     crate::rsproto::stamp_request_id(&mut msg.payload, request_id);
@@ -425,7 +424,7 @@ mod tests {
         let file = Ref::new(FileObject::try_new(4096, producer).unwrap());
         let tok = &mut SchedToken::for_test();
         reg.begin(tok, &lookup, Rights::MAP_READ, b"f").unwrap();
-        reg.begin_fill(tok, &fill, &file, crate::mm::PhysAddr::new(0x5000), 0).unwrap();
+        reg.begin_fill(tok, &fill, &file, 0).unwrap();
         (lookup, fill, file)
     }
 
@@ -546,8 +545,7 @@ mod tests {
             let refused = if gone { ForwardOutcome::PeerClosed } else { ForwardOutcome::Full };
             let originated = us_forward_originate(&reg, &mut msg, &lookup, Rights::MAP_READ, b"f", Forward::PLAIN);
             assert_eq!(originated, refused);
-            let frame = crate::mm::PhysAddr::new(0x5000);
-            assert_eq!(us_forward_originate_fill(&reg, &mut msg, &fill, &file, frame, 0), refused);
+            assert_eq!(us_forward_originate_fill(&reg, &mut msg, &fill, &file, 0), refused);
             test_probe::reset();
             drop((lookup, fill, file));
             assert_eq!(test_probe::pending_op_destroys(), 2, "gone={gone}: no slot keeps a PO");

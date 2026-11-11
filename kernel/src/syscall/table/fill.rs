@@ -3,8 +3,8 @@
 use super::*;
 
 /// Complete a forwarded `File::ReadRange` reply: correlate it to the registration's pending
-/// fill, copy the replied bytes (a transferred ≤1-page `MemoryObject`) into the cache frame,
-/// mark the page ready, and complete the fill PO (waking the parked faulter). An error or
+/// fill, copy the replied bytes (a transferred ≤1-page `MemoryObject`) into the cache page,
+/// mark it ready, and complete the fill PO (waking the parked faulter). An error or
 /// uncorrelated reply fails the PO / is dropped (transfers released, handles closed).
 pub(super) fn complete_read_range_reply(
     reg: &Ref<UserspaceServerReg>,
@@ -29,7 +29,7 @@ pub(super) fn complete_read_range_reply(
         RangeReplyKind::Malformed => KError::KernelError as i32,
         RangeReplyKind::Success { content_len } => match transfers[0].take() {
             None => KError::InvalidArgument as i32, // success but no bytes
-            Some(tr) => match copy_fill_into_frame(&tr.obj, pf.frame, content_len as usize) {
+            Some(tr) => match copy_fill(&pf.file_obj, pf.index, &pf.po, &tr.obj, content_len as usize) {
                 Ok(()) => {
                     pf.file_obj.settle(pf.index, &pf.po, true);
                     drop(tr.obj);
@@ -49,26 +49,21 @@ pub(super) fn complete_read_range_reply(
     Ok(0)
 }
 
-/// Copy `n` bytes (clamped to one page) from the first frame of the transferred fill
-/// `MemoryObject` `src` into the cache frame `dst`, both via the HHDM; a no-op if `src` has no
-/// frames or `n == 0`. `Unsupported` for any other kind of object, or a borrowed one.
-pub(super) fn copy_fill_into_frame(src: &ObjectRef, dst: crate::mm::PhysAddr, n: usize) -> Result<(), KError> {
-    use crate::mm::{PAGE_SIZE, heap};
+/// Copy `n` bytes (at most a page) of the transferred fill `MemoryObject` `src` into page `index`
+/// of `file`, if `po` is still its fill. `Unsupported` for any other kind of object, or a borrowed one.
+pub(super) fn copy_fill(
+    file: &FileObject,
+    index: usize,
+    po: &Ref<PendingOperation>,
+    src: &ObjectRef,
+    n: usize,
+) -> Result<(), KError> {
     let mo = src.downcast_ref::<crate::object::MemoryObject>().ok_or(KError::Unsupported)?;
     if !mo.kernel_reachable() {
         return Err(KError::Unsupported);
     }
-    let frames = mo.frames();
-    let n = n.min(PAGE_SIZE);
-    if frames.is_empty() || n == 0 {
-        return Ok(());
-    }
-    let src_va = (frames[0].as_u64() + heap::hhdm_offset()) as *const u8;
-    let dst_va = (dst.as_u64() + heap::hhdm_offset()) as *mut u8;
-    // SAFETY: both frames are page-aligned, HHDM-mapped, and distinct (one is the
-    // server's just-transferred object, the other the cache frame); `n ≤ PAGE`.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src_va, dst_va, n);
-    }
+    let from = mo.page(0).expect("a memory object has a frame");
+    let n = n.min(crate::mm::PAGE_SIZE);
+    file.fill_page(index, po, |to| to.copy_from(0, from, 0, n));
     Ok(())
 }

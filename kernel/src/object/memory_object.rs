@@ -9,9 +9,10 @@
 //! [`AddressSpace::map_object`]: crate::mm::addr_space::AddressSpace::map_object
 //! [`ObjectRef`]: crate::object::ObjectRef
 
-use core::ptr;
+use core::ops::Range;
 
 use crate::libkern::{AllocError, KBox, KVec};
+use crate::mm::frame::{self, FrameView};
 use crate::mm::{Caching, PAGE_SHIFT, PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::{Header, Shared, kobject};
 
@@ -73,18 +74,13 @@ impl MemoryObject {
         frames.try_reserve(npages)?;
 
         for _ in 0..npages {
-            let Some(f) = heap::buddy_alloc(0) else {
+            let Some(f) = frame::alloc_zeroed(0) else {
                 // `frames` is a bare `KVec` here: its `Drop` frees only storage, not these frames.
                 for &done in frames.iter() {
                     heap::buddy_free(done, 0);
                 }
                 return Err(AllocError);
             };
-            // SAFETY: `f` was just returned by the buddy, is not aliased, and is
-            // HHDM-reachable. Zeroing prevents leaking stale memory to userspace.
-            unsafe {
-                ptr::write_bytes((f.as_u64() + heap::hhdm_offset()) as *mut u8, 0, PAGE_SIZE);
-            }
             frames.try_push(f).expect("within reserved capacity");
         }
 
@@ -151,19 +147,7 @@ impl MemoryObject {
     /// `docs/rationale/deferred-decisions.md` § "Resource servers" / `/proc/self/status`.)
     pub fn try_new_filled(bytes: &[u8]) -> Result<KBox<Self>, AllocError> {
         let obj = Self::try_new(bytes.len().max(1))?;
-        let mut copied = 0usize;
-        for &f in obj.frames.iter() {
-            if copied >= bytes.len() {
-                break;
-            }
-            let n = core::cmp::min(PAGE_SIZE, bytes.len() - copied);
-            // SAFETY: `f` is a live, HHDM-reachable frame owned by `obj`, not
-            // aliased; we copy `n ≤ PAGE_SIZE` bytes into it from a valid source.
-            unsafe {
-                ptr::copy_nonoverlapping(bytes.as_ptr().add(copied), (f.as_u64() + heap::hhdm_offset()) as *mut u8, n);
-            }
-            copied += n;
-        }
+        obj.copy_in(0, bytes);
         Ok(obj)
     }
 
@@ -189,21 +173,36 @@ impl MemoryObject {
         &self.frames
     }
 
-    /// **Copy `src` into the object at byte `offset`** through the HHDM; a range past the last
-    /// frame is cut short, as the caller (`sys_io_submit`) has bounds-checked it.
+    /// Page `i`'s frame, for the kernel to copy in or out of; `None` past the last.
+    pub fn page(&self, i: usize) -> Option<FrameView<'_>> {
+        let &f = self.frames().get(i)?;
+        // SAFETY: a frame this object owns and frees only as it drops, so for the borrow of `self`,
+        // and whose bytes it lends to whoever holds it, as a mapping of it does.
+        Some(unsafe { FrameView::new(f) })
+    }
+
+    /// **Copy `src` into the object from byte `offset`**; a range past the last frame is cut
+    /// short, as the caller (`sys_io_submit`) has bounds-checked it.
     pub fn copy_in(&self, offset: usize, src: &[u8]) {
-        assert!(self.kernel_reachable(), "{BORROWED_ONLY_MAPPED}");
-        let hhdm = heap::hhdm_offset();
-        for (i, &b) in src.iter().enumerate() {
-            let pos = offset + i;
-            let Some(frame) = self.frames.get(pos / PAGE_SIZE) else {
-                break;
-            };
-            let dst = (frame.as_u64() + hhdm) as *mut u8;
-            // SAFETY: within one of this object's frames, which it owns, as just checked, and the
-            // HHDM maps for as long as `self` is alive.
-            unsafe { *dst.add(pos % PAGE_SIZE) = b };
+        self.pieces(offset, src.len(), |page, at, piece| page.write(at, &src[piece]));
+    }
+
+    /// **Copy the object's bytes from `offset` into `dst`**, cut short at the last frame; the count.
+    pub fn copy_out(&self, offset: usize, dst: &mut [u8]) -> usize {
+        self.pieces(offset, dst.len(), |page, at, piece| page.read(at, &mut dst[piece]))
+    }
+
+    /// Hand `step` each frame's piece of `len` bytes from `offset`: page, offset in it, buffer range.
+    fn pieces(&self, offset: usize, len: usize, mut step: impl FnMut(FrameView<'_>, usize, Range<usize>)) -> usize {
+        let mut done = 0;
+        while let Some(pos) = offset.checked_add(done).filter(|_| done < len) {
+            let Some(page) = self.page(pos / PAGE_SIZE) else { break };
+            let at = pos % PAGE_SIZE;
+            let n = (PAGE_SIZE - at).min(len - done);
+            step(page, at, done..done + n);
+            done += n;
         }
+        done
     }
 
     /// Copy the object into a fresh contiguous heap buffer (page-rounded [`size`](Self::size)
@@ -212,20 +211,8 @@ impl MemoryObject {
     /// into a temporary kernel VMA would avoid the copy; see `docs/rationale/deferred-decisions.md`.
     pub fn copy_to_kvec(&self) -> Result<KVec<u8>, AllocError> {
         assert!(self.kernel_reachable(), "{BORROWED_ONLY_MAPPED}");
-        let mut buf = KVec::new();
-        buf.try_reserve(self.size)?;
-        let mut remaining = self.size;
-        for &f in self.frames.iter() {
-            if remaining == 0 {
-                break;
-            }
-            let n = core::cmp::min(PAGE_SIZE, remaining);
-            // SAFETY: `f` is a live, HHDM-reachable frame owned by `self`, as just checked;
-            // reading `n <= PAGE_SIZE` bytes from its HHDM mapping is sound.
-            let page = unsafe { core::slice::from_raw_parts((f.as_u64() + heap::hhdm_offset()) as *const u8, n) };
-            buf.try_extend_from_slice(page)?;
-            remaining -= n;
-        }
+        let mut buf = KVec::try_filled(0, self.size)?;
+        self.copy_out(0, &mut buf);
         Ok(buf)
     }
 
@@ -422,5 +409,39 @@ mod tests {
         };
         assert_eq!(device.caching(), Caching::WriteCombining);
         assert_eq!(MemoryObject::try_new(PAGE_SIZE).unwrap().caching(), Caching::Normal);
+    }
+
+    /// **An object copied out while a user mapping writes it is no race**, which Miri tells: natively,
+    /// any copy passes. Both move aligned atomic words.
+    #[test]
+    fn copying_an_object_out_while_another_writes_it_is_no_race() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        init_global_heap();
+        let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
+        let words = (m.frames()[0].as_u64() + heap::hhdm_offset()) as usize;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..PAGE_SIZE / 8 {
+                    // SAFETY: a word of the object's frame, which outlives the scope; stored
+                    // atomically, as a user's store is to the kernel's reads.
+                    unsafe { AtomicU64::from_ptr((words as *mut u64).add(i)) }.store(u64::MAX, Ordering::Relaxed);
+                }
+            });
+            let copy = m.copy_to_kvec().unwrap();
+            assert!(copy.iter().all(|&b| b == 0 || b == 0xFF));
+        });
+    }
+
+    /// **Copies at different alignments are no race**, which Miri tells: one in from an odd offset
+    /// and one out whole reach the frame in the same aligned words.
+    #[test]
+    fn copies_at_different_alignments_are_no_race() {
+        init_global_heap();
+        let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| m.copy_in(1, &[0xFF; 15]));
+            let copy = m.copy_to_kvec().unwrap();
+            assert!(copy[1..16].iter().all(|&b| b == 0 || b == 0xFF) && copy[0] == 0 && copy[16] == 0);
+        });
     }
 }

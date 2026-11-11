@@ -18,7 +18,6 @@ pub mod stats;
 use crate::dpc::Dpc;
 use crate::libkern::KBox;
 use crate::libkern::io_op::IoOpcode;
-use crate::mm::heap::hhdm_offset;
 use crate::object::header::Ref;
 use crate::object::{DeviceNode, InterruptObject, MemoryObject, PendingOperation};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
@@ -114,24 +113,19 @@ fn block_irp_self_test() {
 /// `true` iff the first `len` bytes of `buffer`'s frames equal the ramdisk
 /// pattern (`RamDisk::pattern_byte`).
 fn buffer_matches_pattern(buffer: &MemoryObject, len: usize) -> bool {
-    let hhdm = hhdm_offset();
-    let mut checked = 0usize;
-    for &frame in buffer.frames() {
-        let va = (frame.as_u64() + hhdm) as *const u8;
-        let n = crate::mm::PAGE_SIZE.min(len - checked);
-        for i in 0..n {
-            // SAFETY: `va + i` is within an owned, HHDM-mapped buffer frame.
-            let got = unsafe { va.add(i).read() };
-            if got != ramdisk::RamDisk::pattern_byte(checked + i) {
-                return false;
-            }
+    let mut chunk = [0u8; 64];
+    let mut checked = 0;
+    while checked < len {
+        let n = chunk.len().min(len - checked);
+        if buffer.copy_out(checked, &mut chunk[..n]) != n {
+            return false;
+        }
+        if chunk[..n].iter().enumerate().any(|(i, &b)| b != ramdisk::RamDisk::pattern_byte(checked + i)) {
+            return false;
         }
         checked += n;
-        if checked >= len {
-            break;
-        }
     }
-    checked == len
+    true
 }
 
 fn interrupt_object_self_test() {

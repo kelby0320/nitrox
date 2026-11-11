@@ -177,7 +177,7 @@ pub(crate) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u
 /// Pointer to the 512-entry page table at physical address `table`, via the HHDM. Dereferencing
 /// is sound only while `table` holds a live page-table frame.
 fn table_ptr(table: PhysAddr) -> *mut Pte {
-    (table.as_u64() + crate::mm::heap::hhdm_offset()) as *mut Pte
+    crate::mm::frame::hhdm(table)
 }
 
 /// A page table at `level` (4 a PML4, 1 a table of leaves), each entry atomic: the kernel half is
@@ -278,15 +278,8 @@ fn alloc_page_table() -> Option<PhysAddr> {
     if TABLES_LEFT.with(|left| left.replace(left.get().map(|n| n.saturating_sub(1))) == Some(0)) {
         return None;
     }
-    let frame = crate::mm::heap::buddy_alloc(0)?;
-    // SAFETY: `buddy_alloc(0)` returned a fresh, exclusively-owned 4 KiB
-    // frame; `table_ptr` addresses it through the HHDM. We are its only
-    // writer and zero all `PAGE_SIZE` bytes, so every entry reads as
-    // not-present before the frame is linked into a table tree.
-    unsafe {
-        core::ptr::write_bytes(table_ptr(frame).cast::<u8>(), 0, PAGE_SIZE);
-    }
-    Some(frame)
+    // Zeroed, every entry reads as not present before the frame is linked into a tree.
+    crate::mm::frame::alloc_zeroed(0)
 }
 
 /// The child table slot `index` of `table` names, linking a fresh one if it is empty.

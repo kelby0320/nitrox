@@ -152,6 +152,20 @@ impl<T> KVec<T> {
         Ok(())
     }
 
+    /// A vector of `len` copies of `value`, allocated once.
+    pub fn try_filled(value: T, len: usize) -> Result<Self, AllocError>
+    where
+        T: Copy,
+    {
+        let mut v = Self::new();
+        v.try_reserve(len)?;
+        let chunk = [value; 64];
+        while v.len < len {
+            v.try_extend_from_slice(&chunk[..chunk.len().min(len - v.len)])?;
+        }
+        Ok(v)
+    }
+
     /// Drop every element, keeping the allocated capacity.
     pub fn clear(&mut self) {
         let initialised: *mut [T] = ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len);

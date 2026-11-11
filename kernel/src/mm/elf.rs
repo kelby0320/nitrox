@@ -22,14 +22,11 @@
 //! `load_elf` takes a `&[u8]` and is agnostic to its source (an `include_bytes!` image, or bytes
 //! read from the initramfs CPIO).
 
-use crate::arch::Paging;
 use crate::arch::abi::{
     DEFAULT_USER_STACK_SIZE as STACK_SIZE, DEFAULT_USER_STACK_TOP as STACK_TOP, E_MACHINE, USER_VIRT_END,
 };
-use crate::arch::paging::ArchPaging;
 use crate::libkern::KBox;
 use crate::mm::addr_space::{AddressSpace, MapError};
-use crate::mm::heap;
 use crate::mm::vmm::{Protection, VAddrRange, Vma};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 use crate::object::MemoryObject;
@@ -236,8 +233,7 @@ fn read_u64(bytes: &[u8], off: usize) -> Result<u64, ElfLoadError> {
 fn map_load_segment(asp: &mut AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &mut u64) -> Result<(), ElfLoadError> {
     let page = PAGE_SIZE as u64;
 
-    // `p_vaddr % PAGE == p_offset % PAGE` is mandatory: the file bytes are copied contiguously
-    // through the HHDM, so their page-relative offset must match the virtual address's.
+    // `p_vaddr % PAGE == p_offset % PAGE`, which the System V ABI asks of a loadable segment.
     if (phdr.p_vaddr % page) != (phdr.p_offset % page) {
         return Err(ElfLoadError::BadSegmentAlignment);
     }
@@ -274,8 +270,8 @@ fn map_load_segment(asp: &mut AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &
         }
     }
 
-    // Copy the file bytes into the new frames via the HHDM; the rest up to `p_memsz` is BSS,
-    // already zero from `map_vma`'s allocation.
+    // Copy the file bytes into the new frames; the rest up to `p_memsz` is BSS, already zero
+    // from `map_vma`'s allocation.
     if phdr.p_filesz == 0 {
         return Ok(());
     }
@@ -284,34 +280,8 @@ fn map_load_segment(asp: &mut AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &
         return Err(ElfLoadError::Truncated);
     }
 
-    let root = asp.root();
-    let mut va = phdr.p_vaddr;
-    let mut file_off = phdr.p_offset;
-    let copy_end = phdr.p_vaddr + phdr.p_filesz;
-    while va < copy_end {
-        let next_page = (va & !(page - 1)) + page;
-        let chunk = core::cmp::min(next_page, copy_end) - va;
-
-        // SAFETY: `root` is the AS's valid PML4; `va` lies in a range
-        // we just mapped (validated `aligned_start..aligned_end`
-        // covers `[p_vaddr, p_vaddr + p_memsz)`), so translate must
-        // succeed.
-        let phys =
-            unsafe { Paging::translate(root, VirtAddr::new(va)) }.expect("just-mapped virtual address must translate");
-
-        // SAFETY: `phys` is a freshly-allocated frame owned by `asp`;
-        // HHDM gives a writable view; `chunk` does not exceed the
-        // remainder of the page.
-        unsafe {
-            let dst = (phys.as_u64() + heap::hhdm_offset()) as *mut u8;
-            let src = bytes[file_off as usize..(file_off + chunk) as usize].as_ptr();
-            core::ptr::copy_nonoverlapping(src, dst, chunk as usize);
-        }
-
-        va += chunk;
-        file_off += chunk;
-    }
-
+    let file = &bytes[phdr.p_offset as usize..file_end as usize];
+    assert!(asp.copy_in(VirtAddr::new(phdr.p_vaddr), file), "a segment just mapped is anonymous memory");
     Ok(())
 }
 
@@ -324,6 +294,9 @@ pub(crate) fn a_test_image() -> std::vec::Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::Paging;
+    use crate::arch::paging::ArchPaging;
+    use crate::mm::heap;
     use crate::mm::test_support::init_global_heap;
 
     pub(super) struct ElfBuilder {

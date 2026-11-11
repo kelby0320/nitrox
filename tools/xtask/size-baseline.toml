@@ -2,9 +2,9 @@
 # `cargo xtask check-size --update` lowers or removes entries as files shrink. A raise is
 # by hand, in a reviewed commit of its own that says why.
 [files]
-"kernel/src/arch/x86_64/acpi.rs" = 1036
+"kernel/src/arch/x86_64/acpi.rs" = 1035
 "kernel/src/main.rs" = 1050
-"kernel/src/object/file_object.rs" = 2366
+"kernel/src/object/file_object.rs" = 1238
 "kernel/src/pci/mod.rs" = 1041
 "kernel/src/syscall/table.rs" = 2002
 "userspace/compositor/src/input.rs" = 2636

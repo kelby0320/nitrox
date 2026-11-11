@@ -38030,3 +38030,23 @@ Part J's seventh sub-part, `typed-layers.md` § J.7, built on `pre-phase-7/part-
 - `unsafe` blocks fall from 685 to 571 and `unsafe fn`s from 233 to 188; `unsafe impl`s rise from
   57 to 59.
 
+## 2026-11-10 — Before Phase 7, J.8: a frame's bytes, through a view
+
+Part J's eighth sub-part, `typed-layers.md` § J.8, built on `pre-phase-7/part-j8-frame-views`.
+
+- **A frame's bytes are reached through a `FrameView` its owner lends** (`mm::frame`), every
+  access an aligned 8-byte atomic and never a reference, a write of part of a word merged by
+  compare-and-swap: a user mapping or another CPU may write the frame meanwhile, and a `&[u8]`
+  over such bytes, a non-atomic copy of them, or atomics of two sizes over one word race in Rust's
+  model. Relaxed loads and stores are plain moves on x86_64. The RAM disk, whose copies stand in
+  for a device's, reaches an I/O request's frames through views too.
+- **The owner lends the view, for a borrow of itself**: a `MemoryObject` its frames, a
+  `FileObject` a ready page, which only its drop frees, and an `AddressSpace` the anonymous memory
+  `&mut` keeps mapped.
+- **A fill's reply finds its page under the file's lock**, by index and PO, not by a frame address
+  held across the wait.
+- **`hhdm` is a safe function** for memory no owner lends: computing an address is safe, and each
+  reach through it is its caller's `unsafe`.
+- **Under Miri the buddy hands out host allocations**, so a frame used after its free is reported.
+- `unsafe` blocks fall from 571 to 559; `unsafe fn`s rise from 188 to 189, `FrameView::new`.
+

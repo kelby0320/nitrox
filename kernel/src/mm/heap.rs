@@ -37,6 +37,10 @@ pub unsafe fn init_buddy(memory_map: &MemoryMapResponse, hhdm_offset: u64) {
 
 /// Allocate `2^order` contiguous physical frames; `None` on OOM. Panics before [`init_buddy`].
 pub fn buddy_alloc(order: usize) -> Option<PhysAddr> {
+    #[cfg(test)]
+    if cfg!(miri) {
+        return miri_frames::alloc(order);
+    }
     let mut slot = BUDDY.lock();
     slot.as_mut().expect("heap::buddy_alloc called before init_buddy").alloc(order)
 }
@@ -45,8 +49,40 @@ pub fn buddy_alloc(order: usize) -> Option<PhysAddr> {
 pub fn buddy_free(addr: PhysAddr, order: usize) {
     #[cfg(test)]
     FREED.with(|f| f.set(f.get() + (1 << order)));
+    #[cfg(test)]
+    if cfg!(miri) {
+        return miri_frames::free(addr, order);
+    }
     let mut slot = BUDDY.lock();
     slot.as_mut().expect("heap::buddy_free called before init_buddy").free(addr, order);
+}
+
+/// **Under Miri, each block is a host allocation of its own**, as each `kmalloc` is, so Miri sees a
+/// frame used after its free: the buddy's leaked buffer stays live throughout.
+#[cfg(test)]
+mod miri_frames {
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
+
+    use crate::mm::{PAGE_SIZE, PhysAddr};
+
+    fn layout(order: usize) -> Layout {
+        let size = PAGE_SIZE << order;
+        Layout::from_size_align(size, size).expect("a block's layout")
+    }
+
+    pub(super) fn alloc(order: usize) -> Option<PhysAddr> {
+        // SAFETY: a layout of at least a page.
+        let block = unsafe { alloc_zeroed(layout(order)) };
+        // Exposed, as an address the HHDM's casts turn back into a pointer.
+        (!block.is_null()).then(|| PhysAddr::new(block.expose_provenance() as u64))
+    }
+
+    /// Give back `block`, which [`alloc`] made at `order`.
+    pub(super) fn free(block: PhysAddr, order: usize) {
+        // SAFETY: what `buddy_free`'s callers promise: a block `alloc` made at `order`, so with
+        // this layout, given back once; a caller breaking that is what Miri reports here.
+        unsafe { dealloc(core::ptr::with_exposed_provenance_mut(block.as_u64() as usize), layout(order)) }
+    }
 }
 
 #[cfg(test)]

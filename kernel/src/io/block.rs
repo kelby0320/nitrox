@@ -452,19 +452,7 @@ pub fn read_blocking(device: &Ref<DeviceNode>, lba: u64, count: u64, dst: &mut [
         return false;
     }
 
-    let hhdm = crate::mm::heap::hhdm_offset();
-    let mut copied = 0usize;
-    for &frame in buf_ref.frames() {
-        let n = PAGE_SIZE.min(len - copied);
-        let src = (frame.as_u64() + hhdm) as *const u8;
-        // SAFETY: `src..src+n` is an owned, HHDM-mapped buffer frame; `dst` fits.
-        unsafe { core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr().add(copied), n) };
-        copied += n;
-        if copied >= len {
-            break;
-        }
-    }
-    true
+    buf_ref.copy_out(0, &mut dst[..len]) == len
 }
 
 /// A block-device partition: a window `[start_lba, start_lba + block_count)` on a

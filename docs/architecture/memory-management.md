@@ -75,7 +75,7 @@ Two distinct paths share the same foundation. Keep them separate in your head:
 
 **Where `MemoryObject` fits.** It is the *owner* of user-mappable physical
 memory, sitting as a kernel object between the buddy allocator and the address
-space. It pulls frames straight from the buddy (zeroed via the HHDM), is
+space. It pulls frames straight from the buddy (zeroed by `frame::alloc_zeroed`), is
 reference-counted and reachable by a handle, and — crucially — *owns* those
 frames. Mapping it installs PTEs that point at its frames; unmap removes the
 PTEs but never frees them. That is the difference from an anonymous `map_vma`
@@ -201,6 +201,30 @@ The single owner of the buddy allocator. Three responsibilities:
    local buddy in `#[cfg(test)]` builds without touching the production
    statics.
 
+Under Miri each block `buddy_alloc` hands out is a host allocation of its own, zeroed and
+aligned to its size, so a frame used after its free, freed twice or overrun is one Miri reports;
+the buddy's own tests keep its coalescing on their local allocator.
+
+## Frame contents
+
+[`mm/frame.rs`](../../kernel/src/mm/frame.rs) is how the kernel reaches a frame's bytes through
+the HHDM:
+
+- **`FrameView`**: one frame its owner lends for a borrow, with `read`, `write`, `fill` and
+  `copy_from`, each stopping an access past the frame's end. **Every access is an aligned 8-byte
+  atomic, never a reference**, and a write of part of a word merges by compare-and-swap: a user
+  mapping or another CPU may write the frame meanwhile, and a `&[u8]` over such bytes, a
+  non-atomic copy, or atomics of two sizes over one word race. Relaxed loads and stores are plain
+  moves on x86_64. Owners lend views: `MemoryObject::page` (with `copy_in` and `copy_out` over
+  it), a `FileObject`'s cache pages, and `AddressSpace::copy_in`, which writes the anonymous
+  memory mapped at an address. The RAM disk, whose copies stand in for a device's, reaches an I/O
+  request's frames through views too.
+- **`alloc_zeroed`**: fresh frames from the buddy, zeroed, as a mapping, a page table or a cache
+  page starts.
+- **`hhdm`**: the address of memory no owner lends, which its caller reaches in its own `unsafe`:
+  ACPI's tables, the page tables, a DMA buffer's memory. The slab reaches its own pages through
+  its `BuddyPager`.
+
 ## Initialisation order
 
 1. Limine writes responses into our request statics, then jumps to `_start`.
@@ -244,7 +268,7 @@ architecture's implementation is re-exported as `arch::Paging`.
   The kernel enables `EFER.NXE` at boot so `NO_EXECUTE` is usable.
 
 Page tables are reached through the higher-half direct map: a table at
-physical `p` is addressed at `p + hhdm_offset()`. Out of scope today:
+physical `p` is addressed at `frame::hhdm(p)`, `p + hhdm_offset()`. Out of scope today:
 reclaiming intermediate tables on unmap, range TLB flush, and cross-CPU
 shootdown — all filed in `docs/rationale/deferred-decisions.md`.
 
@@ -379,7 +403,9 @@ points a process's PTEs at those frames and keeps the object alive for the
 mapping's lifetime via the reference in the `Vma`'s backing. This is what makes the
 object shareable: two mappings (eventually, in two processes) of the same
 object address the same physical memory, and the frames outlive any individual
-mapping. Phase 1 is eager and anonymous-only; copy-on-write and file-backing
+mapping. The kernel reaches the bytes itself through `copy_in` and `copy_out`, over the
+object's [frame views](#frame-contents), as a mapping may write them meanwhile; a borrowed
+aperture's frames it only maps. Phase 1 is eager and anonymous-only; copy-on-write and file-backing
 are later work.
 
 Because creation is eager, `sys_memory_create` caps object size at
@@ -487,7 +513,7 @@ header (hand-rolled `repr(C)`-free reader; no external crates),
 walks the program headers, and for each `PT_LOAD` segment allocates
 a page-aligned VMA covering `[align_down(p_vaddr), align_up(p_vaddr
 + p_memsz))`, then copies file bytes `p_offset..p_offset + p_filesz`
-into the newly-allocated frames via the HHDM. BSS (the `p_memsz -
+into the newly-allocated frames through `AddressSpace::copy_in`. BSS (the `p_memsz -
 p_filesz` tail) comes for free from `map_vma`'s zero-init step.
 **What it refuses**: an entry point outside the user half (entering it
 would fault in the kernel), and segments claiming more than
