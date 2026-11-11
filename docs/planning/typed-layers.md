@@ -613,6 +613,17 @@ frame while mapped, or lose it on a refusal. Forging tables from an address, or 
 either without `unsafe`, does not compile (E0451, E0133). Under Miri, both models, the tests of
 paging, the tables, the address space, kvmap, kstack and the VMA tree: 110 pass.
 
+**After review** (`45019557`):
+- **`map_page` links no kernel-half top-level table** (`MapError::Unshared`): `KernelTables::map`
+  past the vmap's window had linked one into the boot root alone, after the template's capture.
+- **A user half refuses from `USER_MAP_END`, not `USER_VIRT_END`**: the top user page, which a
+  `sysretq` faults on in ring 0, had mapped through the safe call.
+- **A VMA keeps no caching**: anonymous and file pages map write-back, an object's mapping its
+  object's, so a write-combining anonymous VMA, which had panicked naming `Misaligned`, cannot be
+  written. The arms that cannot be reached name the error they got.
+- `KernelTables` walks too, as the doc said; `adopt` refuses a second call; the refusals of `map`
+  and `map_owned`'s hand-back on an arch error are tested. Blocks: 568.
+
 ### J.11 Per-CPU state (kplat-o3 with sched-o3; kplat-d23, sched-d16)
 
 No dense CPU index type, no per-CPU container and no pin exist: the index is a `u32`, a `usize` or a

@@ -38090,9 +38090,13 @@ Part J's tenth sub-part, `typed-layers.md` § J.10, built on
 - **An owned frame is mapped safely** (`map_owned`, the frame handed back with an error); a frame
   an object or a file keeps is mapped `unsafe`ly, the caller keeping it until the shootdown; an
   unmap is safe and gives back the address, the VMA's kind saying whose it was.
-- **A user half refuses the kernel half, a global mapping, and an owned frame not write-back**
-  (`NotUser`), so the safe calls cannot unmap a kernel stack from every root, outlive the space's
-  time loaded, or alias RAM with a second memory type.
+- **A user half refuses an address at or past `USER_MAP_END`, a global mapping, and an owned
+  frame not write-back** (`NotUser`), so the safe calls cannot unmap a kernel stack from every
+  root, map the top user page `sysretq` faults on, outlive the space's time loaded, or alias RAM
+  with a second memory type. A VMA keeps no caching of its own: anonymous and file pages are
+  mapped write-back, and an object's mapping takes its object's.
+- **`map_page` links no kernel-half top-level table** (`Unshared`): every root shares that level,
+  captured at boot, so a mapping under one linked later would be the boot root's alone.
 - `translate` and `attribute_index` are safe on either; `subtree_max_end`, which nothing read, went.
-- `unsafe` blocks fall from 569 to 566 and `unsafe fn`s rise from 195 to 197: the wrappers hold the
+- `unsafe` blocks fall from 569 to 568 and `unsafe fn`s rise from 195 to 197: the wrappers hold the
   root the callers passed bare.
