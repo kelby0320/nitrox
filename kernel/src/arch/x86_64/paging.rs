@@ -311,6 +311,15 @@ fn ensure_table(table: TableRef<'_>, index: usize) -> Result<TableRef<'_>, MapEr
     }
 }
 
+/// The kernel half's table at `index` of `pml4`, which every root shares, so a map never links one.
+fn shared_table(pml4: TableRef<'_>, index: usize) -> Result<TableRef<'_>, MapError> {
+    match pml4.slot(index) {
+        Slot::Table(t) => Ok(t),
+        Slot::Empty(_) => Err(MapError::Unshared),
+        Slot::Leaf(_) => Err(MapError::AlreadyMapped),
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     static TABLES_LEFT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
@@ -406,7 +415,9 @@ impl ArchPaging for X86Paging {
         }
         // SAFETY: the caller guarantees `root` is a valid, caller-owned top-level table.
         let pml4 = unsafe { TableRef::root(root) };
-        let pt = ensure_table(ensure_table(ensure_table(pml4, pml4_index(virt))?, pdpt_index(virt))?, pd_index(virt))?;
+        let top = pml4_index(virt);
+        let pdpt = if top < KERNEL_PML4_BASE { ensure_table(pml4, top)? } else { shared_table(pml4, top)? };
+        let pt = ensure_table(ensure_table(pdpt, pdpt_index(virt))?, pd_index(virt))?;
         let i = pt_index(virt);
         match pt.slot(i) {
             Slot::Empty(old) if pt.link(i, old, Pte::new_leaf(phys, flags)) => Ok(()),

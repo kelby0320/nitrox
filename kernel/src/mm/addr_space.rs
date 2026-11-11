@@ -160,7 +160,7 @@ impl AddressSpace {
             return Err((boxed, MapError::Overlap));
         }
 
-        let flags = page_flags_for(boxed.prot, boxed.caching);
+        let flags = page_flags_for(boxed.prot, Caching::Normal);
         let total_pages = range.pages();
         let mut installed: u64 = 0;
 
@@ -182,9 +182,9 @@ impl AddressSpace {
                     // Impossible: AS lock held and overlap pre-checked.
                     unreachable!("ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check");
                 }
-                Err((_, ArchMapError::Misaligned | ArchMapError::NotUser)) => {
+                Err((_, e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared))) => {
                     // Impossible: `VAddrRange` enforces page alignment.
-                    unreachable!("ArchPaging::map_page returned Misaligned for a page-aligned per-page address");
+                    unreachable!("map_vma: {e:?} for a page-aligned user-half address");
                 }
             }
         }
@@ -252,7 +252,7 @@ impl AddressSpace {
             _ => {}
         }
 
-        let flags = page_flags_for(vma.prot, vma.caching);
+        let flags = page_flags_for(vma.prot, Caching::Normal);
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
 
         match vma.backing {
@@ -266,8 +266,8 @@ impl AddressSpace {
                     // Another CPU faulted on the same page and mapped it first, between this
                     // CPU's fault and the lock: the page is there, so the access can be retried.
                     Err((_, ArchMapError::AlreadyMapped)) => {}
-                    Err((_, ArchMapError::Misaligned | ArchMapError::NotUser)) => {
-                        unreachable!("fault_in: map_page called Misaligned a page-aligned address");
+                    Err((_, e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared))) => {
+                        unreachable!("fault_in: {e:?} for a page-aligned user-half address");
                     }
                 }
                 // Evict the not-present entry the CPU cached for this page on the fault we are
@@ -313,7 +313,6 @@ impl AddressSpace {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
-        boxed.caching = caching;
 
         let mut guard = self.inner.lock();
 
@@ -341,9 +340,9 @@ impl AddressSpace {
                     // Impossible: overlap was pre-checked under the lock.
                     unreachable!("ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check");
                 }
-                Err(ArchMapError::Misaligned | ArchMapError::NotUser) => {
+                Err(e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared)) => {
                     // Impossible: VAddrRange enforces page alignment.
-                    unreachable!("ArchPaging::map_page returned Misaligned for a page-aligned per-page address");
+                    unreachable!("map_object: {e:?} for a page-aligned user-half address");
                 }
             }
         }
@@ -442,7 +441,7 @@ impl AddressSpace {
         if !matches!(&vma.backing, Backing::File(file) if file.as_ptr() == object.as_ptr()) {
             return false;
         }
-        let flags = page_flags_for(vma.prot, vma.caching);
+        let flags = page_flags_for(vma.prot, Caching::Normal);
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
         // SAFETY: `frame` is a live, resident cache frame
         // the file object owns and keeps alive (the VMA holds its reference, until an unmap's
@@ -453,8 +452,8 @@ impl AddressSpace {
                 true
             }
             Err(ArchMapError::OutOfMemory) => false,
-            Err(ArchMapError::Misaligned | ArchMapError::NotUser) => {
-                unreachable!("map_file_page: Misaligned for a page-aligned address")
+            Err(e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared)) => {
+                unreachable!("map_file_page: {e:?} for a page-aligned user-half address")
             }
         }
     }
@@ -619,7 +618,7 @@ fn rollback_object_map(mut guard: SpinLockGuard<'_, Inner>, start: VirtAddr, ins
 /// Translate the VMA-level [`Protection`] and [`Caching`] into hardware [`PageFlags`].
 /// `NO_EXECUTE` is inverted: hardware is executable by default, [`Protection`] non-executable.
 ///
-/// The caching comes from the object via the VMA, so every mapping of one aperture asks for the
+/// The caching comes from the object, so every mapping of one aperture asks for the
 /// same thing (a write-back request over firmware-uncacheable memory made `/dev/framebuffer`
 /// mappings far slower). Public because the boot's `report_framebuffer_cost` measures through it,
 /// and a measurement with its own copy would pass with this translation deleted.

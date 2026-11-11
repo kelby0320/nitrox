@@ -210,14 +210,6 @@ pub struct Vma {
     pub range: VAddrRange,
     pub prot: Protection,
     pub backing: Backing,
-    /// How this mapping's pages are cached: the backing object's answer, taken when the VMA is
-    /// made.
-    ///
-    /// Read wherever page flags are computed. Only `map_object` can see anything but
-    /// [`Caching::Normal`](crate::mm::Caching): an object mapping installs every page up front,
-    /// and the kinds that fault in are ordinary memory. The field lets the answer travel with the
-    /// mapping rather than being recomputed per site.
-    pub caching: crate::mm::Caching,
     link: RbLink,
 }
 
@@ -238,7 +230,7 @@ impl Drop for Vma {
 impl Vma {
     /// An anonymous VMA; a mapping of an object takes its [`backing`](Self::backing) once made.
     pub const fn new(range: VAddrRange, prot: Protection) -> Self {
-        Self { range, prot, backing: Backing::Anonymous, caching: crate::mm::Caching::Normal, link: RbLink::new() }
+        Self { range, prot, backing: Backing::Anonymous, link: RbLink::new() }
     }
 
     /// The backing object's reference, the VMA left anonymous: a refused mapping hands it back.

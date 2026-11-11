@@ -25,7 +25,7 @@ pub const KERNEL_VMAP_START: u64 = 0xFFFF_C000_0000_0000;
 pub const KERNEL_VMAP_END: u64 = 0xFFFF_D000_0000_0000;
 
 const PDPT_SPAN: u64 = 512 << 30;
-/// PDPTs [`init`] links, from the region's start.
+/// PDPTs [`KernelTables::adopt`] links, from the region's start.
 const WINDOW_PDPTS: u64 = 1;
 /// Exclusive upper bound of the window, the part of the region every root shares.
 pub const VMAP_WINDOW_END: u64 = KERNEL_VMAP_START + WINDOW_PDPTS * PDPT_SPAN;

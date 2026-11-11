@@ -289,14 +289,16 @@ freed while its owner lives.
   into it, then captures the kernel half for every address space, so the window is always in
   the capture. The scheduler loads it for a thread with no address space. Its kernel half is edited
   from many CPUs under no lock, so `map` and `unmap` take `&self`, and stay `unsafe`: the caller
-  answers for the address and the frame.
+  answers for the address and the frame. A map under no top-level table is refused (`Unshared`).
 - **`UserTables`** is an address space's own root, behind its lock, edited through `&mut self`
   and freed as it drops, after the space's VMAs. `map_owned` takes a `Frame` and hands it back
-  with an error; it is safe, as it maps write-back, at a user-half page, never global. `map`, for a
+  with an error; it is safe, as it maps write-back, below `USER_MAP_END`, never global. `map`, for a
   frame an object or a file keeps, stays `unsafe`: the caller keeps the frame live until its
   mapping is shot down. `unmap` is safe and gives back the address; the address space takes an
-  anonymous page's frame back by `Frame::from_pte`, by the VMA's kind, after the shootdown. A
-  kernel-half address is refused (`NotUser`), so no address space's tables edit what all share.
+  anonymous page's frame back by `Frame::from_pte`, by the VMA's kind, after the shootdown. An
+  address at or past `USER_MAP_END` is refused (`NotUser`): no address space's tables edit what
+  all share, or map the top user page. Anonymous and file pages are mapped write-back; only an
+  object's mapping takes another caching, its object's.
 
 Page tables are reached through the higher-half direct map: a table at
 physical `p` is addressed at `frame::hhdm(p)`, `p + hhdm_offset()`. Out of scope today:
@@ -479,7 +481,8 @@ The mechanism is template-and-copy:
    kind beyond the local invalidation.
 
 The rule that follows: **PML4 entries for the kernel half are
-immutable post-boot**. The intermediate tables they point at can
+immutable post-boot**, and `map_page` holds it, linking none
+(`MapError::Unshared`). The intermediate tables they point at can
 grow leaves freely; the top-level entries cannot change without
 visiting every AS to update its template-copy. Linux preallocates
 intermediate tables for the kernel-vmap region for the same

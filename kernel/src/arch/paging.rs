@@ -82,8 +82,10 @@ pub enum MapError {
     /// The virtual or physical address was not 4 KiB aligned, or the
     /// virtual address was not canonical.
     Misaligned,
-    /// Refused by a user half's tables: see `UserTables::map_owned`.
+    /// Refused by `UserTables`: past `USER_MAP_END`, global, or an owned frame not write-back.
     NotUser,
+    /// A kernel-half address under no top-level table, which every root shares, so only boot links.
+    Unshared,
 }
 
 /// Why [`ArchPaging::unmap_page`] could not remove a mapping.
@@ -94,7 +96,7 @@ pub enum UnmapError {
     NotMapped,
     /// The virtual address was not 4 KiB aligned, or not canonical.
     Misaligned,
-    /// A kernel-half address, which a user half's tables do not hold.
+    /// Refused by `UserTables::unmap`: an address at or past `USER_MAP_END`.
     NotUser,
 }
 
@@ -120,6 +122,7 @@ pub trait ArchPaging {
     ///
     /// Installs the entry but does **not** flush the TLB. Returns
     /// [`MapError::AlreadyMapped`] rather than replacing an existing leaf.
+    /// It links no kernel-half top-level table ([`MapError::Unshared`]).
     ///
     /// # Safety
     /// - `root` must be the physical base of a valid top-level page

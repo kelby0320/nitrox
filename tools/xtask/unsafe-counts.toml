@@ -16,7 +16,7 @@
 "kernel/src/libkern" = 38
 "kernel/src/limine" = 14
 "kernel/src/main" = 17
-"kernel/src/mm" = 98
+"kernel/src/mm" = 100
 "kernel/src/object" = 23
 "kernel/src/pci" = 4
 "kernel/src/power" = 1

@@ -4,7 +4,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::Paging;
-use crate::arch::abi::USER_VIRT_END;
+use crate::arch::abi::USER_MAP_END;
 use crate::arch::paging::{ArchPaging, MapError, PageFlags, UnmapError};
 use crate::libkern::AllocError;
 use crate::mm::frame::Frame;
@@ -23,6 +23,7 @@ impl KernelTables {
     /// `boot_root` is the live root, whose tables nothing frees; called once, at boot, on the one
     /// CPU running, before anything else reaches the kernel's tables.
     pub unsafe fn adopt(boot_root: PhysAddr, tops: impl Iterator<Item = VirtAddr>) {
+        assert_eq!(KERNEL.root.load(Ordering::Acquire), 0, "the kernel's page tables adopted twice");
         for va in tops {
             // SAFETY: the live boot root, which nothing else edits yet, per the contract.
             unsafe { Paging::ensure_kernel_intermediate(boot_root, va) }.expect("a kernel top-level table at boot");
@@ -41,6 +42,18 @@ impl KernelTables {
     /// The root a CPU loads to run in no address space.
     pub fn root(&self) -> PhysAddr {
         PhysAddr::new(self.root.load(Ordering::Acquire))
+    }
+
+    /// The address `va` maps to, or `None`.
+    pub fn translate(&self, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: the boot root, whose tables nothing frees.
+        unsafe { Paging::translate(self.root(), va) }
+    }
+
+    /// The cache-attribute entry the mapping of `va` selects, or `None`.
+    pub fn attribute_index(&self, va: VirtAddr) -> Option<u8> {
+        // SAFETY: as `translate`.
+        unsafe { Paging::attribute_index(self.root(), va) }
     }
 
     /// Map `phys` at `va`, linking the tables its path lacks.
@@ -131,7 +144,7 @@ impl UserTables {
 
     /// Unmap `va`, giving back what it mapped: a frame `map_owned` took is the caller's again.
     pub fn unmap(&mut self, va: VirtAddr) -> Result<PhysAddr, UnmapError> {
-        if va.as_u64() >= USER_VIRT_END {
+        if va.as_u64() >= USER_MAP_END {
             return Err(UnmapError::NotUser);
         }
         // SAFETY: this value's tree, which `&mut self` alone edits, at a user page, which the
@@ -148,10 +161,10 @@ impl Drop for UserTables {
     }
 }
 
-/// What a user half refuses: a kernel address, a global mapping, or its own frame not write-back.
+/// A user half refuses: past `USER_MAP_END`, a global mapping, or its own frame not write-back.
 fn refused(va: VirtAddr, flags: PageFlags, owned: bool) -> bool {
     let cached = [PageFlags::NO_CACHE, PageFlags::WRITE_THROUGH, PageFlags::WRITE_COMBINING];
-    va.as_u64() >= USER_VIRT_END
+    va.as_u64() >= USER_MAP_END
         || flags.contains(PageFlags::GLOBAL)
         || owned && cached.iter().any(|&c| flags.contains(c))
 }

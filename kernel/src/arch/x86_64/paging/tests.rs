@@ -363,6 +363,8 @@ fn a_walk_beside_a_mapper_in_one_tree_reads_what_is_linked() {
     let root = alloc_page_table().unwrap();
     let frames: std::vec::Vec<PhysAddr> = (0..4).map(|_| alloc_page_table().unwrap()).collect();
     let virt = |i: usize| VirtAddr::new(0xFFFF_C000_0000_0000 + (i as u64) * 0x20_0000);
+    // SAFETY: a live table this test owns, whose kernel-half top level is linked here, as at boot.
+    unsafe { X86Paging::ensure_kernel_intermediate(root, virt(0)) }.unwrap();
     let mapper = std::thread::spawn({
         let frames = frames.clone();
         move || {
