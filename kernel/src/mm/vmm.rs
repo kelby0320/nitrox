@@ -6,7 +6,7 @@
 //! [`arch::Paging`](crate::arch::Paging).
 //!
 //! This file holds the leaf data types ([`VAddrRange`], [`Protection`], [`Backing`], [`Vma`])
-//! and the [`VmaTree`], an intrusive interval-augmented red-black tree of `Vma`s.
+//! and the [`VmaTree`], an intrusive red-black tree of `Vma`s.
 
 use core::ptr::NonNull;
 
@@ -187,16 +187,12 @@ struct RbLink {
     left: Option<NonNull<Vma>>,
     right: Option<NonNull<Vma>>,
     color: RbColor,
-    /// The largest `range.end` in the subtree rooted here (the interval augmentation); kept
-    /// current by every structural mutation.
-    subtree_max_end: VirtAddr,
 }
 
 impl RbLink {
-    /// A link for a fresh `Vma` whose range ends at `end`. New nodes are red (the insert fixup
-    /// recolours).
-    const fn new(end: VirtAddr) -> Self {
-        Self { parent: None, left: None, right: None, color: RbColor::Red, subtree_max_end: end }
+    /// A link for a fresh `Vma`. New nodes are red (the insert fixup recolours).
+    const fn new() -> Self {
+        Self { parent: None, left: None, right: None, color: RbColor::Red }
     }
 }
 
@@ -242,13 +238,7 @@ impl Drop for Vma {
 impl Vma {
     /// An anonymous VMA; a mapping of an object takes its [`backing`](Self::backing) once made.
     pub const fn new(range: VAddrRange, prot: Protection) -> Self {
-        Self {
-            range,
-            prot,
-            backing: Backing::Anonymous,
-            caching: crate::mm::Caching::Normal,
-            link: RbLink::new(range.end()),
-        }
+        Self { range, prot, backing: Backing::Anonymous, caching: crate::mm::Caching::Normal, link: RbLink::new() }
     }
 
     /// The backing object's reference, the VMA left anonymous: a refused mapping hands it back.
@@ -257,7 +247,7 @@ impl Vma {
     }
 }
 
-/// An interval-augmented red-black tree of [`Vma`]s, keyed on `range.start`.
+/// A red-black tree of [`Vma`]s, keyed on `range.start`.
 ///
 /// The tree owns the boxed `Vma`s it stores: `insert` consumes the box (returning it on overlap),
 /// removal returns it, and drop frees every node iteratively without allocating.
@@ -267,9 +257,7 @@ impl Vma {
 /// 1. **BST ordering by `range.start`.** Unique, because no two stored `Vma`s overlap.
 /// 2. **Red-black properties.** Root black; no red node has a red parent; every root-to-leaf path
 ///    crosses the same number of black nodes.
-/// 3. **Interval augmentation.** A node's `subtree_max_end` is the maximum `range.end` in its
-///    subtree.
-/// 4. **Non-overlap.** An insert that would overlap an existing VMA is rejected.
+/// 3. **Non-overlap.** An insert that would overlap an existing VMA is rejected.
 ///
 /// Link pointers (`parent`, `left`, `right`) refer to live `Vma`s owned by this tree, or are
 /// `None`; a node dies only when the tree drops or removes it, so external code cannot invalidate
@@ -334,7 +322,6 @@ impl VmaTree {
             (*n).link.left = None;
             (*n).link.right = None;
             (*n).link.color = RbColor::Red;
-            (*n).link.subtree_max_end = (*n).range.end();
         }
         match parent {
             None => self.root = Some(new_node),
@@ -350,17 +337,12 @@ impl VmaTree {
         }
         self.len += 1;
 
-        // Independent of the RB fixup: each ancestor's subtree gained a node, so its
-        // `subtree_max_end` may have grown.
-        self.update_max_end_up_from(parent);
-
-        // RB fixup restores no-red-red; its rotations maintain augmentation themselves.
+        // RB fixup restores no-red-red.
         self.insert_fixup(new_node);
         Ok(())
     }
 
-    /// Find the `Vma` whose range contains `addr`. A plain O(log n) BST walk; the augmentation is
-    /// not needed.
+    /// Find the `Vma` whose range contains `addr`. A plain O(log n) BST walk.
     pub fn find_covering(&self, addr: VirtAddr) -> Option<&Vma> {
         let mut current = self.root;
         while let Some(node) = current {
@@ -382,7 +364,7 @@ impl VmaTree {
     /// An O(log n) plain BST walk with no backtracking. At each node: if `node.start >=
     /// query.end` the node and its right subtree lie after the query, so descend left; else if
     /// the node overlaps, record it as `best` and descend left for an earlier one; else (entirely
-    /// before the query) descend right. The `subtree_max_end` augmentation is not consulted.
+    /// before the query) descend right.
     pub fn find_first_overlapping(&self, query: VAddrRange) -> Option<&Vma> {
         let mut current = self.root;
         let mut best: Option<NonNull<Vma>> = None;
@@ -531,8 +513,6 @@ impl VmaTree {
             }
         };
 
-        self.update_max_end_up_from(x_parent);
-
         if y_original_color == RbColor::Black {
             self.delete_fixup(x, x_parent, x_is_left);
         }
@@ -543,7 +523,7 @@ impl VmaTree {
         // by any link pointer.
         unsafe {
             let zp = z.as_ptr();
-            (*zp).link = RbLink::new((*zp).range.end());
+            (*zp).link = RbLink::new();
             self.len -= 1;
             Some(KBox::from_raw(z))
         }
@@ -686,47 +666,7 @@ impl VmaTree {
         }
     }
 
-    /// Recompute `subtree_max_end` of `n` from its own range end and its children's.
-    ///
-    /// # Safety
-    /// `n` is a live tree node; its child links (which we read) are
-    /// either `None` or themselves live nodes per the tree invariants.
-    unsafe fn recompute_max_end(n: NonNull<Vma>) {
-        // SAFETY: forwarded from this function's contract.
-        unsafe {
-            let v = n.as_ptr();
-            let mut m = (*v).range.end();
-            if let Some(l) = (*v).link.left {
-                let lm = l.as_ref().link.subtree_max_end;
-                if lm > m {
-                    m = lm;
-                }
-            }
-            if let Some(r) = (*v).link.right {
-                let rm = r.as_ref().link.subtree_max_end;
-                if rm > m {
-                    m = rm;
-                }
-            }
-            (*v).link.subtree_max_end = m;
-        }
-    }
-
-    /// Walk from `start` up to the root, recomputing each ancestor's `subtree_max_end`.
-    fn update_max_end_up_from(&mut self, start: Option<NonNull<Vma>>) {
-        let mut cur = start;
-        while let Some(n) = cur {
-            // SAFETY: tree-link pointer, live by invariants.
-            unsafe {
-                Self::recompute_max_end(n);
-                cur = n.as_ref().link.parent;
-            }
-        }
-    }
-
-    /// Rotate left at `x`: its right child `y` becomes the parent and `x` y's left child. The
-    /// subtree's node set is unchanged, so `y` inherits x's old `subtree_max_end` and x's is
-    /// recomputed.
+    /// Rotate left at `x`: its right child `y` becomes the parent and `x` y's left child.
     ///
     /// # Safety
     /// `x` is a live tree node with a non-`None` right child. Every
@@ -759,9 +699,6 @@ impl VmaTree {
 
             (*yp).link.left = Some(x);
             (*xp).link.parent = Some(y);
-
-            Self::recompute_max_end(x);
-            Self::recompute_max_end(y);
         }
     }
 
@@ -796,9 +733,6 @@ impl VmaTree {
 
             (*xp).link.right = Some(y);
             (*yp).link.parent = Some(x);
-
-            Self::recompute_max_end(y);
-            Self::recompute_max_end(x);
         }
     }
 

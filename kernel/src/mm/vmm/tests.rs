@@ -20,17 +20,15 @@ fn insert_or_panic(tree: &mut VmaTree, r: VAddrRange) {
 }
 
 /// Verify the subtree at `node`: BST ordering by `range.start` (so no overlaps, as inserts
-/// reject them) and the augmentation invariant. Returns the true maximum `range.end`; panics
-/// with a descriptive message on a violation.
-fn check_bst_and_augmentation(node: Option<NonNull<Vma>>) -> VirtAddr {
+/// reject them); panics with a descriptive message on a violation.
+fn check_bst(node: Option<NonNull<Vma>>) {
     let Some(n) = node else {
-        return VirtAddr::new(0);
+        return;
     };
     // SAFETY: link pointer; live as long as the tree is.
     let v = unsafe { n.as_ref() };
-    let mut max_end = v.range.end();
     if let Some(l) = v.link.left {
-        let l_max_end = check_bst_and_augmentation(Some(l));
+        check_bst(Some(l));
         // SAFETY: live link.
         let lv = unsafe { l.as_ref() };
         assert!(
@@ -39,12 +37,9 @@ fn check_bst_and_augmentation(node: Option<NonNull<Vma>>) -> VirtAddr {
             lv.range.start(),
             v.range.start()
         );
-        if l_max_end > max_end {
-            max_end = l_max_end;
-        }
     }
     if let Some(r) = v.link.right {
-        let r_max_end = check_bst_and_augmentation(Some(r));
+        check_bst(Some(r));
         // SAFETY: live link.
         let rv = unsafe { r.as_ref() };
         assert!(
@@ -53,12 +48,7 @@ fn check_bst_and_augmentation(node: Option<NonNull<Vma>>) -> VirtAddr {
             rv.range.start(),
             v.range.start()
         );
-        if r_max_end > max_end {
-            max_end = r_max_end;
-        }
     }
-    assert_eq!(v.link.subtree_max_end, max_end, "augmentation violation at node starting {:?}", v.range.start());
-    max_end
 }
 
 /// Verify the red-black properties of the subtree at `node`: no red node has a red parent,
@@ -82,7 +72,7 @@ fn check_rb(node: Option<NonNull<Vma>>, parent_color: RbColor) -> usize {
 }
 
 fn verify(tree: &VmaTree) {
-    check_bst_and_augmentation(tree.root);
+    check_bst(tree.root);
     if let Some(root) = tree.root {
         // SAFETY: live link.
         let rc = unsafe { root.as_ref().link.color };
@@ -187,14 +177,13 @@ fn protection_empty_is_zero() {
 }
 
 #[test]
-fn vma_new_initializes_link_unlinked_red_with_self_max() {
+fn vma_new_initializes_link_unlinked_red() {
     let r = range(PAGE, PAGE * 4);
     let v = Vma::new(r, Protection::empty());
     assert!(v.link.parent.is_none());
     assert!(v.link.left.is_none());
     assert!(v.link.right.is_none());
     assert_eq!(v.link.color, RbColor::Red);
-    assert_eq!(v.link.subtree_max_end, r.end());
 }
 
 #[test]

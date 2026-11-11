@@ -288,22 +288,18 @@ shootdown — all filed in `docs/rationale/deferred-decisions.md`.
 
 [`mm/vmm.rs`](../../kernel/src/mm/vmm.rs) holds the leaf data types
 (`VAddrRange`, `Protection`, `Backing`, `Vma`) and `VmaTree` — an
-interval-augmented intrusive red-black tree of `Vma`s, keyed on
-`range.start`.
+intrusive red-black tree of `Vma`s, keyed on `range.start`.
 
-- **Intrusive linkage.** The `RbLink` (parent / left / right / colour
-  / `subtree_max_end`) lives as a private field on `Vma`. The tree
+- **Intrusive linkage.** The `RbLink` (parent / left / right / colour)
+  lives as a private field on `Vma`. The tree
   owns the boxed VMAs through `KBox<Vma>`: insert takes a box, remove
   returns one. Slab-backed allocation matches Linux's `vm_area_cachep`
   — every VMA goes through `kmalloc`, no per-address-space arena. The
   arena alternative was considered and rejected; see the decision log
   entry of 2026-05-27.
-- **Interval augmentation.** Each node carries `subtree_max_end`, the
-  maximum `range.end` over its subtree. It is maintained on every
-  structural mutation (insert, remove, rotation). Today's queries are
-  already O(log n) without consuming it; the augmentation is in place
-  for future disjoint-range stabbing queries that need subtree
-  pruning to skip whole branches.
+- **No interval augmentation.** A maximum end kept per subtree, for
+  stabbing queries that prune whole branches, went unread: every query
+  is O(log n) on the start key alone, as the VMAs never overlap.
 - **`Protection` is narrower than `arch::paging::PageFlags`.** A VMA
   carries WRITE / EXEC / USER only; `GLOBAL` and cache-attribute bits
   are per-PTE policy decided at install time, not a property of the
