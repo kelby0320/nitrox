@@ -534,6 +534,18 @@ does not compile. The survey's probe, a frame freed while its owner still reads 
 `unsafe` `from_pte`; it passes natively and Miri reports it. Under Miri, both models, the tests of
 `mm`, the memory object, the cache's frees, the paging race, the block layer and the RAM disk pass.
 
+**After review** (`ac2ed261`):
+- **An address space's root and a `VmapFrames`' frames are handed over by `into_pte`**, as a mapped
+  frame is, and taken back by `from_pte` as their owner drops: held as `Frame`s, a safe `view`
+  reached a live page table and a kernel stack. Viewing either no longer compiles; blocks: 569.
+- **`BuddyPager` and `HeapBuddy` are `mm`'s alone**: a free by hand from `object/` compiled.
+- **`fault_in`'s refusal is driven at each of its four takes, and a read ahead's frames are counted
+  taken and freed** (`frames_taken_by_this_thread`): a leak at either passed every test.
+- A retired frame, and a reference the file cache lists, are pushed only into the room reserved
+  for them, never dropped by a failed push: a reserve drifting from its loop fails tests now.
+- `lock-ordering.md` and `memory-management.md` lose the `Drop`s J.9 removed, and the former lists
+  every frame the `#PF` path drops.
+
 ### J.10 Typed page tables (kmem-o6, kplat-o1's rest, kmem-o10, kmem-o7's first step)
 
 **Most of kplat-o1 is Part I's**: slots read and written atomically through a `TableRef`, one walk,

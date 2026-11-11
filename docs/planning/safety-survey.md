@@ -1563,8 +1563,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   pairs with kmem-o6. Lenses: ownership, soundness, opportunities. Value high, effort medium
   (one lens said large). **Plan**, in P2.
   Done in `9b98803f`: `Frame` and `FrameBlock` in `mm::frame`, `into_pte` and `unsafe from_pte`; a
-  `MemoryObject` `Owned(KVec<Frame>)` or `Borrowed { base, npages }`; cache pages, retired frames,
-  `VmapFrames`' (the kernel stack's), a `DmaBuffer`'s and an address space's root typed.
+  `MemoryObject` `Owned(KVec<Frame>)` or `Borrowed { base, npages }`; cache pages, retired frames
+  and a `DmaBuffer`'s typed. An address space's root and `VmapFrames`' (the kernel stack's) are
+  handed over by `into_pte` (`ac2ed261`).
 - [x] **kmem-o3** encapsulate: kernel-half (vmap) mappings are made through
   `Paging::map_page`/`unmap_page` with a caller-chosen root (`active_root()`, a process root, or
   the root stored in `KernelStack`) and a local-only TLB flush, although the tables are shared by

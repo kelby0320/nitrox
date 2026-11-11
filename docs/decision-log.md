@@ -38058,16 +38058,19 @@ Part J's ninth sub-part, `typed-layers.md` § J.9, built on `pre-phase-7/part-j9
 - **A frame of RAM is a `Frame`, freed as it drops, and a block a `FrameBlock`**, freed at its
   order: neither is `Copy`, so neither is freed twice or at another order, and nothing safe frees
   one. `heap::buddy_free`, `BuddyAllocator::free` and `BuddyPager::free` are `unsafe`, the first
-  `mm`'s alone; the slab's large free, which rebuilds an address from a pointer, keeps its call.
+  and the pager `mm`'s alone; the slab's large free, which rebuilds an address from a pointer,
+  keeps its call.
 - **Every owner holds its frames typed**: a `MemoryObject` is owned frames or a borrowed range, so
   the framebuffer's object lists no addresses and no flag says which; a cache page, a retired
-  frame, a `VmapFrames`' frames, a `DmaBuffer`'s block and an address space's root free
-  themselves. Three rollbacks by hand, and three `Drop`s, went.
+  frame and a `DmaBuffer`'s block free themselves. Three rollbacks by hand, and three `Drop`s,
+  went.
 - **A page table that maps a frame takes it whole (`into_pte`), and an unmap takes it back with
   the `unsafe` `from_pte`**, by the VMA's kind, at three sites: with the frees `unsafe`, these are
   J.9's, where J.10 had drawn them. The PTE is not a second record of ownership: the VMA says
-  whose a page is.
+  whose a page is. **An address space's root and a `VmapFrames`' frames are handed over too**,
+  and taken back as their owner drops: held as `Frame`s, a safe view reached a live page table
+  and a kernel stack.
 - **A frame's drop takes the buddy's lock**, so the rule against freeing under `SCHED` or in an
   interrupt binds it; every frame drops in thread context or on the `#PF` path's exception.
-- `unsafe` blocks rise from 558 to 567, and `unsafe fn`s from 189 to 195: each free that was a
+- `unsafe` blocks rise from 558 to 569, and `unsafe fn`s from 189 to 195: each free that was a
   safe call is `unsafe` now, and so is each hand-over a type cannot hold.
