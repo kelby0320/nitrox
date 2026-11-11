@@ -1622,7 +1622,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   for owned frames). Lenses: abi, ownership, concurrency, opportunities. Value medium, effort
   medium. **Plan**, as kobj-o11, in P2.
   Done in `123999c8`, as kobj-o11; a fresh frame is zeroed by `frame::alloc_zeroed`.
-- [ ] **kmem-o6** narrow: every `ArchPaging` operation takes `root: PhysAddr` under the unsafe
+- [x] **kmem-o6** narrow: every `ArchPaging` operation takes `root: PhysAddr` under the unsafe
   contract "a valid top-level table owned by the caller" (10 unsafe trait fns, 15 more in the
   x86_64 impl), and safe wrappers such as `KernelStack::new(root)` forward a caller's value —
   29 production call sites (`prodgrep` over `Paging::(map_page|unmap_page|translate|
@@ -1638,6 +1638,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   safe fn passing an arbitrary root to `map_page` (kmem-d4), and `load_elf` translating a live AS
   without its lock. It also gives the 512 GiB vmap bound one place to live. Depends on: nothing;
   best with kmem-o2. Lens: opportunities. Value medium, effort medium. **Plan**, in P3.
+  Done in `bb331b92`: `KernelTables` and `UserTables` in `mm::page_tables`, an address space's in
+  its lock; `translate` safe on either, an owned frame mapped safely, a user half refusing the
+  kernel's.
 - [ ] **kmem-o7** remove: `VmaTree` is an intrusive red-black tree over raw `NonNull<Vma>` links
   and holds 102 of the subsystem's 139 raw derefs, plus 23 unsafe blocks and 4 unsafe fns; its
   interval augmentation `subtree_max_end` is maintained by `recompute_max_end`,
@@ -1656,6 +1659,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Value medium, effort medium. **Plan**, in P3,
   for its first step, deleting the augmentation; **later** for its second, replacing the tree: the
   maintainer's call, a balanced tree rather than a vector when it is revisited.
+  Partly done in `abdf3772`: its first step, the augmentation deleted.
 - [x] **kmem-o8** narrow: `copy_from_user`/`copy_to_user` are generic over `T: Copy`, and ABI
   types reinterpret themselves as bytes in hand-written unsafe blocks, each with its own padding
   claim — 21 sites (11 typed copies: `grep -rn 'copy_to_user(\|copy_from_user(' kernel/src
@@ -1691,7 +1695,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   offset past the buffer, references over device-written bytes, and a raw address stored in a
   driver struct (hid.rs:446, storage.rs:861) that outlives its `DmaBuffer`. Depends on: kmem-o8's
   marker trait. Lens: abi. Value medium, effort medium. **Plan**, as drv-o3, in P5.
-- [ ] **kmem-o10** narrow: `AddressSpace` repeats `unsafe { Paging::map_page/unmap_page(root, ..)
+- [x] **kmem-o10** narrow: `AddressSpace` repeats `unsafe { Paging::map_page/unmap_page(root, ..)
   }` with the same SAFETY argument ("root is this AS's PML4, lock held, the frame is fresh or the
   object's"), though holding `&mut Inner` already proves the lock and the root — 8 sites (`grep -n
   "unsafe { Paging::\(map_page\|unmap_page\)" kernel/src/mm/addr_space.rs`: lines 163, 264, 349,
@@ -1705,6 +1709,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   tables without the lock or through the wrong root (none seen today; it makes the rank-4 lock
   claim structural). Depends on: kmem-o2 and kmem-o4. Lenses: soundness, concurrency. Value
   medium, effort small. **Plan**, in P3.
+  Done in `bb331b92`: `UserTables`' `map_owned`, `map` and `unmap` on the locked state; mapping a
+  frame an object or a file keeps stays a narrow `unsafe`, at two sites.
 - [x] **kmem-o11** narrow: x86_64 page-table walks dereference `*table_ptr(x).add(index)` raw at
   every level under a per-function SAFETY argument; `translate` and `attribute_index` duplicate
   the same four-level walk, and shared kernel-half slots are read with plain loads but linked
@@ -2780,7 +2786,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
 
 **Opportunities**
 
-- [ ] **kplat-o1** encapsulate: page tables reached as `root: PhysAddr` and `table_ptr(phys) ->
+- [x] **kplat-o1** encapsulate: page tables reached as `root: PhysAddr` and `table_ptr(phys) ->
   *mut Pte`, every slot read and written with plain loads and stores except `ensure_table`'s CAS,
   and tree validity a caller obligation — 71 sites (`grep -rn 'Paging::\(map_page\|unmap_page\|
   translate\|attribute_index\|ensure_kernel_intermediate\|inherit_kernel_mappings\|
@@ -2794,6 +2800,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   typed roots make it large. Closes: the CAS-versus-plain-read data race (kplat-d7), a dangling
   root, an out-of-range slot index. Depends on: nothing. soundness, opportunities. Value high,
   effort large. **Plan**, in P3.
+  Done: the atomic slots and one walk in Part I; typed roots in `bb331b92`, `translate` and
+  `attribute_index` safe on them. The five walks of the active root stay `unsafe`.
 - [x] **kplat-o2** encapsulate: every Limine request read by hand (`(&raw const X).read()
   .response`, null check, `&*`, raw `.add(i)` array walks, `c_bytes`/`CStr::from_ptr` strings,
   each with its own SAFETY text) plus ten needless `unsafe impl Sync` on `static mut`
