@@ -10,7 +10,7 @@
 pub trait ArchCpu {
     /// Install the CPU's control tables early in boot (on x86_64: the GDT
     /// with its TSS, then the IDT — the order is fixed inside the impl).
-    fn init_tables();
+    fn init_tables(pin: &crate::arch::percpu::CpuPin<'_>);
 
     /// Enable every CPU-level memory-protection feature the kernel depends on (on x86_64: NX
     /// paging via `EFER.NXE`, write protection via `CR0.WP`, SMEP and SMAP). Panics if a
@@ -20,7 +20,7 @@ pub trait ArchCpu {
 
     /// Set the kernel stack the CPU loads on a ring3→ring0 trap (the neutral
     /// name for `TSS.RSP0` on x86_64).
-    fn set_kernel_stack(top: crate::mm::kstack::KernelStackTop);
+    fn set_kernel_stack(top: crate::mm::kstack::KernelStackTop, pin: &crate::arch::percpu::CpuPin<'_>);
 
     /// Park the CPU forever: disable interrupts and `hlt` in a loop so a
     /// spurious wake-up cannot restart execution. Never returns.

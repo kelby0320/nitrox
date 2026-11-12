@@ -38,10 +38,10 @@ pub mod text;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::cpu::ArchCpu;
-use crate::arch::smp::ArchSmp;
+use crate::arch::percpu::{CpuIndex, CpuPin};
 use crate::arch::timer::ArchTimer;
-use crate::libkern::IrqSpinLock;
 use crate::libkern::lockrank::LockRank;
+use crate::libkern::{IrqSpinLock, IrqsOff};
 use crate::limine::Framebuffer;
 use glyphs::{BLANK, GLYPH_W};
 use text::{CELLS, Geometry, Grid, INK, MAX_COLS, PAPER};
@@ -388,7 +388,7 @@ pub fn yield_to_userspace() {
     hold_for_gate();
     let yielded = {
         let mut console = CONSOLE.lock();
-        HOLDER.store(this_holder(), Ordering::Release);
+        HOLDER.store(this_holder(&console.pin()), Ordering::Release);
         let yielded = console.yield_screen();
         HOLDER.store(0, Ordering::Release);
         yielded
@@ -443,16 +443,14 @@ pub fn end_report() {
 }
 
 /// This CPU's [`HOLDER`] value, read with interrupts masked, where the thread cannot migrate.
-fn this_holder() -> u32 {
-    #[cfg(not(test))]
-    debug_assert!(!crate::arch::Cpu::interrupts_enabled(), "the CPU read with interrupts on");
-    crate::arch::Smp::current_cpu().wrapping_add(1)
+fn this_holder(pin: &CpuPin<'_>) -> u32 {
+    CpuIndex::current(pin).get() as u32 + 1
 }
 
 /// Run `f` on the console, waiting for the lock, with [`HOLDER`] naming this CPU meanwhile.
 fn with_console_waiting(f: impl FnOnce(&mut Console)) {
     let mut console = CONSOLE.lock();
-    HOLDER.store(this_holder(), Ordering::Release);
+    HOLDER.store(this_holder(&console.pin()), Ordering::Release);
     f(&mut console);
     HOLDER.store(0, Ordering::Release);
 }
@@ -501,12 +499,14 @@ pub fn reclaim_for_stop_with(last: &[u8]) {
 fn with_console(f: impl FnOnce(&mut Console)) -> bool {
     // A fault inside the console re-enters with its lock held, so with interrupts masked, which
     // keep this thread on the CPU it reads; with them on, this CPU holds no console.
-    if !crate::arch::Cpu::interrupts_enabled() && HOLDER.load(Ordering::Acquire) == this_holder() {
+    if !crate::arch::Cpu::interrupts_enabled()
+        && HOLDER.load(Ordering::Acquire) == this_holder(&IrqsOff::observed().pin())
+    {
         return false;
     }
     for _ in 0..PATIENCE {
         if let Some(mut console) = CONSOLE.try_lock() {
-            HOLDER.store(this_holder(), Ordering::Release);
+            HOLDER.store(this_holder(&console.pin()), Ordering::Release);
             f(&mut console);
             HOLDER.store(0, Ordering::Release);
             return true;

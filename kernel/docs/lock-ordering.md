@@ -576,7 +576,8 @@ A related multi-user-thread invariant (not a lock, but switch-path state): the
 per-CPU trap/syscall stack (TSS.RSP0 + the syscall-entry stack) and this CPU's
 `KERNEL_GS_BASE` (`arm_user_entry_cpu_base`) are re-armed for the incoming thread by
 `arm_kernel_stack`, on **every** switch-in (`switch_into`, through which every switch
-passes) and at each thread's first ring-3 descent (`thread_enter`) — a thread that
+passes) and at each thread's first ring-3 descent (`thread_enter`), both under `SCHED`, whose
+guard lends the per-CPU writes their pin (`arch::percpu`) — a thread that
 blocks mid-syscall is switched away with the entry `swapgs` still in effect, so a
 fresh descent must restore it. With a single user thread neither mattered; multiple do.
 
@@ -603,14 +604,14 @@ deadline heap, and a registration's, to fail its requests, resting on the same r
 
 Every plain [`SpinLock`] critical section runs with **preemption disabled**:
 `lock()` raises the per-CPU depth (`sched::preempt_disable`) before the acquire
-attempt and the guard drop lowers it after release. While the depth is nonzero
-the tick and reschedule IPI do their bookkeeping but skip the switch, latching
-it for `preempt_enable` to replay.
+attempt, and the `PreemptOff` it returns, held in the guard, lowers it after the
+release. While the depth is nonzero the tick and reschedule IPI do their bookkeeping
+but skip the switch, latching it for the `PreemptOff`'s drop to replay.
 
 **Enforced at runtime since 2026-08-14, in three places.** The invariant used to rest on
 review alone: `switch_into` asserts that nothing is switched away with the depth raised (the
 voluntary paths — `yield_now` and everything that blocks — which the involuntary ones already
-refuse); `preempt_enable` saturates rather than wrapping and asserts it was not already zero;
+refuse); a `PreemptOff`'s drop saturates rather than wrapping and asserts the depth was not zero;
 and the ring-3 syscall boundary asserts the depth is zero on entry, which is where a *leaked*
 disable is caught on a thread that never blocks. Debug builds, which is every image `xtask`
 produces. See the decision log, 2026-08-14.

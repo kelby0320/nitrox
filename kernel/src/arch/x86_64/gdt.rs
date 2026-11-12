@@ -1,7 +1,7 @@
 //! The kernel's own GDT, TSS and the IST stacks for `#DF` and NMI.
 //!
 //! **Per-CPU.** Each CPU has its own GDT, TSS and IST stacks ([`GDTS`], [`TSSES`],
-//! [`DF_STACKS`], indexed by [`this_cpu`]), because a TSS holds per-CPU stacks (IST1, IST2 and
+//! [`DF_STACKS`], indexed by [`CpuIndex`]), because a TSS holds per-CPU stacks (IST1, IST2 and
 //! RSP0). [`init`] runs once per CPU, the BSP at boot and each AP during bring-up.
 //!
 //! Layout of each GDT: null, 64-bit kernel code (`0x08`), kernel data (`0x10`), ring-3 data
@@ -10,16 +10,8 @@
 
 use core::arch::asm;
 
+use crate::arch::percpu::{CpuIndex, CpuPin, PerCpu};
 use crate::arch::smp::MAX_CPUS;
-use crate::arch::x86_64::regs;
-
-/// Dense index of the running CPU (its GDT/TSS slot), read via `RDTSCP`; an AP sets it
-/// *before* calling [`init`]. Nothing checks for RDTSCP first: TODO(cpu-feature-check).
-fn this_cpu() -> usize {
-    let cpu = regs::rdtscp_aux() as usize;
-    debug_assert!(cpu < MAX_CPUS, "cpu index out of range");
-    cpu
-}
 
 /// Selector for the 64-bit kernel code segment (GDT index 1), referenced by the IDT's gates.
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
@@ -57,23 +49,23 @@ const GDT_LEN: usize = 7;
 
 const DF_STACK_SIZE: usize = 16 * 1024;
 
-/// One Global Descriptor Table **per CPU**, indexed by [`this_cpu`]; the TSS descriptor's base is
+/// One Global Descriptor Table **per CPU**, indexed by [`CpuIndex`]; the TSS descriptor's base is
 /// the address of that CPU's [`TSSES`] slot.
-static mut GDTS: [[u64; GDT_LEN]; MAX_CPUS] = [[0; GDT_LEN]; MAX_CPUS];
+static GDTS: PerCpu<[u64; GDT_LEN]> = PerCpu::new([[0; GDT_LEN]; MAX_CPUS]);
 
 /// One 64-bit Task State Segment **per CPU**: `ist[0]` (IST1) is its `#DF` stack, `ist[1]` (IST2)
 /// its NMI stack, and `rsp[0]` its current thread's kernel stack.
-static mut TSSES: [Tss; MAX_CPUS] = [const { Tss::new(0, 0) }; MAX_CPUS];
+static TSSES: PerCpu<Tss> = PerCpu::new([const { Tss::new(0, 0) }; MAX_CPUS]);
 
 /// Backing storage for the per-CPU **NMI** IST stacks.
 ///
 /// An NMI can arrive when RSP is the **user** stack (`syscall_entry`'s two-instruction window
 /// after `swapgs`), and an IST=0 gate does not switch stacks: the push would `#PF` under SMAP,
 /// then `#DF` with a misleading dump over the real diagnosis.
-static mut NMI_STACKS: [DfStack; MAX_CPUS] = [const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS];
+static NMI_STACKS: PerCpu<DfStack> = PerCpu::new([const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS]);
 
 /// Backing storage for the per-CPU double-fault IST stacks; the CPU loads RSP directly from IST1.
-static mut DF_STACKS: [DfStack; MAX_CPUS] = [const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS];
+static DF_STACKS: PerCpu<DfStack> = PerCpu::new([const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS]);
 
 #[repr(C, align(16))]
 struct DfStack([u8; DF_STACK_SIZE]);
@@ -133,19 +125,10 @@ fn tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
 /// Install this CPU's GDT, load the TSS, and switch to kernel selectors.
 ///
 /// Call once per CPU, before [`crate::arch::x86_64::idt::init`].
-pub fn init() {
-    let cpu = this_cpu();
-    // Raw element pointers: no bounds-check panic in the boot path.
-    // SAFETY: `cpu < MAX_CPUS`, as both writers of the index bound it; `add(cpu)` stays in
-    // bounds. No references into the `static mut`s are formed.
-    let (df_ptr, nmi_ptr, tss_ptr, gdt_ptr) = unsafe {
-        (
-            (&raw const DF_STACKS).cast::<DfStack>().add(cpu),
-            (&raw const NMI_STACKS).cast::<DfStack>().add(cpu),
-            (&raw mut TSSES).cast::<Tss>().add(cpu),
-            (&raw mut GDTS).cast::<[u64; GDT_LEN]>().add(cpu),
-        )
-    };
+pub fn init(pin: &CpuPin<'_>) {
+    let cpu = CpuIndex::current(pin);
+    let (df_ptr, nmi_ptr, tss_ptr, gdt_ptr) =
+        (DF_STACKS.slot(cpu), NMI_STACKS.slot(cpu), TSSES.slot(cpu), GDTS.slot(cpu));
 
     // IST1 and IST2 at the tops of the `#DF` and NMI stacks (they grow down).
     let df_top = (df_ptr as usize as u64) + DF_STACK_SIZE as u64;
@@ -245,15 +228,12 @@ unsafe fn load_tss() {
 ///
 /// Must be set before any ring-3 entry. `syscall` does *not* consult RSP0; the entry stub loads
 /// the kernel stack itself.
-pub fn set_kernel_stack(top: u64) {
-    regs::debug_assert_pinned("set_kernel_stack");
-    let cpu = this_cpu();
-    // SAFETY: writes only the running CPU's TSS slot (`cpu < MAX_CPUS`), which it
-    // owns exclusively with no outstanding reference. `rsp[0]` is a `u64` at a
-    // 4-aligned offset in a `#[repr(C, packed)]` TSS, so write it unaligned to
-    // avoid forming a misaligned reference.
+pub fn set_kernel_stack(top: u64, pin: &CpuPin<'_>) {
+    let tss_ptr = TSSES.slot(CpuIndex::current(pin));
+    // SAFETY: the running CPU's TSS slot, which `pin` keeps the thread on, so no other CPU writes
+    // it, and no reference to it is formed. `rsp[0]` is a `u64` at a 4-aligned offset in a
+    // `#[repr(C, packed)]` TSS, so it is written unaligned.
     unsafe {
-        let tss_ptr = (&raw mut TSSES).cast::<Tss>().add(cpu);
         let rsp0 = &raw mut (*tss_ptr).rsp[0];
         rsp0.write_unaligned(top);
     }

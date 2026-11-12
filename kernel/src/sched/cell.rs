@@ -3,13 +3,15 @@
 //! such objects, followed with it.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 
+use crate::arch::percpu::CpuPin;
 use crate::object::header::{Shared, Weak};
 
 /// The right to borrow what `SCHED` guards. The scheduler's state keeps the one there is, so a
 /// `&mut` to it is had only while the lock is held, and lends one [`SchedCell`]'s interior at a
 /// time.
-pub struct SchedToken(());
+pub struct SchedToken(PhantomData<core::cell::Cell<()>>);
 
 impl SchedToken {
     /// The token the scheduler's state keeps.
@@ -18,13 +20,20 @@ impl SchedToken {
     /// It is kept in a `SchedState`, and no other token reaches the cells that state's objects
     /// hold.
     pub(super) const unsafe fn new() -> Self {
-        Self(())
+        Self(PhantomData)
+    }
+
+    /// The pin the held lock lends.
+    pub(super) fn pin(&self) -> CpuPin<'_> {
+        // SAFETY: the one token is reached only through `SCHED`'s guard, which masks this CPU's
+        // interrupts while held; a test's own is on the host, where every thread reads index 0.
+        unsafe { CpuPin::assume() }
     }
 
     /// A token for a test's own objects, which no `SchedState` reaches.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(())
+        Self(PhantomData)
     }
 }
 

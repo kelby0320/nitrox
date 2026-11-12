@@ -213,9 +213,11 @@ thread still runs; and the APs past `MAX_CPUS`, parked on Limine's `goto_address
 `kernel_main` then brings the system up in this order — the ordering is load-bearing, and
 each step's rationale is in the source comments:
 
-1. **CPU tables** — GDT + TSS, then IDT (`arch::Cpu::init_tables`). First because it prints
-   nothing and needs nothing, and everything after it can fault: with the IDT live, a bad
-   framebuffer descriptor produces a register dump rather than a silent triple fault.
+1. **CPU tables** — GDT + TSS, then IDT (`arch::Cpu::init_tables`), and the syscall entry
+   (`arch::init_syscall_entry`), each on the CPU a pin keeps the boot on: interrupts are masked
+   and nothing is scheduled yet. First because it prints nothing and needs nothing, and
+   everything after it can fault: with the IDT live, a bad framebuffer descriptor produces a
+   register dump rather than a silent triple fault.
 2. **The screen, then serial.** Neither needs anything but what Limine handed over, so every
    later step can report progress *and failure*. The screen goes first so that the first line is
    on it: `fbcon::init` takes Limine's framebuffer and draws everything COM1 receives from here
@@ -287,8 +289,8 @@ each step's rationale is in the source comments:
 
 ## 4. The first userspace process
 
-`run_first_userspace` arms the syscall fast path, then builds pid 1 by hand — this is the
-one process nothing else can construct:
+`run_first_userspace` builds pid 1 by hand — this is the one process nothing else can
+construct:
 
 - Allocate an address space; load `/sbin/init` from the initramfs (halt if absent).
 - Allocate the process and a notification channel, and a handle to it.

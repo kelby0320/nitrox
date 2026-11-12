@@ -22,6 +22,7 @@ use core::arch::naked_asm;
 use core::mem::offset_of;
 
 use super::{gdt, regs};
+use crate::arch::percpu::{CpuIndex, CpuPin, PerCpu};
 
 const MSR_EFER: u32 = 0xC000_0080;
 const EFER_SCE: u64 = 1 << 0; // syscall enable
@@ -50,30 +51,24 @@ pub struct CpuLocal {
 
 const CPU_LOCAL_INIT: CpuLocal = CpuLocal { rsp_scratch: 0, kstack_top: 0 };
 
-/// One [`CpuLocal`] per CPU, indexed by the dense `current_cpu()` id.
-static mut CPUS: [CpuLocal; crate::arch::smp::MAX_CPUS] = [CPU_LOCAL_INIT; crate::arch::smp::MAX_CPUS];
+/// One [`CpuLocal`] per CPU, its slot reached by [`CpuIndex`] under a pin.
+static CPUS: PerCpu<CpuLocal> = PerCpu::new([CPU_LOCAL_INIT; crate::arch::smp::MAX_CPUS]);
 
 const OFF_SCRATCH: usize = offset_of!(CpuLocal, rsp_scratch);
 const OFF_KSTACK: usize = offset_of!(CpuLocal, kstack_top);
 const _: () = assert!(OFF_SCRATCH == 0 && OFF_KSTACK == 8);
 
 /// Raw pointer to the running CPU's [`CpuLocal`] slot, indexed by the dense CPU id from `RDTSCP`.
-fn this_cpu_block() -> *mut CpuLocal {
-    let idx = regs::rdtscp_aux() as usize;
-    debug_assert!(idx < crate::arch::smp::MAX_CPUS, "cpu index out of range");
-    // SAFETY: `idx < MAX_CPUS`: `IA32_TSC_AUX` is written only with 0 (the BSP) or a slot
-    // of the `MAX_CPUS`-entry identity map (`adopt_dense_index`). Pointer arithmetic within the
-    // static array (no bounds-check panic in this entry path, no reference formed);
-    // each CPU addresses only its own slot.
-    unsafe { (&raw mut CPUS).cast::<CpuLocal>().add(idx) }
+fn this_cpu_block(pin: &CpuPin<'_>) -> *mut CpuLocal {
+    CPUS.slot(CpuIndex::current(pin))
 }
 
 /// Arm the syscall entry on this CPU: `EFER.SCE`, `STAR`, `LSTAR`, `SFMASK`, `KERNEL_GS_BASE`.
 ///
 /// Must run after `gdt::init` (STAR's selectors must be in the loaded GDT) and before any ring-3
 /// entry. The kernel stack is per-thread ([`set_syscall_kernel_stack`]).
-pub fn init_syscall_entry() {
-    let gs_base = this_cpu_block() as u64;
+pub fn init_syscall_entry(pin: &CpuPin<'_>) {
+    let gs_base = this_cpu_block(pin) as u64;
     let star = gdt::STAR_VALUE;
     let lstar = syscall_entry as *const () as u64;
     // SAFETY: all four MSRs are architectural on every long-mode CPU. We
@@ -93,9 +88,8 @@ pub fn init_syscall_entry() {
 ///
 /// `enter_user` does no `swapgs`; a stale `KERNEL_GS_BASE` would fault on `gs:` in the first
 /// `syscall`'s entry.
-pub fn arm_user_entry_cpu_base() {
-    regs::debug_assert_pinned("arm_user_entry_cpu_base");
-    let gs_base = this_cpu_block() as u64;
+pub fn arm_user_entry_cpu_base(pin: &CpuPin<'_>) {
+    let gs_base = this_cpu_block(pin) as u64;
     // SAFETY: architectural MSR; this CPU's `CpuLocal` slot is the block the entry
     // stub reaches through `gs:` after `swapgs`.
     unsafe { regs::wrmsr(MSR_KERNEL_GS_BASE, gs_base) };
@@ -104,20 +98,19 @@ pub fn arm_user_entry_cpu_base() {
     // `syscall` would then `#UD` (`EFER.SCE=0`). The re-arm runs only in that unarmed case.
     // SAFETY: `rdmsr(EFER)` is architectural in ring 0.
     if unsafe { regs::rdmsr(MSR_EFER) } & EFER_SCE == 0 {
-        init_syscall_entry();
+        init_syscall_entry(pin);
     }
 }
 
 /// Set the kernel stack the `syscall` entry stub switches to on this CPU.
 ///
 /// Called with the user thread's kernel stack top before it descends to ring 3.
-pub fn set_syscall_kernel_stack(top: crate::mm::kstack::KernelStackTop) {
-    regs::debug_assert_pinned("set_syscall_kernel_stack");
-    // SAFETY: writes only the running CPU's slot, which interrupts masked keep it on. In ring 0
+pub fn set_syscall_kernel_stack(top: crate::mm::kstack::KernelStackTop, pin: &CpuPin<'_>) {
+    // SAFETY: writes only the running CPU's slot, which `pin` keeps the thread on. In ring 0
     // about to descend to ring 3 on this CPU, no `syscall` on this CPU can be reading
     // `kstack_top` concurrently, and other CPUs touch only their own slots.
     unsafe {
-        (&raw mut (*this_cpu_block()).kstack_top).write(top.get());
+        (&raw mut (*this_cpu_block(pin)).kstack_top).write(top.get());
     }
 }
 
@@ -169,15 +162,16 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
     // passed its address; valid, aligned, and unaliased for this call.
     let f = unsafe { &mut *frame };
     let ret = crate::syscall::dispatch(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
-    crate::sched::end_if_ending();
+    returning_to_ring3(f.rax);
+    ret
+}
+
+/// A syscall's way back to ring 3: its own check first, as `end_if_ending`'s names no syscall.
+fn returning_to_ring3(nr: u64) {
     // **A syscall body must not return with interrupts enabled**: the stub's `cli` makes the
     // `pop rsp` / `sysretq` window safe regardless, and this catches the *cause*.
-    debug_assert!(
-        !<crate::arch::Cpu as crate::arch::cpu::ArchCpu>::interrupts_enabled(),
-        "syscall {} returned with interrupts enabled",
-        f.rax
-    );
-    ret
+    debug_assert!(crate::libkern::irqs::masked(), "syscall {nr} returned with interrupts enabled");
+    crate::sched::end_if_ending();
 }
 
 /// The `syscall` entry point (the `IA32_LSTAR` target).
@@ -308,4 +302,23 @@ pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, a0: u64, a1: u64, 
         // via SFMASK.
         rflags  = const 0x202u64,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::libkern::irqs::force;
+
+    /// Named, before `end_if_ending`'s check refuses it unnamed.
+    #[test]
+    #[should_panic(expected = "syscall 7 returned with interrupts enabled")]
+    fn a_syscall_returning_with_interrupts_on_is_named() {
+        force(true);
+        super::returning_to_ring3(7);
+    }
+
+    #[test]
+    fn a_syscall_returning_with_interrupts_masked_goes_back() {
+        force(false);
+        super::returning_to_ring3(7);
+    }
 }

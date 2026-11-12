@@ -10,7 +10,10 @@
 //! fire while the lock is held and a handler can never find it held by the context it
 //! interrupted.
 
+use crate::arch::percpu::CpuPin;
+use crate::libkern::irqs::backend as irq_backend;
 use crate::libkern::lockrank::{LockRank, Taken};
+use crate::sched::PreemptOff;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
@@ -56,11 +59,11 @@ impl<T> SpinLock<T> {
     /// cannot tick to reschedule the holder, nor ack a TLB shootdown) or when the holder is the
     /// idle thread. With preemption off, a spinner always waits on a *running* holder.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        crate::sched::preempt_disable();
+        let off = crate::sched::preempt_disable();
         loop {
             if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 crate::libkern::lockrank::acquired(self.rank, Taken::Waiting);
-                return SpinLockGuard { lock: self, _here: PhantomData };
+                return SpinLockGuard { lock: self, _off: off };
             }
             // Spin on a relaxed read, not the CAS, so the cacheline is not bus-locked.
             while self.locked.load(Ordering::Relaxed) {
@@ -92,7 +95,7 @@ impl<T> SpinLock<T> {
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
     /// Not `Send`: it is released on the CPU whose preemption count and lock ranks it raised.
-    _here: PhantomData<*const ()>,
+    _off: PreemptOff,
 }
 
 // SAFETY: a shared guard gives out `&T` only, so it may be shared where `T` may.
@@ -117,67 +120,10 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        // Drop the rank first: `preempt_enable` below can replay a deferred reschedule,
+        // Drop the rank first: `_off`, dropped after this, can replay a deferred reschedule,
         // which takes `SCHED` — that acquire must not see this lock still recorded.
         crate::libkern::lockrank::releasing(self.lock.rank);
-        // Release first, then re-enable preemption: a deferred reschedule replayed by
-        // `preempt_enable` must not run while this lock is held.
         self.lock.release();
-        crate::sched::preempt_enable();
-    }
-}
-
-/// Interrupt-flag backend for [`IrqSpinLock`].
-///
-/// On target, this drives the real CPU interrupt flag through the arch layer. Under
-/// `cfg(test)` (host ring 3) the real `cli`/`sti` would `#GP`, so a mock models `IF` in a
-/// **per-thread** `Cell<bool>`, enough to exercise the lock's save/restore *logic*.
-#[cfg(not(test))]
-mod irq_backend {
-    use crate::arch::Cpu;
-    use crate::arch::cpu::ArchCpu;
-
-    #[inline]
-    pub(super) fn disable() -> bool {
-        Cpu::interrupts_disable()
-    }
-
-    #[inline]
-    pub(super) fn restore(prev: bool) {
-        // SAFETY: ring-0; restoring an interrupt state captured by `disable`.
-        unsafe { Cpu::interrupts_restore(prev) }
-    }
-}
-
-#[cfg(test)]
-mod irq_backend {
-    std::thread_local! {
-        /// Models `RFLAGS.IF` for host tests, **one flag per thread**. Starts enabled (the
-        /// boot default once preemption is armed).
-        ///
-        /// Per-thread because `IF` *is* per-CPU: a process-global flag is a machine where any
-        /// core's `cli` masks interrupts on all of them, and a host test thread stands in for a
-        /// core. `cargo test` runs tests concurrently, so a global flag let one test's write fail
-        /// `irq_lock_masks_while_held_and_restores_on_drop`.
-        static MOCK_IF: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
-    }
-
-    pub(super) fn disable() -> bool {
-        MOCK_IF.with(|f| f.replace(false))
-    }
-
-    pub(super) fn restore(prev: bool) {
-        MOCK_IF.with(|f| f.set(prev));
-    }
-
-    /// The modelled flag, for tests asserting on it.
-    pub(super) fn peek() -> bool {
-        MOCK_IF.with(|f| f.get())
-    }
-
-    /// Establish a prior interrupt state before acquiring, for tests that need one.
-    pub(super) fn force(enabled: bool) {
-        MOCK_IF.with(|f| f.set(enabled));
     }
 }
 
@@ -262,6 +208,14 @@ pub struct IrqSpinLockGuard<'a, T> {
 unsafe impl<T: Sync> Sync for IrqSpinLockGuard<'_, T> {}
 
 impl<'a, T> IrqSpinLockGuard<'a, T> {
+    /// The pin the hold lends, through `&mut` as the guard is `Sync`: its holder's thread alone.
+    pub fn pin(&mut self) -> CpuPin<'_> {
+        // SAFETY: the lock masked this CPU's interrupts before it was taken, and restores them only
+        // as the guard drops. An outer guard dropped first would unmask under it, a deadlock if an
+        // interrupt took this lock, which `CpuIndex::current` checks in debug builds.
+        unsafe { CpuPin::assume() }
+    }
+
     /// Release the lock but **keep interrupts masked**, returning the prior interrupt state
     /// the caller must later hand to
     /// [`Cpu::interrupts_restore`](crate::arch::cpu::ArchCpu::interrupts_restore).
@@ -388,7 +342,7 @@ mod tests {
         irq_backend::force(enabled);
     }
     fn mock_if() -> bool {
-        irq_backend::peek()
+        irq_backend::enabled()
     }
 
     #[test]

@@ -656,6 +656,59 @@ where IF=1 and no race is needed; `current(pin)` checked both ways on the host t
 seeing a depth of one, which a process-wide backing fails. `scheduler.md` and `smp.md` say how the
 index is read. Author.
 
+**Built 2026-11-11** (`07ce1e54`).
+- **`arch::percpu`: `CpuIndex`, `CpuPin`, `PerCpu` and `cpu_local!`.** A `CpuIndex` is below
+  `MAX_CPUS` by construction: `BSP`, an AP's from `adopt_dense_index`, or `current(pin)`. A
+  `CpuPin` is lent by an `IrqsOff` (`libkern::irqs`, what masking returns), an `IrqSpinLockGuard`,
+  a `PreemptOff` (what `preempt_disable` returns) or the scheduler's held state, through which the
+  24 reads under `SCHED` became `SchedState::me()` (the implementer's). Debug builds check, as the
+  index is read, that interrupts are masked or preemption is off.
+- **The five `static mut` arrays are `PerCpu`s, reached by raw slot alone.** The shared state, the
+  preemption depth, the deferred reschedule, the ending flag and the lock tracker's ranks, is
+  `cpu_local!`, a host test's thread holding a set of its own; `remote` serves `end_siblings`.
+- **For the maintainer's eye: two departures from the plan.** The bring-up passes down a pin, not
+  its index: `gdt::init` and `init_syscall_entry` read the index under it, as a function handed an
+  index could be handed another CPU's. And `PerCpu` has no safe `get`: a shared borrow of a slot
+  beside a raw write to it is unsound for plain data that is `Sync`, as a TSS is, so the shared
+  values are `cpu_local!`'s, and `PerCpu`'s are raw.
+- **`IrqsOff::observed()` checks in every build** where only the entry masked: the return to ring
+  3, a shootdown IPI, an interrupt's lock scope, the bring-up. **`switch_into` refuses a live
+  `IrqsOff`** in debug builds, the one pin no other check there sees. **The handle lookup's read
+  section holds a `PreemptOff`.**
+- **kplat-d23**: the BSP's syscall entry is armed beside its tables, before it can be scheduled.
+  **sched-d16**: `switch_into` arms the incoming thread's stacks before it lets go of `SCHED`, its
+  pin.
+
+Counts: `unsafe` blocks stay at 568 (`arch` −2, `libkern` and `sched` +1 each), `unsafe fn`s rise
+from 197 to 198 (`CpuPin::assume`), `unsafe impl`s from 59 to 60 (`PerCpu`'s `Sync`), and
+`static mut`s fall from 11 to 6. Each pin's lender argues once what each read of an array argued
+before; the raises are by hand in the code commit.
+
+**The controls**: the BSP's `init_syscall_entry` back at its old place fails `test-qemu`,
+"interrupts observed masked, and they were on", IF being 1 there with no race needed. On the
+host: a pin an outer lock's early release unmasked is refused, and accepted with preemption off;
+two threads each holding a lock see a depth of one, where a process-wide twin shows two; a live
+`IrqsOff` at a switch is refused; `observed` with interrupts on is refused; a mask restores what
+was; each CPU's slot is its own. Seven mutations, each failing its test, the one removing
+`observed`'s check at the pin's check behind it. Forging an index or a pin, reading the index
+without one, sending a mask, or arming after the release does not compile (E0603, E0624, E0133,
+E0061, E0277, E0382). Under Miri, both models, the 31 tests of the per-CPU types, the masks, the
+spinlocks, the preemption checks, grace and the shootdown.
+
+**After review** (`3ea2d34c`):
+- **The index is read unpinned only inside `arch`**: `ArchSmp` lost `current_cpu`,
+  `identity_bound` and `init_this_cpu`, which neutral code could call unpinned, and on an AP make
+  index 0 a second core's. `leave_online` asks `bound_index`; the boot CPU adopts index 0 by its
+  APIC id as an AP adopts its own, and a binding of an index or an APIC id bound already is
+  refused. The banner and the self-test's samples read the index under a mask.
+- **A syscall returning with interrupts on is named again**, checked before `end_if_ending`'s
+  unnamed refusal.
+- **`release_for_switch` holds every check a switch makes**, the lock tracker's first again, and
+  host tests drive it. A plain-lock holder never reaches it: a boot yielding under one stops at
+  the next acquisition's order check.
+- **A pin is lent only to the borrow's own thread**: `IrqSpinLockGuard::pin` takes `&mut`, and
+  `SchedToken` is not `Sync`. An observed `IrqsOff` restores nothing (tested).
+
 ### J.12 DMA memory, bounded and owned (drv-o3 with kmem-o9; drv-o13)
 
 **15 `.virt()` sites** in the drivers behind **21 `unsafe` blocks**, three of them addresses stored

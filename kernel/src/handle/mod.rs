@@ -102,13 +102,12 @@ pub(crate) unsafe fn release_refcount(obj: *mut ()) {
 /// dense id, valid since `MAX_CPUS <= grace::MAX_CTX`. Tests override it with a
 /// thread-local counter so each `std::thread` gets a distinct id.
 #[cfg(not(test))]
-pub(crate) fn current_ctx_id() -> u32 {
-    use crate::arch::smp::ArchSmp;
-    crate::arch::Smp::current_cpu()
+pub(crate) fn current_ctx_id(pin: &crate::arch::percpu::CpuPin<'_>) -> u32 {
+    crate::arch::percpu::CpuIndex::current(pin).get() as u32
 }
 
 #[cfg(test)]
-pub(crate) fn current_ctx_id() -> u32 {
+pub(crate) fn current_ctx_id(_: &crate::arch::percpu::CpuPin<'_>) -> u32 {
     use core::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
     std::thread_local! {

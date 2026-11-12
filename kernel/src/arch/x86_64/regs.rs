@@ -320,13 +320,6 @@ pub fn read_rflags() -> u64 {
     val
 }
 
-/// Assert, in debug builds, that this CPU's interrupts are masked, so its thread cannot migrate
-/// between reading which CPU it is on and writing that CPU's slot.
-#[inline]
-pub fn debug_assert_pinned(what: &str) {
-    debug_assert!(read_rflags() & (1 << 9) == 0, "{what}: this CPU's slot written with interrupts on");
-}
-
 /// Clear the interrupt flag (`cli`), masking maskable interrupts on this CPU.
 /// Leaving interrupts masked indefinitely stalls preemption;
 /// callers must bound the masked window (see [`crate::libkern::IrqSpinLock`]).
@@ -388,8 +381,10 @@ pub fn rdtsc() -> u64 {
 
 /// Read `IA32_TSC_AUX` (the per-CPU logical id the kernel programs there) via `RDTSCP`,
 /// discarding the timestamp. `RDTSCP` (`CPUID.80000001H:EDX[27]`) is in the project's hardware
-/// baseline but not in bare `qemu64`, so the dev loop passes `+rdtscp` (absent, it `#UD`s).
+/// baseline but not in bare `qemu64`, so the dev loop passes `+rdtscp` (absent, it `#UD`s): nothing
+/// checks for it first, TODO(cpu-feature-check).
 /// The "which CPU am I" primitive — see `docs/architecture/scheduler.md` §Per-CPU access.
+#[cfg(not(test))]
 #[inline]
 pub fn rdtscp_aux() -> u32 {
     let aux: u32;

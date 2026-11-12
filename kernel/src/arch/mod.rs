@@ -31,6 +31,7 @@ pub mod irq_install;
 pub mod irq_router;
 pub mod memory_types;
 pub mod paging;
+pub mod percpu;
 pub mod platform;
 pub mod smp;
 pub mod timer;
@@ -88,9 +89,12 @@ pub use x86_64::cpu::X86Cpu as Cpu;
 pub use x86_64::acpi::X86Platform as Platform;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::smp::X86Smp as Smp;
+// The raw read of this CPU's index, for `percpu` alone, which reads it under a pin.
 /// Per-CPU architecture bring-up for an application processor (run on the AP).
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::smp::ap_cpu_init;
+#[cfg(target_arch = "x86_64")]
+use x86_64::smp::current_cpu as raw_current_cpu;
 /// APIC-id-based dense-index assignment: the BSP binds each dense index to a
 /// hardware APIC id ([`bind_cpu_identity`]); each core adopts its own index by
 /// matching its APIC id ([`adopt_dense_index`]), so indices are unique by

@@ -1,6 +1,8 @@
 //! Exit, fault suspension and resumption, and the reaper.
 
 use super::*;
+use crate::arch::percpu::cpu_local;
+use crate::libkern::IrqsOff;
 
 /// The action a supervisor's `sys_exception_resume` requests for a thread suspended on a
 /// fault. Only the two terminal dispositions exist; `ResumeSkip`/`ModifyAndResume` and the
@@ -48,33 +50,20 @@ pub fn pid_has_threads(pid: u32) -> bool {
     has_live_siblings(&SCHED.lock(), pid)
 }
 
-/// Per-CPU copy of the running thread's [`Thread::is_ending`], written under `SCHED` and read on
-/// the way to ring 3 without it, by its own CPU with interrupts masked.
-#[cfg(not(test))]
-static ENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-
-#[cfg(test)]
-std::thread_local! {
-    /// Host-test backing for [`ENDING`], one set per test thread, as `preempt`'s flags are.
-    static ENDING_TLS: [AtomicBool; MAX_CPUS] = const { [const { AtomicBool::new(false) }; MAX_CPUS] };
-}
-
-/// CPU `cpu`'s copy of its running thread's mark. See [`ENDING`].
-#[cfg(not(test))]
-#[inline(always)]
-pub(super) fn with_ending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R {
-    f(&ENDING[cpu])
-}
-
-#[cfg(test)]
-pub(super) fn with_ending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R {
-    ENDING_TLS.with(|a| f(&a[cpu]))
+cpu_local! {
+    /// Per-CPU copy of the running thread's [`Thread::is_ending`], written under `SCHED` and read on
+    /// the way to ring 3 without it, by its own CPU with interrupts masked.
+    pub(super) static ENDING: AtomicBool = AtomicBool::new(false);
 }
 
 /// End the running thread if its process is exiting: called on every return to ring 3, with its
 /// kernel stack unwound and nothing held.
 pub fn end_if_ending() {
-    if with_ending(SchedState::this_cpu(), |e| e.load(Ordering::Acquire)) {
+    let ending = {
+        let off = IrqsOff::observed();
+        ENDING.with(&off.pin(), |e| e.load(Ordering::Acquire))
+    };
+    if ending {
         // What makes freeing sound at an interrupt's tail (`lock-ordering.md`).
         crate::libkern::lockrank::assert_user_entry_safe();
         assert_user_entry_preempt_safe();
@@ -88,14 +77,14 @@ pub fn end_if_ending() {
 /// **None is freed here**: only its own unwinding lets go of what its kernel stack holds.
 pub(super) fn end_siblings(g: &mut SchedState, pid: u32) {
     let same = |r: &Ref<Thread>| r.owner_pid() == pid;
-    let me = SchedState::this_cpu();
+    let me = g.me();
     for c in 0..MAX_CPUS {
         for r in g.ready[c].iter().filter(|r| same(r)) {
             r.set_ending(&mut g.tok);
         }
         if let Some(r) = g.current[c].as_ref().filter(|r| same(r)) {
             r.set_ending(&mut g.tok);
-            with_ending(c, |e| e.store(true, Ordering::Release));
+            ENDING.remote(c, |e| e.store(true, Ordering::Release));
             if c != me {
                 crate::arch::send_reschedule_ipi(c);
             }
@@ -334,11 +323,11 @@ pub fn reap_pending() {
         // while holding one starves the spinners for a round — or forever when the reaper is
         // the **idle** thread, never re-picked while the spinners keep every CPU busy.
         // Interrupts stay enabled; only the switch is deferred.
-        preempt_disable();
+        let off = preempt_disable();
         for slot in buf[..n].iter_mut() {
             drop(slot.take());
         }
-        preempt_enable();
+        drop(off);
         if n < buf.len() {
             return; // drained everything that was parked when we looked
         }
@@ -416,7 +405,7 @@ pub fn wake_reaper_to_reclaim() {
 /// already running or queued — the wake is level-triggered off [`SchedState::ended_pids`],
 /// so a missed edge costs nothing.
 ///
-/// **The only placement site that bypasses the policy.** It pushes onto `ready[this_cpu()]`
+/// **The only placement site that bypasses the policy.** It pushes onto `ready[me()]`
 /// directly: no affinity check and no [`cpu_accepts_work`]. Sound today because a CPU
 /// executing this code is by definition not parked, so the CPU it chooses always accepts
 /// work — but if placement policy grows a rule, this is the site that will not have it.
@@ -425,6 +414,6 @@ fn wake_reaper(g: &mut SchedState) {
         return;
     };
     r.set_state(&mut g.tok, ThreadState::Ready);
-    let cpu = SchedState::this_cpu();
+    let cpu = g.me();
     push_reserved(&mut g.ready[cpu], r, "run queue (reaper wake)");
 }

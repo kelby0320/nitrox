@@ -23,26 +23,22 @@ pub fn online_mask() -> u64 {
 /// running BSP out of the shootdown set, where the slow path's self-IPI is the only thing
 /// that invalidates its own TLB. The result is a freed frame still reachable through a
 /// stale translation: silent memory corruption, strictly worse than the deadlock.
-/// [`ArchSmp::identity_bound`](crate::arch::smp::ArchSmp::identity_bound) is that check;
+/// [`ArchSmp::bound_index`](crate::arch::smp::ArchSmp::bound_index) is that check;
 /// the range check below is a separate, weaker guard — an unbound CPU's `0` is in range.
 ///
-/// **The check errs toward doing nothing.** The BSP's bit is set by [`init`] before
-/// `bind_cpu_identity(0, …)` in `main.rs`, so a BSP panic in that window leaves its bit
-/// set. That is harmless: APs are not launched until after the binding, so no other CPU
-/// exists to initiate a shootdown and wait on it. Failing to clear a bit costs a hang on
+/// **The check errs toward doing nothing.** Failing to clear a bit costs a hang on
 /// a machine that has already panicked; clearing the wrong one costs silent memory
 /// corruption on a healthy one.
 pub fn leave_online() {
     use crate::arch::smp::ArchSmp;
-    clear_online_bit(crate::arch::Smp::identity_bound(), crate::arch::Smp::current_cpu() as usize);
+    clear_online_bit(crate::arch::Smp::bound_index().map(crate::arch::percpu::CpuIndex::get));
 }
 
 /// The decision half of [`leave_online`], split out so the rule is pinned by a host test.
-pub(super) fn clear_online_bit(identity_bound: bool, me: usize) {
-    if !identity_bound || me >= MAX_CPUS {
-        return;
+pub(super) fn clear_online_bit(me: Option<usize>) {
+    if let Some(me) = me.filter(|&me| me < MAX_CPUS) {
+        online_set::remove(me);
     }
-    online_set::remove(me);
 }
 
 /// The number of CPUs whose scheduler state is online (BSP + initialized APs).

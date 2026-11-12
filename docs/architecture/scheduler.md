@@ -134,20 +134,21 @@ RealTime priority array + the TimeShared vruntime heap), and a stable **`cpu_id`
 
 **Per-CPU access is arch-abstracted.** "Which CPU am I" and "reach this CPU's data"
 are x86-specific mechanisms kept **behind `crate::arch`** (arch-boundary rule). Neutral
-code calls **`crate::arch::Smp::current_cpu() -> u32`** (a dense CPU index) and indexes a
-neutral `CPUS[current_cpu()]` array for its scheduler state; it never reads an APIC id,
-an MSR, or `gs:` directly. The x86 implementation reads the index via **`RDTSCP`**, with
+code reads a dense CPU index under a pin, **`CpuIndex::current(pin)`**, and indexes the
+scheduler's per-CPU arrays with it (`SchedState::me`, pinned by the `SCHED` hold); it never
+reads an APIC id, an MSR, or `gs:` directly ([smp.md](smp.md) § 1). The x86 implementation
+reads the index via **`RDTSCP`**, with
 `IA32_TSC_AUX` set to the dense CPU index as each CPU initializes — one instruction, no
 mapping table, and independent of the `swapgs`/`KERNEL_GS_BASE` convention (retained for
 the syscall stub). The mechanism is **swappable behind the abstraction**: x86 could later
 adopt GS-relative access (kernel running with `GS_BASE = &CPUS[i]`) for hot-path speed,
-and an aarch64 port implements the same `current_cpu()` via `MPIDR_EL1`/`TPIDR_EL1`, with
+and an aarch64 port implements the same raw read via `MPIDR_EL1`/`TPIDR_EL1`, with
 no neutral-code change. (LAPIC-id + an id→index map was the considered alternative;
 `RDTSCP`/`TSC_AUX` wins — no MMIO read, no sparse-id table.) Two per-CPU structures sit in
 their proper layers: the **arch** `CpuLocal` (syscall `rsp_scratch`/`kstack_top`,
 `gs:`-reached via `KERNEL_GS_BASE`) becomes one-per-CPU; the **neutral** `CPUS[]`
 (scheduler `current`/`idle`/runqueue + page-table-root bookkeeping) is indexed by
-`current_cpu()`. `MAX_CPUS` (8) sizes both.
+`SchedState::me()`. `MAX_CPUS` (8) sizes both.
 
 Rollout is **incremental** (decision log, 2026-06-26): slice 1 brings APs up pulling
 from the *existing single global runqueue* (all CPUs contend on `SCHED`), proving AP

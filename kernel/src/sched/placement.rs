@@ -44,7 +44,7 @@ fn sched_key(tok: &SchedToken, th: &Thread) -> (u8, u8, u64) {
 /// `rt_priority`, FIFO within one) beats TimeShared (smallest `vruntime`). An O(n) scan
 /// (`docs/architecture/scheduler.md`). Caller holds the run-queue lock.
 pub(super) fn dequeue_front(g: &mut SchedState) -> Option<Ref<Thread>> {
-    let cpu = SchedState::this_cpu();
+    let cpu = g.me();
     let n = g.ready[cpu].len();
     if n == 0 {
         return None;
@@ -135,7 +135,7 @@ pub(super) fn pick_target_cpu(g: &SchedState, th: &Thread, online: u64) -> usize
         return spare;
     }
     // Nothing accepts work. We are executing, so this CPU is the least-wrong answer.
-    SchedState::this_cpu()
+    g.me()
 }
 
 /// The CPU to place a **waking** thread on: its home CPU (`last_cpu`) when that CPU is
@@ -151,7 +151,7 @@ pub(super) fn pick_target_cpu(g: &SchedState, th: &Thread, online: u64) -> usize
 ///    a thread pinned to a parked CPU while every CPU still accepting work is full. A panic
 ///    here must **not** say "every affinity-permitted queue is at reserve" — the only
 ///    permitted queue may be empty and merely parked.
-/// 3. `this_cpu()` — the last resort when *nothing* accepts work, returned without checking
+/// 3. `me()` — the last resort when *nothing* accepts work, returned without checking
 ///    its queue: no queue is worth preferring when nothing will run, and this CPU is the
 ///    only one known to be executing.
 ///
@@ -210,7 +210,7 @@ pub(super) fn place_thread(g: &mut SchedState, r: Ref<Thread>, wake: bool) -> Re
     // CPU. Same-CPU placement needs no IPI: whichever path made the thread runnable reaches
     // a scheduling point before returning to userspace — the timer tail, the syscall return,
     // or, for a device-completion DPC, the device-IRQ tail's `resched_if_idle`.
-    if cpu != SchedState::this_cpu() {
+    if cpu != g.me() {
         crate::arch::send_reschedule_ipi(cpu);
     }
     Ok(())
@@ -223,7 +223,7 @@ pub(super) fn place_thread(g: &mut SchedState, r: Ref<Thread>, wake: bool) -> Re
 /// on it and fall back to the idle slot on `None` — which is empty when idle is already
 /// current, so a mismatch would panic. Caller holds `SCHED`.
 pub(super) fn steal_one(g: &mut SchedState) -> Option<Ref<Thread>> {
-    let me = SchedState::this_cpu();
+    let me = g.me();
     let mut victim = usize::MAX;
     let mut victim_pos = 0usize;
     let mut victim_len = 0usize;
@@ -270,14 +270,14 @@ pub(super) fn pick_next(g: &mut SchedState) -> Option<Ref<Thread>> {
         return Some(t);
     }
     let stolen = steal_one(g)?;
-    seed_vruntime(g, &stolen, SchedState::this_cpu(), true);
+    seed_vruntime(g, &stolen, g.me(), true);
     Some(stolen)
 }
 
 /// Charge the running thread one tick of virtual runtime, scaled by nice weight — only if
 /// **TimeShared** (RealTime is fixed-priority; Idle never accrues). Caller holds `SCHED`.
 pub(super) fn accrue_vruntime(g: &mut SchedState) {
-    let Some(th) = g.current[SchedState::this_cpu()].as_deref() else { return };
+    let Some(th) = g.current[g.me()].as_deref() else { return };
     if th.sched_class(&g.tok) == SchedClass::TimeShared {
         let v = th.vruntime(&g.tok).saturating_add(vruntime_delta(th.nice(&g.tok)));
         th.set_vruntime(&mut g.tok, v);

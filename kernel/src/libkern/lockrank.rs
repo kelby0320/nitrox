@@ -55,11 +55,8 @@
 //! ## Cost, and not under host `cfg(test)`
 //!
 //! Debug builds only (`cfg(debug_assertions)`). The tracker takes no lock and allocates nothing
-//! (it would deadlock against what it instruments): a fixed per-CPU array of atomics, mirroring
-//! `sched`'s `PREEMPT_OFF`. It is also compiled out for host unit tests, as a correctness
-//! requirement: `cargo test` runs tests on **many OS threads**, all reporting the same
-//! `current_cpu()`, so the per-CPU stack would be shared by unrelated threads and read as
-//! inversions.
+//! (it would deadlock against what it instruments): a `cpu_local!` of atomics, as `sched`'s
+//! `PREEMPT_OFF` is. It is compiled out of host unit tests, which count holds per thread.
 //!
 //! The *rule* is unit-tested host-side through [`classify`], which the tracker calls; the
 //! *bookkeeping* against a plain local state struct (see the tests at the bottom).
@@ -240,61 +237,37 @@ pub use inert::{held_by_this_thread, sched_held_by_this_thread};
 #[cfg(all(debug_assertions, not(test)))]
 mod tracker {
     use super::LockRank;
-    use crate::arch::Cpu;
-    use crate::arch::cpu::ArchCpu;
-    use crate::arch::smp::MAX_CPUS;
+    use crate::arch::percpu::cpu_local;
+    use crate::libkern::IrqsOff;
     use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-
-    /// Mask interrupts across a tracker update, returning the prior state.
-    /// The per-CPU depth is a **read-modify-write**, and a plain `SpinLock` acquire leaves
-    /// interrupts *enabled* (`preempt_disable` stops migration, not interruption). An IRQ
-    /// landing between the read and the write does its own acquire/release, and the outer
-    /// write then clobbers the depth with a stale value, corrupting the stack.
-    #[inline]
-    fn mask() -> bool {
-        Cpu::interrupts_disable()
-    }
-
-    #[inline]
-    fn unmask(prev: bool) {
-        // SAFETY: ring-0; restoring the state `mask` captured.
-        unsafe { Cpu::interrupts_restore(prev) };
-    }
 
     /// Deepest lock nesting the tracker records per CPU. Past this it stops recording rather
     /// than panicking, so a legitimately deep path degrades to "unchecked".
     const MAX_HELD: usize = 8;
 
-    /// Ranks currently held on each CPU, innermost last.
-    #[allow(clippy::declare_interior_mutable_const, reason = "an array initializer, copied for each element")]
-    const ZERO: AtomicU8 = AtomicU8::new(0);
-    #[allow(clippy::declare_interior_mutable_const, reason = "an array initializer, copied for each CPU")]
-    const EMPTY: [AtomicU8; MAX_HELD] = [ZERO; MAX_HELD];
-    static HELD: [[AtomicU8; MAX_HELD]; MAX_CPUS] = [EMPTY; MAX_CPUS];
+    struct Held {
+        /// Ranks currently held on each CPU, innermost last.
+        ranks: [AtomicU8; MAX_HELD],
+        /// How many entries of `ranks` are live. May exceed `MAX_HELD`; the excess is
+        /// counted but not recorded (see `MAX_HELD`).
+        depth: AtomicUsize,
+        /// Index below which held ranks belong to an **interrupted** context and are invisible
+        /// to the ordering check. Raised by [`enter_interrupt`], lowered by its guard. See the
+        /// module docs § Interrupt scopes.
+        floor: AtomicUsize,
+    }
 
-    /// How many entries of `HELD[cpu]` are live. May exceed `MAX_HELD`; the excess is
-    /// counted but not recorded (see `MAX_HELD`).
-    #[allow(clippy::declare_interior_mutable_const, reason = "an array initializer, copied for each CPU")]
-    const ZERO_DEPTH: AtomicUsize = AtomicUsize::new(0);
-    static DEPTH: [AtomicUsize; MAX_CPUS] = [ZERO_DEPTH; MAX_CPUS];
-
-    /// Index below which held ranks belong to an **interrupted** context and are invisible
-    /// to the ordering check. Raised by [`enter_interrupt`], lowered by its guard. See the
-    /// module docs § Interrupt scopes.
-    static FLOOR: [AtomicUsize; MAX_CPUS] = [ZERO_DEPTH; MAX_CPUS];
+    cpu_local! {
+        static HELD: Held = Held {
+            ranks: [const { AtomicU8::new(0) }; MAX_HELD],
+            depth: AtomicUsize::new(0),
+            floor: AtomicUsize::new(0),
+        };
+    }
 
     /// Set once a violation has been reported, so the panic path — which takes `SERIAL`,
     /// and may take locks on the way — cannot recurse into a second report.
     static REPORTING: AtomicUsize = AtomicUsize::new(0);
-
-    #[inline]
-    fn this_cpu() -> usize {
-        use crate::arch::smp::ArchSmp;
-        let c = crate::arch::Smp::current_cpu() as usize;
-        // Out of range (very early boot, before SMP is up) folds onto CPU 0, where that code
-        // runs.
-        if c < MAX_CPUS { c } else { 0 }
-    }
 
     /// Record that `rank` has just been acquired on this CPU, and panic if doing so
     /// inverted the order — which only a [`Taken::Waiting`](super::Taken::Waiting)
@@ -302,31 +275,38 @@ mod tracker {
     ///
     /// Called *after* the lock is held, so the report can name a real acquisition rather
     /// than a speculative one — and so a failed `try_lock` records nothing.
+    ///
+    /// The per-CPU depth is a **read-modify-write**, and a plain `SpinLock` acquire leaves
+    /// interrupts *enabled* (`preempt_disable` stops migration, not interruption). An IRQ
+    /// landing between the read and the write does its own acquire/release, and the outer
+    /// write then clobbers the depth with a stale value, corrupting the stack.
     pub fn acquired(rank: LockRank, taken: super::Taken) {
-        let irq = mask();
-        let cpu = this_cpu();
-        let floor = FLOOR[cpu].load(Ordering::Relaxed);
-        let depth = DEPTH[cpu].load(Ordering::Relaxed);
-        // Check against everything held **in this interrupt scope**: entries below the floor
-        // belong to a context this handler interrupted. Decide with `super::classify`, the same
-        // function the host tests call; find the violation under the mask but report outside it,
-        // because `report` panics and the panic path prints.
-        let mut scope = [0u8; MAX_HELD];
-        let n = depth.min(MAX_HELD).saturating_sub(floor);
-        for k in 0..n {
-            scope[k] = HELD[cpu][floor + k].load(Ordering::Relaxed);
-        }
-        let (mut violation, mut contract) = (None, None);
-        match super::classify(rank, &scope[..n], taken) {
-            super::Acquisition::Ok => {}
-            super::Acquisition::ContractBroken { held } => contract = Some(held),
-            super::Acquisition::Inverted { held } => violation = Some(held),
-        }
-        if depth < MAX_HELD {
-            HELD[cpu][depth].store(rank as u8, Ordering::Relaxed);
-        }
-        DEPTH[cpu].store(depth + 1, Ordering::Relaxed);
-        unmask(irq);
+        let off = IrqsOff::mask();
+        let (violation, contract) = HELD.with(&off.pin(), |h| {
+            let floor = h.floor.load(Ordering::Relaxed);
+            let depth = h.depth.load(Ordering::Relaxed);
+            // Check against everything held **in this interrupt scope**: entries below the floor
+            // belong to a context this handler interrupted. Decide with `super::classify`, the same
+            // function the host tests call; find the violation under the mask but report outside it,
+            // because `report` panics and the panic path prints.
+            let mut scope = [0u8; MAX_HELD];
+            let n = depth.min(MAX_HELD).saturating_sub(floor);
+            for (slot, rank) in scope[..n].iter_mut().zip(h.ranks.iter().skip(floor)) {
+                *slot = rank.load(Ordering::Relaxed);
+            }
+            let (mut violation, mut contract) = (None, None);
+            match super::classify(rank, &scope[..n], taken) {
+                super::Acquisition::Ok => {}
+                super::Acquisition::ContractBroken { held } => contract = Some(held),
+                super::Acquisition::Inverted { held } => violation = Some(held),
+            }
+            if depth < MAX_HELD {
+                h.ranks[depth].store(rank as u8, Ordering::Relaxed);
+            }
+            h.depth.store(depth + 1, Ordering::Relaxed);
+            (violation, contract)
+        });
+        drop(off);
         if let Some(held) = contract {
             report_contract(held);
         }
@@ -341,20 +321,20 @@ mod tracker {
     /// goes on to take another lock (a guard drop can replay a deferred reschedule, which
     /// takes `SCHED`).
     pub fn releasing(_rank: LockRank) {
-        let irq = mask();
-        let cpu = this_cpu();
-        let depth = DEPTH[cpu].load(Ordering::Relaxed);
-        // Never pop below the floor: those entries belong to the interrupted context. `depth == 0`
-        // is the same case at the outermost scope (a lock acquired before the tracker saw this
-        // CPU).
-        if depth > FLOOR[cpu].load(Ordering::Relaxed) {
-            let depth = depth - 1;
-            if depth < MAX_HELD {
-                HELD[cpu][depth].store(0, Ordering::Relaxed);
+        let off = IrqsOff::mask();
+        HELD.with(&off.pin(), |h| {
+            let depth = h.depth.load(Ordering::Relaxed);
+            // Never pop below the floor: those entries belong to the interrupted context. `depth == 0`
+            // is the same case at the outermost scope (a lock acquired before the tracker saw this
+            // CPU).
+            if depth > h.floor.load(Ordering::Relaxed) {
+                let depth = depth - 1;
+                if depth < MAX_HELD {
+                    h.ranks[depth].store(0, Ordering::Relaxed);
+                }
+                h.depth.store(depth, Ordering::Relaxed);
             }
-            DEPTH[cpu].store(depth, Ordering::Relaxed);
-        }
-        unmask(irq);
+        });
     }
 
     /// Open a fresh lock-ordering scope for an interrupt handler: ranks held by the
@@ -367,10 +347,12 @@ mod tracker {
     #[must_use = "the scope is restored when the guard drops; dropping it immediately \
                   leaves the handler checked against the interrupted context"]
     pub fn enter_interrupt() -> IrqScope {
-        let cpu = this_cpu();
-        let entry_depth = DEPTH[cpu].load(Ordering::Relaxed);
-        let saved_floor = FLOOR[cpu].swap(entry_depth, Ordering::Relaxed);
-        IrqScope { saved_floor, entry_depth }
+        let off = IrqsOff::observed();
+        HELD.with(&off.pin(), |h| {
+            let entry_depth = h.depth.load(Ordering::Relaxed);
+            let saved_floor = h.floor.swap(entry_depth, Ordering::Relaxed);
+            IrqScope { saved_floor, entry_depth }
+        })
     }
 
     /// Guard returned by [`enter_interrupt`]; its `Drop` closes the interrupt scope.
@@ -387,24 +369,26 @@ mod tracker {
             // (the timer tail, a device-IRQ completion) can resume on a *different* CPU. That is
             // consistent because a switch requires an empty stack and no open scope on both ends
             // (`assert_switch_safe`), so the saved floor and entry depth are then zero.
-            let cpu = this_cpu();
-            let depth = DEPTH[cpu].load(Ordering::Relaxed);
+            let off = IrqsOff::observed();
+            let depth = HELD.with(&off.pin(), |h| {
+                h.floor.store(self.saved_floor, Ordering::Relaxed);
+                h.depth.load(Ordering::Relaxed)
+            });
+            drop(off);
             if depth != self.entry_depth {
                 report_leak(self.entry_depth, depth);
             }
-            FLOOR[cpu].store(self.saved_floor, Ordering::Relaxed);
         }
     }
 
     /// Whether this CPU, and so the thread on it, holds `SCHED`, under which no reference may drop.
     /// Masked, so the thread cannot move to a CPU that does between the index and the scan.
     pub fn sched_held_by_this_thread() -> bool {
-        let irq = mask();
-        let cpu = this_cpu();
-        let depth = DEPTH[cpu].load(Ordering::Relaxed).min(MAX_HELD);
-        let held = HELD[cpu][..depth].iter().any(|r| r.load(Ordering::Relaxed) == LockRank::Sched as u8);
-        unmask(irq);
-        held
+        let off = IrqsOff::mask();
+        HELD.with(&off.pin(), |h| {
+            let depth = h.depth.load(Ordering::Relaxed).min(MAX_HELD);
+            h.ranks[..depth].iter().any(|r| r.load(Ordering::Relaxed) == LockRank::Sched as u8)
+        })
     }
 
     /// Assert that this CPU is safe to context-switch on: nothing held, no interrupt scope
@@ -435,9 +419,10 @@ mod tracker {
     }
 
     fn assert_empty(site: Site) {
-        let cpu = this_cpu();
-        let depth = DEPTH[cpu].load(Ordering::Relaxed);
-        let floor = FLOOR[cpu].load(Ordering::Relaxed);
+        let off = IrqsOff::observed();
+        let (depth, floor) =
+            HELD.with(&off.pin(), |h| (h.depth.load(Ordering::Relaxed), h.floor.load(Ordering::Relaxed)));
+        drop(off);
         if depth != 0 || floor != 0 {
             report_not_empty(site, depth, floor);
         }

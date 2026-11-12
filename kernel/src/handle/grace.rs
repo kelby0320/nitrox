@@ -45,13 +45,6 @@ impl GraceTracker {
     /// walk with `Acquire` loads sees it before freeing a deferred close.
     pub(crate) fn enter_read(&self, ctx_id: u32) -> ReadGuard<'_> {
         debug_assert!((ctx_id as usize) < MAX_CTX);
-        // The context is this CPU's, so a section that moved CPU would close another's.
-        #[cfg(not(test))]
-        debug_assert!(
-            !<crate::arch::Cpu as crate::arch::cpu::ArchCpu>::interrupts_enabled()
-                || crate::sched::preemption_disabled(),
-            "a handle read section that can migrate"
-        );
         let epoch = self.current_epoch.load(Ordering::Acquire);
         self.ctx_observed[ctx_id as usize].store(epoch, Ordering::Release);
         // Dekker, with `synchronize`'s: either this store is seen there, or this section sees the

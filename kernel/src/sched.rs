@@ -40,6 +40,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
+use crate::arch::percpu::{CpuIndex, CpuPin};
 use crate::arch::timer::ArchTimer;
 use crate::arch::{Cpu, MAX_CPUS, Paging, context_switch};
 use crate::libkern::handle::{KObjectType, Rights};
@@ -320,60 +321,59 @@ impl SchedState {
         Some(pid)
     }
 
-    /// Dense index of the running CPU's per-CPU scheduler slots.
+    /// This CPU's index, pinned by the hold that lends the state.
     #[inline]
-    fn this_cpu() -> usize {
-        use crate::arch::smp::ArchSmp;
-        crate::arch::Smp::current_cpu() as usize
+    fn me(&self) -> usize {
+        CpuIndex::current(&self.tok.pin()).get()
     }
 
     /// This CPU's `current`-thread slot (mutable).
     #[inline]
     fn cur_slot(&mut self) -> &mut Option<Ref<Thread>> {
-        &mut self.current[Self::this_cpu()]
+        &mut self.current[self.me()]
     }
 
     /// This CPU's `current`-thread slot (shared).
     #[inline]
     fn cur_ref(&self) -> &Option<Ref<Thread>> {
-        &self.current[Self::this_cpu()]
+        &self.current[self.me()]
     }
 
     /// This CPU's running thread, with the token lent beside it.
     fn running(&mut self) -> (&Thread, &mut SchedToken) {
-        let cur = self.current[Self::this_cpu()].as_deref().expect("current set when a thread runs");
+        let cur = self.current[self.me()].as_deref().expect("current set when a thread runs");
         (cur, &mut self.tok)
     }
 
     /// This CPU's idle-thread parking slot (mutable).
     #[inline]
     fn idle_slot(&mut self) -> &mut Option<Ref<Thread>> {
-        &mut self.idle[Self::this_cpu()]
+        &mut self.idle[self.me()]
     }
 
     /// This CPU's reap list (mutable). Per-CPU so a dying thread is reclaimed only by the
     /// CPU it died on, after its `switch_into` completed.
     #[inline]
     fn reap_slot(&mut self) -> &mut Reserved<Ref<Thread>> {
-        &mut self.reap[Self::this_cpu()]
+        &mut self.reap[self.me()]
     }
 
     /// This CPU's ready run queue (mutable). A preempted thread re-homes here.
     #[inline]
     fn ready_slot(&mut self) -> &mut Reserved<Ref<Thread>> {
-        &mut self.ready[Self::this_cpu()]
+        &mut self.ready[self.me()]
     }
 
     /// This CPU's idle-thread stable address.
     #[inline]
     fn idle_addr(&self) -> usize {
-        self.idle_addr[Self::this_cpu()]
+        self.idle_addr[self.me()]
     }
 
     /// Set this CPU's idle-thread stable address.
     #[inline]
     fn set_idle_addr(&mut self, addr: usize) {
-        let cpu = Self::this_cpu();
+        let cpu = self.me();
         self.idle_addr[cpu] = addr;
     }
 }
@@ -392,7 +392,7 @@ pub fn yield_now() {
     reap_pending();
 
     let g = SCHED.lock();
-    if g.ready[SchedState::this_cpu()].is_empty() {
+    if g.ready[g.me()].is_empty() {
         return; // nothing else ready on this CPU — keep running (guard drops, IF restored)
     }
     switch_to_next(g);
@@ -411,7 +411,7 @@ pub fn on_timer_tick() {
     fire_expired_deadlines(&mut g, now);
     // Charge this CPU's running TimeShared thread a nice-weighted tick of vruntime.
     accrue_vruntime(&mut g);
-    let me = SchedState::this_cpu();
+    let me = g.me();
     g.stats[me].ticks += 1;
     let ready_here = !g.ready[me].is_empty();
     let (new_quantum, reschedule) = tick_quantum(g.quantum[me], ready_here);
@@ -419,9 +419,9 @@ pub fn on_timer_tick() {
     // A preemption-critical window (the running thread may hold a plain lock other CPUs
     // spin on — see [`preempt_disable`]): do not deschedule it. The bookkeeping above
     // still ran; latch the skipped switch for `preempt_enable` / the next tick.
-    if with_preempt_off(me, |c| c.load(Ordering::Relaxed)) > 0 {
+    if PREEMPT_OFF.with(&g.pin(), |c| c.load(Ordering::Relaxed)) > 0 {
         if reschedule || (!ready_here && current_is_idle(&g) && steal_available(&g, me)) {
-            with_resched_pending(me, |c| c.store(true, Ordering::Release));
+            RESCHED_PENDING.with(&g.pin(), |c| c.store(true, Ordering::Release));
         }
         return; // guard drops — IF stays 0 (IRQ context) until iretq
     }
@@ -444,10 +444,10 @@ pub fn on_timer_tick() {
 /// allocator locks) latches the wake for `preempt_enable` instead of descheduling;
 /// otherwise it switches **only if this CPU is idle** and there is work (own queue or
 /// stealable). A running `TimeShared` thread is left to its quantum. Consumes the guard.
-fn resched_if_idle_locked(g: IrqSpinLockGuard<'_, SchedState>) {
-    let me = SchedState::this_cpu();
-    if with_preempt_off(me, |c| c.load(Ordering::Relaxed)) > 0 {
-        with_resched_pending(me, |c| c.store(true, Ordering::Release));
+fn resched_if_idle_locked(mut g: IrqSpinLockGuard<'_, SchedState>) {
+    let me = g.me();
+    if PREEMPT_OFF.with(&g.pin(), |c| c.load(Ordering::Relaxed)) > 0 {
+        RESCHED_PENDING.with(&g.pin(), |c| c.store(true, Ordering::Release));
         return; // guard drops
     }
     if current_is_idle(&g) && (!g.ready[me].is_empty() || steal_available(&g, me)) {
@@ -463,7 +463,8 @@ fn resched_if_idle_locked(g: IrqSpinLockGuard<'_, SchedState>) {
 /// timer path does, since the switch may not return promptly). Runs with IF=0.
 pub fn on_reschedule_ipi() {
     let mut g = SCHED.lock();
-    g.stats[SchedState::this_cpu()].resched_ipis += 1;
+    let cpu = g.me();
+    g.stats[cpu].resched_ipis += 1;
     resched_if_idle_locked(g);
 }
 
@@ -506,15 +507,15 @@ pub fn stats_snapshot() -> stats::Snapshot {
 /// stack, `top`, so a ring-3 → ring-0 transition from it lands on **its** kernel stack, not a
 /// sibling's. Called on every switch-in; a no-op for stackless boot/idle threads (`None`), which
 /// never trap from ring 3. The writes are arch register/per-CPU stores, no locks.
-fn arm_kernel_stack(top: Option<KernelStackTop>) {
+fn arm_kernel_stack(top: Option<KernelStackTop>, pin: &CpuPin<'_>) {
     if let Some(ktop) = top {
-        Cpu::set_kernel_stack(ktop);
-        crate::arch::set_syscall_kernel_stack(ktop);
+        Cpu::set_kernel_stack(ktop, pin);
+        crate::arch::set_syscall_kernel_stack(ktop, pin);
         // Re-assert this CPU's `KERNEL_GS_BASE`. A user thread that **migrated** here must
         // `swapgs` into *this* CPU's block on its next syscall (so the entry stub reads this
         // CPU's freshly-armed `kstack_top`); otherwise it can syscall onto a stale block →
         // `#DF` in `syscall_entry`.
-        crate::arch::arm_user_entry_cpu_base();
+        crate::arch::arm_user_entry_cpu_base(pin);
     }
 }
 
@@ -596,7 +597,7 @@ impl Switch {
     /// mid-switch-out guard to read its saved stack pointer, record where it runs, and raise
     /// `out`'s guard. Caller holds `SCHED`.
     fn prepare(g: &mut SchedState, out: &Thread, next: &Thread) -> Self {
-        let me = SchedState::this_cpu();
+        let me = g.me();
         // Sample the **outgoing** thread's kernel-stack high-water mark. Every thread that runs
         // passes through here, including servers that spend their lives blocked and so never
         // sit in a run queue, which is why this is the sample point. Instrumentation only.
@@ -622,7 +623,7 @@ impl Switch {
         // Where a later wake re-homes it (cache-warm, minimal migration).
         next.set_last_cpu(&mut g.tok, me as u8);
         let ending = next.is_ending(&g.tok);
-        with_ending(me, |e| e.store(ending, Ordering::Release));
+        ENDING.with(&g.tok.pin(), |e| e.store(ending, Ordering::Release));
         // Raised **while still holding `SCHED`**, so it is set before the release makes any `ready`
         // entry for `out` visible to a stealer; `context_switch` clears it once it has committed
         // `out`'s saved stack pointer, and the parked context is then valid to resume elsewhere.
@@ -649,22 +650,8 @@ impl Switch {
 /// # Safety
 /// `switch` was [prepared](Switch::prepare) under the hold `g` is, from the thread this CPU runs
 /// and the one just made `current`, each still pinned by the list it is on.
-unsafe fn switch_into(mut g: IrqSpinLockGuard<'_, SchedState>, switch: Switch) {
-    g.stats[SchedState::this_cpu()].switches += 1;
-    // Drop the lock but keep interrupts masked across the switch; `saved_if` is restored
-    // when this thread next resumes.
-    let saved_if = g.release_keeping_irqs_masked();
-    // Every context switch passes through here, so this is the one place that can check the
-    // lock tracker's per-CPU model still holds: a thread may only be switched away with
-    // nothing held and no interrupt scope open. True by construction (a plain-lock holder
-    // has preemption disabled, an `IrqSpinLock` holder has interrupts masked, and blocking
-    // with a lock held is forbidden); this checks it. Debug builds only.
-    crate::libkern::lockrank::assert_switch_safe();
-    // The other per-CPU invariant: the involuntary paths (`on_timer_tick`,
-    // `resched_if_idle_locked`) latch into `RESCHED_PENDING` rather than switching; this
-    // checks the **voluntary** ones too. The reasoning is on the function.
-    assert_switch_preempt_safe();
-    arm_kernel_stack(switch.next_kstack);
+unsafe fn switch_into(g: IrqSpinLockGuard<'_, SchedState>, switch: Switch) {
+    let saved_if = release_for_switch(g, switch.next_kstack);
     // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
     // with the kernel half inherited); all kernel stacks are mapped in every
     // root, so switching CR3 before the stack swap is sound. Loading it before
@@ -709,6 +696,30 @@ unsafe fn switch_into(mut g: IrqSpinLockGuard<'_, SchedState>, switch: Switch) {
     unsafe { Cpu::interrupts_restore(saved_if) };
 }
 
+/// Let go of `SCHED` for a switch, interrupts kept masked, after arming `next_kstack` under it,
+/// its pin: every check a switch makes, where a host test reaches it.
+fn release_for_switch(mut g: IrqSpinLockGuard<'_, SchedState>, next_kstack: Option<KernelStackTop>) -> bool {
+    let cpu = g.me();
+    g.stats[cpu].switches += 1;
+    crate::libkern::irqs::assert_no_live_masks(&g.pin());
+    // Armed under the lock, its pin: the slots are read only at a ring-3 entry, after the switch.
+    arm_kernel_stack(next_kstack, &g.pin());
+    // Drop the lock but keep interrupts masked across the switch; `saved_if` is restored
+    // when this thread next resumes.
+    let saved_if = g.release_keeping_irqs_masked();
+    // Every context switch passes through here, so this is the one place that can check the
+    // lock tracker's per-CPU model still holds: a thread may only be switched away with
+    // nothing held and no interrupt scope open. True by construction (a plain-lock holder
+    // has preemption disabled, an `IrqSpinLock` holder has interrupts masked, and blocking
+    // with a lock held is forbidden); this checks it. Debug builds only.
+    crate::libkern::lockrank::assert_switch_safe();
+    // The other per-CPU invariant: the involuntary paths (`on_timer_tick`,
+    // `resched_if_idle_locked`) latch into `RESCHED_PENDING` rather than switching; this
+    // checks the **voluntary** ones too. The reasoning is on the function.
+    assert_switch_preempt_safe();
+    saved_if
+}
+
 /// Decide the quantum update and whether to reschedule on a timer tick. Pure (no lock, no
 /// switch) so it is host-testable.
 ///
@@ -748,7 +759,7 @@ pub fn ready_is_empty() -> bool {
 pub(crate) extern "C" fn thread_enter() -> ! {
     // Capture (under the lock) whether the current thread descends to ring 3 and its params.
     let descent: Option<(u64, u64, [u64; 4])> = {
-        let g = SCHED.lock();
+        let mut g = SCHED.lock();
         let cur = g.cur_ref().as_deref().expect("current set when a thread runs");
         match cur.user_entry() {
             // A thread whose process began exiting before it first ran never reaches ring 3.
@@ -757,12 +768,12 @@ pub(crate) extern "C" fn thread_enter() -> ! {
                 exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
             }
             Some((entry, user_sp)) => {
-                let top = cur.kstack_top();
+                let (top, boot) = (cur.kstack_top(), cur.user_boot_args());
                 assert!(top.is_some(), "a user thread has a kernel stack");
                 // Armed under `SCHED`, where reading the CPU and writing its slots cannot straddle a
                 // migration; a switch-in re-arms them wherever the thread resumes.
-                arm_kernel_stack(top);
-                Some((entry, user_sp, cur.user_boot_args()))
+                arm_kernel_stack(top, &g.pin());
+                Some((entry, user_sp, boot))
             }
             None => None,
         }

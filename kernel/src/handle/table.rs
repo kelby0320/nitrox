@@ -423,7 +423,9 @@ impl HandleTable {
             // Steps 5 to 7 are a read section, which a close waits out before releasing. Releases
             // come after it: a last one runs a destructor, which may close.
             let (snap, obj) = {
-                let _read_guard = self.grace.enter_read(current_ctx_id());
+                // Held until the section closes, so it closes the context it opened.
+                let off = crate::sched::preempt_disable();
+                let _read_guard = self.grace.enter_read(current_ctx_id(&off.pin()));
 
                 // Step 5: seqlock-protected metadata snapshot.
                 let snap = read_snapshot(entry);

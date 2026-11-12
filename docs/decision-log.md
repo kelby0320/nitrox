@@ -38100,3 +38100,29 @@ Part J's tenth sub-part, `typed-layers.md` § J.10, built on
 - `translate` and `attribute_index` are safe on either; `subtree_max_end`, which nothing read, went.
 - `unsafe` blocks fall from 569 to 568 and `unsafe fn`s rise from 195 to 197: the wrappers hold the
   root the callers passed bare.
+
+## 2026-11-11 — Before Phase 7, J.11: per-CPU state
+
+Part J's eleventh sub-part, `typed-layers.md` § J.11, built on
+`pre-phase-7/part-j11-per-cpu-state`.
+
+- **Per-CPU state is reached under a pin** (`arch::percpu`): a `CpuPin`, lent by an `IrqsOff`, an
+  `IrqSpinLockGuard`, a `PreemptOff` or the scheduler's held state, under which
+  `CpuIndex::current` reads the running CPU's index. The index is below `MAX_CPUS` by
+  construction. Debug builds check a pin's claim, interrupts masked or preemption off, as it reads.
+- **The arch layer's arrays are `PerCpu`s, reached by raw slot**, and five `static mut`s went; a
+  shared value per CPU is a `cpu_local!`, a set per thread in a host test. `PerCpu` has no safe
+  borrow, as one beside a raw write is unsound for `Sync` plain data.
+- **The bring-up passes down a pin, not an index**, so no function is handed another CPU's.
+- **`IrqsOff::observed()` checks in every build** where only the entry masked, a `pushfq`, and
+  `switch_into` refuses a live `IrqsOff` in debug builds, as masked interrupts pin no thread across
+  a switch. The handle lookup's read section holds a `PreemptOff`.
+- kplat-d23: the BSP's syscall entry is armed beside its tables. sched-d16: the incoming thread's
+  stacks are armed before `SCHED` is let go of.
+- **The raw read of the index is `arch`'s alone**: neutral code reads it under a pin, but for
+  `leave_online`'s `Smp::bound_index` on a CPU about to halt. Every core, the boot one included,
+  adopts its index by its APIC id, and a binding that would give two cores one index is refused.
+- A pin is lent only to the borrow's own thread: `IrqSpinLockGuard::pin` takes `&mut`, and
+  `SchedToken` is not `Sync`.
+- `unsafe` blocks stay at 568, `unsafe fn`s rise from 197 to 198 and `unsafe impl`s from 59 to 60;
+  `static mut`s fall from 11 to 6.
