@@ -76,9 +76,11 @@ impl DeviceVector {
         self
     }
 
-    /// Give back an MSI vector whose message no device was handed: its capability refused it.
+    /// Give back an MSI vector whose message its capability refused; a routed one is masked, kept.
     pub fn give_back(mut self) {
-        self.held = Held::Idle;
+        if self.held == Held::Msi {
+            self.held = Held::Idle;
+        }
     }
 }
 

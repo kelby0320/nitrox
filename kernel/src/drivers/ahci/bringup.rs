@@ -105,9 +105,12 @@ pub fn init(controller: &DeviceNode) -> Outcome {
         give_back(&mut disk);
         return declined("the disk's device node could not be allocated");
     };
-    let Some((signal, vector)) = install_signal(&cfg, desc.interrupt.line as u32) else {
-        give_back(&mut disk);
-        return declined("no interrupt can reach the boot CPU");
+    let (signal, vector) = match install_signal(&cfg, desc.interrupt.line as u32) {
+        Ok(installed) => installed,
+        Err(e) => {
+            give_back(&mut disk);
+            return declined(e.says());
+        }
     };
     let disk = match AHCI.publish(disk) {
         Ok(disk) => disk,
@@ -128,9 +131,8 @@ pub fn init(controller: &DeviceNode) -> Outcome {
 }
 
 /// **The controller's interrupt**: MSI, which needs no interrupt-line register (UEFI often leaves
-/// it meaningless), else INTx from `gsi`; `None`, logged, if neither reaches the boot CPU. Its
-/// vector is the caller's to commit once the disk is published.
-fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Option<(Signal, DeviceVector)> {
+/// it meaningless), else INTx from `gsi`; INTx's refusal, logged, if neither is had.
+fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Result<(Signal, DeviceVector), InstallError> {
     if let Some(cfg) = cfg
         && let Some(msi) = crate::pci::read_msi(cfg)
     {
@@ -151,7 +153,7 @@ fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Option<(Signal,
                     if msi.addr64 { 64 } else { 32 },
                     msi.off
                 );
-                return Some((Signal::Msi { vector: msg.vector }, vector));
+                return Ok((Signal::Msi { vector: msg.vector }, vector));
             }
             Ok((_, vector)) => {
                 vector.give_back();
@@ -169,20 +171,19 @@ fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Option<(Signal,
     // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the kernel's lifetime.
     let vector = match unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) } {
         Ok(vector) => vector,
-        Err(InstallError::PoolFull) => {
-            crate::kprintln!("ahci: no device vector is free for GSI {}", gsi);
-            return None;
-        }
-        Err(InstallError::Unreachable) => {
-            crate::kprintln!("ahci: GSI {} cannot be routed to the boot CPU", gsi);
-            return None;
+        Err(e) => {
+            match e {
+                InstallError::PoolFull => crate::kprintln!("ahci: no device vector is free for GSI {}", gsi),
+                InstallError::Unreachable => crate::kprintln!("ahci: GSI {} cannot be routed to the boot CPU", gsi),
+            }
+            return Err(e);
         }
     };
     if let Some(cfg) = cfg {
         crate::pci::set_intx_disabled(cfg, false);
     }
     crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vector.vector());
-    Some((Signal::Intx { gsi, vector: vector.vector() }, vector))
+    Ok((Signal::Intx { gsi, vector: vector.vector() }, vector))
 }
 
 /// A claimed disk, and its name's bytes and length.

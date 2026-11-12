@@ -129,7 +129,8 @@ enumerated; a disconnection disables the device's slot and frees its memory.
 **Per device**, each step logged if it fails, and the slot disabled again:
 1. a USB 2 port is reset and given its 10 ms recovery; a USB 3 port is enabled by link training,
    which is waited for;
-2. *Enable Slot*, whose answer must be one of MaxSlots' slots, then *Address Device* with the
+2. *Enable Slot*, whose answer must be one of MaxSlots' slots — one past them is refused and left
+   as the controller has it, holding none of the device's memory — then *Address Device* with the
    speed's default packet size, then 10 ms for SET_ADDRESS to settle (USB 2.0 allows a device 2 ms;
    Linux waits 10);
 3. the device descriptor's first eight bytes, then *Evaluate Context* if `bMaxPacketSize0` differs

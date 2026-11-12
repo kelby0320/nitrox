@@ -253,6 +253,12 @@ struct Windows<'a> {
     db: Mmio<'a>,
 }
 
+/// BAR0's capability registers, CAPLENGTH to RTSOFF, as read; `None` for a BAR0 too short.
+fn capabilities(bar: Mmio<'_>) -> Option<[u32; 6]> {
+    let caps = bar.sub(0, RTSOFF + 4)?;
+    Some([CAP_LENGTH_VERSION, HCSPARAMS1, HCSPARAMS2, HCCPARAMS1, DBOFF, RTSOFF].map(|off| caps.read32(off)))
+}
+
 /// [`Windows`] from CAPLENGTH, RTSOFF and DBOFF; `None` when one lies past BAR0.
 fn windows(bar: Mmio<'_>, caplength: u8, rtsoff: u32, dboff: u32, max_ports: u8, max_slots: u8) -> Option<Windows<'_>> {
     Some(Windows {
@@ -347,19 +353,16 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
         Err(_) => return declined("its registers could not be mapped"),
     };
 
-    let lv = base.read32(CAP_LENGTH_VERSION);
+    let Some([lv, hcs1, hcs2, hcc1, dboff, rtsoff]) = capabilities(base) else {
+        return declined("its BAR0 is too short for its capability registers");
+    };
     if lv == u32::MAX {
         return declined("its registers read as all ones");
     }
     let version = lv >> 16;
-    let hcs1 = base.read32(HCSPARAMS1);
-    let hcs2 = base.read32(HCSPARAMS2);
-    let hcc1 = base.read32(HCCPARAMS1);
     let max_slots = (hcs1 & 0xFF) as u8;
     let max_ports = (hcs1 >> 24) as u8;
-    let Some(Windows { op, ir, db }) =
-        windows(base, lv as u8, base.read32(RTSOFF), base.read32(DBOFF), max_ports, max_slots)
-    else {
+    let Some(Windows { op, ir, db }) = windows(base, lv as u8, rtsoff, dboff, max_ports, max_slots) else {
         return declined("its capability registers put a register window past BAR0");
     };
     let scratchpads = ((hcs2 >> 21) & 0x1F) << 5 | (hcs2 >> 27) & 0x1F;
@@ -882,6 +885,17 @@ mod tests {
         assert!(!fits(cap, u32::MAX, db, ports, slots), "RTSOFF far past it");
         assert!(!fits(cap, rts, db + 4, ports, slots), "the doorbells past it");
         assert!(!fits(cap, rts, db, ports, slots + 1), "a slot's doorbell past it");
+        assert!(fits(cap, rts | 0x1F, db | 0x3, ports, slots), "their reserved low bits set");
+    }
+
+    /// **A BAR0 short of the capability registers is declined**: RTSOFF, the last, may end it.
+    #[test]
+    fn a_bar0_short_of_the_capability_registers_is_declined() {
+        let mut regs = [0u32; 7];
+        regs[6] = 0x3000;
+        assert_eq!(capabilities(Mmio::over(&mut regs)).map(|c| c[5]), Some(0x3000), "RTSOFF at its end");
+        assert!(capabilities(Mmio::over(&mut regs[..6])).is_none(), "RTSOFF past it");
+        assert!(capabilities(Mmio::over(&mut regs[..4])).is_none(), "16 bytes");
     }
 
     /// **A declined controller's memory is freed only once it halted**, all of it from one stop:

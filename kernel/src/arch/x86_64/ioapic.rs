@@ -4,7 +4,7 @@
 //! redirection-table entry delivering a vector to a local APIC. It is found from the MADT
 //! (`super::acpi::ioapics()`), its MMIO page mapped uncached, every entry masked, and the
 //! legacy 8259 PICs disabled. ISA-IRQ→GSI resolution (MADT source overrides) and the
-//! device-vector registry (`super::idt::register_device_handler`) are arch-internal; the
+//! device-vector pool (`super::vectors`) are arch-internal; the
 //! neutral [`ArchIrqRouter`] takes a resolved line and vector. [`encode_rte`] and
 //! [`resolve_isa_irq`] are host-tested; the rest runs on-target via [`X86IoApic::self_test`].
 
@@ -256,7 +256,7 @@ impl ArchIrqRouter for X86IoApic {
 /// Install a legacy **ISA** interrupt end-to-end for an in-kernel driver: resolve the ISA IRQ
 /// to its GSI and trigger/polarity (honouring ACPI source overrides), register `handler` for a
 /// fresh device-interrupt vector, route the GSI to it on the boot CPU, and leave the line
-/// unmasked. Returns the IDT vector, or `None`, taking none, if the GSI cannot reach the boot CPU.
+/// unmasked. Returns the vector, which dropped masks the line and stays taken, or why it took none.
 ///
 /// Arch-internal (`pub(crate)`, not re-exported by `crate::arch`): "ISA" is x86-only, so a
 /// fixed legacy device wires its interrupt through its own arch module (the serial console via
@@ -369,6 +369,12 @@ mod tests {
         assert_eq!(regs.read32(IOREGSEL), REG_REDTBL_BASE + 2 * 9, "entry 9's low dword written last");
         assert_ne!(regs.read32(IOWIN) & 1 << 16, 0, "masked");
         assert_ne!(POOL.handler(slot), 0, "its vector still taken");
+        let given = install(10, 0).expect("routed");
+        let slot = (given.vector() - crate::arch::x86_64::idt::DEVICE_IRQ_BASE) as usize;
+        given.give_back();
+        assert_eq!(regs.read32(IOREGSEL), REG_REDTBL_BASE + 2 * 10, "entry 10's low dword written last");
+        assert_ne!(regs.read32(IOWIN) & 1 << 16, 0, "a route given back is masked");
+        assert_ne!(POOL.handler(slot), 0, "and its vector kept");
         *IOAPIC.lock() = None;
     }
 

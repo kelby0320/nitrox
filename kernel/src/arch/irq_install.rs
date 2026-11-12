@@ -42,6 +42,16 @@ pub enum InstallError {
     Unreachable,
 }
 
+impl InstallError {
+    /// What it says, for a log line or a decline.
+    pub fn says(self) -> &'static str {
+        match self {
+            InstallError::PoolFull => "no device vector is free",
+            InstallError::Unreachable => "no interrupt can reach the boot CPU",
+        }
+    }
+}
+
 /// The write a PCI function performs in order to raise its interrupt.
 ///
 /// Produced by [`ArchIrqInstall::install_msi`] and consumed by
@@ -97,4 +107,16 @@ pub trait ArchIrqInstall {
     /// Ring-0, after the interrupt table is installed. `handler` must stay valid for the kernel's
     /// lifetime.
     unsafe fn install_software(handler: extern "C" fn()) -> Result<DeviceVector, InstallError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A full pool says so**, not that the interrupt cannot reach the CPU: a decline's reason.
+    #[test]
+    fn a_full_pool_says_so() {
+        assert_eq!(InstallError::PoolFull.says(), "no device vector is free");
+        assert_eq!(InstallError::Unreachable.says(), "no interrupt can reach the boot CPU");
+    }
 }

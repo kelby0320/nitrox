@@ -373,7 +373,8 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
                 }
                 Err(e) => crate::kprintln!("usb: port {port}: Enable Slot failed: {e}"),
             }
-            // SAFETY: no slot was enabled, so the controller was given none of `mem`.
+            // SAFETY: the controller was given none of `mem`: Enable Slot takes none, and
+            // `set_slot_context`, below, is the first to hand it any.
             mem.release(&unsafe { Quiesced::assume() });
             return Err(());
         }

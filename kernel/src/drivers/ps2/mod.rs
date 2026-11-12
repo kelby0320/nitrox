@@ -551,13 +551,13 @@ pub fn init() {
 }
 
 /// A line's vector for the log, or that it could not be routed.
-struct Routed(Option<u8>);
+struct Routed(Result<u8, crate::arch::irq_install::InstallError>);
 
 impl core::fmt::Display for Routed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.0 {
-            Some(vector) => write!(f, "vec{vector:#x}"),
-            None => f.write_str("unrouted"),
+            Ok(vector) => write!(f, "vec{vector:#x}"),
+            Err(e) => write!(f, "polled: {}", e.says()),
         }
     }
 }
