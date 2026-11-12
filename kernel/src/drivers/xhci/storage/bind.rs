@@ -271,7 +271,7 @@ impl Binding<'_> {
         }
         // **The table first**, before the disk can be reached: nothing else waits on it yet.
         let table = read_table(self.x, self.i, port, lun, unit, self.mem);
-        let backend = BlockBackend { submit, poll, ctx: context(self.i, lun, self.epoch), max_frags: MAX_FRAGS };
+        let backend = BlockBackend::new(context(self.i, lun, self.epoch), MAX_FRAGS);
         let geometry = BlockGeometry { logical_block_size: u.block_len, block_count: u.blocks };
         let Ok(node) =
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, &name[..name_len], backend)

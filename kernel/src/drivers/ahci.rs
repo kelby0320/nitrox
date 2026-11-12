@@ -15,7 +15,7 @@ use crate::arch::DeviceVector;
 use crate::arch::irq_install::{ArchIrqInstall, InstallError};
 use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
-use crate::io::block::BlockBackend;
+use crate::io::block::{BlockBackend, BlockDevice};
 use crate::io::irp::{Irp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::lockrank::LockRank;
@@ -436,16 +436,11 @@ fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
     disk.port_base.read32(PX_TFD) & (TFD_ERR | TFD_BSY | TFD_DRQ) == 0
 }
 
-/// **The disk's block node**, its backend pointing at `disk`, published before the node is.
-fn disk_node(controller: &DeviceNode, sectors: u64, name: &[u8], disk: &AhciDisk) -> Option<KBox<DeviceNode>> {
+/// **The disk's block node**, its backend reaching the disk [`AHCI`] publishes before the node is.
+fn disk_node(controller: &DeviceNode, sectors: u64, name: &[u8]) -> Option<KBox<DeviceNode>> {
     let cdesc = controller.descriptor();
-    let backend = BlockBackend {
-        submit,
-        poll: ahci_poll,
-        ctx: disk as *const AhciDisk as *mut (),
-        // One command table, one page, so one command describes this many fragments.
-        max_frags: MAX_PRDT_ENTRIES,
-    };
+    // One command table, one page, so one command describes this many fragments.
+    let backend = BlockBackend::new(Port, MAX_PRDT_ENTRIES);
     let geometry = BlockGeometry { logical_block_size: SECTOR_SIZE, block_count: sectors };
     let descriptor = ResourceDescriptor {
         identity: DeviceIdentity {
@@ -467,21 +462,34 @@ fn disk_node(controller: &DeviceNode, sectors: u64, name: &[u8], disk: &AhciDisk
     DeviceNode::try_new_block(descriptor, geometry, BlockKind::Disk, name, backend).ok()
 }
 
-/// [`BlockBackend::submit`] for an AHCI disk: builds a `READ DMA EXT` (or write or flush) against
-/// the IRP's fragments and issues it. Completion arrives via the IRQ or the boot polled fallback.
-fn submit(irp: *mut Irp, ctx: *mut ()) {
-    // **A rescan and an eject are refused**, before the disk is touched: a SATA disk's table is read
-    // once at boot; partitioning an internal disk is `nxinstall`'s, and a reboot follows.
-    // SAFETY: `irp` is a live block IRP during submit.
-    let op = unsafe { (*irp).op };
-    if op == crate::io::irp::IrpOp::Rescan as u32 || op == crate::io::irp::IrpOp::Eject as u32 {
-        refuse(irp, crate::syscall::error::KError::Unsupported);
-        return;
-    }
-    let disk = ctx as *mut AhciDisk;
-    // SAFETY: `disk` is the live published disk.
-    let d = unsafe { &*disk };
+/// **The published disk's backend context**: [`AHCI`] holds the one disk served.
+#[derive(Copy, Clone)]
+struct Port;
 
+impl BlockDevice for Port {
+    fn submit(self, irp: *mut Irp) {
+        // **A rescan and an eject are refused**, before the disk is touched: a SATA disk's table is read
+        // once at boot; partitioning an internal disk is `nxinstall`'s, and a reboot follows.
+        // SAFETY: `irp` is a live block IRP during submit.
+        let op = unsafe { (*irp).op };
+        if op == crate::io::irp::IrpOp::Rescan as u32 || op == crate::io::irp::IrpOp::Eject as u32 {
+            refuse(irp, crate::syscall::error::KError::Unsupported);
+            return;
+        }
+        match AHCI.get() {
+            Some(d) => submit(d, irp),
+            None => refuse(irp, crate::syscall::error::KError::PeerClosed),
+        }
+    }
+
+    fn poll(self) {
+        poll_complete_inflight();
+    }
+}
+
+/// [`BlockDevice::submit`] for the AHCI disk `d`: builds a `READ DMA EXT` (or write or flush) against
+/// the IRP's fragments and issues it. Completion arrives via the IRQ or the boot polled fallback.
+fn submit(d: &AhciDisk, irp: *mut Irp) {
     // **More fragments than one command table can describe: refuse, before the lock.**
     // `dispatch_block_irp` already rejects this against the published `max_frags`; this is the
     // backstop for another route. It precedes the port lock because failing an IRP means completing
@@ -784,11 +792,6 @@ fn comreset(pb: Mmio) {
         core::hint::spin_loop();
     }
     pb.write32(PX_SERR, 0xFFFF_FFFF);
-}
-
-/// [`BlockBackend::poll`] for the AHCI disk: complete the in-flight command by polling (boot path).
-fn ahci_poll(_ctx: *mut ()) {
-    poll_complete_inflight();
 }
 
 fn ahci_intr_dpc(_ctx: *mut ()) {

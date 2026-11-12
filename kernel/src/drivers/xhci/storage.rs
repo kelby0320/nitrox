@@ -42,7 +42,7 @@ use super::hub::{self, DeviceMem, Failed};
 use super::ring::{Producer, RingMem, Trb, code, kind};
 use super::{RING_TRBS, Xhci};
 use crate::arch::timer::ArchTimer;
-use crate::io::block::BlockBackend;
+use crate::io::block::{BlockBackend, BlockDevice};
 use crate::io::irp::{Irp, IrpOp, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
@@ -137,15 +137,29 @@ const BOUND: u8 = 1;
 /// A slot whose device has departed: the next device may take it, under a new epoch.
 const RETIRED: u8 = 2;
 
-/// A node's `BlockBackend` context: its slot, its logical unit, and the slot's epoch when it was
+/// A node's [`BlockBackend`] context: its slot, its logical unit, and the slot's epoch when it was
 /// made.
-fn context(slot: usize, lun: u8, epoch: u32) -> *mut () {
-    ((epoch as usize) << 16 | (lun as usize) << 8 | slot) as *mut ()
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct UnitAt {
+    slot: u8,
+    lun: u8,
+    epoch: u32,
 }
 
-fn decode(ctx: *mut ()) -> (usize, u8, u32) {
-    let c = ctx as usize;
-    (c & 0xFF, (c >> 8) as u8, (c >> 16) as u32)
+fn context(slot: usize, lun: u8, epoch: u32) -> UnitAt {
+    UnitAt { slot: slot as u8, lun, epoch }
+}
+
+impl BlockDevice for UnitAt {
+    /// [`Disks::submit`], on the boot's.
+    fn submit(self, irp: *mut Irp) {
+        let a = DISKS.submit(irp, self, crate::arch::Timer::read_ns());
+        act(a, super::controller());
+    }
+
+    /// Nothing. A USB disk exists only once the scheduler runs, so the boot's
+    /// polled reads never reach one.
+    fn poll(self) {}
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -566,9 +580,8 @@ impl Disks {
         }
     }
 
-    fn current(&self, ctx: *mut ()) -> bool {
-        let (i, _, epoch) = decode(ctx);
-        self.epochs.get(i).is_some_and(|e| e.load(Ordering::Acquire) == epoch)
+    fn current(&self, unit: UnitAt) -> bool {
+        self.epochs.get(unit.slot as usize).is_some_and(|e| e.load(Ordering::Acquire) == unit.epoch)
     }
 
     /// [`take`](Self::take), `dev`'s memory kept with the device's, `mem`, when it is refused.
@@ -605,15 +618,15 @@ impl Disks {
 
     /// **A block IRP submitted on any CPU**: started if nothing is in flight, else queued; refused
     /// `PeerClosed` once its device has gone, by its slot's epoch under the device's lock.
-    fn submit(&self, irp: *mut Irp, ctx: *mut (), now: u64) -> Action {
+    fn submit(&self, irp: *mut Irp, unit: UnitAt, now: u64) -> Action {
         let refuse = |e: KError| Action::Complete { irp, status: e as i32, transferred: 0 };
-        let (i, lun, _) = decode(ctx);
-        let Some(slot) = self.devs.get(i) else {
+        let lun = unit.lun;
+        let Some(slot) = self.devs.get(unit.slot as usize) else {
             return refuse(KError::InvalidArgument);
         };
         let mut d = slot.lock();
         // **Under the device's lock**, against which a departure and a reused slot are ordered.
-        let Some(dev) = d.as_mut().filter(|_| self.current(ctx)) else {
+        let Some(dev) = d.as_mut().filter(|_| self.current(unit)) else {
             return refuse(KError::PeerClosed);
         };
         // SAFETY: `irp` is live and owned by its submitter until completed.
@@ -766,16 +779,6 @@ fn act(a: Action, x: Option<&Xhci>) {
         }
     }
 }
-
-/// [`BlockBackend::submit`] for a USB disk: [`Disks::submit`], on the boot's.
-fn submit(irp: *mut Irp, ctx: *mut ()) {
-    let a = DISKS.submit(irp, ctx, crate::arch::Timer::read_ns());
-    act(a, super::controller());
-}
-
-/// [`BlockBackend::poll`]: nothing. A USB disk exists only once the scheduler runs, so the boot's
-/// polled reads never reach one.
-fn poll(_ctx: *mut ()) {}
 
 /// **A transfer event for an endpoint other than the default one**, from the DPC: whether it was a
 /// storage device's.

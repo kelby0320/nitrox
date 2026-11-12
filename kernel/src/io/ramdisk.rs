@@ -42,7 +42,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use crate::arch::irq::ArchIrq;
 use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
-use crate::io::block::BlockBackend;
+use crate::io::block::{BlockBackend, BlockDevice};
 use crate::io::irp::{Irp, IrpOp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
@@ -234,13 +234,21 @@ static COMPLETION_VECTOR: AtomicU8 = AtomicU8::new(0);
 /// only so that tail runs.
 extern "C" fn ramdisk_completion_isr() {}
 
-/// The ramdisk's [`BlockBackend::submit`]: transfer now (a ramdisk has no DMA engine), complete the
+impl BlockDevice for &'static RamDisk {
+    fn submit(self, irp: *mut Irp) {
+        ramdisk_submit(self, irp);
+    }
+
+    /// Its `submit` already queued the completion DPC, so a synchronous read just drains it.
+    fn poll(self) {
+        crate::dpc::run_pending();
+    }
+}
+
+/// The ramdisk's [`BlockDevice::submit`]: transfer now (a ramdisk has no DMA engine), complete the
 /// IRP, and raise the completion interrupt so its DPC drains at once rather than at the next timer
 /// tick.
-fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
-    // SAFETY: `ctx` is the `*const RamDisk` installed in the backend; the device
-    // outlives the IRP.
-    let rd = unsafe { &*(ctx as *const RamDisk) };
+fn ramdisk_submit(rd: &RamDisk, irp: *mut Irp) {
     // SAFETY: `irp` is the live in-flight IRP from `dispatch_block_irp`.
     let (status, transferred) = rd.serve(unsafe { &*irp }, crate::arch::Timer::read_ns);
     // SAFETY: as above, and completed here once.
@@ -256,12 +264,6 @@ fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
     }
 }
 
-/// The ramdisk's [`BlockBackend::poll`]: its `submit` already queued the
-/// completion DPC, so a synchronous read just drains it.
-fn ramdisk_poll(_ctx: *mut ()) {
-    crate::dpc::run_pending();
-}
-
 /// Build a block [`DeviceNode`] for `rd`, which must outlive every IRP submitted
 /// to it (a ramdisk is leaked `'static`). The first call installs the completion
 /// vector; boot-time only, since two first calls racing would each take a vector.
@@ -273,15 +275,10 @@ pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNo
             Err(e) => crate::kprintln!("ramdisk: no completion vector ({}); its completions wait for a tick", e.says()),
         }
     }
-    let backend = BlockBackend {
-        submit: ramdisk_submit,
-        poll: ramdisk_poll,
-        ctx: rd as *const RamDisk as *mut (),
-        // **No hardware limit to inherit**: the ramdisk copies fragment by fragment
-        // with nothing fixed-size to overrun, and a limit nothing enforces would be
-        // a number to maintain.
-        max_frags: u32::MAX,
-    };
+    // **No hardware limit to inherit**: the ramdisk copies fragment by fragment
+    // with nothing fixed-size to overrun, and a limit nothing enforces would be
+    // a number to maintain.
+    let backend = BlockBackend::new(rd, u32::MAX);
     let geometry = BlockGeometry {
         logical_block_size: rd.block_size(),
         block_count: (rd.capacity() / rd.block_size() as usize) as u64,

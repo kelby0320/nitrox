@@ -209,6 +209,11 @@ ahead for the case that needs them. **Deferred:** transparent **filter drivers**
 of formal multi-frame descent — IRP **cancellation**, and the 30-second completion
 **timeout**.
 
+**A backend pairs a context with its driver's functions.** `BlockBackend::new` takes a
+`BlockDevice`: a reference to the device's state (a partition, a RAM disk), or a value naming it
+(AHCI's published port, a USB disk's slot, unit and epoch). Only that type's `submit` and `poll`
+read it back, so no code can hand one backend's context to another's functions.
+
 ## Async completion and `sys_wait`
 
 The driver framework is the archetype of the system's async-first rule (see

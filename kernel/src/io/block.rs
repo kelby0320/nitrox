@@ -1,7 +1,7 @@
 //! The block I/O core — building and dispatching a block [`Irp`].
 //!
 //! A block [`DeviceNode`](crate::object::DeviceNode) carries a [`BlockBackend`]
-//! (a submit function + context) installed by its driver. [`dispatch_block_irp`]
+//! (a [`BlockDevice`] context and its submit and poll) installed by its driver. [`dispatch_block_irp`]
 //! builds an [`Irp`] in an owning [`IrpBox`], sets its `on_complete` and hands it
 //! to the backend; once completed it signals the request's `PendingOperation` and
 //! leaves the box for thread context to free (see [`finish`]).
@@ -17,39 +17,104 @@ use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::object::header::Ref;
 use crate::object::{DeviceNode, MemoryObject, ObjectRef, PendingOperation};
 use crate::syscall::error::KError;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// A block device's I/O entry point, stored on its [`DeviceNode`]. `submit`
-/// takes the in-flight `*mut Irp` and the backend's `ctx`, programs the device
-/// (the ramdisk transfers and queues the completion DPC) and returns; it must
-/// **not** block.
-#[derive(Copy, Clone)]
-pub struct BlockBackend {
-    /// Submit an IRP to the device.
-    pub submit: fn(irp: *mut Irp, ctx: *mut ()),
+/// **A block device's driver, as its backend's context**: a reference to the device's state, or a
+/// value naming it, which [`BlockBackend`] hands back to its `submit` and `poll`. Each device
+/// synchronises its own state, on whichever CPU submits.
+pub trait BlockDevice: Copy + Send + Sync + 'static {
+    /// Take `irp` in flight: program the device and return, never blocking.
+    fn submit(self, irp: *mut Irp);
     /// Drive the in-flight command to completion by **polling**, then run its
     /// completion DPC: for synchronous kernel reads at boot, before interrupts
-    /// are enabled (see [`read_blocking`]). A partition delegates to its disk.
-    pub poll: fn(ctx: *mut ()),
-    /// Device context passed back to `submit`/`poll` (e.g. the controller).
-    pub ctx: *mut (),
+    /// are enabled (see [`read_blocking`]).
+    fn poll(self);
+}
+
+/// A block device's I/O entry point, stored on its [`DeviceNode`]: a [`BlockDevice`] context and
+/// the `submit` and `poll` that read it back as its type, paired by [`new`](Self::new), so no
+/// backend's context reaches another's functions.
+#[derive(Copy, Clone)]
+pub struct BlockBackend {
+    ctx: MaybeUninit<usize>,
+    submit: unsafe fn(MaybeUninit<usize>, *mut Irp),
+    poll: unsafe fn(MaybeUninit<usize>),
+    max_frags: u32,
+}
+
+impl BlockBackend {
+    /// `ctx`'s backend, describing at most `max_frags` fragments in one command.
+    pub fn new<C: BlockDevice>(ctx: C, max_frags: u32) -> Self {
+        const { assert!(size_of::<C>() <= size_of::<usize>() && align_of::<C>() <= align_of::<usize>()) };
+        let mut word = MaybeUninit::<usize>::uninit();
+        // SAFETY: a `C` fits the word, as checked above.
+        unsafe { word.as_mut_ptr().cast::<C>().write(ctx) };
+        BlockBackend { ctx: word, submit: submit_as::<C>, poll: poll_as::<C>, max_frags }
+    }
+
+    /// Submit an IRP to the device.
+    #[allow(clippy::not_unsafe_ptr_arg_deref, reason = "the in-flight IRP its device's submit takes")]
+    pub fn submit(&self, irp: *mut Irp) {
+        // SAFETY: `new` wrote `ctx` as the type `submit` reads it back as.
+        unsafe { (self.submit)(self.ctx, irp) }
+    }
+
+    /// Poll the device's in-flight command to completion ([`BlockDevice::poll`]).
+    pub fn poll(&self) {
+        // SAFETY: as `submit`.
+        unsafe { (self.poll)(self.ctx) }
+    }
+
     /// The most physical fragments this device can describe in **one** command:
     /// a device constraint only the driver knows (AHCI's is its command table's
     /// PRDT capacity; a ramdisk has none). [`dispatch_block_irp`] refuses a
     /// transfer needing more, which keeps a driver from writing past the
     /// structure it programs. Counted in fragments because the hardware limit is
     /// a descriptor count.
-    pub max_frags: u32,
+    pub fn max_frags(&self) -> u32 {
+        self.max_frags
+    }
 }
 
-// SAFETY: a `BlockBackend`'s raw `ctx` points at a device structure that lives
-// for the kernel's lifetime. `submit` and `poll` dereference it on whichever CPU
-// submits, so each device synchronises its own mutable state: AHCI through its
-// port lock and single in-flight slot, the RAM disk through its per-transfer
-// lock, a partition by being an immutable window onto its disk's backend.
-unsafe impl Send for BlockBackend {}
-// SAFETY: as above.
-unsafe impl Sync for BlockBackend {}
+/// **A host test's backend**: its own `submit` and `poll`, and a context they read back, on the
+/// test's thread.
+#[cfg(test)]
+pub(crate) fn test_backend(
+    submit: fn(*mut Irp, *mut ()),
+    poll: fn(*mut ()),
+    ctx: *mut (),
+    max_frags: u32,
+) -> BlockBackend {
+    struct Raw(fn(*mut Irp, *mut ()), fn(*mut ()), *mut ());
+    // SAFETY: a host test's functions and context, which it drives on its own thread.
+    unsafe impl Send for Raw {}
+    // SAFETY: as above.
+    unsafe impl Sync for Raw {}
+    impl BlockDevice for &'static Raw {
+        fn submit(self, irp: *mut Irp) {
+            (self.0)(irp, self.2)
+        }
+        fn poll(self) {
+            (self.1)(self.2)
+        }
+    }
+    BlockBackend::new(&*std::boxed::Box::leak(std::boxed::Box::new(Raw(submit, poll, ctx))), max_frags)
+}
+
+/// # Safety
+/// `ctx` holds a `C`, as [`BlockBackend::new`] wrote it.
+unsafe fn submit_as<C: BlockDevice>(ctx: MaybeUninit<usize>, irp: *mut Irp) {
+    // SAFETY: the caller's.
+    unsafe { ctx.as_ptr().cast::<C>().read() }.submit(irp)
+}
+
+/// # Safety
+/// As [`submit_as`].
+unsafe fn poll_as<C: BlockDevice>(ctx: MaybeUninit<usize>) {
+    // SAFETY: the caller's.
+    unsafe { ctx.as_ptr().cast::<C>().read() }.poll()
+}
 
 /// The owning wrapper around an in-flight [`Irp`]. `#[repr(C)]` with `irp`
 /// **first**, so `*mut IrpBox` and `*mut Irp` share an address and the
@@ -114,7 +179,7 @@ fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: *mut Irp) {
     let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
     let span = info.block_count.checked_mul(info.logical_block_size as u64);
     if offset.checked_add(length).zip(span).is_some_and(|(end, span)| end <= span) {
-        (backend.submit)(irp, backend.ctx);
+        backend.submit(irp);
     } else {
         // SAFETY: as above; completed as a refusing driver completes it.
         unsafe { crate::io::irp::complete(irp, KError::InvalidArgument as i32, 0) };
@@ -157,7 +222,7 @@ pub fn dispatch_block_irp(
     //
     // Splitting across several commands needs one `PendingOperation` to outlive
     // several IRPs. `TODO(block-transfer-split)`.
-    if frags.len() > backend.max_frags as usize {
+    if frags.len() > backend.max_frags() as usize {
         return Err(KError::InvalidArgument);
     }
 
@@ -208,7 +273,7 @@ pub fn dispatch_block_irp(
 /// ([`max_frags`](BlockBackend::max_frags)), or `None` without a block backend;
 /// it sizes the page cache's runs ([`dispatch_block_irp_into_frames`]).
 pub fn max_frags(device: &DeviceNode) -> Option<u32> {
-    device.block_backend().map(|b| b.max_frags)
+    device.block_backend().map(|b| b.max_frags())
 }
 
 /// Dispatch a block IRP moving `length` bytes between device offset `dev_offset`
@@ -236,7 +301,7 @@ pub fn dispatch_block_irp_into_frames(
 
     // A page-sized fragment per frame, refused past the device's limit as above.
     let frags = build_frags(frames, 0, length)?;
-    if frags.len() > backend.max_frags as usize {
+    if frags.len() > backend.max_frags() as usize {
         return Err(KError::InvalidArgument);
     }
 
@@ -310,7 +375,7 @@ pub fn dispatch_block_control(device: &Ref<DeviceNode>, po: &Ref<PendingOperatio
         bx.irp.on_complete = finish;
         &raw mut (*bx_ptr).irp
     };
-    (backend.submit)(irp_ptr, backend.ctx);
+    backend.submit(irp_ptr);
     Ok(())
 }
 
@@ -443,7 +508,7 @@ pub fn read_blocking(device: &Ref<DeviceNode>, lba: u64, count: u64, dst: &mut [
     if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, offset, 0, len as u64).is_err() {
         return false;
     }
-    (backend.poll)(backend.ctx);
+    backend.poll();
 
     let done = crate::sched::pending_op_is_signaled(&po_ref);
     let (status, _result) = crate::sched::pending_op_completion(&po_ref);
@@ -482,19 +547,21 @@ unsafe impl Send for Partition {}
 // SAFETY: as above.
 unsafe impl Sync for Partition {}
 
-/// [`BlockBackend::submit`] for a partition: bounds-check, **rebase** the offset
-/// to disk-absolute and forward to the parent disk's backend. `ctx` is the
-/// `*const Partition`.
-fn partition_submit(irp: *mut Irp, ctx: *mut ()) {
-    use core::sync::atomic::Ordering::SeqCst;
-    // SAFETY: `ctx` is the live `Partition`; `irp` is the in-flight request.
-    let p = unsafe { &*(ctx as *const Partition) };
-    // **Counted in before the retired check, out after the forward**, each `SeqCst` as
-    // `retire_window`'s store and `window_busy`'s load are: either this sees the window retired,
-    // or the rescan retiring it sees this submit and waits for it to reach the disk first.
-    p.entering.fetch_add(1, SeqCst);
-    forward(p, irp);
-    p.entering.fetch_sub(1, SeqCst);
+impl BlockDevice for &'static Partition {
+    /// Bounds-check, **rebase** the offset to disk-absolute and forward to the parent disk's backend.
+    fn submit(self, irp: *mut Irp) {
+        use core::sync::atomic::Ordering::SeqCst;
+        // **Counted in before the retired check, out after the forward**, each `SeqCst` as
+        // `retire_window`'s store and `window_busy`'s load are: either this sees the window retired,
+        // or the rescan retiring it sees this submit and waits for it to reach the disk first.
+        self.entering.fetch_add(1, SeqCst);
+        forward(self, irp);
+        self.entering.fetch_sub(1, SeqCst);
+    }
+
+    fn poll(self) {
+        self.disk.poll();
+    }
 }
 
 /// [`partition_submit`]'s body, between its count in and out: refuse, or rebase and forward.
@@ -509,7 +576,7 @@ fn forward(p: &Partition, irp: *mut Irp) {
     // blocks, so it goes down unchanged.
     // SAFETY: `irp` is in flight and uniquely owned during submit.
     if unsafe { (*irp).op } == IrpOp::Flush as u32 {
-        (p.disk.submit)(irp, p.disk.ctx);
+        p.disk.submit(irp);
         return;
     }
     // SAFETY: as above, `irp` is in flight and uniquely owned during submit.
@@ -517,10 +584,8 @@ fn forward(p: &Partition, irp: *mut Irp) {
     match partition_rebase(offset, length, p.start_lba, p.block_count, p.sector_size) {
         Some(disk_offset) => {
             // SAFETY: `irp` is in flight and uniquely owned during submit.
-            unsafe {
-                (*irp).offset = disk_offset;
-                (p.disk.submit)(irp, p.disk.ctx);
-            }
+            unsafe { (*irp).offset = disk_offset };
+            p.disk.submit(irp);
         }
         None => {
             // SAFETY: `irp` is in flight, and completed here once.
@@ -553,24 +618,11 @@ fn partition_rebase(offset: u64, length: u64, start_lba: u64, block_count: u64, 
     offset.checked_add(start_lba.checked_mul(sector_size)?)
 }
 
-/// [`BlockBackend::poll`] for a partition: delegate to the parent disk's poll.
-fn partition_poll(ctx: *mut ()) {
-    // SAFETY: `ctx` is the live `Partition`.
-    let p = unsafe { &*(ctx as *const Partition) };
-    (p.disk.poll)(p.disk.ctx);
-}
-
-/// A [`BlockBackend`] for a partition window; `partition` must outlive every IRP
-/// submitted to it (it is leaked `'static`).
+/// A [`BlockBackend`] for a partition window, leaked `'static`.
 pub fn partition_backend(partition: &'static Partition) -> BlockBackend {
-    BlockBackend {
-        submit: partition_submit,
-        poll: partition_poll,
-        ctx: partition as *const Partition as *mut (),
-        // **Inherited, not restated**: a partition forwards the same IRP to the
-        // same hardware, so the disk's limit applies; its own number could disagree.
-        max_frags: partition.disk.max_frags,
-    }
+    // **Inherited, not restated**: a partition forwards the same IRP to the
+    // same hardware, so the disk's limit applies; its own number could disagree.
+    BlockBackend::new(partition, partition.disk.max_frags())
 }
 
 impl Partition {

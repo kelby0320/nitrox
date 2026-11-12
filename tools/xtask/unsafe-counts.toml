@@ -8,11 +8,11 @@
 "kernel/src/boot_selftest" = 6
 "kernel/src/clock" = 1
 "kernel/src/dpc" = 4
-"kernel/src/drivers" = 40
+"kernel/src/drivers" = 39
 "kernel/src/fbcon" = 4
 "kernel/src/handle" = 30
 "kernel/src/initramfs" = 1
-"kernel/src/io" = 34
+"kernel/src/io" = 36
 "kernel/src/libkern" = 39
 "kernel/src/limine" = 14
 "kernel/src/main" = 17
@@ -32,7 +32,7 @@
 "kernel/src/framebuffer" = 1
 "kernel/src/handle" = 4
 "kernel/src/initramfs" = 1
-"kernel/src/io" = 5
+"kernel/src/io" = 7
 "kernel/src/libkern" = 2
 "kernel/src/limine" = 2
 "kernel/src/main" = 1
@@ -47,7 +47,7 @@
 "kernel/src/drivers" = 5
 "kernel/src/fbcon" = 1
 "kernel/src/handle" = 1
-"kernel/src/io" = 8
+"kernel/src/io" = 6
 "kernel/src/libkern" = 13
 "kernel/src/mm" = 4
 "kernel/src/object" = 23
