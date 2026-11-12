@@ -695,6 +695,20 @@ without one, sending a mask, or arming after the release does not compile (E0603
 E0061, E0277, E0382). Under Miri, both models, the 31 tests of the per-CPU types, the masks, the
 spinlocks, the preemption checks, grace and the shootdown.
 
+**After review** (`3ea2d34c`):
+- **The index is read unpinned only inside `arch`**: `ArchSmp` lost `current_cpu`,
+  `identity_bound` and `init_this_cpu`, which neutral code could call unpinned, and on an AP make
+  index 0 a second core's. `leave_online` asks `bound_index`; the boot CPU adopts index 0 by its
+  APIC id as an AP adopts its own, and a binding of an index or an APIC id bound already is
+  refused. The banner and the self-test's samples read the index under a mask.
+- **A syscall returning with interrupts on is named again**, checked before `end_if_ending`'s
+  unnamed refusal.
+- **`release_for_switch` holds every check a switch makes**, the lock tracker's first again, and
+  host tests drive it. A plain-lock holder never reaches it: a boot yielding under one stops at
+  the next acquisition's order check.
+- **A pin is lent only to the borrow's own thread**: `IrqSpinLockGuard::pin` takes `&mut`, and
+  `SchedToken` is not `Sync`. An observed `IrqsOff` restores nothing (tested).
+
 ### J.12 DMA memory, bounded and owned (drv-o3 with kmem-o9; drv-o13)
 
 **15 `.virt()` sites** in the drivers behind **21 `unsafe` blocks**, three of them addresses stored

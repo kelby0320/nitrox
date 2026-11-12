@@ -38119,5 +38119,10 @@ Part J's eleventh sub-part, `typed-layers.md` § J.11, built on
   a switch. The handle lookup's read section holds a `PreemptOff`.
 - kplat-d23: the BSP's syscall entry is armed beside its tables. sched-d16: the incoming thread's
   stacks are armed before `SCHED` is let go of.
+- **The raw read of the index is `arch`'s alone**: neutral code reads it under a pin, but for
+  `leave_online`'s `Smp::bound_index` on a CPU about to halt. Every core, the boot one included,
+  adopts its index by its APIC id, and a binding that would give two cores one index is refused.
+- A pin is lent only to the borrow's own thread: `IrqSpinLockGuard::pin` takes `&mut`, and
+  `SchedToken` is not `Sync`.
 - `unsafe` blocks stay at 568, `unsafe fn`s rise from 197 to 198 and `unsafe impl`s from 59 to 60;
   `static mut`s fall from 11 to 6.
