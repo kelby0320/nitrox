@@ -1033,7 +1033,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   one `unsafe` each; xHCI's three, whose pin the hub thread lets go of once it sees the completion,
   complete by address.
 
-- [ ] **sched-o3** encapsulate: per-CPU statics indexed by `this_cpu()` whose correctness rests on
+- [x] **sched-o3** encapsulate: per-CPU statics indexed by `this_cpu()` whose correctness rests on
   a comment that the caller cannot migrate between reading the index and using the slot — 28 sites
   (`grep -rn "with_preempt_off(\|with_resched_pending(\|with_ending(" kernel/src | grep -v "fn
   with_\|tests"` gives 12; `grep -n "\[cpu\]" kernel/src/libkern/lockrank.rs` gives 16), such as
@@ -1047,6 +1047,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   migration between `this_cpu()` and the access, the SMP wrong-slot class seen before. Depends on:
   nothing (the remote accessor wants sched-o1's token). concurrency. Value medium, effort medium.
   **Plan**, as kplat-o3, in P4.
+  Done in `07ce1e54`, as kplat-o3: `cpu_local!`, read with a pin, its host twin a set per thread;
+  the lock tracker's three arrays one `cpu_local!`; `remote` for `end_siblings`' store.
 
 - [x] **sched-o4** narrow: `dpc::enqueue(&Dpc)` is safe for any lifetime, though statics need
   nothing more and heap-embedded IRP DPCs are sound only by the convention that the box outlives its
@@ -2830,7 +2832,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `a_request_reads_the_response_limine_wrote`, `an_array_is_walked_to_its_count_past_its_nulls`
   (a walk that stops at a null, or one past the count, fails it). No `BootToken`: nothing kept past
   boot borrows Limine's memory.
-- [ ] **kplat-o3** encapsulate: a CPU index read from hardware (`rdtscp_aux`/`Smp::current_cpu`)
+- [x] **kplat-o3** encapsulate: a CPU index read from hardware (`rdtscp_aux`/`Smp::current_cpu`)
   and then used to index per-CPU state, with migration between read and use left to each
   caller, the per-CPU arrays indexed through unchecked `.add(idx)`, and `init_this_cpu(u32)` a
   safe fn — 11 sites for the read-then-use pattern (`grep -rn "rdtscp_aux()\|
@@ -2852,6 +2854,10 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kplat-d19), an out-of-range TSC_AUX (kplat-d8, kplat-d11), and 5 of the arch layer's 12
   `static mut`. Depends on: nothing. abi, ownership, concurrency, opportunities. Value high,
   effort medium. **Plan**, in P4.
+  Done in `07ce1e54`: `CpuIndex`, `CpuPin` and `PerCpu` in `arch::percpu`, the pin lent by an
+  `IrqsOff`, an `IrqSpinLockGuard`, a `PreemptOff` or the scheduler's held state; the five arrays
+  `PerCpu`s, reached by raw slot, and the bring-up passing a pin down. `leave_online` alone reads
+  the index unpinned.
 - [x] **kplat-o4** narrow: a suspended thread's ExceptionFrame location carried as a bare
   `usize` (`Thread::exception_frame`) and dereferenced by a safe `ArchRegisters` fn after SCHED,
   the lock that proves the thread parked, is dropped — 6 sites (`grep -rn
@@ -6693,7 +6699,7 @@ exist fails the whole wait. Both probes were removed.
 Two the kplat and sched runs missed, both read from the code while P4 was checked against it, and
 neither run. Both latent.
 
-- [ ] **kplat-d23** `kernel/src/main.rs:716` — `run_first_userspace` calls `arch::init_syscall_entry`
+- [x] **kplat-d23** `kernel/src/main.rs:716` — `run_first_userspace` calls `arch::init_syscall_entry`
   after preemption is armed (main.rs:318, inside `sched_bringup`) and the APs are up
   (main.rs:272), on a boot thread whose `cpu_mask` is every CPU (`object/thread.rs:255`, in
   `try_new_boot`). `init_syscall_entry` (`arch/x86_64/syscall.rs:75`) reads its CPU's block through
@@ -6707,9 +6713,13 @@ neither run. Both latent.
   before the CPU can be scheduled, with its index passed. Unverified: by reading; the control is the
   assertion, which would fire on every debug boot with the old placement, IF being 1 there.
   concurrency. Low. **Plan**, in P4.
-- [ ] **sched-d16** `kernel/src/sched.rs:608` — `arm_kernel_stack_for` (sched.rs:498) says its caller
+  Fixed in `07ce1e54`: armed beside `init_tables`, under a pin; at the old placement the pin's
+  `IrqsOff::observed()` fails `test-qemu`.
+- [x] **sched-d16** `kernel/src/sched.rs:608` — `arm_kernel_stack_for` (sched.rs:498) says its caller
   holds SCHED and reads the incoming thread's `kstack_top` under it, but `switch_into` calls it after
   `release_keeping_irqs_masked` (sched.rs:596). Benign today: the incoming thread's stack does not
   change once it is chosen, and interrupts stay masked to the switch. Fix: call it above the release,
   where the guard is its pin; RSP0 and the syscall stack are read only at a ring-3 entry, so the
   order is equivalent. Unverified: by reading. concurrency. Low. **Plan**, in P4.
+  Fixed in `07ce1e54`: armed above the release, with the guard's pin, which an arm after it cannot
+  borrow (E0382).
