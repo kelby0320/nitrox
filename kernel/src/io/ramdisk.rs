@@ -34,8 +34,8 @@
 //!
 //! **The completion vector is one of eight device vectors** (`DEVICE_IRQ_COUNT`),
 //! shared by every ramdisk. A release boot uses five (AHCI, COM1, the i8042's
-//! two, this); `register_device_handler` asserts on exhaustion, which a machine
-//! with more controllers could reach.
+//! two, this). A machine with more controllers could take them all: then the pool
+//! answers `PoolFull`, and a RAM disk's completions wait for the tick.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -268,8 +268,10 @@ fn ramdisk_poll(_ctx: *mut ()) {
 pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNode>, AllocError> {
     if COMPLETION_VECTOR.load(Ordering::Acquire) == 0 {
         // SAFETY: ring 0 at boot, after the interrupt table; the handler is a `'static` fn.
-        let vector = unsafe { crate::arch::IrqInstall::install_software(ramdisk_completion_isr) };
-        COMPLETION_VECTOR.store(vector, Ordering::Release);
+        match unsafe { crate::arch::IrqInstall::install_software(ramdisk_completion_isr) } {
+            Ok(vector) => COMPLETION_VECTOR.store(vector.commit(), Ordering::Release),
+            Err(e) => crate::kprintln!("ramdisk: no completion vector ({}); its completions wait for a tick", e.says()),
+        }
     }
     let backend = BlockBackend {
         submit: ramdisk_submit,

@@ -77,10 +77,11 @@ pub(crate) fn prepare() {
         return;
     }
     let page = gas.address & !(PAGE_SIZE as u64 - 1);
+    let uncached = crate::arch::paging::PageFlags::WRITABLE | crate::arch::paging::PageFlags::NO_CACHE;
     // SAFETY: the FADT names this page as holding the reset register, which is device memory the
     // kernel maps for no other purpose; the mapping is kept for the rest of this boot, which is
     // not long.
-    match unsafe { crate::mm::kvmap::map_mmio(PhysAddr(page), 1) } {
+    match unsafe { crate::mm::kvmap::map_device(PhysAddr(page), 1, uncached) } {
         Ok(va) => MAPPED.store(va.as_u64() + (gas.address - page), Ordering::Release),
         Err(_) => {
             crate::kprintln!("power: the reset register at {:#x} could not be mapped", gas.address)

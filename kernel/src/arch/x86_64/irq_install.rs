@@ -1,13 +1,14 @@
 //! x86_64 device-interrupt installation: the INTx and MSI halves of [`ArchIrqInstall`].
 //!
 //! Separate from [`super::ioapic`] because an MSI install never touches the IOAPIC: the
-//! device writes to the **local** APIC, and the only shared piece is [`super::idt`]'s
-//! device-vector registry.
+//! device writes to the **local** APIC, and the only shared piece is [`super::vectors`]'s
+//! device-vector pool.
 
-use super::idt;
 use super::ioapic;
+use super::vectors::{DEVICES, Held};
+use crate::arch::DeviceVector;
 use crate::arch::irq::ArchIrq;
-use crate::arch::irq_install::{ArchIrqInstall, MsiMessage};
+use crate::arch::irq_install::{ArchIrqInstall, InstallError, MsiMessage};
 use crate::arch::irq_router::{Polarity, TriggerMode};
 
 /// Base of the local-APIC message address range; a write in `0xFEE0_0000..0xFEF0_0000` is
@@ -42,25 +43,32 @@ fn compose(vector: u8, dest: u32) -> Option<MsiMessage> {
 
 impl ArchIrqInstall for X86IrqInstall {
     /// Composite over the local controller ([`ArchIrq::id`]) and [`ioapic::install`].
-    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> Option<u8> {
+    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> Result<DeviceVector, InstallError> {
+        let dest = crate::arch::Irq::id();
         // SAFETY: forwarded from this fn's contract.
-        unsafe { ioapic::install(gsi, crate::arch::Irq::id(), handler, TriggerMode::Level, Polarity::ActiveLow) }
+        unsafe { ioapic::install(&DEVICES, gsi, dest, handler, TriggerMode::Level, Polarity::ActiveLow) }
     }
 
     /// No router involvement. The destination is checked **before** a vector is taken, so a
     /// refusal costs nothing from the pool of eight.
-    unsafe fn install_msi(handler: extern "C" fn()) -> Option<MsiMessage> {
+    unsafe fn install_msi(handler: extern "C" fn()) -> Result<(MsiMessage, DeviceVector), InstallError> {
         let dest = crate::arch::Irq::id();
         if dest > MSI_MAX_DEST {
-            return None;
+            return Err(InstallError::Unreachable);
         }
-        let vector = idt::register_device_handler(handler);
-        compose(vector, dest)
+        let vector = DEVICES.take(handler, Held::Msi)?;
+        match compose(vector.vector(), dest) {
+            Some(message) => Ok((message, vector)),
+            None => {
+                vector.give_back();
+                Err(InstallError::Unreachable)
+            }
+        }
     }
 
-    unsafe fn install_software(handler: extern "C" fn()) -> u8 {
+    unsafe fn install_software(handler: extern "C" fn()) -> Result<DeviceVector, InstallError> {
         // Nothing to route: the kernel raises the vector through the SELF IPI register.
-        idt::register_device_handler(handler)
+        DEVICES.take(handler, Held::Idle)
     }
 }
 

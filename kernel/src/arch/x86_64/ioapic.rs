@@ -4,21 +4,24 @@
 //! redirection-table entry delivering a vector to a local APIC. It is found from the MADT
 //! (`super::acpi::ioapics()`), its MMIO page mapped uncached, every entry masked, and the
 //! legacy 8259 PICs disabled. ISA-IRQ→GSI resolution (MADT source overrides) and the
-//! device-vector registry (`super::idt::register_device_handler`) are arch-internal; the
+//! device-vector pool (`super::vectors`) are arch-internal; the
 //! neutral [`ArchIrqRouter`] takes a resolved line and vector. [`encode_rte`] and
 //! [`resolve_isa_irq`] are host-tested; the rest runs on-target via [`X86IoApic::self_test`].
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::Cpu;
+use crate::arch::DeviceVector;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::irq::ArchIrq;
+use crate::arch::irq_install::InstallError;
 use crate::arch::irq_router::{ArchIrqRouter, Polarity, TriggerMode};
 use crate::arch::timer::ArchTimer;
-use crate::arch::x86_64::{acpi, idt, regs};
+use crate::arch::x86_64::vectors::{DEVICES, Held, VectorPool};
+use crate::arch::x86_64::{acpi, regs};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock};
-use crate::mm::kvmap;
+use crate::mm::{Mmio, kvmap};
 
 // --- IOAPIC MMIO indirect registers ---
 const IOREGSEL: u64 = 0x00;
@@ -48,26 +51,20 @@ static PIT_DPC: crate::dpc::Dpc = crate::dpc::Dpc::new(pit_dpc_handler, core::pt
 
 /// **The IOAPIC's registers**, reached (IOREGSEL, then IOWIN) only under [`IOAPIC`]'s guard.
 struct IoApic {
-    base: u64,
+    regs: Mmio<'static>,
     gsi_base: u32,
     entries: u32,
 }
 
 impl IoApic {
     fn read(&mut self, idx: u32) -> u32 {
-        // SAFETY: `base` is the uncached page `init` mapped for good, and only `init` makes one.
-        unsafe {
-            core::ptr::write_volatile((self.base + IOREGSEL) as *mut u32, idx);
-            core::ptr::read_volatile((self.base + IOWIN) as *const u32)
-        }
+        self.regs.write32(IOREGSEL, idx);
+        self.regs.read32(IOWIN)
     }
 
     fn write(&mut self, idx: u32, val: u32) {
-        // SAFETY: as `read`, for a 32-bit write.
-        unsafe {
-            core::ptr::write_volatile((self.base + IOREGSEL) as *mut u32, idx);
-            core::ptr::write_volatile((self.base + IOWIN) as *mut u32, val);
-        }
+        self.regs.write32(IOREGSEL, idx);
+        self.regs.write32(IOWIN, val);
     }
 
     /// The redirection entry serving `gsi`, if this IOAPIC has one.
@@ -169,8 +166,8 @@ impl ArchIrqRouter for X86IoApic {
         };
 
         // SAFETY: `io.addr` is the IOAPIC's MMIO frame from the MADT, the kernel's for good.
-        let va = unsafe { kvmap::map_mmio(io.addr, 1) }?;
-        let mut ioapic = IoApic { base: va.as_u64(), gsi_base: io.gsi_base, entries: 0 };
+        let regs = unsafe { kvmap::map_mmio(io.addr, IOWIN + 4) }?;
+        let mut ioapic = IoApic { regs, gsi_base: io.gsi_base, entries: 0 };
         ioapic.entries = ((ioapic.read(REG_VER) >> 16) & 0xFF) + 1;
         let masked = encode_rte(0, 0, Polarity::ActiveHigh, TriggerMode::Edge, true);
         for idx in 0..ioapic.entries {
@@ -216,16 +213,18 @@ impl ArchIrqRouter for X86IoApic {
         }
         let bsp = crate::arch::Irq::id();
         let (gsi, polarity, trigger) = resolve_isa_irq(0, acpi::source_overrides());
-        let vector = idt::register_device_handler(pit_tick);
         PIT_TICKS.store(0, Ordering::Relaxed);
         PIT_DPC_RUNS.store(0, Ordering::Relaxed);
 
-        // Route the PIT's GSI to our vector on the boot CPU and start the PIT.
-        // SAFETY: ring-0, post-init; the handler for `vector` is registered.
-        if !unsafe { Self::route(gsi, vector, bsp, trigger, polarity) } {
-            crate::kprintln!("ioapic: the PIT's GSI{} cannot be routed to the boot CPU", gsi);
-            return;
-        }
+        // Route the PIT's GSI to a vector on the boot CPU and start the PIT.
+        // SAFETY: ring-0, post-init; `pit_tick` is a `'static` fn.
+        let vector = match unsafe { install(&DEVICES, gsi, bsp, pit_tick, trigger, polarity) } {
+            Ok(vector) => vector,
+            Err(e) => {
+                crate::kprintln!("ioapic: the PIT's GSI{} cannot be routed to the boot CPU: {:?}", gsi, e);
+                return;
+            }
+        };
         // SAFETY: ring-0; we own the PIT.
         unsafe { pit_ch0_periodic((PIT_INPUT_HZ / 100) as u16) };
 
@@ -247,7 +246,7 @@ impl ArchIrqRouter for X86IoApic {
         crate::kprintln!(
             "ioapic: routed PIT IRQ0\u{2192}GSI{}\u{2192}vec{:#x}; took {} interrupts ({} via DPC)",
             gsi,
-            vector,
+            vector.vector(),
             PIT_TICKS.load(Ordering::Relaxed),
             PIT_DPC_RUNS.load(Ordering::Relaxed),
         );
@@ -257,7 +256,7 @@ impl ArchIrqRouter for X86IoApic {
 /// Install a legacy **ISA** interrupt end-to-end for an in-kernel driver: resolve the ISA IRQ
 /// to its GSI and trigger/polarity (honouring ACPI source overrides), register `handler` for a
 /// fresh device-interrupt vector, route the GSI to it on the boot CPU, and leave the line
-/// unmasked. Returns the IDT vector, or `None`, taking none, if the GSI cannot reach the boot CPU.
+/// unmasked. Returns the vector, which dropped masks the line and stays taken, or why it took none.
 ///
 /// Arch-internal (`pub(crate)`, not re-exported by `crate::arch`): "ISA" is x86-only, so a
 /// fixed legacy device wires its interrupt through its own arch module (the serial console via
@@ -268,30 +267,35 @@ impl ArchIrqRouter for X86IoApic {
 /// # Safety
 /// Ring-0, after [`X86IoApic::init`]. `handler` must stay valid for the kernel's
 /// lifetime; the caller must be ready to receive the IRQ once interrupts are enabled.
-pub(crate) unsafe fn install_isa_irq(isa_irq: u8, handler: extern "C" fn()) -> Option<u8> {
+pub(crate) unsafe fn install_isa_irq(isa_irq: u8, handler: extern "C" fn()) -> Result<DeviceVector, InstallError> {
     let (gsi, polarity, trigger) = resolve_isa_irq(isa_irq, acpi::source_overrides());
     // SAFETY: forwarded from this fn's contract.
-    unsafe { install(gsi, crate::arch::Irq::id(), handler, trigger, polarity) }
+    unsafe { install(&DEVICES, gsi, crate::arch::Irq::id(), handler, trigger, polarity) }
 }
 
-/// **Route `gsi` to `dest` on a fresh vector for `handler`**; `None`, taking none, if it cannot.
+/// **Route `gsi` to `dest` on a vector from `pool` for `handler`**, which dropped masks the line and
+/// stays taken; an error, taking none, if it cannot.
 ///
 /// # Safety
 /// As [`install_isa_irq`].
 pub(super) unsafe fn install(
+    pool: &'static VectorPool,
     gsi: u32,
     dest: u32,
     handler: extern "C" fn(),
     trigger: TriggerMode,
     polarity: Polarity,
-) -> Option<u8> {
+) -> Result<DeviceVector, InstallError> {
     if !IOAPIC.lock().as_ref().is_some_and(|io| io.names(gsi, dest).is_some()) {
-        return None;
+        return Err(InstallError::Unreachable);
     }
-    let vector = idt::register_device_handler(handler);
+    let vector = pool.take(handler, Held::Idle)?;
     // SAFETY: forwarded from this fn's contract; the handler for `vector` was just
     // registered, so the routed interrupt has somewhere to land.
-    unsafe { X86IoApic::route(gsi, vector, dest, trigger, polarity) }.then_some(vector)
+    if !unsafe { X86IoApic::route(gsi, vector.vector(), dest, trigger, polarity) } {
+        return Err(InstallError::Unreachable);
+    }
+    Ok(vector.routed(gsi))
 }
 
 #[cfg(test)]
@@ -318,42 +322,59 @@ mod tests {
         assert_eq!(high >> 24, 3, "dest in bits 56:63 (high dword 31:24)");
     }
 
+    /// Memory standing in for an IOAPIC's IOREGSEL and IOWIN.
+    fn fake_regs() -> Mmio<'static> {
+        Mmio::over(std::boxed::Box::leak(std::boxed::Box::new([0u32; 8])))
+    }
+
     /// **An IOAPIC serves the GSIs from its base to its count**, and neither neighbour.
     #[test]
     fn an_ioapic_serves_its_gsis_and_neither_neighbour() {
-        let io = IoApic { base: 0, gsi_base: 24, entries: 24 };
+        let io = IoApic { regs: fake_regs(), gsi_base: 24, entries: 24 };
         assert_eq!(io.entry(23), None);
         assert_eq!(io.entry(24), Some(0));
         assert_eq!(io.entry(47), Some(23));
         assert_eq!(io.entry(48), None);
-        assert_eq!(IoApic { base: 0, gsi_base: u32::MAX, entries: 24 }.entry(0), None);
+        assert_eq!(IoApic { regs: fake_regs(), gsi_base: u32::MAX, entries: 24 }.entry(0), None);
     }
 
     /// **A destination wider than the entry's eight bits is refused**, not truncated.
     #[test]
     fn a_destination_wider_than_the_entry_is_refused_rather_than_truncated() {
-        let io = IoApic { base: 0, gsi_base: 0, entries: 24 };
+        let io = IoApic { regs: fake_regs(), gsi_base: 0, entries: 24 };
         assert_eq!(io.names(9, 0xFF), Some((9, 0xFF)));
         assert_eq!(io.names(9, 0x100), None);
         assert_eq!(io.names(24, 0), None);
     }
 
-    /// **A refused install takes no vector**, and one that routes takes one.
+    /// **A refused install takes no vector**, and one that routes takes one, which dropped masks its
+    /// line and stays taken: an interrupt may be on its way.
     #[test]
-    fn a_refused_install_takes_no_vector() {
+    fn a_refused_install_takes_no_vector_and_a_dropped_route_is_masked_and_kept() {
         extern "C" fn handler() {}
-        let mut regs = [0u32; 8];
-        *IOAPIC.lock() = Some(IoApic { base: regs.as_mut_ptr() as u64, gsi_base: 0, entries: 24 });
-        let taken = idt::device_slots_taken();
+        static POOL: VectorPool = VectorPool::new();
+        let regs = fake_regs();
+        *IOAPIC.lock() = Some(IoApic { regs, gsi_base: 0, entries: 24 });
         let install = |gsi, dest| {
             // SAFETY: a host test, where nothing delivers the interrupt.
-            unsafe { install(gsi, dest, handler, TriggerMode::Level, Polarity::ActiveLow) }
+            unsafe { install(&POOL, gsi, dest, handler, TriggerMode::Level, Polarity::ActiveLow) }
         };
-        assert_eq!(install(9, 0x100), None);
-        assert_eq!(install(24, 0), None);
-        assert_eq!(idt::device_slots_taken(), taken);
-        assert!(install(9, 0).is_some());
-        assert_eq!(idt::device_slots_taken(), taken + 1);
+        assert_eq!(install(9, 0x100).err(), Some(InstallError::Unreachable), "a destination too wide");
+        assert_eq!(install(24, 0).err(), Some(InstallError::Unreachable), "a GSI with no entry");
+        assert_eq!(POOL.handler(0), 0, "neither took a vector");
+        let routed = install(9, 0).expect("routed");
+        let slot = (routed.vector() - crate::arch::x86_64::idt::DEVICE_IRQ_BASE) as usize;
+        assert_eq!(regs.read32(IOWIN) & 1 << 16, 0, "its entry unmasked");
+        drop(routed);
+        assert_eq!(regs.read32(IOREGSEL), REG_REDTBL_BASE + 2 * 9, "entry 9's low dword written last");
+        assert_ne!(regs.read32(IOWIN) & 1 << 16, 0, "masked");
+        assert_ne!(POOL.handler(slot), 0, "its vector still taken");
+        let given = install(10, 0).expect("routed");
+        let slot = (given.vector() - crate::arch::x86_64::idt::DEVICE_IRQ_BASE) as usize;
+        given.give_back();
+        assert_eq!(regs.read32(IOREGSEL), REG_REDTBL_BASE + 2 * 10, "entry 10's low dword written last");
+        assert_ne!(regs.read32(IOWIN) & 1 << 16, 0, "a route given back is masked");
+        assert_ne!(POOL.handler(slot), 0, "and its vector kept");
         *IOAPIC.lock() = None;
     }
 

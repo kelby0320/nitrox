@@ -523,8 +523,13 @@ Its VA comes from a cursor over the window, and from ranges given back:
   under the vmap's lock.
 - **Device mappings** (`map_mmio`, `map_device`) are permanent: their VA
   is never given back. `unmap_device` clears one and shoots it down.
+  `map_mmio` returns an **`Mmio`** (`mm/mmio.rs`), a window of registers:
+  each `read32` and `write32` is an aligned dword held to it, and `sub`
+  checks a window inside it as it is made, so an offset a device supplies
+  is held to its window once, at bring-up.
 - **An `MmioWindow`** is one page repointed at device frames in turn (the
-  PCI scan's), and each repoint shoots down the page's old translation.
+  PCI scan's), and each repoint shoots down the page's old translation and
+  lends the new frame's registers until the next.
 
 [`mm/kstack.rs`](../../kernel/src/mm/kstack.rs) builds each thread's
 kernel stack as a `VmapFrames` of `KERNEL_STACK_PAGES` above one guard

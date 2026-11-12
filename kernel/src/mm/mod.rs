@@ -12,12 +12,14 @@ pub mod frame;
 pub mod heap;
 pub mod kstack;
 pub mod kvmap;
+pub mod mmio;
 pub mod page_tables;
 pub mod slab;
 pub mod user_access;
 pub mod vmm;
 
 pub use dma::DmaBuffer;
+pub use mmio::Mmio;
 
 #[cfg(test)]
 pub(crate) mod test_support;

@@ -27,7 +27,7 @@ use super::context::{self, DCI_EP0, speed};
 use super::desc;
 use super::hid::LightsTo;
 use super::ring::{Producer, RingMem, Trb, code, kind};
-use super::{Awaited, CommandRing, PoPtr, RING_TRBS, Waiting, XHCI, Xhci, read32, write32};
+use super::{Awaited, CommandRing, PoPtr, RING_TRBS, Waiting, XHCI, Xhci};
 use crate::arch::timer::ArchTimer;
 use crate::device::UsbFacts;
 use crate::libkern::KVec;
@@ -55,7 +55,7 @@ const COMMAND_NS: u64 = 1_000_000_000;
 const TRANSFER_NS: u64 = 1_000_000_000;
 
 // PORTSC (xHCI 1.2 §5.4.8), at the operational registers' `0x400 + 0x10 × (port − 1)`.
-const PORTSC: u64 = 0x400;
+pub(super) const PORTSC: u64 = 0x400;
 const PORT_CCS: u32 = 1 << 0;
 const PORT_PED: u32 = 1 << 1;
 const PORT_PR: u32 = 1 << 4;
@@ -365,13 +365,16 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
         return Err(());
     };
     let slot = match command(x, Trb::of_kind(kind::ENABLE_SLOT)) {
-        Ok(slot) if slot != 0 => slot,
+        Ok(slot) if slot_named(slot, x.max_slots) => slot,
         failed => {
             match failed {
-                Ok(_) => crate::kprintln!("usb: port {port}: Enable Slot named no slot"),
+                Ok(slot) => {
+                    crate::kprintln!("usb: port {port}: Enable Slot named slot {slot}, not one of its {}", x.max_slots)
+                }
                 Err(e) => crate::kprintln!("usb: port {port}: Enable Slot failed: {e}"),
             }
-            // SAFETY: no slot was enabled, so the controller was given none of `mem`.
+            // SAFETY: the controller was given none of `mem`: Enable Slot takes none, and
+            // `set_slot_context`, below, is the first to hand it any.
             mem.release(&unsafe { Quiesced::assume() });
             return Err(());
         }
@@ -393,6 +396,12 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
             Err(())
         }
     }
+}
+
+/// Whether an Enable Slot's answer names one of the controller's `max_slots` slots, which its
+/// doorbells and device context base array have room for.
+fn slot_named(slot: u8, max_slots: u8) -> bool {
+    (1..=max_slots).contains(&slot)
 }
 
 /// **Bind what the device's classes match, in one configuration**: each class's
@@ -704,7 +713,7 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
         let CommandRing { mem, ring } = &mut *c;
         ring.push(&mut RingMem::of(mem), trb);
     }
-    write32(x.db, 0, 0);
+    x.db.write32(0, 0);
     match wait(x, &po, COMMAND_NS) {
         Some((code::SUCCESS, slot)) => Ok(slot as u8),
         Some((c, _)) => Err(Failed::Code(c)),
@@ -772,11 +781,11 @@ fn enable_port(x: &Xhci, port: u8) -> bool {
 }
 
 fn portsc(x: &Xhci, port: u8) -> u32 {
-    read32(x.op, PORTSC + 0x10 * (port as u64 - 1))
+    x.op.read32(PORTSC + 0x10 * (port as u64 - 1))
 }
 
 fn write_portsc(x: &Xhci, port: u8, val: u32) {
-    write32(x.op, PORTSC + 0x10 * (port as u64 - 1), val);
+    x.op.write32(PORTSC + 0x10 * (port as u64 - 1), val);
 }
 
 /// **A port's connect change, acknowledged**: `None` without one, else whether a device is

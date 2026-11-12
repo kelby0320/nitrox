@@ -16,19 +16,18 @@ pub fn init(controller: &DeviceNode) -> Outcome {
         crate::kprintln!("ahci: controller has no ABAR (BAR5)");
         return declined("the controller has no ABAR (BAR5)");
     }
-    let pages = bar.size.div_ceil(crate::mm::PAGE_SIZE as u64).max(1);
     // SAFETY: `bar.base` is the controller's MMIO ABAR from PCI BAR sizing.
-    let abar = match unsafe { kvmap::map_mmio(PhysAddr(bar.base), pages) } {
-        Ok(va) => va.as_u64() + (bar.base & (crate::mm::PAGE_SIZE as u64 - 1)),
+    let abar = match unsafe { kvmap::map_mmio(PhysAddr(bar.base), bar.size) } {
+        Ok(regs) => regs,
         Err(_) => {
             crate::kprintln!("ahci: ABAR map failed");
             return declined("its ABAR could not be mapped");
         }
     };
 
-    write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_AE);
-    let pi = read32(abar, HBA_PI);
-    let cap = read32(abar, HBA_CAP);
+    abar.write32(HBA_GHC, abar.read32(HBA_GHC) | GHC_AE);
+    let pi = abar.read32(HBA_PI);
+    let cap = abar.read32(HBA_CAP);
     crate::kprintln!("ahci: HBA up (CAP {:#010x}, PI {:#010x})", cap, pi);
 
     // The driver writes 64-bit addresses into the command list, the FIS base and every PRDT entry.
@@ -43,8 +42,10 @@ pub fn init(controller: &DeviceNode) -> Outcome {
         if pi & (1 << p) == 0 {
             continue;
         }
-        let pb = abar + PORT_BASE + p as u64 * PORT_STRIDE;
-        if read32(pb, PX_SSTS) & 0xF == SSTS_DET_PRESENT && read32(pb, PX_SIG) == SIG_SATA {
+        let Some(pb) = port_regs(abar, p) else {
+            continue;
+        };
+        if pb.read32(PX_SSTS) & 0xF == SSTS_DET_PRESENT && pb.read32(PX_SIG) == SIG_SATA {
             port = p;
             break;
         }
@@ -104,9 +105,12 @@ pub fn init(controller: &DeviceNode) -> Outcome {
         give_back(&mut disk);
         return declined("the disk's device node could not be allocated");
     };
-    let Some(signal) = install_signal(&cfg, desc.interrupt.line as u32) else {
-        give_back(&mut disk);
-        return declined("no interrupt can reach the boot CPU");
+    let (signal, vector) = match install_signal(&cfg, desc.interrupt.line as u32) {
+        Ok(installed) => installed,
+        Err(e) => {
+            give_back(&mut disk);
+            return declined(e.says());
+        }
     };
     let disk = match AHCI.publish(disk) {
         Ok(disk) => disk,
@@ -116,18 +120,19 @@ pub fn init(controller: &DeviceNode) -> Outcome {
         }
     };
 
-    write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
-    write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
+    abar.write32(HBA_GHC, abar.read32(HBA_GHC) | GHC_IE);
+    abar.write32(HBA_IS, abar.read32(HBA_IS)); // clear stale
 
     let r = Ref::new(node);
     crate::device::register(r.clone(), "ahci");
     disk.counted.attach(&r);
+    vector.commit();
     Outcome::Claimed { driver: DRIVER, signal }
 }
 
 /// **The controller's interrupt**: MSI, which needs no interrupt-line register (UEFI often leaves
-/// it meaningless), else INTx from `gsi`; `None`, logged, if neither reaches the boot CPU.
-fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Option<Signal> {
+/// it meaningless), else INTx from `gsi`; INTx's refusal, logged, if neither is had.
+fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Result<(Signal, DeviceVector), InstallError> {
     if let Some(cfg) = cfg
         && let Some(msi) = crate::pci::read_msi(cfg)
     {
@@ -136,7 +141,7 @@ fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Option<Signal> 
         match unsafe { crate::arch::IrqInstall::install_msi(isr) } {
             // SAFETY: the handler for `msg.vector` was just registered, so
             // the device may write the message from here on.
-            Some(msg) if unsafe { crate::pci::program_msi(cfg, &msi, msg.address, msg.data) } => {
+            Ok((msg, vector)) if unsafe { crate::pci::program_msi(cfg, &msi, msg.address, msg.data) } => {
                 // MSI does not suppress INTx, and a device able to do both
                 // would assert a line nothing is listening on.
                 crate::pci::set_intx_disabled(cfg, true);
@@ -148,26 +153,37 @@ fn install_signal(cfg: &Option<crate::pci::Config>, gsi: u32) -> Option<Signal> 
                     if msi.addr64 { 64 } else { 32 },
                     msi.off
                 );
-                return Some(Signal::Msi { vector: msg.vector });
+                return Ok((Signal::Msi { vector: msg.vector }, vector));
             }
-            Some(_) => crate::kprintln!(
-                "ahci: MSI declined — the capability cannot hold the message address; \
-                     falling back"
-            ),
-            None => crate::kprintln!("ahci: MSI declined — this CPU cannot be named in a message; falling back"),
+            Ok((_, vector)) => {
+                vector.give_back();
+                crate::kprintln!("ahci: MSI declined — the capability cannot hold the message address; falling back")
+            }
+            Err(InstallError::PoolFull) => {
+                crate::kprintln!("ahci: MSI declined — no device vector is free; falling back")
+            }
+            Err(InstallError::Unreachable) => {
+                crate::kprintln!("ahci: MSI declined — this CPU cannot be named in a message; falling back")
+            }
         }
     }
     // The GSI is the PCI interrupt-line register's (ACPI `_PRT` routing is deferred).
     // SAFETY: ring-0, post-IrqRouter::init; `isr` stays valid for the kernel's lifetime.
-    let Some(vec) = (unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) }) else {
-        crate::kprintln!("ahci: GSI {} cannot be routed to the boot CPU", gsi);
-        return None;
+    let vector = match unsafe { crate::arch::IrqInstall::install_intx(gsi, isr) } {
+        Ok(vector) => vector,
+        Err(e) => {
+            match e {
+                InstallError::PoolFull => crate::kprintln!("ahci: no device vector is free for GSI {}", gsi),
+                InstallError::Unreachable => crate::kprintln!("ahci: GSI {} cannot be routed to the boot CPU", gsi),
+            }
+            return Err(e);
+        }
     };
     if let Some(cfg) = cfg {
         crate::pci::set_intx_disabled(cfg, false);
     }
-    crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vec);
-    Some(Signal::Intx { gsi, vector: vec })
+    crate::kprintln!("ahci: irq via INTx (GSI {}, vec {:#04x})", gsi, vector.vector());
+    Ok((Signal::Intx { gsi, vector: vector.vector() }, vector))
 }
 
 /// A claimed disk, and its name's bytes and length.
@@ -175,8 +191,8 @@ pub(super) type Claimed = (KBox<AhciDisk>, [u8; MAX_DEVICE_NAME], usize);
 
 /// **Claim the SATA disk on `port`**: every allocation made first, so none fails with the port
 /// running, then the port started and the disk identified; or why not, its memory freed if it stopped.
-pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> {
-    let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
+pub(super) fn claim_port(abar: Mmio<'static>, port: u32) -> Result<Claimed, &'static str> {
+    let port_base = port_regs(abar, port).ok_or("its registers lie past the ABAR")?;
     // **A port that will not stop is given nothing**: a command list may be given only to a stopped
     // port, and the one running may be the firmware's.
     if stop_port(port_base).is_none() {
@@ -210,13 +226,13 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         return Err(OUT_OF_MEMORY);
     };
 
-    write32(port_base, PX_CLB, clb as u32);
-    write32(port_base, PX_CLBU, (clb >> 32) as u32);
-    write32(port_base, PX_FB, fb as u32);
-    write32(port_base, PX_FBU, (fb >> 32) as u32);
-    write32(port_base, PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
-    write32(port_base, PX_IS, 0xFFFF_FFFF);
-    write32(port_base, PX_IE, PXIE_DHRE | PX_FATAL);
+    port_base.write32(PX_CLB, clb as u32);
+    port_base.write32(PX_CLBU, (clb >> 32) as u32);
+    port_base.write32(PX_FB, fb as u32);
+    port_base.write32(PX_FBU, (fb >> 32) as u32);
+    port_base.write32(PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
+    port_base.write32(PX_IS, 0xFFFF_FFFF);
+    port_base.write32(PX_IE, PXIE_DHRE | PX_FATAL);
     start_port(port_base);
 
     let mut name = [0u8; MAX_DEVICE_NAME];

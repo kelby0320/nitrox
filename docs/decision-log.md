@@ -38153,3 +38153,20 @@ Part J's twelfth sub-part, `typed-layers.md` § J.12, built on `pre-phase-7/part
 - **A class's bind that fails gives its buffers back through the call that refuses it**:
   `Disks::take_or_keep`, `Disks::retire` and `hid::start`, which also retires the endpoint's node.
 - `unsafe` blocks fall from 568 to 545, and `unsafe fn`s from 198 to 197.
+
+## 2026-11-12 — Before Phase 7, J.13: registers in a window, and vectors given back
+
+Part J's thirteenth sub-part, `typed-layers.md` § J.13, built on `pre-phase-7/part-j13-mmio-window`.
+
+- **A device's registers are an `Mmio`**, a window each access is held to, an aligned dword inside
+  it. `map_mmio` returns one for the bytes it maps. An offset a device supplies makes a window
+  inside it at bring-up, refused past its end: the xHCI's capability registers, and its
+  operational, runtime and doorbell windows, held to BAR0 for MaxPorts and MaxSlots, and AHCI's
+  ports in the ABAR. An Enable Slot's answer is held to MaxSlots.
+- **A device vector is a `DeviceVector`**, taken from a pool that answers `PoolFull` where it
+  asserted, and given back when dropped only while nothing may raise it. **An MSI vector dropped
+  stays taken unless its taker gives it back**, its message refused, as a device may hold it; a
+  vector routed to a line is masked, then kept, whatever its taker asks. A refusal says which it
+  is: a full pool, or a CPU the interrupt cannot reach.
+- `reset.rs` keeps its raw reset register, a byte written at reset with nothing allocated.
+- `unsafe` blocks fall from 545 to 541, and `unsafe fn`s rise from 197 to 198.

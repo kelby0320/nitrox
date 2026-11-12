@@ -11,7 +11,8 @@
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::printable::Printable;
 
-use crate::arch::irq_install::ArchIrqInstall;
+use crate::arch::DeviceVector;
+use crate::arch::irq_install::{ArchIrqInstall, InstallError};
 use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;
@@ -20,7 +21,7 @@ use crate::io::stats::Counted;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, Published};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
-use crate::mm::{PhysAddr, kvmap};
+use crate::mm::{Mmio, PhysAddr, kvmap};
 use crate::object::InterruptObject;
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
@@ -37,6 +38,11 @@ const GHC_IE: u32 = 1 << 1; // global interrupt enable
 
 const PORT_BASE: u64 = 0x100; // first port's registers
 const PORT_STRIDE: u64 = 0x80;
+
+/// Port `port`'s registers, if the ABAR holds them.
+fn port_regs(abar: Mmio<'static>, port: u32) -> Option<Mmio<'static>> {
+    abar.sub(PORT_BASE + port as u64 * PORT_STRIDE, PORT_STRIDE)
+}
 
 const PX_CLB: u64 = 0x00;
 const PX_CLBU: u64 = 0x04;
@@ -187,8 +193,9 @@ impl PortState {
 /// State for the single supported AHCI disk, leaked to `'static`; the ISR reaches it through
 /// [`AHCI`].
 pub struct AhciDisk {
-    abar: u64,      // mapped ABAR kernel-virtual base
-    port_base: u64, // abar + 0x100 + port*0x80
+    abar: Mmio<'static>,
+    /// Its port's registers, inside the ABAR.
+    port_base: Mmio<'static>,
     port: u32,
     _fis: Programmed, // 256 B received-FIS area
     sectors: u64,
@@ -236,18 +243,6 @@ static AHCI_DRAIN_DPC: Dpc = Dpc::new(ahci_drain_dpc, core::ptr::null_mut());
 /// DPC that wakes the watch thread to recover the port after a fault.
 static AHCI_FAULT_DPC: Dpc = Dpc::new(ahci_fault_dpc, core::ptr::null_mut());
 
-#[inline]
-fn read32(base: u64, off: u64) -> u32 {
-    // SAFETY: `base + off` is within the mapped uncached ABAR window.
-    unsafe { core::ptr::read_volatile((base + off) as *const u32) }
-}
-
-#[inline]
-fn write32(base: u64, off: u64, val: u32) {
-    // SAFETY: as `read32`; AHCI registers are 32-bit MMIO.
-    unsafe { core::ptr::write_volatile((base + off) as *mut u32, val) };
-}
-
 mod bringup;
 #[cfg(test)]
 use bringup::claim_port;
@@ -265,27 +260,27 @@ fn declined(why: &'static str) -> Outcome {
 
 /// Stop the port: clear ST then FRE, waiting for CR/FR to clear. The proof they did, or `None`: a
 /// command list still running may still move a command's data.
-fn stop_port(pb: u64) -> Option<Quiesced> {
-    let mut cmd = read32(pb, PX_CMD);
+fn stop_port(pb: Mmio) -> Option<Quiesced> {
+    let mut cmd = pb.read32(PX_CMD);
     cmd &= !CMD_ST;
-    write32(pb, PX_CMD, cmd);
+    pb.write32(PX_CMD, cmd);
     wait_clear(pb, PX_CMD, CMD_CR);
-    cmd = read32(pb, PX_CMD);
+    cmd = pb.read32(PX_CMD);
     cmd &= !CMD_FRE;
-    write32(pb, PX_CMD, cmd);
+    pb.write32(PX_CMD, cmd);
     wait_clear(pb, PX_CMD, CMD_FR);
     // SAFETY: CR and FR read clear: the port fetches no command and receives no FIS.
-    (read32(pb, PX_CMD) & (CMD_CR | CMD_FR) == 0).then(|| unsafe { Quiesced::assume() })
+    (pb.read32(PX_CMD) & (CMD_CR | CMD_FR) == 0).then(|| unsafe { Quiesced::assume() })
 }
 
 /// Start the port: set FRE then ST (FRE must precede ST).
-fn start_port(pb: u64) {
+fn start_port(pb: Mmio) {
     wait_clear(pb, PX_TFD, TFD_BSY | TFD_DRQ);
-    let mut cmd = read32(pb, PX_CMD);
+    let mut cmd = pb.read32(PX_CMD);
     cmd |= CMD_FRE;
-    write32(pb, PX_CMD, cmd);
+    pb.write32(PX_CMD, cmd);
     cmd |= CMD_ST;
-    write32(pb, PX_CMD, cmd);
+    pb.write32(PX_CMD, cmd);
 }
 
 /// **The port's clock.** A host test's moves on as it is read, where the host's reads 0.
@@ -298,9 +293,9 @@ fn clock() -> u64 {
 #[cfg(test)]
 use tests::clock;
 
-fn wait_clear(pb: u64, off: u64, mask: u32) {
+fn wait_clear(pb: Mmio, off: u64, mask: u32) {
     let start = clock();
-    while read32(pb, off) & mask != 0 {
+    while pb.read32(off) & mask != 0 {
         if clock().wrapping_sub(start) > POLL_TIMEOUT_NS {
             return;
         }
@@ -419,18 +414,18 @@ fn build_command(p: &PortState, command: u8, lba: u64, count: u16, frags: &[Phys
 }
 
 fn issue(disk: &AhciDisk) {
-    write32(disk.port_base, PX_CI, 1);
+    disk.port_base.write32(PX_CI, 1);
 }
 
 /// Poll slot 0 to completion within `timeout_ns`; `true` on success, `false` on timeout/error.
 fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
     let start = clock();
     loop {
-        let ci = read32(disk.port_base, PX_CI);
+        let ci = disk.port_base.read32(PX_CI);
         if ci & 1 == 0 {
             break;
         }
-        if read32(disk.port_base, PX_TFD) & TFD_ERR != 0 {
+        if disk.port_base.read32(PX_TFD) & TFD_ERR != 0 {
             return false;
         }
         if clock().wrapping_sub(start) > timeout_ns {
@@ -438,7 +433,7 @@ fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
         }
         core::hint::spin_loop();
     }
-    read32(disk.port_base, PX_TFD) & (TFD_ERR | TFD_BSY | TFD_DRQ) == 0
+    disk.port_base.read32(PX_TFD) & (TFD_ERR | TFD_BSY | TFD_DRQ) == 0
 }
 
 /// **The disk's block node**, its backend pointing at `disk`, published before the node is.
@@ -588,11 +583,11 @@ fn take_retired(d: &AhciDisk, p: &mut PortState) -> (*mut Irp, bool, u32, u64) {
     }
     // **PxCI is read under the lock a submit issues under**: read before it, slot 0 could have
     // taken a new command since, retired here while the HBA still runs it.
-    if read32(d.port_base, PX_CI) & 1 != 0 {
+    if d.port_base.read32(PX_CI) & 1 != 0 {
         return (core::ptr::null_mut(), false, 0, 0);
     }
     let retired = core::mem::replace(&mut p.inflight, core::ptr::null_mut());
-    let err = read32(d.port_base, PX_TFD) & TFD_ERR != 0;
+    let err = d.port_base.read32(PX_TFD) & TFD_ERR != 0;
     // Slot 0's header DW1, which only `build_command` for the next command rewrites, under this lock.
     let moved = p.cmd_list.read::<u32>(4);
     (retired, err, moved, p.issued_at)
@@ -637,9 +632,9 @@ extern "C" fn isr() {
 
 /// [`isr`]'s body: acknowledge, report a fault to the watch thread, or retire slot 0.
 fn on_interrupt(d: &AhciDisk) {
-    let pxis = read32(d.port_base, PX_IS);
-    write32(d.port_base, PX_IS, pxis);
-    write32(d.abar, HBA_IS, 1 << d.port);
+    let pxis = d.port_base.read32(PX_IS);
+    d.port_base.write32(PX_IS, pxis);
+    d.abar.write32(HBA_IS, 1 << d.port);
 
     // **One hold**: the fault report and the retire decide on state no submit can change meanwhile.
     let (faulted, (irp, err, moved, issued_at)) = {
@@ -740,10 +735,10 @@ fn recover(d: &AhciDisk, irp: *mut Irp) -> bool {
             unsafe { retire(d, next, true, 0, clock()) };
         }
     }
-    write32(pb, PX_SERR, 0xFFFF_FFFF);
-    write32(pb, PX_IS, 0xFFFF_FFFF);
-    write32(d.abar, HBA_IS, 1 << d.port);
-    if read32(pb, PX_TFD) & (TFD_BSY | TFD_DRQ) != 0 {
+    pb.write32(PX_SERR, 0xFFFF_FFFF);
+    pb.write32(PX_IS, 0xFFFF_FFFF);
+    d.abar.write32(HBA_IS, 1 << d.port);
+    if pb.read32(PX_TFD) & (TFD_BSY | TFD_DRQ) != 0 {
         comreset(pb);
     }
     start_port(pb);
@@ -777,18 +772,18 @@ fn said(d: &AhciDisk, recovered: bool) {
 }
 
 /// **Reset the link** (COMRESET, AHCI 1.3.1 §10.4.2), for a device still busy once stopped.
-fn comreset(pb: u64) {
-    write32(pb, PX_SCTL, (read32(pb, PX_SCTL) & !0xF) | 1);
+fn comreset(pb: Mmio) {
+    pb.write32(PX_SCTL, (pb.read32(PX_SCTL) & !0xF) | 1);
     let start = clock();
     while clock().wrapping_sub(start) < 1_000_000 {
         core::hint::spin_loop();
     }
-    write32(pb, PX_SCTL, read32(pb, PX_SCTL) & !0xF);
+    pb.write32(PX_SCTL, pb.read32(PX_SCTL) & !0xF);
     let start = clock();
-    while read32(pb, PX_SSTS) & 0xF != SSTS_DET_PRESENT && clock().wrapping_sub(start) <= POLL_TIMEOUT_NS {
+    while pb.read32(PX_SSTS) & 0xF != SSTS_DET_PRESENT && clock().wrapping_sub(start) <= POLL_TIMEOUT_NS {
         core::hint::spin_loop();
     }
-    write32(pb, PX_SERR, 0xFFFF_FFFF);
+    pb.write32(PX_SERR, 0xFFFF_FFFF);
 }
 
 /// [`BlockBackend::poll`] for the AHCI disk: complete the in-flight command by polling (boot path).

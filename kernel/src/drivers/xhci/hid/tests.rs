@@ -315,8 +315,7 @@ fn bound(slot: u8, node: usize) -> Bound {
 #[test]
 fn a_departure_hands_back_its_endpoints_memory_alone() {
     init_global_heap();
-    let mut regs = std::boxed::Box::new([0u32; 64]);
-    let x = super::super::fake(regs.as_mut_ptr() as u64);
+    let x = super::super::fake();
     let (nodes, mut mem) = (Nodes::new(), hub::device_mem().unwrap());
     // SAFETY: no controller was given the endpoints' memory.
     let disabled = hub::Released::Freed(unsafe { crate::mm::dma::Quiesced::assume() });
@@ -338,8 +337,7 @@ fn a_departure_hands_back_its_endpoints_memory_alone() {
 #[test]
 fn an_endpoint_with_no_room_gives_back_its_memory_and_retires_its_node() {
     init_global_heap();
-    let mut regs = std::boxed::Box::new([0u32; 64]);
-    let x = super::super::fake(regs.as_mut_ptr() as u64);
+    let x = super::super::fake();
     let (nodes, mut mem) = (Nodes::new(), hub::device_mem().unwrap());
     for k in 0..MAX_BOUND {
         assert!(start(&x, &nodes, bound(3, k % MAX_NODES), &mut mem), "room for {k}");

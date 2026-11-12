@@ -17,7 +17,7 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, SpinLock};
 use crate::mm::frame::Frame;
 use crate::mm::page_tables::KernelTables;
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
+use crate::mm::{Mmio, PAGE_SIZE, PhysAddr, VirtAddr};
 
 /// Inclusive lower bound of the kernel vmap region (`docs/architecture/overview.md`).
 pub const KERNEL_VMAP_START: u64 = 0xFFFF_C000_0000_0000;
@@ -144,13 +144,19 @@ pub unsafe fn map_device(phys: PhysAddr, n_pages: u64, flags: PageFlags) -> Resu
     Ok(VirtAddr::new(base))
 }
 
-/// [`map_device`], **uncached** and writable: an MMIO window.
+/// [`map_device`], **uncached** and writable: the `len` bytes of registers from `phys`, which
+/// need not be page-aligned, for good.
 ///
 /// # Safety
-/// As [`map_device`].
-pub unsafe fn map_mmio(phys: PhysAddr, n_pages: u64) -> Result<VirtAddr, AllocError> {
+/// As [`map_device`], for the pages `phys .. phys + len` touch.
+pub unsafe fn map_mmio(phys: PhysAddr, len: u64) -> Result<Mmio<'static>, AllocError> {
+    let lead = phys.as_u64() % PAGE_SIZE as u64;
+    let pages = (lead + len).div_ceil(PAGE_SIZE as u64).max(1);
     // SAFETY: forwarded.
-    unsafe { map_device(phys, n_pages, PageFlags::WRITABLE | PageFlags::NO_CACHE) }
+    let va =
+        unsafe { map_device(PhysAddr::new(phys.as_u64() - lead), pages, PageFlags::WRITABLE | PageFlags::NO_CACHE)? };
+    // SAFETY: the registers just mapped, which a device mapping keeps for good.
+    Ok(unsafe { Mmio::new(VirtAddr::new(va.as_u64() + lead), len) })
 }
 
 /// Undo [`map_device`]: clear the mapping and invalidate it on every CPU. The VA is not reused.
@@ -174,17 +180,12 @@ impl MmioWindow {
         Ok(Self { va: VirtAddr::new(VMAP.lock().bump(1)?), mapped: false })
     }
 
-    /// Where the window reads.
-    pub fn va(&self) -> VirtAddr {
-        self.va
-    }
-
-    /// Point the window at the device frame `phys`, invalidating the old translation on every CPU.
+    /// Point the window at the device frame `phys`, invalidating the old translation on every CPU:
+    /// its registers, until the window is pointed again.
     ///
     /// # Safety
-    /// `phys` must be a real MMIO frame safe to map uncached, and nothing may use the window's
-    /// previous frame through it from here on.
-    pub unsafe fn repoint(&mut self, phys: PhysAddr) -> Result<(), AllocError> {
+    /// `phys` must be a real MMIO frame safe to map uncached.
+    pub unsafe fn repoint(&mut self, phys: PhysAddr) -> Result<Mmio<'_>, AllocError> {
         if core::mem::take(&mut self.mapped) {
             // SAFETY: the window's own page, mapped by the previous repoint.
             let _ = unsafe { KernelTables::get().unmap(self.va) };
@@ -193,7 +194,9 @@ impl MmioWindow {
         // SAFETY: the window's own page, unmapped; `phys` is a device frame, per the contract.
         unsafe { map_all(self.va.as_u64(), core::iter::once(phys), PageFlags::WRITABLE | PageFlags::NO_CACHE)? };
         self.mapped = true;
-        Ok(())
+        // SAFETY: the page just mapped to `phys`, which only the next repoint, needing `&mut self`
+        // and so this borrow's end, unmaps.
+        Ok(unsafe { Mmio::new(self.va, PAGE_SIZE as u64) })
     }
 }
 

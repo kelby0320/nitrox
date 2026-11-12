@@ -11,8 +11,8 @@
 use crate::arch::Platform;
 use crate::arch::platform::{ArchPlatform, EcamRegion};
 use crate::libkern::{AllocError, KVec};
-use crate::mm::PhysAddr;
 use crate::mm::kvmap::{self, MmioWindow};
+use crate::mm::{Mmio, PAGE_SIZE, PhysAddr};
 use crate::object::device_node::{
     BAR_FLAG_64, BAR_FLAG_PREFETCH, BAR_IO, BAR_MMIO, BAR_NONE, BarWindow, BlockGeometry, DeviceClass, DeviceIdentity,
     DeviceNode, InterruptSpec, ResourceDescriptor,
@@ -40,24 +40,16 @@ pub(crate) trait Cfg {
     fn write32(&self, off: u16, val: u32);
 }
 
-struct MmioCfg {
-    base: *mut u8,
-}
+/// A function's 4 KiB configuration space, each access held to it.
+struct MmioCfg<'a>(Mmio<'a>);
 
-impl Cfg for MmioCfg {
+impl Cfg for MmioCfg<'_> {
     fn read32(&self, off: u16) -> u32 {
-        // SAFETY: `base` is a live uncached 4 KiB config window and `off` is a
-        // dword-aligned offset inside it. The bound that matters is the
-        // window's, not the 256-byte header's: enumeration reads `< 0x100`, and
-        // `read_msi` refuses a capability whose structure would run past `0x100`,
-        // but either way every offset any caller forms stays well under 4 KiB.
-        unsafe { core::ptr::read_volatile(self.base.add(off as usize) as *const u32) }
+        self.0.read32(off as u64)
     }
 
     fn write32(&self, off: u16, val: u32) {
-        // SAFETY: as `read32`; config-space dword writes are the documented way
-        // to probe a BAR's size (write all-ones, read back the size mask).
-        unsafe { core::ptr::write_volatile(self.base.add(off as usize) as *mut u32, val) }
+        self.0.write32(off as u64, val)
     }
 }
 
@@ -225,12 +217,11 @@ fn probe_function(
     out: &mut Found,
     found: &mut usize,
 ) -> Probe {
-    // SAFETY: `func_phys` is a 4 KiB-aligned config-space frame within `region`, and nothing reads
-    // the window's previous function after this.
-    if unsafe { win.repoint(func_phys(region, bus, dev, func)) }.is_err() {
+    // SAFETY: `func_phys` is a 4 KiB-aligned config-space frame within `region`.
+    let Ok(regs) = (unsafe { win.repoint(func_phys(region, bus, dev, func)) }) else {
         return Probe::Absent;
-    }
-    let cfg = MmioCfg { base: win.va().as_u64() as *mut u8 };
+    };
+    let cfg = MmioCfg(regs);
     if (cfg.read32(REG_ID) & 0xFFFF) as u16 == VENDOR_ABSENT {
         return Probe::Absent;
     }
@@ -303,7 +294,7 @@ pub(crate) enum ConfigError {
 /// returns nothing. A page per claimed device is cheap (Tier 1 drivers are few, bound once at
 /// boot); a shared window behind a lock would cost a lock on a post-scheduler path.
 pub(crate) struct Config {
-    inner: MmioCfg,
+    inner: MmioCfg<'static>,
 }
 
 impl Config {
@@ -316,8 +307,8 @@ impl Config {
         let phys = func_phys(region, desc.bus, desc.dev, desc.func);
         // SAFETY: `phys` is a 4 KiB-aligned config-space frame inside a firmware
         // -described ECAM window, which is device memory and never RAM.
-        let va = unsafe { kvmap::map_mmio(phys, 1) }.map_err(ConfigError::Unmappable)?;
-        Ok(Config { inner: MmioCfg { base: va.as_u64() as *mut u8 } })
+        let regs = unsafe { kvmap::map_mmio(phys, PAGE_SIZE as u64) }.map_err(ConfigError::Unmappable)?;
+        Ok(Config { inner: MmioCfg(regs) })
     }
 }
 
