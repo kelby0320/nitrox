@@ -51,7 +51,7 @@ static LOCK: SpinLock<()> = SpinLock::new(LockRank::TlbShootdown, ());
 static REQUEST_ALL: AtomicBool = AtomicBool::new(false);
 /// The page to invalidate when `REQUEST_ALL == false` (linear address).
 static REQUEST_VA: AtomicU64 = AtomicU64::new(0);
-// `on_ipi` shifts by `current_cpu()` with no range guard, since a CPU servicing an IPI has an
+// `on_ipi` shifts by its CPU's index with no range guard, since a CPU servicing an IPI has an
 // identity by construction; this states that a dense index must fit in [`ACKED`]'s bits.
 const _: () = assert!(MAX_CPUS <= 64, "ACKED is a u64 bitmask indexed by dense CPU id");
 

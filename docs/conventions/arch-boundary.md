@@ -67,6 +67,9 @@ unchanged.
   `arch::platform` (`ArchPlatform` → `Platform`), `arch::entropy`
   (`ArchEntropy` → `Entropy`), `arch::memory_types` (`ArchMemoryTypes` →
   `MemoryTypes`); future `arch::fpu`.
+- **`arch::percpu`** is neutral by construction too, with no trait: `CpuIndex`, `CpuPin`,
+  `PerCpu` and `cpu_local!`, the per-CPU types every architecture shares, over the
+  architecture's raw read of its index, which only `percpu` reaches.
 - A few re-exported module names are themselves neutral and acceptable:
   `arch::abi` (the platform ABI constants) and `arch::serial` (the debug
   console). Their *names* carry no architecture jargon even though their
@@ -95,7 +98,7 @@ Keep **free functions / plain modules** for:
 use crate::arch::{Cpu, Paging};
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
-Cpu::init_tables();
+Cpu::init_protections();
 Cpu::halt_loop();
 let root = Paging::active_root();
 

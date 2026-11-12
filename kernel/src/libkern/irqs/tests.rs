@@ -19,6 +19,8 @@ fn a_mask_restores_what_was() {
     force(false);
     drop(IrqsOff::mask());
     assert!(masked());
+    drop(IrqsOff::observed());
+    assert!(masked(), "an observation restored interrupts it never masked");
 }
 
 /// A switch refuses a live `IrqsOff`, which keeps a thread on no CPU across it.

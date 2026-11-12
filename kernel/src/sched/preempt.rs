@@ -28,11 +28,9 @@ pub fn assert_user_entry_preempt_safe() {
 
 /// Assert that a *voluntary* context switch is not inside a preempt-critical window.
 ///
-/// Split out of [`switch_into`], like [`clear_online_bit`], so a host test can pin it
-/// (`a_voluntary_switch_inside_a_preempt_critical_window_is_refused`); `switch_into` itself
-/// is reached by no host test.
+/// Called by [`release_for_switch`] after the lock tracker's check.
 ///
-/// A plain-lock holder trips `assert_switch_safe` because it holds a rank; a bare
+/// A plain-lock holder is refused before any switch, taking `SCHED` below its rank; a bare
 /// [`preempt_disable`] — the `tlb`, `handle::global` and `reap_pending` windows — holds
 /// nothing, so a yield or block inside one would switch away from a CPU that asked not to be
 /// descheduled and strand the raised counter on a thread no longer running. Debug builds only.

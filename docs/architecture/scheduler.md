@@ -142,7 +142,7 @@ reads the index via **`RDTSCP`**, with
 mapping table, and independent of the `swapgs`/`KERNEL_GS_BASE` convention (retained for
 the syscall stub). The mechanism is **swappable behind the abstraction**: x86 could later
 adopt GS-relative access (kernel running with `GS_BASE = &CPUS[i]`) for hot-path speed,
-and an aarch64 port implements the same `current_cpu()` via `MPIDR_EL1`/`TPIDR_EL1`, with
+and an aarch64 port implements the same raw read via `MPIDR_EL1`/`TPIDR_EL1`, with
 no neutral-code change. (LAPIC-id + an id→index map was the considered alternative;
 `RDTSCP`/`TSC_AUX` wins — no MMIO read, no sparse-id table.) Two per-CPU structures sit in
 their proper layers: the **arch** `CpuLocal` (syscall `rsp_scratch`/`kstack_top`,

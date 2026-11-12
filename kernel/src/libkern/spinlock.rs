@@ -94,7 +94,7 @@ impl<T> SpinLock<T> {
 /// `&mut T` to the inner value.
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
-    /// Dropped after the release, as the field it is. Not `Send`, as the lock ranks it raised.
+    /// Not `Send`: it is released on the CPU whose preemption count and lock ranks it raised.
     _off: PreemptOff,
 }
 
@@ -208,8 +208,8 @@ pub struct IrqSpinLockGuard<'a, T> {
 unsafe impl<T: Sync> Sync for IrqSpinLockGuard<'_, T> {}
 
 impl<'a, T> IrqSpinLockGuard<'a, T> {
-    /// The pin the hold lends.
-    pub fn pin(&self) -> CpuPin<'_> {
+    /// The pin the hold lends, through `&mut` as the guard is `Sync`: its holder's thread alone.
+    pub fn pin(&mut self) -> CpuPin<'_> {
         // SAFETY: the lock masked this CPU's interrupts before it was taken, and restores them only
         // as the guard drops. An outer guard dropped first would unmask under it, a deadlock if an
         // interrupt took this lock, which `CpuIndex::current` checks in debug builds.

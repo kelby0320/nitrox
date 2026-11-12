@@ -4,7 +4,6 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
 use crate::arch::MAX_CPUS;
-use crate::arch::smp::ArchSmp;
 
 /// A dense CPU index, below [`MAX_CPUS`] by construction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -21,7 +20,7 @@ impl CpuIndex {
     /// The running CPU's, under `pin`; unchecked in release, as each write of the index is bounded.
     pub fn current(pin: &CpuPin<'_>) -> Self {
         pin.debug_check();
-        let cpu = crate::arch::Smp::current_cpu();
+        let cpu = super::raw_current_cpu();
         debug_assert!((cpu as usize) < MAX_CPUS, "cpu index {cpu} past MAX_CPUS");
         Self(cpu)
     }
@@ -36,15 +35,12 @@ impl CpuIndex {
 pub struct CpuPin<'a>(PhantomData<(&'a (), *const ())>);
 
 impl CpuPin<'_> {
-    /// A pin.
-    ///
     /// # Safety
     /// This CPU's interrupts stay masked, or its preemption disabled, while the pin lives.
     pub unsafe fn assume() -> Self {
         Self(PhantomData)
     }
 
-    /// Debug builds: the claim holds now, which an outer lock released first, say, breaks.
     fn debug_check(&self) {
         debug_assert!(
             crate::libkern::irqs::masked() || crate::sched::preemption_disabled(),
@@ -83,13 +79,11 @@ pub struct CpuLocalKey<T: 'static> {
 }
 
 impl<T: Sync> CpuLocalKey<T> {
-    /// `slots[i]` for CPU `i`.
     #[cfg(not(test))]
     pub const fn new(slots: [T; MAX_CPUS]) -> Self {
         Self { slots }
     }
 
-    /// The test thread's own set.
     #[cfg(test)]
     pub const fn new(twin: &'static std::thread::LocalKey<[T; MAX_CPUS]>) -> Self {
         Self { twin }

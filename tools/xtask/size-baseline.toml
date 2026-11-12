@@ -3,7 +3,7 @@
 # by hand, in a reviewed commit of its own that says why.
 [files]
 "kernel/src/arch/x86_64/acpi.rs" = 1035
-"kernel/src/main.rs" = 1048
+"kernel/src/main.rs" = 1044
 "kernel/src/object/file_object.rs" = 1220
 "kernel/src/pci/mod.rs" = 1041
 "kernel/src/syscall/table.rs" = 2002

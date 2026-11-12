@@ -444,7 +444,7 @@ pub fn on_timer_tick() {
 /// allocator locks) latches the wake for `preempt_enable` instead of descheduling;
 /// otherwise it switches **only if this CPU is idle** and there is work (own queue or
 /// stealable). A running `TimeShared` thread is left to its quantum. Consumes the guard.
-fn resched_if_idle_locked(g: IrqSpinLockGuard<'_, SchedState>) {
+fn resched_if_idle_locked(mut g: IrqSpinLockGuard<'_, SchedState>) {
     let me = g.me();
     if PREEMPT_OFF.with(&g.pin(), |c| c.load(Ordering::Relaxed)) > 0 {
         RESCHED_PENDING.with(&g.pin(), |c| c.store(true, Ordering::Release));
@@ -650,25 +650,8 @@ impl Switch {
 /// # Safety
 /// `switch` was [prepared](Switch::prepare) under the hold `g` is, from the thread this CPU runs
 /// and the one just made `current`, each still pinned by the list it is on.
-unsafe fn switch_into(mut g: IrqSpinLockGuard<'_, SchedState>, switch: Switch) {
-    let cpu = g.me();
-    g.stats[cpu].switches += 1;
-    // The other per-CPU invariant: the involuntary paths (`on_timer_tick`,
-    // `resched_if_idle_locked`) latch into `RESCHED_PENDING` rather than switching; this
-    // checks the **voluntary** ones too. The reasoning is on the function.
-    assert_switch_preempt_safe();
-    crate::libkern::irqs::assert_no_live_masks(&g.pin());
-    // Armed under the lock, its pin: the slots are read only at a ring-3 entry, after the switch.
-    arm_kernel_stack(switch.next_kstack, &g.pin());
-    // Drop the lock but keep interrupts masked across the switch; `saved_if` is restored
-    // when this thread next resumes.
-    let saved_if = g.release_keeping_irqs_masked();
-    // Every context switch passes through here, so this is the one place that can check the
-    // lock tracker's per-CPU model still holds: a thread may only be switched away with
-    // nothing held and no interrupt scope open. True by construction (a plain-lock holder
-    // has preemption disabled, an `IrqSpinLock` holder has interrupts masked, and blocking
-    // with a lock held is forbidden); this checks it. Debug builds only.
-    crate::libkern::lockrank::assert_switch_safe();
+unsafe fn switch_into(g: IrqSpinLockGuard<'_, SchedState>, switch: Switch) {
+    let saved_if = release_for_switch(g, switch.next_kstack);
     // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
     // with the kernel half inherited); all kernel stacks are mapped in every
     // root, so switching CR3 before the stack swap is sound. Loading it before
@@ -713,6 +696,30 @@ unsafe fn switch_into(mut g: IrqSpinLockGuard<'_, SchedState>, switch: Switch) {
     unsafe { Cpu::interrupts_restore(saved_if) };
 }
 
+/// Let go of `SCHED` for a switch, interrupts kept masked, after arming `next_kstack` under it,
+/// its pin: every check a switch makes, where a host test reaches it.
+fn release_for_switch(mut g: IrqSpinLockGuard<'_, SchedState>, next_kstack: Option<KernelStackTop>) -> bool {
+    let cpu = g.me();
+    g.stats[cpu].switches += 1;
+    crate::libkern::irqs::assert_no_live_masks(&g.pin());
+    // Armed under the lock, its pin: the slots are read only at a ring-3 entry, after the switch.
+    arm_kernel_stack(next_kstack, &g.pin());
+    // Drop the lock but keep interrupts masked across the switch; `saved_if` is restored
+    // when this thread next resumes.
+    let saved_if = g.release_keeping_irqs_masked();
+    // Every context switch passes through here, so this is the one place that can check the
+    // lock tracker's per-CPU model still holds: a thread may only be switched away with
+    // nothing held and no interrupt scope open. True by construction (a plain-lock holder
+    // has preemption disabled, an `IrqSpinLock` holder has interrupts masked, and blocking
+    // with a lock held is forbidden); this checks it. Debug builds only.
+    crate::libkern::lockrank::assert_switch_safe();
+    // The other per-CPU invariant: the involuntary paths (`on_timer_tick`,
+    // `resched_if_idle_locked`) latch into `RESCHED_PENDING` rather than switching; this
+    // checks the **voluntary** ones too. The reasoning is on the function.
+    assert_switch_preempt_safe();
+    saved_if
+}
+
 /// Decide the quantum update and whether to reschedule on a timer tick. Pure (no lock, no
 /// switch) so it is host-testable.
 ///
@@ -752,7 +759,7 @@ pub fn ready_is_empty() -> bool {
 pub(crate) extern "C" fn thread_enter() -> ! {
     // Capture (under the lock) whether the current thread descends to ring 3 and its params.
     let descent: Option<(u64, u64, [u64; 4])> = {
-        let g = SCHED.lock();
+        let mut g = SCHED.lock();
         let cur = g.cur_ref().as_deref().expect("current set when a thread runs");
         match cur.user_entry() {
             // A thread whose process began exiting before it first ran never reaches ring 3.
@@ -761,12 +768,12 @@ pub(crate) extern "C" fn thread_enter() -> ! {
                 exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
             }
             Some((entry, user_sp)) => {
-                let top = cur.kstack_top();
+                let (top, boot) = (cur.kstack_top(), cur.user_boot_args());
                 assert!(top.is_some(), "a user thread has a kernel stack");
                 // Armed under `SCHED`, where reading the CPU and writing its slots cannot straddle a
                 // migration; a switch-in re-arms them wherever the thread resumes.
                 arm_kernel_stack(top, &g.pin());
-                Some((entry, user_sp, cur.user_boot_args()))
+                Some((entry, user_sp, boot))
             }
             None => None,
         }

@@ -2344,7 +2344,7 @@ table's deferred-close reclamation waits for a grace period tracked per *context
 seven weeks.** It said `current_ctx_id()` "returns **0 in production builds** — every CPU
 shares one context", and named "a real per-CPU context id, where one CPU's quiescence no
 longer implies another's" as the *future* case that would break things. That is the current
-implementation. `kernel/src/handle/mod.rs` returns `crate::arch::Smp::current_cpu()`, and has
+implementation. `kernel/src/handle/mod.rs` returns the running CPU's dense index, and has
 since `ef47861` (2026-06-29, Phase 3 slice 0) — while this entry was still being revised as
 late as 2026-07-24, citing that date's exit-time reclamation sweep. So the hazard it sent a
 reader looking for had already arrived, and the entry read as reassurance.

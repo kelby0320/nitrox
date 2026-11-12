@@ -137,8 +137,6 @@ fn fp_fill_pattern(img: &mut arch::VectorRegsImage, seed: u64, live: usize) {
 }
 
 extern "C" fn fp_worker(arg: usize) {
-    use arch::smp::ArchSmp;
-
     let live = arch::fpu_selftest_reg_bytes();
     let seed = 0xA5A5_0000_u64 ^ (arg as u64 + 1);
 
@@ -159,7 +157,7 @@ extern "C" fn fp_worker(arg: usize) {
         }
         core::hint::black_box(acc);
 
-        FP_CPU_MASK.fetch_or(1 << arch::Smp::current_cpu(), Ordering::Relaxed);
+        FP_CPU_MASK.fetch_or(1 << running_on(), Ordering::Relaxed);
 
         // SAFETY: as above; `actual` is a live, writable, correctly aligned image.
         unsafe { arch::fpu_selftest_store_regs(&raw mut actual) };
@@ -404,13 +402,12 @@ fn smp_distribution_demo() {
 }
 
 extern "C" fn dist_worker(arg: usize) {
-    use arch::smp::ArchSmp;
     let mut acc: u64 = 0;
     for i in 0..3_000_000u64 {
         acc = acc.wrapping_add(i ^ arg as u64);
     }
     core::hint::black_box(acc);
-    let cpu = arch::Smp::current_cpu();
+    let cpu = running_on();
     DIST_CPU_MASK.fetch_or(1 << cpu, Ordering::Relaxed);
     DIST_DONE.fetch_add(1, Ordering::Release);
 }
@@ -454,14 +451,18 @@ fn smp_affinity_demo() {
 }
 
 extern "C" fn affinity_worker(id: usize) {
-    use arch::smp::ArchSmp;
     let mut acc: u64 = 0;
     for i in 0..3_000_000u64 {
         acc = acc.wrapping_add(i);
     }
     core::hint::black_box(acc);
-    AFFINITY_RAN_ON[id].store(arch::Smp::current_cpu(), Ordering::Relaxed);
+    AFFINITY_RAN_ON[id].store(running_on(), Ordering::Relaxed);
     AFFINITY_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// The CPU this thread runs on, read under a mask: where it ran, once the mask is let go.
+fn running_on() -> u32 {
+    arch::percpu::CpuIndex::current(&nitrox_kernel::libkern::IrqsOff::mask().pin()).get() as u32
 }
 
 /// Walk Limine's live page tables with `arch::translate` to confirm the kernel's table-walk agrees

@@ -58,11 +58,36 @@ fn a_voluntary_switch_inside_a_preempt_critical_window_is_refused() {
     super::assert_switch_preempt_safe();
 }
 
+/// A switch refuses a live `IrqsOff`, which keeps a thread on no CPU across it.
+#[test]
+#[should_panic(expected = "a switch with an `IrqsOff` live")]
+fn a_switch_under_a_live_mask_is_refused() {
+    let sched = IrqSpinLock::new(LockRank::Sched, test_state());
+    let _off = crate::libkern::IrqsOff::mask();
+    release_for_switch(sched.lock(), None);
+}
+
+#[test]
+#[should_panic(expected = "context switch with preemption disabled")]
+fn a_switch_with_preemption_off_is_refused() {
+    let sched = IrqSpinLock::new(LockRank::Sched, test_state());
+    let _off = super::preempt_disable();
+    release_for_switch(sched.lock(), None);
+}
+
+#[test]
+fn a_switch_with_nothing_held_lets_go_of_the_lock() {
+    let sched = IrqSpinLock::new(LockRank::Sched, test_state());
+    assert!(!release_for_switch(sched.lock(), None));
+    assert!(crate::libkern::irqs::masked());
+    assert_eq!(sched.lock().stats[0].switches, 1);
+}
+
 /// A permanent park must clear **its own** bit.
 #[test]
 fn a_park_clears_its_own_bit_and_only_its_own() {
     super::online_set::force(0b1011);
-    super::clear_online_bit(true, 1);
+    super::clear_online_bit(Some(1));
     assert_eq!(super::online_mask(), 0b1001);
 }
 
@@ -75,7 +100,7 @@ fn a_park_clears_its_own_bit_and_only_its_own() {
 #[test]
 fn a_park_with_no_identity_clears_nobodys_bit() {
     super::online_set::force(0b1011);
-    super::clear_online_bit(false, 0);
+    super::clear_online_bit(None);
     assert_eq!(super::online_mask(), 0b1011, "an unbound CPU cleared someone else's bit");
 }
 
@@ -88,7 +113,7 @@ fn a_park_with_no_identity_clears_nobodys_bit() {
 #[test]
 fn a_park_with_an_out_of_range_index_clears_nobodys_bit() {
     super::online_set::force(0b1011);
-    super::clear_online_bit(true, 64);
+    super::clear_online_bit(Some(64));
     assert_eq!(super::online_mask(), 0b1011, "an out-of-range index cleared a bit");
 }
 

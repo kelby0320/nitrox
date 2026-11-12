@@ -57,15 +57,17 @@ Per-CPU state lives in two layers, split by the arch boundary:
 Neutral code never reads an APIC id, an MSR, or `gs:` directly. It reads the dense index
 under a **pin** (`arch::percpu`): a `CpuPin` that an `IrqsOff`, an `IrqSpinLockGuard`, a
 `PreemptOff` or the scheduler's held state lends, under which the thread cannot change core.
-`CpuIndex::current(pin)` reads the index, so it cannot be read where nothing keeps the thread
-on the core it names; `SchedState::me()` reads it under `SCHED`. A shared value per core is a
+`CpuIndex::current(pin)` reads the index, so neutral code cannot read it where nothing keeps
+the thread on the core it names: the raw read is arch-internal. `SchedState::me()` reads it
+under `SCHED`. A shared value per core is a
 `cpu_local!` (the preemption depth, the deferred reschedule, the ending flag, the lock
 tracker's ranks), reached by `with(pin, f)`, or by `remote(cpu, f)` for another core's, and a
 host test thread has a set of its own. The arch layer's own arrays (the GDTs, TSSes and IST
 stacks, the syscall blocks) are `PerCpu`s, reached by raw slot alone. Debug builds check a
 pin's claim, interrupts masked or preemption off, as the index is read; and `switch_into`
 refuses a live `IrqsOff`, as masked interrupts keep no thread on its core across a switch.
-`leave_online` alone reads the index unpinned, on a core about to halt (§ 8). That keeps the
+`leave_online` alone reads the index unpinned, through `Smp::bound_index`, on a core about to
+halt (§ 8). That keeps the
 "which core am I" mechanism swappable behind `crate::arch` (x86 uses `RDTSCP`; an aarch64
 port would use `MPIDR_EL1`/`TPIDR_EL1`).
 
@@ -78,13 +80,13 @@ is established as follows (`arch/x86_64/smp.rs`):
 
 - The x86 mechanism is **`RDTSCP`**, which returns `IA32_TSC_AUX` in `ecx`. Each
   core programs its own dense index into `IA32_TSC_AUX` once at bring-up; every
-  later `current_cpu()` is a single cheap `RDTSCP` (`X86Smp::current_cpu`,
-  `regs::rdtscp_aux`). `IA32_TSC_AUX` resets to 0, so the BSP reads dense 0 by
-  default.
-- Indices are assigned by **hardware APIC id**, *unique by construction*. Before
-  launching any AP the BSP populates a `DENSE_TO_APIC[]` map — `bind_cpu_identity(0,
-  bsp_apic)` then `bind_cpu_identity(idx, ap_apic)` per AP (`main.rs:bring_up_aps`).
-  Each core then **adopts its own** index: `adopt_dense_index()` reads its hardware
+  later read is a single cheap `RDTSCP` (`CpuIndex::current`, through the arch's raw
+  `current_cpu`). `IA32_TSC_AUX` resets to 0, so an unbound core reads dense 0, the BSP's.
+- Indices are assigned by **hardware APIC id**, *unique by construction*. The BSP binds
+  its own index, 0, to its APIC id first thing (`Smp::adopt_boot_index`), then, before
+  launching each AP, fills the `DENSE_TO_APIC[]` map: `bind_cpu_identity(idx, ap_apic)`
+  (`main.rs:bring_up_aps`). A binding of an index or an APIC id already bound is refused.
+  Each AP then **adopts its own** index: `adopt_dense_index()` reads its hardware
   APIC id (`CPUID.01H:EBX[31:24]`), finds the matching `DENSE_TO_APIC[]` slot, and
   `wrmsr(IA32_TSC_AUX, that_index)`. A core whose APIC id was never bound **parks**
   rather than guessing an index that could collide — and since 2026-08-19 that also
@@ -98,7 +100,7 @@ is established as follows (`arch/x86_64/smp.rs`):
 > Limine's `extra_argument` and leaned on the TSC_AUX reset-default for the BSP.
 > That was racy — a core could run with a colliding index and share another's
 > GDT/TSS/scheduler slots. Deriving from the hardware APIC id removed the race
-> (Bug 2 below). The **placement** of the BSP's own `init_this_cpu(0)` also matters
+> (Bug 2 below). The **placement** of the BSP's own adoption also matters
 > — see Bug 5.
 
 ### 3. Boot to userspace, across cores
@@ -107,13 +109,13 @@ The BSP runs `kernel_main` (`main.rs`) as the **boot thread** — a real schedul
 thread that *adopts* the `_start` context (`Thread::try_new_boot`, tid 0, no
 `KernelStack` of its own). The relevant ordering:
 
-1. **Single-core init** — serial, GDT/IDT tables, paging, initramfs, IRQ routing,
-   entropy, device/IO self-tests, drivers, the console.
-2. **BSP identity** — `arch::Smp::init_this_cpu(CpuIndex::BSP)` sets the BSP's
-   `IA32_TSC_AUX` to 0, and its tables and syscall entry are armed beside it, under a pin
-   `IrqsOff::observed()` lends. **This runs before the scheduler first reads the index and before
-   any AP is online** — critical: it must execute while the boot thread is still
-   pinned to the BSP (Bug 5).
+1. **BSP identity, first thing** — `arch::Smp::adopt_boot_index()` binds index 0 to the
+   BSP's APIC id and sets its `IA32_TSC_AUX` to 0; its GDT/TSS/IDT and syscall entry are
+   armed next, under a pin `IrqsOff::observed()` lends, as `gdt::init` finds its slot by the
+   index. **This runs before anything reads the index and before any AP is online** —
+   critical: it must execute while the boot thread is still pinned to the BSP (Bug 5).
+2. **Single-core init** — serial, paging, initramfs, IRQ routing, entropy, device/IO
+   self-tests, drivers, the console.
 3. **Scheduler up (single-core)** — `sched::init` builds `SchedState`, the BSP's
    `current` (the boot thread) and `idle` thread; demo kernel threads prove the
    context switch, classes, and vruntime while still single-core.
@@ -249,7 +251,7 @@ machinery was already correct once the hazards below were fixed.
 
 These are the load-bearing rules. Every bug in Part 2 was a violation of one.
 
-- **I1 — the running thread *is* `current[this_cpu()]`.** The whole scheduler
+- **I1 — the running thread *is* `current[me()]`.** The whole scheduler
   assumes the code executing on a core equals that core's `current` slot. Violated
   transitively by Bugs 4 and 5 (a double-run, and a core with the wrong dense
   index), which is why both manifested as "the wrong thread got reaped."
@@ -331,7 +333,7 @@ something needed its acknowledgement, and it surfaced as a *terminal* freezing m
 while freeing a glyph outline.
 
 The clear is **guarded by the CPU's identity**, and that guard matters more than the clear:
-`current_cpu()` reads `IA32_TSC_AUX`, whose reset default is `0`, so a CPU that has not adopted
+the index is read from `IA32_TSC_AUX`, whose reset default is `0`, so a CPU that has not adopted
 a dense index is indistinguishable from the BSP. Clearing on its behalf drops the *running*
 BSP from the target set — and since a CPU's own TLB is invalidated by the self-IPI described
 above, which only goes to CPUs in the mask, that turns a hang into a freed frame still

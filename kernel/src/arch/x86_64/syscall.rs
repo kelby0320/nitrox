@@ -51,7 +51,7 @@ pub struct CpuLocal {
 
 const CPU_LOCAL_INIT: CpuLocal = CpuLocal { rsp_scratch: 0, kstack_top: 0 };
 
-/// One [`CpuLocal`] per CPU, indexed by the dense `current_cpu()` id.
+/// One [`CpuLocal`] per CPU, its slot reached by [`CpuIndex`] under a pin.
 static CPUS: PerCpu<CpuLocal> = PerCpu::new([CPU_LOCAL_INIT; crate::arch::smp::MAX_CPUS]);
 
 const OFF_SCRATCH: usize = offset_of!(CpuLocal, rsp_scratch);
@@ -162,15 +162,16 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
     // passed its address; valid, aligned, and unaliased for this call.
     let f = unsafe { &mut *frame };
     let ret = crate::syscall::dispatch(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
-    crate::sched::end_if_ending();
+    returning_to_ring3(f.rax);
+    ret
+}
+
+/// A syscall's way back to ring 3: its own check first, as `end_if_ending`'s names no syscall.
+fn returning_to_ring3(nr: u64) {
     // **A syscall body must not return with interrupts enabled**: the stub's `cli` makes the
     // `pop rsp` / `sysretq` window safe regardless, and this catches the *cause*.
-    debug_assert!(
-        !<crate::arch::Cpu as crate::arch::cpu::ArchCpu>::interrupts_enabled(),
-        "syscall {} returned with interrupts enabled",
-        f.rax
-    );
-    ret
+    debug_assert!(crate::libkern::irqs::masked(), "syscall {nr} returned with interrupts enabled");
+    crate::sched::end_if_ending();
 }
 
 /// The `syscall` entry point (the `IA32_LSTAR` target).
@@ -301,4 +302,23 @@ pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, a0: u64, a1: u64, 
         // via SFMASK.
         rflags  = const 0x202u64,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::libkern::irqs::force;
+
+    /// Named, before `end_if_ending`'s check refuses it unnamed.
+    #[test]
+    #[should_panic(expected = "syscall 7 returned with interrupts enabled")]
+    fn a_syscall_returning_with_interrupts_on_is_named() {
+        force(true);
+        super::returning_to_ring3(7);
+    }
+
+    #[test]
+    fn a_syscall_returning_with_interrupts_masked_goes_back() {
+        force(false);
+        super::returning_to_ring3(7);
+    }
 }

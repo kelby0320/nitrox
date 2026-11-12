@@ -109,8 +109,8 @@ fn kernel_main() {
     }
 
     // The BSP's dense index 0, before the per-CPU control tables are found by it: firmware need not
-    // leave its reset default. On the BSP, with no AP online, it cannot land on another's index.
-    arch::Smp::init_this_cpu(arch::percpu::CpuIndex::BSP);
+    // leave its reset default. Bound to its APIC id, so no AP can adopt it.
+    arch::Smp::adopt_boot_index();
 
     // Install the CPU control tables (x86_64: GDT + TSS, then IDT; their order lives in the arch
     // layer). First, because it prints nothing and needs nothing, and with the IDT live a bad
@@ -257,7 +257,7 @@ fn kernel_main() {
     // The BSP's dense index was set first thing; each AP sets its own in `arch::adopt_dense_index`.
     kprintln!(
         "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
-        arch::Smp::current_cpu(),
+        arch::percpu::CpuIndex::current(&IrqsOff::mask().pin()).get(),
         arch::Smp::cpu_count(),
         arch::MAX_CPUS,
     );
@@ -332,7 +332,7 @@ static AP_ONLINE: AtomicU32 = AtomicU32::new(0);
 /// scheduler. Never returns.
 extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
     // Identity first: the per-CPU GDT/TSS, syscall block and scheduler slots all index off
-    // `current_cpu()`. Match our hardware APIC id against the map the BSP populated before
+    // `CpuIndex::current`. Match our hardware APIC id against the map the BSP populated before
     // launching us; unique by construction, so no core shares another's per-CPU slots.
     let idx = match arch::adopt_dense_index() {
         Some(i) => i,
@@ -399,10 +399,6 @@ fn bring_up_aps() {
     };
     let bsp = resp.bsp_lapic_id;
     let cap = arch::MAX_CPUS as u32;
-
-    // Bind the BSP's dense index (0) to its APIC id so the map is complete and no AP is assigned 0.
-    // Each core adopts its own index by matching its hardware APIC id.
-    arch::bind_cpu_identity(0, bsp);
 
     let mut next_idx: u32 = 1; // 0 is the BSP.
     for info in resp.cpus() {

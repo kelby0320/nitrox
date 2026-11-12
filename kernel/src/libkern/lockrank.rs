@@ -55,8 +55,8 @@
 //! ## Cost, and not under host `cfg(test)`
 //!
 //! Debug builds only (`cfg(debug_assertions)`). The tracker takes no lock and allocates nothing
-//! (it would deadlock against what it instruments): a fixed per-CPU array of atomics, mirroring
-//! `sched`'s `PREEMPT_OFF`. It is compiled out of host unit tests, which count holds per thread.
+//! (it would deadlock against what it instruments): a `cpu_local!` of atomics, as `sched`'s
+//! `PREEMPT_OFF` is. It is compiled out of host unit tests, which count holds per thread.
 //!
 //! The *rule* is unit-tested host-side through [`classify`], which the tracker calls; the
 //! *bookkeeping* against a plain local state struct (see the tests at the bottom).
@@ -245,7 +245,6 @@ mod tracker {
     /// than panicking, so a legitimately deep path degrades to "unchecked".
     const MAX_HELD: usize = 8;
 
-    /// One CPU's held ranks.
     struct Held {
         /// Ranks currently held on each CPU, innermost last.
         ranks: [AtomicU8; MAX_HELD],

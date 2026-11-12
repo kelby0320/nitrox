@@ -9,7 +9,7 @@ fn a_pin_an_outer_lock_unmasked_is_refused() {
     crate::libkern::irqs::force(true);
     let (outer, inner) = (IrqSpinLock::new(LockRank::Leaf, ()), IrqSpinLock::new(LockRank::Leaf, ()));
     let held = outer.lock();
-    let pinned = inner.lock();
+    let mut pinned = inner.lock();
     drop(held);
     CpuIndex::current(&pinned.pin());
 }
@@ -21,7 +21,7 @@ fn the_same_pin_with_preemption_off_is_accepted() {
     let off = crate::sched::preempt_disable();
     let (outer, inner) = (IrqSpinLock::new(LockRank::Leaf, ()), IrqSpinLock::new(LockRank::Leaf, ()));
     let held = outer.lock();
-    let pinned = inner.lock();
+    let mut pinned = inner.lock();
     drop(held);
     assert_eq!(CpuIndex::current(&pinned.pin()), CpuIndex::BSP);
     drop(pinned);
