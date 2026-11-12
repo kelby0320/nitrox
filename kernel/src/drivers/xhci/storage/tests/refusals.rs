@@ -78,3 +78,20 @@ fn a_departure_completes_its_queue_at_once() {
     assert_eq!(held.lax(), [Some(was(&raw mut a)), None, None], "in flight: handed back");
     assert_eq!(a.status, crate::io::irp::IrpStatus::Pending as i32);
 }
+
+/// **A departure ends an armed hub command's wait**, completing it, so its waiter finds the device
+/// gone rather than wait for a DPC that will not come.
+#[test]
+fn a_departure_ends_a_hub_commands_wait() {
+    init_global_heap();
+    let disks = Disks::new();
+    let mut fake = Fake::new();
+    let (i, _) = disks.take(held(fake.dev(5))).unwrap();
+    let po = hub::new_operation().unwrap();
+    let issue = |c| disks.issue_hub(i, c, 0, &scsi::test_unit_ready(), 0, false, 0);
+    // Its wait, the hub thread's, needs a scheduler.
+    core::mem::forget(armed::arm(&po, HubCommand { disks: &disks, i }, issue).unwrap());
+    let _ = departed(&disks, 5);
+    assert!(crate::sched::pending_op_is_signaled(&po), "its waiter ended");
+    assert_eq!(disks.take_back(i), None, "nothing left to take back");
+}

@@ -8,6 +8,11 @@ pub(super) fn fly(irp: *mut Irp) -> InFlight {
     unsafe { InFlight::for_test(irp) }
 }
 
+/// A hub command's completer, over no operation.
+pub(super) fn hub(at: usize) -> Completer {
+    Completer::for_test(at)
+}
+
 /// A token for `irp` the test may drop: what it compares a result with.
 pub(super) fn was(irp: *mut Irp) -> InFlight {
     // SAFETY: as `fly`'s.

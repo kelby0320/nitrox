@@ -159,24 +159,10 @@ fn dev_field<T: Default>(i: usize, f: impl FnOnce(&Dev) -> T) -> T {
 fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Result<HubResult, Failed> {
     let po = hub::new_operation()?;
     let now = crate::arch::Timer::read_ns();
-    DISKS.issue_hub(i, po.as_object().as_ptr(), lun, cdb, len, status_only, now).map_err(Failed::Device)?;
-    let at = crate::arch::Timer::read_ns();
-    let signalled =
-        matches!(crate::sched::wait_on(&[po.as_object()], at + BIND_NS, at), crate::sched::WaitResult::Signaled(_));
-    if !signalled {
-        match DISKS.take_back(i) {
-            TakeBack::Taken => return Err(Failed::Timeout),
-            TakeBack::Gone => return Err(Failed::Device("its device has gone")),
-            // **The DPC took it first**, and completes `po` only once it has let the device's lock
-            // go: so `po` is not dropped until then, as `hub::wait` waits.
-            TakeBack::OnItsWay => {
-                use crate::sched::{WaitResult, wait_on};
-                let done = || matches!(wait_on(&[po.as_object()], u64::MAX, 0), WaitResult::Signaled(_));
-                while !done() {
-                    hub::sleep(1_000_000);
-                }
-            }
-        }
+    let issue = |c| DISKS.issue_hub(i, c, lun, cdb, len, status_only, now);
+    let armed = armed::arm(&po, HubCommand { disks: &DISKS, i }, issue).map_err(Failed::Device)?;
+    if armed.wait(BIND_NS).is_none() {
+        return Err(Failed::Timeout);
     }
     let mut d = DISKS.devs[i].lock();
     let Some(dev) = d.as_mut() else { return Err(Failed::Device("its device has gone")) };
@@ -263,14 +249,16 @@ pub(super) enum End {
     Stranded,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum TakeBack {
-    /// Taken back before the DPC reached it: nothing will complete its operation.
-    Taken,
-    /// The DPC took it first: its completion of the operation is on its way.
-    OnItsWay,
-    /// The device has gone.
-    Gone,
+/// **Device `i`'s hub command**, as its waiter takes it back.
+pub(super) struct HubCommand<'d> {
+    pub(super) disks: &'d Disks,
+    pub(super) i: usize,
+}
+
+impl Record for HubCommand<'_> {
+    fn take_back(&self) -> Option<Completer> {
+        self.disks.take_back(self.i)
+    }
 }
 
 impl Disks {
@@ -375,20 +363,23 @@ impl Disks {
     pub(super) fn issue_hub(
         &self,
         i: usize,
-        po: *mut (),
+        completer: Completer,
         lun: u8,
         cdb: &[u8],
         len: u32,
         status_only: bool,
         now: u64,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), (Completer, &'static str)> {
         let mut d = self.devs[i].lock();
-        let Some(dev) = d.as_mut() else { return Err("its device has gone") };
+        let Some(dev) = d.as_mut() else { return Err((completer, "its device has gone")) };
         if !dev.recovering || matches!(dev.inflight, Some(Command { owner: Owner::Irp { .. }, .. })) {
-            return Err("its device is not held");
+            return Err((completer, "its device is not held"));
+        }
+        if dev.inflight.is_some() {
+            return Err((completer, "another hub command is armed"));
         }
         dev.hub_result = None;
-        let owner = Owner::Hub { po };
+        let owner = Owner::Hub { completer };
         if status_only {
             let tag = dev.tag;
             dev.inflight =
@@ -476,16 +467,19 @@ impl Disks {
         self.devs[i].lock().as_mut().and_then(|dev| dev.rescan.take()).map(|(irp, _)| irp)
     }
 
-    /// **A hub command's wait ran out**: taken back if the DPC has not reached it, so nothing
-    /// completes an operation the hub thread is about to drop.
-    pub(super) fn take_back(&self, i: usize) -> TakeBack {
+    /// **A hub command's wait ran out**: its completer taken back if the DPC has not reached it, so
+    /// nothing completes an operation the hub thread is about to drop. `None` once the DPC, or a
+    /// departure, has it: its completion is on its way.
+    pub(super) fn take_back(&self, i: usize) -> Option<Completer> {
         let mut d = self.devs[i].lock();
-        let Some(dev) = d.as_mut() else { return TakeBack::Gone };
-        if matches!(dev.inflight, Some(Command { owner: Owner::Hub { .. }, .. })) {
-            dev.inflight = None;
-            return TakeBack::Taken;
+        let dev = d.as_mut()?;
+        match dev.inflight.take() {
+            Some(Command { owner: Owner::Hub { completer }, .. }) => Some(completer),
+            other => {
+                dev.inflight = other;
+                None
+            }
         }
-        TakeBack::OnItsWay
     }
 }
 

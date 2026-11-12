@@ -75,15 +75,15 @@ pub(super) fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 
         }
         base + probe as u64 * 16
     };
-    *x.waiting.lock() =
-        Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_object().as_ptr())));
+    let transfer = Awaited::Transfer { slot, status: status_at };
+    let armed = armed::arm(&po, x, |c| install(&x.waiting, transfer, c))?;
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, true));
     mem.ring.push(&mut slots, Trb::data_in(mem.data.phys().as_u64(), len as u32));
     let at = mem.ring.push(&mut slots, Trb::status(true));
     debug_assert_eq!(base + at as u64 * 16, status_at);
     x.db.write32(4 * slot as u64, DCI_EP0 as u32);
-    let answer = match wait(x, &po, TRANSFER_NS) {
+    let answer = match armed.wait(TRANSFER_NS) {
         Some((code::SUCCESS, short)) => Ok(len - short.min(len as u64) as u16),
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),
@@ -129,14 +129,14 @@ pub(in crate::drivers::xhci) fn control_out(
     let next = mem.ring.next_slot();
     let status_slot = if next + 1 == super::RING_TRBS - 1 { 0 } else { next + 1 };
     let status_at = base + status_slot as u64 * 16;
-    *x.waiting.lock() =
-        Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_object().as_ptr())));
+    let transfer = Awaited::Transfer { slot, status: status_at };
+    let armed = armed::arm(&po, x, |c| install(&x.waiting, transfer, c))?;
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, false));
     let at = mem.ring.push(&mut slots, Trb::status(false));
     debug_assert_eq!(base + at as u64 * 16, status_at);
     x.db.write32(4 * slot as u64, DCI_EP0 as u32);
-    let answer = match wait(x, &po, TRANSFER_NS) {
+    let answer = match armed.wait(TRANSFER_NS) {
         Some((code::SUCCESS, _)) => Ok(()),
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),
@@ -169,15 +169,15 @@ pub(in crate::drivers::xhci) fn control_out_data(
         }
         base + probe as u64 * 16
     };
-    *x.waiting.lock() =
-        Some(Waiting::new(Awaited::Transfer { slot, status: status_at }, PoPtr(po.as_object().as_ptr())));
+    let transfer = Awaited::Transfer { slot, status: status_at };
+    let armed = armed::arm(&po, x, |c| install(&x.waiting, transfer, c))?;
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup_out(request));
     mem.ring.push(&mut slots, Trb::data_out(mem.data.phys().as_u64(), len as u32));
     let at = mem.ring.push(&mut slots, Trb::status(false));
     debug_assert_eq!(base + at as u64 * 16, status_at);
     x.db.write32(4 * slot as u64, DCI_EP0 as u32);
-    let answer = match wait(x, &po, TRANSFER_NS) {
+    let answer = match armed.wait(TRANSFER_NS) {
         Some((code::SUCCESS, _)) => Ok(()),
         Some((c, _)) => Err(Failed::Code(c)),
         None => Err(Failed::Timeout),

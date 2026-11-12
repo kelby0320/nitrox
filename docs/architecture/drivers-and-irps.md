@@ -254,16 +254,18 @@ A driver whose work is a sequence with waits in it can run it on **a kernel thre
 as a state machine of DPCs: `sched::spawn` makes the thread, and `sched::wait_on` — the primitive
 under `sys_wait` — blocks it with a deadline on the same waitables. The USB hub thread
 ([`usb.md`](usb.md)) is the first long-lived one, and its waits are the pattern:
-- **A `PendingOperation` per operation**, completed by the DPC with
-  `sched::complete_pending_op_at`, by address: the thread lets go of the operation once it sees the
-  completion, which can be before the DPC's call returns, so the DPC holds no borrow of it. The
-  thread records what it awaits *before* the hardware can answer, so no completion arrives first.
+- **A `PendingOperation` per operation**, armed (`drivers/xhci/armed.rs`): the thread holds it and
+  waits through an `Armed`, and the record the DPC takes holds a `Completer`, which completes it by
+  address, as the thread lets go of it once it sees the completion, which can be before the DPC's
+  call returns. **A record is armed one at a time**, a second refused. The thread arms *before* the
+  hardware can answer, so no completion arrives first.
 - **The DPC completes outside its locks.** It takes the matching record out under the driver's
   leaf lock and completes the operation after releasing it, since completing takes the scheduler's
   lock.
-- **A timeout takes the record back.** If the DPC already took it, its completion is imminent and
-  is waited for, so a DPC never completes an object the thread has dropped — and a DPC drops none
-  itself, since freeing counts as allocating there.
+- **A timeout takes the record back**, as an `Armed` dropped unwaited does. If the DPC already took
+  it, its completion is imminent and is waited for, so a DPC never completes an object the thread
+  has dropped — and a DPC drops none itself, since freeing counts as allocating there. A
+  `Completer` dropped unspent fails a debug build.
 - **An `InterruptObject` for events that are not answers**, signalled by the DPC with
   `sched::signal_interrupt`. It latches, so an event that lands while the thread is busy is
   counted; a kernel thread consumes one with `sched::interrupt_consume`, which `sys_wait` does for

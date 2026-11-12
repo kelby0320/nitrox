@@ -20,6 +20,7 @@
 //! The interrupt's DPC drains the event ring: a port change wakes [`hub`]'s thread, and a command's
 //! or a transfer's completion ends the wait the thread is in. See `docs/planning/phase-6-usb.md`.
 
+mod armed;
 pub mod caps;
 pub mod context;
 pub mod desc;
@@ -44,6 +45,7 @@ use crate::mm::{Mmio, PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
 use crate::object::header::Ref;
 use crate::object::{InterruptObject, PendingOperation};
+use armed::{Completer, Record};
 use ring::{Consumer, Producer, RingMem, Trb, code, kind};
 
 /// PCI class, subclass and programming interface of an xHCI controller.
@@ -189,25 +191,37 @@ enum Awaited {
 
 struct Waiting {
     awaited: Awaited,
-    po: PoPtr,
+    completer: Completer,
     /// **The bytes a short Data stage did not move**, from its own event, which comes before its
     /// Status stage's; the transfer completes with it. `0` for a whole one.
     short: u32,
 }
 
 impl Waiting {
-    fn new(awaited: Awaited, po: PoPtr) -> Waiting {
-        Waiting { awaited, po, short: 0 }
+    fn new(awaited: Awaited, completer: Completer) -> Waiting {
+        Waiting { awaited, completer, short: 0 }
     }
 }
 
-/// A `PendingOperation`, by address: the waiting thread's reference pins it until the record is
-/// taken back or the operation completes.
-struct PoPtr(*mut ());
+/// **Arm the controller's one waiting record** for `awaited`, refused while another is armed.
+fn install(
+    slot: &IrqSpinLock<Option<Waiting>>,
+    awaited: Awaited,
+    completer: Completer,
+) -> Result<(), (Completer, hub::Failed)> {
+    let mut w = slot.lock();
+    if w.is_some() {
+        return Err((completer, hub::Failed::Device("another wait is armed")));
+    }
+    *w = Some(Waiting::new(awaited, completer));
+    Ok(())
+}
 
-// SAFETY: the pointer names a kernel object whose reference count is atomic, and it is only
-// completed through `sched::complete_pending_op`, which serialises on `SCHED`.
-unsafe impl Send for PoPtr {}
+impl Record for &Xhci {
+    fn take_back(&self) -> Option<Completer> {
+        self.waiting.lock().take().map(|w| w.completer)
+    }
+}
 
 struct CommandRing {
     mem: Programmed,
@@ -718,9 +732,7 @@ fn on_event(x: &Xhci, trb: &Trb) {
             let done =
                 ep0_event(&mut x.waiting.lock(), trb.slot_id(), trb.pointer(), trb.completion_code(), trb.residual());
             if let Some((w, code, result)) = done {
-                // SAFETY: the waiting thread's reference pins the `PendingOperation` at `w.po` until
-                // it sees this completion.
-                unsafe { crate::sched::complete_pending_op_at(w.po.0, code as i32, result) };
+                w.completer.complete(code, result);
             }
         }
         _ => {}
@@ -768,9 +780,7 @@ fn complete_if(x: &Xhci, matches: impl Fn(Awaited) -> bool, code: u8, result: u6
         if w.as_ref().is_some_and(|w| matches(w.awaited)) { w.take() } else { None }
     };
     if let Some(w) = taken {
-        // SAFETY: the waiting thread's reference pins the `PendingOperation` at `w.po` until it sees
-        // this completion.
-        unsafe { crate::sched::complete_pending_op_at(w.po.0, code as i32, result) };
+        w.completer.complete(code, result);
     }
 }
 
@@ -918,7 +928,7 @@ mod tests {
 
     /// A transfer on `slot`'s default endpoint waiting for its Status stage at `status`.
     fn transfer(slot: u8, status: u64) -> Option<Waiting> {
-        Some(Waiting::new(Awaited::Transfer { slot, status }, PoPtr(core::ptr::null_mut())))
+        Some(Waiting::new(Awaited::Transfer { slot, status }, Completer::for_test(0)))
     }
 
     /// **A short Data stage's residual is its transfer's result**: its own event ends nothing and
@@ -943,7 +953,7 @@ mod tests {
         let mut w = transfer(3, status);
         assert!(ep0_event(&mut w, 4, status, code::SUCCESS, 0).is_none(), "another slot's");
         assert!(w.is_some());
-        let mut c = Some(Waiting::new(Awaited::Command { trb: status }, PoPtr(core::ptr::null_mut())));
+        let mut c = Some(Waiting::new(Awaited::Command { trb: status }, Completer::for_test(0)));
         assert!(ep0_event(&mut c, 3, status, code::SUCCESS, 0).is_none(), "a command's wait");
         assert!(ep0_event(&mut None, 3, status, code::SUCCESS, 0).is_none(), "nothing waiting");
     }
