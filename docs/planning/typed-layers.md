@@ -766,6 +766,20 @@ test. Under Miri, both models, the 125 tests of DMA, AHCI and the xHCI. Tree Bor
 at the storage tests' fake doorbell array, read by a reference while the devices wrote it through
 an exposed pointer, as on `main`; one pointer now reaches it.
 
+**After review** (`a269f49c`):
+- **A buffer shared between CPUs sits behind the lock that serialises its writers**, as the
+  accessors write through `&self`: AHCI's command list and table are its port lock's state, and
+  the xHCI's device context base array has a lock of its own. Two threads writing the command list
+  through a shared `&AhciDisk` raced under Miri at the head; that no longer compiles.
+- **A bind that fails gives a class's buffers back through the call that refuses it**,
+  `Disks::take_or_keep`, `Disks::retire` and `hid::start`, now tested, where a drop in place of
+  each passed every test. A refused `start` retires its node too, and HID claims before it
+  publishes. `DeviceMem::keep` grows its list rather than leak past the room it had.
+- **The hub thread's deepest static path falls to 8,048 bytes** (10,520 at the head, 9,960 on
+  `main`): a refused bind no longer runs through `Disks::depart`.
+- Tests now pin a command's FIS, PRDT and header, the bytes a retired command's header counted,
+  and a context written to device memory.
+
 ### J.13 Registers in a window, and vectors given back (drv-o7, kplat-o12)
 
 **138 register accesses** through safe functions that dereference any base and offset, and
