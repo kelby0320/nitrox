@@ -1,5 +1,4 @@
 use super::*;
-use crate::io::block::BlockBackend;
 use crate::io::irp::Irp;
 use crate::mm::test_support::init_global_heap;
 use crate::object::device_node::{BlockGeometry, CharBackend, DeviceIdentity};
@@ -30,7 +29,7 @@ fn no_read(_: &Ref<MemoryObject>, _: &Ref<PendingOperation>, _: u64, _: u64, _: 
 }
 
 fn block(desc: ResourceDescriptor, kind: BlockKind, name: &[u8], blocks: u64) -> Ref<DeviceNode> {
-    let backend = BlockBackend { submit: no_submit, poll: no_poll, ctx: core::ptr::null_mut(), max_frags: 1 };
+    let backend = crate::io::block::test_backend(no_submit, no_poll, core::ptr::null_mut(), 1);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: blocks };
     Ref::new(DeviceNode::try_new_block(desc, geometry, kind, name, backend).unwrap())
 }

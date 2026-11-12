@@ -101,7 +101,7 @@ pub fn init(controller: &DeviceNode) -> Outcome {
     );
 
     // **Every step that can fail precedes the publish**, which nothing undoes (a watch thread runs).
-    let Some(node) = disk_node(controller, sectors, &name[..name_len], &disk) else {
+    let Some(node) = disk_node(controller, sectors, &name[..name_len]) else {
         give_back(&mut disk);
         return declined("the disk's device node could not be allocated");
     };

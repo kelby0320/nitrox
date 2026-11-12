@@ -38170,3 +38170,22 @@ Part J's thirteenth sub-part, `typed-layers.md` § J.13, built on `pre-phase-7/p
   is: a full pool, or a CPU the interrupt cannot reach.
 - `reset.rs` keeps its raw reset register, a byte written at reset with nothing allocated.
 - `unsafe` blocks fall from 545 to 541, and `unsafe fn`s rise from 197 to 198.
+
+## 2026-11-12 — Before Phase 7, J.14: an I/O request in flight
+
+Part J's fourteenth sub-part, `typed-layers.md` § J.14, built on `pre-phase-7/part-j14-irp-in-flight`.
+
+- **A block backend's context is typed**: `BlockBackend::new::<C: BlockDevice>` pairs a driver's
+  context, a `Copy` value a word wide at most, with that type's own `submit` and `poll`, its fields
+  private. Not a closed enum of contexts, which would make `io` name its drivers and shut out a
+  Tier 2 one. A USB disk's context is a value, its slot, unit and epoch; AHCI's is a unit type
+  that reaches the disk it publishes.
+- **A block IRP in flight is an `InFlight`**, minted by `io::block`'s dispatch alone once its
+  fragments sum to its length, and spent once: `complete`, or `keep` for a command a stuck device
+  may still move, which AHCI's give-up and a kept USB slot now say. **One dropped unfinished panics
+  a debug build.** It is `io::block`'s child module, so its mint is `io::block`'s and not the RAM
+  disk's. AHCI's kept command leaves slot 0, which nothing reads once the port is dead.
+- **A host test's token is strict** where a driver holds it, so a request a driver drops unfinished
+  fails the test; a test spends what the driver hands back. drv-o12 stays open for its char half:
+  `CharBackend`'s raw context, which Part J's plan leaves.
+- `unsafe` blocks fall from 541 to 518, and `unsafe fn`s rise from 198 to 199.

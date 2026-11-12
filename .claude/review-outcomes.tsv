@@ -683,3 +683,15 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-12	436	963a2657	9	rules-and-docs	optional	demonstrated	fixed	54ea8a82	drivers-and-irps.md vector paragraph rewrapped to the column
 2026-11-12	436	963a2657	10	rules-and-docs	optional	unverified	fixed	54ea8a82	usb.md step 2 says an Enable Slot answer past MaxSlots is refused and left as the controller has it; the reset register mapped while the machine runs is power.md:73 already
 2026-11-12	436	963a2657	11	error-paths	optional	demonstrated	fixed	54ea8a82	duplicate of 7 (console.rs:246)
+2026-11-12	437	3c15a42e	1	logic+tests	worth-fixing	demonstrated	fixed	0dd09525	order test over every head and taken index (refusals.rs); swap-remove and shift-from-last now fail it
+2026-11-12	437	3c15a42e	2	rules-and-docs	worth-fixing	demonstrated	fixed	0dd09525	ReclaimHead SAFETY restated on its own terms; sweep for names this PR removed found only partition_submit (finding 9)
+2026-11-12	437	3c15a42e	3	logic+architecture	optional	demonstrated	fixed	0dd09525	Partition impls removed; a Cell field compiled before, E0277 after; io impls 7 to 5
+2026-11-12	437	3c15a42e	4	logic+tests	optional	demonstrated	fixed	0dd09525	helpers moved above the doc; the run-based orphan sweep flags it at the review head and nothing now
+2026-11-12	437	3c15a42e	5	error-paths	optional	demonstrated	fixed	0dd09525	queue-full tests in both drivers; swept all 20 refusals as silent keep(): 9 missed before, all but the hub-thread rescan completion caught now
+2026-11-12	437	3c15a42e	6	error-paths	optional	demonstrated	fixed	0dd09525	both drivers test strict tokens, teardown keeps what is still held; the review R6 and a storage twin at the let-go now fail
+2026-11-12	437	3c15a42e	7	tests	optional	demonstrated	fixed	0dd09525	partition test asserts a flush reaches the disk unrebased; the if-false mutation fails it
+2026-11-12	437	3c15a42e	8	tests	optional	demonstrated	fixed	0dd09525	host test drives ramdisk_submit through a token; the swapped completion fails it
+2026-11-12	437	3c15a42e	9	architecture	optional	demonstrated	fixed	0dd09525	drivers-and-irps.md and the block test comment no longer name partition_submit
+2026-11-12	437	3c15a42e	10	architecture	optional	unverified	fixed	0dd09525	irp-layout.md and the IrpBox doc say a Tier 2 module would be handed the Irp, the kernel own drivers holding an InFlight; no Tier 2 contract decided
+2026-11-12	437	3c15a42e	11	architecture	optional	demonstrated	fixed	0dd09525	drv-o12 unticked, its block half noted done and its char half open as Part J leaves it; decision log says so
+2026-11-12	437	3c15a42e	12	rules-and-docs	optional	demonstrated	fixed	0dd09525	trailing spaces stripped, usb.md and drivers-and-irps.md paragraphs rewrapped

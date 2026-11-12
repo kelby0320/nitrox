@@ -21,7 +21,7 @@ fn a_window_refuses_a_rescan_and_once_retired_everything() {
     fn disk_submit(_: *mut Irp, _: *mut ()) {}
     fn disk_poll(_: *mut ()) {}
     let p = Partition {
-        disk: BlockBackend { submit: disk_submit, poll: disk_poll, ctx: core::ptr::null_mut(), max_frags: 8 },
+        disk: crate::io::block::test_backend(disk_submit, disk_poll, core::ptr::null_mut(), 8),
         start_lba: 2048,
         block_count: 100,
         sector_size: 512,
@@ -40,9 +40,9 @@ fn a_window_refuses_a_rescan_and_once_retired_everything() {
     }
 }
 
-/// The window's own submit and retirement, driven through `partition_submit`:
-/// a read reaches the disk rebased and a rescan does not; once retired,
-/// nothing more reaches the disk and no submit is left counted in.
+/// The window's own submit and retirement, driven through its backend: a read reaches the disk
+/// rebased, a flush unrebased, and a rescan not at all; once retired, nothing more reaches the
+/// disk and no submit is left counted in.
 #[test]
 fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     let _exclusive = crate::dpc::exclusive();
@@ -60,8 +60,7 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     fn disk_poll(_: *mut ()) {}
     let seen = Seen(RefCell::new(std::vec::Vec::new()));
     let geometry = |blocks| BlockGeometry { logical_block_size: 512, block_count: blocks };
-    let backend =
-        BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, &seen as *const Seen as *mut (), 8);
     let disk = Ref::new(
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(8192), BlockKind::Disk, b"disk", backend).unwrap(),
     );
@@ -71,8 +70,8 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     // any refusal's completion has run.
     let submit = |op: IrpOp, offset: u64| {
         let mut irp = Irp::new_block(op, core::ptr::null(), offset, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
-        let b = part.block_backend().unwrap();
-        (b.submit)(&mut irp, b.ctx);
+        // SAFETY: the test's IRP, which outlives its dispatch.
+        part.block_backend().unwrap().submit(unsafe { crate::io::block::InFlight::for_test(&mut irp) });
         crate::dpc::run_pending();
         irp.status
     };
@@ -82,13 +81,17 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     assert_eq!(submit(IrpOp::Rescan, 0), KError::Unsupported as i32, "a rescan is the disk's alone");
     assert_eq!(submit(IrpOp::Eject, 0), KError::Unsupported as i32, "and an eject");
     assert_eq!(seen.0.borrow().len(), 1, "and neither reached the disk");
+    assert_eq!(submit(IrpOp::Flush, 0), pending);
+    let flush = (IrpOp::Flush as u32, 0);
+    assert_eq!(seen.0.borrow().last(), Some(&flush), "a flush is the disk's cache: not rebased");
+    assert_eq!(submit(IrpOp::Read, 100 * 512), KError::InvalidArgument as i32, "past the window's end");
 
     assert!(!retire_window(&disk), "a disk's node is no window");
     assert!(retire_window(&part));
     for op in [IrpOp::Read, IrpOp::Write, IrpOp::Flush, IrpOp::Rescan] {
         assert_eq!(submit(op, 0), KError::PeerClosed as i32, "retired: {op:?}");
     }
-    assert_eq!(seen.0.borrow().len(), 1, "nothing more reached the disk");
+    assert_eq!(seen.0.borrow().len(), 2, "nothing more reached the disk");
     assert!(!window_busy(&part), "every submit counted out");
     assert!(!window_busy(&disk));
 }
@@ -100,14 +103,24 @@ fn a_node_is_a_window_by_what_made_it_not_by_its_backends_function() {
     use crate::libkern::block::BlockKind;
     use crate::object::device_node::{BlockGeometry, ResourceDescriptor};
     init_global_heap();
-    let mut not_a_window = [0u64; 8];
-    let ctx = not_a_window.as_mut_ptr() as *mut ();
-    let backend = BlockBackend { submit: partition_submit, poll: partition_poll, ctx, max_frags: 8 };
+    fn disk_submit(_: *mut Irp, _: *mut ()) {}
+    fn disk_poll(_: *mut ()) {}
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 100 };
-    let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Partition, b"p", backend);
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, core::ptr::null_mut(), 8);
+    let disk = Ref::new(
+        DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"d", backend).unwrap(),
+    );
+    let window = Partition::new(&disk, 0, 100, 512).unwrap();
+    let node = DeviceNode::try_new_block(
+        ResourceDescriptor::ZERO,
+        geometry,
+        BlockKind::Partition,
+        b"p",
+        partition_backend(window),
+    );
     let node = Ref::new(node.unwrap());
     assert!(!retire_window(&node), "no window made it");
-    assert_eq!(not_a_window, [0; 8], "nothing written through its context");
+    assert!(!window.retired.load(core::sync::atomic::Ordering::SeqCst), "the window its backend forwards to untouched");
 }
 
 /// Page-cache frames go to the device as one IRP, in order; more than it takes
@@ -132,8 +145,7 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
     }
     fn disk_poll(_: *mut ()) {}
     let seen = Seen(RefCell::new(std::vec::Vec::new()));
-    let backend =
-        BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, &seen as *const Seen as *mut (), 8);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 8192 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
@@ -176,8 +188,7 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     }
     fn disk_poll(_: *mut ()) {}
     let seen = Seen(RefCell::new(std::vec::Vec::new()));
-    let backend =
-        BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, &seen as *const Seen as *mut (), 8);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
@@ -247,7 +258,7 @@ fn a_blocking_read_its_device_did_not_complete_fails() {
         crate::dpc::run_pending();
     }
     let read = |submit: fn(*mut Irp, *mut ()), poll: fn(*mut ()), lba| {
-        let backend = BlockBackend { submit, poll, ctx: core::ptr::null_mut(), max_frags: 8 };
+        let backend = crate::io::block::test_backend(submit, poll, core::ptr::null_mut(), 8);
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
         let node =
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
@@ -334,7 +345,7 @@ fn more_refusals_than_the_dpc_queue_holds_each_complete() {
     init_global_heap();
     fn disk_submit(_: *mut Irp, _: *mut ()) {}
     fn disk_poll(_: *mut ()) {}
-    let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: core::ptr::null_mut(), max_frags: 8 };
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, core::ptr::null_mut(), 8);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();

@@ -192,9 +192,9 @@ pub type CharWrite = fn(
     ctx: *mut (),
 ) -> Result<(), KError>;
 
-// SAFETY: identical reasoning to `BlockBackend` — `ctx` points at a device
-// structure that lives for the kernel's lifetime, touched only on the CPU
-// servicing the device; these impls let a `DeviceNode` holding one be `Send`/`Sync`.
+// SAFETY: `ctx` points at a device structure that lives for the kernel's lifetime, or is a value
+// naming one, and each device synchronises its own state on whichever CPU reads or writes; these
+// impls let a `DeviceNode` holding one be `Send`/`Sync`.
 unsafe impl Send for CharBackend {}
 // SAFETY: as above.
 unsafe impl Sync for CharBackend {}

@@ -189,7 +189,7 @@ struct Irp {
 3. The thread `sys_wait`s on the `PendingOperation` (alongside any other
    waitables) — it does **not** block inside the I/O call.
 4. The completion **IRQ** fires; the ISR acknowledges the device and completes the IRP
-   (`io::irp::complete`), which links it for the completion DPC.
+   (`InFlight::complete`, over `io::irp::complete`), which links it for the completion DPC.
 5. The **DPC** runs the IRP's `on_complete`, which signals its
    `PendingOperation`. The stack's per-frame completion routines, which would run
    **up** from the bottom before it, have a slot in the layout and no runner yet:
@@ -208,6 +208,18 @@ ahead for the case that needs them. **Deferred:** transparent **filter drivers**
 (encryption, compression, logging inserted into a stack) — the first genuine user
 of formal multi-frame descent — IRP **cancellation**, and the 30-second completion
 **timeout**.
+
+**A backend pairs a context with its driver's functions.** `BlockBackend::new` takes a
+`BlockDevice`: a reference to the device's state (a partition, a RAM disk), or a value naming it
+(AHCI's published port, a USB disk's slot, unit and epoch). Only that type's `submit` and `poll`
+read it back, so no code can hand one backend's context to another's functions.
+
+**A driver holds a block IRP as an `InFlight`** (`io/block/in_flight.rs`), which `io::block`'s
+dispatch alone mints, once the IRP's fragments are checked to sum to its length: its fields and
+fragments are read through it, a partition rebases it, and a driver gives it up once, by
+`complete`, or by `keep` for a command a stuck device may still move (AHCI's port that will not
+stop, a USB slot kept). **One dropped unfinished panics a debug build**, as its waiter would wait
+for good.
 
 ## Async completion and `sys_wait`
 
@@ -421,12 +433,12 @@ sleeps no longer than a deadline, so a command issued while it sleeps needs no w
 boot's polled wait, before the thread runs, recovers the same way when it gives up on a command,
 which it retired as done before, and runs every completion queued; `read_blocking` counts a read
 only once it completed. While a port is faulted or recovered, what is submitted waits in the queue.
-**A port that will not stop** may still move its command's data: that command is kept, never
-completed, and the disk refuses everything else. **What waits on a kept command waits for good**,
-as nothing in the kernel cancels a request: a filesystem server's write, and a `sys_ns_sync` behind
-it (deferred: *IRP cancellation and the completion timeout*). QEMU clears PxCI on
-an error, so the kept bit is a host test's (`drivers/ahci/tests.rs`); QEMU's `blkdebug`, failing a
-sector `test-qemu`'s probe reads, showed the recovery, and every probe after it passing.
+**A port that will not stop** may still move its command's data: that command is kept
+(`InFlight::keep`), never completed, and the disk refuses everything else. **What waits on a kept
+command waits for good**, as nothing in the kernel cancels a request: a filesystem server's write,
+and a `sys_ns_sync` behind it (deferred: *IRP cancellation and the completion timeout*). QEMU clears
+PxCI on an error, so the kept bit is a host test's (`drivers/ahci/tests.rs`); QEMU's `blkdebug`,
+failing a sector `test-qemu`'s probe reads, showed the recovery, and every probe after it passing.
 
 **How many fragments one command can describe is a device property, and the device
 publishes it** — [`BlockBackend::max_frags`](../../kernel/src/io/block.rs). AHCI's is
@@ -520,8 +532,8 @@ and a rescan waits for the count to reach zero after retiring (`io::block::windo
 side `SeqCst`: either a submit sees the window retired, or the rescan sees the submit and waits for
 it to reach the disk. **The rescan then lets the disk drain before it takes the device**, so every
 IRP a window let through is issued at the old table's offsets before the new table is published,
-never after (PR #369 review). Both halves are host-tested through the window's own node —
-`partition_submit` and `retire_window` driven, not only the predicate they consult — and
+never after (PR #369 review). Both halves are host-tested through the window's own node — its
+backend's submit and `retire_window` driven, not only the predicate they consult — and
 `boot-probe` holds a partition's node across a rescan in `test-qemu`.
 
 **This is a bound, not a policy, and it was once absent.** `sys_io_submit` bounds

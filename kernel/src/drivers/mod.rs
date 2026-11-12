@@ -144,10 +144,10 @@ fn oversize_refused(disk: &Ref<DeviceNode>) {
     // **Ask the device what it can do, then ask for one fragment more**: a driver that published
     // the wrong `max_frags` fails here. A backend with no limit (the ramdisk) has nothing to
     // exceed.
-    if backend.max_frags == u32::MAX {
+    if backend.max_frags() == u32::MAX {
         return;
     }
-    let pages = backend.max_frags as usize + 1;
+    let pages = backend.max_frags() as usize + 1;
     let bytes = pages * crate::mm::PAGE_SIZE;
     let big = match MemoryObject::try_new(bytes) {
         Ok(mo) => Ref::new(mo),
@@ -159,13 +159,13 @@ fn oversize_refused(disk: &Ref<DeviceNode>) {
     };
     match dispatch_block_irp(disk, &big, &po, IoOpcode::Read, 0, 0, bytes as u64) {
         Err(crate::syscall::error::KError::InvalidArgument) => {
-            crate::kprintln!("ahci: oversize self-test OK ({} frags > {} refused)", pages, backend.max_frags)
+            crate::kprintln!("ahci: oversize self-test OK ({} frags > {} refused)", pages, backend.max_frags())
         }
         Err(e) => crate::kprintln!("ahci: oversize self-test FAIL (refused, but with {:?} not InvalidArgument)", e),
         Ok(()) => crate::kprintln!(
             "ahci: oversize self-test FAIL ({} frags accepted, table holds {})",
             pages,
-            backend.max_frags
+            backend.max_frags()
         ),
     }
 }

@@ -328,7 +328,6 @@ fn every_frame_a_read_ahead_takes_comes_back() {
 
 #[test]
 fn a_fill_reads_its_page_and_those_ahead_in_one_irp_within_the_devices_limit() {
-    use crate::io::block::BlockBackend;
     use crate::io::irp::{Irp, PhysFrag};
     use crate::libkern::block::BlockKind;
     use core::cell::RefCell;
@@ -346,8 +345,7 @@ fn a_fill_reads_its_page_and_those_ahead_in_one_irp_within_the_devices_limit() {
     }
     fn disk_poll(_: *mut ()) {}
     let seen = Seen(RefCell::new(std::vec::Vec::new()));
-    let backend =
-        BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, &seen as *const Seen as *mut (), 8);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
@@ -407,7 +405,6 @@ fn a_fill_wait_answers_the_fill_not_the_exit() {
 struct Held(core::cell::RefCell<std::vec::Vec<*mut crate::io::irp::Irp>>);
 
 fn held_disk_file(held: &Held) -> Ref<FileObject> {
-    use crate::io::block::BlockBackend;
     use crate::io::irp::Irp;
     use crate::libkern::block::BlockKind;
     fn disk_submit(irp: *mut Irp, ctx: *mut ()) {
@@ -415,8 +412,7 @@ fn held_disk_file(held: &Held) -> Ref<FileObject> {
         unsafe { (*(ctx as *const Held)).0.borrow_mut().push(irp) };
     }
     fn disk_poll(_: *mut ()) {}
-    let backend =
-        BlockBackend { submit: disk_submit, poll: disk_poll, ctx: held as *const Held as *mut (), max_frags: 8 };
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, held as *const Held as *mut (), 8);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();

@@ -15,8 +15,9 @@ use crate::arch::DeviceVector;
 use crate::arch::irq_install::{ArchIrqInstall, InstallError};
 use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
-use crate::io::block::BlockBackend;
-use crate::io::irp::{Irp, IrpStatus, PhysFrag};
+use crate::io::block::InFlight;
+use crate::io::block::{BlockBackend, BlockDevice};
+use crate::io::irp::{IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, Published};
@@ -128,31 +129,31 @@ const RECOVERING: u8 = 2;
 /// the excess submit with `IoError` (backpressure).
 const PENDING_DEPTH: usize = 32;
 
-/// A FIFO ring of block IRP pointers waiting for slot 0; the submitter owns the boxes.
+/// A FIFO ring of block IRPs waiting for slot 0.
 struct PendingRing {
-    ring: [*mut Irp; PENDING_DEPTH],
+    ring: [Option<InFlight>; PENDING_DEPTH],
     head: usize,
     len: usize,
 }
 
 impl PendingRing {
     const fn new() -> Self {
-        PendingRing { ring: [core::ptr::null_mut(); PENDING_DEPTH], head: 0, len: 0 }
+        PendingRing { ring: [const { None }; PENDING_DEPTH], head: 0, len: 0 }
     }
-    fn push(&mut self, irp: *mut Irp) -> bool {
+    fn push(&mut self, irp: InFlight) -> Result<(), InFlight> {
         if self.len == PENDING_DEPTH {
-            return false;
+            return Err(irp);
         }
         let tail = (self.head + self.len) % PENDING_DEPTH;
-        self.ring[tail] = irp;
+        self.ring[tail] = Some(irp);
         self.len += 1;
-        true
+        Ok(())
     }
-    fn pop(&mut self) -> *mut Irp {
+    fn pop(&mut self) -> Option<InFlight> {
         if self.len == 0 {
-            return core::ptr::null_mut();
+            return None;
         }
-        let irp = self.ring[self.head];
+        let irp = self.ring[self.head].take();
         self.head = (self.head + 1) % PENDING_DEPTH;
         self.len -= 1;
         irp
@@ -166,8 +167,8 @@ struct PortState {
     /// Slot 0's command table: its FIS, then its PRDT.
     cmd_table: Programmed,
     queue: PendingRing,
-    /// The IRP issued on slot 0, `null` when idle.
-    inflight: *mut Irp,
+    /// The IRP issued on slot 0, `None` when idle.
+    inflight: Option<InFlight>,
     /// When slot 0's command issued, for its time on the device and its deadline.
     issued_at: u64,
     /// [`CLEAR`], [`FAULTED`] or [`RECOVERING`]: while not clear, the ISR retires nothing.
@@ -182,7 +183,7 @@ impl PortState {
             cmd_list,
             cmd_table,
             queue: PendingRing::new(),
-            inflight: core::ptr::null_mut(),
+            inflight: None,
             issued_at: 0,
             fault: CLEAR,
             dead: false,
@@ -436,16 +437,11 @@ fn wait_command_polled(disk: &AhciDisk, timeout_ns: u64) -> bool {
     disk.port_base.read32(PX_TFD) & (TFD_ERR | TFD_BSY | TFD_DRQ) == 0
 }
 
-/// **The disk's block node**, its backend pointing at `disk`, published before the node is.
-fn disk_node(controller: &DeviceNode, sectors: u64, name: &[u8], disk: &AhciDisk) -> Option<KBox<DeviceNode>> {
+/// **The disk's block node**, its backend reaching the disk [`AHCI`] publishes before the node is.
+fn disk_node(controller: &DeviceNode, sectors: u64, name: &[u8]) -> Option<KBox<DeviceNode>> {
     let cdesc = controller.descriptor();
-    let backend = BlockBackend {
-        submit,
-        poll: ahci_poll,
-        ctx: disk as *const AhciDisk as *mut (),
-        // One command table, one page, so one command describes this many fragments.
-        max_frags: MAX_PRDT_ENTRIES,
-    };
+    // One command table, one page, so one command describes this many fragments.
+    let backend = BlockBackend::new(Port, MAX_PRDT_ENTRIES);
     let geometry = BlockGeometry { logical_block_size: SECTOR_SIZE, block_count: sectors };
     let descriptor = ResourceDescriptor {
         identity: DeviceIdentity {
@@ -467,27 +463,38 @@ fn disk_node(controller: &DeviceNode, sectors: u64, name: &[u8], disk: &AhciDisk
     DeviceNode::try_new_block(descriptor, geometry, BlockKind::Disk, name, backend).ok()
 }
 
-/// [`BlockBackend::submit`] for an AHCI disk: builds a `READ DMA EXT` (or write or flush) against
-/// the IRP's fragments and issues it. Completion arrives via the IRQ or the boot polled fallback.
-fn submit(irp: *mut Irp, ctx: *mut ()) {
-    // **A rescan and an eject are refused**, before the disk is touched: a SATA disk's table is read
-    // once at boot; partitioning an internal disk is `nxinstall`'s, and a reboot follows.
-    // SAFETY: `irp` is a live block IRP during submit.
-    let op = unsafe { (*irp).op };
-    if op == crate::io::irp::IrpOp::Rescan as u32 || op == crate::io::irp::IrpOp::Eject as u32 {
-        refuse(irp, crate::syscall::error::KError::Unsupported);
-        return;
-    }
-    let disk = ctx as *mut AhciDisk;
-    // SAFETY: `disk` is the live published disk.
-    let d = unsafe { &*disk };
+/// **The published disk's backend context**: [`AHCI`] holds the one disk served.
+#[derive(Copy, Clone)]
+struct Port;
 
+impl BlockDevice for Port {
+    fn submit(self, irp: InFlight) {
+        // **A rescan and an eject are refused**, before the disk is touched: a SATA disk's table is read
+        // once at boot; partitioning an internal disk is `nxinstall`'s, and a reboot follows.
+        let op = irp.op();
+        if op == crate::io::irp::IrpOp::Rescan as u32 || op == crate::io::irp::IrpOp::Eject as u32 {
+            refuse(irp, crate::syscall::error::KError::Unsupported);
+            return;
+        }
+        match AHCI.get() {
+            Some(d) => submit(d, irp),
+            None => refuse(irp, crate::syscall::error::KError::PeerClosed),
+        }
+    }
+
+    fn poll(self) {
+        poll_complete_inflight();
+    }
+}
+
+/// [`BlockDevice::submit`] for the AHCI disk `d`: builds a `READ DMA EXT` (or write or flush) against
+/// the IRP's fragments and issues it. Completion arrives via the IRQ or the boot polled fallback.
+fn submit(d: &AhciDisk, irp: InFlight) {
     // **More fragments than one command table can describe: refuse, before the lock.**
     // `dispatch_block_irp` already rejects this against the published `max_frags`; this is the
     // backstop for another route. It precedes the port lock because failing an IRP means completing
     // it, unavailable under the lock.
-    // SAFETY: `irp` is a live block IRP during submit.
-    if unsafe { (*irp).buffer.count } as usize > MAX_PRDT_ENTRIES as usize {
+    if irp.frags().len() > MAX_PRDT_ENTRIES as usize {
         refuse(irp, crate::syscall::error::KError::InvalidArgument);
         return;
     }
@@ -497,71 +504,49 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     let mut p = d.state.lock();
     // Under the lock a disk is given up under, so nothing is queued behind its kept command.
     let refused = if p.dead {
-        Some(crate::syscall::error::KError::IoError)
-    } else if p.inflight.is_null() && p.fault == CLEAR {
-        // SAFETY: `irp` is a live block IRP.
-        let issued = unsafe { issue_locked(d, &mut p, irp) };
-        (!issued).then_some(crate::syscall::error::KError::InvalidArgument)
+        Some((irp, crate::syscall::error::KError::IoError))
+    } else if p.inflight.is_none() && p.fault == CLEAR {
+        issue_locked(d, &mut p, irp).err().map(|irp| (irp, crate::syscall::error::KError::InvalidArgument))
     } else {
-        (!p.queue.push(irp)).then_some(crate::syscall::error::KError::IoError)
+        p.queue.push(irp).err().map(|irp| (irp, crate::syscall::error::KError::IoError))
     };
     drop(p);
-    if let Some(error) = refused {
+    if let Some((irp, error)) = refused {
         refuse(irp, error);
     }
 }
 
 /// Build slot 0's command for `irp`, issue it and put it in flight in `p`, the held port lock's
-/// state, whose slot 0 is idle. `false`, issuing nothing, for an op with no ATA command
-/// ([`ata_command`]): the caller fails the IRP once it has let go of the lock.
-///
-/// # Safety
-/// `irp` is a live block IRP whose `buffer.frags` is a valid `[PhysFrag; count]`, or has a
-/// count of `0` — a flush carries no buffer, and its pointer is null.
-unsafe fn issue_locked(d: &AhciDisk, p: &mut PortState, irp: *mut Irp) -> bool {
-    debug_assert!(p.inflight.is_null(), "slot 0 is building or running another command");
-    // SAFETY: `irp` is live.
-    let (op, offset, length, buffer) = unsafe { ((*irp).op, (*irp).offset, (*irp).length, (*irp).buffer) };
-    // **No buffer is an empty slice**, not one built from a null pointer, which `from_raw_parts`
-    // forbids.
-    let frags: &[PhysFrag] = if buffer.count == 0 {
-        &[]
-    } else {
-        // SAFETY: a non-empty buffer's `frags` array is owned by the IRP box.
-        unsafe { core::slice::from_raw_parts(buffer.frags as *const PhysFrag, buffer.count as usize) }
-    };
-    let lba = offset / SECTOR_SIZE as u64;
-    let count = (length / SECTOR_SIZE as u64) as u16;
+/// state, whose slot 0 is idle. `irp` back, issuing nothing, for an op with no ATA command
+/// ([`ata_command`]): the caller fails it once it has let go of the lock.
+fn issue_locked(d: &AhciDisk, p: &mut PortState, irp: InFlight) -> Result<(), InFlight> {
+    debug_assert!(p.inflight.is_none(), "slot 0 is building or running another command");
+    let op = irp.op();
+    let lba = irp.offset() / SECTOR_SIZE as u64;
+    let count = (irp.length() / SECTOR_SIZE as u64) as u16;
     let Some((command, write)) = ata_command(op, d.flush_command) else {
-        return false;
+        return Err(irp);
     };
     // A flush is non-data — no LBA, no count, no PRDT — and completes with a D2H register FIS,
     // which `PXIE_DHRE` already interrupts on.
     if op == crate::io::irp::IrpOp::Flush as u32 {
         build_command(p, command, 0, 0, &[], false);
     } else {
-        build_command(p, command, lba, count, frags, write);
+        build_command(p, command, lba, count, irp.frags(), write);
     }
-    p.inflight = irp;
+    p.inflight = Some(irp);
     p.issued_at = clock();
     issue(d);
-    true
+    Ok(())
 }
 
 /// **Complete the IRP slot 0 retired, and count it**: its status, the bytes it moved, and its time
 /// on the device since `issued_at`, when [`issue_locked`] stamped it.
-///
-/// # Safety
-/// `irp` is the IRP [`take_retired`] just took out of flight: live, and uniquely this driver's to
-/// complete.
-unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool, moved: u32, issued_at: u64) {
+fn retire(d: &AhciDisk, irp: InFlight, err: bool, moved: u32, issued_at: u64) {
     let ns = clock().saturating_sub(issued_at);
-    // SAFETY: as the contract says.
-    unsafe {
-        let (status, transferred) = completion(err, (*irp).length, moved);
-        d.counted.record((*irp).op, status == IrpStatus::Success as i32, transferred, ns);
-        crate::io::irp::complete(irp, status, transferred);
-    }
+    let (status, transferred) = completion(err, irp.length(), moved);
+    d.counted.record(irp.op(), status == IrpStatus::Success as i32, transferred, ns);
+    irp.complete(status, transferred);
 }
 
 /// A retired command's status and the bytes it moved: nothing on an error, or when the byte count
@@ -574,23 +559,23 @@ fn completion(err: bool, length: u64, moved: u32) -> (i32, u64) {
 }
 
 /// If slot 0 has retired, take its IRP out of flight in `p`, the held port lock's state: the IRP
-/// (`null` if idle or still running), its error, the bytes it moved and its issue time. The next
+/// (`None` if idle or still running), its error, the bytes it moved and its issue time. The next
 /// command issues from [`drain_queue`]'s DPC, and the caller completes the IRP once unlocked.
-fn take_retired(d: &AhciDisk, p: &mut PortState) -> (*mut Irp, bool, u32, u64) {
+fn take_retired(d: &AhciDisk, p: &mut PortState) -> Option<(InFlight, bool, u32, u64)> {
     // Stopping the port clears PxCI, which must not read as the command finishing.
     if p.fault != CLEAR {
-        return (core::ptr::null_mut(), false, 0, 0);
+        return None;
     }
     // **PxCI is read under the lock a submit issues under**: read before it, slot 0 could have
     // taken a new command since, retired here while the HBA still runs it.
     if d.port_base.read32(PX_CI) & 1 != 0 {
-        return (core::ptr::null_mut(), false, 0, 0);
+        return None;
     }
-    let retired = core::mem::replace(&mut p.inflight, core::ptr::null_mut());
+    let retired = p.inflight.take()?;
     let err = d.port_base.read32(PX_TFD) & TFD_ERR != 0;
     // Slot 0's header DW1, which only `build_command` for the next command rewrites, under this lock.
     let moved = p.cmd_list.read::<u32>(4);
-    (retired, err, moved, p.issued_at)
+    Some((retired, err, moved, p.issued_at))
 }
 
 /// If slot 0 is idle and the port not faulted, issue the next queued IRP. Called from the
@@ -599,27 +584,24 @@ fn drain_queue(d: &AhciDisk) {
     loop {
         let refused = {
             let mut p = d.state.lock();
-            if !p.inflight.is_null() || p.fault != CLEAR {
+            if p.inflight.is_some() || p.fault != CLEAR {
                 return;
             }
-            let next = p.queue.pop();
-            if next.is_null() {
+            let Some(next) = p.queue.pop() else {
                 return;
+            };
+            match issue_locked(d, &mut p, next) {
+                Ok(()) => return,
+                Err(next) => next,
             }
-            // SAFETY: `next` is a live queued IRP.
-            if unsafe { issue_locked(d, &mut p, next) } {
-                return;
-            }
-            next
         };
         refuse(refused, crate::syscall::error::KError::InvalidArgument);
     }
 }
 
 /// Complete `irp` with `error`, outside the port lock.
-fn refuse(irp: *mut Irp, error: crate::syscall::error::KError) {
-    // SAFETY: `irp` is a live IRP not in flight or queued, so uniquely ours to complete.
-    unsafe { crate::io::irp::complete(irp, error as i32, 0) };
+fn refuse(irp: InFlight, error: crate::syscall::error::KError) {
+    irp.complete(error as i32, 0);
 }
 
 /// The AHCI completion ISR (device-IRQ context): acknowledges the controller, completes the
@@ -637,7 +619,7 @@ fn on_interrupt(d: &AhciDisk) {
     d.abar.write32(HBA_IS, 1 << d.port);
 
     // **One hold**: the fault report and the retire decide on state no submit can change meanwhile.
-    let (faulted, (irp, err, moved, issued_at)) = {
+    let (faulted, retired) = {
         let mut p = d.state.lock();
         // An error stops the port, PxCI keeping the command's bit until ST is cleared (§6.2.2.1).
         let faulted = pxis & PX_FATAL != 0 && p.fault == CLEAR;
@@ -650,9 +632,8 @@ fn on_interrupt(d: &AhciDisk) {
         crate::dpc::enqueue(&AHCI_FAULT_DPC);
     }
     // If slot 0 has retired, complete the IRP and queue the drain DPC for the next waiting command.
-    if !irp.is_null() {
-        // SAFETY: `irp` is the retired request, completed here once.
-        unsafe { retire(d, irp, err, moved, issued_at) };
+    if let Some((irp, err, moved, issued_at)) = retired {
+        retire(d, irp, err, moved, issued_at);
         crate::dpc::enqueue(&AHCI_DRAIN_DPC);
     }
     crate::dpc::enqueue(&AHCI_INTR_DPC);
@@ -676,8 +657,8 @@ extern "C" fn watch(_arg: usize) {
         if let crate::sched::WaitResult::Signaled(_) = woke {
             crate::sched::interrupt_consume(&d.wake);
         }
-        if let Some(irp) = claim(d, clock(), false) {
-            said(d, recover(d, irp));
+        if claim(d, clock(), false) {
+            said(d, recover(d));
         }
     }
 }
@@ -697,43 +678,41 @@ pub fn start() {
 fn due_at(d: &AhciDisk, now: u64) -> u64 {
     let latest = now.saturating_add(COMMAND_DEADLINE_NS);
     let p = d.state.lock();
-    if p.inflight.is_null() {
+    if p.inflight.is_none() {
         return latest;
     }
     p.issued_at.saturating_add(COMMAND_DEADLINE_NS + 1).min(latest)
 }
 
 /// **Claim the port for recovery**, under its lock: a fault reported, slot 0's command past its
-/// deadline at `now`, or `forced`. The command, `null` if none; `None` if there is nothing to do.
-fn claim(d: &AhciDisk, now: u64, forced: bool) -> Option<*mut Irp> {
+/// deadline at `now`, or `forced`. Whether there is anything to do.
+fn claim(d: &AhciDisk, now: u64, forced: bool) -> bool {
     let mut p = d.state.lock();
-    let irp = p.inflight;
-    let overdue = !irp.is_null() && now.saturating_sub(p.issued_at) > COMMAND_DEADLINE_NS;
+    let overdue = p.inflight.is_some() && now.saturating_sub(p.issued_at) > COMMAND_DEADLINE_NS;
     match p.fault {
-        RECOVERING => return None,
-        CLEAR if !overdue && !forced => return None,
+        RECOVERING => return false,
+        CLEAR if !overdue && !forced => return false,
         _ => {}
     }
     p.fault = RECOVERING;
-    Some(irp)
+    true
 }
 
-/// **Recover the port after slot 0's command `irp` failed or overran** (AHCI 1.3.1 §6.2.2.1), then
-/// fail `irp` and issue the next. **A port that will not stop** may still move `irp`'s data, so
-/// `irp` is kept and the disk given up. Whether it recovered; the caller says so, as nothing here
-/// may print under a host test.
-fn recover(d: &AhciDisk, irp: *mut Irp) -> bool {
+/// **Recover the port after slot 0's command failed or overran** (AHCI 1.3.1 §6.2.2.1), then fail
+/// that command and issue the next. **A port that will not stop** may still move the command's
+/// data, so it is kept for good and the disk given up. Whether it recovered; the caller says so, as
+/// nothing here may print under a host test.
+fn recover(d: &AhciDisk) -> bool {
     let pb = d.port_base;
     if stop_port(pb).is_none() {
-        let mut refused = give_up(&mut d.state.lock());
-        loop {
-            let next = refused.pop();
-            if next.is_null() {
-                return false;
-            }
-            // SAFETY: `next` was queued, never issued, so uniquely ours.
-            unsafe { retire(d, next, true, 0, clock()) };
+        let (kept, mut refused) = give_up(&mut d.state.lock());
+        if let Some(kept) = kept {
+            kept.keep();
         }
+        while let Some(next) = refused.pop() {
+            retire(d, next, true, 0, clock());
+        }
+        return false;
     }
     pb.write32(PX_SERR, 0xFFFF_FFFF);
     pb.write32(PX_IS, 0xFFFF_FFFF);
@@ -742,24 +721,22 @@ fn recover(d: &AhciDisk, irp: *mut Irp) -> bool {
         comreset(pb);
     }
     start_port(pb);
-    let issued_at = {
+    let (irp, issued_at) = {
         let mut p = d.state.lock();
-        p.inflight = core::ptr::null_mut();
         p.fault = CLEAR;
-        p.issued_at
+        (p.inflight.take(), p.issued_at)
     };
-    if !irp.is_null() {
-        // SAFETY: `irp` was slot 0's, taken out of flight above with the port stopped.
-        unsafe { retire(d, irp, true, 0, issued_at) };
+    if let Some(irp) = irp {
+        retire(d, irp, true, 0, issued_at);
     }
     drain_queue(d);
     true
 }
 
-/// **Give the disk up**, in `p`: refuse all from here, and hand back the queue.
-fn give_up(p: &mut PortState) -> PendingRing {
+/// **Give the disk up**, in `p`: refuse all from here, and hand back slot 0's command and the queue.
+fn give_up(p: &mut PortState) -> (Option<InFlight>, PendingRing) {
     p.dead = true;
-    core::mem::replace(&mut p.queue, PendingRing::new())
+    (p.inflight.take(), core::mem::replace(&mut p.queue, PendingRing::new()))
 }
 
 /// Say what a recovery did.
@@ -784,11 +761,6 @@ fn comreset(pb: Mmio) {
         core::hint::spin_loop();
     }
     pb.write32(PX_SERR, 0xFFFF_FFFF);
-}
-
-/// [`BlockBackend::poll`] for the AHCI disk: complete the in-flight command by polling (boot path).
-fn ahci_poll(_ctx: *mut ()) {
-    poll_complete_inflight();
 }
 
 fn ahci_intr_dpc(_ctx: *mut ()) {
@@ -821,7 +793,7 @@ pub fn poll_complete_inflight() -> bool {
 fn poll_disk(d: &AhciDisk) -> Option<(bool, bool)> {
     let idle = {
         let p = d.state.lock();
-        p.dead || p.inflight.is_null()
+        p.dead || p.inflight.is_none()
     };
     let settled = if idle {
         None
@@ -837,15 +809,14 @@ fn poll_disk(d: &AhciDisk) -> Option<(bool, bool)> {
 /// failed, as the watch thread would. `None` if there was none, else whether the port works.
 fn settle_polled(d: &AhciDisk, finished: bool) -> Option<bool> {
     let working = if finished {
-        let (irp, err, moved, issued_at) = take_retired(d, &mut d.state.lock());
-        if irp.is_null() {
-            return None;
-        }
-        // SAFETY: `irp` is the retired request.
-        unsafe { retire(d, irp, err, moved, issued_at) };
+        let (irp, err, moved, issued_at) = take_retired(d, &mut d.state.lock())?;
+        retire(d, irp, err, moved, issued_at);
         true
     } else {
-        recover(d, claim(d, clock(), true)?)
+        if !claim(d, clock(), true) {
+            return None;
+        }
+        recover(d)
     };
     drain_queue(d);
     Some(working)

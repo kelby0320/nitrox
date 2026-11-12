@@ -42,8 +42,9 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use crate::arch::irq::ArchIrq;
 use crate::arch::irq_install::ArchIrqInstall;
 use crate::arch::timer::ArchTimer;
-use crate::io::block::BlockBackend;
-use crate::io::irp::{Irp, IrpOp, IrpStatus, PhysFrag};
+use crate::io::block::InFlight;
+use crate::io::block::{BlockBackend, BlockDevice};
+use crate::io::irp::{IrpOp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::lockrank::LockRank;
@@ -152,10 +153,10 @@ impl RamDisk {
     /// (a RAM disk's command is a copy, so its time on the device is the copy's)
     /// and recorded into the node's counters. Returns `(status, transferred)`, as
     /// [`transfer`](Self::transfer).
-    fn serve(&self, irp: &Irp, clock: impl Fn() -> u64) -> (i32, u64) {
+    fn serve(&self, op: u32, offset: u64, len: u64, frags: &[PhysFrag], clock: impl Fn() -> u64) -> (i32, u64) {
         let started = clock();
-        let (status, transferred) = self.transfer(irp);
-        self.counted.record(irp.op, status == IrpStatus::Success as i32, transferred, clock() - started);
+        let (status, transferred) = self.transfer(op, offset, len, frags);
+        self.counted.record(op, status == IrpStatus::Success as i32, transferred, clock() - started);
         (status, transferred)
     }
 
@@ -167,10 +168,10 @@ impl RamDisk {
     /// Perform the IRP's transfer against the backing, returning `(status, transferred)`: a copy
     /// either way across the buffer's fragments, under the disk's lock, through views of their
     /// frames, as its copies are the CPU's. No blocking, no allocation.
-    fn transfer(&self, irp: &Irp) -> (i32, u64) {
+    fn transfer(&self, op: u32, dev_off: u64, len: u64, frags: &[PhysFrag]) -> (i32, u64) {
         // **Every op by name**: inferring a write from "not a read" is how a flush, which
         // carries no range, would be taken for one.
-        let is_read = match irp.op {
+        let is_read = match op {
             op if op == IrpOp::Read as u32 => true,
             op if op == IrpOp::Write as u32 => false,
             // A RAM disk's memory is its medium: nothing is cached, so a flush is done.
@@ -179,22 +180,11 @@ impl RamDisk {
             op if op == IrpOp::Rescan as u32 || op == IrpOp::Eject as u32 => return (KError::Unsupported as i32, 0),
             _ => return (KError::InvalidArgument as i32, 0),
         };
-        let dev_off = irp.offset;
-        let len = irp.length;
         if dev_off.checked_add(len).is_none_or(|end| end > self.capacity() as u64) {
             return (KError::InvalidArgument as i32, 0);
         }
         let _busy = self.busy.lock();
         let base = self.base();
-        // No buffer is an empty slice, never one built from its null pointer, which
-        // `from_raw_parts` forbids at any length — as in the AHCI driver.
-        let frags: &[PhysFrag] = if irp.buffer.count == 0 {
-            &[]
-        } else {
-            // SAFETY: `irp.buffer.frags` points at a `[PhysFrag; count]` owned by the
-            // IRP's box for the IRP's lifetime (see `io::block`).
-            unsafe { core::slice::from_raw_parts(irp.buffer.frags as *const PhysFrag, irp.buffer.count as usize) }
-        };
         // **The fragments must hold `len`, and only `len` moves**: a fragment's length bounds no disk.
         if frags.iter().try_fold(0u64, |sum, f| sum.checked_add(f.len)).is_none_or(|sum| sum < len) {
             return (KError::InvalidArgument as i32, 0);
@@ -234,17 +224,24 @@ static COMPLETION_VECTOR: AtomicU8 = AtomicU8::new(0);
 /// only so that tail runs.
 extern "C" fn ramdisk_completion_isr() {}
 
-/// The ramdisk's [`BlockBackend::submit`]: transfer now (a ramdisk has no DMA engine), complete the
+impl BlockDevice for &'static RamDisk {
+    fn submit(self, irp: InFlight) {
+        ramdisk_submit(self, irp);
+    }
+
+    /// Its `submit` already queued the completion DPC, so a synchronous read just drains it.
+    fn poll(self) {
+        crate::dpc::run_pending();
+    }
+}
+
+/// The ramdisk's [`BlockDevice::submit`]: transfer now (a ramdisk has no DMA engine), complete the
 /// IRP, and raise the completion interrupt so its DPC drains at once rather than at the next timer
 /// tick.
-fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
-    // SAFETY: `ctx` is the `*const RamDisk` installed in the backend; the device
-    // outlives the IRP.
-    let rd = unsafe { &*(ctx as *const RamDisk) };
-    // SAFETY: `irp` is the live in-flight IRP from `dispatch_block_irp`.
-    let (status, transferred) = rd.serve(unsafe { &*irp }, crate::arch::Timer::read_ns);
-    // SAFETY: as above, and completed here once.
-    unsafe { crate::io::irp::complete(irp, status, transferred) };
+fn ramdisk_submit(rd: &RamDisk, irp: InFlight) {
+    let read_ns = crate::arch::Timer::read_ns;
+    let (status, transferred) = rd.serve(irp.op(), irp.offset(), irp.length(), irp.frags(), read_ns);
+    irp.complete(status, transferred);
     let vector = COMPLETION_VECTOR.load(Ordering::Acquire);
     if vector != 0 {
         // SAFETY: ring 0, and this CPU's local controller is up. The first submits come from
@@ -254,12 +251,6 @@ fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
         // `vector` was installed with `ramdisk_completion_isr` by `try_new_device`.
         unsafe { crate::arch::Irq::raise_on_self(vector) };
     }
-}
-
-/// The ramdisk's [`BlockBackend::poll`]: its `submit` already queued the
-/// completion DPC, so a synchronous read just drains it.
-fn ramdisk_poll(_ctx: *mut ()) {
-    crate::dpc::run_pending();
 }
 
 /// Build a block [`DeviceNode`] for `rd`, which must outlive every IRP submitted
@@ -273,15 +264,10 @@ pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNo
             Err(e) => crate::kprintln!("ramdisk: no completion vector ({}); its completions wait for a tick", e.says()),
         }
     }
-    let backend = BlockBackend {
-        submit: ramdisk_submit,
-        poll: ramdisk_poll,
-        ctx: rd as *const RamDisk as *mut (),
-        // **No hardware limit to inherit**: the ramdisk copies fragment by fragment
-        // with nothing fixed-size to overrun, and a limit nothing enforces would be
-        // a number to maintain.
-        max_frags: u32::MAX,
-    };
+    // **No hardware limit to inherit**: the ramdisk copies fragment by fragment
+    // with nothing fixed-size to overrun, and a limit nothing enforces would be
+    // a number to maintain.
+    let backend = BlockBackend::new(rd, u32::MAX);
     let geometry = BlockGeometry {
         logical_block_size: rd.block_size(),
         block_count: (rd.capacity() / rd.block_size() as usize) as u64,
@@ -377,9 +363,28 @@ pub fn publish_modules() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::irp::{IRP_BUF_FRAGS, IrpBuffer};
+    use crate::io::irp::{IRP_BUF_FRAGS, Irp, IrpBuffer};
     use crate::mm::test_support::init_global_heap;
     use crate::object::MemoryObject;
+
+    /// An IRP's parts as a driver hands them over, its fragments a raw slice of its buffer's.
+    impl RamDisk {
+        fn transfer_irp(&self, irp: &Irp) -> (i32, u64) {
+            self.transfer(irp.op, irp.offset, irp.length, raw_frags(irp))
+        }
+
+        fn serve_irp(&self, irp: &Irp, clock: impl Fn() -> u64) -> (i32, u64) {
+            self.serve(irp.op, irp.offset, irp.length, raw_frags(irp), clock)
+        }
+    }
+
+    fn raw_frags(irp: &Irp) -> &[PhysFrag] {
+        match irp.buffer.count {
+            0 => &[],
+            // SAFETY: the test's fragments, which outlive the IRP it reads them through.
+            n => unsafe { core::slice::from_raw_parts(irp.buffer.frags as *const PhysFrag, n as usize) },
+        }
+    }
 
     /// An IRP over host memory: on the host the HHDM offset is 0, so a fragment's "physical" base
     /// is simply a host address.
@@ -414,11 +419,11 @@ mod tests {
         assert_eq!(rd.capacity(), 2048);
 
         let out = frames_of(&[0xAB; 512]);
-        let (status, n) = rd.transfer(&irp(IrpOp::Write, 512, &[frag(&out, 0, 512)]));
+        let (status, n) = rd.transfer_irp(&irp(IrpOp::Write, 512, &[frag(&out, 0, 512)]));
         assert_eq!((status, n), (IrpStatus::Success as i32, 512));
 
         let back = frames_of(&[0; 512]);
-        let (status, n) = rd.transfer(&irp(IrpOp::Read, 512, &[frag(&back, 0, 100), frag(&back, 100, 412)]));
+        let (status, n) = rd.transfer_irp(&irp(IrpOp::Read, 512, &[frag(&back, 0, 100), frag(&back, 100, 412)]));
         assert_eq!((status, n), (IrpStatus::Success as i32, 512));
         assert!(bytes(&back, 512).iter().all(|&x| x == 0xAB));
         drop(rd);
@@ -438,15 +443,38 @@ mod tests {
         let buffer =
             IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: &frag(&long, 0, 1024) as *const PhysFrag as u64 };
         let write = Irp::new_block(IrpOp::Write, core::ptr::null(), 1536, 512, buffer, core::ptr::null_mut(), 0);
-        assert_eq!(rd.transfer(&write), (IrpStatus::Success as i32, 512));
+        assert_eq!(rd.transfer_irp(&write), (IrpStatus::Success as i32, 512));
         let short = frames_of(&[0; 256]);
         let buffer =
             IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: &frag(&short, 0, 256) as *const PhysFrag as u64 };
         let read = Irp::new_block(IrpOp::Read, core::ptr::null(), 0, 512, buffer, core::ptr::null_mut(), 0);
-        assert_eq!(rd.transfer(&read), (KError::InvalidArgument as i32, 0), "fragments short of it");
+        assert_eq!(rd.transfer_irp(&read), (KError::InvalidArgument as i32, 0), "fragments short of it");
         drop(rd);
         assert!(module[1536..2048].iter().all(|&x| x == 0xAB), "the last block written");
         assert!(module[2048..].iter().all(|&x| x == 0xCD), "and not a byte past the disk");
+    }
+
+    /// **A request submitted is completed with its status and the bytes it moved**, through the
+    /// token's fragments: a write, then a read past the disk's end.
+    #[test]
+    fn a_submitted_request_completes_with_its_status_and_what_it_moved() {
+        let _exclusive = crate::dpc::exclusive();
+        init_global_heap();
+        let mut module = vec![0_u8; 2048];
+        // SAFETY: `module` outlives `rd`.
+        let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), 2048) }.unwrap();
+        let out = frames_of(&[0xAB; 512]);
+        let frags = [frag(&out, 0, 512)];
+        let (mut write, mut past) = (irp(IrpOp::Write, 512, &frags), irp(IrpOp::Read, 2048, &frags));
+        for r in [&mut write as *mut Irp, &mut past] {
+            // SAFETY: the test's IRPs and fragments, which outlive the requests.
+            ramdisk_submit(&rd, unsafe { InFlight::for_test(r) });
+        }
+        crate::dpc::run_pending();
+        assert_eq!((write.status, write.transferred), (IrpStatus::Success as i32, 512));
+        assert_eq!((past.status, past.transferred), (KError::InvalidArgument as i32, 0));
+        drop(rd);
+        assert!(module[512..1024].iter().all(|&x| x == 0xAB), "written through the token's fragments");
     }
 
     /// **The disk it owns takes writes**, through a pointer that may write.
@@ -455,12 +483,12 @@ mod tests {
         init_global_heap();
         let rd = RamDisk::try_new().unwrap();
         let out = frames_of(&[0x5A; 512]);
-        assert_eq!(rd.transfer(&irp(IrpOp::Write, 1024, &[frag(&out, 0, 512)])), (IrpStatus::Success as i32, 512));
+        assert_eq!(rd.transfer_irp(&irp(IrpOp::Write, 1024, &[frag(&out, 0, 512)])), (IrpStatus::Success as i32, 512));
         let back = frames_of(&[0; 512]);
-        assert_eq!(rd.transfer(&irp(IrpOp::Read, 1024, &[frag(&back, 0, 512)])), (IrpStatus::Success as i32, 512));
+        assert_eq!(rd.transfer_irp(&irp(IrpOp::Read, 1024, &[frag(&back, 0, 512)])), (IrpStatus::Success as i32, 512));
         assert_eq!(bytes(&back, 512), [0x5A; 512]);
         let before = frames_of(&[0; 512]);
-        rd.transfer(&irp(IrpOp::Read, 512, &[frag(&before, 0, 512)]));
+        rd.transfer_irp(&irp(IrpOp::Read, 512, &[frag(&before, 0, 512)]));
         assert!(
             bytes(&before, 512).iter().enumerate().all(|(i, &b)| b == RamDisk::pattern_byte(512 + i)),
             "and nowhere else"
@@ -484,10 +512,13 @@ mod tests {
             ticks.get()
         };
         let buf = frames_of(&[0; 1024]);
-        assert_eq!(rd.serve(&irp(IrpOp::Write, 0, &[frag(&buf, 0, 1024)]), clock), (IrpStatus::Success as i32, 1024));
-        assert_eq!(rd.serve(&irp(IrpOp::Read, 512, &[frag(&buf, 0, 512)]), clock).1, 512);
-        assert_eq!(rd.serve(&irp(IrpOp::Read, 2048, &[frag(&buf, 0, 512)]), clock).1, 0, "past the end");
-        rd.serve(&irp(IrpOp::Rescan, 0, &[]), clock);
+        assert_eq!(
+            rd.serve_irp(&irp(IrpOp::Write, 0, &[frag(&buf, 0, 1024)]), clock),
+            (IrpStatus::Success as i32, 1024)
+        );
+        assert_eq!(rd.serve_irp(&irp(IrpOp::Read, 512, &[frag(&buf, 0, 512)]), clock).1, 512);
+        assert_eq!(rd.serve_irp(&irp(IrpOp::Read, 2048, &[frag(&buf, 0, 512)]), clock).1, 0, "past the end");
+        rd.serve_irp(&irp(IrpOp::Rescan, 0, &[]), clock);
         let r = IO.record_for(0, 0);
         assert_eq!((r.writes, r.written_bytes, r.reads, r.read_bytes), (1, 1024, 1, 512));
         assert_eq!((r.errors, r.busy_ns), (1, 15), "three commands of 5 ticks each; the rescan none");
@@ -502,14 +533,14 @@ mod tests {
         let mut module = vec![7u8; 1024];
         // SAFETY: as above.
         let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
-        assert_eq!(rd.transfer(&irp(IrpOp::Flush, 0, &[])), (IrpStatus::Success as i32, 0));
+        assert_eq!(rd.transfer_irp(&irp(IrpOp::Flush, 0, &[])), (IrpStatus::Success as i32, 0));
         let out = frames_of(&[0xCD; 512]);
-        assert_eq!(rd.transfer(&irp(IrpOp::Flush, 0, &[frag(&out, 0, 512)])), (IrpStatus::Success as i32, 0));
+        assert_eq!(rd.transfer_irp(&irp(IrpOp::Flush, 0, &[frag(&out, 0, 512)])), (IrpStatus::Success as i32, 0));
         let out = [frag(&out, 0, 512)];
         let mut unknown = irp(IrpOp::Write, 0, &out);
         unknown.op = 7;
-        assert_eq!(rd.transfer(&unknown).0, KError::InvalidArgument as i32);
-        assert_eq!(rd.transfer(&irp(IrpOp::Eject, 0, &[])).0, KError::Unsupported as i32, "nothing ejects it");
+        assert_eq!(rd.transfer_irp(&unknown).0, KError::InvalidArgument as i32);
+        assert_eq!(rd.transfer_irp(&irp(IrpOp::Eject, 0, &[])).0, KError::Unsupported as i32, "nothing ejects it");
         drop(rd);
         assert!(module.iter().all(|&x| x == 7), "nothing written");
     }
@@ -521,9 +552,9 @@ mod tests {
         // SAFETY: as above.
         let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), module.len()) }.unwrap();
         let out = frames_of(&[0; 512]);
-        let (status, n) = rd.transfer(&irp(IrpOp::Write, 768, &[frag(&out, 0, 512)]));
+        let (status, n) = rd.transfer_irp(&irp(IrpOp::Write, 768, &[frag(&out, 0, 512)]));
         assert_eq!((status, n), (KError::InvalidArgument as i32, 0), "ends 256 bytes past the disk");
-        let (status, _) = rd.transfer(&irp(IrpOp::Read, u64::MAX - 10, &[frag(&out, 0, 512)]));
+        let (status, _) = rd.transfer_irp(&irp(IrpOp::Read, u64::MAX - 10, &[frag(&out, 0, 512)]));
         assert_eq!(status, KError::InvalidArgument as i32, "an offset that overflows");
         drop(rd);
         assert!(module.iter().all(|&x| x == 7));
@@ -534,7 +565,7 @@ mod tests {
         init_global_heap();
         let rd = RamDisk::try_new().unwrap();
         let out = frames_of(&[0; 64]);
-        rd.transfer(&irp(IrpOp::Read, 1000, &[frag(&out, 0, 64)]));
+        rd.transfer_irp(&irp(IrpOp::Read, 1000, &[frag(&out, 0, 64)]));
         assert!(bytes(&out, 64).iter().enumerate().all(|(i, &x)| x == RamDisk::pattern_byte(1000 + i)));
     }
 
@@ -565,7 +596,7 @@ mod tests {
         for op in [IrpOp::Write, IrpOp::Read] {
             std::thread::scope(|s| {
                 s.spawn(|| m.copy_in(0, &[1; 512]));
-                assert_eq!(rd.transfer(&irp(op, 0, &frags)), (IrpStatus::Success as i32, 512));
+                assert_eq!(rd.transfer_irp(&irp(op, 0, &frags)), (IrpStatus::Success as i32, 512));
             });
         }
         drop(rd);

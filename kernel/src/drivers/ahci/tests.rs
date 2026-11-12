@@ -1,4 +1,5 @@
 use super::*;
+use crate::io::irp::Irp;
 
 std::thread_local! {
     static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
@@ -157,7 +158,7 @@ fn a_rescan_and_an_eject_are_refused_without_touching_a_disk() {
     crate::mm::test_support::init_global_heap();
     for op in [IrpOp::Rescan, IrpOp::Eject] {
         let mut irp = Irp::new_block(op, core::ptr::null(), 0, 0, IrpBuffer::NONE, core::ptr::null_mut(), 0);
-        submit(&mut irp, core::ptr::null_mut());
+        Port.submit(fly(&mut irp));
         crate::dpc::run_pending();
         assert_eq!(irp.status, crate::syscall::error::KError::Unsupported as i32, "{op:?}");
     }
@@ -182,8 +183,40 @@ fn fake_abar() -> Mmio<'static> {
     Mmio::over(std::boxed::Box::leak(std::boxed::Box::new([0u32; 96])))
 }
 
+/// **A test's disk, which keeps what its port still holds when the test ends**, as a disk given up
+/// does: so only a request the driver let go of unfinished fails the test.
+struct Fake(AhciDisk);
+
+impl core::ops::Deref for Fake {
+    type Target = AhciDisk;
+    fn deref(&self) -> &AhciDisk {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Fake {
+    fn deref_mut(&mut self) -> &mut AhciDisk {
+        &mut self.0
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let (slot, mut queue) = give_up(&mut self.0.state.lock());
+        if let Some(slot) = slot {
+            slot.keep();
+        }
+        while let Some(irp) = queue.pop() {
+            irp.keep();
+        }
+    }
+}
+
 /// **A disk on fake registers**, and the ABAR they are in.
-fn fake_disk() -> (Mmio<'static>, AhciDisk) {
+fn fake_disk() -> (Mmio<'static>, Fake) {
     crate::mm::test_support::init_global_heap();
     let abar = fake_abar();
     let disk = AhciDisk {
@@ -204,11 +237,22 @@ fn fake_disk() -> (Mmio<'static>, AhciDisk) {
         counted: Counted::new(),
         wake: interrupt_object(),
     };
-    (abar, disk)
+    (abar, Fake(disk))
 }
 
 fn interrupt_object() -> Ref<InterruptObject> {
     Ref::new(InterruptObject::try_new().unwrap())
+}
+
+/// `irp`, in flight: dropped by the driver, it fails the test.
+fn fly(irp: *mut Irp) -> InFlight {
+    // SAFETY: the test's IRP, which outlives the disk it is submitted to.
+    unsafe { InFlight::for_test(irp) }
+}
+
+/// Whether slot 0's command is `irp`.
+fn in_slot(d: &AhciDisk, irp: &Irp) -> bool {
+    d.state.lock().inflight.as_ref().is_some_and(|f| f.is(irp))
 }
 
 /// A read of one sector into `frag`.
@@ -216,10 +260,6 @@ fn read_irp(frag: &PhysFrag) -> Irp {
     use crate::io::irp::{IRP_BUF_FRAGS, IrpBuffer, IrpOp};
     let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: 1, frags: frag as *const PhysFrag as u64 };
     Irp::new_block(IrpOp::Read, core::ptr::null(), 0, 512, buffer, core::ptr::null_mut(), 0)
-}
-
-fn ctx(d: &AhciDisk) -> *mut () {
-    d as *const AhciDisk as *mut ()
 }
 
 const IO_ERROR: i32 = crate::syscall::error::KError::IoError as i32;
@@ -240,13 +280,13 @@ fn a_command_issued_after_the_slot_read_idle_is_not_retired() {
             true => Irp::new_block(IrpOp::Flush, core::ptr::null(), 0, 0, none, core::ptr::null_mut(), 0),
         };
         assert_eq!(d.port_base.read32(PX_CI), 0, "flush {flush}: slot 0 idle when the interrupt came");
-        submit(&mut irp, ctx(&d));
+        submit(&d, fly(&mut irp));
         assert_eq!(d.port_base.read32(PX_CI), 1, "flush {flush}: issued since, on another CPU");
-        let (retired, ..) = take_retired(&d, &mut d.state.lock());
+        let retired = take_retired(&d, &mut d.state.lock());
         crate::dpc::run_pending();
-        assert!(retired.is_null(), "flush {flush}: retired while the HBA runs it");
+        assert!(retired.is_none(), "flush {flush}: retired while the HBA runs it");
         assert_eq!(irp.status, PENDING, "flush {flush}");
-        assert!(core::ptr::eq(d.state.lock().inflight, &irp), "flush {flush}: still in flight");
+        assert!(in_slot(&d, &irp), "flush {flush}: still in flight");
     }
 }
 
@@ -258,15 +298,15 @@ fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
-    submit(&mut first, ctx(&d));
-    submit(&mut second, ctx(&d));
+    submit(&d, fly(&mut first));
+    submit(&d, fly(&mut second));
     d.port_base.write32(PX_TFD, 0x50);
     // Slot 0's header DW1: the byte count an HBA writes back.
     d.state.lock().cmd_list.write::<u32>(4, 512);
     assert_eq!(settle_polled(&d, false), Some(true));
     crate::dpc::run_pending();
     assert_eq!((first.status, first.transferred), (IO_ERROR, 0), "failed, whatever the count said");
-    assert!(core::ptr::eq(d.state.lock().inflight, &second), "the next issued");
+    assert!(in_slot(&d, &second), "the next issued");
     assert_eq!(d.state.lock().fault, CLEAR);
 }
 
@@ -279,7 +319,7 @@ fn a_retired_command_is_done_by_the_bytes_its_header_counted() {
     for (counted, done) in [(512, (IrpStatus::Success as i32, 512)), (511, (IO_ERROR, 0))] {
         let (_regs, d) = fake_disk();
         let mut r = read_irp(&frag);
-        submit(&mut r, ctx(&d));
+        submit(&d, fly(&mut r));
         d.port_base.write32(PX_CI, 0);
         d.port_base.write32(PX_TFD, 0x50);
         d.state.lock().cmd_list.write::<u32>(4, counted);
@@ -298,8 +338,8 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         let (_regs, d) = fake_disk();
         let frag = PhysFrag { base: 0x10_0000, len: 512 };
         let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
-        submit(&mut first, ctx(&d));
-        submit(&mut second, ctx(&d));
+        submit(&d, fly(&mut first));
+        submit(&d, fly(&mut second));
         d.port_base.write32(PX_IS, PXIE_TFEE);
         d.port_base.write32(PX_TFD, 0x51);
         d.port_base.write32(PX_CI, keeps as u32);
@@ -307,9 +347,9 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         crate::dpc::run_pending();
         assert_eq!(first.status, PENDING, "keeps {keeps}: not retired, the watch thread's");
         assert_eq!(d.state.lock().fault, FAULTED, "keeps {keeps}");
-        let irp = claim(&d, 0, false).expect("a reported fault is claimed");
-        assert!(core::ptr::eq(irp, &first));
-        assert_eq!(claim(&d, 0, true), None, "and only once");
+        assert!(claim(&d, 0, false), "a reported fault is claimed");
+        assert!(in_slot(&d, &first), "for its command");
+        assert!(!claim(&d, 0, true), "and only once");
         d.port_base.write32(PX_CI, 0);
         d.port_base.write32(PX_TFD, 0x50);
         on_interrupt(&d);
@@ -318,10 +358,10 @@ fn a_task_file_error_is_recovered_its_command_failed_and_the_next_issued() {
         d.port_base.write32(PX_SERR, 1 << 26);
         d.port_base.write32(PX_IS, 0);
         d.abar.write32(HBA_IS, 0);
-        assert!(recover(&d, irp));
+        assert!(recover(&d));
         crate::dpc::run_pending();
         assert_eq!(first.status, IO_ERROR, "keeps {keeps}");
-        assert!(core::ptr::eq(d.state.lock().inflight, &second), "keeps {keeps}: the next issued");
+        assert!(in_slot(&d, &second), "keeps {keeps}: the next issued");
         assert_eq!(d.state.lock().fault, CLEAR, "keeps {keeps}");
         assert_eq!(d.port_base.read32(PX_SERR), !0, "keeps {keeps}: the error latched");
         assert_eq!(d.port_base.read32(PX_IS), !0, "keeps {keeps}");
@@ -338,18 +378,18 @@ fn a_command_past_its_deadline_is_recovered_and_failed() {
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
     assert_eq!(due_at(&d, 7), 7 + COMMAND_DEADLINE_NS, "idle: a deadline's length on");
-    submit(&mut first, ctx(&d));
-    submit(&mut second, ctx(&d));
+    submit(&d, fly(&mut first));
+    submit(&d, fly(&mut second));
     d.port_base.write32(PX_TFD, 0x50);
     let t = 1_000;
     d.state.lock().issued_at = t;
     assert_eq!(due_at(&d, t + 5), t + COMMAND_DEADLINE_NS + 1, "its deadline, before a deadline's length");
-    assert_eq!(claim(&d, t + COMMAND_DEADLINE_NS, false), None, "at its deadline");
-    let irp = claim(&d, t + COMMAND_DEADLINE_NS + 1, false).expect("past it");
-    assert!(recover(&d, irp));
+    assert!(!claim(&d, t + COMMAND_DEADLINE_NS, false), "at its deadline");
+    assert!(claim(&d, t + COMMAND_DEADLINE_NS + 1, false), "past it");
+    assert!(recover(&d));
     crate::dpc::run_pending();
     assert_eq!(first.status, IO_ERROR);
-    assert!(core::ptr::eq(d.state.lock().inflight, &second), "the next issued");
+    assert!(in_slot(&d, &second), "the next issued");
 }
 
 /// **A fault with nothing in flight holds what is submitted until the port is back**: one issued
@@ -363,28 +403,28 @@ fn a_fault_with_nothing_in_flight_holds_what_comes_until_the_port_is_back() {
     d.port_base.write32(PX_IS, 1 << 27);
     d.port_base.write32(PX_TFD, 0x50);
     on_interrupt(&d);
-    submit(&mut first, ctx(&d));
-    let idle = core::ptr::null_mut();
-    assert_eq!((d.state.lock().inflight, d.port_base.read32(PX_CI)), (idle, 0), "faulted: queued");
-    let irp = claim(&d, 0, false).expect("a reported fault is claimed");
-    assert_eq!(irp, idle, "with no command of its own");
-    submit(&mut second, ctx(&d));
+    submit(&d, fly(&mut first));
+    let idle = || (d.state.lock().inflight.is_none(), d.port_base.read32(PX_CI));
+    assert_eq!(idle(), (true, 0), "faulted: queued");
+    assert!(claim(&d, 0, false), "a reported fault is claimed");
+    assert!(d.state.lock().inflight.is_none(), "with no command of its own");
+    submit(&d, fly(&mut second));
     drain_queue(&d);
-    assert_eq!((d.state.lock().inflight, d.port_base.read32(PX_CI)), (idle, 0), "recovering: queued");
-    assert!(recover(&d, irp));
+    assert_eq!(idle(), (true, 0), "recovering: queued");
+    assert!(recover(&d));
     crate::dpc::run_pending();
-    assert!(core::ptr::eq(d.state.lock().inflight, &first), "the first issued once the port is back");
+    assert!(in_slot(&d, &first), "the first issued once the port is back");
     assert_eq!(d.port_base.read32(PX_CI), 1);
     assert_eq!((first.status, second.status), (PENDING, PENDING));
 }
 
 /// A disk on a port that will not stop, its first command kept: the second was queued behind it.
-fn given_up(d: &AhciDisk, first: &mut Irp, second: &mut Irp) {
-    submit(first, ctx(d));
-    submit(second, ctx(d));
+fn given_up(d: &AhciDisk, first: InFlight, second: InFlight) {
+    submit(d, first);
+    submit(d, second);
     d.port_base.write32(PX_CMD, CMD_ST | CMD_FRE | CMD_CR | CMD_FR);
-    let irp = claim(d, 0, true).expect("a forced claim");
-    assert!(!recover(d, irp), "the port did not stop");
+    assert!(claim(d, 0, true), "a forced claim");
+    assert!(!recover(d), "the port did not stop");
 }
 
 /// **A port that will not stop keeps its command and fails the rest**: the command's buffer may yet
@@ -395,13 +435,13 @@ fn a_port_that_will_not_stop_keeps_its_command_and_fails_the_rest() {
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second, mut third) = (read_irp(&frag), read_irp(&frag), read_irp(&frag));
-    given_up(&d, &mut first, &mut second);
+    given_up(&d, fly(&mut first), fly(&mut second));
     crate::dpc::run_pending();
     assert!(d.state.lock().dead);
     assert_eq!(first.status, PENDING, "kept");
-    assert!(core::ptr::eq(d.state.lock().inflight, &first), "and still slot 0's");
+    assert!(d.state.lock().inflight.is_none(), "for good, out of slot 0");
     assert_eq!(second.status, IO_ERROR, "queued: failed");
-    submit(&mut third, ctx(&d));
+    submit(&d, fly(&mut third));
     crate::dpc::run_pending();
     assert_eq!(third.status, IO_ERROR, "after: refused");
 }
@@ -413,18 +453,20 @@ fn a_request_meeting_the_give_up_at_the_port_lock_is_refused() {
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut late) = (read_irp(&frag), read_irp(&frag));
-    submit(&mut first, ctx(&d));
+    submit(&d, fly(&mut first));
     let late_irp = &mut late as *mut Irp as usize;
     let mut q = d.state.lock();
     std::thread::scope(|s| {
         let (d, exclusive) = (&d, &exclusive);
         let waiting = s.spawn(move || {
             let _shared = exclusive.share();
-            submit(late_irp as *mut Irp, ctx(d))
+            submit(d, fly(late_irp as *mut Irp))
         });
         // Long enough for `waiting` to be at the lock.
         crate::mm::test_support::settle();
-        let _ = give_up(&mut q);
+        if let (Some(kept), _) = give_up(&mut q) {
+            kept.keep();
+        }
         drop(q);
         waiting.join().unwrap();
     });
@@ -439,7 +481,7 @@ fn a_poll_of_a_disk_given_up_waits_for_nothing() {
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
-    given_up(&d, &mut first, &mut second);
+    given_up(&d, fly(&mut first), fly(&mut second));
     d.port_base.write32(PX_CI, 1);
     let before = clock();
     assert_eq!(poll_disk(&d), None);
@@ -457,8 +499,8 @@ fn an_interrupt_queues_the_fault_dpc_on_a_fault_and_the_drain_dpc_on_a_retire() 
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second) = (read_irp(&frag), read_irp(&frag));
-    submit(&mut first, ctx(&d));
-    submit(&mut second, ctx(&d));
+    submit(&d, fly(&mut first));
+    submit(&d, fly(&mut second));
     crate::dpc::take_enqueued();
     on_interrupt(&d);
     let queued = crate::dpc::take_enqueued();
@@ -496,7 +538,7 @@ fn a_commands_device_time_runs_from_its_issue_to_its_retire() {
         let frag = PhysFrag { base: 0x10_0000, len: 512 };
         let mut irp = read_irp(&frag);
         set_clock(ISSUE);
-        submit(&mut irp, ctx(&d));
+        submit(&d, fly(&mut irp));
         set_clock(ISSUE + ON_DEVICE);
         match way {
             "interrupt" => {
@@ -511,10 +553,10 @@ fn a_commands_device_time_runs_from_its_issue_to_its_retire() {
                 d.port_base.write32(PX_IS, PXIE_TFEE);
                 d.port_base.write32(PX_TFD, 0x51);
                 on_interrupt(&d);
-                let taken = claim(&d, 0, false).expect("a reported fault is claimed");
+                assert!(claim(&d, 0, false), "a reported fault is claimed");
                 d.port_base.write32(PX_CI, 0);
                 d.port_base.write32(PX_TFD, 0x50);
-                assert!(recover(&d, taken));
+                assert!(recover(&d));
             }
         }
         crate::dpc::run_pending();
@@ -569,4 +611,63 @@ fn a_port_that_will_not_stop_is_given_no_command_list() {
     pb.write32(PX_CMD, CMD_CR);
     assert_eq!(claim_port(abar, 0).map(|_| ()), Err("its port would not stop"));
     assert_eq!((pb.read32(PX_CLB), pb.read32(PX_FB), pb.read32(PX_CI)), (0, 0, 0), "nothing given");
+}
+
+/// **A submit past a full queue is refused `IoError`**: slot 0 busy, the queue full behind it.
+#[test]
+fn a_submit_past_a_full_queue_is_refused() {
+    let _exclusive = crate::dpc::exclusive();
+    let (_regs, d) = fake_disk();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let mut irps: std::vec::Vec<Irp> = (0..PENDING_DEPTH + 2).map(|_| read_irp(&frag)).collect();
+    for r in irps.iter_mut() {
+        submit(&d, fly(r));
+    }
+    crate::dpc::run_pending();
+    let (last, held) = irps.split_last().unwrap();
+    assert!(held.iter().all(|r| r.status == PENDING), "issued, then queued");
+    assert_eq!(last.status, IO_ERROR, "past the queue: refused");
+}
+
+/// **A request the port cannot take is refused `InvalidArgument`**: more fragments than a command
+/// table holds, or an op with no ATA command, at an idle slot 0 or reaching it from the queue.
+#[test]
+fn a_request_the_port_cannot_take_is_refused() {
+    let _exclusive = crate::dpc::exclusive();
+    use crate::io::irp::{IRP_BUF_FRAGS, IrpBuffer, IrpOp};
+    let (_regs, d) = fake_disk();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let many = std::vec![frag; MAX_PRDT_ENTRIES as usize + 1];
+    let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: many.len() as u32, frags: many.as_ptr() as u64 };
+    let len = 512 * many.len() as u64;
+    let mut wide = Irp::new_block(IrpOp::Read, core::ptr::null(), 0, len, buffer, core::ptr::null_mut(), 0);
+    let rescan = || Irp::new_block(IrpOp::Rescan, core::ptr::null(), 0, 0, IrpBuffer::NONE, core::ptr::null_mut(), 0);
+    let (mut idle, mut first, mut queued) = (rescan(), read_irp(&frag), rescan());
+    for r in [&mut wide as *mut Irp, &mut idle, &mut first, &mut queued] {
+        submit(&d, fly(r));
+    }
+    crate::dpc::run_pending();
+    let invalid = crate::syscall::error::KError::InvalidArgument as i32;
+    assert_eq!((wide.status, idle.status), (invalid, invalid), "at submit");
+    assert_eq!(queued.status, PENDING, "behind slot 0's read");
+    d.port_base.write32(PX_CI, 0);
+    d.port_base.write32(PX_TFD, 0x50);
+    d.state.lock().cmd_list.write::<u32>(4, 512);
+    assert_eq!(settle_polled(&d, true), Some(true));
+    crate::dpc::run_pending();
+    assert_eq!(queued.status, invalid, "reaching slot 0 from the queue");
+}
+
+/// **A request with no disk published is refused `PeerClosed`**: the port names the disk AHCI
+/// publishes, and a host test publishes none.
+#[test]
+fn a_request_with_no_disk_published_is_refused() {
+    let _exclusive = crate::dpc::exclusive();
+    crate::mm::test_support::init_global_heap();
+    assert!(AHCI.get().is_none());
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let mut r = read_irp(&frag);
+    Port.submit(fly(&mut r));
+    crate::dpc::run_pending();
+    assert_eq!(r.status, crate::syscall::error::KError::PeerClosed as i32);
 }

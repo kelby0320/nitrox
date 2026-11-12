@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::handle::table::{fail_installs_after, net_installed};
-use crate::io::block::BlockBackend;
 use crate::io::irp::Irp;
 use crate::libkern::block::BlockKind;
 use crate::libkern::io_op::{IoOp, IoOpcode};
@@ -186,7 +185,7 @@ fn an_io_request_refused_after_its_handle_closes_it() {
     init_global_heap();
     global::init_for_tests();
     test_probe::reset();
-    let backend = BlockBackend { submit: no_submit, poll: no_poll, ctx: core::ptr::null_mut(), max_frags: 1 };
+    let backend = crate::io::block::test_backend(no_submit, no_poll, core::ptr::null_mut(), 1);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let disk = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"d", backend).unwrap();
     let disk = install(PID, ObjectRef::new(disk), Rights::READ).unwrap();
@@ -216,7 +215,7 @@ fn an_io_request_its_device_takes_keeps_its_handle() {
     let _exclusive = crate::dpc::exclusive();
     init_global_heap();
     global::init_for_tests();
-    let backend = BlockBackend { submit: completes, poll: runs, ctx: core::ptr::null_mut(), max_frags: 1 };
+    let backend = crate::io::block::test_backend(completes, runs, core::ptr::null_mut(), 1);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let disk = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"d", backend).unwrap();
     let disk = install(PID, ObjectRef::new(disk), Rights::READ | Rights::WRITE).unwrap();
