@@ -136,7 +136,7 @@ impl Nodes {
         events: &[InputEvent],
         scratch: &mut [u8],
         now: u64,
-    ) -> Option<(ParkedRead, usize)> {
+    ) -> Option<(Loan<ParkedRead>, usize)> {
         let mut r = self.readers[index].lock();
         if !self.current(context(index, epoch)) || !r.offer(events) {
             return None;
@@ -168,11 +168,7 @@ impl Nodes {
                 if !self.current(ctx) {
                     return ReadNow::Gone;
                 }
-                let found = r.read_now(&mut tmp[..max_len], now);
-                if found == ReadNow::Empty {
-                    r.park(ParkedRead::new(po, buffer, buf_offset, max_len));
-                }
-                found
+                r.read_now(&mut tmp[..max_len], now, || ParkedRead::new(po, buffer, buf_offset, max_len))
             },
         );
         match found {

@@ -19,7 +19,6 @@ pub(super) trait Record {
 /// unspent fails a debug build, as its waiter would wait for good.
 pub(super) struct Completer {
     po: *mut (),
-    /// A host test's, over no operation, which it may drop.
     #[cfg(test)]
     lax: bool,
 }
@@ -41,7 +40,7 @@ impl Completer {
         let _ = ManuallyDrop::new(self);
     }
 
-    /// A host test's completer, over no operation: never completed, only compared and dropped.
+    /// A host test's, over no operation: never completed, only compared and dropped.
     #[cfg(test)]
     pub(super) fn for_test(at: usize) -> Completer {
         Completer { po: at as *mut (), lax: true }

@@ -956,3 +956,20 @@ fn pids_are_refused_once_spent_never_reused() {
     assert_eq!(s.take_pid(), None);
     assert_eq!(s.take_pid(), None);
 }
+
+/// **A driver's reclaim runs once registered, and a full table refuses**, the one place a test
+/// registers.
+#[test]
+fn a_registered_reclaim_runs_and_a_full_table_refuses() {
+    static RAN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    fn reclaim() {
+        RAN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    let mut taken = 0;
+    while register_reclaim(reclaim) {
+        taken += 1;
+    }
+    assert_eq!(taken, 4, "every place, then refused");
+    exit::run_reclaims();
+    assert_eq!(RAN.load(core::sync::atomic::Ordering::Relaxed), 4);
+}

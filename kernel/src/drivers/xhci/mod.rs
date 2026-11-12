@@ -789,6 +789,9 @@ pub fn start() {
     if XHCI.get().is_none() {
         return;
     }
+    if !crate::sched::register_reclaim(hid::reclaim_completed) {
+        crate::kprintln!("usb: its input reads are reclaimed only as the next parks");
+    }
     if crate::sched::spawn(hub::main, 0).is_err() {
         crate::kprintln!("xhci: no memory for the hub thread; nothing will be enumerated");
     }

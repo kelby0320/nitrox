@@ -3,6 +3,8 @@
 use super::*;
 use crate::arch::percpu::cpu_local;
 use crate::libkern::IrqsOff;
+use crate::libkern::SpinLock;
+use crate::libkern::lockrank::LockRank;
 
 /// The action a supervisor's `sys_exception_resume` requests for a thread suspended on a
 /// fault. Only the two terminal dispositions exist; `ResumeSkip`/`ModifyAndResume` and the
@@ -292,6 +294,29 @@ pub(super) fn drain_pending_drops(g: &mut SchedState, buf: &mut [Option<ObjectRe
     n
 }
 
+/// **The drivers' reclaims** of what their DPCs gave back, run by [`reap_pending`]: each joins once,
+/// at its driver's start.
+static RECLAIMS: SpinLock<[Option<Reclaim>; 4]> = SpinLock::new(LockRank::Leaf, [None; 4]);
+
+/// A driver's reclaim.
+type Reclaim = fn();
+
+/// **Have [`reap_pending`] run `reclaim`**, in thread context; `false` if every place is taken.
+pub fn register_reclaim(reclaim: Reclaim) -> bool {
+    let mut r = RECLAIMS.lock();
+    let Some(slot) = r.iter_mut().find(|s| s.is_none()) else { return false };
+    *slot = Some(reclaim);
+    true
+}
+
+/// Run every registered reclaim, the table let go of first: a reclaim frees.
+pub(super) fn run_reclaims() {
+    let reclaims = *RECLAIMS.lock();
+    for reclaim in reclaims.into_iter().flatten() {
+        reclaim();
+    }
+}
+
 /// Drop every pending reaped thread and deferred-drop ref **outside** the run-queue lock, in
 /// thread context (a reaped thread's `KernelStack` `Drop` takes rank-6 allocator locks and
 /// starts a TLB shootdown). Idempotent; called by `yield_now`, `exit_thread`,
@@ -304,9 +329,7 @@ pub fn reap_pending() {
     // so the frees happen even with nothing else to reap.
     crate::io::block::reclaim_completed();
     // The char drivers park their completed reads for the same reason.
-    crate::drivers::console::reclaim_completed();
-    crate::drivers::ps2::reclaim_completed();
-    crate::drivers::xhci::hid::reclaim_completed();
+    run_reclaims();
     loop {
         // A batch a lock hold, on this stack; the loop goes round for the rest.
         let mut buf: [Option<ObjectRef>; 64] = [const { None }; 64];

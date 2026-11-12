@@ -79,6 +79,14 @@ IRP. An IRP carries none of its own: a completed IRP is linked onto one list,
 drained by one static DPC. This matters: per `kernel/CLAUDE.md`, allocation in
 IRQ/DPC context is forbidden.
 
+**What a DPC uses but must not drop is a `Handoff`** (`libkern/handoff.rs`): freeing counts as
+allocating, and a last reference dropped there reaches the slab's plain lock. Thread context
+parks a value (an input read, a finished PS/2 lights write); the DPC is lent it, uses it with no
+lock held and gives it back; thread context takes what is owed and drops it outside the lock, as
+the next read parks and from `sched::reap_pending`, which runs each driver's reclaim, registered
+once at its start. A park never writes over a value lent or owed, and a `Loan` dropped instead of
+given back fails a debug build. Block IRPs keep their own unbounded list (`io::block`).
+
 > **Reconciliation with Phase 1.** Phase 1 wakes `sys_wait`ers *directly* from
 > the timer-tick handler under the rank-1 scheduler lock (see the decision log,
 > 2026-06-08). The `phase-2/dpc` item builds the DPC queue described here and

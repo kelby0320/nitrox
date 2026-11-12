@@ -15,8 +15,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::ps2::Port;
 use crate::arch::timer::ArchTimer;
 use crate::dpc::Dpc;
-use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader, Submitted};
+use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, Reader, Submitted};
 use crate::libkern::IrqSpinLock;
+use crate::libkern::handoff::Handoff;
 use crate::libkern::input::InputEvent;
 use crate::libkern::lockrank::LockRank;
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
@@ -41,7 +42,8 @@ struct Inner {
     lights: Option<lights::Exchange>,
     lights_po: Option<Ref<PendingOperation>>,
     lights_next: Option<(Ref<PendingOperation>, u8)>,
-    lights_done: [Option<LightsDone>; 4],
+    /// Finished lights writes, which the DPC completes and thread context drops.
+    lights_done: Handoff<LightsDone, 4>,
     lights_unreported: Option<i32>,
     /// What the DPC logs about the exchange that ended, outside this lock (the serial port's lock
     /// ranks above it).
@@ -51,16 +53,6 @@ struct Inner {
 struct LightsDone {
     po: Ref<PendingOperation>,
     status: i32,
-    state: Completion,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum Completion {
-    Waiting,
-    /// The DPC took it and is completing it **outside this lock** — completing takes the
-    /// scheduler's, which ranks above it — so thread context must not drop it yet.
-    Completing,
-    Completed,
 }
 
 #[derive(Copy, Clone)]
@@ -78,7 +70,7 @@ impl Inner {
             lights: None,
             lights_po: None,
             lights_next: None,
-            lights_done: [const { None }; 4],
+            lights_done: Handoff::new(),
             lights_unreported: None,
             lights_say: None,
         }
@@ -130,11 +122,15 @@ impl Inner {
         true
     }
 
+    /// **Park the ended write's completion**, or, with every slot taken, leave it unreported for
+    /// the next reclaim.
     fn report_lights(&mut self) {
         let Some(status) = self.lights_unreported else { return };
-        let Some(slot) = self.lights_done.iter_mut().find(|d| d.is_none()) else { return };
-        if let Some(po) = self.lights_po.take() {
-            *slot = Some(LightsDone { po, status, state: Completion::Waiting });
+        if let Some(po) = self.lights_po.take()
+            && let Err(done) = self.lights_done.park(LightsDone { po, status })
+        {
+            self.lights_po = Some(done.po);
+            return;
         }
         self.lights_unreported = None;
     }
@@ -217,12 +213,7 @@ fn read(
         || {
             let now = crate::arch::Timer::read_ns();
             let mut g = ps2.lock();
-            let dev = &mut g.devices[index];
-            let found = dev.read_now(&mut tmp[..max_len], now);
-            if found == ReadNow::Empty {
-                dev.park(ParkedRead::new(po, buffer, buf_offset, max_len));
-            }
-            found
+            g.devices[index].read_now(&mut tmp[..max_len], now, || ParkedRead::new(po, buffer, buf_offset, max_len))
         },
     );
     match found {
@@ -246,44 +237,36 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
             PS2.lock().devices[index].owe(read);
         }
     }
-    // **Finished lights writes**: taken under the lock and completed outside it (completing takes
-    // the scheduler's lock, which ranks above this leaf); `Completing` keeps thread context from
-    // dropping them first.
-    let mut taken: [Option<(usize, *mut (), i32)>; 4] = [None; 4];
-    let say = {
-        let mut g = PS2.lock();
-        for (i, d) in g.lights_done.iter_mut().enumerate() {
-            if let Some(d) = d.as_mut().filter(|d| d.state == Completion::Waiting) {
-                d.state = Completion::Completing;
-                taken[i] = Some((i, d.po.as_object().as_ptr(), d.status));
-            }
-        }
-        g.lights_say.take()
-    };
-    for &(_, po, status) in taken.iter().flatten() {
-        // SAFETY: the slot holds the reference to the `PendingOperation` at `po`, `Completing` until
-        // thread context reclaims it after this.
-        let po = unsafe { &*po.cast::<crate::object::PendingOperation>() };
-        crate::sched::complete_pending_op(po, status, (status == 0) as u64);
-    }
-    if taken.iter().any(Option::is_some) {
-        let mut g = PS2.lock();
-        for &(i, _, _) in taken.iter().flatten() {
-            if let Some(d) = g.lights_done[i].as_mut() {
-                d.state = Completion::Completed;
-            }
-        }
-    }
-    match say {
+    match complete_lights(&PS2) {
         Some(Say::Acknowledged) => crate::kprintln!("ps2: keyboard lights acknowledged"),
         Some(Say::Refused(why)) => crate::kprintln!("ps2: the keyboard did not take its lights ({:?})", why),
         None => {}
     }
 }
 
+/// **Finished lights writes**: lent under the lock and completed outside it (completing takes the
+/// scheduler's lock, which ranks above this leaf), then given back for thread context to drop. What
+/// to say of the exchange that ended.
+fn complete_lights(ps2: &IrqSpinLock<Inner>) -> Option<Say> {
+    let (lent, say) = {
+        let mut g = ps2.lock();
+        (g.lights_done.lend_all(), g.lights_say.take())
+    };
+    for d in lent.iter().flatten() {
+        crate::sched::complete_pending_op(&d.po, d.status, (d.status == 0) as u64);
+    }
+    if lent.iter().any(Option::is_some) {
+        let mut g = ps2.lock();
+        for d in lent.into_iter().flatten() {
+            g.lights_done.give_back(d);
+        }
+    }
+    say
+}
+
 /// Drop any read the DPC has finished with, from `sched::reap_pending` and before a new read parks
 /// — **thread context only**, being the frees `ps2_intr_dpc` must not do.
-pub fn reclaim_completed() {
+fn reclaim_completed() {
     reclaim(&PS2);
 }
 
@@ -293,14 +276,9 @@ fn reclaim(ps2: &IrqSpinLock<Inner>) {
         let owed = ps2.lock().devices[index].take_owed();
         drop(owed);
     }
-    let mut done: [Option<LightsDone>; 4] = [const { None }; 4];
-    let started = {
+    let (done, started) = {
         let mut g = ps2.lock();
-        for (slot, out) in g.lights_done.iter_mut().zip(done.iter_mut()) {
-            if slot.as_ref().is_some_and(|d| d.state == Completion::Completed) {
-                *out = slot.take();
-            }
-        }
+        let done = g.lights_done.take_all();
         let waited = g.lights_unreported.is_some();
         g.report_lights();
         if waited
@@ -311,7 +289,7 @@ fn reclaim(ps2: &IrqSpinLock<Inner>) {
             let now = crate::arch::Timer::read_ns();
             g.lights_start(po, lights, now);
         }
-        waited
+        (done, waited)
     };
     drop(done);
     if started {
@@ -510,6 +488,9 @@ pub fn init() {
         PS2.lock().mouse.enable_wheel();
     }
 
+    if !crate::sched::register_reclaim(reclaim_completed) {
+        crate::kprintln!("ps2: its reads are reclaimed only as the next parks");
+    }
     for (index, present) in [(DEV_KEYBOARD, present.keyboard), (DEV_MOUSE, present.mouse)] {
         if !present {
             continue;
@@ -614,5 +595,44 @@ mod tests {
             Some(scancode::Decoded::Key { code: 72, pressed: true }),
             "with no exchange in flight the decoder sees the answer, and Up becomes keypad 8"
         );
+    }
+
+    fn lights_po() -> Ref<PendingOperation> {
+        crate::mm::test_support::init_global_heap();
+        Ref::new(PendingOperation::try_new().unwrap())
+    }
+
+    /// **A finished lights write is completed by the DPC and dropped only by the reclaim**, in
+    /// thread context.
+    #[test]
+    fn a_finished_lights_write_is_completed_then_reclaimed() {
+        let ps2 = IrqSpinLock::new(LockRank::Leaf, Inner::new());
+        let po = lights_po();
+        {
+            let mut g = ps2.lock();
+            g.lights_po = Some(po.clone());
+            g.lights_unreported = Some(0);
+            g.report_lights();
+        }
+        assert!(complete_lights(&ps2).is_none());
+        assert_eq!(crate::sched::pending_op_completion(&po), (0, 1));
+        let [owed, ..] = ps2.lock().lights_done.take_all();
+        assert!(owed.is_some_and(|d| core::ptr::eq(d.po.as_ptr(), po.as_ptr())), "given back, for the reclaim");
+    }
+
+    /// **A write ended while every completion slot is taken waits**, kept, for the next reclaim.
+    #[test]
+    fn a_lights_write_ended_with_every_slot_taken_waits() {
+        let ps2 = IrqSpinLock::new(LockRank::Leaf, Inner::new());
+        let mut g = ps2.lock();
+        for _ in 0..4 {
+            assert!(g.lights_done.park(LightsDone { po: lights_po(), status: 0 }).is_ok());
+        }
+        let po = lights_po();
+        g.lights_po = Some(po.clone());
+        g.lights_unreported = Some(0);
+        g.report_lights();
+        assert!(g.lights_po.as_ref().is_some_and(|p| core::ptr::eq(p.as_ptr(), po.as_ptr())), "kept");
+        assert_eq!(g.lights_unreported, Some(0), "for the next reclaim");
     }
 }

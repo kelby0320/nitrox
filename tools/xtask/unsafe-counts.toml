@@ -8,7 +8,7 @@
 "kernel/src/boot_selftest" = 6
 "kernel/src/clock" = 1
 "kernel/src/dpc" = 4
-"kernel/src/drivers" = 20
+"kernel/src/drivers" = 19
 "kernel/src/fbcon" = 4
 "kernel/src/handle" = 30
 "kernel/src/initramfs" = 1
