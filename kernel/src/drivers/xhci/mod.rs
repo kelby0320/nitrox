@@ -427,12 +427,7 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     };
     let cmd_ring = Producer::new(&mut RingMem::of(&cmd_mem), cmd_mem.phys().as_u64());
     // The event ring's one segment: its base and size, in the table the controller reads.
-    let e = erst.virt() as *mut u64;
-    // SAFETY: `erst` is a page, which holds one 16-byte segment-table entry.
-    unsafe {
-        core::ptr::write_volatile(e, ev_mem.phys().as_u64());
-        core::ptr::write_volatile(e.add(1), RING_TRBS as u64);
-    }
+    erst.write(0, [ev_mem.phys().as_u64(), RING_TRBS as u64]);
 
     write32(op, CONFIG, max_slots as u32);
     write64(op, DCBAAP, dcbaa.phys().as_u64());
@@ -563,15 +558,13 @@ fn scratchpads_for(count: u32, dcbaa: &DmaBuffer) -> Option<Scratchpads> {
     let array = Programmed::new(DmaBuffer::alloc(count as usize * 8).ok()?);
     let mut pages: KVec<Programmed> = KVec::new();
     pages.try_reserve(count as usize).ok()?;
-    let a = array.virt() as *mut u64;
     for i in 0..count as usize {
         let page = Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?);
-        // SAFETY: `array` holds `count` entries.
-        unsafe { core::ptr::write_volatile(a.add(i), page.phys().as_u64()) };
+        array.write(i * 8, page.phys().as_u64());
         pages.try_push(page).ok()?;
     }
-    // SAFETY: `dcbaa` holds at least one entry; slot 0 is the scratchpad array's.
-    unsafe { core::ptr::write_volatile(dcbaa.virt() as *mut u64, array.phys().as_u64()) };
+    // Slot 0 of the device context base array is the scratchpad array's.
+    dcbaa.write(0, array.phys().as_u64());
     Some(Scratchpads { array: Some(array), pages })
 }
 

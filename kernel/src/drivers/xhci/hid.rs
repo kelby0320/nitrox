@@ -24,10 +24,10 @@ use super::{RING_TRBS, Xhci, write32};
 use crate::arch::timer::ArchTimer;
 use crate::drivers::hid::{keyboard, mouse};
 use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader, Submitted};
-use crate::libkern::IrqSpinLock;
 use crate::libkern::device::DeviceKind;
 use crate::libkern::input::{EV_KEY, InputEvent, KEY_PRESS};
 use crate::libkern::lockrank::LockRank;
+use crate::libkern::{IrqSpinLock, KVec};
 use crate::mm::dma::{DmaBuffer, Programmed};
 use crate::object::device_node::{CharBackend, DeviceNode, ResourceDescriptor};
 use crate::object::header::Ref;
@@ -79,9 +79,8 @@ impl Layout {
     }
 }
 
-/// **An endpoint the DPC polls.** Its ring and report buffer are the device's memory, which the hub
-/// thread holds; this keeps where they are. [`depart`] takes the entry out before that memory can
-/// go.
+/// **An endpoint the DPC polls.** Its ring and report buffer are the device's memory, which it owns
+/// while bound; [`depart`] takes the entry out and hands them back, freed once the slot is disabled.
 pub(super) struct Bound {
     slot: u8,
     dci: u8,
@@ -90,10 +89,8 @@ pub(super) struct Bound {
     epoch: u32,
     decoder: Decoder,
     ring: Producer,
-    ring_mem: RingMem<'static>,
-    ring_phys: u64,
-    buf_phys: u64,
-    buf_virt: u64,
+    ring_mem: Programmed,
+    buf: Programmed,
     len: u16,
     halted: bool,
     /// Times it has halted, counted when the DPC sees each: the third leaves it stopped.
@@ -172,11 +169,8 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
             crate::kprintln!("usb: port {port}: no memory for its endpoints; not bound");
             return None;
         };
-        // SAFETY: `ring` goes into the device's memory, freed only once its slot is disabled and
-        // its endpoints are out of the table, after which nothing uses it.
-        let mut ring_mem = unsafe { RingMem::kept(&ring) };
         let ring_phys = ring.phys().as_u64();
-        let producer = Producer::new(&mut ring_mem, ring_phys);
+        let producer = Producer::new(&mut RingMem::of(&ring), ring_phys);
         eps[i] = context::Interrupt {
             dci: c.endpoint.dci(),
             max_packet: c.endpoint.max_packet,
@@ -185,14 +179,7 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
             ring: ring_phys,
             cycle: producer.cycle(),
         };
-        prepared[i] = Some(Prepared {
-            c,
-            producer,
-            ring_mem,
-            ring_phys,
-            buf_phys: buf.phys().as_u64(),
-            buf_virt: buf.virt() as u64,
-        });
+        prepared[i] = Some(Prepared { c, producer, at: [ring_phys, buf.phys().as_u64()] });
         // **The device's memory**: freed with it, and only after its slot is disabled.
         if mem.class.try_reserve(2).is_err() {
             crate::kprintln!("usb: port {port}: no memory for its endpoints; not bound");
@@ -287,6 +274,10 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
             crate::kprintln!("usb: port {port}: no input node for its {what}; not bound");
             continue;
         };
+        let Some([ring_mem, buf]) = mem.claim(p.at) else {
+            crate::kprintln!("usb: port {port}: its {what}'s memory is not the device's; not bound");
+            continue;
+        };
         let bound = Bound {
             slot,
             dci: c.endpoint.dci(),
@@ -295,16 +286,15 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
             epoch,
             decoder,
             ring: p.producer,
-            ring_mem: p.ring_mem,
-            ring_phys: p.ring_phys,
-            buf_phys: p.buf_phys,
-            buf_virt: p.buf_virt,
+            ring_mem,
+            buf,
             len: c.endpoint.max_packet.max(layout.map_or(0, |l| l.report_bytes())).min(REPORT_MAX as u16),
             halted: false,
             halts: 0,
             lights_dead: no_lights,
         };
-        if !start(x, bound) {
+        if let Err(back) = start(x, bound) {
+            mem.keep(back);
             crate::kprintln!("usb: port {port}: no room to poll its {what}; not bound");
             continue;
         }
@@ -427,8 +417,10 @@ fn report_layout(x: &Xhci, slot: u8, mem: &mut DeviceMem, c: &Candidate) -> Resu
     }
     let mut tries = Tries::default();
     let mut last = None;
+    let mut bytes =
+        KVec::try_filled(0u8, (c.report_len as usize).min(crate::mm::PAGE_SIZE)).map_err(|_| Failed::NoMemory)?;
     for n in 1..=DESCRIPTOR_TRIES {
-        match hub::read_interface_descriptor(x, slot, mem, super::desc::kind::REPORT, c.interface, c.report_len) {
+        match hub::read_interface_descriptor(x, slot, mem, super::desc::kind::REPORT, c.interface, &mut bytes) {
             Ok(desc) if desc.len() >= c.report_len as usize => {
                 let desc = &desc[..c.report_len as usize];
                 let layout = match c.is_keyboard {
@@ -474,10 +466,8 @@ fn report_bytes(layout: &mouse::Layout) -> u16 {
 struct Prepared {
     c: Candidate,
     producer: Producer,
-    ring_mem: RingMem<'static>,
-    ring_phys: u64,
-    buf_phys: u64,
-    buf_virt: u64,
+    /// Where its ring and report buffer are, in the device's memory.
+    at: [u64; 2],
 }
 
 /// The longest report read: a TRB asks for the endpoint's maximum packet, up to this.
@@ -513,19 +503,19 @@ fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32, u32)> {
     Some((index, epoch, served?))
 }
 
-/// Put `bound` in the table and queue its first TRB. Whether there was room.
-fn start(x: &Xhci, mut bound: Bound) -> bool {
+/// Put `bound` in the table and queue its first TRB; its memory back when there was no room.
+fn start(x: &Xhci, mut bound: Bound) -> Result<(), [Programmed; 2]> {
     let mut t = x.hid.lock();
     let Some(free) = t.entries.iter_mut().find(|e| e.is_none()) else {
-        return false;
+        return Err([bound.ring_mem, bound.buf]);
     };
     queue(x, &mut bound);
     *free = Some(bound);
-    true
+    Ok(())
 }
 
 fn queue(x: &Xhci, b: &mut Bound) {
-    b.ring.push(&mut b.ring_mem, Trb::normal(b.buf_phys, b.len as u32));
+    b.ring.push(&mut RingMem::of(&b.ring_mem), Trb::normal(b.buf.phys().as_u64(), b.len as u32));
     write32(x.db, 4 * b.slot as u64, b.dci as u32);
 }
 
@@ -545,11 +535,7 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
         match trb.completion_code() {
             code::SUCCESS | code::SHORT_PACKET => {
                 got = ((b.len as u32).saturating_sub(trb.residual()) as usize).min(report.len());
-                for (i, r) in report[..got].iter_mut().enumerate() {
-                    // SAFETY: the report buffer is a page the controller finished writing with this
-                    // event, and `got` is at most what this TRB asked for.
-                    *r = unsafe { core::ptr::read_volatile((b.buf_virt as *const u8).add(i)) };
-                }
+                b.buf.copy_out(0, &mut report[..got]);
                 queue(x, b);
                 Some((b.node, b.epoch))
             }
@@ -661,7 +647,8 @@ pub(super) fn recover(x: &Xhci) {
                 Some(b) if b.halted => {
                     // Taken: the DPC will not see it halt again, since nothing is queued on it.
                     b.halted = false;
-                    Some((b.slot, b.dci, b.halts, b.ring_phys + b.ring.next_slot() as u64 * 16, b.ring.cycle()))
+                    let at = b.ring_mem.phys().as_u64() + b.ring.next_slot() as u64 * 16;
+                    Some((b.slot, b.dci, b.halts, at, b.ring.cycle()))
                 }
                 _ => None,
             }
@@ -702,10 +689,15 @@ pub(super) fn recover(x: &Xhci) {
 ///    read is refused, `PeerClosed`; a lights write still waiting is completed `PeerClosed`.
 ///
 /// From the hub thread. The records depart after this, as one change.
-pub(super) fn depart(x: &Xhci, slot: u8) {
+/// Their memory is handed back, to go with the slot's.
+pub(super) fn depart(x: &Xhci, slot: u8) -> impl Iterator<Item = Programmed> {
+    depart_from(x, &NODES, slot)
+}
+
+fn depart_from(x: &Xhci, nodes: &Nodes, slot: u8) -> impl Iterator<Item = Programmed> {
     let now = crate::arch::Timer::read_ns();
     // `bind` binds at most four interfaces a device.
-    let mut gone: [Option<(usize, Decoder)>; 4] = [const { None }; 4];
+    let mut gone: [Option<Bound>; 4] = [const { None }; 4];
     {
         let mut t = x.hid.lock();
         let mut k = 0;
@@ -714,14 +706,17 @@ pub(super) fn depart(x: &Xhci, slot: u8) {
                 continue;
             };
             if let Some(g) = gone.get_mut(k) {
-                *g = Some((b.node, b.decoder));
+                *g = Some(b);
                 k += 1;
             }
         }
     }
-    for (node, decoder) in gone.into_iter().flatten() {
-        let_go(&NODES, node, decoder, now);
+    let mut mem: [Option<[Programmed; 2]>; 4] = [const { None }; 4];
+    for (Bound { node, decoder, ring_mem, buf, .. }, m) in gone.into_iter().flatten().zip(mem.iter_mut()) {
+        let_go(nodes, node, decoder, now);
+        *m = Some([ring_mem, buf]);
     }
+    mem.into_iter().flatten().flatten()
 }
 
 /// **Node `node`'s device has gone**: what `decoder` holds released and the node retired, in one

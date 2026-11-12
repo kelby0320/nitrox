@@ -195,32 +195,31 @@ enum HubResult {
     Fault(Fault),
 }
 
-/// A bulk endpoint's ring: written by the DPC and by `submit`, which hold where its memory is, the
-/// hub thread holding the memory while the device is in the table.
+/// A bulk endpoint's ring: written by the DPC and by `submit`, under the device's lock.
 #[derive(Debug)]
 struct Ring {
     producer: Producer,
-    mem: RingMem<'static>,
-    phys: u64,
+    mem: Programmed,
 }
 
 impl Ring {
     /// **Push a transfer descriptor of `trbs` TRBs**, padding with No Ops first if it would
     /// straddle the Link. The address of each TRB pushed is handed to `each`.
     fn push_td(&mut self, trbs: &[Trb], mut each: impl FnMut(usize, u64)) {
+        let mut slots = RingMem::of(&self.mem);
         if self.producer.room_before_link(RING_TRBS) < trbs.len() {
             while self.producer.room_before_link(RING_TRBS) != RING_TRBS - 1 {
-                self.producer.push(&mut self.mem, Trb::no_op());
+                self.producer.push(&mut slots, Trb::no_op());
             }
         }
         for (k, t) in trbs.iter().enumerate() {
-            let at = self.producer.push(&mut self.mem, *t);
-            each(k, self.phys + at as u64 * 16);
+            let at = self.producer.push(&mut slots, *t);
+            each(k, self.mem.phys().as_u64() + at as u64 * 16);
         }
     }
 
     fn next(&self) -> (u64, bool) {
-        (self.phys + self.producer.next_slot() as u64 * 16, self.producer.cycle())
+        (self.mem.phys().as_u64() + self.producer.next_slot() as u64 * 16, self.producer.cycle())
     }
 }
 
@@ -237,7 +236,7 @@ struct Lun {
 }
 
 /// **A bound storage device.** Its rings, wrapper page and binding buffer are the device's memory,
-/// which the hub thread holds and frees after its slot is disabled; this keeps where they are.
+/// which it owns while bound and its departure hands back, freed once its slot is disabled.
 #[derive(Debug)]
 pub(super) struct Dev {
     slot: u8,
@@ -251,11 +250,9 @@ pub(super) struct Dev {
     bulk_in: Ring,
     bulk_out: Ring,
     /// The wrapper page: the command wrapper at 0, the status wrapper at [`CSW_AT`].
-    wrap_virt: u64,
-    wrap_phys: u64,
+    wrap: Programmed,
     /// The binding's data buffer, [`BIND_DATA`] bytes: what the hub thread's commands read into.
-    data_virt: u64,
-    data_phys: u64,
+    data: Programmed,
     db: u64,
     tag: u32,
     luns: [Lun; MAX_LUNS],
@@ -441,19 +438,13 @@ impl Dev {
     #[allow(clippy::too_many_arguments, reason = "a command's owner, unit, CDB, length, direction and buffer")]
     fn issue(&mut self, owner: Owner, lun: u8, cdb: &[u8], len: u32, input: bool, frags: &[PhysFrag], now: u64) {
         self.tag = self.tag.wrapping_add(1);
-        let w = cbw(self.tag, len, input, lun, cdb);
-        for (i, b) in w.iter().enumerate() {
-            // SAFETY: the wrapper page holds a command wrapper at 0 and a status wrapper at CSW_AT,
-            // and no transfer is using it: one command runs at a time.
-            unsafe { core::ptr::write_volatile((self.wrap_virt as *mut u8).add(i), *b) };
-        }
-        for i in 0..CSW_LEN {
-            // SAFETY: as above; a stale status must not read as this command's.
-            unsafe { core::ptr::write_volatile((self.wrap_virt as *mut u8).add(CSW_AT as usize + i), 0) };
-        }
+        self.wrap.copy_in(0, &cbw(self.tag, len, input, lun, cdb));
+        // A stale status must not read as this command's.
+        self.wrap.fill(CSW_AT as usize, CSW_LEN, 0);
         let frags = &frags[..frags.len().min(MAX_FRAGS as usize)];
         let no_data = frags.is_empty();
-        self.bulk_out.push_td(&[Trb::bulk(self.wrap_phys, CBW_LEN as u32, false, no_data, false, 0)], |_, _| {});
+        let wrap = self.wrap.phys().as_u64();
+        self.bulk_out.push_td(&[Trb::bulk(wrap, CBW_LEN as u32, false, no_data, false, 0)], |_, _| {});
         let mps = if input { self.in_mps } else { self.out_mps };
         let total: u64 = frags.iter().map(|f| f.len).sum();
         let mut data = [Trb::default(); MAX_FRAGS as usize];
@@ -484,7 +475,7 @@ impl Dev {
     /// **Ask for the status wrapper**, the command's data stage over: on bulk IN, interrupting.
     fn ask_status(&mut self, short: bool) {
         let mut csw_trb = 0;
-        let trb = Trb::bulk(self.wrap_phys + CSW_AT, CSW_LEN as u32, false, true, true, 0);
+        let trb = Trb::bulk(self.wrap.phys().as_u64() + CSW_AT, CSW_LEN as u32, false, true, true, 0);
         self.bulk_in.push_td(&[trb], |_, at| csw_trb = at);
         if let Some(c) = self.inflight.as_mut() {
             c.stage = Stage::Status { csw_trb, short };
@@ -500,12 +491,12 @@ impl Dev {
 
     fn read_csw(&self) -> [u8; CSW_LEN] {
         let mut b = [0u8; CSW_LEN];
-        for (i, v) in b.iter_mut().enumerate() {
-            // SAFETY: the wrapper page, which the controller finished writing with the event that
-            // brought this here.
-            *v = unsafe { core::ptr::read_volatile((self.wrap_virt as *const u8).add(CSW_AT as usize + i)) };
-        }
+        self.wrap.copy_out(CSW_AT as usize, &mut b);
         b
+    }
+
+    fn into_mem(self) -> [Programmed; 4] {
+        [self.bulk_in.mem, self.bulk_out.mem, self.wrap, self.data]
     }
 
     fn ejected(&self, lun: u8) -> bool {
@@ -543,13 +534,14 @@ impl Dev {
 impl Disks {
     /// **Device `i` has gone**: out of the table, its slot retired. What it held, to be completed
     /// `PeerClosed` by the caller: its queue at once, and — once the slot is disabled — the command in
-    /// flight and one a failed recovery stranded.
-    fn depart(&self, i: usize) -> ([Option<*mut Irp>; QUEUE], [Option<*mut Irp>; 3]) {
+    /// flight and one a failed recovery stranded; and its memory, freed then too.
+    #[allow(clippy::type_complexity, reason = "what a departure hands back, each for its own time")]
+    fn depart(&self, i: usize) -> ([Option<*mut Irp>; QUEUE], [Option<*mut Irp>; 3], Option<[Programmed; 4]>) {
         let dev = self.devs[i].lock().take();
         self.states[i].store(RETIRED, Ordering::Release);
         let mut queued = [None; QUEUE];
         let Some(mut dev) = dev else {
-            return (queued, [None; 3]);
+            return (queued, [None; 3], None);
         };
         for q in queued.iter_mut() {
             *q = dev.queue.pop().map(|c| c.irp);
@@ -558,7 +550,8 @@ impl Disks {
             Some(Owner::Irp { cmd, .. }) => Some(cmd.irp),
             _ => None,
         };
-        (queued, [inflight, dev.stranded.take(), dev.rescan.take().map(|(irp, _)| irp)])
+        let held = [inflight, dev.stranded.take(), dev.rescan.take().map(|(irp, _)| irp)];
+        (queued, held, Some(dev.into_mem()))
     }
 
     fn slot_of(&self, slot: u8) -> Option<usize> {
@@ -579,16 +572,20 @@ impl Disks {
     }
 
     /// **Take a slot for `dev`**: a free one, else a retired one under a new epoch. The slot and its
-    /// epoch, or `None` when all are bound. From the hub thread.
-    fn take(&self, dev: Dev) -> Option<(usize, u32)> {
+    /// epoch, or `dev`'s memory back when all are bound. From the hub thread.
+    #[allow(clippy::result_large_err, reason = "four buffers, handed back once, on a refusal")]
+    fn take(&self, dev: Dev) -> Result<(usize, u32), [Programmed; 4]> {
         let states: [u8; MAX_DEVICES] = core::array::from_fn(|i| self.states[i].load(Ordering::Acquire));
-        let i = states.iter().position(|&s| s == FREE).or_else(|| states.iter().position(|&s| s == RETIRED))?;
+        let Some(i) = states.iter().position(|&s| s == FREE).or_else(|| states.iter().position(|&s| s == RETIRED))
+        else {
+            return Err(dev.into_mem());
+        };
         if states[i] == RETIRED {
             self.epochs[i].fetch_add(1, Ordering::AcqRel);
         }
         *self.devs[i].lock() = Some(dev);
         self.states[i].store(BOUND, Ordering::Release);
-        Some((i, self.epochs[i].load(Ordering::Acquire)))
+        Ok((i, self.epochs[i].load(Ordering::Acquire)))
     }
 
     /// **A block IRP submitted on any CPU**: started if nothing is in flight, else queued; refused

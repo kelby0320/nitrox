@@ -13,7 +13,6 @@
 //! Where the TRBs live is [`Slots`]': device memory, [`RingMem`], in the kernel, a `Vec` in a test.
 //! Everything else here is the arithmetic, so the host tests are tests of it.
 
-use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, fence};
 
 use crate::mm::dma::DmaBuffer;
@@ -247,25 +246,13 @@ pub trait Slots {
 /// **A ring's TRBs in device memory**: every ring's, the controller's and each device's, for as
 /// long as `'a` holds the buffer.
 #[derive(Copy, Clone, Debug)]
-pub struct RingMem<'a>(u64, PhantomData<&'a DmaBuffer>);
+pub struct RingMem<'a>(&'a DmaBuffer);
 
 impl<'a> RingMem<'a> {
     /// The ring in `buffer`, which holds a ring's TRBs.
     pub fn of(buffer: &'a DmaBuffer) -> RingMem<'a> {
         assert!(buffer.len() >= super::RING_TRBS * 16, "a ring's buffer holds its TRBs");
-        RingMem(buffer.virt() as u64, PhantomData)
-    }
-}
-
-impl RingMem<'static> {
-    /// The ring in `buffer`, held by its address where no borrow can be: an endpoint's, which the
-    /// DPC writes while the hub thread owns the buffer.
-    ///
-    /// # Safety
-    /// `buffer` is not freed while the ring is used.
-    pub unsafe fn kept(buffer: &DmaBuffer) -> RingMem<'static> {
-        let RingMem(at, _) = RingMem::of(buffer);
-        RingMem(at, PhantomData)
+        RingMem(buffer)
     }
 }
 
@@ -275,16 +262,11 @@ impl Slots for RingMem<'_> {
     }
 
     fn read(&self, i: usize) -> Trb {
-        let p = self.0 as *const u32;
-        // SAFETY: `i < RING_TRBS`, as `Producer` and `Consumer` index, and the buffer holds that
-        // many TRBs of four dwords while its owner keeps it.
-        read_trb(|n| unsafe { core::ptr::read_volatile(p.add(i * 4 + n)) })
+        read_trb(|n| self.0.read(i * 16 + n * 4))
     }
 
     fn write(&mut self, i: usize, trb: Trb) {
-        let p = self.0 as *mut u32;
-        // SAFETY: as `read`.
-        write_trb(trb, |n, dw| unsafe { core::ptr::write_volatile(p.add(i * 4 + n), dw) });
+        write_trb(trb, |n, dw| self.0.write(i * 16 + n * 4, dw));
     }
 }
 

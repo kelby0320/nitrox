@@ -14,43 +14,45 @@ pub(in crate::drivers::xhci) fn recover_ep0(x: &Xhci, slot: u8, mem: &DeviceMem)
 
 /// **A GET_DESCRIPTOR** of `kind`, index `index`, in language `lang`, up to `len` bytes, on the
 /// default endpoint. The bytes, as many as asked: a device that sent fewer left the rest zero.
-pub(super) fn read_descriptor<'m>(
+#[allow(clippy::too_many_arguments, reason = "the request's fields, and where its answer goes")]
+pub(super) fn read_descriptor<'o>(
     x: &Xhci,
     slot: u8,
-    mem: &'m mut DeviceMem,
+    mem: &mut DeviceMem,
     kind: u8,
     index: u8,
     lang: u16,
     len: u16,
-) -> Result<&'m [u8], Failed> {
+    out: &'o mut [u8],
+) -> Result<&'o [u8], Failed> {
     control_in(x, slot, mem, get_descriptor(kind, index, lang, len), len)?;
-    Ok(data_bytes(mem, len))
+    Ok(data_bytes(mem, len, out))
 }
 
-/// **A GET_DESCRIPTOR to interface `iface`**: a HID report descriptor, up to `len` bytes and a
+/// **A GET_DESCRIPTOR to interface `iface`**: a HID report descriptor, up to `out`'s length and a
 /// page. **The bytes that arrived**, fewer than asked for when the device sent less.
-pub(in crate::drivers::xhci) fn read_interface_descriptor<'m>(
+pub(in crate::drivers::xhci) fn read_interface_descriptor<'o>(
     x: &Xhci,
     slot: u8,
-    mem: &'m mut DeviceMem,
+    mem: &mut DeviceMem,
     kind: u8,
     iface: u8,
-    len: u16,
-) -> Result<&'m [u8], Failed> {
-    let len = len.min(crate::mm::PAGE_SIZE as u16);
+    out: &'o mut [u8],
+) -> Result<&'o [u8], Failed> {
+    let len = out.len().min(crate::mm::PAGE_SIZE) as u16;
     let got = control_in(x, slot, mem, [0x81, 6, 0, kind, iface, 0, len as u8, (len >> 8) as u8], len)?;
-    Ok(data_bytes(mem, got))
+    Ok(data_bytes(mem, got, out))
 }
 
 pub(super) fn get_descriptor(kind: u8, index: u8, lang: u16, len: u16) -> [u8; 8] {
     [0x80, 6, index, kind, lang as u8, (lang >> 8) as u8, len as u8, (len >> 8) as u8]
 }
 
-/// The first `len` bytes of the device's data page, and no more than it holds.
-pub(super) fn data_bytes(mem: &DeviceMem, len: u16) -> &[u8] {
-    let len = (len as usize).min(mem.data.len());
-    // SAFETY: `data` holds `len` bytes, and the transfer that wrote them is done.
-    unsafe { core::slice::from_raw_parts(mem.data.virt() as *const u8, len) }
+/// The first `len` bytes of the device's data page, and no more than it holds or `out` takes.
+pub(super) fn data_bytes<'o>(mem: &DeviceMem, len: u16, out: &'o mut [u8]) -> &'o [u8] {
+    let len = (len as usize).min(mem.data.len()).min(out.len());
+    mem.data.copy_out(0, &mut out[..len]);
+    &out[..len]
 }
 
 /// **A control transfer reading `len` bytes** into the device's data page: Setup, Data, Status,
@@ -92,11 +94,11 @@ pub(super) fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 
 /// **The data page cleared for a read of `len` bytes**, cut to the page: the length to ask for.
 pub(super) fn clear_for(mem: &mut DeviceMem, len: u16) -> u16 {
     let len = len.min(mem.data.len() as u16);
-    // SAFETY: `data` is a page the controller writes only during a transfer, and none is running on
+    // `data` is a page the controller writes only during a transfer, and none is running on
     // this endpoint: every failure that can leave one live — a timeout, any error but a stall —
     // leaves it in doubt, and nothing more is asked of it; a stall's remains are skipped by
     // `recover_ep0` before another starts.
-    unsafe { core::ptr::write_bytes(mem.data.virt(), 0, len as usize) };
+    mem.data.fill(0, len as usize, 0);
     len
 }
 
@@ -108,7 +110,7 @@ pub(in crate::drivers::xhci) fn control_in_byte(
     request: [u8; 8],
 ) -> Result<u8, Failed> {
     control_in(x, slot, mem, request, 1)?;
-    Ok(data_bytes(mem, 1)[0])
+    Ok(mem.data.read(0))
 }
 
 /// **A control transfer with no data stage**: Setup, then an IN Status stage, waited for.
@@ -155,9 +157,9 @@ pub(in crate::drivers::xhci) fn control_out_data(
         return Err(IN_DOUBT);
     }
     let len = data.len().min(crate::mm::PAGE_SIZE);
-    // SAFETY: `data` is a page no transfer is using: the default endpoint runs one at a time, and
+    // `data` is a page no transfer is using: the default endpoint runs one at a time, and
     // every failure that could leave one live leaves it in doubt, asked nothing more.
-    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), mem.data.virt(), len) };
+    mem.data.copy_in(0, &data[..len]);
     let base = mem.ep0.phys().as_u64();
     let po = new_operation()?;
     let status_at = {

@@ -155,6 +155,11 @@ a device's contexts and rings until its slot is disabled — QEMU's *Disable Slo
 default endpoint's output context — so a failed enumeration and a departure both disable first. A
 slot that does not disable, or that a wedged controller cannot be asked about, **keeps its memory
 for good**: a few pages leaked is the price of not handing the controller memory it may yet write.
+**A bound class owns its memory**: a storage device's rings, wrapper page and binding buffer, and
+each keyboard's or mouse's ring and report buffer, are its table entry's while it is bound, so the
+DPC reaches them through the entry it holds, never a kept address; its departure hands them back,
+freed with the slot's memory or kept with it. Until a class binds, and after a bind that fails,
+they are the device's memory, with its contexts.
 **And its storage commands with it**: the one in flight and one a failed recovery stranded are
 never completed, since completing one hands its buffer back while the controller may still move its
 data; only a rescan, which moves none, completes. What waits on a kept command waits for good, as
@@ -321,8 +326,8 @@ every keyboard's ring when it ends.
    keys then its modifiers, in batches when it held more than one batch's (B.7); a mouse's held buttons from its decoder's state, which
    works whatever its report ID. QEMU sends nothing for a key held when its device goes, so this is
    the only release there is;
-2. **its endpoints leave the DPC's table**, so the DPC cannot touch a report buffer the release is
-   about to free;
+2. **its endpoints leave the DPC's table**, with the rings and report buffers they own, so the DPC
+   cannot touch one the release is about to free;
 3. **each node retires**: a read waiting is answered with the releases, or completed `PeerClosed`
    if there were none; after them a read is refused at submission, `PeerClosed`; a lights write
    still waiting is completed `PeerClosed`. **A report the DPC decoded before step 2 and pushes
@@ -331,7 +336,8 @@ every keyboard's ring when it ends.
    releases must stay last. The reader may then see a key let go that it never saw pressed, which
    is harmless where a key down after them would be held for good;
 4. **its records depart** — the device and its keyboards and mice, as one generation;
-5. **its slot is disabled**, and only then its memory freed: rings and buffers are the device's.
+5. **its slot is disabled**, and only then its memory freed: rings and buffers are the device's,
+   its classes' with them.
 
 **A keyboard's lights** (B.5) are a write to its node — one byte, in HID's order
 ([`io-operation.md`](../spec/io-operation.md) § Keyboard lights) — which the node's `submit_write`
@@ -572,8 +578,9 @@ supervises.
   - the wheel not negated;
   - the descriptor ignored.
 - **`drivers::xhci::storage`** (Part D) — host tests on the wrappers and the SCSI commands' bytes
-  and answers; an IRP fitting its unit; and **the fast path driven through `Disks`**, with heap
-  memory standing in for the rings, the wrapper page and the doorbell array: a read's TRBs, its
+  and answers; an IRP fitting its unit; and **the fast path driven through `Disks`**, each device
+  with rings, a wrapper page and a binding buffer of its own and heap memory standing in for the
+  doorbell array: a read's TRBs, its
   status asked for at its data stage's end (short, there) and its completion; the next IRP started;
   a failed status and a stall left for the hub thread, and a submit meanwhile queued; and a slot
   departed and taken again, its old node refused `PeerClosed` and its new one served. Since PR

@@ -125,6 +125,28 @@ impl DeviceMem {
         self.class.iter_mut().for_each(|b| b.release(stopped));
     }
 
+    /// **The buffers at `at`, out of the device's memory**, all or none: a class's, for the table
+    /// entry that owns them while it is bound.
+    pub(super) fn claim<const N: usize>(&mut self, at: [u64; N]) -> Option<[Programmed; N]> {
+        let mut taken: [Option<Programmed>; N] = [const { None }; N];
+        for (k, &a) in at.iter().enumerate() {
+            let Some(i) = self.class.iter().position(|b| b.phys().as_u64() == a) else {
+                self.keep(taken.into_iter().flatten());
+                return None;
+            };
+            taken[k] = Some(self.class.remove(i));
+        }
+        Some(taken.map(|b| b.expect("each found above")))
+    }
+
+    /// **Buffers a class gives back unbound**: the device's memory again, freed with the rest. One
+    /// no room is left for is leaked.
+    pub(super) fn keep(&mut self, buffers: impl IntoIterator<Item = Programmed>) {
+        for b in buffers {
+            let _ = self.class.push_within_capacity(b);
+        }
+    }
+
     /// **What a control transfer came to**, its endpoint left in doubt by any failure but a stall,
     /// which is the request's answer.
     fn settled<T>(&mut self, answer: Result<T, Failed>) -> Result<T, Failed> {
@@ -269,7 +291,7 @@ fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     // **Its keyboards and mice let go first**: what they held released, their
     // endpoints out of the DPC's table — so nothing touches a report buffer the release below is
     // about to free — and their nodes retired.
-    super::hid::depart(x, dev.slot);
+    let hid = super::hid::depart(x, dev.slot);
     // **And its storage**: out of the DPC's table, its queue completed
     // `PeerClosed`. The command in flight waits until the slot is disabled: until then the
     // controller may still move its data.
@@ -281,18 +303,31 @@ fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     }
     let released = release(x, dev.slot, dev._mem);
     match released {
-        Released::Freed => crate::kprintln!("usb: port {port}: disconnected; slot {} disabled", dev.slot),
+        Released::Freed(_) => crate::kprintln!("usb: port {port}: disconnected; slot {} disabled", dev.slot),
         Released::Kept(why) => {
             crate::kprintln!("usb: port {port}: disconnected; slot {} kept: {why}", dev.slot)
         }
     }
+    released.settle(hid);
     super::storage::finish(storage, &released);
 }
 
 pub(super) enum Released {
-    Freed,
+    /// Its slot disabled: the proof the controller is done with all of its memory.
+    Freed(Quiesced),
     /// Its memory was kept, **deliberately leaked**, because the controller may still own it.
     Kept(&'static str),
+}
+
+impl Released {
+    /// **Free a departed class's `buffers` with the slot's memory**, or leak them with it.
+    pub(super) fn settle(&self, buffers: impl IntoIterator<Item = Programmed>) {
+        for mut b in buffers {
+            if let Released::Freed(stopped) = self {
+                b.release(stopped);
+            }
+        }
+    }
 }
 
 /// **Disable `slot`, then free its memory — in that order, and only then.** The controller reads
@@ -310,8 +345,9 @@ fn release(x: &Xhci, slot: u8, mut mem: DeviceMem) -> Released {
     }
     set_slot_context(x, slot, 0);
     // SAFETY: Disable Slot completed: the controller reads and writes none of the slot's memory.
-    mem.release(&unsafe { Quiesced::assume() });
-    Released::Freed
+    let stopped = unsafe { Quiesced::assume() };
+    mem.release(&stopped);
+    Released::Freed(stopped)
 }
 
 /// **Enumerate the device at `port`**, logging the step that fails if one does. On failure its
@@ -385,7 +421,7 @@ fn bind(
     let interrupts = hid.as_ref().map_or(&[][..], |h| h.endpoints());
     let bulks = storage.as_ref().map(|s| s.endpoints());
     let bulks = bulks.as_ref().map_or(&[][..], |b| &b[..]);
-    if !context::configure_endpoints(input_bytes(&mut mem.input, x), x.layout, port, speed_id, interrupts, bulks) {
+    if !context::configure_endpoints(&mut input_bytes(&mem.input, x), x.layout, port, speed_id, interrupts, bulks) {
         crate::kprintln!("usb: port {port}: its endpoints name the default endpoint's index, or one twice; not bound");
         return;
     }
@@ -447,7 +483,7 @@ fn address_and_read(
     let default = speed::default_max_packet0(speed_id);
     let ring_at = mem.ep0.phys().as_u64();
     let cycle = mem.ring.cycle();
-    context::address_device(input_bytes(&mut mem.input, x), x.layout, port, speed_id, ring_at, cycle, default);
+    context::address_device(&mut input_bytes(&mem.input, x), x.layout, port, speed_id, ring_at, cycle, default);
     command(x, Trb::with_input(kind::ADDRESS_DEVICE, mem.input.phys().as_u64(), slot))
         .map_err(|e| ("Address Device", e))?;
     // **SET_ADDRESS's recovery interval**: USB 2.0 §9.2.6.3 gives a device 2 ms after the request
@@ -457,13 +493,14 @@ fn address_and_read(
 
     // **The default endpoint's packet**, from the first eight bytes, which every packet size can
     // carry. At SuperSpeed it is an exponent.
-    let raw = read_descriptor(x, slot, mem, desc::kind::DEVICE, 0, 0, 8)
+    let mut bytes = [0u8; 18];
+    let raw = read_descriptor(x, slot, mem, desc::kind::DEVICE, 0, 0, 8, &mut bytes)
         .and_then(|b| desc::device_prefix(b).ok_or(Failed::Device("its first eight bytes are not a device descriptor")))
         .map_err(|e| ("reading its packet size", e))?;
     let max = desc::max_packet0(speed::is_super(speed_id), raw)
         .ok_or(("reading its packet size", Failed::Device("bMaxPacketSize0 is not one this speed allows")))?;
     if max != default {
-        context::evaluate_ep0(input_bytes(&mut mem.input, x), x.layout, ring_at, cycle, max);
+        context::evaluate_ep0(&mut input_bytes(&mem.input, x), x.layout, ring_at, cycle, max);
         command(x, Trb::with_input(kind::EVALUATE_CONTEXT, mem.input.phys().as_u64(), slot))
             .map_err(|e| ("Evaluate Context", e))?;
         // Said, because nothing else shows it: QEMU's controller reads the packet size only for a
@@ -471,20 +508,16 @@ fn address_and_read(
         crate::kprintln!("usb: port {port}: its default endpoint takes {max}-byte packets, not {default}; evaluated");
     }
 
-    let dev = read_descriptor(x, slot, mem, desc::kind::DEVICE, 0, 0, 18)
+    let dev = read_descriptor(x, slot, mem, desc::kind::DEVICE, 0, 0, 18, &mut bytes)
         .and_then(|b| desc::device(b).ok_or(Failed::Device("its device descriptor does not read")))
         .map_err(|e| ("reading its device descriptor", e))?;
-    let total = read_descriptor(x, slot, mem, desc::kind::CONFIGURATION, 0, 0, 9)
+    let total = read_descriptor(x, slot, mem, desc::kind::CONFIGURATION, 0, 0, 9, &mut bytes)
         .and_then(|b| desc::configuration_total(b).ok_or(Failed::Device("its configuration does not read")))
         .map_err(|e| ("reading its configuration", e))?;
     let len = (total as usize).min(crate::mm::PAGE_SIZE) as u16;
-    let config_len = {
-        let b = read_descriptor(x, slot, mem, desc::kind::CONFIGURATION, 0, 0, len)
-            .map_err(|e| ("reading its configuration", e))?;
-        let n = b.len().min(config.len());
-        config[..n].copy_from_slice(&b[..n]);
-        n
-    };
+    let config_len = read_descriptor(x, slot, mem, desc::kind::CONFIGURATION, 0, 0, len, config)
+        .map_err(|e| ("reading its configuration", e))?
+        .len();
     let config = &config[..config_len];
 
     // **Its name**: the product string, and the serial beside it, as a disk's is its model and
@@ -548,18 +581,19 @@ fn name_of(
     if dev.product_string == 0 && dev.serial == 0 {
         return Ok((0, 0));
     }
-    let Some(lang) = string(x, port, slot, mem, 0, 0)?.and_then(desc::first_language) else {
+    let mut bytes = [0u8; 255];
+    let Some(lang) = string(x, port, slot, mem, 0, 0, &mut bytes)?.and_then(desc::first_language) else {
         return Ok((0, 0));
     };
     let mut n = 0;
     if dev.product_string != 0
-        && let Some(b) = string(x, port, slot, mem, dev.product_string, lang)?
+        && let Some(b) = string(x, port, slot, mem, dev.product_string, lang, &mut bytes)?
     {
         n = desc::string_into(b, out).unwrap_or(0);
     }
     let mut s = 0;
     if dev.serial != 0 {
-        s = string(x, port, slot, mem, dev.serial, lang)?
+        s = string(x, port, slot, mem, dev.serial, lang, &mut bytes)?
             .and_then(|b| desc::string_into(b, &mut serial[..]))
             .unwrap_or(0);
         if s > 0 && n + s + 3 <= out.len() {
@@ -579,16 +613,18 @@ fn name_of(
 
 /// **String descriptor `index`**, in language `lang`: its bytes, or `None` if the device stalled the
 /// request and its default endpoint was recovered. Any other failure is the device's end.
-fn string<'m>(
+#[allow(clippy::too_many_arguments, reason = "the request's fields, and where its answer goes")]
+fn string<'o>(
     x: &Xhci,
     port: u8,
     slot: u8,
-    mem: &'m mut DeviceMem,
+    mem: &mut DeviceMem,
     index: u8,
     lang: u16,
-) -> Result<Option<&'m [u8]>, (&'static str, Failed)> {
+    out: &'o mut [u8; 255],
+) -> Result<Option<&'o [u8]>, (&'static str, Failed)> {
     match control_in(x, slot, mem, get_descriptor(desc::kind::STRING, index, lang, 255), 255) {
-        Ok(_) => Ok(Some(data_bytes(mem, 255))),
+        Ok(_) => Ok(Some(data_bytes(mem, 255, out))),
         Err(Failed::Code(code::STALL)) => {
             recover_ep0(x, slot, mem).map_err(|e| ("recovering its default endpoint after a stall", e))?;
             crate::kprintln!(
@@ -766,17 +802,13 @@ fn speed_of(s: u32) -> u8 {
 
 /// Point slot `slot`'s entry of the device context base array at `output`, or clear it with 0.
 fn set_slot_context(x: &Xhci, slot: u8, output: u64) {
-    // SAFETY: the array holds an entry for every slot up to `max_slots`, and the controller only
-    // names slots up to that.
-    unsafe { core::ptr::write_volatile((x.dcbaa.virt() as *mut u64).add(slot as usize), output) };
+    x.dcbaa.write(slot as usize * 8, output);
 }
 
-/// The input context's bytes, cleared for a new command.
-pub(super) fn input_bytes<'a>(input: &'a mut Programmed, x: &Xhci) -> &'a mut [u8] {
-    let len = x.layout.input_len();
-    let bytes = &mut input.as_mut_slice()[..len];
-    bytes.fill(0);
-    bytes
+/// The input context, cleared for a new command.
+pub(super) fn input_bytes<'a>(input: &'a Programmed, x: &Xhci) -> context::Input<'a> {
+    input.fill(0, x.layout.input_len(), 0);
+    context::Input(input)
 }
 
 /// Sleep for `ns`: a wait on nothing with a deadline, so the CPU runs something else meanwhile.

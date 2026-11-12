@@ -42,6 +42,24 @@ fn the_prdt_capacity_is_what_fits_in_a_command_table() {
     assert!(PRDT_OFFSET + (MAX_PRDT_ENTRIES as usize + 1) * PRDT_ENTRY > CMD_TABLE_BYTES);
 }
 
+/// **A command's fragments stop at the table's room**: the last entry the page holds is written,
+/// and one fragment more stops before a byte of the table is.
+#[test]
+fn a_command_past_the_tables_room_stops() {
+    let (_regs, d) = fake_disk();
+    let frag = |i: u64| PhysFrag { base: 0x10_0000 + i * 0x1000, len: 512 };
+    let frags: std::vec::Vec<PhysFrag> = (0..=MAX_PRDT_ENTRIES as u64).map(frag).collect();
+    let (full, over) = (&frags[..MAX_PRDT_ENTRIES as usize], &frags[..]);
+    build_command(&d, ATA_READ_DMA_EXT, 0, 8, full, false);
+    let last = PRDT_OFFSET + (MAX_PRDT_ENTRIES as usize - 1) * PRDT_ENTRY;
+    assert_eq!(d.cmd_table.read::<u64>(last), frag(MAX_PRDT_ENTRIES as u64 - 1).base, "the page's last entry");
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_command(&d, ATA_WRITE_DMA_EXT, 0, 8, over, true);
+    }));
+    assert!(built.is_err(), "one fragment past the table's room");
+    assert_eq!(d.cmd_table.read::<[u8; 3]>(0), [0x27, 0x80, ATA_READ_DMA_EXT], "the table untouched");
+}
+
 /// What that capacity is worth as a transfer, pinning the figure in `deferred-decisions.md`.
 #[test]
 fn one_command_covers_just_under_a_megabyte() {
@@ -229,8 +247,8 @@ fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
     submit(&mut first, ctx(&d));
     submit(&mut second, ctx(&d));
     write32(d.port_base, PX_TFD, 0x50);
-    // SAFETY: slot 0's header is the disk's; DW1 is the byte count an HBA writes back.
-    unsafe { (d.cmd_list.virt() as *mut u32).add(1).write_volatile(512) };
+    // Slot 0's header DW1: the byte count an HBA writes back.
+    d.cmd_list.write::<u32>(4, 512);
     assert_eq!(settle_polled(&d, false), Some(true));
     crate::dpc::run_pending();
     assert_eq!((first.status, first.transferred), (IO_ERROR, 0), "failed, whatever the count said");
