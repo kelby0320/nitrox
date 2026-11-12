@@ -3,8 +3,11 @@
 //!
 //! An **output** (device) context is 32 entries the controller owns: the slot context, then one
 //! per endpoint. An **input** context is what a command hands it: an input control context saying
-//! which entries to add, then the same 32. Everything here is offsets and dwords into a byte
-//! slice, so the host tests check them against the specification's layout at both sizes.
+//! which entries to add, then the same 32. Everything here is offsets and dwords, into device
+//! memory or a byte slice, so the host tests check them against the specification's layout at both
+//! sizes.
+
+use crate::mm::dma::DmaBuffer;
 
 /// Port speeds as `PORTSC` and the slot context give them: the default Protocol Speed IDs (xHCI
 /// 1.2 §7.2.2.1.1), which apply when a Supported Protocol capability lists none of its own.
@@ -85,9 +88,30 @@ impl Layout {
     }
 }
 
+/// **Where an input context is written**, a dword at a time: device memory, or a test's bytes.
+pub trait InputCtx {
+    /// Write dword `val`, little-endian, at byte offset `off`.
+    fn put(&mut self, off: usize, val: u32);
+}
+
+impl InputCtx for [u8] {
+    fn put(&mut self, off: usize, val: u32) {
+        self[off..off + 4].copy_from_slice(&val.to_le_bytes());
+    }
+}
+
+/// An input context in device memory.
+pub struct Input<'a>(pub &'a DmaBuffer);
+
+impl InputCtx for Input<'_> {
+    fn put(&mut self, off: usize, val: u32) {
+        self.0.write(off, val.to_le());
+    }
+}
+
 /// Write dword `val` at byte offset `off`.
-fn put(ctx: &mut [u8], off: usize, val: u32) {
-    ctx[off..off + 4].copy_from_slice(&val.to_le_bytes());
+fn put(ctx: &mut (impl InputCtx + ?Sized), off: usize, val: u32) {
+    ctx.put(off, val);
 }
 
 /// Input Control Context, dword 1: the Add Context flags. `A0` is the slot, `A1` the default
@@ -104,7 +128,15 @@ const CONTROL_AVERAGE_TRB: u32 = 8;
 /// **The input context for Address Device**: the slot — its speed, one context entry, its root
 /// port — and the default endpoint, with its transfer ring at `ring`, that ring's cycle state, and
 /// `max_packet` as the speed's default. `ctx` must be `input_len` bytes, zeroed.
-pub fn address_device(ctx: &mut [u8], l: Layout, port: u8, speed_id: u8, ring: u64, cycle: bool, max_packet: u16) {
+pub fn address_device(
+    ctx: &mut (impl InputCtx + ?Sized),
+    l: Layout,
+    port: u8,
+    speed_id: u8,
+    ring: u64,
+    cycle: bool,
+    max_packet: u16,
+) {
     put(ctx, 4, ADD_SLOT | ADD_EP0);
     // Slot, dword 0: route string 0 (a root port), the speed in bits 23:20, context entries 1 in
     // bits 31:27. Dword 1: the root hub port number in bits 23:16.
@@ -115,14 +147,14 @@ pub fn address_device(ctx: &mut [u8], l: Layout, port: u8, speed_id: u8, ring: u
 
 /// **The input context for Evaluate Context** of the default endpoint: only `A1`, and the endpoint
 /// with its new maximum packet. `ctx` must be `input_len` bytes, zeroed.
-pub fn evaluate_ep0(ctx: &mut [u8], l: Layout, ring: u64, cycle: bool, max_packet: u16) {
+pub fn evaluate_ep0(ctx: &mut (impl InputCtx + ?Sized), l: Layout, ring: u64, cycle: bool, max_packet: u16) {
     put(ctx, 4, ADD_EP0);
     endpoint0(ctx, l, ring, cycle, max_packet);
 }
 
 /// The default endpoint's context: control, three retries, `max_packet` in dword 1 bits 31:16,
 /// the dequeue pointer and its cycle state in dwords 2 and 3, and the average TRB length.
-fn endpoint0(ctx: &mut [u8], l: Layout, ring: u64, cycle: bool, max_packet: u16) {
+fn endpoint0(ctx: &mut (impl InputCtx + ?Sized), l: Layout, ring: u64, cycle: bool, max_packet: u16) {
     let ep = l.endpoint(DCI_EP0);
     put(ctx, ep + 4, CERR_3 | EP_TYPE_CONTROL | (max_packet as u32) << 16);
     put(ctx, ep + 8, (ring as u32 & !0xF) | cycle as u32);
@@ -192,7 +224,7 @@ pub struct Bulk {
 /// `input_len` bytes, zeroed. **`false`, with nothing written, when an endpoint's index is the
 /// default endpoint's or another's**: the indices are the device's word.
 pub fn configure_endpoints(
-    ctx: &mut [u8],
+    ctx: &mut (impl InputCtx + ?Sized),
     l: Layout,
     port: u8,
     speed_id: u8,
@@ -242,6 +274,22 @@ mod tests {
         u32::from_le_bytes(ctx[off..off + 4].try_into().unwrap())
     }
 
+    /// **A context written to device memory is the bytes a slice gets**, dwords little-endian.
+    #[test]
+    fn a_context_in_device_memory_is_the_one_a_slice_gets() {
+        crate::mm::test_support::init_global_heap();
+        for csz in [false, true] {
+            let l = Layout::new(csz);
+            let mut want = vec![0u8; l.input_len()];
+            address_device(&mut want[..], l, 13, speed::HIGH, 0x1_2345_6000, true, 64);
+            let mem = DmaBuffer::alloc(l.input_len()).unwrap();
+            address_device(&mut Input(&mem), l, 13, speed::HIGH, 0x1_2345_6000, true, 64);
+            let mut got = vec![0u8; l.input_len()];
+            mem.copy_out(0, &mut got);
+            assert_eq!(got, want, "entries of {} bytes", if csz { 64 } else { 32 });
+        }
+    }
+
     /// **The same Address Device context at both entry sizes**, each field where the spec puts it.
     #[test]
     fn address_device_lays_out_the_slot_and_ep0_at_either_size() {
@@ -249,7 +297,7 @@ mod tests {
             let l = Layout::new(csz);
             assert_eq!((l.input_len(), l.output_len()), (33 * entry, 32 * entry));
             let mut ctx = vec![0u8; l.input_len()];
-            address_device(&mut ctx, l, 13, speed::HIGH, 0x1_2345_6000, true, 64);
+            address_device(&mut ctx[..], l, 13, speed::HIGH, 0x1_2345_6000, true, 64);
             assert_eq!(dword(&ctx, 0), 0, "nothing dropped");
             assert_eq!(dword(&ctx, 4), 0b11, "A0 and A1");
             assert_eq!(dword(&ctx, entry), 3 << 20 | 1 << 27, "high speed, one entry, entry {entry}");
@@ -268,7 +316,7 @@ mod tests {
     fn evaluate_names_only_the_default_endpoint() {
         let l = Layout::new(false);
         let mut ctx = vec![0u8; l.input_len()];
-        evaluate_ep0(&mut ctx, l, 0x8000, false, 8);
+        evaluate_ep0(&mut ctx[..], l, 0x8000, false, 8);
         assert_eq!(dword(&ctx, 4), 0b10, "A1 only");
         assert!(ctx[32..64].iter().all(|&b| b == 0), "the slot context is not written");
         assert_eq!(dword(&ctx, 64 + 4), 8 << 16 | 4 << 3 | 3 << 1);
@@ -284,7 +332,7 @@ mod tests {
         let kbd = Interrupt { dci: 3, max_packet: 8, burst: 0, interval: 6, ring: 0x5000, cycle: true };
         let bulk_in = Bulk { dci: 5, input: true, max_packet: 1024, burst: 15, ring: 0x2_0000_7000, cycle: false };
         let bulk_out = Bulk { dci: 4, input: false, max_packet: 512, burst: 0, ring: 0x8000, cycle: true };
-        assert!(configure_endpoints(&mut ctx, l, 2, speed::SUPER, &[kbd], &[bulk_in, bulk_out]));
+        assert!(configure_endpoints(&mut ctx[..], l, 2, speed::SUPER, &[kbd], &[bulk_in, bulk_out]));
         assert_eq!(dword(&ctx, 4), 1 | 1 << 3 | 1 << 4 | 1 << 5, "the slot and the three endpoints");
         assert_eq!(dword(&ctx, 32) >> 27, 5, "entries up to index 5");
         let i = l.endpoint(5);
@@ -324,7 +372,7 @@ mod tests {
             let mut ctx = vec![0u8; l.input_len()];
             let kbd = Interrupt { dci: 3, max_packet: 8, burst: 0, interval: 6, ring: 0x1_0000_5000, cycle: true };
             let mouse = Interrupt { dci: 5, max_packet: 4, burst: 1, interval: 3, ring: 0x6000, cycle: false };
-            assert!(configure_endpoints(&mut ctx, l, 9, speed::HIGH, &[kbd, mouse], &[]));
+            assert!(configure_endpoints(&mut ctx[..], l, 9, speed::HIGH, &[kbd, mouse], &[]));
             assert_eq!(dword(&ctx, 0), 0, "nothing dropped");
             assert_eq!(dword(&ctx, 4), 1 | 1 << 3 | 1 << 5, "A0, A3 and A5");
             assert_eq!(dword(&ctx, entry), 3 << 20 | 5 << 27, "high speed, entries to DCI 5");
@@ -351,7 +399,7 @@ mod tests {
         let l = Layout::new(false);
         let mut ctx = vec![0u8; l.input_len()];
         let big = Interrupt { dci: 3, max_packet: 0xFFFF, burst: 15, interval: 0, ring: 0, cycle: false };
-        assert!(configure_endpoints(&mut ctx, l, 1, speed::HIGH, &[big], &[]));
+        assert!(configure_endpoints(&mut ctx[..], l, 1, speed::HIGH, &[big], &[]));
         let payload = 0xFFFF * 16;
         assert_eq!(dword(&ctx, 4 * 32) >> 24, payload >> 16, "Max ESIT Payload Hi");
         assert_eq!(dword(&ctx, 4 * 32 + 16) >> 16, payload & 0xFFFF, "Max ESIT Payload Lo");
@@ -383,10 +431,10 @@ mod tests {
             (&[kbd], [bulk(3, true), bulk(4, false)], "a keyboard's and a stick's"),
         ] {
             let mut ctx = vec![0u8; l.input_len()];
-            assert!(!configure_endpoints(&mut ctx, l, 1, speed::HIGH, ints, &bulks), "{why}");
+            assert!(!configure_endpoints(&mut ctx[..], l, 1, speed::HIGH, ints, &bulks), "{why}");
             assert!(ctx.iter().all(|&b| b == 0), "{why}: nothing written");
         }
         let mut ctx = vec![0u8; l.input_len()];
-        assert!(configure_endpoints(&mut ctx, l, 1, speed::HIGH, &[], &[bulk(31, true), bulk(2, false)]));
+        assert!(configure_endpoints(&mut ctx[..], l, 1, speed::HIGH, &[], &[bulk(31, true), bulk(2, false)]));
     }
 }

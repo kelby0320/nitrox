@@ -8,12 +8,10 @@ pub(in crate::drivers::xhci) struct Prepared {
     interface: u8,
     in_ep: super::desc::Endpoint,
     out_ep: super::desc::Endpoint,
-    bulk_in: Ring,
-    bulk_out: Ring,
-    wrap_virt: u64,
-    wrap_phys: u64,
-    data_virt: u64,
-    data_phys: u64,
+    bulk_in: Producer,
+    bulk_out: Producer,
+    /// Where its rings, wrapper page and binding buffer are, in the device's memory.
+    at: [u64; 4],
 }
 
 impl Prepared {
@@ -26,16 +24,16 @@ impl Prepared {
                 input: true,
                 max_packet: i.max_packet,
                 burst: i.burst,
-                ring: self.bulk_in.phys,
-                cycle: self.bulk_in.producer.cycle(),
+                ring: self.at[0],
+                cycle: self.bulk_in.cycle(),
             },
             context::Bulk {
                 dci: o.dci(),
                 input: false,
                 max_packet: o.max_packet,
                 burst: o.burst,
-                ring: self.bulk_out.phys,
-                cycle: self.bulk_out.producer.cycle(),
+                ring: self.at[1],
+                cycle: self.bulk_out.cycle(),
             },
         ]
     }
@@ -54,22 +52,14 @@ pub(in crate::drivers::xhci) fn prepare(port: u8, mem: &mut DeviceMem, config: &
         crate::kprintln!("usb: port {port}: no memory for its storage endpoints; not bound");
         return None;
     };
-    let ring = |b: &DmaBuffer| {
-        // SAFETY: `b` goes into the device's memory, freed only once its slot is disabled and it is
-        // out of the table, after which nothing uses its rings.
-        let (mut mem, phys) = (unsafe { RingMem::kept(b) }, b.phys().as_u64());
-        Ring { producer: Producer::new(&mut mem, phys), mem, phys }
-    };
+    let ring = |b: &DmaBuffer| Producer::new(&mut RingMem::of(b), b.phys().as_u64());
     let p = Prepared {
         interface: s.number,
         in_ep: s.bulk_in,
         out_ep: s.bulk_out,
         bulk_in: ring(&rin),
         bulk_out: ring(&rout),
-        wrap_virt: wrap.virt() as u64,
-        wrap_phys: wrap.phys().as_u64(),
-        data_virt: data.virt() as u64,
-        data_phys: data.phys().as_u64(),
+        at: [&rin, &rout, &wrap, &data].map(|b| b.phys().as_u64()),
     };
     if mem.class.try_reserve(4).is_err() {
         crate::kprintln!("usb: port {port}: no memory for its storage endpoints; not bound");
@@ -94,6 +84,10 @@ pub(in crate::drivers::xhci) fn bind(
     parent: Option<u32>,
     serial: &[u8],
 ) {
+    let Some([rin, rout, wrap, data]) = mem.claim(p.at) else {
+        crate::kprintln!("usb: port {port}: its storage memory is not the device's; not bound");
+        return;
+    };
     let dev = Dev {
         slot,
         interface: p.interface,
@@ -103,12 +97,10 @@ pub(in crate::drivers::xhci) fn bind(
         out_address: p.out_ep.address,
         in_mps: p.in_ep.max_packet,
         out_mps: p.out_ep.max_packet,
-        bulk_in: p.bulk_in,
-        bulk_out: p.bulk_out,
-        wrap_virt: p.wrap_virt,
-        wrap_phys: p.wrap_phys,
-        data_virt: p.data_virt,
-        data_phys: p.data_phys,
+        bulk_in: Ring { producer: p.bulk_in, mem: rin },
+        bulk_out: Ring { producer: p.bulk_out, mem: rout },
+        wrap,
+        data,
         db: x.db,
         tag: 0,
         luns: [Lun::default(); MAX_LUNS],
@@ -124,7 +116,7 @@ pub(in crate::drivers::xhci) fn bind(
         queue: Queue::new(),
         counted: [const { Counted::new() }; MAX_LUNS],
     };
-    let Some((i, epoch)) = DISKS.take(dev) else {
+    let Some((i, epoch)) = DISKS.take_or_keep(dev, mem) else {
         crate::kprintln!("usb: port {port}: {MAX_DEVICES} storage devices are bound already; not bound");
         return;
     };
@@ -138,7 +130,7 @@ pub(in crate::drivers::xhci) fn bind(
         }
         Err(e) => {
             crate::kprintln!("usb: port {port}: GET MAX LUN failed: {e}; not bound");
-            retire(i);
+            retire(i, b.mem);
             return;
         }
     };
@@ -158,7 +150,7 @@ pub(in crate::drivers::xhci) fn bind(
         }
     }
     if published == 0 {
-        retire(i);
+        retire(i, b.mem);
     } else {
         act(DISKS.let_go(i, crate::arch::Timer::read_ns()), Some(x));
     }

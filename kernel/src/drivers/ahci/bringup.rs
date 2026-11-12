@@ -193,16 +193,15 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
     let (Ok(intr), Ok(wake)) = (InterruptObject::try_new(), InterruptObject::try_new()) else {
         return Err(OUT_OF_MEMORY);
     };
+    let (clb, fb) = (cmd_list.phys().as_u64(), fis.phys().as_u64());
     let disk = AhciDisk {
         abar,
         port_base,
         port,
-        cmd_list: Programmed::new(cmd_list),
         _fis: Programmed::new(fis),
-        cmd_table: Programmed::new(cmd_table),
         sectors: 0,
         flush_command: ATA_FLUSH_CACHE,
-        state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
+        state: IrqSpinLock::new(LockRank::Leaf, PortState::new(Programmed::new(cmd_list), Programmed::new(cmd_table))),
         intr: Ref::new(intr),
         counted: Counted::new(),
         wake: Ref::new(wake),
@@ -211,10 +210,10 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         return Err(OUT_OF_MEMORY);
     };
 
-    write32(port_base, PX_CLB, disk.cmd_list.phys().as_u64() as u32);
-    write32(port_base, PX_CLBU, (disk.cmd_list.phys().as_u64() >> 32) as u32);
-    write32(port_base, PX_FB, disk._fis.phys().as_u64() as u32);
-    write32(port_base, PX_FBU, (disk._fis.phys().as_u64() >> 32) as u32);
+    write32(port_base, PX_CLB, clb as u32);
+    write32(port_base, PX_CLBU, (clb >> 32) as u32);
+    write32(port_base, PX_FB, fb as u32);
+    write32(port_base, PX_FBU, (fb >> 32) as u32);
     write32(port_base, PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
     write32(port_base, PX_IS, 0xFFFF_FFFF);
     write32(port_base, PX_IE, PXIE_DHRE | PX_FATAL);

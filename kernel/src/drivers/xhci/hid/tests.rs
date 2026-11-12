@@ -288,3 +288,66 @@ fn a_departing_keyboards_releases_end_its_ring_whatever_the_dpc_pushes() {
     let last = events.rfind(|e| e.kind == EV_KEY).map(|e| (e.code, e.value));
     assert_eq!(last, Some((30, KEY_RELEASE)), "the key left down");
 }
+
+/// An endpoint of the device in `slot`, its node `node`, polling a page of its own.
+fn bound(slot: u8, node: usize) -> Bound {
+    let page = || Programmed::new(DmaBuffer::alloc(PAGE_SIZE).unwrap());
+    let ring_mem = page();
+    Bound {
+        slot,
+        dci: 3,
+        interface: 0,
+        node,
+        epoch: 0,
+        decoder: Decoder::Mouse { layout: mouse::Layout::BOOT, buttons: 0 },
+        ring: Producer::new(&mut RingMem::of(&ring_mem), ring_mem.phys().as_u64()),
+        ring_mem,
+        buf: page(),
+        len: 8,
+        halted: false,
+        halts: 0,
+        lights_dead: true,
+    }
+}
+
+/// **A departure hands back its device's endpoints' memory, and no other's**: freed with its slot
+/// disabled, leaked with its slot kept, counted. Another device's endpoint stays bound.
+#[test]
+fn a_departure_hands_back_its_endpoints_memory_alone() {
+    init_global_heap();
+    let mut regs = std::boxed::Box::new([0u32; 64]);
+    let x = super::super::fake(regs.as_mut_ptr() as u64);
+    let (nodes, mut mem) = (Nodes::new(), hub::device_mem().unwrap());
+    // SAFETY: no controller was given the endpoints' memory.
+    let disabled = hub::Released::Freed(unsafe { crate::mm::dma::Quiesced::assume() });
+    for (released, freed) in [(hub::Released::Kept("wedged"), 0), (disabled, 4)] {
+        for (slot, node) in [(3, 0), (4, 1), (3, 2)] {
+            assert!(start(&x, &nodes, bound(slot, node), &mut mem));
+        }
+        let before = crate::mm::heap::frames_freed_by_this_thread();
+        released.settle(depart_from(&x, &nodes, 3));
+        assert_eq!(crate::mm::heap::frames_freed_by_this_thread() - before, freed, "two rings, two reports");
+        let left: std::vec::Vec<u8> = x.hid.lock().entries.iter().flatten().map(|b| b.slot).collect();
+        assert_eq!(left, [4], "the other device's endpoint stays");
+        let _ = depart_from(&x, &nodes, 4);
+    }
+}
+
+/// **An endpoint with no room to be polled gives its memory back to the device and retires its
+/// node**: neither left to no one, a read of the node refused rather than waiting for ever.
+#[test]
+fn an_endpoint_with_no_room_gives_back_its_memory_and_retires_its_node() {
+    init_global_heap();
+    let mut regs = std::boxed::Box::new([0u32; 64]);
+    let x = super::super::fake(regs.as_mut_ptr() as u64);
+    let (nodes, mut mem) = (Nodes::new(), hub::device_mem().unwrap());
+    for k in 0..MAX_BOUND {
+        assert!(start(&x, &nodes, bound(3, k % MAX_NODES), &mut mem), "room for {k}");
+    }
+    let (index, _) = nodes.take(false).expect("a free node");
+    let refused = bound(4, index);
+    let at = [refused.ring_mem.phys().as_u64(), refused.buf.phys().as_u64()];
+    assert!(!start(&x, &nodes, refused, &mut mem), "no room");
+    assert!(mem.claim(at).is_some(), "its ring and report buffer the device's");
+    assert_eq!(nodes.states[index].load(Ordering::Acquire), RETIRED, "its node retired");
+}

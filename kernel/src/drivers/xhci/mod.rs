@@ -38,7 +38,7 @@ use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
 use crate::dpc::{Dpc, OneAtATime};
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{IrqSpinLock, KBox, KVec, Published};
+use crate::libkern::{IrqSpinLock, KBox, KVec, Published, SpinLock};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
 use crate::mm::{PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
@@ -145,7 +145,7 @@ pub struct Xhci {
     caps: caps::ExtCaps,
     /// The device context base array, whose slot entries the hub thread writes, and the
     /// scratchpad buffers and their array, which are the controller's from here on.
-    dcbaa: Programmed,
+    dcbaa: SpinLock<Programmed>,
     _scratch: Scratchpads,
     /// The command ring. The hub thread writes it; probe's No Op is its first TRB.
     cmd: IrqSpinLock<CommandRing>,
@@ -172,8 +172,8 @@ pub struct Xhci {
 }
 
 // SAFETY: shared once published. Its bases and descriptions never change, and every field that
-// does is atomic or locked, but for DMA memory: the scratchpads and the segment table go untouched
-// after bring-up, and the device context base array is the hub thread's alone.
+// does is atomic or locked, but for DMA memory the CPU writes only at bring-up: the scratchpads and
+// the segment table.
 unsafe impl Sync for Xhci {}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -227,7 +227,7 @@ struct Scratchpads {
 impl Xhci {
     /// It halted: what it was given is freed with it.
     fn release(&mut self, halted: &Quiesced) {
-        self.dcbaa.release(halted);
+        self.dcbaa.get_mut().release(halted);
         self._erst.release(halted);
         self.cmd.lock().mem.release(halted);
         self.events.lock().mem.release(halted);
@@ -427,12 +427,7 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     };
     let cmd_ring = Producer::new(&mut RingMem::of(&cmd_mem), cmd_mem.phys().as_u64());
     // The event ring's one segment: its base and size, in the table the controller reads.
-    let e = erst.virt() as *mut u64;
-    // SAFETY: `erst` is a page, which holds one 16-byte segment-table entry.
-    unsafe {
-        core::ptr::write_volatile(e, ev_mem.phys().as_u64());
-        core::ptr::write_volatile(e.add(1), RING_TRBS as u64);
-    }
+    erst.write(0, [ev_mem.phys().as_u64(), RING_TRBS as u64]);
 
     write32(op, CONFIG, max_slots as u32);
     write64(op, DCBAAP, dcbaa.phys().as_u64());
@@ -468,7 +463,7 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
         max_ports,
         layout: context::Layout::new(hcc1 & HCC_CSZ != 0),
         caps: ext,
-        dcbaa: Programmed::new(dcbaa),
+        dcbaa: SpinLock::new(LockRank::Leaf, Programmed::new(dcbaa)),
         _scratch: scratch,
         cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: Programmed::new(cmd_mem), ring: cmd_ring }),
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(ev_mem), ring: Consumer::new() }),
@@ -563,15 +558,13 @@ fn scratchpads_for(count: u32, dcbaa: &DmaBuffer) -> Option<Scratchpads> {
     let array = Programmed::new(DmaBuffer::alloc(count as usize * 8).ok()?);
     let mut pages: KVec<Programmed> = KVec::new();
     pages.try_reserve(count as usize).ok()?;
-    let a = array.virt() as *mut u64;
     for i in 0..count as usize {
         let page = Programmed::new(DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?);
-        // SAFETY: `array` holds `count` entries.
-        unsafe { core::ptr::write_volatile(a.add(i), page.phys().as_u64()) };
+        array.write(i * 8, page.phys().as_u64());
         pages.try_push(page).ok()?;
     }
-    // SAFETY: `dcbaa` holds at least one entry; slot 0 is the scratchpad array's.
-    unsafe { core::ptr::write_volatile(dcbaa.virt() as *mut u64, array.phys().as_u64()) };
+    // Slot 0 of the device context base array is the scratchpad array's.
+    dcbaa.write(0, array.phys().as_u64());
     Some(Scratchpads { array: Some(array), pages })
 }
 
@@ -838,7 +831,7 @@ fn fake(regs: u64) -> Xhci {
         max_ports: 1,
         layout: context::Layout::new(false),
         caps: caps::ExtCaps::default(),
-        dcbaa: Programmed::new(page()),
+        dcbaa: SpinLock::new(LockRank::Leaf, Programmed::new(page())),
         _scratch: Scratchpads { array: None, pages: KVec::new() },
         cmd: IrqSpinLock::new(LockRank::Leaf, CommandRing { mem: Programmed::new(cmd_mem), ring }),
         events: IrqSpinLock::new(LockRank::Leaf, EventRing { mem: Programmed::new(page()), ring: Consumer::new() }),

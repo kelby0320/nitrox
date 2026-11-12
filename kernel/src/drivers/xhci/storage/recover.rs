@@ -143,11 +143,7 @@ pub(super) fn run(
     if len > 0 && matches!(result, Ok(Status::Passed { .. })) {
         let d = DISKS.devs[i].lock();
         if let Some(dev) = d.as_ref() {
-            for (k, b) in out[..len as usize].iter_mut().enumerate() {
-                // SAFETY: the binding buffer holds BIND_DATA bytes, which the controller finished
-                // writing with the command just waited for.
-                *b = unsafe { core::ptr::read_volatile((dev.data_virt as *const u8).add(k)) };
-            }
+            dev.data.copy_out(0, &mut out[..len as usize]);
         }
     }
     result
@@ -225,8 +221,9 @@ fn reset_recovery(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Result<(), Failed>
     clear_halt(x, i, out_dci, mem)
 }
 
-pub(super) fn retire(i: usize) {
-    let _ = DISKS.depart(i);
+/// [`Disks::retire`].
+pub(super) fn retire(i: usize, mem: &mut DeviceMem) {
+    DISKS.retire(i, mem);
 }
 
 /// **How long the hub thread may sleep** at `now` ([`Disks::bound`]).
@@ -399,9 +396,8 @@ impl Disks {
             dev.ask_status(false);
         } else {
             let len = len.min(BIND_DATA as u32);
-            // SAFETY: the binding buffer holds `BIND_DATA` bytes, and no transfer is using it.
-            unsafe { core::ptr::write_bytes(dev.data_virt as *mut u8, 0, len as usize) };
-            let frags = [PhysFrag { base: dev.data_phys, len: len as u64 }];
+            dev.data.fill(0, len as usize, 0);
+            let frags = [PhysFrag { base: dev.data.phys().as_u64(), len: len as u64 }];
             let frags = if len == 0 { &frags[..0] } else { &frags[..] };
             dev.issue(owner, lun, cdb, len, len > 0, frags, now);
         }
@@ -550,8 +546,8 @@ pub(super) enum BeginRescan {
 }
 
 /// What a departure leaves for after the slot is disabled: the command that was in flight, one a
-/// failed recovery stranded, and a rescan waiting.
-pub(in crate::drivers::xhci) struct Departed(pub(super) [Option<*mut Irp>; 3]);
+/// failed recovery stranded, and a rescan waiting; and the device's memory.
+pub(in crate::drivers::xhci) struct Departed(pub(super) [Option<*mut Irp>; 3], pub(super) Option<[Programmed; 4]>);
 
 /// **The device in xHCI slot `slot` has gone**: out of the table, so the DPC touches none of its
 /// memory; its queue completed `PeerClosed` now, and any later submit refused so by its slot's
@@ -559,22 +555,24 @@ pub(in crate::drivers::xhci) struct Departed(pub(super) [Option<*mut Irp>; 3]);
 /// then the controller may still move its data. From the hub thread.
 pub(in crate::drivers::xhci) fn depart(slot: u8) -> Departed {
     let Some(i) = DISKS.slot_of(slot) else {
-        return Departed([None; 3]);
+        return Departed([None; 3], None);
     };
-    let (queued, held) = DISKS.depart(i);
+    let (queued, held, mem) = DISKS.depart(i);
     for irp in queued.into_iter().flatten() {
         complete(irp, KError::PeerClosed as i32, 0);
     }
-    Departed(held)
+    Departed(held, mem)
 }
 
 /// **Complete what a departure handed back**, `PeerClosed`, by what became of the slot: all of it
 /// once disabled; if it was kept, its commands are kept with its memory, never completed, as the
 /// controller may still move their data, and only the rescan, which moves none, completes.
+/// The device's own memory goes as they do.
 pub(in crate::drivers::xhci) fn finish(d: Departed, slot: &super::hub::Released) {
     let [inflight, stranded, rescan] = d.0;
-    let disabled = matches!(slot, super::hub::Released::Freed);
+    let disabled = matches!(slot, super::hub::Released::Freed(_));
     for irp in [inflight, stranded].into_iter().flatten().filter(|_| disabled).chain(rescan) {
         complete(irp, KError::PeerClosed as i32, 0);
     }
+    slot.settle(d.1.into_iter().flatten());
 }

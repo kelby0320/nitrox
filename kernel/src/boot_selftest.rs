@@ -518,11 +518,11 @@ fn demand_paging_smoke_test() {
 }
 
 /// Prove `DmaBuffer` gives a physically-contiguous, page-aligned, zeroed block whose
-/// physical address is what a device would DMA at its `virt()` mapping. Dropped at end.
+/// physical address is what a device would DMA at its kernel mapping. Dropped at end.
 fn dma_smoke_test() {
     use nitrox_kernel::mm::DmaBuffer;
 
-    let mut buf = match DmaBuffer::alloc(2 * mm::PAGE_SIZE) {
+    let buf = match DmaBuffer::alloc(2 * mm::PAGE_SIZE) {
         Ok(b) => b,
         Err(_) => {
             kprintln!("dma: smoke test skipped (alloc failed)");
@@ -530,13 +530,13 @@ fn dma_smoke_test() {
         }
     };
     let phys = buf.phys();
-    let zeroed = buf.as_slice().iter().all(|&b| b == 0);
     let len = buf.len();
-    buf.as_mut_slice()[0] = 0xD3;
-    buf.as_mut_slice()[len - 1] = 0xA7;
+    let zeroed = (0..len).all(|i| buf.read::<u8>(i) == 0);
+    buf.write::<u8>(0, 0xD3);
+    buf.write::<u8>(len - 1, 0xA7);
 
     // SAFETY: read-only walk of the live top-level page table via the HHDM.
-    let mapped = unsafe { arch::Paging::translate(arch::Paging::active_root(), mm::VirtAddr::new(buf.virt() as u64)) };
+    let mapped = unsafe { arch::Paging::translate(arch::Paging::active_root(), buf.mapped_at()) };
 
     if zeroed && phys.is_page_aligned() && phys.as_u64() != 0 && mapped == Some(phys) {
         kprintln!(

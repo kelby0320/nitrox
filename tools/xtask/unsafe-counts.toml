@@ -8,7 +8,7 @@
 "kernel/src/boot_selftest" = 6
 "kernel/src/clock" = 1
 "kernel/src/dpc" = 4
-"kernel/src/drivers" = 68
+"kernel/src/drivers" = 45
 "kernel/src/fbcon" = 4
 "kernel/src/handle" = 30
 "kernel/src/initramfs" = 1
@@ -27,7 +27,7 @@
 [unsafe-fns]
 "kernel/src/arch" = 126
 "kernel/src/dpc" = 2
-"kernel/src/drivers" = 4
+"kernel/src/drivers" = 3
 "kernel/src/fbcon" = 5
 "kernel/src/framebuffer" = 1
 "kernel/src/handle" = 4

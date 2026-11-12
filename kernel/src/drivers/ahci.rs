@@ -155,6 +155,10 @@ impl PendingRing {
 
 /// **Slot 0 and the queue in front of it**, read and changed only in a hold of the port lock.
 struct PortState {
+    /// The 1 KiB command list, slot 0's header first.
+    cmd_list: Programmed,
+    /// Slot 0's command table: its FIS, then its PRDT.
+    cmd_table: Programmed,
     queue: PendingRing,
     /// The IRP issued on slot 0, `null` when idle.
     inflight: *mut Irp,
@@ -167,8 +171,10 @@ struct PortState {
 }
 
 impl PortState {
-    const fn new() -> Self {
+    fn new(cmd_list: Programmed, cmd_table: Programmed) -> Self {
         PortState {
+            cmd_list,
+            cmd_table,
             queue: PendingRing::new(),
             inflight: core::ptr::null_mut(),
             issued_at: 0,
@@ -184,9 +190,7 @@ pub struct AhciDisk {
     abar: u64,      // mapped ABAR kernel-virtual base
     port_base: u64, // abar + 0x100 + port*0x80
     port: u32,
-    cmd_list: Programmed,  // 1 KiB command list; slot 0's header first
-    _fis: Programmed,      // 256 B received-FIS area
-    cmd_table: Programmed, // CFIS + PRDT for slot 0
+    _fis: Programmed, // 256 B received-FIS area
     sectors: u64,
     flush_command: u8,
     /// The port lock: slot 0 and its queue, taken from thread context and the ISR alike.
@@ -199,7 +203,7 @@ pub struct AhciDisk {
 
 // SAFETY: the disk state is set up once at boot and is immutable thereafter except for `state`,
 // the port lock, which `submit`, the ISR and the watch thread take, on whichever CPU, before
-// reading or changing slot 0.
+// reading or changing slot 0, whose memory it holds.
 unsafe impl Send for AhciDisk {}
 // SAFETY: as above.
 unsafe impl Sync for AhciDisk {}
@@ -207,7 +211,8 @@ unsafe impl Sync for AhciDisk {}
 impl AhciDisk {
     /// Its port stopped: the memory it gave the port is freed with it.
     fn release(&mut self, stopped: &Quiesced) {
-        for b in [&mut self.cmd_list, &mut self._fis, &mut self.cmd_table] {
+        let p = &mut *self.state.lock();
+        for b in [&mut p.cmd_list, &mut self._fis, &mut p.cmd_table] {
             b.release(stopped);
         }
     }
@@ -314,7 +319,7 @@ unsafe fn identify(
     name: &mut [u8; MAX_DEVICE_NAME],
 ) -> Option<(u64, usize, u8)> {
     let frags = [PhysFrag { base: data.phys().as_u64(), len: SECTOR_SIZE as u64 }];
-    build_command(disk, ATA_IDENTIFY, 0, 0, &frags, false);
+    build_command(&disk.state.lock(), ATA_IDENTIFY, 0, 0, &frags, false);
     issue(disk);
     if !wait_command_polled(disk, COMMAND_DEADLINE_NS) {
         // The command may be running yet: its buffer goes only once the port has stopped it.
@@ -325,8 +330,7 @@ unsafe fn identify(
     }
     // SAFETY: the command retired, PxCI read clear, and the next one rewrites the table.
     data.release(&unsafe { Quiesced::assume() });
-    // SAFETY: `data` is a page holding the 512-byte, 256-word IDENTIFY result, aligned for words.
-    identity(unsafe { &*(data.virt() as *const [u16; 256]) }, name)
+    identity(&data.read::<[u16; 256]>(0), name)
 }
 
 /// **What an IDENTIFY result says**: its LBA48 sector count, the length of the identity written into
@@ -387,54 +391,31 @@ fn format_identity(words: &[u16; 256], out: &mut [u8; MAX_DEVICE_NAME]) -> usize
     n
 }
 
-fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[PhysFrag], write: bool) {
-    let ct = disk.cmd_table.virt();
-    // SAFETY: `ct` is our owned page-sized command-table buffer, and `frags.len()` is
+/// Write slot 0's command into `p`, the held port lock's state.
+fn build_command(p: &PortState, command: u8, lba: u64, count: u16, frags: &[PhysFrag], write: bool) {
+    let ct = &p.cmd_table;
+    // **The fragments fit the table**: `frags.len()` is
     // `<= MAX_PRDT_ENTRIES` — refused by [`submit`] before the port lock is taken, and again by
     // `dispatch_block_irp` against the `max_frags` this driver publishes. The check is not here
     // because here is under the port lock, where a failure cannot be reported (a `debug_assert!`
-    // there panics on a lock-order violation while formatting, and vanishes in release).
-    unsafe { core::ptr::write_bytes(ct, 0, PRDT_OFFSET + frags.len() * PRDT_ENTRY) };
+    // there panics on a lock-order violation while formatting, and vanishes in release). Those
+    // refusals are all that keep a caller from the panic a write past the table's room makes, here.
+    ct.fill(0, PRDT_OFFSET + frags.len() * PRDT_ENTRY, 0);
 
-    // Command FIS — H2D Register FIS (type 0x27), command set.
-    // SAFETY: `ct` addresses the 64-byte CFIS area.
-    unsafe {
-        ct.add(0).write(0x27);
-        ct.add(1).write(0x80); // C=1 (command)
-        ct.add(2).write(command);
-        ct.add(4).write(lba as u8);
-        ct.add(5).write((lba >> 8) as u8);
-        ct.add(6).write((lba >> 16) as u8);
-        ct.add(7).write(0x40); // device: LBA mode
-        ct.add(8).write((lba >> 24) as u8);
-        ct.add(9).write((lba >> 32) as u8);
-        ct.add(10).write((lba >> 40) as u8);
-        ct.add(12).write(count as u8);
-        ct.add(13).write((count >> 8) as u8);
-    }
+    // Command FIS — H2D Register FIS (type 0x27), C=1 (command), the device in LBA mode.
+    let [l0, l1, l2, l3, l4, l5, ..] = lba.to_le_bytes();
+    ct.copy_in(0, &[0x27, 0x80, command, 0, l0, l1, l2, 0x40, l3, l4, l5, 0, count as u8, (count >> 8) as u8]);
 
     for (i, f) in frags.iter().enumerate() {
-        let e = (ct as u64 + PRDT_OFFSET as u64 + (i as u64) * PRDT_ENTRY as u64) as *mut u32;
-        // SAFETY: `e` is within the owned command-table page (frags bounded).
-        unsafe {
-            e.add(0).write(f.base as u32);
-            e.add(1).write((f.base >> 32) as u32);
-            e.add(2).write(0);
-            // DBC = byte count - 1 (bits 21:0); bit 31 = interrupt on completion.
-            e.add(3).write(((f.len as u32 - 1) & 0x003F_FFFF) | (1 << 31));
-        }
+        // DBC = byte count - 1 (bits 21:0); bit 31 = interrupt on completion.
+        let dbc = ((f.len as u32 - 1) & 0x003F_FFFF) | (1 << 31);
+        ct.write(PRDT_OFFSET + i * PRDT_ENTRY, [f.base as u32, (f.base >> 32) as u32, 0, dbc]);
     }
 
-    let cl = disk.cmd_list.virt() as *mut u32;
-    // DW0: CFL = 5 dwords (H2D FIS), W bit, PRDTL = frag count.
+    // Slot 0's header — DW0: CFL = 5 dwords (H2D FIS), W bit, PRDTL = frag count; DW1: PRDBC.
     let dw0 = 5u32 | ((write as u32) << 6) | ((frags.len() as u32) << 16);
-    // SAFETY: `cl` addresses the 1 KiB command list; slot 0 is its first 32 bytes.
-    unsafe {
-        cl.add(0).write(dw0);
-        cl.add(1).write(0); // PRDBC
-        cl.add(2).write(disk.cmd_table.phys().as_u64() as u32);
-        cl.add(3).write((disk.cmd_table.phys().as_u64() >> 32) as u32);
-    }
+    let table = ct.phys().as_u64();
+    p.cmd_list.write(0, [dw0, 0, table as u32, (table >> 32) as u32]);
 }
 
 fn issue(disk: &AhciDisk) {
@@ -562,9 +543,9 @@ unsafe fn issue_locked(d: &AhciDisk, p: &mut PortState, irp: *mut Irp) -> bool {
     // A flush is non-data — no LBA, no count, no PRDT — and completes with a D2H register FIS,
     // which `PXIE_DHRE` already interrupts on.
     if op == crate::io::irp::IrpOp::Flush as u32 {
-        build_command(d, command, 0, 0, &[], false);
+        build_command(p, command, 0, 0, &[], false);
     } else {
-        build_command(d, command, lba, count, frags, write);
+        build_command(p, command, lba, count, frags, write);
     }
     p.inflight = irp;
     p.issued_at = clock();
@@ -612,9 +593,8 @@ fn take_retired(d: &AhciDisk, p: &mut PortState) -> (*mut Irp, bool, u32, u64) {
     }
     let retired = core::mem::replace(&mut p.inflight, core::ptr::null_mut());
     let err = read32(d.port_base, PX_TFD) & TFD_ERR != 0;
-    // SAFETY: the command list is this disk's, mapped while it lives, and slot 0's header DW1 is
-    // only rewritten by `build_command` for the next command, which cannot start under this lock.
-    let moved = unsafe { (d.cmd_list.virt() as *const u32).add(1).read_volatile() };
+    // Slot 0's header DW1, which only `build_command` for the next command rewrites, under this lock.
+    let moved = p.cmd_list.read::<u32>(4);
     (retired, err, moved, p.issued_at)
 }
 
