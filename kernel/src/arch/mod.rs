@@ -31,6 +31,7 @@ pub mod irq_install;
 pub mod irq_router;
 pub mod memory_types;
 pub mod paging;
+pub mod percpu;
 pub mod platform;
 pub mod smp;
 pub mod timer;

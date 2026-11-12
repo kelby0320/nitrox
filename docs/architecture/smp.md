@@ -54,10 +54,20 @@ Per-CPU state lives in two layers, split by the arch boundary:
 `MAX_CPUS = 8` sizes the arrays and the CPU bitmasks. QEMU is exercised with
 `-smp 4`.
 
-Neutral code never reads an APIC id, an MSR, or `gs:` directly — it asks
-`crate::arch::Smp::current_cpu() -> u32` (the dense index) and indexes its arrays.
-That keeps the "which core am I" mechanism swappable behind `crate::arch` (x86
-uses `RDTSCP`; an aarch64 port would use `MPIDR_EL1`/`TPIDR_EL1`).
+Neutral code never reads an APIC id, an MSR, or `gs:` directly. It reads the dense index
+under a **pin** (`arch::percpu`): a `CpuPin` that an `IrqsOff`, an `IrqSpinLockGuard`, a
+`PreemptOff` or the scheduler's held state lends, under which the thread cannot change core.
+`CpuIndex::current(pin)` reads the index, so it cannot be read where nothing keeps the thread
+on the core it names; `SchedState::me()` reads it under `SCHED`. A shared value per core is a
+`cpu_local!` (the preemption depth, the deferred reschedule, the ending flag, the lock
+tracker's ranks), reached by `with(pin, f)`, or by `remote(cpu, f)` for another core's, and a
+host test thread has a set of its own. The arch layer's own arrays (the GDTs, TSSes and IST
+stacks, the syscall blocks) are `PerCpu`s, reached by raw slot alone. Debug builds check a
+pin's claim, interrupts masked or preemption off, as the index is read; and `switch_into`
+refuses a live `IrqsOff`, as masked interrupts keep no thread on its core across a switch.
+`leave_online` alone reads the index unpinned, on a core about to halt (§ 8). That keeps the
+"which core am I" mechanism swappable behind `crate::arch` (x86 uses `RDTSCP`; an aarch64
+port would use `MPIDR_EL1`/`TPIDR_EL1`).
 
 ### 2. The dense CPU index (identity)
 
@@ -99,8 +109,9 @@ thread that *adopts* the `_start` context (`Thread::try_new_boot`, tid 0, no
 
 1. **Single-core init** — serial, GDT/IDT tables, paging, initramfs, IRQ routing,
    entropy, device/IO self-tests, drivers, the console.
-2. **BSP identity** — `arch::Smp::init_this_cpu(0)` sets the BSP's `IA32_TSC_AUX`
-   to 0. **This runs before the scheduler first reads `current_cpu()` and before
+2. **BSP identity** — `arch::Smp::init_this_cpu(CpuIndex::BSP)` sets the BSP's
+   `IA32_TSC_AUX` to 0, and its tables and syscall entry are armed beside it, under a pin
+   `IrqsOff::observed()` lends. **This runs before the scheduler first reads the index and before
    any AP is online** — critical: it must execute while the boot thread is still
    pinned to the BSP (Bug 5).
 3. **Scheduler up (single-core)** — `sched::init` builds `SchedState`, the BSP's
@@ -147,7 +158,7 @@ it as `current`, and calls `switch_into`. In order, the preparation:
    (`Thread::parked_sp`, which answers `None` while the guard is raised), its
    **page-table root** (`resolve_root` → the process's CR3, or the boot root for
    kernel threads) and its `kstack_top`.
-2. Records `last_cpu = this_cpu()` on the incoming thread (for cache-warm wakeups).
+2. Records `last_cpu = me()` on the incoming thread (for cache-warm wakeups).
 3. **Raises the outgoing thread's `on_cpu` guard** (`Thread::raise_on_cpu`) — while
    still holding `SCHED` (§7, invariant I2) — and takes the addresses of its saved-RSP
    slot, guard byte and FP area. That parked context is written after the lock is
@@ -155,12 +166,13 @@ it as `current`, and calls `switch_into`. In order, the preparation:
 
 Then `switch_into`:
 
-4. **Releases `SCHED`** but keeps interrupts masked (`release_keeping_irqs_masked`).
-5. **Arms the incoming thread's kernel-entry state on this core**
-   (`arm_kernel_stack`): sets **TSS.RSP0** (`Cpu::set_kernel_stack`) and
-   the **syscall entry stack** to the incoming thread's `kstack_top`, and
-   re-asserts this core's **`KERNEL_GS_BASE`** (`arm_user_entry_cpu_base`). This is
-   what makes migration safe (§5).
+4. **Arms the incoming thread's kernel-entry state on this core**
+   (`arm_kernel_stack`), under the `SCHED` guard, its pin: sets **TSS.RSP0**
+   (`Cpu::set_kernel_stack`) and the **syscall entry stack** to the incoming thread's
+   `kstack_top`, and re-asserts this core's **`KERNEL_GS_BASE`**
+   (`arm_user_entry_cpu_base`). Nothing reads them before a ring-3 entry, after the switch.
+   This is what makes migration safe (§5).
+5. **Releases `SCHED`** but keeps interrupts masked (`release_keeping_irqs_masked`).
 6. **Loads CR3** (`Paging::set_page_table(next_root)`) — before the stack swap, so
    a dying thread leaves CR3 on the incoming root before its own address space is
    torn down.
@@ -181,9 +193,8 @@ fabricated frame `ret`s into `thread_trampoline` (`context.rs`): `sti` (it did n
 arrive via an `iretq` that would restore IF), then `call thread_enter`
 (`sched.rs`). `thread_enter` reads the current thread under `SCHED`; if it is a
 **user** thread it points TSS.RSP0 + the syscall stack at this thread's kernel
-stack and re-arms `KERNEL_GS_BASE` (`arm_kernel_stack`), still under `SCHED`,
-where reading the CPU and writing its slots cannot straddle a migration; the setters
-assert interrupts are masked in debug builds. It then `enter_user`s to ring 3 (seeding
+stack and re-arms `KERNEL_GS_BASE` (`arm_kernel_stack`), still under `SCHED`, whose
+guard lends the setters their pin. It then `enter_user`s to ring 3 (seeding
 `rdi/rsi/rdx/rcx` with the spawn hand-off — notification channel, root namespace,
 etc.). A **kernel** thread runs its body then `exit_thread`s.
 

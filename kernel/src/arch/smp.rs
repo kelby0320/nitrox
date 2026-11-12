@@ -21,7 +21,7 @@ pub trait ArchSmp {
     fn cpu_count() -> usize;
 
     /// The dense logical index (`0..MAX_CPUS`) of the CPU this runs on — the
-    /// primitive neutral code uses to index per-CPU state (`CPUS[current_cpu()]`).
+    /// unpinned primitive [`CpuIndex::current`](crate::arch::percpu::CpuIndex::current) pins.
     /// Read from the hardware, not hard-coded, so it is correct on every running CPU.
     fn current_cpu() -> u32;
 
@@ -33,8 +33,6 @@ pub trait ArchSmp {
     /// not run [`init_this_cpu`](ArchSmp::init_this_cpu) reports `0`, indistinguishable from
     /// a correctly-identified CPU 0. Any caller that would *act on another CPU's behalf* if
     /// it guessed wrong — clearing its bit in a mask, taking its slot — must ask here first.
-    /// Callers that merely index per-CPU state defensively (the lock tracker folds an
-    /// out-of-range id onto 0) do not need it.
     fn identity_bound() -> bool;
 
     /// Establish this CPU's logical `index` so [`current_cpu`](ArchSmp::current_cpu)
@@ -42,7 +40,7 @@ pub trait ArchSmp {
     /// at boot; each AP with its index at SMP bring-up). On x86 this programs
     /// `IA32_TSC_AUX`, which `RDTSCP` reads back; it affects only that returned id,
     /// not the timestamp counter.
-    fn init_this_cpu(index: u32);
+    fn init_this_cpu(index: crate::arch::percpu::CpuIndex);
 
     /// Send an inter-processor interrupt of `vector` to the CPU whose interrupt-controller id
     /// is `target` (on x86 its x2APIC id, not its dense index).

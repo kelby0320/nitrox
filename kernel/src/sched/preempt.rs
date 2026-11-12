@@ -1,6 +1,10 @@
 //! Preemption control: the per-CPU disable count and the deferred reschedule.
 
+use core::marker::PhantomData;
+
 use super::*;
+use crate::arch::percpu::{CpuPin, cpu_local};
+use crate::libkern::IrqsOff;
 
 /// Assert that a thread arriving from ring 3 has preemption enabled.
 ///
@@ -15,7 +19,7 @@ use super::*;
 /// Debug builds only.
 pub fn assert_user_entry_preempt_safe() {
     debug_assert_eq!(
-        with_preempt_off(SchedState::this_cpu(), |c| c.load(Ordering::Relaxed)),
+        preempt_depth(),
         0,
         "entered a syscall from ring 3 with preemption disabled — a kernel path leaked a \
          `preempt_disable`, and this CPU will stop preempting until something notices"
@@ -34,7 +38,7 @@ pub fn assert_user_entry_preempt_safe() {
 /// descheduled and strand the raised counter on a thread no longer running. Debug builds only.
 pub(super) fn assert_switch_preempt_safe() {
     debug_assert_eq!(
-        with_preempt_off(SchedState::this_cpu(), |c| c.load(Ordering::Relaxed)),
+        preempt_depth(),
         0,
         "context switch with preemption disabled — a voluntary switch inside a \
          preempt-critical region deschedules a CPU that asked not to be, and strands the \
@@ -42,55 +46,41 @@ pub(super) fn assert_switch_preempt_safe() {
     );
 }
 
-/// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by the thread
-/// running on that CPU (which cannot migrate while it is nonzero); read by the same CPU's
-/// tick and reschedule-IPI handlers.
-#[cfg(not(test))]
-static PREEMPT_OFF: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
-
-/// Set when a reschedule opportunity (tick expiry or reschedule IPI) was skipped because
-/// [`PREEMPT_OFF`] was raised; consumed by [`preempt_enable`], which replays the
-/// reschedule. Backstop: the CPU's next periodic tick.
-#[cfg(not(test))]
-static RESCHED_PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-
-#[cfg(test)]
-std::thread_local! {
-    /// Host-test backing for [`PREEMPT_OFF`] and [`RESCHED_PENDING`], **one pair per thread**.
-    ///
-    /// Under `cfg(test)` `current_cpu()` reports `0` for every thread, so as process-globals
-    /// every concurrent test taking a [`SpinLock`](crate::libkern::SpinLock) (whose `lock()`
-    /// calls [`preempt_disable`]) would write the same two slots. Scoped access rather than a
-    /// leaked `'static` (`kernel/CLAUDE.md` forbids `Box::leak` patterns); the production
-    /// path indexes the static directly.
-    static PREEMPT_OFF_TLS: [AtomicU32; MAX_CPUS] =
-        const { [const { AtomicU32::new(0) }; MAX_CPUS] };
-    static RESCHED_PENDING_TLS: [AtomicBool; MAX_CPUS] =
-        const { [const { AtomicBool::new(false) }; MAX_CPUS] };
+cpu_local! {
+    /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by the thread
+    /// running on that CPU (which cannot migrate while it is nonzero); read by the same CPU's
+    /// tick and reschedule-IPI handlers.
+    pub(super) static PREEMPT_OFF: AtomicU32 = AtomicU32::new(0);
 }
 
-/// This CPU's preempt-disable counter. See [`PREEMPT_OFF`].
-#[cfg(not(test))]
-#[inline(always)]
-pub(super) fn with_preempt_off<R>(cpu: usize, f: impl FnOnce(&AtomicU32) -> R) -> R {
-    f(&PREEMPT_OFF[cpu])
+cpu_local! {
+    /// Set when a reschedule opportunity (tick expiry or reschedule IPI) was skipped because
+    /// [`PREEMPT_OFF`] was raised; consumed by [`preempt_enable`], which replays the
+    /// reschedule. Backstop: the CPU's next periodic tick.
+    pub(super) static RESCHED_PENDING: AtomicBool = AtomicBool::new(false);
 }
 
-#[cfg(test)]
-pub(super) fn with_preempt_off<R>(cpu: usize, f: impl FnOnce(&AtomicU32) -> R) -> R {
-    PREEMPT_OFF_TLS.with(|a| f(&a[cpu]))
+/// This CPU's preemption disabled until it drops; not `Send`, as the depth is its CPU's.
+#[must_use = "preemption is enabled again as it drops"]
+pub struct PreemptOff(PhantomData<*const ()>);
+
+impl PreemptOff {
+    /// The pin it lends.
+    pub fn pin(&self) -> CpuPin<'_> {
+        // SAFETY: the depth it raised keeps the thread on this CPU until it drops.
+        unsafe { CpuPin::assume() }
+    }
 }
 
-/// This CPU's deferred-reschedule latch. See [`RESCHED_PENDING`].
-#[cfg(not(test))]
-#[inline(always)]
-pub(super) fn with_resched_pending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R {
-    f(&RESCHED_PENDING[cpu])
+impl Drop for PreemptOff {
+    fn drop(&mut self) {
+        preempt_enable();
+    }
 }
 
-#[cfg(test)]
-pub(super) fn with_resched_pending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R {
-    RESCHED_PENDING_TLS.with(|a| f(&a[cpu]))
+pub(super) fn preempt_depth() -> u32 {
+    let off = IrqsOff::mask();
+    PREEMPT_OFF.with(&off.pin(), |c| c.load(Ordering::Relaxed))
 }
 
 /// Disable preemption on the current CPU (nestable). While the depth is nonzero, the tick
@@ -104,44 +94,43 @@ pub(super) fn with_resched_pending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) ->
 /// descheduled holding such a lock, the spinners keep every CPU busy and the holder is
 /// starved forever.
 ///
-/// Contract: pair with [`preempt_enable`] on the same thread; the window must be bounded (no
+/// Contract: the guard drops on this thread, not being `Send`; the window must be bounded (no
 /// blocking, no `sys_wait`) and hold no `SCHED`-ordered lock.
 ///
 /// [`SpinLock`](crate::libkern::SpinLock) calls this in `lock()` (and the enable in its
 /// guard drop), making **every plain-spinlock critical section a no-preemption region**: a
 /// spinner, even with interrupts masked, always waits on a *running* holder, so the wait is
 /// bounded by the critical section.
-pub fn preempt_disable() {
+pub fn preempt_disable() -> PreemptOff {
     // Mask IRQs across read-index + increment: an interrupt between them could migrate this
     // thread and the increment would land on the wrong CPU's counter, sticking it nonzero.
     // Once the count is raised, descheduling is impossible.
-    let prev = preempt_irqs_mask();
-    with_preempt_off(SchedState::this_cpu(), |c| c.fetch_add(1, Ordering::Relaxed));
-    preempt_irqs_restore(prev);
+    let off = IrqsOff::mask();
+    PREEMPT_OFF.with(&off.pin(), |c| c.fetch_add(1, Ordering::Relaxed));
+    PreemptOff(PhantomData)
 }
 
 /// Whether preemption is off on this CPU, for an assertion: exact when it is.
 pub fn preemption_disabled() -> bool {
-    with_preempt_off(SchedState::this_cpu(), |c| c.load(Ordering::Relaxed) > 0)
+    preempt_depth() > 0
 }
 
 /// Re-enable preemption (see [`preempt_disable`]); at depth zero, replays a reschedule that
 /// was skipped during the window. (If the thread is descheduled or migrates between the
 /// depth reaching zero and the replay, the replay's under-lock re-check makes it a no-op;
 /// the origin CPU's next tick covers any consumed-but-unserviced wake.)
-pub fn preempt_enable() {
-    let prev = preempt_irqs_mask();
-    let me = SchedState::this_cpu();
+fn preempt_enable() {
+    let off = IrqsOff::mask();
     // **Saturating, not wrapping.** An unbalanced enable at depth 0 would set the counter to
     // `u32::MAX` and that CPU would never preempt again. Overflow checks do not help: an
     // atomic RMW wraps by definition. The `debug_assert` is the loud half and the saturation
     // the safe half.
     //
     // **Do not "simplify" this to a plain load/store.** Masked interrupts make the RMW
-    // redundant on target, but `preempt_irqs_mask` is what makes it indivisible, and a plain
+    // redundant on target, but `off` is what makes it indivisible, and a plain
     // load/store would make this line's correctness depend on that mask staying exactly
     // where it is. The RMW costs an uncontended `lock` prefix and removes the coupling.
-    let depth_before = with_preempt_off(me, |c| {
+    let depth_before = PREEMPT_OFF.with(&off.pin(), |c| {
         c.try_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)))
             // unwrap_or: the closure is infallible, so `try_update` cannot return `Err`.
             .unwrap_or(0)
@@ -151,41 +140,15 @@ pub fn preempt_enable() {
         "preempt_enable with no matching preempt_disable — the counter would have wrapped \
          to u32::MAX and this CPU would never preempt again"
     );
-    let replay = depth_before == 1 && with_resched_pending(me, |c| c.swap(false, Ordering::AcqRel));
-    preempt_irqs_restore(prev);
+    let replay = depth_before == 1 && RESCHED_PENDING.with(&off.pin(), |c| c.swap(false, Ordering::AcqRel));
+    drop(off);
     if replay {
         // Mirror `on_reschedule_ipi`: resume an idle CPU into the scheduler; a busy thread
         // is left to its quantum (the next tick reschedules it).
         let g = SCHED.lock();
-        let cpu = SchedState::this_cpu();
+        let cpu = g.me();
         if current_is_idle(&g) && (!g.ready[cpu].is_empty() || steal_available(&g, cpu)) {
             switch_to_next(g);
         }
     }
-}
-
-/// Mask interrupts for the preempt-counter update window. A no-op on the host, where tests
-/// run ring-3 with no ticks to race (a real `cli` would `#GP`).
-#[inline]
-fn preempt_irqs_mask() -> bool {
-    #[cfg(not(test))]
-    {
-        Cpu::interrupts_disable()
-    }
-    #[cfg(test)]
-    {
-        false
-    }
-}
-
-/// Restore the interrupt state captured by [`preempt_irqs_mask`].
-#[inline]
-fn preempt_irqs_restore(prev: bool) {
-    #[cfg(not(test))]
-    // SAFETY: ring-0; restoring the state captured by the paired mask.
-    unsafe {
-        Cpu::interrupts_restore(prev)
-    };
-    #[cfg(test)]
-    let _ = prev;
 }

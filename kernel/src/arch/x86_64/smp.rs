@@ -2,10 +2,12 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::arch::percpu::{CpuIndex, CpuPin};
 use crate::arch::smp::{ArchSmp, MAX_CPUS};
 use crate::arch::x86_64::regs;
 
 /// `IA32_TSC_AUX`: each CPU's dense index; `RDTSCP`/`RDPID` read it back. Does not affect the TSC.
+#[cfg(not(test))]
 const MSR_TSC_AUX: u32 = 0xC000_0103;
 
 const APIC_UNSET: u32 = u32::MAX;
@@ -33,17 +35,12 @@ pub fn bind_cpu_identity(dense: u32, apic: u32) {
 
 /// Set the running core's dense index in `IA32_TSC_AUX` by looking up its APIC id. `None` if
 /// never bound; the caller must **not** run with a guessed index, which would collide.
-pub fn adopt_dense_index() -> Option<u32> {
+pub fn adopt_dense_index() -> Option<CpuIndex> {
     let apic = hw_apic_id();
-    for (i, slot) in DENSE_TO_APIC.iter().enumerate() {
-        if slot.load(Ordering::Acquire) == apic {
-            // SAFETY: `IA32_TSC_AUX` is architectural; writing this core's dense
-            // index only sets what RDTSCP/RDPID return. Ring-0 wrmsr.
-            unsafe { regs::wrmsr(MSR_TSC_AUX, i as u64) };
-            return Some(i as u32);
-        }
-    }
-    None
+    let i = DENSE_TO_APIC.iter().position(|slot| slot.load(Ordering::Acquire) == apic)?;
+    let index = CpuIndex::new(i)?;
+    X86Smp::init_this_cpu(index);
+    Some(index)
 }
 
 /// The x2APIC id bound to dense index `cpu`, or `None` if out of range or unbound.
@@ -55,10 +52,6 @@ pub(crate) fn apic_of_dense(cpu: usize) -> Option<u32> {
         APIC_UNSET => None,
         apic => Some(apic),
     }
-}
-
-fn dense_index_ok(index: u32) -> bool {
-    (index as usize) < MAX_CPUS
 }
 
 /// The x86_64 [`ArchSmp`] implementation. Re-exported as `crate::arch::Smp`.
@@ -96,16 +89,16 @@ impl ArchSmp for X86Smp {
         0
     }
 
-    fn init_this_cpu(index: u32) {
-        // In a release build too: every per-CPU array is indexed with it, unchecked.
-        assert!(dense_index_ok(index), "dense CPU index {index} past MAX_CPUS");
+    fn init_this_cpu(index: CpuIndex) {
         #[cfg(not(test))]
         // SAFETY: IA32_TSC_AUX is architectural on every x86-64 CPU; writing the
         // logical index there only sets the value RDTSCP/RDPID return, leaving the
         // timestamp counter untouched. Ring-0 wrmsr.
         unsafe {
-            regs::wrmsr(MSR_TSC_AUX, index as u64)
+            regs::wrmsr(MSR_TSC_AUX, index.get() as u64)
         };
+        #[cfg(test)]
+        let _ = index;
     }
 
     unsafe fn send_ipi(target: u32, vector: u8) {
@@ -118,12 +111,12 @@ impl ArchSmp for X86Smp {
 
 /// Per-CPU bring-up for an application processor, run on the AP itself.
 ///
-/// [`X86Smp::init_this_cpu`] must already have set this CPU's index, so `current_cpu()` is
+/// [`adopt_dense_index`] must already have set this CPU's index, so `current_cpu()` is
 /// correct for the per-CPU GDT/TSS and syscall block. Loads the GDT/TSS and shared IDT, enables
 /// NX/WP/SMEP/SMAP, enters x2APIC, and arms the syscall MSRs. Leaves interrupts masked.
-pub fn ap_cpu_init() {
+pub fn ap_cpu_init(pin: &CpuPin<'_>) {
     use crate::arch::cpu::ArchCpu;
-    super::gdt::init();
+    super::gdt::init(pin);
     super::idt::load();
     super::cpu::X86Cpu::init_protections();
     // CR0/CR4/XCR0 are per-CPU. Must precede the first `context_switch` on this CPU, which
@@ -139,23 +132,16 @@ pub fn ap_cpu_init() {
     // SAFETY: ring-0 AP bring-up path; the CPU advertises x2APIC (asserted inside
     // `enable_this_cpu`), and this runs before the AP touches the local APIC.
     unsafe { super::apic::enable_this_cpu() };
-    super::syscall::init_syscall_entry();
+    super::syscall::init_syscall_entry(pin);
 }
 
 #[cfg(test)]
 mod tests {
-    /// Refused before `IA32_TSC_AUX`, from where every per-CPU array would be indexed with it.
-    #[test]
-    #[should_panic(expected = "past MAX_CPUS")]
-    fn an_index_past_max_cpus_is_refused() {
-        use crate::arch::smp::ArchSmp;
-        X86Smp::init_this_cpu(MAX_CPUS as u32);
-    }
-
     #[test]
     fn the_last_index_is_the_one_below_max_cpus() {
-        assert!(super::dense_index_ok(MAX_CPUS as u32 - 1));
-        assert!(!super::dense_index_ok(MAX_CPUS as u32));
+        use crate::arch::percpu::CpuIndex;
+        assert_eq!(CpuIndex::new(MAX_CPUS - 1).map(CpuIndex::get), Some(MAX_CPUS - 1));
+        assert_eq!(CpuIndex::new(MAX_CPUS), None);
     }
 
     use super::*;

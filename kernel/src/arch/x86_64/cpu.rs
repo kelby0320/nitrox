@@ -28,10 +28,10 @@ const CPUID_7_0_EBX_SMAP: u32 = 1 << 20;
 pub struct X86Cpu;
 
 impl ArchCpu for X86Cpu {
-    fn init_tables() {
+    fn init_tables(pin: &crate::arch::percpu::CpuPin<'_>) {
         // The IDT's gates reference the kernel code selector the GDT installs, and the
         // double-fault gate needs the TSS's IST stack, so the GDT comes first.
-        gdt::init();
+        gdt::init(pin);
         idt::init();
     }
 
@@ -41,8 +41,8 @@ impl ArchCpu for X86Cpu {
         ensure_smap_smep();
     }
 
-    fn set_kernel_stack(top: crate::mm::kstack::KernelStackTop) {
-        gdt::set_kernel_stack(top.get());
+    fn set_kernel_stack(top: crate::mm::kstack::KernelStackTop, pin: &crate::arch::percpu::CpuPin<'_>) {
+        gdt::set_kernel_stack(top.get(), pin);
     }
 
     fn stop_the_machine() -> ! {

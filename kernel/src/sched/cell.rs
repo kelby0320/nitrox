@@ -4,6 +4,7 @@
 
 use core::cell::UnsafeCell;
 
+use crate::arch::percpu::CpuPin;
 use crate::object::header::{Shared, Weak};
 
 /// The right to borrow what `SCHED` guards. The scheduler's state keeps the one there is, so a
@@ -19,6 +20,13 @@ impl SchedToken {
     /// hold.
     pub(super) const unsafe fn new() -> Self {
         Self(())
+    }
+
+    /// The pin the held lock lends.
+    pub(super) fn pin(&self) -> CpuPin<'_> {
+        // SAFETY: the one token is reached only through `SCHED`'s guard, which masks this CPU's
+        // interrupts while held; a test's own is on the host, where every thread reads index 0.
+        unsafe { CpuPin::assume() }
     }
 
     /// A token for a test's own objects, which no `SchedState` reaches.

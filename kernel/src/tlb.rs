@@ -33,10 +33,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
-use crate::arch::smp::ArchSmp;
-use crate::arch::{Cpu, MAX_CPUS, Paging, Smp, send_shootdown_ipi};
-use crate::libkern::SpinLock;
+use crate::arch::percpu::CpuIndex;
+use crate::arch::{Cpu, MAX_CPUS, Paging, send_shootdown_ipi};
 use crate::libkern::lockrank::LockRank;
+use crate::libkern::{IrqsOff, SpinLock};
 use crate::mm::VirtAddr;
 
 /// Serialises initiators: one request in flight system-wide, so the single request block below is
@@ -77,12 +77,6 @@ pub fn shootdown_all() {
     shootdown(None);
 }
 
-/// This CPU's index, read where the thread cannot migrate.
-fn pinned_cpu() -> usize {
-    debug_assert!(crate::sched::preemption_disabled(), "the CPU read with preemption on");
-    Smp::current_cpu() as usize
-}
-
 /// Perform the local invalidation for a request. `None` = whole TLB.
 fn invalidate_local(va: Option<VirtAddr>) {
     match va {
@@ -102,14 +96,13 @@ fn shootdown(va: Option<VirtAddr>) {
         other_cpu();
     }
     // Preemption off before reading this CPU: the sole-online path invalidates only the one read.
-    crate::sched::preempt_disable();
-    let me = pinned_cpu();
+    let off = crate::sched::preempt_disable();
+    let me = CpuIndex::current(&off.pin()).get();
     let online = crate::sched::online_mask();
 
     // Sole online CPU (or pre-SMP boot): invalidate locally; no other CPU holds a stale entry.
     if online & !(1u64 << me) == 0 {
         invalidate_local(va);
-        crate::sched::preempt_enable();
         return;
     }
 
@@ -164,8 +157,6 @@ fn shootdown(va: Option<VirtAddr>) {
     // `sysretq` stub's window on the user stack; `syscall_dispatch` asserts against it.
     // SAFETY: ring-0; restore the interrupt state captured above.
     unsafe { Cpu::interrupts_restore(prev_if) };
-    // Re-enable preemption last; a reschedule latched during the window is replayed here.
-    crate::sched::preempt_enable();
 }
 
 #[cfg(test)]
@@ -208,7 +199,7 @@ pub fn on_ipi() {
     invalidate_local(va);
     // Acknowledge after the invalidation is issued: the initiator sees completion only once this
     // CPU can no longer use the stale translation.
-    ACKED.fetch_or(1u64 << (Smp::current_cpu() as usize), Ordering::Release);
+    ACKED.fetch_or(1u64 << CpuIndex::current(&IrqsOff::observed().pin()).get(), Ordering::Release);
 }
 
 #[cfg(test)]

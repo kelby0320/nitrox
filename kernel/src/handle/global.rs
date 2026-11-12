@@ -116,9 +116,9 @@ pub fn close_all_owned_by(pid: u32) -> usize {
     loop {
         let (batch, more): ([Option<Closed>; SWEEP_BATCH], bool) = get().close_owned_batch(pid, &mut cursor);
         let n = batch.iter().flatten().count();
-        crate::sched::preempt_disable();
+        let off = crate::sched::preempt_disable();
         drop(batch);
-        crate::sched::preempt_enable();
+        drop(off);
         closed += n;
         if !more {
             return closed;

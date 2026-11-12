@@ -10,29 +10,24 @@
 // under `cfg(test)`. Each pair is positive-and-negative on purpose: the `should_panic` half
 // alone would pass against a guard that fires unconditionally.
 
-/// Raise the depth on *this thread's* counter and put it back, whatever the test does.
-///
-/// RAII because two tests panic while it is alive and cleanup after the assert would not
-/// run. Nothing depends on that today (libtest gives every test a fresh OS thread), so it
-/// is defensive against a harness that shares a thread.
-struct PreemptRaised;
-impl PreemptRaised {
-    fn new() -> Self {
-        super::with_preempt_off(super::SchedState::this_cpu(), |c| {
-            c.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-        });
-        PreemptRaised
-    }
-}
-impl Drop for PreemptRaised {
-    fn drop(&mut self) {
-        // `fetch_sub`, not `store(0)`: zeroing would make this fixture unusable inside a
-        // held `SpinLock`, whose guard drop then reaches `preempt_enable` and trips its
-        // underflow assert — reporting a wrap that never happened.
-        super::with_preempt_off(super::SchedState::this_cpu(), |c| {
-            c.fetch_sub(1, core::sync::atomic::Ordering::Relaxed)
-        });
-    }
+/// `cpu_local!`'s twin is a thread's own: a process-wide one shows each holder a depth of two.
+#[test]
+fn each_thread_holding_a_lock_sees_a_depth_of_its_own() {
+    use std::sync::{Arc, Barrier};
+    let both = Arc::new(Barrier::new(2));
+    let depth_while_held = |both: Arc<Barrier>| {
+        move || {
+            let lock = crate::libkern::SpinLock::new(LockRank::Leaf, ());
+            let _held = lock.lock();
+            both.wait();
+            let depth = super::preempt_depth();
+            both.wait();
+            depth
+        }
+    };
+    let a = std::thread::spawn(depth_while_held(both.clone()));
+    let b = std::thread::spawn(depth_while_held(both));
+    assert_eq!((a.join().unwrap(), b.join().unwrap()), (1, 1));
 }
 
 #[test]
@@ -45,7 +40,7 @@ fn a_syscall_from_ring_3_with_preemption_enabled_is_accepted() {
 #[test]
 #[should_panic(expected = "entered a syscall from ring 3 with preemption disabled")]
 fn a_syscall_from_ring_3_with_preemption_disabled_is_refused() {
-    let _raised = PreemptRaised::new();
+    let _off = super::preempt_disable();
     super::assert_user_entry_preempt_safe();
 }
 
@@ -59,7 +54,7 @@ fn a_voluntary_switch_with_preemption_enabled_is_accepted() {
 #[test]
 #[should_panic(expected = "context switch with preemption disabled")]
 fn a_voluntary_switch_inside_a_preempt_critical_window_is_refused() {
-    let _raised = PreemptRaised::new();
+    let _off = super::preempt_disable();
     super::assert_switch_preempt_safe();
 }
 
@@ -113,6 +108,8 @@ fn inert_ref(tid: u32) -> Ref<Thread> {
 
 /// A fresh `SchedState` for data-structure tests (no idle thread; the refs are inert).
 fn test_state() -> SchedState {
+    // Masked, as `SCHED`'s hold leaves a CPU: the state's token lends a pin.
+    crate::libkern::irqs::force(false);
     SchedState {
         ready: [const { Reserved::unreserved() }; MAX_CPUS],
         cpu_online: {
@@ -426,7 +423,7 @@ fn steal_one_skips_busiest_victim_with_no_stealable_thread() {
         assert!(st.ready[1].push(t).is_ok());
     }
     assert!(st.ready[2].push(inert_ref(20)).is_ok());
-    // Host `this_cpu()` is 0. `steal_one` must not return None when `steal_available` holds
+    // Host `me()` is 0. `steal_one` must not return None when `steal_available` holds
     // (searching only the busiest victim would), which panics the idle-steal paths.
     assert!(steal_available(&st, 0));
     let stolen = steal_one(&mut st).expect("steal_one must succeed when steal_available");
@@ -477,7 +474,7 @@ fn drain_pending_drops_moves_all_and_preserves_capacity() {
 }
 
 // --- stats: the pure format step. The increment sites and `stats_snapshot` need a running
-// scheduler (they read `this_cpu()`) and are validated under QEMU.
+// scheduler (they read `me()`) and are validated under QEMU.
 
 /// A snapshot with the given rows online (all other CPUs offline).
 fn snap_with(rows: &[(usize, stats::CpuSnapshot)]) -> stats::Snapshot {
@@ -807,7 +804,7 @@ fn a_process_ending_wakes_its_blocked_thread_resumes_its_suspended_one_and_tells
     assert!(st.suspended.is_empty());
     let ready: std::vec::Vec<_> = st.ready.iter().flat_map(|q| q.iter().map(|r| r.as_ptr())).collect();
     assert!(ready.contains(&b) && ready.contains(&s3), "woken and resumed to run");
-    assert!(with_ending(1, |e| e.load(Ordering::Acquire)), "CPU 1 ends its running thread on the way out");
+    assert!(ENDING.remote(1, |e| e.load(Ordering::Acquire)), "CPU 1 ends its running thread on the way out");
     let left = st.deadlines.iter().any(|e| e.target == deadline::Target::Thread(b as usize));
     assert!(left, "left for its own wait_on to remove");
     assert!(st.reap.iter().all(|q| q.is_empty()));

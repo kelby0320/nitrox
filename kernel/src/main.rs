@@ -21,7 +21,7 @@ use nitrox_kernel::arch::timer::ArchTimer;
 use nitrox_kernel::fbcon;
 use nitrox_kernel::framebuffer;
 use nitrox_kernel::kprintln;
-use nitrox_kernel::libkern::printable::Printable;
+use nitrox_kernel::libkern::{IrqsOff, printable::Printable};
 use nitrox_kernel::limine::{
     BaseRevision, BootloaderInfoRequest, DateAtBootRequest, ExecutableCmdlineRequest, FirmwareTypeRequest, Framebuffer,
     FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker, SmpInfo,
@@ -110,12 +110,14 @@ fn kernel_main() {
 
     // The BSP's dense index 0, before the per-CPU control tables are found by it: firmware need not
     // leave its reset default. On the BSP, with no AP online, it cannot land on another's index.
-    arch::Smp::init_this_cpu(0);
+    arch::Smp::init_this_cpu(arch::percpu::CpuIndex::BSP);
 
     // Install the CPU control tables (x86_64: GDT + TSS, then IDT; their order lives in the arch
     // layer). First, because it prints nothing and needs nothing, and with the IDT live a bad
     // framebuffer descriptor below gives a register dump rather than a silent triple fault.
-    arch::Cpu::init_tables();
+    arch::Cpu::init_tables(&IrqsOff::observed().pin());
+    // The syscall entry beside them, before the CPU can be scheduled.
+    arch::init_syscall_entry(&IrqsOff::observed().pin());
 
     // The screen, then serial, both needing only what Limine handed over. The screen first, so a
     // machine with no serial port can still say why a boot died.
@@ -133,6 +135,7 @@ fn kernel_main() {
         Err(why) => kprintln!("fbcon: no console on screen — {why}"),
     }
     kprintln!("CPU tables installed (GDT/TSS/IDT)");
+    kprintln!("syscall fast-path armed");
 
     // Say what was handed over and what this processor is before anything that can fail on an
     // unfamiliar machine, so a boot that stops at the next step has said what it stopped on. Both
@@ -337,12 +340,12 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
             // Our APIC id was never bound: a bring-up bug, and fatal (`docs/decision-log.md`,
             // 2026-08-19). The BSP does the stopping, because this core cannot: `ap_cpu_init` has
             // not run, so it has no local APIC and cannot send an IPI, and with no identity
-            // `this_cpu()` reads the `IA32_TSC_AUX` reset default, **0**, so anything touching
+            // `CpuIndex::current` reads the `IA32_TSC_AUX` reset default, **0**, so anything touching
             // per-CPU state would corrupt the BSP's slots.
             //
             // That rules out `kprintln!` and `writeln!` too: `write_str` tees into the log ring
             // first, and `klog::push` takes `KLOG`, whose `lockrank::acquired` indexes
-            // `FLOOR[cpu]`/`DEPTH[cpu]` by `this_cpu()`, again the BSP's slots while it spins in
+            // its held ranks by that index, again the BSP's slots while it spins in
             // `bring_up_aps`. So only the unsynchronised emergency writer's raw `write_byte`, which
             // is port I/O alone. No APIC id in the message: `hw_apic_id` is arch-internal, and
             // widening `ArchSmp` for one diagnostic is not the trade.
@@ -358,7 +361,7 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
             arch::Cpu::halt_loop();
         }
     };
-    arch::ap_cpu_init();
+    arch::ap_cpu_init(&IrqsOff::observed().pin());
     // SAFETY: ring 0; this CPU's x2APIC + IDT are now live.
     unsafe {
         arch::Timer::start_periodic(sched::TICK_NS);
@@ -381,7 +384,7 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
         arch::Cpu::halt_loop();
     }
     AP_ONLINE.fetch_add(1, Ordering::Release);
-    kprintln!("smp: cpu {} online (AP)", idx);
+    kprintln!("smp: cpu {} online (AP)", idx.get());
 
     sched::ap_run();
 }
@@ -696,7 +699,7 @@ unsafe fn unmap_plain(base: nitrox_kernel::mm::VirtAddr, pages: u64) {
     unsafe { nitrox_kernel::mm::kvmap::unmap_device(base, pages) };
 }
 
-/// Arm the syscall fast path, then load and launch **init** from the initramfs (`/sbin/init`) as
+/// Load and launch **init** from the initramfs (`/sbin/init`) as
 /// pid 1, with `rdi` = its notification-channel handle, `rsi` = a full-rights root-namespace handle
 /// carrying the boot kernel-server bindings, `rdx` = the system-control handle.
 fn run_first_userspace() {
@@ -707,9 +710,6 @@ fn run_first_userspace() {
     use nitrox_kernel::object::header::Ref;
     use nitrox_kernel::object::kernel_server::KernelServerId;
     use nitrox_kernel::object::{Namespace, NotificationChannel, ObjectRef, Process};
-
-    arch::init_syscall_entry();
-    kprintln!("syscall fast-path armed");
 
     let mut aspace = match AddressSpace::new() {
         Ok(a) => a,

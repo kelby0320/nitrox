@@ -4,7 +4,7 @@
 # commit that adds the `unsafe`, whose message says why (kernel/CLAUDE.md's `unsafe` policy).
 
 [unsafe-blocks]
-"kernel/src/arch" = 199
+"kernel/src/arch" = 197
 "kernel/src/boot_selftest" = 6
 "kernel/src/clock" = 1
 "kernel/src/dpc" = 4
@@ -13,7 +13,7 @@
 "kernel/src/handle" = 30
 "kernel/src/initramfs" = 1
 "kernel/src/io" = 34
-"kernel/src/libkern" = 38
+"kernel/src/libkern" = 39
 "kernel/src/limine" = 14
 "kernel/src/main" = 17
 "kernel/src/mm" = 100
@@ -21,11 +21,11 @@
 "kernel/src/pci" = 4
 "kernel/src/power" = 1
 "kernel/src/report" = 1
-"kernel/src/sched" = 21
+"kernel/src/sched" = 22
 "kernel/src/tlb" = 2
 
 [unsafe-fns]
-"kernel/src/arch" = 125
+"kernel/src/arch" = 126
 "kernel/src/dpc" = 2
 "kernel/src/drivers" = 4
 "kernel/src/fbcon" = 5
@@ -42,6 +42,7 @@
 "kernel/src/sched" = 3
 
 [unsafe-impls]
+"kernel/src/arch" = 1
 "kernel/src/dpc" = 3
 "kernel/src/drivers" = 5
 "kernel/src/fbcon" = 1
@@ -60,4 +61,4 @@
 "kernel/src/mm" = 1
 
 [static-muts]
-"kernel/src/arch" = 11
+"kernel/src/arch" = 6

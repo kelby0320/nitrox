@@ -100,7 +100,7 @@ pub fn ap_init() -> Result<(), AllocError> {
     *g.ready_slot() = ready;
     // Mark *this* CPU's bit in the same critical section that reserved its queues, so no
     // placement targets it before they exist.
-    let cpu = SchedState::this_cpu();
+    let cpu = g.me();
     g.cpu_online[cpu] = true;
     online_set::add(cpu); // lock-free mirror
     Ok(())

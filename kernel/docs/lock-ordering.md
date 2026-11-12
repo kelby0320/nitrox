@@ -576,7 +576,8 @@ A related multi-user-thread invariant (not a lock, but switch-path state): the
 per-CPU trap/syscall stack (TSS.RSP0 + the syscall-entry stack) and this CPU's
 `KERNEL_GS_BASE` (`arm_user_entry_cpu_base`) are re-armed for the incoming thread by
 `arm_kernel_stack`, on **every** switch-in (`switch_into`, through which every switch
-passes) and at each thread's first ring-3 descent (`thread_enter`) — a thread that
+passes) and at each thread's first ring-3 descent (`thread_enter`), both under `SCHED`, whose
+guard lends the per-CPU writes their pin (`arch::percpu`) — a thread that
 blocks mid-syscall is switched away with the entry `swapgs` still in effect, so a
 fresh descent must restore it. With a single user thread neither mattered; multiple do.
 
