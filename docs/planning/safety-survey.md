@@ -2216,7 +2216,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   using — both have bitten this codebase. Depends on: nothing. Lenses: abi, ownership, soundness,
   concurrency, opportunities. Value high, effort medium. **Plan**, in P5.
 
-- [ ] **drv-o7** narrow: MMIO accessors are safe functions that dereference whatever base and offset
+- [x] **drv-o7** narrow: MMIO accessors are safe functions that dereference whatever base and offset
   they are given. AHCI and xHCI `read32/write32/write64(base: u64, off: u64)`, PCI
   `MmioCfg::read32/write32(off: u16)` over a 4 KiB window with no range or alignment check, and
   storage's doorbell write. xHCI's operational, runtime and doorbell bases come from
@@ -2234,6 +2234,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   RTSOFF, MaxPorts, a slot ID) or a wrong base turning a register access into a write to arbitrary
   kernel memory, and out-of-window or unaligned config reads through a safe trait method. Depends
   on: nothing. Lenses: abi, soundness, opportunities. Value medium, effort medium. **Plan**, in P5.
+  Done in `48f823e7`: `mm::mmio::Mmio`, which `map_mmio` returns and `MmioWindow::repoint` lends;
+  the xHCI's windows from a pure `windows(..)` held to BAR0, an Enable Slot to MaxSlots; AHCI's
+  ports, PCI's configuration space, storage's doorbell and the IOAPIC's registers windows too.
 
 - [x] **drv-o8** encapsulate: the scheduler's object calls (`complete_pending_op`,
   `pending_op_is_signaled`, `pending_op_completion`, `signal_interrupt`, `interrupt_consume`,
@@ -3002,7 +3005,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   kernel/src/libkern. Closes: a second `Platform::init` mutating data behind a live `&'static`
   slice, count/data publication drifting apart, and the subsystem's only transmute. Depends on:
   nothing. ownership, concurrency, opportunities. Value low, effort small. **Later.**
-- [ ] **kplat-o12** encapsulate: device vectors registered from a pool of eight with no release;
+- [x] **kplat-o12** encapsulate: device vectors registered from a pool of eight with no release;
   a driver that registers and then declines keeps the slot, and exhausting the pool is an assert
   — 8 sites (`grep -rn "install_msi\|install_software\|install_intx\|install_isa_irq\|
   register_device_handler" kernel/src --include=*.rs` call sites: serial.rs:178, ps2.rs:293,
@@ -3016,6 +3019,9 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   failure path and the boot-time assert when the pool runs out (the release image already uses
   5 or 6 slots, the test image 7, io/ramdisk.rs:35-38). Depends on: nothing. ownership. Value
   low, effort small. **Plan**, in P5.
+  Done in `5c98c09b`: `VectorPool` answers `PoolFull`; every install returns a `DeviceVector`,
+  given back dropped only while nothing may raise it, an MSI one kept unless given back and a
+  routed one masked and kept; a failed route gives its vector back.
 - [x] **kplat-o13** narrow: hardware stack pointers travel as `u64`: the TSS.RSP0 and syscall
   stack setters are safe fns taking any `u64`, and `fabricate_frame` is an `unsafe fn` whose
   contract is "top has 56 writable bytes below it", all three values coming from a KernelStack

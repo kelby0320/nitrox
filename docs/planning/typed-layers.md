@@ -803,6 +803,38 @@ pool a value for it, as the global counter is shared by parallel tests; a guard 
 routed install leaves the entry masked and the vector taken, on the IOAPIC's register fake.
 `pci/mod.rs` is at its size entry, so `MmioCfg` may not grow it. Author.
 
+**Built 2026-11-12** (`48f823e7` the windows, `5c98c09b` the vectors).
+- **`mm::mmio::Mmio`, a window of device registers**: `read32` and `write32` an aligned dword held
+  to it, `sub` a window inside it, `None` past its end. `kvmap::map_mmio` returns one for the bytes
+  it maps, and `MmioWindow::repoint` lends its new frame's until the next. **The xHCI's three
+  windows come from a pure `windows(..)`**, held to BAR0 for MaxPorts' port sets, interrupter 0 and
+  MaxSlots' doorbells; an Enable Slot answer past MaxSlots is refused. AHCI's ports are windows in
+  the ABAR, PCI's configuration space one of 4 KiB, its `Cfg` callers unchanged, and storage's
+  doorbell the controller's window. The IOAPIC's registers are one too.
+- **`VectorPool` answers `PoolFull`**, a slot taken by compare-and-swap, and every install returns
+  a **`DeviceVector`**, given back when dropped only while nothing may raise it. One a device may
+  hold an MSI message for stays taken; one routed to a line is masked, then kept. A route that
+  fails gives its vector back, where it leaked.
+- **For the maintainer's eye: three departures from the plan.**
+  1. **An MSI vector dropped stays taken unless given back**, where the plan gave back every
+     uncommitted one: a driver gives one back when its capability refuses the message. Forgetting
+     that leaks a vector; forgetting to mark one programmed would free one a device can write.
+  2. **`map_mmio` takes a length in bytes**, not pages, and returns the window at the BAR's own
+     offset in its page, which each driver added by hand.
+  3. **`reset.rs` keeps its raw reset register**, a byte written at reset with nothing allocated,
+     now mapped by `map_device`.
+
+Counts: `unsafe` blocks fall from 545 to 541 (`mm` +4, raised by hand for `Mmio` and its two
+lenders; `arch` −1, `drivers` −5, `pci` −2), and `unsafe fn`s rise from 197 to 198 (`Mmio::new`).
+
+**The controls**: on `main`, a fake whose RTSOFF points past it has `probe`'s arithmetic write past
+it, which Miri reports; here `windows(..)` refuses it, each window allowed to end at BAR0's end
+and refused a step past. A register one past a window, and an unaligned one, panic; a port past
+the ABAR is not claimed; an Enable Slot answer of 0 or past MaxSlots is refused. A full pool answers
+`PoolFull`, the pool a value; a route dropped leaves its entry masked and its vector taken, on the
+IOAPIC's register fake. Thirteen mutations, each failing its test. Under Miri, both models,
+the 180 tests of the windows, the vectors, the IOAPIC, PCI, DMA and the two drivers.
+
 ### J.14 An I/O request in flight (drv-o12, drv-o1)
 
 **38 `*mut Irp`s**, 24 dereferenced raw, through **12 safe functions** taking one; three handlings
