@@ -884,10 +884,10 @@ command by `keep()`. Depends on J.2, which rewrites the same dispatch lines. Aut
 - **For the maintainer's eye: four departures from the plan.**
   1. **`InFlight` is `io::block`'s child** (`io/block/in_flight.rs`), not in `io/irp.rs` beside
      the hashed layout: there its `pub(super)` mint would be all of `io`'s, the RAM disk's too.
-  2. **AHCI's kept command leaves slot 0**, taken by `give_up` and kept, where it stayed in 
+  2. **AHCI's kept command leaves slot 0**, taken by `give_up` and kept, where it stayed in
      slot; nothing reads slot 0 of a dead port, and the watch thread ends with it. `claim` says
      whether to recover, and `recover` takes slot 0's command itself.
-  3. **Two test mints**: `for_test`, which panics when dropped as the real one does, for 
+  3. **Two test mints**: `for_test`, which panics when dropped as the real one does, for
      controls on `keep`; and `for_test_lax`, for tests that compare what comes back and drop it.
      A host test's token dropped while it unwinds is quiet, so a failing control fails its test
      rather than aborting the run.

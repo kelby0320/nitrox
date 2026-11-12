@@ -556,10 +556,15 @@ pub(in crate::drivers::xhci) struct Departed(pub(super) [Option<InFlight>; 3], p
 /// epoch. The command in flight is handed back, for [`finish`] once the slot is disabled: until
 /// then the controller may still move its data. From the hub thread.
 pub(in crate::drivers::xhci) fn depart(slot: u8) -> Departed {
-    let Some(i) = DISKS.slot_of(slot) else {
+    departed(&DISKS, slot)
+}
+
+/// [`depart`], from `disks`.
+pub(super) fn departed(disks: &Disks, slot: u8) -> Departed {
+    let Some(i) = disks.slot_of(slot) else {
         return Departed([const { None }; 3], None);
     };
-    let (queued, held, mem) = DISKS.depart(i);
+    let (queued, held, mem) = disks.depart(i);
     for irp in queued.into_iter().flatten() {
         irp.complete(KError::PeerClosed as i32, 0);
     }

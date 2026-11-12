@@ -47,7 +47,7 @@
 "kernel/src/drivers" = 5
 "kernel/src/fbcon" = 1
 "kernel/src/handle" = 1
-"kernel/src/io" = 7
+"kernel/src/io" = 5
 "kernel/src/libkern" = 13
 "kernel/src/mm" = 4
 "kernel/src/object" = 23

@@ -14,7 +14,9 @@ no timeout, no filter drivers — see § Deferred).
 
 An `Irp` is **kernel-internal** — not a handle-accessible kernel object, like a
 VMA or a page-table entry; userspace never sees one. But a Tier 2 loadable
-kernel module (a future driver) is handed `&mut Irp` and walks its fields, so the
+kernel module (a future driver; none is built) would be handed the `Irp` and walk
+its fields — the kernel's own block drivers hold one as an `InFlight` and read it
+through its accessors ([`drivers-and-irps.md`](../architecture/drivers-and-irps.md)) — so the
 layout is a **kernel-ABI version-hash input** (`abi-version-hash.md` § "IRP
 layout"): `Irp`, `IrpStack`, `IrpStackFrame`, and the `IrpOp`/`IrpStatus` enums.
 Any field/offset/size change invalidates the hash and forces all modules to

@@ -183,8 +183,40 @@ fn fake_abar() -> Mmio<'static> {
     Mmio::over(std::boxed::Box::leak(std::boxed::Box::new([0u32; 96])))
 }
 
+/// **A test's disk, which keeps what its port still holds when the test ends**, as a disk given up
+/// does: so only a request the driver let go of unfinished fails the test.
+struct Fake(AhciDisk);
+
+impl core::ops::Deref for Fake {
+    type Target = AhciDisk;
+    fn deref(&self) -> &AhciDisk {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Fake {
+    fn deref_mut(&mut self) -> &mut AhciDisk {
+        &mut self.0
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let (slot, mut queue) = give_up(&mut self.0.state.lock());
+        if let Some(slot) = slot {
+            slot.keep();
+        }
+        while let Some(irp) = queue.pop() {
+            irp.keep();
+        }
+    }
+}
+
 /// **A disk on fake registers**, and the ABAR they are in.
-fn fake_disk() -> (Mmio<'static>, AhciDisk) {
+fn fake_disk() -> (Mmio<'static>, Fake) {
     crate::mm::test_support::init_global_heap();
     let abar = fake_abar();
     let disk = AhciDisk {
@@ -205,17 +237,17 @@ fn fake_disk() -> (Mmio<'static>, AhciDisk) {
         counted: Counted::new(),
         wake: interrupt_object(),
     };
-    (abar, disk)
+    (abar, Fake(disk))
 }
 
 fn interrupt_object() -> Ref<InterruptObject> {
     Ref::new(InterruptObject::try_new().unwrap())
 }
 
-/// `irp`, in flight, by a token the test may drop: a status checked after shows it was completed.
+/// `irp`, in flight: dropped by the driver, it fails the test.
 fn fly(irp: *mut Irp) -> InFlight {
     // SAFETY: the test's IRP, which outlives the disk it is submitted to.
-    unsafe { InFlight::for_test_lax(irp) }
+    unsafe { InFlight::for_test(irp) }
 }
 
 /// Whether slot 0's command is `irp`.
@@ -403,15 +435,13 @@ fn a_port_that_will_not_stop_keeps_its_command_and_fails_the_rest() {
     let (_regs, d) = fake_disk();
     let frag = PhysFrag { base: 0x10_0000, len: 512 };
     let (mut first, mut second, mut third) = (read_irp(&frag), read_irp(&frag), read_irp(&frag));
-    // SAFETY: the test's IRPs, which outlive the disk; one dropped unfinished fails the test.
-    let strict = |irp: *mut Irp| unsafe { InFlight::for_test(irp) };
-    given_up(&d, strict(&mut first), strict(&mut second));
+    given_up(&d, fly(&mut first), fly(&mut second));
     crate::dpc::run_pending();
     assert!(d.state.lock().dead);
     assert_eq!(first.status, PENDING, "kept");
     assert!(d.state.lock().inflight.is_none(), "for good, out of slot 0");
     assert_eq!(second.status, IO_ERROR, "queued: failed");
-    submit(&d, strict(&mut third));
+    submit(&d, fly(&mut third));
     crate::dpc::run_pending();
     assert_eq!(third.status, IO_ERROR, "after: refused");
 }
@@ -581,4 +611,63 @@ fn a_port_that_will_not_stop_is_given_no_command_list() {
     pb.write32(PX_CMD, CMD_CR);
     assert_eq!(claim_port(abar, 0).map(|_| ()), Err("its port would not stop"));
     assert_eq!((pb.read32(PX_CLB), pb.read32(PX_FB), pb.read32(PX_CI)), (0, 0, 0), "nothing given");
+}
+
+/// **A submit past a full queue is refused `IoError`**: slot 0 busy, the queue full behind it.
+#[test]
+fn a_submit_past_a_full_queue_is_refused() {
+    let _exclusive = crate::dpc::exclusive();
+    let (_regs, d) = fake_disk();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let mut irps: std::vec::Vec<Irp> = (0..PENDING_DEPTH + 2).map(|_| read_irp(&frag)).collect();
+    for r in irps.iter_mut() {
+        submit(&d, fly(r));
+    }
+    crate::dpc::run_pending();
+    let (last, held) = irps.split_last().unwrap();
+    assert!(held.iter().all(|r| r.status == PENDING), "issued, then queued");
+    assert_eq!(last.status, IO_ERROR, "past the queue: refused");
+}
+
+/// **A request the port cannot take is refused `InvalidArgument`**: more fragments than a command
+/// table holds, or an op with no ATA command, at an idle slot 0 or reaching it from the queue.
+#[test]
+fn a_request_the_port_cannot_take_is_refused() {
+    let _exclusive = crate::dpc::exclusive();
+    use crate::io::irp::{IRP_BUF_FRAGS, IrpBuffer, IrpOp};
+    let (_regs, d) = fake_disk();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let many = std::vec![frag; MAX_PRDT_ENTRIES as usize + 1];
+    let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: many.len() as u32, frags: many.as_ptr() as u64 };
+    let len = 512 * many.len() as u64;
+    let mut wide = Irp::new_block(IrpOp::Read, core::ptr::null(), 0, len, buffer, core::ptr::null_mut(), 0);
+    let rescan = || Irp::new_block(IrpOp::Rescan, core::ptr::null(), 0, 0, IrpBuffer::NONE, core::ptr::null_mut(), 0);
+    let (mut idle, mut first, mut queued) = (rescan(), read_irp(&frag), rescan());
+    for r in [&mut wide as *mut Irp, &mut idle, &mut first, &mut queued] {
+        submit(&d, fly(r));
+    }
+    crate::dpc::run_pending();
+    let invalid = crate::syscall::error::KError::InvalidArgument as i32;
+    assert_eq!((wide.status, idle.status), (invalid, invalid), "at submit");
+    assert_eq!(queued.status, PENDING, "behind slot 0's read");
+    d.port_base.write32(PX_CI, 0);
+    d.port_base.write32(PX_TFD, 0x50);
+    d.state.lock().cmd_list.write::<u32>(4, 512);
+    assert_eq!(settle_polled(&d, true), Some(true));
+    crate::dpc::run_pending();
+    assert_eq!(queued.status, invalid, "reaching slot 0 from the queue");
+}
+
+/// **A request with no disk published is refused `PeerClosed`**: the port names the disk AHCI
+/// publishes, and a host test publishes none.
+#[test]
+fn a_request_with_no_disk_published_is_refused() {
+    let _exclusive = crate::dpc::exclusive();
+    crate::mm::test_support::init_global_heap();
+    assert!(AHCI.get().is_none());
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    let mut r = read_irp(&frag);
+    Port.submit(fly(&mut r));
+    crate::dpc::run_pending();
+    assert_eq!(r.status, crate::syscall::error::KError::PeerClosed as i32);
 }

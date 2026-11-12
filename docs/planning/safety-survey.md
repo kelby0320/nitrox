@@ -2313,7 +2313,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   values, where a `Published` holds one. Fails without it:
   `a_value_is_published_once_and_a_second_is_refused`.
 
-- [x] **drv-o12** encapsulate: `BlockBackend`'s `ctx: *mut ()` is re-cast at every submit and poll
+- [ ] **drv-o12** encapsulate: `BlockBackend`'s `ctx: *mut ()` is re-cast at every submit and poll
   (Partition, AhciDisk, RamDisk), or is an integer smuggled through the pointer (USB slot/lun/epoch,
   storage.rs:136; HID and PS/2 indexes, hid.rs:75). Its `submit`, `poll` and `ctx` fields are pub,
   so safe code can pair any ctx with any submit; `window_of` identifies a Partition by comparing
@@ -2329,9 +2329,12 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   window missed on rescan because two function addresses compare equal or unequal (drv-d16).
   Depends on: drv-o11 (for the `'static` device refs). Lenses: ownership, soundness, opportunities.
   Value medium, effort medium. **Plan**, in P5.
-  Done in `fb32fe03`, by the second option, which leaves room for a Tier 2 driver: private fields,
-  and `BlockBackend::new::<C: BlockDevice>`, each context read back as its own type by its own
-  functions; a USB disk's a `UnitAt` value. A window is its node's, `DeviceNode::window`.
+  **The block half** done in `fb32fe03`, by the second option, which leaves room for a Tier 2
+  driver: private fields, and `BlockBackend::new::<C: BlockDevice>`, each context read back as its
+  own type by its own functions; a USB disk's a `UnitAt` value. A window is its node's,
+  `DeviceNode::window`. **The char half is open**: `CharBackend`'s fields are public and its
+  `ctx: *mut ()` carries HID's `epoch << 8 | slot` and PS/2's index, which Part J leaves
+  (`typed-layers.md` § What Part J does not do).
 
 - [x] **drv-o13** encapsulate: the storage `Dev` and HID `Bound` table entries keep raw u64 virtual
   addresses of rings, wrapper, binding and report pages that live in `DeviceMem.class`, owned by

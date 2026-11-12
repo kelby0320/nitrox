@@ -367,8 +367,6 @@ mod tests {
     use crate::mm::test_support::init_global_heap;
     use crate::object::MemoryObject;
 
-    /// An IRP over host memory: on the host the HHDM offset is 0, so a fragment's "physical" base
-    /// is simply a host address.
     /// An IRP's parts as a driver hands them over, its fragments a raw slice of its buffer's.
     impl RamDisk {
         fn transfer_irp(&self, irp: &Irp) -> (i32, u64) {
@@ -388,6 +386,8 @@ mod tests {
         }
     }
 
+    /// An IRP over host memory: on the host the HHDM offset is 0, so a fragment's "physical" base
+    /// is simply a host address.
     fn irp(op: IrpOp, offset: u64, frags: &[PhysFrag]) -> Irp {
         let length = frags.iter().map(|f| f.len).sum();
         let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: frags.len() as u32, frags: frags.as_ptr() as u64 };
@@ -452,6 +452,29 @@ mod tests {
         drop(rd);
         assert!(module[1536..2048].iter().all(|&x| x == 0xAB), "the last block written");
         assert!(module[2048..].iter().all(|&x| x == 0xCD), "and not a byte past the disk");
+    }
+
+    /// **A request submitted is completed with its status and the bytes it moved**, through the
+    /// token's fragments: a write, then a read past the disk's end.
+    #[test]
+    fn a_submitted_request_completes_with_its_status_and_what_it_moved() {
+        let _exclusive = crate::dpc::exclusive();
+        init_global_heap();
+        let mut module = vec![0_u8; 2048];
+        // SAFETY: `module` outlives `rd`.
+        let rd = unsafe { RamDisk::over_memory(module.as_mut_ptr(), 2048) }.unwrap();
+        let out = frames_of(&[0xAB; 512]);
+        let frags = [frag(&out, 0, 512)];
+        let (mut write, mut past) = (irp(IrpOp::Write, 512, &frags), irp(IrpOp::Read, 2048, &frags));
+        for r in [&mut write as *mut Irp, &mut past] {
+            // SAFETY: the test's IRPs and fragments, which outlive the requests.
+            ramdisk_submit(&rd, unsafe { InFlight::for_test(r) });
+        }
+        crate::dpc::run_pending();
+        assert_eq!((write.status, write.transferred), (IrpStatus::Success as i32, 512));
+        assert_eq!((past.status, past.transferred), (KError::InvalidArgument as i32, 0));
+        drop(rd);
+        assert!(module[512..1024].iter().all(|&x| x == 0xAB), "written through the token's fragments");
     }
 
     /// **The disk it owns takes writes**, through a pointer that may write.

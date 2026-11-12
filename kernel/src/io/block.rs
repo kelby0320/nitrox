@@ -123,7 +123,7 @@ unsafe fn poll_as<C: BlockDevice>(ctx: MaybeUninit<usize>) {
 /// completion's [`finish`] recovers the box from the `irp` pointer, which a dispatch makes from
 /// the box's, so that it reaches the whole box. Its `ObjectRef`s keep
 /// the raw pointers inside `irp` valid; `frags` backs `irp.buffer`. None of this is the
-/// hashed `Irp` layout: a Tier 2 module only ever sees `*mut Irp`.
+/// hashed `Irp` layout, which is all a Tier 2 module would see.
 #[repr(C)]
 pub(crate) struct IrpBox {
     irp: Irp,
@@ -395,8 +395,8 @@ pub fn reclaim_backlog() -> usize {
 
 // SAFETY: the pointer is an `IrpBox` this module allocated and owns exclusively from the
 // moment its IRP completes; it is reachable only under `RECLAIM`, and the thread-context
-// drain takes the whole list before touching any of it. Same reasoning as `BlockBackend`
-// above — a raw pointer into memory this module owns for a well-defined interval.
+// drain takes the whole list before touching any of it, so whichever CPU holds the lock may hold
+// the pointer.
 unsafe impl Send for ReclaimHead {}
 
 /// Drop every completed IRP box. **Thread context only**: the frees
@@ -534,13 +534,6 @@ pub struct Partition {
     /// that passed the check reaches the disk after the new table is published.
     entering: core::sync::atomic::AtomicU32,
 }
-
-// SAFETY: a `Partition` is immutable after setup but for `retired` and `entering`, which
-// are atomic, and its `disk` backend is `Send + Sync` (its device synchronises itself), so
-// it may be used from whichever CPU submits.
-unsafe impl Send for Partition {}
-// SAFETY: as above.
-unsafe impl Sync for Partition {}
 
 impl BlockDevice for &'static Partition {
     /// Bounds-check, **rebase** the offset to disk-absolute and forward to the parent disk's backend.
