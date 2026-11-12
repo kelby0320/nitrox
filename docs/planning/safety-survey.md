@@ -1682,7 +1682,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   nothing. Lenses: abi, ownership, soundness, opportunities. Value medium, effort small.
   **Fix**, as kobj-o6.
   Fixed in `efb315e2` and `d4b1fa5e`, as kobj-o6.
-- [ ] **kmem-o9** encapsulate: drivers reach `DmaBuffer` memory through the raw `virt()` pointer,
+- [x] **kmem-o9** encapsulate: drivers reach `DmaBuffer` memory through the raw `virt()` pointer,
   with their own offset arithmetic, volatile accesses and slice building, and sometimes store the
   address as a `u64` in their own structs; `as_slice`/`as_mut_slice` hand out references over
   memory a device may be writing — 19 sites (`grep -rn "\.virt()" kernel/src --include=*.rs |
@@ -1697,6 +1697,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   offset past the buffer, references over device-written bytes, and a raw address stored in a
   driver struct (hid.rs:446, storage.rs:861) that outlives its `DmaBuffer`. Depends on: kmem-o8's
   marker trait. Lens: abi. Value medium, effort medium. **Plan**, as drv-o3, in P5.
+  Done in `8909c3d1`, as drv-o3: `read::<T: Pod>`, `write`, `copy_in`, `copy_out` and `fill`,
+  volatile, bounded and aligned; `virt()` gone, the self-test reading `mapped_at`, an address.
 - [x] **kmem-o10** narrow: `AddressSpace` repeats `unsafe { Paging::map_page/unmap_page(root, ..)
   }` with the same SAFETY argument ("root is this AS's PML4, lock held, the frame is fresh or the
   object's"), though holding `&mut Inner` already proves the lock and the root — 8 sites (`grep -n
@@ -2134,7 +2136,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   Done in `499e3cc4`, on `30e79517`'s types: the registry holds `Ref<DeviceNode>`, and block I/O
   and the char backends take typed devices and buffers.
 
-- [ ] **drv-o3** encapsulate: DMA memory is read and written through raw pointers from
+- [x] **drv-o3** encapsulate: DMA memory is read and written through raw pointers from
   `DmaBuffer::virt()`, or u64 addresses kept beside the buffer, at hand-computed offsets: AHCI
   command FIS, PRDT, command header and IDENTIFY page, the xHCI ERST, scratchpads and DCBAA, the
   hub's ep0 data page (`data_bytes`, `control_in`), the storage wrapper and binding pages, and the
@@ -2151,6 +2153,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   demonstrated `data_bytes` slice (drv-d8), the PRDT count guarded by convention twice
   (ahci.rs:363-366, 491), the DCBAA slot index. Depends on: nothing. Lenses: abi, opportunities.
   Value high, effort medium. **Plan**, in P5.
+  Done in `8909c3d1`: the accessors on `DmaBuffer` itself, no `DmaRegion` (a safe `Copy` handle
+  to DMA memory is what Part I removed); the drivers' fifteen raw reaches through them, the hub's
+  data page copied out, and a fragment past the PRDT's room stopping `build_command`.
 
 - [x] **drv-o4** encapsulate: device memory handed to a controller, then freed by drop on a path
   that has not proved the controller quiescent: decline paths after a port or controller was
@@ -2318,7 +2323,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   Depends on: drv-o11 (for the `'static` device refs). Lenses: ownership, soundness, opportunities.
   Value medium, effort medium. **Plan**, in P5.
 
-- [ ] **drv-o13** encapsulate: the storage `Dev` and HID `Bound` table entries keep raw u64 virtual
+- [x] **drv-o13** encapsulate: the storage `Dev` and HID `Bound` table entries keep raw u64 virtual
   addresses of rings, wrapper, binding and report pages that live in `DeviceMem.class`, owned by
   the hub thread. `RawSlots(u64)` is a safe struct whose read and write dereference any address,
   and every access argues the memory lives "as long as the entry is in the table"; the
@@ -2339,6 +2344,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   slot is disabled, and safe `RawSlots` writes to an arbitrary address. Depends on: drv-o3 and
   drv-o4 for the accessors and for `release` (not required). Lenses: ownership, soundness,
   opportunities. Value medium, effort medium. **Plan**, in P5.
+  Done in `8909c3d1`: `Dev` and `Bound` own their buffers while bound, claimed from the device's
+  memory, and each use makes its `RingMem` from them; `RingMem::kept` gone. A departure hands them
+  back, freed by the `Quiesced` that `Released::Freed` carries, or leaked with a kept slot.
 
 - [x] **drv-o14** remove: MemoryObject bytes are read through hand-computed HHDM pointers (frame +
   `hhdm_offset`) instead of a bounded accessor, and `copy_into_memobj` is duplicated as an `unsafe

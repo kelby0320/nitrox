@@ -729,6 +729,43 @@ refused; `build_command` with a fragment past the PRDT's room stops, where it wr
 today; a departure whose slot was kept frees none of a device's buffers and one that disabled
 frees all, counted. `hub.rs` is 985 lines, so a move comes first. Author.
 
+**Built 2026-11-12** (`8909c3d1`, after `502f2667` moved the hub's control transfers out).
+- **`DmaBuffer`'s bytes through bounded volatile accessors**: `read::<T: Pod>`, `write`,
+  `copy_in`, `copy_out` and `fill`, each stopping an access past the buffer's end, or unaligned for
+  its type, before a byte moves. `as_slice`, `as_mut_slice` and `Programmed::as_mut_slice` went,
+  and the drivers' fifteen raw reaches with them: AHCI's IDENTIFY, command table and header; the
+  xHCI's ERST, scratchpads and device context slots; the hub's data page, copied into its
+  caller's buffer, a report descriptor into a heap buffer of its length; storage's wrappers and
+  binding buffer, and HID's reports. `RingMem` holds its buffer, and the input context builders
+  write through `InputCtx`.
+- **The storage `Dev` and HID `Bound` own their buffers while bound**, so each use makes its
+  `RingMem` from the buffer its entry holds: `RingMem::kept` and the three stored addresses went. A
+  departure hands them back, `Released::Freed` carrying the `Quiesced` that frees them with the
+  slot's memory; a kept slot leaks them.
+- **For the maintainer's eye: three departures from the plan.**
+  1. **`virt()` went, rather than becoming crate-private**: nothing in the crate needs it, and the
+     self-test checks the translation of `mapped_at`, an address.
+  2. **The accessors are volatile, not J.8's atomic words**: a buffer is up to `2^MAX_ORDER`
+     frames where a view is one, and what writes it meanwhile is a device, outside the memory
+     model, which volatile is for; on the CPU's side one holder reaches it, under its owner's lock.
+  3. **A class's buffers stay the device's memory until it binds**, where the plan had the
+     prepared class own them: a bind fails on a dozen paths, from Configure Endpoint to a full
+     table, and each would have had to give them back. `DeviceMem::claim` takes them all or none,
+     and a bind refused after it hands them back.
+
+Counts: `unsafe` blocks fall from 568 to 545 (`drivers` 68 to 45), and `unsafe fn`s from 198 to
+197 (`RingMem::kept`).
+
+**The controls**: `build_command` with 249 fragments stops before a byte of the table moves; on
+`main` it SIGSEGVs, and Miri reports a 4,112-byte write into a 4,096-byte block. Four bytes at
+`len() - 3` are refused where a `u32` at `len() - 4` passes, bytes so that alignment is not what
+stops them, and a word at an offset of 2 is refused. A departure, counted: a disabled slot frees a
+storage device's seven pages and two endpoints' four, a kept one none, and another device's
+endpoint stays bound. A class claims its buffers all or none. Seven mutations, each failing its
+test. Under Miri, both models, the 125 tests of DMA, AHCI and the xHCI. Tree Borrows first stopped
+at the storage tests' fake doorbell array, read by a reference while the devices wrote it through
+an exposed pointer, as on `main`; one pointer now reaches it.
+
 ### J.13 Registers in a window, and vectors given back (drv-o7, kplat-o12)
 
 **138 register accesses** through safe functions that dereference any base and offset, and

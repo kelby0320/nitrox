@@ -13,7 +13,7 @@ maintainer's call), its thirteen runs done 2026-10-26 and 2026-10-27 and triaged
 Part J added for the kernel layers it plans (the maintainer's call); Part I's items marked fix all
 fixed 2026-11-01, and its Miri job built the same day; Part E detailed 2026-11-02; E.1 to E.5
 built by 2026-11-05; Part J detailed 2026-11-05, J.1 to J.5 built 2026-11-06, J.6 to J.8 2026-11-10,
-J.9 to J.11 2026-11-11.** Each later
+J.9 to J.11 2026-11-11, J.12 2026-11-12.** Each later
 part gets its detail pass when it is next. Ten parts, A–J, in the order below: Part I between D
 and E, and **Part J between Part E's two halves** (the maintainer's call, 2026-11-02). Part E is
 the syscall-surface consolidation, planned separately in

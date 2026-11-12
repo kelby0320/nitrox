@@ -38126,3 +38126,19 @@ Part J's eleventh sub-part, `typed-layers.md` § J.11, built on
   `SchedToken` is not `Sync`.
 - `unsafe` blocks stay at 568, `unsafe fn`s rise from 197 to 198 and `unsafe impl`s from 59 to 60;
   `static mut`s fall from 11 to 6.
+
+## 2026-11-12 — Before Phase 7, J.12: DMA memory, bounded and owned
+
+Part J's twelfth sub-part, `typed-layers.md` § J.12, built on `pre-phase-7/part-j12-dma-memory`.
+
+- **A `DmaBuffer`'s bytes are reached through bounded volatile accessors**: `read::<T: Pod>`,
+  `write`, `copy_in`, `copy_out` and `fill`, each stopping an access past the buffer's end, or
+  unaligned for its type, before a byte moves. No reference to the bytes is to be had, as a device
+  may write them meanwhile, and no address: `as_slice`, `as_mut_slice` and `virt` went.
+- **Volatile, not a frame view's atomic words**: what races the CPU here is a device, outside the
+  memory model, and a buffer spans up to `2^MAX_ORDER` frames.
+- **A USB class's buffers are its table entry's while it is bound**: the storage `Dev` and the HID
+  `Bound` claim them from the device's memory as they bind, and the DPC makes each ring from the
+  buffer its entry holds, so no address outlives its buffer. A departure hands them back, freed by
+  the `Quiesced` a disabled slot proves, or kept with a slot that would not disable.
+- `unsafe` blocks fall from 568 to 545, and `unsafe fn`s from 198 to 197.
