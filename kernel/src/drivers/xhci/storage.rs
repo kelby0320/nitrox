@@ -49,6 +49,7 @@ use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::printable::Printable;
 use crate::libkern::{IrqSpinLock, KVec};
+use crate::mm::Mmio;
 use crate::mm::dma::{DmaBuffer, Programmed};
 use crate::object::device_node::{BlockGeometry, DeviceNode, ResourceDescriptor};
 use crate::syscall::error::KError;
@@ -253,7 +254,8 @@ pub(super) struct Dev {
     wrap: Programmed,
     /// The binding's data buffer, [`BIND_DATA`] bytes: what the hub thread's commands read into.
     data: Programmed,
-    db: u64,
+    /// The controller's doorbells.
+    db: Mmio<'static>,
     tag: u32,
     luns: [Lun; MAX_LUNS],
     inflight: Option<Command>,
@@ -484,9 +486,7 @@ impl Dev {
     }
 
     fn ring(&self, dci: u8) {
-        // SAFETY: `db` is the controller's doorbell array, or a host test's stand-in for it, with an
-        // entry per slot.
-        unsafe { core::ptr::write_volatile((self.db + 4 * self.slot as u64) as *mut u32, dci as u32) };
+        self.db.write32(4 * self.slot as u64, dci as u32);
     }
 
     fn read_csw(&self) -> [u8; CSW_LEN] {

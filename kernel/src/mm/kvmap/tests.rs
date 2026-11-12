@@ -89,11 +89,11 @@ fn a_repointed_window_reads_the_new_frame_and_shoots_down_the_old() {
     let shots = crate::tlb::shootdowns_by_this_thread().0;
     // SAFETY: frames this test owns, read through the window by nothing.
     unsafe { win.repoint(first).unwrap() };
-    assert_eq!(translate(&other, win.va().as_u64()), Some(first));
+    assert_eq!(translate(&other, win.va.as_u64()), Some(first));
     assert_eq!(crate::tlb::shootdowns_by_this_thread().0, shots, "nothing to shoot down yet");
     // SAFETY: as above.
     unsafe { win.repoint(second).unwrap() };
-    assert_eq!(translate(&other, win.va().as_u64()), Some(second));
+    assert_eq!(translate(&other, win.va.as_u64()), Some(second));
     assert_eq!(crate::tlb::shootdowns_by_this_thread().0, shots + 1, "the first frame's page");
 }
 

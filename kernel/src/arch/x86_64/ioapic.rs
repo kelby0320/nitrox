@@ -18,7 +18,7 @@ use crate::arch::timer::ArchTimer;
 use crate::arch::x86_64::{acpi, idt, regs};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock};
-use crate::mm::kvmap;
+use crate::mm::{Mmio, kvmap};
 
 // --- IOAPIC MMIO indirect registers ---
 const IOREGSEL: u64 = 0x00;
@@ -48,26 +48,20 @@ static PIT_DPC: crate::dpc::Dpc = crate::dpc::Dpc::new(pit_dpc_handler, core::pt
 
 /// **The IOAPIC's registers**, reached (IOREGSEL, then IOWIN) only under [`IOAPIC`]'s guard.
 struct IoApic {
-    base: u64,
+    regs: Mmio<'static>,
     gsi_base: u32,
     entries: u32,
 }
 
 impl IoApic {
     fn read(&mut self, idx: u32) -> u32 {
-        // SAFETY: `base` is the uncached page `init` mapped for good, and only `init` makes one.
-        unsafe {
-            core::ptr::write_volatile((self.base + IOREGSEL) as *mut u32, idx);
-            core::ptr::read_volatile((self.base + IOWIN) as *const u32)
-        }
+        self.regs.write32(IOREGSEL, idx);
+        self.regs.read32(IOWIN)
     }
 
     fn write(&mut self, idx: u32, val: u32) {
-        // SAFETY: as `read`, for a 32-bit write.
-        unsafe {
-            core::ptr::write_volatile((self.base + IOREGSEL) as *mut u32, idx);
-            core::ptr::write_volatile((self.base + IOWIN) as *mut u32, val);
-        }
+        self.regs.write32(IOREGSEL, idx);
+        self.regs.write32(IOWIN, val);
     }
 
     /// The redirection entry serving `gsi`, if this IOAPIC has one.
@@ -169,8 +163,8 @@ impl ArchIrqRouter for X86IoApic {
         };
 
         // SAFETY: `io.addr` is the IOAPIC's MMIO frame from the MADT, the kernel's for good.
-        let va = unsafe { kvmap::map_mmio(io.addr, 1) }?;
-        let mut ioapic = IoApic { base: va.as_u64(), gsi_base: io.gsi_base, entries: 0 };
+        let regs = unsafe { kvmap::map_mmio(io.addr, IOWIN + 4) }?;
+        let mut ioapic = IoApic { regs, gsi_base: io.gsi_base, entries: 0 };
         ioapic.entries = ((ioapic.read(REG_VER) >> 16) & 0xFF) + 1;
         let masked = encode_rte(0, 0, Polarity::ActiveHigh, TriggerMode::Edge, true);
         for idx in 0..ioapic.entries {
@@ -318,21 +312,26 @@ mod tests {
         assert_eq!(high >> 24, 3, "dest in bits 56:63 (high dword 31:24)");
     }
 
+    /// Memory standing in for an IOAPIC's IOREGSEL and IOWIN.
+    fn fake_regs() -> Mmio<'static> {
+        Mmio::over(std::boxed::Box::leak(std::boxed::Box::new([0u32; 8])))
+    }
+
     /// **An IOAPIC serves the GSIs from its base to its count**, and neither neighbour.
     #[test]
     fn an_ioapic_serves_its_gsis_and_neither_neighbour() {
-        let io = IoApic { base: 0, gsi_base: 24, entries: 24 };
+        let io = IoApic { regs: fake_regs(), gsi_base: 24, entries: 24 };
         assert_eq!(io.entry(23), None);
         assert_eq!(io.entry(24), Some(0));
         assert_eq!(io.entry(47), Some(23));
         assert_eq!(io.entry(48), None);
-        assert_eq!(IoApic { base: 0, gsi_base: u32::MAX, entries: 24 }.entry(0), None);
+        assert_eq!(IoApic { regs: fake_regs(), gsi_base: u32::MAX, entries: 24 }.entry(0), None);
     }
 
     /// **A destination wider than the entry's eight bits is refused**, not truncated.
     #[test]
     fn a_destination_wider_than_the_entry_is_refused_rather_than_truncated() {
-        let io = IoApic { base: 0, gsi_base: 0, entries: 24 };
+        let io = IoApic { regs: fake_regs(), gsi_base: 0, entries: 24 };
         assert_eq!(io.names(9, 0xFF), Some((9, 0xFF)));
         assert_eq!(io.names(9, 0x100), None);
         assert_eq!(io.names(24, 0), None);
@@ -342,8 +341,7 @@ mod tests {
     #[test]
     fn a_refused_install_takes_no_vector() {
         extern "C" fn handler() {}
-        let mut regs = [0u32; 8];
-        *IOAPIC.lock() = Some(IoApic { base: regs.as_mut_ptr() as u64, gsi_base: 0, entries: 24 });
+        *IOAPIC.lock() = Some(IoApic { regs: fake_regs(), gsi_base: 0, entries: 24 });
         let taken = idt::device_slots_taken();
         let install = |gsi, dest| {
             // SAFETY: a host test, where nothing delivers the interrupt.

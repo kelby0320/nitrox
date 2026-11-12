@@ -30,7 +30,9 @@ controller**; a second is declined.
    having saved its BARs and command register. From D3hot the driver waits the 10 ms PCI PM 1.2
    requires, and restores what the transition reset when the function lacks `No_Soft_Reset`. The
    laptop's controller was in D3 when Linux was asked about it; QEMU's has no power management.
-2. **Bus mastering** on.
+2. **Bus mastering** on, and **its register windows held to BAR0**: the operational registers
+   with a port set for each of MaxPorts, interrupter 0's, and a doorbell for each of MaxSlots, where
+   CAPLENGTH, RTSOFF and DBOFF put them. A controller that puts one past BAR0 is declined.
 3. **The firmware's handoff**, through the USB Legacy Support extended capability: OS-owned set,
    up to a second for the firmware to clear BIOS-owned — then it is taken anyway, as Linux takes
    it — and the firmware's SMIs turned off.
@@ -127,8 +129,9 @@ enumerated; a disconnection disables the device's slot and frees its memory.
 **Per device**, each step logged if it fails, and the slot disabled again:
 1. a USB 2 port is reset and given its 10 ms recovery; a USB 3 port is enabled by link training,
    which is waited for;
-2. *Enable Slot*, then *Address Device* with the speed's default packet size, then 10 ms for
-   SET_ADDRESS to settle (USB 2.0 allows a device 2 ms; Linux waits 10);
+2. *Enable Slot*, whose answer must be one of MaxSlots' slots, then *Address Device* with the
+   speed's default packet size, then 10 ms for SET_ADDRESS to settle (USB 2.0 allows a device 2 ms;
+   Linux waits 10);
 3. the device descriptor's first eight bytes, then *Evaluate Context* if `bMaxPacketSize0` differs
    from that default — **an exponent at SuperSpeed** (9 is 512), a byte count below it;
 4. the device descriptor, the configuration descriptor (nine bytes, then `wTotalLength`), string

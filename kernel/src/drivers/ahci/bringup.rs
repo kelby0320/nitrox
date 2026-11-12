@@ -16,19 +16,18 @@ pub fn init(controller: &DeviceNode) -> Outcome {
         crate::kprintln!("ahci: controller has no ABAR (BAR5)");
         return declined("the controller has no ABAR (BAR5)");
     }
-    let pages = bar.size.div_ceil(crate::mm::PAGE_SIZE as u64).max(1);
     // SAFETY: `bar.base` is the controller's MMIO ABAR from PCI BAR sizing.
-    let abar = match unsafe { kvmap::map_mmio(PhysAddr(bar.base), pages) } {
-        Ok(va) => va.as_u64() + (bar.base & (crate::mm::PAGE_SIZE as u64 - 1)),
+    let abar = match unsafe { kvmap::map_mmio(PhysAddr(bar.base), bar.size) } {
+        Ok(regs) => regs,
         Err(_) => {
             crate::kprintln!("ahci: ABAR map failed");
             return declined("its ABAR could not be mapped");
         }
     };
 
-    write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_AE);
-    let pi = read32(abar, HBA_PI);
-    let cap = read32(abar, HBA_CAP);
+    abar.write32(HBA_GHC, abar.read32(HBA_GHC) | GHC_AE);
+    let pi = abar.read32(HBA_PI);
+    let cap = abar.read32(HBA_CAP);
     crate::kprintln!("ahci: HBA up (CAP {:#010x}, PI {:#010x})", cap, pi);
 
     // The driver writes 64-bit addresses into the command list, the FIS base and every PRDT entry.
@@ -43,8 +42,10 @@ pub fn init(controller: &DeviceNode) -> Outcome {
         if pi & (1 << p) == 0 {
             continue;
         }
-        let pb = abar + PORT_BASE + p as u64 * PORT_STRIDE;
-        if read32(pb, PX_SSTS) & 0xF == SSTS_DET_PRESENT && read32(pb, PX_SIG) == SIG_SATA {
+        let Some(pb) = port_regs(abar, p) else {
+            continue;
+        };
+        if pb.read32(PX_SSTS) & 0xF == SSTS_DET_PRESENT && pb.read32(PX_SIG) == SIG_SATA {
             port = p;
             break;
         }
@@ -116,8 +117,8 @@ pub fn init(controller: &DeviceNode) -> Outcome {
         }
     };
 
-    write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
-    write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
+    abar.write32(HBA_GHC, abar.read32(HBA_GHC) | GHC_IE);
+    abar.write32(HBA_IS, abar.read32(HBA_IS)); // clear stale
 
     let r = Ref::new(node);
     crate::device::register(r.clone(), "ahci");
@@ -175,8 +176,8 @@ pub(super) type Claimed = (KBox<AhciDisk>, [u8; MAX_DEVICE_NAME], usize);
 
 /// **Claim the SATA disk on `port`**: every allocation made first, so none fails with the port
 /// running, then the port started and the disk identified; or why not, its memory freed if it stopped.
-pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> {
-    let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
+pub(super) fn claim_port(abar: Mmio<'static>, port: u32) -> Result<Claimed, &'static str> {
+    let port_base = port_regs(abar, port).ok_or("its registers lie past the ABAR")?;
     // **A port that will not stop is given nothing**: a command list may be given only to a stopped
     // port, and the one running may be the firmware's.
     if stop_port(port_base).is_none() {
@@ -210,13 +211,13 @@ pub(super) fn claim_port(abar: u64, port: u32) -> Result<Claimed, &'static str> 
         return Err(OUT_OF_MEMORY);
     };
 
-    write32(port_base, PX_CLB, clb as u32);
-    write32(port_base, PX_CLBU, (clb >> 32) as u32);
-    write32(port_base, PX_FB, fb as u32);
-    write32(port_base, PX_FBU, (fb >> 32) as u32);
-    write32(port_base, PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
-    write32(port_base, PX_IS, 0xFFFF_FFFF);
-    write32(port_base, PX_IE, PXIE_DHRE | PX_FATAL);
+    port_base.write32(PX_CLB, clb as u32);
+    port_base.write32(PX_CLBU, (clb >> 32) as u32);
+    port_base.write32(PX_FB, fb as u32);
+    port_base.write32(PX_FBU, (fb >> 32) as u32);
+    port_base.write32(PX_SERR, 0xFFFF_FFFF); // clear errors (write-1-to-clear)
+    port_base.write32(PX_IS, 0xFFFF_FFFF);
+    port_base.write32(PX_IE, PXIE_DHRE | PX_FATAL);
     start_port(port_base);
 
     let mut name = [0u8; MAX_DEVICE_NAME];

@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use super::context;
 use super::hub::{self, DeviceMem, Failed};
 use super::ring::{Producer, RingMem, Trb, code, kind};
-use super::{RING_TRBS, Xhci, write32};
+use super::{RING_TRBS, Xhci};
 use crate::arch::timer::ArchTimer;
 use crate::drivers::hid::{keyboard, mouse};
 use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader, Submitted};
@@ -521,7 +521,7 @@ fn start(x: &Xhci, nodes: &Nodes, mut bound: Bound, mem: &mut DeviceMem) -> bool
 
 fn queue(x: &Xhci, b: &mut Bound) {
     b.ring.push(&mut RingMem::of(&b.ring_mem), Trb::normal(b.buf.phys().as_u64(), b.len as u32));
-    write32(x.db, 4 * b.slot as u64, b.dci as u32);
+    x.db.write32(4 * b.slot as u64, b.dci as u32);
 }
 
 /// **A Transfer Event for an endpoint other than the default one**, from the DPC: a report to

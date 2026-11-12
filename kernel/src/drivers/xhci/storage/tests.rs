@@ -152,29 +152,20 @@ fn a_usb_disk_is_named_by_its_model_and_serial() {
     assert_eq!(&out[..n], b"QEMU QEMU HARDDISK");
 }
 
-/// The doorbell array the devices it makes share, standing in for a controller's: one pointer,
-/// which they and the test reach it by alike. Each device's rings, wrapper page and binding buffer
-/// are its own, reached through its entry in the table.
+/// The doorbell array the devices it makes share, standing in for a controller's. Each device's
+/// rings, wrapper page and binding buffer are its own, reached through its entry in the table.
 struct Fake {
-    db: *mut [u32; 256],
-}
-
-impl Drop for Fake {
-    fn drop(&mut self) {
-        // SAFETY: the array `new` made by `into_raw`, freed once.
-        drop(unsafe { std::boxed::Box::from_raw(self.db) });
-    }
+    db: Mmio<'static>,
 }
 
 impl Fake {
     fn new() -> Fake {
-        Fake { db: std::boxed::Box::into_raw(std::boxed::Box::new([0u32; 256])) }
+        Fake { db: Mmio::over(std::boxed::Box::leak(std::boxed::Box::new([0u32; 256]))) }
     }
 
     /// What was last rung for `slot`.
-    fn doorbell(&self, slot: usize) -> u32 {
-        // SAFETY: the array `new` made, an entry per slot, which the devices write as a doorbell.
-        unsafe { self.db.cast::<u32>().add(slot).read_volatile() }
+    fn doorbell(&self, slot: u64) -> u32 {
+        self.db.read32(4 * slot)
     }
 
     fn dev(&mut self, slot: u8) -> Dev {
@@ -196,7 +187,7 @@ impl Fake {
             bulk_out: ring(),
             wrap: buffer(crate::mm::PAGE_SIZE),
             data: buffer(BIND_DATA),
-            db: self.db as u64,
+            db: self.db,
             tag: 0,
             luns: {
                 let mut l = [Lun::default(); MAX_LUNS];

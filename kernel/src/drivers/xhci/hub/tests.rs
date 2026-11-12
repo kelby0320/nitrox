@@ -52,8 +52,7 @@ fn a_control_transfer_is_cut_to_the_data_page() {
 #[test]
 fn a_default_endpoint_in_doubt_is_asked_nothing_more() {
     crate::mm::test_support::init_global_heap();
-    let mut regs = std::boxed::Box::new([0u32; 64]);
-    let x = super::super::fake(regs.as_mut_ptr() as u64);
+    let x = super::super::fake();
     for (failure, doubt) in [(Failed::Code(code::STALL), false), (Failed::Code(4), true), (Failed::Timeout, true)] {
         let mut mem = device_mem().unwrap();
         assert!(mem.settled::<()>(Err(failure)).is_err());
@@ -105,4 +104,12 @@ fn a_class_claims_its_buffers_all_or_none() {
     assert_eq!((a.phys().as_u64(), b.phys().as_u64(), mem.class.len()), (at[0], at[1], 0));
     mem.keep([a, b]);
     assert_eq!(mem.class.len(), 2, "given back");
+}
+
+/// **An Enable Slot names one of the controller's slots**: zero, and one past its last, are refused.
+#[test]
+fn an_enable_slot_names_one_of_the_controllers_slots() {
+    assert!(!slot_named(0, 32), "no slot");
+    assert!(slot_named(1, 32) && slot_named(32, 32), "its first and its last");
+    assert!(!slot_named(33, 32), "one past its last");
 }

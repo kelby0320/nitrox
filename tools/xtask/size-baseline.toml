@@ -5,7 +5,7 @@
 "kernel/src/arch/x86_64/acpi.rs" = 1035
 "kernel/src/main.rs" = 1044
 "kernel/src/object/file_object.rs" = 1220
-"kernel/src/pci/mod.rs" = 1041
+"kernel/src/pci/mod.rs" = 1032
 "kernel/src/syscall/table.rs" = 2002
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643

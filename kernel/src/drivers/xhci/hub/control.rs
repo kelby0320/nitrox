@@ -82,7 +82,7 @@ pub(super) fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 
     mem.ring.push(&mut slots, Trb::data_in(mem.data.phys().as_u64(), len as u32));
     let at = mem.ring.push(&mut slots, Trb::status(true));
     debug_assert_eq!(base + at as u64 * 16, status_at);
-    write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
+    x.db.write32(4 * slot as u64, DCI_EP0 as u32);
     let answer = match wait(x, &po, TRANSFER_NS) {
         Some((code::SUCCESS, short)) => Ok(len - short.min(len as u64) as u16),
         Some((c, _)) => Err(Failed::Code(c)),
@@ -135,7 +135,7 @@ pub(in crate::drivers::xhci) fn control_out(
     mem.ring.push(&mut slots, Trb::setup(request, false));
     let at = mem.ring.push(&mut slots, Trb::status(false));
     debug_assert_eq!(base + at as u64 * 16, status_at);
-    write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
+    x.db.write32(4 * slot as u64, DCI_EP0 as u32);
     let answer = match wait(x, &po, TRANSFER_NS) {
         Some((code::SUCCESS, _)) => Ok(()),
         Some((c, _)) => Err(Failed::Code(c)),
@@ -176,7 +176,7 @@ pub(in crate::drivers::xhci) fn control_out_data(
     mem.ring.push(&mut slots, Trb::data_out(mem.data.phys().as_u64(), len as u32));
     let at = mem.ring.push(&mut slots, Trb::status(false));
     debug_assert_eq!(base + at as u64 * 16, status_at);
-    write32(x.db, 4 * slot as u64, DCI_EP0 as u32);
+    x.db.write32(4 * slot as u64, DCI_EP0 as u32);
     let answer = match wait(x, &po, TRANSFER_NS) {
         Some((code::SUCCESS, _)) => Ok(()),
         Some((c, _)) => Err(Failed::Code(c)),

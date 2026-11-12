@@ -40,7 +40,7 @@ use crate::dpc::{Dpc, OneAtATime};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox, KVec, Published, SpinLock};
 use crate::mm::dma::{DmaBuffer, Programmed, Quiesced};
-use crate::mm::{PhysAddr, kvmap};
+use crate::mm::{Mmio, PhysAddr, kvmap};
 use crate::object::device_node::{DeviceNode, ResourceDescriptor};
 use crate::object::header::Ref;
 use crate::object::{InterruptObject, PendingOperation};
@@ -135,12 +135,14 @@ pub(super) fn controller() -> Option<&'static Xhci> {
 /// A brought-up controller. Leaked to `'static` once published, as AHCI's disk is: a Tier 1
 /// controller lives as long as the kernel.
 pub struct Xhci {
-    /// The operational, runtime and doorbell registers' virtual bases.
-    op: u64,
-    rt: u64,
-    db: u64,
+    /// The operational registers with their port sets, interrupter 0's, and the doorbells.
+    op: Mmio<'static>,
+    ir: Mmio<'static>,
+    db: Mmio<'static>,
     /// How many ports it has, numbered from 1.
     max_ports: u8,
+    /// How many device slots it has, numbered from 1.
+    max_slots: u8,
     layout: context::Layout,
     caps: caps::ExtCaps,
     /// The device context base array, whose slot entries the hub thread writes, and the
@@ -236,22 +238,28 @@ impl Xhci {
     }
 }
 
-#[inline]
-fn read32(base: u64, off: u64) -> u32 {
-    // SAFETY: `base + off` is inside the controller's mapped, uncached register window.
-    unsafe { core::ptr::read_volatile((base + off) as *const u32) }
-}
-
-#[inline]
-fn write32(base: u64, off: u64, val: u32) {
-    // SAFETY: as `read32`.
-    unsafe { core::ptr::write_volatile((base + off) as *mut u32, val) };
-}
-
 /// A 64-bit register, written as two dwords, low first (xHCI 1.2 §5.1).
-fn write64(base: u64, off: u64, val: u64) {
-    write32(base, off, val as u32);
-    write32(base, off + 4, (val >> 32) as u32);
+fn write64(regs: Mmio, off: u64, val: u64) {
+    regs.write32(off, val as u32);
+    regs.write32(off + 4, (val >> 32) as u32);
+}
+
+/// **The controller's register windows in BAR0**, `bar`, where its capability registers put them:
+/// the operational registers with a port set each for `max_ports`, interrupter 0's runtime
+/// registers, and a doorbell each for the controller and `max_slots` slots.
+struct Windows<'a> {
+    op: Mmio<'a>,
+    ir: Mmio<'a>,
+    db: Mmio<'a>,
+}
+
+/// [`Windows`] from CAPLENGTH, RTSOFF and DBOFF; `None` when one lies past BAR0.
+fn windows(bar: Mmio<'_>, caplength: u8, rtsoff: u32, dboff: u32, max_ports: u8, max_slots: u8) -> Option<Windows<'_>> {
+    Some(Windows {
+        op: bar.sub(caplength as u64, hub::PORTSC + 0x10 * max_ports as u64)?,
+        ir: bar.sub((rtsoff & !0x1F) as u64 + IR0, 0x20)?,
+        db: bar.sub((dboff & !0x3) as u64, 4 * (max_slots as u64 + 1))?,
+    })
 }
 
 /// **Bring-up's clock.** A host test's moves on as it is read, where the host's reads 0.
@@ -333,33 +341,34 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     if bar.size == 0 {
         return declined("it has no BAR0");
     }
-    let pages = bar.size.div_ceil(crate::mm::PAGE_SIZE as u64).max(1);
     // SAFETY: `bar.base` is the controller's MMIO register window, sized by PCI enumeration.
-    let base = match unsafe { kvmap::map_mmio(PhysAddr(bar.base), pages) } {
-        Ok(va) => va.as_u64() + (bar.base & (crate::mm::PAGE_SIZE as u64 - 1)),
+    let base = match unsafe { kvmap::map_mmio(PhysAddr(bar.base), bar.size) } {
+        Ok(regs) => regs,
         Err(_) => return declined("its registers could not be mapped"),
     };
 
-    let lv = read32(base, CAP_LENGTH_VERSION);
+    let lv = base.read32(CAP_LENGTH_VERSION);
     if lv == u32::MAX {
         return declined("its registers read as all ones");
     }
-    let op = base + (lv & 0xFF) as u64;
     let version = lv >> 16;
-    let hcs1 = read32(base, HCSPARAMS1);
-    let hcs2 = read32(base, HCSPARAMS2);
-    let hcc1 = read32(base, HCCPARAMS1);
-    let db = base + (read32(base, DBOFF) & !0x3) as u64;
-    let rt = base + (read32(base, RTSOFF) & !0x1F) as u64;
+    let hcs1 = base.read32(HCSPARAMS1);
+    let hcs2 = base.read32(HCSPARAMS2);
+    let hcc1 = base.read32(HCCPARAMS1);
     let max_slots = (hcs1 & 0xFF) as u8;
     let max_ports = (hcs1 >> 24) as u8;
+    let Some(Windows { op, ir, db }) =
+        windows(base, lv as u8, base.read32(RTSOFF), base.read32(DBOFF), max_ports, max_slots)
+    else {
+        return declined("its capability registers put a register window past BAR0");
+    };
     let scratchpads = ((hcs2 >> 21) & 0x1F) << 5 | (hcs2 >> 27) & 0x1F;
     // The driver writes 64-bit addresses everywhere, of frames anywhere in memory: a controller
     // without them would DMA to the low half of each. Both machines have them.
     if hcc1 & HCC_AC64 == 0 {
         return declined("no 64-bit addressing (AC64 clear)");
     }
-    let ext = caps::walk(|o| read32(base, o as u64), hcc1 >> 16, bar.size.min(u32::MAX as u64) as u32);
+    let ext = caps::walk(|o| base.read32(o as u64), hcc1 >> 16, bar.size.min(u32::MAX as u64) as u32);
 
     // **The firmware lets go.** Without the handoff its SMM handler may go on driving the
     // controller under the kernel.
@@ -368,14 +377,14 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
         Some(leg) => {
             let leg = leg as u64;
             let start = crate::arch::Timer::read_ns();
-            write32(base, leg, read32(base, leg) | LEGSUP_OS_OWNED);
-            let released = wait_for(HANDOFF_NS, || read32(base, leg) & LEGSUP_BIOS_OWNED == 0);
+            base.write32(leg, base.read32(leg) | LEGSUP_OS_OWNED);
+            let released = wait_for(HANDOFF_NS, || base.read32(leg) & LEGSUP_BIOS_OWNED == 0);
             if !released {
                 // As Linux: the firmware is wrong, and the controller is taken anyway.
-                write32(base, leg, read32(base, leg) & !LEGSUP_BIOS_OWNED);
+                base.write32(leg, base.read32(leg) & !LEGSUP_BIOS_OWNED);
             }
-            let ctl = read32(base, leg + 4);
-            write32(base, leg + 4, (ctl & LEGCTL_KEEP) | LEGCTL_CLEAR_EVENTS);
+            let ctl = base.read32(leg + 4);
+            base.write32(leg + 4, (ctl & LEGCTL_KEEP) | LEGCTL_CLEAR_EVENTS);
             let ms = crate::arch::Timer::read_ns().wrapping_sub(start) / 1_000_000;
             if released {
                 crate::kprintln!("xhci: {at}: the firmware handed it over in {ms} ms; its SMIs are off");
@@ -388,27 +397,27 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     // **Not before it is ready** (xHCI 1.2 §4.2): no operational register may be written while
     // Controller Not Ready is set, which a function just raised from D3 can be — a reset written
     // then would land on nothing, and the poll after it pass at once.
-    if !wait_for(RESET_NS, || read32(op, USBSTS) & STS_CNR == 0) {
+    if !wait_for(RESET_NS, || op.read32(USBSTS) & STS_CNR == 0) {
         return declined("it stayed not ready after power-up");
     }
 
     // **Halt, then reset.** The pause comes between setting HCRST and the first read, which is the
     // read it guards: no bound on a loop can stand in for it.
-    if read32(op, USBSTS) & STS_HCH == 0 {
-        write32(op, USBCMD, read32(op, USBCMD) & !CMD_RUN);
-        if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH != 0) {
+    if op.read32(USBSTS) & STS_HCH == 0 {
+        op.write32(USBCMD, op.read32(USBCMD) & !CMD_RUN);
+        if !wait_for(HALT_NS, || op.read32(USBSTS) & STS_HCH != 0) {
             return declined("it did not halt");
         }
     }
-    write32(op, USBCMD, CMD_HCRST);
+    op.write32(USBCMD, CMD_HCRST);
     pause(1_000_000);
-    if !wait_for(RESET_NS, || read32(op, USBCMD) & CMD_HCRST == 0) {
+    if !wait_for(RESET_NS, || op.read32(USBCMD) & CMD_HCRST == 0) {
         return declined("its reset did not complete");
     }
-    if !wait_for(RESET_NS, || read32(op, USBSTS) & STS_CNR == 0) {
+    if !wait_for(RESET_NS, || op.read32(USBSTS) & STS_CNR == 0) {
         return declined("it stayed not ready after its reset");
     }
-    if read32(op, PAGESIZE) & 1 == 0 {
+    if op.read32(PAGESIZE) & 1 == 0 {
         return declined("its page size is not 4 KiB");
     }
 
@@ -429,12 +438,11 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     // The event ring's one segment: its base and size, in the table the controller reads.
     erst.write(0, [ev_mem.phys().as_u64(), RING_TRBS as u64]);
 
-    write32(op, CONFIG, max_slots as u32);
+    op.write32(CONFIG, max_slots as u32);
     write64(op, DCBAAP, dcbaa.phys().as_u64());
     write64(op, CRCR, cmd_mem.phys().as_u64() | cmd_ring.cycle() as u64);
-    let ir = rt + IR0;
-    write32(ir, IMOD, IMOD_INTERVAL);
-    write32(ir, ERSTSZ, 1);
+    ir.write32(IMOD, IMOD_INTERVAL);
+    ir.write32(ERSTSZ, 1);
     write64(ir, ERDP, ev_mem.phys().as_u64());
     write64(ir, ERSTBA, erst.phys().as_u64());
 
@@ -458,9 +466,10 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     };
     let x = Xhci {
         op,
-        rt,
+        ir,
         db,
         max_ports,
+        max_slots,
         layout: context::Layout::new(hcc1 & HCC_CSZ != 0),
         caps: ext,
         dcbaa: SpinLock::new(LockRank::Leaf, Programmed::new(dcbaa)),
@@ -488,8 +497,8 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     // **Run, and prove the rings with a No Op**, polled: interrupts are masked here, and the
     // interrupter is not on yet. Any port's change event that lands first is counted and passed.
     // A decline from here gives the box back only once the controller has stopped.
-    write32(op, USBCMD, CMD_RUN);
-    if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH == 0) {
+    op.write32(USBCMD, CMD_RUN);
+    if !wait_for(HALT_NS, || op.read32(USBSTS) & STS_HCH == 0) {
         give_back(op, |halted| boxed.release(halted));
         return declined("it did not start running");
     }
@@ -518,8 +527,8 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     // throw that interrupt away, and with EHB still set nothing would raise another for the rest of
     // the boot, since only a DPC clears EHB and only an interrupt runs the DPC. So the pending
     // interrupt is kept, and the drain consumes what landed and clears EHB.
-    write32(ir, IMAN, IMAN_IE);
-    write32(op, USBCMD, read32(op, USBCMD) | CMD_INTE);
+    ir.write32(IMAN, IMAN_IE);
+    op.write32(USBCMD, op.read32(USBCMD) | CMD_INTE);
     drain_counting(x);
 
     crate::kprintln!(
@@ -570,21 +579,21 @@ fn scratchpads_for(count: u32, dcbaa: &DmaBuffer) -> Option<Scratchpads> {
 
 /// Stop a controller that was started, before a decline frees what it writes to: halt it, then
 /// reset it, each within its bound. The proof it halted, or `None`, and no reset (xHCI 1.2 §5.4.1).
-fn stop(op: u64) -> Option<Quiesced> {
-    write32(op, USBCMD, 0);
-    if !wait_for(HALT_NS, || read32(op, USBSTS) & STS_HCH != 0) {
+fn stop(op: Mmio) -> Option<Quiesced> {
+    op.write32(USBCMD, 0);
+    if !wait_for(HALT_NS, || op.read32(USBSTS) & STS_HCH != 0) {
         return None;
     }
-    write32(op, USBCMD, CMD_HCRST);
+    op.write32(USBCMD, CMD_HCRST);
     pause(1_000_000);
-    let _ = wait_for(RESET_NS, || read32(op, USBCMD) & CMD_HCRST == 0);
+    let _ = wait_for(RESET_NS, || op.read32(USBCMD) & CMD_HCRST == 0);
     // SAFETY: HCH read set: the controller halted, and a halted one touches no memory.
     Some(unsafe { Quiesced::assume() })
 }
 
 /// **Decline a started controller**: its memory `release`d once it has stopped, so freed when
 /// dropped, and kept for good if it did not stop.
-fn give_back(op: u64, release: impl FnOnce(&Quiesced)) {
+fn give_back(op: Mmio, release: impl FnOnce(&Quiesced)) {
     if let Some(halted) = stop(op) {
         release(&halted);
     }
@@ -600,7 +609,7 @@ fn no_op(x: &Xhci) -> Option<u8> {
         mem.phys().as_u64() + slot as u64 * 16
     };
     // Doorbell 0 is the command ring's, and its target is zero.
-    write32(x.db, 0, 0);
+    x.db.write32(0, 0);
     let mut answer = None;
     let done = wait_for(NO_OP_NS, || {
         drain(x, |trb| {
@@ -630,7 +639,7 @@ fn drain(x: &Xhci, mut seen: impl FnMut(&Trb)) {
         }
         seen(&trb);
     }
-    write64(x.rt + IR0, ERDP, (mem.phys().as_u64() + ring.dequeue() as u64 * 16) | ERDP_EHB);
+    write64(x.ir, ERDP, (mem.phys().as_u64() + ring.dequeue() as u64 * 16) | ERDP_EHB);
 }
 
 /// The interrupt: acknowledge it, and leave the event ring to the DPC.
@@ -638,8 +647,8 @@ extern "C" fn isr() {
     let Some(x) = XHCI.get() else {
         return;
     };
-    write32(x.rt + IR0, IMAN, IMAN_IP | IMAN_IE);
-    write32(x.op, USBSTS, STS_EINT);
+    x.ir.write32(IMAN, IMAN_IP | IMAN_IE);
+    x.op.write32(USBSTS, STS_EINT);
     crate::dpc::enqueue(&XHCI_DPC);
 }
 
@@ -667,7 +676,7 @@ fn drain_events(x: &Xhci) {
                 n += 1;
             }
             let at = mem.phys().as_u64() + ring.dequeue() as u64 * 16;
-            write64(x.rt + IR0, ERDP, at | ERDP_EHB);
+            write64(x.ir, ERDP, at | ERDP_EHB);
         }
         for trb in &batch[..n] {
             on_event(x, trb);
@@ -817,18 +826,20 @@ impl fmt::Display for Ranges<'_> {
     }
 }
 
-/// A controller over `regs`, host memory standing in for its registers: its rings made, its memory
-/// its own, nothing running.
+/// A controller over host memory standing in for its registers: its rings made, its memory its
+/// own, nothing running.
 #[cfg(test)]
-fn fake(regs: u64) -> Xhci {
+fn fake() -> Xhci {
+    let regs = Mmio::over(std::boxed::Box::leak(std::boxed::Box::new([0u32; 64])));
     let page = || DmaBuffer::alloc(RING_TRBS * 16).unwrap();
     let cmd_mem = page();
     let ring = Producer::new(&mut RingMem::of(&cmd_mem), cmd_mem.phys().as_u64());
     Xhci {
         op: regs,
-        rt: regs,
+        ir: regs,
         db: regs,
         max_ports: 1,
+        max_slots: 15,
         layout: context::Layout::new(false),
         caps: caps::ExtCaps::default(),
         dcbaa: SpinLock::new(LockRank::Leaf, Programmed::new(page())),
@@ -852,22 +863,38 @@ fn fake(regs: u64) -> Xhci {
 mod tests {
     use super::*;
 
+    /// **A controller's register windows lie in BAR0, or it is declined**: each may end at BAR0's
+    /// end, and one a step past, by CAPLENGTH, RTSOFF, DBOFF, MaxPorts or MaxSlots, refuses it.
+    #[test]
+    fn a_controllers_register_windows_lie_in_bar0() {
+        let mut regs = [0u32; 0x400];
+        let bar = Mmio::over(&mut regs);
+        let fits = |cap, rts, db, ports, slots| windows(bar, cap, rts, db, ports, slots).is_some();
+        let (cap, rts, db, ports, slots) = (0x20, 0x1000 - 0x40, 0x1000 - 4 * 32, 190, 31);
+        assert!(fits(cap, rts, db, ports, slots), "each window ending at BAR0's end");
+        assert!(!fits(cap + 4, rts, db, ports, slots), "the operational registers past it");
+        assert!(!fits(cap, rts, db, ports + 1, slots), "a port's registers past it");
+        assert!(!fits(cap, rts + 0x20, db, ports, slots), "interrupter 0 past it");
+        assert!(!fits(cap, u32::MAX, db, ports, slots), "RTSOFF far past it");
+        assert!(!fits(cap, rts, db + 4, ports, slots), "the doorbells past it");
+        assert!(!fits(cap, rts, db, ports, slots + 1), "a slot's doorbell past it");
+    }
+
     /// **A declined controller's memory is freed only once it halted**, all of it from one stop:
     /// its context base array, both rings and the segment table. One running is not reset.
     #[test]
     fn a_declined_controller_frees_its_memory_only_once_halted() {
         crate::mm::test_support::init_global_heap();
         for halts in [false, true] {
-            let mut regs = std::boxed::Box::new([0u32; 4]);
-            let op = regs.as_mut_ptr() as u64;
-            write32(op, USBSTS, if halts { STS_HCH } else { 0 });
-            let mut x = fake(op);
+            let mut x = fake();
+            let op = x.op;
+            op.write32(USBSTS, if halts { STS_HCH } else { 0 });
             let freed = crate::mm::heap::frames_freed_by_this_thread();
             give_back(op, |halted| x.release(halted));
             drop(x);
             let gave = crate::mm::heap::frames_freed_by_this_thread() - freed;
             assert_eq!(gave, if halts { 4 } else { 0 }, "halts {halts}: its memory freed");
-            assert_eq!(read32(op, USBCMD), if halts { CMD_HCRST } else { 0 }, "halts {halts}: reset");
+            assert_eq!(op.read32(USBCMD), if halts { CMD_HCRST } else { 0 }, "halts {halts}: reset");
         }
     }
 

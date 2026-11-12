@@ -329,7 +329,13 @@ so a matched controller cannot read as having no driver. The enumeration line fo
 also names its capabilities (`caps msi64 msix pcie +1`: MSI's form, MSI-X, PCI Express, and a
 count of the rest), from the same capability walk `find_capability` uses.
 
-**MMIO mapping.** A driver maps a device's register window with
+**A Tier 1 driver's registers are an `Mmio`** (`mm/mmio.rs`), mapped by `kvmap::map_mmio`
+for good: each access an aligned dword held to the window. Its windows inside the BAR are made
+once, at bring-up, from what the device says: the xHCI's operational, runtime and doorbell
+registers from CAPLENGTH, RTSOFF and DBOFF, held to MaxPorts and MaxSlots; AHCI's ports, each
+held to the ABAR; PCI's configuration space, 4 KiB.
+
+**MMIO mapping.** A userspace driver would map a device's register window with
 
 ```rust
 sys_device_map_mmio(device: RawHandle, region_idx: u32, flags: MmioFlags) -> RawHandle
