@@ -571,6 +571,21 @@ impl Disks {
         self.epochs.get(i).is_some_and(|e| e.load(Ordering::Acquire) == epoch)
     }
 
+    /// [`take`](Self::take), `dev`'s memory kept with the device's, `mem`, when it is refused.
+    fn take_or_keep(&self, dev: Dev, mem: &mut DeviceMem) -> Option<(usize, u32)> {
+        self.take(dev).map_err(|back| mem.keep(back)).ok()
+    }
+
+    /// **Device `i` out of the table before it was published**: its memory kept with the device's,
+    /// `mem`, freed with it once its slot is disabled.
+    fn retire(&self, i: usize, mem: &mut DeviceMem) {
+        let dev = self.devs[i].lock().take();
+        self.states[i].store(RETIRED, Ordering::Release);
+        if let Some(dev) = dev {
+            mem.keep(dev.into_mem());
+        }
+    }
+
     /// **Take a slot for `dev`**: a free one, else a retired one under a new epoch. The slot and its
     /// epoch, or `dev`'s memory back when all are bound. From the hub thread.
     #[allow(clippy::result_large_err, reason = "four buffers, handed back once, on a refusal")]

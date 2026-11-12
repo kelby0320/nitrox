@@ -22,7 +22,7 @@ arriving in a widget runs on every boot:
 | The merged stream at `/dev/input/new` | `userspace/input-server/` |
 | Device stream → logical events, the locks, and the keymap | `userspace/libinput/` |
 | Focus, hit-testing, implicit grab, key repeat | `userspace/compositor/src/input.rs` |
-| The keyboards' lights: the compositor's locks, written to each keyboard's node (§4c) | `userspace/compositor/`, `userspace/input-server/`, `kernel/src/drivers/ps2/lights.rs`, `kernel/src/drivers/xhci/hub.rs` |
+| The keyboards' lights: the compositor's locks, written to each keyboard's node (§4c) | `userspace/compositor/`, `userspace/input-server/`, `kernel/src/drivers/ps2/lights.rs`, `kernel/src/drivers/xhci/hub.rs`, `kernel/src/drivers/xhci/hub/control.rs` |
 | Delivery to a widget | `userspace/libui/src/route.rs` |
 
 `cargo xtask check-input` injects a keystroke, a click and a **wheel** over QMP and asserts each

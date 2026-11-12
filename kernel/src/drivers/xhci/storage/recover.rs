@@ -221,9 +221,9 @@ fn reset_recovery(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Result<(), Failed>
     clear_halt(x, i, out_dci, mem)
 }
 
-/// Device `i` out of the table before it was published: its memory, handed back.
-pub(super) fn retire(i: usize) -> Option<[Programmed; 4]> {
-    DISKS.depart(i).2
+/// [`Disks::retire`].
+pub(super) fn retire(i: usize, mem: &mut DeviceMem) {
+    DISKS.retire(i, mem);
 }
 
 /// **How long the hub thread may sleep** at `now` ([`Disks::bound`]).

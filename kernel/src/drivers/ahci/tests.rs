@@ -50,14 +50,32 @@ fn a_command_past_the_tables_room_stops() {
     let frag = |i: u64| PhysFrag { base: 0x10_0000 + i * 0x1000, len: 512 };
     let frags: std::vec::Vec<PhysFrag> = (0..=MAX_PRDT_ENTRIES as u64).map(frag).collect();
     let (full, over) = (&frags[..MAX_PRDT_ENTRIES as usize], &frags[..]);
-    build_command(&d, ATA_READ_DMA_EXT, 0, 8, full, false);
+    build_command(&d.state.lock(), ATA_READ_DMA_EXT, 0, 8, full, false);
     let last = PRDT_OFFSET + (MAX_PRDT_ENTRIES as usize - 1) * PRDT_ENTRY;
-    assert_eq!(d.cmd_table.read::<u64>(last), frag(MAX_PRDT_ENTRIES as u64 - 1).base, "the page's last entry");
+    let entry = d.state.lock().cmd_table.read::<u64>(last);
+    assert_eq!(entry, frag(MAX_PRDT_ENTRIES as u64 - 1).base, "the page's last entry");
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_command(&d, ATA_WRITE_DMA_EXT, 0, 8, over, true);
+        build_command(&d.state.lock(), ATA_WRITE_DMA_EXT, 0, 8, over, true);
     }));
     assert!(built.is_err(), "one fragment past the table's room");
-    assert_eq!(d.cmd_table.read::<[u8; 3]>(0), [0x27, 0x80, ATA_READ_DMA_EXT], "the table untouched");
+    let fis = d.state.lock().cmd_table.read::<[u8; 3]>(0);
+    assert_eq!(fis, [0x27, 0x80, ATA_READ_DMA_EXT], "the table untouched");
+}
+
+/// **A command is laid out as the HBA reads it**: the FIS's command, LBA and count, a PRDT entry a
+/// fragment, and slot 0's header naming the FIS's length, the direction, the entries and the table.
+#[test]
+fn a_command_is_laid_out_as_the_hba_reads_it() {
+    let (_regs, d) = fake_disk();
+    let frags = [PhysFrag { base: 0x1_2345_6000, len: 4096 }, PhysFrag { base: 0x8000, len: 512 }];
+    let p = d.state.lock();
+    build_command(&p, ATA_WRITE_DMA_EXT, 0x0605_0403_0201, 0x0102, &frags, true);
+    let fis: [u8; 14] = p.cmd_table.read(0);
+    assert_eq!(fis, [0x27, 0x80, ATA_WRITE_DMA_EXT, 0, 1, 2, 3, 0x40, 4, 5, 6, 0, 2, 1]);
+    assert_eq!(p.cmd_table.read::<[u32; 4]>(PRDT_OFFSET), [0x2345_6000, 1, 0, 4095 | 1 << 31]);
+    assert_eq!(p.cmd_table.read::<[u32; 4]>(PRDT_OFFSET + PRDT_ENTRY), [0x8000, 0, 0, 511 | 1 << 31]);
+    let table = p.cmd_table.phys().as_u64();
+    assert_eq!(p.cmd_list.read::<[u32; 4]>(0), [5 | 1 << 6 | 2 << 16, 0, table as u32, (table >> 32) as u32]);
 }
 
 /// What that capacity is worth as a transfer, pinning the figure in `deferred-decisions.md`.
@@ -180,12 +198,16 @@ fn fake_disk() -> (FakeRegs, AhciDisk) {
         abar,
         port_base: abar + PORT_BASE,
         port: 0,
-        cmd_list: Programmed::new(DmaBuffer::alloc(1024).unwrap()),
         _fis: Programmed::new(DmaBuffer::alloc(256).unwrap()),
-        cmd_table: Programmed::new(DmaBuffer::alloc(CMD_TABLE_BYTES).unwrap()),
         sectors: 1 << 20,
         flush_command: ATA_FLUSH_CACHE_EXT,
-        state: IrqSpinLock::new(LockRank::Leaf, PortState::new()),
+        state: IrqSpinLock::new(
+            LockRank::Leaf,
+            PortState::new(
+                Programmed::new(DmaBuffer::alloc(1024).unwrap()),
+                Programmed::new(DmaBuffer::alloc(CMD_TABLE_BYTES).unwrap()),
+            ),
+        ),
         intr: interrupt_object(),
         counted: Counted::new(),
         wake: interrupt_object(),
@@ -248,12 +270,31 @@ fn a_command_a_polled_wait_gave_up_on_is_failed_not_retired() {
     submit(&mut second, ctx(&d));
     write32(d.port_base, PX_TFD, 0x50);
     // Slot 0's header DW1: the byte count an HBA writes back.
-    d.cmd_list.write::<u32>(4, 512);
+    d.state.lock().cmd_list.write::<u32>(4, 512);
     assert_eq!(settle_polled(&d, false), Some(true));
     crate::dpc::run_pending();
     assert_eq!((first.status, first.transferred), (IO_ERROR, 0), "failed, whatever the count said");
     assert!(core::ptr::eq(d.state.lock().inflight, &second), "the next issued");
     assert_eq!(d.state.lock().fault, CLEAR);
+}
+
+/// **A retired command is done by the bytes slot 0's header counted**: its whole length a success,
+/// a byte short a failure.
+#[test]
+fn a_retired_command_is_done_by_the_bytes_its_header_counted() {
+    let _exclusive = crate::dpc::exclusive();
+    let frag = PhysFrag { base: 0x10_0000, len: 512 };
+    for (counted, done) in [(512, (IrpStatus::Success as i32, 512)), (511, (IO_ERROR, 0))] {
+        let (_regs, d) = fake_disk();
+        let mut r = read_irp(&frag);
+        submit(&mut r, ctx(&d));
+        write32(d.port_base, PX_CI, 0);
+        write32(d.port_base, PX_TFD, 0x50);
+        d.state.lock().cmd_list.write::<u32>(4, counted);
+        assert_eq!(settle_polled(&d, true), Some(true), "retired");
+        crate::dpc::run_pending();
+        assert_eq!((r.status, r.transferred), done, "{counted} bytes counted");
+    }
 }
 
 /// **A task file error is recovered, its command failed and the next issued**: a real HBA keeps the

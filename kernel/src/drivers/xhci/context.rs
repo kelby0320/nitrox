@@ -274,6 +274,22 @@ mod tests {
         u32::from_le_bytes(ctx[off..off + 4].try_into().unwrap())
     }
 
+    /// **A context written to device memory is the bytes a slice gets**, dwords little-endian.
+    #[test]
+    fn a_context_in_device_memory_is_the_one_a_slice_gets() {
+        crate::mm::test_support::init_global_heap();
+        for csz in [false, true] {
+            let l = Layout::new(csz);
+            let mut want = vec![0u8; l.input_len()];
+            address_device(&mut want[..], l, 13, speed::HIGH, 0x1_2345_6000, true, 64);
+            let mem = DmaBuffer::alloc(l.input_len()).unwrap();
+            address_device(&mut Input(&mem), l, 13, speed::HIGH, 0x1_2345_6000, true, 64);
+            let mut got = vec![0u8; l.input_len()];
+            mem.copy_out(0, &mut got);
+            assert_eq!(got, want, "entries of {} bytes", if csz { 64 } else { 32 });
+        }
+    }
+
     /// **The same Address Device context at both entry sizes**, each field where the spec puts it.
     #[test]
     fn address_device_lays_out_the_slot_and_ep0_at_either_size() {

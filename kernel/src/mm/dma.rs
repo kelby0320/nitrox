@@ -36,8 +36,9 @@ pub struct DmaBuffer {
 // SAFETY: a `DmaBuffer` owns its physical frames outright; the `virt` pointer
 // addresses the kernel-global HHDM mapping of those frames, valid for the
 // buffer's lifetime regardless of which CPU/thread holds it. Moving the owner
-// across threads is therefore sound. (Not `Sync`: shared concurrent access to
-// the bytes is the holder's responsibility, like `&mut`-vs-`&` on any buffer.)
+// across threads is therefore sound. (Not `Sync`: its accessors write through
+// `&self`, so a buffer shared between CPUs is shared behind the lock that
+// serialises them.)
 unsafe impl Send for DmaBuffer {}
 
 impl DmaBuffer {

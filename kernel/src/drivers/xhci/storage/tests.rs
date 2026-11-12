@@ -911,3 +911,27 @@ fn a_hub_commands_data_is_cut_to_the_binding_buffer() {
     assert_eq!(disks.issue_hub(i, 0x1234 as *mut (), 0, &scsi::inquiry(), len, false, 0), Ok(()));
     assert_eq!(disks.trb(i, 0, 0).0[2] & 0x1_FFFF, BIND_DATA as u32, "the data stage's length");
 }
+
+/// **A device the table refuses, or retires before it is published, gives its memory back to the
+/// device's**: its rings, wrapper page and binding buffer, freed with the rest once the slot is
+/// disabled.
+#[test]
+fn a_device_refused_or_retired_gives_its_memory_back_to_the_devices() {
+    init_global_heap();
+    let (disks, mut fake) = (Disks::new(), Fake::new());
+    let mut mem = super::super::hub::device_mem().unwrap();
+    let at = |d: &Dev| [&d.bulk_in.mem, &d.bulk_out.mem, &d.wrap, &d.data].map(|b| b.phys().as_u64());
+    let retired = fake.dev(10);
+    let retired_at = at(&retired);
+    let (i, _) = disks.take(retired).unwrap();
+    for k in 1..MAX_DEVICES {
+        disks.take(fake.dev(10 + k as u8)).unwrap();
+    }
+    let refused = fake.dev(99);
+    let refused_at = at(&refused);
+    assert!(disks.take_or_keep(refused, &mut mem).is_none(), "every slot bound");
+    disks.retire(i, &mut mem);
+    assert!(disks.devs[i].lock().is_none(), "out of the table");
+    assert!(mem.claim(refused_at).is_some(), "the refused device's memory the device's");
+    assert!(mem.claim(retired_at).is_some(), "and the retired one's");
+}

@@ -91,8 +91,9 @@ scratchpad(s)` on `test-qemu` — the No Op's answer, and the MSI vector.
 
 ## Enumeration: the hub thread
 
-**A kernel thread** (`drivers/xhci/hub.rs`), spawned by `drivers::start` once the scheduler and
-the APs are up — after them rather than during AP bring-up, the scheduler's most delicate moment.
+**A kernel thread** (`drivers/xhci/hub.rs`, its control transfers in `hub/control.rs`), spawned by
+`drivers::start` once the scheduler and the APs are up — after them rather than during AP
+bring-up, the scheduler's most delicate moment.
 It is **the first long-lived kernel thread to block in `sched::wait_on`**, on two kinds of thing,
 and to sleep:
 - **a command's or a control transfer's `PendingOperation`**, which the DPC completes when the

@@ -140,10 +140,10 @@ impl DeviceMem {
     }
 
     /// **Buffers a class gives back unbound**: the device's memory again, freed with the rest. One
-    /// no room is left for is leaked.
+    /// the list cannot grow for is leaked.
     pub(super) fn keep(&mut self, buffers: impl IntoIterator<Item = Programmed>) {
         for b in buffers {
-            let _ = self.class.push_within_capacity(b);
+            let _ = self.class.try_push(b);
         }
     }
 
@@ -458,7 +458,7 @@ const CONFIG_MAX: usize = 512;
 /// The longest serial string kept: what names a USB disk beside its model.
 const SERIAL_MAX: usize = 32;
 
-fn device_mem() -> Option<DeviceMem> {
+pub(super) fn device_mem() -> Option<DeviceMem> {
     let input = DmaBuffer::alloc(crate::mm::PAGE_SIZE.max(super::context::Layout::new(true).input_len())).ok()?;
     let output = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
     let ep0 = DmaBuffer::alloc(super::RING_TRBS * 16).ok()?;
@@ -802,7 +802,7 @@ fn speed_of(s: u32) -> u8 {
 
 /// Point slot `slot`'s entry of the device context base array at `output`, or clear it with 0.
 fn set_slot_context(x: &Xhci, slot: u8, output: u64) {
-    x.dcbaa.write(slot as usize * 8, output);
+    x.dcbaa.lock().write(slot as usize * 8, output);
 }
 
 /// The input context, cleared for a new command.

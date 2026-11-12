@@ -346,7 +346,9 @@ address**. That path exists: [`mm::dma::DmaBuffer`](../../kernel/src/mm/dma.rs)
 (the `phase-2/dma-alloc` item) — a zeroed, page-aligned contiguous block from the
 buddy allocator that exposes `phys()` and **bounded volatile accessors**, `read`, `write`,
 `copy_in`, `copy_out` and `fill`, each stopping an access past the buffer's end or unaligned
-for its type, and never a reference to bytes the device may write meanwhile. (x86 DMA is
+for its type, and never a reference to bytes the device may write meanwhile. They write through
+`&self`, so a buffer is not `Sync`: one shared between CPUs sits behind the lock that serialises
+its writers, as AHCI's command list and table do in its port lock's state. (x86 DMA is
 snoop-coherent, so no cache maintenance; a non-coherent arch will add an `ArchDma`
 clean/invalidate hook.) IOMMU-constrained DMA (so a userspace driver can only
 touch memory it legitimately holds) is **deferred** with userspace drivers.

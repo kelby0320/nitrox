@@ -116,13 +116,9 @@ pub(in crate::drivers::xhci) fn bind(
         queue: Queue::new(),
         counted: [const { Counted::new() }; MAX_LUNS],
     };
-    let (i, epoch) = match DISKS.take(dev) {
-        Ok(taken) => taken,
-        Err(back) => {
-            mem.keep(back);
-            crate::kprintln!("usb: port {port}: {MAX_DEVICES} storage devices are bound already; not bound");
-            return;
-        }
+    let Some((i, epoch)) = DISKS.take_or_keep(dev, mem) else {
+        crate::kprintln!("usb: port {port}: {MAX_DEVICES} storage devices are bound already; not bound");
+        return;
     };
     let mut b = Binding { x, port, i, epoch, mem, parent, serial };
     let max_lun = match hub::control_in_byte(x, slot, b.mem, [0xA1, 0xFE, 0, 0, p.interface, 0, 1, 0]) {
@@ -134,7 +130,7 @@ pub(in crate::drivers::xhci) fn bind(
         }
         Err(e) => {
             crate::kprintln!("usb: port {port}: GET MAX LUN failed: {e}; not bound");
-            b.mem.keep(retire(i).into_iter().flatten());
+            retire(i, b.mem);
             return;
         }
     };
@@ -154,7 +150,7 @@ pub(in crate::drivers::xhci) fn bind(
         }
     }
     if published == 0 {
-        b.mem.keep(retire(i).into_iter().flatten());
+        retire(i, b.mem);
     } else {
         act(DISKS.let_go(i, crate::arch::Timer::read_ns()), Some(x));
     }

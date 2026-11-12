@@ -270,12 +270,13 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
         // A keyboard whose descriptor puts its lights nowhere this driver writes takes none.
         let no_lights = matches!(decoder, Decoder::Keyboard { layout, .. } if layout.lights.is_none());
         let kind = if c.is_keyboard { DeviceKind::Keyboard } else { DeviceKind::Mouse };
-        let Some((node, epoch, served)) = publish(kind, parent) else {
-            crate::kprintln!("usb: port {port}: no input node for its {what}; not bound");
-            continue;
-        };
         let Some([ring_mem, buf]) = mem.claim(p.at) else {
             crate::kprintln!("usb: port {port}: its {what}'s memory is not the device's; not bound");
+            continue;
+        };
+        let Some((node, epoch, served)) = publish(kind, parent) else {
+            mem.keep([ring_mem, buf]);
+            crate::kprintln!("usb: port {port}: no input node for its {what}; not bound");
             continue;
         };
         let bound = Bound {
@@ -293,8 +294,7 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
             halts: 0,
             lights_dead: no_lights,
         };
-        if let Err(back) = start(x, bound) {
-            mem.keep(back);
+        if !start(x, &NODES, bound, mem) {
             crate::kprintln!("usb: port {port}: no room to poll its {what}; not bound");
             continue;
         }
@@ -503,15 +503,20 @@ fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32, u32)> {
     Some((index, epoch, served?))
 }
 
-/// Put `bound` in the table and queue its first TRB; its memory back when there was no room.
-fn start(x: &Xhci, mut bound: Bound) -> Result<(), [Programmed; 2]> {
+/// **Put `bound` in the table and queue its first TRB.** Whether there was room: with none, its
+/// memory is the device's, `mem`, again, and its node, in `nodes`, retires.
+fn start(x: &Xhci, nodes: &Nodes, mut bound: Bound, mem: &mut DeviceMem) -> bool {
     let mut t = x.hid.lock();
     let Some(free) = t.entries.iter_mut().find(|e| e.is_none()) else {
-        return Err([bound.ring_mem, bound.buf]);
+        drop(t);
+        let Bound { node, decoder, ring_mem, buf, .. } = bound;
+        mem.keep([ring_mem, buf]);
+        let_go(nodes, node, decoder, crate::arch::Timer::read_ns());
+        return false;
     };
     queue(x, &mut bound);
     *free = Some(bound);
-    Ok(())
+    true
 }
 
 fn queue(x: &Xhci, b: &mut Bound) {
@@ -697,24 +702,23 @@ pub(super) fn depart(x: &Xhci, slot: u8) -> impl Iterator<Item = Programmed> {
 fn depart_from(x: &Xhci, nodes: &Nodes, slot: u8) -> impl Iterator<Item = Programmed> {
     let now = crate::arch::Timer::read_ns();
     // `bind` binds at most four interfaces a device.
-    let mut gone: [Option<Bound>; 4] = [const { None }; 4];
+    let mut gone: [Option<(usize, Decoder)>; 4] = [const { None }; 4];
+    let mut mem: [Option<[Programmed; 2]>; 4] = [const { None }; 4];
     {
         let mut t = x.hid.lock();
         let mut k = 0;
         for e in t.entries.iter_mut() {
-            let Some(b) = e.take_if(|b| b.slot == slot) else {
+            let Some(Bound { node, decoder, ring_mem, buf, .. }) = e.take_if(|b| b.slot == slot) else {
                 continue;
             };
-            if let Some(g) = gone.get_mut(k) {
-                *g = Some(b);
+            if let (Some(g), Some(m)) = (gone.get_mut(k), mem.get_mut(k)) {
+                (*g, *m) = (Some((node, decoder)), Some([ring_mem, buf]));
                 k += 1;
             }
         }
     }
-    let mut mem: [Option<[Programmed; 2]>; 4] = [const { None }; 4];
-    for (Bound { node, decoder, ring_mem, buf, .. }, m) in gone.into_iter().flatten().zip(mem.iter_mut()) {
+    for (node, decoder) in gone.into_iter().flatten() {
         let_go(nodes, node, decoder, now);
-        *m = Some([ring_mem, buf]);
     }
     mem.into_iter().flatten().flatten()
 }
