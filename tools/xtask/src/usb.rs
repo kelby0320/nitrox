@@ -226,22 +226,28 @@ pub(crate) fn usb_input_args(cmd: &mut Command, add_controller: bool) {
     cmd.arg("-device").arg("usb-kbd,bus=xhci.0,id=usbkbd").arg("-device").arg("usb-mouse,bus=xhci.0");
 }
 
-/// **`boot-probe`'s registry test has reported**, waited for before `check-input --usb`'s keyboards
-/// come and go, as an unplug in the middle of it fails it. Not the whole verdict, which comes long
+/// **`boot-probe`'s registry and devices tests have reported**, waited for before `check-input
+/// --usb`'s keyboards come and go, as an unplug in the middle of either fails it: the devices
+/// test reads a USB record, then its file. Not the whole verdict, which comes long
 /// after the test client gives up. Read from the transcript, not with `expect`.
 pub(crate) fn await_registry_probe(s: &Session) -> R<()> {
     let start = std::time::Instant::now();
-    let reported = |l: &str| {
-        l.starts_with("boot-probe: registry: ")
-            && (l.ends_with("keyboard and mouse at their raw indices ok") || l.ends_with(" FAIL"))
+    let reported = |l: &str, test: &str, ok: &str| l.starts_with(test) && (l.ends_with(ok) || l.ends_with(" FAIL"));
+    let both = |t: &str| {
+        let lines = || t.lines().map(str::trim_end);
+        lines().any(|l| reported(l, "boot-probe: registry: ", "keyboard and mouse at their raw indices ok"))
+            && lines().any(|l| reported(l, "boot-probe: devices: ", "agreeing with the registry ok"))
     };
-    while !s.transcript().lines().any(|l| reported(l.trim_end())) {
+    while !both(&s.transcript()) {
         if start.elapsed() > std::time::Duration::from_secs(90) {
-            return Err("boot-probe's registry test did not report within 90 s".into());
+            return Err("boot-probe's registry and devices tests did not report within 90 s".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    println!("  ok: boot-probe's registry test reported, {} ms after the gate asked", start.elapsed().as_millis());
+    println!(
+        "  ok: boot-probe's registry and devices tests reported, {} ms after the gate asked",
+        start.elapsed().as_millis()
+    );
     Ok(())
 }
 
