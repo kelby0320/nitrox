@@ -38185,4 +38185,7 @@ Part J's fourteenth sub-part, `typed-layers.md` § J.14, built on `pre-phase-7/p
   may still move, which AHCI's give-up and a kept USB slot now say. **One dropped unfinished panics
   a debug build.** It is `io::block`'s child module, so its mint is `io::block`'s and not the RAM
   disk's. AHCI's kept command leaves slot 0, which nothing reads once the port is dead.
+- **A host test's token is strict** where a driver holds it, so a request a driver drops unfinished
+  fails the test; a test spends what the driver hands back. drv-o12 stays open for its char half:
+  `CharBackend`'s raw context, which Part J's plan leaves.
 - `unsafe` blocks fall from 541 to 518, and `unsafe fn`s rise from 198 to 199.

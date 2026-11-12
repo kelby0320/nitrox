@@ -907,6 +907,30 @@ dropping a kept slot's command. Compile probes: the RAM disk minting a token is 
 private functions E0616, and a raw pointer as a context E0277. Under Miri, both models, the
 134 tests of `io::block`, the RAM disk, the two drivers, and the tests on `test_backend`.
 
+**After review** (`0dd09525`):
+- **The drivers' host tests mint strict tokens**, so a request a driver drops unfinished fails its
+  test, where a lax one hid a request lost from a queue. A fake AHCI disk and a test's `Disks` keep
+  what they still hold when the test ends; the storage tests spend what the driver hands back
+  through `Lax` before comparing it.
+- **Every refusal a host test can reach is driven**: a full queue in both drivers; AHCI's
+  fragments past a command table, an op with no ATA command at submit and at the drain, and no disk
+  published; storage's slot out of range, a command its unit refuses, and a departure's queue
+  (`departed`, the departure over a test's `Disks`); a partition's flush, unrebased, and a read
+  past its window. Of twenty refusals each made a silent `keep()`, every one fails a test but the
+  rescan's completion, which needs the hub thread.
+- **The queue keeps its order**, over every head and every command taken, and `ramdisk_submit` is
+  host-tested through its token.
+- `Partition`'s `unsafe impl Send` and `Sync` are gone: the compiler derives both, and refuses a
+  field that is not `Sync` (E0277), which the two impls let through.
+- **drv-o12 is narrowed to its block half**: `CharBackend`'s public `ctx: *mut ()` stays open, as
+  this part's plan leaves it.
+- `irp-layout.md` says a Tier 2 module would be handed the `Irp` while the kernel's own drivers hold
+  an `InFlight`; a stale `partition_submit`, a dangling SAFETY reference, an orphaned doc comment,
+  and the docs' whitespace and wrapping fixed. The storage tests' tokens and refusals are files of
+  their own.
+
+Counts: `unsafe impl`s fall by two more (`io`, `Partition`'s).
+
 ### J.15 The hub's waits, and the DPC's hand-offs (drv-o15, drv-o6)
 
 - **`Armed` and `Completer`** (drv-o15): the hub thread arms a record with a PO it holds and waits
