@@ -78,7 +78,8 @@ carries everything down and back up.
   `sys_io_submit` returned and the completion DPC signals. `0` for an internal
   IRP with no userspace waiter (none in Phase 2).
 - **`next`** and **`on_complete`** — a driver completes an IRP with
-  `io::irp::complete(irp, status, transferred)`, from its ISR, a DPC or a refusal: that records
+  `io::irp::complete(irp, status, transferred)` (a block driver through its `InFlight`'s
+  `complete`), from its ISR, a DPC or a refusal: that records
   the outcome and links the IRP by `next` onto one list, drained by **one static DPC** (no heap
   allocation in IRQ context, per `kernel/CLAUDE.md`), which runs each IRP's `on_complete`. The
   block layer's signals `completion` and hands its box to thread context to free. One DPC for

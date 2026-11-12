@@ -37,7 +37,7 @@ pub(in crate::drivers::xhci) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut D
     let give_up = |why: &str| {
         if let Some(irp) = DISKS.drop_rescan(i) {
             crate::kprintln!("usb: port {port}: its disk {why}; not rescanned");
-            complete(irp, KError::IoError as i32, 0);
+            irp.complete(KError::IoError as i32, 0);
         }
         for &child in gone.iter() {
             crate::device::depart(child);
@@ -97,9 +97,9 @@ pub(in crate::drivers::xhci) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut D
     };
     act(DISKS.let_go(i, crate::arch::Timer::read_ns()), Some(x));
     match found {
-        Some(Some(n)) => complete(irp, 0, n as u64),
-        Some(None) => complete(irp, KError::IoError as i32, 0),
-        None => complete(irp, KError::PeerClosed as i32, 0),
+        Some(Some(n)) => irp.complete(0, n as u64),
+        Some(None) => irp.complete(KError::IoError as i32, 0),
+        None => irp.complete(KError::PeerClosed as i32, 0),
     }
     Recovered::Done
 }
@@ -285,7 +285,7 @@ impl Disks {
             let d = s.lock();
             let Some(dev) = d.as_ref() else { continue };
             let mut until = bound.unwrap_or(now.saturating_add(DEADLINE_NS));
-            if let Some(c) = dev.inflight
+            if let Some(c) = &dev.inflight
                 && matches!(c.owner, Owner::Irp { .. })
             {
                 until = until.min(c.deadline);
@@ -303,7 +303,7 @@ impl Disks {
             let mut d = self.devs[i].lock();
             let dev = d.as_mut()?;
             if dev.fault.is_none()
-                && let Some(c) = dev.inflight
+                && let Some(c) = &dev.inflight
                 && matches!(c.owner, Owner::Irp { .. })
                 && now > c.deadline
             {
@@ -399,7 +399,8 @@ impl Disks {
             dev.data.fill(0, len as usize, 0);
             let frags = [PhysFrag { base: dev.data.phys().as_u64(), len: len as u64 }];
             let frags = if len == 0 { &frags[..0] } else { &frags[..] };
-            dev.issue(owner, lun, cdb, len, len > 0, frags, now);
+            let dci = dev.issue(lun, cdb, len, len > 0, frags);
+            dev.launch(owner, dci, now);
         }
         Ok(())
     }
@@ -409,7 +410,7 @@ impl Disks {
     pub(super) fn rescan_unit(&self, i: usize) -> Option<Lun> {
         let d = self.devs[i].lock();
         let dev = d.as_ref()?;
-        let (_, lun) = dev.rescan?;
+        let lun = dev.rescan.as_ref()?.1;
         dev.luns.get(lun as usize).copied()
     }
 
@@ -471,7 +472,7 @@ impl Disks {
     }
 
     /// **Give up device `i`'s waiting rescan**: its IRP, for the caller to complete.
-    fn drop_rescan(&self, i: usize) -> Option<*mut Irp> {
+    fn drop_rescan(&self, i: usize) -> Option<InFlight> {
         self.devs[i].lock().as_mut().and_then(|dev| dev.rescan.take()).map(|(irp, _)| irp)
     }
 
@@ -533,7 +534,8 @@ pub(in crate::drivers::xhci) fn recover(x: &Xhci, i: usize, mem: &mut DeviceMem)
     if end == End::Stranded { Recovered::Ended } else { Recovered::Done }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(super) enum BeginRescan {
     /// No rescan is waiting, or the device has gone.
     Nothing,
@@ -542,12 +544,12 @@ pub(super) enum BeginRescan {
     /// One is waiting on a device a failed recovery stranded, which is to be ended.
     Ended,
     /// It is the hub thread's, for unit `lun`, and the device is held.
-    Ready { irp: *mut Irp, lun: u8, unit: Lun },
+    Ready { irp: InFlight, lun: u8, unit: Lun },
 }
 
 /// What a departure leaves for after the slot is disabled: the command that was in flight, one a
 /// failed recovery stranded, and a rescan waiting; and the device's memory.
-pub(in crate::drivers::xhci) struct Departed(pub(super) [Option<*mut Irp>; 3], pub(super) Option<[Programmed; 4]>);
+pub(in crate::drivers::xhci) struct Departed(pub(super) [Option<InFlight>; 3], pub(super) Option<[Programmed; 4]>);
 
 /// **The device in xHCI slot `slot` has gone**: out of the table, so the DPC touches none of its
 /// memory; its queue completed `PeerClosed` now, and any later submit refused so by its slot's
@@ -555,11 +557,11 @@ pub(in crate::drivers::xhci) struct Departed(pub(super) [Option<*mut Irp>; 3], p
 /// then the controller may still move its data. From the hub thread.
 pub(in crate::drivers::xhci) fn depart(slot: u8) -> Departed {
     let Some(i) = DISKS.slot_of(slot) else {
-        return Departed([None; 3], None);
+        return Departed([const { None }; 3], None);
     };
     let (queued, held, mem) = DISKS.depart(i);
     for irp in queued.into_iter().flatten() {
-        complete(irp, KError::PeerClosed as i32, 0);
+        irp.complete(KError::PeerClosed as i32, 0);
     }
     Departed(held, mem)
 }
@@ -571,8 +573,14 @@ pub(in crate::drivers::xhci) fn depart(slot: u8) -> Departed {
 pub(in crate::drivers::xhci) fn finish(d: Departed, slot: &super::hub::Released) {
     let [inflight, stranded, rescan] = d.0;
     let disabled = matches!(slot, super::hub::Released::Freed(_));
-    for irp in [inflight, stranded].into_iter().flatten().filter(|_| disabled).chain(rescan) {
-        complete(irp, KError::PeerClosed as i32, 0);
+    for irp in [inflight, stranded].into_iter().flatten() {
+        match disabled {
+            true => irp.complete(KError::PeerClosed as i32, 0),
+            false => irp.keep(),
+        }
+    }
+    if let Some(irp) = rescan {
+        irp.complete(KError::PeerClosed as i32, 0);
     }
     slot.settle(d.1.into_iter().flatten());
 }

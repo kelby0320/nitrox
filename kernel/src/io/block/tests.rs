@@ -70,7 +70,8 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     // any refusal's completion has run.
     let submit = |op: IrpOp, offset: u64| {
         let mut irp = Irp::new_block(op, core::ptr::null(), offset, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
-        part.block_backend().unwrap().submit(&mut irp);
+        // SAFETY: the test's IRP, which outlives its dispatch.
+        part.block_backend().unwrap().submit(unsafe { crate::io::block::InFlight::for_test(&mut irp) });
         crate::dpc::run_pending();
         irp.status
     };

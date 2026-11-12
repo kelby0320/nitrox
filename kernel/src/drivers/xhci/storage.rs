@@ -42,8 +42,9 @@ use super::hub::{self, DeviceMem, Failed};
 use super::ring::{Producer, RingMem, Trb, code, kind};
 use super::{RING_TRBS, Xhci};
 use crate::arch::timer::ArchTimer;
+use crate::io::block::InFlight;
 use crate::io::block::{BlockBackend, BlockDevice};
-use crate::io::irp::{Irp, IrpOp, PhysFrag};
+use crate::io::irp::{IrpOp, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::lockrank::LockRank;
@@ -152,7 +153,7 @@ fn context(slot: usize, lun: u8, epoch: u32) -> UnitAt {
 
 impl BlockDevice for UnitAt {
     /// [`Disks::submit`], on the boot's.
-    fn submit(self, irp: *mut Irp) {
+    fn submit(self, irp: InFlight) {
         let a = DISKS.submit(irp, self, crate::arch::Timer::read_ns());
         act(a, super::controller());
     }
@@ -162,7 +163,8 @@ impl BlockDevice for UnitAt {
     fn poll(self) {}
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 enum Owner {
     /// A block IRP's command; `retried` once a unit attention has sent it again.
     Irp { cmd: IrpCmd, retried: bool },
@@ -181,7 +183,7 @@ enum Stage {
 }
 
 /// A command in flight: whose, its tag, where it is, its deadline, and when it was issued.
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 struct Command {
     owner: Owner,
     tag: u32,
@@ -280,18 +282,18 @@ pub(super) struct Dev {
     recovering: bool,
     /// **An IRP a failed recovery could not stop**: its command's TRBs may still move its data, so it
     /// is completed only by the departure that follows, once the slot is disabled.
-    stranded: Option<*mut Irp>,
+    stranded: Option<InFlight>,
     /// **A `Rescan` waiting for the hub thread**, and the unit it names: not a command on the
     /// rings, so held here rather than queued. **The device goes on meanwhile**: what is queued
     /// drains, so what the disk's windows forwarded before they were retired reaches the disk
     /// before the new table is published.
-    rescan: Option<(*mut Irp, u8)>,
+    rescan: Option<(InFlight, u8)>,
     queue: Queue,
     counted: [Counted; MAX_LUNS],
 }
 
-// SAFETY: `Dev` holds raw pointers to in-flight IRPs and an operation, which its lock serialises;
-// the IRPs are owned by their submitters until completed, and the operation by the waiting thread.
+// SAFETY: `Dev` holds a raw pointer to the hub thread's operation, which its lock serialises; the
+// thread holds the operation while its command is in flight.
 unsafe impl Send for Dev {}
 
 /// **A command's CDB**: ten bytes, or sixteen for a unit of 2³² blocks or more.
@@ -326,9 +328,10 @@ fn rw_cdb(blocks: u64, write: bool, lba: u64, count: u16) -> Cdb {
 
 /// **A block IRP's command**, worked out and checked at submission: so an IRP that waits starts
 /// without a second check that could fail where nothing can complete it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 struct IrpCmd {
-    irp: *mut Irp,
+    irp: InFlight,
     lun: u8,
     cdb: Cdb,
     len: u32,
@@ -346,16 +349,16 @@ struct Queue {
 
 impl Queue {
     const fn new() -> Queue {
-        Queue { ring: [None; QUEUE], head: 0, len: 0 }
+        Queue { ring: [const { None }; QUEUE], head: 0, len: 0 }
     }
 
-    fn push(&mut self, c: IrpCmd) -> bool {
+    fn push(&mut self, c: IrpCmd) -> Result<(), IrpCmd> {
         if self.len == QUEUE {
-            return false;
+            return Err(c);
         }
         self.ring[(self.head + self.len) % QUEUE] = Some(c);
         self.len += 1;
-        true
+        Ok(())
     }
 
     fn pop(&mut self) -> Option<IrpCmd> {
@@ -370,35 +373,39 @@ impl Queue {
 
     /// Take out the first command `want` picks, the rest kept in their order.
     fn pop_where(&mut self, want: impl Fn(&IrpCmd) -> bool) -> Option<IrpCmd> {
-        let (mut taken, mut kept) = (None, Queue::new());
-        while let Some(c) = self.pop() {
-            if taken.is_none() && want(&c) {
-                taken = Some(c);
-            } else {
-                kept.push(c);
-            }
+        let at = |k: usize| (self.head + k) % QUEUE;
+        let k = (0..self.len).find(|&k| self.ring[at(k)].as_ref().is_some_and(&want))?;
+        let taken = self.ring[at(k)].take();
+        for k in k..self.len - 1 {
+            self.ring[at(k)] = self.ring[at(k + 1)].take();
         }
-        *self = kept;
+        self.len -= 1;
         taken
     }
 }
 
 /// **What the caller does after a method of [`Disks`]**, with no lock held: complete an IRP, end
 /// one of the hub thread's waits, or wake the hub thread.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum Action {
     /// Nothing more.
     None,
     /// Complete `irp` with `status` and `transferred` bytes.
-    Complete { irp: *mut Irp, status: i32, transferred: u64 },
+    Complete { irp: InFlight, status: i32, transferred: u64 },
     /// Complete the hub thread's operation at `po`.
     Hub { po: *mut () },
     /// The hub thread has a fault to handle.
     Wake,
     /// Complete `irp` `PeerClosed`, its unit ejected; `said` names it the first time, to log.
-    Ejected { irp: *mut Irp, said: Option<(u8, u8)> },
+    Ejected { irp: InFlight, said: Option<(u8, u8)> },
     /// Complete the eject `irp`, and wake the hub thread to answer what waited on its unit.
-    Stopped { irp: *mut Irp },
+    Stopped { irp: InFlight },
+}
+
+/// Complete `irp` with the error `e`.
+fn refusal(irp: InFlight, e: KError) -> Action {
+    Action::Complete { irp, status: e as i32, transferred: 0 }
 }
 
 /// **The storage devices**, eight slots under an epoch. One static in a boot ([`DISKS`]); a value so
@@ -445,14 +452,14 @@ fn packets(remaining: u64, mps: u16) -> u32 {
 impl Dev {
     /// **Put a command on the rings**: its wrapper written, the command wrapper on bulk OUT, the
     /// data as a Normal TRB per fragment on the side it moves, the last interrupting on
-    /// completion — or, with no data, the command wrapper itself — then the doorbells. **The status
+    /// completion — or, with no data, the command wrapper itself. **The status
     /// wrapper is asked for when that stage ends** ([`Dev::ask_status`]), not queued behind it:
     /// QEMU's `usb-storage` takes a status read that arrives while its data is still coming as
     /// part of the data stage, and never answers it, so a `READ(10)`, whose data comes from QEMU's
     /// disk asynchronously, hung while an `INQUIRY` answered at once. Linux asks for each stage
     /// after the last, which is why it never meets this.
-    #[allow(clippy::too_many_arguments, reason = "a command's owner, unit, CDB, length, direction and buffer")]
-    fn issue(&mut self, owner: Owner, lun: u8, cdb: &[u8], len: u32, input: bool, frags: &[PhysFrag], now: u64) {
+    /// [`Dev::launch`] puts it in flight, given the endpoint returned here, whose event ends it.
+    fn issue(&mut self, lun: u8, cdb: &[u8], len: u32, input: bool, frags: &[PhysFrag]) -> u8 {
         self.tag = self.tag.wrapping_add(1);
         self.wrap.copy_in(0, &cbw(self.tag, len, input, lun, cdb));
         // A stale status must not read as this command's.
@@ -474,7 +481,11 @@ impl Dev {
             let side = if input { &mut self.bulk_in } else { &mut self.bulk_out };
             side.push_td(&data[..frags.len()], |_, _| {});
         }
-        let dci = if !no_data && input { self.in_dci } else { self.out_dci };
+        if !no_data && input { self.in_dci } else { self.out_dci }
+    }
+
+    /// The command [`Dev::issue`] put on the rings, `owner`'s, in flight, and the doorbells rung.
+    fn launch(&mut self, owner: Owner, dci: u8, now: u64) {
         self.inflight = Some(Command {
             owner,
             tag: self.tag,
@@ -483,7 +494,7 @@ impl Dev {
             started: now,
         });
         self.ring(self.out_dci);
-        if !no_data && input {
+        if dci == self.in_dci {
             self.ring(self.in_dci);
         }
     }
@@ -523,25 +534,18 @@ impl Dev {
         self.queue.pop_where(|c| !luns.get(c.lun as usize).is_some_and(|u| u.ejected))
     }
 
-    fn command_for(&self, irp: *mut Irp, lun: u8) -> Result<IrpCmd, KError> {
+    fn command_for(&self, irp: InFlight, lun: u8) -> Result<IrpCmd, (InFlight, KError)> {
         let unit = self.luns.get(lun as usize).copied().unwrap_or_default();
-        // SAFETY: `irp` is live and owned by its submitter until completed.
-        let (op, offset, length) = unsafe { ((*irp).op, (*irp).offset, (*irp).length) };
-        let (cdb, len, input) = irp_command(op, offset, length, unit)?;
-        Ok(IrpCmd { irp, lun, cdb, len, input, op })
+        let op = irp.op();
+        match irp_command(op, irp.offset(), irp.length(), unit) {
+            Ok((cdb, len, input)) => Ok(IrpCmd { irp, lun, cdb, len, input, op }),
+            Err(e) => Err((irp, e)),
+        }
     }
 
     fn start(&mut self, c: IrpCmd, retried: bool, now: u64) {
-        // SAFETY: `c.irp` is live and owned by its submitter until completed.
-        let (count, frags) = unsafe { ((*c.irp).buffer.count, (*c.irp).buffer.frags) };
-        let frags: &[PhysFrag] = if count == 0 || frags == 0 {
-            &[]
-        } else {
-            // SAFETY: an IRP's fragments are `count` `PhysFrag`s its owner keeps for its life;
-            // `dispatch_block_irp` refused more than `MAX_FRAGS`.
-            unsafe { core::slice::from_raw_parts(frags as *const PhysFrag, (count as usize).min(MAX_FRAGS as usize)) }
-        };
-        self.issue(Owner::Irp { cmd: c, retried }, c.lun, c.cdb.as_slice(), c.len, c.input, frags, now);
+        let dci = self.issue(c.lun, c.cdb.as_slice(), c.len, c.input, c.irp.frags());
+        self.launch(Owner::Irp { cmd: c, retried }, dci, now);
     }
 }
 
@@ -550,12 +554,12 @@ impl Disks {
     /// `PeerClosed` by the caller: its queue at once, and — once the slot is disabled — the command in
     /// flight and one a failed recovery stranded; and its memory, freed then too.
     #[allow(clippy::type_complexity, reason = "what a departure hands back, each for its own time")]
-    fn depart(&self, i: usize) -> ([Option<*mut Irp>; QUEUE], [Option<*mut Irp>; 3], Option<[Programmed; 4]>) {
+    fn depart(&self, i: usize) -> ([Option<InFlight>; QUEUE], [Option<InFlight>; 3], Option<[Programmed; 4]>) {
         let dev = self.devs[i].lock().take();
         self.states[i].store(RETIRED, Ordering::Release);
-        let mut queued = [None; QUEUE];
+        let mut queued = [const { None }; QUEUE];
         let Some(mut dev) = dev else {
-            return (queued, [None; 3], None);
+            return (queued, [const { None }; 3], None);
         };
         for q in queued.iter_mut() {
             *q = dev.queue.pop().map(|c| c.irp);
@@ -618,19 +622,17 @@ impl Disks {
 
     /// **A block IRP submitted on any CPU**: started if nothing is in flight, else queued; refused
     /// `PeerClosed` once its device has gone, by its slot's epoch under the device's lock.
-    fn submit(&self, irp: *mut Irp, unit: UnitAt, now: u64) -> Action {
-        let refuse = |e: KError| Action::Complete { irp, status: e as i32, transferred: 0 };
+    fn submit(&self, irp: InFlight, unit: UnitAt, now: u64) -> Action {
         let lun = unit.lun;
         let Some(slot) = self.devs.get(unit.slot as usize) else {
-            return refuse(KError::InvalidArgument);
+            return refusal(irp, KError::InvalidArgument);
         };
         let mut d = slot.lock();
         // **Under the device's lock**, against which a departure and a reused slot are ordered.
         let Some(dev) = d.as_mut().filter(|_| self.current(unit)) else {
-            return refuse(KError::PeerClosed);
+            return refusal(irp, KError::PeerClosed);
         };
-        // SAFETY: `irp` is live and owned by its submitter until completed.
-        let op = unsafe { (*irp).op };
+        let op = irp.op();
         if let Some(u) = dev.luns.get_mut(lun as usize).filter(|u| u.ejected) {
             if op == IrpOp::Flush as u32 {
                 return Action::Complete { irp, status: 0, transferred: 0 };
@@ -642,22 +644,25 @@ impl Disks {
         // its own commands once the device is quiet.
         if op == IrpOp::Rescan as u32 {
             if dev.luns.get(lun as usize).and_then(|u| u.record).is_none() {
-                return refuse(KError::Unsupported);
+                return refusal(irp, KError::Unsupported);
             }
             if dev.rescan.is_some() {
-                return refuse(KError::WouldBlock);
+                return refusal(irp, KError::WouldBlock);
             }
             dev.rescan = Some((irp, lun));
             return Action::Wake;
         }
         let c = match dev.command_for(irp, lun) {
             Ok(c) => c,
-            Err(e) => return refuse(e),
+            Err((irp, e)) => return refusal(irp, e),
         };
         // **Not while a rescan waits**: until the hub thread takes the device, it runs as ever, so
         // what is queued drains before the table is read. Once taken, `recovering` holds it.
         if dev.inflight.is_some() || dev.fault.is_some() || dev.recovering {
-            return if dev.queue.push(c) { Action::None } else { refuse(KError::IoError) };
+            return match dev.queue.push(c) {
+                Ok(()) => Action::None,
+                Err(c) => refusal(c.irp, KError::IoError),
+            };
         }
         dev.start(c, false, now);
         Action::None
@@ -673,8 +678,13 @@ impl Disks {
             if dev.slot != slot || (dci != dev.in_dci && dci != dev.out_dci) {
                 continue;
             }
-            let Some(cmd) = dev.inflight else {
+            let Some(cmd) = dev.inflight.as_ref() else {
                 return Some(Action::None);
+            };
+            let (stage, tag, started) = (cmd.stage, cmd.tag, cmd.started);
+            let hub = match cmd.owner {
+                Owner::Hub { po } => Some(po),
+                Owner::Irp { .. } => None,
             };
             // **A command with a fault recorded is the hub thread's**, which will reset what is on
             // its rings: a later event of it changes nothing. A deadline marked as the command was
@@ -684,7 +694,7 @@ impl Disks {
                 return Some(Action::None);
             }
             let ok = matches!(code, code::SUCCESS | code::SHORT_PACKET);
-            let at_csw = match cmd.stage {
+            let at_csw = match stage {
                 // **The data stage is over**, whole or short — a short one ends at the TRB that came
                 // up short, which the status wrapper's residue then says — so the status is asked for.
                 Stage::Data { dci: data } if ok && dci == data => {
@@ -700,14 +710,14 @@ impl Disks {
             let fault = if !ok {
                 Some(Fault::Transfer { dci, code })
             } else {
-                let short = matches!((cmd.stage, cmd.owner), (Stage::Status { short: true, .. }, Owner::Irp { .. }));
-                match csw(&dev.read_csw(), cmd.tag) {
+                let short = matches!(stage, Stage::Status { short: true, .. }) && hub.is_none();
+                match csw(&dev.read_csw(), tag) {
                     Status::Passed { residue: 0 } if short => Some(Fault::Short),
                     Status::Passed { residue: 0 } => None,
                     s => Some(Fault::Status(s)),
                 }
             };
-            if let Owner::Hub { po } = cmd.owner {
+            if let Some(po) = hub {
                 dev.inflight = None;
                 dev.hub_result = Some(match fault {
                     None => HubResult::Status(Status::Passed { residue: 0 }),
@@ -716,14 +726,15 @@ impl Disks {
                 });
                 return Some(Action::Hub { po });
             }
-            let Owner::Irp { cmd: c, .. } = cmd.owner else { return Some(Action::None) };
             if let Some(f) = fault {
                 dev.fault = Some(f);
                 return Some(Action::Wake);
             }
-            dev.inflight = None;
+            let Some(Command { owner: Owner::Irp { cmd: c, .. }, .. }) = dev.inflight.take() else {
+                return Some(Action::None);
+            };
             dev.fault = None;
-            dev.counted[c.lun as usize % MAX_LUNS].record(c.op, true, c.len as u64, now.saturating_sub(cmd.started));
+            dev.counted[c.lun as usize % MAX_LUNS].record(c.op, true, c.len as u64, now.saturating_sub(started));
             // **Ejected before the next starts**, so nothing queued behind the eject reaches the unit.
             let stopped = c.op == IrpOp::Eject as u32
                 && dev.luns.get_mut(c.lun as usize).is_some_and(|u| !core::mem::replace(&mut u.ejected, true));
@@ -743,28 +754,23 @@ impl Disks {
     }
 }
 
-fn complete(irp: *mut Irp, status: i32, transferred: u64) {
-    // SAFETY: `irp` is live and uniquely this driver's, completed here once.
-    unsafe { crate::io::irp::complete(irp, status, transferred) };
-}
-
 /// Do what an [`Action`] says. No lock held. `x` is the controller, to wake the hub thread through:
 /// the DPC's, the hub thread's, and a submit's — which wakes it only for a rescan; a command's
 /// deadline it learns from [`Disks::bound`].
 fn act(a: Action, x: Option<&Xhci>) {
     match a {
         Action::None => {}
-        Action::Complete { irp, status, transferred } => complete(irp, status, transferred),
+        Action::Complete { irp, status, transferred } => irp.complete(status, transferred),
         Action::Ejected { irp, said } => {
             if let Some((slot, lun)) = said {
                 crate::kprintln!(
                     "usb: slot {slot}: LUN {lun}: ejected, and asked for more; refused until plugged in again"
                 );
             }
-            complete(irp, KError::PeerClosed as i32, 0);
+            irp.complete(KError::PeerClosed as i32, 0);
         }
         Action::Stopped { irp } => {
-            complete(irp, 0, 0);
+            irp.complete(0, 0);
             act(Action::Wake, x);
         }
         Action::Hub { po } => {

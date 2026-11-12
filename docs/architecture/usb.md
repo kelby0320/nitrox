@@ -166,8 +166,8 @@ DPC reaches them through the entry it holds, never a kept address; its departure
 freed with the slot's memory or kept with it. Until a class binds, and after a bind that fails,
 they are the device's memory, with its contexts.
 **And its storage commands with it**: the one in flight and one a failed recovery stranded are
-never completed, since completing one hands its buffer back while the controller may still move its
-data; only a rescan, which moves none, completes. What waits on a kept command waits for good, as
+kept (`InFlight::keep`), never completed, since completing one hands its buffer back while the
+controller may still move its data; only a rescan, which moves none, completes. What waits on a kept command waits for good, as
 on AHCI ([`drivers-and-irps.md`](drivers-and-irps.md)).
 
 **A connect change on a port that has a device is a departure**, then an arrival if something is

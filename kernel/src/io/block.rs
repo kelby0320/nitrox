@@ -20,12 +20,15 @@ use crate::syscall::error::KError;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+mod in_flight;
+pub use in_flight::InFlight;
+
 /// **A block device's driver, as its backend's context**: a reference to the device's state, or a
 /// value naming it, which [`BlockBackend`] hands back to its `submit` and `poll`. Each device
 /// synchronises its own state, on whichever CPU submits.
 pub trait BlockDevice: Copy + Send + Sync + 'static {
     /// Take `irp` in flight: program the device and return, never blocking.
-    fn submit(self, irp: *mut Irp);
+    fn submit(self, irp: InFlight);
     /// Drive the in-flight command to completion by **polling**, then run its
     /// completion DPC: for synchronous kernel reads at boot, before interrupts
     /// are enabled (see [`read_blocking`]).
@@ -38,7 +41,7 @@ pub trait BlockDevice: Copy + Send + Sync + 'static {
 #[derive(Copy, Clone)]
 pub struct BlockBackend {
     ctx: MaybeUninit<usize>,
-    submit: unsafe fn(MaybeUninit<usize>, *mut Irp),
+    submit: unsafe fn(MaybeUninit<usize>, InFlight),
     poll: unsafe fn(MaybeUninit<usize>),
     max_frags: u32,
 }
@@ -54,8 +57,7 @@ impl BlockBackend {
     }
 
     /// Submit an IRP to the device.
-    #[allow(clippy::not_unsafe_ptr_arg_deref, reason = "the in-flight IRP its device's submit takes")]
-    pub fn submit(&self, irp: *mut Irp) {
+    pub fn submit(&self, irp: InFlight) {
         // SAFETY: `new` wrote `ctx` as the type `submit` reads it back as.
         unsafe { (self.submit)(self.ctx, irp) }
     }
@@ -92,8 +94,8 @@ pub(crate) fn test_backend(
     // SAFETY: as above.
     unsafe impl Sync for Raw {}
     impl BlockDevice for &'static Raw {
-        fn submit(self, irp: *mut Irp) {
-            (self.0)(irp, self.2)
+        fn submit(self, irp: InFlight) {
+            (self.0)(irp.into_raw(), self.2)
         }
         fn poll(self) {
             (self.1)(self.2)
@@ -104,7 +106,7 @@ pub(crate) fn test_backend(
 
 /// # Safety
 /// `ctx` holds a `C`, as [`BlockBackend::new`] wrote it.
-unsafe fn submit_as<C: BlockDevice>(ctx: MaybeUninit<usize>, irp: *mut Irp) {
+unsafe fn submit_as<C: BlockDevice>(ctx: MaybeUninit<usize>, irp: InFlight) {
     // SAFETY: the caller's.
     unsafe { ctx.as_ptr().cast::<C>().read() }.submit(irp)
 }
@@ -173,16 +175,40 @@ fn whole_blocks(dn: &DeviceNode, offset: u64, length: u64) -> Result<(), KError>
 
 /// **Submit `irp` to `backend`, or complete it `InvalidArgument` if its range is past `dn`'s end**,
 /// an outcome, not an argument failure (`docs/spec/io-operation.md`).
-fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: *mut Irp) {
+fn submit_within(dn: &DeviceNode, backend: BlockBackend, irp: InFlight) {
     let info = dn.block_info();
-    // SAFETY: `irp` is freshly placed and uniquely owned until it is submitted or completed.
-    let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
     let span = info.block_count.checked_mul(info.logical_block_size as u64);
-    if offset.checked_add(length).zip(span).is_some_and(|(end, span)| end <= span) {
+    if irp.offset().checked_add(irp.length()).zip(span).is_some_and(|(end, span)| end <= span) {
         backend.submit(irp);
     } else {
-        // SAFETY: as above; completed as a refusing driver completes it.
-        unsafe { crate::io::irp::complete(irp, KError::InvalidArgument as i32, 0) };
+        irp.complete(KError::InvalidArgument as i32, 0);
+    }
+}
+
+/// **Place `bx` and mint its IRP in flight**: its buffer pointed at its fragments, and its
+/// completion finishing the box. `InvalidArgument`, the box freed, if the fragments do not hold the
+/// IRP's length.
+fn arm(bx: KBox<IrpBox>) -> Result<InFlight, KError> {
+    let bx_ptr = KBox::into_raw(bx).as_ptr();
+    // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned `IrpBox`; `irp` is its first field.
+    let irp = unsafe {
+        let bx = &mut *bx_ptr;
+        if !bx.frags.is_empty() {
+            bx.irp.buffer =
+                IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
+        }
+        bx.irp.on_complete = finish;
+        core::ptr::NonNull::new_unchecked(&raw mut (*bx_ptr).irp)
+    };
+    // SAFETY: the box's IRP, submitted nowhere yet; the box keeps its fragments until reclaimed,
+    // after the completion.
+    match unsafe { InFlight::mint(irp) } {
+        Some(irp) => Ok(irp),
+        None => {
+            // SAFETY: the box placed above, which nothing else has reached.
+            drop(unsafe { KBox::from_raw(core::ptr::NonNull::new_unchecked(bx_ptr)) });
+            Err(KError::InvalidArgument)
+        }
     }
 }
 
@@ -251,21 +277,8 @@ pub fn dispatch_block_irp(
         reclaim_next: core::ptr::null_mut(),
     })
     .map_err(|_| KError::OutOfMemory)?;
-    let bx_ptr = KBox::into_raw(bx).as_ptr();
-
-    // Finish wiring now that the box has a stable address: point `irp.buffer` at
-    // `frags` and have its completion finish the box (`irp` is first).
-    // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned `IrpBox`.
-    let irp_ptr = unsafe {
-        let bx = &mut *bx_ptr;
-        bx.irp.buffer =
-            IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
-        bx.irp.on_complete = finish;
-        &raw mut (*bx_ptr).irp
-    };
-
-    // Completes asynchronously: the backend, or its completion interrupt, calls `irp::complete`.
-    submit_within(dn, backend, irp_ptr);
+    // Completes asynchronously: the backend, or its completion interrupt, completes it.
+    submit_within(dn, backend, arm(bx)?);
     Ok(())
 }
 
@@ -328,18 +341,7 @@ pub fn dispatch_block_irp_into_frames(
         reclaim_next: core::ptr::null_mut(),
     })
     .map_err(|_| KError::OutOfMemory)?;
-    let bx_ptr = KBox::into_raw(bx).as_ptr();
-
-    // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned `IrpBox`; wire `irp.buffer` at
-    // the now-stable `frags`, and have its completion finish the box (irp is the first field).
-    let irp_ptr = unsafe {
-        let bx = &mut *bx_ptr;
-        bx.irp.buffer =
-            IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
-        bx.irp.on_complete = finish;
-        &raw mut (*bx_ptr).irp
-    };
-    submit_within(dn, backend, irp_ptr);
+    submit_within(dn, backend, arm(bx)?);
     Ok(())
 }
 
@@ -367,15 +369,8 @@ pub fn dispatch_block_control(device: &Ref<DeviceNode>, po: &Ref<PendingOperatio
         reclaim_next: core::ptr::null_mut(),
     })
     .map_err(|_| KError::OutOfMemory)?;
-    let bx_ptr = KBox::into_raw(bx).as_ptr();
-    // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned `IrpBox`; have its completion finish
-    // the box (`irp` is the first field). `irp.buffer` stays `NONE`: nothing to transfer.
-    let irp_ptr = unsafe {
-        let bx = &mut *bx_ptr;
-        bx.irp.on_complete = finish;
-        &raw mut (*bx_ptr).irp
-    };
-    backend.submit(irp_ptr);
+    // `irp.buffer` stays `NONE`: nothing to transfer.
+    backend.submit(arm(bx)?);
     Ok(())
 }
 
@@ -549,7 +544,7 @@ unsafe impl Sync for Partition {}
 
 impl BlockDevice for &'static Partition {
     /// Bounds-check, **rebase** the offset to disk-absolute and forward to the parent disk's backend.
-    fn submit(self, irp: *mut Irp) {
+    fn submit(self, irp: InFlight) {
         use core::sync::atomic::Ordering::SeqCst;
         // **Counted in before the retired check, out after the forward**, each `SeqCst` as
         // `retire_window`'s store and `window_busy`'s load are: either this sees the window retired,
@@ -564,33 +559,24 @@ impl BlockDevice for &'static Partition {
     }
 }
 
-/// [`partition_submit`]'s body, between its count in and out: refuse, or rebase and forward.
-fn forward(p: &Partition, irp: *mut Irp) {
-    // SAFETY: `irp` is in flight and uniquely owned during submit.
-    if let Some(e) = window_refusal(p, unsafe { (*irp).op }) {
-        // SAFETY: `irp` is in flight, and completed here once.
-        unsafe { crate::io::irp::complete(irp, e as i32, 0) };
+/// A partition's submit's body, between its count in and out: refuse, or rebase and forward.
+fn forward(p: &Partition, mut irp: InFlight) {
+    if let Some(e) = window_refusal(p, irp.op()) {
+        irp.complete(e as i32, 0);
         return;
     }
     // **A flush names no range**: it is the disk's cache, not the partition's
     // blocks, so it goes down unchanged.
-    // SAFETY: `irp` is in flight and uniquely owned during submit.
-    if unsafe { (*irp).op } == IrpOp::Flush as u32 {
+    if irp.op() == IrpOp::Flush as u32 {
         p.disk.submit(irp);
         return;
     }
-    // SAFETY: as above, `irp` is in flight and uniquely owned during submit.
-    let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
-    match partition_rebase(offset, length, p.start_lba, p.block_count, p.sector_size) {
+    match partition_rebase(irp.offset(), irp.length(), p.start_lba, p.block_count, p.sector_size) {
         Some(disk_offset) => {
-            // SAFETY: `irp` is in flight and uniquely owned during submit.
-            unsafe { (*irp).offset = disk_offset };
+            irp.rebase(disk_offset);
             p.disk.submit(irp);
         }
-        None => {
-            // SAFETY: `irp` is in flight, and completed here once.
-            unsafe { crate::io::irp::complete(irp, KError::InvalidArgument as i32, 0) };
-        }
+        None => irp.complete(KError::InvalidArgument as i32, 0),
     }
 }
 
