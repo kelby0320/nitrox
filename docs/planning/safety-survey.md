@@ -2091,7 +2091,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
 
 **Opportunities**
 
-- [ ] **drv-o1** encapsulate: an in-flight IRP is passed as a raw `*mut Irp` through the safe
+- [x] **drv-o1** encapsulate: an in-flight IRP is passed as a raw `*mut Irp` through the safe
   `fn(*mut Irp, *mut ())` of `BlockBackend::submit`. Each driver derefs it raw, rebuilds its own
   fragment slice with its own null and zero-count handling, and completes it by hand
   (`set_completion` + `dpc::enqueue(&(*irp).dpc)`); "completed exactly once" and "fragments sum to
@@ -2112,6 +2112,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   would have been a dropped token), the three variants of null and zero-count handling, and safe fn
   pointers that dereference raw arguments. Depends on: nothing. Lenses: abi, ownership,
   opportunities. Value high, effort medium. **Plan**, in P5.
+  Done in `e8597abc`: `io::block::InFlight`, minted by dispatch once its fragments sum to its
+  length; `complete` and `keep` spend it, and one dropped unfinished panics a debug build. AHCI's
+  ring and slot 0 and USB storage's commands, actions, stranded command and rescan hold one; the
+  RAM disk's transfer takes its parts. No `*mut Irp` is left in a driver.
 
 - [x] **drv-o2** encapsulate: kernel objects are adopted from a `KBox` and downcast from an
   `ObjectRef` by hand. `ObjectRef::from_raw(KBox::into_raw(x).as_ptr() as *mut (),
@@ -2309,7 +2313,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   values, where a `Published` holds one. Fails without it:
   `a_value_is_published_once_and_a_second_is_refused`.
 
-- [ ] **drv-o12** encapsulate: `BlockBackend`'s `ctx: *mut ()` is re-cast at every submit and poll
+- [x] **drv-o12** encapsulate: `BlockBackend`'s `ctx: *mut ()` is re-cast at every submit and poll
   (Partition, AhciDisk, RamDisk), or is an integer smuggled through the pointer (USB slot/lun/epoch,
   storage.rs:136; HID and PS/2 indexes, hid.rs:75). Its `submit`, `poll` and `ctx` fields are pub,
   so safe code can pair any ctx with any submit; `window_of` identifies a Partition by comparing
@@ -2325,6 +2329,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   window missed on rescan because two function addresses compare equal or unequal (drv-d16).
   Depends on: drv-o11 (for the `'static` device refs). Lenses: ownership, soundness, opportunities.
   Value medium, effort medium. **Plan**, in P5.
+  Done in `fb32fe03`, by the second option, which leaves room for a Tier 2 driver: private fields,
+  and `BlockBackend::new::<C: BlockDevice>`, each context read back as its own type by its own
+  functions; a USB disk's a `UnitAt` value. A window is its node's, `DeviceNode::window`.
 
 - [x] **drv-o13** encapsulate: the storage `Dev` and HID `Bound` table entries keep raw u64 virtual
   addresses of rings, wrapper, binding and report pages that live in `DeviceMem.class`, owned by

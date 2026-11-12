@@ -866,6 +866,47 @@ Controls: a dropped token panics; a fragment sum short of the length is refused 
 with a raw slice, so the new guard does not hide the old; a port that will not stop keeps its
 command by `keep()`. Depends on J.2, which rewrites the same dispatch lines. Author.
 
+**Built 2026-11-12** (`fb32fe03` the typed backend, `e8597abc` the token).
+- **`BlockBackend::new::<C: BlockDevice>(ctx, max_frags)`**, its fields private: a `BlockDevice`
+  is a driver's context, a `Copy` value a word wide at most, read back as `C` by `C`'s own `submit`
+  and `poll`. A partition's and a RAM disk's are their `&'static` state, AHCI's the unit `Port`,
+  which reaches the disk AHCI publishes, and a USB disk's a `UnitAt`, its slot, unit and epoch,
+  where they were an integer cast to a pointer. `BlockBackend` is `Send` and `Sync` by its
+  context's bound. A window is its node's (`DeviceNode::window`), not a function address compared.
+- **`InFlight`**, minted by `io::block`'s dispatch alone, once the IRP's fragments sum to its
+  length: short, over and a wrapping sum are refused. A driver reads `op`, `offset`, `length` and
+  `frags` through it, a partition `rebase`s it, and it is spent once, by `complete` or `keep`; a
+  debug build panics on one dropped unfinished. AHCI's ring and slot 0 hold one, and USB storage's
+  `IrpCmd`, `Owner`, `Command`, `Action`, `BeginRescan`, `stranded`, `rescan` and `Departed`, none
+  `Copy` now; the RAM disk's `transfer` takes the request's parts. **No `*mut Irp` is left in a
+  driver**: what remains is the `Irp`'s own layout and completion list, `IrpBox`'s `finish`, and
+  test helpers.
+- **For the maintainer's eye: four departures from the plan.**
+  1. **`InFlight` is `io::block`'s child** (`io/block/in_flight.rs`), not in `io/irp.rs` beside
+     the hashed layout: there its `pub(super)` mint would be all of `io`'s, the RAM disk's too.
+  2. **AHCI's kept command leaves slot 0**, taken by `give_up` and kept, where it stayed in 
+     slot; nothing reads slot 0 of a dead port, and the watch thread ends with it. `claim` says
+     whether to recover, and `recover` takes slot 0's command itself.
+  3. **Two test mints**: `for_test`, which panics when dropped as the real one does, for 
+     controls on `keep`; and `for_test_lax`, for tests that compare what comes back and drop it.
+     A host test's token dropped while it unwinds is quiet, so a failing control fails its test
+     rather than aborting the run.
+  4. **USB storage's `Dev` keeps its `unsafe impl Send`**, for the hub thread's operation pointer
+     alone now, which J.15 takes up.
+
+Counts: `unsafe` blocks fall from 541 to 518 (`drivers` −18; `io` −5, after +2 raised by hand for
+the typed backend's trampolines and its store), `unsafe fn`s rise from 198 to 199 (`io` +3 by hand,
+the two trampolines and `InFlight::mint`; `drivers` −2), and `unsafe impl`s fall by one (`io`: two
+for `BlockBackend` gone, one for `InFlight` raised by hand).
+
+**The controls**: six mutations, each failing its test. The drop's panic removed; the mint's sum
+check removed; the RAM disk's own check removed, which
+`a_transfer_moves_its_length_whatever_its_fragments_hold` still catches through a raw slice; AHCI
+dropping its kept command, and leaving it in slot 0, over tokens that panic when dropped; storage
+dropping a kept slot's command. Compile probes: the RAM disk minting a token is E0624, a backend's
+private functions E0616, and a raw pointer as a context E0277. Under Miri, both models, the
+134 tests of `io::block`, the RAM disk, the two drivers, and the tests on `test_backend`.
+
 ### J.15 The hub's waits, and the DPC's hand-offs (drv-o15, drv-o6)
 
 - **`Armed` and `Completer`** (drv-o15): the hub thread arms a record with a PO it holds and waits
