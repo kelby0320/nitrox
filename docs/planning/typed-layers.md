@@ -835,6 +835,17 @@ the ABAR is not claimed; an Enable Slot answer of 0 or past MaxSlots is refused.
 IOAPIC's register fake. Thirteen mutations, each failing its test. Under Miri, both models,
 the 180 tests of the windows, the vectors, the IOAPIC, PCI, DMA and the two drivers.
 
+**After review** (`54ea8a82`):
+- **A BAR0 too short for its capability registers is declined**, read through a pure
+  `capabilities(..)`, where a 16-byte one panicked at HCCPARAMS1: the windows' rule, held to the
+  first reads too.
+- **`give_back` frees only an MSI vector**: on a routed one it masks the line and keeps the vector,
+  where it left the entry unmasked and the vector for the next taker.
+- **A full pool says so**: `InstallError::says`, in AHCI's decline, the console's and PS/2's lines
+  and the RAM disk's, where `PoolFull` read as a route that failed.
+- Tests pin RTSOFF's and DBOFF's reserved bits. The MSI give-backs stay untested, unreachable on
+  x86 today, and a missed one leaks a vector rather than freeing a live one.
+
 ### J.14 An I/O request in flight (drv-o12, drv-o1)
 
 **38 `*mut Irp`s**, 24 dereferenced raw, through **12 safe functions** taking one; three handlings
