@@ -31,6 +31,17 @@
 //! into is not architectural at all, and lives in [`crate::pci`]. That split is
 //! why this trait yields a message rather than programming a device.
 
+use crate::arch::DeviceVector;
+
+/// Why a device interrupt could not be installed. Either way it took no vector.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InstallError {
+    /// Every device vector is taken.
+    PoolFull,
+    /// It cannot reach the boot CPU: its line has no route there, or the CPU no name in a message.
+    Unreachable,
+}
+
 /// The write a PCI function performs in order to raise its interrupt.
 ///
 /// Produced by [`ArchIrqInstall::install_msi`] and consumed by
@@ -53,29 +64,26 @@ pub trait ArchIrqInstall {
     /// Install a **PCI INTx** interrupt end to end: register `handler` for a
     /// fresh device vector, route `gsi` to it on the boot CPU with the PCI INTx
     /// convention (level-triggered, active-low), and unmask the line. Returns
-    /// the assigned vector, or `None`, taking none, if `gsi` cannot reach the boot CPU.
+    /// the vector, which dropped masks the line and stays taken.
     ///
     /// # Safety
     /// Ring-0, after the router is up. `handler` must stay valid for the
     /// kernel's lifetime, and the caller must be ready to receive `gsi` once
     /// interrupts are enabled.
-    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> Option<u8>;
+    unsafe fn install_intx(gsi: u32, handler: extern "C" fn()) -> Result<DeviceVector, InstallError>;
 
     /// Register `handler` for a fresh device vector and return the message a
     /// device must write to raise it on the calling CPU. Nothing is routed:
     /// an MSI device delivers the interrupt itself, so the caller's remaining
     /// job is to write the message into the device (see
-    /// [`crate::pci::program_msi`]).
-    ///
-    /// Returns `None` when this CPU cannot be named in a message — the vector
-    /// pool is untouched in that case, and the caller should fall back to
-    /// [`install_intx`](ArchIrqInstall::install_intx).
+    /// [`crate::pci::program_msi`]). **The vector stays taken when dropped**: a
+    /// device may have its message, unless [`DeviceVector::give_back`] says not.
     ///
     /// # Safety
     /// Ring-0, after the local controller is up. `handler` must stay valid for
     /// the kernel's lifetime, and the caller must be ready to receive the
     /// interrupt from the moment it writes the message into the device.
-    unsafe fn install_msi(handler: extern "C" fn()) -> Option<MsiMessage>;
+    unsafe fn install_msi(handler: extern "C" fn()) -> Result<(MsiMessage, DeviceVector), InstallError>;
 
     /// Register `handler` for a fresh device vector that **no device raises**: the kernel raises
     /// it on the current CPU with
@@ -83,10 +91,10 @@ pub trait ArchIrqInstall {
     ///
     /// For a backend with no hardware of its own whose completions must still run at a
     /// device-interrupt tail — a RAM disk. Without one, a completion DPC waits for the next timer
-    /// tick, which serialises every block I/O on it.
+    /// tick, which serialises every block I/O on it. Dropped, the vector is given back.
     ///
     /// # Safety
     /// Ring-0, after the interrupt table is installed. `handler` must stay valid for the kernel's
     /// lifetime.
-    unsafe fn install_software(handler: extern "C" fn()) -> u8;
+    unsafe fn install_software(handler: extern "C" fn()) -> Result<DeviceVector, InstallError>;
 }

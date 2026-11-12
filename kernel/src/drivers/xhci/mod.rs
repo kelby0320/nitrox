@@ -33,7 +33,7 @@ pub use hub::FIRST_ROUND_NS;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::arch::irq_install::ArchIrqInstall;
+use crate::arch::irq_install::{ArchIrqInstall, InstallError};
 use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
 use crate::dpc::{Dpc, OneAtATime};
@@ -450,13 +450,17 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
     let Some(msi) = crate::pci::read_msi(&cfg) else {
         return declined("no MSI capability");
     };
+    // **Its vector stays taken from here, on a decline too**: the device may be handed its message.
     // SAFETY: ring 0, after the interrupt controller; `isr` lives as long as the kernel, and does
     // nothing until `XHCI` is published below.
-    let Some(msg) = (unsafe { crate::arch::IrqInstall::install_msi(isr) }) else {
-        return declined("this CPU cannot be named in an MSI message");
+    let (msg, vector) = match unsafe { crate::arch::IrqInstall::install_msi(isr) } {
+        Ok(installed) => installed,
+        Err(InstallError::PoolFull) => return declined("no device vector is free"),
+        Err(InstallError::Unreachable) => return declined("this CPU cannot be named in an MSI message"),
     };
     // SAFETY: the handler for `msg.vector` is registered, so the device may raise it.
     if !unsafe { crate::pci::program_msi(&cfg, &msi, msg.address, msg.data) } {
+        vector.give_back();
         return declined("its MSI capability cannot hold the message address");
     }
     crate::pci::set_intx_disabled(&cfg, true);
@@ -553,7 +557,7 @@ pub fn init(controller: &DeviceNode, usb_off: bool) -> Outcome {
         if msi.addr64 { 64 } else { 32 },
         msi.off
     );
-    Outcome::Claimed { driver: DRIVER, signal: Signal::Msi { vector: msg.vector } }
+    Outcome::Claimed { driver: DRIVER, signal: Signal::Msi { vector: vector.commit() } }
 }
 
 const OUT_OF_MEMORY: &str = "out of memory";
@@ -826,8 +830,8 @@ impl fmt::Display for Ranges<'_> {
     }
 }
 
-/// A controller over host memory standing in for its registers: its rings made, its memory its
-/// own, nothing running.
+/// A controller over host memory standing in for its registers: its rings made, its memory
+/// its own, nothing running.
 #[cfg(test)]
 fn fake() -> Xhci {
     let regs = Mmio::over(std::boxed::Box::leak(std::boxed::Box::new([0u32; 64])));

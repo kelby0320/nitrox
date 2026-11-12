@@ -11,7 +11,8 @@
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::printable::Printable;
 
-use crate::arch::irq_install::ArchIrqInstall;
+use crate::arch::DeviceVector;
+use crate::arch::irq_install::{ArchIrqInstall, InstallError};
 use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;

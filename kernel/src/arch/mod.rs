@@ -73,6 +73,8 @@ pub use x86_64::ioapic::X86IoApic as IrqRouter;
 // on any of them. See `arch/irq_install.rs`.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::irq_install::X86IrqInstall as IrqInstall;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::vectors::DeviceVector;
 // Legacy *ISA* interrupt installation is **not** re-exported neutrally: "ISA" is an
 // x86-only concept (ARM has no ISA IRQs), so surfacing it here would leak arch
 // jargon (`docs/conventions/arch-boundary.md`). A fixed legacy platform device wires

@@ -168,9 +168,9 @@ pub unsafe fn console_arm_rx(handler: extern "C" fn()) -> Option<u8> {
     // SAFETY: forwarded from this fn's contract (ring-0, post-router-init; `handler`
     // valid for the kernel's lifetime). `install_isa_irq` is the x86 IOAPIC routing
     // primitive, kept inside the arch layer.
-    let vector = unsafe { super::ioapic::install_isa_irq(COM1_IRQ, handler) }?;
+    let vector = unsafe { super::ioapic::install_isa_irq(COM1_IRQ, handler) }.ok()?;
     COM1.enable_rx_interrupt();
-    Some(vector)
+    Some(vector.commit())
 }
 
 /// `true` if a UART answers at COM1.

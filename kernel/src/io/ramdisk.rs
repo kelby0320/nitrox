@@ -268,8 +268,10 @@ fn ramdisk_poll(_ctx: *mut ()) {
 pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNode>, AllocError> {
     if COMPLETION_VECTOR.load(Ordering::Acquire) == 0 {
         // SAFETY: ring 0 at boot, after the interrupt table; the handler is a `'static` fn.
-        let vector = unsafe { crate::arch::IrqInstall::install_software(ramdisk_completion_isr) };
-        COMPLETION_VECTOR.store(vector, Ordering::Release);
+        match unsafe { crate::arch::IrqInstall::install_software(ramdisk_completion_isr) } {
+            Ok(vector) => COMPLETION_VECTOR.store(vector.commit(), Ordering::Release),
+            Err(e) => crate::kprintln!("ramdisk: no completion vector ({e:?}); its completions wait for a tick"),
+        }
     }
     let backend = BlockBackend {
         submit: ramdisk_submit,

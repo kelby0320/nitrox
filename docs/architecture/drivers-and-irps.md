@@ -124,6 +124,15 @@ installing an interrupt spans both plus the handler registry.
   register). The one user is the RAM disk (§ "The RAM disk"): a completion DPC drains only at an
   interrupt tail, so without an interrupt it waited for the timer tick.
 
+**Each install takes a vector from a pool of eight** (`arch/x86_64/vectors.rs`), and a full pool
+answers `PoolFull` where it once halted the boot: a driver declines, the RAM disk waits for the
+tick. The vector comes
+back as a `DeviceVector`, which **gives it back when dropped only while nothing may raise it**: a
+software vector before its user commits it, and an MSI vector whose message the capability
+refused. One a device may have been handed a message for stays taken, as the device may still
+write it; one routed to a line is masked, then kept, as an interrupt may be on its way. A claimed
+device commits its vector for good.
+
 **Deferred:** MSI-X, and shared PCI INTx (the "chain of handlers, each returns
 *mine* / *not mine*" model). Neither MSI nor MSI-X is ever shared, so the second
 matters only for a device that has neither.

@@ -20,7 +20,7 @@
 
 use core::arch::asm;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::registers::RegisterValues;
 use crate::arch::Cpu;
@@ -446,14 +446,9 @@ fn reschedule_ipi_dispatch(_frame: &mut ExceptionFrame) {
 // registers without touching the IDT.
 
 /// First device-IRQ vector. Above the timer (`0x20`) and the exception range.
-const DEVICE_IRQ_BASE: u8 = 0x30;
+pub(super) const DEVICE_IRQ_BASE: u8 = 0x30;
 /// Number of device-IRQ vectors (`0x30..=0x37`); add stubs to `DEVICE_STUBS` for more.
-const DEVICE_IRQ_COUNT: usize = 8;
-
-/// Registered handler per device vector, a function pointer stored in a `usize` (`0` = none).
-/// Written once at registration (boot), read in IRQ context, lock-free.
-static DEVICE_HANDLERS: [AtomicUsize; DEVICE_IRQ_COUNT] = [const { AtomicUsize::new(0) }; DEVICE_IRQ_COUNT];
-static NEXT_DEVICE_SLOT: AtomicUsize = AtomicUsize::new(0);
+pub(super) const DEVICE_IRQ_COUNT: usize = 8;
 
 irq_dispatcher! {
 /// Shared dispatcher for every device-IRQ vector: runs the registered handler, then signals
@@ -462,16 +457,12 @@ fn device_irq_dispatch(frame: &mut ExceptionFrame) {
     crate::entropy::on_irq_sample(regs::rdtsc());
     // `vector` is the immediate the stub pushed, always in `DEVICE_IRQ_BASE..+COUNT`.
     let vector = frame.vector as usize;
-    let slot = vector.wrapping_sub(DEVICE_IRQ_BASE as usize);
-    if slot < DEVICE_IRQ_COUNT {
-        let h = DEVICE_HANDLERS[slot].load(Ordering::Acquire);
-        if h != 0 {
-            // SAFETY: a non-zero slot holds a function pointer installed by
-            // `register_device_handler` (a real `extern "C" fn()`); single
-            // writer at boot, so the value is valid.
-            let f: extern "C" fn() = unsafe { core::mem::transmute(h) };
-            f();
-        }
+    let h = super::vectors::DEVICES.handler(vector.wrapping_sub(DEVICE_IRQ_BASE as usize));
+    if h != 0 {
+        // SAFETY: a non-zero slot holds a function pointer `VectorPool::take` stored, a real
+        // `extern "C" fn()`.
+        let f: extern "C" fn() = unsafe { core::mem::transmute(h) };
+        f();
     }
     // SAFETY: ring-0, reached only from a device IRQ after `Irq::init`.
     unsafe { crate::arch::Irq::eoi() };
@@ -484,23 +475,6 @@ fn device_irq_dispatch(frame: &mut ExceptionFrame) {
     // was already sent; a delayed return resumes into the stub's epilogue and `iretq`s.
     crate::sched::resched_if_idle();
 }
-}
-
-/// Register `handler` for the next free device-IRQ vector and return that vector. The gates
-/// for every device vector are pre-installed by [`init`]; this only fills the registry, so a
-/// driver wires `(GSI → vector)` at the router and `(vector → handler)` here.
-///
-/// Panics if the device-vector pool is exhausted, a static configuration error.
-pub(crate) fn register_device_handler(handler: extern "C" fn()) -> u8 {
-    let slot = NEXT_DEVICE_SLOT.fetch_add(1, Ordering::Relaxed);
-    assert!(slot < DEVICE_IRQ_COUNT, "device-IRQ vector pool exhausted");
-    DEVICE_HANDLERS[slot].store(handler as usize, Ordering::Release);
-    DEVICE_IRQ_BASE + slot as u8
-}
-
-#[cfg(test)]
-pub(crate) fn device_slots_taken() -> usize {
-    NEXT_DEVICE_SLOT.load(Ordering::Relaxed)
 }
 
 macro_rules! device_irq_stub {

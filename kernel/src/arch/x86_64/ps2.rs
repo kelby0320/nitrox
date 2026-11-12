@@ -12,6 +12,7 @@
 
 use super::ioapic;
 use super::regs::{inb, outb};
+use crate::arch::DeviceVector;
 
 const DATA: u16 = 0x60;
 const CMD: u16 = 0x64;
@@ -290,9 +291,9 @@ fn reset_to_three_bytes() -> bool {
 pub unsafe fn arm(kbd: extern "C" fn(), aux: extern "C" fn()) -> (Option<u8>, Option<u8>) {
     // SAFETY: forwarded from this fn's contract. `install_isa_irq` is the x86 IOAPIC
     // routing primitive, kept inside the arch layer (`arch/mod.rs` refuses to surface it).
-    let kbd_vec = unsafe { ioapic::install_isa_irq(KBD_IRQ, kbd) };
+    let kbd_vec = unsafe { ioapic::install_isa_irq(KBD_IRQ, kbd) }.ok().map(DeviceVector::commit);
     // SAFETY: as above, for the aux line.
-    let aux_vec = unsafe { ioapic::install_isa_irq(AUX_IRQ, aux) };
+    let aux_vec = unsafe { ioapic::install_isa_irq(AUX_IRQ, aux) }.ok().map(DeviceVector::commit);
 
     // Enable the controller's interrupt generation last, so neither line fires before both
     // handlers are routed.

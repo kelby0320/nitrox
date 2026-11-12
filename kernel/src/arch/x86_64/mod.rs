@@ -28,6 +28,7 @@ pub mod syscall;
 pub mod timer;
 pub mod tlb;
 pub mod user_access;
+pub mod vectors;
 
 // CPU control (init_tables / init_protections / set_kernel_stack / halt_loop)
 // lives on the `ArchCpu` trait, impl'd in `cpu.rs` and re-exported as

@@ -73,8 +73,8 @@ observe the unseeded path.
 ### Software (slice 2)
 
 - **Interrupt-timing jitter.** At each interrupt dispatch (the timer tick via
-  `sched::on_timer_tick`, and device IRQs via handlers registered through
-  `idt::register_device_handler`), the low bits of `regs::rdtsc()` are sampled and
+  `sched::on_timer_tick`, and device IRQs via handlers registered in the device-vector
+  pool, `vectors::VectorPool`), the low bits of `regs::rdtsc()` are sampled and
   pushed into the pool. The unpredictability is in the *fine-grained timing* of when
   interrupts arrive relative to the TSC — accumulated over hundreds of samples.
 

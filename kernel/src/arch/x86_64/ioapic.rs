@@ -11,11 +11,14 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::Cpu;
+use crate::arch::DeviceVector;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::irq::ArchIrq;
+use crate::arch::irq_install::InstallError;
 use crate::arch::irq_router::{ArchIrqRouter, Polarity, TriggerMode};
 use crate::arch::timer::ArchTimer;
-use crate::arch::x86_64::{acpi, idt, regs};
+use crate::arch::x86_64::vectors::{DEVICES, Held, VectorPool};
+use crate::arch::x86_64::{acpi, regs};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock};
 use crate::mm::{Mmio, kvmap};
@@ -210,16 +213,18 @@ impl ArchIrqRouter for X86IoApic {
         }
         let bsp = crate::arch::Irq::id();
         let (gsi, polarity, trigger) = resolve_isa_irq(0, acpi::source_overrides());
-        let vector = idt::register_device_handler(pit_tick);
         PIT_TICKS.store(0, Ordering::Relaxed);
         PIT_DPC_RUNS.store(0, Ordering::Relaxed);
 
-        // Route the PIT's GSI to our vector on the boot CPU and start the PIT.
-        // SAFETY: ring-0, post-init; the handler for `vector` is registered.
-        if !unsafe { Self::route(gsi, vector, bsp, trigger, polarity) } {
-            crate::kprintln!("ioapic: the PIT's GSI{} cannot be routed to the boot CPU", gsi);
-            return;
-        }
+        // Route the PIT's GSI to a vector on the boot CPU and start the PIT.
+        // SAFETY: ring-0, post-init; `pit_tick` is a `'static` fn.
+        let vector = match unsafe { install(&DEVICES, gsi, bsp, pit_tick, trigger, polarity) } {
+            Ok(vector) => vector,
+            Err(e) => {
+                crate::kprintln!("ioapic: the PIT's GSI{} cannot be routed to the boot CPU: {:?}", gsi, e);
+                return;
+            }
+        };
         // SAFETY: ring-0; we own the PIT.
         unsafe { pit_ch0_periodic((PIT_INPUT_HZ / 100) as u16) };
 
@@ -241,7 +246,7 @@ impl ArchIrqRouter for X86IoApic {
         crate::kprintln!(
             "ioapic: routed PIT IRQ0\u{2192}GSI{}\u{2192}vec{:#x}; took {} interrupts ({} via DPC)",
             gsi,
-            vector,
+            vector.vector(),
             PIT_TICKS.load(Ordering::Relaxed),
             PIT_DPC_RUNS.load(Ordering::Relaxed),
         );
@@ -262,30 +267,35 @@ impl ArchIrqRouter for X86IoApic {
 /// # Safety
 /// Ring-0, after [`X86IoApic::init`]. `handler` must stay valid for the kernel's
 /// lifetime; the caller must be ready to receive the IRQ once interrupts are enabled.
-pub(crate) unsafe fn install_isa_irq(isa_irq: u8, handler: extern "C" fn()) -> Option<u8> {
+pub(crate) unsafe fn install_isa_irq(isa_irq: u8, handler: extern "C" fn()) -> Result<DeviceVector, InstallError> {
     let (gsi, polarity, trigger) = resolve_isa_irq(isa_irq, acpi::source_overrides());
     // SAFETY: forwarded from this fn's contract.
-    unsafe { install(gsi, crate::arch::Irq::id(), handler, trigger, polarity) }
+    unsafe { install(&DEVICES, gsi, crate::arch::Irq::id(), handler, trigger, polarity) }
 }
 
-/// **Route `gsi` to `dest` on a fresh vector for `handler`**; `None`, taking none, if it cannot.
+/// **Route `gsi` to `dest` on a vector from `pool` for `handler`**, which dropped masks the line and
+/// stays taken; an error, taking none, if it cannot.
 ///
 /// # Safety
 /// As [`install_isa_irq`].
 pub(super) unsafe fn install(
+    pool: &'static VectorPool,
     gsi: u32,
     dest: u32,
     handler: extern "C" fn(),
     trigger: TriggerMode,
     polarity: Polarity,
-) -> Option<u8> {
+) -> Result<DeviceVector, InstallError> {
     if !IOAPIC.lock().as_ref().is_some_and(|io| io.names(gsi, dest).is_some()) {
-        return None;
+        return Err(InstallError::Unreachable);
     }
-    let vector = idt::register_device_handler(handler);
+    let vector = pool.take(handler, Held::Idle)?;
     // SAFETY: forwarded from this fn's contract; the handler for `vector` was just
     // registered, so the routed interrupt has somewhere to land.
-    unsafe { X86IoApic::route(gsi, vector, dest, trigger, polarity) }.then_some(vector)
+    if !unsafe { X86IoApic::route(gsi, vector.vector(), dest, trigger, polarity) } {
+        return Err(InstallError::Unreachable);
+    }
+    Ok(vector.routed(gsi))
 }
 
 #[cfg(test)]
@@ -337,21 +347,28 @@ mod tests {
         assert_eq!(io.names(24, 0), None);
     }
 
-    /// **A refused install takes no vector**, and one that routes takes one.
+    /// **A refused install takes no vector**, and one that routes takes one, which dropped masks its
+    /// line and stays taken: an interrupt may be on its way.
     #[test]
-    fn a_refused_install_takes_no_vector() {
+    fn a_refused_install_takes_no_vector_and_a_dropped_route_is_masked_and_kept() {
         extern "C" fn handler() {}
-        *IOAPIC.lock() = Some(IoApic { regs: fake_regs(), gsi_base: 0, entries: 24 });
-        let taken = idt::device_slots_taken();
+        static POOL: VectorPool = VectorPool::new();
+        let regs = fake_regs();
+        *IOAPIC.lock() = Some(IoApic { regs, gsi_base: 0, entries: 24 });
         let install = |gsi, dest| {
             // SAFETY: a host test, where nothing delivers the interrupt.
-            unsafe { install(gsi, dest, handler, TriggerMode::Level, Polarity::ActiveLow) }
+            unsafe { install(&POOL, gsi, dest, handler, TriggerMode::Level, Polarity::ActiveLow) }
         };
-        assert_eq!(install(9, 0x100), None);
-        assert_eq!(install(24, 0), None);
-        assert_eq!(idt::device_slots_taken(), taken);
-        assert!(install(9, 0).is_some());
-        assert_eq!(idt::device_slots_taken(), taken + 1);
+        assert_eq!(install(9, 0x100).err(), Some(InstallError::Unreachable), "a destination too wide");
+        assert_eq!(install(24, 0).err(), Some(InstallError::Unreachable), "a GSI with no entry");
+        assert_eq!(POOL.handler(0), 0, "neither took a vector");
+        let routed = install(9, 0).expect("routed");
+        let slot = (routed.vector() - crate::arch::x86_64::idt::DEVICE_IRQ_BASE) as usize;
+        assert_eq!(regs.read32(IOWIN) & 1 << 16, 0, "its entry unmasked");
+        drop(routed);
+        assert_eq!(regs.read32(IOREGSEL), REG_REDTBL_BASE + 2 * 9, "entry 9's low dword written last");
+        assert_ne!(regs.read32(IOWIN) & 1 << 16, 0, "masked");
+        assert_ne!(POOL.handler(slot), 0, "its vector still taken");
         *IOAPIC.lock() = None;
     }
 
