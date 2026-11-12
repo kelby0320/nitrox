@@ -38189,3 +38189,20 @@ Part J's fourteenth sub-part, `typed-layers.md` § J.14, built on `pre-phase-7/p
   fails the test; a test spends what the driver hands back. drv-o12 stays open for its char half:
   `CharBackend`'s raw context, which Part J's plan leaves.
 - `unsafe` blocks fall from 541 to 518, and `unsafe fn`s rise from 198 to 199.
+
+## 2026-11-12 — Before Phase 7, J.15: the hub's waits, and the DPC's hand-offs
+
+Part J's fifteenth sub-part, `typed-layers.md` § J.15, built on `pre-phase-7/part-j15-hub-waits`.
+
+- **A wait the hub thread arms and the DPC ends is an `Armed` and a `Completer`**, the xHCI's own:
+  the record holds the `Completer`, which completes the operation by address once and fails a
+  debug build dropped unspent; the `Armed` takes the record back when its wait runs out, or waits
+  out the completion on its way. **One record is armed at a time**, a second refused where it
+  overwrote the first. A departure completes a hub command armed on its device.
+- **What a DPC uses but must not drop is a `Handoff`**: parked, lent in a `Loan` given back, taken
+  by thread context. A park refuses where a hand-back overwrote; a `Loan` dropped panics a debug
+  build and leaks in a release one. The console reads through `input::Reader`, and the drivers
+  register their reclaims with `reap_pending` rather than it naming them. io's `RECLAIM` list
+  stays, unbounded.
+- `unsafe` blocks fall from 518 to 515, and `unsafe impl`s from 57 to 56. **Part J is done once the
+  whole suite has run under Miri and what it reports is triaged.**

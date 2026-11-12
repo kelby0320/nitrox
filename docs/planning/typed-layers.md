@@ -946,6 +946,45 @@ Counts: `unsafe impl`s fall by two more (`io`, `Partition`'s).
 Controls: a second hub command refused; a second `park` refused with the first kept, counted by a
 `Drop`; a dropped `Loan` panics. After J.14. Author.
 
+**Built 2026-11-12** (`1acd2913` the armed waits, `d7e4eefe` the hand-offs).
+- **`Armed` and `Completer`** (`drivers/xhci/armed.rs`): the hub thread arms a record with a
+  `Completer` for a `PendingOperation` it holds, and waits through an `Armed`, which takes the
+  record back when its wait runs out, or waits out the completion already on its way, and does the
+  same dropped unwaited. The DPC completes through the `Completer`, spent once; a debug build
+  panics on one dropped unspent. **Arming refuses while a record is armed**, the controller's one
+  record and a storage device's hub command alike, where a second overwrote the first. `hub::wait`
+  and storage's take-back are one `Armed::wait`, and a departure that finds a hub command armed
+  completes it, where it dropped it. USB storage's `Dev` is `Send` by its fields.
+- **One `Handoff<T, N>`** (`libkern/handoff.rs`): `park`, refusing where `owe` overwrote; a `Loan`
+  the DPC gives back; `take_all`, in thread context. `input::Reader` keeps its read in one, generic
+  over its ring, and **the console moves onto it**, its copy deleted. PS/2's finished lights writes
+  are a `Handoff` of four, where a raw pointer and a `Completing` state kept thread context off
+  them. Each driver registers its reclaim once with `sched::register_reclaim`, which `reap_pending`
+  runs, where it named each. io's `RECLAIM` stays.
+- **For the maintainer's eye: four departures from the plan.**
+  1. **`Armed` and `Completer` are the xHCI's** (`drivers/xhci/armed.rs`), not `sched`'s: no other
+     driver waits this way. The record is a trait, `Record`, the controller's one waiting record and
+     a storage device's hub command its two.
+  2. **A `Loan` dropped in a release build leaks** its value rather than drop it where it was lent;
+     a debug build panics.
+  3. **`Handoff` grew `park_with`**, which makes the value only where a slot is free, so a reader's
+     read is never built to be dropped under its lock; and `lend_all`, for PS/2's four.
+  4. **A failed registration is logged, not fatal**: every read reclaims the one before it as it
+     parks, so only the last delivered read's references would wait.
+
+Counts: `unsafe` blocks fall from 518 to 515 (`drivers`: three by-address completions become one,
+and PS/2's cast pointer goes), and `unsafe impl`s from 57 to 56 (`Dev`'s `Send`; `PoPtr`'s becomes
+`Completer`'s).
+
+**The controls**: seventeen mutations, each failing its test. A second hub command and a second
+controller wait armed; the `Completer`'s drop panic removed; a refused `Completer` dropped; an
+unwaited `Armed` leaving its record; a departure forgetting or dropping a hub command; `take_back`
+taking a read in flight. A park writing over a slot, by `park` and by `park_with`; a dropped
+`Loan` quiet; a reader dropping its loan, or lending to an empty ring; `take_all` emptying what it
+does not own; the reclaims never run; PS/2 dropping a lent lights write, and losing one a full
+table refused. Under Miri, both models, the 172 tests of the xHCI, the input readers, PS/2, the
+console and `Handoff`.
+
 ### What Part J does not do
 
 - **Replace the VMA tree**: kmem-o7's second step is later, a balanced tree the maintainer's

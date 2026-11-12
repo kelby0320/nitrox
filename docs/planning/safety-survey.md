@@ -2197,7 +2197,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   one static `FINISH` DPC and its `on_complete`; the `Irp` loses its inline `dpc`, an ABI-hash
   change. `more_refusals_than_the_dpc_queue_holds_each_complete`.
 
-- [ ] **drv-o6** encapsulate: "a DPC must never drop an `ObjectRef`" (the same-CPU SlabCache
+- [x] **drv-o6** encapsulate: "a DPC must never drop an `ObjectRef`" (the same-CPU SlabCache
   deadlock, decision log 2026-08-06, and the earlier input bug input/mod.rs cites) is held by
   hand-rolled hand-offs: io::block's RECLAIM list, `input::Reader`'s `parked`/`to_drop`/`delivering`,
   console.rs's copy of Reader (`Inner`, `read_now`, `take_ready`, `owe`, `reclaim`, plus its own
@@ -2219,6 +2219,10 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   Closes: an `ObjectRef`'s last drop in DPC or IRQ context, and another CPU dropping what a DPC is
   using — both have bitten this codebase. Depends on: nothing. Lenses: abi, ownership, soundness,
   concurrency, opportunities. Value high, effort medium. **Plan**, in P5.
+  Done in `d7e4eefe`: `libkern::handoff::Handoff<T, N>` with `park`, `park_with`, `lend`, a `Loan`
+  given back, and `take_all`; `input::Reader` over a `Drain` ring, the console on it; PS/2's lights
+  a `Handoff` of four; `sched::register_reclaim`. No `PoLease`: the hub's timed waits are
+  drv-o15's `Armed`.
 
 - [x] **drv-o7** narrow: MMIO accessors are safe functions that dereference whatever base and offset
   they are given. AHCI and xHCI `read32/write32/write64(base: u64, off: u64)`, PCI
@@ -2379,7 +2383,7 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   Done in `123999c8`: the four reads use `MemoryObject::copy_out`; `copy_into_memobj` had gone
   already, the console and the input layer calling `copy_in`.
 
-- [ ] **drv-o15** encapsulate: a PendingOperation is borrowed by raw pointer (`PoPtr`,
+- [x] **drv-o15** encapsulate: a PendingOperation is borrowed by raw pointer (`PoPtr`,
   `Owner::Hub { po }`, `Action::Hub`) while the hub thread's `ObjectRef` pins it, and "take the
   record back on timeout, else wait for the completion already on its way" is hand-written twice;
   registration overwrites an armed record silently (the shape of drv-d3) — 10 sites (record
@@ -2394,6 +2398,9 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   (or `sched`, beside `wait_on`). Closes: completing a PO after its waiter dropped it, and one
   record silently replacing another. Depends on: nothing. Lens: ownership. Value medium, effort
   medium. **Plan**, in P5.
+  Done in `1acd2913`: `drivers/xhci/armed.rs`, `arm` refusing while a record is armed, `Armed::wait`
+  taking back or waiting out, a `Completer` the DPC spends; the controller's record and a storage
+  device's hub command are its two `Record`s, and a departure completes an armed one.
 
 - [x] **drv-o16** encapsulate: three hand-written `Slots` impls over TRB ring memory (xhci/mod.rs
   `DmaSlots`, storage.rs `RawSlots`, hid.rs `RawSlots`) disagree on ordering: `DmaSlots` and
