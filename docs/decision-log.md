@@ -38238,3 +38238,5 @@ Part J's fifteenth sub-part, `typed-layers.md` § J.15, built on `pre-phase-7/pa
   cache's fault path moved to files with room first (`64b4b96f`, `2de23ac8`); the path is `293f330a`.
 - **Miri runs at Part E's end**, the whole suite once after E.11, as after J.15, and no sub-part runs
   it before (the maintainer's call, 2026-11-13).
+- After review (`51a704fe`): a page no user may reach is never faulted in, and a copy's page the kernel
+  has no memory to back reads as a bad address, said in the spec and deferred (`copy-fault-oom`).

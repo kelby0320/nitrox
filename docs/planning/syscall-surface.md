@@ -440,6 +440,20 @@ inside a page, or a window a page past the object, let through; and the copy ass
 reads four arguments: a resident file page not copied, a file's window not its pages from the
 offset, and the page above the lower of two mappings taken.
 
+**After review** (`51a704fe`):
+- **The specs say what a copy's fault now does**: `user-memory-access.md`'s contract, its error
+  variant and its Lookup, `syscall-abi.md`'s `FaultFromUser`, and `rsproto-file-ops.md`'s fill,
+  which waits for a client's touch and not for a syscall's copy.
+- **A page no user may reach is never faulted in**: a kernel copy, unlike the CPU, checks no page's
+  user bit, and no such mapping exists in the user half today.
+- **Each copy primitive's lock assertion, and the gap below the mapping above, is pinned by a test**;
+  libos's model refuses a length past every address rather than overflow.
+- **A copy's page the kernel has no memory to back still reads as a bad address**, now said in the
+  spec, and deferred as `copy-fault-oom`: nothing can force that allocation to fail in a test.
+- Declined: a test of the fault handler's retry after a mapping moved, as no host test reaches the
+  handler and a boot cannot hold a fill open while it remaps; `map_file_page`'s side is pinned.
+- `memory_map`'s spec says a file's last page maps whole, as it did before.
+
 ### E.7 A resolve carries its operation, and a flush answers through a PO
 
 **The shape**: `sys_ns_lookup(ns, path, len, rights, op)`, where `op`, in a fifth register, is a
