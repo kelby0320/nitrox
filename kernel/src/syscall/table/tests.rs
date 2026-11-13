@@ -1,3 +1,4 @@
+use super::memory::{full_mem_rights, map_mem_map_err, round_up_page};
 use super::*;
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
