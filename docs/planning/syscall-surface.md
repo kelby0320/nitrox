@@ -1,7 +1,7 @@
 # The syscall surface, consolidated
 
 **Status: planned 2026-10-08, for between Phase 6 and Phase 7 (the maintainer's call); detailed
-2026-11-02.** The review below found the drift and the shape a consolidation could take; [*Part E
+2026-11-02; E.1 to E.5 built by 2026-11-05, and E.6 2026-11-13.** The review below found the drift and the shape a consolidation could take; [*Part E
 in detail*](#part-e-in-detail) is the plan, and where they differ it wins.
 
 ## Why
@@ -405,6 +405,54 @@ Three bash findings and the gap, which are one path and Phase 7's first:
   survey's two anonymous mappings, adjacent today.
 
 Author; `/pr-review`; a boot-probe test of each.
+
+**Built 2026-11-13** (`64b4b96f` and `2de23ac8` move the memory syscalls, and the page cache's fault
+path, to files with room; `293f330a` the path).
+- **`sys_memory_map(obj, hint, size, rights, offset)`**: a window of a file or a memory object from a
+  page of it, held inside the object. libos's `map_range` maps one; every raw caller passes 0.
+- **kmem-29**: `map_object` and `map_file` take a `Placement`, a named range or one "anywhere", and
+  find it under the hold that inserts it, so two threads mapping at once never meet.
+- **th-d9's kernel half**: an "anywhere" mapping keeps a page unmapped below itself and below the
+  mapping above it, so a thread's stack that overruns faults. `thread-stack-guard` is resolved.
+- **kmem-15**: a file backing names its first page, and `map_file_page` installs a filled page only
+  where the mapping still puts it; otherwise nothing is installed and the access retries.
+- **kmem-28**: a kernel copy's not-present fault is served in `pf_dispatch`, ahead of the recovery
+  table, where nothing has to wait: an anonymous page is zeroed, a file's resident page mapped. A
+  file's page not resident fails the copy at once, `copy-from-unread-file`. **No copy runs with a
+  lock held**: `lockrank` asserts it at every copy, in debug kernels and host tests, and none of
+  the 18 gates or the host suite holds one.
+- **For the maintainer's eye: four departures from the plan.**
+  1. **The offset maps a memory object too**, not a file alone: one call over both kinds, as the
+     surface prefers.
+  2. **The kept page is below the mapping above, too**: a page below each new mapping alone lets a
+     later one, placed in a hole, sit against the bottom of the mapping above it.
+  3. **kmem-15 has no boot-probe test**: a boot cannot hold a fill open while it remaps. Its control
+     is the host test of the bash's steps.
+  4. **"Checked first, by `lockrank`" is an assertion at every copy**, which found no copy under a
+     lock.
+
+**The controls**: the bash's probes fail at `main`, kmem-29's two searches returning one range,
+kmem-15's remap installing page 2 where page 1 belongs, and th-d9's two maps adjacent. Nine
+mutations each fail their test: the search and insert split across two holds, 2 ms apart; no gap,
+or a gap below alone; the index unchecked; an object's or a file's first page ignored; an offset
+inside a page, or a window a page past the object, let through; and the copy assertion removed.
+**The three boot-probe tests fail on the old kernel** with this userspace, which it accepts, as it
+reads four arguments: a resident file page not copied, a file's window not its pages from the
+offset, and the page above the lower of two mappings taken.
+
+**After review** (`51a704fe`):
+- **The specs say what a copy's fault now does**: `user-memory-access.md`'s contract, its error
+  variant and its Lookup, `syscall-abi.md`'s `FaultFromUser`, and `rsproto-file-ops.md`'s fill,
+  which waits for a client's touch and not for a syscall's copy.
+- **A page no user may reach is never faulted in**: a kernel copy, unlike the CPU, checks no page's
+  user bit, and no such mapping exists in the user half today.
+- **Each copy primitive's lock assertion, and the gap below the mapping above, is pinned by a test**;
+  libos's model refuses a length past every address rather than overflow.
+- **A copy's page the kernel has no memory to back still reads as a bad address**, now said in the
+  spec, and deferred as `copy-fault-oom`: nothing can force that allocation to fail in a test.
+- Declined: a test of the fault handler's retry after a mapping moved, as no host test reaches the
+  handler and a boot cannot hold a fill open while it remaps; `map_file_page`'s side is pinned.
+- `memory_map`'s spec says a file's last page maps whole, as it did before.
 
 ### E.7 A resolve carries its operation, and a flush answers through a PO
 

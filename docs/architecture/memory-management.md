@@ -91,11 +91,13 @@ the same physical memory — the property that makes it shareable. See
 slab-backed `KVec<Frame>`; refcount 1) → `handle table install(pid,
 ObjectRef::new(obj), full_rights)` → return the handle to userspace.
 
-**Trace — `sys_memory_map(h, 0, size, rights)`:** resolve the caller's
+**Trace — `sys_memory_map(h, 0, size, rights, offset)`:** resolve the caller's
 `AddressSpace` (`sched::current_process`) → handle-table `lookup` (checks owner
 + that the handle carries the requested `MAP_*` rights; pins the object) →
-`find_free_range` picks a virtual range → `AddressSpace::map_object` installs a
-PTE per page pointing at `obj.frames()[i]` and records a VMA backed by
+`AddressSpace::map_object` places the range under the same hold as its insert —
+the lowest free one in the "anywhere" window with a page left unmapped below it
+and below the next mapping above — then installs a PTE per page pointing at
+`obj.frames()[first + i]`, `first` the offset's page, and records a VMA backed by
 `Backing::Object`, holding a `Ref<MemoryObject>` → `flush_tlb_all` (the AS is active) → return the base address.
 A subsequent user dereference is pure MMU: the process PML4 walk hits the
 installed PTE, no kernel involvement.
@@ -396,9 +398,12 @@ ELF loader's, is filled eagerly, so its rollback frees without one.
   page allocates + zeroes one frame, installs the leaf PTE, and flushes the
   stale not-present TLB entry (the faulting AS is live in the MMU). The ELF
   loader reserves user stacks lazily; PT_LOAD segments stay eager because the
-  loader copies file bytes into their frames. `Backing::File` is the
-  page-cache backing: `fault_in` only signals it, and the fault path pages
-  the file in outside the AS lock (`file_backing`, `map_file_page`).
+  loader copies file bytes into their frames. `Backing::File { file, first }`
+  is the page-cache backing, from the file's page `first`: `fault_in` only
+  signals it, and the fault path pages the file in outside the AS lock
+  (`file_backing`, `map_file_page`). `map_file_page` installs the page only if
+  the mapping still puts it there, as an unmap and a map may have moved it
+  during the fill; otherwise the access retries against what is there now.
 - **Frame ownership depends on the backing kind.**
   `UserTables::unmap` returns the `PhysAddr` it cleared;
   `unmap_covering` and `Drop` branch on `Vma.backing`: for
@@ -575,7 +580,9 @@ there — silently, which is what makes a stack overrun expensive to
 diagnose rather than merely a crash. Two things enforce it: `MMAP_MAX`
 stops the `hint == 0` search below the gap, and `sys_memory_map`
 refuses a **hinted** range that intersects it (`MMAP_MAX` bounds only
-the search). 256 pages rather than one because Linux's guard was a
+the search). Every other stack, a thread's that libos maps, is guarded
+by the page an "anywhere" mapping leaves unmapped below itself and below
+the mapping above it. 256 pages rather than one because Linux's guard was a
 single page until Stack Clash (CVE-2017-1000364) showed a large frame
 can step over one.
 
@@ -663,7 +670,9 @@ management story.
   consults the table on every fault: on a match whose address is a
   user one (`CR2` below `USER_VIRT_END`; a fault on the kernel side
   is a kernel bug) it patches the saved
-  RIP to the recovery PC and `iretq`s. The recovery code closes the
+  RIP to the recovery PC and `iretq`s — unless the page is not present
+  and can be served with nothing to wait for (an anonymous page zeroed, a
+  file's resident page mapped), when the copy resumes. The recovery code closes the
   SMAP window and signals failure to the Rust wrapper. On a table
   miss the handler branches on the fault: a **not-present ring-3**
   fault is offered to `AddressSpace::fault_in` for demand paging

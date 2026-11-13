@@ -12,7 +12,7 @@ The kernel must never:
 - fetch instructions from a user page,
 - silently accept a faulting access as kernel state.
 
-Every read from or write to user memory goes through this subsystem. Faults during a copy turn into [`UserAccessError::Fault`]; faults outside a copy halt the kernel.
+Every read from or write to user memory goes through this subsystem. A fault during a copy on a page not yet faulted in is served where nothing has to wait, and the copy resumes; any other fault during a copy turns into [`UserAccessError::Fault`]. Faults outside a copy halt the kernel.
 
 ## The opaque pointer types
 
@@ -51,7 +51,7 @@ Every primitive runs three steps in order:
 
 1. **Validate the access.** The user pointer was already checked against `USER_VIRT_END` at construction; the primitive additionally checks that `addr + len` stays inside the user half and that the length arithmetic does not overflow. Failures: `BadAddress`.
 2. **Open the user-access window, perform the copy, close the window.** The window is bracketed by the platform's "permit kernel access to user pages" instruction pair (`stac` / `clac` on x86_64 with SMAP; `msr PAN, 0` / `msr PAN, 1` on aarch64 with PAN). The copy itself uses the platform's bulk-byte or load/store primitive (`rep movsb` for single-T and slice copies; a `lodsb`/`stosb` loop for the cstr variant on x86_64).
-3. **Convert any `#PF` inside the window into `Err(UserAccessError::Fault)`** via the exception table.
+3. **Serve a not-present `#PF` inside the window where nothing has to wait, and convert any other into `Err(UserAccessError::Fault)`**, via the exception table (§ Lookup).
 
 The boundary between steps is enforced by inline assembly. The window-opening / -closing instructions and the `.user_access_table` section emission live nowhere outside the arch's user-access module (`kernel/src/arch/<arch>/user_access.rs`).
 
@@ -61,7 +61,7 @@ The boundary between steps is enforced by inline assembly. The window-opening / 
 pub enum UserAccessError {
     BadAddress,    // addr or addr+len outside [0, USER_VIRT_END), or arithmetic overflow
     Misaligned,    // addr not aligned for T
-    Fault,         // #PF during the copy — user page unmapped, protected, etc.
+    Fault,         // #PF the copy could not serve — no mapping, a protection, a file page not resident, no memory
     NoTerminator,  // copy_cstr_from_user filled dst without finding a NUL
 }
 ```
@@ -112,7 +112,12 @@ The `<fault_pc>` is a local numeric label inside the same `asm!` block, sitting 
 
 ### Lookup
 
-The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. On a match whose faulting address (`CR2`) is below `USER_VIRT_END`, the handler writes `entry.recovery_pc` into `frame.rip` and returns. The naked stub then `iretq`s to the recovery PC. Otherwise the handler falls through to `dump_and_halt`: a `#PF` outside a registered window, or one on the copy's kernel-side pointer, is a kernel bug, not a recoverable condition.
+The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. A match whose faulting address (`CR2`) is below `USER_VIRT_END` ends one of two ways:
+
+- **Served, and the copy resumes**: a not-present page the handler can back with nothing to wait for. An anonymous page is zeroed, and a file's page the page cache holds is mapped; the handler returns to the faulting instruction.
+- **Recovered**: any other fault on the user side, which is no mapping, a protection the access breaks, a file's page not resident, or no memory to back the page. The handler writes `entry.recovery_pc` into `frame.rip` and returns, and the naked stub `iretq`s to the recovery PC.
+
+No match, or a fault on the copy's kernel-side pointer, falls through to `dump_and_halt`: a kernel bug, not a recoverable condition. **No copy runs with a lock held**, as serving its fault takes the address space's lock and may allocate: `lockrank` asserts it at each in a debug build.
 
 The lookup is linear over the table. The table holds one entry per raw copy routine (two today, `copy_bytes_raw` and `copy_cstr_raw`), easily fits in a single cacheline, and runs only on the rare faulting path. A sorted table + binary search would be theoretical work; revisit if Phase 2 ever pushes the entry count past a few dozen.
 
@@ -170,6 +175,6 @@ The public surface (`UserPtr<T>`, `UserMutPtr<T>`, the seven copy primitives, `U
 
 ## Out of scope
 
-- **Page-fault demand allocation.** A `#PF` on a legitimate user mapping today still terminates the kernel (no scheduler, no active address space). When the scheduler arrives, `pf_dispatch` will grow a VMA-lookup branch between exception-table lookup and `dump_and_halt`. Tracked in the slice-1 decision log entry.
+- **A copy waiting for a file's page.** A copy from a page the cache does not hold fails `Fault` rather than stop on a device inside a syscall (`deferred-decisions.md`, `copy-from-unread-file`).
 - **Atomic copies.** Compound primitives (e.g. "copy this struct atomically") are layered on top by syscall handlers; the primitives in this document are the byte-level foundation.
 - **Cross-thread aliasing.** `UserPtr<T>` carries `PhantomData<*const T>`, so it is neither `Send` nor `Sync` by auto-trait inference. Callers that need to pass user pointers across threads must opt in explicitly with a justification.

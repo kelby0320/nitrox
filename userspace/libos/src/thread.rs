@@ -11,13 +11,11 @@ use libkern::KError;
 /// Where a thread begins: `rdi`, `rsi` and `rdx` are `0`, and `rcx`, the fourth, its `arg0`.
 pub type Entry = extern "C" fn(u64, u64, u64, u64) -> !;
 
-/// A thread's stack: a mapping of its own, which nothing below it guards, as yet.
+/// A thread's stack: a mapping of its own, above a page the kernel leaves unmapped.
 pub struct Stack(Mapping<MapReadWrite>);
 
 impl Stack {
     /// `bytes` of stack, rounded up to a page.
-    // TODO(thread-stack-guard): a hint-less map places a mapping flush against the one below, so an
-    // overrun lands in it rather than faulting.
     pub fn new(bytes: usize) -> Result<Stack> {
         let len = bytes.checked_next_multiple_of(4096).ok_or(Error::from(KError::TooLarge))?;
         Ok(Stack(Handle::<Memory, MapReadWrite>::create(len)?.map(len)?))

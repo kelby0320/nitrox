@@ -38,6 +38,24 @@ pub const USER_STACK_GUARD_BOTTOM: u64 = USER_STACK_BOTTOM - USER_STACK_GUARD_SI
 /// could sit in the gap and restore the silent stack overrun the gap removes.
 const MMAP_MAX: u64 = USER_STACK_GUARD_BOTTOM;
 
+/// **The page an "anywhere" mapping keeps unmapped below itself and the mapping above**: a stack's.
+const MMAP_GAP: u64 = PAGE_SIZE as u64;
+
+/// **Where a mapping goes**, placed under the hold that inserts it, so two at once never meet.
+#[derive(Copy, Clone, Debug)]
+pub enum Placement {
+    /// Exactly this range.
+    At(VAddrRange),
+    /// This many bytes, page-aligned, anywhere in the window, [`MMAP_GAP`] free on either side.
+    Anywhere(u64),
+}
+
+impl From<VAddrRange> for Placement {
+    fn from(range: VAddrRange) -> Placement {
+        Placement::At(range)
+    }
+}
+
 /// Why [`AddressSpace::map_vma`] could not install a mapping; the caller's [`KBox<Vma>`] comes
 /// back alongside.
 #[derive(Debug, PartialEq, Eq)]
@@ -50,6 +68,19 @@ pub enum MapError {
     Overlap,
     /// Frame allocation failed; frames installed before the failure are rolled back first.
     OutOfMemory,
+    /// No range of the size asked for is free in the "anywhere" window.
+    NoRoom,
+}
+
+/// What [`AddressSpace::map_file_page`] did with a filled page.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FilePage {
+    /// The page is mapped: installed here, or by a racing fault.
+    Mapped,
+    /// **The mapping there no longer puts that page there**: nothing installed; the access retries.
+    Changed,
+    /// A page-table allocation failed.
+    NoMemory,
 }
 
 /// Outcome of [`AddressSpace::fault_in`]. Only [`Mapped`](FaultIn::Mapped) lets the instruction
@@ -143,14 +174,8 @@ impl AddressSpace {
     /// frees the frames it mapped with no shootdown.
     pub fn map_vma(&mut self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
         let range = boxed.range;
-
-        // Both endpoints must be canonical; test `end - 1` since the end is exclusive.
-        let last_byte = VirtAddr::new(range.end().as_u64() - 1);
-        if !range.start().is_canonical() || !last_byte.is_canonical() {
-            return Err((boxed, MapError::NotCanonical));
-        }
-        if range.end().as_u64() > USER_MAP_END {
-            return Err((boxed, MapError::NotUserHalf));
+        if let Err(e) = user_placement(Placement::At(range)) {
+            return Err((boxed, e));
         }
 
         let mut guard = self.inner.lock();
@@ -206,13 +231,8 @@ impl AddressSpace {
     pub fn map_vma_lazy(&self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
         debug_assert!(matches!(boxed.backing, Backing::Anonymous), "map_vma_lazy is for anonymous mappings only");
         let range = boxed.range;
-
-        let last_byte = VirtAddr::new(range.end().as_u64() - 1);
-        if !range.start().is_canonical() || !last_byte.is_canonical() {
-            return Err((boxed, MapError::NotCanonical));
-        }
-        if range.end().as_u64() > USER_MAP_END {
-            return Err((boxed, MapError::NotUserHalf));
+        if let Err(e) = user_placement(Placement::At(range)) {
+            return Err((boxed, e));
         }
 
         let mut guard = self.inner.lock();
@@ -228,7 +248,8 @@ impl AddressSpace {
     }
 
     /// Resolve a page fault at `addr` for `access` against this (currently loaded) address space.
-    /// Called from the arch `#PF` handler for a **not-present** ring-3 fault.
+    /// Called from the arch `#PF` handler for a **not-present** fault from ring 3, or from a kernel
+    /// copy of user memory, mid-syscall, which holds no lock.
     ///
     /// For an [`Anonymous`](Backing::Anonymous) VMA permitting the access, allocates and zeroes
     /// a frame, installs the leaf PTE and flushes that page's stale not-present TLB entry. The
@@ -241,6 +262,10 @@ impl AddressSpace {
         let Some(vma) = inner.vma_tree.find_covering(addr) else {
             return FaultIn::NoVma;
         };
+        // A kernel copy, unlike the CPU, checks no page's user bit.
+        if !vma.prot.contains(Protection::USER) {
+            return FaultIn::Protection;
+        }
 
         match access {
             FaultAccess::Write if !vma.prot.contains(Protection::WRITE) => {
@@ -279,53 +304,52 @@ impl AddressSpace {
             Backing::Object(_) => FaultIn::NoVma,
             // Signal only: the file cache's lock is rank 4 like this one and they never nest
             // (see `FaultIn::FileBacked`).
-            Backing::File(_) => FaultIn::FileBacked,
+            Backing::File { .. } => FaultIn::FileBacked,
         }
     }
 
-    /// Map a [`MemoryObject`]'s **own** frames over `range`, holding `object` alive. Allocates and
+    /// Map a [`MemoryObject`]'s **own** frames from its page `first` where `at` places them, the
+    /// range they map, holding `object` alive. Allocates and
     /// zeroes **nothing**: mapping the object twice aliases the same memory. The object frees the
     /// frames on its last-ref drop, not unmap.
     ///
-    /// `object` needs at least `range.pages()` frames (the syscall layer checks). On failure it
+    /// `object` needs `first` and the range's pages (the syscall layer checks). On failure it
     /// is handed back in the error tuple.
     pub fn map_object(
         &self,
-        range: VAddrRange,
+        at: impl Into<Placement>,
         prot: Protection,
         object: Ref<MemoryObject>,
-    ) -> Result<(), (Ref<MemoryObject>, MapError)> {
-        let last_byte = VirtAddr::new(range.end().as_u64() - 1);
-        if !range.start().is_canonical() || !last_byte.is_canonical() {
-            return Err((object, MapError::NotCanonical));
+        first: usize,
+    ) -> Result<VAddrRange, (Ref<MemoryObject>, MapError)> {
+        let at = at.into();
+        if let Err(e) = user_placement(at) {
+            return Err((object, e));
         }
-        if range.end().as_u64() > USER_MAP_END {
-            return Err((object, MapError::NotUserHalf));
-        }
-
         let caching = object.caching();
-        let npages = range.pages();
-        debug_assert!(object.npages() as u64 >= npages, "object too small for range");
 
         // Build the VMA box before the lock (no allocation under a spinlock); the only fallible
         // step before `object` is consumed, so failure can return it.
-        let mut boxed = match KBox::try_new(Vma::new(range, prot)) {
+        let mut boxed = match KBox::try_new(Vma::new(placeholder(at), prot)) {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
 
         let mut guard = self.inner.lock();
-
-        if guard.vma_tree.find_first_overlapping(range).is_some() {
-            return Err((object, MapError::Overlap));
-        }
+        let range = match place(&guard.vma_tree, at) {
+            Ok(range) => range,
+            Err(e) => return Err((object, e)),
+        };
+        boxed.range = range;
+        let npages = range.pages();
+        debug_assert!(object.npages() as u64 >= first as u64 + npages, "object too small for range");
 
         let flags = page_flags_for(prot, caching);
         let mut installed: u64 = 0;
 
         for i in 0..npages {
             let virt = VirtAddr::new(range.start().as_u64() + i * (PAGE_SIZE as u64));
-            let frame = object.frame_to_map(i as usize).expect("an object as large as the range");
+            let frame = object.frame_to_map(first + i as usize).expect("an object as large as the range");
             // SAFETY: `frame` is owned by the `MemoryObject` the VMA will keep alive until an
             // unmap's shootdown (`Unmapped`), or a rollback's; aliasing a frame already
             // mapped elsewhere is intended (shared memory). No frame is
@@ -349,7 +373,7 @@ impl AddressSpace {
 
         boxed.backing = Backing::Object(object);
         match guard.vma_tree.insert(boxed) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(range),
             Err(mut b) => {
                 rollback_object_map(guard, range.start(), installed);
                 let Backing::Object(object) = b.take_backing() else { unreachable!("an object-backed VMA") };
@@ -358,7 +382,7 @@ impl AddressSpace {
         }
     }
 
-    /// Reserve `range` as a **lazy file-backed** mapping of `object` (a
+    /// Reserve where `at` places it a **lazy file-backed** mapping of `object` from page `first` (a
     /// [`FileObject`](crate::object::FileObject)) with **no PTEs**; pages come in through
     /// `fault_in`, [`FaultIn::FileBacked`], fill, [`map_file_page`]. The VMA keeps `object` alive
     /// so its cache frames outlive the mapping; `unmap` removes the PTEs but never frees the
@@ -367,18 +391,16 @@ impl AddressSpace {
     /// [`map_file_page`]: AddressSpace::map_file_page
     pub fn map_file(
         &self,
-        range: VAddrRange,
+        at: impl Into<Placement>,
         prot: Protection,
         object: Ref<FileObject>,
-    ) -> Result<(), (Ref<FileObject>, MapError)> {
-        let last_byte = VirtAddr::new(range.end().as_u64() - 1);
-        if !range.start().is_canonical() || !last_byte.is_canonical() {
-            return Err((object, MapError::NotCanonical));
+        first: usize,
+    ) -> Result<VAddrRange, (Ref<FileObject>, MapError)> {
+        let at = at.into();
+        if let Err(e) = user_placement(at) {
+            return Err((object, e));
         }
-        if range.end().as_u64() > USER_MAP_END {
-            return Err((object, MapError::NotUserHalf));
-        }
-        let mut boxed = match KBox::try_new(Vma::new(range, prot)) {
+        let mut boxed = match KBox::try_new(Vma::new(placeholder(at), prot)) {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
@@ -396,15 +418,19 @@ impl AddressSpace {
             Err((object, e))
         };
         let mut guard = self.inner.lock();
-        if guard.vma_tree.find_first_overlapping(range).is_some() {
-            drop(guard);
-            return refused(object, MapError::Overlap);
-        }
-        boxed.backing = Backing::File(object);
+        let range = match place(&guard.vma_tree, at) {
+            Ok(range) => range,
+            Err(e) => {
+                drop(guard);
+                return refused(object, e);
+            }
+        };
+        boxed.range = range;
+        boxed.backing = Backing::File { file: object, first };
         match guard.vma_tree.insert(boxed) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(range),
             Err(mut b) => {
-                let Backing::File(object) = b.take_backing() else { unreachable!("a file-backed VMA") };
+                let Backing::File { file: object, .. } = b.take_backing() else { unreachable!("a file-backed VMA") };
                 drop(guard);
                 refused(object, MapError::Overlap)
             }
@@ -418,28 +444,21 @@ impl AddressSpace {
     pub fn file_backing(&self, addr: VirtAddr) -> Option<(Ref<FileObject>, usize)> {
         let guard = self.inner.lock();
         let vma = guard.vma_tree.find_covering(addr)?;
-        let Backing::File(file) = &vma.backing else {
-            return None;
-        };
-        let object = file.clone();
-        let page_base = addr.as_u64() & !(PAGE_SIZE as u64 - 1);
-        let index = ((page_base - vma.range.start().as_u64()) / PAGE_SIZE as u64) as usize;
-        Some((object, index))
+        let (file, index) = file_page(vma, addr)?;
+        Some((file.clone(), index))
     }
 
-    /// Install the leaf PTE for the file-backed page at `addr` pointing at `frame`. Re-validates
-    /// under the AS lock that a `FileBacked` VMA for the **same** `object` still covers `addr`
-    /// (the fault may have raced an unmap or exit). `true` if the page is now present (installed
-    /// here or by a racing fault); `false` if the VMA is gone or changed, or a page-table
-    /// allocation failed. The object owns the frame, so `unmap` removes the PTE without freeing it.
-    pub fn map_file_page(&self, addr: VirtAddr, object: &Ref<FileObject>, frame: PhysAddr) -> bool {
+    /// **Install the leaf PTE for page `index` of `object` at `addr`**, pointing at `frame`, if the
+    /// mapping there still puts that page there, as an unmap and a map may have moved it since the
+    /// fault read it. The object owns the frame, so `unmap` removes the PTE without freeing it.
+    pub fn map_file_page(&self, addr: VirtAddr, object: &Ref<FileObject>, index: usize, frame: PhysAddr) -> FilePage {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
         let Some(vma) = inner.vma_tree.find_covering(addr) else {
-            return false;
+            return FilePage::Changed;
         };
-        if !matches!(&vma.backing, Backing::File(file) if file.as_ptr() == object.as_ptr()) {
-            return false;
+        if file_page(vma, addr).is_none_or(|(file, at)| file.as_ptr() != object.as_ptr() || at != index) {
+            return FilePage::Changed;
         }
         let flags = page_flags_for(vma.prot, Caching::Normal);
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
@@ -449,9 +468,9 @@ impl AddressSpace {
         match unsafe { inner.tables.map(page_base, frame, flags) } {
             Ok(()) | Err(ArchMapError::AlreadyMapped) => {
                 Paging::flush_tlb_page(page_base);
-                true
+                FilePage::Mapped
             }
-            Err(ArchMapError::OutOfMemory) => false,
+            Err(ArchMapError::OutOfMemory) => FilePage::NoMemory,
             Err(e @ (ArchMapError::Misaligned | ArchMapError::NotUser | ArchMapError::Unshared)) => {
                 unreachable!("map_file_page: {e:?} for a page-aligned user-half address")
             }
@@ -463,12 +482,6 @@ impl AddressSpace {
     /// user-half bound, so without this check a stack overrun could land in mapped memory.
     pub fn in_stack_guard(start: u64, end: u64) -> bool {
         start < USER_STACK_BOTTOM && end > USER_STACK_GUARD_BOTTOM
-    }
-
-    /// Lowest free range of `size` bytes in the "anywhere" window, for `sys_memory_map(hint=0)`.
-    pub fn find_free_range(&self, size: u64) -> Option<VAddrRange> {
-        let guard = self.inner.lock();
-        guard.vma_tree.find_free_range(VirtAddr::new(MMAP_BASE), VirtAddr::new(MMAP_MAX), size)
     }
 
     /// [`unmap_covering`](Self::unmap_covering), reserving as it asks. **Host tests only.**
@@ -584,10 +597,53 @@ fn free_vma_pages(tables: &mut UserTables, vma: &Vma) {
                 // The `MemoryObject` owns the frames and frees them on its last-ref drop.
                 Backing::Object(_) => {}
                 // The file's page cache owns the frames, as an object owns its own.
-                Backing::File(_) => {}
+                Backing::File { .. } => {}
             }
         }
     }
+}
+
+/// The range a VMA is boxed with before the lock; an "anywhere" one's is overwritten under it.
+fn placeholder(at: Placement) -> VAddrRange {
+    match at {
+        Placement::At(range) => range,
+        Placement::Anywhere(_) => {
+            VAddrRange::new(VirtAddr::new(MMAP_BASE), VirtAddr::new(MMAP_BASE + PAGE_SIZE as u64))
+                .expect("a page at the window's base")
+        }
+    }
+}
+
+/// A range named by its caller must be canonical and in the user half; the window's always are.
+fn user_placement(at: Placement) -> Result<(), MapError> {
+    let Placement::At(range) = at else { return Ok(()) };
+    // Both endpoints must be canonical; test `end - 1` since the end is exclusive.
+    let last_byte = VirtAddr::new(range.end().as_u64() - 1);
+    if !range.start().is_canonical() || !last_byte.is_canonical() {
+        return Err(MapError::NotCanonical);
+    }
+    if range.end().as_u64() > USER_MAP_END {
+        return Err(MapError::NotUserHalf);
+    }
+    Ok(())
+}
+
+/// **The range `at` comes to in `tree`**, under the hold that will insert it.
+fn place(tree: &VmaTree, at: Placement) -> Result<VAddrRange, MapError> {
+    match at {
+        Placement::At(range) if tree.find_first_overlapping(range).is_some() => Err(MapError::Overlap),
+        Placement::At(range) => Ok(range),
+        Placement::Anywhere(size) => tree
+            .find_free_range(VirtAddr::new(MMAP_BASE), VirtAddr::new(MMAP_MAX), size, MMAP_GAP)
+            .ok_or(MapError::NoRoom),
+    }
+}
+
+/// The file `vma` maps and the page of it at `addr`, which `vma` covers; `None` for another backing.
+fn file_page(vma: &Vma, addr: VirtAddr) -> Option<(&Ref<FileObject>, usize)> {
+    let Backing::File { file, first } = &vma.backing else { return None };
+    let page_base = addr.as_u64() & !(PAGE_SIZE as u64 - 1);
+    Some((file, first + ((page_base - vma.range.start().as_u64()) / PAGE_SIZE as u64) as usize))
 }
 
 /// Roll back a partial `map_vma`: uninstall `installed` PTEs from `start`, freeing each frame, with

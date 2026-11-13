@@ -1425,7 +1425,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `9b98803f`, as kmem-o2: the frees are `unsafe` and `mm`'s, and every owner's frames
   a `Frame` or `FrameBlock`, freed as it drops. The probe needs an `unsafe` `Frame::from_pte`, and
   Miri reports it.
-- [ ] **kmem-d12** `kernel/src/mm/addr_space.rs:458` — `map_file_page` re-checks only that some
+- [x] **kmem-d12** `kernel/src/mm/addr_space.rs:458` — `map_file_page` re-checks only that some
   FileBacked VMA of the same object covers `addr`, not that `addr` still maps to the page index
   `file_backing` computed in an earlier hold of the AS lock. Thread A faults at 6P in F mapped at
   [4P,8P) (page 2) and parks on the fill. B unmaps and maps F at [5P,9P), where 6P is page 1. A's
@@ -1435,6 +1435,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Demonstrated: a host test in addr_space/tests.rs ran those steps. `map_file_page` returned
   true and `translate(6P) == frame2` (a second probe asserts the equivalent with frame 1 at 5P).
   Lenses: abi, ownership, concurrency. Low. **Plan**, as the bash's kmem-15, in Part E.
+  Done in `293f330a`, as kmem-15.
 - [x] **kmem-d13** `kernel/src/object/file_object.rs:598` — write-back takes a page's device
   position from its first block and writes `pages * PAGE_SIZE` contiguously from there, and
   `block_map` (table.rs:2622) accepts block sizes under a page without refusing a run boundary
@@ -1449,7 +1450,7 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   Fixed in `adb5f75d`: `block_map` refuses a run that does not begin and end on a page boundary;
   fails without it, or with only the start checked:
   `a_block_map_the_page_cache_cannot_use_is_refused`.
-- [ ] **kmem-d14** `kernel/src/arch/x86_64/idt.rs:258` — copy-primitive recovery runs before any
+- [x] **kmem-d14** `kernel/src/arch/x86_64/idt.rs:258` — copy-primitive recovery runs before any
   demand fault-in, so the kernel never populates a valid but lazily backed user page (an untouched
   stack page or an untouched FileBacked page). The copy fails with `Fault`, and `sys_channel_recv`
   has already popped the message, so the message is destroyed and its transferred handles are
@@ -1459,6 +1460,8 @@ The inventory, `cargo xtask unsafe-inventory` over its paths:
   `lookup_recovery(f.rip)` before `try_fault_in`, and there is no prefault step. A boot test
   receiving into an untouched page of a fresh file mapping would show it. Lens: abi. Low.
   **Plan**, as the bash's kmem-28, in Part E.
+  Done in `293f330a`, as kmem-28: a received message's page not yet faulted in is served, and one in a
+  file's page not resident still fails.
 - [x] **kmem-d15** `kernel/src/arch/x86_64/idt.rs:258` — recovery matches the faulting RIP alone,
   and `copy_bytes_raw` registers `rep movsb` for both directions, so a fault on the kernel-side
   pointer is also turned into `UserAccessError::Fault` instead of `dump_and_halt`. A dangling
@@ -6361,7 +6364,7 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   opportunities. Low. **Fix.**
   Fixed in `009c098c`: `rename_wait` goes through `po_wait`, which checks the wait. A probe failing
   the wait read status 0 before, -1 after.
-- [ ] **th-d9** `userspace/test-harness/src/stage.rs:621` — The crate's user threads run on stacks
+- [x] **th-d9** `userspace/test-harness/src/stage.rs:621` — The crate's user threads run on stacks
   with no guard gap. Each stack is mapped at exactly its size with hint 0, so first-fit places it
   directly against the previous mapping, and `EXIT_SPAWNING` carves 48 stacks from one mapping.
   Other sites: stage.rs:487-507 (4 pages), harness.rs:132-160 (8 pages), harness.rs:337-363 (1
@@ -6373,6 +6376,8 @@ The inventory, `cargo xtask unsafe-inventory userspace/test-harness`:
   its stack would show. soundness. Low. **Plan**, in P7.
   Userspace half done in `e02204d2` and `321a1b83`: every thread runs on a libos `Stack` of its own,
   `EXIT_SPAWNING`'s 48 among them; the guard below each waits on the kernel half (E.6).
+  Kernel half done in `293f330a`: an "anywhere" mapping keeps a page unmapped below itself and the
+  mapping above; fails without it: `an_anywhere_mapping_keeps_a_page_free_on_either_side`.
 - [x] **th-d10** `userspace/test-harness/src/inputclient.rs:104` — `lookup` never closes the
   PendingOperation that `sys_ns_lookup` returned, because this copy of `po_wait` (:72-96), unlike
   the other 11 hand-rolled copies, does not close the PO. One PO handle leaks per

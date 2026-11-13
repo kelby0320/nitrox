@@ -518,7 +518,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   (tests `object::memory_object`), removing the partial-failure `buddy_free(done, 0)` rollback,
   removing `write_bytes` in `DmaBuffer::alloc` (tests `mm::dma`), and `DmaBuffer::drop` freeing at
   order 0 instead of `self.order`, which leaks higher-order buffers. Lens: tests. Medium. **Later.**
-- [ ] **kmem-15** `kernel/src/mm/addr_space.rs:453` — `map_file_page` re-validates that a
+- [x] **kmem-15** `kernel/src/mm/addr_space.rs:453` — `map_file_page` re-validates that a
   FileBacked VMA for the same object still covers `addr`, but not that `addr` still corresponds to
   the page index the fault filled. Thread A faults at X in a mapping of file F at base B (index
   i) and parks on the fill. Thread B unmaps it and maps F again at B', which still covers X. A
@@ -528,6 +528,8 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `try_fault_in` (`idt.rs:315-319`) takes the index from `file_backing`, and the frame is
   installed without re-deriving it under the second AS-lock hold. Lens: logic. Low.
   **Later**, in Part E.
+  Fixed in `293f330a`, Part E.6: a filled page is installed only where its mapping still puts it; fails
+  without it: `a_fill_whose_mapping_moved_under_it_installs_nothing`.
 - [x] **kmem-16** `kernel/src/object/file_object.rs:540` — `begin_fill`'s read-ahead adjacency test
   computes `first * bs + (n * PAGE_SIZE) as u64` unchecked. `block_map` guarantees only that each
   run's own end fits a u64, so a run map near the top of the byte range overflows when the next
@@ -2156,7 +2158,7 @@ Found 11, refuted by a boot 0, reported 11.
   Architecture. Medium. **Fix**, as kmem-8.
   Fixed in `badc91cd`; fails without it:
   `an_image_whose_segments_claim_more_than_the_budget_is_refused`.
-- [ ] **kmem-28** `kernel/src/arch/x86_64/idt.rs:250` — `pf_dispatch` checks the user-copy
+- [x] **kmem-28** `kernel/src/arch/x86_64/idt.rs:250` — `pf_dispatch` checks the user-copy
   recovery table before demand paging, so a kernel copy that touches a valid but not-yet-faulted
   page (a lazy anonymous page or any FileBacked page) fails with `UserAccessError::Fault` instead
   of faulting it in. A process maps a file with `sys_memory_map` (FileBacked VMAs are always lazy)
@@ -2171,7 +2173,9 @@ Found 11, refuted by a boot 0, reported 11.
   pre-scheduler state. To settle it, boot a test-image program that maps a file (or lazy anonymous
   memory) and passes an untouched page as the source buffer of `sys_debug_kprint`, and check for
   `Fault`. Architecture. Low. **Later**, in Part E.
-- [ ] **kmem-29** `kernel/src/syscall/table.rs:878` — `sys_memory_map(hint = 0)` picks its range
+  Fixed in `293f330a`, Part E.6, where nothing has to wait; a file's page not resident still fails,
+  `copy-from-unread-file`. The boot-probe's copy test fails on the old kernel.
+- [x] **kmem-29** `kernel/src/syscall/table.rs:878` — `sys_memory_map(hint = 0)` picks its range
   with `find_free_range` under one AS-lock hold and maps it under another, so two threads mapping
   concurrently can pick the same range. The loser gets `MapError::Overlap`, which reaches the
   caller as InvalidArgument. Two threads of one process each call
@@ -2181,6 +2185,8 @@ Found 11, refuted by a boot 0, reported 11.
   `find_free_range(PAGE)` calls return the same range (true); `map_object` of the first returned
   `Ok(())`, the second `Err(Overlap)`. Fix: search and insert under one hold. Architecture. Low.
   **Later**, in Part E.
+  Fixed in `293f330a`, Part E.6; fails with the two holds back, 2 ms apart:
+  `two_maps_placed_anywhere_at_once_never_meet`.
 - [ ] **kmem-30** `kernel/src/syscall/table.rs:2188` — `sys_file_sync` is a per-kind verb: its name
   and `lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)` bind it to
   FileObject, beside `sys_ns_sync` and the per-kind memory calls, where the project prefers a few

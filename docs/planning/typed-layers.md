@@ -2,7 +2,7 @@
 
 **Status: added 2026-10-27, when the safety survey was triaged (the maintainer's call); detailed
 2026-11-05.** Part J of [`pre-phase-7.md`](pre-phase-7.md), between Part E's two halves
-([`syscall-surface.md`](syscall-surface.md) § *The order*).
+([`syscall-surface.md`](syscall-surface.md) § *The order*). **Done 2026-11-13**, J.15 merged.
 
 ## Why
 

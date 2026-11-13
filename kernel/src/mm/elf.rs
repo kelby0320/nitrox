@@ -132,7 +132,7 @@ pub fn load_elf(asp: &mut AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLo
     match asp.map_vma_lazy(stack_vma) {
         Ok(()) => {}
         // `map_vma_lazy` allocates nothing; the arm is for exhaustiveness over `MapError`.
-        Err((_, MapError::OutOfMemory)) => return Err(ElfLoadError::OutOfMemory),
+        Err((_, MapError::OutOfMemory | MapError::NoRoom)) => return Err(ElfLoadError::OutOfMemory),
         Err((_, MapError::Overlap)) => return Err(ElfLoadError::SegmentOverlap),
         Err((_, MapError::NotCanonical | MapError::NotUserHalf)) => {
             unreachable!("stack range is fixed and validated at compile time")
@@ -263,7 +263,7 @@ fn map_load_segment(asp: &mut AddressSpace, bytes: &[u8], phdr: &Phdr, loaded: &
     let vma = KBox::try_new(Vma::new(range, prot)).map_err(|_| ElfLoadError::OutOfMemory)?;
     match asp.map_vma(vma) {
         Ok(()) => {}
-        Err((_, MapError::OutOfMemory)) => return Err(ElfLoadError::OutOfMemory),
+        Err((_, MapError::OutOfMemory | MapError::NoRoom)) => return Err(ElfLoadError::OutOfMemory),
         Err((_, MapError::Overlap)) => return Err(ElfLoadError::SegmentOverlap),
         Err((_, MapError::NotCanonical | MapError::NotUserHalf)) => {
             return Err(ElfLoadError::BadSegmentRange);

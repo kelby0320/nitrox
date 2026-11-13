@@ -19,12 +19,12 @@ use librsproto::session::Dir;
 /// (`tools/xtask/src/rootfs.rs`). 32 KiB = 8 pages — past the old 64 KiB eager read cap, so
 /// reading it proves the page cache lifts the cap. Kept small because each page demand-faults
 /// through the stateless fs-server fill at ~325 ms/page under QEMU.
-const LARGE_FILE_BYTES: usize = 32 * 1024;
+pub(super) const LARGE_FILE_BYTES: usize = 32 * 1024;
 
 /// The expected byte at file offset `i` of `/system/large.bin` — position-sensitive
 /// (the page index `i >> 12` in the high part) so a mis-faulted page is detected.
 /// MUST match the xtask generator.
-fn fill_byte(i: usize) -> u8 {
+pub(super) fn fill_byte(i: usize) -> u8 {
     (((i >> 12) ^ i) & 0xFF) as u8
 }
 

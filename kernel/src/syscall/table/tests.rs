@@ -1,3 +1,4 @@
+use super::memory::{full_mem_rights, map_mem_map_err, round_up_page, window};
 use super::*;
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
@@ -537,6 +538,7 @@ fn map_mem_map_err_mapping() {
     assert_eq!(map_mem_map_err(MapError::NotCanonical), KError::InvalidArgument);
     assert_eq!(map_mem_map_err(MapError::NotUserHalf), KError::InvalidArgument);
     assert_eq!(map_mem_map_err(MapError::OutOfMemory), KError::OutOfMemory);
+    assert_eq!(map_mem_map_err(MapError::NoRoom), KError::OutOfMemory);
 }
 
 #[test]
@@ -890,4 +892,17 @@ fn a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames() {
     // SAFETY: the cache frame is the test heap's, reachable through its HHDM offset.
     let filled = unsafe { core::slice::from_raw_parts((frame.as_u64() + heap::hhdm_offset()) as *const u8, 4) };
     assert_eq!(filled, b"\x7fELF");
+}
+
+/// **A mapping is whole pages of its object, from a page of it**: to its end and no further.
+#[test]
+fn a_mapping_window_is_whole_pages_inside_its_object() {
+    let (p, object) = (PAGE_SIZE as u64, 4 * PAGE_SIZE);
+    assert_eq!(window(1, 0, object), Ok((p, 0)), "rounded up to a page");
+    assert_eq!(window(p + 1, 2 * p, object), Ok((2 * p, 2)), "to its end");
+    assert_eq!(window(p + 1, 3 * p, object), Err(KError::InvalidArgument), "a page past it");
+    assert_eq!(window(p, 4 * p, object), Err(KError::InvalidArgument), "from its end");
+    assert_eq!(window(p, p / 2, object), Err(KError::InvalidArgument), "from inside a page");
+    assert_eq!(window(0, 0, object), Err(KError::InvalidArgument), "nothing");
+    assert_eq!(window(p, !(p - 1), object), Err(KError::InvalidArgument), "past every address");
 }

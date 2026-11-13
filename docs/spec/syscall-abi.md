@@ -62,7 +62,7 @@ The kernel validates every pointer argument before access:
 - Length check: `address + length` must not overflow or cross into kernel space
 - Maximum size: total copy size must not exceed `MAX_USER_COPY_SIZE` (16 MiB)
 
-Page faults during user memory access are recovered via the exception table; the syscall returns `FaultFromUser` (`-31`) if the user buffer is not accessible.
+A page of the user buffer not yet faulted in is served where nothing has to wait: anonymous memory zeroed, a file's page the page cache holds. Any other page fault during user memory access is recovered via the exception table, and the syscall returns `FaultFromUser` (`-31`): a buffer not mapped, not mapped for the access, in a file's page not resident, or one the kernel had no memory to back.
 
 ## Syscall numbering
 
@@ -530,9 +530,10 @@ fn sys_memory_map(
     hint:   usize,
     size:   usize,
     rights: Rights,
+    offset: usize,
 ) -> isize
 ```
-Maps `obj`'s frames into the calling process's address space. `hint` is an advisory page-aligned address (`0` = "anywhere", chosen from a kernel mmap window). **A non-zero `hint` intersecting the stack guard gap is refused** with `InvalidArgument` — the gap below the initial thread's stack is reserved so that a stack overrun faults instead of landing in mapped memory, and the "anywhere" window's own bound cannot enforce that against a caller naming its own address. **So is one reaching the top page of the user half**, which no mapping covers: a `syscall` in its last bytes would return to a non-canonical address. `rights` is the `MAP_*` subset to install; the handle must carry every requested `MAP_*` bit (so a mapping cannot amplify — e.g. mapping writable requires `MAP_WRITE`), **and `MAP_READ` whatever was asked**, since every mapped page can be read, else `NoAccess`. `size` is rounded up to a page and must be ≤ the object's size. Returns the mapped base virtual address. Mapping the same object twice **aliases the same physical memory** (the object owns the frames).
+Maps `size` bytes of `obj`, from byte `offset`, into the calling process's address space. `hint` is an advisory page-aligned address (`0` = "anywhere", chosen from a kernel mmap window: the lowest range free with **an unmapped page below it and below the next mapping above it**, so a stack placed there faults as it overruns, and found under the same lock hold as the mapping is made, so two threads mapping at once never meet). A hinted range is not held off those pages. **A non-zero `hint` intersecting the stack guard gap is refused** with `InvalidArgument` — the gap below the initial thread's stack is reserved so that a stack overrun faults instead of landing in mapped memory, and the "anywhere" window's own bound cannot enforce that against a caller naming its own address. **So is one reaching the top page of the user half**, which no mapping covers: a `syscall` in its last bytes would return to a non-canonical address. `rights` is the `MAP_*` subset to install; the handle must carry every requested `MAP_*` bit (so a mapping cannot amplify — e.g. mapping writable requires `MAP_WRITE`), **and `MAP_READ` whatever was asked**, since every mapped page can be read, else `NoAccess`. `size` is rounded up to a page; `offset` must be page-aligned, and `offset + size` ≤ the object's size rounded up to a page, else `InvalidArgument`: a file's last page maps whole. Returns the mapped base virtual address. Mapping the same object twice **aliases the same physical memory** (the object owns the frames).
 
 ```rust
 fn sys_memory_unmap(addr: usize, size: usize) -> isize

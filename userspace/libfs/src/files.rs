@@ -29,7 +29,7 @@ pub enum FileError {
 
 /// The largest file copied in one mapping.
 ///
-/// A file maps whole (`sys_memory_map` has no offset), so this bounds address space, not RAM; a
+/// A copy maps its file whole, so this bounds address space, not RAM; a
 /// windowed copy would not lift it, as unmapping leaves the pages with the page-cache object.
 /// A copy through `sys_io_submit` will (`copy-limit` in `deferred-decisions.md`).
 pub const MAX_COPY: u64 = 8 * 1024 * 1024;

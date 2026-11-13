@@ -209,6 +209,7 @@ pub fn copy_slice_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<(), User
     if n == 0 {
         return Ok(());
     }
+    crate::libkern::lockrank::assert_user_copy_safe();
     // SAFETY: `addr` was validated user-half for `n` bytes, `dst`'s length; the arch copy opens
     // the access window and recovers a fault on the user side.
     let faulted = unsafe { UserAccess::copy_in(dst, addr as *const u8) };
@@ -223,6 +224,7 @@ pub fn copy_slice_to_user(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), UserAcc
     if n == 0 {
         return Ok(());
     }
+    crate::libkern::lockrank::assert_user_copy_safe();
     // SAFETY: `addr` was validated user-half for `n` bytes, `src`'s length; as above.
     let faulted = unsafe { UserAccess::copy_out(addr as *mut u8, src) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
@@ -251,6 +253,7 @@ pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], Us
         return Err(UserAccessError::NoTerminator);
     }
     validate_user_range(addr, max as u64)?;
+    crate::libkern::lockrank::assert_user_copy_safe();
     // SAFETY: `addr` is in `[0, USER_VIRT_END - max)`; `dst` provides
     // `max` writable bytes. The arch raw primitive walks user memory
     // one byte at a time, registering only the user-side load as a
@@ -447,6 +450,35 @@ mod tests {
             assert_eq!(out, b"hello\0");
             assert_eq!(out.len(), 6);
         }
+    }
+
+    /// **No copy of user memory holds a lock**: its fault may page in, taking the address space's.
+    #[test]
+    #[should_panic(expected = "a copy of user memory with a lock held")]
+    fn a_copy_with_a_lock_held_is_refused() {
+        let src = [7u8];
+        held(|| copy_slice_from_user(&mut [0u8; 1], UserPtr::new(src.as_ptr() as u64).unwrap()).map(|_| ()));
+    }
+
+    #[test]
+    #[should_panic(expected = "a copy of user memory with a lock held")]
+    fn a_copy_out_with_a_lock_held_is_refused() {
+        let mut dst = [0u8];
+        held(|| copy_slice_to_user(UserMutPtr::new(dst.as_mut_ptr() as u64).unwrap(), &[7]));
+    }
+
+    #[test]
+    #[should_panic(expected = "a copy of user memory with a lock held")]
+    fn a_string_copy_with_a_lock_held_is_refused() {
+        let src = *b"x\0";
+        held(|| copy_cstr_from_user(&mut [0u8; 2], UserPtr::new(src.as_ptr() as u64).unwrap()).map(|_| ()));
+    }
+
+    /// `copy` made with a lock held.
+    fn held(copy: impl FnOnce() -> Result<(), UserAccessError>) {
+        let lock = crate::libkern::SpinLock::new(crate::libkern::lockrank::LockRank::Leaf, ());
+        let _held = lock.lock();
+        let _ = copy();
     }
 
     /// **A string copy into an empty destination writes nothing**: the routine copies a byte

@@ -25,7 +25,13 @@ impl Handle<Memory, MapReadWrite> {
 both!([T: Mappable, M: MemMode] T, M {
     /// Map the object's first `len` bytes with this mode's rights, wherever the kernel chooses.
     pub fn map(&self, len: usize) -> Result<Mapping<M>> {
-        let addr = check(sys::memory_map(self.raw().0, 0, len as u64, M::map_rights()))?;
+        self.map_range(0, len)
+    }
+
+    /// **Map `len` bytes of the object from `offset`**, a page boundary, with this mode's rights,
+    /// wherever the kernel chooses; `InvalidArgument` past the object's end.
+    pub fn map_range(&self, offset: usize, len: usize) -> Result<Mapping<M>> {
+        let addr = check(sys::memory_map(self.raw().0, 0, len as u64, M::map_rights(), offset as u64))?;
         let base = NonNull::new(addr as usize as *mut u8).ok_or(Error::from(KError::KernelError))?;
         Ok(Mapping { base, len, _m: PhantomData })
     }
@@ -165,6 +171,21 @@ mod tests {
         assert_eq!(&out, b"\0nitrox\0");
         drop(m);
         assert_eq!(sys::mappings(), 0);
+    }
+
+    /// **A range maps from its offset**, whole pages in: its last page, and not one past it.
+    #[test]
+    fn a_range_maps_from_its_offset() {
+        sys::reset();
+        let mem = Handle::<Memory, MapReadWrite>::create(3 * 4096).unwrap();
+        mem.map(3 * 4096).unwrap().write_from(2 * 4096, b"E6").unwrap();
+        let mut out = [0u8; 2];
+        mem.map_range(2 * 4096, 4096).unwrap().read_into(0, &mut out).unwrap();
+        assert_eq!(&out, b"E6");
+        let refused = |offset, len| mem.map_range(offset, len).err().map(|e| e.code());
+        assert_eq!(refused(2 * 4096, 4097), Some(KError::InvalidArgument), "a page past its end");
+        assert_eq!(refused(100, 4096), Some(KError::InvalidArgument), "from inside a page");
+        assert_eq!(refused(0, usize::MAX), Some(KError::InvalidArgument), "past every address");
     }
 
     #[test]

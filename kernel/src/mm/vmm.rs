@@ -142,8 +142,9 @@ pub enum Backing {
     /// last-ref drop, **not** unmap.
     Object(Ref<MemoryObject>),
     /// Backed by a file's pages served through the page cache. A not-present fault is serviced
-    /// outside the AS lock (`AddressSpace::file_backing`, `map_file_page`).
-    File(Ref<FileObject>),
+    /// outside the AS lock (`AddressSpace::file_backing`, `map_file_page`). Its first page maps
+    /// the file's page `first`.
+    File { file: Ref<FileObject>, first: usize },
 }
 
 /// The kind of access that triggered a page fault, decoded from the arch's fault information.
@@ -219,7 +220,7 @@ impl Drop for Vma {
     /// those do. The object's dirty pin is untouched: what was written through this mapping is
     /// still unwritten, and a later write-back decides.
     fn drop(&mut self) {
-        if let Backing::File(file) = &self.backing
+        if let Backing::File { file, .. } = &self.backing
             && self.prot.contains(Protection::WRITE)
         {
             file.writable_unmapped();
@@ -375,24 +376,24 @@ impl VmaTree {
         best.map(|n| unsafe { n.as_ref() })
     }
 
-    /// Find the lowest page-aligned gap of `size` bytes within `[min, max)` not covered by any
-    /// VMA, for `sys_memory_map(hint = 0)`; `None` if none fits.
+    /// Find the lowest page-aligned range of `size` bytes within `[min, max)` with `gap` bytes free
+    /// below it and below the next VMA above, for `sys_memory_map(hint = 0)`; `None` if none fits.
     ///
     /// An O(n) scan of the VMAs in ascending order. The result is page-aligned: the cursor starts
-    /// at the page-aligned `min` and only advances to a VMA's `range.end()`.
-    pub fn find_free_range(&self, min: VirtAddr, max: VirtAddr, size: u64) -> Option<VAddrRange> {
+    /// at the page-aligned `min` and only advances to a VMA's `range.end()` plus a page-aligned `gap`.
+    pub fn find_free_range(&self, min: VirtAddr, max: VirtAddr, size: u64, gap: u64) -> Option<VAddrRange> {
         let max = max.as_u64();
         let mut cursor = min.as_u64();
         for v in self.iter() {
             let s = v.range.start().as_u64();
             let e = v.range.end().as_u64();
-            if e <= cursor {
+            if e.saturating_add(gap) <= cursor {
                 continue;
             }
-            if s >= cursor.saturating_add(size) {
+            if s >= cursor.saturating_add(size).saturating_add(gap) {
                 break;
             }
-            cursor = e;
+            cursor = e.saturating_add(gap);
             if cursor.saturating_add(size) > max {
                 return None;
             }

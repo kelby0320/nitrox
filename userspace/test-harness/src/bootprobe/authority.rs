@@ -88,7 +88,7 @@ pub(super) fn map_needs_read_test() -> bool {
         Line::new().s(b"boot-probe: map FAIL: no handle without MAP_READ").end();
         return false;
     };
-    let refused = refused::authority::map_asking(&blind, PAGE, 0);
+    let refused = refused::authority::map_asking(&blind, 0, PAGE, 0);
     let mapped = mem.map(PAGE as usize);
     if refused != KError::NoAccess.as_i32() as i64 {
         Line::new().s(b"boot-probe: map FAIL: a handle without MAP_READ was mapped").end();

@@ -193,7 +193,7 @@ fn cmd_cat(root_ns: u64, path: &[u8]) {
         return;
     }
     // SAFETY: `h` is a mappable resource handle with MAP_READ.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, size, RIGHT_MAP_READ) };
+    let addr = unsafe { syscall5(SYS_MEMORY_MAP, h, 0, size, RIGHT_MAP_READ, 0) };
     if addr < 0 {
         kprint(b"cat: map failed\r\n");
         // SAFETY: closing our own handle.
@@ -235,7 +235,7 @@ fn cmd_lsblk(root_ns: u64) {
     let sr = unsafe { syscall2(SYS_HANDLE_STAT, h, (&mut info as *mut HandleInfo) as u64) };
     let addr = if sr == 0 {
         // SAFETY: `h` is a mappable snapshot with MAP_READ; the syscall rounds up to whole pages.
-        unsafe { syscall4(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ) }
+        unsafe { syscall5(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ, 0) }
     } else {
         -1
     };
@@ -329,7 +329,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _h0: u64, _a0: u64) -> ! {
     }
     let buf_h = buf_h as u64;
     // SAFETY: `buf_h` is a fresh MemoryObject handle with full MAP rights.
-    let buf_addr = unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    let buf_addr = unsafe { syscall5(SYS_MEMORY_MAP, buf_h, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE, 0) };
     if buf_addr < 0 {
         kprint(b"eshell: read buffer map failed\r\n");
         halt();
