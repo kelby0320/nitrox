@@ -138,8 +138,8 @@ mod tests {
     fn waiters_add_take_and_remove() {
         let (io, mut tok) = fresh();
         let tok = &mut tok;
-        let t1 = 0x1000usize as *mut ();
-        let t2 = 0x2000usize as *mut ();
+        let t1 = core::ptr::without_provenance_mut(0x1000);
+        let t2 = core::ptr::without_provenance_mut(0x2000);
         assert!(io.add_waiter(tok, t1).is_ok());
         assert!(io.add_waiter(tok, t2).is_ok());
         io.remove_waiter(tok, t1);
