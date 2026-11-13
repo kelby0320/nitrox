@@ -129,15 +129,15 @@ beside its notification channel:
   `service-mgr` has started nothing more. Init fires the failing verdict and spawns `eshell` —
   the backstop init itself gave `auth-service` and `logging-service` when it started them.
 - **`TERMINAL_OP_FINISH`** (administration Part E.4): a shutdown has asked every session and
-  service to stop. Init unmounts its own mounts, last first — `sys_ns_sync`, then `Meta::Unmount`
-  on the control channel it **keeps** for each since then, with no held check — and calls
-  `sys_power` with the system-control object, to halt or to reboot as the second byte says. Every
-  mount is unmounted whatever the one before answered, and if `sys_power` refuses, init says so
-  and goes on reaping: the filesystems are clean by then. **One wait here is not bounded by
-  init**: `sys_ns_sync` blocks until its write IRPs complete, and interrupt-driven IRPs have no
-  force-complete timeout yet, so a disk that stops completing writes holds the shutdown there
-  (`deferred-decisions.md` § *IRP cancellation and the completion timeout*). The answer to
-  `Meta::Unmount` is bounded, at 10 s.
+  service to stop. Init unmounts its own mounts, last first — the mount's flush, then
+  `Meta::Unmount` on the control channel it **keeps** for each since then, with no held check —
+  and calls `sys_power` with the system-control object, to halt or to reboot as the second byte
+  says. Every mount is tried whatever the one before answered, and if `sys_power` refuses, init
+  says so and goes on reaping. **Every wait here is bounded**: the flush at 60 s
+  (`FLUSH_TIMEOUT_NS`), as it runs on a kernel thread of its own, and the answer to
+  `Meta::Unmount` at 10 s. **A flush that fails or runs out of time sends no `Meta::Unmount`**:
+  the server would record the filesystem clean over what was not written, so it is left not clean
+  for the next mount's check.
 - **Its closing** means `service-mgr` has died. Init reports it and **does not restart it**: a
   fresh `service-mgr` could not re-adopt the running servers or the registry that reached them.
   The machine needs a restart.

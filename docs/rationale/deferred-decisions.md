@@ -150,13 +150,27 @@ request cancellation or the 30-second force-complete timeout. Phase 2 stacks are
 shallow and the boot-path block driver completes promptly. `sys_io_cancel` is
 defined (number reserved) but returns `Unsupported` until this lands. Trigger:
 long-running or cancellable I/O (network, user-abortable operations) and Tier 2
-module unload (which drains in-flight IRPs). **A shutdown is exposed to it too** (PR #343 review):
-`init`'s `Finish` calls `sys_ns_sync`, which blocks until its write IRPs complete, so a disk that
-stops completing writes holds PID 1 there and `sys_power` is never reached. The kernel's own flush
-in `sys_power` is bounded; the write-back before it is only as bounded as the IRPs it waits on.
+module unload (which drains in-flight IRPs). **A shutdown is no longer held by it** (pre-Phase-7
+E.7): a mount's flush runs on a kernel thread of its own, which `init` and the storage service
+wait for by a deadline, so a disk that stops completing writes costs the shutdown 60 s and leaves
+that filesystem not clean. **The thread itself still waits for good**, and keeps its place in the
+mount's budget of sixteen: a stuck device holds up its own mount's flushes, and no other.
 **So does a request a driver keeps for good**: an AHCI port that will not stop and a USB slot that
 will not disable keep their commands, since the device may still write the buffers, and what waits
-on one — a filesystem server's write, a `sys_ns_sync` behind it — waits for good.
+on one — a filesystem server's write, a flush's thread behind it — waits for good.
+
+**A supervisor's flush deadline bounds a whole mount's write-back — `TODO(flush-progress-bound)`.**
+`FLUSH_TIMEOUT_NS`, 60 s, is twice the 30 s a device gives one stuck command, but `init` and the
+storage service wait that long for every dirty file of a mount, written in turn. A slow device
+with a large dirty set runs past it with nothing failed: at shutdown `init` then sends no
+`Meta::Unmount` and stops the machine while the flush still writes, so what it had not reached
+is lost and the filesystem is left not clean; an eject or unmount is refused, and asked again
+finds the running flush holding the files. It was deferred (the maintainer's call, PR #440
+review) as the dirty set left at a stop is small: libfs's copy and write flush each file they
+write, so what is left is what mapping writers did not flush. A bound that resets on progress
+needs a progress signal the operation does not give: a held count that falls as the flush lets
+each file go, or a count of IRPs done. Trigger: a writer that leaves more dirty data than its
+device writes in 60 s, or a stop that is seen to lose it.
 
 **Async-I/O surface subset.** The [`IoOp`](../spec/io-operation.md) descriptor
 ships with only `Read`/`Write` opcodes and no `flags` modifiers; `Flush`/`Trim`,
@@ -1411,7 +1425,7 @@ so it cannot tell the difference. Two consequences, both currently benign. Write
 more device I/O than it needs to on a file that was mostly read. And `File::Touch`
 (Slice C4) therefore stamps `mtime` on **sync**, not on write: a caller that maps a file
 `MAP_WRITE`, changes nothing, and syncs anyway will move the timestamp. In practice the two
-coincide — `sys_file_sync` requires `MAP_WRITE` and callers reach for it precisely after
+coincide — a file's flush requires `MAP_WRITE` and callers reach for it precisely after
 writing — so this is a fidelity gap, not a wrong answer. The fix is to harvest the PTE
 dirty bits (and re-protect pages read-only after each writeback so re-dirtying is
 observable), which is the same machinery a periodic writeback daemon needs. Trigger: a
@@ -1448,7 +1462,7 @@ by the kernel.** `RESOLVE_CREATE`/`GROW`/`TRUNCATE`/`RENAME` all gate on nothing
 write it. Today that is contained by *namespace construction* — a sandbox that must not
 write a filesystem is not given a binding to it at all, which is the architecture's
 intended mechanism (`docs/architecture/namespace-and-resource-servers.md`) — so this is a
-missing *refinement*, not an open hole. It surfaced writing `sys_file_rename` (2026-07-29),
+missing *refinement*, not an open hole. It surfaced writing the rename (2026-07-29),
 where an attempt to check `MAP_WRITE` on both bindings failed against a live mount because
 the bits are not what the name suggests. Doing it properly means deciding where per-mount
 authority lives: rights on the binding independent of the endpoint handle's, a read-only
@@ -1900,7 +1914,7 @@ unlink, rmdir and rename — every operation that passes through it. It is **not
 a plain overwrite: under Model A the kernel writes file data straight to the device, so
 editing a file's existing bytes leaves its `mtime` at the last size change. This is the
 timestamp gap users actually notice ("I saved the file and the date didn't change"). Needs
-a writeback notification to the server — the natural hook is `sys_file_sync`, which already
+a writeback notification to the server — the natural hook is a file's flush, which already
 crosses into the kernel with the file's identity in hand, though a notification per sync
 has its own cost to weigh. Trigger: a text editor, or anything that rewrites a file in
 place without changing its length.
@@ -1910,7 +1924,7 @@ place without changing its length.
 **Writeback when a `FileObject` is torn down — built for unmount by administration C.1 and C.5c;
 shutdown's half still owed.**
 
-**Before C.1 (2026-09-24)**, `sys_file_sync` was the only writeback trigger. Unmapping a
+**Before C.1 (2026-09-24)**, a file's flush was the only writeback trigger. Unmapping a
 `MAP_WRITE` VMA wrote nothing back, and a `FileObject`'s `Drop` freed its cached frames unwritten.
 So data written through a mapping and never synced was lost when its writer let go. Nothing lost
 data, because every file writer (`libfs`, `nxsh`) synced before letting go. But that was a
@@ -1919,11 +1933,11 @@ otherwise until 2026-09-22.
 
 **What C.1 built: the data now outlives its writer.** A file its server caches holds a reference to
 itself while dirty, so its pages outlive whoever wrote them. Such a file has a nonzero file id,
-which is every file `fs-server-ext4` serves. `sys_ns_sync` writes every such object under a
+which is every file `fs-server-ext4` serves. A mount's flush writes every such object under a
 registration (`filesystem-data-path.md` § *One object per file*).
 
-**What C.5c built: an unmount syncs first.** The storage service's unmount calls `sys_ns_sync`,
-refuses while a file is still held (`sys_ns_held`), and only then has the server record the
+**What C.5c built: an unmount syncs first.** The storage service's unmount flushes the mount,
+refuses while a file is still held (`RESOLVE_OP_HELD`), and only then has the server record the
 filesystem clean ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md) § `Unmount`).
 `boot-probe` proves it on every run: a file written through a mapping and never synced is on the
 device after the unmount. **C.8's `check-storage` proves it where the host can read the result**: a
@@ -2277,15 +2291,15 @@ server's stay signalled and `sys_wait` fires again at once, a spin for the rest 
 registration going reaches it, which takes `service-mgr` with it.
 
 **libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
-`Namespace::flush` and `fs::flush` are `async` though `sys_ns_sync` and `sys_file_sync` answer
-within the call; `Spawn::path` hands the kernel a file, which it reads within the spawn;
+`Spawn::path` hands the kernel a file, which it reads within the spawn;
 `entropy::fill` makes an `EntropyObject` for each call; `system::stop` takes the system-control
 object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
 its authority is the `SYSTEM_CLOCK` grant until there is a clock node to hold, so its one caller,
 `date`, passes one when E.10 makes it. Every other caller is written once, against the shape it will
 keep, and the call under it changes as its sub-part of
-[`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 makes both flushes resolves or an
-`io_submit`, E.8 makes `Spawn` read the image into memory first, E.9 makes entropy a node, and
+[`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 made both flushes, once answered
+within the call, a resolve and an `io_submit`; E.8 makes `Spawn` read the image into memory
+first, E.9 makes entropy a node, and
 E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: each of those sub-parts.
 
 **Any process can end a test run — `TODO(test-verdict-authority)`.** `sys_test_exit` checks no
@@ -2563,10 +2577,10 @@ decision log entry for the date shown.
 | A listable `/dev` (`/dev` directory stub) | 2026-07-29 | Phase 4 D3: `list` takes the **union** of the filesystem under a path and the namespace bindings beneath it, so `/dev` lists like any directory of mount points and `sys_ns_enumerate` found its consumer. **One limitation stays open, and is now carried by the administration plan's Part B**: a kernel server owning a subtree is one binding, so `/dev/blk` lists as empty until the device registry can be enumerated. (Moved here 2026-09-22; the entry had read as open for two months — PR #326 review.) **Part B's detail pass (2026-09-23) answers it differently**: `/dev/blk` stays unlistable in the root namespace, the only one where it lists empty, and the device table is read through `/dev/registry` there and through `/dev/devices` everywhere else. **Built 2026-09-24** (Part B.1–B.5): `/dev/registry`, the device manager's `/dev/devices` in every session, and every enumeration that probed `/dev/blk/0`, `1`, … for the first miss now reads the registry or the namespace's own bindings. |
 | x2APIC | 2026-06-26 | Built — and **x2APIC-only**, not dual-mode: the ≈2014 baseline guarantees it, so no xAPIC fallback is carried. The dev loop runs QEMU ≥ 9.0. |
 | Concurrent direct-block + forwarded-lookup hang | 2026-07-20 | Not the block/forwarding path — a missing cross-CPU wake; fixed by the reschedule IPI. |
-| Writeback IRPs | Phase 3 | Dirty-page writeback landed with read-write `fs-server-ext4` (`FileObject::writeback` / `sys_file_sync`). |
+| Writeback IRPs | Phase 3 | Dirty-page writeback landed with read-write `fs-server-ext4` (`FileObject::writeback` / a file's flush). |
 | File-size discovery via `sys_handle_stat` | 2026-06-27 | `HandleInfo` gained `size: u64`; the lazy resolve grants `INSPECT`. |
 | Forwarded-lookup concurrency (N = 1) | Phase 2/3 | `US_PENDING_MAX = 8` outstanding forwarded lookups, correlated by `request_id`. |
-| File truncate | 2026-07-24 | `sys_file_truncate` → `RESOLVE_TRUNCATE` → `ext4::truncate_file`, kernel-forwarded so the page cache stays coherent. |
+| File truncate | 2026-07-24 | `RESOLVE_OP_TRUNCATE` → `RESOLVE_TRUNCATE` → `ext4::truncate_file`, kernel-forwarded so the page cache stays coherent. |
 | Reclaiming a process's handles at exit | 2026-07-24 | Marked thread + a batched sweep in `reap_pending`; `next_owned` stays unbuilt (the sweep scans). |
 | Wall-clock time | 2026-07-24 | `CLOCK_REALTIME` anchored from the CMOS RTC at boot; the fs-server stamps inodes. Setting the clock stayed unbuilt; this row pointed at an open entry for it that did not exist, until the row below (2026-09-29). |
 | Setting the clock | 2026-09-29 | Administration Part E.5: `sys_clock_set` needs `SYSTEM_CLOCK`, steps the offset, and writes the RTC in the chip's own encoding, read back; the `clock` grant and `date --set`. `check-shutdown` proves the time survives a reboot. No time-sync service: nothing sets the clock but a person. |

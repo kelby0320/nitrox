@@ -21,7 +21,7 @@ pub const RESOLVE_GROW: u32 = 1 << 2;
 pub const RESOLVE_CREATE: u32 = 1 << 3;
 /// `RESOLVE_TRUNCATE` — **shrink** the file to the `new_size` appended after the suffix
 /// (free the blocks past the new end) before replying its map. Combined with
-/// [`RESOLVE_FILE_LAZY`]; for `sys_file_truncate`. Mutually exclusive with [`RESOLVE_GROW`].
+/// [`RESOLVE_FILE_LAZY`]; for `RESOLVE_OP_TRUNCATE`. Mutually exclusive with [`RESOLVE_GROW`].
 pub const RESOLVE_TRUNCATE: u32 = 1 << 4;
 /// `RESOLVE_RENAME` — **rename** the resolved path to a second path carried in the same
 /// request, and reply status-only ([`OBJECT_KIND_NONE`]) rather than an object.

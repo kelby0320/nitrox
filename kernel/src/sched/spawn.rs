@@ -1,6 +1,7 @@
 //! Spawning threads and processes, and bringing up each CPU's scheduler.
 
 use super::*;
+use crate::libkern::KBox;
 
 /// Pre-reserved capacity for [`SchedState::ended_pids`]. Exit pushes into it under `SCHED`,
 /// so it must never allocate; the depth only has to cover a burst of exits between two
@@ -110,6 +111,27 @@ pub fn ap_init() -> Result<(), AllocError> {
 /// class and enqueue it. Returns the new thread id.
 pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
     spawn_with_class(entry, arg, SchedClass::TimeShared, 0, 0)
+}
+
+/// **A kernel thread's work, owned by the thread that does it**, which [`spawn_job`] hands over.
+pub trait Job: Sized + Send + 'static {
+    fn run(job: KBox<Self>);
+}
+
+/// **Start a kernel thread that owns `job`** and runs it, or hand `job` back if none could be made.
+pub fn spawn_job<J: Job>(job: KBox<J>) -> Result<(), KBox<J>> {
+    let at = KBox::into_raw(job);
+    match spawn(run_job::<J>, at.as_ptr().expose_provenance()) {
+        Ok(_) => Ok(()),
+        // SAFETY: the pointer `into_raw` gave, which no thread was started to take.
+        Err(_) => Err(unsafe { KBox::from_raw(at) }),
+    }
+}
+
+extern "C" fn run_job<J: Job>(at: usize) {
+    let at = core::ptr::NonNull::new(core::ptr::with_exposed_provenance_mut::<J>(at)).expect("a box's pointer");
+    // SAFETY: `spawn_job` handed this thread the box's pointer, which no one else holds.
+    J::run(unsafe { KBox::from_raw(at) })
 }
 
 /// Set a thread's CPU **affinity** mask (`sys_thread_set_affinity`). Takes effect at the

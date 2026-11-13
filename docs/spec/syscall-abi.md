@@ -103,19 +103,15 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `28` | `sys_io_submit` |
 | `29` | `sys_io_cancel` |
 | `30` | `sys_ns_enumerate` |
-| `31` | `sys_file_sync` |
-| `32` | `sys_file_grow` |
-| `33` | `sys_file_create` |
-| `34` | `sys_file_truncate` |
-| `35` | `sys_file_rename` |
 | `36` | `sys_process_terminate` |
 | `37` | `sys_ns_derive` |
-| `38` | `sys_ns_sync` |
-| `39` | `sys_ns_held` |
 | `40` | `sys_power` |
 | `41` | `sys_clock_set` |
 
-Numbers are assigned in landing order, not in the order syscalls appear below.
+Numbers are assigned in landing order, not in the order syscalls appear below. `31` to `35`,
+`38` and `39` went when a resolve came to carry its operation and a file's flush became an
+`io_submit` (pre-Phase-7 E.7); they answer `Unsupported`, as any number nothing holds does, until
+the numbers are assigned again.
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -196,7 +192,10 @@ Initiates the [`IoOp`](io-operation.md) `*op` against `resource` and returns a
 `PendingOperation` handle (positive value); it **never blocks**. In Phase 2
 `resource` is a block [`DeviceNode`](device-node.md) and the opcodes are
 `Read`/`Write`/`Flush`/`Rescan`/`Eject`; the last three name no buffer and no range, and a
-`Flush` completes once the device's cache is on its medium. The operation's outcome is delivered through the PO: `sys_wait`
+`Flush` completes once the device's cache is on its medium. **A `Flush` on a `FileObject`** puts
+every page of the file on the device instead: it needs `MAP_WRITE`, as a writable mapping does,
+and runs on a kernel thread of its own, as a mount's flush does (`sys_ns_lookup`, below), counted
+in the same budget. The operation's outcome is delivered through the PO: `sys_wait`
 writes `IoResult.status` (`0` = success, negative `KError` on a device/medium
 error) and `IoResult.result` (bytes transferred). A zero-length or cache-hit
 request returns a **pre-signalled** PO, so callers have one code path.
@@ -263,16 +262,16 @@ fn sys_ns_lookup(
     path:     UserPtr<u8>,
     path_len: usize,
     rights:   Rights,
+    op:       UserPtr<ResolveOp>,   // null: a plain lookup
 ) -> isize
 ```
 Looks up `path` in namespace `ns` (longest-prefix match), requesting at most
-`rights`. Requires `LOOKUP` on `ns`. Returns a `PendingOperation` handle; the
-operation completes carrying either the resolved resource handle in
-`IoResult.result` (with rights = requested ∩ binding rights, `status == 0`) or a
-negative `KError` in `IoResult.status`. (A direct-handle binding completes the PO
-immediately, pre-signalled; a resource-server binding completes it after the IPC
-round-trip — slice 3.) The `IoResult.result` word is the result-carrying
-extension noted under `sys_wait`.
+`rights`, and does what `op` says there (below). Requires `LOOKUP` on `ns`. Returns a
+`PendingOperation` handle; the operation completes carrying either the resolved resource handle in
+`IoResult.result` (with rights = requested ∩ binding rights, `status == 0`) or a negative `KError`
+in `IoResult.status`. (A direct-handle binding completes the PO immediately, pre-signalled; a
+resource-server binding completes it after the IPC round-trip — slice 3.) The `IoResult.result` word
+is the result-carrying extension noted under `sys_wait`.
 
 **The handle is made by the read.** The PO completes with the resolved object held in
 it, and the `sys_wait` that first reports the completion installs the handle in the
@@ -292,14 +291,84 @@ missing `LOOKUP`, a malformed/oversize `path`, or exhaustion of the PO or its ha
 return **synchronously** as a negative isize, with **no** `PendingOperation` created;
 the resolved handle's own exhaustion comes through the PO, at the read.
 
-**The file verbs are lookups too**: `sys_file_grow(ns, path, path_len, rights, size)`,
-`sys_file_create` and `sys_file_truncate` with the same arguments, and
-`sys_file_rename(ns, path, path_len, dest, dest_len, flags)` resolve `path` as `sys_ns_lookup`
-does and hand the server that owns it the operation: `RESOLVE_GROW`, `RESOLVE_CREATE`,
+**A resolve carries its operation**, a `ResolveOp` by pointer, copied in whole:
+
+```rust
+#[repr(C)]                       // 32 bytes, 8-byte aligned
+pub struct ResolveOp {
+    pub code: u32,               // RESOLVE_OP_*
+    pub flags: u32,              // a rename's
+    pub size: u64,               // a size change's
+    pub dest_ptr: u64,           // a rename's destination path
+    pub dest_len: u64,
+}
+```
+
+A field its `code` does not use must be `0`, and an unknown `code` is refused `InvalidArgument`.
+
+| `code` | Value | What the resolve does |
+|---|---|---|
+| `RESOLVE_OP_CREATE` | `1` | Makes the file if it is absent, grows it to `size`, and resolves it |
+| `RESOLVE_OP_GROW` | `2` | Grows the file to `size` first, if it is shorter |
+| `RESOLVE_OP_TRUNCATE` | `3` | Shrinks the file to `size` first, if it is longer |
+| `RESOLVE_OP_RENAME` | `4` | Renames `path` to the destination, on one filesystem; answers a status |
+| `RESOLVE_OP_FLUSH` | `5` | Writes back the mount's dirty files; answers how many |
+| `RESOLVE_OP_HELD` | `6` | Counts the mount's files something holds; answers how many |
+
+The first four are handed to the server that owns the path as `RESOLVE_GROW`, `RESOLVE_CREATE`,
 `RESOLVE_TRUNCATE` and `RESOLVE_RENAME` in [`rsproto-namespace-ops.md`](rsproto-namespace-ops.md),
-which says what each does. **A `size` past `u32::MAX` is refused `TooLarge`, and `flags` past
-`u16::MAX` `InvalidArgument`**, synchronously, before anything resolves: the request carries 32
-and 16 bits, and a value cut to fit would truncate a file meant just over 4 GiB to its low bits.
+which says what each does there. **A `size` past `u32::MAX` is refused `TooLarge`, and `flags`
+past `u16::MAX` `InvalidArgument`**, synchronously, before anything resolves: the request carries
+32 and 16 bits, and a value cut to fit would truncate a file meant just over 4 GiB to its low bits.
+A rename's destination must resolve through the same binding as its source, else `Unsupported`,
+the cue to copy and remove.
+
+**A flush writes back every dirty file** in the page cache of the userspace server that `path`
+resolves to, and completes the operation with how many it wrote. That includes files nothing
+holds any more: a file mapped writable stays cached and dirty until a write-back cleans it, so a
+writer that exits without flushing loses nothing until this runs
+([`filesystem-data-path.md`](../architecture/filesystem-data-path.md) § *One object per file*). An
+unmount runs it before it marks a filesystem clean, and so does shutdown. It changes no file; it
+only makes what was already written durable. A write that failed completes it `IoError`; the other
+files are still written, and a file whose write failed stays dirty.
+
+**It runs on a kernel thread of its own**, so the call returns at once and the caller waits on the
+operation, with a deadline if it likes. The thread lets go of the files and the place it holds
+before it completes the operation, so a held asked straight after counts none of them. **A mount
+runs sixteen flushes at once** (`FILE_OPS_MAX`), and a flush past them waits its turn: a thread
+that finishes one runs the next waiting on its mount, first come first served. A device that
+stops answering so holds up its own mount's flushes, and no other. **A process may have four of a
+mount's flushes running or waiting** (`FILE_OPS_PER_PROCESS`): one past them is refused
+`WouldBlock` synchronously, the operation not kept, which libos sleeps on and asks again, so no
+process takes a mount's budget from the others. Two calls still wait inside themselves:
+`sys_process_spawn` reads a file-backed image's pages, and `sys_power` waits on its flush.
+
+**A held counts the files the server has handed out that something still holds**: a handle, a
+mapping, an IRP in flight, or a dirty file's pin on itself. A forgotten file is not counted, and
+the page cache holds its files weakly, so a file nothing holds is not there to count. It waits on
+nothing: the operation is complete when the call returns. **Ask it after a flush.** The flush
+writes back every dirty file a write-back can clean, and lets go of its pin, so what is left is
+held by someone. That is the storage service's check before an unmount, which it refuses while
+the answer is not zero ([`storage.md`](../architecture/storage.md)). A filesystem is marked clean
+as the last step of an unmount, and a file still mapped writable could otherwise be written after
+it.
+
+**A count taken straight after I/O can include a finished IRP.** An IRP holds the file whose
+frames it moves until its box is freed in thread context. The kernel frees finished IRPs before
+it counts. But an IRP whose completion is still running on another CPU has already woken its
+waiter, before parking its box, so for that moment its file counts. So the storage service asks
+again after a few milliseconds before it believes a non-zero answer. A real holder is still
+holding then.
+
+**A flush's and a held's scope is the whole server, not the path.** A namespace that reaches only
+a subtree of a filesystem, such as a session's `/home`, writes back and counts every file of that
+filesystem, wherever it lies and whoever holds it: a count, not which files or whose. Nothing
+narrows it, since the unmount that needs it holds the whole mount. Both need only `LOOKUP`, and
+ask for no rights: `rights` must be `0`, else `InvalidArgument`. **They act on the server the
+path's binding names**, not on one a subnamespace reply would lead a lookup to: a path through the
+storage service's `fs` reaches the storage service. A path that resolves to anything but a
+userspace server completes the operation `Unsupported`, and one that resolves to nothing
+`NotFound`.
 
 ```rust
 fn sys_ns_bind(
@@ -349,62 +418,6 @@ is how it hands its namespace to someone. **A snapshot**: targets are shared, so
 same paths to the same resources, but a later bind or unbind in either does not reach the other. Returns
 `OutOfMemory` if the copy cannot be allocated, and the usual handle errors. Built for the view
 broker (`docs/planning/administration.md` § Part A). (Syscall number `37`.)
-
-```rust
-fn sys_ns_sync(ns: RawHandle, path: UserPtr<u8>, path_len: usize) -> isize
-```
-**Writes back every dirty file** in the page cache of the userspace server that `path` resolves
-to in `ns`, and returns how many it wrote. That includes files nothing holds any more: a file
-mapped writable stays cached and dirty until a write-back cleans it, so a writer that exits
-without `sys_file_sync` loses nothing until this runs
-([`filesystem-data-path.md`](../architecture/filesystem-data-path.md) § *One object per file*).
-An unmount calls it before it marks a filesystem clean, and so will shutdown.
-
-Requires `LOOKUP` on `ns`. It changes no file; it only makes what was already written durable.
-`Unsupported` if `path` resolves to anything but a userspace server, and `NotFound` if it
-resolves to nothing. `IoError` if a write failed; the other files are still written, and a file
-whose write failed stays dirty.
-
-**It blocks** until the writes complete, as `sys_file_sync` does, and is outside async-first for
-the same reason: a durability point is something the caller wants to know it has reached. **The
-syncs are not the only calls outside it** (PR #370 review): `sys_process_spawn` reads a file-backed
-image's pages inside the call, a device round trip each; `sys_power` waits on its flush (below);
-and `sys_debug_kprint` completes at once. (Syscall number `38`.)
-
-**Its scope is the whole server, not the path.** A namespace that reaches only a subtree of a
-filesystem, such as a session's `/home`, writes back every dirty file that server holds, wherever
-it lies.
-
-```rust
-fn sys_ns_held(ns: RawHandle, path: UserPtr<u8>, path_len: usize) -> isize
-```
-Returns **how many of the files the userspace server that `path` resolves to in `ns` has handed
-out are still held by something**: a handle, a mapping, an IRP in flight, or a dirty file's pin
-on itself. A forgotten file is not counted. The page cache holds its files weakly, so a file
-nothing holds is not there to count.
-
-**Ask it after `sys_ns_sync`.** The sync writes back every dirty file a write-back can clean, and
-lets go of its pin, so what is left is held by someone. That is the storage service's check
-before an unmount, which it refuses while the answer is not zero
-([`storage.md`](../architecture/storage.md)). A filesystem is marked clean as the last step of an
-unmount, and a file still mapped writable could otherwise be written after it.
-
-**A count taken straight after I/O can include a finished IRP.** An IRP holds the file whose
-frames it moves until its box is freed in thread context. The kernel frees finished IRPs before
-it counts. But an IRP whose completion is still running on another CPU has already woken its
-waiter, before parking its box, so for that moment its file counts. So the storage service asks
-again after a few milliseconds before it believes a non-zero answer. A real holder is still
-holding then.
-
-**Its scope is the whole server, as `sys_ns_sync`'s is.** A namespace that reaches only a
-subtree of a filesystem, such as a session's `/home`, counts every file of that filesystem held
-anywhere. So any session learns how many files other processes hold open on its root filesystem:
-a count, not which files or whose. Nothing narrows it, since the unmount that needs it holds the
-whole mount.
-
-Requires `LOOKUP` on `ns`. `Unsupported` if `path` resolves to anything but a userspace server,
-and `NotFound` if it resolves to nothing. It does not block. (Syscall number `39`,
-administration Part C.5c.)
 
 ### Entropy
 

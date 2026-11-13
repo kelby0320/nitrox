@@ -2,6 +2,7 @@ use super::memory::{full_mem_rights, map_mem_map_err, round_up_page, window};
 use super::*;
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
+use crate::libkern::resolve_op::*;
 use crate::mm::test_support::init_global_heap;
 use crate::object::Process;
 
@@ -773,16 +774,27 @@ fn a_lookup_completed_twice_keeps_its_first_object() {
 /// anything is looked up, never cut to fit.
 #[test]
 fn a_file_size_or_rename_flags_past_what_the_wire_carries_are_refused() {
-    let size = |n: u64| ResolveOp::Size(n, SizeChange::Truncate).forward_op();
+    let size = |n: u64| Resolve::Size(n, SizeChange::Truncate).forward_op();
     assert!(matches!(size(u32::MAX as u64), Ok(ForwardOp::Size(u32::MAX, _))));
     assert_eq!(size(1 << 32).err(), Some(KError::TooLarge));
-    let rename = |f: u64| ResolveOp::Rename { dest_ptr: 0, dest_len: 0, flags: f }.forward_op();
+    let rename = |f: u64| Resolve::Rename { dest_ptr: 0, dest_len: 0, flags: f }.forward_op();
     assert!(matches!(rename(u16::MAX as u64), Ok(ForwardOp::Rename { flags: u16::MAX })));
     assert_eq!(rename(1 << 16).err(), Some(KError::InvalidArgument));
     let path = b"/f";
     let just_over_4_gib = 0x1_0000_000A;
-    let truncate = dispatch(SYS_FILE_TRUNCATE, 0xDEAD, path.as_ptr() as u64, 2, 0, just_over_4_gib, 0);
+    let op = ResolveOp { code: RESOLVE_OP_TRUNCATE, flags: 0, size: just_over_4_gib, dest_ptr: 0, dest_len: 0 };
+    let truncate = dispatch(SYS_NS_LOOKUP, 0xDEAD, path.as_ptr() as u64, 2, 0, &raw const op as u64, 0);
     assert_eq!(truncate, KError::TooLarge.as_isize(), "taken as 10 bytes, it would free the rest");
+}
+
+#[test]
+fn a_flush_or_held_asking_for_rights_is_refused_before_anything_is_looked_up() {
+    let path = b"/m";
+    for code in [RESOLVE_OP_FLUSH, RESOLVE_OP_HELD] {
+        let op = ResolveOp { code, flags: 0, size: 0, dest_ptr: 0, dest_len: 0 };
+        let asked = dispatch(SYS_NS_LOOKUP, 0xDEAD, path.as_ptr() as u64, 2, 1, &raw const op as u64, 0);
+        assert_eq!(asked, KError::InvalidArgument.as_isize(), "code {code}");
+    }
 }
 
 /// **A fill's reply readies its own page**, not one a resize let a fault reserve its index for.
@@ -905,4 +917,43 @@ fn a_mapping_window_is_whole_pages_inside_its_object() {
     assert_eq!(window(p, p / 2, object), Err(KError::InvalidArgument), "from inside a page");
     assert_eq!(window(0, 0, object), Err(KError::InvalidArgument), "nothing");
     assert_eq!(window(p, !(p - 1), object), Err(KError::InvalidArgument), "past every address");
+}
+
+#[test]
+fn a_resolve_op_is_read_whole_and_refuses_what_its_code_does_not_use() {
+    let read = |op: ResolveOp| Resolve::read(&raw const op as u64);
+    let op = |code| ResolveOp { code, flags: 0, size: 0, dest_ptr: 0, dest_len: 0 };
+    assert!(matches!(Resolve::read(0), Ok(Resolve::Plain)));
+    let sized = |code| ResolveOp { size: 9, ..op(code) };
+    assert!(matches!(read(sized(RESOLVE_OP_CREATE)), Ok(Resolve::Size(9, SizeChange::Create))));
+    assert!(matches!(read(sized(RESOLVE_OP_GROW)), Ok(Resolve::Size(9, SizeChange::Grow))));
+    assert!(matches!(read(sized(RESOLVE_OP_TRUNCATE)), Ok(Resolve::Size(9, SizeChange::Truncate))));
+    let rename = ResolveOp { flags: 1, dest_ptr: 0x40, dest_len: 3, ..op(RESOLVE_OP_RENAME) };
+    assert!(matches!(read(rename), Ok(Resolve::Rename { dest_ptr: 0x40, dest_len: 3, flags: 1 })));
+    assert!(matches!(read(op(RESOLVE_OP_FLUSH)), Ok(Resolve::Flush)));
+    assert!(matches!(read(op(RESOLVE_OP_HELD)), Ok(Resolve::Held)));
+    let strays = [
+        ResolveOp { flags: 1, ..op(0) },
+        ResolveOp { size: 1, ..op(0) },
+        ResolveOp { dest_ptr: 1, ..op(0) },
+        ResolveOp { dest_len: 1, ..op(0) },
+    ];
+    let sizes = [false, true, false, false];
+    let uses = [
+        (RESOLVE_OP_CREATE, sizes),
+        (RESOLVE_OP_GROW, sizes),
+        (RESOLVE_OP_TRUNCATE, sizes),
+        (RESOLVE_OP_RENAME, [true, false, true, true]),
+        (RESOLVE_OP_FLUSH, [false; 4]),
+        (RESOLVE_OP_HELD, [false; 4]),
+    ];
+    for (code, used) in uses {
+        for (stray, _) in strays.iter().zip(used).filter(|(_, used)| !used) {
+            let refused = read(ResolveOp { code, ..*stray });
+            assert_eq!(refused.err(), Some(KError::InvalidArgument), "code {code}, {stray:?}");
+        }
+    }
+    for unknown in [0, 7] {
+        assert_eq!(read(op(unknown)).err(), Some(KError::InvalidArgument), "code {unknown}");
+    }
 }

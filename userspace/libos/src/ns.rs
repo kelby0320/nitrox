@@ -4,10 +4,17 @@
 use libkern::{KError, NsEntry, Rights};
 
 use crate::error::{Error, Result, check};
-use crate::exec::Op;
+use crate::exec::{Op, submit_again};
 use crate::handle::{CanBind, CanLookup, Channel, Handle, Namespace, NsMutable, Only, Ref, both};
 use crate::sys;
+use crate::sys::Resolve;
+use crate::time::Deadline;
 use crate::wait::Signalled;
+use crate::wait::WaitSet;
+
+/// **How long a supervisor waits for a mount's flush**: twice a device's 30 s for a stuck command.
+// TODO(flush-progress-bound): it bounds the whole write-back, not one command.
+pub const FLUSH_TIMEOUT_NS: u64 = 60_000_000_000;
 
 impl Handle<Namespace, NsMutable> {
     /// A new, empty namespace, with every right a namespace has.
@@ -21,7 +28,7 @@ both!([M: CanLookup] Namespace, M {
     /// Resolve `path` to a `T` of mode `M2` with at most `rights`. The type and mode are the
     /// caller's expectation, which the kernel checks at the first use.
     pub async fn lookup<T, M2>(&self, path: &str, rights: Rights) -> Result<Handle<T, M2>> {
-        let po = check(sys::ns_lookup(self.raw().0, path.as_bytes(), rights.bits()))?;
+        let po = check(sys::ns_lookup(self.raw().0, path.as_bytes(), rights.bits(), Resolve::Plain))?;
         let done = Op::from_po(po).await?;
         Ok(Handle::fresh(done.result, rights))
     }
@@ -29,7 +36,7 @@ both!([M: CanLookup] Namespace, M {
     /// Resolve `path` as [`lookup`](Self::lookup) does, without waiting here: for a caller that
     /// answers other handles while it resolves, and adds the [`Lookup`]'s operation to its wait.
     pub fn start_lookup<T, M2>(&self, path: &str, rights: Rights) -> Result<Lookup<T, M2>> {
-        let po = check(sys::ns_lookup(self.raw().0, path.as_bytes(), rights.bits()))?;
+        let po = check(sys::ns_lookup(self.raw().0, path.as_bytes(), rights.bits(), Resolve::Plain))?;
         Ok(Lookup { op: Op::from_po(po), rights, _t: core::marker::PhantomData })
     }
 
@@ -47,13 +54,29 @@ both!([M: CanLookup] Namespace, M {
 
     /// Write back every dirty file of the server `path` resolves to: how many it wrote.
     pub async fn flush(&self, path: &str) -> Result<u64> {
-        // TODO(surface-shape): the kernel answers it within the call, until a flush is a resolve.
-        check(sys::ns_sync(self.raw().0, path.as_bytes()))
+        Ok(Op::status(self.start_flush(path, Deadline::NEVER)?).await?.result)
+    }
+
+    /// [`flush`](Self::flush), given up at `deadline` as `TimedOut`, left to finish alone.
+    pub fn flush_by(&self, path: &str, deadline: Deadline) -> Result<u64> {
+        let mut op = Op::status(self.start_flush(path, deadline)?);
+        let signalled = {
+            let mut set = WaitSet::<1>::new();
+            set.add_op(&op)?;
+            set.wait(deadline)?
+        };
+        op.completion_in(&signalled).unwrap_or(Err(Error::from(KError::TimedOut))).map(|done| done.result)
+    }
+
+    fn start_flush(&self, path: &str, deadline: Deadline) -> Result<u64> {
+        submit_again(|| sys::ns_lookup(self.raw().0, path.as_bytes(), 0, Resolve::Flush), deadline)
     }
 
     /// How many of the files the server `path` resolves to has handed out something still holds.
     pub fn held(&self, path: &str) -> Result<u64> {
-        check(sys::ns_held(self.raw().0, path.as_bytes()))
+        let po = check(sys::ns_lookup(self.raw().0, path.as_bytes(), 0, Resolve::Held))?;
+        let done = Op::status(po).wait_out()?;
+        if done.status < 0 { Err(Error::from_status(done.status)) } else { Ok(done.result) }
     }
 });
 
@@ -309,5 +332,21 @@ mod tests {
         sys::fail_next_sync(KError::IoError as i32);
         assert_eq!(block_on(ns.flush("/")).err().unwrap().code(), KError::IoError);
         assert!(ns.held("/nothing").err().unwrap().is_not_found());
+    }
+
+    #[test]
+    fn a_busy_mount_is_asked_again_and_a_stuck_flush_is_given_up_at_its_deadline() {
+        sys::reset();
+        let ns = ns();
+        sys::mount("/", 2, 0);
+        sys::busy_flushes(2);
+        assert_eq!(block_on(ns.flush("/")).unwrap(), 2, "after two refusals");
+        assert_eq!(sys::sleeps(), 2, "a sleep before each ask again");
+        sys::flushes_never_finish();
+        let timed_out = |r: Result<u64>| r.err().map(|e| e.code());
+        assert_eq!(timed_out(ns.flush_by("/", Deadline::after(5_000_000).unwrap())), Some(KError::TimedOut));
+        assert_eq!(sys::closed_in_flight(), 1, "closed, not waited on");
+        sys::busy_flushes(u32::MAX);
+        assert_eq!(timed_out(ns.flush_by("/", Deadline::after(5_000_000).unwrap())), Some(KError::TimedOut));
     }
 }

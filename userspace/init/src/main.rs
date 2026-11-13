@@ -16,6 +16,7 @@ use init::manifest::{self, BindSpec, Manifest, Mode, MountSpec};
 use libkern::{
     KError, KIND_CHILD_EXITED, KOBJ_SYSTEM_CONTROL, Rights, SysCaps, TERMINAL_OP_EMERGENCY, TERMINAL_OP_FINISH,
 };
+use libos::FLUSH_TIMEOUT_NS;
 use libos::boot::Start;
 use libos::log::{self, Line};
 use libos::system::{self, Stop};
@@ -547,15 +548,11 @@ fn reap_loop(notify: Option<Handle<Notify, Only>>, root: Root, mut terminal: Opt
 }
 
 /// **Finish a shutdown.** `service-mgr` has asked every session and service to stop. What is left
-/// is `init`'s own: its mounts, last first — each written back with `sys_ns_sync`, then told
-/// `Meta::Unmount`, on which its server records the filesystem clean and exits — and then the
-/// machine, through `sys_power`. Whatever one mount answers, the next is still unmounted, since one
-/// stopped half way leaves every later filesystem not clean; whatever still runs writes after the
-/// sync at its own risk, as at a power cut.
-///
-/// **The sync is the one wait `init` does not bound**: it waits on write IRPs, and an
-/// interrupt-driven IRP has no force-complete timeout yet (`deferred-decisions.md` § *IRP
-/// cancellation and the completion timeout*); each `Meta::Unmount` answer is bounded by
+/// is `init`'s own: its mounts, last first — each flushed, then told `Meta::Unmount`, on which its
+/// server records the filesystem clean and exits — and then the machine, through `sys_power`.
+/// Whatever one mount answers, the next is still unmounted, since one stopped half way leaves every
+/// later filesystem not clean; whatever still runs writes after the flush at its own risk, as at a
+/// power cut. **Each wait is bounded**: a flush by `FLUSH_TIMEOUT_NS`, an unmount's answer by
 /// `UNMOUNT_TIMEOUT_NS`. Returns only if the machine cannot be stopped, after saying so.
 fn finish(root: &Root, reboot: bool, held: &mut Finish) {
     log::write(if reboot {
@@ -583,18 +580,21 @@ fn finish(root: &Root, reboot: bool, held: &mut Finish) {
         .end();
 }
 
-/// Unmount one of `init`'s mounts at shutdown; each step is tried whatever the last did. Its
+/// Unmount one of `init`'s mounts at shutdown, unless its flush did not finish. Its
 /// control channel closes at the end: its server has exited or been abandoned.
 fn unmount_one(root: &Root, m: Kept) {
     let at = m.mount_point.as_bytes();
-    if let Err(e) = block_on(root.flush(&m.mount_point)) {
-        let mut l = Line::new();
-        l.s(b"init: ").s(at).s(b": its files could not all be written back (").i(e.code() as i64).s(b")");
-        l.end();
-    }
+    let deadline = Deadline::after(FLUSH_TIMEOUT_NS).unwrap_or(Deadline::at(FLUSH_TIMEOUT_NS));
+    let sent = match init::unmount::flush_then_ask(root, &m.mount_point, (&m.control).into(), deadline) {
+        Ok(sent) => sent,
+        Err(e) => {
+            let mut l = Line::new();
+            l.s(b"init: ").s(at).s(b": its files could not all be written back (").i(e as i64);
+            l.s(b"), so it is not marked clean").end();
+            return;
+        }
+    };
     let mut msg = Msg::new();
-    let request = init::unmount::request(msg.payload_mut(), 1).and_then(|n| msg.set_len(n).ok());
-    let sent = request.is_some() && m.control.send(&msg, &mut Carried::new()).is_ok();
     let answered = sent && {
         let deadline = Deadline::after(UNMOUNT_TIMEOUT_NS).unwrap_or(Deadline::at(UNMOUNT_TIMEOUT_NS));
         let mut set = WaitSet::<1>::new();

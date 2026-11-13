@@ -34,7 +34,7 @@ extent tree*.
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
 defines the fs-neutral protocol (`MapRange`/`AllocRange`/`BlockRun`), the kernel interface
-(`FileObject` producer, dirty tracking, writeback, `MAP_WRITE`, `sys_file_sync`), the shared
+(`FileObject` producer, dirty tracking, writeback, `MAP_WRITE`, a file's flush), the shared
 device, and the data-before-metadata ordering. This document covers only *how ext4 backs
 that contract*: extent trees, bitmaps, inodes, directory entries — none of which the kernel
 or the protocol knows about.
@@ -227,8 +227,8 @@ supervisor on the control channel. The server then replies and exits
 ([`rsproto-wire-format.md`](../spec/rsproto-wire-format.md) § *Meta::Unmount*). A filesystem found
 not clean is reported (`the filesystem was not cleanly unmounted last time`) and served anyway;
 a repair tool is `TODO(fs-repair)`. **`init`'s mounts are unmounted by a shutdown** (administration
-Part E.4): `sys_ns_sync`, then `Meta::Unmount`, last mounted first. A machine turned off without
-one is still reported on its next boot.
+Part E.4): a flush of the mount, then `Meta::Unmount`, last mounted first. A machine turned off
+without one is still reported on its next boot.
 
 **The control channel stays open after `Ready`**, and takes a wait slot while it is. A directory
 session may use the last slot only once it has closed. **`init` keeps its end** for the shutdown's
@@ -281,7 +281,7 @@ Each part builds on proven machinery and is independently verifiable.
   into the cache frame. **Verified by the existing read tests** (`current-generation`, the
   8-page `large.bin`) — the hardest new machinery de-risked before any write correctness.
   (The standalone `MapRange` op is deferred; the resolve reply carries the initial map.)
-- **Part C — overwrite-in-place** ✅. `MAP_WRITE` mappings + `sys_file_sync` + kernel write
+- **Part C — overwrite-in-place** ✅. `MAP_WRITE` mappings + a file's flush + kernel write
   IRPs to **existing** LBAs (`FileObject::writeback`). Writing back all resident pages is
   correct for overwrite; per-page dirty tracking is deferred.
 
@@ -307,7 +307,7 @@ Each part builds on proven machinery and is independently verifiable.
   regular file, since the id comes off the wire and a touch can trail the unlink of what it names.
 - **Part D — file growth** ✅. `grow_file` (block-bitmap allocation + extent-tree extension +
   inode size/block-count) — **`e2fsck`-verified**. Triggered by grow-on-resolve
-  (`RESOLVE_GROW` + `sys_file_grow`): the server grows the file, then replies its map; the
+  (`RESOLVE_GROW` + `RESOLVE_OP_GROW`): the server grows the file, then replies its map; the
   client writes the new region + syncs. The fs-server now holds a read-write device handle.
 
   **A grow zeroes, on the device, everything it adds**: the old last block past the old size, and
@@ -339,7 +339,7 @@ Each part builds on proven machinery and is independently verifiable.
 - **Part E — file creation** ✅. `create_file` (inode allocation via the inode bitmap +
   `ext4_dir_entry_2` insertion by splitting an existing entry's slack in the parent
   directory, then inode init as an extents regular file) — **`e2fsck`-verified**. Triggered
-  by create-on-resolve (`RESOLVE_CREATE | RESOLVE_GROW` + `sys_file_create`): the server
+  by create-on-resolve (`RESOLVE_CREATE | RESOLVE_GROW` + `RESOLVE_OP_CREATE`): the server
   creates the file (idempotent — an existing name returns its inode), grows it to the
   requested size, then replies its map; the client writes + syncs, and a subsequent plain
   `sys_ns_lookup` of the new path resolves (proving the directory entry is on disk).

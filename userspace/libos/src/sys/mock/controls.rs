@@ -33,7 +33,7 @@ pub fn fail_next_bind(status: i32) {
     with(|m| m.fail_bind = Some(status));
 }
 
-/// Fail the next `file_sync` or `ns_sync` with `status`.
+/// Complete the next file's or mount's flush with `status`.
 pub fn fail_next_sync(status: i32) {
     with(|m| m.fail_sync = Some(status));
 }
@@ -78,9 +78,19 @@ pub fn submitted() -> Vec<IoOp> {
     with(|m| m.submitted.clone())
 }
 
-/// Answer `ns_sync` of `path` with `written` and `ns_held` with `held`.
+/// Answer a flush of the mount at `path` with `written`, and a held with `held`.
 pub fn mount(path: &str, written: i64, held: i64) {
     with(|m| m.mounts.insert(path.as_bytes().to_vec(), (written, held)));
+}
+
+/// Refuse the next `n` flushes `WouldBlock`, as the kernel refuses one past its process's share.
+pub fn busy_flushes(n: u32) {
+    with(|m| m.busy_flushes = n);
+}
+
+/// Let every flush from now on start and never finish, as one on a device that stopped does.
+pub fn flushes_never_finish() {
+    with(|m| m.flush_never = true);
 }
 
 /// Let the next `reads` entropy reads find the pool unseeded.

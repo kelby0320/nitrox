@@ -36,6 +36,7 @@ pub mod power;
 pub mod printable;
 pub mod published;
 pub mod reserved;
+pub mod resolve_op;
 pub mod spawn;
 pub mod spinlock;
 pub mod syscaps;

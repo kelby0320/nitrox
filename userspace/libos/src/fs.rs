@@ -1,12 +1,13 @@
 //! Files by path: the verbs that make, grow, shrink and rename one, each a resolve answered by the
 //! filesystem server that owns the path, and a file's flush.
 
-use libkern::Rights;
+use libkern::{IO_OPCODE_FLUSH, IoOp, Rights};
 
 use crate::error::{Result, check};
-use crate::exec::Op;
+use crate::exec::{Op, submit_again};
 use crate::handle::{CanLookup, CanMapWrite, File, Handle, Namespace, Ref};
-use crate::sys::{self, Resize};
+use crate::sys::{self, Resize, Resolve};
+use crate::time::Deadline;
 
 /// Make the file at `path`, at least `size` bytes, and resolve it with at most `rights`. A file
 /// already there is resolved, grown if it is shorter.
@@ -46,7 +47,7 @@ async fn resize<M: CanLookup, F>(
     size: u64,
     rights: Rights,
 ) -> Result<Handle<File, F>> {
-    let po = check(sys::file_resize(verb, ns.raw().0, path.as_bytes(), rights.bits(), size))?;
+    let po = check(sys::ns_lookup(ns.raw().0, path.as_bytes(), rights.bits(), Resolve::Size(verb, size)))?;
     let done = Op::from_po(po).await?;
     Ok(Handle::fresh(done.result, rights))
 }
@@ -59,7 +60,8 @@ pub async fn rename<'a, M: CanLookup + 'a>(
     to: &str,
     flags: u16,
 ) -> Result<()> {
-    let po = check(sys::file_rename(ns.into().raw().0, from.as_bytes(), to.as_bytes(), flags as u64))?;
+    let rename = Resolve::Rename { to: to.as_bytes(), flags };
+    let po = check(sys::ns_lookup(ns.into().raw().0, from.as_bytes(), Rights::MAP_READ.bits(), rename))?;
     // A lookup's: a server may answer with a handle, which this closes.
     let done = Op::from_po(po).await?;
     if done.result != 0 {
@@ -70,8 +72,10 @@ pub async fn rename<'a, M: CanLookup + 'a>(
 
 /// Put every page of `file` on the device; needs `MAP_WRITE`.
 pub async fn flush<'a, F: CanMapWrite + 'a>(file: impl Into<Ref<'a, File, F>>) -> Result<()> {
-    // TODO(surface-shape): the kernel answers it within the call, until a flush is an `io_submit`.
-    check(sys::file_sync(file.into().raw().0)).map(|_| ())
+    let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
+    let raw = file.into().raw();
+    let po = submit_again(|| sys::io_submit(raw.0, &op), Deadline::NEVER)?;
+    Op::status(po).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -100,6 +104,19 @@ mod tests {
         assert!(gone.is_not_found());
         let big = block_on(create::<_, MapReadWrite>(&ns, "/h", 1 << 32, rw())).err().unwrap();
         assert_eq!(big.code(), KError::TooLarge, "a size the wire cannot carry, refused before it resolves");
+    }
+
+    #[test]
+    fn a_files_flush_is_its_flush_asked_again_while_its_mount_is_busy() {
+        sys::reset();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        let f: Handle<File, MapReadWrite> = block_on(create(&ns, "/f", 1, rw())).unwrap();
+        sys::busy_flushes(1);
+        assert!(block_on(flush(&f)).is_ok());
+        let flushes = sys::submitted().into_iter().filter(|op| op.opcode == IO_OPCODE_FLUSH && op.buffer == 0);
+        assert_eq!(flushes.count(), 2, "refused once, and taken");
+        sys::fail_next_sync(KError::IoError as i32);
+        assert_eq!(block_on(flush(&f)).err().map(|e| e.code()), Some(KError::IoError));
     }
 
     #[test]

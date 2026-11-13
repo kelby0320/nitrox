@@ -107,7 +107,7 @@ fn c1_byte(p: u64, i: u64) -> u8 {
 /// 1. **A write through one mapping is read through another without a sync**: two resolves
 ///    share the file's object, and the device does not have the write yet, so the second read
 ///    is a reading of the cache.
-/// 2. **Unmapped and closed without a sync, the write is kept, and `sys_ns_sync` writes it**,
+/// 2. **Unmapped and closed without a sync, the write is kept, and a mount's flush writes it**,
 ///    checked on the device on both sides of the sync.
 /// 3. **A truncate and a grow of a file held open read zero over the regrown range** (a whole
 ///    page and a partial tail) through a new mapping and on the device. The mapping reads the
@@ -151,7 +151,7 @@ pub(super) fn file_cache_test(root: Root<'_>) -> bool {
         log::write(b"boot-probe: c1 shared-object MISMATCH\n");
     }
 
-    // 2. Let go of everything without a sync; the write is kept, and `sys_ns_sync` writes it.
+    // 2. Let go of everything without a sync; the write is kept, and a mount's flush writes it.
     drop(wa);
     drop(ra);
     drop(w);
@@ -162,7 +162,7 @@ pub(super) fn file_cache_test(root: Root<'_>) -> bool {
         && on_device(0, 64) == Some(pattern(0, 64))
         && on_device(PAGE, 64) == Some(pattern(1, 64));
     if kept && synced {
-        log::write(b"boot-probe: c1 an unsynced write closed reaches the device on sys_ns_sync ok\n");
+        log::write(b"boot-probe: c1 an unsynced write closed reaches the device on a flush ok\n");
     } else {
         log::write(b"boot-probe: c1 ns-sync MISMATCH\n");
     }
@@ -211,7 +211,7 @@ pub(super) fn file_cache_test(root: Root<'_>) -> bool {
 /// **An unlinked file's pages are not written back.** A file
 /// written through a mapping and let go without a sync stays dirty in the kernel's cache.
 /// When it is unlinked, the server's `File::Forget` takes it out of that cache before the
-/// server frees its block. So a `sys_ns_sync` after the unlink finds nothing of it to write,
+/// server frees its block. So a mount flush after the unlink finds nothing of it to write,
 /// and the block the file had does not receive its bytes — which, after a free, could be
 /// another file's.
 ///
@@ -578,7 +578,7 @@ pub(super) fn continuation_test(root: Root<'_>) -> bool {
     true
 }
 
-/// **Overwrite** an existing file in place through a `MAP_WRITE` mapping, `sys_file_sync`, then
+/// **Overwrite** an existing file in place through a `MAP_WRITE` mapping, `fs::flush`, then
 /// read the block **off the device** ([`RootDevice`]) and verify the change persisted: the write
 /// data path (dirty pages, write IRPs, device) with no fs-server metadata write.
 pub(super) fn overwrite_test(root: Root<'_>) -> bool {
@@ -621,9 +621,9 @@ pub(super) fn overwrite_test(root: Root<'_>) -> bool {
     }
 }
 
-/// **Grow** a file past EOF via `sys_file_grow`
+/// **Grow** a file past EOF via `fs::grow`
 /// (the fs-server allocates a block + extends its extent tree + updates the inode), write
-/// into the newly-allocated region, `sys_file_sync`, then read the device and confirm the
+/// into the newly-allocated region, `fs::flush`, then read the device and confirm the
 /// appended data persisted — proving the write path's metadata mutation end to end.
 pub(super) fn grow_test(root: Root<'_>) -> bool {
     let path = "/system/rwtest";
@@ -698,8 +698,8 @@ pub(super) fn refused_create_test(root: Root<'_>) -> bool {
 }
 
 /// **Create** a brand-new file via
-/// `sys_file_create` (the fs-server allocates an inode + inserts a directory entry in the
-/// parent, then grows it to the target size), write into it, `sys_file_sync`, then read the
+/// `fs::create` (the fs-server allocates an inode + inserts a directory entry in the
+/// parent, then grows it to the target size), write into it, `fs::flush`, then read the
 /// path off the device and confirm both that it resolves there and that its data persisted —
 /// proving inode allocation + directory-entry insertion end to end.
 pub(super) fn create_test(root: Root<'_>) -> bool {

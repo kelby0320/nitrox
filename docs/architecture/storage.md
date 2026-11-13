@@ -69,7 +69,7 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
 | The FAT checks | `userspace/fs-server-fat/src/volume.rs` | `Fat::check`, the label and `was_left_clean`, for the same reason; the check's refusal is the reason a FAT is not served (Phase 6 Part E.5) |
 | The partition-table reader | `userspace/libgpt/` | Each disk's entries, for `init.toml`'s UUID sources |
 | The `Storage` codec | `userspace/librsproto/src/storage.rs` | `Mount`, `Unmount` and `InUse` bodies ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)) |
-| The busy check | `kernel/src/syscall/table.rs` (`sys_ns_held`) | How many of a mount's files something still holds, after the finished IRPs have let go |
+| The busy check | `kernel/src/syscall/table/flush.rs` (`held`) | How many of a mount's files something still holds, after the finished IRPs have let go |
 
 ## 3. A boot, end to end
 
@@ -256,8 +256,8 @@ and left unmounted.
 **A departure takes the device out of the table and closes the service's node.** A mount on it is
 torn down as an unmount is, but with nothing kept:
 1. its label leaves `fs`;
-2. `sys_ns_sync` over the mount: every dirty file's write-back is refused `PeerClosed`, and the
-   kernel lets each such file go rather than keeping it for the boot
+2. A flush of the mount (`RESOLVE_OP_FLUSH`): every dirty file's write-back is refused
+   `PeerClosed`, and the kernel lets each such file go rather than keeping it for the boot
    ([`filesystem-data-path.md`](filesystem-data-path.md));
 3. `Meta::Unmount`: the server's attempt to record the filesystem clean fails, and it answers and
    exits — **not a terminate**, which is a request neither filesystem server reads;
@@ -304,9 +304,9 @@ answers every request on a session.
   stick, which `nxinstall` then names as holding the running system.
 - **`Unmount`** is a chain, each link only once the one before it held:
   1. The label leaves `fs`.
-  2. Every dirty file is written back: `sys_ns_sync` on the mount's namespace. That includes a
+  2. Every dirty file is written back: a flush of the mount (`RESOLVE_OP_FLUSH`). That includes a
      file a writer mapped, wrote and let go of without a sync.
-  3. **Refused while a file is still held**: `sys_ns_held`, asked after the sync, when what is
+  3. **Refused while a file is still held**: `RESOLVE_OP_HELD`, asked after the flush, when what is
      left is someone's. A handle or a mapping could write after the filesystem is marked clean.
      A refusal here puts the label back and changes nothing.
   4. `Meta::Unmount`: the server records the filesystem clean and exits. A read-only mount records
@@ -522,7 +522,7 @@ device it is about, a device read again planned as an arrival, and each `note`.
   [`deferred-decisions.md`](../rationale/deferred-decisions.md).
 
 - **A resolve already on its way to a mount's server can outlive the busy check.** One the kernel
-  forwarded before the unmount began may complete after `sys_ns_held` said zero, and hand out a
+  forwarded before the unmount began may complete after the held count said zero, and hand out a
   file of a filesystem about to be marked clean. It needs a resolve in flight at the moment the
   unmount starts. A lazy unmount, which would drain those, is not built.
 - **An open directory session is not a held file.** A client holding one when its filesystem is

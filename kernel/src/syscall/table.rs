@@ -16,18 +16,8 @@ use crate::handle::table::{Claim, HandleError, HandleTable};
 use crate::libkern::clock::ClockId;
 use crate::rsproto::SizeChange;
 use mappable::Mappable;
+use resolve::Resolve;
 
-/// What a resolve is being asked to do beyond resolving, one intent per call site.
-#[derive(Copy, Clone)]
-pub enum ResolveOp {
-    /// A plain lookup.
-    Plain,
-    /// Change the file's size first (`sys_file_create` / `_grow` / `_truncate`), as passed.
-    Size(u64, SizeChange),
-    /// Rename the resolved path to `dest_ptr`/`dest_len` (`sys_file_rename`). Both paths must
-    /// resolve through the **same binding**, so a server never sees a cross-filesystem rename.
-    Rename { dest_ptr: u64, dest_len: usize, flags: u64 },
-}
 use crate::arch::RegisterValues;
 use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
 use crate::libkern::io_op::{IoOp, IoOpcode};
@@ -183,24 +173,10 @@ pub const SYS_IO_SUBMIT: u64 = 28;
 pub const SYS_IO_CANCEL: u64 = 29;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
 pub const SYS_NS_ENUMERATE: u64 = 30;
-/// `sys_file_sync` — flush a writable file mapping's dirty pages to the device.
-pub const SYS_FILE_SYNC: u64 = 31;
-/// `sys_file_grow` — resolve a file, growing it to a target size first (a5 = new size).
-pub const SYS_FILE_GROW: u64 = 32;
-/// `sys_file_create` — create a file, grow it to a target size (a5 = new size), then resolve.
-pub const SYS_FILE_CREATE: u64 = 33;
-/// `sys_file_truncate` — resolve a file, shrinking it to a target size first (a5 = new size).
-pub const SYS_FILE_TRUNCATE: u64 = 34;
-/// `sys_file_rename` — rename a path within one filesystem (a3/a4 = dest ptr/len, a5 = flags).
-pub const SYS_FILE_RENAME: u64 = 35;
 /// `sys_process_terminate` — **ask** a process to exit (§11h) via a `TerminateRequested` notice.
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
 /// `sys_ns_derive` — a new namespace holding a copy of another's bindings, full-rights handle.
 pub const SYS_NS_DERIVE: u64 = 37;
-/// `sys_ns_sync(ns, path, path_len)` — write back every dirty file under a mount.
-pub const SYS_NS_SYNC: u64 = 38;
-/// `sys_ns_held(ns, path, path_len)` — how many of a mount's files something still holds.
-pub const SYS_NS_HELD: u64 = 39;
 /// `sys_power(system_control, op)` — flush every disk, stop every processor, halt or reset.
 pub const SYS_POWER: u64 = 40;
 /// `sys_clock_set(clock, ns)` — set the wall clock, and the RTC under it. Needs `SYSTEM_CLOCK`.
@@ -247,21 +223,9 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_PROCESS_TERMINATE => encode(sys_process_terminate(a0)),
         SYS_NS_CREATE => encode(sys_ns_create()),
         SYS_NS_DERIVE => encode(sys_ns_derive(a0)),
-        SYS_NS_SYNC => encode(sys_ns_sync(a0, a1, a2 as usize)),
-        SYS_NS_HELD => encode(sys_ns_held(a0, a1, a2 as usize)),
         SYS_POWER => encode(sys_power(a0, a1)),
         SYS_CLOCK_SET => encode(sys_clock_set(a0, a1)),
-        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
-        SYS_FILE_GROW => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4, SizeChange::Grow))),
-        SYS_FILE_CREATE => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4, SizeChange::Create))),
-        SYS_FILE_RENAME => encode(sys_ns_lookup(
-            a0,
-            a1,
-            a2 as usize,
-            crate::libkern::handle::Rights::MAP_READ.bits(),
-            ResolveOp::Rename { dest_ptr: a3, dest_len: a4 as usize, flags: a5 },
-        )),
-        SYS_FILE_TRUNCATE => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4, SizeChange::Truncate))),
+        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, a4)),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2)),
@@ -269,7 +233,6 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
         SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
         SYS_IO_CANCEL => encode(sys_io_cancel(a0)),
-        SYS_FILE_SYNC => encode(sys_file_sync(a0)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Test build only: end the QEMU run with the caller's verdict. Without `isa-debug-exit`
         // the write is ignored and this **returns `Unsupported`**; parking the CPU instead
@@ -906,26 +869,29 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
     Ok(po_h.bits() as isize)
 }
 
-/// `sys_ns_lookup(ns, path, path_len, rights)` — resolve `path` in `ns` (longest-prefix match),
+/// `sys_ns_lookup(ns, path, path_len, rights, op)` — resolve `path` in `ns` (longest-prefix match),
 /// requesting at most `rights`. Requires `LOOKUP` on `ns`. Returns a [`PendingOperation`]
 /// handle; the completion delivers the resolved resource handle in `IoResult.result` (rights =
 /// `requested ∩ binding.rights`) with `status == 0`, or a `NotFound` `status`.
+/// `op`, a `ResolveOp` or null, is what is done there; a flush or held is [`flush::mount`]'s.
 ///
 /// Argument / permission / allocation failures return **synchronously** (no PO); resolution
 /// failures (no covering binding, or a non-empty suffix on a direct-handle leaf) arrive
 /// **through** the PO.
-pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64, op: ResolveOp) -> SysResult {
-    let fwd = op.forward_op()?;
+pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64, op_ptr: u64) -> SysResult {
+    let op = Resolve::read(op_ptr)?;
+    let fwd = op.forward(rights_bits)?;
     let pid = crate::sched::current_owner_pid();
     let requested = Rights::from_bits_truncate(rights_bits);
     let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;
     let mut buf = [0u8; NS_PATH_MAX];
     let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
     validate_path(path).map_err(|_| KError::InvalidArgument)?;
+    let Some(fwd) = fwd else { return flush::mount(&ns, path, matches!(op, Resolve::Flush), pid) };
 
     let mut dest_buf = [0u8; NS_PATH_MAX];
     let dest: Option<&[u8]> = match op {
-        ResolveOp::Rename { dest_ptr, dest_len, .. } => {
+        Resolve::Rename { dest_ptr, dest_len, .. } => {
             let d = copy_ns_path(dest_ptr, dest_len, &mut dest_buf)?;
             validate_path(d).map_err(|_| KError::InvalidArgument)?;
             Some(d)
@@ -943,22 +909,6 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
         drop(crate::sched::complete_lookup(&po_ref, status, parked));
     }
     Ok(po_h.bits() as isize)
-}
-
-impl ResolveOp {
-    /// The request the wire carries, or the refusal of a size or flags it cannot: a size past
-    /// `u32::MAX` is `TooLarge`, not that size modulo 2^32.
-    fn forward_op(self) -> Result<ForwardOp, KError> {
-        Ok(match self {
-            ResolveOp::Plain => ForwardOp::Plain,
-            ResolveOp::Size(size, change) => {
-                ForwardOp::Size(u32::try_from(size).map_err(|_| KError::TooLarge)?, change)
-            }
-            ResolveOp::Rename { flags, .. } => {
-                ForwardOp::Rename { flags: u16::try_from(flags).map_err(|_| KError::InvalidArgument)? }
-            }
-        })
-    }
 }
 
 /// What a lookup completes its PO with: a status and, on success, the object and rights its
@@ -1446,104 +1396,6 @@ fn complete_resolve_reply(
     Ok(0)
 }
 
-/// `sys_file_sync(handle)` — flush a writable file mapping's resident pages to the device.
-/// Requires `MAP_WRITE` on the `FileObject` handle. Blocks on the write IRPs (async-first-exempt
-/// on a syscall thread). `0` on success, else a `KError`.
-fn sys_file_sync(handle: u64) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-    let file = lookup_as::<FileObject>(handle, pid, Rights::MAP_WRITE)?;
-    write_back(&file)?;
-    Ok(0)
-}
-
-/// Write one file's pages back, tell its server, and unpin it if no writable mapping appeared.
-fn write_back(file_obj: &Ref<FileObject>) -> Result<(), KError> {
-    let mark = file_obj.clean_mark();
-    match FileObject::writeback(file_obj) {
-        crate::object::file_object::WriteBack::Written => {}
-        crate::object::file_object::WriteBack::Failed => return Err(KError::IoError),
-        // **Its device has gone**: nothing will take these pages, so the file is let go.
-        crate::object::file_object::WriteBack::Gone => {
-            let pages = FileObject::let_go(file_obj);
-            crate::kprintln!("file: its device has gone; a dirty file and its {pages} page(s) let go, unwritten");
-            return Err(KError::PeerClosed);
-        }
-    }
-    // Under Model A the server does not know the data landed: tell it (best-effort, unwaited).
-    notify_file_touched(file_obj);
-    if let Some(mark) = mark {
-        FileObject::unpin_if_clean(file_obj, mark);
-    }
-    Ok(())
-}
-
-/// `sys_ns_sync(ns, path, path_len)` — **write back every dirty file** cached under the
-/// registration `path` resolves through in `ns`, whether or not anything still holds it (a
-/// writer that exits without syncing leaves its file dirty and pinned). Needs `LOOKUP` on `ns`:
-/// it changes no file, only makes what was written durable;
-/// `path` must resolve to a userspace server's binding, else `Unsupported`. Returns how many
-/// files were written. **Blocks** on the write IRPs in the calling thread, like `sys_file_sync`.
-fn sys_ns_sync(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-    let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;
-    let mut buf = [0u8; NS_PATH_MAX];
-    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
-    validate_path(path).map_err(|_| KError::InvalidArgument)?;
-    let reg = match ns.resolve(path) {
-        Some((ResolvedTarget::UserspaceServer(reg, _), _, _)) => reg,
-        Some(_) => return Err(KError::Unsupported),
-        None => return Err(KError::NotFound),
-    };
-    let files = reg.cache_objects().map_err(|_| KError::OutOfMemory)?;
-    let mut written = 0isize;
-    let mut result = Ok(());
-    for f in files.iter() {
-        if !f.is_dirty() {
-            continue;
-        }
-        match write_back(f) {
-            Ok(()) => written += 1,
-            Err(e) => result = Err(e),
-        }
-    }
-    drop(files);
-    drop(reg);
-    result.map(|()| written)
-}
-
-/// `sys_ns_held(ns, path, path_len)` — **how many of a mount's files something still holds**
-/// (a handle, mapping, IRP in flight or dirty pin; the cache holds its objects weakly): the
-/// live page-cache objects of the registration `path` resolves through in `ns`, a forgotten
-/// file's aside. **Asked after [`sys_ns_sync`]**, what is left is held by someone; the storage
-/// service refuses an unmount while it is not zero.
-///
-/// **A finished IRP's reference is released first** (its box is freed only in thread context,
-/// [`crate::io::block::reclaim_completed`]), or the first unmount after a write was refused.
-/// Exact except for an IRP whose completion is still running on another CPU: that file is
-/// counted ([`storage.md`](../../docs/architecture/storage.md) §6).
-///
-/// Needs `LOOKUP`. `Unsupported` if `path` resolves to anything but a userspace server,
-/// `NotFound` if to nothing. It does not block.
-fn sys_ns_held(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-    let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;
-    let mut buf = [0u8; NS_PATH_MAX];
-    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
-    validate_path(path).map_err(|_| KError::InvalidArgument)?;
-    let reg = match ns.resolve(path) {
-        Some((ResolvedTarget::UserspaceServer(reg, _), _, _)) => reg,
-        Some(_) => return Err(KError::Unsupported),
-        None => return Err(KError::NotFound),
-    };
-    crate::io::block::reclaim_completed();
-    // Taken under the cache's lock, dropped after: each may be the last and `Drop` takes it.
-    let files = reg.cache_objects().map_err(|_| KError::OutOfMemory)?;
-    let held = files.len() as isize;
-    drop(files);
-    drop(reg);
-    Ok(held)
-}
-
 /// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt or reset
 /// the machine ([`crate::power`]). Needs `WRITE` on a
 /// [`SystemControl`](crate::object::SystemControl), which only `init` holds; `op` is
@@ -1559,30 +1411,6 @@ fn sys_power(sc_h: u64, op: u64) -> SysResult {
     let what = if op == PowerOp::Halt { "halt" } else { "reboot" };
     crate::kprintln!("power: pid {pid} asks to {what}");
     crate::power::power(op)
-}
-
-/// Send `File::Touch` for a just-flushed Model A file so its server can stamp `mtime`. Stamps
-/// on **sync**, not on the write (no per-page dirty bit, `TODO(page-dirty-tracking)`). Silent
-/// on failure: the data is durable, and a dropped touch costs only a stale `mtime`.
-fn notify_file_touched(file_obj: &Ref<FileObject>) {
-    use crate::libkern::KBox;
-    use crate::object::FileObject;
-
-    let Some((reg, file_id)) = FileObject::touch_target(file_obj) else {
-        return; // not a cached Model A file — nothing to notify
-    };
-    // Heap-bounced: a 4 KiB `StoredMsg` does not belong on a measured kernel stack.
-    // Zeroed in place: the by-value form would put 4 KiB in this frame, on a sync path that is
-    // already among the deepest in the kernel.
-    let Ok(mut msg) = KBox::<crate::object::ipc_channel::StoredMsg>::try_new_zeroed() else {
-        return;
-    };
-    let Some(body_len) = crate::rsproto::build_touch_request(&mut msg.payload, file_id) else {
-        return;
-    };
-    msg.header.payload_len = body_len as u32;
-    msg.header.handle_count = 0;
-    crate::sched::us_forward_notify(&reg, &mut msg);
 }
 
 /// Build a lazy [`FileObject`] for an `OBJECT_KIND_FILE` resolve reply; returns what the lookup's
@@ -1866,8 +1694,10 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
 }
 
 mod fill;
+mod flush;
 mod mappable;
 mod memory;
+mod resolve;
 mod send;
 mod spawn;
 mod submit;

@@ -26,9 +26,13 @@ fn sized(ns: &Handle<Namespace, NsMutable>, path: &str, size: u64) {
 
 /// What `f` returns, and the resolves it made: the model answers each at once, in one wait.
 fn resolves<R>(f: impl FnOnce() -> R) -> (R, u32) {
-    let before = mock::counts().1;
+    let waits = || {
+        let flushes = mock::submitted().iter().filter(|op| op.opcode == libkern::IO_OPCODE_FLUSH).count();
+        mock::counts().1 - flushes as u32
+    };
+    let before = waits();
     let r = f();
-    (r, mock::counts().1 - before)
+    (r, waits() - before)
 }
 
 /// What `f` returns, and whether it left a handle open or a file mapped.

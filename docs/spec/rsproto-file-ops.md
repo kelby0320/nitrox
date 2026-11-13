@@ -201,8 +201,8 @@ and it asks for nothing back.
 It exists because of Model A. The kernel owns the file-data path, so an in-place,
 **same-length** overwrite travels from the page cache to the device with no resolve and no
 IPC at all: the server has no way to observe that the file changed, and its `mtime` would
-keep reporting the last *size* change. After flushing such a file (`sys_file_sync`), the
-kernel names it to the server, and the server stamps the modification time.
+keep reporting the last *size* change. After flushing such a file (`sys_io_submit`'s `Flush` on
+it), the kernel names it to the server, and the server stamps the modification time.
 
 Two properties are deliberate:
 

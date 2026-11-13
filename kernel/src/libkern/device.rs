@@ -213,6 +213,11 @@ crate::libkern::pod::pod!(DeviceRecord {
 });
 
 const _: () = assert!(size_of::<DeviceRecord>() == 144);
+const _: () = assert!(offset_of!(DeviceRecord, subclass) == 29);
+const _: () = assert!(offset_of!(DeviceRecord, prog_if) == 30);
+const _: () = assert!(offset_of!(DeviceRecord, revision) == 31);
+const _: () = assert!(offset_of!(DeviceRecord, dev) == 35);
+const _: () = assert!(offset_of!(DeviceRecord, flags) == 39);
 const _: () = assert!(align_of::<DeviceRecord>() == 8);
 const _: () = assert!(offset_of!(DeviceRecord, id) == 0);
 const _: () = assert!(offset_of!(DeviceRecord, class) == 4);
@@ -346,6 +351,7 @@ pub struct IoHeader {
 crate::libkern::pod::pod!(IoHeader { magic, version, count, record_size, cache });
 
 const _: () = assert!(size_of::<IoHeader>() == 80);
+const _: () = assert!(offset_of!(IoHeader, version) == 4);
 const _: () = assert!(align_of::<IoHeader>() == 8);
 const _: () = assert!(offset_of!(IoHeader, magic) == 0);
 const _: () = assert!(offset_of!(IoHeader, count) == 8);
@@ -380,6 +386,10 @@ pub struct IoRecord {
 crate::libkern::pod::pod!(IoRecord { id, flags, reads, writes, flushes, errors, read_bytes, written_bytes, busy_ns });
 
 const _: () = assert!(size_of::<IoRecord>() == 64);
+const _: () = assert!(offset_of!(IoRecord, writes) == 16);
+const _: () = assert!(offset_of!(IoRecord, flushes) == 24);
+const _: () = assert!(offset_of!(IoRecord, errors) == 32);
+const _: () = assert!(offset_of!(IoRecord, written_bytes) == 48);
 const _: () = assert!(align_of::<IoRecord>() == 8);
 const _: () = assert!(offset_of!(IoRecord, id) == 0);
 const _: () = assert!(offset_of!(IoRecord, flags) == 4);

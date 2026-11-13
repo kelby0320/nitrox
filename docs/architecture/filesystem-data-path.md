@@ -4,7 +4,7 @@
 with deferrals (a periodic writeback daemon, per-page dirty tracking) marked inline. Verified
 2026-08-05; the writeback triggers corrected 2026-09-22, and a claim of dirty tracking that the
 code never had corrected 2026-09-24. **One object per file, dirty objects kept until a sync, and
-`sys_ns_sync`** built by administration Part C.1 (2026-09-24, § *One object per file*), with
+a mount's flush** built by administration Part C.1 (2026-09-24, § *One object per file*), with
 `File::Forget` for a file its server frees. A dirty file whose device has gone is let go (Phase 6
 Part D, 2026-10-06). **A second implementer, `fs-server-fat`**, maps in 512-byte sectors and names a
 file by its first cluster, and the kernel refuses a map it cannot use (Phase 6 Part E, 2026-10-06,
@@ -82,9 +82,9 @@ BlockRun {
   **Mutates the filesystem's metadata** (its allocator + its block map + the inode/dir-entry
   equivalent). **Deferred, and nothing calls it**: no `AllocRange` exists in the kernel or any
   server, and `writeback` skips a page over a hole rather than allocating for it — a file grows
-  through `sys_file_grow`'s resolve, whose reply carries the new blocks. The op is designed for a
-  write-back that allocates, which dirty tracking would make possible (the Part C review,
-  2026-09-24, found this line describing it as current).
+  through a resolve carrying `RESOLVE_OP_GROW`, whose reply carries the new blocks. The op is
+  designed for a write-back that allocates, which dirty tracking would make possible (the Part C
+  review, 2026-09-24, found this line describing it as current).
 
 Naming is deliberately neutral: `MapRange`/`AllocRange`/`BlockRun`, not "extents." These are
 new **`Block`-category** ops (`0x03xx`) in the RS wire format (`docs/spec/rsproto-block-ops.md`).
@@ -147,7 +147,7 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   the file's order, up to the device's `max_frags` and at most `RUN_MAX_PAGES`, 256. Each run is
   decided under the object's lock as its IRP is issued (`begin_write`), so a `Forget` stops the
   write-back before its next run and a resize governs every run after it. A page over a hole
-  is skipped: growth goes through `sys_file_grow`'s resolve, not writeback. **A page over
+  is skipped: growth goes through a resolve carrying `RESOLVE_OP_GROW`, not writeback. **A page over
   `UNWRITTEN` blocks is not**: it is written to them like any other, since a write-back looks blocks
   up by `device_block_in`, which ignores the flag — the flag read as a hole would skip the write.
   **An ext4 unwritten extent is a different thing, and is a hole here** (Phase 6 Part H.1):
@@ -158,11 +158,12 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   IRPs that carried them and their time. Since Part H.4 an IRP carries a run of pages either way,
   so the fills count the pages they brought in as well (`/dev/registry/io` version 2). `/dev/registry/io` serves them beside
   the disks' counters, and the device manager's `io.tsm` as its `page-cache` row. **Two triggers:
-  `sys_file_sync`** on one file, an `msync`-style syscall, and **`sys_ns_sync`** on every dirty
-  file of a mount. Unmapping a `MAP_WRITE` VMA does *not* write back. After it, the kernel sends
-  the server `File::Touch` with the file's id, since an in-place write never reaches the server
-  any other way, and its `mtime` would not move. (This bullet said unmap was a trigger until
-  2026-09-22; it never was — PR #326 review.)
+  a file's flush** (`sys_io_submit` with `Flush`), an `msync`-style operation, and **a mount's
+  flush** (`RESOLVE_OP_FLUSH`) on every dirty file of it. Each runs on a kernel thread of its own
+  and completes its `PendingOperation`. Unmapping a `MAP_WRITE` VMA does *not* write back. After
+  it, the kernel sends the server `File::Touch` with the file's id, since an in-place write never
+  reaches the server any other way, and its `mtime` would not move. (This bullet said unmap was a
+  trigger until 2026-09-22; it never was — PR #326 review.)
 - **Shared device by capability**: the block device (`/dev/blk/N`, a kernel `DeviceNode`) is
   reachable by two handles — the fs-server keeps a read-write handle for **metadata** I/O, and
   the `FileObject` producer references the same device so the kernel can IRP **file data**
@@ -190,8 +191,8 @@ sync and a fresh resolve.
   at the start could write after its page's IRP read the frame, then go before the end. Until such
   a write-back, the object stays alive and in the cache, however soon its users let go, and the
   next resolve of the file finds it with its pages. **A writer that exits without syncing loses
-  nothing until the machine stops**: `sys_ns_sync` writes it, and **the storage service's unmount
-  calls it** before the filesystem is marked clean (administration Part C.5c,
+  nothing until the machine stops**: a mount's flush writes it, and **the storage service's unmount
+  runs one** before the filesystem is marked clean (administration Part C.5c,
   [`storage.md`](storage.md) §8). What is still owed is `init`'s own mounts, which only Part E's
   shutdown will unmount. Since a sync that begins with a writable mapping in place cannot clean,
   `libfs` and `nxsh` unmap before they sync. Otherwise every file they write would stay pinned
@@ -204,9 +205,9 @@ sync and a fresh resolve.
   registration. The sync answers `PeerClosed`. It is **not** marked dead, as a `Forget` marks a
   file: a dead file's fill reads a hole, and a fill from a departed disk must fail, not read zeros.
   Any other failure keeps the pin, for a later sync to try again.
-- **What still holds a file is countable**: `sys_ns_held` counts a registration's live cached
-  objects, after the finished IRPs have let go of theirs. Asked after a sync, a non-zero answer is
-  someone's handle or mapping, which is what an unmount is refused on.
+- **What still holds a file is countable**: a resolve carrying `RESOLVE_OP_HELD` counts a
+  registration's live cached objects, after the finished IRPs have let go of theirs. Asked after a
+  sync, a non-zero answer is someone's handle or mapping, which is what an unmount is refused on.
 - **A grow, create or truncate resizes the one object in place.** It is a resolve, and its reply
   carries the new size and map. What a page says stays honest across it. Everything past the
   smaller of the old and new sizes leaves the index, so no fault finds it and no write-back writes

@@ -104,9 +104,9 @@ the request and the kernel re-requests from the first uncovered block.
 ## AllocRange (`op = 0x0301`) — mutating
 
 **Deferred — specified, not implemented.** No `0x0301` exists in the kernel or any server: a file
-grows through `sys_file_grow`'s resolve, whose `FILE_BLOCKS` reply carries the new runs, and
-`writeback` skips a page over a hole. `MapRange` is likewise carried by the resolve reply today
-(`ext4-fs-server-rw.md` lists both standalone ops as deferred).
+grows through a resolve carrying `RESOLVE_OP_GROW`, whose `FILE_BLOCKS` reply carries the new
+runs, and `writeback` skips a page over a hole. `MapRange` is likewise carried by the resolve reply
+today (`ext4-fs-server-rw.md` lists both standalone ops as deferred).
 
 Allocate device blocks to back a range that is currently a hole / past EOF, insert them into
 the file, and return their runs. The kernel would call this when flushing dirty pages that

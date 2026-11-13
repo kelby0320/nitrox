@@ -98,11 +98,12 @@ says so with the server's reason, which `disk --mount` prints.
 and each link runs only once the one before it held:
 
 1. **The label leaves `fs`**, so nothing new resolves under it.
-2. **Every dirty file is written back** (`sys_ns_sync`), whether or not anything still holds it.
-3. **It is refused while a file is still held** (`sys_ns_held`): a handle or a mapping could
+2. **Every dirty file is written back** (a resolve carrying `RESOLVE_OP_FLUSH`), whether or not
+   anything still holds it.
+3. **It is refused while a file is still held** (`RESOLVE_OP_HELD`): a handle or a mapping could
    write after the filesystem is marked clean. The count is asked after the sync, and asked
    again after a few milliseconds before it is believed, because an IRP that just finished holds
-   its file until its completion ends (`syscall-abi.md` § `sys_ns_held`). **A refusal here leaves
+   its file until its completion ends (`syscall-abi.md` § `sys_ns_lookup`). **A refusal here leaves
    the mount exactly as it was.**
 4. **The server records the filesystem clean and exits**, on
    [`Meta::Unmount`](rsproto-wire-format.md). From here the mount is gone, whatever the answer. A

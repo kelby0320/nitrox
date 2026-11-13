@@ -32,6 +32,7 @@ use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::object::header::{Header, Ref, Shared, Weak, kobject};
 use crate::object::{FileObject, Forgotten, IpcChannel, PendingOperation};
 use crate::sched::{SchedCell, SchedToken};
+use crate::syscall::error::KError;
 
 /// Largest lookup suffix a [`PendingLookup`] stores inline (no allocation under `SCHED`). A
 /// longer one keeps its true `suffix_len` but a truncated buffer: harmless for an eager
@@ -45,7 +46,7 @@ pub const LOOKUP_SUFFIX_MAX: usize = 256;
 pub enum ForwardOp {
     /// A plain lookup.
     Plain,
-    /// A size change first (`sys_file_create` / `_grow` / `_truncate`).
+    /// A size change first (`RESOLVE_OP_CREATE` / `_GROW` / `_TRUNCATE`).
     Size(u32, crate::rsproto::SizeChange),
     /// A rename to the lookup's `dest`, with its `RENAME_*` flags.
     Rename {
@@ -166,11 +167,36 @@ pub struct UserspaceServerReg {
     /// held), and never taken inside a `FileObject`'s lock. **No reference is ever dropped
     /// under it**, since the last one would re-enter it from `FileObject::leave_cache`.
     files: SpinLock<KVec<CachedFile>>,
+    /// Ranked as `files` is, as it allocates while held; nothing is dropped under it.
+    flushes: SpinLock<Flushes>,
+}
+
+/// **How many flushes one mount runs at once**: a device that stopped holds up its own mount alone.
+pub const FILE_OPS_MAX: u32 = 16;
+
+/// **How many of a mount's flushes one process may have queued or running**, so no process holds
+/// the budget.
+pub const FILE_OPS_PER_PROCESS: u32 = 4;
+
+/// A flush of `file`, or of the whole mount with `None`, for process `pid`, answered through `po`.
+pub struct QueuedFlush {
+    /// The file, or `None` for every dirty file of the mount.
+    pub file: Option<Ref<FileObject>>,
+    /// The operation the flush completes.
+    pub po: Ref<PendingOperation>,
+    /// The process that asked.
+    pub pid: u32,
+}
+
+struct Flushes {
+    running: u32,
+    waiting: KVec<QueuedFlush>,
+    by_process: KVec<(u32, u32)>,
 }
 
 kobject!(UserspaceServerReg, closing = crate::sched::us_reg_detach);
-// SAFETY: a registration changes once shared only in `inner`, a `SchedCell`, and behind `files`'
-// lock.
+// SAFETY: a registration changes once shared only in `inner`, a `SchedCell`, and behind the locks
+// of `files` and `flushes`.
 unsafe impl Shared for UserspaceServerReg {}
 
 impl UserspaceServerReg {
@@ -191,8 +217,63 @@ impl UserspaceServerReg {
                 next_id: 1,
             }),
             files: SpinLock::new(LockRank::Registry, KVec::new()),
+            flushes: SpinLock::new(
+                LockRank::Registry,
+                Flushes { running: 0, waiting: KVec::new(), by_process: KVec::new() },
+            ),
         })
         .map(Ref::new)
+    }
+
+    /// **Admit `flush` to this mount's budget**: `Some` to run now, or `None`, queued behind the
+    /// flushes waiting before it. Past its process's share it is handed back `WouldBlock`.
+    pub fn admit_flush(&self, flush: QueuedFlush) -> Result<Option<QueuedFlush>, (KError, QueuedFlush)> {
+        let mut g = self.flushes.lock();
+        let at = g.by_process.iter().position(|&(pid, _)| pid == flush.pid);
+        if at.is_some_and(|i| g.by_process[i].1 >= FILE_OPS_PER_PROCESS) {
+            return Err((KError::WouldBlock, flush));
+        }
+        let run = g.running < FILE_OPS_MAX && g.waiting.is_empty();
+        let room = run || g.waiting.try_reserve(1).is_ok();
+        let counted = match at {
+            Some(i) => {
+                g.by_process[i].1 += 1;
+                true
+            }
+            None => room && g.by_process.try_push((flush.pid, 1)).is_ok(),
+        };
+        if !room || !counted {
+            if counted {
+                Self::uncount(&mut g, flush.pid);
+            }
+            return Err((KError::OutOfMemory, flush));
+        }
+        if run {
+            g.running += 1;
+            return Ok(Some(flush));
+        }
+        g.waiting.push_within_capacity(flush).map(|()| None).map_err(|f| (KError::OutOfMemory, f))
+    }
+
+    /// **A flush of `pid`'s is done**: its share given back, and its place handed to the flush
+    /// waiting longest, returned to be run, or given back if none waits.
+    pub fn flush_done(&self, pid: u32) -> Option<QueuedFlush> {
+        let mut g = self.flushes.lock();
+        Self::uncount(&mut g, pid);
+        if g.waiting.is_empty() {
+            g.running = g.running.saturating_sub(1);
+            return None;
+        }
+        Some(g.waiting.remove(0))
+    }
+
+    fn uncount(g: &mut Flushes, pid: u32) {
+        if let Some(i) = g.by_process.iter().position(|&(p, _)| p == pid) {
+            g.by_process[i].1 -= 1;
+            if g.by_process[i].1 == 0 {
+                g.by_process.remove(i);
+            }
+        }
     }
 
     // --- The file cache (its own lock; never under `SCHED`) --------------

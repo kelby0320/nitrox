@@ -36,10 +36,10 @@ it fit for supervisors and PID 1 (decision log, 2026-10-27). `eshell` and `libhe
 cannot express; `tools/xtask/raw-syscalls.toml` lists them.
 
 **It is written to the syscall surface Part E ends with** (`docs/planning/syscall-surface.md`),
-over today's calls, so a caller is written once: `Namespace::flush` and `fs::flush` are `async`
-though today's calls answer within themselves, `Spawn::path` hands the kernel a file it reads
-within the spawn, and `entropy::fill` makes a source for each call. Each is
-`TODO(surface-shape)`, and changes underneath as its sub-part lands.
+over today's calls, so a caller is written once: `Spawn::path` hands the kernel a file it reads
+within the spawn, and `entropy::fill` makes a source for each call. Each is `TODO(surface-shape)`,
+and changes underneath as its sub-part lands. The flushes were the first: each is now an operation,
+a resolve's for a mount and an `io_submit`'s for a file, run on a kernel thread of its own.
 
 ## Handles: owned, borrowed, and in flight
 
@@ -82,7 +82,7 @@ gives one out once.
 | `memory` | `Handle<Memory, MapReadWrite>::create`, and `map(len) -> Mapping<M>` on memory or a file |
 | `channel` | `Msg`, and a `Channel` endpoint's `pair`, `send`, `send_held`, `send_by` and `recv` |
 | `wait` | `WaitSet<N>`, borrowing up to `N` handles or operations, and `Signalled`, which of them a wait found |
-| `ns` | a namespace's `create`, `lookup`, `start_lookup`, `copy`, `bind`, `bind_server`, `unbind`, `bindings`, `flush` and `held` |
+| `ns` | a namespace's `create`, `lookup`, `start_lookup`, `copy`, `bind`, `bind_server`, `unbind`, `bindings`, `flush`, `flush_by` (a deadline) and `held` |
 | `fs` | `create`, `grow`, `truncate`, `rename` and `flush`: a file by path |
 | `process` | `Spawn`, by image or by path, and `exit` |
 | `thread` | `Stack`, `start` and `start_on`, a mask of CPUs, the calling thread's `exit`, and a thread suspended on a fault: its `fault_registers`, and `settle`, to resume it or end it |
@@ -93,6 +93,10 @@ gives one out once.
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
 | `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |
 | `io` | a `Resource`'s `read` and `write`, and a notification queue's `recv` |
+
+**A flush refused `WouldBlock`**, its process already running or waiting with its share of the
+mount's flushes, is slept on and asked again, to the caller's deadline; `flush_by` gives up a flush
+itself at its deadline, `TimedOut`, and leaves it to finish with no one waiting.
 
 **A `Mapping` lends no reference to its bytes.** Another process mapping the same object, or a
 device the kernel lent it to, may write them at any time, and a Rust reference promises nothing
@@ -167,7 +171,11 @@ a held send's.
   `OutOfMemory` (the PO's waiter queue full) is slept on and tried again; any other refusal is
   for good. A lookup waits for nothing, since the kernel releases a lookup whose PO is closed
   unread; but a wait that read the PO has installed its handle, so the drop polls once and
-  closes the handle a successful lookup reports.
+  closes the handle a successful lookup reports. **An op that names no buffer**, a flush among
+  them, waits for nothing either, as it lends nothing.
+- **`abandon(buffer)`** closes an unfinished I/O unwaited, taking the buffer it borrowed by value
+  and closing it too: the kernel's operation holds its own references, so what it still touches
+  is no one else's.
 
 **`block_on` — the single-threaded reactor.** Alloc-free; drives one future to
 completion:

@@ -38240,3 +38240,31 @@ Part J's fifteenth sub-part, `typed-layers.md` § J.15, built on `pre-phase-7/pa
   it before (the maintainer's call, 2026-11-13).
 - After review (`51a704fe`): a page no user may reach is never faulted in, and a copy's page the kernel
   has no memory to back reads as a bad address, said in the spec and deferred (`copy-fault-oom`).
+
+## 2026-11-13 — Before Phase 7, E.7: a resolve carries its operation; a flush, a PO
+
+E.6 merged, #439. E.7, `syscall-surface.md` § E.7, built on `pre-phase-7/part-e7-resolve-op`.
+
+- **A resolve carries its operation**: `sys_ns_lookup`'s fifth argument points at a `ResolveOp`,
+  null for a plain lookup, and create, grow, truncate, rename, flush and held are its codes. Seven
+  syscalls go, their numbers left to E.11's renumbering.
+- **No syscall waits on a device for a flush any more**: a mount's flush, and a file's, now
+  `io_submit(file, Flush)` (kmem-30), each run on a kernel thread of its own that lets go of what it
+  holds before it completes its PO, so a held asked after counts none of it. **Sixteen a mount**,
+  and one past them refused `WouldBlock` at once: a device that stopped answering fills its own
+  mount's budget, and no other. `sys_process_spawn`'s image read and `sys_power`'s flush still wait
+  inside themselves.
+- **So a supervisor can give up on a flush**: `init` and the storage service wait 60 s, and `init`
+  sends no `Meta::Unmount` after a flush that did not finish, which would record the filesystem
+  clean over what was not written. libos sleeps on a `WouldBlock` and asks again to the caller's
+  deadline, and `Op::abandon` closes an I/O unwaited, its buffer with it.
+- Departures, for the maintainer's eye: a flush's or held's resolution errors come through the PO;
+  the flush job is tested on a host thread, as a host test cannot start a kernel thread, and so is
+  "a held straight after a flush answers 0", which a boot could not catch; and the resolve decoding
+  and the mock's resolves moved to files of their own. The flush syscalls moved first (`8fcba821`);
+  the rest is `d9390cbf`.
+- After review (`bfe2c7a7`), **a flush past a mount's sixteen waits its turn, and a process may have
+  four of a mount's flushes running or waiting** (the maintainer's call): a refused-and-retried
+  budget let one process starve every other flush on a mount. A file's flush counts in its mount's
+  budget forgotten or not; a flush or held asks for no rights. The supervisors' 60 s bounding a
+  whole mount's write-back is deferred (`flush-progress-bound`, the maintainer's call).

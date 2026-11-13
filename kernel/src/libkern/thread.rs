@@ -56,6 +56,7 @@ const _: () = assert!(core::mem::offset_of!(ThreadArgs, class) == 24);
 const _: () = assert!(core::mem::offset_of!(ThreadArgs, rt_priority) == 25);
 const _: () = assert!(core::mem::offset_of!(ThreadArgs, nice) == 26);
 const _: () = assert!(core::mem::offset_of!(ThreadArgs, cpu_affinity) == 27);
+const _: () = assert!(core::mem::offset_of!(ThreadArgs, _reserved) == 28);
 
 #[cfg(test)]
 mod tests {

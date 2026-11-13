@@ -369,6 +369,10 @@ crate::libkern::pod::pod!(NsEntry { path_len, kind, rights, path });
 
 const _: () = assert!(core::mem::size_of::<NsEntry>() == 16 + NS_ENTRY_PATH_MAX);
 const _: () = assert!(core::mem::align_of::<NsEntry>() == 8);
+const _: () = assert!(core::mem::offset_of!(NsEntry, path_len) == 0);
+const _: () = assert!(core::mem::offset_of!(NsEntry, kind) == 4);
+const _: () = assert!(core::mem::offset_of!(NsEntry, rights) == 8);
+const _: () = assert!(core::mem::offset_of!(NsEntry, path) == 16);
 
 impl NsEntry {
     /// An all-zero entry (the kernel fills it before copy-out).

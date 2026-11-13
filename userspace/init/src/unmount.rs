@@ -2,7 +2,24 @@
 //! the answer read back (`docs/spec/rsproto-wire-format.md` § Meta::Unmount). **Hand-built and
 //! hand-parsed**, as [`ready`](crate::ready) is, to keep `librsproto` out of init's build.
 
+use libkern::KError;
+use libos::{CanLookup, Carried, Channel, Deadline, Msg, Namespace, Only, Ref};
+
 use crate::ready::{ERROR_BODY_LEN, FLAG_ERROR, HEADER_LEN, RS_MAGIC};
+
+/// **Flush the mount at `mount_point` by `deadline`, then ask its server to unmount**: whether the
+/// request was sent. A flush that did not finish sends nothing, or it would be recorded clean.
+pub fn flush_then_ask<'a, M: CanLookup + 'a>(
+    ns: impl Into<Ref<'a, Namespace, M>>,
+    mount_point: &str,
+    control: Ref<'_, Channel, Only>,
+    deadline: Deadline,
+) -> Result<bool, KError> {
+    ns.into().flush_by(mount_point, deadline).map_err(|e| e.code())?;
+    let mut msg = Msg::new();
+    let request = request(msg.payload_mut(), 1).and_then(|n| msg.set_len(n).ok());
+    Ok(request.is_some() && control.send(&msg, &mut Carried::new()).is_ok())
+}
 
 /// The `Meta::Unmount` op.
 pub const OP_UNMOUNT: u16 = 0x0005;
@@ -68,8 +85,31 @@ fn u32_at(b: &[u8], off: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libos::{Handle, NsMutable, mock};
     use librsproto::error::error_body;
     use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
+
+    #[test]
+    fn a_mount_whose_flush_did_not_finish_is_not_asked_to_unmount() {
+        mock::reset();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        mock::mount("/m", 1, 0);
+        let (ours, theirs) = Handle::<Channel, Only>::pair(4).unwrap();
+        let asked = || theirs.recv(&mut Msg::new()).is_ok();
+        let soon = || Deadline::after(5_000_000).unwrap();
+        mock::fail_next_sync(KError::IoError as i32);
+        assert_eq!(flush_then_ask(&ns, "/m", (&ours).into(), soon()), Err(KError::IoError));
+        assert!(!asked(), "a failed flush");
+        mock::flushes_never_finish();
+        assert_eq!(flush_then_ask(&ns, "/m", (&ours).into(), soon()), Err(KError::TimedOut));
+        assert!(!asked(), "a flush out of time");
+        mock::reset();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        mock::mount("/m", 1, 0);
+        let (ours, theirs) = Handle::<Channel, Only>::pair(4).unwrap();
+        assert_eq!(flush_then_ask(&ns, "/m", (&ours).into(), soon()), Ok(true));
+        assert!(theirs.recv(&mut Msg::new()).is_ok(), "a finished flush is followed by the request");
+    }
 
     #[test]
     fn the_request_decodes_as_an_unmount() {

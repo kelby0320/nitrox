@@ -517,6 +517,62 @@ full on a stopped stick, and a flush of another mount going through; through lib
 abandon returning at its deadline and a `WouldBlock` retried; a failed flush at shutdown, with no
 `Meta::Unmount`. Author; `/pr-review`.
 
+**Built 2026-11-13** (`8fcba821` moves the flush syscalls to `syscall/table/flush.rs`; `d9390cbf`
+the rest).
+- **`sys_ns_lookup(ns, path, len, rights, op)`**: a `ResolveOp` of 32 bytes, codes 1 to 6, a field
+  its code does not use refused, `abi-sync-check`'s "resolve operations" family holding the codes to
+  libkern's. `file_grow`, `file_create`, `file_truncate`, `file_rename`, `ns_sync`, `ns_held` and
+  `file_sync` are gone, seven numbers that answer `Unsupported` until E.11 numbers the surface
+  again.
+- **A flush runs on a kernel thread of its own**, a `sched::Job` that owns its file or registration,
+  its place and its PO, and lets go of the first two before it completes the third. **A mount runs
+  sixteen at once** (`FILE_OPS_MAX`), counted on its registration, and one past them is refused
+  `WouldBlock` before anything is made. `Held` is complete when the call returns.
+- **kmem-30**: a file's flush is `io_submit(file, Flush)`, needing `MAP_WRITE`; `io-operation.md`
+  says it apart from a device's.
+- **libos**: `Namespace::flush_by(path, deadline)`; a `WouldBlock` slept on and asked again to the
+  caller's deadline; `Op::abandon(buffer)`; and an op that names no buffer is a status, whose drop
+  waits for nothing.
+- **`init` and the storage service flush by a 60 s deadline** (`FLUSH_TIMEOUT_NS`), and `init` sends
+  no `Meta::Unmount` after a flush that failed, was refused or ran out of time.
+- **For the maintainer's eye: four departures from the plan.**
+  1. **A flush's or held's resolution errors come through the PO**, as a lookup's do: a path to no
+     server is `NotFound` there, and to a server not in userspace `Unsupported`.
+  2. **"A flush that does not return before its write-back, by a slowed device in a host test"** is
+     not a host test: a host test cannot start a kernel thread. The job's run is tested on a host
+     thread, and the gates run the real one.
+  3. **"`Held` asked straight after a flush's PO, answering 0" is that host test**, not a boot's: on
+     a boot the wrong order would let go a few microseconds after it completes, before any caller
+     could ask.
+  4. **The kernel and libos mocks split by responsibility** to stay within their sizes: the resolve
+     decoding to `syscall/table/resolve.rs`, the mock's resolves to `sys/mock/resolve.rs`.
+
+**The controls**: nine mutations each fail their test: a budget one past sixteen; the PO completed
+before the job lets go of its file and place, or of its place alone, 50 ms between; a `ResolveOp`'s
+unused field let through; `submit_flush`'s `MAP_WRITE` check removed, when the test reaches a kernel
+thread's start, which a host cannot run; an `abandon` that waits; an op naming no buffer waited on;
+a `WouldBlock` not asked again; and `init` asking a mount to unmount after a failed flush.
+`abi-sync-check` finds a resolve code changed on one side. **All 18 CI gates pass under KVM**;
+`check-shutdown` holds `init`'s flush, then its clean unmount, and `check-media` a pulled stick's.
+
+**After review** (`bfe2c7a7`):
+- **A flush past a mount's sixteen waits its turn**, first come first served, and a thread that
+  finishes one runs the next; **a process may have four of a mount's flushes running or waiting**,
+  and only one past them is refused `WouldBlock` (the maintainer's call). Before, any process could
+  keep all sixteen and make every other flush on the mount poll for ever, `auth-service`'s among
+  them.
+- **A file's flush counts in its mount's budget forgotten or not, and whatever its id**: it takes
+  its place from its producer's registration. A file with no device behind it answers `IoError` at
+  once.
+- **The ordering the spec promises is pinned deterministically**: a flush's work, its file let go
+  and its place passed on, is a function the test calls before anything completes.
+- **A flush and a held ask for no rights**, and act on the server their path's binding names, as
+  the spec now says.
+- Every ABI mirror's field is pinned by an offset assert on both sides, `ResolveOp`'s first.
+- `Op::abandon` closes unwaited only the buffer the I/O names, and waits out any other.
+- **Deferred**: the supervisors' 60 s bounds a whole mount's write-back, not one command
+  (`flush-progress-bound`), as the dirty set left at a stop is what mapping writers left unflushed.
+
 ### E.8 Files as resources, a copy, and spawn
 
 **`Read` and `Write` on a `FileObject`**, the first resources that are not devices:

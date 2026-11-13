@@ -50,7 +50,7 @@ pub use handle::{
     Resource, Thread, Timer, WriteOnly,
 };
 pub use memory::Mapping;
-pub use ns::{Bindings, Lookup};
+pub use ns::{Bindings, FLUSH_TIMEOUT_NS, Lookup};
 pub use process::{Refused, Spawn, exit, spawn};
 pub use thread::thread_create;
 pub use time::Deadline;

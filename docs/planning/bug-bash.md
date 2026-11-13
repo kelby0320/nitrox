@@ -2187,7 +2187,7 @@ Found 11, refuted by a boot 0, reported 11.
   **Later**, in Part E.
   Fixed in `293f330a`, Part E.6; fails with the two holds back, 2 ms apart:
   `two_maps_placed_anywhere_at_once_never_meet`.
-- [ ] **kmem-30** `kernel/src/syscall/table.rs:2188` — `sys_file_sync` is a per-kind verb: its name
+- [x] **kmem-30** `kernel/src/syscall/table.rs:2188` — `sys_file_sync` is a per-kind verb: its name
   and `lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)` bind it to
   FileObject, beside `sys_ns_sync` and the per-kind memory calls, where the project prefers a few
   object-generic calls. Any other object that will need a durability point (a block device, a
@@ -2195,6 +2195,9 @@ Found 11, refuted by a boot 0, reported 11.
   handles. A design note rather than a failure, worth listing in the syscall-surface work.
   Unverified: nothing to run; the maintainer's call on whether the syscall-surface work takes it
   up. Architecture. Low. **Later**, in Part E.
+  Fixed in `d9390cbf`, Part E.7: a file's flush is `io_submit(file, Flush)`, and a mount's a
+  resolve's operation; `submit_flush`'s rights are pinned by
+  `a_files_flush_needs_map_write_and_names_nothing_else`.
 
 What held up: `user_access.rs` copy primitives check `addr+len` with `checked_add` against
 `USER_VIRT_END` (equal to the canonical boundary), handle zero-sized `T`, bound `copy_cstr` by the
