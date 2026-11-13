@@ -110,6 +110,15 @@ impl Reader {
         Reader::over(EventRing::new())
     }
 
+    /// **Ready for another device**: its ring emptied and the device not gone, its hand-off kept,
+    /// so a read lent to the DPC is given back where it was lent. A read still parked, the last
+    /// device's, is handed back to be refused.
+    pub fn renew(&mut self) -> Option<ParkedRead> {
+        self.ring = EventRing::new();
+        self.retired = false;
+        self.read.take_parked()
+    }
+
     /// **Events from the interrupt path**, pushed as one group, or dropped once the device has
     /// gone: a retired node's ring ends with the releases its departure pushed. Whether they
     /// were pushed.

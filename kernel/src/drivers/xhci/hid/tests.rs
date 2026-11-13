@@ -228,6 +228,28 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     assert!(!nodes.current(context(MAX_NODES + 1, 0)), "no such slot");
 }
 
+/// **A slot reused while the DPC delivers to its last node's read gets the read back**: its reader
+/// is renewed in place, so the loan is given back where it was lent, and the new node parks a read
+/// once it has been reclaimed.
+#[test]
+fn a_slot_reused_while_its_read_is_lent_gets_the_read_back() {
+    init_global_heap();
+    let nodes = Nodes::new();
+    for _ in 0..MAX_NODES {
+        nodes.take(true).unwrap();
+    }
+    let buf = Ref::new(crate::object::MemoryObject::try_new(crate::mm::PAGE_SIZE).unwrap());
+    let po = || Ref::new(crate::object::PendingOperation::try_new().unwrap());
+    let read = |po: &Ref<_>, epoch| nodes.read(&buf, po, 0, INPUT_EVENT_LEN as u64, context(0, epoch), 0);
+    assert_eq!(read(&po(), 0), Ok(()));
+    let (loan, _) = nodes.push(0, 0, &[InputEvent::key(30, KEY_PRESS, 1)], &mut [0u8; DRAIN_MAX], 0).unwrap();
+    nodes.retire(0, |_| {}, 0);
+    assert_eq!(nodes.take(true), Some((0, 1)), "the retired slot reused");
+    nodes.readers[0].lock().owe(loan);
+    assert_eq!(read(&po(), 1), Ok(()));
+    assert!(nodes.readers[0].lock().has_parked(), "the new node's read parked");
+}
+
 /// **A report the DPC pushes after its device departed is dropped**, under the node's lock: once
 /// the node has retired, so its releases stay the last thing its ring holds, and once the slot is
 /// another device's, whose ring it is not.

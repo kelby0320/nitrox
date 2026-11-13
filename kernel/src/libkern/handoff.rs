@@ -20,6 +20,8 @@ pub struct Handoff<T, const N: usize = 1> {
 pub struct Loan<T> {
     value: Option<T>,
     slot: usize,
+    /// The address of the `Handoff` that lent it, which stays where it is while it lends.
+    from: usize,
 }
 
 impl<T, const N: usize> Handoff<T, N> {
@@ -72,15 +74,20 @@ impl<T, const N: usize> Handoff<T, N> {
         let Slot::Parked(value) = core::mem::replace(&mut self.slots[slot], Slot::Lent) else {
             unreachable!("only a parked slot is lent")
         };
-        Loan { value: Some(value), slot }
+        Loan { value: Some(value), slot, from: self.address() }
+    }
+
+    fn address(&self) -> usize {
+        core::ptr::from_ref(self).addr()
     }
 
     /// **Give `loan` back**, owed to thread context. A loan from elsewhere is leaked, as dropping it
     /// here is what this type prevents.
     pub fn give_back(&mut self, mut loan: Loan<T>) {
         let value = loan.value.take();
+        let here = loan.from == self.address();
         match self.slots.get_mut(loan.slot) {
-            Some(slot @ Slot::Lent) => *slot = value.map_or(Slot::Empty, Slot::Owed),
+            Some(slot @ Slot::Lent) if here => *slot = value.map_or(Slot::Empty, Slot::Owed),
             _ => {
                 core::mem::forget(value);
                 debug_assert!(false, "a loan given back where it was not lent");

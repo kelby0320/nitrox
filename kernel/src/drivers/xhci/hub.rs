@@ -707,7 +707,7 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
         let c = x.cmd.lock();
         c.mem.phys().as_u64() + c.ring.next_slot() as u64 * 16
     };
-    let armed = armed::arm(&po, x, |c| install(&x.waiting, Awaited::Command { trb: sent }, c))?;
+    let armed = armed::arm(po, x, |c| install(&x.waiting, Awaited::Command { trb: sent }, c))?;
     {
         let mut c = x.cmd.lock();
         let CommandRing { mem, ring } = &mut *c;

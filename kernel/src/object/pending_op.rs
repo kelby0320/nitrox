@@ -219,7 +219,8 @@ mod tests {
     fn waiters_add_remove_take_caps_at_max() {
         let (p, mut tok) = fresh();
         let tok = &mut tok;
-        let ths: [*mut (); PendingOperation::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+        let ths: [*mut (); PendingOperation::MAX_WAITERS] =
+            core::array::from_fn(|i| core::ptr::without_provenance_mut(0x1000 + i));
         for &t in &ths {
             assert!(p.add_waiter(tok, t).is_ok());
         }

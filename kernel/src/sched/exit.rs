@@ -296,25 +296,39 @@ pub(super) fn drain_pending_drops(g: &mut SchedState, buf: &mut [Option<ObjectRe
 
 /// **The drivers' reclaims** of what their DPCs gave back, run by [`reap_pending`]: each joins once,
 /// at its driver's start.
-static RECLAIMS: SpinLock<[Option<Reclaim>; 4]> = SpinLock::new(LockRank::Leaf, [None; 4]);
+static RECLAIMS: Reclaims = Reclaims::new();
 
 /// A driver's reclaim.
 type Reclaim = fn();
 
-/// **Have [`reap_pending`] run `reclaim`**, in thread context; `false` if every place is taken.
-pub fn register_reclaim(reclaim: Reclaim) -> bool {
-    let mut r = RECLAIMS.lock();
-    let Some(slot) = r.iter_mut().find(|s| s.is_none()) else { return false };
-    *slot = Some(reclaim);
-    true
+/// A table of reclaims, four places.
+pub(super) struct Reclaims(SpinLock<[Option<Reclaim>; 4]>);
+
+impl Reclaims {
+    pub(super) const fn new() -> Reclaims {
+        Reclaims(SpinLock::new(LockRank::Leaf, [None; 4]))
+    }
+
+    /// `reclaim` in the first free place; `false` if every place is taken.
+    pub(super) fn register(&self, reclaim: Reclaim) -> bool {
+        let mut r = self.0.lock();
+        let Some(slot) = r.iter_mut().find(|s| s.is_none()) else { return false };
+        *slot = Some(reclaim);
+        true
+    }
+
+    /// Run every one registered, the table let go of first: a reclaim frees.
+    pub(super) fn run(&self) {
+        let reclaims = *self.0.lock();
+        for reclaim in reclaims.into_iter().flatten() {
+            reclaim();
+        }
+    }
 }
 
-/// Run every registered reclaim, the table let go of first: a reclaim frees.
-pub(super) fn run_reclaims() {
-    let reclaims = *RECLAIMS.lock();
-    for reclaim in reclaims.into_iter().flatten() {
-        reclaim();
-    }
+/// **Have [`reap_pending`] run `reclaim`**, in thread context; `false` if every place is taken.
+pub fn register_reclaim(reclaim: Reclaim) -> bool {
+    RECLAIMS.register(reclaim)
 }
 
 /// Drop every pending reaped thread and deferred-drop ref **outside** the run-queue lock, in
@@ -329,7 +343,7 @@ pub fn reap_pending() {
     // so the frees happen even with nothing else to reap.
     crate::io::block::reclaim_completed();
     // The char drivers park their completed reads for the same reason.
-    run_reclaims();
+    RECLAIMS.run();
     loop {
         // A batch a lock hold, on this stack; the loop goes round for the rest.
         let mut buf: [Option<ObjectRef>; 64] = [const { None }; 64];

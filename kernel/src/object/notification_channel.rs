@@ -224,7 +224,8 @@ mod tests {
         init_global_heap();
         let (obj, mut tok) = new_chan();
         let tok = &mut tok;
-        let ths: [*mut (); NotificationChannel::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+        let ths: [*mut (); NotificationChannel::MAX_WAITERS] =
+            core::array::from_fn(|i| core::ptr::without_provenance_mut(0x1000 + i));
         for &t in &ths {
             assert!(obj.add_waiter(tok, t).is_ok());
         }

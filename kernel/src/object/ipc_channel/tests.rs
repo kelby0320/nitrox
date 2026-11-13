@@ -128,7 +128,8 @@ fn waiters_add_remove_take_caps_at_max() {
     init_global_heap();
     let (a, b) = new_pair();
     let tok = &mut SchedToken::for_test();
-    let ths: [*mut (); IpcChannel::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+    let ths: [*mut (); IpcChannel::MAX_WAITERS] =
+        core::array::from_fn(|i| core::ptr::without_provenance_mut(0x1000 + i));
     for &t in &ths {
         assert!(a.add_waiter(tok, t).is_ok());
     }

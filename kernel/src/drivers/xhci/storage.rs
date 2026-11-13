@@ -564,7 +564,7 @@ impl Disks {
         let inflight = match dev.inflight.take().map(|c| c.owner) {
             Some(Owner::Irp { cmd, .. }) => Some(cmd.irp),
             // **Its waiter ends**, to find the device gone, rather than wait for a DPC that will not
-            // come.
+            // come. None is armed here: the hub thread, which departs devices, waits out its own.
             Some(Owner::Hub { completer }) => {
                 completer.complete(0, 0);
                 None

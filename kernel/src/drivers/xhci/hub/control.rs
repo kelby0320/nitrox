@@ -76,7 +76,7 @@ pub(super) fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 
         base + probe as u64 * 16
     };
     let transfer = Awaited::Transfer { slot, status: status_at };
-    let armed = armed::arm(&po, x, |c| install(&x.waiting, transfer, c))?;
+    let armed = armed::arm(po, x, |c| install(&x.waiting, transfer, c))?;
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, true));
     mem.ring.push(&mut slots, Trb::data_in(mem.data.phys().as_u64(), len as u32));
@@ -130,7 +130,7 @@ pub(in crate::drivers::xhci) fn control_out(
     let status_slot = if next + 1 == super::RING_TRBS - 1 { 0 } else { next + 1 };
     let status_at = base + status_slot as u64 * 16;
     let transfer = Awaited::Transfer { slot, status: status_at };
-    let armed = armed::arm(&po, x, |c| install(&x.waiting, transfer, c))?;
+    let armed = armed::arm(po, x, |c| install(&x.waiting, transfer, c))?;
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup(request, false));
     let at = mem.ring.push(&mut slots, Trb::status(false));
@@ -170,7 +170,7 @@ pub(in crate::drivers::xhci) fn control_out_data(
         base + probe as u64 * 16
     };
     let transfer = Awaited::Transfer { slot, status: status_at };
-    let armed = armed::arm(&po, x, |c| install(&x.waiting, transfer, c))?;
+    let armed = armed::arm(po, x, |c| install(&x.waiting, transfer, c))?;
     let mut slots = RingMem::of(&mem.ep0);
     mem.ring.push(&mut slots, Trb::setup_out(request));
     mem.ring.push(&mut slots, Trb::data_out(mem.data.phys().as_u64(), len as u32));

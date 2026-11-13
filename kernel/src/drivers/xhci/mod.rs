@@ -218,8 +218,8 @@ fn install(
 }
 
 impl Record for &Xhci {
-    fn take_back(&self) -> Option<Completer> {
-        self.waiting.lock().take().map(|w| w.completer)
+    fn take_back(&self, po: *mut ()) -> Option<Completer> {
+        self.waiting.lock().take_if(|w| w.completer.is_for(po)).map(|w| w.completer)
     }
 }
 

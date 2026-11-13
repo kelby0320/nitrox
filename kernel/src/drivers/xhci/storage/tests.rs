@@ -2,7 +2,7 @@ use super::*;
 use crate::drivers::xhci::ring::Slots;
 use crate::io::irp::{Irp, IrpBuffer};
 use crate::mm::test_support::init_global_heap;
-use tokens::{Lax, fly, hub, was};
+use tokens::{Lax, fly, hub, op_at, was};
 
 mod refusals;
 mod tokens;
@@ -721,7 +721,8 @@ fn a_hub_command_the_dpc_reached_is_waited_for() {
     assert_eq!(disks.issue_hub(i, hub(0x1234), 0, &scsi::test_unit_ready(), 0, false, 0).map_err(|e| e.1), Ok(()));
     let second = disks.issue_hub(i, hub(0x5678), 0, &scsi::test_unit_ready(), 0, false, 0).map_err(|e| e.1);
     assert_eq!(second, Err("another hub command is armed"), "the first kept");
-    assert_eq!(disks.take_back(i), Some(hub(0x1234)), "before the DPC reached it");
+    assert_eq!(disks.take_back(i, op_at(0x5678)), None, "another wait's is not its to take");
+    assert_eq!(disks.take_back(i, op_at(0x1234)), Some(hub(0x1234)), "before the DPC reached it");
     assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none());
     assert_eq!(disks.issue_hub(i, hub(0x1234), 0, &scsi::test_unit_ready(), 0, false, 0).map_err(|e| e.1), Ok(()));
     disks.on_transfer(5, 4, code::SUCCESS, 0, 1).lax();
@@ -730,7 +731,7 @@ fn a_hub_command_the_dpc_reached_is_waited_for() {
         disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1).lax(),
         Some(Action::Hub { completer: hub(0x1234) })
     );
-    assert_eq!(disks.take_back(i), None, "after it: its completion is on its way");
+    assert_eq!(disks.take_back(i, op_at(0x1234)), None, "after it: its completion is on its way");
     let result = disks.devs[i].lock().as_ref().unwrap().hub_result;
     assert_eq!(result, Some(HubResult::Status(Status::Passed { residue: 0 })));
 }
@@ -917,7 +918,7 @@ fn a_hub_command_goes_only_on_a_held_device_and_never_replaces_a_read() {
         "a read in flight"
     );
     assert!(running(&disks, i, &r).is_some(), "the read still in flight");
-    assert_eq!(disks.take_back(i), None, "a read is not the hub thread's to take back");
+    assert_eq!(disks.take_back(i, op_at(0x1234)), None, "a read is not the hub thread's to take back");
     assert!(running(&disks, i, &r).is_some());
 
     let mut other = Fake::new();

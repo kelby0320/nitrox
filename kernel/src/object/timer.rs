@@ -175,7 +175,8 @@ mod tests {
     fn waiters_add_remove_take_caps_at_max() {
         init_global_heap();
         let (t, tok) = (Timer::try_new().unwrap(), &mut SchedToken::for_test());
-        let ths: [*mut (); Timer::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+        let ths: [*mut (); Timer::MAX_WAITERS] =
+            core::array::from_fn(|i| core::ptr::without_provenance_mut(0x1000 + i));
         for &th in &ths {
             assert!(t.add_waiter(tok, th).is_ok());
         }

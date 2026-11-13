@@ -79,8 +79,15 @@ fn a_departure_completes_its_queue_at_once() {
     assert_eq!(a.status, crate::io::irp::IrpStatus::Pending as i32);
 }
 
-/// **A departure ends an armed hub command's wait**, completing it, so its waiter finds the device
-/// gone rather than wait for a DPC that will not come.
+/// `armed`'s wait, polled: the host clock reads 0, so a bound of 0 is a deadline already passed.
+fn polled<R: Record>(armed: armed::Armed<R>) -> Option<(u8, u64)> {
+    let thread = crate::object::header::Ref::new(crate::object::Thread::try_new(0, 0).unwrap());
+    crate::sched::with_current(thread, || armed.wait(0))
+}
+
+/// **A departure that finds a hub command armed completes it**, so its waiter finds the device gone
+/// rather than wait for a DPC that will not come. None is armed as a device departs, as the hub
+/// thread both departs devices and waits on its commands: this holds the arm all the same.
 #[test]
 fn a_departure_ends_a_hub_commands_wait() {
     init_global_heap();
@@ -88,10 +95,30 @@ fn a_departure_ends_a_hub_commands_wait() {
     let mut fake = Fake::new();
     let (i, _) = disks.take(held(fake.dev(5))).unwrap();
     let po = hub::new_operation().unwrap();
+    let seen = po.clone();
     let issue = |c| disks.issue_hub(i, c, 0, &scsi::test_unit_ready(), 0, false, 0);
-    // Its wait, the hub thread's, needs a scheduler.
-    core::mem::forget(armed::arm(&po, HubCommand { disks: &disks, i }, issue).unwrap());
+    let armed = armed::arm(po, HubCommand { disks: &disks, i }, issue).unwrap();
     let _ = departed(&disks, 5);
-    assert!(crate::sched::pending_op_is_signaled(&po), "its waiter ended");
-    assert_eq!(disks.take_back(i), None, "nothing left to take back");
+    assert!(crate::sched::pending_op_is_signaled(&seen), "its operation completed");
+    assert_eq!(polled(armed), Some((0, 0)), "its waiter ended");
+    assert!(disks.devs[i].lock().is_none(), "to find its device gone");
+}
+
+/// **A hub command's end completes its operation**: the DPC's action, here for an error on its
+/// transfer, with what it came to kept for the hub thread.
+#[test]
+fn a_hub_commands_end_completes_its_operation() {
+    init_global_heap();
+    let disks = Disks::new();
+    let mut fake = Fake::new();
+    let (i, _) = disks.take(held(fake.dev(5))).unwrap();
+    let po = hub::new_operation().unwrap();
+    let seen = po.clone();
+    let issue = |c| disks.issue_hub(i, c, 0, &scsi::test_unit_ready(), 0, false, 0);
+    let armed = armed::arm(po, HubCommand { disks: &disks, i }, issue).unwrap();
+    act(disks.on_transfer(5, 4, code::STALL, 0, 1).expect("the device's"), None);
+    assert!(crate::sched::pending_op_is_signaled(&seen), "completed by the DPC's action");
+    assert_eq!(polled(armed), Some((0, 0)));
+    let result = disks.devs[i].lock().as_ref().unwrap().hub_result;
+    assert!(matches!(result, Some(HubResult::Fault(Fault::Transfer { dci: 4, code: code::STALL }))));
 }

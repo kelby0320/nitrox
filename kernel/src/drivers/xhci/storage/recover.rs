@@ -160,7 +160,7 @@ fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Resul
     let po = hub::new_operation()?;
     let now = crate::arch::Timer::read_ns();
     let issue = |c| DISKS.issue_hub(i, c, lun, cdb, len, status_only, now);
-    let armed = armed::arm(&po, HubCommand { disks: &DISKS, i }, issue).map_err(Failed::Device)?;
+    let armed = armed::arm(po, HubCommand { disks: &DISKS, i }, issue).map_err(Failed::Device)?;
     if armed.wait(BIND_NS).is_none() {
         return Err(Failed::Timeout);
     }
@@ -256,8 +256,8 @@ pub(super) struct HubCommand<'d> {
 }
 
 impl Record for HubCommand<'_> {
-    fn take_back(&self) -> Option<Completer> {
-        self.disks.take_back(self.i)
+    fn take_back(&self, po: *mut ()) -> Option<Completer> {
+        self.disks.take_back(self.i, po)
     }
 }
 
@@ -467,14 +467,14 @@ impl Disks {
         self.devs[i].lock().as_mut().and_then(|dev| dev.rescan.take()).map(|(irp, _)| irp)
     }
 
-    /// **A hub command's wait ran out**: its completer taken back if the DPC has not reached it, so
-    /// nothing completes an operation the hub thread is about to drop. `None` once the DPC, or a
-    /// departure, has it: its completion is on its way.
-    pub(super) fn take_back(&self, i: usize) -> Option<Completer> {
+    /// **A hub command's wait ran out**: its completer, the one for the operation at `po`, taken back
+    /// if the DPC has not reached it, so nothing completes an operation the hub thread is about to
+    /// drop. `None` once the DPC, or a departure, has it: its completion is on its way.
+    pub(super) fn take_back(&self, i: usize, po: *mut ()) -> Option<Completer> {
         let mut d = self.devs[i].lock();
         let dev = d.as_mut()?;
         match dev.inflight.take() {
-            Some(Command { owner: Owner::Hub { completer }, .. }) => Some(completer),
+            Some(Command { owner: Owner::Hub { completer }, .. }) if completer.is_for(po) => Some(completer),
             other => {
                 dev.inflight = other;
                 None
