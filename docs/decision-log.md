@@ -38213,3 +38213,28 @@ Part J's fifteenth sub-part, `typed-layers.md` § J.15, built on `pre-phase-7/pa
   counted as 23 — twenty-four were sentinel addresses, now made without provenance; twenty-two are
   the direct map, the host heap's frames and user addresses, where a kernel has only a number; and
   sixteen are kept, each for its reason (`typed-layers.md` § J.15). **Part J's condition is met.**
+
+## 2026-11-13 — Before Phase 7, E.6: the mapping path
+
+**Part J is done**, #438 merged. E.6, the first sub-part of Part E's second half, `syscall-surface.md`
+§ E.6, built on `pre-phase-7/part-e6-mapping-path`.
+
+- **`sys_memory_map` takes an offset**, page-aligned, and maps `size` bytes of the object from it: a
+  file's or a memory object's, held inside the object. `ld.so` will map a segment so. libos's
+  `map_range` maps one; `eshell`, `libheap` and the harness's refusal pass 0.
+- **A placement is found under the hold that inserts it** (kmem-29), and **an "anywhere" mapping keeps
+  a page unmapped below itself and below the mapping above it** (th-d9's kernel half), so a thread's
+  stack that overruns faults rather than write the mapping beneath. A hinted mapping is not held off.
+- **A filled file page is installed only where its mapping still puts it** (kmem-15); otherwise the
+  access retries against the mapping as it now stands.
+- **A kernel copy's not-present fault is served where nothing has to wait** (kmem-28): an anonymous
+  page zeroed, a file's resident page mapped, and the copy resumed. A file's page not resident still
+  fails it at once, as fetching it would stop the thread on a device inside a syscall
+  (`copy-from-unread-file`). **No copy of user memory holds a lock**, which `lockrank` asserts at
+  each; a fault in one may take the address space's lock and allocate, as one from ring 3 may.
+- Departures, for the maintainer's eye: the offset maps a memory object too; the kept page is below
+  the mapping above as well as the new one; kmem-15's control is a host test, as a boot cannot hold
+  a fill open; and `lockrank`'s check is an assertion at every copy. The memory syscalls and the
+  cache's fault path moved to files with room first (`64b4b96f`, `2de23ac8`); the path is `293f330a`.
+- **Miri runs at Part E's end**, the whole suite once after E.11, as after J.15, and no sub-part runs
+  it before (the maintainer's call, 2026-11-13).
