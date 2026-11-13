@@ -350,6 +350,40 @@ const _: () = assert!(offset_of!(IoOp, buf_offset) == 16);
 const _: () = assert!(offset_of!(IoOp, offset) == 24);
 const _: () = assert!(offset_of!(IoOp, length) == 32);
 
+/// **What a resolve does beyond resolving**; a field its `code` does not use must be `0`.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct ResolveOp {
+    /// A `RESOLVE_*` code — offset 0.
+    pub code: u32,
+    /// A rename's flags — offset 4.
+    pub flags: u32,
+    /// A size change's size — offset 8.
+    pub size: u64,
+    /// A rename's destination path — offset 16.
+    pub dest_ptr: u64,
+    /// Its length — offset 24.
+    pub dest_len: u64,
+}
+
+const _: () = assert!(size_of::<ResolveOp>() == 32);
+const _: () = assert!(align_of::<ResolveOp>() == 8);
+const _: () = assert!(offset_of!(ResolveOp, size) == 8);
+const _: () = assert!(offset_of!(ResolveOp, dest_len) == 24);
+
+/// Make the file, at least `size` bytes, and resolve it.
+pub const RESOLVE_OP_CREATE: u32 = 1;
+/// Resolve the file, grown to `size` first if it is shorter.
+pub const RESOLVE_OP_GROW: u32 = 2;
+/// Resolve the file, shrunk to `size` first if it is longer.
+pub const RESOLVE_OP_TRUNCATE: u32 = 3;
+/// Rename the path to the destination, on one filesystem.
+pub const RESOLVE_OP_RENAME: u32 = 4;
+/// Write back every dirty file of the mount the path resolves through: how many it wrote.
+pub const RESOLVE_OP_FLUSH: u32 = 5;
+/// How many of the mount's files something still holds.
+pub const RESOLVE_OP_HELD: u32 = 6;
+
 /// Handle metadata written by `sys_handle_stat`; 24 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

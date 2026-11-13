@@ -8,11 +8,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 
 use libkern::{
-    HandleInfo, IPC_HANDLE_MAX, IPC_PAYLOAD_SIZE, IoOp, IoResult, IpcMsg, KError, KObjectType, Notification, NsEntry,
-    RegisterValues, Rights, SPAWN_MAX_HANDLES, SpawnArgs, ThreadArgs,
+    HandleInfo, IO_OPCODE_FLUSH, IPC_HANDLE_MAX, IPC_PAYLOAD_SIZE, IoOp, IoResult, IpcMsg, KError, KObjectType,
+    Notification, NsEntry, RegisterValues, Rights, SPAWN_MAX_HANDLES, SpawnArgs, ThreadArgs,
 };
 
-use super::Resize;
+use super::{Resize, Resolve};
 
 const PAGE: usize = 4096;
 /// The kernel's cap on one memory object.
@@ -137,7 +137,9 @@ struct Mock {
     /// Whether the next rename's answer carries a handle, as a server's could.
     rename_handle: bool,
     submitted: Vec<IoOp>,
-    /// What `ns_sync` and `ns_held` answer for a mount path: `(written, held)`.
+    busy_flushes: u32,
+    flush_never: bool,
+    /// What a flush and a held answer for a mount path: `(written, held)`.
     mounts: BTreeMap<Vec<u8>, (i64, i64)>,
     unseeded: u32,
     /// Unseeded reads to find the kernel's seed-waiter places all taken, their PO done `WouldBlock`.
@@ -318,6 +320,19 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
         m.submitted.push(*op);
         if let Some(status) = m.fail_submit.take() {
             return status as i64;
+        }
+        let file =
+            matches!(m.get(resource, Rights::empty()), Ok((o, _)) if matches!(m.objects[o], Object::File { .. }));
+        if file && op.opcode == IO_OPCODE_FLUSH {
+            if let Err(r) = m.typed(resource, Rights::MAP_WRITE, KObjectType::FileObject) {
+                return r;
+            }
+            if m.busy_flushes > 0 {
+                m.busy_flushes -= 1;
+                return e(KError::WouldBlock);
+            }
+            let status = m.fail_sync.take().unwrap_or(0);
+            return m.po(Po { ready: !m.flush_never, never: m.flush_never, status, result: 0, lookup: None });
         }
         if let Err(r) = m.get(resource, Rights::empty()) {
             return r;
@@ -668,7 +683,7 @@ pub fn ns_derive(ns: u64) -> i64 {
     })
 }
 
-pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
+fn plain_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
     with(|m| {
         let ns = match m.namespace(ns, Rights::LOOKUP) {
             Ok(o) => o,
@@ -754,103 +769,6 @@ pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
         out.path_len = path.len() as u32;
         out.rights = *rights;
         0
-    })
-}
-
-fn mount_answer(ns: u64, path: &[u8], held: bool) -> i64 {
-    with(|m| {
-        if let Err(r) = m.namespace(ns, Rights::LOOKUP) {
-            return r;
-        }
-        match m.mounts.get(path) {
-            Some(&(written, still)) => {
-                if held {
-                    return still;
-                }
-                m.fail_sync.take().map_or(written, |s| s as i64)
-            }
-            None => e(KError::NotFound),
-        }
-    })
-}
-
-pub fn ns_sync(ns: u64, path: &[u8]) -> i64 {
-    mount_answer(ns, path, false)
-}
-
-pub fn ns_held(ns: u64, path: &[u8]) -> i64 {
-    mount_answer(ns, path, true)
-}
-
-/// The file verbs, as a filesystem server mounted over the whole namespace would answer them: a
-/// create is not exclusive, a grow never shrinks, a truncate never grows.
-pub fn file_resize(verb: Resize, ns: u64, path: &[u8], rights: u64, size: u64) -> i64 {
-    with(|m| {
-        if size > u32::MAX as u64 {
-            return e(KError::TooLarge);
-        }
-        let ns = match m.namespace(ns, Rights::LOOKUP) {
-            Ok(o) => o,
-            Err(r) => return r,
-        };
-        if !valid_path(path) {
-            return e(KError::InvalidArgument);
-        }
-        let found = match (m.file_at(ns, path), verb) {
-            (None, Resize::Create) => {
-                let obj = m.object(Object::File { bytes: Pages::new(FILE_ROOM), size: 0 });
-                let all = Rights::MAP_READ | Rights::MAP_WRITE | Rights::INSPECT | Rights::TRANSFER | Rights::DUPLICATE;
-                m.bindings(ns).push(Binding::new(path, obj, all.bits()));
-                Some((obj, all.bits()))
-            }
-            (None, _) => None,
-            (Some(got), _) => Some(got),
-        };
-        let Some((obj, bound)) = found else { return m.lookup_po(Err(KError::NotFound)) };
-        let ignored = verb == Resize::Truncate && core::mem::take(&mut m.ignore_truncate);
-        if let Object::File { size: now, .. } = &mut m.objects[obj] {
-            *now = match verb {
-                Resize::Create | Resize::Grow => (*now).max(size),
-                Resize::Truncate if ignored => *now,
-                Resize::Truncate => (*now).min(size),
-            };
-        }
-        m.lookup_po(Ok((obj, bound & rights)))
-    })
-}
-
-/// An existing destination is refused `AlreadyExists` unless `flags` asks to replace it, as a
-/// filesystem server answers (`librsproto`'s `RENAME_REPLACE`, bit 0).
-pub fn file_rename(ns: u64, from: &[u8], to: &[u8], flags: u64) -> i64 {
-    with(|m| {
-        let ns = match m.namespace(ns, Rights::LOOKUP) {
-            Ok(o) => o,
-            Err(r) => return r,
-        };
-        if !valid_path(from) || !valid_path(to) {
-            return e(KError::InvalidArgument);
-        }
-        let b = m.bindings(ns);
-        let status = match b.iter().position(|x| x.path == from) {
-            Some(_) if flags & 1 == 0 && from != to && b.iter().any(|x| x.path == to) => KError::AlreadyExists as i32,
-            Some(i) => {
-                b.retain(|x| x.path != to);
-                let i = b.iter().position(|x| x.path == from).unwrap_or(i);
-                b[i].path = to.to_vec();
-                0
-            }
-            None => KError::NotFound as i32,
-        };
-        let lookup = (status == 0 && core::mem::take(&mut m.rename_handle))
-            .then(|| (m.object(Object::Memory(Pages::new(PAGE))), Rights::MAP_READ.bits()));
-        m.po(Po { ready: true, never: false, status, result: 0, lookup })
-    })
-}
-
-pub fn file_sync(file: u64) -> i64 {
-    with(|m| match m.typed(file, Rights::MAP_WRITE, KObjectType::FileObject) {
-        Ok(_) => m.fail_sync.take().map_or(0, |s| s as i64),
-        Err(r) => r,
     })
 }
 
@@ -985,8 +903,10 @@ pub fn power(h: u64, op: u64) -> i64 {
 }
 
 mod controls;
+mod resolve;
 mod thread;
 mod time;
 pub use controls::*;
+pub use resolve::ns_lookup;
 pub use thread::*;
 pub use time::*;

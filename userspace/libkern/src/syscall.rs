@@ -75,19 +75,6 @@ pub const SYS_IO_SUBMIT: u64 = 28;
 pub const SYS_IO_CANCEL: u64 = 29;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
 pub const SYS_NS_ENUMERATE: u64 = 30;
-/// `sys_file_sync` — flush a writable file mapping's pages to the device.
-pub const SYS_FILE_SYNC: u64 = 31;
-/// `sys_file_grow` — resolve a file, growing it to a target size first.
-pub const SYS_FILE_GROW: u64 = 32;
-/// `sys_file_create` — create a file, grow it to a target size, then resolve.
-pub const SYS_FILE_CREATE: u64 = 33;
-/// `sys_file_truncate` — resolve a file, **shrinking** it to a target size first.
-pub const SYS_FILE_TRUNCATE: u64 = 34;
-/// `sys_file_rename` — rename a path to another path **within the same filesystem**
-/// (a3/a4 = destination pointer/length, a5 = `RENAME_*` flags). Returns a `PendingOperation`
-/// whose completion carries status only. A destination on a different binding fails with
-/// `Unsupported` — the cue to copy then unlink.
-pub const SYS_FILE_RENAME: u64 = 35;
 /// `sys_process_terminate` — **ask** a process to exit; it is delivered as a
 /// `TerminateRequested` notification and nothing stops a process that ignores it (§11h).
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
@@ -95,14 +82,6 @@ pub const SYS_PROCESS_TERMINATE: u64 = 36;
 /// full namespace rights (so it can be transferred, which a process's own root cannot). Requires
 /// `LOOKUP` on `ns`.
 pub const SYS_NS_DERIVE: u64 = 37;
-/// `sys_ns_sync(ns, path, path_len)` — write back every dirty file cached under the userspace
-/// server `path` resolves to in `ns`, returning how many were written. Requires `LOOKUP` on
-/// `ns`. **Blocks** until the writes complete, like `sys_file_sync` — a durability point.
-pub const SYS_NS_SYNC: u64 = 38;
-/// `sys_ns_held(ns, path, path_len)` — how many of the files the userspace server `path` resolves
-/// to handed out are still held (a handle, mapping, IRP or dirty pin). Asked after `sys_ns_sync`,
-/// non-zero means the mount is in use.
-pub const SYS_NS_HELD: u64 = 39;
 /// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt
 /// ([`POWER_HALT`]) or reset ([`POWER_REBOOT`]). Needs `WRITE` on the system-control object,
 /// which only `init` holds, and **returns only to refuse**.

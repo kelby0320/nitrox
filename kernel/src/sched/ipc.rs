@@ -64,7 +64,7 @@ pub enum ForwardOutcome {
 /// Push a **fire-and-forget** message into a registration's server inbox: no pending slot,
 /// no `request_id`, no reply. `true` if it was queued. Used for `File::Touch` after a Model
 /// A writeback; nothing is reserved so nothing is rolled back, and a full ring or dead
-/// server just leaves a stale `mtime` rather than failing `sys_file_sync`, whose data is
+/// server just leaves a stale `mtime` rather than failing a file's flush, whose data is
 /// already on the device.
 pub fn us_forward_notify(reg: &UserspaceServerReg, msg: &mut StoredMsg) -> bool {
     let mut g = SCHED.lock();

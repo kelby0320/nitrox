@@ -7,7 +7,10 @@
 //! negative = a `KError` discriminant. Each takes typed arguments, so what the kernel is handed is
 //! what the types say.
 
-use libkern::{IoResult, SYS_FILE_CREATE, SYS_FILE_GROW, SYS_FILE_TRUNCATE};
+use libkern::{
+    IoResult, RESOLVE_OP_CREATE, RESOLVE_OP_FLUSH, RESOLVE_OP_GROW, RESOLVE_OP_HELD, RESOLVE_OP_RENAME,
+    RESOLVE_OP_TRUNCATE, ResolveOp,
+};
 
 /// The three file verbs that resolve a path to a file of a size: what each does to the size.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,14 +23,45 @@ pub enum Resize {
     Truncate,
 }
 
-impl Resize {
+/// **What a resolve does beyond resolving**, as the seam takes it: the kernel's `ResolveOp`, typed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Resolve<'a> {
+    Plain,
+    /// The file's size changed first, as the verb says.
+    Size(Resize, u64),
+    /// The path renamed to `to`, with the server's flags.
+    Rename {
+        to: &'a [u8],
+        flags: u16,
+    },
+    Flush,
+    Held,
+}
+
+impl Resolve<'_> {
+    /// The `ResolveOp` the kernel reads, `None` for a plain lookup; a rename's points at `to`.
     #[cfg_attr(any(test, feature = "mock"), allow(dead_code, reason = "the mock answers by the variant"))]
-    pub(super) fn number(self) -> u64 {
-        match self {
-            Resize::Create => SYS_FILE_CREATE,
-            Resize::Grow => SYS_FILE_GROW,
-            Resize::Truncate => SYS_FILE_TRUNCATE,
-        }
+    pub(super) fn op(self) -> Option<ResolveOp> {
+        let code = |code| ResolveOp { code, ..ResolveOp::default() };
+        Some(match self {
+            Resolve::Plain => return None,
+            Resolve::Size(verb, size) => {
+                let verb = match verb {
+                    Resize::Create => RESOLVE_OP_CREATE,
+                    Resize::Grow => RESOLVE_OP_GROW,
+                    Resize::Truncate => RESOLVE_OP_TRUNCATE,
+                };
+                ResolveOp { size, ..code(verb) }
+            }
+            Resolve::Rename { to, flags } => ResolveOp {
+                flags: flags as u32,
+                dest_ptr: to.as_ptr() as u64,
+                dest_len: to.len() as u64,
+                ..code(RESOLVE_OP_RENAME)
+            },
+            Resolve::Flush => code(RESOLVE_OP_FLUSH),
+            Resolve::Held => code(RESOLVE_OP_HELD),
+        })
     }
 }
 

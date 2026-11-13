@@ -154,13 +154,19 @@ impl Op {
     ///
     /// Issues `sys_io_submit` (which never blocks). A synchronous submit error (bad
     /// argument / permission) is returned here; device/medium errors arrive later
-    /// through the future's `IoResult.status`.
+    /// through the future's `IoResult.status`. One that names no buffer lends nothing to wait for.
     pub fn submit(resource: RawHandle, op: &IoOp) -> Result<Op> {
         let po = sys::io_submit(resource.0, op);
         if po < 0 {
             return Err(Error::from_status(po as i32));
         }
-        Ok(Op::of(po as u64, Kind::Io))
+        Ok(Op::of(po as u64, if op.buffer == 0 { Kind::Status } else { Kind::Io }))
+    }
+
+    /// **Stop waiting for an I/O, handing over the buffer it borrowed**: both are closed unwaited.
+    pub fn abandon<B>(mut self, buffer: B) {
+        self.finished = true;
+        drop(buffer);
     }
 
     /// Wrap a lookup's PO; its drop waits for nothing, as the kernel frees a lookup closed unread.
@@ -301,6 +307,20 @@ impl Drop for Op {
     }
 }
 
+/// **Submit until the kernel takes it**, sleeping on `WouldBlock` to `deadline`, then `TimedOut`.
+pub(crate) fn submit_again(mut submit: impl FnMut() -> i64, deadline: crate::Deadline) -> Result<u64> {
+    loop {
+        let r = submit();
+        if r != KError::WouldBlock as i64 {
+            return crate::error::check(r);
+        }
+        if crate::time::now().is_ok_and(|now| now >= deadline.ns()) {
+            return Err(Error::from(KError::TimedOut));
+        }
+        sleep();
+    }
+}
+
 // --- block_on: the single-task driver -------------------------------------
 
 /// Drive one future to completion on the current thread, blocking in `sys_wait`
@@ -347,7 +367,7 @@ mod tests {
     use libkern::{IO_OPCODE_READ, IoOp};
 
     fn read_op() -> IoOp {
-        IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 }
+        IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: 7, buf_offset: 0, offset: 0, length: 0 }
     }
 
     #[test]
@@ -543,7 +563,15 @@ mod tests {
         drop(Op::submit(RawHandle(1), &read_op()).unwrap());
         assert_eq!(sys::closed_in_flight(), 0);
         let ns = sys::served("/x");
-        drop(Op::from_po(sys::ns_lookup(ns, b"/x", 0) as u64));
+        drop(Op::from_po(sys::ns_lookup(ns, b"/x", 0, sys::Resolve::Plain) as u64));
+        assert_eq!(sys::closed_in_flight(), 1);
+    }
+
+    #[test]
+    fn a_dropped_io_naming_no_buffer_is_not_waited_out() {
+        sys::reset();
+        sys::script_next(0, 1, false);
+        drop(Op::submit(RawHandle(1), &IoOp { buffer: 0, ..read_op() }).unwrap());
         assert_eq!(sys::closed_in_flight(), 1);
     }
 
@@ -567,6 +595,15 @@ mod tests {
         assert_eq!(sys::counts().2, closes + 1, "closed, and not waited on again");
     }
 
+    #[test]
+    fn an_abandoned_io_is_closed_unwaited() {
+        sys::reset();
+        sys::script_never();
+        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
+        op.abandon(crate::Handle::<crate::Memory, crate::MapReadWrite>::create(4096).unwrap());
+        assert_eq!(sys::closed_in_flight(), 1);
+    }
+
     /// **A dropped I/O whose wait is refused for now waits again**, rather than closing in flight.
     #[test]
     fn a_dropped_io_whose_wait_is_refused_for_now_waits_again() {
@@ -584,7 +621,7 @@ mod tests {
     fn a_dropped_lookup_closes_the_handle_a_wait_installed() {
         sys::reset();
         let ns = sys::served("/x");
-        let mut lookup = Op::from_po(sys::ns_lookup(ns, b"/x", 0) as u64);
+        let mut lookup = Op::from_po(sys::ns_lookup(ns, b"/x", 0, sys::Resolve::Plain) as u64);
         sys::script_next(0, 5, false);
         let mut io = Op::submit(RawHandle(1), &read_op()).unwrap();
         let mut first = true;
@@ -599,7 +636,7 @@ mod tests {
         drop(lookup);
         assert_eq!(sys::open_handles(), open - 2, "its PO, and the handle its wait installed");
         let closes = sys::counts().2;
-        drop(Op::from_po(sys::ns_lookup(ns, b"/y", 0) as u64));
+        drop(Op::from_po(sys::ns_lookup(ns, b"/y", 0, sys::Resolve::Plain) as u64));
         assert_eq!(sys::counts().2, closes + 1, "a failed lookup's PO, and no handle");
     }
 

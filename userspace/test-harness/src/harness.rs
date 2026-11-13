@@ -2167,7 +2167,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// **`mtime` survives an in-place overwrite.**
 ///
-/// A **same-length** rewrite (map, change bytes, `sys_file_sync`) reaches the device with no
+/// A **same-length** rewrite (map, change bytes, `fs::flush`) reaches the device with no
 /// resolve and no IPC, so the fs-server never hears of it and `mtime` once kept reporting creation.
 /// The check crosses a wall-clock second and asserts: the content changed (else a stale `mtime` and
 /// a failed write look alike), `mtime` advanced, and the size did not (so it was the in-place

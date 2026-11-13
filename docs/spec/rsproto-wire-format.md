@@ -201,15 +201,17 @@ mounted, and replies success.
 
 It is the fourth step of the storage service's unmount chain (administration Part C.5c,
 [`rsproto-storage-ops.md`](rsproto-storage-ops.md) § `Unmount`): by then the supervisor has
-taken the label out of `fs`, had the kernel write back every dirty file (`sys_ns_sync`), and found
-nothing still holding a file of it (`sys_ns_held`). After the reply it flushes the drive
-(`IoOpcode::Flush`). The storage service is the first sender, and `boot-probe` drives it on every
-`test-qemu` run, against the test image's scratch filesystem.
+taken the label out of `fs`, had the kernel write back every dirty file (a resolve carrying
+`RESOLVE_OP_FLUSH`), and found nothing still holding a file of it (`RESOLVE_OP_HELD`). After the
+reply it flushes the drive (`IoOpcode::Flush`). The storage service is the first sender, and
+`boot-probe` drives it on every `test-qemu` run, against the test image's scratch filesystem.
 
 **A filesystem server keeps its control channel after `Ready` for this**, and treats the peer
 closing it as ordinary. **`init` keeps its end too**, since administration Part E.4, and is the
-second sender: when a shutdown finishes, it runs `sys_ns_sync` and then `Meta::Unmount` on each of
-its own mounts, last mounted first, **without** the held check, and says what each answered. It
+second sender: when a shutdown finishes, it flushes each of its own mounts (`RESOLVE_OP_FLUSH`),
+last mounted first, and sends it `Meta::Unmount`, **without** the held check, and says what each
+answered. **A flush that fails or runs out of time is followed by no `Meta::Unmount`**: the
+server would record the filesystem clean over what was not written. It
 builds the request and reads the answer by hand (`userspace/init/src/unmount.rs`), as it reads
 `Ready`, since `librsproto` is kept out of `init`'s build. The drive's flush is `sys_power`'s.
 

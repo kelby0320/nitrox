@@ -5,7 +5,7 @@ use libkern::{
     syscall1, syscall2, syscall3, syscall4, syscall5, syscall6,
 };
 
-use super::Resize;
+use super::Resolve;
 
 pub(super) fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
     let count = handles.len().min(results.len());
@@ -125,10 +125,14 @@ pub fn ns_derive(ns: u64) -> i64 {
     unsafe { syscall1(libkern::SYS_NS_DERIVE, ns) }
 }
 
-/// `sys_ns_lookup` — returns a `PendingOperation` whose completion carries the handle.
-pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
-    // SAFETY: `path` is a live buffer of its length, which the kernel copies in.
-    unsafe { syscall4(libkern::SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) }
+/// `sys_ns_lookup` — a `PendingOperation` for `path` in `ns`, doing what `op` says there: its
+/// completion carries a handle, or a flush's or a held's count.
+pub fn ns_lookup(ns: u64, path: &[u8], rights: u64, op: Resolve<'_>) -> i64 {
+    let op = op.op();
+    let at = op.as_ref().map_or(0, |o| o as *const libkern::ResolveOp as u64);
+    // SAFETY: `path`, the `ResolveOp` or null, and the destination a rename's points at are live
+    // buffers of their lengths, which the kernel copies in.
+    unsafe { syscall5(libkern::SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights, at) }
 }
 
 /// `sys_ns_bind` of `resource` at `path`, scoped to the server's `base` when that is not empty.
@@ -157,46 +161,6 @@ pub fn ns_unbind(ns: u64, path: &[u8]) -> i64 {
 pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
     // SAFETY: `out` is a live `NsEntry`, which the kernel writes whole or not at all.
     unsafe { syscall3(libkern::SYS_NS_ENUMERATE, ns, index, out as *mut NsEntry as u64) }
-}
-
-/// `sys_ns_sync` — write back the server `path` resolves to; how many files it wrote.
-pub fn ns_sync(ns: u64, path: &[u8]) -> i64 {
-    // SAFETY: `path` is a live buffer of its length, which the kernel copies in.
-    unsafe { syscall3(libkern::SYS_NS_SYNC, ns, path.as_ptr() as u64, path.len() as u64) }
-}
-
-/// `sys_ns_held` — how many of that server's files something holds.
-pub fn ns_held(ns: u64, path: &[u8]) -> i64 {
-    // SAFETY: `path` is a live buffer of its length, which the kernel copies in.
-    unsafe { syscall3(libkern::SYS_NS_HELD, ns, path.as_ptr() as u64, path.len() as u64) }
-}
-
-/// `sys_file_create`, `sys_file_grow` or `sys_file_truncate` — a lookup's `PendingOperation`.
-pub fn file_resize(verb: Resize, ns: u64, path: &[u8], rights: u64, size: u64) -> i64 {
-    // SAFETY: `path` is a live buffer of its length, which the kernel copies in.
-    unsafe { syscall5(verb.number(), ns, path.as_ptr() as u64, path.len() as u64, rights, size) }
-}
-
-/// `sys_file_rename` of `from` to `to` — a `PendingOperation` carrying status only.
-pub fn file_rename(ns: u64, from: &[u8], to: &[u8], flags: u64) -> i64 {
-    // SAFETY: `from` and `to` are live buffers of their lengths, which the kernel copies in.
-    unsafe {
-        syscall6(
-            libkern::SYS_FILE_RENAME,
-            ns,
-            from.as_ptr() as u64,
-            from.len() as u64,
-            to.as_ptr() as u64,
-            to.len() as u64,
-            flags,
-        )
-    }
-}
-
-/// `sys_file_sync(file)` — returns once its pages are on the device.
-pub fn file_sync(file: u64) -> i64 {
-    // SAFETY: a register-only call.
-    unsafe { syscall1(libkern::SYS_FILE_SYNC, file) }
 }
 
 /// `sys_process_spawn(&args)` — spawn a child process; returns a `Process` handle.

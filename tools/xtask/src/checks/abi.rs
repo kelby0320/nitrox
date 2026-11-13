@@ -106,6 +106,13 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U32Const,
         one_sided: &[],
     },
+    AbiFamily {
+        what: "resolve operations",
+        kernel_file: "kernel/src/libkern/resolve_op.rs",
+        user_files: &["userspace/libkern/src/abi.rs"],
+        shape: AbiShape::U32Const,
+        one_sided: &[],
+    },
     // `sys_power`'s operations. The kernel states them in a file of their
     // own, so the sweep there finds nothing else; `libkern` keeps them beside `SYS_POWER`.
     AbiFamily {

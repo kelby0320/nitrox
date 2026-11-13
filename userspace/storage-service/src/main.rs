@@ -20,10 +20,10 @@
 //!    session** for `Mount`, `Unmount`, `Reread` and `InUse`. A **media session** carries `Eject`
 //!    alone; a **watch** is only pinged when the mounts change ([`storage_service::watch`]).
 //!
-//! **An unmount is a chain**: the label leaves `fs`, every dirty file is written back
-//! (`sys_ns_sync`), the unmount is refused if a file is still held (`sys_ns_held`), the server
-//! records the filesystem clean and exits (`Meta::Unmount`), the drive's cache is flushed, and
-//! the namespace is dropped.
+//! **An unmount is a chain**: the label leaves `fs`, every dirty file is written back (the mount's
+//! flush, by `FLUSH_TIMEOUT_NS`), the unmount is refused if a file is still held (the mount's
+//! held), the server records the filesystem clean and exits (`Meta::Unmount`), the drive's cache
+//! is flushed, and the namespace is dropped.
 //!
 //! **A shutdown unmounts everything.** On `CTRL_OP_SHUTDOWN` (sent only by a shutdown, since this
 //! service is `essential`) it runs the chain on every mount, last mounted first, **without the
@@ -48,8 +48,8 @@ use libos::boot::Start;
 use libos::control::{self, Control};
 use libos::log::{self, Line};
 use libos::{
-    Carried, Channel, Deadline, File, Handle, MapRead, MapReadWrite, Mapping, Memory, Msg, Namespace, NsMutable,
-    NsReadOnly, Only, Op, Process, ReadWrite, Resource, Spawn, WaitSet, block_on, time,
+    Carried, Channel, Deadline, FLUSH_TIMEOUT_NS, File, Handle, MapRead, MapReadWrite, Mapping, Memory, Msg, Namespace,
+    NsMutable, NsReadOnly, Only, Op, Process, ReadWrite, Resource, Spawn, WaitSet, block_on, time,
 };
 use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed};
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, parse_read_dir_request};

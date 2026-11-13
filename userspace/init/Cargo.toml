@@ -14,6 +14,8 @@ libinittoml = { path = "../libinittoml" }
 # only: init's own build still hand-parses (`userspace/init/CLAUDE.md`).
 [dev-dependencies]
 librsproto = { path = "../librsproto" }
+# The kernel's model under libos, for the shutdown's flush and unmount.
+libos = { path = "../libos", features = ["mock"] }
 
 # A library + binary split: the library holds init's host-testable internals (the
 # bump-allocator math now; the `toml_lite` parser in Part 4), the binary is the

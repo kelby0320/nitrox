@@ -1,6 +1,6 @@
 //! `rename` — re-point a name at the same file.
 //!
-//! One `sys_file_rename`, no fallback. Where [`move`](../move) will copy when it has to,
+//! One `fs::rename`, no fallback. Where [`move`](../move) will copy when it has to,
 //! `rename` only ever re-points a directory entry — O(1), identity-preserving, and it either
 //! works or says why.
 //!

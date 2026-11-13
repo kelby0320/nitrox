@@ -231,7 +231,7 @@ is refused, `WouldBlock`. [`device-node.md`](device-node.md) § *The change node
 pub enum IoOpcode {
     Read  = 0,   // device → buffer
     Write = 1,   // buffer → device
-    Flush = 2,   // the device's volatile write cache → its medium
+    Flush = 2,   // a device's volatile write cache → its medium; a file's pages → its device
     Rescan = 3,  // a disk's partition table, read again (Phase 6 Part G)
     Eject = 4,   // a removable disk's medium stopped and ejected (pre-Phase-7 Part C.4)
 }
@@ -248,6 +248,13 @@ is `0`. A partition passes it to its disk; a RAM disk, whose memory is its mediu
 completes it at once; an AHCI disk issues `FLUSH CACHE EXT`, or `FLUSH CACHE` on a drive
 IDENTIFY does not list the 48-bit form for. *(Administration Part C.2; it resolved
 `TODO(ahci-flush)`.)*
+
+**One opcode, two meanings a resource apart.** On a **file**, a `FileObject`, `Flush` puts every
+page of the file on its device: the page cache's write-back, as a writable mapping's writes need.
+It does not empty the device's volatile cache, which stays the device's own `Flush`: the storage
+service sends that at an unmount and `sys_power` at a stop. A file's flush runs on a kernel
+thread of its own and is counted in its mount's budget, as a mount's flush is
+([`syscall-abi.md`](syscall-abi.md) § `sys_ns_lookup`): one past it is refused `WouldBlock`.
 
 **`Rescan`** *(Phase 6 Part G)* **reads a disk's partition table again**, after a holder of the
 disk has rewritten it: the disk's partitions depart, and those its table now holds are published,
@@ -286,10 +293,11 @@ buffer and no range, needs `WRITE`, and its PO completes, `result` `0`, once the
 
 `Read` requires the `READ` right on `resource`; `Write`, `Flush`, `Rescan` and `Eject` require
 `WRITE` — only a writer has anything to make durable, a table to have rewritten, or a medium to
-stop. A block `DeviceNode` bound read-only into a namespace (the Phase 2 default — see
-[`device-node.md`](device-node.md)) therefore rejects `Write` at the lookup-rights gate, before
-any IRP is built. The buffer-side rights (`MAP_READ`/`MAP_WRITE` on `buffer`) are checked
-independently, as above.
+stop. A file's `Flush` requires `MAP_WRITE`, the right a writable mapping of it needs. A block
+`DeviceNode` bound read-only into a namespace (the Phase 2 default — see
+[`device-node.md`](device-node.md)) therefore rejects `Write` at the lookup-rights gate, before any
+IRP is built. The buffer-side rights (`MAP_READ`/`MAP_WRITE` on `buffer`) are checked independently,
+as above.
 
 ## Relationship to the IRP
 

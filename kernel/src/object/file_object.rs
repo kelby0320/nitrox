@@ -20,7 +20,7 @@
 //! indexes objects weakly, so a clean object goes with its last user. **A dirty object holds a
 //! reference to itself** — mapped writable since the last write-back that began with no
 //! writable mapping and saw none made — so a writer that exits without syncing loses nothing:
-//! `sys_ns_sync` enumerates the cache and writes it back. Dirty is per object, not per page,
+//! a mount's flush enumerates the cache and writes it back. Dirty is per object, not per page,
 //! until `TODO(page-dirty-tracking)`.
 //!
 //! [`resize`]: FileObject::resize

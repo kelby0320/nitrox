@@ -51,9 +51,11 @@ fn wait_ready(control: &Chan) -> Result<Chan, &'static [u8]> {
     }
 }
 
-/// Write back every dirty file of the mount in `ns`, held or not. `false` if one failed.
+/// Write back every dirty file of the mount in `ns`, held or not, by [`FLUSH_TIMEOUT_NS`]. `false`
+/// if one failed or the flush ran out of time.
 pub(super) fn sync_mount(ns: &Ns) -> bool {
-    block_on(ns.flush("/")).is_ok()
+    let deadline = time::Deadline::after(FLUSH_TIMEOUT_NS).unwrap_or(time::Deadline::at(FLUSH_TIMEOUT_NS));
+    ns.flush_by("/", deadline).is_ok()
 }
 
 /// **How many of the mount's files something still holds**, asked after a sync. An IRP whose

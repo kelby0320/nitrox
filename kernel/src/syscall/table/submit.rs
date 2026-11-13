@@ -20,7 +20,7 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     let (dev_right, buf_right) = match opcode {
         IoOpcode::Read => (Rights::READ, Rights::MAP_WRITE),
         IoOpcode::Write => (Rights::WRITE, Rights::MAP_READ),
-        IoOpcode::Flush => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Flush),
+        IoOpcode::Flush => return submit_flush(resource_h, &op, pid),
         IoOpcode::Rescan => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Rescan),
         IoOpcode::Eject => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Eject),
     };
@@ -88,6 +88,20 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
     crate::io::block::dispatch_block_control(&device, &po_ref, irp_op)?;
     installed.commit();
     Ok(po_h.bits() as isize)
+}
+
+/// A file's flush is its pages' ([`flush::file`]); anything else's, the device's own cache's.
+pub(super) fn submit_flush(resource_h: u64, op: &IoOp, pid: u32) -> SysResult {
+    let device = || submit_control(resource_h, op, pid, crate::io::irp::IrpOp::Flush);
+    let Ok(found) = global::get().lookup(RawHandle(resource_h), pid, Rights::empty()) else { return device() };
+    let Ok(file) = found.object.downcast::<FileObject>() else { return device() };
+    if op.buffer != 0 || op.buf_offset != 0 || op.offset != 0 || op.length != 0 {
+        return Err(KError::InvalidArgument);
+    }
+    if !found.rights.contains(Rights::MAP_WRITE) {
+        return Err(KError::NoAccess);
+    }
+    super::flush::file(file, pid)
 }
 
 /// An I/O buffer's size; a borrowed one is refused, as the kernel and the device reach its frames.

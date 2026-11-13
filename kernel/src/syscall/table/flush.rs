@@ -1,15 +1,106 @@
 //! Making what was written durable: a file's pages, and a mount's.
 
 use super::*;
+use crate::object::userspace_server::FileOp;
+use crate::sched::Job;
 
-/// `sys_file_sync(handle)` — flush a writable file mapping's resident pages to the device.
-/// Requires `MAP_WRITE` on the `FileObject` handle. Blocks on the write IRPs (async-first-exempt
-/// on a syscall thread). `0` on success, else a `KError`.
-pub(super) fn sys_file_sync(handle: u64) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-    let file = lookup_as::<FileObject>(handle, pid, Rights::MAP_WRITE)?;
-    write_back(&file)?;
-    Ok(0)
+/// **A mount's flush or held**: an operation's handle, or `WouldBlock` past the mount's budget.
+pub(super) fn mount(ns: &Namespace, path: &[u8], flush: bool, pid: u32) -> SysResult {
+    let reg = match ns.resolve(path) {
+        Some((ResolvedTarget::UserspaceServer(reg, _), _, _)) => Ok(reg),
+        Some(_) => Err(KError::Unsupported),
+        None => Err(KError::NotFound),
+    };
+    let place = match &reg {
+        Ok(reg) if flush => Some(UserspaceServerReg::begin_file_op(reg).ok_or(KError::WouldBlock)?),
+        _ => None,
+    };
+    let (po, installed, po_h) = operation(pid)?;
+    match (reg, place) {
+        (Err(e), _) => crate::sched::complete_pending_op(&po, e as i32, 0),
+        (Ok(reg), None) => {
+            let held = held(&reg);
+            drop(reg);
+            match held {
+                Ok(n) => crate::sched::complete_pending_op(&po, 0, n),
+                Err(e) => crate::sched::complete_pending_op(&po, e as i32, 0),
+            }
+        }
+        (Ok(reg), Some(place)) => start(Flushing::Mount(reg), Some(place), po)?,
+    }
+    installed.commit();
+    Ok(po_h.bits() as isize)
+}
+
+/// **`sys_io_submit`'s flush of a file**, counted in its mount's budget.
+pub(super) fn file(file: Ref<FileObject>, pid: u32) -> SysResult {
+    let place = match FileObject::touch_target(&file) {
+        Some((reg, _)) => Some(UserspaceServerReg::begin_file_op(&reg).ok_or(KError::WouldBlock)?),
+        None => None,
+    };
+    let (po, installed, po_h) = operation(pid)?;
+    start(Flushing::File(file), place, po)?;
+    installed.commit();
+    Ok(po_h.bits() as isize)
+}
+
+fn operation(pid: u32) -> Result<(Ref<PendingOperation>, Installed<'static, 1>, RawHandle), KError> {
+    let po = Ref::new(PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?);
+    let mut installed = installing::<1>(pid);
+    let po_h = installed.install(po.clone().erase(), pending_op_rights()).map_err(refused)?;
+    Ok((po, installed, po_h))
+}
+
+/// How many of `reg`'s files something holds, after the finished IRPs' references are released.
+pub(super) fn held(reg: &Ref<UserspaceServerReg>) -> Result<u64, KError> {
+    crate::io::block::reclaim_completed();
+    // Taken under the cache's lock, dropped after: each may be the last and `Drop` takes it.
+    let files = reg.cache_objects().map_err(|_| KError::OutOfMemory)?;
+    Ok(files.len() as u64)
+}
+
+enum Flushing {
+    Mount(Ref<UserspaceServerReg>),
+    File(Ref<FileObject>),
+}
+
+/// **A flush on a kernel thread**, letting go of its file and place before it completes its PO.
+pub(super) struct Flush {
+    what: Option<Flushing>,
+    place: Option<FileOp>,
+    po: Option<Ref<PendingOperation>>,
+}
+
+fn start(what: Flushing, place: Option<FileOp>, po: Ref<PendingOperation>) -> Result<(), KError> {
+    let job = KBox::try_new(Flush { what: Some(what), place, po: Some(po) }).map_err(|_| KError::OutOfMemory)?;
+    crate::sched::spawn_job(job).map_err(|_| KError::OutOfMemory)
+}
+
+impl Job for Flush {
+    fn run(mut job: KBox<Self>) {
+        let (status, written) = match job.what.take() {
+            Some(Flushing::Mount(reg)) => flush_mount(&reg),
+            Some(Flushing::File(file)) => (write_back(&file).err().map_or(0, |e| e as i32), 0),
+            None => (KError::KernelError as i32, 0),
+        };
+        drop(job.place.take());
+        if let Some(po) = job.po.take() {
+            crate::sched::complete_pending_op(&po, status, written);
+        }
+    }
+}
+
+/// Write back every dirty file of `reg`'s mount, held or not: the last failure, and the count.
+fn flush_mount(reg: &Ref<UserspaceServerReg>) -> (i32, u64) {
+    let Ok(files) = reg.cache_objects() else { return (KError::OutOfMemory as i32, 0) };
+    let (mut status, mut written) = (0, 0);
+    for f in files.iter().filter(|f| f.is_dirty()) {
+        match write_back(f) {
+            Ok(()) => written += 1,
+            Err(e) => status = e as i32,
+        }
+    }
+    (status, written)
 }
 
 /// Write one file's pages back, tell its server, and unpin it if no writable mapping appeared.
@@ -31,73 +122,6 @@ fn write_back(file_obj: &Ref<FileObject>) -> Result<(), KError> {
         FileObject::unpin_if_clean(file_obj, mark);
     }
     Ok(())
-}
-
-/// `sys_ns_sync(ns, path, path_len)` — **write back every dirty file** cached under the
-/// registration `path` resolves through in `ns`, whether or not anything still holds it (a
-/// writer that exits without syncing leaves its file dirty and pinned). Needs `LOOKUP` on `ns`:
-/// it changes no file, only makes what was written durable;
-/// `path` must resolve to a userspace server's binding, else `Unsupported`. Returns how many
-/// files were written. **Blocks** on the write IRPs in the calling thread, like `sys_file_sync`.
-pub(super) fn sys_ns_sync(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-    let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;
-    let mut buf = [0u8; NS_PATH_MAX];
-    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
-    validate_path(path).map_err(|_| KError::InvalidArgument)?;
-    let reg = match ns.resolve(path) {
-        Some((ResolvedTarget::UserspaceServer(reg, _), _, _)) => reg,
-        Some(_) => return Err(KError::Unsupported),
-        None => return Err(KError::NotFound),
-    };
-    let files = reg.cache_objects().map_err(|_| KError::OutOfMemory)?;
-    let mut written = 0isize;
-    let mut result = Ok(());
-    for f in files.iter() {
-        if !f.is_dirty() {
-            continue;
-        }
-        match write_back(f) {
-            Ok(()) => written += 1,
-            Err(e) => result = Err(e),
-        }
-    }
-    drop(files);
-    drop(reg);
-    result.map(|()| written)
-}
-
-/// `sys_ns_held(ns, path, path_len)` — **how many of a mount's files something still holds**
-/// (a handle, mapping, IRP in flight or dirty pin; the cache holds its objects weakly): the
-/// live page-cache objects of the registration `path` resolves through in `ns`, a forgotten
-/// file's aside. **Asked after [`sys_ns_sync`]**, what is left is held by someone; the storage
-/// service refuses an unmount while it is not zero.
-///
-/// **A finished IRP's reference is released first** (its box is freed only in thread context,
-/// [`crate::io::block::reclaim_completed`]), or the first unmount after a write was refused.
-/// Exact except for an IRP whose completion is still running on another CPU: that file is
-/// counted ([`storage.md`](../../docs/architecture/storage.md) §6).
-///
-/// Needs `LOOKUP`. `Unsupported` if `path` resolves to anything but a userspace server,
-/// `NotFound` if to nothing. It does not block.
-pub(super) fn sys_ns_held(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-    let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;
-    let mut buf = [0u8; NS_PATH_MAX];
-    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
-    validate_path(path).map_err(|_| KError::InvalidArgument)?;
-    let reg = match ns.resolve(path) {
-        Some((ResolvedTarget::UserspaceServer(reg, _), _, _)) => reg,
-        Some(_) => return Err(KError::Unsupported),
-        None => return Err(KError::NotFound),
-    };
-    crate::io::block::reclaim_completed();
-    // Taken under the cache's lock, dropped after: each may be the last and `Drop` takes it.
-    let files = reg.cache_objects().map_err(|_| KError::OutOfMemory)?;
-    let held = files.len() as isize;
-    drop(files);
-    drop(reg);
-    Ok(held)
 }
 
 /// Send `File::Touch` for a just-flushed Model A file so its server can stamp `mtime`. Stamps
@@ -123,3 +147,6 @@ fn notify_file_touched(file_obj: &Ref<FileObject>) {
     msg.header.handle_count = 0;
     crate::sched::us_forward_notify(&reg, &mut msg);
 }
+
+#[cfg(test)]
+mod tests;

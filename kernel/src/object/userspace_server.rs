@@ -26,6 +26,8 @@
 //! § Subtree scoping), so up to [`US_PENDING_MAX`] lookups and, independently, fills can be in
 //! flight; a full table fails a new request `WouldBlock`.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::libkern::handle::Rights;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
@@ -45,7 +47,7 @@ pub const LOOKUP_SUFFIX_MAX: usize = 256;
 pub enum ForwardOp {
     /// A plain lookup.
     Plain,
-    /// A size change first (`sys_file_create` / `_grow` / `_truncate`).
+    /// A size change first (`RESOLVE_OP_CREATE` / `_GROW` / `_TRUNCATE`).
     Size(u32, crate::rsproto::SizeChange),
     /// A rename to the lookup's `dest`, with its `RENAME_*` flags.
     Rename {
@@ -166,11 +168,26 @@ pub struct UserspaceServerReg {
     /// held), and never taken inside a `FileObject`'s lock. **No reference is ever dropped
     /// under it**, since the last one would re-enter it from `FileObject::leave_cache`.
     files: SpinLock<KVec<CachedFile>>,
+    file_ops: AtomicU32,
+}
+
+/// **How many flushes one mount runs at once**: a device that stopped fills its own budget alone.
+pub const FILE_OPS_MAX: u32 = 16;
+
+/// **A flush's place in its mount's budget**, given back as it drops.
+pub struct FileOp {
+    reg: Ref<UserspaceServerReg>,
+}
+
+impl Drop for FileOp {
+    fn drop(&mut self) {
+        self.reg.file_ops.fetch_sub(1, Ordering::Release);
+    }
 }
 
 kobject!(UserspaceServerReg, closing = crate::sched::us_reg_detach);
-// SAFETY: a registration changes once shared only in `inner`, a `SchedCell`, and behind `files`'
-// lock.
+// SAFETY: a registration changes once shared only in `inner`, a `SchedCell`, behind `files`' lock,
+// and in `file_ops`, an atomic.
 unsafe impl Shared for UserspaceServerReg {}
 
 impl UserspaceServerReg {
@@ -191,8 +208,16 @@ impl UserspaceServerReg {
                 next_id: 1,
             }),
             files: SpinLock::new(LockRank::Registry, KVec::new()),
+            file_ops: AtomicU32::new(0),
         })
         .map(Ref::new)
+    }
+
+    /// **A place in this mount's flush budget**, or `None` with every place taken.
+    pub fn begin_file_op(this: &Ref<Self>) -> Option<FileOp> {
+        let taken =
+            this.file_ops.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < FILE_OPS_MAX).then_some(n + 1));
+        taken.ok().map(|_| FileOp { reg: this.clone() })
     }
 
     // --- The file cache (its own lock; never under `SCHED`) --------------

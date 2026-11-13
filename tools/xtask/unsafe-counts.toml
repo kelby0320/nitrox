@@ -21,7 +21,7 @@
 "kernel/src/pci" = 2
 "kernel/src/power" = 1
 "kernel/src/report" = 1
-"kernel/src/sched" = 22
+"kernel/src/sched" = 24
 "kernel/src/tlb" = 2
 
 [unsafe-fns]

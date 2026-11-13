@@ -450,7 +450,7 @@ only once it completed. While a port is faulted or recovered, what is submitted 
 **A port that will not stop** may still move its command's data: that command is kept
 (`InFlight::keep`), never completed, and the disk refuses everything else. **What waits on a kept
 command waits for good**, as nothing in the kernel cancels a request: a filesystem server's write,
-and a `sys_ns_sync` behind it (deferred: *IRP cancellation and the completion timeout*). QEMU clears
+and a mount's flush behind it (deferred: *IRP cancellation and the completion timeout*). QEMU clears
 PxCI on an error, so the kept bit is a host test's (`drivers/ahci/tests.rs`); QEMU's `blkdebug`,
 failing a sector `test-qemu`'s probe reads, showed the recovery, and every probe after it passing.
 

@@ -205,15 +205,15 @@ fn get_u64(b: &[u8], off: usize) -> u64 {
 
 /// `RESOLVE_GROW` — grow the resolved file to the `new_size` appended after the suffix
 /// (allocate blocks + extend its extent tree) **before** replying its Model A map. Combined
-/// with `RESOLVE_FILE_LAZY`. For `sys_file_grow`. See `docs/architecture/ext4-fs-server-rw.md`.
+/// with `RESOLVE_FILE_LAZY`. For `RESOLVE_OP_GROW`. See `docs/architecture/ext4-fs-server-rw.md`.
 pub const RESOLVE_GROW: u32 = 1 << 2;
 /// `RESOLVE_CREATE` — create the file (in its parent directory) if it does not exist, before
-/// growing/mapping. Combined with `RESOLVE_GROW`. For `sys_file_create`.
+/// growing/mapping. Combined with `RESOLVE_GROW`. For `RESOLVE_OP_CREATE`.
 pub const RESOLVE_CREATE: u32 = 1 << 3;
 /// `RESOLVE_TRUNCATE`: **shrink** the resolved file to the `new_size` appended after the suffix
 /// (free the blocks past the new end) before replying its Model A map. Combined with
-/// `RESOLVE_FILE_LAZY`. For `sys_file_truncate`. A separate flag from [`RESOLVE_GROW`]: the two do
-/// opposite things to the block allocator and a caller must not get one when it asked for the
+/// `RESOLVE_FILE_LAZY`. For `RESOLVE_OP_TRUNCATE`. A separate flag from [`RESOLVE_GROW`]: the two
+/// do opposite things to the block allocator and a caller must not get one when it asked for the
 /// other.
 pub const RESOLVE_TRUNCATE: u32 = 1 << 4;
 /// `RESOLVE_RENAME`: rename the resolved path to a second path carried after the suffix, replying
@@ -225,11 +225,11 @@ pub const RESOLVE_RENAME: u32 = 1 << 5;
 /// Which size change a resolve carries. The size itself rides after the suffix.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum SizeChange {
-    /// Grow the file, allocating blocks (`sys_file_grow`).
+    /// Grow the file, allocating blocks (`RESOLVE_OP_GROW`).
     Grow,
-    /// Create it if absent, then grow (`sys_file_create`).
+    /// Create it if absent, then grow (`RESOLVE_OP_CREATE`).
     Create,
-    /// Shrink it, freeing blocks past the new end (`sys_file_truncate`).
+    /// Shrink it, freeing blocks past the new end (`RESOLVE_OP_TRUNCATE`).
     Truncate,
 }
 
@@ -463,7 +463,7 @@ const TOUCH_BY_ID_LEN: usize = 8;
 /// the writer is one the writer could choose (decision log 2026-07-22).
 ///
 /// Expects **no reply**: `request_id` stays `0` and nothing is registered as pending, which keeps
-/// `sys_file_sync` off a second blocking round trip. Ordering holds where it matters: the request
+/// a file's flush off a second blocking round trip. Ordering holds where it matters: the request
 /// goes into the same endpoint ring as forwarded resolves.
 pub fn build_touch_request(out: &mut [u8], file_id: u64) -> Option<usize> {
     let body_len = TOUCH_BY_ID_LEN;
