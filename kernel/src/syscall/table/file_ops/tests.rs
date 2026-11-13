@@ -98,3 +98,93 @@ fn a_flushs_thread_runs_each_flush_its_place_passes_to_and_completes_each() {
     assert_eq!(admit(&reg, flush(502, None)), Ok(true), "fifteen run, the thread's place given back");
     assert_eq!(admit(&reg, flush(503, None)), Ok(false));
 }
+
+/// A block file of `pages` pages on the device, but for `holes`.
+fn on_device(reg: &Ref<UserspaceServerReg>, pages: u64, holes: &[u64]) -> Ref<FileObject> {
+    let mut runs = crate::libkern::KVec::new();
+    for page in (0..pages).filter(|p| !holes.contains(p)) {
+        runs.try_push(crate::object::BlockRun { file_block: page, device_lba: 100 + page, length: 1, flags: 0 })
+            .unwrap();
+    }
+    let device =
+        Ref::new(DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap());
+    let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 0 };
+    Ref::new(FileObject::try_new_with_runs(pages as usize * PAGE_SIZE, producer, runs).unwrap())
+}
+
+fn io(
+    pid: u32,
+    file: &Ref<FileObject>,
+    rights: Rights,
+    opcode: IoOpcode,
+    buffer: RawHandle,
+    at: (u64, u64, u64),
+) -> SysResult {
+    let op = IoOp { opcode: opcode as u32, flags: 0, buffer: buffer.0, buf_offset: at.0, offset: at.1, length: at.2 };
+    submit(file.clone(), rights, &op, opcode, pid)
+}
+
+#[test]
+fn a_files_read_or_write_is_refused_without_its_rights_its_range_or_a_buffer_that_holds_it() {
+    const PID: u32 = 4491;
+    init_global_heap();
+    global::init_for_tests();
+    let reg = registration();
+    fill(&reg);
+    let f = on_device(&reg, 2, &[1]);
+    let both = Rights::MAP_READ | Rights::MAP_WRITE;
+    let mo =
+        |rights| global::get().install(PID, ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap()), rights).unwrap();
+    let (rw, ro) = (mo(both), mo(Rights::MAP_READ));
+    let page = PAGE_SIZE as u64;
+    assert_eq!(io(PID, &f, Rights::MAP_WRITE, IoOpcode::Read, rw, (0, 0, 1)), Err(KError::NoAccess));
+    assert_eq!(io(PID, &f, Rights::MAP_READ, IoOpcode::Write, rw, (0, 0, 1)), Err(KError::NoAccess));
+    assert_eq!(io(PID, &f, both, IoOpcode::Read, ro, (0, 0, 1)), Err(KError::NoAccess), "a read's buffer is written");
+    assert_eq!(io(PID, &f, both, IoOpcode::Read, rw, (1, 0, page)), Err(KError::InvalidArgument), "past the buffer");
+    assert_eq!(
+        io(PID, &f, both, IoOpcode::Write, rw, (0, 2 * page - 1, 2)),
+        Err(KError::InvalidArgument),
+        "past the end"
+    );
+    assert_eq!(io(PID, &f, both, IoOpcode::Write, rw, (0, page, 1)), Err(KError::Unsupported), "over a hole");
+    let src = global::get().install(PID, on_device(&reg, 1, &[]).erase(), Rights::MAP_READ).unwrap();
+    assert_eq!(io(PID, &f, both, IoOpcode::Write, src, (1, 0, page)), Err(KError::InvalidArgument), "past the source");
+    let writable_file = global::get().install(PID, on_device(&reg, 1, &[]).erase(), both).unwrap();
+    let into_file = io(PID, &f, both, IoOpcode::Read, writable_file, (0, 0, 1));
+    assert_eq!(into_file, Err(KError::InvalidArgument), "a read into a file");
+    let big = on_device(&reg, (MAX_USER_COPY_SIZE / page) + 2, &[]);
+    let big_src = global::get().install(PID, big.clone().erase(), Rights::MAP_READ).unwrap();
+    let past_window = (0, 0, MAX_USER_COPY_SIZE + 1);
+    assert_eq!(io(PID, &big, both, IoOpcode::Write, big_src, past_window), Err(KError::InvalidArgument), "a window");
+    let flagged = IoOp { opcode: IoOpcode::Read as u32, flags: 1, buffer: rw.0, buf_offset: 0, offset: 0, length: 1 };
+    assert_eq!(submit(f.clone(), both, &flagged, IoOpcode::Read, PID), Err(KError::InvalidArgument));
+    let stub = Ref::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap());
+    assert_eq!(io(PID, &stub, both, IoOpcode::Read, rw, (0, 0, 1)), Err(KError::Unsupported), "no server's");
+    assert_eq!(global::close_all_owned_by(PID), 5);
+}
+
+#[test]
+fn a_read_at_the_end_completes_at_once_and_a_full_mount_queues_the_rest_in_turn() {
+    const PID: u32 = 4492;
+    init_global_heap();
+    global::init_for_tests();
+    let reg = registration();
+    let f = on_device(&reg, 1, &[]);
+    let both = Rights::MAP_READ | Rights::MAP_WRITE;
+    let rw = global::get().install(PID, ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap()), both).unwrap();
+    let operation_of = |h: isize| {
+        let found = global::get().lookup(RawHandle(h as u64), PID, Rights::empty()).unwrap();
+        found.object.downcast::<PendingOperation>().ok().unwrap()
+    };
+    let running = fill(&reg);
+    let at_end = operation_of(io(PID, &f, both, IoOpcode::Read, rw, (0, PAGE_SIZE as u64, 1)).unwrap());
+    assert_eq!(crate::sched::pending_op_completion(&at_end), (0, 0), "answered, not queued");
+    let read = operation_of(io(PID, &f, both, IoOpcode::Read, rw, (0, 0, 8)).unwrap());
+    let write = operation_of(io(PID, &f, both, IoOpcode::Write, rw, (0, 0, 8)).unwrap());
+    assert!(!crate::sched::pending_op_is_signaled(&read) && !crate::sched::pending_op_is_signaled(&write));
+    let next = reg.op_done(running[0]).unwrap();
+    assert!(matches!(next.work, FileWork::Read(..)) && core::ptr::eq(&*next.po, &*read), "in turn");
+    let next = reg.op_done(running[1]).unwrap();
+    assert!(matches!(next.work, FileWork::Write(..)) && core::ptr::eq(&*next.po, &*write));
+    global::close_all_owned_by(PID);
+}

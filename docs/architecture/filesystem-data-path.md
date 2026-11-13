@@ -138,6 +138,9 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
 - **Writable mappings, and dirty per object**: `sys_memory_map` grants `MAP_WRITE` on a
   `FileObject` when requested and permitted, and a store faults in a writable PTE. The object
   counts its writable mappings, and one mapped writable is **dirty** (§ *One object per file*).
+  **A `Write` through `sys_io_submit`** (pre-Phase-7 E.8) counts as one for as long as it runs, and
+  so dirties the file the same way; a `Read` fills pages as a fault does, on a kernel thread rather
+  than the reader's ([`io-operation.md`](../spec/io-operation.md) § *A file as the resource*).
   There is no per-page dirty bit (`TODO(page-dirty-tracking)`). This bullet said a store "marks
   the `CachePage` dirty" until 2026-09-24, when the administration Part C detail pass found no such
   state in the code.

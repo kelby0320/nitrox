@@ -245,7 +245,7 @@ mod fault;
 /// Page-cache fill and write-back counters, the measurement behind the read-ahead decision.
 /// Always on: two atomic adds per fill are nothing beside the block read they bracket.
 pub mod fill_stats;
-mod flush;
+pub mod io;
 
 impl FileObject {
     /// **Out of the registration's cache** before the box is rebuilt, by address (a new object for

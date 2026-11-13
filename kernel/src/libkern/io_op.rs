@@ -36,6 +36,10 @@ pub const IO_OPCODE_RESCAN: u32 = 3;
 /// [`IoOpcode::Eject`]'s value.
 pub const IO_OPCODE_EJECT: u32 = 4;
 
+/// **The most one `Read` or `Write` of a file moves**, a copy's window: a memory buffer is held to
+/// it by its size, a file as a buffer by this.
+pub const MAX_USER_COPY_SIZE: u64 = 16 << 20;
+
 /// The operation selector. `#[repr(u32)]`; part of the ABI version hash. Each value is stated
 /// once, above, and the variants take it.
 #[repr(u32)]

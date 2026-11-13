@@ -360,3 +360,4 @@ fn a_whole_read_fails_at_a_page_truncated_after_its_fault() {
 }
 
 mod io;
+mod rw;

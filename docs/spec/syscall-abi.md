@@ -189,8 +189,10 @@ Phase 2 slice 5).
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
 ```
 Initiates the [`IoOp`](io-operation.md) `*op` against `resource` and returns a
-`PendingOperation` handle (positive value); it **never blocks**. In Phase 2
-`resource` is a block [`DeviceNode`](device-node.md) and the opcodes are
+`PendingOperation` handle (positive value); it **never blocks**. `resource` is a
+[`DeviceNode`](device-node.md), or a `FileObject`, which takes `Read` and `Write` a page at a time
+through its page cache, and a copy from another file
+([`io-operation.md`](io-operation.md) § *A file as the resource*). A block device's opcodes are
 `Read`/`Write`/`Flush`/`Rescan`/`Eject`; the last three name no buffer and no range, and a
 `Flush` completes once the device's cache is on its medium. **A `Flush` on a `FileObject`** puts
 every page of the file on the device instead: it needs `MAP_WRITE`, as a writable mapping does,

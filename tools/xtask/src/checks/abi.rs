@@ -107,6 +107,13 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         one_sided: &[],
     },
     AbiFamily {
+        what: "the I/O window",
+        kernel_file: "kernel/src/libkern/io_op.rs",
+        user_files: &["userspace/libkern/src/abi.rs"],
+        shape: AbiShape::U64Const,
+        one_sided: &[],
+    },
+    AbiFamily {
         what: "resolve operations",
         kernel_file: "kernel/src/libkern/resolve_op.rs",
         user_files: &["userspace/libkern/src/abi.rs"],

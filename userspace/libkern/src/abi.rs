@@ -325,6 +325,8 @@ pub const IO_OPCODE_RESCAN: u32 = 3;
 /// `IoOpcode::Eject` — stop a removable disk's medium; every later request on it is refused
 /// `PeerClosed` until it is plugged in again. As for a rescan: no buffer, no range, `WRITE`.
 pub const IO_OPCODE_EJECT: u32 = 4;
+/// **The most one `Read` or `Write` of a file moves**, a copy's window.
+pub const MAX_USER_COPY_SIZE: u64 = 16 << 20;
 
 /// The `sys_io_submit` operation descriptor — the userspace mirror of the
 /// kernel's `IoOp` (`docs/spec/io-operation.md`). 40 bytes, 8-byte aligned.

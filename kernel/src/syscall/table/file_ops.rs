@@ -1,9 +1,54 @@
-//! A mount's file operations, each on a kernel thread of its own, admitted to the mount's budget.
+//! A mount's file operations, each on a kernel thread of its own, admitted to the mount's budget:
+//! its flushes, and `sys_io_submit`'s `Read` and `Write` on a file.
 
-use super::flush::{flush_mount, write_back};
+use super::flush::{flush_mount, operation, write_back};
 use super::*;
-use crate::object::userspace_server::{FileWork, QueuedOp};
+use crate::libkern::io_op::MAX_USER_COPY_SIZE;
+use crate::object::file_object::io::Source;
+use crate::object::userspace_server::{FileWork, QueuedOp, Span};
 use crate::sched::Job;
+
+/// **`Read` or `Write` on `file`, held with `rights`**: `MAP_READ` to read it into a memory object,
+/// `MAP_WRITE` to write it from one or from another file, which a copy reads with `MAP_READ`.
+pub(super) fn submit(file: Ref<FileObject>, rights: Rights, op: &IoOp, opcode: IoOpcode, pid: u32) -> SysResult {
+    let read = opcode == IoOpcode::Read;
+    let (need, buf_need) =
+        if read { (Rights::MAP_READ, Rights::MAP_WRITE) } else { (Rights::MAP_WRITE, Rights::MAP_READ) };
+    if !rights.contains(need) {
+        return Err(KError::NoAccess);
+    }
+    if op.flags != 0 || op.length > MAX_USER_COPY_SIZE {
+        return Err(KError::InvalidArgument);
+    }
+    let buf_end = op.buf_offset.checked_add(op.length).ok_or(KError::InvalidArgument)?;
+    let buffer = global::get().lookup(RawHandle(op.buffer), pid, buf_need).map_err(map_handle_err)?.object;
+    let from = match buffer.downcast::<MemoryObject>() {
+        Ok(mo) if buf_end <= super::submit::io_buffer_size(&mo)? => Source::Memory(mo),
+        Err(other) if !read => match other.downcast::<FileObject>() {
+            Ok(f) if buf_end <= f.size() as u64 => Source::File(f),
+            _ => return Err(KError::InvalidArgument),
+        },
+        _ => return Err(KError::InvalidArgument),
+    };
+    if !read {
+        file.writable_range(op.offset, op.length)?;
+    }
+    let reg = file.op_owner().ok_or(KError::Unsupported)?;
+    let nothing = op.length == 0 || (read && op.offset >= file.size() as u64);
+    let span = Span { file, offset: op.offset, buf_offset: op.buf_offset, length: op.length };
+    let work = match from {
+        Source::Memory(mo) if read => FileWork::Read(span, mo),
+        from => FileWork::Write(span, from),
+    };
+    let (po, installed, po_h) = operation(pid)?;
+    if nothing {
+        crate::sched::complete_pending_op(&po, 0, 0);
+    } else {
+        admit(reg, QueuedOp { work, po, pid })?;
+    }
+    installed.commit();
+    Ok(po_h.bits() as isize)
+}
 
 /// Run `op` now or queue it; `WouldBlock` past its process's share.
 pub(super) fn admit(reg: Ref<UserspaceServerReg>, op: QueuedOp) -> Result<(), KError> {
@@ -73,9 +118,14 @@ pub(super) fn finish(
     op: QueuedOp,
 ) -> (Ref<PendingOperation>, i32, u64, Option<QueuedOp>) {
     let QueuedOp { work, po, pid } = op;
+    let mut fault = |file: &Ref<FileObject>, index| FileObject::fault_in_page(file, index);
     let (status, done) = match work {
         FileWork::FlushMount => flush_mount(reg),
         FileWork::Flush(file) => (write_back(&file).err().map_or(0, |e| e as i32), 0),
+        FileWork::Read(s, into) => FileObject::read_into(&s.file, s.offset, s.length, &into, s.buf_offset, &mut fault),
+        FileWork::Write(s, from) => {
+            FileObject::write_from(&s.file, s.offset, s.length, &from, s.buf_offset, &mut fault)
+        }
     };
     (po, status, done, reg.op_done(pid))
 }

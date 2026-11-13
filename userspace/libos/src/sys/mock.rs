@@ -334,6 +334,9 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
             let status = m.fail_sync.take().unwrap_or(0);
             return m.po(Po { ready: !m.flush_never, never: m.flush_never, status, result: 0, lookup: None });
         }
+        if file && (op.opcode == libkern::IO_OPCODE_READ || op.opcode == libkern::IO_OPCODE_WRITE) {
+            return file_io::file_io(m, resource, op);
+        }
         if let Err(r) = m.get(resource, Rights::empty()) {
             return r;
         }
@@ -903,6 +906,7 @@ pub fn power(h: u64, op: u64) -> i64 {
 }
 
 mod controls;
+mod file_io;
 mod resolve;
 mod thread;
 mod time;

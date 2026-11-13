@@ -29,8 +29,9 @@
 use crate::libkern::handle::Rights;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
+use crate::object::file_object::io::Source;
 use crate::object::header::{Header, Ref, Shared, Weak, kobject};
-use crate::object::{FileObject, Forgotten, IpcChannel, PendingOperation};
+use crate::object::{FileObject, Forgotten, IpcChannel, MemoryObject, PendingOperation};
 use crate::sched::{SchedCell, SchedToken};
 use crate::syscall::error::KError;
 
@@ -183,6 +184,22 @@ pub enum FileWork {
     FlushMount,
     /// Write back one file's pages.
     Flush(Ref<FileObject>),
+    /// Read the span into a memory object.
+    Read(Span, Ref<MemoryObject>),
+    /// Write the span from a memory object or another file.
+    Write(Span, Source),
+}
+
+/// `length` bytes of `file` from `offset`, and of its buffer from `buf_offset`.
+pub struct Span {
+    /// The file read or written.
+    pub file: Ref<FileObject>,
+    /// Where in it.
+    pub offset: u64,
+    /// Where in the buffer.
+    pub buf_offset: u64,
+    /// How many bytes.
+    pub length: u64,
 }
 
 /// A file operation for process `pid`, answered through `po`.
