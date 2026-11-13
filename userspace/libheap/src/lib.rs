@@ -345,7 +345,7 @@ unsafe impl ArenaSource for SyscallSource {
         let rights = libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE;
         // SAFETY: map the just-created object read/write, kernel-chosen address
         // (hint = 0). Returns the mapped address or a negative error.
-        let addr = unsafe { libkern::syscall4(libkern::SYS_MEMORY_MAP, h as u64, 0, size as u64, rights) };
+        let addr = unsafe { libkern::syscall5(libkern::SYS_MEMORY_MAP, h as u64, 0, size as u64, rights, 0) };
         if addr < 0 {
             // SAFETY: `h` is the handle we just created.
             unsafe { libkern::syscall1(libkern::SYS_HANDLE_CLOSE, h as u64) };

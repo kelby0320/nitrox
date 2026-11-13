@@ -136,8 +136,8 @@ first grant is the child's `rdx`. **Without `namespace()`, the child shares this
 a thread of its has ended, so nothing could give the stack back safely. `Stack::new` is one
 mapping each, and `start` hands the kernel its top, which enters every thread with `rsp` 8 below a
 16-byte boundary, as a `call` would leave it (`enter_user`). A thread's entry is `extern "C"
-fn(u64, u64, u64, u64) -> !`, `rcx` its `arg0`. An overrun lands in the mapping below until a
-hint-less map leaves a gap there, `TODO(thread-stack-guard)`.
+fn(u64, u64, u64, u64) -> !`, `rcx` its `arg0`. An overrun meets the page the kernel leaves
+unmapped below every mapping it places, and faults. `map_range` maps an object from a page of it.
 
 ## The async model
 

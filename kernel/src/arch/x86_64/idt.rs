@@ -265,8 +265,14 @@ irq_dispatcher! {
 fn pf_dispatch(f: &mut ExceptionFrame) {
     debug_assert_eq!(f.vector, 14);
     let cr2 = regs::read_cr2();
+    let present = f.error_code & 1 != 0;
 
     if let Some(recovery) = crate::mm::user_access::lookup_recovery(f.rip, cr2) {
+        // A kernel copy met a page not yet faulted in: served where nothing waits, and the copy
+        // retried. No copy holds a lock (`user_access`).
+        if !present && try_fault_in(cr2, f.error_code, false) {
+            return;
+        }
         f.rip = recovery;
         return;
     }
@@ -275,8 +281,7 @@ fn pf_dispatch(f: &mut ExceptionFrame) {
 
         // Demand paging: a not-present ring-3 fault may fall in a reserved-but-unbacked
         // anonymous VMA. Try to fault it in; on success the stub `iretq`s and the access retries.
-        let present = f.error_code & 1 != 0;
-        if !present && try_fault_in(cr2, f.error_code) {
+        if !present && try_fault_in(cr2, f.error_code, true) {
             return;
         }
 
@@ -293,13 +298,12 @@ fn pf_dispatch(f: &mut ExceptionFrame) {
 
 /// Try to demand-fault the page at `cr2` into the running process's address space, taking only
 /// the access *kind* from `error_code` (the caller has confirmed not-present). Returns `true`
-/// iff a frame was faulted in and the instruction may be retried.
+/// iff the instruction may be retried: a frame was faulted in, or the mapping moved under a fill.
 ///
-/// Reached only for ring-3 faults, so the thread holds no kernel locks and taking the
-/// address-space lock cannot deadlock. Kernel copy-primitive faults are caught earlier by
-/// `lookup_recovery`; a kernel access to a not-yet-faulted user page is not auto-populated
-/// (see `docs/rationale/deferred-decisions.md`).
-fn try_fault_in(cr2: u64, error_code: u64) -> bool {
+/// No lock is held at a ring-3 fault or a kernel copy's, so taking the address-space lock cannot
+/// deadlock. **A file's page not resident is filled only if `may_wait`**: a kernel copy fails rather
+/// than stop on a device inside a syscall, `TODO(copy-from-unread-file)`.
+fn try_fault_in(cr2: u64, error_code: u64, may_wait: bool) -> bool {
     use crate::mm::vmm::FaultAccess;
 
     let write = error_code & (1 << 1) != 0;
@@ -329,10 +333,13 @@ fn try_fault_in(cr2: u64, error_code: u64) -> bool {
             let Some((file_obj, index)) = asp.file_backing(addr) else {
                 return false;
             };
-            match crate::object::FileObject::fault_in_page(&file_obj, index) {
-                Some(frame) => asp.map_file_page(addr, &file_obj, frame),
-                None => false,
-            }
+            let frame = match may_wait {
+                true => crate::object::FileObject::fault_in_page(&file_obj, index),
+                false => file_obj.resident_page(index),
+            };
+            frame.is_some_and(|frame| {
+                asp.map_file_page(addr, &file_obj, index, frame) != crate::mm::addr_space::FilePage::NoMemory
+            })
         }
         _ => false,
     }

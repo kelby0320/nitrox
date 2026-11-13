@@ -172,7 +172,7 @@ pub fn classify(rank: LockRank, held: &[u8], taken: Taken) -> Acquisition {
 /// per-CPU model does not hold there).
 #[cfg(all(debug_assertions, not(test)))]
 pub use tracker::{
-    IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing,
+    IrqScope, acquired, assert_switch_safe, assert_user_copy_safe, assert_user_entry_safe, enter_interrupt, releasing,
     sched_held_by_this_thread,
 };
 
@@ -227,10 +227,17 @@ mod inert {
     pub fn assert_switch_safe() {}
     #[inline(always)]
     pub fn assert_user_entry_safe() {}
+    #[inline(always)]
+    pub fn assert_user_copy_safe() {
+        #[cfg(test)]
+        assert_eq!(held_by_this_thread(), 0, "a copy of user memory with a lock held");
+    }
 }
 
 #[cfg(not(all(debug_assertions, not(test))))]
-pub use inert::{IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing};
+pub use inert::{
+    IrqScope, acquired, assert_switch_safe, assert_user_copy_safe, assert_user_entry_safe, enter_interrupt, releasing,
+};
 #[cfg(test)]
 pub use inert::{held_by_this_thread, sched_held_by_this_thread};
 
@@ -411,11 +418,17 @@ mod tracker {
         assert_empty(Site::UserEntry);
     }
 
+    /// Assert that this CPU holds nothing as a thread copies user memory, whose fault may page in.
+    pub fn assert_user_copy_safe() {
+        assert_empty(Site::UserCopy);
+    }
+
     /// Which boundary [`assert_empty`] is checking; only used to word the report.
     #[derive(Copy, Clone)]
     enum Site {
         ContextSwitch,
         UserEntry,
+        UserCopy,
     }
 
     fn assert_empty(site: Site) {
@@ -518,6 +531,10 @@ mod tracker {
             Site::UserEntry => {
                 "ring-3 entry — the calling thread was in user mode and can hold nothing, so \
                  this is a leaked acquire from earlier on this CPU"
+            }
+            Site::UserCopy => {
+                "a copy of user memory — it may fault a page in, which takes the address \
+                 space's lock and allocates, so no copy may hold a lock"
             }
         };
         panic!(

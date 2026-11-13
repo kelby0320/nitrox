@@ -3,6 +3,14 @@
 use super::*;
 
 impl FileObject {
+    /// **Page `index`'s frame if it is resident**, for a fault that may not wait for a fill.
+    pub fn resident_page(&self, index: usize) -> Option<PhysAddr> {
+        match self.inner.lock().pages.iter().find(|p| p.index == index) {
+            Some(p) if p.state == PageState::Ready => Some(p.frame.phys()),
+            _ => None,
+        }
+    }
+
     /// **Fault page `index` in**, blocking until it is resident: a hit returns at once; a miss
     /// reserves a frame, starts the producer fill, and **parks the calling thread** on the fill's
     /// `PendingOperation`. `None` on a frame/PO allocation failure or a failed fill. Called from

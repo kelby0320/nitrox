@@ -467,7 +467,7 @@ pub fn memory_create(size: u64) -> i64 {
     })
 }
 
-pub fn memory_map(h: u64, _hint: u64, size: u64, rights: u64) -> i64 {
+pub fn memory_map(h: u64, _hint: u64, size: u64, rights: u64, offset: u64) -> i64 {
     with(|m| {
         let (obj, have) = match m.get(h, Rights::empty()) {
             Ok(got) => got,
@@ -489,15 +489,16 @@ pub fn memory_map(h: u64, _hint: u64, size: u64, rights: u64) -> i64 {
             }
             _ => return e(KError::InvalidArgument),
         };
-        if size == 0 || size as usize > room {
+        let end = (size as usize).next_multiple_of(PAGE).checked_add(offset as usize);
+        if size == 0 || !(offset as usize).is_multiple_of(PAGE) || end.is_none_or(|end| end > room) {
             return e(KError::InvalidArgument);
         }
-        let base = match &mut m.objects[obj] {
-            Object::Memory(b) | Object::File { bytes: b, .. } => b.base(),
+        let at = match &mut m.objects[obj] {
+            Object::Memory(b) | Object::File { bytes: b, .. } => b.base() + offset,
             _ => unreachable!("checked mappable"),
         };
-        m.maps.entry(base).and_modify(|(_, n)| *n += 1).or_insert((obj, 1));
-        base as i64
+        m.maps.entry(at).and_modify(|(_, n)| *n += 1).or_insert((obj, 1));
+        at as i64
     })
 }
 

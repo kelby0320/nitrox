@@ -2306,13 +2306,6 @@ at 4. The check compares named values, so naming each on both sides would let it
 E.7 of [`syscall-surface.md`](../planning/syscall-surface.md) rewrites the resolve and its replies,
 and names them there rather than now and again then. Trigger: E.7.
 
-**A thread's stack has no guard below it — `TODO(thread-stack-guard)`.** `libos::thread::Stack`
-is a mapping of its own, but a mapping placed without a hint lies flush against the one below, so
-a thread that overruns its stack writes into that mapping rather than faulting. The main thread's
-stack has a guard gap; no other does. The kernel's half of the safety survey's th-d9, planned in
-Part E.6 of [`syscall-surface.md`](../planning/syscall-surface.md): `find_free_range` leaves an
-unmapped page below what a hint-less map places. Trigger: E.6.
-
 **vDSO-equivalent for `sys_clock_read`.** On modern Linux, `clock_gettime` is implemented in vDSO — userspace reads TSC directly, no syscall. Nitrox initially does one syscall per `sys_clock_read`. The API shape leaves room for this optimization later (the `ClockId` enum can map to fixed memory locations) without changing call sites.
 
 ### Concurrency primitives
@@ -2384,6 +2377,15 @@ holding objects closes, or the send rule extended to whatever can hold an endpoi
 binder outside the supervisors, or the first report of kernel memory lost this way.
 
 ### Memory management
+
+**A kernel copy from a file's page not resident fails — `TODO(copy-from-unread-file)`.** A copy of
+user memory that meets a page not yet faulted in is served in the `#PF` handler where nothing has
+to wait: an anonymous page is zeroed, and a file's page the cache holds is mapped. A file's page
+the cache does not hold fails the copy at once, `FaultFromUser`. Fetching it would stop the thread
+on a device inside a syscall, with no `PendingOperation` and no deadline, which async-first does
+not allow, and a `sys_wait` could not then bound even the copy of its own results. A program that
+passes a buffer in a file it mapped touches its pages first. Trigger: a consumer that cannot,
+which would want the copy to answer through a `PendingOperation` of its own.
 
 **The process memory model — one pass, four parts.** These extend the same AS/fault
 machinery and should land together rather than as four independent entries each waiting on
@@ -2513,6 +2515,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A thread's stack with no guard below it (`thread-stack-guard`) | 2026-11-13 | **Pre-Phase-7 E.6**: a mapping placed without a hint keeps an unmapped page below itself, and below the mapping above it, so a `libos::thread::Stack` that overruns faults rather than write the mapping beneath. A hinted mapping is not held off that page. |
 | A handle's rights checked against the tag its caller passes (`handle-install-tag`) | 2026-11-06 | **`HandleTable::install(pid, ObjectRef, rights)`, pre-Phase-7 J.3**: the tag is the reference's own, its object's header's, and the reference comes back with a refusal. `allocate`, which took a tag beside a raw pointer, is private to the table and `unsafe`, so no caller writes a tag. |
 | A library's raw-handle functions beside its typed ones (`raw-handle-shims`) | 2026-11-05 | **Their last callers moved**: the test harness and the two filesystem servers' entry, in pre-Phase-7 Part E.5, and the thirty-three shims went with them, and with them what only they used: `librsproto`'s raw `Dir` session and libstream's raw `Bootstrap`. Each library's only form is its typed one. |
 | Five provenance tests that only Miri can fail (`miri-provenance-tests`) | 2026-11-01 | **The Miri job**, `cargo xtask miri`, nightly and by hand: each pins a pointer's provenance, which the hardware cannot see, so natively it passes on the old code as on the new, and half of a sixth, a fill answered with the wrong kind of object, reads uninitialised bytes that happen to refuse. All of them now run in that job. |

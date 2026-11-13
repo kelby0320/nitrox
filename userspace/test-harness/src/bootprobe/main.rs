@@ -40,6 +40,7 @@ mod exits;
 mod filelib;
 mod files;
 mod gates;
+mod mapping;
 mod policy;
 mod received;
 mod refused;
@@ -60,6 +61,7 @@ use exits::*;
 use filelib::*;
 use files::*;
 use gates::*;
+use mapping::*;
 use policy::*;
 use received::*;
 use registry::*;
@@ -115,6 +117,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
     // rest — a boot that fails three of these should say three, not one.
     let ok = sched_gate(root)
         & fp_gate()
+        & copy_from_pages_not_faulted_in_test(root)
+        & map_window_test(root)
+        & anywhere_maps_test()
         & read_large_file(root)
         & overwrite_test(root)
         & grow_test(root)

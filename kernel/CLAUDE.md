@@ -30,7 +30,7 @@ Rules:
 - Every `unsafe` block has a `// SAFETY:` comment explaining the invariants that make it sound.
 - Don't extend `unsafe` to new files without a reason. The total `unsafe` surface is roughly 10-15% of the kernel; adding `unsafe` should require justification. `cargo xtask check-unsafe` holds each module's count of each kind of `unsafe` (blocks, `unsafe fn`s and `unsafe impl`s, `#[unsafe(..)]` attributes, `unsafe extern` blocks and `static mut`s) to `tools/xtask/unsafe-counts.toml`, and a raise is made by hand in the commit that adds the `unsafe`, saying why.
 - Wrap `unsafe` operations in safe abstractions where possible. The arch layer is unsafe internally but exposes safe traits.
-- Pointer dereferences in safe code through `UserPtr<T>` / `UserMutPtr<T>` are forbidden. The only way to access user memory is via the copy primitives in `kernel/src/mm/user_access.rs`.
+- Pointer dereferences in safe code through `UserPtr<T>` / `UserMutPtr<T>` are forbidden. The only way to access user memory is via the copy primitives in `kernel/src/mm/user_access.rs`, and **no lock is held across one**: a copy that meets a page not yet faulted in has it served in the `#PF` handler, which takes the address space's lock and may allocate. `lockrank` asserts it at every copy.
 - A frame of RAM is owned by a `Frame`, and a block of them by a `FrameBlock` (`kernel/src/mm/frame.rs`), freed as it drops: the buddy's frees are `unsafe` and `mm`'s alone, never a call by hand. A page table that maps a frame takes it by `Frame::into_pte`, as an address space does its root and a `VmapFrames` its frames, so no view reaches a frame the kernel reaches another way; an unmap takes an anonymous page's back by the `unsafe` `Frame::from_pte`, dropping it after its shootdown.
 - Page tables are owned (`kernel/src/mm/page_tables.rs`): the boot root by `KernelTables`, an address space's by `UserTables`, behind its lock. A root is a bare address only where a CPU loads it, which stays `unsafe`; an owned frame is mapped by the safe `UserTables::map_owned`, and a user half refuses any address at or past `USER_MAP_END`; no map links a kernel-half top-level table, which every root shares.
 - Per-CPU state is reached under a pin (`kernel/src/arch/percpu.rs`): a `CpuPin`, lent by an `IrqsOff`, an `IrqSpinLockGuard`, a `PreemptOff` or the scheduler's held state, under which `CpuIndex::current` reads the CPU's index. The arch layer's arrays are `PerCpu`s, reached by raw slot; a shared value per CPU is a `cpu_local!`. The raw read is `arch`'s: outside it, only `leave_online` reads the index unpinned, through `Smp::bound_index`, on a CPU about to halt; every core adopts its index by its APIC id.
@@ -98,8 +98,8 @@ This is intentional — strict equality matching prevents subtle ABI mismatches.
   `SCHED`, which debug builds assert on every drop) either. A `SCHED` hold lets go of
   references through a `Deferred<N>` bag (`kernel/src/sched/deferred.rs`), dropped after the
   lock; an interrupt's bag parks them in `deferred_drops`. Two documented
-  exceptions, both reached only from ring 3, where nothing is held: the `#PF`
-  fault-in path (`map_page` may allocate intermediate page-table frames —
+  exceptions, both reached where nothing is held: the `#PF` fault-in path, from
+  ring 3 or from a kernel copy of user memory (`map_page` may allocate intermediate page-table frames —
   `kernel/docs/lock-ordering.md` § The AddressSpace lock), and a thread ending
   itself at an interrupt's return to ring 3 (§ A thread ends itself).
 - Holding a spinlock across a function call that might allocate or block.

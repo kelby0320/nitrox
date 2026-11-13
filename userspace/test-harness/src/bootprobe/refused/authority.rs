@@ -24,9 +24,11 @@ pub(crate) fn set_monotonic_clock(ns: u64) -> i64 {
 
 /// What mapping `len` bytes of `h` asking for `rights` answers: the address, unmapped at once, or
 /// the refusal. libos's `map` always asks for the principal rights of its type.
-pub(crate) fn map_asking<T, M>(h: &Handle<T, M>, len: u64, rights: u64) -> i64 {
-    // SAFETY: register-only syscall on a handle this process holds.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, h.raw().0, 0, len, rights) };
+/// `hint` names where, `0` anywhere.
+pub(crate) fn map_asking<T, M>(h: &Handle<T, M>, hint: u64, len: u64, rights: u64) -> i64 {
+    // SAFETY: register-only syscall on a handle this process holds; a named range the kernel
+    // refuses if anything is mapped there.
+    let addr = unsafe { syscall5(SYS_MEMORY_MAP, h.raw().0, hint, len, rights, 0) };
     if addr > 0 {
         // SAFETY: unmapping the mapping just made, which nothing read or wrote.
         unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len) };

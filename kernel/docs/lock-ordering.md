@@ -241,11 +241,13 @@ This is sound:
   is held; the handler acquires nothing higher-ranked first (it reaches the AS
   through `current_process()`, which takes rank-1 `SCHED` *briefly and releases
   it* before returning), so rank 4 is the only lock held during the fault-in.
-- It is reached **only for ring-3 faults** (`cs & 3 == 3`). A user thread never
-  holds the kernel `AddressSpace` lock, so the faulting context cannot already
-  own the lock the handler is about to take — no self-deadlock. Kernel
-  copy-primitive faults are caught earlier by the user-access recovery table and
-  never reach `fault_in`.
+- It is reached for a **ring-3 fault** (`cs & 3 == 3`), and for a **kernel copy of
+  user memory** whose page is not yet faulted in. A user thread holds no kernel
+  lock, and no copy runs with one held: `lockrank` asserts it at every copy
+  (`assert_user_copy_safe`). So the faulting context cannot already own the lock
+  the handler is about to take — no self-deadlock. A copy's fault waits for
+  nothing: it zeroes an anonymous page or maps a file's resident one, and a file's
+  page not resident fails the copy.
 
 The faulting address space **is live in the MMU**, so `fault_in` flushes the
 faulted page's stale not-present TLB entry after installing the PTE (unlike the

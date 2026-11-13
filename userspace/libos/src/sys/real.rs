@@ -57,9 +57,9 @@ pub fn memory_create(size: u64) -> i64 {
 }
 
 /// `sys_memory_map` — returns the base address (`hint = 0` lets the kernel choose).
-pub fn memory_map(h: u64, hint: u64, size: u64, rights: u64) -> i64 {
+pub fn memory_map(h: u64, hint: u64, size: u64, rights: u64, offset: u64) -> i64 {
     // SAFETY: a register-only call; the kernel places the mapping where nothing is mapped.
-    unsafe { syscall4(libkern::SYS_MEMORY_MAP, h, hint, size, rights) }
+    unsafe { syscall5(libkern::SYS_MEMORY_MAP, h, hint, size, rights, offset) }
 }
 
 /// `sys_memory_unmap(addr, size)` — unmap the region covering `addr`.

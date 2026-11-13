@@ -11,8 +11,18 @@ pub(super) fn full_mem_rights() -> Rights {
 pub(super) fn map_mem_map_err(e: MapError) -> KError {
     match e {
         MapError::Overlap | MapError::NotCanonical | MapError::NotUserHalf => KError::InvalidArgument,
-        MapError::OutOfMemory => KError::OutOfMemory,
+        MapError::OutOfMemory | MapError::NoRoom => KError::OutOfMemory,
     }
+}
+
+/// `size` bytes, rounded up to a page, of an object of `max_bytes` from `offset`: the size and page.
+pub(super) fn window(size: u64, offset: u64, max_bytes: usize) -> Result<(u64, usize), KError> {
+    let size = round_up_page(size);
+    let end = offset.checked_add(size).ok_or(KError::InvalidArgument)?;
+    if size == 0 || !offset.is_multiple_of(PAGE_SIZE as u64) || end > max_bytes as u64 {
+        return Err(KError::InvalidArgument);
+    }
+    Ok((size, (offset / PAGE_SIZE as u64) as usize))
 }
 
 pub(super) fn round_up_page(n: u64) -> u64 {
@@ -40,10 +50,11 @@ pub fn sys_memory_create(size: u64, flags: u64) -> SysResult {
     Ok(install(pid, ObjectRef::new(obj), full_mem_rights())?.bits() as isize)
 }
 
-/// `sys_memory_map(obj, hint, size, rights)` — map `obj`'s frames into the caller's address
+/// `sys_memory_map(obj, hint, size, rights, offset)` — map `size` bytes of `obj`, from the
+/// page-aligned byte `offset`, into the caller's address
 /// space with `rights` (a subset of the `MAP_*` band). `hint == 0` picks any free range;
 /// otherwise `hint` is the requested page-aligned base. Returns the mapped base address.
-pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResult {
+pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64, offset: u64) -> SysResult {
     let req = Rights::from_bits_truncate(rights);
     // The handle must carry the `MAP_*` bits installed, and `MAP_READ` always: every mapping reads.
     let required = (req & (Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC)) | Rights::MAP_READ;
@@ -60,13 +71,10 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
         Mappable::File(file) => file.npages() * PAGE_SIZE,
     };
 
-    let size = round_up_page(size);
-    if size == 0 || size as usize > max_bytes {
-        return Err(KError::InvalidArgument);
-    }
+    let (size, first) = window(size, offset, max_bytes)?;
 
-    let range = if hint == 0 {
-        asp.find_free_range(size).ok_or(KError::OutOfMemory)?
+    let at = if hint == 0 {
+        Placement::Anywhere(size)
     } else {
         let start = VirtAddr::new(hint);
         if !start.is_page_aligned() {
@@ -79,7 +87,7 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
         if AddressSpace::in_stack_guard(hint, end) {
             return Err(KError::InvalidArgument);
         }
-        VAddrRange::new(start, VirtAddr::new(end)).ok_or(KError::InvalidArgument)?
+        Placement::At(VAddrRange::new(start, VirtAddr::new(end)).ok_or(KError::InvalidArgument)?)
     };
 
     let mut prot = Protection::USER;
@@ -92,10 +100,10 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
 
     // `MemoryObject` maps eagerly; `FileObject` **lazily** (`fault_in` pages in on first touch).
     let result = match object {
-        Mappable::Memory(memory) => asp.map_object(range, prot, memory).map_err(|(_, e)| e),
-        Mappable::File(file) => asp.map_file(range, prot, file).map_err(|(_, e)| e),
+        Mappable::Memory(memory) => asp.map_object(at, prot, memory, first).map_err(|(_, e)| e),
+        Mappable::File(file) => asp.map_file(at, prot, file, first).map_err(|(_, e)| e),
     };
-    result.map_err(map_mem_map_err)?;
+    let range = result.map_err(map_mem_map_err)?;
     Paging::flush_tlb_all();
     Ok(range.start().as_u64() as isize)
 }

@@ -112,7 +112,7 @@ The `<fault_pc>` is a local numeric label inside the same `asm!` block, sitting 
 
 ### Lookup
 
-The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. On a match whose faulting address (`CR2`) is below `USER_VIRT_END`, the handler writes `entry.recovery_pc` into `frame.rip` and returns. The naked stub then `iretq`s to the recovery PC. Otherwise the handler falls through to `dump_and_halt`: a `#PF` outside a registered window, or one on the copy's kernel-side pointer, is a kernel bug, not a recoverable condition.
+The `#PF` handler (`kernel/src/arch/x86_64/idt.rs::pf_dispatch`) walks the bracketed slice linearly, comparing `frame.rip` against each `fault_pc`. On a match whose faulting address (`CR2`) is below `USER_VIRT_END`, a **not-present** fault is first served where nothing has to wait, and the copy resumes: an anonymous page is zeroed, and a file's page the page cache holds is mapped. Otherwise, a file's page not resident among it, the handler writes `entry.recovery_pc` into `frame.rip` and returns. **No copy runs with a lock held**, as serving its fault takes the address space's lock: `lockrank` asserts it at each in a debug build. The naked stub then `iretq`s to the recovery PC. Otherwise the handler falls through to `dump_and_halt`: a `#PF` outside a registered window, or one on the copy's kernel-side pointer, is a kernel bug, not a recoverable condition.
 
 The lookup is linear over the table. The table holds one entry per raw copy routine (two today, `copy_bytes_raw` and `copy_cstr_raw`), easily fits in a single cacheline, and runs only on the rare faulting path. A sorted table + binary search would be theoretical work; revisit if Phase 2 ever pushes the entry count past a few dozen.
 
@@ -170,6 +170,6 @@ The public surface (`UserPtr<T>`, `UserMutPtr<T>`, the seven copy primitives, `U
 
 ## Out of scope
 
-- **Page-fault demand allocation.** A `#PF` on a legitimate user mapping today still terminates the kernel (no scheduler, no active address space). When the scheduler arrives, `pf_dispatch` will grow a VMA-lookup branch between exception-table lookup and `dump_and_halt`. Tracked in the slice-1 decision log entry.
+- **A copy waiting for a file's page.** A copy from a page the cache does not hold fails `Fault` rather than stop on a device inside a syscall (`deferred-decisions.md`, `copy-from-unread-file`).
 - **Atomic copies.** Compound primitives (e.g. "copy this struct atomically") are layered on top by syscall handlers; the primitives in this document are the byte-level foundation.
 - **Cross-thread aliasing.** `UserPtr<T>` carries `PhantomData<*const T>`, so it is neither `Send` nor `Sync` by auto-trait inference. Callers that need to pass user pointers across threads must opt in explicitly with a justification.

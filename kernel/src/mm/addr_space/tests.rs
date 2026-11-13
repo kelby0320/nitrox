@@ -142,10 +142,10 @@ fn no_way_of_mapping_reaches_the_top_page_of_the_user_half() {
     assert!(matches!(asp.map_vma(anon_box(last, uprot())), Err((_, MapError::NotUserHalf))));
     assert!(matches!(asp.map_vma_lazy(anon_box(last, uprot())), Err((_, MapError::NotUserHalf))));
     let obj = into_obj(MemoryObject::try_new(PAGE as usize).unwrap());
-    assert!(matches!(asp.map_object(last, uprot(), obj.clone()), Err((_, MapError::NotUserHalf))));
+    assert!(matches!(asp.map_object(last, uprot(), obj.clone(), 0), Err((_, MapError::NotUserHalf))));
     let file = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-    assert!(matches!(asp.map_file(last, uprot(), file), Err((_, MapError::NotUserHalf))));
-    assert!(asp.map_object(below, uprot(), obj).is_ok());
+    assert!(matches!(asp.map_file(last, uprot(), file, 0), Err((_, MapError::NotUserHalf))));
+    assert!(asp.map_object(below, uprot(), obj, 0).is_ok());
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn unmapping_an_object_needs_no_room_for_frames_and_an_anonymous_mapping_does() 
     init_global_heap();
     let mut asp = AddressSpace::new().unwrap();
     let obj = into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap());
-    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).unwrap();
+    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj, 0).unwrap();
     asp.map_vma(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
     assert!(matches!(asp.unmap_covering(va(PAGE * 5), KVec::new()), Ok(Some(_))));
     assert_eq!(asp.unmap_covering(va(PAGE * 16), KVec::new()).err().map(|(_, pages)| pages), Some(2));
@@ -212,7 +212,7 @@ fn map_object_points_ptes_at_object_frames() {
     let frames = [m.frames()[0].phys(), m.frames()[1].phys(), m.frames()[2].phys()];
     let obj = into_obj(m);
 
-    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_object must succeed");
+    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj, 0).expect("map_object must succeed");
 
     for i in 0..3u64 {
         let phys = asp.translate(va(PAGE * (4 + i))).expect("page must be mapped");
@@ -230,8 +230,8 @@ fn map_object_twice_aliases_same_frame() {
     let obj = into_obj(m);
     let obj2 = obj.clone(); // second mapping needs its own reference
 
-    asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
-    asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), obj2).unwrap();
+    asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj, 0).unwrap();
+    asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), obj2, 0).unwrap();
 
     let p1 = asp.translate(va(PAGE * 4)).unwrap();
     let p2 = asp.translate(va(PAGE * 8)).unwrap();
@@ -249,7 +249,7 @@ fn unmap_object_mapping_does_not_free_the_objects_frames() {
     let obj = into_obj(m);
     let keep = obj.clone();
 
-    asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
+    asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj, 0).unwrap();
     let removed = asp.unmap_at(va(PAGE * 4)).expect("unmap must find the covering vma");
     assert!(asp.translate(va(PAGE * 4)).is_none());
     drop(removed);
@@ -259,12 +259,13 @@ fn unmap_object_mapping_does_not_free_the_objects_frames() {
 }
 
 #[test]
-fn find_free_range_picks_a_gap_in_the_mmap_window() {
+fn an_anywhere_mapping_starts_at_the_window_base() {
     init_global_heap();
     let asp = AddressSpace::new().unwrap();
-    let r = asp.find_free_range(PAGE).expect("empty AS has room");
-    assert_eq!(r.start().as_u64(), MMAP_BASE);
-    assert_eq!(r.len(), PAGE);
+    let r =
+        asp.map_object(Placement::Anywhere(PAGE), uprot(), into_obj(MemoryObject::try_new(PAGE as usize).unwrap()), 0);
+    let r = r.expect("an empty space has room");
+    assert_eq!((r.start().as_u64(), r.len()), (MMAP_BASE, PAGE));
 }
 
 use crate::object::{FileObject, Producer, Reserve};
@@ -284,7 +285,7 @@ fn dropping_an_address_space_releases_a_file_mapping_it_last_holds() {
     let asp = AddressSpace::new().unwrap();
     test_probe::reset();
     let obj = into_file(FileObject::try_new(3 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-    asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_file must succeed");
+    asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj, 0).expect("map_file must succeed");
     assert_eq!(test_probe::file_object_destroys(), 0, "the mapping holds the file alive");
     drop(asp);
     assert_eq!(test_probe::file_object_destroys(), 1, "dropping the AS released the file");
@@ -295,7 +296,7 @@ fn map_file_reserves_lazily_with_no_ptes() {
     init_global_heap();
     let asp = AddressSpace::new().unwrap();
     let obj = into_file(FileObject::try_new(3 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-    asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_file must succeed");
+    asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj, 0).expect("map_file must succeed");
     assert_eq!(asp.len(), 1, "the VMA is reserved");
     for i in 0..3u64 {
         assert!(!is_mapped(&asp, va(PAGE * (4 + i))), "page {i} must be lazy");
@@ -308,7 +309,7 @@ fn fault_in_file_backed_signals_and_file_backing_resolves() {
     let asp = AddressSpace::new().unwrap();
     let obj = into_file(FileObject::try_new(4 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
     let obj_ptr = obj.as_ptr();
-    asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj).unwrap();
+    asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj, 0).unwrap();
 
     assert_eq!(asp.fault_in(va(PAGE * 5), FaultAccess::Read), FaultIn::FileBacked);
 
@@ -331,12 +332,12 @@ fn map_file_page_installs_pte_for_a_ready_frame() {
     };
     f.mark_ready(1);
     let obj = into_file(f);
-    asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj.clone()).unwrap();
+    asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj.clone(), 0).unwrap();
 
-    assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
+    assert_eq!(asp.map_file_page(va(PAGE * 5), &obj, 1, frame), FilePage::Mapped);
     let phys = asp.translate(va(PAGE * 5)).expect("page must now be mapped");
     assert_eq!(phys, frame, "PTE points at the cache frame");
-    assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
+    assert_eq!(asp.map_file_page(va(PAGE * 5), &obj, 1, frame), FilePage::Mapped);
 }
 
 #[test]
@@ -350,12 +351,13 @@ fn map_file_page_rejects_wrong_object_or_unmapped() {
     };
     f.mark_ready(0);
     let obj = into_file(f);
-    asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
+    asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone(), 0).unwrap();
 
     let other = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-    assert!(!asp.map_file_page(va(PAGE * 4), &other, frame));
-    assert!(!asp.map_file_page(va(PAGE * 99), &obj, frame));
-    assert!(asp.map_file_page(va(PAGE * 4), &obj, frame));
+    assert_eq!(asp.map_file_page(va(PAGE * 4), &other, 0, frame), FilePage::Changed);
+    assert_eq!(asp.map_file_page(va(PAGE * 99), &obj, 0, frame), FilePage::Changed);
+    assert!(!is_mapped(&asp, va(PAGE * 4)), "neither installed");
+    assert_eq!(asp.map_file_page(va(PAGE * 4), &obj, 0, frame), FilePage::Mapped);
 }
 
 #[test]
@@ -371,8 +373,8 @@ fn unmap_file_mapping_keeps_the_objects_frames() {
     f.mark_ready(0);
     let obj = into_file(f);
     let keep = obj.clone();
-    asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
-    asp.map_file_page(va(PAGE * 4), &keep, frame);
+    asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj, 0).unwrap();
+    asp.map_file_page(va(PAGE * 4), &keep, 0, frame);
     assert!(is_mapped(&asp, va(PAGE * 4)));
 
     let removed = asp.unmap_at(va(PAGE * 4)).expect("covering vma");
@@ -391,17 +393,17 @@ fn a_writable_file_mapping_is_counted_while_its_vma_exists() {
     let asp = AddressSpace::new().unwrap();
     let obj = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
     let fo = || -> &FileObject { &obj };
-    asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
+    asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone(), 0).unwrap();
     assert_eq!(fo().writable_maps(), 1);
-    let (back, _) = asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap_err();
+    let (back, _) = asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone(), 0).unwrap_err();
     drop(back);
     assert_eq!(fo().writable_maps(), 1, "a refused map leaves no count behind");
-    asp.map_file(range(PAGE * 8, PAGE * 9), Protection::USER, obj.clone()).unwrap();
+    asp.map_file(range(PAGE * 8, PAGE * 9), Protection::USER, obj.clone(), 0).unwrap();
     assert_eq!(fo().writable_maps(), 1);
     drop(asp.unmap_at(va(PAGE * 4)).unwrap());
     assert_eq!(fo().writable_maps(), 0);
     let asp2 = AddressSpace::new().unwrap();
-    asp2.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
+    asp2.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone(), 0).unwrap();
     assert_eq!(fo().writable_maps(), 1);
     drop(asp2);
     assert_eq!(fo().writable_maps(), 0);
@@ -434,7 +436,7 @@ fn an_unmap_frees_an_anonymous_mappings_frames_and_never_an_objects() {
     asp.map_vma(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
     let obj = into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap());
     let keep = obj.clone();
-    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).unwrap();
+    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj, 0).unwrap();
     let freed = heap::frames_freed_by_this_thread();
     drop(asp.unmap_at(va(PAGE * 5)));
     assert_eq!(heap::frames_freed_by_this_thread(), freed, "an object's frames are the object's to free");
@@ -561,9 +563,9 @@ fn mapping_an_aperture_object_selects_the_write_combining_entry() {
     let device = unsafe {
         MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGE as usize, Caching::WriteCombining).unwrap()
     };
-    asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), into_obj(device)).expect("map_object must succeed");
+    asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), into_obj(device), 0).expect("map_object must succeed");
     let ordinary = MemoryObject::try_new(PAGE as usize).unwrap();
-    asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(ordinary)).expect("map_object must succeed");
+    asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(ordinary), 0).expect("map_object must succeed");
 
     let index = |v: u64| asp.with_tables(|t| t.attribute_index(va(v)));
     // Entry 5 is write-combining and entry 0 write-back in the table the kernel programs.
@@ -633,7 +635,7 @@ fn a_failed_object_map_is_shot_down_before_its_object_comes_back() {
     for (tables, mapped) in [(0, 0), (3, 2)] {
         crate::arch::fail_page_tables_after(Some(tables));
         let shots = crate::tlb::shootdowns_by_this_thread().0;
-        let result = asp.map_object(range(start, start + 4 * PAGE), uprot(), obj);
+        let result = asp.map_object(range(start, start + 4 * PAGE), uprot(), obj, 0);
         crate::arch::fail_page_tables_after(None);
         let (back, e) = result.unwrap_err();
         assert_eq!(e, MapError::OutOfMemory);
@@ -649,7 +651,7 @@ fn an_unmap_is_shot_down_before_its_frames_or_its_object_are_freed() {
     init_global_heap();
     let mut asp = AddressSpace::new().unwrap();
     asp.map_vma(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
-    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap()))
+    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap()), 0)
         .unwrap();
     for (at, frames) in [(PAGE * 16, 2), (PAGE * 4, 3)] {
         let unmapped = asp.unmap_at(va(at)).unwrap();
@@ -670,13 +672,13 @@ fn copy_in_writes_only_anonymous_memory_that_is_present() {
     asp.map_vma_lazy(anon_box(range(PAGE * 6, PAGE * 7), uprot())).unwrap();
     let m = MemoryObject::try_new(PAGE as usize).unwrap();
     let object_frame = m.frames()[0].phys();
-    asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(m)).unwrap();
+    asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(m), 0).unwrap();
     let f = FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap();
     let Reserve::New(file_frame) = f.reserve(0) else { panic!("a fresh page") };
     f.mark_ready(0);
     let file = into_file(f);
-    asp.map_file(range(PAGE * 10, PAGE * 11), uprot(), file.clone()).unwrap();
-    assert!(asp.map_file_page(va(PAGE * 10), &file, file_frame));
+    asp.map_file(range(PAGE * 10, PAGE * 11), uprot(), file.clone(), 0).unwrap();
+    assert_eq!(asp.map_file_page(va(PAGE * 10), &file, 0, file_frame), FilePage::Mapped);
 
     assert!(asp.copy_in(va(PAGE * 5 - 2), &[1, 2, 3, 4]), "across two anonymous pages");
     assert!(!asp.copy_in(va(PAGE * 6 - 1), &[5, 6]), "into a page not yet faulted in");
@@ -689,4 +691,73 @@ fn copy_in_writes_only_anonymous_memory_that_is_present() {
     assert_eq!([PAGE * 5 - 2, PAGE * 5 - 1, PAGE * 5, PAGE * 5 + 1].map(at), [1, 2, 3, 4]);
     assert_eq!(at(PAGE * 6 - 1), 5, "what came before the page not faulted in");
     assert_eq!((byte(object_frame), byte(file_frame)), (0, 0), "neither the object's page nor the file's");
+}
+
+fn anywhere(asp: &AddressSpace, pages: u64) -> VAddrRange {
+    let obj = into_obj(MemoryObject::try_new((pages * PAGE) as usize).unwrap());
+    asp.map_object(Placement::Anywhere(pages * PAGE), uprot(), obj, 0).expect("room in the window")
+}
+
+/// **Two maps placed anywhere at once never meet**: neither is refused `Overlap`.
+#[test]
+fn two_maps_placed_anywhere_at_once_never_meet() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    let placed = || (0..64).map(|_| anywhere(&asp, 1).start().as_u64()).collect::<std::vec::Vec<_>>();
+    let mut all = std::thread::scope(|s| {
+        let (a, b) = (s.spawn(placed), s.spawn(placed));
+        [a.join().unwrap(), b.join().unwrap()].concat()
+    });
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), 128, "every map its own range");
+}
+
+/// **An anywhere mapping keeps a page free below itself, and below the mapping above it.**
+#[test]
+fn an_anywhere_mapping_keeps_a_page_free_on_either_side() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    let base = MMAP_BASE;
+    assert_eq!(anywhere(&asp, 1).start().as_u64(), base);
+    assert_eq!(anywhere(&asp, 1).start().as_u64(), base + 2 * PAGE, "a page above the first");
+    let named = into_obj(MemoryObject::try_new(PAGE as usize).unwrap());
+    asp.map_object(range(base + 5 * PAGE, base + 6 * PAGE), uprot(), named, 0).expect("a named range is not held off");
+    assert_eq!(
+        anywhere(&asp, 1).start().as_u64(),
+        base + 7 * PAGE,
+        "not the hole that leaves none below the named one"
+    );
+}
+
+/// **A fill installed after its mapping moved installs nothing**: the access retries for page 1.
+#[test]
+fn a_fill_whose_mapping_moved_under_it_installs_nothing() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    let f = FileObject::try_new(4 * PAGE as usize, Producer::Stub { base: 0 }).unwrap();
+    let Reserve::New(frame) = f.reserve(2) else { panic!("a fresh page") };
+    f.mark_ready(2);
+    let f = into_file(f);
+    asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), f.clone(), 0).unwrap();
+    let (_, index) = asp.file_backing(va(PAGE * 6)).unwrap();
+    drop(asp.unmap_at(va(PAGE * 4)));
+    asp.map_file(range(PAGE * 5, PAGE * 9), uprot(), f.clone(), 0).unwrap();
+    assert_eq!(asp.map_file_page(va(PAGE * 6), &f, index, frame), FilePage::Changed);
+    assert!(!is_mapped(&asp, va(PAGE * 6)), "page 2 is not where page 1 belongs");
+    assert_eq!(asp.file_backing(va(PAGE * 6)).map(|(_, i)| i), Some(1), "what the retry faults in");
+}
+
+/// **A mapping from an offset begins at that page of its object.**
+#[test]
+fn a_mapping_from_an_offset_begins_at_that_page() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    let m = MemoryObject::try_new(4 * PAGE as usize).unwrap();
+    let third = m.frames()[2].phys();
+    asp.map_object(range(PAGE * 4, PAGE * 6), uprot(), into_obj(m), 2).unwrap();
+    assert_eq!(asp.translate(va(PAGE * 4)), Some(third));
+    let f = into_file(FileObject::try_new(4 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
+    asp.map_file(range(PAGE * 8, PAGE * 10), uprot(), f, 2).unwrap();
+    assert_eq!(asp.file_backing(va(PAGE * 9)).map(|(_, i)| i), Some(3));
 }

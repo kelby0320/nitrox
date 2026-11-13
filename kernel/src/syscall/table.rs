@@ -34,7 +34,7 @@ use crate::libkern::io_op::{IoOp, IoOpcode};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
 use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
 use crate::libkern::{ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notification, SendMode, ThreadArgs, TimerFlags};
-use crate::mm::addr_space::{AddressSpace, MapError};
+use crate::mm::addr_space::{AddressSpace, MapError, Placement};
 use crate::mm::elf::{MAX_IMAGE_BYTES, load_elf};
 use crate::mm::user_access::{
     UserMutPtr, UserPtr, copy_array_from_user, copy_array_to_user, copy_from_user, copy_slice_from_user,
@@ -229,7 +229,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_HANDLE_RESTRICT => encode(sys_handle_restrict(a0, a1)),
         SYS_HANDLE_STAT => encode(sys_handle_stat(a0, a1)),
         SYS_MEMORY_CREATE => encode(sys_memory_create(a0, a1)),
-        SYS_MEMORY_MAP => encode(sys_memory_map(a0, a1, a2, a3)),
+        SYS_MEMORY_MAP => encode(sys_memory_map(a0, a1, a2, a3, a4)),
         SYS_MEMORY_UNMAP => encode(sys_memory_unmap(a0, a1)),
         SYS_CLOCK_READ => encode(sys_clock_read(a0, a1)),
         SYS_TIMER_CREATE => encode(sys_timer_create(a0)),
