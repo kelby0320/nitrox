@@ -2400,7 +2400,8 @@ The inventory, `cargo xtask unsafe-inventory kernel/src/drivers kernel/src/pci k
   medium. **Plan**, in P5.
   Done in `1acd2913`: `drivers/xhci/armed.rs`, `arm` refusing while a record is armed, `Armed::wait`
   taking back or waiting out, a `Completer` the DPC spends; the controller's record and a storage
-  device's hub command are its two `Record`s, and a departure completes an armed one.
+  device's hub command are its two `Record`s, and a departure completes an armed one. After
+  review (`0ae91c0f`), the `Armed` owns its operation and takes back its own `Completer` only.
 
 - [x] **drv-o16** encapsulate: three hand-written `Slots` impls over TRB ring memory (xhci/mod.rs
   `DmaSlots`, storage.rs `RawSlots`, hid.rs `RawSlots`) disagree on ordering: `DmaSlots` and

@@ -954,7 +954,8 @@ Controls: a second hub command refused; a second `park` refused with the first k
   panics on one dropped unspent. **Arming refuses while a record is armed**, the controller's one
   record and a storage device's hub command alike, where a second overwrote the first. `hub::wait`
   and storage's take-back are one `Armed::wait`, and a departure that finds a hub command armed
-  completes it, where it dropped it. USB storage's `Dev` is `Send` by its fields.
+  completes it, where it dropped it, though none is armed as a device departs: the hub thread both
+  departs devices and waits on its commands. USB storage's `Dev` is `Send` by its fields.
 - **One `Handoff<T, N>`** (`libkern/handoff.rs`): `park`, refusing where `owe` overwrote; a `Loan`
   the DPC gives back; `take_all`, in thread context. `input::Reader` keeps its read in one, generic
   over its ring, and **the console moves onto it**, its copy deleted. PS/2's finished lights writes
@@ -985,16 +986,41 @@ does not own; the reclaims never run; PS/2 dropping a lent lights write, and los
 table refused. Under Miri, both models, the 172 tests of the xHCI, the input readers, PS/2, the
 console and `Handoff`.
 
+**After review** (`0ae91c0f`):
+- **An `Armed` owns its operation**: `arm` takes the `Ref`, so an `Armed` forgotten in safe code
+  leaks the operation rather than free it under its `Completer`, a use after free Miri reported.
+  The operation used after it is armed does not compile (E0382).
+- **A wait takes back its own `Completer` only**: `Record::take_back` names its operation, so a wait
+  that runs out never withdraws a second one armed since the DPC emptied the record.
+- **A USB input node's slot given to another device keeps its `Handoff`**: `Reader::renew` in place
+  of a new reader, so a read the DPC was delivering as its device departed is given back where it
+  was lent, where a debug build panicked in the DPC. **A `Loan` names the `Handoff` that lent it**,
+  and any other refuses it.
+- **The tests reach what they did not**: a wait that runs out, its record taken back, or waited out
+  as the DPC takes it; a completion event, and a hub command's end, completing the operation; a
+  lend past a slot already lent. The reclaim test fills a table of its own, not the kernel's.
+- Declined: a host test of `reap_pending` running the reclaims, as it drains deferred drops other
+  host tests own; one missed there waits only for the next read, which reclaims before it parks.
+  Refuted: a departure leaves no hub command's waiter without its completion, and the waiter reads
+  the device gone, as before.
+
 **The whole suite under Miri, after J.15** (2026-11-12, at `ab0319e7`): 1,277 tests pass under
 Stacked Borrows, in 58 minutes, and under Tree Borrows, in 104; nine are ignored, each with its
-reason. **Miri reports no undefined behaviour.** It warns of 23 integer-to-pointer casts, the same
-sites in both models:
-- **Fourteen were tests' sentinel addresses**, only compared, now made by `ptr::without_provenance`
-  (`248042c4`). The same tests under Miri warn 17 times on the old code and 3 times on the new.
-- **Nine stay, a number made a pointer where nothing else can**: the direct map, seven; the host
-  heap Miri's frames come from, freeing a block by its address; and a validated user address handed
-  to the copy. There Miri checks that an access lands in a live allocation, as J.8's probe, a
+reason. **Miri reports no undefined behaviour.** It warns of integer-to-pointer casts at 62 sites,
+the same in both models; they were first counted as 23 by a search that missed every warning
+printed on its test's line.
+- **Twenty-four were sentinel addresses**, only compared: the objects' and the IRP's tests' waiters
+  and operations, a test `Completer`'s, a test framebuffer's, and a USB input node's context, which
+  packs its slot and epoch. They are made by `ptr::without_provenance` (`248042c4`, `0ae91c0f`).
+- **Twenty-two are a number made a pointer where nothing else can**: the direct map, eighteen; the
+  host heap Miri's frames come from, freeing a block by its address; and three user addresses handed
+  to the copies. There Miri checks that an access lands in a live allocation, as J.8's probe, a
   frame read after its free, showed, but not which pointer may make it.
+- **Sixteen are kept, each for its reason**: five slab descriptors found by masking an address the
+  direct map made; a device's registers and a kernel stack's top, addresses by nature; the IRP's
+  fragment list and completion, `u64`s in its specified layout, at five; three tests that hand a
+  scoped thread an address as an integer, a raw pointer not being `Send`; and the deadline heap's
+  timer, kept by address and reached under `SCHED`, whose closing removes it first.
 
 **Part J's condition is met**: the suite has run under Miri after J.15, and what it reports is
 triaged.
