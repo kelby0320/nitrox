@@ -139,6 +139,9 @@ struct Mock {
     submitted: Vec<IoOp>,
     busy_flushes: u32,
     flush_never: bool,
+    /// A file's reads: never finished, or the next short by this many bytes.
+    reads_never: bool,
+    read_short: u64,
     /// What a flush and a held answer for a mount path: `(written, held)`.
     mounts: BTreeMap<Vec<u8>, (i64, i64)>,
     unseeded: u32,
@@ -778,7 +781,7 @@ pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
 pub fn process_spawn(args: &SpawnArgs) -> i64 {
     with(|m| {
         match m.get(args.image, Rights::MAP_READ) {
-            Ok((o, _)) if matches!(m.objects[o], Object::Memory(_) | Object::File { .. }) => {}
+            Ok((o, _)) if matches!(m.objects[o], Object::Memory(_)) => {}
             Ok(_) => return e(KError::InvalidArgument),
             Err(r) => return r,
         }

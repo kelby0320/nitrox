@@ -182,8 +182,8 @@ impl MemoryObject {
 
     /// Copy the object into a fresh contiguous heap buffer (page-rounded [`size`](Self::size)
     /// bytes): `sys_process_spawn` needs one slice for the ELF loader, so the largest is
-    /// [`MAX_IMAGE_BYTES`](crate::mm::elf::MAX_IMAGE_BYTES), 4 MiB less a page. Mapping the frames
-    /// into a temporary kernel VMA would avoid the copy; see `docs/rationale/deferred-decisions.md`.
+    /// [`MAX_IMAGE_BYTES`](crate::mm::elf::MAX_IMAGE_BYTES), 4 MiB less a page. A loader reading
+    /// the frames would avoid the copy (`spawn-image-kvec` in `docs/rationale/deferred-decisions.md`).
     pub fn copy_to_kvec(&self) -> Result<KVec<u8>, AllocError> {
         assert!(self.kernel_reachable(), "{BORROWED_ONLY_MAPPED}");
         let mut buf = KVec::try_filled(0, self.size)?;

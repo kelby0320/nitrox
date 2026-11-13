@@ -138,7 +138,7 @@ pub(super) fn spawn_copy_needs_duplicate_test(root: Root<'_>) -> bool {
         Line::new().s(b"boot-probe: spawn grant FAIL: ").s(why).end();
         false
     };
-    let img = lookup::<File, MapRead, _>(root, "/bin/test-stage", Rights::MAP_READ);
+    let img = lookup::<File, MapRead, _>(root, "/bin/test-stage", Rights::MAP_READ | Rights::INSPECT);
     let mem = Handle::<Memory, MapReadWrite>::create(PAGE as usize);
     let (Ok(img), Ok(mem)) = (img, mem) else {
         return fail(b"no /bin/test-stage or memory object");

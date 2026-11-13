@@ -393,7 +393,8 @@ fn run_grants(setup: &StageSetup, ns: Option<&Handle<Namespace, NsReadOnly>>) ->
             continue;
         }
         let made = Handle::<Channel, Only>::pair(4);
-        let image = ns.map(|ns| block_on(ns.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ)));
+        let image =
+            ns.map(|ns| block_on(ns.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ | Rights::INSPECT)));
         let (Ok((mine, its)), Some(Ok(image))) = (made, image) else {
             exit(1);
         };

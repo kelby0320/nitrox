@@ -40,7 +40,10 @@ later field kept its offset.)
   → a readable object; e.g. `/initramfs/sbin/<name>`, later `/bin`, `/store`) and
   passes the handle. The kernel requires the caller hold it with `MAP_READ`, reads
   its bytes, and loads the ELF (a static `ET_EXEC`); a malformed ELF or wrong handle
-  type returns `InvalidArgument`. The image handle is **read, not consumed** — the
+  type returns `InvalidArgument`. **A `FileObject` is the wrong type** (pre-Phase-7 E.8): a
+  spawn never waits on a device, so libos's `Spawn` reads a file image into a memory object
+  first, its size the file's stat (so the image needs `INSPECT` too), refusing a read shorter
+  than that and abandoning one past 60 s. The image handle is **read, not consumed** — the
   spawner closes it after spawn. (init itself is loaded from the initramfs by the
   kernel at boot, before any userspace, so it needs no spawner.)
 - **`handle_count`** — number of valid `handles`/`rights` entries (`≤ 4`; larger

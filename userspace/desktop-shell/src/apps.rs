@@ -305,7 +305,7 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     // The image comes from the session's `/bin`, not the application's namespace.
     let mut path = alloc::string::String::from("/bin/");
     path.push_str(program);
-    let Ok(image) = block_on(session_ns.lookup::<File, MapRead>(&path, Rights::MAP_READ)) else {
+    let Ok(image) = block_on(session_ns.lookup::<File, MapRead>(&path, Rights::MAP_READ | Rights::INSPECT)) else {
         Line::new().s(b"desktop-shell: ").s(program.as_bytes()).s(b" not found in /bin").end();
         return false;
     };

@@ -75,7 +75,7 @@ fn spawn_program(
     grant: Option<(Endpoint, Rights)>,
     caps: SysCaps,
 ) -> Option<Handle<Process, Only>> {
-    let Ok(image) = block_on(root.lookup::<File, MapRead>(path, Rights::MAP_READ)) else {
+    let Ok(image) = block_on(root.lookup::<File, MapRead>(path, Rights::MAP_READ | Rights::INSPECT)) else {
         Line::new().s(b"init: image not found: ").s(path.as_bytes()).end();
         return None;
     };

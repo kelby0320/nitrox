@@ -131,7 +131,7 @@ libraries to project. `/lib` is designed here and wired when dynamic linking exi
 Because projection is lookup-based, it composes with path-based spawn for free: a
 `service.toml` `executable = "/bin/heartbeat"` resolves through the process's namespace
 → forwarded to the profile server → probed to `/store/<hash>-heartbeat/bin/heartbeat`
-→ a store `FileObject` handle → `sys_process_spawn`. The whole stack — supervisor,
+→ a store `FileObject` handle, read into memory by libos → `sys_process_spawn`. The whole stack — supervisor,
 profile server, store, ELF loader — composes without any of them knowing about the
 others. This is the slice-1 demo: heartbeat becomes a store package, and service-mgr
 spawns it via `/bin/heartbeat`.

@@ -36,10 +36,11 @@ it fit for supervisors and PID 1 (decision log, 2026-10-27). `eshell` and `libhe
 cannot express; `tools/xtask/raw-syscalls.toml` lists them.
 
 **It is written to the syscall surface Part E ends with** (`docs/planning/syscall-surface.md`),
-over today's calls, so a caller is written once: `Spawn::path` hands the kernel a file it reads
-within the spawn, and `entropy::fill` makes a source for each call. Each is `TODO(surface-shape)`,
-and changes underneath as its sub-part lands. The flushes were the first: each is now an operation,
-a resolve's for a mount and an `io_submit`'s for a file, run on a kernel thread of its own.
+over today's calls, so a caller is written once: `entropy::fill` makes a source for each call,
+which is `TODO(surface-shape)`, and changes underneath as its sub-part lands. The flushes were the
+first: each is now an operation, a resolve's for a mount and an `io_submit`'s for a file, run on a
+kernel thread of its own. **`Spawn` reads a file image into a memory object** before the spawn,
+by a 60 s deadline, its size the file's stat: the kernel spawns from memory alone.
 
 ## Handles: owned, borrowed, and in flight
 

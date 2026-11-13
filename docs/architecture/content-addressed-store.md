@@ -101,12 +101,11 @@ the same on any filesystem the fs-server supports.
 A store path resolved through the fs-server is a **`FileObject`** — a demand-paged
 file (bytes materialized on fault via the fs-server's `File::ReadRange` producer),
 distinct from the eager `MemoryObject` the in-kernel initramfs server hands back. The
-path-based-spawn ELF loader therefore accepts **both** image types: for a `FileObject`
-it materializes the image by driving `FileObject::fault_in_page` per page (which
-blocks on the producer until resident) into a contiguous buffer, then runs `load_elf`
-— the direct analog of `MemoryObject::copy_to_kvec`. This is what lets a program be
-spawned from the store (`executable = "/bin/heartbeat"` → the profile server → a store
-`FileObject` → spawn). See [process-spawn-args](../spec/process-spawn-args.md).
+spawner reads a `FileObject` image into a memory object before the spawn: libos's `Spawn`
+does it with a `Read` (pre-Phase-7 E.8), as the kernel spawns from memory alone and so
+never waits on a device inside the call. This is what lets a program be spawned from the
+store (`executable = "/bin/heartbeat"` → the profile server → a store `FileObject` → its
+bytes read into memory → spawn). See [process-spawn-args](../spec/process-spawn-args.md).
 
 ## Generations and garbage collection
 
@@ -138,7 +137,7 @@ spawn (per above) — not by any special capability. Direct manual manipulation 
 |---|---|---|
 | Store on ext4 | ✅ pre-built into the image (read-only) | runtime writes (package manager + fs RW) |
 | `/store` RO namespace binding | ✅ (`LOOKUP\|READ\|MAP_READ`) | the writer's `WRITE` route |
-| Reading store programs | ✅ `FileObject`-spawn | — |
+| Reading store programs | ✅ read into memory, then spawned | — |
 | Generations | ✅ one static generation | runtime switch / rollback (need persisted state) |
 | Package manager, GC, dep graph | — | ✅ designed here; built after fs RW |
 

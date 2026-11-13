@@ -841,18 +841,6 @@ impl FileObject {
         pages
     }
 
-    /// The whole file in a fresh heap buffer, each page faulted in by `fault` first: a spawn gives
-    /// [`fault_in_page`](Self::fault_in_page), which blocks on each fill. `AllocError` on a failure.
-    pub fn read_to_kvec(&self, mut fault: impl FnMut(usize) -> Option<PhysAddr>) -> Result<KVec<u8>, AllocError> {
-        let mut buf = KVec::try_filled(0, self.size())?;
-        for (i, piece) in buf.chunks_mut(PAGE_SIZE).enumerate() {
-            fault(i).ok_or(AllocError)?;
-            // Not ready once faulted in only if a truncation took it since.
-            self.ready_page(i).ok_or(AllocError)?.read(0, piece);
-        }
-        Ok(buf)
-    }
-
     /// Start an asynchronous fill of `frame` for page `index`, completing `po`, by dispatching on
     /// the [`Producer`]. `file_obj` is this object's reference (the deferred fill clones it).
     fn start_fill(

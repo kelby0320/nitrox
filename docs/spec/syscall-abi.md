@@ -342,8 +342,9 @@ that finishes one runs the next waiting on its mount, first come first served. A
 stops answering so holds up its own mount's flushes, and no other. **A process may have four of a
 mount's flushes running or waiting** (`FILE_OPS_PER_PROCESS`): one past them is refused
 `WouldBlock` synchronously, the operation not kept, which libos sleeps on and asks again, so no
-process takes a mount's budget from the others. Two calls still wait inside themselves:
-`sys_process_spawn` reads a file-backed image's pages, and `sys_power` waits on its flush.
+process takes a mount's budget from the others. One call still waits inside itself: `sys_power`,
+on its flush. `sys_process_spawn` takes a memory object alone, which libos reads a file into
+first ([`process-spawn-args.md`](process-spawn-args.md)).
 
 **A held counts the files the server has handed out that something still holds**: a handle, a
 mapping, an IRP in flight, or a dirty file's pin on itself. A forgotten file is not counted, and

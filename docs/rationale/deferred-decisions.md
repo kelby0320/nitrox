@@ -159,6 +159,15 @@ mount's budget of sixteen: a stuck device holds up its own mount's flushes, and 
 will not disable keep their commands, since the device may still write the buffers, and what waits
 on one — a filesystem server's write, a flush's thread behind it — waits for good.
 
+**A spawn copies its image into one buffer for the loader — `TODO(spawn-image-kvec)`.**
+`load_elf` takes one slice, so `sys_process_spawn` copies the image's memory object into a `KVec`
+of its size, a frame at a time through word-wide atomic reads. Measured on a `test-qemu` boot
+after E.8 (pre-Phase-7), which moved a file image's read out of the syscall and into libos: 144
+spawns at 1.40 ms each inside the call, down from 1.74 ms, and **84 % of it this copy**, 169 ms
+for 22 MiB. The plan named it the copy to remove if it showed, and it shows. A loader that reads
+segments through the frames, or a temporary kernel mapping of them, would end it; an image is
+already a memory object the kernel reaches. Trigger: spawn time mattering, or a loader rewrite.
+
 **A supervisor's flush deadline bounds a whole mount's write-back — `TODO(flush-progress-bound)`.**
 `FLUSH_TIMEOUT_NS`, 60 s, is twice the 30 s a device gives one stuck command, but `init` and the
 storage service wait that long for every dirty file of a mount, written in turn. A slow device
@@ -2282,16 +2291,14 @@ server's stay signalled and `sys_wait` fires again at once, a spin for the rest 
 registration going reaches it, which takes `service-mgr` with it.
 
 **libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
-`Spawn::path` hands the kernel a file, which it reads within the spawn;
 `entropy::fill` makes an `EntropyObject` for each call; `system::stop` takes the system-control
 object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
 its authority is the `SYSTEM_CLOCK` grant until there is a clock node to hold, so its one caller,
 `date`, passes one when E.10 makes it. Every other caller is written once, against the shape it will
 keep, and the call under it changes as its sub-part of
 [`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 made both flushes, once answered
-within the call, a resolve and an `io_submit`; E.8 makes `Spawn` read the image into memory
-first, E.9 makes entropy a node, and
-E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: each of those sub-parts.
+within the call, a resolve and an `io_submit`; E.8 made `Spawn` read a file image into memory
+first; E.9 makes entropy a node, and E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: each of those sub-parts.
 
 **Any process can end a test run — `TODO(test-verdict-authority)`.** `sys_test_exit` checks no
 handle and no syscap: a kernel built with the test harness writes the verdict to `isa-debug-exit`

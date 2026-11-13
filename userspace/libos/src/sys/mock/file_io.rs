@@ -48,7 +48,9 @@ pub(super) fn file_io(m: &mut Mock, file: u64, op: &IoOp) -> i64 {
             p.0[at / PAGE].0[at % PAGE] = byte;
         }
     }
-    m.po(Po { ready: true, never: false, status: 0, result: n as u64, lookup: None })
+    let never = read && m.reads_never;
+    let short = if read { core::mem::take(&mut m.read_short) } else { 0 };
+    m.po(Po { ready: !never, never, status: 0, result: (n as u64).saturating_sub(short), lookup: None })
 }
 
 fn pages(o: &Object) -> &Pages {

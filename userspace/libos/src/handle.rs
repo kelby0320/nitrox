@@ -101,9 +101,16 @@ pub trait CanBind: Sealed {}
 impl CanBind for NsMutable {}
 
 /// An object a process maps: memory, or a file's pages.
-pub trait Mappable: Sealed {}
-impl Mappable for Memory {}
-impl Mappable for File {}
+pub trait Mappable: Sealed {
+    /// Whether it is a file, which a spawn reads into memory first.
+    const FILE: bool;
+}
+impl Mappable for Memory {
+    const FILE: bool = false;
+}
+impl Mappable for File {
+    const FILE: bool = true;
+}
 
 /// A memory mode's `MAP_*` rights, used when mapping.
 pub trait MemMode: Sealed {
