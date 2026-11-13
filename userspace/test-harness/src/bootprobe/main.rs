@@ -127,6 +127,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         & grow_test(root)
         & create_test(root)
         & file_io_test(root)
+        & nocache_test(root)
         & refused_create_test(root)
         & copy_into_itself_test(root)
         & file_cache_test(root)

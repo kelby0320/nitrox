@@ -27,7 +27,7 @@ pub(super) fn file_io(m: &mut Mock, file: u64, op: &IoOp) -> i64 {
     };
     let file_size = size(&m.objects[f]).unwrap_or(0);
     let past = |at: u64, len: u64, end: u64| at.checked_add(len).is_none_or(|e| e > end);
-    let refused = op.flags != 0
+    let refused = op.flags & !libkern::IO_NOCACHE != 0
         || op.length > libkern::MAX_USER_COPY_SIZE
         || held.is_none_or(|end| past(op.buf_offset, op.length, end))
         || (!read && past(op.offset, op.length, file_size));

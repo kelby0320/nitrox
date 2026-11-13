@@ -46,9 +46,11 @@ both!([M: CanMapWrite] File, M {
     }
 
     /// **Copy `len` bytes of `src` from `src_offset` to `offset`**, at most
-    /// [`MAX_USER_COPY_SIZE`](libkern::MAX_USER_COPY_SIZE) a call.
+    /// [`MAX_USER_COPY_SIZE`](libkern::MAX_USER_COPY_SIZE) a call: a window of a stream, whose pages
+    /// are let go once it completes, the destination's once on the device (`IO_NOCACHE`).
     pub async fn copy_from<MS: CanMapRead>(&self, src: &Handle<File, MS>, src_offset: u64, offset: u64, len: u64) -> Result<usize> {
-        let op = IoOp { opcode: IO_OPCODE_WRITE, flags: 0, buffer: src.raw().0, buf_offset: src_offset, offset, length: len };
+        let (buffer, buf_offset, flags) = (src.raw().0, src_offset, libkern::IO_NOCACHE);
+        let op = IoOp { opcode: IO_OPCODE_WRITE, flags, buffer, buf_offset, offset, length: len };
         Ok(Op::submit_by(self.raw(), &op, Deadline::NEVER)?.await?.result as usize)
     }
 });

@@ -92,7 +92,7 @@ gives one out once.
 | `boot` | `Start`: `_start`'s four registers, owned and typed |
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
 | `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |
-| `io` | a `Resource`'s `read` and `write`, a `File`'s `read`, `write` and `copy_from`, and a notification queue's `recv` |
+| `io` | a `Resource`'s `read` and `write`, a `File`'s `read`, `write` and `copy_from`, a window of a copy whose pages go once it completes (`IO_NOCACHE`), and a notification queue's `recv` |
 
 **A flush refused `WouldBlock`**, its process already running or waiting with its share of the
 mount's flushes, is slept on and asked again, to the caller's deadline; `flush_by` gives up a flush

@@ -153,6 +153,9 @@ Also fs-agnostic — the kernel never knows which filesystem backs a file.
   is skipped: growth goes through a resolve carrying `RESOLVE_OP_GROW`, not writeback. **A page over
   `UNWRITTEN` blocks is not**: it is written to them like any other, since a write-back looks blocks
   up by `device_block_in`, which ignores the flag — the flag read as a hole would skip the write.
+  **A write-back clears the mark on the blocks it wrote** (pre-Phase-7 E.8), splitting a run where
+  it must: a page `IO_NOCACHE` lets go fills from them again, where the mark would read it as
+  zero. A page whose blocks are still marked is never let go.
   **An ext4 unwritten extent is a different thing, and is a hole here** (Phase 6 Part H.1):
   allocated by `fallocate` and never written, it reads as zeroes, so `fs-server-ext4` maps it as one
   — and a write into it, as into any hole, is not written back.

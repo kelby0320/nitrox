@@ -81,9 +81,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   cover less would promise something it does not do. It is not a zero-length
   transfer, so the pre-signalled no-op below does not apply to it. **Nor does a
   `Rescan` or an `Eject`**, for the same reason.
-- **`flags`** — reserved for per-operation modifiers (e.g. a future
-  force-unit-access / no-cache bit). No flag is defined yet, so any set bit
-  returns `InvalidArgument`.
+- **`flags`** — per-operation modifiers. One is defined, **`IO_NOCACHE`** (`1 << 0`), on a
+  file's `Read` or `Write` alone ([A file as the resource](#a-file-as-the-resource)); every other
+  bit, and any bit on a device's request, returns `InvalidArgument`.
 - **`buffer`** — a `MemoryObject` handle providing the data buffer: the
   destination for `Read`, the source for `Write`; for a `Write` on a file, another file
   ([A file as the resource](#a-file-as-the-resource)). The handle must carry the
@@ -252,6 +252,13 @@ kernel thread of its own in its mount's budget, as a file's `Flush` does
   for.
 - **An op stops at the first page that fails**, or that a truncate has put past the end: `status`
   is the error and `result` the bytes done, which stay in the cache.
+- **`IO_NOCACHE` lets the window's pages go once the op succeeds**, the file written back first
+  if it is dirty, as it is after a `Write`; a copy's source's window goes too. A copy a window at a
+  time so holds two windows at most, however large the file. **It is a hint**: the pages stay
+  unless the write-back answered written, nothing maps the file, no other read, write or
+  write-back is running on it, and no write began since the write-back did. A page over blocks the
+  file's server marked unwritten stays too, unless a write-back has written them since: a fill
+  would read it as zero.
 
 ## IoOpcode
 

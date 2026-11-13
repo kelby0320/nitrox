@@ -52,3 +52,52 @@ pub(super) fn file_io_test(root: Root<'_>) -> bool {
     line.s(if ok { b" ok" } else { b" FAIL" }).end();
     ok
 }
+
+/// The bytes the page cache has filled from devices since boot, from `io.tsm`'s `page-cache` row.
+fn filled(root: Root<'_>) -> Option<u64> {
+    use libstream::wire::{Table, Value};
+    let h = lookup::<File, MapRead, _>(root, "/svc/devices/info/io.tsm", Rights::MAP_READ | Rights::INSPECT).ok()?;
+    let t = Table::decode(&read_all(&h)?).ok()?;
+    let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
+    let (name, bytes) = (col("name")?, col("read_bytes")?);
+    let row = t.rows.iter().find(|r| r[name] == Value::Str("page-cache".into()))?;
+    match row[bytes] {
+        Value::Int(v) => Some(v.max(0) as u64),
+        _ => None,
+    }
+}
+
+/// **`IO_NOCACHE` lets a copy's window go, the source's with it, unless something maps it**: the
+/// source read again after a copy fills from the device, and with a mapping held it does not.
+pub(super) fn nocache_test(root: Root<'_>) -> bool {
+    const LEN: usize = 16 * super::PAGE as usize;
+    let src = block_on(fs::create::<_, MapReadWrite>(root, "/system/e8nc-src", LEN as u64, RW));
+    let dst = block_on(fs::create::<_, MapReadWrite>(root, "/system/e8nc-dst", LEN as u64, RW));
+    let buf = Handle::<Memory, MapReadWrite>::create(LEN);
+    let (Ok(src), Ok(dst), Ok(buf)) = (src, dst, buf) else {
+        log::write(b"boot-probe: no-cache: the files could not be made FAIL\n");
+        return false;
+    };
+    let source = lookup::<File, MapRead, _>(root, "/system/e8nc-src", Rights::MAP_READ);
+    let written = block_on(src.write(&buf, 0, 0, LEN as u64)).is_ok() && block_on(fs::flush(&src)).is_ok();
+    let (Ok(source), true) = (source, written) else {
+        log::write(b"boot-probe: no-cache: the source could not be written FAIL\n");
+        return false;
+    };
+    let copied_then_reread = || {
+        let copied = block_on(dst.copy_from(&source, 0, 0, LEN as u64)).ok() == Some(LEN);
+        let before = filled(root)?;
+        let read = block_on(source.read(&buf, 0, 0, LEN as u64)).ok() == Some(LEN);
+        Some((copied && read).then_some(filled(root)?.saturating_sub(before)))
+    };
+    let mapping = source.map(LEN);
+    let held = copied_then_reread().flatten();
+    drop(mapping);
+    let let_go = copied_then_reread().flatten();
+    let ok = held.is_some_and(|n| n < LEN as u64) && let_go.is_some_and(|n| n >= LEN as u64);
+    let mut line = Line::new();
+    line.s(b"boot-probe: no-cache: a copy's source read again filled ").u(let_go.unwrap_or(0));
+    line.s(b" bytes, and ").u(held.unwrap_or(0)).s(b" with a mapping held");
+    line.s(if ok { b" ok" } else { b" FAIL" }).end();
+    ok
+}

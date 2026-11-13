@@ -1,5 +1,6 @@
 //! The QEMU gates, a module each: a guest booted and driven, and what it shows checked.
 
+mod copy;
 mod display;
 mod fbcon;
 mod input;
@@ -17,6 +18,7 @@ mod storage;
 mod terminal;
 mod test_qemu;
 
+pub(crate) use copy::*;
 pub(crate) use display::*;
 pub(crate) use fbcon::*;
 pub(crate) use input::*;

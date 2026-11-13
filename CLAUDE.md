@@ -60,11 +60,11 @@ cargo xtask check-install  # install to a blank disk from the live menu, then bo
 cargo xtask check-recovery # reset a password on an installed disk from the live image, then boot it
 cargo xtask image --live --selftest # the test live image: the live stick with the test packages
 cargo xtask check-storage  # that stick beside a copy of the release disk; the host checks the disk
+cargo xtask check-copy     # a file twice the machine's memory copied on a stick; the host checks it
 cargo xtask check-media    # the live desktop: a stick plugged in, shown in Files, saved to, ejected
 cargo xtask check-shutdown # `with power shutdown` on a test disk; the host checks it; then a reboot
 cargo xtask check-resolutions # four display gates at five screen sizes — on demand, not in CI
-cargo xtask throughput-stick # the stick Part H's copies are timed with, and the scripts that time them
-cargo xtask throughput-stick --check PATH # read it back: an image, or the stick where it is mounted
+cargo xtask throughput-stick [--check PATH] # the stick Part H times copies on; --check reads one back
 ```
 
 **Use `--grab` to touch the mouse or press a chord**, and read a gate's paragraph before changing

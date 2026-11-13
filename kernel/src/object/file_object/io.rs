@@ -16,7 +16,109 @@ pub enum Source {
 /// How a page is faulted in: [`FileObject::fault_in_page`], which blocks on its fill.
 pub type FaultIn<'a> = &'a mut dyn FnMut(&Ref<FileObject>, usize) -> Option<PhysAddr>;
 
+/// **What uses an object's frames now**: its mappings, and the reads, writes and write-backs running
+/// on it, which hold its frames bare. A window's pages go only with none of them.
+#[derive(Default)]
+pub(super) struct Users {
+    /// Writable mappings: raised before the mapping is made, lowered when its VMA drops — atomic,
+    /// since a VMA drops wherever its address space does and must take no lock here.
+    pub(super) writable_maps: AtomicU32,
+    /// Every mapping: raised under the object's lock, lowered after an unmap's shootdown.
+    maps: AtomicU32,
+    /// Reads, writes and write-backs running: raised under the object's lock.
+    ops: AtomicU32,
+}
+
+/// A read, write or write-back running on a file, counted while it lives.
+pub(super) struct Running<'a>(&'a FileObject);
+
+impl<'a> Running<'a> {
+    pub(super) fn begin(file: &'a FileObject) -> Self {
+        let _g = file.inner.lock();
+        file.users.ops.fetch_add(1, Ordering::AcqRel);
+        Self(file)
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.users.ops.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl FileObject {
+    /// **A mapping of the object is about to be made**: counted before the address space's lock,
+    /// as the writable among them are.
+    pub fn mapped(&self) {
+        let _g = self.inner.lock();
+        self.users.maps.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A mapping of the object has gone, after its shootdown. Lock-free and saturating, as
+    /// [`writable_unmapped`](Self::writable_unmapped) is.
+    pub fn unmapped(&self) {
+        let _ = self.users.maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writable_maps(&self) -> u32 {
+        self.users.writable_maps.load(Ordering::Acquire)
+    }
+
+    /// **Pages a write-back put on the device are written**: their blocks' `UNWRITTEN` mark is
+    /// cleared, so a page let go fills from them again rather than reading as zero.
+    pub(super) fn written(&self, first: usize, pages: usize) {
+        let Some(bs) = self.block_size() else { return };
+        let block = |page: usize| (page * PAGE_SIZE) as u64 / bs as u64;
+        let mut g = self.inner.lock();
+        if let Some(runs) = clear_unwritten(&g.runs, block(first), block(first + pages)) {
+            g.runs = runs;
+        }
+    }
+
+    /// **`IO_NOCACHE`: let pages `pages` go**, if nothing uses the frames and the file is clean:
+    /// no mapping, no read, write or write-back running, and no write begun since `mark`, taken
+    /// before the write-back that cleaned it. How many went; a loading page stays, as does one over
+    /// blocks still marked unwritten, which a fill would read as zero though they may hold its bytes.
+    pub fn let_window_go(&self, pages: core::ops::Range<usize>, mark: u64) -> usize {
+        let mut gone: KVec<Frame> = KVec::new();
+        if gone.try_reserve(pages.len()).is_err() {
+            return 0;
+        }
+        {
+            let mut g = self.inner.lock();
+            let used = self.users.maps.load(Ordering::Acquire) != 0 || self.users.ops.load(Ordering::Acquire) != 0;
+            if used || g.map_gen != mark || g.self_pin.is_some() {
+                return 0;
+            }
+            let bs = self.block_size().map(u64::from);
+            let refills = |runs: &KVec<BlockRun>, index: usize| {
+                bs.is_none_or(|bs| {
+                    let first = (index * PAGE_SIZE) as u64 / bs;
+                    let blocks = first..first + (PAGE_SIZE as u64 / bs).max(1);
+                    !runs.iter().any(|r| {
+                        let held = r.file_block..r.file_block + r.length as u64;
+                        r.flags & RUN_UNWRITTEN != 0
+                            && r.device_lba != 0
+                            && held.start < blocks.end
+                            && blocks.start < held.end
+                    })
+                })
+            };
+            let mut i = 0;
+            while i < g.pages.len() {
+                let p = &g.pages[i];
+                let ready = p.state == PageState::Ready && p.fill.is_none();
+                if pages.contains(&p.index) && ready && refills(&g.runs, p.index) {
+                    let Ok(()) = gone.push_within_capacity(g.pages.remove(i).frame) else { unreachable!("reserved") };
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        gone.len()
+    }
+
     /// **The mount whose budget a read or write of this file counts in**: its producer's
     /// registration, for a file a server serves; `None` for one no server does.
     pub fn op_owner(&self) -> Option<Ref<UserspaceServerReg>> {
@@ -84,6 +186,7 @@ impl FileObject {
         dst_at: u64,
         fault: FaultIn<'_>,
     ) -> (i32, u64) {
+        let _running = Running::begin(file);
         let mut done = 0;
         while done < len {
             let at = offset + done;
@@ -118,6 +221,7 @@ impl FileObject {
         src_at: u64,
         fault: FaultIn<'_>,
     ) -> (i32, u64) {
+        let _running = Running::begin(file);
         FileObject::writable_mapped(file);
         let mut done = 0;
         let status = loop {
@@ -160,7 +264,11 @@ impl FileObject {
         pieces: &Pieces<'_>,
         fault: FaultIn<'_>,
     ) -> Result<(), KError> {
-        if at == 0 && pieces.len() == PAGE_SIZE && matches!(file.reserve(index), Reserve::New(_)) {
+        let reserved = (at == 0 && pieces.len() == PAGE_SIZE).then(|| file.reserve(index));
+        if matches!(reserved, Some(Reserve::Oom)) {
+            return Err(KError::OutOfMemory);
+        }
+        if matches!(reserved, Some(Reserve::New(_))) {
             let written = {
                 let g = file.inner.lock();
                 let page =
@@ -174,6 +282,34 @@ impl FileObject {
         pieces.copy_into(file.ready_page(index).ok_or(KError::InvalidArgument)?, at);
         Ok(())
     }
+}
+
+/// **`runs` with blocks `from..to` no longer marked unwritten**, a run split where the range
+/// starts or ends inside it; `None` if none was marked or the runs cannot grow by the two splits.
+pub(super) fn clear_unwritten(runs: &KVec<BlockRun>, from: u64, to: u64) -> Option<KVec<BlockRun>> {
+    let touched =
+        |r: &BlockRun| r.flags & RUN_UNWRITTEN != 0 && r.file_block < to && from < r.file_block + r.length as u64;
+    if !runs.iter().any(touched) {
+        return None;
+    }
+    let mut out = KVec::new();
+    out.try_reserve(runs.len() + 2).ok()?;
+    for r in runs.iter() {
+        if !touched(r) {
+            out.push_within_capacity(*r).ok()?;
+            continue;
+        }
+        let end = r.file_block + r.length as u64;
+        let (a, b) = (from.max(r.file_block), to.min(end));
+        for (start, stop, flags) in [(r.file_block, a, r.flags), (a, b, r.flags & !RUN_UNWRITTEN), (b, end, r.flags)] {
+            if start < stop {
+                let device_lba = if r.device_lba == 0 { 0 } else { r.device_lba + (start - r.file_block) };
+                let piece = BlockRun { file_block: start, device_lba, length: (stop - start) as u32, flags };
+                out.push_within_capacity(piece).ok()?;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Fault in every page of `file` that `n` bytes from `at` touch.

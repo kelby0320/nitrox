@@ -1,5 +1,6 @@
 use super::super::flush::held;
 use super::*;
+use crate::libkern::io_op::IO_NOCACHE;
 use crate::mm::test_support::init_global_heap;
 use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
 use crate::object::userspace_server::{FILE_OPS_MAX, FILE_OPS_PER_PROCESS, FileWork, QueuedOp};
@@ -156,7 +157,8 @@ fn a_files_read_or_write_is_refused_without_its_rights_its_range_or_a_buffer_tha
     let big_src = global::get().install(PID, big.clone().erase(), Rights::MAP_READ).unwrap();
     let past_window = (0, 0, MAX_USER_COPY_SIZE + 1);
     assert_eq!(io(PID, &big, both, IoOpcode::Write, big_src, past_window), Err(KError::InvalidArgument), "a window");
-    let flagged = IoOp { opcode: IoOpcode::Read as u32, flags: 1, buffer: rw.0, buf_offset: 0, offset: 0, length: 1 };
+    let flagged =
+        IoOp { opcode: IoOpcode::Read as u32, flags: 1 << 1, buffer: rw.0, buf_offset: 0, offset: 0, length: 1 };
     assert_eq!(submit(f.clone(), both, &flagged, IoOpcode::Read, PID), Err(KError::InvalidArgument));
     let stub = Ref::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap());
     assert_eq!(io(PID, &stub, both, IoOpcode::Read, rw, (0, 0, 1)), Err(KError::Unsupported), "no server's");
@@ -179,12 +181,73 @@ fn a_read_at_the_end_completes_at_once_and_a_full_mount_queues_the_rest_in_turn(
     let running = fill(&reg);
     let at_end = operation_of(io(PID, &f, both, IoOpcode::Read, rw, (0, PAGE_SIZE as u64, 1)).unwrap());
     assert_eq!(crate::sched::pending_op_completion(&at_end), (0, 0), "answered, not queued");
-    let read = operation_of(io(PID, &f, both, IoOpcode::Read, rw, (0, 0, 8)).unwrap());
+    let uncached =
+        IoOp { opcode: IoOpcode::Read as u32, flags: IO_NOCACHE, buffer: rw.0, buf_offset: 0, offset: 0, length: 8 };
+    let read = operation_of(submit(f.clone(), both, &uncached, IoOpcode::Read, PID).unwrap());
     let write = operation_of(io(PID, &f, both, IoOpcode::Write, rw, (0, 0, 8)).unwrap());
     assert!(!crate::sched::pending_op_is_signaled(&read) && !crate::sched::pending_op_is_signaled(&write));
     let next = reg.op_done(running[0]).unwrap();
-    assert!(matches!(next.work, FileWork::Read(..)) && core::ptr::eq(&*next.po, &*read), "in turn");
+    assert!(matches!(&next.work, FileWork::Read(s, _) if s.nocache) && core::ptr::eq(&*next.po, &*read), "in turn");
     let next = reg.op_done(running[1]).unwrap();
     assert!(matches!(next.work, FileWork::Write(..)) && core::ptr::eq(&*next.po, &*write));
     global::close_all_owned_by(PID);
+}
+
+fn uncached_op(reg: &Ref<UserspaceServerReg>, work: FileWork) -> (i32, u64) {
+    let po = Ref::new(PendingOperation::try_new().unwrap());
+    let op = reg.admit_op(QueuedOp { work, po, pid: 4493 }).ok().unwrap().unwrap();
+    let (_, status, done, _) = finish(reg, op);
+    (status, done)
+}
+
+fn span(file: &Ref<FileObject>, length: u64) -> Span {
+    Span { file: file.clone(), offset: 0, buf_offset: 0, length, nocache: true }
+}
+
+#[test]
+fn a_no_cache_read_lets_its_window_go_unless_something_maps_the_file() {
+    init_global_heap();
+    let reg = registration();
+    let f = on_device(&reg, 2, &[]);
+    let resident = |f: &Ref<FileObject>| (0..2).filter(|&i| f.lookup(i).is_some()).count();
+    let fill_in = |f: &Ref<FileObject>| {
+        for i in 0..2 {
+            if let crate::object::file_object::Reserve::New(_) = f.reserve(i) {
+                f.mark_ready(i);
+            }
+        }
+    };
+    let into = || Ref::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap());
+    fill_in(&f);
+    f.mapped();
+    assert_eq!(uncached_op(&reg, FileWork::Read(span(&f, 2 * PAGE_SIZE as u64), into())), (0, 2 * PAGE_SIZE as u64));
+    assert_eq!(resident(&f), 2, "a mapping holds them");
+    f.unmapped();
+    uncached_op(&reg, FileWork::Read(span(&f, 2 * PAGE_SIZE as u64), into()));
+    assert_eq!(resident(&f), 0);
+}
+
+#[test]
+fn a_no_cache_write_whose_write_back_fails_keeps_its_pages() {
+    init_global_heap();
+    let reg = registration();
+    let f = on_device(&reg, 2, &[]);
+    let from = Source::Memory(Ref::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap()));
+    let written = uncached_op(&reg, FileWork::Write(span(&f, 2 * PAGE_SIZE as u64), from));
+    assert_eq!(written, (0, 2 * PAGE_SIZE as u64), "two whole pages, no fill");
+    assert!(f.lookup(0).is_some() && f.lookup(1).is_some(), "a device with no driver takes no write-back");
+}
+
+#[test]
+fn a_no_cache_read_that_fails_lets_nothing_go() {
+    init_global_heap();
+    let reg = registration();
+    let f = on_device(&reg, 2, &[]);
+    if let crate::object::file_object::Reserve::New(_) = f.reserve(0) {
+        f.mark_ready(0);
+    }
+    let into = Ref::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap());
+    let read = uncached_op(&reg, FileWork::Read(span(&f, 2 * PAGE_SIZE as u64), into));
+    assert_eq!(read, (KError::IoError as i32, PAGE_SIZE as u64), "a device with no driver fails the second page");
+    assert!(f.lookup(0).is_some(), "the page read before the failure stays");
 }

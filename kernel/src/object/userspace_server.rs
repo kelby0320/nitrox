@@ -200,6 +200,8 @@ pub struct Span {
     pub buf_offset: u64,
     /// How many bytes.
     pub length: u64,
+    /// Whether its pages go once it completes (`IO_NOCACHE`).
+    pub nocache: bool,
 }
 
 /// A file operation for process `pid`, answered through `po`.

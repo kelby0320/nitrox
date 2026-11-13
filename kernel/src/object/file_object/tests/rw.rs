@@ -159,3 +159,66 @@ fn a_truncate_or_a_failed_page_stops_an_op_with_the_bytes_done() {
     assert_eq!(FileObject::write_from(&g, 1, 3 * P - 2, &from, 0, &mut { fail }), (KError::IoError as i32, 2 * P - 1));
     assert_eq!(FileObject::read_into(&g, 0, 3 * P, &into, 0, &mut { fail }), (KError::IoError as i32, 2 * P));
 }
+
+#[test]
+fn a_window_goes_only_with_nothing_using_its_frames_and_no_write_begun_since_its_mark() {
+    init_global_heap();
+    let reg = registration();
+    let f = on_device(&reg, 12, 6 * PAGE_SIZE, &[]);
+    let into = memory(6 * PAGE_SIZE, 0);
+    let mut seen = std::vec::Vec::new();
+    FileObject::read_into(&f, 0, 5 * P, &into, 0, &mut |f, i| fault_in(f, i, &mut seen));
+    let mark = f.clean_mark().unwrap();
+    assert_eq!(f.let_window_go(0..2, mark), 2);
+    assert!(f.lookup(0).is_none() && f.lookup(2).is_some());
+    f.mapped();
+    assert_eq!(f.let_window_go(2..3, mark), 0, "a mapping");
+    f.unmapped();
+    let running = crate::object::file_object::io::Running::begin(&f);
+    assert_eq!(f.let_window_go(2..3, mark), 0, "another op holding its frames");
+    drop(running);
+    FileObject::writable_mapped(&f);
+    f.writable_unmapped();
+    assert_eq!(f.let_window_go(2..3, mark), 0, "a write begun since the mark");
+    let mark = f.clean_mark().unwrap();
+    assert_eq!(f.let_window_go(2..3, mark), 0, "dirty");
+    FileObject::unpin_if_clean(&f, mark);
+    assert!(matches!(f.reserve(5), Reserve::New(_)));
+    assert_eq!(f.let_window_go(2..6, mark), 3, "the ready pages, and not the one loading");
+    assert!(f.lookup(5).is_some());
+}
+
+#[test]
+fn a_write_back_clears_the_unwritten_mark_on_the_blocks_it_wrote_and_no_more() {
+    let run = |file_block, device_lba, length, flags| BlockRun { file_block, device_lba, length, flags };
+    let mut runs = KVec::new();
+    runs.try_push(run(0, 100, 4, RUN_UNWRITTEN)).unwrap();
+    runs.try_push(run(4, 0, 2, 0)).unwrap();
+    runs.try_push(run(6, 200, 4, RUN_UNWRITTEN)).unwrap();
+    let cleared = crate::object::file_object::io::clear_unwritten(&runs, 2, 8).unwrap();
+    let got: std::vec::Vec<_> = cleared.iter().map(|r| (r.file_block, r.device_lba, r.length, r.flags)).collect();
+    let u = RUN_UNWRITTEN;
+    assert_eq!(got, [(0, 100, 2, u), (2, 102, 2, 0), (4, 0, 2, 0), (6, 200, 2, 0), (8, 202, 2, u)]);
+    assert!(crate::object::file_object::io::clear_unwritten(&cleared, 2, 8).is_none(), "nothing left marked there");
+}
+
+#[test]
+fn a_page_over_blocks_still_marked_unwritten_is_not_let_go_until_written() {
+    init_global_heap();
+    let reg = registration();
+    let mut runs = KVec::new();
+    runs.try_push(BlockRun { file_block: 0, device_lba: 100, length: 2, flags: RUN_UNWRITTEN }).unwrap();
+    let device = DEVICE.with(Ref::clone);
+    let producer = Producer::FsServerBlocks { device, block_size: 4096, reg: reg.clone(), file_id: 13 };
+    let f = Ref::new(FileObject::try_new_with_runs(2 * PAGE_SIZE, producer, runs).unwrap());
+    let mut seen = std::vec::Vec::new();
+    FileObject::write_from(&f, 0, 2 * P, &Source::Memory(memory(2 * PAGE_SIZE, 5)), 0, &mut |f, i| {
+        fault_in(f, i, &mut seen)
+    });
+    let mark = f.clean_mark().unwrap();
+    FileObject::unpin_if_clean(&f, mark);
+    assert!(!f.is_dirty(), "clean, as a write-back leaves it");
+    assert_eq!(f.let_window_go(0..2, mark), 0, "a fill would read it as zero");
+    f.written(0, 1);
+    assert_eq!(f.let_window_go(0..2, mark), 1, "the page written back, and not the other");
+}

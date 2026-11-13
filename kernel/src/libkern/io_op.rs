@@ -36,6 +36,10 @@ pub const IO_OPCODE_RESCAN: u32 = 3;
 /// [`IoOpcode::Eject`]'s value.
 pub const IO_OPCODE_EJECT: u32 = 4;
 
+/// **`IoOp::flags`: let the window's pages go once the op completes**, written back first if dirty:
+/// a file's `Read` or `Write`, and a copy's source too. A hint: they stay while anything uses them.
+pub const IO_NOCACHE: u32 = 1 << 0;
+
 /// **The most one `Read` or `Write` of a file moves**, a copy's window: a memory buffer is held to
 /// it by its size, a file as a buffer by this.
 pub const MAX_USER_COPY_SIZE: u64 = 16 << 20;

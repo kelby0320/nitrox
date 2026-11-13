@@ -1894,15 +1894,6 @@ the field — the fix is an order that can be undone (counts before bits, or the
 a failed count) and a test failing each write of a grow in turn, as `extent.rs`'s already does for
 the extent tree.
 
-**A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
-whole of it, and refuses one over `MAX_COPY`, 8 MiB: unmapping leaves a file's pages with its
-page-cache object until the object drops, so a copy a window at a time, which `sys_memory_map`'s
-offset allows, would still hold every page. A stick's photos and videos are over it. **Scheduled**
-(2026-10-08, the maintainer's call): the syscall consolidation between Phases 6 and 7, where a
-copy is `sys_io_submit` on two files and the kernel streams it a window at a time
-([`syscall-surface.md`](../planning/syscall-surface.md)). A `SYS_FILE_COPY` for Part H was turned
-down: named for files, a special case, and code the consolidation would replace.
-
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 
 **Encrypted root (LUKS).** Architecture accommodates this — LUKS is a block device filter driver in initramfs; init invokes it before spawning fs-server. Not in initial scope. Trigger: encrypted-root deployment.
@@ -2537,6 +2528,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A copy of a file over 8 MiB (`copy-limit`) | 2026-11-13 | **Pre-Phase-7 E.8**: a copy is `sys_io_submit(destination, Write, buffer = source file)`, a window of 16 MiB at a time with `IO_NOCACHE`, which lets each window's pages go once it is on the device, so `libfs` copies a file of any size the wire carries, 4 GiB less a byte, holding two windows at most. `check-copy` copies 512 MiB in a machine of 256 MiB. Widening the 32-bit size is a change of its own: a 5 GiB file answers `TooLarge` at the destination's create. |
 | A thread's stack with no guard below it (`thread-stack-guard`) | 2026-11-13 | **Pre-Phase-7 E.6**: a mapping placed without a hint keeps an unmapped page below itself, and below the mapping above it, so a `libos::thread::Stack` that overruns faults rather than write the mapping beneath. A hinted mapping is not held off that page. |
 | A handle's rights checked against the tag its caller passes (`handle-install-tag`) | 2026-11-06 | **`HandleTable::install(pid, ObjectRef, rights)`, pre-Phase-7 J.3**: the tag is the reference's own, its object's header's, and the reference comes back with a refusal. `allocate`, which took a tag beside a raw pointer, is private to the table and `unsafe`, so no caller writes a tag. |
 | A library's raw-handle functions beside its typed ones (`raw-handle-shims`) | 2026-11-05 | **Their last callers moved**: the test harness and the two filesystem servers' entry, in pre-Phase-7 Part E.5, and the thirty-three shims went with them, and with them what only they used: `librsproto`'s raw `Dir` session and libstream's raw `Bootstrap`. Each library's only form is its typed one. |

@@ -325,6 +325,10 @@ pub const IO_OPCODE_RESCAN: u32 = 3;
 /// `IoOpcode::Eject` — stop a removable disk's medium; every later request on it is refused
 /// `PeerClosed` until it is plugged in again. As for a rescan: no buffer, no range, `WRITE`.
 pub const IO_OPCODE_EJECT: u32 = 4;
+
+/// **`IoOp::flags`: let the window's pages go once the op completes**, written back first if dirty:
+/// a file's `Read` or `Write`, and a copy's source too. A hint: they stay while anything uses them.
+pub const IO_NOCACHE: u32 = 1 << 0;
 /// **The most one `Read` or `Write` of a file moves**, a copy's window.
 pub const MAX_USER_COPY_SIZE: u64 = 16 << 20;
 

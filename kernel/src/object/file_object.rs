@@ -143,10 +143,8 @@ pub struct FileObject {
     /// Exact file size in bytes; the mapped range is bounded by it. **Changes in place** for a
     /// cached Model A file ([`resize`](Self::resize)), so it is atomic.
     size: AtomicUsize,
-    /// Writable mappings that exist now: raised by [`writable_mapped`](Self::writable_mapped)
-    /// before the mapping is made, lowered when such a VMA drops — atomic, since a VMA drops
-    /// wherever its address space does and must take no lock here.
-    writable_maps: AtomicU32,
+    /// What uses its frames now.
+    users: io::Users,
     producer: Producer,
     inner: SpinLock<Inner>,
 }
@@ -272,7 +270,7 @@ impl FileObject {
             header: Header::new(),
             magic: Self::MAGIC,
             size: AtomicUsize::new(size),
-            writable_maps: AtomicU32::new(0),
+            users: io::Users::default(),
             producer,
             inner: SpinLock::new(
                 LockRank::KernelObject,
@@ -344,7 +342,7 @@ impl FileObject {
     pub fn writable_mapped(file_obj: &Ref<FileObject>) {
         let fo: &FileObject = file_obj;
         let mut g = fo.inner.lock();
-        fo.writable_maps.fetch_add(1, Ordering::AcqRel);
+        fo.users.writable_maps.fetch_add(1, Ordering::AcqRel);
         g.map_gen = g.map_gen.wrapping_add(1);
         // No sync writes a forgotten object, so a pin on it is one nothing would ever clean.
         if g.self_pin.is_none() && fo.cache_key().is_some() && !g.dead {
@@ -355,7 +353,7 @@ impl FileObject {
     /// A writable mapping of this object has gone. Lock-free, since a VMA drops wherever its
     /// address space is torn down; saturating, so a never-counted VMA takes no one's count.
     pub fn writable_unmapped(&self) {
-        let _ = self.writable_maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        let _ = self.users.writable_maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
     }
 
     /// **Taken before a write-back: whether it can leave the object clean.** `Some` only if no
@@ -366,7 +364,7 @@ impl FileObject {
     /// that syncs while still mapped leaves its file dirty, so `libfs` and `nxsh` unmap first.
     pub fn clean_mark(&self) -> Option<u64> {
         let g = self.inner.lock();
-        if self.writable_maps.load(Ordering::Acquire) == 0 { Some(g.map_gen) } else { None }
+        if self.users.writable_maps.load(Ordering::Acquire) == 0 { Some(g.map_gen) } else { None }
     }
 
     /// After a successful write-back that began at `mark`: **clean**, unless a writable mapping
@@ -621,11 +619,6 @@ impl FileObject {
         self.inner.lock().retired.len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn writable_maps(&self) -> u32 {
-        self.writable_maps.load(Ordering::Acquire)
-    }
-
     /// Look up page `index`: its frame + [`PageState`] if cached, else `None`.
     pub fn lookup(&self, index: usize) -> Option<(PhysAddr, PageState)> {
         let g = self.inner.lock();
@@ -756,6 +749,7 @@ impl FileObject {
             Producer::FsServerBlocks { device, block_size, .. } => (device.clone(), *block_size),
             _ => return WriteBack::Failed,
         };
+        let _running = io::Running::begin(fo);
         let max = run_pages(crate::io::block::max_frags(&device));
         fo.write_runs(block_size, max, |frames, dev_offset, length| {
             let po = match PendingOperation::try_new() {
@@ -818,7 +812,7 @@ impl FileObject {
             let status = issue(&frames, dev_block * block_size as u64, (pages * PAGE_SIZE) as u64);
             self.finish_io();
             match WriteBack::of(status) {
-                WriteBack::Written => {}
+                WriteBack::Written => self.written(start, pages),
                 w => return w,
             }
             // Past the pages the run wrote. It may have taken pages faulted in since the list was

@@ -3,7 +3,7 @@
 
 use super::flush::{flush_mount, operation, write_back};
 use super::*;
-use crate::libkern::io_op::MAX_USER_COPY_SIZE;
+use crate::libkern::io_op::{IO_NOCACHE, MAX_USER_COPY_SIZE};
 use crate::object::file_object::io::Source;
 use crate::object::userspace_server::{FileWork, QueuedOp, Span};
 use crate::sched::Job;
@@ -17,7 +17,7 @@ pub(super) fn submit(file: Ref<FileObject>, rights: Rights, op: &IoOp, opcode: I
     if !rights.contains(need) {
         return Err(KError::NoAccess);
     }
-    if op.flags != 0 || op.length > MAX_USER_COPY_SIZE {
+    if op.flags & !IO_NOCACHE != 0 || op.length > MAX_USER_COPY_SIZE {
         return Err(KError::InvalidArgument);
     }
     let buf_end = op.buf_offset.checked_add(op.length).ok_or(KError::InvalidArgument)?;
@@ -35,7 +35,8 @@ pub(super) fn submit(file: Ref<FileObject>, rights: Rights, op: &IoOp, opcode: I
     }
     let reg = file.op_owner().ok_or(KError::Unsupported)?;
     let nothing = op.length == 0 || (read && op.offset >= file.size() as u64);
-    let span = Span { file, offset: op.offset, buf_offset: op.buf_offset, length: op.length };
+    let nocache = op.flags & IO_NOCACHE != 0;
+    let span = Span { file, offset: op.offset, buf_offset: op.buf_offset, length: op.length, nocache };
     let work = match from {
         Source::Memory(mo) if read => FileWork::Read(span, mo),
         from => FileWork::Write(span, from),
@@ -122,12 +123,40 @@ pub(super) fn finish(
     let (status, done) = match work {
         FileWork::FlushMount => flush_mount(reg),
         FileWork::Flush(file) => (write_back(&file).err().map_or(0, |e| e as i32), 0),
-        FileWork::Read(s, into) => FileObject::read_into(&s.file, s.offset, s.length, &into, s.buf_offset, &mut fault),
+        FileWork::Read(s, into) => {
+            let done = FileObject::read_into(&s.file, s.offset, s.length, &into, s.buf_offset, &mut fault);
+            uncache(&s, None, done, false);
+            done
+        }
         FileWork::Write(s, from) => {
-            FileObject::write_from(&s.file, s.offset, s.length, &from, s.buf_offset, &mut fault)
+            let done = FileObject::write_from(&s.file, s.offset, s.length, &from, s.buf_offset, &mut fault);
+            uncache(&s, Some(&from), done, true);
+            done
         }
     };
     (po, status, done, reg.op_done(pid))
+}
+
+/// **`IO_NOCACHE` once an op has succeeded**: its file's window let go, and a copy's source's,
+/// each written back first if dirty, or always after a write. Each stays if the write-back fails.
+fn uncache(s: &Span, from: Option<&Source>, (status, done): (i32, u64), wrote: bool) {
+    if !s.nocache || status != 0 {
+        return;
+    }
+    let window = |file: &Ref<FileObject>, at: u64, written: bool| {
+        let mark = file.clean_mark();
+        if (written || file.is_dirty()) && write_back(file).is_err() {
+            return;
+        }
+        let page = PAGE_SIZE as u64;
+        if let Some(mark) = mark {
+            file.let_window_go((at / page) as usize..at.saturating_add(done).div_ceil(page) as usize, mark);
+        }
+    };
+    window(&s.file, s.offset, wrote);
+    if let Some(Source::File(source)) = from {
+        window(source, s.buf_offset, false);
+    }
 }
 
 #[cfg(test)]

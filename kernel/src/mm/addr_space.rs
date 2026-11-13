@@ -411,10 +411,12 @@ impl AddressSpace {
         if writable {
             FileObject::writable_mapped(&object);
         }
+        object.mapped();
         let refused = |object: Ref<FileObject>, e: MapError| {
             if writable {
                 object.writable_unmapped();
             }
+            object.unmapped();
             Err((object, e))
         };
         let mut guard = self.inner.lock();
