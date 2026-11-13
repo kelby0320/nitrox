@@ -38263,3 +38263,8 @@ E.6 merged, #439. E.7, `syscall-surface.md` § E.7, built on `pre-phase-7/part-e
   "a held straight after a flush answers 0", which a boot could not catch; and the resolve decoding
   and the mock's resolves moved to files of their own. The flush syscalls moved first (`8fcba821`);
   the rest is `d9390cbf`.
+- After review (`bfe2c7a7`), **a flush past a mount's sixteen waits its turn, and a process may have
+  four of a mount's flushes running or waiting** (the maintainer's call): a refused-and-retried
+  budget let one process starve every other flush on a mount. A file's flush counts in its mount's
+  budget forgotten or not; a flush or held asks for no rights. The supervisors' 60 s bounding a
+  whole mount's write-back is deferred (`flush-progress-bound`, the maintainer's call).

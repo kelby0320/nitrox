@@ -555,6 +555,24 @@ a `WouldBlock` not asked again; and `init` asking a mount to unmount after a fai
 `abi-sync-check` finds a resolve code changed on one side. **All 18 CI gates pass under KVM**;
 `check-shutdown` holds `init`'s flush, then its clean unmount, and `check-media` a pulled stick's.
 
+**After review** (`bfe2c7a7`):
+- **A flush past a mount's sixteen waits its turn**, first come first served, and a thread that
+  finishes one runs the next; **a process may have four of a mount's flushes running or waiting**,
+  and only one past them is refused `WouldBlock` (the maintainer's call). Before, any process could
+  keep all sixteen and make every other flush on the mount poll for ever, `auth-service`'s among
+  them.
+- **A file's flush counts in its mount's budget forgotten or not, and whatever its id**: it takes
+  its place from its producer's registration. A file with no device behind it answers `IoError` at
+  once.
+- **The ordering the spec promises is pinned deterministically**: a flush's work, its file let go
+  and its place passed on, is a function the test calls before anything completes.
+- **A flush and a held ask for no rights**, and act on the server their path's binding names, as
+  the spec now says.
+- Every ABI mirror's field is pinned by an offset assert on both sides, `ResolveOp`'s first.
+- `Op::abandon` closes unwaited only the buffer the I/O names, and waits out any other.
+- **Deferred**: the supervisors' 60 s bounds a whole mount's write-back, not one command
+  (`flush-progress-bound`), as the dirty set left at a stop is what mapping writers left unflushed.
+
 ### E.8 Files as resources, a copy, and spawn
 
 **`Read` and `Write` on a `FileObject`**, the first resources that are not devices:
