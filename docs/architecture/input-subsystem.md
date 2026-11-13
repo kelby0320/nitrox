@@ -15,7 +15,7 @@ arriving in a widget runs on every boot:
 |---|---|
 | i8042 controller, keyboard + mouse, one driver | `kernel/src/drivers/ps2/` |
 | USB HID boot keyboards and mice: bound and polled by the xHCI driver; their reports decoded | `kernel/src/drivers/xhci/hid.rs`, `kernel/src/drivers/hid/` |
-| Per-device lossy ring with a `SYN_DROPPED` marker, the parked read and its hand-off — shared by every input driver since Phase 6 Part B.1 | `kernel/src/drivers/input/` |
+| Per-device lossy ring with a `SYN_DROPPED` marker, the parked read and its hand-off — shared by every input driver since Phase 6 Part B.1, and by the serial console over a ring of bytes | `kernel/src/drivers/input/` |
 | The `InputEvent` record crossing the kernel boundary | `kernel/src/libkern/input.rs` |
 | Raw device nodes at `/dev/input/raw/<n>` | `kernel/src/object/kernel_server.rs` |
 | Each keyboard and mouse handed to the input server | `userspace/device-mgr/` |

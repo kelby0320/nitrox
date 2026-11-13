@@ -35,7 +35,7 @@ const _: () = assert!(MAX_NODES <= 32, "`Nodes::keyboards` has a bit per slot");
 pub(super) static NODES: Nodes = Nodes::new();
 
 pub(super) fn context(slot: usize, epoch: u32) -> *mut () {
-    ((epoch as usize) << 8 | slot) as *mut ()
+    core::ptr::without_provenance_mut((epoch as usize) << 8 | slot)
 }
 
 pub(super) fn slot_of(ctx: *mut ()) -> (usize, u32) {
@@ -66,18 +66,20 @@ impl Nodes {
     }
 
     /// **Take a slot for a new node**: a free one, else a retired one, reset — its epoch first,
-    /// so a stale handle's next read finds it changed under the node's lock, then its reader and
-    /// any lights write still waiting on it. The slot and its epoch, or `None` when every slot is
-    /// bound. From the hub thread.
+    /// so a stale handle's next read finds it changed under the node's lock, then its reader, renewed
+    /// rather than replaced, and any lights write still waiting on it. The slot and its epoch, or
+    /// `None` when every slot is bound. From the hub thread.
     pub(super) fn take(&self, keyboard: bool) -> Option<(usize, u32)> {
         let states: [u8; MAX_NODES] = core::array::from_fn(|i| self.states[i].load(Ordering::Acquire));
         let index = choose(&states)?;
         if states[index] == RETIRED {
             self.epochs[index].fetch_add(1, Ordering::AcqRel);
             self.reclaim();
-            let old = core::mem::take(&mut *self.readers[index].lock());
-            // Its references dropped here, with the lock let go.
-            drop(old);
+            let stale = self.readers[index].lock().renew();
+            if let Some(read) = stale {
+                input::refuse(&read, KError::PeerClosed);
+                drop(read);
+            }
             let waiting = self.lights.lock()[index].take();
             if let Some((po, _)) = waiting {
                 crate::sched::complete_pending_op(&po, KError::PeerClosed as i32, 0);
@@ -136,7 +138,7 @@ impl Nodes {
         events: &[InputEvent],
         scratch: &mut [u8],
         now: u64,
-    ) -> Option<(ParkedRead, usize)> {
+    ) -> Option<(Loan<ParkedRead>, usize)> {
         let mut r = self.readers[index].lock();
         if !self.current(context(index, epoch)) || !r.offer(events) {
             return None;
@@ -168,11 +170,7 @@ impl Nodes {
                 if !self.current(ctx) {
                     return ReadNow::Gone;
                 }
-                let found = r.read_now(&mut tmp[..max_len], now);
-                if found == ReadNow::Empty {
-                    r.park(ParkedRead::new(po, buffer, buf_offset, max_len));
-                }
-                found
+                r.read_now(&mut tmp[..max_len], now, || ParkedRead::new(po, buffer, buf_offset, max_len))
             },
         );
         match found {

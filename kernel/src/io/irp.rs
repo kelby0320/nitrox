@@ -328,8 +328,8 @@ mod tests {
 
     #[test]
     fn new_block_initialises_single_layer_pending() {
-        let dev = 0xdead_beefusize as *const ();
-        let po = 0xfeed_face_usize as *mut ();
+        let dev = core::ptr::without_provenance(0xdead_beef);
+        let po = core::ptr::without_provenance_mut(0xfeed_face);
         let irp = Irp::new_block(IrpOp::Read, dev, 0x1000, 0x2000, IrpBuffer::NONE, po, 7);
         assert_eq!(irp.op, IrpOp::Read as u32);
         assert_eq!(irp.status, IrpStatus::Pending as i32);

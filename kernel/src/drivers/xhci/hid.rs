@@ -25,6 +25,7 @@ use crate::arch::timer::ArchTimer;
 use crate::drivers::hid::{keyboard, mouse};
 use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader, Submitted};
 use crate::libkern::device::DeviceKind;
+use crate::libkern::handoff::Loan;
 use crate::libkern::input::{EV_KEY, InputEvent, KEY_PRESS};
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KVec};
@@ -845,7 +846,7 @@ pub(super) fn lights_data(report_id: Option<u8>, lights: u8) -> ([u8; 2], usize)
 
 /// Drop every read the DPC has finished with. **Thread context only**: from `sched::reap_pending`,
 /// and before a read parks.
-pub fn reclaim_completed() {
+pub(super) fn reclaim_completed() {
     NODES.reclaim();
 }
 

@@ -27,7 +27,7 @@ use super::context::{self, DCI_EP0, speed};
 use super::desc;
 use super::hid::LightsTo;
 use super::ring::{Producer, RingMem, Trb, code, kind};
-use super::{Awaited, CommandRing, PoPtr, RING_TRBS, Waiting, XHCI, Xhci};
+use super::{Awaited, CommandRing, RING_TRBS, XHCI, Xhci, armed, install};
 use crate::arch::timer::ArchTimer;
 use crate::device::UsbFacts;
 use crate::libkern::KVec;
@@ -707,14 +707,14 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
         let c = x.cmd.lock();
         c.mem.phys().as_u64() + c.ring.next_slot() as u64 * 16
     };
-    *x.waiting.lock() = Some(Waiting::new(Awaited::Command { trb: sent }, PoPtr(po.as_object().as_ptr())));
+    let armed = armed::arm(po, x, |c| install(&x.waiting, Awaited::Command { trb: sent }, c))?;
     {
         let mut c = x.cmd.lock();
         let CommandRing { mem, ring } = &mut *c;
         ring.push(&mut RingMem::of(mem), trb);
     }
     x.db.write32(0, 0);
-    match wait(x, &po, COMMAND_NS) {
+    match armed.wait(COMMAND_NS) {
         Some((code::SUCCESS, slot)) => Ok(slot as u8),
         Some((c, _)) => Err(Failed::Code(c)),
         None => {
@@ -726,26 +726,6 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
             Err(Failed::Timeout)
         }
     }
-}
-
-/// **Wait for `po`**, up to `bound_ns`: its completion code and result, or `None` if it did not
-/// complete. On a timeout the waiting record is taken back, so the DPC cannot complete an operation
-/// this thread is about to drop; if the DPC already took it, its completion is on the way, and is
-/// waited for.
-fn wait(x: &Xhci, po: &Ref<PendingOperation>, bound_ns: u64) -> Option<(u8, u64)> {
-    let now = crate::arch::Timer::read_ns();
-    let done =
-        matches!(crate::sched::wait_on(&[po.as_object()], now + bound_ns, now), crate::sched::WaitResult::Signaled(_));
-    if !done {
-        if x.waiting.lock().take().is_some() {
-            return None;
-        }
-        while !matches!(crate::sched::wait_on(&[po.as_object()], u64::MAX, 0), crate::sched::WaitResult::Signaled(_)) {
-            sleep(1_000_000);
-        }
-    }
-    let (status, result) = crate::sched::pending_op_completion(po);
-    Some((status as u8, result))
 }
 
 /// A fresh operation for one wait.

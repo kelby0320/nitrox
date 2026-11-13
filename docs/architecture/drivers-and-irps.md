@@ -79,6 +79,16 @@ IRP. An IRP carries none of its own: a completed IRP is linked onto one list,
 drained by one static DPC. This matters: per `kernel/CLAUDE.md`, allocation in
 IRQ/DPC context is forbidden.
 
+**What a DPC uses but must not drop is a `Handoff`** (`libkern/handoff.rs`): freeing counts as
+allocating, and a last reference dropped there reaches the slab's plain lock. Thread context
+parks a value (an input read, a finished PS/2 lights write); the DPC is lent it, uses it with no
+lock held and gives it back; thread context takes what is owed and drops it outside the lock, as
+the next read parks and from `sched::reap_pending`, which runs each driver's reclaim, registered
+once at its start. A park never writes over a value lent or owed; a `Loan` dropped instead of
+given back, or given back to a `Handoff` that did not lend it, fails a debug build. A USB input
+node's slot given to another device keeps its `Handoff`, so a read lent as its device departed is
+given back where it was lent. Block IRPs keep their own unbounded list (`io::block`).
+
 > **Reconciliation with Phase 1.** Phase 1 wakes `sys_wait`ers *directly* from
 > the timer-tick handler under the rank-1 scheduler lock (see the decision log,
 > 2026-06-08). The `phase-2/dpc` item builds the DPC queue described here and
@@ -254,16 +264,20 @@ A driver whose work is a sequence with waits in it can run it on **a kernel thre
 as a state machine of DPCs: `sched::spawn` makes the thread, and `sched::wait_on` — the primitive
 under `sys_wait` — blocks it with a deadline on the same waitables. The USB hub thread
 ([`usb.md`](usb.md)) is the first long-lived one, and its waits are the pattern:
-- **A `PendingOperation` per operation**, completed by the DPC with
-  `sched::complete_pending_op_at`, by address: the thread lets go of the operation once it sees the
-  completion, which can be before the DPC's call returns, so the DPC holds no borrow of it. The
-  thread records what it awaits *before* the hardware can answer, so no completion arrives first.
+- **A `PendingOperation` per operation**, armed (`drivers/xhci/armed.rs`): the thread hands it to
+  an `Armed`, which owns it and is waited through, and the record the DPC takes holds a
+  `Completer`, which completes it by address, as the `Armed` lets go of it once it sees the
+  completion, which can be before the DPC's call returns. An `Armed` forgotten leaks the operation
+  rather than free it under the `Completer`. **A record is armed one at a time**, a second refused.
+  The thread arms *before* the hardware can answer, so no completion arrives first.
 - **The DPC completes outside its locks.** It takes the matching record out under the driver's
   leaf lock and completes the operation after releasing it, since completing takes the scheduler's
   lock.
-- **A timeout takes the record back.** If the DPC already took it, its completion is imminent and
-  is waited for, so a DPC never completes an object the thread has dropped — and a DPC drops none
-  itself, since freeing counts as allocating there.
+- **A timeout takes the record back**, as an `Armed` dropped unwaited does — its own `Completer`
+  only, never another wait's armed since. If the DPC already took it, its completion is imminent
+  and is waited for, so a DPC never completes an object the thread has dropped — and a DPC drops
+  none itself, since freeing counts as allocating there. A `Completer` dropped unspent fails a debug
+  build.
 - **An `InterruptObject` for events that are not answers**, signalled by the DPC with
   `sched::signal_interrupt`. It latches, so an event that lands while the thread is busy is
   counted; a kernel thread consumes one with `sched::interrupt_consume`, which `sys_wait` does for

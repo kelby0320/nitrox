@@ -224,14 +224,15 @@ mod tests {
         init_global_heap();
         let (obj, mut tok) = new_chan();
         let tok = &mut tok;
-        let ths: [*mut (); NotificationChannel::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+        let ths: [*mut (); NotificationChannel::MAX_WAITERS] =
+            core::array::from_fn(|i| core::ptr::without_provenance_mut(0x1000 + i));
         for &t in &ths {
             assert!(obj.add_waiter(tok, t).is_ok());
         }
-        assert!(obj.add_waiter(tok, 0xDEAD as *mut ()).is_err());
+        assert!(obj.add_waiter(tok, core::ptr::without_provenance_mut(0xDEAD)).is_err());
         obj.remove_waiter(tok, ths[0]);
-        assert!(obj.add_waiter(tok, 0xBEEF as *mut ()).is_ok());
-        assert_eq!(&obj.take_waiters(tok)[..], &[ths[1], ths[2], ths[3], 0xBEEF as *mut ()]);
+        assert!(obj.add_waiter(tok, core::ptr::without_provenance_mut(0xBEEF)).is_ok());
+        assert_eq!(&obj.take_waiters(tok)[..], &[ths[1], ths[2], ths[3], core::ptr::without_provenance_mut(0xBEEF)]);
         assert!(obj.take_waiters(tok).is_empty());
     }
 

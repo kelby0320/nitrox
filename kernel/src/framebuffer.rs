@@ -87,7 +87,7 @@ mod tests {
 
     fn at(address: u64, bpp: u16) -> Framebuffer {
         Framebuffer {
-            address: address as *mut u8,
+            address: core::ptr::without_provenance_mut(address as usize),
             width: 1024,
             height: 768,
             pitch: 4096,

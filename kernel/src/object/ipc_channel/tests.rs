@@ -128,14 +128,15 @@ fn waiters_add_remove_take_caps_at_max() {
     init_global_heap();
     let (a, b) = new_pair();
     let tok = &mut SchedToken::for_test();
-    let ths: [*mut (); IpcChannel::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+    let ths: [*mut (); IpcChannel::MAX_WAITERS] =
+        core::array::from_fn(|i| core::ptr::without_provenance_mut(0x1000 + i));
     for &t in &ths {
         assert!(a.add_waiter(tok, t).is_ok());
     }
-    assert!(a.add_waiter(tok, 0xDEAD as *mut ()).is_err());
+    assert!(a.add_waiter(tok, core::ptr::without_provenance_mut(0xDEAD)).is_err());
     a.remove_waiter(tok, ths[0]);
-    assert!(a.add_waiter(tok, 0xBEEF as *mut ()).is_ok());
-    assert_eq!(&a.take_waiters(tok)[..], &[ths[1], ths[2], ths[3], 0xBEEF as *mut ()]);
+    assert!(a.add_waiter(tok, core::ptr::without_provenance_mut(0xBEEF)).is_ok());
+    assert_eq!(&a.take_waiters(tok)[..], &[ths[1], ths[2], ths[3], core::ptr::without_provenance_mut(0xBEEF)]);
     assert!(a.take_waiters(tok).is_empty());
     drop(a);
     drop(b);
@@ -297,7 +298,7 @@ fn cancel_marks_the_matching_held_send() {
     }
     let mut t = empty_xfer();
     assert_eq!(a.send_or_queue(tok, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
-    assert!(!b.cancel_pending_send(tok, 0xDEAD as *const PendingOperation));
+    assert!(!b.cancel_pending_send(tok, core::ptr::without_provenance(0xDEAD)));
     assert!(b.cancel_pending_send(tok, po.as_ptr()));
     drop(po);
     drop(a);

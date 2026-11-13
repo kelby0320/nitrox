@@ -2,7 +2,7 @@ use super::*;
 use crate::drivers::xhci::ring::Slots;
 use crate::io::irp::{Irp, IrpBuffer};
 use crate::mm::test_support::init_global_heap;
-use tokens::{Lax, fly, was};
+use tokens::{Lax, fly, hub, op_at, was};
 
 mod refusals;
 mod tokens;
@@ -718,15 +718,20 @@ fn a_hub_command_the_dpc_reached_is_waited_for() {
     let disks = Disks::new();
     let mut fake = Fake::new();
     let (i, _) = disks.take(held(fake.dev(5))).unwrap();
-    let po = 0x1234 as *mut ();
-    assert_eq!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0), Ok(()));
-    assert_eq!(disks.take_back(i), TakeBack::Taken, "before the DPC reached it");
+    assert_eq!(disks.issue_hub(i, hub(0x1234), 0, &scsi::test_unit_ready(), 0, false, 0).map_err(|e| e.1), Ok(()));
+    let second = disks.issue_hub(i, hub(0x5678), 0, &scsi::test_unit_ready(), 0, false, 0).map_err(|e| e.1);
+    assert_eq!(second, Err("another hub command is armed"), "the first kept");
+    assert_eq!(disks.take_back(i, op_at(0x5678)), None, "another wait's is not its to take");
+    assert_eq!(disks.take_back(i, op_at(0x1234)), Some(hub(0x1234)), "before the DPC reached it");
     assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none());
-    assert_eq!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0), Ok(()));
+    assert_eq!(disks.issue_hub(i, hub(0x1234), 0, &scsi::test_unit_ready(), 0, false, 0).map_err(|e| e.1), Ok(()));
     disks.on_transfer(5, 4, code::SUCCESS, 0, 1).lax();
     disks.answer(i, 2, 0);
-    assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1).lax(), Some(Action::Hub { po }));
-    assert_eq!(disks.take_back(i), TakeBack::OnItsWay, "after it: its completion is on its way");
+    assert_eq!(
+        disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1).lax(),
+        Some(Action::Hub { completer: hub(0x1234) })
+    );
+    assert_eq!(disks.take_back(i, op_at(0x1234)), None, "after it: its completion is on its way");
     let result = disks.devs[i].lock().as_ref().unwrap().hub_result;
     assert_eq!(result, Some(HubResult::Status(Status::Passed { residue: 0 })));
 }
@@ -802,12 +807,14 @@ fn a_short_read_whose_status_says_nothing_is_missing_fails() {
     assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Short), "left for reset recovery");
 
     let (j, _) = disks.take(held(fake.dev(5))).unwrap();
-    let po = 0x1234 as *mut ();
-    assert_eq!(disks.issue_hub(j, po, 0, &scsi::inquiry(), 36, false, 0), Ok(()));
+    assert_eq!(disks.issue_hub(j, hub(0x1234), 0, &scsi::inquiry(), 36, false, 0).map_err(|e| e.1), Ok(()));
     disks.on_transfer(5, 4, code::SUCCESS, 0, 1).lax();
     assert_eq!(disks.on_transfer(5, 3, code::SHORT_PACKET, 0, 1).lax(), Some(Action::None));
     disks.answer(j, 1, 0);
-    assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, j), 1).lax(), Some(Action::Hub { po }));
+    assert_eq!(
+        disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, j), 1).lax(),
+        Some(Action::Hub { completer: hub(0x1234) })
+    );
     let result = disks.devs[j].lock().as_ref().unwrap().hub_result;
     assert_eq!(result, Some(HubResult::Status(Status::Passed { residue: 0 })));
 }
@@ -894,26 +901,38 @@ fn a_hub_command_goes_only_on_a_held_device_and_never_replaces_a_read() {
     let disks = Disks::new();
     let mut fake = Fake::new();
     let (i, epoch) = disks.take(fake.dev(5)).unwrap();
-    let po = 0x1234 as *mut ();
     let tur = scsi::test_unit_ready();
-    assert_eq!(disks.issue_hub(i, po, 1, &tur, 0, false, 0), Err("its device is not held"), "idle");
+    assert_eq!(
+        disks.issue_hub(i, hub(0x1234), 1, &tur, 0, false, 0).map_err(|e| e.1),
+        Err("its device is not held"),
+        "idle"
+    );
     let frags = [PhysFrag { base: 0x10_000, len: 512 }];
     let mut r = irp(IrpOp::Read, 0, 512, &frags);
     disks.submit(fly(&mut r), context(i, 0, epoch), 0).lax();
-    assert_eq!(disks.issue_hub(i, po, 1, &tur, 0, false, 0), Err("its device is not held"));
+    assert_eq!(disks.issue_hub(i, hub(0x1234), 1, &tur, 0, false, 0).map_err(|e| e.1), Err("its device is not held"));
     disks.devs[i].lock().as_mut().unwrap().recovering = true;
-    assert_eq!(disks.issue_hub(i, po, 1, &tur, 0, false, 0), Err("its device is not held"), "a read in flight");
+    assert_eq!(
+        disks.issue_hub(i, hub(0x1234), 1, &tur, 0, false, 0).map_err(|e| e.1),
+        Err("its device is not held"),
+        "a read in flight"
+    );
     assert!(running(&disks, i, &r).is_some(), "the read still in flight");
+    assert_eq!(disks.take_back(i, op_at(0x1234)), None, "a read is not the hub thread's to take back");
+    assert!(running(&disks, i, &r).is_some());
 
     let mut other = Fake::new();
     let (j, epoch) = disks.take(held(other.dev(6))).unwrap();
     let mut q = irp(IrpOp::Read, 0, 512, &frags);
     disks.submit(fly(&mut q), context(j, 0, epoch), 0).lax();
     assert!(disks.devs[j].lock().as_ref().unwrap().inflight.is_none(), "queued behind the binding");
-    assert_eq!(disks.issue_hub(j, po, 1, &tur, 0, false, 0), Ok(()));
+    assert_eq!(disks.issue_hub(j, hub(0x1234), 1, &tur, 0, false, 0).map_err(|e| e.1), Ok(()));
     disks.on_transfer(6, 4, code::SUCCESS, 0, 1).lax();
     disks.answer(j, 1, 0);
-    assert_eq!(disks.on_transfer(6, 3, code::SUCCESS, csw_trb(&disks, j), 1).lax(), Some(Action::Hub { po }));
+    assert_eq!(
+        disks.on_transfer(6, 3, code::SUCCESS, csw_trb(&disks, j), 1).lax(),
+        Some(Action::Hub { completer: hub(0x1234) })
+    );
     assert_eq!(disks.let_go(j, 2).lax(), Action::None);
     assert!(running(&disks, j, &q).is_some(), "started at the let-go");
 }
@@ -928,7 +947,7 @@ fn a_hub_commands_buffer_is_cleared_before_it_is_sent() {
     let dev = held(fake.dev(5));
     dev.data.fill(0, BIND_DATA, 0xFF);
     let (i, _) = disks.take(dev).unwrap();
-    assert_eq!(disks.issue_hub(i, 0x1234 as *mut (), 0, &scsi::request_sense(), 18, false, 0), Ok(()));
+    assert_eq!(disks.issue_hub(i, hub(0x1234), 0, &scsi::request_sense(), 18, false, 0).map_err(|e| e.1), Ok(()));
     let data: [u64; 4] = disks.with_dev(i, |d| d.data.read(0));
     assert_eq!(data, [0, 0, u64::MAX << 16, u64::MAX], "its 18 bytes, and no more");
 }
@@ -942,7 +961,7 @@ fn a_hub_commands_data_is_cut_to_the_binding_buffer() {
     let mut fake = Fake::new();
     let (i, _) = disks.take(held(fake.dev(5))).unwrap();
     let len = BIND_DATA as u32 + 512;
-    assert_eq!(disks.issue_hub(i, 0x1234 as *mut (), 0, &scsi::inquiry(), len, false, 0), Ok(()));
+    assert_eq!(disks.issue_hub(i, hub(0x1234), 0, &scsi::inquiry(), len, false, 0).map_err(|e| e.1), Ok(()));
     assert_eq!(disks.trb(i, 0, 0).0[2] & 0x1_FFFF, BIND_DATA as u32, "the data stage's length");
 }
 

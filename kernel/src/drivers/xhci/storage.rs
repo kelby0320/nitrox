@@ -36,6 +36,7 @@
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
+use super::armed::{self, Completer, Record};
 use super::context;
 use super::desc;
 use super::hub::{self, DeviceMem, Failed};
@@ -168,8 +169,8 @@ impl BlockDevice for UnitAt {
 enum Owner {
     /// A block IRP's command; `retried` once a unit attention has sent it again.
     Irp { cmd: IrpCmd, retried: bool },
-    /// One of the hub thread's own, which waits on the operation at `po`.
-    Hub { po: *mut () },
+    /// One of the hub thread's own, which waits for `completer` to end it.
+    Hub { completer: Completer },
 }
 
 /// **Where a command is**: its data stage — or its command wrapper, with no data — still moving, or
@@ -292,10 +293,6 @@ pub(super) struct Dev {
     counted: [Counted; MAX_LUNS],
 }
 
-// SAFETY: `Dev` holds a raw pointer to the hub thread's operation, which its lock serialises; the
-// thread holds the operation while its command is in flight.
-unsafe impl Send for Dev {}
-
 /// **A command's CDB**: ten bytes, or sixteen for a unit of 2³² blocks or more.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Cdb {
@@ -388,13 +385,13 @@ impl Queue {
 /// one of the hub thread's waits, or wake the hub thread.
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq))]
-pub enum Action {
+pub(super) enum Action {
     /// Nothing more.
     None,
     /// Complete `irp` with `status` and `transferred` bytes.
     Complete { irp: InFlight, status: i32, transferred: u64 },
-    /// Complete the hub thread's operation at `po`.
-    Hub { po: *mut () },
+    /// End the hub thread's wait.
+    Hub { completer: Completer },
     /// The hub thread has a fault to handle.
     Wake,
     /// Complete `irp` `PeerClosed`, its unit ejected; `said` names it the first time, to log.
@@ -566,7 +563,13 @@ impl Disks {
         }
         let inflight = match dev.inflight.take().map(|c| c.owner) {
             Some(Owner::Irp { cmd, .. }) => Some(cmd.irp),
-            _ => None,
+            // **Its waiter ends**, to find the device gone, rather than wait for a DPC that will not
+            // come. None is armed here: the hub thread, which departs devices, waits out its own.
+            Some(Owner::Hub { completer }) => {
+                completer.complete(0, 0);
+                None
+            }
+            None => None,
         };
         let held = [inflight, dev.stranded.take(), dev.rescan.take().map(|(irp, _)| irp)];
         (queued, held, Some(dev.into_mem()))
@@ -682,10 +685,7 @@ impl Disks {
                 return Some(Action::None);
             };
             let (stage, tag, started) = (cmd.stage, cmd.tag, cmd.started);
-            let hub = match cmd.owner {
-                Owner::Hub { po } => Some(po),
-                Owner::Irp { .. } => None,
-            };
+            let hub = matches!(cmd.owner, Owner::Hub { .. });
             // **A command with a fault recorded is the hub thread's**, which will reset what is on
             // its rings: a later event of it changes nothing. A deadline marked as the command was
             // ending is not such a fault — the command made it, and its completion below clears
@@ -710,21 +710,23 @@ impl Disks {
             let fault = if !ok {
                 Some(Fault::Transfer { dci, code })
             } else {
-                let short = matches!(stage, Stage::Status { short: true, .. }) && hub.is_none();
+                let short = matches!(stage, Stage::Status { short: true, .. }) && !hub;
                 match csw(&dev.read_csw(), tag) {
                     Status::Passed { residue: 0 } if short => Some(Fault::Short),
                     Status::Passed { residue: 0 } => None,
                     s => Some(Fault::Status(s)),
                 }
             };
-            if let Some(po) = hub {
-                dev.inflight = None;
+            if hub {
+                let Some(Command { owner: Owner::Hub { completer }, .. }) = dev.inflight.take() else {
+                    return Some(Action::None);
+                };
                 dev.hub_result = Some(match fault {
                     None => HubResult::Status(Status::Passed { residue: 0 }),
                     Some(Fault::Status(s)) => HubResult::Status(s),
                     Some(f) => HubResult::Fault(f),
                 });
-                return Some(Action::Hub { po });
+                return Some(Action::Hub { completer });
             }
             if let Some(f) = fault {
                 dev.fault = Some(f);
@@ -773,11 +775,7 @@ fn act(a: Action, x: Option<&Xhci>) {
             irp.complete(0, 0);
             act(Action::Wake, x);
         }
-        Action::Hub { po } => {
-            // SAFETY: the hub thread holds the reference to the `PendingOperation` at `po` while
-            // its command is in flight, and lets go of it once it sees this completion.
-            unsafe { crate::sched::complete_pending_op_at(po, 0, 0) };
-        }
+        Action::Hub { completer } => completer.complete(0, 0),
         Action::Wake => {
             if let Some(x) = x {
                 crate::sched::signal_interrupt(&x.hub_wake);

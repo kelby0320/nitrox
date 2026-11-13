@@ -219,14 +219,15 @@ mod tests {
     fn waiters_add_remove_take_caps_at_max() {
         let (p, mut tok) = fresh();
         let tok = &mut tok;
-        let ths: [*mut (); PendingOperation::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
+        let ths: [*mut (); PendingOperation::MAX_WAITERS] =
+            core::array::from_fn(|i| core::ptr::without_provenance_mut(0x1000 + i));
         for &t in &ths {
             assert!(p.add_waiter(tok, t).is_ok());
         }
-        assert!(p.add_waiter(tok, 0xDEAD as *mut ()).is_err());
+        assert!(p.add_waiter(tok, core::ptr::without_provenance_mut(0xDEAD)).is_err());
         p.remove_waiter(tok, ths[1]);
-        assert!(p.add_waiter(tok, 0xBEEF as *mut ()).is_ok());
-        assert_eq!(&p.take_waiters(tok)[..], &[ths[0], ths[2], ths[3], 0xBEEF as *mut ()]);
+        assert!(p.add_waiter(tok, core::ptr::without_provenance_mut(0xBEEF)).is_ok());
+        assert_eq!(&p.take_waiters(tok)[..], &[ths[0], ths[2], ths[3], core::ptr::without_provenance_mut(0xBEEF)]);
         assert!(p.take_waiters(tok).is_empty());
     }
 
