@@ -38204,5 +38204,8 @@ Part J's fifteenth sub-part, `typed-layers.md` § J.15, built on `pre-phase-7/pa
   build and leaks in a release one. The console reads through `input::Reader`, and the drivers
   register their reclaims with `reap_pending` rather than it naming them. io's `RECLAIM` list
   stays, unbounded.
-- `unsafe` blocks fall from 518 to 515, and `unsafe impl`s from 57 to 56. **Part J is done once the
-  whole suite has run under Miri and what it reports is triaged.**
+- `unsafe` blocks fall from 518 to 515, and `unsafe impl`s from 57 to 56.
+- **The whole suite under Miri, after J.15, reports no undefined behaviour** in either model: 1,277
+  tests pass, nine ignored with their reasons. Of its 23 integer-to-pointer casts, fourteen were
+  tests' sentinel addresses, now made without provenance; the nine left are the direct map, the host
+  heap's frames and a user address, where a kernel has only a number. **Part J's condition is met.**

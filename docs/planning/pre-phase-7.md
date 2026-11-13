@@ -1018,7 +1018,9 @@ the surface's new kernel code, which wants P1 and P2 under it
 `unsafe`, `check-unsafe`, from the first. The pass found eleven items Part I had already taken part
 of, six premises that no longer hold, and two latent defects, kplat-d23 and sched-d16. **Part J
 is done when the whole suite has run under Miri after J.15 and what it reports is triaged** (the
-maintainer's call, 2026-11-06).
+maintainer's call, 2026-11-06). **It ran 2026-11-12**: no undefined behaviour in either model, and
+its 23 integer-to-pointer casts triaged, fourteen tests' sentinels made without provenance and nine
+left where a kernel has only a number ([`typed-layers.md`](typed-layers.md) § J.15).
 
 ## Part E — the syscall surface
 

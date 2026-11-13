@@ -985,6 +985,20 @@ does not own; the reclaims never run; PS/2 dropping a lent lights write, and los
 table refused. Under Miri, both models, the 172 tests of the xHCI, the input readers, PS/2, the
 console and `Handoff`.
 
+**The whole suite under Miri, after J.15** (2026-11-12, at `ab0319e7`): 1,277 tests pass under
+Stacked Borrows, in 58 minutes, and under Tree Borrows, in 104; nine are ignored, each with its
+reason. **Miri reports no undefined behaviour.** It warns of 23 integer-to-pointer casts, the same
+sites in both models:
+- **Fourteen were tests' sentinel addresses**, only compared, now made by `ptr::without_provenance`
+  (`248042c4`). The same tests under Miri warn 17 times on the old code and 3 times on the new.
+- **Nine stay, a number made a pointer where nothing else can**: the direct map, seven; the host
+  heap Miri's frames come from, freeing a block by its address; and a validated user address handed
+  to the copy. There Miri checks that an access lands in a live allocation, as J.8's probe, a
+  frame read after its free, showed, but not which pointer may make it.
+
+**Part J's condition is met**: the suite has run under Miri after J.15, and what it reports is
+triaged.
+
 ### What Part J does not do
 
 - **Replace the VMA tree**: kmem-o7's second step is later, a balanced tree the maintainer's
