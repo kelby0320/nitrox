@@ -1881,9 +1881,9 @@ a failed count) and a test failing each write of a grow in turn, as `extent.rs`'
 the extent tree.
 
 **A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
-whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0
-only, and unmapping leaves a file's pages with its page-cache object until the object drops, so a
-windowed copy would still hold every page. A stick's photos and videos are over it. **Scheduled**
+whole of it, and refuses one over `MAX_COPY`, 8 MiB: unmapping leaves a file's pages with its
+page-cache object until the object drops, so a copy a window at a time, which `sys_memory_map`'s
+offset allows, would still hold every page. A stick's photos and videos are over it. **Scheduled**
 (2026-10-08, the maintainer's call): the syscall consolidation between Phases 6 and 7, where a
 copy is `sys_io_submit` on two files and the kernel streams it a window at a time
 ([`syscall-surface.md`](../planning/syscall-surface.md)). A `SYS_FILE_COPY` for Part H was turned
@@ -2377,6 +2377,14 @@ holding objects closes, or the send rule extended to whatever can hold an endpoi
 binder outside the supervisors, or the first report of kernel memory lost this way.
 
 ### Memory management
+
+**A copy's page the kernel has no memory to back reads as a bad address — `TODO(copy-fault-oom)`.**
+A kernel copy that meets a page not yet faulted in, when no frame or page table can be had for it,
+fails `FaultFromUser`, which the caller cannot tell from its own bad pointer, where `OutOfMemory`
+would say a retry might help. The copy's recovery path carries no reason, and nothing can force the
+allocation inside the `#PF` handler to fail: frames fail on demand only in host tests, which reach
+no handler. A ring-3 touch of that page is a fatal fault, so the copy is no blunter. Trigger: a
+boot hook that fails a frame allocation, or a caller that retries under memory pressure.
 
 **A kernel copy from a file's page not resident fails — `TODO(copy-from-unread-file)`.** A copy of
 user memory that meets a page not yet faulted in is served in the `#PF` handler where nothing has

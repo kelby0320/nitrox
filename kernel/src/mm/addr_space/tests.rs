@@ -728,6 +728,9 @@ fn an_anywhere_mapping_keeps_a_page_free_on_either_side() {
         base + 7 * PAGE,
         "not the hole that leaves none below the named one"
     );
+    let above = into_obj(MemoryObject::try_new(PAGE as usize).unwrap());
+    asp.map_object(range(base + 8 * PAGE, base + 9 * PAGE), uprot(), above, 0).expect("the page above it, named");
+    assert_eq!(anywhere(&asp, 1).start().as_u64(), base + 10 * PAGE, "a page free below it, too");
 }
 
 /// **A fill installed after its mapping moved installs nothing**: the access retries for page 1.
@@ -749,6 +752,16 @@ fn a_fill_whose_mapping_moved_under_it_installs_nothing() {
 }
 
 /// **A mapping from an offset begins at that page of its object.**
+/// **A page no user may reach is never faulted in**: a kernel copy, unlike the CPU, would reach it.
+#[test]
+fn a_page_no_user_may_reach_is_not_faulted_in() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 5), Protection::WRITE)).unwrap();
+    assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Read), FaultIn::Protection);
+    assert!(!is_mapped(&asp, va(PAGE * 4)));
+}
+
 #[test]
 fn a_mapping_from_an_offset_begins_at_that_page() {
     init_global_heap();

@@ -269,7 +269,8 @@ fn pf_dispatch(f: &mut ExceptionFrame) {
 
     if let Some(recovery) = crate::mm::user_access::lookup_recovery(f.rip, cr2) {
         // A kernel copy met a page not yet faulted in: served where nothing waits, and the copy
-        // retried. No copy holds a lock (`user_access`).
+        // retried. No copy holds a lock (`user_access`). TODO(copy-fault-oom): one with no memory
+        // to back it is recovered as a bad address.
         if !present && try_fault_in(cr2, f.error_code, false) {
             return;
         }

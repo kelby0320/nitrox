@@ -456,9 +456,29 @@ mod tests {
     #[test]
     #[should_panic(expected = "a copy of user memory with a lock held")]
     fn a_copy_with_a_lock_held_is_refused() {
-        let (lock, src) = (crate::libkern::SpinLock::new(crate::libkern::lockrank::LockRank::Leaf, ()), [7u8]);
+        let src = [7u8];
+        held(|| copy_slice_from_user(&mut [0u8; 1], UserPtr::new(src.as_ptr() as u64).unwrap()).map(|_| ()));
+    }
+
+    #[test]
+    #[should_panic(expected = "a copy of user memory with a lock held")]
+    fn a_copy_out_with_a_lock_held_is_refused() {
+        let mut dst = [0u8];
+        held(|| copy_slice_to_user(UserMutPtr::new(dst.as_mut_ptr() as u64).unwrap(), &[7]));
+    }
+
+    #[test]
+    #[should_panic(expected = "a copy of user memory with a lock held")]
+    fn a_string_copy_with_a_lock_held_is_refused() {
+        let src = *b"x\0";
+        held(|| copy_cstr_from_user(&mut [0u8; 2], UserPtr::new(src.as_ptr() as u64).unwrap()).map(|_| ()));
+    }
+
+    /// `copy` made with a lock held.
+    fn held(copy: impl FnOnce() -> Result<(), UserAccessError>) {
+        let lock = crate::libkern::SpinLock::new(crate::libkern::lockrank::LockRank::Leaf, ());
         let _held = lock.lock();
-        let _ = copy_slice_from_user(&mut [0u8; 1], UserPtr::new(src.as_ptr() as u64).unwrap());
+        let _ = copy();
     }
 
     /// **A string copy into an empty destination writes nothing**: the routine copies a byte

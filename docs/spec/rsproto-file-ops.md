@@ -48,10 +48,12 @@ Model B (`ReadRange`); Model A's `MapRange`/`AllocRange` are in
    client's table.
 3. The client `sys_memory_map`s the file handle. The mapping is **lazy** — no
    pages are resident.
-4. On the first touch of a page, the kernel's page-fault handler issues a
-   **`File::ReadRange`** for that page's byte range and **blocks the faulting
-   thread** until the server replies. The reply's `MemoryObject` is copied into
-   the page-cache frame, the page is mapped, and the thread resumes.
+4. On the first touch of a page by the client, the kernel's page-fault handler
+   issues a **`File::ReadRange`** for that page's byte range and **blocks the
+   faulting thread** until the server replies. The reply's `MemoryObject` is
+   copied into the page-cache frame, the page is mapped, and the thread resumes.
+   A syscall's copy from a page not yet resident does not wait: it fails
+   `FaultFromUser` ([`user-memory-access.md`](user-memory-access.md)).
 
 The fill is **stateless**: each `ReadRange` re-identifies its file by the same
 path `suffix` the lazy `Resolve` used (the kernel stores it on the page-cache

@@ -185,6 +185,7 @@ mod tests {
         let refused = |offset, len| mem.map_range(offset, len).err().map(|e| e.code());
         assert_eq!(refused(2 * 4096, 4097), Some(KError::InvalidArgument), "a page past its end");
         assert_eq!(refused(100, 4096), Some(KError::InvalidArgument), "from inside a page");
+        assert_eq!(refused(0, usize::MAX), Some(KError::InvalidArgument), "past every address");
     }
 
     #[test]

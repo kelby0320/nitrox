@@ -489,7 +489,7 @@ pub fn memory_map(h: u64, _hint: u64, size: u64, rights: u64, offset: u64) -> i6
             }
             _ => return e(KError::InvalidArgument),
         };
-        let end = (size as usize).next_multiple_of(PAGE).checked_add(offset as usize);
+        let end = (size as usize).checked_next_multiple_of(PAGE).and_then(|s| s.checked_add(offset as usize));
         if size == 0 || !(offset as usize).is_multiple_of(PAGE) || end.is_none_or(|end| end > room) {
             return e(KError::InvalidArgument);
         }

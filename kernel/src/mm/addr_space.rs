@@ -248,7 +248,8 @@ impl AddressSpace {
     }
 
     /// Resolve a page fault at `addr` for `access` against this (currently loaded) address space.
-    /// Called from the arch `#PF` handler for a **not-present** ring-3 fault.
+    /// Called from the arch `#PF` handler for a **not-present** fault from ring 3, or from a kernel
+    /// copy of user memory, mid-syscall, which holds no lock.
     ///
     /// For an [`Anonymous`](Backing::Anonymous) VMA permitting the access, allocates and zeroes
     /// a frame, installs the leaf PTE and flushes that page's stale not-present TLB entry. The
@@ -261,6 +262,10 @@ impl AddressSpace {
         let Some(vma) = inner.vma_tree.find_covering(addr) else {
             return FaultIn::NoVma;
         };
+        // A kernel copy, unlike the CPU, checks no page's user bit.
+        if !vma.prot.contains(Protection::USER) {
+            return FaultIn::Protection;
+        }
 
         match access {
             FaultAccess::Write if !vma.prot.contains(Protection::WRITE) => {
