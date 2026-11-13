@@ -66,6 +66,12 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     Ok(po_h.bits() as isize)
 }
 
+/// `sys_io_cancel(pending)` — request cancellation of an in-flight operation. **Always
+/// `Unsupported`**; the number is reserved.
+pub fn sys_io_cancel(_pending_h: u64) -> SysResult {
+    Err(KError::Unsupported)
+}
+
 /// `sys_io_submit`'s **flush**: make what has been written to the block device `resource_h`
 /// durable, completing the returned `PendingOperation` once the device has written its cache.
 /// Needs `WRITE` on the device and names no buffer and no range, so each of those fields must
