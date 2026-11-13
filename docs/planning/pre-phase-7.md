@@ -13,7 +13,7 @@ maintainer's call), its thirteen runs done 2026-10-26 and 2026-10-27 and triaged
 Part J added for the kernel layers it plans (the maintainer's call); Part I's items marked fix all
 fixed 2026-11-01, and its Miri job built the same day; Part E detailed 2026-11-02; E.1 to E.5
 built by 2026-11-05; Part J detailed 2026-11-05, J.1 to J.5 built 2026-11-06, J.6 to J.8 2026-11-10,
-J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6 and E.7 built
+J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6 to E.8 built
 2026-11-13.** Each later
 part gets its detail pass when it is next. Ten parts, A–J, in the order below: Part I between D
 and E, and **Part J between Part E's two halves** (the maintainer's call, 2026-11-02). Part E is
@@ -1034,8 +1034,10 @@ is then one crate's change, while what moves between processes, entropy's bindin
 and power's handles, stays with the supervisors that hold them. **E.1 built 2026-11-03**: libos's
 safe layer, the ratchet on raw syscalls in CI, and the counts' probe kept. **E.6 built
 2026-11-13**: the mapping path, Part E's second half begun. **E.7 built 2026-11-13**: a resolve
-carries its operation, and a flush answers through a PO. **The whole suite runs under Miri at
-Part E's end**, after E.11, and no sub-part runs it before (the maintainer's call, 2026-11-13).
+carries its operation, and a flush answers through a PO. **E.8 built 2026-11-13**: files as
+resources, a copy bounded by the wire rather than memory, and spawn from memory alone. **The whole
+suite runs under Miri at Part E's end**, after E.11, and no sub-part runs it before (the
+maintainer's call, 2026-11-13).
 
 **With it, four of the bash's findings** ([`bug-bash.md`](bug-bash.md)): `sys_file_sync`'s name and
 lookup binding it to files (kmem-30), and three in the memory-mapping path that Phase 7's threads

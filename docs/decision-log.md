@@ -38268,3 +38268,24 @@ E.6 merged, #439. E.7, `syscall-surface.md` § E.7, built on `pre-phase-7/part-e
   budget let one process starve every other flush on a mount. A file's flush counts in its mount's
   budget forgotten or not; a flush or held asks for no rights. The supervisors' 60 s bounding a
   whole mount's write-back is deferred (`flush-progress-bound`, the maintainer's call).
+
+## 2026-11-13 — Before Phase 7, E.8: files as resources, a copy, and spawn
+
+E.7 merged, #440. E.8, `syscall-surface.md` § E.8, built on
+`pre-phase-7/part-e8-files-as-resources`.
+
+- **A file takes `Read` and `Write`** through `sys_io_submit`, on its mount's kernel threads in
+  E.7's budget, now a queue of any file operation. A write is dirty until a flush, counts as a
+  writable mapping while it runs, and is refused past the end and over a hole; **a copy is a `Write`
+  whose buffer is another file**, each source page read in before the destination's is touched.
+- **`IO_NOCACHE` lets a window's pages go** once its op succeeds, if nothing uses the frames: a file
+  counts every mapping now, and the reads, writes and write-backs running. libfs copies a window of
+  16 MiB at a time with it, so **a copy is bounded by the wire's 4 GiB, not by memory**
+  (`copy-limit` resolved); `check-copy`, in CI by the maintainer's call, copies 512 MiB in 256 MiB.
+- **A write-back clears the `UNWRITTEN` mark** on what it wrote, found when a page let go and
+  filled again read as zero; a page over blocks still marked is never let go.
+- **`sys_process_spawn` takes a memory object alone**, so no spawn waits on a device; libos reads a
+  file image into one first, by 60 s, its size the stat's, so an image lookup asks for `INSPECT`.
+- Measured: a spawn's time in the call from 1.74 ms to 1.40 ms; the copy into the loader's buffer
+  is 84 % of it, deferred (`spawn-image-kvec`). Frames in use are not counted, so the twice-memory
+  copy's finishing is the control. The commits: `a6bebdb1`, `4427fc96`, `8e208f78`, `481c21bf`.
