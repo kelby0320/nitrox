@@ -8,6 +8,7 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64, op: Resolve<'_>) -> i64 {
         Resolve::Plain => plain_lookup(ns, path, rights),
         Resolve::Size(verb, size) => file_resize(verb, ns, path, rights, size),
         Resolve::Rename { to, flags } => file_rename(ns, path, to, flags as u64),
+        Resolve::Flush | Resolve::Held if rights != 0 => e(KError::InvalidArgument),
         Resolve::Flush => mount_answer(ns, path, false),
         Resolve::Held => mount_answer(ns, path, true),
     }

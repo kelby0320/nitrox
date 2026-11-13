@@ -82,7 +82,10 @@ const _: () = assert!(offset_of!(ThreadArgs, entry) == 0);
 const _: () = assert!(offset_of!(ThreadArgs, user_sp) == 8);
 const _: () = assert!(offset_of!(ThreadArgs, arg0) == 16);
 const _: () = assert!(offset_of!(ThreadArgs, class) == 24);
+const _: () = assert!(offset_of!(ThreadArgs, rt_priority) == 25);
+const _: () = assert!(offset_of!(ThreadArgs, nice) == 26);
 const _: () = assert!(offset_of!(ThreadArgs, cpu_affinity) == 27);
+const _: () = assert!(offset_of!(ThreadArgs, _reserved) == 28);
 
 /// The faulted-register snapshot `sys_thread_get_registers` writes: the 16 GPRs
 /// (incl. `rsp`), then `rip` (index 16) and `rflags` (index 17).
@@ -257,7 +260,9 @@ const _: () = assert!(align_of::<IpcMsgHeader>() == 8);
 const _: () = assert!(offset_of!(IpcMsgHeader, sender_pid) == 0);
 const _: () = assert!(offset_of!(IpcMsgHeader, payload_len) == 4);
 const _: () = assert!(offset_of!(IpcMsgHeader, handle_count) == 8);
+const _: () = assert!(offset_of!(IpcMsgHeader, _pad1) == 9);
 const _: () = assert!(offset_of!(IpcMsgHeader, flags) == 10);
+const _: () = assert!(offset_of!(IpcMsgHeader, _pad2) == 12);
 const _: () = assert!(offset_of!(IpcMsgHeader, timestamp) == 16);
 const _: () = assert!(size_of::<IpcMsg>() == IPC_MSG_SIZE);
 const _: () = assert!(align_of::<IpcMsg>() == 4096);
@@ -368,7 +373,10 @@ pub struct ResolveOp {
 
 const _: () = assert!(size_of::<ResolveOp>() == 32);
 const _: () = assert!(align_of::<ResolveOp>() == 8);
+const _: () = assert!(offset_of!(ResolveOp, code) == 0);
+const _: () = assert!(offset_of!(ResolveOp, flags) == 4);
 const _: () = assert!(offset_of!(ResolveOp, size) == 8);
+const _: () = assert!(offset_of!(ResolveOp, dest_ptr) == 16);
 const _: () = assert!(offset_of!(ResolveOp, dest_len) == 24);
 
 /// Make the file, at least `size` bytes, and resolve it.
@@ -429,6 +437,10 @@ pub struct NsEntry {
 }
 
 const _: () = assert!(size_of::<NsEntry>() == 16 + NS_ENTRY_PATH_MAX);
+const _: () = assert!(offset_of!(NsEntry, path_len) == 0);
+const _: () = assert!(offset_of!(NsEntry, kind) == 4);
+const _: () = assert!(offset_of!(NsEntry, rights) == 8);
+const _: () = assert!(offset_of!(NsEntry, path) == 16);
 const _: () = assert!(align_of::<NsEntry>() == 8);
 
 impl NsEntry {
@@ -440,6 +452,7 @@ impl NsEntry {
 const _: () = assert!(offset_of!(HandleInfo, rights) == 0);
 const _: () = assert!(offset_of!(HandleInfo, object_type) == 8);
 const _: () = assert!(offset_of!(HandleInfo, generation) == 12);
+const _: () = assert!(offset_of!(HandleInfo, size) == 16);
 
 /// What a block device is, mirroring `kernel/src/libkern/block.rs` byte for byte; read from
 /// `/dev/blk/<n>/info`.

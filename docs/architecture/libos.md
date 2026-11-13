@@ -84,10 +84,6 @@ gives one out once.
 | `wait` | `WaitSet<N>`, borrowing up to `N` handles or operations, and `Signalled`, which of them a wait found |
 | `ns` | a namespace's `create`, `lookup`, `start_lookup`, `copy`, `bind`, `bind_server`, `unbind`, `bindings`, `flush`, `flush_by` (a deadline) and `held` |
 | `fs` | `create`, `grow`, `truncate`, `rename` and `flush`: a file by path |
-
-**A flush refused `WouldBlock`**, its mount running all the flushes it runs at once, is slept on
-and asked again, to the caller's deadline; `flush_by` gives up a flush itself at its deadline,
-`TimedOut`, and leaves it to finish with no one waiting.
 | `process` | `Spawn`, by image or by path, and `exit` |
 | `thread` | `Stack`, `start` and `start_on`, a mask of CPUs, the calling thread's `exit`, and a thread suspended on a fault: its `fault_registers`, and `settle`, to resume it or end it |
 | `time` | `now`, `wall`, `sleep`, `sleep_until`, `Deadline`, and a `Timer`'s `create`, `set` and `disarm` |
@@ -97,6 +93,10 @@ and asked again, to the caller's deadline; `flush_by` gives up a flush itself at
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
 | `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |
 | `io` | a `Resource`'s `read` and `write`, and a notification queue's `recv` |
+
+**A flush refused `WouldBlock`**, its process already running or waiting with its share of the
+mount's flushes, is slept on and asked again, to the caller's deadline; `flush_by` gives up a flush
+itself at its deadline, `TimedOut`, and leaves it to finish with no one waiting.
 
 **A `Mapping` lends no reference to its bytes.** Another process mapping the same object, or a
 device the kernel lent it to, may write them at any time, and a Rust reference promises nothing

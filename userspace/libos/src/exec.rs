@@ -142,6 +142,8 @@ unsafe fn waker_noop(_data: *const ()) {}
 pub struct Op {
     po: u64,
     kind: Kind,
+    /// The buffer an I/O names, which only [`abandon`](Self::abandon) given it closes unwaited.
+    buffer: u64,
     finished: bool,
     /// Whether `poll` has returned `Ready`, so its result is handed out once.
     done: bool,
@@ -160,12 +162,16 @@ impl Op {
         if po < 0 {
             return Err(Error::from_status(po as i32));
         }
-        Ok(Op::of(po as u64, if op.buffer == 0 { Kind::Status } else { Kind::Io }))
+        let mut submitted = Op::of(po as u64, if op.buffer == 0 { Kind::Status } else { Kind::Io });
+        submitted.buffer = op.buffer;
+        Ok(submitted)
     }
 
-    /// **Stop waiting for an I/O, handing over the buffer it borrowed**: both are closed unwaited.
-    pub fn abandon<B>(mut self, buffer: B) {
-        self.finished = true;
+    /// **Stop waiting for an I/O, handing over the buffer it borrowed**: both are closed unwaited,
+    /// and a mapping of the buffer must be gone. Given any other handle, the I/O is waited out.
+    pub fn abandon<M>(mut self, buffer: crate::Handle<crate::Memory, M>) {
+        self.finished = buffer.raw().0 == self.buffer && self.buffer != 0;
+        drop(self);
         drop(buffer);
     }
 
@@ -183,7 +189,7 @@ impl Op {
     }
 
     fn of(po: u64, kind: Kind) -> Op {
-        Op { po, kind, finished: false, done: false, registered: false }
+        Op { po, kind, buffer: 0, finished: false, done: false, registered: false }
     }
 
     /// The `PendingOperation` a [`WaitSet`](crate::WaitSet) waits on for this operation.
@@ -599,9 +605,21 @@ mod tests {
     fn an_abandoned_io_is_closed_unwaited() {
         sys::reset();
         sys::script_never();
-        let op = Op::submit(RawHandle(1), &read_op()).unwrap();
-        op.abandon(crate::Handle::<crate::Memory, crate::MapReadWrite>::create(4096).unwrap());
+        let buffer = crate::Handle::<crate::Memory, crate::MapReadWrite>::create(4096).unwrap();
+        let op = Op::submit(RawHandle(1), &IoOp { buffer: buffer.raw().0, ..read_op() }).unwrap();
+        op.abandon(buffer);
         assert_eq!(sys::closed_in_flight(), 1);
+    }
+
+    #[test]
+    fn an_io_abandoned_with_another_buffer_is_waited_out() {
+        sys::reset();
+        sys::script_next(0, 1, false);
+        let buffer = crate::Handle::<crate::Memory, crate::MapReadWrite>::create(4096).unwrap();
+        let op = Op::submit(RawHandle(1), &IoOp { buffer: buffer.raw().0, ..read_op() }).unwrap();
+        op.abandon(crate::Handle::<crate::Memory, crate::MapReadWrite>::create(4096).unwrap());
+        assert_eq!(sys::closed_in_flight(), 0);
+        drop(buffer);
     }
 
     /// **A dropped I/O whose wait is refused for now waits again**, rather than closing in flight.

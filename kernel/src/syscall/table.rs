@@ -880,10 +880,7 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
 /// **through** the PO.
 pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64, op_ptr: u64) -> SysResult {
     let op = Resolve::read(op_ptr)?;
-    let fwd = match op {
-        Resolve::Flush | Resolve::Held => None,
-        _ => Some(op.forward_op()?),
-    };
+    let fwd = op.forward(rights_bits)?;
     let pid = crate::sched::current_owner_pid();
     let requested = Rights::from_bits_truncate(rights_bits);
     let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;

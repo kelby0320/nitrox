@@ -86,6 +86,8 @@ fn u32_at(b: &[u8], off: usize) -> u32 {
 mod tests {
     use super::*;
     use libos::{Handle, NsMutable, mock};
+    use librsproto::error::error_body;
+    use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
     #[test]
     fn a_mount_whose_flush_did_not_finish_is_not_asked_to_unmount() {
@@ -108,8 +110,6 @@ mod tests {
         assert_eq!(flush_then_ask(&ns, "/m", (&ours).into(), soon()), Ok(true));
         assert!(theirs.recv(&mut Msg::new()).is_ok(), "a finished flush is followed by the request");
     }
-    use librsproto::error::error_body;
-    use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
     #[test]
     fn the_request_decodes_as_an_unmount() {

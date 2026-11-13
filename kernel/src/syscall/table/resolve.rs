@@ -48,6 +48,16 @@ impl Resolve {
         if stray { Err(KError::InvalidArgument) } else { Ok(resolve) }
     }
 
+    /// The request the wire carries, or `None` for a flush or held, which goes no further than the
+    /// kernel and asks for no rights.
+    pub(super) fn forward(self, rights_bits: u64) -> Result<Option<ForwardOp>, KError> {
+        match self {
+            Resolve::Flush | Resolve::Held if rights_bits != 0 => Err(KError::InvalidArgument),
+            Resolve::Flush | Resolve::Held => Ok(None),
+            _ => self.forward_op().map(Some),
+        }
+    }
+
     /// The request the wire carries, or the refusal of a size or flags it cannot: a size past
     /// `u32::MAX` is `TooLarge`, not that size modulo 2^32.
     pub(super) fn forward_op(self) -> Result<ForwardOp, KError> {

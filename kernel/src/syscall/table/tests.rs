@@ -787,6 +787,16 @@ fn a_file_size_or_rename_flags_past_what_the_wire_carries_are_refused() {
     assert_eq!(truncate, KError::TooLarge.as_isize(), "taken as 10 bytes, it would free the rest");
 }
 
+#[test]
+fn a_flush_or_held_asking_for_rights_is_refused_before_anything_is_looked_up() {
+    let path = b"/m";
+    for code in [RESOLVE_OP_FLUSH, RESOLVE_OP_HELD] {
+        let op = ResolveOp { code, flags: 0, size: 0, dest_ptr: 0, dest_len: 0 };
+        let asked = dispatch(SYS_NS_LOOKUP, 0xDEAD, path.as_ptr() as u64, 2, 1, &raw const op as u64, 0);
+        assert_eq!(asked, KError::InvalidArgument.as_isize(), "code {code}");
+    }
+}
+
 /// **A fill's reply readies its own page**, not one a resize let a fault reserve its index for.
 #[test]
 fn a_stale_fill_reply_leaves_its_indexs_next_page_loading() {
@@ -911,15 +921,39 @@ fn a_mapping_window_is_whole_pages_inside_its_object() {
 
 #[test]
 fn a_resolve_op_is_read_whole_and_refuses_what_its_code_does_not_use() {
-    let op = |code, flags, size, dest_ptr| ResolveOp { code, flags, size, dest_ptr, dest_len: 0 };
     let read = |op: ResolveOp| Resolve::read(&raw const op as u64);
+    let op = |code| ResolveOp { code, flags: 0, size: 0, dest_ptr: 0, dest_len: 0 };
     assert!(matches!(Resolve::read(0), Ok(Resolve::Plain)));
-    assert!(matches!(read(op(RESOLVE_OP_GROW, 0, 9, 0)), Ok(Resolve::Size(9, SizeChange::Grow))));
-    assert!(matches!(read(op(RESOLVE_OP_RENAME, 1, 0, 0x40)), Ok(Resolve::Rename { dest_ptr: 0x40, flags: 1, .. })));
-    assert!(matches!(read(op(RESOLVE_OP_FLUSH, 0, 0, 0)), Ok(Resolve::Flush)));
-    assert!(matches!(read(op(RESOLVE_OP_HELD, 0, 0, 0)), Ok(Resolve::Held)));
-    for refused in [op(0, 0, 0, 0), op(7, 0, 0, 0), op(RESOLVE_OP_CREATE, 1, 0, 0), op(RESOLVE_OP_HELD, 0, 1, 0)] {
-        assert_eq!(read(refused).err(), Some(KError::InvalidArgument), "code {}", refused.code);
+    let sized = |code| ResolveOp { size: 9, ..op(code) };
+    assert!(matches!(read(sized(RESOLVE_OP_CREATE)), Ok(Resolve::Size(9, SizeChange::Create))));
+    assert!(matches!(read(sized(RESOLVE_OP_GROW)), Ok(Resolve::Size(9, SizeChange::Grow))));
+    assert!(matches!(read(sized(RESOLVE_OP_TRUNCATE)), Ok(Resolve::Size(9, SizeChange::Truncate))));
+    let rename = ResolveOp { flags: 1, dest_ptr: 0x40, dest_len: 3, ..op(RESOLVE_OP_RENAME) };
+    assert!(matches!(read(rename), Ok(Resolve::Rename { dest_ptr: 0x40, dest_len: 3, flags: 1 })));
+    assert!(matches!(read(op(RESOLVE_OP_FLUSH)), Ok(Resolve::Flush)));
+    assert!(matches!(read(op(RESOLVE_OP_HELD)), Ok(Resolve::Held)));
+    let strays = [
+        ResolveOp { flags: 1, ..op(0) },
+        ResolveOp { size: 1, ..op(0) },
+        ResolveOp { dest_ptr: 1, ..op(0) },
+        ResolveOp { dest_len: 1, ..op(0) },
+    ];
+    let sizes = [false, true, false, false];
+    let uses = [
+        (RESOLVE_OP_CREATE, sizes),
+        (RESOLVE_OP_GROW, sizes),
+        (RESOLVE_OP_TRUNCATE, sizes),
+        (RESOLVE_OP_RENAME, [true, false, true, true]),
+        (RESOLVE_OP_FLUSH, [false; 4]),
+        (RESOLVE_OP_HELD, [false; 4]),
+    ];
+    for (code, used) in uses {
+        for (stray, _) in strays.iter().zip(used).filter(|(_, used)| !used) {
+            let refused = read(ResolveOp { code, ..*stray });
+            assert_eq!(refused.err(), Some(KError::InvalidArgument), "code {code}, {stray:?}");
+        }
     }
-    assert_eq!(read(op(RESOLVE_OP_RENAME, 0, 1, 0x40)).err(), Some(KError::InvalidArgument), "a rename's size");
+    for unknown in [0, 7] {
+        assert_eq!(read(op(unknown)).err(), Some(KError::InvalidArgument), "code {unknown}");
+    }
 }

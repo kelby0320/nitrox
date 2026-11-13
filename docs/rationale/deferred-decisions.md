@@ -154,10 +154,23 @@ module unload (which drains in-flight IRPs). **A shutdown is no longer held by i
 E.7): a mount's flush runs on a kernel thread of its own, which `init` and the storage service
 wait for by a deadline, so a disk that stops completing writes costs the shutdown 60 s and leaves
 that filesystem not clean. **The thread itself still waits for good**, and keeps its place in the
-mount's budget of sixteen: a stuck device fills its own mount's budget, and no other.
+mount's budget of sixteen: a stuck device holds up its own mount's flushes, and no other.
 **So does a request a driver keeps for good**: an AHCI port that will not stop and a USB slot that
 will not disable keep their commands, since the device may still write the buffers, and what waits
 on one — a filesystem server's write, a flush's thread behind it — waits for good.
+
+**A supervisor's flush deadline bounds a whole mount's write-back — `TODO(flush-progress-bound)`.**
+`FLUSH_TIMEOUT_NS`, 60 s, is twice the 30 s a device gives one stuck command, but `init` and the
+storage service wait that long for every dirty file of a mount, written in turn. A slow device
+with a large dirty set runs past it with nothing failed: at shutdown `init` then sends no
+`Meta::Unmount` and stops the machine while the flush still writes, so what it had not reached
+is lost and the filesystem is left not clean; an eject or unmount is refused, and asked again
+finds the running flush holding the files. It was deferred (the maintainer's call, PR #440
+review) as the dirty set left at a stop is small: libfs's copy and write flush each file they
+write, so what is left is what mapping writers did not flush. A bound that resets on progress
+needs a progress signal the operation does not give: a held count that falls as the flush lets
+each file go, or a count of IRPs done. Trigger: a writer that leaves more dirty data than its
+device writes in 60 s, or a stop that is seen to lose it.
 
 **Async-I/O surface subset.** The [`IoOp`](../spec/io-operation.md) descriptor
 ships with only `Read`/`Write` opcodes and no `flags` modifiers; `Flush`/`Trim`,

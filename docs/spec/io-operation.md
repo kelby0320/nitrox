@@ -253,8 +253,10 @@ IDENTIFY does not list the 48-bit form for. *(Administration Part C.2; it resolv
 page of the file on its device: the page cache's write-back, as a writable mapping's writes need.
 It does not empty the device's volatile cache, which stays the device's own `Flush`: the storage
 service sends that at an unmount and `sys_power` at a stop. A file's flush runs on a kernel
-thread of its own and is counted in its mount's budget, as a mount's flush is
-([`syscall-abi.md`](syscall-abi.md) § `sys_ns_lookup`): one past it is refused `WouldBlock`.
+thread of its own and takes its turn in its mount's budget, as a mount's flush does, forgotten or
+not ([`syscall-abi.md`](syscall-abi.md) § `sys_ns_lookup`); one past its process's share is refused
+`WouldBlock`. A file with no device behind it has nothing to write: its flush completes `IoError`
+at once.
 
 **`Rescan`** *(Phase 6 Part G)* **reads a disk's partition table again**, after a holder of the
 disk has rewritten it: the disk's partitions depart, and those its table now holds are published,

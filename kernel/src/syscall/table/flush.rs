@@ -1,24 +1,21 @@
 //! Making what was written durable: a file's pages, and a mount's.
 
 use super::*;
-use crate::object::userspace_server::FileOp;
+use crate::object::userspace_server::QueuedFlush;
 use crate::sched::Job;
 
-/// **A mount's flush or held**: an operation's handle, or `WouldBlock` past the mount's budget.
+/// **A mount's flush or held**: an operation's handle, or `WouldBlock` past the process's share.
 pub(super) fn mount(ns: &Namespace, path: &[u8], flush: bool, pid: u32) -> SysResult {
     let reg = match ns.resolve(path) {
         Some((ResolvedTarget::UserspaceServer(reg, _), _, _)) => Ok(reg),
         Some(_) => Err(KError::Unsupported),
         None => Err(KError::NotFound),
     };
-    let place = match &reg {
-        Ok(reg) if flush => Some(UserspaceServerReg::begin_file_op(reg).ok_or(KError::WouldBlock)?),
-        _ => None,
-    };
     let (po, installed, po_h) = operation(pid)?;
-    match (reg, place) {
-        (Err(e), _) => crate::sched::complete_pending_op(&po, e as i32, 0),
-        (Ok(reg), None) => {
+    match reg {
+        Err(e) => crate::sched::complete_pending_op(&po, e as i32, 0),
+        Ok(reg) if flush => admit(reg, QueuedFlush { file: None, po, pid })?,
+        Ok(reg) => {
             let held = held(&reg);
             drop(reg);
             match held {
@@ -26,22 +23,65 @@ pub(super) fn mount(ns: &Namespace, path: &[u8], flush: bool, pid: u32) -> SysRe
                 Err(e) => crate::sched::complete_pending_op(&po, e as i32, 0),
             }
         }
-        (Ok(reg), Some(place)) => start(Flushing::Mount(reg), Some(place), po)?,
     }
     installed.commit();
     Ok(po_h.bits() as isize)
 }
 
-/// **`sys_io_submit`'s flush of a file**, counted in its mount's budget.
+/// **`sys_io_submit`'s flush of a file**, admitted to its mount's budget. A file with no device
+/// behind it has nothing a flush can write: `IoError` at once, as its write-back answers.
 pub(super) fn file(file: Ref<FileObject>, pid: u32) -> SysResult {
-    let place = match FileObject::touch_target(&file) {
-        Some((reg, _)) => Some(UserspaceServerReg::begin_file_op(&reg).ok_or(KError::WouldBlock)?),
-        None => None,
-    };
     let (po, installed, po_h) = operation(pid)?;
-    start(Flushing::File(file), place, po)?;
+    match file.flush_owner() {
+        Some(reg) => admit(reg, QueuedFlush { file: Some(file), po, pid })?,
+        None => crate::sched::complete_pending_op(&po, KError::IoError as i32, 0),
+    }
     installed.commit();
     Ok(po_h.bits() as isize)
+}
+
+/// Run `flush` now or queue it; `WouldBlock` past its process's share.
+fn admit(reg: Ref<UserspaceServerReg>, flush: QueuedFlush) -> Result<(), KError> {
+    let mut job = KBox::try_new(Flush { reg: None, first: None }).map_err(|_| KError::OutOfMemory)?;
+    match reg.admit_flush(flush) {
+        Ok(None) => Ok(()),
+        Ok(Some(flush)) => {
+            let pid = flush.pid;
+            job.reg = Some(reg.clone());
+            job.first = Some(flush);
+            if let Err(job) = crate::sched::spawn_job(job) {
+                drop(job);
+                pass_on(&reg, reg.flush_done(pid));
+                return Err(KError::OutOfMemory);
+            }
+            Ok(())
+        }
+        Err((e, _)) => Err(e),
+    }
+}
+
+/// **A place freed with no thread to run its flush**: each flush it passes to is started, or,
+/// while no thread can be made, answered `OutOfMemory` and its place passed on in turn.
+fn pass_on(reg: &Ref<UserspaceServerReg>, mut next: Option<QueuedFlush>) {
+    while let Some(flush) = next.take() {
+        let pid = flush.pid;
+        let refused = match KBox::try_new(Flush { reg: None, first: None }) {
+            Ok(mut job) => {
+                job.reg = Some(reg.clone());
+                job.first = Some(flush);
+                match crate::sched::spawn_job(job) {
+                    Ok(()) => return,
+                    Err(mut job) => job.first.take(),
+                }
+            }
+            Err(_) => Some(flush),
+        };
+        let po = refused.map(|f| f.po);
+        next = reg.flush_done(pid);
+        if let Some(po) = po {
+            crate::sched::complete_pending_op(&po, KError::OutOfMemory as i32, 0);
+        }
+    }
 }
 
 fn operation(pid: u32) -> Result<(Ref<PendingOperation>, Installed<'static, 1>, RawHandle), KError> {
@@ -59,35 +99,33 @@ pub(super) fn held(reg: &Ref<UserspaceServerReg>) -> Result<u64, KError> {
     Ok(files.len() as u64)
 }
 
-enum Flushing {
-    Mount(Ref<UserspaceServerReg>),
-    File(Ref<FileObject>),
-}
-
-/// **A flush on a kernel thread**, letting go of its file and place before it completes its PO.
+/// **A flush on a kernel thread**, which runs the mount's flushes its place passes to after it.
 pub(super) struct Flush {
-    what: Option<Flushing>,
-    place: Option<FileOp>,
-    po: Option<Ref<PendingOperation>>,
-}
-
-fn start(what: Flushing, place: Option<FileOp>, po: Ref<PendingOperation>) -> Result<(), KError> {
-    let job = KBox::try_new(Flush { what: Some(what), place, po: Some(po) }).map_err(|_| KError::OutOfMemory)?;
-    crate::sched::spawn_job(job).map_err(|_| KError::OutOfMemory)
+    reg: Option<Ref<UserspaceServerReg>>,
+    first: Option<QueuedFlush>,
 }
 
 impl Job for Flush {
     fn run(mut job: KBox<Self>) {
-        let (status, written) = match job.what.take() {
-            Some(Flushing::Mount(reg)) => flush_mount(&reg),
-            Some(Flushing::File(file)) => (write_back(&file).err().map_or(0, |e| e as i32), 0),
-            None => (KError::KernelError as i32, 0),
-        };
-        drop(job.place.take());
-        if let Some(po) = job.po.take() {
+        let (Some(reg), mut next) = (job.reg.take(), job.first.take()) else { return };
+        drop(job);
+        while let Some(flush) = next {
+            let (po, status, written, after) = finish(&reg, flush);
             crate::sched::complete_pending_op(&po, status, written);
+            next = after;
         }
     }
+}
+
+/// **One flush done**, its file let go and its place passed on before its operation is completed,
+/// so a held asked then counts none of it: the operation, its answer, and the flush the place went to.
+fn finish(reg: &Ref<UserspaceServerReg>, flush: QueuedFlush) -> (Ref<PendingOperation>, i32, u64, Option<QueuedFlush>) {
+    let QueuedFlush { file, po, pid } = flush;
+    let (status, written) = match file {
+        None => flush_mount(reg),
+        Some(file) => (write_back(&file).err().map_or(0, |e| e as i32), 0),
+    };
+    (po, status, written, reg.flush_done(pid))
 }
 
 /// Write back every dirty file of `reg`'s mount, held or not: the last failure, and the count.

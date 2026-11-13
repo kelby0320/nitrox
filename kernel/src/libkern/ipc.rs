@@ -74,6 +74,8 @@ pub struct IpcMsg {
 }
 
 const _: () = assert!(core::mem::size_of::<IpcMsgHeader>() == IPC_HEADER_SIZE);
+const _: () = assert!(core::mem::offset_of!(IpcMsgHeader, _pad1) == 9);
+const _: () = assert!(core::mem::offset_of!(IpcMsgHeader, _pad2) == 12);
 const _: () = assert!(core::mem::align_of::<IpcMsgHeader>() == 8);
 const _: () = assert!(core::mem::offset_of!(IpcMsgHeader, sender_pid) == 0);
 const _: () = assert!(core::mem::offset_of!(IpcMsgHeader, payload_len) == 4);

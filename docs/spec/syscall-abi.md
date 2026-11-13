@@ -335,9 +335,12 @@ files are still written, and a file whose write failed stays dirty.
 **It runs on a kernel thread of its own**, so the call returns at once and the caller waits on the
 operation, with a deadline if it likes. The thread lets go of the files and the place it holds
 before it completes the operation, so a held asked straight after counts none of them. **A mount
-runs sixteen flushes at once** (`FILE_OPS_MAX`): one past them is refused `WouldBlock`
-synchronously, before anything is made, which libos sleeps on and asks again. A device that stops
-answering so fills its own mount's budget, and no other. Two calls still wait inside themselves:
+runs sixteen flushes at once** (`FILE_OPS_MAX`), and a flush past them waits its turn: a thread
+that finishes one runs the next waiting on its mount, first come first served. A device that
+stops answering so holds up its own mount's flushes, and no other. **A process may have four of a
+mount's flushes running or waiting** (`FILE_OPS_PER_PROCESS`): one past them is refused
+`WouldBlock` synchronously, the operation not kept, which libos sleeps on and asks again, so no
+process takes a mount's budget from the others. Two calls still wait inside themselves:
 `sys_process_spawn` reads a file-backed image's pages, and `sys_power` waits on its flush.
 
 **A held counts the files the server has handed out that something still holds**: a handle, a
@@ -360,9 +363,12 @@ holding then.
 **A flush's and a held's scope is the whole server, not the path.** A namespace that reaches only
 a subtree of a filesystem, such as a session's `/home`, writes back and counts every file of that
 filesystem, wherever it lies and whoever holds it: a count, not which files or whose. Nothing
-narrows it, since the unmount that needs it holds the whole mount. Both need only `LOOKUP`; a path
-that resolves to anything but a userspace server completes the operation `Unsupported`, and one
-that resolves to nothing `NotFound`.
+narrows it, since the unmount that needs it holds the whole mount. Both need only `LOOKUP`, and
+ask for no rights: `rights` must be `0`, else `InvalidArgument`. **They act on the server the
+path's binding names**, not on one a subnamespace reply would lead a lookup to: a path through the
+storage service's `fs` reaches the storage service. A path that resolves to anything but a
+userspace server completes the operation `Unsupported`, and one that resolves to nothing
+`NotFound`.
 
 ```rust
 fn sys_ns_bind(

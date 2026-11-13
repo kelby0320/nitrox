@@ -13,6 +13,7 @@ use crate::wait::Signalled;
 use crate::wait::WaitSet;
 
 /// **How long a supervisor waits for a mount's flush**: twice a device's 30 s for a stuck command.
+// TODO(flush-progress-bound): it bounds the whole write-back, not one command.
 pub const FLUSH_TIMEOUT_NS: u64 = 60_000_000_000;
 
 impl Handle<Namespace, NsMutable> {

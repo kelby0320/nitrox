@@ -83,7 +83,7 @@ pub fn mount(path: &str, written: i64, held: i64) {
     with(|m| m.mounts.insert(path.as_bytes().to_vec(), (written, held)));
 }
 
-/// Refuse the next `n` flushes `WouldBlock`, as a mount with every flush in flight does.
+/// Refuse the next `n` flushes `WouldBlock`, as the kernel refuses one past its process's share.
 pub fn busy_flushes(n: u32) {
     with(|m| m.busy_flushes = n);
 }
