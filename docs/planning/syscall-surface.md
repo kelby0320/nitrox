@@ -669,6 +669,22 @@ taken, a stalled read waited for, an image unstatted passed on. `abi-sync-check`
 window changed on one side.
 **All 19 CI gates pass under KVM**, `check-copy` among them.
 
+**After review** (`a208be12`):
+- **A copy holds its source in use for its whole life**, so another op's `IO_NOCACHE` lets none of
+  its frames go mid-copy: three reviewers each showed a source window freed under a copy. Every
+  borrow of a ready frame now takes its holder's `Running`, and so does `map_file_page`, which the
+  fault handler holds from fetching a frame until its PTE is in.
+- **The read side of `IO_NOCACHE` writes nothing back**: a `Read`'s file and a copy's source let a
+  window go only if clean, their holder having perhaps `MAP_READ` alone. After a `Write`, a failed
+  write-back is the op's status.
+- **A write-back clears a mark only where the run map still puts the block it wrote**, and **a copy
+  onto its own overlapping bytes is refused**.
+- **libos refuses a spawn image past `SPAWN_IMAGE_MAX`** before it reads it.
+- Tests for the copy source's release, admission with no thread, a whole page with no frame, the
+  read loop's end guards, a non-block file's flush, and libos's copy flag.
+- **Deferred**: a copy runs in its destination's budget but waits on its source's device too
+  (`copy-two-budgets`, the maintainer's call).
+
 ### E.9 Entropy, namespaces, and the two removed
 
 - **Entropy is a char node.** `/dev/entropy` becomes a `DeviceNode`, read through `submit_read`

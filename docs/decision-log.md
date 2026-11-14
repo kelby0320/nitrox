@@ -38289,3 +38289,10 @@ E.7 merged, #440. E.8, `syscall-surface.md` § E.8, built on
 - Measured: a spawn's time in the call from 1.74 ms to 1.40 ms; the copy into the loader's buffer
   is 84 % of it, deferred (`spawn-image-kvec`). Frames in use are not counted, so the twice-memory
   copy's finishing is the control. The commits: `a6bebdb1`, `4427fc96`, `8e208f78`, `481c21bf`.
+- After review (`a208be12`), **a copy holds its source in use**, so no other op's `IO_NOCACHE` frees a
+  frame it copies from, and a frame lent to anyone, a fault's among them, is lent on a `Running`;
+  **the read side of `IO_NOCACHE` writes nothing back** and lets go only a clean file; a write-back
+  clears a mark only where the runs still put what it wrote; an overlapping copy within a file is
+  refused; libos refuses a spawn image past `SPAWN_IMAGE_MAX` unread. A copy waiting on its
+  source's device in its destination's budget is deferred (`copy-two-budgets`, the maintainer's
+  call).
