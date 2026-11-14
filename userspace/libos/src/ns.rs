@@ -19,7 +19,7 @@ pub const FLUSH_TIMEOUT_NS: u64 = 60_000_000_000;
 impl Handle<Namespace, NsMutable> {
     /// A new, empty namespace, with every right a namespace has.
     pub fn create() -> Result<Self> {
-        let h = check(sys::ns_create())?;
+        let h = check(sys::ns_create(0))?;
         Ok(Handle::fresh(h, Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT | Rights::UNBIND))
     }
 }
@@ -42,14 +42,15 @@ both!([M: CanLookup] Namespace, M {
 
     /// A new namespace holding a copy of every binding here, with every right a namespace has.
     pub fn copy(&self) -> Result<Handle<Namespace, NsMutable>> {
-        let h = check(sys::ns_derive(self.raw().0))?;
+        let h = check(sys::ns_create(self.raw().0))?;
         Ok(Handle::fresh(h, Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT | Rights::UNBIND))
     }
 
     /// The bindings, in the order they were made: their paths, kinds and rights, not the files
     /// a mounted server holds.
     pub fn bindings(&self) -> Bindings<'_> {
-        Bindings { ns: self.raw().0, next: 0, done: false, _b: core::marker::PhantomData }
+        let batch = [NsEntry::zeroed(); BATCH];
+        Bindings { ns: self.raw().0, next: 0, batch, at: 0, len: 0, last: false, _b: core::marker::PhantomData }
     }
 
     /// Write back every dirty file of the server `path` resolves to: how many it wrote.
@@ -121,11 +122,17 @@ impl<T, M> Lookup<T, M> {
     }
 }
 
-/// A namespace's bindings, one call each, borrowed from its handle.
+/// Bindings one listing call reads: a namespace of fewer is listed in one.
+const BATCH: usize = 32;
+
+/// A namespace's bindings, read [`BATCH`] a call, borrowed from its handle.
 pub struct Bindings<'a> {
     ns: u64,
     next: u64,
-    done: bool,
+    batch: [NsEntry; BATCH],
+    at: usize,
+    len: usize,
+    last: bool,
     _b: core::marker::PhantomData<&'a ()>,
 }
 
@@ -133,20 +140,27 @@ impl Iterator for Bindings<'_> {
     type Item = Result<NsEntry>;
 
     fn next(&mut self) -> Option<Result<NsEntry>> {
-        if self.done {
-            return None;
-        }
-        let mut entry = NsEntry::zeroed();
-        match check(sys::ns_enumerate(self.ns, self.next, &mut entry)) {
-            Ok(_) => {
-                self.next += 1;
-                Some(Ok(entry))
+        if self.at == self.len {
+            if self.last {
+                return None;
             }
-            Err(e) => {
-                self.done = true;
-                (e.code() != KError::NotFound).then_some(Err(e))
+            (self.at, self.len) = (0, 0);
+            match check(sys::ns_enumerate(self.ns, self.next, &mut self.batch)) {
+                Ok(n) => {
+                    (self.len, self.last) = (n as usize, (n as usize) < BATCH);
+                    self.next += n;
+                }
+                Err(e) => {
+                    self.last = true;
+                    return Some(Err(e));
+                }
+            }
+            if self.len == 0 {
+                return None;
             }
         }
+        self.at += 1;
+        Some(Ok(self.batch[self.at - 1]))
     }
 }
 
@@ -230,12 +244,14 @@ mod tests {
     }
 
     #[test]
-    fn a_bind_needs_transfer_and_a_path_bound_once() {
+    fn a_bind_needs_transfer_and_duplicate_and_a_path_bound_once() {
         sys::reset();
         let ns = ns();
         let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap().without_transfer().unwrap();
         assert_eq!(ns.bind("/m", &mem).err().unwrap().code(), KError::NoAccess);
         let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        let no_copy = mem.duplicate(Rights::MAP_READ | Rights::TRANSFER).unwrap();
+        assert_eq!(ns.bind("/m", &no_copy).err().unwrap().code(), KError::NoAccess, "a bind is a copy");
         ns.bind("/m", &mem).unwrap();
         assert_eq!(ns.bind("/m", &mem).err().unwrap().code(), KError::AlreadyExists);
         sys::fail_next_bind(KError::NoAccess as i32);
@@ -311,15 +327,31 @@ mod tests {
     }
 
     #[test]
-    fn a_borrowed_root_resolves_and_cannot_be_bound_into() {
+    fn a_listing_of_no_entries_or_past_the_cap_is_refused_as_the_kernel_refuses_it() {
         sys::reset();
         let ns = ns();
+        let mut room = [NsEntry::zeroed(); libkern::NS_ENUMERATE_MAX as usize + 1];
+        let refused = |out: &mut [NsEntry]| check(sys::ns_enumerate(ns.raw().0, 0, out)).err().map(|e| e.code());
+        assert_eq!(refused(&mut room[..0]), Some(KError::InvalidArgument));
+        assert_eq!(refused(&mut room), Some(KError::InvalidArgument));
+        assert_eq!(refused(&mut room[..libkern::NS_ENUMERATE_MAX as usize]), None, "the cap itself");
+    }
+
+    #[test]
+    fn a_listing_reads_a_batch_a_call_and_ends_on_a_short_one() {
+        sys::reset();
         let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
-        ns.bind("/m", &mem).unwrap();
-        let root_raw = sys::with_rights(ns.raw().0, Rights::LOOKUP);
-        // SAFETY: the mock's handle stays open for the test.
-        let root = unsafe { Ref::<Namespace, NsReadOnly>::from_raw(libkern::RawHandle(root_raw), Rights::empty()) };
-        assert!(block_on(root.lookup::<Memory, MapRead>("/m", Rights::MAP_READ)).is_ok());
+        let calls = |n: usize| {
+            let ns = ns();
+            for i in 0..n {
+                ns.bind(&std::format!("/m{i}"), &mem).unwrap();
+            }
+            let before = sys::enumerates();
+            assert_eq!(ns.bindings().map(Result::unwrap).count(), n);
+            sys::enumerates() - before
+        };
+        let at = [0, 13, BATCH - 1, BATCH, BATCH + 1, 2 * BATCH + 1].map(|n| (n, calls(n)));
+        assert_eq!(at, [(0, 1), (13, 1), (BATCH - 1, 1), (BATCH, 2), (BATCH + 1, 2), (2 * BATCH + 1, 3)]);
     }
 
     #[test]

@@ -248,7 +248,7 @@ that now is cheaper than discovering it is impossible later.
 
 `view-broker` (administration Part A, 2026-09-23) also serves and holds `BIND_NAMESPACE`, and it
 reconciles the same way: it binds only into namespaces it *created* — each view a copy it made of
-the namespace its caller sent, via `sys_ns_derive` — and it never registers itself (`service-mgr`
+the namespace its caller sent, via `sys_ns_create(from)` — and it never registers itself (`service-mgr`
 binds it at `/svc/views`). Its constructing is narrower than the shell's, since it adds one
 profile's grants to a namespace that already exists rather than composing one from endpoints. What a
 bug in it reaches is set out in [`administration.md`](../planning/administration.md) § *Why one
@@ -381,6 +381,9 @@ why two terminals do not contend: each mints its own, on its own backend. `nxsh`
 handed-down terminal when its parent gives one and resolves `/dev/tty` otherwise, which is the
 second shape's mechanism confirmed, without the first clause: the name stays present, because
 minting is what it is for.
+
+**What an application namespace holds as every namespace does: `/dev/entropy`**, resolved from the
+session's, since a program's random bytes come from there and nowhere else (2026-11-13).
 
 **What an application namespace deliberately lacks: `/applications`** (M14 Part H). The *session*
 namespace has it — it is where the Applications menu's entries come from — and an application's

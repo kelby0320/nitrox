@@ -47,8 +47,6 @@ const IPC_CHANNEL_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::SEND.b
 /// for the producer and consumer halves of the SQE/CQE regions.
 const IO_RING_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::READ.bits() | Rights::WRITE.bits());
 
-const ENTROPY_PRINCIPALS: Rights = Rights::READ;
-
 /// Principal rights valid on [`KObjectType::DeviceNode`] handles: `READ` and
 /// `WRITE` (a block device is written via `sys_io_submit`). `INSPECT` is a
 /// generic right, not on the principal mask.
@@ -79,7 +77,6 @@ pub(crate) fn is_rights_compatible(ty: KObjectType, rights: Rights) -> bool {
         | KObjectType::InterruptObject
         | KObjectType::PendingOperation => WAIT_ONLY_PRINCIPALS,
         KObjectType::IoRing => IO_RING_PRINCIPALS,
-        KObjectType::EntropyObject => ENTROPY_PRINCIPALS,
         KObjectType::DeviceNode => DEVICE_NODE_PRINCIPALS,
         KObjectType::SystemControl => SYSTEM_CONTROL_PRINCIPALS,
         KObjectType::Invalid | KObjectType::UserspaceServerReg => return false,
@@ -102,7 +99,6 @@ mod tests {
             KObjectType::IpcChannel,
             KObjectType::IoRing,
             KObjectType::Timer,
-            KObjectType::EntropyObject,
             KObjectType::DeviceNode,
             KObjectType::SystemControl,
         ] {

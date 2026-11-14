@@ -244,8 +244,8 @@ machinery was already correct once the hazards below were fixed.
   one runnable thread from the busiest other core's `ready` queue. A thread is
   stealable to core `me` if its **affinity** includes `me` **and** its **`on_cpu`
   guard is clear** (I2). User and kernel threads alike are stealable.
-- **Affinity**: a per-thread `cpu_mask` (`sys_thread_set_affinity`); placement and
-  stealing honour it.
+- **Affinity**: a per-thread `cpu_mask`, set when the thread is made
+  (`ThreadArgs::cpu_affinity`); placement and stealing honour it.
 
 ### 7. The invariants that keep it correct
 
@@ -546,9 +546,9 @@ syscalls while migratable.
   maintained at the CR3 load in `switch_into`, so a shootdown targets only those
   cores instead of broadcasting to all online cores. A correctness-neutral
   optimization; broadcast-to-all is already correct.
-- **`sys_thread_set_affinity`-driven active migration** — changing affinity to
-  exclude a thread's current core does not yet forcibly migrate it mid-slice
-  (it moves on its next reschedule).
+- **Active migration on an affinity change** — nothing changes a thread's affinity after
+  it is made since `sys_thread_set_affinity` went (2026-11-13, `thread-affinity`); one that
+  excluded a thread's current core would not forcibly migrate it mid-slice.
 - **SMP panic path** (review F8, 2026-07-21) — **half resolved 2026-08-19.** A panicking or
 faulting CPU now *does* stop the others: `Cpu::stop_the_machine` sends an **NMI** to every
 online CPU and they halt without dumping (NMI rather than a fixed vector because the CPUs most

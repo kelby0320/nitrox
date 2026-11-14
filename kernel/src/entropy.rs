@@ -9,7 +9,8 @@
 //! [`init`] runs once at boot (after the timer/APIC, before the handle table): it draws a hardware
 //! burst, mixes early jitter, **always keys the CSPRNG** from what it gathered (so kernel draws
 //! work with no hardware RNG), and latches `seeded` if it crossed the gate. Then [`on_irq_sample`]
-//! folds in jitter from IRQ context, and [`fill`] / [`seed_u64`] draw output.
+//! folds in jitter from IRQ context, and [`fill`] / [`seed_u64`] draw output. Userspace reads it
+//! through `/dev/entropy`, a char [`DeviceNode`] whose `Read` is [`BACKEND`]'s.
 //!
 //! All state is behind one [`IrqSpinLock`], a **leaf**: held alone, briefly, with interrupts
 //! masked, no nested locks, no allocation. See `kernel/docs/lock-ordering.md`.
@@ -17,9 +18,11 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::{ChaCha20Rng, IrqSpinLock, Reserved};
-use crate::object::PendingOperation;
+use crate::libkern::{ChaCha20Rng, IrqSpinLock, Reserved, SpinLock};
+use crate::object::device_node::{CharBackend, DeviceNode, ResourceDescriptor};
 use crate::object::header::Ref;
+use crate::object::{MemoryObject, PendingOperation};
+use crate::syscall::error::KError;
 
 /// Pool size in bytes: one ChaCha key.
 const POOL_LEN: usize = 32;
@@ -43,20 +46,22 @@ const RESEED_BYTES: u32 = 1 << 20; // 1 MiB
 /// Diffusion multiplier for the pool absorb (the SplitMix64 constant); mixing only.
 const ABSORB_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Maximum `sys_entropy_read` callers blocked at once on the pool seeding. Only reachable on a CPU
-/// with no hardware RNG (otherwise it seeds at boot), so a small cap suffices; an overflowing
-/// reader is told to retry rather than queued.
+/// Maximum `/dev/entropy` reads waiting at once on the pool seeding. Only reachable on a CPU with
+/// no hardware RNG (otherwise it seeds at boot), so a small cap suffices; an overflowing read is
+/// refused `WouldBlock` rather than queued.
 pub const SEED_WAITERS_MAX: usize = 4;
+
+/// The most bytes one read of `/dev/entropy` answers; a reader reads again for more.
+pub const READ_MAX: usize = 256;
 
 /// Outcome of registering a `PendingOperation` to be woken when the pool seeds.
 pub enum SeedWaitReg {
     /// Queued; the timer-tick drain will complete it once the pool seeds.
     Queued,
-    /// The pool was already seeded (a race after the caller's `is_seeded` check) —
-    /// the caller should complete the returned PO now so its wait returns at once.
+    /// The pool was already seeded; the PO is handed back.
     AlreadySeeded(Ref<PendingOperation>),
-    /// The waiter list was full; the caller should complete the returned PO with a
-    /// retry status. Pathological (> `SEED_WAITERS_MAX` concurrent unseeded reads).
+    /// The waiter list was full; the PO is handed back, and the read refused. Pathological (>
+    /// `SEED_WAITERS_MAX` concurrent unseeded reads).
     Full(Ref<PendingOperation>),
 }
 
@@ -252,22 +257,80 @@ pub fn seed_u64() -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// `true` once the pool has latched **seeded** (crossed the 256-bit estimate). Gates the userspace
-/// read contract; kernel draws work once [`init`] has keyed the CSPRNG, seeded or not.
-pub fn is_seeded() -> bool {
-    ENTROPY.lock().seeded
+/// `/dev/entropy`'s backend: a read and no write.
+pub const BACKEND: CharBackend = CharBackend { submit_read: read, submit_write: None, ctx: core::ptr::null_mut() };
+
+/// The node `/dev/entropy` serves, made by [`make_node`].
+static NODE: SpinLock<Option<Ref<DeviceNode>>> = SpinLock::new(LockRank::Leaf, None);
+
+/// Make the node `/dev/entropy` serves, once: `false` if there is no memory for it.
+pub fn make_node() -> bool {
+    if NODE.lock().is_some() {
+        return true;
+    }
+    let Ok(node) = DeviceNode::try_new_char(ResourceDescriptor::ZERO, BACKEND) else { return false };
+    let mut slot = NODE.lock();
+    if slot.is_none() {
+        *slot = Some(Ref::new(node));
+    }
+    true
 }
 
-/// Register `po` to be completed when the pool seeds (the unseeded `sys_entropy_read` path). On
-/// [`SeedWaitReg::Queued`] the subsystem owns `po` until [`drain_seed_waiters`] signals it;
-/// otherwise `po` is handed back to complete now. The re-check under the lock closes the race
-/// between the caller's `is_seeded` check and registering.
-pub fn register_seed_waiter(po: Ref<PendingOperation>) -> SeedWaitReg {
-    let reg = ENTROPY.lock().register_waiter(po);
-    if matches!(reg, SeedWaitReg::Queued) {
-        SEED_WAKE_PENDING.store(true, Ordering::Release);
+/// The node `/dev/entropy` serves, or `None` before [`make_node`].
+pub fn node() -> Option<Ref<DeviceNode>> {
+    NODE.lock().clone()
+}
+
+/// **A read of `/dev/entropy`**: up to [`READ_MAX`] bytes into `buffer` at `buf_offset`, its
+/// operation completed with how many. Before the pool seeds, the operation waits for the seeding
+/// and completes with `0`, and the reader reads again; a read past [`SEED_WAITERS_MAX`] waiting is
+/// refused `WouldBlock`. `offset` is a stream's, and ignored.
+fn read(
+    buffer: &Ref<MemoryObject>,
+    po: &Ref<PendingOperation>,
+    buf_offset: u64,
+    _offset: u64,
+    max_len: u64,
+    _ctx: *mut (),
+) -> Result<(), KError> {
+    read_from(&ENTROPY, &SEED_WAKE_PENDING, buffer, po, buf_offset, max_len)
+}
+
+/// [`read`] against `state` and `pending`: the statics in a boot, and a host test's own, so an
+/// unseeded read is driven from its submission to its completion.
+fn read_from(
+    state: &IrqSpinLock<EntropyState>,
+    pending: &AtomicBool,
+    buffer: &MemoryObject,
+    po: &Ref<PendingOperation>,
+    buf_offset: u64,
+    max_len: u64,
+) -> Result<(), KError> {
+    let n = (max_len as usize).min(READ_MAX);
+    let mut bytes = [0u8; READ_MAX];
+    let waited = {
+        let mut g = state.lock();
+        if g.seeded {
+            g.draw(&mut bytes[..n]);
+            None
+        } else {
+            Some(g.register_waiter(po.clone()))
+        }
+    };
+    match waited {
+        None => {
+            buffer.copy_in(buf_offset as usize, &bytes[..n]);
+            bytes.iter_mut().for_each(|b| *b = 0);
+            crate::sched::complete_pending_op(po, 0, n as u64);
+            Ok(())
+        }
+        Some(SeedWaitReg::Queued) => {
+            pending.store(true, Ordering::Release);
+            Ok(())
+        }
+        Some(SeedWaitReg::AlreadySeeded(_)) => unreachable!("seeded was looked at under the same hold"),
+        Some(SeedWaitReg::Full(_)) => Err(KError::WouldBlock),
     }
-    reg
 }
 
 /// `true` iff seed-waiters are queued: the lock-free gate the timer tick checks.
@@ -429,5 +492,47 @@ mod tests {
         s.seeded = true;
         assert_eq!(s.drain_waiters(&mut out), 2, "drains all once seeded");
         assert_eq!(s.seed_waiters.len(), 0);
+    }
+
+    /// **An unseeded read waits for the seeding**: its operation completes, through the tick's
+    /// wake, with nothing, and the read after fills; a read past the waiters' places is refused.
+    #[test]
+    fn an_unseeded_read_completes_empty_once_seeded_and_the_next_fills() {
+        let state = IrqSpinLock::new(LockRank::Leaf, reserved_state());
+        crate::sched::reserve_deferred_drops();
+        state.lock().key_from_pool();
+        let (pending, buffer) = (AtomicBool::new(false), MemoryObject::try_new(4096).unwrap());
+        let first = po();
+        assert_eq!(read_from(&state, &pending, &buffer, &first, 8, 64), Ok(()));
+        assert!(!crate::sched::pending_op_is_signaled(&first) && pending.load(Ordering::Acquire), "parked");
+        crate::sched::wake_seed_waiters(|out| state.lock().drain_waiters(out));
+        assert!(!crate::sched::pending_op_is_signaled(&first), "no wake before the seeding");
+        let mut g = state.lock();
+        g.credit(SEED_BITS);
+        g.maybe_latch();
+        drop(g);
+        crate::sched::wake_seed_waiters(|out| state.lock().drain_waiters(out));
+        assert_eq!(crate::sched::pending_op_completion(&first), (0, 0), "nothing: read again");
+        let mut untouched = [0u8; 8 + READ_MAX + 8];
+        buffer.copy_out(0, &mut untouched);
+        assert!(untouched.iter().all(|&b| b == 0), "a waited read writes nothing");
+        let next = po();
+        assert_eq!(read_from(&state, &pending, &buffer, &next, 8, 4096), Ok(()));
+        assert_eq!(crate::sched::pending_op_completion(&next), (0, READ_MAX as u64), "at most READ_MAX");
+        let mut got = [0u8; 8 + READ_MAX + 8];
+        buffer.copy_out(0, &mut got);
+        assert!(got[..8].iter().chain(&got[8 + READ_MAX..]).all(|&b| b == 0), "only its window written");
+        assert!(got[8..8 + READ_MAX].iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn an_unseeded_read_past_the_waiters_places_is_refused_would_block() {
+        let state = IrqSpinLock::new(LockRank::Leaf, reserved_state());
+        let (pending, buffer) = (AtomicBool::new(false), MemoryObject::try_new(4096).unwrap());
+        let waiting: std::vec::Vec<_> = (0..SEED_WAITERS_MAX).map(|_| po()).collect();
+        for p in &waiting {
+            assert_eq!(read_from(&state, &pending, &buffer, p, 0, 8), Ok(()));
+        }
+        assert_eq!(read_from(&state, &pending, &buffer, &po(), 0, 8), Err(KError::WouldBlock));
     }
 }

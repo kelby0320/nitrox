@@ -24,7 +24,6 @@ entry, so the descriptor is defined once here and reused by both paths.
 
 ```rust
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
-fn sys_io_cancel(pending: RawHandle) -> isize
 ```
 
 `resource` is the handle the operation targets. In Phase 2 this is a **block
@@ -49,10 +48,9 @@ resource-agnostic so future resource kinds (char devices, sockets) reuse them.
   **operation** outcomes and are delivered through the PO, not synchronously —
   the same split the namespace lookup uses (`syscall-abi.md` § Namespace).
 
-`sys_io_cancel` requests cancellation of an in-flight operation. **Phase 2
-returns `Unsupported`** — IRP cancellation is deferred (`deferred-decisions.md`
-§ "Drivers and interrupts"); the syscall number is reserved now so the ABI is
-stable when cancellation lands.
+**Nothing cancels an operation once it is submitted** (`io-cancel` in
+`deferred-decisions.md`): a waiter may give up its wait, and the operation runs to its end.
+`sys_io_cancel`, which only ever answered `Unsupported`, went on 2026-11-13.
 
 ## Layout
 
@@ -143,8 +141,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   every char node but the registry's change node, which reads it as the generation the
   reader holds ([`device-node.md`](device-node.md), Phase 6 Part C) — and
   `length` is the **maximum** bytes to read — the PO completes with `result` = the
-  bytes actually delivered (≥ 1, ≤ `length`), which arrive when the device's RX
-  interrupt fires (or immediately, if bytes are already buffered). The bytes land in
+  bytes actually delivered (≥ 1, ≤ `length`, but for `/dev/entropy`'s waited read, below),
+  which arrive when the device's RX interrupt fires (or immediately, if bytes are already
+  buffered). The bytes land in
   `buffer` exactly as for a block read.
   The `buffer` is still a `MemoryObject` with `MAP_WRITE`, and
   `buf_offset + length <= buffer.size()` still holds. The completion is delivered
@@ -157,8 +156,17 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   to everything below: like every zero-length request it completes at once, `result` `0`,
   before any device's rule is asked (`length` above).
 
-  Today's char nodes are the serial console at `/dev/console` and the raw input
-  devices at `/dev/input/raw/<n>`.
+  Today's char nodes are the serial console at `/dev/console`, the raw input devices at
+  `/dev/input/raw/<n>`, the registry's change node at `/dev/registry/changes`, and the kernel
+  generator at `/dev/entropy`.
+
+  **`/dev/entropy` answers at most 256 bytes a read, and may answer none.** A read before the
+  generator is seeded, which only a CPU with neither `RDSEED` nor `RDRAND` sees, waits for the
+  seeding and completes with `status` `0` and **`result` `0`, which means read again**, not the
+  end of a stream: the generator never ends, and a read after the seeding fills. A read past the
+  four that may wait at once is refused `WouldBlock`, synchronously. A reader that takes `0` as an
+  end, as a byte stream's `read_exact` would, must treat this node apart
+  ([`entropy.md`](../architecture/entropy.md)).
 
 ### Keyboard lights
 
@@ -191,7 +199,8 @@ needs comes with the nodes the device manager hands it.
 Char devices come in two flavours, and the difference is visible to a caller:
 
 - **Byte streams** — `/dev/console`. Exactly as above: any `length ≥ 1` is legal and
-  any `result` in `1..=length` is a normal completion.
+  any `result` in `1..=length` is a normal completion. `/dev/entropy` is one too, but for its
+  waited read's `0`, above.
 - **Record streams** — `/dev/input/raw/<n>`, which carry fixed-size
   [`InputEvent`](../architecture/input-subsystem.md) records. `length` is **floored to a
   whole number of records**, and `result` is always a whole multiple of the record
@@ -355,8 +364,8 @@ returned. The `IoOp` is the **userspace-facing** request; the `Irp` is its
 - Opcodes beyond `Read`/`Write`/`Flush`/`Rescan`/`Eject` — `Trim`/`Discard`, device-specific
   control. Added with a consumer (SSD trim). A per-write force-unit-access bit is a
   `flags` modifier, below, not an opcode.
-- The `flags` modifiers (force-unit-access, no-cache).
-- `sys_io_cancel` semantics (returns `Unsupported` until IRP cancellation lands).
+- The `flags` modifier force-unit-access; `IO_NOCACHE` is built.
+- Cancelling a submitted operation (`io-cancel`), with IRP cancellation.
 - Scatter/gather over multiple buffers in one `IoOp` (Phase 2 is single-buffer;
   the IRP's PRDT already supports multiple physical fragments of one object).
 

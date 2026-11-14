@@ -1,48 +1,63 @@
-//! Random bytes from the kernel's generator.
+//! Random bytes from the kernel's generator, read through the node a namespace binds at
+//! `/dev/entropy`.
 
-use libkern::{KError, Rights};
+use libkern::{IO_OPCODE_READ, IoOp, KError, Rights};
 
-use crate::error::{Result, check};
+use crate::error::Result;
 use crate::exec::{Op, block_on};
-use crate::handle::{Handle, ReadOnly, Resource};
-use crate::sys;
+use crate::handle::{CanLookup, Handle, MapReadWrite, Memory, Namespace, ReadOnly, Ref, Resource};
+use crate::memory::Mapping;
+use crate::time::Deadline;
+use crate::wait::WaitSet;
 
-/// The most one read fills.
+/// The most one read fills, as the kernel answers.
 const READ_MAX: usize = 256;
 
 /// How long a read pauses before reading again when the kernel had no place for it to wait: a tick.
 const NO_PLACE_PAUSE_NS: u64 = 10_000_000;
 
-/// A source of random bytes: one made for this process, or the object `/dev/entropy` resolves to.
-pub struct Source(Handle<Resource, ReadOnly>);
+/// Where a namespace binds the generator.
+pub const PATH: &str = "/dev/entropy";
+
+/// A source of random bytes: the node a namespace binds at [`PATH`], and a page it reads into.
+pub struct Source {
+    node: Handle<Resource, ReadOnly>,
+    page: Handle<Memory, MapReadWrite>,
+    view: Mapping<MapReadWrite>,
+}
 
 impl Source {
-    /// A source made for this process.
-    pub fn new() -> Result<Source> {
-        // TODO(surface-shape): a handle made for the call, until entropy is a node every namespace binds.
-        Ok(Source(Handle::fresh(check(sys::entropy_create())?, Rights::empty())))
+    /// The source `ns` binds at [`PATH`]: `NotFound` if it binds none.
+    pub fn open<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>) -> Result<Source> {
+        Source::from_handle(block_on(ns.into().lookup(PATH, Rights::READ))?)
     }
 
-    /// A source this process was handed, such as a lookup of `/dev/entropy` answers.
-    pub fn from_handle(handle: Handle<Resource, ReadOnly>) -> Source {
-        Source(handle)
+    /// A source this process was handed: the node a lookup of [`PATH`] answers.
+    pub fn from_handle(node: Handle<Resource, ReadOnly>) -> Result<Source> {
+        let page = Handle::<Memory, MapReadWrite>::create(READ_MAX)?;
+        let view = page.map(READ_MAX)?;
+        Ok(Source { node, page, view })
     }
 
     /// Fill `buf` with random bytes. Before the generator is seeded, which only a machine with no
-    /// hardware source sees, each read waits for the seeding and reads again; one the kernel had no
-    /// place to keep waiting, past its few for the machine, pauses and reads again.
+    /// hardware source sees, a read waits for the seeding, answers nothing, and is read again; one
+    /// the kernel had no place to keep waiting, past its few for the machine, pauses and reads
+    /// again. A second empty answer in a row is `IoError`: the generator answers one only as it
+    /// seeds, so what [`open`](Self::open) found is not it.
     pub fn fill(&self, buf: &mut [u8]) -> Result<()> {
-        for chunk in buf.chunks_mut(READ_MAX) {
-            loop {
-                match check(sys::entropy_read(self.0.raw().0, chunk))? {
-                    0 => break,
-                    po => match block_on(Op::status(po)) {
-                        Err(e) if e.code() == KError::WouldBlock => crate::time::sleep(NO_PLACE_PAUSE_NS)?,
-                        done => {
-                            done?;
-                        }
-                    },
-                };
+        let (mut at, mut waited) = (0, false);
+        while at < buf.len() {
+            let want = (buf.len() - at).min(READ_MAX);
+            match block_on(self.node.read(&self.page, 0, 0, want as u64)) {
+                Ok(0) if waited => return Err(KError::IoError.into()),
+                Ok(0) => waited = true,
+                Ok(n) => {
+                    let n = n.min(want);
+                    self.view.read_into(0, &mut buf[at..at + n])?;
+                    (at, waited) = (at + n, false);
+                }
+                Err(e) if e.code() == KError::WouldBlock => crate::time::sleep(NO_PLACE_PAUSE_NS)?,
+                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -51,101 +66,54 @@ impl Source {
     /// [`fill`](Self::fill) for a caller that cannot wait, such as a server whose clients wait on
     /// it: refused `WouldBlock` before the generator is seeded, when what it filled is not to be
     /// used. **Each call refused holds one of the kernel's places for a reader waiting on the
-    /// seeding** until it seeds, as closing the read's PO does not give it back: there are four for
-    /// the machine (`SEED_WAITERS_MAX`), and a [`fill`](Self::fill) that finds them taken pauses and
-    /// reads again.
+    /// seeding** until it seeds, as closing the read's operation does not give it back: there are
+    /// four for the machine, and a [`fill`](Self::fill) that finds them taken pauses and reads
+    /// again.
     pub fn try_fill(&self, buf: &mut [u8]) -> Result<()> {
-        for chunk in buf.chunks_mut(READ_MAX) {
-            let po = check(sys::entropy_read(self.0.raw().0, chunk))?;
-            if po != 0 {
-                // The read's PO closes unwaited, as a status's drop waits on nothing.
-                drop(Op::status(po));
+        let mut at = 0;
+        while at < buf.len() {
+            let want = (buf.len() - at).min(READ_MAX);
+            let page = Handle::<Memory, MapReadWrite>::create(READ_MAX)?;
+            let op = IoOp {
+                opcode: IO_OPCODE_READ,
+                flags: 0,
+                buffer: page.raw().0,
+                buf_offset: 0,
+                offset: 0,
+                length: want as u64,
+            };
+            let mut read = Op::submit(self.node.raw(), &op)?;
+            let done = {
+                let mut set = WaitSet::<1>::new();
+                set.add_op(&read)?;
+                set.wait(Deadline::POLL).ok().and_then(|signalled| read.completion_in(&signalled))
+            };
+            let n = match done {
+                Some(done) => (done?.result as usize).min(want),
+                None => 0,
+            };
+            if n == 0 {
+                // Unseeded: the read waits for the seeding, and its page is let go unwaited.
+                read.abandon(page);
                 return Err(KError::WouldBlock.into());
             }
+            drop(read);
+            page.map(READ_MAX)?.read_into(0, &mut buf[at..at + n])?;
+            at += n;
         }
         Ok(())
     }
 }
 
-/// [`Source::fill`] from a source made for the call.
-pub fn fill(buf: &mut [u8]) -> Result<()> {
-    Source::new()?.fill(buf)
+/// [`Source::fill`] from the source `ns` binds.
+pub fn fill<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>, buf: &mut [u8]) -> Result<()> {
+    Source::open(ns)?.fill(buf)
 }
 
-/// [`Source::try_fill`] from a source made for the call.
-pub fn try_fill(buf: &mut [u8]) -> Result<()> {
-    Source::new()?.try_fill(buf)
+/// [`Source::try_fill`] from the source `ns` binds.
+pub fn try_fill<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>, buf: &mut [u8]) -> Result<()> {
+    Source::open(ns)?.try_fill(buf)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_fill_reads_in_pieces_and_closes_its_source() {
-        sys::reset();
-        let mut buf = [0u8; 600];
-        fill(&mut buf).unwrap();
-        assert!(buf[256..].iter().any(|&b| b != 0) && buf[599] != 0, "every piece filled");
-        assert_eq!(sys::open_handles(), 2, "the two devices, and no source left open");
-    }
-
-    #[test]
-    fn a_try_before_the_seeding_is_refused_and_leaves_nothing_open() {
-        sys::reset();
-        sys::unseeded(1);
-        let mut buf = [0u8; 8];
-        assert_eq!(try_fill(&mut buf).map_err(|e| e.code()), Err(KError::WouldBlock));
-        assert_eq!(sys::open_handles(), 2, "neither the source nor the read's PO left open");
-        assert_eq!(sys::counts().1, 0, "and nothing waited on");
-        try_fill(&mut buf).unwrap();
-        assert!(buf.iter().any(|&b| b != 0), "seeded, it fills");
-    }
-
-    /// **Every place for a waiter taken is a read to retry, not a failure**: the kernel answers a
-    /// reader past `SEED_WAITERS_MAX` `WouldBlock`, and each `try_fill` before the seeding holds one.
-    #[test]
-    fn a_fill_that_finds_no_place_to_wait_reads_again() {
-        sys::reset();
-        sys::unseeded(2);
-        sys::seed_waiters_full(1);
-        let slept = sys::sleeps();
-        let mut buf = [0u8; 8];
-        fill(&mut buf).unwrap();
-        assert!(buf.iter().any(|&b| b != 0));
-        assert!(sys::sleeps() > slept, "a pause before reading again, not a spin");
-        assert_eq!(sys::open_handles(), 2, "both POs and the source closed");
-    }
-
-    /// One source reads again, held open between reads, and a source handed over reads as one made
-    /// here does.
-    #[test]
-    fn a_source_reads_again_and_a_handed_one_reads_alike() {
-        sys::reset();
-        let source = Source::new().unwrap();
-        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
-        source.fill(&mut a).unwrap();
-        assert_eq!(sys::open_handles(), 3, "the two devices, and the source kept");
-        source.try_fill(&mut b).unwrap();
-        assert!(a.iter().any(|&x| x != 0) && b.iter().any(|&x| x != 0));
-        let handed = Source::from_handle(source.0);
-        let mut c = [0u8; 8];
-        handed.fill(&mut c).unwrap();
-        assert!(c.iter().any(|&x| x != 0));
-        let blind = handed.0.duplicate(Rights::INSPECT).unwrap();
-        let refused = Source::from_handle(blind).fill(&mut c).map_err(|e| e.code());
-        assert_eq!(refused, Err(KError::NoAccess), "read from the handle it was handed, not one of its own");
-        drop(handed);
-        assert_eq!(sys::open_handles(), 2, "the source closes with its owner");
-    }
-
-    #[test]
-    fn an_unseeded_read_waits_and_reads_again() {
-        sys::reset();
-        sys::unseeded(1);
-        let mut buf = [0u8; 8];
-        fill(&mut buf).unwrap();
-        assert!(buf.iter().any(|&b| b != 0));
-        assert_eq!(sys::open_handles(), 2, "the PO closed too");
-    }
-}
+mod tests;

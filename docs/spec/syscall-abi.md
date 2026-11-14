@@ -90,7 +90,6 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `15` | `sys_process_spawn` |
 | `16` | `sys_process_exit` |
 | `17` | `sys_thread_exit` |
-| `18` | `sys_thread_set_affinity` |
 | `19` | `sys_thread_create` |
 | `20` | `sys_thread_get_registers` |
 | `21` | `sys_exception_resume` |
@@ -98,20 +97,18 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `23` | `sys_ns_lookup` |
 | `24` | `sys_ns_bind` |
 | `25` | `sys_ns_unbind` |
-| `26` | `sys_entropy_create` |
-| `27` | `sys_entropy_read` |
 | `28` | `sys_io_submit` |
-| `29` | `sys_io_cancel` |
 | `30` | `sys_ns_enumerate` |
 | `36` | `sys_process_terminate` |
-| `37` | `sys_ns_derive` |
 | `40` | `sys_power` |
 | `41` | `sys_clock_set` |
 
-Numbers are assigned in landing order, not in the order syscalls appear below. `31` to `35`,
-`38` and `39` went when a resolve came to carry its operation and a file's flush became an
-`io_submit` (pre-Phase-7 E.7); they answer `Unsupported`, as any number nothing holds does, until
-the numbers are assigned again.
+Numbers are assigned in landing order, not in the order syscalls appear below. **Twelve are
+vacant**, and answer `Unsupported`, as any number nothing holds does, until they are assigned
+again: `31` to `35`, `38` and `39` went when a resolve came to carry its operation and a file's
+flush became an `io_submit` (pre-Phase-7 E.7); `18` (`thread_set_affinity`) and `29`
+(`io_cancel`) went for want of a caller, `26` and `27` (`entropy_create`, `entropy_read`) when
+entropy became a char node, and `37` (`ns_derive`) when `ns_create` came to copy (E.9).
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -182,8 +179,7 @@ layout assertions, which is why the drift was invisible.
 
 The system's single generic asynchronous-I/O entry point; full descriptor and
 semantics in [`io-operation.md`](io-operation.md). Syscall numbers:
-`sys_io_submit = 28`, `sys_io_cancel = 29` (introduced with the storage slice,
-Phase 2 slice 5).
+`sys_io_submit = 28` (introduced with the storage slice, Phase 2 slice 5).
 
 ```rust
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
@@ -208,26 +204,26 @@ exhaustion) return a negative `KError` **synchronously**, with no PO created;
 *device/medium* failures are delivered **through the PO** — the same split as the
 namespace lookup. (Syscall number `28`.)
 
-```rust
-fn sys_io_cancel(pending: RawHandle) -> isize
-```
-Requests cancellation of an in-flight operation. **Phase 2 returns
-`Unsupported`** — IRP cancellation is deferred (`deferred-decisions.md`
-§ "Drivers and interrupts"); the number is reserved now so the ABI is stable when
-cancellation lands. (Syscall number `29`.)
+**Nothing cancels an operation once it is submitted** (`TODO(io-cancel)`): a waiter may give up
+its wait, and the operation runs to its end. `sys_io_cancel` (`29`), which only ever answered
+`Unsupported`, went on 2026-11-13, to come back with IRP cancellation and a caller.
 
 ```rust
-fn sys_ns_enumerate(ns: RawHandle, index: u64, out: UserMutPtr<NsEntry>) -> isize
+fn sys_ns_enumerate(ns: RawHandle, index: u64, out: UserMutPtr<NsEntry>, count: u64) -> isize
 ```
-Writes the `index`-th binding (insertion order) of namespace `ns` to `out`, or
-returns `NotFound` once `index` is past the binding count (the iteration
-terminator). Requires `LOOKUP` on `ns`. `NsEntry` (`#[repr(C)]`, `16 +
-NS_ENTRY_PATH_MAX` bytes) carries `path_len` (the binding path's true length),
-`kind` (`NS_KIND_DIRECT`/`KERNEL`/`MOUNT`), `rights` (the binding's max rights), and
-the path inline (truncated to `NS_ENTRY_PATH_MAX = 256`). This **lists a namespace's
-bindings** — mount points + kernel resources — not the files inside a mounted
-filesystem (that is an fs-server `readdir`, deferred). Synchronous (the kernel holds
-the bindings). (Syscall number `30`.)
+Writes the bindings of namespace `ns` from the `index`-th (insertion order) into the array of
+`count` entries at `out`, and returns how many it wrote: fewer than `count` only at the end, `0`
+past it, so a listing of fewer bindings than its array holds is one call. `count` is `1` to
+`NS_ENUMERATE_MAX` (64), else `InvalidArgument`, as is a misaligned `out`; **an array any part of
+which lies outside the user half is `FaultFromUser`**, refused before any lookup and with nothing
+written. A fault on an unmapped page inside it is `FaultFromUser` too, after the entries before it
+are written. Each entry is read under the namespace's lock in turn, so a bind or unbind beside a
+listing may shift what follows, and each is written whole, its path's unused bytes zero. Requires
+`LOOKUP` on `ns`. `NsEntry` (`#[repr(C)]`, `16 + NS_ENTRY_PATH_MAX` bytes) carries `path_len` (the
+binding path's true length), `kind` (`NS_KIND_DIRECT`/`KERNEL`/`MOUNT`), `rights` (the binding's max
+rights), and the path inline (truncated to `NS_ENTRY_PATH_MAX = 256`). This **lists a namespace's
+bindings** — mount points + kernel resources — not the files inside a mounted filesystem (that is an
+fs-server `readdir`, deferred). Synchronous (the kernel holds the bindings). (Syscall number `30`.)
 
 ```rust
 fn sys_wait(
@@ -387,7 +383,7 @@ fn sys_ns_bind(
 ```
 Binds `resource` (a direct kernel-object handle in slice 1; an IPC resource-server endpoint in slice 3) at `path` in `ns`. Requires the `BIND` right on `ns` (the enforced gate) **and** the `BIND_NAMESPACE` system capability (an additional gate; see [syscaps](../architecture/syscaps.md)). Returns `0` on success.
 
-**A direct handle needs `TRANSFER`** (`NoAccess` without it). Every resolve of the binding mints a handle to the object for whoever asked, so a bind gives the object away as an IPC send and a spawn grant do, and like them it needs the right that says a handle may leave its process. Until the PR #342 review it needed none, so a handle issued not to leave — `init`'s system-control object — could have been published. An IPC endpoint bound as a userspace server needs no right: the kernel keeps it, and no resolve hands it out.
+**A direct handle needs `TRANSFER` and `DUPLICATE`** (`NoAccess` without either). Every resolve of the binding mints a handle to the object for whoever asked, so a bind gives the object away as an IPC send and a spawn grant do, and like them it needs the right that says a handle may leave its process; and the binder keeps its own, so a bind is a copy, which needs `DUPLICATE` as a copied grant does (since 2026-11-13). A binding carries the handle's rights, so it then carries `DUPLICATE`, which grants a resolver nothing a second resolve would not. Until the PR #342 review it needed none, so a handle issued not to leave — `init`'s system-control object — could have been published. An IPC endpoint bound as a userspace server needs no right: the kernel keeps it, and no resolve hands it out.
 
 **Subtree scoping** (`base_len > 0`): for an IPC resource-server (userspace-server) bind, `base` is an absolute namespace path the kernel prepends to every forwarded lookup's suffix, so the binding exposes only that sub-tree of the server — e.g. `sys_ns_bind(ns, "/home", …, fs_endpoint, "/home/alice", 11)` makes a lookup of `/home/notes` reach the server as `home/alice/notes`, and nothing above `/home/alice` nameable. `base` is validated like any binding path (no `.`/`..`, so it cannot escape the subtree; root `/` and paths over 128 bytes are rejected → `InvalidArgument`). `base_len == 0` = an unscoped whole-tree mount (the original behaviour; existing callers via `syscall4` pass 0 automatically). A non-zero `base` on a **direct-handle** bind is rejected (`InvalidArgument`) — scoping applies only to servers. See [session-and-auth](../architecture/session-and-auth.md) § Session construction.
 
@@ -401,57 +397,33 @@ fn sys_ns_unbind(
 Removes the binding at `path` in `ns`. Requires `UNBIND` right on `ns`.
 
 ```rust
-fn sys_ns_create() -> isize
+fn sys_ns_create(from: RawHandle) -> isize
 ```
-Creates a new empty `Namespace` kernel object, independent of the caller's root
-namespace. Returns a handle with full namespace rights (`LOOKUP | BIND | UNBIND`
-plus the generic duplicate/transfer/inspect band).
-
-```rust
-fn sys_ns_derive(ns: RawHandle) -> isize
-```
-Creates a new `Namespace` holding **a copy of every binding in `ns`** — each path, target,
-subtree base and rights value — and returns a handle to it with the same full rights
-`sys_ns_create` gives. Requires `LOOKUP` on `ns`: every binding in the copy is one the caller
-could already resolve, and binding into the result still needs `BIND_NAMESPACE`. **Unbinding in
-it does not only narrow**: resolution is longest-prefix, so removing a narrower binding exposes
-the broader one beneath it, and a copy can reach through `/` what the source's `/home` confined.
-A namespace must therefore never rely on a narrower binding to hide part of a broader one —
-[`namespace-and-resource-servers.md`](../architecture/namespace-and-resource-servers.md) states
-the rule. A process's own root arrives `LOOKUP`-only and cannot be transferred; deriving a copy
-is how it hands its namespace to someone. **A snapshot**: targets are shared, so both resolve the
-same paths to the same resources, but a later bind or unbind in either does not reach the other. Returns
+Creates a new `Namespace` kernel object: **empty if `from` is null**, independent of the caller's
+root namespace, and otherwise holding **a copy of every binding in `from`** — each path, target,
+subtree base and rights value. Returns a handle with full namespace rights (`LOOKUP | BIND | UNBIND`
+plus the generic duplicate/transfer/inspect band). A copy needs `LOOKUP` on `from`: every binding in
+the copy is one the caller could already resolve, and binding into the result still needs
+`BIND_NAMESPACE`. **Unbinding in it does not only narrow**: resolution is longest-prefix, so
+removing a narrower binding exposes the broader one beneath it, and a copy can reach through `/`
+what the source's `/home` confined. A namespace must therefore never rely on a narrower binding to
+hide part of a broader one —
+[`namespace-and-resource-servers.md`](../architecture/namespace-and-resource-servers.md) states the
+rule. A process's own root arrives `LOOKUP`-only and cannot be transferred; creating a copy is how
+it hands its namespace to someone. **A snapshot**: targets are shared, so both resolve the same
+paths to the same resources, but a later bind or unbind in either does not reach the other. Returns
 `OutOfMemory` if the copy cannot be allocated, and the usual handle errors. Built for the view
-broker (`docs/planning/administration.md` § Part A). (Syscall number `37`.)
+broker (`docs/planning/administration.md` § Part A). (Syscall number `22`.)
 
 ### Entropy
 
-The kernel CSPRNG, exposed as an `EntropyObject` handle. Full model in
-[`docs/architecture/entropy.md`](../architecture/entropy.md). Syscall numbers:
-`sys_entropy_create = 26`, `sys_entropy_read = 27` (implemented in Phase 2 slice 2).
-
-```rust
-fn sys_entropy_create() -> isize
-```
-Returns a handle to the kernel entropy source (the singleton CSPRNG) with `READ`
-plus the generic duplicate/transfer/inspect band. The source is shared; the handle
-is a capability token onto it (many handles, one generator).
-
-```rust
-fn sys_entropy_read(handle: RawHandle, buf: UserMutPtr<u8>, len: usize) -> isize
-```
-Requires `READ` on `handle`. `len` is capped per call (256 bytes; loop for more).
-**Return contract:**
-- **`0`** — `buf[0..len]` was filled synchronously. This is the common case: the
-  pool seeds at boot, before userspace.
-- **a positive value** — a `PendingOperation` handle. The pool is not yet seeded
-  (only on hardware lacking `RDSEED`/`RDRAND`, before enough interrupt jitter has
-  accumulated); the buffer is **untouched**. The caller `sys_wait`s on the handle
-  (it completes when the pool seeds) and then **re-reads**. This preserves the
-  async-first rule without blocking inside the syscall.
-- **a negative value** — a `KError`.
-
-The split is unambiguous because handle values are always ≥ 1.
+**There is no entropy syscall.** The kernel CSPRNG is read through `/dev/entropy`, a char
+`DeviceNode`, with `sys_io_submit` (`Read`, into a `MemoryObject` held with `MAP_WRITE`). A read
+answers at most 256 bytes, so a reader reads again for more. Before the generator seeds (only on a
+CPU with neither `RDSEED` nor `RDRAND`) the operation waits and completes with `result` 0; a reader
+reads again. `sys_entropy_create` (`26`) and `sys_entropy_read` (`27`) went on 2026-11-13, and
+their numbers are vacant. The contract is in [`docs/architecture/entropy.md`](../architecture/entropy.md)
+and [`io-operation.md`](io-operation.md).
 
 ### Process and Thread
 
@@ -480,20 +452,14 @@ fn sys_process_exit(status: i32) -> !
 ```
 Exits the **calling process** with `status`: the kernel closes the process's handles, records `status` (a second `sys_process_exit` racing the first exits with the first's), and sets every other thread of the process on its way to end: a blocked one is woken and its `sys_wait` never returns to it, a suspended one is resumed to terminate, and one running on another CPU is stopped by an interrupt. Each ends on its way back to ring 3, so whatever it held is let go. The last thread out delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), and the process is reaped (freeing its address space). Does not return. (Syscall number `16`.)
 
-```rust
-fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: u64) -> isize
-```
-Restricts which CPUs `thread` may run on (requires `SIGNAL`). **No-op until SMP (Phase 3):** validates the handle is a `Thread` carrying `SIGNAL`, then accepts and ignores `cpu_mask`. (Syscall number `18`.)
+**A thread's CPUs are set when it is made** (`ThreadArgs::cpu_affinity`, `sys_thread_create`), and
+nothing changes them after (`TODO(thread-affinity)`): `sys_thread_set_affinity` (`18`), which had
+no caller, went on 2026-11-13, to come back with the `std` port's.
 
 ```rust
 fn sys_thread_set_tls(tls_base: usize) -> isize
 ```
 Sets the calling thread's TLS base register (FS_BASE on x86_64, TPIDR_EL0 on aarch64).
-
-```rust
-fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: CpuMask) -> isize
-```
-Restricts which CPUs `thread` may run on. Requires `SIGNAL` right.
 
 ```rust
 fn sys_thread_get_registers(thread: RawHandle, out: UserMutPtr<RegisterValues>) -> isize

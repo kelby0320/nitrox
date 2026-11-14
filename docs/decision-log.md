@@ -38296,3 +38296,26 @@ E.7 merged, #440. E.8, `syscall-surface.md` § E.8, built on
   refused; libos refuses a spawn image past `SPAWN_IMAGE_MAX` unread. A copy waiting on its
   source's device in its destination's budget is deferred (`copy-two-budgets`, the maintainer's
   call).
+
+## 2026-11-13 — Before Phase 7, E.9: entropy, namespaces, and the two removed
+
+E.8 merged, #441. E.9, `syscall-surface.md` § E.9, built on `pre-phase-7/part-e9-entropy-namespaces`.
+
+- **`thread_set_affinity` and `io_cancel` went** (the maintainer's call), each deferred with its
+  marker to come back with the `std` port's caller (`thread-affinity`, `io-cancel`).
+- **`ns_create(from)`** copies a namespace and `ns_derive` went; **`ns_enumerate` fills a batch**
+  of up to 64 and answers how many, so a listing is one call: 13 `ns_enumerate` to 1
+  in the probe's `list .`.
+- **Entropy is a char node**, read through `io_submit`; `EntropyObject`, its type and its two
+  numbers went, so the ABI hash's inputs changed. **Every namespace `libsession` builds binds
+  `/dev/entropy`**, a session member granting random bytes alone, the authority every process
+  had while it was ambient. libos's `entropy::fill` takes the caller's namespace, as libos holds
+  none: Phase 7's `std` will want a process's root reachable without one.
+- **A direct bind asks `DUPLICATE` as well as `TRANSFER`**, a bind being a copy (`direct-bind-copy`
+  resolved); five binds that asked their source for `TRANSFER` alone ask for both.
+- The commits: `f1dde197`, `5a80e2c0`, `13431e6f`, `24c3cba3`. Forty-two syscalls to thirty.
+- After review (`a7353cb8`), **a listing's array is checked whole before any lookup**, an array any
+  part of which lies outside the user half `FaultFromUser` with nothing written, and each entry
+  is written fresh; **`/dev/entropy`'s waited `0` is in the char contract** as read again; libos
+  refuses a second empty answer from what it took for the generator; tty-server reads a token's
+  bytes as it mints it.

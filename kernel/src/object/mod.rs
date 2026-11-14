@@ -17,7 +17,6 @@
 //! destructor.
 
 pub mod device_node;
-pub mod entropy_object;
 pub mod file_object;
 pub mod header;
 pub mod interrupt_object;
@@ -35,7 +34,6 @@ pub mod userspace_server;
 pub mod wait_queue;
 
 pub use device_node::DeviceNode;
-pub use entropy_object::EntropyObject;
 pub use file_object::{BlockRun, FileObject, Forgotten, PageState, Producer, Reserve};
 pub use header::{KObjectHeader, ObjectRef};
 pub use interrupt_object::InterruptObject;

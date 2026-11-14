@@ -13,7 +13,8 @@ use libos::{
 #[derive(Clone, Copy)]
 pub struct Members<'a> {
     /// The namespace direct handles are resolved from: the supervisor's own — the root namespace —
-    /// for a session, and **the session's** for an application. `None` binds no console.
+    /// for a session, and **the session's** for an application. `None` binds no console and no
+    /// `/dev/entropy`.
     pub root_ns: Option<Ref<'a, Namespace, NsReadOnly>>,
     /// The fs-server endpoint, bound at `/home` scoped to the user's subtree.
     pub fs_endpoint: Option<Ref<'a, Channel, Only>>,
@@ -64,6 +65,9 @@ pub struct Members<'a> {
     pub desktop_endpoint: Option<Ref<'a, Channel, Only>>,
 }
 
+/// What a direct-handle bind needs of the handle bound: it leaves its holder, and is a copy.
+pub(crate) const DIRECT: Rights = Rights::from_bits(Rights::TRANSFER.bits() | Rights::DUPLICATE.bits());
+
 /// Which optional members a namespace built from [`Members`] bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bound {
@@ -83,6 +87,8 @@ pub struct Bound {
     pub storage: bool,
     /// `/dev/desktop` bound.
     pub desktop: bool,
+    /// `/dev/entropy` bound.
+    pub entropy: bool,
 }
 
 /// A namespace built from [`Members`], owned and closed on drop, and what bound into it.
@@ -233,11 +239,21 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
     // graphical session** (see [`Members::bind_console`]): the console is shared.
     if bind_console
         && let Some(root) = root_ns
-        && let Ok(console) = resolve::<Resource, ReadOnly, _>(root, "/dev/console", Rights::READ | Rights::TRANSFER)
+        && let Ok(console) = resolve::<Resource, ReadOnly, _>(root, "/dev/console", DIRECT | Rights::READ)
     {
         bound.console = ns.bind("/dev/console", &console).is_ok();
         if !bound.console {
             log::write(b"libsession: /dev/console bind FAIL (shell has no console)\n");
+        }
+    }
+    // `/dev/entropy` → the kernel's generator, a direct-handle bind resolved from our own namespace,
+    // in **every namespace this builds**: random bytes, and nothing else, which every process could
+    // read before the generator was a node. Non-fatal.
+    if let Some(root) = root_ns {
+        let node = resolve::<Resource, ReadOnly, _>(root, "/dev/entropy", DIRECT | Rights::READ);
+        bound.entropy = node.is_ok_and(|node| ns.bind("/dev/entropy", &node).is_ok());
+        if !bound.entropy {
+            log::write(b"libsession: /dev/entropy bind FAIL (no random bytes in this namespace)\n");
         }
     }
     // `/dev/desktop` → `desktop-shell`'s own endpoint, for an application. No base. Non-fatal.
@@ -266,9 +282,8 @@ fn bind_session_user(ns: &Handle<Namespace, NsMutable>, user: &[u8]) {
         log::write(b"libsession: /session/user map FAIL\n");
         return;
     }
-    // A reader's rights, and the `TRANSFER` a direct bind needs.
-    let snapshot =
-        mem.duplicate(Rights::MAP_READ | Rights::INSPECT | Rights::TRANSFER).and_then(Handle::into_read_only);
+    // A reader's rights, and the two a direct bind needs.
+    let snapshot = mem.duplicate(DIRECT | Rights::MAP_READ | Rights::INSPECT).and_then(Handle::into_read_only);
     if snapshot.and_then(|s| ns.bind("/session/user", &s)).is_err() {
         log::write(b"libsession: /session/user bind FAIL (whoami will report no identity)\n");
     }

@@ -2,7 +2,7 @@
 
 **Status:** Implemented — `kernel/src/object/namespace.rs`, with userspace resource servers
 (fs-server, profile-server, auth, tty) bound by supervisors. Deferrals are marked inline.
-Verified 2026-08-05; derivation (`sys_ns_derive`) added and the `BIND_NAMESPACE` gate corrected
+Verified 2026-08-05; copying (`sys_ns_create(from)`) added and the `BIND_NAMESPACE` gate corrected
 to "enforced" 2026-09-23; a server minting a narrower endpoint on request (the device manager's
 info-only one) described 2026-09-24; a resolve continued in a namespace a server hands back
 (`OBJECT_KIND_SUBNAMESPACE`) built with administration Part C.4, 2026-09-24; a direct-handle bind
@@ -197,7 +197,7 @@ every lookup through it comes back `Unsupported` from a peer that has never hear
 `/dev/tty` that could not be opened.
 
 A **direct handle** is a supervisor binding a concrete object — a `MemoryObject` at
-`/store`, the console `DeviceNode` at `/dev/console`, an `EntropyObject` — that lookup
+`/store`, the console `DeviceNode` at `/dev/console` — that lookup
 returns (rights-attenuated). A **`KernelServer`** is the answer for resources that must be
 *computed per lookup* (e.g. `/proc/self/process`, which depends on *who* is asking)
 without spinning up a userspace process — see "In-kernel resource servers" below.
@@ -323,7 +323,7 @@ enforced since Phase 3 slice 6 Part C, 2026-07-14.)
 Resolution is longest-prefix, so a path under a removed binding falls to the next
 shorter one: with `/` bound to a filesystem and `/home` to alice's subtree of it,
 `/home/bob/x` resolves through `/home` and stays in alice's; unbind `/home` and it
-resolves through `/`, to bob's. Since `sys_ns_derive` (below), **any holder of a
+resolves through `/`, to bob's. Since a namespace can be copied (below), **any holder of a
 namespace can make a copy it may unbind in**, so this is a rule for whoever builds
 one:
 
@@ -342,15 +342,14 @@ filesystem at `/` and so confines nothing to begin with. The kernel test
 `unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one`
 (`kernel/src/object/namespace.rs`) pins the behaviour.
 
-**Deriving a namespace** (`sys_ns_derive`, 2026-09-23) copies every binding of one
-the caller can `LOOKUP` into a new namespace it holds with full rights. The copy is
-a **snapshot** — the targets are shared (a registration stays alive while either
-binds it), but a later bind or unbind in one does not reach the other — so a copy can
-be sent, pruned, or have bindings added by a holder of `BIND_NAMESPACE`, and the
-source is untouched. It exists for the view broker, which runs a program in its
-caller's namespace plus a profile's grants: the caller sends a copy, and the broker
-copies *that* again before binding anything, since whoever sent a namespace may still
-hold a handle to it (`docs/planning/administration.md` § Part A).
+**Copying a namespace** (`sys_ns_create(from)`; `sys_ns_derive` until 2026-11-13) copies every
+binding of one the caller can `LOOKUP` into a new namespace it holds with full rights. The copy is a
+**snapshot** — the targets are shared (a registration stays alive while either binds it), but a
+later bind or unbind in one does not reach the other — so a copy can be sent, pruned, or have
+bindings added by a holder of `BIND_NAMESPACE`, and the source is untouched. It exists for the view
+broker, which runs a program in its caller's namespace plus a profile's grants: the caller sends a
+copy, and the broker copies *that* again before binding anything, since whoever sent a namespace may
+still hold a handle to it (`docs/planning/administration.md` § Part A).
 
 **Supervisor-mediated binding.** Resource servers never bind themselves; a
 supervisor holding the binding authority does it on their behalf after a Ready
@@ -431,7 +430,7 @@ slice 7 — an in-kernel server never returns it.)
 **The content model: a lookup yields a handle to a kernel object.** An in-kernel
 server's job is to *produce the right handle* for `suffix`:
 
-- `/dev/entropy` → an `EntropyObject` handle (the caller then `sys_entropy_read`s it).
+- `/dev/entropy` → the CSPRNG's char `DeviceNode` (the caller then reads it with `sys_io_submit`).
 - `/proc/self/process` → the caller's own `Process` handle; `/proc/self/status` → a
   freshly-synthesized read-only `MemoryObject` snapshot; etc.
 - `/dev/registry` → a snapshot of the whole device table, `/dev/registry/<id>` → that
@@ -659,15 +658,17 @@ policy; a server never touches namespace bindings.
 
 Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
 
-- **`sys_ns_create() -> handle`** — a fresh, empty `Namespace` with full namespace
-  rights (`LOOKUP | BIND | UNBIND` + generic management).
-- **`sys_ns_derive(ns) -> handle`** — a new namespace holding a snapshot copy of
-  `ns`'s bindings, with the same full rights. Needs `LOOKUP` on `ns`.
+- **`sys_ns_create(from) -> handle`** — a fresh `Namespace` with full namespace
+  rights (`LOOKUP | BIND | UNBIND` + generic management): empty if `from` is null, else
+  a snapshot copy of `from`'s bindings, which needs `LOOKUP` on `from`.
+- **`sys_ns_enumerate(ns, index, out, count) -> n`** — up to `count` bindings from the
+  `index`-th, at most 64, written to an array: how many. Needs `LOOKUP`.
 - **`sys_ns_bind(ns, path, path_len, resource) -> 0`** — bind `resource` (a direct
   handle in slice 1; a userspace-server endpoint in slice 7) at `path`. Needs `BIND`
-  on `ns` and the `BIND_NAMESPACE` syscap, and **a direct handle needs `TRANSFER`**:
-  every resolve of the binding mints a handle to the object, so a bind gives it away as a
-  send does (PR #342 review, 2026-09-29). In-kernel `KernelServer`
+  on `ns` and the `BIND_NAMESPACE` syscap, and **a direct handle needs `TRANSFER` and
+  `DUPLICATE`**: every resolve of the binding mints a handle to the object, so a bind gives it
+  away as a send does (PR #342 review, 2026-09-29), and the binder keeps its own, so it is a
+  copy (2026-11-13). In-kernel `KernelServer`
   bindings are made by the kernel at boot, not through this syscall.
 - **`sys_ns_unbind(ns, path, path_len) -> 0`** — remove the binding at `path`. Needs
   `UNBIND`.
@@ -675,7 +676,7 @@ Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
   `path`, requesting at most `rights`; the PO completes with the resolved handle
   (`IoResult.result`) or an error (`IoResult.status`). Needs `LOOKUP`.
 
-Numbers `22`–`25`, `30` (`sys_ns_enumerate`) and `37` (`sys_ns_derive`); pre-stabilization.
+Numbers `22`–`25` and `30` (`sys_ns_enumerate`); pre-stabilization.
 
 ## Scope summary
 

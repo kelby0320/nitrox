@@ -2,9 +2,9 @@
 
 use super::*;
 
-/// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the unseeded
-/// `sys_entropy_read` path), gated by a lock-free check so the common case costs one atomic
-/// load. From the tick.
+/// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (an unseeded read
+/// of `/dev/entropy`), gated by a lock-free check so the common case costs one atomic load. From
+/// the tick.
 pub(super) fn wake_entropy_seed_waiters() {
     if crate::entropy::seed_wake_pending() {
         wake_seed_waiters(crate::entropy::drain_seed_waiters);
@@ -15,7 +15,7 @@ pub(super) fn wake_entropy_seed_waiters() {
 /// move into an interrupt's bag, so they reach `deferred_drops` rather than drop here. Drained
 /// before `SCHED` is taken, so `ENTROPY` never nests in it. Bounded: waiters queue only pre-seed
 /// and the drain fires post-seed, so the lifetime total is ≤ `SEED_WAITERS_MAX`.
-pub(super) fn wake_seed_waiters(drain: impl FnOnce(&mut [Option<Ref<PendingOperation>>]) -> usize) {
+pub(crate) fn wake_seed_waiters(drain: impl FnOnce(&mut [Option<Ref<PendingOperation>>]) -> usize) {
     use crate::entropy::SEED_WAITERS_MAX;
     let mut buf: [Option<Ref<PendingOperation>>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
     let n = drain(&mut buf);

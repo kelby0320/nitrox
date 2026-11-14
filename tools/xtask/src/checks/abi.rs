@@ -107,6 +107,13 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         one_sided: &[],
     },
     AbiFamily {
+        what: "the binding listing's batch",
+        kernel_file: "kernel/src/libkern/handle.rs",
+        user_files: &["userspace/libkern/src/abi.rs"],
+        shape: AbiShape::U64Const,
+        one_sided: &[],
+    },
+    AbiFamily {
         what: "the spawn image limit",
         kernel_file: "kernel/src/libkern/spawn.rs",
         user_files: &["userspace/libkern/src/abi.rs"],

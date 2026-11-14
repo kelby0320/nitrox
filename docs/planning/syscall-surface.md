@@ -709,6 +709,53 @@ window changed on one side.
 
 Author for the kernel's half; `/pr-review`.
 
+**Built 2026-11-13** (`f1dde197` the two removed; `5a80e2c0` the namespace calls; `13431e6f`
+entropy and its binding; `24c3cba3` the direct bind). Forty-two numbers to thirty, E.10's two to
+go.
+- **`thread_set_affinity` and `io_cancel` went**, each with its entry and marker
+  (`thread-affinity`, `io-cancel`), and the scheduler's setter only the first used.
+- **`ns_create(from)`** copies a namespace, and `ns_derive` went. **`ns_enumerate` fills up to 64
+  entries** and answers how many; libos reads 32 a call and stops on a short batch. **The probe's
+  control, 13 to 1**: `cargo xtask syscall-counts` on `main` and on this branch, `list .`
+  making 43 calls of its own and then 31, and the session's programs 39 `ns_enumerate` and then 3,
+  one a listing.
+- **`/dev/entropy` is a char node**, read through `io_submit`, 256 bytes a read; an unseeded read
+  completes with nothing once the pool seeds, and a host test takes it there through the tick's
+  wake. `EntropyObject`, its type and its two numbers went. **Every namespace `libsession` builds
+  binds it**, both columns and each application's, resolved from the root as the console is.
+- **A direct bind asks `DUPLICATE`** as well as `TRANSFER`; `direct-bind-copy` is resolved.
+- **For the maintainer's eye: four departures from the plan.**
+  1. **`entropy::fill` takes the caller's namespace.** libos holds none of its own and starts
+     nothing up, so a call with no namespace could reach no `/dev/entropy`; `surface-shape`'s
+     claim that the call kept its shape was wrong, and says so now. `tty-server` opens one source
+     at startup. Phase 7's `std` will want a process's root without a caller to pass it.
+  2. **The binding is in the entropy commit**, not one of its own: apart, the commit before it
+     would leave every session without random bytes, and `nxinstall`, `account` and `disk` failing.
+  3. **A view needed nothing**: the broker copies its caller's namespace, which now binds it.
+  4. **A binding now carries `DUPLICATE`**, as the handle bound must hold it; a resolver gains
+     nothing a second resolve would not. A libfs test that bound a server's table, which carries
+     none, reads it through a mock server instead.
+
+**The controls**: twenty-six mutations each fail their test, or `abi-sync-check`: the listing's
+every bound, its batch's end, the mock's cap and the cap changed on one side; the entropy read's
+cap, its seeding, its wake, its fifth waiter, the node answered, an empty answer, a full queue, a
+try that waits; the bind rule in the kernel and the mock, each of the five binds without
+`DUPLICATE`, and `/dev/entropy` left unbound; 18, 26 and 37 answered again. **All 19 CI gates pass
+under KVM.**
+
+**After review** (`a7353cb8`):
+- **A listing's array is checked whole before any lookup**: any part outside the user half is
+  `FaultFromUser` with nothing written, where an entry straddling the end passed and faulted
+  after a partial write; and **each entry is fresh**, where one reused carried a longer path's
+  bytes. The loop is `listing::fill`, which a host test drives.
+- **`io-operation.md` names `/dev/entropy`'s waited read**, whose `0` means read again, not the
+  end of a stream, and `syscall-abi.md` lists all twelve vacant numbers.
+- **libos refuses a second empty answer**, so a `/dev/entropy` bound to another node is not read
+  for ever; **tty-server reads each token's bytes as it mints it**, as before, and logs one it
+  could not make.
+- Refuted by runs: the installer's and the offline `account`'s draws (`check-install`,
+  `check-recovery`), and the entropy wiring, each caller reached by a passing gate.
+
 ### E.10 One authority model
 
 **A handle, for both** (the maintainer's call, finding 5). Each privileged system operation is a

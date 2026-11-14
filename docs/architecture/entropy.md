@@ -1,31 +1,31 @@
 # Entropy
 
-**Status:** Implemented — `kernel/src/entropy.rs`, `kernel/src/arch/entropy.rs` and the
-`EntropyObject` kernel object. Verified 2026-08-05.
+**Status:** Implemented — `kernel/src/entropy.rs`, `kernel/src/arch/entropy.rs` and
+`/dev/entropy`'s char `DeviceNode`. Verified 2026-11-13.
 
 Nitrox keeps a single in-kernel **CSPRNG**: a cryptographically-strong random
 generator seeded from hardware (`RDSEED`/`RDRAND`) and software (interrupt-timing
-jitter) sources, drawn through a ChaCha20 stream. Userspace reaches it through an
-`EntropyObject` handle; the kernel draws from the same generator for address-space
+jitter) sources, drawn through a ChaCha20 stream. Userspace reaches it through
+`/dev/entropy`, a char `DeviceNode`; the kernel draws from the same generator for address-space
 layout randomization (ASLR) and the handle-table slot shuffle.
 
 This document is the design for the entropy subsystem. Exact ABIs (the
-`sys_entropy_*` signatures) live in [`docs/spec/syscall-abi.md`](../spec/syscall-abi.md);
+read, and the numbers that went) live in [`docs/spec/syscall-abi.md`](../spec/syscall-abi.md)
+and [`docs/spec/io-operation.md`](../spec/io-operation.md);
 this is the *why* and the *shape*. The original sketch is
 [`docs/archive/os-design-v5.1.md`](../archive/os-design-v5.1.md) § Entropy.
 
-> **Implementation phasing.** This doc designs the whole subsystem, but it lands
-> across **Phase 2 slice 2** (this slice) plus one consumer in slice 3:
-> - **Slice 2 (this slice):** the ChaCha20 CSPRNG, the hardware-RNG arch interface,
->   the entropy pool + boot seeding + interrupt-jitter mixing + periodic reseed, the
->   `EntropyObject` kernel object, and the `sys_entropy_create` / `sys_entropy_read`
->   syscalls. The kernel's own PRNGs (handle-table shuffle; later ASLR) re-seed from
->   it.
-> - **Slice 3 (resource servers):** the `/dev/entropy` resource server that binds an
->   `EntropyObject` into each process's namespace. Until then a process obtains a
->   handle directly via `sys_entropy_create`.
+> **Implementation phasing.** The subsystem landed across **Phase 2 slice 2** and one consumer
+> in slice 3:
+> - **Slice 2:** the ChaCha20 CSPRNG, the hardware-RNG arch interface, the entropy pool + boot
+>   seeding + interrupt-jitter mixing + periodic reseed, and an `EntropyObject` with the
+>   `sys_entropy_create` / `sys_entropy_read` syscalls. The kernel's own PRNGs (handle-table
+>   shuffle; later ASLR) re-seed from it.
+> - **Slice 3:** the `/dev/entropy` binding.
 >
-> Each section below marks which wave a feature belongs to.
+> On 2026-11-13 the slice-3 binding became the char node: `EntropyObject` and both syscalls were
+> removed, and `/dev/entropy` is read with `sys_io_submit`. The sections below mark which wave a
+> feature belongs to.
 
 ## Goals and non-goals
 
@@ -141,57 +141,56 @@ fixed `PHASE1_SEED`). At init it:
 3. latches **seeded** and keys the CSPRNG.
 
 **Seeded-before-userspace guarantee.** On any CPU with `RDSEED` or `RDRAND` the pool
-is seeded long before `run_first_userspace`, so a userspace `sys_entropy_read`
-returns immediately. The blocking path exists only for the jitter-only case (no HW
+is seeded long before `run_first_userspace`, so a userspace read of
+`/dev/entropy` completes at once. The blocking path exists only for the jitter-only case (no HW
 RNG), where seeding waits for enough interrupt samples.
 
 **Re-seeding the kernel PRNGs.** The handle-table free-list PRNG (`handle/prng.rs`,
 seeded via `PHASE1_SEED` in `handle/global.rs`) and — when it lands — ASLR draw
 their seeds from the CSPRNG, closing the `TODO(entropy)` notes.
 
-## The `EntropyObject` and the read contract (slice 2)
+## `/dev/entropy` and the read contract
 
-`EntropyObject` is a kernel object (`KObjectType::EntropyObject`, already reserved;
-principal mask `READ` in `handle/type_rights.rs`). It is a **capability token**: the
-random source is a kernel singleton (the one CSPRNG), and every `EntropyObject`
-handle is a view onto it — analogous to many handles referring to one object.
-
-```
-fn sys_entropy_create() -> isize            // syscall 26
-```
-Returns a handle to the entropy source with `READ` + the generic management band
-(`DUPLICATE | TRANSFER | INSPECT`). (The verb matches `sys_ns_create` /
-`sys_timer_create`; it mints a fresh handle/token, not a new random stream.)
+`/dev/entropy` is a **char `DeviceNode`** (`KObjectType::DeviceNode`). One node is made at boot
+(`entropy::make_node`, `kernel/src/entropy.rs`), and the kernel server `KernelServerId::Entropy`
+answers that same node to every resolve of `/dev/entropy` (an exact match; a non-empty suffix is
+`NotFound`). The root namespace binds it with `READ | DUPLICATE | INSPECT | TRANSFER`, and
+services inherit the root; `libsession` binds it in every session and application namespace it
+builds, resolved from the root, and a view is a copy of its caller's namespace, so holds it too. The node is a view onto the one CSPRNG, so many handles read one
+generator.
 
 ```
-fn sys_entropy_read(handle: RawHandle, buf: UserMutPtr<u8>, len: usize) -> isize  // syscall 27
+sys_io_submit(node, IoOp { opcode: Read, buffer, buf_offset, offset: ignored, length })
 ```
-Requires `READ` on `handle`. `len` is bounded per call (256 bytes — a cap like the
-`sys_kprint` bounce buffer; loop for more). The return value distinguishes the two
-outcomes (unambiguous because handle values are always ≥ 1):
 
-- **Seeded (the common case) → returns `0`:** the syscall fills `buf[0..len]` with
-  CSPRNG output and returns synchronously. The kernel bounce buffer is wiped after
-  copy-out so no entropy lingers on the kernel stack.
-- **Unseeded (rare — only the no-HW-RNG, pre-jitter window) → returns a positive
-  `PendingOperation` handle:** the buffer is untouched. The PO completes once the
-  pool seeds (the seed-latch drains the waiter list on the next scheduler tick and
-  completes each); the caller `sys_wait`s on it, then **re-reads** (now seeded →
-  synchronous fill). This keeps the async-first contract
-  (`docs/rationale/why-async-syscalls.md`) without ever blocking inside a syscall.
-  In practice the pool is seeded before userspace runs, so this path is the safety
-  net, not the norm.
+`buffer` is a `MemoryObject` held with `MAP_WRITE`. The call requires `READ` on the node.
 
-Slice-3 `/dev/entropy` changes nothing here: the resource server simply binds an
-`EntropyObject` handle into each process's namespace, and clients use the same
-`sys_entropy_read`.
+- **A read answers at most 256 bytes** (`READ_MAX`). The pending operation completes with
+  `result` = the bytes written, so a reader reads again for more. The kernel bounce buffer is
+  wiped after copy-out so no entropy lingers on the kernel stack.
+- **Unseeded (rare: only a CPU with neither `RDSEED` nor `RDRAND`, before enough jitter):** the
+  operation waits and writes nothing. It completes with status 0 and `result` 0 once the pool
+  seeds (the timer tick's drain completes it), and the reader reads again. This keeps the
+  async-first contract (`docs/rationale/why-async-syscalls.md`) without blocking inside a
+  syscall. In practice the pool is seeded before userspace runs, so this path is the safety net.
+- **More than `SEED_WAITERS_MAX` (4) unseeded reads waiting at once:** the submit is refused
+  `WouldBlock` synchronously, with no pending operation.
+- **A `Write` is `Unsupported`.**
+
+libos wraps this as `entropy::Source` (`userspace/libos/src/entropy.rs`): `Source::open(ns)`
+resolves `/dev/entropy` in the namespace the caller passes, `fill` waits for the seeding and
+reads again as needed, and `try_fill` is refused `WouldBlock` before the seeding, for a caller
+that cannot wait. libos holds no namespace of its own.
+
+Until 2026-11-13 the generator was an `EntropyObject` handle from `sys_entropy_create` (`26`),
+read with `sys_entropy_read` (`27`); both numbers are now vacant.
 
 ## Lock discipline (slice 2)
 
 Sampling runs in **interrupt context** (timer tick + device IRQs), so the pool's
 ingest path must not take a rank-ordered sleepable lock or allocate. It uses an
 `IrqSpinLock` (or a lock-free push), exactly like the DPC queue — a **leaf** held
-alone, briefly, with interrupts masked. The CSPRNG *draw* (from `sys_entropy_read`
+alone, briefly, with interrupts masked. The CSPRNG *draw* (from a read of `/dev/entropy`
 and the kernel PRNG re-seed) is a syscall/boot-context lock at the kernel-object
 rank. The `seeded` latch and the "wake the waiters" step on seeding follow the
 `PendingOperation` completion path (under `SCHED`), with no `ObjectRef` drop under
@@ -205,9 +204,9 @@ when the code lands (Part C).
 | ChaCha20 CSPRNG, pool, entropy estimate, seeded gate | **kernel** (slice 2) |
 | HW-RNG access (`RDSEED`/`RDRAND`), CPUID detection | **kernel arch layer** (slice 2) |
 | Interrupt-jitter sampling | **kernel** (slice 2) |
-| `sys_entropy_create` / `sys_entropy_read`, `EntropyObject` | **kernel** (slice 2) |
+| `/dev/entropy`'s char node and its read | **kernel** |
 | Re-seeding the handle-table / ASLR PRNGs | **kernel** (slice 2) |
-| `/dev/entropy` resource server + namespace binding | **kernel/userspace** (slice 3) |
+| `/dev/entropy` kernel-server binding in the root namespace | **kernel** (slice 3) |
 | Userspace CSPRNG wrappers (`getrandom`-style in `librt`) | **userspace** (later) |
 
 ## Slice-2 vs slice-3 scope
@@ -215,9 +214,9 @@ when the code lands (Part C).
 | Item | Slice |
 |---|---|
 | CSPRNG + pool + sources + seeding + reseed | **2** |
-| `EntropyObject` + `sys_entropy_create`/`sys_entropy_read` | **2** |
-| Direct `sys_entropy_create` to obtain a handle | **2** |
-| `/dev/entropy` binding via the resource server | **3** |
+| `EntropyObject` + `sys_entropy_create`/`sys_entropy_read` (removed 2026-11-13) | **2** |
+| `/dev/entropy` binding via the kernel server | **3** |
+| `/dev/entropy` as a char `DeviceNode`, read with `sys_io_submit` | 2026-11-13 |
 
 ## Deferred
 

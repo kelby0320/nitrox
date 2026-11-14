@@ -220,7 +220,8 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
   affinity mask, preferring its last CPU (cache warmth) then the least-loaded
   permitted CPU.
 - **`sys_thread_set_affinity`** becomes functional (replaces the `table.rs:384`
-  no-op). Validation as implemented (corrected 2026-07-21, review F9): the mask is
+  no-op); it went on 2026-11-13, having no caller, so a thread's mask is set when it is
+  made (`thread-affinity`), and `sys_thread_create` validates it the same way. Validation as implemented (corrected 2026-07-21, review F9): the mask is
   clamped to `MAX_CPUS` bits and rejected only if empty — it is **not** checked
   against the *online* set, so a mask naming only offline CPUs is accepted.
   Placement then falls back to **the least-loaded CPU that accepts work**, outside
@@ -398,8 +399,8 @@ than slots, and a give-back of slots never promised.
   frequency (e.g. 1000 Hz) is the cheap stopgap, trading steady IRQ overhead for
   granularity.
 - **Post-spawn class / priority change syscall** — class, nice, and affinity are set at
-  spawn via `ThreadArgs`; affinity can already change post-spawn via
-  `sys_thread_set_affinity` (a no-op today, functional in slice 3). A `renice`-style
+  spawn via `ThreadArgs`, and since `sys_thread_set_affinity` went (2026-11-13,
+  `thread-affinity`) none changes after. A `renice`-style
   `sys_thread_set_priority` / `sys_thread_set_class` for changing class or nice *after*
   spawn (e.g. a shell `renice`, a supervisor retuning a service, a thread self-elevating
   to RealTime) is a real but non-urgent case — added when a consumer needs it.

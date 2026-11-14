@@ -77,8 +77,8 @@ nothing further under the session's bases. Closing a session that is not open is
 **Every binding a grant made goes**, the broker's own `/dev/log` snapshot included, while a
 `/dev/log` the caller already had stays. A program that ignores the request, and every process
 sharing its namespace, then resolves nothing new through any of them. **A copy of the view is
-beyond the broker's reach**: one made with `sys_ns_derive` — a `with` run inside the view makes
-one — keeps every binding it was made with, until its processes exit (`TODO(forcible-kill)`).
+beyond the broker's reach**: one made with `sys_ns_create(from)` — a `with` run inside the view
+makes one — keeps every binding it was made with, until its processes exit (`TODO(forcible-kill)`).
 
 ### `Request` (`0x0E02`) — client
 
@@ -106,7 +106,7 @@ the request is asked, as before.
 
 Transferred handles, in order: **a namespace** (always), then each stream whose bit is set, then
 the terminal. A count that disagrees with the bits is refused. **The namespace is the one the view
-is built from**, and its sender chooses it: `with` sends a copy of its own, from `sys_ns_derive`,
+is built from**, and its sender chooses it: `with` sends a copy of its own, from `sys_ns_create(from)`,
 since the one a process is spawned with cannot be transferred; `desktop-shell`'s Restart and Shut
 down send an application's, which it built, so the view does not reach the window manager the
 session's does (Part F.3).

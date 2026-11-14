@@ -98,8 +98,13 @@ pub fn unseeded(reads: u32) {
     with(|m| m.unseeded = reads);
 }
 
+/// A handle to a new `/dev/entropy` node, to bind where a namespace keeps it.
+pub fn entropy_node() -> u64 {
+    with(|m| m.mint(Object::Entropy, Rights::READ | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT)) as u64
+}
+
 /// Let the next `reads` unseeded reads find every place the kernel keeps for a reader waiting on
-/// the seeding taken, as it answers past `SEED_WAITERS_MAX`: a PO done `WouldBlock`, to read again.
+/// the seeding taken, as it answers past `SEED_WAITERS_MAX`: refused `WouldBlock`, to read again.
 pub fn seed_waiters_full(reads: u32) {
     with(|m| m.seed_full = reads);
 }
@@ -135,12 +140,18 @@ pub fn verdicts() -> Vec<u64> {
 pub fn answering(path: &str) -> (u64, u64) {
     let mut ends = [0; 2];
     channel_create(4, &mut ends);
+    (answering_with(path, ends[0]), ends[1])
+}
+
+/// A namespace whose server at `path` answers each lookup at once with the object `handle` names,
+/// which moves into it, as a server's reply hands its resolver what it serves.
+pub fn answering_with(path: &str, handle: u64) -> u64 {
     with(|m| {
-        let (ours, _) = m.table[&ends[0]];
-        m.table.remove(&ends[0]);
-        let server = m.object(Object::Answers(ours));
+        let (target, _) = m.table[&handle];
+        m.table.remove(&handle);
+        let server = m.object(Object::Answers(target));
         let ns = m.object(Object::Namespace(vec![Binding::new(path.as_bytes(), server, u64::MAX)]));
-        (m.install(ns, Rights::LOOKUP.bits()), ends[1])
+        m.install(ns, Rights::LOOKUP.bits())
     })
 }
 
@@ -237,6 +248,11 @@ pub fn threads() -> Vec<ThreadArgs> {
 /// Waits that slept until their deadline.
 pub fn sleeps() -> u32 {
     with(|m| m.sleeps)
+}
+
+/// `sys_ns_enumerate` calls since the reset.
+pub fn enumerates() -> u32 {
+    with(|m| m.enumerates)
 }
 
 /// How many POs were closed before they signalled.

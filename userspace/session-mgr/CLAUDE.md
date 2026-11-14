@@ -140,6 +140,8 @@ from the same `Members`, with `/applications` and the console off and `/dev/draw
   mounted filesystem) and `/info` (the table), through the route `service-mgr` hands over;
 - `/dev/services` — `service-mgr`'s table of services (administration Part E.2b);
 - `/dev/console` — **this column only** (`bind_console`); a graphical session has none;
+- `/dev/entropy` — the kernel's generator, in **every** namespace it builds, an application's too:
+  random bytes and nothing else, which every process could read before the generator was a node;
 - `/system/fonts` — **the graphical column only** (`bind_fonts`);
 - **never the machine's block devices.** From Phase 5 Part H.1 until administration Part G.3 an
   installer boot's session held every one; now a program reaches a disk only through the view

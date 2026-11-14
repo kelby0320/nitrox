@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::object::{
-    DeviceNode, EntropyObject, FileObject, InterruptObject, IpcChannel, MemoryObject, Namespace, NotificationChannel,
+    DeviceNode, FileObject, InterruptObject, IpcChannel, MemoryObject, Namespace, NotificationChannel,
     PendingOperation, Process, SystemControl, Thread, Timer, UserspaceServerReg,
 };
 
@@ -444,7 +444,6 @@ unsafe fn dispatch_destroy(header: NonNull<KObjectHeader>) {
             IpcChannel,
             PendingOperation,
             Namespace,
-            EntropyObject,
             DeviceNode,
             InterruptObject,
             UserspaceServerReg,
@@ -521,10 +520,6 @@ pub(crate) mod test_probe {
 
     pub(crate) fn namespace_destroys() -> usize {
         destroys(KObjectType::Namespace)
-    }
-
-    pub(crate) fn entropy_object_destroys() -> usize {
-        destroys(KObjectType::EntropyObject)
     }
 
     pub(crate) fn system_control_destroys() -> usize {

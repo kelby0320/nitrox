@@ -8,7 +8,7 @@
 //! the grants come from: every block device, for `disks`. **And the root filesystem**, through
 //! which it reads and replaces `/system/views.toml` and makes and removes `/home/<name>` for the
 //! accounts it fronts. It never holds a session's ingredients — the caller hands it a copy of its
-//! own namespace (`sys_ns_derive`), and it copies that again before binding anything, so the
+//! own namespace (`sys_ns_create(from)`), and it copies that again before binding anything, so the
 //! caller cannot keep a handle to what it builds. It never touches a terminal: `with` reads the
 //! password.
 //!
@@ -133,7 +133,7 @@ struct Granted {
 }
 
 /// **Undo what a view's grants bound** for whatever shares the view, a program that ignored a
-/// request to stop included; a copy made with `sys_ns_derive` keeps them (`TODO(forcible-kill)`).
+/// request to stop included; a copy made with `sys_ns_create(from)` keeps them (`TODO(forcible-kill)`).
 fn unbind_grants(view_ns: &Handle<Namespace, NsMutable>, granted: &Granted) {
     if granted.disks {
         libsession::withdraw_block_devices(view_ns);
@@ -894,14 +894,14 @@ impl Broker {
                 // taken here is the log as this view is made, bound at the same path as a direct
                 // handle — readable and sizeable, and nothing more.
                 Grant::KernelLog => {
+                    let direct = Rights::TRANSFER | Rights::DUPLICATE;
                     let snapshot: Option<Handle<Memory, MapRead>> =
-                        lookup(&self.root_ns, KERNEL_LOG, Rights::MAP_READ | Rights::INSPECT | Rights::TRANSFER);
+                        lookup(&self.root_ns, KERNEL_LOG, Rights::MAP_READ | Rights::INSPECT | direct);
                     let bind = snapshot.as_ref().map(|s| view_ns.bind(KERNEL_LOG, s));
                     // A caller that already binds `/dev/log` keeps its own.
                     kernel_log_ours = matches!(bind, Some(Ok(())));
                     let kept = matches!(&bind, Some(Err(e)) if e.code() == KError::AlreadyExists);
-                    // The bind took its own reference.
-                    drop(snapshot);
+                    drop(snapshot); // The bind took its own reference.
                     if !kernel_log_ours && !kept {
                         return Err("the kernel's log is not there to grant");
                     }

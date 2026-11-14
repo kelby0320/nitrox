@@ -221,6 +221,7 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/storage` | the storage service's **session** endpoint, scoped to `/fs` | every mounted filesystem, `/storage/<label>/…`, and nothing to mount with — see below |
 | `/dev/storage` | the same endpoint, scoped to `/info` | the table of what each disk holds; since Phase 6 Part F a media session that ejects a removable disk's mount, and a watch pinged when the mounts change ([`storage.md`](storage.md) §8a) |
 | `/dev/services` | `service-mgr`'s **session** endpoint for its services | the table of services, `all.tsm`, and nothing to start or stop one with — [`rsproto-services-ops.md`](../spec/rsproto-services-ops.md) |
+| `/dev/entropy` | the kernel generator's char node, resolved from the supervisor's root | READ: random bytes, in **every** namespace `libsession` builds, an application's too, and nothing else ([`entropy.md`](entropy.md)) |
 
 Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
 `/dev/blk`, on every boot. *Absence is the sandbox* — this is Nitrox's "sandboxing by

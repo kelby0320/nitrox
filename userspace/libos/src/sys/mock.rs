@@ -52,6 +52,7 @@ enum Object {
     Process,
     /// The registers it faulted with while it is suspended on a fault.
     Thread(Option<RegisterValues>),
+    /// `/dev/entropy`'s char node, whose `Read` answers bytes, or waits while unseeded.
     Entropy,
     SystemControl,
     Timer(u64),
@@ -66,12 +67,11 @@ impl Object {
             Object::Channel { .. } => KObjectType::IpcChannel,
             Object::Po(_) => KObjectType::PendingOperation,
             Object::Notify(_) => KObjectType::NotificationChannel,
-            Object::Device => KObjectType::DeviceNode,
+            Object::Device | Object::Entropy => KObjectType::DeviceNode,
             Object::Server | Object::Answers(_) => KObjectType::UserspaceServerReg,
             Object::Process => KObjectType::Process,
             Object::Thread(_) => KObjectType::Thread,
             Object::Timer(_) => KObjectType::Timer,
-            Object::Entropy => KObjectType::EntropyObject,
             Object::SystemControl => KObjectType::SystemControl,
         }
     }
@@ -151,6 +151,7 @@ struct Mock {
     clock_answer: Option<i64>,
     clock: u64,
     sleeps: u32,
+    enumerates: u32,
     submits: u32,
     waits: u32,
     closes: u32,
@@ -339,6 +340,9 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
         }
         if file && (op.opcode == libkern::IO_OPCODE_READ || op.opcode == libkern::IO_OPCODE_WRITE) {
             return file_io::file_io(m, resource, op);
+        }
+        if matches!(m.get(resource, Rights::empty()), Ok((o, _)) if matches!(m.objects[o], Object::Entropy)) {
+            return file_io::entropy_read(m, resource, op);
         }
         if let Err(r) = m.get(resource, Rights::empty()) {
             return r;
@@ -671,21 +675,17 @@ pub fn channel_recv(ch: u64, msg: &mut IpcMsg, handles: &mut [u64; IPC_HANDLE_MA
     })
 }
 
-pub fn ns_create() -> i64 {
+pub fn ns_create(from: u64) -> i64 {
     with(|m| {
+        let copy = match from {
+            0 => Vec::new(),
+            from => match m.namespace(from, Rights::LOOKUP) {
+                Ok(src) => m.bindings(src).clone(),
+                Err(r) => return r,
+            },
+        };
         let rights = Rights::LOOKUP | Rights::BIND | Rights::UNBIND | Rights::DUPLICATE | Rights::TRANSFER;
-        m.mint(Object::Namespace(Vec::new()), rights | Rights::INSPECT)
-    })
-}
-
-pub fn ns_derive(ns: u64) -> i64 {
-    with(|m| match m.namespace(ns, Rights::LOOKUP) {
-        Ok(src) => {
-            let copy = m.bindings(src).clone();
-            let rights = Rights::LOOKUP | Rights::BIND | Rights::UNBIND | Rights::DUPLICATE | Rights::TRANSFER;
-            m.mint(Object::Namespace(copy), rights | Rights::INSPECT)
-        }
-        Err(r) => r,
+        m.mint(Object::Namespace(copy), rights | Rights::INSPECT)
     })
 }
 
@@ -733,7 +733,7 @@ pub fn ns_bind(ns: u64, path: &[u8], resource: u64, base: &[u8]) -> i64 {
             if !base.is_empty() {
                 return e(KError::InvalidArgument);
             }
-            if !Rights::from_bits(rights).contains(Rights::TRANSFER) {
+            if !Rights::from_bits(rights).contains(Rights::TRANSFER | Rights::DUPLICATE) {
                 return e(KError::NoAccess);
             }
         }
@@ -762,19 +762,27 @@ pub fn ns_unbind(ns: u64, path: &[u8]) -> i64 {
     })
 }
 
-pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
+pub fn ns_enumerate(ns: u64, index: u64, out: &mut [NsEntry]) -> i64 {
     with(|m| {
+        m.enumerates += 1;
+        if out.is_empty() || out.len() as u64 > libkern::NS_ENUMERATE_MAX {
+            return e(KError::InvalidArgument);
+        }
         let ns = match m.namespace(ns, Rights::LOOKUP) {
             Ok(o) => o,
             Err(r) => return r,
         };
-        let Some(Binding { path, rights, .. }) = m.bindings(ns).get(index as usize) else { return e(KError::NotFound) };
-        *out = NsEntry::zeroed();
-        let n = path.len().min(out.path.len());
-        out.path[..n].copy_from_slice(&path[..n]);
-        out.path_len = path.len() as u32;
-        out.rights = *rights;
-        0
+        let from = m.bindings(ns).iter().skip(index as usize);
+        let mut written = 0;
+        for (Binding { path, rights, .. }, out) in from.zip(out.iter_mut()) {
+            *out = NsEntry::zeroed();
+            let n = path.len().min(out.path.len());
+            out.path[..n].copy_from_slice(&path[..n]);
+            out.path_len = path.len() as u32;
+            out.rights = *rights;
+            written += 1;
+        }
+        written
     })
 }
 
@@ -849,42 +857,6 @@ pub unsafe fn thread_create(args: &ThreadArgs) -> i64 {
         }
         m.threads.push(*args);
         m.mint(Object::Thread(None), Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)
-    })
-}
-
-pub fn entropy_create() -> i64 {
-    with(|m| m.mint(Object::Entropy, Rights::READ | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT))
-}
-
-pub fn entropy_read(h: u64, buf: &mut [u8]) -> i64 {
-    with(|m| {
-        if buf.is_empty() {
-            return 0;
-        }
-        if buf.len() > 256 {
-            return e(KError::TooLarge);
-        }
-        if let Err(r) = m.typed(h, Rights::READ, KObjectType::EntropyObject) {
-            return r;
-        }
-        if m.unseeded > 0 {
-            m.unseeded -= 1;
-            if m.seed_full > 0 {
-                m.seed_full -= 1;
-                return m.po(Po {
-                    ready: true,
-                    never: false,
-                    status: e(KError::WouldBlock) as i32,
-                    result: 0,
-                    lookup: None,
-                });
-            }
-            return m.po(Po { ready: false, never: false, status: 0, result: 0, lookup: None });
-        }
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
-        }
-        0
     })
 }
 

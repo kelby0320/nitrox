@@ -797,5 +797,16 @@ pub(crate) extern "C" fn thread_enter() -> ! {
     }
 }
 
+/// Give the global `deferred_drops` the reserve `init` gives it, which no host test runs.
+#[cfg(test)]
+pub(crate) fn reserve_deferred_drops() {
+    let fresh = Reserved::with_capacity(DEFERRED_DROP_RESERVE).unwrap();
+    let spare = {
+        let mut g = SCHED.lock();
+        if g.deferred_drops.capacity() == 0 { core::mem::replace(&mut g.deferred_drops, fresh) } else { fresh }
+    };
+    drop(spare);
+}
+
 #[cfg(test)]
 mod tests;

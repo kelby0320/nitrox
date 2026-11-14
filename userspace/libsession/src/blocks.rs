@@ -36,7 +36,7 @@ pub fn share_block_devices<'a, 'b, M: CanLookup + 'a>(
         bound += 1;
         // A snapshot, resolved once: device facts do not change while a machine runs.
         let info_path = blk_path(n, true);
-        if let Ok(info) = resolve::<Memory, MapRead, _>(from, &info_path, Rights::MAP_READ | Rights::TRANSFER)
+        if let Ok(info) = resolve::<Memory, MapRead, _>(from, &info_path, crate::namespace::DIRECT | Rights::MAP_READ)
             && to.bind(&info_path, &info).is_err()
         {
             log::write(b"libsession: a device's info leaf would not bind\n");

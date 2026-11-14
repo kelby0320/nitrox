@@ -92,8 +92,8 @@ pub(super) fn cpu_accepts_work(g: &SchedState, cpu: usize, online: u64) -> bool 
 ///
 /// **When affinity permits no CPU that accepts work, it places on one that does anyway**,
 /// outside the mask (see the fallback). Reachable because a permitted CPU can *park* after
-/// the fact, and `sys_thread_set_affinity` validates only that the mask is non-empty within
-/// `MAX_CPUS`, not that it names an online CPU. Caller holds `SCHED`.
+/// the fact, and `sys_thread_create` validates only that a mask is non-empty within `MAX_CPUS`,
+/// not that it names an online CPU. Caller holds `SCHED`.
 pub(super) fn pick_target_cpu(g: &SchedState, th: &Thread, online: u64) -> usize {
     let mask = th.cpu_mask(&g.tok);
     let mut best = usize::MAX;

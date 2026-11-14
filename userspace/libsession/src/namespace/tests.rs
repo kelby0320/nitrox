@@ -85,13 +85,15 @@ fn bare<'a>() -> Members<'a> {
     }
 }
 
-/// A root namespace with a console bound that a lookup of `READ | TRANSFER` finds.
+/// A root namespace with a console and a generator bound that a direct bind's lookup finds.
 fn root_with_console() -> Handle<Namespace, NsMutable> {
     let root = Handle::<Namespace, NsMutable>::create().unwrap();
-    let console = mock::with_rights(mock::device(), Rights::READ | Rights::TRANSFER);
-    // SAFETY: a handle the mock has just made, which nothing else holds.
-    let console = unsafe { Handle::<Resource, ReadOnly>::from_raw(RawHandle(console), Rights::empty()) };
-    root.bind("/dev/console", &console).unwrap();
+    for (path, raw) in [("/dev/console", mock::device()), ("/dev/entropy", mock::entropy_node())] {
+        let node = mock::with_rights(raw, Rights::READ | DIRECT);
+        // SAFETY: a handle the mock has just made, which nothing else holds.
+        let node = unsafe { Handle::<Resource, ReadOnly>::from_raw(RawHandle(node), Rights::empty()) };
+        root.bind(path, &node).unwrap();
+    }
     root
 }
 
@@ -128,6 +130,7 @@ fn a_session_binds_each_member_to_its_own_endpoint() {
             "/dev/services",
             "/system/fonts",
             "/dev/console",
+            "/dev/entropy",
             "/dev/desktop",
         ]
     );
@@ -146,13 +149,15 @@ fn a_session_binds_each_member_to_its_own_endpoint() {
         ("/dev/services", 48, ""),
         ("/dev/desktop", 49, ""),
         ("/dev/console", -1, ""),
+        ("/dev/entropy", -1, ""),
     ] {
         if tag >= 0 {
             assert_eq!(rights_of(&es, path), 1 << tag, "{path}");
         }
         assert_eq!(mock::bound_base(built.ns.raw().0, path).as_deref(), Some(base.as_bytes()), "{path}'s base");
     }
-    assert_eq!(rights_of(&es, "/dev/console"), (Rights::READ | Rights::TRANSFER).bits());
+    assert_eq!(rights_of(&es, "/dev/console"), (Rights::READ | DIRECT).bits());
+    assert_eq!(rights_of(&es, "/dev/entropy"), (Rights::READ | DIRECT).bits());
     let want = Bound {
         bin: true,
         tty: true,
@@ -162,6 +167,7 @@ fn a_session_binds_each_member_to_its_own_endpoint() {
         devices: true,
         storage: true,
         desktop: true,
+        entropy: true,
     };
     assert_eq!(built.bound, want);
 }
@@ -186,6 +192,8 @@ fn a_member_not_asked_for_is_not_bound() {
     let empty_root = Handle::<Namespace, NsMutable>::create().unwrap();
     let no_device = build_namespace(&full(&e, Some(lookup_only(&empty_root)))).unwrap();
     assert!(!no_device.bound.console, "a root with no console binds none");
+    assert!(!no_device.bound.entropy, "nor a generator it has none of");
+    assert!(build_namespace(&no_console).unwrap().bound.entropy, "a column with no console has one");
     let no_base = Members { views_base: "", ..full(&e, None) };
     assert!(!paths(&entries(build_namespace(&no_base).unwrap().ns.as_ref())).contains(&"/dev/views"));
     let no_user = Members { user: b"", ..full(&e, None) };

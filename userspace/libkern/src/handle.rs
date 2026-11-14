@@ -158,7 +158,6 @@ pub enum KObjectType {
     InterruptObject = 8,
     PendingOperation = 9,
     IoRing = 10,
-    EntropyObject = 11,
     DeviceNode = 12,
     UserspaceServerReg = 13,
     FileObject = 14,
@@ -175,7 +174,6 @@ pub const KOBJ_IPC_CHANNEL: u32 = KObjectType::IpcChannel as u32;
 pub const KOBJ_NOTIFICATION_CHANNEL: u32 = KObjectType::NotificationChannel as u32;
 pub const KOBJ_TIMER: u32 = KObjectType::Timer as u32;
 pub const KOBJ_PENDING_OPERATION: u32 = KObjectType::PendingOperation as u32;
-pub const KOBJ_ENTROPY_OBJECT: u32 = KObjectType::EntropyObject as u32;
 pub const KOBJ_FILE_OBJECT: u32 = KObjectType::FileObject as u32;
 pub const KOBJ_SYSTEM_CONTROL: u32 = KObjectType::SystemControl as u32;
 

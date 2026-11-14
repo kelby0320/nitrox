@@ -104,11 +104,11 @@ pub enum WaitPhase {
 
 /// A dense CPU index must fit in [`Thread`]'s `cpu_mask` (a `u8`): raising `MAX_CPUS` past 8
 /// means widening that field, the shifts that read it (`1u8 << 8` panics in debug and wraps to
-/// bit 0 in release) and `sys_thread_set_affinity`'s truncation **together**.
+/// bit 0 in release) and `sys_thread_create`'s truncation of `cpu_affinity` **together**.
 const _: () = assert!(
     crate::arch::MAX_CPUS <= 8,
     "MAX_CPUS > 8 does not fit Thread::cpu_mask (u8) — widen the field, the `1 << c` shifts \
-     in sched/placement.rs, and sys_thread_set_affinity's mask trim together"
+     in sched/placement.rs, and sys_thread_create's mask trim together"
 );
 
 /// A thread kernel object, `#[repr(C)]` with [`KObjectHeader`] first. See "Mutation discipline".
@@ -448,7 +448,8 @@ impl Thread {
         self.sched.read(tok).cpu_mask
     }
 
-    /// Set the CPU affinity bitmask (`sys_thread_set_affinity`).
+    /// Set the CPU affinity bitmask: a test's, as a thread's is set when it is made.
+    #[cfg(test)]
     pub(crate) fn set_cpu_mask(&self, tok: &mut SchedToken, mask: u8) {
         self.sched.get(tok).cpu_mask = mask;
     }

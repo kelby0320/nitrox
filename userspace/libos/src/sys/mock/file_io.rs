@@ -63,3 +63,40 @@ fn pages(o: &Object) -> &Pages {
         _ => unreachable!("a buffer checked to be memory or a file"),
     }
 }
+
+/// A read of `/dev/entropy`'s node, as the kernel answers it: at most 256 bytes, or, while the model
+/// is unseeded, an operation that completes with none, and `WouldBlock` once its waiters' places
+/// are taken.
+pub(super) fn entropy_read(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
+    if op.opcode != libkern::IO_OPCODE_READ {
+        return e(KError::Unsupported);
+    }
+    if let Err(r) = m.typed(h, Rights::READ, KObjectType::DeviceNode) {
+        return r;
+    }
+    let b = match m.get(op.buffer, Rights::MAP_WRITE) {
+        Ok((b, _)) if matches!(m.objects[b], Object::Memory(_)) => b,
+        Ok(_) => return e(KError::InvalidArgument),
+        Err(r) => return r,
+    };
+    let room = pages(&m.objects[b]).0.len() * PAGE;
+    if op.flags != 0 || op.buf_offset.checked_add(op.length).is_none_or(|end| end > room as u64) {
+        return e(KError::InvalidArgument);
+    }
+    if m.unseeded > 0 && op.length > 0 {
+        m.unseeded -= 1;
+        if m.seed_full > 0 {
+            m.seed_full -= 1;
+            return e(KError::WouldBlock);
+        }
+        return m.po(Po { ready: false, never: false, status: 0, result: 0, lookup: None });
+    }
+    let n = op.length.min(256) as usize;
+    if let Object::Memory(p) = &mut m.objects[b] {
+        for k in 0..n {
+            let at = op.buf_offset as usize + k;
+            p.0[at / PAGE].0[at % PAGE] = (k as u8).wrapping_mul(37).wrapping_add(11);
+        }
+    }
+    m.po(Po { ready: true, never: false, status: 0, result: n as u64, lookup: None })
+}

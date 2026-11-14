@@ -33,7 +33,6 @@ fn one_of_each() -> std::vec::Vec<ObjectRef> {
         b.erase(),
         ObjectRef::new(PendingOperation::try_new().unwrap()),
         ObjectRef::new(Namespace::try_new().unwrap()),
-        ObjectRef::new(EntropyObject::try_new().unwrap()),
         ObjectRef::new(InterruptObject::try_new().unwrap()),
         ObjectRef::new(SystemControl::try_new().unwrap()),
     ]
@@ -60,7 +59,6 @@ fn each_object_is_its_own_kind_and_no_other() {
             IpcChannel,
             PendingOperation,
             Namespace,
-            EntropyObject,
             DeviceNode,
             InterruptObject,
             UserspaceServerReg,
