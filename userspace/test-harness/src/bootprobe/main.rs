@@ -171,7 +171,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         & auth_multi_client_test(root)
         & a_reply_is_its_requests_test(root)
         & a_session_takes_memory_and_whole_bodies_test(root)
-        & ns_derive_test(root)
+        & ns_copy_test(root)
         & view_broker_test(root)
         & view_grants_end_test(root)
         & registry_test(root)

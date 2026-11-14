@@ -1362,7 +1362,7 @@ revocation either. An elevated program can therefore outlive the login that star
 maintainer took "asked, not forced" for Part A over building a kill inside it.
 
 **A copy of the view keeps its grants** (found by the review of Part D's group B fixes,
-2026-10-22). `sys_ns_derive` needs only `LOOKUP`, which every program has on its own root, and its
+2026-10-22). A copy (`sys_ns_create(from)`) needs only `LOOKUP`, which every program has on its own root, and its
 copy is a snapshot (`derive_is_a_snapshot_in_both_directions`): a child started on one resolves
 through every grant after the broker unbinds them from the view. `with` run inside a view makes
 such a copy for the broker to build the next view in, so a program started that way keeps the

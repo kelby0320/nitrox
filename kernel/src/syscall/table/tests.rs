@@ -81,7 +81,7 @@ fn unknown_number_is_unsupported() {
 
 #[test]
 fn a_removed_number_is_unsupported_before_it_reads_an_argument() {
-    for removed in [18, 29, 31, 32, 33, 34, 35, 38, 39] {
+    for removed in [18, 29, 31, 32, 33, 34, 35, 37, 38, 39] {
         let refused = dispatch(removed, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
         assert_eq!(refused, KError::Unsupported.as_isize(), "number {removed}");
     }
@@ -218,6 +218,19 @@ fn the_system_control_handle_cannot_be_given_away() {
 fn entropy_read_rejects_zero_and_oversize_len() {
     assert_eq!(sys_entropy_read(0xDEAD, 0x1000, 0), Ok(0));
     assert_eq!(sys_entropy_read(0xDEAD, 0x1000, ENTROPY_READ_MAX + 1), Err(KError::TooLarge),);
+}
+
+#[test]
+fn a_listing_is_refused_a_count_past_its_cap_or_an_array_past_the_user_half_before_any_lookup() {
+    let size = core::mem::size_of::<NsEntry>() as u64;
+    let fits = USER_VIRT_END - 2 * size;
+    assert_eq!(sys_ns_enumerate(0xDEAD, 0, 0x1000, 0), Err(KError::InvalidArgument));
+    assert_eq!(sys_ns_enumerate(0xDEAD, 0, 0x1000, NS_ENUMERATE_MAX + 1), Err(KError::InvalidArgument));
+    assert_eq!(sys_ns_enumerate(0xDEAD, 0, fits, 3), Err(KError::FaultFromUser), "its last entry past the end");
+    let wraps = (u64::MAX - size) & !7;
+    assert_eq!(sys_ns_enumerate(0xDEAD, 0, wraps, 3), Err(KError::InvalidArgument), "an array that wraps");
+    assert_eq!(listing::entries(0x1000, NS_ENUMERATE_MAX), Ok(size), "the cap itself is taken");
+    assert_eq!(listing::entries(fits, 2), Ok(size), "two entries end at the user half's end");
 }
 
 #[test]

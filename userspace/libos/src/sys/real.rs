@@ -113,16 +113,10 @@ pub fn channel_recv(ch: u64, msg: &mut IpcMsg, handles: &mut [u64; IPC_HANDLE_MA
     }
 }
 
-/// `sys_ns_create` — a new empty namespace.
-pub fn ns_create() -> i64 {
-    // SAFETY: a call with no arguments.
-    unsafe { libkern::syscall0(libkern::SYS_NS_CREATE) }
-}
-
-/// `sys_ns_derive(ns)` — a new namespace holding a copy of `ns`'s bindings.
-pub fn ns_derive(ns: u64) -> i64 {
+/// `sys_ns_create(from)` — a new namespace, empty for `0`, else holding a copy of `from`'s bindings.
+pub fn ns_create(from: u64) -> i64 {
     // SAFETY: a register-only call.
-    unsafe { syscall1(libkern::SYS_NS_DERIVE, ns) }
+    unsafe { syscall1(libkern::SYS_NS_CREATE, from) }
 }
 
 /// `sys_ns_lookup` — a `PendingOperation` for `path` in `ns`, doing what `op` says there: its
@@ -157,10 +151,10 @@ pub fn ns_unbind(ns: u64, path: &[u8]) -> i64 {
     unsafe { syscall3(libkern::SYS_NS_UNBIND, ns, path.as_ptr() as u64, path.len() as u64) }
 }
 
-/// `sys_ns_enumerate` — writes an `NsEntry` to `out`; `NotFound` past the end.
-pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
-    // SAFETY: `out` is a live `NsEntry`, which the kernel writes whole or not at all.
-    unsafe { syscall3(libkern::SYS_NS_ENUMERATE, ns, index, out as *mut NsEntry as u64) }
+/// `sys_ns_enumerate` — writes the bindings from `index` into `out`: how many, `0` past the end.
+pub fn ns_enumerate(ns: u64, index: u64, out: &mut [NsEntry]) -> i64 {
+    // SAFETY: `out` is a live array of `out.len()` entries, which the kernel writes in place.
+    unsafe { syscall4(libkern::SYS_NS_ENUMERATE, ns, index, out.as_mut_ptr() as u64, out.len() as u64) }
 }
 
 /// `sys_process_spawn(&args)` — spawn a child process; returns a `Process` handle.

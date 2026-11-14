@@ -19,7 +19,7 @@ use mappable::Mappable;
 use resolve::Resolve;
 
 use crate::arch::RegisterValues;
-use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
+use crate::libkern::handle::{HandleInfo, KObjectType, NS_ENUMERATE_MAX, NsEntry, RawHandle, Rights};
 use crate::libkern::io_op::{IoOp, IoOpcode};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
 use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
@@ -153,7 +153,7 @@ pub const SYS_THREAD_CREATE: u64 = 19;
 pub const SYS_THREAD_GET_REGISTERS: u64 = 20;
 /// `sys_exception_resume` — resume or terminate a thread suspended on a fault.
 pub const SYS_EXCEPTION_RESUME: u64 = 21;
-/// `sys_ns_create` — create an empty `Namespace`, return a full-rights handle.
+/// `sys_ns_create` — create a `Namespace`, empty or a copy of another; a full-rights handle.
 pub const SYS_NS_CREATE: u64 = 22;
 /// `sys_ns_lookup` — resolve a path in a namespace, return a `PendingOperation`.
 pub const SYS_NS_LOOKUP: u64 = 23;
@@ -171,8 +171,6 @@ pub const SYS_IO_SUBMIT: u64 = 28;
 pub const SYS_NS_ENUMERATE: u64 = 30;
 /// `sys_process_terminate` — **ask** a process to exit (§11h) via a `TerminateRequested` notice.
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
-/// `sys_ns_derive` — a new namespace holding a copy of another's bindings, full-rights handle.
-pub const SYS_NS_DERIVE: u64 = 37;
 /// `sys_power(system_control, op)` — flush every disk, stop every processor, halt or reset.
 pub const SYS_POWER: u64 = 40;
 /// `sys_clock_set(clock, ns)` — set the wall clock, and the RTC under it. Needs `SYSTEM_CLOCK`.
@@ -216,14 +214,13 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_PROCESS_TERMINATE => encode(sys_process_terminate(a0)),
-        SYS_NS_CREATE => encode(sys_ns_create()),
-        SYS_NS_DERIVE => encode(sys_ns_derive(a0)),
+        SYS_NS_CREATE => encode(sys_ns_create(a0)),
         SYS_POWER => encode(sys_power(a0, a1)),
         SYS_CLOCK_SET => encode(sys_clock_set(a0, a1)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, a4)),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
-        SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2)),
+        SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2, a3)),
         SYS_ENTROPY_CREATE => encode(sys_entropy_create()),
         SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
         SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
@@ -652,15 +649,8 @@ pub fn sys_timer_set(timer_h: u64, deadline_ns: u64, interval_ns: u64) -> SysRes
     Ok(0)
 }
 
-/// `sys_ns_create()` — create an empty [`Namespace`]; the handle carries [`namespace_rights`].
-pub fn sys_ns_create() -> SysResult {
-    let obj = Namespace::try_new().map_err(|_| KError::OutOfMemory)?;
-    let pid = crate::sched::current_owner_pid();
-    Ok(install(pid, ObjectRef::new(obj), namespace_rights())?.bits() as isize)
-}
-
-/// `sys_ns_derive(ns)` — create a new [`Namespace`] holding a **copy of `ns`'s bindings** and
-/// return a full-rights handle to it. Requires `LOOKUP` on `ns`.
+/// `sys_ns_create(from)` — create a [`Namespace`], empty if `from` is null, else a **copy of
+/// `from`'s bindings**, which needs `LOOKUP` on it; the handle carries [`namespace_rights`].
 ///
 /// **`LOOKUP` is enough because a copy binds nothing a caller could not already resolve**;
 /// binding into it still needs `BIND_NAMESPACE`. A process's own root arrives `LOOKUP`-only
@@ -668,12 +658,14 @@ pub fn sys_ns_create() -> SysResult {
 /// copy can widen what it reaches**: resolution is longest-prefix, so removing a narrower
 /// binding exposes the broader one beneath it
 /// (`docs/architecture/namespace-and-resource-servers.md`). The copy is a snapshot
-/// ([`Namespace::try_derive`]).
-pub fn sys_ns_derive(ns_h: u64) -> SysResult {
+/// ([`Namespace::try_copy`]).
+pub fn sys_ns_create(from_h: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
-    let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;
-    let obj = ns.try_derive().map_err(|_| KError::OutOfMemory)?;
-    Ok(install(pid, ObjectRef::new(obj), namespace_rights())?.bits() as isize)
+    let obj = match from_h {
+        0 => Namespace::try_new(),
+        from => lookup_as::<Namespace>(from, pid, Rights::LOOKUP)?.try_copy(),
+    };
+    Ok(install(pid, ObjectRef::new(obj.map_err(|_| KError::OutOfMemory)?), namespace_rights())?.bits() as isize)
 }
 
 /// Require the calling process to hold system capability `cap` (`docs/architecture/syscaps.md`),
@@ -773,22 +765,6 @@ pub fn sys_ns_unbind(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
         }
         None => Err(KError::NotFound),
     }
-}
-
-/// `sys_ns_enumerate(ns, index, out)` — write the `index`-th binding of `ns` (insertion order)
-/// to the user [`NsEntry`] at `out`: path, target kind (`NS_KIND_*`) and rights. Requires
-/// `LOOKUP`. Returns `0`, or `NotFound` when `index` is past the binding count (the iteration
-/// terminator). Lists **bindings**, not filesystem `readdir`.
-pub fn sys_ns_enumerate(ns_h: u64, index: u64, out: u64) -> SysResult {
-    let uptr = UserMutPtr::<NsEntry>::new(out).map_err(from_user_access)?;
-    let pid = crate::sched::current_owner_pid();
-    let ns = lookup_as::<Namespace>(ns_h, pid, Rights::LOOKUP)?;
-    let mut entry = NsEntry::zeroed();
-    if !ns.enumerate(index as usize, &mut entry) {
-        return Err(KError::NotFound);
-    }
-    copy_to_user(uptr, &entry).map_err(from_user_access)?;
-    Ok(0)
 }
 
 /// Per-call cap on `sys_entropy_read`; bounds the on-stack bounce buffer.
@@ -1672,6 +1648,7 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
 mod file_ops;
 mod fill;
 mod flush;
+mod listing;
 mod mappable;
 mod memory;
 mod resolve;
@@ -1679,6 +1656,7 @@ mod send;
 mod spawn;
 mod submit;
 use fill::complete_read_range_reply;
+use listing::sys_ns_enumerate;
 use memory::{sys_memory_create, sys_memory_map, sys_memory_unmap};
 use spawn::sys_process_spawn;
 use submit::sys_io_submit;

@@ -148,10 +148,10 @@ fn cmd_mounts(root_ns: u64) {
     let mut i: u64 = 0;
     loop {
         let mut e = NsEntry::zeroed();
-        // SAFETY: `&mut e` is a valid NsEntry out-param.
-        let r = unsafe { syscall3(SYS_NS_ENUMERATE, root_ns, i, (&mut e as *mut NsEntry) as u64) };
-        if r != 0 {
-            break; // NotFound: past the last binding
+        // SAFETY: `&mut e` is a valid array of one NsEntry.
+        let r = unsafe { syscall4(SYS_NS_ENUMERATE, root_ns, i, (&mut e as *mut NsEntry) as u64, 1) };
+        if r != 1 {
+            break; // past the last binding, or a refusal
         }
         let n = (e.path_len as usize).min(NS_ENTRY_PATH_MAX);
         kprint(&e.path[..n]);

@@ -239,6 +239,11 @@ pub fn sleeps() -> u32 {
     with(|m| m.sleeps)
 }
 
+/// `sys_ns_enumerate` calls since the reset.
+pub fn enumerates() -> u32 {
+    with(|m| m.enumerates)
+}
+
 /// How many POs were closed before they signalled.
 pub fn closed_in_flight() -> u32 {
     with(|m| m.closed_in_flight)

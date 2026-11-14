@@ -334,7 +334,7 @@ impl Namespace {
         true
     }
 
-    /// A new namespace holding **a copy of every binding** in this one — `sys_ns_derive`.
+    /// A new namespace holding **a copy of every binding** in this one — `sys_ns_create(from)`.
     ///
     /// **A snapshot, not a view**: the copy owns its binding list, so a later bind or unbind in
     /// either namespace does not reach the other. *Targets* are shared, not duplicated: a direct
@@ -349,7 +349,7 @@ impl Namespace {
     ///
     /// A view is its caller's namespace plus a profile's grants
     /// (`docs/planning/administration.md` § *A view is your namespace plus a profile*).
-    pub fn try_derive(&self) -> Result<KBox<Namespace>, AllocError> {
+    pub fn try_copy(&self) -> Result<KBox<Namespace>, AllocError> {
         let derived = Namespace::try_new()?;
         let mut copied: KVec<Binding> = KVec::new();
         let copy = {
@@ -396,7 +396,7 @@ fn resolve_target(t: &BindingTarget) -> ResolvedTarget {
     }
 }
 
-/// Copy every binding in `from` onto the end of `into`, for [`Namespace::try_derive`]: targets
+/// Copy every binding in `from` onto the end of `into`, for [`Namespace::try_copy`]: targets
 /// shared (handle or registration cloned, kernel-server id copied), bases and rights as they are.
 ///
 /// **Called under the source's lock**: it allocates and clones, and never drops a target. An
@@ -816,7 +816,7 @@ mod tests {
         let base = SubtreeBase::from_path(b"/home/alice").unwrap();
         n.bind_userspace_server(b"/home", reg, Rights::LOOKUP | Rights::WRITE, base).unwrap();
 
-        let d = n.try_derive().unwrap();
+        let d = n.try_copy().unwrap();
         let (t, r, suf) = d.resolve(b"/dev/timer").unwrap();
         assert_eq!((r, suf), (Rights::LOOKUP | Rights::INSPECT, &b""[..]));
         match t {
@@ -843,7 +843,7 @@ mod tests {
         let n = ns();
         n.bind(b"/a", target(), Rights::LOOKUP).unwrap();
         n.bind(b"/b", target(), Rights::LOOKUP).unwrap();
-        let d = n.try_derive().unwrap();
+        let d = n.try_copy().unwrap();
 
         n.bind(b"/c", target(), Rights::LOOKUP).unwrap();
         drop(n.unbind(b"/a").expect("was bound"));
@@ -866,7 +866,7 @@ mod tests {
         n.bind(b"/a", target(), Rights::LOOKUP).unwrap();
         n.bind(b"/b", target(), Rights::LOOKUP).unwrap();
         n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap();
-        let d = n.try_derive().unwrap();
+        let d = n.try_copy().unwrap();
 
         drop(n);
         assert_eq!(test_probe::timer_destroys(), 0, "the copy still binds both timers");
@@ -889,7 +889,7 @@ mod tests {
         let alice = SubtreeBase::from_path(b"/home/alice").unwrap();
         n.bind_userspace_server(b"/home", us_reg_target(), Rights::LOOKUP, alice).unwrap();
 
-        let d = n.try_derive().unwrap();
+        let d = n.try_copy().unwrap();
         drop(d.unbind(b"/home").expect("was bound"));
         match d.resolve(b"/home/bob/x").unwrap() {
             (ResolvedTarget::UserspaceServer(reg, b), _, suf) => {
@@ -913,7 +913,7 @@ mod tests {
         n.bind(b"/dev", target(), Rights::LOOKUP).unwrap();
         let _ = n.resolve(b"/dev/tty0");
         assert_eq!(n.cache_len(), 1, "precondition: the source has a cached entry");
-        let d = n.try_derive().unwrap();
+        let d = n.try_copy().unwrap();
         assert_eq!(d.cache_len(), 0);
         assert!(d.resolve(b"/dev/tty0").is_some());
         assert_eq!(d.cache_len(), 1, "and it caches its own resolutions");

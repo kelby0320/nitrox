@@ -340,6 +340,9 @@ impl HandleInfo {
 /// length is still reported in `path_len`).
 pub const NS_ENTRY_PATH_MAX: usize = 256;
 
+/// The most bindings one `sys_ns_enumerate` writes.
+pub const NS_ENUMERATE_MAX: u64 = 64;
+
 /// [`NsEntry::kind`]: a directly-bound resource handle.
 pub const NS_KIND_DIRECT: u32 = 0;
 /// [`NsEntry::kind`]: an in-kernel resource server (`/dev/blk`, `/dev/entropy`, …).

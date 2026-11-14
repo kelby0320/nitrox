@@ -392,7 +392,7 @@ pub(super) fn auth_multi_client_test(root: Root<'_>) -> bool {
     true
 }
 
-/// Prove `sys_ns_derive` through the syscall, not only through `Namespace::try_derive`, whose host
+/// Prove `sys_ns_create(from)` through the syscall, not only through `Namespace::try_copy`, whose host
 /// tests cannot see the rights check, the handle the syscall allocates, or the rights it carries.
 ///
 /// Four claims, each one a view depends on:
@@ -403,25 +403,25 @@ pub(super) fn auth_multi_client_test(root: Root<'_>) -> bool {
 /// 4. a namespace handle without `LOOKUP` cannot be copied.
 ///
 /// `/subtreetest` is the test image's own `[[bind]]`, already resolved by `subtree_bind_test`.
-pub(super) fn ns_derive_test(root: Root<'_>) -> bool {
+pub(super) fn ns_copy_test(root: Root<'_>) -> bool {
     const PATH: &str = "/subtreetest/current-generation";
     let d = match root.copy() {
         Ok(d) => d,
         Err(e) => {
-            Line::new().s(b"boot-probe: ns derive FAIL (").i(i64::from(e.code().as_i32())).s(b")").end();
+            Line::new().s(b"boot-probe: ns copy FAIL (").i(i64::from(e.code().as_i32())).s(b")").end();
             return false;
         }
     };
     let mut ok = true;
 
     if lookup::<File, MapRead, _>(&d, PATH, Rights::MAP_READ).is_err() {
-        log::write(b"boot-probe: ns derive: the copy does not resolve what the root does FAIL\n");
+        log::write(b"boot-probe: ns copy: the copy does not resolve what the root does FAIL\n");
         ok = false;
     }
 
     let want = Rights::TRANSFER.bits() | Rights::UNBIND.bits();
     if !d.stat().is_ok_and(|info| info.rights & want == want) {
-        log::write(b"boot-probe: ns derive: the copy cannot be sent or pruned FAIL\n");
+        log::write(b"boot-probe: ns copy: the copy cannot be sent or pruned FAIL\n");
         ok = false;
     }
 
@@ -431,24 +431,24 @@ pub(super) fn ns_derive_test(root: Root<'_>) -> bool {
     let (copy_resolves, root_resolves) = (in_copy.is_ok(), in_root.is_ok());
     drop((in_copy, in_root));
     if unbound.is_err() || copy_resolves {
-        log::write(b"boot-probe: ns derive: unbinding in the copy did not take FAIL\n");
+        log::write(b"boot-probe: ns copy: unbinding in the copy did not take FAIL\n");
         ok = false;
     }
     if !root_resolves {
-        log::write(b"boot-probe: ns derive: unbinding in the copy reached the root FAIL\n");
+        log::write(b"boot-probe: ns copy: unbinding in the copy reached the root FAIL\n");
         ok = false;
     }
 
     // A handle to the same copy with everything but `LOOKUP`.
     let refused = d.duplicate(Rights::from_bits(!Rights::LOOKUP.bits())).is_ok_and(|blind| blind.copy().is_err());
     if !refused {
-        log::write(b"boot-probe: ns derive: copied a handle without LOOKUP FAIL\n");
+        log::write(b"boot-probe: ns copy: copied a handle without LOOKUP FAIL\n");
         ok = false;
     }
 
     drop(d);
     if ok {
-        log::write(b"boot-probe: ns derive: a sendable snapshot, pruned without touching the root ok\n");
+        log::write(b"boot-probe: ns copy: a sendable snapshot, pruned without touching the root ok\n");
     }
     ok
 }

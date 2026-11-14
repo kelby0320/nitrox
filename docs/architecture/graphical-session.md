@@ -248,7 +248,7 @@ that now is cheaper than discovering it is impossible later.
 
 `view-broker` (administration Part A, 2026-09-23) also serves and holds `BIND_NAMESPACE`, and it
 reconciles the same way: it binds only into namespaces it *created* — each view a copy it made of
-the namespace its caller sent, via `sys_ns_derive` — and it never registers itself (`service-mgr`
+the namespace its caller sent, via `sys_ns_create(from)` — and it never registers itself (`service-mgr`
 binds it at `/svc/views`). Its constructing is narrower than the shell's, since it adds one
 profile's grants to a namespace that already exists rather than composing one from endpoints. What a
 bug in it reaches is set out in [`administration.md`](../planning/administration.md) § *Why one

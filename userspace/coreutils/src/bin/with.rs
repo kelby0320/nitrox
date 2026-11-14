@@ -8,7 +8,7 @@
 //! with the `views` grant binds, so outside one they say which view to use.
 //!
 //! **What `with` never gets is the authority.** It sends the view broker a *copy* of its own
-//! namespace (`sys_ns_derive`); the broker builds the view there, and the program runs in a
+//! namespace (`sys_ns_create(from)`); the broker builds the view there, and the program runs in a
 //! namespace `with` holds no handle to. `with` relays: its streams move to the program, and what
 //! comes back is an exit status.
 //!

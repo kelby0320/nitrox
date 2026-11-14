@@ -151,6 +151,7 @@ struct Mock {
     clock_answer: Option<i64>,
     clock: u64,
     sleeps: u32,
+    enumerates: u32,
     submits: u32,
     waits: u32,
     closes: u32,
@@ -671,21 +672,17 @@ pub fn channel_recv(ch: u64, msg: &mut IpcMsg, handles: &mut [u64; IPC_HANDLE_MA
     })
 }
 
-pub fn ns_create() -> i64 {
+pub fn ns_create(from: u64) -> i64 {
     with(|m| {
+        let copy = match from {
+            0 => Vec::new(),
+            from => match m.namespace(from, Rights::LOOKUP) {
+                Ok(src) => m.bindings(src).clone(),
+                Err(r) => return r,
+            },
+        };
         let rights = Rights::LOOKUP | Rights::BIND | Rights::UNBIND | Rights::DUPLICATE | Rights::TRANSFER;
-        m.mint(Object::Namespace(Vec::new()), rights | Rights::INSPECT)
-    })
-}
-
-pub fn ns_derive(ns: u64) -> i64 {
-    with(|m| match m.namespace(ns, Rights::LOOKUP) {
-        Ok(src) => {
-            let copy = m.bindings(src).clone();
-            let rights = Rights::LOOKUP | Rights::BIND | Rights::UNBIND | Rights::DUPLICATE | Rights::TRANSFER;
-            m.mint(Object::Namespace(copy), rights | Rights::INSPECT)
-        }
-        Err(r) => r,
+        m.mint(Object::Namespace(copy), rights | Rights::INSPECT)
     })
 }
 
@@ -762,19 +759,27 @@ pub fn ns_unbind(ns: u64, path: &[u8]) -> i64 {
     })
 }
 
-pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
+pub fn ns_enumerate(ns: u64, index: u64, out: &mut [NsEntry]) -> i64 {
     with(|m| {
+        m.enumerates += 1;
+        if out.is_empty() || out.len() as u64 > libkern::NS_ENUMERATE_MAX {
+            return e(KError::InvalidArgument);
+        }
         let ns = match m.namespace(ns, Rights::LOOKUP) {
             Ok(o) => o,
             Err(r) => return r,
         };
-        let Some(Binding { path, rights, .. }) = m.bindings(ns).get(index as usize) else { return e(KError::NotFound) };
-        *out = NsEntry::zeroed();
-        let n = path.len().min(out.path.len());
-        out.path[..n].copy_from_slice(&path[..n]);
-        out.path_len = path.len() as u32;
-        out.rights = *rights;
-        0
+        let from = m.bindings(ns).iter().skip(index as usize);
+        let mut written = 0;
+        for (Binding { path, rights, .. }, out) in from.zip(out.iter_mut()) {
+            *out = NsEntry::zeroed();
+            let n = path.len().min(out.path.len());
+            out.path[..n].copy_from_slice(&path[..n]);
+            out.path_len = path.len() as u32;
+            out.rights = *rights;
+            written += 1;
+        }
+        written
     })
 }
 

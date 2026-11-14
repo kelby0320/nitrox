@@ -55,7 +55,9 @@ pub const SYS_THREAD_CREATE: u64 = 19;
 pub const SYS_THREAD_GET_REGISTERS: u64 = 20;
 /// `sys_exception_resume` — resume or terminate a thread suspended on a fault.
 pub const SYS_EXCEPTION_RESUME: u64 = 21;
-/// `sys_ns_create` — create an empty `Namespace`, return a full-rights handle.
+/// `sys_ns_create(from)` — create a `Namespace`, empty if `from` is null, else a **snapshot of
+/// `from`'s bindings** (so it can be transferred, which a process's own root cannot), which needs
+/// `LOOKUP` on `from`. A full-rights handle.
 pub const SYS_NS_CREATE: u64 = 22;
 /// `sys_ns_lookup` — resolve a path in a namespace, return a `PendingOperation`.
 pub const SYS_NS_LOOKUP: u64 = 23;
@@ -69,15 +71,12 @@ pub const SYS_ENTROPY_CREATE: u64 = 26;
 pub const SYS_ENTROPY_READ: u64 = 27;
 /// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
 pub const SYS_IO_SUBMIT: u64 = 28;
-/// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
+/// `sys_ns_enumerate(ns, index, out, count)` — up to `count` of a namespace's bindings from
+/// `index`, at most [`NS_ENUMERATE_MAX`](crate::NS_ENUMERATE_MAX): how many it wrote.
 pub const SYS_NS_ENUMERATE: u64 = 30;
 /// `sys_process_terminate` — **ask** a process to exit; it is delivered as a
 /// `TerminateRequested` notification and nothing stops a process that ignores it (§11h).
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
-/// `sys_ns_derive(ns)` — a new namespace holding a **snapshot of `ns`'s bindings**, returned with
-/// full namespace rights (so it can be transferred, which a process's own root cannot). Requires
-/// `LOOKUP` on `ns`.
-pub const SYS_NS_DERIVE: u64 = 37;
 /// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt
 /// ([`POWER_HALT`]) or reset ([`POWER_REBOOT`]). Needs `WRITE` on the system-control object,
 /// which only `init` holds, and **returns only to refuse**.
