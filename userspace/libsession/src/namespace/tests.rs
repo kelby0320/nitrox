@@ -85,11 +85,11 @@ fn bare<'a>() -> Members<'a> {
     }
 }
 
-/// A root namespace with a console and a generator bound that a lookup of `READ | TRANSFER` finds.
+/// A root namespace with a console and a generator bound that a direct bind's lookup finds.
 fn root_with_console() -> Handle<Namespace, NsMutable> {
     let root = Handle::<Namespace, NsMutable>::create().unwrap();
     for (path, raw) in [("/dev/console", mock::device()), ("/dev/entropy", mock::entropy_node())] {
-        let node = mock::with_rights(raw, Rights::READ | Rights::TRANSFER);
+        let node = mock::with_rights(raw, Rights::READ | DIRECT);
         // SAFETY: a handle the mock has just made, which nothing else holds.
         let node = unsafe { Handle::<Resource, ReadOnly>::from_raw(RawHandle(node), Rights::empty()) };
         root.bind(path, &node).unwrap();
@@ -156,8 +156,8 @@ fn a_session_binds_each_member_to_its_own_endpoint() {
         }
         assert_eq!(mock::bound_base(built.ns.raw().0, path).as_deref(), Some(base.as_bytes()), "{path}'s base");
     }
-    assert_eq!(rights_of(&es, "/dev/console"), (Rights::READ | Rights::TRANSFER).bits());
-    assert_eq!(rights_of(&es, "/dev/entropy"), (Rights::READ | Rights::TRANSFER).bits());
+    assert_eq!(rights_of(&es, "/dev/console"), (Rights::READ | DIRECT).bits());
+    assert_eq!(rights_of(&es, "/dev/entropy"), (Rights::READ | DIRECT).bits());
     let want = Bound {
         bin: true,
         tty: true,

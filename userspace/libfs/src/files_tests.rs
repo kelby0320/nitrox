@@ -289,15 +289,18 @@ fn creating_a_file_is_idempotent_and_keeps_what_it_holds() {
     assert_eq!(get(&ns, "/f"), b"kept");
 }
 
-/// A server's table, as `librsproto::server` hands it on, is a file this crate can read.
+/// A server's table, as `librsproto::server` hands it on, is a file this crate can read through a
+/// namespace whose server answers with it.
 #[test]
 fn a_served_table_reads_back() {
-    use libos::{Channel, Memory, Msg, Only};
-    let ns = fresh();
+    use libos::{Channel, Memory, Msg, NsReadOnly, Only};
+    let _ = fresh();
     let (ours, peer) = Handle::<Channel, Only>::pair(2).unwrap();
     assert!(librsproto::server::reply_object(&ours, 1, b"a table"));
     let table: Handle<Memory, libos::MapRead> = peer.recv(&mut Msg::new()).unwrap().take(0).unwrap();
-    ns.bind("/t", &table).unwrap();
+    let served = mock::answering_with("/t", table.into_raw().0);
+    // SAFETY: a namespace the mock has just made, which nothing else holds.
+    let ns = unsafe { Handle::<Namespace, NsReadOnly>::from_raw(libkern::RawHandle(served), Rights::LOOKUP) };
     assert_eq!(file_len(&ns, "/t"), Some(4096));
-    assert_eq!(unpadded(&get(&ns, "/t")), b"a table");
+    assert_eq!(unpadded(&read(&ns, "/t").unwrap()), b"a table");
 }

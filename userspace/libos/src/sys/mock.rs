@@ -733,7 +733,7 @@ pub fn ns_bind(ns: u64, path: &[u8], resource: u64, base: &[u8]) -> i64 {
             if !base.is_empty() {
                 return e(KError::InvalidArgument);
             }
-            if !Rights::from_bits(rights).contains(Rights::TRANSFER) {
+            if !Rights::from_bits(rights).contains(Rights::TRANSFER | Rights::DUPLICATE) {
                 return e(KError::NoAccess);
             }
         }

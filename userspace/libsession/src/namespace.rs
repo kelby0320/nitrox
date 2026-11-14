@@ -65,6 +65,9 @@ pub struct Members<'a> {
     pub desktop_endpoint: Option<Ref<'a, Channel, Only>>,
 }
 
+/// What a direct-handle bind needs of the handle bound: it leaves its holder, and is a copy.
+pub(crate) const DIRECT: Rights = Rights::from_bits(Rights::TRANSFER.bits() | Rights::DUPLICATE.bits());
+
 /// Which optional members a namespace built from [`Members`] bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bound {
@@ -236,7 +239,7 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
     // graphical session** (see [`Members::bind_console`]): the console is shared.
     if bind_console
         && let Some(root) = root_ns
-        && let Ok(console) = resolve::<Resource, ReadOnly, _>(root, "/dev/console", Rights::READ | Rights::TRANSFER)
+        && let Ok(console) = resolve::<Resource, ReadOnly, _>(root, "/dev/console", DIRECT | Rights::READ)
     {
         bound.console = ns.bind("/dev/console", &console).is_ok();
         if !bound.console {
@@ -247,7 +250,7 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
     // in **every namespace this builds**: random bytes, and nothing else, which every process could
     // read before the generator was a node. Non-fatal.
     if let Some(root) = root_ns {
-        let node = resolve::<Resource, ReadOnly, _>(root, "/dev/entropy", Rights::READ | Rights::TRANSFER);
+        let node = resolve::<Resource, ReadOnly, _>(root, "/dev/entropy", DIRECT | Rights::READ);
         bound.entropy = node.is_ok_and(|node| ns.bind("/dev/entropy", &node).is_ok());
         if !bound.entropy {
             log::write(b"libsession: /dev/entropy bind FAIL (no random bytes in this namespace)\n");
@@ -279,9 +282,8 @@ fn bind_session_user(ns: &Handle<Namespace, NsMutable>, user: &[u8]) {
         log::write(b"libsession: /session/user map FAIL\n");
         return;
     }
-    // A reader's rights, and the `TRANSFER` a direct bind needs.
-    let snapshot =
-        mem.duplicate(Rights::MAP_READ | Rights::INSPECT | Rights::TRANSFER).and_then(Handle::into_read_only);
+    // A reader's rights, and the two a direct bind needs.
+    let snapshot = mem.duplicate(DIRECT | Rights::MAP_READ | Rights::INSPECT).and_then(Handle::into_read_only);
     if snapshot.and_then(|s| ns.bind("/session/user", &s)).is_err() {
         log::write(b"libsession: /session/user bind FAIL (whoami will report no identity)\n");
     }

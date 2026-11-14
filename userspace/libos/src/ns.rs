@@ -244,12 +244,14 @@ mod tests {
     }
 
     #[test]
-    fn a_bind_needs_transfer_and_a_path_bound_once() {
+    fn a_bind_needs_transfer_and_duplicate_and_a_path_bound_once() {
         sys::reset();
         let ns = ns();
         let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap().without_transfer().unwrap();
         assert_eq!(ns.bind("/m", &mem).err().unwrap().code(), KError::NoAccess);
         let mem = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        let no_copy = mem.duplicate(Rights::MAP_READ | Rights::TRANSFER).unwrap();
+        assert_eq!(ns.bind("/m", &no_copy).err().unwrap().code(), KError::NoAccess, "a bind is a copy");
         ns.bind("/m", &mem).unwrap();
         assert_eq!(ns.bind("/m", &mem).err().unwrap().code(), KError::AlreadyExists);
         sys::fail_next_bind(KError::NoAccess as i32);

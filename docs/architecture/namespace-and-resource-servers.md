@@ -665,9 +665,10 @@ Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
   `index`-th, at most 64, written to an array: how many. Needs `LOOKUP`.
 - **`sys_ns_bind(ns, path, path_len, resource) -> 0`** — bind `resource` (a direct
   handle in slice 1; a userspace-server endpoint in slice 7) at `path`. Needs `BIND`
-  on `ns` and the `BIND_NAMESPACE` syscap, and **a direct handle needs `TRANSFER`**:
-  every resolve of the binding mints a handle to the object, so a bind gives it away as a
-  send does (PR #342 review, 2026-09-29). In-kernel `KernelServer`
+  on `ns` and the `BIND_NAMESPACE` syscap, and **a direct handle needs `TRANSFER` and
+  `DUPLICATE`**: every resolve of the binding mints a handle to the object, so a bind gives it
+  away as a send does (PR #342 review, 2026-09-29), and the binder keeps its own, so it is a
+  copy (2026-11-13). In-kernel `KernelServer`
   bindings are made by the kernel at boot, not through this syscall.
 - **`sys_ns_unbind(ns, path, path_len) -> 0`** — remove the binding at `path`. Needs
   `UNBIND`.

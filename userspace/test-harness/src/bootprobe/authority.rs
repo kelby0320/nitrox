@@ -233,9 +233,10 @@ pub(super) fn lookup_po_stays_test(root: Root<'_>) -> bool {
 /// to the object for whoever asked: without it, `init` could publish its system-control object,
 /// whose handle carries no `TRANSFER` so that it cannot leave `init`.
 ///
-/// A memory object's handle, duplicated without `TRANSFER`, is refused `NoAccess`, and the
-/// original, with it, is taken — in the same namespace, so the refusal is the right's.
-pub(super) fn bind_needs_transfer_test() -> bool {
+/// A memory object's handle, duplicated without `TRANSFER` or without `DUPLICATE`, is refused
+/// `NoAccess`, as a bind gives it away and is a copy, and the original, with both, is taken — in
+/// the same namespace, so each refusal is the right's.
+pub(super) fn bind_needs_transfer_and_duplicate_test() -> bool {
     use libkern::KError;
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: bind FAIL: ").s(why).end();
@@ -246,18 +247,24 @@ pub(super) fn bind_needs_transfer_test() -> bool {
     let (Ok(ns), Ok(mem)) = (ns, mem) else {
         return fail(b"no namespace or memory object to bind");
     };
-    let kept = mem.duplicate(Rights::MAP_READ | Rights::INSPECT);
-    let refused =
-        kept.as_ref().is_ok_and(|kept| matches!(ns.bind("/kept", kept), Err(e) if e.code() == KError::NoAccess));
+    let refused = |rights: Rights| {
+        let held = mem.duplicate(rights);
+        held.as_ref().is_ok_and(|held| matches!(ns.bind("/held", held), Err(e) if e.code() == KError::NoAccess))
+    };
+    let (kept, uncopied) =
+        (refused(Rights::MAP_READ | Rights::DUPLICATE), refused(Rights::MAP_READ | Rights::TRANSFER));
     let taken = ns.bind("/given", &mem).is_ok();
-    drop((ns, mem, kept));
-    if !refused {
+    drop((ns, mem));
+    if !kept {
         return fail(b"a handle without TRANSFER was not refused NoAccess");
     }
-    if !taken {
-        return fail(b"a handle with TRANSFER was not bound");
+    if !uncopied {
+        return fail(b"a handle without DUPLICATE was not refused NoAccess");
     }
-    log::write(b"boot-probe: a direct bind needs TRANSFER: refused without it, taken with it ok\n");
+    if !taken {
+        return fail(b"a handle with TRANSFER and DUPLICATE was not bound");
+    }
+    log::write(b"boot-probe: a direct bind needs TRANSFER and DUPLICATE: refused without either, taken with both ok\n");
     true
 }
 

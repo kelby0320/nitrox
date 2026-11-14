@@ -200,7 +200,9 @@ fn the_system_control_handle_cannot_be_given_away() {
     assert!(t.duplicate(h, 1, Rights::WRITE).is_err(), "a duplicate is refused");
     let held = t.lookup(h, 1, Rights::empty()).unwrap().rights;
     assert_eq!(direct_bindable(held), Err(KError::NoAccess), "and so is a bind");
-    assert_eq!(direct_bindable(held | Rights::TRANSFER), Ok(()), "which TRANSFER would allow");
+    assert_eq!(direct_bindable(held | Rights::TRANSFER), Err(KError::NoAccess), "a copy wants DUPLICATE");
+    assert_eq!(direct_bindable(held | Rights::DUPLICATE), Err(KError::NoAccess), "and to leave, TRANSFER");
+    assert_eq!(direct_bindable(held | Rights::TRANSFER | Rights::DUPLICATE), Ok(()), "which both allow");
     drop(t.close(h, 1).unwrap());
 }
 

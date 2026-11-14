@@ -140,12 +140,18 @@ pub fn verdicts() -> Vec<u64> {
 pub fn answering(path: &str) -> (u64, u64) {
     let mut ends = [0; 2];
     channel_create(4, &mut ends);
+    (answering_with(path, ends[0]), ends[1])
+}
+
+/// A namespace whose server at `path` answers each lookup at once with the object `handle` names,
+/// which moves into it, as a server's reply hands its resolver what it serves.
+pub fn answering_with(path: &str, handle: u64) -> u64 {
     with(|m| {
-        let (ours, _) = m.table[&ends[0]];
-        m.table.remove(&ends[0]);
-        let server = m.object(Object::Answers(ours));
+        let (target, _) = m.table[&handle];
+        m.table.remove(&handle);
+        let server = m.object(Object::Answers(target));
         let ns = m.object(Object::Namespace(vec![Binding::new(path.as_bytes(), server, u64::MAX)]));
-        (m.install(ns, Rights::LOOKUP.bits()), ends[1])
+        m.install(ns, Rights::LOOKUP.bits())
     })
 }
 

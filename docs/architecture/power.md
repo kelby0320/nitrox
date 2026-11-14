@@ -19,11 +19,11 @@ carries `WRITE`, which `sys_power` requires, and `INSPECT`, and neither `DUPLICA
   spawn grant and a direct-handle bind each need `TRANSFER`;
 - so it is bound in no namespace, and no lookup yields it.
 
-The bind was the gap the PR #342 review found: `sys_ns_bind` asked for no right on a direct
-handle, so `init` could have published the object at a path anyone resolving it would get a
-`WRITE` handle from. A direct-handle bind needs `TRANSFER` since then, for every object — a bind
-gives the object away as a send does ([`syscall-abi.md`](../spec/syscall-abi.md) §
-Namespace).
+The bind was the gap the PR #342 review found: `sys_ns_bind` asked for no right on a direct handle,
+so `init` could have published the object at a path anyone resolving it would get a `WRITE` handle
+from. A direct-handle bind needs `TRANSFER` since then, and `DUPLICATE` since 2026-11-13, for every
+object — a bind gives the object away as a send does, and is a copy
+([`syscall-abi.md`](../spec/syscall-abi.md) § Namespace).
 
 So the process that stops the machine is the one the kernel started first. That is deliberate:
 `init` mounted the root, and a shutdown's last steps are its own — its mounts written back and

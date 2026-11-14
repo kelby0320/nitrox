@@ -83,7 +83,7 @@ fn a_device_is_handed_on_with_its_info_and_its_rights() {
     let es = entries(to.as_ref());
     assert_eq!(paths(&es), ["/dev/blk/0", "/dev/blk/0/info", "/dev/blk/1"]);
     assert_eq!(es[0].1, DEVICE.bits());
-    assert_eq!(es[1].1, (Rights::MAP_READ | Rights::TRANSFER).bits());
+    assert_eq!(es[1].1, (Rights::MAP_READ | crate::namespace::DIRECT).bits());
     assert_eq!(es[2].1, DEVICE.bits());
     assert_eq!((mock::open_handles(), mock::mappings()), before, "the handles and the mapping are given back");
     assert!(mock::logged().ends_with(b"libsession: 2 block device(s) handed to a namespace\n"));

@@ -1841,16 +1841,6 @@ disk that is not removable. An internal disk is partitioned by `nxinstall`, whic
 table again, as the hub thread does a stick's. **Trigger**: a second internal disk someone wants to
 use without a reboot.
 
-**A direct bind is a copy that needs no `DUPLICATE` — `TODO(direct-bind-copy)`.** `sys_ns_bind`
-binds a handle directly with `TRANSFER` alone (`direct_bindable`), and the binder keeps its handle,
-so the object then has two holders, which is a copy. The rule for moves (2026-10-28,
-`handle-system.md` § Moves) says a copy needs `DUPLICATE` too, so a supervisor holding a
-`TRANSFER`-only handle could bind it and then move it. A bind gave the object away by the earlier
-decision, and only a supervisor holding `BIND_NAMESPACE` binds. Found by PR #403's review. Deferred
-by the maintainer: asking for `DUPLICATE` changes what a supervisor may bind, and every in-tree
-direct bind must be checked first. **Trigger**: the syscall surface's pass in Part E, or a bind
-found copying a handle its holder could not duplicate.
-
 **ext4 with blocks smaller than a page — `TODO(ext4-subpage-runs)`.** The kernel fills a page as one
 device range from the page's first block, and writes it back the same way, so a page must lie
 within one run. FAT's server makes that so by refusing small clusters; **`fs-server-ext4` does not
@@ -2563,6 +2553,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A direct bind, a copy that needed no `DUPLICATE` (`direct-bind-copy`) | 2026-11-13 | **Pre-Phase-7 E.9**: `sys_ns_bind` asks `TRANSFER` and `DUPLICATE` of a direct handle, once every in-tree direct bind was checked: five now ask their source for `DUPLICATE` too, `libsession`'s console, generator, `/session/user` and a disk's info leaf, and the view broker's kernel log. A binding so carries `DUPLICATE`, which grants a resolver nothing a second resolve would not. |
 | A copy of a file over 8 MiB (`copy-limit`) | 2026-11-13 | **Pre-Phase-7 E.8**: a copy is `sys_io_submit(destination, Write, buffer = source file)`, a window of 16 MiB at a time with `IO_NOCACHE`, which lets each window's pages go once it is on the device, so `libfs` copies a file of any size the wire carries, 4 GiB less a byte, holding two windows at most. `check-copy` copies 512 MiB in a machine of 256 MiB. Widening the 32-bit size is a change of its own: a 5 GiB file answers `TooLarge` at the destination's create. |
 | A thread's stack with no guard below it (`thread-stack-guard`) | 2026-11-13 | **Pre-Phase-7 E.6**: a mapping placed without a hint keeps an unmapped page below itself, and below the mapping above it, so a `libos::thread::Stack` that overruns faults rather than write the mapping beneath. A hinted mapping is not held off that page. |
 | A handle's rights checked against the tag its caller passes (`handle-install-tag`) | 2026-11-06 | **`HandleTable::install(pid, ObjectRef, rights)`, pre-Phase-7 J.3**: the tag is the reference's own, its object's header's, and the reference comes back with a refusal. `allocate`, which took a tag beside a raw pointer, is private to the table and `unsafe`, so no caller writes a tag. |

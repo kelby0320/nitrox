@@ -669,19 +669,19 @@ fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
     if proc.syscaps().contains(cap) { Ok(()) } else { Err(KError::NoAccess) }
 }
 
-/// Whether a handle carrying `rights` may be bound as a **direct handle**: only one that may
-/// leave its process, so `NoAccess` without `TRANSFER`. A direct bind gives the object away
-/// (every resolve mints a handle to it), as an IPC send and a spawn grant do; `init`'s
-/// system-control object carries no `TRANSFER` so it cannot leave `init`. A **userspace-server**
-/// bind needs no right: the kernel keeps the endpoint. A bind is a copy: TODO(direct-bind-copy).
+/// Whether a handle carrying `rights` may be bound as a **direct handle**: `NoAccess` without
+/// `TRANSFER` and `DUPLICATE`. A direct bind gives the object away (every resolve mints a handle to
+/// it), as an IPC send and a spawn grant do, and the binder keeps its own, which makes it a copy;
+/// `init`'s system-control object carries neither, so it cannot leave `init`. A
+/// **userspace-server** bind needs no right: the kernel keeps the endpoint.
 fn direct_bindable(rights: Rights) -> Result<(), KError> {
-    if rights.contains(Rights::TRANSFER) { Ok(()) } else { Err(KError::NoAccess) }
+    if rights.contains(Rights::TRANSFER | Rights::DUPLICATE) { Ok(()) } else { Err(KError::NoAccess) }
 }
 
 /// `sys_ns_bind(ns, path, path_len, resource, base, base_len)` — bind `resource` at `path` in
 /// namespace `ns`: an `IpcChannel` as a userspace server, anything else as a direct handle.
-/// Requires `BIND` on `ns`, the `BIND_NAMESPACE` syscap, and, for a direct handle, `TRANSFER`
-/// ([`direct_bindable`]). The binding takes a **clone** of the resource's reference (the caller's
+/// Requires `BIND` on `ns`, the `BIND_NAMESPACE` syscap, and, for a direct handle, `TRANSFER` and
+/// `DUPLICATE` ([`direct_bindable`]). The binding takes a **clone** of the resource's reference (the caller's
 /// handle stays valid) and caps its rights at the handle's current rights. Returns 0.
 pub fn sys_ns_bind(
     ns_h: u64,
