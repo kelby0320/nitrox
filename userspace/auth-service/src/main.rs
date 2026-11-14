@@ -319,7 +319,7 @@ fn serve_admin_request(store: &mut Store, ch: &Endpoint, req: &[u8]) {
         _ => &[],
     };
     let needs_salt = matches!(m.op, OP_AUTH_ADD | OP_AUTH_SET_PASSWORD);
-    let salt = if needs_salt { fresh_salt() } else { Some([0u8; libusers::SALT_LEN]) };
+    let salt = if needs_salt { fresh_salt(&store.root) } else { Some([0u8; libusers::SALT_LEN]) };
     let Some(salt) = salt else {
         return refuse_admin(ch, m.op, m.request_id, name, KError::IoError, b"no entropy for a salt");
     };
@@ -363,10 +363,11 @@ fn refuse_admin(ch: &Endpoint, op: u16, request_id: u64, name: &[u8], err: KErro
     server::reply_error(ch, op, request_id, err, why);
 }
 
-/// A new password's salt, from the kernel's generator; `None` if it cannot be made or fails.
-fn fresh_salt() -> Option<[u8; libusers::SALT_LEN]> {
+/// A new password's salt, from the kernel's generator `root` binds; `None` if it cannot be made
+/// or fails.
+fn fresh_salt(root: &Handle<Namespace, NsReadOnly>) -> Option<[u8; libusers::SALT_LEN]> {
     let mut salt = [0u8; libusers::SALT_LEN];
-    entropy::fill(&mut salt).ok().map(|()| salt)
+    entropy::fill(root, &mut salt).ok().map(|()| salt)
 }
 
 /// **Replace `/system/users` with `bytes`, atomically.** A leftover `users.new`, from a write that

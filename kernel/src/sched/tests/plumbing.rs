@@ -79,16 +79,6 @@ fn a_bag_deferring_past_its_size_ends_the_machine() {
     g.defer(b);
 }
 
-/// Give the global `deferred_drops` the reserve `init` gives it, which no host test runs.
-fn reserve_deferred_drops() {
-    let fresh = Reserved::with_capacity(DEFERRED_DROP_RESERVE).unwrap();
-    let spare = {
-        let mut g = SCHED.lock();
-        if g.deferred_drops.capacity() == 0 { core::mem::replace(&mut g.deferred_drops, fresh) } else { fresh }
-    };
-    drop(spare);
-}
-
 fn take_parked(mine: &[*mut ()]) -> std::vec::Vec<ObjectRef> {
     let mut parked = std::vec::Vec::new();
     let mut g = SCHED.lock();

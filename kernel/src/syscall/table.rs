@@ -38,7 +38,7 @@ use crate::object::kernel_server::{self, OpStatus};
 use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, SubtreeBase, validate_path};
 use crate::object::userspace_server::{Forward, ForwardOp};
 use crate::object::{
-    BlockSendOutcome, DeviceNode, EntropyObject, FileObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace,
+    BlockSendOutcome, DeviceNode, FileObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace,
     NotificationChannel, NsError, ObjectRef, PendingOperation, Process, ReclaimedSend, RecvState, SendOutcome,
     StoredMsg, Timer as TimerObject, TransferRef, UserspaceServerReg,
 };
@@ -161,10 +161,6 @@ pub const SYS_NS_LOOKUP: u64 = 23;
 pub const SYS_NS_BIND: u64 = 24;
 /// `sys_ns_unbind` — remove the binding at a path in a namespace.
 pub const SYS_NS_UNBIND: u64 = 25;
-/// `sys_entropy_create` — create an `EntropyObject` handle onto the kernel CSPRNG.
-pub const SYS_ENTROPY_CREATE: u64 = 26;
-/// `sys_entropy_read` — fill a buffer with CSPRNG output (or return a PO if unseeded).
-pub const SYS_ENTROPY_READ: u64 = 27;
 /// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
 pub const SYS_IO_SUBMIT: u64 = 28;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
@@ -221,8 +217,6 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2, a3)),
-        SYS_ENTROPY_CREATE => encode(sys_entropy_create()),
-        SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
         SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Test build only: end the QEMU run with the caller's verdict. Without `isa-debug-exit`
@@ -765,66 +759,6 @@ pub fn sys_ns_unbind(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
         }
         None => Err(KError::NotFound),
     }
-}
-
-/// Per-call cap on `sys_entropy_read`; bounds the on-stack bounce buffer.
-const ENTROPY_READ_MAX: usize = 256;
-
-fn entropy_rights() -> Rights {
-    Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER
-}
-
-/// `sys_entropy_create()` — create an [`EntropyObject`] token onto the kernel CSPRNG.
-pub fn sys_entropy_create() -> SysResult {
-    let obj = EntropyObject::try_new().map_err(|_| KError::OutOfMemory)?;
-    let pid = crate::sched::current_owner_pid();
-    Ok(install(pid, ObjectRef::new(obj), entropy_rights())?.bits() as isize)
-}
-
-/// `sys_entropy_read(ent, buf, len)` — fill `buf[0..len]` with CSPRNG output. Requires `READ`
-/// on `ent`. `len` is capped at [`ENTROPY_READ_MAX`].
-///
-/// Returns `0` when filled synchronously (the common case: the pool seeds at boot). A
-/// **positive** value is a [`PendingOperation`] handle: the pool is not yet seeded (hardware
-/// without `RDSEED`/`RDRAND`), so the caller `sys_wait`s on it and **re-reads**. A negative
-/// value is a [`KError`]; handles are ≥ 1, so the cases are unambiguous.
-pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
-    if len == 0 {
-        return Ok(0);
-    }
-    if len > ENTROPY_READ_MAX {
-        return Err(KError::TooLarge);
-    }
-    let pid = crate::sched::current_owner_pid();
-    let _ent = lookup_as::<EntropyObject>(ent_h, pid, Rights::READ)?;
-    let uptr = UserMutPtr::<u8>::new(buf_ptr).map_err(from_user_access)?;
-
-    if crate::entropy::is_seeded() {
-        // Wipe the bounce buffer so no entropy lingers on the kernel stack.
-        let mut buf = [0u8; ENTROPY_READ_MAX];
-        crate::entropy::fill(&mut buf[..len]);
-        let r = copy_slice_to_user(uptr, &buf[..len]).map_err(from_user_access);
-        buf.iter_mut().for_each(|b| *b = 0);
-        r?;
-        return Ok(0);
-    }
-
-    let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    let po_ref = Ref::new(po);
-    let po_h = install(pid, po_ref.clone().erase(), pending_op_rights())?;
-    match crate::entropy::register_seed_waiter(po_ref.clone()) {
-        crate::entropy::SeedWaitReg::Queued => {}
-        crate::entropy::SeedWaitReg::AlreadySeeded(r) => {
-            crate::sched::complete_pending_op(&po_ref, 0, 0);
-            drop(r);
-        }
-        crate::entropy::SeedWaitReg::Full(r) => {
-            // Too many concurrent unseeded readers: `WouldBlock` is the status the caller reads.
-            crate::sched::complete_pending_op(&po_ref, KError::WouldBlock as i32, 0);
-            drop(r);
-        }
-    }
-    Ok(po_h.bits() as isize)
 }
 
 /// `sys_ns_lookup(ns, path, path_len, rights, op)` — resolve `path` in `ns` (longest-prefix match),

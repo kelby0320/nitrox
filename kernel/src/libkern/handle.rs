@@ -256,8 +256,6 @@ pub enum KObjectType {
     PendingOperation = 9,
     /// An I/O ring.
     IoRing = 10,
-    /// The entropy source.
-    EntropyObject = 11,
     /// A device node.
     DeviceNode = 12,
     /// A userspace resource-server registration.
@@ -285,7 +283,6 @@ impl KObjectType {
             8 => Some(Self::InterruptObject),
             9 => Some(Self::PendingOperation),
             10 => Some(Self::IoRing),
-            11 => Some(Self::EntropyObject),
             12 => Some(Self::DeviceNode),
             13 => Some(Self::UserspaceServerReg),
             14 => Some(Self::FileObject),

@@ -382,6 +382,9 @@ handed-down terminal when its parent gives one and resolves `/dev/tty` otherwise
 second shape's mechanism confirmed, without the first clause: the name stays present, because
 minting is what it is for.
 
+**What an application namespace holds as every namespace does: `/dev/entropy`**, resolved from the
+session's, since a program's random bytes come from there and nowhere else (2026-11-13).
+
 **What an application namespace deliberately lacks: `/applications`** (M14 Part H). The *session*
 namespace has it — it is where the Applications menu's entries come from — and an application's
 does not, so `nxsh` on the serial console can list the installed applications and the same `nxsh`

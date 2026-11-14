@@ -532,9 +532,9 @@ struct Ids {
 }
 
 impl Ids {
-    fn fresh() -> Option<Ids> {
+    fn fresh(ns: Ns<'_>) -> Option<Ids> {
         let mut b = [0u8; 56];
-        entropy::fill(&mut b).is_ok().then(|| Ids {
+        entropy::fill(ns, &mut b).is_ok().then(|| Ids {
             disk_id: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
             disk_guid: b[4..20].try_into().unwrap_or_default(),
             partition_guid: b[20..36].try_into().unwrap_or_default(),
@@ -690,7 +690,7 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
             return refuse(&format!("{r}"));
         }
     };
-    let Some(ids) = Ids::fresh() else {
+    let Some(ids) = Ids::fresh(ns) else {
         drop(handle);
         return refuse("the kernel's entropy source did not answer, and the IDs written must be random");
     };

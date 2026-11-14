@@ -81,7 +81,7 @@ fn unknown_number_is_unsupported() {
 
 #[test]
 fn a_removed_number_is_unsupported_before_it_reads_an_argument() {
-    for removed in [18, 29, 31, 32, 33, 34, 35, 37, 38, 39] {
+    for removed in [18, 26, 27, 29, 31, 32, 33, 34, 35, 37, 38, 39] {
         let refused = dispatch(removed, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
         assert_eq!(refused, KError::Unsupported.as_isize(), "number {removed}");
     }
@@ -188,16 +188,6 @@ fn namespace_rights_are_allocatable_on_a_namespace() {
 }
 
 #[test]
-fn entropy_rights_are_allocatable_on_an_entropy_object() {
-    init_global_heap();
-    let t = HandleTable::try_new(0x2468_ACE0_1357_9BDF).unwrap();
-    let e = EntropyObject::try_new().unwrap();
-    let h =
-        t.install(1, ObjectRef::new(e), entropy_rights()).expect("entropy_rights must be valid for an EntropyObject");
-    drop(t.close(h, 1).unwrap());
-}
-
-#[test]
 fn the_system_control_handle_cannot_be_given_away() {
     use crate::object::SystemControl;
     use crate::object::system_control::INIT_RIGHTS;
@@ -212,12 +202,6 @@ fn the_system_control_handle_cannot_be_given_away() {
     assert_eq!(direct_bindable(held), Err(KError::NoAccess), "and so is a bind");
     assert_eq!(direct_bindable(held | Rights::TRANSFER), Ok(()), "which TRANSFER would allow");
     drop(t.close(h, 1).unwrap());
-}
-
-#[test]
-fn entropy_read_rejects_zero_and_oversize_len() {
-    assert_eq!(sys_entropy_read(0xDEAD, 0x1000, 0), Ok(0));
-    assert_eq!(sys_entropy_read(0xDEAD, 0x1000, ENTROPY_READ_MAX + 1), Err(KError::TooLarge),);
 }
 
 #[test]

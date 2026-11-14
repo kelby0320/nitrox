@@ -378,7 +378,7 @@ fn offline(stage: &Stage, name: &str, file: &str) -> i32 {
         }
     };
     let mut salt = [0u8; libusers::SALT_LEN];
-    if entropy::fill(&mut salt).is_err() {
+    if entropy::fill(&stage.namespace, &mut salt).is_err() {
         scrub(&mut pw);
         say(stage, "the kernel's entropy source did not answer, so there is no salt");
         return EXIT_FAILURE;

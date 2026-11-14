@@ -98,8 +98,13 @@ pub fn unseeded(reads: u32) {
     with(|m| m.unseeded = reads);
 }
 
+/// A handle to a new `/dev/entropy` node, to bind where a namespace keeps it.
+pub fn entropy_node() -> u64 {
+    with(|m| m.mint(Object::Entropy, Rights::READ | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT)) as u64
+}
+
 /// Let the next `reads` unseeded reads find every place the kernel keeps for a reader waiting on
-/// the seeding taken, as it answers past `SEED_WAITERS_MAX`: a PO done `WouldBlock`, to read again.
+/// the seeding taken, as it answers past `SEED_WAITERS_MAX`: refused `WouldBlock`, to read again.
 pub fn seed_waiters_full(reads: u32) {
     with(|m| m.seed_full = reads);
 }

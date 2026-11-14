@@ -65,10 +65,6 @@ pub const SYS_NS_LOOKUP: u64 = 23;
 pub const SYS_NS_BIND: u64 = 24;
 /// `sys_ns_unbind` — remove the binding at a path in a namespace.
 pub const SYS_NS_UNBIND: u64 = 25;
-/// `sys_entropy_create` — create an `EntropyObject` handle onto the kernel CSPRNG.
-pub const SYS_ENTROPY_CREATE: u64 = 26;
-/// `sys_entropy_read` — fill a buffer with CSPRNG output (or a PO if unseeded).
-pub const SYS_ENTROPY_READ: u64 = 27;
 /// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
 pub const SYS_IO_SUBMIT: u64 = 28;
 /// `sys_ns_enumerate(ns, index, out, count)` — up to `count` of a namespace's bindings from

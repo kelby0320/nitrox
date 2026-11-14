@@ -330,12 +330,12 @@ fn ns_demo() {
     log::write(b"test-harness: ns-demo done\n");
 }
 
-/// Entropy demo: read CSPRNG bytes (the pool seeds at boot); the two 32-byte draws must differ.
-fn entropy_demo() {
+/// Entropy demo: read CSPRNG bytes from `root`'s `/dev/entropy`; the two 32-byte draws must differ.
+fn entropy_demo(root: &Root) {
     log::write(b"test-harness: entropy-demo start\n");
 
-    let Ok(source) = entropy::Source::new() else {
-        log::write(b"test-harness: entropy_create FAIL\n");
+    let Ok(source) = entropy::Source::open(root) else {
+        log::write(b"test-harness: /dev/entropy open FAIL\n");
         return;
     };
     let mut a = [0u8; 32];
@@ -366,8 +366,8 @@ fn entropy_demo() {
     l.end();
 }
 
-/// Kernel-server demo: resolve `/dev/entropy` from the root namespace and read from the handle the
-/// in-kernel server hands back (boot-binding and `KernelServer` dispatch).
+/// Kernel-server demo: resolve `/dev/entropy` from the root namespace and read from the char node
+/// the in-kernel server hands back (boot-binding and `KernelServer` dispatch).
 fn dev_entropy_lookup_demo(root: &Root) {
     log::write(b"test-harness: /dev/entropy lookup-demo start\n");
     let Ok(resolved) = block_on(root.lookup::<Resource, ReadOnly>("/dev/entropy", Rights::READ)) else {
@@ -376,7 +376,7 @@ fn dev_entropy_lookup_demo(root: &Root) {
     };
 
     let mut a = [0u8; 32];
-    if entropy::Source::from_handle(resolved).try_fill(&mut a).is_err() {
+    if entropy::Source::from_handle(resolved).and_then(|source| source.try_fill(&mut a)).is_err() {
         log::write(b"test-harness: /dev/entropy read not synchronous\n");
         return;
     }
@@ -3026,7 +3026,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, boot2: u64, arg0: u64) -> ! {
 
     ns_demo();
 
-    entropy_demo();
+    entropy_demo(root);
 
     dev_entropy_lookup_demo(root);
 

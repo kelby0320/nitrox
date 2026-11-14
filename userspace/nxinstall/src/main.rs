@@ -100,13 +100,13 @@ const FS_BLOCK: u64 = 4096;
 /// small filesystems and the cap large ones.
 const BYTES_PER_INODE: u32 = 16384;
 
-/// 16 bytes from the kernel CSPRNG, for a partition GUID.
+/// 16 bytes from the kernel CSPRNG `namespace` binds, for a partition GUID.
 ///
 /// Refuses rather than inventing one: constant GUIDs would collide with every other machine this
 /// program installed.
-fn random_guid() -> Option<[u8; 16]> {
+fn random_guid(namespace: Option<&Root>) -> Option<[u8; 16]> {
     let mut buf = [0u8; 16];
-    entropy::fill(&mut buf).ok().map(|()| buf)
+    entropy::fill(namespace?, &mut buf).ok().map(|()| buf)
 }
 
 /// One block device this view can reach.
@@ -300,6 +300,7 @@ fn layout_for(target: &Device, srcs: &Sources) -> Result<nxinstall::Layout, Stri
 }
 
 fn install(
+    namespace: Option<&Root>,
     io: &Scratch,
     target: &Device,
     srcs: &Sources,
@@ -312,7 +313,7 @@ fn install(
     // Every timestamp is the install's own; an unreadable clock leaves the epoch.
     let now = wall_clock_seconds();
 
-    let (esp_guid, root_guid) = match (random_guid(), random_guid()) {
+    let (esp_guid, root_guid) = match (random_guid(namespace), random_guid(namespace)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
             return Err(String::from(
@@ -322,7 +323,7 @@ fn install(
             ));
         }
     };
-    let disk_guid = random_guid().ok_or_else(|| String::from("no entropy for the disk GUID"))?;
+    let disk_guid = random_guid(namespace).ok_or_else(|| String::from("no entropy for the disk GUID"))?;
 
     // The table first, and the filesystems after: a disk with a table and empty partitions can
     // be installed to again; the other order leaves bytes nobody can find.
@@ -350,7 +351,7 @@ fn install(
         Some(p) => p,
         None => return Err(String::from("could not allocate a transfer buffer for the target")),
     };
-    let uuid = random_guid().ok_or_else(|| {
+    let uuid = random_guid(namespace).ok_or_else(|| {
         String::from(
             "the kernel would not give out random bytes, and a filesystem with an invented \
              UUID collides with every other machine's. Nothing further was written.",
@@ -398,7 +399,7 @@ fn install(
     say(&format!("  {} director(ies), {} file(s), {}", copied.dirs, copied.files, human(copied.bytes)));
 
     say(&format!("making {}'s account, its administrator", String::from_utf8_lossy(&account.name)));
-    let salt = random_guid().ok_or("the kernel would not give out random bytes for a salt")?;
+    let salt = random_guid(namespace).ok_or("the kernel would not give out random bytes for a salt")?;
     nxinstall::account::write(&dst, &account.name, &account.password, &salt, now)
         .map_err(|e| format!("writing the first account failed: {e}"))?;
     log(&format!("the first account is {}, its administrator", String::from_utf8_lossy(&account.name)));
@@ -769,7 +770,7 @@ fn run(
     };
 
     note(&format!("installing to {} ({})", target.path(), identity));
-    let installed = install(&io, target, &srcs, &layout, &account, &mut note);
+    let installed = install(namespace, &io, target, &srcs, &layout, &account, &mut note);
     libkern::scrub(&mut account.password);
     match installed {
         Ok(()) => {

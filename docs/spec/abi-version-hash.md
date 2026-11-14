@@ -62,6 +62,8 @@ KObjectType::Namespace            = 0x03
 ... etc
 ```
 
+Discriminant `11` is vacant: `EntropyObject` was removed on 2026-11-13.
+
 Adding a new variant changes the hash. Removing or renumbering a variant changes the hash.
 
 ### Notification enum layout

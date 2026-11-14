@@ -9,7 +9,6 @@
 
 use crate::libkern::KBox;
 use crate::libkern::handle::Rights;
-use crate::object::EntropyObject;
 use crate::object::MemoryObject;
 use crate::object::ObjectRef;
 use crate::syscall::error::KError;
@@ -90,14 +89,15 @@ fn complete_with_memobj(obj: KBox<MemoryObject>) -> OpStatus {
     OpStatus::Completed(ObjectRef::new(obj))
 }
 
-/// `/dev/entropy` — a **leaf**; an exact match mints an [`EntropyObject`] on the global CSPRNG.
+/// `/dev/entropy` — a **leaf**; an exact match answers the CSPRNG's char node, one for every
+/// resolve, whose `Read` draws from it.
 fn entropy_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
     }
-    match EntropyObject::try_new() {
-        Ok(obj) => OpStatus::Completed(ObjectRef::new(obj)),
-        Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+    match crate::entropy::node() {
+        Some(node) => OpStatus::Completed(node.erase()),
+        None => OpStatus::Rejected(KError::NotFound),
     }
 }
 
@@ -415,12 +415,13 @@ mod tests {
     }
 
     #[test]
-    fn entropy_exact_match_yields_entropy_object() {
+    fn entropy_exact_match_yields_its_char_node() {
         init_global_heap();
+        assert!(crate::entropy::make_node());
         match dispatch(KernelServerId::Entropy, b"", Rights::READ) {
             OpStatus::Completed(obj) => {
-                assert_eq!(obj.object_type(), KObjectType::EntropyObject);
-                drop(obj);
+                assert_eq!(obj.object_type(), KObjectType::DeviceNode);
+                assert!(core::ptr::eq(obj.as_ptr(), crate::entropy::node().unwrap().erase().as_ptr()), "the one node");
             }
             OpStatus::Rejected(e) => panic!("expected Completed, got Rejected({e:?})"),
             OpStatus::Pending => panic!("a kernel server never returns Pending"),

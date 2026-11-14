@@ -13,7 +13,8 @@ use libos::{
 #[derive(Clone, Copy)]
 pub struct Members<'a> {
     /// The namespace direct handles are resolved from: the supervisor's own — the root namespace —
-    /// for a session, and **the session's** for an application. `None` binds no console.
+    /// for a session, and **the session's** for an application. `None` binds no console and no
+    /// `/dev/entropy`.
     pub root_ns: Option<Ref<'a, Namespace, NsReadOnly>>,
     /// The fs-server endpoint, bound at `/home` scoped to the user's subtree.
     pub fs_endpoint: Option<Ref<'a, Channel, Only>>,
@@ -83,6 +84,8 @@ pub struct Bound {
     pub storage: bool,
     /// `/dev/desktop` bound.
     pub desktop: bool,
+    /// `/dev/entropy` bound.
+    pub entropy: bool,
 }
 
 /// A namespace built from [`Members`], owned and closed on drop, and what bound into it.
@@ -238,6 +241,16 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
         bound.console = ns.bind("/dev/console", &console).is_ok();
         if !bound.console {
             log::write(b"libsession: /dev/console bind FAIL (shell has no console)\n");
+        }
+    }
+    // `/dev/entropy` → the kernel's generator, a direct-handle bind resolved from our own namespace,
+    // in **every namespace this builds**: random bytes, and nothing else, which every process could
+    // read before the generator was a node. Non-fatal.
+    if let Some(root) = root_ns {
+        let node = resolve::<Resource, ReadOnly, _>(root, "/dev/entropy", Rights::READ | Rights::TRANSFER);
+        bound.entropy = node.is_ok_and(|node| ns.bind("/dev/entropy", &node).is_ok());
+        if !bound.entropy {
+            log::write(b"libsession: /dev/entropy bind FAIL (no random bytes in this namespace)\n");
         }
     }
     // `/dev/desktop` → `desktop-shell`'s own endpoint, for an application. No base. Non-fatal.

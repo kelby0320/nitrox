@@ -180,9 +180,9 @@ fn now_ns() -> u64 {
 /// not answer is one someone else could make up too, and without one the caller is asked for its
 /// password, which is safe. An unseeded pool is none too: the serve loop does not wait for it, and
 /// a missing token only costs a password prompt.
-fn random_token() -> Option<[u8; tty_server::tokens::LEN]> {
+fn random_token(source: Option<&entropy::Source>) -> Option<[u8; tty_server::tokens::LEN]> {
     let mut buf = [0u8; tty_server::tokens::LEN];
-    entropy::try_fill(&mut buf).ok()?;
+    source?.try_fill(&mut buf).ok()?;
     Some(buf)
 }
 
@@ -203,6 +203,8 @@ struct Server {
     /// The page every console read lands in, and its mapping.
     map: Mapping<MapReadWrite>,
     buf: Handle<Memory, MapReadWrite>,
+    /// Where tokens' bits come from: `/dev/entropy`, if the root binds it.
+    entropy: Option<entropy::Source>,
 }
 
 impl Server {
@@ -355,7 +357,7 @@ impl Server {
             OP_TTY_OPEN_SIBLING => self.open_sibling(ch, request_id),
             // A token for this terminal's backend: how the view broker learns which terminal a
             // request came from without asking the requester.
-            OP_TTY_TOKEN => match (self.reg.backend_of_terminal(ch), random_token()) {
+            OP_TTY_TOKEN => match (self.reg.backend_of_terminal(ch), random_token(self.entropy.as_ref())) {
                 (Some(backend), Some(token)) => {
                     self.tokens.mint(token, backend, now_ns());
                     self.links.answer(ch, op, request_id, &token);
@@ -547,6 +549,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         log::write(b"tty-server: /dev/console not found\n");
         libos::exit(1);
     };
+    let entropy = start.root.as_ref().and_then(|root| entropy::Source::open(root).ok());
 
     // One page, mapped once, for every console read.
     let Ok(buf) = Handle::<Memory, MapReadWrite>::create(4096) else {
@@ -576,6 +579,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         console,
         map,
         buf,
+        entropy,
     };
     srv.serve_loop();
 }

@@ -97,8 +97,6 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `23` | `sys_ns_lookup` |
 | `24` | `sys_ns_bind` |
 | `25` | `sys_ns_unbind` |
-| `26` | `sys_entropy_create` |
-| `27` | `sys_entropy_read` |
 | `28` | `sys_io_submit` |
 | `30` | `sys_ns_enumerate` |
 | `36` | `sys_process_terminate` |
@@ -416,32 +414,13 @@ broker (`docs/planning/administration.md` § Part A). (Syscall number `22`.)
 
 ### Entropy
 
-The kernel CSPRNG, exposed as an `EntropyObject` handle. Full model in
-[`docs/architecture/entropy.md`](../architecture/entropy.md). Syscall numbers:
-`sys_entropy_create = 26`, `sys_entropy_read = 27` (implemented in Phase 2 slice 2).
-
-```rust
-fn sys_entropy_create() -> isize
-```
-Returns a handle to the kernel entropy source (the singleton CSPRNG) with `READ`
-plus the generic duplicate/transfer/inspect band. The source is shared; the handle
-is a capability token onto it (many handles, one generator).
-
-```rust
-fn sys_entropy_read(handle: RawHandle, buf: UserMutPtr<u8>, len: usize) -> isize
-```
-Requires `READ` on `handle`. `len` is capped per call (256 bytes; loop for more).
-**Return contract:**
-- **`0`** — `buf[0..len]` was filled synchronously. This is the common case: the
-  pool seeds at boot, before userspace.
-- **a positive value** — a `PendingOperation` handle. The pool is not yet seeded
-  (only on hardware lacking `RDSEED`/`RDRAND`, before enough interrupt jitter has
-  accumulated); the buffer is **untouched**. The caller `sys_wait`s on the handle
-  (it completes when the pool seeds) and then **re-reads**. This preserves the
-  async-first rule without blocking inside the syscall.
-- **a negative value** — a `KError`.
-
-The split is unambiguous because handle values are always ≥ 1.
+**There is no entropy syscall.** The kernel CSPRNG is read through `/dev/entropy`, a char
+`DeviceNode`, with `sys_io_submit` (`Read`, into a `MemoryObject` held with `MAP_WRITE`). A read
+answers at most 256 bytes, so a reader reads again for more. Before the generator seeds (only on a
+CPU with neither `RDSEED` nor `RDRAND`) the operation waits and completes with `result` 0; a reader
+reads again. `sys_entropy_create` (`26`) and `sys_entropy_read` (`27`) went on 2026-11-13, and
+their numbers are vacant. The contract is in [`docs/architecture/entropy.md`](../architecture/entropy.md)
+and [`io-operation.md`](io-operation.md).
 
 ### Process and Thread
 

@@ -36,8 +36,8 @@ it fit for supervisors and PID 1 (decision log, 2026-10-27). `eshell` and `libhe
 cannot express; `tools/xtask/raw-syscalls.toml` lists them.
 
 **It is written to the syscall surface Part E ends with** (`docs/planning/syscall-surface.md`),
-over today's calls, so a caller is written once: `entropy::fill` makes a source for each call,
-which is `TODO(surface-shape)`, and changes underneath as its sub-part lands. The flushes were the
+over today's calls, so a caller is written once: a call under it changes as its sub-part lands.
+The flushes were the
 first: each is now an operation, a resolve's for a mount and an `io_submit`'s for a file, run on a
 kernel thread of its own. **`Spawn` reads a file image into a memory object** before the spawn,
 by a 60 s deadline, its size the file's stat: the kernel spawns from memory alone.
@@ -89,7 +89,7 @@ gives one out once.
 | `thread` | `Stack`, `start` and `start_on`, a mask of CPUs, the calling thread's `exit`, and a thread suspended on a fault: its `fault_registers`, and `settle`, to resume it or end it |
 | `time` | `now`, `wall`, `sleep`, `sleep_until`, `Deadline`, and a `Timer`'s `create`, `set` and `disarm` |
 | `log` | `write`, and `Line`, one write a line |
-| `entropy` | `fill`, and `try_fill` for a caller that cannot wait for the seeding, from a source made for the call or from a `Source`, made here or handed over by `/dev/entropy`, read as often as wanted |
+| `entropy` | `Source::open(ns)` resolves `/dev/entropy` (`entropy::PATH`) in the namespace the caller passes, `Source::from_handle(node)` takes a node already held; `Source::fill` waits for the seeding and reads again as needed, `Source::try_fill` is refused `WouldBlock` before the seeding, for a caller that cannot wait; `entropy::fill(ns, buf)` and `entropy::try_fill(ns, buf)` open a source for the call. libos holds no namespace of its own |
 | `boot` | `Start`: `_start`'s four registers, owned and typed |
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
 | `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |

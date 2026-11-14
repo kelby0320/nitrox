@@ -770,10 +770,10 @@ fn run_first_userspace() {
     };
 
     // Bind the in-kernel resource servers into pid 1's root namespace (the kernel is the supervisor
-    // at boot); children inherit them. `/dev/entropy` mints an `EntropyObject` on lookup; its
-    // rights are the band `sys_entropy_create` mints (`entropy_rights`).
+    // at boot); children inherit them. `/dev/entropy` answers the CSPRNG's char node.
     let entropy_binding_rights = Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    if ns.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, entropy_binding_rights).is_err() {
+    let entropy = nitrox_kernel::entropy::make_node();
+    if !entropy || ns.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, entropy_binding_rights).is_err() {
         kprintln!("init: binding /dev/entropy failed");
         return;
     }

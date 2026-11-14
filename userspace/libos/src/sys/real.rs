@@ -217,18 +217,6 @@ pub fn clock_set(ns: u64) -> i64 {
     unsafe { syscall2(libkern::SYS_CLOCK_SET, libkern::CLOCK_REALTIME, ns) }
 }
 
-/// `sys_entropy_create` — a handle onto the kernel's generator.
-pub fn entropy_create() -> i64 {
-    // SAFETY: a call with no arguments.
-    unsafe { libkern::syscall0(libkern::SYS_ENTROPY_CREATE) }
-}
-
-/// `sys_entropy_read` into `buf`: `0` filled, a `PendingOperation` while unseeded, or an error.
-pub fn entropy_read(h: u64, buf: &mut [u8]) -> i64 {
-    // SAFETY: `buf` is a live buffer of its length, which the kernel writes.
-    unsafe { syscall3(libkern::SYS_ENTROPY_READ, h, buf.as_mut_ptr() as u64, buf.len() as u64) }
-}
-
 /// `sys_test_exit(code)`: under the kernel's test harness it ends the run, and returns elsewhere.
 pub fn test_exit(code: u64) -> i64 {
     // SAFETY: a register-only call.

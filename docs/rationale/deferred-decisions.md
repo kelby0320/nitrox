@@ -2318,14 +2318,15 @@ server's stay signalled and `sys_wait` fires again at once, a spin for the rest 
 registration going reaches it, which takes `service-mgr` with it.
 
 **libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
-`entropy::fill` makes an `EntropyObject` for each call; `system::stop` takes the system-control
-object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
+`system::stop` takes the system-control object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
 its authority is the `SYSTEM_CLOCK` grant until there is a clock node to hold, so its one caller,
 `date`, passes one when E.10 makes it. Every other caller is written once, against the shape it will
 keep, and the call under it changes as its sub-part of
 [`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 made both flushes, once answered
 within the call, a resolve and an `io_submit`; E.8 made `Spawn` read a file image into memory
-first; E.9 makes entropy a node, and E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: each of those sub-parts.
+first; E.9 made entropy a node, read through the `/dev/entropy` a caller's namespace binds, so
+`entropy::fill` came to take that namespace: libos holds none of its own, and has nothing to start
+up. E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: E.10.
 
 **Any process can end a test run — `TODO(test-verdict-authority)`.** `sys_test_exit` checks no
 handle and no syscap: a kernel built with the test harness writes the verdict to `isa-debug-exit`

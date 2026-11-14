@@ -197,7 +197,7 @@ every lookup through it comes back `Unsupported` from a peer that has never hear
 `/dev/tty` that could not be opened.
 
 A **direct handle** is a supervisor binding a concrete object — a `MemoryObject` at
-`/store`, the console `DeviceNode` at `/dev/console`, an `EntropyObject` — that lookup
+`/store`, the console `DeviceNode` at `/dev/console` — that lookup
 returns (rights-attenuated). A **`KernelServer`** is the answer for resources that must be
 *computed per lookup* (e.g. `/proc/self/process`, which depends on *who* is asking)
 without spinning up a userspace process — see "In-kernel resource servers" below.
@@ -430,7 +430,7 @@ slice 7 — an in-kernel server never returns it.)
 **The content model: a lookup yields a handle to a kernel object.** An in-kernel
 server's job is to *produce the right handle* for `suffix`:
 
-- `/dev/entropy` → an `EntropyObject` handle (the caller then `sys_entropy_read`s it).
+- `/dev/entropy` → the CSPRNG's char `DeviceNode` (the caller then reads it with `sys_io_submit`).
 - `/proc/self/process` → the caller's own `Process` handle; `/proc/self/status` → a
   freshly-synthesized read-only `MemoryObject` snapshot; etc.
 - `/dev/registry` → a snapshot of the whole device table, `/dev/registry/<id>` → that
