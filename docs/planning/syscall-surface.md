@@ -743,6 +743,19 @@ try that waits; the bind rule in the kernel and the mock, each of the five binds
 `DUPLICATE`, and `/dev/entropy` left unbound; 18, 26 and 37 answered again. **All 19 CI gates pass
 under KVM.**
 
+**After review** (`a7353cb8`):
+- **A listing's array is checked whole before any lookup**: any part outside the user half is
+  `FaultFromUser` with nothing written, where an entry straddling the end passed and faulted
+  after a partial write; and **each entry is fresh**, where one reused carried a longer path's
+  bytes. The loop is `listing::fill`, which a host test drives.
+- **`io-operation.md` names `/dev/entropy`'s waited read**, whose `0` means read again, not the
+  end of a stream, and `syscall-abi.md` lists all twelve vacant numbers.
+- **libos refuses a second empty answer**, so a `/dev/entropy` bound to another node is not read
+  for ever; **tty-server reads each token's bytes as it mints it**, as before, and logs one it
+  could not make.
+- Refuted by runs: the installer's and the offline `account`'s draws (`check-install`,
+  `check-recovery`), and the entropy wiring, each caller reached by a passing gate.
+
 ### E.10 One authority model
 
 **A handle, for both** (the maintainer's call, finding 5). Each privileged system operation is a

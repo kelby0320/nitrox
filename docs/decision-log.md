@@ -38314,3 +38314,8 @@ E.8 merged, #441. E.9, `syscall-surface.md` § E.9, built on `pre-phase-7/part-e
 - **A direct bind asks `DUPLICATE` as well as `TRANSFER`**, a bind being a copy (`direct-bind-copy`
   resolved); five binds that asked their source for `TRANSFER` alone ask for both.
 - The commits: `f1dde197`, `5a80e2c0`, `13431e6f`, `24c3cba3`. Forty-two syscalls to thirty.
+- After review (`a7353cb8`), **a listing's array is checked whole before any lookup**, an array any
+  part of which lies outside the user half `FaultFromUser` with nothing written, and each entry
+  is written fresh; **`/dev/entropy`'s waited `0` is in the char contract** as read again; libos
+  refuses a second empty answer from what it took for the generator; tty-server reads a token's
+  bytes as it mints it.
