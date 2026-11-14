@@ -21,9 +21,9 @@ fn mark_byte(page_at: u64, i: usize) -> u8 {
     ((page_at >> 12) as u8).wrapping_mul(31).wrapping_add(i as u8)
 }
 
-/// **A file twice the machine's memory, copied on a stick** (pre-Phase-7 E.8). The page cache keeps
-/// what it holds until its object goes, so the copy finishes only if each window's pages are let go
-/// once it is copied (`IO_NOCACHE`); without that it runs out of memory a quarter of the way in.
+/// **A file twice the machine's memory, copied on a stick.** The page cache keeps what it holds
+/// until its object goes, so the copy finishes only if each window's pages are let go once it is
+/// copied (`IO_NOCACHE`); without that it runs out of memory a quarter of the way in.
 /// The test live image boots beside a stick holding a sparse 512 MiB file with a page of bytes at
 /// each of [`MARKS`]; `copy` copies it, `disk --eject` unmounts the stick, and the host checks the
 /// filesystem clean and the copy whole: its size, and every mark where the source had it.

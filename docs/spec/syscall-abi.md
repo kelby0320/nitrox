@@ -337,10 +337,12 @@ files are still written, and a file whose write failed stays dirty.
 **It runs on a kernel thread of its own**, so the call returns at once and the caller waits on the
 operation, with a deadline if it likes. The thread lets go of the files and the place it holds
 before it completes the operation, so a held asked straight after counts none of them. **A mount
-runs sixteen flushes at once** (`FILE_OPS_MAX`), and a flush past them waits its turn: a thread
-that finishes one runs the next waiting on its mount, first come first served. A device that
-stops answering so holds up its own mount's flushes, and no other. **A process may have four of a
-mount's flushes running or waiting** (`FILE_OPS_PER_PROCESS`): one past them is refused
+runs sixteen file operations at once** (`FILE_OPS_MAX`): its flushes, and its files' `Read`s and
+`Write`s through `sys_io_submit`. One past them waits its turn: a thread that finishes one runs the
+next waiting on its mount, first come first served. A device that stops answering so holds up its
+own mount's operations, and no other, but for a copy, which waits on its source's device too and
+runs in its destination's mount (`TODO(copy-two-budgets)`). **A process may have four of a mount's
+file operations running or waiting** (`FILE_OPS_PER_PROCESS`): one past them is refused
 `WouldBlock` synchronously, the operation not kept, which libos sleeps on and asks again, so no
 process takes a mount's budget from the others. One call still waits inside itself: `sys_power`,
 on its flush. `sys_process_spawn` takes a memory object alone, which libos reads a file into

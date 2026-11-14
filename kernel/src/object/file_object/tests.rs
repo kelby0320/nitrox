@@ -319,7 +319,7 @@ fn a_page_being_filled_is_neither_lent_nor_marked_ready() {
     init_global_heap();
     let f = fobj(PAGE_SIZE);
     let Fault::Fill(_, po) = f.reserve_fault(0) else { panic!("a miss") };
-    assert!(f.ready_page(0).is_none(), "a loading page is not lent");
+    assert!(f.ready_page(&f.running(), 0).is_none(), "a loading page is not lent");
     f.mark_ready(0);
     assert_eq!(f.lookup(0).map(|(_, state)| state), Some(PageState::Loading), "nor marked ready");
     f.settle(0, &po, false);

@@ -12,13 +12,13 @@
 pub struct IoOp {
     /// [`IoOpcode`] discriminant.
     pub opcode: u32,
-    /// Reserved; must be 0.
+    /// [`IO_NOCACHE`] on a file's `Read` or `Write`; otherwise 0.
     pub flags: u32,
-    /// `MemoryObject` handle providing the data buffer (`RawHandle` value).
+    /// The data buffer (`RawHandle` value): a `MemoryObject`, or for a copy, the source file.
     pub buffer: u64,
     /// Byte offset within `buffer`.
     pub buf_offset: u64,
-    /// Byte offset within the resource (the device).
+    /// Byte offset within the resource: a device or a file.
     pub offset: u64,
     /// Bytes to transfer.
     pub length: u64,

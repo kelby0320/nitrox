@@ -4,7 +4,7 @@
 use super::flush::{flush_mount, operation, write_back};
 use super::*;
 use crate::libkern::io_op::{IO_NOCACHE, MAX_USER_COPY_SIZE};
-use crate::object::file_object::io::Source;
+use crate::object::file_object::io::{Source, same_bytes};
 use crate::object::userspace_server::{FileWork, QueuedOp, Span};
 use crate::sched::Job;
 
@@ -33,6 +33,10 @@ pub(super) fn submit(file: Ref<FileObject>, rights: Rights, op: &IoOp, opcode: I
     if !read {
         file.writable_range(op.offset, op.length)?;
     }
+    if same_bytes(&file, op.offset, &from, op.buf_offset, op.length) {
+        return Err(KError::InvalidArgument);
+    }
+    // TODO(copy-two-budgets): a copy waits on its source's device too, in this mount's budget.
     let reg = file.op_owner().ok_or(KError::Unsupported)?;
     let nothing = op.length == 0 || (read && op.offset >= file.size() as u64);
     let nocache = op.flags & IO_NOCACHE != 0;
@@ -51,8 +55,15 @@ pub(super) fn submit(file: Ref<FileObject>, rights: Rights, op: &IoOp, opcode: I
     Ok(po_h.bits() as isize)
 }
 
+/// How a thread is started for a job: `sched::spawn_job`, the job handed back if none could be.
+pub(super) type Start<'a> = &'a mut dyn FnMut(KBox<FileOps>) -> Result<(), KBox<FileOps>>;
+
 /// Run `op` now or queue it; `WouldBlock` past its process's share.
 pub(super) fn admit(reg: Ref<UserspaceServerReg>, op: QueuedOp) -> Result<(), KError> {
+    admit_with(reg, op, &mut crate::sched::spawn_job)
+}
+
+pub(super) fn admit_with(reg: Ref<UserspaceServerReg>, op: QueuedOp, start: Start<'_>) -> Result<(), KError> {
     let mut job = KBox::try_new(FileOps { reg: None, first: None }).map_err(|_| KError::OutOfMemory)?;
     match reg.admit_op(op) {
         Ok(None) => Ok(()),
@@ -60,9 +71,9 @@ pub(super) fn admit(reg: Ref<UserspaceServerReg>, op: QueuedOp) -> Result<(), KE
             let pid = op.pid;
             job.reg = Some(reg.clone());
             job.first = Some(op);
-            if let Err(job) = crate::sched::spawn_job(job) {
+            if let Err(job) = start(job) {
                 drop(job);
-                pass_on(&reg, reg.op_done(pid));
+                pass_on(&reg, reg.op_done(pid), start);
                 return Err(KError::OutOfMemory);
             }
             Ok(())
@@ -73,14 +84,14 @@ pub(super) fn admit(reg: Ref<UserspaceServerReg>, op: QueuedOp) -> Result<(), KE
 
 /// **A place freed with no thread to run its operation**: each one it passes to is started, or,
 /// while no thread can be made, answered `OutOfMemory` and its place passed on in turn.
-fn pass_on(reg: &Ref<UserspaceServerReg>, mut next: Option<QueuedOp>) {
+pub(super) fn pass_on(reg: &Ref<UserspaceServerReg>, mut next: Option<QueuedOp>, start: Start<'_>) {
     while let Some(op) = next.take() {
         let pid = op.pid;
         let refused = match KBox::try_new(FileOps { reg: None, first: None }) {
             Ok(mut job) => {
                 job.reg = Some(reg.clone());
                 job.first = Some(op);
-                match crate::sched::spawn_job(job) {
+                match start(job) {
                     Ok(()) => return,
                     Err(mut job) => job.first.take(),
                 }
@@ -124,39 +135,56 @@ pub(super) fn finish(
         FileWork::FlushMount => flush_mount(reg),
         FileWork::Flush(file) => (write_back(&file).err().map_or(0, |e| e as i32), 0),
         FileWork::Read(s, into) => {
-            let done = FileObject::read_into(&s.file, s.offset, s.length, &into, s.buf_offset, &mut fault);
-            uncache(&s, None, done, false);
-            done
+            let (status, done) = FileObject::read_into(&s.file, s.offset, s.length, &into, s.buf_offset, &mut fault);
+            if s.nocache && status == 0 {
+                let_clean_go(&s.file, s.offset, done);
+            }
+            (status, done)
         }
         FileWork::Write(s, from) => {
-            let done = FileObject::write_from(&s.file, s.offset, s.length, &from, s.buf_offset, &mut fault);
-            uncache(&s, Some(&from), done, true);
-            done
+            let (status, done) = FileObject::write_from(&s.file, s.offset, s.length, &from, s.buf_offset, &mut fault);
+            match status {
+                0 => (uncache_written(&s, &from, done).err().map_or(0, |e| e as i32), done),
+                failed => (failed, done),
+            }
         }
     };
     (po, status, done, reg.op_done(pid))
 }
 
-/// **`IO_NOCACHE` once an op has succeeded**: its file's window let go, and a copy's source's,
-/// each written back first if dirty, or always after a write. Each stays if the write-back fails.
-fn uncache(s: &Span, from: Option<&Source>, (status, done): (i32, u64), wrote: bool) {
-    if !s.nocache || status != 0 {
+/// **`IO_NOCACHE` after a write**: the file written back, its window let go, and a copy's source's
+/// window if it is clean. The write-back's failure is the op's, which wrote nothing durable.
+fn uncache_written(s: &Span, from: &Source, done: u64) -> Result<(), KError> {
+    if !s.nocache {
+        return Ok(());
+    }
+    if let Source::File(source) = from {
+        let_clean_go(source, s.buf_offset, done);
+    }
+    let mark = s.file.clean_mark();
+    write_back(&s.file)?;
+    if let Some(mark) = mark {
+        s.file.let_window_go(window(s.offset, done), mark);
+    }
+    Ok(())
+}
+
+/// **A read's window, or a copy's source's, let go if its file is clean**, and written back by no
+/// one: a holder of `MAP_READ` alone may not have a file written. A file whose dirt is not tracked,
+/// one its server gave no id, is kept.
+fn let_clean_go(file: &Ref<FileObject>, at: u64, done: u64) {
+    if file.cache_key().is_none() || file.is_dirty() {
         return;
     }
-    let window = |file: &Ref<FileObject>, at: u64, written: bool| {
-        let mark = file.clean_mark();
-        if (written || file.is_dirty()) && write_back(file).is_err() {
-            return;
-        }
-        let page = PAGE_SIZE as u64;
-        if let Some(mark) = mark {
-            file.let_window_go((at / page) as usize..at.saturating_add(done).div_ceil(page) as usize, mark);
-        }
-    };
-    window(&s.file, s.offset, wrote);
-    if let Some(Source::File(source)) = from {
-        window(source, s.buf_offset, false);
+    if let Some(mark) = file.clean_mark() {
+        file.let_window_go(window(at, done), mark);
     }
+}
+
+/// The pages `done` bytes from `at` touch.
+fn window(at: u64, done: u64) -> core::ops::Range<usize> {
+    let page = PAGE_SIZE as u64;
+    (at / page) as usize..at.saturating_add(done).div_ceil(page) as usize
 }
 
 #[cfg(test)]

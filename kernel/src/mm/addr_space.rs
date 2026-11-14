@@ -21,6 +21,7 @@ use crate::mm::frame::{Frame, FrameView};
 use crate::mm::page_tables::UserTables;
 use crate::mm::vmm::{Backing, FaultAccess, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr};
+use crate::object::file_object::io::Running;
 use crate::object::header::Ref;
 use crate::object::{FileObject, MemoryObject};
 
@@ -452,8 +453,16 @@ impl AddressSpace {
 
     /// **Install the leaf PTE for page `index` of `object` at `addr`**, pointing at `frame`, if the
     /// mapping there still puts that page there, as an unmap and a map may have moved it since the
-    /// fault read it. The object owns the frame, so `unmap` removes the PTE without freeing it.
-    pub fn map_file_page(&self, addr: VirtAddr, object: &Ref<FileObject>, index: usize, frame: PhysAddr) -> FilePage {
+    /// fault read it. The object owns the frame, so `unmap` removes the PTE without freeing it, and
+    /// the caller's `Running`, held since it fetched the frame, keeps `IO_NOCACHE` from freeing it.
+    pub fn map_file_page(
+        &self,
+        addr: VirtAddr,
+        object: &Ref<FileObject>,
+        index: usize,
+        frame: PhysAddr,
+        _running: &Running<'_>,
+    ) -> FilePage {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
         let Some(vma) = inner.vma_tree.find_covering(addr) else {
@@ -464,9 +473,9 @@ impl AddressSpace {
         }
         let flags = page_flags_for(vma.prot, Caching::Normal);
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
-        // SAFETY: `frame` is a live, resident cache frame
-        // the file object owns and keeps alive (the VMA holds its reference, until an unmap's
-        // shootdown); `page_base` is page-aligned and in the validated user-half VMA range.
+        // SAFETY: `frame` is a live, resident cache frame the file object owns and keeps alive (the
+        // VMA holds its reference, until an unmap's shootdown), which the caller's `Running` keeps
+        // from being let go; `page_base` is page-aligned and in the validated user-half VMA range.
         match unsafe { inner.tables.map(page_base, frame, flags) } {
             Ok(()) | Err(ArchMapError::AlreadyMapped) => {
                 Paging::flush_tlb_page(page_base);

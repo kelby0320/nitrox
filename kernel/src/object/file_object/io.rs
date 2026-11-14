@@ -29,8 +29,9 @@ pub(super) struct Users {
     ops: AtomicU32,
 }
 
-/// A read, write or write-back running on a file, counted while it lives.
-pub(super) struct Running<'a>(&'a FileObject);
+/// **A read, write, write-back or fault running on a file**, counted while it lives: a frame lent
+/// to its holder is not let go under it.
+pub struct Running<'a>(pub(super) &'a FileObject);
 
 impl<'a> Running<'a> {
     pub(super) fn begin(file: &'a FileObject) -> Self {
@@ -47,6 +48,23 @@ impl Drop for Running<'_> {
 }
 
 impl FileObject {
+    /// **This file in use while the guard lives**, so no frame it lends is let go: a fault holds one
+    /// from fetching its page until its PTE is in.
+    pub fn running(&self) -> Running<'_> {
+        Running::begin(self)
+    }
+
+    /// Page `index`'s frame while it is [`Ready`](PageState::Ready), lent to `running`'s holder.
+    pub(super) fn ready_page<'a>(&'a self, running: &Running<'_>, index: usize) -> Option<FrameView<'a>> {
+        debug_assert!(core::ptr::eq(running.0, self), "a page lent on another file's Running");
+        let g = self.inner.lock();
+        let p = g.pages.iter().find(|p| p.index == index && p.state == PageState::Ready)?;
+        // SAFETY: a ready page has no fill (`mark_ready`), so no `settle` frees it; a truncation
+        // retires it; `let_window_go` frees it only with no `Running`, and the caller holds one;
+        // only `self`'s drop frees it otherwise.
+        Some(unsafe { FrameView::new(p.frame.phys()) })
+    }
+
     /// **A mapping of the object is about to be made**: counted before the address space's lock,
     /// as the writable among them are.
     pub fn mapped(&self) {
@@ -65,13 +83,14 @@ impl FileObject {
         self.users.writable_maps.load(Ordering::Acquire)
     }
 
-    /// **Pages a write-back put on the device are written**: their blocks' `UNWRITTEN` mark is
-    /// cleared, so a page let go fills from them again rather than reading as zero.
-    pub(super) fn written(&self, first: usize, pages: usize) {
+    /// **Pages a write-back put on the device from block `lba` are written**: their blocks' `UNWRITTEN`
+    /// mark is cleared, so a page let go fills from them again rather than reading as zero. Only
+    /// where the run map still puts them there: a resize during the write may have moved them.
+    pub(super) fn written(&self, first: usize, pages: usize, lba: u64) {
         let Some(bs) = self.block_size() else { return };
         let block = |page: usize| (page * PAGE_SIZE) as u64 / bs as u64;
         let mut g = self.inner.lock();
-        if let Some(runs) = clear_unwritten(&g.runs, block(first), block(first + pages)) {
+        if let Some(runs) = clear_unwritten(&g.runs, block(first), block(first + pages), lba) {
             g.runs = runs;
         }
     }
@@ -186,7 +205,7 @@ impl FileObject {
         dst_at: u64,
         fault: FaultIn<'_>,
     ) -> (i32, u64) {
-        let _running = Running::begin(file);
+        let running = Running::begin(file);
         let mut done = 0;
         while done < len {
             let at = offset + done;
@@ -198,7 +217,7 @@ impl FileObject {
                 return (KError::IoError as i32, done);
             }
             let size = file.size() as u64;
-            let Some(page) = file.ready_page(index).filter(|_| at < size) else { break };
+            let Some(page) = file.ready_page(&running, index).filter(|_| at < size) else { break };
             let in_page = (at % PAGE_SIZE as u64) as usize;
             let n = (PAGE_SIZE - in_page).min((len - done).min(size - at) as usize);
             memory_pieces(dst, dst_at + done, n, |frame, frame_at, from, k| {
@@ -221,7 +240,16 @@ impl FileObject {
         src_at: u64,
         fault: FaultIn<'_>,
     ) -> (i32, u64) {
-        let _running = Running::begin(file);
+        if same_bytes(file, offset, src, src_at, len) {
+            return (KError::InvalidArgument as i32, 0);
+        }
+        let running = Running::begin(file);
+        // **A copy's source is held too**, so another op's `IO_NOCACHE` lets none of its frames go
+        // while this copies from them.
+        let source = match src {
+            Source::File(from) => Some(Running::begin(from)),
+            Source::Memory(_) => None,
+        };
         FileObject::writable_mapped(file);
         let mut done = 0;
         let status = loop {
@@ -242,11 +270,11 @@ impl FileObject {
             if let Err(e) = file.writable_range(at, n as u64) {
                 break e as i32;
             }
-            let pieces = match source_pieces(src, src_at + done, n) {
+            let pieces = match source_pieces(src, source.as_ref(), src_at + done, n) {
                 Ok(pieces) => pieces,
                 Err(e) => break e as i32,
             };
-            if let Err(e) = Self::write_page(file, index, in_page, &pieces, fault) {
+            if let Err(e) = Self::write_page(file, &running, index, in_page, &pieces, fault) {
                 break e as i32;
             }
             done += n as u64;
@@ -255,40 +283,52 @@ impl FileObject {
         (status, done)
     }
 
-    /// **Write `pieces` into page `index` from `at`**: a whole page not resident is reserved zeroed
-    /// and written before it is ready, with no fill; any other is faulted in first.
+    /// **Write `pieces` into page `index` from `at`**: a whole page not resident is made, written
+    /// and ready under one hold, with no fill; any other is faulted in first.
     fn write_page(
         file: &Ref<Self>,
+        running: &Running<'_>,
         index: usize,
         at: usize,
         pieces: &Pieces<'_>,
         fault: FaultIn<'_>,
     ) -> Result<(), KError> {
-        let reserved = (at == 0 && pieces.len() == PAGE_SIZE).then(|| file.reserve(index));
-        if matches!(reserved, Some(Reserve::Oom)) {
-            return Err(KError::OutOfMemory);
-        }
-        if matches!(reserved, Some(Reserve::New(_))) {
-            let written = {
-                let g = file.inner.lock();
-                let page =
-                    g.pages.iter().find(|p| p.index == index && p.state == PageState::Loading && p.fill.is_none());
-                page.map(|p| pieces.copy_into(p.view(), 0)).is_some()
-            };
-            file.mark_ready(index);
-            return if written { Ok(()) } else { Err(KError::IoError) };
+        if at == 0
+            && pieces.len() == PAGE_SIZE
+            && let Some(written) = file.write_whole(index, pieces)
+        {
+            return written;
         }
         fault(file, index).ok_or(KError::IoError)?;
-        pieces.copy_into(file.ready_page(index).ok_or(KError::InvalidArgument)?, at);
+        pieces.copy_into(file.ready_page(running, index).ok_or(KError::InvalidArgument)?, at);
         Ok(())
+    }
+
+    /// Page `index` written whole if it is not resident, so no fault sees it before it is ready:
+    /// `None` if it is; `OutOfMemory` if no frame or slot is free.
+    fn write_whole(&self, index: usize, pieces: &Pieces<'_>) -> Option<Result<(), KError>> {
+        let mut g = self.inner.lock();
+        if g.pages.iter().any(|p| p.index == index) {
+            return None;
+        }
+        let Some(frame) = g.pages.try_reserve(1).ok().and_then(|()| Frame::alloc()) else {
+            return Some(Err(KError::OutOfMemory));
+        };
+        pieces.copy_into(frame.view(), 0);
+        let page = CachePage { index, frame, state: PageState::Ready, fill: None };
+        let Ok(()) = g.pages.push_within_capacity(page) else { unreachable!("reserved") };
+        Some(Ok(()))
     }
 }
 
-/// **`runs` with blocks `from..to` no longer marked unwritten**, a run split where the range
-/// starts or ends inside it; `None` if none was marked or the runs cannot grow by the two splits.
-pub(super) fn clear_unwritten(runs: &KVec<BlockRun>, from: u64, to: u64) -> Option<KVec<BlockRun>> {
-    let touched =
-        |r: &BlockRun| r.flags & RUN_UNWRITTEN != 0 && r.file_block < to && from < r.file_block + r.length as u64;
+/// **`runs` with blocks `from..to`, written from device block `lba`, no longer marked unwritten**,
+/// a run split where the range starts or ends inside it; a run putting them elsewhere is left
+/// marked. `None` if none was marked or the runs cannot grow by the two splits.
+pub(super) fn clear_unwritten(runs: &KVec<BlockRun>, from: u64, to: u64, lba: u64) -> Option<KVec<BlockRun>> {
+    let same_place = |r: &BlockRun| r.device_lba.wrapping_sub(r.file_block) == lba.wrapping_sub(from);
+    let touched = |r: &BlockRun| {
+        r.flags & RUN_UNWRITTEN != 0 && r.file_block < to && from < r.file_block + r.length as u64 && same_place(r)
+    };
     if !runs.iter().any(touched) {
         return None;
     }
@@ -310,6 +350,15 @@ pub(super) fn clear_unwritten(runs: &KVec<BlockRun>, from: u64, to: u64) -> Opti
         }
     }
     Some(out)
+}
+
+/// **Whether a copy would read bytes it writes first**: a file onto itself, its ranges overlapping
+/// and not the same. A copy goes forward a word at a time, so it would read what it had just
+/// written; the same range is a copy of nothing.
+pub fn same_bytes(file: &FileObject, offset: u64, src: &Source, src_at: u64, len: u64) -> bool {
+    let Source::File(from) = src else { return false };
+    let overlap = offset < src_at.saturating_add(len) && src_at < offset.saturating_add(len);
+    core::ptr::eq(&**from, file) && overlap && offset != src_at
 }
 
 /// Fault in every page of `file` that `n` bytes from `at` touch.
@@ -345,8 +394,8 @@ impl Pieces<'_> {
     }
 }
 
-/// `src`'s pieces of `n` bytes from `at`, `n` at most a page.
-fn source_pieces(src: &Source, at: u64, n: usize) -> Result<Pieces<'_>, KError> {
+/// `src`'s pieces of `n` bytes from `at`, `n` at most a page; a file's lent on `running`.
+fn source_pieces<'a>(src: &'a Source, running: Option<&Running<'_>>, at: u64, n: usize) -> Result<Pieces<'a>, KError> {
     let mut pieces = Pieces([None, None]);
     let mut done = 0;
     let mut slot = 0;
@@ -358,7 +407,7 @@ fn source_pieces(src: &Source, at: u64, n: usize) -> Result<Pieces<'_>, KError> 
         let frame = match src {
             Source::Memory(mo) => mo.page(index),
             // Faulted in before; gone only if a truncate took it since.
-            Source::File(from) => from.ready_page(index),
+            Source::File(from) => running.and_then(|r| from.ready_page(r, index)),
         };
         pieces.0[slot] = Some((frame.ok_or(KError::InvalidArgument)?, frame_at, k));
         slot += 1;

@@ -60,8 +60,8 @@ stable when cancellation lands.
 #[repr(C)]
 pub struct IoOp {
     pub opcode:     u32,        // offset 0  — IoOpcode discriminant
-    pub flags:      u32,        // offset 4  — reserved; must be 0
-    pub buffer:     RawHandle,  // offset 8  — MemoryObject for the data (u64)
+    pub flags:      u32,        // offset 4  — IO_NOCACHE on a file's Read or Write, else 0
+    pub buffer:     RawHandle,  // offset 8  — MemoryObject, or a copy's source file (u64)
     pub buf_offset: u64,        // offset 16 — byte offset within `buffer`
     pub offset:     u64,        // offset 24 — byte offset within the resource
     pub length:     u64,        // offset 32 — bytes to transfer
@@ -249,16 +249,20 @@ kernel thread of its own in its mount's budget, as a file's `Flush` does
 - **A copy** is a `Write` whose `buffer` is another file, with `MAP_READ`: `buf_offset` is where
   in it to read from, and the range must lie inside it. Each page of the source is read in before
   the destination's is touched, so two copies opposite ways never each hold a page the other waits
-  for.
+  for, and the source counts as in use until the copy ends, so no other op lets its pages go under
+  it. **A copy of a file onto itself whose ranges overlap is refused** `InvalidArgument`, as it
+  would read bytes it had just written; onto the same range it copies nothing.
 - **An op stops at the first page that fails**, or that a truncate has put past the end: `status`
   is the error and `result` the bytes done, which stay in the cache.
-- **`IO_NOCACHE` lets the window's pages go once the op succeeds**, the file written back first
-  if it is dirty, as it is after a `Write`; a copy's source's window goes too. A copy a window at a
-  time so holds two windows at most, however large the file. **It is a hint**: the pages stay
-  unless the write-back answered written, nothing maps the file, no other read, write or
-  write-back is running on it, and no write began since the write-back did. A page over blocks the
-  file's server marked unwritten stays too, unless a write-back has written them since: a fill
-  would read it as zero.
+- **`IO_NOCACHE` lets the window's pages go once the op succeeds.** After a `Write` the file is
+  written back first, and a failed write-back is the op's `status`, its bytes in the cache but not
+  on the device. A `Read`'s file, and a copy's source, let a window go only if the file is clean:
+  their holder may hold `MAP_READ` alone, which has no file written, and a file whose dirt is not
+  tracked, one its server named with no id, keeps its pages. A copy a window at a time so holds
+  two windows at most, however large the file. **It is a hint**: the pages stay unless nothing
+  maps the file, no other read, write, write-back or copy from it is running, and no write began
+  since the mark the write-back was measured from. A page over blocks the file's server marked
+  unwritten stays too, unless a write-back has written them since: a fill would read it as zero.
 
 ## IoOpcode
 

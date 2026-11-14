@@ -27,7 +27,11 @@ pub(super) fn file_io(m: &mut Mock, file: u64, op: &IoOp) -> i64 {
     };
     let file_size = size(&m.objects[f]).unwrap_or(0);
     let past = |at: u64, len: u64, end: u64| at.checked_add(len).is_none_or(|e| e > end);
-    let refused = op.flags & !libkern::IO_NOCACHE != 0
+    let overlap =
+        op.offset < op.buf_offset.saturating_add(op.length) && op.buf_offset < op.offset.saturating_add(op.length);
+    let onto_itself = !read && f == b && overlap && op.offset != op.buf_offset;
+    let refused = onto_itself
+        || op.flags & !libkern::IO_NOCACHE != 0
         || op.length > libkern::MAX_USER_COPY_SIZE
         || held.is_none_or(|end| past(op.buf_offset, op.length, end))
         || (!read && past(op.offset, op.length, file_size));
@@ -40,7 +44,7 @@ pub(super) fn file_io(m: &mut Mock, file: u64, op: &IoOp) -> i64 {
     let mut bytes = vec![0; n];
     for (k, byte) in bytes.iter_mut().enumerate() {
         let at = from_at as usize + k;
-        *byte = pages(&m.objects[from]).0[at / PAGE].0[at % PAGE];
+        *byte = pages(&m.objects[from]).0.get(at / PAGE).map_or(0, |page| page.0[at % PAGE]);
     }
     if let Object::Memory(p) | Object::File { bytes: p, .. } = &mut m.objects[to] {
         for (k, &byte) in bytes.iter().enumerate() {

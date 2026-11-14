@@ -157,6 +157,9 @@ fn read_image(image: u64, file: bool) -> Result<Option<Handle<Memory, MapReadWri
         Ok(_) if info.object_type == libkern::handle::KOBJ_FILE_OBJECT => {}
         _ => return Ok(None),
     }
+    if info.size > libkern::SPAWN_IMAGE_MAX {
+        return Err(Error::from(KError::TooLarge));
+    }
     let memory = Handle::<Memory, MapReadWrite>::create(info.size as usize)?;
     let deadline = Deadline::after(IMAGE_READ_NS).unwrap_or(Deadline::at(IMAGE_READ_NS));
     let op =
@@ -357,5 +360,22 @@ mod tests {
         let (_ns, file) = file_program(Rights::MAP_READ);
         let refused = Spawn::new(&file).spawn();
         assert_eq!(refused.err().map(|r| r.error.code()), Some(KError::NoAccess), "its size is its stat's");
+    }
+
+    #[test]
+    fn a_file_image_past_what_spawn_takes_is_refused_before_it_is_read() {
+        sys::reset();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::INSPECT;
+        let _big: Handle<File, MapReadWrite> =
+            block_on(crate::fs::create(&ns, "/bin/big", libkern::SPAWN_IMAGE_MAX + 1, rights)).unwrap();
+        let refused = block_on(Spawn::path(&ns, "/bin/big")).unwrap().spawn();
+        assert_eq!(refused.err().map(|r| r.error.code()), Some(KError::TooLarge));
+        assert!(!sys::submitted().iter().any(|op| op.opcode == IO_OPCODE_READ), "nothing read");
+        let _edge: Handle<File, MapReadWrite> =
+            block_on(crate::fs::create(&ns, "/bin/edge", libkern::SPAWN_IMAGE_MAX, rights)).unwrap();
+        let taken = block_on(Spawn::path(&ns, "/bin/edge")).unwrap().spawn();
+        assert_ne!(taken.err().map(|r| r.error.code()), Some(KError::TooLarge), "the largest spawn takes");
+        assert!(sys::submitted().iter().any(|op| op.opcode == IO_OPCODE_READ), "read");
     }
 }

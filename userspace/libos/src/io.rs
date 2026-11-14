@@ -47,7 +47,8 @@ both!([M: CanMapWrite] File, M {
 
     /// **Copy `len` bytes of `src` from `src_offset` to `offset`**, at most
     /// [`MAX_USER_COPY_SIZE`](libkern::MAX_USER_COPY_SIZE) a call: a window of a stream, whose pages
-    /// are let go once it completes, the destination's once on the device (`IO_NOCACHE`).
+    /// are let go once it completes (`IO_NOCACHE`), the destination's once on the device, and the
+    /// source's if it is clean. Onto its own overlapping bytes it is refused `InvalidArgument`.
     pub async fn copy_from<MS: CanMapRead>(&self, src: &Handle<File, MS>, src_offset: u64, offset: u64, len: u64) -> Result<usize> {
         let (buffer, buf_offset, flags) = (src.raw().0, src_offset, libkern::IO_NOCACHE);
         let op = IoOp { opcode: IO_OPCODE_WRITE, flags, buffer, buf_offset, offset, length: len };
@@ -91,6 +92,9 @@ mod tests {
         back.map(8192).unwrap().read_into(0, &mut got).unwrap();
         assert_eq!(got[..1000], [0; 1000], "a's bytes before the write");
         assert_eq!(got[1000..], [7; 1000]);
+        let copy = sys::submitted().into_iter().rfind(|op| op.buffer == a.raw().0).unwrap();
+        assert_eq!(copy.flags, libkern::IO_NOCACHE, "a copy streams, its windows let go");
+        assert_eq!(block_on(b.copy_from(&b, 0, 8, 64)).err().map(|e| e.code()), Some(KError::InvalidArgument));
     }
 
     #[test]

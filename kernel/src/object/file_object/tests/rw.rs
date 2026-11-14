@@ -190,16 +190,22 @@ fn a_window_goes_only_with_nothing_using_its_frames_and_no_write_begun_since_its
 
 #[test]
 fn a_write_back_clears_the_unwritten_mark_on_the_blocks_it_wrote_and_no_more() {
+    init_global_heap();
     let run = |file_block, device_lba, length, flags| BlockRun { file_block, device_lba, length, flags };
     let mut runs = KVec::new();
     runs.try_push(run(0, 100, 4, RUN_UNWRITTEN)).unwrap();
     runs.try_push(run(4, 0, 2, 0)).unwrap();
     runs.try_push(run(6, 200, 4, RUN_UNWRITTEN)).unwrap();
-    let cleared = crate::object::file_object::io::clear_unwritten(&runs, 2, 8).unwrap();
-    let got: std::vec::Vec<_> = cleared.iter().map(|r| (r.file_block, r.device_lba, r.length, r.flags)).collect();
+    let clear = crate::object::file_object::io::clear_unwritten;
+    let got = |runs: &KVec<BlockRun>| -> std::vec::Vec<_> {
+        runs.iter().map(|r| (r.file_block, r.device_lba, r.length, r.flags)).collect()
+    };
     let u = RUN_UNWRITTEN;
-    assert_eq!(got, [(0, 100, 2, u), (2, 102, 2, 0), (4, 0, 2, 0), (6, 200, 2, 0), (8, 202, 2, u)]);
-    assert!(crate::object::file_object::io::clear_unwritten(&cleared, 2, 8).is_none(), "nothing left marked there");
+    let cleared = clear(&runs, 2, 8, 102).unwrap();
+    assert_eq!(got(&cleared), [(0, 100, 2, u), (2, 102, 2, 0), (4, 0, 2, 0), (6, 200, 4, u)], "6.. is not at 106");
+    let cleared = clear(&cleared, 6, 8, 200).unwrap();
+    assert_eq!(got(&cleared), [(0, 100, 2, u), (2, 102, 2, 0), (4, 0, 2, 0), (6, 200, 2, 0), (8, 202, 2, u)]);
+    assert!(clear(&cleared, 2, 8, 102).is_none(), "nothing left marked there");
 }
 
 #[test]
@@ -219,6 +225,94 @@ fn a_page_over_blocks_still_marked_unwritten_is_not_let_go_until_written() {
     FileObject::unpin_if_clean(&f, mark);
     assert!(!f.is_dirty(), "clean, as a write-back leaves it");
     assert_eq!(f.let_window_go(0..2, mark), 0, "a fill would read it as zero");
-    f.written(0, 1);
+    f.written(0, 1, 100);
     assert_eq!(f.let_window_go(0..2, mark), 1, "the page written back, and not the other");
+}
+
+#[test]
+fn a_copys_source_is_held_so_no_other_op_lets_its_frames_go_mid_copy() {
+    init_global_heap();
+    let reg = registration();
+    let (src, dst) = (on_device(&reg, 20, PAGE_SIZE, &[]), on_device(&reg, 21, PAGE_SIZE, &[]));
+    let mut seen = std::vec::Vec::new();
+    let mut gone = 0;
+    let copied = FileObject::write_from(&dst, 10, 100, &Source::File(src.clone()), 0, &mut |f, i| {
+        if f.as_ptr() == dst.as_ptr() {
+            gone += src.let_window_go(0..1, src.clean_mark().unwrap());
+        }
+        fault_in(f, i, &mut seen)
+    });
+    assert_eq!((copied, gone), ((0, 100), 0), "the source's page stays while the copy reads it");
+    let back = memory(PAGE_SIZE, 0);
+    FileObject::read_into(&dst, 10, 100, &back, 0, &mut |f, i| fault_in(f, i, &mut seen));
+    assert_eq!(bytes(&back, 0, 100), [byte_of(0); 100]);
+}
+
+#[test]
+fn a_write_back_leaves_marked_what_a_resize_moved_while_it_wrote() {
+    init_global_heap();
+    let reg = registration();
+    let f = on_device(&reg, 22, 2 * PAGE_SIZE, &[]);
+    let mut seen = std::vec::Vec::new();
+    FileObject::write_from(&f, 0, 2 * P, &Source::Memory(memory(2 * PAGE_SIZE, 1)), 0, &mut |f, i| {
+        fault_in(f, i, &mut seen)
+    });
+    let moved = || {
+        let mut runs = KVec::new();
+        runs.try_push(BlockRun { file_block: 0, device_lba: 500, length: 2, flags: RUN_UNWRITTEN }).unwrap();
+        runs
+    };
+    let wrote = f.write_runs(4096, 64, |_, _, _| {
+        f.resize(0, KVec::new()).unwrap();
+        f.resize(2 * PAGE_SIZE, moved()).unwrap();
+        0
+    });
+    assert!(matches!(wrote, WriteBack::Written));
+    assert!(f.inner.lock().runs.iter().all(|r| r.flags & RUN_UNWRITTEN != 0), "blocks 500.. were never written");
+}
+
+#[test]
+fn a_copy_of_a_file_onto_its_own_overlapping_bytes_is_refused_and_onto_the_same_ones_is_none() {
+    init_global_heap();
+    let reg = registration();
+    let f = on_device(&reg, 23, PAGE_SIZE, &[]);
+    let mut seen = std::vec::Vec::new();
+    let mut fault = |f: &Ref<FileObject>, i| fault_in(f, i, &mut seen);
+    let itself = Source::File(f.clone());
+    assert_eq!(FileObject::write_from(&f, 8, 64, &itself, 0, &mut fault), (KError::InvalidArgument as i32, 0));
+    assert_eq!(FileObject::write_from(&f, 0, 64, &itself, 8, &mut fault), (KError::InvalidArgument as i32, 0));
+    assert_eq!(FileObject::write_from(&f, 16, 64, &itself, 16, &mut fault), (0, 64), "the same range");
+    assert_eq!(FileObject::write_from(&f, 64, 32, &itself, 0, &mut fault), (0, 32), "apart");
+    let back = memory(PAGE_SIZE, 0);
+    FileObject::read_into(&f, 0, 96, &back, 0, &mut fault);
+    assert_eq!(bytes(&back, 0, 96), [byte_of(0); 96]);
+}
+
+#[test]
+fn a_whole_page_with_no_frame_for_it_is_out_of_memory_and_counted_nothing() {
+    init_global_heap();
+    let reg = registration();
+    let f = on_device(&reg, 24, PAGE_SIZE, &[]);
+    let from = Source::Memory(memory(PAGE_SIZE, 2));
+    crate::mm::frame::fail_frames_after(Some(0));
+    let written = FileObject::write_from(&f, 0, P, &from, 0, &mut |_, _| None);
+    crate::mm::frame::fail_frames_after(None);
+    assert_eq!(written, (KError::OutOfMemory as i32, 0));
+    assert!(f.lookup(0).is_none());
+}
+
+#[test]
+fn a_read_past_the_end_reserves_nothing_and_one_cut_by_a_truncate_into_its_page_stops_short() {
+    init_global_heap();
+    let reg = registration();
+    let f = on_device(&reg, 25, 2 * PAGE_SIZE, &[]);
+    let into = memory(2 * PAGE_SIZE, 0);
+    let mut seen = std::vec::Vec::new();
+    assert_eq!(FileObject::read_into(&f, 2 * P, P, &into, 0, &mut |f, i| fault_in(f, i, &mut seen)), (0, 0));
+    assert!(seen.is_empty() && f.lookup(2).is_none(), "no page past the end faulted in");
+    let mut cut = |file: &Ref<FileObject>, i| {
+        file.resize(PAGE_SIZE + 50, KVec::new()).unwrap();
+        fault_in(file, i, &mut seen)
+    };
+    assert_eq!(FileObject::read_into(&f, P + 100, 100, &into, 0, &mut cut), (0, 0), "its byte now past the end");
 }

@@ -168,6 +168,18 @@ for 22 MiB. The plan named it the copy to remove if it showed, and it shows. A l
 segments through the frames, or a temporary kernel mapping of them, would end it; an image is
 already a memory object the kernel reaches. Trigger: spawn time mattering, or a loader rewrite.
 
+**A copy runs in its destination's budget, and waits on its source's device too —
+`TODO(copy-two-budgets)`.** A mount runs sixteen file operations at once, so a device that stops
+answering holds up its own mount alone. A copy between two mounts is admitted to its
+destination's, but reads its source's pages, through fills that wait on the source's device with
+no deadline. A source device that keeps its commands for good, an AHCI port that will not stop or
+a USB slot that will not disable, could so hold all sixteen of the destination's places, and every
+flush of that mount, `init`'s at shutdown among them, would queue behind them. A stick pulled out
+fails its reads at once, `PeerClosed`, so it takes a stuck controller. No single budget is right,
+as a copy waits on both devices, and a place in each would let two copies the opposite ways each
+hold one and wait for the other. Deferred (the maintainer's call, PR #441 review). Trigger: a device
+that keeps its commands meeting a copy, or IRP cancellation, which would let a fill be given up.
+
 **A supervisor's flush deadline bounds a whole mount's write-back — `TODO(flush-progress-bound)`.**
 `FLUSH_TIMEOUT_NS`, 60 s, is twice the 30 s a device gives one stuck command, but `init` and the
 storage service wait that long for every dirty file of a mount, written in turn. A slow device

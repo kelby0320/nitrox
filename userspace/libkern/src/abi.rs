@@ -12,6 +12,9 @@ use core::mem::{align_of, offset_of, size_of};
 /// Maximum initial handles a parent can install in a child at spawn.
 pub const SPAWN_MAX_HANDLES: usize = 4;
 
+/// **The largest image spawn takes**: a spawner refuses a larger one before it reads it.
+pub const SPAWN_IMAGE_MAX: u64 = 4_190_208;
+
 /// The spawn argument block, passed by pointer to `sys_process_spawn`.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -340,13 +343,13 @@ pub struct IoOp {
     /// Operation selector ([`IO_OPCODE_READ`] / [`IO_OPCODE_WRITE`] / [`IO_OPCODE_FLUSH`]) —
     /// offset 0.
     pub opcode: u32,
-    /// Reserved; must be 0 — offset 4.
+    /// [`IO_NOCACHE`] on a file's `Read` or `Write`; otherwise 0 — offset 4.
     pub flags: u32,
-    /// `MemoryObject` handle providing the data buffer — offset 8.
+    /// The data buffer: a `MemoryObject`, or for a copy, the source file — offset 8.
     pub buffer: u64,
     /// Byte offset within `buffer` — offset 16.
     pub buf_offset: u64,
-    /// Byte offset within the resource (the device) — offset 24.
+    /// Byte offset within the resource, a device or a file — offset 24.
     pub offset: u64,
     /// Bytes to transfer — offset 32.
     pub length: u64,

@@ -70,6 +70,8 @@ pub(super) fn flush_mount(reg: &Ref<UserspaceServerReg>) -> (i32, u64) {
 
 /// Write one file's pages back, tell its server, and unpin it if no writable mapping appeared.
 pub(super) fn write_back(file_obj: &Ref<FileObject>) -> Result<(), KError> {
+    #[cfg(test)]
+    WRITE_BACKS.with(|n| n.set(n.get() + 1));
     let mark = file_obj.clean_mark();
     match FileObject::writeback(file_obj) {
         crate::object::file_object::WriteBack::Written => {}
@@ -111,6 +113,12 @@ fn notify_file_touched(file_obj: &Ref<FileObject>) {
     msg.header.payload_len = body_len as u32;
     msg.header.handle_count = 0;
     crate::sched::us_forward_notify(&reg, &mut msg);
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The write-backs this thread has begun, for a test of who may begin one.
+    pub(super) static WRITE_BACKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

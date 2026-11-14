@@ -26,6 +26,11 @@ use crate::libkern::handle::RawHandle;
 /// Maximum initial handles a parent can install in a child at spawn.
 pub const SPAWN_MAX_HANDLES: usize = 4;
 
+/// **The largest image spawn takes**, `MAX_IMAGE_BYTES`: a spawner refuses a larger one before it
+/// reads it.
+pub const SPAWN_IMAGE_MAX: u64 = 4_190_208;
+const _: () = assert!(SPAWN_IMAGE_MAX as usize == crate::mm::elf::MAX_IMAGE_BYTES);
+
 /// The spawn argument block, passed by `UserPtr<SpawnArgs>`.
 #[repr(C)]
 #[derive(Copy, Clone)]

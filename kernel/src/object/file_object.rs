@@ -727,15 +727,6 @@ impl FileObject {
         true
     }
 
-    /// Page `index`'s frame while it is [`Ready`](PageState::Ready), for the borrow of `self`.
-    fn ready_page(&self, index: usize) -> Option<FrameView<'_>> {
-        let g = self.inner.lock();
-        let p = g.pages.iter().find(|p| p.index == index && p.state == PageState::Ready)?;
-        // SAFETY: a ready page has no fill (`mark_ready`), so no `settle` frees it; a truncation
-        // retires it, and only `self`'s drop frees it.
-        Some(unsafe { FrameView::new(p.frame.phys()) })
-    }
-
     /// Flush every resident, block-backed page to the device (the **Model A** overwrite
     /// writeback), a run of index-adjacent, device-adjacent pages per **block write IRP**
     /// ([`begin_write`](Self::begin_write)), blocking on each; pages over a hole are skipped.
@@ -812,7 +803,7 @@ impl FileObject {
             let status = issue(&frames, dev_block * block_size as u64, (pages * PAGE_SIZE) as u64);
             self.finish_io();
             match WriteBack::of(status) {
-                WriteBack::Written => self.written(start, pages),
+                WriteBack::Written => self.written(start, pages, dev_block),
                 w => return w,
             }
             // Past the pages the run wrote. It may have taken pages faulted in since the list was
