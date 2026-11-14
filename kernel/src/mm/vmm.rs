@@ -215,15 +215,16 @@ pub struct Vma {
 }
 
 impl Drop for Vma {
-    /// A writable file mapping lowers its file's writable-mapping count as it goes, whichever
-    /// path frees it (unmap or address-space teardown). Lock-free, since a VMA drops wherever
-    /// those do. The object's dirty pin is untouched: what was written through this mapping is
-    /// still unwritten, and a later write-back decides.
+    /// A file mapping lowers its file's mapping counts as it goes, whichever path frees it: an
+    /// unmap, after its shootdown (`Unmapped`), or an address space's teardown, which none loads.
+    /// Lock-free, since a VMA drops wherever those do. The object's dirty pin is untouched: what
+    /// was written through this mapping is still unwritten, and a later write-back decides.
     fn drop(&mut self) {
-        if let Backing::File { file, .. } = &self.backing
-            && self.prot.contains(Protection::WRITE)
-        {
-            file.writable_unmapped();
+        if let Backing::File { file, .. } = &self.backing {
+            if self.prot.contains(Protection::WRITE) {
+                file.writable_unmapped();
+            }
+            file.unmapped();
         }
     }
 }

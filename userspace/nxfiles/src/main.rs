@@ -180,8 +180,8 @@ fn perform(ns: Ns<'_>, op: &FileOp) -> (bool, &'static str) {
                 Err(_) => (false, "could not move it"),
             }
         }
-        // `libfs::copy` maps both sides and copies with no heap, bounded by `libfs::MAX_COPY`; a
-        // *folder* takes `copy_tree`.
+        // `libfs::copy` has the kernel copy a window at a time, with no heap; a *folder* takes
+        // `copy_tree`.
         FileOp::Copy { from, to, dir } => {
             if taken(to) {
                 return (false, "that name is taken");

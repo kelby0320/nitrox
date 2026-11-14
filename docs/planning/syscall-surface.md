@@ -636,6 +636,55 @@ after; the `KVec`, which `load_elf`'s one buffer asks for, is the copy to remove
 **Controls:** `process_spawn` of a `FileObject` refused, and `Spawn`'s deadline ending a `Read` that
 does not finish, through libos's mock; an image shorter than its stat refused. Author; `/pr-review`.
 
+**Built 2026-11-13** (`a6bebdb1` lets a mount's budget queue any file operation; `4427fc96` reads
+and writes; `8e208f78` `IO_NOCACHE` and the copy; `481c21bf` spawn).
+- **A file takes `Read` and `Write`** on its mount's threads, in E.7's budget: a read short at the
+  end, a write refused past it and over a hole, a whole page written without its fill, a copy
+  faulting each source page in before the destination's, and an op stopped at a failed page with
+  the bytes done. libos's `File::read`, `write` and `copy_from`.
+- **`IO_NOCACHE`** lets a window go once its op succeeds, checked under the object's lock against
+  a count of every mapping, the reads, writes and write-backs running, and the mark. libfs copies
+  16 MiB windows with it; `copy-limit` is resolved, the bound the wire's 4 GiB less a byte.
+- **Spawn takes a memory object alone**; libos's `Spawn` reads a file image into one first.
+- **For the maintainer's eye: five departures from the plan.**
+  1. **A write-back clears the `UNWRITTEN` mark on the blocks it wrote**, and a page over blocks
+     still marked is never let go. The plan did not name it: the boot-probe test found a copy's
+     destination, let go and filled again, reading as zero, since nothing had evicted a page while
+     its object lived before.
+  2. **"Frames in use never two windows above where they began" is not measured**: nothing counts
+     frames in use. `check-copy` (in CI, the maintainer's call) copies twice the machine's memory,
+     which only finishes if each window goes, and a boot-probe test sees a window filled again.
+  3. **A no-cache op that fails lets nothing go**, a failed write's pages being dirty.
+  4. **`Spawn` reads any file image, however it was made**, not `Spawn::path`'s alone, so the
+     image lookups behind a spawn ask for `INSPECT`, for the stat.
+  5. **The loader's buffer stays**, though it shows, 84 % of a spawn: `spawn-image-kvec`.
+
+**The controls**: thirty-four mutations each fail their test, five of them a boot or a gate: the
+engine's every refusal, its whole-page fill, the copy's order, the write counted as a mapping, a
+failed page hidden; the submission's every check, and a file's I/O not routed to it (a boot);
+the free's every condition; the mark's clearing and its split, and the call that clears it, which
+`check-copy` catches running out of memory, as it does a copy without `IO_NOCACHE`; the mapping
+counts in `map_file` and `Vma::drop` (a boot each); a file image taken by the kernel, a short read
+taken, a stalled read waited for, an image unstatted passed on. `abi-sync-check` finds the copy
+window changed on one side.
+**All 19 CI gates pass under KVM**, `check-copy` among them.
+
+**After review** (`a208be12`):
+- **A copy holds its source in use for its whole life**, so another op's `IO_NOCACHE` lets none of
+  its frames go mid-copy: three reviewers each showed a source window freed under a copy. Every
+  borrow of a ready frame now takes its holder's `Running`, and so does `map_file_page`, which the
+  fault handler holds from fetching a frame until its PTE is in.
+- **The read side of `IO_NOCACHE` writes nothing back**: a `Read`'s file and a copy's source let a
+  window go only if clean, their holder having perhaps `MAP_READ` alone. After a `Write`, a failed
+  write-back is the op's status.
+- **A write-back clears a mark only where the run map still puts the block it wrote**, and **a copy
+  onto its own overlapping bytes is refused**.
+- **libos refuses a spawn image past `SPAWN_IMAGE_MAX`** before it reads it.
+- Tests for the copy source's release, admission with no thread, a whole page with no frame, the
+  read loop's end guards, a non-block file's flush, and libos's copy flag.
+- **Deferred**: a copy runs in its destination's budget but waits on its source's device too
+  (`copy-two-budgets`, the maintainer's call).
+
 ### E.9 Entropy, namespaces, and the two removed
 
 - **Entropy is a char node.** `/dev/entropy` becomes a `DeviceNode`, read through `submit_read`

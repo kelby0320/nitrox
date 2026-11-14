@@ -730,3 +730,19 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-13	440	2812cc3e	10	rules-and-docs	optional	demonstrated	fixed	bfe2c7a7	the test moved below the module's imports
 2026-11-13	440	2812cc3e	11	architecture	optional	demonstrated	fixed	bfe2c7a7	all five ResolveOp offsets asserted in libkern (code/flags swapped fails to build); swept: ThreadArgs, IpcMsgHeader, HandleInfo, NsEntry and the device records pinned on both sides
 2026-11-13	440	2812cc3e	12	architecture	optional	unverified	fixed	bfe2c7a7	a flush or held with rights is refused InvalidArgument before any lookup (kernel and mock); the spec says they act on the binding's own server, not a subnamespace's
+2026-11-13	441	e00859b2	1	logic+error-paths+architecture	blocking	demonstrated	fixed	a208be12	a copy holds a Running on its source; ready_page takes the holder's Running as proof; the reviewers' probe kept as a test, failing with the source uncounted
+2026-11-13	441	e00859b2	2	logic	worth-fixing	demonstrated	fixed	a208be12	written() clears a mark only where the runs still put the block at the LBA written; a test resizes inside the IRP
+2026-11-13	441	e00859b2	3	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	a208be12	same_bytes refuses an overlapping same-file copy InvalidArgument at submit, in the engine and the mock; identity copies nothing; four controls
+2026-11-13	441	e00859b2	4	tests	worth-fixing	demonstrated	fixed	a208be12	the source goes first and on its own; test on a destination with no driver
+2026-11-13	441	e00859b2	5	tests	worth-fixing	demonstrated	fixed	a208be12	admit_with/pass_on take the start function; place kept, op unanswered, pass-on stopped each fail the test
+2026-11-13	441	e00859b2	6	tests	worth-fixing	demonstrated	fixed	a208be12	write_whole under one hold ends the unreachable IoError branch; OOM tested via fail_frames_after
+2026-11-13	441	e00859b2	7	tests	worth-fixing	demonstrated	fixed	a208be12	libos test reads the copy's submitted flags
+2026-11-13	441	e00859b2	8	architecture	worth-fixing	unverified	fixed	a208be12	reproduced (old code begins a write-back under a host-only counter); the read side lets only a clean, tracked file go
+2026-11-13	441	e00859b2	9	architecture+logic	worth-fixing	unverified	deferred	a208be12	copy-two-budgets, the maintainer's call; marker at file_ops::submit, entry, syscall-abi.md names it
+2026-11-13	441	e00859b2	10	rules-and-docs+architecture	worth-fixing	demonstrated	fixed	a208be12	IoOp mirrors, io-operation.md layout, syscall-abi.md budget wording
+2026-11-13	441	e00859b2	11	logic+error-paths	optional	unverified	fixed	a208be12	reproduced on the host (fetch, unmap, let-go, remap, install); the fault handler holds a Running and map_file_page takes it; the handler's placement runs only in a guest
+2026-11-13	441	e00859b2	12	error-paths	optional	unverified	fixed	a208be12	reproduced; a failed write-back after a Write is the op's status
+2026-11-13	441	e00859b2	13	tests	optional	demonstrated	fixed	a208be12	past-end and truncate-into-page tests; each guard removed fails
+2026-11-13	441	e00859b2	14	tests	optional	demonstrated	fixed	a208be12	a Model B file's flush answered IoError at once on a full mount
+2026-11-13	441	e00859b2	15	rules-and-docs	optional	demonstrated	fixed	a208be12	citation removed; branch sweep finds no other
+2026-11-13	441	e00859b2	16	architecture	optional	unverified	fixed	a208be12	reproduced; SPAWN_IMAGE_MAX paired by abi-sync-check, refused TooLarge before any read; tested at both neighbours

@@ -162,9 +162,19 @@ impl Op {
         if po < 0 {
             return Err(Error::from_status(po as i32));
         }
-        let mut submitted = Op::of(po as u64, if op.buffer == 0 { Kind::Status } else { Kind::Io });
+        Ok(Op::lending(po as u64, op))
+    }
+
+    /// [`submit`](Self::submit), asked again while the kernel answers `WouldBlock`, to `deadline`.
+    pub(crate) fn submit_by(resource: RawHandle, op: &IoOp, deadline: crate::Deadline) -> Result<Op> {
+        let po = submit_again(|| sys::io_submit(resource.0, op), deadline)?;
+        Ok(Op::lending(po, op))
+    }
+
+    fn lending(po: u64, op: &IoOp) -> Op {
+        let mut submitted = Op::of(po, if op.buffer == 0 { Kind::Status } else { Kind::Io });
         submitted.buffer = op.buffer;
-        Ok(submitted)
+        submitted
     }
 
     /// **Stop waiting for an I/O, handing over the buffer it borrowed**: both are closed unwaited,

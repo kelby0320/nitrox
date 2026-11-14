@@ -143,10 +143,8 @@ pub struct FileObject {
     /// Exact file size in bytes; the mapped range is bounded by it. **Changes in place** for a
     /// cached Model A file ([`resize`](Self::resize)), so it is atomic.
     size: AtomicUsize,
-    /// Writable mappings that exist now: raised by [`writable_mapped`](Self::writable_mapped)
-    /// before the mapping is made, lowered when such a VMA drops — atomic, since a VMA drops
-    /// wherever its address space does and must take no lock here.
-    writable_maps: AtomicU32,
+    /// What uses its frames now.
+    users: io::Users,
     producer: Producer,
     inner: SpinLock<Inner>,
 }
@@ -245,7 +243,7 @@ mod fault;
 /// Page-cache fill and write-back counters, the measurement behind the read-ahead decision.
 /// Always on: two atomic adds per fill are nothing beside the block read they bracket.
 pub mod fill_stats;
-mod flush;
+pub mod io;
 
 impl FileObject {
     /// **Out of the registration's cache** before the box is rebuilt, by address (a new object for
@@ -272,7 +270,7 @@ impl FileObject {
             header: Header::new(),
             magic: Self::MAGIC,
             size: AtomicUsize::new(size),
-            writable_maps: AtomicU32::new(0),
+            users: io::Users::default(),
             producer,
             inner: SpinLock::new(
                 LockRank::KernelObject,
@@ -344,7 +342,7 @@ impl FileObject {
     pub fn writable_mapped(file_obj: &Ref<FileObject>) {
         let fo: &FileObject = file_obj;
         let mut g = fo.inner.lock();
-        fo.writable_maps.fetch_add(1, Ordering::AcqRel);
+        fo.users.writable_maps.fetch_add(1, Ordering::AcqRel);
         g.map_gen = g.map_gen.wrapping_add(1);
         // No sync writes a forgotten object, so a pin on it is one nothing would ever clean.
         if g.self_pin.is_none() && fo.cache_key().is_some() && !g.dead {
@@ -355,7 +353,7 @@ impl FileObject {
     /// A writable mapping of this object has gone. Lock-free, since a VMA drops wherever its
     /// address space is torn down; saturating, so a never-counted VMA takes no one's count.
     pub fn writable_unmapped(&self) {
-        let _ = self.writable_maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        let _ = self.users.writable_maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
     }
 
     /// **Taken before a write-back: whether it can leave the object clean.** `Some` only if no
@@ -366,7 +364,7 @@ impl FileObject {
     /// that syncs while still mapped leaves its file dirty, so `libfs` and `nxsh` unmap first.
     pub fn clean_mark(&self) -> Option<u64> {
         let g = self.inner.lock();
-        if self.writable_maps.load(Ordering::Acquire) == 0 { Some(g.map_gen) } else { None }
+        if self.users.writable_maps.load(Ordering::Acquire) == 0 { Some(g.map_gen) } else { None }
     }
 
     /// After a successful write-back that began at `mark`: **clean**, unless a writable mapping
@@ -621,11 +619,6 @@ impl FileObject {
         self.inner.lock().retired.len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn writable_maps(&self) -> u32 {
-        self.writable_maps.load(Ordering::Acquire)
-    }
-
     /// Look up page `index`: its frame + [`PageState`] if cached, else `None`.
     pub fn lookup(&self, index: usize) -> Option<(PhysAddr, PageState)> {
         let g = self.inner.lock();
@@ -734,15 +727,6 @@ impl FileObject {
         true
     }
 
-    /// Page `index`'s frame while it is [`Ready`](PageState::Ready), for the borrow of `self`.
-    fn ready_page(&self, index: usize) -> Option<FrameView<'_>> {
-        let g = self.inner.lock();
-        let p = g.pages.iter().find(|p| p.index == index && p.state == PageState::Ready)?;
-        // SAFETY: a ready page has no fill (`mark_ready`), so no `settle` frees it; a truncation
-        // retires it, and only `self`'s drop frees it.
-        Some(unsafe { FrameView::new(p.frame.phys()) })
-    }
-
     /// Flush every resident, block-backed page to the device (the **Model A** overwrite
     /// writeback), a run of index-adjacent, device-adjacent pages per **block write IRP**
     /// ([`begin_write`](Self::begin_write)), blocking on each; pages over a hole are skipped.
@@ -756,6 +740,7 @@ impl FileObject {
             Producer::FsServerBlocks { device, block_size, .. } => (device.clone(), *block_size),
             _ => return WriteBack::Failed,
         };
+        let _running = io::Running::begin(fo);
         let max = run_pages(crate::io::block::max_frags(&device));
         fo.write_runs(block_size, max, |frames, dev_offset, length| {
             let po = match PendingOperation::try_new() {
@@ -818,7 +803,7 @@ impl FileObject {
             let status = issue(&frames, dev_block * block_size as u64, (pages * PAGE_SIZE) as u64);
             self.finish_io();
             match WriteBack::of(status) {
-                WriteBack::Written => {}
+                WriteBack::Written => self.written(start, pages, dev_block),
                 w => return w,
             }
             // Past the pages the run wrote. It may have taken pages faulted in since the list was
@@ -845,18 +830,6 @@ impl FileObject {
         };
         drop(pin);
         pages
-    }
-
-    /// The whole file in a fresh heap buffer, each page faulted in by `fault` first: a spawn gives
-    /// [`fault_in_page`](Self::fault_in_page), which blocks on each fill. `AllocError` on a failure.
-    pub fn read_to_kvec(&self, mut fault: impl FnMut(usize) -> Option<PhysAddr>) -> Result<KVec<u8>, AllocError> {
-        let mut buf = KVec::try_filled(0, self.size())?;
-        for (i, piece) in buf.chunks_mut(PAGE_SIZE).enumerate() {
-            fault(i).ok_or(AllocError)?;
-            // Not ready once faulted in only if a truncation took it since.
-            self.ready_page(i).ok_or(AllocError)?.read(0, piece);
-        }
-        Ok(buf)
     }
 
     /// Start an asynchronous fill of `frame` for page `index`, completing `po`, by dispatching on

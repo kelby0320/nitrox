@@ -12,10 +12,16 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 
     let optr = UserPtr::<IoOp>::new(op_ptr).map_err(from_user_access)?;
     let op = copy_from_user(optr).map_err(from_user_access)?;
+    let opcode = IoOpcode::from_u32(op.opcode).ok_or(KError::InvalidArgument)?;
+    if matches!(opcode, IoOpcode::Read | IoOpcode::Write)
+        && let Ok(found) = global::get().lookup(RawHandle(resource_h), pid, Rights::empty())
+        && let Ok(file) = found.object.downcast::<FileObject>()
+    {
+        return super::file_ops::submit(file, found.rights, &op, opcode, pid);
+    }
     if op.flags != 0 {
         return Err(KError::InvalidArgument);
     }
-    let opcode = IoOpcode::from_u32(op.opcode).ok_or(KError::InvalidArgument)?;
 
     let (dev_right, buf_right) = match opcode {
         IoOpcode::Read => (Rights::READ, Rights::MAP_WRITE),
@@ -64,6 +70,12 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     dispatched?;
     installed.commit();
     Ok(po_h.bits() as isize)
+}
+
+/// `sys_io_cancel(pending)` — request cancellation of an in-flight operation. **Always
+/// `Unsupported`**; the number is reserved.
+pub fn sys_io_cancel(_pending_h: u64) -> SysResult {
+    Err(KError::Unsupported)
 }
 
 /// `sys_io_submit`'s **flush**: make what has been written to the block device `resource_h`

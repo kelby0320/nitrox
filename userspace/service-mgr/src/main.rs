@@ -202,7 +202,7 @@ fn spawn_service(
     registry: Option<&BindNs>,
     decl: &ServiceDecl,
 ) -> (Option<Handle<Process, Only>>, Option<Endpoint>) {
-    let Some(image) = lookup::<File, MapRead, _>(root, &decl.executable, Rights::MAP_READ) else {
+    let Some(image) = lookup::<File, MapRead, _>(root, &decl.executable, Rights::MAP_READ | Rights::INSPECT) else {
         Line::new().s(b"service-mgr: image not found: ").s(decl.executable.as_bytes()).end();
         return (None, None);
     };
@@ -275,7 +275,7 @@ fn spawn_service(
 /// Spawn `path` with a fresh control channel's end moved in as its `rdx`, and `BIND_NAMESPACE`: its
 /// process and this manager's end.
 fn spawn_supervisor(root: &Handle<Namespace, NsReadOnly>, path: &str) -> Option<(Handle<Process, Only>, Endpoint)> {
-    let Some(image) = lookup::<File, MapRead, _>(root, path, Rights::MAP_READ) else {
+    let Some(image) = lookup::<File, MapRead, _>(root, path, Rights::MAP_READ | Rights::INSPECT) else {
         log::write(b"service-mgr: image not found (login chain)\n");
         return None;
     };

@@ -125,17 +125,14 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     Ok(parent_handle.bits() as isize)
 }
 
-/// A spawn's image as one buffer for the loader, read through the HHDM: a borrowed one is refused.
+/// **A spawn's image as one buffer for the loader**, from a memory object alone, so a spawn never
+/// waits on a device: a file is read into one first, by libos. A borrowed object is refused too.
 pub(super) fn image_bytes(img: &ObjectRef) -> Result<KVec<u8>, KError> {
-    if let Some(mo) = img.downcast_ref::<MemoryObject>() {
-        if !mo.kernel_reachable() {
-            return Err(KError::InvalidArgument);
-        }
-        image_fits(mo.size())?;
-        return mo.copy_to_kvec().map_err(|_| KError::OutOfMemory);
+    // TODO(spawn-image-kvec): the loader's one buffer is most of a spawn's time.
+    let mo = img.downcast_ref::<MemoryObject>().ok_or(KError::InvalidArgument)?;
+    if !mo.kernel_reachable() {
+        return Err(KError::InvalidArgument);
     }
-    // Blocks on each fill — sound on the syscall thread, which holds no AS/cache lock.
-    let file = img.clone().downcast::<FileObject>().map_err(|_| KError::InvalidArgument)?;
-    image_fits(file.size())?;
-    file.read_to_kvec(|i| FileObject::fault_in_page(&file, i)).map_err(|_| KError::OutOfMemory)
+    image_fits(mo.size())?;
+    mo.copy_to_kvec().map_err(|_| KError::OutOfMemory)
 }

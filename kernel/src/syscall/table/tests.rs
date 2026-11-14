@@ -878,6 +878,15 @@ fn a_fill_answered_with_a_borrowed_or_wrong_object_fails_and_leaves_its_page_loa
     assert_eq!(refused(po), unsupported, "another kind of object");
 }
 
+#[test]
+fn a_spawns_image_is_a_memory_object_and_never_a_file() {
+    use crate::object::FileObject;
+    use crate::object::file_object::Producer;
+    init_global_heap();
+    let file = ObjectRef::new(FileObject::try_new(PAGE_SIZE, Producer::Stub { base: 0 }).unwrap());
+    assert_eq!(spawn::image_bytes(&file).err(), Some(KError::InvalidArgument), "a file, read by libos first");
+}
+
 /// **A borrowed memory object is refused wherever the kernel reaches its frames itself.**
 #[test]
 fn a_borrowed_memory_object_is_refused_where_the_kernel_reaches_its_frames() {

@@ -24,11 +24,12 @@ fn sized(ns: &Handle<Namespace, NsMutable>, path: &str, size: u64) {
     let _: Handle<File, MapReadWrite> = block_on(fs::create(ns, path, size, rights)).unwrap();
 }
 
-/// What `f` returns, and the resolves it made: the model answers each at once, in one wait.
+/// What `f` returns, and the resolves it made: the model answers each at once, in one wait, as
+/// it does each I/O, which is not one.
 fn resolves<R>(f: impl FnOnce() -> R) -> (R, u32) {
     let waits = || {
-        let flushes = mock::submitted().iter().filter(|op| op.opcode == libkern::IO_OPCODE_FLUSH).count();
-        mock::counts().1 - flushes as u32
+        let (submits, waits, _) = mock::counts();
+        waits - submits
     };
     let before = waits();
     let r = f();
@@ -147,9 +148,25 @@ fn a_copy_names_what_is_wrong_with_its_source() {
     let ns = fresh();
     assert_eq!(copy(&ns, "/none", "/dst", true), Err(FileError::NotFound));
     assert_eq!(file_len(&ns, "/dst"), None);
-    sized(&ns, "/huge", MAX_COPY + 1);
-    assert_eq!(copy(&ns, "/huge", "/dst", true), Err(FileError::TooLarge));
-    assert_eq!(file_len(&ns, "/dst"), None, "nothing is made for a source too big");
+}
+
+#[test]
+fn a_copy_goes_a_window_at_a_time_each_let_go_once_copied() {
+    let ns = fresh();
+    let bytes: alloc::vec::Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+    put(&ns, "/src", &bytes);
+    sized(&ns, "/dst", bytes.len() as u64);
+    let rw = Rights::MAP_READ | Rights::MAP_WRITE;
+    let src: Handle<File, libos::MapRead> = block_on(ns.lookup("/src", Rights::MAP_READ)).unwrap();
+    let dst: Handle<File, MapReadWrite> = block_on(ns.lookup("/dst", rw)).unwrap();
+    let before = mock::submitted().len();
+    assert_eq!(crate::files::copy_windows(&src, &dst, bytes.len() as u64, 4096), Ok(()));
+    let ops = mock::submitted()[before..].to_vec();
+    let windows: alloc::vec::Vec<_> = ops.iter().filter(|op| op.opcode == libkern::IO_OPCODE_WRITE).collect();
+    let spans: alloc::vec::Vec<_> = windows.iter().map(|op| (op.buf_offset, op.offset, op.length)).collect();
+    assert_eq!(spans, [(0, 0, 4096), (4096, 4096, 4096), (8192, 8192, 1808)]);
+    assert!(windows.iter().all(|op| op.flags == libkern::IO_NOCACHE && op.buffer == src.raw().0));
+    assert_eq!(get(&ns, "/dst"), bytes);
 }
 
 #[test]

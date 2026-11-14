@@ -334,10 +334,28 @@ fn map_file_page_installs_pte_for_a_ready_frame() {
     let obj = into_file(f);
     asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj.clone(), 0).unwrap();
 
-    assert_eq!(asp.map_file_page(va(PAGE * 5), &obj, 1, frame), FilePage::Mapped);
+    assert_eq!(asp.map_file_page(va(PAGE * 5), &obj, 1, frame, &obj.running()), FilePage::Mapped);
     let phys = asp.translate(va(PAGE * 5)).expect("page must now be mapped");
     assert_eq!(phys, frame, "PTE points at the cache frame");
-    assert_eq!(asp.map_file_page(va(PAGE * 5), &obj, 1, frame), FilePage::Mapped);
+    assert_eq!(asp.map_file_page(va(PAGE * 5), &obj, 1, frame, &obj.running()), FilePage::Mapped);
+}
+
+#[test]
+fn a_faults_running_keeps_its_frame_from_being_let_go_before_its_pte_is_in() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    let f = FileObject::try_new(4 * PAGE as usize, Producer::Stub { base: 0 }).unwrap();
+    let Reserve::New(_) = f.reserve(1) else { panic!("a new page") };
+    f.mark_ready(1);
+    let obj = into_file(f);
+    asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj.clone(), 0).unwrap();
+    let running = obj.running();
+    let frame = obj.resident_page(1).unwrap();
+    drop(asp.unmap_at(va(PAGE * 4)));
+    assert_eq!(obj.let_window_go(0..4, obj.clean_mark().unwrap()), 0, "a fault between fetch and install");
+    asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj.clone(), 0).unwrap();
+    assert_eq!(asp.map_file_page(va(PAGE * 5), &obj, 1, frame, &running), FilePage::Mapped);
+    assert_eq!(obj.resident_page(1), Some(frame), "the PTE's frame still the file's");
 }
 
 #[test]
@@ -354,10 +372,10 @@ fn map_file_page_rejects_wrong_object_or_unmapped() {
     asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone(), 0).unwrap();
 
     let other = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-    assert_eq!(asp.map_file_page(va(PAGE * 4), &other, 0, frame), FilePage::Changed);
-    assert_eq!(asp.map_file_page(va(PAGE * 99), &obj, 0, frame), FilePage::Changed);
+    assert_eq!(asp.map_file_page(va(PAGE * 4), &other, 0, frame, &other.running()), FilePage::Changed);
+    assert_eq!(asp.map_file_page(va(PAGE * 99), &obj, 0, frame, &obj.running()), FilePage::Changed);
     assert!(!is_mapped(&asp, va(PAGE * 4)), "neither installed");
-    assert_eq!(asp.map_file_page(va(PAGE * 4), &obj, 0, frame), FilePage::Mapped);
+    assert_eq!(asp.map_file_page(va(PAGE * 4), &obj, 0, frame, &obj.running()), FilePage::Mapped);
 }
 
 #[test]
@@ -374,7 +392,7 @@ fn unmap_file_mapping_keeps_the_objects_frames() {
     let obj = into_file(f);
     let keep = obj.clone();
     asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj, 0).unwrap();
-    asp.map_file_page(va(PAGE * 4), &keep, 0, frame);
+    asp.map_file_page(va(PAGE * 4), &keep, 0, frame, &keep.running());
     assert!(is_mapped(&asp, va(PAGE * 4)));
 
     let removed = asp.unmap_at(va(PAGE * 4)).expect("covering vma");
@@ -678,7 +696,7 @@ fn copy_in_writes_only_anonymous_memory_that_is_present() {
     f.mark_ready(0);
     let file = into_file(f);
     asp.map_file(range(PAGE * 10, PAGE * 11), uprot(), file.clone(), 0).unwrap();
-    assert_eq!(asp.map_file_page(va(PAGE * 10), &file, 0, file_frame), FilePage::Mapped);
+    assert_eq!(asp.map_file_page(va(PAGE * 10), &file, 0, file_frame, &file.running()), FilePage::Mapped);
 
     assert!(asp.copy_in(va(PAGE * 5 - 2), &[1, 2, 3, 4]), "across two anonymous pages");
     assert!(!asp.copy_in(va(PAGE * 6 - 1), &[5, 6]), "into a page not yet faulted in");
@@ -746,7 +764,7 @@ fn a_fill_whose_mapping_moved_under_it_installs_nothing() {
     let (_, index) = asp.file_backing(va(PAGE * 6)).unwrap();
     drop(asp.unmap_at(va(PAGE * 4)));
     asp.map_file(range(PAGE * 5, PAGE * 9), uprot(), f.clone(), 0).unwrap();
-    assert_eq!(asp.map_file_page(va(PAGE * 6), &f, index, frame), FilePage::Changed);
+    assert_eq!(asp.map_file_page(va(PAGE * 6), &f, index, frame, &f.running()), FilePage::Changed);
     assert!(!is_mapped(&asp, va(PAGE * 6)), "page 2 is not where page 1 belongs");
     assert_eq!(asp.file_backing(va(PAGE * 6)).map(|(_, i)| i), Some(1), "what the retry faults in");
 }

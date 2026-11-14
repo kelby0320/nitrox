@@ -189,8 +189,10 @@ Phase 2 slice 5).
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
 ```
 Initiates the [`IoOp`](io-operation.md) `*op` against `resource` and returns a
-`PendingOperation` handle (positive value); it **never blocks**. In Phase 2
-`resource` is a block [`DeviceNode`](device-node.md) and the opcodes are
+`PendingOperation` handle (positive value); it **never blocks**. `resource` is a
+[`DeviceNode`](device-node.md), or a `FileObject`, which takes `Read` and `Write` a page at a time
+through its page cache, and a copy from another file
+([`io-operation.md`](io-operation.md) § *A file as the resource*). A block device's opcodes are
 `Read`/`Write`/`Flush`/`Rescan`/`Eject`; the last three name no buffer and no range, and a
 `Flush` completes once the device's cache is on its medium. **A `Flush` on a `FileObject`** puts
 every page of the file on the device instead: it needs `MAP_WRITE`, as a writable mapping does,
@@ -335,13 +337,16 @@ files are still written, and a file whose write failed stays dirty.
 **It runs on a kernel thread of its own**, so the call returns at once and the caller waits on the
 operation, with a deadline if it likes. The thread lets go of the files and the place it holds
 before it completes the operation, so a held asked straight after counts none of them. **A mount
-runs sixteen flushes at once** (`FILE_OPS_MAX`), and a flush past them waits its turn: a thread
-that finishes one runs the next waiting on its mount, first come first served. A device that
-stops answering so holds up its own mount's flushes, and no other. **A process may have four of a
-mount's flushes running or waiting** (`FILE_OPS_PER_PROCESS`): one past them is refused
+runs sixteen file operations at once** (`FILE_OPS_MAX`): its flushes, and its files' `Read`s and
+`Write`s through `sys_io_submit`. One past them waits its turn: a thread that finishes one runs the
+next waiting on its mount, first come first served. A device that stops answering so holds up its
+own mount's operations, and no other, but for a copy, which waits on its source's device too and
+runs in its destination's mount (`TODO(copy-two-budgets)`). **A process may have four of a mount's
+file operations running or waiting** (`FILE_OPS_PER_PROCESS`): one past them is refused
 `WouldBlock` synchronously, the operation not kept, which libos sleeps on and asks again, so no
-process takes a mount's budget from the others. Two calls still wait inside themselves:
-`sys_process_spawn` reads a file-backed image's pages, and `sys_power` waits on its flush.
+process takes a mount's budget from the others. One call still waits inside itself: `sys_power`,
+on its flush. `sys_process_spawn` takes a memory object alone, which libos reads a file into
+first ([`process-spawn-args.md`](process-spawn-args.md)).
 
 **A held counts the files the server has handed out that something still holds**: a handle, a
 mapping, an IRP in flight, or a dirty file's pin on itself. A forgotten file is not counted, and

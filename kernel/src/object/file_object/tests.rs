@@ -304,8 +304,11 @@ fn a_file_read_whole_while_another_writes_a_page_is_no_race() {
                 unsafe { AtomicU64::from_ptr((words as *mut u64).add(i)) }.store(u64::MAX, Ordering::Relaxed);
             }
         });
-        let copy = f.read_to_kvec(|i| FileObject::fault_in_page(&f, i)).unwrap();
-        assert!(copy.iter().all(|&b| b == 0 || b == 0xFF));
+        let copy = crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap();
+        let read = FileObject::read_into(&f, 0, PAGE_SIZE as u64, &copy, 0, &mut FileObject::fault_in_page);
+        let mut bytes = std::vec![0; PAGE_SIZE];
+        copy.copy_out(0, &mut bytes);
+        assert!(read == (0, PAGE_SIZE as u64) && bytes.iter().all(|&b| b == 0 || b == 0xFF));
     });
 }
 
@@ -316,7 +319,7 @@ fn a_page_being_filled_is_neither_lent_nor_marked_ready() {
     init_global_heap();
     let f = fobj(PAGE_SIZE);
     let Fault::Fill(_, po) = f.reserve_fault(0) else { panic!("a miss") };
-    assert!(f.ready_page(0).is_none(), "a loading page is not lent");
+    assert!(f.ready_page(&f.running(), 0).is_none(), "a loading page is not lent");
     f.mark_ready(0);
     assert_eq!(f.lookup(0).map(|(_, state)| state), Some(PageState::Loading), "nor marked ready");
     f.settle(0, &po, false);
@@ -340,23 +343,5 @@ fn a_cache_frees_each_pages_frame_once() {
     assert_eq!(heap::frames_freed_by_this_thread() - freed, 4, "the cached page and the two retired");
 }
 
-/// **A page a truncation takes between its fault and its copy fails the read**, rather than
-/// lending a page that is no longer the file's.
-#[test]
-fn a_whole_read_fails_at_a_page_truncated_after_its_fault() {
-    init_global_heap();
-    let f = fobj(2 * PAGE_SIZE);
-    let faults = core::cell::Cell::new(0);
-    let read = f.read_to_kvec(|i| {
-        faults.set(faults.get() + 1);
-        let frame = fill(&f, i, 7);
-        (i == 1).then(|| f.resize(PAGE_SIZE, KVec::new()).unwrap());
-        Some(frame)
-    });
-    assert!(read.is_err() && faults.get() == 2, "the second page, truncated after its fault, fails it");
-    let whole = fobj(2 * PAGE_SIZE);
-    let read = whole.read_to_kvec(|i| Some(fill(&whole, i, 7)));
-    assert!(read.is_ok_and(|b| b.len() == 2 * PAGE_SIZE && b.iter().all(|&x| x == 7)), "untruncated, it reads whole");
-}
-
 mod io;
+mod rw;

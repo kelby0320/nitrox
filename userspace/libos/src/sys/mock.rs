@@ -139,6 +139,9 @@ struct Mock {
     submitted: Vec<IoOp>,
     busy_flushes: u32,
     flush_never: bool,
+    /// A file's reads: never finished, or the next short by this many bytes.
+    reads_never: bool,
+    read_short: u64,
     /// What a flush and a held answer for a mount path: `(written, held)`.
     mounts: BTreeMap<Vec<u8>, (i64, i64)>,
     unseeded: u32,
@@ -333,6 +336,9 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
             }
             let status = m.fail_sync.take().unwrap_or(0);
             return m.po(Po { ready: !m.flush_never, never: m.flush_never, status, result: 0, lookup: None });
+        }
+        if file && (op.opcode == libkern::IO_OPCODE_READ || op.opcode == libkern::IO_OPCODE_WRITE) {
+            return file_io::file_io(m, resource, op);
         }
         if let Err(r) = m.get(resource, Rights::empty()) {
             return r;
@@ -775,7 +781,7 @@ pub fn ns_enumerate(ns: u64, index: u64, out: &mut NsEntry) -> i64 {
 pub fn process_spawn(args: &SpawnArgs) -> i64 {
     with(|m| {
         match m.get(args.image, Rights::MAP_READ) {
-            Ok((o, _)) if matches!(m.objects[o], Object::Memory(_) | Object::File { .. }) => {}
+            Ok((o, _)) if matches!(m.objects[o], Object::Memory(_)) => {}
             Ok(_) => return e(KError::InvalidArgument),
             Err(r) => return r,
         }
@@ -903,6 +909,7 @@ pub fn power(h: u64, op: u64) -> i64 {
 }
 
 mod controls;
+mod file_io;
 mod resolve;
 mod thread;
 mod time;

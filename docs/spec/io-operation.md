@@ -60,8 +60,8 @@ stable when cancellation lands.
 #[repr(C)]
 pub struct IoOp {
     pub opcode:     u32,        // offset 0  — IoOpcode discriminant
-    pub flags:      u32,        // offset 4  — reserved; must be 0
-    pub buffer:     RawHandle,  // offset 8  — MemoryObject for the data (u64)
+    pub flags:      u32,        // offset 4  — IO_NOCACHE on a file's Read or Write, else 0
+    pub buffer:     RawHandle,  // offset 8  — MemoryObject, or a copy's source file (u64)
     pub buf_offset: u64,        // offset 16 — byte offset within `buffer`
     pub offset:     u64,        // offset 24 — byte offset within the resource
     pub length:     u64,        // offset 32 — bytes to transfer
@@ -81,11 +81,12 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   cover less would promise something it does not do. It is not a zero-length
   transfer, so the pre-signalled no-op below does not apply to it. **Nor does a
   `Rescan` or an `Eject`**, for the same reason.
-- **`flags`** — reserved for per-operation modifiers (e.g. a future
-  force-unit-access / no-cache bit). No flag is defined yet, so any set bit
-  returns `InvalidArgument`.
+- **`flags`** — per-operation modifiers. One is defined, **`IO_NOCACHE`** (`1 << 0`), on a
+  file's `Read` or `Write` alone ([A file as the resource](#a-file-as-the-resource)); every other
+  bit, and any bit on a device's request, returns `InvalidArgument`.
 - **`buffer`** — a `MemoryObject` handle providing the data buffer: the
-  destination for `Read`, the source for `Write`. The handle must carry the
+  destination for `Read`, the source for `Write`; for a `Write` on a file, another file
+  ([A file as the resource](#a-file-as-the-resource)). The handle must carry the
   matching `MAP_*` right (`MAP_WRITE` for `Read` — the kernel writes device data
   into it; `MAP_READ` for `Write`). The kernel addresses the object's frames
   directly for DMA; the caller need not have it mapped. A borrowed object, one
@@ -223,6 +224,45 @@ registry's generation is past the read's `offset`**, then completes with the cur
 eight little-endian bytes, `result` 8. A read whose `offset` is already behind is answered at
 once. `length` below 8 is refused synchronously, `InvalidArgument`; a fifth read waiting at once
 is refused, `WouldBlock`. [`device-node.md`](device-node.md) § *The change node* has why.
+
+## A file as the resource
+
+**A `FileObject` takes `Read` and `Write`** (pre-Phase-7 E.8), the first resource that is not a
+device. A file's rights are its `MAP_READ`, to read it, and its `MAP_WRITE`, to write it; no right
+is new. **`offset` and `length` are bytes**, with none of a block device's alignment, and a call
+moves at most `MAX_USER_COPY_SIZE`, 16 MiB (`kernel/src/libkern/io_op.rs`). The op runs on a
+kernel thread of its own in its mount's budget, as a file's `Flush` does
+([`syscall-abi.md`](syscall-abi.md) § `sys_ns_lookup`): one past its process's share is refused
+`WouldBlock`.
+
+- **A `Read`** lands the file's bytes in `buffer`, a `MemoryObject` with `MAP_WRITE`, through the
+  page cache, filling a page not resident. **It is short at the file's end**: `status` `0` and
+  `result` the bytes read, `0` from the end or past it.
+- **A `Write`** puts `buffer`'s bytes in the page cache, where they are **dirty until a `Flush`**, as
+  a store through a mapping is. It counts as a writable mapping while it runs, so a flush beside
+  it leaves the file dirty rather than cleaning it under the write. A whole page is written
+  without first being read. **It is refused past the file's end**, `InvalidArgument`, as growth is
+  a resolve's; **and over a hole**, an ext4 unwritten extent among them, **or on a file with no
+  blocks or one its server has forgotten**, `Unsupported`, since write-back would skip the page
+  and the count would claim bytes no block took. Both are checked when the op is submitted, and
+  again a page at a time.
+- **A copy** is a `Write` whose `buffer` is another file, with `MAP_READ`: `buf_offset` is where
+  in it to read from, and the range must lie inside it. Each page of the source is read in before
+  the destination's is touched, so two copies opposite ways never each hold a page the other waits
+  for, and the source counts as in use until the copy ends, so no other op lets its pages go under
+  it. **A copy of a file onto itself whose ranges overlap is refused** `InvalidArgument`, as it
+  would read bytes it had just written; onto the same range it copies nothing.
+- **An op stops at the first page that fails**, or that a truncate has put past the end: `status`
+  is the error and `result` the bytes done, which stay in the cache.
+- **`IO_NOCACHE` lets the window's pages go once the op succeeds.** After a `Write` the file is
+  written back first, and a failed write-back is the op's `status`, its bytes in the cache but not
+  on the device. A `Read`'s file, and a copy's source, let a window go only if the file is clean:
+  their holder may hold `MAP_READ` alone, which has no file written, and a file whose dirt is not
+  tracked, one its server named with no id, keeps its pages. A copy a window at a time so holds
+  two windows at most, however large the file. **It is a hint**: the pages stay unless nothing
+  maps the file, no other read, write, write-back or copy from it is running, and no write began
+  since the mark the write-back was measured from. A page over blocks the file's server marked
+  unwritten stays too, unless a write-back has written them since: a fill would read it as zero.
 
 ## IoOpcode
 

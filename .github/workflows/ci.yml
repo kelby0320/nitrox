@@ -392,6 +392,14 @@ jobs:
         if: matrix.group == 'live-test'
         run: cargo xtask check-storage --kvm
 
+      # **A copy past the machine's memory** (pre-Phase-7 E.8): the test live image in 256 MiB
+      # beside a stick holding a 512 MiB file, copied there from the serial shell. The page cache
+      # never evicts, so the copy finishes only if each window's pages are let go once copied
+      # (`IO_NOCACHE`); the host then finds the stick clean and the copy whole.
+      - name: cargo xtask check-copy --kvm
+        if: matrix.group == 'live-test'
+        run: cargo xtask check-copy --kvm
+
       # **Removable media on the desktop a person uses** (Phase 6 Part F): the release live image
       # as the boot stick beside a copy of the release disk, logged in at the graphical greeter.
       # Files lists the internal disk in Drives with no eject button; a FAT stick plugged in over

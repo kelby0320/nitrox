@@ -428,6 +428,7 @@ each time.
 | `check-report` | `release-live` | 23 | The live menu's hardware report with no serial port, its pages turned on PS/2: AHCI declined with no disk, no COM1. |
 | `check-report --usb` | `release-live` | 30 | The same pages turned on a USB keyboard, before `init`. |
 | `check-storage` | `live-test` | 137 / 63 | Disks the host reads afterwards: an unmount's writes, sticks plugged and pulled while mounted, FAT, partitioning and formatting; a SATA partition labelled as the live root is. |
+| `check-copy` | `live-test` | 60 | A copy of a file twice the machine's memory, which finishes only if each window's pages are let go (`IO_NOCACHE`); the copy read whole on the host. |
 | `check-media` | `live-test` | 46 | Removable media on the desktop: Files' Drives updated with nothing typed, Save As onto a stick, Files' eject. |
 | `check-display` | `display.yml` | 120 | The guest's screen against the host's render — base address, stride, channels — and the overview's round trip. |
 | `check-input` | `input.yml` | 104 | A PS/2 key and click reaching a client window through the compositor's router. |
@@ -638,6 +639,16 @@ as the live root is, on a disk published before the RAM disk holding the real on
 passing it over is required. Without that, `init` mounts the decoy as `/` and refuses it. With the
 storage service matching the first partition published instead, it calls the boot an installed one
 and mounts the real root a second time, read-write. It runs in CI's QEMU job.
+
+`cargo xtask check-copy` is the **copy gate** (pre-Phase-7 E.8). It boots the test live image in
+the gates' 256 MiB beside a USB stick, a whole-disk ext4 holding a 512 MiB file that is holes but
+for a page at each side of a window's edge and at the end. After `boot-probe` has exited, a serial
+login runs `copy` on the stick, matched by the size in its table's row; `disk --eject` leaves it
+clean. With the machine stopped, the host finds the stick clean and the copy the source's size,
+each page of bytes in its place and the holes zero. **The page cache never evicts**, so the copy
+finishes only if each window's pages go once it is on the device: without `IO_NOCACHE` it runs out
+of memory. `boot-probe`'s no-cache test sees the same at a window's size on every boot; this gate
+is the one that runs past the machine's memory.
 
 `cargo xtask check-media` is the **removable-media gate** (Phase 6 Part F), on the desktop a person
 uses: the **release** live image as the boot stick beside a copy of the release disk, logged in at

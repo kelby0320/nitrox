@@ -37,6 +37,7 @@ mod accounts;
 mod authority;
 mod deadlines;
 mod exits;
+mod file_io;
 mod filelib;
 mod files;
 mod gates;
@@ -58,6 +59,7 @@ use accounts::*;
 use authority::*;
 use deadlines::*;
 use exits::*;
+use file_io::*;
 use filelib::*;
 use files::*;
 use gates::*;
@@ -124,6 +126,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         & overwrite_test(root)
         & grow_test(root)
         & create_test(root)
+        & file_io_test(root)
+        & nocache_test(root)
         & refused_create_test(root)
         & copy_into_itself_test(root)
         & file_cache_test(root)

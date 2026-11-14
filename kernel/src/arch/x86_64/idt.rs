@@ -334,12 +334,14 @@ fn try_fault_in(cr2: u64, error_code: u64, may_wait: bool) -> bool {
             let Some((file_obj, index)) = asp.file_backing(addr) else {
                 return false;
             };
+            // Held from fetching the frame until its PTE is in, so no `IO_NOCACHE` lets it go.
+            let running = file_obj.running();
             let frame = match may_wait {
                 true => crate::object::FileObject::fault_in_page(&file_obj, index),
                 false => file_obj.resident_page(index),
             };
             frame.is_some_and(|frame| {
-                asp.map_file_page(addr, &file_obj, index, frame) != crate::mm::addr_space::FilePage::NoMemory
+                asp.map_file_page(addr, &file_obj, index, frame, &running) != crate::mm::addr_space::FilePage::NoMemory
             })
         }
         _ => false,

@@ -159,6 +159,27 @@ mount's budget of sixteen: a stuck device holds up its own mount's flushes, and 
 will not disable keep their commands, since the device may still write the buffers, and what waits
 on one — a filesystem server's write, a flush's thread behind it — waits for good.
 
+**A spawn copies its image into one buffer for the loader — `TODO(spawn-image-kvec)`.**
+`load_elf` takes one slice, so `sys_process_spawn` copies the image's memory object into a `KVec`
+of its size, a frame at a time through word-wide atomic reads. Measured on a `test-qemu` boot
+after E.8 (pre-Phase-7), which moved a file image's read out of the syscall and into libos: 144
+spawns at 1.40 ms each inside the call, down from 1.74 ms, and **84 % of it this copy**, 169 ms
+for 22 MiB. The plan named it the copy to remove if it showed, and it shows. A loader that reads
+segments through the frames, or a temporary kernel mapping of them, would end it; an image is
+already a memory object the kernel reaches. Trigger: spawn time mattering, or a loader rewrite.
+
+**A copy runs in its destination's budget, and waits on its source's device too —
+`TODO(copy-two-budgets)`.** A mount runs sixteen file operations at once, so a device that stops
+answering holds up its own mount alone. A copy between two mounts is admitted to its
+destination's, but reads its source's pages, through fills that wait on the source's device with
+no deadline. A source device that keeps its commands for good, an AHCI port that will not stop or
+a USB slot that will not disable, could so hold all sixteen of the destination's places, and every
+flush of that mount, `init`'s at shutdown among them, would queue behind them. A stick pulled out
+fails its reads at once, `PeerClosed`, so it takes a stuck controller. No single budget is right,
+as a copy waits on both devices, and a place in each would let two copies the opposite ways each
+hold one and wait for the other. Deferred (the maintainer's call, PR #441 review). Trigger: a device
+that keeps its commands meeting a copy, or IRP cancellation, which would let a fill be given up.
+
 **A supervisor's flush deadline bounds a whole mount's write-back — `TODO(flush-progress-bound)`.**
 `FLUSH_TIMEOUT_NS`, 60 s, is twice the 30 s a device gives one stuck command, but `init` and the
 storage service wait that long for every dirty file of a mount, written in turn. A slow device
@@ -1894,15 +1915,6 @@ the field — the fix is an order that can be undone (counts before bits, or the
 a failed count) and a test failing each write of a grow in turn, as `extent.rs`'s already does for
 the extent tree.
 
-**A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
-whole of it, and refuses one over `MAX_COPY`, 8 MiB: unmapping leaves a file's pages with its
-page-cache object until the object drops, so a copy a window at a time, which `sys_memory_map`'s
-offset allows, would still hold every page. A stick's photos and videos are over it. **Scheduled**
-(2026-10-08, the maintainer's call): the syscall consolidation between Phases 6 and 7, where a
-copy is `sys_io_submit` on two files and the kernel streams it a window at a time
-([`syscall-surface.md`](../planning/syscall-surface.md)). A `SYS_FILE_COPY` for Part H was turned
-down: named for files, a special case, and code the consolidation would replace.
-
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 
 **Encrypted root (LUKS).** Architecture accommodates this — LUKS is a block device filter driver in initramfs; init invokes it before spawning fs-server. Not in initial scope. Trigger: encrypted-root deployment.
@@ -2291,16 +2303,14 @@ server's stay signalled and `sys_wait` fires again at once, a spin for the rest 
 registration going reaches it, which takes `service-mgr` with it.
 
 **libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
-`Spawn::path` hands the kernel a file, which it reads within the spawn;
 `entropy::fill` makes an `EntropyObject` for each call; `system::stop` takes the system-control
 object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
 its authority is the `SYSTEM_CLOCK` grant until there is a clock node to hold, so its one caller,
 `date`, passes one when E.10 makes it. Every other caller is written once, against the shape it will
 keep, and the call under it changes as its sub-part of
 [`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 made both flushes, once answered
-within the call, a resolve and an `io_submit`; E.8 makes `Spawn` read the image into memory
-first, E.9 makes entropy a node, and
-E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: each of those sub-parts.
+within the call, a resolve and an `io_submit`; E.8 made `Spawn` read a file image into memory
+first; E.9 makes entropy a node, and E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: each of those sub-parts.
 
 **Any process can end a test run — `TODO(test-verdict-authority)`.** `sys_test_exit` checks no
 handle and no syscap: a kernel built with the test harness writes the verdict to `isa-debug-exit`
@@ -2537,6 +2547,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A copy of a file over 8 MiB (`copy-limit`) | 2026-11-13 | **Pre-Phase-7 E.8**: a copy is `sys_io_submit(destination, Write, buffer = source file)`, a window of 16 MiB at a time with `IO_NOCACHE`, which lets each window's pages go once it is on the device, so `libfs` copies a file of any size the wire carries, 4 GiB less a byte, holding two windows at most. `check-copy` copies 512 MiB in a machine of 256 MiB. Widening the 32-bit size is a change of its own: a 5 GiB file answers `TooLarge` at the destination's create. |
 | A thread's stack with no guard below it (`thread-stack-guard`) | 2026-11-13 | **Pre-Phase-7 E.6**: a mapping placed without a hint keeps an unmapped page below itself, and below the mapping above it, so a `libos::thread::Stack` that overruns faults rather than write the mapping beneath. A hinted mapping is not held off that page. |
 | A handle's rights checked against the tag its caller passes (`handle-install-tag`) | 2026-11-06 | **`HandleTable::install(pid, ObjectRef, rights)`, pre-Phase-7 J.3**: the tag is the reference's own, its object's header's, and the reference comes back with a refusal. `allocate`, which took a tag beside a raw pointer, is private to the table and `unsafe`, so no caller writes a tag. |
 | A library's raw-handle functions beside its typed ones (`raw-handle-shims`) | 2026-11-05 | **Their last callers moved**: the test harness and the two filesystem servers' entry, in pre-Phase-7 Part E.5, and the thirty-three shims went with them, and with them what only they used: `librsproto`'s raw `Dir` session and libstream's raw `Bootstrap`. Each library's only form is its typed one. |

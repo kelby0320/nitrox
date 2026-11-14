@@ -12,13 +12,13 @@
 pub struct IoOp {
     /// [`IoOpcode`] discriminant.
     pub opcode: u32,
-    /// Reserved; must be 0.
+    /// [`IO_NOCACHE`] on a file's `Read` or `Write`; otherwise 0.
     pub flags: u32,
-    /// `MemoryObject` handle providing the data buffer (`RawHandle` value).
+    /// The data buffer (`RawHandle` value): a `MemoryObject`, or for a copy, the source file.
     pub buffer: u64,
     /// Byte offset within `buffer`.
     pub buf_offset: u64,
-    /// Byte offset within the resource (the device).
+    /// Byte offset within the resource: a device or a file.
     pub offset: u64,
     /// Bytes to transfer.
     pub length: u64,
@@ -35,6 +35,14 @@ pub const IO_OPCODE_FLUSH: u32 = 2;
 pub const IO_OPCODE_RESCAN: u32 = 3;
 /// [`IoOpcode::Eject`]'s value.
 pub const IO_OPCODE_EJECT: u32 = 4;
+
+/// **`IoOp::flags`: let the window's pages go once the op completes**, written back first if dirty:
+/// a file's `Read` or `Write`, and a copy's source too. A hint: they stay while anything uses them.
+pub const IO_NOCACHE: u32 = 1 << 0;
+
+/// **The most one `Read` or `Write` of a file moves**, a copy's window: a memory buffer is held to
+/// it by its size, a file as a buffer by this.
+pub const MAX_USER_COPY_SIZE: u64 = 16 << 20;
 
 /// The operation selector. `#[repr(u32)]`; part of the ABI version hash. Each value is stated
 /// once, above, and the variants take it.

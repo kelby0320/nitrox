@@ -1,12 +1,17 @@
 //! Processes: [`Spawn`] a program, and [`exit`].
 
-use libkern::{KError, RawHandle, Rights, SPAWN_MAX_HANDLES, SpawnArgs, SysCaps};
+use libkern::{HandleInfo, IO_OPCODE_READ, IoOp, KError, RawHandle, Rights, SPAWN_MAX_HANDLES, SpawnArgs, SysCaps};
 
 use crate::error::{Error, Result, check};
+use crate::exec::Op;
 use crate::handle::{
-    CanLookup, CanMapRead, File, Handle, Handles, MapRead, Mappable, Namespace, Only, Process, Ref, both,
+    CanLookup, CanMapRead, File, Handle, Handles, MapRead, MapReadWrite, Mappable, Memory, Namespace, Only, Process,
+    Ref, both,
 };
-use crate::sys;
+use crate::{Deadline, WaitSet, sys};
+
+/// **How long a spawn waits for its image's read**, as long as a flush: twice a device's 30 s.
+const IMAGE_READ_NS: u64 = crate::FLUSH_TIMEOUT_NS;
 
 /// A child process to start: its image, its namespace, the handles it is given and its `arg0`.
 ///
@@ -16,6 +21,8 @@ use crate::sys;
 /// `rdx` at entry.
 pub struct Spawn<'a> {
     image: u64,
+    /// Whether `image` is a file, which needs `INSPECT` for its size.
+    file: bool,
     /// The image [`path`](Spawn::path) looked up, closed once the spawn is done with it.
     _held_image: Option<Handle<File, MapRead>>,
     args: SpawnArgs,
@@ -39,11 +46,12 @@ impl From<Refused> for Error {
 
 impl<'a> Spawn<'a> {
     /// Spawn the ELF image `image` holds, which it needs `MAP_READ` on.
+    /// A file is read into memory when it starts, and needs `INSPECT` too, for its size.
     pub fn new<T: Mappable + 'a, M: CanMapRead + 'a>(image: impl Into<Ref<'a, T, M>>) -> Self {
-        Spawn::of(image.into().raw().0, None)
+        Spawn::of(image.into().raw().0, T::FILE, None)
     }
 
-    fn of(image: u64, _held_image: Option<Handle<File, MapRead>>) -> Self {
+    fn of(image: u64, file: bool, _held_image: Option<Handle<File, MapRead>>) -> Self {
         let args = SpawnArgs {
             image,
             handle_count: 0,
@@ -54,15 +62,13 @@ impl<'a> Spawn<'a> {
             namespace: 0,
             syscaps: 0,
         };
-        Spawn { image, _held_image, args, moved: Handles::new(), _b: core::marker::PhantomData }
+        Spawn { image, file, _held_image, args, moved: Handles::new(), _b: core::marker::PhantomData }
     }
 
     /// Spawn the program at `path` in `ns`.
     pub async fn path<M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>, path: &str) -> Result<Spawn<'a>> {
-        // TODO(surface-shape): the kernel reads a file's image within the spawn, until spawn takes
-        // only memory and this reads it first.
-        let image: Handle<File, MapRead> = ns.into().lookup(path, Rights::MAP_READ).await?;
-        Ok(Spawn::of(image.raw().0, Some(image)))
+        let image: Handle<File, MapRead> = ns.into().lookup(path, Rights::MAP_READ | Rights::INSPECT).await?;
+        Ok(Spawn::of(image.raw().0, true, Some(image)))
     }
 
     /// The child's root: a namespace it may only look up in. Without one, this process's own root,
@@ -118,7 +124,11 @@ impl<'a> Spawn<'a> {
     /// Start it. The kernel starts it whole or not at all, so a refusal hands back every moved
     /// grant.
     pub fn spawn(mut self) -> core::result::Result<Handle<Process, Only>, Refused> {
-        self.args.image = self.image;
+        let read = match read_image(self.image, self.file) {
+            Ok(read) => read,
+            Err(error) => return Err(Refused { error, moved: core::mem::take(&mut self.moved) }),
+        };
+        self.args.image = read.as_ref().map_or(self.image, |m| m.raw().0);
         match check(sys::process_spawn(&self.args)) {
             Ok(h) => {
                 self.moved.moved();
@@ -137,6 +147,40 @@ both!([] Process, Only {
     }
 });
 
+/// **A file image read into memory**, as the kernel spawns from nothing else, so no spawn waits on
+/// a device; `None` for an image that is memory already. Its size is the file's stat, and a read
+/// shorter than that is refused; one that runs past [`IMAGE_READ_NS`] is abandoned, `TimedOut`.
+fn read_image(image: u64, file: bool) -> Result<Option<Handle<Memory, MapReadWrite>>> {
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    match check(sys::handle_stat(image, &mut info)) {
+        Err(e) if file => return Err(e),
+        Ok(_) if info.object_type == libkern::handle::KOBJ_FILE_OBJECT => {}
+        _ => return Ok(None),
+    }
+    if info.size > libkern::SPAWN_IMAGE_MAX {
+        return Err(Error::from(KError::TooLarge));
+    }
+    let memory = Handle::<Memory, MapReadWrite>::create(info.size as usize)?;
+    let deadline = Deadline::after(IMAGE_READ_NS).unwrap_or(Deadline::at(IMAGE_READ_NS));
+    let op =
+        IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: memory.raw().0, buf_offset: 0, offset: 0, length: info.size };
+    let mut op = Op::submit_by(RawHandle(image), &op, deadline)?;
+    let signalled = {
+        let mut set = WaitSet::<1>::new();
+        set.add_op(&op)?;
+        set.wait(deadline)?
+    };
+    match op.completion_in(&signalled) {
+        None => {
+            op.abandon(memory);
+            Err(Error::from(KError::TimedOut))
+        }
+        Some(Ok(done)) if done.result == info.size => Ok(Some(memory)),
+        Some(Ok(_)) => Err(Error::from(KError::InvalidArgument)),
+        Some(Err(e)) => Err(e),
+    }
+}
+
 /// End this process with `status`, closing every handle it holds.
 pub fn exit(status: i32) -> ! {
     sys::process_exit(status)
@@ -154,6 +198,7 @@ pub fn spawn(args: &SpawnArgs) -> Result<Handle<Process, Only>> {
 mod tests {
     use super::*;
     use crate::{Channel, MapReadWrite, Memory, NsMutable, block_on};
+    use libkern::IO_OPCODE_READ;
 
     fn program() -> (Handle<Namespace, NsMutable>, Handle<Memory, MapReadWrite>) {
         let ns = Handle::<Namespace, NsMutable>::create().unwrap();
@@ -276,5 +321,61 @@ mod tests {
     #[should_panic(expected = "exit(3)")]
     fn exit_ends_the_process() {
         exit(3);
+    }
+
+    fn file_program(rights: Rights) -> (Handle<Namespace, NsMutable>, Handle<File, MapReadWrite>) {
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        let file = block_on(crate::fs::create(&ns, "/bin/f", 5000, rights | Rights::MAP_WRITE)).unwrap();
+        (ns, file)
+    }
+
+    #[test]
+    fn a_file_image_is_read_into_memory_and_the_memory_spawned() {
+        sys::reset();
+        let (ns, _file) = file_program(Rights::MAP_READ | Rights::INSPECT);
+        let s = block_on(Spawn::path(&ns, "/bin/f")).unwrap();
+        assert!(s.spawn().is_ok(), "the kernel, as the model, takes no file");
+        let reads: std::vec::Vec<_> = sys::submitted().into_iter().filter(|op| op.opcode == IO_OPCODE_READ).collect();
+        assert_eq!(reads.iter().map(|op| op.length).collect::<std::vec::Vec<_>>(), [5000], "its stat's size");
+        assert!(!sys::is_open(reads[0].buffer), "the memory let go once the child has its copy");
+    }
+
+    #[test]
+    fn an_image_read_that_does_not_finish_is_abandoned_and_a_short_one_refused() {
+        sys::reset();
+        let (ns, _file) = file_program(Rights::MAP_READ | Rights::INSPECT);
+        sys::next_read_short(1);
+        let short = block_on(Spawn::path(&ns, "/bin/f")).unwrap().spawn();
+        assert_eq!(short.err().map(|r| r.error.code()), Some(KError::InvalidArgument), "shorter than its stat");
+        sys::reads_never_finish();
+        let stuck = block_on(Spawn::path(&ns, "/bin/f")).unwrap().spawn();
+        assert_eq!(stuck.err().map(|r| r.error.code()), Some(KError::TimedOut));
+        assert_eq!(sys::closed_in_flight(), 1, "abandoned, its buffer with it");
+        assert!(sys::spawned().is_empty());
+    }
+
+    #[test]
+    fn a_file_image_the_spawner_cannot_stat_is_refused() {
+        sys::reset();
+        let (_ns, file) = file_program(Rights::MAP_READ);
+        let refused = Spawn::new(&file).spawn();
+        assert_eq!(refused.err().map(|r| r.error.code()), Some(KError::NoAccess), "its size is its stat's");
+    }
+
+    #[test]
+    fn a_file_image_past_what_spawn_takes_is_refused_before_it_is_read() {
+        sys::reset();
+        let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::INSPECT;
+        let _big: Handle<File, MapReadWrite> =
+            block_on(crate::fs::create(&ns, "/bin/big", libkern::SPAWN_IMAGE_MAX + 1, rights)).unwrap();
+        let refused = block_on(Spawn::path(&ns, "/bin/big")).unwrap().spawn();
+        assert_eq!(refused.err().map(|r| r.error.code()), Some(KError::TooLarge));
+        assert!(!sys::submitted().iter().any(|op| op.opcode == IO_OPCODE_READ), "nothing read");
+        let _edge: Handle<File, MapReadWrite> =
+            block_on(crate::fs::create(&ns, "/bin/edge", libkern::SPAWN_IMAGE_MAX, rights)).unwrap();
+        let taken = block_on(Spawn::path(&ns, "/bin/edge")).unwrap().spawn();
+        assert_ne!(taken.err().map(|r| r.error.code()), Some(KError::TooLarge), "the largest spawn takes");
+        assert!(sys::submitted().iter().any(|op| op.opcode == IO_OPCODE_READ), "read");
     }
 }

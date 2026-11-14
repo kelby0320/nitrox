@@ -1093,12 +1093,6 @@ fn forward_userspace_lookup(
     }
 }
 
-/// `sys_io_cancel(pending)` — request cancellation of an in-flight operation. **Always
-/// `Unsupported`**; the number is reserved.
-pub fn sys_io_cancel(_pending_h: u64) -> SysResult {
-    Err(KError::Unsupported)
-}
-
 /// `sys_wait(handles, count, results, deadline)` — block until ≥1 of `handles[0..count]`
 /// signals or `deadline` (absolute monotonic ns; `0` = poll, `u64::MAX` = no timeout) elapses.
 /// Each handle needs `WAIT` and must be a `Timer`, `NotificationChannel`, `IpcChannel`,
@@ -1693,6 +1687,7 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     Ok(0)
 }
 
+mod file_ops;
 mod fill;
 mod flush;
 mod mappable;
@@ -1704,7 +1699,7 @@ mod submit;
 use fill::complete_read_range_reply;
 use memory::{sys_memory_create, sys_memory_map, sys_memory_unmap};
 use spawn::sys_process_spawn;
-use submit::sys_io_submit;
+use submit::{sys_io_cancel, sys_io_submit};
 
 #[cfg(test)]
 mod tests;

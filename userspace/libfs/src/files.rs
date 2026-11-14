@@ -19,7 +19,7 @@ pub enum FileError {
     Exists,
     /// The destination could not be shrunk to the source's length.
     TruncateFailed,
-    /// The file exceeds [`MAX_COPY`].
+    /// The file exceeds [`MAX_COPY`], to read or write whole; or, to copy, what a file may hold.
     TooLarge,
     /// A [`rename_path`] across filesystems; the caller falls back to [`copy`] + unlink.
     CrossDevice,
@@ -27,11 +27,8 @@ pub enum FileError {
     Io(i32),
 }
 
-/// The largest file copied in one mapping.
-///
-/// A copy maps its file whole, so this bounds address space, not RAM; a
-/// windowed copy would not lift it, as unmapping leaves the pages with the page-cache object.
-/// A copy through `sys_io_submit` will (`copy-limit` in `deferred-decisions.md`).
+/// **The largest file [`read`] and [`write`] take**, which hold it whole in memory. A [`copy`] is
+/// not held to it: the kernel copies a window at a time, each let go once copied.
 pub const MAX_COPY: u64 = 8 * 1024 * 1024;
 
 /// The suffix of [`save`]'s temporary. Beside the file it replaces, as a rename is only
@@ -101,9 +98,6 @@ fn copy_from<M: CanLookup>(
     overwrite: bool,
 ) -> Result<u64, FileError> {
     let size = stated(src).ok_or(FileError::NotFound)?;
-    if size > MAX_COPY {
-        return Err(FileError::TooLarge);
-    }
     let existing = file_len(ns, dst);
     if existing.is_some() && !overwrite {
         return Err(FileError::Exists);
@@ -113,7 +107,7 @@ fn copy_from<M: CanLookup>(
     if size == 0 {
         return Ok(0);
     }
-    copy_bytes(src, &out, size as usize)?;
+    copy_windows(src, &out, size, libkern::MAX_USER_COPY_SIZE)?;
     Ok(size)
 }
 
@@ -134,14 +128,22 @@ fn open_sized<M: CanLookup>(
     block_on(fs::create(ns, path, size, rw())).map_err(io)
 }
 
-/// Copy `size` bytes between the files' mappings, then flush the destination to the device.
-fn copy_bytes(src: &Handle<File, MapRead>, dst: &Handle<File, MapReadWrite>, size: usize) -> Result<(), FileError> {
-    {
-        let from = src.map(size).map_err(io)?;
-        dst.map(size).map_err(io)?.copy_from(0, &from, 0, size).map_err(io)?;
+/// **Copy `size` bytes a window at a time**, each window's pages let go once it is on the device,
+/// so a copy holds two windows at most however large the file; then flush the destination.
+pub(crate) fn copy_windows(
+    src: &Handle<File, MapRead>,
+    dst: &Handle<File, MapReadWrite>,
+    size: u64,
+    window: u64,
+) -> Result<(), FileError> {
+    let mut at = 0;
+    while at < size {
+        let n = (size - at).min(window);
+        if block_on(dst.copy_from(src, at, at, n)).map_err(io)? as u64 != n {
+            return Err(FileError::Io(KError::IoError.as_i32()));
+        }
+        at += n;
     }
-    // After the unmaps: a writable mapping still in place leaves the file dirty, and the kernel
-    // keeps a dirty file's pages until the next flush.
     block_on(fs::flush(dst)).map_err(io)
 }
 

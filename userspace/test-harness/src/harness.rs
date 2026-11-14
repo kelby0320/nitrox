@@ -151,7 +151,7 @@ fn stage_spawn_demo(root: &Root, notif: &Notif) {
     log::write(b"test-harness: setup-message stage demo (spawn a Tier-1 stage)\n");
     const STAGE_ROWS: i64 = 500;
 
-    let Ok(img) = block_on(root.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ)) else {
+    let Ok(img) = block_on(root.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ | Rights::INSPECT)) else {
         log::write(b"test-harness: stage image FAIL\n");
         exit(1);
     };
@@ -512,7 +512,7 @@ fn timer_sleep_ms(ms: u64) {
 /// run); a crash exits nonzero.
 fn exit_storm_demo(root: &Root, notif: &Notif) {
     log::write(b"test-harness: exit-storm start\n");
-    let Ok(img) = block_on(root.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ)) else {
+    let Ok(img) = block_on(root.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ | Rights::INSPECT)) else {
         log::write(b"test-harness: exit-storm image lookup FAIL\n");
         exit(1);
     };
@@ -878,7 +878,7 @@ fn run_coreutil_capture_in(
     use libstream::setup::{StageStreams, send_stage_setup};
     use libstream::wire::Record;
 
-    let Ok(img) = block_on(root.lookup::<File, MapRead>(image, Rights::MAP_READ)) else {
+    let Ok(img) = block_on(root.lookup::<File, MapRead>(image, Rights::MAP_READ | Rights::INSPECT)) else {
         return_fail(b"test-harness: coreutil image FAIL\n")
     };
     let Ok((rx, list_stdout)) = Handle::<Channel, Only>::pair(1) else {
@@ -982,7 +982,7 @@ fn dead_stage_closes_its_pipe_demo(root: &Root, notif: &Notif) {
     use libstream::wire::{Record, WireError};
 
     log::write(b"test-harness: dead-stage pipe-close demo\n");
-    let Ok(img) = block_on(root.lookup::<File, MapRead>("/bin/list", Rights::MAP_READ)) else {
+    let Ok(img) = block_on(root.lookup::<File, MapRead>("/bin/list", Rights::MAP_READ | Rights::INSPECT)) else {
         return_fail(b"test-harness: dead-stage image FAIL\n")
     };
     let Ok((rx, stdout)) = Handle::<Channel, Only>::pair(4) else {
@@ -1823,7 +1823,7 @@ fn run_coreutil_in(
     use libstream::setup::{StageStreams, send_stage_setup};
     use libstream::wire::Record;
 
-    let Ok(img) = block_on(root.lookup::<File, MapRead>(image, Rights::MAP_READ)) else {
+    let Ok(img) = block_on(root.lookup::<File, MapRead>(image, Rights::MAP_READ | Rights::INSPECT)) else {
         return_fail(b"test-harness: coreutil image FAIL\n")
     };
     let Ok((rx, stdout)) = Handle::<Channel, Only>::pair(4) else {
@@ -2624,7 +2624,7 @@ fn fp_hardfloat_demo(root: &Root, notif: &Notif) {
     use libstream::wire::Record;
     // Each worker's seed travels in `argv` of the setup message, never in `arg0`.
     const SEEDS: [&str; FP_WORKERS] = ["1", "2", "3"];
-    let Ok(img) = block_on(root.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ)) else {
+    let Ok(img) = block_on(root.lookup::<File, MapRead>("/bin/test-stage", Rights::MAP_READ | Rights::INSPECT)) else {
         log::write(b"test-harness: hard-float image lookup FAIL\n");
         exit(1);
     };

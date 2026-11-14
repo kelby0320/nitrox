@@ -23,6 +23,7 @@ pub(crate) fn print_help() {
            check-install     install to a blank disk from the live menu, then boot that disk\n  \
            check-recovery    reset a password on an installed disk from the live image, then boot it\n  \
            check-storage     the test live stick beside a copy of the release disk; the host checks it\n  \
+           check-copy        copy a file twice the machine's memory on a stick; the host checks it\n  \
            check-media       the live desktop: a stick plugged in, shown in Files, saved to, ejected\n  \
            check-shutdown    `with power shutdown` on a test disk; the host checks it; then a reboot\n  \
            check-resolutions run four display gates at five screen sizes; on demand, not in CI\n  \

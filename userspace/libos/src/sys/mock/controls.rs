@@ -263,3 +263,13 @@ pub fn last_wait_count() -> usize {
 pub fn counts() -> (u32, u32, u32) {
     with(|m| (m.submits, m.waits, m.closes))
 }
+
+/// Let every file read from now on start and never finish, as one on a device that stopped does.
+pub fn reads_never_finish() {
+    with(|m| m.reads_never = true);
+}
+
+/// Answer the next file read `by` bytes short, as one of a file truncated since its stat is.
+pub fn next_read_short(by: u64) {
+    with(|m| m.read_short = by);
+}
