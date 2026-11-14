@@ -746,3 +746,13 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-13	441	e00859b2	14	tests	optional	demonstrated	fixed	a208be12	a Model B file's flush answered IoError at once on a full mount
 2026-11-13	441	e00859b2	15	rules-and-docs	optional	demonstrated	fixed	a208be12	citation removed; branch sweep finds no other
 2026-11-13	441	e00859b2	16	architecture	optional	unverified	fixed	a208be12	reproduced; SPAWN_IMAGE_MAX paired by abi-sync-check, refused TooLarge before any read; tested at both neighbours
+2026-11-13	442	1b330b80	1	logic+error-paths+architecture	blocking	demonstrated	fixed	a7353cb8	entries checks the whole array before any lookup: outside the user half FaultFromUser, nothing written; misaligned InvalidArgument; spec corrected; the old last-entry check fails the straddle test
+2026-11-13	442	1b330b80	2	architecture	blocking	demonstrated	fixed	a7353cb8	io-operation.md names /dev/entropy and the registry change node; a waited read's 0 is read again, not the end of a stream; docs
+2026-11-13	442	1b330b80	3	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	a7353cb8	listing::fill makes each entry fresh; reusing it fails the fill test (stale /b/very/long/binding bytes)
+2026-11-13	442	1b330b80	4	logic+tests	worth-fixing	demonstrated	fixed	a7353cb8	fill takes base and size and hands each entry its address; one slot, one index and an ignored failed write each fail the host test
+2026-11-13	442	1b330b80	5	error-paths	optional	demonstrated	fixed	a7353cb8	a second empty answer in a row is IoError; a mock device at /dev/entropy otherwise loops until the mock's guard
+2026-11-13	442	1b330b80	6	error-paths	optional	unverified	fixed	a7353cb8	tty-server reads each token from its kept root (try_fill) and logs a failure; a test-qemu boot with tokens refused fails the probe's grace test
+2026-11-13	442	1b330b80	7	error-paths	optional	unverified	refuted		check-install and check-recovery pass on 1b330b80 and after the fixes; the GUIDs are drawn from the same namespace before any write
+2026-11-13	442	1b330b80	8	tests	optional	demonstrated	fixed	a7353cb8	a device answering 4096 to an 8-byte fill; without the cut the slice panics
+2026-11-13	442	1b330b80	9	tests	optional	unverified	refuted		every caller is reached by a passing gate: test-qemu grace (tokens), test-interactive (auth salt), check-recovery (offline salt), check-storage (disk ids), check-install (GUIDs)
+2026-11-13	442	1b330b80	10	rules-and-docs	optional	demonstrated	fixed	a7353cb8	the paragraph lists all twelve vacant numbers, each Unsupported, pinned by a_removed_number_is_unsupported; docs
