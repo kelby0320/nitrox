@@ -42,16 +42,19 @@ impl Source {
     /// Fill `buf` with random bytes. Before the generator is seeded, which only a machine with no
     /// hardware source sees, a read waits for the seeding, answers nothing, and is read again; one
     /// the kernel had no place to keep waiting, past its few for the machine, pauses and reads
-    /// again.
+    /// again. A second empty answer in a row is `IoError`: the generator answers one only as it
+    /// seeds, so what [`open`](Self::open) found is not it.
     pub fn fill(&self, buf: &mut [u8]) -> Result<()> {
-        let mut at = 0;
+        let (mut at, mut waited) = (0, false);
         while at < buf.len() {
             let want = (buf.len() - at).min(READ_MAX);
             match block_on(self.node.read(&self.page, 0, 0, want as u64)) {
+                Ok(0) if waited => return Err(KError::IoError.into()),
+                Ok(0) => waited = true,
                 Ok(n) => {
                     let n = n.min(want);
                     self.view.read_into(0, &mut buf[at..at + n])?;
-                    at += n;
+                    (at, waited) = (at + n, false);
                 }
                 Err(e) if e.code() == KError::WouldBlock => crate::time::sleep(NO_PLACE_PAUSE_NS)?,
                 Err(e) => return Err(e),

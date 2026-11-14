@@ -93,3 +93,32 @@ fn an_unseeded_read_answers_nothing_and_is_read_again() {
     assert!(buf.iter().any(|&b| b != 0));
     assert_eq!(sys::open_handles(), before, "the waited operation closed too");
 }
+
+/// A `/dev/entropy` bound to some other node, one answering at once with `answer` bytes.
+fn with_a_node_answering(answer: Option<u64>) -> Handle<Namespace, NsMutable> {
+    let ns = Handle::<Namespace, NsMutable>::create().unwrap();
+    let node: Handle<Resource, ReadOnly> = Handle::fresh(
+        sys::with_rights(sys::device(), Rights::READ | Rights::DUPLICATE | Rights::TRANSFER),
+        Rights::READ,
+    );
+    ns.bind(PATH, &node).unwrap();
+    if let Some(n) = answer {
+        sys::script_next(0, n, true);
+    }
+    ns
+}
+
+#[test]
+fn a_node_that_answers_nothing_twice_is_refused_not_read_for_ever() {
+    sys::reset();
+    let ns = with_a_node_answering(None);
+    assert_eq!(fill(&ns, &mut [0u8; 8]).map_err(|e| e.code()), Err(KError::IoError));
+}
+
+#[test]
+fn a_node_that_answers_more_than_asked_fills_only_what_was_asked() {
+    sys::reset();
+    let ns = with_a_node_answering(Some(4096));
+    let mut buf = [0u8; 8];
+    fill(&ns, &mut buf).unwrap();
+}

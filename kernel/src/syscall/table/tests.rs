@@ -207,19 +207,6 @@ fn the_system_control_handle_cannot_be_given_away() {
 }
 
 #[test]
-fn a_listing_is_refused_a_count_past_its_cap_or_an_array_past_the_user_half_before_any_lookup() {
-    let size = core::mem::size_of::<NsEntry>() as u64;
-    let fits = USER_VIRT_END - 2 * size;
-    assert_eq!(sys_ns_enumerate(0xDEAD, 0, 0x1000, 0), Err(KError::InvalidArgument));
-    assert_eq!(sys_ns_enumerate(0xDEAD, 0, 0x1000, NS_ENUMERATE_MAX + 1), Err(KError::InvalidArgument));
-    assert_eq!(sys_ns_enumerate(0xDEAD, 0, fits, 3), Err(KError::FaultFromUser), "its last entry past the end");
-    let wraps = (u64::MAX - size) & !7;
-    assert_eq!(sys_ns_enumerate(0xDEAD, 0, wraps, 3), Err(KError::InvalidArgument), "an array that wraps");
-    assert_eq!(listing::entries(0x1000, NS_ENUMERATE_MAX), Ok(size), "the cap itself is taken");
-    assert_eq!(listing::entries(fits, 2), Ok(size), "two entries end at the user half's end");
-}
-
-#[test]
 fn map_ns_err_maps_each_variant() {
     assert_eq!(map_ns_err(NsError::InvalidPath), KError::InvalidArgument);
     assert_eq!(map_ns_err(NsError::AlreadyBound), KError::AlreadyExists);

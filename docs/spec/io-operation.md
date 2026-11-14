@@ -141,8 +141,9 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   every char node but the registry's change node, which reads it as the generation the
   reader holds ([`device-node.md`](device-node.md), Phase 6 Part C) — and
   `length` is the **maximum** bytes to read — the PO completes with `result` = the
-  bytes actually delivered (≥ 1, ≤ `length`), which arrive when the device's RX
-  interrupt fires (or immediately, if bytes are already buffered). The bytes land in
+  bytes actually delivered (≥ 1, ≤ `length`, but for `/dev/entropy`'s waited read, below),
+  which arrive when the device's RX interrupt fires (or immediately, if bytes are already
+  buffered). The bytes land in
   `buffer` exactly as for a block read.
   The `buffer` is still a `MemoryObject` with `MAP_WRITE`, and
   `buf_offset + length <= buffer.size()` still holds. The completion is delivered
@@ -155,8 +156,17 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   to everything below: like every zero-length request it completes at once, `result` `0`,
   before any device's rule is asked (`length` above).
 
-  Today's char nodes are the serial console at `/dev/console` and the raw input
-  devices at `/dev/input/raw/<n>`.
+  Today's char nodes are the serial console at `/dev/console`, the raw input devices at
+  `/dev/input/raw/<n>`, the registry's change node at `/dev/registry/changes`, and the kernel
+  generator at `/dev/entropy`.
+
+  **`/dev/entropy` answers at most 256 bytes a read, and may answer none.** A read before the
+  generator is seeded, which only a CPU with neither `RDSEED` nor `RDRAND` sees, waits for the
+  seeding and completes with `status` `0` and **`result` `0`, which means read again**, not the
+  end of a stream: the generator never ends, and a read after the seeding fills. A read past the
+  four that may wait at once is refused `WouldBlock`, synchronously. A reader that takes `0` as an
+  end, as a byte stream's `read_exact` would, must treat this node apart
+  ([`entropy.md`](../architecture/entropy.md)).
 
 ### Keyboard lights
 
@@ -189,7 +199,8 @@ needs comes with the nodes the device manager hands it.
 Char devices come in two flavours, and the difference is visible to a caller:
 
 - **Byte streams** — `/dev/console`. Exactly as above: any `length ≥ 1` is legal and
-  any `result` in `1..=length` is a normal completion.
+  any `result` in `1..=length` is a normal completion. `/dev/entropy` is one too, but for its
+  waited read's `0`, above.
 - **Record streams** — `/dev/input/raw/<n>`, which carry fixed-size
   [`InputEvent`](../architecture/input-subsystem.md) records. `length` is **floored to a
   whole number of records**, and `result` is always a whole multiple of the record

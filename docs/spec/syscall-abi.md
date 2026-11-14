@@ -103,10 +103,12 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `40` | `sys_power` |
 | `41` | `sys_clock_set` |
 
-Numbers are assigned in landing order, not in the order syscalls appear below. `31` to `35`,
-`38` and `39` went when a resolve came to carry its operation and a file's flush became an
-`io_submit` (pre-Phase-7 E.7); they answer `Unsupported`, as any number nothing holds does, until
-the numbers are assigned again.
+Numbers are assigned in landing order, not in the order syscalls appear below. **Twelve are
+vacant**, and answer `Unsupported`, as any number nothing holds does, until they are assigned
+again: `31` to `35`, `38` and `39` went when a resolve came to carry its operation and a file's
+flush became an `io_submit` (pre-Phase-7 E.7); `18` (`thread_set_affinity`) and `29`
+(`io_cancel`) went for want of a caller, `26` and `27` (`entropy_create`, `entropy_read`) when
+entropy became a char node, and `37` (`ns_derive`) when `ns_create` came to copy (E.9).
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -212,15 +214,16 @@ fn sys_ns_enumerate(ns: RawHandle, index: u64, out: UserMutPtr<NsEntry>, count: 
 Writes the bindings of namespace `ns` from the `index`-th (insertion order) into the array of
 `count` entries at `out`, and returns how many it wrote: fewer than `count` only at the end, `0`
 past it, so a listing of fewer bindings than its array holds is one call. `count` is `1` to
-`NS_ENUMERATE_MAX` (64), else `InvalidArgument`, as is an array that runs out of the user half;
-each entry is read under the namespace's lock in turn, so a bind or unbind beside a listing may
-shift what follows. Requires `LOOKUP` on `ns`. `NsEntry` (`#[repr(C)]`, `16 +
-NS_ENTRY_PATH_MAX` bytes) carries `path_len` (the binding path's true length),
-`kind` (`NS_KIND_DIRECT`/`KERNEL`/`MOUNT`), `rights` (the binding's max rights), and
-the path inline (truncated to `NS_ENTRY_PATH_MAX = 256`). This **lists a namespace's
-bindings** — mount points + kernel resources — not the files inside a mounted
-filesystem (that is an fs-server `readdir`, deferred). Synchronous (the kernel holds
-the bindings). (Syscall number `30`.)
+`NS_ENUMERATE_MAX` (64), else `InvalidArgument`, as is a misaligned `out`; **an array any part of
+which lies outside the user half is `FaultFromUser`**, refused before any lookup and with nothing
+written. A fault on an unmapped page inside it is `FaultFromUser` too, after the entries before it
+are written. Each entry is read under the namespace's lock in turn, so a bind or unbind beside a
+listing may shift what follows, and each is written whole, its path's unused bytes zero. Requires
+`LOOKUP` on `ns`. `NsEntry` (`#[repr(C)]`, `16 + NS_ENTRY_PATH_MAX` bytes) carries `path_len` (the
+binding path's true length), `kind` (`NS_KIND_DIRECT`/`KERNEL`/`MOUNT`), `rights` (the binding's max
+rights), and the path inline (truncated to `NS_ENTRY_PATH_MAX = 256`). This **lists a namespace's
+bindings** — mount points + kernel resources — not the files inside a mounted filesystem (that is an
+fs-server `readdir`, deferred). Synchronous (the kernel holds the bindings). (Syscall number `30`.)
 
 ```rust
 fn sys_wait(

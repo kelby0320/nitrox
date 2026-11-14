@@ -25,8 +25,8 @@ use libos::boot::Start;
 use libos::control::{self, Control};
 use libos::log::{self, Line};
 use libos::{
-    Carried, Channel, Deadline, Handle, MapReadWrite, Mapping, Memory, Msg, Only, Op, ReadOnly, Resource, WaitSet,
-    block_on, entropy, time,
+    Carried, Channel, Deadline, Handle, MapReadWrite, Mapping, Memory, Msg, Namespace, NsReadOnly, Only, Op, ReadOnly,
+    Resource, WaitSet, block_on, entropy, time,
 };
 use librsproto::namespace::parse_resolve_request;
 use librsproto::server;
@@ -176,13 +176,16 @@ fn now_ns() -> u64 {
     time::now().unwrap_or(0)
 }
 
-/// A token's 128 bits, from the kernel CSPRNG — **or none**: a token made up when the pool will
-/// not answer is one someone else could make up too, and without one the caller is asked for its
-/// password, which is safe. An unseeded pool is none too: the serve loop does not wait for it, and
-/// a missing token only costs a password prompt.
-fn random_token(source: Option<&entropy::Source>) -> Option<[u8; tty_server::tokens::LEN]> {
+/// A token's 128 bits, from the kernel CSPRNG `root` binds, read for this token alone — **or
+/// none**: a token made up when the pool will not answer is one someone else could make up too,
+/// and without one the caller is asked for its password, which is safe. An unseeded pool is none
+/// too: the serve loop does not wait for it, and a missing token only costs a password prompt.
+fn random_token(root: Option<&Handle<Namespace, NsReadOnly>>) -> Option<[u8; tty_server::tokens::LEN]> {
     let mut buf = [0u8; tty_server::tokens::LEN];
-    source?.try_fill(&mut buf).ok()?;
+    if root.is_none_or(|root| entropy::try_fill(root, &mut buf).is_err()) {
+        log::write(b"tty-server: no random bytes for a token; the caller will be asked a password\n");
+        return None;
+    }
     Some(buf)
 }
 
@@ -203,8 +206,8 @@ struct Server {
     /// The page every console read lands in, and its mapping.
     map: Mapping<MapReadWrite>,
     buf: Handle<Memory, MapReadWrite>,
-    /// Where tokens' bits come from: `/dev/entropy`, if the root binds it.
-    entropy: Option<entropy::Source>,
+    /// The root, where tokens' bits come from: its `/dev/entropy`.
+    root: Option<Handle<Namespace, NsReadOnly>>,
 }
 
 impl Server {
@@ -357,7 +360,7 @@ impl Server {
             OP_TTY_OPEN_SIBLING => self.open_sibling(ch, request_id),
             // A token for this terminal's backend: how the view broker learns which terminal a
             // request came from without asking the requester.
-            OP_TTY_TOKEN => match (self.reg.backend_of_terminal(ch), random_token(self.entropy.as_ref())) {
+            OP_TTY_TOKEN => match (self.reg.backend_of_terminal(ch), random_token(self.root.as_ref())) {
                 (Some(backend), Some(token)) => {
                     self.tokens.mint(token, backend, now_ns());
                     self.links.answer(ch, op, request_id, &token);
@@ -549,7 +552,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         log::write(b"tty-server: /dev/console not found\n");
         libos::exit(1);
     };
-    let entropy = start.root.as_ref().and_then(|root| entropy::Source::open(root).ok());
 
     // One page, mapped once, for every console read.
     let Ok(buf) = Handle::<Memory, MapReadWrite>::create(4096) else {
@@ -579,7 +581,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         console,
         map,
         buf,
-        entropy,
+        root: start.root.take(),
     };
     srv.serve_loop();
 }
