@@ -80,6 +80,14 @@ fn unknown_number_is_unsupported() {
 }
 
 #[test]
+fn a_removed_number_is_unsupported_before_it_reads_an_argument() {
+    for removed in [18, 29, 31, 32, 33, 34, 35, 38, 39] {
+        let refused = dispatch(removed, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
+        assert_eq!(refused, KError::Unsupported.as_isize(), "number {removed}");
+    }
+}
+
+#[test]
 fn join_subtree_prepends_base_stripping_leading_slash() {
     let mut out = [0u8; NS_PATH_MAX];
     assert_eq!(join_subtree(b"/home/alice", b"notes.txt", &mut out), Some(&b"home/alice/notes.txt"[..]));

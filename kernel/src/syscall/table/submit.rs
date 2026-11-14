@@ -7,6 +7,7 @@ use super::*;
 /// handle. Never blocks: the outcome (status + bytes transferred) arrives through the PO.
 /// Argument / permission / allocation failures return a negative `KError` synchronously with no
 /// PO; device/medium failures arrive through the PO (`docs/spec/io-operation.md`).
+// TODO(io-cancel): nothing cancels an operation once it is submitted.
 pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
 
@@ -70,12 +71,6 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     dispatched?;
     installed.commit();
     Ok(po_h.bits() as isize)
-}
-
-/// `sys_io_cancel(pending)` — request cancellation of an in-flight operation. **Always
-/// `Unsupported`**; the number is reserved.
-pub fn sys_io_cancel(_pending_h: u64) -> SysResult {
-    Err(KError::Unsupported)
 }
 
 /// `sys_io_submit`'s **flush**: make what has been written to the block device `resource_h`

@@ -195,8 +195,8 @@ In layout terms:
 
 Tracked in `docs/rationale/deferred-decisions.md` § "Drivers and interrupts":
 
-- **Cancellation** — no cancel field / cancel routine; `sys_io_cancel` is
-  `Unsupported`. Adds a `cancel` fn ptr + a cancellable flag when it lands.
+- **Cancellation** — no cancel field / cancel routine, and no syscall asks for one
+  (`io-cancel`). Adds a `cancel` fn ptr + a cancellable flag when it lands.
 - **Completion timeout** — the 30 s force-complete is not built.
 - **Filter drivers** — transparent stack insertion; the stack is fixed at build
   time in Phase 2.

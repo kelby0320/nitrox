@@ -382,7 +382,7 @@ fn closing_an_endpoint_wakes_a_receiver_blocked_on_its_peer() {
 }
 
 /// **A borrowed thread stands beside what other CPUs write in it**: one CPU reads it through a
-/// `&Thread` while another sets its affinity under `SCHED`, and a third, switching it out, writes
+/// `&Thread` while another sets where it last ran under `SCHED`, and a third, switching it out, writes
 /// its saved stack pointer with the lock let go and then clears its guard, as the switch's asm
 /// does. Miri reports a race between such a borrow and any write outside a cell; and the stack
 /// pointer is read only once the guard is seen clear.
@@ -394,7 +394,7 @@ fn a_borrowed_thread_stands_beside_its_scheduler_and_its_switch() {
     let shared: &Thread = &th;
     th.raise_on_cpu(&SCHED.lock().tok);
     std::thread::scope(|s| {
-        s.spawn(|| (1..=4).for_each(|mask| set_thread_affinity(&th, mask)));
+        s.spawn(|| (1..=4).for_each(|cpu| th.set_last_cpu(&mut SCHED.lock().tok, cpu)));
         s.spawn(|| {
             // SAFETY: the slot and the guard byte are the thread's, which `th` pins, and only this
             // switch writes them while the guard is raised: the slot, then the guard.
@@ -414,7 +414,7 @@ fn a_borrowed_thread_stands_beside_its_scheduler_and_its_switch() {
         };
         assert_eq!(sp, 0x1000, "read once the switch had committed it");
     });
-    assert_eq!(shared.cpu_mask(&SCHED.lock().tok), 4);
+    assert_eq!(shared.last_cpu(&SCHED.lock().tok), 4);
 }
 
 /// **A switch is prepared from what the incoming thread's guard lets it read, and leaves the

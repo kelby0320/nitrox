@@ -168,6 +168,21 @@ for 22 MiB. The plan named it the copy to remove if it showed, and it shows. A l
 segments through the frames, or a temporary kernel mapping of them, would end it; an image is
 already a memory object the kernel reaches. Trigger: spawn time mattering, or a loader rewrite.
 
+**Changing a thread's CPUs after it is made — `TODO(thread-affinity)`.** A thread's affinity is
+set by `sys_thread_create` (`ThreadArgs::cpu_affinity`), and placement and stealing honour it.
+`sys_thread_set_affinity` changed it after, and had no caller in the tree, so it went in the
+syscall surface's pass (2026-11-13, the maintainer's call), with the scheduler's setter that only
+it used. Bringing it back is its old body: a `SIGNAL` check, the mask trimmed to `MAX_CPUS` and
+refused empty, set under `SCHED`; a thread on a CPU the new mask excludes moves at its next
+reschedule. **Trigger**: the `std` port's `sched_setaffinity`, or another caller.
+
+**Cancelling an operation once it is submitted — `TODO(io-cancel)`.** `sys_io_cancel` only ever
+answered `Unsupported`, its number reserved for an ABI not yet stable, so it went in the syscall
+surface's pass (2026-11-13, the maintainer's call). A waiter can give up its wait (`Op::abandon`),
+and the operation runs to its end, its buffer the device's until then. A real cancel needs IRP
+cancellation in every driver, and a PO that completes `Cancelled` once the device has let go.
+**Trigger**: the `std` port's, or a device whose operations can wait for ever.
+
 **A copy runs in its destination's budget, and waits on its source's device too —
 `TODO(copy-two-budgets)`.** A mount runs sixteen file operations at once, so a device that stops
 answering holds up its own mount alone. A copy between two mounts is admitted to its

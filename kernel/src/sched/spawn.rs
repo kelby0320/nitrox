@@ -134,13 +134,6 @@ extern "C" fn run_job<J: Job>(at: usize) {
     J::run(unsafe { KBox::from_raw(at) })
 }
 
-/// Set a thread's CPU **affinity** mask (`sys_thread_set_affinity`). Takes effect at the
-/// next placement / steal / wake; a thread running on a now-excluded CPU finishes its slice
-/// there.
-pub fn set_thread_affinity(thread: &Ref<Thread>, mask: u8) {
-    thread.set_cpu_mask(&mut SCHED.lock().tok, mask);
-}
-
 /// As [`spawn`] but pinned to the CPUs in `cpu_mask` (bit `c` ⇒ may run on CPU `c`).
 pub fn spawn_with_affinity(entry: ThreadEntry, arg: usize, cpu_mask: u8) -> Result<u32, AllocError> {
     spawn_inner(entry, arg, SchedClass::TimeShared, 0, 0, cpu_mask)

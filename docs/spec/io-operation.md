@@ -24,7 +24,6 @@ entry, so the descriptor is defined once here and reused by both paths.
 
 ```rust
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
-fn sys_io_cancel(pending: RawHandle) -> isize
 ```
 
 `resource` is the handle the operation targets. In Phase 2 this is a **block
@@ -49,10 +48,9 @@ resource-agnostic so future resource kinds (char devices, sockets) reuse them.
   **operation** outcomes and are delivered through the PO, not synchronously —
   the same split the namespace lookup uses (`syscall-abi.md` § Namespace).
 
-`sys_io_cancel` requests cancellation of an in-flight operation. **Phase 2
-returns `Unsupported`** — IRP cancellation is deferred (`deferred-decisions.md`
-§ "Drivers and interrupts"); the syscall number is reserved now so the ABI is
-stable when cancellation lands.
+**Nothing cancels an operation once it is submitted** (`io-cancel` in
+`deferred-decisions.md`): a waiter may give up its wait, and the operation runs to its end.
+`sys_io_cancel`, which only ever answered `Unsupported`, went on 2026-11-13.
 
 ## Layout
 
@@ -355,8 +353,8 @@ returned. The `IoOp` is the **userspace-facing** request; the `Irp` is its
 - Opcodes beyond `Read`/`Write`/`Flush`/`Rescan`/`Eject` — `Trim`/`Discard`, device-specific
   control. Added with a consumer (SSD trim). A per-write force-unit-access bit is a
   `flags` modifier, below, not an opcode.
-- The `flags` modifiers (force-unit-access, no-cache).
-- `sys_io_cancel` semantics (returns `Unsupported` until IRP cancellation lands).
+- The `flags` modifier force-unit-access; `IO_NOCACHE` is built.
+- Cancelling a submitted operation (`io-cancel`), with IRP cancellation.
 - Scatter/gather over multiple buffers in one `IoOp` (Phase 2 is single-buffer;
   the IRP's PRDT already supports multiple physical fragments of one object).
 

@@ -49,8 +49,6 @@ pub const SYS_PROCESS_SPAWN: u64 = 15;
 pub const SYS_PROCESS_EXIT: u64 = 16;
 /// `sys_thread_exit` — terminate the calling thread with a status.
 pub const SYS_THREAD_EXIT: u64 = 17;
-/// `sys_thread_set_affinity` — restrict a thread's CPU set (no-op until SMP).
-pub const SYS_THREAD_SET_AFFINITY: u64 = 18;
 /// `sys_thread_create` — start another thread in the calling process.
 pub const SYS_THREAD_CREATE: u64 = 19;
 /// `sys_thread_get_registers` — read a suspended (faulted) thread's registers.
@@ -71,8 +69,6 @@ pub const SYS_ENTROPY_CREATE: u64 = 26;
 pub const SYS_ENTROPY_READ: u64 = 27;
 /// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
 pub const SYS_IO_SUBMIT: u64 = 28;
-/// `sys_io_cancel` — request cancellation (currently `Unsupported`).
-pub const SYS_IO_CANCEL: u64 = 29;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
 pub const SYS_NS_ENUMERATE: u64 = 30;
 /// `sys_process_terminate` — **ask** a process to exit; it is delivered as a

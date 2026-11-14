@@ -166,8 +166,8 @@ a held send's.
   read twice costs only the second wait: a lookup's handle is installed by the first read, and
   every later read reports the same handle. A second poll after `Ready` is an error and waits on
   nothing: the result, which may be a handle, is handed out once.
-- **`Drop`** closes the PO, **first waiting for an unfinished I/O**: `sys_io_cancel` is
-  `Unsupported`, and the device may still be writing the buffer the dropped future borrowed,
+- **`Drop`** closes the PO, **first waiting for an unfinished I/O**: nothing cancels one
+  (`io-cancel`), and the device may still be writing the buffer the dropped future borrowed,
   which the caller would otherwise get back while it is written. A wait refused with
   `OutOfMemory` (the PO's waiter queue full) is slept on and tried again; any other refusal is
   for good. A lookup waits for nothing, since the kernel releases a lookup whose PO is closed

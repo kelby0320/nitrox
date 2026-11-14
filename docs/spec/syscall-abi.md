@@ -90,7 +90,6 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `15` | `sys_process_spawn` |
 | `16` | `sys_process_exit` |
 | `17` | `sys_thread_exit` |
-| `18` | `sys_thread_set_affinity` |
 | `19` | `sys_thread_create` |
 | `20` | `sys_thread_get_registers` |
 | `21` | `sys_exception_resume` |
@@ -101,7 +100,6 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `26` | `sys_entropy_create` |
 | `27` | `sys_entropy_read` |
 | `28` | `sys_io_submit` |
-| `29` | `sys_io_cancel` |
 | `30` | `sys_ns_enumerate` |
 | `36` | `sys_process_terminate` |
 | `37` | `sys_ns_derive` |
@@ -182,8 +180,7 @@ layout assertions, which is why the drift was invisible.
 
 The system's single generic asynchronous-I/O entry point; full descriptor and
 semantics in [`io-operation.md`](io-operation.md). Syscall numbers:
-`sys_io_submit = 28`, `sys_io_cancel = 29` (introduced with the storage slice,
-Phase 2 slice 5).
+`sys_io_submit = 28` (introduced with the storage slice, Phase 2 slice 5).
 
 ```rust
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
@@ -208,13 +205,9 @@ exhaustion) return a negative `KError` **synchronously**, with no PO created;
 *device/medium* failures are delivered **through the PO** — the same split as the
 namespace lookup. (Syscall number `28`.)
 
-```rust
-fn sys_io_cancel(pending: RawHandle) -> isize
-```
-Requests cancellation of an in-flight operation. **Phase 2 returns
-`Unsupported`** — IRP cancellation is deferred (`deferred-decisions.md`
-§ "Drivers and interrupts"); the number is reserved now so the ABI is stable when
-cancellation lands. (Syscall number `29`.)
+**Nothing cancels an operation once it is submitted** (`TODO(io-cancel)`): a waiter may give up
+its wait, and the operation runs to its end. `sys_io_cancel` (`29`), which only ever answered
+`Unsupported`, went on 2026-11-13, to come back with IRP cancellation and a caller.
 
 ```rust
 fn sys_ns_enumerate(ns: RawHandle, index: u64, out: UserMutPtr<NsEntry>) -> isize
@@ -480,20 +473,14 @@ fn sys_process_exit(status: i32) -> !
 ```
 Exits the **calling process** with `status`: the kernel closes the process's handles, records `status` (a second `sys_process_exit` racing the first exits with the first's), and sets every other thread of the process on its way to end: a blocked one is woken and its `sys_wait` never returns to it, a suspended one is resumed to terminate, and one running on another CPU is stopped by an interrupt. Each ends on its way back to ring 3, so whatever it held is let go. The last thread out delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), and the process is reaped (freeing its address space). Does not return. (Syscall number `16`.)
 
-```rust
-fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: u64) -> isize
-```
-Restricts which CPUs `thread` may run on (requires `SIGNAL`). **No-op until SMP (Phase 3):** validates the handle is a `Thread` carrying `SIGNAL`, then accepts and ignores `cpu_mask`. (Syscall number `18`.)
+**A thread's CPUs are set when it is made** (`ThreadArgs::cpu_affinity`, `sys_thread_create`), and
+nothing changes them after (`TODO(thread-affinity)`): `sys_thread_set_affinity` (`18`), which had
+no caller, went on 2026-11-13, to come back with the `std` port's.
 
 ```rust
 fn sys_thread_set_tls(tls_base: usize) -> isize
 ```
 Sets the calling thread's TLS base register (FS_BASE on x86_64, TPIDR_EL0 on aarch64).
-
-```rust
-fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: CpuMask) -> isize
-```
-Restricts which CPUs `thread` may run on. Requires `SIGNAL` right.
 
 ```rust
 fn sys_thread_get_registers(thread: RawHandle, out: UserMutPtr<RegisterValues>) -> isize

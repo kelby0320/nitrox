@@ -147,8 +147,6 @@ pub const SYS_PROCESS_SPAWN: u64 = 15;
 pub const SYS_PROCESS_EXIT: u64 = 16;
 /// `sys_thread_exit` — terminate the calling thread with a status.
 pub const SYS_THREAD_EXIT: u64 = 17;
-/// `sys_thread_set_affinity` — restrict a thread's CPU set (no-op until SMP).
-pub const SYS_THREAD_SET_AFFINITY: u64 = 18;
 /// `sys_thread_create` — start another thread in the calling process.
 pub const SYS_THREAD_CREATE: u64 = 19;
 /// `sys_thread_get_registers` — read a suspended (faulted) thread's registers.
@@ -169,8 +167,6 @@ pub const SYS_ENTROPY_CREATE: u64 = 26;
 pub const SYS_ENTROPY_READ: u64 = 27;
 /// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
 pub const SYS_IO_SUBMIT: u64 = 28;
-/// `sys_io_cancel` — request cancellation of an in-flight operation (always `Unsupported`).
-pub const SYS_IO_CANCEL: u64 = 29;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
 pub const SYS_NS_ENUMERATE: u64 = 30;
 /// `sys_process_terminate` — **ask** a process to exit (§11h) via a `TerminateRequested` notice.
@@ -216,7 +212,6 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_CHANNEL_SEND => encode(sys_channel_send(a0, a1, a2, a3, a4, a5)),
         SYS_CHANNEL_RECV => encode(sys_channel_recv(a0, a1, a2, a3)),
         SYS_PROCESS_SPAWN => encode(sys_process_spawn(a0)),
-        SYS_THREAD_SET_AFFINITY => encode(sys_thread_set_affinity(a0, a1)),
         SYS_THREAD_CREATE => encode(sys_thread_create(a0)),
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
@@ -232,7 +227,6 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_ENTROPY_CREATE => encode(sys_entropy_create()),
         SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
         SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
-        SYS_IO_CANCEL => encode(sys_io_cancel(a0)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Test build only: end the QEMU run with the caller's verdict. Without `isa-debug-exit`
         // the write is ignored and this **returns `Unsupported`**; parking the CPU instead
@@ -272,19 +266,6 @@ fn sys_thread_exit(status: i32) -> ! {
     crate::sched::exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: status })
 }
 
-/// `sys_thread_set_affinity(thread, cpu_mask)` — restrict a thread's CPUs (bit `c` ⇒ CPU `c`).
-/// Requires `SIGNAL`. Bits above `MAX_CPUS` are ignored; an empty mask is `InvalidArgument`.
-pub fn sys_thread_set_affinity(thread_h: u64, cpu_mask: u64) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-    let ok = lookup_as::<crate::object::Thread>(thread_h, pid, Rights::SIGNAL)?;
-    let mask = (cpu_mask & ((1u64 << crate::arch::MAX_CPUS) - 1)) as u8;
-    if mask == 0 {
-        return Err(KError::InvalidArgument);
-    }
-    crate::sched::set_thread_affinity(&ok, mask);
-    Ok(0)
-}
-
 /// `sys_thread_create(args)` — start another thread in the **calling process** and return a
 /// `Thread` handle (`SIGNAL | TERMINATE | INSPECT | DUPLICATE`) to it. The new thread begins at
 /// `args.entry` (ring 3) with `rsp = args.user_sp` and `rcx = args.arg0`; the caller owns the
@@ -322,6 +303,7 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     if args.nice < -20 || args.nice > 19 {
         return Err(KError::InvalidArgument);
     }
+    // TODO(thread-affinity): a thread's CPUs are set here, and nothing changes them after.
     let cpu_mask = if args.cpu_affinity == 0 {
         u8::MAX
     } else {
@@ -1699,7 +1681,7 @@ mod submit;
 use fill::complete_read_range_reply;
 use memory::{sys_memory_create, sys_memory_map, sys_memory_unmap};
 use spawn::sys_process_spawn;
-use submit::{sys_io_cancel, sys_io_submit};
+use submit::sys_io_submit;
 
 #[cfg(test)]
 mod tests;
