@@ -60,9 +60,8 @@ stub, which `iretq`s the (possibly retried) frame. The uniform stub epilogue
 makes *every* user-fault vector suspendable, not just `#PF`.
 
 **Deferred to Phase 2** (the debugger extras): the `ResumeSkip` /
-`ModifyAndResume` dispositions, the 30 s auto-terminate timeout
-(`sys_exception_extend_timeout`), and the debugger exception-channel priority
-chain.
+`ModifyAndResume` dispositions, the 30 s auto-terminate timeout, and the debugger
+exception-channel priority chain.
 
 ## Status (this slice)
 

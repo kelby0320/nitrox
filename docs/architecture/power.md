@@ -1,10 +1,10 @@
 # Power
 
 **Status: the kernel half built with administration Part E.3, and `shutdown` above it with Part
-E.4; the stop became a write to the power node on 2026-11-15, replacing the `SystemControl` object
-and `sys_power`.** The power node, its halt and reboot, and the FADT facts a reset and the clock
-use. A person asks with `with power shutdown [--reboot]`; `service-mgr` stops the sessions and the
-services, and `init` unmounts its filesystems and writes the power node
+E.4; the stop is a write to the power node.** The power node, its halt and reboot, and the FADT
+facts a reset and the clock use. A person asks with `with power shutdown [--reboot]`;
+`service-mgr` stops the sessions and the services, and `init` unmounts its filesystems and writes
+the power node
 ([`service-manager.md`](service-manager.md) § *Shutdown*). Not built at all: power-off, which needs
 AML.
 
@@ -20,8 +20,8 @@ which a write needs, and `INSPECT`, and neither `DUPLICATE` nor `TRANSFER` (`INI
 - so it is bound in no namespace, and no lookup yields it.
 
 The bind was the gap the PR #342 review found: `sys_ns_bind` asked for no right on a direct handle,
-so `init` could have published the object it then held (a `SystemControl` object, until 2026-11-15)
-at a path anyone resolving it would get a `WRITE` handle from. A direct-handle bind needs
+so `init` could have published the object it then held at a path anyone resolving it would get a
+`WRITE` handle from. A direct-handle bind needs
 `TRANSFER` since then, and `DUPLICATE` since 2026-11-13, for every object — a bind gives the
 object away as a send does, and is a copy ([`syscall-abi.md`](../spec/syscall-abi.md) §
 Namespace). The power node, which has neither right, still cannot be bound.
@@ -108,7 +108,7 @@ it. A revision-1 FADT ends at byte 116, before the reset register:
 The hardware report prints them as four `fadt:` lines, so the laptop's report says whether it can
 reset by register. The RTC reads the century register when the FADT names one, in the chip's own
 BCD or binary, and believes only 19–21; otherwise the year is 2000–2099, as before. **A set writes
-it** (the clock node's write; `sys_clock_set` until 2026-11-15), in the same encoding — which is why a set is refused outside
+it** (the clock node's write), in the same encoding — which is why a set is refused outside
 2000–2099: a machine with no century register would read a later year back as another century.
 
 ## What gates it

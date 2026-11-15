@@ -3,10 +3,8 @@
 **Status:** Implemented (Phase 3 slice 6, 2026-07-14). Living document. The type,
 the `Process.syscaps` field, spawn inheritance, the init boot grant, and the two wired
 gates (`BIND_NAMESPACE` on `sys_ns_bind`, `REAL_TIME` on the RT scheduling class) are
-in. **A third, `SYSTEM_CLOCK` on `sys_clock_set`, from administration Part E.5
-(2026-09-29) until 2026-11-15**, when the clock became a node and bit 4 fell vacant. The
-other three caps are defined and inherited, their gates deferred to their operations'
-slices. Last checked 2026-11-15.
+in. The other three caps are defined and inherited, their gates deferred to their
+operations' slices. Last checked 2026-11-15.
 
 **SysCaps** are the kernel's second axis of authority: **ambient, per-process
 capabilities** for privileged *operations*, distinct from per-handle
@@ -40,7 +38,7 @@ Capability Bitmask"). Each is one bit of a `u64`:
 | Bit | Capability | Gates | Wired |
 |---|---|---|---|
 | `1<<0` | `LOAD_MODULE` | loading/unloading Tier-2 LKMs | **defined only** (no loader yet) |
-| `1<<1` | `BIND_NAMESPACE` | `sys_ns_bind` (`sys_ns_release_initramfs` does not exist) | **this slice** |
+| `1<<1` | `BIND_NAMESPACE` | `sys_ns_bind` | **this slice** |
 | `1<<2` | `PHYSICAL_MEMORY` | mapping arbitrary physical memory | **defined only** (no phys-map syscall) |
 | `1<<3` | `REAL_TIME` | requesting the `RealTime` scheduling class | **this slice** |
 | `1<<5` | `AUDIT_CONTROL` | audit-subsystem management | **defined only** (no audit subsystem) |
@@ -158,11 +156,8 @@ right returns, so userspace sees one "insufficient authority" story.
 
 ### The two gates wired this slice
 
-**`BIND_NAMESPACE` — on `sys_ns_bind`** (`syscall/table.rs`). It was also specified to gate
-`sys_ns_release_initramfs`, which **has never existed** under that spelling or as
-`sys_release_initramfs` (audit D.5f, corrected 2026-08-18). The existing
-`Rights::BIND`-on-the-handle check stays; the
-syscap is an *additional* gate checked first:
+**`BIND_NAMESPACE` — on `sys_ns_bind`** (`syscall/table.rs`). The existing
+`Rights::BIND`-on-the-handle check stays; the syscap is an *additional* gate checked first:
 
 ```rust
 pub fn sys_ns_bind(ns_h, path, len, resource_h) -> SysResult {
@@ -184,8 +179,8 @@ fields; if `class == RealTime` and the caller lacks `REAL_TIME`, it is rejected
 your own thread is not privileged). Trusted kernel threads keep setting the class
 directly via `spawn_with_class` (they bypass the syscall).
 
-**Bit 4 is vacant** (`SYSTEM_CLOCK`, 2026-09-29 to 2026-11-15). **The clock is a node, not a
-capability**: setting it is a write to a char node whose handle `init` holds from boot and
+**Bit 4 is vacant.** **The clock is a node, not a capability**: setting it is a write to a
+char node whose handle `init` holds from boot and
 moves on to the view broker, and the `clock` grant binds into a program's view
 ([`io-operation.md`](../spec/io-operation.md) § *The clock node*,
 [`views-toml-schema.md`](../spec/views-toml-schema.md)). `SERVICE_MGR_CAPS` is
@@ -245,8 +240,7 @@ passing under the new gate (init/parent granted appropriately), *and* that a pro
 
 - **In:** the `SysCaps` type (kernel + userspace mirror); the `Process.syscaps` field
   + inheritance (`child = parent & args.syscaps`) in `sys_process_spawn`; the boot
-  grant (init = full set); the `BIND_NAMESPACE` gate on `ns_bind` (there is no
-  `ns_release_initramfs` to gate);
+  grant (init = full set); the `BIND_NAMESPACE` gate on `ns_bind`;
   the `REAL_TIME` gate + the finalized `ThreadArgs` class/nice/affinity ABI; the
   `SpawnArgs.syscaps` field.
 - **Defined, not wired:** `LOAD_MODULE`, `PHYSICAL_MEMORY`,

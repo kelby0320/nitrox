@@ -66,11 +66,11 @@ Init holds the kitchen sink at startup. It uses these capabilities for legitimat
 - `BIND_NAMESPACE` — to register fs-server endpoints in the system namespace
 - `LOAD_MODULE` — to load Tier 2 LKMs (delegated to device manager later)
 - `PHYSICAL_MEMORY` — only used in extreme recovery scenarios
-- **The clock node** (administration Part E.10) — a char `DeviceNode` handle in `rcx`, not a
-  syscap (`SYSTEM_CLOCK` is gone): `WRITE`, `INSPECT`, `TRANSFER` and `DUPLICATE`. Init **moves**
-  it to `service-mgr` as the fourth handoff on the terminal channel and holds it no longer, so
-  it never sets the clock itself. `service-mgr` moves it on to the one service declared
-  `clock = true`, the view broker, whose `clock` grant binds it at `/dev/clock`.
+- **The clock node** (2026-11-15) — a char `DeviceNode` handle in `rcx`, not a syscap: `WRITE`,
+  `INSPECT`, `TRANSFER` and `DUPLICATE`. Init **moves** it to `service-mgr` as the fourth handoff
+  on the terminal channel and holds it no longer, so it never sets the clock itself. `service-mgr`
+  moves it on to the one service declared `clock = true`, the view broker, whose `clock` grant
+  binds it at `/dev/clock`.
 - **The power node** (administration Part E.3) — a char `DeviceNode` handle in `rdx`, not a
   syscap: the capability to stop the machine, with `WRITE` and `INSPECT` and neither `DUPLICATE`
   nor `TRANSFER`, so init cannot delegate it even by mistake — not by a send, a spawn grant or a
@@ -121,7 +121,7 @@ Init reads files from the in-kernel initramfs resource server bound at `/initram
 
 Resolve them through the root namespace and map what comes back, as `read_manifest` does. There's no special initramfs API — it's a regular resource server.
 
-**The initramfs is never released.** `sys_release_initramfs()` does not exist — it is specified in [`syscall-abi.md`](../../docs/spec/syscall-abi.md) and was never built, and the initramfs must stay resident regardless: the root fs-server's restart image can only come from it, since `/store/…/bin/fs-server-ext4` is unreadable without the very server being restarted. `/initramfs/...` paths stay valid for the life of the machine. See [`deferred-decisions.md`](../../docs/rationale/deferred-decisions.md). (This file said init calls the syscall after bootstrap until 2026-08-18; audit D.5f.)
+**The initramfs is never released**: it stays resident for the life of the machine, since the root fs-server's restart image can only come from it — `/store/…/bin/fs-server-ext4` is unreadable without the very server being restarted — so `/initramfs/...` paths stay valid. See [`deferred-decisions.md`](../../docs/rationale/deferred-decisions.md).
 
 ## The terminal channel
 

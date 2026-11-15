@@ -204,8 +204,7 @@ exhaustion) return a negative `KError` **synchronously**, with no PO created;
 namespace lookup. (Syscall number `27`.)
 
 **Nothing cancels an operation once it is submitted** (`TODO(io-cancel)`): a waiter may give up
-its wait, and the operation runs to its end. `sys_io_cancel` (`29`), which only ever answered
-`Unsupported`, went on 2026-11-13, to come back with IRP cancellation and a caller.
+its wait, and the operation runs to its end.
 
 ```rust
 fn sys_ns_enumerate(ns: RawHandle, index: u64, out: UserMutPtr<NsEntry>, count: u64) -> isize
@@ -420,8 +419,7 @@ broker (`docs/planning/administration.md` § Part A). (Syscall number `22`.)
 `DeviceNode`, with `sys_io_submit` (`Read`, into a `MemoryObject` held with `MAP_WRITE`). A read
 answers at most 256 bytes, so a reader reads again for more. Before the generator seeds (only on a
 CPU with neither `RDSEED` nor `RDRAND`) the operation waits and completes with `result` 0; a reader
-reads again. `sys_entropy_create` (`26`) and `sys_entropy_read` (`27`) went on 2026-11-13, and
-their numbers are vacant. The contract is in [`docs/architecture/entropy.md`](../architecture/entropy.md)
+reads again. The contract is in [`docs/architecture/entropy.md`](../architecture/entropy.md)
 and [`io-operation.md`](io-operation.md).
 
 ### Process and Thread
@@ -452,8 +450,7 @@ fn sys_process_exit(status: i32) -> !
 Exits the **calling process** with `status`: the kernel closes the process's handles, records `status` (a second `sys_process_exit` racing the first exits with the first's), and sets every other thread of the process on its way to end: a blocked one is woken and its `sys_wait` never returns to it, a suspended one is resumed to terminate, and one running on another CPU is stopped by an interrupt. Each ends on its way back to ring 3, so whatever it held is let go. The last thread out delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), and the process is reaped (freeing its address space). Does not return. (Syscall number `16`.)
 
 **A thread's CPUs are set when it is made** (`ThreadArgs::cpu_affinity`, `sys_thread_create`), and
-nothing changes them after (`TODO(thread-affinity)`): `sys_thread_set_affinity` (`18`), which had
-no caller, went on 2026-11-13, to come back with the `std` port's.
+nothing changes them after (`TODO(thread-affinity)`).
 
 ```rust
 fn sys_thread_set_tls(tls_base: usize) -> isize
@@ -470,7 +467,7 @@ fn sys_exception_resume(thread: RawHandle, disposition: u64, code: u64) -> isize
 ```
 Acts on a thread **suspended on a fault**. `disposition` is `0` = **Resume** (re-enter the faulting instruction — without first fixing the fault's cause it simply re-faults) or `2` = **Terminate** (exit the thread with `code`); other values are reserved and return `Unsupported`. Requires `SIGNAL` right and a `Thread` handle; the thread must currently be suspended (else `InvalidArgument`). Returns `0`. (Syscall number `21`.)
 
-The exception model is **suspend + supervised resume/terminate**: a ring-3 fault suspends the faulting thread and delivers a `Notification` (`SegFault`/`IllegalInsn`/`DivideByZero`) to the faulting process's `NotificationChannel`; a supervisor (a sibling thread holding the faulter's handle) inspects it via `sys_thread_get_registers` and resumes or terminates it. **Deferred to Phase 2:** the `ResumeSkip` / `ModifyAndResume` dispositions (`1` / `3`), the 30 s auto-terminate timeout (`sys_exception_extend_timeout`), and the debugger exception-channel priority chain.
+The exception model is **suspend + supervised resume/terminate**: a ring-3 fault suspends the faulting thread and delivers a `Notification` (`SegFault`/`IllegalInsn`/`DivideByZero`) to the faulting process's `NotificationChannel`; a supervisor (a sibling thread holding the faulter's handle) inspects it via `sys_thread_get_registers` and resumes or terminates it. **Deferred to Phase 2:** the `ResumeSkip` / `ModifyAndResume` dispositions (`1` / `3`), the 30 s auto-terminate timeout, and the debugger exception-channel priority chain.
 
 ```rust
 fn sys_process_terminate(process: RawHandle) -> isize
@@ -494,11 +491,6 @@ leaving `TERMINATE` unspent keeps it available to gate a forcible kill if one is
 built. The authority is the handle itself: no syscall accepts a pid, so "you may terminate
 your own children" needs no rule — a child's handle is the only one you have unless a
 supervisor was *given* more, which is hand-down policy rather than a kernel check.
-
-```rust
-fn sys_exception_extend_timeout(thread: RawHandle, additional_ns: u64) -> isize
-```
-Extends the deadline before the kernel auto-terminates a suspended thread. Used by debuggers that need more time to inspect.
 
 ### Memory
 
@@ -586,7 +578,7 @@ Reads the current value of the specified clock (Monotonic, Realtime, ProcessCpu,
 
 **`Monotonic` and `Realtime` are serviced**; `ProcessCpu` and `ThreadCpu` return `Unsupported`, since the per-CPU clocks need scheduler CPU accounting (`TODO(sched-acct)`). `Realtime` is the monotonic counter plus an offset anchored from the RTC at boot (2026-07-24), and returns `Unsupported` on a machine whose RTC could not be read, until something sets it. The selector and the `out` pointer are validated before any clock is read, so an unknown `ClockId` returns `InvalidArgument` and an unsupported clock returns `Unsupported` without touching `*out`. (This paragraph said `Monotonic` only until 2026-09-29.)
 
-**No syscall sets the clock** (`sys_clock_set`, number `41`, until 2026-11-15). The **clock node**
+**No syscall sets the clock.** The **clock node**
 does: a char node `init` holds from boot and moves on to the view broker, written with
 **eight bytes**, little-endian nanoseconds since the Unix epoch, by `sys_io_submit`
 ([`io-operation.md`](io-operation.md) § *The clock node*). `sys_clock_read` is unchanged.
@@ -600,15 +592,9 @@ fn sys_device_map_mmio(
 ```
 Returns a `MemoryObject` handle for the MMIO region indexed by `region_idx` in the device's resource descriptor (see [`device-node.md`](device-node.md)). Requires appropriate rights on `device`. Subsequent `sys_memory_map` on the returned object installs MMIO PTEs. **Deferred** — this is the *userspace*-driver path; Phase 2's Tier 1 drivers map their BARs in kernel space directly, so the syscall is unimplemented until userspace drivers + IOMMU land (`deferred-decisions.md`).
 
-```rust
-fn sys_release_initramfs() -> isize
-```
-Unbinds `/initramfs` from the root namespace and frees the initramfs physical pages. One-shot — succeeds once, returns `AlreadyReleased` thereafter. Requires `BIND_NAMESPACE`. **Deferred** — not implemented, and neither is the `AlreadyReleased` error it names. The initramfs must currently stay resident because the root fs-server's restart image can only come from it (`deferred-decisions.md`, "Filesystem server restart"). Marked 2026-08-18: this signature carried no deferred marker for as long as it has existed, three lines below one that does, and `check-docs`' syscall cross-check reads *numbered* table rows and prose bullets, so an unnumbered code block is invisible to it (audit D.5f).
-
 ### Power
 
-There is no power syscall (`sys_power`, number `40`, was removed on 2026-11-15; it answers
-`Unsupported`). **The machine is stopped by a write to the power node**
+There is no power syscall. **The machine is stopped by a write to the power node**
 ([`power.md`](../architecture/power.md)): one char `DeviceNode`, made by the kernel at boot and
 handed to `init` in `rdx`, bound in no namespace, with `WRITE` and `INSPECT` and neither
 `DUPLICATE` nor `TRANSFER`. `init` submits a one-byte `Write` of `POWER_HALT` (`0`) or
