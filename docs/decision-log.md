@@ -38342,3 +38342,17 @@ E.9 merged, #442. E.10, `syscall-surface.md` § E.10, built on `pre-phase-7/part
   the clock's moves, the act's call site and init's kept power node are host-tested, and
   `abi-sync-check` pairs the syscap bits.
 
+## 2026-11-15 — Before Phase 7, E.11: the numbers, and the record
+
+E.10 merged, #443. E.11, `syscall-surface.md` § E.11, built on `pre-phase-7/part-e11-numbers`.
+
+- **The syscall numbers are `0` to `27`, dense and in family order** (`ee948649`): the handles,
+  memory, the clock and timers, waits and notifications, the channels, processes and threads,
+  namespaces, and I/O. Four move: `process_terminate` 36 to 17, `thread_exit` 17 to 18,
+  `ns_enumerate` 30 to 26, `io_submit` 28 to 27. **`SYSCALLS` (28)** names how many on both
+  sides, held by `abi-sync-check`; every number from it on answers `Unsupported`. Numbers are no
+  ABI-hash input, and every caller names them through `libkern`.
+- **The docs that describe today name no removed call** (`8e35260f`): the removed calls and
+  objects were kept there as asides, and go, the history being here; `release_initramfs` and
+  `exception_extend_timeout`, never built, leave the design.
+

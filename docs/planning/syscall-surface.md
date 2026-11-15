@@ -852,6 +852,30 @@ every removed name across those finds nothing.** It also takes `release_initramf
 `exception_extend_timeout` out of `syscall-abi.md`, `overview.md`, `notifications.md`, `syscaps.md`
 and `init`'s `CLAUDE.md`. The implementer; `/pr-review`.
 
+**Built 2026-11-15** (`ee948649` the numbers; `8e35260f` the docs).
+- **The numbers are `0` to `27`, dense and in family order**, the order "What stays" lists. Four
+  move: `process_terminate` 36 to 17, beside `process_exit`; `thread_exit` 17 to 18;
+  `ns_enumerate` 30 to 26; `io_submit` 28 to 27. **`SYSCALLS` (28)**, in the kernel and `libkern`
+  both, is how many, so `abi-sync-check` holds it as it does each number; the counters size their
+  table by it, and every number from it on answers `Unsupported`. A host test pins the family
+  order and the density.
+- **The docs that describe today name no removed call**: the grep of every removed name across
+  `spec/`, `architecture/`, `reference/`, `conventions/` and `init`'s `CLAUDE.md` finds nothing,
+  and the same pattern finds 116 lines in the decision log. `release_initramfs` and
+  `exception_extend_timeout` are gone from the five docs. `scheduler.md` no longer describes
+  `thread_set_affinity` as present. The renumbering is mine, an ABI change; the docs were
+  delegated, and I read the diff.
+- **A check beyond the plan's**: its grep of removed *names* cannot see a moved *number*, and
+  `syscall-abi.md` states each call's in a sentence after its block, which `check-docs` does not
+  read; four were stale. A script checks each "Syscall number" sentence against the call it
+  follows, and all eighteen agree.
+- **The controls**: two numbers swapped fail the family-order test; a vacant number served fails
+  the past-the-last test; a slot past the last fails the counters'; `SYSCALLS` changed on one
+  side fails `abi-sync-check`; a number wrong in the table fails `check-docs`.
+
+4,498 host tests; **all 19 CI gates pass under KVM**. The whole suite's Miri run, Part E's end,
+follows.
+
 ### What this part does not do
 
 No new call for speed, and no ring. No page-cache reclaim beyond `IO_NOCACHE`: the clock algorithm
